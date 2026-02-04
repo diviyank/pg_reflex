@@ -14,6 +14,7 @@ extension_sql!(
         sql_query TEXT,
         parsed_sql_query JSON,
         indexes TEXT[],
+        enabled BOOLEAN DEFAULT TRUE
     );
     
     -- You can also add indexes here
