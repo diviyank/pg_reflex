@@ -1,5 +1,7 @@
 use pgrx::prelude::*;
 
+use sqlparser::dialect::{self, PostgreSqlDialect};
+use sqlparser::parser::Parser;
 ::pgrx::pg_module_magic!(name, version);
 
 /// This SQL will be executed exactly once when 'CREATE EXTENSION' is run.
@@ -11,10 +13,12 @@ extension_sql!(
         graph_level INT NOT NULL,
         depends_on TEXT[],
         depends_on_imv TEXT[],
+        graph_child TEXT[],
         sql_query TEXT,
         parsed_sql_query JSON,
-        indexes TEXT[],
+        index_columns TEXT[],
         enabled BOOLEAN DEFAULT TRUE
+        last_update_date TIMESTAMP
     );
     
     -- You can also add indexes here
@@ -22,6 +26,36 @@ extension_sql!(
     "#,
     name = "pg_reflex_init", // Unique name for this SQL block
 );
+
+#[pg_extern]
+fn create_incremental_view(view_name: &str, sql: &str) -> &'static str {
+    let dialect = PostgreSqlDialect {};
+    let parsed_sql = Parser::parse_sql(&dialect, sql).unwrap();
+
+    let froms = vec!["3", "4"];
+    Spi::connect(|mut client| {
+        let matching_froms = client.select(
+            "SELECT name from public.__reflex_ivm_reference where name in ANY($1)",
+            None,
+            Some(vec![(
+                PgBuiltInOids::TEXTARRAYOID.oid(),
+                froms.into_datum(),
+            )]),
+        );
+
+        let mut results = Vec::new();
+
+        for row in matching_froms {
+            if let Some(name) = row.get_by_name("name").unwrap_or(None) {
+                results.push(name);
+            }
+        }
+    });
+
+    Spi::run("INSERT INTO public.__reflex_ivm_reference (name, graph_level, depends_on, depends_on_imv, sql_query, parsed_sql_query, index_columns) VALUES ($1, )").unwrap();
+
+    "CREATE INCREMENTAL VIEW"
+}
 
 #[pg_extern]
 fn hello_pg_reflex() -> &'static str {
