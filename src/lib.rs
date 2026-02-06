@@ -1,3 +1,5 @@
+use pgrx::datum::DatumWithOid;
+use pgrx::pg_sys::panic::ErrorReportable;
 use pgrx::prelude::*;
 
 use sqlparser::dialect::{self, PostgreSqlDialect};
@@ -32,18 +34,21 @@ fn create_incremental_view(view_name: &str, sql: &str) -> &'static str {
     let dialect = PostgreSqlDialect {};
     let parsed_sql = Parser::parse_sql(&dialect, sql).unwrap();
 
-    let froms = vec!["3", "4"];
-    Spi::connect(|mut client| {
-        let matching_froms = client.select(
-            "SELECT name from public.__reflex_ivm_reference where name in ANY($1)",
-            None,
-            Some(vec![(
-                PgBuiltInOids::TEXTARRAYOID.oid(),
-                froms.into_datum(),
-            )]),
-        );
+    let froms: Vec<&str> = vec!["3", "4"];
 
-        let mut results = Vec::new();
+    Spi::connect(|mut client| {
+        let args = [unsafe { DatumWithOid::new(froms, PgBuiltInOids::TEXTARRAYOID.oid().value()) }];
+
+        let matching_froms = client
+            .select(
+                "SELECT name from public.__reflex_ivm_reference where name = ANY($1)",
+                None,
+                &args,
+            )
+            .unwrap_or_report()
+            .collect::<Vec<_>>();
+
+        let mut results: Vec<&str> = Vec::new();
 
         for row in matching_froms {
             if let Some(name) = row.get_by_name("name").unwrap_or(None) {
