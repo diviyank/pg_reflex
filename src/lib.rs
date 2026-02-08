@@ -18,7 +18,9 @@ extension_sql!(
         unlogged_tables TEXT[],
         graph_child TEXT[],
         sql_query TEXT,
+        base_query TEXT,
         parsed_sql_query JSON,
+        aggregations JSON,
         index_columns TEXT[],
         enabled BOOLEAN DEFAULT TRUE
         last_update_date TIMESTAMP
@@ -31,9 +33,13 @@ extension_sql!(
 );
 
 #[pg_extern]
-fn create_incremental_view(view_name: &str, sql: &str) -> &'static str {
+fn create_reflex_ivm(view_name: &str, sql: &str) -> &'static str {
     let dialect = PostgreSqlDialect {};
     let parsed_sql = Parser::parse_sql(&dialect, sql).unwrap();
+
+    // TODO: EXCLUDE SOME CASES for now: WINDOW functions, CTEs
+
+    // TODO: Find all FROMs
 
     let froms: Vec<&str> = vec!["3", "4"];
 
@@ -57,10 +63,52 @@ fn create_incremental_view(view_name: &str, sql: &str) -> &'static str {
             }
         }
 
-        client.update(query, None, None);
+        // TODO: CREATE Intermediate table(s)
+
+        // TODO: CREATE target table
+
+        // TODO: CREATE indexes
+
+        // TODO: CREATE triggers if not exist except on target tables
+
+        client.update(
+            "INSERT INTO public.__reflex_ivm_reference
+                 (name,
+                 graph_level,
+                 depends_on,
+                 depends_on_imv,
+                 graph_child,
+                 sql_query,
+                 parsed_sql_query,
+                 index_columns,
+                 enabled,
+                 last_update_date)",
+            None,
+            None,
+        );
     });
 
-    "CREATE INCREMENTAL VIEW"
+    "CREATE REFLEX INCREMENTAL VIEW"
+}
+
+/// Run the given trigger
+#[pg_extern]
+fn run_reflex_trigger(view_name: &str, new_data: &str) -> &str {
+    // TODO: GET all info from reflex_reference
+    // TODO: Build dependency graph
+    // TODO: TOPOLOGICAL levels:
+
+    // TODO: Run query Up until group by (base-query - if there is) and pull datas for given topological level
+
+    // TODO: Run base-aggregations
+
+    // TODO: Compute deltas
+
+    // TODO: Go up a topological level: with deltas!
+
+    // TODO: Update all-deltas
+
+    &format!("UPDATED all views from {}", view_name)
 }
 
 #[pg_extern]
