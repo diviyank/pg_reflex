@@ -15,6 +15,7 @@ extension_sql!(
         graph_level INT NOT NULL,
         depends_on TEXT[],
         depends_on_imv TEXT[],
+        unlogged_tables TEXT[],
         graph_child TEXT[],
         sql_query TEXT,
         parsed_sql_query JSON,
@@ -55,9 +56,9 @@ fn create_incremental_view(view_name: &str, sql: &str) -> &'static str {
                 results.push(name);
             }
         }
-    });
 
-    Spi::run("INSERT INTO public.__reflex_ivm_reference (name, graph_level, depends_on, depends_on_imv, sql_query, parsed_sql_query, index_columns) VALUES ($1, )").unwrap();
+        client.update(query, None, None);
+    });
 
     "CREATE INCREMENTAL VIEW"
 }
