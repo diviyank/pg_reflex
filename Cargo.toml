@@ -22,7 +22,7 @@ pg_test = []
 
 [dependencies]
 pgrx = "=0.16.1"
-sqlparser = "0.60.0"
+sqlparser = { version = "0.60", features = ["visitor"] }
 
 [dev-dependencies]
 pgrx-tests = "=0.16.1"

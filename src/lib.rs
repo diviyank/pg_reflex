@@ -1,9 +1,12 @@
 use pgrx::datum::DatumWithOid;
 use pgrx::pg_sys::panic::ErrorReportable;
 use pgrx::prelude::*;
-
+use sqlparser::ast::{Expr, Query, Select, SelectItem, SetExpr, Statement, TableFactor};
 use sqlparser::dialect::{self, PostgreSqlDialect};
 use sqlparser::parser::Parser;
+mod sql_analyzer;
+
+use sql_analyzer::{analyze, SqlAnalysisError};
 ::pgrx::pg_module_magic!(name, version);
 
 /// This SQL will be executed exactly once when 'CREATE EXTENSION' is run.
@@ -12,7 +15,7 @@ extension_sql!(
     r#"
     CREATE TABLE IF NOT EXISTS public.__reflex_ivm_reference (
         name TEXT PRIMARY KEY COLLATE "C",
-        graph_level INT NOT NULL,
+        graph_depth INT NOT NULL,
         depends_on TEXT[],
         depends_on_imv TEXT[],
         unlogged_tables TEXT[],
@@ -29,26 +32,39 @@ extension_sql!(
     -- You can also add indexes here
     CREATE INDEX IF NOT EXISTS idx__reflex_ivm_name ON public.__reflex_ivm_reference(name);
     "#,
-    name = "pg_reflex_init", // Unique name for this SQL block
+    name = "pg_reflex_init",
 );
 
 #[pg_extern]
 fn create_reflex_ivm(view_name: &str, sql: &str) -> &'static str {
     let dialect = PostgreSqlDialect {};
     let parsed_sql = Parser::parse_sql(&dialect, sql).unwrap();
+    let froms: Vec<String> = match analyze(&parsed_sql) {
+        Err(SqlAnalysisError::MultipleQueries(n)) => {
+            return "ERROR: Expected 1 query, got multiple";
+        }
+        Err(SqlAnalysisError::NotASelectQuery) => {
+            return "ERROR: Query is not a SELECT";
+        }
+        Ok(analysis) => {
+            if analysis.has_unsupported_features() {
+                return "ERROR: Query has one or multiple of the unsupported features (CTE, LIMIT, ORDER BY, WINDOW)";
+            }
 
-    // TODO: EXCLUDE SOME CASES for now: WINDOW functions, CTEs
-
-    // TODO: Find all FROMs
-
-    let froms: Vec<&str> = vec!["3", "4"];
+            println!("\nSources found:");
+            for src in &analysis.sources {
+                println!("  - {}", src);
+            }
+            analysis.sources
+        }
+    };
 
     Spi::connect(|mut client| {
         let args = [unsafe { DatumWithOid::new(froms, PgBuiltInOids::TEXTARRAYOID.oid().value()) }];
 
         let matching_froms = client
             .select(
-                "SELECT name from public.__reflex_ivm_reference where name = ANY($1)",
+                "SELECT name, graph_depth from public.__reflex_ivm_reference where name = ANY($1)",
                 None,
                 &args,
             )
@@ -96,11 +112,11 @@ fn create_reflex_ivm(view_name: &str, sql: &str) -> &'static str {
 fn run_reflex_trigger(view_name: &str, new_data: &str) -> &str {
     // TODO: GET all info from reflex_reference
     // TODO: Build dependency graph
-    // TODO: TOPOLOGICAL levels:
+    // TODO: FOR TOPOLOGICAL levels:
 
     // TODO: Run query Up until group by (base-query - if there is) and pull datas for given topological level
 
-    // TODO: Run base-aggregations
+    // TODO: Run base-aggregations for every
 
     // TODO: Compute deltas
 
