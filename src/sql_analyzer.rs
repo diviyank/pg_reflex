@@ -48,7 +48,7 @@ impl<'a> Visitor for AnalysisVisitor<'a> {
         {
             self.analysis.has_cte = true;
         }
-        if query.limit.is_some() {
+        if query.limit_clause.is_some() {
             self.analysis.has_limit = true;
         }
         if query

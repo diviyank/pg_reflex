@@ -109,7 +109,7 @@ fn create_reflex_ivm(view_name: &str, sql: &str) -> &'static str {
 
 /// Run the given trigger
 #[pg_extern]
-fn run_reflex_trigger(view_name: &str, new_data: &str) -> &str {
+fn run_reflex_trigger<'a>(view_name: &'a str, new_data: &'a str) -> &'a str {
     // TODO: GET all info from reflex_reference
     // TODO: Build dependency graph
     // TODO: FOR TOPOLOGICAL levels:
