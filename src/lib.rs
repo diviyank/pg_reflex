@@ -8,7 +8,6 @@ mod sql_analyzer;
 
 use sql_analyzer::{analyze, SqlAnalysisError};
 ::pgrx::pg_module_magic!(name, version);
-
 /// This SQL will be executed exactly once when 'CREATE EXTENSION' is run.
 /// Collate "C" for faster lookups
 extension_sql!(
@@ -71,13 +70,17 @@ fn create_reflex_ivm(view_name: &str, sql: &str) -> &'static str {
             .unwrap_or_report()
             .collect::<Vec<_>>();
 
-        let mut results: Vec<&str> = Vec::new();
+        let ivm_froms: Vec<&str> = matching_froms
+            .iter()
+            .filter_map(|row| row.get_by_name("name").unwrap_or(None))
+            .collect();
 
-        for row in matching_froms {
-            if let Some(name) = row.get_by_name("name").unwrap_or(None) {
-                results.push(name);
-            }
-        }
+        // Getting depth
+        let depth = matching_froms
+            .iter()
+            .filter_map(|row| row.get_by_name::<i32, _>("graph_depth").unwrap_or(None))
+            .max()
+            .unwrap_or(0);
 
         // TODO: CREATE Intermediate table(s)
 
@@ -100,7 +103,7 @@ fn create_reflex_ivm(view_name: &str, sql: &str) -> &'static str {
                  enabled,
                  last_update_date)",
             None,
-            None,
+            &[],
         );
     });
 
@@ -108,24 +111,24 @@ fn create_reflex_ivm(view_name: &str, sql: &str) -> &'static str {
 }
 
 /// Run the given trigger
-#[pg_extern]
-fn run_reflex_trigger<'a>(view_name: &'a str, new_data: &'a str) -> &'a str {
-    // TODO: GET all info from reflex_reference
-    // TODO: Build dependency graph
-    // TODO: FOR TOPOLOGICAL levels:
-
-    // TODO: Run query Up until group by (base-query - if there is) and pull datas for given topological level
-
-    // TODO: Run base-aggregations for every
-
-    // TODO: Compute deltas
-
-    // TODO: Go up a topological level: with deltas!
-
-    // TODO: Update all-deltas
-
-    &format!("UPDATED all views from {}", view_name)
-}
+// #[pg_extern]
+// fn run_reflex_trigger<'a>(view_name: &'a str, new_data: &'a str) -> &'a str {
+//     // TODO: GET all info from reflex_reference
+//     // TODO: Build dependency graph
+//     // TODO: FOR TOPOLOGICAL levels:
+//
+//     // TODO: Run query Up until group by (base-query - if there is) and pull datas for given topological level
+//
+//     // TODO: Run base-aggregations for every
+//
+//     // TODO: Compute deltas
+//
+//     // TODO: Go up a topological level: with deltas!
+//
+//     // TODO: Update all-deltas
+//
+//     &format!("UPDATED all views from {}", view_name)
+// }
 
 #[pg_extern]
 fn hello_pg_reflex() -> &'static str {
