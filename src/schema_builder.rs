@@ -146,45 +146,52 @@ pub fn build_indexes_ddl(view_name: &str, plan: &AggregationPlan) -> Vec<String>
     indexes
 }
 
-/// Build trigger DDL statements for a source table.
+/// Build consolidated trigger DDL statements for a source table.
 ///
-/// Returns 3 DDL blocks (INSERT, DELETE, UPDATE), each creating a plpgsql
-/// wrapper function and a statement-level trigger with REFERENCING clauses.
+/// Returns 4 DDL blocks (INSERT, DELETE, UPDATE, TRUNCATE), each creating a plpgsql
+/// wrapper function and a statement-level trigger. One set of triggers per source table
+/// handles ALL dependent IMVs via a FOR loop over the reference table.
 ///
 /// The wrapper copies transition table data into temp tables (because transition
 /// tables are only visible within the trigger function's direct SQL context, not
-/// in functions called from it via SPI), then calls `reflex_build_delta_sql`.
-pub fn build_trigger_ddls(source_table: &str, view_name: &str) -> Vec<String> {
+/// in functions called from it via SPI), then loops over all dependent IMVs and
+/// calls `reflex_build_delta_sql` for each.
+pub fn build_trigger_ddls(source_table: &str) -> Vec<String> {
     let safe_source = source_table.replace('.', "_");
-    let ref_new = format!("__reflex_new_{}", view_name);
-    let ref_old = format!("__reflex_old_{}", view_name);
-    let delta_new = format!("__reflex_delta_new_{}", view_name);
-    let delta_old = format!("__reflex_delta_old_{}", view_name);
+    let ref_new = format!("__reflex_new_{}", safe_source);
+    let ref_old = format!("__reflex_old_{}", safe_source);
+    let delta_new = format!("__reflex_delta_new_{}", safe_source);
+    let delta_old = format!("__reflex_delta_old_{}", safe_source);
 
+    // Core loop body shared by INSERT/DELETE/UPDATE triggers.
+    // {copy_transition} is replaced per-operation, {op} is replaced per-operation.
+    // The FOR loop iterates over all IMVs that depend on this source.
     let body_core = format!(
-        "DECLARE _sql TEXT; _bq TEXT; _eq TEXT; _agg TEXT; _stmt TEXT; \
+        "DECLARE _rec RECORD; _sql TEXT; _stmt TEXT; \
          BEGIN \
-           SELECT base_query, end_query, aggregations INTO _bq, _eq, _agg \
-             FROM public.__reflex_ivm_reference WHERE name = '{{view}}' AND enabled = TRUE; \
-           IF _bq IS NULL THEN RETURN NULL; END IF; \
-           PERFORM pg_advisory_xact_lock(hashtext('{{view}}')); \
            {{copy_transition}} \
-           _sql := reflex_build_delta_sql('{{view}}', '{{source}}', '{{op}}', _bq, _eq, _agg); \
-           IF _sql <> '' THEN \
-             FOREACH _stmt IN ARRAY string_to_array(_sql, E'\\n--<<REFLEX_SEP>>--\\n') LOOP \
-               IF _stmt <> '' THEN EXECUTE _stmt; END IF; \
-             END LOOP; \
-           END IF; \
+           FOR _rec IN \
+             SELECT name, base_query, end_query, aggregations::text AS aggregations \
+             FROM public.__reflex_ivm_reference \
+             WHERE '{source_table}' = ANY(depends_on) AND enabled = TRUE \
+             ORDER BY graph_depth \
+           LOOP \
+             PERFORM pg_advisory_xact_lock(hashtext(_rec.name)); \
+             _sql := reflex_build_delta_sql(_rec.name, '{source_table}', '{{op}}', _rec.base_query, _rec.end_query, _rec.aggregations); \
+             IF _sql <> '' THEN \
+               FOREACH _stmt IN ARRAY string_to_array(_sql, E'\\n--<<REFLEX_SEP>>--\\n') LOOP \
+                 IF _stmt <> '' THEN EXECUTE _stmt; END IF; \
+               END LOOP; \
+             END IF; \
+           END LOOP; \
            RETURN NULL; \
          END;"
     );
 
     // INSERT
-    let ins_fn = format!("__reflex_ins_trigger_{}_{}", view_name, safe_source);
-    let ins_trig = format!("__reflex_trigger_{}_ins_on_{}", view_name, safe_source);
+    let ins_fn = format!("__reflex_ins_trigger_on_{}", safe_source);
+    let ins_trig = format!("__reflex_trigger_ins_on_{}", safe_source);
     let ins_body = body_core
-        .replace("{view}", view_name)
-        .replace("{source}", source_table)
         .replace("{op}", "INSERT")
         .replace(
             "{copy_transition}",
@@ -202,11 +209,9 @@ pub fn build_trigger_ddls(source_table: &str, view_name: &str) -> Vec<String> {
     );
 
     // DELETE
-    let del_fn = format!("__reflex_del_trigger_{}_{}", view_name, safe_source);
-    let del_trig = format!("__reflex_trigger_{}_del_on_{}", view_name, safe_source);
+    let del_fn = format!("__reflex_del_trigger_on_{}", safe_source);
+    let del_trig = format!("__reflex_trigger_del_on_{}", safe_source);
     let del_body = body_core
-        .replace("{view}", view_name)
-        .replace("{source}", source_table)
         .replace("{op}", "DELETE")
         .replace(
             "{copy_transition}",
@@ -224,11 +229,9 @@ pub fn build_trigger_ddls(source_table: &str, view_name: &str) -> Vec<String> {
     );
 
     // UPDATE
-    let upd_fn = format!("__reflex_upd_trigger_{}_{}", view_name, safe_source);
-    let upd_trig = format!("__reflex_trigger_{}_upd_on_{}", view_name, safe_source);
+    let upd_fn = format!("__reflex_upd_trigger_on_{}", safe_source);
+    let upd_trig = format!("__reflex_trigger_upd_on_{}", safe_source);
     let upd_body = body_core
-        .replace("{view}", view_name)
-        .replace("{source}", source_table)
         .replace("{op}", "UPDATE")
         .replace(
             "{copy_transition}",
@@ -247,19 +250,26 @@ pub fn build_trigger_ddls(source_table: &str, view_name: &str) -> Vec<String> {
          FOR EACH STATEMENT EXECUTE FUNCTION {upd_fn}()"
     );
 
-    // TRUNCATE — no REFERENCING clauses allowed
-    let trunc_fn = format!("__reflex_trunc_trigger_{}_{}", view_name, safe_source);
-    let trunc_trig = format!("__reflex_trigger_{}_trunc_on_{}", view_name, safe_source);
+    // TRUNCATE — no REFERENCING clauses; loops over all dependent IMVs
+    let trunc_fn = format!("__reflex_trunc_trigger_on_{}", safe_source);
+    let trunc_trig = format!("__reflex_trigger_trunc_on_{}", safe_source);
     let trunc_body = format!(
-        "DECLARE _stmts TEXT; _stmt TEXT; \
+        "DECLARE _rec RECORD; _stmts TEXT; _stmt TEXT; \
          BEGIN \
-           PERFORM pg_advisory_xact_lock(hashtext('{view_name}')); \
-           _stmts := reflex_build_truncate_sql('{view_name}'); \
-           IF _stmts <> '' THEN \
-             FOREACH _stmt IN ARRAY string_to_array(_stmts, E'\\n--<<REFLEX_SEP>>--\\n') LOOP \
-               IF _stmt <> '' THEN EXECUTE _stmt; END IF; \
-             END LOOP; \
-           END IF; \
+           FOR _rec IN \
+             SELECT name \
+             FROM public.__reflex_ivm_reference \
+             WHERE '{source_table}' = ANY(depends_on) AND enabled = TRUE \
+             ORDER BY graph_depth \
+           LOOP \
+             PERFORM pg_advisory_xact_lock(hashtext(_rec.name)); \
+             _stmts := reflex_build_truncate_sql(_rec.name); \
+             IF _stmts <> '' THEN \
+               FOREACH _stmt IN ARRAY string_to_array(_stmts, E'\\n--<<REFLEX_SEP>>--\\n') LOOP \
+                 IF _stmt <> '' THEN EXECUTE _stmt; END IF; \
+               END LOOP; \
+             END IF; \
+           END LOOP; \
            RETURN NULL; \
          END;"
     );
@@ -376,26 +386,29 @@ mod tests {
 
     #[test]
     fn test_trigger_ddls_format() {
-        let ddls = build_trigger_ddls("orders", "city_totals");
+        let ddls = build_trigger_ddls("orders");
         assert_eq!(ddls.len(), 4);
-        // INSERT trigger: copies transition table to temp, calls Rust
+        // INSERT trigger: copies transition table to temp, loops over IMVs
         assert!(ddls[0].contains("AFTER INSERT ON orders"));
         assert!(ddls[0].contains("REFERENCING NEW TABLE AS"));
-        assert!(ddls[0].contains("__reflex_delta_new_city_totals"));
+        assert!(ddls[0].contains("__reflex_delta_new_orders"));
         assert!(ddls[0].contains("reflex_build_delta_sql"));
         assert!(ddls[0].contains("'INSERT'"));
+        assert!(ddls[0].contains("FOR _rec IN"));
+        assert!(ddls[0].contains("__reflex_ins_trigger_on_orders"));
         // DELETE trigger
         assert!(ddls[1].contains("AFTER DELETE ON orders"));
-        assert!(ddls[1].contains("__reflex_delta_old_city_totals"));
+        assert!(ddls[1].contains("__reflex_delta_old_orders"));
         assert!(ddls[1].contains("'DELETE'"));
         // UPDATE trigger
         assert!(ddls[2].contains("AFTER UPDATE ON orders"));
-        assert!(ddls[2].contains("__reflex_delta_new_city_totals"));
-        assert!(ddls[2].contains("__reflex_delta_old_city_totals"));
+        assert!(ddls[2].contains("__reflex_delta_new_orders"));
+        assert!(ddls[2].contains("__reflex_delta_old_orders"));
         assert!(ddls[2].contains("'UPDATE'"));
         // TRUNCATE trigger
         assert!(ddls[3].contains("AFTER TRUNCATE ON orders"));
         assert!(ddls[3].contains("reflex_build_truncate_sql"));
+        assert!(ddls[3].contains("FOR _rec IN"));
     }
 
     #[test]

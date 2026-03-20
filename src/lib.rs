@@ -199,10 +199,29 @@ fn create_reflex_ivm(view_name: &str, sql: &str) -> &'static str {
             }
         }
 
-        // CREATE triggers on ALL source tables (including IMV target tables for cascading)
+        // CREATE consolidated triggers on source tables (one set per source, shared by all IMVs).
+        // Skip if triggers already exist on this source (another IMV already created them).
         for source in &froms {
-            for ddl in build_trigger_ddls(source, view_name) {
-                client.update(&ddl, None, &[]).unwrap_or_report();
+            if source.starts_with('<') {
+                continue;
+            }
+            let safe_source = source.replace('.', "_");
+            let trig_exists = client
+                .select(
+                    &format!(
+                        "SELECT 1 FROM pg_trigger WHERE tgname = '__reflex_trigger_ins_on_{}'",
+                        safe_source
+                    ),
+                    None,
+                    &[],
+                )
+                .unwrap_or_report()
+                .len() > 0;
+
+            if !trig_exists {
+                for ddl in build_trigger_ddls(source) {
+                    client.update(&ddl, None, &[]).unwrap_or_report();
+                }
             }
         }
 
@@ -435,27 +454,33 @@ fn drop_reflex_ivm_impl(view_name: &str, cascade: bool) -> &'static str {
             }
         }
 
-        // 4. Drop triggers and trigger functions on source tables
+        // 4. Drop consolidated triggers only if no OTHER IMV depends on this source.
+        //    The trigger function is shared; it discovers IMVs via the reference table.
+        //    We must delete the reference row FIRST (step 8) so the trigger stops
+        //    finding this IMV. But we need the reference row for step 7. So we check
+        //    here and drop triggers AFTER deleting the row (moved below step 8).
+        //    For now, just collect sources that need trigger cleanup.
+        let mut sources_to_cleanup: Vec<(String, String)> = Vec::new(); // (source, safe_source)
         for source in &depends_on {
             let safe_source = source.replace('.', "_");
-            for op in &["ins", "del", "upd", "trunc"] {
-                let trig_name = format!("__reflex_trigger_{}_{}_on_{}", view_name, op, safe_source);
-                client
-                    .update(
-                        &format!("DROP TRIGGER IF EXISTS \"{}\" ON {}", trig_name, source),
-                        None,
-                        &[],
-                    )
-                    .unwrap_or_report();
+            let other_count = client
+                .select(
+                    &format!(
+                        "SELECT COUNT(*) AS cnt FROM public.__reflex_ivm_reference \
+                         WHERE '{}' = ANY(depends_on) AND name != '{}'",
+                        source, view_name
+                    ),
+                    None,
+                    &[],
+                )
+                .unwrap_or_report()
+                .first()
+                .get_by_name::<i64, _>("cnt")
+                .unwrap_or(None)
+                .unwrap_or(0);
 
-                let fn_name = format!("__reflex_{}_trigger_{}_{}", op, view_name, safe_source);
-                client
-                    .update(
-                        &format!("DROP FUNCTION IF EXISTS {}()", fn_name),
-                        None,
-                        &[],
-                    )
-                    .unwrap_or_report();
+            if other_count == 0 {
+                sources_to_cleanup.push((source.clone(), safe_source));
             }
         }
 
@@ -517,6 +542,29 @@ fn drop_reflex_ivm_impl(view_name: &str, cascade: bool) -> &'static str {
                 }],
             )
             .unwrap_or_report();
+
+        // 9. Drop consolidated triggers on sources where no other IMV depends
+        for (source, safe_source) in &sources_to_cleanup {
+            for op in &["ins", "del", "upd", "trunc"] {
+                let trig_name = format!("__reflex_trigger_{}_on_{}", op, safe_source);
+                client
+                    .update(
+                        &format!("DROP TRIGGER IF EXISTS \"{}\" ON {}", trig_name, source),
+                        None,
+                        &[],
+                    )
+                    .unwrap_or_report();
+
+                let fn_name = format!("__reflex_{}_trigger_on_{}", op, safe_source);
+                client
+                    .update(
+                        &format!("DROP FUNCTION IF EXISTS {}()", fn_name),
+                        None,
+                        &[],
+                    )
+                    .unwrap_or_report();
+            }
+        }
 
         "DROP REFLEX INCREMENTAL VIEW"
     })
@@ -943,10 +991,10 @@ mod tests {
             "SELECT grp, SUM(val) AS total FROM test_trig_src GROUP BY grp",
         );
 
-        // Check all 4 triggers exist (INSERT, DELETE, UPDATE, TRUNCATE)
+        // Check all 4 consolidated triggers exist (INSERT, DELETE, UPDATE, TRUNCATE)
         let count = Spi::get_one::<i64>(
             "SELECT COUNT(*) FROM pg_trigger
-             WHERE tgname LIKE '__reflex_trigger_test_trig_view_%_on_test_trig_src'",
+             WHERE tgname LIKE '__reflex_trigger_%_on_test_trig_src'",
         )
         .expect("query")
         .expect("count");
@@ -1669,6 +1717,51 @@ mod tests {
         assert_eq!(count, 0);
     }
 
+    #[pg_test]
+    fn test_drop_shared_trigger_lifecycle() {
+        // Two IMVs on the same source. Dropping one should keep triggers;
+        // dropping the last should remove triggers.
+        Spi::run("CREATE TABLE drop_sh_src (id SERIAL, grp TEXT, val NUMERIC)")
+            .expect("create table");
+        Spi::run("INSERT INTO drop_sh_src (grp, val) VALUES ('a', 1)").expect("seed");
+
+        crate::create_reflex_ivm(
+            "drop_sh_v1",
+            "SELECT grp, SUM(val) AS total FROM drop_sh_src GROUP BY grp",
+        );
+        crate::create_reflex_ivm(
+            "drop_sh_v2",
+            "SELECT grp, COUNT(*) AS cnt FROM drop_sh_src GROUP BY grp",
+        );
+
+        // Both share 4 triggers on the source
+        let trig_count = Spi::get_one::<i64>(
+            "SELECT COUNT(*) FROM pg_trigger WHERE tgname LIKE '__reflex_trigger_%_on_drop_sh_src'",
+        ).expect("q").expect("v");
+        assert_eq!(trig_count, 4);
+
+        // Drop v1 → triggers should remain (v2 still depends on source)
+        crate::drop_reflex_ivm("drop_sh_v1");
+        let trig_after_v1 = Spi::get_one::<i64>(
+            "SELECT COUNT(*) FROM pg_trigger WHERE tgname LIKE '__reflex_trigger_%_on_drop_sh_src'",
+        ).expect("q").expect("v");
+        assert_eq!(trig_after_v1, 4);
+
+        // v2 should still work after v1 is dropped
+        Spi::run("INSERT INTO drop_sh_src (grp, val) VALUES ('b', 2)").expect("insert");
+        let cnt = Spi::get_one::<i64>(
+            "SELECT cnt FROM drop_sh_v2 WHERE grp = 'b'",
+        ).expect("q").expect("v");
+        assert_eq!(cnt, 1);
+
+        // Drop v2 → triggers should be removed (no more dependents)
+        crate::drop_reflex_ivm("drop_sh_v2");
+        let trig_after_v2 = Spi::get_one::<i64>(
+            "SELECT COUNT(*) FROM pg_trigger WHERE tgname LIKE '__reflex_trigger_%_on_drop_sh_src'",
+        ).expect("q").expect("v");
+        assert_eq!(trig_after_v2, 0);
+    }
+
     // ---- TRUNCATE tests ----
 
     #[pg_test]
@@ -1787,6 +1880,218 @@ mod tests {
         let count_after = Spi::get_one::<i64>("SELECT COUNT(*) FROM recon_pt_view")
             .expect("q").expect("v");
         assert_eq!(count_after, 2);
+    }
+
+    // ---- Fan-out / fan-in topology tests ----
+
+    #[pg_test]
+    fn test_one_source_multiple_imvs() {
+        // One source table with 3 independent IMVs depending on it.
+        // INSERT/DELETE/UPDATE on the source should update all 3 correctly.
+        Spi::run("CREATE TABLE multi_src (id SERIAL, city TEXT, amount NUMERIC, qty INTEGER)")
+            .expect("create table");
+        Spi::run(
+            "INSERT INTO multi_src (city, amount, qty) VALUES \
+             ('Paris', 100, 2), ('Paris', 200, 3), ('London', 300, 1)",
+        ).expect("seed");
+
+        // IMV 1: SUM of amount by city
+        crate::create_reflex_ivm(
+            "multi_v1",
+            "SELECT city, SUM(amount) AS total FROM multi_src GROUP BY city",
+        );
+        // IMV 2: COUNT by city
+        crate::create_reflex_ivm(
+            "multi_v2",
+            "SELECT city, COUNT(*) AS cnt FROM multi_src GROUP BY city",
+        );
+        // IMV 3: SUM of qty (no group by — global aggregate)
+        crate::create_reflex_ivm(
+            "multi_v3",
+            "SELECT SUM(qty) AS total_qty FROM multi_src",
+        );
+
+        // Verify initial state
+        let p_total = Spi::get_one::<pgrx::AnyNumeric>(
+            "SELECT total FROM multi_v1 WHERE city = 'Paris'",
+        ).expect("q").expect("v");
+        assert_eq!(p_total.to_string(), "300");
+
+        let p_cnt = Spi::get_one::<i64>(
+            "SELECT cnt FROM multi_v2 WHERE city = 'Paris'",
+        ).expect("q").expect("v");
+        assert_eq!(p_cnt, 2);
+
+        let tq = Spi::get_one::<pgrx::AnyNumeric>(
+            "SELECT total_qty FROM multi_v3",
+        ).expect("q").expect("v");
+        assert_eq!(tq.to_string(), "6"); // 2+3+1
+
+        // INSERT → all 3 IMVs update
+        Spi::run("INSERT INTO multi_src (city, amount, qty) VALUES ('Paris', 50, 5)")
+            .expect("insert");
+
+        let p_total2 = Spi::get_one::<pgrx::AnyNumeric>(
+            "SELECT total FROM multi_v1 WHERE city = 'Paris'",
+        ).expect("q").expect("v");
+        assert_eq!(p_total2.to_string(), "350");
+
+        let p_cnt2 = Spi::get_one::<i64>(
+            "SELECT cnt FROM multi_v2 WHERE city = 'Paris'",
+        ).expect("q").expect("v");
+        assert_eq!(p_cnt2, 3);
+
+        let tq2 = Spi::get_one::<pgrx::AnyNumeric>(
+            "SELECT total_qty FROM multi_v3",
+        ).expect("q").expect("v");
+        assert_eq!(tq2.to_string(), "11"); // 6+5
+
+        // DELETE → all 3 update
+        Spi::run("DELETE FROM multi_src WHERE amount = 100").expect("delete");
+
+        let p_total3 = Spi::get_one::<pgrx::AnyNumeric>(
+            "SELECT total FROM multi_v1 WHERE city = 'Paris'",
+        ).expect("q").expect("v");
+        assert_eq!(p_total3.to_string(), "250"); // 200+50
+
+        let p_cnt3 = Spi::get_one::<i64>(
+            "SELECT cnt FROM multi_v2 WHERE city = 'Paris'",
+        ).expect("q").expect("v");
+        assert_eq!(p_cnt3, 2);
+
+        let tq3 = Spi::get_one::<pgrx::AnyNumeric>(
+            "SELECT total_qty FROM multi_v3",
+        ).expect("q").expect("v");
+        assert_eq!(tq3.to_string(), "9"); // 11-2
+
+        // UPDATE → all 3 update
+        Spi::run("UPDATE multi_src SET amount = 999, qty = 10 WHERE city = 'London'")
+            .expect("update");
+
+        let l_total = Spi::get_one::<pgrx::AnyNumeric>(
+            "SELECT total FROM multi_v1 WHERE city = 'London'",
+        ).expect("q").expect("v");
+        assert_eq!(l_total.to_string(), "999");
+
+        let tq4 = Spi::get_one::<pgrx::AnyNumeric>(
+            "SELECT total_qty FROM multi_v3",
+        ).expect("q").expect("v");
+        assert_eq!(tq4.to_string(), "18"); // 9 - 1 + 10
+
+        // Verify consolidated triggers: 3 IMVs on same source → only 4 triggers (not 12)
+        let trig_count = Spi::get_one::<i64>(
+            "SELECT COUNT(*) FROM pg_trigger WHERE tgname LIKE '__reflex_trigger_%_on_multi_src'",
+        ).expect("q").expect("v");
+        assert_eq!(trig_count, 4); // ins, del, upd, trunc — shared by all 3 IMVs
+    }
+
+    #[pg_test]
+    fn test_4_level_cascade_chain() {
+        // 4-level chain: base → L1 → L2 → L3 → L4
+        // Each level aggregates differently to exercise the cascade.
+        Spi::run(
+            "CREATE TABLE chain4_src (id SERIAL, region TEXT, city TEXT, amount NUMERIC)",
+        ).expect("create table");
+        Spi::run(
+            "INSERT INTO chain4_src (region, city, amount) VALUES \
+             ('US', 'NYC', 100), ('US', 'LA', 200), \
+             ('EU', 'London', 300), ('EU', 'Paris', 400)",
+        ).expect("seed");
+
+        // L1: SUM by region+city (keeps full granularity)
+        crate::create_reflex_ivm(
+            "chain4_l1",
+            "SELECT region, city, SUM(amount) AS city_total FROM chain4_src GROUP BY region, city",
+        );
+
+        // L2: SUM by region (rolls up cities)
+        crate::create_reflex_ivm(
+            "chain4_l2",
+            "SELECT region, SUM(city_total) AS region_total FROM chain4_l1 GROUP BY region",
+        );
+
+        // L3: COUNT of regions (how many regions have data)
+        crate::create_reflex_ivm(
+            "chain4_l3",
+            "SELECT COUNT(*) AS num_regions FROM chain4_l2",
+        );
+
+        // L4: passthrough of L3 (tests cascading through passthrough)
+        crate::create_reflex_ivm(
+            "chain4_l4",
+            "SELECT num_regions FROM chain4_l3",
+        );
+
+        // Verify initial state across all levels
+        let nyc = Spi::get_one::<pgrx::AnyNumeric>(
+            "SELECT city_total FROM chain4_l1 WHERE city = 'NYC'",
+        ).expect("q").expect("v");
+        assert_eq!(nyc.to_string(), "100");
+
+        let us = Spi::get_one::<pgrx::AnyNumeric>(
+            "SELECT region_total FROM chain4_l2 WHERE region = 'US'",
+        ).expect("q").expect("v");
+        assert_eq!(us.to_string(), "300"); // 100+200
+
+        let nr = Spi::get_one::<i64>(
+            "SELECT num_regions FROM chain4_l3",
+        ).expect("q").expect("v");
+        assert_eq!(nr, 2); // US, EU
+
+        let nr4 = Spi::get_one::<i64>(
+            "SELECT num_regions FROM chain4_l4",
+        ).expect("q").expect("v");
+        assert_eq!(nr4, 2);
+
+        // INSERT into base → all 4 levels update
+        Spi::run(
+            "INSERT INTO chain4_src (region, city, amount) VALUES ('US', 'NYC', 50)",
+        ).expect("insert");
+
+        let nyc2 = Spi::get_one::<pgrx::AnyNumeric>(
+            "SELECT city_total FROM chain4_l1 WHERE city = 'NYC'",
+        ).expect("q").expect("v");
+        assert_eq!(nyc2.to_string(), "150"); // 100+50
+
+        let us2 = Spi::get_one::<pgrx::AnyNumeric>(
+            "SELECT region_total FROM chain4_l2 WHERE region = 'US'",
+        ).expect("q").expect("v");
+        assert_eq!(us2.to_string(), "350"); // 150+200
+
+        // Still 2 regions
+        let nr2 = Spi::get_one::<i64>(
+            "SELECT num_regions FROM chain4_l4",
+        ).expect("q").expect("v");
+        assert_eq!(nr2, 2);
+
+        // INSERT a new region → L3/L4 should show 3
+        Spi::run(
+            "INSERT INTO chain4_src (region, city, amount) VALUES ('ASIA', 'Tokyo', 500)",
+        ).expect("insert new region");
+
+        let nr3 = Spi::get_one::<i64>(
+            "SELECT num_regions FROM chain4_l3",
+        ).expect("q").expect("v");
+        assert_eq!(nr3, 3);
+
+        let nr3_l4 = Spi::get_one::<i64>(
+            "SELECT num_regions FROM chain4_l4",
+        ).expect("q").expect("v");
+        assert_eq!(nr3_l4, 3);
+
+        // DELETE all rows for ASIA → region disappears, back to 2
+        Spi::run("DELETE FROM chain4_src WHERE region = 'ASIA'").expect("delete region");
+
+        let nr_del = Spi::get_one::<i64>(
+            "SELECT num_regions FROM chain4_l4",
+        ).expect("q").expect("v");
+        assert_eq!(nr_del, 2);
+
+        // Verify EU region total unchanged through all operations
+        let eu = Spi::get_one::<pgrx::AnyNumeric>(
+            "SELECT region_total FROM chain4_l2 WHERE region = 'EU'",
+        ).expect("q").expect("v");
+        assert_eq!(eu.to_string(), "700"); // 300+400
     }
 }
 

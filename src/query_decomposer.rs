@@ -12,15 +12,6 @@ pub fn bare_column_name(col: &str) -> &str {
     col.rsplit('.').next().unwrap_or(col)
 }
 
-/// Temp table name holding new rows delta, accessible from called functions.
-pub fn delta_table_new(view_name: &str) -> String {
-    format!("__reflex_delta_new_{}", view_name)
-}
-
-/// Temp table name holding old rows delta, accessible from called functions.
-pub fn delta_table_old(view_name: &str) -> String {
-    format!("__reflex_delta_old_{}", view_name)
-}
 
 /// Replace a SQL identifier with another, respecting word boundaries.
 /// Only replaces when the match is NOT part of a longer identifier

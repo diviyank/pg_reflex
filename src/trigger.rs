@@ -1,7 +1,7 @@
 use pgrx::prelude::*;
 
 use crate::aggregation::AggregationPlan;
-use crate::query_decomposer::{bare_column_name, delta_table_new, delta_table_old, intermediate_table_name};
+use crate::query_decomposer::{bare_column_name, intermediate_table_name};
 
 /// Whether a delta adds or subtracts from the intermediate table.
 #[derive(Clone, Copy)]
@@ -159,8 +159,9 @@ pub fn reflex_build_delta_sql(
     };
 
     let intermediate_tbl = intermediate_table_name(view_name);
-    let new_tbl = delta_table_new(view_name);
-    let old_tbl = delta_table_old(view_name);
+    let safe_src = source_table.replace('.', "_").replace('"', "");
+    let new_tbl = format!("__reflex_delta_new_{}", safe_src);
+    let old_tbl = format!("__reflex_delta_old_{}", safe_src);
 
     let mut stmts: Vec<String> = Vec::new();
 
