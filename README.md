@@ -1,0 +1,345 @@
+# pg_reflex
+
+**Incremental View Maintenance for PostgreSQL** -- keep your aggregated views fresh in real-time, without full refreshes.
+
+pg_reflex is a PostgreSQL extension that maintains materialized views incrementally. When source data changes (INSERT, UPDATE, DELETE), only the affected groups are recomputed -- not the entire dataset. This turns O(N) `REFRESH MATERIALIZED VIEW` into O(delta) trigger-based updates.
+
+## Quick Start
+
+```sql
+-- Install the extension
+CREATE EXTENSION pg_reflex;
+
+-- Create a source table
+CREATE TABLE sales (
+    id SERIAL PRIMARY KEY,
+    region TEXT,
+    amount NUMERIC
+);
+INSERT INTO sales (region, amount) VALUES
+    ('US', 100), ('US', 200), ('EU', 150);
+
+-- Create an incremental materialized view
+SELECT create_reflex_ivm(
+    'sales_by_region',
+    'SELECT region, SUM(amount) AS total FROM sales GROUP BY region'
+);
+
+-- Query the view (it's a regular table)
+SELECT * FROM sales_by_region;
+--  region | total
+-- --------+-------
+--  US     |   300
+--  EU     |   150
+
+-- Insert new data -- the view updates automatically via triggers
+INSERT INTO sales (region, amount) VALUES ('US', 50), ('EU', 200);
+
+SELECT * FROM sales_by_region;
+--  region | total
+-- --------+-------
+--  US     |   350
+--  EU     |   350
+
+-- Deletes and updates also propagate
+DELETE FROM sales WHERE amount = 100;
+SELECT * FROM sales_by_region;
+--  region | total
+-- --------+-------
+--  US     |   250
+--  EU     |   350
+```
+
+## Installation
+
+### Prerequisites
+
+- PostgreSQL 13-18
+- Rust toolchain (stable)
+- [pgrx](https://github.com/pgcentralfoundation/pgrx) v0.16.1
+
+### Build & Install
+
+```bash
+# Install pgrx if you haven't
+cargo install cargo-pgrx --version 0.16.1
+cargo pgrx init --pg17 $(which pg_config)  # adjust for your PG version
+
+# Build and install
+cargo pgrx install --release
+
+# Or run a development instance
+cargo pgrx run pg17
+```
+
+Then in psql:
+```sql
+CREATE EXTENSION pg_reflex;
+```
+
+## API Reference
+
+### `create_reflex_ivm(view_name TEXT, sql TEXT) -> TEXT`
+
+Creates an incrementally maintained view from a SELECT query.
+
+**Parameters:**
+- `view_name` -- Name for the resulting view table
+- `sql` -- A SELECT query with GROUP BY, aggregate functions, or DISTINCT
+
+**Returns:** `'CREATE REFLEX INCREMENTAL VIEW'` on success, or an error string.
+
+**What it creates:**
+1. An **intermediate table** (`__reflex_intermediate_{view_name}`) -- UNLOGGED, stores partial aggregate state (sufficient statistics)
+2. A **target table** (`{view_name}`) -- regular table you query, contains the final computed results
+3. **Triggers** on each source table (INSERT, DELETE, UPDATE) that keep the view in sync
+4. A **metadata entry** in `__reflex_ivm_reference` tracking the view's configuration
+
+```sql
+-- Passthrough (no aggregation) — complex JOINs/filters kept fresh via triggers
+SELECT create_reflex_ivm('active_orders',
+    'SELECT o.id, o.amount, p.name AS product_name
+     FROM orders o JOIN products p ON o.product_id = p.id
+     WHERE o.status = ''active''');
+
+-- Simple aggregation
+SELECT create_reflex_ivm('daily_totals',
+    'SELECT region, SUM(amount) AS total, COUNT(*) AS cnt
+     FROM orders GROUP BY region');
+
+-- Average (decomposed into SUM + COUNT internally)
+SELECT create_reflex_ivm('avg_salaries',
+    'SELECT dept, AVG(salary) AS avg_sal FROM employees GROUP BY dept');
+
+-- DISTINCT with reference counting
+SELECT create_reflex_ivm('unique_regions',
+    'SELECT DISTINCT region FROM orders');
+
+-- JOIN-based view
+SELECT create_reflex_ivm('dept_revenue',
+    'SELECT d.name, SUM(o.amount) AS revenue
+     FROM orders o JOIN departments d ON o.dept_id = d.id
+     GROUP BY d.name');
+
+-- MIN/MAX
+SELECT create_reflex_ivm('price_range',
+    'SELECT category, MIN(price) AS lo, MAX(price) AS hi
+     FROM products GROUP BY category');
+
+-- Multiple aggregates in one view
+SELECT create_reflex_ivm('full_stats',
+    'SELECT region,
+            SUM(amount) AS total,
+            COUNT(*) AS cnt,
+            AVG(amount) AS avg_amount,
+            MIN(amount) AS min_amount,
+            MAX(amount) AS max_amount
+     FROM orders GROUP BY region');
+
+-- CTE: each WITH clause becomes its own sub-IMV automatically
+SELECT create_reflex_ivm('top_regions',
+    'WITH regional AS (
+        SELECT region, SUM(amount) AS total FROM orders GROUP BY region
+    )
+    SELECT region, total FROM regional WHERE total > 1000');
+-- Creates: sub-IMV "top_regions__cte_regional" + VIEW "top_regions"
+
+-- Multi-level CTE (chained)
+SELECT create_reflex_ivm('region_summary',
+    'WITH by_city AS (
+        SELECT region, city, SUM(amount) AS city_total
+        FROM orders GROUP BY region, city
+    ),
+    by_region AS (
+        SELECT region, SUM(city_total) AS total, COUNT(*) AS num_cities
+        FROM by_city GROUP BY region
+    )
+    SELECT region, total, num_cities FROM by_region');
+-- Creates: sub-IMV "region_summary__cte_by_city",
+--          sub-IMV "region_summary__cte_by_region" (depends on by_city),
+--          VIEW "region_summary"
+```
+
+## Supported SQL Features
+
+### Aggregate Functions
+
+| Function | Incremental on INSERT | Incremental on DELETE | Notes |
+|----------|:---:|:---:|-------|
+| `SUM(x)` | Yes | Yes | Additive -- stores running sum |
+| `COUNT(x)` | Yes | Yes | Additive -- stores running count |
+| `COUNT(*)` | Yes | Yes | Additive -- stores running count |
+| `AVG(x)` | Yes | Yes | Decomposed to SUM + COUNT, recomputed as SUM/COUNT |
+| `MIN(x)` | Yes | Recomputes group | Uses LEAST on insert; full group rescan on delete |
+| `MAX(x)` | Yes | Recomputes group | Uses GREATEST on insert; full group rescan on delete |
+| `DISTINCT` | Yes | Yes | Reference counting (`__ivm_count`) tracks multiplicity |
+
+### Query Clauses
+
+| Clause | Supported | Notes |
+|--------|:---------:|-------|
+| Passthrough (no agg) | Yes | Complex JOINs/filters without GROUP BY. INSERT is incremental (O(delta)); DELETE/UPDATE do full refresh from source |
+| `GROUP BY` | Yes | Required for aggregate queries |
+| `WHERE` | Yes | Static filters only (no `NOW()` or `RANDOM()`) |
+| `JOIN` (INNER) | Yes | Triggers created on each source table |
+| `LEFT/RIGHT JOIN` | Yes | Parsed and used, same trigger mechanism |
+| `HAVING` | Parsed | Stored in metadata, not yet applied in triggers |
+| `DISTINCT` | Yes | Without GROUP BY, columns become implicit group keys |
+| `CTE (WITH)` | Yes | Each CTE becomes a sub-IMV; passthrough main body becomes a VIEW |
+| `WITH RECURSIVE` | No | Recursive CTEs cannot be decomposed into static IMV layers |
+| `LIMIT` | No | Rejected -- not meaningful for materialized views |
+| `ORDER BY` | No | Rejected -- the target table is unordered |
+| `WINDOW functions` | No | Rejected -- not incrementally maintainable |
+| `Subqueries in FROM` | Parsed | Tracked as `<subquery:alias>` |
+
+## How It Works
+
+### Architecture
+
+```
+Source Table(s)
+    |
+    | AFTER INSERT/UPDATE/DELETE triggers
+    v
++-------------------+     +--------------------+
+| Intermediate Table| --> | Target Table       |
+| (UNLOGGED)        |     | (your view)        |
+|                   |     |                    |
+| Stores partial    |     | Final query result |
+| aggregates:       |     | users SELECT from  |
+| __sum_x, __count_x|     | this table         |
+| __ivm_count       |     |                    |
++-------------------+     +--------------------+
+```
+
+### Delta Processing
+
+When you INSERT, UPDATE, or DELETE rows in a source table:
+
+1. **Statement-level triggers** fire (one per operation type)
+2. The trigger copies the **transition table** (new/old rows) into a temp table
+3. A Rust function generates **UPSERT SQL** from the stored `base_query`, replacing the source table with the delta temp table
+4. The UPSERT merges the delta into the **intermediate table** using `ON CONFLICT DO UPDATE SET`:
+   - For INSERT: `__sum_x = intermediate.__sum_x + delta.__sum_x`
+   - For DELETE: `__sum_x = intermediate.__sum_x - delta.__sum_x`
+   - For UPDATE: subtract old values, then add new values
+5. The **target table** is refreshed from the intermediate table using the stored `end_query`
+6. `__ivm_count` tracks how many source rows contribute to each group -- groups with `__ivm_count = 0` are excluded from the target
+
+### Sufficient Statistics
+
+Instead of storing raw data, pg_reflex stores the minimum state needed to maintain each aggregate:
+
+| User writes | Intermediate stores | Target computes |
+|---|---|---|
+| `AVG(salary)` | `__sum_salary` + `__count_salary` | `__sum_salary / __count_salary` |
+| `COUNT(*)` | `__count_star` | `__count_star` |
+| `DISTINCT col` | `col` + `__ivm_count` | `col WHERE __ivm_count > 0` |
+
+### Dependency Graph
+
+IMVs can depend on other IMVs. pg_reflex tracks this via `graph_depth` and `graph_child` in the metadata table:
+
+```sql
+-- L1: depends on base table (depth = 1)
+SELECT create_reflex_ivm('daily_totals',
+    'SELECT date, SUM(amount) AS total FROM sales GROUP BY date');
+
+-- L2: depends on L1 (depth = 2)
+SELECT create_reflex_ivm('monthly_totals',
+    'SELECT date_trunc(''month'', date) AS month, SUM(total) AS grand_total
+     FROM daily_totals GROUP BY date_trunc(''month'', date)');
+```
+
+> **Note:** Multi-level cascading propagation (L1 triggers automatically updating L2) is a known v1 limitation. Single-level trigger propagation works correctly. For chained views, a manual refresh of downstream views may be needed after bulk operations.
+
+## Metadata & Introspection
+
+All IMV metadata is stored in `public.__reflex_ivm_reference`:
+
+```sql
+SELECT name, graph_depth, depends_on, enabled, last_update_date
+FROM public.__reflex_ivm_reference;
+
+--        name       | graph_depth |  depends_on   | enabled |     last_update_date
+-- ------------------+-------------+---------------+---------+--------------------------
+--  sales_by_region  |           1 | {sales}       | t       | 2025-01-15 10:30:00
+--  dept_revenue     |           1 | {orders,departments} | t | 2025-01-15 10:31:00
+```
+
+Useful columns:
+- `base_query` -- the query that computes partial aggregates from source data
+- `end_query` -- the query that computes final results from the intermediate table
+- `aggregations` -- JSON describing the aggregation plan (column mappings, types)
+- `depends_on` -- source tables this view reads from
+- `depends_on_imv` -- other IMVs this view depends on
+- `graph_child` -- downstream IMVs that depend on this one
+
+## Testing
+
+```bash
+# Run all tests (47 unit + 25 integration)
+cargo test
+
+# Run only unit tests (no PostgreSQL required)
+cargo test --lib -- --skip pg_test
+
+# Run integration tests against PostgreSQL 17
+cargo pgrx test pg17
+```
+
+## Benchmarks
+
+Benchmark scripts are in `benchmarks/`. See [`benchmarks/README.md`](benchmarks/README.md) for details.
+
+```bash
+cargo pgrx run pg17
+# In another terminal:
+psql -f benchmarks/setup.sql
+psql -f benchmarks/bench_sum.sql
+psql -f benchmarks/bench_baseline.sql
+psql -f benchmarks/teardown.sql
+```
+
+### Performance Summary (SUM aggregate, single machine)
+
+| Operation | 1K rows | 10K rows | 100K rows | 1M rows |
+|---|---:|---:|---:|---:|
+| Batch INSERT (1K rows) | 13 ms | 11 ms | 12 ms | 11 ms |
+| Single INSERT | 5 ms | 4 ms | 4 ms | 4 ms |
+| UPDATE (100 rows) | 10 ms | 10 ms | 15 ms | 59 ms |
+| DELETE (100 rows) | 5 ms | 6 ms | 10 ms | 59 ms |
+
+Key insight: **INSERT latency is constant regardless of table size** -- the trigger only processes the delta rows, not the full table.
+
+## Known Limitations
+
+- **Multi-level cascading:** Chained IMVs (A triggers B triggers C) require explicit graph traversal, not yet implemented. Single-level propagation works. CTE-based views use VIEWs for the outer layer which avoids this issue.
+- **Passthrough DELETE/UPDATE:** For passthrough IMVs (no aggregation), DELETE and UPDATE triggers do a full refresh from source (O(N)). INSERT is incremental (O(delta)). Aggregate IMVs are fully incremental for all operations.
+- **CTE passthrough requirement:** Each CTE must contain GROUP BY, aggregation, or DISTINCT. Passthrough CTEs (`WITH filtered AS (SELECT * FROM t WHERE ...)`) are not yet supported as sub-IMVs.
+- **Recursive CTEs:** `WITH RECURSIVE` is not supported.
+- **MIN/MAX on DELETE:** Requires full group rescan from the source table (no algebraic inverse for extrema).
+- **Non-deterministic functions:** `NOW()`, `RANDOM()`, `CURRENT_DATE` in WHERE clauses are not supported -- the view definition must be static.
+- **TRUNCATE:** Does not fire INSERT/UPDATE/DELETE triggers. A separate TRUNCATE trigger is needed (not yet implemented).
+- **NULL group keys:** PostgreSQL's `ON CONFLICT` does not match `NULL = NULL`. NULL values in GROUP BY columns are not supported.
+- **No DROP/ALTER:** There is no `drop_reflex_ivm()` function yet. To remove an IMV, manually drop the target table, intermediate table, triggers, and the metadata row.
+- **Target table refresh:** Currently does `DELETE all + INSERT all` from intermediate. A targeted refresh (only affected groups) would improve UPDATE/DELETE latency at large scales.
+
+## Project Structure
+
+```
+src/
+  lib.rs               -- Extension entry point, create_reflex_ivm, integration tests
+  sql_analyzer.rs       -- SQL parsing: extracts GROUP BY, aggregates, JOINs, WHERE
+  aggregation.rs        -- Maps user aggregates to sufficient statistics
+  query_decomposer.rs   -- Generates base_query (source->intermediate) and end_query (intermediate->target)
+  schema_builder.rs     -- DDL generation: tables, indexes, triggers
+  trigger.rs            -- Delta processing: UPSERT SQL generation, target refresh
+  bin/pgrx_embed.rs     -- pgrx binary entry point
+benchmarks/             -- SQL benchmark scripts (1K to 1M rows)
+tests/pg_regress/       -- PostgreSQL regression tests
+```
+
+## License
+
+TBD
