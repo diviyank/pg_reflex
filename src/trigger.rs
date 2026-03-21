@@ -140,6 +140,43 @@ pub fn build_min_max_recompute_sql(
 }
 
 
+/// Build the group column list for targeted refresh.
+/// Returns quoted column names from group_by + distinct columns (bare names).
+/// Returns None if there are no group columns (sentinel-only case).
+fn group_columns(plan: &AggregationPlan) -> Option<Vec<String>> {
+    let cols: Vec<String> = plan
+        .group_by_columns
+        .iter()
+        .chain(plan.distinct_columns.iter())
+        .map(|c| format!("\"{}\"", bare_column_name(c)))
+        .collect();
+    if cols.is_empty() {
+        None
+    } else {
+        Some(cols)
+    }
+}
+
+/// Build SELECT DISTINCT clause that casts group columns to text.
+/// The intermediate/target tables may store group columns as TEXT
+/// (due to type resolution), so we cast from the delta query to match.
+fn affected_groups_select(cols: &[String]) -> String {
+    cols.iter()
+        .map(|c| format!("{}::text AS {}", c, c))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Build a row-value expression for WHERE ... IN clauses.
+/// Single column: "col"   Multi-column: ("col1", "col2")
+fn row_expr(cols: &[String]) -> String {
+    if cols.len() == 1 {
+        cols[0].clone()
+    } else {
+        format!("({})", cols.join(", "))
+    }
+}
+
 /// Generates the SQL statements to apply a delta to an IMV.
 ///
 /// Called from plpgsql trigger wrappers. Returns a delimiter-separated string
@@ -185,13 +222,44 @@ pub fn reflex_build_delta_sql(
             .iter()
             .any(|ic| ic.source_aggregate == "MIN" || ic.source_aggregate == "MAX");
 
+        // Determine if we can use targeted refresh (need group columns)
+        let grp_cols = group_columns(&plan);
+        let affected_tbl = format!("__reflex_affected_{}", view_name);
+
         match operation {
             "INSERT" => {
                 let delta_q = base_query.replace(source_table, &format!("\"{}\"", new_tbl));
+
+                // Create temp table with affected group keys before UPSERT
+                if let Some(ref cols) = grp_cols {
+                    let select_expr = affected_groups_select(cols);
+                    stmts.push(format!(
+                        "DROP TABLE IF EXISTS \"{}\"",
+                        affected_tbl
+                    ));
+                    stmts.push(format!(
+                        "CREATE TEMP TABLE \"{}\" AS SELECT DISTINCT {} FROM ({}) _d",
+                        affected_tbl, select_expr, delta_q
+                    ));
+                }
+
                 stmts.push(build_upsert_sql(&intermediate_tbl, &delta_q, &plan, DeltaOp::Add));
             }
             "DELETE" => {
                 let delta_q = base_query.replace(source_table, &format!("\"{}\"", old_tbl));
+
+                if let Some(ref cols) = grp_cols {
+                    let select_expr = affected_groups_select(cols);
+                    stmts.push(format!(
+                        "DROP TABLE IF EXISTS \"{}\"",
+                        affected_tbl
+                    ));
+                    stmts.push(format!(
+                        "CREATE TEMP TABLE \"{}\" AS SELECT DISTINCT {} FROM ({}) _d",
+                        affected_tbl, select_expr, delta_q
+                    ));
+                }
+
                 stmts.push(build_upsert_sql(&intermediate_tbl, &delta_q, &plan, DeltaOp::Subtract));
                 if has_min_max {
                     if let Some(recompute) = build_min_max_recompute_sql(&intermediate_tbl, &plan, source_table) {
@@ -201,23 +269,55 @@ pub fn reflex_build_delta_sql(
             }
             "UPDATE" => {
                 let delta_old = base_query.replace(source_table, &format!("\"{}\"", old_tbl));
+                let delta_new = base_query.replace(source_table, &format!("\"{}\"", new_tbl));
+
+                // Union of affected groups from both old and new
+                if let Some(ref cols) = grp_cols {
+                    let select_expr = affected_groups_select(cols);
+                    stmts.push(format!(
+                        "DROP TABLE IF EXISTS \"{}\"",
+                        affected_tbl
+                    ));
+                    stmts.push(format!(
+                        "CREATE TEMP TABLE \"{}\" AS SELECT DISTINCT {} FROM ({}) _d UNION SELECT DISTINCT {} FROM ({}) _d",
+                        affected_tbl, select_expr, delta_old, select_expr, delta_new
+                    ));
+                }
+
                 stmts.push(build_upsert_sql(&intermediate_tbl, &delta_old, &plan, DeltaOp::Subtract));
                 if has_min_max {
                     if let Some(recompute) = build_min_max_recompute_sql(&intermediate_tbl, &plan, source_table) {
                         stmts.push(recompute);
                     }
                 }
-                let delta_new = base_query.replace(source_table, &format!("\"{}\"", new_tbl));
                 stmts.push(build_upsert_sql(&intermediate_tbl, &delta_new, &plan, DeltaOp::Add));
             }
             _ => {}
         }
 
         // Refresh target from intermediate
-        // TRUNCATE is ~46x faster than DELETE at 1M rows (13ms vs 600ms)
-        // Trade-off: AccessExclusiveLock (blocks concurrent readers during trigger txn)
-        stmts.push(format!("TRUNCATE \"{}\"", view_name));
-        stmts.push(format!("INSERT INTO \"{}\" {}", view_name, end_query));
+        if let Some(ref cols) = grp_cols {
+            // Targeted refresh: only update groups that changed
+            let cols_str = cols.join(", ");
+            let row = row_expr(cols);
+
+            stmts.push(format!(
+                "DELETE FROM \"{}\" WHERE {} IN (SELECT {} FROM \"{}\")",
+                view_name, row, cols_str, affected_tbl
+            ));
+            stmts.push(format!(
+                "INSERT INTO \"{}\" {} AND {} IN (SELECT {} FROM \"{}\")",
+                view_name, end_query, row, cols_str, affected_tbl
+            ));
+            stmts.push(format!(
+                "DROP TABLE IF EXISTS \"{}\"",
+                affected_tbl
+            ));
+        } else {
+            // No group columns (sentinel-only): full refresh
+            stmts.push(format!("TRUNCATE \"{}\"", view_name));
+            stmts.push(format!("INSERT INTO \"{}\" {}", view_name, end_query));
+        }
     }
 
     // Update last_update_date
