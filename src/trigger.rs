@@ -160,8 +160,10 @@ pub fn reflex_build_delta_sql(
 
     let intermediate_tbl = intermediate_table_name(view_name);
     let safe_src = source_table.replace('.', "_").replace('"', "");
-    let new_tbl = format!("__reflex_delta_new_{}", safe_src);
-    let old_tbl = format!("__reflex_delta_old_{}", safe_src);
+    // Use the transition table names directly (no temp table copy needed).
+    // Transition tables are visible in plpgsql EXECUTE context.
+    let new_tbl = format!("__reflex_new_{}", safe_src);
+    let old_tbl = format!("__reflex_old_{}", safe_src);
 
     let mut stmts: Vec<String> = Vec::new();
 
@@ -212,7 +214,9 @@ pub fn reflex_build_delta_sql(
         }
 
         // Refresh target from intermediate
-        stmts.push(format!("DELETE FROM \"{}\"", view_name));
+        // TRUNCATE is ~46x faster than DELETE at 1M rows (13ms vs 600ms)
+        // Trade-off: AccessExclusiveLock (blocks concurrent readers during trigger txn)
+        stmts.push(format!("TRUNCATE \"{}\"", view_name));
         stmts.push(format!("INSERT INTO \"{}\" {}", view_name, end_query));
     }
 

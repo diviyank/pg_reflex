@@ -152,24 +152,19 @@ pub fn build_indexes_ddl(view_name: &str, plan: &AggregationPlan) -> Vec<String>
 /// wrapper function and a statement-level trigger. One set of triggers per source table
 /// handles ALL dependent IMVs via a FOR loop over the reference table.
 ///
-/// The wrapper copies transition table data into temp tables (because transition
-/// tables are only visible within the trigger function's direct SQL context, not
-/// in functions called from it via SPI), then loops over all dependent IMVs and
-/// calls `reflex_build_delta_sql` for each.
+/// Transition tables are referenced directly in EXECUTE context (no temp table copy).
 pub fn build_trigger_ddls(source_table: &str) -> Vec<String> {
     let safe_source = source_table.replace('.', "_");
     let ref_new = format!("__reflex_new_{}", safe_source);
     let ref_old = format!("__reflex_old_{}", safe_source);
-    let delta_new = format!("__reflex_delta_new_{}", safe_source);
-    let delta_old = format!("__reflex_delta_old_{}", safe_source);
 
     // Core loop body shared by INSERT/DELETE/UPDATE triggers.
-    // {copy_transition} is replaced per-operation, {op} is replaced per-operation.
+    // {op} is replaced per-operation.
     // The FOR loop iterates over all IMVs that depend on this source.
+    // Transition tables are visible in plpgsql EXECUTE context, no copy needed.
     let body_core = format!(
         "DECLARE _rec RECORD; _sql TEXT; _stmt TEXT; \
          BEGIN \
-           {{copy_transition}} \
            FOR _rec IN \
              SELECT name, base_query, end_query, aggregations::text AS aggregations \
              FROM public.__reflex_ivm_reference \
@@ -191,15 +186,7 @@ pub fn build_trigger_ddls(source_table: &str) -> Vec<String> {
     // INSERT
     let ins_fn = format!("__reflex_ins_trigger_on_{}", safe_source);
     let ins_trig = format!("__reflex_trigger_ins_on_{}", safe_source);
-    let ins_body = body_core
-        .replace("{op}", "INSERT")
-        .replace(
-            "{copy_transition}",
-            &format!(
-                "DROP TABLE IF EXISTS \"{delta_new}\"; \
-                 CREATE TEMP TABLE \"{delta_new}\" ON COMMIT DROP AS SELECT * FROM \"{ref_new}\";"
-            ),
-        );
+    let ins_body = body_core.replace("{op}", "INSERT");
     let ins_ddl = format!(
         "CREATE OR REPLACE FUNCTION {ins_fn}() RETURNS TRIGGER AS $fn$ {ins_body} $fn$ LANGUAGE plpgsql;\n\
          CREATE OR REPLACE TRIGGER \"{ins_trig}\" \
@@ -211,15 +198,7 @@ pub fn build_trigger_ddls(source_table: &str) -> Vec<String> {
     // DELETE
     let del_fn = format!("__reflex_del_trigger_on_{}", safe_source);
     let del_trig = format!("__reflex_trigger_del_on_{}", safe_source);
-    let del_body = body_core
-        .replace("{op}", "DELETE")
-        .replace(
-            "{copy_transition}",
-            &format!(
-                "DROP TABLE IF EXISTS \"{delta_old}\"; \
-                 CREATE TEMP TABLE \"{delta_old}\" ON COMMIT DROP AS SELECT * FROM \"{ref_old}\";"
-            ),
-        );
+    let del_body = body_core.replace("{op}", "DELETE");
     let del_ddl = format!(
         "CREATE OR REPLACE FUNCTION {del_fn}() RETURNS TRIGGER AS $fn$ {del_body} $fn$ LANGUAGE plpgsql;\n\
          CREATE OR REPLACE TRIGGER \"{del_trig}\" \
@@ -231,17 +210,7 @@ pub fn build_trigger_ddls(source_table: &str) -> Vec<String> {
     // UPDATE
     let upd_fn = format!("__reflex_upd_trigger_on_{}", safe_source);
     let upd_trig = format!("__reflex_trigger_upd_on_{}", safe_source);
-    let upd_body = body_core
-        .replace("{op}", "UPDATE")
-        .replace(
-            "{copy_transition}",
-            &format!(
-                "DROP TABLE IF EXISTS \"{delta_new}\"; \
-                 CREATE TEMP TABLE \"{delta_new}\" ON COMMIT DROP AS SELECT * FROM \"{ref_new}\"; \
-                 DROP TABLE IF EXISTS \"{delta_old}\"; \
-                 CREATE TEMP TABLE \"{delta_old}\" ON COMMIT DROP AS SELECT * FROM \"{ref_old}\";"
-            ),
-        );
+    let upd_body = body_core.replace("{op}", "UPDATE");
     let upd_ddl = format!(
         "CREATE OR REPLACE FUNCTION {upd_fn}() RETURNS TRIGGER AS $fn$ {upd_body} $fn$ LANGUAGE plpgsql;\n\
          CREATE OR REPLACE TRIGGER \"{upd_trig}\" \
@@ -388,22 +357,20 @@ mod tests {
     fn test_trigger_ddls_format() {
         let ddls = build_trigger_ddls("orders");
         assert_eq!(ddls.len(), 4);
-        // INSERT trigger: copies transition table to temp, loops over IMVs
+        // INSERT trigger: references transition table directly, loops over IMVs
         assert!(ddls[0].contains("AFTER INSERT ON orders"));
         assert!(ddls[0].contains("REFERENCING NEW TABLE AS"));
-        assert!(ddls[0].contains("__reflex_delta_new_orders"));
         assert!(ddls[0].contains("reflex_build_delta_sql"));
         assert!(ddls[0].contains("'INSERT'"));
         assert!(ddls[0].contains("FOR _rec IN"));
         assert!(ddls[0].contains("__reflex_ins_trigger_on_orders"));
+        // No temp table copy (transition tables used directly)
+        assert!(!ddls[0].contains("CREATE TEMP TABLE"));
         // DELETE trigger
         assert!(ddls[1].contains("AFTER DELETE ON orders"));
-        assert!(ddls[1].contains("__reflex_delta_old_orders"));
         assert!(ddls[1].contains("'DELETE'"));
         // UPDATE trigger
         assert!(ddls[2].contains("AFTER UPDATE ON orders"));
-        assert!(ddls[2].contains("__reflex_delta_new_orders"));
-        assert!(ddls[2].contains("__reflex_delta_old_orders"));
         assert!(ddls[2].contains("'UPDATE'"));
         // TRUNCATE trigger
         assert!(ddls[3].contains("AFTER TRUNCATE ON orders"));
