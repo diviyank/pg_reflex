@@ -345,20 +345,20 @@ fn query_column_types_from_catalog(
             ("public", table.as_str())
         };
         let query = format!(
-            "SELECT column_name, data_type FROM information_schema.columns \
+            "SELECT column_name::text AS col_name, data_type::text AS data_type \
+             FROM information_schema.columns \
              WHERE table_schema = '{}' AND table_name = '{}'",
             schema, tbl
         );
         let rows = client
             .select(&query, None, &[])
-            .unwrap_or_report()
-            .collect::<Vec<_>>();
-        for row in &rows {
+            .unwrap_or_report();
+        for row in rows {
             if let (Some(col_name), Some(data_type)) = (
-                row.get_by_name::<&str, _>("column_name").unwrap_or(None),
-                row.get_by_name::<&str, _>("data_type").unwrap_or(None),
+                row.get_by_name::<String, _>("col_name").unwrap_or(None),
+                row.get_by_name::<String, _>("data_type").unwrap_or(None),
             ) {
-                let pg_type = map_information_schema_type(data_type);
+                let pg_type = map_information_schema_type(&data_type);
                 types.insert(format!("{}.{}", tbl, col_name), pg_type.clone());
                 // Also insert bare column name for simpler lookups
                 types.entry(col_name.to_string()).or_insert(pg_type);
@@ -2092,6 +2092,248 @@ mod tests {
             "SELECT region_total FROM chain4_l2 WHERE region = 'EU'",
         ).expect("q").expect("v");
         assert_eq!(eu.to_string(), "700"); // 300+400
+    }
+
+    // ================================================================
+    // Targeted refresh correctness tests
+    // ================================================================
+
+    /// Test that INSERT creates new groups and updates existing groups correctly.
+    #[pg_test]
+    fn pg_test_targeted_refresh_insert_correctness() {
+        // Setup: 100 rows across 10 groups (group_id 0..9, 10 rows each)
+        Spi::run("CREATE TABLE tr_src (id SERIAL, group_id INT NOT NULL, amount NUMERIC NOT NULL)").expect("create");
+        Spi::run(
+            "INSERT INTO tr_src (group_id, amount) \
+             SELECT i % 10, (i * 7 % 100)::numeric FROM generate_series(1, 100) i"
+        ).expect("seed");
+
+        Spi::run(
+            "SELECT create_reflex_ivm('tr_insert_test', \
+             'SELECT group_id, SUM(amount) AS total, COUNT(*) AS cnt FROM tr_src GROUP BY group_id')"
+        ).expect("create imv");
+
+        // Verify 10 groups
+        let cnt = Spi::get_one::<i64>("SELECT COUNT(*) FROM tr_insert_test").expect("q").expect("v");
+        assert_eq!(cnt, 10);
+
+        // INSERT 20 rows: 15 into existing groups (0..4), 5 into NEW groups (10..14)
+        Spi::run(
+            "INSERT INTO tr_src (group_id, amount) \
+             SELECT CASE WHEN i <= 15 THEN (i - 1) % 5 ELSE i - 16 + 10 END, 100.0 \
+             FROM generate_series(1, 20) i"
+        ).expect("insert");
+
+        // Now should have 15 groups (10 original + 5 new)
+        let cnt2 = Spi::get_one::<i64>("SELECT COUNT(*) FROM tr_insert_test").expect("q").expect("v");
+        assert_eq!(cnt2, 15);
+
+        // Verify correctness against direct query
+        let mismatches = Spi::get_one::<i64>(
+            "SELECT COUNT(*) FROM ( \
+                SELECT r.group_id::text FROM tr_insert_test r \
+                FULL OUTER JOIN (SELECT group_id, SUM(amount) AS total, COUNT(*) AS cnt FROM tr_src GROUP BY group_id) d \
+                    ON r.group_id::text = d.group_id::text \
+                WHERE r.total IS DISTINCT FROM d.total OR r.cnt IS DISTINCT FROM d.cnt \
+            ) x"
+        ).expect("q").expect("v");
+        assert_eq!(mismatches, 0, "IMV should match direct query after INSERT");
+    }
+
+    /// Test that DELETE removes groups when all their rows are deleted.
+    #[pg_test]
+    fn pg_test_targeted_refresh_delete_group_elimination() {
+        Spi::run("CREATE TABLE tr_del_src (id SERIAL, region TEXT NOT NULL, amount NUMERIC NOT NULL)").expect("create");
+        Spi::run("INSERT INTO tr_del_src (region, amount) VALUES ('A', 10), ('A', 20), ('A', 30)").expect("ins A");
+        Spi::run("INSERT INTO tr_del_src (region, amount) VALUES ('B', 40), ('B', 50)").expect("ins B");
+        Spi::run("INSERT INTO tr_del_src (region, amount) VALUES ('C', 60)").expect("ins C");
+
+        Spi::run(
+            "SELECT create_reflex_ivm('tr_del_test', \
+             'SELECT region, SUM(amount) AS total, COUNT(*) AS cnt FROM tr_del_src GROUP BY region')"
+        ).expect("create imv");
+
+        // 3 groups: A(60, 3), B(90, 2), C(60, 1)
+        let cnt = Spi::get_one::<i64>("SELECT COUNT(*) FROM tr_del_test").expect("q").expect("v");
+        assert_eq!(cnt, 3);
+
+        // Delete ALL rows from group B
+        Spi::run("DELETE FROM tr_del_src WHERE region = 'B'").expect("delete B");
+
+        // Group B should be gone
+        let cnt2 = Spi::get_one::<i64>("SELECT COUNT(*) FROM tr_del_test").expect("q").expect("v");
+        assert_eq!(cnt2, 2);
+
+        let has_b = Spi::get_one::<i64>(
+            "SELECT COUNT(*) FROM tr_del_test WHERE region = 'B'"
+        ).expect("q").expect("v");
+        assert_eq!(has_b, 0, "Group B should be eliminated");
+
+        // A and C should be unchanged
+        let a_total = Spi::get_one::<pgrx::AnyNumeric>(
+            "SELECT total FROM tr_del_test WHERE region = 'A'"
+        ).expect("q").expect("v");
+        assert_eq!(a_total.to_string(), "60");
+    }
+
+    /// Test that UPDATE correctly handles rows changing groups.
+    #[pg_test]
+    fn pg_test_targeted_refresh_update_group_change() {
+        Spi::run("CREATE TABLE tr_upd_src (id SERIAL, region TEXT NOT NULL, amount NUMERIC NOT NULL)").expect("create");
+        Spi::run("INSERT INTO tr_upd_src (region, amount) VALUES \
+                  ('East', 100), ('East', 200), ('West', 300), ('West', 400)").expect("seed");
+
+        Spi::run(
+            "SELECT create_reflex_ivm('tr_upd_test', \
+             'SELECT region, SUM(amount) AS total, COUNT(*) AS cnt FROM tr_upd_src GROUP BY region')"
+        ).expect("create imv");
+
+        // East=300(2), West=700(2)
+        let east = Spi::get_one::<pgrx::AnyNumeric>(
+            "SELECT total FROM tr_upd_test WHERE region = 'East'"
+        ).expect("q").expect("v");
+        assert_eq!(east.to_string(), "300");
+
+        // Move one East row to a NEW group "North"
+        Spi::run("UPDATE tr_upd_src SET region = 'North' WHERE id = 1").expect("update");
+
+        // East should lose 100 (now 200, cnt=1), North should appear (100, cnt=1), West unchanged
+        let east2 = Spi::get_one::<pgrx::AnyNumeric>(
+            "SELECT total FROM tr_upd_test WHERE region = 'East'"
+        ).expect("q").expect("v");
+        assert_eq!(east2.to_string(), "200");
+
+        let north = Spi::get_one::<pgrx::AnyNumeric>(
+            "SELECT total FROM tr_upd_test WHERE region = 'North'"
+        ).expect("q").expect("v");
+        assert_eq!(north.to_string(), "100");
+
+        let west = Spi::get_one::<pgrx::AnyNumeric>(
+            "SELECT total FROM tr_upd_test WHERE region = 'West'"
+        ).expect("q").expect("v");
+        assert_eq!(west.to_string(), "700");
+
+        let cnt = Spi::get_one::<i64>("SELECT COUNT(*) FROM tr_upd_test").expect("q").expect("v");
+        assert_eq!(cnt, 3);
+    }
+
+    /// Test targeted refresh with multi-column GROUP BY.
+    #[pg_test]
+    fn pg_test_targeted_refresh_multi_column_group() {
+        Spi::run("CREATE TABLE tr_mc_src (id SERIAL, region TEXT NOT NULL, category TEXT NOT NULL, amount NUMERIC NOT NULL)").expect("create");
+        Spi::run("INSERT INTO tr_mc_src (region, category, amount) VALUES \
+                  ('US', 'A', 10), ('US', 'B', 20), ('EU', 'A', 30), ('EU', 'B', 40)").expect("seed");
+
+        Spi::run(
+            "SELECT create_reflex_ivm('tr_mc_test', \
+             'SELECT region, category, SUM(amount) AS total FROM tr_mc_src GROUP BY region, category')"
+        ).expect("create imv");
+
+        // 4 groups: US-A(10), US-B(20), EU-A(30), EU-B(40)
+        let cnt = Spi::get_one::<i64>("SELECT COUNT(*) FROM tr_mc_test").expect("q").expect("v");
+        assert_eq!(cnt, 4);
+
+        // INSERT into existing group US-A and new group US-C
+        Spi::run("INSERT INTO tr_mc_src (region, category, amount) VALUES ('US', 'A', 5), ('US', 'C', 50)").expect("insert");
+
+        let cnt2 = Spi::get_one::<i64>("SELECT COUNT(*) FROM tr_mc_test").expect("q").expect("v");
+        assert_eq!(cnt2, 5, "Should have 5 groups after insert (4 + US-C)");
+
+        let us_a = Spi::get_one::<pgrx::AnyNumeric>(
+            "SELECT total FROM tr_mc_test WHERE region = 'US' AND category = 'A'"
+        ).expect("q").expect("v");
+        assert_eq!(us_a.to_string(), "15"); // 10 + 5
+
+        // DELETE all EU rows
+        Spi::run("DELETE FROM tr_mc_src WHERE region = 'EU'").expect("delete");
+
+        let cnt3 = Spi::get_one::<i64>("SELECT COUNT(*) FROM tr_mc_test").expect("q").expect("v");
+        assert_eq!(cnt3, 3, "Should have 3 groups after deleting EU");
+    }
+
+    /// Test that INTEGER GROUP BY columns are preserved (not cast to TEXT).
+    #[pg_test]
+    fn pg_test_integer_group_by_type_preservation() {
+        Spi::run("CREATE TABLE tr_type_src (id SERIAL, bucket_id INTEGER NOT NULL, val NUMERIC NOT NULL)").expect("create");
+        Spi::run("INSERT INTO tr_type_src (bucket_id, val) SELECT i % 5, i::numeric FROM generate_series(1, 50) i").expect("seed");
+
+        Spi::run(
+            "SELECT create_reflex_ivm('tr_type_test', \
+             'SELECT bucket_id, SUM(val) AS total, COUNT(*) AS cnt FROM tr_type_src GROUP BY bucket_id')"
+        ).expect("create imv");
+
+        // Check the column type in the target table — should preserve INTEGER
+        let col_type = Spi::get_one::<String>(
+            "SELECT data_type::text FROM information_schema.columns \
+             WHERE table_name = 'tr_type_test' AND column_name = 'bucket_id'"
+        ).expect("q").expect("v");
+        assert_eq!(col_type, "integer", "bucket_id should be INTEGER, not TEXT");
+
+        // Regardless of type, correctness should hold
+        Spi::run("INSERT INTO tr_type_src (bucket_id, val) VALUES (0, 999), (5, 111)").expect("insert");
+
+        let cnt = Spi::get_one::<i64>("SELECT COUNT(*) FROM tr_type_test").expect("q").expect("v");
+        assert_eq!(cnt, 6, "Should have 6 groups (0-4 original + 5 new)");
+
+        // Full correctness check using text cast to handle both cases
+        let mismatches = Spi::get_one::<i64>(
+            "SELECT COUNT(*) FROM ( \
+                SELECT r.bucket_id FROM tr_type_test r \
+                FULL OUTER JOIN (SELECT bucket_id, SUM(val) AS total FROM tr_type_src GROUP BY bucket_id) d \
+                    ON r.bucket_id::text = d.bucket_id::text \
+                WHERE r.total IS DISTINCT FROM d.total \
+            ) x"
+        ).expect("q").expect("v");
+        assert_eq!(mismatches, 0, "IMV should match direct query");
+    }
+
+    /// Test correctness with higher cardinality (10K rows, 1K groups).
+    #[pg_test]
+    fn pg_test_high_cardinality_correctness() {
+        Spi::run("CREATE TABLE tr_hc_src (id SERIAL, grp INT NOT NULL, val NUMERIC NOT NULL)").expect("create");
+        Spi::run(
+            "INSERT INTO tr_hc_src (grp, val) \
+             SELECT i % 1000, ROUND((random() * 100)::numeric, 2) FROM generate_series(1, 10000) i"
+        ).expect("seed");
+
+        Spi::run(
+            "SELECT create_reflex_ivm('tr_hc_test', \
+             'SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM tr_hc_src GROUP BY grp')"
+        ).expect("create imv");
+
+        let cnt = Spi::get_one::<i64>("SELECT COUNT(*) FROM tr_hc_test").expect("q").expect("v");
+        assert_eq!(cnt, 1000);
+
+        // INSERT 500 rows (some new groups 1000..1049, some existing)
+        Spi::run(
+            "INSERT INTO tr_hc_src (grp, val) \
+             SELECT CASE WHEN i <= 450 THEN i % 500 ELSE 999 + i - 449 END, 10.0 \
+             FROM generate_series(1, 500) i"
+        ).expect("insert");
+
+        // DELETE 200 rows from known ids
+        Spi::run("DELETE FROM tr_hc_src WHERE id <= 200").expect("delete");
+
+        // UPDATE 100 rows (change amounts)
+        Spi::run("UPDATE tr_hc_src SET val = val + 1 WHERE id > 200 AND id <= 300").expect("update");
+
+        // Full correctness verification
+        let mismatches = Spi::get_one::<i64>(
+            "SELECT COUNT(*) FROM ( \
+                SELECT r.grp FROM tr_hc_test r \
+                FULL OUTER JOIN (SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM tr_hc_src GROUP BY grp) d \
+                    ON r.grp::text = d.grp::text \
+                WHERE r.total IS DISTINCT FROM d.total OR r.cnt IS DISTINCT FROM d.cnt \
+            ) x"
+        ).expect("q").expect("v");
+        assert_eq!(mismatches, 0, "IMV should match direct query after INSERT+DELETE+UPDATE");
+
+        // Verify group count makes sense
+        let final_cnt = Spi::get_one::<i64>("SELECT COUNT(*) FROM tr_hc_test").expect("q").expect("v");
+        let expected_cnt = Spi::get_one::<i64>(
+            "SELECT COUNT(DISTINCT grp) FROM tr_hc_src"
+        ).expect("q").expect("v");
+        assert_eq!(final_cnt, expected_cnt, "Group count should match source distinct count");
     }
 }
 
