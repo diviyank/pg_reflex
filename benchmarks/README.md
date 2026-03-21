@@ -3,62 +3,106 @@
 ## Prerequisites
 
 - PostgreSQL 17 with pg_reflex extension installed
-- Start with: `cargo pgrx run pg17`
-- Connect with the psql connection string shown by pgrx
+- pgrx-managed PG17 on port 28817:
+  ```bash
+  cargo pgrx install --release --pg-config ~/.pgrx/17.7/pgrx-install/bin/pg_config
+  ~/.pgrx/17.7/pgrx-install/bin/pg_ctl -D ~/.pgrx/data-17 -l ~/.pgrx/17.log start
+  ```
 
 ## Running
 
 ```bash
-# Setup (creates extension + source tables)
-psql -f benchmarks/setup.sql
+PSQL="~/.pgrx/17.7/pgrx-install/bin/psql -h localhost -p 28817 -d bench_db"
 
-# Individual benchmarks
-psql -f benchmarks/bench_sum.sql
-psql -f benchmarks/bench_avg.sql
-psql -f benchmarks/bench_count_distinct.sql
-psql -f benchmarks/bench_join.sql
-psql -f benchmarks/bench_cascade.sql
-psql -f benchmarks/bench_cte.sql
+# Main benchmarks
+$PSQL -f benchmarks/bench_matrix.sql           # Fair comparison matrix (recommended)
+$PSQL -f benchmarks/bench_mixed_operations.sql  # INSERT → UPDATE → DELETE sequence
+$PSQL -f benchmarks/bench_oltp_single_row.sql   # Single-row insert latency
 
-# THE MAIN BENCHMARK: large batch operations vs REFRESH MATERIALIZED VIEW
-psql -f benchmarks/bench_batch.sql
+# Profiling
+$PSQL -f benchmarks/bench_profile_v2.sql        # Per-step pipeline timing
 
-# Baseline comparison (standard REFRESH MATERIALIZED VIEW)
-psql -f benchmarks/bench_baseline.sql
-
-# Cleanup
-psql -f benchmarks/teardown.sql
+# Legacy benchmarks (still work)
+$PSQL -f benchmarks/setup.sql && $PSQL -f benchmarks/bench_batch.sql
 ```
 
-## What's Measured
+## Performance Results (2026-03-21)
 
-Each benchmark script tests at 4 data scales: **1K, 10K, 100K, 1M** source rows.
+### Fair Comparison: pg_reflex vs bare INSERT + REFRESH MATERIALIZED VIEW
 
-For each scale:
-| Metric | Description |
-|--------|-------------|
-| Initial materialization | Time to `create_reflex_ivm()` on an existing table |
-| Batch INSERT (1K rows) | Trigger latency for a 1000-row batch insert |
-| Single INSERT (1 row) | Trigger latency for a single-row insert |
-| UPDATE (100 rows) | Trigger latency for updating 100 rows |
-| DELETE (100 rows) | Trigger latency for deleting 100 rows |
-| Correctness check | Verifies IMV matches a direct `SELECT ... GROUP BY` query |
+Source: 1M rows. All timings include INSERT cost on both sides.
+
+**pg_reflex advantage (% faster than traditional approach):**
+
+| Groups | 1K batch | 10K batch | 50K batch |
+|--------|----------|-----------|-----------|
+| **10** | +92% | +66% | +28% |
+| **1K** | +86% | +63% | +26% |
+| **10K** | +88% | +28% | +17% |
+| **100K** | +96% | +78% | +10% |
+
+pg_reflex is faster in every scenario. The advantage is largest at high cardinality with small batches — the typical real-time analytics pattern.
+
+### Raw Timings (100K groups, 1 IMV)
+
+| Operation | pg_reflex | bare INSERT + REFRESH | Speedup |
+|-----------|-----------|----------------------|---------|
+| INSERT 1K | 28 ms | 775 ms | **28x** |
+| INSERT 10K | 184 ms | 827 ms | **4.5x** |
+| INSERT 50K | 891 ms | 990 ms | **1.1x** |
+
+### Mixed Operations (100K groups, covering index)
+
+| Operation | pg_reflex | REFRESH |
+|-----------|-----------|---------|
+| INSERT 10K | 229 ms | 596 ms |
+| UPDATE 5K | 323 ms | 598 ms |
+| DELETE 2K | 33 ms | 605 ms |
+
+### OLTP Single-Row Insert Latency
+
+| Scenario | avg ms/insert |
+|----------|---------------|
+| 1 IMV (10 groups) | ~3.5 ms |
+| 2 IMVs (10 + 10K groups) | ~7.5 ms |
+| 3 IMVs | ~13.6 ms |
+| bare INSERT (no trigger) | ~0.06 ms |
+
+### Pipeline Profiling (100K groups, 100K batch)
+
+Where time goes inside the trigger:
+
+| Step | Time | % of total |
+|------|------|-----------|
+| MERGE into intermediate | 725 ms | 41% |
+| INSERT affected into target | 368 ms | 21% |
+| Framework overhead (plpgsql/FFI) | 319 ms | 18% |
+| DELETE affected from target | 128 ms | 7% |
+| Affected groups extraction | 94 ms | 5% |
+| Cleanup + metadata | 1 ms | <1% |
+| **Total** | **1,766 ms** | |
 
 ## Benchmark Scripts
 
-| Script | IMV Query | Focus |
-|--------|-----------|-------|
-| `bench_sum.sql` | `SELECT region, SUM(amount) GROUP BY region` | Core SUM aggregate |
-| `bench_avg.sql` | `SELECT region, AVG(amount) GROUP BY region` | AVG decomposition (SUM+COUNT) |
-| `bench_count_distinct.sql` | `SELECT DISTINCT region` | Reference counting for DISTINCT |
-| `bench_join.sql` | `SELECT ... FROM orders JOIN products ... GROUP BY category` | JOIN-based IMV |
-| `bench_cascade.sql` | L1 from source, L2 from L1 | Single-level propagation timing |
-| `bench_cte.sql` | CTE decomposition (single, chained, JOIN) | CTE-based complex queries |
-| **`bench_batch.sql`** | **SUM+COUNT on 1M base rows** | **Large batch INSERT/DELETE/UPDATE (10K-1M) vs REFRESH MATVIEW** |
-| `bench_baseline.sql` | Same as bench_sum, using standard `MATERIALIZED VIEW` | Comparison baseline |
+| Script | What it tests |
+|--------|---------------|
+| **`bench_matrix.sql`** | **Fair comparison across 4 cardinalities × 3 batch sizes** |
+| **`bench_mixed_operations.sql`** | **INSERT→UPDATE→DELETE sequence with correctness checks** |
+| **`bench_oltp_single_row.sql`** | **Per-insert overhead with 1-3 IMVs** |
+| **`bench_profile_v2.sql`** | **Per-step pipeline timing (find bottlenecks)** |
+| `bench_highcard_multi_imv.sql` | 4 IMVs vs 4 MATVIEWs on 5M source, 1M target rows each |
+| `bench_batch.sql` | Low-cardinality batch INSERT/DELETE/UPDATE (10 groups) |
+| `bench_truncate_vs_delete.sql` | Isolated TRUNCATE vs DELETE on 1M-row targets |
+| `bench_production.sql` | JOIN-based 3M orders × customers × products |
+| `bench_sum.sql` | SUM aggregate at various scales |
+| `bench_avg.sql` | AVG decomposition (SUM+COUNT) |
+| `bench_join.sql` | JOIN-based IMV |
+| `bench_cascade.sql` | Multi-level IMV propagation |
 
 ## Interpreting Results
 
-The `\timing on` directive shows wall-clock time for each SQL statement. Compare:
-- **pg_reflex trigger time** (batch INSERT/DELETE/UPDATE) vs **REFRESH MATERIALIZED VIEW** time from bench_baseline.sql
-- At larger scales, pg_reflex should be significantly faster since it processes only the delta, not the entire dataset
+- **pg_reflex time** includes both the INSERT and the trigger overhead
+- **Baseline** = bare INSERT (no trigger) + REFRESH MATERIALIZED VIEW
+- Positive advantage % = pg_reflex is faster
+- pg_reflex advantage grows with: higher cardinality, smaller batch size, more IMVs on same source
+- REFRESH advantage grows with: very large batches (>50K) on low-cardinality views
