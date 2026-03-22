@@ -43,8 +43,13 @@ cargo install cargo-pgrx --version '=0.16.1' --locked
 cargo pgrx init --pg17 download    # adjust pg17 to your version (pg15, pg16, pg18)
 
 # 5. Build and install the extension into your PostgreSQL instance
-cargo pgrx install --release --pg-config $(pg_config)
+cargo pgrx install --release --pg-config $(which pg_config)
 ```
+
+> **Note:** If you get a "Permission denied" error, the PostgreSQL extension directories need to be writable by your user. On a dev machine:
+> ```bash
+> sudo chown -R $USER /usr/share/postgresql/extension/ /usr/lib/postgresql/*/lib/
+> ```
 
 Then enable the extension in your database:
 
@@ -70,7 +75,7 @@ psql -d mydb -c "ALTER EXTENSION pg_reflex UPDATE TO '1.1.0';"
 ```bash
 cd pg_reflex
 git pull
-cargo pgrx install --release --pg-config $(pg_config)
+cargo pgrx install --release --pg-config $(which pg_config)
 
 # Update the extension in each database that uses it
 psql -d mydb -c "ALTER EXTENSION pg_reflex UPDATE;"
