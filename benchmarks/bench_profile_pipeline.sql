@@ -5,6 +5,7 @@
 -- Tests at 1K, 10K, 50K batch sizes with 1 IMV, 100K groups, covering index.
 
 \timing on
+SELECT setseed(0.42);
 \echo ''
 \echo '================================================================'
 \echo '  PIPELINE PROFILING: Step-by-Step Timing'

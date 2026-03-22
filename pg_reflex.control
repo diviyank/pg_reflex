@@ -1,4 +1,4 @@
-comment = 'pg_reflex:  Created by pgrx'
+comment = 'pg_reflex: Incremental materialized view maintenance for PostgreSQL'
 default_version = '@CARGO_VERSION@'
 module_pathname = 'pg_reflex'
 relocatable = false

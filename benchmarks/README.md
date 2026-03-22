@@ -24,7 +24,14 @@ $PSQL -f benchmarks/bench_profile_v2.sql        # Per-step pipeline timing
 
 # Legacy benchmarks (still work)
 $PSQL -f benchmarks/setup.sql && $PSQL -f benchmarks/bench_batch.sql
+
+# Multi-run with variance reporting
+./benchmarks/run_bench.sh benchmarks/bench_sum.sql 5
 ```
+
+### Reproducibility
+
+All benchmarks use `SELECT setseed(0.42)` for deterministic `random()` calls. To change the seed, edit the `setseed()` call at the top of each benchmark file.
 
 ## Performance Results (2026-03-21)
 

@@ -10,6 +10,7 @@
 -- compared with REFRESH MATERIALIZED VIEW.
 
 \timing on
+SELECT setseed(0.42);
 \echo ''
 \echo '================================================================'
 \echo '  PRODUCTION BENCHMARK'

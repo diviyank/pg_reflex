@@ -3,6 +3,7 @@
 -- Same query as bench_sum.sql: SELECT region, SUM(amount) FROM bench_orders GROUP BY region
 
 \timing on
+SELECT setseed(0.42);
 \echo ''
 \echo '=========================================='
 \echo '  BASELINE: Standard MATERIALIZED VIEW'

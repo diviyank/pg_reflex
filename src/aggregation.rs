@@ -293,4 +293,29 @@ mod tests {
         assert_eq!(plan.intermediate_columns[1].name, "__max_salary");
         assert_eq!(plan.intermediate_columns[1].source_aggregate, "MAX");
     }
+
+    mod proptest_tests {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            /// AVG always produces both SUM and COUNT intermediate columns
+            #[test]
+            fn avg_always_produces_sum_and_count(col in "[a-z]{1,10}") {
+                let sql = format!(
+                    "SELECT grp, AVG({}) AS avg_val FROM tbl GROUP BY grp",
+                    col
+                );
+                let plan = plan_from_sql(&sql);
+                let has_sum = plan.intermediate_columns.iter().any(|ic| {
+                    ic.source_aggregate == "SUM" && ic.source_arg == col
+                });
+                let has_count = plan.intermediate_columns.iter().any(|ic| {
+                    ic.source_aggregate == "COUNT" && ic.source_arg == col
+                });
+                assert!(has_sum, "AVG({}) must produce SUM intermediate column", col);
+                assert!(has_count, "AVG({}) must produce COUNT intermediate column", col);
+            }
+        }
+    }
 }

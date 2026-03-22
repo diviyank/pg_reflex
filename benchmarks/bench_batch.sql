@@ -7,6 +7,7 @@
 -- Base table: 1M rows. Batch sizes: 10K, 50K, 100K, 500K, 1M rows.
 
 \timing on
+SELECT setseed(0.42);
 \echo ''
 \echo '================================================================'
 \echo '  BENCHMARK: BATCH UPDATES — pg_reflex vs REFRESH MATERIALIZED VIEW'

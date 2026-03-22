@@ -1,7 +1,7 @@
 use pgrx::prelude::*;
 
 use crate::aggregation::AggregationPlan;
-use crate::query_decomposer::{bare_column_name, intermediate_table_name};
+use crate::query_decomposer::{bare_column_name, intermediate_table_name, quote_identifier, split_qualified_name};
 
 /// Whether a delta adds or subtracts from the intermediate table.
 #[derive(Clone, Copy)]
@@ -215,7 +215,10 @@ pub fn reflex_build_delta_sql(
 ) -> String {
     let plan: AggregationPlan = match serde_json::from_str(aggregations_json) {
         Ok(p) => p,
-        Err(_) => return String::new(),
+        Err(_) => {
+            pgrx::warning!("pg_reflex: invalid aggregations JSON for '{}'", view_name);
+            return String::new();
+        }
     };
 
     let intermediate_tbl = intermediate_table_name(view_name);
@@ -231,11 +234,11 @@ pub fn reflex_build_delta_sql(
         match operation {
             "INSERT" => {
                 let delta_q = base_query.replace(source_table, &format!("\"{}\"", new_tbl));
-                stmts.push(format!("INSERT INTO \"{}\" {}", view_name, delta_q));
+                stmts.push(format!("INSERT INTO {} {}", quote_identifier(view_name), delta_q));
             }
             "DELETE" | "UPDATE" => {
-                stmts.push(format!("DELETE FROM \"{}\"", view_name));
-                stmts.push(format!("INSERT INTO \"{}\" {}", view_name, base_query));
+                stmts.push(format!("DELETE FROM {}", quote_identifier(view_name)));
+                stmts.push(format!("INSERT INTO {} {}", quote_identifier(view_name), base_query));
             }
             _ => {}
         }
@@ -247,7 +250,8 @@ pub fn reflex_build_delta_sql(
 
         // Determine if we can use targeted refresh (need group columns)
         let grp_cols = group_columns(&plan);
-        let affected_tbl = format!("__reflex_affected_{}", view_name);
+        let bare_view = split_qualified_name(view_name).1;
+        let affected_tbl = format!("__reflex_affected_{}", bare_view);
 
         match operation {
             "INSERT" => {
@@ -324,13 +328,14 @@ pub fn reflex_build_delta_sql(
             let cols_str = cols.join(", ");
             let row = row_expr(cols);
 
+            let qv = quote_identifier(view_name);
             stmts.push(format!(
-                "DELETE FROM \"{}\" WHERE {} IN (SELECT {} FROM \"{}\")",
-                view_name, row, cols_str, affected_tbl
+                "DELETE FROM {} WHERE {} IN (SELECT {} FROM \"{}\")",
+                qv, row, cols_str, affected_tbl
             ));
             stmts.push(format!(
-                "INSERT INTO \"{}\" {} AND {} IN (SELECT {} FROM \"{}\")",
-                view_name, end_query, row, cols_str, affected_tbl
+                "INSERT INTO {} {} AND {} IN (SELECT {} FROM \"{}\")",
+                qv, end_query, row, cols_str, affected_tbl
             ));
             stmts.push(format!(
                 "DROP TABLE IF EXISTS \"{}\"",
@@ -338,15 +343,15 @@ pub fn reflex_build_delta_sql(
             ));
         } else {
             // No group columns (sentinel-only): full refresh
-            stmts.push(format!("TRUNCATE \"{}\"", view_name));
-            stmts.push(format!("INSERT INTO \"{}\" {}", view_name, end_query));
+            stmts.push(format!("TRUNCATE {}", quote_identifier(view_name)));
+            stmts.push(format!("INSERT INTO {} {}", quote_identifier(view_name), end_query));
         }
     }
 
     // Update last_update_date
     stmts.push(format!(
         "UPDATE public.__reflex_ivm_reference SET last_update_date = NOW() WHERE name = '{}'",
-        view_name
+        view_name.replace("'", "''")
     ));
 
     stmts.join("\n--<<REFLEX_SEP>>--\n")
@@ -361,7 +366,7 @@ pub fn reflex_build_truncate_sql(view_name: &str) -> String {
     // Check if this is a passthrough IMV by reading aggregations from the reference table
     let agg_json: String = Spi::get_one::<&str>(&format!(
         "SELECT aggregations::text FROM public.__reflex_ivm_reference WHERE name = '{}'",
-        view_name
+        view_name.replace("'", "''")
     ))
     .unwrap_or(None)
     .unwrap_or("{}")
@@ -379,17 +384,17 @@ pub fn reflex_build_truncate_sql(view_name: &str) -> String {
 
     if is_passthrough {
         // Passthrough: just clear the target, then re-insert from source (which is now empty)
-        stmts.push(format!("DELETE FROM \"{}\"", view_name));
+        stmts.push(format!("DELETE FROM {}", quote_identifier(view_name)));
     } else {
         // Aggregate: clear intermediate and target
         stmts.push(format!("TRUNCATE {}", intermediate_tbl));
-        stmts.push(format!("DELETE FROM \"{}\"", view_name));
+        stmts.push(format!("DELETE FROM {}", quote_identifier(view_name)));
     }
 
     // Update last_update_date
     stmts.push(format!(
         "UPDATE public.__reflex_ivm_reference SET last_update_date = NOW() WHERE name = '{}'",
-        view_name
+        view_name.replace("'", "''")
     ));
 
     stmts.join("\n--<<REFLEX_SEP>>--\n")

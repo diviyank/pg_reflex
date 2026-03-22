@@ -5,6 +5,7 @@
 -- Source: 1M rows, 100K groups, 1 IMV with covering index.
 
 \timing on
+SELECT setseed(0.42);
 \echo ''
 \echo '================================================================'
 \echo '  BENCHMARK: MIXED OPERATIONS (INSERT → UPDATE → DELETE)'

@@ -5,6 +5,7 @@
 -- ALL timings include INSERT cost for fair comparison.
 
 \timing on
+SELECT setseed(0.42);
 \echo ''
 \echo '================================================================'
 \echo '  FAIR BENCHMARK MATRIX'

@@ -3,6 +3,7 @@
 -- (Multi-level cascading is a known v1 limitation)
 
 \timing on
+SELECT setseed(0.42);
 \echo ''
 \echo '=========================================='
 \echo '  BENCHMARK: Single-Level Propagation'

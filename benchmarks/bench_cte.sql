@@ -2,6 +2,7 @@
 -- Tests complex queries with CTEs at 4 data scales
 
 \timing on
+SELECT setseed(0.42);
 \echo ''
 \echo '=========================================='
 \echo '  BENCHMARK: CTE Decomposition'

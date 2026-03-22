@@ -9,6 +9,7 @@
 -- Self-contained: creates its own setup, does not require other benchmarks.
 
 \timing on
+SELECT setseed(0.42);
 \echo ''
 \echo '================================================================'
 \echo '  BENCHMARK: TRUNCATE vs DELETE on 1M-row targets'

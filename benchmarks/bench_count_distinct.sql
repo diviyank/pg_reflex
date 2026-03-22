@@ -2,6 +2,7 @@
 -- Measures: SELECT DISTINCT region FROM bench_orders
 
 \timing on
+SELECT setseed(0.42);
 \echo ''
 \echo '=========================================='
 \echo '  BENCHMARK: DISTINCT (ref counting)'

@@ -2,6 +2,7 @@
 -- Measures: SELECT region, AVG(amount) AS avg_amount FROM bench_orders GROUP BY region
 
 \timing on
+SELECT setseed(0.42);
 \echo ''
 \echo '=========================================='
 \echo '  BENCHMARK: AVG Aggregate'

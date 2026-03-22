@@ -2,6 +2,7 @@
 -- Decomposes the trigger pipeline into individually timed steps.
 
 \timing on
+SELECT setseed(0.42);
 \echo ''
 \echo '================================================================'
 \echo '  PIPELINE PROFILING V2 (MERGE-based)'

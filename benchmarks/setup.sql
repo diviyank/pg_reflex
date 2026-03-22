@@ -3,6 +3,9 @@
 
 CREATE EXTENSION IF NOT EXISTS pg_reflex;
 
+-- Deterministic random seed for reproducible benchmarks
+SELECT setseed(0.42);
+
 -- Source table for single-table benchmarks (SUM, AVG, COUNT, DISTINCT)
 DROP TABLE IF EXISTS bench_orders CASCADE;
 CREATE TABLE bench_orders (

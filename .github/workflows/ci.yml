@@ -1,0 +1,97 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: [15, 17, 18]
+    name: "PostgreSQL ${{ matrix.pg }}"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-all-crates: true
+
+      - name: Cache pgrx
+        uses: actions/cache@v4
+        with:
+          path: ~/.pgrx/
+          key: pgrx-pg${{ matrix.pg }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: pgrx-pg${{ matrix.pg }}-
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libpq-dev
+
+      - name: Install cargo-pgrx
+        run: cargo install cargo-pgrx --version '=0.16.1' --locked
+
+      - name: Initialize pgrx
+        run: cargo pgrx init --pg${{ matrix.pg }} download
+
+      - name: Run tests
+        run: cargo pgrx test pg${{ matrix.pg }}
+
+  concurrent-test:
+    name: "Concurrent tests"
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-all-crates: true
+
+      - name: Cache pgrx
+        uses: actions/cache@v4
+        with:
+          path: ~/.pgrx/
+          key: pgrx-pg17-${{ hashFiles('Cargo.lock') }}
+          restore-keys: pgrx-pg17-
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libpq-dev
+
+      - name: Install cargo-pgrx
+        run: cargo install cargo-pgrx --version '=0.16.1' --locked
+
+      - name: Initialize pgrx
+        run: cargo pgrx init --pg17 download
+
+      - name: Install extension
+        run: cargo pgrx install --pg-config ~/.pgrx/17.*/pgrx-install/bin/pg_config
+
+      - name: Start PostgreSQL
+        run: |
+          PGRX_DIR=$(find ~/.pgrx -maxdepth 1 -type d -name '17.*' | head -1)
+          ${PGRX_DIR}/pgrx-install/bin/initdb -D /tmp/pgdata-concurrent 2>/dev/null || true
+          # Copy extension files into the data directory's lib/share paths
+          ${PGRX_DIR}/pgrx-install/bin/pg_ctl -D ${PGRX_DIR}/data-17 -l /tmp/pg-concurrent.log -o "-p 28817" start
+
+      - name: Create test database
+        run: |
+          PGRX_DIR=$(find ~/.pgrx -maxdepth 1 -type d -name '17.*' | head -1)
+          ${PGRX_DIR}/pgrx-install/bin/createdb -h localhost -p 28817 bench_db 2>/dev/null || true
+          ${PGRX_DIR}/pgrx-install/bin/psql -h localhost -p 28817 -d bench_db -c "CREATE EXTENSION IF NOT EXISTS pg_reflex"
+
+      - name: Run concurrent tests
+        run: PG_VERSION=17 ./tests/test_concurrent.sh
+
+      - name: Stop PostgreSQL
+        if: always()
+        run: |
+          PGRX_DIR=$(find ~/.pgrx -maxdepth 1 -type d -name '17.*' | head -1)
+          ${PGRX_DIR}/pgrx-install/bin/pg_ctl -D ${PGRX_DIR}/data-17 stop 2>/dev/null || true

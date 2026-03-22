@@ -5,6 +5,7 @@
 -- Source: 1M rows, varying group cardinality.
 
 \timing on
+SELECT setseed(0.42);
 \echo ''
 \echo '================================================================'
 \echo '  BENCHMARK: SINGLE-ROW OLTP INSERT LATENCY'

@@ -14,7 +14,7 @@ mod trigger;
 use aggregation::plan_aggregation;
 use query_decomposer::{
     bare_column_name, generate_aggregations_json, generate_base_query, generate_end_query,
-    intermediate_table_name, replace_identifier,
+    intermediate_table_name, quote_identifier, replace_identifier, split_qualified_name,
 };
 use schema_builder::{
     build_indexes_ddl, build_intermediate_table_ddl, build_target_table_ddl, build_trigger_ddls,
@@ -50,10 +50,44 @@ extension_sql!(
     name = "pg_reflex_init",
 );
 
+/// Validates that a view name contains only safe characters.
+/// Allows: ASCII letters, digits, underscore, period (for schema qualification).
+/// Rejects everything else (quotes, semicolons, whitespace, etc.).
+fn validate_view_name(name: &str) -> Result<(), &'static str> {
+    if name.is_empty() {
+        return Err("ERROR: Invalid view name: name is empty");
+    }
+    if name.starts_with('.') || name.chars().next().map_or(false, |c| c.is_ascii_digit()) {
+        return Err("ERROR: Invalid view name: must start with a letter or underscore");
+    }
+    if name.contains("..") || name.ends_with('.') {
+        return Err("ERROR: Invalid view name: invalid period placement");
+    }
+    for ch in name.chars() {
+        if !(ch.is_ascii_alphanumeric() || ch == '_' || ch == '.') {
+            return Err(
+                "ERROR: Invalid view name: only alphanumeric, underscore, and period allowed",
+            );
+        }
+    }
+    Ok(())
+}
+
 #[pg_extern]
 fn create_reflex_ivm(view_name: &str, sql: &str) -> &'static str {
+    if let Err(msg) = validate_view_name(view_name) {
+        return msg;
+    }
     let dialect = PostgreSqlDialect {};
-    let parsed_sql = Parser::parse_sql(&dialect, sql).unwrap();
+    let parsed_sql = match Parser::parse_sql(&dialect, sql) {
+        Ok(stmts) => stmts,
+        Err(e) => {
+            warning!("pg_reflex: failed to parse SQL for '{}': {}", view_name, e);
+            return Box::leak(
+                format!("ERROR: Failed to parse SQL: {}", e).into_boxed_str(),
+            );
+        }
+    };
     let analysis = match analyze(&parsed_sql) {
         Err(SqlAnalysisError::MultipleQueries(_)) => {
             return "ERROR: Expected 1 query, got multiple";
@@ -106,7 +140,15 @@ fn create_reflex_ivm(view_name: &str, sql: &str) -> &'static str {
         // Check if the main body is passthrough (no aggregation).
         // If so, all its sources are CTE sub-IMVs which don't get triggers,
         // so we create a VIEW (reads live from sub-IMV targets, zero overhead).
-        let body_parsed = Parser::parse_sql(&dialect, &body_sql).unwrap();
+        let body_parsed = match Parser::parse_sql(&dialect, &body_sql) {
+            Ok(stmts) => stmts,
+            Err(e) => {
+                warning!("pg_reflex: failed to parse rewritten CTE body for '{}': {}", view_name, e);
+                return Box::leak(
+                    format!("ERROR: Failed to parse rewritten CTE body: {}", e).into_boxed_str(),
+                );
+            }
+        };
         let body_analysis = match analyze(&body_parsed) {
             Ok(a) => a,
             Err(_) => return "ERROR: Failed to analyze rewritten CTE body",
@@ -118,7 +160,7 @@ fn create_reflex_ivm(view_name: &str, sql: &str) -> &'static str {
             Spi::connect_mut(|client| {
                 client
                     .update(
-                        &format!("CREATE OR REPLACE VIEW \"{}\" AS {}", view_name, body_sql),
+                        &format!("CREATE OR REPLACE VIEW {} AS {}", quote_identifier(view_name), body_sql),
                         None,
                         &[],
                     )
@@ -136,6 +178,27 @@ fn create_reflex_ivm(view_name: &str, sql: &str) -> &'static str {
 
     // Build aggregation plan from the analysis
     let plan = plan_aggregation(&analysis);
+
+    // Check for duplicate view name
+    let already_exists = Spi::connect(|client| {
+        !client
+            .select(
+                "SELECT 1 FROM public.__reflex_ivm_reference WHERE name = $1",
+                None,
+                &[unsafe {
+                    DatumWithOid::new(
+                        view_name.to_string(),
+                        PgBuiltInOids::TEXTOID.oid().value(),
+                    )
+                }],
+            )
+            .unwrap_or_report()
+            .collect::<Vec<_>>()
+            .is_empty()
+    });
+    if already_exists {
+        return "ERROR: IMV with this name already exists";
+    }
 
     Spi::connect_mut(|client| {
         // Lookup existing IMVs among the source tables
@@ -172,14 +235,14 @@ fn create_reflex_ivm(view_name: &str, sql: &str) -> &'static str {
             // Passthrough: CREATE TABLE AS — Postgres infers columns + types, populates data
             client
                 .update(
-                    &format!("CREATE TABLE \"{}\" AS {}", view_name, sql),
+                    &format!("CREATE TABLE {} AS {}", quote_identifier(view_name), sql),
                     None,
                     &[],
                 )
                 .unwrap_or_report();
             // ANALYZE so the query planner has statistics for the new table
             client
-                .update(&format!("ANALYZE \"{}\"", view_name), None, &[])
+                .update(&format!("ANALYZE {}", quote_identifier(view_name)), None, &[])
                 .unwrap_or_report();
         } else {
             // Aggregate: build intermediate + target tables from the plan
@@ -237,7 +300,8 @@ fn create_reflex_ivm(view_name: &str, sql: &str) -> &'static str {
                     .map(|c| format!("\"{}\"", bare_column_name(c)))
                     .collect();
                 let safe_src = source.replace('.', "_");
-                let idx_name = format!("__reflex_idx_{}_{}", view_name, safe_src);
+                let bare_view = split_qualified_name(view_name).1;
+                let idx_name = format!("__reflex_idx_{}_{}", bare_view, safe_src);
                 let ddl = format!(
                     "CREATE INDEX IF NOT EXISTS \"{}\" ON {} ({})",
                     idx_name, source, idx_cols.join(", ")
@@ -315,7 +379,7 @@ fn create_reflex_ivm(view_name: &str, sql: &str) -> &'static str {
                 .update(&initial_insert, None, &[])
                 .unwrap_or_report();
 
-            let target_insert = format!("INSERT INTO \"{}\" {}", view_name, end_query);
+            let target_insert = format!("INSERT INTO {} {}", quote_identifier(view_name), end_query);
             client
                 .update(&target_insert, None, &[])
                 .unwrap_or_report();
@@ -323,6 +387,7 @@ fn create_reflex_ivm(view_name: &str, sql: &str) -> &'static str {
 
     });
 
+    info!("pg_reflex: created IMV '{}'", view_name);
     "CREATE REFLEX INCREMENTAL VIEW"
 }
 
@@ -344,14 +409,27 @@ fn query_column_types_from_catalog(
         } else {
             ("public", table.as_str())
         };
-        let query = format!(
-            "SELECT column_name::text AS col_name, data_type::text AS data_type \
-             FROM information_schema.columns \
-             WHERE table_schema = '{}' AND table_name = '{}'",
-            schema, tbl
-        );
         let rows = client
-            .select(&query, None, &[])
+            .select(
+                "SELECT column_name::text AS col_name, data_type::text AS data_type \
+                 FROM information_schema.columns \
+                 WHERE table_schema = $1 AND table_name = $2",
+                None,
+                &[
+                    unsafe {
+                        DatumWithOid::new(
+                            schema.to_string(),
+                            PgBuiltInOids::TEXTOID.oid().value(),
+                        )
+                    },
+                    unsafe {
+                        DatumWithOid::new(
+                            tbl.to_string(),
+                            PgBuiltInOids::TEXTOID.oid().value(),
+                        )
+                    },
+                ],
+            )
             .unwrap_or_report();
         for row in rows {
             if let (Some(col_name), Some(data_type)) = (
@@ -395,11 +473,17 @@ fn map_information_schema_type(data_type: &str) -> String {
 /// Refuses to drop if the IMV has children unless cascade is true.
 #[pg_extern]
 fn drop_reflex_ivm(view_name: &str) -> &'static str {
+    if let Err(msg) = validate_view_name(view_name) {
+        return msg;
+    }
     drop_reflex_ivm_impl(view_name, false)
 }
 
 #[pg_extern(name = "drop_reflex_ivm")]
 fn drop_reflex_ivm_cascade(view_name: &str, cascade: bool) -> &'static str {
+    if let Err(msg) = validate_view_name(view_name) {
+        return msg;
+    }
     drop_reflex_ivm_impl(view_name, cascade)
 }
 
@@ -422,6 +506,7 @@ fn drop_reflex_ivm_impl(view_name: &str, cascade: bool) -> &'static str {
             .collect::<Vec<_>>();
 
         if exists.is_empty() {
+            warning!("pg_reflex: drop failed — IMV '{}' not found", view_name);
             return "ERROR: IMV not found";
         }
 
@@ -465,13 +550,23 @@ fn drop_reflex_ivm_impl(view_name: &str, cascade: bool) -> &'static str {
             let safe_source = source.replace('.', "_");
             let other_count = client
                 .select(
-                    &format!(
-                        "SELECT COUNT(*) AS cnt FROM public.__reflex_ivm_reference \
-                         WHERE '{}' = ANY(depends_on) AND name != '{}'",
-                        source, view_name
-                    ),
+                    "SELECT COUNT(*) AS cnt FROM public.__reflex_ivm_reference \
+                     WHERE $1 = ANY(depends_on) AND name != $2",
                     None,
-                    &[],
+                    &[
+                        unsafe {
+                            DatumWithOid::new(
+                                source.clone(),
+                                PgBuiltInOids::TEXTOID.oid().value(),
+                            )
+                        },
+                        unsafe {
+                            DatumWithOid::new(
+                                view_name.to_string(),
+                                PgBuiltInOids::TEXTOID.oid().value(),
+                            )
+                        },
+                    ],
                 )
                 .unwrap_or_report()
                 .first()
@@ -487,7 +582,7 @@ fn drop_reflex_ivm_impl(view_name: &str, cascade: bool) -> &'static str {
         // 5. Drop target table
         client
             .update(
-                &format!("DROP TABLE IF EXISTS \"{}\"", view_name),
+                &format!("DROP TABLE IF EXISTS {}", quote_identifier(view_name)),
                 None,
                 &[],
             )
@@ -566,6 +661,7 @@ fn drop_reflex_ivm_impl(view_name: &str, cascade: bool) -> &'static str {
             }
         }
 
+        info!("pg_reflex: dropped IMV '{}'", view_name);
         "DROP REFLEX INCREMENTAL VIEW"
     })
 }
@@ -574,6 +670,9 @@ fn drop_reflex_ivm_impl(view_name: &str, cascade: bool) -> &'static str {
 /// Use this as a safety net (manually or via pg_cron) to fix drift.
 #[pg_extern]
 fn reflex_reconcile(view_name: &str) -> &'static str {
+    if let Err(msg) = validate_view_name(view_name) {
+        return msg;
+    }
     Spi::connect_mut(|client| {
         let rows = client
             .select(
@@ -591,6 +690,7 @@ fn reflex_reconcile(view_name: &str) -> &'static str {
             .collect::<Vec<_>>();
 
         if rows.is_empty() {
+            warning!("pg_reflex: reconcile failed — IMV '{}' not found or disabled", view_name);
             return "ERROR: IMV not found or disabled";
         }
 
@@ -622,11 +722,11 @@ fn reflex_reconcile(view_name: &str) -> &'static str {
         if is_passthrough || end_query.is_empty() {
             // Passthrough or no end_query: full refresh from base_query
             client
-                .update(&format!("DELETE FROM \"{}\"", view_name), None, &[])
+                .update(&format!("DELETE FROM {}", quote_identifier(view_name)), None, &[])
                 .unwrap_or_report();
             client
                 .update(
-                    &format!("INSERT INTO \"{}\" {}", view_name, base_query),
+                    &format!("INSERT INTO {} {}", quote_identifier(view_name), base_query),
                     None,
                     &[],
                 )
@@ -645,11 +745,11 @@ fn reflex_reconcile(view_name: &str) -> &'static str {
                 )
                 .unwrap_or_report();
             client
-                .update(&format!("DELETE FROM \"{}\"", view_name), None, &[])
+                .update(&format!("DELETE FROM {}", quote_identifier(view_name)), None, &[])
                 .unwrap_or_report();
             client
                 .update(
-                    &format!("INSERT INTO \"{}\" {}", view_name, end_query),
+                    &format!("INSERT INTO {} {}", quote_identifier(view_name), end_query),
                     None,
                     &[],
                 )
@@ -670,6 +770,7 @@ fn reflex_reconcile(view_name: &str) -> &'static str {
             )
             .unwrap_or_report();
 
+        info!("pg_reflex: reconciled IMV '{}'", view_name);
         "RECONCILED"
     })
 }
@@ -2335,6 +2436,525 @@ mod tests {
         ).expect("q").expect("v");
         assert_eq!(final_cnt, expected_cnt, "Group count should match source distinct count");
     }
+
+    // ---- Phase 1 & 2: Error handling and validation tests ----
+
+    #[pg_test]
+    fn test_malformed_sql_returns_error() {
+        let result = crate::create_reflex_ivm("bad_sql_view", "SELEC broken garbage !!!");
+        assert!(
+            result.starts_with("ERROR"),
+            "Malformed SQL should return error, got: {}",
+            result
+        );
+        assert!(result.contains("parse"), "Error should mention parse failure");
+    }
+
+    #[pg_test]
+    fn test_special_chars_view_name_rejected() {
+        Spi::run("CREATE TABLE vn_src (id SERIAL, val INT)").expect("create table");
+        let r1 = crate::create_reflex_ivm("bad'name", "SELECT val FROM vn_src");
+        assert!(r1.starts_with("ERROR"), "Single quote should be rejected");
+        let r2 = crate::create_reflex_ivm("bad;name", "SELECT val FROM vn_src");
+        assert!(r2.starts_with("ERROR"), "Semicolon should be rejected");
+        let r3 = crate::create_reflex_ivm("bad--name", "SELECT val FROM vn_src");
+        assert!(r3.starts_with("ERROR"), "SQL comment should be rejected");
+        let r4 = crate::create_reflex_ivm("bad name", "SELECT val FROM vn_src");
+        assert!(r4.starts_with("ERROR"), "Whitespace should be rejected");
+        let r5 = crate::create_reflex_ivm("", "SELECT val FROM vn_src");
+        assert!(r5.starts_with("ERROR"), "Empty name should be rejected");
+    }
+
+    #[pg_test]
+    fn test_drop_nonexistent_imv() {
+        let result = crate::drop_reflex_ivm("nonexistent_view_xyz");
+        assert!(result.starts_with("ERROR"), "Should error on non-existent IMV");
+    }
+
+    #[pg_test]
+    fn test_validate_view_name_unit() {
+        // Valid names
+        assert!(crate::validate_view_name("my_view").is_ok());
+        assert!(crate::validate_view_name("schema1.my_view").is_ok());
+        assert!(crate::validate_view_name("_private").is_ok());
+        assert!(crate::validate_view_name("View123").is_ok());
+        // Invalid names
+        assert!(crate::validate_view_name("").is_err());
+        assert!(crate::validate_view_name("bad'name").is_err());
+        assert!(crate::validate_view_name("bad\"name").is_err());
+        assert!(crate::validate_view_name("bad;name").is_err());
+        assert!(crate::validate_view_name("bad name").is_err());
+        assert!(crate::validate_view_name("bad\\name").is_err());
+        assert!(crate::validate_view_name("1starts_with_digit").is_err());
+        assert!(crate::validate_view_name(".starts_with_dot").is_err());
+        assert!(crate::validate_view_name("bad..double").is_err());
+        assert!(crate::validate_view_name("ends_with_dot.").is_err());
+    }
+
+    // ---- Phase 4: Edge case tests ----
+
+    #[pg_test]
+    fn test_duplicate_view_name() {
+        Spi::run("CREATE TABLE dup_src (id SERIAL, grp TEXT, val NUMERIC)").expect("create table");
+        Spi::run("INSERT INTO dup_src (grp, val) VALUES ('a', 1)").expect("seed");
+        let r1 = crate::create_reflex_ivm(
+            "dup_view",
+            "SELECT grp, SUM(val) AS total FROM dup_src GROUP BY grp",
+        );
+        assert_eq!(r1, "CREATE REFLEX INCREMENTAL VIEW");
+        let r2 = crate::create_reflex_ivm(
+            "dup_view",
+            "SELECT grp, SUM(val) AS total FROM dup_src GROUP BY grp",
+        );
+        assert!(
+            r2.starts_with("ERROR"),
+            "Duplicate view name should return error, got: {}",
+            r2
+        );
+    }
+
+    #[pg_test]
+    fn test_empty_source_table() {
+        Spi::run("CREATE TABLE empty_src (id SERIAL, grp TEXT, val NUMERIC)").expect("create table");
+        let result = crate::create_reflex_ivm(
+            "empty_view",
+            "SELECT grp, SUM(val) AS total FROM empty_src GROUP BY grp",
+        );
+        assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
+        let count =
+            Spi::get_one::<i64>("SELECT COUNT(*) FROM empty_view").expect("q").expect("v");
+        assert_eq!(count, 0, "Empty source should produce empty view");
+        // Now insert and verify trigger works
+        Spi::run("INSERT INTO empty_src (grp, val) VALUES ('x', 42)").expect("insert");
+        let total = Spi::get_one::<pgrx::AnyNumeric>(
+            "SELECT total FROM empty_view WHERE grp = 'x'",
+        )
+        .expect("q")
+        .expect("v");
+        assert_eq!(total.to_string(), "42");
+    }
+
+    #[pg_test]
+    fn test_update_group_by_column() {
+        Spi::run(
+            "CREATE TABLE grpmove_src (id SERIAL, grp TEXT, val NUMERIC)",
+        )
+        .expect("create table");
+        Spi::run(
+            "INSERT INTO grpmove_src (grp, val) VALUES ('A', 10), ('A', 20), ('B', 30)",
+        )
+        .expect("seed");
+        crate::create_reflex_ivm(
+            "grpmove_view",
+            "SELECT grp, SUM(val) AS total FROM grpmove_src GROUP BY grp",
+        );
+        // Move a row from group A to group B
+        Spi::run("UPDATE grpmove_src SET grp = 'B' WHERE val = 10").expect("update");
+        let a = Spi::get_one::<pgrx::AnyNumeric>(
+            "SELECT total FROM grpmove_view WHERE grp = 'A'",
+        )
+        .expect("q")
+        .expect("v");
+        assert_eq!(a.to_string(), "20", "Group A should have lost 10");
+        let b = Spi::get_one::<pgrx::AnyNumeric>(
+            "SELECT total FROM grpmove_view WHERE grp = 'B'",
+        )
+        .expect("q")
+        .expect("v");
+        assert_eq!(b.to_string(), "40", "Group B should have gained 10");
+    }
+
+    #[pg_test]
+    fn test_min_max_delete_recompute() {
+        Spi::run("CREATE TABLE mmr_src (id SERIAL, grp TEXT, val NUMERIC)").expect("create table");
+        Spi::run("INSERT INTO mmr_src (grp, val) VALUES ('X', 10), ('X', 20), ('X', 30)")
+            .expect("seed");
+        crate::create_reflex_ivm(
+            "mmr_view",
+            "SELECT grp, MIN(val) AS lo, MAX(val) AS hi FROM mmr_src GROUP BY grp",
+        );
+        let lo =
+            Spi::get_one::<pgrx::AnyNumeric>("SELECT lo FROM mmr_view WHERE grp = 'X'")
+                .expect("q")
+                .expect("v");
+        assert_eq!(lo.to_string(), "10", "Initial MIN should be 10");
+        // Delete the MIN row — should trigger recompute
+        Spi::run("DELETE FROM mmr_src WHERE val = 10").expect("delete min");
+        let lo2 =
+            Spi::get_one::<pgrx::AnyNumeric>("SELECT lo FROM mmr_view WHERE grp = 'X'")
+                .expect("q")
+                .expect("v");
+        assert_eq!(lo2.to_string(), "20", "After deleting 10, MIN should be 20");
+    }
+
+    #[pg_test]
+    fn test_delete_all_rows_from_source() {
+        Spi::run("CREATE TABLE delall_src (id SERIAL, grp TEXT, val NUMERIC)").expect("create table");
+        Spi::run("INSERT INTO delall_src (grp, val) VALUES ('A', 10), ('B', 20)").expect("seed");
+        crate::create_reflex_ivm(
+            "delall_view",
+            "SELECT grp, SUM(val) AS total FROM delall_src GROUP BY grp",
+        );
+        Spi::run("DELETE FROM delall_src").expect("delete all");
+        let count =
+            Spi::get_one::<i64>("SELECT COUNT(*) FROM delall_view").expect("q").expect("v");
+        assert_eq!(count, 0, "View should be empty after deleting all source rows");
+    }
+
+    #[pg_test]
+    fn test_reconcile_aggregate() {
+        Spi::run(
+            "CREATE TABLE recon_agg_src (id SERIAL, grp TEXT, val NUMERIC)",
+        )
+        .expect("create table");
+        Spi::run(
+            "INSERT INTO recon_agg_src (grp, val) VALUES ('A', 10), ('A', 20), ('B', 30)",
+        )
+        .expect("seed");
+        crate::create_reflex_ivm(
+            "recon_agg_view",
+            "SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM recon_agg_src GROUP BY grp",
+        );
+        // Corrupt intermediate table
+        Spi::run(
+            "UPDATE __reflex_intermediate_recon_agg_view SET \"__sum_val\" = 999 WHERE \"grp\" = 'A'",
+        )
+        .expect("corrupt intermediate");
+        // Reconcile should fix it
+        let result = crate::reflex_reconcile("recon_agg_view");
+        assert_eq!(result, "RECONCILED");
+        let a = Spi::get_one::<pgrx::AnyNumeric>(
+            "SELECT total FROM recon_agg_view WHERE grp = 'A'",
+        )
+        .expect("q")
+        .expect("v");
+        assert_eq!(a.to_string(), "30", "After reconcile, SUM should be 10+20=30");
+    }
+
+    // ---- Round 2: Boundary condition tests ----
+
+    #[pg_test]
+    fn test_null_in_aggregate_expression() {
+        Spi::run(
+            "CREATE TABLE null_agg_src (id SERIAL, grp TEXT NOT NULL, val NUMERIC)",
+        )
+        .expect("create table");
+        Spi::run(
+            "INSERT INTO null_agg_src (grp, val) VALUES ('A', 10), ('A', NULL), ('A', 30)",
+        )
+        .expect("seed");
+        crate::create_reflex_ivm(
+            "null_agg_view",
+            "SELECT grp, SUM(val) AS total, COUNT(val) AS cnt FROM null_agg_src GROUP BY grp",
+        );
+        // SUM should ignore NULL: 10 + 30 = 40
+        let total = Spi::get_one::<pgrx::AnyNumeric>(
+            "SELECT total FROM null_agg_view WHERE grp = 'A'",
+        )
+        .expect("q")
+        .expect("v");
+        assert_eq!(total.to_string(), "40", "SUM should ignore NULLs");
+        // COUNT(val) should skip NULL: 2
+        let cnt = Spi::get_one::<i64>(
+            "SELECT cnt FROM null_agg_view WHERE grp = 'A'",
+        )
+        .expect("q")
+        .expect("v");
+        assert_eq!(cnt, 2, "COUNT(col) should skip NULLs");
+    }
+
+    #[pg_test]
+    fn test_count_col_vs_count_star() {
+        Spi::run(
+            "CREATE TABLE ccvs_src (id SERIAL, grp TEXT NOT NULL, val NUMERIC)",
+        )
+        .expect("create table");
+        Spi::run(
+            "INSERT INTO ccvs_src (grp, val) VALUES ('X', 1), ('X', NULL), ('X', 3), ('X', NULL)",
+        )
+        .expect("seed");
+        crate::create_reflex_ivm(
+            "ccvs_view",
+            "SELECT grp, COUNT(*) AS cnt_star, COUNT(val) AS cnt_val FROM ccvs_src GROUP BY grp",
+        );
+        let cnt_star = Spi::get_one::<i64>(
+            "SELECT cnt_star FROM ccvs_view WHERE grp = 'X'",
+        )
+        .expect("q")
+        .expect("v");
+        assert_eq!(cnt_star, 4, "COUNT(*) should count all rows including NULLs");
+        let cnt_val = Spi::get_one::<i64>(
+            "SELECT cnt_val FROM ccvs_view WHERE grp = 'X'",
+        )
+        .expect("q")
+        .expect("v");
+        assert_eq!(cnt_val, 2, "COUNT(col) should skip NULLs");
+    }
+
+    #[pg_test]
+    fn test_distinct_with_group_by() {
+        Spi::run(
+            "CREATE TABLE dg_src (id SERIAL, grp TEXT NOT NULL, val TEXT NOT NULL)",
+        )
+        .expect("create table");
+        Spi::run(
+            "INSERT INTO dg_src (grp, val) VALUES \
+             ('A', 'x'), ('A', 'x'), ('A', 'y'), ('B', 'x'), ('B', 'x')",
+        )
+        .expect("seed");
+        let result = crate::create_reflex_ivm(
+            "dg_view",
+            "SELECT DISTINCT grp, val FROM dg_src",
+        );
+        assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
+        let count =
+            Spi::get_one::<i64>("SELECT COUNT(*) FROM dg_view").expect("q").expect("v");
+        // DISTINCT (A,x), (A,y), (B,x) = 3 unique pairs
+        assert_eq!(count, 3, "DISTINCT should eliminate duplicate (grp, val) pairs");
+    }
+
+    #[pg_test]
+    fn test_schema_qualified_source() {
+        Spi::run(
+            "CREATE TABLE sq_src (id SERIAL, grp TEXT NOT NULL, val NUMERIC NOT NULL)",
+        )
+        .expect("create table");
+        Spi::run("INSERT INTO sq_src (grp, val) VALUES ('A', 10), ('B', 20)").expect("seed");
+        let result = crate::create_reflex_ivm(
+            "sq_view",
+            "SELECT grp, SUM(val) AS total FROM public.sq_src GROUP BY grp",
+        );
+        assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
+        let total = Spi::get_one::<pgrx::AnyNumeric>(
+            "SELECT total FROM sq_view WHERE grp = 'A'",
+        )
+        .expect("q")
+        .expect("v");
+        assert_eq!(total.to_string(), "10");
+        // Trigger should work with schema-qualified source
+        Spi::run("INSERT INTO sq_src (grp, val) VALUES ('A', 5)").expect("insert");
+        let total2 = Spi::get_one::<pgrx::AnyNumeric>(
+            "SELECT total FROM sq_view WHERE grp = 'A'",
+        )
+        .expect("q")
+        .expect("v");
+        assert_eq!(total2.to_string(), "15");
+    }
+
+    #[pg_test]
+    fn test_insert_zero_rows() {
+        Spi::run(
+            "CREATE TABLE zr_src (id SERIAL, grp TEXT NOT NULL, val NUMERIC NOT NULL)",
+        )
+        .expect("create table");
+        Spi::run("INSERT INTO zr_src (grp, val) VALUES ('A', 10)").expect("seed");
+        crate::create_reflex_ivm(
+            "zr_view",
+            "SELECT grp, SUM(val) AS total FROM zr_src GROUP BY grp",
+        );
+        // Insert zero rows (WHERE false) — trigger fires but no delta
+        Spi::run("INSERT INTO zr_src (grp, val) SELECT 'B', 99 WHERE false").expect("empty insert");
+        let count =
+            Spi::get_one::<i64>("SELECT COUNT(*) FROM zr_view").expect("q").expect("v");
+        assert_eq!(count, 1, "Zero-row insert should not change view");
+    }
+
+    #[pg_test]
+    fn test_update_value_only() {
+        Spi::run(
+            "CREATE TABLE uvo_src (id SERIAL, grp TEXT NOT NULL, val NUMERIC NOT NULL)",
+        )
+        .expect("create table");
+        Spi::run(
+            "INSERT INTO uvo_src (grp, val) VALUES ('A', 10), ('A', 20)",
+        )
+        .expect("seed");
+        crate::create_reflex_ivm(
+            "uvo_view",
+            "SELECT grp, SUM(val) AS total FROM uvo_src GROUP BY grp",
+        );
+        // Update value, not group column
+        Spi::run("UPDATE uvo_src SET val = 50 WHERE val = 10").expect("update");
+        let total = Spi::get_one::<pgrx::AnyNumeric>(
+            "SELECT total FROM uvo_view WHERE grp = 'A'",
+        )
+        .expect("q")
+        .expect("v");
+        assert_eq!(total.to_string(), "70", "SUM should be 50 + 20 = 70");
+    }
+
+    #[pg_test]
+    fn test_multiple_deletes_same_group() {
+        Spi::run(
+            "CREATE TABLE md_src (id SERIAL, grp TEXT NOT NULL, val NUMERIC NOT NULL)",
+        )
+        .expect("create table");
+        Spi::run(
+            "INSERT INTO md_src (grp, val) VALUES ('A', 10), ('A', 20), ('A', 30), ('A', 40)",
+        )
+        .expect("seed");
+        crate::create_reflex_ivm(
+            "md_view",
+            "SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM md_src GROUP BY grp",
+        );
+        // Delete two rows separately
+        Spi::run("DELETE FROM md_src WHERE val = 10").expect("delete 1");
+        Spi::run("DELETE FROM md_src WHERE val = 30").expect("delete 2");
+        let total = Spi::get_one::<pgrx::AnyNumeric>(
+            "SELECT total FROM md_view WHERE grp = 'A'",
+        )
+        .expect("q")
+        .expect("v");
+        assert_eq!(total.to_string(), "60", "SUM should be 20 + 40 = 60");
+        let cnt = Spi::get_one::<i64>(
+            "SELECT cnt FROM md_view WHERE grp = 'A'",
+        )
+        .expect("q")
+        .expect("v");
+        assert_eq!(cnt, 2, "COUNT should be 2 after deleting 2 of 4 rows");
+    }
+
+    #[pg_test]
+    fn test_large_batch_correctness() {
+        Spi::run(
+            "CREATE TABLE lb_src (id SERIAL, grp TEXT NOT NULL, val NUMERIC NOT NULL)",
+        )
+        .expect("create table");
+        // 10K rows across 100 groups
+        Spi::run(
+            "INSERT INTO lb_src (grp, val) \
+             SELECT 'g' || (i % 100), i FROM generate_series(1, 10000) i",
+        )
+        .expect("seed 10K rows");
+        crate::create_reflex_ivm(
+            "lb_view",
+            "SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM lb_src GROUP BY grp",
+        );
+        // Compare IMV against direct query
+        let mismatches = Spi::get_one::<i64>(
+            "SELECT COUNT(*) FROM ( \
+                SELECT grp, total, cnt FROM lb_view \
+                EXCEPT \
+                SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM lb_src GROUP BY grp \
+            ) x",
+        )
+        .expect("q")
+        .expect("v");
+        assert_eq!(mismatches, 0, "IMV should match direct query for 10K rows");
+        // Insert another batch and re-verify
+        Spi::run(
+            "INSERT INTO lb_src (grp, val) \
+             SELECT 'g' || (i % 100), i FROM generate_series(10001, 15000) i",
+        )
+        .expect("insert 5K more");
+        let mismatches2 = Spi::get_one::<i64>(
+            "SELECT COUNT(*) FROM ( \
+                SELECT grp, total, cnt FROM lb_view \
+                EXCEPT \
+                SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM lb_src GROUP BY grp \
+            ) x",
+        )
+        .expect("q")
+        .expect("v");
+        assert_eq!(mismatches2, 0, "IMV should match after additional batch insert");
+    }
+
+    #[pg_test]
+    fn test_where_clause_imv() {
+        Spi::run(
+            "CREATE TABLE wc_src (id SERIAL, grp TEXT NOT NULL, val NUMERIC NOT NULL, active BOOLEAN NOT NULL)",
+        )
+        .expect("create table");
+        Spi::run(
+            "INSERT INTO wc_src (grp, val, active) VALUES \
+             ('A', 10, true), ('A', 20, false), ('B', 30, true), ('B', 40, true)",
+        )
+        .expect("seed");
+        crate::create_reflex_ivm(
+            "wc_view",
+            "SELECT grp, SUM(val) AS total FROM wc_src WHERE active = true GROUP BY grp",
+        );
+        let a = Spi::get_one::<pgrx::AnyNumeric>(
+            "SELECT total FROM wc_view WHERE grp = 'A'",
+        )
+        .expect("q")
+        .expect("v");
+        assert_eq!(a.to_string(), "10", "WHERE should filter out inactive row (val=20)");
+        let b = Spi::get_one::<pgrx::AnyNumeric>(
+            "SELECT total FROM wc_view WHERE grp = 'B'",
+        )
+        .expect("q")
+        .expect("v");
+        assert_eq!(b.to_string(), "70", "Both B rows are active: 30 + 40 = 70");
+    }
+
+    #[pg_test]
+    fn test_avg_with_all_same_values() {
+        Spi::run(
+            "CREATE TABLE avg_same_src (id SERIAL, grp TEXT NOT NULL, val NUMERIC NOT NULL)",
+        )
+        .expect("create table");
+        Spi::run(
+            "INSERT INTO avg_same_src (grp, val) VALUES ('X', 42), ('X', 42), ('X', 42)",
+        )
+        .expect("seed");
+        crate::create_reflex_ivm(
+            "avg_same_view",
+            "SELECT grp, AVG(val) AS avg_val FROM avg_same_src GROUP BY grp",
+        );
+        let avg = Spi::get_one::<pgrx::AnyNumeric>(
+            "SELECT avg_val FROM avg_same_view WHERE grp = 'X'",
+        )
+        .expect("q")
+        .expect("v");
+        // AVG of identical values should be that value (no precision loss)
+        let avg_f: f64 = avg.to_string().parse().expect("parse avg");
+        assert!(
+            (avg_f - 42.0).abs() < 0.0001,
+            "AVG of identical values should be exact, got {}",
+            avg_f
+        );
+    }
+
+    // ---- Schema support tests ----
+
+    #[pg_test]
+    fn test_schema_qualified_view_name() {
+        Spi::run("CREATE SCHEMA IF NOT EXISTS test_schema").expect("create schema");
+        Spi::run(
+            "CREATE TABLE test_schema.sq_src2 (id SERIAL, grp TEXT NOT NULL, val NUMERIC NOT NULL)",
+        )
+        .expect("create table in schema");
+        Spi::run("INSERT INTO test_schema.sq_src2 (grp, val) VALUES ('A', 10), ('B', 20)")
+            .expect("seed");
+
+        let result = crate::create_reflex_ivm(
+            "test_schema.sq_view2",
+            "SELECT grp, SUM(val) AS total FROM test_schema.sq_src2 GROUP BY grp",
+        );
+        assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
+
+        // Verify table exists in test_schema and has correct data
+        let total = Spi::get_one::<pgrx::AnyNumeric>(
+            "SELECT total FROM test_schema.sq_view2 WHERE grp = 'A'",
+        )
+        .expect("q")
+        .expect("v");
+        assert_eq!(total.to_string(), "10");
+
+        // Verify trigger fires for source table INSERTs
+        Spi::run("INSERT INTO test_schema.sq_src2 (grp, val) VALUES ('A', 5)").expect("insert");
+        let total2 = Spi::get_one::<pgrx::AnyNumeric>(
+            "SELECT total FROM test_schema.sq_view2 WHERE grp = 'A'",
+        )
+        .expect("q")
+        .expect("v");
+        assert_eq!(total2.to_string(), "15");
+
+        // Verify drop works
+        let drop_result = crate::drop_reflex_ivm("test_schema.sq_view2");
+        assert_eq!(drop_result, "DROP REFLEX INCREMENTAL VIEW");
+    }
 }
 
 /// This module is required by `cargo pgrx test` invocations.
@@ -2349,5 +2969,43 @@ pub mod pg_test {
     pub fn postgresql_conf_options() -> Vec<&'static str> {
         // return any postgresql.conf settings that are required for your tests
         vec![]
+    }
+}
+
+#[cfg(test)]
+mod proptest_tests {
+    use proptest::prelude::*;
+
+    proptest! {
+        /// Any string with characters outside [a-zA-Z0-9_.] should be rejected
+        #[test]
+        fn validate_rejects_unsafe_chars(s in "[a-zA-Z_][a-zA-Z0-9_.]{0,20}[^a-zA-Z0-9_.]+") {
+            assert!(crate::validate_view_name(&s).is_err());
+        }
+
+        /// Any valid identifier (letter/underscore start, alphanumeric/underscore/period body,
+        /// no consecutive dots, no trailing dot) should be accepted
+        #[test]
+        fn validate_accepts_safe_names(s in "[a-zA-Z_][a-zA-Z0-9_]{0,30}") {
+            assert!(crate::validate_view_name(&s).is_ok());
+        }
+
+        /// Schema-qualified names (one dot, valid parts) should be accepted
+        #[test]
+        fn validate_accepts_schema_qualified(
+            schema in "[a-zA-Z_][a-zA-Z0-9_]{0,10}",
+            name in "[a-zA-Z_][a-zA-Z0-9_]{0,10}",
+        ) {
+            let qualified = format!("{}.{}", schema, name);
+            assert!(crate::validate_view_name(&qualified).is_ok());
+        }
+
+        /// Empty string should always be rejected
+        #[test]
+        fn validate_rejects_empty(s in "[ \t\n]*") {
+            if s.is_empty() {
+                assert!(crate::validate_view_name(&s).is_err());
+            }
+        }
     }
 }

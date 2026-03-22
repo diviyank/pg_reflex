@@ -541,4 +541,10 @@ mod tests {
         );
         assert!(a.having_clause.is_some());
     }
+
+    #[test]
+    fn test_malformed_sql_parse_error() {
+        let result = Parser::parse_sql(&PostgreSqlDialect {}, "SELEC broken garbage !!!");
+        assert!(result.is_err(), "Malformed SQL should fail to parse");
+    }
 }

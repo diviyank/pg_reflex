@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use crate::aggregation::AggregationPlan;
-use crate::query_decomposer::{bare_column_name, intermediate_table_name};
+use crate::query_decomposer::{bare_column_name, intermediate_table_name, quote_identifier, split_qualified_name};
 
 /// Build the DDL for the intermediate (UNLOGGED) table.
 ///
@@ -121,8 +121,8 @@ pub fn build_target_table_ddl(
     let columns_sql = columns.join(",\n");
 
     format!(
-        "CREATE TABLE IF NOT EXISTS \"{}\" (\n{}\n)",
-        view_name, columns_sql
+        "CREATE TABLE IF NOT EXISTS {} (\n{}\n)",
+        quote_identifier(view_name), columns_sql
     )
 }
 
@@ -136,9 +136,10 @@ pub fn build_indexes_ddl(view_name: &str, plan: &AggregationPlan) -> Vec<String>
     if plan.group_by_columns.len() > 1 {
         for (i, col) in plan.group_by_columns.iter().enumerate() {
             let bare = bare_column_name(col);
+            let bare_view = split_qualified_name(view_name).1;
             indexes.push(format!(
                 "CREATE INDEX IF NOT EXISTS \"idx__reflex_{}_{}\" ON {} (\"{}\")",
-                view_name, i, table_name, bare
+                bare_view, i, table_name, bare
             ));
         }
     }

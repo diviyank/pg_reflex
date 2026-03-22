@@ -275,10 +275,39 @@ Useful columns:
 - `depends_on_imv` -- other IMVs this view depends on
 - `graph_child` -- downstream IMVs that depend on this one
 
+## API Reference
+
+### `create_reflex_ivm(view_name TEXT, sql TEXT) -> TEXT`
+
+Creates an incremental materialized view from a SELECT query. Returns `'CREATE REFLEX INCREMENTAL VIEW'` on success, or `'ERROR: ...'` on failure.
+
+View names must contain only alphanumeric characters, underscores, and periods (for schema qualification).
+
+### `drop_reflex_ivm(view_name TEXT) -> TEXT`
+
+Drops an IMV and all its artifacts (target table, intermediate table, triggers, metadata). Refuses if the IMV has child dependencies.
+
+### `drop_reflex_ivm(view_name TEXT, cascade BOOLEAN) -> TEXT`
+
+Same as above, but with `cascade = true` drops all child IMVs first.
+
+```sql
+SELECT drop_reflex_ivm('monthly_totals');           -- fails if children exist
+SELECT drop_reflex_ivm('daily_totals', true);       -- drops children first
+```
+
+### `reflex_reconcile(view_name TEXT) -> TEXT`
+
+Rebuilds the intermediate and target tables from the source data. Use to fix drift or as a periodic safety net via `pg_cron`. Returns `'RECONCILED'` on success.
+
+```sql
+SELECT reflex_reconcile('sales_by_region');
+```
+
 ## Testing
 
 ```bash
-# Run all tests (47 unit + 25 integration)
+# Run all tests (unit + integration)
 cargo test
 
 # Run only unit tests (no PostgreSQL required)
@@ -320,10 +349,8 @@ Key insight: **INSERT latency is constant regardless of table size** -- the trig
 - **Recursive CTEs:** `WITH RECURSIVE` is not supported.
 - **MIN/MAX on DELETE:** Requires full group rescan from the source table (no algebraic inverse for extrema).
 - **Non-deterministic functions:** `NOW()`, `RANDOM()`, `CURRENT_DATE` in WHERE clauses are not supported -- the view definition must be static.
-- **TRUNCATE:** Does not fire INSERT/UPDATE/DELETE triggers. A separate TRUNCATE trigger is needed (not yet implemented).
-- **NULL group keys:** PostgreSQL's `ON CONFLICT` does not match `NULL = NULL`. NULL values in GROUP BY columns are not supported.
-- **No DROP/ALTER:** There is no `drop_reflex_ivm()` function yet. To remove an IMV, manually drop the target table, intermediate table, triggers, and the metadata row.
-- **Target table refresh:** Currently does `DELETE all + INSERT all` from intermediate. A targeted refresh (only affected groups) would improve UPDATE/DELETE latency at large scales.
+- **NULL group keys:** PostgreSQL's MERGE does not match `NULL = NULL`. NULL values in GROUP BY columns are not supported.
+- **HAVING clause:** Parsed and stored in metadata but not yet enforced in trigger logic.
 
 ## Project Structure
 
@@ -334,7 +361,7 @@ src/
   aggregation.rs        -- Maps user aggregates to sufficient statistics
   query_decomposer.rs   -- Generates base_query (source->intermediate) and end_query (intermediate->target)
   schema_builder.rs     -- DDL generation: tables, indexes, triggers
-  trigger.rs            -- Delta processing: UPSERT SQL generation, target refresh
+  trigger.rs            -- Delta processing: MERGE-based delta application, targeted refresh
   bin/pgrx_embed.rs     -- pgrx binary entry point
 benchmarks/             -- SQL benchmark scripts (1K to 1M rows)
 tests/pg_regress/       -- PostgreSQL regression tests
@@ -342,4 +369,4 @@ tests/pg_regress/       -- PostgreSQL regression tests
 
 ## License
 
-TBD
+Apache License 2.0. See [LICENSE](LICENSE) for details.

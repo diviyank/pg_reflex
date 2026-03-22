@@ -2,6 +2,7 @@
 -- Measures: SELECT region, SUM(amount) AS total FROM bench_orders GROUP BY region
 
 \timing on
+SELECT setseed(0.42);
 \echo ''
 \echo '=========================================='
 \echo '  BENCHMARK: SUM Aggregate'

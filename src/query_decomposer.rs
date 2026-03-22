@@ -1,9 +1,36 @@
 use crate::aggregation::AggregationPlan;
 use crate::sql_analyzer::SqlAnalysis;
 
+/// Split a potentially schema-qualified name into (Option<schema>, name).
+/// "my_view" -> (None, "my_view")
+/// "myschema.my_view" -> (Some("myschema"), "my_view")
+pub fn split_qualified_name(name: &str) -> (Option<&str>, &str) {
+    match name.find('.') {
+        Some(pos) => (Some(&name[..pos]), &name[pos + 1..]),
+        None => (None, name),
+    }
+}
+
+/// Quote a potentially schema-qualified name for use in SQL DDL/DML.
+/// "my_view" -> "\"my_view\""
+/// "myschema.my_view" -> "\"myschema\".\"my_view\""
+pub fn quote_identifier(name: &str) -> String {
+    let (schema, tbl) = split_qualified_name(name);
+    match schema {
+        Some(s) => format!("\"{}\".\"{}\"", s, tbl),
+        None => format!("\"{}\"", tbl),
+    }
+}
+
 /// Name of the intermediate (unlogged) table for a given view.
+/// For schema-qualified names, the intermediate table is in the same schema.
 pub fn intermediate_table_name(view_name: &str) -> String {
-    format!("__reflex_intermediate_{}", view_name)
+    let (schema, name) = split_qualified_name(view_name);
+    let int_name = format!("__reflex_intermediate_{}", name);
+    match schema {
+        Some(s) => format!("\"{}\".\"{}\"", s, int_name),
+        None => int_name,
+    }
 }
 
 /// Strip table alias/qualifier from a column expression.
@@ -317,5 +344,75 @@ mod tests {
             "new_tbl",
         );
         assert_eq!(result.matches("new_tbl").count(), 2);
+    }
+
+    #[test]
+    fn test_split_qualified_name() {
+        assert_eq!(split_qualified_name("my_view"), (None, "my_view"));
+        assert_eq!(
+            split_qualified_name("myschema.my_view"),
+            (Some("myschema"), "my_view")
+        );
+    }
+
+    #[test]
+    fn test_quote_identifier_unqualified() {
+        assert_eq!(quote_identifier("my_view"), "\"my_view\"");
+    }
+
+    #[test]
+    fn test_quote_identifier_qualified() {
+        assert_eq!(
+            quote_identifier("myschema.my_view"),
+            "\"myschema\".\"my_view\""
+        );
+    }
+
+    #[test]
+    fn test_intermediate_table_name_qualified() {
+        assert_eq!(
+            intermediate_table_name("myschema.my_view"),
+            "\"myschema\".\"__reflex_intermediate_my_view\""
+        );
+    }
+
+    mod proptest_tests {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            /// bare_column_name strips table qualifier: "tbl.col" -> "col"
+            #[test]
+            fn bare_strips_qualifier(
+                tbl in "[a-z]{1,10}",
+                col in "[a-z]{1,10}",
+            ) {
+                let qualified = format!("{}.{}", tbl, col);
+                assert_eq!(bare_column_name(&qualified), col);
+            }
+
+            /// bare_column_name is identity for unqualified names
+            #[test]
+            fn bare_identity_for_unqualified(col in "[a-z_][a-z0-9_]{0,15}") {
+                assert_eq!(bare_column_name(&col), col);
+            }
+
+            /// replace_identifier never replaces partial matches
+            #[test]
+            fn replace_no_partial(
+                word in "[a-z]{2,8}",
+                suffix in "[a-z]{1,5}",
+            ) {
+                let longer = format!("{}{}", word, suffix);
+                let sql = format!("SELECT {} FROM {}", longer, longer);
+                let result = replace_identifier(&sql, &word, "REPLACED");
+                // The longer word should NOT be replaced
+                assert!(
+                    result.contains(&longer),
+                    "Partial match should not be replaced: word='{}', longer='{}', result='{}'",
+                    word, longer, result
+                );
+            }
+        }
     }
 }

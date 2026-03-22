@@ -10,6 +10,7 @@
 --                  vs traditional (INSERT + 4x REFRESH MATERIALIZED VIEW)
 
 \timing on
+SELECT setseed(0.42);
 \echo ''
 \echo '================================================================'
 \echo '  BENCHMARK: HIGH-CARDINALITY MULTI-IMV'

@@ -6,6 +6,7 @@
 -- Tests both low-cardinality (10 groups) and high-cardinality (~3,650 groups).
 
 \timing on
+SELECT setseed(0.42);
 \echo ''
 \echo '================================================================'
 \echo '  DIAGNOSTIC BENCHMARK: Trigger Pipeline Decomposition'

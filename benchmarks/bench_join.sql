@@ -4,6 +4,7 @@
 --           GROUP BY p.category
 
 \timing on
+SELECT setseed(0.42);
 \echo ''
 \echo '=========================================='
 \echo '  BENCHMARK: JOIN Aggregate'
