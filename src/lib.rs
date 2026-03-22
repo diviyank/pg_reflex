@@ -268,6 +268,43 @@ fn create_reflex_ivm(view_name: &str, sql: &str) -> &'static str {
             if source.starts_with('<') {
                 continue;
             }
+
+            // Check if source is a materialized view (can't have triggers)
+            let (src_schema, src_name) = split_qualified_name(source);
+            let src_schema_str = src_schema.unwrap_or("public").to_string();
+            let is_matview = client
+                .select(
+                    "SELECT 1 FROM pg_class c JOIN pg_namespace n ON c.relnamespace = n.oid \
+                     WHERE n.nspname = $1 AND c.relname = $2 AND c.relkind = 'm'",
+                    None,
+                    &[
+                        unsafe {
+                            DatumWithOid::new(
+                                src_schema_str.clone(),
+                                PgBuiltInOids::TEXTOID.oid().value(),
+                            )
+                        },
+                        unsafe {
+                            DatumWithOid::new(
+                                src_name.to_string(),
+                                PgBuiltInOids::TEXTOID.oid().value(),
+                            )
+                        },
+                    ],
+                )
+                .unwrap_or_report()
+                .len()
+                > 0;
+
+            if is_matview {
+                warning!(
+                    "pg_reflex: source '{}' is a materialized view — triggers skipped. \
+                     Use SELECT refresh_imv_depending_on('{}') after REFRESH MATERIALIZED VIEW.",
+                    source, source
+                );
+                continue;
+            }
+
             let safe_source = source.replace('.', "_");
             let trig_exists = client
                 .select(
@@ -773,6 +810,61 @@ fn reflex_reconcile(view_name: &str) -> &'static str {
         info!("pg_reflex: reconciled IMV '{}'", view_name);
         "RECONCILED"
     })
+}
+
+/// Refresh a single IMV by rebuilding from source. Alias for reflex_reconcile.
+/// Use after REFRESH MATERIALIZED VIEW on a source that feeds this IMV.
+#[pg_extern]
+fn refresh_reflex_imv(view_name: &str) -> &'static str {
+    reflex_reconcile(view_name)
+}
+
+/// Refresh ALL IMVs that depend on a given source table or materialized view.
+/// Processes IMVs in graph_depth order (L1 before L2).
+#[pg_extern]
+fn refresh_imv_depending_on(source: &str) -> &'static str {
+    // Collect IMV names in a separate SPI connection (closed before reconcile calls)
+    let names: Vec<String> = Spi::connect(|client| {
+        client
+            .select(
+                "SELECT name FROM public.__reflex_ivm_reference \
+                 WHERE $1 = ANY(depends_on) AND enabled = TRUE \
+                 ORDER BY graph_depth",
+                None,
+                &[unsafe {
+                    DatumWithOid::new(
+                        source.to_string(),
+                        PgBuiltInOids::TEXTOID.oid().value(),
+                    )
+                }],
+            )
+            .unwrap_or_report()
+            .filter_map(|row| {
+                row.get_by_name::<&str, _>("name")
+                    .unwrap_or(None)
+                    .map(|s| s.to_string())
+            })
+            .collect()
+    });
+
+    if names.is_empty() {
+        warning!("pg_reflex: no IMVs depend on '{}'", source);
+        return "REFRESHED 0 IMVs";
+    }
+
+    let count = names.len();
+    for name in &names {
+        let result = reflex_reconcile(name);
+        if result.starts_with("ERROR") {
+            warning!("pg_reflex: failed to refresh '{}': {}", name, result);
+        }
+    }
+
+    info!(
+        "pg_reflex: refreshed {} IMV(s) depending on '{}'",
+        count, source
+    );
+    Box::leak(format!("REFRESHED {} IMVs", count).into_boxed_str())
 }
 
 #[pg_extern]
@@ -3302,6 +3394,101 @@ mod tests {
         .expect("q")
         .expect("v");
         assert_eq!(total.to_string(), "60", "A total should be 10+20+30=60");
+    }
+
+    // ---- Materialized view + refresh tests ----
+
+    #[pg_test]
+    fn test_matview_source_skip_triggers() {
+        // Create a base table and a materialized view on it
+        Spi::run("CREATE TABLE mv_base (id SERIAL, grp TEXT NOT NULL, val NUMERIC NOT NULL)")
+            .expect("create base");
+        Spi::run("INSERT INTO mv_base (grp, val) VALUES ('A', 10), ('B', 20)")
+            .expect("seed base");
+        Spi::run("CREATE MATERIALIZED VIEW mv_src AS SELECT grp, SUM(val) AS total FROM mv_base GROUP BY grp")
+            .expect("create matview");
+
+        // Create an IMV that reads from the materialized view — should succeed
+        // (triggers skipped for matview, warning emitted)
+        let result = crate::create_reflex_ivm(
+            "mv_imv",
+            "SELECT grp, SUM(total) AS grand_total FROM mv_src GROUP BY grp",
+        );
+        assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
+
+        // Verify initial data is correct
+        let a = Spi::get_one::<pgrx::AnyNumeric>(
+            "SELECT grand_total FROM mv_imv WHERE grp = 'A'",
+        )
+        .expect("q")
+        .expect("v");
+        assert_eq!(a.to_string(), "10");
+
+        // Insert into base table and refresh the matview
+        Spi::run("INSERT INTO mv_base (grp, val) VALUES ('A', 5)").expect("insert");
+        Spi::run("REFRESH MATERIALIZED VIEW mv_src").expect("refresh matview");
+
+        // IMV is stale (no triggers on matview) — still shows old value
+        let a_stale = Spi::get_one::<pgrx::AnyNumeric>(
+            "SELECT grand_total FROM mv_imv WHERE grp = 'A'",
+        )
+        .expect("q")
+        .expect("v");
+        assert_eq!(a_stale.to_string(), "10", "IMV should be stale before refresh");
+
+        // Refresh the IMV — should pick up new matview data
+        let refresh = crate::refresh_reflex_imv("mv_imv");
+        assert_eq!(refresh, "RECONCILED");
+
+        let a_fresh = Spi::get_one::<pgrx::AnyNumeric>(
+            "SELECT grand_total FROM mv_imv WHERE grp = 'A'",
+        )
+        .expect("q")
+        .expect("v");
+        assert_eq!(a_fresh.to_string(), "15", "After refresh, IMV should have 10+5=15");
+    }
+
+    #[pg_test]
+    fn test_refresh_imv_depending_on() {
+        Spi::run("CREATE TABLE rdep_src (id SERIAL, grp TEXT NOT NULL, val NUMERIC NOT NULL)")
+            .expect("create table");
+        Spi::run("INSERT INTO rdep_src (grp, val) VALUES ('X', 10), ('Y', 20)")
+            .expect("seed");
+
+        // Create two IMVs on the same source
+        crate::create_reflex_ivm(
+            "rdep_v1",
+            "SELECT grp, SUM(val) AS total FROM rdep_src GROUP BY grp",
+        );
+        crate::create_reflex_ivm(
+            "rdep_v2",
+            "SELECT grp, COUNT(*) AS cnt FROM rdep_src GROUP BY grp",
+        );
+
+        // Corrupt both by directly modifying intermediate tables
+        Spi::run("UPDATE __reflex_intermediate_rdep_v1 SET \"__sum_val\" = 999 WHERE \"grp\" = 'X'")
+            .expect("corrupt v1");
+        Spi::run("UPDATE __reflex_intermediate_rdep_v2 SET \"__count_star\" = 999 WHERE \"grp\" = 'X'")
+            .expect("corrupt v2");
+
+        // Refresh all IMVs depending on rdep_src
+        let result = crate::refresh_imv_depending_on("rdep_src");
+        assert!(result.contains("2"), "Should refresh 2 IMVs, got: {}", result);
+
+        // Verify both are fixed
+        let v1 = Spi::get_one::<pgrx::AnyNumeric>(
+            "SELECT total FROM rdep_v1 WHERE grp = 'X'",
+        )
+        .expect("q")
+        .expect("v");
+        assert_eq!(v1.to_string(), "10", "v1 should be fixed after refresh");
+
+        let v2 = Spi::get_one::<i64>(
+            "SELECT cnt FROM rdep_v2 WHERE grp = 'X'",
+        )
+        .expect("q")
+        .expect("v");
+        assert_eq!(v2, 1, "v2 should be fixed after refresh");
     }
 }
 

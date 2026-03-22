@@ -1,5 +1,21 @@
 # Changelog
 
+## [1.0.1] - 2026-03-22
+
+### Added
+- Materialized view support as source tables (triggers auto-skipped, warning emitted)
+- `refresh_reflex_imv(view_name)` — refresh a single IMV (alias for `reflex_reconcile`)
+- `refresh_imv_depending_on(source)` — refresh all IMVs depending on a source table or materialized view
+- HAVING clause support with AST-based rewriting (handles complex expressions like `AVG(x) > COUNT(*)`)
+- Auto-detection of HAVING aggregates not in SELECT list (added to intermediate table automatically)
+- Incremental passthrough DELETE/UPDATE (O(delta) row-matching instead of O(N) full refresh)
+- Multi-level cascade confirmed and tested (works to arbitrary depth)
+- CTE passthrough support (passthrough CTEs become sub-IMV tables)
+
+### Fixed
+- Materialized views no longer cause "cannot have triggers" error
+- Passthrough DELETE/UPDATE no longer does full table refresh
+
 ## [1.0.0] - 2026-03-22
 
 ### Added
