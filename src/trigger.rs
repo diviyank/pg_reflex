@@ -231,14 +231,49 @@ pub fn reflex_build_delta_sql(
     let mut stmts: Vec<String> = Vec::new();
 
     if plan.is_passthrough {
+        let qv = quote_identifier(view_name);
         match operation {
             "INSERT" => {
                 let delta_q = base_query.replace(source_table, &format!("\"{}\"", new_tbl));
-                stmts.push(format!("INSERT INTO {} {}", quote_identifier(view_name), delta_q));
+                stmts.push(format!("INSERT INTO {} {}", qv, delta_q));
             }
-            "DELETE" | "UPDATE" => {
-                stmts.push(format!("DELETE FROM {}", quote_identifier(view_name)));
-                stmts.push(format!("INSERT INTO {} {}", quote_identifier(view_name), base_query));
+            "DELETE" => {
+                if plan.passthrough_columns.is_empty() {
+                    // Legacy fallback: full refresh
+                    stmts.push(format!("DELETE FROM {}", qv));
+                    stmts.push(format!("INSERT INTO {} {}", qv, base_query));
+                } else {
+                    let delta_q = base_query.replace(source_table, &format!("\"{}\"", old_tbl));
+                    let match_clause = plan.passthrough_columns.iter()
+                        .map(|c| format!("{}.\"{}\" IS NOT DISTINCT FROM __d.\"{}\"", qv, c, c))
+                        .collect::<Vec<_>>()
+                        .join(" AND ");
+                    stmts.push(format!(
+                        "DELETE FROM {} USING ({}) __d WHERE {}",
+                        qv, delta_q, match_clause
+                    ));
+                }
+            }
+            "UPDATE" => {
+                if plan.passthrough_columns.is_empty() {
+                    // Legacy fallback: full refresh
+                    stmts.push(format!("DELETE FROM {}", qv));
+                    stmts.push(format!("INSERT INTO {} {}", qv, base_query));
+                } else {
+                    // Phase 1: subtract old values
+                    let delta_old = base_query.replace(source_table, &format!("\"{}\"", old_tbl));
+                    let match_clause = plan.passthrough_columns.iter()
+                        .map(|c| format!("{}.\"{}\" IS NOT DISTINCT FROM __d.\"{}\"", qv, c, c))
+                        .collect::<Vec<_>>()
+                        .join(" AND ");
+                    stmts.push(format!(
+                        "DELETE FROM {} USING ({}) __d WHERE {}",
+                        qv, delta_old, match_clause
+                    ));
+                    // Phase 2: add new values
+                    let delta_new = base_query.replace(source_table, &format!("\"{}\"", new_tbl));
+                    stmts.push(format!("INSERT INTO {} {}", qv, delta_new));
+                }
             }
             _ => {}
         }
@@ -423,6 +458,7 @@ mod tests {
             needs_ivm_count: true,
             distinct_columns: vec![],
             is_passthrough: false,
+            passthrough_columns: vec![],
         }
     }
 
@@ -464,6 +500,7 @@ mod tests {
             needs_ivm_count: true,
             distinct_columns: vec![],
             is_passthrough: false,
+            passthrough_columns: vec![],
         };
         let delta = "SELECT city, MIN(price) AS \"__min_price\", COUNT(*) AS __ivm_count FROM src GROUP BY city";
         let sql = build_merge_sql("intermediate", delta, &plan, DeltaOp::Add);
@@ -485,6 +522,7 @@ mod tests {
             needs_ivm_count: true,
             distinct_columns: vec![],
             is_passthrough: false,
+            passthrough_columns: vec![],
         };
         let delta = "SELECT city, MIN(price) FROM src GROUP BY city";
         let sql = build_merge_sql("intermediate", delta, &plan, DeltaOp::Subtract);
@@ -514,6 +552,7 @@ mod tests {
             needs_ivm_count: true,
             distinct_columns: vec![],
             is_passthrough: false,
+            passthrough_columns: vec![],
         };
         let sql = build_min_max_recompute_sql("intermediate", &plan, "orders");
         assert!(sql.is_some());

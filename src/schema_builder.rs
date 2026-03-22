@@ -318,6 +318,7 @@ mod tests {
             needs_ivm_count: true,
             distinct_columns: vec![],
             is_passthrough: false,
+            passthrough_columns: vec![],
         }
     }
 
@@ -407,6 +408,7 @@ mod tests {
             needs_ivm_count: true,
             distinct_columns: vec![],
             is_passthrough: false,
+            passthrough_columns: vec![],
         };
         let types = HashMap::new();
         assert!(build_intermediate_table_ddl("test_view", &plan, &types).is_none());

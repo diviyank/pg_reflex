@@ -39,6 +39,9 @@ pub struct AggregationPlan {
     /// True when query has no GROUP BY, no aggregates, no DISTINCT.
     /// Passthrough IMVs skip the intermediate table and modify the target directly.
     pub is_passthrough: bool,
+    /// Column names in the passthrough SELECT list (used for incremental DELETE/UPDATE matching).
+    #[serde(default)]
+    pub passthrough_columns: Vec<String>,
 }
 
 /// Sanitize a SQL expression to be used as part of a column name.
@@ -199,6 +202,20 @@ pub fn plan_aggregation(analysis: &SqlAnalysis) -> AggregationPlan {
         Vec::new()
     };
 
+    // For passthrough queries, collect column names for incremental DELETE/UPDATE
+    let passthrough_columns = if is_passthrough {
+        analysis
+            .select_columns
+            .iter()
+            .map(|c| {
+                let name = c.alias.as_deref().unwrap_or(&c.expr_sql);
+                crate::query_decomposer::bare_column_name(name).to_string()
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
     AggregationPlan {
         group_by_columns: analysis.group_by_columns.clone(),
         intermediate_columns,
@@ -207,6 +224,7 @@ pub fn plan_aggregation(analysis: &SqlAnalysis) -> AggregationPlan {
         needs_ivm_count,
         distinct_columns,
         is_passthrough,
+        passthrough_columns,
     }
 }
 

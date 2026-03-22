@@ -4,6 +4,27 @@
 
 pg_reflex is a PostgreSQL extension that maintains materialized views incrementally. When source data changes (INSERT, UPDATE, DELETE), only the affected groups are recomputed -- not the entire dataset. This turns O(N) `REFRESH MATERIALIZED VIEW` into O(delta) trigger-based updates.
 
+## Installation
+
+### Pre-built packages (recommended)
+
+Download the `.deb` package for your PostgreSQL version from [GitHub Releases](https://github.com/fentech/pg_reflex/releases):
+
+```bash
+# Example for PostgreSQL 17
+sudo dpkg -i pg-reflex-1.0.0-pg17-amd64.deb
+```
+
+### From source
+
+Requires Rust toolchain and [cargo-pgrx](https://github.com/pgcentralfoundation/pgrx):
+
+```bash
+cargo install cargo-pgrx --version '=0.16.1' --locked
+cargo pgrx init --pg17 download
+cargo pgrx install --release --pg-config $(pg_config)
+```
+
 ## Quick Start
 
 ```sql
@@ -48,33 +69,6 @@ SELECT * FROM sales_by_region;
 -- --------+-------
 --  US     |   250
 --  EU     |   350
-```
-
-## Installation
-
-### Prerequisites
-
-- PostgreSQL 13-18
-- Rust toolchain (stable)
-- [pgrx](https://github.com/pgcentralfoundation/pgrx) v0.16.1
-
-### Build & Install
-
-```bash
-# Install pgrx if you haven't
-cargo install cargo-pgrx --version 0.16.1
-cargo pgrx init --pg17 $(which pg_config)  # adjust for your PG version
-
-# Build and install
-cargo pgrx install --release
-
-# Or run a development instance
-cargo pgrx run pg17
-```
-
-Then in psql:
-```sql
-CREATE EXTENSION pg_reflex;
 ```
 
 ## API Reference
@@ -216,15 +210,14 @@ Source Table(s)
 
 When you INSERT, UPDATE, or DELETE rows in a source table:
 
-1. **Statement-level triggers** fire (one per operation type)
-2. The trigger copies the **transition table** (new/old rows) into a temp table
-3. A Rust function generates **UPSERT SQL** from the stored `base_query`, replacing the source table with the delta temp table
-4. The UPSERT merges the delta into the **intermediate table** using `ON CONFLICT DO UPDATE SET`:
+1. **Statement-level triggers** fire (one per operation type, shared across all IMVs on the same source)
+2. A Rust function generates **MERGE SQL** from the stored `base_query`, replacing the source table reference with the transition table (new/old rows)
+3. The MERGE applies the delta to the **intermediate table**:
    - For INSERT: `__sum_x = intermediate.__sum_x + delta.__sum_x`
    - For DELETE: `__sum_x = intermediate.__sum_x - delta.__sum_x`
-   - For UPDATE: subtract old values, then add new values
-5. The **target table** is refreshed from the intermediate table using the stored `end_query`
-6. `__ivm_count` tracks how many source rows contribute to each group -- groups with `__ivm_count = 0` are excluded from the target
+   - For UPDATE: subtract old values, then add new values (two-phase)
+4. **Targeted refresh**: only the affected groups (identified via a temp table of changed group keys) are deleted and re-inserted into the **target table** from the intermediate table
+5. `__ivm_count` tracks how many source rows contribute to each group -- groups with `__ivm_count = 0` are excluded from the target
 
 ### Sufficient Statistics
 
@@ -251,7 +244,7 @@ SELECT create_reflex_ivm('monthly_totals',
      FROM daily_totals GROUP BY date_trunc(''month'', date)');
 ```
 
-> **Note:** Multi-level cascading propagation (L1 triggers automatically updating L2) is a known v1 limitation. Single-level trigger propagation works correctly. For chained views, a manual refresh of downstream views may be needed after bulk operations.
+Multi-level cascading propagation works automatically -- when L1 updates its target table, PostgreSQL fires L2's triggers, which process their own delta. This works to arbitrary depth.
 
 ## Metadata & Introspection
 
@@ -343,9 +336,7 @@ Key insight: **INSERT latency is constant regardless of table size** -- the trig
 
 ## Known Limitations
 
-- **Multi-level cascading:** Chained IMVs (A triggers B triggers C) require explicit graph traversal, not yet implemented. Single-level propagation works. CTE-based views use VIEWs for the outer layer which avoids this issue.
-- **Passthrough DELETE/UPDATE:** For passthrough IMVs (no aggregation), DELETE and UPDATE triggers do a full refresh from source (O(N)). INSERT is incremental (O(delta)). Aggregate IMVs are fully incremental for all operations.
-- **CTE passthrough requirement:** Each CTE must contain GROUP BY, aggregation, or DISTINCT. Passthrough CTEs (`WITH filtered AS (SELECT * FROM t WHERE ...)`) are not yet supported as sub-IMVs.
+- **Passthrough DELETE/UPDATE with exact duplicates:** Passthrough IMVs use row-matching for incremental DELETE/UPDATE. If the view contains rows that are identical across ALL columns (exact duplicates), a single-row delete may remove multiple matching rows. This is rare in practice (most queries include a PK or unique column).
 - **Recursive CTEs:** `WITH RECURSIVE` is not supported.
 - **MIN/MAX on DELETE:** Requires full group rescan from the source table (no algebraic inverse for extrema).
 - **Non-deterministic functions:** `NOW()`, `RANDOM()`, `CURRENT_DATE` in WHERE clauses are not supported -- the view definition must be static.

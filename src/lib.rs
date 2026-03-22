@@ -2955,6 +2955,252 @@ mod tests {
         let drop_result = crate::drop_reflex_ivm("test_schema.sq_view2");
         assert_eq!(drop_result, "DROP REFLEX INCREMENTAL VIEW");
     }
+
+    // ---- Multi-level cascade test ----
+
+    #[pg_test]
+    fn test_multi_level_cascade_propagation() {
+        // Base table
+        Spi::run(
+            "CREATE TABLE mlc_src (id SERIAL, region TEXT NOT NULL, amount NUMERIC NOT NULL)",
+        )
+        .expect("create base table");
+        Spi::run(
+            "INSERT INTO mlc_src (region, amount) VALUES ('US', 100), ('US', 200), ('EU', 150)",
+        )
+        .expect("seed");
+
+        // L1: aggregates base by region
+        let r1 = crate::create_reflex_ivm(
+            "mlc_l1",
+            "SELECT region, SUM(amount) AS total, COUNT(*) AS cnt FROM mlc_src GROUP BY region",
+        );
+        assert_eq!(r1, "CREATE REFLEX INCREMENTAL VIEW");
+
+        // L2: aggregates L1 (re-aggregates totals — tests cascade)
+        let r2 = crate::create_reflex_ivm(
+            "mlc_l2",
+            "SELECT region, SUM(total) AS grand_total FROM mlc_l1 GROUP BY region",
+        );
+        assert_eq!(r2, "CREATE REFLEX INCREMENTAL VIEW");
+
+        // Verify initial state
+        let l1_us = Spi::get_one::<pgrx::AnyNumeric>(
+            "SELECT total FROM mlc_l1 WHERE region = 'US'",
+        ).expect("q").expect("v");
+        assert_eq!(l1_us.to_string(), "300", "L1 US = 100 + 200");
+
+        let l2_us = Spi::get_one::<pgrx::AnyNumeric>(
+            "SELECT grand_total FROM mlc_l2 WHERE region = 'US'",
+        ).expect("q").expect("v");
+        assert_eq!(l2_us.to_string(), "300", "L2 US = L1 US = 300");
+
+        // INSERT into base → both L1 and L2 should update
+        Spi::run("INSERT INTO mlc_src (region, amount) VALUES ('US', 50)").expect("insert");
+
+        let l1_after_ins = Spi::get_one::<pgrx::AnyNumeric>(
+            "SELECT total FROM mlc_l1 WHERE region = 'US'",
+        ).expect("q").expect("v");
+        assert_eq!(l1_after_ins.to_string(), "350", "L1 US after insert = 350");
+
+        let l2_after_ins = Spi::get_one::<pgrx::AnyNumeric>(
+            "SELECT grand_total FROM mlc_l2 WHERE region = 'US'",
+        ).expect("q").expect("v");
+        assert_eq!(l2_after_ins.to_string(), "350", "L2 US should cascade from L1");
+
+        // UPDATE base (change amount) → both levels should reflect
+        Spi::run("UPDATE mlc_src SET amount = 500 WHERE amount = 200").expect("update");
+
+        let l1_after_upd = Spi::get_one::<pgrx::AnyNumeric>(
+            "SELECT total FROM mlc_l1 WHERE region = 'US'",
+        ).expect("q").expect("v");
+        assert_eq!(l1_after_upd.to_string(), "650", "L1 US after update = 100 + 500 + 50");
+
+        let l2_after_upd = Spi::get_one::<pgrx::AnyNumeric>(
+            "SELECT grand_total FROM mlc_l2 WHERE region = 'US'",
+        ).expect("q").expect("v");
+        assert_eq!(l2_after_upd.to_string(), "650", "L2 US should cascade update");
+
+        // DELETE from base → both levels update
+        Spi::run("DELETE FROM mlc_src WHERE amount = 100").expect("delete");
+
+        let l1_after_del = Spi::get_one::<pgrx::AnyNumeric>(
+            "SELECT total FROM mlc_l1 WHERE region = 'US'",
+        ).expect("q").expect("v");
+        assert_eq!(l1_after_del.to_string(), "550", "L1 US after delete = 500 + 50");
+
+        let l2_after_del = Spi::get_one::<pgrx::AnyNumeric>(
+            "SELECT grand_total FROM mlc_l2 WHERE region = 'US'",
+        ).expect("q").expect("v");
+        assert_eq!(l2_after_del.to_string(), "550", "L2 US should cascade delete");
+
+        // DELETE all US rows → US group should disappear from both levels
+        Spi::run("DELETE FROM mlc_src WHERE region = 'US'").expect("delete all US");
+
+        let l1_count = Spi::get_one::<i64>(
+            "SELECT COUNT(*) FROM mlc_l1 WHERE region = 'US'",
+        ).expect("q").expect("v");
+        assert_eq!(l1_count, 0, "L1 US group should be gone");
+
+        let l2_count = Spi::get_one::<i64>(
+            "SELECT COUNT(*) FROM mlc_l2 WHERE region = 'US'",
+        ).expect("q").expect("v");
+        assert_eq!(l2_count, 0, "L2 US group should cascade-disappear");
+
+        // EU should still be intact at both levels
+        let l2_eu = Spi::get_one::<pgrx::AnyNumeric>(
+            "SELECT grand_total FROM mlc_l2 WHERE region = 'EU'",
+        ).expect("q").expect("v");
+        assert_eq!(l2_eu.to_string(), "150", "L2 EU untouched");
+    }
+
+    // ---- Incremental passthrough DELETE/UPDATE tests ----
+
+    #[pg_test]
+    fn test_passthrough_incremental_delete() {
+        Spi::run(
+            "CREATE TABLE pt_del_src (id SERIAL PRIMARY KEY, region TEXT NOT NULL, val INT NOT NULL)",
+        )
+        .expect("create table");
+        Spi::run(
+            "INSERT INTO pt_del_src (region, val) VALUES ('A', 1), ('A', 2), ('B', 3), ('B', 4), ('C', 5)",
+        )
+        .expect("seed");
+        crate::create_reflex_ivm(
+            "pt_del_view",
+            "SELECT id, region, val FROM pt_del_src",
+        );
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT COUNT(*) FROM pt_del_view").expect("q").expect("v"),
+            5,
+            "Initial view should have 5 rows"
+        );
+
+        // Delete 2 specific rows
+        Spi::run("DELETE FROM pt_del_src WHERE id IN (2, 4)").expect("delete");
+
+        let count =
+            Spi::get_one::<i64>("SELECT COUNT(*) FROM pt_del_view").expect("q").expect("v");
+        assert_eq!(count, 3, "View should have 3 rows after deleting 2");
+
+        // Verify exact content matches source
+        let mismatches = Spi::get_one::<i64>(
+            "SELECT COUNT(*) FROM (
+                SELECT id, region, val FROM pt_del_view
+                EXCEPT
+                SELECT id, region, val FROM pt_del_src
+            ) x",
+        )
+        .expect("q")
+        .expect("v");
+        assert_eq!(mismatches, 0, "View should exactly match source after delete");
+    }
+
+    #[pg_test]
+    fn test_passthrough_incremental_update() {
+        Spi::run(
+            "CREATE TABLE pt_upd_src (id SERIAL PRIMARY KEY, region TEXT NOT NULL, val INT NOT NULL)",
+        )
+        .expect("create table");
+        Spi::run(
+            "INSERT INTO pt_upd_src (region, val) VALUES ('A', 10), ('B', 20), ('C', 30)",
+        )
+        .expect("seed");
+        crate::create_reflex_ivm(
+            "pt_upd_view",
+            "SELECT id, region, val FROM pt_upd_src",
+        );
+
+        // Update a value
+        Spi::run("UPDATE pt_upd_src SET val = 99 WHERE region = 'B'").expect("update");
+
+        let val = Spi::get_one::<i32>(
+            "SELECT val FROM pt_upd_view WHERE region = 'B'",
+        )
+        .expect("q")
+        .expect("v");
+        assert_eq!(val, 99, "Updated value should propagate to view");
+
+        // Update region (changes a different column)
+        Spi::run("UPDATE pt_upd_src SET region = 'D' WHERE val = 99").expect("update region");
+
+        let count_b =
+            Spi::get_one::<i64>("SELECT COUNT(*) FROM pt_upd_view WHERE region = 'B'")
+                .expect("q")
+                .expect("v");
+        assert_eq!(count_b, 0, "Old region B should be gone from view");
+
+        let count_d =
+            Spi::get_one::<i64>("SELECT COUNT(*) FROM pt_upd_view WHERE region = 'D'")
+                .expect("q")
+                .expect("v");
+        assert_eq!(count_d, 1, "New region D should appear in view");
+
+        // Full content check
+        let mismatches = Spi::get_one::<i64>(
+            "SELECT COUNT(*) FROM (
+                SELECT id, region, val FROM pt_upd_view
+                EXCEPT
+                SELECT id, region, val FROM pt_upd_src
+            ) x",
+        )
+        .expect("q")
+        .expect("v");
+        assert_eq!(mismatches, 0, "View should exactly match source after updates");
+    }
+
+    #[pg_test]
+    fn test_cte_passthrough_sub_imv() {
+        Spi::run(
+            "CREATE TABLE cte_pt_src (id SERIAL, region TEXT NOT NULL, val INT NOT NULL, active BOOLEAN NOT NULL)",
+        )
+        .expect("create table");
+        Spi::run(
+            "INSERT INTO cte_pt_src (region, val, active) VALUES \
+             ('A', 10, true), ('A', 20, false), ('B', 30, true)",
+        )
+        .expect("seed");
+
+        // CTE is passthrough (no aggregation) — should become a passthrough sub-IMV
+        let result = crate::create_reflex_ivm(
+            "cte_pt_view",
+            "WITH active_orders AS (
+                SELECT id, region, val FROM cte_pt_src WHERE active = true
+            )
+            SELECT region, SUM(val) AS total FROM active_orders GROUP BY region",
+        );
+        assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
+
+        // Verify initial state
+        let a = Spi::get_one::<pgrx::AnyNumeric>(
+            "SELECT total FROM cte_pt_view WHERE region = 'A'",
+        )
+        .expect("q")
+        .expect("v");
+        assert_eq!(a.to_string(), "10", "Only active A rows: 10");
+
+        // Insert active row → should propagate through CTE sub-IMV
+        Spi::run("INSERT INTO cte_pt_src (region, val, active) VALUES ('A', 5, true)")
+            .expect("insert");
+
+        let a2 = Spi::get_one::<pgrx::AnyNumeric>(
+            "SELECT total FROM cte_pt_view WHERE region = 'A'",
+        )
+        .expect("q")
+        .expect("v");
+        assert_eq!(a2.to_string(), "15", "After insert active A: 10 + 5 = 15");
+
+        // Insert inactive row → should NOT affect view
+        Spi::run("INSERT INTO cte_pt_src (region, val, active) VALUES ('A', 100, false)")
+            .expect("insert inactive");
+
+        let a3 = Spi::get_one::<pgrx::AnyNumeric>(
+            "SELECT total FROM cte_pt_view WHERE region = 'A'",
+        )
+        .expect("q")
+        .expect("v");
+        assert_eq!(a3.to_string(), "15", "Inactive row should not affect view");
+    }
 }
 
 /// This module is required by `cargo pgrx test` invocations.

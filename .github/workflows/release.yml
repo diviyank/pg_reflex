@@ -1,0 +1,132 @@
+name: Release
+
+on:
+  push:
+    tags: ['[0-9]+.[0-9]+.[0-9]+*']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: [15, 17, 18]
+    name: "Build pg${{ matrix.pg }}"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-all-crates: true
+
+      - name: Cache pgrx
+        uses: actions/cache@v4
+        with:
+          path: ~/.pgrx/
+          key: pgrx-release-pg${{ matrix.pg }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: pgrx-release-pg${{ matrix.pg }}-
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libpq-dev
+
+      - name: Install cargo-pgrx
+        run: cargo install cargo-pgrx --version '=0.16.1' --locked
+
+      - name: Initialize pgrx
+        run: cargo pgrx init --pg${{ matrix.pg }} download
+
+      - name: Validate version matches tag
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME}"
+          CARGO_VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          if [ "$TAG_VERSION" != "$CARGO_VERSION" ]; then
+            echo "ERROR: Tag '$TAG_VERSION' does not match Cargo.toml version '$CARGO_VERSION'"
+            exit 1
+          fi
+          echo "VERSION=$CARGO_VERSION" >> "$GITHUB_ENV"
+
+      - name: Build release
+        run: |
+          PG_CONFIG=$(find ~/.pgrx -path "*/${{ matrix.pg }}.*/pgrx-install/bin/pg_config" -print -quit)
+          cargo pgrx install --release --pg-config "$PG_CONFIG"
+
+      - name: Package .deb
+        run: |
+          PGRX_DIR=$(find ~/.pgrx -path "*/${{ matrix.pg }}.*/pgrx-install/bin/pg_config" -print -quit | xargs dirname | xargs dirname | xargs dirname)
+          PG_MAJOR=${{ matrix.pg }}
+          PKG_NAME="pg-reflex-${VERSION}-pg${PG_MAJOR}-amd64"
+          PKG_DIR="/tmp/${PKG_NAME}"
+
+          # Create directory structure matching standard PostgreSQL paths
+          mkdir -p "${PKG_DIR}/usr/lib/postgresql/${PG_MAJOR}/lib"
+          mkdir -p "${PKG_DIR}/usr/share/postgresql/${PG_MAJOR}/extension"
+          mkdir -p "${PKG_DIR}/DEBIAN"
+
+          # Copy extension files from pgrx install
+          cp "${PGRX_DIR}/pgrx-install/lib/postgresql/pg_reflex.so" \
+             "${PKG_DIR}/usr/lib/postgresql/${PG_MAJOR}/lib/"
+          cp "${PGRX_DIR}/pgrx-install/share/postgresql/extension/pg_reflex.control" \
+             "${PKG_DIR}/usr/share/postgresql/${PG_MAJOR}/extension/"
+          cp "${PGRX_DIR}/pgrx-install/share/postgresql/extension/pg_reflex--${VERSION}.sql" \
+             "${PKG_DIR}/usr/share/postgresql/${PG_MAJOR}/extension/"
+
+          # Create DEBIAN/control
+          cat > "${PKG_DIR}/DEBIAN/control" <<EOF
+          Package: pg-reflex-pg${PG_MAJOR}
+          Version: ${VERSION}
+          Section: database
+          Priority: optional
+          Architecture: amd64
+          Depends: postgresql-${PG_MAJOR}
+          Maintainer: Diviyan Kalainathan
+          Homepage: https://github.com/fentech/pg_reflex
+          Description: Incremental materialized view maintenance for PostgreSQL ${PG_MAJOR}
+           pg_reflex maintains materialized views incrementally via triggers,
+           processing only delta rows instead of full table scans.
+          EOF
+          # Remove leading whitespace from heredoc (DEBIAN/control is whitespace-sensitive)
+          sed -i 's/^          //' "${PKG_DIR}/DEBIAN/control"
+
+          # Build .deb
+          dpkg-deb --build "${PKG_DIR}" "/tmp/${PKG_NAME}.deb"
+
+          echo "DEB_PATH=/tmp/${PKG_NAME}.deb" >> "$GITHUB_ENV"
+          echo "DEB_NAME=${PKG_NAME}.deb" >> "$GITHUB_ENV"
+
+      - name: Upload .deb artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.DEB_NAME }}
+          path: ${{ env.DEB_PATH }}
+
+  release:
+    name: "Create Release"
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/artifacts
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="${GITHUB_REF_NAME}"
+
+          # Collect all .deb files
+          DEBS=$(find /tmp/artifacts -name '*.deb' -type f)
+
+          gh release create "$VERSION" \
+            --title "pg_reflex $VERSION" \
+            --generate-notes \
+            $DEBS
