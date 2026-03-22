@@ -6,31 +6,56 @@ pg_reflex is a PostgreSQL extension that maintains materialized views incrementa
 
 ## Installation
 
-### Pre-built packages (recommended)
+### Option A: Pre-built package (recommended)
 
-Download the `.deb` package for your PostgreSQL version from [GitHub Releases](https://github.com/fentech/pg_reflex/releases):
+Download and install the `.deb` package for your PostgreSQL version:
 
 ```bash
-# Example for PostgreSQL 17
+# Download the package (replace 1.0.0 and pg17 with your version)
+wget https://github.com/diviyank/pg_reflex/releases/download/1.0.0/pg-reflex-1.0.0-pg17-amd64.deb
+
+# Install it
 sudo dpkg -i pg-reflex-1.0.0-pg17-amd64.deb
 ```
 
-### From source
+Then enable the extension in your database:
 
-Requires Rust toolchain and [cargo-pgrx](https://github.com/pgcentralfoundation/pgrx):
+```sql
+-- Connect to your database and run:
+CREATE EXTENSION pg_reflex;
+```
+
+### Option B: From source
 
 ```bash
+# 1. Clone the repository
+git clone https://github.com/diviyank/pg_reflex.git
+cd pg_reflex
+
+# 2. Install the Rust toolchain (skip if you already have Rust)
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source ~/.cargo/env
+
+# 3. Install cargo-pgrx (the PostgreSQL extension build tool)
 cargo install cargo-pgrx --version '=0.16.1' --locked
-cargo pgrx init --pg17 download
+
+# 4. Initialize pgrx with your PostgreSQL version (downloads PG headers)
+cargo pgrx init --pg17 download    # adjust pg17 to your version (pg15, pg16, pg18)
+
+# 5. Build and install the extension into your PostgreSQL instance
 cargo pgrx install --release --pg-config $(pg_config)
+```
+
+Then enable the extension in your database:
+
+```sql
+-- Connect to your database and run:
+CREATE EXTENSION pg_reflex;
 ```
 
 ## Quick Start
 
 ```sql
--- Install the extension
-CREATE EXTENSION pg_reflex;
-
 -- Create a source table
 CREATE TABLE sales (
     id SERIAL PRIMARY KEY,

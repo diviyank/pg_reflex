@@ -4,7 +4,7 @@ version = "1.0.0"
 edition = "2021"
 description = "Incremental materialized view maintenance for PostgreSQL"
 license = "Apache-2.0"
-repository = "https://github.com/fentech/pg_reflex"
+repository = "https://github.com/diviyank/pg_reflex"
 authors = ["Diviyan Kalainathan"]
 
 [lib]

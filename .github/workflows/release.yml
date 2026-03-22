@@ -84,7 +84,7 @@ jobs:
           Architecture: amd64
           Depends: postgresql-${PG_MAJOR}
           Maintainer: Diviyan Kalainathan
-          Homepage: https://github.com/fentech/pg_reflex
+          Homepage: https://github.com/diviyank/pg_reflex
           Description: Incremental materialized view maintenance for PostgreSQL ${PG_MAJOR}
            pg_reflex maintains materialized views incrementally via triggers,
            processing only delta rows instead of full table scans.
