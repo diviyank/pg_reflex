@@ -1,5 +1,8 @@
-use crate::aggregation::AggregationPlan;
+use crate::aggregation::{AggregationPlan, IntermediateColumn};
 use crate::sql_analyzer::SqlAnalysis;
+use sqlparser::ast::{Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments};
+use sqlparser::dialect::PostgreSqlDialect;
+use sqlparser::parser::Parser;
 
 /// Split a potentially schema-qualified name into (Option<schema>, name).
 /// "my_view" -> (None, "my_view")
@@ -161,6 +164,99 @@ pub fn generate_base_query(analysis: &SqlAnalysis, plan: &AggregationPlan) -> St
 
 /// Generate the end query: intermediate table -> target table.
 ///
+/// Rewrite a HAVING clause, replacing aggregate function calls with intermediate column refs.
+/// E.g., "SUM(amount) > 1000" → "\"__sum_amount\" > 1000"
+pub fn rewrite_having(having: &str, plan: &AggregationPlan) -> Option<String> {
+    let expr = Parser::new(&PostgreSqlDialect {})
+        .try_with_sql(having)
+        .and_then(|mut p| p.parse_expr())
+        .ok()?;
+    Some(rewrite_having_expr(&expr, &plan.intermediate_columns))
+}
+
+/// Recursively transform a HAVING expression AST, replacing aggregate functions
+/// with references to intermediate table columns.
+fn rewrite_having_expr(expr: &Expr, columns: &[IntermediateColumn]) -> String {
+    match expr {
+        Expr::Function(f) => rewrite_aggregate_call(f, columns),
+        Expr::BinaryOp { left, op, right } => {
+            format!(
+                "{} {} {}",
+                rewrite_having_expr(left, columns),
+                op,
+                rewrite_having_expr(right, columns)
+            )
+        }
+        Expr::UnaryOp { op, expr: inner } => {
+            format!("{} {}", op, rewrite_having_expr(inner, columns))
+        }
+        Expr::Nested(inner) => {
+            format!("({})", rewrite_having_expr(inner, columns))
+        }
+        other => other.to_string(),
+    }
+}
+
+/// Rewrite a single aggregate function call to its intermediate column reference.
+fn rewrite_aggregate_call(f: &Function, columns: &[IntermediateColumn]) -> String {
+    let func_name = f.name.to_string().to_uppercase();
+
+    // Check for COUNT(*)
+    if func_name == "COUNT" {
+        if let FunctionArguments::List(list) = &f.args {
+            if list.args.len() == 1
+                && matches!(
+                    &list.args[0],
+                    FunctionArg::Unnamed(FunctionArgExpr::Wildcard)
+                )
+            {
+                // COUNT(*) → __count_star
+                return "\"__count_star\"".to_string();
+            }
+        }
+    }
+
+    // Extract argument string
+    let arg_str = if let FunctionArguments::List(list) = &f.args {
+        if let Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(arg_expr))) = list.args.first() {
+            Some(arg_expr.to_string())
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let Some(arg) = arg_str else {
+        return f.to_string(); // Can't rewrite, pass through
+    };
+
+    // AVG(x) → __sum_x / NULLIF(__count_x, 0)
+    if func_name == "AVG" {
+        let sanitized = sanitize_for_col_name(&arg);
+        let sum_col = format!("__sum_{}", sanitized);
+        let count_col = format!("__count_{}", sanitized);
+        return format!("\"{}\" / NULLIF(\"{}\", 0)", sum_col, count_col);
+    }
+
+    // SUM/COUNT/MIN/MAX → find matching intermediate column
+    for col in columns {
+        if col.source_aggregate.to_uppercase() == func_name && col.source_arg == arg {
+            return format!("\"{}\"", col.name);
+        }
+    }
+
+    // Fallback: pass through as-is
+    f.to_string()
+}
+
+fn sanitize_for_col_name(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_alphanumeric() || c == '_' { c } else { '_' })
+        .collect::<String>()
+        .to_lowercase()
+}
+
 /// Uses bare column names since the intermediate table has no table qualifiers.
 pub fn generate_end_query(view_name: &str, plan: &AggregationPlan) -> String {
     let table = intermediate_table_name(view_name);
@@ -193,6 +289,17 @@ pub fn generate_end_query(view_name: &str, plan: &AggregationPlan) -> String {
     // This ensures deleted groups disappear from the target.
     if plan.needs_ivm_count {
         query.push_str(" WHERE __ivm_count > 0");
+    }
+
+    // Apply HAVING clause (rewritten to use intermediate column names)
+    if let Some(ref having) = plan.having_clause {
+        if let Some(rewritten) = rewrite_having(having, plan) {
+            if plan.needs_ivm_count {
+                query.push_str(&format!(" AND ({})", rewritten));
+            } else {
+                query.push_str(&format!(" WHERE ({})", rewritten));
+            }
+        }
     }
 
     query
@@ -374,6 +481,40 @@ mod tests {
             intermediate_table_name("myschema.my_view"),
             "\"myschema\".\"__reflex_intermediate_my_view\""
         );
+    }
+
+    #[test]
+    fn test_rewrite_having_simple_sum() {
+        let plan = decompose("SELECT city, SUM(amount) AS total FROM emp GROUP BY city").1;
+        let result = rewrite_having("SUM(amount) > 1000", &plan).unwrap();
+        assert!(result.contains("__sum_amount"), "Got: {}", result);
+        assert!(result.contains("> 1000"), "Got: {}", result);
+    }
+
+    #[test]
+    fn test_rewrite_having_count_star() {
+        let plan = decompose("SELECT city, COUNT(*) AS cnt FROM emp GROUP BY city").1;
+        let result = rewrite_having("COUNT(*) > 5", &plan).unwrap();
+        assert!(result.contains("__count_star"), "Got: {}", result);
+    }
+
+    #[test]
+    fn test_rewrite_having_avg() {
+        let plan = decompose("SELECT dept, AVG(salary) AS avg_sal FROM emp GROUP BY dept").1;
+        let result = rewrite_having("AVG(salary) > 50000", &plan).unwrap();
+        assert!(result.contains("__sum_salary"), "Got: {}", result);
+        assert!(result.contains("NULLIF"), "Got: {}", result);
+        assert!(result.contains("__count_salary"), "Got: {}", result);
+    }
+
+    #[test]
+    fn test_rewrite_having_complex() {
+        let plan =
+            decompose("SELECT city, SUM(amount) AS total, COUNT(*) AS cnt FROM emp GROUP BY city")
+                .1;
+        let result = rewrite_having("SUM(amount) > COUNT(*) * 2", &plan).unwrap();
+        assert!(result.contains("__sum_amount"), "Got: {}", result);
+        assert!(result.contains("__count_star"), "Got: {}", result);
     }
 
     mod proptest_tests {

@@ -202,7 +202,7 @@ SELECT create_reflex_ivm('region_summary',
 | `WHERE` | Yes | Static filters only (no `NOW()` or `RANDOM()`) |
 | `JOIN` (INNER) | Yes | Triggers created on each source table |
 | `LEFT/RIGHT JOIN` | Yes | Parsed and used, same trigger mechanism |
-| `HAVING` | Parsed | Stored in metadata, not yet applied in triggers |
+| `HAVING` | Yes | Rewritten to filter on intermediate columns; aggregates not in SELECT are auto-added |
 | `DISTINCT` | Yes | Without GROUP BY, columns become implicit group keys |
 | `CTE (WITH)` | Yes | Each CTE becomes a sub-IMV; passthrough main body becomes a VIEW |
 | `WITH RECURSIVE` | No | Recursive CTEs cannot be decomposed into static IMV layers |
@@ -366,7 +366,6 @@ Key insight: **INSERT latency is constant regardless of table size** -- the trig
 - **MIN/MAX on DELETE:** Requires full group rescan from the source table (no algebraic inverse for extrema).
 - **Non-deterministic functions:** `NOW()`, `RANDOM()`, `CURRENT_DATE` in WHERE clauses are not supported -- the view definition must be static.
 - **NULL group keys:** PostgreSQL's MERGE does not match `NULL = NULL`. NULL values in GROUP BY columns are not supported.
-- **HAVING clause:** Parsed and stored in metadata but not yet enforced in trigger logic.
 
 ## Project Structure
 

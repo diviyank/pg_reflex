@@ -459,6 +459,7 @@ mod tests {
             distinct_columns: vec![],
             is_passthrough: false,
             passthrough_columns: vec![],
+            having_clause: None,
         }
     }
 
@@ -501,6 +502,7 @@ mod tests {
             distinct_columns: vec![],
             is_passthrough: false,
             passthrough_columns: vec![],
+            having_clause: None,
         };
         let delta = "SELECT city, MIN(price) AS \"__min_price\", COUNT(*) AS __ivm_count FROM src GROUP BY city";
         let sql = build_merge_sql("intermediate", delta, &plan, DeltaOp::Add);
@@ -523,6 +525,7 @@ mod tests {
             distinct_columns: vec![],
             is_passthrough: false,
             passthrough_columns: vec![],
+            having_clause: None,
         };
         let delta = "SELECT city, MIN(price) FROM src GROUP BY city";
         let sql = build_merge_sql("intermediate", delta, &plan, DeltaOp::Subtract);
@@ -553,6 +556,7 @@ mod tests {
             distinct_columns: vec![],
             is_passthrough: false,
             passthrough_columns: vec![],
+            having_clause: None,
         };
         let sql = build_min_max_recompute_sql("intermediate", &plan, "orders");
         assert!(sql.is_some());

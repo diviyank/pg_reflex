@@ -1,4 +1,7 @@
 use serde::{Deserialize, Serialize};
+use sqlparser::ast::{Expr, FunctionArg, FunctionArgExpr, FunctionArguments};
+use sqlparser::dialect::PostgreSqlDialect;
+use sqlparser::parser::Parser;
 
 use crate::sql_analyzer::{AggregateKind, SqlAnalysis};
 
@@ -42,6 +45,9 @@ pub struct AggregationPlan {
     /// Column names in the passthrough SELECT list (used for incremental DELETE/UPDATE matching).
     #[serde(default)]
     pub passthrough_columns: Vec<String>,
+    /// Rewritten HAVING clause (aggregate refs replaced with intermediate column names).
+    #[serde(default)]
+    pub having_clause: Option<String>,
 }
 
 /// Sanitize a SQL expression to be used as part of a column name.
@@ -51,6 +57,63 @@ fn sanitize_for_col_name(s: &str) -> String {
         .map(|c| if c.is_alphanumeric() || c == '_' { c } else { '_' })
         .collect::<String>()
         .to_lowercase()
+}
+
+/// Detect aggregate kind from a function name (mirrors sql_analyzer::detect_aggregate).
+fn detect_aggregate(func_name: &str) -> Option<AggregateKind> {
+    match func_name.to_uppercase().as_str() {
+        "SUM" => Some(AggregateKind::Sum),
+        "COUNT" => Some(AggregateKind::Count),
+        "AVG" => Some(AggregateKind::Avg),
+        "MIN" => Some(AggregateKind::Min),
+        "MAX" => Some(AggregateKind::Max),
+        _ => None,
+    }
+}
+
+/// Recursively collect (aggregate_kind, arg_string) pairs from a HAVING expression.
+fn collect_having_aggregates(expr: &Expr, out: &mut Vec<(AggregateKind, String)>) {
+    match expr {
+        Expr::Function(f) => {
+            let func_name = f.name.to_string();
+            if let Some(kind) = detect_aggregate(&func_name) {
+                // Check for COUNT(*)
+                if let FunctionArguments::List(list) = &f.args {
+                    if list.args.len() == 1
+                        && matches!(
+                            &list.args[0],
+                            FunctionArg::Unnamed(FunctionArgExpr::Wildcard)
+                        )
+                    {
+                        out.push((AggregateKind::CountStar, "*".to_string()));
+                    } else if let Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(arg_expr))) =
+                        list.args.first()
+                    {
+                        out.push((kind, arg_expr.to_string()));
+                    }
+                }
+            }
+            // Also recurse into function args (for nested expressions)
+            if let FunctionArguments::List(list) = &f.args {
+                for arg in &list.args {
+                    if let FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) = arg {
+                        collect_having_aggregates(e, out);
+                    }
+                }
+            }
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            collect_having_aggregates(left, out);
+            collect_having_aggregates(right, out);
+        }
+        Expr::UnaryOp { expr: inner, .. } => {
+            collect_having_aggregates(inner, out);
+        }
+        Expr::Nested(inner) => {
+            collect_having_aggregates(inner, out);
+        }
+        _ => {}
+    }
 }
 
 /// Build an AggregationPlan from a SqlAnalysis.
@@ -179,6 +242,77 @@ pub fn plan_aggregation(analysis: &SqlAnalysis) -> AggregationPlan {
         }
     }
 
+    // Auto-add intermediate columns for aggregates referenced in HAVING but not in SELECT
+    if let Some(ref having_str) = analysis.having_clause {
+        let parse_result = Parser::new(&PostgreSqlDialect {})
+            .try_with_sql(having_str)
+            .and_then(|mut p| p.parse_expr());
+        if let Ok(having_expr) = parse_result {
+            let mut having_aggs = Vec::new();
+            collect_having_aggregates(&having_expr, &mut having_aggs);
+            for (kind, arg) in having_aggs {
+                let arg_sanitized = sanitize_for_col_name(&arg);
+                match kind {
+                    AggregateKind::Sum => {
+                        intermediate_columns.push(IntermediateColumn {
+                            name: format!("__sum_{}", arg_sanitized),
+                            pg_type: "NUMERIC".to_string(),
+                            source_aggregate: "SUM".to_string(),
+                            source_arg: arg,
+                        });
+                    }
+                    AggregateKind::Count => {
+                        intermediate_columns.push(IntermediateColumn {
+                            name: format!("__count_{}", arg_sanitized),
+                            pg_type: "BIGINT".to_string(),
+                            source_aggregate: "COUNT".to_string(),
+                            source_arg: arg,
+                        });
+                    }
+                    AggregateKind::CountStar => {
+                        intermediate_columns.push(IntermediateColumn {
+                            name: "__count_star".to_string(),
+                            pg_type: "BIGINT".to_string(),
+                            source_aggregate: "COUNT".to_string(),
+                            source_arg: "*".to_string(),
+                        });
+                    }
+                    AggregateKind::Avg => {
+                        // AVG needs both SUM and COUNT
+                        intermediate_columns.push(IntermediateColumn {
+                            name: format!("__sum_{}", arg_sanitized),
+                            pg_type: "NUMERIC".to_string(),
+                            source_aggregate: "SUM".to_string(),
+                            source_arg: arg.clone(),
+                        });
+                        intermediate_columns.push(IntermediateColumn {
+                            name: format!("__count_{}", arg_sanitized),
+                            pg_type: "BIGINT".to_string(),
+                            source_aggregate: "COUNT".to_string(),
+                            source_arg: arg,
+                        });
+                    }
+                    AggregateKind::Min => {
+                        intermediate_columns.push(IntermediateColumn {
+                            name: format!("__min_{}", arg_sanitized),
+                            pg_type: "NUMERIC".to_string(),
+                            source_aggregate: "MIN".to_string(),
+                            source_arg: arg,
+                        });
+                    }
+                    AggregateKind::Max => {
+                        intermediate_columns.push(IntermediateColumn {
+                            name: format!("__max_{}", arg_sanitized),
+                            pg_type: "NUMERIC".to_string(),
+                            source_aggregate: "MAX".to_string(),
+                            source_arg: arg,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
     // Deduplicate intermediate columns by name (e.g., SUM(x) and AVG(x) both need __sum_x)
     let mut seen_names = std::collections::HashSet::new();
     intermediate_columns.retain(|col| seen_names.insert(col.name.clone()));
@@ -225,6 +359,7 @@ pub fn plan_aggregation(analysis: &SqlAnalysis) -> AggregationPlan {
         distinct_columns,
         is_passthrough,
         passthrough_columns,
+        having_clause: analysis.having_clause.clone(),
     }
 }
 

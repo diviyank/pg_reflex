@@ -72,20 +72,21 @@ jobs:
         run: cargo pgrx init --pg17 download
 
       - name: Install extension
-        run: cargo pgrx install --pg-config ~/.pgrx/17.*/pgrx-install/bin/pg_config
+        run: |
+          PG_CONFIG=$(find ~/.pgrx -path "*/17.*/pgrx-install/bin/pg_config" -print -quit)
+          cargo pgrx install --pg-config "$PG_CONFIG"
 
       - name: Start PostgreSQL
         run: |
-          PGRX_DIR=$(find ~/.pgrx -maxdepth 1 -type d -name '17.*' | head -1)
-          ${PGRX_DIR}/pgrx-install/bin/initdb -D /tmp/pgdata-concurrent 2>/dev/null || true
-          # Copy extension files into the data directory's lib/share paths
-          ${PGRX_DIR}/pgrx-install/bin/pg_ctl -D ${PGRX_DIR}/data-17 -l /tmp/pg-concurrent.log -o "-p 28817" start
+          PGRX_BIN=$(find ~/.pgrx -path "*/17.*/pgrx-install/bin/pg_ctl" -print -quit | xargs dirname)
+          PGRX_DIR=$(dirname $(dirname "$PGRX_BIN"))
+          ${PGRX_BIN}/pg_ctl -D ${PGRX_DIR}/data-17 -l /tmp/pg-concurrent.log -o "-p 28817" start
 
       - name: Create test database
         run: |
-          PGRX_DIR=$(find ~/.pgrx -maxdepth 1 -type d -name '17.*' | head -1)
-          ${PGRX_DIR}/pgrx-install/bin/createdb -h localhost -p 28817 bench_db 2>/dev/null || true
-          ${PGRX_DIR}/pgrx-install/bin/psql -h localhost -p 28817 -d bench_db -c "CREATE EXTENSION IF NOT EXISTS pg_reflex"
+          PGRX_BIN=$(find ~/.pgrx -path "*/17.*/pgrx-install/bin/psql" -print -quit | xargs dirname)
+          ${PGRX_BIN}/createdb -h localhost -p 28817 bench_db 2>/dev/null || true
+          ${PGRX_BIN}/psql -h localhost -p 28817 -d bench_db -c "CREATE EXTENSION IF NOT EXISTS pg_reflex"
 
       - name: Run concurrent tests
         run: PG_VERSION=17 ./tests/test_concurrent.sh
@@ -93,5 +94,6 @@ jobs:
       - name: Stop PostgreSQL
         if: always()
         run: |
-          PGRX_DIR=$(find ~/.pgrx -maxdepth 1 -type d -name '17.*' | head -1)
-          ${PGRX_DIR}/pgrx-install/bin/pg_ctl -D ${PGRX_DIR}/data-17 stop 2>/dev/null || true
+          PGRX_BIN=$(find ~/.pgrx -path "*/17.*/pgrx-install/bin/pg_ctl" -print -quit | xargs dirname)
+          PGRX_DIR=$(dirname $(dirname "$PGRX_BIN"))
+          ${PGRX_BIN}/pg_ctl -D ${PGRX_DIR}/data-17 stop 2>/dev/null || true

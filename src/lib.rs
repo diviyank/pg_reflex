@@ -3201,6 +3201,108 @@ mod tests {
         .expect("v");
         assert_eq!(a3.to_string(), "15", "Inactive row should not affect view");
     }
+
+    // ---- HAVING clause tests ----
+
+    #[pg_test]
+    fn test_having_filters_groups() {
+        Spi::run(
+            "CREATE TABLE hv_src (id SERIAL, region TEXT NOT NULL, amount NUMERIC NOT NULL)",
+        )
+        .expect("create table");
+        Spi::run(
+            "INSERT INTO hv_src (region, amount) VALUES \
+             ('US', 500), ('US', 600), ('EU', 100), ('EU', 50), ('JP', 2000)",
+        )
+        .expect("seed");
+
+        // Only regions with SUM > 200 should appear
+        crate::create_reflex_ivm(
+            "hv_view",
+            "SELECT region, SUM(amount) AS total FROM hv_src GROUP BY region HAVING SUM(amount) > 200",
+        );
+
+        // US = 1100, JP = 2000 → both > 200. EU = 150 → excluded.
+        let count =
+            Spi::get_one::<i64>("SELECT COUNT(*) FROM hv_view").expect("q").expect("v");
+        assert_eq!(count, 2, "Only US and JP should pass HAVING SUM > 200");
+
+        let eu = Spi::get_one::<i64>(
+            "SELECT COUNT(*) FROM hv_view WHERE region = 'EU'",
+        )
+        .expect("q")
+        .expect("v");
+        assert_eq!(eu, 0, "EU (150) should be excluded by HAVING");
+    }
+
+    #[pg_test]
+    fn test_having_dynamic_threshold() {
+        Spi::run(
+            "CREATE TABLE hvd_src (id SERIAL, grp TEXT NOT NULL, val NUMERIC NOT NULL)",
+        )
+        .expect("create table");
+        Spi::run(
+            "INSERT INTO hvd_src (grp, val) VALUES ('A', 80), ('B', 40)",
+        )
+        .expect("seed");
+
+        crate::create_reflex_ivm(
+            "hvd_view",
+            "SELECT grp, SUM(val) AS total FROM hvd_src GROUP BY grp HAVING SUM(val) > 50",
+        );
+
+        // Initially: A=80 passes, B=40 fails
+        let count =
+            Spi::get_one::<i64>("SELECT COUNT(*) FROM hvd_view").expect("q").expect("v");
+        assert_eq!(count, 1, "Only A should pass HAVING > 50");
+
+        // Push B over threshold
+        Spi::run("INSERT INTO hvd_src (grp, val) VALUES ('B', 20)").expect("insert B");
+        let b_count =
+            Spi::get_one::<i64>("SELECT COUNT(*) FROM hvd_view WHERE grp = 'B'")
+                .expect("q")
+                .expect("v");
+        assert_eq!(b_count, 1, "B (60) should now appear after crossing threshold");
+
+        // Pull A below threshold by deleting
+        Spi::run("DELETE FROM hvd_src WHERE grp = 'A' AND val = 80").expect("delete A");
+        let a_count =
+            Spi::get_one::<i64>("SELECT COUNT(*) FROM hvd_view WHERE grp = 'A'")
+                .expect("q")
+                .expect("v");
+        assert_eq!(a_count, 0, "A (0) should disappear after falling below threshold");
+    }
+
+    #[pg_test]
+    fn test_having_with_aggregate_not_in_select() {
+        Spi::run(
+            "CREATE TABLE hvn_src (id SERIAL, grp TEXT NOT NULL, val NUMERIC NOT NULL)",
+        )
+        .expect("create table");
+        Spi::run(
+            "INSERT INTO hvn_src (grp, val) VALUES \
+             ('A', 10), ('A', 20), ('A', 30), ('B', 100), ('B', 200)",
+        )
+        .expect("seed");
+
+        // SELECT has SUM but HAVING uses COUNT(*) — not in SELECT
+        crate::create_reflex_ivm(
+            "hvn_view",
+            "SELECT grp, SUM(val) AS total FROM hvn_src GROUP BY grp HAVING COUNT(*) > 2",
+        );
+
+        // A has 3 rows → passes. B has 2 rows → fails.
+        let count =
+            Spi::get_one::<i64>("SELECT COUNT(*) FROM hvn_view").expect("q").expect("v");
+        assert_eq!(count, 1, "Only A (3 rows) should pass HAVING COUNT(*) > 2");
+
+        let total = Spi::get_one::<pgrx::AnyNumeric>(
+            "SELECT total FROM hvn_view WHERE grp = 'A'",
+        )
+        .expect("q")
+        .expect("v");
+        assert_eq!(total.to_string(), "60", "A total should be 10+20+30=60");
+    }
 }
 
 /// This module is required by `cargo pgrx test` invocations.
