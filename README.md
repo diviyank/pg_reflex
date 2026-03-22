@@ -53,6 +53,31 @@ Then enable the extension in your database:
 CREATE EXTENSION pg_reflex;
 ```
 
+## Upgrading
+
+### From pre-built package
+
+```bash
+# Install the new version (replaces the .so and .sql files on disk)
+sudo dpkg -i pg-reflex-1.1.0-pg17-amd64.deb
+
+# Update the extension in each database that uses it
+psql -d mydb -c "ALTER EXTENSION pg_reflex UPDATE TO '1.1.0';"
+```
+
+### From source
+
+```bash
+cd pg_reflex
+git pull
+cargo pgrx install --release --pg-config $(pg_config)
+
+# Update the extension in each database that uses it
+psql -d mydb -c "ALTER EXTENSION pg_reflex UPDATE;"
+```
+
+Existing IMVs, triggers, and data are preserved across upgrades. No need to recreate views.
+
 ## Quick Start
 
 ```sql

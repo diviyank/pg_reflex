@@ -75,6 +75,11 @@ jobs:
           cp "${PGRX_DIR}/pgrx-install/share/postgresql/extension/pg_reflex--${VERSION}.sql" \
              "${PKG_DIR}/usr/share/postgresql/${PG_MAJOR}/extension/"
 
+          # Copy migration files (if any exist)
+          for f in sql/pg_reflex--*--*.sql; do
+            [ -f "$f" ] && cp "$f" "${PKG_DIR}/usr/share/postgresql/${PG_MAJOR}/extension/" || true
+          done
+
           # Create DEBIAN/control
           cat > "${PKG_DIR}/DEBIAN/control" <<EOF
           Package: pg-reflex-pg${PG_MAJOR}

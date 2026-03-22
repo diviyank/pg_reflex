@@ -45,7 +45,6 @@ jobs:
   concurrent-test:
     name: "Concurrent tests"
     runs-on: ubuntu-latest
-    needs: test
     steps:
       - uses: actions/checkout@v4
 
@@ -80,7 +79,11 @@ jobs:
         run: |
           PGRX_BIN=$(find ~/.pgrx -path "*/17.*/pgrx-install/bin/pg_ctl" -print -quit | xargs dirname)
           PGRX_DIR=$(dirname $(dirname "$PGRX_BIN"))
-          ${PGRX_BIN}/pg_ctl -D ${PGRX_DIR}/data-17 -l /tmp/pg-concurrent.log -o "-p 28817" start
+          DATADIR="${PGRX_DIR}/data-17"
+          if [ ! -d "$DATADIR" ]; then
+            ${PGRX_BIN}/initdb -D "$DATADIR" --no-locale --encoding=UTF8
+          fi
+          ${PGRX_BIN}/pg_ctl -D "$DATADIR" -l /tmp/pg-concurrent.log -o "-p 28817" start
 
       - name: Create test database
         run: |
