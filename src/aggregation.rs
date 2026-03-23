@@ -48,6 +48,12 @@ pub struct AggregationPlan {
     /// Column names in the passthrough SELECT list (used for incremental DELETE/UPDATE matching).
     #[serde(default)]
     pub passthrough_columns: Vec<String>,
+    /// Per-source-table column mappings for passthrough DELETE/UPDATE.
+    /// Key: source table name. Value: vec of (target_col, source_col) pairs.
+    /// For the key-owner table, target_col == source_col.
+    /// For secondary (joined) tables, derived from JOIN conditions.
+    #[serde(default)]
+    pub passthrough_key_mappings: std::collections::HashMap<String, Vec<(String, String)>>,
     /// Rewritten HAVING clause (aggregate refs replaced with intermediate column names).
     #[serde(default)]
     pub having_clause: Option<String>,
@@ -394,6 +400,7 @@ pub fn plan_aggregation(analysis: &SqlAnalysis) -> AggregationPlan {
         distinct_columns,
         is_passthrough,
         passthrough_columns,
+        passthrough_key_mappings: std::collections::HashMap::new(),
         having_clause: analysis.having_clause.clone(),
     }
 }

@@ -78,6 +78,8 @@ pub struct SqlAnalysis {
     pub having_clause: Option<String>,
     pub from_clause_sql: String,
     pub joins: Vec<JoinInfo>,
+    /// Table alias → real table name (e.g., "s" → "sales_simulation")
+    pub table_aliases: std::collections::HashMap<String, String>,
 }
 
 impl SqlAnalysis {
@@ -125,8 +127,14 @@ impl<'a> Visitor for AnalysisVisitor<'a> {
 
     fn pre_visit_table_factor(&mut self, factor: &TableFactor) -> ControlFlow<()> {
         match factor {
-            TableFactor::Table { name, .. } => {
-                self.analysis.sources.push(name.to_string());
+            TableFactor::Table { name, alias, .. } => {
+                let table_name = name.to_string();
+                self.analysis.sources.push(table_name.clone());
+                if let Some(a) = alias {
+                    self.analysis
+                        .table_aliases
+                        .insert(a.name.to_string(), table_name);
+                }
             }
             TableFactor::Derived { alias, .. } => {
                 let label = alias
@@ -580,5 +588,23 @@ mod tests {
     fn test_malformed_sql_parse_error() {
         let result = Parser::parse_sql(&PostgreSqlDialect {}, "SELEC broken garbage !!!");
         assert!(result.is_err(), "Malformed SQL should fail to parse");
+    }
+
+    #[test]
+    fn test_table_aliases() {
+        let a = parse_and_analyze(
+            "SELECT s.product_id, s.amount, p.name FROM sales s JOIN products p ON s.product_id = p.id",
+        );
+        assert_eq!(a.table_aliases.get("s").map(String::as_str), Some("sales"));
+        assert_eq!(a.table_aliases.get("p").map(String::as_str), Some("products"));
+    }
+
+    #[test]
+    fn test_table_aliases_schema_qualified() {
+        let a = parse_and_analyze(
+            "SELECT s.id FROM alp.sales_simulation s JOIN dim.products p ON s.product_id = p.id",
+        );
+        assert_eq!(a.table_aliases.get("s").map(String::as_str), Some("alp.sales_simulation"));
+        assert_eq!(a.table_aliases.get("p").map(String::as_str), Some("dim.products"));
     }
 }

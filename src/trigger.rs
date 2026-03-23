@@ -254,46 +254,51 @@ pub fn reflex_build_delta_sql(
 
     if plan.is_passthrough {
         let qv = quote_identifier(view_name);
+        // Look up per-source column mappings for targeted DELETE/UPDATE
+        let mappings = plan.passthrough_key_mappings.get(source_table);
         match operation {
             "INSERT" => {
                 let delta_q = replace_source_with_transition(base_query, source_table, &new_tbl);
                 stmts.push(format!("INSERT INTO {} {}", qv, delta_q));
             }
             "DELETE" => {
-                if plan.passthrough_columns.is_empty() {
-                    // No unique key: full refresh
-                    stmts.push(format!("DELETE FROM {}", qv));
-                    stmts.push(format!("INSERT INTO {} {}", qv, base_query));
-                } else {
-                    // Direct key extraction from transition table — no base_query JOINs needed
-                    let key_cols: Vec<String> = plan.passthrough_columns.iter()
-                        .map(|c| format!("\"{}\"", c))
-                        .collect();
-                    let row = row_expr(&key_cols);
+                if let Some(mappings) = mappings {
+                    // Targeted delete using per-source column mapping
+                    let target_cols: Vec<String> =
+                        mappings.iter().map(|(t, _)| format!("\"{}\"", t)).collect();
+                    let source_cols: Vec<String> =
+                        mappings.iter().map(|(_, s)| format!("\"{}\"", s)).collect();
+                    let row = row_expr(&target_cols);
                     stmts.push(format!(
                         "DELETE FROM {} WHERE {} IN (SELECT {} FROM \"{}\")",
-                        qv, row, key_cols.join(", "), old_tbl
+                        qv, row, source_cols.join(", "), old_tbl
                     ));
+                } else {
+                    // No mapping for this source: full refresh
+                    stmts.push(format!("DELETE FROM {}", qv));
+                    stmts.push(format!("INSERT INTO {} {}", qv, base_query));
                 }
             }
             "UPDATE" => {
-                if plan.passthrough_columns.is_empty() {
-                    // No unique key: full refresh
-                    stmts.push(format!("DELETE FROM {}", qv));
-                    stmts.push(format!("INSERT INTO {} {}", qv, base_query));
-                } else {
-                    // Phase 1: delete old rows by key (direct from transition table, no JOINs)
-                    let key_cols: Vec<String> = plan.passthrough_columns.iter()
-                        .map(|c| format!("\"{}\"", c))
-                        .collect();
-                    let row = row_expr(&key_cols);
+                if let Some(mappings) = mappings {
+                    // Phase 1: delete old rows using per-source column mapping
+                    let target_cols: Vec<String> =
+                        mappings.iter().map(|(t, _)| format!("\"{}\"", t)).collect();
+                    let source_cols: Vec<String> =
+                        mappings.iter().map(|(_, s)| format!("\"{}\"", s)).collect();
+                    let row = row_expr(&target_cols);
                     stmts.push(format!(
                         "DELETE FROM {} WHERE {} IN (SELECT {} FROM \"{}\")",
-                        qv, row, key_cols.join(", "), old_tbl
+                        qv, row, source_cols.join(", "), old_tbl
                     ));
-                    // Phase 2: insert new rows (needs JOINs for derived columns)
-                    let delta_new = replace_source_with_transition(base_query, source_table, &new_tbl);
+                    // Phase 2: insert new rows (base_query with source→transition)
+                    let delta_new =
+                        replace_source_with_transition(base_query, source_table, &new_tbl);
                     stmts.push(format!("INSERT INTO {} {}", qv, delta_new));
+                } else {
+                    // No mapping for this source: full refresh
+                    stmts.push(format!("DELETE FROM {}", qv));
+                    stmts.push(format!("INSERT INTO {} {}", qv, base_query));
                 }
             }
             _ => {}
@@ -302,7 +307,7 @@ pub fn reflex_build_delta_sql(
         let has_min_max = plan
             .intermediate_columns
             .iter()
-            .any(|ic| ic.source_aggregate == "MIN" || ic.source_aggregate == "MAX");
+            .any(|ic| ic.source_aggregate == "MIN" || ic.source_aggregate == "MAX" || ic.source_aggregate == "BOOL_OR");
 
         // Determine if we can use targeted refresh (need group columns)
         let grp_cols = group_columns(&plan);
@@ -481,6 +486,7 @@ mod tests {
             distinct_columns: vec![],
             is_passthrough: false,
             passthrough_columns: vec![],
+            passthrough_key_mappings: std::collections::HashMap::new(),
             having_clause: None,
         }
     }
@@ -524,6 +530,7 @@ mod tests {
             distinct_columns: vec![],
             is_passthrough: false,
             passthrough_columns: vec![],
+            passthrough_key_mappings: std::collections::HashMap::new(),
             having_clause: None,
         };
         let delta = "SELECT city, MIN(price) AS \"__min_price\", COUNT(*) AS __ivm_count FROM src GROUP BY city";
@@ -547,6 +554,7 @@ mod tests {
             distinct_columns: vec![],
             is_passthrough: false,
             passthrough_columns: vec![],
+            passthrough_key_mappings: std::collections::HashMap::new(),
             having_clause: None,
         };
         let delta = "SELECT city, MIN(price) FROM src GROUP BY city";
@@ -578,6 +586,7 @@ mod tests {
             distinct_columns: vec![],
             is_passthrough: false,
             passthrough_columns: vec![],
+            passthrough_key_mappings: std::collections::HashMap::new(),
             having_clause: None,
         };
         let sql = build_min_max_recompute_sql("intermediate", &plan, "orders");

@@ -58,7 +58,7 @@ fn validate_view_name(name: &str) -> Result<(), &'static str> {
     if name.is_empty() {
         return Err("ERROR: Invalid view name: name is empty");
     }
-    if name.starts_with('.') || name.chars().next().map_or(false, |c| c.is_ascii_digit()) {
+    if name.starts_with('.') || name.chars().next().is_some_and(|c| c.is_ascii_digit()) {
         return Err("ERROR: Invalid view name: must start with a letter or underscore");
     }
     if name.contains("..") || name.ends_with('.') {
@@ -112,6 +112,18 @@ fn create_reflex_ivm_impl(view_name: &str, sql: &str, unique_columns_str: &str) 
             a
         }
     };
+
+    // Reject subqueries with aggregation in FROM — the trigger replaces the inner table
+    // with the transition table, so inner aggregations would only see delta rows.
+    let has_subquery_with_agg = analysis.sources.iter().any(|s| s.starts_with("<subquery:"))
+        && analysis
+            .from_clause_sql
+            .to_uppercase()
+            .contains("GROUP BY");
+    if has_subquery_with_agg {
+        return "ERROR: Subqueries with aggregation in FROM are not supported. \
+                Use a CTE (WITH clause) instead — pg_reflex decomposes CTEs into sub-IMVs automatically.";
+    }
 
     // --- CTE decomposition: each CTE becomes its own sub-IMV ---
     if !analysis.ctes.is_empty() {
@@ -191,6 +203,9 @@ fn create_reflex_ivm_impl(view_name: &str, sql: &str, unique_columns_str: &str) 
 
     // Resolve unique key columns for passthrough IMVs (enables targeted DELETE/UPDATE)
     let mut resolved_unique_columns: Vec<String> = Vec::new();
+    let real_sources: Vec<&String> = froms.iter().filter(|s| !s.starts_with('<')).collect();
+    let is_join_query = real_sources.len() > 1;
+
     if plan.is_passthrough {
         if !unique_columns_str.is_empty() {
             // Explicit unique columns from 3rd parameter
@@ -202,8 +217,16 @@ fn create_reflex_ivm_impl(view_name: &str, sql: &str, unique_columns_str: &str) 
             plan.passthrough_columns = resolved_unique_columns.clone();
             info!("pg_reflex: using explicit unique key ({}) for '{}'",
                 resolved_unique_columns.join(", "), view_name);
-        } else {
-            // Auto-detect: check if any source table's PK columns are all in the SELECT list
+
+            // Build per-source-table column mappings
+            build_passthrough_key_mappings(
+                &mut plan,
+                &resolved_unique_columns,
+                &real_sources,
+                &analysis,
+            );
+        } else if !is_join_query {
+            // Auto-detect: only for single-source queries (JOINs need explicit key)
             let select_bare_names: std::collections::HashSet<String> = analysis
                 .select_columns
                 .iter()
@@ -213,14 +236,10 @@ fn create_reflex_ivm_impl(view_name: &str, sql: &str, unique_columns_str: &str) 
                 })
                 .collect();
 
-            for source in &froms {
-                if source.starts_with('<') {
-                    continue;
-                }
+            for source in &real_sources {
                 let (src_schema, src_name) = split_qualified_name(source);
                 let src_schema_str = src_schema.unwrap_or("public");
 
-                // Query pg_index for unique indexes on this source
                 let pk_cols: Vec<String> = Spi::connect(|client| {
                     client
                         .select(
@@ -255,12 +274,25 @@ fn create_reflex_ivm_impl(view_name: &str, sql: &str, unique_columns_str: &str) 
                     if all_in_select {
                         resolved_unique_columns = pk_lower;
                         plan.passthrough_columns = resolved_unique_columns.clone();
+                        // Single source: 1:1 mapping (target col == source col)
+                        plan.passthrough_key_mappings.insert(
+                            source.to_string(),
+                            resolved_unique_columns.iter().map(|c| (c.clone(), c.clone())).collect(),
+                        );
                         info!("pg_reflex: auto-detected PK ({}) from '{}' for '{}'",
                             resolved_unique_columns.join(", "), source, view_name);
                         break;
                     }
                 }
             }
+        } else {
+            // JOIN query without explicit key: fall back to full refresh on DELETE/UPDATE
+            info!(
+                "pg_reflex: JOIN passthrough '{}' has no unique key. \
+                 Provide 3rd argument to create_reflex_ivm for incremental DELETE/UPDATE. \
+                 Example: SELECT create_reflex_ivm('{}', '...', 'col1,col2')",
+                view_name, view_name
+            );
         }
     }
 
@@ -396,6 +428,15 @@ fn create_reflex_ivm_impl(view_name: &str, sql: &str, unique_columns_str: &str) 
         // CREATE consolidated triggers on source tables (one set per source, shared by all IMVs).
         // Skip if triggers already exist on this source (another IMV already created them).
         for source in &froms {
+            if source.starts_with("<subquery:") || source.starts_with("<function:") {
+                warning!(
+                    "pg_reflex: source '{}' for '{}' is a subquery — \
+                     triggers are created on the underlying tables inside the subquery, \
+                     but the subquery itself is re-executed on each delta",
+                    source, view_name
+                );
+                continue;
+            }
             if source.starts_with('<') {
                 continue;
             }
@@ -424,8 +465,8 @@ fn create_reflex_ivm_impl(view_name: &str, sql: &str, unique_columns_str: &str) 
                     ],
                 )
                 .unwrap_or_report()
-                .len()
-                > 0;
+                .next()
+                .is_some();
 
             if is_matview {
                 warning!(
@@ -447,7 +488,8 @@ fn create_reflex_ivm_impl(view_name: &str, sql: &str, unique_columns_str: &str) 
                     &[],
                 )
                 .unwrap_or_report()
-                .len() > 0;
+                .next()
+                .is_some();
 
             if !trig_exists {
                 for ddl in build_trigger_ddls(source) {
@@ -593,6 +635,186 @@ fn create_reflex_ivm_impl(view_name: &str, sql: &str, unique_columns_str: &str) 
 
     info!("pg_reflex: created IMV '{}'", view_name);
     "CREATE REFLEX INCREMENTAL VIEW"
+}
+
+/// Build per-source-table column mappings for passthrough DELETE/UPDATE.
+///
+/// For the "key owner" table (whose columns directly match the key), mapping is 1:1.
+/// For secondary (joined) tables, the mapping is derived from JOIN conditions:
+/// e.g., `ON s.product_id = p.id` maps target "product_id" → source "id" for the products table.
+fn build_passthrough_key_mappings(
+    plan: &mut crate::aggregation::AggregationPlan,
+    key_columns: &[String],
+    sources: &[&String],
+    analysis: &crate::sql_analyzer::SqlAnalysis,
+) {
+    use std::collections::HashMap;
+
+    // Build reverse alias map: real table name → alias
+    let reverse_aliases: HashMap<&str, &str> = analysis
+        .table_aliases
+        .iter()
+        .map(|(alias, table)| (table.as_str(), alias.as_str()))
+        .collect();
+
+    // Build a map from target column name → expr_sql (e.g., "product_id" → "s.product_id")
+    let mut target_col_to_expr: HashMap<String, String> = HashMap::new();
+    for col in &analysis.select_columns {
+        let target_name = col
+            .alias
+            .as_deref()
+            .unwrap_or(&col.expr_sql);
+        let target_name = bare_column_name(target_name).to_lowercase();
+        target_col_to_expr.insert(target_name, col.expr_sql.to_lowercase());
+    }
+
+    // For each source table, determine if it's the key owner or a secondary table
+    for source in sources {
+        let source_str = source.as_str();
+        let alias = reverse_aliases.get(source_str).copied();
+
+        // Check if this source owns all key columns directly
+        // (i.e., for each key column, the SELECT expr references this table)
+        let mut is_key_owner = true;
+        for kc in key_columns {
+            if let Some(expr) = target_col_to_expr.get(kc.as_str()) {
+                // expr is like "s.product_id" — check if the table qualifier matches this source
+                if let Some(dot_pos) = expr.rfind('.') {
+                    let qualifier = &expr[..dot_pos];
+                    let matches_alias = alias.is_some_and(|a| a.to_lowercase() == qualifier);
+                    let matches_table = bare_column_name(source_str).to_lowercase() == qualifier;
+                    if !matches_alias && !matches_table {
+                        is_key_owner = false;
+                        break;
+                    }
+                }
+                // No qualifier (e.g., single table) — assume it belongs to this source if single source
+            } else {
+                is_key_owner = false;
+                break;
+            }
+        }
+
+        if is_key_owner {
+            // Key owner: target_col == source_col (columns exist directly in this table)
+            let mappings: Vec<(String, String)> = key_columns
+                .iter()
+                .map(|kc| {
+                    // Extract the bare source column name from the expression
+                    let source_col = target_col_to_expr
+                        .get(kc.as_str())
+                        .map(|expr| bare_column_name(expr).to_string())
+                        .unwrap_or_else(|| kc.clone());
+                    (kc.clone(), source_col)
+                })
+                .collect();
+            plan.passthrough_key_mappings
+                .insert(source_str.to_string(), mappings);
+        } else {
+            // Secondary table: derive mapping from JOIN conditions
+            let mut mappings: Vec<(String, String)> = Vec::new();
+            for join in &analysis.joins {
+                if let Some(ref cond) = join.condition_sql {
+                    let join_mappings = parse_join_condition_mappings(
+                        cond,
+                        source_str,
+                        &analysis.table_aliases,
+                        key_columns,
+                        &target_col_to_expr,
+                    );
+                    mappings.extend(join_mappings);
+                }
+            }
+            if !mappings.is_empty() {
+                plan.passthrough_key_mappings
+                    .insert(source_str.to_string(), mappings);
+            }
+            // If no mappings found, this source has no entry → triggers fall back to full refresh
+        }
+    }
+}
+
+/// Parse a JOIN condition to extract column mappings between the key-owner table and a secondary table.
+///
+/// For `s.product_id = p.id AND s.version = p.version`:
+/// - Splits by AND
+/// - For each equality, identifies which side belongs to the secondary table
+/// - Maps the key-owner side's target column name to the secondary side's source column name
+fn parse_join_condition_mappings(
+    condition: &str,
+    secondary_table: &str,
+    table_aliases: &std::collections::HashMap<String, String>,
+    key_columns: &[String],
+    target_col_to_expr: &std::collections::HashMap<String, String>,
+) -> Vec<(String, String)> {
+    let mut mappings = Vec::new();
+
+    // Build a set for fast lookup: which aliases/names refer to the secondary table?
+    let secondary_lower = secondary_table.to_lowercase();
+    let secondary_bare = bare_column_name(secondary_table).to_lowercase();
+    let secondary_aliases: Vec<String> = table_aliases
+        .iter()
+        .filter(|(_, table)| table.to_lowercase() == secondary_lower)
+        .map(|(alias, _)| alias.to_lowercase())
+        .collect();
+
+    // Build reverse: for each key column, which expr_sql does it correspond to?
+    // e.g., "product_id" → "s.product_id"
+
+    // Split condition by AND (case insensitive)
+    for part in condition.split(" AND ").chain(condition.split(" and ")) {
+        let part = part.trim();
+        let sides: Vec<&str> = part.splitn(2, '=').collect();
+        if sides.len() != 2 {
+            continue;
+        }
+        let left = sides[0].trim().to_lowercase();
+        let right = sides[1].trim().to_lowercase();
+
+        // Determine which side belongs to the secondary table
+        let (secondary_side, other_side) =
+            if is_from_table(&left, &secondary_bare, &secondary_aliases) {
+                (left, right)
+            } else if is_from_table(&right, &secondary_bare, &secondary_aliases) {
+                (right, left)
+            } else {
+                continue;
+            };
+
+        let secondary_col = bare_column_name(&secondary_side).to_string();
+        let other_col = bare_column_name(&other_side).to_string();
+
+        // Find which key column the other side maps to
+        // The other side's bare column might be a key column directly,
+        // or the other side's full expression might match a key column's expr_sql
+        for kc in key_columns {
+            if *kc == other_col {
+                // Direct match: key column "product_id" and other side bare name is "product_id"
+                mappings.push((kc.clone(), secondary_col.clone()));
+                break;
+            }
+            // Check via expr_sql: key column "product_id" has expr "s.product_id",
+            // and other_side is "s.product_id"
+            if let Some(expr) = target_col_to_expr.get(kc.as_str()) {
+                if *expr == other_side {
+                    mappings.push((kc.clone(), secondary_col.clone()));
+                    break;
+                }
+            }
+        }
+    }
+
+    mappings
+}
+
+/// Check if a qualified column reference (e.g., "p.id") belongs to a given table.
+fn is_from_table(qualified_col: &str, table_bare_name: &str, table_aliases: &[String]) -> bool {
+    if let Some(dot_pos) = qualified_col.rfind('.') {
+        let qualifier = &qualified_col[..dot_pos];
+        qualifier == table_bare_name || table_aliases.iter().any(|a| a == qualifier)
+    } else {
+        false
+    }
 }
 
 /// Query the PostgreSQL catalog for column types of the given source tables.
@@ -983,6 +1205,7 @@ fn reflex_reconcile(view_name: &str) -> &'static str {
                         distinct_columns: vec![],
                         is_passthrough: false,
                         passthrough_columns: vec![],
+                        passthrough_key_mappings: std::collections::HashMap::new(),
                         having_clause: None,
                     }
                 });
@@ -1167,19 +1390,19 @@ fn refresh_imv_depending_on(source: &str) -> &'static str {
     Box::leak(format!("REFRESHED {} IMVs", count).into_boxed_str())
 }
 
-#[pg_extern]
-fn hello_pg_reflex() -> &'static str {
-    "Hello, pg_reflex"
-}
-
 #[cfg(any(test, feature = "pg_test"))]
 #[pg_schema]
 mod tests {
     use pgrx::prelude::*;
 
+    #[pg_extern]
+    fn hello_pg_reflex() -> &'static str {
+        "Hello, pg_reflex"
+    }
+
     #[pg_test]
     fn test_hello_pg_reflex() {
-        assert_eq!("Hello, pg_reflex", crate::hello_pg_reflex());
+        assert_eq!("Hello, pg_reflex", hello_pg_reflex());
     }
 
     #[pg_test]
@@ -3542,6 +3765,782 @@ mod tests {
     }
 
     #[pg_test]
+    fn test_passthrough_join_delete_secondary_table() {
+        // Setup: two source tables with a JOIN
+        Spi::run(
+            "CREATE TABLE ptj_products (id SERIAL PRIMARY KEY, name TEXT NOT NULL)",
+        )
+        .expect("create products");
+        Spi::run(
+            "CREATE TABLE ptj_sales (id SERIAL PRIMARY KEY, product_id INT NOT NULL, amount NUMERIC NOT NULL)",
+        )
+        .expect("create sales");
+        Spi::run(
+            "INSERT INTO ptj_products (id, name) VALUES (1, 'Widget'), (2, 'Gadget'), (3, 'Doohickey')",
+        )
+        .expect("seed products");
+        Spi::run(
+            "INSERT INTO ptj_sales (product_id, amount) VALUES (1, 100), (1, 200), (2, 300), (3, 50)",
+        )
+        .expect("seed sales");
+
+        // Create passthrough JOIN IMV with explicit unique key (id comes from ptj_sales)
+        let result = crate::create_reflex_ivm_with_key(
+            "ptj_view",
+            "SELECT s.id, s.product_id, s.amount, p.name FROM ptj_sales s JOIN ptj_products p ON s.product_id = p.id",
+            "id",
+        );
+        assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
+
+        let count = Spi::get_one::<i64>("SELECT COUNT(*) FROM ptj_view")
+            .expect("q").expect("v");
+        assert_eq!(count, 4, "Initial view should have 4 rows");
+
+        // DELETE from the SECONDARY table (products) — this is the critical test
+        // Deleting product 2 should remove all sales rows referencing it
+        Spi::run("DELETE FROM ptj_products WHERE id = 2").expect("delete product");
+
+        let count_after = Spi::get_one::<i64>("SELECT COUNT(*) FROM ptj_view")
+            .expect("q").expect("v");
+        assert_eq!(count_after, 3, "View should have 3 rows after deleting product 2");
+
+        // Verify no rows reference the deleted product
+        let orphans = Spi::get_one::<i64>(
+            "SELECT COUNT(*) FROM ptj_view WHERE product_id = 2",
+        )
+        .expect("q").expect("v");
+        assert_eq!(orphans, 0, "No rows should reference deleted product");
+
+        // Verify remaining data is correct
+        let mismatches = Spi::get_one::<i64>(
+            "SELECT COUNT(*) FROM (
+                SELECT id, product_id, amount, name FROM ptj_view
+                EXCEPT
+                SELECT s.id, s.product_id, s.amount, p.name
+                FROM ptj_sales s JOIN ptj_products p ON s.product_id = p.id
+            ) x",
+        )
+        .expect("q").expect("v");
+        assert_eq!(mismatches, 0, "View should exactly match source after delete");
+    }
+
+    #[pg_test]
+    fn test_passthrough_join_update_secondary_table() {
+        Spi::run(
+            "CREATE TABLE ptju_products (id SERIAL PRIMARY KEY, name TEXT NOT NULL)",
+        )
+        .expect("create products");
+        Spi::run(
+            "CREATE TABLE ptju_sales (id SERIAL PRIMARY KEY, product_id INT NOT NULL, qty INT NOT NULL)",
+        )
+        .expect("create sales");
+        Spi::run("INSERT INTO ptju_products VALUES (1, 'Alpha'), (2, 'Beta')").expect("seed products");
+        Spi::run("INSERT INTO ptju_sales (product_id, qty) VALUES (1, 10), (2, 20)").expect("seed sales");
+
+        crate::create_reflex_ivm_with_key(
+            "ptju_view",
+            "SELECT s.id, s.qty, p.name FROM ptju_sales s JOIN ptju_products p ON s.product_id = p.id",
+            "id",
+        );
+
+        // UPDATE the secondary table (product name change)
+        Spi::run("UPDATE ptju_products SET name = 'Alpha-v2' WHERE id = 1").expect("update product");
+
+        // The view should reflect the updated product name
+        let name = Spi::get_one::<String>(
+            "SELECT name FROM ptju_view WHERE id = 1",
+        )
+        .expect("q").expect("v");
+        assert_eq!(name, "Alpha-v2", "View should reflect updated product name");
+    }
+
+    /// JOIN passthrough with no explicit key: DELETE on secondary table should fall back
+    /// to full refresh and still produce correct results.
+    #[pg_test]
+    fn test_passthrough_join_no_key_delete_secondary() {
+        Spi::run("CREATE TABLE ptjnk_products (id SERIAL PRIMARY KEY, name TEXT NOT NULL)")
+            .expect("create products");
+        Spi::run("CREATE TABLE ptjnk_sales (id SERIAL PRIMARY KEY, product_id INT NOT NULL, amount INT NOT NULL)")
+            .expect("create sales");
+        Spi::run("INSERT INTO ptjnk_products VALUES (1, 'A'), (2, 'B'), (3, 'C')").expect("seed products");
+        Spi::run("INSERT INTO ptjnk_sales (product_id, amount) VALUES (1, 10), (2, 20), (3, 30)").expect("seed sales");
+
+        // No explicit key → JOIN triggers fall back to full refresh
+        crate::create_reflex_ivm(
+            "ptjnk_view",
+            "SELECT s.id, s.amount, p.name FROM ptjnk_sales s JOIN ptjnk_products p ON s.product_id = p.id",
+        );
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT COUNT(*) FROM ptjnk_view").expect("q").expect("v"),
+            3
+        );
+
+        // DELETE from secondary table → full refresh should still be correct
+        Spi::run("DELETE FROM ptjnk_products WHERE id = 2").expect("delete product");
+        let count = Spi::get_one::<i64>("SELECT COUNT(*) FROM ptjnk_view").expect("q").expect("v");
+        assert_eq!(count, 2, "Full refresh should remove orphaned rows");
+
+        let mismatches = Spi::get_one::<i64>(
+            "SELECT COUNT(*) FROM (
+                SELECT id, amount, name FROM ptjnk_view
+                EXCEPT
+                SELECT s.id, s.amount, p.name FROM ptjnk_sales s JOIN ptjnk_products p ON s.product_id = p.id
+            ) x",
+        ).expect("q").expect("v");
+        assert_eq!(mismatches, 0, "View should exactly match source");
+    }
+
+    /// JOIN passthrough with explicit key: DELETE on the key-owner table should use
+    /// direct key extraction (fast path, no JOINs).
+    #[pg_test]
+    fn test_passthrough_join_delete_key_owner_table() {
+        Spi::run("CREATE TABLE ptjko_products (id SERIAL PRIMARY KEY, name TEXT NOT NULL)")
+            .expect("create products");
+        Spi::run("CREATE TABLE ptjko_sales (id SERIAL PRIMARY KEY, product_id INT NOT NULL, amount INT NOT NULL)")
+            .expect("create sales");
+        Spi::run("INSERT INTO ptjko_products VALUES (1, 'A'), (2, 'B')").expect("seed products");
+        Spi::run("INSERT INTO ptjko_sales (product_id, amount) VALUES (1, 10), (1, 20), (2, 30)")
+            .expect("seed sales");
+
+        crate::create_reflex_ivm_with_key(
+            "ptjko_view",
+            "SELECT s.id, s.product_id, s.amount, p.name FROM ptjko_sales s JOIN ptjko_products p ON s.product_id = p.id",
+            "id",
+        );
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT COUNT(*) FROM ptjko_view").expect("q").expect("v"),
+            3
+        );
+
+        // DELETE from key-owner table (sales) → direct key extraction
+        Spi::run("DELETE FROM ptjko_sales WHERE id = 2").expect("delete sale");
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT COUNT(*) FROM ptjko_view").expect("q").expect("v"),
+            2,
+            "Should remove exactly 1 row"
+        );
+
+        let mismatches = Spi::get_one::<i64>(
+            "SELECT COUNT(*) FROM (
+                SELECT id, product_id, amount, name FROM ptjko_view
+                EXCEPT
+                SELECT s.id, s.product_id, s.amount, p.name FROM ptjko_sales s JOIN ptjko_products p ON s.product_id = p.id
+            ) x",
+        ).expect("q").expect("v");
+        assert_eq!(mismatches, 0);
+    }
+
+    /// 3-table JOIN passthrough: verify DELETE on each table produces correct results.
+    #[pg_test]
+    fn test_passthrough_three_table_join() {
+        Spi::run("CREATE TABLE pt3_regions (id SERIAL PRIMARY KEY, name TEXT NOT NULL)")
+            .expect("create regions");
+        Spi::run("CREATE TABLE pt3_products (id SERIAL PRIMARY KEY, name TEXT NOT NULL)")
+            .expect("create products");
+        Spi::run("CREATE TABLE pt3_sales (id SERIAL PRIMARY KEY, product_id INT NOT NULL, region_id INT NOT NULL, qty INT NOT NULL)")
+            .expect("create sales");
+        Spi::run("INSERT INTO pt3_regions VALUES (1, 'North'), (2, 'South')").expect("seed regions");
+        Spi::run("INSERT INTO pt3_products VALUES (1, 'Widget'), (2, 'Gadget')").expect("seed products");
+        Spi::run("INSERT INTO pt3_sales (product_id, region_id, qty) VALUES (1,1,10), (1,2,20), (2,1,30), (2,2,40)")
+            .expect("seed sales");
+
+        crate::create_reflex_ivm_with_key(
+            "pt3_view",
+            "SELECT s.id, s.qty, p.name AS product_name, r.name AS region_name \
+             FROM pt3_sales s \
+             JOIN pt3_products p ON s.product_id = p.id \
+             JOIN pt3_regions r ON s.region_id = r.id",
+            "id",
+        );
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT COUNT(*) FROM pt3_view").expect("q").expect("v"),
+            4
+        );
+
+        // DELETE from 2nd secondary table (regions)
+        Spi::run("DELETE FROM pt3_regions WHERE id = 2").expect("delete region");
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT COUNT(*) FROM pt3_view").expect("q").expect("v"),
+            2,
+            "Should remove 2 rows (both sales in South region)"
+        );
+
+        // DELETE from 1st secondary table (products)
+        Spi::run("DELETE FROM pt3_products WHERE id = 1").expect("delete product");
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT COUNT(*) FROM pt3_view").expect("q").expect("v"),
+            1,
+            "Should remove 1 more row (Widget in North)"
+        );
+
+        // Verify exact match with source
+        let mismatches = Spi::get_one::<i64>(
+            "SELECT COUNT(*) FROM (
+                SELECT id, qty, product_name, region_name FROM pt3_view
+                EXCEPT
+                SELECT s.id, s.qty, p.name, r.name FROM pt3_sales s
+                    JOIN pt3_products p ON s.product_id = p.id
+                    JOIN pt3_regions r ON s.region_id = r.id
+            ) x",
+        ).expect("q").expect("v");
+        assert_eq!(mismatches, 0, "View should exactly match 3-table JOIN");
+    }
+
+    /// JOIN passthrough with composite key: multiple key columns from the key-owner table.
+    #[pg_test]
+    fn test_passthrough_join_composite_key() {
+        Spi::run("CREATE TABLE ptck_dims (id SERIAL PRIMARY KEY, label TEXT NOT NULL)")
+            .expect("create dims");
+        Spi::run(
+            "CREATE TABLE ptck_facts (product_id INT NOT NULL, region_id INT NOT NULL, dim_id INT NOT NULL, val INT NOT NULL, \
+             PRIMARY KEY (product_id, region_id))",
+        ).expect("create facts");
+        Spi::run("INSERT INTO ptck_dims VALUES (1, 'X'), (2, 'Y')").expect("seed dims");
+        Spi::run(
+            "INSERT INTO ptck_facts VALUES (1,1,1,10), (1,2,1,20), (2,1,2,30), (2,2,2,40)",
+        ).expect("seed facts");
+
+        crate::create_reflex_ivm_with_key(
+            "ptck_view",
+            "SELECT f.product_id, f.region_id, f.val, d.label \
+             FROM ptck_facts f JOIN ptck_dims d ON f.dim_id = d.id",
+            "product_id, region_id",
+        );
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT COUNT(*) FROM ptck_view").expect("q").expect("v"),
+            4
+        );
+
+        // DELETE from key-owner table using composite key
+        Spi::run("DELETE FROM ptck_facts WHERE product_id = 1 AND region_id = 2").expect("delete");
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT COUNT(*) FROM ptck_view").expect("q").expect("v"),
+            3
+        );
+
+        // DELETE from secondary table
+        Spi::run("DELETE FROM ptck_dims WHERE id = 2").expect("delete dim");
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT COUNT(*) FROM ptck_view").expect("q").expect("v"),
+            1,
+            "Should remove both rows referencing dim 2"
+        );
+
+        let mismatches = Spi::get_one::<i64>(
+            "SELECT COUNT(*) FROM (
+                SELECT product_id, region_id, val, label FROM ptck_view
+                EXCEPT
+                SELECT f.product_id, f.region_id, f.val, d.label
+                FROM ptck_facts f JOIN ptck_dims d ON f.dim_id = d.id
+            ) x",
+        ).expect("q").expect("v");
+        assert_eq!(mismatches, 0);
+    }
+
+    /// JOIN passthrough with aliased key column: target uses alias, source uses original name.
+    #[pg_test]
+    fn test_passthrough_join_aliased_key() {
+        Spi::run("CREATE TABLE ptak_cats (id SERIAL PRIMARY KEY, cat_name TEXT NOT NULL)")
+            .expect("create cats");
+        Spi::run(
+            "CREATE TABLE ptak_items (item_id SERIAL PRIMARY KEY, cat_id INT NOT NULL, price INT NOT NULL)",
+        ).expect("create items");
+        Spi::run("INSERT INTO ptak_cats VALUES (1, 'Electronics'), (2, 'Books')").expect("seed cats");
+        Spi::run("INSERT INTO ptak_items (cat_id, price) VALUES (1, 100), (1, 200), (2, 50)")
+            .expect("seed items");
+
+        crate::create_reflex_ivm_with_key(
+            "ptak_view",
+            "SELECT i.item_id AS id, i.price, c.cat_name AS category \
+             FROM ptak_items i JOIN ptak_cats c ON i.cat_id = c.id",
+            "id",
+        );
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT COUNT(*) FROM ptak_view").expect("q").expect("v"),
+            3
+        );
+
+        // DELETE from secondary table (cats) — mapping should resolve cat_id→id
+        Spi::run("DELETE FROM ptak_cats WHERE id = 1").expect("delete cat");
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT COUNT(*) FROM ptak_view").expect("q").expect("v"),
+            1,
+            "Should remove 2 electronics items"
+        );
+
+        let mismatches = Spi::get_one::<i64>(
+            "SELECT COUNT(*) FROM (
+                SELECT id, price, category FROM ptak_view
+                EXCEPT
+                SELECT i.item_id, i.price, c.cat_name FROM ptak_items i JOIN ptak_cats c ON i.cat_id = c.id
+            ) x",
+        ).expect("q").expect("v");
+        assert_eq!(mismatches, 0);
+    }
+
+    /// INSERT on secondary table in a JOIN passthrough should add rows correctly.
+    #[pg_test]
+    fn test_passthrough_join_insert_secondary() {
+        Spi::run("CREATE TABLE ptjis_products (id SERIAL PRIMARY KEY, name TEXT NOT NULL)")
+            .expect("create products");
+        Spi::run("CREATE TABLE ptjis_sales (id SERIAL PRIMARY KEY, product_id INT NOT NULL, amount INT NOT NULL)")
+            .expect("create sales");
+        Spi::run("INSERT INTO ptjis_products VALUES (1, 'Alpha')").expect("seed products");
+        Spi::run("INSERT INTO ptjis_sales (product_id, amount) VALUES (1, 100)").expect("seed sales");
+
+        crate::create_reflex_ivm_with_key(
+            "ptjis_view",
+            "SELECT s.id, s.amount, p.name FROM ptjis_sales s JOIN ptjis_products p ON s.product_id = p.id",
+            "id",
+        );
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT COUNT(*) FROM ptjis_view").expect("q").expect("v"),
+            1
+        );
+
+        // INSERT a new product — no new sales reference it, so view should not change
+        Spi::run("INSERT INTO ptjis_products VALUES (2, 'Beta')").expect("insert product");
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT COUNT(*) FROM ptjis_view").expect("q").expect("v"),
+            1,
+            "New product with no sales should not affect view"
+        );
+
+        // Now add a sale referencing the new product
+        Spi::run("INSERT INTO ptjis_sales (product_id, amount) VALUES (2, 200)").expect("insert sale");
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT COUNT(*) FROM ptjis_view").expect("q").expect("v"),
+            2,
+            "New sale should appear in view"
+        );
+
+        let name = Spi::get_one::<String>("SELECT name FROM ptjis_view WHERE amount = 200")
+            .expect("q").expect("v");
+        assert_eq!(name, "Beta");
+    }
+
+    // =====================================================================
+    // Chained IMV tests with passthrough layers
+    // =====================================================================
+
+    /// Chain: source → passthrough L1 → aggregate L2
+    /// Tests that DML on the source propagates through a passthrough layer
+    /// into an aggregate layer, with full correctness checks.
+    #[pg_test]
+    fn test_chain_passthrough_then_aggregate() {
+        Spi::run(
+            "CREATE TABLE cpta_src (id SERIAL PRIMARY KEY, region TEXT NOT NULL, amount INT NOT NULL, active BOOLEAN NOT NULL)",
+        ).expect("create table");
+        Spi::run(
+            "INSERT INTO cpta_src (region, amount, active) VALUES \
+             ('US', 100, true), ('US', 200, true), ('US', 50, false), \
+             ('EU', 300, true), ('EU', 150, false)",
+        ).expect("seed");
+
+        // L1: passthrough with WHERE filter (only active rows)
+        crate::create_reflex_ivm(
+            "cpta_l1",
+            "SELECT id, region, amount FROM cpta_src WHERE active = true",
+        );
+
+        // L2: aggregate on L1 (SUM by region)
+        crate::create_reflex_ivm(
+            "cpta_l2",
+            "SELECT region, SUM(amount) AS total, COUNT(*) AS cnt FROM cpta_l1 GROUP BY region",
+        );
+
+        // Verify initial state
+        let us_total = Spi::get_one::<pgrx::AnyNumeric>(
+            "SELECT total FROM cpta_l2 WHERE region = 'US'",
+        ).expect("q").expect("v");
+        assert_eq!(us_total.to_string(), "300"); // 100+200 (active only)
+
+        let eu_total = Spi::get_one::<pgrx::AnyNumeric>(
+            "SELECT total FROM cpta_l2 WHERE region = 'EU'",
+        ).expect("q").expect("v");
+        assert_eq!(eu_total.to_string(), "300"); // 300 (active only)
+
+        // INSERT active row → propagates through L1 passthrough → L2 aggregate updates
+        Spi::run("INSERT INTO cpta_src (region, amount, active) VALUES ('US', 400, true)")
+            .expect("insert active");
+        let us_after_ins = Spi::get_one::<pgrx::AnyNumeric>(
+            "SELECT total FROM cpta_l2 WHERE region = 'US'",
+        ).expect("q").expect("v");
+        assert_eq!(us_after_ins.to_string(), "700"); // 100+200+400
+
+        // INSERT inactive row → appears in source but NOT in L1 or L2
+        Spi::run("INSERT INTO cpta_src (region, amount, active) VALUES ('US', 999, false)")
+            .expect("insert inactive");
+        let us_after_inactive = Spi::get_one::<pgrx::AnyNumeric>(
+            "SELECT total FROM cpta_l2 WHERE region = 'US'",
+        ).expect("q").expect("v");
+        assert_eq!(us_after_inactive.to_string(), "700"); // unchanged
+
+        // DELETE an active row → cascades through both levels
+        Spi::run("DELETE FROM cpta_src WHERE amount = 100").expect("delete");
+        let us_after_del = Spi::get_one::<pgrx::AnyNumeric>(
+            "SELECT total FROM cpta_l2 WHERE region = 'US'",
+        ).expect("q").expect("v");
+        assert_eq!(us_after_del.to_string(), "600"); // 200+400
+
+        // UPDATE a row to change region → moves between groups at L2
+        Spi::run("UPDATE cpta_src SET region = 'EU' WHERE amount = 200").expect("update");
+        let us_after_upd = Spi::get_one::<pgrx::AnyNumeric>(
+            "SELECT total FROM cpta_l2 WHERE region = 'US'",
+        ).expect("q").expect("v");
+        assert_eq!(us_after_upd.to_string(), "400"); // only 400 left in US
+
+        let eu_after_upd = Spi::get_one::<pgrx::AnyNumeric>(
+            "SELECT total FROM cpta_l2 WHERE region = 'EU'",
+        ).expect("q").expect("v");
+        assert_eq!(eu_after_upd.to_string(), "500"); // 300+200
+
+        // Verify L1 matches source exactly
+        let l1_mismatches = Spi::get_one::<i64>(
+            "SELECT COUNT(*) FROM (
+                SELECT id, region, amount FROM cpta_l1
+                EXCEPT
+                SELECT id, region, amount FROM cpta_src WHERE active = true
+            ) x",
+        ).expect("q").expect("v");
+        assert_eq!(l1_mismatches, 0, "L1 should exactly match filtered source");
+
+        // Verify L2 matches aggregate of filtered source
+        let l2_mismatches = Spi::get_one::<i64>(
+            "SELECT COUNT(*) FROM (
+                SELECT region, total, cnt FROM cpta_l2
+                EXCEPT
+                SELECT region, SUM(amount), COUNT(*)
+                FROM cpta_src WHERE active = true GROUP BY region
+            ) x",
+        ).expect("q").expect("v");
+        assert_eq!(l2_mismatches, 0, "L2 should exactly match aggregate of filtered source");
+    }
+
+    /// Chain: source → aggregate L1 → passthrough L2
+    /// Tests that an aggregate feeds into a passthrough that tracks all its rows.
+    #[pg_test]
+    fn test_chain_aggregate_then_passthrough() {
+        Spi::run(
+            "CREATE TABLE catp_src (id SERIAL, city TEXT NOT NULL, revenue INT NOT NULL)",
+        ).expect("create table");
+        Spi::run(
+            "INSERT INTO catp_src (city, revenue) VALUES \
+             ('Paris', 100), ('Paris', 200), ('London', 300), ('Berlin', 50)",
+        ).expect("seed");
+
+        // L1: aggregate (SUM by city)
+        crate::create_reflex_ivm(
+            "catp_l1",
+            "SELECT city, SUM(revenue) AS total, COUNT(*) AS cnt FROM catp_src GROUP BY city",
+        );
+
+        // L2: passthrough of L1 (reads all rows from the aggregate target)
+        crate::create_reflex_ivm(
+            "catp_l2",
+            "SELECT city, total, cnt FROM catp_l1",
+        );
+
+        // Verify initial state
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT COUNT(*) FROM catp_l2").expect("q").expect("v"),
+            3, // Paris, London, Berlin
+        );
+        let paris = Spi::get_one::<pgrx::AnyNumeric>(
+            "SELECT total FROM catp_l2 WHERE city = 'Paris'",
+        ).expect("q").expect("v");
+        assert_eq!(paris.to_string(), "300");
+
+        // INSERT → L1 updates → L2 passthrough picks up change
+        Spi::run("INSERT INTO catp_src (city, revenue) VALUES ('Paris', 50)")
+            .expect("insert");
+        let paris_ins = Spi::get_one::<pgrx::AnyNumeric>(
+            "SELECT total FROM catp_l2 WHERE city = 'Paris'",
+        ).expect("q").expect("v");
+        assert_eq!(paris_ins.to_string(), "350");
+
+        // INSERT new city → new group appears in L1 and L2
+        Spi::run("INSERT INTO catp_src (city, revenue) VALUES ('Tokyo', 500)")
+            .expect("insert new city");
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT COUNT(*) FROM catp_l2").expect("q").expect("v"),
+            4,
+        );
+
+        // DELETE all rows for a city → group disappears from L1 and L2
+        Spi::run("DELETE FROM catp_src WHERE city = 'Berlin'").expect("delete group");
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT COUNT(*) FROM catp_l2").expect("q").expect("v"),
+            3, // Berlin gone
+        );
+        let berlin_count = Spi::get_one::<i64>(
+            "SELECT COUNT(*) FROM catp_l2 WHERE city = 'Berlin'",
+        ).expect("q").expect("v");
+        assert_eq!(berlin_count, 0, "Berlin should not exist in L2");
+
+        // UPDATE → value change propagates through both levels
+        Spi::run("UPDATE catp_src SET revenue = 999 WHERE city = 'London'").expect("update");
+        let london = Spi::get_one::<pgrx::AnyNumeric>(
+            "SELECT total FROM catp_l2 WHERE city = 'London'",
+        ).expect("q").expect("v");
+        assert_eq!(london.to_string(), "999");
+
+        // Verify L1 matches source
+        let l1_mismatches = Spi::get_one::<i64>(
+            "SELECT COUNT(*) FROM (
+                SELECT city, total, cnt FROM catp_l1
+                EXCEPT
+                SELECT city, SUM(revenue), COUNT(*) FROM catp_src GROUP BY city
+            ) x",
+        ).expect("q").expect("v");
+        assert_eq!(l1_mismatches, 0, "L1 should exactly match aggregate of source");
+
+        // Verify L2 matches L1 exactly
+        let l2_mismatches = Spi::get_one::<i64>(
+            "SELECT COUNT(*) FROM (
+                SELECT city, total, cnt FROM catp_l2
+                EXCEPT
+                SELECT city, total, cnt FROM catp_l1
+            ) x",
+        ).expect("q").expect("v");
+        assert_eq!(l2_mismatches, 0, "L2 should exactly mirror L1");
+    }
+
+    /// Chain: source → passthrough L1 (JOIN) → aggregate L2
+    /// The passthrough layer is a JOIN, so this tests cascade through a JOIN passthrough.
+    #[pg_test]
+    fn test_chain_passthrough_join_then_aggregate() {
+        Spi::run("CREATE TABLE cpja_products (id SERIAL PRIMARY KEY, category TEXT NOT NULL)")
+            .expect("create products");
+        Spi::run("CREATE TABLE cpja_sales (id SERIAL PRIMARY KEY, product_id INT NOT NULL, amount INT NOT NULL)")
+            .expect("create sales");
+        Spi::run("INSERT INTO cpja_products VALUES (1, 'Electronics'), (2, 'Books'), (3, 'Food')")
+            .expect("seed products");
+        Spi::run(
+            "INSERT INTO cpja_sales (product_id, amount) VALUES \
+             (1, 100), (1, 200), (2, 50), (2, 150), (3, 75)",
+        ).expect("seed sales");
+
+        // L1: passthrough JOIN (denormalize sales with product category)
+        crate::create_reflex_ivm_with_key(
+            "cpja_l1",
+            "SELECT s.id, s.amount, p.category \
+             FROM cpja_sales s JOIN cpja_products p ON s.product_id = p.id",
+            "id",
+        );
+
+        // L2: aggregate on L1 (SUM by category)
+        crate::create_reflex_ivm(
+            "cpja_l2",
+            "SELECT category, SUM(amount) AS total, COUNT(*) AS cnt FROM cpja_l1 GROUP BY category",
+        );
+
+        // Verify initial
+        let elec = Spi::get_one::<pgrx::AnyNumeric>(
+            "SELECT total FROM cpja_l2 WHERE category = 'Electronics'",
+        ).expect("q").expect("v");
+        assert_eq!(elec.to_string(), "300"); // 100+200
+
+        // INSERT into sales → propagates through L1 JOIN → L2 aggregate
+        Spi::run("INSERT INTO cpja_sales (product_id, amount) VALUES (2, 100)")
+            .expect("insert sale");
+        let books = Spi::get_one::<pgrx::AnyNumeric>(
+            "SELECT total FROM cpja_l2 WHERE category = 'Books'",
+        ).expect("q").expect("v");
+        assert_eq!(books.to_string(), "300"); // 50+150+100
+
+        // DELETE a product from secondary table → L1 removes rows → L2 group shrinks
+        Spi::run("DELETE FROM cpja_products WHERE id = 3").expect("delete product");
+        let food_count = Spi::get_one::<i64>(
+            "SELECT COUNT(*) FROM cpja_l2 WHERE category = 'Food'",
+        ).expect("q").expect("v");
+        assert_eq!(food_count, 0, "Food category should disappear from L2");
+
+        // DELETE from sales (key-owner) → direct key extraction at L1 → cascades to L2
+        Spi::run("DELETE FROM cpja_sales WHERE amount = 100 AND product_id = 1").expect("delete sale");
+        let elec_after = Spi::get_one::<pgrx::AnyNumeric>(
+            "SELECT total FROM cpja_l2 WHERE category = 'Electronics'",
+        ).expect("q").expect("v");
+        assert_eq!(elec_after.to_string(), "200"); // only 200 left
+
+        // UPDATE product category → L1 updates → L2 groups shift
+        Spi::run("UPDATE cpja_products SET category = 'Electronics' WHERE id = 2")
+            .expect("update product category");
+        let elec_final = Spi::get_one::<pgrx::AnyNumeric>(
+            "SELECT total FROM cpja_l2 WHERE category = 'Electronics'",
+        ).expect("q").expect("v");
+        assert_eq!(elec_final.to_string(), "500"); // 200 + 50+150+100
+
+        // Verify L1 exactly matches direct JOIN
+        let l1_mismatches = Spi::get_one::<i64>(
+            "SELECT COUNT(*) FROM (
+                SELECT id, amount, category FROM cpja_l1
+                EXCEPT
+                SELECT s.id, s.amount, p.category
+                FROM cpja_sales s JOIN cpja_products p ON s.product_id = p.id
+            ) x",
+        ).expect("q").expect("v");
+        assert_eq!(l1_mismatches, 0, "L1 should exactly match the JOIN");
+
+        // Verify L2 matches aggregate of L1
+        let l2_mismatches = Spi::get_one::<i64>(
+            "SELECT COUNT(*) FROM (
+                SELECT category, total, cnt FROM cpja_l2
+                EXCEPT
+                SELECT category, SUM(amount), COUNT(*) FROM cpja_l1 GROUP BY category
+            ) x",
+        ).expect("q").expect("v");
+        assert_eq!(l2_mismatches, 0, "L2 should exactly match aggregate of L1");
+    }
+
+    // =====================================================================
+    // Multiple IMVs on same source — diverse types
+    // =====================================================================
+
+    /// Multiple IMVs of different types (aggregate, passthrough, distinct) on the same
+    /// source table. All must stay correct through INSERT, DELETE, and UPDATE.
+    #[pg_test]
+    fn test_multiple_mixed_imvs_on_same_source() {
+        Spi::run(
+            "CREATE TABLE mmis_src (id SERIAL PRIMARY KEY, dept TEXT NOT NULL, salary INT NOT NULL, active BOOLEAN NOT NULL)",
+        ).expect("create table");
+        Spi::run(
+            "INSERT INTO mmis_src (dept, salary, active) VALUES \
+             ('Eng', 100, true), ('Eng', 200, true), ('Eng', 50, false), \
+             ('Sales', 300, true), ('Sales', 150, false), \
+             ('HR', 80, true)",
+        ).expect("seed");
+
+        // IMV1: aggregate — SUM salary by dept
+        crate::create_reflex_ivm(
+            "mmis_agg",
+            "SELECT dept, SUM(salary) AS total, COUNT(*) AS cnt FROM mmis_src GROUP BY dept",
+        );
+
+        // IMV2: passthrough — all active employees
+        crate::create_reflex_ivm(
+            "mmis_active",
+            "SELECT id, dept, salary FROM mmis_src WHERE active = true",
+        );
+
+        // IMV3: distinct — unique departments
+        crate::create_reflex_ivm(
+            "mmis_depts",
+            "SELECT DISTINCT dept FROM mmis_src",
+        );
+
+        // IMV4: aggregate — AVG salary globally
+        crate::create_reflex_ivm(
+            "mmis_avg",
+            "SELECT AVG(salary) AS avg_sal FROM mmis_src",
+        );
+
+        // Verify initial state
+        let eng_total = Spi::get_one::<pgrx::AnyNumeric>(
+            "SELECT total FROM mmis_agg WHERE dept = 'Eng'",
+        ).expect("q").expect("v");
+        assert_eq!(eng_total.to_string(), "350"); // 100+200+50
+
+        let active_count = Spi::get_one::<i64>(
+            "SELECT COUNT(*) FROM mmis_active",
+        ).expect("q").expect("v");
+        assert_eq!(active_count, 4); // 100,200,300,80
+
+        let dept_count = Spi::get_one::<i64>(
+            "SELECT COUNT(*) FROM mmis_depts",
+        ).expect("q").expect("v");
+        assert_eq!(dept_count, 3);
+
+        // INSERT → all 4 IMVs must update correctly
+        Spi::run("INSERT INTO mmis_src (dept, salary, active) VALUES ('Eng', 400, true)")
+            .expect("insert");
+
+        assert_eq!(
+            Spi::get_one::<pgrx::AnyNumeric>("SELECT total FROM mmis_agg WHERE dept = 'Eng'")
+                .expect("q").expect("v").to_string(),
+            "750", // 350+400
+        );
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT COUNT(*) FROM mmis_active").expect("q").expect("v"),
+            5,
+        );
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT COUNT(*) FROM mmis_depts").expect("q").expect("v"),
+            3, // no new dept
+        );
+
+        // INSERT new dept → distinct count changes
+        Spi::run("INSERT INTO mmis_src (dept, salary, active) VALUES ('Legal', 250, true)")
+            .expect("insert new dept");
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT COUNT(*) FROM mmis_depts").expect("q").expect("v"),
+            4,
+        );
+
+        // DELETE → all 4 IMVs update
+        Spi::run("DELETE FROM mmis_src WHERE salary = 50").expect("delete inactive eng");
+        assert_eq!(
+            Spi::get_one::<pgrx::AnyNumeric>("SELECT total FROM mmis_agg WHERE dept = 'Eng'")
+                .expect("q").expect("v").to_string(),
+            "700", // 100+200+400
+        );
+        // Active count shouldn't change (deleted row was inactive)
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT COUNT(*) FROM mmis_active").expect("q").expect("v"),
+            6,
+        );
+
+        // DELETE all rows in a dept → group disappears from aggregate and distinct
+        Spi::run("DELETE FROM mmis_src WHERE dept = 'HR'").expect("delete HR");
+        let hr_count = Spi::get_one::<i64>(
+            "SELECT COUNT(*) FROM mmis_agg WHERE dept = 'HR'",
+        ).expect("q").expect("v");
+        assert_eq!(hr_count, 0, "HR should disappear from aggregate");
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT COUNT(*) FROM mmis_depts").expect("q").expect("v"),
+            3, // HR gone, Legal still there
+        );
+
+        // UPDATE → value change propagates to aggregate and avg
+        Spi::run("UPDATE mmis_src SET salary = 1000 WHERE dept = 'Legal'").expect("update");
+        assert_eq!(
+            Spi::get_one::<pgrx::AnyNumeric>("SELECT total FROM mmis_agg WHERE dept = 'Legal'")
+                .expect("q").expect("v").to_string(),
+            "1000",
+        );
+
+        // Verify passthrough matches source exactly
+        let pt_mismatches = Spi::get_one::<i64>(
+            "SELECT COUNT(*) FROM (
+                SELECT id, dept, salary FROM mmis_active
+                EXCEPT
+                SELECT id, dept, salary FROM mmis_src WHERE active = true
+            ) x",
+        ).expect("q").expect("v");
+        assert_eq!(pt_mismatches, 0, "Passthrough IMV should exactly match filtered source");
+
+        // Verify aggregate matches source
+        let agg_mismatches = Spi::get_one::<i64>(
+            "SELECT COUNT(*) FROM (
+                SELECT dept, total, cnt FROM mmis_agg
+                EXCEPT
+                SELECT dept, SUM(salary), COUNT(*) FROM mmis_src GROUP BY dept
+            ) x",
+        ).expect("q").expect("v");
+        assert_eq!(agg_mismatches, 0, "Aggregate IMV should match source");
+
+        // Verify distinct matches source
+        let dist_mismatches = Spi::get_one::<i64>(
+            "SELECT COUNT(*) FROM (
+                SELECT dept FROM mmis_depts
+                EXCEPT
+                SELECT DISTINCT dept FROM mmis_src
+            ) x",
+        ).expect("q").expect("v");
+        assert_eq!(dist_mismatches, 0, "Distinct IMV should match source");
+    }
+
+    #[pg_test]
     fn test_cte_passthrough_sub_imv() {
         Spi::run(
             "CREATE TABLE cte_pt_src (id SERIAL, region TEXT NOT NULL, val INT NOT NULL, active BOOLEAN NOT NULL)",
@@ -3789,6 +4788,350 @@ mod tests {
         .expect("q")
         .expect("v");
         assert_eq!(v2, 1, "v2 should be fixed after refresh");
+    }
+
+    // =====================================================================
+    // Integration tests for untested query features
+    // =====================================================================
+
+    /// BOOL_OR aggregate: INSERT, DELETE (recompute), UPDATE
+    #[pg_test]
+    fn test_bool_or_insert_delete_update() {
+        Spi::run(
+            "CREATE TABLE bo_src (id SERIAL PRIMARY KEY, grp TEXT NOT NULL, flag BOOLEAN NOT NULL)",
+        ).expect("create");
+        Spi::run(
+            "INSERT INTO bo_src (grp, flag) VALUES ('A', false), ('A', false), ('B', true)",
+        ).expect("seed");
+
+        crate::create_reflex_ivm(
+            "bo_view",
+            "SELECT grp, BOOL_OR(flag) AS any_flag FROM bo_src GROUP BY grp",
+        );
+
+        // Initial: A=false (both false), B=true
+        // BOOL_OR returns NULL-safe boolean, read via i64 count to verify
+        let a_val = Spi::get_one::<bool>("SELECT any_flag FROM bo_view WHERE grp = 'A'")
+            .expect("initial A query failed")
+            .expect("initial A returned no rows");
+        assert!(!a_val, "A should be false initially");
+
+        let b_val = Spi::get_one::<bool>("SELECT any_flag FROM bo_view WHERE grp = 'B'")
+            .expect("initial B query failed")
+            .expect("initial B returned no rows");
+        assert!(b_val, "B should be true initially");
+
+        // INSERT true into A → should become true (OR logic)
+        Spi::run("INSERT INTO bo_src (grp, flag) VALUES ('A', true)").expect("insert true");
+        let a_ins = Spi::get_one::<bool>("SELECT any_flag FROM bo_view WHERE grp = 'A'")
+            .expect("after insert query failed")
+            .expect("after insert returned no rows");
+        assert!(a_ins, "A should be true after inserting true");
+
+        // DELETE the only true row → recompute from source, should become false
+        Spi::run("DELETE FROM bo_src WHERE grp = 'A' AND flag = true").expect("delete true");
+        let a_after_del = Spi::get_one::<bool>("SELECT any_flag FROM bo_view WHERE grp = 'A'")
+            .expect("after delete query failed")
+            .expect("after delete no rows");
+        assert!(!a_after_del, "A should revert to false after deleting only true row");
+
+        // UPDATE false→true
+        Spi::run("UPDATE bo_src SET flag = true WHERE id = (SELECT MIN(id) FROM bo_src WHERE grp = 'A')")
+            .expect("update");
+
+        // Final EXCEPT correctness check (no reconcile needed)
+        let mismatches = Spi::get_one::<i64>(
+            "SELECT COUNT(*) FROM (
+                SELECT grp, any_flag FROM bo_view
+                EXCEPT
+                SELECT grp, BOOL_OR(flag) FROM bo_src GROUP BY grp
+            ) x",
+        ).expect("final except query failed").expect("final except no rows");
+        assert_eq!(mismatches, 0, "View should exactly match source");
+    }
+
+    /// LEFT JOIN aggregate: group by a non-nullable column to avoid NULL group key limitation.
+    /// Tests that LEFT JOIN preserves unmatched rows via the left table.
+    #[pg_test]
+    fn test_left_join_aggregate() {
+        Spi::run("CREATE TABLE lj_orders (id SERIAL PRIMARY KEY, product_id INT, region TEXT NOT NULL, amount INT NOT NULL)")
+            .expect("create orders");
+        Spi::run("CREATE TABLE lj_products (id SERIAL PRIMARY KEY, name TEXT NOT NULL)")
+            .expect("create products");
+        Spi::run("INSERT INTO lj_products VALUES (1, 'Widget'), (2, 'Gadget')").expect("seed products");
+        Spi::run(
+            "INSERT INTO lj_orders (product_id, region, amount) VALUES \
+             (1, 'US', 100), (1, 'EU', 200), (2, 'US', 50), (999, 'US', 75)",
+        ).expect("seed orders");
+
+        // GROUP BY region (non-nullable) to avoid NULL group key issue
+        crate::create_reflex_ivm(
+            "lj_view",
+            "SELECT o.region, SUM(o.amount) AS total, COUNT(*) AS cnt \
+             FROM lj_orders o LEFT JOIN lj_products p ON o.product_id = p.id \
+             GROUP BY o.region",
+        );
+
+        // Verify initial: US=100+50+75=225, EU=200
+        let us = Spi::get_one::<pgrx::AnyNumeric>(
+            "SELECT total FROM lj_view WHERE region = 'US'",
+        ).expect("q").expect("v");
+        assert_eq!(us.to_string(), "225");
+
+        // INSERT unmatched order (no product) → still counted in LEFT JOIN
+        Spi::run("INSERT INTO lj_orders (product_id, region, amount) VALUES (NULL, 'EU', 30)")
+            .expect("insert unmatched");
+        let eu = Spi::get_one::<pgrx::AnyNumeric>(
+            "SELECT total FROM lj_view WHERE region = 'EU'",
+        ).expect("q").expect("v");
+        assert_eq!(eu.to_string(), "230"); // 200+30
+
+        // DELETE
+        Spi::run("DELETE FROM lj_orders WHERE amount = 100").expect("delete");
+        let us_del = Spi::get_one::<pgrx::AnyNumeric>(
+            "SELECT total FROM lj_view WHERE region = 'US'",
+        ).expect("q").expect("v");
+        assert_eq!(us_del.to_string(), "125"); // 50+75
+
+        // EXCEPT correctness
+        let mismatches = Spi::get_one::<i64>(
+            "SELECT COUNT(*) FROM (
+                SELECT region, total, cnt FROM lj_view
+                EXCEPT
+                SELECT o.region, SUM(o.amount), COUNT(*)
+                FROM lj_orders o LEFT JOIN lj_products p ON o.product_id = p.id
+                GROUP BY o.region
+            ) x",
+        ).expect("q").expect("v");
+        assert_eq!(mismatches, 0, "LEFT JOIN view should match source");
+    }
+
+    /// RIGHT JOIN passthrough: rows from right table even when left has no match
+    #[pg_test]
+    fn test_right_join_passthrough() {
+        Spi::run("CREATE TABLE rj_items (id SERIAL PRIMARY KEY, cat_id INT, val INT NOT NULL)")
+            .expect("create items");
+        Spi::run("CREATE TABLE rj_cats (id SERIAL PRIMARY KEY, name TEXT NOT NULL)")
+            .expect("create cats");
+        Spi::run("INSERT INTO rj_cats VALUES (1, 'A'), (2, 'B'), (3, 'C')").expect("seed cats");
+        Spi::run("INSERT INTO rj_items (cat_id, val) VALUES (1, 10), (1, 20)").expect("seed items");
+
+        // RIGHT JOIN: all categories appear, even those with no items
+        crate::create_reflex_ivm(
+            "rj_view",
+            "SELECT i.id AS item_id, i.val, c.name AS cat_name \
+             FROM rj_items i RIGHT JOIN rj_cats c ON i.cat_id = c.id",
+        );
+
+        // All 3 cats should appear (A has 2 items, B and C have NULL items)
+        let count = Spi::get_one::<i64>("SELECT COUNT(*) FROM rj_view")
+            .expect("q").expect("v");
+        assert_eq!(count, 4); // 2 items + 2 NULL rows for B and C
+
+        // INSERT item for cat B
+        Spi::run("INSERT INTO rj_items (cat_id, val) VALUES (2, 30)").expect("insert");
+        let b_count = Spi::get_one::<i64>(
+            "SELECT COUNT(*) FROM rj_view WHERE cat_name = 'B' AND item_id IS NOT NULL",
+        ).expect("q").expect("v");
+        assert_eq!(b_count, 1);
+
+        // DELETE item from cat A
+        Spi::run("DELETE FROM rj_items WHERE val = 10").expect("delete");
+
+        // EXCEPT correctness
+        let mismatches = Spi::get_one::<i64>(
+            "SELECT COUNT(*) FROM (
+                SELECT item_id, val, cat_name FROM rj_view
+                EXCEPT
+                SELECT i.id, i.val, c.name
+                FROM rj_items i RIGHT JOIN rj_cats c ON i.cat_id = c.id
+            ) x",
+        ).expect("q").expect("v");
+        assert_eq!(mismatches, 0, "RIGHT JOIN view should match source");
+    }
+
+    /// Cast propagation: SUM(x)::BIGINT should produce correct values and BIGINT column type
+    #[pg_test]
+    fn test_cast_propagation_sum_bigint() {
+        Spi::run("CREATE TABLE cast_src (id SERIAL, grp TEXT NOT NULL, val INT NOT NULL)")
+            .expect("create");
+        Spi::run("INSERT INTO cast_src (grp, val) VALUES ('X', 100), ('X', 200), ('Y', 50)")
+            .expect("seed");
+
+        crate::create_reflex_ivm(
+            "cast_view",
+            "SELECT grp, SUM(val)::BIGINT AS total FROM cast_src GROUP BY grp",
+        );
+
+        // Verify initial values
+        let x = Spi::get_one::<i64>("SELECT total FROM cast_view WHERE grp = 'X'")
+            .expect("q").expect("v");
+        assert_eq!(x, 300);
+
+        // Verify column type is BIGINT (int8)
+        let col_type = Spi::get_one::<String>(
+            "SELECT data_type FROM information_schema.columns \
+             WHERE table_name = 'cast_view' AND column_name = 'total'",
+        ).expect("q").expect("v");
+        assert_eq!(col_type, "bigint", "Column should be BIGINT due to cast");
+
+        // INSERT
+        Spi::run("INSERT INTO cast_src (grp, val) VALUES ('X', 400)").expect("insert");
+        let x_after = Spi::get_one::<i64>("SELECT total FROM cast_view WHERE grp = 'X'")
+            .expect("q").expect("v");
+        assert_eq!(x_after, 700);
+
+        // DELETE
+        Spi::run("DELETE FROM cast_src WHERE val = 200").expect("delete");
+        let x_del = Spi::get_one::<i64>("SELECT total FROM cast_view WHERE grp = 'X'")
+            .expect("q").expect("v");
+        assert_eq!(x_del, 500);
+
+        // UPDATE
+        Spi::run("UPDATE cast_src SET val = 999 WHERE grp = 'Y'").expect("update");
+        let y = Spi::get_one::<i64>("SELECT total FROM cast_view WHERE grp = 'Y'")
+            .expect("q").expect("v");
+        assert_eq!(y, 999);
+
+        // EXCEPT correctness
+        let mismatches = Spi::get_one::<i64>(
+            "SELECT COUNT(*) FROM (
+                SELECT grp, total FROM cast_view
+                EXCEPT
+                SELECT grp, SUM(val)::BIGINT FROM cast_src GROUP BY grp
+            ) x",
+        ).expect("q").expect("v");
+        assert_eq!(mismatches, 0, "Cast view should match source");
+    }
+
+    /// Subquery in FROM with a simple filter: the inner table still gets triggers.
+    /// Note: subqueries with aggregation inside don't work incrementally because
+    /// the trigger replaces the inner table with the transition table, but the
+    /// aggregation in the subquery then only sees the delta rows, not the full table.
+    /// This test uses a simple WHERE filter instead.
+    #[pg_test]
+    fn test_subquery_in_from_with_trigger() {
+        Spi::run("CREATE TABLE sq_src (id SERIAL PRIMARY KEY, val INT NOT NULL, active BOOLEAN NOT NULL)")
+            .expect("create");
+        Spi::run("INSERT INTO sq_src (val, active) VALUES (10, true), (20, true), (30, false)")
+            .expect("seed");
+
+        // Subquery with simple WHERE filter (no aggregation inside)
+        crate::create_reflex_ivm(
+            "sq_view",
+            "SELECT id, val FROM (SELECT id, val FROM sq_src WHERE active = true) AS sub",
+        );
+
+        let count = Spi::get_one::<i64>("SELECT COUNT(*) FROM sq_view")
+            .expect("q").expect("v");
+        assert_eq!(count, 2); // only active rows
+
+        // INSERT active row → appears via trigger on sq_src
+        Spi::run("INSERT INTO sq_src (val, active) VALUES (40, true)").expect("insert active");
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT COUNT(*) FROM sq_view").expect("q").expect("v"),
+            3,
+        );
+
+        // INSERT inactive row → does not appear
+        Spi::run("INSERT INTO sq_src (val, active) VALUES (50, false)").expect("insert inactive");
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT COUNT(*) FROM sq_view").expect("q").expect("v"),
+            3,
+        );
+
+        // DELETE active row
+        Spi::run("DELETE FROM sq_src WHERE val = 10").expect("delete");
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT COUNT(*) FROM sq_view").expect("q").expect("v"),
+            2,
+        );
+
+        // EXCEPT correctness
+        let mismatches = Spi::get_one::<i64>(
+            "SELECT COUNT(*) FROM (
+                SELECT id, val FROM sq_view
+                EXCEPT
+                SELECT id, val FROM sq_src WHERE active = true
+            ) x",
+        ).expect("q").expect("v");
+        assert_eq!(mismatches, 0, "Subquery view should match filtered source");
+    }
+
+    /// Subquery with aggregation in FROM should be rejected with a clear error.
+    #[pg_test]
+    fn test_subquery_with_aggregation_rejected() {
+        Spi::run("CREATE TABLE sqr_products (id SERIAL PRIMARY KEY, name TEXT NOT NULL)")
+            .expect("create");
+        Spi::run("CREATE TABLE sqr_orders (id SERIAL, product_id INT NOT NULL, qty INT NOT NULL)")
+            .expect("create");
+
+        let result = crate::create_reflex_ivm(
+            "sqr_view",
+            "SELECT p.name, sub.total_qty \
+             FROM sqr_products p \
+             JOIN (SELECT product_id, SUM(qty) AS total_qty FROM sqr_orders GROUP BY product_id) AS sub \
+             ON p.id = sub.product_id",
+        );
+        assert!(
+            result.starts_with("ERROR:"),
+            "Subquery with aggregation should be rejected, got: {}",
+            result
+        );
+        assert!(
+            result.contains("CTE"),
+            "Error should suggest using CTE, got: {}",
+            result
+        );
+    }
+
+    /// Subquery as only source: the inner table still gets triggers via visitor recursion.
+    #[pg_test]
+    fn test_subquery_only_source() {
+        Spi::run("CREATE TABLE sqo_src (id SERIAL PRIMARY KEY, val INT NOT NULL)")
+            .expect("create");
+        Spi::run("INSERT INTO sqo_src (val) VALUES (10), (20), (-5)").expect("seed");
+
+        crate::create_reflex_ivm(
+            "sqo_view",
+            "SELECT id, val FROM (SELECT id, val FROM sqo_src WHERE val > 0) AS sub",
+        );
+
+        // Initial: only positive values
+        let count = Spi::get_one::<i64>("SELECT COUNT(*) FROM sqo_view")
+            .expect("q").expect("v");
+        assert_eq!(count, 2);
+
+        // INSERT positive → appears
+        Spi::run("INSERT INTO sqo_src (val) VALUES (30)").expect("insert positive");
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT COUNT(*) FROM sqo_view").expect("q").expect("v"),
+            3,
+        );
+
+        // INSERT negative → does not appear (filtered by subquery WHERE)
+        Spi::run("INSERT INTO sqo_src (val) VALUES (-10)").expect("insert negative");
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT COUNT(*) FROM sqo_view").expect("q").expect("v"),
+            3,
+        );
+
+        // DELETE positive row
+        Spi::run("DELETE FROM sqo_src WHERE val = 20").expect("delete");
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT COUNT(*) FROM sqo_view").expect("q").expect("v"),
+            2,
+        );
+
+        // EXCEPT correctness
+        let mismatches = Spi::get_one::<i64>(
+            "SELECT COUNT(*) FROM (
+                SELECT id, val FROM sqo_view
+                EXCEPT
+                SELECT id, val FROM sqo_src WHERE val > 0
+            ) x",
+        ).expect("q").expect("v");
+        assert_eq!(mismatches, 0, "Subquery view should match filtered source");
     }
 }
 

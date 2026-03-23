@@ -11,11 +11,11 @@ pg_reflex is a PostgreSQL extension that maintains materialized views incrementa
 Download and install the `.deb` package for your PostgreSQL version:
 
 ```bash
-# Download the package (replace 1.0.0 and pg17 with your version)
-wget https://github.com/diviyank/pg_reflex/releases/download/1.0.0/pg-reflex-1.0.0-pg17-amd64.deb
+# Download the package (replace VERSION and pg17 with your version)
+wget https://github.com/diviyank/pg_reflex/releases/download/VERSION/pg-reflex-VERSION-pg17-amd64.deb
 
 # Install it
-sudo dpkg -i pg-reflex-1.0.0-pg17-amd64.deb
+sudo dpkg -i pg-reflex-VERSION-pg17-amd64.deb
 ```
 
 Then enable the extension in your database:
@@ -64,10 +64,10 @@ CREATE EXTENSION pg_reflex;
 
 ```bash
 # Install the new version (replaces the .so and .sql files on disk)
-sudo dpkg -i pg-reflex-1.1.0-pg17-amd64.deb
+sudo dpkg -i pg-reflex-NEW_VERSION-pg17-amd64.deb
 
 # Update the extension in each database that uses it
-psql -d mydb -c "ALTER EXTENSION pg_reflex UPDATE TO '1.1.0';"
+psql -d mydb -c "ALTER EXTENSION pg_reflex UPDATE TO 'NEW_VERSION';"
 ```
 
 ### From source
@@ -126,23 +126,7 @@ SELECT * FROM sales_by_region;
 --  EU     |   350
 ```
 
-## API Reference
-
-### `create_reflex_ivm(view_name TEXT, sql TEXT) -> TEXT`
-
-Creates an incrementally maintained view from a SELECT query.
-
-**Parameters:**
-- `view_name` -- Name for the resulting view table
-- `sql` -- A SELECT query with GROUP BY, aggregate functions, or DISTINCT
-
-**Returns:** `'CREATE REFLEX INCREMENTAL VIEW'` on success, or an error string.
-
-**What it creates:**
-1. An **intermediate table** (`__reflex_intermediate_{view_name}`) -- UNLOGGED, stores partial aggregate state (sufficient statistics)
-2. A **target table** (`{view_name}`) -- regular table you query, contains the final computed results
-3. **Triggers** on each source table (INSERT, DELETE, UPDATE) that keep the view in sync
-4. A **metadata entry** in `__reflex_ivm_reference` tracking the view's configuration
+## Usage Examples
 
 ```sql
 -- Passthrough (no aggregation) — complex JOINs/filters kept fresh via triggers
@@ -351,6 +335,25 @@ Creates an incremental materialized view from a SELECT query. Returns `'CREATE R
 
 View names must contain only alphanumeric characters, underscores, and periods (for schema qualification).
 
+What it creates:
+1. An **intermediate table** (`__reflex_intermediate_{view_name}`) -- UNLOGGED, stores partial aggregate state
+2. A **target table** (`{view_name}`) -- regular table you query, contains the final computed results
+3. **Triggers** on each source table (INSERT, DELETE, UPDATE) that keep the view in sync
+4. A **metadata entry** in `__reflex_ivm_reference` tracking the view's configuration
+
+### `create_reflex_ivm(view_name TEXT, sql TEXT, unique_columns TEXT) -> TEXT`
+
+Same as above, but explicitly specifies the unique key column(s) for passthrough IMVs (no GROUP BY). This enables incremental DELETE/UPDATE via direct key matching instead of full-row comparison.
+
+```sql
+-- Explicit unique key for targeted delete/update
+SELECT create_reflex_ivm('active_orders',
+    'SELECT o.id, o.amount, p.name FROM orders o JOIN products p ON o.product_id = p.id',
+    'id');
+```
+
+If omitted, pg_reflex auto-detects primary keys from the source tables.
+
 ### `drop_reflex_ivm(view_name TEXT) -> TEXT`
 
 Drops an IMV and all its artifacts (target table, intermediate table, triggers, metadata). Refuses if the IMV has child dependencies.
@@ -372,6 +375,23 @@ For performance, reconcile drops all indexes (including user-created), does a bu
 
 ```sql
 SELECT reflex_reconcile('sales_by_region');
+```
+
+### `refresh_reflex_imv(view_name TEXT) -> TEXT`
+
+Alias for `reflex_reconcile`. Provided for naming consistency with PostgreSQL's `REFRESH MATERIALIZED VIEW`.
+
+```sql
+SELECT refresh_reflex_imv('sales_by_region');
+```
+
+### `refresh_imv_depending_on(source TEXT) -> TEXT`
+
+Refreshes all IMVs that depend on the given source table or materialized view. Useful after bulk-loading data with triggers disabled, or after refreshing a source materialized view.
+
+```sql
+-- Refresh all IMVs that read from the 'orders' table
+SELECT refresh_imv_depending_on('orders');
 ```
 
 ## Testing

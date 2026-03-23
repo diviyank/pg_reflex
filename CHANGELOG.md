@@ -24,6 +24,8 @@
 - **Source index creation** — index creation on source tables for MIN/MAX/BOOL_OR recompute now checks column existence first, so it no longer fails when group columns come from JOIN tables.
 - Materialized views no longer cause "cannot have triggers" error
 - Passthrough DELETE/UPDATE no longer does full table refresh
+- **Passthrough JOIN key mapping** — unique key detection for passthrough JOINs now uses per-source-table column mappings derived from JOIN conditions. Previously, DELETE/UPDATE triggers on secondary tables (e.g., `products` in a `sales JOIN products` query) could corrupt data by matching the wrong column. Auto-detection is now restricted to single-source queries; JOINs require the explicit 3rd argument.
+- Dropped PostgreSQL 13/14 from supported versions (MERGE statement requires PG15+)
 
 ### Performance
 - **Deferred index creation** — indexes on intermediate and target tables are now created after bulk data insertion (not before), reducing IMV creation time by ~60% on large datasets
@@ -62,7 +64,7 @@
 - Multi-level cascade propagation works automatically to arbitrary depth (was incorrectly listed as a limitation)
 
 ### Supported
-- PostgreSQL 13, 14, 15, 16, 17, 18
+- PostgreSQL 15, 16, 17, 18 (requires MERGE statement, PG15+)
 - Aggregates: SUM, COUNT, COUNT(*), AVG, MIN, MAX, BOOL_OR
 - DISTINCT, GROUP BY, WHERE, INNER/LEFT/RIGHT JOIN
 - Non-recursive CTEs (decomposed into sub-IMVs)

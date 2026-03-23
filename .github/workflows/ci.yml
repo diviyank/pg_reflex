@@ -7,11 +7,37 @@ on:
     branches: [main]
 
 jobs:
+  lint:
+    name: "Clippy"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-all-crates: true
+      - name: Cache pgrx
+        uses: actions/cache@v4
+        with:
+          path: ~/.pgrx/
+          key: pgrx-clippy-pg17-${{ hashFiles('Cargo.lock') }}
+          restore-keys: pgrx-clippy-pg17-
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libpq-dev libreadline-dev zlib1g-dev
+      - name: Install cargo-pgrx
+        run: cargo install cargo-pgrx --version '=0.16.1' --locked
+      - name: Initialize pgrx
+        run: cargo pgrx init --pg17 download
+      - name: Run clippy
+        run: cargo clippy --features pg17 -- -D warnings
+
   test:
     strategy:
       fail-fast: false
       matrix:
-        pg: [15, 17, 18]
+        pg: [15, 16, 17, 18]
     name: "PostgreSQL ${{ matrix.pg }}"
     runs-on: ubuntu-latest
     steps:

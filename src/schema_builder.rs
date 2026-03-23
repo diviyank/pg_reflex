@@ -341,6 +341,7 @@ mod tests {
             distinct_columns: vec![],
             is_passthrough: false,
             passthrough_columns: vec![],
+            passthrough_key_mappings: std::collections::HashMap::new(),
             having_clause: None,
         }
     }
@@ -437,6 +438,7 @@ mod tests {
             distinct_columns: vec![],
             is_passthrough: false,
             passthrough_columns: vec![],
+            passthrough_key_mappings: std::collections::HashMap::new(),
             having_clause: None,
         };
         let types = HashMap::new();
