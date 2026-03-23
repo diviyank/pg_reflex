@@ -43,7 +43,7 @@ cargo install cargo-pgrx --version '=0.16.1' --locked
 cargo pgrx init --pg17 download    # adjust pg17 to your version (pg15, pg16, pg18)
 
 # 5. Build and install the extension into your PostgreSQL instance
-cargo pgrx install --release --pg-config $(which pg_config)
+./install.sh --release --pg-config $(which pg_config)
 ```
 
 > **Note:** If you get a "Permission denied" error, the PostgreSQL extension directories need to be writable by your user. On a dev machine:
@@ -75,7 +75,7 @@ psql -d mydb -c "ALTER EXTENSION pg_reflex UPDATE TO '1.1.0';"
 ```bash
 cd pg_reflex
 git pull
-cargo pgrx install --release --pg-config $(which pg_config)
+./install.sh --release --pg-config $(which pg_config)
 
 # Update the extension in each database that uses it
 psql -d mydb -c "ALTER EXTENSION pg_reflex UPDATE;"
@@ -185,6 +185,13 @@ SELECT create_reflex_ivm('full_stats',
             MAX(amount) AS max_amount
      FROM orders GROUP BY region');
 
+-- BOOL_OR with cast
+SELECT create_reflex_ivm('product_flags',
+    'SELECT product_id,
+            SUM(qty)::BIGINT AS total_qty,
+            bool_or(is_promotional) AS has_promo
+     FROM order_lines GROUP BY product_id');
+
 -- CTE: each WITH clause becomes its own sub-IMV automatically
 SELECT create_reflex_ivm('top_regions',
     'WITH regional AS (
@@ -221,7 +228,18 @@ SELECT create_reflex_ivm('region_summary',
 | `AVG(x)` | Yes | Yes | Decomposed to SUM + COUNT, recomputed as SUM/COUNT |
 | `MIN(x)` | Yes | Recomputes group | Uses LEAST on insert; full group rescan on delete |
 | `MAX(x)` | Yes | Recomputes group | Uses GREATEST on insert; full group rescan on delete |
+| `BOOL_OR(x)` | Yes | Recomputes group | Uses OR on insert; full group rescan on delete |
 | `DISTINCT` | Yes | Yes | Reference counting (`__ivm_count`) tracks multiplicity |
+
+### Type Casts
+
+Aggregate expressions with casts are supported. The cast is applied when materializing from the intermediate table to the target table:
+
+```sql
+-- Target column "total" will be BIGINT, not NUMERIC
+SELECT create_reflex_ivm('typed_totals',
+    'SELECT region, SUM(amount)::BIGINT AS total FROM orders GROUP BY region');
+```
 
 ### Query Clauses
 
@@ -283,6 +301,8 @@ Instead of storing raw data, pg_reflex stores the minimum state needed to mainta
 | `AVG(salary)` | `__sum_salary` + `__count_salary` | `__sum_salary / __count_salary` |
 | `COUNT(*)` | `__count_star` | `__count_star` |
 | `DISTINCT col` | `col` + `__ivm_count` | `col WHERE __ivm_count > 0` |
+| `BOOL_OR(active)` | `__bool_or_active` | `__bool_or_active` |
+| `SUM(x)::BIGINT` | `__sum_x` (NUMERIC) | `__sum_x::BIGINT` |
 
 ### Dependency Graph
 
@@ -348,6 +368,8 @@ SELECT drop_reflex_ivm('daily_totals', true);       -- drops children first
 
 Rebuilds the intermediate and target tables from the source data. Use to fix drift or as a periodic safety net via `pg_cron`. Returns `'RECONCILED'` on success.
 
+For performance, reconcile drops all indexes (including user-created), does a bulk TRUNCATE + INSERT, then recreates all indexes and runs ANALYZE. User-created index definitions are saved and restored faithfully.
+
 ```sql
 SELECT reflex_reconcile('sales_by_region');
 ```
@@ -393,7 +415,7 @@ Key insight: **INSERT latency is constant regardless of table size** -- the trig
 
 - **Passthrough DELETE/UPDATE with exact duplicates:** Passthrough IMVs use row-matching for incremental DELETE/UPDATE. If the view contains rows that are identical across ALL columns (exact duplicates), a single-row delete may remove multiple matching rows. This is rare in practice (most queries include a PK or unique column).
 - **Recursive CTEs:** `WITH RECURSIVE` is not supported.
-- **MIN/MAX on DELETE:** Requires full group rescan from the source table (no algebraic inverse for extrema).
+- **MIN/MAX/BOOL_OR on DELETE:** Requires full group rescan from the source table (no algebraic inverse for extrema or boolean OR).
 - **Non-deterministic functions:** `NOW()`, `RANDOM()`, `CURRENT_DATE` in WHERE clauses are not supported -- the view definition must be static.
 - **NULL group keys:** PostgreSQL's MERGE does not match `NULL = NULL`. NULL values in GROUP BY columns are not supported.
 

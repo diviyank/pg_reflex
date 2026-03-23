@@ -30,6 +30,7 @@ pub enum AggregateKind {
     Avg,
     Min,
     Max,
+    BoolOr,
 }
 
 #[derive(Debug, Clone)]
@@ -44,6 +45,8 @@ pub struct SelectColumn {
     pub aggregate_arg: Option<String>,
     /// Is this a plain column passthrough (non-aggregated)?
     pub is_passthrough: bool,
+    /// Cast type from wrapping expression (e.g., "BIGINT" from SUM(x)::BIGINT)
+    pub cast_type: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -153,6 +156,7 @@ fn detect_aggregate(func_name: &str) -> Option<AggregateKind> {
         "AVG" => Some(AggregateKind::Avg),
         "MIN" => Some(AggregateKind::Min),
         "MAX" => Some(AggregateKind::Max),
+        "BOOL_OR" => Some(AggregateKind::BoolOr),
         _ => None,
     }
 }
@@ -185,7 +189,13 @@ fn first_arg_sql(args: &FunctionArguments) -> Option<String> {
 
 /// Extract a SelectColumn from a SelectItem expression.
 fn extract_select_column(expr: &Expr, alias: Option<String>) -> SelectColumn {
-    if let Expr::Function(f) = expr {
+    // Unwrap casts to detect aggregates inside (e.g., SUM(x)::BIGINT)
+    let (inner, cast_type) = match expr {
+        Expr::Cast { expr: inner, data_type, .. } => (inner.as_ref(), Some(data_type.to_string())),
+        _ => (expr, None),
+    };
+
+    if let Expr::Function(f) = inner {
         let func_name = f.name.to_string();
         if let Some(mut kind) = detect_aggregate(&func_name) {
             // Check for COUNT(*)
@@ -198,11 +208,12 @@ fn extract_select_column(expr: &Expr, alias: Option<String>) -> SelectColumn {
                 first_arg_sql(&f.args)
             };
             return SelectColumn {
-                expr_sql: expr.to_string(),
+                expr_sql: inner.to_string(),
                 alias,
                 aggregate: Some(kind),
                 aggregate_arg,
                 is_passthrough: false,
+                cast_type,
             };
         }
     }
@@ -212,6 +223,7 @@ fn extract_select_column(expr: &Expr, alias: Option<String>) -> SelectColumn {
         aggregate: None,
         aggregate_arg: None,
         is_passthrough: true,
+        cast_type: None,
     }
 }
 
@@ -321,6 +333,7 @@ pub fn analyze(statements: &[Statement]) -> Result<SqlAnalysis, SqlAnalysisError
                     aggregate: None,
                     aggregate_arg: None,
                     is_passthrough: true,
+                    cast_type: None,
                 });
             }
             SelectItem::QualifiedWildcard(kind, _) => {
@@ -330,6 +343,7 @@ pub fn analyze(statements: &[Statement]) -> Result<SqlAnalysis, SqlAnalysisError
                     aggregate: None,
                     aggregate_arg: None,
                     is_passthrough: true,
+                    cast_type: None,
                 });
             }
         }
@@ -540,6 +554,26 @@ mod tests {
             "SELECT city, COUNT(*) AS cnt FROM emp GROUP BY city HAVING COUNT(*) > 5",
         );
         assert!(a.having_clause.is_some());
+    }
+
+    #[test]
+    fn test_cast_aggregate_detected() {
+        let a = parse_and_analyze(
+            "SELECT city, SUM(amount)::BIGINT AS total FROM orders GROUP BY city",
+        );
+        assert_eq!(a.select_columns.len(), 2);
+        assert_eq!(a.select_columns[1].aggregate, Some(AggregateKind::Sum));
+        assert_eq!(a.select_columns[1].aggregate_arg.as_deref(), Some("amount"));
+        assert_eq!(a.select_columns[1].alias.as_deref(), Some("total"));
+    }
+
+    #[test]
+    fn test_multiple_cast_aggregates() {
+        let a = parse_and_analyze(
+            "SELECT grp, SUM(a)::BIGINT AS sa, COUNT(*)::INT AS cnt FROM t GROUP BY grp",
+        );
+        assert_eq!(a.select_columns[1].aggregate, Some(AggregateKind::Sum));
+        assert_eq!(a.select_columns[2].aggregate, Some(AggregateKind::CountStar));
     }
 
     #[test]

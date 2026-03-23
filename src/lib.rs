@@ -13,7 +13,7 @@ mod trigger;
 
 use aggregation::plan_aggregation;
 use query_decomposer::{
-    bare_column_name, generate_aggregations_json, generate_base_query, generate_end_query,
+    bare_column_name, generate_aggregations_json, generate_base_query, generate_end_query, normalized_column_name,
     intermediate_table_name, quote_identifier, replace_identifier, split_qualified_name,
 };
 use schema_builder::{
@@ -179,6 +179,40 @@ fn create_reflex_ivm(view_name: &str, sql: &str) -> &'static str {
     // Build aggregation plan from the analysis
     let plan = plan_aggregation(&analysis);
 
+    // Warn about select columns that are neither GROUP BY nor recognized aggregates.
+    // These are silently dropped (e.g., bool_or(), string_agg(), unsupported functions).
+    if !plan.is_passthrough {
+        let group_by_set: std::collections::HashSet<&str> = analysis
+            .group_by_columns
+            .iter()
+            .map(|s| s.as_str())
+            .collect();
+        for col in &analysis.select_columns {
+            if !col.is_passthrough && col.aggregate.is_none() {
+                warning!(
+                    "pg_reflex: unsupported expression '{}' in SELECT — column will be missing from IMV '{}'",
+                    col.alias.as_deref().unwrap_or(&col.expr_sql),
+                    view_name
+                );
+            } else if col.is_passthrough
+                && !group_by_set.contains(col.expr_sql.as_str())
+                && !analysis.has_distinct
+            {
+                // Passthrough column not in GROUP BY — likely an unrecognized aggregate or expression
+                let name = col.alias.as_deref().unwrap_or(&col.expr_sql);
+                let bare = bare_column_name(name);
+                let in_gb = group_by_set.iter().any(|gb| bare_column_name(gb) == bare);
+                if !in_gb {
+                    warning!(
+                        "pg_reflex: expression '{}' not in GROUP BY and not a recognized aggregate — column will be missing from IMV '{}'",
+                        col.expr_sql,
+                        view_name
+                    );
+                }
+            }
+        }
+    }
+
     // Check for duplicate view name
     let already_exists = Spi::connect(|client| {
         !client
@@ -256,10 +290,7 @@ fn create_reflex_ivm(view_name: &str, sql: &str) -> &'static str {
 
             let target_ddl = build_target_table_ddl(view_name, &plan, &column_types);
             client.update(&target_ddl, None, &[]).unwrap_or_report();
-
-            for index_ddl in build_indexes_ddl(view_name, &plan) {
-                client.update(&index_ddl, None, &[]).unwrap_or_report();
-            }
+            // Note: indexes are created AFTER bulk insert for performance
         }
 
         // CREATE consolidated triggers on source tables (one set per source, shared by all IMVs).
@@ -327,15 +358,37 @@ fn create_reflex_ivm(view_name: &str, sql: &str) -> &'static str {
 
         // Issue 4: Add index on source GROUP BY columns for MIN/MAX recompute performance
         let has_min_max = plan.intermediate_columns.iter()
-            .any(|ic| ic.source_aggregate == "MIN" || ic.source_aggregate == "MAX");
+            .any(|ic| ic.source_aggregate == "MIN" || ic.source_aggregate == "MAX" || ic.source_aggregate == "BOOL_OR");
         if has_min_max && !plan.group_by_columns.is_empty() {
             for source in &froms {
                 if source.starts_with('<') || ivm_froms.contains(source) {
                     continue;
                 }
-                let idx_cols: Vec<String> = plan.group_by_columns.iter()
-                    .map(|c| format!("\"{}\"", bare_column_name(c)))
+                // Only index columns that actually exist on this source table
+                let (src_schema, src_name) = split_qualified_name(source);
+                let src_schema_str = src_schema.unwrap_or("public");
+                let source_cols: Vec<String> = client
+                    .select(
+                        "SELECT column_name FROM information_schema.columns WHERE table_schema = $1 AND table_name = $2",
+                        None,
+                        &[
+                            unsafe { DatumWithOid::new(src_schema_str.to_string(), PgBuiltInOids::TEXTOID.oid().value()) },
+                            unsafe { DatumWithOid::new(src_name.to_string(), PgBuiltInOids::TEXTOID.oid().value()) },
+                        ],
+                    )
+                    .unwrap_or_report()
+                    .filter_map(|row| row.get_by_name::<&str, _>("column_name").unwrap_or(None).map(|s| s.to_lowercase()))
                     .collect();
+
+                let idx_cols: Vec<String> = plan.group_by_columns.iter()
+                    .map(|c| normalized_column_name(c))
+                    .filter(|c| source_cols.contains(c))
+                    .map(|c| format!("\"{}\"", c))
+                    .collect();
+
+                if idx_cols.is_empty() {
+                    continue;
+                }
                 let safe_src = source.replace('.', "_");
                 let bare_view = split_qualified_name(view_name).1;
                 let idx_name = format!("__reflex_idx_{}_{}", bare_view, safe_src);
@@ -363,7 +416,7 @@ fn create_reflex_ivm(view_name: &str, sql: &str) -> &'static str {
             .group_by_columns
             .iter()
             .chain(plan.distinct_columns.iter())
-            .map(|c| bare_column_name(c).to_string())
+            .map(|c| normalized_column_name(c))
             .collect();
 
         // INSERT into reference table
@@ -419,6 +472,19 @@ fn create_reflex_ivm(view_name: &str, sql: &str) -> &'static str {
             let target_insert = format!("INSERT INTO {} {}", quote_identifier(view_name), end_query);
             client
                 .update(&target_insert, None, &[])
+                .unwrap_or_report();
+
+            // Create indexes AFTER bulk insert (much faster than indexing during insert)
+            for index_ddl in build_indexes_ddl(view_name, &plan) {
+                client.update(&index_ddl, None, &[]).unwrap_or_report();
+            }
+
+            // ANALYZE so the query planner has accurate statistics
+            client
+                .update(&format!("ANALYZE {}", intermediate_tbl), None, &[])
+                .unwrap_or_report();
+            client
+                .update(&format!("ANALYZE {}", quote_identifier(view_name)), None, &[])
                 .unwrap_or_report();
         }
 
@@ -770,7 +836,71 @@ fn reflex_reconcile(view_name: &str) -> &'static str {
                 .unwrap_or_report();
         } else {
             // Aggregate: rebuild intermediate + target
+            // Drop pg_reflex-managed indexes first for faster bulk insert
+            let plan: aggregation::AggregationPlan =
+                serde_json::from_str(&agg_json).unwrap_or_else(|_| {
+                    aggregation::AggregationPlan {
+                        group_by_columns: vec![],
+                        intermediate_columns: vec![],
+                        end_query_mappings: vec![],
+                        has_distinct: false,
+                        needs_ivm_count: false,
+                        distinct_columns: vec![],
+                        is_passthrough: false,
+                        passthrough_columns: vec![],
+                        having_clause: None,
+                    }
+                });
+
             let intermediate = intermediate_table_name(view_name);
+            let (_, bare_view) = split_qualified_name(view_name);
+            let int_unquoted = intermediate.replace('"', "");
+            let (int_schema, _) = split_qualified_name(&int_unquoted);
+            let int_schema_str = int_schema.unwrap_or("public");
+
+            // Collect and drop reflex-managed indexes on intermediate table
+            let int_indexes: Vec<String> = client
+                .select(
+                    "SELECT indexname FROM pg_indexes WHERE schemaname = $1 AND tablename = $2",
+                    None,
+                    &[
+                        unsafe { DatumWithOid::new(int_schema_str.to_string(), PgBuiltInOids::TEXTOID.oid().value()) },
+                        unsafe { DatumWithOid::new(format!("__reflex_intermediate_{}", bare_view), PgBuiltInOids::TEXTOID.oid().value()) },
+                    ],
+                )
+                .unwrap_or_report()
+                .filter_map(|row| row.get_by_name::<&str, _>("indexname").unwrap_or(None).map(|s| s.to_string()))
+                .collect();
+
+            for idx in &int_indexes {
+                client.update(&format!("DROP INDEX IF EXISTS \"{}\".\"{}\"", int_schema_str, idx), None, &[]).unwrap_or_report();
+            }
+
+            // Collect ALL indexes on target table (save DDL for user-created ones)
+            let (tgt_schema, tgt_name) = split_qualified_name(view_name);
+            let tgt_schema_str = tgt_schema.unwrap_or("public");
+            let tgt_saved_indexes: Vec<(String, String)> = client
+                .select(
+                    "SELECT indexname, indexdef FROM pg_indexes WHERE schemaname = $1 AND tablename = $2",
+                    None,
+                    &[
+                        unsafe { DatumWithOid::new(tgt_schema_str.to_string(), PgBuiltInOids::TEXTOID.oid().value()) },
+                        unsafe { DatumWithOid::new(tgt_name.to_string(), PgBuiltInOids::TEXTOID.oid().value()) },
+                    ],
+                )
+                .unwrap_or_report()
+                .filter_map(|row| {
+                    let name = row.get_by_name::<&str, _>("indexname").unwrap_or(None)?.to_string();
+                    let def = row.get_by_name::<&str, _>("indexdef").unwrap_or(None)?.to_string();
+                    Some((name, def))
+                })
+                .collect();
+
+            for (idx_name, _) in &tgt_saved_indexes {
+                client.update(&format!("DROP INDEX IF EXISTS \"{}\".\"{}\"", tgt_schema_str, idx_name), None, &[]).unwrap_or_report();
+            }
+
+            // Bulk insert without indexes
             client
                 .update(&format!("TRUNCATE {}", intermediate), None, &[])
                 .unwrap_or_report();
@@ -782,7 +912,7 @@ fn reflex_reconcile(view_name: &str) -> &'static str {
                 )
                 .unwrap_or_report();
             client
-                .update(&format!("DELETE FROM {}", quote_identifier(view_name)), None, &[])
+                .update(&format!("TRUNCATE {}", quote_identifier(view_name)), None, &[])
                 .unwrap_or_report();
             client
                 .update(
@@ -791,6 +921,41 @@ fn reflex_reconcile(view_name: &str) -> &'static str {
                     &[],
                 )
                 .unwrap_or_report();
+
+            // Recreate intermediate PK
+            let mut pk_cols: Vec<String> = plan.group_by_columns.iter()
+                .map(|c| format!("\"{}\"", normalized_column_name(c)))
+                .collect();
+            if pk_cols.is_empty() && !plan.intermediate_columns.is_empty() {
+                pk_cols.push("__reflex_group".to_string());
+            }
+            for col in &plan.distinct_columns {
+                pk_cols.push(format!("\"{}\"", normalized_column_name(col)));
+            }
+            if !pk_cols.is_empty() {
+                let pk_name = format!("__reflex_intermediate_{}_pkey", bare_view);
+                client.update(
+                    &format!("ALTER TABLE {} ADD CONSTRAINT \"{}\" PRIMARY KEY ({})", intermediate, pk_name, pk_cols.join(", ")),
+                    None, &[],
+                ).unwrap_or_report();
+            }
+
+            // Recreate reflex-managed indexes on both tables
+            for index_ddl in build_indexes_ddl(view_name, &plan) {
+                client.update(&index_ddl, None, &[]).unwrap_or_report();
+            }
+
+            // Recreate user-created indexes on target (skip reflex-managed ones already recreated above)
+            for (idx_name, idx_def) in &tgt_saved_indexes {
+                if idx_name.starts_with("idx__reflex_") || idx_name.starts_with("__reflex_") {
+                    continue; // Already handled by build_indexes_ddl
+                }
+                client.update(idx_def, None, &[]).unwrap_or_report();
+            }
+
+            // ANALYZE for query planner
+            client.update(&format!("ANALYZE {}", intermediate), None, &[]).unwrap_or_report();
+            client.update(&format!("ANALYZE {}", quote_identifier(view_name)), None, &[]).unwrap_or_report();
         }
 
         // Update last_update_date

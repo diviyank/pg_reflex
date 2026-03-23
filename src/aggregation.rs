@@ -27,6 +27,9 @@ pub struct EndQueryMapping {
     pub output_alias: String,
     /// The original aggregate type (e.g., "AVG")
     pub aggregate_type: String,
+    /// Optional cast to apply in the end query (e.g., "BIGINT" from SUM(x)::BIGINT)
+    #[serde(default)]
+    pub cast_type: Option<String>,
 }
 
 /// Complete plan for how to decompose a query into intermediate + final stages.
@@ -67,6 +70,7 @@ fn detect_aggregate(func_name: &str) -> Option<AggregateKind> {
         "AVG" => Some(AggregateKind::Avg),
         "MIN" => Some(AggregateKind::Min),
         "MAX" => Some(AggregateKind::Max),
+        "BOOL_OR" => Some(AggregateKind::BoolOr),
         _ => None,
     }
 }
@@ -143,6 +147,8 @@ pub fn plan_aggregation(analysis: &SqlAnalysis) -> AggregationPlan {
             .clone()
             .unwrap_or_else(|| col.expr_sql.clone());
 
+        let cast_type = col.cast_type.clone();
+
         match agg {
             AggregateKind::Sum => {
                 let col_name = format!("__sum_{}", arg_sanitized);
@@ -156,6 +162,7 @@ pub fn plan_aggregation(analysis: &SqlAnalysis) -> AggregationPlan {
                     intermediate_expr: col_name,
                     output_alias,
                     aggregate_type: "SUM".to_string(),
+                    cast_type,
                 });
             }
             AggregateKind::Count => {
@@ -170,6 +177,7 @@ pub fn plan_aggregation(analysis: &SqlAnalysis) -> AggregationPlan {
                     intermediate_expr: col_name,
                     output_alias,
                     aggregate_type: "COUNT".to_string(),
+                    cast_type,
                 });
             }
             AggregateKind::CountStar => {
@@ -184,6 +192,7 @@ pub fn plan_aggregation(analysis: &SqlAnalysis) -> AggregationPlan {
                     intermediate_expr: col_name,
                     output_alias,
                     aggregate_type: "COUNT".to_string(),
+                    cast_type,
                 });
             }
             AggregateKind::Avg => {
@@ -209,13 +218,14 @@ pub fn plan_aggregation(analysis: &SqlAnalysis) -> AggregationPlan {
                     ),
                     output_alias,
                     aggregate_type: "AVG".to_string(),
+                    cast_type,
                 });
             }
             AggregateKind::Min => {
                 let col_name = format!("__min_{}", arg_sanitized);
                 intermediate_columns.push(IntermediateColumn {
                     name: col_name.clone(),
-                    pg_type: "NUMERIC".to_string(), // Will be overridden by catalog type if available
+                    pg_type: "NUMERIC".to_string(),
                     source_aggregate: "MIN".to_string(),
                     source_arg: arg.to_string(),
                 });
@@ -223,13 +233,14 @@ pub fn plan_aggregation(analysis: &SqlAnalysis) -> AggregationPlan {
                     intermediate_expr: col_name,
                     output_alias,
                     aggregate_type: "MIN".to_string(),
+                    cast_type,
                 });
             }
             AggregateKind::Max => {
                 let col_name = format!("__max_{}", arg_sanitized);
                 intermediate_columns.push(IntermediateColumn {
                     name: col_name.clone(),
-                    pg_type: "NUMERIC".to_string(), // Will be overridden by catalog type if available
+                    pg_type: "NUMERIC".to_string(),
                     source_aggregate: "MAX".to_string(),
                     source_arg: arg.to_string(),
                 });
@@ -237,6 +248,22 @@ pub fn plan_aggregation(analysis: &SqlAnalysis) -> AggregationPlan {
                     intermediate_expr: col_name,
                     output_alias,
                     aggregate_type: "MAX".to_string(),
+                    cast_type,
+                });
+            }
+            AggregateKind::BoolOr => {
+                let col_name = format!("__bool_or_{}", arg_sanitized);
+                intermediate_columns.push(IntermediateColumn {
+                    name: col_name.clone(),
+                    pg_type: "BOOLEAN".to_string(),
+                    source_aggregate: "BOOL_OR".to_string(),
+                    source_arg: arg.to_string(),
+                });
+                end_query_mappings.push(EndQueryMapping {
+                    intermediate_expr: col_name,
+                    output_alias,
+                    aggregate_type: "BOOL_OR".to_string(),
+                    cast_type,
                 });
             }
         }
@@ -305,6 +332,14 @@ pub fn plan_aggregation(analysis: &SqlAnalysis) -> AggregationPlan {
                             name: format!("__max_{}", arg_sanitized),
                             pg_type: "NUMERIC".to_string(),
                             source_aggregate: "MAX".to_string(),
+                            source_arg: arg,
+                        });
+                    }
+                    AggregateKind::BoolOr => {
+                        intermediate_columns.push(IntermediateColumn {
+                            name: format!("__bool_or_{}", arg_sanitized),
+                            pg_type: "BOOLEAN".to_string(),
+                            source_aggregate: "BOOL_OR".to_string(),
                             source_arg: arg,
                         });
                     }

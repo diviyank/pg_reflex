@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use crate::aggregation::AggregationPlan;
-use crate::query_decomposer::{bare_column_name, intermediate_table_name, quote_identifier, split_qualified_name};
+use crate::query_decomposer::{intermediate_table_name, normalized_column_name, quote_identifier, split_qualified_name};
 
 /// Build the DDL for the intermediate (UNLOGGED) table.
 ///
@@ -31,23 +31,25 @@ pub fn build_intermediate_table_ddl(
         columns.push("    __reflex_group INTEGER DEFAULT 0".to_string());
     }
 
-    // Group by columns as table keys (using bare column names, no table qualifiers)
+    // Group by columns as table keys (using normalized lowercase bare names
+    // to match PostgreSQL's case folding of unquoted identifiers)
     for col in &plan.group_by_columns {
-        let bare = bare_column_name(col);
-        let pg_type = resolve_column_type(bare, column_types, "TEXT");
-        columns.push(format!("    \"{}\" {}", bare, pg_type));
+        let norm = normalized_column_name(col);
+        let pg_type = resolve_column_type(&norm, column_types, "TEXT");
+        columns.push(format!("    \"{}\" {}", norm, pg_type));
     }
 
     // For DISTINCT without GROUP BY: the projected columns become the keys
     for col in &plan.distinct_columns {
-        let bare = bare_column_name(col);
-        let pg_type = resolve_column_type(bare, column_types, "TEXT");
-        columns.push(format!("    \"{}\" {}", bare, pg_type));
+        let norm = normalized_column_name(col);
+        let pg_type = resolve_column_type(&norm, column_types, "TEXT");
+        columns.push(format!("    \"{}\" {}", norm, pg_type));
     }
 
     // Intermediate aggregate columns
     for ic in &plan.intermediate_columns {
-        columns.push(format!("    \"{}\" {} DEFAULT 0", ic.name, ic.pg_type));
+        let default = if ic.pg_type == "BOOLEAN" { "FALSE" } else { "0" };
+        columns.push(format!("    \"{}\" {} DEFAULT {}", ic.name, ic.pg_type, default));
     }
 
     // __ivm_count for reference counting
@@ -65,10 +67,10 @@ pub fn build_intermediate_table_ddl(
     pk_cols.extend(
         plan.group_by_columns
             .iter()
-            .map(|c| format!("\"{}\"", bare_column_name(c))),
+            .map(|c| format!("\"{}\"", normalized_column_name(c))),
     );
     for col in &plan.distinct_columns {
-        pk_cols.push(format!("\"{}\"", bare_column_name(col)));
+        pk_cols.push(format!("\"{}\"", normalized_column_name(col)));
     }
     let pk = if !pk_cols.is_empty() {
         format!(",\n    PRIMARY KEY ({})", pk_cols.join(", "))
@@ -90,30 +92,32 @@ pub fn build_target_table_ddl(
 ) -> String {
     let mut columns: Vec<String> = Vec::new();
 
-    // Group by columns (bare names)
+    // Group by columns (normalized lowercase names)
     for col in &plan.group_by_columns {
-        let bare = bare_column_name(col);
-        let pg_type = resolve_column_type(bare, column_types, "TEXT");
-        columns.push(format!("    \"{}\" {}", bare, pg_type));
+        let norm = normalized_column_name(col);
+        let pg_type = resolve_column_type(&norm, column_types, "TEXT");
+        columns.push(format!("    \"{}\" {}", norm, pg_type));
     }
 
-    // DISTINCT columns (bare names)
+    // DISTINCT columns (normalized lowercase names)
     for col in &plan.distinct_columns {
-        let bare = bare_column_name(col);
-        let pg_type = resolve_column_type(bare, column_types, "TEXT");
-        columns.push(format!("    \"{}\" {}", bare, pg_type));
+        let norm = normalized_column_name(col);
+        let pg_type = resolve_column_type(&norm, column_types, "TEXT");
+        columns.push(format!("    \"{}\" {}", norm, pg_type));
     }
 
     // Output columns from end query mappings
     for mapping in &plan.end_query_mappings {
-        let pg_type = match mapping.aggregate_type.as_str() {
-            "SUM" | "AVG" => "NUMERIC",
-            "COUNT" => "BIGINT",
-            "MIN" | "MAX" => {
-                // Try to resolve from column_types, fall back to NUMERIC
-                "NUMERIC"
+        let pg_type = if let Some(ref cast) = mapping.cast_type {
+            cast.as_str()
+        } else {
+            match mapping.aggregate_type.as_str() {
+                "SUM" | "AVG" => "NUMERIC",
+                "COUNT" => "BIGINT",
+                "MIN" | "MAX" => "NUMERIC",
+                "BOOL_OR" => "BOOLEAN",
+                _ => "TEXT",
             }
-            _ => "TEXT",
         };
         columns.push(format!("    \"{}\" {}", mapping.output_alias, pg_type));
     }
@@ -126,22 +130,38 @@ pub fn build_target_table_ddl(
     )
 }
 
-/// Build index DDL statements for the intermediate table.
+/// Build index DDL statements for the intermediate and target tables.
 pub fn build_indexes_ddl(view_name: &str, plan: &AggregationPlan) -> Vec<String> {
     let table_name = intermediate_table_name(view_name);
+    let bare_view = split_qualified_name(view_name).1;
     let mut indexes = Vec::new();
 
-    // For multiple group-by columns, create individual indexes
+    // For multiple group-by columns, create individual indexes on intermediate table
     // (the composite PK already covers combined lookups)
     if plan.group_by_columns.len() > 1 {
         for (i, col) in plan.group_by_columns.iter().enumerate() {
-            let bare = bare_column_name(col);
-            let bare_view = split_qualified_name(view_name).1;
+            let norm = normalized_column_name(col);
             indexes.push(format!(
                 "CREATE INDEX IF NOT EXISTS \"idx__reflex_{}_{}\" ON {} (\"{}\")",
-                bare_view, i, table_name, bare
+                bare_view, i, table_name, norm
             ));
         }
+    }
+
+    // Composite index on target table for targeted refresh DELETE performance
+    if !plan.group_by_columns.is_empty() {
+        let target_tbl = quote_identifier(view_name);
+        let group_cols: Vec<String> = plan
+            .group_by_columns
+            .iter()
+            .map(|c| format!("\"{}\"", normalized_column_name(c)))
+            .collect();
+        indexes.push(format!(
+            "CREATE INDEX IF NOT EXISTS \"idx__reflex_target_{}\" ON {} ({})",
+            bare_view,
+            target_tbl,
+            group_cols.join(", ")
+        ));
     }
 
     indexes
@@ -307,11 +327,13 @@ mod tests {
                     intermediate_expr: "__sum_amount".to_string(),
                     output_alias: "total".to_string(),
                     aggregate_type: "SUM".to_string(),
+                    cast_type: None,
                 },
                 EndQueryMapping {
                     intermediate_expr: "__count_star".to_string(),
                     output_alias: "cnt".to_string(),
                     aggregate_type: "COUNT".to_string(),
+                    cast_type: None,
                 },
             ],
             has_distinct: false,
@@ -386,17 +408,22 @@ mod tests {
         let mut plan = sample_plan();
         plan.group_by_columns = vec!["city".to_string(), "year".to_string()];
         let indexes = build_indexes_ddl("test_view", &plan);
-        assert_eq!(indexes.len(), 2);
+        // 2 individual intermediate indexes + 1 composite target index
+        assert_eq!(indexes.len(), 3);
         assert!(indexes[0].contains("\"city\""));
         assert!(indexes[1].contains("\"year\""));
+        assert!(indexes[2].contains("idx__reflex_target_"));
+        assert!(indexes[2].contains("\"city\", \"year\""));
     }
 
     #[test]
     fn test_indexes_ddl_single_group_by() {
         let plan = sample_plan();
         let indexes = build_indexes_ddl("test_view", &plan);
-        // Single group by column already has PK, no extra indexes needed
-        assert!(indexes.is_empty());
+        // Single group by: no extra intermediate indexes (PK covers it),
+        // but still get a target table index for targeted refresh
+        assert_eq!(indexes.len(), 1);
+        assert!(indexes[0].contains("idx__reflex_target_"));
     }
 
     #[test]

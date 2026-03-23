@@ -42,6 +42,13 @@ pub fn bare_column_name(col: &str) -> &str {
     col.rsplit('.').next().unwrap_or(col)
 }
 
+/// Strip qualifier and lowercase to match PostgreSQL's identifier folding.
+/// Unquoted identifiers in SQL are folded to lowercase by PostgreSQL,
+/// so all generated SQL should use lowercase column names for consistency.
+pub fn normalized_column_name(col: &str) -> String {
+    bare_column_name(col).to_lowercase()
+}
+
 
 /// Replace a SQL identifier with another, respecting word boundaries.
 /// Only replaces when the match is NOT part of a longer identifier
@@ -95,24 +102,17 @@ pub fn generate_base_query(analysis: &SqlAnalysis, plan: &AggregationPlan) -> St
     }
 
     // Group by columns: in the base query we keep the original expression
-    // but alias to the bare column name for the intermediate table
+    // but always alias to the normalized (lowercase) column name for the intermediate table.
+    // This ensures consistency with PostgreSQL's case folding of unquoted identifiers.
     for col in &plan.group_by_columns {
-        let bare = bare_column_name(col);
-        if bare != col {
-            select_parts.push(format!("{} AS \"{}\"", col, bare));
-        } else {
-            select_parts.push(col.clone());
-        }
+        let norm = normalized_column_name(col);
+        select_parts.push(format!("{} AS \"{}\"", col, norm));
     }
 
     // DISTINCT columns (for DISTINCT without GROUP BY)
     for col in &plan.distinct_columns {
-        let bare = bare_column_name(col);
-        if bare != col {
-            select_parts.push(format!("{} AS \"{}\"", col, bare));
-        } else {
-            select_parts.push(col.clone());
-        }
+        let norm = normalized_column_name(col);
+        select_parts.push(format!("{} AS \"{}\"", col, norm));
     }
 
     // Intermediate aggregate columns
@@ -262,24 +262,31 @@ pub fn generate_end_query(view_name: &str, plan: &AggregationPlan) -> String {
     let table = intermediate_table_name(view_name);
     let mut select_parts: Vec<String> = Vec::new();
 
-    // Group by columns (bare names, since intermediate table uses bare column names)
+    // Group by columns (normalized lowercase names matching intermediate table columns)
     for col in &plan.group_by_columns {
-        let bare = bare_column_name(col);
-        select_parts.push(format!("\"{}\"", bare));
+        let norm = normalized_column_name(col);
+        select_parts.push(format!("\"{}\"", norm));
     }
 
     // For DISTINCT without GROUP BY, add the distinct columns
     for col in &plan.distinct_columns {
-        let bare = bare_column_name(col);
-        select_parts.push(format!("\"{}\"", bare));
+        let norm = normalized_column_name(col);
+        select_parts.push(format!("\"{}\"", norm));
     }
 
-    // End query aggregate expressions
+    // End query aggregate expressions (with optional cast)
     for mapping in &plan.end_query_mappings {
-        select_parts.push(format!(
-            "{} AS \"{}\"",
-            mapping.intermediate_expr, mapping.output_alias
-        ));
+        if let Some(ref cast) = mapping.cast_type {
+            select_parts.push(format!(
+                "({})::{} AS \"{}\"",
+                mapping.intermediate_expr, cast, mapping.output_alias
+            ));
+        } else {
+            select_parts.push(format!(
+                "{} AS \"{}\"",
+                mapping.intermediate_expr, mapping.output_alias
+            ));
+        }
     }
 
     let select_clause = select_parts.join(", ");

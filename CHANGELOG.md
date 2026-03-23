@@ -1,8 +1,12 @@
 # Changelog
 
-## [1.0.1] - 2026-03-22
+## [1.0.1] - 2026-03-23
 
 ### Added
+- **`bool_or(expr)` aggregate** — incremental via OR on INSERT, recomputes from source on DELETE (same pattern as MIN/MAX)
+- **Cast propagation** — `SUM(x)::BIGINT` now produces a BIGINT column in the target table (cast applied in end query, intermediate still stores NUMERIC for precision)
+- **Target table index** — composite index on group columns for faster targeted refresh DELETE performance
+- **Unsupported aggregate warnings** — unrecognized aggregates (e.g., `string_agg`) now emit a WARNING instead of being silently dropped
 - Materialized view support as source tables (triggers auto-skipped, warning emitted)
 - `refresh_reflex_imv(view_name)` — refresh a single IMV (alias for `reflex_reconcile`)
 - `refresh_imv_depending_on(source)` — refresh all IMVs depending on a source table or materialized view
@@ -11,10 +15,20 @@
 - Incremental passthrough DELETE/UPDATE (O(delta) row-matching instead of O(N) full refresh)
 - Multi-level cascade confirmed and tested (works to arbitrary depth)
 - CTE passthrough support (passthrough CTEs become sub-IMV tables)
+- `install.sh` wrapper script — copies migration files alongside `cargo pgrx install`
 
 ### Fixed
+- **Trigger table reference replacement** — schema-qualified tables with column qualifiers (e.g., `sales_simulation.product_id` from `alp.sales_simulation`) now work correctly in triggers. Previously caused `missing FROM-clause entry` on every INSERT/UPDATE/DELETE.
+- **Cast expressions no longer silently dropped** — `SUM(x)::BIGINT` is now correctly detected as an aggregate. Previously, the cast wrapper hid the function from the aggregate detector.
+- **Column name case normalization** — unquoted identifiers like `MONTH` are now lowercased consistently (matching PostgreSQL's case folding), preventing `column "MONTH" does not exist` errors at trigger time.
+- **Source index creation** — index creation on source tables for MIN/MAX/BOOL_OR recompute now checks column existence first, so it no longer fails when group columns come from JOIN tables.
 - Materialized views no longer cause "cannot have triggers" error
 - Passthrough DELETE/UPDATE no longer does full table refresh
+
+### Performance
+- **Deferred index creation** — indexes on intermediate and target tables are now created after bulk data insertion (not before), reducing IMV creation time by ~60% on large datasets
+- **Faster `reflex_reconcile`** — drops all indexes (including user-created) before bulk rebuild, recreates them after. Saves index DDL and restores it faithfully. Reduced reconcile time by ~38% on large datasets (6:29 → 4:00 on 7.7M rows). Also uses TRUNCATE instead of DELETE for instant table clearing.
+- **ANALYZE** — intermediate and target tables are analyzed after initial materialization and after reconcile for better query planner statistics
 
 ## [1.0.0] - 2026-03-22
 
@@ -49,7 +63,7 @@
 
 ### Supported
 - PostgreSQL 13, 14, 15, 16, 17, 18
-- Aggregates: SUM, COUNT, COUNT(*), AVG, MIN, MAX
+- Aggregates: SUM, COUNT, COUNT(*), AVG, MIN, MAX, BOOL_OR
 - DISTINCT, GROUP BY, WHERE, INNER/LEFT/RIGHT JOIN
 - Non-recursive CTEs (decomposed into sub-IMVs)
 - Multi-level IMV cascading (A → B → C, tested up to 4 levels)

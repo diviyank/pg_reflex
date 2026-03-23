@@ -1,7 +1,7 @@
 use pgrx::prelude::*;
 
 use crate::aggregation::AggregationPlan;
-use crate::query_decomposer::{bare_column_name, intermediate_table_name, quote_identifier, split_qualified_name};
+use crate::query_decomposer::{intermediate_table_name, normalized_column_name, quote_identifier, replace_identifier, split_qualified_name};
 
 /// Whether a delta adds or subtracts from the intermediate table.
 #[derive(Clone, Copy)]
@@ -19,12 +19,12 @@ pub fn build_merge_sql(
     plan: &AggregationPlan,
     op: DeltaOp,
 ) -> String {
-    // Join columns = group_by + distinct (bare names)
+    // Join columns = group_by + distinct (normalized lowercase names)
     let mut join_cols: Vec<String> = plan
         .group_by_columns
         .iter()
         .chain(plan.distinct_columns.iter())
-        .map(|c| format!("\"{}\"", bare_column_name(c)))
+        .map(|c| format!("\"{}\"", normalized_column_name(c)))
         .collect();
 
     // For aggregates without GROUP BY: use sentinel column
@@ -60,7 +60,13 @@ pub fn build_merge_sql(
                     ic.name, ic.name, ic.name
                 ));
             }
-            ("MIN", DeltaOp::Subtract) | ("MAX", DeltaOp::Subtract) => {
+            ("BOOL_OR", DeltaOp::Add) => {
+                set_clauses.push(format!(
+                    "\"{}\" = t.\"{}\" OR d.\"{}\"",
+                    ic.name, ic.name, ic.name
+                ));
+            }
+            ("MIN", DeltaOp::Subtract) | ("MAX", DeltaOp::Subtract) | ("BOOL_OR", DeltaOp::Subtract) => {
                 set_clauses.push(format!("\"{}\" = NULL", ic.name));
             }
             _ => {
@@ -123,7 +129,7 @@ pub fn build_min_max_recompute_sql(
     let min_max_cols: Vec<&crate::aggregation::IntermediateColumn> = plan
         .intermediate_columns
         .iter()
-        .filter(|ic| ic.source_aggregate == "MIN" || ic.source_aggregate == "MAX")
+        .filter(|ic| ic.source_aggregate == "MIN" || ic.source_aggregate == "MAX" || ic.source_aggregate == "BOOL_OR")
         .collect();
 
     if min_max_cols.is_empty() {
@@ -134,7 +140,7 @@ pub fn build_min_max_recompute_sql(
         .group_by_columns
         .iter()
         .chain(plan.distinct_columns.iter())
-        .map(|c| bare_column_name(c).to_string())
+        .map(|c| normalized_column_name(c))
         .collect();
 
     let mut set_parts: Vec<String> = Vec::new();
@@ -176,7 +182,7 @@ fn group_columns(plan: &AggregationPlan) -> Option<Vec<String>> {
         .group_by_columns
         .iter()
         .chain(plan.distinct_columns.iter())
-        .map(|c| format!("\"{}\"", bare_column_name(c)))
+        .map(|c| format!("\"{}\"", normalized_column_name(c)))
         .collect();
     if cols.is_empty() {
         None
@@ -197,6 +203,22 @@ fn row_expr(cols: &[String]) -> String {
         cols[0].clone()
     } else {
         format!("({})", cols.join(", "))
+    }
+}
+
+/// Replace a source table reference in a base_query with a transition table name.
+/// Handles both schema-qualified names (e.g., `alp.sales_simulation` in FROM)
+/// and bare table names used as column qualifiers (e.g., `sales_simulation.product_id`).
+fn replace_source_with_transition(base_query: &str, source_table: &str, transition_tbl: &str) -> String {
+    let quoted_tbl = format!("\"{}\"", transition_tbl);
+    let replaced = base_query.replace(source_table, &quoted_tbl);
+    // Also replace unqualified table name in column qualifiers
+    let (_, bare_source) = split_qualified_name(source_table);
+    if bare_source != source_table {
+        // Only needed when source_table was schema-qualified
+        replace_identifier(&replaced, bare_source, &quoted_tbl)
+    } else {
+        replaced
     }
 }
 
@@ -234,7 +256,7 @@ pub fn reflex_build_delta_sql(
         let qv = quote_identifier(view_name);
         match operation {
             "INSERT" => {
-                let delta_q = base_query.replace(source_table, &format!("\"{}\"", new_tbl));
+                let delta_q = replace_source_with_transition(base_query, source_table, &new_tbl);
                 stmts.push(format!("INSERT INTO {} {}", qv, delta_q));
             }
             "DELETE" => {
@@ -243,7 +265,7 @@ pub fn reflex_build_delta_sql(
                     stmts.push(format!("DELETE FROM {}", qv));
                     stmts.push(format!("INSERT INTO {} {}", qv, base_query));
                 } else {
-                    let delta_q = base_query.replace(source_table, &format!("\"{}\"", old_tbl));
+                    let delta_q = replace_source_with_transition(base_query, source_table, &old_tbl);
                     let match_clause = plan.passthrough_columns.iter()
                         .map(|c| format!("{}.\"{}\" IS NOT DISTINCT FROM __d.\"{}\"", qv, c, c))
                         .collect::<Vec<_>>()
@@ -261,7 +283,7 @@ pub fn reflex_build_delta_sql(
                     stmts.push(format!("INSERT INTO {} {}", qv, base_query));
                 } else {
                     // Phase 1: subtract old values
-                    let delta_old = base_query.replace(source_table, &format!("\"{}\"", old_tbl));
+                    let delta_old = replace_source_with_transition(base_query, source_table, &old_tbl);
                     let match_clause = plan.passthrough_columns.iter()
                         .map(|c| format!("{}.\"{}\" IS NOT DISTINCT FROM __d.\"{}\"", qv, c, c))
                         .collect::<Vec<_>>()
@@ -271,7 +293,7 @@ pub fn reflex_build_delta_sql(
                         qv, delta_old, match_clause
                     ));
                     // Phase 2: add new values
-                    let delta_new = base_query.replace(source_table, &format!("\"{}\"", new_tbl));
+                    let delta_new = replace_source_with_transition(base_query, source_table, &new_tbl);
                     stmts.push(format!("INSERT INTO {} {}", qv, delta_new));
                 }
             }
@@ -290,7 +312,7 @@ pub fn reflex_build_delta_sql(
 
         match operation {
             "INSERT" => {
-                let delta_q = base_query.replace(source_table, &format!("\"{}\"", new_tbl));
+                let delta_q = replace_source_with_transition(base_query, source_table, &new_tbl);
 
                 // Create temp table with affected group keys before UPSERT
                 if let Some(ref cols) = grp_cols {
@@ -308,7 +330,7 @@ pub fn reflex_build_delta_sql(
                 stmts.push(build_merge_sql(&intermediate_tbl, &delta_q, &plan, DeltaOp::Add));
             }
             "DELETE" => {
-                let delta_q = base_query.replace(source_table, &format!("\"{}\"", old_tbl));
+                let delta_q = replace_source_with_transition(base_query, source_table, &old_tbl);
 
                 if let Some(ref cols) = grp_cols {
                     let select_expr = affected_groups_select(cols);
@@ -330,8 +352,8 @@ pub fn reflex_build_delta_sql(
                 }
             }
             "UPDATE" => {
-                let delta_old = base_query.replace(source_table, &format!("\"{}\"", old_tbl));
-                let delta_new = base_query.replace(source_table, &format!("\"{}\"", new_tbl));
+                let delta_old = replace_source_with_transition(base_query, source_table, &old_tbl);
+                let delta_new = replace_source_with_transition(base_query, source_table, &new_tbl);
 
                 // Union of affected groups from both old and new
                 if let Some(ref cols) = grp_cols {
@@ -453,6 +475,7 @@ mod tests {
                 intermediate_expr: "__sum_amount".to_string(),
                 output_alias: "total".to_string(),
                 aggregate_type: "SUM".to_string(),
+                cast_type: None,
             }],
             has_distinct: false,
             needs_ivm_count: true,
@@ -572,5 +595,27 @@ mod tests {
         let plan = simple_plan();
         let sql = build_min_max_recompute_sql("intermediate", &plan, "orders");
         assert!(sql.is_none());
+    }
+
+    #[test]
+    fn test_replace_source_with_transition_schema_qualified() {
+        let base_query = "SELECT sales_simulation.product_id, SUM(amount) FROM alp.sales_simulation INNER JOIN alp.demand_planning ON demand_planning.id = sales_simulation.dem_plan_id GROUP BY sales_simulation.product_id";
+        let result = replace_source_with_transition(base_query, "alp.sales_simulation", "__reflex_new_alp_sales_simulation");
+        // FROM clause should be replaced
+        assert!(result.contains("\"__reflex_new_alp_sales_simulation\""), "FROM clause not replaced");
+        // Column qualifiers should be replaced
+        assert!(!result.contains(" sales_simulation.product_id"), "Column qualifier not replaced: {}", result);
+        assert!(!result.contains(" sales_simulation.dem_plan_id"), "JOIN qualifier not replaced: {}", result);
+        // Other tables should NOT be replaced
+        assert!(result.contains("alp.demand_planning"), "Other tables should not be affected");
+        assert!(result.contains("demand_planning.id"), "Other table qualifiers should not be affected");
+    }
+
+    #[test]
+    fn test_replace_source_with_transition_unqualified() {
+        let base_query = "SELECT city, SUM(amount) FROM orders GROUP BY city";
+        let result = replace_source_with_transition(base_query, "orders", "__reflex_new_orders");
+        assert!(result.contains("\"__reflex_new_orders\""));
+        assert!(!result.contains(" orders "));
     }
 }
