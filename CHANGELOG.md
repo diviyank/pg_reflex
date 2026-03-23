@@ -16,6 +16,7 @@
 - Multi-level cascade confirmed and tested (works to arbitrary depth)
 - CTE passthrough support (passthrough CTEs become sub-IMV tables)
 - `install.sh` wrapper script — copies migration files alongside `cargo pgrx install`
+- Subquery warning — subqueries in FROM now emit an informational warning (like materialized views)
 
 ### Fixed
 - **Trigger table reference replacement** — schema-qualified tables with column qualifiers (e.g., `sales_simulation.product_id` from `alp.sales_simulation`) now work correctly in triggers. Previously caused `missing FROM-clause entry` on every INSERT/UPDATE/DELETE.
@@ -26,11 +27,16 @@
 - Passthrough DELETE/UPDATE no longer does full table refresh
 - **Passthrough JOIN key mapping** — unique key detection for passthrough JOINs now uses per-source-table column mappings derived from JOIN conditions. Previously, DELETE/UPDATE triggers on secondary tables (e.g., `products` in a `sales JOIN products` query) could corrupt data by matching the wrong column. Auto-detection is now restricted to single-source queries; JOINs require the explicit 3rd argument.
 - Dropped PostgreSQL 13/14 from supported versions (MERGE statement requires PG15+)
+- **BOOL_OR recompute on DELETE** — the recompute SQL was generated but never executed because the guard condition only checked for MIN/MAX, not BOOL_OR. Now fixed.
+- **Subqueries with aggregation in FROM** — now rejected at creation time with a clear error suggesting CTE as the alternative (pg_reflex decomposes CTEs into sub-IMVs automatically). Previously, these silently produced incorrect results because the trigger replaced the inner table with the transition table, making the inner aggregation see only delta rows.
 
 ### Performance
 - **Deferred index creation** — indexes on intermediate and target tables are now created after bulk data insertion (not before), reducing IMV creation time by ~60% on large datasets
 - **Faster `reflex_reconcile`** — drops all indexes (including user-created) before bulk rebuild, recreates them after. Saves index DDL and restores it faithfully. Reduced reconcile time by ~38% on large datasets (6:29 → 4:00 on 7.7M rows). Also uses TRUNCATE instead of DELETE for instant table clearing.
 - **ANALYZE** — intermediate and target tables are analyzed after initial materialization and after reconcile for better query planner statistics
+
+### Tests
+- 172 tests (up from 138 in v1.0.0) covering BOOL_OR, LEFT/RIGHT JOIN, cast propagation, subqueries, passthrough JOINs with per-source key mapping, chained IMVs with passthrough layers, and multiple mixed IMVs on same source
 
 ## [1.0.0] - 2026-03-22
 
