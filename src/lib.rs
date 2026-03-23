@@ -40,6 +40,7 @@ extension_sql!(
         parsed_sql_query JSON,
         aggregations JSON,
         index_columns TEXT[],
+        unique_columns TEXT[],
         enabled BOOLEAN DEFAULT TRUE,
         last_update_date TIMESTAMP
     );
@@ -75,6 +76,15 @@ fn validate_view_name(name: &str) -> Result<(), &'static str> {
 
 #[pg_extern]
 fn create_reflex_ivm(view_name: &str, sql: &str) -> &'static str {
+    create_reflex_ivm_impl(view_name, sql, "")
+}
+
+#[pg_extern(name = "create_reflex_ivm")]
+fn create_reflex_ivm_with_key(view_name: &str, sql: &str, unique_columns: &str) -> &'static str {
+    create_reflex_ivm_impl(view_name, sql, unique_columns)
+}
+
+fn create_reflex_ivm_impl(view_name: &str, sql: &str, unique_columns_str: &str) -> &'static str {
     if let Err(msg) = validate_view_name(view_name) {
         return msg;
     }
@@ -177,7 +187,82 @@ fn create_reflex_ivm(view_name: &str, sql: &str) -> &'static str {
     let froms = analysis.sources.clone();
 
     // Build aggregation plan from the analysis
-    let plan = plan_aggregation(&analysis);
+    let mut plan = plan_aggregation(&analysis);
+
+    // Resolve unique key columns for passthrough IMVs (enables targeted DELETE/UPDATE)
+    let mut resolved_unique_columns: Vec<String> = Vec::new();
+    if plan.is_passthrough {
+        if !unique_columns_str.is_empty() {
+            // Explicit unique columns from 3rd parameter
+            resolved_unique_columns = unique_columns_str
+                .split(',')
+                .map(|s| s.trim().to_lowercase())
+                .filter(|s| !s.is_empty())
+                .collect();
+            plan.passthrough_columns = resolved_unique_columns.clone();
+            info!("pg_reflex: using explicit unique key ({}) for '{}'",
+                resolved_unique_columns.join(", "), view_name);
+        } else {
+            // Auto-detect: check if any source table's PK columns are all in the SELECT list
+            let select_bare_names: std::collections::HashSet<String> = analysis
+                .select_columns
+                .iter()
+                .map(|c| {
+                    let name = c.alias.as_deref().unwrap_or(&c.expr_sql);
+                    bare_column_name(name).to_lowercase()
+                })
+                .collect();
+
+            for source in &froms {
+                if source.starts_with('<') {
+                    continue;
+                }
+                let (src_schema, src_name) = split_qualified_name(source);
+                let src_schema_str = src_schema.unwrap_or("public");
+
+                // Query pg_index for unique indexes on this source
+                let pk_cols: Vec<String> = Spi::connect(|client| {
+                    client
+                        .select(
+                            "SELECT array_agg(a.attname ORDER BY k.n) as cols \
+                             FROM pg_index ix \
+                             JOIN pg_class t ON t.oid = ix.indrelid \
+                             JOIN pg_namespace n ON n.oid = t.relnamespace \
+                             JOIN LATERAL unnest(ix.indkey) WITH ORDINALITY AS k(col, n) ON true \
+                             JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = k.col \
+                             WHERE n.nspname = $1 AND t.relname = $2 AND ix.indisunique AND ix.indisprimary \
+                             GROUP BY ix.indexrelid \
+                             ORDER BY count(*) \
+                             LIMIT 1",
+                            None,
+                            &[
+                                unsafe { DatumWithOid::new(src_schema_str.to_string(), PgBuiltInOids::TEXTOID.oid().value()) },
+                                unsafe { DatumWithOid::new(src_name.to_string(), PgBuiltInOids::TEXTOID.oid().value()) },
+                            ],
+                        )
+                        .unwrap_or_report()
+                        .filter_map(|row| {
+                            row.get_by_name::<Vec<String>, _>("cols")
+                                .unwrap_or(None)
+                        })
+                        .next()
+                        .unwrap_or_default()
+                });
+
+                if !pk_cols.is_empty() {
+                    let pk_lower: Vec<String> = pk_cols.iter().map(|c| c.to_lowercase()).collect();
+                    let all_in_select = pk_lower.iter().all(|c| select_bare_names.contains(c));
+                    if all_in_select {
+                        resolved_unique_columns = pk_lower;
+                        plan.passthrough_columns = resolved_unique_columns.clone();
+                        info!("pg_reflex: auto-detected PK ({}) from '{}' for '{}'",
+                            resolved_unique_columns.join(", "), source, view_name);
+                        break;
+                    }
+                }
+            }
+        }
+    }
 
     // Warn about select columns that are neither GROUP BY nor recognized aggregates.
     // These are silently dropped (e.g., bool_or(), string_agg(), unsupported functions).
@@ -278,6 +363,21 @@ fn create_reflex_ivm(view_name: &str, sql: &str) -> &'static str {
             client
                 .update(&format!("ANALYZE {}", quote_identifier(view_name)), None, &[])
                 .unwrap_or_report();
+
+            // Create unique index on target for resolved unique key columns
+            if !resolved_unique_columns.is_empty() {
+                let bare_view = split_qualified_name(view_name).1;
+                let uk_cols: Vec<String> = resolved_unique_columns.iter()
+                    .map(|c| format!("\"{}\"", c))
+                    .collect();
+                client.update(
+                    &format!(
+                        "CREATE UNIQUE INDEX IF NOT EXISTS \"__reflex_uk_{}\" ON {} ({})",
+                        bare_view, quote_identifier(view_name), uk_cols.join(", ")
+                    ),
+                    None, &[],
+                ).unwrap_or_report();
+            }
         } else {
             // Aggregate: build intermediate + target tables from the plan
             let column_types = query_column_types_from_catalog(client, &froms);
@@ -428,8 +528,8 @@ fn create_reflex_ivm(view_name: &str, sql: &str) -> &'static str {
             "INSERT INTO public.__reflex_ivm_reference
              (name, graph_depth, depends_on, depends_on_imv, unlogged_tables,
               graph_child, sql_query, base_query, end_query,
-              aggregations, index_columns, enabled, last_update_date)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::json, $11, TRUE, NOW())",
+              aggregations, index_columns, unique_columns, enabled, last_update_date)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::json, $11, $12, TRUE, NOW())",
             None,
             &[
                 unsafe { DatumWithOid::new(view_name.to_string(), PgBuiltInOids::TEXTOID.oid().value()) },
@@ -443,6 +543,7 @@ fn create_reflex_ivm(view_name: &str, sql: &str) -> &'static str {
                 unsafe { DatumWithOid::new(end_query.clone(), PgBuiltInOids::TEXTOID.oid().value()) },
                 unsafe { DatumWithOid::new(aggregations_json, PgBuiltInOids::TEXTOID.oid().value()) },
                 unsafe { DatumWithOid::new(index_columns, PgBuiltInOids::TEXTARRAYOID.oid().value()) },
+                unsafe { DatumWithOid::new(resolved_unique_columns.clone(), PgBuiltInOids::TEXTARRAYOID.oid().value()) },
             ],
         ).unwrap_or_report();
 
@@ -823,9 +924,35 @@ fn reflex_reconcile(view_name: &str) -> &'static str {
         };
 
         if is_passthrough || end_query.is_empty() {
-            // Passthrough or no end_query: full refresh from base_query
+            // Passthrough: optimized refresh — drop indexes, TRUNCATE, INSERT, recreate, ANALYZE
+            let (tgt_schema, tgt_name) = split_qualified_name(view_name);
+            let tgt_schema_str = tgt_schema.unwrap_or("public");
+
+            // Save and drop all indexes on target
+            let saved_indexes: Vec<(String, String)> = client
+                .select(
+                    "SELECT indexname, indexdef FROM pg_indexes WHERE schemaname = $1 AND tablename = $2",
+                    None,
+                    &[
+                        unsafe { DatumWithOid::new(tgt_schema_str.to_string(), PgBuiltInOids::TEXTOID.oid().value()) },
+                        unsafe { DatumWithOid::new(tgt_name.to_string(), PgBuiltInOids::TEXTOID.oid().value()) },
+                    ],
+                )
+                .unwrap_or_report()
+                .filter_map(|row| {
+                    let name = row.get_by_name::<&str, _>("indexname").unwrap_or(None)?.to_string();
+                    let def = row.get_by_name::<&str, _>("indexdef").unwrap_or(None)?.to_string();
+                    Some((name, def))
+                })
+                .collect();
+
+            for (idx_name, _) in &saved_indexes {
+                client.update(&format!("DROP INDEX IF EXISTS \"{}\".\"{}\"", tgt_schema_str, idx_name), None, &[]).unwrap_or_report();
+            }
+
+            // Bulk refresh without indexes
             client
-                .update(&format!("DELETE FROM {}", quote_identifier(view_name)), None, &[])
+                .update(&format!("TRUNCATE {}", quote_identifier(view_name)), None, &[])
                 .unwrap_or_report();
             client
                 .update(
@@ -834,6 +961,14 @@ fn reflex_reconcile(view_name: &str) -> &'static str {
                     &[],
                 )
                 .unwrap_or_report();
+
+            // Recreate all indexes
+            for (_, idx_def) in &saved_indexes {
+                client.update(idx_def, None, &[]).unwrap_or_report();
+            }
+
+            // ANALYZE
+            client.update(&format!("ANALYZE {}", quote_identifier(view_name)), None, &[]).unwrap_or_report();
         } else {
             // Aggregate: rebuild intermediate + target
             // Drop pg_reflex-managed indexes first for faster bulk insert

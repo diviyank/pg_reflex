@@ -17,3 +17,6 @@ CREATE FUNCTION "refresh_imv_depending_on"(
 STRICT
 LANGUAGE c
 AS 'MODULE_PATHNAME', 'refresh_imv_depending_on_wrapper';
+
+-- Schema: add unique_columns for targeted passthrough DELETE/UPDATE
+ALTER TABLE public.__reflex_ivm_reference ADD COLUMN IF NOT EXISTS unique_columns TEXT[];

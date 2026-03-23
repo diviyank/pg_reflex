@@ -261,38 +261,37 @@ pub fn reflex_build_delta_sql(
             }
             "DELETE" => {
                 if plan.passthrough_columns.is_empty() {
-                    // Legacy fallback: full refresh
+                    // No unique key: full refresh
                     stmts.push(format!("DELETE FROM {}", qv));
                     stmts.push(format!("INSERT INTO {} {}", qv, base_query));
                 } else {
-                    let delta_q = replace_source_with_transition(base_query, source_table, &old_tbl);
-                    let match_clause = plan.passthrough_columns.iter()
-                        .map(|c| format!("{}.\"{}\" IS NOT DISTINCT FROM __d.\"{}\"", qv, c, c))
-                        .collect::<Vec<_>>()
-                        .join(" AND ");
+                    // Direct key extraction from transition table — no base_query JOINs needed
+                    let key_cols: Vec<String> = plan.passthrough_columns.iter()
+                        .map(|c| format!("\"{}\"", c))
+                        .collect();
+                    let row = row_expr(&key_cols);
                     stmts.push(format!(
-                        "DELETE FROM {} USING ({}) __d WHERE {}",
-                        qv, delta_q, match_clause
+                        "DELETE FROM {} WHERE {} IN (SELECT {} FROM \"{}\")",
+                        qv, row, key_cols.join(", "), old_tbl
                     ));
                 }
             }
             "UPDATE" => {
                 if plan.passthrough_columns.is_empty() {
-                    // Legacy fallback: full refresh
+                    // No unique key: full refresh
                     stmts.push(format!("DELETE FROM {}", qv));
                     stmts.push(format!("INSERT INTO {} {}", qv, base_query));
                 } else {
-                    // Phase 1: subtract old values
-                    let delta_old = replace_source_with_transition(base_query, source_table, &old_tbl);
-                    let match_clause = plan.passthrough_columns.iter()
-                        .map(|c| format!("{}.\"{}\" IS NOT DISTINCT FROM __d.\"{}\"", qv, c, c))
-                        .collect::<Vec<_>>()
-                        .join(" AND ");
+                    // Phase 1: delete old rows by key (direct from transition table, no JOINs)
+                    let key_cols: Vec<String> = plan.passthrough_columns.iter()
+                        .map(|c| format!("\"{}\"", c))
+                        .collect();
+                    let row = row_expr(&key_cols);
                     stmts.push(format!(
-                        "DELETE FROM {} USING ({}) __d WHERE {}",
-                        qv, delta_old, match_clause
+                        "DELETE FROM {} WHERE {} IN (SELECT {} FROM \"{}\")",
+                        qv, row, key_cols.join(", "), old_tbl
                     ));
-                    // Phase 2: add new values
+                    // Phase 2: insert new rows (needs JOINs for derived columns)
                     let delta_new = replace_source_with_transition(base_query, source_table, &new_tbl);
                     stmts.push(format!("INSERT INTO {} {}", qv, delta_new));
                 }

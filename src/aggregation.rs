@@ -489,7 +489,8 @@ mod tests {
         proptest! {
             /// AVG always produces both SUM and COUNT intermediate columns
             #[test]
-            fn avg_always_produces_sum_and_count(col in "[a-z]{1,10}") {
+            fn avg_always_produces_sum_and_count(suffix in "[a-z]{1,10}") {
+                let col = format!("col_{}", suffix);
                 let sql = format!(
                     "SELECT grp, AVG({}) AS avg_val FROM tbl GROUP BY grp",
                     col
