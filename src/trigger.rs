@@ -314,41 +314,62 @@ pub fn reflex_build_delta_sql(
         let bare_view = split_qualified_name(view_name).1;
         let affected_tbl = format!("__reflex_affected_{}", bare_view);
 
+        // Build RETURNING clause for MERGE: returns affected group columns
+        // qualified with t. to disambiguate from the USING source.
+        let returning_clause = grp_cols.as_ref().map(|cols| {
+            let ret_cols = cols.iter().map(|c| format!("t.{}", c)).collect::<Vec<_>>().join(", ");
+            format!(" RETURNING {}", ret_cols)
+        });
+
         match operation {
             "INSERT" => {
                 let delta_q = replace_source_with_transition(base_query, source_table, &new_tbl);
 
-                // Create temp table with affected group keys before UPSERT
                 if let Some(ref cols) = grp_cols {
                     let select_expr = affected_groups_select(cols);
+                    let merge_sql = build_merge_sql(&intermediate_tbl, &delta_q, &plan, DeltaOp::Add);
+                    let ret = returning_clause.as_deref().unwrap_or("");
+                    // 1. Drop old affected table
                     stmts.push(format!(
                         "DROP TABLE IF EXISTS \"{}\"",
                         affected_tbl
                     ));
+                    // 2. Create empty affected table (schema from intermediate, no rows)
                     stmts.push(format!(
-                        "CREATE TEMP TABLE \"{}\" AS SELECT DISTINCT {} FROM ({}) _d",
-                        affected_tbl, select_expr, delta_q
+                        "CREATE TEMP TABLE \"{}\" AS SELECT {} FROM {} WHERE FALSE",
+                        affected_tbl, select_expr, intermediate_tbl
                     ));
+                    // 3. CTE: MERGE + RETURNING → populate affected (data-modifying CTE at top-level INSERT)
+                    stmts.push(format!(
+                        "WITH __m AS ({}{}) INSERT INTO \"{}\" SELECT DISTINCT {} FROM __m",
+                        merge_sql, ret, affected_tbl, select_expr
+                    ));
+                } else {
+                    stmts.push(build_merge_sql(&intermediate_tbl, &delta_q, &plan, DeltaOp::Add));
                 }
-
-                stmts.push(build_merge_sql(&intermediate_tbl, &delta_q, &plan, DeltaOp::Add));
             }
             "DELETE" => {
                 let delta_q = replace_source_with_transition(base_query, source_table, &old_tbl);
 
                 if let Some(ref cols) = grp_cols {
                     let select_expr = affected_groups_select(cols);
+                    let merge_sql = build_merge_sql(&intermediate_tbl, &delta_q, &plan, DeltaOp::Subtract);
+                    let ret = returning_clause.as_deref().unwrap_or("");
                     stmts.push(format!(
                         "DROP TABLE IF EXISTS \"{}\"",
                         affected_tbl
                     ));
                     stmts.push(format!(
-                        "CREATE TEMP TABLE \"{}\" AS SELECT DISTINCT {} FROM ({}) _d",
-                        affected_tbl, select_expr, delta_q
+                        "CREATE TEMP TABLE \"{}\" AS SELECT {} FROM {} WHERE FALSE",
+                        affected_tbl, select_expr, intermediate_tbl
                     ));
+                    stmts.push(format!(
+                        "WITH __m AS ({}{}) INSERT INTO \"{}\" SELECT DISTINCT {} FROM __m",
+                        merge_sql, ret, affected_tbl, select_expr
+                    ));
+                } else {
+                    stmts.push(build_merge_sql(&intermediate_tbl, &delta_q, &plan, DeltaOp::Subtract));
                 }
-
-                stmts.push(build_merge_sql(&intermediate_tbl, &delta_q, &plan, DeltaOp::Subtract));
                 if has_min_max {
                     if let Some(recompute) = build_min_max_recompute_sql(&intermediate_tbl, &plan, source_table) {
                         stmts.push(recompute);
@@ -359,26 +380,45 @@ pub fn reflex_build_delta_sql(
                 let delta_old = replace_source_with_transition(base_query, source_table, &old_tbl);
                 let delta_new = replace_source_with_transition(base_query, source_table, &new_tbl);
 
-                // Union of affected groups from both old and new
                 if let Some(ref cols) = grp_cols {
                     let select_expr = affected_groups_select(cols);
+                    let ret = returning_clause.as_deref().unwrap_or("");
+                    let merge_sub_sql = build_merge_sql(&intermediate_tbl, &delta_old, &plan, DeltaOp::Subtract);
+                    // Create empty affected table, populate from subtract MERGE RETURNING
                     stmts.push(format!(
                         "DROP TABLE IF EXISTS \"{}\"",
                         affected_tbl
                     ));
                     stmts.push(format!(
-                        "CREATE TEMP TABLE \"{}\" AS SELECT DISTINCT {} FROM ({}) _d UNION SELECT DISTINCT {} FROM ({}) _d",
-                        affected_tbl, select_expr, delta_old, select_expr, delta_new
+                        "CREATE TEMP TABLE \"{}\" AS SELECT {} FROM {} WHERE FALSE",
+                        affected_tbl, select_expr, intermediate_tbl
                     ));
-                }
+                    stmts.push(format!(
+                        "WITH __m AS ({}{}) INSERT INTO \"{}\" SELECT DISTINCT {} FROM __m",
+                        merge_sub_sql, ret, affected_tbl, select_expr
+                    ));
 
-                stmts.push(build_merge_sql(&intermediate_tbl, &delta_old, &plan, DeltaOp::Subtract));
-                if has_min_max {
-                    if let Some(recompute) = build_min_max_recompute_sql(&intermediate_tbl, &plan, source_table) {
-                        stmts.push(recompute);
+                    if has_min_max {
+                        if let Some(recompute) = build_min_max_recompute_sql(&intermediate_tbl, &plan, source_table) {
+                            stmts.push(recompute);
+                        }
                     }
+
+                    // Add groups from add MERGE RETURNING to affected table
+                    let merge_add_sql = build_merge_sql(&intermediate_tbl, &delta_new, &plan, DeltaOp::Add);
+                    stmts.push(format!(
+                        "WITH __m AS ({}{}) INSERT INTO \"{}\" SELECT DISTINCT {} FROM __m",
+                        merge_add_sql, ret, affected_tbl, select_expr
+                    ));
+                } else {
+                    stmts.push(build_merge_sql(&intermediate_tbl, &delta_old, &plan, DeltaOp::Subtract));
+                    if has_min_max {
+                        if let Some(recompute) = build_min_max_recompute_sql(&intermediate_tbl, &plan, source_table) {
+                            stmts.push(recompute);
+                        }
+                    }
+                    stmts.push(build_merge_sql(&intermediate_tbl, &delta_new, &plan, DeltaOp::Add));
                 }
-                stmts.push(build_merge_sql(&intermediate_tbl, &delta_new, &plan, DeltaOp::Add));
             }
             _ => {}
         }

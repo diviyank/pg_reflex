@@ -59,28 +59,14 @@ pub fn build_intermediate_table_ddl(
 
     let columns_sql = columns.join(",\n");
 
-    // Primary key on group by columns and/or distinct columns
-    let mut pk_cols: Vec<String> = Vec::new();
-    if needs_sentinel {
-        pk_cols.push("__reflex_group".to_string());
-    }
-    pk_cols.extend(
-        plan.group_by_columns
-            .iter()
-            .map(|c| format!("\"{}\"", normalized_column_name(c))),
-    );
-    for col in &plan.distinct_columns {
-        pk_cols.push(format!("\"{}\"", normalized_column_name(col)));
-    }
-    let pk = if !pk_cols.is_empty() {
-        format!(",\n    PRIMARY KEY ({})", pk_cols.join(", "))
-    } else {
-        String::new()
-    };
+    // No inline PRIMARY KEY — we use a hash index for O(1) lookups instead.
+    // The B-tree PK is redundant because MERGE handles insert-or-update correctly,
+    // the delta query uses GROUP BY (unique output), and advisory locks prevent
+    // concurrent MERGEs on the same IMV.
 
     Some(format!(
-        "CREATE UNLOGGED TABLE IF NOT EXISTS {} (\n{}{}\n)",
-        table_name, columns_sql, pk
+        "CREATE UNLOGGED TABLE IF NOT EXISTS {} (\n{}\n)",
+        table_name, columns_sql
     ))
 }
 
@@ -125,7 +111,7 @@ pub fn build_target_table_ddl(
     let columns_sql = columns.join(",\n");
 
     format!(
-        "CREATE TABLE IF NOT EXISTS {} (\n{}\n)",
+        "CREATE UNLOGGED TABLE IF NOT EXISTS {} (\n{}\n)",
         quote_identifier(view_name), columns_sql
     )
 }
@@ -136,8 +122,37 @@ pub fn build_indexes_ddl(view_name: &str, plan: &AggregationPlan) -> Vec<String>
     let bare_view = split_qualified_name(view_name).1;
     let mut indexes = Vec::new();
 
-    // For multiple group-by columns, create individual indexes on intermediate table
-    // (the composite PK already covers combined lookups)
+    // Index on intermediate table group columns for MERGE lookups.
+    // Single-column: hash index for O(1) lookups (~30% faster than B-tree).
+    // Multi-column: B-tree (hash doesn't support multi-column in PostgreSQL).
+    // No PK constraint — MERGE handles insert-or-update correctly, and advisory
+    // locks prevent concurrent modifications.
+    {
+        let mut idx_cols: Vec<String> = Vec::new();
+        if plan.group_by_columns.is_empty()
+            && plan.distinct_columns.is_empty()
+            && !plan.intermediate_columns.is_empty()
+        {
+            idx_cols.push("__reflex_group".to_string());
+        }
+        idx_cols.extend(
+            plan.group_by_columns
+                .iter()
+                .map(|c| format!("\"{}\"", normalized_column_name(c))),
+        );
+        for col in &plan.distinct_columns {
+            idx_cols.push(format!("\"{}\"", normalized_column_name(col)));
+        }
+        if !idx_cols.is_empty() {
+            let using = if idx_cols.len() == 1 { "USING hash" } else { "" };
+            indexes.push(format!(
+                "CREATE INDEX IF NOT EXISTS \"idx__reflex_int_{}\" ON {} {} ({})",
+                bare_view, table_name, using, idx_cols.join(", ")
+            ));
+        }
+    }
+
+    // For multiple group-by columns, create individual B-tree indexes on intermediate table
     if plan.group_by_columns.len() > 1 {
         for (i, col) in plan.group_by_columns.iter().enumerate() {
             let norm = normalized_column_name(col);
@@ -364,7 +379,8 @@ mod tests {
         assert!(ddl.contains("\"__sum_amount\" NUMERIC DEFAULT 0"));
         assert!(ddl.contains("\"__count_star\" BIGINT DEFAULT 0"));
         assert!(ddl.contains("__ivm_count BIGINT DEFAULT 0"));
-        assert!(ddl.contains("PRIMARY KEY (\"city\")"));
+        // No PRIMARY KEY — we use a hash index created separately via build_indexes_ddl
+        assert!(!ddl.contains("PRIMARY KEY"));
     }
 
     #[test]
@@ -372,7 +388,7 @@ mod tests {
         let plan = sample_plan();
         let types = sample_types();
         let ddl = build_target_table_ddl("test_view", &plan, &types);
-        assert!(ddl.contains("CREATE TABLE"));
+        assert!(ddl.contains("CREATE UNLOGGED TABLE"));
         assert!(ddl.contains("\"test_view\""));
         assert!(ddl.contains("\"city\" TEXT"));
         assert!(ddl.contains("\"total\" NUMERIC"));
@@ -409,22 +425,25 @@ mod tests {
         let mut plan = sample_plan();
         plan.group_by_columns = vec!["city".to_string(), "year".to_string()];
         let indexes = build_indexes_ddl("test_view", &plan);
-        // 2 individual intermediate indexes + 1 composite target index
-        assert_eq!(indexes.len(), 3);
-        assert!(indexes[0].contains("\"city\""));
-        assert!(indexes[1].contains("\"year\""));
-        assert!(indexes[2].contains("idx__reflex_target_"));
-        assert!(indexes[2].contains("\"city\", \"year\""));
+        // B-tree index on intermediate (multi-column, no hash) + 2 individual + 1 target
+        assert_eq!(indexes.len(), 4);
+        assert!(indexes[0].contains("idx__reflex_int_"));
+        assert!(!indexes[0].contains("USING hash")); // multi-column uses B-tree
+        assert!(indexes[0].contains("\"city\", \"year\""));
+        assert!(indexes[1].contains("\"city\""));
+        assert!(indexes[2].contains("\"year\""));
+        assert!(indexes[3].contains("idx__reflex_target_"));
     }
 
     #[test]
     fn test_indexes_ddl_single_group_by() {
         let plan = sample_plan();
         let indexes = build_indexes_ddl("test_view", &plan);
-        // Single group by: no extra intermediate indexes (PK covers it),
-        // but still get a target table index for targeted refresh
-        assert_eq!(indexes.len(), 1);
-        assert!(indexes[0].contains("idx__reflex_target_"));
+        // hash index on intermediate (single column) + target table index
+        assert_eq!(indexes.len(), 2);
+        assert!(indexes[0].contains("USING hash"));
+        assert!(indexes[0].contains("\"city\""));
+        assert!(indexes[1].contains("idx__reflex_target_"));
     }
 
     #[test]

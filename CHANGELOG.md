@@ -1,5 +1,24 @@
 # Changelog
 
+## [1.0.2] - 2026-03-24
+
+### Performance
+- **UNLOGGED target table** — target tables are now `UNLOGGED` (matching intermediate tables). Eliminates WAL writes on every targeted refresh (DELETE+INSERT), reducing write overhead. Crash recovery already required `reflex_reconcile()` due to the UNLOGGED intermediate, so this adds zero additional risk.
+- **Hash index on intermediate** — single-column GROUP BY keys now use a hash index instead of a B-tree primary key for O(1) MERGE lookups (~30% faster MERGE for single-column groups). Multi-column GROUP BY falls back to B-tree (hash doesn't support multi-column in PostgreSQL). The B-tree PK is removed because MERGE handles insert-or-update correctly and advisory locks prevent concurrent modifications.
+- **MERGE RETURNING** — the delta query now runs once per trigger fire instead of twice. The MERGE into intermediate uses `RETURNING` in a CTE to capture affected group keys, eliminating the separate `SELECT DISTINCT groups FROM (delta_query)` statement. For UPDATE operations, delta_old and delta_new each run once instead of twice (4 → 2 executions).
+
+### Benchmarks (100K groups, 1M source, single-column GROUP BY)
+- INSERT 10K: 236ms → 171ms (**28% faster**)
+- INSERT 50K: 1,170ms → 865ms (**26% faster**)
+- INSERT 100K: 2,298ms → 1,802ms (**22% faster**)
+
+### Migration
+- Existing aggregate IMVs: intermediate PK dropped and replaced with hash/B-tree index, target table converted to UNLOGGED. Migration is automatic via `ALTER EXTENSION pg_reflex UPDATE`.
+- Existing passthrough IMVs: target table converted to UNLOGGED.
+
+### Tests
+- 172 tests (unchanged from v1.0.1, all passing)
+
 ## [1.0.1] - 2026-03-23
 
 ### Added

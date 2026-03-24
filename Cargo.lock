@@ -912,7 +912,7 @@ dependencies = [
 
 [[package]]
 name = "pg_reflex"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "pgrx",
  "pgrx-tests",

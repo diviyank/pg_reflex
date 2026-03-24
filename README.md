@@ -254,7 +254,7 @@ Source Table(s)
     v
 +-------------------+     +--------------------+
 | Intermediate Table| --> | Target Table       |
-| (UNLOGGED)        |     | (your view)        |
+| (UNLOGGED)        |     | (UNLOGGED)         |
 |                   |     |                    |
 | Stores partial    |     | Final query result |
 | aggregates:       |     | users SELECT from  |
@@ -269,11 +269,11 @@ When you INSERT, UPDATE, or DELETE rows in a source table:
 
 1. **Statement-level triggers** fire (one per operation type, shared across all IMVs on the same source)
 2. A Rust function generates **MERGE SQL** from the stored `base_query`, replacing the source table reference with the transition table (new/old rows)
-3. The MERGE applies the delta to the **intermediate table**:
+3. The MERGE applies the delta to the **intermediate table** and captures affected group keys via `RETURNING`:
    - For INSERT: `__sum_x = intermediate.__sum_x + delta.__sum_x`
    - For DELETE: `__sum_x = intermediate.__sum_x - delta.__sum_x`
    - For UPDATE: subtract old values, then add new values (two-phase)
-4. **Targeted refresh**: only the affected groups (identified via a temp table of changed group keys) are deleted and re-inserted into the **target table** from the intermediate table
+4. **Targeted refresh**: only the affected groups (captured from MERGE RETURNING) are deleted and re-inserted into the **target table** from the intermediate table
 5. `__ivm_count` tracks how many source rows contribute to each group -- groups with `__ivm_count = 0` are excluded from the target
 
 ### Sufficient Statistics
@@ -337,7 +337,7 @@ View names must contain only alphanumeric characters, underscores, and periods (
 
 What it creates:
 1. An **intermediate table** (`__reflex_intermediate_{view_name}`) -- UNLOGGED, stores partial aggregate state
-2. A **target table** (`{view_name}`) -- regular table you query, contains the final computed results
+2. A **target table** (`{view_name}`) -- UNLOGGED table you query, contains the final computed results
 3. **Triggers** on each source table (INSERT, DELETE, UPDATE) that keep the view in sync
 4. A **metadata entry** in `__reflex_ivm_reference` tracking the view's configuration
 

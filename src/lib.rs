@@ -1283,25 +1283,7 @@ fn reflex_reconcile(view_name: &str) -> &'static str {
                 )
                 .unwrap_or_report();
 
-            // Recreate intermediate PK
-            let mut pk_cols: Vec<String> = plan.group_by_columns.iter()
-                .map(|c| format!("\"{}\"", normalized_column_name(c)))
-                .collect();
-            if pk_cols.is_empty() && !plan.intermediate_columns.is_empty() {
-                pk_cols.push("__reflex_group".to_string());
-            }
-            for col in &plan.distinct_columns {
-                pk_cols.push(format!("\"{}\"", normalized_column_name(col)));
-            }
-            if !pk_cols.is_empty() {
-                let pk_name = format!("__reflex_intermediate_{}_pkey", bare_view);
-                client.update(
-                    &format!("ALTER TABLE {} ADD CONSTRAINT \"{}\" PRIMARY KEY ({})", intermediate, pk_name, pk_cols.join(", ")),
-                    None, &[],
-                ).unwrap_or_report();
-            }
-
-            // Recreate reflex-managed indexes on both tables
+            // Recreate reflex-managed indexes (hash index on intermediate + target indexes)
             for index_ddl in build_indexes_ddl(view_name, &plan) {
                 client.update(&index_ddl, None, &[]).unwrap_or_report();
             }
