@@ -75,16 +75,16 @@ fn validate_view_name(name: &str) -> Result<(), &'static str> {
 }
 
 #[pg_extern]
-fn create_reflex_ivm(view_name: &str, sql: &str) -> &'static str {
-    create_reflex_ivm_impl(view_name, sql, "")
+fn create_reflex_ivm(view_name: &str, sql: &str, unique_columns: default!(Option<&str>, "NULL")) -> &'static str {
+    create_reflex_ivm_impl(view_name, sql, unique_columns.unwrap_or(""), false)
 }
 
-#[pg_extern(name = "create_reflex_ivm")]
-fn create_reflex_ivm_with_key(view_name: &str, sql: &str, unique_columns: &str) -> &'static str {
-    create_reflex_ivm_impl(view_name, sql, unique_columns)
+#[pg_extern]
+fn create_reflex_ivm_if_not_exists(view_name: &str, sql: &str, unique_columns: default!(Option<&str>, "NULL")) -> &'static str {
+    create_reflex_ivm_impl(view_name, sql, unique_columns.unwrap_or(""), true)
 }
 
-fn create_reflex_ivm_impl(view_name: &str, sql: &str, unique_columns_str: &str) -> &'static str {
+fn create_reflex_ivm_impl(view_name: &str, sql: &str, unique_columns_str: &str, if_not_exists: bool) -> &'static str {
     if let Err(msg) = validate_view_name(view_name) {
         return msg;
     }
@@ -137,7 +137,7 @@ fn create_reflex_ivm_impl(view_name: &str, sql: &str, unique_columns_str: &str) 
             }
 
             let cte_view_name = format!("{}__cte_{}", view_name, cte.alias);
-            let result = create_reflex_ivm(&cte_view_name, &cte_query);
+            let result = create_reflex_ivm(&cte_view_name, &cte_query, None);
             if result.starts_with("ERROR") {
                 return result;
             }
@@ -192,7 +192,7 @@ fn create_reflex_ivm_impl(view_name: &str, sql: &str, unique_columns_str: &str) 
         }
 
         // Main body has aggregation → create as a normal IMV
-        return create_reflex_ivm(view_name, &body_sql);
+        return create_reflex_ivm(view_name, &body_sql, None);
     }
     // --- End CTE decomposition ---
 
@@ -348,6 +348,9 @@ fn create_reflex_ivm_impl(view_name: &str, sql: &str, unique_columns_str: &str) 
             .is_empty()
     });
     if already_exists {
+        if if_not_exists {
+            return "REFLEX INCREMENTAL VIEW ALREADY EXISTS (skipped)";
+        }
         return "ERROR: IMV with this name already exists";
     }
 
@@ -1418,6 +1421,7 @@ mod tests {
         let result = crate::create_reflex_ivm(
             "test_city_totals",
             "SELECT city, SUM(amount) AS total FROM test_orders GROUP BY city",
+            None,
         );
         assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
 
@@ -1458,6 +1462,7 @@ mod tests {
         let result = crate::create_reflex_ivm(
             "test_dept_avg",
             "SELECT dept, AVG(salary) AS avg_sal FROM test_emp GROUP BY dept",
+            None,
         );
         assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
 
@@ -1496,6 +1501,7 @@ mod tests {
         let result = crate::create_reflex_ivm(
             "test_distinct_countries",
             "SELECT DISTINCT country FROM test_visits",
+            None,
         );
         assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
 
@@ -1519,6 +1525,7 @@ mod tests {
         let result = crate::create_reflex_ivm(
             "test_cat_counts",
             "SELECT category, COUNT(*) AS cnt FROM test_items GROUP BY category",
+            None,
         );
         assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
 
@@ -1544,6 +1551,7 @@ mod tests {
         let result = crate::create_reflex_ivm(
             "test_score_range",
             "SELECT subject, MIN(score) AS lo, MAX(score) AS hi FROM test_scores GROUP BY subject",
+            None,
         );
         assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
 
@@ -1575,6 +1583,7 @@ mod tests {
         let result = crate::create_reflex_ivm(
             "test_region_stats",
             "SELECT region, SUM(revenue) AS total, COUNT(*) AS cnt, AVG(revenue) AS avg_rev FROM test_sales GROUP BY region",
+            None,
         );
         assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
 
@@ -1606,12 +1615,14 @@ mod tests {
         crate::create_reflex_ivm(
             "test_imv_1",
             "SELECT val, SUM(amount) AS total FROM test_base GROUP BY val",
+            None,
         );
 
         // Second IMV depends on test_imv_1, should be at depth 2
         crate::create_reflex_ivm(
             "test_imv_2",
             "SELECT val, SUM(total) AS grand_total FROM test_imv_1 GROUP BY val",
+            None,
         );
 
         let depth1 = Spi::get_one::<i32>(
@@ -1643,6 +1654,7 @@ mod tests {
         let result = crate::create_reflex_ivm(
             "bad_view",
             "WITH RECURSIVE nums AS (SELECT 1 AS n UNION ALL SELECT n+1 FROM nums WHERE n < 10) SELECT n, COUNT(*) AS cnt FROM nums GROUP BY n",
+            None,
         );
         assert!(result.starts_with("ERROR"));
         assert!(result.contains("RECURSIVE"));
@@ -1652,7 +1664,7 @@ mod tests {
     fn test_unsupported_limit_rejected() {
         Spi::run("CREATE TABLE test_t2 (id INT)").expect("create table");
         let result =
-            crate::create_reflex_ivm("bad_view2", "SELECT id, COUNT(*) AS cnt FROM test_t2 GROUP BY id LIMIT 10");
+            crate::create_reflex_ivm("bad_view2", "SELECT id, COUNT(*) AS cnt FROM test_t2 GROUP BY id LIMIT 10", None);
         assert!(result.starts_with("ERROR"));
     }
 
@@ -1662,6 +1674,7 @@ mod tests {
         let result = crate::create_reflex_ivm(
             "bad_view3",
             "SELECT id, SUM(amount) OVER (PARTITION BY id) FROM test_t3",
+            None,
         );
         assert!(result.starts_with("ERROR"));
     }
@@ -1675,6 +1688,7 @@ mod tests {
         crate::create_reflex_ivm(
             "test_ref_view",
             "SELECT city, SUM(amount) AS total FROM test_ref_src GROUP BY city",
+            None,
         );
 
         // Verify all key fields are populated
@@ -1705,6 +1719,7 @@ mod tests {
         crate::create_reflex_ivm(
             "test_trig_view",
             "SELECT grp, SUM(val) AS total FROM test_trig_src GROUP BY grp",
+            None,
         );
 
         // Check all 4 consolidated triggers exist (INSERT, DELETE, UPDATE, TRUNCATE)
@@ -1729,6 +1744,7 @@ mod tests {
         crate::create_reflex_ivm(
             "trig_ins_view",
             "SELECT city, SUM(amount) AS total FROM trig_ins_src GROUP BY city",
+            None,
         );
 
         // Insert more rows AFTER IMV creation — triggers should fire
@@ -1763,6 +1779,7 @@ mod tests {
         crate::create_reflex_ivm(
             "trig_del_view",
             "SELECT city, SUM(amount) AS total FROM trig_del_src GROUP BY city",
+            None,
         );
 
         // Delete one Paris row
@@ -1786,6 +1803,7 @@ mod tests {
         crate::create_reflex_ivm(
             "trig_delall_view",
             "SELECT city, SUM(amount) AS total FROM trig_delall_src GROUP BY city",
+            None,
         );
 
         // Delete all rows for city 'X'
@@ -1818,6 +1836,7 @@ mod tests {
         crate::create_reflex_ivm(
             "trig_upd_view",
             "SELECT city, SUM(amount) AS total FROM trig_upd_src GROUP BY city",
+            None,
         );
 
         // Update: change amount for city 'A'
@@ -1843,6 +1862,7 @@ mod tests {
         crate::create_reflex_ivm(
             "trig_avg_view",
             "SELECT dept, AVG(salary) AS avg_sal FROM trig_avg_src GROUP BY dept",
+            None,
         );
 
         // Insert another row
@@ -1879,6 +1899,7 @@ mod tests {
         crate::create_reflex_ivm(
             "trig_dist_view",
             "SELECT DISTINCT country FROM trig_dist_src",
+            None,
         );
 
         // Delete one 'US' — should still appear (ref count > 0)
@@ -1917,6 +1938,7 @@ mod tests {
         crate::create_reflex_ivm(
             "trig_bulk_view",
             "SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM trig_bulk_src GROUP BY grp",
+            None,
         );
 
         // Bulk insert 100 rows for group 'X'
@@ -1948,6 +1970,7 @@ mod tests {
         let result = crate::create_reflex_ivm(
             "test_dept_counts",
             "SELECT d.dept_name, COUNT(*) AS emp_count FROM test_j_emp e JOIN test_j_dept d ON e.dept_id = d.id GROUP BY d.dept_name",
+            None,
         );
         assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
 
@@ -1977,6 +2000,7 @@ mod tests {
         let result = crate::create_reflex_ivm(
             "pt_view",
             "SELECT id, name FROM pt_src WHERE active = true",
+            None,
         );
         assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
 
@@ -2012,6 +2036,7 @@ mod tests {
         let result = crate::create_reflex_ivm(
             "pt_join_view",
             "SELECT o.id, p.name, o.amount FROM pt_orders o JOIN pt_products p ON o.product_id = p.id",
+            None,
         );
         assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
 
@@ -2032,7 +2057,7 @@ mod tests {
         Spi::run("CREATE TABLE pt_del (id SERIAL, val TEXT)").expect("create");
         Spi::run("INSERT INTO pt_del (val) VALUES ('a'), ('b'), ('c')").expect("seed");
 
-        crate::create_reflex_ivm("pt_del_view", "SELECT id, val FROM pt_del");
+        crate::create_reflex_ivm("pt_del_view", "SELECT id, val FROM pt_del", None);
 
         // DELETE → full refresh
         Spi::run("DELETE FROM pt_del WHERE val = 'b'").expect("delete");
@@ -2053,6 +2078,7 @@ mod tests {
         let result = crate::create_reflex_ivm(
             "cte_simple",
             "WITH regional AS (SELECT region, SUM(amount) AS total FROM cte_src1 GROUP BY region) SELECT region, total FROM regional",
+            None,
         );
         assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
 
@@ -2079,6 +2105,7 @@ mod tests {
         crate::create_reflex_ivm(
             "cte_prop",
             "WITH totals AS (SELECT region, SUM(amount) AS total FROM cte_src2 GROUP BY region) SELECT region, total FROM totals",
+            None,
         );
 
         // INSERT into source → sub-IMV updates → VIEW reflects changes
@@ -2108,6 +2135,7 @@ mod tests {
         crate::create_reflex_ivm(
             "cte_filtered",
             "WITH totals AS (SELECT region, SUM(amount) AS total FROM cte_src3 GROUP BY region) SELECT region, total FROM totals WHERE total > 100",
+            None,
         );
 
         // Only Y (200) should appear, not X (50)
@@ -2142,6 +2170,7 @@ mod tests {
              ), by_region AS (\
                 SELECT region, SUM(city_total) AS total FROM by_city GROUP BY region\
              ) SELECT region, total FROM by_region",
+            None,
         );
         assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
 
@@ -2169,6 +2198,7 @@ mod tests {
         let result = crate::create_reflex_ivm(
             "cte_agg_main",
             "WITH totals AS (SELECT region, SUM(amount) AS total FROM cte_src5 GROUP BY region) SELECT COUNT(*) AS num_regions FROM totals",
+            None,
         );
         assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
 
@@ -2188,6 +2218,7 @@ mod tests {
         crate::create_reflex_ivm(
             "e2e_view",
             "SELECT city, SUM(amount) AS total, COUNT(*) AS cnt FROM e2e_src GROUP BY city",
+            None,
         );
 
         // 1. INSERT initial rows
@@ -2256,12 +2287,14 @@ mod tests {
         crate::create_reflex_ivm(
             "cascade_l1",
             "SELECT category, SUM(amount) AS total FROM cascade_src GROUP BY category",
+            None,
         );
 
         // L2: SUM of L1 totals (grand total across all categories)
         crate::create_reflex_ivm(
             "cascade_l2",
             "SELECT SUM(total) AS grand_total FROM cascade_l1",
+            None,
         );
 
         // Verify initial state
@@ -2315,6 +2348,7 @@ mod tests {
         crate::create_reflex_ivm(
             "e2e_dept_counts",
             "SELECT d.dept_name, COUNT(*) AS emp_count FROM e2e_emp e JOIN e2e_dept d ON e.dept_id = d.id GROUP BY d.dept_name",
+            None,
         );
 
         // Verify initial
@@ -2350,6 +2384,7 @@ mod tests {
         crate::create_reflex_ivm(
             "drop_view",
             "SELECT grp, SUM(val) AS total FROM drop_src GROUP BY grp",
+            None,
         );
 
         // Verify IMV exists
@@ -2396,10 +2431,12 @@ mod tests {
         crate::create_reflex_ivm(
             "drop_parent",
             "SELECT grp, SUM(val) AS total FROM drop_ch_src GROUP BY grp",
+            None,
         );
         crate::create_reflex_ivm(
             "drop_child",
             "SELECT grp, SUM(total) AS grand FROM drop_parent GROUP BY grp",
+            None,
         );
 
         // Should refuse without cascade
@@ -2416,10 +2453,12 @@ mod tests {
         crate::create_reflex_ivm(
             "drop_cas_parent",
             "SELECT grp, SUM(val) AS total FROM drop_cas_src GROUP BY grp",
+            None,
         );
         crate::create_reflex_ivm(
             "drop_cas_child",
             "SELECT grp, SUM(total) AS grand FROM drop_cas_parent GROUP BY grp",
+            None,
         );
 
         // Cascade should drop both
@@ -2444,10 +2483,12 @@ mod tests {
         crate::create_reflex_ivm(
             "drop_sh_v1",
             "SELECT grp, SUM(val) AS total FROM drop_sh_src GROUP BY grp",
+            None,
         );
         crate::create_reflex_ivm(
             "drop_sh_v2",
             "SELECT grp, COUNT(*) AS cnt FROM drop_sh_src GROUP BY grp",
+            None,
         );
 
         // Both share 4 triggers on the source
@@ -2490,6 +2531,7 @@ mod tests {
         crate::create_reflex_ivm(
             "trunc_view",
             "SELECT grp, SUM(val) AS total FROM trunc_src GROUP BY grp",
+            None,
         );
 
         // Verify data exists
@@ -2521,6 +2563,7 @@ mod tests {
         crate::create_reflex_ivm(
             "trunc2_view",
             "SELECT grp, SUM(val) AS total FROM trunc2_src GROUP BY grp",
+            None,
         );
 
         Spi::run("TRUNCATE trunc2_src").expect("truncate");
@@ -2549,6 +2592,7 @@ mod tests {
         crate::create_reflex_ivm(
             "recon_view",
             "SELECT grp, SUM(val) AS total FROM recon_src GROUP BY grp",
+            None,
         );
 
         // Corrupt the intermediate table by zeroing out a value
@@ -2581,7 +2625,7 @@ mod tests {
         Spi::run("INSERT INTO recon_pt_src (name) VALUES ('Alice'), ('Bob')")
             .expect("seed");
 
-        crate::create_reflex_ivm("recon_pt_view", "SELECT id, name FROM recon_pt_src");
+        crate::create_reflex_ivm("recon_pt_view", "SELECT id, name FROM recon_pt_src", None);
 
         // Manually delete a row from target (corrupt)
         Spi::run("DELETE FROM recon_pt_view WHERE name = 'Alice'").expect("corrupt");
@@ -2615,16 +2659,19 @@ mod tests {
         crate::create_reflex_ivm(
             "multi_v1",
             "SELECT city, SUM(amount) AS total FROM multi_src GROUP BY city",
+            None,
         );
         // IMV 2: COUNT by city
         crate::create_reflex_ivm(
             "multi_v2",
             "SELECT city, COUNT(*) AS cnt FROM multi_src GROUP BY city",
+            None,
         );
         // IMV 3: SUM of qty (no group by — global aggregate)
         crate::create_reflex_ivm(
             "multi_v3",
             "SELECT SUM(qty) AS total_qty FROM multi_src",
+            None,
         );
 
         // Verify initial state
@@ -2718,24 +2765,28 @@ mod tests {
         crate::create_reflex_ivm(
             "chain4_l1",
             "SELECT region, city, SUM(amount) AS city_total FROM chain4_src GROUP BY region, city",
+            None,
         );
 
         // L2: SUM by region (rolls up cities)
         crate::create_reflex_ivm(
             "chain4_l2",
             "SELECT region, SUM(city_total) AS region_total FROM chain4_l1 GROUP BY region",
+            None,
         );
 
         // L3: COUNT of regions (how many regions have data)
         crate::create_reflex_ivm(
             "chain4_l3",
             "SELECT COUNT(*) AS num_regions FROM chain4_l2",
+            None,
         );
 
         // L4: passthrough of L3 (tests cascading through passthrough)
         crate::create_reflex_ivm(
             "chain4_l4",
             "SELECT num_regions FROM chain4_l3",
+            None,
         );
 
         // Verify initial state across all levels
@@ -3056,7 +3107,7 @@ mod tests {
 
     #[pg_test]
     fn test_malformed_sql_returns_error() {
-        let result = crate::create_reflex_ivm("bad_sql_view", "SELEC broken garbage !!!");
+        let result = crate::create_reflex_ivm("bad_sql_view", "SELEC broken garbage !!!", None);
         assert!(
             result.starts_with("ERROR"),
             "Malformed SQL should return error, got: {}",
@@ -3068,15 +3119,15 @@ mod tests {
     #[pg_test]
     fn test_special_chars_view_name_rejected() {
         Spi::run("CREATE TABLE vn_src (id SERIAL, val INT)").expect("create table");
-        let r1 = crate::create_reflex_ivm("bad'name", "SELECT val FROM vn_src");
+        let r1 = crate::create_reflex_ivm("bad'name", "SELECT val FROM vn_src", None);
         assert!(r1.starts_with("ERROR"), "Single quote should be rejected");
-        let r2 = crate::create_reflex_ivm("bad;name", "SELECT val FROM vn_src");
+        let r2 = crate::create_reflex_ivm("bad;name", "SELECT val FROM vn_src", None);
         assert!(r2.starts_with("ERROR"), "Semicolon should be rejected");
-        let r3 = crate::create_reflex_ivm("bad--name", "SELECT val FROM vn_src");
+        let r3 = crate::create_reflex_ivm("bad--name", "SELECT val FROM vn_src", None);
         assert!(r3.starts_with("ERROR"), "SQL comment should be rejected");
-        let r4 = crate::create_reflex_ivm("bad name", "SELECT val FROM vn_src");
+        let r4 = crate::create_reflex_ivm("bad name", "SELECT val FROM vn_src", None);
         assert!(r4.starts_with("ERROR"), "Whitespace should be rejected");
-        let r5 = crate::create_reflex_ivm("", "SELECT val FROM vn_src");
+        let r5 = crate::create_reflex_ivm("", "SELECT val FROM vn_src", None);
         assert!(r5.starts_with("ERROR"), "Empty name should be rejected");
     }
 
@@ -3115,11 +3166,13 @@ mod tests {
         let r1 = crate::create_reflex_ivm(
             "dup_view",
             "SELECT grp, SUM(val) AS total FROM dup_src GROUP BY grp",
+            None,
         );
         assert_eq!(r1, "CREATE REFLEX INCREMENTAL VIEW");
         let r2 = crate::create_reflex_ivm(
             "dup_view",
             "SELECT grp, SUM(val) AS total FROM dup_src GROUP BY grp",
+            None,
         );
         assert!(
             r2.starts_with("ERROR"),
@@ -3134,6 +3187,7 @@ mod tests {
         let result = crate::create_reflex_ivm(
             "empty_view",
             "SELECT grp, SUM(val) AS total FROM empty_src GROUP BY grp",
+            None,
         );
         assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
         let count =
@@ -3162,6 +3216,7 @@ mod tests {
         crate::create_reflex_ivm(
             "grpmove_view",
             "SELECT grp, SUM(val) AS total FROM grpmove_src GROUP BY grp",
+            None,
         );
         // Move a row from group A to group B
         Spi::run("UPDATE grpmove_src SET grp = 'B' WHERE val = 10").expect("update");
@@ -3187,6 +3242,7 @@ mod tests {
         crate::create_reflex_ivm(
             "mmr_view",
             "SELECT grp, MIN(val) AS lo, MAX(val) AS hi FROM mmr_src GROUP BY grp",
+            None,
         );
         let lo =
             Spi::get_one::<pgrx::AnyNumeric>("SELECT lo FROM mmr_view WHERE grp = 'X'")
@@ -3209,6 +3265,7 @@ mod tests {
         crate::create_reflex_ivm(
             "delall_view",
             "SELECT grp, SUM(val) AS total FROM delall_src GROUP BY grp",
+            None,
         );
         Spi::run("DELETE FROM delall_src").expect("delete all");
         let count =
@@ -3229,6 +3286,7 @@ mod tests {
         crate::create_reflex_ivm(
             "recon_agg_view",
             "SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM recon_agg_src GROUP BY grp",
+            None,
         );
         // Corrupt intermediate table
         Spi::run(
@@ -3261,6 +3319,7 @@ mod tests {
         crate::create_reflex_ivm(
             "null_agg_view",
             "SELECT grp, SUM(val) AS total, COUNT(val) AS cnt FROM null_agg_src GROUP BY grp",
+            None,
         );
         // SUM should ignore NULL: 10 + 30 = 40
         let total = Spi::get_one::<pgrx::AnyNumeric>(
@@ -3291,6 +3350,7 @@ mod tests {
         crate::create_reflex_ivm(
             "ccvs_view",
             "SELECT grp, COUNT(*) AS cnt_star, COUNT(val) AS cnt_val FROM ccvs_src GROUP BY grp",
+            None,
         );
         let cnt_star = Spi::get_one::<i64>(
             "SELECT cnt_star FROM ccvs_view WHERE grp = 'X'",
@@ -3320,6 +3380,7 @@ mod tests {
         let result = crate::create_reflex_ivm(
             "dg_view",
             "SELECT DISTINCT grp, val FROM dg_src",
+            None,
         );
         assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
         let count =
@@ -3338,6 +3399,7 @@ mod tests {
         let result = crate::create_reflex_ivm(
             "sq_view",
             "SELECT grp, SUM(val) AS total FROM public.sq_src GROUP BY grp",
+            None,
         );
         assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
         let total = Spi::get_one::<pgrx::AnyNumeric>(
@@ -3366,6 +3428,7 @@ mod tests {
         crate::create_reflex_ivm(
             "zr_view",
             "SELECT grp, SUM(val) AS total FROM zr_src GROUP BY grp",
+            None,
         );
         // Insert zero rows (WHERE false) — trigger fires but no delta
         Spi::run("INSERT INTO zr_src (grp, val) SELECT 'B', 99 WHERE false").expect("empty insert");
@@ -3387,6 +3450,7 @@ mod tests {
         crate::create_reflex_ivm(
             "uvo_view",
             "SELECT grp, SUM(val) AS total FROM uvo_src GROUP BY grp",
+            None,
         );
         // Update value, not group column
         Spi::run("UPDATE uvo_src SET val = 50 WHERE val = 10").expect("update");
@@ -3411,6 +3475,7 @@ mod tests {
         crate::create_reflex_ivm(
             "md_view",
             "SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM md_src GROUP BY grp",
+            None,
         );
         // Delete two rows separately
         Spi::run("DELETE FROM md_src WHERE val = 10").expect("delete 1");
@@ -3444,6 +3509,7 @@ mod tests {
         crate::create_reflex_ivm(
             "lb_view",
             "SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM lb_src GROUP BY grp",
+            None,
         );
         // Compare IMV against direct query
         let mismatches = Spi::get_one::<i64>(
@@ -3488,6 +3554,7 @@ mod tests {
         crate::create_reflex_ivm(
             "wc_view",
             "SELECT grp, SUM(val) AS total FROM wc_src WHERE active = true GROUP BY grp",
+            None,
         );
         let a = Spi::get_one::<pgrx::AnyNumeric>(
             "SELECT total FROM wc_view WHERE grp = 'A'",
@@ -3516,6 +3583,7 @@ mod tests {
         crate::create_reflex_ivm(
             "avg_same_view",
             "SELECT grp, AVG(val) AS avg_val FROM avg_same_src GROUP BY grp",
+            None,
         );
         let avg = Spi::get_one::<pgrx::AnyNumeric>(
             "SELECT avg_val FROM avg_same_view WHERE grp = 'X'",
@@ -3546,6 +3614,7 @@ mod tests {
         let result = crate::create_reflex_ivm(
             "test_schema.sq_view2",
             "SELECT grp, SUM(val) AS total FROM test_schema.sq_src2 GROUP BY grp",
+            None,
         );
         assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
 
@@ -3589,6 +3658,7 @@ mod tests {
         let r1 = crate::create_reflex_ivm(
             "mlc_l1",
             "SELECT region, SUM(amount) AS total, COUNT(*) AS cnt FROM mlc_src GROUP BY region",
+            None,
         );
         assert_eq!(r1, "CREATE REFLEX INCREMENTAL VIEW");
 
@@ -3596,6 +3666,7 @@ mod tests {
         let r2 = crate::create_reflex_ivm(
             "mlc_l2",
             "SELECT region, SUM(total) AS grand_total FROM mlc_l1 GROUP BY region",
+            None,
         );
         assert_eq!(r2, "CREATE REFLEX INCREMENTAL VIEW");
 
@@ -3684,6 +3755,7 @@ mod tests {
         crate::create_reflex_ivm(
             "pt_del_view",
             "SELECT id, region, val FROM pt_del_src",
+            None,
         );
         assert_eq!(
             Spi::get_one::<i64>("SELECT COUNT(*) FROM pt_del_view").expect("q").expect("v"),
@@ -3724,6 +3796,7 @@ mod tests {
         crate::create_reflex_ivm(
             "pt_upd_view",
             "SELECT id, region, val FROM pt_upd_src",
+            None,
         );
 
         // Update a value
@@ -3785,10 +3858,10 @@ mod tests {
         .expect("seed sales");
 
         // Create passthrough JOIN IMV with explicit unique key (id comes from ptj_sales)
-        let result = crate::create_reflex_ivm_with_key(
+        let result = crate::create_reflex_ivm(
             "ptj_view",
             "SELECT s.id, s.product_id, s.amount, p.name FROM ptj_sales s JOIN ptj_products p ON s.product_id = p.id",
-            "id",
+            Some("id"),
         );
         assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
 
@@ -3837,10 +3910,10 @@ mod tests {
         Spi::run("INSERT INTO ptju_products VALUES (1, 'Alpha'), (2, 'Beta')").expect("seed products");
         Spi::run("INSERT INTO ptju_sales (product_id, qty) VALUES (1, 10), (2, 20)").expect("seed sales");
 
-        crate::create_reflex_ivm_with_key(
+        crate::create_reflex_ivm(
             "ptju_view",
             "SELECT s.id, s.qty, p.name FROM ptju_sales s JOIN ptju_products p ON s.product_id = p.id",
-            "id",
+            Some("id"),
         );
 
         // UPDATE the secondary table (product name change)
@@ -3869,6 +3942,7 @@ mod tests {
         crate::create_reflex_ivm(
             "ptjnk_view",
             "SELECT s.id, s.amount, p.name FROM ptjnk_sales s JOIN ptjnk_products p ON s.product_id = p.id",
+            None,
         );
         assert_eq!(
             Spi::get_one::<i64>("SELECT COUNT(*) FROM ptjnk_view").expect("q").expect("v"),
@@ -3902,10 +3976,10 @@ mod tests {
         Spi::run("INSERT INTO ptjko_sales (product_id, amount) VALUES (1, 10), (1, 20), (2, 30)")
             .expect("seed sales");
 
-        crate::create_reflex_ivm_with_key(
+        crate::create_reflex_ivm(
             "ptjko_view",
             "SELECT s.id, s.product_id, s.amount, p.name FROM ptjko_sales s JOIN ptjko_products p ON s.product_id = p.id",
-            "id",
+            Some("id"),
         );
         assert_eq!(
             Spi::get_one::<i64>("SELECT COUNT(*) FROM ptjko_view").expect("q").expect("v"),
@@ -3944,13 +4018,13 @@ mod tests {
         Spi::run("INSERT INTO pt3_sales (product_id, region_id, qty) VALUES (1,1,10), (1,2,20), (2,1,30), (2,2,40)")
             .expect("seed sales");
 
-        crate::create_reflex_ivm_with_key(
+        crate::create_reflex_ivm(
             "pt3_view",
             "SELECT s.id, s.qty, p.name AS product_name, r.name AS region_name \
              FROM pt3_sales s \
              JOIN pt3_products p ON s.product_id = p.id \
              JOIN pt3_regions r ON s.region_id = r.id",
-            "id",
+            Some("id"),
         );
         assert_eq!(
             Spi::get_one::<i64>("SELECT COUNT(*) FROM pt3_view").expect("q").expect("v"),
@@ -4000,11 +4074,11 @@ mod tests {
             "INSERT INTO ptck_facts VALUES (1,1,1,10), (1,2,1,20), (2,1,2,30), (2,2,2,40)",
         ).expect("seed facts");
 
-        crate::create_reflex_ivm_with_key(
+        crate::create_reflex_ivm(
             "ptck_view",
             "SELECT f.product_id, f.region_id, f.val, d.label \
              FROM ptck_facts f JOIN ptck_dims d ON f.dim_id = d.id",
-            "product_id, region_id",
+            Some("product_id, region_id"),
         );
         assert_eq!(
             Spi::get_one::<i64>("SELECT COUNT(*) FROM ptck_view").expect("q").expect("v"),
@@ -4049,11 +4123,11 @@ mod tests {
         Spi::run("INSERT INTO ptak_items (cat_id, price) VALUES (1, 100), (1, 200), (2, 50)")
             .expect("seed items");
 
-        crate::create_reflex_ivm_with_key(
+        crate::create_reflex_ivm(
             "ptak_view",
             "SELECT i.item_id AS id, i.price, c.cat_name AS category \
              FROM ptak_items i JOIN ptak_cats c ON i.cat_id = c.id",
-            "id",
+            Some("id"),
         );
         assert_eq!(
             Spi::get_one::<i64>("SELECT COUNT(*) FROM ptak_view").expect("q").expect("v"),
@@ -4088,10 +4162,10 @@ mod tests {
         Spi::run("INSERT INTO ptjis_products VALUES (1, 'Alpha')").expect("seed products");
         Spi::run("INSERT INTO ptjis_sales (product_id, amount) VALUES (1, 100)").expect("seed sales");
 
-        crate::create_reflex_ivm_with_key(
+        crate::create_reflex_ivm(
             "ptjis_view",
             "SELECT s.id, s.amount, p.name FROM ptjis_sales s JOIN ptjis_products p ON s.product_id = p.id",
-            "id",
+            Some("id"),
         );
         assert_eq!(
             Spi::get_one::<i64>("SELECT COUNT(*) FROM ptjis_view").expect("q").expect("v"),
@@ -4141,12 +4215,14 @@ mod tests {
         crate::create_reflex_ivm(
             "cpta_l1",
             "SELECT id, region, amount FROM cpta_src WHERE active = true",
+            None,
         );
 
         // L2: aggregate on L1 (SUM by region)
         crate::create_reflex_ivm(
             "cpta_l2",
             "SELECT region, SUM(amount) AS total, COUNT(*) AS cnt FROM cpta_l1 GROUP BY region",
+            None,
         );
 
         // Verify initial state
@@ -4233,12 +4309,14 @@ mod tests {
         crate::create_reflex_ivm(
             "catp_l1",
             "SELECT city, SUM(revenue) AS total, COUNT(*) AS cnt FROM catp_src GROUP BY city",
+            None,
         );
 
         // L2: passthrough of L1 (reads all rows from the aggregate target)
         crate::create_reflex_ivm(
             "catp_l2",
             "SELECT city, total, cnt FROM catp_l1",
+            None,
         );
 
         // Verify initial state
@@ -4322,17 +4400,18 @@ mod tests {
         ).expect("seed sales");
 
         // L1: passthrough JOIN (denormalize sales with product category)
-        crate::create_reflex_ivm_with_key(
+        crate::create_reflex_ivm(
             "cpja_l1",
             "SELECT s.id, s.amount, p.category \
              FROM cpja_sales s JOIN cpja_products p ON s.product_id = p.id",
-            "id",
+            Some("id"),
         );
 
         // L2: aggregate on L1 (SUM by category)
         crate::create_reflex_ivm(
             "cpja_l2",
             "SELECT category, SUM(amount) AS total, COUNT(*) AS cnt FROM cpja_l1 GROUP BY category",
+            None,
         );
 
         // Verify initial
@@ -4415,24 +4494,28 @@ mod tests {
         crate::create_reflex_ivm(
             "mmis_agg",
             "SELECT dept, SUM(salary) AS total, COUNT(*) AS cnt FROM mmis_src GROUP BY dept",
+            None,
         );
 
         // IMV2: passthrough — all active employees
         crate::create_reflex_ivm(
             "mmis_active",
             "SELECT id, dept, salary FROM mmis_src WHERE active = true",
+            None,
         );
 
         // IMV3: distinct — unique departments
         crate::create_reflex_ivm(
             "mmis_depts",
             "SELECT DISTINCT dept FROM mmis_src",
+            None,
         );
 
         // IMV4: aggregate — AVG salary globally
         crate::create_reflex_ivm(
             "mmis_avg",
             "SELECT AVG(salary) AS avg_sal FROM mmis_src",
+            None,
         );
 
         // Verify initial state
@@ -4559,6 +4642,7 @@ mod tests {
                 SELECT id, region, val FROM cte_pt_src WHERE active = true
             )
             SELECT region, SUM(val) AS total FROM active_orders GROUP BY region",
+            None,
         );
         assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
 
@@ -4611,6 +4695,7 @@ mod tests {
         crate::create_reflex_ivm(
             "hv_view",
             "SELECT region, SUM(amount) AS total FROM hv_src GROUP BY region HAVING SUM(amount) > 200",
+            None,
         );
 
         // US = 1100, JP = 2000 → both > 200. EU = 150 → excluded.
@@ -4640,6 +4725,7 @@ mod tests {
         crate::create_reflex_ivm(
             "hvd_view",
             "SELECT grp, SUM(val) AS total FROM hvd_src GROUP BY grp HAVING SUM(val) > 50",
+            None,
         );
 
         // Initially: A=80 passes, B=40 fails
@@ -4680,6 +4766,7 @@ mod tests {
         crate::create_reflex_ivm(
             "hvn_view",
             "SELECT grp, SUM(val) AS total FROM hvn_src GROUP BY grp HAVING COUNT(*) > 2",
+            None,
         );
 
         // A has 3 rows → passes. B has 2 rows → fails.
@@ -4712,6 +4799,7 @@ mod tests {
         let result = crate::create_reflex_ivm(
             "mv_imv",
             "SELECT grp, SUM(total) AS grand_total FROM mv_src GROUP BY grp",
+            None,
         );
         assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
 
@@ -4758,10 +4846,12 @@ mod tests {
         crate::create_reflex_ivm(
             "rdep_v1",
             "SELECT grp, SUM(val) AS total FROM rdep_src GROUP BY grp",
+            None,
         );
         crate::create_reflex_ivm(
             "rdep_v2",
             "SELECT grp, COUNT(*) AS cnt FROM rdep_src GROUP BY grp",
+            None,
         );
 
         // Corrupt both by directly modifying intermediate tables
@@ -4807,6 +4897,7 @@ mod tests {
         crate::create_reflex_ivm(
             "bo_view",
             "SELECT grp, BOOL_OR(flag) AS any_flag FROM bo_src GROUP BY grp",
+            None,
         );
 
         // Initial: A=false (both false), B=true
@@ -4870,6 +4961,7 @@ mod tests {
             "SELECT o.region, SUM(o.amount) AS total, COUNT(*) AS cnt \
              FROM lj_orders o LEFT JOIN lj_products p ON o.product_id = p.id \
              GROUP BY o.region",
+            None,
         );
 
         // Verify initial: US=100+50+75=225, EU=200
@@ -4921,6 +5013,7 @@ mod tests {
             "rj_view",
             "SELECT i.id AS item_id, i.val, c.name AS cat_name \
              FROM rj_items i RIGHT JOIN rj_cats c ON i.cat_id = c.id",
+            None,
         );
 
         // All 3 cats should appear (A has 2 items, B and C have NULL items)
@@ -4961,6 +5054,7 @@ mod tests {
         crate::create_reflex_ivm(
             "cast_view",
             "SELECT grp, SUM(val)::BIGINT AS total FROM cast_src GROUP BY grp",
+            None,
         );
 
         // Verify initial values
@@ -5020,6 +5114,7 @@ mod tests {
         crate::create_reflex_ivm(
             "sq_view",
             "SELECT id, val FROM (SELECT id, val FROM sq_src WHERE active = true) AS sub",
+            None,
         );
 
         let count = Spi::get_one::<i64>("SELECT COUNT(*) FROM sq_view")
@@ -5072,6 +5167,7 @@ mod tests {
              FROM sqr_products p \
              JOIN (SELECT product_id, SUM(qty) AS total_qty FROM sqr_orders GROUP BY product_id) AS sub \
              ON p.id = sub.product_id",
+            None,
         );
         assert!(
             result.starts_with("ERROR:"),
@@ -5095,6 +5191,7 @@ mod tests {
         crate::create_reflex_ivm(
             "sqo_view",
             "SELECT id, val FROM (SELECT id, val FROM sqo_src WHERE val > 0) AS sub",
+            None,
         );
 
         // Initial: only positive values

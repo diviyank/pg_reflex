@@ -15,6 +15,7 @@
 - Incremental passthrough DELETE/UPDATE (O(delta) row-matching instead of O(N) full refresh)
 - Multi-level cascade confirmed and tested (works to arbitrary depth)
 - CTE passthrough support (passthrough CTEs become sub-IMV tables)
+- `create_reflex_ivm_if_not_exists(name, sql)` / `create_reflex_ivm_if_not_exists(name, sql, unique_columns)` — idempotent IMV creation that returns a notice instead of an error if the view already exists
 - `install.sh` wrapper script — copies migration files alongside `cargo pgrx install`
 - Subquery warning — subqueries in FROM now emit an informational warning (like materialized views)
 

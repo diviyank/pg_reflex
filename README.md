@@ -354,6 +354,21 @@ SELECT create_reflex_ivm('active_orders',
 
 If omitted, pg_reflex auto-detects primary keys from the source tables.
 
+### `create_reflex_ivm_if_not_exists(view_name TEXT, sql TEXT [, unique_columns TEXT]) -> TEXT`
+
+Same as `create_reflex_ivm`, but returns `'REFLEX INCREMENTAL VIEW ALREADY EXISTS (skipped)'` instead of an error if the view already exists. Useful for idempotent migration scripts and setup routines that may run more than once.
+
+```sql
+-- Safe to run multiple times
+SELECT create_reflex_ivm_if_not_exists('sales_by_region',
+    'SELECT region, SUM(amount) AS total FROM sales GROUP BY region');
+
+-- With explicit unique key
+SELECT create_reflex_ivm_if_not_exists('active_orders',
+    'SELECT o.id, o.amount FROM orders o JOIN products p ON o.product_id = p.id',
+    'id');
+```
+
 ### `drop_reflex_ivm(view_name TEXT) -> TEXT`
 
 Drops an IMV and all its artifacts (target table, intermediate table, triggers, metadata). Refuses if the IMV has child dependencies.
