@@ -1,4 +1,8 @@
 use pgrx::prelude::*;
+use pgrx::spi::Spi;
+use pgrx::PgBuiltInOids;
+use pgrx::datum::DatumWithOid;
+use pgrx::pg_sys::panic::ErrorReportable;
 
 use crate::aggregation::AggregationPlan;
 use crate::query_decomposer::{intermediate_table_name, normalized_column_name, quote_identifier, replace_identifier, split_qualified_name};
@@ -497,6 +501,168 @@ pub fn reflex_build_truncate_sql(view_name: &str) -> String {
     ));
 
     stmts.join("\n--<<REFLEX_SEP>>--\n")
+}
+
+/// Flushes all accumulated deferred deltas for a given source table.
+///
+/// Called by the deferred constraint trigger at COMMIT time.
+/// Reads from the staging table (__reflex_delta_<source>), applies deltas
+/// to each DEFERRED IMV, then cleans up staging and pending rows.
+#[pg_extern]
+pub fn reflex_flush_deferred(source_table: &str) -> String {
+    let safe_src = source_table.replace('.', "_").replace('"', "");
+    let delta_tbl = format!("__reflex_delta_{}", safe_src);
+
+    // Read all DEFERRED IMVs that depend on this source
+    let imvs: Vec<(String, String, String, String)> = Spi::connect(|client| {
+        let args = [unsafe {
+            DatumWithOid::new(
+                source_table.to_string(),
+                PgBuiltInOids::TEXTOID.oid().value(),
+            )
+        }];
+        client
+            .select(
+                "SELECT name, base_query, end_query, aggregations::text AS aggregations \
+                 FROM public.__reflex_ivm_reference \
+                 WHERE $1 = ANY(depends_on) AND enabled = TRUE \
+                   AND COALESCE(refresh_mode, 'IMMEDIATE') = 'DEFERRED' \
+                 ORDER BY graph_depth",
+                None,
+                &args,
+            )
+            .unwrap_or_report()
+            .map(|row| {
+                (
+                    row.get_by_name::<&str, _>("name").unwrap_or(None).unwrap_or("").to_string(),
+                    row.get_by_name::<&str, _>("base_query").unwrap_or(None).unwrap_or("").to_string(),
+                    row.get_by_name::<&str, _>("end_query").unwrap_or(None).unwrap_or("").to_string(),
+                    row.get_by_name::<&str, _>("aggregations").unwrap_or(None).unwrap_or("{}").to_string(),
+                )
+            })
+            .collect()
+    });
+
+    if imvs.is_empty() {
+        return "NO DEFERRED IMVS".to_string();
+    }
+
+    let mut total_processed = 0usize;
+
+    Spi::connect_mut(|client| {
+        // Check if staging table has any rows
+        let has_rows = client
+            .select(
+                &format!("SELECT EXISTS(SELECT 1 FROM {} LIMIT 1) AS has", delta_tbl),
+                None,
+                &[],
+            )
+            .unwrap_or_report()
+            .next()
+            .map(|row| row.get_by_name::<bool, _>("has").unwrap_or(None).unwrap_or(false))
+            .unwrap_or(false);
+
+        if !has_rows {
+            // No deltas to process — clean up pending rows
+            client
+                .update(
+                    &format!(
+                        "DELETE FROM public.__reflex_deferred_pending WHERE source_table = '{}'",
+                        source_table.replace("'", "''")
+                    ),
+                    None,
+                    &[],
+                )
+                .unwrap_or_report();
+            return;
+        }
+
+        for (imv_name, base_query, end_query, agg_json) in &imvs {
+            // Acquire advisory lock for this IMV
+            client
+                .update(
+                    &format!("SELECT pg_advisory_xact_lock(hashtext('{}'))", imv_name.replace("'", "''")),
+                    None,
+                    &[],
+                )
+                .unwrap_or_report();
+
+            // Process INSERT deltas (op = 'I')
+            let ins_base = base_query.replace(
+                source_table,
+                &format!("(SELECT * FROM {} WHERE __reflex_op = 'I') AS __dt", delta_tbl),
+            );
+            let ins_sql = reflex_build_delta_sql(imv_name, source_table, "INSERT", &ins_base, end_query, agg_json);
+            if !ins_sql.is_empty() {
+                for stmt in ins_sql.split("\n--<<REFLEX_SEP>>--\n") {
+                    if !stmt.is_empty() {
+                        client.update(stmt, None, &[]).unwrap_or_report();
+                    }
+                }
+                total_processed += 1;
+            }
+
+            // Process DELETE deltas (op = 'D')
+            let del_base = base_query.replace(
+                source_table,
+                &format!("(SELECT * FROM {} WHERE __reflex_op = 'D') AS __dt", delta_tbl),
+            );
+            let del_sql = reflex_build_delta_sql(imv_name, source_table, "DELETE", &del_base, end_query, agg_json);
+            if !del_sql.is_empty() {
+                for stmt in del_sql.split("\n--<<REFLEX_SEP>>--\n") {
+                    if !stmt.is_empty() {
+                        client.update(stmt, None, &[]).unwrap_or_report();
+                    }
+                }
+                total_processed += 1;
+            }
+
+            // Process UPDATE deltas: U_OLD as DELETE, U_NEW as INSERT
+            let upd_old_base = base_query.replace(
+                source_table,
+                &format!("(SELECT * FROM {} WHERE __reflex_op = 'U_OLD') AS __dt", delta_tbl),
+            );
+            let upd_old_sql = reflex_build_delta_sql(imv_name, source_table, "DELETE", &upd_old_base, end_query, agg_json);
+            if !upd_old_sql.is_empty() {
+                for stmt in upd_old_sql.split("\n--<<REFLEX_SEP>>--\n") {
+                    if !stmt.is_empty() {
+                        client.update(stmt, None, &[]).unwrap_or_report();
+                    }
+                }
+            }
+
+            let upd_new_base = base_query.replace(
+                source_table,
+                &format!("(SELECT * FROM {} WHERE __reflex_op = 'U_NEW') AS __dt", delta_tbl),
+            );
+            let upd_new_sql = reflex_build_delta_sql(imv_name, source_table, "INSERT", &upd_new_base, end_query, agg_json);
+            if !upd_new_sql.is_empty() {
+                for stmt in upd_new_sql.split("\n--<<REFLEX_SEP>>--\n") {
+                    if !stmt.is_empty() {
+                        client.update(stmt, None, &[]).unwrap_or_report();
+                    }
+                }
+                total_processed += 1;
+            }
+        }
+
+        // Clean up: truncate staging table and remove pending rows
+        client
+            .update(&format!("TRUNCATE {}", delta_tbl), None, &[])
+            .unwrap_or_report();
+        client
+            .update(
+                &format!(
+                    "DELETE FROM public.__reflex_deferred_pending WHERE source_table = '{}'",
+                    source_table.replace("'", "''")
+                ),
+                None,
+                &[],
+            )
+            .unwrap_or_report();
+    });
+
+    format!("FLUSHED {} DEFERRED OPERATIONS", total_processed)
 }
 
 #[cfg(test)]

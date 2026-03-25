@@ -1,7 +1,8 @@
 use serde::Serialize;
 use sqlparser::ast::{
     Expr, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, Join, JoinConstraint,
-    JoinOperator, Query, SelectItem, SetExpr, Statement, TableFactor, Visit, Visitor,
+    JoinOperator, Query, SelectItem, SetExpr, SetOperator, SetQuantifier, Statement, TableFactor,
+    Visit, Visitor,
 };
 use std::ops::ControlFlow;
 
@@ -47,6 +48,8 @@ pub struct SelectColumn {
     pub is_passthrough: bool,
     /// Cast type from wrapping expression (e.g., "BIGINT" from SUM(x)::BIGINT)
     pub cast_type: Option<String>,
+    /// True if this is a window function expression (has OVER clause)
+    pub is_window: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -61,6 +64,18 @@ pub struct JoinInfo {
 pub struct CteInfo {
     pub alias: String,
     pub query_sql: String,
+}
+
+/// Information about a set operation (UNION, UNION ALL, INTERSECT, EXCEPT).
+#[derive(Debug, Clone)]
+pub struct SetOperationInfo {
+    /// The set operator (Union, Intersect, Except)
+    pub op: SetOperator,
+    /// Whether ALL was specified (true = UNION ALL, false = UNION)
+    pub is_all: bool,
+    /// SQL strings for each operand (flattened from the binary tree).
+    /// For `A UNION ALL B UNION ALL C`, this contains [A_sql, B_sql, C_sql].
+    pub operand_sqls: Vec<String>,
 }
 
 #[derive(Debug, Default)]
@@ -80,11 +95,13 @@ pub struct SqlAnalysis {
     pub joins: Vec<JoinInfo>,
     /// Table alias → real table name (e.g., "s" → "sales_simulation")
     pub table_aliases: std::collections::HashMap<String, String>,
+    /// Set operation info if the query uses UNION/INTERSECT/EXCEPT
+    pub set_operation: Option<SetOperationInfo>,
 }
 
 impl SqlAnalysis {
     pub fn has_unsupported_features(&self) -> bool {
-        self.has_recursive_cte || self.has_window_function || self.has_limit || self.has_order_by
+        self.has_recursive_cte || self.has_limit || self.has_order_by
     }
 }
 
@@ -204,6 +221,19 @@ fn extract_select_column(expr: &Expr, alias: Option<String>) -> SelectColumn {
     };
 
     if let Expr::Function(f) = inner {
+        // Check if this is a window function (has OVER clause)
+        if f.over.is_some() {
+            return SelectColumn {
+                expr_sql: expr.to_string(),
+                alias,
+                aggregate: None,
+                aggregate_arg: None,
+                is_passthrough: false,
+                cast_type,
+                is_window: true,
+            };
+        }
+
         let func_name = f.name.to_string();
         if let Some(mut kind) = detect_aggregate(&func_name) {
             // Check for COUNT(*)
@@ -222,6 +252,7 @@ fn extract_select_column(expr: &Expr, alias: Option<String>) -> SelectColumn {
                 aggregate_arg,
                 is_passthrough: false,
                 cast_type,
+                is_window: false,
             };
         }
     }
@@ -232,6 +263,7 @@ fn extract_select_column(expr: &Expr, alias: Option<String>) -> SelectColumn {
         aggregate_arg: None,
         is_passthrough: true,
         cast_type: None,
+        is_window: false,
     }
 }
 
@@ -294,6 +326,38 @@ fn extract_join_info(join: &Join) -> JoinInfo {
     }
 }
 
+/// Recursively flatten a binary tree of set operations into a list of operand SQL strings.
+/// For `(A UNION ALL B) UNION ALL C` with the same operator and quantifier, produces [A, B, C].
+/// Mixed operators or quantifiers stop the flattening and wrap the subtree as a single operand.
+fn flatten_set_operands(
+    top_op: &SetOperator,
+    top_is_all: bool,
+    left: &SetExpr,
+    right: &SetExpr,
+    out: &mut Vec<String>,
+) {
+    // Recurse into left if it's the same operator+quantifier
+    match left {
+        SetExpr::SetOperation { op, set_quantifier, left: ll, right: lr }
+            if std::mem::discriminant(op) == std::mem::discriminant(top_op)
+                && matches!(set_quantifier, SetQuantifier::All) == top_is_all =>
+        {
+            flatten_set_operands(top_op, top_is_all, ll, lr, out);
+        }
+        other => out.push(other.to_string()),
+    }
+    // Right operand is always a leaf (SQL is left-associative for set ops)
+    match right {
+        SetExpr::SetOperation { op, set_quantifier, left: rl, right: rr }
+            if std::mem::discriminant(op) == std::mem::discriminant(top_op)
+                && matches!(set_quantifier, SetQuantifier::All) == top_is_all =>
+        {
+            flatten_set_operands(top_op, top_is_all, rl, rr, out);
+        }
+        other => out.push(other.to_string()),
+    }
+}
+
 pub fn analyze(statements: &[Statement]) -> Result<SqlAnalysis, SqlAnalysisError> {
     if statements.len() != 1 {
         return Err(SqlAnalysisError::MultipleQueries(statements.len()));
@@ -312,7 +376,19 @@ pub fn analyze(statements: &[Statement]) -> Result<SqlAnalysis, SqlAnalysisError
     };
     let _ = query.visit(&mut visitor);
 
-    // Phase 2: Direct extraction from the top-level Select
+    // Phase 2: Handle set operations (UNION/INTERSECT/EXCEPT) or direct SELECT
+    if let SetExpr::SetOperation { op, set_quantifier, left, right } = query.body.as_ref() {
+        let is_all = matches!(set_quantifier, SetQuantifier::All);
+        let mut operands = Vec::new();
+        flatten_set_operands(op, is_all, left, right, &mut operands);
+        analysis.set_operation = Some(SetOperationInfo {
+            op: op.clone(),
+            is_all,
+            operand_sqls: operands,
+        });
+        return Ok(analysis);
+    }
+
     let select = match query.body.as_ref() {
         SetExpr::Select(s) => s,
         _ => return Err(SqlAnalysisError::NotASelectQuery),
@@ -342,6 +418,7 @@ pub fn analyze(statements: &[Statement]) -> Result<SqlAnalysis, SqlAnalysisError
                     aggregate_arg: None,
                     is_passthrough: true,
                     cast_type: None,
+                    is_window: false,
                 });
             }
             SelectItem::QualifiedWildcard(kind, _) => {
@@ -352,6 +429,7 @@ pub fn analyze(statements: &[Statement]) -> Result<SqlAnalysis, SqlAnalysisError
                     aggregate_arg: None,
                     is_passthrough: true,
                     cast_type: None,
+                    is_window: false,
                 });
             }
         }
@@ -524,10 +602,13 @@ mod tests {
     }
 
     #[test]
-    fn test_unsupported_window() {
+    fn test_window_detected() {
         let a = parse_and_analyze("SELECT id, SUM(amount) OVER (PARTITION BY city) FROM orders");
-        assert!(a.has_unsupported_features());
+        assert!(!a.has_unsupported_features(), "Window functions should no longer be unsupported");
         assert!(a.has_window_function);
+        // The window column should be flagged
+        let win_col = a.select_columns.iter().find(|c| c.is_window);
+        assert!(win_col.is_some(), "Should detect window function in SELECT");
     }
 
     #[test]

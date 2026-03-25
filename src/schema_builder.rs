@@ -3,13 +3,17 @@ use std::collections::HashMap;
 use crate::aggregation::AggregationPlan;
 use crate::query_decomposer::{intermediate_table_name, normalized_column_name, quote_identifier, split_qualified_name};
 
-/// Build the DDL for the intermediate (UNLOGGED) table.
+/// Build the DDL for the intermediate table.
+///
+/// When `logged` is true, creates a regular (WAL-logged) table for crash safety.
+/// When false (default), creates an UNLOGGED table for maximum write performance.
 ///
 /// Returns None if no intermediate table is needed (no aggregation, no group by, no distinct).
 pub fn build_intermediate_table_ddl(
     view_name: &str,
     plan: &AggregationPlan,
     column_types: &HashMap<String, String>,
+    logged: bool,
 ) -> Option<String> {
     // Need at least one of: group by, aggregation, or distinct
     if plan.group_by_columns.is_empty()
@@ -64,17 +68,22 @@ pub fn build_intermediate_table_ddl(
     // the delta query uses GROUP BY (unique output), and advisory locks prevent
     // concurrent MERGEs on the same IMV.
 
+    let create_prefix = if logged { "CREATE TABLE" } else { "CREATE UNLOGGED TABLE" };
     Some(format!(
-        "CREATE UNLOGGED TABLE IF NOT EXISTS {} (\n{}\n)",
-        table_name, columns_sql
+        "{} IF NOT EXISTS {} (\n{}\n)",
+        create_prefix, table_name, columns_sql
     ))
 }
 
 /// Build the DDL for the target (materialized view result) table.
+///
+/// When `logged` is true, creates a regular (WAL-logged) table for crash safety.
+/// When false (default), creates an UNLOGGED table for maximum write performance.
 pub fn build_target_table_ddl(
     view_name: &str,
     plan: &AggregationPlan,
     column_types: &HashMap<String, String>,
+    logged: bool,
 ) -> String {
     let mut columns: Vec<String> = Vec::new();
 
@@ -110,9 +119,10 @@ pub fn build_target_table_ddl(
 
     let columns_sql = columns.join(",\n");
 
+    let create_prefix = if logged { "CREATE TABLE" } else { "CREATE UNLOGGED TABLE" };
     format!(
-        "CREATE UNLOGGED TABLE IF NOT EXISTS {} (\n{}\n)",
-        quote_identifier(view_name), columns_sql
+        "{} IF NOT EXISTS {} (\n{}\n)",
+        create_prefix, quote_identifier(view_name), columns_sql
     )
 }
 
@@ -288,6 +298,208 @@ pub fn build_trigger_ddls(source_table: &str) -> Vec<String> {
     vec![ins_ddl, del_ddl, upd_ddl, trunc_ddl]
 }
 
+/// Build deferred-mode trigger DDL statements for a source table.
+///
+/// In deferred mode, the statement-level trigger captures delta rows into a staging
+/// table and inserts a flag into the deferred-pending table. A constraint trigger
+/// (DEFERRABLE INITIALLY DEFERRED) fires at COMMIT to flush all accumulated deltas.
+///
+/// The immediate triggers still handle IMMEDIATE-mode IMVs on the same source
+/// (mixed mode: some IMVs IMMEDIATE, some DEFERRED).
+pub fn build_deferred_trigger_ddls(source_table: &str) -> Vec<String> {
+    let safe_source = source_table.replace('.', "_");
+    let ref_new = format!("__reflex_new_{}", safe_source);
+    let ref_old = format!("__reflex_old_{}", safe_source);
+    let delta_tbl = format!("__reflex_delta_{}", safe_source);
+
+    // Mixed-mode body: process IMMEDIATE IMVs inline, stage deltas for DEFERRED IMVs.
+    let body_core = format!(
+        "DECLARE _rec RECORD; _sql TEXT; _stmt TEXT; _has_deferred BOOLEAN := FALSE; \
+         BEGIN \
+           FOR _rec IN \
+             SELECT name, base_query, end_query, aggregations::text AS aggregations, \
+                    COALESCE(refresh_mode, 'IMMEDIATE') AS refresh_mode \
+             FROM public.__reflex_ivm_reference \
+             WHERE '{source_table}' = ANY(depends_on) AND enabled = TRUE \
+             ORDER BY graph_depth \
+           LOOP \
+             IF _rec.refresh_mode = 'IMMEDIATE' THEN \
+               PERFORM pg_advisory_xact_lock(hashtext(_rec.name)); \
+               _sql := reflex_build_delta_sql(_rec.name, '{source_table}', '{{op}}', _rec.base_query, _rec.end_query, _rec.aggregations); \
+               IF _sql <> '' THEN \
+                 FOREACH _stmt IN ARRAY string_to_array(_sql, E'\\n--<<REFLEX_SEP>>--\\n') LOOP \
+                   IF _stmt <> '' THEN EXECUTE _stmt; END IF; \
+                 END LOOP; \
+               END IF; \
+             ELSE \
+               _has_deferred := TRUE; \
+             END IF; \
+           END LOOP; \
+           IF _has_deferred THEN \
+             INSERT INTO {delta_tbl} SELECT '{{op_code}}', * FROM \"{{ref_tbl}}\"; \
+             INSERT INTO public.__reflex_deferred_pending (source_table, operation) \
+               VALUES ('{source_table}', '{{op}}'); \
+           END IF; \
+           RETURN NULL; \
+         END;"
+    );
+
+    // INSERT
+    let ins_fn = format!("__reflex_ins_trigger_on_{}", safe_source);
+    let ins_trig = format!("__reflex_trigger_ins_on_{}", safe_source);
+    let ins_body = body_core
+        .replace("{op}", "INSERT")
+        .replace("{op_code}", "I")
+        .replace("{ref_tbl}", &ref_new);
+    let ins_ddl = format!(
+        "CREATE OR REPLACE FUNCTION {ins_fn}() RETURNS TRIGGER AS $fn$ {ins_body} $fn$ LANGUAGE plpgsql;\n\
+         CREATE OR REPLACE TRIGGER \"{ins_trig}\" \
+         AFTER INSERT ON {source_table} \
+         REFERENCING NEW TABLE AS \"{ref_new}\" \
+         FOR EACH STATEMENT EXECUTE FUNCTION {ins_fn}()"
+    );
+
+    // DELETE
+    let del_fn = format!("__reflex_del_trigger_on_{}", safe_source);
+    let del_trig = format!("__reflex_trigger_del_on_{}", safe_source);
+    let del_body = body_core
+        .replace("{op}", "DELETE")
+        .replace("{op_code}", "D")
+        .replace("{ref_tbl}", &ref_old);
+    let del_ddl = format!(
+        "CREATE OR REPLACE FUNCTION {del_fn}() RETURNS TRIGGER AS $fn$ {del_body} $fn$ LANGUAGE plpgsql;\n\
+         CREATE OR REPLACE TRIGGER \"{del_trig}\" \
+         AFTER DELETE ON {source_table} \
+         REFERENCING OLD TABLE AS \"{ref_old}\" \
+         FOR EACH STATEMENT EXECUTE FUNCTION {del_fn}()"
+    );
+
+    // UPDATE — capture both old and new rows
+    let upd_fn = format!("__reflex_upd_trigger_on_{}", safe_source);
+    let upd_trig = format!("__reflex_trigger_upd_on_{}", safe_source);
+    let upd_body = format!(
+        "DECLARE _rec RECORD; _sql TEXT; _stmt TEXT; _has_deferred BOOLEAN := FALSE; \
+         BEGIN \
+           FOR _rec IN \
+             SELECT name, base_query, end_query, aggregations::text AS aggregations, \
+                    COALESCE(refresh_mode, 'IMMEDIATE') AS refresh_mode \
+             FROM public.__reflex_ivm_reference \
+             WHERE '{source_table}' = ANY(depends_on) AND enabled = TRUE \
+             ORDER BY graph_depth \
+           LOOP \
+             IF _rec.refresh_mode = 'IMMEDIATE' THEN \
+               PERFORM pg_advisory_xact_lock(hashtext(_rec.name)); \
+               _sql := reflex_build_delta_sql(_rec.name, '{source_table}', 'UPDATE', _rec.base_query, _rec.end_query, _rec.aggregations); \
+               IF _sql <> '' THEN \
+                 FOREACH _stmt IN ARRAY string_to_array(_sql, E'\\n--<<REFLEX_SEP>>--\\n') LOOP \
+                   IF _stmt <> '' THEN EXECUTE _stmt; END IF; \
+                 END LOOP; \
+               END IF; \
+             ELSE \
+               _has_deferred := TRUE; \
+             END IF; \
+           END LOOP; \
+           IF _has_deferred THEN \
+             INSERT INTO {delta_tbl} SELECT 'U_OLD', * FROM \"{ref_old}\"; \
+             INSERT INTO {delta_tbl} SELECT 'U_NEW', * FROM \"{ref_new}\"; \
+             INSERT INTO public.__reflex_deferred_pending (source_table, operation) \
+               VALUES ('{source_table}', 'UPDATE'); \
+           END IF; \
+           RETURN NULL; \
+         END;"
+    );
+    let upd_ddl = format!(
+        "CREATE OR REPLACE FUNCTION {upd_fn}() RETURNS TRIGGER AS $fn$ {upd_body} $fn$ LANGUAGE plpgsql;\n\
+         CREATE OR REPLACE TRIGGER \"{upd_trig}\" \
+         AFTER UPDATE ON {source_table} \
+         REFERENCING NEW TABLE AS \"{ref_new}\" OLD TABLE AS \"{ref_old}\" \
+         FOR EACH STATEMENT EXECUTE FUNCTION {upd_fn}()"
+    );
+
+    // TRUNCATE — same as immediate (no deferred staging for truncate)
+    let trunc_fn = format!("__reflex_trunc_trigger_on_{}", safe_source);
+    let trunc_trig = format!("__reflex_trigger_trunc_on_{}", safe_source);
+    let trunc_body = format!(
+        "DECLARE _rec RECORD; _stmts TEXT; _stmt TEXT; \
+         BEGIN \
+           FOR _rec IN \
+             SELECT name \
+             FROM public.__reflex_ivm_reference \
+             WHERE '{source_table}' = ANY(depends_on) AND enabled = TRUE \
+             ORDER BY graph_depth \
+           LOOP \
+             PERFORM pg_advisory_xact_lock(hashtext(_rec.name)); \
+             _stmts := reflex_build_truncate_sql(_rec.name); \
+             IF _stmts <> '' THEN \
+               FOREACH _stmt IN ARRAY string_to_array(_stmts, E'\\n--<<REFLEX_SEP>>--\\n') LOOP \
+                 IF _stmt <> '' THEN EXECUTE _stmt; END IF; \
+               END LOOP; \
+             END IF; \
+           END LOOP; \
+           TRUNCATE {delta_tbl}; \
+           DELETE FROM public.__reflex_deferred_pending WHERE source_table = '{source_table}'; \
+           RETURN NULL; \
+         END;"
+    );
+    let trunc_ddl = format!(
+        "CREATE OR REPLACE FUNCTION {trunc_fn}() RETURNS TRIGGER AS $fn$ {trunc_body} $fn$ LANGUAGE plpgsql;\n\
+         CREATE OR REPLACE TRIGGER \"{trunc_trig}\" \
+         AFTER TRUNCATE ON {source_table} \
+         FOR EACH STATEMENT EXECUTE FUNCTION {trunc_fn}()"
+    );
+
+    vec![ins_ddl, del_ddl, upd_ddl, trunc_ddl]
+}
+
+/// Build DDL for the deferred-pending table and its constraint trigger.
+///
+/// The constraint trigger fires at COMMIT time and processes all accumulated
+/// staging deltas for each source table.
+pub fn build_deferred_flush_ddl() -> Vec<String> {
+    vec![
+        // Pending queue table
+        "CREATE TABLE IF NOT EXISTS public.__reflex_deferred_pending (\
+            id BIGSERIAL, \
+            source_table TEXT NOT NULL, \
+            operation TEXT NOT NULL, \
+            batch_ts TIMESTAMPTZ DEFAULT now()\
+         )".to_string(),
+        // Constraint trigger function: flushes all pending deltas at COMMIT
+        "CREATE OR REPLACE FUNCTION __reflex_deferred_flush_fn() RETURNS TRIGGER AS $fn$ \
+         DECLARE _src RECORD; \
+         BEGIN \
+           FOR _src IN \
+             SELECT DISTINCT source_table FROM public.__reflex_deferred_pending \
+           LOOP \
+             PERFORM reflex_flush_deferred(_src.source_table); \
+           END LOOP; \
+           RETURN NULL; \
+         END; \
+         $fn$ LANGUAGE plpgsql".to_string(),
+        // Constraint trigger — fires at COMMIT for any INSERT into the pending table
+        "CREATE CONSTRAINT TRIGGER __reflex_deferred_flush_trigger \
+         AFTER INSERT ON public.__reflex_deferred_pending \
+         DEFERRABLE INITIALLY DEFERRED \
+         FOR EACH ROW EXECUTE FUNCTION __reflex_deferred_flush_fn()".to_string(),
+    ]
+}
+
+/// Build DDL for a staging (delta) table that captures transition rows in deferred mode.
+///
+/// The staging table mirrors the source table's columns plus a `__reflex_op` column
+/// to identify the operation type (I=insert, D=delete, U_OLD=update old, U_NEW=update new).
+pub fn build_staging_table_ddl(source_table: &str) -> String {
+    let safe_source = source_table.replace('.', "_");
+    let delta_tbl = format!("__reflex_delta_{}", safe_source);
+    format!(
+        "CREATE UNLOGGED TABLE IF NOT EXISTS {} (\
+            __reflex_op TEXT NOT NULL, \
+            LIKE {} INCLUDING DEFAULTS\
+         )",
+        delta_tbl, source_table
+    )
+}
+
 /// Resolve a column's PostgreSQL type from the catalog lookup map.
 ///
 /// The map keys can be either "table.column" or just "column".
@@ -372,7 +584,7 @@ mod tests {
     fn test_intermediate_table_ddl() {
         let plan = sample_plan();
         let types = sample_types();
-        let ddl = build_intermediate_table_ddl("test_view", &plan, &types).unwrap();
+        let ddl = build_intermediate_table_ddl("test_view", &plan, &types, false).unwrap();
         assert!(ddl.contains("CREATE UNLOGGED TABLE"));
         assert!(ddl.contains("__reflex_intermediate_test_view"));
         assert!(ddl.contains("\"city\" TEXT"));
@@ -384,15 +596,33 @@ mod tests {
     }
 
     #[test]
+    fn test_intermediate_table_ddl_logged() {
+        let plan = sample_plan();
+        let types = sample_types();
+        let ddl = build_intermediate_table_ddl("test_view", &plan, &types, true).unwrap();
+        assert!(ddl.contains("CREATE TABLE"));
+        assert!(!ddl.contains("UNLOGGED"));
+    }
+
+    #[test]
     fn test_target_table_ddl() {
         let plan = sample_plan();
         let types = sample_types();
-        let ddl = build_target_table_ddl("test_view", &plan, &types);
+        let ddl = build_target_table_ddl("test_view", &plan, &types, false);
         assert!(ddl.contains("CREATE UNLOGGED TABLE"));
         assert!(ddl.contains("\"test_view\""));
         assert!(ddl.contains("\"city\" TEXT"));
         assert!(ddl.contains("\"total\" NUMERIC"));
         assert!(ddl.contains("\"cnt\" BIGINT"));
+    }
+
+    #[test]
+    fn test_target_table_ddl_logged() {
+        let plan = sample_plan();
+        let types = sample_types();
+        let ddl = build_target_table_ddl("test_view", &plan, &types, true);
+        assert!(ddl.contains("CREATE TABLE"));
+        assert!(!ddl.contains("UNLOGGED"));
     }
 
     #[test]
@@ -461,7 +691,7 @@ mod tests {
             having_clause: None,
         };
         let types = HashMap::new();
-        assert!(build_intermediate_table_ddl("test_view", &plan, &types).is_none());
+        assert!(build_intermediate_table_ddl("test_view", &plan, &types, false).is_none());
     }
 
     #[test]

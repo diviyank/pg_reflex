@@ -10,6 +10,7 @@ mod query_decomposer;
 mod schema_builder;
 mod sql_analyzer;
 mod trigger;
+mod window;
 
 use aggregation::plan_aggregation;
 use query_decomposer::{
@@ -18,6 +19,7 @@ use query_decomposer::{
 };
 use schema_builder::{
     build_indexes_ddl, build_intermediate_table_ddl, build_target_table_ddl, build_trigger_ddls,
+    build_deferred_trigger_ddls, build_deferred_flush_ddl, build_staging_table_ddl,
 };
 use sql_analyzer::{analyze, SqlAnalysisError};
 
@@ -42,7 +44,9 @@ extension_sql!(
         index_columns TEXT[],
         unique_columns TEXT[],
         enabled BOOLEAN DEFAULT TRUE,
-        last_update_date TIMESTAMP
+        last_update_date TIMESTAMP,
+        storage_mode TEXT DEFAULT 'UNLOGGED',
+        refresh_mode TEXT DEFAULT 'IMMEDIATE'
     );
 
     -- Index on name for fast lookups
@@ -75,16 +79,38 @@ fn validate_view_name(name: &str) -> Result<(), &'static str> {
 }
 
 #[pg_extern]
-fn create_reflex_ivm(view_name: &str, sql: &str, unique_columns: default!(Option<&str>, "NULL")) -> &'static str {
-    create_reflex_ivm_impl(view_name, sql, unique_columns.unwrap_or(""), false)
+fn create_reflex_ivm(
+    view_name: &str,
+    sql: &str,
+    unique_columns: default!(Option<&str>, "NULL"),
+    storage: default!(Option<&str>, "'UNLOGGED'"),
+    mode: default!(Option<&str>, "'IMMEDIATE'"),
+) -> &'static str {
+    create_reflex_ivm_impl(view_name, sql, unique_columns.unwrap_or(""), false, storage.unwrap_or("UNLOGGED"), mode.unwrap_or("IMMEDIATE"))
 }
 
 #[pg_extern]
-fn create_reflex_ivm_if_not_exists(view_name: &str, sql: &str, unique_columns: default!(Option<&str>, "NULL")) -> &'static str {
-    create_reflex_ivm_impl(view_name, sql, unique_columns.unwrap_or(""), true)
+fn create_reflex_ivm_if_not_exists(
+    view_name: &str,
+    sql: &str,
+    unique_columns: default!(Option<&str>, "NULL"),
+    storage: default!(Option<&str>, "'UNLOGGED'"),
+    mode: default!(Option<&str>, "'IMMEDIATE'"),
+) -> &'static str {
+    create_reflex_ivm_impl(view_name, sql, unique_columns.unwrap_or(""), true, storage.unwrap_or("UNLOGGED"), mode.unwrap_or("IMMEDIATE"))
 }
 
-fn create_reflex_ivm_impl(view_name: &str, sql: &str, unique_columns_str: &str, if_not_exists: bool) -> &'static str {
+fn create_reflex_ivm_impl(view_name: &str, sql: &str, unique_columns_str: &str, if_not_exists: bool, storage_mode: &str, refresh_mode: &str) -> &'static str {
+    let storage_upper = storage_mode.to_uppercase();
+    if storage_upper != "LOGGED" && storage_upper != "UNLOGGED" {
+        return "ERROR: storage must be 'LOGGED' or 'UNLOGGED'";
+    }
+    let logged = storage_upper == "LOGGED";
+    let mode_upper = refresh_mode.to_uppercase();
+    if mode_upper != "IMMEDIATE" && mode_upper != "DEFERRED" {
+        return "ERROR: mode must be 'IMMEDIATE' or 'DEFERRED'";
+    }
+    let deferred = mode_upper == "DEFERRED";
     if let Err(msg) = validate_view_name(view_name) {
         return msg;
     }
@@ -113,6 +139,255 @@ fn create_reflex_ivm_impl(view_name: &str, sql: &str, unique_columns_str: &str, 
         }
     };
 
+    // --- Set operation decomposition: UNION ALL / UNION ---
+    if let Some(ref set_op) = analysis.set_operation {
+        match set_op.op {
+            sqlparser::ast::SetOperator::Union => {}
+            _ => {
+                return "ERROR: Only UNION and UNION ALL are currently supported. \
+                        INTERSECT and EXCEPT support is planned.";
+            }
+        }
+
+        // Each operand becomes its own sub-IMV
+        let mut sub_imv_names: Vec<String> = Vec::new();
+        for (i, operand_sql) in set_op.operand_sqls.iter().enumerate() {
+            let sub_name = format!("{}__union_{}", view_name, i);
+            let result = create_reflex_ivm_impl(
+                &sub_name, operand_sql, "", false, storage_mode, refresh_mode,
+            );
+            if result.starts_with("ERROR") {
+                return result;
+            }
+            sub_imv_names.push(sub_name);
+        }
+
+        // Build the union query over sub-IMV targets
+        let union_selects: Vec<String> = sub_imv_names
+            .iter()
+            .map(|name| format!("SELECT * FROM {}", quote_identifier(name)))
+            .collect();
+
+        if set_op.is_all {
+            // UNION ALL: create a VIEW (zero overhead, always up-to-date)
+            let view_sql = union_selects.join(" UNION ALL ");
+            Spi::connect_mut(|client| {
+                client
+                    .update(
+                        &format!(
+                            "CREATE OR REPLACE VIEW {} AS {}",
+                            quote_identifier(view_name),
+                            view_sql
+                        ),
+                        None,
+                        &[],
+                    )
+                    .unwrap_or_report();
+            });
+
+            // Register in reference table so drop_reflex_ivm can clean up.
+            // depends_on = sub-IMV names (the VIEW reads from them, not from real sources)
+            Spi::connect_mut(|client| {
+                let depends_on: Vec<String> = sub_imv_names.clone();
+                let depends_on_imv: Vec<String> = sub_imv_names.clone();
+                let graph_child: Vec<String> = Vec::new();
+                let depth = sub_imv_names.len() as i32 + 1;
+                client.update(
+                    "INSERT INTO public.__reflex_ivm_reference
+                     (name, graph_depth, depends_on, depends_on_imv, unlogged_tables,
+                      graph_child, sql_query, base_query, end_query,
+                      aggregations, index_columns, unique_columns, enabled, last_update_date,
+                      storage_mode, refresh_mode)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::json, $11, $12, TRUE, NOW(), $13, $14)",
+                    None,
+                    &[
+                        unsafe { DatumWithOid::new(view_name.to_string(), PgBuiltInOids::TEXTOID.oid().value()) },
+                        unsafe { DatumWithOid::new(depth, PgBuiltInOids::INT4OID.oid().value()) },
+                        unsafe { DatumWithOid::new(depends_on, PgBuiltInOids::TEXTARRAYOID.oid().value()) },
+                        unsafe { DatumWithOid::new(depends_on_imv.clone(), PgBuiltInOids::TEXTARRAYOID.oid().value()) },
+                        unsafe { DatumWithOid::new(Vec::<String>::new(), PgBuiltInOids::TEXTARRAYOID.oid().value()) },
+                        unsafe { DatumWithOid::new(graph_child, PgBuiltInOids::TEXTARRAYOID.oid().value()) },
+                        unsafe { DatumWithOid::new(sql.to_string(), PgBuiltInOids::TEXTOID.oid().value()) },
+                        unsafe { DatumWithOid::new(view_sql.clone(), PgBuiltInOids::TEXTOID.oid().value()) },
+                        unsafe { DatumWithOid::new(String::new(), PgBuiltInOids::TEXTOID.oid().value()) },
+                        unsafe { DatumWithOid::new("{}".to_string(), PgBuiltInOids::TEXTOID.oid().value()) },
+                        unsafe { DatumWithOid::new(Vec::<String>::new(), PgBuiltInOids::TEXTARRAYOID.oid().value()) },
+                        unsafe { DatumWithOid::new(Vec::<String>::new(), PgBuiltInOids::TEXTARRAYOID.oid().value()) },
+                        unsafe { DatumWithOid::new(storage_upper.clone(), PgBuiltInOids::TEXTOID.oid().value()) },
+                        unsafe { DatumWithOid::new(mode_upper.clone(), PgBuiltInOids::TEXTOID.oid().value()) },
+                    ],
+                ).unwrap_or_report();
+
+                // Update sub-IMVs graph_child
+                for imv_name in &depends_on_imv {
+                    client.update(
+                        "UPDATE public.__reflex_ivm_reference
+                         SET graph_child = array_append(COALESCE(graph_child, ARRAY[]::TEXT[]), $1)
+                         WHERE name = $2",
+                        None,
+                        &[
+                            unsafe { DatumWithOid::new(view_name.to_string(), PgBuiltInOids::TEXTOID.oid().value()) },
+                            unsafe { DatumWithOid::new(imv_name.to_string(), PgBuiltInOids::TEXTOID.oid().value()) },
+                        ],
+                    ).unwrap_or_report();
+                }
+            });
+        } else {
+            // UNION (dedup): create a VIEW with UNION over sub-IMVs.
+            // The sub-IMVs maintain data incrementally; PostgreSQL's UNION
+            // handles deduplication at query time. This is correct and simple —
+            // the expensive part (scanning source tables) is already incremental.
+            let view_sql = union_selects.join(" UNION ");
+            Spi::connect_mut(|client| {
+                client
+                    .update(
+                        &format!(
+                            "CREATE OR REPLACE VIEW {} AS {}",
+                            quote_identifier(view_name),
+                            view_sql
+                        ),
+                        None,
+                        &[],
+                    )
+                    .unwrap_or_report();
+            });
+
+            // Register in reference table
+            Spi::connect_mut(|client| {
+                let depends_on: Vec<String> = sub_imv_names.clone();
+                let depends_on_imv: Vec<String> = sub_imv_names.clone();
+                let graph_child: Vec<String> = Vec::new();
+                let depth = sub_imv_names.len() as i32 + 1;
+                client.update(
+                    "INSERT INTO public.__reflex_ivm_reference
+                     (name, graph_depth, depends_on, depends_on_imv, unlogged_tables,
+                      graph_child, sql_query, base_query, end_query,
+                      aggregations, index_columns, unique_columns, enabled, last_update_date,
+                      storage_mode, refresh_mode)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::json, $11, $12, TRUE, NOW(), $13, $14)",
+                    None,
+                    &[
+                        unsafe { DatumWithOid::new(view_name.to_string(), PgBuiltInOids::TEXTOID.oid().value()) },
+                        unsafe { DatumWithOid::new(depth, PgBuiltInOids::INT4OID.oid().value()) },
+                        unsafe { DatumWithOid::new(depends_on, PgBuiltInOids::TEXTARRAYOID.oid().value()) },
+                        unsafe { DatumWithOid::new(depends_on_imv.clone(), PgBuiltInOids::TEXTARRAYOID.oid().value()) },
+                        unsafe { DatumWithOid::new(Vec::<String>::new(), PgBuiltInOids::TEXTARRAYOID.oid().value()) },
+                        unsafe { DatumWithOid::new(graph_child, PgBuiltInOids::TEXTARRAYOID.oid().value()) },
+                        unsafe { DatumWithOid::new(sql.to_string(), PgBuiltInOids::TEXTOID.oid().value()) },
+                        unsafe { DatumWithOid::new(view_sql.clone(), PgBuiltInOids::TEXTOID.oid().value()) },
+                        unsafe { DatumWithOid::new(String::new(), PgBuiltInOids::TEXTOID.oid().value()) },
+                        unsafe { DatumWithOid::new("{}".to_string(), PgBuiltInOids::TEXTOID.oid().value()) },
+                        unsafe { DatumWithOid::new(Vec::<String>::new(), PgBuiltInOids::TEXTARRAYOID.oid().value()) },
+                        unsafe { DatumWithOid::new(Vec::<String>::new(), PgBuiltInOids::TEXTARRAYOID.oid().value()) },
+                        unsafe { DatumWithOid::new(storage_upper.clone(), PgBuiltInOids::TEXTOID.oid().value()) },
+                        unsafe { DatumWithOid::new(mode_upper.clone(), PgBuiltInOids::TEXTOID.oid().value()) },
+                    ],
+                ).unwrap_or_report();
+
+                for imv_name in &depends_on_imv {
+                    client.update(
+                        "UPDATE public.__reflex_ivm_reference
+                         SET graph_child = array_append(COALESCE(graph_child, ARRAY[]::TEXT[]), $1)
+                         WHERE name = $2",
+                        None,
+                        &[
+                            unsafe { DatumWithOid::new(view_name.to_string(), PgBuiltInOids::TEXTOID.oid().value()) },
+                            unsafe { DatumWithOid::new(imv_name.to_string(), PgBuiltInOids::TEXTOID.oid().value()) },
+                        ],
+                    ).unwrap_or_report();
+                }
+            });
+        }
+
+        return "CREATE REFLEX INCREMENTAL VIEW";
+    }
+    // --- End set operation decomposition ---
+
+    // --- Window function decomposition: base sub-IMV + VIEW wrapper ---
+    // Window functions can't be incrementally maintained (ROW_NUMBER, RANK, LAG
+    // depend on the full result set). Instead, we decompose into:
+    //   1. A sub-IMV for the base query (aggregate or passthrough) — incrementally maintained
+    //   2. A VIEW that applies window functions at read time over the sub-IMV result
+    // For GROUP BY + WINDOW, the sub-IMV result is small (one row per group),
+    // so the window computation at read time is fast.
+    if analysis.has_window_function {
+        let decomp = window::decompose_window_query(&analysis);
+
+        // Create a sub-IMV for the base query (aggregate or passthrough, no windows)
+        let base_name = format!("{}__base", view_name);
+        let result = create_reflex_ivm_impl(
+            &base_name, &decomp.base_query, unique_columns_str, false, storage_mode, refresh_mode,
+        );
+        if result.starts_with("ERROR") {
+            return result;
+        }
+
+        // Create a VIEW that applies window functions to the base sub-IMV
+        let view_sql = format!(
+            "SELECT {} FROM {}",
+            decomp.view_select,
+            quote_identifier(&base_name)
+        );
+        Spi::connect_mut(|client| {
+            client
+                .update(
+                    &format!(
+                        "CREATE OR REPLACE VIEW {} AS {}",
+                        quote_identifier(view_name),
+                        view_sql
+                    ),
+                    None,
+                    &[],
+                )
+                .unwrap_or_report();
+
+            // Register in reference table for cleanup
+            let depends_on = vec![base_name.clone()];
+            let depends_on_imv = vec![base_name.clone()];
+            client.update(
+                "INSERT INTO public.__reflex_ivm_reference
+                 (name, graph_depth, depends_on, depends_on_imv, unlogged_tables,
+                  graph_child, sql_query, base_query, end_query,
+                  aggregations, index_columns, unique_columns, enabled, last_update_date,
+                  storage_mode, refresh_mode)
+                 VALUES ($1, 2, $2, $3, $4, $5, $6, $7, $8, $9::json, $10, $11, TRUE, NOW(), $12, $13)",
+                None,
+                &[
+                    unsafe { DatumWithOid::new(view_name.to_string(), PgBuiltInOids::TEXTOID.oid().value()) },
+                    unsafe { DatumWithOid::new(depends_on, PgBuiltInOids::TEXTARRAYOID.oid().value()) },
+                    unsafe { DatumWithOid::new(depends_on_imv.clone(), PgBuiltInOids::TEXTARRAYOID.oid().value()) },
+                    unsafe { DatumWithOid::new(Vec::<String>::new(), PgBuiltInOids::TEXTARRAYOID.oid().value()) },
+                    unsafe { DatumWithOid::new(Vec::<String>::new(), PgBuiltInOids::TEXTARRAYOID.oid().value()) },
+                    unsafe { DatumWithOid::new(sql.to_string(), PgBuiltInOids::TEXTOID.oid().value()) },
+                    unsafe { DatumWithOid::new(view_sql.clone(), PgBuiltInOids::TEXTOID.oid().value()) },
+                    unsafe { DatumWithOid::new(String::new(), PgBuiltInOids::TEXTOID.oid().value()) },
+                    unsafe { DatumWithOid::new("{}".to_string(), PgBuiltInOids::TEXTOID.oid().value()) },
+                    unsafe { DatumWithOid::new(Vec::<String>::new(), PgBuiltInOids::TEXTARRAYOID.oid().value()) },
+                    unsafe { DatumWithOid::new(Vec::<String>::new(), PgBuiltInOids::TEXTARRAYOID.oid().value()) },
+                    unsafe { DatumWithOid::new(storage_upper.clone(), PgBuiltInOids::TEXTOID.oid().value()) },
+                    unsafe { DatumWithOid::new(mode_upper.clone(), PgBuiltInOids::TEXTOID.oid().value()) },
+                ],
+            ).unwrap_or_report();
+
+            // Update base IMV's graph_child
+            for name in &depends_on_imv {
+                client.update(
+                    "UPDATE public.__reflex_ivm_reference
+                     SET graph_child = array_append(COALESCE(graph_child, ARRAY[]::TEXT[]), $1)
+                     WHERE name = $2",
+                    None,
+                    &[
+                        unsafe { DatumWithOid::new(view_name.to_string(), PgBuiltInOids::TEXTOID.oid().value()) },
+                        unsafe { DatumWithOid::new(name.to_string(), PgBuiltInOids::TEXTOID.oid().value()) },
+                    ],
+                ).unwrap_or_report();
+            }
+        });
+
+        return "CREATE REFLEX INCREMENTAL VIEW";
+    }
+    // --- End window function decomposition ---
+
     // Reject subqueries with aggregation in FROM — the trigger replaces the inner table
     // with the transition table, so inner aggregations would only see delta rows.
     let has_subquery_with_agg = analysis.sources.iter().any(|s| s.starts_with("<subquery:"))
@@ -137,7 +412,7 @@ fn create_reflex_ivm_impl(view_name: &str, sql: &str, unique_columns_str: &str, 
             }
 
             let cte_view_name = format!("{}__cte_{}", view_name, cte.alias);
-            let result = create_reflex_ivm(&cte_view_name, &cte_query, None);
+            let result = create_reflex_ivm_impl(&cte_view_name, &cte_query, "", false, storage_mode, refresh_mode);
             if result.starts_with("ERROR") {
                 return result;
             }
@@ -192,7 +467,7 @@ fn create_reflex_ivm_impl(view_name: &str, sql: &str, unique_columns_str: &str, 
         }
 
         // Main body has aggregation → create as a normal IMV
-        return create_reflex_ivm(view_name, &body_sql, None);
+        return create_reflex_ivm_impl(view_name, &body_sql, "", false, storage_mode, refresh_mode);
     }
     // --- End CTE decomposition ---
 
@@ -387,9 +662,10 @@ fn create_reflex_ivm_impl(view_name: &str, sql: &str, unique_columns_str: &str, 
 
         if plan.is_passthrough {
             // Passthrough: CREATE TABLE AS — Postgres infers columns + types, populates data
+            let create_kw = if logged { "CREATE TABLE" } else { "CREATE UNLOGGED TABLE" };
             client
                 .update(
-                    &format!("CREATE TABLE {} AS {}", quote_identifier(view_name), sql),
+                    &format!("{} {} AS {}", create_kw, quote_identifier(view_name), sql),
                     None,
                     &[],
                 )
@@ -417,13 +693,13 @@ fn create_reflex_ivm_impl(view_name: &str, sql: &str, unique_columns_str: &str, 
             // Aggregate: build intermediate + target tables from the plan
             let column_types = query_column_types_from_catalog(client, &froms);
 
-            if let Some(ddl) = build_intermediate_table_ddl(view_name, &plan, &column_types) {
+            if let Some(ddl) = build_intermediate_table_ddl(view_name, &plan, &column_types, logged) {
                 let tbl = intermediate_table_name(view_name);
                 client.update(&ddl, None, &[]).unwrap_or_report();
                 unlogged_tables.push(tbl);
             }
 
-            let target_ddl = build_target_table_ddl(view_name, &plan, &column_types);
+            let target_ddl = build_target_table_ddl(view_name, &plan, &column_types, logged);
             client.update(&target_ddl, None, &[]).unwrap_or_report();
             // Note: indexes are created AFTER bulk insert for performance
         }
@@ -494,10 +770,54 @@ fn create_reflex_ivm_impl(view_name: &str, sql: &str, unique_columns_str: &str, 
                 .next()
                 .is_some();
 
+            if deferred {
+                // Deferred mode: create staging table if not exists
+                let staging_ddl = build_staging_table_ddl(source);
+                client.update(&staging_ddl, None, &[]).unwrap_or_report();
+            }
+
             if !trig_exists {
-                for ddl in build_trigger_ddls(source) {
+                // Choose trigger type: if ANY deferred IMV exists on this source,
+                // use deferred triggers (they handle both IMMEDIATE and DEFERRED IMVs).
+                let has_any_deferred = deferred || {
+                    let check = client
+                        .select(
+                            &format!(
+                                "SELECT 1 FROM public.__reflex_ivm_reference \
+                                 WHERE '{}' = ANY(depends_on) AND refresh_mode = 'DEFERRED' AND enabled = TRUE",
+                                source.replace("'", "''")
+                            ),
+                            None,
+                            &[],
+                        )
+                        .unwrap_or_report()
+                        .next()
+                        .is_some();
+                    check
+                };
+
+                if has_any_deferred {
+                    for ddl in build_deferred_trigger_ddls(source) {
+                        client.update(&ddl, None, &[]).unwrap_or_report();
+                    }
+                } else {
+                    for ddl in build_trigger_ddls(source) {
+                        client.update(&ddl, None, &[]).unwrap_or_report();
+                    }
+                }
+            } else if deferred {
+                // Triggers already exist — upgrade to deferred triggers
+                // (which handle both IMMEDIATE and DEFERRED IMVs)
+                for ddl in build_deferred_trigger_ddls(source) {
                     client.update(&ddl, None, &[]).unwrap_or_report();
                 }
+            }
+        }
+
+        // Create deferred flush infrastructure if this IMV uses deferred mode
+        if deferred {
+            for ddl in build_deferred_flush_ddl() {
+                client.update(&ddl, None, &[]).unwrap_or_report();
             }
         }
 
@@ -573,8 +893,8 @@ fn create_reflex_ivm_impl(view_name: &str, sql: &str, unique_columns_str: &str, 
             "INSERT INTO public.__reflex_ivm_reference
              (name, graph_depth, depends_on, depends_on_imv, unlogged_tables,
               graph_child, sql_query, base_query, end_query,
-              aggregations, index_columns, unique_columns, enabled, last_update_date)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::json, $11, $12, TRUE, NOW())",
+              aggregations, index_columns, unique_columns, enabled, last_update_date, storage_mode, refresh_mode)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::json, $11, $12, TRUE, NOW(), $13, $14)",
             None,
             &[
                 unsafe { DatumWithOid::new(view_name.to_string(), PgBuiltInOids::TEXTOID.oid().value()) },
@@ -589,6 +909,8 @@ fn create_reflex_ivm_impl(view_name: &str, sql: &str, unique_columns_str: &str, 
                 unsafe { DatumWithOid::new(aggregations_json, PgBuiltInOids::TEXTOID.oid().value()) },
                 unsafe { DatumWithOid::new(index_columns, PgBuiltInOids::TEXTARRAYOID.oid().value()) },
                 unsafe { DatumWithOid::new(resolved_unique_columns.clone(), PgBuiltInOids::TEXTARRAYOID.oid().value()) },
+                unsafe { DatumWithOid::new(storage_upper.clone(), PgBuiltInOids::TEXTOID.oid().value()) },
+                unsafe { DatumWithOid::new(mode_upper.clone(), PgBuiltInOids::TEXTOID.oid().value()) },
             ],
         ).unwrap_or_report();
 
@@ -1404,6 +1726,8 @@ mod tests {
             "test_city_totals",
             "SELECT city, SUM(amount) AS total FROM test_orders GROUP BY city",
             None,
+            None,
+            None,
         );
         assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
 
@@ -1445,6 +1769,8 @@ mod tests {
             "test_dept_avg",
             "SELECT dept, AVG(salary) AS avg_sal FROM test_emp GROUP BY dept",
             None,
+            None,
+            None,
         );
         assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
 
@@ -1484,6 +1810,8 @@ mod tests {
             "test_distinct_countries",
             "SELECT DISTINCT country FROM test_visits",
             None,
+            None,
+            None,
         );
         assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
 
@@ -1507,6 +1835,8 @@ mod tests {
         let result = crate::create_reflex_ivm(
             "test_cat_counts",
             "SELECT category, COUNT(*) AS cnt FROM test_items GROUP BY category",
+            None,
+            None,
             None,
         );
         assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
@@ -1533,6 +1863,8 @@ mod tests {
         let result = crate::create_reflex_ivm(
             "test_score_range",
             "SELECT subject, MIN(score) AS lo, MAX(score) AS hi FROM test_scores GROUP BY subject",
+            None,
+            None,
             None,
         );
         assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
@@ -1566,6 +1898,8 @@ mod tests {
             "test_region_stats",
             "SELECT region, SUM(revenue) AS total, COUNT(*) AS cnt, AVG(revenue) AS avg_rev FROM test_sales GROUP BY region",
             None,
+            None,
+            None,
         );
         assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
 
@@ -1598,12 +1932,16 @@ mod tests {
             "test_imv_1",
             "SELECT val, SUM(amount) AS total FROM test_base GROUP BY val",
             None,
+            None,
+            None,
         );
 
         // Second IMV depends on test_imv_1, should be at depth 2
         crate::create_reflex_ivm(
             "test_imv_2",
             "SELECT val, SUM(total) AS grand_total FROM test_imv_1 GROUP BY val",
+            None,
+            None,
             None,
         );
 
@@ -1637,6 +1975,8 @@ mod tests {
             "bad_view",
             "WITH RECURSIVE nums AS (SELECT 1 AS n UNION ALL SELECT n+1 FROM nums WHERE n < 10) SELECT n, COUNT(*) AS cnt FROM nums GROUP BY n",
             None,
+            None,
+            None,
         );
         assert!(result.starts_with("ERROR"));
         assert!(result.contains("RECURSIVE"));
@@ -1646,19 +1986,22 @@ mod tests {
     fn test_unsupported_limit_rejected() {
         Spi::run("CREATE TABLE test_t2 (id INT)").expect("create table");
         let result =
-            crate::create_reflex_ivm("bad_view2", "SELECT id, COUNT(*) AS cnt FROM test_t2 GROUP BY id LIMIT 10", None);
+            crate::create_reflex_ivm("bad_view2", "SELECT id, COUNT(*) AS cnt FROM test_t2 GROUP BY id LIMIT 10", None, None, None);
         assert!(result.starts_with("ERROR"));
     }
 
     #[pg_test]
-    fn test_unsupported_window_rejected() {
+    fn test_window_function_accepted() {
         Spi::run("CREATE TABLE test_t3 (id INT, amount INT)").expect("create table");
+        Spi::run("INSERT INTO test_t3 VALUES (1, 10), (1, 20), (2, 30)").expect("seed");
         let result = crate::create_reflex_ivm(
             "bad_view3",
-            "SELECT id, SUM(amount) OVER (PARTITION BY id) FROM test_t3",
+            "SELECT id, amount, SUM(amount) OVER (PARTITION BY id) AS part_sum FROM test_t3",
+            None,
+            None,
             None,
         );
-        assert!(result.starts_with("ERROR"));
+        assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
     }
 
     #[pg_test]
@@ -1670,6 +2013,8 @@ mod tests {
         crate::create_reflex_ivm(
             "test_ref_view",
             "SELECT city, SUM(amount) AS total FROM test_ref_src GROUP BY city",
+            None,
+            None,
             None,
         );
 
@@ -1702,6 +2047,8 @@ mod tests {
             "test_trig_view",
             "SELECT grp, SUM(val) AS total FROM test_trig_src GROUP BY grp",
             None,
+            None,
+            None,
         );
 
         // Check all 4 consolidated triggers exist (INSERT, DELETE, UPDATE, TRUNCATE)
@@ -1726,6 +2073,8 @@ mod tests {
         crate::create_reflex_ivm(
             "trig_ins_view",
             "SELECT city, SUM(amount) AS total FROM trig_ins_src GROUP BY city",
+            None,
+            None,
             None,
         );
 
@@ -1762,6 +2111,8 @@ mod tests {
             "trig_del_view",
             "SELECT city, SUM(amount) AS total FROM trig_del_src GROUP BY city",
             None,
+            None,
+            None,
         );
 
         // Delete one Paris row
@@ -1785,6 +2136,8 @@ mod tests {
         crate::create_reflex_ivm(
             "trig_delall_view",
             "SELECT city, SUM(amount) AS total FROM trig_delall_src GROUP BY city",
+            None,
+            None,
             None,
         );
 
@@ -1819,6 +2172,8 @@ mod tests {
             "trig_upd_view",
             "SELECT city, SUM(amount) AS total FROM trig_upd_src GROUP BY city",
             None,
+            None,
+            None,
         );
 
         // Update: change amount for city 'A'
@@ -1844,6 +2199,8 @@ mod tests {
         crate::create_reflex_ivm(
             "trig_avg_view",
             "SELECT dept, AVG(salary) AS avg_sal FROM trig_avg_src GROUP BY dept",
+            None,
+            None,
             None,
         );
 
@@ -1881,6 +2238,8 @@ mod tests {
         crate::create_reflex_ivm(
             "trig_dist_view",
             "SELECT DISTINCT country FROM trig_dist_src",
+            None,
+            None,
             None,
         );
 
@@ -1921,6 +2280,8 @@ mod tests {
             "trig_bulk_view",
             "SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM trig_bulk_src GROUP BY grp",
             None,
+            None,
+            None,
         );
 
         // Bulk insert 100 rows for group 'X'
@@ -1953,6 +2314,8 @@ mod tests {
             "test_dept_counts",
             "SELECT d.dept_name, COUNT(*) AS emp_count FROM test_j_emp e JOIN test_j_dept d ON e.dept_id = d.id GROUP BY d.dept_name",
             None,
+            None,
+            None,
         );
         assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
 
@@ -1982,6 +2345,8 @@ mod tests {
         let result = crate::create_reflex_ivm(
             "pt_view",
             "SELECT id, name FROM pt_src WHERE active = true",
+            None,
+            None,
             None,
         );
         assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
@@ -2019,6 +2384,8 @@ mod tests {
             "pt_join_view",
             "SELECT o.id, p.name, o.amount FROM pt_orders o JOIN pt_products p ON o.product_id = p.id",
             None,
+            None,
+            None,
         );
         assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
 
@@ -2039,7 +2406,7 @@ mod tests {
         Spi::run("CREATE TABLE pt_del (id SERIAL, val TEXT)").expect("create");
         Spi::run("INSERT INTO pt_del (val) VALUES ('a'), ('b'), ('c')").expect("seed");
 
-        crate::create_reflex_ivm("pt_del_view", "SELECT id, val FROM pt_del", None);
+        crate::create_reflex_ivm("pt_del_view", "SELECT id, val FROM pt_del", None, None, None);
 
         // DELETE → full refresh
         Spi::run("DELETE FROM pt_del WHERE val = 'b'").expect("delete");
@@ -2060,6 +2427,8 @@ mod tests {
         let result = crate::create_reflex_ivm(
             "cte_simple",
             "WITH regional AS (SELECT region, SUM(amount) AS total FROM cte_src1 GROUP BY region) SELECT region, total FROM regional",
+            None,
+            None,
             None,
         );
         assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
@@ -2087,6 +2456,8 @@ mod tests {
         crate::create_reflex_ivm(
             "cte_prop",
             "WITH totals AS (SELECT region, SUM(amount) AS total FROM cte_src2 GROUP BY region) SELECT region, total FROM totals",
+            None,
+            None,
             None,
         );
 
@@ -2117,6 +2488,8 @@ mod tests {
         crate::create_reflex_ivm(
             "cte_filtered",
             "WITH totals AS (SELECT region, SUM(amount) AS total FROM cte_src3 GROUP BY region) SELECT region, total FROM totals WHERE total > 100",
+            None,
+            None,
             None,
         );
 
@@ -2153,6 +2526,8 @@ mod tests {
                 SELECT region, SUM(city_total) AS total FROM by_city GROUP BY region\
              ) SELECT region, total FROM by_region",
             None,
+            None,
+            None,
         );
         assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
 
@@ -2181,6 +2556,8 @@ mod tests {
             "cte_agg_main",
             "WITH totals AS (SELECT region, SUM(amount) AS total FROM cte_src5 GROUP BY region) SELECT COUNT(*) AS num_regions FROM totals",
             None,
+            None,
+            None,
         );
         assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
 
@@ -2200,6 +2577,8 @@ mod tests {
         crate::create_reflex_ivm(
             "e2e_view",
             "SELECT city, SUM(amount) AS total, COUNT(*) AS cnt FROM e2e_src GROUP BY city",
+            None,
+            None,
             None,
         );
 
@@ -2270,12 +2649,16 @@ mod tests {
             "cascade_l1",
             "SELECT category, SUM(amount) AS total FROM cascade_src GROUP BY category",
             None,
+            None,
+            None,
         );
 
         // L2: SUM of L1 totals (grand total across all categories)
         crate::create_reflex_ivm(
             "cascade_l2",
             "SELECT SUM(total) AS grand_total FROM cascade_l1",
+            None,
+            None,
             None,
         );
 
@@ -2331,6 +2714,8 @@ mod tests {
             "e2e_dept_counts",
             "SELECT d.dept_name, COUNT(*) AS emp_count FROM e2e_emp e JOIN e2e_dept d ON e.dept_id = d.id GROUP BY d.dept_name",
             None,
+            None,
+            None,
         );
 
         // Verify initial
@@ -2366,6 +2751,8 @@ mod tests {
         crate::create_reflex_ivm(
             "drop_view",
             "SELECT grp, SUM(val) AS total FROM drop_src GROUP BY grp",
+            None,
+            None,
             None,
         );
 
@@ -2414,10 +2801,14 @@ mod tests {
             "drop_parent",
             "SELECT grp, SUM(val) AS total FROM drop_ch_src GROUP BY grp",
             None,
+            None,
+            None,
         );
         crate::create_reflex_ivm(
             "drop_child",
             "SELECT grp, SUM(total) AS grand FROM drop_parent GROUP BY grp",
+            None,
+            None,
             None,
         );
 
@@ -2436,10 +2827,14 @@ mod tests {
             "drop_cas_parent",
             "SELECT grp, SUM(val) AS total FROM drop_cas_src GROUP BY grp",
             None,
+            None,
+            None,
         );
         crate::create_reflex_ivm(
             "drop_cas_child",
             "SELECT grp, SUM(total) AS grand FROM drop_cas_parent GROUP BY grp",
+            None,
+            None,
             None,
         );
 
@@ -2466,10 +2861,14 @@ mod tests {
             "drop_sh_v1",
             "SELECT grp, SUM(val) AS total FROM drop_sh_src GROUP BY grp",
             None,
+            None,
+            None,
         );
         crate::create_reflex_ivm(
             "drop_sh_v2",
             "SELECT grp, COUNT(*) AS cnt FROM drop_sh_src GROUP BY grp",
+            None,
+            None,
             None,
         );
 
@@ -2514,6 +2913,8 @@ mod tests {
             "trunc_view",
             "SELECT grp, SUM(val) AS total FROM trunc_src GROUP BY grp",
             None,
+            None,
+            None,
         );
 
         // Verify data exists
@@ -2546,6 +2947,8 @@ mod tests {
             "trunc2_view",
             "SELECT grp, SUM(val) AS total FROM trunc2_src GROUP BY grp",
             None,
+            None,
+            None,
         );
 
         Spi::run("TRUNCATE trunc2_src").expect("truncate");
@@ -2574,6 +2977,8 @@ mod tests {
         crate::create_reflex_ivm(
             "recon_view",
             "SELECT grp, SUM(val) AS total FROM recon_src GROUP BY grp",
+            None,
+            None,
             None,
         );
 
@@ -2607,7 +3012,7 @@ mod tests {
         Spi::run("INSERT INTO recon_pt_src (name) VALUES ('Alice'), ('Bob')")
             .expect("seed");
 
-        crate::create_reflex_ivm("recon_pt_view", "SELECT id, name FROM recon_pt_src", None);
+        crate::create_reflex_ivm("recon_pt_view", "SELECT id, name FROM recon_pt_src", None, None, None);
 
         // Manually delete a row from target (corrupt)
         Spi::run("DELETE FROM recon_pt_view WHERE name = 'Alice'").expect("corrupt");
@@ -2642,17 +3047,23 @@ mod tests {
             "multi_v1",
             "SELECT city, SUM(amount) AS total FROM multi_src GROUP BY city",
             None,
+            None,
+            None,
         );
         // IMV 2: COUNT by city
         crate::create_reflex_ivm(
             "multi_v2",
             "SELECT city, COUNT(*) AS cnt FROM multi_src GROUP BY city",
             None,
+            None,
+            None,
         );
         // IMV 3: SUM of qty (no group by — global aggregate)
         crate::create_reflex_ivm(
             "multi_v3",
             "SELECT SUM(qty) AS total_qty FROM multi_src",
+            None,
+            None,
             None,
         );
 
@@ -2748,12 +3159,16 @@ mod tests {
             "chain4_l1",
             "SELECT region, city, SUM(amount) AS city_total FROM chain4_src GROUP BY region, city",
             None,
+            None,
+            None,
         );
 
         // L2: SUM by region (rolls up cities)
         crate::create_reflex_ivm(
             "chain4_l2",
             "SELECT region, SUM(city_total) AS region_total FROM chain4_l1 GROUP BY region",
+            None,
+            None,
             None,
         );
 
@@ -2762,12 +3177,16 @@ mod tests {
             "chain4_l3",
             "SELECT COUNT(*) AS num_regions FROM chain4_l2",
             None,
+            None,
+            None,
         );
 
         // L4: passthrough of L3 (tests cascading through passthrough)
         crate::create_reflex_ivm(
             "chain4_l4",
             "SELECT num_regions FROM chain4_l3",
+            None,
+            None,
             None,
         );
 
@@ -3089,7 +3508,7 @@ mod tests {
 
     #[pg_test]
     fn test_malformed_sql_returns_error() {
-        let result = crate::create_reflex_ivm("bad_sql_view", "SELEC broken garbage !!!", None);
+        let result = crate::create_reflex_ivm("bad_sql_view", "SELEC broken garbage !!!", None, None, None);
         assert!(
             result.starts_with("ERROR"),
             "Malformed SQL should return error, got: {}",
@@ -3101,15 +3520,15 @@ mod tests {
     #[pg_test]
     fn test_special_chars_view_name_rejected() {
         Spi::run("CREATE TABLE vn_src (id SERIAL, val INT)").expect("create table");
-        let r1 = crate::create_reflex_ivm("bad'name", "SELECT val FROM vn_src", None);
+        let r1 = crate::create_reflex_ivm("bad'name", "SELECT val FROM vn_src", None, None, None);
         assert!(r1.starts_with("ERROR"), "Single quote should be rejected");
-        let r2 = crate::create_reflex_ivm("bad;name", "SELECT val FROM vn_src", None);
+        let r2 = crate::create_reflex_ivm("bad;name", "SELECT val FROM vn_src", None, None, None);
         assert!(r2.starts_with("ERROR"), "Semicolon should be rejected");
-        let r3 = crate::create_reflex_ivm("bad--name", "SELECT val FROM vn_src", None);
+        let r3 = crate::create_reflex_ivm("bad--name", "SELECT val FROM vn_src", None, None, None);
         assert!(r3.starts_with("ERROR"), "SQL comment should be rejected");
-        let r4 = crate::create_reflex_ivm("bad name", "SELECT val FROM vn_src", None);
+        let r4 = crate::create_reflex_ivm("bad name", "SELECT val FROM vn_src", None, None, None);
         assert!(r4.starts_with("ERROR"), "Whitespace should be rejected");
-        let r5 = crate::create_reflex_ivm("", "SELECT val FROM vn_src", None);
+        let r5 = crate::create_reflex_ivm("", "SELECT val FROM vn_src", None, None, None);
         assert!(r5.starts_with("ERROR"), "Empty name should be rejected");
     }
 
@@ -3149,11 +3568,15 @@ mod tests {
             "dup_view",
             "SELECT grp, SUM(val) AS total FROM dup_src GROUP BY grp",
             None,
+            None,
+            None,
         );
         assert_eq!(r1, "CREATE REFLEX INCREMENTAL VIEW");
         let r2 = crate::create_reflex_ivm(
             "dup_view",
             "SELECT grp, SUM(val) AS total FROM dup_src GROUP BY grp",
+            None,
+            None,
             None,
         );
         assert!(
@@ -3169,6 +3592,8 @@ mod tests {
         let result = crate::create_reflex_ivm(
             "empty_view",
             "SELECT grp, SUM(val) AS total FROM empty_src GROUP BY grp",
+            None,
+            None,
             None,
         );
         assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
@@ -3199,6 +3624,8 @@ mod tests {
             "grpmove_view",
             "SELECT grp, SUM(val) AS total FROM grpmove_src GROUP BY grp",
             None,
+            None,
+            None,
         );
         // Move a row from group A to group B
         Spi::run("UPDATE grpmove_src SET grp = 'B' WHERE val = 10").expect("update");
@@ -3225,6 +3652,8 @@ mod tests {
             "mmr_view",
             "SELECT grp, MIN(val) AS lo, MAX(val) AS hi FROM mmr_src GROUP BY grp",
             None,
+            None,
+            None,
         );
         let lo =
             Spi::get_one::<pgrx::AnyNumeric>("SELECT lo FROM mmr_view WHERE grp = 'X'")
@@ -3248,6 +3677,8 @@ mod tests {
             "delall_view",
             "SELECT grp, SUM(val) AS total FROM delall_src GROUP BY grp",
             None,
+            None,
+            None,
         );
         Spi::run("DELETE FROM delall_src").expect("delete all");
         let count =
@@ -3268,6 +3699,8 @@ mod tests {
         crate::create_reflex_ivm(
             "recon_agg_view",
             "SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM recon_agg_src GROUP BY grp",
+            None,
+            None,
             None,
         );
         // Corrupt intermediate table
@@ -3302,6 +3735,8 @@ mod tests {
             "null_agg_view",
             "SELECT grp, SUM(val) AS total, COUNT(val) AS cnt FROM null_agg_src GROUP BY grp",
             None,
+            None,
+            None,
         );
         // SUM should ignore NULL: 10 + 30 = 40
         let total = Spi::get_one::<pgrx::AnyNumeric>(
@@ -3333,6 +3768,8 @@ mod tests {
             "ccvs_view",
             "SELECT grp, COUNT(*) AS cnt_star, COUNT(val) AS cnt_val FROM ccvs_src GROUP BY grp",
             None,
+            None,
+            None,
         );
         let cnt_star = Spi::get_one::<i64>(
             "SELECT cnt_star FROM ccvs_view WHERE grp = 'X'",
@@ -3363,6 +3800,8 @@ mod tests {
             "dg_view",
             "SELECT DISTINCT grp, val FROM dg_src",
             None,
+            None,
+            None,
         );
         assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
         let count =
@@ -3381,6 +3820,8 @@ mod tests {
         let result = crate::create_reflex_ivm(
             "sq_view",
             "SELECT grp, SUM(val) AS total FROM public.sq_src GROUP BY grp",
+            None,
+            None,
             None,
         );
         assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
@@ -3411,6 +3852,8 @@ mod tests {
             "zr_view",
             "SELECT grp, SUM(val) AS total FROM zr_src GROUP BY grp",
             None,
+            None,
+            None,
         );
         // Insert zero rows (WHERE false) — trigger fires but no delta
         Spi::run("INSERT INTO zr_src (grp, val) SELECT 'B', 99 WHERE false").expect("empty insert");
@@ -3432,6 +3875,8 @@ mod tests {
         crate::create_reflex_ivm(
             "uvo_view",
             "SELECT grp, SUM(val) AS total FROM uvo_src GROUP BY grp",
+            None,
+            None,
             None,
         );
         // Update value, not group column
@@ -3457,6 +3902,8 @@ mod tests {
         crate::create_reflex_ivm(
             "md_view",
             "SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM md_src GROUP BY grp",
+            None,
+            None,
             None,
         );
         // Delete two rows separately
@@ -3491,6 +3938,8 @@ mod tests {
         crate::create_reflex_ivm(
             "lb_view",
             "SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM lb_src GROUP BY grp",
+            None,
+            None,
             None,
         );
         // Compare IMV against direct query
@@ -3537,6 +3986,8 @@ mod tests {
             "wc_view",
             "SELECT grp, SUM(val) AS total FROM wc_src WHERE active = true GROUP BY grp",
             None,
+            None,
+            None,
         );
         let a = Spi::get_one::<pgrx::AnyNumeric>(
             "SELECT total FROM wc_view WHERE grp = 'A'",
@@ -3565,6 +4016,8 @@ mod tests {
         crate::create_reflex_ivm(
             "avg_same_view",
             "SELECT grp, AVG(val) AS avg_val FROM avg_same_src GROUP BY grp",
+            None,
+            None,
             None,
         );
         let avg = Spi::get_one::<pgrx::AnyNumeric>(
@@ -3596,6 +4049,8 @@ mod tests {
         let result = crate::create_reflex_ivm(
             "test_schema.sq_view2",
             "SELECT grp, SUM(val) AS total FROM test_schema.sq_src2 GROUP BY grp",
+            None,
+            None,
             None,
         );
         assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
@@ -3641,6 +4096,8 @@ mod tests {
             "mlc_l1",
             "SELECT region, SUM(amount) AS total, COUNT(*) AS cnt FROM mlc_src GROUP BY region",
             None,
+            None,
+            None,
         );
         assert_eq!(r1, "CREATE REFLEX INCREMENTAL VIEW");
 
@@ -3648,6 +4105,8 @@ mod tests {
         let r2 = crate::create_reflex_ivm(
             "mlc_l2",
             "SELECT region, SUM(total) AS grand_total FROM mlc_l1 GROUP BY region",
+            None,
+            None,
             None,
         );
         assert_eq!(r2, "CREATE REFLEX INCREMENTAL VIEW");
@@ -3738,6 +4197,8 @@ mod tests {
             "pt_del_view",
             "SELECT id, region, val FROM pt_del_src",
             None,
+            None,
+            None,
         );
         assert_eq!(
             Spi::get_one::<i64>("SELECT COUNT(*) FROM pt_del_view").expect("q").expect("v"),
@@ -3778,6 +4239,8 @@ mod tests {
         crate::create_reflex_ivm(
             "pt_upd_view",
             "SELECT id, region, val FROM pt_upd_src",
+            None,
+            None,
             None,
         );
 
@@ -3844,6 +4307,8 @@ mod tests {
             "ptj_view",
             "SELECT s.id, s.product_id, s.amount, p.name FROM ptj_sales s JOIN ptj_products p ON s.product_id = p.id",
             Some("id"),
+            None,
+            None,
         );
         assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
 
@@ -3896,6 +4361,8 @@ mod tests {
             "ptju_view",
             "SELECT s.id, s.qty, p.name FROM ptju_sales s JOIN ptju_products p ON s.product_id = p.id",
             Some("id"),
+            None,
+            None,
         );
 
         // UPDATE the secondary table (product name change)
@@ -3924,6 +4391,8 @@ mod tests {
         crate::create_reflex_ivm(
             "ptjnk_view",
             "SELECT s.id, s.amount, p.name FROM ptjnk_sales s JOIN ptjnk_products p ON s.product_id = p.id",
+            None,
+            None,
             None,
         );
         assert_eq!(
@@ -3962,6 +4431,8 @@ mod tests {
             "ptjko_view",
             "SELECT s.id, s.product_id, s.amount, p.name FROM ptjko_sales s JOIN ptjko_products p ON s.product_id = p.id",
             Some("id"),
+            None,
+            None,
         );
         assert_eq!(
             Spi::get_one::<i64>("SELECT COUNT(*) FROM ptjko_view").expect("q").expect("v"),
@@ -4007,6 +4478,8 @@ mod tests {
              JOIN pt3_products p ON s.product_id = p.id \
              JOIN pt3_regions r ON s.region_id = r.id",
             Some("id"),
+            None,
+            None,
         );
         assert_eq!(
             Spi::get_one::<i64>("SELECT COUNT(*) FROM pt3_view").expect("q").expect("v"),
@@ -4061,6 +4534,8 @@ mod tests {
             "SELECT f.product_id, f.region_id, f.val, d.label \
              FROM ptck_facts f JOIN ptck_dims d ON f.dim_id = d.id",
             Some("product_id, region_id"),
+            None,
+            None,
         );
         assert_eq!(
             Spi::get_one::<i64>("SELECT COUNT(*) FROM ptck_view").expect("q").expect("v"),
@@ -4110,6 +4585,8 @@ mod tests {
             "SELECT i.item_id AS id, i.price, c.cat_name AS category \
              FROM ptak_items i JOIN ptak_cats c ON i.cat_id = c.id",
             Some("id"),
+            None,
+            None,
         );
         assert_eq!(
             Spi::get_one::<i64>("SELECT COUNT(*) FROM ptak_view").expect("q").expect("v"),
@@ -4148,6 +4625,8 @@ mod tests {
             "ptjis_view",
             "SELECT s.id, s.amount, p.name FROM ptjis_sales s JOIN ptjis_products p ON s.product_id = p.id",
             Some("id"),
+            None,
+            None,
         );
         assert_eq!(
             Spi::get_one::<i64>("SELECT COUNT(*) FROM ptjis_view").expect("q").expect("v"),
@@ -4198,12 +4677,16 @@ mod tests {
             "cpta_l1",
             "SELECT id, region, amount FROM cpta_src WHERE active = true",
             None,
+            None,
+            None,
         );
 
         // L2: aggregate on L1 (SUM by region)
         crate::create_reflex_ivm(
             "cpta_l2",
             "SELECT region, SUM(amount) AS total, COUNT(*) AS cnt FROM cpta_l1 GROUP BY region",
+            None,
+            None,
             None,
         );
 
@@ -4292,12 +4775,16 @@ mod tests {
             "catp_l1",
             "SELECT city, SUM(revenue) AS total, COUNT(*) AS cnt FROM catp_src GROUP BY city",
             None,
+            None,
+            None,
         );
 
         // L2: passthrough of L1 (reads all rows from the aggregate target)
         crate::create_reflex_ivm(
             "catp_l2",
             "SELECT city, total, cnt FROM catp_l1",
+            None,
+            None,
             None,
         );
 
@@ -4387,12 +4874,16 @@ mod tests {
             "SELECT s.id, s.amount, p.category \
              FROM cpja_sales s JOIN cpja_products p ON s.product_id = p.id",
             Some("id"),
+            None,
+            None,
         );
 
         // L2: aggregate on L1 (SUM by category)
         crate::create_reflex_ivm(
             "cpja_l2",
             "SELECT category, SUM(amount) AS total, COUNT(*) AS cnt FROM cpja_l1 GROUP BY category",
+            None,
+            None,
             None,
         );
 
@@ -4477,12 +4968,16 @@ mod tests {
             "mmis_agg",
             "SELECT dept, SUM(salary) AS total, COUNT(*) AS cnt FROM mmis_src GROUP BY dept",
             None,
+            None,
+            None,
         );
 
         // IMV2: passthrough — all active employees
         crate::create_reflex_ivm(
             "mmis_active",
             "SELECT id, dept, salary FROM mmis_src WHERE active = true",
+            None,
+            None,
             None,
         );
 
@@ -4491,12 +4986,16 @@ mod tests {
             "mmis_depts",
             "SELECT DISTINCT dept FROM mmis_src",
             None,
+            None,
+            None,
         );
 
         // IMV4: aggregate — AVG salary globally
         crate::create_reflex_ivm(
             "mmis_avg",
             "SELECT AVG(salary) AS avg_sal FROM mmis_src",
+            None,
+            None,
             None,
         );
 
@@ -4625,6 +5124,8 @@ mod tests {
             )
             SELECT region, SUM(val) AS total FROM active_orders GROUP BY region",
             None,
+            None,
+            None,
         );
         assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
 
@@ -4678,6 +5179,8 @@ mod tests {
             "hv_view",
             "SELECT region, SUM(amount) AS total FROM hv_src GROUP BY region HAVING SUM(amount) > 200",
             None,
+            None,
+            None,
         );
 
         // US = 1100, JP = 2000 → both > 200. EU = 150 → excluded.
@@ -4707,6 +5210,8 @@ mod tests {
         crate::create_reflex_ivm(
             "hvd_view",
             "SELECT grp, SUM(val) AS total FROM hvd_src GROUP BY grp HAVING SUM(val) > 50",
+            None,
+            None,
             None,
         );
 
@@ -4749,6 +5254,8 @@ mod tests {
             "hvn_view",
             "SELECT grp, SUM(val) AS total FROM hvn_src GROUP BY grp HAVING COUNT(*) > 2",
             None,
+            None,
+            None,
         );
 
         // A has 3 rows → passes. B has 2 rows → fails.
@@ -4781,6 +5288,8 @@ mod tests {
         let result = crate::create_reflex_ivm(
             "mv_imv",
             "SELECT grp, SUM(total) AS grand_total FROM mv_src GROUP BY grp",
+            None,
+            None,
             None,
         );
         assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
@@ -4829,10 +5338,14 @@ mod tests {
             "rdep_v1",
             "SELECT grp, SUM(val) AS total FROM rdep_src GROUP BY grp",
             None,
+            None,
+            None,
         );
         crate::create_reflex_ivm(
             "rdep_v2",
             "SELECT grp, COUNT(*) AS cnt FROM rdep_src GROUP BY grp",
+            None,
+            None,
             None,
         );
 
@@ -4879,6 +5392,8 @@ mod tests {
         crate::create_reflex_ivm(
             "bo_view",
             "SELECT grp, BOOL_OR(flag) AS any_flag FROM bo_src GROUP BY grp",
+            None,
+            None,
             None,
         );
 
@@ -4944,6 +5459,8 @@ mod tests {
              FROM lj_orders o LEFT JOIN lj_products p ON o.product_id = p.id \
              GROUP BY o.region",
             None,
+            None,
+            None,
         );
 
         // Verify initial: US=100+50+75=225, EU=200
@@ -4996,6 +5513,8 @@ mod tests {
             "SELECT i.id AS item_id, i.val, c.name AS cat_name \
              FROM rj_items i RIGHT JOIN rj_cats c ON i.cat_id = c.id",
             None,
+            None,
+            None,
         );
 
         // All 3 cats should appear (A has 2 items, B and C have NULL items)
@@ -5036,6 +5555,8 @@ mod tests {
         crate::create_reflex_ivm(
             "cast_view",
             "SELECT grp, SUM(val)::BIGINT AS total FROM cast_src GROUP BY grp",
+            None,
+            None,
             None,
         );
 
@@ -5097,6 +5618,8 @@ mod tests {
             "sq_view",
             "SELECT id, val FROM (SELECT id, val FROM sq_src WHERE active = true) AS sub",
             None,
+            None,
+            None,
         );
 
         let count = Spi::get_one::<i64>("SELECT COUNT(*) FROM sq_view")
@@ -5150,6 +5673,8 @@ mod tests {
              JOIN (SELECT product_id, SUM(qty) AS total_qty FROM sqr_orders GROUP BY product_id) AS sub \
              ON p.id = sub.product_id",
             None,
+            None,
+            None,
         );
         assert!(
             result.starts_with("ERROR:"),
@@ -5173,6 +5698,8 @@ mod tests {
         crate::create_reflex_ivm(
             "sqo_view",
             "SELECT id, val FROM (SELECT id, val FROM sqo_src WHERE val > 0) AS sub",
+            None,
+            None,
             None,
         );
 
@@ -5211,6 +5738,1227 @@ mod tests {
             ) x",
         ).expect("q").expect("v");
         assert_eq!(mismatches, 0, "Subquery view should match filtered source");
+    }
+
+    // ---- Storage mode tests ----
+
+    #[pg_test]
+    fn test_create_logged_imv() {
+        Spi::run("CREATE TABLE log_orders (id SERIAL, city TEXT, amount NUMERIC)")
+            .expect("create table");
+        Spi::run("INSERT INTO log_orders (city, amount) VALUES ('Paris', 100), ('London', 200)")
+            .expect("insert data");
+
+        let result = crate::create_reflex_ivm(
+            "log_city_totals",
+            "SELECT city, SUM(amount) AS total FROM log_orders GROUP BY city",
+            None,
+            Some("LOGGED"),
+            None,
+        );
+        assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
+
+        // Verify both tables are LOGGED (relpersistence = 'p')
+        let target_persist = Spi::get_one::<String>(
+            "SELECT relpersistence::text FROM pg_class WHERE relname = 'log_city_totals'",
+        ).expect("query").expect("value");
+        assert_eq!(target_persist, "p", "Target table should be permanent (logged)");
+
+        let intermediate_persist = Spi::get_one::<String>(
+            "SELECT relpersistence::text FROM pg_class WHERE relname = '__reflex_intermediate_log_city_totals'",
+        ).expect("query").expect("value");
+        assert_eq!(intermediate_persist, "p", "Intermediate table should be permanent (logged)");
+
+        // Verify data is correct
+        let paris_total = Spi::get_one::<pgrx::AnyNumeric>(
+            "SELECT total FROM log_city_totals WHERE city = 'Paris'",
+        ).expect("query").expect("value");
+        assert_eq!(paris_total.to_string(), "100");
+
+        // Verify storage_mode in reference table
+        let mode = Spi::get_one::<String>(
+            "SELECT storage_mode FROM public.__reflex_ivm_reference WHERE name = 'log_city_totals'",
+        ).expect("query").expect("value");
+        assert_eq!(mode, "LOGGED");
+    }
+
+    #[pg_test]
+    fn test_create_logged_passthrough() {
+        Spi::run("CREATE TABLE log_pt_src (id SERIAL PRIMARY KEY, val TEXT NOT NULL)")
+            .expect("create table");
+        Spi::run("INSERT INTO log_pt_src (val) VALUES ('a'), ('b')").expect("insert");
+
+        crate::create_reflex_ivm(
+            "log_pt_view",
+            "SELECT id, val FROM log_pt_src",
+            None,
+            Some("LOGGED"),
+            None,
+        );
+
+        // Verify target table is LOGGED
+        let persist = Spi::get_one::<String>(
+            "SELECT relpersistence::text FROM pg_class WHERE relname = 'log_pt_view'",
+        ).expect("query").expect("value");
+        assert_eq!(persist, "p", "Passthrough target should be permanent (logged)");
+    }
+
+    #[pg_test]
+    fn test_logged_trigger_works() {
+        Spi::run("CREATE TABLE log_trg (id SERIAL, region TEXT, amount NUMERIC)")
+            .expect("create table");
+        Spi::run("INSERT INTO log_trg (region, amount) VALUES ('A', 10), ('B', 20)")
+            .expect("insert");
+
+        crate::create_reflex_ivm(
+            "log_trg_view",
+            "SELECT region, SUM(amount) AS total FROM log_trg GROUP BY region",
+            None,
+            Some("LOGGED"),
+            None,
+        );
+
+        // INSERT trigger
+        Spi::run("INSERT INTO log_trg (region, amount) VALUES ('A', 5)").expect("insert");
+        let a_total = Spi::get_one::<pgrx::AnyNumeric>(
+            "SELECT total FROM log_trg_view WHERE region = 'A'",
+        ).expect("query").expect("value");
+        assert_eq!(a_total.to_string(), "15");
+
+        // DELETE trigger
+        Spi::run("DELETE FROM log_trg WHERE amount = 20").expect("delete");
+        let b_count = Spi::get_one::<i64>(
+            "SELECT COUNT(*) FROM log_trg_view WHERE region = 'B'",
+        ).expect("query").expect("value");
+        assert_eq!(b_count, 0, "Region B should be gone after deleting its only row");
+    }
+
+    #[pg_test]
+    fn test_default_is_unlogged() {
+        Spi::run("CREATE TABLE def_orders (id SERIAL, city TEXT, amount NUMERIC)")
+            .expect("create table");
+        Spi::run("INSERT INTO def_orders (city, amount) VALUES ('Paris', 100)")
+            .expect("insert");
+
+        crate::create_reflex_ivm(
+            "def_city_totals",
+            "SELECT city, SUM(amount) AS total FROM def_orders GROUP BY city",
+            None,
+            None,
+            None,
+        );
+
+        // Verify tables are UNLOGGED (relpersistence = 'u')
+        let target_persist = Spi::get_one::<String>(
+            "SELECT relpersistence::text FROM pg_class WHERE relname = 'def_city_totals'",
+        ).expect("query").expect("value");
+        assert_eq!(target_persist, "u", "Default target should be unlogged");
+
+        let intermediate_persist = Spi::get_one::<String>(
+            "SELECT relpersistence::text FROM pg_class WHERE relname = '__reflex_intermediate_def_city_totals'",
+        ).expect("query").expect("value");
+        assert_eq!(intermediate_persist, "u", "Default intermediate should be unlogged");
+    }
+
+    #[pg_test]
+    fn test_invalid_storage_mode() {
+        Spi::run("CREATE TABLE inv_stor (id SERIAL, val INT)").expect("create table");
+        let result = crate::create_reflex_ivm(
+            "inv_stor_view",
+            "SELECT val, COUNT(*) AS cnt FROM inv_stor GROUP BY val",
+            None,
+            Some("INVALID"),
+            None,
+        );
+        assert!(result.starts_with("ERROR:"), "Invalid storage should return error, got: {}", result);
+    }
+
+    // ---- Deferred mode tests ----
+
+    #[pg_test]
+    fn test_deferred_basic_insert() {
+        Spi::run("CREATE TABLE def_src (id SERIAL, city TEXT, amount NUMERIC)")
+            .expect("create table");
+        Spi::run("INSERT INTO def_src (city, amount) VALUES ('Paris', 100), ('London', 200)")
+            .expect("insert seed");
+
+        let result = crate::create_reflex_ivm(
+            "def_view",
+            "SELECT city, SUM(amount) AS total FROM def_src GROUP BY city",
+            None,
+            None,
+            Some("DEFERRED"),
+        );
+        assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
+
+        // Verify refresh_mode in reference table
+        let mode = Spi::get_one::<String>(
+            "SELECT refresh_mode FROM public.__reflex_ivm_reference WHERE name = 'def_view'",
+        ).expect("query").expect("value");
+        assert_eq!(mode, "DEFERRED");
+
+        // Verify staging table exists
+        let staging_exists = Spi::get_one::<bool>(
+            "SELECT EXISTS(SELECT 1 FROM pg_class WHERE relname = '__reflex_delta_def_src')",
+        ).expect("query").expect("value");
+        assert!(staging_exists, "Staging table should exist");
+
+        // Verify deferred pending table exists
+        let pending_exists = Spi::get_one::<bool>(
+            "SELECT EXISTS(SELECT 1 FROM pg_class WHERE relname = '__reflex_deferred_pending')",
+        ).expect("query").expect("value");
+        assert!(pending_exists, "Deferred pending table should exist");
+
+        // Verify initial data is correct (created during initial materialization)
+        let paris_total = Spi::get_one::<pgrx::AnyNumeric>(
+            "SELECT total FROM def_view WHERE city = 'Paris'",
+        ).expect("query").expect("value");
+        assert_eq!(paris_total.to_string(), "100");
+    }
+
+    #[pg_test]
+    fn test_immediate_mode_explicit() {
+        Spi::run("CREATE TABLE imm_src (id SERIAL, city TEXT, amount NUMERIC)")
+            .expect("create table");
+        Spi::run("INSERT INTO imm_src (city, amount) VALUES ('Paris', 100)")
+            .expect("insert");
+
+        let result = crate::create_reflex_ivm(
+            "imm_view",
+            "SELECT city, SUM(amount) AS total FROM imm_src GROUP BY city",
+            None,
+            None,
+            Some("IMMEDIATE"),
+        );
+        assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
+
+        // Verify it works like normal: INSERT should update immediately
+        Spi::run("INSERT INTO imm_src (city, amount) VALUES ('Paris', 50)")
+            .expect("insert");
+        let total = Spi::get_one::<pgrx::AnyNumeric>(
+            "SELECT total FROM imm_view WHERE city = 'Paris'",
+        ).expect("query").expect("value");
+        assert_eq!(total.to_string(), "150");
+    }
+
+    #[pg_test]
+    fn test_invalid_mode() {
+        Spi::run("CREATE TABLE inv_mode (id SERIAL, val INT)").expect("create table");
+        let result = crate::create_reflex_ivm(
+            "inv_mode_view",
+            "SELECT val, COUNT(*) AS cnt FROM inv_mode GROUP BY val",
+            None,
+            None,
+            Some("INVALID"),
+        );
+        assert!(result.starts_with("ERROR:"), "Invalid mode should return error, got: {}", result);
+    }
+
+    // ========================================================================
+    // UNION ALL tests
+    // ========================================================================
+
+    /// Basic UNION ALL of two tables — initial materialization
+    #[pg_test]
+    fn test_union_all_basic() {
+        Spi::run("CREATE TABLE ua_eu (id SERIAL, city TEXT, amount NUMERIC)").expect("create");
+        Spi::run("CREATE TABLE ua_us (id SERIAL, city TEXT, amount NUMERIC)").expect("create");
+        Spi::run("INSERT INTO ua_eu (city, amount) VALUES ('Paris', 100), ('Berlin', 200)").expect("seed");
+        Spi::run("INSERT INTO ua_us (city, amount) VALUES ('NYC', 300), ('LA', 400)").expect("seed");
+
+        let result = crate::create_reflex_ivm(
+            "ua_basic",
+            "SELECT city, amount FROM ua_eu UNION ALL SELECT city, amount FROM ua_us",
+            None, None, None,
+        );
+        assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
+
+        let count = Spi::get_one::<i64>("SELECT COUNT(*) FROM ua_basic")
+            .expect("q").expect("v");
+        assert_eq!(count, 4);
+
+        // Verify all rows present
+        let paris = Spi::get_one::<i64>(
+            "SELECT COUNT(*) FROM ua_basic WHERE city = 'Paris'",
+        ).expect("q").expect("v");
+        assert_eq!(paris, 1);
+
+        let nyc = Spi::get_one::<i64>(
+            "SELECT COUNT(*) FROM ua_basic WHERE city = 'NYC'",
+        ).expect("q").expect("v");
+        assert_eq!(nyc, 1);
+    }
+
+    /// UNION ALL: INSERT into first source propagates to target
+    #[pg_test]
+    fn test_union_all_insert_source_a() {
+        Spi::run("CREATE TABLE uaia_eu (id SERIAL, city TEXT, amount NUMERIC)").expect("create");
+        Spi::run("CREATE TABLE uaia_us (id SERIAL, city TEXT, amount NUMERIC)").expect("create");
+        Spi::run("INSERT INTO uaia_eu (city, amount) VALUES ('Paris', 100)").expect("seed");
+        Spi::run("INSERT INTO uaia_us (city, amount) VALUES ('NYC', 200)").expect("seed");
+
+        crate::create_reflex_ivm(
+            "uaia_view",
+            "SELECT city, amount FROM uaia_eu UNION ALL SELECT city, amount FROM uaia_us",
+            None, None, None,
+        );
+
+        // INSERT into EU source → should appear in target
+        Spi::run("INSERT INTO uaia_eu (city, amount) VALUES ('Berlin', 300)").expect("insert");
+        let count = Spi::get_one::<i64>("SELECT COUNT(*) FROM uaia_view")
+            .expect("q").expect("v");
+        assert_eq!(count, 3);
+
+        let berlin = Spi::get_one::<pgrx::AnyNumeric>(
+            "SELECT amount FROM uaia_view WHERE city = 'Berlin'",
+        ).expect("q").expect("v");
+        assert_eq!(berlin.to_string(), "300");
+    }
+
+    /// UNION ALL: INSERT into second source propagates to target
+    #[pg_test]
+    fn test_union_all_insert_source_b() {
+        Spi::run("CREATE TABLE uaib_eu (id SERIAL, city TEXT, amount NUMERIC)").expect("create");
+        Spi::run("CREATE TABLE uaib_us (id SERIAL, city TEXT, amount NUMERIC)").expect("create");
+        Spi::run("INSERT INTO uaib_eu (city, amount) VALUES ('Paris', 100)").expect("seed");
+        Spi::run("INSERT INTO uaib_us (city, amount) VALUES ('NYC', 200)").expect("seed");
+
+        crate::create_reflex_ivm(
+            "uaib_view",
+            "SELECT city, amount FROM uaib_eu UNION ALL SELECT city, amount FROM uaib_us",
+            None, None, None,
+        );
+
+        // INSERT into US source
+        Spi::run("INSERT INTO uaib_us (city, amount) VALUES ('LA', 400), ('Chicago', 500)").expect("insert");
+        let count = Spi::get_one::<i64>("SELECT COUNT(*) FROM uaib_view")
+            .expect("q").expect("v");
+        assert_eq!(count, 4);
+    }
+
+    /// UNION ALL: DELETE from one source removes only those rows
+    #[pg_test]
+    fn test_union_all_delete() {
+        Spi::run("CREATE TABLE uad_a (id SERIAL PRIMARY KEY, val TEXT)").expect("create");
+        Spi::run("CREATE TABLE uad_b (id SERIAL PRIMARY KEY, val TEXT)").expect("create");
+        Spi::run("INSERT INTO uad_a (val) VALUES ('x'), ('y')").expect("seed");
+        Spi::run("INSERT INTO uad_b (val) VALUES ('z')").expect("seed");
+
+        crate::create_reflex_ivm(
+            "uad_view",
+            "SELECT id, val FROM uad_a UNION ALL SELECT id, val FROM uad_b",
+            None, None, None,
+        );
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT COUNT(*) FROM uad_view").expect("q").expect("v"),
+            3
+        );
+
+        // DELETE from source A
+        Spi::run("DELETE FROM uad_a WHERE val = 'x'").expect("delete");
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT COUNT(*) FROM uad_view").expect("q").expect("v"),
+            2
+        );
+
+        // Source B rows untouched
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT COUNT(*) FROM uad_view WHERE val = 'z'").expect("q").expect("v"),
+            1
+        );
+    }
+
+    /// UNION ALL: UPDATE in one source reflected in target
+    #[pg_test]
+    fn test_union_all_update() {
+        Spi::run("CREATE TABLE uau_a (id SERIAL PRIMARY KEY, val INT)").expect("create");
+        Spi::run("CREATE TABLE uau_b (id SERIAL PRIMARY KEY, val INT)").expect("create");
+        Spi::run("INSERT INTO uau_a (val) VALUES (10), (20)").expect("seed");
+        Spi::run("INSERT INTO uau_b (val) VALUES (30)").expect("seed");
+
+        crate::create_reflex_ivm(
+            "uau_view",
+            "SELECT id, val FROM uau_a UNION ALL SELECT id, val FROM uau_b",
+            None, None, None,
+        );
+
+        Spi::run("UPDATE uau_a SET val = 99 WHERE val = 10").expect("update");
+        let updated = Spi::get_one::<i64>(
+            "SELECT COUNT(*) FROM uau_view WHERE val = 99",
+        ).expect("q").expect("v");
+        assert_eq!(updated, 1);
+
+        // Old value gone
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT COUNT(*) FROM uau_view WHERE val = 10").expect("q").expect("v"),
+            0
+        );
+    }
+
+    /// UNION ALL with 3 operands
+    #[pg_test]
+    fn test_union_all_three_operands() {
+        Spi::run("CREATE TABLE ua3_a (id SERIAL, val TEXT)").expect("create");
+        Spi::run("CREATE TABLE ua3_b (id SERIAL, val TEXT)").expect("create");
+        Spi::run("CREATE TABLE ua3_c (id SERIAL, val TEXT)").expect("create");
+        Spi::run("INSERT INTO ua3_a (val) VALUES ('a1'), ('a2')").expect("seed");
+        Spi::run("INSERT INTO ua3_b (val) VALUES ('b1')").expect("seed");
+        Spi::run("INSERT INTO ua3_c (val) VALUES ('c1'), ('c2'), ('c3')").expect("seed");
+
+        let result = crate::create_reflex_ivm(
+            "ua3_view",
+            "SELECT val FROM ua3_a UNION ALL SELECT val FROM ua3_b UNION ALL SELECT val FROM ua3_c",
+            None, None, None,
+        );
+        assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
+
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT COUNT(*) FROM ua3_view").expect("q").expect("v"),
+            6
+        );
+
+        // INSERT into middle source
+        Spi::run("INSERT INTO ua3_b (val) VALUES ('b2')").expect("insert");
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT COUNT(*) FROM ua3_view").expect("q").expect("v"),
+            7
+        );
+    }
+
+    /// UNION ALL with aggregation in sub-queries
+    #[pg_test]
+    fn test_union_all_with_aggregates() {
+        Spi::run("CREATE TABLE uaag_eu (id SERIAL, city TEXT, amount NUMERIC)").expect("create");
+        Spi::run("CREATE TABLE uaag_us (id SERIAL, city TEXT, amount NUMERIC)").expect("create");
+        Spi::run("INSERT INTO uaag_eu (city, amount) VALUES ('Paris', 100), ('Paris', 200), ('Berlin', 50)").expect("seed");
+        Spi::run("INSERT INTO uaag_us (city, amount) VALUES ('NYC', 300), ('NYC', 100)").expect("seed");
+
+        let result = crate::create_reflex_ivm(
+            "uaag_view",
+            "SELECT city, SUM(amount) AS total FROM uaag_eu GROUP BY city \
+             UNION ALL \
+             SELECT city, SUM(amount) AS total FROM uaag_us GROUP BY city",
+            None, None, None,
+        );
+        assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
+
+        // Should have 3 rows: Paris(300), Berlin(50), NYC(400)
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT COUNT(*) FROM uaag_view").expect("q").expect("v"),
+            3
+        );
+
+        let paris = Spi::get_one::<pgrx::AnyNumeric>(
+            "SELECT total FROM uaag_view WHERE city = 'Paris'",
+        ).expect("q").expect("v");
+        assert_eq!(paris.to_string(), "300");
+
+        // INSERT into EU → Paris aggregate updates
+        Spi::run("INSERT INTO uaag_eu (city, amount) VALUES ('Paris', 50)").expect("insert");
+        let paris2 = Spi::get_one::<pgrx::AnyNumeric>(
+            "SELECT total FROM uaag_view WHERE city = 'Paris'",
+        ).expect("q").expect("v");
+        assert_eq!(paris2.to_string(), "350");
+    }
+
+    /// UNION ALL with different WHERE clauses on the same table
+    #[pg_test]
+    fn test_union_all_same_table_different_filters() {
+        Spi::run("CREATE TABLE uaf_src (id SERIAL, category TEXT, val INT)").expect("create");
+        Spi::run("INSERT INTO uaf_src (category, val) VALUES \
+            ('A', 10), ('A', 20), ('B', 30), ('B', 40), ('C', 50)").expect("seed");
+
+        let result = crate::create_reflex_ivm(
+            "uaf_view",
+            "SELECT category, SUM(val) AS total FROM uaf_src WHERE category = 'A' GROUP BY category \
+             UNION ALL \
+             SELECT category, SUM(val) AS total FROM uaf_src WHERE category = 'B' GROUP BY category",
+            None, None, None,
+        );
+        assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
+
+        // Only A and B, not C
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT COUNT(*) FROM uaf_view").expect("q").expect("v"),
+            2
+        );
+
+        // Insert a new A row
+        Spi::run("INSERT INTO uaf_src (category, val) VALUES ('A', 5)").expect("insert");
+        let a_total = Spi::get_one::<pgrx::AnyNumeric>(
+            "SELECT total FROM uaf_view WHERE category = 'A'",
+        ).expect("q").expect("v");
+        assert_eq!(a_total.to_string(), "35"); // 10+20+5
+
+        // Insert a C row — should NOT appear (filtered out by both operands)
+        Spi::run("INSERT INTO uaf_src (category, val) VALUES ('C', 100)").expect("insert");
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT COUNT(*) FROM uaf_view").expect("q").expect("v"),
+            2
+        );
+    }
+
+    /// UNION ALL: TRUNCATE one source clears its rows but not the other
+    #[pg_test]
+    fn test_union_all_truncate() {
+        Spi::run("CREATE TABLE uat_a (id SERIAL, val TEXT)").expect("create");
+        Spi::run("CREATE TABLE uat_b (id SERIAL, val TEXT)").expect("create");
+        Spi::run("INSERT INTO uat_a (val) VALUES ('a1'), ('a2')").expect("seed");
+        Spi::run("INSERT INTO uat_b (val) VALUES ('b1')").expect("seed");
+
+        crate::create_reflex_ivm(
+            "uat_view",
+            "SELECT val FROM uat_a UNION ALL SELECT val FROM uat_b",
+            None, None, None,
+        );
+
+        Spi::run("TRUNCATE uat_a").expect("truncate");
+        // Only b1 remains
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT COUNT(*) FROM uat_view").expect("q").expect("v"),
+            1
+        );
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT COUNT(*) FROM uat_view WHERE val = 'b1'").expect("q").expect("v"),
+            1
+        );
+    }
+
+    // ========================================================================
+    // UNION (dedup) tests
+    // ========================================================================
+
+    /// Basic UNION dedup — duplicate rows across sources appear once
+    #[pg_test]
+    fn test_union_dedup_basic() {
+        Spi::run("CREATE TABLE ud_a (id SERIAL, city TEXT)").expect("create");
+        Spi::run("CREATE TABLE ud_b (id SERIAL, city TEXT)").expect("create");
+        Spi::run("INSERT INTO ud_a (city) VALUES ('Paris'), ('Berlin')").expect("seed");
+        Spi::run("INSERT INTO ud_b (city) VALUES ('Paris'), ('NYC')").expect("seed");
+
+        let result = crate::create_reflex_ivm(
+            "ud_basic",
+            "SELECT city FROM ud_a UNION SELECT city FROM ud_b",
+            None, None, None,
+        );
+        assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
+
+        // Paris appears in both, but UNION deduplicates → 3 distinct cities
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT COUNT(*) FROM ud_basic").expect("q").expect("v"),
+            3
+        );
+    }
+
+    /// UNION dedup: delete from one source — row still visible from other source
+    #[pg_test]
+    fn test_union_dedup_delete_one_source() {
+        Spi::run("CREATE TABLE udd_a (id SERIAL PRIMARY KEY, city TEXT)").expect("create");
+        Spi::run("CREATE TABLE udd_b (id SERIAL PRIMARY KEY, city TEXT)").expect("create");
+        Spi::run("INSERT INTO udd_a (city) VALUES ('Paris'), ('Berlin')").expect("seed");
+        Spi::run("INSERT INTO udd_b (city) VALUES ('Paris'), ('NYC')").expect("seed");
+
+        crate::create_reflex_ivm(
+            "udd_view",
+            "SELECT city FROM udd_a UNION SELECT city FROM udd_b",
+            None, None, None,
+        );
+
+        // Delete Paris from source A — still visible via source B
+        Spi::run("DELETE FROM udd_a WHERE city = 'Paris'").expect("delete");
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT COUNT(*) FROM udd_view WHERE city = 'Paris'").expect("q").expect("v"),
+            1,
+            "Paris should still be visible via source B"
+        );
+
+        // Total: Berlin, Paris, NYC = 3
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT COUNT(*) FROM udd_view").expect("q").expect("v"),
+            3
+        );
+    }
+
+    /// UNION dedup: delete from both sources — row disappears
+    #[pg_test]
+    fn test_union_dedup_delete_both_sources() {
+        Spi::run("CREATE TABLE uddb_a (id SERIAL PRIMARY KEY, city TEXT)").expect("create");
+        Spi::run("CREATE TABLE uddb_b (id SERIAL PRIMARY KEY, city TEXT)").expect("create");
+        Spi::run("INSERT INTO uddb_a (city) VALUES ('Paris')").expect("seed");
+        Spi::run("INSERT INTO uddb_b (city) VALUES ('Paris'), ('NYC')").expect("seed");
+
+        crate::create_reflex_ivm(
+            "uddb_view",
+            "SELECT city FROM uddb_a UNION SELECT city FROM uddb_b",
+            None, None, None,
+        );
+
+        // Delete Paris from A
+        Spi::run("DELETE FROM uddb_a WHERE city = 'Paris'").expect("delete");
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT COUNT(*) FROM uddb_view WHERE city = 'Paris'").expect("q").expect("v"),
+            1, "Still visible from B"
+        );
+
+        // Delete Paris from B too
+        Spi::run("DELETE FROM uddb_b WHERE city = 'Paris'").expect("delete");
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT COUNT(*) FROM uddb_view WHERE city = 'Paris'").expect("q").expect("v"),
+            0, "Gone from both sources"
+        );
+
+        // Only NYC remains
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT COUNT(*) FROM uddb_view").expect("q").expect("v"),
+            1
+        );
+    }
+
+    /// UNION dedup: INSERT a duplicate — count stays the same
+    #[pg_test]
+    fn test_union_dedup_insert_duplicate() {
+        Spi::run("CREATE TABLE udi_a (id SERIAL, city TEXT)").expect("create");
+        Spi::run("CREATE TABLE udi_b (id SERIAL, city TEXT)").expect("create");
+        Spi::run("INSERT INTO udi_a (city) VALUES ('Paris')").expect("seed");
+        Spi::run("INSERT INTO udi_b (city) VALUES ('NYC')").expect("seed");
+
+        crate::create_reflex_ivm(
+            "udi_view",
+            "SELECT city FROM udi_a UNION SELECT city FROM udi_b",
+            None, None, None,
+        );
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT COUNT(*) FROM udi_view").expect("q").expect("v"),
+            2
+        );
+
+        // Insert Paris into B — already exists via A, total stays 2
+        Spi::run("INSERT INTO udi_b (city) VALUES ('Paris')").expect("insert dup");
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT COUNT(*) FROM udi_view").expect("q").expect("v"),
+            2, "UNION dedup: duplicate across sources should not add a row"
+        );
+    }
+
+    /// UNION with aggregates in sub-queries
+    #[pg_test]
+    fn test_union_dedup_with_aggregates() {
+        Spi::run("CREATE TABLE uda_eu (id SERIAL, region TEXT, amount NUMERIC)").expect("create");
+        Spi::run("CREATE TABLE uda_us (id SERIAL, region TEXT, amount NUMERIC)").expect("create");
+        Spi::run("INSERT INTO uda_eu (region, amount) VALUES ('West', 100), ('West', 200), ('East', 50)").expect("seed");
+        Spi::run("INSERT INTO uda_us (region, amount) VALUES ('West', 300), ('South', 75)").expect("seed");
+
+        let result = crate::create_reflex_ivm(
+            "uda_view",
+            "SELECT region, SUM(amount) AS total FROM uda_eu GROUP BY region \
+             UNION \
+             SELECT region, SUM(amount) AS total FROM uda_us GROUP BY region",
+            None, None, None,
+        );
+        assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
+
+        // West appears in both with DIFFERENT totals (300 from EU, 300 from US)
+        // UNION dedup on (region, total): EU-West=300, US-West=300 are same row → deduplicated
+        // Result: (West, 300), (East, 50), (South, 75) = 3 rows
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT COUNT(*) FROM uda_view").expect("q").expect("v"),
+            3
+        );
+    }
+
+    // ========================================================================
+    // WINDOW function tests
+    // ========================================================================
+
+    /// Simple ROW_NUMBER() over entire result (no PARTITION BY)
+    #[pg_test]
+    fn test_window_row_number_no_partition() {
+        Spi::run("CREATE TABLE wrn_src (id SERIAL, name TEXT, score INT)").expect("create");
+        Spi::run("INSERT INTO wrn_src (name, score) VALUES \
+            ('Alice', 90), ('Bob', 80), ('Charlie', 70)").expect("seed");
+
+        let result = crate::create_reflex_ivm(
+            "wrn_view",
+            "SELECT name, score, ROW_NUMBER() OVER (ORDER BY score DESC) AS rnk FROM wrn_src",
+            None, None, None,
+        );
+        assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
+
+        // Alice=1, Bob=2, Charlie=3
+        let alice_rank = Spi::get_one::<i64>(
+            "SELECT rnk FROM wrn_view WHERE name = 'Alice'",
+        ).expect("q").expect("v");
+        assert_eq!(alice_rank, 1);
+
+        let charlie_rank = Spi::get_one::<i64>(
+            "SELECT rnk FROM wrn_view WHERE name = 'Charlie'",
+        ).expect("q").expect("v");
+        assert_eq!(charlie_rank, 3);
+    }
+
+    /// ROW_NUMBER: INSERT changes rankings
+    #[pg_test]
+    fn test_window_row_number_insert_reranks() {
+        Spi::run("CREATE TABLE wrni_src (id SERIAL, name TEXT, score INT)").expect("create");
+        Spi::run("INSERT INTO wrni_src (name, score) VALUES \
+            ('Alice', 90), ('Bob', 80)").expect("seed");
+
+        crate::create_reflex_ivm(
+            "wrni_view",
+            "SELECT name, score, ROW_NUMBER() OVER (ORDER BY score DESC) AS rnk FROM wrni_src",
+            None, None, None,
+        );
+
+        // Insert someone who beats Alice
+        Spi::run("INSERT INTO wrni_src (name, score) VALUES ('Zara', 95)").expect("insert");
+
+        let zara_rank = Spi::get_one::<i64>(
+            "SELECT rnk FROM wrni_view WHERE name = 'Zara'",
+        ).expect("q").expect("v");
+        assert_eq!(zara_rank, 1, "Zara should be rank 1");
+
+        let alice_rank = Spi::get_one::<i64>(
+            "SELECT rnk FROM wrni_view WHERE name = 'Alice'",
+        ).expect("q").expect("v");
+        assert_eq!(alice_rank, 2, "Alice should drop to rank 2");
+
+        let bob_rank = Spi::get_one::<i64>(
+            "SELECT rnk FROM wrni_view WHERE name = 'Bob'",
+        ).expect("q").expect("v");
+        assert_eq!(bob_rank, 3, "Bob should drop to rank 3");
+    }
+
+    /// ROW_NUMBER: DELETE changes rankings
+    #[pg_test]
+    fn test_window_row_number_delete_reranks() {
+        Spi::run("CREATE TABLE wrnd_src (id SERIAL PRIMARY KEY, name TEXT, score INT)").expect("create");
+        Spi::run("INSERT INTO wrnd_src (name, score) VALUES \
+            ('Alice', 90), ('Bob', 80), ('Charlie', 70)").expect("seed");
+
+        crate::create_reflex_ivm(
+            "wrnd_view",
+            "SELECT name, score, ROW_NUMBER() OVER (ORDER BY score DESC) AS rnk FROM wrnd_src",
+            None, None, None,
+        );
+
+        // Delete Alice (rank 1)
+        Spi::run("DELETE FROM wrnd_src WHERE name = 'Alice'").expect("delete");
+
+        // Bob promoted to rank 1
+        let bob_rank = Spi::get_one::<i64>(
+            "SELECT rnk FROM wrnd_view WHERE name = 'Bob'",
+        ).expect("q").expect("v");
+        assert_eq!(bob_rank, 1);
+
+        // Charlie promoted to rank 2
+        let charlie_rank = Spi::get_one::<i64>(
+            "SELECT rnk FROM wrnd_view WHERE name = 'Charlie'",
+        ).expect("q").expect("v");
+        assert_eq!(charlie_rank, 2);
+
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT COUNT(*) FROM wrnd_view").expect("q").expect("v"),
+            2
+        );
+    }
+
+    /// ROW_NUMBER with PARTITION BY — partitioned ranking
+    #[pg_test]
+    fn test_window_row_number_partition_by() {
+        Spi::run("CREATE TABLE wrnp_src (id SERIAL, dept TEXT, name TEXT, score INT)").expect("create");
+        Spi::run("INSERT INTO wrnp_src (dept, name, score) VALUES \
+            ('eng', 'Alice', 90), ('eng', 'Bob', 80), ('eng', 'Charlie', 70), \
+            ('sales', 'Dave', 95), ('sales', 'Eve', 85)").expect("seed");
+
+        let result = crate::create_reflex_ivm(
+            "wrnp_view",
+            "SELECT dept, name, score, ROW_NUMBER() OVER (PARTITION BY dept ORDER BY score DESC) AS rnk FROM wrnp_src",
+            None, None, None,
+        );
+        assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
+
+        // eng: Alice=1, Bob=2, Charlie=3
+        let alice_rank = Spi::get_one::<i64>(
+            "SELECT rnk FROM wrnp_view WHERE name = 'Alice'",
+        ).expect("q").expect("v");
+        assert_eq!(alice_rank, 1);
+
+        // sales: Dave=1, Eve=2
+        let dave_rank = Spi::get_one::<i64>(
+            "SELECT rnk FROM wrnp_view WHERE name = 'Dave'",
+        ).expect("q").expect("v");
+        assert_eq!(dave_rank, 1);
+
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT COUNT(*) FROM wrnp_view").expect("q").expect("v"),
+            5
+        );
+    }
+
+    /// PARTITION BY: INSERT affects only the partition, not other partitions
+    #[pg_test]
+    fn test_window_partition_insert_isolation() {
+        Spi::run("CREATE TABLE wpi_src (id SERIAL, dept TEXT, name TEXT, score INT)").expect("create");
+        Spi::run("INSERT INTO wpi_src (dept, name, score) VALUES \
+            ('eng', 'Alice', 90), ('eng', 'Bob', 80), \
+            ('sales', 'Dave', 95)").expect("seed");
+
+        crate::create_reflex_ivm(
+            "wpi_view",
+            "SELECT dept, name, score, ROW_NUMBER() OVER (PARTITION BY dept ORDER BY score DESC) AS rnk FROM wpi_src",
+            None, None, None,
+        );
+
+        // Insert into eng partition — sales should be unaffected
+        Spi::run("INSERT INTO wpi_src (dept, name, score) VALUES ('eng', 'Zara', 95)").expect("insert");
+
+        // eng: Zara=1, Alice=2, Bob=3
+        let zara = Spi::get_one::<i64>(
+            "SELECT rnk FROM wpi_view WHERE name = 'Zara'",
+        ).expect("q").expect("v");
+        assert_eq!(zara, 1);
+
+        let alice = Spi::get_one::<i64>(
+            "SELECT rnk FROM wpi_view WHERE name = 'Alice'",
+        ).expect("q").expect("v");
+        assert_eq!(alice, 2);
+
+        // sales: Dave still rank 1 (unaffected)
+        let dave = Spi::get_one::<i64>(
+            "SELECT rnk FROM wpi_view WHERE name = 'Dave'",
+        ).expect("q").expect("v");
+        assert_eq!(dave, 1);
+    }
+
+    /// RANK() with ties
+    #[pg_test]
+    fn test_window_rank_with_ties() {
+        Spi::run("CREATE TABLE wr_src (id SERIAL, name TEXT, score INT)").expect("create");
+        Spi::run("INSERT INTO wr_src (name, score) VALUES \
+            ('Alice', 90), ('Bob', 90), ('Charlie', 80)").expect("seed");
+
+        let result = crate::create_reflex_ivm(
+            "wr_view",
+            "SELECT name, score, RANK() OVER (ORDER BY score DESC) AS rnk FROM wr_src",
+            None, None, None,
+        );
+        assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
+
+        // Alice and Bob tied at rank 1, Charlie at rank 3 (not 2)
+        let alice = Spi::get_one::<i64>(
+            "SELECT rnk FROM wr_view WHERE name = 'Alice'",
+        ).expect("q").expect("v");
+        assert_eq!(alice, 1);
+
+        let bob = Spi::get_one::<i64>(
+            "SELECT rnk FROM wr_view WHERE name = 'Bob'",
+        ).expect("q").expect("v");
+        assert_eq!(bob, 1);
+
+        let charlie = Spi::get_one::<i64>(
+            "SELECT rnk FROM wr_view WHERE name = 'Charlie'",
+        ).expect("q").expect("v");
+        assert_eq!(charlie, 3); // RANK skips 2
+    }
+
+    /// DENSE_RANK() — no gaps after ties
+    #[pg_test]
+    fn test_window_dense_rank() {
+        Spi::run("CREATE TABLE wdr_src (id SERIAL, name TEXT, score INT)").expect("create");
+        Spi::run("INSERT INTO wdr_src (name, score) VALUES \
+            ('Alice', 90), ('Bob', 90), ('Charlie', 80)").expect("seed");
+
+        let result = crate::create_reflex_ivm(
+            "wdr_view",
+            "SELECT name, score, DENSE_RANK() OVER (ORDER BY score DESC) AS rnk FROM wdr_src",
+            None, None, None,
+        );
+        assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
+
+        let charlie = Spi::get_one::<i64>(
+            "SELECT rnk FROM wdr_view WHERE name = 'Charlie'",
+        ).expect("q").expect("v");
+        assert_eq!(charlie, 2); // DENSE_RANK: 1,1,2 not 1,1,3
+    }
+
+    /// SUM() OVER (PARTITION BY) — running/partition aggregate via window
+    #[pg_test]
+    fn test_window_sum_partition() {
+        Spi::run("CREATE TABLE wsp_src (id SERIAL, dept TEXT, amount NUMERIC)").expect("create");
+        Spi::run("INSERT INTO wsp_src (dept, amount) VALUES \
+            ('eng', 100), ('eng', 200), ('sales', 50), ('sales', 75)").expect("seed");
+
+        let result = crate::create_reflex_ivm(
+            "wsp_view",
+            "SELECT dept, amount, SUM(amount) OVER (PARTITION BY dept) AS dept_total FROM wsp_src",
+            None, None, None,
+        );
+        assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
+
+        // All eng rows should show dept_total = 300
+        let eng_totals: Vec<String> = Spi::connect(|client| {
+            client
+                .select("SELECT dept_total::text FROM wsp_view WHERE dept = 'eng' ORDER BY amount", None, &[])
+                .unwrap()
+                .map(|row| row.get_by_name::<&str, _>("dept_total").unwrap().unwrap().to_string())
+                .collect()
+        });
+        assert_eq!(eng_totals, vec!["300", "300"]);
+
+        // Insert into eng → dept_total should update for ALL eng rows
+        Spi::run("INSERT INTO wsp_src (dept, amount) VALUES ('eng', 50)").expect("insert");
+        let eng_total = Spi::get_one::<pgrx::AnyNumeric>(
+            "SELECT DISTINCT dept_total FROM wsp_view WHERE dept = 'eng'",
+        ).expect("q").expect("v");
+        assert_eq!(eng_total.to_string(), "350");
+    }
+
+    /// LAG() — access previous row in window
+    #[pg_test]
+    fn test_window_lag() {
+        Spi::run("CREATE TABLE wl_src (id SERIAL, ts INT, val INT)").expect("create");
+        Spi::run("INSERT INTO wl_src (ts, val) VALUES (1, 10), (2, 20), (3, 30)").expect("seed");
+
+        let result = crate::create_reflex_ivm(
+            "wl_view",
+            "SELECT ts, val, LAG(val) OVER (ORDER BY ts) AS prev_val FROM wl_src",
+            None, None, None,
+        );
+        assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
+
+        // ts=1 → prev_val = NULL; ts=2 → prev_val = 10; ts=3 → prev_val = 20
+        let prev_at_2 = Spi::get_one::<i32>(
+            "SELECT prev_val FROM wl_view WHERE ts = 2",
+        ).expect("q").expect("v");
+        assert_eq!(prev_at_2, 10);
+
+        let prev_at_3 = Spi::get_one::<i32>(
+            "SELECT prev_val FROM wl_view WHERE ts = 3",
+        ).expect("q").expect("v");
+        assert_eq!(prev_at_3, 20);
+
+        // Insert ts=0 → shifts everything
+        Spi::run("INSERT INTO wl_src (ts, val) VALUES (0, 5)").expect("insert");
+        let prev_at_1 = Spi::get_one::<i32>(
+            "SELECT prev_val FROM wl_view WHERE ts = 1",
+        ).expect("q").expect("v");
+        assert_eq!(prev_at_1, 5, "ts=1 should now lag ts=0 (val=5)");
+    }
+
+    /// LEAD() — access next row in window
+    #[pg_test]
+    fn test_window_lead() {
+        Spi::run("CREATE TABLE wld_src (id SERIAL, ts INT, val INT)").expect("create");
+        Spi::run("INSERT INTO wld_src (ts, val) VALUES (1, 10), (2, 20), (3, 30)").expect("seed");
+
+        let result = crate::create_reflex_ivm(
+            "wld_view",
+            "SELECT ts, val, LEAD(val) OVER (ORDER BY ts) AS next_val FROM wld_src",
+            None, None, None,
+        );
+        assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
+
+        let next_at_1 = Spi::get_one::<i32>(
+            "SELECT next_val FROM wld_view WHERE ts = 1",
+        ).expect("q").expect("v");
+        assert_eq!(next_at_1, 20);
+
+        // ts=3 has no next → NULL
+        let next_at_3_is_null = Spi::get_one::<bool>(
+            "SELECT next_val IS NULL FROM wld_view WHERE ts = 3",
+        ).expect("q").expect("v");
+        assert!(next_at_3_is_null, "Last row should have NULL next_val");
+    }
+
+    /// GROUP BY + WINDOW: Aggregates maintained incrementally,
+    /// window recomputed over intermediate result
+    #[pg_test]
+    fn test_window_group_by_plus_window() {
+        Spi::run("CREATE TABLE wgw_src (id SERIAL, city TEXT, amount NUMERIC)").expect("create");
+        Spi::run("INSERT INTO wgw_src (city, amount) VALUES \
+            ('Paris', 100), ('Paris', 200), ('London', 50), ('Berlin', 300)").expect("seed");
+
+        let result = crate::create_reflex_ivm(
+            "wgw_view",
+            "SELECT city, SUM(amount) AS total, \
+                    RANK() OVER (ORDER BY SUM(amount) DESC) AS rnk \
+             FROM wgw_src GROUP BY city",
+            None, None, None,
+        );
+        assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
+
+        // Berlin=300 rank 1, Paris=300 rank 1, London=50 rank 3
+        let berlin_rank = Spi::get_one::<i64>(
+            "SELECT rnk FROM wgw_view WHERE city = 'Berlin'",
+        ).expect("q").expect("v");
+        assert_eq!(berlin_rank, 1);
+
+        let paris_rank = Spi::get_one::<i64>(
+            "SELECT rnk FROM wgw_view WHERE city = 'Paris'",
+        ).expect("q").expect("v");
+        assert_eq!(paris_rank, 1); // Tied with Berlin
+
+        let london_rank = Spi::get_one::<i64>(
+            "SELECT rnk FROM wgw_view WHERE city = 'London'",
+        ).expect("q").expect("v");
+        assert_eq!(london_rank, 3);
+    }
+
+    /// GROUP BY + WINDOW: INSERT changes aggregate and re-ranks
+    #[pg_test]
+    fn test_window_group_by_insert_reranks() {
+        Spi::run("CREATE TABLE wgwi_src (id SERIAL, city TEXT, amount NUMERIC)").expect("create");
+        Spi::run("INSERT INTO wgwi_src (city, amount) VALUES \
+            ('Paris', 100), ('London', 200), ('Berlin', 150)").expect("seed");
+
+        crate::create_reflex_ivm(
+            "wgwi_view",
+            "SELECT city, SUM(amount) AS total, \
+                    RANK() OVER (ORDER BY SUM(amount) DESC) AS rnk \
+             FROM wgwi_src GROUP BY city",
+            None, None, None,
+        );
+
+        // Initial: London=200(1), Berlin=150(2), Paris=100(3)
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT rnk FROM wgwi_view WHERE city = 'London'").expect("q").expect("v"),
+            1
+        );
+
+        // Insert enough to make Paris rank 1
+        Spi::run("INSERT INTO wgwi_src (city, amount) VALUES ('Paris', 250)").expect("insert");
+
+        // Now: Paris=350(1), London=200(2), Berlin=150(3)
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT rnk FROM wgwi_view WHERE city = 'Paris'").expect("q").expect("v"),
+            1, "Paris should be rank 1 after insert"
+        );
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT rnk FROM wgwi_view WHERE city = 'London'").expect("q").expect("v"),
+            2, "London should drop to rank 2"
+        );
+
+        // Verify aggregate is correct
+        let paris_total = Spi::get_one::<pgrx::AnyNumeric>(
+            "SELECT total FROM wgwi_view WHERE city = 'Paris'",
+        ).expect("q").expect("v");
+        assert_eq!(paris_total.to_string(), "350");
+    }
+
+    /// GROUP BY + WINDOW with PARTITION BY — partitioned ranking over aggregates
+    #[pg_test]
+    fn test_window_group_by_partition_by() {
+        Spi::run("CREATE TABLE wgwp_src (id SERIAL, region TEXT, city TEXT, amount NUMERIC)").expect("create");
+        Spi::run("INSERT INTO wgwp_src (region, city, amount) VALUES \
+            ('EU', 'Paris', 100), ('EU', 'Paris', 200), ('EU', 'Berlin', 300), \
+            ('US', 'NYC', 400), ('US', 'LA', 150), ('US', 'Chicago', 250)").expect("seed");
+
+        let result = crate::create_reflex_ivm(
+            "wgwp_view",
+            "SELECT region, city, SUM(amount) AS total, \
+                    ROW_NUMBER() OVER (PARTITION BY region ORDER BY SUM(amount) DESC) AS rnk \
+             FROM wgwp_src GROUP BY region, city",
+            None, None, None,
+        );
+        assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
+
+        // EU: Berlin=300(1), Paris=300(1 or 2 depending on tie-breaking)
+        // US: NYC=400(1), Chicago=250(2), LA=150(3)
+        let nyc_rank = Spi::get_one::<i64>(
+            "SELECT rnk FROM wgwp_view WHERE city = 'NYC'",
+        ).expect("q").expect("v");
+        assert_eq!(nyc_rank, 1);
+
+        let la_rank = Spi::get_one::<i64>(
+            "SELECT rnk FROM wgwp_view WHERE city = 'LA'",
+        ).expect("q").expect("v");
+        assert_eq!(la_rank, 3);
+
+        // INSERT into EU → only EU partition should re-rank
+        Spi::run("INSERT INTO wgwp_src (region, city, amount) VALUES ('EU', 'Madrid', 500)").expect("insert");
+        let madrid_rank = Spi::get_one::<i64>(
+            "SELECT rnk FROM wgwp_view WHERE city = 'Madrid'",
+        ).expect("q").expect("v");
+        assert_eq!(madrid_rank, 1, "Madrid (500) should be rank 1 in EU");
+
+        // US ranks unchanged
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT rnk FROM wgwp_view WHERE city = 'NYC'").expect("q").expect("v"),
+            1, "NYC rank should be unchanged (US partition untouched)"
+        );
+    }
+
+    /// GROUP BY + WINDOW: DELETE removes a group and re-ranks
+    #[pg_test]
+    fn test_window_group_by_delete_reranks() {
+        Spi::run("CREATE TABLE wgwd_src (id SERIAL, city TEXT, amount NUMERIC)").expect("create");
+        Spi::run("INSERT INTO wgwd_src (city, amount) VALUES \
+            ('A', 100), ('B', 200), ('C', 300)").expect("seed");
+
+        crate::create_reflex_ivm(
+            "wgwd_view",
+            "SELECT city, SUM(amount) AS total, \
+                    ROW_NUMBER() OVER (ORDER BY SUM(amount) DESC) AS rnk \
+             FROM wgwd_src GROUP BY city",
+            None, None, None,
+        );
+
+        // Delete the top city
+        Spi::run("DELETE FROM wgwd_src WHERE city = 'C'").expect("delete");
+
+        // B should become rank 1, A rank 2
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT rnk FROM wgwd_view WHERE city = 'B'").expect("q").expect("v"),
+            1
+        );
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT rnk FROM wgwd_view WHERE city = 'A'").expect("q").expect("v"),
+            2
+        );
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT COUNT(*) FROM wgwd_view").expect("q").expect("v"),
+            2
+        );
+    }
+
+    /// Multiple window functions in the same query
+    #[pg_test]
+    fn test_window_multiple_functions() {
+        Spi::run("CREATE TABLE wmf_src (id SERIAL, name TEXT, score INT)").expect("create");
+        Spi::run("INSERT INTO wmf_src (name, score) VALUES \
+            ('Alice', 90), ('Bob', 80), ('Charlie', 70), ('Dave', 90)").expect("seed");
+
+        let result = crate::create_reflex_ivm(
+            "wmf_view",
+            "SELECT name, score, \
+                    ROW_NUMBER() OVER (ORDER BY score DESC, name) AS row_num, \
+                    RANK() OVER (ORDER BY score DESC) AS rnk, \
+                    DENSE_RANK() OVER (ORDER BY score DESC) AS dense_rnk \
+             FROM wmf_src",
+            None, None, None,
+        );
+        assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
+
+        // Alice: row_num=1, rank=1, dense_rank=1
+        let alice_rn = Spi::get_one::<i64>("SELECT row_num FROM wmf_view WHERE name = 'Alice'").expect("q").expect("v");
+        let alice_r = Spi::get_one::<i64>("SELECT rnk FROM wmf_view WHERE name = 'Alice'").expect("q").expect("v");
+        let alice_dr = Spi::get_one::<i64>("SELECT dense_rnk FROM wmf_view WHERE name = 'Alice'").expect("q").expect("v");
+        assert_eq!(alice_rn, 1);
+        assert_eq!(alice_r, 1);
+        assert_eq!(alice_dr, 1);
+
+        // Charlie: row_num=4, rank=3, dense_rank=2 (because RANK skips, DENSE_RANK doesn't)
+        // Wait: Alice=90, Dave=90, Bob=80, Charlie=70
+        // ROW_NUMBER by (score DESC, name): Alice(1), Dave(2), Bob(3), Charlie(4)
+        // RANK by score DESC: 1,1,3,4
+        // DENSE_RANK by score DESC: 1,1,2,3
+        let charlie_rn = Spi::get_one::<i64>("SELECT row_num FROM wmf_view WHERE name = 'Charlie'").expect("q").expect("v");
+        let charlie_r = Spi::get_one::<i64>("SELECT rnk FROM wmf_view WHERE name = 'Charlie'").expect("q").expect("v");
+        let charlie_dr = Spi::get_one::<i64>("SELECT dense_rnk FROM wmf_view WHERE name = 'Charlie'").expect("q").expect("v");
+        assert_eq!(charlie_rn, 4);
+        assert_eq!(charlie_r, 4);
+        assert_eq!(charlie_dr, 3);
+    }
+
+    /// Window function with UPDATE — value change triggers re-ranking
+    #[pg_test]
+    fn test_window_update_reranks() {
+        Spi::run("CREATE TABLE wu_src (id SERIAL PRIMARY KEY, name TEXT, score INT)").expect("create");
+        Spi::run("INSERT INTO wu_src (name, score) VALUES \
+            ('Alice', 90), ('Bob', 80), ('Charlie', 70)").expect("seed");
+
+        crate::create_reflex_ivm(
+            "wu_view",
+            "SELECT name, score, ROW_NUMBER() OVER (ORDER BY score DESC) AS rnk FROM wu_src",
+            None, None, None,
+        );
+
+        // Update Charlie to top score
+        Spi::run("UPDATE wu_src SET score = 100 WHERE name = 'Charlie'").expect("update");
+
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT rnk FROM wu_view WHERE name = 'Charlie'").expect("q").expect("v"),
+            1, "Charlie should be rank 1 after score update"
+        );
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT rnk FROM wu_view WHERE name = 'Alice'").expect("q").expect("v"),
+            2
+        );
+    }
+
+    /// EXCEPT correctness check for GROUP BY + WINDOW
+    #[pg_test]
+    fn test_window_group_by_except_correctness() {
+        Spi::run("CREATE TABLE wge_src (id SERIAL, city TEXT, amount NUMERIC)").expect("create");
+        Spi::run("INSERT INTO wge_src (city, amount) VALUES \
+            ('Paris', 100), ('Paris', 200), ('London', 50), ('Berlin', 300), ('Berlin', 50)").expect("seed");
+
+        crate::create_reflex_ivm(
+            "wge_view",
+            "SELECT city, SUM(amount) AS total, \
+                    RANK() OVER (ORDER BY SUM(amount) DESC) AS rnk \
+             FROM wge_src GROUP BY city",
+            None, None, None,
+        );
+
+        // Verify via EXCEPT against fresh computation
+        let mismatches = Spi::get_one::<i64>(
+            "SELECT COUNT(*) FROM (
+                SELECT city, total, rnk FROM wge_view
+                EXCEPT
+                SELECT city, SUM(amount) AS total, RANK() OVER (ORDER BY SUM(amount) DESC) AS rnk
+                FROM wge_src GROUP BY city
+            ) x",
+        ).expect("q").expect("v");
+        assert_eq!(mismatches, 0, "IMV should match fresh computation");
+
+        // Mutate and re-check
+        Spi::run("INSERT INTO wge_src (city, amount) VALUES ('London', 500)").expect("insert");
+        Spi::run("DELETE FROM wge_src WHERE city = 'Berlin' AND amount = 50").expect("delete");
+
+        let mismatches2 = Spi::get_one::<i64>(
+            "SELECT COUNT(*) FROM (
+                SELECT city, total, rnk FROM wge_view
+                EXCEPT
+                SELECT city, SUM(amount) AS total, RANK() OVER (ORDER BY SUM(amount) DESC) AS rnk
+                FROM wge_src GROUP BY city
+            ) x",
+        ).expect("q").expect("v");
+        assert_eq!(mismatches2, 0, "IMV should match fresh computation after mutations");
+    }
+
+    /// Window with TRUNCATE — should clear and recompute correctly on re-insert
+    #[pg_test]
+    fn test_window_truncate_and_reinsert() {
+        Spi::run("CREATE TABLE wtr_src (id SERIAL, val INT)").expect("create");
+        Spi::run("INSERT INTO wtr_src (val) VALUES (10), (20), (30)").expect("seed");
+
+        crate::create_reflex_ivm(
+            "wtr_view",
+            "SELECT val, ROW_NUMBER() OVER (ORDER BY val) AS rnk FROM wtr_src",
+            None, None, None,
+        );
+
+        Spi::run("TRUNCATE wtr_src").expect("truncate");
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT COUNT(*) FROM wtr_view").expect("q").expect("v"),
+            0
+        );
+
+        // Re-insert different data
+        Spi::run("INSERT INTO wtr_src (val) VALUES (99), (1)").expect("reinsert");
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT COUNT(*) FROM wtr_view").expect("q").expect("v"),
+            2
+        );
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT rnk FROM wtr_view WHERE val = 1").expect("q").expect("v"),
+            1
+        );
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT rnk FROM wtr_view WHERE val = 99").expect("q").expect("v"),
+            2
+        );
     }
 }
 
