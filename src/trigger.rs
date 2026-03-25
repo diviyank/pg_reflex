@@ -222,6 +222,40 @@ fn replace_source_with_transition(base_query: &str, source_table: &str, transiti
     }
 }
 
+/// Push MERGE + affected-groups population.
+/// PG17+: single CTE with MERGE RETURNING (captures affected groups in one statement).
+/// PG15/16: separate MERGE + SELECT DISTINCT from delta query (MERGE RETURNING unsupported).
+fn push_merge_and_affected(
+    stmts: &mut Vec<String>,
+    merge_sql: &str,
+    affected_tbl: &str,
+    select_expr: &str,
+    delta_query: &str,
+    grp_cols: &[String],
+) {
+    #[cfg(not(any(feature = "pg15", feature = "pg16")))]
+    {
+        let _ = delta_query; // only used in PG15/16 fallback path
+        let ret_cols = grp_cols.iter()
+            .map(|c| format!("t.{}", c))
+            .collect::<Vec<_>>()
+            .join(", ");
+        stmts.push(format!(
+            "WITH __m AS ({} RETURNING {}) INSERT INTO \"{}\" SELECT DISTINCT {} FROM __m",
+            merge_sql, ret_cols, affected_tbl, select_expr
+        ));
+    }
+    #[cfg(any(feature = "pg15", feature = "pg16"))]
+    {
+        let _ = grp_cols; // only used in PG17+ RETURNING path
+        stmts.push(merge_sql.to_string());
+        stmts.push(format!(
+            "INSERT INTO \"{}\" SELECT DISTINCT {} FROM ({}) AS __d",
+            affected_tbl, select_expr, delta_query
+        ));
+    }
+}
+
 /// Generates the SQL statements to apply a delta to an IMV.
 ///
 /// Called from plpgsql trigger wrappers. Returns a delimiter-separated string
@@ -314,13 +348,6 @@ pub fn reflex_build_delta_sql(
         let bare_view = split_qualified_name(view_name).1;
         let affected_tbl = format!("__reflex_affected_{}", bare_view);
 
-        // Build RETURNING clause for MERGE: returns affected group columns
-        // qualified with t. to disambiguate from the USING source.
-        let returning_clause = grp_cols.as_ref().map(|cols| {
-            let ret_cols = cols.iter().map(|c| format!("t.{}", c)).collect::<Vec<_>>().join(", ");
-            format!(" RETURNING {}", ret_cols)
-        });
-
         match operation {
             "INSERT" => {
                 let delta_q = replace_source_with_transition(base_query, source_table, &new_tbl);
@@ -328,22 +355,12 @@ pub fn reflex_build_delta_sql(
                 if let Some(ref cols) = grp_cols {
                     let select_expr = affected_groups_select(cols);
                     let merge_sql = build_merge_sql(&intermediate_tbl, &delta_q, &plan, DeltaOp::Add);
-                    let ret = returning_clause.as_deref().unwrap_or("");
-                    // 1. Drop old affected table
-                    stmts.push(format!(
-                        "DROP TABLE IF EXISTS \"{}\"",
-                        affected_tbl
-                    ));
-                    // 2. Create empty affected table (schema from intermediate, no rows)
+                    stmts.push(format!("DROP TABLE IF EXISTS \"{}\"", affected_tbl));
                     stmts.push(format!(
                         "CREATE TEMP TABLE \"{}\" AS SELECT {} FROM {} WHERE FALSE",
                         affected_tbl, select_expr, intermediate_tbl
                     ));
-                    // 3. CTE: MERGE + RETURNING → populate affected (data-modifying CTE at top-level INSERT)
-                    stmts.push(format!(
-                        "WITH __m AS ({}{}) INSERT INTO \"{}\" SELECT DISTINCT {} FROM __m",
-                        merge_sql, ret, affected_tbl, select_expr
-                    ));
+                    push_merge_and_affected(&mut stmts, &merge_sql, &affected_tbl, &select_expr, &delta_q, cols);
                 } else {
                     stmts.push(build_merge_sql(&intermediate_tbl, &delta_q, &plan, DeltaOp::Add));
                 }
@@ -354,19 +371,12 @@ pub fn reflex_build_delta_sql(
                 if let Some(ref cols) = grp_cols {
                     let select_expr = affected_groups_select(cols);
                     let merge_sql = build_merge_sql(&intermediate_tbl, &delta_q, &plan, DeltaOp::Subtract);
-                    let ret = returning_clause.as_deref().unwrap_or("");
-                    stmts.push(format!(
-                        "DROP TABLE IF EXISTS \"{}\"",
-                        affected_tbl
-                    ));
+                    stmts.push(format!("DROP TABLE IF EXISTS \"{}\"", affected_tbl));
                     stmts.push(format!(
                         "CREATE TEMP TABLE \"{}\" AS SELECT {} FROM {} WHERE FALSE",
                         affected_tbl, select_expr, intermediate_tbl
                     ));
-                    stmts.push(format!(
-                        "WITH __m AS ({}{}) INSERT INTO \"{}\" SELECT DISTINCT {} FROM __m",
-                        merge_sql, ret, affected_tbl, select_expr
-                    ));
+                    push_merge_and_affected(&mut stmts, &merge_sql, &affected_tbl, &select_expr, &delta_q, cols);
                 } else {
                     stmts.push(build_merge_sql(&intermediate_tbl, &delta_q, &plan, DeltaOp::Subtract));
                 }
@@ -382,21 +392,13 @@ pub fn reflex_build_delta_sql(
 
                 if let Some(ref cols) = grp_cols {
                     let select_expr = affected_groups_select(cols);
-                    let ret = returning_clause.as_deref().unwrap_or("");
                     let merge_sub_sql = build_merge_sql(&intermediate_tbl, &delta_old, &plan, DeltaOp::Subtract);
-                    // Create empty affected table, populate from subtract MERGE RETURNING
-                    stmts.push(format!(
-                        "DROP TABLE IF EXISTS \"{}\"",
-                        affected_tbl
-                    ));
+                    stmts.push(format!("DROP TABLE IF EXISTS \"{}\"", affected_tbl));
                     stmts.push(format!(
                         "CREATE TEMP TABLE \"{}\" AS SELECT {} FROM {} WHERE FALSE",
                         affected_tbl, select_expr, intermediate_tbl
                     ));
-                    stmts.push(format!(
-                        "WITH __m AS ({}{}) INSERT INTO \"{}\" SELECT DISTINCT {} FROM __m",
-                        merge_sub_sql, ret, affected_tbl, select_expr
-                    ));
+                    push_merge_and_affected(&mut stmts, &merge_sub_sql, &affected_tbl, &select_expr, &delta_old, cols);
 
                     if has_min_max {
                         if let Some(recompute) = build_min_max_recompute_sql(&intermediate_tbl, &plan, source_table) {
@@ -404,12 +406,8 @@ pub fn reflex_build_delta_sql(
                         }
                     }
 
-                    // Add groups from add MERGE RETURNING to affected table
                     let merge_add_sql = build_merge_sql(&intermediate_tbl, &delta_new, &plan, DeltaOp::Add);
-                    stmts.push(format!(
-                        "WITH __m AS ({}{}) INSERT INTO \"{}\" SELECT DISTINCT {} FROM __m",
-                        merge_add_sql, ret, affected_tbl, select_expr
-                    ));
+                    push_merge_and_affected(&mut stmts, &merge_add_sql, &affected_tbl, &select_expr, &delta_new, cols);
                 } else {
                     stmts.push(build_merge_sql(&intermediate_tbl, &delta_old, &plan, DeltaOp::Subtract));
                     if has_min_max {
