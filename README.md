@@ -489,20 +489,68 @@ psql -f benchmarks/bench_baseline.sql
 psql -f benchmarks/teardown.sql
 ```
 
-### Performance Summary (1M source rows, single IMV, PostgreSQL 17)
+### Performance Summary (single IMV, PostgreSQL 17)
+
+Trigger overhead only (total DML time minus bare DML time), measured in isolation.
+
+**1M source rows, 1K groups:**
 
 | IMV Type | INSERT 1K | UPDATE 100 | vs REFRESH MATVIEW |
 |---|---:|---:|---|
-| GROUP BY (1K groups) | 77 ms | 4 ms (warm) | REFRESH: 55 ms |
-| Passthrough JOIN | 10 ms | varies | REFRESH: 2,500 ms (**250x faster**) |
-| WINDOW (GROUP BY + RANK) | 41 ms | similar to GROUP BY | REFRESH: 57 ms |
+| GROUP BY (SUM/COUNT) | 36 ms | 3 ms | REFRESH: 52 ms |
+| Passthrough JOIN | 10 ms | 3 ms | REFRESH: 2,500 ms (**250x faster**) |
+| WINDOW (GROUP BY + RANK) | 41 ms | similar | REFRESH: 57 ms |
 | UNION ALL (2 operands) | 16 ms | n/a | REFRESH: 410 ms (**25x faster**) |
 
-Key: trigger overhead is O(delta), not O(source). With multiple IMVs on the same source, overhead scales linearly per IMV (sequential trigger loop).
-| UPDATE (100 rows) | 10 ms | 10 ms | 15 ms | 59 ms |
-| DELETE (100 rows) | 5 ms | 6 ms | 10 ms | 59 ms |
+Key: trigger overhead is O(delta), not O(source). With multiple IMVs on the same source, overhead scales linearly per IMV.
 
-Key insight: **INSERT latency is constant regardless of table size** -- the trigger only processes the delta rows, not the full table.
+### Comparison: pg_reflex vs pg_ivm vs REFRESH MATERIALIZED VIEW
+
+Measured in isolated databases (one extension per database) on the same hardware.
+Source: **5M rows, 30K groups, GROUP BY + SUM/COUNT**.
+
+#### INSERT — trigger overhead
+
+| Batch | pg_reflex | pg_ivm | REFRESH MV |
+|---:|---:|---:|---:|
+| 1K | 36 ms | 42 ms | 463 ms |
+| 10K | 62 ms | 3,012 ms | 470 ms |
+| 50K | 221 ms | 26,668 ms | 463 ms |
+| 100K | 29 ms | 25,686 ms | 476 ms |
+| 500K | 78 ms | 27,510 ms | 526 ms |
+
+#### UPDATE — trigger overhead
+
+| Batch | pg_reflex | pg_ivm | REFRESH MV |
+|---:|---:|---:|---:|
+| 100 | 9 ms | 8 ms | 462 ms |
+| 1K | ~0 ms | 46 ms | 762 ms |
+| 10K | ~0 ms | 2,978 ms | 483 ms |
+
+#### DELETE — trigger overhead
+
+| Batch | pg_reflex | pg_ivm | REFRESH MV |
+|---:|---:|---:|---:|
+| 100 | 24 ms | 22 ms | 470 ms |
+| 1K | ~0 ms | 22 ms | 489 ms |
+| 10K | 58 ms | 91 ms | 1,321 ms |
+| 100K | 193 ms | 551 ms | 467 ms |
+
+#### Read performance
+
+| Operation | pg_reflex | pg_ivm | MATVIEW |
+|---|---:|---:|---:|
+| Point read (indexed) | 0.014 ms | 0.043 ms | 0.026 ms |
+| Full scan (30K rows) | 0.8 ms | 0.7 ms | 0.7 ms |
+
+**Key observations:**
+- Both IVM extensions significantly outperform `REFRESH MATERIALIZED VIEW` for small-to-medium batches (1K–10K rows)
+- pg_reflex uses MERGE-based batch delta processing, which maintains consistent performance across batch sizes
+- pg_ivm performs well on small batches but has higher overhead at larger batch sizes (10K+ rows), likely due to its per-row counting algorithm
+- `REFRESH MATERIALIZED VIEW` has constant cost (~470ms) regardless of batch size — it always rescans the full source
+- For very large batches (500K rows = 10% of source), `REFRESH` can be more efficient than incremental maintenance
+
+> **Reproduce these benchmarks:** `benchmarks/bench_isolated.sql` (single-extension isolated test) and `benchmarks/bench_vs_pgivm.sql` (side-by-side). Run each extension in its own database for accurate isolated measurements.
 
 ## Known Limitations
 
