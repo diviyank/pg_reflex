@@ -512,6 +512,58 @@ mod tests {
                 assert!(has_sum, "AVG({}) must produce SUM intermediate column", col);
                 assert!(has_count, "AVG({}) must produce COUNT intermediate column", col);
             }
+
+            /// Every supported aggregate produces at least one intermediate column
+            #[test]
+            fn every_aggregate_produces_intermediate(
+                agg_kind in prop_oneof![
+                    Just(("SUM", "SUM(val)")),
+                    Just(("COUNT", "COUNT(val)")),
+                    Just(("COUNT", "COUNT(*)")),
+                    Just(("MIN", "MIN(val)")),
+                    Just(("MAX", "MAX(val)")),
+                    Just(("BOOL_OR", "BOOL_OR(flag)")),
+                ],
+            ) {
+                let sql = format!(
+                    "SELECT grp, {} AS agg_val FROM tbl GROUP BY grp",
+                    agg_kind.1
+                );
+                let plan = plan_from_sql(&sql);
+                prop_assert!(!plan.intermediate_columns.is_empty(),
+                    "{} should produce intermediate columns", agg_kind.0);
+            }
+
+            /// Multiple aggregates produce at least as many intermediate columns
+            #[test]
+            fn multiple_aggregates_produce_multiple_intermediates(
+                suffix in "[a-z]{1,5}",
+            ) {
+                let col = format!("v_{}", suffix);
+                let sql = format!(
+                    "SELECT grp, SUM({col}) AS s, COUNT({col}) AS c, MIN({col}) AS lo, MAX({col}) AS hi FROM tbl GROUP BY grp",
+                    col = col,
+                );
+                let plan = plan_from_sql(&sql);
+                // SUM + COUNT + MIN + MAX = at least 4 intermediate columns
+                prop_assert!(plan.intermediate_columns.len() >= 4,
+                    "4 aggregates should produce >= 4 intermediates, got {}", plan.intermediate_columns.len());
+            }
+
+            /// Passthrough queries (no GROUP BY, no aggregates) have no intermediate columns
+            #[test]
+            fn passthrough_has_no_intermediates(suffix in "[a-z]{1,5}") {
+                let col = format!("col_{}", suffix);
+                let sql = format!(
+                    "SELECT {}, id FROM tbl",
+                    col
+                );
+                let plan = plan_from_sql(&sql);
+                prop_assert!(plan.is_passthrough,
+                    "Query without GROUP BY or aggregates should be passthrough");
+                prop_assert!(plan.intermediate_columns.is_empty(),
+                    "Passthrough should have no intermediate columns");
+            }
         }
     }
 }

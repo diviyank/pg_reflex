@@ -1,8 +1,8 @@
 use serde::Serialize;
 use sqlparser::ast::{
-    Expr, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, Join, JoinConstraint,
-    JoinOperator, Query, SelectItem, SetExpr, SetOperator, SetQuantifier, Statement, TableFactor,
-    Visit, Visitor,
+    Distinct, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr,
+    GroupByWithModifier, Join, JoinConstraint, JoinOperator, Query, SelectItem, SetExpr,
+    SetOperator, SetQuantifier, Statement, TableFactor, Visit, Visitor,
 };
 use std::ops::ControlFlow;
 
@@ -97,11 +97,65 @@ pub struct SqlAnalysis {
     pub table_aliases: std::collections::HashMap<String, String>,
     /// Set operation info if the query uses UNION/INTERSECT/EXCEPT
     pub set_operation: Option<SetOperationInfo>,
+    // --- Unsupported feature detection flags ---
+    pub has_lateral_join: bool,
+    pub has_distinct_on: bool,
+    pub has_grouping_sets: bool,
+    pub has_tablesample: bool,
+    pub has_filter_clause: bool,
+    pub has_within_group: bool,
+    pub has_scalar_subquery: bool,
+    pub unsupported_aggregates: Vec<String>,
+    pub has_nondeterministic_select: bool,
 }
 
 impl SqlAnalysis {
-    pub fn has_unsupported_features(&self) -> bool {
-        self.has_recursive_cte || self.has_limit || self.has_order_by
+    /// Returns a human-readable reason if the query uses unsupported SQL features,
+    /// or None if the query is fully supported.
+    pub fn unsupported_reason(&self) -> Option<String> {
+        if self.has_recursive_cte {
+            return Some("RECURSIVE CTEs are not supported".into());
+        }
+        if self.has_limit {
+            return Some("LIMIT is not supported (materialized views have no row order)".into());
+        }
+        if self.has_order_by {
+            return Some("ORDER BY is not supported (materialized views have no row order)".into());
+        }
+        if self.has_lateral_join {
+            return Some("LATERAL joins are not supported".into());
+        }
+        if self.has_distinct_on {
+            return Some("DISTINCT ON is not supported".into());
+        }
+        if self.has_grouping_sets {
+            return Some(
+                "GROUPING SETS / CUBE / ROLLUP are not supported".into(),
+            );
+        }
+        if self.has_tablesample {
+            return Some("TABLESAMPLE is not supported (non-deterministic)".into());
+        }
+        if self.has_filter_clause {
+            return Some("FILTER clause on aggregates is not supported".into());
+        }
+        if self.has_within_group {
+            return Some("WITHIN GROUP (ordered-set aggregates) is not supported".into());
+        }
+        if self.has_scalar_subquery {
+            return Some("Scalar subqueries in SELECT are not supported".into());
+        }
+        if self.has_nondeterministic_select {
+            return Some("Non-deterministic functions (NOW, RANDOM, etc.) in SELECT are not supported".into());
+        }
+        if !self.unsupported_aggregates.is_empty() {
+            let names = self.unsupported_aggregates.join(", ");
+            return Some(format!(
+                "Unsupported aggregate(s): {}. Supported: SUM, COUNT, AVG, MIN, MAX, BOOL_OR",
+                names
+            ));
+        }
+        None
     }
 }
 
@@ -134,17 +188,51 @@ impl<'a> Visitor for AnalysisVisitor<'a> {
     }
 
     fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<()> {
-        if let Expr::Function(f) = expr {
-            if f.over.is_some() {
-                self.analysis.has_window_function = true;
+        match expr {
+            Expr::Function(f) => {
+                if f.over.is_some() {
+                    self.analysis.has_window_function = true;
+                } else {
+                    // Detect FILTER clause
+                    if f.filter.is_some() {
+                        self.analysis.has_filter_clause = true;
+                    }
+                    // Detect WITHIN GROUP (ordered-set aggregates)
+                    if !f.within_group.is_empty() {
+                        self.analysis.has_within_group = true;
+                    }
+                    let func_name = f.name.to_string().to_uppercase();
+                    // Detect unsupported aggregate functions
+                    if is_known_unsupported_aggregate(&func_name) {
+                        if !self.analysis.unsupported_aggregates.contains(&func_name) {
+                            self.analysis.unsupported_aggregates.push(func_name.clone());
+                        }
+                    }
+                    // Detect non-deterministic functions in SELECT
+                    if is_nondeterministic_function(&func_name) {
+                        self.analysis.has_nondeterministic_select = true;
+                    }
+                }
             }
+            Expr::Subquery(_) => {
+                self.analysis.has_scalar_subquery = true;
+            }
+            Expr::GroupingSets(_) | Expr::Cube(_) | Expr::Rollup(_) => {
+                self.analysis.has_grouping_sets = true;
+            }
+            _ => {}
         }
         ControlFlow::Continue(())
     }
 
     fn pre_visit_table_factor(&mut self, factor: &TableFactor) -> ControlFlow<()> {
         match factor {
-            TableFactor::Table { name, alias, .. } => {
+            TableFactor::Table {
+                name,
+                alias,
+                sample,
+                ..
+            } => {
                 let table_name = name.to_string();
                 self.analysis.sources.push(table_name.clone());
                 if let Some(a) = alias {
@@ -152,8 +240,16 @@ impl<'a> Visitor for AnalysisVisitor<'a> {
                         .table_aliases
                         .insert(a.name.to_string(), table_name);
                 }
+                if sample.is_some() {
+                    self.analysis.has_tablesample = true;
+                }
             }
-            TableFactor::Derived { alias, .. } => {
+            TableFactor::Derived {
+                lateral, alias, ..
+            } => {
+                if *lateral {
+                    self.analysis.has_lateral_join = true;
+                }
                 let label = alias
                     .as_ref()
                     .map(|a| format!("<subquery:{}>", a.name))
@@ -184,6 +280,62 @@ fn detect_aggregate(func_name: &str) -> Option<AggregateKind> {
         "BOOL_OR" => Some(AggregateKind::BoolOr),
         _ => None,
     }
+}
+
+/// Check if a function name is a known PostgreSQL aggregate that pg_reflex does NOT support.
+fn is_known_unsupported_aggregate(func_name: &str) -> bool {
+    matches!(
+        func_name,
+        "STRING_AGG"
+            | "ARRAY_AGG"
+            | "JSON_AGG"
+            | "JSONB_AGG"
+            | "JSON_OBJECT_AGG"
+            | "JSONB_OBJECT_AGG"
+            | "XMLAGG"
+            | "PERCENTILE_CONT"
+            | "PERCENTILE_DISC"
+            | "MODE"
+            | "STDDEV"
+            | "STDDEV_POP"
+            | "STDDEV_SAMP"
+            | "VARIANCE"
+            | "VAR_POP"
+            | "VAR_SAMP"
+            | "CORR"
+            | "COVAR_POP"
+            | "COVAR_SAMP"
+            | "REGR_SLOPE"
+            | "REGR_INTERCEPT"
+            | "REGR_COUNT"
+            | "REGR_R2"
+            | "REGR_AVGX"
+            | "REGR_AVGY"
+            | "REGR_SXX"
+            | "REGR_SYY"
+            | "REGR_SXY"
+            | "BIT_AND"
+            | "BIT_OR"
+            | "BIT_XOR"
+            | "BOOL_AND"
+            | "EVERY"
+    )
+}
+
+/// Check if a function name is non-deterministic (result changes across calls).
+fn is_nondeterministic_function(func_name: &str) -> bool {
+    matches!(
+        func_name,
+        "NOW"
+            | "CURRENT_TIMESTAMP"
+            | "CURRENT_DATE"
+            | "CURRENT_TIME"
+            | "RANDOM"
+            | "CLOCK_TIMESTAMP"
+            | "STATEMENT_TIMESTAMP"
+            | "TIMEOFDAY"
+            | "GEN_RANDOM_UUID"
+    )
 }
 
 /// Check if function args contain a wildcard (for COUNT(*)).
@@ -394,8 +546,16 @@ pub fn analyze(statements: &[Statement]) -> Result<SqlAnalysis, SqlAnalysisError
         _ => return Err(SqlAnalysisError::NotASelectQuery),
     };
 
-    // DISTINCT
-    analysis.has_distinct = select.distinct.is_some();
+    // DISTINCT / DISTINCT ON
+    match &select.distinct {
+        Some(Distinct::On(_)) => {
+            analysis.has_distinct_on = true;
+        }
+        Some(_) => {
+            analysis.has_distinct = true;
+        }
+        None => {}
+    }
 
     // SELECT columns
     for item in &select.projection {
@@ -435,8 +595,18 @@ pub fn analyze(statements: &[Statement]) -> Result<SqlAnalysis, SqlAnalysisError
         }
     }
 
-    // GROUP BY
-    if let GroupByExpr::Expressions(exprs, _modifiers) = &select.group_by {
+    // GROUP BY (and detect GROUPING SETS / CUBE / ROLLUP modifiers)
+    if let GroupByExpr::Expressions(exprs, modifiers) = &select.group_by {
+        for m in modifiers {
+            match m {
+                GroupByWithModifier::Rollup
+                | GroupByWithModifier::Cube
+                | GroupByWithModifier::GroupingSets(_) => {
+                    analysis.has_grouping_sets = true;
+                }
+                _ => {}
+            }
+        }
         for expr in exprs {
             analysis.group_by_columns.push(expr.to_string());
         }
@@ -560,7 +730,7 @@ mod tests {
         let a = parse_and_analyze(
             "WITH regional AS (SELECT region, SUM(amount) AS total FROM orders GROUP BY region) SELECT region, total FROM regional",
         );
-        assert!(!a.has_unsupported_features()); // Non-recursive CTE is now supported
+        assert!(!a.unsupported_reason().is_some()); // Non-recursive CTE is now supported
         assert_eq!(a.ctes.len(), 1);
         assert_eq!(a.ctes[0].alias, "regional");
         assert!(a.ctes[0].query_sql.contains("SUM"));
@@ -584,27 +754,27 @@ mod tests {
             "WITH RECURSIVE nums AS (SELECT 1 AS n UNION ALL SELECT n+1 FROM nums WHERE n < 10) SELECT * FROM nums",
         );
         assert!(a.has_recursive_cte);
-        assert!(a.has_unsupported_features());
+        assert!(a.unsupported_reason().is_some());
     }
 
     #[test]
     fn test_unsupported_limit() {
         let a = parse_and_analyze("SELECT * FROM emp LIMIT 10");
-        assert!(a.has_unsupported_features());
+        assert!(a.unsupported_reason().is_some());
         assert!(a.has_limit);
     }
 
     #[test]
     fn test_unsupported_order_by() {
         let a = parse_and_analyze("SELECT * FROM emp ORDER BY id");
-        assert!(a.has_unsupported_features());
+        assert!(a.unsupported_reason().is_some());
         assert!(a.has_order_by);
     }
 
     #[test]
     fn test_window_detected() {
         let a = parse_and_analyze("SELECT id, SUM(amount) OVER (PARTITION BY city) FROM orders");
-        assert!(!a.has_unsupported_features(), "Window functions should no longer be unsupported");
+        assert!(!a.unsupported_reason().is_some(), "Window functions should no longer be unsupported");
         assert!(a.has_window_function);
         // The window column should be flagged
         let win_col = a.select_columns.iter().find(|c| c.is_window);
@@ -687,5 +857,259 @@ mod tests {
         );
         assert_eq!(a.table_aliases.get("s").map(String::as_str), Some("alp.sales_simulation"));
         assert_eq!(a.table_aliases.get("p").map(String::as_str), Some("dim.products"));
+    }
+
+    // ========================================================================
+    // Unsupported feature detection tests
+    // ========================================================================
+
+    #[test]
+    fn test_detect_lateral_join() {
+        let a = parse_and_analyze(
+            "SELECT t.id, s.val FROM t, LATERAL (SELECT val FROM t2 WHERE t2.id = t.id) s",
+        );
+        assert!(a.has_lateral_join);
+        assert!(a.unsupported_reason().is_some());
+        assert!(a.unsupported_reason().unwrap().contains("LATERAL"));
+    }
+
+    #[test]
+    fn test_detect_distinct_on() {
+        let a = parse_and_analyze(
+            "SELECT DISTINCT ON (city) city, val FROM t",
+        );
+        assert!(a.has_distinct_on);
+        assert!(!a.has_distinct, "DISTINCT ON should not set has_distinct");
+        assert!(a.unsupported_reason().is_some());
+        assert!(a.unsupported_reason().unwrap().contains("DISTINCT ON"));
+    }
+
+    #[test]
+    fn test_detect_grouping_sets() {
+        let a = parse_and_analyze(
+            "SELECT city, SUM(val) FROM t GROUP BY GROUPING SETS ((city), ())",
+        );
+        assert!(a.has_grouping_sets);
+        assert!(a.unsupported_reason().is_some());
+    }
+
+    #[test]
+    fn test_detect_cube() {
+        let a = parse_and_analyze(
+            "SELECT city, state, SUM(val) FROM t GROUP BY CUBE (city, state)",
+        );
+        assert!(a.has_grouping_sets);
+        assert!(a.unsupported_reason().is_some());
+    }
+
+    #[test]
+    fn test_detect_rollup() {
+        let a = parse_and_analyze(
+            "SELECT city, SUM(val) FROM t GROUP BY ROLLUP (city)",
+        );
+        assert!(a.has_grouping_sets);
+        assert!(a.unsupported_reason().is_some());
+    }
+
+    #[test]
+    fn test_detect_filter_clause() {
+        let a = parse_and_analyze(
+            "SELECT city, COUNT(*) FILTER (WHERE active) FROM t GROUP BY city",
+        );
+        assert!(a.has_filter_clause);
+        assert!(a.unsupported_reason().is_some());
+        assert!(a.unsupported_reason().unwrap().contains("FILTER"));
+    }
+
+    #[test]
+    fn test_detect_within_group() {
+        let a = parse_and_analyze(
+            "SELECT city, PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY val) FROM t GROUP BY city",
+        );
+        assert!(a.has_within_group);
+        assert!(a.unsupported_reason().is_some());
+    }
+
+    #[test]
+    fn test_detect_tablesample() {
+        let a = parse_and_analyze(
+            "SELECT * FROM t TABLESAMPLE BERNOULLI (10)",
+        );
+        assert!(a.has_tablesample);
+        assert!(a.unsupported_reason().is_some());
+        assert!(a.unsupported_reason().unwrap().contains("TABLESAMPLE"));
+    }
+
+    #[test]
+    fn test_detect_nondeterministic_select() {
+        let a = parse_and_analyze(
+            "SELECT NOW(), city FROM t GROUP BY city",
+        );
+        assert!(a.has_nondeterministic_select);
+        assert!(a.unsupported_reason().is_some());
+
+        let b = parse_and_analyze(
+            "SELECT RANDOM(), id FROM t",
+        );
+        assert!(b.has_nondeterministic_select);
+    }
+
+    #[test]
+    fn test_detect_unsupported_aggregate_string_agg() {
+        let a = parse_and_analyze(
+            "SELECT city, STRING_AGG(name, ', ') FROM t GROUP BY city",
+        );
+        assert!(!a.unsupported_aggregates.is_empty());
+        assert!(a.unsupported_aggregates.contains(&"STRING_AGG".to_string()));
+        assert!(a.unsupported_reason().is_some());
+    }
+
+    #[test]
+    fn test_detect_unsupported_aggregate_array_agg() {
+        let a = parse_and_analyze(
+            "SELECT city, ARRAY_AGG(val) FROM t GROUP BY city",
+        );
+        assert!(a.unsupported_aggregates.contains(&"ARRAY_AGG".to_string()));
+    }
+
+    #[test]
+    fn test_detect_unsupported_aggregate_stddev() {
+        let a = parse_and_analyze(
+            "SELECT city, STDDEV(val) FROM t GROUP BY city",
+        );
+        assert!(a.unsupported_aggregates.contains(&"STDDEV".to_string()));
+    }
+
+    #[test]
+    fn test_detect_scalar_subquery() {
+        let a = parse_and_analyze(
+            "SELECT (SELECT MAX(x) FROM t2), city FROM t GROUP BY city",
+        );
+        assert!(a.has_scalar_subquery);
+        assert!(a.unsupported_reason().is_some());
+    }
+
+    #[test]
+    fn test_supported_aggregates_not_flagged() {
+        let a = parse_and_analyze(
+            "SELECT city, SUM(val), COUNT(*), AVG(val), MIN(val), MAX(val), BOOL_OR(flag) \
+             FROM t GROUP BY city",
+        );
+        assert!(a.unsupported_aggregates.is_empty(),
+            "Supported aggregates should not be flagged: {:?}", a.unsupported_aggregates);
+        assert!(!a.has_filter_clause);
+        assert!(!a.has_within_group);
+        assert!(!a.has_nondeterministic_select);
+        assert!(a.unsupported_reason().is_none(),
+            "Query with only supported features should pass: {:?}", a.unsupported_reason());
+    }
+
+    #[test]
+    fn test_regular_functions_not_flagged_as_aggregates() {
+        // UPPER, LOWER, COALESCE etc. are scalar functions, not aggregates
+        let a = parse_and_analyze(
+            "SELECT UPPER(name), COALESCE(val, 0) FROM t",
+        );
+        assert!(a.unsupported_aggregates.is_empty(),
+            "Regular scalar functions should not be flagged: {:?}", a.unsupported_aggregates);
+    }
+
+    #[test]
+    fn test_multiple_unsupported_aggregates() {
+        let a = parse_and_analyze(
+            "SELECT city, STRING_AGG(name, ','), ARRAY_AGG(val), STDDEV(val) FROM t GROUP BY city",
+        );
+        assert_eq!(a.unsupported_aggregates.len(), 3);
+    }
+
+    mod proptest_tests {
+        use super::*;
+        use proptest::prelude::*;
+
+        /// Generate a random supported aggregate expression
+        fn supported_agg_strategy() -> impl Strategy<Value = (&'static str, String)> {
+            prop_oneof![
+                Just(("SUM", "SUM(val)".to_string())),
+                Just(("COUNT", "COUNT(val)".to_string())),
+                Just(("COUNT", "COUNT(*)".to_string())),
+                Just(("AVG", "AVG(val)".to_string())),
+                Just(("MIN", "MIN(val)".to_string())),
+                Just(("MAX", "MAX(val)".to_string())),
+                Just(("BOOL_OR", "BOOL_OR(flag)".to_string())),
+            ]
+        }
+
+        /// Generate a random unsupported aggregate name
+        fn unsupported_agg_strategy() -> impl Strategy<Value = &'static str> {
+            prop_oneof![
+                Just("STRING_AGG"),
+                Just("ARRAY_AGG"),
+                Just("JSON_AGG"),
+                Just("JSONB_AGG"),
+                Just("STDDEV"),
+                Just("VARIANCE"),
+                Just("BOOL_AND"),
+                Just("EVERY"),
+                Just("BIT_AND"),
+                Just("BIT_OR"),
+                Just("MODE"),
+            ]
+        }
+
+        proptest! {
+            /// Any query using only supported aggregates should pass validation
+            #[test]
+            fn supported_sql_passes_validation(
+                agg1 in supported_agg_strategy(),
+                agg2 in supported_agg_strategy(),
+                has_where in any::<bool>(),
+            ) {
+                let where_clause = if has_where { " WHERE val > 0" } else { "" };
+                let sql = format!(
+                    "SELECT grp, {} AS a1, {} AS a2 FROM tbl{} GROUP BY grp",
+                    agg1.1, agg2.1, where_clause
+                );
+                let a = parse_and_analyze(&sql);
+                prop_assert!(a.unsupported_reason().is_none(),
+                    "Supported query should pass: {} => {:?}", sql, a.unsupported_reason());
+            }
+
+            /// Any query using an unsupported aggregate should be detected
+            #[test]
+            fn unsupported_aggregate_always_detected(
+                agg_name in unsupported_agg_strategy(),
+            ) {
+                // STRING_AGG needs two args, others need one
+                let expr = if agg_name == "STRING_AGG" {
+                    format!("{}(name, ',')", agg_name)
+                } else {
+                    format!("{}(val)", agg_name)
+                };
+                let sql = format!(
+                    "SELECT grp, {} AS a FROM tbl GROUP BY grp",
+                    expr
+                );
+                let a = parse_and_analyze(&sql);
+                prop_assert!(!a.unsupported_aggregates.is_empty(),
+                    "{} should be detected as unsupported in: {}", agg_name, sql);
+            }
+
+            /// Non-deterministic functions are always detected
+            #[test]
+            fn nondeterministic_always_detected(
+                func in prop_oneof![
+                    Just("NOW()"),
+                    Just("RANDOM()"),
+                    Just("CURRENT_TIMESTAMP"),
+                    Just("CLOCK_TIMESTAMP()"),
+                    Just("GEN_RANDOM_UUID()"),
+                ],
+            ) {
+                let sql = format!("SELECT {}, grp FROM tbl GROUP BY grp", func);
+                let a = parse_and_analyze(&sql);
+                prop_assert!(a.has_nondeterministic_select,
+                    "{} should be detected as non-deterministic in: {}", func, sql);
+            }
+        }
     }
 }

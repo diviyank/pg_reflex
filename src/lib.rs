@@ -133,8 +133,10 @@ fn create_reflex_ivm_impl(view_name: &str, sql: &str, unique_columns_str: &str, 
             return "ERROR: Query is not a SELECT";
         }
         Ok(a) => {
-            if a.has_unsupported_features() {
-                return "ERROR: Query has unsupported features (RECURSIVE CTE, LIMIT, ORDER BY, WINDOW)";
+            if let Some(reason) = a.unsupported_reason() {
+                return Box::leak(
+                    format!("ERROR: {}", reason).into_boxed_str(),
+                );
             }
             a
         }
@@ -8828,6 +8830,591 @@ mod tests {
         assert!(r3.contains("ALREADY EXISTS"), "if_not_exists should skip: {}", r3);
     }
 
+    // ========================================================================
+    // Additional correctness tests — aggregate edge cases
+    // ========================================================================
+
+    /// BOOL_OR: all values become false after deletes
+    #[pg_test]
+    fn test_correctness_bool_or_all_false() {
+        Spi::run("CREATE TABLE cc_bor (id SERIAL PRIMARY KEY, grp TEXT, flag BOOLEAN)").expect("create");
+        Spi::run("INSERT INTO cc_bor (grp, flag) VALUES ('a', true), ('a', false), ('b', false), ('b', true)").expect("seed");
+
+        let sql = "SELECT grp, BOOL_OR(flag) AS any_true FROM cc_bor GROUP BY grp";
+        crate::create_reflex_ivm("cc_bor_v", sql, None, None, None);
+        assert_imv_correct("cc_bor_v", sql);
+
+        // Delete all true rows — BOOL_OR should become false for both groups
+        Spi::run("DELETE FROM cc_bor WHERE flag = true").expect("delete");
+        assert_imv_correct("cc_bor_v", sql);
+
+        // Re-insert a true → should flip back
+        Spi::run("INSERT INTO cc_bor (grp, flag) VALUES ('a', true)").expect("insert");
+        assert_imv_correct("cc_bor_v", sql);
+    }
+
+    /// MIN/MAX: entire group deleted, group should disappear
+    #[pg_test]
+    fn test_correctness_min_max_all_deleted() {
+        Spi::run("CREATE TABLE cc_mm (id SERIAL PRIMARY KEY, grp TEXT, val INT NOT NULL)").expect("create");
+        Spi::run("INSERT INTO cc_mm (grp, val) VALUES ('a', 10), ('a', 20), ('b', 5)").expect("seed");
+
+        let sql = "SELECT grp, MIN(val) AS lo, MAX(val) AS hi FROM cc_mm GROUP BY grp";
+        crate::create_reflex_ivm("cc_mm_v", sql, None, None, None);
+        assert_imv_correct("cc_mm_v", sql);
+
+        // Delete all 'a' rows — group disappears
+        Spi::run("DELETE FROM cc_mm WHERE grp = 'a'").expect("delete");
+        assert_imv_correct("cc_mm_v", sql);
+
+        // Re-insert into 'a'
+        Spi::run("INSERT INTO cc_mm (grp, val) VALUES ('a', 100)").expect("insert");
+        assert_imv_correct("cc_mm_v", sql);
+    }
+
+    /// AVG with single-row groups
+    #[pg_test]
+    fn test_correctness_avg_single_row_group() {
+        Spi::run("CREATE TABLE cc_avg1 (id SERIAL PRIMARY KEY, grp TEXT, val NUMERIC NOT NULL)").expect("create");
+        Spi::run("INSERT INTO cc_avg1 (grp, val) VALUES ('a', 10.5), ('b', 20.7), ('c', 30.3)").expect("seed");
+
+        let sql = "SELECT grp, AVG(val) AS mean FROM cc_avg1 GROUP BY grp";
+        crate::create_reflex_ivm("cc_avg1_v", sql, None, None, None);
+        assert_imv_correct("cc_avg1_v", sql);
+
+        // Add second row to 'a' → AVG should change
+        Spi::run("INSERT INTO cc_avg1 (grp, val) VALUES ('a', 30.5)").expect("insert");
+        assert_imv_correct("cc_avg1_v", sql);
+
+        // Delete it back → single-row again
+        Spi::run("DELETE FROM cc_avg1 WHERE grp = 'a' AND val = 30.5").expect("delete");
+        assert_imv_correct("cc_avg1_v", sql);
+    }
+
+    /// COUNT(col) where all values are NULL
+    #[pg_test]
+    fn test_correctness_count_col_all_null() {
+        Spi::run("CREATE TABLE cc_cnull (id SERIAL PRIMARY KEY, grp TEXT, val INT)").expect("create");
+        Spi::run("INSERT INTO cc_cnull (grp, val) VALUES ('a', NULL), ('a', NULL), ('b', 1)").expect("seed");
+
+        let sql = "SELECT grp, COUNT(val) AS cnt FROM cc_cnull GROUP BY grp";
+        crate::create_reflex_ivm("cc_cnull_v", sql, None, None, None);
+        assert_imv_correct("cc_cnull_v", sql);
+
+        // Insert non-null into 'a'
+        Spi::run("INSERT INTO cc_cnull (grp, val) VALUES ('a', 5)").expect("insert");
+        assert_imv_correct("cc_cnull_v", sql);
+
+        // Delete the non-null → back to 0
+        Spi::run("DELETE FROM cc_cnull WHERE val = 5").expect("delete");
+        assert_imv_correct("cc_cnull_v", sql);
+    }
+
+    /// SUM with negative values
+    #[pg_test]
+    fn test_correctness_sum_negative_values() {
+        Spi::run("CREATE TABLE cc_sneg (id SERIAL PRIMARY KEY, grp TEXT, val INT NOT NULL)").expect("create");
+        Spi::run("INSERT INTO cc_sneg (grp, val) VALUES ('a', -10), ('a', 20), ('a', -5), ('b', -100), ('b', 50)").expect("seed");
+
+        let sql = "SELECT grp, SUM(val) AS total FROM cc_sneg GROUP BY grp";
+        crate::create_reflex_ivm("cc_sneg_v", sql, None, None, None);
+        assert_imv_correct("cc_sneg_v", sql);
+
+        // Insert more negatives
+        Spi::run("INSERT INTO cc_sneg (grp, val) VALUES ('a', -30), ('b', -1)").expect("insert");
+        assert_imv_correct("cc_sneg_v", sql);
+
+        // Update positive to negative
+        Spi::run("UPDATE cc_sneg SET val = -20 WHERE val = 20").expect("update");
+        assert_imv_correct("cc_sneg_v", sql);
+    }
+
+    /// Multiple aggregates on same column
+    #[pg_test]
+    fn test_correctness_multi_aggregate_same_col() {
+        Spi::run("CREATE TABLE cc_magg (id SERIAL PRIMARY KEY, grp TEXT, val INT NOT NULL)").expect("create");
+        Spi::run("INSERT INTO cc_magg (grp, val) VALUES ('a', 10), ('a', 20), ('a', 30), ('b', 5), ('b', 15)").expect("seed");
+
+        let sql = "SELECT grp, SUM(val) AS s, AVG(val) AS a, MIN(val) AS lo, MAX(val) AS hi, COUNT(val) AS c FROM cc_magg GROUP BY grp";
+        crate::create_reflex_ivm("cc_magg_v", sql, None, None, None);
+        assert_imv_correct("cc_magg_v", sql);
+
+        // Insert
+        Spi::run("INSERT INTO cc_magg (grp, val) VALUES ('a', 1), ('b', 100)").expect("insert");
+        assert_imv_correct("cc_magg_v", sql);
+
+        // Delete min for 'b'
+        Spi::run("DELETE FROM cc_magg WHERE grp = 'b' AND val = 5").expect("delete");
+        assert_imv_correct("cc_magg_v", sql);
+
+        // Update
+        Spi::run("UPDATE cc_magg SET val = 99 WHERE grp = 'a' AND val = 1").expect("update");
+        assert_imv_correct("cc_magg_v", sql);
+    }
+
+    // ========================================================================
+    // Additional correctness tests — join edge cases
+    // ========================================================================
+
+    /// FULL OUTER JOIN with aggregation
+    #[pg_test]
+    fn test_correctness_full_outer_join_aggregate() {
+        Spi::run("CREATE TABLE cc_foj1 (id INT PRIMARY KEY, grp TEXT, val INT NOT NULL)").expect("create1");
+        Spi::run("CREATE TABLE cc_foj2 (id INT PRIMARY KEY, grp TEXT, val INT NOT NULL)").expect("create2");
+        Spi::run("INSERT INTO cc_foj1 VALUES (1, 'a', 10), (2, 'a', 20), (3, 'b', 30)").expect("seed1");
+        Spi::run("INSERT INTO cc_foj2 VALUES (1, 'a', 100), (2, 'c', 200)").expect("seed2");
+
+        // Aggregate IMV over INNER JOIN (FULL OUTER not supported for passthrough)
+        let sql = "SELECT cc_foj1.grp, SUM(cc_foj1.val) AS s1, SUM(cc_foj2.val) AS s2 \
+                   FROM cc_foj1 JOIN cc_foj2 ON cc_foj1.grp = cc_foj2.grp GROUP BY cc_foj1.grp";
+        crate::create_reflex_ivm("cc_foj_v", sql, None, None, None);
+        assert_imv_correct("cc_foj_v", sql);
+
+        // Insert into left
+        Spi::run("INSERT INTO cc_foj1 VALUES (4, 'a', 5)").expect("insert1");
+        assert_imv_correct("cc_foj_v", sql);
+
+        // Insert into right, new matching group
+        Spi::run("INSERT INTO cc_foj2 VALUES (3, 'b', 50)").expect("insert2");
+        assert_imv_correct("cc_foj_v", sql);
+
+        // Delete from left
+        Spi::run("DELETE FROM cc_foj1 WHERE id = 1").expect("delete");
+        assert_imv_correct("cc_foj_v", sql);
+    }
+
+    /// CROSS JOIN with mutations
+    #[pg_test]
+    fn test_correctness_cross_join() {
+        Spi::run("CREATE TABLE cc_cj1 (id INT PRIMARY KEY, x TEXT)").expect("create");
+        Spi::run("CREATE TABLE cc_cj2 (id INT PRIMARY KEY, y TEXT)").expect("create");
+        Spi::run("INSERT INTO cc_cj1 VALUES (1, 'a'), (2, 'b')").expect("seed1");
+        Spi::run("INSERT INTO cc_cj2 VALUES (10, 'x'), (20, 'y')").expect("seed2");
+
+        let sql = "SELECT cc_cj1.id AS l, cc_cj2.id AS r, x, y FROM cc_cj1 CROSS JOIN cc_cj2";
+        crate::create_reflex_ivm("cc_cj_v", sql, Some("l, r"), None, None);
+        assert_imv_correct("cc_cj_v", sql);
+
+        // Insert one row → should add N cross products
+        Spi::run("INSERT INTO cc_cj1 VALUES (3, 'c')").expect("insert");
+        assert_imv_correct("cc_cj_v", sql);
+
+        // Delete from other side
+        Spi::run("DELETE FROM cc_cj2 WHERE id = 10").expect("delete");
+        assert_imv_correct("cc_cj_v", sql);
+    }
+
+    /// Self-join with aggregation lifecycle
+    #[pg_test]
+    fn test_correctness_self_join_aggregate_lifecycle() {
+        Spi::run("CREATE TABLE cc_sj (id SERIAL PRIMARY KEY, grp INT NOT NULL, val INT NOT NULL)").expect("create");
+        Spi::run("INSERT INTO cc_sj (grp, val) VALUES (1, 10), (1, 20), (2, 30), (2, 40)").expect("seed");
+
+        // Self-join with GROUP BY triggers full refresh (auto-detected)
+        let sql = "SELECT t1.grp, SUM(t1.val + t2.val) AS total FROM cc_sj t1 JOIN cc_sj t2 ON t1.grp = t2.grp GROUP BY t1.grp";
+        crate::create_reflex_ivm("cc_sj_v", sql, None, None, None);
+        assert_imv_correct("cc_sj_v", sql);
+
+        // Insert
+        Spi::run("INSERT INTO cc_sj (grp, val) VALUES (1, 5)").expect("insert");
+        assert_imv_correct("cc_sj_v", sql);
+
+        // Delete
+        Spi::run("DELETE FROM cc_sj WHERE val = 5").expect("delete");
+        assert_imv_correct("cc_sj_v", sql);
+
+        // Update
+        Spi::run("UPDATE cc_sj SET val = 99 WHERE grp = 2 AND val = 40").expect("update");
+        assert_imv_correct("cc_sj_v", sql);
+    }
+
+    // ========================================================================
+    // Additional correctness tests — feature edge cases
+    // ========================================================================
+
+    /// 3-level CTE chain with mutations
+    #[pg_test]
+    fn test_correctness_cte_three_levels() {
+        Spi::run("CREATE TABLE cc_cte3 (id SERIAL PRIMARY KEY, grp TEXT, val INT NOT NULL)").expect("create");
+        Spi::run("INSERT INTO cc_cte3 (grp, val) VALUES ('a', 10), ('a', 20), ('b', 30), ('b', 40), ('c', 50)").expect("seed");
+
+        let sql = "WITH \
+            level1 AS (SELECT grp, SUM(val) AS total FROM cc_cte3 GROUP BY grp), \
+            level2 AS (SELECT grp, total FROM level1 WHERE total > 15) \
+            SELECT grp, total FROM level2";
+        crate::create_reflex_ivm("cc_cte3_v", sql, None, None, None);
+        assert_imv_correct("cc_cte3_v", sql);
+
+        // Insert to push 'c' total higher
+        Spi::run("INSERT INTO cc_cte3 (grp, val) VALUES ('c', 100)").expect("insert");
+        assert_imv_correct("cc_cte3_v", sql);
+
+        // Delete to drop 'a' below threshold
+        Spi::run("DELETE FROM cc_cte3 WHERE grp = 'a' AND val = 20").expect("delete");
+        assert_imv_correct("cc_cte3_v", sql);
+    }
+
+    /// WHERE that initially matches no rows, then rows appear
+    #[pg_test]
+    fn test_correctness_where_excludes_all() {
+        Spi::run("CREATE TABLE cc_wex (id SERIAL PRIMARY KEY, grp TEXT, val INT NOT NULL)").expect("create");
+        Spi::run("INSERT INTO cc_wex (grp, val) VALUES ('a', 1), ('b', 2)").expect("seed");
+
+        let sql = "SELECT grp, SUM(val) AS total FROM cc_wex WHERE val > 100 GROUP BY grp";
+        crate::create_reflex_ivm("cc_wex_v", sql, None, None, None);
+        assert_imv_correct("cc_wex_v", sql);
+
+        // IMV should be empty
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT COUNT(*) FROM cc_wex_v").expect("q").expect("v"),
+            0
+        );
+
+        // Insert matching rows → groups should appear
+        Spi::run("INSERT INTO cc_wex (grp, val) VALUES ('a', 200), ('c', 300)").expect("insert");
+        assert_imv_correct("cc_wex_v", sql);
+
+        // Delete → back to empty
+        Spi::run("DELETE FROM cc_wex WHERE val > 100").expect("delete");
+        assert_imv_correct("cc_wex_v", sql);
+    }
+
+    /// HAVING: group bounces above and below threshold
+    #[pg_test]
+    fn test_correctness_having_group_enters_exits() {
+        Spi::run("CREATE TABLE cc_hav (id SERIAL PRIMARY KEY, grp TEXT, val INT NOT NULL)").expect("create");
+        Spi::run("INSERT INTO cc_hav (grp, val) VALUES ('a', 10), ('a', 20), ('b', 5)").expect("seed");
+
+        let sql = "SELECT grp, SUM(val) AS total FROM cc_hav GROUP BY grp HAVING SUM(val) > 25";
+        crate::create_reflex_ivm("cc_hav_v", sql, None, None, None);
+        assert_imv_correct("cc_hav_v", sql);
+
+        // 'a' total=30 (visible), 'b' total=5 (hidden)
+        // Push 'b' above threshold
+        Spi::run("INSERT INTO cc_hav (grp, val) VALUES ('b', 25)").expect("insert");
+        assert_imv_correct("cc_hav_v", sql);
+
+        // Drop 'a' below threshold
+        Spi::run("DELETE FROM cc_hav WHERE grp = 'a' AND val = 20").expect("delete");
+        assert_imv_correct("cc_hav_v", sql);
+
+        // Push 'a' back above
+        Spi::run("INSERT INTO cc_hav (grp, val) VALUES ('a', 50)").expect("insert2");
+        assert_imv_correct("cc_hav_v", sql);
+    }
+
+    /// Window: LAG/LEAD through full lifecycle
+    #[pg_test]
+    fn test_correctness_window_lag_lead_mutations() {
+        Spi::run("CREATE TABLE cc_wlag (id SERIAL PRIMARY KEY, grp TEXT, val INT NOT NULL)").expect("create");
+        Spi::run("INSERT INTO cc_wlag (grp, val) VALUES ('a', 10), ('a', 20), ('a', 30), ('b', 5), ('b', 15)").expect("seed");
+
+        let sql = "SELECT grp, val, LAG(val) OVER (PARTITION BY grp ORDER BY val) AS prev_val, \
+                   LEAD(val) OVER (PARTITION BY grp ORDER BY val) AS next_val \
+                   FROM cc_wlag";
+        crate::create_reflex_ivm("cc_wlag_v", sql, None, None, None);
+        assert_imv_correct("cc_wlag_v", sql);
+
+        // Insert → windows should recalculate
+        Spi::run("INSERT INTO cc_wlag (grp, val) VALUES ('a', 15)").expect("insert");
+        assert_imv_correct("cc_wlag_v", sql);
+
+        // Delete
+        Spi::run("DELETE FROM cc_wlag WHERE grp = 'a' AND val = 20").expect("delete");
+        assert_imv_correct("cc_wlag_v", sql);
+    }
+
+    // ========================================================================
+    // Combination tests — features combined
+    // ========================================================================
+
+    /// CTE containing a JOIN, outer query with HAVING
+    #[pg_test]
+    fn test_combo_cte_join_having() {
+        Spi::run("CREATE TABLE cc_cjh1 (id INT PRIMARY KEY, grp TEXT)").expect("create1");
+        Spi::run("CREATE TABLE cc_cjh2 (id INT, val INT NOT NULL)").expect("create2");
+        Spi::run("INSERT INTO cc_cjh1 VALUES (1, 'a'), (2, 'a'), (3, 'b')").expect("seed1");
+        Spi::run("INSERT INTO cc_cjh2 VALUES (1, 10), (2, 20), (3, 30)").expect("seed2");
+
+        let sql = "WITH joined AS ( \
+            SELECT cc_cjh1.grp, cc_cjh2.val FROM cc_cjh1 JOIN cc_cjh2 ON cc_cjh1.id = cc_cjh2.id \
+        ) \
+        SELECT grp, SUM(val) AS total FROM joined GROUP BY grp HAVING SUM(val) > 20";
+        crate::create_reflex_ivm("cc_cjh_v", sql, None, None, None);
+        assert_imv_correct("cc_cjh_v", sql);
+
+        // Insert to push 'b' above threshold
+        Spi::run("INSERT INTO cc_cjh1 VALUES (4, 'b')").expect("insert1");
+        Spi::run("INSERT INTO cc_cjh2 VALUES (4, 25)").expect("insert2");
+        assert_imv_correct("cc_cjh_v", sql);
+    }
+
+    /// DISTINCT + WHERE filter
+    #[pg_test]
+    fn test_combo_distinct_where() {
+        Spi::run("CREATE TABLE cc_dw (id SERIAL PRIMARY KEY, grp TEXT, val INT NOT NULL)").expect("create");
+        Spi::run("INSERT INTO cc_dw (grp, val) VALUES ('a', 10), ('a', 10), ('b', 20), ('b', 30), ('a', 20)").expect("seed");
+
+        let sql = "SELECT DISTINCT grp, val FROM cc_dw WHERE val > 5";
+        crate::create_reflex_ivm("cc_dw_v", sql, Some("grp, val"), None, None);
+        assert_imv_correct("cc_dw_v", sql);
+
+        // Insert duplicate — should not add new row
+        Spi::run("INSERT INTO cc_dw (grp, val) VALUES ('a', 10)").expect("insert");
+        assert_imv_correct("cc_dw_v", sql);
+
+        // Delete one copy of duplicate — DISTINCT should still show it
+        Spi::run("DELETE FROM cc_dw WHERE id = (SELECT MIN(id) FROM cc_dw WHERE grp = 'a' AND val = 10)").expect("delete");
+        assert_imv_correct("cc_dw_v", sql);
+    }
+
+    /// UNION ALL where both operands have GROUP BY
+    #[pg_test]
+    fn test_combo_union_aggregate_operands() {
+        Spi::run("CREATE TABLE cc_ua1 (id SERIAL PRIMARY KEY, grp TEXT, val INT NOT NULL)").expect("create1");
+        Spi::run("CREATE TABLE cc_ua2 (id SERIAL PRIMARY KEY, grp TEXT, val INT NOT NULL)").expect("create2");
+        Spi::run("INSERT INTO cc_ua1 (grp, val) VALUES ('a', 10), ('a', 20), ('b', 30)").expect("seed1");
+        Spi::run("INSERT INTO cc_ua2 (grp, val) VALUES ('a', 100), ('c', 200)").expect("seed2");
+
+        let sql = "SELECT grp, SUM(val) AS total FROM cc_ua1 GROUP BY grp \
+                   UNION ALL \
+                   SELECT grp, SUM(val) AS total FROM cc_ua2 GROUP BY grp";
+        crate::create_reflex_ivm("cc_ua_v", sql, None, None, None);
+        assert_imv_correct("cc_ua_v", sql);
+
+        // Insert into first table
+        Spi::run("INSERT INTO cc_ua1 (grp, val) VALUES ('b', 5)").expect("insert1");
+        assert_imv_correct("cc_ua_v", sql);
+
+        // Insert into second table
+        Spi::run("INSERT INTO cc_ua2 (grp, val) VALUES ('c', 50)").expect("insert2");
+        assert_imv_correct("cc_ua_v", sql);
+
+        // Delete from first
+        Spi::run("DELETE FROM cc_ua1 WHERE grp = 'a' AND val = 10").expect("delete");
+        assert_imv_correct("cc_ua_v", sql);
+    }
+
+    /// Cast on multiple aggregates
+    #[pg_test]
+    fn test_combo_cast_multiple_aggregates() {
+        Spi::run("CREATE TABLE cc_cast (id SERIAL PRIMARY KEY, grp TEXT, val INT NOT NULL)").expect("create");
+        Spi::run("INSERT INTO cc_cast (grp, val) VALUES ('a', 10), ('a', 20), ('b', 30)").expect("seed");
+
+        let sql = "SELECT grp, SUM(val)::BIGINT AS s, COUNT(*)::INT AS c FROM cc_cast GROUP BY grp";
+        crate::create_reflex_ivm("cc_cast_v", sql, None, None, None);
+        assert_imv_correct("cc_cast_v", sql);
+
+        Spi::run("INSERT INTO cc_cast (grp, val) VALUES ('a', 5)").expect("insert");
+        assert_imv_correct("cc_cast_v", sql);
+
+        Spi::run("DELETE FROM cc_cast WHERE grp = 'b'").expect("delete");
+        assert_imv_correct("cc_cast_v", sql);
+    }
+
+    /// HAVING with AVG threshold
+    #[pg_test]
+    fn test_combo_having_with_avg() {
+        Spi::run("CREATE TABLE cc_havg (id SERIAL PRIMARY KEY, grp TEXT, val INT NOT NULL)").expect("create");
+        Spi::run("INSERT INTO cc_havg (grp, val) VALUES ('a', 10), ('a', 20), ('a', 30), ('b', 5), ('b', 100)").expect("seed");
+
+        let sql = "SELECT grp, AVG(val) AS mean, COUNT(*) AS cnt FROM cc_havg GROUP BY grp HAVING AVG(val) > 15";
+        crate::create_reflex_ivm("cc_havg_v", sql, None, None, None);
+        assert_imv_correct("cc_havg_v", sql);
+
+        // Drop 'a' average by adding low values
+        Spi::run("INSERT INTO cc_havg (grp, val) VALUES ('a', 1), ('a', 1), ('a', 1)").expect("insert");
+        assert_imv_correct("cc_havg_v", sql);
+
+        // Raise 'b' average
+        Spi::run("DELETE FROM cc_havg WHERE grp = 'b' AND val = 5").expect("delete");
+        assert_imv_correct("cc_havg_v", sql);
+    }
+
+    // ========================================================================
+    // Randomized / matrix correctness tests
+    // ========================================================================
+
+    /// Iterate over multiple aggregate SQL templates, verifying correctness after each mutation
+    #[pg_test]
+    fn test_randomized_aggregate_correctness() {
+        Spi::run("CREATE TABLE rnd_agg (id SERIAL PRIMARY KEY, grp TEXT NOT NULL, val INT NOT NULL, flag BOOLEAN NOT NULL)").expect("create");
+        Spi::run(
+            "INSERT INTO rnd_agg (grp, val, flag) \
+             SELECT 'g' || (i % 5), (i * 7 + 13) % 100, (i % 3 = 0) \
+             FROM generate_series(1, 100) i"
+        ).expect("seed");
+
+        let test_cases: Vec<(&str, &str)> = vec![
+            ("SELECT grp, SUM(val) AS s FROM rnd_agg GROUP BY grp", "rnd_sum"),
+            ("SELECT grp, COUNT(*) AS c FROM rnd_agg GROUP BY grp", "rnd_cnt"),
+            ("SELECT grp, COUNT(val) AS c FROM rnd_agg GROUP BY grp", "rnd_cntv"),
+            ("SELECT grp, AVG(val) AS a FROM rnd_agg GROUP BY grp", "rnd_avg"),
+            ("SELECT grp, MIN(val) AS lo FROM rnd_agg GROUP BY grp", "rnd_min"),
+            ("SELECT grp, MAX(val) AS hi FROM rnd_agg GROUP BY grp", "rnd_max"),
+            ("SELECT grp, BOOL_OR(flag) AS any FROM rnd_agg GROUP BY grp", "rnd_bor"),
+            ("SELECT grp, SUM(val) AS s, COUNT(*) AS c, AVG(val) AS a FROM rnd_agg GROUP BY grp", "rnd_multi"),
+            ("SELECT grp, MIN(val) AS lo, MAX(val) AS hi, SUM(val) AS s FROM rnd_agg GROUP BY grp", "rnd_mmsum"),
+            ("SELECT grp, SUM(val) AS s FROM rnd_agg WHERE val > 30 GROUP BY grp", "rnd_where"),
+            ("SELECT grp, SUM(val) AS s FROM rnd_agg GROUP BY grp HAVING SUM(val) > 200", "rnd_having"),
+            ("SELECT grp, SUM(val)::BIGINT AS s FROM rnd_agg GROUP BY grp", "rnd_cast"),
+        ];
+
+        for (sql, name) in &test_cases {
+            let result = crate::create_reflex_ivm(name, sql, None, None, None);
+            assert!(!result.starts_with("ERROR"), "Failed to create IMV '{}': {}", name, result);
+            assert_imv_correct(name, sql);
+
+            // INSERT
+            Spi::run("INSERT INTO rnd_agg (grp, val, flag) VALUES ('g0', 42, true), ('g3', 77, false)").expect("insert");
+            assert_imv_correct(name, sql);
+
+            // DELETE
+            Spi::run("DELETE FROM rnd_agg WHERE id IN (SELECT id FROM rnd_agg ORDER BY id LIMIT 3)").expect("delete");
+            assert_imv_correct(name, sql);
+
+            // UPDATE
+            Spi::run("UPDATE rnd_agg SET val = val + 1 WHERE grp = 'g1'").expect("update");
+            assert_imv_correct(name, sql);
+
+            // Cleanup
+            crate::drop_reflex_ivm_cascade(name, true);
+            // Restore data for next iteration
+            Spi::run("DELETE FROM rnd_agg").expect("clear");
+            Spi::run(
+                "INSERT INTO rnd_agg (grp, val, flag) \
+                 SELECT 'g' || (i % 5), (i * 7 + 13) % 100, (i % 3 = 0) \
+                 FROM generate_series(1, 100) i"
+            ).expect("reseed");
+        }
+    }
+
+    /// Iterate over join types with correctness checks
+    #[pg_test]
+    fn test_randomized_join_correctness() {
+        Spi::run("CREATE TABLE rnd_j1 (id INT PRIMARY KEY, grp TEXT NOT NULL, val INT NOT NULL)").expect("create1");
+        Spi::run("CREATE TABLE rnd_j2 (id INT PRIMARY KEY, grp TEXT NOT NULL, val INT NOT NULL)").expect("create2");
+        Spi::run("INSERT INTO rnd_j1 VALUES (1,'a',10),(2,'a',20),(3,'b',30),(4,'c',40)").expect("seed1");
+        Spi::run("INSERT INTO rnd_j2 VALUES (1,'a',100),(2,'b',200),(3,'d',300)").expect("seed2");
+
+        // Test aggregate queries over different join types
+        // Test INNER JOIN aggregate with mutations to both tables
+        let inner_sql = "SELECT rnd_j1.grp, SUM(rnd_j1.val) AS s1, SUM(rnd_j2.val) AS s2 \
+                 FROM rnd_j1 INNER JOIN rnd_j2 ON rnd_j1.grp = rnd_j2.grp GROUP BY rnd_j1.grp";
+        let result = crate::create_reflex_ivm("rnd_inner", inner_sql, None, None, None);
+        assert!(!result.starts_with("ERROR"), "Failed to create 'rnd_inner': {}", result);
+        assert_imv_correct("rnd_inner", inner_sql);
+
+        // Mutate left table
+        Spi::run("INSERT INTO rnd_j1 VALUES (5, 'b', 50)").expect("insert left");
+        assert_imv_correct("rnd_inner", inner_sql);
+
+        // Mutate right table
+        Spi::run("INSERT INTO rnd_j2 VALUES (4, 'a', 150)").expect("insert right");
+        assert_imv_correct("rnd_inner", inner_sql);
+
+        // Delete from left
+        Spi::run("DELETE FROM rnd_j1 WHERE id = 5").expect("delete left");
+        assert_imv_correct("rnd_inner", inner_sql);
+
+        // Delete from right
+        Spi::run("DELETE FROM rnd_j2 WHERE id = 4").expect("delete right");
+        assert_imv_correct("rnd_inner", inner_sql);
+
+        crate::drop_reflex_ivm_cascade("rnd_inner", true);
+
+        // Test LEFT JOIN aggregate — only mutate primary (left) table
+        let left_sql = "SELECT rnd_j1.grp, SUM(rnd_j1.val) AS s1, COUNT(rnd_j2.val) AS c2 \
+                 FROM rnd_j1 LEFT JOIN rnd_j2 ON rnd_j1.grp = rnd_j2.grp GROUP BY rnd_j1.grp";
+        let result = crate::create_reflex_ivm("rnd_left", left_sql, None, None, None);
+        assert!(!result.starts_with("ERROR"), "Failed to create 'rnd_left': {}", result);
+        assert_imv_correct("rnd_left", left_sql);
+
+        // Mutate primary (left) table
+        Spi::run("INSERT INTO rnd_j1 VALUES (6, 'b', 60)").expect("insert left");
+        assert_imv_correct("rnd_left", left_sql);
+
+        Spi::run("DELETE FROM rnd_j1 WHERE id = 6").expect("delete left");
+        assert_imv_correct("rnd_left", left_sql);
+
+        crate::drop_reflex_ivm_cascade("rnd_left", true);
+
+        // Test RIGHT JOIN aggregate — only mutate primary (right) table
+        let right_sql = "SELECT rnd_j2.grp, COUNT(rnd_j1.val) AS c1, SUM(rnd_j2.val) AS s2 \
+                 FROM rnd_j1 RIGHT JOIN rnd_j2 ON rnd_j1.grp = rnd_j2.grp GROUP BY rnd_j2.grp";
+        let result = crate::create_reflex_ivm("rnd_right", right_sql, None, None, None);
+        assert!(!result.starts_with("ERROR"), "Failed to create 'rnd_right': {}", result);
+        assert_imv_correct("rnd_right", right_sql);
+
+        // Mutate primary (right) table
+        Spi::run("INSERT INTO rnd_j2 VALUES (5, 'b', 250)").expect("insert right");
+        assert_imv_correct("rnd_right", right_sql);
+
+        Spi::run("DELETE FROM rnd_j2 WHERE id = 5").expect("delete right");
+        assert_imv_correct("rnd_right", right_sql);
+
+        crate::drop_reflex_ivm_cascade("rnd_right", true);
+    }
+
+    /// Stress test: many sequential mutations with periodic correctness checks
+    #[pg_test]
+    fn test_randomized_mutation_sequence() {
+        Spi::run("CREATE TABLE rnd_mut (id SERIAL PRIMARY KEY, grp TEXT NOT NULL, val INT NOT NULL)").expect("create");
+        Spi::run(
+            "INSERT INTO rnd_mut (grp, val) \
+             SELECT 'g' || (i % 3), i * 11 % 50 \
+             FROM generate_series(1, 50) i"
+        ).expect("seed");
+
+        let sql = "SELECT grp, SUM(val) AS s, COUNT(*) AS c, MIN(val) AS lo, MAX(val) AS hi FROM rnd_mut GROUP BY grp";
+        let result = crate::create_reflex_ivm("rnd_mut_v", sql, None, None, None);
+        assert!(!result.starts_with("ERROR"), "Failed to create: {}", result);
+        assert_imv_correct("rnd_mut_v", sql);
+
+        // 50 mixed mutations, check every 5th
+        for i in 0..50 {
+            match i % 3 {
+                0 => {
+                    // Batch INSERT
+                    let ins_sql = format!(
+                        "INSERT INTO rnd_mut (grp, val) VALUES ('g{}', {}), ('g{}', {})",
+                        i % 3, (i * 7 + 3) % 100,
+                        (i + 1) % 3, (i * 13 + 7) % 100
+                    );
+                    Spi::run(&ins_sql).expect("insert");
+                }
+                1 => {
+                    // DELETE some rows
+                    let del_sql = format!(
+                        "DELETE FROM rnd_mut WHERE id IN (SELECT id FROM rnd_mut WHERE grp = 'g{}' LIMIT 1)",
+                        i % 3
+                    );
+                    Spi::run(&del_sql).expect("delete");
+                }
+                _ => {
+                    // UPDATE some values
+                    let upd_sql = format!(
+                        "UPDATE rnd_mut SET val = val + 1 WHERE grp = 'g{}'",
+                        i % 3
+                    );
+                    Spi::run(&upd_sql).expect("update");
+                }
+            }
+
+            // Check correctness every 5 mutations
+            if (i + 1) % 5 == 0 {
+                assert_imv_correct("rnd_mut_v", sql);
+            }
+        }
+
+        // Final check
+        assert_imv_correct("rnd_mut_v", sql);
+    }
+
+    // ========================================================================
+    // Error path tests
+    // ========================================================================
+
     /// RECURSIVE CTE → still rejected
     #[pg_test]
     fn test_error_recursive_cte() {
@@ -8876,6 +9463,138 @@ mod tests {
             "SELECT val, COUNT(*) AS c FROM err_mode GROUP BY val",
             None, None, Some("BANANA"));
         assert!(result.starts_with("ERROR"), "Invalid mode should error: {}", result);
+    }
+
+    // ========================================================================
+    // Unsupported SQL construct rejection (integration tests)
+    // ========================================================================
+
+    #[pg_test]
+    fn test_error_unsupported_aggregate_string_agg() {
+        Spi::run("CREATE TABLE err_sagg (city TEXT, name TEXT)").expect("create");
+        let result = crate::create_reflex_ivm("err_sagg_v",
+            "SELECT city, STRING_AGG(name, ', ') AS names FROM err_sagg GROUP BY city",
+            None, None, None);
+        assert!(result.starts_with("ERROR"), "STRING_AGG should be rejected: {}", result);
+    }
+
+    #[pg_test]
+    fn test_error_unsupported_aggregate_array_agg() {
+        Spi::run("CREATE TABLE err_aagg (city TEXT, val INT)").expect("create");
+        let result = crate::create_reflex_ivm("err_aagg_v",
+            "SELECT city, ARRAY_AGG(val) AS vals FROM err_aagg GROUP BY city",
+            None, None, None);
+        assert!(result.starts_with("ERROR"), "ARRAY_AGG should be rejected: {}", result);
+    }
+
+    #[pg_test]
+    fn test_error_unsupported_aggregate_stddev() {
+        Spi::run("CREATE TABLE err_stddev (city TEXT, val NUMERIC)").expect("create");
+        let result = crate::create_reflex_ivm("err_stddev_v",
+            "SELECT city, STDDEV(val) AS sd FROM err_stddev GROUP BY city",
+            None, None, None);
+        assert!(result.starts_with("ERROR"), "STDDEV should be rejected: {}", result);
+    }
+
+    #[pg_test]
+    fn test_error_lateral_join() {
+        Spi::run("CREATE TABLE err_lat1 (id INT, val INT)").expect("create");
+        Spi::run("CREATE TABLE err_lat2 (id INT, val INT)").expect("create");
+        let result = crate::create_reflex_ivm("err_lat_v",
+            "SELECT t.id, s.val FROM err_lat1 t, LATERAL (SELECT val FROM err_lat2 WHERE err_lat2.id = t.id) s",
+            None, None, None);
+        assert!(result.starts_with("ERROR"), "LATERAL join should be rejected: {}", result);
+    }
+
+    #[pg_test]
+    fn test_error_distinct_on() {
+        Spi::run("CREATE TABLE err_don (city TEXT, val INT)").expect("create");
+        let result = crate::create_reflex_ivm("err_don_v",
+            "SELECT DISTINCT ON (city) city, val FROM err_don",
+            None, None, None);
+        assert!(result.starts_with("ERROR"), "DISTINCT ON should be rejected: {}", result);
+    }
+
+    #[pg_test]
+    fn test_error_grouping_sets() {
+        Spi::run("CREATE TABLE err_gset (city TEXT, val INT)").expect("create");
+        let result = crate::create_reflex_ivm("err_gset_v",
+            "SELECT city, SUM(val) FROM err_gset GROUP BY GROUPING SETS ((city), ())",
+            None, None, None);
+        assert!(result.starts_with("ERROR"), "GROUPING SETS should be rejected: {}", result);
+    }
+
+    #[pg_test]
+    fn test_error_cube() {
+        Spi::run("CREATE TABLE err_cube (city TEXT, state TEXT, val INT)").expect("create");
+        let result = crate::create_reflex_ivm("err_cube_v",
+            "SELECT city, state, SUM(val) FROM err_cube GROUP BY CUBE (city, state)",
+            None, None, None);
+        assert!(result.starts_with("ERROR"), "CUBE should be rejected: {}", result);
+    }
+
+    #[pg_test]
+    fn test_error_rollup() {
+        Spi::run("CREATE TABLE err_rollup (city TEXT, val INT)").expect("create");
+        let result = crate::create_reflex_ivm("err_rollup_v",
+            "SELECT city, SUM(val) FROM err_rollup GROUP BY ROLLUP (city)",
+            None, None, None);
+        assert!(result.starts_with("ERROR"), "ROLLUP should be rejected: {}", result);
+    }
+
+    #[pg_test]
+    fn test_error_filter_clause() {
+        Spi::run("CREATE TABLE err_filt (city TEXT, active BOOLEAN)").expect("create");
+        let result = crate::create_reflex_ivm("err_filt_v",
+            "SELECT city, COUNT(*) FILTER (WHERE active) AS cnt FROM err_filt GROUP BY city",
+            None, None, None);
+        assert!(result.starts_with("ERROR"), "FILTER clause should be rejected: {}", result);
+    }
+
+    #[pg_test]
+    fn test_error_within_group() {
+        Spi::run("CREATE TABLE err_wg (city TEXT, val NUMERIC)").expect("create");
+        let result = crate::create_reflex_ivm("err_wg_v",
+            "SELECT city, PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY val) FROM err_wg GROUP BY city",
+            None, None, None);
+        assert!(result.starts_with("ERROR"), "WITHIN GROUP should be rejected: {}", result);
+    }
+
+    #[pg_test]
+    fn test_error_tablesample() {
+        Spi::run("CREATE TABLE err_samp (id INT, val INT)").expect("create");
+        let result = crate::create_reflex_ivm("err_samp_v",
+            "SELECT * FROM err_samp TABLESAMPLE BERNOULLI (10)",
+            None, None, None);
+        assert!(result.starts_with("ERROR"), "TABLESAMPLE should be rejected: {}", result);
+    }
+
+    #[pg_test]
+    fn test_error_nondeterministic_now_in_select() {
+        Spi::run("CREATE TABLE err_now (city TEXT, val INT)").expect("create");
+        let result = crate::create_reflex_ivm("err_now_v",
+            "SELECT NOW(), city, SUM(val) AS s FROM err_now GROUP BY city",
+            None, None, None);
+        assert!(result.starts_with("ERROR"), "NOW() in SELECT should be rejected: {}", result);
+    }
+
+    #[pg_test]
+    fn test_error_nondeterministic_random_in_select() {
+        Spi::run("CREATE TABLE err_rnd (city TEXT, val INT)").expect("create");
+        let result = crate::create_reflex_ivm("err_rnd_v",
+            "SELECT RANDOM(), city, SUM(val) AS s FROM err_rnd GROUP BY city",
+            None, None, None);
+        assert!(result.starts_with("ERROR"), "RANDOM() in SELECT should be rejected: {}", result);
+    }
+
+    #[pg_test]
+    fn test_error_scalar_subquery_in_select() {
+        Spi::run("CREATE TABLE err_ssq1 (city TEXT, val INT)").expect("create");
+        Spi::run("CREATE TABLE err_ssq2 (x INT)").expect("create");
+        let result = crate::create_reflex_ivm("err_ssq_v",
+            "SELECT (SELECT MAX(x) FROM err_ssq2), city, SUM(val) AS s FROM err_ssq1 GROUP BY city",
+            None, None, None);
+        assert!(result.starts_with("ERROR"), "Scalar subquery in SELECT should be rejected: {}", result);
     }
 }
 
