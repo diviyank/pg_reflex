@@ -122,6 +122,87 @@ pub fn build_merge_sql(
     )
 }
 
+/// Build a net-delta query for UPDATE: combines old (negated) and new transition tables
+/// into a single aggregated delta. Halves the MERGE count for SUM/COUNT aggregates.
+///
+/// Produces: SELECT group_cols, SUM(CASE WHEN __op='N' THEN val ELSE -val END) AS __sum_val, ...
+///           FROM (SELECT 'N', * FROM new_tbl UNION ALL SELECT 'O', * FROM old_tbl) GROUP BY ...
+fn build_net_delta_query(
+    delta_old: &str,
+    delta_new: &str,
+    plan: &AggregationPlan,
+) -> String {
+    // Extract the GROUP BY columns and aggregate expressions from the base query pattern.
+    // The delta queries look like: SELECT group_col, SUM(amount) AS __sum_amount, COUNT(*) AS __ivm_count FROM transition_table GROUP BY group_col
+    // We need to rewrite them into a net-delta form.
+    //
+    // Approach: UNION ALL the new (positive) and old (negated) delta queries, then re-aggregate.
+    // The outer SELECT uses the same GROUP BY and sums the results — since old values are
+    // negated in the subtract query, the net effect is (new - old) per group.
+    //
+    // For SUM: SUM(val_from_new) + SUM(-val_from_old) = net delta
+    // For COUNT: COUNT(new) - COUNT(old) = net ivm_count delta
+    //
+    // We achieve this by treating the Add delta as positive and using the Subtract delta
+    // which already produces negative aggregates via the MERGE subtract path.
+    // But actually, both delta queries produce POSITIVE aggregates — the negation
+    // happens in the MERGE SET clause (t.col - d.col for subtract).
+    //
+    // Simplest correct approach: just wrap both in a UNION ALL and re-aggregate.
+    // The new delta contributes positively, the old delta contributes negatively.
+
+    // Build group column list
+    let mut grp_cols: Vec<String> = plan.group_by_columns.iter()
+        .chain(plan.distinct_columns.iter())
+        .map(|c| format!("\"{}\"", normalized_column_name(c)))
+        .collect();
+
+    // For aggregates without GROUP BY: use sentinel column
+    let needs_sentinel = grp_cols.is_empty() && !plan.intermediate_columns.is_empty();
+    if needs_sentinel {
+        grp_cols.push("__reflex_group".to_string());
+    }
+
+    let grp_select = if grp_cols.is_empty() {
+        String::new()
+    } else {
+        format!("{}, ", grp_cols.join(", "))
+    };
+
+    let grp_by = if grp_cols.is_empty() {
+        String::new()
+    } else {
+        format!(" GROUP BY {}", grp_cols.join(", "))
+    };
+
+    // Build aggregate expressions: for each intermediate column, compute net delta
+    let mut agg_exprs: Vec<String> = Vec::new();
+    for ic in &plan.intermediate_columns {
+        // SUM/COUNT: net = positive from new + negative from old
+        agg_exprs.push(format!(
+            "SUM(CASE WHEN __reflex_sign = 1 THEN \"{}\" ELSE -\"{}\" END) AS \"{}\"",
+            ic.name, ic.name, ic.name
+        ));
+    }
+    if plan.needs_ivm_count {
+        agg_exprs.push(
+            "SUM(CASE WHEN __reflex_sign = 1 THEN __ivm_count ELSE -__ivm_count END) AS __ivm_count".to_string()
+        );
+    }
+
+    let agg_select = agg_exprs.join(", ");
+
+    // The inner UNION ALL: new delta (sign=+1) UNION ALL old delta (sign=-1)
+    let sentinel_col = if needs_sentinel { ", 0 AS __reflex_group" } else { "" };
+    format!(
+        "SELECT {grp_select}{agg_select} FROM (\
+            SELECT 1 AS __reflex_sign, __d.*{sentinel_col} FROM ({delta_new}) AS __d \
+            UNION ALL \
+            SELECT -1 AS __reflex_sign, __d.*{sentinel_col} FROM ({delta_old}) AS __d\
+         ) AS __net{grp_by}"
+    )
+}
+
 /// Build a SQL UPDATE that recomputes MIN/MAX columns from the source table
 /// for groups whose MIN/MAX was set to NULL by a subtract operation.
 /// Returns None if the plan has no MIN/MAX columns.
@@ -394,31 +475,46 @@ pub fn reflex_build_delta_sql(
                 let delta_old = replace_source_with_transition(base_query, source_table, &old_tbl);
                 let delta_new = replace_source_with_transition(base_query, source_table, &new_tbl);
 
-                if let Some(ref cols) = grp_cols {
+                if has_min_max {
+                    // MIN/MAX/BOOL_OR need two-phase: subtract → recompute → add.
+                    // Can't use net-delta because MIN/MAX have no algebraic inverse.
+                    if let Some(ref cols) = grp_cols {
+                        let select_expr = affected_groups_select(cols);
+                        let merge_sub_sql = build_merge_sql(&intermediate_tbl, &delta_old, &plan, DeltaOp::Subtract);
+                        stmts.push(format!("DROP TABLE IF EXISTS \"{}\"", affected_tbl));
+                        stmts.push(format!(
+                            "CREATE TEMP TABLE \"{}\" AS SELECT {} FROM {} WHERE FALSE",
+                            affected_tbl, select_expr, intermediate_tbl
+                        ));
+                        push_merge_and_affected(&mut stmts, &merge_sub_sql, &affected_tbl, &select_expr, &delta_old, cols);
+                        if let Some(recompute) = build_min_max_recompute_sql(&intermediate_tbl, &plan, source_table) {
+                            stmts.push(recompute);
+                        }
+                        let merge_add_sql = build_merge_sql(&intermediate_tbl, &delta_new, &plan, DeltaOp::Add);
+                        push_merge_and_affected(&mut stmts, &merge_add_sql, &affected_tbl, &select_expr, &delta_new, cols);
+                    } else {
+                        stmts.push(build_merge_sql(&intermediate_tbl, &delta_old, &plan, DeltaOp::Subtract));
+                        if let Some(recompute) = build_min_max_recompute_sql(&intermediate_tbl, &plan, source_table) {
+                            stmts.push(recompute);
+                        }
+                        stmts.push(build_merge_sql(&intermediate_tbl, &delta_new, &plan, DeltaOp::Add));
+                    }
+                } else if grp_cols.is_some() {
+                    // No MIN/MAX + has group columns: use single-pass net-delta MERGE.
+                    // Combines old (negated) + new into one delta, halving MERGE count.
+                    let cols = grp_cols.as_ref().unwrap();
+                    let net_delta = build_net_delta_query(&delta_old, &delta_new, &plan);
                     let select_expr = affected_groups_select(cols);
-                    let merge_sub_sql = build_merge_sql(&intermediate_tbl, &delta_old, &plan, DeltaOp::Subtract);
+                    let merge_sql = build_merge_sql(&intermediate_tbl, &net_delta, &plan, DeltaOp::Add);
                     stmts.push(format!("DROP TABLE IF EXISTS \"{}\"", affected_tbl));
                     stmts.push(format!(
                         "CREATE TEMP TABLE \"{}\" AS SELECT {} FROM {} WHERE FALSE",
                         affected_tbl, select_expr, intermediate_tbl
                     ));
-                    push_merge_and_affected(&mut stmts, &merge_sub_sql, &affected_tbl, &select_expr, &delta_old, cols);
-
-                    if has_min_max {
-                        if let Some(recompute) = build_min_max_recompute_sql(&intermediate_tbl, &plan, source_table) {
-                            stmts.push(recompute);
-                        }
-                    }
-
-                    let merge_add_sql = build_merge_sql(&intermediate_tbl, &delta_new, &plan, DeltaOp::Add);
-                    push_merge_and_affected(&mut stmts, &merge_add_sql, &affected_tbl, &select_expr, &delta_new, cols);
+                    push_merge_and_affected(&mut stmts, &merge_sql, &affected_tbl, &select_expr, &net_delta, cols);
                 } else {
+                    // No MIN/MAX, no group columns (sentinel): fall back to two-phase
                     stmts.push(build_merge_sql(&intermediate_tbl, &delta_old, &plan, DeltaOp::Subtract));
-                    if has_min_max {
-                        if let Some(recompute) = build_min_max_recompute_sql(&intermediate_tbl, &plan, source_table) {
-                            stmts.push(recompute);
-                        }
-                    }
                     stmts.push(build_merge_sql(&intermediate_tbl, &delta_new, &plan, DeltaOp::Add));
                 }
             }

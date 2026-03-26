@@ -149,12 +149,14 @@ fn create_reflex_ivm_impl(view_name: &str, sql: &str, unique_columns_str: &str, 
             }
         }
 
-        // Each operand becomes its own sub-IMV
+        // Each operand becomes its own sub-IMV.
+        // Propagate unique_columns so passthrough sub-IMVs can use targeted DELETE/UPDATE
+        // instead of falling back to full refresh.
         let mut sub_imv_names: Vec<String> = Vec::new();
         for (i, operand_sql) in set_op.operand_sqls.iter().enumerate() {
             let sub_name = format!("{}__union_{}", view_name, i);
             let result = create_reflex_ivm_impl(
-                &sub_name, operand_sql, "", false, storage_mode, refresh_mode,
+                &sub_name, operand_sql, unique_columns_str, false, storage_mode, refresh_mode,
             );
             if result.starts_with("ERROR") {
                 return result;

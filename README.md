@@ -198,6 +198,48 @@ SELECT create_reflex_ivm('region_summary',
 -- Creates: sub-IMV "region_summary__cte_by_city",
 --          sub-IMV "region_summary__cte_by_region" (depends on by_city),
 --          VIEW "region_summary"
+
+-- UNION ALL: each operand becomes a sub-IMV
+SELECT create_reflex_ivm('all_orders',
+    'SELECT region, amount FROM domestic_orders
+     UNION ALL
+     SELECT region, amount FROM international_orders');
+-- Creates: sub-IMV "all_orders__union_0", sub-IMV "all_orders__union_1",
+--          VIEW "all_orders" (zero overhead, reads from sub-IMVs)
+
+-- UNION (dedup)
+SELECT create_reflex_ivm('active_regions',
+    'SELECT region FROM domestic_orders
+     UNION
+     SELECT region FROM international_orders');
+
+-- WINDOW: GROUP BY + ranking
+SELECT create_reflex_ivm('ranked_regions',
+    'SELECT region, SUM(amount) AS total,
+            RANK() OVER (ORDER BY SUM(amount) DESC) AS rnk
+     FROM orders GROUP BY region');
+-- Creates: sub-IMV "ranked_regions__base" (incremental aggregates),
+--          VIEW "ranked_regions" (applies RANK at read time)
+
+-- WINDOW: passthrough with LAG/LEAD
+SELECT create_reflex_ivm('time_series',
+    'SELECT ts, value, LAG(value) OVER (ORDER BY ts) AS prev_value
+     FROM measurements');
+
+-- Crash-safe mode: WAL-logged tables
+SELECT create_reflex_ivm('critical_view',
+    'SELECT region, SUM(amount) AS total FROM orders GROUP BY region',
+    NULL,                -- unique_columns
+    'LOGGED'             -- storage: crash-safe WAL-logged tables
+);
+
+-- Deferred mode: batch coalescing at COMMIT
+SELECT create_reflex_ivm('batch_view',
+    'SELECT region, SUM(amount) AS total FROM orders GROUP BY region',
+    NULL,                -- unique_columns
+    'UNLOGGED',          -- storage
+    'DEFERRED'           -- mode: accumulate deltas, flush at COMMIT
+);
 ```
 
 ## Supported SQL Features
@@ -237,10 +279,13 @@ SELECT create_reflex_ivm('typed_totals',
 | `HAVING` | Yes | Rewritten to filter on intermediate columns; aggregates not in SELECT are auto-added |
 | `DISTINCT` | Yes | Without GROUP BY, columns become implicit group keys |
 | `CTE (WITH)` | Yes | Each CTE becomes a sub-IMV; passthrough main body becomes a VIEW |
+| `UNION ALL` | Yes | Each operand becomes a sub-IMV; parent is a VIEW |
+| `UNION` (dedup) | Yes | Same decomposition; PostgreSQL handles dedup at read time |
+| `WINDOW functions` | Yes | Decomposed into base sub-IMV + VIEW that applies window at read time |
 | `WITH RECURSIVE` | No | Recursive CTEs cannot be decomposed into static IMV layers |
+| `INTERSECT / EXCEPT` | No | Planned for future release |
 | `LIMIT` | No | Rejected -- not meaningful for materialized views |
 | `ORDER BY` | No | Rejected -- the target table is unordered |
-| `WINDOW functions` | No | Rejected -- not incrementally maintainable |
 | `Subqueries in FROM` | Parsed | Tracked as `<subquery:alias>` |
 
 ## How It Works
@@ -329,45 +374,53 @@ Useful columns:
 
 ## API Reference
 
-### `create_reflex_ivm(view_name TEXT, sql TEXT) -> TEXT`
+### `create_reflex_ivm(view_name, sql [, unique_columns [, storage [, mode]]]) -> TEXT`
 
 Creates an incremental materialized view from a SELECT query. Returns `'CREATE REFLEX INCREMENTAL VIEW'` on success, or `'ERROR: ...'` on failure.
 
-View names must contain only alphanumeric characters, underscores, and periods (for schema qualification).
+**Parameters:**
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `view_name` | TEXT | required | Name for the IMV (alphanumeric, underscores, periods) |
+| `sql` | TEXT | required | SELECT query to maintain incrementally |
+| `unique_columns` | TEXT | NULL | Comma-separated unique key columns for passthrough IMVs |
+| `storage` | TEXT | `'UNLOGGED'` | `'LOGGED'` for crash-safe WAL-logged tables, `'UNLOGGED'` for max performance |
+| `mode` | TEXT | `'IMMEDIATE'` | `'DEFERRED'` to batch deltas until COMMIT, `'IMMEDIATE'` for per-statement updates |
 
-What it creates:
-1. An **intermediate table** (`__reflex_intermediate_{view_name}`) -- UNLOGGED, stores partial aggregate state
-2. A **target table** (`{view_name}`) -- UNLOGGED table you query, contains the final computed results
-3. **Triggers** on each source table (INSERT, DELETE, UPDATE) that keep the view in sync
-4. A **metadata entry** in `__reflex_ivm_reference` tracking the view's configuration
+**What it creates** depends on the query type:
 
-### `create_reflex_ivm(view_name TEXT, sql TEXT, unique_columns TEXT) -> TEXT`
-
-Same as above, but explicitly specifies the unique key column(s) for passthrough IMVs (no GROUP BY). This enables incremental DELETE/UPDATE via direct key matching instead of full-row comparison.
+| Query type | Creates |
+|---|---|
+| GROUP BY + aggregates | Intermediate table + target table + triggers |
+| Passthrough (no agg) | Target table + triggers |
+| CTE (WITH) | Sub-IMV per CTE + VIEW or IMV for main body |
+| UNION ALL / UNION | Sub-IMV per operand + VIEW |
+| WINDOW functions | Base sub-IMV + VIEW (window applied at read time) |
 
 ```sql
--- Explicit unique key for targeted delete/update
+-- Basic (2 args)
+SELECT create_reflex_ivm('sales_by_region',
+    'SELECT region, SUM(amount) AS total FROM sales GROUP BY region');
+
+-- With unique key (3 args)
 SELECT create_reflex_ivm('active_orders',
     'SELECT o.id, o.amount, p.name FROM orders o JOIN products p ON o.product_id = p.id',
     'id');
+
+-- Crash-safe (4 args)
+SELECT create_reflex_ivm('critical_view',
+    'SELECT region, SUM(amount) AS total FROM sales GROUP BY region',
+    NULL, 'LOGGED');
+
+-- Full (5 args)
+SELECT create_reflex_ivm('batch_view',
+    'SELECT region, SUM(amount) AS total FROM sales GROUP BY region',
+    NULL, 'UNLOGGED', 'DEFERRED');
 ```
 
-If omitted, pg_reflex auto-detects primary keys from the source tables.
+### `create_reflex_ivm_if_not_exists(view_name, sql [, unique_columns [, storage [, mode]]]) -> TEXT`
 
-### `create_reflex_ivm_if_not_exists(view_name TEXT, sql TEXT [, unique_columns TEXT]) -> TEXT`
-
-Same as `create_reflex_ivm`, but returns `'REFLEX INCREMENTAL VIEW ALREADY EXISTS (skipped)'` instead of an error if the view already exists. Useful for idempotent migration scripts and setup routines that may run more than once.
-
-```sql
--- Safe to run multiple times
-SELECT create_reflex_ivm_if_not_exists('sales_by_region',
-    'SELECT region, SUM(amount) AS total FROM sales GROUP BY region');
-
--- With explicit unique key
-SELECT create_reflex_ivm_if_not_exists('active_orders',
-    'SELECT o.id, o.amount FROM orders o JOIN products p ON o.product_id = p.id',
-    'id');
-```
+Same as `create_reflex_ivm`, but returns `'REFLEX INCREMENTAL VIEW ALREADY EXISTS (skipped)'` instead of an error if the view already exists. Same parameters.
 
 ### `drop_reflex_ivm(view_name TEXT) -> TEXT`
 
@@ -435,12 +488,16 @@ psql -f benchmarks/bench_baseline.sql
 psql -f benchmarks/teardown.sql
 ```
 
-### Performance Summary (SUM aggregate, single machine)
+### Performance Summary (1M source rows, single IMV, PostgreSQL 17)
 
-| Operation | 1K rows | 10K rows | 100K rows | 1M rows |
-|---|---:|---:|---:|---:|
-| Batch INSERT (1K rows) | 13 ms | 11 ms | 12 ms | 11 ms |
-| Single INSERT | 5 ms | 4 ms | 4 ms | 4 ms |
+| IMV Type | INSERT 1K | UPDATE 100 | vs REFRESH MATVIEW |
+|---|---:|---:|---|
+| GROUP BY (1K groups) | 77 ms | 4 ms (warm) | REFRESH: 55 ms |
+| Passthrough JOIN | 10 ms | varies | REFRESH: 2,500 ms (**250x faster**) |
+| WINDOW (GROUP BY + RANK) | 41 ms | similar to GROUP BY | REFRESH: 57 ms |
+| UNION ALL (2 operands) | 16 ms | n/a | REFRESH: 410 ms (**25x faster**) |
+
+Key: trigger overhead is O(delta), not O(source). With multiple IMVs on the same source, overhead scales linearly per IMV (sequential trigger loop).
 | UPDATE (100 rows) | 10 ms | 10 ms | 15 ms | 59 ms |
 | DELETE (100 rows) | 5 ms | 6 ms | 10 ms | 59 ms |
 

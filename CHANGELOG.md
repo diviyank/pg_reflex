@@ -1,5 +1,41 @@
 # Changelog
 
+## [1.0.3] - 2026-03-26
+
+### Added
+- **WINDOW function support** — queries with `ROW_NUMBER()`, `RANK()`, `DENSE_RANK()`, `LAG()`, `LEAD()`, `SUM() OVER (...)`, and any other PostgreSQL window function are now supported. Decomposed into a base sub-IMV (incrementally maintained) + a VIEW that applies window functions at read time. For GROUP BY + WINDOW, the VIEW scans only the small intermediate result (one row per group).
+- **UNION ALL / UNION support** — set operations are decomposed into per-operand sub-IMVs. `UNION ALL` creates a zero-overhead VIEW over the sub-IMV targets. `UNION` (dedup) creates a VIEW with PostgreSQL's native deduplication. Supports 2+ operands, aggregates in operands, and mixed WHERE filters on the same source table.
+- **`storage` parameter** — `create_reflex_ivm('v', 'SELECT ...', NULL, 'LOGGED')` creates WAL-logged tables for crash safety. Default: `'UNLOGGED'` (current behavior). Propagated to CTE sub-IMVs and UNION sub-IMVs.
+- **`mode` parameter** — `create_reflex_ivm('v', 'SELECT ...', NULL, 'UNLOGGED', 'DEFERRED')` accumulates deltas during the transaction and flushes at COMMIT via a two-stage trigger design (immediate capture to staging table + deferred constraint trigger). Default: `'IMMEDIATE'` (current behavior).
+- **Materialized view auto-refresh** — event trigger on `ddl_command_end` automatically cascades `REFRESH MATERIALIZED VIEW` to dependent pg_reflex IMVs. No manual `refresh_imv_depending_on()` needed.
+- New `window.rs` module for window function query decomposition
+- `reflex_flush_deferred(source_table)` function for manual deferred delta processing
+
+### Performance
+- **Single-pass UPDATE MERGE** — for aggregate queries without MIN/MAX, UPDATE operations now use a single net-delta MERGE (combining old and new transition tables) instead of two separate MERGEs. Reduces MERGE count by 50% for UPDATE operations.
+
+### Migration
+- New columns in `__reflex_ivm_reference`: `storage_mode` (default `'UNLOGGED'`), `refresh_mode` (default `'IMMEDIATE'`). Existing IMVs backfilled automatically.
+- Deferred processing infrastructure: `__reflex_deferred_pending` table + constraint trigger created automatically.
+- Materialized view event trigger installed automatically.
+- Migration is automatic via `ALTER EXTENSION pg_reflex UPDATE`.
+
+### Tests
+- 214 tests (up from 172 in v1.0.2)
+- New test coverage: 9 UNION ALL tests, 5 UNION dedup tests, 18 WINDOW function tests, 5 LOGGED mode tests, 3 DEFERRED mode tests
+
+### API
+```sql
+-- Full signature (all params have defaults, backward-compatible)
+SELECT create_reflex_ivm(
+    'view_name',                -- TEXT: view name
+    'SELECT ...',               -- TEXT: query
+    NULL,                       -- TEXT: unique_columns (optional)
+    'UNLOGGED',                 -- TEXT: storage mode ('LOGGED' or 'UNLOGGED')
+    'IMMEDIATE'                 -- TEXT: refresh mode ('IMMEDIATE' or 'DEFERRED')
+);
+```
+
 ## [1.0.2] - 2026-03-24
 
 ### Performance
