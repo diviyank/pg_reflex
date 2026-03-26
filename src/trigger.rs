@@ -440,11 +440,7 @@ pub fn reflex_build_delta_sql(
                 if let Some(ref cols) = grp_cols {
                     let select_expr = affected_groups_select(cols);
                     let merge_sql = build_merge_sql(&intermediate_tbl, &delta_q, &plan, DeltaOp::Add);
-                    stmts.push(format!("DROP TABLE IF EXISTS \"{}\"", affected_tbl));
-                    stmts.push(format!(
-                        "CREATE TEMP TABLE \"{}\" AS SELECT {} FROM {} WHERE FALSE",
-                        affected_tbl, select_expr, intermediate_tbl
-                    ));
+                    stmts.push(format!("TRUNCATE \"{}\"", affected_tbl));
                     push_merge_and_affected(&mut stmts, &merge_sql, &affected_tbl, &select_expr, &delta_q, cols);
                 } else {
                     stmts.push(build_merge_sql(&intermediate_tbl, &delta_q, &plan, DeltaOp::Add));
@@ -456,11 +452,7 @@ pub fn reflex_build_delta_sql(
                 if let Some(ref cols) = grp_cols {
                     let select_expr = affected_groups_select(cols);
                     let merge_sql = build_merge_sql(&intermediate_tbl, &delta_q, &plan, DeltaOp::Subtract);
-                    stmts.push(format!("DROP TABLE IF EXISTS \"{}\"", affected_tbl));
-                    stmts.push(format!(
-                        "CREATE TEMP TABLE \"{}\" AS SELECT {} FROM {} WHERE FALSE",
-                        affected_tbl, select_expr, intermediate_tbl
-                    ));
+                    stmts.push(format!("TRUNCATE \"{}\"", affected_tbl));
                     push_merge_and_affected(&mut stmts, &merge_sql, &affected_tbl, &select_expr, &delta_q, cols);
                 } else {
                     stmts.push(build_merge_sql(&intermediate_tbl, &delta_q, &plan, DeltaOp::Subtract));
@@ -481,11 +473,7 @@ pub fn reflex_build_delta_sql(
                     if let Some(ref cols) = grp_cols {
                         let select_expr = affected_groups_select(cols);
                         let merge_sub_sql = build_merge_sql(&intermediate_tbl, &delta_old, &plan, DeltaOp::Subtract);
-                        stmts.push(format!("DROP TABLE IF EXISTS \"{}\"", affected_tbl));
-                        stmts.push(format!(
-                            "CREATE TEMP TABLE \"{}\" AS SELECT {} FROM {} WHERE FALSE",
-                            affected_tbl, select_expr, intermediate_tbl
-                        ));
+                        stmts.push(format!("TRUNCATE \"{}\"", affected_tbl));
                         push_merge_and_affected(&mut stmts, &merge_sub_sql, &affected_tbl, &select_expr, &delta_old, cols);
                         if let Some(recompute) = build_min_max_recompute_sql(&intermediate_tbl, &plan, source_table) {
                             stmts.push(recompute);
@@ -506,11 +494,7 @@ pub fn reflex_build_delta_sql(
                     let net_delta = build_net_delta_query(&delta_old, &delta_new, &plan);
                     let select_expr = affected_groups_select(cols);
                     let merge_sql = build_merge_sql(&intermediate_tbl, &net_delta, &plan, DeltaOp::Add);
-                    stmts.push(format!("DROP TABLE IF EXISTS \"{}\"", affected_tbl));
-                    stmts.push(format!(
-                        "CREATE TEMP TABLE \"{}\" AS SELECT {} FROM {} WHERE FALSE",
-                        affected_tbl, select_expr, intermediate_tbl
-                    ));
+                    stmts.push(format!("TRUNCATE \"{}\"", affected_tbl));
                     push_merge_and_affected(&mut stmts, &merge_sql, &affected_tbl, &select_expr, &net_delta, cols);
                 } else {
                     // No MIN/MAX, no group columns (sentinel): fall back to two-phase
@@ -535,10 +519,6 @@ pub fn reflex_build_delta_sql(
             stmts.push(format!(
                 "INSERT INTO {} {} AND {} IN (SELECT {} FROM \"{}\")",
                 qv, end_query, row, cols_str, affected_tbl
-            ));
-            stmts.push(format!(
-                "DROP TABLE IF EXISTS \"{}\"",
-                affected_tbl
             ));
         } else {
             // No group columns (sentinel-only): full refresh

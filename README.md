@@ -283,7 +283,8 @@ SELECT create_reflex_ivm('typed_totals',
 | `UNION` (dedup) | Yes | Same decomposition; PostgreSQL handles dedup at read time |
 | `WINDOW functions` | Yes | Decomposed into base sub-IMV + VIEW that applies window at read time |
 | `WITH RECURSIVE` | No | Recursive CTEs cannot be decomposed into static IMV layers |
-| `INTERSECT / EXCEPT` | No | Planned for future release |
+| `INTERSECT` | Yes | Each operand becomes a sub-IMV; parent is a VIEW |
+| `EXCEPT` | Yes | Each operand becomes a sub-IMV; parent is a VIEW |
 | `LIMIT` | No | Rejected -- not meaningful for materialized views |
 | `ORDER BY` | No | Rejected -- the target table is unordered |
 | `Subqueries in FROM` | Parsed | Tracked as `<subquery:alias>` |

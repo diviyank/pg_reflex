@@ -382,7 +382,7 @@ pub fn analyze(statements: &[Statement]) -> Result<SqlAnalysis, SqlAnalysisError
         let mut operands = Vec::new();
         flatten_set_operands(op, is_all, left, right, &mut operands);
         analysis.set_operation = Some(SetOperationInfo {
-            op: op.clone(),
+            op: *op,
             is_all,
             operand_sqls: operands,
         });

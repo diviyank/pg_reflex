@@ -205,18 +205,27 @@ pub fn build_trigger_ddls(source_table: &str) -> Vec<String> {
     let ref_old = format!("__reflex_old_{}", safe_source);
 
     // Core loop body shared by INSERT/DELETE/UPDATE triggers.
-    // {op} is replaced per-operation.
+    // {op} is replaced per-operation. {transition_tbl} is the NEW or OLD table name.
     // The FOR loop iterates over all IMVs that depend on this source.
     // Transition tables are visible in plpgsql EXECUTE context, no copy needed.
+    //
+    // Early-exit: if the transition table is empty, skip the entire loop (no IMVs to process).
+    // This avoids Rust FFI calls and advisory locks when a statement affects 0 relevant rows.
     let body_core = format!(
-        "DECLARE _rec RECORD; _sql TEXT; _stmt TEXT; \
+        "DECLARE _rec RECORD; _sql TEXT; _stmt TEXT; _has_rows BOOLEAN; _pred_match BOOLEAN; \
          BEGIN \
+           SELECT EXISTS(SELECT 1 FROM \"{{transition_tbl}}\" LIMIT 1) INTO _has_rows; \
+           IF NOT _has_rows THEN RETURN NULL; END IF; \
            FOR _rec IN \
-             SELECT name, base_query, end_query, aggregations::text AS aggregations \
+             SELECT name, base_query, end_query, aggregations::text AS aggregations, where_predicate \
              FROM public.__reflex_ivm_reference \
              WHERE '{source_table}' = ANY(depends_on) AND enabled = TRUE \
              ORDER BY graph_depth \
            LOOP \
+             IF _rec.where_predicate IS NOT NULL THEN \
+               EXECUTE format('SELECT EXISTS(SELECT 1 FROM %I WHERE %s LIMIT 1)', '{{transition_tbl}}', _rec.where_predicate) INTO _pred_match; \
+               IF NOT _pred_match THEN CONTINUE; END IF; \
+             END IF; \
              PERFORM pg_advisory_xact_lock(hashtext(_rec.name)); \
              _sql := reflex_build_delta_sql(_rec.name, '{source_table}', '{{op}}', _rec.base_query, _rec.end_query, _rec.aggregations); \
              IF _sql <> '' THEN \
@@ -232,7 +241,7 @@ pub fn build_trigger_ddls(source_table: &str) -> Vec<String> {
     // INSERT
     let ins_fn = format!("__reflex_ins_trigger_on_{}", safe_source);
     let ins_trig = format!("__reflex_trigger_ins_on_{}", safe_source);
-    let ins_body = body_core.replace("{op}", "INSERT");
+    let ins_body = body_core.replace("{op}", "INSERT").replace("{transition_tbl}", &ref_new);
     let ins_ddl = format!(
         "CREATE OR REPLACE FUNCTION {ins_fn}() RETURNS TRIGGER AS $fn$ {ins_body} $fn$ LANGUAGE plpgsql;\n\
          CREATE OR REPLACE TRIGGER \"{ins_trig}\" \
@@ -244,7 +253,7 @@ pub fn build_trigger_ddls(source_table: &str) -> Vec<String> {
     // DELETE
     let del_fn = format!("__reflex_del_trigger_on_{}", safe_source);
     let del_trig = format!("__reflex_trigger_del_on_{}", safe_source);
-    let del_body = body_core.replace("{op}", "DELETE");
+    let del_body = body_core.replace("{op}", "DELETE").replace("{transition_tbl}", &ref_old);
     let del_ddl = format!(
         "CREATE OR REPLACE FUNCTION {del_fn}() RETURNS TRIGGER AS $fn$ {del_body} $fn$ LANGUAGE plpgsql;\n\
          CREATE OR REPLACE TRIGGER \"{del_trig}\" \
@@ -256,7 +265,7 @@ pub fn build_trigger_ddls(source_table: &str) -> Vec<String> {
     // UPDATE
     let upd_fn = format!("__reflex_upd_trigger_on_{}", safe_source);
     let upd_trig = format!("__reflex_trigger_upd_on_{}", safe_source);
-    let upd_body = body_core.replace("{op}", "UPDATE");
+    let upd_body = body_core.replace("{op}", "UPDATE").replace("{transition_tbl}", &ref_new);
     let upd_ddl = format!(
         "CREATE OR REPLACE FUNCTION {upd_fn}() RETURNS TRIGGER AS $fn$ {upd_body} $fn$ LANGUAGE plpgsql;\n\
          CREATE OR REPLACE TRIGGER \"{upd_trig}\" \
@@ -313,16 +322,23 @@ pub fn build_deferred_trigger_ddls(source_table: &str) -> Vec<String> {
     let delta_tbl = format!("__reflex_delta_{}", safe_source);
 
     // Mixed-mode body: process IMMEDIATE IMVs inline, stage deltas for DEFERRED IMVs.
+    // Early-exit if transition table is empty.
     let body_core = format!(
-        "DECLARE _rec RECORD; _sql TEXT; _stmt TEXT; _has_deferred BOOLEAN := FALSE; \
+        "DECLARE _rec RECORD; _sql TEXT; _stmt TEXT; _has_deferred BOOLEAN := FALSE; _has_rows BOOLEAN; _pred_match BOOLEAN; \
          BEGIN \
+           SELECT EXISTS(SELECT 1 FROM \"{{transition_tbl}}\" LIMIT 1) INTO _has_rows; \
+           IF NOT _has_rows THEN RETURN NULL; END IF; \
            FOR _rec IN \
              SELECT name, base_query, end_query, aggregations::text AS aggregations, \
-                    COALESCE(refresh_mode, 'IMMEDIATE') AS refresh_mode \
+                    COALESCE(refresh_mode, 'IMMEDIATE') AS refresh_mode, where_predicate \
              FROM public.__reflex_ivm_reference \
              WHERE '{source_table}' = ANY(depends_on) AND enabled = TRUE \
              ORDER BY graph_depth \
            LOOP \
+             IF _rec.where_predicate IS NOT NULL THEN \
+               EXECUTE format('SELECT EXISTS(SELECT 1 FROM %I WHERE %s LIMIT 1)', '{{transition_tbl}}', _rec.where_predicate) INTO _pred_match; \
+               IF NOT _pred_match THEN CONTINUE; END IF; \
+             END IF; \
              IF _rec.refresh_mode = 'IMMEDIATE' THEN \
                PERFORM pg_advisory_xact_lock(hashtext(_rec.name)); \
                _sql := reflex_build_delta_sql(_rec.name, '{source_table}', '{{op}}', _rec.base_query, _rec.end_query, _rec.aggregations); \
@@ -350,7 +366,8 @@ pub fn build_deferred_trigger_ddls(source_table: &str) -> Vec<String> {
     let ins_body = body_core
         .replace("{op}", "INSERT")
         .replace("{op_code}", "I")
-        .replace("{ref_tbl}", &ref_new);
+        .replace("{ref_tbl}", &ref_new)
+        .replace("{transition_tbl}", &ref_new);
     let ins_ddl = format!(
         "CREATE OR REPLACE FUNCTION {ins_fn}() RETURNS TRIGGER AS $fn$ {ins_body} $fn$ LANGUAGE plpgsql;\n\
          CREATE OR REPLACE TRIGGER \"{ins_trig}\" \
@@ -365,7 +382,8 @@ pub fn build_deferred_trigger_ddls(source_table: &str) -> Vec<String> {
     let del_body = body_core
         .replace("{op}", "DELETE")
         .replace("{op_code}", "D")
-        .replace("{ref_tbl}", &ref_old);
+        .replace("{ref_tbl}", &ref_old)
+        .replace("{transition_tbl}", &ref_old);
     let del_ddl = format!(
         "CREATE OR REPLACE FUNCTION {del_fn}() RETURNS TRIGGER AS $fn$ {del_body} $fn$ LANGUAGE plpgsql;\n\
          CREATE OR REPLACE TRIGGER \"{del_trig}\" \
@@ -378,8 +396,10 @@ pub fn build_deferred_trigger_ddls(source_table: &str) -> Vec<String> {
     let upd_fn = format!("__reflex_upd_trigger_on_{}", safe_source);
     let upd_trig = format!("__reflex_trigger_upd_on_{}", safe_source);
     let upd_body = format!(
-        "DECLARE _rec RECORD; _sql TEXT; _stmt TEXT; _has_deferred BOOLEAN := FALSE; \
+        "DECLARE _rec RECORD; _sql TEXT; _stmt TEXT; _has_deferred BOOLEAN := FALSE; _has_rows BOOLEAN; \
          BEGIN \
+           SELECT EXISTS(SELECT 1 FROM \"{ref_new}\" LIMIT 1) INTO _has_rows; \
+           IF NOT _has_rows THEN RETURN NULL; END IF; \
            FOR _rec IN \
              SELECT name, base_query, end_query, aggregations::text AS aggregations, \
                     COALESCE(refresh_mode, 'IMMEDIATE') AS refresh_mode \

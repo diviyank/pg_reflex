@@ -46,7 +46,8 @@ extension_sql!(
         enabled BOOLEAN DEFAULT TRUE,
         last_update_date TIMESTAMP,
         storage_mode TEXT DEFAULT 'UNLOGGED',
-        refresh_mode TEXT DEFAULT 'IMMEDIATE'
+        refresh_mode TEXT DEFAULT 'IMMEDIATE',
+        where_predicate TEXT
     );
 
     -- Index on name for fast lookups
@@ -139,13 +140,14 @@ fn create_reflex_ivm_impl(view_name: &str, sql: &str, unique_columns_str: &str, 
         }
     };
 
-    // --- Set operation decomposition: UNION ALL / UNION ---
+    // --- Set operation decomposition: UNION / INTERSECT / EXCEPT ---
     if let Some(ref set_op) = analysis.set_operation {
         match set_op.op {
-            sqlparser::ast::SetOperator::Union => {}
+            sqlparser::ast::SetOperator::Union
+            | sqlparser::ast::SetOperator::Intersect
+            | sqlparser::ast::SetOperator::Except => {}
             _ => {
-                return "ERROR: Only UNION and UNION ALL are currently supported. \
-                        INTERSECT and EXCEPT support is planned.";
+                return "ERROR: Unsupported set operation. Supported: UNION, INTERSECT, EXCEPT.";
             }
         }
 
@@ -235,11 +237,16 @@ fn create_reflex_ivm_impl(view_name: &str, sql: &str, unique_columns_str: &str, 
                 }
             });
         } else {
-            // UNION (dedup): create a VIEW with UNION over sub-IMVs.
-            // The sub-IMVs maintain data incrementally; PostgreSQL's UNION
-            // handles deduplication at query time. This is correct and simple —
-            // the expensive part (scanning source tables) is already incremental.
-            let view_sql = union_selects.join(" UNION ");
+            // UNION / INTERSECT / EXCEPT (without ALL): create a VIEW.
+            // The sub-IMVs maintain data incrementally; PostgreSQL handles
+            // the set operation semantics at query time.
+            let set_keyword = match set_op.op {
+                sqlparser::ast::SetOperator::Union => "UNION",
+                sqlparser::ast::SetOperator::Intersect => "INTERSECT",
+                sqlparser::ast::SetOperator::Except => "EXCEPT",
+                _ => "UNION",
+            };
+            let view_sql = union_selects.join(&format!(" {} ", set_keyword));
             Spi::connect_mut(|client| {
                 client
                     .update(
@@ -891,12 +898,16 @@ fn create_reflex_ivm_impl(view_name: &str, sql: &str, unique_columns_str: &str, 
         let depends_on_imv: Vec<String> = ivm_froms.clone();
         let graph_child: Vec<String> = Vec::new();
 
+        // Store the WHERE predicate for predicate-filtered trigger skip
+        let where_predicate: String = analysis.where_clause.clone().unwrap_or_default();
+
         client.update(
             "INSERT INTO public.__reflex_ivm_reference
              (name, graph_depth, depends_on, depends_on_imv, unlogged_tables,
               graph_child, sql_query, base_query, end_query,
-              aggregations, index_columns, unique_columns, enabled, last_update_date, storage_mode, refresh_mode)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::json, $11, $12, TRUE, NOW(), $13, $14)",
+              aggregations, index_columns, unique_columns, enabled, last_update_date,
+              storage_mode, refresh_mode, where_predicate)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::json, $11, $12, TRUE, NOW(), $13, $14, NULLIF($15, ''))",
             None,
             &[
                 unsafe { DatumWithOid::new(view_name.to_string(), PgBuiltInOids::TEXTOID.oid().value()) },
@@ -913,6 +924,7 @@ fn create_reflex_ivm_impl(view_name: &str, sql: &str, unique_columns_str: &str, 
                 unsafe { DatumWithOid::new(resolved_unique_columns.clone(), PgBuiltInOids::TEXTARRAYOID.oid().value()) },
                 unsafe { DatumWithOid::new(storage_upper.clone(), PgBuiltInOids::TEXTOID.oid().value()) },
                 unsafe { DatumWithOid::new(mode_upper.clone(), PgBuiltInOids::TEXTOID.oid().value()) },
+                unsafe { DatumWithOid::new(where_predicate, PgBuiltInOids::TEXTOID.oid().value()) },
             ],
         ).unwrap_or_report();
 
@@ -947,6 +959,28 @@ fn create_reflex_ivm_impl(view_name: &str, sql: &str, unique_columns_str: &str, 
             // Create indexes AFTER bulk insert (much faster than indexing during insert)
             for index_ddl in build_indexes_ddl(view_name, &plan) {
                 client.update(&index_ddl, None, &[]).unwrap_or_report();
+            }
+
+            // Create persistent affected-groups table (avoids DROP+CREATE per trigger fire).
+            // Uses UNLOGGED for speed; lost on crash but rebuilt by reflex_reconcile.
+            if !plan.group_by_columns.is_empty() || !plan.distinct_columns.is_empty() {
+                let bare_view = split_qualified_name(view_name).1;
+                let affected_name = format!("__reflex_affected_{}", bare_view);
+                client
+                    .update(
+                        &format!(
+                            "CREATE UNLOGGED TABLE IF NOT EXISTS \"{}\" AS SELECT {} FROM {} WHERE FALSE",
+                            affected_name,
+                            plan.group_by_columns.iter()
+                                .chain(plan.distinct_columns.iter())
+                                .map(|c| format!("\"{}\"", normalized_column_name(c)))
+                                .collect::<Vec<_>>()
+                                .join(", "),
+                            intermediate_tbl
+                        ),
+                        None, &[],
+                    )
+                    .unwrap_or_report();
             }
 
             // ANALYZE so the query planner has accurate statistics
@@ -1346,6 +1380,16 @@ fn drop_reflex_ivm_impl(view_name: &str, cascade: bool) -> &'static str {
         client
             .update(
                 &format!("DROP TABLE IF EXISTS {}", intermediate),
+                None,
+                &[],
+            )
+            .unwrap_or_report();
+
+        // 6b. Drop persistent affected-groups table
+        let bare_view = split_qualified_name(view_name).1;
+        client
+            .update(
+                &format!("DROP TABLE IF EXISTS \"__reflex_affected_{}\"", bare_view),
                 None,
                 &[],
             )
@@ -6365,6 +6409,114 @@ mod tests {
         assert_eq!(
             Spi::get_one::<i64>("SELECT COUNT(*) FROM uda_view").expect("q").expect("v"),
             3
+        );
+    }
+
+    // ========================================================================
+    // INTERSECT / EXCEPT tests
+    // ========================================================================
+
+    /// Basic INTERSECT: only rows in both sources appear
+    #[pg_test]
+    fn test_intersect_basic() {
+        Spi::run("CREATE TABLE ix_a (id SERIAL, city TEXT)").expect("create");
+        Spi::run("CREATE TABLE ix_b (id SERIAL, city TEXT)").expect("create");
+        Spi::run("INSERT INTO ix_a (city) VALUES ('Paris'), ('Berlin'), ('London')").expect("seed");
+        Spi::run("INSERT INTO ix_b (city) VALUES ('Paris'), ('London'), ('NYC')").expect("seed");
+
+        let result = crate::create_reflex_ivm(
+            "ix_view",
+            "SELECT city FROM ix_a INTERSECT SELECT city FROM ix_b",
+            None, None, None,
+        );
+        assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
+
+        // Only Paris and London are in both
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT COUNT(*) FROM ix_view").expect("q").expect("v"),
+            2
+        );
+    }
+
+    /// INTERSECT with trigger: INSERT into one source may add to result
+    #[pg_test]
+    fn test_intersect_insert_trigger() {
+        Spi::run("CREATE TABLE ixi_a (id SERIAL, city TEXT)").expect("create");
+        Spi::run("CREATE TABLE ixi_b (id SERIAL, city TEXT)").expect("create");
+        Spi::run("INSERT INTO ixi_a (city) VALUES ('Paris')").expect("seed");
+        Spi::run("INSERT INTO ixi_b (city) VALUES ('London')").expect("seed");
+
+        crate::create_reflex_ivm(
+            "ixi_view",
+            "SELECT city FROM ixi_a INTERSECT SELECT city FROM ixi_b",
+            None, None, None,
+        );
+
+        // No intersection initially
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT COUNT(*) FROM ixi_view").expect("q").expect("v"),
+            0
+        );
+
+        // Insert Paris into B → now Paris is in both
+        Spi::run("INSERT INTO ixi_b (city) VALUES ('Paris')").expect("insert");
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT COUNT(*) FROM ixi_view WHERE city = 'Paris'").expect("q").expect("v"),
+            1
+        );
+    }
+
+    /// Basic EXCEPT: rows in A but not in B
+    #[pg_test]
+    fn test_except_basic() {
+        Spi::run("CREATE TABLE ex_a (id SERIAL, city TEXT)").expect("create");
+        Spi::run("CREATE TABLE ex_b (id SERIAL, city TEXT)").expect("create");
+        Spi::run("INSERT INTO ex_a (city) VALUES ('Paris'), ('Berlin'), ('London')").expect("seed");
+        Spi::run("INSERT INTO ex_b (city) VALUES ('Paris'), ('London')").expect("seed");
+
+        let result = crate::create_reflex_ivm(
+            "ex_view",
+            "SELECT city FROM ex_a EXCEPT SELECT city FROM ex_b",
+            None, None, None,
+        );
+        assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
+
+        // Only Berlin is in A but not in B
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT COUNT(*) FROM ex_view").expect("q").expect("v"),
+            1
+        );
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT COUNT(*) FROM ex_view WHERE city = 'Berlin'").expect("q").expect("v"),
+            1
+        );
+    }
+
+    /// EXCEPT with trigger: DELETE from B adds to result
+    #[pg_test]
+    fn test_except_delete_trigger() {
+        Spi::run("CREATE TABLE exd_a (id SERIAL, city TEXT)").expect("create");
+        Spi::run("CREATE TABLE exd_b (id SERIAL PRIMARY KEY, city TEXT)").expect("create");
+        Spi::run("INSERT INTO exd_a (city) VALUES ('Paris'), ('Berlin')").expect("seed");
+        Spi::run("INSERT INTO exd_b (city) VALUES ('Paris'), ('Berlin')").expect("seed");
+
+        crate::create_reflex_ivm(
+            "exd_view",
+            "SELECT city FROM exd_a EXCEPT SELECT city FROM exd_b",
+            None, None, None,
+        );
+
+        // No rows initially (all in both)
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT COUNT(*) FROM exd_view").expect("q").expect("v"),
+            0
+        );
+
+        // Delete Paris from B → Paris now in A but not B
+        Spi::run("DELETE FROM exd_b WHERE city = 'Paris'").expect("delete");
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT COUNT(*) FROM exd_view WHERE city = 'Paris'").expect("q").expect("v"),
+            1
         );
     }
 

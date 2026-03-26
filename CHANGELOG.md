@@ -1,5 +1,26 @@
 # Changelog
 
+## [1.0.4] - 2026-03-26
+
+### Performance
+- **Empty-delta early-exit** — triggers check if the transition table is empty before entering the IMV processing loop. Skips all Rust FFI calls, advisory locks, and MERGE generation when a statement doesn't produce relevant rows. Saves 5-15ms per trigger fire for empty deltas.
+- **Predicate-filtered trigger skip** — WHERE clauses from IMV queries are stored in `__reflex_ivm_reference.where_predicate`. Before processing an IMV, the trigger evaluates the predicate against the transition table. Non-matching IMVs are skipped entirely (no advisory lock, no delta SQL). Particularly effective for UNION sub-IMVs with disjoint filters.
+- **Persistent affected-groups table** — replaced per-trigger-fire `DROP TABLE + CREATE TEMP TABLE` with a persistent UNLOGGED table created at IMV setup time. Uses `TRUNCATE` (0.17ms) instead of `DROP+CREATE` (0.65ms) — 3.9x faster per trigger fire.
+- **Single-pass UPDATE MERGE** — for aggregate queries without MIN/MAX, UPDATE operations use a single net-delta MERGE combining old and new transition tables, halving the MERGE count.
+
+### Added
+- **INTERSECT support** — `SELECT ... INTERSECT SELECT ...` decomposes into sub-IMVs, same pattern as UNION.
+- **EXCEPT support** — `SELECT ... EXCEPT SELECT ...` decomposes into sub-IMVs.
+
+### Tests
+- 218 tests (up from 214 in v1.0.3)
+- New: 2 INTERSECT tests, 2 EXCEPT tests
+
+### Benchmarks (single-IMV, warm cache, 1M source rows)
+- GROUP BY UPDATE 100 rows: **4.4ms** (vs 55ms REFRESH MATERIALIZED VIEW)
+- PASSTHROUGH INSERT 1K rows: **10ms** (vs 2,500ms REFRESH — 250x faster)
+- Per-IMV overhead: ~4ms warm, scales linearly with number of IMVs on same source
+
 ## [1.0.3] - 2026-03-26
 
 ### Added
