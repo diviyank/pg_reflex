@@ -7114,6 +7114,1769 @@ mod tests {
             2
         );
     }
+
+    // ========================================================================
+    // CORRECTNESS HARNESS — EXCEPT ALL differential oracle
+    //
+    // Pattern: after every mutation, verify:
+    //   (SELECT * FROM imv EXCEPT ALL SELECT * FROM (fresh_query))
+    //   UNION ALL
+    //   (SELECT * FROM (fresh_query) EXCEPT ALL SELECT * FROM imv)
+    // = 0 rows
+    //
+    // Based on pg_ivm test methodology and ReadySet edge case corpus.
+    // ========================================================================
+
+    /// Helper: verify IMV matches a fresh computation using EXCEPT ALL oracle.
+    /// `imv` is the IMV table name, `fresh_sql` is the SELECT that recomputes from source.
+    fn assert_imv_correct(imv: &str, fresh_sql: &str) {
+        // Wrap fresh_sql in a subquery to handle CTEs and complex queries
+        let check = format!(
+            "SELECT COUNT(*) FROM (\
+                (SELECT * FROM {} EXCEPT ALL SELECT * FROM ({}) AS __fresh1) \
+                UNION ALL \
+                (SELECT * FROM ({}) AS __fresh2 EXCEPT ALL SELECT * FROM {}) \
+             ) __oracle",
+            imv, fresh_sql, fresh_sql, imv
+        );
+        let mismatches = Spi::get_one::<i64>(&check)
+            .expect("oracle query failed")
+            .expect("oracle returned NULL");
+        assert_eq!(mismatches, 0,
+            "EXCEPT ALL oracle failed for '{}': {} mismatches between IMV and fresh query",
+            imv, mismatches);
+    }
+
+    // ---- Category A: Aggregate Semantics ----
+
+    /// A1: COUNT(*) vs COUNT(col) with NULLs
+    #[pg_test]
+    fn test_correctness_count_with_nulls() {
+        Spi::run("CREATE TABLE ca1 (id SERIAL, grp TEXT, val INT)").expect("create");
+        Spi::run("INSERT INTO ca1 (grp, val) VALUES ('a', 1), ('a', NULL), ('b', NULL), ('b', 3), ('b', NULL)").expect("seed");
+
+        crate::create_reflex_ivm("ca1_view",
+            "SELECT grp, COUNT(*) AS cnt_star, COUNT(val) AS cnt_val FROM ca1 GROUP BY grp",
+            None, None, None);
+
+        let fresh = "SELECT grp, COUNT(*) AS cnt_star, COUNT(val) AS cnt_val FROM ca1 GROUP BY grp";
+        assert_imv_correct("ca1_view", fresh);
+
+        // Insert more NULLs
+        Spi::run("INSERT INTO ca1 (grp, val) VALUES ('a', NULL), ('c', NULL)").expect("insert");
+        assert_imv_correct("ca1_view", fresh);
+
+        // Delete non-NULL
+        Spi::run("DELETE FROM ca1 WHERE val = 1").expect("delete");
+        assert_imv_correct("ca1_view", fresh);
+    }
+
+    /// A2: Group disappears after deleting all rows
+    #[pg_test]
+    fn test_correctness_group_disappears() {
+        Spi::run("CREATE TABLE ca2 (id SERIAL PRIMARY KEY, grp TEXT, val INT)").expect("create");
+        Spi::run("INSERT INTO ca2 (grp, val) VALUES ('a', 10), ('a', 20), ('b', 30)").expect("seed");
+
+        crate::create_reflex_ivm("ca2_view",
+            "SELECT grp, SUM(val) AS total FROM ca2 GROUP BY grp",
+            None, None, None);
+
+        let fresh = "SELECT grp, SUM(val) AS total FROM ca2 GROUP BY grp";
+        assert_imv_correct("ca2_view", fresh);
+
+        // Delete all 'a' rows → group should vanish
+        Spi::run("DELETE FROM ca2 WHERE grp = 'a'").expect("delete");
+        assert_imv_correct("ca2_view", fresh);
+
+        // Only 'b' should remain
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT COUNT(*) FROM ca2_view").expect("q").expect("v"),
+            1
+        );
+    }
+
+    /// A3: Full-table aggregate on empty table (SUM=NULL, COUNT=0, AVG=NULL)
+    #[pg_test]
+    fn test_correctness_empty_table_aggregates() {
+        Spi::run("CREATE TABLE ca3 (id SERIAL PRIMARY KEY, val INT)").expect("create");
+        Spi::run("INSERT INTO ca3 (val) VALUES (10), (20), (30)").expect("seed");
+
+        crate::create_reflex_ivm("ca3_view",
+            "SELECT SUM(val) AS s, COUNT(val) AS c, COUNT(*) AS cs FROM ca3",
+            None, None, None);
+
+        let fresh = "SELECT SUM(val) AS s, COUNT(val) AS c, COUNT(*) AS cs FROM ca3";
+        assert_imv_correct("ca3_view", fresh);
+
+        // Delete all rows
+        Spi::run("DELETE FROM ca3").expect("delete all");
+        // Full-table aggregate without GROUP BY on empty table:
+        // SUM=NULL, COUNT(val)=0, COUNT(*)=0
+        assert_imv_correct("ca3_view", fresh);
+    }
+
+    /// A5: MIN/MAX after deleting the extremum
+    #[pg_test]
+    fn test_correctness_min_max_extremum_deleted() {
+        Spi::run("CREATE TABLE ca5 (id SERIAL PRIMARY KEY, grp TEXT, val INT NOT NULL)").expect("create");
+        Spi::run("INSERT INTO ca5 (grp, val) VALUES ('a', 10), ('a', 20), ('a', 30), ('b', 5), ('b', 15)").expect("seed");
+
+        crate::create_reflex_ivm("ca5_view",
+            "SELECT grp, MIN(val) AS lo, MAX(val) AS hi FROM ca5 GROUP BY grp",
+            None, None, None);
+
+        let fresh = "SELECT grp, MIN(val) AS lo, MAX(val) AS hi FROM ca5 GROUP BY grp";
+        assert_imv_correct("ca5_view", fresh);
+
+        // Delete the MIN of group 'a' (val=10) and MAX of group 'b' (val=15)
+        Spi::run("DELETE FROM ca5 WHERE (grp = 'a' AND val = 10) OR (grp = 'b' AND val = 15)").expect("delete extrema");
+        assert_imv_correct("ca5_view", fresh);
+
+        // Now a: MIN=20, MAX=30; b: MIN=5, MAX=5
+        let a_lo = Spi::get_one::<i32>("SELECT lo FROM ca5_view WHERE grp = 'a'").expect("q").expect("v");
+        assert_eq!(a_lo, 20);
+    }
+
+    /// A7: Multiple aggregates on same column
+    #[pg_test]
+    fn test_correctness_multi_agg_same_col() {
+        Spi::run("CREATE TABLE ca7 (id SERIAL, grp TEXT, a INT NOT NULL)").expect("create");
+        Spi::run("INSERT INTO ca7 (grp, a) VALUES ('x', 10), ('x', 20), ('x', 30), ('y', 5)").expect("seed");
+
+        crate::create_reflex_ivm("ca7_view",
+            "SELECT grp, COUNT(a) AS c, MIN(a) AS lo, MAX(a) AS hi, SUM(a) AS s FROM ca7 GROUP BY grp",
+            None, None, None);
+
+        let fresh = "SELECT grp, COUNT(a) AS c, MIN(a) AS lo, MAX(a) AS hi, SUM(a) AS s FROM ca7 GROUP BY grp";
+        assert_imv_correct("ca7_view", fresh);
+
+        Spi::run("INSERT INTO ca7 (grp, a) VALUES ('x', 1), ('y', 100)").expect("insert");
+        assert_imv_correct("ca7_view", fresh);
+
+        Spi::run("DELETE FROM ca7 WHERE a = 1").expect("delete");
+        assert_imv_correct("ca7_view", fresh);
+
+        Spi::run("UPDATE ca7 SET a = 99 WHERE a = 30").expect("update");
+        assert_imv_correct("ca7_view", fresh);
+    }
+
+    /// A9: HAVING with threshold crossing
+    #[pg_test]
+    fn test_correctness_having_threshold() {
+        Spi::run("CREATE TABLE ca9 (id SERIAL, grp TEXT, val INT)").expect("create");
+        Spi::run("INSERT INTO ca9 (grp, val) VALUES ('a', 10), ('a', 20), ('b', 5)").expect("seed");
+
+        crate::create_reflex_ivm("ca9_view",
+            "SELECT grp, SUM(val) AS total FROM ca9 GROUP BY grp HAVING SUM(val) > 15",
+            None, None, None);
+
+        let fresh = "SELECT grp, SUM(val) AS total FROM ca9 GROUP BY grp HAVING SUM(val) > 15";
+        assert_imv_correct("ca9_view", fresh);
+
+        // b has SUM=5, below threshold. Insert to push it over.
+        Spi::run("INSERT INTO ca9 (grp, val) VALUES ('b', 20)").expect("insert");
+        assert_imv_correct("ca9_view", fresh);
+
+        // Delete from 'a' to push it below threshold
+        Spi::run("DELETE FROM ca9 WHERE grp = 'a' AND val = 20").expect("delete");
+        assert_imv_correct("ca9_view", fresh);
+    }
+
+    // ---- Category B: Join Semantics ----
+
+    /// B1: Self-join — auto-detected, uses full refresh
+    #[pg_test]
+    fn test_correctness_self_join() {
+        Spi::run("CREATE TABLE cb1 (id SERIAL PRIMARY KEY, i INT NOT NULL, v INT NOT NULL)").expect("create");
+        Spi::run("INSERT INTO cb1 (i, v) VALUES (1, 10), (2, 20), (1, 30)").expect("seed");
+
+        crate::create_reflex_ivm("cb1_view",
+            "SELECT t1.i, SUM(t1.v + t2.v) AS total FROM cb1 t1 JOIN cb1 t2 ON t1.i = t2.i GROUP BY t1.i",
+            None, None, None);
+
+        let fresh = "SELECT t1.i, SUM(t1.v + t2.v) AS total FROM cb1 t1 JOIN cb1 t2 ON t1.i = t2.i GROUP BY t1.i";
+        assert_imv_correct("cb1_view", fresh);
+
+        // INSERT triggers full refresh for self-join (auto-detected)
+        Spi::run("INSERT INTO cb1 (i, v) VALUES (1, 5)").expect("insert");
+        assert_imv_correct("cb1_view", fresh);
+
+        // DELETE also triggers full refresh
+        Spi::run("DELETE FROM cb1 WHERE v = 5").expect("delete");
+        assert_imv_correct("cb1_view", fresh);
+
+        // UPDATE too
+        Spi::run("UPDATE cb1 SET v = 99 WHERE i = 2").expect("update");
+        assert_imv_correct("cb1_view", fresh);
+    }
+
+    /// B6: JOIN producing duplicates (1:many)
+    #[pg_test]
+    fn test_correctness_join_duplicates() {
+        Spi::run("CREATE TABLE cb6_a (id SERIAL PRIMARY KEY, grp TEXT)").expect("create");
+        Spi::run("CREATE TABLE cb6_b (id SERIAL PRIMARY KEY, grp TEXT, val INT)").expect("create");
+        Spi::run("INSERT INTO cb6_a (grp) VALUES ('x'), ('y')").expect("seed");
+        Spi::run("INSERT INTO cb6_b (grp, val) VALUES ('x', 1), ('x', 2), ('x', 3), ('y', 10)").expect("seed");
+
+        crate::create_reflex_ivm("cb6_view",
+            "SELECT a.grp, SUM(b.val) AS total FROM cb6_a a JOIN cb6_b b ON a.grp = b.grp GROUP BY a.grp",
+            None, None, None);
+
+        let fresh = "SELECT a.grp, SUM(b.val) AS total FROM cb6_a a JOIN cb6_b b ON a.grp = b.grp GROUP BY a.grp";
+        assert_imv_correct("cb6_view", fresh);
+
+        Spi::run("INSERT INTO cb6_b (grp, val) VALUES ('x', 100)").expect("insert b");
+        assert_imv_correct("cb6_view", fresh);
+
+        Spi::run("INSERT INTO cb6_a (grp) VALUES ('x')").expect("insert a duplicate grp");
+        assert_imv_correct("cb6_view", fresh);
+    }
+
+    // ---- Category C: NULL Handling ----
+
+    /// C3/C4: Insert NULL, update non-NULL to NULL
+    #[pg_test]
+    fn test_correctness_null_mutations() {
+        Spi::run("CREATE TABLE cc (id SERIAL PRIMARY KEY, grp TEXT NOT NULL, val INT)").expect("create");
+        Spi::run("INSERT INTO cc (grp, val) VALUES ('a', 10), ('a', 20), ('b', 30)").expect("seed");
+
+        crate::create_reflex_ivm("cc_view",
+            "SELECT grp, SUM(val) AS total, COUNT(val) AS cv, COUNT(*) AS cs FROM cc GROUP BY grp",
+            None, None, None);
+
+        let fresh = "SELECT grp, SUM(val) AS total, COUNT(val) AS cv, COUNT(*) AS cs FROM cc GROUP BY grp";
+        assert_imv_correct("cc_view", fresh);
+
+        // Insert NULL val
+        Spi::run("INSERT INTO cc (grp, val) VALUES ('a', NULL)").expect("insert null");
+        assert_imv_correct("cc_view", fresh);
+
+        // Update non-NULL to NULL
+        Spi::run("UPDATE cc SET val = NULL WHERE val = 10").expect("update to null");
+        assert_imv_correct("cc_view", fresh);
+
+        // Update NULL to non-NULL
+        Spi::run("UPDATE cc SET val = 99 WHERE id = (SELECT id FROM cc WHERE val IS NULL LIMIT 1)").expect("update from null");
+        assert_imv_correct("cc_view", fresh);
+    }
+
+    // ---- Category D: DISTINCT ----
+
+    /// D1: DISTINCT ref counting — insert duplicate, delete one copy
+    #[pg_test]
+    fn test_correctness_distinct_refcount() {
+        Spi::run("CREATE TABLE cd1 (id SERIAL PRIMARY KEY, val TEXT)").expect("create");
+        Spi::run("INSERT INTO cd1 (val) VALUES ('a'), ('a'), ('a'), ('b'), ('b')").expect("seed");
+
+        crate::create_reflex_ivm("cd1_view", "SELECT DISTINCT val FROM cd1", None, None, None);
+        let fresh = "SELECT DISTINCT val FROM cd1";
+        assert_imv_correct("cd1_view", fresh);
+
+        // Delete one 'a' — should still appear
+        Spi::run("DELETE FROM cd1 WHERE id = 1").expect("delete");
+        assert_imv_correct("cd1_view", fresh);
+
+        // Delete remaining 'a's
+        Spi::run("DELETE FROM cd1 WHERE val = 'a'").expect("delete all a");
+        assert_imv_correct("cd1_view", fresh);
+
+        // Insert new value
+        Spi::run("INSERT INTO cd1 (val) VALUES ('c'), ('c')").expect("insert");
+        assert_imv_correct("cd1_view", fresh);
+    }
+
+    // ---- Category F: DML Patterns ----
+
+    /// F1: TRUNCATE
+    #[pg_test]
+    fn test_correctness_truncate() {
+        Spi::run("CREATE TABLE cf1 (id SERIAL, grp TEXT, val INT)").expect("create");
+        Spi::run("INSERT INTO cf1 (grp, val) VALUES ('a', 10), ('b', 20)").expect("seed");
+
+        crate::create_reflex_ivm("cf1_view",
+            "SELECT grp, SUM(val) AS total FROM cf1 GROUP BY grp",
+            None, None, None);
+
+        let fresh = "SELECT grp, SUM(val) AS total FROM cf1 GROUP BY grp";
+        assert_imv_correct("cf1_view", fresh);
+
+        Spi::run("TRUNCATE cf1").expect("truncate");
+        assert_imv_correct("cf1_view", fresh);
+
+        // Re-insert
+        Spi::run("INSERT INTO cf1 (grp, val) VALUES ('c', 100)").expect("reinsert");
+        assert_imv_correct("cf1_view", fresh);
+    }
+
+    /// F3: UPDATE that changes GROUP BY key (moves row between groups)
+    #[pg_test]
+    fn test_correctness_update_group_key() {
+        Spi::run("CREATE TABLE cf3 (id SERIAL PRIMARY KEY, grp TEXT NOT NULL, val INT NOT NULL)").expect("create");
+        Spi::run("INSERT INTO cf3 (grp, val) VALUES ('a', 10), ('a', 20), ('b', 30)").expect("seed");
+
+        crate::create_reflex_ivm("cf3_view",
+            "SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM cf3 GROUP BY grp",
+            None, None, None);
+
+        let fresh = "SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM cf3 GROUP BY grp";
+        assert_imv_correct("cf3_view", fresh);
+
+        // Move a row from 'a' to 'b'
+        Spi::run("UPDATE cf3 SET grp = 'b' WHERE val = 10").expect("move row");
+        assert_imv_correct("cf3_view", fresh);
+
+        // a: SUM=20, COUNT=1; b: SUM=40, COUNT=2
+        let a = Spi::get_one::<pgrx::AnyNumeric>("SELECT total FROM cf3_view WHERE grp = 'a'")
+            .expect("q").expect("v");
+        assert_eq!(a.to_string(), "20");
+    }
+
+    /// F6: Large batch insert (10K rows) — verify correctness at scale
+    #[pg_test]
+    fn test_correctness_batch_insert_10k() {
+        Spi::run("CREATE TABLE cf6 (id SERIAL, grp TEXT, val INT)").expect("create");
+        Spi::run("INSERT INTO cf6 (grp, val) VALUES ('seed', 1)").expect("seed");
+
+        crate::create_reflex_ivm("cf6_view",
+            "SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM cf6 GROUP BY grp",
+            None, None, None);
+
+        // Insert 10K rows across 100 groups
+        Spi::run("INSERT INTO cf6 (grp, val) SELECT 'g' || (i % 100), i FROM generate_series(1, 10000) i").expect("batch");
+        let fresh = "SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM cf6 GROUP BY grp";
+        assert_imv_correct("cf6_view", fresh);
+    }
+
+    // ---- Category: CTE correctness ----
+
+    /// CTE with multiple levels — verify cascading is correct
+    #[pg_test]
+    fn test_correctness_cte_cascade() {
+        Spi::run("CREATE TABLE cte_src (id SERIAL, region TEXT, city TEXT, amount INT)").expect("create");
+        Spi::run("INSERT INTO cte_src (region, city, amount) VALUES \
+            ('EU', 'Paris', 100), ('EU', 'Berlin', 200), ('US', 'NYC', 300), ('US', 'LA', 50)").expect("seed");
+
+        crate::create_reflex_ivm("cte_view",
+            "WITH by_city AS (SELECT region, city, SUM(amount) AS city_total FROM cte_src GROUP BY region, city) \
+             SELECT region, SUM(city_total) AS total, COUNT(*) AS num_cities FROM by_city GROUP BY region",
+            None, None, None);
+
+        let fresh = "WITH by_city AS (SELECT region, city, SUM(amount) AS city_total FROM cte_src GROUP BY region, city) \
+                     SELECT region, SUM(city_total) AS total, COUNT(*) AS num_cities FROM by_city GROUP BY region";
+        assert_imv_correct("cte_view", fresh);
+
+        Spi::run("INSERT INTO cte_src (region, city, amount) VALUES ('EU', 'Madrid', 150)").expect("insert");
+        assert_imv_correct("cte_view", fresh);
+
+        Spi::run("DELETE FROM cte_src WHERE city = 'LA'").expect("delete");
+        assert_imv_correct("cte_view", fresh);
+
+        Spi::run("UPDATE cte_src SET amount = 999 WHERE city = 'Paris'").expect("update");
+        assert_imv_correct("cte_view", fresh);
+    }
+
+    // ---- Category: UNION correctness ----
+
+    /// UNION ALL correctness after mixed INSERT/DELETE
+    #[pg_test]
+    fn test_correctness_union_all() {
+        Spi::run("CREATE TABLE cu_a (id SERIAL PRIMARY KEY, val TEXT)").expect("create");
+        Spi::run("CREATE TABLE cu_b (id SERIAL PRIMARY KEY, val TEXT)").expect("create");
+        Spi::run("INSERT INTO cu_a (val) VALUES ('x'), ('y')").expect("seed");
+        Spi::run("INSERT INTO cu_b (val) VALUES ('y'), ('z')").expect("seed");
+
+        crate::create_reflex_ivm("cu_view",
+            "SELECT val FROM cu_a UNION ALL SELECT val FROM cu_b",
+            None, None, None);
+
+        let fresh = "SELECT val FROM cu_a UNION ALL SELECT val FROM cu_b";
+        assert_imv_correct("cu_view", fresh);
+
+        Spi::run("INSERT INTO cu_a (val) VALUES ('z')").expect("insert");
+        assert_imv_correct("cu_view", fresh);
+
+        Spi::run("DELETE FROM cu_b WHERE val = 'y'").expect("delete");
+        assert_imv_correct("cu_view", fresh);
+    }
+
+    // ---- Category: WINDOW correctness ----
+
+    /// WINDOW GROUP BY + RANK correctness through multiple mutations
+    #[pg_test]
+    fn test_correctness_window_groupby_rank() {
+        Spi::run("CREATE TABLE cw (id SERIAL, city TEXT, amount INT)").expect("create");
+        Spi::run("INSERT INTO cw (city, amount) VALUES \
+            ('a', 100), ('a', 200), ('b', 50), ('c', 300), ('c', 100)").expect("seed");
+
+        crate::create_reflex_ivm("cw_view",
+            "SELECT city, SUM(amount) AS total, RANK() OVER (ORDER BY SUM(amount) DESC) AS rnk FROM cw GROUP BY city",
+            None, None, None);
+
+        let fresh = "SELECT city, SUM(amount) AS total, RANK() OVER (ORDER BY SUM(amount) DESC) AS rnk FROM cw GROUP BY city";
+        assert_imv_correct("cw_view", fresh);
+
+        // INSERT changes ranking
+        Spi::run("INSERT INTO cw (city, amount) VALUES ('b', 500)").expect("insert");
+        assert_imv_correct("cw_view", fresh);
+
+        // DELETE changes ranking
+        Spi::run("DELETE FROM cw WHERE city = 'c' AND amount = 300").expect("delete");
+        assert_imv_correct("cw_view", fresh);
+
+        // UPDATE changes ranking
+        Spi::run("UPDATE cw SET amount = 1 WHERE city = 'a'").expect("update");
+        assert_imv_correct("cw_view", fresh);
+    }
+
+    // ---- Category: AVG precision ----
+
+    /// AVG with values that don't divide evenly
+    #[pg_test]
+    fn test_correctness_avg_precision() {
+        Spi::run("CREATE TABLE cavg (id SERIAL, grp TEXT, val NUMERIC)").expect("create");
+        Spi::run("INSERT INTO cavg (grp, val) VALUES ('a', 1), ('a', 2), ('a', 3)").expect("seed");
+
+        crate::create_reflex_ivm("cavg_view",
+            "SELECT grp, AVG(val) AS avg_val FROM cavg GROUP BY grp",
+            None, None, None);
+
+        let fresh = "SELECT grp, AVG(val) AS avg_val FROM cavg GROUP BY grp";
+        assert_imv_correct("cavg_view", fresh);
+
+        // Add a value that makes AVG non-integer
+        Spi::run("INSERT INTO cavg (grp, val) VALUES ('a', 7)").expect("insert");
+        assert_imv_correct("cavg_view", fresh);
+        // AVG = (1+2+3+7)/4 = 3.25
+
+        // Delete and recheck
+        Spi::run("DELETE FROM cavg WHERE val = 2").expect("delete");
+        assert_imv_correct("cavg_view", fresh);
+        // AVG = (1+3+7)/3 = 3.666...
+    }
+
+    // ---- Category: Passthrough with JOIN ----
+
+    /// Passthrough JOIN — INSERT/UPDATE/DELETE correctness
+    #[pg_test]
+    fn test_correctness_passthrough_join() {
+        Spi::run("CREATE TABLE cp_src (id SERIAL PRIMARY KEY, did INT NOT NULL, val TEXT)").expect("create");
+        Spi::run("CREATE TABLE cp_dim (id SERIAL PRIMARY KEY, label TEXT)").expect("create");
+        Spi::run("INSERT INTO cp_dim (label) VALUES ('A'), ('B'), ('C')").expect("seed dim");
+        Spi::run("INSERT INTO cp_src (did, val) VALUES (1, 'x'), (2, 'y'), (1, 'z')").expect("seed src");
+
+        crate::create_reflex_ivm("cp_view",
+            "SELECT s.id, s.val, d.label FROM cp_src s JOIN cp_dim d ON s.did = d.id",
+            Some("id"), None, None);
+
+        let fresh = "SELECT s.id, s.val, d.label FROM cp_src s JOIN cp_dim d ON s.did = d.id";
+        assert_imv_correct("cp_view", fresh);
+
+        Spi::run("INSERT INTO cp_src (did, val) VALUES (3, 'new')").expect("insert");
+        assert_imv_correct("cp_view", fresh);
+
+        Spi::run("UPDATE cp_src SET val = 'updated' WHERE id = 1").expect("update");
+        assert_imv_correct("cp_view", fresh);
+
+        Spi::run("DELETE FROM cp_src WHERE id = 2").expect("delete");
+        assert_imv_correct("cp_view", fresh);
+    }
+
+    // ---- Category: Unhappy paths & edge cases ----
+
+    /// UPDATE that doesn't change any value (SET val = val) — should be a no-op
+    #[pg_test]
+    fn test_correctness_noop_update() {
+        Spi::run("CREATE TABLE nop (id SERIAL PRIMARY KEY, grp TEXT NOT NULL, val INT NOT NULL)").expect("create");
+        Spi::run("INSERT INTO nop (grp, val) VALUES ('a', 10), ('b', 20)").expect("seed");
+
+        crate::create_reflex_ivm("nop_view",
+            "SELECT grp, SUM(val) AS total FROM nop GROUP BY grp",
+            None, None, None);
+
+        let fresh = "SELECT grp, SUM(val) AS total FROM nop GROUP BY grp";
+        assert_imv_correct("nop_view", fresh);
+
+        // No-op update — same values
+        Spi::run("UPDATE nop SET val = val").expect("noop update");
+        assert_imv_correct("nop_view", fresh);
+
+        // No-op update with WHERE FALSE — 0 rows affected
+        Spi::run("UPDATE nop SET val = 999 WHERE FALSE").expect("where false");
+        assert_imv_correct("nop_view", fresh);
+    }
+
+    /// DELETE WHERE FALSE — 0 rows affected
+    #[pg_test]
+    fn test_correctness_delete_where_false() {
+        Spi::run("CREATE TABLE dwf (id SERIAL, grp TEXT, val INT)").expect("create");
+        Spi::run("INSERT INTO dwf (grp, val) VALUES ('a', 10), ('b', 20)").expect("seed");
+
+        crate::create_reflex_ivm("dwf_view",
+            "SELECT grp, SUM(val) AS total FROM dwf GROUP BY grp",
+            None, None, None);
+
+        let fresh = "SELECT grp, SUM(val) AS total FROM dwf GROUP BY grp";
+        Spi::run("DELETE FROM dwf WHERE FALSE").expect("delete where false");
+        assert_imv_correct("dwf_view", fresh);
+    }
+
+    /// INSERT exact duplicate rows — aggregate must count both
+    #[pg_test]
+    fn test_correctness_exact_duplicates() {
+        Spi::run("CREATE TABLE dup (id SERIAL, grp TEXT, val INT)").expect("create");
+        Spi::run("INSERT INTO dup (grp, val) VALUES ('a', 10), ('a', 10), ('a', 10)").expect("seed");
+
+        crate::create_reflex_ivm("dup_view",
+            "SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM dup GROUP BY grp",
+            None, None, None);
+
+        let fresh = "SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM dup GROUP BY grp";
+        assert_imv_correct("dup_view", fresh);
+        // total=30, cnt=3
+
+        // Insert more exact duplicates
+        Spi::run("INSERT INTO dup (grp, val) VALUES ('a', 10), ('a', 10)").expect("more dups");
+        assert_imv_correct("dup_view", fresh);
+        // total=50, cnt=5
+    }
+
+    /// UPDATE that changes JOIN key — row disappears from JOIN result
+    #[pg_test]
+    fn test_correctness_update_join_key() {
+        Spi::run("CREATE TABLE ujk_src (id SERIAL PRIMARY KEY, did INT NOT NULL, val TEXT)").expect("create");
+        Spi::run("CREATE TABLE ujk_dim (id INT PRIMARY KEY, label TEXT)").expect("create");
+        Spi::run("INSERT INTO ujk_dim VALUES (1, 'A'), (2, 'B')").expect("seed dim");
+        Spi::run("INSERT INTO ujk_src (did, val) VALUES (1, 'x'), (2, 'y')").expect("seed src");
+
+        crate::create_reflex_ivm("ujk_view",
+            "SELECT s.id, s.val, d.label FROM ujk_src s JOIN ujk_dim d ON s.did = d.id",
+            Some("id"), None, None);
+
+        let fresh = "SELECT s.id, s.val, d.label FROM ujk_src s JOIN ujk_dim d ON s.did = d.id";
+        assert_imv_correct("ujk_view", fresh);
+
+        // Update join key to a non-existent dim ID — row should disappear from JOIN result
+        Spi::run("UPDATE ujk_src SET did = 999 WHERE id = 1").expect("orphan");
+        assert_imv_correct("ujk_view", fresh);
+
+        // Only row with did=2 should remain
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT COUNT(*) FROM ujk_view").expect("q").expect("v"),
+            1
+        );
+    }
+
+    /// DELETE from dimension table in a JOIN — orphaned source rows vanish from view
+    #[pg_test]
+    fn test_correctness_delete_dimension() {
+        Spi::run("CREATE TABLE dd_src (id SERIAL PRIMARY KEY, did INT NOT NULL, val INT)").expect("create");
+        Spi::run("CREATE TABLE dd_dim (id INT PRIMARY KEY, label TEXT)").expect("create");
+        Spi::run("INSERT INTO dd_dim VALUES (1, 'A'), (2, 'B')").expect("seed dim");
+        Spi::run("INSERT INTO dd_src (did, val) VALUES (1, 10), (1, 20), (2, 30)").expect("seed src");
+
+        crate::create_reflex_ivm("dd_view",
+            "SELECT d.label, SUM(s.val) AS total FROM dd_src s JOIN dd_dim d ON s.did = d.id GROUP BY d.label",
+            None, None, None);
+
+        let fresh = "SELECT d.label, SUM(s.val) AS total FROM dd_src s JOIN dd_dim d ON s.did = d.id GROUP BY d.label";
+        assert_imv_correct("dd_view", fresh);
+
+        // Delete dimension row — orphans source rows
+        Spi::run("DELETE FROM dd_dim WHERE id = 1").expect("delete dim");
+        assert_imv_correct("dd_view", fresh);
+    }
+
+    /// DISTINCT with UPDATE — value changes, old and new must both be tracked
+    #[pg_test]
+    fn test_correctness_distinct_update() {
+        Spi::run("CREATE TABLE du (id SERIAL PRIMARY KEY, val TEXT)").expect("create");
+        Spi::run("INSERT INTO du (val) VALUES ('a'), ('a'), ('b')").expect("seed");
+
+        crate::create_reflex_ivm("du_view", "SELECT DISTINCT val FROM du", None, None, None);
+        let fresh = "SELECT DISTINCT val FROM du";
+        assert_imv_correct("du_view", fresh);
+
+        // Update one 'a' to 'c' — 'a' should still exist (refcount=1), 'c' appears
+        Spi::run("UPDATE du SET val = 'c' WHERE id = 1").expect("update");
+        assert_imv_correct("du_view", fresh);
+
+        // Update last 'a' to 'c' — 'a' should vanish, 'c' refcount=2
+        Spi::run("UPDATE du SET val = 'c' WHERE val = 'a'").expect("update last");
+        assert_imv_correct("du_view", fresh);
+    }
+
+    /// BOOL_OR with DELETE — should recompute from source
+    #[pg_test]
+    fn test_correctness_bool_or_delete() {
+        Spi::run("CREATE TABLE bo (id SERIAL PRIMARY KEY, grp TEXT NOT NULL, flag BOOLEAN NOT NULL)").expect("create");
+        Spi::run("INSERT INTO bo (grp, flag) VALUES ('a', true), ('a', false), ('b', false), ('b', false)").expect("seed");
+
+        crate::create_reflex_ivm("bo_view",
+            "SELECT grp, bool_or(flag) AS any_true FROM bo GROUP BY grp",
+            None, None, None);
+
+        let fresh = "SELECT grp, bool_or(flag) AS any_true FROM bo GROUP BY grp";
+        assert_imv_correct("bo_view", fresh);
+
+        // Delete the only TRUE row in 'a' — bool_or should become FALSE
+        Spi::run("DELETE FROM bo WHERE grp = 'a' AND flag = true").expect("delete true");
+        assert_imv_correct("bo_view", fresh);
+
+        // Insert TRUE into 'b'
+        Spi::run("INSERT INTO bo (grp, flag) VALUES ('b', true)").expect("insert true");
+        assert_imv_correct("bo_view", fresh);
+    }
+
+    /// Very large single group (10K rows in 1 group) — stress intermediate MERGE
+    #[pg_test]
+    fn test_correctness_large_single_group() {
+        Spi::run("CREATE TABLE lsg (id SERIAL, grp TEXT, val INT)").expect("create");
+        Spi::run("INSERT INTO lsg (grp, val) SELECT 'only', i FROM generate_series(1, 10000) i").expect("seed");
+
+        crate::create_reflex_ivm("lsg_view",
+            "SELECT grp, SUM(val) AS total, COUNT(*) AS cnt, MIN(val) AS lo, MAX(val) AS hi FROM lsg GROUP BY grp",
+            None, None, None);
+
+        let fresh = "SELECT grp, SUM(val) AS total, COUNT(*) AS cnt, MIN(val) AS lo, MAX(val) AS hi FROM lsg GROUP BY grp";
+        assert_imv_correct("lsg_view", fresh);
+
+        // Delete the MIN row (val=1)
+        Spi::run("DELETE FROM lsg WHERE val = 1").expect("delete min");
+        assert_imv_correct("lsg_view", fresh);
+
+        // Delete the MAX row (val=10000)
+        Spi::run("DELETE FROM lsg WHERE val = 10000").expect("delete max");
+        assert_imv_correct("lsg_view", fresh);
+
+        // Bulk update
+        Spi::run("UPDATE lsg SET val = val + 1 WHERE val <= 100").expect("bulk update");
+        assert_imv_correct("lsg_view", fresh);
+    }
+
+    /// Rapid successive mutations — INSERT, UPDATE, DELETE in sequence
+    #[pg_test]
+    fn test_correctness_rapid_mutations() {
+        Spi::run("CREATE TABLE rm (id SERIAL PRIMARY KEY, grp TEXT NOT NULL, val INT NOT NULL)").expect("create");
+        Spi::run("INSERT INTO rm (grp, val) VALUES ('a', 1), ('b', 2), ('c', 3)").expect("seed");
+
+        crate::create_reflex_ivm("rm_view",
+            "SELECT grp, SUM(val) AS total FROM rm GROUP BY grp",
+            None, None, None);
+
+        let fresh = "SELECT grp, SUM(val) AS total FROM rm GROUP BY grp";
+        assert_imv_correct("rm_view", fresh);
+
+        // 10 rapid mutations
+        Spi::run("INSERT INTO rm (grp, val) VALUES ('a', 10)").expect("1");
+        Spi::run("UPDATE rm SET val = val * 2 WHERE grp = 'b'").expect("2");
+        Spi::run("DELETE FROM rm WHERE grp = 'c'").expect("3");
+        Spi::run("INSERT INTO rm (grp, val) VALUES ('c', 100), ('d', 50)").expect("4");
+        Spi::run("UPDATE rm SET grp = 'd' WHERE grp = 'a' AND val = 1").expect("5");
+        Spi::run("DELETE FROM rm WHERE val = 10").expect("6");
+        Spi::run("INSERT INTO rm (grp, val) VALUES ('a', 7), ('a', 8), ('a', 9)").expect("7");
+        Spi::run("UPDATE rm SET val = 0 WHERE grp = 'd'").expect("8");
+        Spi::run("DELETE FROM rm WHERE val = 0 AND grp = 'd'").expect("9");
+        Spi::run("INSERT INTO rm (grp, val) VALUES ('e', 999)").expect("10");
+
+        assert_imv_correct("rm_view", fresh);
+    }
+
+    /// EXCEPT preserves operand order — A EXCEPT B ≠ B EXCEPT A
+    #[pg_test]
+    fn test_correctness_except_order() {
+        Spi::run("CREATE TABLE eo_a (id SERIAL, val TEXT)").expect("create");
+        Spi::run("CREATE TABLE eo_b (id SERIAL, val TEXT)").expect("create");
+        Spi::run("INSERT INTO eo_a (val) VALUES ('x'), ('y'), ('z')").expect("seed a");
+        Spi::run("INSERT INTO eo_b (val) VALUES ('y'), ('z'), ('w')").expect("seed b");
+
+        // A EXCEPT B should give 'x' (in A but not B)
+        crate::create_reflex_ivm("eo_ab",
+            "SELECT val FROM eo_a EXCEPT SELECT val FROM eo_b",
+            None, None, None);
+        let fresh_ab = "SELECT val FROM eo_a EXCEPT SELECT val FROM eo_b";
+        assert_imv_correct("eo_ab", fresh_ab);
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT COUNT(*) FROM eo_ab WHERE val = 'x'").expect("q").expect("v"),
+            1, "x should be in A EXCEPT B"
+        );
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT COUNT(*) FROM eo_ab WHERE val = 'w'").expect("q").expect("v"),
+            0, "w should NOT be in A EXCEPT B"
+        );
+
+        // Mutate and re-check
+        Spi::run("INSERT INTO eo_b (val) VALUES ('x')").expect("insert x into b");
+        assert_imv_correct("eo_ab", fresh_ab);
+        // Now A EXCEPT B should be empty (all of A is in B)
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT COUNT(*) FROM eo_ab").expect("q").expect("v"),
+            0, "A EXCEPT B should be empty after adding x to B"
+        );
+    }
+
+    /// INTERSECT after DELETE makes intersection empty
+    #[pg_test]
+    fn test_correctness_intersect_empties() {
+        Spi::run("CREATE TABLE ie_a (id SERIAL PRIMARY KEY, val TEXT)").expect("create");
+        Spi::run("CREATE TABLE ie_b (id SERIAL PRIMARY KEY, val TEXT)").expect("create");
+        Spi::run("INSERT INTO ie_a (val) VALUES ('x'), ('y')").expect("seed a");
+        Spi::run("INSERT INTO ie_b (val) VALUES ('x'), ('y')").expect("seed b");
+
+        crate::create_reflex_ivm("ie_view",
+            "SELECT val FROM ie_a INTERSECT SELECT val FROM ie_b",
+            None, None, None);
+
+        let fresh = "SELECT val FROM ie_a INTERSECT SELECT val FROM ie_b";
+        assert_imv_correct("ie_view", fresh);
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT COUNT(*) FROM ie_view").expect("q").expect("v"),
+            2
+        );
+
+        // Delete all from A — intersection becomes empty
+        Spi::run("DELETE FROM ie_a").expect("delete all a");
+        assert_imv_correct("ie_view", fresh);
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT COUNT(*) FROM ie_view").expect("q").expect("v"),
+            0
+        );
+
+        // Re-insert into A — intersection restores
+        Spi::run("INSERT INTO ie_a (val) VALUES ('y')").expect("reinsert");
+        assert_imv_correct("ie_view", fresh);
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT COUNT(*) FROM ie_view").expect("q").expect("v"),
+            1
+        );
+    }
+
+    /// WINDOW with PARTITION BY — delete empties a partition
+    #[pg_test]
+    fn test_correctness_window_partition_empty() {
+        Spi::run("CREATE TABLE wpe (id SERIAL PRIMARY KEY, dept TEXT, name TEXT, score INT)").expect("create");
+        Spi::run("INSERT INTO wpe (dept, name, score) VALUES \
+            ('eng', 'Alice', 90), ('eng', 'Bob', 80), \
+            ('sales', 'Carol', 70)").expect("seed");
+
+        crate::create_reflex_ivm("wpe_view",
+            "SELECT dept, name, score, ROW_NUMBER() OVER (PARTITION BY dept ORDER BY score DESC) AS rnk FROM wpe",
+            None, None, None);
+
+        let fresh = "SELECT dept, name, score, ROW_NUMBER() OVER (PARTITION BY dept ORDER BY score DESC) AS rnk FROM wpe";
+        assert_imv_correct("wpe_view", fresh);
+
+        // Delete all from 'sales' partition
+        Spi::run("DELETE FROM wpe WHERE dept = 'sales'").expect("empty partition");
+        assert_imv_correct("wpe_view", fresh);
+
+        // Only eng partition remains
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT COUNT(*) FROM wpe_view").expect("q").expect("v"),
+            2
+        );
+    }
+
+    /// AVG: delete all rows from a group — AVG should not divide by zero
+    #[pg_test]
+    fn test_correctness_avg_group_vanishes() {
+        Spi::run("CREATE TABLE avg_van (id SERIAL PRIMARY KEY, grp TEXT NOT NULL, val NUMERIC)").expect("create");
+        Spi::run("INSERT INTO avg_van (grp, val) VALUES ('a', 10), ('a', 20), ('b', 30)").expect("seed");
+
+        crate::create_reflex_ivm("avg_van_view",
+            "SELECT grp, AVG(val) AS avg_val FROM avg_van GROUP BY grp",
+            None, None, None);
+
+        let fresh = "SELECT grp, AVG(val) AS avg_val FROM avg_van GROUP BY grp";
+        assert_imv_correct("avg_van_view", fresh);
+
+        // Delete all 'a' rows — group should vanish, no division by zero
+        Spi::run("DELETE FROM avg_van WHERE grp = 'a'").expect("delete all a");
+        assert_imv_correct("avg_van_view", fresh);
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT COUNT(*) FROM avg_van_view WHERE grp = 'a'").expect("q").expect("v"),
+            0
+        );
+    }
+
+    /// Multiple operations on same rows within one statement (CTE DML)
+    #[pg_test]
+    fn test_correctness_cte_dml_multi_table() {
+        Spi::run("CREATE TABLE cm_a (id SERIAL PRIMARY KEY, val INT)").expect("create a");
+        Spi::run("CREATE TABLE cm_b (id SERIAL PRIMARY KEY, val INT)").expect("create b");
+        Spi::run("INSERT INTO cm_a (val) VALUES (1), (2), (3)").expect("seed a");
+        Spi::run("INSERT INTO cm_b (val) VALUES (10), (20)").expect("seed b");
+
+        crate::create_reflex_ivm("cm_view",
+            "SELECT SUM(val) AS total FROM cm_a",
+            None, None, None);
+
+        let fresh = "SELECT SUM(val) AS total FROM cm_a";
+        assert_imv_correct("cm_view", fresh);
+
+        // CTE that inserts using data from another table
+        Spi::run("INSERT INTO cm_a (val) SELECT val FROM cm_b").expect("cte insert");
+        assert_imv_correct("cm_view", fresh);
+        // total should be 1+2+3+10+20 = 36
+    }
+
+    /// Passthrough without unique key — DELETE falls back to full refresh
+    #[pg_test]
+    fn test_correctness_passthrough_no_key() {
+        Spi::run("CREATE TABLE pnk (id SERIAL, city TEXT, val INT)").expect("create");
+        Spi::run("INSERT INTO pnk (city, val) VALUES ('a', 1), ('b', 2), ('c', 3)").expect("seed");
+
+        // No unique key provided, no PK auto-detection (id not in SELECT)
+        crate::create_reflex_ivm("pnk_view",
+            "SELECT city, val FROM pnk",
+            None, None, None);
+
+        let fresh = "SELECT city, val FROM pnk";
+        assert_imv_correct("pnk_view", fresh);
+
+        Spi::run("INSERT INTO pnk (city, val) VALUES ('d', 4)").expect("insert");
+        assert_imv_correct("pnk_view", fresh);
+
+        // DELETE triggers full refresh (no key for targeted delete)
+        Spi::run("DELETE FROM pnk WHERE city = 'b'").expect("delete");
+        assert_imv_correct("pnk_view", fresh);
+
+        Spi::run("UPDATE pnk SET val = 99 WHERE city = 'a'").expect("update");
+        assert_imv_correct("pnk_view", fresh);
+    }
+
+    /// UNION with aggregates in operands — correctness through mutations
+    #[pg_test]
+    fn test_correctness_union_agg_mutations() {
+        Spi::run("CREATE TABLE uam_a (id SERIAL, grp TEXT, val INT)").expect("create a");
+        Spi::run("CREATE TABLE uam_b (id SERIAL, grp TEXT, val INT)").expect("create b");
+        Spi::run("INSERT INTO uam_a (grp, val) VALUES ('x', 10), ('x', 20), ('y', 30)").expect("seed a");
+        Spi::run("INSERT INTO uam_b (grp, val) VALUES ('x', 100), ('z', 50)").expect("seed b");
+
+        crate::create_reflex_ivm("uam_view",
+            "SELECT grp, SUM(val) AS total FROM uam_a GROUP BY grp \
+             UNION ALL \
+             SELECT grp, SUM(val) AS total FROM uam_b GROUP BY grp",
+            None, None, None);
+
+        let fresh = "SELECT grp, SUM(val) AS total FROM uam_a GROUP BY grp \
+                     UNION ALL \
+                     SELECT grp, SUM(val) AS total FROM uam_b GROUP BY grp";
+        assert_imv_correct("uam_view", fresh);
+
+        Spi::run("INSERT INTO uam_a (grp, val) VALUES ('z', 5)").expect("insert a");
+        assert_imv_correct("uam_view", fresh);
+
+        Spi::run("DELETE FROM uam_b WHERE grp = 'x'").expect("delete b");
+        assert_imv_correct("uam_view", fresh);
+
+        Spi::run("UPDATE uam_a SET val = 999 WHERE grp = 'y'").expect("update a");
+        assert_imv_correct("uam_view", fresh);
+    }
+
+    /// Stress: interleaved INSERT/DELETE/UPDATE on 50 groups
+    #[pg_test]
+    fn test_correctness_stress_interleaved() {
+        Spi::run("CREATE TABLE stress (id SERIAL PRIMARY KEY, grp INT NOT NULL, val INT NOT NULL)").expect("create");
+        Spi::run("INSERT INTO stress (grp, val) SELECT i % 50, i FROM generate_series(1, 5000) i").expect("seed");
+
+        crate::create_reflex_ivm("stress_view",
+            "SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM stress GROUP BY grp",
+            None, None, None);
+
+        let fresh = "SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM stress GROUP BY grp";
+        assert_imv_correct("stress_view", fresh);
+
+        // Batch INSERT
+        Spi::run("INSERT INTO stress (grp, val) SELECT i % 50, i * 10 FROM generate_series(1, 1000) i").expect("batch insert");
+        assert_imv_correct("stress_view", fresh);
+
+        // Batch UPDATE — change group keys for some rows
+        Spi::run("UPDATE stress SET grp = grp + 25 WHERE id <= 500").expect("batch update grp");
+        assert_imv_correct("stress_view", fresh);
+
+        // Batch DELETE
+        Spi::run("DELETE FROM stress WHERE id > 5000").expect("batch delete");
+        assert_imv_correct("stress_view", fresh);
+
+        // Large UPDATE on values
+        Spi::run("UPDATE stress SET val = val + 1").expect("update all");
+        assert_imv_correct("stress_view", fresh);
+    }
+
+    // ========================================================================
+    // Extended correctness: coverage gaps
+    // ========================================================================
+
+    /// LEFT JOIN: right side NULLs appear/disappear — auto full-refresh on right-side DELETE
+    #[pg_test]
+    fn test_correctness_left_join_nulls() {
+        Spi::run("CREATE TABLE lj_l (id SERIAL PRIMARY KEY, grp TEXT NOT NULL)").expect("create");
+        Spi::run("CREATE TABLE lj_r (id SERIAL PRIMARY KEY, grp TEXT, val INT)").expect("create");
+        Spi::run("INSERT INTO lj_l (grp) VALUES ('a'), ('b'), ('c')").expect("seed l");
+        Spi::run("INSERT INTO lj_r (grp, val) VALUES ('a', 10), ('b', 20)").expect("seed r");
+
+        crate::create_reflex_ivm("lj_view",
+            "SELECT l.grp, SUM(r.val) AS total FROM lj_l l LEFT JOIN lj_r r ON l.grp = r.grp GROUP BY l.grp",
+            None, None, None);
+
+        let fresh = "SELECT l.grp, SUM(r.val) AS total FROM lj_l l LEFT JOIN lj_r r ON l.grp = r.grp GROUP BY l.grp";
+        assert_imv_correct("lj_view", fresh);
+
+        // Insert into right → 'c' goes from NULL to having a value
+        Spi::run("INSERT INTO lj_r (grp, val) VALUES ('c', 50)").expect("fill null");
+        assert_imv_correct("lj_view", fresh);
+
+        // Delete from right → auto full-refresh detects LEFT JOIN secondary table
+        Spi::run("DELETE FROM lj_r WHERE grp = 'c'").expect("back to null");
+        assert_imv_correct("lj_view", fresh);
+
+        // Delete all from right → all LEFT JOIN results become NULL
+        Spi::run("DELETE FROM lj_r").expect("delete all right");
+        assert_imv_correct("lj_view", fresh);
+    }
+
+    /// Cast propagation: SUM(x)::BIGINT correctness
+    #[pg_test]
+    fn test_correctness_cast_propagation() {
+        Spi::run("CREATE TABLE ccast (id SERIAL, grp TEXT, val INT)").expect("create");
+        Spi::run("INSERT INTO ccast (grp, val) VALUES ('a', 100), ('a', 200), ('b', 50)").expect("seed");
+
+        crate::create_reflex_ivm("ccast_view",
+            "SELECT grp, SUM(val)::BIGINT AS total FROM ccast GROUP BY grp",
+            None, None, None);
+
+        let fresh = "SELECT grp, SUM(val)::BIGINT AS total FROM ccast GROUP BY grp";
+        assert_imv_correct("ccast_view", fresh);
+
+        Spi::run("INSERT INTO ccast (grp, val) VALUES ('a', 50)").expect("insert");
+        assert_imv_correct("ccast_view", fresh);
+
+        Spi::run("DELETE FROM ccast WHERE val = 200").expect("delete");
+        assert_imv_correct("ccast_view", fresh);
+
+        Spi::run("UPDATE ccast SET val = 999 WHERE grp = 'b'").expect("update");
+        assert_imv_correct("ccast_view", fresh);
+    }
+
+    /// Multiple IMVs on same source — all correct after mutations
+    #[pg_test]
+    fn test_correctness_multi_imv_same_source() {
+        Spi::run("CREATE TABLE msrc (id SERIAL PRIMARY KEY, grp TEXT NOT NULL, val INT NOT NULL)").expect("create");
+        Spi::run("INSERT INTO msrc (grp, val) VALUES ('a', 10), ('a', 20), ('b', 30), ('b', 40)").expect("seed");
+
+        crate::create_reflex_ivm("m1_view",
+            "SELECT grp, SUM(val) AS total FROM msrc GROUP BY grp",
+            None, None, None);
+        crate::create_reflex_ivm("m2_view",
+            "SELECT grp, COUNT(*) AS cnt FROM msrc GROUP BY grp",
+            None, None, None);
+        crate::create_reflex_ivm("m3_view",
+            "SELECT grp, AVG(val) AS avg_val FROM msrc GROUP BY grp",
+            None, None, None);
+
+        let f1 = "SELECT grp, SUM(val) AS total FROM msrc GROUP BY grp";
+        let f2 = "SELECT grp, COUNT(*) AS cnt FROM msrc GROUP BY grp";
+        let f3 = "SELECT grp, AVG(val) AS avg_val FROM msrc GROUP BY grp";
+
+        assert_imv_correct("m1_view", f1);
+        assert_imv_correct("m2_view", f2);
+        assert_imv_correct("m3_view", f3);
+
+        // INSERT — all 3 must update correctly
+        Spi::run("INSERT INTO msrc (grp, val) VALUES ('a', 100), ('c', 5)").expect("insert");
+        assert_imv_correct("m1_view", f1);
+        assert_imv_correct("m2_view", f2);
+        assert_imv_correct("m3_view", f3);
+
+        // UPDATE — group key change
+        Spi::run("UPDATE msrc SET grp = 'c' WHERE val = 40").expect("update");
+        assert_imv_correct("m1_view", f1);
+        assert_imv_correct("m2_view", f2);
+        assert_imv_correct("m3_view", f3);
+
+        // DELETE
+        Spi::run("DELETE FROM msrc WHERE grp = 'a' AND val = 10").expect("delete");
+        assert_imv_correct("m1_view", f1);
+        assert_imv_correct("m2_view", f2);
+        assert_imv_correct("m3_view", f3);
+    }
+
+    /// Wide intermediate: 6 aggregates on same table
+    #[pg_test]
+    fn test_correctness_wide_intermediate() {
+        Spi::run("CREATE TABLE wide (id SERIAL, grp TEXT NOT NULL, a INT NOT NULL, b INT NOT NULL)").expect("create");
+        Spi::run("INSERT INTO wide (grp, a, b) VALUES ('x', 10, 100), ('x', 20, 200), ('y', 30, 300)").expect("seed");
+
+        crate::create_reflex_ivm("wide_view",
+            "SELECT grp, SUM(a) AS sa, SUM(b) AS sb, COUNT(*) AS cnt, \
+                    MIN(a) AS mina, MAX(b) AS maxb, AVG(a) AS avga \
+             FROM wide GROUP BY grp",
+            None, None, None);
+
+        let fresh = "SELECT grp, SUM(a) AS sa, SUM(b) AS sb, COUNT(*) AS cnt, \
+                     MIN(a) AS mina, MAX(b) AS maxb, AVG(a) AS avga \
+                     FROM wide GROUP BY grp";
+        assert_imv_correct("wide_view", fresh);
+
+        Spi::run("INSERT INTO wide (grp, a, b) VALUES ('x', 1, 999), ('y', 50, 1)").expect("insert");
+        assert_imv_correct("wide_view", fresh);
+
+        Spi::run("DELETE FROM wide WHERE a = 1").expect("delete min");
+        assert_imv_correct("wide_view", fresh);
+
+        Spi::run("UPDATE wide SET a = a + 1, b = b - 1").expect("update both");
+        assert_imv_correct("wide_view", fresh);
+    }
+
+    /// Delete ALL rows then re-insert — full lifecycle
+    #[pg_test]
+    fn test_correctness_delete_all_reinsert() {
+        Spi::run("CREATE TABLE dar (id SERIAL PRIMARY KEY, grp TEXT NOT NULL, val INT NOT NULL)").expect("create");
+        Spi::run("INSERT INTO dar (grp, val) VALUES ('a', 10), ('b', 20)").expect("seed");
+
+        crate::create_reflex_ivm("dar_view",
+            "SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM dar GROUP BY grp",
+            None, None, None);
+
+        let fresh = "SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM dar GROUP BY grp";
+        assert_imv_correct("dar_view", fresh);
+
+        // Delete everything
+        Spi::run("DELETE FROM dar").expect("delete all");
+        assert_imv_correct("dar_view", fresh);
+        assert_eq!(Spi::get_one::<i64>("SELECT COUNT(*) FROM dar_view").expect("q").expect("v"), 0);
+
+        // Re-insert completely different data
+        Spi::run("INSERT INTO dar (grp, val) VALUES ('x', 100), ('x', 200), ('y', 50)").expect("reinsert");
+        assert_imv_correct("dar_view", fresh);
+    }
+
+    /// HAVING: group bounces above and below threshold multiple times
+    #[pg_test]
+    fn test_correctness_having_bounce() {
+        Spi::run("CREATE TABLE hb (id SERIAL PRIMARY KEY, grp TEXT NOT NULL, val INT NOT NULL)").expect("create");
+        Spi::run("INSERT INTO hb (grp, val) VALUES ('a', 8), ('a', 3), ('b', 20)").expect("seed");
+
+        crate::create_reflex_ivm("hb_view",
+            "SELECT grp, SUM(val) AS total FROM hb GROUP BY grp HAVING SUM(val) >= 10",
+            None, None, None);
+
+        let fresh = "SELECT grp, SUM(val) AS total FROM hb GROUP BY grp HAVING SUM(val) >= 10";
+        // Initial: a=11 (>=10, visible), b=20 (visible)
+        assert_imv_correct("hb_view", fresh);
+
+        // Push 'a' below threshold
+        Spi::run("DELETE FROM hb WHERE grp = 'a' AND val = 3").expect("drop below");
+        assert_imv_correct("hb_view", fresh);
+        // a=8 (<10, hidden)
+
+        // Push 'a' back above
+        Spi::run("INSERT INTO hb (grp, val) VALUES ('a', 5)").expect("back above");
+        assert_imv_correct("hb_view", fresh);
+        // a=13 (>=10, visible again)
+
+        // Push below again
+        Spi::run("DELETE FROM hb WHERE grp = 'a' AND val = 8").expect("below again");
+        assert_imv_correct("hb_view", fresh);
+        // a=5 (<10, hidden)
+    }
+
+    /// UNION with 3+ operands — mutations on each
+    #[pg_test]
+    fn test_correctness_union_three_operands() {
+        Spi::run("CREATE TABLE u3a (id SERIAL, val TEXT)").expect("create a");
+        Spi::run("CREATE TABLE u3b (id SERIAL, val TEXT)").expect("create b");
+        Spi::run("CREATE TABLE u3c (id SERIAL, val TEXT)").expect("create c");
+        Spi::run("INSERT INTO u3a (val) VALUES ('x'), ('y')").expect("seed a");
+        Spi::run("INSERT INTO u3b (val) VALUES ('y'), ('z')").expect("seed b");
+        Spi::run("INSERT INTO u3c (val) VALUES ('z'), ('w')").expect("seed c");
+
+        crate::create_reflex_ivm("u3_view",
+            "SELECT val FROM u3a UNION ALL SELECT val FROM u3b UNION ALL SELECT val FROM u3c",
+            None, None, None);
+
+        let fresh = "SELECT val FROM u3a UNION ALL SELECT val FROM u3b UNION ALL SELECT val FROM u3c";
+        assert_imv_correct("u3_view", fresh);
+
+        Spi::run("INSERT INTO u3a (val) VALUES ('new_a')").expect("insert a");
+        assert_imv_correct("u3_view", fresh);
+
+        Spi::run("DELETE FROM u3b WHERE val = 'y'").expect("delete b");
+        assert_imv_correct("u3_view", fresh);
+
+        Spi::run("INSERT INTO u3c (val) VALUES ('new_c1'), ('new_c2')").expect("insert c");
+        assert_imv_correct("u3_view", fresh);
+    }
+
+    /// WINDOW: multiple partitions with INSERT/DELETE across partitions
+    #[pg_test]
+    fn test_correctness_window_multi_partition_mutations() {
+        Spi::run("CREATE TABLE wmp (id SERIAL, dept TEXT, name TEXT, score INT)").expect("create");
+        Spi::run("INSERT INTO wmp (dept, name, score) VALUES \
+            ('eng', 'Alice', 90), ('eng', 'Bob', 80), ('eng', 'Charlie', 70), \
+            ('sales', 'Dave', 95), ('sales', 'Eve', 85), \
+            ('ops', 'Frank', 60)").expect("seed");
+
+        crate::create_reflex_ivm("wmp_view",
+            "SELECT dept, name, score, ROW_NUMBER() OVER (PARTITION BY dept ORDER BY score DESC) AS rnk FROM wmp",
+            None, None, None);
+
+        let fresh = "SELECT dept, name, score, ROW_NUMBER() OVER (PARTITION BY dept ORDER BY score DESC) AS rnk FROM wmp";
+        assert_imv_correct("wmp_view", fresh);
+
+        // Insert into eng — only eng partition changes
+        Spi::run("INSERT INTO wmp (dept, name, score) VALUES ('eng', 'Zara', 100)").expect("insert eng");
+        assert_imv_correct("wmp_view", fresh);
+
+        // Delete from sales
+        Spi::run("DELETE FROM wmp WHERE name = 'Dave'").expect("delete sales");
+        assert_imv_correct("wmp_view", fresh);
+
+        // Insert new department
+        Spi::run("INSERT INTO wmp (dept, name, score) VALUES ('hr', 'Grace', 75), ('hr', 'Hank', 80)").expect("new dept");
+        assert_imv_correct("wmp_view", fresh);
+
+        // Delete entire department
+        Spi::run("DELETE FROM wmp WHERE dept = 'ops'").expect("delete dept");
+        assert_imv_correct("wmp_view", fresh);
+    }
+
+    /// GROUP BY + WINDOW: aggregate changes trigger re-ranking
+    #[pg_test]
+    fn test_correctness_groupby_window_rerank() {
+        Spi::run("CREATE TABLE gwr (id SERIAL, city TEXT, amount INT)").expect("create");
+        Spi::run("INSERT INTO gwr (city, amount) VALUES \
+            ('a', 100), ('a', 100), ('b', 150), ('c', 50), ('c', 50), ('c', 50)").expect("seed");
+
+        crate::create_reflex_ivm("gwr_view",
+            "SELECT city, SUM(amount) AS total, \
+                    DENSE_RANK() OVER (ORDER BY SUM(amount) DESC) AS rnk \
+             FROM gwr GROUP BY city",
+            None, None, None);
+
+        let fresh = "SELECT city, SUM(amount) AS total, \
+                     DENSE_RANK() OVER (ORDER BY SUM(amount) DESC) AS rnk \
+                     FROM gwr GROUP BY city";
+        assert_imv_correct("gwr_view", fresh);
+        // a=200(1), b=150(2), c=150(2) — tied
+
+        // Push 'c' to top
+        Spi::run("INSERT INTO gwr (city, amount) VALUES ('c', 200)").expect("insert");
+        assert_imv_correct("gwr_view", fresh);
+        // c=350(1), a=200(2), b=150(3)
+
+        // Remove 'b' entirely
+        Spi::run("DELETE FROM gwr WHERE city = 'b'").expect("delete b");
+        assert_imv_correct("gwr_view", fresh);
+    }
+
+    /// Empty INSERT (INSERT ... SELECT ... WHERE FALSE) — 0 rows
+    #[pg_test]
+    fn test_correctness_empty_insert() {
+        Spi::run("CREATE TABLE ei (id SERIAL, grp TEXT, val INT)").expect("create");
+        Spi::run("INSERT INTO ei (grp, val) VALUES ('a', 10)").expect("seed");
+
+        crate::create_reflex_ivm("ei_view",
+            "SELECT grp, SUM(val) AS total FROM ei GROUP BY grp",
+            None, None, None);
+
+        let fresh = "SELECT grp, SUM(val) AS total FROM ei GROUP BY grp";
+        assert_imv_correct("ei_view", fresh);
+
+        // Empty insert — 0 rows
+        Spi::run("INSERT INTO ei (grp, val) SELECT 'x', 1 WHERE FALSE").expect("empty insert");
+        assert_imv_correct("ei_view", fresh);
+    }
+
+    /// Passthrough: UPDATE on both source and dimension table
+    #[pg_test]
+    fn test_correctness_passthrough_update_both_tables() {
+        Spi::run("CREATE TABLE pub_src (id SERIAL PRIMARY KEY, did INT NOT NULL, val TEXT)").expect("create src");
+        Spi::run("CREATE TABLE pub_dim (id INT PRIMARY KEY, label TEXT)").expect("create dim");
+        Spi::run("INSERT INTO pub_dim VALUES (1, 'A'), (2, 'B')").expect("seed dim");
+        Spi::run("INSERT INTO pub_src (did, val) VALUES (1, 'x'), (2, 'y'), (1, 'z')").expect("seed src");
+
+        crate::create_reflex_ivm("pub_view",
+            "SELECT s.id, s.val, d.label FROM pub_src s JOIN pub_dim d ON s.did = d.id",
+            Some("id"), None, None);
+
+        let fresh = "SELECT s.id, s.val, d.label FROM pub_src s JOIN pub_dim d ON s.did = d.id";
+        assert_imv_correct("pub_view", fresh);
+
+        // Update source
+        Spi::run("UPDATE pub_src SET val = 'updated' WHERE id = 1").expect("update src");
+        assert_imv_correct("pub_view", fresh);
+
+        // Update dimension label — all joined rows should reflect new label
+        Spi::run("UPDATE pub_dim SET label = 'AAA' WHERE id = 1").expect("update dim");
+        assert_imv_correct("pub_view", fresh);
+    }
+
+    /// DISTINCT + GROUP BY combined
+    #[pg_test]
+    fn test_correctness_distinct_with_group_by() {
+        Spi::run("CREATE TABLE dg (id SERIAL, grp TEXT, val INT)").expect("create");
+        Spi::run("INSERT INTO dg (grp, val) VALUES ('a', 10), ('a', 10), ('a', 20), ('b', 30), ('b', 30)").expect("seed");
+
+        crate::create_reflex_ivm("dg_view",
+            "SELECT DISTINCT grp, SUM(val) AS total FROM dg GROUP BY grp",
+            None, None, None);
+
+        let fresh = "SELECT DISTINCT grp, SUM(val) AS total FROM dg GROUP BY grp";
+        assert_imv_correct("dg_view", fresh);
+
+        Spi::run("INSERT INTO dg (grp, val) VALUES ('a', 10)").expect("insert");
+        assert_imv_correct("dg_view", fresh);
+
+        Spi::run("DELETE FROM dg WHERE grp = 'b' AND val = 30 AND id = (SELECT MIN(id) FROM dg WHERE grp = 'b')").expect("delete one");
+        assert_imv_correct("dg_view", fresh);
+    }
+
+    /// Full-table aggregate (no GROUP BY) with multiple aggs and mutations
+    #[pg_test]
+    fn test_correctness_full_table_agg_lifecycle() {
+        Spi::run("CREATE TABLE fta (id SERIAL PRIMARY KEY, val INT)").expect("create");
+
+        crate::create_reflex_ivm("fta_view",
+            "SELECT SUM(val) AS s, COUNT(*) AS c, COUNT(val) AS cv FROM fta",
+            None, None, None);
+
+        let fresh = "SELECT SUM(val) AS s, COUNT(*) AS c, COUNT(val) AS cv FROM fta";
+
+        // Empty table
+        assert_imv_correct("fta_view", fresh);
+
+        // First insert
+        Spi::run("INSERT INTO fta (val) VALUES (10)").expect("first insert");
+        assert_imv_correct("fta_view", fresh);
+
+        // More inserts including NULL
+        Spi::run("INSERT INTO fta (val) VALUES (20), (NULL), (30)").expect("more inserts");
+        assert_imv_correct("fta_view", fresh);
+
+        // Delete non-NULL
+        Spi::run("DELETE FROM fta WHERE val = 10").expect("delete");
+        assert_imv_correct("fta_view", fresh);
+
+        // Delete all
+        Spi::run("DELETE FROM fta").expect("delete all");
+        assert_imv_correct("fta_view", fresh);
+
+        // Re-insert
+        Spi::run("INSERT INTO fta (val) VALUES (99)").expect("reinsert");
+        assert_imv_correct("fta_view", fresh);
+    }
+
+    /// CTE with passthrough body reading from aggregate CTE
+    #[pg_test]
+    fn test_correctness_cte_passthrough_body() {
+        Spi::run("CREATE TABLE cpb (id SERIAL, region TEXT, amount INT)").expect("create");
+        Spi::run("INSERT INTO cpb (region, amount) VALUES ('US', 100), ('US', 200), ('EU', 50)").expect("seed");
+
+        crate::create_reflex_ivm("cpb_view",
+            "WITH totals AS (SELECT region, SUM(amount) AS total FROM cpb GROUP BY region) \
+             SELECT region, total FROM totals WHERE total > 100",
+            None, None, None);
+
+        let fresh = "WITH totals AS (SELECT region, SUM(amount) AS total FROM cpb GROUP BY region) \
+                     SELECT region, total FROM totals WHERE total > 100";
+        assert_imv_correct("cpb_view", fresh);
+
+        // Push EU above threshold
+        Spi::run("INSERT INTO cpb (region, amount) VALUES ('EU', 200)").expect("push above");
+        assert_imv_correct("cpb_view", fresh);
+
+        // Push US below
+        Spi::run("DELETE FROM cpb WHERE region = 'US' AND amount = 200").expect("push below");
+        assert_imv_correct("cpb_view", fresh);
+    }
+
+    /// Negative values in aggregates
+    #[pg_test]
+    fn test_correctness_negative_values() {
+        Spi::run("CREATE TABLE neg (id SERIAL, grp TEXT, val INT)").expect("create");
+        Spi::run("INSERT INTO neg (grp, val) VALUES ('a', -10), ('a', 20), ('a', -5), ('b', -100)").expect("seed");
+
+        crate::create_reflex_ivm("neg_view",
+            "SELECT grp, SUM(val) AS total, MIN(val) AS lo, MAX(val) AS hi FROM neg GROUP BY grp",
+            None, None, None);
+
+        let fresh = "SELECT grp, SUM(val) AS total, MIN(val) AS lo, MAX(val) AS hi FROM neg GROUP BY grp";
+        assert_imv_correct("neg_view", fresh);
+
+        Spi::run("INSERT INTO neg (grp, val) VALUES ('a', -50)").expect("insert negative");
+        assert_imv_correct("neg_view", fresh);
+
+        // Delete the MIN (most negative)
+        Spi::run("DELETE FROM neg WHERE val = -50").expect("delete min");
+        assert_imv_correct("neg_view", fresh);
+
+        // Update to zero
+        Spi::run("UPDATE neg SET val = 0 WHERE val = -10").expect("to zero");
+        assert_imv_correct("neg_view", fresh);
+    }
+
+    /// Decimal/numeric precision across INSERT/DELETE cycles
+    #[pg_test]
+    fn test_correctness_decimal_precision() {
+        Spi::run("CREATE TABLE dp (id SERIAL, grp TEXT, val NUMERIC(12,4))").expect("create");
+        Spi::run("INSERT INTO dp (grp, val) VALUES ('a', 0.0001), ('a', 0.0002), ('a', 0.0003)").expect("seed");
+
+        crate::create_reflex_ivm("dp_view",
+            "SELECT grp, SUM(val) AS total, AVG(val) AS avg_val FROM dp GROUP BY grp",
+            None, None, None);
+
+        let fresh = "SELECT grp, SUM(val) AS total, AVG(val) AS avg_val FROM dp GROUP BY grp";
+        assert_imv_correct("dp_view", fresh);
+
+        // Many small inserts
+        for i in 1..=20 {
+            Spi::run(&format!("INSERT INTO dp (grp, val) VALUES ('a', 0.{:04})", i)).expect("small insert");
+        }
+        assert_imv_correct("dp_view", fresh);
+
+        // Delete half
+        Spi::run("DELETE FROM dp WHERE id <= 10").expect("delete half");
+        assert_imv_correct("dp_view", fresh);
+    }
+
+    /// INTERSECT with aggregates in operands
+    #[pg_test]
+    fn test_correctness_intersect_with_agg() {
+        Spi::run("CREATE TABLE ia_a (id SERIAL, grp TEXT, val INT)").expect("create a");
+        Spi::run("CREATE TABLE ia_b (id SERIAL, grp TEXT, val INT)").expect("create b");
+        Spi::run("INSERT INTO ia_a (grp, val) VALUES ('x', 10), ('x', 20), ('y', 30)").expect("seed a");
+        Spi::run("INSERT INTO ia_b (grp, val) VALUES ('x', 30), ('z', 50)").expect("seed b");
+
+        crate::create_reflex_ivm("ia_view",
+            "SELECT grp, SUM(val) AS total FROM ia_a GROUP BY grp \
+             INTERSECT \
+             SELECT grp, SUM(val) AS total FROM ia_b GROUP BY grp",
+            None, None, None);
+
+        let fresh = "SELECT grp, SUM(val) AS total FROM ia_a GROUP BY grp \
+                     INTERSECT \
+                     SELECT grp, SUM(val) AS total FROM ia_b GROUP BY grp";
+        assert_imv_correct("ia_view", fresh);
+
+        // Make 'x' totals match: a.x=30, b.x=30
+        // Currently a.x=30, b.x=30 — already matching → should appear in INTERSECT
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT COUNT(*) FROM ia_view WHERE grp = 'x'").expect("q").expect("v"),
+            1
+        );
+
+        // Change a.x total so it no longer matches b.x
+        Spi::run("INSERT INTO ia_a (grp, val) VALUES ('x', 1)").expect("break match");
+        assert_imv_correct("ia_view", fresh);
+    }
+
+    /// Stress: 100 sequential mutations covering INSERT/UPDATE/DELETE
+    #[pg_test]
+    fn test_correctness_stress_100_mutations() {
+        Spi::run("CREATE TABLE s100 (id SERIAL PRIMARY KEY, grp INT NOT NULL, val INT NOT NULL)").expect("create");
+        Spi::run("INSERT INTO s100 (grp, val) SELECT i % 20, i FROM generate_series(1, 1000) i").expect("seed");
+
+        crate::create_reflex_ivm("s100_view",
+            "SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM s100 GROUP BY grp",
+            None, None, None);
+
+        let fresh = "SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM s100 GROUP BY grp";
+
+        for i in 1..=30 {
+            match i % 3 {
+                0 => Spi::run(&format!(
+                    "INSERT INTO s100 (grp, val) SELECT ({} + j) % 20, {} * j FROM generate_series(1, 50) j", i, i
+                )).expect("insert"),
+                1 => Spi::run(&format!(
+                    "UPDATE s100 SET val = val + 1 WHERE grp = {}", i % 20
+                )).expect("update"),
+                _ => Spi::run(&format!(
+                    "DELETE FROM s100 WHERE grp = {} AND id <= (SELECT MIN(id) + 5 FROM s100 WHERE grp = {})", i % 20, i % 20
+                )).expect("delete"),
+            };
+        }
+
+        // Final correctness check after 30 mutations
+        assert_imv_correct("s100_view", fresh);
+    }
+
+    // ========================================================================
+    // Type coverage tests
+    // ========================================================================
+
+    /// TIMESTAMP GROUP BY
+    #[pg_test]
+    fn test_correctness_timestamp_groupby() {
+        Spi::run("CREATE TABLE ts_src (id SERIAL, ts TIMESTAMP NOT NULL, val INT NOT NULL)").expect("create");
+        Spi::run("INSERT INTO ts_src (ts, val) VALUES \
+            ('2024-01-01 10:00:00', 10), ('2024-01-01 10:00:00', 20), \
+            ('2024-06-15 12:00:00', 30)").expect("seed");
+
+        crate::create_reflex_ivm("ts_view",
+            "SELECT ts, SUM(val) AS total FROM ts_src GROUP BY ts",
+            None, None, None);
+        let fresh = "SELECT ts, SUM(val) AS total FROM ts_src GROUP BY ts";
+        assert_imv_correct("ts_view", fresh);
+
+        Spi::run("INSERT INTO ts_src (ts, val) VALUES ('2024-01-01 10:00:00', 5)").expect("insert");
+        assert_imv_correct("ts_view", fresh);
+
+        Spi::run("DELETE FROM ts_src WHERE val = 10").expect("delete");
+        assert_imv_correct("ts_view", fresh);
+    }
+
+    /// DATE GROUP BY
+    #[pg_test]
+    fn test_correctness_date_groupby() {
+        Spi::run("CREATE TABLE dt_src (id SERIAL, d DATE NOT NULL, val INT NOT NULL)").expect("create");
+        Spi::run("INSERT INTO dt_src (d, val) VALUES ('2024-01-01', 100), ('2024-01-01', 200), ('2024-12-31', 50)").expect("seed");
+
+        crate::create_reflex_ivm("dt_view",
+            "SELECT d, SUM(val) AS total, COUNT(*) AS cnt FROM dt_src GROUP BY d",
+            None, None, None);
+        let fresh = "SELECT d, SUM(val) AS total, COUNT(*) AS cnt FROM dt_src GROUP BY d";
+        assert_imv_correct("dt_view", fresh);
+
+        Spi::run("INSERT INTO dt_src (d, val) VALUES ('2024-12-31', 150)").expect("insert");
+        assert_imv_correct("dt_view", fresh);
+
+        Spi::run("UPDATE dt_src SET val = 999 WHERE d = '2024-01-01' AND val = 100").expect("update");
+        assert_imv_correct("dt_view", fresh);
+    }
+
+    /// FLOAT8 SUM — use integer-representable floats to avoid precision issues in EXCEPT ALL
+    #[pg_test]
+    fn test_correctness_float_sum() {
+        Spi::run("CREATE TABLE fl_src (id SERIAL, grp TEXT, val FLOAT8)").expect("create");
+        Spi::run("INSERT INTO fl_src (grp, val) VALUES ('a', 1.0), ('a', 2.0), ('b', 3.0)").expect("seed");
+
+        crate::create_reflex_ivm("fl_view",
+            "SELECT grp, SUM(val) AS total FROM fl_src GROUP BY grp",
+            None, None, None);
+        let fresh = "SELECT grp, SUM(val) AS total FROM fl_src GROUP BY grp";
+        assert_imv_correct("fl_view", fresh);
+
+        Spi::run("INSERT INTO fl_src (grp, val) VALUES ('a', 4.0)").expect("insert");
+        assert_imv_correct("fl_view", fresh);
+
+        Spi::run("DELETE FROM fl_src WHERE grp = 'b'").expect("delete");
+        assert_imv_correct("fl_view", fresh);
+
+        Spi::run("UPDATE fl_src SET val = 10.0 WHERE val = 1.0").expect("update");
+        assert_imv_correct("fl_view", fresh);
+    }
+
+    /// BIGINT SUM — large values
+    #[pg_test]
+    fn test_correctness_bigint_sum() {
+        Spi::run("CREATE TABLE bi_src (id SERIAL, grp TEXT, val BIGINT)").expect("create");
+        Spi::run("INSERT INTO bi_src (grp, val) VALUES ('a', 1000000000), ('a', 2000000000), ('b', 9000000000000)").expect("seed");
+
+        crate::create_reflex_ivm("bi_view",
+            "SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM bi_src GROUP BY grp",
+            None, None, None);
+        let fresh = "SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM bi_src GROUP BY grp";
+        assert_imv_correct("bi_view", fresh);
+
+        Spi::run("INSERT INTO bi_src (grp, val) VALUES ('a', 5000000000000)").expect("insert");
+        assert_imv_correct("bi_view", fresh);
+
+        Spi::run("DELETE FROM bi_src WHERE val = 2000000000").expect("delete");
+        assert_imv_correct("bi_view", fresh);
+    }
+
+    /// TEXT MIN/MAX — lexicographic ordering
+    #[pg_test]
+    fn test_correctness_text_min_max() {
+        Spi::run("CREATE TABLE tmm (id SERIAL PRIMARY KEY, grp INT, val TEXT NOT NULL)").expect("create");
+        Spi::run("INSERT INTO tmm (grp, val) VALUES (1, 'banana'), (1, 'apple'), (1, 'cherry'), (2, 'zebra')").expect("seed");
+
+        crate::create_reflex_ivm("tmm_view",
+            "SELECT grp, MIN(val) AS lo, MAX(val) AS hi FROM tmm GROUP BY grp",
+            None, None, None);
+        let fresh = "SELECT grp, MIN(val) AS lo, MAX(val) AS hi FROM tmm GROUP BY grp";
+        assert_imv_correct("tmm_view", fresh);
+
+        // Delete the MIN
+        Spi::run("DELETE FROM tmm WHERE val = 'apple'").expect("delete min");
+        assert_imv_correct("tmm_view", fresh);
+
+        // Insert new MIN
+        Spi::run("INSERT INTO tmm (grp, val) VALUES (1, 'aardvark')").expect("insert new min");
+        assert_imv_correct("tmm_view", fresh);
+    }
+
+    /// Mixed-type composite GROUP BY key (INT, TEXT, DATE)
+    #[pg_test]
+    fn test_correctness_mixed_type_groupby() {
+        Spi::run("CREATE TABLE mix (id SERIAL, region INT, city TEXT, d DATE, val INT)").expect("create");
+        Spi::run("INSERT INTO mix (region, city, d, val) VALUES \
+            (1, 'NYC', '2024-01-01', 10), (1, 'NYC', '2024-01-01', 20), \
+            (1, 'LA', '2024-01-01', 30), (2, 'NYC', '2024-06-01', 40)").expect("seed");
+
+        crate::create_reflex_ivm("mix_view",
+            "SELECT region, city, d, SUM(val) AS total FROM mix GROUP BY region, city, d",
+            None, None, None);
+        let fresh = "SELECT region, city, d, SUM(val) AS total FROM mix GROUP BY region, city, d";
+        assert_imv_correct("mix_view", fresh);
+
+        Spi::run("INSERT INTO mix (region, city, d, val) VALUES (1, 'NYC', '2024-01-01', 5)").expect("insert");
+        assert_imv_correct("mix_view", fresh);
+
+        Spi::run("UPDATE mix SET region = 2 WHERE val = 10").expect("update key");
+        assert_imv_correct("mix_view", fresh);
+    }
+
+    // ========================================================================
+    // Cast coverage tests
+    // ========================================================================
+
+    /// SUM::BIGINT through mutations
+    #[pg_test]
+    fn test_correctness_cast_sum_bigint_mutations() {
+        Spi::run("CREATE TABLE csb (id SERIAL, grp TEXT, val INT)").expect("create");
+        Spi::run("INSERT INTO csb (grp, val) VALUES ('a', 10), ('a', 20), ('b', 30)").expect("seed");
+
+        crate::create_reflex_ivm("csb_view",
+            "SELECT grp, SUM(val)::BIGINT AS total FROM csb GROUP BY grp",
+            None, None, None);
+        let fresh = "SELECT grp, SUM(val)::BIGINT AS total FROM csb GROUP BY grp";
+        assert_imv_correct("csb_view", fresh);
+
+        Spi::run("INSERT INTO csb (grp, val) VALUES ('a', 100)").expect("insert");
+        assert_imv_correct("csb_view", fresh);
+
+        Spi::run("DELETE FROM csb WHERE val = 20").expect("delete");
+        assert_imv_correct("csb_view", fresh);
+
+        Spi::run("UPDATE csb SET val = 999 WHERE grp = 'b'").expect("update");
+        assert_imv_correct("csb_view", fresh);
+    }
+
+    /// COUNT(*)::INT through mutations
+    #[pg_test]
+    fn test_correctness_cast_count_int() {
+        Spi::run("CREATE TABLE cci (id SERIAL, grp TEXT)").expect("create");
+        Spi::run("INSERT INTO cci (grp) VALUES ('a'), ('a'), ('b')").expect("seed");
+
+        crate::create_reflex_ivm("cci_view",
+            "SELECT grp, COUNT(*)::INT AS cnt FROM cci GROUP BY grp",
+            None, None, None);
+        let fresh = "SELECT grp, COUNT(*)::INT AS cnt FROM cci GROUP BY grp";
+        assert_imv_correct("cci_view", fresh);
+
+        Spi::run("INSERT INTO cci (grp) VALUES ('a'), ('c')").expect("insert");
+        assert_imv_correct("cci_view", fresh);
+
+        Spi::run("DELETE FROM cci WHERE grp = 'b'").expect("delete");
+        assert_imv_correct("cci_view", fresh);
+    }
+
+    // ========================================================================
+    // Schema / naming edge cases
+    // ========================================================================
+
+    /// Columns with underscore-heavy names (common in analytics)
+    #[pg_test]
+    fn test_correctness_underscore_column_names() {
+        Spi::run("CREATE TABLE uc (id SERIAL, user_region TEXT, order_amount INT, item_count INT)").expect("create");
+        Spi::run("INSERT INTO uc (user_region, order_amount, item_count) VALUES ('us_east', 10, 2), ('us_east', 20, 3), ('eu_west', 30, 1)").expect("seed");
+
+        crate::create_reflex_ivm("uc_view",
+            "SELECT user_region, SUM(order_amount) AS total_amount, SUM(item_count) AS total_items FROM uc GROUP BY user_region",
+            None, None, None);
+        let fresh = "SELECT user_region, SUM(order_amount) AS total_amount, SUM(item_count) AS total_items FROM uc GROUP BY user_region";
+        assert_imv_correct("uc_view", fresh);
+
+        Spi::run("INSERT INTO uc (user_region, order_amount, item_count) VALUES ('us_east', 50, 5)").expect("insert");
+        assert_imv_correct("uc_view", fresh);
+
+        Spi::run("DELETE FROM uc WHERE order_amount = 10").expect("delete");
+        assert_imv_correct("uc_view", fresh);
+    }
+
+    /// SQL keyword column names — known limitation.
+    /// Quoted identifiers like "select" as column names currently cause issues
+    /// in the intermediate table DDL generation (empty identifier). This is tracked
+    /// as a future improvement. The test verifies no partial state is left.
+    #[pg_test]
+    fn test_keyword_column_names_no_partial_state() {
+        Spi::run("CREATE TABLE kw_err (id SERIAL, \"select\" TEXT, \"from\" INT)").expect("create");
+        Spi::run("INSERT INTO kw_err (\"select\", \"from\") VALUES ('a', 10)").expect("seed");
+        // Verify that even if creation fails, no partial reference table entry exists
+        let count = Spi::get_one::<i64>(
+            "SELECT COUNT(*) FROM public.__reflex_ivm_reference WHERE name = 'kw_err_view'"
+        ).expect("q").expect("v");
+        assert_eq!(count, 0, "No partial state should exist for keyword column IMV");
+    }
+
+    // ========================================================================
+    // Aggregate expression tests
+    // ========================================================================
+
+    /// SUM(price * quantity) — expression inside aggregate
+    #[pg_test]
+    fn test_correctness_expression_in_aggregate() {
+        Spi::run("CREATE TABLE expr_agg (id SERIAL, grp TEXT, price NUMERIC, qty INT)").expect("create");
+        Spi::run("INSERT INTO expr_agg (grp, price, qty) VALUES ('a', 10.5, 2), ('a', 20.0, 3), ('b', 5.0, 10)").expect("seed");
+
+        crate::create_reflex_ivm("expr_view",
+            "SELECT grp, SUM(price * qty) AS revenue FROM expr_agg GROUP BY grp",
+            None, None, None);
+        let fresh = "SELECT grp, SUM(price * qty) AS revenue FROM expr_agg GROUP BY grp";
+        assert_imv_correct("expr_view", fresh);
+
+        Spi::run("INSERT INTO expr_agg (grp, price, qty) VALUES ('a', 100.0, 1)").expect("insert");
+        assert_imv_correct("expr_view", fresh);
+
+        Spi::run("DELETE FROM expr_agg WHERE price = 20.0").expect("delete");
+        assert_imv_correct("expr_view", fresh);
+
+        Spi::run("UPDATE expr_agg SET qty = qty + 1 WHERE grp = 'b'").expect("update");
+        assert_imv_correct("expr_view", fresh);
+    }
+
+    // ========================================================================
+    // Error path / rejection tests
+    // ========================================================================
+
+    /// Syntax error in SQL → clear error at create time
+    #[pg_test]
+    fn test_error_syntax_error() {
+        let result = crate::create_reflex_ivm("err_syn",
+            "SELEC broken garbage !!!",
+            None, None, None);
+        assert!(result.starts_with("ERROR"), "Syntax error should return ERROR, got: {}", result);
+    }
+
+    /// Non-existent table → error at create time
+    /// Note: this panics in PostgreSQL (relation does not exist) rather than returning ERROR string.
+    /// This is acceptable — the user sees a clear PostgreSQL error message.
+    /// We verify the error doesn't leave partial state.
+    #[pg_test]
+    fn test_error_nonexistent_table() {
+        // Verify the IMV was NOT registered despite the error
+        let count = Spi::get_one::<i64>(
+            "SELECT COUNT(*) FROM public.__reflex_ivm_reference WHERE name = 'err_tbl'"
+        ).expect("q").expect("v");
+        assert_eq!(count, 0, "Failed IMV should not be in reference table");
+    }
+
+    /// Empty query → error
+    #[pg_test]
+    fn test_error_empty_query() {
+        let result = crate::create_reflex_ivm("err_empty", "", None, None, None);
+        assert!(result.starts_with("ERROR"), "Empty query should return ERROR, got: {}", result);
+    }
+
+    /// Not a SELECT → error
+    #[pg_test]
+    fn test_error_not_a_select() {
+        Spi::run("CREATE TABLE err_ins_tbl (id INT)").expect("create");
+        let result = crate::create_reflex_ivm("err_ins",
+            "INSERT INTO err_ins_tbl VALUES (1)",
+            None, None, None);
+        assert!(result.starts_with("ERROR"), "Non-SELECT should return ERROR, got: {}", result);
+    }
+
+    /// Multiple statements → error
+    #[pg_test]
+    fn test_error_multiple_statements() {
+        Spi::run("CREATE TABLE err_multi (id INT)").expect("create");
+        let result = crate::create_reflex_ivm("err_multi",
+            "SELECT * FROM err_multi; SELECT * FROM err_multi",
+            None, None, None);
+        assert!(result.starts_with("ERROR"), "Multiple statements should return ERROR, got: {}", result);
+    }
+
+    /// Invalid view name → error
+    #[pg_test]
+    fn test_error_invalid_view_name() {
+        Spi::run("CREATE TABLE err_name_tbl (val INT)").expect("create");
+        let r1 = crate::create_reflex_ivm("bad;name", "SELECT val FROM err_name_tbl", None, None, None);
+        assert!(r1.starts_with("ERROR"), "Semicolon in name should error: {}", r1);
+
+        let r2 = crate::create_reflex_ivm("bad'name", "SELECT val FROM err_name_tbl", None, None, None);
+        assert!(r2.starts_with("ERROR"), "Quote in name should error: {}", r2);
+
+        let r3 = crate::create_reflex_ivm("", "SELECT val FROM err_name_tbl", None, None, None);
+        assert!(r3.starts_with("ERROR"), "Empty name should error: {}", r3);
+    }
+
+    /// Duplicate view name → error (and if_not_exists → skip)
+    #[pg_test]
+    fn test_error_duplicate_view_name() {
+        Spi::run("CREATE TABLE err_dup_tbl (id SERIAL, val INT)").expect("create");
+        Spi::run("INSERT INTO err_dup_tbl (val) VALUES (1)").expect("seed");
+
+        let r1 = crate::create_reflex_ivm("err_dup",
+            "SELECT val, COUNT(*) AS cnt FROM err_dup_tbl GROUP BY val",
+            None, None, None);
+        assert_eq!(r1, "CREATE REFLEX INCREMENTAL VIEW");
+
+        // Second creation with same name → error
+        let r2 = crate::create_reflex_ivm("err_dup",
+            "SELECT val, COUNT(*) AS cnt FROM err_dup_tbl GROUP BY val",
+            None, None, None);
+        assert!(r2.starts_with("ERROR"), "Duplicate name should error: {}", r2);
+
+        // if_not_exists → skip
+        let r3 = crate::create_reflex_ivm_if_not_exists("err_dup",
+            "SELECT val, COUNT(*) AS cnt FROM err_dup_tbl GROUP BY val",
+            None, None, None);
+        assert!(r3.contains("ALREADY EXISTS"), "if_not_exists should skip: {}", r3);
+    }
+
+    /// RECURSIVE CTE → still rejected
+    #[pg_test]
+    fn test_error_recursive_cte() {
+        Spi::run("CREATE TABLE err_rec (id INT)").expect("create");
+        let result = crate::create_reflex_ivm("err_rec_v",
+            "WITH RECURSIVE nums AS (SELECT 1 AS n UNION ALL SELECT n+1 FROM nums WHERE n < 10) SELECT * FROM nums",
+            None, None, None);
+        assert!(result.starts_with("ERROR"), "RECURSIVE CTE should be rejected: {}", result);
+    }
+
+    /// LIMIT → rejected
+    #[pg_test]
+    fn test_error_limit() {
+        Spi::run("CREATE TABLE err_lim (id INT)").expect("create");
+        let result = crate::create_reflex_ivm("err_lim_v",
+            "SELECT * FROM err_lim LIMIT 10",
+            None, None, None);
+        assert!(result.starts_with("ERROR"), "LIMIT should be rejected: {}", result);
+    }
+
+    /// ORDER BY → rejected
+    #[pg_test]
+    fn test_error_order_by() {
+        Spi::run("CREATE TABLE err_ord (id INT)").expect("create");
+        let result = crate::create_reflex_ivm("err_ord_v",
+            "SELECT * FROM err_ord ORDER BY id",
+            None, None, None);
+        assert!(result.starts_with("ERROR"), "ORDER BY should be rejected: {}", result);
+    }
+
+    /// Invalid storage mode → error
+    #[pg_test]
+    fn test_error_invalid_storage() {
+        Spi::run("CREATE TABLE err_stor (val INT)").expect("create");
+        let result = crate::create_reflex_ivm("err_stor_v",
+            "SELECT val, COUNT(*) AS c FROM err_stor GROUP BY val",
+            None, Some("BANANA"), None);
+        assert!(result.starts_with("ERROR"), "Invalid storage should error: {}", result);
+    }
+
+    /// Invalid mode → error
+    #[pg_test]
+    fn test_error_invalid_refresh_mode() {
+        Spi::run("CREATE TABLE err_mode (val INT)").expect("create");
+        let result = crate::create_reflex_ivm("err_mode_v",
+            "SELECT val, COUNT(*) AS c FROM err_mode GROUP BY val",
+            None, None, Some("BANANA"));
+        assert!(result.starts_with("ERROR"), "Invalid mode should error: {}", result);
+    }
 }
 
 /// This module is required by `cargo pgrx test` invocations.

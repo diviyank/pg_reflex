@@ -274,17 +274,26 @@ pub fn generate_end_query(view_name: &str, plan: &AggregationPlan) -> String {
         select_parts.push(format!("\"{}\"", norm));
     }
 
-    // End query aggregate expressions (with optional cast)
+    // End query aggregate expressions (with optional cast).
+    // For sentinel-only (no GROUP BY): wrap SUM/AVG in NULLIF guard so empty table
+    // returns NULL (matching PostgreSQL's SUM/AVG on empty result).
+    let is_sentinel = plan.group_by_columns.is_empty() && plan.distinct_columns.is_empty();
     for mapping in &plan.end_query_mappings {
+        let expr = if is_sentinel && matches!(mapping.aggregate_type.as_str(), "SUM" | "AVG" | "MIN" | "MAX") {
+            format!("CASE WHEN __ivm_count > 0 THEN {} END", mapping.intermediate_expr)
+        } else {
+            mapping.intermediate_expr.clone()
+        };
+
         if let Some(ref cast) = mapping.cast_type {
             select_parts.push(format!(
                 "({})::{} AS \"{}\"",
-                mapping.intermediate_expr, cast, mapping.output_alias
+                expr, cast, mapping.output_alias
             ));
         } else {
             select_parts.push(format!(
                 "{} AS \"{}\"",
-                mapping.intermediate_expr, mapping.output_alias
+                expr, mapping.output_alias
             ));
         }
     }
@@ -294,7 +303,10 @@ pub fn generate_end_query(view_name: &str, plan: &AggregationPlan) -> String {
 
     // Filter out groups with zero reference count.
     // This ensures deleted groups disappear from the target.
-    if plan.needs_ivm_count {
+    // Exception: sentinel-only aggregates (no GROUP BY) must always return exactly
+    // one row, matching PostgreSQL's behavior of SELECT SUM(x) FROM empty_table → (NULL).
+    let is_sentinel = plan.group_by_columns.is_empty() && plan.distinct_columns.is_empty();
+    if plan.needs_ivm_count && !is_sentinel {
         query.push_str(" WHERE __ivm_count > 0");
     }
 

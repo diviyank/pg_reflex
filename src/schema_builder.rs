@@ -52,8 +52,25 @@ pub fn build_intermediate_table_ddl(
 
     // Intermediate aggregate columns
     for ic in &plan.intermediate_columns {
-        let default = if ic.pg_type == "BOOLEAN" { "FALSE" } else { "0" };
-        columns.push(format!("    \"{}\" {} DEFAULT {}", ic.name, ic.pg_type, default));
+        // For MIN/MAX, resolve the actual source column type from catalog
+        // instead of using the hardcoded NUMERIC (which breaks for TEXT, DATE, etc.)
+        let effective_type = if (ic.source_aggregate == "MIN" || ic.source_aggregate == "MAX")
+            && ic.pg_type == "NUMERIC"
+        {
+            resolve_column_type(&ic.source_arg, column_types, &ic.pg_type)
+        } else {
+            ic.pg_type.clone()
+        };
+        let default = match effective_type.as_str() {
+            "BOOLEAN" => "FALSE",
+            t if t.to_uppercase().starts_with("TEXT")
+                || t.to_uppercase().starts_with("VARCHAR")
+                || t.to_uppercase().starts_with("CHAR") => "''",
+            t if t.to_uppercase().contains("TIMESTAMP")
+                || t.to_uppercase().contains("DATE") => "'epoch'",
+            _ => "0",
+        };
+        columns.push(format!("    \"{}\" {} DEFAULT {}", ic.name, effective_type, default));
     }
 
     // __ivm_count for reference counting
@@ -104,14 +121,20 @@ pub fn build_target_table_ddl(
     // Output columns from end query mappings
     for mapping in &plan.end_query_mappings {
         let pg_type = if let Some(ref cast) = mapping.cast_type {
-            cast.as_str()
+            cast.to_string()
         } else {
             match mapping.aggregate_type.as_str() {
-                "SUM" | "AVG" => "NUMERIC",
-                "COUNT" => "BIGINT",
-                "MIN" | "MAX" => "NUMERIC",
-                "BOOL_OR" => "BOOLEAN",
-                _ => "TEXT",
+                "SUM" | "AVG" => "NUMERIC".to_string(),
+                "COUNT" => "BIGINT".to_string(),
+                "MIN" | "MAX" => {
+                    // Resolve from source column type — MIN/MAX return the same type as input
+                    let source_arg = mapping.intermediate_expr
+                        .trim_start_matches("__min_")
+                        .trim_start_matches("__max_");
+                    resolve_column_type(source_arg, column_types, "NUMERIC")
+                }
+                "BOOL_OR" => "BOOLEAN".to_string(),
+                _ => "TEXT".to_string(),
             }
         };
         columns.push(format!("    \"{}\" {}", mapping.output_alias, pg_type));

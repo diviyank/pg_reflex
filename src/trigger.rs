@@ -74,16 +74,19 @@ pub fn build_merge_sql(
                 set_clauses.push(format!("\"{}\" = NULL", ic.name));
             }
             _ => {
+                // COALESCE handles NULL in delta (e.g., SUM(NULL)=NULL but we need 0).
+                // Use type-appropriate default: 0 for numeric, FALSE for boolean.
+                let default_val = if ic.pg_type == "BOOLEAN" { "FALSE" } else { "0" };
                 set_clauses.push(format!(
-                    "\"{}\" = t.\"{}\" {} d.\"{}\"",
-                    ic.name, ic.name, operator, ic.name
+                    "\"{}\" = COALESCE(t.\"{}\", {}) {} COALESCE(d.\"{}\", {})",
+                    ic.name, ic.name, default_val, operator, ic.name, default_val
                 ));
             }
         }
     }
     if plan.needs_ivm_count {
         set_clauses.push(format!(
-            "__ivm_count = t.__ivm_count {} d.__ivm_count",
+            "__ivm_count = COALESCE(t.__ivm_count, 0) {} COALESCE(d.__ivm_count, 0)",
             operator
         ));
     }
@@ -97,9 +100,29 @@ pub fn build_merge_sql(
         insert_cols.push("__ivm_count".to_string());
     }
 
+    // Determine default values for INSERT COALESCE based on column types.
+    // MIN/MAX columns should NOT be coalesced — NULL is valid (means "no value").
+    // Only SUM/COUNT need COALESCE to 0 (NULL + 0 = 0, not NULL).
     let insert_vals: Vec<String> = insert_cols
         .iter()
-        .map(|c| format!("d.{}", c))
+        .map(|c| {
+            if c.starts_with("\"__") || c == "__ivm_count" {
+                // Check if this is a MIN/MAX column — don't coalesce
+                let is_min_max = plan.intermediate_columns.iter()
+                    .any(|ic| format!("\"{}\"", ic.name) == *c
+                        && (ic.source_aggregate == "MIN" || ic.source_aggregate == "MAX"));
+                if is_min_max {
+                    format!("d.{}", c) // No COALESCE for MIN/MAX
+                } else {
+                    let is_bool = plan.intermediate_columns.iter()
+                        .any(|ic| format!("\"{}\"", ic.name) == *c && ic.pg_type == "BOOLEAN");
+                    let default_val = if is_bool { "FALSE" } else { "0" };
+                    format!("COALESCE(d.{}, {})", c, default_val)
+                }
+            } else {
+                format!("d.{}", c)
+            }
+        })
         .collect();
 
     // For Subtract: omit WHEN NOT MATCHED (can't subtract from non-existent group)
@@ -178,15 +201,15 @@ fn build_net_delta_query(
     // Build aggregate expressions: for each intermediate column, compute net delta
     let mut agg_exprs: Vec<String> = Vec::new();
     for ic in &plan.intermediate_columns {
-        // SUM/COUNT: net = positive from new + negative from old
+        // SUM/COUNT: net = positive from new + negative from old. COALESCE for NULL safety.
         agg_exprs.push(format!(
-            "SUM(CASE WHEN __reflex_sign = 1 THEN \"{}\" ELSE -\"{}\" END) AS \"{}\"",
+            "SUM(CASE WHEN __reflex_sign = 1 THEN COALESCE(\"{}\", 0) ELSE -COALESCE(\"{}\", 0) END) AS \"{}\"",
             ic.name, ic.name, ic.name
         ));
     }
     if plan.needs_ivm_count {
         agg_exprs.push(
-            "SUM(CASE WHEN __reflex_sign = 1 THEN __ivm_count ELSE -__ivm_count END) AS __ivm_count".to_string()
+            "SUM(CASE WHEN __reflex_sign = 1 THEN COALESCE(__ivm_count, 0) ELSE -COALESCE(__ivm_count, 0) END) AS __ivm_count".to_string()
         );
     }
 
@@ -296,7 +319,10 @@ fn row_expr(cols: &[String]) -> String {
 /// and bare table names used as column qualifiers (e.g., `sales_simulation.product_id`).
 fn replace_source_with_transition(base_query: &str, source_table: &str, transition_tbl: &str) -> String {
     let quoted_tbl = format!("\"{}\"", transition_tbl);
-    let replaced = base_query.replace(source_table, &quoted_tbl);
+    // Use word-boundary-aware replacement to avoid corrupting column names
+    // that contain the source table name as a substring (e.g., __bool_or_flag
+    // contains "bo" when the source table is "bo").
+    let replaced = replace_identifier(base_query, source_table, &quoted_tbl);
     // Also replace unqualified table name in column qualifiers
     let (_, bare_source) = split_qualified_name(source_table);
     if bare_source != source_table {
@@ -371,7 +397,121 @@ pub fn reflex_build_delta_sql(
 
     let mut stmts: Vec<String> = Vec::new();
 
-    if plan.is_passthrough {
+    // Pre-compute group columns and affected-groups table name (used by multiple paths)
+    let grp_cols = group_columns(&plan);
+    let bare_view = split_qualified_name(view_name).1;
+    let affected_tbl = format!("__reflex_affected_{}", bare_view);
+
+    // Detect cases where standard incremental delta is incorrect:
+    // 1. Self-join: source_table appears multiple times in base_query
+    // 2. LEFT/RIGHT JOIN secondary table DELETE/UPDATE: NULL semantics can't be captured by MERGE subtract
+    let bare_source = split_qualified_name(source_table).1;
+    let (is_self_join, is_outer_join_secondary) = if !plan.is_passthrough {
+        let occurrences = base_query.split_whitespace()
+            .filter(|w| {
+                let trimmed = w.trim_matches(|c: char| !c.is_alphanumeric() && c != '_');
+                trimmed == source_table || trimmed == bare_source
+            })
+            .count();
+        let self_join = occurrences > 1;
+
+        let bq_upper = base_query.to_uppercase();
+        let outer_secondary = !self_join
+            && (operation == "DELETE" || operation == "UPDATE")
+            && (bq_upper.contains("LEFT JOIN") || bq_upper.contains("RIGHT JOIN")
+                || bq_upper.contains("LEFT OUTER") || bq_upper.contains("RIGHT OUTER"))
+            && bq_upper.find("JOIN").is_some_and(|pos| {
+                let after = &base_query[pos..];
+                after.contains(source_table) || after.contains(bare_source)
+            });
+        (self_join, outer_secondary)
+    } else {
+        (false, false)
+    };
+
+    if is_self_join && !plan.is_passthrough {
+        // Self-join: full refresh (delta itself is wrong — both aliases get replaced).
+        stmts.push(format!("TRUNCATE {}", intermediate_tbl));
+        stmts.push(format!("INSERT INTO {} {}", intermediate_tbl, base_query));
+        let qv = quote_identifier(view_name);
+        if end_query.is_empty() {
+            stmts.push(format!("TRUNCATE {}", qv));
+            stmts.push(format!("INSERT INTO {} {}", qv, base_query));
+        } else {
+            stmts.push(format!("TRUNCATE {}", qv));
+            stmts.push(format!("INSERT INTO {} {}", qv, end_query));
+        }
+    } else if is_outer_join_secondary && !plan.is_passthrough {
+        // LEFT/RIGHT JOIN secondary table DELETE/UPDATE: targeted group reconcile.
+        // The delta correctly identifies WHICH groups changed (affected groups),
+        // but the MERGE subtract produces wrong values (can't represent NULL from LEFT JOIN).
+        // Fix: extract affected groups from delta, delete them from intermediate,
+        // re-insert ONLY those groups from the full base_query.
+        if let Some(ref cols) = grp_cols {
+            let select_expr = affected_groups_select(cols);
+            let cols_str = cols.join(", ");
+            let row = row_expr(cols);
+            let qv = quote_identifier(view_name);
+
+            // Determine transition table for affected group extraction
+            let transition = if operation == "DELETE" { &old_tbl } else { &new_tbl };
+            // Build a delta query to extract group keys from transition table
+            let delta_q = replace_source_with_transition(base_query, source_table, transition);
+
+            // Create affected groups table
+            stmts.push(format!("TRUNCATE \"{}\"", affected_tbl));
+
+            // Extract affected groups from delta
+            #[cfg(not(any(feature = "pg15", feature = "pg16")))]
+            {
+                // PG17+: use a lightweight SELECT from the delta to get group keys
+                stmts.push(format!(
+                    "INSERT INTO \"{}\" SELECT DISTINCT {} FROM ({}) AS __d",
+                    affected_tbl, select_expr, delta_q
+                ));
+            }
+            #[cfg(any(feature = "pg15", feature = "pg16"))]
+            {
+                stmts.push(format!(
+                    "INSERT INTO \"{}\" SELECT DISTINCT {} FROM ({}) AS __d",
+                    affected_tbl, select_expr, delta_q
+                ));
+            }
+
+            // Delete affected groups from intermediate
+            stmts.push(format!(
+                "DELETE FROM {} WHERE {} IN (SELECT {} FROM \"{}\")",
+                intermediate_tbl, row, cols_str, affected_tbl
+            ));
+
+            // Re-insert ONLY affected groups from the FULL base_query (reads real source).
+            // Wrap base_query in subquery and filter by affected group keys.
+            stmts.push(format!(
+                "INSERT INTO {} SELECT * FROM ({}) AS __full WHERE {} IN (SELECT {} FROM \"{}\")",
+                intermediate_tbl, base_query, row, cols_str, affected_tbl
+            ));
+
+            // Targeted refresh of target (same as normal path)
+            stmts.push(format!(
+                "DELETE FROM {} WHERE {} IN (SELECT {} FROM \"{}\")",
+                qv, row, cols_str, affected_tbl
+            ));
+            stmts.push(format!(
+                "INSERT INTO {} {} AND {} IN (SELECT {} FROM \"{}\")",
+                qv, end_query, row, cols_str, affected_tbl
+            ));
+        } else {
+            // No group columns: full refresh
+            stmts.push(format!("TRUNCATE {}", intermediate_tbl));
+            stmts.push(format!("INSERT INTO {} {}", intermediate_tbl, base_query));
+            stmts.push(format!("TRUNCATE {}", quote_identifier(view_name)));
+            if end_query.is_empty() {
+                stmts.push(format!("INSERT INTO {} {}", quote_identifier(view_name), base_query));
+            } else {
+                stmts.push(format!("INSERT INTO {} {}", quote_identifier(view_name), end_query));
+            }
+        }
+    } else if plan.is_passthrough {
         let qv = quote_identifier(view_name);
         // Look up per-source column mappings for targeted DELETE/UPDATE
         let mappings = plan.passthrough_key_mappings.get(source_table);
@@ -427,11 +567,6 @@ pub fn reflex_build_delta_sql(
             .intermediate_columns
             .iter()
             .any(|ic| ic.source_aggregate == "MIN" || ic.source_aggregate == "MAX" || ic.source_aggregate == "BOOL_OR");
-
-        // Determine if we can use targeted refresh (need group columns)
-        let grp_cols = group_columns(&plan);
-        let bare_view = split_qualified_name(view_name).1;
-        let affected_tbl = format!("__reflex_affected_{}", bare_view);
 
         match operation {
             "INSERT" => {
@@ -778,8 +913,8 @@ mod tests {
         let sql = build_merge_sql("__reflex_intermediate_v", delta, &plan, DeltaOp::Add);
         assert!(sql.contains("MERGE INTO __reflex_intermediate_v AS t"));
         assert!(sql.contains("t.\"city\" = d.\"city\""));
-        assert!(sql.contains("t.\"__sum_amount\" + d.\"__sum_amount\""));
-        assert!(sql.contains("t.__ivm_count + d.__ivm_count"));
+        assert!(sql.contains("COALESCE(t.\"__sum_amount\", 0) + COALESCE(d.\"__sum_amount\", 0)"));
+        assert!(sql.contains("COALESCE(t.__ivm_count, 0) + COALESCE(d.__ivm_count, 0)"));
         assert!(sql.contains("WHEN NOT MATCHED THEN INSERT"));
     }
 
@@ -788,8 +923,8 @@ mod tests {
         let plan = simple_plan();
         let delta = "SELECT city, SUM(amount) AS \"__sum_amount\", COUNT(*) AS __ivm_count FROM \"__reflex_old_v\" GROUP BY city";
         let sql = build_merge_sql("__reflex_intermediate_v", delta, &plan, DeltaOp::Subtract);
-        assert!(sql.contains("t.\"__sum_amount\" - d.\"__sum_amount\""));
-        assert!(sql.contains("t.__ivm_count - d.__ivm_count"));
+        assert!(sql.contains("COALESCE(t.\"__sum_amount\", 0) - COALESCE(d.\"__sum_amount\", 0)"));
+        assert!(sql.contains("COALESCE(t.__ivm_count, 0) - COALESCE(d.__ivm_count, 0)"));
         // Subtract should NOT have WHEN NOT MATCHED
         assert!(!sql.contains("WHEN NOT MATCHED"));
     }
