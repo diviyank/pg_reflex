@@ -558,7 +558,6 @@ Source: **5M rows, 30K groups, GROUP BY + SUM/COUNT**.
 - **Recursive CTEs:** `WITH RECURSIVE` is not supported.
 - **MIN/MAX/BOOL_OR on DELETE:** Requires full group rescan from the source table (no algebraic inverse for extrema or boolean OR).
 - **Non-deterministic functions:** `NOW()`, `RANDOM()`, `CURRENT_DATE` in WHERE clauses are not supported -- the view definition must be static.
-- **NULL group keys:** PostgreSQL's MERGE does not match `NULL = NULL`. NULL values in GROUP BY columns are not supported.
 - **Subqueries with aggregation in FROM:** `SELECT ... FROM (SELECT SUM(x) ... GROUP BY y) AS sub` is not supported — use a CTE (`WITH sub AS (...)`) instead, which pg_reflex decomposes into sub-IMVs automatically. Simple subqueries without aggregation (e.g., WHERE filters) work correctly.
 
 ## Project Structure

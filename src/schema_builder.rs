@@ -111,11 +111,16 @@ pub fn build_target_table_ddl(
         columns.push(format!("    \"{}\" {}", norm, pg_type));
     }
 
-    // DISTINCT columns (normalized lowercase names)
-    for col in &plan.distinct_columns {
-        let norm = normalized_column_name(col);
-        let pg_type = resolve_column_type(&norm, column_types, "TEXT");
-        columns.push(format!("    \"{}\" {}", norm, pg_type));
+    // DISTINCT columns (normalized lowercase names) — only for DISTINCT queries,
+    // NOT for COUNT(DISTINCT) where the distinct column is internal to the intermediate.
+    let has_count_distinct = plan.end_query_mappings.iter()
+        .any(|m| m.intermediate_expr.starts_with("COUNT("));
+    if !has_count_distinct {
+        for col in &plan.distinct_columns {
+            let norm = normalized_column_name(col);
+            let pg_type = resolve_column_type(&norm, column_types, "TEXT");
+            columns.push(format!("    \"{}\" {}", norm, pg_type));
+        }
     }
 
     // Output columns from end query mappings

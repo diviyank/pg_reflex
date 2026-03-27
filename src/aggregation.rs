@@ -130,6 +130,9 @@ fn collect_having_aggregates(expr: &Expr, out: &mut Vec<(AggregateKind, String)>
 pub fn plan_aggregation(analysis: &SqlAnalysis) -> AggregationPlan {
     let mut intermediate_columns = Vec::new();
     let mut end_query_mappings = Vec::new();
+    let mut count_distinct_columns: Vec<String> = Vec::new();
+
+    // (Mixed COUNT(DISTINCT) + other aggregates validation is done in lib.rs)
 
     for col in &analysis.select_columns {
         if col.is_passthrough {
@@ -157,15 +160,28 @@ pub fn plan_aggregation(analysis: &SqlAnalysis) -> AggregationPlan {
 
         match agg {
             AggregateKind::Sum => {
-                let col_name = format!("__sum_{}", arg_sanitized);
+                let sum_col = format!("__sum_{}", arg_sanitized);
+                let count_col = format!("__nonnull_count_{}", arg_sanitized);
                 intermediate_columns.push(IntermediateColumn {
-                    name: col_name.clone(),
+                    name: sum_col.clone(),
                     pg_type: "NUMERIC".to_string(),
                     source_aggregate: "SUM".to_string(),
                     source_arg: arg.to_string(),
                 });
+                // Companion COUNT(col) tracks non-NULL contributors.
+                // When this drops to 0, SUM should be NULL (not 0).
+                // Only add if not already present from another aggregate.
+                if !intermediate_columns.iter().any(|ic| ic.name == count_col) {
+                    intermediate_columns.push(IntermediateColumn {
+                        name: count_col.clone(),
+                        pg_type: "BIGINT".to_string(),
+                        source_aggregate: "COUNT".to_string(),
+                        source_arg: arg.to_string(),
+                    });
+                }
+                // End query: CASE WHEN non-null count > 0 THEN sum END (returns NULL when all values are NULL)
                 end_query_mappings.push(EndQueryMapping {
-                    intermediate_expr: col_name,
+                    intermediate_expr: format!("CASE WHEN \"{}\" > 0 THEN \"{}\" END", count_col, sum_col),
                     output_alias,
                     aggregate_type: "SUM".to_string(),
                     cast_type,
@@ -272,6 +288,19 @@ pub fn plan_aggregation(analysis: &SqlAnalysis) -> AggregationPlan {
                     cast_type,
                 });
             }
+            AggregateKind::CountDistinct => {
+                // COUNT(DISTINCT val): the intermediate uses (grp, val) as compound key.
+                // The end_query does COUNT(*) per original GROUP BY.
+                // We add `val` to distinct_columns (which extends the intermediate key).
+                // No extra intermediate aggregate column needed — just __ivm_count.
+                count_distinct_columns.push(arg.to_string());
+                end_query_mappings.push(EndQueryMapping {
+                    intermediate_expr: "COUNT(*)".to_string(),
+                    output_alias,
+                    aggregate_type: "COUNT".to_string(),
+                    cast_type,
+                });
+            }
         }
     }
 
@@ -349,6 +378,9 @@ pub fn plan_aggregation(analysis: &SqlAnalysis) -> AggregationPlan {
                             source_arg: arg,
                         });
                     }
+                    AggregateKind::CountDistinct => {
+                        // COUNT(DISTINCT) in HAVING is not supported yet
+                    }
                 }
             }
         }
@@ -365,8 +397,9 @@ pub fn plan_aggregation(analysis: &SqlAnalysis) -> AggregationPlan {
     // __ivm_count for reference counting (not needed for passthrough)
     let needs_ivm_count = !is_passthrough;
 
-    // For DISTINCT without GROUP BY, the passthrough columns become distinct columns
-    let distinct_columns = if analysis.has_distinct && analysis.group_by_columns.is_empty() {
+    // For DISTINCT without GROUP BY, the passthrough columns become distinct columns.
+    // For COUNT(DISTINCT val), the distinct column extends the intermediate key.
+    let mut distinct_columns = if analysis.has_distinct && analysis.group_by_columns.is_empty() {
         analysis
             .select_columns
             .iter()
@@ -376,6 +409,7 @@ pub fn plan_aggregation(analysis: &SqlAnalysis) -> AggregationPlan {
     } else {
         Vec::new()
     };
+    distinct_columns.extend(count_distinct_columns);
 
     // For passthrough queries, collect column names for incremental DELETE/UPDATE
     let passthrough_columns = if is_passthrough {
@@ -422,11 +456,15 @@ mod tests {
     fn test_sum_single_column() {
         let plan = plan_from_sql("SELECT city, SUM(amount) FROM orders GROUP BY city");
         assert_eq!(plan.group_by_columns, vec!["city"]);
-        assert_eq!(plan.intermediate_columns.len(), 1);
+        // SUM produces 2 intermediate columns: __sum_amount + __nonnull_count_amount
+        assert_eq!(plan.intermediate_columns.len(), 2);
         assert_eq!(plan.intermediate_columns[0].name, "__sum_amount");
         assert_eq!(plan.intermediate_columns[0].source_aggregate, "SUM");
+        assert_eq!(plan.intermediate_columns[1].name, "__nonnull_count_amount");
+        assert_eq!(plan.intermediate_columns[1].source_aggregate, "COUNT");
         assert_eq!(plan.end_query_mappings.len(), 1);
-        assert_eq!(plan.end_query_mappings[0].intermediate_expr, "__sum_amount");
+        // End query uses CASE WHEN non-null count > 0 THEN sum END
+        assert!(plan.end_query_mappings[0].intermediate_expr.contains("CASE WHEN"));
     }
 
     #[test]
@@ -462,8 +500,8 @@ mod tests {
             "SELECT city, SUM(amount) AS total, COUNT(*) AS cnt, MAX(price) AS max_p FROM orders GROUP BY city",
         );
         assert_eq!(plan.group_by_columns, vec!["city"]);
-        // SUM -> 1 col, COUNT(*) -> 1 col, MAX -> 1 col = 3 intermediate columns
-        assert_eq!(plan.intermediate_columns.len(), 3);
+        // SUM -> 2 cols (sum + nonnull_count), COUNT(*) -> 1 col, MAX -> 1 col = 4 intermediate columns
+        assert_eq!(plan.intermediate_columns.len(), 4);
         assert_eq!(plan.end_query_mappings.len(), 3);
         assert_eq!(plan.end_query_mappings[0].output_alias, "total");
         assert_eq!(plan.end_query_mappings[1].output_alias, "cnt");

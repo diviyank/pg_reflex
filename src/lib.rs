@@ -138,6 +138,19 @@ fn create_reflex_ivm_impl(view_name: &str, sql: &str, unique_columns_str: &str, 
                     format!("ERROR: {}", reason).into_boxed_str(),
                 );
             }
+            // Reject SUM(DISTINCT), AVG(DISTINCT), etc. — DISTINCT modifier is only
+            // supported on COUNT. Check the original SQL for the pattern.
+            let sql_upper = sql.to_uppercase();
+            let has_distinct_agg = sql_upper.contains("SUM(DISTINCT") || sql_upper.contains("SUM (DISTINCT")
+                || sql_upper.contains("AVG(DISTINCT") || sql_upper.contains("AVG (DISTINCT")
+                || sql_upper.contains("MIN(DISTINCT") || sql_upper.contains("MIN (DISTINCT")
+                || sql_upper.contains("MAX(DISTINCT") || sql_upper.contains("MAX (DISTINCT")
+                || sql_upper.contains("BOOL_OR(DISTINCT") || sql_upper.contains("BOOL_OR (DISTINCT");
+            if has_distinct_agg {
+                return "ERROR: DISTINCT modifier on SUM/AVG/MIN/MAX/BOOL_OR is not supported. \
+                        Only COUNT(DISTINCT col) is supported. Use a CTE with SELECT DISTINCT \
+                        to pre-deduplicate: WITH d AS (SELECT DISTINCT grp, val FROM t) SELECT grp, SUM(val) FROM d GROUP BY grp";
+            }
             a
         }
     };
@@ -486,6 +499,19 @@ fn create_reflex_ivm_impl(view_name: &str, sql: &str, unique_columns_str: &str, 
 
     // Build aggregation plan from the analysis
     let mut plan = plan_aggregation(&analysis);
+
+    // Reject mixed queries: COUNT(DISTINCT) + other aggregates (SUM, AVG, MIN, MAX, BOOL_OR).
+    // COUNT(DISTINCT) uses a compound intermediate key (grp, val) which is incompatible
+    // with regular aggregates that use (grp) as the key.
+    let has_cd = analysis.select_columns.iter()
+        .any(|c| matches!(c.aggregate, Some(sql_analyzer::AggregateKind::CountDistinct)));
+    let has_other_agg = analysis.select_columns.iter()
+        .any(|c| matches!(c.aggregate, Some(ref k) if !matches!(k,
+            sql_analyzer::AggregateKind::CountDistinct)));
+    if has_cd && has_other_agg {
+        return "ERROR: COUNT(DISTINCT col) cannot be mixed with other aggregates in the same query. \
+                Use a CTE to separate them: WITH cd AS (SELECT grp, COUNT(DISTINCT col) ...) SELECT ...";
+    }
 
     // Resolve unique key columns for passthrough IMVs (enables targeted DELETE/UPDATE)
     let mut resolved_unique_columns: Vec<String> = Vec::new();
@@ -6003,6 +6029,276 @@ mod tests {
     }
 
     // ========================================================================
+    // DEFERRED mode correctness tests
+    //
+    // Deferred mode stages deltas in __reflex_delta_<source> and flushes
+    // at COMMIT via a constraint trigger. In pgrx tests (which rollback),
+    // we manually call reflex_flush_deferred() to simulate the COMMIT flush.
+    // ========================================================================
+
+    /// Deferred: GROUP BY SUM/COUNT — INSERT + manual flush + oracle
+    #[pg_test]
+    fn test_deferred_groupby_insert_oracle() {
+        Spi::run("CREATE TABLE dfi (id SERIAL, city TEXT NOT NULL, amount INT NOT NULL)").expect("create");
+        Spi::run("INSERT INTO dfi (city, amount) VALUES ('Paris', 100), ('Paris', 200), ('London', 50)").expect("seed");
+
+        crate::create_reflex_ivm("dfi_view",
+            "SELECT city, SUM(amount) AS total, COUNT(*) AS cnt FROM dfi GROUP BY city",
+            None, None, Some("DEFERRED"));
+
+        let fresh = "SELECT city, SUM(amount) AS total, COUNT(*) AS cnt FROM dfi GROUP BY city";
+        assert_imv_correct("dfi_view", fresh);
+
+        // INSERT — delta staged, view NOT yet updated
+        Spi::run("INSERT INTO dfi (city, amount) VALUES ('Paris', 50), ('Berlin', 300)").expect("insert");
+
+        // Verify delta was staged
+        let staged = Spi::get_one::<i64>(
+            "SELECT COUNT(*) FROM __reflex_delta_dfi"
+        ).expect("q").expect("v");
+        assert!(staged > 0, "Delta should be staged: {} rows", staged);
+
+        // Manual flush (simulates COMMIT constraint trigger)
+        Spi::run("SELECT reflex_flush_deferred('dfi')").expect("flush");
+
+        // Oracle check after flush
+        assert_imv_correct("dfi_view", fresh);
+
+        // Paris=350, London=50, Berlin=300
+        let paris = Spi::get_one::<pgrx::AnyNumeric>(
+            "SELECT total FROM dfi_view WHERE city = 'Paris'"
+        ).expect("q").expect("v");
+        assert_eq!(paris.to_string(), "350");
+    }
+
+    /// Deferred: multiple INSERTs coalesced into single flush
+    #[pg_test]
+    fn test_deferred_batch_coalescing() {
+        Spi::run("CREATE TABLE dbc (id SERIAL, grp TEXT NOT NULL, val INT NOT NULL)").expect("create");
+        Spi::run("INSERT INTO dbc (grp, val) VALUES ('a', 10)").expect("seed");
+
+        crate::create_reflex_ivm("dbc_view",
+            "SELECT grp, SUM(val) AS total FROM dbc GROUP BY grp",
+            None, None, Some("DEFERRED"));
+
+        let fresh = "SELECT grp, SUM(val) AS total FROM dbc GROUP BY grp";
+
+        // Multiple INSERTs — all staged, not flushed
+        Spi::run("INSERT INTO dbc (grp, val) VALUES ('a', 20)").expect("insert 1");
+        Spi::run("INSERT INTO dbc (grp, val) VALUES ('a', 30)").expect("insert 2");
+        Spi::run("INSERT INTO dbc (grp, val) VALUES ('b', 100)").expect("insert 3");
+        Spi::run("INSERT INTO dbc (grp, val) VALUES ('b', 200)").expect("insert 4");
+
+        // All 4 coalesced in one flush
+        Spi::run("SELECT reflex_flush_deferred('dbc')").expect("flush");
+        assert_imv_correct("dbc_view", fresh);
+        // a: 10+20+30=60, b: 100+200=300
+    }
+
+    /// Deferred: DELETE + flush + oracle
+    #[pg_test]
+    fn test_deferred_delete_oracle() {
+        Spi::run("CREATE TABLE dfd (id SERIAL PRIMARY KEY, grp TEXT NOT NULL, val INT NOT NULL)").expect("create");
+        Spi::run("INSERT INTO dfd (grp, val) VALUES ('a', 10), ('a', 20), ('b', 30)").expect("seed");
+
+        crate::create_reflex_ivm("dfd_view",
+            "SELECT grp, SUM(val) AS total FROM dfd GROUP BY grp",
+            None, None, Some("DEFERRED"));
+
+        let fresh = "SELECT grp, SUM(val) AS total FROM dfd GROUP BY grp";
+        assert_imv_correct("dfd_view", fresh);
+
+        // DELETE
+        Spi::run("DELETE FROM dfd WHERE val = 10").expect("delete");
+        Spi::run("SELECT reflex_flush_deferred('dfd')").expect("flush");
+        assert_imv_correct("dfd_view", fresh);
+
+        // Delete entire group
+        Spi::run("DELETE FROM dfd WHERE grp = 'a'").expect("delete group");
+        Spi::run("SELECT reflex_flush_deferred('dfd')").expect("flush");
+        assert_imv_correct("dfd_view", fresh);
+    }
+
+    /// Deferred: UPDATE + flush + oracle
+    #[pg_test]
+    fn test_deferred_update_oracle() {
+        Spi::run("CREATE TABLE dfu (id SERIAL PRIMARY KEY, grp TEXT NOT NULL, val INT NOT NULL)").expect("create");
+        Spi::run("INSERT INTO dfu (grp, val) VALUES ('a', 10), ('a', 20), ('b', 30)").expect("seed");
+
+        crate::create_reflex_ivm("dfu_view",
+            "SELECT grp, SUM(val) AS total FROM dfu GROUP BY grp",
+            None, None, Some("DEFERRED"));
+
+        let fresh = "SELECT grp, SUM(val) AS total FROM dfu GROUP BY grp";
+        assert_imv_correct("dfu_view", fresh);
+
+        // UPDATE value
+        Spi::run("UPDATE dfu SET val = 99 WHERE val = 10").expect("update");
+        Spi::run("SELECT reflex_flush_deferred('dfu')").expect("flush");
+        assert_imv_correct("dfu_view", fresh);
+
+        // UPDATE group key (move row between groups)
+        Spi::run("UPDATE dfu SET grp = 'b' WHERE val = 20").expect("move group");
+        Spi::run("SELECT reflex_flush_deferred('dfu')").expect("flush");
+        assert_imv_correct("dfu_view", fresh);
+    }
+
+    /// Deferred: mixed INSERT + DELETE + UPDATE, single flush
+    #[pg_test]
+    fn test_deferred_mixed_mutations() {
+        Spi::run("CREATE TABLE dfm (id SERIAL PRIMARY KEY, grp TEXT NOT NULL, val INT NOT NULL)").expect("create");
+        Spi::run("INSERT INTO dfm (grp, val) VALUES ('a', 10), ('a', 20), ('b', 30), ('c', 40)").expect("seed");
+
+        crate::create_reflex_ivm("dfm_view",
+            "SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM dfm GROUP BY grp",
+            None, None, Some("DEFERRED"));
+
+        let fresh = "SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM dfm GROUP BY grp";
+        assert_imv_correct("dfm_view", fresh);
+
+        // Multiple mixed mutations, all staged
+        Spi::run("INSERT INTO dfm (grp, val) VALUES ('a', 100)").expect("insert");
+        Spi::run("DELETE FROM dfm WHERE grp = 'c'").expect("delete");
+        Spi::run("UPDATE dfm SET val = 999 WHERE grp = 'b'").expect("update");
+        Spi::run("INSERT INTO dfm (grp, val) VALUES ('d', 50), ('d', 60)").expect("insert 2");
+
+        // Single flush processes all accumulated deltas
+        Spi::run("SELECT reflex_flush_deferred('dfm')").expect("flush");
+        assert_imv_correct("dfm_view", fresh);
+    }
+
+    /// Deferred: DISTINCT with ref counting
+    #[pg_test]
+    fn test_deferred_distinct_oracle() {
+        Spi::run("CREATE TABLE dfdst (id SERIAL PRIMARY KEY, val TEXT NOT NULL)").expect("create");
+        Spi::run("INSERT INTO dfdst (val) VALUES ('x'), ('x'), ('y'), ('z')").expect("seed");
+
+        crate::create_reflex_ivm("dfdst_view",
+            "SELECT DISTINCT val FROM dfdst",
+            None, None, Some("DEFERRED"));
+
+        let fresh = "SELECT DISTINCT val FROM dfdst";
+        assert_imv_correct("dfdst_view", fresh);
+
+        // Insert duplicate
+        Spi::run("INSERT INTO dfdst (val) VALUES ('x')").expect("insert dup");
+        Spi::run("SELECT reflex_flush_deferred('dfdst')").expect("flush");
+        assert_imv_correct("dfdst_view", fresh);
+
+        // Delete one copy of 'x' — should still appear (refcount > 0)
+        Spi::run("DELETE FROM dfdst WHERE id = 1").expect("delete one");
+        Spi::run("SELECT reflex_flush_deferred('dfdst')").expect("flush");
+        assert_imv_correct("dfdst_view", fresh);
+
+        // Delete all 'z' — should disappear
+        Spi::run("DELETE FROM dfdst WHERE val = 'z'").expect("delete z");
+        Spi::run("SELECT reflex_flush_deferred('dfdst')").expect("flush");
+        assert_imv_correct("dfdst_view", fresh);
+    }
+
+    /// Deferred: NULLs in aggregate columns — INSERT and DELETE with NULLs
+    #[pg_test]
+    fn test_deferred_null_values() {
+        Spi::run("CREATE TABLE dfn (id SERIAL PRIMARY KEY, grp TEXT NOT NULL, val INT)").expect("create");
+        Spi::run("INSERT INTO dfn (grp, val) VALUES ('a', 10), ('a', NULL), ('b', 30)").expect("seed");
+
+        crate::create_reflex_ivm("dfn_view",
+            "SELECT grp, SUM(val) AS total, COUNT(val) AS cv, COUNT(*) AS cs FROM dfn GROUP BY grp",
+            None, None, Some("DEFERRED"));
+
+        let fresh = "SELECT grp, SUM(val) AS total, COUNT(val) AS cv, COUNT(*) AS cs FROM dfn GROUP BY grp";
+        assert_imv_correct("dfn_view", fresh);
+
+        // INSERT NULL value
+        Spi::run("INSERT INTO dfn (grp, val) VALUES ('a', NULL)").expect("insert null");
+        Spi::run("SELECT reflex_flush_deferred('dfn')").expect("flush");
+        assert_imv_correct("dfn_view", fresh);
+
+        // INSERT non-NULL value
+        Spi::run("INSERT INTO dfn (grp, val) VALUES ('a', 50)").expect("insert non-null");
+        Spi::run("SELECT reflex_flush_deferred('dfn')").expect("flush");
+        assert_imv_correct("dfn_view", fresh);
+
+        // DELETE a NULL row
+        Spi::run("DELETE FROM dfn WHERE val IS NULL AND id = (SELECT MIN(id) FROM dfn WHERE val IS NULL)").expect("delete null");
+        Spi::run("SELECT reflex_flush_deferred('dfn')").expect("flush");
+        assert_imv_correct("dfn_view", fresh);
+
+        // DELETE a non-NULL row
+        Spi::run("DELETE FROM dfn WHERE val = 30").expect("delete non-null");
+        Spi::run("SELECT reflex_flush_deferred('dfn')").expect("flush");
+        assert_imv_correct("dfn_view", fresh);
+    }
+
+    /// Deferred: fuzz — random mutations + flush + oracle
+    #[pg_test]
+    fn test_deferred_fuzz() {
+        Spi::run("SELECT setseed(0.88)").expect("seed");
+        Spi::run("CREATE TABLE df_fuzz (id SERIAL PRIMARY KEY, grp INT NOT NULL, val INT NOT NULL)").expect("create");
+        Spi::run("INSERT INTO df_fuzz (grp, val) SELECT (random()*10)::int, (random()*500)::int FROM generate_series(1, 200)").expect("seed data");
+
+        crate::create_reflex_ivm("df_fuzz_view",
+            "SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM df_fuzz GROUP BY grp",
+            None, None, Some("DEFERRED"));
+
+        let fresh = "SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM df_fuzz GROUP BY grp";
+        assert_imv_correct("df_fuzz_view", fresh);
+
+        for _ in 0..5 {
+            // Batch of 3-5 random mutations
+            for _ in 0..3 {
+                match Spi::get_one::<i32>("SELECT (random()*2)::int").expect("q").expect("v") {
+                    0 => Spi::run("INSERT INTO df_fuzz (grp, val) SELECT (random()*10)::int, (random()*500)::int FROM generate_series(1, (1+random()*20)::int)").expect("insert"),
+                    1 => Spi::run("DELETE FROM df_fuzz WHERE id IN (SELECT id FROM df_fuzz ORDER BY random() LIMIT (1+random()*5)::int)").expect("delete"),
+                    _ => Spi::run("UPDATE df_fuzz SET val = (random()*999)::int WHERE id = (SELECT id FROM df_fuzz ORDER BY random() LIMIT 1)").expect("update"),
+                };
+            }
+            // Flush and verify
+            Spi::run("SELECT reflex_flush_deferred('df_fuzz')").expect("flush");
+            assert_imv_correct("df_fuzz_view", fresh);
+        }
+    }
+
+    /// Deferred: UPDATE non-NULL to NULL — all values in group become NULL → SUM must be NULL
+    #[pg_test]
+    fn test_deferred_update_to_null_all_null_group() {
+        Spi::run("CREATE TABLE dfun (id SERIAL PRIMARY KEY, grp TEXT NOT NULL, val INT)").expect("create");
+        Spi::run("INSERT INTO dfun (grp, val) VALUES ('a', 10), ('a', NULL), ('b', 30)").expect("seed");
+        // Group 'a': SUM=10, COUNT(val)=1, COUNT(*)=2
+
+        crate::create_reflex_ivm("dfun_view",
+            "SELECT grp, SUM(val) AS total, COUNT(val) AS cv, COUNT(*) AS cs FROM dfun GROUP BY grp",
+            None, None, Some("DEFERRED"));
+
+        let fresh = "SELECT grp, SUM(val) AS total, COUNT(val) AS cv, COUNT(*) AS cs FROM dfun GROUP BY grp";
+        assert_imv_correct("dfun_view", fresh);
+
+        // UPDATE the only non-NULL val in group 'a' to NULL
+        // After: group 'a' has (NULL, NULL) → SUM=NULL, COUNT(val)=0, COUNT(*)=2
+        Spi::run("UPDATE dfun SET val = NULL WHERE val = 10").expect("update to null");
+        Spi::run("SELECT reflex_flush_deferred('dfun')").expect("flush");
+        assert_imv_correct("dfun_view", fresh);
+    }
+
+    /// Same bug test for IMMEDIATE mode — verify the immediate path handles this correctly
+    #[pg_test]
+    fn test_immediate_update_to_null_all_null_group() {
+        Spi::run("CREATE TABLE imun (id SERIAL PRIMARY KEY, grp TEXT NOT NULL, val INT)").expect("create");
+        Spi::run("INSERT INTO imun (grp, val) VALUES ('a', 10), ('a', NULL), ('b', 30)").expect("seed");
+
+        crate::create_reflex_ivm("imun_view",
+            "SELECT grp, SUM(val) AS total, COUNT(val) AS cv, COUNT(*) AS cs FROM imun GROUP BY grp",
+            None, None, Some("IMMEDIATE"));
+
+        let fresh = "SELECT grp, SUM(val) AS total, COUNT(val) AS cv, COUNT(*) AS cs FROM imun GROUP BY grp";
+        assert_imv_correct("imun_view", fresh);
+
+        // UPDATE the only non-NULL val to NULL
+        Spi::run("UPDATE imun SET val = NULL WHERE val = 10").expect("update to null");
+        assert_imv_correct("imun_view", fresh);
+    }
+
+    // ========================================================================
     // UNION ALL tests
     // ========================================================================
 
@@ -8504,6 +8800,390 @@ mod tests {
     }
 
     // ========================================================================
+    // Fuzz testing — randomized correctness verification
+    //
+    // Each fuzz test generates random data and random mutations using
+    // PostgreSQL's random() function, then verifies via EXCEPT ALL oracle.
+    // Runs multiple scenarios in a single #[pg_test] to maximize coverage.
+    // ========================================================================
+
+    /// Fuzz: random GROUP BY + SUM/COUNT with random INSERT/UPDATE/DELETE
+    #[pg_test]
+    fn test_fuzz_groupby_sum_count() {
+        Spi::run("SELECT setseed(0.42)").expect("seed");
+
+        for round in 0..10 {
+            let tbl = format!("fuzz_sc_{}", round);
+            let view = format!("fuzz_sc_v_{}", round);
+
+            // Random table with 3-50 groups, 100-500 rows
+            Spi::run(&format!(
+                "CREATE TABLE {} (id SERIAL PRIMARY KEY, grp INT NOT NULL, val INT NOT NULL)", tbl
+            )).expect("create");
+            Spi::run(&format!(
+                "INSERT INTO {} (grp, val) SELECT (random() * 30)::int, (random() * 1000 - 500)::int \
+                 FROM generate_series(1, 100 + (random() * 400)::int)", tbl
+            )).expect("seed");
+
+            let query = format!(
+                "SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM {} GROUP BY grp", tbl
+            );
+            crate::create_reflex_ivm(&view, &query, None, None, None);
+            assert_imv_correct(&view, &query);
+
+            // 5-15 random mutations
+            let num_mutations = 5 + (round % 11);
+            for m in 0..num_mutations {
+                match m % 3 {
+                    0 => {
+                        // Random INSERT (1-50 rows)
+                        Spi::run(&format!(
+                            "INSERT INTO {} (grp, val) SELECT (random() * 30)::int, (random() * 1000 - 500)::int \
+                             FROM generate_series(1, 1 + (random() * 49)::int)", tbl
+                        )).expect("insert");
+                    }
+                    1 => {
+                        // Random UPDATE (change values)
+                        Spi::run(&format!(
+                            "UPDATE {} SET val = (random() * 2000 - 1000)::int \
+                             WHERE id <= (SELECT MIN(id) + (random() * 20)::int FROM {})", tbl, tbl
+                        )).expect("update");
+                    }
+                    _ => {
+                        // Random DELETE (1-20 rows)
+                        Spi::run(&format!(
+                            "DELETE FROM {} WHERE id IN (\
+                                SELECT id FROM {} ORDER BY random() LIMIT (1 + (random() * 19)::int)\
+                            )", tbl, tbl
+                        )).expect("delete");
+                    }
+                }
+                assert_imv_correct(&view, &query);
+            }
+
+            // Cleanup
+            Spi::run(&format!("SELECT drop_reflex_ivm('{}', true)", view)).expect("drop");
+            Spi::run(&format!("DROP TABLE IF EXISTS {} CASCADE", tbl)).expect("drop table");
+        }
+    }
+
+    /// Fuzz: random GROUP BY + AVG with NULLs
+    #[pg_test]
+    fn test_fuzz_groupby_avg_with_nulls() {
+        Spi::run("SELECT setseed(0.7)").expect("seed");
+
+        for round in 0..8 {
+            let tbl = format!("fuzz_avg_{}", round);
+            let view = format!("fuzz_avg_v_{}", round);
+
+            Spi::run(&format!(
+                "CREATE TABLE {} (id SERIAL PRIMARY KEY, grp TEXT NOT NULL, val NUMERIC)", tbl
+            )).expect("create");
+            // Insert with ~20% NULLs
+            Spi::run(&format!(
+                "INSERT INTO {} (grp, val) SELECT \
+                    'g' || (random() * 10)::int, \
+                    CASE WHEN random() < 0.2 THEN NULL ELSE (random() * 1000)::numeric(10,2) END \
+                 FROM generate_series(1, 200)", tbl
+            )).expect("seed");
+
+            let query = format!(
+                "SELECT grp, AVG(val) AS avg_val, COUNT(val) AS cv, COUNT(*) AS cs FROM {} GROUP BY grp", tbl
+            );
+            crate::create_reflex_ivm(&view, &query, None, None, None);
+            assert_imv_correct(&view, &query);
+
+            for m in 0..10 {
+                match m % 4 {
+                    0 => Spi::run(&format!(
+                        "INSERT INTO {} (grp, val) VALUES ('g' || (random()*10)::int, \
+                         CASE WHEN random() < 0.3 THEN NULL ELSE (random()*500)::numeric(10,2) END)", tbl
+                    )).expect("insert"),
+                    1 => Spi::run(&format!(
+                        "UPDATE {} SET val = NULL WHERE id = (SELECT id FROM {} ORDER BY random() LIMIT 1)", tbl, tbl
+                    )).expect("update to null"),
+                    2 => Spi::run(&format!(
+                        "UPDATE {} SET val = (random()*999)::numeric(10,2) WHERE val IS NULL AND id = \
+                         (SELECT id FROM {} WHERE val IS NULL ORDER BY random() LIMIT 1)", tbl, tbl
+                    )).expect("update from null"),
+                    _ => Spi::run(&format!(
+                        "DELETE FROM {} WHERE id = (SELECT id FROM {} ORDER BY random() LIMIT 1)", tbl, tbl
+                    )).expect("delete"),
+                };
+                assert_imv_correct(&view, &query);
+            }
+
+            Spi::run(&format!("SELECT drop_reflex_ivm('{}', true)", view)).expect("drop");
+            Spi::run(&format!("DROP TABLE IF EXISTS {} CASCADE", tbl)).expect("drop table");
+        }
+    }
+
+    /// Fuzz: random MIN/MAX with random extremum deletions
+    #[pg_test]
+    fn test_fuzz_min_max_extremum() {
+        Spi::run("SELECT setseed(0.13)").expect("seed");
+
+        for round in 0..8 {
+            let tbl = format!("fuzz_mm_{}", round);
+            let view = format!("fuzz_mm_v_{}", round);
+
+            Spi::run(&format!(
+                "CREATE TABLE {} (id SERIAL PRIMARY KEY, grp INT NOT NULL, val INT NOT NULL)", tbl
+            )).expect("create");
+            Spi::run(&format!(
+                "INSERT INTO {} (grp, val) SELECT (random()*5)::int, (random()*1000)::int \
+                 FROM generate_series(1, 150)", tbl
+            )).expect("seed");
+
+            let query = format!(
+                "SELECT grp, MIN(val) AS lo, MAX(val) AS hi, COUNT(*) AS cnt FROM {} GROUP BY grp", tbl
+            );
+            crate::create_reflex_ivm(&view, &query, None, None, None);
+            assert_imv_correct(&view, &query);
+
+            for _ in 0..12 {
+                // Randomly delete the current MIN or MAX of a random group
+                let action = Spi::get_one::<i32>(
+                    "SELECT (random() * 3)::int"
+                ).expect("q").expect("v");
+
+                match action {
+                    0 => {
+                        // Delete the MIN row of a random group
+                        Spi::run(&format!(
+                            "DELETE FROM {} WHERE id = (\
+                                SELECT id FROM {} WHERE val = (\
+                                    SELECT MIN(val) FROM {} WHERE grp = (\
+                                        SELECT grp FROM {} ORDER BY random() LIMIT 1\
+                                    )\
+                                ) LIMIT 1\
+                            )", tbl, tbl, tbl, tbl
+                        )).expect("delete min");
+                    }
+                    1 => {
+                        // Delete the MAX row
+                        Spi::run(&format!(
+                            "DELETE FROM {} WHERE id = (\
+                                SELECT id FROM {} WHERE val = (\
+                                    SELECT MAX(val) FROM {} WHERE grp = (\
+                                        SELECT grp FROM {} ORDER BY random() LIMIT 1\
+                                    )\
+                                ) LIMIT 1\
+                            )", tbl, tbl, tbl, tbl
+                        )).expect("delete max");
+                    }
+                    2 => {
+                        // Insert new potential extremum
+                        Spi::run(&format!(
+                            "INSERT INTO {} (grp, val) VALUES ((random()*5)::int, (random()*2000 - 500)::int)", tbl
+                        )).expect("insert extremum");
+                    }
+                    _ => {
+                        // Random update
+                        Spi::run(&format!(
+                            "UPDATE {} SET val = (random()*1500)::int WHERE id = (\
+                                SELECT id FROM {} ORDER BY random() LIMIT 1\
+                            )", tbl, tbl
+                        )).expect("update");
+                    }
+                }
+                assert_imv_correct(&view, &query);
+            }
+
+            Spi::run(&format!("SELECT drop_reflex_ivm('{}', true)", view)).expect("drop");
+            Spi::run(&format!("DROP TABLE IF EXISTS {} CASCADE", tbl)).expect("drop table");
+        }
+    }
+
+    /// Fuzz: random DISTINCT with random INSERT/DELETE
+    #[pg_test]
+    fn test_fuzz_distinct() {
+        Spi::run("SELECT setseed(0.99)").expect("seed");
+
+        for round in 0..8 {
+            let tbl = format!("fuzz_dist_{}", round);
+            let view = format!("fuzz_dist_v_{}", round);
+
+            Spi::run(&format!(
+                "CREATE TABLE {} (id SERIAL PRIMARY KEY, val TEXT NOT NULL)", tbl
+            )).expect("create");
+            Spi::run(&format!(
+                "INSERT INTO {} (val) SELECT 'v' || (random()*20)::int FROM generate_series(1, 200)", tbl
+            )).expect("seed");
+
+            let query = format!("SELECT DISTINCT val FROM {}", tbl);
+            crate::create_reflex_ivm(&view, &query, None, None, None);
+            assert_imv_correct(&view, &query);
+
+            for _ in 0..15 {
+                match Spi::get_one::<i32>("SELECT (random()*2)::int").expect("q").expect("v") {
+                    0 => Spi::run(&format!(
+                        "INSERT INTO {} (val) SELECT 'v' || (random()*25)::int FROM generate_series(1, 1 + (random()*10)::int)", tbl
+                    )).expect("insert"),
+                    1 => Spi::run(&format!(
+                        "DELETE FROM {} WHERE id IN (SELECT id FROM {} ORDER BY random() LIMIT (1 + (random()*5)::int))", tbl, tbl
+                    )).expect("delete"),
+                    _ => Spi::run(&format!(
+                        "UPDATE {} SET val = 'v' || (random()*25)::int WHERE id = (SELECT id FROM {} ORDER BY random() LIMIT 1)", tbl, tbl
+                    )).expect("update"),
+                };
+                assert_imv_correct(&view, &query);
+            }
+
+            Spi::run(&format!("SELECT drop_reflex_ivm('{}', true)", view)).expect("drop");
+            Spi::run(&format!("DROP TABLE IF EXISTS {} CASCADE", tbl)).expect("drop table");
+        }
+    }
+
+    /// Fuzz: random GROUP BY with NULL group keys
+    #[pg_test]
+    fn test_fuzz_null_group_keys() {
+        Spi::run("SELECT setseed(0.31)").expect("seed");
+
+        for round in 0..8 {
+            let tbl = format!("fuzz_nk_{}", round);
+            let view = format!("fuzz_nk_v_{}", round);
+
+            Spi::run(&format!(
+                "CREATE TABLE {} (id SERIAL PRIMARY KEY, grp TEXT, val INT NOT NULL)", tbl
+            )).expect("create");
+            // ~25% NULL group keys
+            Spi::run(&format!(
+                "INSERT INTO {} (grp, val) SELECT \
+                    CASE WHEN random() < 0.25 THEN NULL ELSE 'g' || (random()*8)::int END, \
+                    (random()*500)::int \
+                 FROM generate_series(1, 200)", tbl
+            )).expect("seed");
+
+            let query = format!(
+                "SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM {} GROUP BY grp", tbl
+            );
+            crate::create_reflex_ivm(&view, &query, None, None, None);
+            assert_imv_correct(&view, &query);
+
+            for _ in 0..12 {
+                match Spi::get_one::<i32>("SELECT (random()*3)::int").expect("q").expect("v") {
+                    0 => Spi::run(&format!(
+                        "INSERT INTO {} (grp, val) VALUES (\
+                            CASE WHEN random() < 0.3 THEN NULL ELSE 'g' || (random()*8)::int END, \
+                            (random()*500)::int)", tbl
+                    )).expect("insert"),
+                    1 => Spi::run(&format!(
+                        "UPDATE {} SET grp = CASE WHEN random() < 0.3 THEN NULL ELSE 'g' || (random()*8)::int END \
+                         WHERE id = (SELECT id FROM {} ORDER BY random() LIMIT 1)", tbl, tbl
+                    )).expect("update grp"),
+                    2 => Spi::run(&format!(
+                        "DELETE FROM {} WHERE id = (SELECT id FROM {} ORDER BY random() LIMIT 1)", tbl, tbl
+                    )).expect("delete"),
+                    _ => Spi::run(&format!(
+                        "UPDATE {} SET val = (random()*999)::int WHERE grp IS NULL AND id = \
+                         (SELECT MIN(id) FROM {} WHERE grp IS NULL)", tbl, tbl
+                    )).expect("update null grp val"),
+                };
+                assert_imv_correct(&view, &query);
+            }
+
+            Spi::run(&format!("SELECT drop_reflex_ivm('{}', true)", view)).expect("drop");
+            Spi::run(&format!("DROP TABLE IF EXISTS {} CASCADE", tbl)).expect("drop table");
+        }
+    }
+
+    /// Fuzz: random JOIN aggregate with mutations on both tables
+    #[pg_test]
+    fn test_fuzz_join_aggregate() {
+        Spi::run("SELECT setseed(0.55)").expect("seed");
+
+        for round in 0..5 {
+            let src = format!("fuzz_js_{}", round);
+            let dim = format!("fuzz_jd_{}", round);
+            let view = format!("fuzz_j_v_{}", round);
+
+            Spi::run(&format!(
+                "CREATE TABLE {} (id INT PRIMARY KEY, label TEXT NOT NULL)", dim
+            )).expect("create dim");
+            Spi::run(&format!(
+                "INSERT INTO {} SELECT i, 'label_' || i FROM generate_series(1, 10) i", dim
+            )).expect("seed dim");
+
+            Spi::run(&format!(
+                "CREATE TABLE {} (id SERIAL PRIMARY KEY, did INT NOT NULL, val INT NOT NULL)", src
+            )).expect("create src");
+            Spi::run(&format!(
+                "INSERT INTO {} (did, val) SELECT (random()*9+1)::int, (random()*100)::int \
+                 FROM generate_series(1, 200)", src
+            )).expect("seed src");
+
+            let query = format!(
+                "SELECT d.label, SUM(s.val) AS total, COUNT(*) AS cnt \
+                 FROM {} s JOIN {} d ON s.did = d.id GROUP BY d.label", src, dim
+            );
+            crate::create_reflex_ivm(&view, &query, None, None, None);
+            assert_imv_correct(&view, &query);
+
+            for _ in 0..10 {
+                match Spi::get_one::<i32>("SELECT (random()*2)::int").expect("q").expect("v") {
+                    0 => Spi::run(&format!(
+                        "INSERT INTO {} (did, val) VALUES ((random()*9+1)::int, (random()*100)::int)", src
+                    )).expect("insert src"),
+                    1 => Spi::run(&format!(
+                        "DELETE FROM {} WHERE id = (SELECT id FROM {} ORDER BY random() LIMIT 1)", src, src
+                    )).expect("delete src"),
+                    _ => Spi::run(&format!(
+                        "UPDATE {} SET val = (random()*200)::int WHERE id = (SELECT id FROM {} ORDER BY random() LIMIT 1)", src, src
+                    )).expect("update src"),
+                };
+                assert_imv_correct(&view, &query);
+            }
+
+            Spi::run(&format!("SELECT drop_reflex_ivm('{}', true)", view)).expect("drop");
+            Spi::run(&format!("DROP TABLE IF EXISTS {} CASCADE", src)).expect("drop src");
+            Spi::run(&format!("DROP TABLE IF EXISTS {} CASCADE", dim)).expect("drop dim");
+        }
+    }
+
+    /// Fuzz: random passthrough with random mutations
+    #[pg_test]
+    fn test_fuzz_passthrough() {
+        Spi::run("SELECT setseed(0.77)").expect("seed");
+
+        for round in 0..5 {
+            let tbl = format!("fuzz_pt_{}", round);
+            let view = format!("fuzz_pt_v_{}", round);
+
+            Spi::run(&format!(
+                "CREATE TABLE {} (id SERIAL PRIMARY KEY, city TEXT, amount NUMERIC)", tbl
+            )).expect("create");
+            Spi::run(&format!(
+                "INSERT INTO {} (city, amount) SELECT 'c' || (random()*20)::int, (random()*1000)::numeric(10,2) \
+                 FROM generate_series(1, 100)", tbl
+            )).expect("seed");
+
+            let query = format!("SELECT id, city, amount FROM {}", tbl);
+            crate::create_reflex_ivm(&view, &query, Some("id"), None, None);
+            assert_imv_correct(&view, &query);
+
+            for _ in 0..10 {
+                match Spi::get_one::<i32>("SELECT (random()*2)::int").expect("q").expect("v") {
+                    0 => Spi::run(&format!(
+                        "INSERT INTO {} (city, amount) VALUES ('c' || (random()*20)::int, (random()*1000)::numeric(10,2))", tbl
+                    )).expect("insert"),
+                    1 => Spi::run(&format!(
+                        "DELETE FROM {} WHERE id = (SELECT id FROM {} ORDER BY random() LIMIT 1)", tbl, tbl
+                    )).expect("delete"),
+                    _ => Spi::run(&format!(
+                        "UPDATE {} SET amount = (random()*999)::numeric(10,2) WHERE id = (\
+                            SELECT id FROM {} ORDER BY random() LIMIT 1)", tbl, tbl
+                    )).expect("update"),
+                };
+                assert_imv_correct(&view, &query);
+            }
+
+            Spi::run(&format!("SELECT drop_reflex_ivm('{}', true)", view)).expect("drop");
+            Spi::run(&format!("DROP TABLE IF EXISTS {} CASCADE", tbl)).expect("drop table");
+        }
+    }
+
+    // ========================================================================
     // Type coverage tests
     // ========================================================================
 
@@ -8698,19 +9378,83 @@ mod tests {
         assert_imv_correct("uc_view", fresh);
     }
 
-    /// SQL keyword column names — known limitation.
-    /// Quoted identifiers like "select" as column names currently cause issues
-    /// in the intermediate table DDL generation (empty identifier). This is tracked
-    /// as a future improvement. The test verifies no partial state is left.
+    /// SQL keyword column names — now properly handled via quote stripping in normalized_column_name
     #[pg_test]
-    fn test_keyword_column_names_no_partial_state() {
-        Spi::run("CREATE TABLE kw_err (id SERIAL, \"select\" TEXT, \"from\" INT)").expect("create");
-        Spi::run("INSERT INTO kw_err (\"select\", \"from\") VALUES ('a', 10)").expect("seed");
-        // Verify that even if creation fails, no partial reference table entry exists
-        let count = Spi::get_one::<i64>(
-            "SELECT COUNT(*) FROM public.__reflex_ivm_reference WHERE name = 'kw_err_view'"
-        ).expect("q").expect("v");
-        assert_eq!(count, 0, "No partial state should exist for keyword column IMV");
+    fn test_correctness_keyword_column_names() {
+        Spi::run("CREATE TABLE kw_src (id SERIAL, \"select\" TEXT, \"from\" INT)").expect("create");
+        Spi::run("INSERT INTO kw_src (\"select\", \"from\") VALUES ('a', 10), ('a', 20), ('b', 30)").expect("seed");
+
+        crate::create_reflex_ivm("kw_view",
+            "SELECT \"select\", SUM(\"from\") AS total FROM kw_src GROUP BY \"select\"",
+            None, None, None);
+        let fresh = "SELECT \"select\", SUM(\"from\") AS total FROM kw_src GROUP BY \"select\"";
+        assert_imv_correct("kw_view", fresh);
+
+        Spi::run("INSERT INTO kw_src (\"select\", \"from\") VALUES ('a', 50)").expect("insert");
+        assert_imv_correct("kw_view", fresh);
+
+        Spi::run("DELETE FROM kw_src WHERE \"from\" = 10").expect("delete");
+        assert_imv_correct("kw_view", fresh);
+    }
+
+    /// NULL GROUP BY keys — IS NOT DISTINCT FROM handles NULL = NULL correctly
+    #[pg_test]
+    fn test_correctness_null_group_key() {
+        Spi::run("CREATE TABLE ngk (id SERIAL PRIMARY KEY, grp TEXT, val INT NOT NULL)").expect("create");
+        Spi::run("INSERT INTO ngk (grp, val) VALUES ('a', 10), ('a', 20), (NULL, 30), (NULL, 40), ('b', 50)").expect("seed");
+
+        crate::create_reflex_ivm("ngk_view",
+            "SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM ngk GROUP BY grp",
+            None, None, None);
+
+        let fresh = "SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM ngk GROUP BY grp";
+        assert_imv_correct("ngk_view", fresh);
+        // NULL group: total=70, cnt=2; 'a': total=30, cnt=2; 'b': total=50, cnt=1
+
+        // Insert into NULL group
+        Spi::run("INSERT INTO ngk (grp, val) VALUES (NULL, 100)").expect("insert null");
+        assert_imv_correct("ngk_view", fresh);
+        // NULL group: total=170, cnt=3
+
+        // Delete from NULL group
+        Spi::run("DELETE FROM ngk WHERE grp IS NULL AND val = 30").expect("delete null");
+        assert_imv_correct("ngk_view", fresh);
+        // NULL group: total=140, cnt=2
+
+        // Update non-NULL to NULL (move row between groups)
+        Spi::run("UPDATE ngk SET grp = NULL WHERE grp = 'b'").expect("move to null");
+        assert_imv_correct("ngk_view", fresh);
+        // NULL group: total=190, cnt=3; 'b' disappears
+
+        // Update NULL to non-NULL (move row out of NULL group)
+        Spi::run("UPDATE ngk SET grp = 'c' WHERE grp IS NULL AND val = 40").expect("move from null");
+        assert_imv_correct("ngk_view", fresh);
+    }
+
+    /// NULL GROUP BY with multiple NULL key columns
+    #[pg_test]
+    fn test_correctness_null_multi_column_group_key() {
+        Spi::run("CREATE TABLE nmk (id SERIAL, g1 TEXT, g2 INT, val INT NOT NULL)").expect("create");
+        Spi::run("INSERT INTO nmk (g1, g2, val) VALUES \
+            ('a', 1, 10), ('a', NULL, 20), (NULL, 1, 30), (NULL, NULL, 40)").expect("seed");
+
+        crate::create_reflex_ivm("nmk_view",
+            "SELECT g1, g2, SUM(val) AS total FROM nmk GROUP BY g1, g2",
+            None, None, None);
+
+        let fresh = "SELECT g1, g2, SUM(val) AS total FROM nmk GROUP BY g1, g2";
+        assert_imv_correct("nmk_view", fresh);
+
+        // Insert with both NULLs — should merge into existing (NULL, NULL) group
+        Spi::run("INSERT INTO nmk (g1, g2, val) VALUES (NULL, NULL, 100)").expect("insert both null");
+        assert_imv_correct("nmk_view", fresh);
+
+        // Insert with one NULL
+        Spi::run("INSERT INTO nmk (g1, g2, val) VALUES ('a', NULL, 5)").expect("insert one null");
+        assert_imv_correct("nmk_view", fresh);
+
+        Spi::run("DELETE FROM nmk WHERE val = 40").expect("delete");
+        assert_imv_correct("nmk_view", fresh);
     }
 
     // ========================================================================
@@ -8964,9 +9708,10 @@ mod tests {
         Spi::run("INSERT INTO cc_foj1 VALUES (1, 'a', 10), (2, 'a', 20), (3, 'b', 30)").expect("seed1");
         Spi::run("INSERT INTO cc_foj2 VALUES (1, 'a', 100), (2, 'c', 200)").expect("seed2");
 
-        // Aggregate IMV over INNER JOIN (FULL OUTER not supported for passthrough)
-        let sql = "SELECT cc_foj1.grp, SUM(cc_foj1.val) AS s1, SUM(cc_foj2.val) AS s2 \
-                   FROM cc_foj1 JOIN cc_foj2 ON cc_foj1.grp = cc_foj2.grp GROUP BY cc_foj1.grp";
+        // FULL OUTER JOIN aggregate — outer-join-secondary detection handles this
+        let sql = "SELECT COALESCE(cc_foj1.grp, cc_foj2.grp) AS grp, SUM(cc_foj1.val) AS s1, SUM(cc_foj2.val) AS s2 \
+                   FROM cc_foj1 FULL OUTER JOIN cc_foj2 ON cc_foj1.grp = cc_foj2.grp \
+                   GROUP BY COALESCE(cc_foj1.grp, cc_foj2.grp)";
         crate::create_reflex_ivm("cc_foj_v", sql, None, None, None);
         assert_imv_correct("cc_foj_v", sql);
 
@@ -9463,6 +10208,110 @@ mod tests {
             "SELECT val, COUNT(*) AS c FROM err_mode GROUP BY val",
             None, None, Some("BANANA"));
         assert!(result.starts_with("ERROR"), "Invalid mode should error: {}", result);
+    }
+
+    // ========================================================================
+    // COUNT(DISTINCT) tests
+    // ========================================================================
+
+    /// COUNT(DISTINCT val) — basic correctness with oracle
+    #[pg_test]
+    fn test_correctness_count_distinct_basic() {
+        Spi::run("CREATE TABLE cd_src (id SERIAL PRIMARY KEY, grp TEXT NOT NULL, val INT NOT NULL)").expect("create");
+        Spi::run("INSERT INTO cd_src (grp, val) VALUES ('a', 1), ('a', 1), ('a', 2), ('b', 3), ('b', 3), ('b', 3)").expect("seed");
+
+        crate::create_reflex_ivm("cd_view",
+            "SELECT grp, COUNT(DISTINCT val) AS cd FROM cd_src GROUP BY grp",
+            None, None, None);
+
+        let fresh = "SELECT grp, COUNT(DISTINCT val) AS cd FROM cd_src GROUP BY grp";
+        assert_imv_correct("cd_view", fresh);
+        // a: 2 distinct (1, 2), b: 1 distinct (3)
+
+        // INSERT duplicate — cd should NOT change
+        Spi::run("INSERT INTO cd_src (grp, val) VALUES ('a', 1)").expect("dup");
+        assert_imv_correct("cd_view", fresh);
+
+        // INSERT new distinct value
+        Spi::run("INSERT INTO cd_src (grp, val) VALUES ('a', 99)").expect("new val");
+        assert_imv_correct("cd_view", fresh);
+        // a: 3 distinct (1, 2, 99)
+
+        // DELETE one copy of a duplicated value — cd should NOT change
+        Spi::run("DELETE FROM cd_src WHERE id = 1").expect("delete dup");
+        assert_imv_correct("cd_view", fresh);
+
+        // DELETE all copies of val=1 — cd decreases
+        Spi::run("DELETE FROM cd_src WHERE val = 1").expect("delete all val=1");
+        assert_imv_correct("cd_view", fresh);
+        // a: 2 distinct (2, 99)
+    }
+
+    /// COUNT(DISTINCT) with UPDATE
+    #[pg_test]
+    fn test_correctness_count_distinct_update() {
+        Spi::run("CREATE TABLE cdu_src (id SERIAL PRIMARY KEY, grp TEXT NOT NULL, val TEXT NOT NULL)").expect("create");
+        Spi::run("INSERT INTO cdu_src (grp, val) VALUES ('x', 'a'), ('x', 'b'), ('x', 'c'), ('y', 'a')").expect("seed");
+
+        crate::create_reflex_ivm("cdu_view",
+            "SELECT grp, COUNT(DISTINCT val) AS cd FROM cdu_src GROUP BY grp",
+            None, None, None);
+
+        let fresh = "SELECT grp, COUNT(DISTINCT val) AS cd FROM cdu_src GROUP BY grp";
+        assert_imv_correct("cdu_view", fresh);
+
+        // UPDATE to existing value — cd should decrease
+        Spi::run("UPDATE cdu_src SET val = 'a' WHERE val = 'b'").expect("update to dup");
+        assert_imv_correct("cdu_view", fresh);
+        // x: was {a,b,c}=3, now {a,a,c}=2
+
+        // UPDATE to new value — cd should increase
+        Spi::run("UPDATE cdu_src SET val = 'z' WHERE id = (SELECT MIN(id) FROM cdu_src WHERE val = 'a' AND grp = 'x')").expect("update to new");
+        assert_imv_correct("cdu_view", fresh);
+    }
+
+    /// COUNT(DISTINCT) + COUNT(*) → rejected (mixed aggregates)
+    #[pg_test]
+    fn test_error_count_distinct_with_count_star() {
+        Spi::run("CREATE TABLE cdcs (id SERIAL, grp TEXT NOT NULL, val INT NOT NULL)").expect("create");
+        let result = crate::create_reflex_ivm("cdcs_view",
+            "SELECT grp, COUNT(DISTINCT val) AS cd, COUNT(*) AS total FROM cdcs GROUP BY grp",
+            None, None, None);
+        assert!(result.starts_with("ERROR"), "COUNT(DISTINCT)+COUNT(*) should be rejected: {}", result);
+    }
+
+    /// COUNT(DISTINCT) mixed with SUM → should be rejected
+    #[pg_test]
+    fn test_error_count_distinct_mixed_with_sum() {
+        Spi::run("CREATE TABLE cdm (grp TEXT, val INT, amount INT)").expect("create");
+        let result = crate::create_reflex_ivm("cdm_view",
+            "SELECT grp, COUNT(DISTINCT val) AS cd, SUM(amount) AS total FROM cdm GROUP BY grp",
+            None, None, None);
+        assert!(result.starts_with("ERROR"), "Mixed COUNT(DISTINCT)+SUM should error: {}", result);
+    }
+
+    /// COUNT(DISTINCT) fuzz
+    #[pg_test]
+    fn test_fuzz_count_distinct() {
+        Spi::run("SELECT setseed(0.63)").expect("seed");
+        Spi::run("CREATE TABLE cd_fuzz (id SERIAL PRIMARY KEY, grp INT NOT NULL, val INT NOT NULL)").expect("create");
+        Spi::run("INSERT INTO cd_fuzz (grp, val) SELECT (random()*5)::int, (random()*10)::int FROM generate_series(1, 200)").expect("seed data");
+
+        crate::create_reflex_ivm("cd_fuzz_view",
+            "SELECT grp, COUNT(DISTINCT val) AS cd FROM cd_fuzz GROUP BY grp",
+            None, None, None);
+
+        let fresh = "SELECT grp, COUNT(DISTINCT val) AS cd FROM cd_fuzz GROUP BY grp";
+        assert_imv_correct("cd_fuzz_view", fresh);
+
+        for _ in 0..15 {
+            match Spi::get_one::<i32>("SELECT (random()*2)::int").expect("q").expect("v") {
+                0 => Spi::run("INSERT INTO cd_fuzz (grp, val) VALUES ((random()*5)::int, (random()*10)::int)").expect("insert"),
+                1 => Spi::run("DELETE FROM cd_fuzz WHERE id = (SELECT id FROM cd_fuzz ORDER BY random() LIMIT 1)").expect("delete"),
+                _ => Spi::run("UPDATE cd_fuzz SET val = (random()*10)::int WHERE id = (SELECT id FROM cd_fuzz ORDER BY random() LIMIT 1)").expect("update"),
+            };
+            assert_imv_correct("cd_fuzz_view", fresh);
+        }
     }
 
     // ========================================================================

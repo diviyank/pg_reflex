@@ -46,7 +46,7 @@ pub fn bare_column_name(col: &str) -> &str {
 /// Unquoted identifiers in SQL are folded to lowercase by PostgreSQL,
 /// so all generated SQL should use lowercase column names for consistency.
 pub fn normalized_column_name(col: &str) -> String {
-    bare_column_name(col).to_lowercase()
+    bare_column_name(col).trim_matches('"').to_lowercase()
 }
 
 
@@ -144,7 +144,7 @@ pub fn generate_base_query(analysis: &SqlAnalysis, plan: &AggregationPlan) -> St
     // Group by: use the original group_by_columns expressions (with table qualifiers)
     // because the FROM clause defines those aliases.
     // For DISTINCT without GROUP BY, group by all passthrough columns.
-    let group_cols = if plan.group_by_columns.is_empty() && plan.has_distinct {
+    let mut group_cols = if plan.group_by_columns.is_empty() && plan.has_distinct {
         analysis
             .select_columns
             .iter()
@@ -154,6 +154,12 @@ pub fn generate_base_query(analysis: &SqlAnalysis, plan: &AggregationPlan) -> St
     } else {
         plan.group_by_columns.clone()
     };
+    // Include distinct_columns in GROUP BY (needed for COUNT(DISTINCT) compound key)
+    for dc in &plan.distinct_columns {
+        if !group_cols.contains(dc) {
+            group_cols.push(dc.clone());
+        }
+    }
 
     if !group_cols.is_empty() {
         query.push_str(&format!(" GROUP BY {}", group_cols.join(", ")));
@@ -268,10 +274,15 @@ pub fn generate_end_query(view_name: &str, plan: &AggregationPlan) -> String {
         select_parts.push(format!("\"{}\"", norm));
     }
 
-    // For DISTINCT without GROUP BY, add the distinct columns
-    for col in &plan.distinct_columns {
-        let norm = normalized_column_name(col);
-        select_parts.push(format!("\"{}\"", norm));
+    // For DISTINCT without GROUP BY (not COUNT(DISTINCT)), add the distinct columns to output.
+    // For COUNT(DISTINCT), distinct_columns are internal to the intermediate — not in the SELECT.
+    let has_count_distinct_mapping = plan.end_query_mappings.iter()
+        .any(|m| m.intermediate_expr.starts_with("COUNT("));
+    if !has_count_distinct_mapping {
+        for col in &plan.distinct_columns {
+            let norm = normalized_column_name(col);
+            select_parts.push(format!("\"{}\"", norm));
+        }
     }
 
     // End query aggregate expressions (with optional cast).
@@ -308,6 +319,15 @@ pub fn generate_end_query(view_name: &str, plan: &AggregationPlan) -> String {
     let is_sentinel = plan.group_by_columns.is_empty() && plan.distinct_columns.is_empty();
     if plan.needs_ivm_count && !is_sentinel {
         query.push_str(" WHERE __ivm_count > 0");
+    }
+
+    // For COUNT(DISTINCT): add GROUP BY on the original group columns
+    // so COUNT(*) re-aggregates from the (grp, val) compound intermediate to just (grp).
+    if has_count_distinct_mapping && !plan.group_by_columns.is_empty() {
+        let grp_cols: Vec<String> = plan.group_by_columns.iter()
+            .map(|c| format!("\"{}\"", normalized_column_name(c)))
+            .collect();
+        query.push_str(&format!(" GROUP BY {}", grp_cols.join(", ")));
     }
 
     // Apply HAVING clause (rewritten to use intermediate column names)

@@ -28,6 +28,7 @@ pub enum AggregateKind {
     Sum,
     Count,
     CountStar,
+    CountDistinct,
     Avg,
     Min,
     Max,
@@ -203,10 +204,9 @@ impl<'a> Visitor for AnalysisVisitor<'a> {
                     }
                     let func_name = f.name.to_string().to_uppercase();
                     // Detect unsupported aggregate functions
-                    if is_known_unsupported_aggregate(&func_name) {
-                        if !self.analysis.unsupported_aggregates.contains(&func_name) {
-                            self.analysis.unsupported_aggregates.push(func_name.clone());
-                        }
+                    if is_known_unsupported_aggregate(&func_name)
+                        && !self.analysis.unsupported_aggregates.contains(&func_name) {
+                        self.analysis.unsupported_aggregates.push(func_name.clone());
                     }
                     // Detect non-deterministic functions in SELECT
                     if is_nondeterministic_function(&func_name) {
@@ -391,6 +391,15 @@ fn extract_select_column(expr: &Expr, alias: Option<String>) -> SelectColumn {
             // Check for COUNT(*)
             if matches!(kind, AggregateKind::Count) && is_wildcard_arg(&f.args) {
                 kind = AggregateKind::CountStar;
+            }
+            // Check for DISTINCT modifier on aggregates
+            if let FunctionArguments::List(list) = &f.args {
+                if list.duplicate_treatment == Some(sqlparser::ast::DuplicateTreatment::Distinct)
+                    && kind == AggregateKind::Count
+                {
+                    kind = AggregateKind::CountDistinct;
+                }
+                // SUM(DISTINCT), AVG(DISTINCT), etc. are rejected in lib.rs via SQL string check
             }
             let aggregate_arg = if matches!(kind, AggregateKind::CountStar) {
                 Some("*".to_string())
@@ -730,7 +739,7 @@ mod tests {
         let a = parse_and_analyze(
             "WITH regional AS (SELECT region, SUM(amount) AS total FROM orders GROUP BY region) SELECT region, total FROM regional",
         );
-        assert!(!a.unsupported_reason().is_some()); // Non-recursive CTE is now supported
+        assert!(a.unsupported_reason().is_none()); // Non-recursive CTE is now supported
         assert_eq!(a.ctes.len(), 1);
         assert_eq!(a.ctes[0].alias, "regional");
         assert!(a.ctes[0].query_sql.contains("SUM"));
@@ -774,7 +783,7 @@ mod tests {
     #[test]
     fn test_window_detected() {
         let a = parse_and_analyze("SELECT id, SUM(amount) OVER (PARTITION BY city) FROM orders");
-        assert!(!a.unsupported_reason().is_some(), "Window functions should no longer be unsupported");
+        assert!(a.unsupported_reason().is_none(), "Window functions should no longer be unsupported");
         assert!(a.has_window_function);
         // The window column should be flagged
         let win_col = a.select_columns.iter().find(|c| c.is_window);

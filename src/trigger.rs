@@ -41,10 +41,12 @@ pub fn build_merge_sql(
         DeltaOp::Subtract => "-",
     };
 
-    // ON clause: t."col" = d."col" for each join column
+    // ON clause: IS NOT DISTINCT FROM handles NULL group keys correctly
+    // (NULL = NULL is false, but NULL IS NOT DISTINCT FROM NULL is true).
+    // Same performance as = (uses same B-tree/hash index).
     let on_clause = join_cols
         .iter()
-        .map(|c| format!("t.{} = d.{}", c, c))
+        .map(|c| format!("t.{} IS NOT DISTINCT FROM d.{}", c, c))
         .collect::<Vec<_>>()
         .join(" AND ");
 
@@ -282,6 +284,22 @@ pub fn build_min_max_recompute_sql(
 }
 
 
+/// Build a NULL-safe match condition for affected groups.
+/// Uses EXISTS with IS NOT DISTINCT FROM instead of IN (which fails for NULL keys).
+/// `target_alias` is the table being filtered (e.g., target table or intermediate).
+/// `affected_tbl` is the affected-groups table.
+/// `cols` are the group column names (quoted).
+/// `cols` are the group column names (quoted).
+fn null_safe_in(affected_tbl: &str, cols: &[String]) -> String {
+    let conditions: Vec<String> = cols.iter()
+        .map(|c| format!("{} IS NOT DISTINCT FROM __a.{}", c, c))
+        .collect();
+    format!(
+        "EXISTS (SELECT 1 FROM \"{}\" AS __a WHERE {})",
+        affected_tbl, conditions.join(" AND ")
+    )
+}
+
 /// Build the group column list for targeted refresh.
 /// Returns quoted column names from group_by + distinct columns (bare names).
 /// Returns None if there are no group columns (sentinel-only case).
@@ -406,41 +424,51 @@ pub fn reflex_build_delta_sql(
     // 1. Self-join: source_table appears multiple times in base_query
     // 2. LEFT/RIGHT JOIN secondary table DELETE/UPDATE: NULL semantics can't be captured by MERGE subtract
     let bare_source = split_qualified_name(source_table).1;
-    let (is_self_join, is_outer_join_secondary) = if !plan.is_passthrough {
-        let occurrences = base_query.split_whitespace()
-            .filter(|w| {
-                let trimmed = w.trim_matches(|c: char| !c.is_alphanumeric() && c != '_');
-                trimmed == source_table || trimmed == bare_source
-            })
-            .count();
-        let self_join = occurrences > 1;
+    // Detect self-join and outer-join-secondary for BOTH aggregate and passthrough queries.
+    let occurrences = base_query.split_whitespace()
+        .filter(|w| {
+            let trimmed = w.trim_matches(|c: char| !c.is_alphanumeric() && c != '_');
+            trimmed == source_table || trimmed == bare_source
+        })
+        .count();
+    let is_self_join = occurrences > 1;
 
-        let bq_upper = base_query.to_uppercase();
-        let outer_secondary = !self_join
-            && (operation == "DELETE" || operation == "UPDATE")
-            && (bq_upper.contains("LEFT JOIN") || bq_upper.contains("RIGHT JOIN")
-                || bq_upper.contains("LEFT OUTER") || bq_upper.contains("RIGHT OUTER"))
-            && bq_upper.find("JOIN").is_some_and(|pos| {
-                let after = &base_query[pos..];
-                after.contains(source_table) || after.contains(bare_source)
-            });
-        (self_join, outer_secondary)
-    } else {
-        (false, false)
-    };
+    let bq_upper = base_query.to_uppercase();
+    let is_full_outer = bq_upper.contains("FULL JOIN") || bq_upper.contains("FULL OUTER");
+    let is_outer_join_secondary = !is_self_join
+        && (bq_upper.contains("LEFT JOIN") || bq_upper.contains("RIGHT JOIN")
+            || bq_upper.contains("LEFT OUTER") || bq_upper.contains("RIGHT OUTER")
+            || is_full_outer)
+        && bq_upper.find("JOIN").is_some_and(|pos| {
+            let after = &base_query[pos..];
+            after.contains(source_table) || after.contains(bare_source)
+        })
+        // For LEFT/RIGHT JOIN: only DELETE/UPDATE need special handling (INSERT is correct).
+        // For FULL OUTER JOIN: ALL operations need full refresh (both sides produce NULLs).
+        && (operation == "DELETE" || operation == "UPDATE" || is_full_outer);
 
-    if is_self_join && !plan.is_passthrough {
+    if is_self_join {
         // Self-join: full refresh (delta itself is wrong — both aliases get replaced).
-        stmts.push(format!("TRUNCATE {}", intermediate_tbl));
-        stmts.push(format!("INSERT INTO {} {}", intermediate_tbl, base_query));
         let qv = quote_identifier(view_name);
-        if end_query.is_empty() {
-            stmts.push(format!("TRUNCATE {}", qv));
+        if plan.is_passthrough {
+            stmts.push(format!("DELETE FROM {}", qv));
             stmts.push(format!("INSERT INTO {} {}", qv, base_query));
         } else {
-            stmts.push(format!("TRUNCATE {}", qv));
-            stmts.push(format!("INSERT INTO {} {}", qv, end_query));
+            stmts.push(format!("TRUNCATE {}", intermediate_tbl));
+            stmts.push(format!("INSERT INTO {} {}", intermediate_tbl, base_query));
+            if end_query.is_empty() {
+                stmts.push(format!("TRUNCATE {}", qv));
+                stmts.push(format!("INSERT INTO {} {}", qv, base_query));
+            } else {
+                stmts.push(format!("TRUNCATE {}", qv));
+                stmts.push(format!("INSERT INTO {} {}", qv, end_query));
+            }
         }
+    } else if is_outer_join_secondary && plan.is_passthrough {
+        // Passthrough outer-join secondary: full refresh from source
+        let qv = quote_identifier(view_name);
+        stmts.push(format!("DELETE FROM {}", qv));
+        stmts.push(format!("INSERT INTO {} {}", qv, base_query));
     } else if is_outer_join_secondary && !plan.is_passthrough {
         // LEFT/RIGHT JOIN secondary table DELETE/UPDATE: targeted group reconcile.
         // The delta correctly identifies WHICH groups changed (affected groups),
@@ -449,8 +477,6 @@ pub fn reflex_build_delta_sql(
         // re-insert ONLY those groups from the full base_query.
         if let Some(ref cols) = grp_cols {
             let select_expr = affected_groups_select(cols);
-            let cols_str = cols.join(", ");
-            let row = row_expr(cols);
             let qv = quote_identifier(view_name);
 
             // Determine transition table for affected group extraction
@@ -478,27 +504,21 @@ pub fn reflex_build_delta_sql(
                 ));
             }
 
-            // Delete affected groups from intermediate
-            stmts.push(format!(
-                "DELETE FROM {} WHERE {} IN (SELECT {} FROM \"{}\")",
-                intermediate_tbl, row, cols_str, affected_tbl
-            ));
+            // Delete affected groups from intermediate (NULL-safe)
+            let ns_in_int = null_safe_in(&affected_tbl, cols);
+            stmts.push(format!("DELETE FROM {} WHERE {}", intermediate_tbl, ns_in_int));
 
             // Re-insert ONLY affected groups from the FULL base_query (reads real source).
-            // Wrap base_query in subquery and filter by affected group keys.
+            let ns_in_full = null_safe_in(&affected_tbl, cols);
             stmts.push(format!(
-                "INSERT INTO {} SELECT * FROM ({}) AS __full WHERE {} IN (SELECT {} FROM \"{}\")",
-                intermediate_tbl, base_query, row, cols_str, affected_tbl
+                "INSERT INTO {} SELECT * FROM ({}) AS __full WHERE {}",
+                intermediate_tbl, base_query, ns_in_full
             ));
 
-            // Targeted refresh of target (same as normal path)
-            stmts.push(format!(
-                "DELETE FROM {} WHERE {} IN (SELECT {} FROM \"{}\")",
-                qv, row, cols_str, affected_tbl
-            ));
-            stmts.push(format!(
-                "INSERT INTO {} {} AND {} IN (SELECT {} FROM \"{}\")",
-                qv, end_query, row, cols_str, affected_tbl
+            // Targeted refresh of target (NULL-safe)
+            let ns_in_tgt = null_safe_in(&affected_tbl, cols);
+            stmts.push(format!("DELETE FROM {} WHERE {}", qv, ns_in_tgt));
+            stmts.push(format!("INSERT INTO {} {} AND {}", qv, end_query, ns_in_tgt
             ));
         } else {
             // No group columns: full refresh
@@ -640,21 +660,21 @@ pub fn reflex_build_delta_sql(
             _ => {}
         }
 
-        // Refresh target from intermediate
-        if let Some(ref cols) = grp_cols {
-            // Targeted refresh: only update groups that changed
-            let cols_str = cols.join(", ");
-            let row = row_expr(cols);
-
+        // Refresh target from intermediate.
+        // For COUNT(DISTINCT): end_query has a GROUP BY re-aggregation, so targeted refresh
+        // (appending AND to end_query) doesn't work. Use full target refresh instead.
+        let end_query_has_group_by = end_query.to_uppercase().contains("GROUP BY");
+        if end_query_has_group_by {
+            // Full target refresh — correct for COUNT(DISTINCT) and other re-aggregating end queries
             let qv = quote_identifier(view_name);
-            stmts.push(format!(
-                "DELETE FROM {} WHERE {} IN (SELECT {} FROM \"{}\")",
-                qv, row, cols_str, affected_tbl
-            ));
-            stmts.push(format!(
-                "INSERT INTO {} {} AND {} IN (SELECT {} FROM \"{}\")",
-                qv, end_query, row, cols_str, affected_tbl
-            ));
+            stmts.push(format!("DELETE FROM {}", qv));
+            stmts.push(format!("INSERT INTO {} {}", qv, end_query));
+        } else if let Some(ref cols) = grp_cols {
+            // Targeted refresh (NULL-safe via IS NOT DISTINCT FROM)
+            let qv = quote_identifier(view_name);
+            let ns_in = null_safe_in(&affected_tbl, cols);
+            stmts.push(format!("DELETE FROM {} WHERE {}", qv, ns_in));
+            stmts.push(format!("INSERT INTO {} {} AND {}", qv, end_query, ns_in));
         } else {
             // No group columns (sentinel-only): full refresh
             stmts.push(format!("TRUNCATE {}", quote_identifier(view_name)));
@@ -799,10 +819,8 @@ pub fn reflex_flush_deferred(source_table: &str) -> String {
                 .unwrap_or_report();
 
             // Process INSERT deltas (op = 'I')
-            let ins_base = base_query.replace(
-                source_table,
-                &format!("(SELECT * FROM {} WHERE __reflex_op = 'I') AS __dt", delta_tbl),
-            );
+            let ins_staging = format!("(SELECT * FROM {} WHERE __reflex_op = 'I') AS __dt", delta_tbl);
+            let ins_base = replace_identifier(base_query, source_table, &ins_staging);
             let ins_sql = reflex_build_delta_sql(imv_name, source_table, "INSERT", &ins_base, end_query, agg_json);
             if !ins_sql.is_empty() {
                 for stmt in ins_sql.split("\n--<<REFLEX_SEP>>--\n") {
@@ -814,10 +832,8 @@ pub fn reflex_flush_deferred(source_table: &str) -> String {
             }
 
             // Process DELETE deltas (op = 'D')
-            let del_base = base_query.replace(
-                source_table,
-                &format!("(SELECT * FROM {} WHERE __reflex_op = 'D') AS __dt", delta_tbl),
-            );
+            let del_staging = format!("(SELECT * FROM {} WHERE __reflex_op = 'D') AS __dt", delta_tbl);
+            let del_base = replace_identifier(base_query, source_table, &del_staging);
             let del_sql = reflex_build_delta_sql(imv_name, source_table, "DELETE", &del_base, end_query, agg_json);
             if !del_sql.is_empty() {
                 for stmt in del_sql.split("\n--<<REFLEX_SEP>>--\n") {
@@ -829,10 +845,8 @@ pub fn reflex_flush_deferred(source_table: &str) -> String {
             }
 
             // Process UPDATE deltas: U_OLD as DELETE, U_NEW as INSERT
-            let upd_old_base = base_query.replace(
-                source_table,
-                &format!("(SELECT * FROM {} WHERE __reflex_op = 'U_OLD') AS __dt", delta_tbl),
-            );
+            let upd_old_staging = format!("(SELECT * FROM {} WHERE __reflex_op = 'U_OLD') AS __dt", delta_tbl);
+            let upd_old_base = replace_identifier(base_query, source_table, &upd_old_staging);
             let upd_old_sql = reflex_build_delta_sql(imv_name, source_table, "DELETE", &upd_old_base, end_query, agg_json);
             if !upd_old_sql.is_empty() {
                 for stmt in upd_old_sql.split("\n--<<REFLEX_SEP>>--\n") {
@@ -842,9 +856,8 @@ pub fn reflex_flush_deferred(source_table: &str) -> String {
                 }
             }
 
-            let upd_new_base = base_query.replace(
-                source_table,
-                &format!("(SELECT * FROM {} WHERE __reflex_op = 'U_NEW') AS __dt", delta_tbl),
+            let upd_new_staging = format!("(SELECT * FROM {} WHERE __reflex_op = 'U_NEW') AS __dt", delta_tbl);
+            let upd_new_base = replace_identifier(base_query, source_table, &upd_new_staging
             );
             let upd_new_sql = reflex_build_delta_sql(imv_name, source_table, "INSERT", &upd_new_base, end_query, agg_json);
             if !upd_new_sql.is_empty() {
@@ -912,7 +925,7 @@ mod tests {
         let delta = "SELECT city, SUM(amount) AS \"__sum_amount\", COUNT(*) AS __ivm_count FROM \"__reflex_new_v\" GROUP BY city";
         let sql = build_merge_sql("__reflex_intermediate_v", delta, &plan, DeltaOp::Add);
         assert!(sql.contains("MERGE INTO __reflex_intermediate_v AS t"));
-        assert!(sql.contains("t.\"city\" = d.\"city\""));
+        assert!(sql.contains("t.\"city\" IS NOT DISTINCT FROM d.\"city\""));
         assert!(sql.contains("COALESCE(t.\"__sum_amount\", 0) + COALESCE(d.\"__sum_amount\", 0)"));
         assert!(sql.contains("COALESCE(t.__ivm_count, 0) + COALESCE(d.__ivm_count, 0)"));
         assert!(sql.contains("WHEN NOT MATCHED THEN INSERT"));
