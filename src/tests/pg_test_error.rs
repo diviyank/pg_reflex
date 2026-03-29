@@ -405,12 +405,13 @@ fn test_error_rollup() {
 }
 
 #[pg_test]
-fn test_error_filter_clause() {
+fn test_filter_clause_now_supported() {
     Spi::run("CREATE TABLE err_filt (city TEXT, active BOOLEAN)").expect("create");
     let result = crate::create_reflex_ivm("err_filt_v",
         "SELECT city, COUNT(*) FILTER (WHERE active) AS cnt FROM err_filt GROUP BY city",
         None, None, None);
-    assert!(result.starts_with("ERROR"), "FILTER clause should be rejected: {}", result);
+    assert!(!result.starts_with("ERROR"), "FILTER clause should be supported now: {}", result);
+    crate::drop_reflex_ivm("err_filt_v");
 }
 
 #[pg_test]

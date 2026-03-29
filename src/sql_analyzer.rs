@@ -51,6 +51,8 @@ pub struct SelectColumn {
     pub cast_type: Option<String>,
     /// True if this is a window function expression (has OVER clause)
     pub is_window: bool,
+    /// The FILTER (WHERE ...) predicate, if any (original SQL string)
+    pub filter_expr: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -108,6 +110,10 @@ pub struct SqlAnalysis {
     pub has_scalar_subquery: bool,
     pub unsupported_aggregates: Vec<String>,
     pub has_nondeterministic_select: bool,
+    /// DISTINCT ON columns (e.g., ["city"] from DISTINCT ON (city))
+    pub distinct_on_columns: Vec<String>,
+    /// ORDER BY expressions as strings (e.g., ["city", "val DESC"])
+    pub order_by_exprs: Vec<String>,
 }
 
 impl SqlAnalysis {
@@ -120,14 +126,15 @@ impl SqlAnalysis {
         if self.has_limit {
             return Some("LIMIT is not supported (materialized views have no row order)".into());
         }
-        if self.has_order_by {
+        if self.has_order_by && !self.has_distinct_on {
             return Some("ORDER BY is not supported (materialized views have no row order)".into());
         }
         if self.has_lateral_join {
             return Some("LATERAL joins are not supported".into());
         }
-        if self.has_distinct_on {
-            return Some("DISTINCT ON is not supported".into());
+        // DISTINCT ON is supported via ROW_NUMBER() decomposition (see create_ivm.rs)
+        if self.has_distinct_on && self.order_by_exprs.is_empty() {
+            return Some("DISTINCT ON without ORDER BY is not supported (row selection would be arbitrary)".into());
         }
         if self.has_grouping_sets {
             return Some(
@@ -137,9 +144,7 @@ impl SqlAnalysis {
         if self.has_tablesample {
             return Some("TABLESAMPLE is not supported (non-deterministic)".into());
         }
-        if self.has_filter_clause {
-            return Some("FILTER clause on aggregates is not supported".into());
-        }
+        // FILTER clause is supported via CASE WHEN rewrite (see extract_select_column)
         if self.has_within_group {
             return Some("WITHIN GROUP (ordered-set aggregates) is not supported".into());
         }
@@ -383,6 +388,7 @@ fn extract_select_column(expr: &Expr, alias: Option<String>) -> SelectColumn {
                 is_passthrough: false,
                 cast_type,
                 is_window: true,
+                filter_expr: None,
             };
         }
 
@@ -401,19 +407,41 @@ fn extract_select_column(expr: &Expr, alias: Option<String>) -> SelectColumn {
                 }
                 // SUM(DISTINCT), AVG(DISTINCT), etc. are rejected in lib.rs via SQL string check
             }
-            let aggregate_arg = if matches!(kind, AggregateKind::CountStar) {
+            let mut aggregate_arg = if matches!(kind, AggregateKind::CountStar) {
                 Some("*".to_string())
             } else {
                 first_arg_sql(&f.args)
             };
+
+            // FILTER (WHERE cond) → rewrite aggregate_arg to CASE WHEN cond THEN arg END
+            let filter_expr = f.filter.as_ref().map(|filt| filt.to_string());
+            if let Some(ref filter) = filter_expr {
+                if matches!(kind, AggregateKind::CountStar) {
+                    // COUNT(*) FILTER (WHERE c) → COUNT(CASE WHEN c THEN 1 END)
+                    kind = AggregateKind::Count;
+                    aggregate_arg = Some(format!("CASE WHEN {} THEN 1 END", filter));
+                } else if let Some(ref arg) = aggregate_arg {
+                    aggregate_arg = Some(format!("CASE WHEN {} THEN {} END", filter, arg));
+                }
+            }
+
+            // Rewrite expr_sql to reflect the CASE WHEN form for base_query generation
+            let expr_sql = if filter_expr.is_some() {
+                let arg_str = aggregate_arg.as_deref().unwrap_or("*");
+                format!("{}({})", func_name, arg_str)
+            } else {
+                inner.to_string()
+            };
+
             return SelectColumn {
-                expr_sql: inner.to_string(),
+                expr_sql,
                 alias,
                 aggregate: Some(kind),
                 aggregate_arg,
                 is_passthrough: false,
                 cast_type,
                 is_window: false,
+                filter_expr,
             };
         }
     }
@@ -425,6 +453,7 @@ fn extract_select_column(expr: &Expr, alias: Option<String>) -> SelectColumn {
         is_passthrough: true,
         cast_type: None,
         is_window: false,
+        filter_expr: None,
     }
 }
 
@@ -557,13 +586,21 @@ pub fn analyze(statements: &[Statement]) -> Result<SqlAnalysis, SqlAnalysisError
 
     // DISTINCT / DISTINCT ON
     match &select.distinct {
-        Some(Distinct::On(_)) => {
+        Some(Distinct::On(cols)) => {
             analysis.has_distinct_on = true;
+            analysis.distinct_on_columns = cols.iter().map(|e| e.to_string()).collect();
         }
         Some(_) => {
             analysis.has_distinct = true;
         }
         None => {}
+    }
+
+    // Capture ORDER BY expressions (needed for DISTINCT ON decomposition)
+    if let Some(ref order_by) = query.order_by {
+        if let sqlparser::ast::OrderByKind::Expressions(exprs) = &order_by.kind {
+            analysis.order_by_exprs = exprs.iter().map(|e| e.to_string()).collect();
+        }
     }
 
     // SELECT columns
@@ -588,6 +625,7 @@ pub fn analyze(statements: &[Statement]) -> Result<SqlAnalysis, SqlAnalysisError
                     is_passthrough: true,
                     cast_type: None,
                     is_window: false,
+                    filter_expr: None,
                 });
             }
             SelectItem::QualifiedWildcard(kind, _) => {
@@ -599,6 +637,7 @@ pub fn analyze(statements: &[Statement]) -> Result<SqlAnalysis, SqlAnalysisError
                     is_passthrough: true,
                     cast_type: None,
                     is_window: false,
+                    filter_expr: None,
                 });
             }
         }

@@ -244,6 +244,130 @@ pub(crate) fn create_reflex_ivm_impl(view_name: &str, sql: &str, unique_columns_
     }
     // --- End set operation decomposition ---
 
+    // --- DISTINCT ON decomposition: passthrough sub-IMV + ROW_NUMBER VIEW ---
+    // DISTINCT ON (cols) ORDER BY ... selects one row per group. We decompose into:
+    //   1. A sub-IMV for the base data (passthrough) — incrementally maintained
+    //   2. A VIEW with ROW_NUMBER() OVER (PARTITION BY <cols> ORDER BY <order>) WHERE rn = 1
+    if analysis.has_distinct_on && !analysis.distinct_on_columns.is_empty() {
+        // Build base SQL: original SELECT without DISTINCT ON and ORDER BY
+        let select_items: Vec<String> = analysis.select_columns.iter().map(|c| {
+            if let Some(ref alias) = c.alias {
+                format!("{} AS {}", c.expr_sql, alias)
+            } else {
+                c.expr_sql.clone()
+            }
+        }).collect();
+        let mut base_sql = format!("SELECT {} FROM {}", select_items.join(", "), analysis.from_clause_sql);
+        if let Some(ref wc) = analysis.where_clause {
+            base_sql.push_str(&format!(" WHERE {}", wc));
+        }
+
+        // Create sub-IMV for the base data
+        let base_name = format!("{}__base", view_name);
+        let result = create_reflex_ivm_impl(
+            &base_name, &base_sql, unique_columns_str, false, storage_mode, refresh_mode,
+        );
+        if result.starts_with("ERROR") {
+            return result;
+        }
+
+        // Build the VIEW: SELECT <cols> FROM (SELECT *, ROW_NUMBER() OVER (...) AS __reflex_rn FROM base) WHERE __reflex_rn = 1
+        // Strip table qualifiers — the VIEW reads from the base sub-IMV which has bare column names
+        let partition_cols: Vec<String> = analysis.distinct_on_columns.iter()
+            .map(|c| format!("\"{}\"", bare_column_name(c)))
+            .collect();
+        let partition_by = partition_cols.join(", ");
+
+        // For ORDER BY, strip table qualifiers but preserve ASC/DESC/NULLS modifiers
+        let order_parts: Vec<String> = analysis.order_by_exprs.iter().map(|expr| {
+            // Split on first space to separate column from modifiers (e.g., "j2.val DESC")
+            let parts: Vec<&str> = expr.splitn(2, ' ').collect();
+            let col = format!("\"{}\"", bare_column_name(parts[0]));
+            if parts.len() > 1 {
+                format!("{} {}", col, parts[1])
+            } else {
+                col
+            }
+        }).collect();
+        let order_by = order_parts.join(", ");
+
+        // Output column list (just names/aliases, no expressions)
+        let output_cols: Vec<String> = analysis.select_columns.iter().map(|c| {
+            if let Some(ref alias) = c.alias {
+                format!("\"{}\"", alias)
+            } else {
+                format!("\"{}\"", bare_column_name(&c.expr_sql))
+            }
+        }).collect();
+
+        let view_sql = format!(
+            "SELECT {} FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY {} ORDER BY {}) AS __reflex_rn FROM {}) __sub WHERE __reflex_rn = 1",
+            output_cols.join(", "),
+            partition_by,
+            order_by,
+            quote_identifier(&base_name)
+        );
+
+        Spi::connect_mut(|client| {
+            client
+                .update(
+                    &format!(
+                        "CREATE OR REPLACE VIEW {} AS {}",
+                        quote_identifier(view_name),
+                        view_sql
+                    ),
+                    None,
+                    &[],
+                )
+                .unwrap_or_report();
+
+            // Register in reference table for cleanup
+            let depends_on = vec![base_name.clone()];
+            let depends_on_imv = vec![base_name.clone()];
+            client.update(
+                "INSERT INTO public.__reflex_ivm_reference
+                 (name, graph_depth, depends_on, depends_on_imv, unlogged_tables,
+                  graph_child, sql_query, base_query, end_query,
+                  aggregations, index_columns, unique_columns, enabled, last_update_date,
+                  storage_mode, refresh_mode)
+                 VALUES ($1, 2, $2, $3, $4, $5, $6, $7, $8, $9::json, $10, $11, TRUE, NOW(), $12, $13)",
+                None,
+                &[
+                    unsafe { DatumWithOid::new(view_name.to_string(), PgBuiltInOids::TEXTOID.oid().value()) },
+                    unsafe { DatumWithOid::new(depends_on, PgBuiltInOids::TEXTARRAYOID.oid().value()) },
+                    unsafe { DatumWithOid::new(depends_on_imv.clone(), PgBuiltInOids::TEXTARRAYOID.oid().value()) },
+                    unsafe { DatumWithOid::new(Vec::<String>::new(), PgBuiltInOids::TEXTARRAYOID.oid().value()) },
+                    unsafe { DatumWithOid::new(Vec::<String>::new(), PgBuiltInOids::TEXTARRAYOID.oid().value()) },
+                    unsafe { DatumWithOid::new(sql.to_string(), PgBuiltInOids::TEXTOID.oid().value()) },
+                    unsafe { DatumWithOid::new(view_sql.clone(), PgBuiltInOids::TEXTOID.oid().value()) },
+                    unsafe { DatumWithOid::new(String::new(), PgBuiltInOids::TEXTOID.oid().value()) },
+                    unsafe { DatumWithOid::new("{}".to_string(), PgBuiltInOids::TEXTOID.oid().value()) },
+                    unsafe { DatumWithOid::new(Vec::<String>::new(), PgBuiltInOids::TEXTARRAYOID.oid().value()) },
+                    unsafe { DatumWithOid::new(Vec::<String>::new(), PgBuiltInOids::TEXTARRAYOID.oid().value()) },
+                    unsafe { DatumWithOid::new(storage_upper.clone(), PgBuiltInOids::TEXTOID.oid().value()) },
+                    unsafe { DatumWithOid::new(mode_upper.clone(), PgBuiltInOids::TEXTOID.oid().value()) },
+                ],
+            ).unwrap_or_report();
+
+            // Update base IMV's graph_child
+            for name in &depends_on_imv {
+                client.update(
+                    "UPDATE public.__reflex_ivm_reference
+                     SET graph_child = array_append(COALESCE(graph_child, ARRAY[]::TEXT[]), $1)
+                     WHERE name = $2",
+                    None,
+                    &[
+                        unsafe { DatumWithOid::new(view_name.to_string(), PgBuiltInOids::TEXTOID.oid().value()) },
+                        unsafe { DatumWithOid::new(name.to_string(), PgBuiltInOids::TEXTOID.oid().value()) },
+                    ],
+                ).unwrap_or_report();
+            }
+        });
+
+        return "CREATE REFLEX INCREMENTAL VIEW";
+    }
+    // --- End DISTINCT ON decomposition ---
+
     // --- Window function decomposition: base sub-IMV + VIEW wrapper ---
     // Window functions can't be incrementally maintained (ROW_NUMBER, RANK, LAG
     // depend on the full result set). Instead, we decompose into:

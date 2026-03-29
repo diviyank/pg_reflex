@@ -167,6 +167,8 @@ mod tests {
     include!("tests/pg_test_error.rs");
     include!("tests/pg_test_e2e.rs");
     include!("tests/pg_test_correctness.rs");
+    include!("tests/pg_test_filter.rs");
+    include!("tests/pg_test_distinct_on.rs");
 }
 
 /// This module is required by `cargo pgrx test` invocations.

@@ -96,15 +96,44 @@ pub(crate) fn drop_reflex_ivm_impl(view_name: &str, cascade: bool) -> &'static s
             }
         }
 
-        // 5. Drop target table
+        // 5. Drop target (could be a TABLE or a VIEW for window/DISTINCT ON decompositions)
         let cascade_suffix = if cascade { " CASCADE" } else { "" };
-        client
-            .update(
-                &format!("DROP TABLE IF EXISTS {}{}", quote_identifier(view_name), cascade_suffix),
+        let (tgt_schema, tgt_name) = split_qualified_name(view_name);
+        let tgt_schema_str = tgt_schema.unwrap_or("public");
+        let relkind: String = client
+            .select(
+                "SELECT COALESCE((SELECT relkind::TEXT FROM pg_class c JOIN pg_namespace n ON c.relnamespace = n.oid \
+                 WHERE n.nspname = $1 AND c.relname = $2), 'r')",
                 None,
-                &[],
+                &[
+                    unsafe { DatumWithOid::new(tgt_schema_str.to_string(), PgBuiltInOids::TEXTOID.oid().value()) },
+                    unsafe { DatumWithOid::new(tgt_name.to_string(), PgBuiltInOids::TEXTOID.oid().value()) },
+                ],
             )
-            .unwrap_or_report();
+            .unwrap_or_report()
+            .first()
+            .get_by_name::<&str, _>("coalesce")
+            .unwrap_or(None)
+            .unwrap_or("r")
+            .to_string();
+
+        if relkind == "v" {
+            client
+                .update(
+                    &format!("DROP VIEW IF EXISTS {}{}", quote_identifier(view_name), cascade_suffix),
+                    None,
+                    &[],
+                )
+                .unwrap_or_report();
+        } else {
+            client
+                .update(
+                    &format!("DROP TABLE IF EXISTS {}{}", quote_identifier(view_name), cascade_suffix),
+                    None,
+                    &[],
+                )
+                .unwrap_or_report();
+        }
 
         // 6. Drop intermediate table
         let intermediate = intermediate_table_name(view_name);

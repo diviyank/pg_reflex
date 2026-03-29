@@ -282,8 +282,9 @@ fn test_detect_filter_clause() {
         "SELECT city, COUNT(*) FILTER (WHERE active) FROM t GROUP BY city",
     );
     assert!(a.has_filter_clause);
-    assert!(a.unsupported_reason().is_some());
-    assert!(a.unsupported_reason().unwrap().contains("FILTER"));
+    // FILTER is now supported via CASE WHEN rewrite
+    assert!(a.unsupported_reason().is_none(),
+        "FILTER should be supported, got: {:?}", a.unsupported_reason());
 }
 
 #[test]
@@ -385,6 +386,163 @@ fn test_multiple_unsupported_aggregates() {
         "SELECT city, STRING_AGG(name, ','), ARRAY_AGG(val), STDDEV(val) FROM t GROUP BY city",
     );
     assert_eq!(a.unsupported_aggregates.len(), 3);
+}
+
+// ========================================================================
+// FILTER clause tests
+// ========================================================================
+
+#[test]
+fn test_filter_sum() {
+    let a = parse_and_analyze(
+        "SELECT city, SUM(amount) FILTER (WHERE active) AS active_total FROM t GROUP BY city",
+    );
+    assert!(a.has_filter_clause, "FILTER should be detected");
+    assert!(a.unsupported_reason().is_none(),
+        "FILTER should no longer be rejected: {:?}", a.unsupported_reason());
+    let col = &a.select_columns[1];
+    assert_eq!(col.aggregate, Some(AggregateKind::Sum));
+    let arg = col.aggregate_arg.as_deref().unwrap();
+    assert!(arg.contains("CASE") && arg.contains("WHEN") && arg.contains("active"),
+        "SUM FILTER arg should be rewritten to CASE WHEN, got: {}", arg);
+    assert!(arg.contains("amount"),
+        "Rewritten arg should contain original column: {}", arg);
+}
+
+#[test]
+fn test_filter_count_star() {
+    let a = parse_and_analyze(
+        "SELECT city, COUNT(*) FILTER (WHERE active) AS active_cnt FROM t GROUP BY city",
+    );
+    assert!(a.unsupported_reason().is_none());
+    let col = &a.select_columns[1];
+    // COUNT(*) FILTER → COUNT(CASE WHEN active THEN 1 END)
+    assert_eq!(col.aggregate, Some(AggregateKind::Count),
+        "COUNT(*) FILTER should become Count (not CountStar), got: {:?}", col.aggregate);
+    let arg = col.aggregate_arg.as_deref().unwrap();
+    assert!(arg.contains("CASE") && arg.contains("1"),
+        "COUNT(*) FILTER arg should be CASE WHEN ... THEN 1 END, got: {}", arg);
+}
+
+#[test]
+fn test_filter_count_col() {
+    let a = parse_and_analyze(
+        "SELECT city, COUNT(val) FILTER (WHERE active) AS cnt FROM t GROUP BY city",
+    );
+    assert!(a.unsupported_reason().is_none());
+    let col = &a.select_columns[1];
+    assert_eq!(col.aggregate, Some(AggregateKind::Count));
+    let arg = col.aggregate_arg.as_deref().unwrap();
+    assert!(arg.contains("CASE") && arg.contains("val"),
+        "COUNT(col) FILTER arg should be CASE WHEN ... THEN val END, got: {}", arg);
+}
+
+#[test]
+fn test_filter_avg() {
+    let a = parse_and_analyze(
+        "SELECT city, AVG(salary) FILTER (WHERE active) AS avg_sal FROM t GROUP BY city",
+    );
+    assert!(a.unsupported_reason().is_none());
+    let col = &a.select_columns[1];
+    assert_eq!(col.aggregate, Some(AggregateKind::Avg));
+    let arg = col.aggregate_arg.as_deref().unwrap();
+    assert!(arg.contains("CASE") && arg.contains("salary"),
+        "AVG FILTER arg should be rewritten, got: {}", arg);
+}
+
+#[test]
+fn test_filter_min_max() {
+    let a = parse_and_analyze(
+        "SELECT city, MIN(val) FILTER (WHERE active) AS lo, MAX(val) FILTER (WHERE active) AS hi FROM t GROUP BY city",
+    );
+    assert!(a.unsupported_reason().is_none());
+    assert_eq!(a.select_columns[1].aggregate, Some(AggregateKind::Min));
+    assert_eq!(a.select_columns[2].aggregate, Some(AggregateKind::Max));
+    for col in &a.select_columns[1..] {
+        let arg = col.aggregate_arg.as_deref().unwrap();
+        assert!(arg.contains("CASE") && arg.contains("val"),
+            "MIN/MAX FILTER arg should be rewritten, got: {}", arg);
+    }
+}
+
+#[test]
+fn test_filter_mixed_with_regular() {
+    let a = parse_and_analyze(
+        "SELECT city, SUM(amount) AS total, COUNT(*) FILTER (WHERE active) AS active_cnt FROM t GROUP BY city",
+    );
+    assert!(a.unsupported_reason().is_none());
+    // Regular SUM — not rewritten
+    let sum_col = &a.select_columns[1];
+    assert_eq!(sum_col.aggregate, Some(AggregateKind::Sum));
+    assert_eq!(sum_col.aggregate_arg.as_deref(), Some("amount"));
+    // COUNT(*) FILTER — rewritten
+    let cnt_col = &a.select_columns[2];
+    assert_eq!(cnt_col.aggregate, Some(AggregateKind::Count));
+    let arg = cnt_col.aggregate_arg.as_deref().unwrap();
+    assert!(arg.contains("CASE"), "FILTER aggregate should be rewritten, got: {}", arg);
+}
+
+#[test]
+fn test_filter_expr_captured() {
+    let a = parse_and_analyze(
+        "SELECT city, SUM(amount) FILTER (WHERE status = 'active') AS s FROM t GROUP BY city",
+    );
+    let col = &a.select_columns[1];
+    assert!(col.filter_expr.is_some(), "filter_expr should be captured");
+    let filter = col.filter_expr.as_deref().unwrap();
+    assert!(filter.contains("status") && filter.contains("active"),
+        "filter_expr should contain the original predicate, got: {}", filter);
+}
+
+// ========================================================================
+// DISTINCT ON tests
+// ========================================================================
+
+#[test]
+fn test_distinct_on_columns_captured() {
+    let a = parse_and_analyze(
+        "SELECT DISTINCT ON (city) city, name, val FROM t ORDER BY city, val DESC",
+    );
+    assert!(a.has_distinct_on);
+    assert!(!a.distinct_on_columns.is_empty(), "distinct_on_columns should be captured");
+    assert_eq!(a.distinct_on_columns, vec!["city"]);
+}
+
+#[test]
+fn test_distinct_on_multi_columns_captured() {
+    let a = parse_and_analyze(
+        "SELECT DISTINCT ON (city, dept) city, dept, name FROM t ORDER BY city, dept, name",
+    );
+    assert!(a.has_distinct_on);
+    assert_eq!(a.distinct_on_columns, vec!["city", "dept"]);
+}
+
+#[test]
+fn test_distinct_on_order_by_captured() {
+    let a = parse_and_analyze(
+        "SELECT DISTINCT ON (city) city, name, val FROM t ORDER BY city, val DESC",
+    );
+    assert!(!a.order_by_exprs.is_empty(), "ORDER BY should be captured");
+    // Should contain something like "city" and "val DESC"
+    let joined = a.order_by_exprs.join(", ");
+    assert!(joined.contains("city"), "ORDER BY should contain 'city': {}", joined);
+    assert!(joined.contains("val"), "ORDER BY should contain 'val': {}", joined);
+}
+
+#[test]
+fn test_distinct_on_no_longer_rejected() {
+    let a = parse_and_analyze(
+        "SELECT DISTINCT ON (city) city, name, val FROM t ORDER BY city, val DESC",
+    );
+    assert!(a.unsupported_reason().is_none(),
+        "DISTINCT ON should be supported, got: {:?}", a.unsupported_reason());
+}
+
+#[test]
+fn test_order_by_still_rejected_without_distinct_on() {
+    let a = parse_and_analyze("SELECT * FROM t ORDER BY id");
+    assert!(a.unsupported_reason().is_some());
+    assert!(a.unsupported_reason().unwrap().contains("ORDER BY"));
 }
 
 mod proptest_tests {
