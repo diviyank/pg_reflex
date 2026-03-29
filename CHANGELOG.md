@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.1.0] - 2026-03-29
+
+### Fixed
+- **DROP CASCADE** — `drop_reflex_ivm(name, true)` now issues `DROP TABLE ... CASCADE` on target, intermediate, and affected-groups tables. Previously, cascade only dropped child IMVs in the reflex dependency graph but left external PostgreSQL objects (views, foreign keys) intact, causing the drop to fail if any existed.
+
+### Internal
+- **Codebase restructured** — `lib.rs` reduced from 10,548 to 189 lines. Implementation split into focused modules: `create_ivm.rs` (IVM creation), `drop_ivm.rs` (drop logic), `reconcile.rs` (reconcile/refresh). Submodule tests extracted into separate files under `src/tests/`.
+- **Tests reorganized** — 376 tests split into 18 categorized files (basic, trigger, passthrough, CTE, set ops, window, drop, reconcile, deferred, error, e2e, correctness, plus 6 unit test files). No test logic changed.
+
+### Tests
+- 376 tests (up from 375 in v1.0.4)
+- New: non-SELECT query rejection integration test (INSERT, UPDATE, DELETE, CREATE/DROP/ALTER TABLE)
+
 ## [1.0.4] - 2026-03-26
 
 ### Performance
