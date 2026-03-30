@@ -36,6 +36,7 @@ pub enum AggregateKind {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct SelectColumn {
     /// The original expression as a SQL string (e.g., "SUM(amount)")
     pub expr_sql: String,
