@@ -769,7 +769,8 @@ pub(crate) fn create_reflex_ivm_impl(view_name: &str, sql: &str, unique_columns_
             }
         } else {
             // Aggregate: build intermediate + target tables from the plan
-            let column_types = query_column_types_from_catalog(client, &froms);
+            let (column_types, not_null_cols) = query_column_types_from_catalog(client, &froms);
+            plan.optimize_not_null_sums(&not_null_cols);
 
             if let Some(ddl) = build_intermediate_table_ddl(view_name, &plan, &column_types, logged) {
                 let tbl = intermediate_table_name(view_name);
@@ -1251,8 +1252,9 @@ fn is_from_table(qualified_col: &str, table_bare_name: &str, table_aliases: &[St
 fn query_column_types_from_catalog(
     client: &pgrx::spi::SpiClient<'_>,
     table_names: &[String],
-) -> HashMap<String, String> {
+) -> (HashMap<String, String>, std::collections::HashSet<String>) {
     let mut types = HashMap::new();
+    let mut not_null_cols = std::collections::HashSet::new();
     for table in table_names {
         // Skip non-real tables (subqueries, functions)
         if table.starts_with('<') {
@@ -1267,7 +1269,8 @@ fn query_column_types_from_catalog(
         };
         let rows = client
             .select(
-                "SELECT column_name::text AS col_name, data_type::text AS data_type \
+                "SELECT column_name::text AS col_name, data_type::text AS data_type, \
+                        is_nullable::text AS is_nullable \
                  FROM information_schema.columns \
                  WHERE table_schema = $1 AND table_name = $2",
                 None,
@@ -1296,10 +1299,18 @@ fn query_column_types_from_catalog(
                 types.insert(format!("{}.{}", tbl, col_name), pg_type.clone());
                 // Also insert bare column name for simpler lookups
                 types.entry(col_name.to_string()).or_insert(pg_type);
+
+                // Track NOT NULL columns for SUM optimization
+                let is_nullable = row.get_by_name::<String, _>("is_nullable")
+                    .unwrap_or(None)
+                    .unwrap_or_default();
+                if is_nullable == "NO" {
+                    not_null_cols.insert(col_name.to_string());
+                }
             }
         }
     }
-    types
+    (types, not_null_cols)
 }
 
 /// Map information_schema data_type strings to PostgreSQL type names usable in DDL.

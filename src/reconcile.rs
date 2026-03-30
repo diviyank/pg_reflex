@@ -121,6 +121,7 @@ pub(crate) fn reflex_reconcile(view_name: &str) -> &'static str {
                         passthrough_columns: vec![],
                         passthrough_key_mappings: std::collections::HashMap::new(),
                         having_clause: None,
+                        not_null_columns: std::collections::HashSet::new(),
                     }
                 });
 

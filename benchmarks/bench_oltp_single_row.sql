@@ -78,8 +78,8 @@ BEGIN
         ROUND(EXTRACT(MILLISECONDS FROM _end - _start) / 100, 2);
 END $$;
 
--- Baseline: same without trigger
-ALTER TABLE oltp_src DISABLE TRIGGER ALL;
+-- Baseline: measure raw INSERT cost on an identical table without triggers
+CREATE TEMP TABLE oltp_baseline (LIKE oltp_src INCLUDING DEFAULTS);
 
 \echo '[no trigger] 100 single-row inserts:'
 DO $$
@@ -90,7 +90,7 @@ DECLARE
 BEGIN
     _start := clock_timestamp();
     FOR i IN 1..100 LOOP
-        INSERT INTO oltp_src (customer_id, category, amount)
+        INSERT INTO oltp_baseline (customer_id, category, amount)
         VALUES (i, _cats[1 + (i % 10)], ROUND((random() * 100)::numeric, 2));
     END LOOP;
     _end := clock_timestamp();
@@ -99,7 +99,7 @@ BEGIN
         ROUND(EXTRACT(MILLISECONDS FROM _end - _start) / 100, 2);
 END $$;
 
-ALTER TABLE oltp_src ENABLE TRIGGER ALL;
+DROP TABLE oltp_baseline;
 
 -- ============================================================
 -- SCENARIO 2: 1 IMV, high cardinality (10K groups)

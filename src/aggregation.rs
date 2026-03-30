@@ -57,6 +57,59 @@ pub struct AggregationPlan {
     /// Rewritten HAVING clause (aggregate refs replaced with intermediate column names).
     #[serde(default)]
     pub having_clause: Option<String>,
+    /// Source columns known to be NOT NULL at IMV creation time.
+    /// Used to skip companion __nonnull_count columns for SUM aggregates.
+    #[serde(default)]
+    pub not_null_columns: std::collections::HashSet<String>,
+}
+
+impl AggregationPlan {
+    /// Remove __nonnull_count_* companion columns for SUM aggregates where the source
+    /// column is NOT NULL. When a column can't be NULL, SUM can never produce NULL
+    /// (empty group case is handled by __ivm_count), so the companion count is redundant.
+    pub fn optimize_not_null_sums(&mut self, not_null_columns: &std::collections::HashSet<String>) {
+        let to_remove: std::collections::HashSet<String> = self.intermediate_columns.iter()
+            .filter(|ic| {
+                ic.source_aggregate == "SUM"
+                    && not_null_columns.contains(&ic.source_arg)
+            })
+            .map(|ic| {
+                let arg_sanitized = ic.source_arg.chars()
+                    .map(|c| if c.is_alphanumeric() || c == '_' { c } else { '_' })
+                    .collect::<String>()
+                    .to_lowercase();
+                format!("__nonnull_count_{}", arg_sanitized)
+            })
+            .collect();
+
+        if to_remove.is_empty() {
+            return;
+        }
+
+        // Remove companion count columns from intermediate
+        self.intermediate_columns.retain(|ic| !to_remove.contains(&ic.name));
+
+        // Update end_query_mappings: replace CASE WHEN __nonnull_count > 0 THEN __sum END
+        // with just the __sum reference (the WHERE __ivm_count > 0 filter or sentinel
+        // CASE WHEN wrapper in generate_end_query handles the empty-group case).
+        for mapping in &mut self.end_query_mappings {
+            if mapping.aggregate_type == "SUM" {
+                for count_name in &to_remove {
+                    let old_prefix = format!("CASE WHEN \"{}\" > 0 THEN ", count_name);
+                    if mapping.intermediate_expr.starts_with(&old_prefix) {
+                        if let Some(sum_ref) = mapping.intermediate_expr
+                            .strip_prefix(&old_prefix)
+                            .and_then(|r| r.strip_suffix(" END"))
+                        {
+                            mapping.intermediate_expr = sum_ref.to_string();
+                        }
+                    }
+                }
+            }
+        }
+
+        self.not_null_columns = not_null_columns.clone();
+    }
 }
 
 /// Sanitize a SQL expression to be used as part of a column name.
@@ -436,6 +489,7 @@ pub fn plan_aggregation(analysis: &SqlAnalysis) -> AggregationPlan {
         passthrough_columns,
         passthrough_key_mappings: std::collections::HashMap::new(),
         having_clause: analysis.having_clause.clone(),
+        not_null_columns: std::collections::HashSet::new(),
     }
 }
 

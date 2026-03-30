@@ -353,6 +353,7 @@ fn replace_source_with_transition(base_query: &str, source_table: &str, transiti
 
 /// Push MERGE + affected-groups population.
 /// PG17+: single CTE with MERGE RETURNING (captures affected groups in one statement).
+///   When `include_cleanup` is true, prepends a DELETE FROM affected CTE (replaces TRUNCATE).
 /// PG15/16: separate MERGE + SELECT DISTINCT from delta query (MERGE RETURNING unsupported).
 fn push_merge_and_affected(
     stmts: &mut Vec<String>,
@@ -361,6 +362,7 @@ fn push_merge_and_affected(
     select_expr: &str,
     delta_query: &str,
     grp_cols: &[String],
+    include_cleanup: bool,
 ) {
     #[cfg(not(any(feature = "pg15", feature = "pg16")))]
     {
@@ -369,14 +371,20 @@ fn push_merge_and_affected(
             .map(|c| format!("t.{}", c))
             .collect::<Vec<_>>()
             .join(", ");
+        let cleanup_cte = if include_cleanup {
+            format!("cleanup AS (DELETE FROM \"{}\" RETURNING 1), ", affected_tbl)
+        } else {
+            String::new()
+        };
         stmts.push(format!(
-            "WITH __m AS ({} RETURNING {}) INSERT INTO \"{}\" SELECT DISTINCT {} FROM __m",
-            merge_sql, ret_cols, affected_tbl, select_expr
+            "WITH {}__m AS ({} RETURNING {}) INSERT INTO \"{}\" SELECT DISTINCT {} FROM __m",
+            cleanup_cte, merge_sql, ret_cols, affected_tbl, select_expr
         ));
     }
     #[cfg(any(feature = "pg15", feature = "pg16"))]
     {
         let _ = grp_cols; // only used in PG17+ RETURNING path
+        let _ = include_cleanup; // cleanup handled by caller via TRUNCATE on PG15/16
         stmts.push(merge_sql.to_string());
         stmts.push(format!(
             "INSERT INTO \"{}\" SELECT DISTINCT {} FROM ({}) AS __d",
@@ -595,8 +603,9 @@ pub fn reflex_build_delta_sql(
                 if let Some(ref cols) = grp_cols {
                     let select_expr = affected_groups_select(cols);
                     let merge_sql = build_merge_sql(&intermediate_tbl, &delta_q, &plan, DeltaOp::Add);
+                    #[cfg(any(feature = "pg15", feature = "pg16"))]
                     stmts.push(format!("TRUNCATE \"{}\"", affected_tbl));
-                    push_merge_and_affected(&mut stmts, &merge_sql, &affected_tbl, &select_expr, &delta_q, cols);
+                    push_merge_and_affected(&mut stmts, &merge_sql, &affected_tbl, &select_expr, &delta_q, cols, true);
                 } else {
                     stmts.push(build_merge_sql(&intermediate_tbl, &delta_q, &plan, DeltaOp::Add));
                 }
@@ -607,8 +616,9 @@ pub fn reflex_build_delta_sql(
                 if let Some(ref cols) = grp_cols {
                     let select_expr = affected_groups_select(cols);
                     let merge_sql = build_merge_sql(&intermediate_tbl, &delta_q, &plan, DeltaOp::Subtract);
+                    #[cfg(any(feature = "pg15", feature = "pg16"))]
                     stmts.push(format!("TRUNCATE \"{}\"", affected_tbl));
-                    push_merge_and_affected(&mut stmts, &merge_sql, &affected_tbl, &select_expr, &delta_q, cols);
+                    push_merge_and_affected(&mut stmts, &merge_sql, &affected_tbl, &select_expr, &delta_q, cols, true);
                 } else {
                     stmts.push(build_merge_sql(&intermediate_tbl, &delta_q, &plan, DeltaOp::Subtract));
                 }
@@ -623,18 +633,17 @@ pub fn reflex_build_delta_sql(
                 let delta_new = replace_source_with_transition(base_query, source_table, &new_tbl);
 
                 if has_min_max {
-                    // MIN/MAX/BOOL_OR need two-phase: subtract → recompute → add.
-                    // Can't use net-delta because MIN/MAX have no algebraic inverse.
                     if let Some(ref cols) = grp_cols {
                         let select_expr = affected_groups_select(cols);
                         let merge_sub_sql = build_merge_sql(&intermediate_tbl, &delta_old, &plan, DeltaOp::Subtract);
+                        #[cfg(any(feature = "pg15", feature = "pg16"))]
                         stmts.push(format!("TRUNCATE \"{}\"", affected_tbl));
-                        push_merge_and_affected(&mut stmts, &merge_sub_sql, &affected_tbl, &select_expr, &delta_old, cols);
+                        push_merge_and_affected(&mut stmts, &merge_sub_sql, &affected_tbl, &select_expr, &delta_old, cols, true);
                         if let Some(recompute) = build_min_max_recompute_sql(&intermediate_tbl, &plan, source_table) {
                             stmts.push(recompute);
                         }
                         let merge_add_sql = build_merge_sql(&intermediate_tbl, &delta_new, &plan, DeltaOp::Add);
-                        push_merge_and_affected(&mut stmts, &merge_add_sql, &affected_tbl, &select_expr, &delta_new, cols);
+                        push_merge_and_affected(&mut stmts, &merge_add_sql, &affected_tbl, &select_expr, &delta_new, cols, false);
                     } else {
                         stmts.push(build_merge_sql(&intermediate_tbl, &delta_old, &plan, DeltaOp::Subtract));
                         if let Some(recompute) = build_min_max_recompute_sql(&intermediate_tbl, &plan, source_table) {
@@ -643,16 +652,14 @@ pub fn reflex_build_delta_sql(
                         stmts.push(build_merge_sql(&intermediate_tbl, &delta_new, &plan, DeltaOp::Add));
                     }
                 } else if grp_cols.is_some() {
-                    // No MIN/MAX + has group columns: use single-pass net-delta MERGE.
-                    // Combines old (negated) + new into one delta, halving MERGE count.
                     let cols = grp_cols.as_ref().unwrap();
                     let net_delta = build_net_delta_query(&delta_old, &delta_new, &plan);
                     let select_expr = affected_groups_select(cols);
                     let merge_sql = build_merge_sql(&intermediate_tbl, &net_delta, &plan, DeltaOp::Add);
+                    #[cfg(any(feature = "pg15", feature = "pg16"))]
                     stmts.push(format!("TRUNCATE \"{}\"", affected_tbl));
-                    push_merge_and_affected(&mut stmts, &merge_sql, &affected_tbl, &select_expr, &net_delta, cols);
+                    push_merge_and_affected(&mut stmts, &merge_sql, &affected_tbl, &select_expr, &net_delta, cols, true);
                 } else {
-                    // No MIN/MAX, no group columns (sentinel): fall back to two-phase
                     stmts.push(build_merge_sql(&intermediate_tbl, &delta_old, &plan, DeltaOp::Subtract));
                     stmts.push(build_merge_sql(&intermediate_tbl, &delta_new, &plan, DeltaOp::Add));
                 }
@@ -660,33 +667,85 @@ pub fn reflex_build_delta_sql(
             _ => {}
         }
 
-        // Refresh target from intermediate.
-        // For COUNT(DISTINCT): end_query has a GROUP BY re-aggregation, so targeted refresh
-        // (appending AND to end_query) doesn't work. Use full target refresh instead.
+        // Refresh target from intermediate, clean up dead groups, and update metadata.
+        // PG17+: consolidated into a single CTE chain (fewer EXECUTE calls = less SPI overhead).
+        // PG15/16: separate statements.
         let end_query_has_group_by = end_query.to_uppercase().contains("GROUP BY");
+        let include_dead_cleanup = plan.needs_ivm_count && grp_cols.is_some()
+            && (operation == "DELETE" || operation == "UPDATE");
+        let metadata_sql = format!(
+            "UPDATE public.__reflex_ivm_reference SET last_update_date = NOW() \
+             WHERE name = '{}' AND (last_update_date IS NULL OR last_update_date < NOW() - INTERVAL '1 second')",
+            view_name.replace("'", "''")
+        );
+
         if end_query_has_group_by {
-            // Full target refresh — correct for COUNT(DISTINCT) and other re-aggregating end queries
             let qv = quote_identifier(view_name);
-            stmts.push(format!("DELETE FROM {}", qv));
-            stmts.push(format!("INSERT INTO {} {}", qv, end_query));
+            #[cfg(not(any(feature = "pg15", feature = "pg16")))]
+            {
+                stmts.push(format!(
+                    "WITH del AS (DELETE FROM {} RETURNING 1), \
+                     ins AS (INSERT INTO {} {} RETURNING 1) \
+                     {}",
+                    qv, qv, end_query, metadata_sql
+                ));
+            }
+            #[cfg(any(feature = "pg15", feature = "pg16"))]
+            {
+                stmts.push(format!("DELETE FROM {}", qv));
+                stmts.push(format!("INSERT INTO {} {}", qv, end_query));
+                stmts.push(metadata_sql);
+            }
         } else if let Some(ref cols) = grp_cols {
-            // Targeted refresh (NULL-safe via IS NOT DISTINCT FROM)
             let qv = quote_identifier(view_name);
             let ns_in = null_safe_in(&affected_tbl, cols);
-            stmts.push(format!("DELETE FROM {} WHERE {}", qv, ns_in));
-            stmts.push(format!("INSERT INTO {} {} AND {}", qv, end_query, ns_in));
+            #[cfg(not(any(feature = "pg15", feature = "pg16")))]
+            {
+                let mut ctes = Vec::new();
+                if include_dead_cleanup {
+                    ctes.push(format!(
+                        "dead_cleanup AS (DELETE FROM {} WHERE __ivm_count <= 0 RETURNING 1)",
+                        intermediate_tbl
+                    ));
+                }
+                ctes.push(format!(
+                    "del AS (DELETE FROM {} WHERE {} RETURNING 1)",
+                    qv, ns_in
+                ));
+                ctes.push(format!(
+                    "ins AS (INSERT INTO {} {} AND {} RETURNING 1)",
+                    qv, end_query, ns_in
+                ));
+                stmts.push(format!("WITH {} {}", ctes.join(", "), metadata_sql));
+            }
+            #[cfg(any(feature = "pg15", feature = "pg16"))]
+            {
+                if include_dead_cleanup {
+                    stmts.push(format!("DELETE FROM {} WHERE __ivm_count <= 0", intermediate_tbl));
+                }
+                stmts.push(format!("DELETE FROM {} WHERE {}", qv, ns_in));
+                stmts.push(format!("INSERT INTO {} {} AND {}", qv, end_query, ns_in));
+                stmts.push(metadata_sql);
+            }
         } else {
-            // No group columns (sentinel-only): full refresh
-            stmts.push(format!("TRUNCATE {}", quote_identifier(view_name)));
-            stmts.push(format!("INSERT INTO {} {}", quote_identifier(view_name), end_query));
+            let qv = quote_identifier(view_name);
+            #[cfg(not(any(feature = "pg15", feature = "pg16")))]
+            {
+                stmts.push(format!(
+                    "WITH del AS (DELETE FROM {} RETURNING 1), \
+                     ins AS (INSERT INTO {} {} RETURNING 1) \
+                     {}",
+                    qv, qv, end_query, metadata_sql
+                ));
+            }
+            #[cfg(any(feature = "pg15", feature = "pg16"))]
+            {
+                stmts.push(format!("TRUNCATE {}", qv));
+                stmts.push(format!("INSERT INTO {} {}", qv, end_query));
+                stmts.push(metadata_sql);
+            }
         }
     }
-
-    // Update last_update_date
-    stmts.push(format!(
-        "UPDATE public.__reflex_ivm_reference SET last_update_date = NOW() WHERE name = '{}'",
-        view_name.replace("'", "''")
-    ));
 
     stmts.join("\n--<<REFLEX_SEP>>--\n")
 }
@@ -725,9 +784,10 @@ pub fn reflex_build_truncate_sql(view_name: &str) -> String {
         stmts.push(format!("DELETE FROM {}", quote_identifier(view_name)));
     }
 
-    // Update last_update_date
+    // Update last_update_date (lazy: skip if updated within the last second)
     stmts.push(format!(
-        "UPDATE public.__reflex_ivm_reference SET last_update_date = NOW() WHERE name = '{}'",
+        "UPDATE public.__reflex_ivm_reference SET last_update_date = NOW() \
+         WHERE name = '{}' AND (last_update_date IS NULL OR last_update_date < NOW() - INTERVAL '1 second')",
         view_name.replace("'", "''")
     ));
 

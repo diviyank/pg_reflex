@@ -23,6 +23,7 @@ fn simple_plan() -> AggregationPlan {
         passthrough_columns: vec![],
         passthrough_key_mappings: std::collections::HashMap::new(),
         having_clause: None,
+        not_null_columns: std::collections::HashSet::new(),
     }
 }
 
@@ -67,6 +68,7 @@ fn test_build_merge_min_add() {
         passthrough_columns: vec![],
         passthrough_key_mappings: std::collections::HashMap::new(),
         having_clause: None,
+        not_null_columns: std::collections::HashSet::new(),
     };
     let delta = "SELECT city, MIN(price) AS \"__min_price\", COUNT(*) AS __ivm_count FROM src GROUP BY city";
     let sql = build_merge_sql("intermediate", delta, &plan, DeltaOp::Add);
@@ -91,6 +93,7 @@ fn test_build_upsert_min_subtract_sets_null() {
         passthrough_columns: vec![],
         passthrough_key_mappings: std::collections::HashMap::new(),
         having_clause: None,
+        not_null_columns: std::collections::HashSet::new(),
     };
     let delta = "SELECT city, MIN(price) FROM src GROUP BY city";
     let sql = build_merge_sql("intermediate", delta, &plan, DeltaOp::Subtract);
@@ -123,6 +126,7 @@ fn test_min_max_recompute_sql() {
         passthrough_columns: vec![],
         passthrough_key_mappings: std::collections::HashMap::new(),
         having_clause: None,
+        not_null_columns: std::collections::HashSet::new(),
     };
     let sql = build_min_max_recompute_sql("intermediate", &plan, "orders");
     assert!(sql.is_some());
