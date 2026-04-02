@@ -1,0 +1,209 @@
+Timing is on.
+ setseed 
+---------
+ 
+(1 row)
+
+Time: 0,568 ms
+
+================================================================
+  REPRODUCE: bench_sop_forecast + detailed trigger timing
+  db_clone | PG18 | 76M source rows | 7.7M output rows
+  shared_buffers = 128MB
+================================================================
+DO
+Time: 1,260 ms
+ target_indexes 
+----------------
+              5
+(1 row)
+
+Time: 1,912 ms
+SELECT 80098
+Time: 1625,571 ms (00:01,626)
+ pool_size 
+-----------
+     80098
+(1 row)
+
+Time: 3,512 ms
+CREATE TABLE
+Time: 1,788 ms
+CREATE FUNCTION
+Time: 0,932 ms
+CREATE FUNCTION
+Time: 0,646 ms
+INSERT 0 1
+Time: 4,398 ms
+DELETE 1
+Time: 1,799 ms
+SELECT 1
+Time: 1,244 ms
+CREATE FUNCTION
+Time: 0,958 ms
+CREATE FUNCTION
+Time: 0,798 ms
+
+================================================================
+  INSERT BENCHMARK (all batch sizes)
+================================================================
+
+--- INSERT 1,000 rows ---
+         metric         |  ms   
+------------------------+-------
+ reflex_total           | 144.4
+ raw_insert_replica     |  46.1
+ overhead_total         |  98.2
+ trigger_delta_insert   |  21.7
+ trigger_total_internal |  22.5
+ source_insert_cost     | 121.9
+ trigger_pct_of_total   |  15.6
+(7 rows)
+
+Time: 694,198 ms
+
+--- INSERT 5,000 rows ---
+         metric         |  ms   
+------------------------+-------
+ reflex_total           | 550.3
+ raw_insert_replica     | 108.8
+ overhead_total         | 441.5
+ trigger_delta_insert   |  92.2
+ trigger_total_internal |  93.0
+ source_insert_cost     | 457.3
+ trigger_pct_of_total   |  16.9
+(7 rows)
+
+Time: 1071,746 ms (00:01,072)
+
+--- INSERT 10,000 rows ---
+         metric         |  ms   
+------------------------+-------
+ reflex_total           | 840.9
+ raw_insert_replica     | 239.7
+ overhead_total         | 601.3
+ trigger_delta_insert   | 231.5
+ trigger_total_internal | 232.1
+ source_insert_cost     | 608.8
+ trigger_pct_of_total   |  27.6
+(7 rows)
+
+Time: 1426,647 ms (00:01,427)
+
+--- INSERT 25,000 rows ---
+         metric         |   ms   
+------------------------+--------
+ reflex_total           | 2480.7
+ raw_insert_replica     |  801.0
+ overhead_total         | 1679.7
+ trigger_delta_insert   |  468.0
+ trigger_total_internal |  468.5
+ source_insert_cost     | 2012.2
+ trigger_pct_of_total   |   18.9
+(7 rows)
+
+Time: 3661,476 ms (00:03,661)
+
+--- INSERT 50,000 rows ---
+         metric         |   ms   
+------------------------+--------
+ reflex_total           | 5582.9
+ raw_insert_replica     | 4436.7
+ overhead_total         | 1146.2
+ trigger_delta_insert   | 1041.7
+ trigger_total_internal | 1042.3
+ source_insert_cost     | 4540.7
+ trigger_pct_of_total   |   18.7
+(7 rows)
+
+Time: 10772,255 ms (00:10,772)
+
+--- INSERT 100,000 rows ---
+         metric         |   ms    
+------------------------+---------
+ reflex_total           |  9897.0
+ raw_insert_replica     | 10132.1
+ overhead_total         |  -235.1
+ trigger_delta_insert   |  2051.0
+ trigger_total_internal |  2051.9
+ source_insert_cost     |  7845.1
+ trigger_pct_of_total   |    20.7
+(7 rows)
+
+Time: 20933,819 ms (00:20,934)
+
+================================================================
+  TRIGGER INTERNALS PER BATCH SIZE
+================================================================
+ batch_size |    step_name     |   ms   
+------------+------------------+--------
+       1000 | 1_exists_check   |    0.2
+       1000 | 2_ref_query      |    0.1
+       1000 | 4_advisory_lock  |    0.1
+       1000 | 5_rust_ffi       |    0.1
+       1000 | 6_execute_stmt_1 |   21.7
+       1000 | 7_trigger_total  |   22.5
+       5000 | 1_exists_check   |    0.1
+       5000 | 2_ref_query      |    0.3
+       5000 | 4_advisory_lock  |    0.1
+       5000 | 5_rust_ffi       |    0.1
+       5000 | 6_execute_stmt_1 |   92.2
+       5000 | 7_trigger_total  |   93.0
+      10000 | 1_exists_check   |    0.1
+      10000 | 2_ref_query      |    0.2
+      10000 | 4_advisory_lock  |    0.0
+      10000 | 5_rust_ffi       |    0.1
+      10000 | 6_execute_stmt_1 |  231.5
+      10000 | 7_trigger_total  |  232.1
+      25000 | 1_exists_check   |    0.1
+      25000 | 2_ref_query      |    0.2
+      25000 | 4_advisory_lock  |    0.0
+      25000 | 5_rust_ffi       |    0.1
+      25000 | 6_execute_stmt_1 |  468.0
+      25000 | 7_trigger_total  |  468.5
+      50000 | 1_exists_check   |    0.1
+      50000 | 2_ref_query      |    0.2
+      50000 | 4_advisory_lock  |    0.0
+      50000 | 5_rust_ffi       |    0.1
+      50000 | 6_execute_stmt_1 | 1041.7
+      50000 | 7_trigger_total  | 1042.3
+     100000 | 1_exists_check   |    0.1
+     100000 | 2_ref_query      |    0.4
+     100000 | 4_advisory_lock  |    0.1
+     100000 | 5_rust_ffi       |    0.2
+     100000 | 6_execute_stmt_1 | 2051.0
+     100000 | 7_trigger_total  | 2051.9
+(36 rows)
+
+Time: 0,242 ms
+
+--- Trigger delta INSERT scaling ---
+ batch_size | delta_insert_ms | trigger_total_ms 
+------------+-----------------+------------------
+       1000 |            21.7 |             22.5
+       5000 |            92.2 |             93.0
+      10000 |           231.5 |            232.1
+      25000 |           468.0 |            468.5
+      50000 |          1041.7 |           1042.3
+     100000 |          2051.0 |           2051.9
+(6 rows)
+
+Time: 0,239 ms
+DO
+Time: 16,635 ms
+DROP TABLE
+Time: 2,140 ms
+DROP FUNCTION
+Time: 1,344 ms
+DROP FUNCTION
+Time: 1,040 ms
+DROP FUNCTION
+Time: 0,921 ms
+DROP TABLE
+Time: 1,479 ms
+DROP TABLE
+Time: 1,070 ms
+
+================================================================
+  BENCHMARK COMPLETE
+================================================================

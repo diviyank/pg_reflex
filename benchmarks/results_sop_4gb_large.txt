@@ -1,0 +1,184 @@
+Timing is on.
+ setseed 
+---------
+ 
+(1 row)
+
+Time: 2,205 ms
+
+================================================================
+  SOP FORECAST BENCHMARK — LARGE BATCHES (500K, 1M, 2M)
+  shared_buffers = 4GB
+================================================================
+ shared_buffers 
+----------------
+ 4GB
+(1 row)
+
+Time: 0,066 ms
+DO
+Time: 7,047 ms
+
+--- REFRESH MATERIALIZED VIEW baseline (2 runs) ---
+CREATE TABLE
+Time: 143,213 ms
+DO
+Time: 105125,960 ms (01:45,126)
+ run | REFRESH (ms) 
+-----+--------------
+   1 |        40396
+   2 |        64101
+(2 rows)
+
+Time: 1,036 ms
+SELECT 160196
+Time: 2554,894 ms (00:02,555)
+ pool_size 
+-----------
+    160196
+(1 row)
+
+Time: 8,661 ms
+CREATE FUNCTION
+Time: 2,737 ms
+CREATE FUNCTION
+Time: 1,048 ms
+INSERT 0 1
+Time: 23,511 ms
+DELETE 1
+Time: 2,718 ms
+CREATE FUNCTION
+Time: 1,016 ms
+CREATE FUNCTION
+Time: 0,971 ms
+CREATE FUNCTION
+Time: 0,961 ms
+
+================================================================
+  INSERT BENCHMARK
+================================================================
+--- INSERT 500,000 ---
+       metric       |  ms   
+--------------------+-------
+ reflex_total       | 58799
+ raw_insert_replica | 29133
+ refresh_baseline   | 64101
+ raw+refresh        | 93234
+ advantage_%        |  36.9
+(5 rows)
+
+Time: 90880,962 ms (01:30,881)
+--- INSERT 1,000,000 ---
+       metric       |   ms   
+--------------------+--------
+ reflex_total       |  55132
+ raw_insert_replica |  46723
+ refresh_baseline   |  64101
+ raw+refresh        | 110824
+ advantage_%        |   50.3
+(5 rows)
+
+Time: 109512,908 ms (01:49,513)
+--- INSERT 2,000,000 ---
+       metric       |   ms   
+--------------------+--------
+ reflex_total       | 178520
+ raw_insert_replica | 232403
+ refresh_baseline   |  64101
+ raw+refresh        | 296503
+ advantage_%        |   39.8
+(5 rows)
+
+Time: 434773,625 ms (07:14,774)
+
+================================================================
+  DELETE BENCHMARK
+================================================================
+--- DELETE 500,000 ---
+       metric       |  ms   
+--------------------+-------
+ reflex_total       | 18660
+ raw_delete_replica |  3179
+ refresh_baseline   | 64101
+ raw+refresh        | 67279
+ advantage_%        |  72.3
+(5 rows)
+
+Time: 141005,754 ms (02:21,006)
+--- DELETE 1,000,000 ---
+       metric       |  ms   
+--------------------+-------
+ reflex_total       | 14128
+ raw_delete_replica |  5676
+ refresh_baseline   | 64101
+ raw+refresh        | 69776
+ advantage_%        |  79.8
+(5 rows)
+
+Time: 251143,355 ms (04:11,143)
+--- DELETE 2,000,000 ---
+       metric       |  ms   
+--------------------+-------
+ reflex_total       | 23982
+ raw_delete_replica | 29197
+ refresh_baseline   | 64101
+ raw+refresh        | 93298
+ advantage_%        |  74.3
+(5 rows)
+
+Time: 713249,642 ms (11:53,250)
+
+================================================================
+  UPDATE BENCHMARK
+================================================================
+--- UPDATE 500,000 ---
+       metric       |  ms   
+--------------------+-------
+ reflex_total       | 53521
+ raw_update_replica | 34935
+ refresh_baseline   | 64101
+ raw+refresh        | 99036
+ advantage_%        |  46.0
+(5 rows)
+
+Time: 159107,544 ms (02:39,108)
+--- UPDATE 1,000,000 ---
+       metric       |   ms   
+--------------------+--------
+ reflex_total       | 206888
+ raw_update_replica | 208928
+ refresh_baseline   |  64101
+ raw+refresh        | 273028
+ advantage_%        |   24.2
+(5 rows)
+
+Time: 581543,573 ms (09:41,544)
+--- UPDATE 2,000,000 ---
+       metric       |   ms   
+--------------------+--------
+ reflex_total       | 469219
+ raw_update_replica | 445654
+ refresh_baseline   |  64101
+ raw+refresh        | 509755
+ advantage_%        |    8.0
+(5 rows)
+
+Time: 1412635,335 ms (23:32,635)
+DROP FUNCTION
+Time: 4,348 ms
+DROP FUNCTION
+Time: 0,988 ms
+DROP FUNCTION
+Time: 0,673 ms
+DROP FUNCTION
+Time: 1,003 ms
+DROP FUNCTION
+Time: 0,589 ms
+DROP TABLE
+Time: 3,658 ms
+DROP TABLE
+Time: 1,937 ms
+
+================================================================
+  BENCHMARK COMPLETE — LARGE BATCHES
+================================================================

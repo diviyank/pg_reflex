@@ -1,0 +1,156 @@
+Timing is on.
+ setseed 
+---------
+ 
+(1 row)
+
+Time: 0,460 ms
+ pg_stat_reset_shared 
+----------------------
+ 
+(1 row)
+
+Time: 0,380 ms
+
+================================================================
+  DIAGNOSTIC v2: 50K INSERT component breakdown
+  shared_buffers=128MB | source=18.7GB | target=~2-3GB
+================================================================
+DO
+Time: 1,234 ms
+SELECT 80098
+Time: 1486,427 ms (00:01,486)
+CREATE TABLE
+Time: 1,702 ms
+CREATE FUNCTION
+Time: 1,107 ms
+
+--- TEST A: Source INSERT, replica mode ---
+DO
+Time: 3273,387 ms (00:03,273)
+
+--- TEST B: Source INSERT, trigger disabled, FK active ---
+ALTER TABLE
+Time: 1,034 ms
+DO
+Time: 4797,841 ms (00:04,798)
+DO
+Time: 76,192 ms
+ALTER TABLE
+Time: 1,259 ms
+
+--- TEST C: Full 50K INSERT with trigger ---
+DO
+Time: 5228,103 ms (00:05,228)
+DO
+Time: 471,243 ms
+
+--- TEST D: Instrumented trigger ---
+SELECT 1
+Time: 13,237 ms
+CREATE FUNCTION
+Time: 3,640 ms
+DO
+Time: 6231,620 ms (00:06,232)
+DO
+Time: 6,589 ms
+DROP TABLE
+Time: 1,884 ms
+DO
+Time: 398,372 ms
+
+--- TEST E: Delta INSERT after source INSERT (dirty buffer pool) ---
+ALTER TABLE
+Time: 1,051 ms
+DO
+Time: 5028,347 ms (00:05,028)
+ALTER TABLE
+Time: 0,735 ms
+DO
+Time: 408,403 ms
+
+--- TEST F: After dropping from shared buffers (pg_buffercache eviction) ---
+CHECKPOINT
+Time: 3364,729 ms (00:03,365)
+DO
+Time: 2850,085 ms (00:02,850)
+DO
+Time: 5066,932 ms (00:05,067)
+DO
+Time: 382,535 ms
+
+--- TEST G: Repeat full INSERT (warm cache, compare with F) ---
+DO
+Time: 5808,176 ms (00:05,808)
+DO
+Time: 400,004 ms
+
+--- Buffer statistics since start of diagnostic ---
+psql:/home/diviyan/fentech/tools/pg_reflex/benchmarks/bench_diagnostic_breakdown_v2.sql:372: ERROR:  column "buffers_checkpoint" does not exist
+LINE 2:     buffers_checkpoint,
+            ^
+Time: 0,747 ms
+
+================================================================
+  RESULTS SUMMARY
+================================================================
+    test_name    |         step_name          |     ms     
+-----------------+----------------------------+------------
+ A_replica       | source_insert              |     3158.9
+ B_no_trigger_fk | source_insert              |     4018.4
+ C_with_trigger  | total                      |     4371.7
+ D_instrumented  | exists_check               |        0.2
+ D_instrumented  | ref_query                  |        0.3
+ D_instrumented  | advisory_lock              |        0.1
+ D_instrumented  | rust_ffi                   |        0.2
+ D_instrumented  | execute_stmt_1             |     1000.0
+ D_instrumented  | trigger_total              |     1001.0
+ D_instrumented  | wall_clock_total           |     5385.8
+ E_post_source   | source_insert_no_trig      |     3347.3
+ E_post_source   | delta_insert_dirty_buffers |      841.2
+ F_cold_sim      | eviction_scan_count        | 76099377.0
+ F_cold_sim      | full_insert_cold_target    |     4289.4
+ G_warm_repeat   | full_insert_warm           |     5081.9
+(15 rows)
+
+Time: 0,352 ms
+
+--- Computed breakdown ---
+                     component                      |  ms  
+----------------------------------------------------+------
+ A: Source INSERT (replica, no trigger/FK)          | 3159
+ B: Source INSERT (no trigger, FK active)           | 4018
+ B-A: FK registration overhead                      |  860
+ C: Full INSERT with trigger                        | 4372
+ C-B: Trigger overhead (total)                      |  353
+ D: Trigger internal (delta EXECUTE)                | 1000
+ D: Trigger internal total                          | 1001
+ D: Wall clock (source + trigger)                   | 5386
+ E: Source INSERT alone (no trigger)                | 3347
+ E: Delta INSERT after source (dirty buffers)       |  841
+ F: Full INSERT cold target (after buffer eviction) | 4289
+ G: Full INSERT warm (repeat)                       | 5082
+(12 rows)
+
+Time: 0,399 ms
+DROP FUNCTION
+Time: 0,953 ms
+DROP TABLE
+Time: 1,911 ms
+DROP TABLE
+Time: 1,247 ms
+
+================================================================
+  DIAGNOSTIC v2 COMPLETE
+
+  shared_buffers = 128MB
+  source table + indexes = ~18.7GB
+  target table + indexes = ~2-3GB
+
+  Key questions answered:
+  A vs B: FK overhead (should be ~0, deferred)
+  C vs B: pure trigger overhead
+  D steps: where time goes inside trigger
+  E: does dirty buffer pool slow the delta INSERT?
+  F vs G: cold vs warm cache impact
+================================================================

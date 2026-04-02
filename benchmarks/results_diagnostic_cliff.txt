@@ -1,0 +1,364 @@
+Timing is on.
+ setseed 
+---------
+ 
+(1 row)
+
+Time: 16,530 ms
+
+================================================================
+  DIAGNOSTIC: 25K vs 50K INSERT cliff analysis
+================================================================
+DO
+Time: 18,031 ms
+SELECT 80098
+Time: 65779,119 ms (01:05,779)
+ pool_size 
+-----------
+     80098
+(1 row)
+
+Time: 5,597 ms
+CREATE FUNCTION
+Time: 3,988 ms
+
+================================================================
+  TEST 1: 25K rows — EXPLAIN ANALYZE of delta INSERT
+================================================================
+Time: 4,038 ms
+SELECT 25000
+Time: 36,372 ms
+ delta rows (25K) 
+------------------
+            25000
+(1 row)
+
+Time: 1,247 ms
+
+--- EXPLAIN (ANALYZE, BUFFERS) INSERT into target from 25K delta ---
+                                                                                            QUERY PLAN                                                                                             
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Insert on sop_forecast_reflex  (cost=5.12..1119.72 rows=0 width=0) (actual time=2297.853..2297.855 rows=0.00 loops=1)
+   Buffers: shared hit=523418 read=33969 dirtied=33076 written=20437, local hit=320
+   ->  Nested Loop Left Join  (cost=5.12..1119.72 rows=242 width=121) (actual time=3.231..414.843 rows=25000.00 loops=1)
+         Buffers: shared hit=254121 read=1912 written=806, local hit=320
+         ->  Nested Loop Left Join  (cost=4.83..1012.85 rows=242 width=72) (actual time=2.285..237.324 rows=25000.00 loops=1)
+               Join Filter: ((demand_planning.assortment_id = pricing.assortment_id) AND (pricing.canal_id = location.canal_id))
+               Buffers: shared hit=173091 read=1511 written=779, local hit=320
+               ->  Nested Loop  (cost=4.54..912.32 rows=242 width=72) (actual time=1.654..169.621 rows=25000.00 loops=1)
+                     Buffers: shared hit=98800 read=1204 written=611, local hit=320
+                     ->  Hash Join  (cost=4.12..722.71 rows=242 width=72) (actual time=0.636..17.334 rows=25000.00 loops=1)
+                           Hash Cond: (_diag_delta.location_id = location.id)
+                           Buffers: shared read=3, local hit=320
+                           ->  Hash Join  (cost=2.53..716.14 rows=1862 width=64) (actual time=0.338..11.628 rows=25000.00 loops=1)
+                                 Hash Cond: (_diag_delta.dem_plan_id = demand_planning.id)
+                                 Buffers: shared read=2, local hit=320
+                                 ->  Seq Scan on _diag_delta  (cost=0.00..630.40 rows=31040 width=56) (actual time=0.003..2.467 rows=25000.00 loops=1)
+                                       Buffers: local hit=320
+                                 ->  Hash  (cost=2.38..2.38 rows=12 width=16) (actual time=0.332..0.332 rows=1.00 loops=1)
+                                       Buckets: 1024  Batches: 1  Memory Usage: 9kB
+                                       Buffers: shared read=2
+                                       ->  Seq Scan on demand_planning  (cost=0.00..2.38 rows=12 width=16) (actual time=0.313..0.331 rows=1.00 loops=1)
+                                             Filter: (is_sent_to_sop AND ((status)::text <> ALL ('{archive,archiving,error}'::text[])))
+                                             Rows Removed by Filter: 27
+                                             Buffers: shared read=2
+                           ->  Hash  (cost=1.26..1.26 rows=26 width=16) (actual time=0.296..0.296 rows=26.00 loops=1)
+                                 Buckets: 1024  Batches: 1  Memory Usage: 10kB
+                                 Buffers: shared read=1
+                                 ->  Seq Scan on location  (cost=0.00..1.26 rows=26 width=16) (actual time=0.288..0.291 rows=26.00 loops=1)
+                                       Buffers: shared read=1
+                     ->  Index Only Scan using product_pkey on product  (cost=0.42..0.78 rows=1 width=8) (actual time=0.006..0.006 rows=1.00 loops=25000)
+                           Index Cond: (id = _diag_delta.product_id)
+                           Heap Fetches: 25000
+                           Index Searches: 25000
+                           Buffers: shared hit=98800 read=1201 written=611
+               ->  Index Scan using ix_company_schema_pricing_product_id on pricing  (cost=0.29..0.40 rows=1 width=32) (actual time=0.002..0.002 rows=0.98 loops=25000)
+                     Index Cond: (product_id = _diag_delta.product_id)
+                     Index Searches: 25000
+                     Buffers: shared hit=74291 read=307 written=168
+         ->  Index Scan using idx_current_assortment_activity_product on current_assortment_activity_view caav  (cost=0.29..0.40 rows=1 width=16) (actual time=0.007..0.007 rows=0.76 loops=25000)
+               Index Cond: (product_id = _diag_delta.product_id)
+               Filter: (location_id = _diag_delta.location_id)
+               Rows Removed by Filter: 0
+               Index Searches: 25000
+               Buffers: shared hit=81030 read=401 written=27
+ Planning:
+   Buffers: shared hit=402 read=36
+ Planning Time: 10.010 ms
+ Execution Time: 2298.161 ms
+(48 rows)
+
+Time: 2322,001 ms (00:02,322)
+
+--- Timed INSERT (25K, no EXPLAIN overhead) ---
+DELETE 25000
+Time: 5896,097 ms (00:05,896)
+INSERT 0 25000
+Time: 473,639 ms
+DELETE 25000
+Time: 480,874 ms
+DROP TABLE
+Time: 5,056 ms
+
+================================================================
+  TEST 2: 50K rows — EXPLAIN ANALYZE of delta INSERT
+================================================================
+Time: 2,869 ms
+SELECT 50000
+Time: 53,715 ms
+ delta rows (50K) 
+------------------
+            50000
+(1 row)
+
+Time: 7,660 ms
+
+--- EXPLAIN (ANALYZE, BUFFERS) INSERT into target from 50K delta ---
+                                                                                            QUERY PLAN                                                                                             
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Insert on sop_forecast_reflex  (cost=5.12..1914.91 rows=0 width=0) (actual time=2677.988..2677.990 rows=0.00 loops=1)
+   Buffers: shared hit=1109359 read=61884 dirtied=62125 written=63212, local hit=443 read=133 written=133
+   ->  Nested Loop Left Join  (cost=5.12..1914.91 rows=436 width=121) (actual time=0.196..315.617 rows=50000.00 loops=1)
+         Buffers: shared hit=512318 read=2348 written=2146, local hit=443 read=133 written=133
+         ->  Nested Loop Left Join  (cost=4.83..1735.27 rows=436 width=72) (actual time=0.185..229.160 rows=50000.00 loops=1)
+               Join Filter: ((demand_planning.assortment_id = pricing.assortment_id) AND (pricing.canal_id = location.canal_id))
+               Buffers: shared hit=347184 read=2246 written=2055, local hit=443 read=133 written=133
+               ->  Nested Loop  (cost=4.54..1572.16 rows=436 width=72) (actual time=0.175..140.125 rows=50000.00 loops=1)
+                     Buffers: shared hit=198256 read=1748 written=1592, local hit=443 read=133 written=133
+                     ->  Hash Join  (cost=4.12..1297.60 rows=436 width=72) (actual time=0.159..30.279 rows=50000.00 loops=1)
+                           Hash Cond: (_diag_delta.location_id = location.id)
+                           Buffers: shared read=3, local hit=443 read=133 written=133
+                           ->  Hash Join  (cost=2.53..1287.02 rows=3352 width=64) (actual time=0.081..19.891 rows=50000.00 loops=1)
+                                 Hash Cond: (_diag_delta.dem_plan_id = demand_planning.id)
+                                 Buffers: shared read=2, local hit=443 read=133 written=133
+                                 ->  Seq Scan on _diag_delta  (cost=0.00..1134.72 rows=55872 width=56) (actual time=0.034..5.038 rows=50000.00 loops=1)
+                                       Buffers: local hit=443 read=133 written=133
+                                 ->  Hash  (cost=2.38..2.38 rows=12 width=16) (actual time=0.043..0.043 rows=1.00 loops=1)
+                                       Buckets: 1024  Batches: 1  Memory Usage: 9kB
+                                       Buffers: shared read=2
+                                       ->  Seq Scan on demand_planning  (cost=0.00..2.38 rows=12 width=16) (actual time=0.030..0.042 rows=1.00 loops=1)
+                                             Filter: (is_sent_to_sop AND ((status)::text <> ALL ('{archive,archiving,error}'::text[])))
+                                             Rows Removed by Filter: 27
+                                             Buffers: shared read=2
+                           ->  Hash  (cost=1.26..1.26 rows=26 width=16) (actual time=0.075..0.075 rows=26.00 loops=1)
+                                 Buckets: 1024  Batches: 1  Memory Usage: 10kB
+                                 Buffers: shared read=1
+                                 ->  Seq Scan on location  (cost=0.00..1.26 rows=26 width=16) (actual time=0.065..0.069 rows=26.00 loops=1)
+                                       Buffers: shared read=1
+                     ->  Index Only Scan using product_pkey on product  (cost=0.42..0.63 rows=1 width=8) (actual time=0.002..0.002 rows=1.00 loops=50000)
+                           Index Cond: (id = _diag_delta.product_id)
+                           Heap Fetches: 50000
+                           Index Searches: 50000
+                           Buffers: shared hit=198256 read=1745 written=1592
+               ->  Index Scan using ix_company_schema_pricing_product_id on pricing  (cost=0.29..0.36 rows=1 width=32) (actual time=0.001..0.001 rows=0.99 loops=50000)
+                     Index Cond: (product_id = _diag_delta.product_id)
+                     Index Searches: 50000
+                     Buffers: shared hit=148928 read=498 written=463
+         ->  Index Scan using idx_current_assortment_activity_product on current_assortment_activity_view caav  (cost=0.29..0.37 rows=1 width=16) (actual time=0.001..0.001 rows=0.81 loops=50000)
+               Index Cond: (product_id = _diag_delta.product_id)
+               Filter: (location_id = _diag_delta.location_id)
+               Rows Removed by Filter: 0
+               Index Searches: 50000
+               Buffers: shared hit=165134 read=102 written=91
+ Planning:
+   Buffers: shared read=2
+ Planning Time: 0.749 ms
+ Execution Time: 2678.045 ms
+(48 rows)
+
+Time: 2679,225 ms (00:02,679)
+
+--- Timed INSERT (50K, no EXPLAIN overhead) ---
+DELETE 50000
+Time: 412,871 ms
+INSERT 0 50000
+Time: 946,133 ms
+DELETE 50000
+Time: 395,733 ms
+DROP TABLE
+Time: 1,868 ms
+
+================================================================
+  TEST 3: SELECT-only (no INSERT) — isolate JOIN cost
+================================================================
+Time: 5,909 ms
+SELECT 25000
+Time: 34,180 ms
+--- 25K SELECT only (no write) ---
+                                                                                         QUERY PLAN                                                                                          
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Nested Loop Left Join  (cost=5.12..1118.51 rows=242 width=113) (actual time=0.181..110.149 rows=25000.00 loops=1)
+   Buffers: shared hit=254615 read=1418 written=1107, local hit=320
+   ->  Nested Loop Left Join  (cost=4.83..1012.85 rows=242 width=72) (actual time=0.169..77.478 rows=25000.00 loops=1)
+         Join Filter: ((demand_planning.assortment_id = pricing.assortment_id) AND (pricing.canal_id = location.canal_id))
+         Buffers: shared hit=173233 read=1369 written=1070, local hit=320
+         ->  Nested Loop  (cost=4.54..912.32 rows=242 width=72) (actual time=0.154..48.843 rows=25000.00 loops=1)
+               Buffers: shared hit=98825 read=1179 written=919, local hit=320
+               ->  Hash Join  (cost=4.12..722.71 rows=242 width=72) (actual time=0.132..11.156 rows=25000.00 loops=1)
+                     Hash Cond: (_diag_delta.location_id = location.id)
+                     Buffers: shared read=3, local hit=320
+                     ->  Hash Join  (cost=2.53..716.14 rows=1862 width=64) (actual time=0.056..7.082 rows=25000.00 loops=1)
+                           Hash Cond: (_diag_delta.dem_plan_id = demand_planning.id)
+                           Buffers: shared read=2, local hit=320
+                           ->  Seq Scan on _diag_delta  (cost=0.00..630.40 rows=31040 width=56) (actual time=0.006..1.686 rows=25000.00 loops=1)
+                                 Buffers: local hit=320
+                           ->  Hash  (cost=2.38..2.38 rows=12 width=16) (actual time=0.046..0.047 rows=1.00 loops=1)
+                                 Buckets: 1024  Batches: 1  Memory Usage: 9kB
+                                 Buffers: shared read=2
+                                 ->  Seq Scan on demand_planning  (cost=0.00..2.38 rows=12 width=16) (actual time=0.029..0.045 rows=1.00 loops=1)
+                                       Filter: (is_sent_to_sop AND ((status)::text <> ALL ('{archive,archiving,error}'::text[])))
+                                       Rows Removed by Filter: 27
+                                       Buffers: shared read=2
+                     ->  Hash  (cost=1.26..1.26 rows=26 width=16) (actual time=0.073..0.073 rows=26.00 loops=1)
+                           Buckets: 1024  Batches: 1  Memory Usage: 10kB
+                           Buffers: shared read=1
+                           ->  Seq Scan on location  (cost=0.00..1.26 rows=26 width=16) (actual time=0.063..0.067 rows=26.00 loops=1)
+                                 Buffers: shared read=1
+               ->  Index Only Scan using product_pkey on product  (cost=0.42..0.78 rows=1 width=8) (actual time=0.001..0.001 rows=1.00 loops=25000)
+                     Index Cond: (id = _diag_delta.product_id)
+                     Heap Fetches: 25000
+                     Index Searches: 25000
+                     Buffers: shared hit=98825 read=1176 written=919
+         ->  Index Scan using ix_company_schema_pricing_product_id on pricing  (cost=0.29..0.40 rows=1 width=32) (actual time=0.001..0.001 rows=0.98 loops=25000)
+               Index Cond: (product_id = _diag_delta.product_id)
+               Index Searches: 25000
+               Buffers: shared hit=74408 read=190 written=151
+   ->  Index Scan using idx_current_assortment_activity_product on current_assortment_activity_view caav  (cost=0.29..0.40 rows=1 width=16) (actual time=0.001..0.001 rows=0.76 loops=25000)
+         Index Cond: (product_id = _diag_delta.product_id)
+         Filter: (location_id = _diag_delta.location_id)
+         Rows Removed by Filter: 0
+         Index Searches: 25000
+         Buffers: shared hit=81382 read=49 written=37
+ Planning:
+   Buffers: shared hit=25 read=3
+ Planning Time: 0.690 ms
+ Execution Time: 111.048 ms
+(46 rows)
+
+Time: 112,152 ms
+DROP TABLE
+Time: 0,999 ms
+Time: 2,783 ms
+SELECT 50000
+Time: 49,128 ms
+
+--- 50K SELECT only (no write) ---
+                                                                                         QUERY PLAN                                                                                          
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Nested Loop Left Join  (cost=5.12..1912.73 rows=436 width=113) (actual time=0.082..203.864 rows=50000.00 loops=1)
+   Buffers: shared hit=514568 read=98, local hit=64 read=512 dirtied=512 written=448
+   ->  Nested Loop Left Join  (cost=4.83..1735.27 rows=436 width=72) (actual time=0.076..139.751 rows=50000.00 loops=1)
+         Join Filter: ((demand_planning.assortment_id = pricing.assortment_id) AND (pricing.canal_id = location.canal_id))
+         Buffers: shared hit=349336 read=94, local hit=64 read=512 dirtied=512 written=448
+         ->  Nested Loop  (cost=4.54..1572.16 rows=436 width=72) (actual time=0.071..86.099 rows=50000.00 loops=1)
+               Buffers: shared hit=199931 read=73, local hit=64 read=512 dirtied=512 written=448
+               ->  Hash Join  (cost=4.12..1297.60 rows=436 width=72) (actual time=0.064..24.992 rows=50000.00 loops=1)
+                     Hash Cond: (_diag_delta.location_id = location.id)
+                     Buffers: shared hit=3, local hit=64 read=512 dirtied=512 written=448
+                     ->  Hash Join  (cost=2.53..1287.02 rows=3352 width=64) (actual time=0.049..17.116 rows=50000.00 loops=1)
+                           Hash Cond: (_diag_delta.dem_plan_id = demand_planning.id)
+                           Buffers: shared hit=2, local hit=64 read=512 dirtied=512 written=448
+                           ->  Seq Scan on _diag_delta  (cost=0.00..1134.72 rows=55872 width=56) (actual time=0.038..6.907 rows=50000.00 loops=1)
+                                 Buffers: local hit=64 read=512 dirtied=512 written=448
+                           ->  Hash  (cost=2.38..2.38 rows=12 width=16) (actual time=0.009..0.009 rows=1.00 loops=1)
+                                 Buckets: 1024  Batches: 1  Memory Usage: 9kB
+                                 Buffers: shared hit=2
+                                 ->  Seq Scan on demand_planning  (cost=0.00..2.38 rows=12 width=16) (actual time=0.005..0.008 rows=1.00 loops=1)
+                                       Filter: (is_sent_to_sop AND ((status)::text <> ALL ('{archive,archiving,error}'::text[])))
+                                       Rows Removed by Filter: 27
+                                       Buffers: shared hit=2
+                     ->  Hash  (cost=1.26..1.26 rows=26 width=16) (actual time=0.013..0.013 rows=26.00 loops=1)
+                           Buckets: 1024  Batches: 1  Memory Usage: 10kB
+                           Buffers: shared hit=1
+                           ->  Seq Scan on location  (cost=0.00..1.26 rows=26 width=16) (actual time=0.006..0.009 rows=26.00 loops=1)
+                                 Buffers: shared hit=1
+               ->  Index Only Scan using product_pkey on product  (cost=0.42..0.63 rows=1 width=8) (actual time=0.001..0.001 rows=1.00 loops=50000)
+                     Index Cond: (id = _diag_delta.product_id)
+                     Heap Fetches: 50000
+                     Index Searches: 50000
+                     Buffers: shared hit=199928 read=73
+         ->  Index Scan using ix_company_schema_pricing_product_id on pricing  (cost=0.29..0.36 rows=1 width=32) (actual time=0.001..0.001 rows=0.99 loops=50000)
+               Index Cond: (product_id = _diag_delta.product_id)
+               Index Searches: 50000
+               Buffers: shared hit=149405 read=21
+   ->  Index Scan using idx_current_assortment_activity_product on current_assortment_activity_view caav  (cost=0.29..0.37 rows=1 width=16) (actual time=0.001..0.001 rows=0.81 loops=50000)
+         Index Cond: (product_id = _diag_delta.product_id)
+         Filter: (location_id = _diag_delta.location_id)
+         Rows Removed by Filter: 0
+         Index Searches: 50000
+         Buffers: shared hit=165232 read=4
+ Planning:
+   Buffers: shared hit=28
+ Planning Time: 0.550 ms
+ Execution Time: 205.527 ms
+(46 rows)
+
+Time: 206,474 ms
+DROP TABLE
+Time: 3,458 ms
+
+================================================================
+  TEST 4: INSERT without target indexes — isolate index cost
+================================================================
+SELECT 5
+Time: 13,611 ms
+ indexes to drop 
+-----------------
+               5
+(1 row)
+
+Time: 0,139 ms
+DO
+Time: 128,974 ms
+Time: 3,700 ms
+SELECT 50000
+Time: 49,631 ms
+--- 50K INSERT into target WITHOUT indexes ---
+INSERT 0 50000
+Time: 265,443 ms
+DELETE 50000
+Time: 449,141 ms
+DROP TABLE
+Time: 1,036 ms
+--- Recreating indexes (time each one) ---
+DO
+Time: 17143,413 ms (00:17,143)
+DROP TABLE
+Time: 47,799 ms
+
+================================================================
+  TEST 5: 50K INSERT with work_mem = 256MB
+================================================================
+Time: 3,599 ms
+SELECT 50000
+Time: 58,647 ms
+psql:/home/diviyan/fentech/tools/pg_reflex/benchmarks/bench_diagnostic_cliff.sql:429: WARNING:  SET LOCAL can only be used in transaction blocks
+SET
+Time: 0,106 ms
+psql:/home/diviyan/fentech/tools/pg_reflex/benchmarks/bench_diagnostic_cliff.sql:430: WARNING:  SET LOCAL can only be used in transaction blocks
+SET
+Time: 0,109 ms
+--- 50K INSERT with boosted work_mem ---
+INSERT 0 50000
+Time: 742,687 ms
+RESET
+Time: 0,057 ms
+RESET
+Time: 0,027 ms
+DELETE 50000
+Time: 312,890 ms
+DROP TABLE
+Time: 1,044 ms
+DROP FUNCTION
+Time: 0,871 ms
+DROP TABLE
+Time: 1,481 ms
+
+================================================================
+  DIAGNOSTIC COMPLETE
+  Compare:
+    TEST 1 vs 2: plan differences at 25K vs 50K (planner tipping point?)
+    TEST 2 vs 3: JOIN cost vs total INSERT cost (index overhead isolation)
+    TEST 2 vs 4: with vs without indexes (index maintenance cost)
+    TEST 2 vs 5: default vs boosted work_mem (memory pressure?)
+================================================================

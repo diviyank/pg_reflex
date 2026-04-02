@@ -1,0 +1,189 @@
+Timing is on.
+ setseed 
+---------
+ 
+(1 row)
+
+Time: 0,502 ms
+
+================================================================
+  DIAGNOSTIC BREAKDOWN: Where does the 50K INSERT time go?
+================================================================
+DO
+Time: 0,973 ms
+SELECT 80098
+Time: 1457,460 ms (00:01,457)
+CREATE FUNCTION
+Time: 1,453 ms
+CREATE FUNCTION
+Time: 1,014 ms
+CREATE TABLE
+Time: 8,231 ms
+
+--- TEST 1: Full 50K INSERT with trigger (total) ---
+DO
+Time: 16357,663 ms (00:16,358)
+
+--- TEST 2: 50K source INSERT, triggers disabled, FK active ---
+psql:/home/diviyan/fentech/tools/pg_reflex/benchmarks/bench_diagnostic_breakdown.sql:108: ERROR:  cannot ALTER TABLE "sales_simulation" because it has pending trigger events
+CONTEXT:  SQL statement "ALTER TABLE alp.sales_simulation ENABLE TRIGGER "__reflex_trigger_ins_on_alp_sales_simulation""
+PL/pgSQL function inline_code_block line 12 at SQL statement
+Time: 4234,847 ms (00:04,235)
+
+--- TEST 3: 50K source INSERT, replica mode (no trigger, no FK) ---
+DO
+Time: 3464,802 ms (00:03,465)
+
+--- TEST 4: Instrumented trigger (step-by-step timing) ---
+SELECT 1
+Time: 3,273 ms
+CREATE FUNCTION
+Time: 1,064 ms
+DO
+Time: 4693,908 ms (00:04,694)
+DO
+Time: 2,289 ms
+DROP TABLE
+Time: 4,642 ms
+
+--- TEST 5: Delta INSERT from fresh temp table (simulating transition table, after source INSERT) ---
+psql:/home/diviyan/fentech/tools/pg_reflex/benchmarks/bench_diagnostic_breakdown.sql:261: ERROR:  cannot ALTER TABLE "sales_simulation" because it has pending trigger events
+CONTEXT:  SQL statement "ALTER TABLE alp.sales_simulation ENABLE TRIGGER "__reflex_trigger_ins_on_alp_sales_simulation""
+PL/pgSQL function inline_code_block line 7 at SQL statement
+Time: 3319,319 ms (00:03,319)
+SELECT 0
+Time: 111,856 ms
+ transition rows 
+-----------------
+               0
+(1 row)
+
+Time: 0,239 ms
+psql:/home/diviyan/fentech/tools/pg_reflex/benchmarks/bench_diagnostic_breakdown.sql:298: NOTICE:  Delta SQL: INSERT INTO "alp"."sop_forecast_reflex" 
+    SELECT
+        "__reflex_new_alp_sales_simulation".dem_plan_id, "__reflex_new_alp_sales_simulation".week, "__reflex_new_alp_sales_simulation".isoyear,
+    
+DO
+Time: 1,259 ms
+DROP TABLE
+Time: 1,147 ms
+psql:/home/diviyan/fentech/tools/pg_reflex/benchmarks/bench_diagnostic_breakdown.sql:301: ERROR:  syntax error at or near "PERFORM"
+LINE 1: PERFORM _diag_cleanup();
+        ^
+Time: 0,107 ms
+
+--- TEST 6: Delta INSERT after source INSERT (EXPLAIN ANALYZE, dirty buffers) ---
+psql:/home/diviyan/fentech/tools/pg_reflex/benchmarks/bench_diagnostic_breakdown.sql:318: ERROR:  cannot ALTER TABLE "sales_simulation" because it has pending trigger events
+CONTEXT:  SQL statement "ALTER TABLE alp.sales_simulation ENABLE TRIGGER "__reflex_trigger_ins_on_alp_sales_simulation""
+PL/pgSQL function inline_code_block line 7 at SQL statement
+Time: 4971,677 ms (00:04,972)
+SELECT 0
+Time: 28,549 ms
+                                                                           QUERY PLAN                                                                           
+----------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Insert on sop_forecast_reflex  (cost=5.25..81.32 rows=0 width=0) (actual time=0.077..0.078 rows=0.00 loops=1)
+   Buffers: shared read=1 written=1
+   ->  Nested Loop Left Join  (cost=5.25..81.32 rows=5 width=121) (actual time=0.076..0.077 rows=0.00 loops=1)
+         Buffers: shared read=1 written=1
+         ->  Nested Loop Left Join  (cost=4.83..71.56 rows=5 width=80) (actual time=0.076..0.077 rows=0.00 loops=1)
+               Join Filter: ((demand_planning.assortment_id = pricing.assortment_id) AND (pricing.canal_id = location.canal_id))
+               Buffers: shared read=1 written=1
+               ->  Nested Loop  (cost=4.54..53.27 rows=5 width=80) (actual time=0.076..0.077 rows=0.00 loops=1)
+                     Buffers: shared read=1 written=1
+                     ->  Hash Join  (cost=4.12..22.85 rows=5 width=80) (actual time=0.076..0.077 rows=0.00 loops=1)
+                           Hash Cond: (_diag_transition2.location_id = location.id)
+                           Buffers: shared read=1 written=1
+                           ->  Hash Join  (cost=2.53..21.15 rows=41 width=72) (actual time=0.004..0.005 rows=0.00 loops=1)
+                                 Hash Cond: (_diag_transition2.dem_plan_id = demand_planning.id)
+                                 ->  Seq Scan on _diag_transition2  (cost=0.00..16.80 rows=680 width=64) (actual time=0.004..0.004 rows=0.00 loops=1)
+                                 ->  Hash  (cost=2.38..2.38 rows=12 width=16) (never executed)
+                                       ->  Seq Scan on demand_planning  (cost=0.00..2.38 rows=12 width=16) (never executed)
+                                             Filter: (is_sent_to_sop AND ((status)::text <> ALL ('{archive,archiving,error}'::text[])))
+                           ->  Hash  (cost=1.26..1.26 rows=26 width=16) (actual time=0.069..0.069 rows=26.00 loops=1)
+                                 Buckets: 1024  Batches: 1  Memory Usage: 10kB
+                                 Buffers: shared read=1 written=1
+                                 ->  Seq Scan on location  (cost=0.00..1.26 rows=26 width=16) (actual time=0.061..0.064 rows=26.00 loops=1)
+                                       Buffers: shared read=1 written=1
+                     ->  Index Only Scan using product_pkey on product  (cost=0.42..6.08 rows=1 width=8) (never executed)
+                           Index Cond: (id = _diag_transition2.product_id)
+                           Heap Fetches: 0
+                           Index Searches: 0
+               ->  Index Scan using ix_company_schema_pricing_product_id on pricing  (cost=0.29..3.64 rows=1 width=32) (never executed)
+                     Index Cond: (product_id = _diag_transition2.product_id)
+                     Index Searches: 0
+         ->  Index Only Scan using idx_current_assortment_activity on current_assortment_activity_view caav  (cost=0.41..1.92 rows=1 width=16) (never executed)
+               Index Cond: ((product_id = _diag_transition2.product_id) AND (location_id = _diag_transition2.location_id))
+               Heap Fetches: 0
+               Index Searches: 0
+ Planning:
+   Buffers: shared hit=33 read=3 written=3
+ Planning Time: 0.654 ms
+ Execution Time: 0.113 ms
+(38 rows)
+
+Time: 1,145 ms
+DROP TABLE
+Time: 1,274 ms
+ _diag_cleanup 
+---------------
+ 
+(1 row)
+
+Time: 383,572 ms
+
+================================================================
+  RESULTS SUMMARY
+================================================================
+
+       test_name       |                        step_name                         |   ms    
+-----------------------+----------------------------------------------------------+---------
+ T1_full_with_trigger  | total                                                    | 15747.5
+ T3_replica_mode       | total                                                    |  2927.8
+ T4_instrumented       | exists_check                                             |     0.1
+ T4_instrumented       | ref_query                                                |     0.3
+ T4_instrumented       | advisory_lock                                            |     0.1
+ T4_instrumented       | rust_ffi_build_sql                                       |     0.1
+ T4_instrumented       | generated_sql_len=2335                                   |     0.0
+ T4_instrumented       | execute_stmt_1_(INSERT INTO "alp"."sop_forecast_reflex" +|   830.3
+                       |     SELECT                                              +| 
+                       |         ...)                                             | 
+ T4_instrumented       | trigger_total                                            |   832.5
+ T4_instrumented       | wall_clock_total                                         |  4268.0
+ T5_post_source_insert | delta_insert_only                                        |     0.8
+(11 rows)
+
+Time: 3,305 ms
+
+--- Computed breakdown ---
+                   component                   |  ms   
+-----------------------------------------------+-------
+ Source INSERT (no trigger, with FK)           |      
+ Source INSERT (replica, no FK)                |  2928
+ FK overhead (T2 - T3)                         |      
+ Full INSERT with trigger (T1)                 | 15748
+ Trigger overhead (T1 - T2)                    |      
+ Delta INSERT after source (T5, dirty buffers) |     1
+ Trigger internal total (T4)                   |   832
+ Gap: wall_clock - trigger_internal (T4)       |      
+(8 rows)
+
+Time: 0,423 ms
+DROP FUNCTION
+Time: 1,990 ms
+DROP FUNCTION
+Time: 0,895 ms
+DROP TABLE
+Time: 1,111 ms
+DROP TABLE
+Time: 1,934 ms
+
+================================================================
+  DIAGNOSTIC COMPLETE
+
+  Key comparisons:
+  T1 vs T2: trigger overhead (isolates trigger from source INSERT)
+  T2 vs T3: FK constraint overhead (deferred, should be ~0)
+  T4 steps: where time goes INSIDE the trigger
+  T5 vs T4: transition table overhead (T5 uses temp table after source INSERT)
+  T6: EXPLAIN with dirty buffer pool (vs diagnostic_cliff TEST 2 with clean pool)
+================================================================

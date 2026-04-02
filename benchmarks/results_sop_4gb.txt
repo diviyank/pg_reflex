@@ -1,0 +1,338 @@
+Timing is on.
+ setseed 
+---------
+ 
+(1 row)
+
+Time: 0,650 ms
+
+================================================================
+  SOP FORECAST BENCHMARK — shared_buffers = 4GB
+  pg_reflex v1.1.2 vs REFRESH MATERIALIZED VIEW
+  db_clone | PG18 | 76M source rows | 7.7M output rows
+================================================================
+ shared_buffers 
+----------------
+ 4GB
+(1 row)
+
+Time: 0,086 ms
+DO
+Time: 1,458 ms
+ imv_rows 
+----------
+  7732941
+(1 row)
+
+Time: 147,691 ms
+ matview_rows 
+--------------
+      7732941
+(1 row)
+
+Time: 27872,293 ms (00:27,872)
+
+--- REFRESH MATERIALIZED VIEW baseline ---
+CREATE TABLE
+Time: 5,982 ms
+DO
+Time: 77954,996 ms (01:17,955)
+ run | REFRESH (ms) 
+-----+--------------
+   1 |        38556
+   2 |        38886
+(2 rows)
+
+Time: 0,315 ms
+SELECT 1
+Time: 2,027 ms
+SELECT 80098
+Time: 1431,133 ms (00:01,431)
+ pool_size 
+-----------
+     80098
+(1 row)
+
+Time: 3,560 ms
+CREATE FUNCTION
+Time: 1,330 ms
+CREATE FUNCTION
+Time: 2,089 ms
+INSERT 0 1
+Time: 10,148 ms
+DELETE 1
+Time: 2,124 ms
+CREATE FUNCTION
+Time: 1,109 ms
+CREATE FUNCTION
+Time: 0,710 ms
+CREATE FUNCTION
+Time: 1,112 ms
+
+================================================================
+  INSERT BENCHMARK
+================================================================
+--- INSERT 1,000 ---
+       metric       |  ms   
+--------------------+-------
+ reflex_total       |   235
+ raw_insert_replica |    36
+ refresh_baseline   | 38886
+ raw+refresh        | 38921
+ advantage_%        |  99.4
+(5 rows)
+
+Time: 789,807 ms
+--- INSERT 10,000 ---
+       metric       |  ms   
+--------------------+-------
+ reflex_total       |  1555
+ raw_insert_replica |   250
+ refresh_baseline   | 38886
+ raw+refresh        | 39136
+ advantage_%        |  96.0
+(5 rows)
+
+Time: 2013,491 ms (00:02,013)
+--- INSERT 25,000 ---
+       metric       |  ms   
+--------------------+-------
+ reflex_total       |  2527
+ raw_insert_replica |  1103
+ refresh_baseline   | 38886
+ raw+refresh        | 39989
+ advantage_%        |  93.7
+(5 rows)
+
+Time: 4140,332 ms (00:04,140)
+--- INSERT 50,000 ---
+       metric       |  ms   
+--------------------+-------
+ reflex_total       |  5732
+ raw_insert_replica |  5883
+ refresh_baseline   | 38886
+ raw+refresh        | 44769
+ advantage_%        |  87.2
+(5 rows)
+
+Time: 13169,205 ms (00:13,169)
+--- INSERT 100,000 ---
+       metric       |  ms   
+--------------------+-------
+ reflex_total       | 16463
+ raw_insert_replica | 10022
+ refresh_baseline   | 38886
+ raw+refresh        | 48908
+ advantage_%        |  66.3
+(5 rows)
+
+Time: 30670,661 ms (00:30,671)
+--- INSERT 200,000 ---
+       metric       |  ms   
+--------------------+-------
+ reflex_total       | 23473
+ raw_insert_replica | 22747
+ refresh_baseline   | 38886
+ raw+refresh        | 61633
+ advantage_%        |  61.9
+(5 rows)
+
+Time: 54020,478 ms (00:54,020)
+--- INSERT 500,000 ---
+       metric       |  ms   
+--------------------+-------
+ reflex_total       | 45769
+ raw_insert_replica | 20657
+ refresh_baseline   | 38886
+ raw+refresh        | 59543
+ advantage_%        |  23.1
+(5 rows)
+
+Time: 72467,148 ms (01:12,467)
+
+================================================================
+  DELETE BENCHMARK
+================================================================
+--- DELETE 1,000 ---
+       metric       |  ms   
+--------------------+-------
+ reflex_total       |   508
+ raw_delete_replica |    77
+ refresh_baseline   | 38886
+ raw+refresh        | 38962
+ advantage_%        |  98.7
+(5 rows)
+
+Time: 1026,079 ms (00:01,026)
+--- DELETE 10,000 ---
+       metric       |  ms   
+--------------------+-------
+ reflex_total       |   116
+ raw_delete_replica |    82
+ refresh_baseline   | 38886
+ raw+refresh        | 38967
+ advantage_%        |  99.7
+(5 rows)
+
+Time: 966,506 ms
+--- DELETE 50,000 ---
+       metric       |  ms   
+--------------------+-------
+ reflex_total       |   297
+ raw_delete_replica |    39
+ refresh_baseline   | 38886
+ raw+refresh        | 38924
+ advantage_%        |  99.2
+(5 rows)
+
+Time: 6774,015 ms (00:06,774)
+--- DELETE 100,000 ---
+       metric       |  ms   
+--------------------+-------
+ reflex_total       |   550
+ raw_delete_replica |    76
+ refresh_baseline   | 38886
+ raw+refresh        | 38962
+ advantage_%        |  98.6
+(5 rows)
+
+Time: 17000,417 ms (00:17,000)
+--- DELETE 200,000 ---
+       metric       |  ms   
+--------------------+-------
+ reflex_total       |  1284
+ raw_delete_replica |   164
+ refresh_baseline   | 38886
+ raw+refresh        | 39050
+ advantage_%        |  96.7
+(5 rows)
+
+Time: 30032,649 ms (00:30,033)
+--- DELETE 500,000 ---
+       metric       |  ms   
+--------------------+-------
+ reflex_total       |  2957
+ raw_delete_replica |   629
+ refresh_baseline   | 38886
+ raw+refresh        | 39515
+ advantage_%        |  92.5
+(5 rows)
+
+Time: 143939,059 ms (02:23,939)
+
+================================================================
+  UPDATE BENCHMARK
+================================================================
+--- UPDATE 1,000 ---
+       metric       |  ms   
+--------------------+-------
+ reflex_total       |  4220
+ raw_update_replica |    29
+ refresh_baseline   | 38886
+ raw+refresh        | 38915
+ advantage_%        |  89.2
+(5 rows)
+
+Time: 4631,203 ms (00:04,631)
+--- UPDATE 10,000 ---
+       metric       |  ms   
+--------------------+-------
+ reflex_total       |   416
+ raw_update_replica |  2537
+ refresh_baseline   | 38886
+ raw+refresh        | 41423
+ advantage_%        |  99.0
+(5 rows)
+
+Time: 4335,472 ms (00:04,335)
+--- UPDATE 50,000 ---
+       metric       |  ms   
+--------------------+-------
+ reflex_total       |  7335
+ raw_update_replica |  5632
+ refresh_baseline   | 38886
+ raw+refresh        | 44517
+ advantage_%        |  83.5
+(5 rows)
+
+Time: 20820,901 ms (00:20,821)
+--- UPDATE 100,000 ---
+       metric       |  ms   
+--------------------+-------
+ reflex_total       | 20635
+ raw_update_replica | 12331
+ refresh_baseline   | 38886
+ raw+refresh        | 51216
+ advantage_%        |  59.7
+(5 rows)
+
+Time: 48796,442 ms (00:48,796)
+--- UPDATE 200,000 ---
+       metric       |  ms   
+--------------------+-------
+ reflex_total       | 40009
+ raw_update_replica | 27192
+ refresh_baseline   | 38886
+ raw+refresh        | 66078
+ advantage_%        |  39.5
+(5 rows)
+
+Time: 90786,030 ms (01:30,786)
+--- UPDATE 500,000 ---
+       metric       |   ms   
+--------------------+--------
+ reflex_total       |  83060
+ raw_update_replica |  78921
+ refresh_baseline   |  38886
+ raw+refresh        | 117806
+ advantage_%        |   29.5
+(5 rows)
+
+Time: 215967,121 ms (03:35,967)
+
+================================================================
+  FULL REFRESH COMPARISON
+================================================================
+psql:/home/diviyan/fentech/tools/pg_reflex/benchmarks/bench_sop_4gb.sql:300: NOTICE:  REFRESH MATERIALIZED VIEW: 96657 ms
+psql:/home/diviyan/fentech/tools/pg_reflex/benchmarks/bench_sop_4gb.sql:300: INFO:  pg_reflex: reconciled IMV 'alp.sop_forecast_reflex'
+psql:/home/diviyan/fentech/tools/pg_reflex/benchmarks/bench_sop_4gb.sql:300: NOTICE:  reflex_reconcile: 127995 ms
+DO
+Time: 225437,348 ms (03:45,437)
+
+--- Correctness check ---
+psql:/home/diviyan/fentech/tools/pg_reflex/benchmarks/bench_sop_4gb.sql:307: INFO:  pg_reflex: reconciled IMV 'alp.sop_forecast_reflex'
+ reflex_reconcile 
+------------------
+ RECONCILED
+(1 row)
+
+Time: 79581,843 ms (01:19,582)
+REFRESH MATERIALIZED VIEW
+Time: 84295,811 ms (01:24,296)
+ correctness 
+-------------
+ PASS
+(1 row)
+
+Time: 10766,638 ms (00:10,767)
+--- Cleanup ---
+DROP FUNCTION
+Time: 3,637 ms
+DROP FUNCTION
+Time: 0,958 ms
+DROP FUNCTION
+Time: 0,576 ms
+DROP FUNCTION
+Time: 1,004 ms
+DROP FUNCTION
+Time: 1,979 ms
+DROP TABLE
+Time: 1,274 ms
+DROP TABLE
+Time: 1,534 ms
+DROP TABLE
+Time: 1,236 ms
+
+================================================================
+  BENCHMARK COMPLETE — shared_buffers = 4GB
+================================================================
