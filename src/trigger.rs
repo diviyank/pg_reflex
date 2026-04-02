@@ -443,14 +443,33 @@ pub fn reflex_build_delta_sql(
 
     let bq_upper = base_query.to_uppercase();
     let is_full_outer = bq_upper.contains("FULL JOIN") || bq_upper.contains("FULL OUTER");
+    // Check if source_table is the secondary table in a LEFT/RIGHT/FULL JOIN.
+    // The source is secondary if it appears as the table being outer-joined,
+    // i.e. directly after "LEFT JOIN", "RIGHT JOIN", or "FULL JOIN".
+    // Do NOT match if source_table only appears in ON conditions (that's the primary table).
+    let src_upper = source_table.to_uppercase();
+    let bare_upper = bare_source.to_uppercase();
     let is_outer_join_secondary = !is_self_join
         && (bq_upper.contains("LEFT JOIN") || bq_upper.contains("RIGHT JOIN")
             || bq_upper.contains("LEFT OUTER") || bq_upper.contains("RIGHT OUTER")
             || is_full_outer)
-        && bq_upper.find("JOIN").is_some_and(|pos| {
-            let after = &base_query[pos..];
-            after.contains(source_table) || after.contains(bare_source)
-        })
+        && {
+            // Check if source_table appears directly after an outer JOIN keyword
+            let patterns = ["LEFT JOIN ", "LEFT OUTER JOIN ", "RIGHT JOIN ", "RIGHT OUTER JOIN ",
+                           "FULL JOIN ", "FULL OUTER JOIN "];
+            patterns.iter().any(|pat| {
+                let mut search_from = 0;
+                while let Some(pos) = bq_upper[search_from..].find(pat) {
+                    let after = &bq_upper[search_from + pos + pat.len()..];
+                    let next_token = after.split_whitespace().next().unwrap_or("");
+                    if next_token == src_upper || next_token == bare_upper {
+                        return true;
+                    }
+                    search_from += pos + pat.len();
+                }
+                false
+            })
+        }
         // For LEFT/RIGHT JOIN: only DELETE/UPDATE need special handling (INSERT is correct).
         // For FULL OUTER JOIN: ALL operations need full refresh (both sides produce NULLs).
         && (operation == "DELETE" || operation == "UPDATE" || is_full_outer);

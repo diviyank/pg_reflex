@@ -968,8 +968,14 @@ pub(crate) fn create_reflex_ivm_impl(view_name: &str, sql: &str, unique_columns_
         let depends_on_imv: Vec<String> = ivm_froms.clone();
         let graph_child: Vec<String> = Vec::new();
 
-        // Store the WHERE predicate for predicate-filtered trigger skip
-        let where_predicate: String = analysis.where_clause.clone().unwrap_or_default();
+        // Store the WHERE predicate for predicate-filtered trigger skip.
+        // Only safe for single-source queries: multi-table WHERE clauses may reference
+        // joined tables whose columns are not available in the trigger transition table.
+        let where_predicate: String = if real_sources.len() <= 1 {
+            analysis.where_clause.clone().unwrap_or_default()
+        } else {
+            String::new()
+        };
 
         client.update(
             "INSERT INTO public.__reflex_ivm_reference

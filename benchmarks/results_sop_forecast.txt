@@ -1,0 +1,57 @@
+Timing is on.
+ setseed 
+---------
+ 
+(1 row)
+
+Time: 0,901 ms
+
+================================================================
+  SOP FORECAST VIEW BENCHMARK
+  pg_reflex v1.1.1 vs REFRESH MATERIALIZED VIEW
+  db_clone | PG18 | 76M source rows | 7.7M output rows
+================================================================
+
+--- Creating pg_reflex IMV ---
+psql:/home/diviyan/fentech/tools/pg_reflex/benchmarks/bench_sop_forecast.sql:63: INFO:  pg_reflex: using explicit unique key (dem_plan_id, product_id, location_id, order_date) for 'alp.sop_forecast_reflex'
+psql:/home/diviyan/fentech/tools/pg_reflex/benchmarks/bench_sop_forecast.sql:63: WARNING:  pg_reflex: source 'alp.current_assortment_activity_view' is a materialized view — triggers skipped. Use SELECT refresh_imv_depending_on('alp.current_assortment_activity_view') after REFRESH MATERIALIZED VIEW.
+psql:/home/diviyan/fentech/tools/pg_reflex/benchmarks/bench_sop_forecast.sql:63: INFO:  pg_reflex: created IMV 'alp.sop_forecast_reflex'
+       create_reflex_ivm        
+--------------------------------
+ CREATE REFLEX INCREMENTAL VIEW
+(1 row)
+
+Time: 13201,341 ms (00:13,201)
+--- Creating indexes on IMV ---
+CREATE INDEX
+Time: 2046,788 ms (00:02,047)
+CREATE INDEX
+Time: 2783,416 ms (00:02,783)
+CREATE INDEX
+Time: 4505,563 ms (00:04,506)
+CREATE INDEX
+Time: 4515,106 ms (00:04,515)
+--- Verifying row counts ---
+ imv_rows 
+----------
+  7732941
+(1 row)
+
+Time: 154,587 ms
+ matview_rows 
+--------------
+      7732941
+(1 row)
+
+Time: 23512,133 ms (00:23,512)
+
+--- REFRESH MATERIALIZED VIEW baseline ---
+CREATE TABLE
+Time: 4,506 ms
+psql:/home/diviyan/fentech/tools/pg_reflex/benchmarks/bench_sop_forecast.sql:96: FATAL:  terminating connection due to administrator command
+CONTEXT:  SQL statement "REFRESH MATERIALIZED VIEW alp.sop_forecast_view"
+PL/pgSQL function inline_code_block line 5 at SQL statement
+psql:/home/diviyan/fentech/tools/pg_reflex/benchmarks/bench_sop_forecast.sql:96: server closed the connection unexpectedly
+	This probably means the server terminated abnormally
+	before or while processing the request.
+psql:/home/diviyan/fentech/tools/pg_reflex/benchmarks/bench_sop_forecast.sql:96: error: connection to server was lost
