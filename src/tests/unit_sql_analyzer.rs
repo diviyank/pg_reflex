@@ -45,8 +45,7 @@ fn test_distinct_detected() {
 
 #[test]
 fn test_where_clause() {
-    let a =
-        parse_and_analyze("SELECT city, COUNT(*) FROM emp WHERE active = true GROUP BY city");
+    let a = parse_and_analyze("SELECT city, COUNT(*) FROM emp WHERE active = true GROUP BY city");
     assert!(a.where_clause.is_some());
     assert!(a.where_clause.unwrap().contains("active"));
 }
@@ -83,9 +82,7 @@ fn test_passthrough_columns() {
 
 #[test]
 fn test_min_max_detection() {
-    let a = parse_and_analyze(
-        "SELECT city, MIN(salary), MAX(salary) FROM emp GROUP BY city",
-    );
+    let a = parse_and_analyze("SELECT city, MIN(salary), MAX(salary) FROM emp GROUP BY city");
     assert_eq!(a.select_columns[1].aggregate, Some(AggregateKind::Min));
     assert_eq!(a.select_columns[2].aggregate, Some(AggregateKind::Max));
 }
@@ -139,7 +136,10 @@ fn test_unsupported_order_by() {
 #[test]
 fn test_window_detected() {
     let a = parse_and_analyze("SELECT id, SUM(amount) OVER (PARTITION BY city) FROM orders");
-    assert!(a.unsupported_reason().is_none(), "Window functions should no longer be unsupported");
+    assert!(
+        a.unsupported_reason().is_none(),
+        "Window functions should no longer be unsupported"
+    );
     assert!(a.has_window_function);
     // The window column should be flagged
     let win_col = a.select_columns.iter().find(|c| c.is_window);
@@ -148,8 +148,7 @@ fn test_window_detected() {
 
 #[test]
 fn test_multiple_queries_error() {
-    let parsed =
-        Parser::parse_sql(&PostgreSqlDialect {}, "SELECT 1; SELECT 2").unwrap();
+    let parsed = Parser::parse_sql(&PostgreSqlDialect {}, "SELECT 1; SELECT 2").unwrap();
     assert!(matches!(
         analyze(&parsed),
         Err(SqlAnalysisError::MultipleQueries(2))
@@ -158,8 +157,7 @@ fn test_multiple_queries_error() {
 
 #[test]
 fn test_not_select_error() {
-    let parsed =
-        Parser::parse_sql(&PostgreSqlDialect {}, "CREATE TABLE t (id INT)").unwrap();
+    let parsed = Parser::parse_sql(&PostgreSqlDialect {}, "CREATE TABLE t (id INT)").unwrap();
     assert!(matches!(
         analyze(&parsed),
         Err(SqlAnalysisError::NotASelectQuery)
@@ -182,9 +180,8 @@ fn test_having_clause() {
 
 #[test]
 fn test_cast_aggregate_detected() {
-    let a = parse_and_analyze(
-        "SELECT city, SUM(amount)::BIGINT AS total FROM orders GROUP BY city",
-    );
+    let a =
+        parse_and_analyze("SELECT city, SUM(amount)::BIGINT AS total FROM orders GROUP BY city");
     assert_eq!(a.select_columns.len(), 2);
     assert_eq!(a.select_columns[1].aggregate, Some(AggregateKind::Sum));
     assert_eq!(a.select_columns[1].aggregate_arg.as_deref(), Some("amount"));
@@ -197,7 +194,10 @@ fn test_multiple_cast_aggregates() {
         "SELECT grp, SUM(a)::BIGINT AS sa, COUNT(*)::INT AS cnt FROM t GROUP BY grp",
     );
     assert_eq!(a.select_columns[1].aggregate, Some(AggregateKind::Sum));
-    assert_eq!(a.select_columns[2].aggregate, Some(AggregateKind::CountStar));
+    assert_eq!(
+        a.select_columns[2].aggregate,
+        Some(AggregateKind::CountStar)
+    );
 }
 
 #[test]
@@ -212,7 +212,10 @@ fn test_table_aliases() {
         "SELECT s.product_id, s.amount, p.name FROM sales s JOIN products p ON s.product_id = p.id",
     );
     assert_eq!(a.table_aliases.get("s").map(String::as_str), Some("sales"));
-    assert_eq!(a.table_aliases.get("p").map(String::as_str), Some("products"));
+    assert_eq!(
+        a.table_aliases.get("p").map(String::as_str),
+        Some("products")
+    );
 }
 
 #[test]
@@ -220,8 +223,14 @@ fn test_table_aliases_schema_qualified() {
     let a = parse_and_analyze(
         "SELECT s.id FROM alp.sales_simulation s JOIN dim.products p ON s.product_id = p.id",
     );
-    assert_eq!(a.table_aliases.get("s").map(String::as_str), Some("alp.sales_simulation"));
-    assert_eq!(a.table_aliases.get("p").map(String::as_str), Some("dim.products"));
+    assert_eq!(
+        a.table_aliases.get("s").map(String::as_str),
+        Some("alp.sales_simulation")
+    );
+    assert_eq!(
+        a.table_aliases.get("p").map(String::as_str),
+        Some("dim.products")
+    );
 }
 
 // ========================================================================
@@ -240,9 +249,7 @@ fn test_detect_lateral_join() {
 
 #[test]
 fn test_detect_distinct_on() {
-    let a = parse_and_analyze(
-        "SELECT DISTINCT ON (city) city, val FROM t",
-    );
+    let a = parse_and_analyze("SELECT DISTINCT ON (city) city, val FROM t");
     assert!(a.has_distinct_on);
     assert!(!a.has_distinct, "DISTINCT ON should not set has_distinct");
     assert!(a.unsupported_reason().is_some());
@@ -251,40 +258,35 @@ fn test_detect_distinct_on() {
 
 #[test]
 fn test_detect_grouping_sets() {
-    let a = parse_and_analyze(
-        "SELECT city, SUM(val) FROM t GROUP BY GROUPING SETS ((city), ())",
-    );
+    let a = parse_and_analyze("SELECT city, SUM(val) FROM t GROUP BY GROUPING SETS ((city), ())");
     assert!(a.has_grouping_sets);
     assert!(a.unsupported_reason().is_some());
 }
 
 #[test]
 fn test_detect_cube() {
-    let a = parse_and_analyze(
-        "SELECT city, state, SUM(val) FROM t GROUP BY CUBE (city, state)",
-    );
+    let a = parse_and_analyze("SELECT city, state, SUM(val) FROM t GROUP BY CUBE (city, state)");
     assert!(a.has_grouping_sets);
     assert!(a.unsupported_reason().is_some());
 }
 
 #[test]
 fn test_detect_rollup() {
-    let a = parse_and_analyze(
-        "SELECT city, SUM(val) FROM t GROUP BY ROLLUP (city)",
-    );
+    let a = parse_and_analyze("SELECT city, SUM(val) FROM t GROUP BY ROLLUP (city)");
     assert!(a.has_grouping_sets);
     assert!(a.unsupported_reason().is_some());
 }
 
 #[test]
 fn test_detect_filter_clause() {
-    let a = parse_and_analyze(
-        "SELECT city, COUNT(*) FILTER (WHERE active) FROM t GROUP BY city",
-    );
+    let a = parse_and_analyze("SELECT city, COUNT(*) FILTER (WHERE active) FROM t GROUP BY city");
     assert!(a.has_filter_clause);
     // FILTER is now supported via CASE WHEN rewrite
-    assert!(a.unsupported_reason().is_none(),
-        "FILTER should be supported, got: {:?}", a.unsupported_reason());
+    assert!(
+        a.unsupported_reason().is_none(),
+        "FILTER should be supported, got: {:?}",
+        a.unsupported_reason()
+    );
 }
 
 #[test]
@@ -298,9 +300,7 @@ fn test_detect_within_group() {
 
 #[test]
 fn test_detect_tablesample() {
-    let a = parse_and_analyze(
-        "SELECT * FROM t TABLESAMPLE BERNOULLI (10)",
-    );
+    let a = parse_and_analyze("SELECT * FROM t TABLESAMPLE BERNOULLI (10)");
     assert!(a.has_tablesample);
     assert!(a.unsupported_reason().is_some());
     assert!(a.unsupported_reason().unwrap().contains("TABLESAMPLE"));
@@ -308,23 +308,17 @@ fn test_detect_tablesample() {
 
 #[test]
 fn test_detect_nondeterministic_select() {
-    let a = parse_and_analyze(
-        "SELECT NOW(), city FROM t GROUP BY city",
-    );
+    let a = parse_and_analyze("SELECT NOW(), city FROM t GROUP BY city");
     assert!(a.has_nondeterministic_select);
     assert!(a.unsupported_reason().is_some());
 
-    let b = parse_and_analyze(
-        "SELECT RANDOM(), id FROM t",
-    );
+    let b = parse_and_analyze("SELECT RANDOM(), id FROM t");
     assert!(b.has_nondeterministic_select);
 }
 
 #[test]
 fn test_detect_unsupported_aggregate_string_agg() {
-    let a = parse_and_analyze(
-        "SELECT city, STRING_AGG(name, ', ') FROM t GROUP BY city",
-    );
+    let a = parse_and_analyze("SELECT city, STRING_AGG(name, ', ') FROM t GROUP BY city");
     assert!(!a.unsupported_aggregates.is_empty());
     assert!(a.unsupported_aggregates.contains(&"STRING_AGG".to_string()));
     assert!(a.unsupported_reason().is_some());
@@ -332,27 +326,35 @@ fn test_detect_unsupported_aggregate_string_agg() {
 
 #[test]
 fn test_detect_unsupported_aggregate_array_agg() {
-    let a = parse_and_analyze(
-        "SELECT city, ARRAY_AGG(val) FROM t GROUP BY city",
-    );
+    let a = parse_and_analyze("SELECT city, ARRAY_AGG(val) FROM t GROUP BY city");
     assert!(a.unsupported_aggregates.contains(&"ARRAY_AGG".to_string()));
 }
 
 #[test]
 fn test_detect_unsupported_aggregate_stddev() {
-    let a = parse_and_analyze(
-        "SELECT city, STDDEV(val) FROM t GROUP BY city",
-    );
+    let a = parse_and_analyze("SELECT city, STDDEV(val) FROM t GROUP BY city");
     assert!(a.unsupported_aggregates.contains(&"STDDEV".to_string()));
 }
 
 #[test]
 fn test_detect_scalar_subquery() {
+    let a = parse_and_analyze("SELECT (SELECT MAX(x) FROM t2), city FROM t GROUP BY city");
+    assert!(a.has_scalar_subquery);
+    // Scalar subqueries are now allowed (evaluated at trigger time as static values)
+    assert!(
+        a.unsupported_reason().is_none(),
+        "Scalar subqueries should be allowed, got: {:?}",
+        a.unsupported_reason()
+    );
+}
+
+#[test]
+fn test_scalar_subquery_in_where() {
     let a = parse_and_analyze(
-        "SELECT (SELECT MAX(x) FROM t2), city FROM t GROUP BY city",
+        "SELECT city, SUM(val) FROM t WHERE year >= (SELECT MAX(year) FROM t2) GROUP BY city",
     );
     assert!(a.has_scalar_subquery);
-    assert!(a.unsupported_reason().is_some());
+    assert!(a.unsupported_reason().is_none());
 }
 
 #[test]
@@ -361,23 +363,30 @@ fn test_supported_aggregates_not_flagged() {
         "SELECT city, SUM(val), COUNT(*), AVG(val), MIN(val), MAX(val), BOOL_OR(flag) \
          FROM t GROUP BY city",
     );
-    assert!(a.unsupported_aggregates.is_empty(),
-        "Supported aggregates should not be flagged: {:?}", a.unsupported_aggregates);
+    assert!(
+        a.unsupported_aggregates.is_empty(),
+        "Supported aggregates should not be flagged: {:?}",
+        a.unsupported_aggregates
+    );
     assert!(!a.has_filter_clause);
     assert!(!a.has_within_group);
     assert!(!a.has_nondeterministic_select);
-    assert!(a.unsupported_reason().is_none(),
-        "Query with only supported features should pass: {:?}", a.unsupported_reason());
+    assert!(
+        a.unsupported_reason().is_none(),
+        "Query with only supported features should pass: {:?}",
+        a.unsupported_reason()
+    );
 }
 
 #[test]
 fn test_regular_functions_not_flagged_as_aggregates() {
     // UPPER, LOWER, COALESCE etc. are scalar functions, not aggregates
-    let a = parse_and_analyze(
-        "SELECT UPPER(name), COALESCE(val, 0) FROM t",
+    let a = parse_and_analyze("SELECT UPPER(name), COALESCE(val, 0) FROM t");
+    assert!(
+        a.unsupported_aggregates.is_empty(),
+        "Regular scalar functions should not be flagged: {:?}",
+        a.unsupported_aggregates
     );
-    assert!(a.unsupported_aggregates.is_empty(),
-        "Regular scalar functions should not be flagged: {:?}", a.unsupported_aggregates);
 }
 
 #[test]
@@ -398,15 +407,24 @@ fn test_filter_sum() {
         "SELECT city, SUM(amount) FILTER (WHERE active) AS active_total FROM t GROUP BY city",
     );
     assert!(a.has_filter_clause, "FILTER should be detected");
-    assert!(a.unsupported_reason().is_none(),
-        "FILTER should no longer be rejected: {:?}", a.unsupported_reason());
+    assert!(
+        a.unsupported_reason().is_none(),
+        "FILTER should no longer be rejected: {:?}",
+        a.unsupported_reason()
+    );
     let col = &a.select_columns[1];
     assert_eq!(col.aggregate, Some(AggregateKind::Sum));
     let arg = col.aggregate_arg.as_deref().unwrap();
-    assert!(arg.contains("CASE") && arg.contains("WHEN") && arg.contains("active"),
-        "SUM FILTER arg should be rewritten to CASE WHEN, got: {}", arg);
-    assert!(arg.contains("amount"),
-        "Rewritten arg should contain original column: {}", arg);
+    assert!(
+        arg.contains("CASE") && arg.contains("WHEN") && arg.contains("active"),
+        "SUM FILTER arg should be rewritten to CASE WHEN, got: {}",
+        arg
+    );
+    assert!(
+        arg.contains("amount"),
+        "Rewritten arg should contain original column: {}",
+        arg
+    );
 }
 
 #[test]
@@ -417,11 +435,18 @@ fn test_filter_count_star() {
     assert!(a.unsupported_reason().is_none());
     let col = &a.select_columns[1];
     // COUNT(*) FILTER → COUNT(CASE WHEN active THEN 1 END)
-    assert_eq!(col.aggregate, Some(AggregateKind::Count),
-        "COUNT(*) FILTER should become Count (not CountStar), got: {:?}", col.aggregate);
+    assert_eq!(
+        col.aggregate,
+        Some(AggregateKind::Count),
+        "COUNT(*) FILTER should become Count (not CountStar), got: {:?}",
+        col.aggregate
+    );
     let arg = col.aggregate_arg.as_deref().unwrap();
-    assert!(arg.contains("CASE") && arg.contains("1"),
-        "COUNT(*) FILTER arg should be CASE WHEN ... THEN 1 END, got: {}", arg);
+    assert!(
+        arg.contains("CASE") && arg.contains("1"),
+        "COUNT(*) FILTER arg should be CASE WHEN ... THEN 1 END, got: {}",
+        arg
+    );
 }
 
 #[test]
@@ -433,8 +458,11 @@ fn test_filter_count_col() {
     let col = &a.select_columns[1];
     assert_eq!(col.aggregate, Some(AggregateKind::Count));
     let arg = col.aggregate_arg.as_deref().unwrap();
-    assert!(arg.contains("CASE") && arg.contains("val"),
-        "COUNT(col) FILTER arg should be CASE WHEN ... THEN val END, got: {}", arg);
+    assert!(
+        arg.contains("CASE") && arg.contains("val"),
+        "COUNT(col) FILTER arg should be CASE WHEN ... THEN val END, got: {}",
+        arg
+    );
 }
 
 #[test]
@@ -446,8 +474,11 @@ fn test_filter_avg() {
     let col = &a.select_columns[1];
     assert_eq!(col.aggregate, Some(AggregateKind::Avg));
     let arg = col.aggregate_arg.as_deref().unwrap();
-    assert!(arg.contains("CASE") && arg.contains("salary"),
-        "AVG FILTER arg should be rewritten, got: {}", arg);
+    assert!(
+        arg.contains("CASE") && arg.contains("salary"),
+        "AVG FILTER arg should be rewritten, got: {}",
+        arg
+    );
 }
 
 #[test]
@@ -460,8 +491,11 @@ fn test_filter_min_max() {
     assert_eq!(a.select_columns[2].aggregate, Some(AggregateKind::Max));
     for col in &a.select_columns[1..] {
         let arg = col.aggregate_arg.as_deref().unwrap();
-        assert!(arg.contains("CASE") && arg.contains("val"),
-            "MIN/MAX FILTER arg should be rewritten, got: {}", arg);
+        assert!(
+            arg.contains("CASE") && arg.contains("val"),
+            "MIN/MAX FILTER arg should be rewritten, got: {}",
+            arg
+        );
     }
 }
 
@@ -479,7 +513,11 @@ fn test_filter_mixed_with_regular() {
     let cnt_col = &a.select_columns[2];
     assert_eq!(cnt_col.aggregate, Some(AggregateKind::Count));
     let arg = cnt_col.aggregate_arg.as_deref().unwrap();
-    assert!(arg.contains("CASE"), "FILTER aggregate should be rewritten, got: {}", arg);
+    assert!(
+        arg.contains("CASE"),
+        "FILTER aggregate should be rewritten, got: {}",
+        arg
+    );
 }
 
 #[test]
@@ -490,8 +528,11 @@ fn test_filter_expr_captured() {
     let col = &a.select_columns[1];
     assert!(col.filter_expr.is_some(), "filter_expr should be captured");
     let filter = col.filter_expr.as_deref().unwrap();
-    assert!(filter.contains("status") && filter.contains("active"),
-        "filter_expr should contain the original predicate, got: {}", filter);
+    assert!(
+        filter.contains("status") && filter.contains("active"),
+        "filter_expr should contain the original predicate, got: {}",
+        filter
+    );
 }
 
 // ========================================================================
@@ -504,7 +545,10 @@ fn test_distinct_on_columns_captured() {
         "SELECT DISTINCT ON (city) city, name, val FROM t ORDER BY city, val DESC",
     );
     assert!(a.has_distinct_on);
-    assert!(!a.distinct_on_columns.is_empty(), "distinct_on_columns should be captured");
+    assert!(
+        !a.distinct_on_columns.is_empty(),
+        "distinct_on_columns should be captured"
+    );
     assert_eq!(a.distinct_on_columns, vec!["city"]);
 }
 
@@ -525,8 +569,16 @@ fn test_distinct_on_order_by_captured() {
     assert!(!a.order_by_exprs.is_empty(), "ORDER BY should be captured");
     // Should contain something like "city" and "val DESC"
     let joined = a.order_by_exprs.join(", ");
-    assert!(joined.contains("city"), "ORDER BY should contain 'city': {}", joined);
-    assert!(joined.contains("val"), "ORDER BY should contain 'val': {}", joined);
+    assert!(
+        joined.contains("city"),
+        "ORDER BY should contain 'city': {}",
+        joined
+    );
+    assert!(
+        joined.contains("val"),
+        "ORDER BY should contain 'val': {}",
+        joined
+    );
 }
 
 #[test]
@@ -534,8 +586,11 @@ fn test_distinct_on_no_longer_rejected() {
     let a = parse_and_analyze(
         "SELECT DISTINCT ON (city) city, name, val FROM t ORDER BY city, val DESC",
     );
-    assert!(a.unsupported_reason().is_none(),
-        "DISTINCT ON should be supported, got: {:?}", a.unsupported_reason());
+    assert!(
+        a.unsupported_reason().is_none(),
+        "DISTINCT ON should be supported, got: {:?}",
+        a.unsupported_reason()
+    );
 }
 
 #[test]
@@ -543,6 +598,72 @@ fn test_order_by_still_rejected_without_distinct_on() {
     let a = parse_and_analyze("SELECT * FROM t ORDER BY id");
     assert!(a.unsupported_reason().is_some());
     assert!(a.unsupported_reason().unwrap().contains("ORDER BY"));
+}
+
+// ========================================================================
+// Bug fix tests: aggregate-derived expressions (CASE + SUM)
+// ========================================================================
+
+#[test]
+fn test_case_with_sum_detected_as_aggregate_derived() {
+    let a = parse_and_analyze(
+        "SELECT grp, CASE WHEN SUM(x) = 0 THEN 0 ELSE SUM(x) END AS val FROM t GROUP BY grp",
+    );
+    let col = &a.select_columns[1];
+    assert!(
+        col.is_aggregate_derived,
+        "CASE containing SUM should be marked as aggregate_derived"
+    );
+    assert!(
+        !col.is_passthrough,
+        "Aggregate-derived column should not be passthrough"
+    );
+    assert!(
+        col.aggregate.is_none(),
+        "Aggregate-derived column should not have a direct aggregate kind"
+    );
+}
+
+#[test]
+fn test_nested_case_with_multiple_aggregates() {
+    let a = parse_and_analyze(
+        "SELECT grp, CASE WHEN SUM(a) = 0 AND SUM(b) = 0 THEN 0 WHEN SUM(b) = 0 THEN 2 ELSE SUM(a) / SUM(b) END AS zscore FROM t GROUP BY grp",
+    );
+    let col = &a.select_columns[1];
+    assert!(col.is_aggregate_derived);
+    assert!(!col.is_passthrough);
+}
+
+#[test]
+fn test_simple_sum_not_aggregate_derived() {
+    let a = parse_and_analyze("SELECT grp, SUM(x) AS total FROM t GROUP BY grp");
+    let col = &a.select_columns[1];
+    assert!(
+        !col.is_aggregate_derived,
+        "Simple SUM should not be aggregate_derived"
+    );
+    assert!(col.aggregate.is_some());
+}
+
+#[test]
+fn test_expr_contains_aggregate_function() {
+    use crate::sql_analyzer::expr_contains_aggregate;
+    use sqlparser::dialect::PostgreSqlDialect;
+    use sqlparser::parser::Parser;
+
+    let expr = Parser::new(&PostgreSqlDialect {})
+        .try_with_sql("CASE WHEN SUM(x) > 0 THEN SUM(x) ELSE 0 END")
+        .unwrap()
+        .parse_expr()
+        .unwrap();
+    assert!(expr_contains_aggregate(&expr));
+
+    let expr2 = Parser::new(&PostgreSqlDialect {})
+        .try_with_sql("x + y * 2")
+        .unwrap()
+        .parse_expr()
+        .unwrap();
+    assert!(!expr_contains_aggregate(&expr2));
 }
 
 mod proptest_tests {

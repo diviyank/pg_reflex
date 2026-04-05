@@ -38,17 +38,39 @@ pub fn intermediate_table_name(view_name: &str) -> String {
 
 /// Strip table alias/qualifier from a column expression.
 /// E.g., "d.dept_name" -> "dept_name", "city" -> "city"
+/// Only strips qualifiers for simple column references — expressions containing
+/// parentheses (function calls like `COALESCE(t.x, t.y)`) are returned as-is.
 pub fn bare_column_name(col: &str) -> &str {
-    col.rsplit('.').next().unwrap_or(col)
+    if col.contains('(') {
+        col
+    } else {
+        col.rsplit('.').next().unwrap_or(col)
+    }
 }
 
 /// Strip qualifier and lowercase to match PostgreSQL's identifier folding.
 /// Unquoted identifiers in SQL are folded to lowercase by PostgreSQL,
 /// so all generated SQL should use lowercase column names for consistency.
+/// For complex expressions (containing parentheses), sanitizes characters
+/// that are invalid in identifiers (parens, commas, spaces, dots) to underscores.
 pub fn normalized_column_name(col: &str) -> String {
-    bare_column_name(col).trim_matches('"').to_lowercase()
+    let bare = bare_column_name(col).trim_matches('"').to_lowercase();
+    if bare.contains('(') {
+        bare.chars()
+            .map(|c| {
+                if c.is_alphanumeric() || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect::<String>()
+            .trim_matches('_')
+            .to_string()
+    } else {
+        bare
+    }
 }
-
 
 /// Replace a SQL identifier with another, respecting word boundaries.
 /// Only replaces when the match is NOT part of a longer identifier
@@ -63,12 +85,20 @@ pub fn replace_identifier(sql: &str, old_name: &str, new_name: &str) -> String {
     let mut i = 0;
     while i < bytes.len() {
         if i + old_bytes.len() <= bytes.len() && &bytes[i..i + old_bytes.len()] == old_bytes {
-            let before_ok =
-                i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
+            let before_ok = i == 0
+                || !(bytes[i - 1].is_ascii_alphanumeric()
+                    || bytes[i - 1] == b'_'
+                    || bytes[i - 1] == b'.');
+            // Don't replace identifiers that follow "AS " (output aliases, not table refs)
+            let after_as = i >= 3
+                && (bytes[i - 1] == b' ')
+                && (bytes[i - 2] == b'S' || bytes[i - 2] == b's')
+                && (bytes[i - 3] == b'A' || bytes[i - 3] == b'a')
+                && (i < 4 || !bytes[i - 4].is_ascii_alphanumeric());
             let after_pos = i + old_bytes.len();
             let after_ok = after_pos >= bytes.len()
                 || !(bytes[after_pos].is_ascii_alphanumeric() || bytes[after_pos] == b'_');
-            if before_ok && after_ok {
+            if before_ok && after_ok && !after_as {
                 result.push_str(new_name);
                 i += old_bytes.len();
                 continue;
@@ -79,8 +109,6 @@ pub fn replace_identifier(sql: &str, old_name: &str, new_name: &str) -> String {
     }
     result
 }
-
-
 
 /// Generate the base query: source data -> intermediate table.
 ///
@@ -256,11 +284,8 @@ fn rewrite_aggregate_call(f: &Function, columns: &[IntermediateColumn]) -> Strin
     f.to_string()
 }
 
-fn sanitize_for_col_name(s: &str) -> String {
-    s.chars()
-        .map(|c| if c.is_alphanumeric() || c == '_' { c } else { '_' })
-        .collect::<String>()
-        .to_lowercase()
+pub fn sanitize_for_col_name(s: &str) -> String {
+    crate::aggregation::sanitize_for_col_name(s)
 }
 
 /// Uses bare column names since the intermediate table has no table qualifiers.
@@ -268,44 +293,76 @@ pub fn generate_end_query(view_name: &str, plan: &AggregationPlan) -> String {
     let table = intermediate_table_name(view_name);
     let mut select_parts: Vec<String> = Vec::new();
 
-    // Group by columns (normalized lowercase names matching intermediate table columns)
-    for col in &plan.group_by_columns {
-        let norm = normalized_column_name(col);
-        select_parts.push(format!("\"{}\"", norm));
-    }
-
-    // For DISTINCT without GROUP BY (not COUNT(DISTINCT)), add the distinct columns to output.
-    // For COUNT(DISTINCT), distinct_columns are internal to the intermediate — not in the SELECT.
-    let has_count_distinct_mapping = plan.end_query_mappings.iter()
-        .any(|m| m.intermediate_expr.starts_with("COUNT("));
-    if !has_count_distinct_mapping {
-        for col in &plan.distinct_columns {
-            let norm = normalized_column_name(col);
-            select_parts.push(format!("\"{}\"", norm));
-        }
-    }
-
-    // End query aggregate expressions (with optional cast).
-    // For sentinel-only (no GROUP BY): wrap SUM/AVG in NULLIF guard so empty table
-    // returns NULL (matching PostgreSQL's SUM/AVG on empty result).
     let is_sentinel = plan.group_by_columns.is_empty() && plan.distinct_columns.is_empty();
-    for mapping in &plan.end_query_mappings {
-        let expr = if is_sentinel && matches!(mapping.aggregate_type.as_str(), "SUM" | "AVG" | "MIN" | "MAX") {
-            format!("CASE WHEN __ivm_count > 0 THEN {} END", mapping.intermediate_expr)
+    let has_count_distinct_mapping = plan
+        .end_query_mappings
+        .iter()
+        .any(|m| m.intermediate_expr.starts_with("COUNT("));
+
+    // Helper: build SELECT expression for a GROUP BY column
+    let gb_select = |col: &str| -> String {
+        let norm = normalized_column_name(col);
+        if let Some(user_alias) = plan.group_by_aliases.get(col) {
+            let user_norm = normalized_column_name(user_alias);
+            format!("\"{}\" AS \"{}\"", norm, user_norm)
+        } else {
+            format!("\"{}\"", norm)
+        }
+    };
+
+    // Helper: build SELECT expression for an end_query mapping
+    let agg_select = |mapping: &crate::aggregation::EndQueryMapping| -> String {
+        let expr = if is_sentinel
+            && matches!(
+                mapping.aggregate_type.as_str(),
+                "SUM" | "AVG" | "MIN" | "MAX"
+            ) {
+            format!(
+                "CASE WHEN __ivm_count > 0 THEN {} END",
+                mapping.intermediate_expr
+            )
         } else {
             mapping.intermediate_expr.clone()
         };
-
         if let Some(ref cast) = mapping.cast_type {
-            select_parts.push(format!(
-                "({})::{} AS \"{}\"",
-                expr, cast, mapping.output_alias
-            ));
+            format!("({})::{} AS \"{}\"", expr, cast, mapping.output_alias)
         } else {
-            select_parts.push(format!(
-                "{} AS \"{}\"",
-                expr, mapping.output_alias
-            ));
+            format!("{} AS \"{}\"", expr, mapping.output_alias)
+        }
+    };
+
+    if !plan.output_column_order.is_empty() {
+        // Use output_column_order to match the user's SELECT column order
+        for entry in &plan.output_column_order {
+            if let Some(gb_expr) = entry.strip_prefix("gb:") {
+                select_parts.push(gb_select(gb_expr));
+            } else if let Some(agg_alias) = entry.strip_prefix("agg:") {
+                if let Some(mapping) = plan
+                    .end_query_mappings
+                    .iter()
+                    .find(|m| m.output_alias == agg_alias)
+                {
+                    select_parts.push(agg_select(mapping));
+                }
+            }
+        }
+    } else {
+        // Fallback: GROUP BY columns first, then aggregates (legacy order)
+        for col in &plan.group_by_columns {
+            select_parts.push(gb_select(col));
+        }
+        let has_count_distinct_mapping = plan
+            .end_query_mappings
+            .iter()
+            .any(|m| m.intermediate_expr.starts_with("COUNT("));
+        if !has_count_distinct_mapping {
+            for col in &plan.distinct_columns {
+                let norm = normalized_column_name(col);
+                select_parts.push(format!("\"{}\"", norm));
+            }
+        }
+        for mapping in &plan.end_query_mappings {
+            select_parts.push(agg_select(mapping));
         }
     }
 
@@ -324,7 +381,9 @@ pub fn generate_end_query(view_name: &str, plan: &AggregationPlan) -> String {
     // For COUNT(DISTINCT): add GROUP BY on the original group columns
     // so COUNT(*) re-aggregates from the (grp, val) compound intermediate to just (grp).
     if has_count_distinct_mapping && !plan.group_by_columns.is_empty() {
-        let grp_cols: Vec<String> = plan.group_by_columns.iter()
+        let grp_cols: Vec<String> = plan
+            .group_by_columns
+            .iter()
             .map(|c| format!("\"{}\"", normalized_column_name(c)))
             .collect();
         query.push_str(&format!(" GROUP BY {}", grp_cols.join(", ")));

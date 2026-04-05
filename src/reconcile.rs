@@ -20,17 +20,17 @@ pub(crate) fn reflex_reconcile(view_name: &str) -> &'static str {
                  FROM public.__reflex_ivm_reference WHERE name = $1 AND enabled = TRUE",
                 None,
                 &[unsafe {
-                    DatumWithOid::new(
-                        view_name.to_string(),
-                        PgBuiltInOids::TEXTOID.oid().value(),
-                    )
+                    DatumWithOid::new(view_name.to_string(), PgBuiltInOids::TEXTOID.oid().value())
                 }],
             )
             .unwrap_or_report()
             .collect::<Vec<_>>();
 
         if rows.is_empty() {
-            warning!("pg_reflex: reconcile failed — IMV '{}' not found or disabled", view_name);
+            warning!(
+                "pg_reflex: reconcile failed — IMV '{}' not found or disabled",
+                view_name
+            );
             return "ERROR: IMV not found or disabled";
         }
 
@@ -51,13 +51,12 @@ pub(crate) fn reflex_reconcile(view_name: &str) -> &'static str {
             .unwrap_or("{}")
             .to_string();
 
-        let is_passthrough = if let Ok(plan) =
-            serde_json::from_str::<aggregation::AggregationPlan>(&agg_json)
-        {
-            plan.is_passthrough
-        } else {
-            false
-        };
+        let is_passthrough =
+            if let Ok(plan) = serde_json::from_str::<aggregation::AggregationPlan>(&agg_json) {
+                plan.is_passthrough
+            } else {
+                false
+            };
 
         if is_passthrough || end_query.is_empty() {
             // Passthrough: optimized refresh — drop indexes, TRUNCATE, INSERT, recreate, ANALYZE
@@ -83,12 +82,25 @@ pub(crate) fn reflex_reconcile(view_name: &str) -> &'static str {
                 .collect();
 
             for (idx_name, _) in &saved_indexes {
-                client.update(&format!("DROP INDEX IF EXISTS \"{}\".\"{}\"", tgt_schema_str, idx_name), None, &[]).unwrap_or_report();
+                client
+                    .update(
+                        &format!(
+                            "DROP INDEX IF EXISTS \"{}\".\"{}\"",
+                            tgt_schema_str, idx_name
+                        ),
+                        None,
+                        &[],
+                    )
+                    .unwrap_or_report();
             }
 
             // Bulk refresh without indexes
             client
-                .update(&format!("TRUNCATE {}", quote_identifier(view_name)), None, &[])
+                .update(
+                    &format!("TRUNCATE {}", quote_identifier(view_name)),
+                    None,
+                    &[],
+                )
                 .unwrap_or_report();
             client
                 .update(
@@ -104,25 +116,31 @@ pub(crate) fn reflex_reconcile(view_name: &str) -> &'static str {
             }
 
             // ANALYZE
-            client.update(&format!("ANALYZE {}", quote_identifier(view_name)), None, &[]).unwrap_or_report();
+            client
+                .update(
+                    &format!("ANALYZE {}", quote_identifier(view_name)),
+                    None,
+                    &[],
+                )
+                .unwrap_or_report();
         } else {
             // Aggregate: rebuild intermediate + target
             // Drop pg_reflex-managed indexes first for faster bulk insert
-            let plan: aggregation::AggregationPlan =
-                serde_json::from_str(&agg_json).unwrap_or_else(|_| {
-                    aggregation::AggregationPlan {
-                        group_by_columns: vec![],
-                        intermediate_columns: vec![],
-                        end_query_mappings: vec![],
-                        has_distinct: false,
-                        needs_ivm_count: false,
-                        distinct_columns: vec![],
-                        is_passthrough: false,
-                        passthrough_columns: vec![],
-                        passthrough_key_mappings: std::collections::HashMap::new(),
-                        having_clause: None,
-                        not_null_columns: std::collections::HashSet::new(),
-                    }
+            let plan: aggregation::AggregationPlan = serde_json::from_str(&agg_json)
+                .unwrap_or_else(|_| aggregation::AggregationPlan {
+                    group_by_columns: vec![],
+                    intermediate_columns: vec![],
+                    end_query_mappings: vec![],
+                    has_distinct: false,
+                    needs_ivm_count: false,
+                    distinct_columns: vec![],
+                    is_passthrough: false,
+                    passthrough_columns: vec![],
+                    passthrough_key_mappings: std::collections::HashMap::new(),
+                    having_clause: None,
+                    not_null_columns: std::collections::HashSet::new(),
+                    group_by_aliases: std::collections::HashMap::new(),
+                    output_column_order: vec![],
                 });
 
             let intermediate = intermediate_table_name(view_name);
@@ -137,16 +155,36 @@ pub(crate) fn reflex_reconcile(view_name: &str) -> &'static str {
                     "SELECT indexname FROM pg_indexes WHERE schemaname = $1 AND tablename = $2",
                     None,
                     &[
-                        unsafe { DatumWithOid::new(int_schema_str.to_string(), PgBuiltInOids::TEXTOID.oid().value()) },
-                        unsafe { DatumWithOid::new(format!("__reflex_intermediate_{}", bare_view), PgBuiltInOids::TEXTOID.oid().value()) },
+                        unsafe {
+                            DatumWithOid::new(
+                                int_schema_str.to_string(),
+                                PgBuiltInOids::TEXTOID.oid().value(),
+                            )
+                        },
+                        unsafe {
+                            DatumWithOid::new(
+                                format!("__reflex_intermediate_{}", bare_view),
+                                PgBuiltInOids::TEXTOID.oid().value(),
+                            )
+                        },
                     ],
                 )
                 .unwrap_or_report()
-                .filter_map(|row| row.get_by_name::<&str, _>("indexname").unwrap_or(None).map(|s| s.to_string()))
+                .filter_map(|row| {
+                    row.get_by_name::<&str, _>("indexname")
+                        .unwrap_or(None)
+                        .map(|s| s.to_string())
+                })
                 .collect();
 
             for idx in &int_indexes {
-                client.update(&format!("DROP INDEX IF EXISTS \"{}\".\"{}\"", int_schema_str, idx), None, &[]).unwrap_or_report();
+                client
+                    .update(
+                        &format!("DROP INDEX IF EXISTS \"{}\".\"{}\"", int_schema_str, idx),
+                        None,
+                        &[],
+                    )
+                    .unwrap_or_report();
             }
 
             // Collect ALL indexes on target table (save DDL for user-created ones)
@@ -170,7 +208,16 @@ pub(crate) fn reflex_reconcile(view_name: &str) -> &'static str {
                 .collect();
 
             for (idx_name, _) in &tgt_saved_indexes {
-                client.update(&format!("DROP INDEX IF EXISTS \"{}\".\"{}\"", tgt_schema_str, idx_name), None, &[]).unwrap_or_report();
+                client
+                    .update(
+                        &format!(
+                            "DROP INDEX IF EXISTS \"{}\".\"{}\"",
+                            tgt_schema_str, idx_name
+                        ),
+                        None,
+                        &[],
+                    )
+                    .unwrap_or_report();
             }
 
             // Bulk insert without indexes
@@ -185,7 +232,11 @@ pub(crate) fn reflex_reconcile(view_name: &str) -> &'static str {
                 )
                 .unwrap_or_report();
             client
-                .update(&format!("TRUNCATE {}", quote_identifier(view_name)), None, &[])
+                .update(
+                    &format!("TRUNCATE {}", quote_identifier(view_name)),
+                    None,
+                    &[],
+                )
                 .unwrap_or_report();
             client
                 .update(
@@ -209,8 +260,16 @@ pub(crate) fn reflex_reconcile(view_name: &str) -> &'static str {
             }
 
             // ANALYZE for query planner
-            client.update(&format!("ANALYZE {}", intermediate), None, &[]).unwrap_or_report();
-            client.update(&format!("ANALYZE {}", quote_identifier(view_name)), None, &[]).unwrap_or_report();
+            client
+                .update(&format!("ANALYZE {}", intermediate), None, &[])
+                .unwrap_or_report();
+            client
+                .update(
+                    &format!("ANALYZE {}", quote_identifier(view_name)),
+                    None,
+                    &[],
+                )
+                .unwrap_or_report();
         }
 
         // Update last_update_date
@@ -219,10 +278,7 @@ pub(crate) fn reflex_reconcile(view_name: &str) -> &'static str {
                 "UPDATE public.__reflex_ivm_reference SET last_update_date = NOW() WHERE name = $1",
                 None,
                 &[unsafe {
-                    DatumWithOid::new(
-                        view_name.to_string(),
-                        PgBuiltInOids::TEXTOID.oid().value(),
-                    )
+                    DatumWithOid::new(view_name.to_string(), PgBuiltInOids::TEXTOID.oid().value())
                 }],
             )
             .unwrap_or_report();
@@ -244,10 +300,7 @@ pub(crate) fn refresh_imv_depending_on(source: &str) -> &'static str {
                  ORDER BY graph_depth",
                 None,
                 &[unsafe {
-                    DatumWithOid::new(
-                        source.to_string(),
-                        PgBuiltInOids::TEXTOID.oid().value(),
-                    )
+                    DatumWithOid::new(source.to_string(), PgBuiltInOids::TEXTOID.oid().value())
                 }],
             )
             .unwrap_or_report()

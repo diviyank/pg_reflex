@@ -451,13 +451,24 @@ fn test_error_nondeterministic_random_in_select() {
 }
 
 #[pg_test]
-fn test_error_scalar_subquery_in_select() {
+fn test_scalar_subquery_in_where_allowed() {
+    // Scalar subqueries are now allowed — they evaluate at trigger time as static values
     Spi::run("CREATE TABLE err_ssq1 (city TEXT, val INT)").expect("create");
     Spi::run("CREATE TABLE err_ssq2 (x INT)").expect("create");
-    let result = crate::create_reflex_ivm("err_ssq_v",
-        "SELECT (SELECT MAX(x) FROM err_ssq2), city, SUM(val) AS s FROM err_ssq1 GROUP BY city",
-        None, None, None);
-    assert!(result.starts_with("ERROR"), "Scalar subquery in SELECT should be rejected: {}", result);
+    Spi::run("INSERT INTO err_ssq2 VALUES (42)").expect("seed");
+    let result = crate::create_reflex_ivm(
+        "err_ssq_v",
+        "SELECT city, SUM(val) AS s FROM err_ssq1 \
+         WHERE val > (SELECT MAX(x) FROM err_ssq2) GROUP BY city",
+        None,
+        None,
+        None,
+    );
+    assert!(
+        !result.starts_with("ERROR"),
+        "Scalar subquery in WHERE should be allowed: {}",
+        result
+    );
 }
 
 #[pg_test]

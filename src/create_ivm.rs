@@ -7,18 +7,27 @@ use std::collections::HashMap;
 
 use crate::aggregation::plan_aggregation;
 use crate::query_decomposer::{
-    bare_column_name, generate_aggregations_json, generate_base_query, generate_end_query, normalized_column_name,
-    intermediate_table_name, quote_identifier, replace_identifier, split_qualified_name,
+    bare_column_name, generate_aggregations_json, generate_base_query, generate_end_query,
+    intermediate_table_name, normalized_column_name, quote_identifier, replace_identifier,
+    split_qualified_name,
 };
 use crate::schema_builder::{
-    build_indexes_ddl, build_intermediate_table_ddl, build_target_table_ddl, build_trigger_ddls,
-    build_deferred_trigger_ddls, build_deferred_flush_ddl, build_staging_table_ddl,
+    build_deferred_flush_ddl, build_deferred_trigger_ddls, build_indexes_ddl,
+    build_intermediate_table_ddl, build_staging_table_ddl, build_target_table_ddl,
+    build_trigger_ddls, resolve_column_type,
 };
 use crate::sql_analyzer::{analyze, SqlAnalysisError};
-use crate::window;
 use crate::validate_view_name;
+use crate::window;
 
-pub(crate) fn create_reflex_ivm_impl(view_name: &str, sql: &str, unique_columns_str: &str, if_not_exists: bool, storage_mode: &str, refresh_mode: &str) -> &'static str {
+pub(crate) fn create_reflex_ivm_impl(
+    view_name: &str,
+    sql: &str,
+    unique_columns_str: &str,
+    if_not_exists: bool,
+    storage_mode: &str,
+    refresh_mode: &str,
+) -> &'static str {
     let storage_upper = storage_mode.to_uppercase();
     if storage_upper != "LOGGED" && storage_upper != "UNLOGGED" {
         return "ERROR: storage must be 'LOGGED' or 'UNLOGGED'";
@@ -37,9 +46,7 @@ pub(crate) fn create_reflex_ivm_impl(view_name: &str, sql: &str, unique_columns_
         Ok(stmts) => stmts,
         Err(e) => {
             warning!("pg_reflex: failed to parse SQL for '{}': {}", view_name, e);
-            return Box::leak(
-                format!("ERROR: Failed to parse SQL: {}", e).into_boxed_str(),
-            );
+            return Box::leak(format!("ERROR: Failed to parse SQL: {}", e).into_boxed_str());
         }
     };
     let analysis = match analyze(&parsed_sql) {
@@ -51,18 +58,21 @@ pub(crate) fn create_reflex_ivm_impl(view_name: &str, sql: &str, unique_columns_
         }
         Ok(a) => {
             if let Some(reason) = a.unsupported_reason() {
-                return Box::leak(
-                    format!("ERROR: {}", reason).into_boxed_str(),
-                );
+                return Box::leak(format!("ERROR: {}", reason).into_boxed_str());
             }
             // Reject SUM(DISTINCT), AVG(DISTINCT), etc. — DISTINCT modifier is only
             // supported on COUNT. Check the original SQL for the pattern.
             let sql_upper = sql.to_uppercase();
-            let has_distinct_agg = sql_upper.contains("SUM(DISTINCT") || sql_upper.contains("SUM (DISTINCT")
-                || sql_upper.contains("AVG(DISTINCT") || sql_upper.contains("AVG (DISTINCT")
-                || sql_upper.contains("MIN(DISTINCT") || sql_upper.contains("MIN (DISTINCT")
-                || sql_upper.contains("MAX(DISTINCT") || sql_upper.contains("MAX (DISTINCT")
-                || sql_upper.contains("BOOL_OR(DISTINCT") || sql_upper.contains("BOOL_OR (DISTINCT");
+            let has_distinct_agg = sql_upper.contains("SUM(DISTINCT")
+                || sql_upper.contains("SUM (DISTINCT")
+                || sql_upper.contains("AVG(DISTINCT")
+                || sql_upper.contains("AVG (DISTINCT")
+                || sql_upper.contains("MIN(DISTINCT")
+                || sql_upper.contains("MIN (DISTINCT")
+                || sql_upper.contains("MAX(DISTINCT")
+                || sql_upper.contains("MAX (DISTINCT")
+                || sql_upper.contains("BOOL_OR(DISTINCT")
+                || sql_upper.contains("BOOL_OR (DISTINCT");
             if has_distinct_agg {
                 return "ERROR: DISTINCT modifier on SUM/AVG/MIN/MAX/BOOL_OR is not supported. \
                         Only COUNT(DISTINCT col) is supported. Use a CTE with SELECT DISTINCT \
@@ -90,7 +100,12 @@ pub(crate) fn create_reflex_ivm_impl(view_name: &str, sql: &str, unique_columns_
         for (i, operand_sql) in set_op.operand_sqls.iter().enumerate() {
             let sub_name = format!("{}__union_{}", view_name, i);
             let result = create_reflex_ivm_impl(
-                &sub_name, operand_sql, unique_columns_str, false, storage_mode, refresh_mode,
+                &sub_name,
+                operand_sql,
+                unique_columns_str,
+                false,
+                storage_mode,
+                refresh_mode,
             );
             if result.starts_with("ERROR") {
                 return result;
@@ -156,16 +171,28 @@ pub(crate) fn create_reflex_ivm_impl(view_name: &str, sql: &str, unique_columns_
 
                 // Update sub-IMVs graph_child
                 for imv_name in &depends_on_imv {
-                    client.update(
-                        "UPDATE public.__reflex_ivm_reference
+                    client
+                        .update(
+                            "UPDATE public.__reflex_ivm_reference
                          SET graph_child = array_append(COALESCE(graph_child, ARRAY[]::TEXT[]), $1)
                          WHERE name = $2",
-                        None,
-                        &[
-                            unsafe { DatumWithOid::new(view_name.to_string(), PgBuiltInOids::TEXTOID.oid().value()) },
-                            unsafe { DatumWithOid::new(imv_name.to_string(), PgBuiltInOids::TEXTOID.oid().value()) },
-                        ],
-                    ).unwrap_or_report();
+                            None,
+                            &[
+                                unsafe {
+                                    DatumWithOid::new(
+                                        view_name.to_string(),
+                                        PgBuiltInOids::TEXTOID.oid().value(),
+                                    )
+                                },
+                                unsafe {
+                                    DatumWithOid::new(
+                                        imv_name.to_string(),
+                                        PgBuiltInOids::TEXTOID.oid().value(),
+                                    )
+                                },
+                            ],
+                        )
+                        .unwrap_or_report();
                 }
             });
         } else {
@@ -226,16 +253,28 @@ pub(crate) fn create_reflex_ivm_impl(view_name: &str, sql: &str, unique_columns_
                 ).unwrap_or_report();
 
                 for imv_name in &depends_on_imv {
-                    client.update(
-                        "UPDATE public.__reflex_ivm_reference
+                    client
+                        .update(
+                            "UPDATE public.__reflex_ivm_reference
                          SET graph_child = array_append(COALESCE(graph_child, ARRAY[]::TEXT[]), $1)
                          WHERE name = $2",
-                        None,
-                        &[
-                            unsafe { DatumWithOid::new(view_name.to_string(), PgBuiltInOids::TEXTOID.oid().value()) },
-                            unsafe { DatumWithOid::new(imv_name.to_string(), PgBuiltInOids::TEXTOID.oid().value()) },
-                        ],
-                    ).unwrap_or_report();
+                            None,
+                            &[
+                                unsafe {
+                                    DatumWithOid::new(
+                                        view_name.to_string(),
+                                        PgBuiltInOids::TEXTOID.oid().value(),
+                                    )
+                                },
+                                unsafe {
+                                    DatumWithOid::new(
+                                        imv_name.to_string(),
+                                        PgBuiltInOids::TEXTOID.oid().value(),
+                                    )
+                                },
+                            ],
+                        )
+                        .unwrap_or_report();
                 }
             });
         }
@@ -250,14 +289,22 @@ pub(crate) fn create_reflex_ivm_impl(view_name: &str, sql: &str, unique_columns_
     //   2. A VIEW with ROW_NUMBER() OVER (PARTITION BY <cols> ORDER BY <order>) WHERE rn = 1
     if analysis.has_distinct_on && !analysis.distinct_on_columns.is_empty() {
         // Build base SQL: original SELECT without DISTINCT ON and ORDER BY
-        let select_items: Vec<String> = analysis.select_columns.iter().map(|c| {
-            if let Some(ref alias) = c.alias {
-                format!("{} AS {}", c.expr_sql, alias)
-            } else {
-                c.expr_sql.clone()
-            }
-        }).collect();
-        let mut base_sql = format!("SELECT {} FROM {}", select_items.join(", "), analysis.from_clause_sql);
+        let select_items: Vec<String> = analysis
+            .select_columns
+            .iter()
+            .map(|c| {
+                if let Some(ref alias) = c.alias {
+                    format!("{} AS {}", c.expr_sql, alias)
+                } else {
+                    c.expr_sql.clone()
+                }
+            })
+            .collect();
+        let mut base_sql = format!(
+            "SELECT {} FROM {}",
+            select_items.join(", "),
+            analysis.from_clause_sql
+        );
         if let Some(ref wc) = analysis.where_clause {
             base_sql.push_str(&format!(" WHERE {}", wc));
         }
@@ -265,7 +312,12 @@ pub(crate) fn create_reflex_ivm_impl(view_name: &str, sql: &str, unique_columns_
         // Create sub-IMV for the base data
         let base_name = format!("{}__base", view_name);
         let result = create_reflex_ivm_impl(
-            &base_name, &base_sql, unique_columns_str, false, storage_mode, refresh_mode,
+            &base_name,
+            &base_sql,
+            unique_columns_str,
+            false,
+            storage_mode,
+            refresh_mode,
         );
         if result.starts_with("ERROR") {
             return result;
@@ -273,32 +325,42 @@ pub(crate) fn create_reflex_ivm_impl(view_name: &str, sql: &str, unique_columns_
 
         // Build the VIEW: SELECT <cols> FROM (SELECT *, ROW_NUMBER() OVER (...) AS __reflex_rn FROM base) WHERE __reflex_rn = 1
         // Strip table qualifiers — the VIEW reads from the base sub-IMV which has bare column names
-        let partition_cols: Vec<String> = analysis.distinct_on_columns.iter()
+        let partition_cols: Vec<String> = analysis
+            .distinct_on_columns
+            .iter()
             .map(|c| format!("\"{}\"", bare_column_name(c)))
             .collect();
         let partition_by = partition_cols.join(", ");
 
         // For ORDER BY, strip table qualifiers but preserve ASC/DESC/NULLS modifiers
-        let order_parts: Vec<String> = analysis.order_by_exprs.iter().map(|expr| {
-            // Split on first space to separate column from modifiers (e.g., "j2.val DESC")
-            let parts: Vec<&str> = expr.splitn(2, ' ').collect();
-            let col = format!("\"{}\"", bare_column_name(parts[0]));
-            if parts.len() > 1 {
-                format!("{} {}", col, parts[1])
-            } else {
-                col
-            }
-        }).collect();
+        let order_parts: Vec<String> = analysis
+            .order_by_exprs
+            .iter()
+            .map(|expr| {
+                // Split on first space to separate column from modifiers (e.g., "j2.val DESC")
+                let parts: Vec<&str> = expr.splitn(2, ' ').collect();
+                let col = format!("\"{}\"", bare_column_name(parts[0]));
+                if parts.len() > 1 {
+                    format!("{} {}", col, parts[1])
+                } else {
+                    col
+                }
+            })
+            .collect();
         let order_by = order_parts.join(", ");
 
         // Output column list (just names/aliases, no expressions)
-        let output_cols: Vec<String> = analysis.select_columns.iter().map(|c| {
-            if let Some(ref alias) = c.alias {
-                format!("\"{}\"", alias)
-            } else {
-                format!("\"{}\"", bare_column_name(&c.expr_sql))
-            }
-        }).collect();
+        let output_cols: Vec<String> = analysis
+            .select_columns
+            .iter()
+            .map(|c| {
+                if let Some(ref alias) = c.alias {
+                    format!("\"{}\"", alias)
+                } else {
+                    format!("\"{}\"", bare_column_name(&c.expr_sql))
+                }
+            })
+            .collect();
 
         let view_sql = format!(
             "SELECT {} FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY {} ORDER BY {}) AS __reflex_rn FROM {}) __sub WHERE __reflex_rn = 1",
@@ -351,16 +413,28 @@ pub(crate) fn create_reflex_ivm_impl(view_name: &str, sql: &str, unique_columns_
 
             // Update base IMV's graph_child
             for name in &depends_on_imv {
-                client.update(
-                    "UPDATE public.__reflex_ivm_reference
+                client
+                    .update(
+                        "UPDATE public.__reflex_ivm_reference
                      SET graph_child = array_append(COALESCE(graph_child, ARRAY[]::TEXT[]), $1)
                      WHERE name = $2",
-                    None,
-                    &[
-                        unsafe { DatumWithOid::new(view_name.to_string(), PgBuiltInOids::TEXTOID.oid().value()) },
-                        unsafe { DatumWithOid::new(name.to_string(), PgBuiltInOids::TEXTOID.oid().value()) },
-                    ],
-                ).unwrap_or_report();
+                        None,
+                        &[
+                            unsafe {
+                                DatumWithOid::new(
+                                    view_name.to_string(),
+                                    PgBuiltInOids::TEXTOID.oid().value(),
+                                )
+                            },
+                            unsafe {
+                                DatumWithOid::new(
+                                    name.to_string(),
+                                    PgBuiltInOids::TEXTOID.oid().value(),
+                                )
+                            },
+                        ],
+                    )
+                    .unwrap_or_report();
             }
         });
 
@@ -381,7 +455,12 @@ pub(crate) fn create_reflex_ivm_impl(view_name: &str, sql: &str, unique_columns_
         // Create a sub-IMV for the base query (aggregate or passthrough, no windows)
         let base_name = format!("{}__base", view_name);
         let result = create_reflex_ivm_impl(
-            &base_name, &decomp.base_query, unique_columns_str, false, storage_mode, refresh_mode,
+            &base_name,
+            &decomp.base_query,
+            unique_columns_str,
+            false,
+            storage_mode,
+            refresh_mode,
         );
         if result.starts_with("ERROR") {
             return result;
@@ -436,16 +515,28 @@ pub(crate) fn create_reflex_ivm_impl(view_name: &str, sql: &str, unique_columns_
 
             // Update base IMV's graph_child
             for name in &depends_on_imv {
-                client.update(
-                    "UPDATE public.__reflex_ivm_reference
+                client
+                    .update(
+                        "UPDATE public.__reflex_ivm_reference
                      SET graph_child = array_append(COALESCE(graph_child, ARRAY[]::TEXT[]), $1)
                      WHERE name = $2",
-                    None,
-                    &[
-                        unsafe { DatumWithOid::new(view_name.to_string(), PgBuiltInOids::TEXTOID.oid().value()) },
-                        unsafe { DatumWithOid::new(name.to_string(), PgBuiltInOids::TEXTOID.oid().value()) },
-                    ],
-                ).unwrap_or_report();
+                        None,
+                        &[
+                            unsafe {
+                                DatumWithOid::new(
+                                    view_name.to_string(),
+                                    PgBuiltInOids::TEXTOID.oid().value(),
+                                )
+                            },
+                            unsafe {
+                                DatumWithOid::new(
+                                    name.to_string(),
+                                    PgBuiltInOids::TEXTOID.oid().value(),
+                                )
+                            },
+                        ],
+                    )
+                    .unwrap_or_report();
             }
         });
 
@@ -456,10 +547,7 @@ pub(crate) fn create_reflex_ivm_impl(view_name: &str, sql: &str, unique_columns_
     // Reject subqueries with aggregation in FROM — the trigger replaces the inner table
     // with the transition table, so inner aggregations would only see delta rows.
     let has_subquery_with_agg = analysis.sources.iter().any(|s| s.starts_with("<subquery:"))
-        && analysis
-            .from_clause_sql
-            .to_uppercase()
-            .contains("GROUP BY");
+        && analysis.from_clause_sql.to_uppercase().contains("GROUP BY");
     if has_subquery_with_agg {
         return "ERROR: Subqueries with aggregation in FROM are not supported. \
                 Use a CTE (WITH clause) instead — pg_reflex decomposes CTEs into sub-IMVs automatically.";
@@ -473,11 +561,19 @@ pub(crate) fn create_reflex_ivm_impl(view_name: &str, sql: &str, unique_columns_
             // Rewrite references to earlier CTEs in this CTE's query
             let mut cte_query = cte.query_sql.clone();
             for (earlier_alias, earlier_imv) in &cte_name_map {
-                cte_query = replace_identifier(&cte_query, earlier_alias, earlier_imv);
+                let quoted = quote_identifier(earlier_imv);
+                cte_query = replace_identifier(&cte_query, earlier_alias, &quoted);
             }
 
             let cte_view_name = format!("{}__cte_{}", view_name, cte.alias);
-            let result = create_reflex_ivm_impl(&cte_view_name, &cte_query, "", false, storage_mode, refresh_mode);
+            let result = create_reflex_ivm_impl(
+                &cte_view_name,
+                &cte_query,
+                "",
+                false,
+                storage_mode,
+                refresh_mode,
+            );
             if result.starts_with("ERROR") {
                 return result;
             }
@@ -492,7 +588,8 @@ pub(crate) fn create_reflex_ivm_impl(view_name: &str, sql: &str, unique_columns_
                 body = format!("{} {}", body, ob);
             }
             for (cte_alias, cte_imv_name) in &cte_name_map {
-                body = replace_identifier(&body, cte_alias, cte_imv_name);
+                let quoted = quote_identifier(cte_imv_name);
+                body = replace_identifier(&body, cte_alias, &quoted);
             }
             body
         } else {
@@ -505,7 +602,11 @@ pub(crate) fn create_reflex_ivm_impl(view_name: &str, sql: &str, unique_columns_
         let body_parsed = match Parser::parse_sql(&dialect, &body_sql) {
             Ok(stmts) => stmts,
             Err(e) => {
-                warning!("pg_reflex: failed to parse rewritten CTE body for '{}': {}", view_name, e);
+                warning!(
+                    "pg_reflex: failed to parse rewritten CTE body for '{}': {}",
+                    view_name,
+                    e
+                );
                 return Box::leak(
                     format!("ERROR: Failed to parse rewritten CTE body: {}", e).into_boxed_str(),
                 );
@@ -522,7 +623,11 @@ pub(crate) fn create_reflex_ivm_impl(view_name: &str, sql: &str, unique_columns_
             Spi::connect_mut(|client| {
                 client
                     .update(
-                        &format!("CREATE OR REPLACE VIEW {} AS {}", quote_identifier(view_name), body_sql),
+                        &format!(
+                            "CREATE OR REPLACE VIEW {} AS {}",
+                            quote_identifier(view_name),
+                            body_sql
+                        ),
                         None,
                         &[],
                     )
@@ -544,11 +649,16 @@ pub(crate) fn create_reflex_ivm_impl(view_name: &str, sql: &str, unique_columns_
     // Reject mixed queries: COUNT(DISTINCT) + other aggregates (SUM, AVG, MIN, MAX, BOOL_OR).
     // COUNT(DISTINCT) uses a compound intermediate key (grp, val) which is incompatible
     // with regular aggregates that use (grp) as the key.
-    let has_cd = analysis.select_columns.iter()
-        .any(|c| matches!(c.aggregate, Some(crate::sql_analyzer::AggregateKind::CountDistinct)));
-    let has_other_agg = analysis.select_columns.iter()
-        .any(|c| matches!(c.aggregate, Some(ref k) if !matches!(k,
-            crate::sql_analyzer::AggregateKind::CountDistinct)));
+    let has_cd = analysis.select_columns.iter().any(|c| {
+        matches!(
+            c.aggregate,
+            Some(crate::sql_analyzer::AggregateKind::CountDistinct)
+        )
+    });
+    let has_other_agg = analysis.select_columns.iter().any(|c| {
+        matches!(c.aggregate, Some(ref k) if !matches!(k,
+            crate::sql_analyzer::AggregateKind::CountDistinct))
+    });
     if has_cd && has_other_agg {
         return "ERROR: COUNT(DISTINCT col) cannot be mixed with other aggregates in the same query. \
                 Use a CTE to separate them: WITH cd AS (SELECT grp, COUNT(DISTINCT col) ...) SELECT ...";
@@ -568,8 +678,11 @@ pub(crate) fn create_reflex_ivm_impl(view_name: &str, sql: &str, unique_columns_
                 .filter(|s| !s.is_empty())
                 .collect();
             plan.passthrough_columns = resolved_unique_columns.clone();
-            info!("pg_reflex: using explicit unique key ({}) for '{}'",
-                resolved_unique_columns.join(", "), view_name);
+            info!(
+                "pg_reflex: using explicit unique key ({}) for '{}'",
+                resolved_unique_columns.join(", "),
+                view_name
+            );
 
             // Build per-source-table column mappings
             build_passthrough_key_mappings(
@@ -630,10 +743,17 @@ pub(crate) fn create_reflex_ivm_impl(view_name: &str, sql: &str, unique_columns_
                         // Single source: 1:1 mapping (target col == source col)
                         plan.passthrough_key_mappings.insert(
                             source.to_string(),
-                            resolved_unique_columns.iter().map(|c| (c.clone(), c.clone())).collect(),
+                            resolved_unique_columns
+                                .iter()
+                                .map(|c| (c.clone(), c.clone()))
+                                .collect(),
                         );
-                        info!("pg_reflex: auto-detected PK ({}) from '{}' for '{}'",
-                            resolved_unique_columns.join(", "), source, view_name);
+                        info!(
+                            "pg_reflex: auto-detected PK ({}) from '{}' for '{}'",
+                            resolved_unique_columns.join(", "),
+                            source,
+                            view_name
+                        );
                         break;
                     }
                 }
@@ -650,15 +770,13 @@ pub(crate) fn create_reflex_ivm_impl(view_name: &str, sql: &str, unique_columns_
     }
 
     // Warn about select columns that are neither GROUP BY nor recognized aggregates.
-    // These are silently dropped (e.g., bool_or(), string_agg(), unsupported functions).
+    // Note: passthrough columns not explicitly in GROUP BY are auto-added by plan_aggregation,
+    // so we use the plan's group_by_columns (which includes auto-added ones) for validation.
     if !plan.is_passthrough {
-        let group_by_set: std::collections::HashSet<&str> = analysis
-            .group_by_columns
-            .iter()
-            .map(|s| s.as_str())
-            .collect();
+        let group_by_set: std::collections::HashSet<&str> =
+            plan.group_by_columns.iter().map(|s| s.as_str()).collect();
         for col in &analysis.select_columns {
-            if !col.is_passthrough && col.aggregate.is_none() {
+            if !col.is_passthrough && col.aggregate.is_none() && !col.is_aggregate_derived {
                 warning!(
                     "pg_reflex: unsupported expression '{}' in SELECT — column will be missing from IMV '{}'",
                     col.alias.as_deref().unwrap_or(&col.expr_sql),
@@ -690,10 +808,7 @@ pub(crate) fn create_reflex_ivm_impl(view_name: &str, sql: &str, unique_columns_
                 "SELECT 1 FROM public.__reflex_ivm_reference WHERE name = $1",
                 None,
                 &[unsafe {
-                    DatumWithOid::new(
-                        view_name.to_string(),
-                        PgBuiltInOids::TEXTOID.oid().value(),
-                    )
+                    DatumWithOid::new(view_name.to_string(), PgBuiltInOids::TEXTOID.oid().value())
                 }],
             )
             .unwrap_or_report()
@@ -740,7 +855,11 @@ pub(crate) fn create_reflex_ivm_impl(view_name: &str, sql: &str, unique_columns_
 
         if plan.is_passthrough {
             // Passthrough: CREATE TABLE AS — Postgres infers columns + types, populates data
-            let create_kw = if logged { "CREATE TABLE" } else { "CREATE UNLOGGED TABLE" };
+            let create_kw = if logged {
+                "CREATE TABLE"
+            } else {
+                "CREATE UNLOGGED TABLE"
+            };
             client
                 .update(
                     &format!("{} {} AS {}", create_kw, quote_identifier(view_name), sql),
@@ -750,29 +869,78 @@ pub(crate) fn create_reflex_ivm_impl(view_name: &str, sql: &str, unique_columns_
                 .unwrap_or_report();
             // ANALYZE so the query planner has statistics for the new table
             client
-                .update(&format!("ANALYZE {}", quote_identifier(view_name)), None, &[])
+                .update(
+                    &format!("ANALYZE {}", quote_identifier(view_name)),
+                    None,
+                    &[],
+                )
                 .unwrap_or_report();
 
             // Create unique index on target for resolved unique key columns
             if !resolved_unique_columns.is_empty() {
                 let bare_view = split_qualified_name(view_name).1;
-                let uk_cols: Vec<String> = resolved_unique_columns.iter()
+                let uk_cols: Vec<String> = resolved_unique_columns
+                    .iter()
                     .map(|c| format!("\"{}\"", c))
                     .collect();
-                client.update(
-                    &format!(
-                        "CREATE UNIQUE INDEX IF NOT EXISTS \"__reflex_uk_{}\" ON {} ({})",
-                        bare_view, quote_identifier(view_name), uk_cols.join(", ")
-                    ),
-                    None, &[],
-                ).unwrap_or_report();
+                client
+                    .update(
+                        &format!(
+                            "CREATE UNIQUE INDEX IF NOT EXISTS \"__reflex_uk_{}\" ON {} ({})",
+                            bare_view,
+                            quote_identifier(view_name),
+                            uk_cols.join(", ")
+                        ),
+                        None,
+                        &[],
+                    )
+                    .unwrap_or_report();
             }
         } else {
             // Aggregate: build intermediate + target tables from the plan
-            let (column_types, not_null_cols) = query_column_types_from_catalog(client, &froms);
+            let (mut column_types, not_null_cols) = query_column_types_from_catalog(client, &froms);
             plan.optimize_not_null_sums(&not_null_cols);
 
-            if let Some(ddl) = build_intermediate_table_ddl(view_name, &plan, &column_types, logged) {
+            // Discover actual types for computed expressions by introspecting query output.
+            // 1. Base query types: resolves GROUP BY expressions (DATE_TRUNC, EXTRACT, etc.)
+            let base_q_for_types = generate_base_query(&analysis, &plan);
+            augment_column_types_from_query(&base_q_for_types, &mut column_types);
+            // 2. Original SQL types: resolves aggregate output types (SUM(int)→BIGINT, etc.)
+            augment_column_types_from_query(sql, &mut column_types);
+
+            // Fix intermediate SUM column types: use DOUBLE PRECISION instead of NUMERIC
+            // when the base_query produces DOUBLE PRECISION (preserves float arithmetic path).
+            for ic in &mut plan.intermediate_columns {
+                if ic.source_aggregate == "SUM" {
+                    let base_type = resolve_column_type(&ic.name, &column_types, "").to_uppercase();
+                    if base_type == "DOUBLE PRECISION" {
+                        ic.pg_type = "DOUBLE PRECISION".to_string();
+                    }
+                }
+            }
+
+            // Set cast_type on end_query_mappings so the end_query casts intermediate
+            // to the correct target type (e.g., BIGINT for SUM(int)).
+            for mapping in &mut plan.end_query_mappings {
+                if mapping.cast_type.is_none() {
+                    let discovered = resolve_column_type(&mapping.output_alias, &column_types, "");
+                    if !discovered.is_empty() {
+                        let default_type = match mapping.aggregate_type.as_str() {
+                            "SUM" | "AVG" | "DERIVED" => "NUMERIC",
+                            "COUNT" => "BIGINT",
+                            "BOOL_OR" => "BOOLEAN",
+                            _ => "",
+                        };
+                        // Only set cast if discovered type differs from the intermediate default
+                        if !default_type.is_empty() && discovered.to_uppercase() != default_type {
+                            mapping.cast_type = Some(discovered);
+                        }
+                    }
+                }
+            }
+
+            if let Some(ddl) = build_intermediate_table_ddl(view_name, &plan, &column_types, logged)
+            {
                 let tbl = intermediate_table_name(view_name);
                 client.update(&ddl, None, &[]).unwrap_or_report();
                 unlogged_tables.push(tbl);
@@ -791,7 +959,8 @@ pub(crate) fn create_reflex_ivm_impl(view_name: &str, sql: &str, unique_columns_
                     "pg_reflex: source '{}' for '{}' is a subquery — \
                      triggers are created on the underlying tables inside the subquery, \
                      but the subquery itself is re-executed on each delta",
-                    source, view_name
+                    source,
+                    view_name
                 );
                 continue;
             }
@@ -830,7 +999,8 @@ pub(crate) fn create_reflex_ivm_impl(view_name: &str, sql: &str, unique_columns_
                 warning!(
                     "pg_reflex: source '{}' is a materialized view — triggers skipped. \
                      Use SELECT refresh_imv_depending_on('{}') after REFRESH MATERIALIZED VIEW.",
-                    source, source
+                    source,
+                    source
                 );
                 continue;
             }
@@ -858,8 +1028,9 @@ pub(crate) fn create_reflex_ivm_impl(view_name: &str, sql: &str, unique_columns_
             if !trig_exists {
                 // Choose trigger type: if ANY deferred IMV exists on this source,
                 // use deferred triggers (they handle both IMMEDIATE and DEFERRED IMVs).
-                let has_any_deferred = deferred || {
-                    let check = client
+                let has_any_deferred = deferred
+                    || {
+                        let check = client
                         .select(
                             &format!(
                                 "SELECT 1 FROM public.__reflex_ivm_reference \
@@ -872,8 +1043,8 @@ pub(crate) fn create_reflex_ivm_impl(view_name: &str, sql: &str, unique_columns_
                         .unwrap_or_report()
                         .next()
                         .is_some();
-                    check
-                };
+                        check
+                    };
 
                 if has_any_deferred {
                     for ddl in build_deferred_trigger_ddls(source) {
@@ -901,8 +1072,11 @@ pub(crate) fn create_reflex_ivm_impl(view_name: &str, sql: &str, unique_columns_
         }
 
         // Issue 4: Add index on source GROUP BY columns for MIN/MAX recompute performance
-        let has_min_max = plan.intermediate_columns.iter()
-            .any(|ic| ic.source_aggregate == "MIN" || ic.source_aggregate == "MAX" || ic.source_aggregate == "BOOL_OR");
+        let has_min_max = plan.intermediate_columns.iter().any(|ic| {
+            ic.source_aggregate == "MIN"
+                || ic.source_aggregate == "MAX"
+                || ic.source_aggregate == "BOOL_OR"
+        });
         if has_min_max && !plan.group_by_columns.is_empty() {
             for source in &froms {
                 if source.starts_with('<') || ivm_froms.contains(source) {
@@ -924,7 +1098,9 @@ pub(crate) fn create_reflex_ivm_impl(view_name: &str, sql: &str, unique_columns_
                     .filter_map(|row| row.get_by_name::<&str, _>("column_name").unwrap_or(None).map(|s| s.to_lowercase()))
                     .collect();
 
-                let idx_cols: Vec<String> = plan.group_by_columns.iter()
+                let idx_cols: Vec<String> = plan
+                    .group_by_columns
+                    .iter()
                     .map(|c| normalized_column_name(c))
                     .filter(|c| source_cols.contains(c))
                     .map(|c| format!("\"{}\"", c))
@@ -938,7 +1114,9 @@ pub(crate) fn create_reflex_ivm_impl(view_name: &str, sql: &str, unique_columns_
                 let idx_name = format!("__reflex_idx_{}_{}", bare_view, safe_src);
                 let ddl = format!(
                     "CREATE INDEX IF NOT EXISTS \"{}\" ON {} ({})",
-                    idx_name, source, idx_cols.join(", ")
+                    idx_name,
+                    source,
+                    idx_cols.join(", ")
                 );
                 client.update(&ddl, None, &[]).unwrap_or_report();
             }
@@ -960,7 +1138,13 @@ pub(crate) fn create_reflex_ivm_impl(view_name: &str, sql: &str, unique_columns_
             .group_by_columns
             .iter()
             .chain(plan.distinct_columns.iter())
-            .map(|c| normalized_column_name(c))
+            .map(|c| {
+                if let Some(alias) = plan.group_by_aliases.get(c) {
+                    normalized_column_name(alias)
+                } else {
+                    normalized_column_name(c)
+                }
+            })
             .collect();
 
         // INSERT into reference table
@@ -1006,16 +1190,28 @@ pub(crate) fn create_reflex_ivm_impl(view_name: &str, sql: &str, unique_columns_
 
         // Update source IMVs with the new child in their graph_child field
         for imv_name in &ivm_froms {
-            client.update(
-                "UPDATE public.__reflex_ivm_reference
+            client
+                .update(
+                    "UPDATE public.__reflex_ivm_reference
                  SET graph_child = array_append(COALESCE(graph_child, ARRAY[]::TEXT[]), $1)
                  WHERE name = $2",
-                None,
-                &[
-                    unsafe { DatumWithOid::new(view_name.to_string(), PgBuiltInOids::TEXTOID.oid().value()) },
-                    unsafe { DatumWithOid::new(imv_name.to_string(), PgBuiltInOids::TEXTOID.oid().value()) },
-                ],
-            ).unwrap_or_report();
+                    None,
+                    &[
+                        unsafe {
+                            DatumWithOid::new(
+                                view_name.to_string(),
+                                PgBuiltInOids::TEXTOID.oid().value(),
+                            )
+                        },
+                        unsafe {
+                            DatumWithOid::new(
+                                imv_name.to_string(),
+                                PgBuiltInOids::TEXTOID.oid().value(),
+                            )
+                        },
+                    ],
+                )
+                .unwrap_or_report();
         }
 
         // Initial materialization (skip for passthrough — CREATE TABLE AS already populated)
@@ -1023,14 +1219,11 @@ pub(crate) fn create_reflex_ivm_impl(view_name: &str, sql: &str, unique_columns_
             let intermediate_tbl = intermediate_table_name(view_name);
             let base_q = generate_base_query(&analysis, &plan);
             let initial_insert = format!("INSERT INTO {} {}", intermediate_tbl, base_q);
-            client
-                .update(&initial_insert, None, &[])
-                .unwrap_or_report();
+            client.update(&initial_insert, None, &[]).unwrap_or_report();
 
-            let target_insert = format!("INSERT INTO {} {}", quote_identifier(view_name), end_query);
-            client
-                .update(&target_insert, None, &[])
-                .unwrap_or_report();
+            let target_insert =
+                format!("INSERT INTO {} {}", quote_identifier(view_name), end_query);
+            client.update(&target_insert, None, &[]).unwrap_or_report();
 
             // Create indexes AFTER bulk insert (much faster than indexing during insert)
             for index_ddl in build_indexes_ddl(view_name, &plan) {
@@ -1064,10 +1257,13 @@ pub(crate) fn create_reflex_ivm_impl(view_name: &str, sql: &str, unique_columns_
                 .update(&format!("ANALYZE {}", intermediate_tbl), None, &[])
                 .unwrap_or_report();
             client
-                .update(&format!("ANALYZE {}", quote_identifier(view_name)), None, &[])
+                .update(
+                    &format!("ANALYZE {}", quote_identifier(view_name)),
+                    None,
+                    &[],
+                )
                 .unwrap_or_report();
         }
-
     });
 
     info!("pg_reflex: created IMV '{}'", view_name);
@@ -1097,10 +1293,7 @@ fn build_passthrough_key_mappings(
     // Build a map from target column name → expr_sql (e.g., "product_id" → "s.product_id")
     let mut target_col_to_expr: HashMap<String, String> = HashMap::new();
     for col in &analysis.select_columns {
-        let target_name = col
-            .alias
-            .as_deref()
-            .unwrap_or(&col.expr_sql);
+        let target_name = col.alias.as_deref().unwrap_or(&col.expr_sql);
         let target_name = bare_column_name(target_name).to_lowercase();
         target_col_to_expr.insert(target_name, col.expr_sql.to_lowercase());
     }
@@ -1282,16 +1475,10 @@ fn query_column_types_from_catalog(
                 None,
                 &[
                     unsafe {
-                        DatumWithOid::new(
-                            schema.to_string(),
-                            PgBuiltInOids::TEXTOID.oid().value(),
-                        )
+                        DatumWithOid::new(schema.to_string(), PgBuiltInOids::TEXTOID.oid().value())
                     },
                     unsafe {
-                        DatumWithOid::new(
-                            tbl.to_string(),
-                            PgBuiltInOids::TEXTOID.oid().value(),
-                        )
+                        DatumWithOid::new(tbl.to_string(), PgBuiltInOids::TEXTOID.oid().value())
                     },
                 ],
             )
@@ -1307,7 +1494,8 @@ fn query_column_types_from_catalog(
                 types.entry(col_name.to_string()).or_insert(pg_type);
 
                 // Track NOT NULL columns for SUM optimization
-                let is_nullable = row.get_by_name::<String, _>("is_nullable")
+                let is_nullable = row
+                    .get_by_name::<String, _>("is_nullable")
                     .unwrap_or(None)
                     .unwrap_or_default();
                 if is_nullable == "NO" {
@@ -1340,4 +1528,45 @@ fn map_information_schema_type(data_type: &str) -> String {
         "jsonb" => "JSONB".to_string(),
         _ => "TEXT".to_string(),
     }
+}
+
+/// Augment the column_types map with actual types from the base_query output.
+/// This handles computed expressions (DATE_TRUNC, EXTRACT, COALESCE, etc.)
+/// whose types cannot be resolved from the source table catalog alone.
+///
+/// Creates a temporary view from the base_query, reads column types from
+/// pg_attribute, then drops the view.
+fn augment_column_types_from_query(base_query: &str, column_types: &mut HashMap<String, String>) {
+    Spi::connect_mut(|mut client| {
+        let tmp = "__reflex_typecheck_view";
+        let create = format!("CREATE TEMP VIEW {} AS {}", tmp, base_query);
+        if client.update(&create, None, &[]).is_err() {
+            return;
+        }
+        let rows = client
+            .select(
+                "SELECT a.attname::text AS col_name, \
+                        format_type(a.atttypid, a.atttypmod)::text AS col_type \
+                 FROM pg_attribute a \
+                 JOIN pg_class c ON c.oid = a.attrelid \
+                 WHERE c.relname = $1 AND a.attnum > 0 AND NOT a.attisdropped",
+                None,
+                &[unsafe {
+                    DatumWithOid::new(tmp.to_string(), PgBuiltInOids::TEXTOID.oid().value())
+                }],
+            )
+            .unwrap_or_report();
+        for row in rows {
+            if let (Some(col_name), Some(col_type)) = (
+                row.get_by_name::<String, _>("col_name").unwrap_or(None),
+                row.get_by_name::<String, _>("col_type").unwrap_or(None),
+            ) {
+                let pg_type = map_information_schema_type(&col_type);
+                column_types
+                    .entry(col_name)
+                    .or_insert_with(|| pg_type.to_string());
+            }
+        }
+        let _ = client.update(&format!("DROP VIEW IF EXISTS {}", tmp), None, &[]);
+    });
 }

@@ -40,6 +40,8 @@ fn sample_plan() -> AggregationPlan {
         passthrough_key_mappings: std::collections::HashMap::new(),
         having_clause: None,
         not_null_columns: std::collections::HashSet::new(),
+        group_by_aliases: std::collections::HashMap::new(),
+        output_column_order: vec![],
     }
 }
 
@@ -160,6 +162,8 @@ fn test_no_intermediate_for_passthrough() {
         passthrough_key_mappings: std::collections::HashMap::new(),
         having_clause: None,
         not_null_columns: std::collections::HashSet::new(),
+        group_by_aliases: std::collections::HashMap::new(),
+        output_column_order: vec![],
     };
     let types = HashMap::new();
     assert!(build_intermediate_table_ddl("test_view", &plan, &types, false).is_none());

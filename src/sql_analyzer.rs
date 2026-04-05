@@ -54,6 +54,10 @@ pub struct SelectColumn {
     pub is_window: bool,
     /// The FILTER (WHERE ...) predicate, if any (original SQL string)
     pub filter_expr: Option<String>,
+    /// True if the expression contains aggregate functions but is not a simple aggregate
+    /// (e.g., CASE WHEN SUM(x) > 0 THEN SUM(x)/SUM(y) END). The constituent aggregates
+    /// are extracted separately and this expression is rewritten in the end_query.
+    pub is_aggregate_derived: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -135,12 +139,13 @@ impl SqlAnalysis {
         }
         // DISTINCT ON is supported via ROW_NUMBER() decomposition (see create_ivm.rs)
         if self.has_distinct_on && self.order_by_exprs.is_empty() {
-            return Some("DISTINCT ON without ORDER BY is not supported (row selection would be arbitrary)".into());
+            return Some(
+                "DISTINCT ON without ORDER BY is not supported (row selection would be arbitrary)"
+                    .into(),
+            );
         }
         if self.has_grouping_sets {
-            return Some(
-                "GROUPING SETS / CUBE / ROLLUP are not supported".into(),
-            );
+            return Some("GROUPING SETS / CUBE / ROLLUP are not supported".into());
         }
         if self.has_tablesample {
             return Some("TABLESAMPLE is not supported (non-deterministic)".into());
@@ -149,11 +154,14 @@ impl SqlAnalysis {
         if self.has_within_group {
             return Some("WITHIN GROUP (ordered-set aggregates) is not supported".into());
         }
-        if self.has_scalar_subquery {
-            return Some("Scalar subqueries in SELECT are not supported".into());
-        }
+        // Scalar subqueries are allowed — they evaluate at trigger time against current
+        // table state, producing correct results as effectively static values within
+        // one statement execution. E.g., WHERE year >= (SELECT year FROM max_date_view).
         if self.has_nondeterministic_select {
-            return Some("Non-deterministic functions (NOW, RANDOM, etc.) in SELECT are not supported".into());
+            return Some(
+                "Non-deterministic functions (NOW, RANDOM, etc.) in SELECT are not supported"
+                    .into(),
+            );
         }
         if !self.unsupported_aggregates.is_empty() {
             let names = self.unsupported_aggregates.join(", ");
@@ -211,7 +219,8 @@ impl<'a> Visitor for AnalysisVisitor<'a> {
                     let func_name = f.name.to_string().to_uppercase();
                     // Detect unsupported aggregate functions
                     if is_known_unsupported_aggregate(&func_name)
-                        && !self.analysis.unsupported_aggregates.contains(&func_name) {
+                        && !self.analysis.unsupported_aggregates.contains(&func_name)
+                    {
                         self.analysis.unsupported_aggregates.push(func_name.clone());
                     }
                     // Detect non-deterministic functions in SELECT
@@ -250,9 +259,7 @@ impl<'a> Visitor for AnalysisVisitor<'a> {
                     self.analysis.has_tablesample = true;
                 }
             }
-            TableFactor::Derived {
-                lateral, alias, ..
-            } => {
+            TableFactor::Derived { lateral, alias, .. } => {
                 if *lateral {
                     self.analysis.has_lateral_join = true;
                 }
@@ -276,7 +283,62 @@ impl<'a> Visitor for AnalysisVisitor<'a> {
 }
 
 /// Detect aggregate kind from a function name.
-fn detect_aggregate(func_name: &str) -> Option<AggregateKind> {
+/// Recursively check if an expression tree contains any aggregate function calls.
+pub fn expr_contains_aggregate(expr: &Expr) -> bool {
+    match expr {
+        Expr::Function(f) if f.over.is_none() => {
+            let name = f.name.to_string();
+            if detect_aggregate(&name).is_some() {
+                return true;
+            }
+            // Check arguments recursively
+            if let FunctionArguments::List(list) = &f.args {
+                for arg in &list.args {
+                    if let FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) = arg {
+                        if expr_contains_aggregate(e) {
+                            return true;
+                        }
+                    }
+                }
+            }
+            false
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            expr_contains_aggregate(left) || expr_contains_aggregate(right)
+        }
+        Expr::UnaryOp { expr: inner, .. } => expr_contains_aggregate(inner),
+        Expr::Nested(inner) => expr_contains_aggregate(inner),
+        Expr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            if let Some(op) = operand {
+                if expr_contains_aggregate(op) {
+                    return true;
+                }
+            }
+            for case_when in conditions {
+                if expr_contains_aggregate(&case_when.condition)
+                    || expr_contains_aggregate(&case_when.result)
+                {
+                    return true;
+                }
+            }
+            if let Some(el) = else_result {
+                if expr_contains_aggregate(el) {
+                    return true;
+                }
+            }
+            false
+        }
+        Expr::Cast { expr: inner, .. } => expr_contains_aggregate(inner),
+        _ => false,
+    }
+}
+
+pub fn detect_aggregate(func_name: &str) -> Option<AggregateKind> {
     match func_name.to_uppercase().as_str() {
         "SUM" => Some(AggregateKind::Sum),
         "COUNT" => Some(AggregateKind::Count),
@@ -374,7 +436,11 @@ fn first_arg_sql(args: &FunctionArguments) -> Option<String> {
 fn extract_select_column(expr: &Expr, alias: Option<String>) -> SelectColumn {
     // Unwrap casts to detect aggregates inside (e.g., SUM(x)::BIGINT)
     let (inner, cast_type) = match expr {
-        Expr::Cast { expr: inner, data_type, .. } => (inner.as_ref(), Some(data_type.to_string())),
+        Expr::Cast {
+            expr: inner,
+            data_type,
+            ..
+        } => (inner.as_ref(), Some(data_type.to_string())),
         _ => (expr, None),
     };
 
@@ -390,6 +456,7 @@ fn extract_select_column(expr: &Expr, alias: Option<String>) -> SelectColumn {
                 cast_type,
                 is_window: true,
                 filter_expr: None,
+                is_aggregate_derived: false,
             };
         }
 
@@ -443,18 +510,24 @@ fn extract_select_column(expr: &Expr, alias: Option<String>) -> SelectColumn {
                 cast_type,
                 is_window: false,
                 filter_expr,
+                is_aggregate_derived: false,
             };
         }
     }
+
+    // Check if the expression contains aggregates inside a compound expression
+    // (e.g., CASE WHEN SUM(x) > 0 THEN SUM(x)/SUM(y) END)
+    let has_nested_agg = expr_contains_aggregate(expr);
     SelectColumn {
         expr_sql: expr.to_string(),
         alias,
         aggregate: None,
         aggregate_arg: None,
-        is_passthrough: true,
+        is_passthrough: !has_nested_agg,
         cast_type: None,
         is_window: false,
         filter_expr: None,
+        is_aggregate_derived: has_nested_agg,
     }
 }
 
@@ -505,9 +578,13 @@ fn extract_join_info(join: &Join) -> JoinInfo {
     };
     let condition_sql = join_constraint(&join.join_operator).and_then(|c| match c {
         JoinConstraint::On(expr) => Some(expr.to_string()),
-        JoinConstraint::Using(cols) => {
-            Some(format!("USING ({})", cols.iter().map(|c| c.to_string()).collect::<Vec<_>>().join(", ")))
-        }
+        JoinConstraint::Using(cols) => Some(format!(
+            "USING ({})",
+            cols.iter()
+                .map(|c| c.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
         _ => None,
     });
     JoinInfo {
@@ -529,9 +606,13 @@ fn flatten_set_operands(
 ) {
     // Recurse into left if it's the same operator+quantifier
     match left {
-        SetExpr::SetOperation { op, set_quantifier, left: ll, right: lr }
-            if std::mem::discriminant(op) == std::mem::discriminant(top_op)
-                && matches!(set_quantifier, SetQuantifier::All) == top_is_all =>
+        SetExpr::SetOperation {
+            op,
+            set_quantifier,
+            left: ll,
+            right: lr,
+        } if std::mem::discriminant(op) == std::mem::discriminant(top_op)
+            && matches!(set_quantifier, SetQuantifier::All) == top_is_all =>
         {
             flatten_set_operands(top_op, top_is_all, ll, lr, out);
         }
@@ -539,9 +620,13 @@ fn flatten_set_operands(
     }
     // Right operand is always a leaf (SQL is left-associative for set ops)
     match right {
-        SetExpr::SetOperation { op, set_quantifier, left: rl, right: rr }
-            if std::mem::discriminant(op) == std::mem::discriminant(top_op)
-                && matches!(set_quantifier, SetQuantifier::All) == top_is_all =>
+        SetExpr::SetOperation {
+            op,
+            set_quantifier,
+            left: rl,
+            right: rr,
+        } if std::mem::discriminant(op) == std::mem::discriminant(top_op)
+            && matches!(set_quantifier, SetQuantifier::All) == top_is_all =>
         {
             flatten_set_operands(top_op, top_is_all, rl, rr, out);
         }
@@ -568,7 +653,13 @@ pub fn analyze(statements: &[Statement]) -> Result<SqlAnalysis, SqlAnalysisError
     let _ = query.visit(&mut visitor);
 
     // Phase 2: Handle set operations (UNION/INTERSECT/EXCEPT) or direct SELECT
-    if let SetExpr::SetOperation { op, set_quantifier, left, right } = query.body.as_ref() {
+    if let SetExpr::SetOperation {
+        op,
+        set_quantifier,
+        left,
+        right,
+    } = query.body.as_ref()
+    {
         let is_all = matches!(set_quantifier, SetQuantifier::All);
         let mut operands = Vec::new();
         flatten_set_operands(op, is_all, left, right, &mut operands);
@@ -627,6 +718,7 @@ pub fn analyze(statements: &[Statement]) -> Result<SqlAnalysis, SqlAnalysisError
                     cast_type: None,
                     is_window: false,
                     filter_expr: None,
+                    is_aggregate_derived: false,
                 });
             }
             SelectItem::QualifiedWildcard(kind, _) => {
@@ -639,6 +731,7 @@ pub fn analyze(statements: &[Statement]) -> Result<SqlAnalysis, SqlAnalysisError
                     cast_type: None,
                     is_window: false,
                     filter_expr: None,
+                    is_aggregate_derived: false,
                 });
             }
         }

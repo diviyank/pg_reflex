@@ -107,10 +107,10 @@ fn test_deferred_groupby_insert_oracle() {
     assert_imv_correct("dfi_view", fresh);
 
     // Paris=350, London=50, Berlin=300
-    let paris = Spi::get_one::<pgrx::AnyNumeric>(
+    let paris = Spi::get_one::<i64>(
         "SELECT total FROM dfi_view WHERE city = 'Paris'"
     ).expect("q").expect("v");
-    assert_eq!(paris.to_string(), "350");
+    assert_eq!(paris, 350i64);
 }
 
 /// Deferred: multiple INSERTs coalesced into single flush

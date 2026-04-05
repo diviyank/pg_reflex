@@ -74,7 +74,14 @@ fn create_reflex_ivm(
     storage: default!(Option<&str>, "'UNLOGGED'"),
     mode: default!(Option<&str>, "'IMMEDIATE'"),
 ) -> &'static str {
-    create_ivm::create_reflex_ivm_impl(view_name, sql, unique_columns.unwrap_or(""), false, storage.unwrap_or("UNLOGGED"), mode.unwrap_or("IMMEDIATE"))
+    create_ivm::create_reflex_ivm_impl(
+        view_name,
+        sql,
+        unique_columns.unwrap_or(""),
+        false,
+        storage.unwrap_or("UNLOGGED"),
+        mode.unwrap_or("IMMEDIATE"),
+    )
 }
 
 #[pg_extern]
@@ -85,7 +92,14 @@ fn create_reflex_ivm_if_not_exists(
     storage: default!(Option<&str>, "'UNLOGGED'"),
     mode: default!(Option<&str>, "'IMMEDIATE'"),
 ) -> &'static str {
-    create_ivm::create_reflex_ivm_impl(view_name, sql, unique_columns.unwrap_or(""), true, storage.unwrap_or("UNLOGGED"), mode.unwrap_or("IMMEDIATE"))
+    create_ivm::create_reflex_ivm_impl(
+        view_name,
+        sql,
+        unique_columns.unwrap_or(""),
+        true,
+        storage.unwrap_or("UNLOGGED"),
+        mode.unwrap_or("IMMEDIATE"),
+    )
 }
 
 /// Drop a reflex IMV and all its artifacts (triggers, tables, reference row).
@@ -150,9 +164,11 @@ mod tests {
         let mismatches = Spi::get_one::<i64>(&check)
             .expect("oracle query failed")
             .expect("oracle returned NULL");
-        assert_eq!(mismatches, 0,
+        assert_eq!(
+            mismatches, 0,
             "EXCEPT ALL oracle failed for '{}': {} mismatches between IMV and fresh query",
-            imv, mismatches);
+            imv, mismatches
+        );
     }
 
     include!("tests/pg_test_basic.rs");

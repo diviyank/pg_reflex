@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 
-use crate::aggregation::AggregationPlan;
-use crate::query_decomposer::{intermediate_table_name, normalized_column_name, quote_identifier, split_qualified_name};
+use crate::aggregation::{AggregationPlan, EndQueryMapping};
+use crate::query_decomposer::{
+    intermediate_table_name, normalized_column_name, quote_identifier, split_qualified_name,
+};
 
 /// Build the DDL for the intermediate table.
 ///
@@ -65,12 +67,19 @@ pub fn build_intermediate_table_ddl(
             "BOOLEAN" => "FALSE",
             t if t.to_uppercase().starts_with("TEXT")
                 || t.to_uppercase().starts_with("VARCHAR")
-                || t.to_uppercase().starts_with("CHAR") => "''",
-            t if t.to_uppercase().contains("TIMESTAMP")
-                || t.to_uppercase().contains("DATE") => "'epoch'",
+                || t.to_uppercase().starts_with("CHAR") =>
+            {
+                "''"
+            }
+            t if t.to_uppercase().contains("TIMESTAMP") || t.to_uppercase().contains("DATE") => {
+                "'epoch'"
+            }
             _ => "0",
         };
-        columns.push(format!("    \"{}\" {} DEFAULT {}", ic.name, effective_type, default));
+        columns.push(format!(
+            "    \"{}\" {} DEFAULT {}",
+            ic.name, effective_type, default
+        ));
     }
 
     // __ivm_count for reference counting
@@ -85,7 +94,11 @@ pub fn build_intermediate_table_ddl(
     // the delta query uses GROUP BY (unique output), and advisory locks prevent
     // concurrent MERGEs on the same IMV.
 
-    let create_prefix = if logged { "CREATE TABLE" } else { "CREATE UNLOGGED TABLE" };
+    let create_prefix = if logged {
+        "CREATE TABLE"
+    } else {
+        "CREATE UNLOGGED TABLE"
+    };
     Some(format!(
         "{} IF NOT EXISTS {} (\n{}\n)",
         create_prefix, table_name, columns_sql
@@ -104,36 +117,17 @@ pub fn build_target_table_ddl(
 ) -> String {
     let mut columns: Vec<String> = Vec::new();
 
-    // Group by columns (normalized lowercase names)
-    for col in &plan.group_by_columns {
-        let norm = normalized_column_name(col);
-        let pg_type = resolve_column_type(&norm, column_types, "TEXT");
-        columns.push(format!("    \"{}\" {}", norm, pg_type));
-    }
-
-    // DISTINCT columns (normalized lowercase names) — only for DISTINCT queries,
-    // NOT for COUNT(DISTINCT) where the distinct column is internal to the intermediate.
-    let has_count_distinct = plan.end_query_mappings.iter()
-        .any(|m| m.intermediate_expr.starts_with("COUNT("));
-    if !has_count_distinct {
-        for col in &plan.distinct_columns {
-            let norm = normalized_column_name(col);
-            let pg_type = resolve_column_type(&norm, column_types, "TEXT");
-            columns.push(format!("    \"{}\" {}", norm, pg_type));
-        }
-    }
-
-    // Output columns from end query mappings
-    for mapping in &plan.end_query_mappings {
-        let pg_type = if let Some(ref cast) = mapping.cast_type {
+    // Helper: resolve type for an end_query_mapping
+    let mapping_type = |mapping: &EndQueryMapping| -> String {
+        if let Some(ref cast) = mapping.cast_type {
             cast.to_string()
         } else {
             match mapping.aggregate_type.as_str() {
-                "SUM" | "AVG" => "NUMERIC".to_string(),
+                "SUM" | "AVG" | "DERIVED" => "NUMERIC".to_string(),
                 "COUNT" => "BIGINT".to_string(),
                 "MIN" | "MAX" => {
-                    // Resolve from source column type — MIN/MAX return the same type as input
-                    let source_arg = mapping.intermediate_expr
+                    let source_arg = mapping
+                        .intermediate_expr
                         .trim_start_matches("__min_")
                         .trim_start_matches("__max_");
                     resolve_column_type(source_arg, column_types, "NUMERIC")
@@ -141,16 +135,76 @@ pub fn build_target_table_ddl(
                 "BOOL_OR" => "BOOLEAN".to_string(),
                 _ => "TEXT".to_string(),
             }
+        }
+    };
+
+    // Helper: resolve type for a GROUP BY column
+    let gb_col_ddl = |col: &str| -> String {
+        let output_name = if let Some(alias) = plan.group_by_aliases.get(col) {
+            normalized_column_name(alias)
+        } else {
+            normalized_column_name(col)
         };
-        columns.push(format!("    \"{}\" {}", mapping.output_alias, pg_type));
+        let pg_type = resolve_column_type(&output_name, column_types, "TEXT");
+        format!("    \"{}\" {}", output_name, pg_type)
+    };
+
+    if !plan.output_column_order.is_empty() {
+        // Use output_column_order to match the user's SELECT column order
+        for entry in &plan.output_column_order {
+            if let Some(gb_expr) = entry.strip_prefix("gb:") {
+                columns.push(gb_col_ddl(gb_expr));
+            } else if let Some(agg_alias) = entry.strip_prefix("agg:") {
+                if let Some(mapping) = plan
+                    .end_query_mappings
+                    .iter()
+                    .find(|m| m.output_alias == agg_alias)
+                {
+                    columns.push(format!(
+                        "    \"{}\" {}",
+                        mapping.output_alias,
+                        mapping_type(mapping)
+                    ));
+                }
+            }
+        }
+    } else {
+        // Fallback: GROUP BY columns first, then aggregates (legacy order)
+        for col in &plan.group_by_columns {
+            columns.push(gb_col_ddl(col));
+        }
+        let has_count_distinct = plan
+            .end_query_mappings
+            .iter()
+            .any(|m| m.intermediate_expr.starts_with("COUNT("));
+        if !has_count_distinct {
+            for col in &plan.distinct_columns {
+                let norm = normalized_column_name(col);
+                let pg_type = resolve_column_type(&norm, column_types, "TEXT");
+                columns.push(format!("    \"{}\" {}", norm, pg_type));
+            }
+        }
+        for mapping in &plan.end_query_mappings {
+            columns.push(format!(
+                "    \"{}\" {}",
+                mapping.output_alias,
+                mapping_type(mapping)
+            ));
+        }
     }
 
     let columns_sql = columns.join(",\n");
 
-    let create_prefix = if logged { "CREATE TABLE" } else { "CREATE UNLOGGED TABLE" };
+    let create_prefix = if logged {
+        "CREATE TABLE"
+    } else {
+        "CREATE UNLOGGED TABLE"
+    };
     format!(
         "{} IF NOT EXISTS {} (\n{}\n)",
-        create_prefix, quote_identifier(view_name), columns_sql
+        create_prefix,
+        quote_identifier(view_name),
+        columns_sql
     )
 }
 
@@ -182,10 +236,17 @@ pub fn build_indexes_ddl(view_name: &str, plan: &AggregationPlan) -> Vec<String>
             idx_cols.push(format!("\"{}\"", normalized_column_name(col)));
         }
         if !idx_cols.is_empty() {
-            let using = if idx_cols.len() == 1 { "USING hash" } else { "" };
+            let using = if idx_cols.len() == 1 {
+                "USING hash"
+            } else {
+                ""
+            };
             indexes.push(format!(
                 "CREATE INDEX IF NOT EXISTS \"idx__reflex_int_{}\" ON {} {} ({})",
-                bare_view, table_name, using, idx_cols.join(", ")
+                bare_view,
+                table_name,
+                using,
+                idx_cols.join(", ")
             ));
         }
     }
@@ -207,7 +268,14 @@ pub fn build_indexes_ddl(view_name: &str, plan: &AggregationPlan) -> Vec<String>
         let group_cols: Vec<String> = plan
             .group_by_columns
             .iter()
-            .map(|c| format!("\"{}\"", normalized_column_name(c)))
+            .map(|c| {
+                let name = if let Some(alias) = plan.group_by_aliases.get(c) {
+                    normalized_column_name(alias)
+                } else {
+                    normalized_column_name(c)
+                };
+                format!("\"{}\"", name)
+            })
             .collect();
         indexes.push(format!(
             "CREATE INDEX IF NOT EXISTS \"idx__reflex_target_{}\" ON {} ({})",
@@ -228,7 +296,7 @@ pub fn build_indexes_ddl(view_name: &str, plan: &AggregationPlan) -> Vec<String>
 ///
 /// Transition tables are referenced directly in EXECUTE context (no temp table copy).
 pub fn build_trigger_ddls(source_table: &str) -> Vec<String> {
-    let safe_source = source_table.replace('.', "_");
+    let safe_source = source_table.replace('.', "_").replace('"', "");
     let ref_new = format!("__reflex_new_{}", safe_source);
     let ref_old = format!("__reflex_old_{}", safe_source);
 
@@ -269,7 +337,9 @@ pub fn build_trigger_ddls(source_table: &str) -> Vec<String> {
     // INSERT
     let ins_fn = format!("__reflex_ins_trigger_on_{}", safe_source);
     let ins_trig = format!("__reflex_trigger_ins_on_{}", safe_source);
-    let ins_body = body_core.replace("{op}", "INSERT").replace("{transition_tbl}", &ref_new);
+    let ins_body = body_core
+        .replace("{op}", "INSERT")
+        .replace("{transition_tbl}", &ref_new);
     let ins_ddl = format!(
         "CREATE OR REPLACE FUNCTION {ins_fn}() RETURNS TRIGGER AS $fn$ {ins_body} $fn$ LANGUAGE plpgsql;\n\
          CREATE OR REPLACE TRIGGER \"{ins_trig}\" \
@@ -281,7 +351,9 @@ pub fn build_trigger_ddls(source_table: &str) -> Vec<String> {
     // DELETE
     let del_fn = format!("__reflex_del_trigger_on_{}", safe_source);
     let del_trig = format!("__reflex_trigger_del_on_{}", safe_source);
-    let del_body = body_core.replace("{op}", "DELETE").replace("{transition_tbl}", &ref_old);
+    let del_body = body_core
+        .replace("{op}", "DELETE")
+        .replace("{transition_tbl}", &ref_old);
     let del_ddl = format!(
         "CREATE OR REPLACE FUNCTION {del_fn}() RETURNS TRIGGER AS $fn$ {del_body} $fn$ LANGUAGE plpgsql;\n\
          CREATE OR REPLACE TRIGGER \"{del_trig}\" \
@@ -293,7 +365,9 @@ pub fn build_trigger_ddls(source_table: &str) -> Vec<String> {
     // UPDATE
     let upd_fn = format!("__reflex_upd_trigger_on_{}", safe_source);
     let upd_trig = format!("__reflex_trigger_upd_on_{}", safe_source);
-    let upd_body = body_core.replace("{op}", "UPDATE").replace("{transition_tbl}", &ref_new);
+    let upd_body = body_core
+        .replace("{op}", "UPDATE")
+        .replace("{transition_tbl}", &ref_new);
     let upd_ddl = format!(
         "CREATE OR REPLACE FUNCTION {upd_fn}() RETURNS TRIGGER AS $fn$ {upd_body} $fn$ LANGUAGE plpgsql;\n\
          CREATE OR REPLACE TRIGGER \"{upd_trig}\" \
@@ -344,7 +418,7 @@ pub fn build_trigger_ddls(source_table: &str) -> Vec<String> {
 /// The immediate triggers still handle IMMEDIATE-mode IMVs on the same source
 /// (mixed mode: some IMVs IMMEDIATE, some DEFERRED).
 pub fn build_deferred_trigger_ddls(source_table: &str) -> Vec<String> {
-    let safe_source = source_table.replace('.', "_");
+    let safe_source = source_table.replace('.', "_").replace('"', "");
     let ref_new = format!("__reflex_new_{}", safe_source);
     let ref_old = format!("__reflex_old_{}", safe_source);
     let delta_tbl = format!("__reflex_delta_{}", safe_source);
@@ -511,7 +585,8 @@ pub fn build_deferred_flush_ddl() -> Vec<String> {
             source_table TEXT NOT NULL, \
             operation TEXT NOT NULL, \
             batch_ts TIMESTAMPTZ DEFAULT now()\
-         )".to_string(),
+         )"
+        .to_string(),
         // Constraint trigger function: flushes all pending deltas at COMMIT
         "CREATE OR REPLACE FUNCTION __reflex_deferred_flush_fn() RETURNS TRIGGER AS $fn$ \
          DECLARE _src RECORD; \
@@ -523,12 +598,14 @@ pub fn build_deferred_flush_ddl() -> Vec<String> {
            END LOOP; \
            RETURN NULL; \
          END; \
-         $fn$ LANGUAGE plpgsql".to_string(),
+         $fn$ LANGUAGE plpgsql"
+            .to_string(),
         // Constraint trigger — fires at COMMIT for any INSERT into the pending table
         "CREATE CONSTRAINT TRIGGER __reflex_deferred_flush_trigger \
          AFTER INSERT ON public.__reflex_deferred_pending \
          DEFERRABLE INITIALLY DEFERRED \
-         FOR EACH ROW EXECUTE FUNCTION __reflex_deferred_flush_fn()".to_string(),
+         FOR EACH ROW EXECUTE FUNCTION __reflex_deferred_flush_fn()"
+            .to_string(),
     ]
 }
 
@@ -552,7 +629,7 @@ pub fn build_staging_table_ddl(source_table: &str) -> String {
 ///
 /// The map keys can be either "table.column" or just "column".
 /// Falls back to the provided default type.
-fn resolve_column_type(
+pub(crate) fn resolve_column_type(
     col_name: &str,
     column_types: &HashMap<String, String>,
     default_type: &str,

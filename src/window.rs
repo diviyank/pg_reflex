@@ -60,7 +60,10 @@ pub fn decompose_window_query(analysis: &SqlAnalysis) -> WindowDecomposition {
         base_query.push_str(&format!(" WHERE {}", wc));
     }
     if !analysis.group_by_columns.is_empty() {
-        base_query.push_str(&format!(" GROUP BY {}", analysis.group_by_columns.join(", ")));
+        base_query.push_str(&format!(
+            " GROUP BY {}",
+            analysis.group_by_columns.join(", ")
+        ));
     }
     if let Some(ref hc) = analysis.having_clause {
         base_query.push_str(&format!(" HAVING {}", hc));

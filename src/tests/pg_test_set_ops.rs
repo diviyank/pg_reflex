@@ -230,10 +230,10 @@ fn test_union_all_same_table_different_filters() {
 
     // Insert a new A row
     Spi::run("INSERT INTO uaf_src (category, val) VALUES ('A', 5)").expect("insert");
-    let a_total = Spi::get_one::<pgrx::AnyNumeric>(
+    let a_total = Spi::get_one::<i64>(
         "SELECT total FROM uaf_view WHERE category = 'A'",
     ).expect("q").expect("v");
-    assert_eq!(a_total.to_string(), "35"); // 10+20+5
+    assert_eq!(a_total, 35i64); // 10+20+5
 
     // Insert a C row — should NOT appear (filtered out by both operands)
     Spi::run("INSERT INTO uaf_src (category, val) VALUES ('C', 100)").expect("insert");

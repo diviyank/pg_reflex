@@ -175,32 +175,32 @@ fn test_cte_passthrough_sub_imv() {
     assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
 
     // Verify initial state
-    let a = Spi::get_one::<pgrx::AnyNumeric>(
+    let a = Spi::get_one::<i64>(
         "SELECT total FROM cte_pt_view WHERE region = 'A'",
     )
     .expect("q")
     .expect("v");
-    assert_eq!(a.to_string(), "10", "Only active A rows: 10");
+    assert_eq!(a, 10i64, "Only active A rows: 10");
 
     // Insert active row → should propagate through CTE sub-IMV
     Spi::run("INSERT INTO cte_pt_src (region, val, active) VALUES ('A', 5, true)")
         .expect("insert");
 
-    let a2 = Spi::get_one::<pgrx::AnyNumeric>(
+    let a2 = Spi::get_one::<i64>(
         "SELECT total FROM cte_pt_view WHERE region = 'A'",
     )
     .expect("q")
     .expect("v");
-    assert_eq!(a2.to_string(), "15", "After insert active A: 10 + 5 = 15");
+    assert_eq!(a2, 15i64, "After insert active A: 10 + 5 = 15");
 
     // Insert inactive row → should NOT affect view
     Spi::run("INSERT INTO cte_pt_src (region, val, active) VALUES ('A', 100, false)")
         .expect("insert inactive");
 
-    let a3 = Spi::get_one::<pgrx::AnyNumeric>(
+    let a3 = Spi::get_one::<i64>(
         "SELECT total FROM cte_pt_view WHERE region = 'A'",
     )
     .expect("q")
     .expect("v");
-    assert_eq!(a3.to_string(), "15", "Inactive row should not affect view");
+    assert_eq!(a3, 15i64, "Inactive row should not affect view");
 }

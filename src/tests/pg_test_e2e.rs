@@ -253,10 +253,10 @@ fn test_one_source_multiple_imvs() {
     ).expect("q").expect("v");
     assert_eq!(p_cnt, 2);
 
-    let tq = Spi::get_one::<pgrx::AnyNumeric>(
+    let tq = Spi::get_one::<i64>(
         "SELECT total_qty FROM multi_v3",
     ).expect("q").expect("v");
-    assert_eq!(tq.to_string(), "6"); // 2+3+1
+    assert_eq!(tq, 6i64); // 2+3+1
 
     // INSERT → all 3 IMVs update
     Spi::run("INSERT INTO multi_src (city, amount, qty) VALUES ('Paris', 50, 5)")
@@ -272,10 +272,10 @@ fn test_one_source_multiple_imvs() {
     ).expect("q").expect("v");
     assert_eq!(p_cnt2, 3);
 
-    let tq2 = Spi::get_one::<pgrx::AnyNumeric>(
+    let tq2 = Spi::get_one::<i64>(
         "SELECT total_qty FROM multi_v3",
     ).expect("q").expect("v");
-    assert_eq!(tq2.to_string(), "11"); // 6+5
+    assert_eq!(tq2, 11i64); // 6+5
 
     // DELETE → all 3 update
     Spi::run("DELETE FROM multi_src WHERE amount = 100").expect("delete");
@@ -290,10 +290,10 @@ fn test_one_source_multiple_imvs() {
     ).expect("q").expect("v");
     assert_eq!(p_cnt3, 2);
 
-    let tq3 = Spi::get_one::<pgrx::AnyNumeric>(
+    let tq3 = Spi::get_one::<i64>(
         "SELECT total_qty FROM multi_v3",
     ).expect("q").expect("v");
-    assert_eq!(tq3.to_string(), "9"); // 11-2
+    assert_eq!(tq3, 9i64); // 11-2
 
     // UPDATE → all 3 update
     Spi::run("UPDATE multi_src SET amount = 999, qty = 10 WHERE city = 'London'")
@@ -304,10 +304,10 @@ fn test_one_source_multiple_imvs() {
     ).expect("q").expect("v");
     assert_eq!(l_total.to_string(), "999");
 
-    let tq4 = Spi::get_one::<pgrx::AnyNumeric>(
+    let tq4 = Spi::get_one::<i64>(
         "SELECT total_qty FROM multi_v3",
     ).expect("q").expect("v");
-    assert_eq!(tq4.to_string(), "18"); // 9 - 1 + 10
+    assert_eq!(tq4, 18i64); // 9 - 1 + 10
 
     // Verify consolidated triggers: 3 IMVs on same source → only 4 triggers (not 12)
     let trig_count = Spi::get_one::<i64>(
@@ -644,50 +644,50 @@ fn test_chain_passthrough_then_aggregate() {
     );
 
     // Verify initial state
-    let us_total = Spi::get_one::<pgrx::AnyNumeric>(
+    let us_total = Spi::get_one::<i64>(
         "SELECT total FROM cpta_l2 WHERE region = 'US'",
     ).expect("q").expect("v");
-    assert_eq!(us_total.to_string(), "300"); // 100+200 (active only)
+    assert_eq!(us_total, 300i64); // 100+200 (active only)
 
-    let eu_total = Spi::get_one::<pgrx::AnyNumeric>(
+    let eu_total = Spi::get_one::<i64>(
         "SELECT total FROM cpta_l2 WHERE region = 'EU'",
     ).expect("q").expect("v");
-    assert_eq!(eu_total.to_string(), "300"); // 300 (active only)
+    assert_eq!(eu_total, 300i64); // 300 (active only)
 
     // INSERT active row → propagates through L1 passthrough → L2 aggregate updates
     Spi::run("INSERT INTO cpta_src (region, amount, active) VALUES ('US', 400, true)")
         .expect("insert active");
-    let us_after_ins = Spi::get_one::<pgrx::AnyNumeric>(
+    let us_after_ins = Spi::get_one::<i64>(
         "SELECT total FROM cpta_l2 WHERE region = 'US'",
     ).expect("q").expect("v");
-    assert_eq!(us_after_ins.to_string(), "700"); // 100+200+400
+    assert_eq!(us_after_ins, 700i64); // 100+200+400
 
     // INSERT inactive row → appears in source but NOT in L1 or L2
     Spi::run("INSERT INTO cpta_src (region, amount, active) VALUES ('US', 999, false)")
         .expect("insert inactive");
-    let us_after_inactive = Spi::get_one::<pgrx::AnyNumeric>(
+    let us_after_inactive = Spi::get_one::<i64>(
         "SELECT total FROM cpta_l2 WHERE region = 'US'",
     ).expect("q").expect("v");
-    assert_eq!(us_after_inactive.to_string(), "700"); // unchanged
+    assert_eq!(us_after_inactive, 700i64); // unchanged
 
     // DELETE an active row → cascades through both levels
     Spi::run("DELETE FROM cpta_src WHERE amount = 100").expect("delete");
-    let us_after_del = Spi::get_one::<pgrx::AnyNumeric>(
+    let us_after_del = Spi::get_one::<i64>(
         "SELECT total FROM cpta_l2 WHERE region = 'US'",
     ).expect("q").expect("v");
-    assert_eq!(us_after_del.to_string(), "600"); // 200+400
+    assert_eq!(us_after_del, 600i64); // 200+400
 
     // UPDATE a row to change region → moves between groups at L2
     Spi::run("UPDATE cpta_src SET region = 'EU' WHERE amount = 200").expect("update");
-    let us_after_upd = Spi::get_one::<pgrx::AnyNumeric>(
+    let us_after_upd = Spi::get_one::<i64>(
         "SELECT total FROM cpta_l2 WHERE region = 'US'",
     ).expect("q").expect("v");
-    assert_eq!(us_after_upd.to_string(), "400"); // only 400 left in US
+    assert_eq!(us_after_upd, 400i64); // only 400 left in US
 
-    let eu_after_upd = Spi::get_one::<pgrx::AnyNumeric>(
+    let eu_after_upd = Spi::get_one::<i64>(
         "SELECT total FROM cpta_l2 WHERE region = 'EU'",
     ).expect("q").expect("v");
-    assert_eq!(eu_after_upd.to_string(), "500"); // 300+200
+    assert_eq!(eu_after_upd, 500i64); // 300+200
 
     // Verify L1 matches source exactly
     let l1_mismatches = Spi::get_one::<i64>(
@@ -746,18 +746,18 @@ fn test_chain_aggregate_then_passthrough() {
         Spi::get_one::<i64>("SELECT COUNT(*) FROM catp_l2").expect("q").expect("v"),
         3, // Paris, London, Berlin
     );
-    let paris = Spi::get_one::<pgrx::AnyNumeric>(
+    let paris = Spi::get_one::<i64>(
         "SELECT total FROM catp_l2 WHERE city = 'Paris'",
     ).expect("q").expect("v");
-    assert_eq!(paris.to_string(), "300");
+    assert_eq!(paris, 300i64);
 
     // INSERT → L1 updates → L2 passthrough picks up change
     Spi::run("INSERT INTO catp_src (city, revenue) VALUES ('Paris', 50)")
         .expect("insert");
-    let paris_ins = Spi::get_one::<pgrx::AnyNumeric>(
+    let paris_ins = Spi::get_one::<i64>(
         "SELECT total FROM catp_l2 WHERE city = 'Paris'",
     ).expect("q").expect("v");
-    assert_eq!(paris_ins.to_string(), "350");
+    assert_eq!(paris_ins, 350i64);
 
     // INSERT new city → new group appears in L1 and L2
     Spi::run("INSERT INTO catp_src (city, revenue) VALUES ('Tokyo', 500)")
@@ -780,10 +780,10 @@ fn test_chain_aggregate_then_passthrough() {
 
     // UPDATE → value change propagates through both levels
     Spi::run("UPDATE catp_src SET revenue = 999 WHERE city = 'London'").expect("update");
-    let london = Spi::get_one::<pgrx::AnyNumeric>(
+    let london = Spi::get_one::<i64>(
         "SELECT total FROM catp_l2 WHERE city = 'London'",
     ).expect("q").expect("v");
-    assert_eq!(london.to_string(), "999");
+    assert_eq!(london, 999i64);
 
     // Verify L1 matches source
     let l1_mismatches = Spi::get_one::<i64>(
@@ -841,18 +841,18 @@ fn test_chain_passthrough_join_then_aggregate() {
     );
 
     // Verify initial
-    let elec = Spi::get_one::<pgrx::AnyNumeric>(
+    let elec = Spi::get_one::<i64>(
         "SELECT total FROM cpja_l2 WHERE category = 'Electronics'",
     ).expect("q").expect("v");
-    assert_eq!(elec.to_string(), "300"); // 100+200
+    assert_eq!(elec, 300i64); // 100+200
 
     // INSERT into sales → propagates through L1 JOIN → L2 aggregate
     Spi::run("INSERT INTO cpja_sales (product_id, amount) VALUES (2, 100)")
         .expect("insert sale");
-    let books = Spi::get_one::<pgrx::AnyNumeric>(
+    let books = Spi::get_one::<i64>(
         "SELECT total FROM cpja_l2 WHERE category = 'Books'",
     ).expect("q").expect("v");
-    assert_eq!(books.to_string(), "300"); // 50+150+100
+    assert_eq!(books, 300i64); // 50+150+100
 
     // DELETE a product from secondary table → L1 removes rows → L2 group shrinks
     Spi::run("DELETE FROM cpja_products WHERE id = 3").expect("delete product");
@@ -863,18 +863,18 @@ fn test_chain_passthrough_join_then_aggregate() {
 
     // DELETE from sales (key-owner) → direct key extraction at L1 → cascades to L2
     Spi::run("DELETE FROM cpja_sales WHERE amount = 100 AND product_id = 1").expect("delete sale");
-    let elec_after = Spi::get_one::<pgrx::AnyNumeric>(
+    let elec_after = Spi::get_one::<i64>(
         "SELECT total FROM cpja_l2 WHERE category = 'Electronics'",
     ).expect("q").expect("v");
-    assert_eq!(elec_after.to_string(), "200"); // only 200 left
+    assert_eq!(elec_after, 200i64); // only 200 left
 
     // UPDATE product category → L1 updates → L2 groups shift
     Spi::run("UPDATE cpja_products SET category = 'Electronics' WHERE id = 2")
         .expect("update product category");
-    let elec_final = Spi::get_one::<pgrx::AnyNumeric>(
+    let elec_final = Spi::get_one::<i64>(
         "SELECT total FROM cpja_l2 WHERE category = 'Electronics'",
     ).expect("q").expect("v");
-    assert_eq!(elec_final.to_string(), "500"); // 200 + 50+150+100
+    assert_eq!(elec_final, 500i64); // 200 + 50+150+100
 
     // Verify L1 exactly matches direct JOIN
     let l1_mismatches = Spi::get_one::<i64>(
@@ -949,10 +949,10 @@ fn test_multiple_mixed_imvs_on_same_source() {
     );
 
     // Verify initial state
-    let eng_total = Spi::get_one::<pgrx::AnyNumeric>(
+    let eng_total = Spi::get_one::<i64>(
         "SELECT total FROM mmis_agg WHERE dept = 'Eng'",
     ).expect("q").expect("v");
-    assert_eq!(eng_total.to_string(), "350"); // 100+200+50
+    assert_eq!(eng_total, 350i64); // 100+200+50
 
     let active_count = Spi::get_one::<i64>(
         "SELECT COUNT(*) FROM mmis_active",
@@ -969,9 +969,9 @@ fn test_multiple_mixed_imvs_on_same_source() {
         .expect("insert");
 
     assert_eq!(
-        Spi::get_one::<pgrx::AnyNumeric>("SELECT total FROM mmis_agg WHERE dept = 'Eng'")
-            .expect("q").expect("v").to_string(),
-        "750", // 350+400
+        Spi::get_one::<i64>("SELECT total FROM mmis_agg WHERE dept = 'Eng'")
+            .expect("q").expect("v"),
+        750i64, // 350+400
     );
     assert_eq!(
         Spi::get_one::<i64>("SELECT COUNT(*) FROM mmis_active").expect("q").expect("v"),
@@ -993,9 +993,9 @@ fn test_multiple_mixed_imvs_on_same_source() {
     // DELETE → all 4 IMVs update
     Spi::run("DELETE FROM mmis_src WHERE salary = 50").expect("delete inactive eng");
     assert_eq!(
-        Spi::get_one::<pgrx::AnyNumeric>("SELECT total FROM mmis_agg WHERE dept = 'Eng'")
-            .expect("q").expect("v").to_string(),
-        "700", // 100+200+400
+        Spi::get_one::<i64>("SELECT total FROM mmis_agg WHERE dept = 'Eng'")
+            .expect("q").expect("v"),
+        700i64, // 100+200+400
     );
     // Active count shouldn't change (deleted row was inactive)
     assert_eq!(
@@ -1017,9 +1017,9 @@ fn test_multiple_mixed_imvs_on_same_source() {
     // UPDATE → value change propagates to aggregate and avg
     Spi::run("UPDATE mmis_src SET salary = 1000 WHERE dept = 'Legal'").expect("update");
     assert_eq!(
-        Spi::get_one::<pgrx::AnyNumeric>("SELECT total FROM mmis_agg WHERE dept = 'Legal'")
-            .expect("q").expect("v").to_string(),
-        "1000",
+        Spi::get_one::<i64>("SELECT total FROM mmis_agg WHERE dept = 'Legal'")
+            .expect("q").expect("v"),
+        1000i64,
     );
 
     // Verify passthrough matches source exactly
@@ -1300,25 +1300,25 @@ fn test_left_join_aggregate() {
     );
 
     // Verify initial: US=100+50+75=225, EU=200
-    let us = Spi::get_one::<pgrx::AnyNumeric>(
+    let us = Spi::get_one::<i64>(
         "SELECT total FROM lj_view WHERE region = 'US'",
     ).expect("q").expect("v");
-    assert_eq!(us.to_string(), "225");
+    assert_eq!(us, 225i64);
 
     // INSERT unmatched order (no product) → still counted in LEFT JOIN
     Spi::run("INSERT INTO lj_orders (product_id, region, amount) VALUES (NULL, 'EU', 30)")
         .expect("insert unmatched");
-    let eu = Spi::get_one::<pgrx::AnyNumeric>(
+    let eu = Spi::get_one::<i64>(
         "SELECT total FROM lj_view WHERE region = 'EU'",
     ).expect("q").expect("v");
-    assert_eq!(eu.to_string(), "230"); // 200+30
+    assert_eq!(eu, 230i64); // 200+30
 
     // DELETE
     Spi::run("DELETE FROM lj_orders WHERE amount = 100").expect("delete");
-    let us_del = Spi::get_one::<pgrx::AnyNumeric>(
+    let us_del = Spi::get_one::<i64>(
         "SELECT total FROM lj_view WHERE region = 'US'",
     ).expect("q").expect("v");
-    assert_eq!(us_del.to_string(), "125"); // 50+75
+    assert_eq!(us_del, 125i64); // 50+75
 
     // EXCEPT correctness
     let mismatches = Spi::get_one::<i64>(

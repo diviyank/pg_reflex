@@ -1,5 +1,6 @@
 use super::*;
 use crate::aggregation::{AggregationPlan, EndQueryMapping, IntermediateColumn};
+use crate::schema_builder::build_trigger_ddls;
 
 fn simple_plan() -> AggregationPlan {
     AggregationPlan {
@@ -24,6 +25,8 @@ fn simple_plan() -> AggregationPlan {
         passthrough_key_mappings: std::collections::HashMap::new(),
         having_clause: None,
         not_null_columns: std::collections::HashSet::new(),
+        group_by_aliases: std::collections::HashMap::new(),
+        output_column_order: vec![],
     }
 }
 
@@ -69,6 +72,8 @@ fn test_build_merge_min_add() {
         passthrough_key_mappings: std::collections::HashMap::new(),
         having_clause: None,
         not_null_columns: std::collections::HashSet::new(),
+        group_by_aliases: std::collections::HashMap::new(),
+        output_column_order: vec![],
     };
     let delta = "SELECT city, MIN(price) AS \"__min_price\", COUNT(*) AS __ivm_count FROM src GROUP BY city";
     let sql = build_merge_sql("intermediate", delta, &plan, DeltaOp::Add);
@@ -94,6 +99,8 @@ fn test_build_upsert_min_subtract_sets_null() {
         passthrough_key_mappings: std::collections::HashMap::new(),
         having_clause: None,
         not_null_columns: std::collections::HashSet::new(),
+        group_by_aliases: std::collections::HashMap::new(),
+        output_column_order: vec![],
     };
     let delta = "SELECT city, MIN(price) FROM src GROUP BY city";
     let sql = build_merge_sql("intermediate", delta, &plan, DeltaOp::Subtract);
@@ -127,6 +134,8 @@ fn test_min_max_recompute_sql() {
         passthrough_key_mappings: std::collections::HashMap::new(),
         having_clause: None,
         not_null_columns: std::collections::HashSet::new(),
+        group_by_aliases: std::collections::HashMap::new(),
+        output_column_order: vec![],
     };
     let sql = build_min_max_recompute_sql("intermediate", &plan, "orders");
     assert!(sql.is_some());
@@ -147,15 +156,36 @@ fn test_no_min_max_recompute_for_sum_only() {
 #[test]
 fn test_replace_source_with_transition_schema_qualified() {
     let base_query = "SELECT sales_simulation.product_id, SUM(amount) FROM alp.sales_simulation INNER JOIN alp.demand_planning ON demand_planning.id = sales_simulation.dem_plan_id GROUP BY sales_simulation.product_id";
-    let result = replace_source_with_transition(base_query, "alp.sales_simulation", "__reflex_new_alp_sales_simulation");
+    let result = replace_source_with_transition(
+        base_query,
+        "alp.sales_simulation",
+        "__reflex_new_alp_sales_simulation",
+    );
     // FROM clause should be replaced
-    assert!(result.contains("\"__reflex_new_alp_sales_simulation\""), "FROM clause not replaced");
+    assert!(
+        result.contains("\"__reflex_new_alp_sales_simulation\""),
+        "FROM clause not replaced"
+    );
     // Column qualifiers should be replaced
-    assert!(!result.contains(" sales_simulation.product_id"), "Column qualifier not replaced: {}", result);
-    assert!(!result.contains(" sales_simulation.dem_plan_id"), "JOIN qualifier not replaced: {}", result);
+    assert!(
+        !result.contains(" sales_simulation.product_id"),
+        "Column qualifier not replaced: {}",
+        result
+    );
+    assert!(
+        !result.contains(" sales_simulation.dem_plan_id"),
+        "JOIN qualifier not replaced: {}",
+        result
+    );
     // Other tables should NOT be replaced
-    assert!(result.contains("alp.demand_planning"), "Other tables should not be affected");
-    assert!(result.contains("demand_planning.id"), "Other table qualifiers should not be affected");
+    assert!(
+        result.contains("alp.demand_planning"),
+        "Other tables should not be affected"
+    );
+    assert!(
+        result.contains("demand_planning.id"),
+        "Other table qualifiers should not be affected"
+    );
 }
 
 #[test]
@@ -164,4 +194,44 @@ fn test_replace_source_with_transition_unqualified() {
     let result = replace_source_with_transition(base_query, "orders", "__reflex_new_orders");
     assert!(result.contains("\"__reflex_new_orders\""));
     assert!(!result.contains(" orders "));
+}
+
+// ========================================================================
+// Bug fix tests: quoted identifiers in trigger names
+// ========================================================================
+
+#[test]
+fn test_trigger_ddl_quoted_table_name() {
+    // Tables with reserved-word names like "order" should not break trigger naming
+    let ddls = build_trigger_ddls("alp.\"order\"");
+    for ddl in &ddls {
+        // Trigger function names should NOT contain literal quote characters
+        assert!(
+            !ddl.contains("__reflex_ins_trigger_on_alp_\"order\""),
+            "Trigger function name should not contain quotes: {}",
+            &ddl[..ddl.len().min(200)]
+        );
+        // Should contain the clean name
+        assert!(
+            ddl.contains("__reflex_") && ddl.contains("_on_alp_order"),
+            "Trigger should use stripped name 'alp_order': {}",
+            &ddl[..ddl.len().min(200)]
+        );
+        // The source table reference in SQL strings should still use the quoted form
+        assert!(
+            ddl.contains("ON alp.\"order\""),
+            "Trigger DDL should reference the original table with quotes"
+        );
+    }
+}
+
+#[test]
+fn test_trigger_ddl_unquoted_table_name_unchanged() {
+    let ddls = build_trigger_ddls("public.sales");
+    for ddl in &ddls {
+        assert!(
+            ddl.contains("_on_public_sales"),
+            "Unquoted table names should work normally"
+        );
+    }
 }

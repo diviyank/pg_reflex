@@ -1,11 +1,14 @@
+use pgrx::datum::DatumWithOid;
+use pgrx::pg_sys::panic::ErrorReportable;
 use pgrx::prelude::*;
 use pgrx::spi::Spi;
 use pgrx::PgBuiltInOids;
-use pgrx::datum::DatumWithOid;
-use pgrx::pg_sys::panic::ErrorReportable;
 
 use crate::aggregation::AggregationPlan;
-use crate::query_decomposer::{intermediate_table_name, normalized_column_name, quote_identifier, replace_identifier, split_qualified_name};
+use crate::query_decomposer::{
+    intermediate_table_name, normalized_column_name, quote_identifier, replace_identifier,
+    split_qualified_name,
+};
 
 /// Whether a delta adds or subtracts from the intermediate table.
 #[derive(Clone, Copy)]
@@ -72,13 +75,19 @@ pub fn build_merge_sql(
                     ic.name, ic.name, ic.name
                 ));
             }
-            ("MIN", DeltaOp::Subtract) | ("MAX", DeltaOp::Subtract) | ("BOOL_OR", DeltaOp::Subtract) => {
+            ("MIN", DeltaOp::Subtract)
+            | ("MAX", DeltaOp::Subtract)
+            | ("BOOL_OR", DeltaOp::Subtract) => {
                 set_clauses.push(format!("\"{}\" = NULL", ic.name));
             }
             _ => {
                 // COALESCE handles NULL in delta (e.g., SUM(NULL)=NULL but we need 0).
                 // Use type-appropriate default: 0 for numeric, FALSE for boolean.
-                let default_val = if ic.pg_type == "BOOLEAN" { "FALSE" } else { "0" };
+                let default_val = if ic.pg_type == "BOOLEAN" {
+                    "FALSE"
+                } else {
+                    "0"
+                };
                 set_clauses.push(format!(
                     "\"{}\" = COALESCE(t.\"{}\", {}) {} COALESCE(d.\"{}\", {})",
                     ic.name, ic.name, default_val, operator, ic.name, default_val
@@ -110,13 +119,16 @@ pub fn build_merge_sql(
         .map(|c| {
             if c.starts_with("\"__") || c == "__ivm_count" {
                 // Check if this is a MIN/MAX column — don't coalesce
-                let is_min_max = plan.intermediate_columns.iter()
-                    .any(|ic| format!("\"{}\"", ic.name) == *c
-                        && (ic.source_aggregate == "MIN" || ic.source_aggregate == "MAX"));
+                let is_min_max = plan.intermediate_columns.iter().any(|ic| {
+                    format!("\"{}\"", ic.name) == *c
+                        && (ic.source_aggregate == "MIN" || ic.source_aggregate == "MAX")
+                });
                 if is_min_max {
                     format!("d.{}", c) // No COALESCE for MIN/MAX
                 } else {
-                    let is_bool = plan.intermediate_columns.iter()
+                    let is_bool = plan
+                        .intermediate_columns
+                        .iter()
                         .any(|ic| format!("\"{}\"", ic.name) == *c && ic.pg_type == "BOOLEAN");
                     let default_val = if is_bool { "FALSE" } else { "0" };
                     format!("COALESCE(d.{}, {})", c, default_val)
@@ -152,11 +164,7 @@ pub fn build_merge_sql(
 ///
 /// Produces: SELECT group_cols, SUM(CASE WHEN __op='N' THEN val ELSE -val END) AS __sum_val, ...
 ///           FROM (SELECT 'N', * FROM new_tbl UNION ALL SELECT 'O', * FROM old_tbl) GROUP BY ...
-fn build_net_delta_query(
-    delta_old: &str,
-    delta_new: &str,
-    plan: &AggregationPlan,
-) -> String {
+fn build_net_delta_query(delta_old: &str, delta_new: &str, plan: &AggregationPlan) -> String {
     // Extract the GROUP BY columns and aggregate expressions from the base query pattern.
     // The delta queries look like: SELECT group_col, SUM(amount) AS __sum_amount, COUNT(*) AS __ivm_count FROM transition_table GROUP BY group_col
     // We need to rewrite them into a net-delta form.
@@ -177,7 +185,9 @@ fn build_net_delta_query(
     // The new delta contributes positively, the old delta contributes negatively.
 
     // Build group column list
-    let mut grp_cols: Vec<String> = plan.group_by_columns.iter()
+    let mut grp_cols: Vec<String> = plan
+        .group_by_columns
+        .iter()
         .chain(plan.distinct_columns.iter())
         .map(|c| format!("\"{}\"", normalized_column_name(c)))
         .collect();
@@ -218,7 +228,11 @@ fn build_net_delta_query(
     let agg_select = agg_exprs.join(", ");
 
     // The inner UNION ALL: new delta (sign=+1) UNION ALL old delta (sign=-1)
-    let sentinel_col = if needs_sentinel { ", 0 AS __reflex_group" } else { "" };
+    let sentinel_col = if needs_sentinel {
+        ", 0 AS __reflex_group"
+    } else {
+        ""
+    };
     format!(
         "SELECT {grp_select}{agg_select} FROM (\
             SELECT 1 AS __reflex_sign, __d.*{sentinel_col} FROM ({delta_new}) AS __d \
@@ -239,7 +253,11 @@ pub fn build_min_max_recompute_sql(
     let min_max_cols: Vec<&crate::aggregation::IntermediateColumn> = plan
         .intermediate_columns
         .iter()
-        .filter(|ic| ic.source_aggregate == "MIN" || ic.source_aggregate == "MAX" || ic.source_aggregate == "BOOL_OR")
+        .filter(|ic| {
+            ic.source_aggregate == "MIN"
+                || ic.source_aggregate == "MAX"
+                || ic.source_aggregate == "BOOL_OR"
+        })
         .collect();
 
     if min_max_cols.is_empty() {
@@ -257,7 +275,12 @@ pub fn build_min_max_recompute_sql(
     for ic in &min_max_cols {
         let join_cond: Vec<String> = group_cols
             .iter()
-            .map(|gc| format!("{}.\"{}\" = {}.\"{}\"", source_table, gc, intermediate_tbl, gc))
+            .map(|gc| {
+                format!(
+                    "{}.\"{}\" = {}.\"{}\"",
+                    source_table, gc, intermediate_tbl, gc
+                )
+            })
             .collect();
 
         set_parts.push(format!(
@@ -283,7 +306,6 @@ pub fn build_min_max_recompute_sql(
     ))
 }
 
-
 /// Build a NULL-safe match condition for affected groups.
 /// Uses EXISTS with IS NOT DISTINCT FROM instead of IN (which fails for NULL keys).
 /// `target_alias` is the table being filtered (e.g., target table or intermediate).
@@ -291,12 +313,14 @@ pub fn build_min_max_recompute_sql(
 /// `cols` are the group column names (quoted).
 /// `cols` are the group column names (quoted).
 fn null_safe_in(affected_tbl: &str, cols: &[String]) -> String {
-    let conditions: Vec<String> = cols.iter()
+    let conditions: Vec<String> = cols
+        .iter()
         .map(|c| format!("{} IS NOT DISTINCT FROM __a.{}", c, c))
         .collect();
     format!(
         "EXISTS (SELECT 1 FROM \"{}\" AS __a WHERE {})",
-        affected_tbl, conditions.join(" AND ")
+        affected_tbl,
+        conditions.join(" AND ")
     )
 }
 
@@ -335,7 +359,11 @@ fn row_expr(cols: &[String]) -> String {
 /// Replace a source table reference in a base_query with a transition table name.
 /// Handles both schema-qualified names (e.g., `alp.sales_simulation` in FROM)
 /// and bare table names used as column qualifiers (e.g., `sales_simulation.product_id`).
-fn replace_source_with_transition(base_query: &str, source_table: &str, transition_tbl: &str) -> String {
+fn replace_source_with_transition(
+    base_query: &str,
+    source_table: &str,
+    transition_tbl: &str,
+) -> String {
     let quoted_tbl = format!("\"{}\"", transition_tbl);
     // Use word-boundary-aware replacement to avoid corrupting column names
     // that contain the source table name as a substring (e.g., __bool_or_flag
@@ -367,12 +395,16 @@ fn push_merge_and_affected(
     #[cfg(not(any(feature = "pg15", feature = "pg16")))]
     {
         let _ = delta_query; // only used in PG15/16 fallback path
-        let ret_cols = grp_cols.iter()
+        let ret_cols = grp_cols
+            .iter()
             .map(|c| format!("t.{}", c))
             .collect::<Vec<_>>()
             .join(", ");
         let cleanup_cte = if include_cleanup {
-            format!("cleanup AS (DELETE FROM \"{}\" RETURNING 1), ", affected_tbl)
+            format!(
+                "cleanup AS (DELETE FROM \"{}\" RETURNING 1), ",
+                affected_tbl
+            )
         } else {
             String::new()
         };
@@ -433,7 +465,8 @@ pub fn reflex_build_delta_sql(
     // 2. LEFT/RIGHT JOIN secondary table DELETE/UPDATE: NULL semantics can't be captured by MERGE subtract
     let bare_source = split_qualified_name(source_table).1;
     // Detect self-join and outer-join-secondary for BOTH aggregate and passthrough queries.
-    let occurrences = base_query.split_whitespace()
+    let occurrences = base_query
+        .split_whitespace()
         .filter(|w| {
             let trimmed = w.trim_matches(|c: char| !c.is_alphanumeric() && c != '_');
             trimmed == source_table || trimmed == bare_source
@@ -449,14 +482,22 @@ pub fn reflex_build_delta_sql(
     // Do NOT match if source_table only appears in ON conditions (that's the primary table).
     let src_upper = source_table.to_uppercase();
     let bare_upper = bare_source.to_uppercase();
-    let is_outer_join_secondary = !is_self_join
-        && (bq_upper.contains("LEFT JOIN") || bq_upper.contains("RIGHT JOIN")
-            || bq_upper.contains("LEFT OUTER") || bq_upper.contains("RIGHT OUTER")
+    let is_outer_join_secondary_table = !is_self_join
+        && (bq_upper.contains("LEFT JOIN")
+            || bq_upper.contains("RIGHT JOIN")
+            || bq_upper.contains("LEFT OUTER")
+            || bq_upper.contains("RIGHT OUTER")
             || is_full_outer)
         && {
             // Check if source_table appears directly after an outer JOIN keyword
-            let patterns = ["LEFT JOIN ", "LEFT OUTER JOIN ", "RIGHT JOIN ", "RIGHT OUTER JOIN ",
-                           "FULL JOIN ", "FULL OUTER JOIN "];
+            let patterns = [
+                "LEFT JOIN ",
+                "LEFT OUTER JOIN ",
+                "RIGHT JOIN ",
+                "RIGHT OUTER JOIN ",
+                "FULL JOIN ",
+                "FULL OUTER JOIN ",
+            ];
             patterns.iter().any(|pat| {
                 let mut search_from = 0;
                 while let Some(pos) = bq_upper[search_from..].find(pat) {
@@ -469,10 +510,13 @@ pub fn reflex_build_delta_sql(
                 }
                 false
             })
-        }
-        // For LEFT/RIGHT JOIN: only DELETE/UPDATE need special handling (INSERT is correct).
-        // For FULL OUTER JOIN: ALL operations need full refresh (both sides produce NULLs).
-        && (operation == "DELETE" || operation == "UPDATE" || is_full_outer);
+        };
+    // For LEFT/RIGHT JOIN: only the secondary table's DELETE/UPDATE needs special handling.
+    // For FULL OUTER JOIN: ALL operations on BOTH tables need targeted reconcile,
+    // because the FULL JOIN delta always includes unmatched rows from the other side.
+    let is_outer_join_secondary = (is_outer_join_secondary_table
+        && (operation == "DELETE" || operation == "UPDATE"))
+        || (is_full_outer && !is_self_join);
 
     if is_self_join {
         // Self-join: full refresh (delta itself is wrong — both aliases get replaced).
@@ -507,7 +551,11 @@ pub fn reflex_build_delta_sql(
             let qv = quote_identifier(view_name);
 
             // Determine transition table for affected group extraction
-            let transition = if operation == "DELETE" { &old_tbl } else { &new_tbl };
+            let transition = if operation == "DELETE" {
+                &old_tbl
+            } else {
+                &new_tbl
+            };
             // Build a delta query to extract group keys from transition table
             let delta_q = replace_source_with_transition(base_query, source_table, transition);
 
@@ -533,7 +581,10 @@ pub fn reflex_build_delta_sql(
 
             // Delete affected groups from intermediate (NULL-safe)
             let ns_in_int = null_safe_in(&affected_tbl, cols);
-            stmts.push(format!("DELETE FROM {} WHERE {}", intermediate_tbl, ns_in_int));
+            stmts.push(format!(
+                "DELETE FROM {} WHERE {}",
+                intermediate_tbl, ns_in_int
+            ));
 
             // Re-insert ONLY affected groups from the FULL base_query (reads real source).
             let ns_in_full = null_safe_in(&affected_tbl, cols);
@@ -545,7 +596,9 @@ pub fn reflex_build_delta_sql(
             // Targeted refresh of target (NULL-safe)
             let ns_in_tgt = null_safe_in(&affected_tbl, cols);
             stmts.push(format!("DELETE FROM {} WHERE {}", qv, ns_in_tgt));
-            stmts.push(format!("INSERT INTO {} {} AND {}", qv, end_query, ns_in_tgt
+            stmts.push(format!(
+                "INSERT INTO {} {} AND {}",
+                qv, end_query, ns_in_tgt
             ));
         } else {
             // No group columns: full refresh
@@ -553,9 +606,17 @@ pub fn reflex_build_delta_sql(
             stmts.push(format!("INSERT INTO {} {}", intermediate_tbl, base_query));
             stmts.push(format!("TRUNCATE {}", quote_identifier(view_name)));
             if end_query.is_empty() {
-                stmts.push(format!("INSERT INTO {} {}", quote_identifier(view_name), base_query));
+                stmts.push(format!(
+                    "INSERT INTO {} {}",
+                    quote_identifier(view_name),
+                    base_query
+                ));
             } else {
-                stmts.push(format!("INSERT INTO {} {}", quote_identifier(view_name), end_query));
+                stmts.push(format!(
+                    "INSERT INTO {} {}",
+                    quote_identifier(view_name),
+                    end_query
+                ));
             }
         }
     } else if plan.is_passthrough {
@@ -577,7 +638,10 @@ pub fn reflex_build_delta_sql(
                     let row = row_expr(&target_cols);
                     stmts.push(format!(
                         "DELETE FROM {} WHERE {} IN (SELECT {} FROM \"{}\")",
-                        qv, row, source_cols.join(", "), old_tbl
+                        qv,
+                        row,
+                        source_cols.join(", "),
+                        old_tbl
                     ));
                 } else {
                     // No mapping for this source: full refresh
@@ -595,7 +659,10 @@ pub fn reflex_build_delta_sql(
                     let row = row_expr(&target_cols);
                     stmts.push(format!(
                         "DELETE FROM {} WHERE {} IN (SELECT {} FROM \"{}\")",
-                        qv, row, source_cols.join(", "), old_tbl
+                        qv,
+                        row,
+                        source_cols.join(", "),
+                        old_tbl
                     ));
                     // Phase 2: insert new rows (base_query with source→transition)
                     let delta_new =
@@ -610,10 +677,11 @@ pub fn reflex_build_delta_sql(
             _ => {}
         }
     } else {
-        let has_min_max = plan
-            .intermediate_columns
-            .iter()
-            .any(|ic| ic.source_aggregate == "MIN" || ic.source_aggregate == "MAX" || ic.source_aggregate == "BOOL_OR");
+        let has_min_max = plan.intermediate_columns.iter().any(|ic| {
+            ic.source_aggregate == "MIN"
+                || ic.source_aggregate == "MAX"
+                || ic.source_aggregate == "BOOL_OR"
+        });
 
         match operation {
             "INSERT" => {
@@ -621,12 +689,26 @@ pub fn reflex_build_delta_sql(
 
                 if let Some(ref cols) = grp_cols {
                     let select_expr = affected_groups_select(cols);
-                    let merge_sql = build_merge_sql(&intermediate_tbl, &delta_q, &plan, DeltaOp::Add);
+                    let merge_sql =
+                        build_merge_sql(&intermediate_tbl, &delta_q, &plan, DeltaOp::Add);
                     #[cfg(any(feature = "pg15", feature = "pg16"))]
                     stmts.push(format!("TRUNCATE \"{}\"", affected_tbl));
-                    push_merge_and_affected(&mut stmts, &merge_sql, &affected_tbl, &select_expr, &delta_q, cols, true);
+                    push_merge_and_affected(
+                        &mut stmts,
+                        &merge_sql,
+                        &affected_tbl,
+                        &select_expr,
+                        &delta_q,
+                        cols,
+                        true,
+                    );
                 } else {
-                    stmts.push(build_merge_sql(&intermediate_tbl, &delta_q, &plan, DeltaOp::Add));
+                    stmts.push(build_merge_sql(
+                        &intermediate_tbl,
+                        &delta_q,
+                        &plan,
+                        DeltaOp::Add,
+                    ));
                 }
             }
             "DELETE" => {
@@ -634,15 +716,31 @@ pub fn reflex_build_delta_sql(
 
                 if let Some(ref cols) = grp_cols {
                     let select_expr = affected_groups_select(cols);
-                    let merge_sql = build_merge_sql(&intermediate_tbl, &delta_q, &plan, DeltaOp::Subtract);
+                    let merge_sql =
+                        build_merge_sql(&intermediate_tbl, &delta_q, &plan, DeltaOp::Subtract);
                     #[cfg(any(feature = "pg15", feature = "pg16"))]
                     stmts.push(format!("TRUNCATE \"{}\"", affected_tbl));
-                    push_merge_and_affected(&mut stmts, &merge_sql, &affected_tbl, &select_expr, &delta_q, cols, true);
+                    push_merge_and_affected(
+                        &mut stmts,
+                        &merge_sql,
+                        &affected_tbl,
+                        &select_expr,
+                        &delta_q,
+                        cols,
+                        true,
+                    );
                 } else {
-                    stmts.push(build_merge_sql(&intermediate_tbl, &delta_q, &plan, DeltaOp::Subtract));
+                    stmts.push(build_merge_sql(
+                        &intermediate_tbl,
+                        &delta_q,
+                        &plan,
+                        DeltaOp::Subtract,
+                    ));
                 }
                 if has_min_max {
-                    if let Some(recompute) = build_min_max_recompute_sql(&intermediate_tbl, &plan, source_table) {
+                    if let Some(recompute) =
+                        build_min_max_recompute_sql(&intermediate_tbl, &plan, source_table)
+                    {
                         stmts.push(recompute);
                     }
                 }
@@ -654,33 +752,88 @@ pub fn reflex_build_delta_sql(
                 if has_min_max {
                     if let Some(ref cols) = grp_cols {
                         let select_expr = affected_groups_select(cols);
-                        let merge_sub_sql = build_merge_sql(&intermediate_tbl, &delta_old, &plan, DeltaOp::Subtract);
+                        let merge_sub_sql = build_merge_sql(
+                            &intermediate_tbl,
+                            &delta_old,
+                            &plan,
+                            DeltaOp::Subtract,
+                        );
                         #[cfg(any(feature = "pg15", feature = "pg16"))]
                         stmts.push(format!("TRUNCATE \"{}\"", affected_tbl));
-                        push_merge_and_affected(&mut stmts, &merge_sub_sql, &affected_tbl, &select_expr, &delta_old, cols, true);
-                        if let Some(recompute) = build_min_max_recompute_sql(&intermediate_tbl, &plan, source_table) {
+                        push_merge_and_affected(
+                            &mut stmts,
+                            &merge_sub_sql,
+                            &affected_tbl,
+                            &select_expr,
+                            &delta_old,
+                            cols,
+                            true,
+                        );
+                        if let Some(recompute) =
+                            build_min_max_recompute_sql(&intermediate_tbl, &plan, source_table)
+                        {
                             stmts.push(recompute);
                         }
-                        let merge_add_sql = build_merge_sql(&intermediate_tbl, &delta_new, &plan, DeltaOp::Add);
-                        push_merge_and_affected(&mut stmts, &merge_add_sql, &affected_tbl, &select_expr, &delta_new, cols, false);
+                        let merge_add_sql =
+                            build_merge_sql(&intermediate_tbl, &delta_new, &plan, DeltaOp::Add);
+                        push_merge_and_affected(
+                            &mut stmts,
+                            &merge_add_sql,
+                            &affected_tbl,
+                            &select_expr,
+                            &delta_new,
+                            cols,
+                            false,
+                        );
                     } else {
-                        stmts.push(build_merge_sql(&intermediate_tbl, &delta_old, &plan, DeltaOp::Subtract));
-                        if let Some(recompute) = build_min_max_recompute_sql(&intermediate_tbl, &plan, source_table) {
+                        stmts.push(build_merge_sql(
+                            &intermediate_tbl,
+                            &delta_old,
+                            &plan,
+                            DeltaOp::Subtract,
+                        ));
+                        if let Some(recompute) =
+                            build_min_max_recompute_sql(&intermediate_tbl, &plan, source_table)
+                        {
                             stmts.push(recompute);
                         }
-                        stmts.push(build_merge_sql(&intermediate_tbl, &delta_new, &plan, DeltaOp::Add));
+                        stmts.push(build_merge_sql(
+                            &intermediate_tbl,
+                            &delta_new,
+                            &plan,
+                            DeltaOp::Add,
+                        ));
                     }
                 } else if grp_cols.is_some() {
                     let cols = grp_cols.as_ref().unwrap();
                     let net_delta = build_net_delta_query(&delta_old, &delta_new, &plan);
                     let select_expr = affected_groups_select(cols);
-                    let merge_sql = build_merge_sql(&intermediate_tbl, &net_delta, &plan, DeltaOp::Add);
+                    let merge_sql =
+                        build_merge_sql(&intermediate_tbl, &net_delta, &plan, DeltaOp::Add);
                     #[cfg(any(feature = "pg15", feature = "pg16"))]
                     stmts.push(format!("TRUNCATE \"{}\"", affected_tbl));
-                    push_merge_and_affected(&mut stmts, &merge_sql, &affected_tbl, &select_expr, &net_delta, cols, true);
+                    push_merge_and_affected(
+                        &mut stmts,
+                        &merge_sql,
+                        &affected_tbl,
+                        &select_expr,
+                        &net_delta,
+                        cols,
+                        true,
+                    );
                 } else {
-                    stmts.push(build_merge_sql(&intermediate_tbl, &delta_old, &plan, DeltaOp::Subtract));
-                    stmts.push(build_merge_sql(&intermediate_tbl, &delta_new, &plan, DeltaOp::Add));
+                    stmts.push(build_merge_sql(
+                        &intermediate_tbl,
+                        &delta_old,
+                        &plan,
+                        DeltaOp::Subtract,
+                    ));
+                    stmts.push(build_merge_sql(
+                        &intermediate_tbl,
+                        &delta_new,
+                        &plan,
+                        DeltaOp::Add,
+                    ));
                 }
             }
             _ => {}
@@ -690,7 +843,8 @@ pub fn reflex_build_delta_sql(
         // PG17+: consolidated into a single CTE chain (fewer EXECUTE calls = less SPI overhead).
         // PG15/16: separate statements.
         let end_query_has_group_by = end_query.to_uppercase().contains("GROUP BY");
-        let include_dead_cleanup = plan.needs_ivm_count && grp_cols.is_some()
+        let include_dead_cleanup = plan.needs_ivm_count
+            && grp_cols.is_some()
             && (operation == "DELETE" || operation == "UPDATE");
         let metadata_sql = format!(
             "UPDATE public.__reflex_ivm_reference SET last_update_date = NOW() \
@@ -740,7 +894,10 @@ pub fn reflex_build_delta_sql(
             #[cfg(any(feature = "pg15", feature = "pg16"))]
             {
                 if include_dead_cleanup {
-                    stmts.push(format!("DELETE FROM {} WHERE __ivm_count <= 0", intermediate_tbl));
+                    stmts.push(format!(
+                        "DELETE FROM {} WHERE __ivm_count <= 0",
+                        intermediate_tbl
+                    ));
                 }
                 stmts.push(format!("DELETE FROM {} WHERE {}", qv, ns_in));
                 stmts.push(format!("INSERT INTO {} {} AND {}", qv, end_query, ns_in));
@@ -784,9 +941,7 @@ pub fn reflex_build_truncate_sql(view_name: &str) -> String {
     .unwrap_or("{}")
     .to_string();
 
-    let is_passthrough = if let Ok(plan) =
-        serde_json::from_str::<AggregationPlan>(&agg_json)
-    {
+    let is_passthrough = if let Ok(plan) = serde_json::from_str::<AggregationPlan>(&agg_json) {
         plan.is_passthrough
     } else {
         false
@@ -844,10 +999,22 @@ pub fn reflex_flush_deferred(source_table: &str) -> String {
             .unwrap_or_report()
             .map(|row| {
                 (
-                    row.get_by_name::<&str, _>("name").unwrap_or(None).unwrap_or("").to_string(),
-                    row.get_by_name::<&str, _>("base_query").unwrap_or(None).unwrap_or("").to_string(),
-                    row.get_by_name::<&str, _>("end_query").unwrap_or(None).unwrap_or("").to_string(),
-                    row.get_by_name::<&str, _>("aggregations").unwrap_or(None).unwrap_or("{}").to_string(),
+                    row.get_by_name::<&str, _>("name")
+                        .unwrap_or(None)
+                        .unwrap_or("")
+                        .to_string(),
+                    row.get_by_name::<&str, _>("base_query")
+                        .unwrap_or(None)
+                        .unwrap_or("")
+                        .to_string(),
+                    row.get_by_name::<&str, _>("end_query")
+                        .unwrap_or(None)
+                        .unwrap_or("")
+                        .to_string(),
+                    row.get_by_name::<&str, _>("aggregations")
+                        .unwrap_or(None)
+                        .unwrap_or("{}")
+                        .to_string(),
                 )
             })
             .collect()
@@ -869,7 +1036,11 @@ pub fn reflex_flush_deferred(source_table: &str) -> String {
             )
             .unwrap_or_report()
             .next()
-            .map(|row| row.get_by_name::<bool, _>("has").unwrap_or(None).unwrap_or(false))
+            .map(|row| {
+                row.get_by_name::<bool, _>("has")
+                    .unwrap_or(None)
+                    .unwrap_or(false)
+            })
             .unwrap_or(false);
 
         if !has_rows {
@@ -891,16 +1062,29 @@ pub fn reflex_flush_deferred(source_table: &str) -> String {
             // Acquire advisory lock for this IMV
             client
                 .update(
-                    &format!("SELECT pg_advisory_xact_lock(hashtext('{}'))", imv_name.replace("'", "''")),
+                    &format!(
+                        "SELECT pg_advisory_xact_lock(hashtext('{}'))",
+                        imv_name.replace("'", "''")
+                    ),
                     None,
                     &[],
                 )
                 .unwrap_or_report();
 
             // Process INSERT deltas (op = 'I')
-            let ins_staging = format!("(SELECT * FROM {} WHERE __reflex_op = 'I') AS __dt", delta_tbl);
+            let ins_staging = format!(
+                "(SELECT * FROM {} WHERE __reflex_op = 'I') AS __dt",
+                delta_tbl
+            );
             let ins_base = replace_identifier(base_query, source_table, &ins_staging);
-            let ins_sql = reflex_build_delta_sql(imv_name, source_table, "INSERT", &ins_base, end_query, agg_json);
+            let ins_sql = reflex_build_delta_sql(
+                imv_name,
+                source_table,
+                "INSERT",
+                &ins_base,
+                end_query,
+                agg_json,
+            );
             if !ins_sql.is_empty() {
                 for stmt in ins_sql.split("\n--<<REFLEX_SEP>>--\n") {
                     if !stmt.is_empty() {
@@ -911,9 +1095,19 @@ pub fn reflex_flush_deferred(source_table: &str) -> String {
             }
 
             // Process DELETE deltas (op = 'D')
-            let del_staging = format!("(SELECT * FROM {} WHERE __reflex_op = 'D') AS __dt", delta_tbl);
+            let del_staging = format!(
+                "(SELECT * FROM {} WHERE __reflex_op = 'D') AS __dt",
+                delta_tbl
+            );
             let del_base = replace_identifier(base_query, source_table, &del_staging);
-            let del_sql = reflex_build_delta_sql(imv_name, source_table, "DELETE", &del_base, end_query, agg_json);
+            let del_sql = reflex_build_delta_sql(
+                imv_name,
+                source_table,
+                "DELETE",
+                &del_base,
+                end_query,
+                agg_json,
+            );
             if !del_sql.is_empty() {
                 for stmt in del_sql.split("\n--<<REFLEX_SEP>>--\n") {
                     if !stmt.is_empty() {
@@ -924,9 +1118,19 @@ pub fn reflex_flush_deferred(source_table: &str) -> String {
             }
 
             // Process UPDATE deltas: U_OLD as DELETE, U_NEW as INSERT
-            let upd_old_staging = format!("(SELECT * FROM {} WHERE __reflex_op = 'U_OLD') AS __dt", delta_tbl);
+            let upd_old_staging = format!(
+                "(SELECT * FROM {} WHERE __reflex_op = 'U_OLD') AS __dt",
+                delta_tbl
+            );
             let upd_old_base = replace_identifier(base_query, source_table, &upd_old_staging);
-            let upd_old_sql = reflex_build_delta_sql(imv_name, source_table, "DELETE", &upd_old_base, end_query, agg_json);
+            let upd_old_sql = reflex_build_delta_sql(
+                imv_name,
+                source_table,
+                "DELETE",
+                &upd_old_base,
+                end_query,
+                agg_json,
+            );
             if !upd_old_sql.is_empty() {
                 for stmt in upd_old_sql.split("\n--<<REFLEX_SEP>>--\n") {
                     if !stmt.is_empty() {
@@ -935,10 +1139,19 @@ pub fn reflex_flush_deferred(source_table: &str) -> String {
                 }
             }
 
-            let upd_new_staging = format!("(SELECT * FROM {} WHERE __reflex_op = 'U_NEW') AS __dt", delta_tbl);
-            let upd_new_base = replace_identifier(base_query, source_table, &upd_new_staging
+            let upd_new_staging = format!(
+                "(SELECT * FROM {} WHERE __reflex_op = 'U_NEW') AS __dt",
+                delta_tbl
             );
-            let upd_new_sql = reflex_build_delta_sql(imv_name, source_table, "INSERT", &upd_new_base, end_query, agg_json);
+            let upd_new_base = replace_identifier(base_query, source_table, &upd_new_staging);
+            let upd_new_sql = reflex_build_delta_sql(
+                imv_name,
+                source_table,
+                "INSERT",
+                &upd_new_base,
+                end_query,
+                agg_json,
+            );
             if !upd_new_sql.is_empty() {
                 for stmt in upd_new_sql.split("\n--<<REFLEX_SEP>>--\n") {
                     if !stmt.is_empty() {

@@ -13,8 +13,7 @@ fn decompose(sql: &str) -> (SqlAnalysis, AggregationPlan) {
 
 #[test]
 fn test_base_query_simple_sum() {
-    let (analysis, plan) =
-        decompose("SELECT city, SUM(amount) AS total FROM orders GROUP BY city");
+    let (analysis, plan) = decompose("SELECT city, SUM(amount) AS total FROM orders GROUP BY city");
     let base = generate_base_query(&analysis, &plan);
     assert!(base.contains("SUM(amount)"));
     assert!(base.contains("__sum_amount"));
@@ -25,8 +24,7 @@ fn test_base_query_simple_sum() {
 
 #[test]
 fn test_base_query_with_avg() {
-    let (analysis, plan) =
-        decompose("SELECT dept, AVG(salary) AS avg_sal FROM emp GROUP BY dept");
+    let (analysis, plan) = decompose("SELECT dept, AVG(salary) AS avg_sal FROM emp GROUP BY dept");
     let base = generate_base_query(&analysis, &plan);
     assert!(base.contains("SUM(salary)"));
     assert!(base.contains("__sum_salary"));
@@ -37,8 +35,7 @@ fn test_base_query_with_avg() {
 
 #[test]
 fn test_end_query_avg() {
-    let (_analysis, plan) =
-        decompose("SELECT dept, AVG(salary) AS avg_sal FROM emp GROUP BY dept");
+    let (_analysis, plan) = decompose("SELECT dept, AVG(salary) AS avg_sal FROM emp GROUP BY dept");
     let end = generate_end_query("test_view", &plan);
     assert!(end.contains("__reflex_intermediate_test_view"));
     assert!(end.contains("__sum_salary / NULLIF(__count_salary, 0)"));
@@ -62,9 +59,8 @@ fn test_end_query_distinct() {
 
 #[test]
 fn test_base_query_with_where() {
-    let (analysis, plan) = decompose(
-        "SELECT city, COUNT(*) AS cnt FROM emp WHERE active = true GROUP BY city",
-    );
+    let (analysis, plan) =
+        decompose("SELECT city, COUNT(*) AS cnt FROM emp WHERE active = true GROUP BY city");
     let base = generate_base_query(&analysis, &plan);
     assert!(base.contains("WHERE active = true"));
 }
@@ -116,7 +112,11 @@ fn test_end_query_uses_bare_names() {
 
 #[test]
 fn test_replace_identifier_basic() {
-    let result = replace_identifier("SELECT * FROM regional WHERE x > 1", "regional", "my_view__cte_regional");
+    let result = replace_identifier(
+        "SELECT * FROM regional WHERE x > 1",
+        "regional",
+        "my_view__cte_regional",
+    );
     assert!(result.contains("my_view__cte_regional"));
     assert!(!result.contains(" regional "));
 }
@@ -196,8 +196,7 @@ fn test_rewrite_having_avg() {
 #[test]
 fn test_rewrite_having_complex() {
     let plan =
-        decompose("SELECT city, SUM(amount) AS total, COUNT(*) AS cnt FROM emp GROUP BY city")
-            .1;
+        decompose("SELECT city, SUM(amount) AS total, COUNT(*) AS cnt FROM emp GROUP BY city").1;
     let result = rewrite_having("SUM(amount) > COUNT(*) * 2", &plan).unwrap();
     assert!(result.contains("__sum_amount"), "Got: {}", result);
     assert!(result.contains("__count_star"), "Got: {}", result);

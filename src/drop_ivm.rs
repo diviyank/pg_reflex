@@ -13,10 +13,7 @@ pub(crate) fn drop_reflex_ivm_impl(view_name: &str, cascade: bool) -> &'static s
                  FROM public.__reflex_ivm_reference WHERE name = $1",
                 None,
                 &[unsafe {
-                    DatumWithOid::new(
-                        view_name.to_string(),
-                        PgBuiltInOids::TEXTOID.oid().value(),
-                    )
+                    DatumWithOid::new(view_name.to_string(), PgBuiltInOids::TEXTOID.oid().value())
                 }],
             )
             .unwrap_or_report()
@@ -72,10 +69,7 @@ pub(crate) fn drop_reflex_ivm_impl(view_name: &str, cascade: bool) -> &'static s
                     None,
                     &[
                         unsafe {
-                            DatumWithOid::new(
-                                source.clone(),
-                                PgBuiltInOids::TEXTOID.oid().value(),
-                            )
+                            DatumWithOid::new(source.clone(), PgBuiltInOids::TEXTOID.oid().value())
                         },
                         unsafe {
                             DatumWithOid::new(
@@ -120,7 +114,11 @@ pub(crate) fn drop_reflex_ivm_impl(view_name: &str, cascade: bool) -> &'static s
         if relkind == "v" {
             client
                 .update(
-                    &format!("DROP VIEW IF EXISTS {}{}", quote_identifier(view_name), cascade_suffix),
+                    &format!(
+                        "DROP VIEW IF EXISTS {}{}",
+                        quote_identifier(view_name),
+                        cascade_suffix
+                    ),
                     None,
                     &[],
                 )
@@ -128,7 +126,11 @@ pub(crate) fn drop_reflex_ivm_impl(view_name: &str, cascade: bool) -> &'static s
         } else {
             client
                 .update(
-                    &format!("DROP TABLE IF EXISTS {}{}", quote_identifier(view_name), cascade_suffix),
+                    &format!(
+                        "DROP TABLE IF EXISTS {}{}",
+                        quote_identifier(view_name),
+                        cascade_suffix
+                    ),
                     None,
                     &[],
                 )
@@ -149,7 +151,10 @@ pub(crate) fn drop_reflex_ivm_impl(view_name: &str, cascade: bool) -> &'static s
         let bare_view = split_qualified_name(view_name).1;
         client
             .update(
-                &format!("DROP TABLE IF EXISTS \"__reflex_affected_{}\"{}", bare_view, cascade_suffix),
+                &format!(
+                    "DROP TABLE IF EXISTS \"__reflex_affected_{}\"{}",
+                    bare_view, cascade_suffix
+                ),
                 None,
                 &[],
             )
@@ -187,10 +192,7 @@ pub(crate) fn drop_reflex_ivm_impl(view_name: &str, cascade: bool) -> &'static s
                 "DELETE FROM public.__reflex_ivm_reference WHERE name = $1",
                 None,
                 &[unsafe {
-                    DatumWithOid::new(
-                        view_name.to_string(),
-                        PgBuiltInOids::TEXTOID.oid().value(),
-                    )
+                    DatumWithOid::new(view_name.to_string(), PgBuiltInOids::TEXTOID.oid().value())
                 }],
             )
             .unwrap_or_report();
@@ -209,11 +211,7 @@ pub(crate) fn drop_reflex_ivm_impl(view_name: &str, cascade: bool) -> &'static s
 
                 let fn_name = format!("__reflex_{}_trigger_on_{}", op, safe_source);
                 client
-                    .update(
-                        &format!("DROP FUNCTION IF EXISTS {}()", fn_name),
-                        None,
-                        &[],
-                    )
+                    .update(&format!("DROP FUNCTION IF EXISTS {}()", fn_name), None, &[])
                     .unwrap_or_report();
             }
         }

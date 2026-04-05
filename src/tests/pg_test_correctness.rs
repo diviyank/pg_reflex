@@ -867,9 +867,9 @@ fn test_correctness_update_group_key() {
     assert_imv_correct("cf3_view", fresh);
 
     // a: SUM=20, COUNT=1; b: SUM=40, COUNT=2
-    let a = Spi::get_one::<pgrx::AnyNumeric>("SELECT total FROM cf3_view WHERE grp = 'a'")
+    let a = Spi::get_one::<i64>("SELECT total FROM cf3_view WHERE grp = 'a'")
         .expect("q").expect("v");
-    assert_eq!(a.to_string(), "20");
+    assert_eq!(a, 20i64);
 }
 
 /// F6: Large batch insert (10K rows) — verify correctness at scale
