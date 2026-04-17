@@ -25,11 +25,28 @@ pub fn quote_identifier(name: &str) -> String {
     }
 }
 
+/// Ensure an identifier fits within PostgreSQL's NAMEDATALEN limit (63 chars).
+/// If the raw name exceeds 63 characters, truncate and append a hash suffix
+/// so that distinct input names remain distinct after truncation.
+pub fn safe_identifier(raw: &str) -> String {
+    const MAX_IDENT: usize = 63;
+    if raw.len() <= MAX_IDENT {
+        return raw.to_string();
+    }
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    raw.hash(&mut hasher);
+    let hash = hasher.finish();
+    // 9 chars for suffix: _ + 8 hex digits
+    format!("{}_{:08x}", &raw[..MAX_IDENT - 9], hash as u32)
+}
+
 /// Name of the intermediate (unlogged) table for a given view.
 /// For schema-qualified names, the intermediate table is in the same schema.
 pub fn intermediate_table_name(view_name: &str) -> String {
     let (schema, name) = split_qualified_name(view_name);
-    let int_name = format!("__reflex_intermediate_{}", name);
+    let int_name = safe_identifier(&format!("__reflex_intermediate_{}", name));
     match schema {
         Some(s) => format!("\"{}\".\"{}\"", s, int_name),
         None => int_name,

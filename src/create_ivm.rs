@@ -9,7 +9,7 @@ use crate::aggregation::plan_aggregation;
 use crate::query_decomposer::{
     bare_column_name, generate_aggregations_json, generate_base_query, generate_end_query,
     intermediate_table_name, normalized_column_name, quote_identifier, replace_identifier,
-    split_qualified_name,
+    safe_identifier, split_qualified_name,
 };
 use crate::schema_builder::{
     build_deferred_flush_ddl, build_deferred_trigger_ddls, build_indexes_ddl,
@@ -98,7 +98,7 @@ pub(crate) fn create_reflex_ivm_impl(
         // instead of falling back to full refresh.
         let mut sub_imv_names: Vec<String> = Vec::new();
         for (i, operand_sql) in set_op.operand_sqls.iter().enumerate() {
-            let sub_name = format!("{}__union_{}", view_name, i);
+            let sub_name = safe_identifier(&format!("{}__union_{}", view_name, i));
             let result = create_reflex_ivm_impl(
                 &sub_name,
                 operand_sql,
@@ -565,7 +565,8 @@ pub(crate) fn create_reflex_ivm_impl(
                 cte_query = replace_identifier(&cte_query, earlier_alias, &quoted);
             }
 
-            let cte_view_name = format!("{}__cte_{}", view_name, cte.alias);
+            let cte_view_name =
+                safe_identifier(&format!("{}__cte_{}", view_name, cte.alias));
             let result = create_reflex_ivm_impl(
                 &cte_view_name,
                 &cte_query,
@@ -598,45 +599,7 @@ pub(crate) fn create_reflex_ivm_impl(
 
         // Check if the main body is passthrough (no aggregation).
         // If so, all its sources are CTE sub-IMVs which don't get triggers,
-        // so we create a VIEW (reads live from sub-IMV targets, zero overhead).
-        let body_parsed = match Parser::parse_sql(&dialect, &body_sql) {
-            Ok(stmts) => stmts,
-            Err(e) => {
-                warning!(
-                    "pg_reflex: failed to parse rewritten CTE body for '{}': {}",
-                    view_name,
-                    e
-                );
-                return Box::leak(
-                    format!("ERROR: Failed to parse rewritten CTE body: {}", e).into_boxed_str(),
-                );
-            }
-        };
-        let body_analysis = match analyze(&body_parsed) {
-            Ok(a) => a,
-            Err(_) => return "ERROR: Failed to analyze rewritten CTE body",
-        };
-
-        let body_plan = plan_aggregation(&body_analysis);
-        if body_plan.is_passthrough {
-            // All sources are CTE sub-IMVs → VIEW reads live, always up-to-date
-            Spi::connect_mut(|client| {
-                client
-                    .update(
-                        &format!(
-                            "CREATE OR REPLACE VIEW {} AS {}",
-                            quote_identifier(view_name),
-                            body_sql
-                        ),
-                        None,
-                        &[],
-                    )
-                    .unwrap_or_report();
-            });
-            return "CREATE REFLEX INCREMENTAL VIEW";
-        }
-
-        // Main body has aggregation → create as a normal IMV
+        // CTE body (passthrough or aggregate) → create as a normal IMV
         return create_reflex_ivm_impl(view_name, &body_sql, "", false, storage_mode, refresh_mode);
     }
     // --- End CTE decomposition ---
@@ -968,28 +931,18 @@ pub(crate) fn create_reflex_ivm_impl(
                 continue;
             }
 
-            // Check if source is a materialized view (can't have triggers)
-            let (src_schema, src_name) = split_qualified_name(source);
-            let src_schema_str = src_schema.unwrap_or("public").to_string();
+            // Check if source is a materialized view (can't have triggers).
+            // Use to_regclass() which respects the current search_path.
             let is_matview = client
                 .select(
-                    "SELECT 1 FROM pg_class c JOIN pg_namespace n ON c.relnamespace = n.oid \
-                     WHERE n.nspname = $1 AND c.relname = $2 AND c.relkind = 'm'",
+                    "SELECT 1 FROM pg_class WHERE oid = to_regclass($1) AND relkind = 'm'",
                     None,
-                    &[
-                        unsafe {
-                            DatumWithOid::new(
-                                src_schema_str.clone(),
-                                PgBuiltInOids::TEXTOID.oid().value(),
-                            )
-                        },
-                        unsafe {
-                            DatumWithOid::new(
-                                src_name.to_string(),
-                                PgBuiltInOids::TEXTOID.oid().value(),
-                            )
-                        },
-                    ],
+                    &[unsafe {
+                        DatumWithOid::new(
+                            source.to_string(),
+                            PgBuiltInOids::TEXTOID.oid().value(),
+                        )
+                    }],
                 )
                 .unwrap_or_report()
                 .next()
@@ -1111,7 +1064,8 @@ pub(crate) fn create_reflex_ivm_impl(
                 }
                 let safe_src = source.replace('.', "_");
                 let bare_view = split_qualified_name(view_name).1;
-                let idx_name = format!("__reflex_idx_{}_{}", bare_view, safe_src);
+                let idx_name =
+                    safe_identifier(&format!("__reflex_idx_{}_{}", bare_view, safe_src));
                 let ddl = format!(
                     "CREATE INDEX IF NOT EXISTS \"{}\" ON {} ({})",
                     idx_name,
@@ -1234,7 +1188,8 @@ pub(crate) fn create_reflex_ivm_impl(
             // Uses UNLOGGED for speed; lost on crash but rebuilt by reflex_reconcile.
             if !plan.group_by_columns.is_empty() || !plan.distinct_columns.is_empty() {
                 let bare_view = split_qualified_name(view_name).1;
-                let affected_name = format!("__reflex_affected_{}", bare_view);
+                let affected_name =
+                    safe_identifier(&format!("__reflex_affected_{}", bare_view));
                 client
                     .update(
                         &format!(
@@ -1537,7 +1492,7 @@ fn map_information_schema_type(data_type: &str) -> String {
 /// Creates a temporary view from the base_query, reads column types from
 /// pg_attribute, then drops the view.
 fn augment_column_types_from_query(base_query: &str, column_types: &mut HashMap<String, String>) {
-    Spi::connect_mut(|mut client| {
+    Spi::connect_mut(|client| {
         let tmp = "__reflex_typecheck_view";
         let create = format!("CREATE TEMP VIEW {} AS {}", tmp, base_query);
         if client.update(&create, None, &[]).is_err() {

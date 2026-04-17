@@ -2,7 +2,9 @@ use pgrx::datum::DatumWithOid;
 use pgrx::pg_sys::panic::ErrorReportable;
 use pgrx::prelude::*;
 
-use crate::query_decomposer::{intermediate_table_name, quote_identifier, split_qualified_name};
+use crate::query_decomposer::{
+    intermediate_table_name, quote_identifier, safe_identifier, split_qualified_name,
+};
 
 pub(crate) fn drop_reflex_ivm_impl(view_name: &str, cascade: bool) -> &'static str {
     Spi::connect_mut(|client| {
@@ -152,8 +154,9 @@ pub(crate) fn drop_reflex_ivm_impl(view_name: &str, cascade: bool) -> &'static s
         client
             .update(
                 &format!(
-                    "DROP TABLE IF EXISTS \"__reflex_affected_{}\"{}",
-                    bare_view, cascade_suffix
+                    "DROP TABLE IF EXISTS \"{}\"{}",
+                    safe_identifier(&format!("__reflex_affected_{}", bare_view)),
+                    cascade_suffix
                 ),
                 None,
                 &[],

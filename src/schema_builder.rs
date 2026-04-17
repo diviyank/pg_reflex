@@ -2,7 +2,8 @@ use std::collections::HashMap;
 
 use crate::aggregation::{AggregationPlan, EndQueryMapping};
 use crate::query_decomposer::{
-    intermediate_table_name, normalized_column_name, quote_identifier, split_qualified_name,
+    intermediate_table_name, normalized_column_name, quote_identifier, safe_identifier,
+    split_qualified_name,
 };
 
 /// Build the DDL for the intermediate table.
@@ -241,9 +242,10 @@ pub fn build_indexes_ddl(view_name: &str, plan: &AggregationPlan) -> Vec<String>
             } else {
                 ""
             };
+            let idx_name = safe_identifier(&format!("idx__reflex_int_{}", bare_view));
             indexes.push(format!(
-                "CREATE INDEX IF NOT EXISTS \"idx__reflex_int_{}\" ON {} {} ({})",
-                bare_view,
+                "CREATE INDEX IF NOT EXISTS \"{}\" ON {} {} ({})",
+                idx_name,
                 table_name,
                 using,
                 idx_cols.join(", ")
@@ -255,9 +257,10 @@ pub fn build_indexes_ddl(view_name: &str, plan: &AggregationPlan) -> Vec<String>
     if plan.group_by_columns.len() > 1 {
         for (i, col) in plan.group_by_columns.iter().enumerate() {
             let norm = normalized_column_name(col);
+            let idx_name = safe_identifier(&format!("idx__reflex_{}_{}", bare_view, i));
             indexes.push(format!(
-                "CREATE INDEX IF NOT EXISTS \"idx__reflex_{}_{}\" ON {} (\"{}\")",
-                bare_view, i, table_name, norm
+                "CREATE INDEX IF NOT EXISTS \"{}\" ON {} (\"{}\")",
+                idx_name, table_name, norm
             ));
         }
     }
@@ -277,9 +280,10 @@ pub fn build_indexes_ddl(view_name: &str, plan: &AggregationPlan) -> Vec<String>
                 format!("\"{}\"", name)
             })
             .collect();
+        let idx_name = safe_identifier(&format!("idx__reflex_target_{}", bare_view));
         indexes.push(format!(
-            "CREATE INDEX IF NOT EXISTS \"idx__reflex_target_{}\" ON {} ({})",
-            bare_view,
+            "CREATE INDEX IF NOT EXISTS \"{}\" ON {} ({})",
+            idx_name,
             target_tbl,
             group_cols.join(", ")
         ));
@@ -601,6 +605,8 @@ pub fn build_deferred_flush_ddl() -> Vec<String> {
          $fn$ LANGUAGE plpgsql"
             .to_string(),
         // Constraint trigger — fires at COMMIT for any INSERT into the pending table
+        "DROP TRIGGER IF EXISTS __reflex_deferred_flush_trigger ON public.__reflex_deferred_pending"
+            .to_string(),
         "CREATE CONSTRAINT TRIGGER __reflex_deferred_flush_trigger \
          AFTER INSERT ON public.__reflex_deferred_pending \
          DEFERRABLE INITIALLY DEFERRED \
@@ -614,10 +620,10 @@ pub fn build_deferred_flush_ddl() -> Vec<String> {
 /// The staging table mirrors the source table's columns plus a `__reflex_op` column
 /// to identify the operation type (I=insert, D=delete, U_OLD=update old, U_NEW=update new).
 pub fn build_staging_table_ddl(source_table: &str) -> String {
-    let safe_source = source_table.replace('.', "_");
+    let safe_source = source_table.replace('.', "_").replace('"', "");
     let delta_tbl = format!("__reflex_delta_{}", safe_source);
     format!(
-        "CREATE UNLOGGED TABLE IF NOT EXISTS {} (\
+        "CREATE UNLOGGED TABLE IF NOT EXISTS \"{}\" (\
             __reflex_op TEXT NOT NULL, \
             LIKE {} INCLUDING DEFAULTS\
          )",

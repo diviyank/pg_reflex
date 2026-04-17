@@ -725,7 +725,7 @@ pub fn plan_aggregation(analysis: &SqlAnalysis) -> AggregationPlan {
                 let alias_norm = col
                     .alias
                     .as_deref()
-                    .map(|a| crate::query_decomposer::normalized_column_name(a));
+                    .map(crate::query_decomposer::normalized_column_name);
                 // Skip if normalized expression or alias already matches a GROUP BY column
                 !gb_norms
                     .iter()
@@ -742,7 +742,15 @@ pub fn plan_aggregation(analysis: &SqlAnalysis) -> AggregationPlan {
         if let Some(sc) = analysis
             .select_columns
             .iter()
-            .find(|sc| sc.is_passthrough && sc.expr_sql == *gb)
+            .find(|sc| {
+                if !sc.is_passthrough {
+                    return false;
+                }
+                // Exact match first, then normalized (handles table.col vs col)
+                sc.expr_sql == *gb
+                    || crate::query_decomposer::normalized_column_name(&sc.expr_sql)
+                        == crate::query_decomposer::normalized_column_name(gb)
+            })
         {
             if let Some(ref alias) = sc.alias {
                 let norm_gb = crate::query_decomposer::normalized_column_name(gb);
@@ -766,7 +774,15 @@ pub fn plan_aggregation(analysis: &SqlAnalysis) -> AggregationPlan {
                     col.alias.as_deref().unwrap_or(&col.expr_sql)
                 ))
             } else if col.is_passthrough {
-                Some(format!("gb:{}", col.expr_sql))
+                // Resolve to the matching GROUP BY expression so that keys are consistent
+                // with group_by_aliases (e.g. SELECT table.col matches GROUP BY col).
+                let norm = crate::query_decomposer::normalized_column_name(&col.expr_sql);
+                let gb_key = group_by_columns
+                    .iter()
+                    .find(|g| crate::query_decomposer::normalized_column_name(g) == norm)
+                    .cloned()
+                    .unwrap_or_else(|| col.expr_sql.clone());
+                Some(format!("gb:{}", gb_key))
             } else if col.aggregate.is_some() || col.is_aggregate_derived {
                 Some(format!(
                     "agg:{}",

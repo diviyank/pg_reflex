@@ -7,7 +7,7 @@ use pgrx::PgBuiltInOids;
 use crate::aggregation::AggregationPlan;
 use crate::query_decomposer::{
     intermediate_table_name, normalized_column_name, quote_identifier, replace_identifier,
-    split_qualified_name,
+    safe_identifier, split_qualified_name,
 };
 
 /// Whether a delta adds or subtracts from the intermediate table.
@@ -458,7 +458,7 @@ pub fn reflex_build_delta_sql(
     // Pre-compute group columns and affected-groups table name (used by multiple paths)
     let grp_cols = group_columns(&plan);
     let bare_view = split_qualified_name(view_name).1;
-    let affected_tbl = format!("__reflex_affected_{}", bare_view);
+    let affected_tbl = safe_identifier(&format!("__reflex_affected_{}", bare_view));
 
     // Detect cases where standard incremental delta is incorrect:
     // 1. Self-join: source_table appears multiple times in base_query

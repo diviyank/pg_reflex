@@ -3,7 +3,9 @@ use pgrx::pg_sys::panic::ErrorReportable;
 use pgrx::prelude::*;
 
 use crate::aggregation;
-use crate::query_decomposer::{intermediate_table_name, quote_identifier, split_qualified_name};
+use crate::query_decomposer::{
+    intermediate_table_name, quote_identifier, safe_identifier, split_qualified_name,
+};
 use crate::schema_builder::build_indexes_ddl;
 use crate::validate_view_name;
 
@@ -163,7 +165,10 @@ pub(crate) fn reflex_reconcile(view_name: &str) -> &'static str {
                         },
                         unsafe {
                             DatumWithOid::new(
-                                format!("__reflex_intermediate_{}", bare_view),
+                                safe_identifier(&format!(
+                                    "__reflex_intermediate_{}",
+                                    bare_view
+                                )),
                                 PgBuiltInOids::TEXTOID.oid().value(),
                             )
                         },
