@@ -739,19 +739,15 @@ pub fn plan_aggregation(analysis: &SqlAnalysis) -> AggregationPlan {
     // Build GROUP BY aliases: map expression -> user alias when they differ
     let mut group_by_aliases = std::collections::HashMap::new();
     for gb in &group_by_columns {
-        if let Some(sc) = analysis
-            .select_columns
-            .iter()
-            .find(|sc| {
-                if !sc.is_passthrough {
-                    return false;
-                }
-                // Exact match first, then normalized (handles table.col vs col)
-                sc.expr_sql == *gb
-                    || crate::query_decomposer::normalized_column_name(&sc.expr_sql)
-                        == crate::query_decomposer::normalized_column_name(gb)
-            })
-        {
+        if let Some(sc) = analysis.select_columns.iter().find(|sc| {
+            if !sc.is_passthrough {
+                return false;
+            }
+            // Exact match first, then normalized (handles table.col vs col)
+            sc.expr_sql == *gb
+                || crate::query_decomposer::normalized_column_name(&sc.expr_sql)
+                    == crate::query_decomposer::normalized_column_name(gb)
+        }) {
             if let Some(ref alias) = sc.alias {
                 let norm_gb = crate::query_decomposer::normalized_column_name(gb);
                 let norm_alias = crate::query_decomposer::normalized_column_name(alias);

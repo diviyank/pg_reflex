@@ -565,8 +565,7 @@ pub(crate) fn create_reflex_ivm_impl(
                 cte_query = replace_identifier(&cte_query, earlier_alias, &quoted);
             }
 
-            let cte_view_name =
-                safe_identifier(&format!("{}__cte_{}", view_name, cte.alias));
+            let cte_view_name = safe_identifier(&format!("{}__cte_{}", view_name, cte.alias));
             let result = create_reflex_ivm_impl(
                 &cte_view_name,
                 &cte_query,
@@ -749,9 +748,10 @@ pub(crate) fn create_reflex_ivm_impl(
                 && !group_by_set.contains(col.expr_sql.as_str())
                 && !analysis.has_distinct
             {
-                // Passthrough column not in GROUP BY — likely an unrecognized aggregate or expression
-                let name = col.alias.as_deref().unwrap_or(&col.expr_sql);
-                let bare = bare_column_name(name);
+                // Passthrough column not in GROUP BY — likely an unrecognized aggregate or expression.
+                // Match on the underlying expression, not the output alias: `src.col AS renamed`
+                // is still a valid grouped passthrough if `col` (bare) is in GROUP BY.
+                let bare = bare_column_name(&col.expr_sql);
                 let in_gb = group_by_set.iter().any(|gb| bare_column_name(gb) == bare);
                 if !in_gb {
                     warning!(
@@ -938,10 +938,7 @@ pub(crate) fn create_reflex_ivm_impl(
                     "SELECT 1 FROM pg_class WHERE oid = to_regclass($1) AND relkind = 'm'",
                     None,
                     &[unsafe {
-                        DatumWithOid::new(
-                            source.to_string(),
-                            PgBuiltInOids::TEXTOID.oid().value(),
-                        )
+                        DatumWithOid::new(source.to_string(), PgBuiltInOids::TEXTOID.oid().value())
                     }],
                 )
                 .unwrap_or_report()
@@ -1064,8 +1061,7 @@ pub(crate) fn create_reflex_ivm_impl(
                 }
                 let safe_src = source.replace('.', "_");
                 let bare_view = split_qualified_name(view_name).1;
-                let idx_name =
-                    safe_identifier(&format!("__reflex_idx_{}_{}", bare_view, safe_src));
+                let idx_name = safe_identifier(&format!("__reflex_idx_{}_{}", bare_view, safe_src));
                 let ddl = format!(
                     "CREATE INDEX IF NOT EXISTS \"{}\" ON {} ({})",
                     idx_name,
@@ -1188,8 +1184,7 @@ pub(crate) fn create_reflex_ivm_impl(
             // Uses UNLOGGED for speed; lost on crash but rebuilt by reflex_reconcile.
             if !plan.group_by_columns.is_empty() || !plan.distinct_columns.is_empty() {
                 let bare_view = split_qualified_name(view_name).1;
-                let affected_name =
-                    safe_identifier(&format!("__reflex_affected_{}", bare_view));
+                let affected_name = safe_identifier(&format!("__reflex_affected_{}", bare_view));
                 client
                     .update(
                         &format!(

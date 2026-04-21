@@ -339,3 +339,157 @@ fn test_immediate_update_to_null_all_null_group() {
     Spi::run("UPDATE imun SET val = NULL WHERE val = 10").expect("update to null");
     assert_imv_correct("imun_view", fresh);
 }
+
+/// Test A — zscore-style duplicate-key regression.
+/// When a grouped aggregate IMV has a unique index on its group key, inserting
+/// a row that maps into an existing group must not violate the index at flush.
+/// Regression for: sibling-CTE DELETE+INSERT pattern where INSERT can't see DELETE.
+#[pg_test]
+fn test_deferred_groupby_unique_index_existing_group() {
+    Spi::run("CREATE TABLE dfgk (id SERIAL PRIMARY KEY, grp TEXT NOT NULL, val INT NOT NULL)")
+        .expect("create");
+    Spi::run("INSERT INTO dfgk (grp, val) VALUES ('a', 10), ('b', 20)").expect("seed");
+
+    crate::create_reflex_ivm(
+        "dfgk_view",
+        "SELECT grp, SUM(val) AS total FROM dfgk GROUP BY grp",
+        None,
+        None,
+        Some("DEFERRED"),
+    );
+
+    // Unique index on group key — mirrors the real-world zscore_reflex setup.
+    Spi::run("CREATE UNIQUE INDEX dfgk_view_unique ON dfgk_view (grp)").expect("unique idx");
+
+    let fresh = "SELECT grp, SUM(val) AS total FROM dfgk GROUP BY grp";
+    assert_imv_correct("dfgk_view", fresh);
+
+    // INSERT a row mapping to an existing group — requires the flush to
+    // refresh group 'a' without violating the unique index.
+    Spi::run("INSERT INTO dfgk (grp, val) VALUES ('a', 100)").expect("insert existing");
+    Spi::run("SELECT reflex_flush_deferred('dfgk')").expect("flush");
+    assert_imv_correct("dfgk_view", fresh);
+
+    // UPDATE an existing group's value — same risk.
+    Spi::run("UPDATE dfgk SET val = 999 WHERE grp = 'b' AND val = 20").expect("update");
+    Spi::run("SELECT reflex_flush_deferred('dfgk')").expect("flush");
+    assert_imv_correct("dfgk_view", fresh);
+}
+
+/// Test B — qualified source-table refs in SELECT and GROUP BY.
+/// Mirrors stock_transfer_baseline_reflex which uses `src.col AS alias` in
+/// SELECT and mixed qualified/unqualified refs in GROUP BY.
+/// Regression for: `replace_identifier` corrupting qualified refs by inlining
+/// the `(SELECT ...) AS __dt` subquery before the dot.
+#[pg_test]
+fn test_deferred_qualified_source_refs() {
+    Spi::run("CREATE TABLE dfqs (id SERIAL PRIMARY KEY, grp TEXT NOT NULL, raw INT NOT NULL, val INT NOT NULL)")
+        .expect("create");
+    Spi::run("INSERT INTO dfqs (grp, raw, val) VALUES ('a', 1, 10), ('b', 2, 20)").expect("seed");
+
+    // Mix qualified and unqualified in SELECT, GROUP BY, and join predicates.
+    // Also rename a grouped column via `AS` — the false-positive-warning case.
+    crate::create_reflex_ivm(
+        "dfqs_view",
+        "SELECT dfqs.grp, dfqs.raw AS raw_renamed, SUM(dfqs.val) AS total \
+         FROM dfqs GROUP BY dfqs.grp, raw",
+        None,
+        None,
+        Some("DEFERRED"),
+    );
+
+    let fresh = "SELECT dfqs.grp, dfqs.raw AS raw_renamed, SUM(dfqs.val) AS total \
+                 FROM dfqs GROUP BY dfqs.grp, raw";
+    assert_imv_correct("dfqs_view", fresh);
+
+    Spi::run("INSERT INTO dfqs (grp, raw, val) VALUES ('a', 1, 5), ('c', 3, 30)").expect("insert");
+    Spi::run("SELECT reflex_flush_deferred('dfqs')").expect("flush");
+    assert_imv_correct("dfqs_view", fresh);
+
+    Spi::run("UPDATE dfqs SET val = 99 WHERE grp = 'b'").expect("update");
+    Spi::run("SELECT reflex_flush_deferred('dfqs')").expect("flush");
+    assert_imv_correct("dfqs_view", fresh);
+
+    Spi::run("DELETE FROM dfqs WHERE grp = 'c'").expect("delete");
+    Spi::run("SELECT reflex_flush_deferred('dfqs')").expect("flush");
+    assert_imv_correct("dfqs_view", fresh);
+}
+
+/// Passthrough IMV + DEFERRED flush exercises every delta op without leaking
+/// the IMMEDIATE-only `__reflex_old_<src>` transition-table reference.
+/// Regression for: the passthrough DELETE path in reflex_build_delta_sql
+/// literally names that table; the flush must stand it up as a temp view
+/// over the delta or the unconditional DELETE/UPDATE calls fail to parse.
+#[pg_test]
+fn test_deferred_passthrough_all_ops() {
+    Spi::run("CREATE TABLE dfpa (id SERIAL PRIMARY KEY, k TEXT NOT NULL, v INT NOT NULL)")
+        .expect("create");
+    Spi::run("INSERT INTO dfpa (k, v) VALUES ('a', 10), ('b', 20)").expect("seed");
+
+    // Passthrough IMV: explicit unique key, no aggregate.
+    crate::create_reflex_ivm(
+        "dfpa_view",
+        "SELECT id, k, v FROM dfpa",
+        Some("id"),
+        None,
+        Some("DEFERRED"),
+    );
+
+    let fresh = "SELECT id, k, v FROM dfpa";
+    assert_imv_correct("dfpa_view", fresh);
+
+    // INSERT-only flush must not trip the DELETE-branch staging reference.
+    Spi::run("INSERT INTO dfpa (k, v) VALUES ('c', 30)").expect("insert");
+    Spi::run("SELECT reflex_flush_deferred('dfpa')").expect("flush");
+    assert_imv_correct("dfpa_view", fresh);
+
+    // DELETE flush.
+    Spi::run("DELETE FROM dfpa WHERE k = 'a'").expect("delete");
+    Spi::run("SELECT reflex_flush_deferred('dfpa')").expect("flush");
+    assert_imv_correct("dfpa_view", fresh);
+
+    // UPDATE flush.
+    Spi::run("UPDATE dfpa SET v = 99 WHERE k = 'b'").expect("update");
+    Spi::run("SELECT reflex_flush_deferred('dfpa')").expect("flush");
+    assert_imv_correct("dfpa_view", fresh);
+
+    // Mixed batch.
+    Spi::run("INSERT INTO dfpa (k, v) VALUES ('d', 40)").expect("ins");
+    Spi::run("DELETE FROM dfpa WHERE k = 'c'").expect("del");
+    Spi::run("UPDATE dfpa SET v = 101 WHERE k = 'b'").expect("upd");
+    Spi::run("SELECT reflex_flush_deferred('dfpa')").expect("flush");
+    assert_imv_correct("dfpa_view", fresh);
+}
+
+/// Test D — renamed grouped column should not cause creation to misbehave.
+/// Regression for: the "not in GROUP BY" warning that fires on `src.col AS
+/// other_name` even when `col` is in GROUP BY. Also verifies the renamed
+/// column is populated correctly under IMMEDIATE mode.
+#[pg_test]
+fn test_immediate_renamed_grouped_column() {
+    Spi::run("CREATE TABLE dfrn (id SERIAL PRIMARY KEY, src_col TEXT NOT NULL, val INT NOT NULL)")
+        .expect("create");
+    Spi::run("INSERT INTO dfrn (src_col, val) VALUES ('a', 10), ('b', 20)").expect("seed");
+
+    crate::create_reflex_ivm(
+        "dfrn_view",
+        "SELECT dfrn.src_col AS renamed, SUM(val) AS total FROM dfrn GROUP BY src_col",
+        None,
+        None,
+        Some("IMMEDIATE"),
+    );
+
+    let fresh = "SELECT dfrn.src_col AS renamed, SUM(val) AS total FROM dfrn GROUP BY src_col";
+    assert_imv_correct("dfrn_view", fresh);
+
+    Spi::run("INSERT INTO dfrn (src_col, val) VALUES ('a', 5)").expect("insert");
+    assert_imv_correct("dfrn_view", fresh);
+
+    // Verify renamed column is actually populated (not NULL).
+    let row_count = Spi::get_one::<i64>(
+        "SELECT COUNT(*) FROM dfrn_view WHERE renamed IS NOT NULL",
+    )
+    .expect("q")
+    .expect("v");
+    assert!(row_count > 0, "renamed column should be populated");
+}

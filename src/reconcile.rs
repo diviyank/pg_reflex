@@ -165,10 +165,7 @@ pub(crate) fn reflex_reconcile(view_name: &str) -> &'static str {
                         },
                         unsafe {
                             DatumWithOid::new(
-                                safe_identifier(&format!(
-                                    "__reflex_intermediate_{}",
-                                    bare_view
-                                )),
+                                safe_identifier(&format!("__reflex_intermediate_{}", bare_view)),
                                 PgBuiltInOids::TEXTOID.oid().value(),
                             )
                         },

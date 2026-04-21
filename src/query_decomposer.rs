@@ -92,6 +92,12 @@ pub fn normalized_column_name(col: &str) -> String {
 /// Replace a SQL identifier with another, respecting word boundaries.
 /// Only replaces when the match is NOT part of a longer identifier
 /// (i.e., the character before/after is not alphanumeric or `_`).
+///
+/// **Contract:** `new_name` must itself be a simple identifier (possibly
+/// schema-qualified and quoted). If you need to swap a source table for a
+/// complex expression like `(SELECT …) AS __dt`, use
+/// [`replace_source_with_delta`] — otherwise a match followed by `.col`
+/// produces invalid SQL `(SELECT …) AS __dt.col`.
 pub fn replace_identifier(sql: &str, old_name: &str, new_name: &str) -> String {
     if old_name.is_empty() {
         return sql.to_string();
@@ -125,6 +131,53 @@ pub fn replace_identifier(sql: &str, old_name: &str, new_name: &str) -> String {
         i += 1;
     }
     result
+}
+
+/// Rewrite every reference to `source_table` in `sql` so it resolves to a
+/// delta subquery aliased as `alias`.
+///
+/// Qualified refs `<source>.<col>` become `<alias>.<col>` (two-pass rewrite,
+/// pass 1). Standalone refs (e.g. in `FROM <source>` / `JOIN <source>`)
+/// become `<subquery> AS <alias>` (pass 2, via [`replace_identifier`]).
+///
+/// This exists because the naive approach — calling `replace_identifier`
+/// once with the full `"(SELECT …) AS __dt"` string — corrupts qualified
+/// refs, producing invalid SQL like `(SELECT …) AS __dt.col`.
+pub fn replace_source_with_delta(
+    sql: &str,
+    source_table: &str,
+    subquery: &str,
+    alias: &str,
+) -> String {
+    if source_table.is_empty() {
+        return sql.to_string();
+    }
+    // Pass 1: rewrite qualified refs `<src>.` -> `<alias>.`.
+    let qualified_from = format!("{}.", source_table);
+    let qualified_to = format!("{}.", alias);
+    let mut out = String::with_capacity(sql.len());
+    let bytes = sql.as_bytes();
+    let pat = qualified_from.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if i + pat.len() <= bytes.len() && &bytes[i..i + pat.len()] == pat {
+            let before_ok = i == 0
+                || !(bytes[i - 1].is_ascii_alphanumeric()
+                    || bytes[i - 1] == b'_'
+                    || bytes[i - 1] == b'.');
+            if before_ok {
+                out.push_str(&qualified_to);
+                i += pat.len();
+                continue;
+            }
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    // Pass 2: rewrite remaining standalone `<src>` (FROM/JOIN positions)
+    // -> `<subquery> AS <alias>`.
+    let standalone_replacement = format!("{} AS {}", subquery, alias);
+    replace_identifier(&out, source_table, &standalone_replacement)
 }
 
 /// Generate the base query: source data -> intermediate table.

@@ -7,7 +7,7 @@ use pgrx::PgBuiltInOids;
 use crate::aggregation::AggregationPlan;
 use crate::query_decomposer::{
     intermediate_table_name, normalized_column_name, quote_identifier, replace_identifier,
-    safe_identifier, split_qualified_name,
+    replace_source_with_delta, safe_identifier, split_qualified_name,
 };
 
 /// Whether a delta adds or subtracts from the intermediate table.
@@ -840,8 +840,11 @@ pub fn reflex_build_delta_sql(
         }
 
         // Refresh target from intermediate, clean up dead groups, and update metadata.
-        // PG17+: consolidated into a single CTE chain (fewer EXECUTE calls = less SPI overhead).
-        // PG15/16: separate statements.
+        //
+        // Emitted as separate statements (not a single CTE chain): sibling CTEs
+        // in Postgres share a snapshot, so an `INSERT` sibling cannot observe
+        // a `DELETE` sibling — when the target has a unique index on the group
+        // key, re-inserting the refreshed row hits a duplicate-key error.
         let end_query_has_group_by = end_query.to_uppercase().contains("GROUP BY");
         let include_dead_cleanup = plan.needs_ivm_count
             && grp_cols.is_some()
@@ -854,72 +857,26 @@ pub fn reflex_build_delta_sql(
 
         if end_query_has_group_by {
             let qv = quote_identifier(view_name);
-            #[cfg(not(any(feature = "pg15", feature = "pg16")))]
-            {
-                stmts.push(format!(
-                    "WITH del AS (DELETE FROM {} RETURNING 1), \
-                     ins AS (INSERT INTO {} {} RETURNING 1) \
-                     {}",
-                    qv, qv, end_query, metadata_sql
-                ));
-            }
-            #[cfg(any(feature = "pg15", feature = "pg16"))]
-            {
-                stmts.push(format!("DELETE FROM {}", qv));
-                stmts.push(format!("INSERT INTO {} {}", qv, end_query));
-                stmts.push(metadata_sql);
-            }
+            stmts.push(format!("DELETE FROM {}", qv));
+            stmts.push(format!("INSERT INTO {} {}", qv, end_query));
+            stmts.push(metadata_sql);
         } else if let Some(ref cols) = grp_cols {
             let qv = quote_identifier(view_name);
             let ns_in = null_safe_in(&affected_tbl, cols);
-            #[cfg(not(any(feature = "pg15", feature = "pg16")))]
-            {
-                let mut ctes = Vec::new();
-                if include_dead_cleanup {
-                    ctes.push(format!(
-                        "dead_cleanup AS (DELETE FROM {} WHERE __ivm_count <= 0 RETURNING 1)",
-                        intermediate_tbl
-                    ));
-                }
-                ctes.push(format!(
-                    "del AS (DELETE FROM {} WHERE {} RETURNING 1)",
-                    qv, ns_in
+            if include_dead_cleanup {
+                stmts.push(format!(
+                    "DELETE FROM {} WHERE __ivm_count <= 0",
+                    intermediate_tbl
                 ));
-                ctes.push(format!(
-                    "ins AS (INSERT INTO {} {} AND {} RETURNING 1)",
-                    qv, end_query, ns_in
-                ));
-                stmts.push(format!("WITH {} {}", ctes.join(", "), metadata_sql));
             }
-            #[cfg(any(feature = "pg15", feature = "pg16"))]
-            {
-                if include_dead_cleanup {
-                    stmts.push(format!(
-                        "DELETE FROM {} WHERE __ivm_count <= 0",
-                        intermediate_tbl
-                    ));
-                }
-                stmts.push(format!("DELETE FROM {} WHERE {}", qv, ns_in));
-                stmts.push(format!("INSERT INTO {} {} AND {}", qv, end_query, ns_in));
-                stmts.push(metadata_sql);
-            }
+            stmts.push(format!("DELETE FROM {} WHERE {}", qv, ns_in));
+            stmts.push(format!("INSERT INTO {} {} AND {}", qv, end_query, ns_in));
+            stmts.push(metadata_sql);
         } else {
             let qv = quote_identifier(view_name);
-            #[cfg(not(any(feature = "pg15", feature = "pg16")))]
-            {
-                stmts.push(format!(
-                    "WITH del AS (DELETE FROM {} RETURNING 1), \
-                     ins AS (INSERT INTO {} {} RETURNING 1) \
-                     {}",
-                    qv, qv, end_query, metadata_sql
-                ));
-            }
-            #[cfg(any(feature = "pg15", feature = "pg16"))]
-            {
-                stmts.push(format!("TRUNCATE {}", qv));
-                stmts.push(format!("INSERT INTO {} {}", qv, end_query));
-                stmts.push(metadata_sql);
-            }
+            stmts.push(format!("TRUNCATE {}", qv));
+            stmts.push(format!("INSERT INTO {} {}", qv, end_query));
+            stmts.push(metadata_sql);
         }
     }
 
@@ -1058,6 +1015,25 @@ pub fn reflex_flush_deferred(source_table: &str) -> String {
             return;
         }
 
+        // Passthrough DELETE/UPDATE branches in reflex_build_delta_sql reference
+        // `__reflex_old_<safe_src>` literally (as a trigger transition table).
+        // That table only exists inside an IMMEDIATE trigger's REFERENCING scope;
+        // here we're at COMMIT, so stand it up as a temp view over the delta.
+        let old_view = format!("__reflex_old_{}", safe_src);
+        client
+            .update(&format!("DROP VIEW IF EXISTS {}", old_view), None, &[])
+            .unwrap_or_report();
+        client
+            .update(
+                &format!(
+                    "CREATE TEMP VIEW {} AS SELECT * FROM {} WHERE __reflex_op IN ('D', 'U_OLD')",
+                    old_view, delta_tbl
+                ),
+                None,
+                &[],
+            )
+            .unwrap_or_report();
+
         for (imv_name, base_query, end_query, agg_json) in &imvs {
             // Acquire advisory lock for this IMV
             client
@@ -1072,11 +1048,8 @@ pub fn reflex_flush_deferred(source_table: &str) -> String {
                 .unwrap_or_report();
 
             // Process INSERT deltas (op = 'I')
-            let ins_staging = format!(
-                "(SELECT * FROM {} WHERE __reflex_op = 'I') AS __dt",
-                delta_tbl
-            );
-            let ins_base = replace_identifier(base_query, source_table, &ins_staging);
+            let ins_subq = format!("(SELECT * FROM {} WHERE __reflex_op = 'I')", delta_tbl);
+            let ins_base = replace_source_with_delta(base_query, source_table, &ins_subq, "__dt");
             let ins_sql = reflex_build_delta_sql(
                 imv_name,
                 source_table,
@@ -1095,11 +1068,8 @@ pub fn reflex_flush_deferred(source_table: &str) -> String {
             }
 
             // Process DELETE deltas (op = 'D')
-            let del_staging = format!(
-                "(SELECT * FROM {} WHERE __reflex_op = 'D') AS __dt",
-                delta_tbl
-            );
-            let del_base = replace_identifier(base_query, source_table, &del_staging);
+            let del_subq = format!("(SELECT * FROM {} WHERE __reflex_op = 'D')", delta_tbl);
+            let del_base = replace_source_with_delta(base_query, source_table, &del_subq, "__dt");
             let del_sql = reflex_build_delta_sql(
                 imv_name,
                 source_table,
@@ -1118,11 +1088,9 @@ pub fn reflex_flush_deferred(source_table: &str) -> String {
             }
 
             // Process UPDATE deltas: U_OLD as DELETE, U_NEW as INSERT
-            let upd_old_staging = format!(
-                "(SELECT * FROM {} WHERE __reflex_op = 'U_OLD') AS __dt",
-                delta_tbl
-            );
-            let upd_old_base = replace_identifier(base_query, source_table, &upd_old_staging);
+            let upd_old_subq = format!("(SELECT * FROM {} WHERE __reflex_op = 'U_OLD')", delta_tbl);
+            let upd_old_base =
+                replace_source_with_delta(base_query, source_table, &upd_old_subq, "__dt");
             let upd_old_sql = reflex_build_delta_sql(
                 imv_name,
                 source_table,
@@ -1139,11 +1107,9 @@ pub fn reflex_flush_deferred(source_table: &str) -> String {
                 }
             }
 
-            let upd_new_staging = format!(
-                "(SELECT * FROM {} WHERE __reflex_op = 'U_NEW') AS __dt",
-                delta_tbl
-            );
-            let upd_new_base = replace_identifier(base_query, source_table, &upd_new_staging);
+            let upd_new_subq = format!("(SELECT * FROM {} WHERE __reflex_op = 'U_NEW')", delta_tbl);
+            let upd_new_base =
+                replace_source_with_delta(base_query, source_table, &upd_new_subq, "__dt");
             let upd_new_sql = reflex_build_delta_sql(
                 imv_name,
                 source_table,
@@ -1162,7 +1128,11 @@ pub fn reflex_flush_deferred(source_table: &str) -> String {
             }
         }
 
-        // Clean up: truncate staging table and remove pending rows
+        // Clean up: truncate staging table, drop the temp old-view shim,
+        // and remove pending rows.
+        client
+            .update(&format!("DROP VIEW IF EXISTS {}", old_view), None, &[])
+            .unwrap_or_report();
         client
             .update(&format!("TRUNCATE {}", delta_tbl), None, &[])
             .unwrap_or_report();

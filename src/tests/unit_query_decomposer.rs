@@ -140,6 +140,81 @@ fn test_replace_identifier_multiple_occurrences() {
 }
 
 #[test]
+fn test_replace_source_with_delta_qualified_and_standalone() {
+    let result = replace_source_with_delta(
+        "SELECT t.col, t.x FROM t WHERE t.col > 1",
+        "t",
+        "(SUBQ)",
+        "__dt",
+    );
+    assert!(
+        result.contains("__dt.col"),
+        "qualified .col should get alias prefix: {}",
+        result
+    );
+    assert!(
+        result.contains("__dt.x"),
+        "qualified .x should get alias prefix: {}",
+        result
+    );
+    assert!(
+        result.contains("FROM (SUBQ) AS __dt"),
+        "standalone src should become subquery+alias: {}",
+        result
+    );
+    assert!(
+        !result.contains(" t.col"),
+        "original qualified form must be gone: {}",
+        result
+    );
+}
+
+#[test]
+fn test_replace_source_with_delta_no_partial_match() {
+    let result = replace_source_with_delta(
+        "SELECT other_t.col, t_suffix.x FROM t",
+        "t",
+        "(SUBQ)",
+        "__dt",
+    );
+    assert!(
+        result.contains("other_t.col"),
+        "similar prefix identifier must not be rewritten: {}",
+        result
+    );
+    assert!(
+        result.contains("t_suffix.x"),
+        "similar suffix identifier must not be rewritten: {}",
+        result
+    );
+    assert!(
+        result.contains("FROM (SUBQ) AS __dt"),
+        "standalone src should still be replaced: {}",
+        result
+    );
+}
+
+#[test]
+fn test_replace_source_with_delta_only_qualified() {
+    // If every reference is qualified (no standalone FROM <src>), the
+    // helper should still rewrite all of them to use the alias prefix.
+    let result = replace_source_with_delta(
+        "SELECT t.a, t.b FROM other_table JOIN t ON other_table.id = t.id",
+        "t",
+        "(SUBQ)",
+        "__dt",
+    );
+    assert!(result.contains("__dt.a"), "rewrite a: {}", result);
+    assert!(result.contains("__dt.b"), "rewrite b: {}", result);
+    assert!(result.contains("__dt.id"), "rewrite id in ON: {}", result);
+    assert!(
+        result.contains("JOIN (SUBQ) AS __dt ON"),
+        "JOIN position rewritten: {}",
+        result
+    );
+}
+
+#[test]
 fn test_split_qualified_name() {
     assert_eq!(split_qualified_name("my_view"), (None, "my_view"));
     assert_eq!(
