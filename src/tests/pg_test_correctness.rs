@@ -3106,6 +3106,44 @@ fn test_correctness_count_distinct_basic() {
     // a: 2 distinct (2, 99)
 }
 
+/// Bug #3 regression: COUNT(DISTINCT nullable_col) with NULL values.
+/// The intermediate key includes `val`; the subtract MERGE must join on
+/// (grp, val) using IS NOT DISTINCT FROM so NULL rows match and get
+/// removed on DELETE — otherwise orphan counter rows accumulate and the
+/// count stays stale.
+#[pg_test]
+fn test_correctness_count_distinct_nullable() {
+    Spi::run("CREATE TABLE cdn_src (id SERIAL PRIMARY KEY, grp TEXT NOT NULL, val INT)").expect("create");
+    Spi::run("INSERT INTO cdn_src (grp, val) VALUES ('a', 1), ('a', 2), ('a', NULL), ('a', NULL), ('b', NULL)").expect("seed");
+
+    crate::create_reflex_ivm("cdn_view",
+        "SELECT grp, COUNT(DISTINCT val) AS cd FROM cdn_src GROUP BY grp",
+        None, None, None);
+
+    let fresh = "SELECT grp, COUNT(DISTINCT val) AS cd FROM cdn_src GROUP BY grp";
+    assert_imv_correct("cdn_view", fresh);
+    // Postgres COUNT(DISTINCT val) ignores NULLs: a → 2, b → 0
+
+    // INSERT another NULL row — count must stay the same (NULL not counted).
+    Spi::run("INSERT INTO cdn_src (grp, val) VALUES ('a', NULL)").expect("null insert");
+    assert_imv_correct("cdn_view", fresh);
+
+    // DELETE one of the NULL rows — count must stay the same (NULL not counted),
+    // but the intermediate compound key for (a, NULL) must match via
+    // IS NOT DISTINCT FROM so no orphan row is left behind.
+    Spi::run("DELETE FROM cdn_src WHERE id = 3").expect("delete null");
+    assert_imv_correct("cdn_view", fresh);
+
+    // DELETE all NULL rows for group a — still no change (NULL not counted).
+    Spi::run("DELETE FROM cdn_src WHERE grp = 'a' AND val IS NULL").expect("delete all nulls");
+    assert_imv_correct("cdn_view", fresh);
+
+    // DELETE a real distinct value — count must decrement.
+    Spi::run("DELETE FROM cdn_src WHERE grp = 'a' AND val = 1").expect("delete val=1");
+    assert_imv_correct("cdn_view", fresh);
+    // a: {2} → 1
+}
+
 /// COUNT(DISTINCT) with UPDATE
 #[pg_test]
 fn test_correctness_count_distinct_update() {

@@ -129,7 +129,7 @@ BEGIN
 
         _t_step := clock_timestamp();
         _sql := reflex_build_delta_sql(_rec.name, 'alp.sales_simulation', 'INSERT',
-                    _rec.base_query, _rec.end_query, _rec.aggregations);
+                    _rec.base_query, _rec.end_query, _rec.aggregations, _rec.base_query);
         INSERT INTO _trigger_timings (batch_size, run_type, step_name, ms) VALUES
             (0, 'instrumented', '5_rust_ffi', EXTRACT(EPOCH FROM clock_timestamp() - _t_step) * 1000);
 

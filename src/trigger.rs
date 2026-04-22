@@ -7,7 +7,8 @@ use pgrx::PgBuiltInOids;
 use crate::aggregation::AggregationPlan;
 use crate::query_decomposer::{
     intermediate_table_name, normalized_column_name, quote_identifier, replace_identifier,
-    replace_source_with_delta, safe_identifier, split_qualified_name,
+    replace_source_with_delta, safe_identifier, split_qualified_name, staging_delta_table_name,
+    transition_new_table_name, transition_old_table_name,
 };
 
 /// Whether a delta adds or subtracts from the intermediate table.
@@ -242,13 +243,19 @@ fn build_net_delta_query(delta_old: &str, delta_new: &str, plan: &AggregationPla
     )
 }
 
-/// Build a SQL UPDATE that recomputes MIN/MAX columns from the source table
-/// for groups whose MIN/MAX was set to NULL by a subtract operation.
-/// Returns None if the plan has no MIN/MAX columns.
+/// Build a SQL UPDATE that recomputes MIN/MAX/BOOL_OR columns from the original
+/// (un-delta-substituted) base_query for groups whose value was set to NULL
+/// by a subtract operation. Returns None if the plan has no MIN/MAX/BOOL_OR columns.
+///
+/// The recompute source is `orig_base_query` as a subquery — this preserves any
+/// JOINs and aliases referenced by the aggregated expression (e.g.,
+/// `BOOL_OR(caav.product_id IS NOT NULL)` where `caav` is a LEFT JOIN alias).
+/// A scalar subquery `SELECT AGG(expr) FROM source_table WHERE …` would fail
+/// for such expressions because `source_table` alone doesn't expose the JOINs.
 pub fn build_min_max_recompute_sql(
     intermediate_tbl: &str,
     plan: &AggregationPlan,
-    source_table: &str,
+    orig_base_query: &str,
 ) -> Option<String> {
     let min_max_cols: Vec<&crate::aggregation::IntermediateColumn> = plan
         .intermediate_columns
@@ -271,37 +278,44 @@ pub fn build_min_max_recompute_sql(
         .map(|c| normalized_column_name(c))
         .collect();
 
-    let mut set_parts: Vec<String> = Vec::new();
-    for ic in &min_max_cols {
-        let join_cond: Vec<String> = group_cols
-            .iter()
-            .map(|gc| {
-                format!(
-                    "{}.\"{}\" = {}.\"{}\"",
-                    source_table, gc, intermediate_tbl, gc
-                )
-            })
-            .collect();
-
-        set_parts.push(format!(
-            "\"{}\" = (SELECT {}({}) FROM {} WHERE {})",
-            ic.name,
-            ic.source_aggregate,
-            ic.source_arg,
-            source_table,
-            join_cond.join(" AND ")
-        ));
-    }
+    let set_parts: Vec<String> = min_max_cols
+        .iter()
+        .map(|ic| format!("\"{}\" = __src.\"{}\"", ic.name, ic.name))
+        .collect();
 
     let null_check: Vec<String> = min_max_cols
         .iter()
         .map(|ic| format!("{}.\"{}\" IS NULL", intermediate_tbl, ic.name))
         .collect();
 
+    // Sentinel-only (no GROUP BY) case: single row, no join keys to match.
+    // The WHERE reduces to the NULL filter only.
+    if group_cols.is_empty() {
+        return Some(format!(
+            "UPDATE {} SET {} FROM ({}) AS __src WHERE {}",
+            intermediate_tbl,
+            set_parts.join(", "),
+            orig_base_query,
+            null_check.join(" OR ")
+        ));
+    }
+
+    let join_cond: Vec<String> = group_cols
+        .iter()
+        .map(|gc| {
+            format!(
+                "{}.\"{}\" IS NOT DISTINCT FROM __src.\"{}\"",
+                intermediate_tbl, gc, gc
+            )
+        })
+        .collect();
+
     Some(format!(
-        "UPDATE {} SET {} WHERE {}",
+        "UPDATE {} SET {} FROM ({}) AS __src WHERE {} AND ({})",
         intermediate_tbl,
         set_parts.join(", "),
+        orig_base_query,
+        join_cond.join(" AND "),
         null_check.join(" OR ")
     ))
 }
@@ -437,6 +451,7 @@ pub fn reflex_build_delta_sql(
     base_query: &str,
     end_query: &str,
     aggregations_json: &str,
+    orig_base_query: &str,
 ) -> String {
     let plan: AggregationPlan = match serde_json::from_str(aggregations_json) {
         Ok(p) => p,
@@ -447,11 +462,10 @@ pub fn reflex_build_delta_sql(
     };
 
     let intermediate_tbl = intermediate_table_name(view_name);
-    let safe_src = source_table.replace('.', "_").replace('"', "");
     // Use the transition table names directly (no temp table copy needed).
     // Transition tables are visible in plpgsql EXECUTE context.
-    let new_tbl = format!("__reflex_new_{}", safe_src);
-    let old_tbl = format!("__reflex_old_{}", safe_src);
+    let new_tbl = transition_new_table_name(source_table);
+    let old_tbl = transition_old_table_name(source_table);
 
     let mut stmts: Vec<String> = Vec::new();
 
@@ -739,7 +753,7 @@ pub fn reflex_build_delta_sql(
                 }
                 if has_min_max {
                     if let Some(recompute) =
-                        build_min_max_recompute_sql(&intermediate_tbl, &plan, source_table)
+                        build_min_max_recompute_sql(&intermediate_tbl, &plan, orig_base_query)
                     {
                         stmts.push(recompute);
                     }
@@ -770,7 +784,7 @@ pub fn reflex_build_delta_sql(
                             true,
                         );
                         if let Some(recompute) =
-                            build_min_max_recompute_sql(&intermediate_tbl, &plan, source_table)
+                            build_min_max_recompute_sql(&intermediate_tbl, &plan, orig_base_query)
                         {
                             stmts.push(recompute);
                         }
@@ -793,7 +807,7 @@ pub fn reflex_build_delta_sql(
                             DeltaOp::Subtract,
                         ));
                         if let Some(recompute) =
-                            build_min_max_recompute_sql(&intermediate_tbl, &plan, source_table)
+                            build_min_max_recompute_sql(&intermediate_tbl, &plan, orig_base_query)
                         {
                             stmts.push(recompute);
                         }
@@ -932,8 +946,7 @@ pub fn reflex_build_truncate_sql(view_name: &str) -> String {
 /// to each DEFERRED IMV, then cleans up staging and pending rows.
 #[pg_extern]
 pub fn reflex_flush_deferred(source_table: &str) -> String {
-    let safe_src = source_table.replace('.', "_").replace('"', "");
-    let delta_tbl = format!("__reflex_delta_{}", safe_src);
+    let delta_tbl = staging_delta_table_name(source_table);
 
     // Read all DEFERRED IMVs that depend on this source
     let imvs: Vec<(String, String, String, String)> = Spi::connect(|client| {
@@ -1016,10 +1029,10 @@ pub fn reflex_flush_deferred(source_table: &str) -> String {
         }
 
         // Passthrough DELETE/UPDATE branches in reflex_build_delta_sql reference
-        // `__reflex_old_<safe_src>` literally (as a trigger transition table).
-        // That table only exists inside an IMMEDIATE trigger's REFERENCING scope;
-        // here we're at COMMIT, so stand it up as a temp view over the delta.
-        let old_view = format!("__reflex_old_{}", safe_src);
+        // the OLD transition table literally. That table only exists inside an
+        // IMMEDIATE trigger's REFERENCING scope; here we're at COMMIT, so stand
+        // it up as a temp view over the delta.
+        let old_view = transition_old_table_name(source_table);
         client
             .update(&format!("DROP VIEW IF EXISTS {}", old_view), None, &[])
             .unwrap_or_report();
@@ -1057,6 +1070,7 @@ pub fn reflex_flush_deferred(source_table: &str) -> String {
                 &ins_base,
                 end_query,
                 agg_json,
+                base_query,
             );
             if !ins_sql.is_empty() {
                 for stmt in ins_sql.split("\n--<<REFLEX_SEP>>--\n") {
@@ -1077,6 +1091,7 @@ pub fn reflex_flush_deferred(source_table: &str) -> String {
                 &del_base,
                 end_query,
                 agg_json,
+                base_query,
             );
             if !del_sql.is_empty() {
                 for stmt in del_sql.split("\n--<<REFLEX_SEP>>--\n") {
@@ -1098,6 +1113,7 @@ pub fn reflex_flush_deferred(source_table: &str) -> String {
                 &upd_old_base,
                 end_query,
                 agg_json,
+                base_query,
             );
             if !upd_old_sql.is_empty() {
                 for stmt in upd_old_sql.split("\n--<<REFLEX_SEP>>--\n") {
@@ -1117,6 +1133,7 @@ pub fn reflex_flush_deferred(source_table: &str) -> String {
                 &upd_new_base,
                 end_query,
                 agg_json,
+                base_query,
             );
             if !upd_new_sql.is_empty() {
                 for stmt in upd_new_sql.split("\n--<<REFLEX_SEP>>--\n") {

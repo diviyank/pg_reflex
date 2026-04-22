@@ -80,7 +80,8 @@ BEGIN
     built_sql := reflex_build_delta_sql('prof_view', 'prof_src', 'INSERT',
         replace(base_q, 'prof_src', 'staged_batch'),
         end_q,
-        agg_json);
+        agg_json,
+        base_q);
     t1 := clock_timestamp();
     step := 'S2: reflex_build_delta_sql (Rust FFI)'; duration_ms := ROUND(EXTRACT(MILLISECONDS FROM t1 - t0)::numeric, 1); RETURN NEXT;
 

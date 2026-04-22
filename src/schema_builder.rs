@@ -3,7 +3,8 @@ use std::collections::HashMap;
 use crate::aggregation::{AggregationPlan, EndQueryMapping};
 use crate::query_decomposer::{
     intermediate_table_name, normalized_column_name, quote_identifier, safe_identifier,
-    split_qualified_name,
+    split_qualified_name, staging_delta_table_name, transition_new_table_name,
+    transition_old_table_name,
 };
 
 /// Build the DDL for the intermediate table.
@@ -301,8 +302,8 @@ pub fn build_indexes_ddl(view_name: &str, plan: &AggregationPlan) -> Vec<String>
 /// Transition tables are referenced directly in EXECUTE context (no temp table copy).
 pub fn build_trigger_ddls(source_table: &str) -> Vec<String> {
     let safe_source = source_table.replace('.', "_").replace('"', "");
-    let ref_new = format!("__reflex_new_{}", safe_source);
-    let ref_old = format!("__reflex_old_{}", safe_source);
+    let ref_new = transition_new_table_name(source_table);
+    let ref_old = transition_old_table_name(source_table);
 
     // Core loop body shared by INSERT/DELETE/UPDATE triggers.
     // {op} is replaced per-operation. {transition_tbl} is the NEW or OLD table name.
@@ -327,7 +328,7 @@ pub fn build_trigger_ddls(source_table: &str) -> Vec<String> {
                IF NOT _pred_match THEN CONTINUE; END IF; \
              END IF; \
              PERFORM pg_advisory_xact_lock(hashtext(_rec.name)); \
-             _sql := reflex_build_delta_sql(_rec.name, '{source_table}', '{{op}}', _rec.base_query, _rec.end_query, _rec.aggregations); \
+             _sql := reflex_build_delta_sql(_rec.name, '{source_table}', '{{op}}', _rec.base_query, _rec.end_query, _rec.aggregations, _rec.base_query); \
              IF _sql <> '' THEN \
                FOREACH _stmt IN ARRAY string_to_array(_sql, E'\\n--<<REFLEX_SEP>>--\\n') LOOP \
                  IF _stmt <> '' THEN EXECUTE _stmt; END IF; \
@@ -339,8 +340,8 @@ pub fn build_trigger_ddls(source_table: &str) -> Vec<String> {
     );
 
     // INSERT
-    let ins_fn = format!("__reflex_ins_trigger_on_{}", safe_source);
-    let ins_trig = format!("__reflex_trigger_ins_on_{}", safe_source);
+    let ins_fn = safe_identifier(&format!("__reflex_ins_trigger_on_{}", safe_source));
+    let ins_trig = safe_identifier(&format!("__reflex_trigger_ins_on_{}", safe_source));
     let ins_body = body_core
         .replace("{op}", "INSERT")
         .replace("{transition_tbl}", &ref_new);
@@ -353,8 +354,8 @@ pub fn build_trigger_ddls(source_table: &str) -> Vec<String> {
     );
 
     // DELETE
-    let del_fn = format!("__reflex_del_trigger_on_{}", safe_source);
-    let del_trig = format!("__reflex_trigger_del_on_{}", safe_source);
+    let del_fn = safe_identifier(&format!("__reflex_del_trigger_on_{}", safe_source));
+    let del_trig = safe_identifier(&format!("__reflex_trigger_del_on_{}", safe_source));
     let del_body = body_core
         .replace("{op}", "DELETE")
         .replace("{transition_tbl}", &ref_old);
@@ -367,8 +368,8 @@ pub fn build_trigger_ddls(source_table: &str) -> Vec<String> {
     );
 
     // UPDATE
-    let upd_fn = format!("__reflex_upd_trigger_on_{}", safe_source);
-    let upd_trig = format!("__reflex_trigger_upd_on_{}", safe_source);
+    let upd_fn = safe_identifier(&format!("__reflex_upd_trigger_on_{}", safe_source));
+    let upd_trig = safe_identifier(&format!("__reflex_trigger_upd_on_{}", safe_source));
     let upd_body = body_core
         .replace("{op}", "UPDATE")
         .replace("{transition_tbl}", &ref_new);
@@ -381,8 +382,8 @@ pub fn build_trigger_ddls(source_table: &str) -> Vec<String> {
     );
 
     // TRUNCATE — no REFERENCING clauses; loops over all dependent IMVs
-    let trunc_fn = format!("__reflex_trunc_trigger_on_{}", safe_source);
-    let trunc_trig = format!("__reflex_trigger_trunc_on_{}", safe_source);
+    let trunc_fn = safe_identifier(&format!("__reflex_trunc_trigger_on_{}", safe_source));
+    let trunc_trig = safe_identifier(&format!("__reflex_trigger_trunc_on_{}", safe_source));
     let trunc_body = format!(
         "DECLARE _rec RECORD; _stmts TEXT; _stmt TEXT; \
          BEGIN \
@@ -423,9 +424,9 @@ pub fn build_trigger_ddls(source_table: &str) -> Vec<String> {
 /// (mixed mode: some IMVs IMMEDIATE, some DEFERRED).
 pub fn build_deferred_trigger_ddls(source_table: &str) -> Vec<String> {
     let safe_source = source_table.replace('.', "_").replace('"', "");
-    let ref_new = format!("__reflex_new_{}", safe_source);
-    let ref_old = format!("__reflex_old_{}", safe_source);
-    let delta_tbl = format!("__reflex_delta_{}", safe_source);
+    let ref_new = transition_new_table_name(source_table);
+    let ref_old = transition_old_table_name(source_table);
+    let delta_tbl = staging_delta_table_name(source_table);
 
     // Mixed-mode body: process IMMEDIATE IMVs inline, stage deltas for DEFERRED IMVs.
     // Early-exit if transition table is empty.
@@ -447,7 +448,7 @@ pub fn build_deferred_trigger_ddls(source_table: &str) -> Vec<String> {
              END IF; \
              IF _rec.refresh_mode = 'IMMEDIATE' THEN \
                PERFORM pg_advisory_xact_lock(hashtext(_rec.name)); \
-               _sql := reflex_build_delta_sql(_rec.name, '{source_table}', '{{op}}', _rec.base_query, _rec.end_query, _rec.aggregations); \
+               _sql := reflex_build_delta_sql(_rec.name, '{source_table}', '{{op}}', _rec.base_query, _rec.end_query, _rec.aggregations, _rec.base_query); \
                IF _sql <> '' THEN \
                  FOREACH _stmt IN ARRAY string_to_array(_sql, E'\\n--<<REFLEX_SEP>>--\\n') LOOP \
                    IF _stmt <> '' THEN EXECUTE _stmt; END IF; \
@@ -467,8 +468,8 @@ pub fn build_deferred_trigger_ddls(source_table: &str) -> Vec<String> {
     );
 
     // INSERT
-    let ins_fn = format!("__reflex_ins_trigger_on_{}", safe_source);
-    let ins_trig = format!("__reflex_trigger_ins_on_{}", safe_source);
+    let ins_fn = safe_identifier(&format!("__reflex_ins_trigger_on_{}", safe_source));
+    let ins_trig = safe_identifier(&format!("__reflex_trigger_ins_on_{}", safe_source));
     let ins_body = body_core
         .replace("{op}", "INSERT")
         .replace("{op_code}", "I")
@@ -483,8 +484,8 @@ pub fn build_deferred_trigger_ddls(source_table: &str) -> Vec<String> {
     );
 
     // DELETE
-    let del_fn = format!("__reflex_del_trigger_on_{}", safe_source);
-    let del_trig = format!("__reflex_trigger_del_on_{}", safe_source);
+    let del_fn = safe_identifier(&format!("__reflex_del_trigger_on_{}", safe_source));
+    let del_trig = safe_identifier(&format!("__reflex_trigger_del_on_{}", safe_source));
     let del_body = body_core
         .replace("{op}", "DELETE")
         .replace("{op_code}", "D")
@@ -499,8 +500,8 @@ pub fn build_deferred_trigger_ddls(source_table: &str) -> Vec<String> {
     );
 
     // UPDATE — capture both old and new rows
-    let upd_fn = format!("__reflex_upd_trigger_on_{}", safe_source);
-    let upd_trig = format!("__reflex_trigger_upd_on_{}", safe_source);
+    let upd_fn = safe_identifier(&format!("__reflex_upd_trigger_on_{}", safe_source));
+    let upd_trig = safe_identifier(&format!("__reflex_trigger_upd_on_{}", safe_source));
     let upd_body = format!(
         "DECLARE _rec RECORD; _sql TEXT; _stmt TEXT; _has_deferred BOOLEAN := FALSE; _has_rows BOOLEAN; \
          BEGIN \
@@ -515,7 +516,7 @@ pub fn build_deferred_trigger_ddls(source_table: &str) -> Vec<String> {
            LOOP \
              IF _rec.refresh_mode = 'IMMEDIATE' THEN \
                PERFORM pg_advisory_xact_lock(hashtext(_rec.name)); \
-               _sql := reflex_build_delta_sql(_rec.name, '{source_table}', 'UPDATE', _rec.base_query, _rec.end_query, _rec.aggregations); \
+               _sql := reflex_build_delta_sql(_rec.name, '{source_table}', 'UPDATE', _rec.base_query, _rec.end_query, _rec.aggregations, _rec.base_query); \
                IF _sql <> '' THEN \
                  FOREACH _stmt IN ARRAY string_to_array(_sql, E'\\n--<<REFLEX_SEP>>--\\n') LOOP \
                    IF _stmt <> '' THEN EXECUTE _stmt; END IF; \
@@ -543,8 +544,8 @@ pub fn build_deferred_trigger_ddls(source_table: &str) -> Vec<String> {
     );
 
     // TRUNCATE — same as immediate (no deferred staging for truncate)
-    let trunc_fn = format!("__reflex_trunc_trigger_on_{}", safe_source);
-    let trunc_trig = format!("__reflex_trigger_trunc_on_{}", safe_source);
+    let trunc_fn = safe_identifier(&format!("__reflex_trunc_trigger_on_{}", safe_source));
+    let trunc_trig = safe_identifier(&format!("__reflex_trigger_trunc_on_{}", safe_source));
     let trunc_body = format!(
         "DECLARE _rec RECORD; _stmts TEXT; _stmt TEXT; \
          BEGIN \
@@ -620,8 +621,7 @@ pub fn build_deferred_flush_ddl() -> Vec<String> {
 /// The staging table mirrors the source table's columns plus a `__reflex_op` column
 /// to identify the operation type (I=insert, D=delete, U_OLD=update old, U_NEW=update new).
 pub fn build_staging_table_ddl(source_table: &str) -> String {
-    let safe_source = source_table.replace('.', "_").replace('"', "");
-    let delta_tbl = format!("__reflex_delta_{}", safe_source);
+    let delta_tbl = staging_delta_table_name(source_table);
     format!(
         "CREATE UNLOGGED TABLE IF NOT EXISTS \"{}\" (\
             __reflex_op TEXT NOT NULL, \

@@ -195,6 +195,130 @@ fn test_replace_source_with_delta_no_partial_match() {
 }
 
 #[test]
+fn test_replace_source_with_delta_consumes_as_alias() {
+    // When the source has a user-alias in FROM/JOIN, the delta subquery must
+    // adopt that alias (not emit `AS __dt AS ol` which is invalid SQL).
+    let result = replace_source_with_delta(
+        "SELECT ol.x FROM order_line AS ol WHERE ol.y > 1",
+        "order_line",
+        "(SUBQ)",
+        "__dt",
+    );
+    assert!(
+        result.contains("FROM (SUBQ) AS ol"),
+        "user alias must be preserved: {}",
+        result
+    );
+    assert!(
+        !result.contains("AS __dt"),
+        "default alias must be dropped when user alias exists: {}",
+        result
+    );
+    assert!(result.contains("ol.x"));
+    assert!(result.contains("ol.y"));
+}
+
+#[test]
+fn test_replace_source_with_delta_consumes_bare_alias() {
+    // Same thing for the no-AS form: `FROM table alias`.
+    let result = replace_source_with_delta(
+        "SELECT lib.x FROM location_inventory_baseline lib WHERE lib.y > 1",
+        "location_inventory_baseline",
+        "(SUBQ)",
+        "__dt",
+    );
+    assert!(
+        result.contains("FROM (SUBQ) AS lib"),
+        "bare user alias must be consumed: {}",
+        result
+    );
+    assert!(
+        !result.contains("AS __dt lib"),
+        "must not emit double alias: {}",
+        result
+    );
+}
+
+#[test]
+fn test_replace_source_with_delta_consumes_alias_in_join() {
+    let result = replace_source_with_delta(
+        "SELECT o.x, ol.y FROM \"order\" AS o JOIN order_line AS ol ON ol.oid = o.id",
+        "order_line",
+        "(SUBQ)",
+        "__dt",
+    );
+    assert!(
+        result.contains("JOIN (SUBQ) AS ol ON"),
+        "JOIN alias must be consumed: {}",
+        result
+    );
+    assert!(
+        !result.contains("AS __dt AS ol"),
+        "must not emit double alias in JOIN: {}",
+        result
+    );
+}
+
+#[test]
+fn test_replace_source_with_delta_no_alias_still_defaults() {
+    // Sanity check: when source has no alias, we still add `AS __dt`.
+    let result = replace_source_with_delta(
+        "SELECT orders.x FROM orders WHERE orders.y > 1",
+        "orders",
+        "(SUBQ)",
+        "__dt",
+    );
+    assert!(
+        result.contains("FROM (SUBQ) AS __dt"),
+        "default alias used when no user alias: {}",
+        result
+    );
+    assert!(result.contains("__dt.x"));
+    assert!(result.contains("__dt.y"));
+}
+
+// Bug #12: the `AS <ident>` branch of consume_table_alias accepted any
+// identifier — including reserved keywords like SELECT — as an alias. The
+// bare-identifier branch already rejected follow-keywords; the AS branch
+// must apply the same guard.
+#[test]
+fn test_replace_source_with_delta_rejects_reserved_word_as_alias() {
+    // `FROM orders AS SELECT …` is invalid SQL. pg_reflex must NOT adopt
+    // `SELECT` as the subquery's alias (which would silently swallow the
+    // reserved keyword and push a confusing mis-parse downstream). Instead
+    // it must emit the default alias so the planner sees the malformed
+    // `AS __dt AS SELECT …` and rejects it with a clear error.
+    let result = replace_source_with_delta(
+        "SELECT x FROM orders AS SELECT y, z",
+        "orders",
+        "(SUBQ)",
+        "__dt",
+    );
+    // The default alias must be emitted (i.e., SELECT not consumed as alias).
+    assert!(
+        result.contains("FROM (SUBQ) AS __dt"),
+        "must fall back to default alias rather than consuming SELECT: {}",
+        result
+    );
+}
+
+#[test]
+fn test_replace_source_with_delta_rejects_follow_keyword_as_alias() {
+    // Same principle for follow-keywords under AS form: `FROM orders AS JOIN …`.
+    let result = replace_source_with_delta(
+        "SELECT x FROM orders AS JOIN other ON orders.id = other.id",
+        "orders",
+        "(SUBQ)",
+        "__dt",
+    );
+    assert!(
+        result.contains("FROM (SUBQ) AS __dt"),
+        "must fall back to default alias rather than consuming JOIN: {}",
+        result
+    );
+}
+
+#[test]
 fn test_replace_source_with_delta_only_qualified() {
     // If every reference is qualified (no standalone FROM <src>), the
     // helper should still rewrite all of them to use the alias prefix.

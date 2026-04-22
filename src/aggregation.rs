@@ -569,12 +569,13 @@ pub fn plan_aggregation(analysis: &SqlAnalysis) -> AggregationPlan {
             }
             AggregateKind::CountDistinct => {
                 // COUNT(DISTINCT val): the intermediate uses (grp, val) as compound key.
-                // The end_query does COUNT(*) per original GROUP BY.
-                // We add `val` to distinct_columns (which extends the intermediate key).
-                // No extra intermediate aggregate column needed — just __ivm_count.
+                // The end_query counts non-NULL distinct values per original GROUP BY
+                // using COUNT(val). COUNT(val) (not COUNT(*)) matches Postgres
+                // semantics — COUNT(DISTINCT val) ignores NULLs.
                 count_distinct_columns.push(arg.to_string());
+                let arg_norm = crate::query_decomposer::normalized_column_name(arg);
                 end_query_mappings.push(EndQueryMapping {
-                    intermediate_expr: "COUNT(*)".to_string(),
+                    intermediate_expr: format!("COUNT(\"{}\")", arg_norm),
                     output_alias,
                     aggregate_type: "COUNT".to_string(),
                     cast_type,

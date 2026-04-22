@@ -185,7 +185,7 @@ BEGIN
 
         _t_step := clock_timestamp();
         _sql := reflex_build_delta_sql(_rec.name, 'alp.sales_simulation', 'INSERT',
-                    _rec.base_query, _rec.end_query, _rec.aggregations);
+                    _rec.base_query, _rec.end_query, _rec.aggregations, _rec.base_query);
         INSERT INTO _timings VALUES ('D_instrumented', 'rust_ffi', EXTRACT(EPOCH FROM clock_timestamp() - _t_step) * 1000);
 
         IF _sql <> '' THEN
@@ -258,7 +258,7 @@ BEGIN
     SELECT name, base_query, end_query, aggregations::text AS aggregations
     INTO _rec FROM public.__reflex_ivm_reference WHERE name = 'alp.sop_forecast_reflex';
     delta_sql := reflex_build_delta_sql(_rec.name, 'alp.sales_simulation', 'INSERT',
-                     _rec.base_query, _rec.end_query, _rec.aggregations);
+                     _rec.base_query, _rec.end_query, _rec.aggregations, _rec.base_query);
 
     -- Create temp table mimicking transition table
     CREATE TEMP TABLE _diag_trans ON COMMIT DROP AS

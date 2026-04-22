@@ -461,6 +461,78 @@ fn test_deferred_passthrough_all_ops() {
     assert_imv_correct("dfpa_view", fresh);
 }
 
+/// Regression for journal/2026-04-21_min_max_recompute_bug.md:
+/// DEFERRED DELETE on a source feeding a BOOL_OR aggregate whose argument
+/// references a LEFT JOIN alias. The recompute step used to emit a scalar
+/// subquery `SELECT BOOL_OR(alias.col ...) FROM source_table WHERE ...` —
+/// the JOIN alias wasn't in the subquery's FROM, so the flush aborted with
+/// `missing FROM-clause entry for table "alias"`.
+#[pg_test]
+fn test_deferred_bool_or_with_join_alias_recompute() {
+    Spi::run("CREATE TABLE brja_src (g INT NOT NULL, p INT)").expect("create src");
+    Spi::run("CREATE TABLE brja_dim (p INT PRIMARY KEY)").expect("create dim");
+    Spi::run("INSERT INTO brja_src VALUES (1, 1), (1, 2), (2, 3)").expect("seed src");
+    Spi::run("INSERT INTO brja_dim VALUES (1)").expect("seed dim");
+
+    crate::create_reflex_ivm(
+        "brja_view",
+        "SELECT brja_src.g, BOOL_OR(d.p IS NOT NULL) AS has_match \
+         FROM brja_src LEFT JOIN brja_dim d ON d.p = brja_src.p \
+         GROUP BY brja_src.g",
+        None,
+        None,
+        Some("DEFERRED"),
+    );
+
+    let fresh = "SELECT brja_src.g, BOOL_OR(d.p IS NOT NULL) AS has_match \
+                 FROM brja_src LEFT JOIN brja_dim d ON d.p = brja_src.p \
+                 GROUP BY brja_src.g";
+    assert_imv_correct("brja_view", fresh);
+
+    Spi::run("DELETE FROM brja_src WHERE p = 1").expect("delete");
+    Spi::run("SELECT reflex_flush_deferred('brja_src')").expect("flush");
+    assert_imv_correct("brja_view", fresh);
+
+    Spi::run("INSERT INTO brja_src VALUES (1, 1)").expect("reinsert");
+    Spi::run("SELECT reflex_flush_deferred('brja_src')").expect("flush");
+    assert_imv_correct("brja_view", fresh);
+}
+
+/// Regression for journal/2026-04-21_db_clone_benchmark.md bug 2/3:
+/// DEFERRED flush on a source that is referenced with a user alias
+/// (`FROM src AS s` or bare `FROM src s`) used to emit invalid SQL like
+/// `FROM (SELECT … ) AS __dt AS s` from `replace_source_with_delta`.
+#[pg_test]
+fn test_deferred_flush_consumes_user_alias_in_from() {
+    Spi::run("CREATE TABLE dfua (id SERIAL PRIMARY KEY, grp TEXT NOT NULL, val INT NOT NULL)")
+        .expect("create");
+    Spi::run("INSERT INTO dfua (grp, val) VALUES ('a', 10), ('a', 20), ('b', 30)")
+        .expect("seed");
+
+    crate::create_reflex_ivm(
+        "dfua_view",
+        "SELECT s.grp, SUM(s.val) AS total FROM dfua AS s GROUP BY s.grp",
+        None,
+        None,
+        Some("DEFERRED"),
+    );
+
+    let fresh = "SELECT s.grp, SUM(s.val) AS total FROM dfua AS s GROUP BY s.grp";
+    assert_imv_correct("dfua_view", fresh);
+
+    Spi::run("INSERT INTO dfua (grp, val) VALUES ('a', 5), ('c', 100)").expect("insert");
+    Spi::run("SELECT reflex_flush_deferred('dfua')").expect("flush");
+    assert_imv_correct("dfua_view", fresh);
+
+    Spi::run("DELETE FROM dfua WHERE grp = 'a' AND val = 10").expect("delete");
+    Spi::run("SELECT reflex_flush_deferred('dfua')").expect("flush");
+    assert_imv_correct("dfua_view", fresh);
+
+    Spi::run("UPDATE dfua SET val = 999 WHERE grp = 'b'").expect("update");
+    Spi::run("SELECT reflex_flush_deferred('dfua')").expect("flush");
+    assert_imv_correct("dfua_view", fresh);
+}
+
 /// Test D — renamed grouped column should not cause creation to misbehave.
 /// Regression for: the "not in GROUP BY" warning that fires on `src.col AS
 /// other_name` even when `col` is in GROUP BY. Also verifies the renamed

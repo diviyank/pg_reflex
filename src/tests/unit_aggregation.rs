@@ -178,6 +178,69 @@ fn test_case_sum_end_query_references_intermediate() {
     assert_eq!(derived.output_alias, "ratio");
 }
 
+// Bug #2: aggregates appearing only in HAVING (not in SELECT) must still
+// produce intermediate columns so DELETE can recompute MIN/MAX/BOOL_OR
+// and HAVING evaluates against fresh state, not stale pre-delete values.
+#[test]
+fn test_having_only_max_creates_intermediate_column() {
+    let plan =
+        plan_from_sql("SELECT grp, SUM(x) AS total FROM t GROUP BY grp HAVING MAX(amount) > 100");
+    let has_max = plan
+        .intermediate_columns
+        .iter()
+        .any(|ic| ic.source_aggregate == "MAX" && ic.source_arg == "amount");
+    assert!(
+        has_max,
+        "HAVING-only MAX(amount) must add __max_amount to intermediate_columns. \
+         Got: {:?}",
+        plan.intermediate_columns
+            .iter()
+            .map(|ic| (&ic.name, &ic.source_aggregate))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn test_having_only_min_creates_intermediate_column() {
+    let plan = plan_from_sql("SELECT grp, COUNT(*) FROM t GROUP BY grp HAVING MIN(price) < 10");
+    let has_min = plan
+        .intermediate_columns
+        .iter()
+        .any(|ic| ic.source_aggregate == "MIN" && ic.source_arg == "price");
+    assert!(has_min, "HAVING-only MIN(price) must add __min_price");
+}
+
+#[test]
+fn test_having_only_bool_or_creates_intermediate_column() {
+    let plan = plan_from_sql("SELECT grp, COUNT(*) FROM t GROUP BY grp HAVING BOOL_OR(active)");
+    let has_bool_or = plan
+        .intermediate_columns
+        .iter()
+        .any(|ic| ic.source_aggregate == "BOOL_OR" && ic.source_arg == "active");
+    assert!(
+        has_bool_or,
+        "HAVING-only BOOL_OR(active) must add __bool_or_active"
+    );
+}
+
+#[test]
+fn test_having_only_max_is_recomputed_on_delete() {
+    // This is the actual correctness assertion: build_min_max_recompute_sql
+    // must include the HAVING-only MAX column in its SET list, so DELETE
+    // that removes the current max triggers a fresh rescan.
+    use crate::trigger::build_min_max_recompute_sql;
+    let plan =
+        plan_from_sql("SELECT grp, SUM(x) AS total FROM t GROUP BY grp HAVING MAX(amount) > 100");
+    let orig_base = "SELECT grp AS \"grp\", SUM(x) AS \"__sum_x\", MAX(amount) AS \"__max_amount\", COUNT(*) AS __ivm_count FROM t GROUP BY grp";
+    let sql = build_min_max_recompute_sql("__reflex_intermediate_v", &plan, orig_base);
+    let sql = sql.expect("HAVING-only MAX must produce a recompute SQL");
+    assert!(
+        sql.contains("\"__max_amount\" = __src.\"__max_amount\""),
+        "HAVING-only MAX(amount) must be recomputed on delete: {}",
+        sql
+    );
+}
+
 mod proptest_tests {
     use super::*;
     use proptest::prelude::*;

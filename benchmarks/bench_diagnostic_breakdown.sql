@@ -184,7 +184,7 @@ BEGIN
         -- Step 5: Rust FFI call (build delta SQL)
         _t_step := clock_timestamp();
         _sql := reflex_build_delta_sql(_rec.name, 'alp.sales_simulation', 'INSERT',
-                    _rec.base_query, _rec.end_query, _rec.aggregations);
+                    _rec.base_query, _rec.end_query, _rec.aggregations, _rec.base_query);
         INSERT INTO _timings (test_name, step_name, ms) VALUES
             ('T4_instrumented', 'rust_ffi_build_sql', EXTRACT(EPOCH FROM clock_timestamp() - _t_step) * 1000);
 
@@ -275,7 +275,7 @@ BEGIN
     WHERE name = 'alp.sop_forecast_reflex';
 
     _sql := reflex_build_delta_sql(_rec.name, 'alp.sales_simulation', 'INSERT',
-                _rec.base_query, _rec.end_query, _rec.aggregations);
+                _rec.base_query, _rec.end_query, _rec.aggregations, _rec.base_query);
 
     -- Log the SQL
     RAISE NOTICE 'Delta SQL: %', left(_sql, 200);

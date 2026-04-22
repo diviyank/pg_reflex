@@ -53,6 +53,39 @@ pub fn intermediate_table_name(view_name: &str) -> String {
     }
 }
 
+/// Canonical sanitized form of a source_table name used as a suffix in
+/// generated trigger-side identifiers (transition tables, staging delta).
+/// Strips schema dots and quotes so the suffix is a bare identifier body.
+pub fn sanitized_source_suffix(source_table: &str) -> String {
+    source_table.replace('.', "_").replace('"', "")
+}
+
+/// Name of the NEW transition table for a source table's triggers.
+/// Wraps raw `__reflex_new_<src>` in `safe_identifier` so that long source
+/// names do not silently collide under PG's 63-char NAMEDATALEN.
+pub fn transition_new_table_name(source_table: &str) -> String {
+    safe_identifier(&format!(
+        "__reflex_new_{}",
+        sanitized_source_suffix(source_table)
+    ))
+}
+
+/// Name of the OLD transition table for a source table's triggers.
+pub fn transition_old_table_name(source_table: &str) -> String {
+    safe_identifier(&format!(
+        "__reflex_old_{}",
+        sanitized_source_suffix(source_table)
+    ))
+}
+
+/// Name of the deferred-mode staging (delta) table for a source table.
+pub fn staging_delta_table_name(source_table: &str) -> String {
+    safe_identifier(&format!(
+        "__reflex_delta_{}",
+        sanitized_source_suffix(source_table)
+    ))
+}
+
 /// Strip table alias/qualifier from a column expression.
 /// E.g., "d.dept_name" -> "dept_name", "city" -> "city"
 /// Only strips qualifiers for simple column references — expressions containing
@@ -138,7 +171,12 @@ pub fn replace_identifier(sql: &str, old_name: &str, new_name: &str) -> String {
 ///
 /// Qualified refs `<source>.<col>` become `<alias>.<col>` (two-pass rewrite,
 /// pass 1). Standalone refs (e.g. in `FROM <source>` / `JOIN <source>`)
-/// become `<subquery> AS <alias>` (pass 2, via [`replace_identifier`]).
+/// become `<subquery> AS <effective_alias>` (pass 2).
+///
+/// Pass 2 consumes an existing user alias when present — `FROM order_line AS ol`
+/// becomes `FROM (SUBQ) AS ol`, not `FROM (SUBQ) AS __dt AS ol` (the latter is
+/// invalid SQL). Supports both `source AS alias` and bare `source alias` forms.
+/// Falls back to `alias` (caller-provided default) when no user alias is present.
 ///
 /// This exists because the naive approach — calling `replace_identifier`
 /// once with the full `"(SELECT …) AS __dt"` string — corrupts qualified
@@ -174,10 +212,158 @@ pub fn replace_source_with_delta(
         out.push(bytes[i] as char);
         i += 1;
     }
-    // Pass 2: rewrite remaining standalone `<src>` (FROM/JOIN positions)
-    // -> `<subquery> AS <alias>`.
-    let standalone_replacement = format!("{} AS {}", subquery, alias);
-    replace_identifier(&out, source_table, &standalone_replacement)
+    // Pass 2: rewrite standalone `<src>` (FROM/JOIN positions) -> `<subquery> AS <effective_alias>`.
+    replace_standalone_source_with_subquery(&out, source_table, subquery, alias)
+}
+
+/// Byte-scanner variant of [`replace_identifier`] that also consumes an existing
+/// user alias (`source AS alias` or bare `source alias`) so the emitted replacement
+/// uses the user's alias instead of the caller-provided default.
+fn replace_standalone_source_with_subquery(
+    sql: &str,
+    source_table: &str,
+    subquery: &str,
+    default_alias: &str,
+) -> String {
+    let bytes = sql.as_bytes();
+    let pat = source_table.as_bytes();
+    let mut out = String::with_capacity(sql.len() + subquery.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if i + pat.len() <= bytes.len() && &bytes[i..i + pat.len()] == pat {
+            let before_ok = i == 0
+                || !(bytes[i - 1].is_ascii_alphanumeric()
+                    || bytes[i - 1] == b'_'
+                    || bytes[i - 1] == b'.');
+            let after_as = i >= 3
+                && (bytes[i - 1] == b' ')
+                && (bytes[i - 2] == b'S' || bytes[i - 2] == b's')
+                && (bytes[i - 3] == b'A' || bytes[i - 3] == b'a')
+                && (i < 4 || !bytes[i - 4].is_ascii_alphanumeric());
+            let after_pos = i + pat.len();
+            let after_ok = after_pos >= bytes.len()
+                || !(bytes[after_pos].is_ascii_alphanumeric() || bytes[after_pos] == b'_');
+            if before_ok && after_ok && !after_as {
+                let (user_alias, consumed_to) = consume_table_alias(bytes, after_pos);
+                let effective = user_alias.as_deref().unwrap_or(default_alias);
+                out.push_str(subquery);
+                out.push_str(" AS ");
+                out.push_str(effective);
+                i = consumed_to;
+                continue;
+            }
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
+}
+
+/// Scan forward from `start` looking for an optional table alias. Returns
+/// `(Some(alias), new_index)` if an alias (with or without `AS`) was consumed,
+/// else `(None, start)` so the caller can fall back to its default.
+///
+/// Reject bare identifiers that match SQL keywords which can follow a table
+/// reference (JOIN, WHERE, ON, …) — those are NOT aliases.
+fn consume_table_alias(bytes: &[u8], start: usize) -> (Option<String>, usize) {
+    let mut i = start;
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    if i >= bytes.len() {
+        return (None, start);
+    }
+
+    // `AS <ident>` form — AS is unambiguous, but the identifier after it
+    // must not be a reserved keyword (SELECT, WHERE, JOIN, …). Blindly
+    // consuming `AS SELECT` pushes a mis-parse downstream with a confusing
+    // error — reject it here so the original SQL is preserved.
+    let has_as = i + 2 <= bytes.len()
+        && (bytes[i] == b'A' || bytes[i] == b'a')
+        && (bytes[i + 1] == b'S' || bytes[i + 1] == b's')
+        && (i + 2 == bytes.len() || bytes[i + 2].is_ascii_whitespace());
+    if has_as {
+        let mut j = i + 2;
+        while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        let name_start = j;
+        while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
+            j += 1;
+        }
+        if j > name_start {
+            let name_bytes = &bytes[name_start..j];
+            if is_follow_keyword(name_bytes) {
+                return (None, start);
+            }
+            let name = std::str::from_utf8(name_bytes).unwrap_or("").to_string();
+            return (Some(name), j);
+        }
+        return (None, start);
+    }
+
+    // Bare identifier — must not be a SQL keyword that can follow a table.
+    let name_start = i;
+    while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+        i += 1;
+    }
+    if i == name_start {
+        return (None, start);
+    }
+    let name_bytes = &bytes[name_start..i];
+    if is_follow_keyword(name_bytes) {
+        return (None, start);
+    }
+    let name = std::str::from_utf8(name_bytes).unwrap_or("").to_string();
+    (Some(name), i)
+}
+
+/// SQL keywords that can follow a table reference in FROM/JOIN clauses,
+/// plus a handful of fully-reserved words that are never valid as an alias
+/// (SELECT, FROM, AS, DISTINCT). A bare identifier matching any of these
+/// is not a table alias; under the `AS <ident>` form it marks a mis-parse.
+fn is_follow_keyword(ident: &[u8]) -> bool {
+    const KEYWORDS: &[&[u8]] = &[
+        b"ON",
+        b"JOIN",
+        b"LEFT",
+        b"RIGHT",
+        b"INNER",
+        b"OUTER",
+        b"FULL",
+        b"CROSS",
+        b"NATURAL",
+        b"LATERAL",
+        b"USING",
+        b"WHERE",
+        b"GROUP",
+        b"ORDER",
+        b"HAVING",
+        b"LIMIT",
+        b"OFFSET",
+        b"UNION",
+        b"INTERSECT",
+        b"EXCEPT",
+        b"WITH",
+        b"TABLESAMPLE",
+        b"AND",
+        b"OR",
+        b"FETCH",
+        b"WINDOW",
+        b"FOR",
+        b"RETURNING",
+        b"SELECT",
+        b"FROM",
+        b"AS",
+        b"DISTINCT",
+    ];
+    KEYWORDS.iter().any(|kw| {
+        kw.len() == ident.len()
+            && kw
+                .iter()
+                .zip(ident.iter())
+                .all(|(a, b)| a.eq_ignore_ascii_case(b))
+    })
 }
 
 /// Generate the base query: source data -> intermediate table.
