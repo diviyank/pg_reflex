@@ -272,7 +272,44 @@ fn rewrite_expr_aggregates(
                     }
                     AggregateKind::Min => format!("__min_{}", arg_sanitized),
                     AggregateKind::Max => format!("__max_{}", arg_sanitized),
-                    AggregateKind::BoolOr => format!("__bool_or_{}", arg_sanitized),
+                    AggregateKind::BoolOr => {
+                        let true_col = format!("__bool_or_{}_true_count", arg_sanitized);
+                        let nonnull_col = format!("__bool_or_{}_nonnull_count", arg_sanitized);
+                        let (has_true, has_nonnull) = {
+                            let all: Vec<&str> = existing
+                                .iter()
+                                .chain(new_cols.iter())
+                                .map(|ic| ic.name.as_str())
+                                .collect();
+                            (
+                                all.contains(&true_col.as_str()),
+                                all.contains(&nonnull_col.as_str()),
+                            )
+                        };
+                        if !has_true {
+                            new_cols.push(IntermediateColumn {
+                                name: true_col.clone(),
+                                pg_type: "BIGINT".to_string(),
+                                source_aggregate: "SUM".to_string(),
+                                source_arg: format!("CASE WHEN ({}) THEN 1 ELSE 0 END", arg),
+                            });
+                        }
+                        if !has_nonnull {
+                            new_cols.push(IntermediateColumn {
+                                name: nonnull_col.clone(),
+                                pg_type: "BIGINT".to_string(),
+                                source_aggregate: "SUM".to_string(),
+                                source_arg: format!(
+                                    "CASE WHEN ({}) IS NOT NULL THEN 1 ELSE 0 END",
+                                    arg
+                                ),
+                            });
+                        }
+                        return format!(
+                            "CASE WHEN \"{}\" > 0 THEN \"{}\" > 0 ELSE NULL END",
+                            nonnull_col, true_col
+                        );
+                    }
                     AggregateKind::Avg => format!("__sum_{}", arg_sanitized),
                 };
                 // Add intermediate column if not already present
@@ -293,7 +330,6 @@ fn rewrite_expr_aggregates(
                             AggregateKind::Count
                             | AggregateKind::CountStar
                             | AggregateKind::CountDistinct => "BIGINT".to_string(),
-                            AggregateKind::BoolOr => "BOOLEAN".to_string(),
                             _ => "NUMERIC".to_string(),
                         },
                         source_aggregate: source_agg,
@@ -553,15 +589,25 @@ pub fn plan_aggregation(analysis: &SqlAnalysis) -> AggregationPlan {
                 });
             }
             AggregateKind::BoolOr => {
-                let col_name = format!("__bool_or_{}", arg_sanitized);
+                let true_col = format!("__bool_or_{}_true_count", arg_sanitized);
+                let nonnull_col = format!("__bool_or_{}_nonnull_count", arg_sanitized);
                 intermediate_columns.push(IntermediateColumn {
-                    name: col_name.clone(),
-                    pg_type: "BOOLEAN".to_string(),
-                    source_aggregate: "BOOL_OR".to_string(),
-                    source_arg: arg.to_string(),
+                    name: true_col.clone(),
+                    pg_type: "BIGINT".to_string(),
+                    source_aggregate: "SUM".to_string(),
+                    source_arg: format!("CASE WHEN ({}) THEN 1 ELSE 0 END", arg),
+                });
+                intermediate_columns.push(IntermediateColumn {
+                    name: nonnull_col.clone(),
+                    pg_type: "BIGINT".to_string(),
+                    source_aggregate: "SUM".to_string(),
+                    source_arg: format!("CASE WHEN ({}) IS NOT NULL THEN 1 ELSE 0 END", arg),
                 });
                 end_query_mappings.push(EndQueryMapping {
-                    intermediate_expr: col_name,
+                    intermediate_expr: format!(
+                        "CASE WHEN \"{}\" > 0 THEN \"{}\" > 0 ELSE NULL END",
+                        nonnull_col, true_col
+                    ),
                     output_alias,
                     aggregate_type: "BOOL_OR".to_string(),
                     cast_type,
@@ -652,10 +698,19 @@ pub fn plan_aggregation(analysis: &SqlAnalysis) -> AggregationPlan {
                     }
                     AggregateKind::BoolOr => {
                         intermediate_columns.push(IntermediateColumn {
-                            name: format!("__bool_or_{}", arg_sanitized),
-                            pg_type: "BOOLEAN".to_string(),
-                            source_aggregate: "BOOL_OR".to_string(),
-                            source_arg: arg,
+                            name: format!("__bool_or_{}_true_count", arg_sanitized),
+                            pg_type: "BIGINT".to_string(),
+                            source_aggregate: "SUM".to_string(),
+                            source_arg: format!("CASE WHEN ({}) THEN 1 ELSE 0 END", arg),
+                        });
+                        intermediate_columns.push(IntermediateColumn {
+                            name: format!("__bool_or_{}_nonnull_count", arg_sanitized),
+                            pg_type: "BIGINT".to_string(),
+                            source_aggregate: "SUM".to_string(),
+                            source_arg: format!(
+                                "CASE WHEN ({}) IS NOT NULL THEN 1 ELSE 0 END",
+                                arg
+                            ),
                         });
                     }
                     AggregateKind::CountDistinct => {

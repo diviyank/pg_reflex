@@ -565,3 +565,101 @@ fn test_immediate_renamed_grouped_column() {
     .expect("v");
     assert!(row_count > 0, "renamed column should be populated");
 }
+
+// ========================================================================
+// #3 / #12b — DO-block gate + where_predicate flush correctness
+// ========================================================================
+
+#[pg_test]
+fn test_flush_is_noop_when_affected_empty() {
+    Spi::run("CREATE TABLE noop_src (id SERIAL PRIMARY KEY, grp TEXT NOT NULL, val INT NOT NULL, note TEXT)").expect("create");
+    Spi::run("INSERT INTO noop_src (grp, val, note) VALUES ('a', 10, 'x'), ('b', 20, 'y')").expect("seed");
+    crate::create_reflex_ivm(
+        "noop_view",
+        "SELECT grp, SUM(val) AS total FROM noop_src GROUP BY grp",
+        None,
+        None,
+        Some("DEFERRED"),
+    );
+    let fresh = "SELECT grp, SUM(val) AS total FROM noop_src GROUP BY grp";
+    assert_imv_correct("noop_view", fresh);
+    Spi::run("UPDATE noop_src SET note = 'changed'").expect("update non-agg col");
+    Spi::run("SELECT reflex_flush_deferred('noop_src')").expect("flush");
+    assert_imv_correct("noop_view", fresh);
+}
+
+#[pg_test]
+fn test_flush_correct_after_empty_delta_gate_sequence() {
+    Spi::run("CREATE TABLE gate_src (id SERIAL PRIMARY KEY, grp TEXT NOT NULL, val INT NOT NULL)").expect("create");
+    Spi::run("INSERT INTO gate_src (grp, val) VALUES ('a', 10)").expect("seed");
+    crate::create_reflex_ivm(
+        "gate_view",
+        "SELECT grp, SUM(val) AS total FROM gate_src GROUP BY grp",
+        None,
+        None,
+        Some("DEFERRED"),
+    );
+    let fresh = "SELECT grp, SUM(val) AS total FROM gate_src GROUP BY grp";
+    assert_imv_correct("gate_view", fresh);
+    Spi::run("INSERT INTO gate_src (grp, val) VALUES ('b', 20)").expect("insert");
+    Spi::run("SELECT reflex_flush_deferred('gate_src')").expect("flush after insert");
+    assert_imv_correct("gate_view", fresh);
+    Spi::run("DELETE FROM gate_src WHERE grp = 'b'").expect("delete");
+    Spi::run("SELECT reflex_flush_deferred('gate_src')").expect("flush after delete");
+    assert_imv_correct("gate_view", fresh);
+    Spi::run("INSERT INTO gate_src (grp, val) VALUES ('b', 30)").expect("re-insert");
+    Spi::run("SELECT reflex_flush_deferred('gate_src')").expect("flush after re-insert");
+    assert_imv_correct("gate_view", fresh);
+}
+
+#[pg_test]
+fn test_deferred_upd_respects_where_predicate() {
+    Spi::run("CREATE TABLE pred_src (id SERIAL PRIMARY KEY, grp TEXT NOT NULL, val INT NOT NULL, status TEXT NOT NULL)").expect("create");
+    Spi::run("INSERT INTO pred_src (grp, val, status) VALUES ('a', 10, 'active'), ('b', 20, 'active'), ('c', 30, 'inactive')").expect("seed");
+    crate::create_reflex_ivm(
+        "pred_view",
+        "SELECT grp, SUM(val) AS total FROM pred_src WHERE status = 'active' GROUP BY grp",
+        None,
+        None,
+        Some("DEFERRED"),
+    );
+    let fresh = "SELECT grp, SUM(val) AS total FROM pred_src WHERE status = 'active' GROUP BY grp";
+    assert_imv_correct("pred_view", fresh);
+    Spi::run("UPDATE pred_src SET val = 999 WHERE status = 'inactive'").expect("update inactive");
+    Spi::run("SELECT reflex_flush_deferred('pred_src')").expect("flush");
+    assert_imv_correct("pred_view", fresh);
+}
+
+#[pg_test]
+fn test_flush_deferred_skips_imv_on_predicate_miss() {
+    Spi::run("CREATE TABLE two_src (id SERIAL PRIMARY KEY, grp TEXT NOT NULL, val INT NOT NULL, status TEXT NOT NULL)").expect("create");
+    Spi::run("INSERT INTO two_src (grp, val, status) VALUES ('a', 10, 'active'), ('b', 20, 'active')").expect("seed");
+    crate::create_reflex_ivm(
+        "two_view_active",
+        "SELECT grp, SUM(val) AS total FROM two_src WHERE status = 'active' GROUP BY grp",
+        None,
+        None,
+        Some("DEFERRED"),
+    );
+    crate::create_reflex_ivm(
+        "two_view_never",
+        "SELECT grp, SUM(val) AS total FROM two_src WHERE status = 'never' GROUP BY grp",
+        None,
+        None,
+        Some("DEFERRED"),
+    );
+    let fresh_active = "SELECT grp, SUM(val) AS total FROM two_src WHERE status = 'active' GROUP BY grp";
+    let fresh_never = "SELECT grp, SUM(val) AS total FROM two_src WHERE status = 'never' GROUP BY grp";
+    assert_imv_correct("two_view_active", fresh_active);
+    assert_imv_correct("two_view_never", fresh_never);
+    Spi::run("INSERT INTO two_src (grp, val, status) VALUES ('c', 30, 'active')").expect("insert");
+    Spi::run("SELECT reflex_flush_deferred('two_src')").expect("flush");
+    assert_imv_correct("two_view_active", fresh_active);
+    assert_imv_correct("two_view_never", fresh_never);
+    let never_int_count = Spi::get_one::<i64>(
+        "SELECT COUNT(*) FROM __reflex_intermediate_two_view_never",
+    )
+    .expect("q")
+    .expect("v");
+    assert_eq!(never_int_count, 0, "intermediate for 'never' IMV must have 0 rows");
+}

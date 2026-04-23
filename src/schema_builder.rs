@@ -503,17 +503,21 @@ pub fn build_deferred_trigger_ddls(source_table: &str) -> Vec<String> {
     let upd_fn = safe_identifier(&format!("__reflex_upd_trigger_on_{}", safe_source));
     let upd_trig = safe_identifier(&format!("__reflex_trigger_upd_on_{}", safe_source));
     let upd_body = format!(
-        "DECLARE _rec RECORD; _sql TEXT; _stmt TEXT; _has_deferred BOOLEAN := FALSE; _has_rows BOOLEAN; \
+        "DECLARE _rec RECORD; _sql TEXT; _stmt TEXT; _has_deferred BOOLEAN := FALSE; _has_rows BOOLEAN; _pred_match BOOLEAN; \
          BEGIN \
            SELECT EXISTS(SELECT 1 FROM \"{ref_new}\" LIMIT 1) INTO _has_rows; \
            IF NOT _has_rows THEN RETURN NULL; END IF; \
            FOR _rec IN \
              SELECT name, base_query, end_query, aggregations::text AS aggregations, \
-                    COALESCE(refresh_mode, 'IMMEDIATE') AS refresh_mode \
+                    COALESCE(refresh_mode, 'IMMEDIATE') AS refresh_mode, where_predicate \
              FROM public.__reflex_ivm_reference \
              WHERE '{source_table}' = ANY(depends_on) AND enabled = TRUE \
              ORDER BY graph_depth \
            LOOP \
+             IF _rec.where_predicate IS NOT NULL THEN \
+               EXECUTE format('SELECT EXISTS(SELECT 1 FROM %I WHERE %s LIMIT 1)', '{ref_new}', _rec.where_predicate) INTO _pred_match; \
+               IF NOT _pred_match THEN CONTINUE; END IF; \
+             END IF; \
              IF _rec.refresh_mode = 'IMMEDIATE' THEN \
                PERFORM pg_advisory_xact_lock(hashtext(_rec.name)); \
                _sql := reflex_build_delta_sql(_rec.name, '{source_table}', 'UPDATE', _rec.base_query, _rec.end_query, _rec.aggregations, _rec.base_query); \

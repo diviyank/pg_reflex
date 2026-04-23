@@ -70,15 +70,7 @@ pub fn build_merge_sql(
                     ic.name, ic.name, ic.name
                 ));
             }
-            ("BOOL_OR", DeltaOp::Add) => {
-                set_clauses.push(format!(
-                    "\"{}\" = t.\"{}\" OR d.\"{}\"",
-                    ic.name, ic.name, ic.name
-                ));
-            }
-            ("MIN", DeltaOp::Subtract)
-            | ("MAX", DeltaOp::Subtract)
-            | ("BOOL_OR", DeltaOp::Subtract) => {
+            ("MIN", DeltaOp::Subtract) | ("MAX", DeltaOp::Subtract) => {
                 set_clauses.push(format!("\"{}\" = NULL", ic.name));
             }
             _ => {
@@ -243,15 +235,14 @@ fn build_net_delta_query(delta_old: &str, delta_new: &str, plan: &AggregationPla
     )
 }
 
-/// Build a SQL UPDATE that recomputes MIN/MAX/BOOL_OR columns from the original
+/// Build a SQL UPDATE that recomputes MIN/MAX columns from the original
 /// (un-delta-substituted) base_query for groups whose value was set to NULL
-/// by a subtract operation. Returns None if the plan has no MIN/MAX/BOOL_OR columns.
+/// by a subtract operation. Returns None if the plan has no MIN/MAX columns.
 ///
 /// The recompute source is `orig_base_query` as a subquery — this preserves any
-/// JOINs and aliases referenced by the aggregated expression (e.g.,
-/// `BOOL_OR(caav.product_id IS NOT NULL)` where `caav` is a LEFT JOIN alias).
-/// A scalar subquery `SELECT AGG(expr) FROM source_table WHERE …` would fail
-/// for such expressions because `source_table` alone doesn't expose the JOINs.
+/// JOINs and aliases referenced by the aggregated expression. A scalar subquery
+/// `SELECT AGG(expr) FROM source_table WHERE …` would fail for such expressions
+/// because `source_table` alone doesn't expose the JOINs.
 pub fn build_min_max_recompute_sql(
     intermediate_tbl: &str,
     plan: &AggregationPlan,
@@ -260,11 +251,7 @@ pub fn build_min_max_recompute_sql(
     let min_max_cols: Vec<&crate::aggregation::IntermediateColumn> = plan
         .intermediate_columns
         .iter()
-        .filter(|ic| {
-            ic.source_aggregate == "MIN"
-                || ic.source_aggregate == "MAX"
-                || ic.source_aggregate == "BOOL_OR"
-        })
+        .filter(|ic| ic.source_aggregate == "MIN" || ic.source_aggregate == "MAX")
         .collect();
 
     if min_max_cols.is_empty() {
@@ -336,6 +323,27 @@ fn null_safe_in(affected_tbl: &str, cols: &[String]) -> String {
         affected_tbl,
         conditions.join(" AND ")
     )
+}
+
+/// Splice an affected-groups filter into `end_query` immediately before its `GROUP BY` clause.
+///
+/// `output_gb_cols` must be pre-quoted column names matching `plan.group_by_columns`.
+/// Returns `None` if `end_query` contains no ` GROUP BY ` marker (defensive fallback).
+fn inject_affected_filter_before_group_by(
+    end_query: &str,
+    output_gb_cols: &[String],
+    affected_tbl: &str,
+) -> Option<String> {
+    let upper = end_query.to_uppercase();
+    let gb_marker = " GROUP BY ";
+    let pos = upper.rfind(gb_marker)?;
+    let filter = null_safe_in(affected_tbl, output_gb_cols);
+    Some(format!(
+        "{} AND {}{}",
+        &end_query[..pos],
+        filter,
+        &end_query[pos..]
+    ))
 }
 
 /// Build the group column list for targeted refresh.
@@ -443,7 +451,7 @@ fn push_merge_and_affected(
 ///
 /// Called from plpgsql trigger wrappers. Returns a delimiter-separated string
 /// of SQL statements for the plpgsql function to EXECUTE.
-#[pg_extern]
+#[pg_extern(parallel_safe)]
 pub fn reflex_build_delta_sql(
     view_name: &str,
     source_table: &str,
@@ -691,11 +699,10 @@ pub fn reflex_build_delta_sql(
             _ => {}
         }
     } else {
-        let has_min_max = plan.intermediate_columns.iter().any(|ic| {
-            ic.source_aggregate == "MIN"
-                || ic.source_aggregate == "MAX"
-                || ic.source_aggregate == "BOOL_OR"
-        });
+        let has_min_max = plan
+            .intermediate_columns
+            .iter()
+            .any(|ic| ic.source_aggregate == "MIN" || ic.source_aggregate == "MAX");
 
         match operation {
             "INSERT" => {
@@ -871,20 +878,72 @@ pub fn reflex_build_delta_sql(
 
         if end_query_has_group_by {
             let qv = quote_identifier(view_name);
-            stmts.push(format!("DELETE FROM {}", qv));
-            stmts.push(format!("INSERT INTO {} {}", qv, end_query));
+            if plan.group_by_columns.is_empty() {
+                // Global COUNT(DISTINCT) with no output GROUP BY — single output row, full rebuild.
+                stmts.push(format!("DELETE FROM {}", qv));
+                stmts.push(format!("INSERT INTO {} {}", qv, end_query));
+            } else {
+                let output_cols: Vec<String> = plan
+                    .group_by_columns
+                    .iter()
+                    .map(|c| format!("\"{}\"", normalized_column_name(c)))
+                    .collect();
+                match inject_affected_filter_before_group_by(end_query, &output_cols, &affected_tbl)
+                {
+                    Some(spliced_end_q) => {
+                        let ns_in = null_safe_in(&affected_tbl, &output_cols);
+                        let inner = format!(
+                            "DELETE FROM {qv} WHERE {ns}; \
+                             INSERT INTO {qv} {spliced};",
+                            qv = qv,
+                            ns = ns_in,
+                            spliced = spliced_end_q,
+                        );
+                        stmts.push(format!(
+                            "DO $reflex_refresh$ BEGIN \
+                               IF EXISTS(SELECT 1 FROM \"{aff}\") THEN {body} END IF; \
+                             END $reflex_refresh$",
+                            aff = affected_tbl,
+                            body = inner
+                        ));
+                    }
+                    None => {
+                        // No GROUP BY found — defensive fallback to full rebuild.
+                        stmts.push(format!("DELETE FROM {}", qv));
+                        stmts.push(format!("INSERT INTO {} {}", qv, end_query));
+                    }
+                }
+            }
             stmts.push(metadata_sql);
         } else if let Some(ref cols) = grp_cols {
             let qv = quote_identifier(view_name);
             let ns_in = null_safe_in(&affected_tbl, cols);
-            if include_dead_cleanup {
-                stmts.push(format!(
-                    "DELETE FROM {} WHERE __ivm_count <= 0",
-                    intermediate_tbl
-                ));
-            }
-            stmts.push(format!("DELETE FROM {} WHERE {}", qv, ns_in));
-            stmts.push(format!("INSERT INTO {} {} AND {}", qv, end_query, ns_in));
+            let inner = if include_dead_cleanup {
+                format!(
+                    "DELETE FROM {int} WHERE __ivm_count <= 0; \
+                     DELETE FROM {qv} WHERE {ns}; \
+                     INSERT INTO {qv} {eq} AND {ns};",
+                    int = intermediate_tbl,
+                    qv = qv,
+                    ns = ns_in,
+                    eq = end_query
+                )
+            } else {
+                format!(
+                    "DELETE FROM {qv} WHERE {ns}; \
+                     INSERT INTO {qv} {eq} AND {ns};",
+                    qv = qv,
+                    ns = ns_in,
+                    eq = end_query
+                )
+            };
+            stmts.push(format!(
+                "DO $reflex_refresh$ BEGIN \
+                   IF EXISTS(SELECT 1 FROM \"{aff}\") THEN {body} END IF; \
+                 END $reflex_refresh$",
+                aff = affected_tbl,
+                body = inner
+            ));
             stmts.push(metadata_sql);
         } else {
             let qv = quote_identifier(view_name);
@@ -899,7 +958,7 @@ pub fn reflex_build_delta_sql(
 
 /// Generates SQL statements to handle a TRUNCATE on a source table.
 /// TRUNCATE has no transition tables, so we clear intermediate + target entirely.
-#[pg_extern]
+#[pg_extern(parallel_safe)]
 pub fn reflex_build_truncate_sql(view_name: &str) -> String {
     let intermediate_tbl = intermediate_table_name(view_name);
 
@@ -949,7 +1008,7 @@ pub fn reflex_flush_deferred(source_table: &str) -> String {
     let delta_tbl = staging_delta_table_name(source_table);
 
     // Read all DEFERRED IMVs that depend on this source
-    let imvs: Vec<(String, String, String, String)> = Spi::connect(|client| {
+    let imvs: Vec<(String, String, String, String, Option<String>)> = Spi::connect(|client| {
         let args = [unsafe {
             DatumWithOid::new(
                 source_table.to_string(),
@@ -958,7 +1017,8 @@ pub fn reflex_flush_deferred(source_table: &str) -> String {
         }];
         client
             .select(
-                "SELECT name, base_query, end_query, aggregations::text AS aggregations \
+                "SELECT name, base_query, end_query, aggregations::text AS aggregations, \
+                        where_predicate \
                  FROM public.__reflex_ivm_reference \
                  WHERE $1 = ANY(depends_on) AND enabled = TRUE \
                    AND COALESCE(refresh_mode, 'IMMEDIATE') = 'DEFERRED' \
@@ -985,6 +1045,9 @@ pub fn reflex_flush_deferred(source_table: &str) -> String {
                         .unwrap_or(None)
                         .unwrap_or("{}")
                         .to_string(),
+                    row.get_by_name::<&str, _>("where_predicate")
+                        .unwrap_or(None)
+                        .map(|s: &str| s.to_string()),
                 )
             })
             .collect()
@@ -1028,6 +1091,13 @@ pub fn reflex_flush_deferred(source_table: &str) -> String {
             return;
         }
 
+        // Refresh planner stats on the staging delta so queries over it get correct
+        // row estimates (TRUNCATE resets stats to zero; without ANALYZE the planner
+        // assumes an empty table and may pick a bad plan).
+        client
+            .update(&format!("ANALYZE {}", delta_tbl), None, &[])
+            .unwrap_or_report();
+
         // Passthrough DELETE/UPDATE branches in reflex_build_delta_sql reference
         // the OLD transition table literally. That table only exists inside an
         // IMMEDIATE trigger's REFERENCING scope; here we're at COMMIT, so stand
@@ -1047,7 +1117,32 @@ pub fn reflex_flush_deferred(source_table: &str) -> String {
             )
             .unwrap_or_report();
 
-        for (imv_name, base_query, end_query, agg_json) in &imvs {
+        for (imv_name, base_query, end_query, agg_json, where_pred) in &imvs {
+            // Skip this IMV if where_predicate is set and no staged row matches it.
+            if let Some(pred) = where_pred {
+                let new_subq = format!(
+                    "(SELECT * FROM {} WHERE __reflex_op IN ('I', 'U_NEW'))",
+                    delta_tbl
+                );
+                let pred_sql = format!(
+                    "SELECT EXISTS(SELECT 1 FROM {} AS __pred_chk WHERE {} LIMIT 1)",
+                    new_subq, pred
+                );
+                let matched = client
+                    .select(&pred_sql, None, &[])
+                    .unwrap_or_report()
+                    .next()
+                    .map(|row| {
+                        row.get_by_name::<bool, _>("exists")
+                            .unwrap_or(None)
+                            .unwrap_or(false)
+                    })
+                    .unwrap_or(false);
+                if !matched {
+                    continue;
+                }
+            }
+
             // Acquire advisory lock for this IMV
             client
                 .update(

@@ -1022,11 +1022,10 @@ pub(crate) fn create_reflex_ivm_impl(
         }
 
         // Issue 4: Add index on source GROUP BY columns for MIN/MAX recompute performance
-        let has_min_max = plan.intermediate_columns.iter().any(|ic| {
-            ic.source_aggregate == "MIN"
-                || ic.source_aggregate == "MAX"
-                || ic.source_aggregate == "BOOL_OR"
-        });
+        let has_min_max = plan
+            .intermediate_columns
+            .iter()
+            .any(|ic| ic.source_aggregate == "MIN" || ic.source_aggregate == "MAX");
         if has_min_max && !plan.group_by_columns.is_empty() {
             for source in &froms {
                 if source.starts_with('<') || ivm_froms.contains(source) {

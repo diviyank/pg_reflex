@@ -180,3 +180,95 @@ fn test_resolve_column_type() {
     assert_eq!(resolve_column_type("name", &types, "TEXT"), "varchar");
     assert_eq!(resolve_column_type("unknown", &types, "TEXT"), "TEXT");
 }
+
+// ========================================================================
+// #12a — deferred UPDATE trigger body must check where_predicate
+// ========================================================================
+
+#[test]
+fn test_deferred_upd_body_contains_where_predicate_check() {
+    let ddls = build_deferred_trigger_ddls("orders");
+    let upd_ddl = &ddls[2];
+    assert!(
+        upd_ddl.contains("_rec.where_predicate IS NOT NULL"),
+        "deferred UPDATE DDL must check where_predicate before proceeding: {}",
+        &upd_ddl[..upd_ddl.len().min(400)]
+    );
+    let pred_pos = upd_ddl
+        .find("where_predicate")
+        .expect("where_predicate must appear in UPDATE DDL");
+    let lock_pos = upd_ddl
+        .find("pg_advisory_xact_lock")
+        .expect("advisory lock must appear in UPDATE DDL");
+    assert!(
+        pred_pos < lock_pos,
+        "predicate check must come before pg_advisory_xact_lock"
+    );
+}
+
+#[test]
+fn test_deferred_upd_body_declares_pred_match() {
+    let ddls = build_deferred_trigger_ddls("orders");
+    let upd_ddl = &ddls[2];
+    assert!(
+        upd_ddl.contains("_pred_match BOOLEAN"),
+        "deferred UPDATE DDL DECLARE section must include _pred_match BOOLEAN: {}",
+        &upd_ddl[..upd_ddl.len().min(400)]
+    );
+}
+
+// ── Phase B (#1): Algebraic BOOL_OR schema ──
+
+#[test]
+fn test_intermediate_ddl_bool_or_emits_bigint_counters() {
+    let plan = AggregationPlan {
+        group_by_columns: vec!["grp".to_string()],
+        intermediate_columns: vec![
+            IntermediateColumn {
+                name: "__bool_or_flag_true_count".to_string(),
+                pg_type: "BIGINT".to_string(),
+                source_aggregate: "SUM".to_string(),
+                source_arg: "CASE WHEN (flag) THEN 1 ELSE 0 END".to_string(),
+            },
+            IntermediateColumn {
+                name: "__bool_or_flag_nonnull_count".to_string(),
+                pg_type: "BIGINT".to_string(),
+                source_aggregate: "SUM".to_string(),
+                source_arg: "CASE WHEN (flag) IS NOT NULL THEN 1 ELSE 0 END".to_string(),
+            },
+        ],
+        end_query_mappings: vec![EndQueryMapping {
+            intermediate_expr: "CASE WHEN \"__bool_or_flag_nonnull_count\" > 0 THEN \"__bool_or_flag_true_count\" > 0 ELSE NULL END".to_string(),
+            output_alias: "has_any".to_string(),
+            aggregate_type: "BOOL_OR".to_string(),
+            cast_type: None,
+        }],
+        has_distinct: false,
+        needs_ivm_count: true,
+        distinct_columns: vec![],
+        is_passthrough: false,
+        passthrough_columns: vec![],
+        passthrough_key_mappings: std::collections::HashMap::new(),
+        having_clause: None,
+        not_null_columns: std::collections::HashSet::new(),
+        group_by_aliases: std::collections::HashMap::new(),
+        output_column_order: vec![],
+    };
+    let types = HashMap::new();
+    let ddl = build_intermediate_table_ddl("test_view", &plan, &types, false).unwrap();
+    assert!(
+        ddl.contains("\"__bool_or_flag_true_count\" BIGINT DEFAULT 0"),
+        "true_count must be BIGINT DEFAULT 0: {}",
+        ddl
+    );
+    assert!(
+        ddl.contains("\"__bool_or_flag_nonnull_count\" BIGINT DEFAULT 0"),
+        "nonnull_count must be BIGINT DEFAULT 0: {}",
+        ddl
+    );
+    assert!(
+        !ddl.contains("BOOLEAN"),
+        "algebraic BOOL_OR must not produce a BOOLEAN intermediate column: {}",
+        ddl
+    );
+}

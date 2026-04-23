@@ -39,6 +39,8 @@ The development is always in these steps:
 
 There's a few development journals in `discussion*.md` files.
 
+Use first LSP + ast-grep tools first to go through files. 
+
 
 # Priorities
 

@@ -213,13 +213,122 @@ fn test_having_only_min_creates_intermediate_column() {
 #[test]
 fn test_having_only_bool_or_creates_intermediate_column() {
     let plan = plan_from_sql("SELECT grp, COUNT(*) FROM t GROUP BY grp HAVING BOOL_OR(active)");
-    let has_bool_or = plan
+    // Algebraic BOOL_OR: two BIGINT SUM counter columns instead of one BOOLEAN column.
+    let has_true_count = plan
         .intermediate_columns
         .iter()
-        .any(|ic| ic.source_aggregate == "BOOL_OR" && ic.source_arg == "active");
+        .any(|ic| ic.name == "__bool_or_active_true_count" && ic.source_aggregate == "SUM");
+    let has_nonnull_count = plan
+        .intermediate_columns
+        .iter()
+        .any(|ic| ic.name == "__bool_or_active_nonnull_count" && ic.source_aggregate == "SUM");
     assert!(
-        has_bool_or,
-        "HAVING-only BOOL_OR(active) must add __bool_or_active"
+        has_true_count,
+        "HAVING BOOL_OR(active) must add __bool_or_active_true_count (SUM BIGINT): {:?}",
+        plan.intermediate_columns
+            .iter()
+            .map(|ic| (&ic.name, &ic.source_aggregate))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        has_nonnull_count,
+        "HAVING BOOL_OR(active) must add __bool_or_active_nonnull_count (SUM BIGINT): {:?}",
+        plan.intermediate_columns
+            .iter()
+            .map(|ic| (&ic.name, &ic.source_aggregate))
+            .collect::<Vec<_>>()
+    );
+    let has_raw = plan
+        .intermediate_columns
+        .iter()
+        .any(|ic| ic.source_aggregate == "BOOL_OR");
+    assert!(
+        !has_raw,
+        "algebraic BOOL_OR must not produce a raw BOOL_OR intermediate column"
+    );
+}
+
+#[test]
+fn test_plan_bool_or_emits_two_counter_columns() {
+    let plan = plan_from_sql("SELECT grp, BOOL_OR(flag) AS has_any FROM t GROUP BY grp");
+    let true_col = plan
+        .intermediate_columns
+        .iter()
+        .find(|ic| ic.name == "__bool_or_flag_true_count");
+    let nonnull_col = plan
+        .intermediate_columns
+        .iter()
+        .find(|ic| ic.name == "__bool_or_flag_nonnull_count");
+    assert!(
+        true_col.is_some(),
+        "BOOL_OR must emit __bool_or_flag_true_count: {:?}",
+        plan.intermediate_columns
+    );
+    assert!(
+        nonnull_col.is_some(),
+        "BOOL_OR must emit __bool_or_flag_nonnull_count: {:?}",
+        plan.intermediate_columns
+    );
+    assert_eq!(
+        true_col.unwrap().pg_type,
+        "BIGINT",
+        "true_count must be BIGINT"
+    );
+    assert_eq!(
+        nonnull_col.unwrap().pg_type,
+        "BIGINT",
+        "nonnull_count must be BIGINT"
+    );
+    assert_eq!(
+        true_col.unwrap().source_aggregate,
+        "SUM",
+        "true_count uses SUM aggregate"
+    );
+    assert_eq!(
+        nonnull_col.unwrap().source_aggregate,
+        "SUM",
+        "nonnull_count uses SUM aggregate"
+    );
+    assert_eq!(plan.end_query_mappings.len(), 1);
+    assert_eq!(plan.end_query_mappings[0].aggregate_type, "BOOL_OR");
+    assert_eq!(plan.end_query_mappings[0].output_alias, "has_any");
+}
+
+#[test]
+fn test_plan_bool_or_end_query_mapping_uses_case_expression() {
+    let plan = plan_from_sql("SELECT grp, BOOL_OR(flag) AS has_any FROM t GROUP BY grp");
+    let mapping = &plan.end_query_mappings[0];
+    assert!(
+        mapping.intermediate_expr.contains("CASE WHEN"),
+        "BOOL_OR end query must use CASE expression: {}",
+        mapping.intermediate_expr
+    );
+    assert!(
+        mapping
+            .intermediate_expr
+            .contains("__bool_or_flag_nonnull_count"),
+        "CASE expression must reference nonnull_count: {}",
+        mapping.intermediate_expr
+    );
+    assert!(
+        mapping
+            .intermediate_expr
+            .contains("__bool_or_flag_true_count"),
+        "CASE expression must reference true_count: {}",
+        mapping.intermediate_expr
+    );
+}
+
+#[test]
+fn test_plan_bool_or_no_raw_bool_or_aggregate() {
+    let plan = plan_from_sql("SELECT grp, BOOL_OR(flag) FROM t GROUP BY grp");
+    assert!(
+        !plan
+            .intermediate_columns
+            .iter()
+            .any(|ic| ic.source_aggregate == "BOOL_OR"),
+        "BOOL_OR must not produce a raw BOOL_OR aggregate column (algebraic only): {:?}",
+        plan.intermediate_columns
     );
 }
 
