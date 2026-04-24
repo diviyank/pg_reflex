@@ -7,14 +7,14 @@ use std::collections::HashMap;
 
 use crate::aggregation::plan_aggregation;
 use crate::query_decomposer::{
-    bare_column_name, generate_aggregations_json, generate_base_query, generate_end_query,
-    intermediate_table_name, normalized_column_name, quote_identifier, replace_identifier,
-    safe_identifier, split_qualified_name,
+    bare_column_name, format_pg_text_array_literal, generate_aggregations_json,
+    generate_base_query, generate_end_query, intermediate_table_name, normalized_column_name,
+    quote_identifier, replace_identifier, safe_identifier, split_qualified_name,
 };
 use crate::schema_builder::{
-    build_deferred_flush_ddl, build_deferred_trigger_ddls, build_indexes_ddl,
-    build_intermediate_table_ddl, build_staging_table_ddl, build_target_table_ddl,
-    build_trigger_ddls, resolve_column_type,
+    build_deferred_flush_ddl, build_deferred_trigger_ddls, build_delta_scratch_table_ddl,
+    build_indexes_ddl, build_intermediate_table_ddl, build_passthrough_scratch_ddls,
+    build_staging_table_ddl, build_target_table_ddl, build_trigger_ddls, resolve_column_type,
 };
 use crate::sql_analyzer::{analyze, SqlAnalysisError};
 use crate::validate_view_name;
@@ -149,21 +149,21 @@ pub(crate) fn create_reflex_ivm_impl(
                       graph_child, sql_query, base_query, end_query,
                       aggregations, index_columns, unique_columns, enabled, last_update_date,
                       storage_mode, refresh_mode)
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::json, $11, $12, TRUE, NOW(), $13, $14)",
+                     VALUES ($1, $2, $3::TEXT[], $4::TEXT[], $5::TEXT[], $6::TEXT[], $7, $8, $9, $10::json, $11::TEXT[], $12::TEXT[], TRUE, NOW(), $13, $14)",
                     None,
                     &[
                         unsafe { DatumWithOid::new(view_name.to_string(), PgBuiltInOids::TEXTOID.oid().value()) },
                         unsafe { DatumWithOid::new(depth, PgBuiltInOids::INT4OID.oid().value()) },
-                        unsafe { DatumWithOid::new(depends_on, PgBuiltInOids::TEXTARRAYOID.oid().value()) },
-                        unsafe { DatumWithOid::new(depends_on_imv.clone(), PgBuiltInOids::TEXTARRAYOID.oid().value()) },
-                        unsafe { DatumWithOid::new(Vec::<String>::new(), PgBuiltInOids::TEXTARRAYOID.oid().value()) },
-                        unsafe { DatumWithOid::new(graph_child, PgBuiltInOids::TEXTARRAYOID.oid().value()) },
+                        unsafe { DatumWithOid::new(format_pg_text_array_literal(&depends_on), PgBuiltInOids::TEXTOID.oid().value()) },
+                        unsafe { DatumWithOid::new(format_pg_text_array_literal(&depends_on_imv), PgBuiltInOids::TEXTOID.oid().value()) },
+                        unsafe { DatumWithOid::new(String::from("{}"), PgBuiltInOids::TEXTOID.oid().value()) },
+                        unsafe { DatumWithOid::new(format_pg_text_array_literal(&graph_child), PgBuiltInOids::TEXTOID.oid().value()) },
                         unsafe { DatumWithOid::new(sql.to_string(), PgBuiltInOids::TEXTOID.oid().value()) },
                         unsafe { DatumWithOid::new(view_sql.clone(), PgBuiltInOids::TEXTOID.oid().value()) },
                         unsafe { DatumWithOid::new(String::new(), PgBuiltInOids::TEXTOID.oid().value()) },
                         unsafe { DatumWithOid::new("{}".to_string(), PgBuiltInOids::TEXTOID.oid().value()) },
-                        unsafe { DatumWithOid::new(Vec::<String>::new(), PgBuiltInOids::TEXTARRAYOID.oid().value()) },
-                        unsafe { DatumWithOid::new(Vec::<String>::new(), PgBuiltInOids::TEXTARRAYOID.oid().value()) },
+                        unsafe { DatumWithOid::new(String::from("{}"), PgBuiltInOids::TEXTOID.oid().value()) },
+                        unsafe { DatumWithOid::new(String::from("{}"), PgBuiltInOids::TEXTOID.oid().value()) },
                         unsafe { DatumWithOid::new(storage_upper.clone(), PgBuiltInOids::TEXTOID.oid().value()) },
                         unsafe { DatumWithOid::new(mode_upper.clone(), PgBuiltInOids::TEXTOID.oid().value()) },
                     ],
@@ -232,21 +232,21 @@ pub(crate) fn create_reflex_ivm_impl(
                       graph_child, sql_query, base_query, end_query,
                       aggregations, index_columns, unique_columns, enabled, last_update_date,
                       storage_mode, refresh_mode)
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::json, $11, $12, TRUE, NOW(), $13, $14)",
+                     VALUES ($1, $2, $3::TEXT[], $4::TEXT[], $5::TEXT[], $6::TEXT[], $7, $8, $9, $10::json, $11::TEXT[], $12::TEXT[], TRUE, NOW(), $13, $14)",
                     None,
                     &[
                         unsafe { DatumWithOid::new(view_name.to_string(), PgBuiltInOids::TEXTOID.oid().value()) },
                         unsafe { DatumWithOid::new(depth, PgBuiltInOids::INT4OID.oid().value()) },
-                        unsafe { DatumWithOid::new(depends_on, PgBuiltInOids::TEXTARRAYOID.oid().value()) },
-                        unsafe { DatumWithOid::new(depends_on_imv.clone(), PgBuiltInOids::TEXTARRAYOID.oid().value()) },
-                        unsafe { DatumWithOid::new(Vec::<String>::new(), PgBuiltInOids::TEXTARRAYOID.oid().value()) },
-                        unsafe { DatumWithOid::new(graph_child, PgBuiltInOids::TEXTARRAYOID.oid().value()) },
+                        unsafe { DatumWithOid::new(format_pg_text_array_literal(&depends_on), PgBuiltInOids::TEXTOID.oid().value()) },
+                        unsafe { DatumWithOid::new(format_pg_text_array_literal(&depends_on_imv), PgBuiltInOids::TEXTOID.oid().value()) },
+                        unsafe { DatumWithOid::new(String::from("{}"), PgBuiltInOids::TEXTOID.oid().value()) },
+                        unsafe { DatumWithOid::new(format_pg_text_array_literal(&graph_child), PgBuiltInOids::TEXTOID.oid().value()) },
                         unsafe { DatumWithOid::new(sql.to_string(), PgBuiltInOids::TEXTOID.oid().value()) },
                         unsafe { DatumWithOid::new(view_sql.clone(), PgBuiltInOids::TEXTOID.oid().value()) },
                         unsafe { DatumWithOid::new(String::new(), PgBuiltInOids::TEXTOID.oid().value()) },
                         unsafe { DatumWithOid::new("{}".to_string(), PgBuiltInOids::TEXTOID.oid().value()) },
-                        unsafe { DatumWithOid::new(Vec::<String>::new(), PgBuiltInOids::TEXTARRAYOID.oid().value()) },
-                        unsafe { DatumWithOid::new(Vec::<String>::new(), PgBuiltInOids::TEXTARRAYOID.oid().value()) },
+                        unsafe { DatumWithOid::new(String::from("{}"), PgBuiltInOids::TEXTOID.oid().value()) },
+                        unsafe { DatumWithOid::new(String::from("{}"), PgBuiltInOids::TEXTOID.oid().value()) },
                         unsafe { DatumWithOid::new(storage_upper.clone(), PgBuiltInOids::TEXTOID.oid().value()) },
                         unsafe { DatumWithOid::new(mode_upper.clone(), PgBuiltInOids::TEXTOID.oid().value()) },
                     ],
@@ -392,20 +392,20 @@ pub(crate) fn create_reflex_ivm_impl(
                   graph_child, sql_query, base_query, end_query,
                   aggregations, index_columns, unique_columns, enabled, last_update_date,
                   storage_mode, refresh_mode)
-                 VALUES ($1, 2, $2, $3, $4, $5, $6, $7, $8, $9::json, $10, $11, TRUE, NOW(), $12, $13)",
+                 VALUES ($1, 2, $2::TEXT[], $3::TEXT[], $4::TEXT[], $5::TEXT[], $6, $7, $8, $9::json, $10::TEXT[], $11::TEXT[], TRUE, NOW(), $12, $13)",
                 None,
                 &[
                     unsafe { DatumWithOid::new(view_name.to_string(), PgBuiltInOids::TEXTOID.oid().value()) },
-                    unsafe { DatumWithOid::new(depends_on, PgBuiltInOids::TEXTARRAYOID.oid().value()) },
-                    unsafe { DatumWithOid::new(depends_on_imv.clone(), PgBuiltInOids::TEXTARRAYOID.oid().value()) },
-                    unsafe { DatumWithOid::new(Vec::<String>::new(), PgBuiltInOids::TEXTARRAYOID.oid().value()) },
-                    unsafe { DatumWithOid::new(Vec::<String>::new(), PgBuiltInOids::TEXTARRAYOID.oid().value()) },
+                    unsafe { DatumWithOid::new(format_pg_text_array_literal(&depends_on), PgBuiltInOids::TEXTOID.oid().value()) },
+                    unsafe { DatumWithOid::new(format_pg_text_array_literal(&depends_on_imv), PgBuiltInOids::TEXTOID.oid().value()) },
+                    unsafe { DatumWithOid::new(String::from("{}"), PgBuiltInOids::TEXTOID.oid().value()) },
+                    unsafe { DatumWithOid::new(String::from("{}"), PgBuiltInOids::TEXTOID.oid().value()) },
                     unsafe { DatumWithOid::new(sql.to_string(), PgBuiltInOids::TEXTOID.oid().value()) },
                     unsafe { DatumWithOid::new(view_sql.clone(), PgBuiltInOids::TEXTOID.oid().value()) },
                     unsafe { DatumWithOid::new(String::new(), PgBuiltInOids::TEXTOID.oid().value()) },
                     unsafe { DatumWithOid::new("{}".to_string(), PgBuiltInOids::TEXTOID.oid().value()) },
-                    unsafe { DatumWithOid::new(Vec::<String>::new(), PgBuiltInOids::TEXTARRAYOID.oid().value()) },
-                    unsafe { DatumWithOid::new(Vec::<String>::new(), PgBuiltInOids::TEXTARRAYOID.oid().value()) },
+                    unsafe { DatumWithOid::new(String::from("{}"), PgBuiltInOids::TEXTOID.oid().value()) },
+                    unsafe { DatumWithOid::new(String::from("{}"), PgBuiltInOids::TEXTOID.oid().value()) },
                     unsafe { DatumWithOid::new(storage_upper.clone(), PgBuiltInOids::TEXTOID.oid().value()) },
                     unsafe { DatumWithOid::new(mode_upper.clone(), PgBuiltInOids::TEXTOID.oid().value()) },
                 ],
@@ -494,20 +494,20 @@ pub(crate) fn create_reflex_ivm_impl(
                   graph_child, sql_query, base_query, end_query,
                   aggregations, index_columns, unique_columns, enabled, last_update_date,
                   storage_mode, refresh_mode)
-                 VALUES ($1, 2, $2, $3, $4, $5, $6, $7, $8, $9::json, $10, $11, TRUE, NOW(), $12, $13)",
+                 VALUES ($1, 2, $2::TEXT[], $3::TEXT[], $4::TEXT[], $5::TEXT[], $6, $7, $8, $9::json, $10::TEXT[], $11::TEXT[], TRUE, NOW(), $12, $13)",
                 None,
                 &[
                     unsafe { DatumWithOid::new(view_name.to_string(), PgBuiltInOids::TEXTOID.oid().value()) },
-                    unsafe { DatumWithOid::new(depends_on, PgBuiltInOids::TEXTARRAYOID.oid().value()) },
-                    unsafe { DatumWithOid::new(depends_on_imv.clone(), PgBuiltInOids::TEXTARRAYOID.oid().value()) },
-                    unsafe { DatumWithOid::new(Vec::<String>::new(), PgBuiltInOids::TEXTARRAYOID.oid().value()) },
-                    unsafe { DatumWithOid::new(Vec::<String>::new(), PgBuiltInOids::TEXTARRAYOID.oid().value()) },
+                    unsafe { DatumWithOid::new(format_pg_text_array_literal(&depends_on), PgBuiltInOids::TEXTOID.oid().value()) },
+                    unsafe { DatumWithOid::new(format_pg_text_array_literal(&depends_on_imv), PgBuiltInOids::TEXTOID.oid().value()) },
+                    unsafe { DatumWithOid::new(String::from("{}"), PgBuiltInOids::TEXTOID.oid().value()) },
+                    unsafe { DatumWithOid::new(String::from("{}"), PgBuiltInOids::TEXTOID.oid().value()) },
                     unsafe { DatumWithOid::new(sql.to_string(), PgBuiltInOids::TEXTOID.oid().value()) },
                     unsafe { DatumWithOid::new(view_sql.clone(), PgBuiltInOids::TEXTOID.oid().value()) },
                     unsafe { DatumWithOid::new(String::new(), PgBuiltInOids::TEXTOID.oid().value()) },
                     unsafe { DatumWithOid::new("{}".to_string(), PgBuiltInOids::TEXTOID.oid().value()) },
-                    unsafe { DatumWithOid::new(Vec::<String>::new(), PgBuiltInOids::TEXTARRAYOID.oid().value()) },
-                    unsafe { DatumWithOid::new(Vec::<String>::new(), PgBuiltInOids::TEXTARRAYOID.oid().value()) },
+                    unsafe { DatumWithOid::new(String::from("{}"), PgBuiltInOids::TEXTOID.oid().value()) },
+                    unsafe { DatumWithOid::new(String::from("{}"), PgBuiltInOids::TEXTOID.oid().value()) },
                     unsafe { DatumWithOid::new(storage_upper.clone(), PgBuiltInOids::TEXTOID.oid().value()) },
                     unsafe { DatumWithOid::new(mode_upper.clone(), PgBuiltInOids::TEXTOID.oid().value()) },
                 ],
@@ -558,6 +558,14 @@ pub(crate) fn create_reflex_ivm_impl(
         let mut cte_name_map: Vec<(String, String)> = Vec::new();
 
         for cte in &analysis.ctes {
+            let alias_lower = cte.alias.to_lowercase();
+            if alias_lower.starts_with("__reflex_new_")
+                || alias_lower.starts_with("__reflex_old_")
+                || alias_lower.starts_with("__reflex_delta_")
+            {
+                return "ERROR: CTE alias conflicts with pg_reflex reserved prefix (__reflex_new_/old_/delta_)";
+            }
+
             // Rewrite references to earlier CTEs in this CTE's query
             let mut cte_query = cte.query_sql.clone();
             for (earlier_alias, earlier_imv) in &cte_name_map {
@@ -785,15 +793,66 @@ pub(crate) fn create_reflex_ivm_impl(
         return "ERROR: IMV with this name already exists";
     }
 
+    // Bug #10: reject creation if it would form a cycle in the dependency DAG.
+    // Traverse depends_on edges reachable from froms; if view_name appears, it's a cycle.
+    // UNION (not UNION ALL) prevents infinite loops when the existing graph already has cycles.
+    //
+    // We deliberately avoid `.first().get_one::<bool>()` here: in pgrx 0.18 that path
+    // calls `PgMemoryContexts::CurrentMemoryContext.parent()`, which segfaults when
+    // CurrentMemoryContext is NULL in this call context (observed on PG 17.7). Instead
+    // we project the match rows directly and check whether the result set is non-empty,
+    // mirroring the duplicate-name probe above (line 776).
+    let cycle_detected = if froms.is_empty() {
+        false
+    } else {
+        Spi::connect(|client| {
+            let args = [
+                unsafe {
+                    DatumWithOid::new(
+                        format_pg_text_array_literal(&froms),
+                        PgBuiltInOids::TEXTOID.oid().value(),
+                    )
+                },
+                unsafe {
+                    DatumWithOid::new(view_name.to_string(), PgBuiltInOids::TEXTOID.oid().value())
+                },
+            ];
+            !client
+                .select(
+                    "WITH RECURSIVE dep_graph(dep) AS (\
+                        SELECT unnest(depends_on) \
+                        FROM public.__reflex_ivm_reference \
+                        WHERE name = ANY($1::TEXT[]) \
+                        UNION \
+                        SELECT unnest(r.depends_on) \
+                        FROM dep_graph dg \
+                        JOIN public.__reflex_ivm_reference r ON r.name = dg.dep \
+                    ) \
+                    SELECT 1 FROM dep_graph WHERE dep = $2 LIMIT 1",
+                    Some(1),
+                    &args,
+                )
+                .unwrap_or_report()
+                .collect::<Vec<_>>()
+                .is_empty()
+        })
+    };
+    if cycle_detected {
+        return "ERROR: circular dependency detected — this IMV would form a cycle in the dependency graph";
+    }
+
     Spi::connect_mut(|client| {
         // Lookup existing IMVs among the source tables
         let args = [unsafe {
-            DatumWithOid::new(froms.clone(), PgBuiltInOids::TEXTARRAYOID.oid().value())
+            DatumWithOid::new(
+                format_pg_text_array_literal(&froms),
+                PgBuiltInOids::TEXTOID.oid().value(),
+            )
         }];
 
         let matching_froms = client
             .select(
-                "SELECT name, graph_depth FROM public.__reflex_ivm_reference WHERE name = ANY($1)",
+                "SELECT name, graph_depth FROM public.__reflex_ivm_reference WHERE name = ANY($1::TEXT[])",
                 None,
                 &args,
             )
@@ -859,6 +918,20 @@ pub(crate) fn create_reflex_ivm_impl(
                     )
                     .unwrap_or_report();
             }
+
+            // Passthrough scratch tables: one new-side + one old-side per real source.
+            // Populated at trigger time from the transition tables so downstream DML
+            // (DELETE ... WHERE IN (SELECT FROM transition), INSERT ... SELECT FROM transition)
+            // reads from a plain table, not a transition table — avoids the nested-trigger
+            // transition-table-in-EXECUTE assertion.
+            for source in &froms {
+                if source.starts_with('<') {
+                    continue;
+                }
+                for ddl in build_passthrough_scratch_ddls(view_name, source) {
+                    client.update(&ddl, None, &[]).unwrap_or_report();
+                }
+            }
         } else {
             // Aggregate: build intermediate + target tables from the plan
             let (mut column_types, not_null_cols) = query_column_types_from_catalog(client, &froms);
@@ -907,6 +980,13 @@ pub(crate) fn create_reflex_ivm_impl(
                 let tbl = intermediate_table_name(view_name);
                 client.update(&ddl, None, &[]).unwrap_or_report();
                 unlogged_tables.push(tbl);
+                // Delta scratch table: materialized intermediate for MERGE (avoids
+                // transition-table-in-EXECUTE SIGABRT). Always UNLOGGED, no indexes.
+                if let Some(scratch_ddl) =
+                    build_delta_scratch_table_ddl(view_name, &plan, &column_types)
+                {
+                    client.update(&scratch_ddl, None, &[]).unwrap_or_report();
+                }
             }
 
             let target_ddl = build_target_table_ddl(view_name, &plan, &column_types, logged);
@@ -1116,21 +1196,21 @@ pub(crate) fn create_reflex_ivm_impl(
               graph_child, sql_query, base_query, end_query,
               aggregations, index_columns, unique_columns, enabled, last_update_date,
               storage_mode, refresh_mode, where_predicate)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::json, $11, $12, TRUE, NOW(), $13, $14, NULLIF($15, ''))",
+             VALUES ($1, $2, $3::TEXT[], $4::TEXT[], $5::TEXT[], $6::TEXT[], $7, $8, $9, $10::json, $11::TEXT[], $12::TEXT[], TRUE, NOW(), $13, $14, NULLIF($15, ''))",
             None,
             &[
                 unsafe { DatumWithOid::new(view_name.to_string(), PgBuiltInOids::TEXTOID.oid().value()) },
                 unsafe { DatumWithOid::new(depth, PgBuiltInOids::INT4OID.oid().value()) },
-                unsafe { DatumWithOid::new(depends_on, PgBuiltInOids::TEXTARRAYOID.oid().value()) },
-                unsafe { DatumWithOid::new(depends_on_imv, PgBuiltInOids::TEXTARRAYOID.oid().value()) },
-                unsafe { DatumWithOid::new(unlogged_tables.clone(), PgBuiltInOids::TEXTARRAYOID.oid().value()) },
-                unsafe { DatumWithOid::new(graph_child, PgBuiltInOids::TEXTARRAYOID.oid().value()) },
+                unsafe { DatumWithOid::new(format_pg_text_array_literal(&depends_on), PgBuiltInOids::TEXTOID.oid().value()) },
+                unsafe { DatumWithOid::new(format_pg_text_array_literal(&depends_on_imv), PgBuiltInOids::TEXTOID.oid().value()) },
+                unsafe { DatumWithOid::new(format_pg_text_array_literal(&unlogged_tables), PgBuiltInOids::TEXTOID.oid().value()) },
+                unsafe { DatumWithOid::new(format_pg_text_array_literal(&graph_child), PgBuiltInOids::TEXTOID.oid().value()) },
                 unsafe { DatumWithOid::new(sql.to_string(), PgBuiltInOids::TEXTOID.oid().value()) },
                 unsafe { DatumWithOid::new(base_query, PgBuiltInOids::TEXTOID.oid().value()) },
                 unsafe { DatumWithOid::new(end_query.clone(), PgBuiltInOids::TEXTOID.oid().value()) },
                 unsafe { DatumWithOid::new(aggregations_json, PgBuiltInOids::TEXTOID.oid().value()) },
-                unsafe { DatumWithOid::new(index_columns, PgBuiltInOids::TEXTARRAYOID.oid().value()) },
-                unsafe { DatumWithOid::new(resolved_unique_columns.clone(), PgBuiltInOids::TEXTARRAYOID.oid().value()) },
+                unsafe { DatumWithOid::new(format_pg_text_array_literal(&index_columns), PgBuiltInOids::TEXTOID.oid().value()) },
+                unsafe { DatumWithOid::new(format_pg_text_array_literal(&resolved_unique_columns), PgBuiltInOids::TEXTOID.oid().value()) },
                 unsafe { DatumWithOid::new(storage_upper.clone(), PgBuiltInOids::TEXTOID.oid().value()) },
                 unsafe { DatumWithOid::new(mode_upper.clone(), PgBuiltInOids::TEXTOID.oid().value()) },
                 unsafe { DatumWithOid::new(where_predicate, PgBuiltInOids::TEXTOID.oid().value()) },

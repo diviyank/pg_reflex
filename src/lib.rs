@@ -1,8 +1,23 @@
 use pgrx::prelude::*;
 
+// Stub archive for `cargo test --lib` on Linux.
+//
+// The test binary links natively and pgrx_pg_sys drags in unresolved refs
+// to postgres server symbols (errstart, palloc0, CurrentMemoryContext, ...)
+// that only exist when the .so is loaded into postgres. build.rs builds a
+// static archive of weak stubs to satisfy these references. The `#[link]`
+// directive below is scoped to `cfg(test)` so the archive is ONLY pulled in
+// by the test binary — the cdylib postgres actually dlopens stays free of
+// stub variables that would otherwise shadow PG's real globals and segfault
+// every SPI call (observed on PG 17.7 as SIGSEGV / SIGABRT under cassert).
+#[cfg(all(test, target_os = "linux"))]
+#[link(name = "pg_reflex_pg_stubs", kind = "static")]
+unsafe extern "C" {}
+
 mod aggregation;
 mod create_ivm;
 mod drop_ivm;
+mod introspect;
 mod query_decomposer;
 mod reconcile;
 mod schema_builder;
@@ -34,7 +49,11 @@ extension_sql!(
         last_update_date TIMESTAMP,
         storage_mode TEXT DEFAULT 'UNLOGGED',
         refresh_mode TEXT DEFAULT 'IMMEDIATE',
-        where_predicate TEXT
+        where_predicate TEXT,
+        last_flush_ms BIGINT,
+        last_flush_rows BIGINT,
+        flush_count BIGINT DEFAULT 0,
+        last_error TEXT
     );
 
     -- Index on name for fast lookups
@@ -141,6 +160,69 @@ fn refresh_imv_depending_on(source: &str) -> &'static str {
     reconcile::refresh_imv_depending_on(source)
 }
 
+/// Rebuild an IMV from scratch to fix drift. Alias for reflex_reconcile.
+#[pg_extern]
+fn reflex_rebuild_imv(view_name: &str) -> &'static str {
+    reconcile::reflex_reconcile(view_name)
+}
+
+extension_sql!(
+    r#"
+    CREATE OR REPLACE FUNCTION public.__reflex_on_sql_drop()
+    RETURNS event_trigger LANGUAGE plpgsql AS $$
+    DECLARE
+        _obj RECORD;
+    BEGIN
+        FOR _obj IN
+            SELECT object_identity
+            FROM pg_event_trigger_dropped_objects()
+            WHERE object_type = 'table'
+        LOOP
+            DELETE FROM public.__reflex_ivm_reference
+            WHERE depends_on @> ARRAY[_obj.object_identity]
+               OR depends_on @> ARRAY[split_part(_obj.object_identity, '.', 2)];
+        END LOOP;
+    END;
+    $$;
+
+    CREATE EVENT TRIGGER reflex_on_sql_drop
+        ON sql_drop
+        EXECUTE FUNCTION public.__reflex_on_sql_drop();
+
+    CREATE OR REPLACE FUNCTION public.__reflex_on_ddl_command_end()
+    RETURNS event_trigger LANGUAGE plpgsql AS $$
+    DECLARE
+        _cmd RECORD;
+        _imv RECORD;
+        _src TEXT;
+    BEGIN
+        FOR _cmd IN
+            SELECT object_identity, command_tag
+            FROM pg_event_trigger_ddl_commands()
+            WHERE command_tag = 'ALTER TABLE'
+        LOOP
+            _src := _cmd.object_identity;
+            FOR _imv IN
+                SELECT name FROM public.__reflex_ivm_reference
+                WHERE depends_on @> ARRAY[_src]
+                   OR depends_on @> ARRAY[split_part(_src, '.', 2)]
+            LOOP
+                RAISE WARNING 'pg_reflex: source table % was altered; IMV % may be stale — run SELECT reflex_rebuild_imv(''%'') to recover',
+                    _src, _imv.name, _imv.name;
+            END LOOP;
+        END LOOP;
+    END;
+    $$;
+
+    CREATE EVENT TRIGGER reflex_on_ddl_command_end
+        ON ddl_command_end
+        WHEN TAG IN ('ALTER TABLE')
+        EXECUTE FUNCTION public.__reflex_on_ddl_command_end();
+    "#,
+    name = "pg_reflex_event_trigger",
+    requires = ["pg_reflex_init"],
+);
+
 #[cfg(any(test, feature = "pg_test"))]
 #[pg_schema]
 mod tests {
@@ -185,6 +267,8 @@ mod tests {
     include!("tests/pg_test_correctness.rs");
     include!("tests/pg_test_filter.rs");
     include!("tests/pg_test_distinct_on.rs");
+    include!("tests/pg_test_1_2_0.rs");
+    include!("tests/pg_test_no_sigabrt.rs");
 }
 
 /// This module is required by `cargo pgrx test` invocations.

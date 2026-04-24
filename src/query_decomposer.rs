@@ -25,6 +25,41 @@ pub fn quote_identifier(name: &str) -> String {
     }
 }
 
+/// Format a slice of strings as a PostgreSQL array literal in TEXT form
+/// (e.g. `{"a","b","c"}`). Use with a `::TEXT[]` cast on the SQL side.
+///
+/// Motivation: pgrx 0.16/0.18 on PG 17.7 cassert builds trips a
+/// `MemoryContextIsValid(context)` assertion when `DatumWithOid::new(Vec<String>,
+/// TEXTARRAYOID)` is passed as an SPI parameter — `initArrayResult` fires with a
+/// CurrentMemoryContext that PG considers invalid. Avoiding the ArrayResult code
+/// path entirely by shipping the array as a TEXT scalar and letting the server
+/// parse it sidesteps the crash.
+///
+/// Empty slice returns `{}`. Each element is double-quoted; embedded `"` and `\`
+/// are backslash-escaped per PG's array input syntax.
+pub fn format_pg_text_array_literal(values: &[String]) -> String {
+    let mut out = String::with_capacity(values.iter().map(|v| v.len() + 3).sum::<usize>() + 2);
+    out.push('{');
+    for (i, v) in values.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push('"');
+        for ch in v.chars() {
+            match ch {
+                '\\' | '"' => {
+                    out.push('\\');
+                    out.push(ch);
+                }
+                _ => out.push(ch),
+            }
+        }
+        out.push('"');
+    }
+    out.push('}');
+    out
+}
+
 /// Ensure an identifier fits within PostgreSQL's NAMEDATALEN limit (63 chars).
 /// If the raw name exceeds 63 characters, truncate and append a hash suffix
 /// so that distinct input names remain distinct after truncation.
@@ -82,6 +117,39 @@ pub fn transition_old_table_name(source_table: &str) -> String {
 pub fn staging_delta_table_name(source_table: &str) -> String {
     safe_identifier(&format!(
         "__reflex_delta_{}",
+        sanitized_source_suffix(source_table)
+    ))
+}
+
+/// Name of the per-IMV UNLOGGED delta scratch table used to materialize the
+/// grouped delta before issuing MERGE (avoids referencing transition tables
+/// inside EXECUTE'd MERGE statements, which trips a PG assert).
+pub fn delta_scratch_table_name(view_name: &str) -> String {
+    safe_identifier(&format!(
+        "__reflex_scratch_{}",
+        split_qualified_name(view_name).1
+    ))
+}
+
+/// Name of the per-(IMV, source) UNLOGGED NEW-side passthrough scratch table.
+/// Used to materialize the NEW transition for passthrough IMVs so that
+/// downstream DML never references a transition table inside EXECUTE — which
+/// trips a PG assertion in nested-trigger contexts (cf. delta scratch above).
+pub fn passthrough_scratch_new_table_name(view_name: &str, source_table: &str) -> String {
+    safe_identifier(&format!(
+        "__reflex_pt_new_{}_{}",
+        split_qualified_name(view_name).1,
+        sanitized_source_suffix(source_table)
+    ))
+}
+
+/// Name of the per-(IMV, source) UNLOGGED OLD-side passthrough scratch table.
+/// Separate from the NEW-side scratch to keep DELETE-then-INSERT ordering
+/// correct under UPDATE (the DELETE reads OLD while INSERT reads NEW).
+pub fn passthrough_scratch_old_table_name(view_name: &str, source_table: &str) -> String {
+    safe_identifier(&format!(
+        "__reflex_pt_old_{}_{}",
+        split_qualified_name(view_name).1,
         sanitized_source_suffix(source_table)
     ))
 }

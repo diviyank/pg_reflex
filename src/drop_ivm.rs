@@ -3,7 +3,8 @@ use pgrx::pg_sys::panic::ErrorReportable;
 use pgrx::prelude::*;
 
 use crate::query_decomposer::{
-    intermediate_table_name, quote_identifier, safe_identifier, split_qualified_name,
+    delta_scratch_table_name, intermediate_table_name, passthrough_scratch_new_table_name,
+    passthrough_scratch_old_table_name, quote_identifier, safe_identifier, split_qualified_name,
 };
 
 pub(crate) fn drop_reflex_ivm_impl(view_name: &str, cascade: bool) -> &'static str {
@@ -162,6 +163,36 @@ pub(crate) fn drop_reflex_ivm_impl(view_name: &str, cascade: bool) -> &'static s
                 &[],
             )
             .unwrap_or_report();
+
+        // 6c. Drop delta scratch table
+        client
+            .update(
+                &format!(
+                    "DROP TABLE IF EXISTS \"{}\"{}",
+                    delta_scratch_table_name(view_name),
+                    cascade_suffix
+                ),
+                None,
+                &[],
+            )
+            .unwrap_or_report();
+
+        // 6d. Drop passthrough scratch tables (one new-side + one old-side per source).
+        //     DROP ... IF EXISTS is harmless when the IMV is an aggregate.
+        for source in &depends_on {
+            for tbl in [
+                passthrough_scratch_new_table_name(view_name, source),
+                passthrough_scratch_old_table_name(view_name, source),
+            ] {
+                client
+                    .update(
+                        &format!("DROP TABLE IF EXISTS \"{}\"{}", tbl, cascade_suffix),
+                        None,
+                        &[],
+                    )
+                    .unwrap_or_report();
+            }
+        }
 
         // 7. Update parent IMVs: remove this view from their graph_child
         for parent in &depends_on_imv {

@@ -8,11 +8,7 @@ repository = "https://github.com/diviyank/pg_reflex"
 authors = ["Diviyan Kalainathan"]
 
 [lib]
-crate-type = ["cdylib", "lib"]
-
-[[bin]]
-name = "pgrx_embed_pg_reflex"
-path = "./src/bin/pgrx_embed.rs"
+crate-type = ["cdylib"]
 
 [features]
 default = ["pg17"]
@@ -23,13 +19,13 @@ pg18 = ["pgrx/pg18", "pgrx-tests/pg18" ]
 pg_test = []
 
 [dependencies]
-pgrx = "=0.16.1"
+pgrx = "=0.18.0"
 sqlparser = { version = "0.60", features = ["visitor"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 [dev-dependencies]
-pgrx-tests = "=0.16.1"
+pgrx-tests = "=0.18.0"
 proptest = "1"
 
 [profile.dev]

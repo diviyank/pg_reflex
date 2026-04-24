@@ -2,24 +2,18 @@ use std::collections::HashMap;
 
 use crate::aggregation::{AggregationPlan, EndQueryMapping};
 use crate::query_decomposer::{
-    intermediate_table_name, normalized_column_name, quote_identifier, safe_identifier,
-    split_qualified_name, staging_delta_table_name, transition_new_table_name,
+    delta_scratch_table_name, intermediate_table_name, normalized_column_name,
+    passthrough_scratch_new_table_name, passthrough_scratch_old_table_name, quote_identifier,
+    safe_identifier, split_qualified_name, staging_delta_table_name, transition_new_table_name,
     transition_old_table_name,
 };
 
-/// Build the DDL for the intermediate table.
-///
-/// When `logged` is true, creates a regular (WAL-logged) table for crash safety.
-/// When false (default), creates an UNLOGGED table for maximum write performance.
-///
+/// Returns the SQL column definition list shared by the intermediate and delta scratch tables.
 /// Returns None if no intermediate table is needed (no aggregation, no group by, no distinct).
-pub fn build_intermediate_table_ddl(
-    view_name: &str,
+fn intermediate_column_spec(
     plan: &AggregationPlan,
     column_types: &HashMap<String, String>,
-    logged: bool,
-) -> Option<String> {
-    // Need at least one of: group by, aggregation, or distinct
+) -> Option<Vec<String>> {
     if plan.group_by_columns.is_empty()
         && plan.intermediate_columns.is_empty()
         && !plan.has_distinct
@@ -28,7 +22,6 @@ pub fn build_intermediate_table_ddl(
         return None;
     }
 
-    let table_name = intermediate_table_name(view_name);
     let mut columns: Vec<String> = Vec::new();
 
     // For aggregates without GROUP BY: add a sentinel column so we have a PK
@@ -89,13 +82,29 @@ pub fn build_intermediate_table_ddl(
         columns.push("    __ivm_count BIGINT DEFAULT 0".to_string());
     }
 
+    Some(columns)
+}
+
+/// Build the DDL for the intermediate table.
+///
+/// When `logged` is true, creates a regular (WAL-logged) table for crash safety.
+/// When false (default), creates an UNLOGGED table for maximum write performance.
+///
+/// Returns None if no intermediate table is needed (no aggregation, no group by, no distinct).
+pub fn build_intermediate_table_ddl(
+    view_name: &str,
+    plan: &AggregationPlan,
+    column_types: &HashMap<String, String>,
+    logged: bool,
+) -> Option<String> {
+    let columns = intermediate_column_spec(plan, column_types)?;
+    let table_name = intermediate_table_name(view_name);
     let columns_sql = columns.join(",\n");
 
     // No inline PRIMARY KEY — we use a hash index for O(1) lookups instead.
     // The B-tree PK is redundant because MERGE handles insert-or-update correctly,
     // the delta query uses GROUP BY (unique output), and advisory locks prevent
     // concurrent MERGEs on the same IMV.
-
     let create_prefix = if logged {
         "CREATE TABLE"
     } else {
@@ -104,6 +113,29 @@ pub fn build_intermediate_table_ddl(
     Some(format!(
         "{} IF NOT EXISTS {} (\n{}\n)",
         create_prefix, table_name, columns_sql
+    ))
+}
+
+/// Build the DDL for the per-IMV UNLOGGED delta scratch table.
+///
+/// This scratch table has the same column shape as the intermediate table but is
+/// always UNLOGGED, has no indexes, and is TRUNCATE'd before each MERGE.  It
+/// exists so that MERGE reads from a plain table rather than an inline transition-
+/// table subquery, avoiding the PG cassert that fires when a MERGE USING clause
+/// references a transition table inside a dynamically-executed statement.
+///
+/// Returns None when no intermediate table is needed for this IMV.
+pub fn build_delta_scratch_table_ddl(
+    view_name: &str,
+    plan: &AggregationPlan,
+    column_types: &HashMap<String, String>,
+) -> Option<String> {
+    let columns = intermediate_column_spec(plan, column_types)?;
+    let table_name = delta_scratch_table_name(view_name);
+    let columns_sql = columns.join(",\n");
+    Some(format!(
+        "CREATE UNLOGGED TABLE IF NOT EXISTS \"{}\" (\n{}\n)",
+        table_name, columns_sql
     ))
 }
 
@@ -327,7 +359,7 @@ pub fn build_trigger_ddls(source_table: &str) -> Vec<String> {
                EXECUTE format('SELECT EXISTS(SELECT 1 FROM %I WHERE %s LIMIT 1)', '{{transition_tbl}}', _rec.where_predicate) INTO _pred_match; \
                IF NOT _pred_match THEN CONTINUE; END IF; \
              END IF; \
-             PERFORM pg_advisory_xact_lock(hashtext(_rec.name)); \
+             PERFORM pg_advisory_xact_lock(hashtext(_rec.name), hashtext(reverse(_rec.name))); \
              _sql := reflex_build_delta_sql(_rec.name, '{source_table}', '{{op}}', _rec.base_query, _rec.end_query, _rec.aggregations, _rec.base_query); \
              IF _sql <> '' THEN \
                FOREACH _stmt IN ARRAY string_to_array(_sql, E'\\n--<<REFLEX_SEP>>--\\n') LOOP \
@@ -385,7 +417,7 @@ pub fn build_trigger_ddls(source_table: &str) -> Vec<String> {
     let trunc_fn = safe_identifier(&format!("__reflex_trunc_trigger_on_{}", safe_source));
     let trunc_trig = safe_identifier(&format!("__reflex_trigger_trunc_on_{}", safe_source));
     let trunc_body = format!(
-        "DECLARE _rec RECORD; _stmts TEXT; _stmt TEXT; \
+        "DECLARE _rec RECORD; _stmts TEXT; \
          BEGIN \
            FOR _rec IN \
              SELECT name \
@@ -393,13 +425,9 @@ pub fn build_trigger_ddls(source_table: &str) -> Vec<String> {
              WHERE '{source_table}' = ANY(depends_on) AND enabled = TRUE \
              ORDER BY graph_depth \
            LOOP \
-             PERFORM pg_advisory_xact_lock(hashtext(_rec.name)); \
+             PERFORM pg_advisory_xact_lock(hashtext(_rec.name), hashtext(reverse(_rec.name))); \
              _stmts := reflex_build_truncate_sql(_rec.name); \
-             IF _stmts <> '' THEN \
-               FOREACH _stmt IN ARRAY string_to_array(_stmts, E'\\n--<<REFLEX_SEP>>--\\n') LOOP \
-                 IF _stmt <> '' THEN EXECUTE _stmt; END IF; \
-               END LOOP; \
-             END IF; \
+             IF _stmts <> '' THEN PERFORM reflex_execute_separated(_stmts); END IF; \
            END LOOP; \
            RETURN NULL; \
          END;"
@@ -447,7 +475,7 @@ pub fn build_deferred_trigger_ddls(source_table: &str) -> Vec<String> {
                IF NOT _pred_match THEN CONTINUE; END IF; \
              END IF; \
              IF _rec.refresh_mode = 'IMMEDIATE' THEN \
-               PERFORM pg_advisory_xact_lock(hashtext(_rec.name)); \
+               PERFORM pg_advisory_xact_lock(hashtext(_rec.name), hashtext(reverse(_rec.name))); \
                _sql := reflex_build_delta_sql(_rec.name, '{source_table}', '{{op}}', _rec.base_query, _rec.end_query, _rec.aggregations, _rec.base_query); \
                IF _sql <> '' THEN \
                  FOREACH _stmt IN ARRAY string_to_array(_sql, E'\\n--<<REFLEX_SEP>>--\\n') LOOP \
@@ -519,7 +547,7 @@ pub fn build_deferred_trigger_ddls(source_table: &str) -> Vec<String> {
                IF NOT _pred_match THEN CONTINUE; END IF; \
              END IF; \
              IF _rec.refresh_mode = 'IMMEDIATE' THEN \
-               PERFORM pg_advisory_xact_lock(hashtext(_rec.name)); \
+               PERFORM pg_advisory_xact_lock(hashtext(_rec.name), hashtext(reverse(_rec.name))); \
                _sql := reflex_build_delta_sql(_rec.name, '{source_table}', 'UPDATE', _rec.base_query, _rec.end_query, _rec.aggregations, _rec.base_query); \
                IF _sql <> '' THEN \
                  FOREACH _stmt IN ARRAY string_to_array(_sql, E'\\n--<<REFLEX_SEP>>--\\n') LOOP \
@@ -551,7 +579,7 @@ pub fn build_deferred_trigger_ddls(source_table: &str) -> Vec<String> {
     let trunc_fn = safe_identifier(&format!("__reflex_trunc_trigger_on_{}", safe_source));
     let trunc_trig = safe_identifier(&format!("__reflex_trigger_trunc_on_{}", safe_source));
     let trunc_body = format!(
-        "DECLARE _rec RECORD; _stmts TEXT; _stmt TEXT; \
+        "DECLARE _rec RECORD; _stmts TEXT; \
          BEGIN \
            FOR _rec IN \
              SELECT name \
@@ -559,13 +587,9 @@ pub fn build_deferred_trigger_ddls(source_table: &str) -> Vec<String> {
              WHERE '{source_table}' = ANY(depends_on) AND enabled = TRUE \
              ORDER BY graph_depth \
            LOOP \
-             PERFORM pg_advisory_xact_lock(hashtext(_rec.name)); \
+             PERFORM pg_advisory_xact_lock(hashtext(_rec.name), hashtext(reverse(_rec.name))); \
              _stmts := reflex_build_truncate_sql(_rec.name); \
-             IF _stmts <> '' THEN \
-               FOREACH _stmt IN ARRAY string_to_array(_stmts, E'\\n--<<REFLEX_SEP>>--\\n') LOOP \
-                 IF _stmt <> '' THEN EXECUTE _stmt; END IF; \
-               END LOOP; \
-             END IF; \
+             IF _stmts <> '' THEN PERFORM reflex_execute_separated(_stmts); END IF; \
            END LOOP; \
            TRUNCATE {delta_tbl}; \
            DELETE FROM public.__reflex_deferred_pending WHERE source_table = '{source_table}'; \
@@ -635,6 +659,28 @@ pub fn build_staging_table_ddl(source_table: &str) -> String {
     )
 }
 
+/// Build DDL for the per-(IMV, source) UNLOGGED passthrough scratch tables.
+///
+/// Returns two CREATE statements (new-side and old-side). Each scratch mirrors
+/// the source shape via `LIKE source INCLUDING DEFAULTS`. They are populated
+/// at trigger time from the transition tables, then read by the passthrough
+/// trigger's DML — avoiding transition-table references inside EXECUTE, which
+/// trips a PG assertion in nested-trigger contexts.
+pub fn build_passthrough_scratch_ddls(view_name: &str, source_table: &str) -> Vec<String> {
+    let new_tbl = passthrough_scratch_new_table_name(view_name, source_table);
+    let old_tbl = passthrough_scratch_old_table_name(view_name, source_table);
+    vec![
+        format!(
+            "CREATE UNLOGGED TABLE IF NOT EXISTS \"{}\" (LIKE {} INCLUDING DEFAULTS)",
+            new_tbl, source_table
+        ),
+        format!(
+            "CREATE UNLOGGED TABLE IF NOT EXISTS \"{}\" (LIKE {} INCLUDING DEFAULTS)",
+            old_tbl, source_table
+        ),
+    ]
+}
+
 /// Resolve a column's PostgreSQL type from the catalog lookup map.
 ///
 /// The map keys can be either "table.column" or just "column".
@@ -658,6 +704,23 @@ pub(crate) fn resolve_column_type(
         if key.ends_with(&format!(".{}", bare)) {
             return val.clone();
         }
+    }
+    // Expression columns (e.g. CASE, coalesce) can't be resolved from the catalog.
+    // Numeric is a safer default than TEXT for aggregate intermediates — if the
+    // expression is text-valued it will error loudly at CREATE time, which is
+    // preferable to silent behaviour drift.
+    if default_type == "TEXT" {
+        // Warn only when executing inside Postgres; pgrx::warning! requires a live
+        // elog context and panics under `cargo test --lib`.
+        #[cfg(not(test))]
+        pgrx::warning!(
+            "pg_reflex: could not resolve type for '{}' from catalog; defaulting to NUMERIC. \
+             If this column is non-numeric, add an explicit CAST in the IMV SQL.",
+            col_name
+        );
+        #[cfg(test)]
+        let _ = col_name;
+        return "NUMERIC".to_string();
     }
     default_type.to_string()
 }

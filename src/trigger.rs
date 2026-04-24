@@ -6,9 +6,10 @@ use pgrx::PgBuiltInOids;
 
 use crate::aggregation::AggregationPlan;
 use crate::query_decomposer::{
-    intermediate_table_name, normalized_column_name, quote_identifier, replace_identifier,
-    replace_source_with_delta, safe_identifier, split_qualified_name, staging_delta_table_name,
-    transition_new_table_name, transition_old_table_name,
+    delta_scratch_table_name, intermediate_table_name, normalized_column_name,
+    passthrough_scratch_new_table_name, passthrough_scratch_old_table_name, quote_identifier,
+    replace_identifier, replace_source_with_delta, safe_identifier, split_qualified_name,
+    staging_delta_table_name, transition_new_table_name, transition_old_table_name,
 };
 
 /// Whether a delta adds or subtracts from the intermediate table.
@@ -19,11 +20,35 @@ pub enum DeltaOp {
 }
 
 /// Build a MERGE statement that merges a delta query into the intermediate table.
+/// Used directly by unit tests; production code goes through `push_materialized_merge`.
 /// MERGE is 3-4x faster than INSERT...ON CONFLICT because it uses a hash join
 /// strategy instead of per-row index probes for conflict resolution.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn build_merge_sql(
     intermediate_tbl: &str,
     delta_query: &str,
+    plan: &AggregationPlan,
+    op: DeltaOp,
+) -> String {
+    build_merge_using(intermediate_tbl, &format!("({})", delta_query), plan, op)
+}
+
+/// Like `build_merge_sql` but reads the delta from a pre-materialized table rather
+/// than an inline subquery.  Use this when the delta may reference a transition
+/// table — PostgreSQL's MERGE rejects transition-table references inside a USING
+/// subquery executed via EXECUTE (triggers a PG cassert / SIGABRT on cassert builds).
+fn build_merge_from_table_sql(
+    intermediate_tbl: &str,
+    scratch_tbl: &str,
+    plan: &AggregationPlan,
+    op: DeltaOp,
+) -> String {
+    build_merge_using(intermediate_tbl, &format!("\"{}\"", scratch_tbl), plan, op)
+}
+
+fn build_merge_using(
+    intermediate_tbl: &str,
+    using_clause: &str,
     plan: &AggregationPlan,
     op: DeltaOp,
 ) -> String {
@@ -143,9 +168,9 @@ pub fn build_merge_sql(
     };
 
     format!(
-        "MERGE INTO {} AS t USING ({}) AS d ON {} WHEN MATCHED THEN UPDATE SET {}{}",
+        "MERGE INTO {} AS t USING {} AS d ON {} WHEN MATCHED THEN UPDATE SET {}{}",
         intermediate_tbl,
-        delta_query,
+        using_clause,
         on_clause,
         set_clauses.join(", "),
         not_matched
@@ -405,46 +430,51 @@ fn replace_source_with_transition(
 /// PG17+: single CTE with MERGE RETURNING (captures affected groups in one statement).
 ///   When `include_cleanup` is true, prepends a DELETE FROM affected CTE (replaces TRUNCATE).
 /// PG15/16: separate MERGE + SELECT DISTINCT from delta query (MERGE RETURNING unsupported).
-fn push_merge_and_affected(
+fn push_materialized_merge(
     stmts: &mut Vec<String>,
-    merge_sql: &str,
+    scratch_tbl: &str,
+    delta_query: &str,
+    intermediate_tbl: &str,
+    plan: &AggregationPlan,
+    op: DeltaOp,
+) {
+    stmts.push(format!("TRUNCATE \"{}\"", scratch_tbl));
+    stmts.push(format!("INSERT INTO \"{}\" {}", scratch_tbl, delta_query));
+    stmts.push(build_merge_from_table_sql(
+        intermediate_tbl,
+        scratch_tbl,
+        plan,
+        op,
+    ));
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_materialized_merge_and_affected(
+    stmts: &mut Vec<String>,
+    scratch_tbl: &str,
+    delta_query: &str,
+    intermediate_tbl: &str,
+    plan: &AggregationPlan,
+    op: DeltaOp,
     affected_tbl: &str,
     select_expr: &str,
-    delta_query: &str,
-    grp_cols: &[String],
     include_cleanup: bool,
 ) {
-    #[cfg(not(any(feature = "pg15", feature = "pg16")))]
-    {
-        let _ = delta_query; // only used in PG15/16 fallback path
-        let ret_cols = grp_cols
-            .iter()
-            .map(|c| format!("t.{}", c))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let cleanup_cte = if include_cleanup {
-            format!(
-                "cleanup AS (DELETE FROM \"{}\" RETURNING 1), ",
-                affected_tbl
-            )
-        } else {
-            String::new()
-        };
-        stmts.push(format!(
-            "WITH {}__m AS ({} RETURNING {}) INSERT INTO \"{}\" SELECT DISTINCT {} FROM __m",
-            cleanup_cte, merge_sql, ret_cols, affected_tbl, select_expr
-        ));
+    if include_cleanup {
+        stmts.push(format!("TRUNCATE \"{}\"", affected_tbl));
     }
-    #[cfg(any(feature = "pg15", feature = "pg16"))]
-    {
-        let _ = grp_cols; // only used in PG17+ RETURNING path
-        let _ = include_cleanup; // cleanup handled by caller via TRUNCATE on PG15/16
-        stmts.push(merge_sql.to_string());
-        stmts.push(format!(
-            "INSERT INTO \"{}\" SELECT DISTINCT {} FROM ({}) AS __d",
-            affected_tbl, select_expr, delta_query
-        ));
-    }
+    stmts.push(format!("TRUNCATE \"{}\"", scratch_tbl));
+    stmts.push(format!("INSERT INTO \"{}\" {}", scratch_tbl, delta_query));
+    stmts.push(build_merge_from_table_sql(
+        intermediate_tbl,
+        scratch_tbl,
+        plan,
+        op,
+    ));
+    stmts.push(format!(
+        "INSERT INTO \"{}\" SELECT DISTINCT {} FROM \"{}\" AS __d",
+        affected_tbl, select_expr, scratch_tbl
+    ));
 }
 
 /// Generates the SQL statements to apply a delta to an IMV.
@@ -458,10 +488,11 @@ pub fn reflex_build_delta_sql(
     operation: &str,
     base_query: &str,
     end_query: &str,
-    aggregations_json: &str,
+    aggregations_json: Option<&str>,
     orig_base_query: &str,
 ) -> String {
-    let plan: AggregationPlan = match serde_json::from_str(aggregations_json) {
+    let json = aggregations_json.unwrap_or("{}");
+    let plan: AggregationPlan = match serde_json::from_str(json) {
         Ok(p) => p,
         Err(_) => {
             pgrx::warning!("pg_reflex: invalid aggregations JSON for '{}'", view_name);
@@ -481,6 +512,7 @@ pub fn reflex_build_delta_sql(
     let grp_cols = group_columns(&plan);
     let bare_view = split_qualified_name(view_name).1;
     let affected_tbl = safe_identifier(&format!("__reflex_affected_{}", bare_view));
+    let scratch_tbl = delta_scratch_table_name(view_name);
 
     // Detect cases where standard incremental delta is incorrect:
     // 1. Self-join: source_table appears multiple times in base_query
@@ -585,21 +617,10 @@ pub fn reflex_build_delta_sql(
             stmts.push(format!("TRUNCATE \"{}\"", affected_tbl));
 
             // Extract affected groups from delta
-            #[cfg(not(any(feature = "pg15", feature = "pg16")))]
-            {
-                // PG17+: use a lightweight SELECT from the delta to get group keys
-                stmts.push(format!(
-                    "INSERT INTO \"{}\" SELECT DISTINCT {} FROM ({}) AS __d",
-                    affected_tbl, select_expr, delta_q
-                ));
-            }
-            #[cfg(any(feature = "pg15", feature = "pg16"))]
-            {
-                stmts.push(format!(
-                    "INSERT INTO \"{}\" SELECT DISTINCT {} FROM ({}) AS __d",
-                    affected_tbl, select_expr, delta_q
-                ));
-            }
+            stmts.push(format!(
+                "INSERT INTO \"{}\" SELECT DISTINCT {} FROM ({}) AS __d",
+                affected_tbl, select_expr, delta_q
+            ));
 
             // Delete affected groups from intermediate (NULL-safe)
             let ns_in_int = null_safe_in(&affected_tbl, cols);
@@ -643,11 +664,40 @@ pub fn reflex_build_delta_sql(
         }
     } else if plan.is_passthrough {
         let qv = quote_identifier(view_name);
+        let pt_new = passthrough_scratch_new_table_name(view_name, source_table);
+        let pt_old = passthrough_scratch_old_table_name(view_name, source_table);
         // Look up per-source column mappings for targeted DELETE/UPDATE
         let mappings = plan.passthrough_key_mappings.get(source_table);
+
+        // Materialize the transition tables into per-(IMV, source) UNLOGGED scratch
+        // tables BEFORE any downstream DML references them. This is the key fix for
+        // the nested-trigger SIGABRT: subquery reads of transition tables inside
+        // EXECUTE'd DML (DELETE … WHERE IN (SELECT … FROM transition), INSERT …
+        // SELECT … FROM transition) trip a PG assertion when fired from a
+        // downstream trigger. Plain `INSERT INTO scratch SELECT * FROM transition`
+        // is the one pattern that stays safe — so we confine every transition
+        // reference to that pattern and route subsequent statements through the
+        // scratch tables.
+        let needs_new = matches!(operation, "INSERT" | "UPDATE");
+        let needs_old = matches!(operation, "DELETE" | "UPDATE");
+        if needs_new {
+            stmts.push(format!("TRUNCATE \"{}\"", pt_new));
+            stmts.push(format!(
+                "INSERT INTO \"{}\" SELECT * FROM \"{}\"",
+                pt_new, new_tbl
+            ));
+        }
+        if needs_old {
+            stmts.push(format!("TRUNCATE \"{}\"", pt_old));
+            stmts.push(format!(
+                "INSERT INTO \"{}\" SELECT * FROM \"{}\"",
+                pt_old, old_tbl
+            ));
+        }
+
         match operation {
             "INSERT" => {
-                let delta_q = replace_source_with_transition(base_query, source_table, &new_tbl);
+                let delta_q = replace_source_with_transition(base_query, source_table, &pt_new);
                 stmts.push(format!("INSERT INTO {} {}", qv, delta_q));
             }
             "DELETE" => {
@@ -663,7 +713,7 @@ pub fn reflex_build_delta_sql(
                         qv,
                         row,
                         source_cols.join(", "),
-                        old_tbl
+                        pt_old
                     ));
                 } else {
                     // No mapping for this source: full refresh
@@ -684,11 +734,11 @@ pub fn reflex_build_delta_sql(
                         qv,
                         row,
                         source_cols.join(", "),
-                        old_tbl
+                        pt_old
                     ));
-                    // Phase 2: insert new rows (base_query with source→transition)
+                    // Phase 2: insert new rows (base_query with source→pt_new scratch)
                     let delta_new =
-                        replace_source_with_transition(base_query, source_table, &new_tbl);
+                        replace_source_with_transition(base_query, source_table, &pt_new);
                     stmts.push(format!("INSERT INTO {} {}", qv, delta_new));
                 } else {
                     // No mapping for this source: full refresh
@@ -710,26 +760,26 @@ pub fn reflex_build_delta_sql(
 
                 if let Some(ref cols) = grp_cols {
                     let select_expr = affected_groups_select(cols);
-                    let merge_sql =
-                        build_merge_sql(&intermediate_tbl, &delta_q, &plan, DeltaOp::Add);
-                    #[cfg(any(feature = "pg15", feature = "pg16"))]
-                    stmts.push(format!("TRUNCATE \"{}\"", affected_tbl));
-                    push_merge_and_affected(
+                    push_materialized_merge_and_affected(
                         &mut stmts,
-                        &merge_sql,
+                        &scratch_tbl,
+                        &delta_q,
+                        &intermediate_tbl,
+                        &plan,
+                        DeltaOp::Add,
                         &affected_tbl,
                         &select_expr,
-                        &delta_q,
-                        cols,
                         true,
                     );
                 } else {
-                    stmts.push(build_merge_sql(
-                        &intermediate_tbl,
+                    push_materialized_merge(
+                        &mut stmts,
+                        &scratch_tbl,
                         &delta_q,
+                        &intermediate_tbl,
                         &plan,
                         DeltaOp::Add,
-                    ));
+                    );
                 }
             }
             "DELETE" => {
@@ -737,26 +787,26 @@ pub fn reflex_build_delta_sql(
 
                 if let Some(ref cols) = grp_cols {
                     let select_expr = affected_groups_select(cols);
-                    let merge_sql =
-                        build_merge_sql(&intermediate_tbl, &delta_q, &plan, DeltaOp::Subtract);
-                    #[cfg(any(feature = "pg15", feature = "pg16"))]
-                    stmts.push(format!("TRUNCATE \"{}\"", affected_tbl));
-                    push_merge_and_affected(
+                    push_materialized_merge_and_affected(
                         &mut stmts,
-                        &merge_sql,
+                        &scratch_tbl,
+                        &delta_q,
+                        &intermediate_tbl,
+                        &plan,
+                        DeltaOp::Subtract,
                         &affected_tbl,
                         &select_expr,
-                        &delta_q,
-                        cols,
                         true,
                     );
                 } else {
-                    stmts.push(build_merge_sql(
-                        &intermediate_tbl,
+                    push_materialized_merge(
+                        &mut stmts,
+                        &scratch_tbl,
                         &delta_q,
+                        &intermediate_tbl,
                         &plan,
                         DeltaOp::Subtract,
-                    ));
+                    );
                 }
                 if has_min_max {
                     if let Some(recompute) =
@@ -773,21 +823,15 @@ pub fn reflex_build_delta_sql(
                 if has_min_max {
                     if let Some(ref cols) = grp_cols {
                         let select_expr = affected_groups_select(cols);
-                        let merge_sub_sql = build_merge_sql(
-                            &intermediate_tbl,
+                        push_materialized_merge_and_affected(
+                            &mut stmts,
+                            &scratch_tbl,
                             &delta_old,
+                            &intermediate_tbl,
                             &plan,
                             DeltaOp::Subtract,
-                        );
-                        #[cfg(any(feature = "pg15", feature = "pg16"))]
-                        stmts.push(format!("TRUNCATE \"{}\"", affected_tbl));
-                        push_merge_and_affected(
-                            &mut stmts,
-                            &merge_sub_sql,
                             &affected_tbl,
                             &select_expr,
-                            &delta_old,
-                            cols,
                             true,
                         );
                         if let Some(recompute) =
@@ -795,66 +839,72 @@ pub fn reflex_build_delta_sql(
                         {
                             stmts.push(recompute);
                         }
-                        let merge_add_sql =
-                            build_merge_sql(&intermediate_tbl, &delta_new, &plan, DeltaOp::Add);
-                        push_merge_and_affected(
+                        push_materialized_merge_and_affected(
                             &mut stmts,
-                            &merge_add_sql,
+                            &scratch_tbl,
+                            &delta_new,
+                            &intermediate_tbl,
+                            &plan,
+                            DeltaOp::Add,
                             &affected_tbl,
                             &select_expr,
-                            &delta_new,
-                            cols,
                             false,
                         );
                     } else {
-                        stmts.push(build_merge_sql(
-                            &intermediate_tbl,
+                        push_materialized_merge(
+                            &mut stmts,
+                            &scratch_tbl,
                             &delta_old,
+                            &intermediate_tbl,
                             &plan,
                             DeltaOp::Subtract,
-                        ));
+                        );
                         if let Some(recompute) =
                             build_min_max_recompute_sql(&intermediate_tbl, &plan, orig_base_query)
                         {
                             stmts.push(recompute);
                         }
-                        stmts.push(build_merge_sql(
-                            &intermediate_tbl,
+                        push_materialized_merge(
+                            &mut stmts,
+                            &scratch_tbl,
                             &delta_new,
+                            &intermediate_tbl,
                             &plan,
                             DeltaOp::Add,
-                        ));
+                        );
                     }
                 } else if grp_cols.is_some() {
-                    let cols = grp_cols.as_ref().unwrap();
+                    let cols = grp_cols.as_ref().expect("grp_cols is Some — checked above");
                     let net_delta = build_net_delta_query(&delta_old, &delta_new, &plan);
                     let select_expr = affected_groups_select(cols);
-                    let merge_sql =
-                        build_merge_sql(&intermediate_tbl, &net_delta, &plan, DeltaOp::Add);
-                    #[cfg(any(feature = "pg15", feature = "pg16"))]
-                    stmts.push(format!("TRUNCATE \"{}\"", affected_tbl));
-                    push_merge_and_affected(
+                    push_materialized_merge_and_affected(
                         &mut stmts,
-                        &merge_sql,
+                        &scratch_tbl,
+                        &net_delta,
+                        &intermediate_tbl,
+                        &plan,
+                        DeltaOp::Add,
                         &affected_tbl,
                         &select_expr,
-                        &net_delta,
-                        cols,
                         true,
                     );
                 } else {
-                    stmts.push(build_merge_sql(
-                        &intermediate_tbl,
+                    push_materialized_merge(
+                        &mut stmts,
+                        &scratch_tbl,
                         &delta_old,
+                        &intermediate_tbl,
                         &plan,
                         DeltaOp::Subtract,
-                    ));
-                    stmts.push(build_merge_sql(
-                        &intermediate_tbl,
+                    );
+                    push_materialized_merge(
+                        &mut stmts,
+                        &scratch_tbl,
                         &delta_new,
+                        &intermediate_tbl,
                         &plan,
                         DeltaOp::Add,
-                    ));
+                    );
                 }
             }
             _ => {}
@@ -892,20 +942,8 @@ pub fn reflex_build_delta_sql(
                 {
                     Some(spliced_end_q) => {
                         let ns_in = null_safe_in(&affected_tbl, &output_cols);
-                        let inner = format!(
-                            "DELETE FROM {qv} WHERE {ns}; \
-                             INSERT INTO {qv} {spliced};",
-                            qv = qv,
-                            ns = ns_in,
-                            spliced = spliced_end_q,
-                        );
-                        stmts.push(format!(
-                            "DO $reflex_refresh$ BEGIN \
-                               IF EXISTS(SELECT 1 FROM \"{aff}\") THEN {body} END IF; \
-                             END $reflex_refresh$",
-                            aff = affected_tbl,
-                            body = inner
-                        ));
+                        stmts.push(format!("DELETE FROM {} WHERE {}", qv, ns_in));
+                        stmts.push(format!("INSERT INTO {} {}", qv, spliced_end_q));
                     }
                     None => {
                         // No GROUP BY found — defensive fallback to full rebuild.
@@ -918,32 +956,14 @@ pub fn reflex_build_delta_sql(
         } else if let Some(ref cols) = grp_cols {
             let qv = quote_identifier(view_name);
             let ns_in = null_safe_in(&affected_tbl, cols);
-            let inner = if include_dead_cleanup {
-                format!(
-                    "DELETE FROM {int} WHERE __ivm_count <= 0; \
-                     DELETE FROM {qv} WHERE {ns}; \
-                     INSERT INTO {qv} {eq} AND {ns};",
-                    int = intermediate_tbl,
-                    qv = qv,
-                    ns = ns_in,
-                    eq = end_query
-                )
-            } else {
-                format!(
-                    "DELETE FROM {qv} WHERE {ns}; \
-                     INSERT INTO {qv} {eq} AND {ns};",
-                    qv = qv,
-                    ns = ns_in,
-                    eq = end_query
-                )
-            };
-            stmts.push(format!(
-                "DO $reflex_refresh$ BEGIN \
-                   IF EXISTS(SELECT 1 FROM \"{aff}\") THEN {body} END IF; \
-                 END $reflex_refresh$",
-                aff = affected_tbl,
-                body = inner
-            ));
+            if include_dead_cleanup {
+                stmts.push(format!(
+                    "DELETE FROM {} WHERE __ivm_count <= 0",
+                    intermediate_tbl
+                ));
+            }
+            stmts.push(format!("DELETE FROM {} WHERE {}", qv, ns_in));
+            stmts.push(format!("INSERT INTO {} {} AND {}", qv, end_query, ns_in));
             stmts.push(metadata_sql);
         } else {
             let qv = quote_identifier(view_name);
@@ -952,6 +972,20 @@ pub fn reflex_build_delta_sql(
             stmts.push(metadata_sql);
         }
     }
+
+    // Historical note (2026-04-24): an earlier version of this function
+    // guarded against *any* transition-table reference outside a sanctioned
+    // scratch-populate INSERT. That guard existed under the hypothesis that
+    // `EXECUTE '…__reflex_new_*…'` inside a trigger body was the root cause
+    // of the backend SIGSEGV/SIGABRT we were seeing. The real root cause
+    // turned out to be in build.rs — weak stub definitions of
+    // `CurrentMemoryContext` etc. were leaking into the installed cdylib,
+    // shadowing postgres's real globals and causing NULL derefs in pgrx's
+    // SPI path. With that fixed, transition-table references in EXECUTE
+    // are safe again and the guard was over-rejecting legitimate full-
+    // refresh SQL (e.g. the LEFT JOIN secondary-table fallback that does
+    // `DELETE FROM target; INSERT INTO target <end_query>` where end_query
+    // can legitimately read from a transition table in some code paths).
 
     stmts.join("\n--<<REFLEX_SEP>>--\n")
 }
@@ -996,6 +1030,20 @@ pub fn reflex_build_truncate_sql(view_name: &str) -> String {
     ));
 
     stmts.join("\n--<<REFLEX_SEP>>--\n")
+}
+
+/// Theme 5.3: execute a `\n--<<REFLEX_SEP>>--\n`-separated SQL string, running
+/// each non-empty statement in order. Replaces the `string_to_array + FOREACH`
+/// pattern in generated trigger bodies with a single Rust-side call — smaller
+/// trigger DDL, no intermediate array allocation.
+#[pg_extern]
+pub fn reflex_execute_separated(sql: &str) {
+    for stmt in sql.split("\n--<<REFLEX_SEP>>--\n") {
+        let trimmed = stmt.trim();
+        if !trimmed.is_empty() {
+            Spi::run(trimmed).unwrap_or_report();
+        }
+    }
 }
 
 /// Flushes all accumulated deferred deltas for a given source table.
@@ -1098,19 +1146,73 @@ pub fn reflex_flush_deferred(source_table: &str) -> String {
             .update(&format!("ANALYZE {}", delta_tbl), None, &[])
             .unwrap_or_report();
 
-        // Passthrough DELETE/UPDATE branches in reflex_build_delta_sql reference
-        // the OLD transition table literally. That table only exists inside an
-        // IMMEDIATE trigger's REFERENCING scope; here we're at COMMIT, so stand
-        // it up as a temp view over the delta.
+        // Passthrough INSERT/DELETE/UPDATE branches in reflex_build_delta_sql
+        // reference the NEW/OLD transition tables literally — either directly
+        // (pre-Phase-E paths) or via the Phase E per-(IMV, source) scratch
+        // populate `INSERT INTO __reflex_pt_*_<v>_<s> SELECT * FROM __reflex_(new|old)_<s>`.
+        // Those transition tables only exist inside an IMMEDIATE trigger's
+        // REFERENCING scope; here we're at COMMIT, so stand both sides up as
+        // temp views over the staging delta. The views must project the source
+        // columns only (no `__reflex_op` metadata column) so downstream DML —
+        // including `INSERT INTO pt_scratch SELECT * FROM view` where pt_scratch
+        // is shaped `LIKE source` — sees the same column list as a real
+        // transition table.
+        let (src_schema, src_name_only) = split_qualified_name(source_table);
+        let src_schema_lit = src_schema.unwrap_or("public").replace("'", "''");
+        let src_name_lit = src_name_only.replace("'", "''");
+        let src_cols: Vec<String> = client
+            .select(
+                "SELECT quote_ident(column_name) AS qc \
+                 FROM information_schema.columns \
+                 WHERE table_schema = $1 AND table_name = $2 \
+                 ORDER BY ordinal_position",
+                None,
+                &[
+                    unsafe {
+                        DatumWithOid::new(
+                            src_schema_lit.clone(),
+                            PgBuiltInOids::TEXTOID.oid().value(),
+                        )
+                    },
+                    unsafe {
+                        DatumWithOid::new(
+                            src_name_lit.clone(),
+                            PgBuiltInOids::TEXTOID.oid().value(),
+                        )
+                    },
+                ],
+            )
+            .unwrap_or_report()
+            .filter_map(|row| {
+                row.get_by_name::<&str, _>("qc")
+                    .unwrap_or(None)
+                    .map(|s| s.to_string())
+            })
+            .collect();
+        let projection = src_cols.join(", ");
+        let new_view = transition_new_table_name(source_table);
         let old_view = transition_old_table_name(source_table);
+        client
+            .update(&format!("DROP VIEW IF EXISTS {}", new_view), None, &[])
+            .unwrap_or_report();
+        client
+            .update(
+                &format!(
+                    "CREATE TEMP VIEW {} AS SELECT {} FROM {} WHERE __reflex_op IN ('I', 'U_NEW')",
+                    new_view, projection, delta_tbl
+                ),
+                None,
+                &[],
+            )
+            .unwrap_or_report();
         client
             .update(&format!("DROP VIEW IF EXISTS {}", old_view), None, &[])
             .unwrap_or_report();
         client
             .update(
                 &format!(
-                    "CREATE TEMP VIEW {} AS SELECT * FROM {} WHERE __reflex_op IN ('D', 'U_OLD')",
-                    old_view, delta_tbl
+                    "CREATE TEMP VIEW {} AS SELECT {} FROM {} WHERE __reflex_op IN ('D', 'U_OLD')",
+                    old_view, projection, delta_tbl
                 ),
                 None,
                 &[],
@@ -1143,19 +1245,17 @@ pub fn reflex_flush_deferred(source_table: &str) -> String {
                 }
             }
 
-            // Acquire advisory lock for this IMV
-            client
-                .update(
-                    &format!(
-                        "SELECT pg_advisory_xact_lock(hashtext('{}'))",
-                        imv_name.replace("'", "''")
-                    ),
-                    None,
-                    &[],
-                )
-                .unwrap_or_report();
+            // Collect every per-IMV statement into an ordered list; we emit them
+            // inside a single PL/pgSQL DO block with EXCEPTION so one bad IMV
+            // rolls back only its own subtransaction and lets the cascade continue.
+            let mut imv_stmts: Vec<String> = Vec::new();
 
-            // Process INSERT deltas (op = 'I')
+            imv_stmts.push(format!(
+                "PERFORM pg_advisory_xact_lock(hashtext('{}'), hashtext(reverse('{}')))",
+                imv_name.replace("'", "''"),
+                imv_name.replace("'", "''")
+            ));
+
             let ins_subq = format!("(SELECT * FROM {} WHERE __reflex_op = 'I')", delta_tbl);
             let ins_base = replace_source_with_delta(base_query, source_table, &ins_subq, "__dt");
             let ins_sql = reflex_build_delta_sql(
@@ -1164,19 +1264,19 @@ pub fn reflex_flush_deferred(source_table: &str) -> String {
                 "INSERT",
                 &ins_base,
                 end_query,
-                agg_json,
+                Some(agg_json.as_str()),
                 base_query,
             );
+            let mut ins_had_stmts = false;
             if !ins_sql.is_empty() {
                 for stmt in ins_sql.split("\n--<<REFLEX_SEP>>--\n") {
                     if !stmt.is_empty() {
-                        client.update(stmt, None, &[]).unwrap_or_report();
+                        imv_stmts.push(stmt.to_string());
+                        ins_had_stmts = true;
                     }
                 }
-                total_processed += 1;
             }
 
-            // Process DELETE deltas (op = 'D')
             let del_subq = format!("(SELECT * FROM {} WHERE __reflex_op = 'D')", delta_tbl);
             let del_base = replace_source_with_delta(base_query, source_table, &del_subq, "__dt");
             let del_sql = reflex_build_delta_sql(
@@ -1185,19 +1285,19 @@ pub fn reflex_flush_deferred(source_table: &str) -> String {
                 "DELETE",
                 &del_base,
                 end_query,
-                agg_json,
+                Some(agg_json.as_str()),
                 base_query,
             );
+            let mut del_had_stmts = false;
             if !del_sql.is_empty() {
                 for stmt in del_sql.split("\n--<<REFLEX_SEP>>--\n") {
                     if !stmt.is_empty() {
-                        client.update(stmt, None, &[]).unwrap_or_report();
+                        imv_stmts.push(stmt.to_string());
+                        del_had_stmts = true;
                     }
                 }
-                total_processed += 1;
             }
 
-            // Process UPDATE deltas: U_OLD as DELETE, U_NEW as INSERT
             let upd_old_subq = format!("(SELECT * FROM {} WHERE __reflex_op = 'U_OLD')", delta_tbl);
             let upd_old_base =
                 replace_source_with_delta(base_query, source_table, &upd_old_subq, "__dt");
@@ -1207,13 +1307,13 @@ pub fn reflex_flush_deferred(source_table: &str) -> String {
                 "DELETE",
                 &upd_old_base,
                 end_query,
-                agg_json,
+                Some(agg_json.as_str()),
                 base_query,
             );
             if !upd_old_sql.is_empty() {
                 for stmt in upd_old_sql.split("\n--<<REFLEX_SEP>>--\n") {
                     if !stmt.is_empty() {
-                        client.update(stmt, None, &[]).unwrap_or_report();
+                        imv_stmts.push(stmt.to_string());
                     }
                 }
             }
@@ -1227,21 +1327,75 @@ pub fn reflex_flush_deferred(source_table: &str) -> String {
                 "INSERT",
                 &upd_new_base,
                 end_query,
-                agg_json,
+                Some(agg_json.as_str()),
                 base_query,
             );
+            let mut upd_had_stmts = false;
             if !upd_new_sql.is_empty() {
                 for stmt in upd_new_sql.split("\n--<<REFLEX_SEP>>--\n") {
                     if !stmt.is_empty() {
-                        client.update(stmt, None, &[]).unwrap_or_report();
+                        imv_stmts.push(stmt.to_string());
+                        upd_had_stmts = true;
                     }
                 }
+            }
+
+            // Phase 3.4 — wrap per-IMV statements in a PL/pgSQL DO block. The
+            // BEGIN…EXCEPTION…END creates an internal subtransaction: a single
+            // bad IMV only rolls back its own work and logs a WARNING instead of
+            // aborting the entire flush cascade.
+            //
+            // Theme 4 (observability): inside the same savepoint, record flush
+            // timing + staged row count + clear last_error on success; on
+            // failure the EXCEPTION branch captures SQLERRM into last_error.
+            let body = imv_stmts
+                .into_iter()
+                .map(|s| format!("{};", s))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let do_block = format!(
+                "DO $_reflex_imv_sp$ \
+                 DECLARE _t0 TIMESTAMP := clock_timestamp(); \
+                         _rows BIGINT; \
+                 BEGIN \
+                   SELECT COUNT(*) INTO _rows FROM {delta_tbl}; \
+                   \n{body}\n \
+                   UPDATE public.__reflex_ivm_reference \
+                     SET last_flush_ms = EXTRACT(EPOCH FROM (clock_timestamp() - _t0)) * 1000, \
+                         last_flush_rows = _rows, \
+                         flush_count = COALESCE(flush_count, 0) + 1, \
+                         last_error = NULL \
+                     WHERE name = '{imv_name_esc}'; \
+                 EXCEPTION WHEN OTHERS THEN \
+                   RAISE WARNING 'pg_reflex: IMV % flush failed at cascade: % (SQLSTATE %)', \
+                     '{imv_name_esc}', SQLERRM, SQLSTATE; \
+                   UPDATE public.__reflex_ivm_reference \
+                     SET last_error = LEFT(SQLERRM || ' (SQLSTATE ' || SQLSTATE || ')', 500), \
+                         flush_count = COALESCE(flush_count, 0) + 1 \
+                     WHERE name = '{imv_name_esc}'; \
+                 END $_reflex_imv_sp$",
+                delta_tbl = delta_tbl,
+                body = body,
+                imv_name_esc = imv_name.replace("'", "''"),
+            );
+            client.update(&do_block, None, &[]).unwrap_or_report();
+
+            if ins_had_stmts {
+                total_processed += 1;
+            }
+            if del_had_stmts {
+                total_processed += 1;
+            }
+            if upd_had_stmts {
                 total_processed += 1;
             }
         }
 
-        // Clean up: truncate staging table, drop the temp old-view shim,
+        // Clean up: truncate staging table, drop the temp view shims,
         // and remove pending rows.
+        client
+            .update(&format!("DROP VIEW IF EXISTS {}", new_view), None, &[])
+            .unwrap_or_report();
         client
             .update(&format!("DROP VIEW IF EXISTS {}", old_view), None, &[])
             .unwrap_or_report();

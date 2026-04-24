@@ -178,7 +178,7 @@ fn test_resolve_column_type() {
     assert_eq!(resolve_column_type("emp.salary", &types, "TEXT"), "integer");
     assert_eq!(resolve_column_type("salary", &types, "TEXT"), "integer");
     assert_eq!(resolve_column_type("name", &types, "TEXT"), "varchar");
-    assert_eq!(resolve_column_type("unknown", &types, "TEXT"), "TEXT");
+    assert_eq!(resolve_column_type("unknown", &types, "TEXT"), "NUMERIC");
 }
 
 // ========================================================================

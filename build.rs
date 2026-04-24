@@ -1,17 +1,35 @@
 fn main() {
-    // On Linux, native test binaries can't link because pgrx_pg_sys references
-    // postgres server symbols (errstart, palloc0, etc.) that are only available
-    // at runtime when the extension is loaded into postgres. We provide weak stub
-    // definitions that satisfy the linker; they are never called in #[test] paths.
+    // On Linux, native `cargo test --lib` test binaries can't link because
+    // pgrx_pg_sys references postgres server symbols (errstart, palloc0,
+    // CurrentMemoryContext, etc.) that only exist at runtime when the
+    // extension is loaded into postgres. We provide weak stub definitions
+    // that satisfy the linker; they are never called in #[test] paths.
     //
-    // macOS handles this with -Wl,-undefined,dynamic_lookup in .cargo/config.toml.
-    // lld's ELF mode has no equivalent flag for executables, so we use stubs instead.
+    // CRITICAL: the stubs must ONLY ever be linked into the Rust test
+    // binary, never into the cdylib that postgres dlopens. If the variable
+    // stubs (CurrentMemoryContext, ErrorContext, PG_exception_stack,
+    // error_context_stack) end up in the .so, they become local BSS symbols
+    // that shadow postgres's real globals at module-load time — every pgrx
+    // call that reads `pg_sys::CurrentMemoryContext` then reads NULL and
+    // segfaults (SIGSEGV on production PG, SIGABRT under --enable-cassert).
+    //
+    // We express the narrow scope in src/lib.rs with a `#[cfg(test)]
+    // #[link(name = "pg_reflex_pg_stubs", kind = "static")]` block. Build.rs
+    // only builds the archive and exposes its search path; it does NOT emit
+    // `cargo:rustc-link-lib=...` (which would apply to every crate target,
+    // cdylib included). The `#[cfg(test)]` attribute scopes the `#[link]`
+    // request to the unit-test binary only — pgrx's `cargo pgrx test`
+    // rebuilds the .so without `cfg(test)` active, so the cdylib stays
+    // clean and postgres resolves all server symbols at dlopen.
+    //
+    // macOS handles the same need via -Wl,-undefined,dynamic_lookup in
+    // .cargo/config.toml, so no archive is needed there.
     #[cfg(target_os = "linux")]
-    emit_postgres_stubs();
+    emit_postgres_stubs_archive();
 }
 
 #[cfg(target_os = "linux")]
-fn emit_postgres_stubs() {
+fn emit_postgres_stubs_archive() {
     use std::path::PathBuf;
     use std::process::Command;
 
@@ -41,8 +59,9 @@ fn emit_postgres_stubs() {
         .expect("invoke ar for pg stubs");
     assert!(ar_status.success(), "failed to archive pg stubs");
 
+    // Expose the search path so `#[link(...)]` in cfg(test) code finds the
+    // archive — but do NOT emit a global rustc-link-lib directive.
     println!("cargo:rustc-link-search=native={}", out_dir.display());
-    println!("cargo:rustc-link-lib=static=pg_reflex_pg_stubs");
     println!("cargo:rerun-if-changed=build.rs");
 }
 
@@ -50,7 +69,8 @@ fn emit_postgres_stubs() {
 const PG_STUBS_C: &str = r#"
 /* Weak stubs for postgres server symbols used by pgrx in test binaries.
  * These are never called in #[test] paths — they exist only to satisfy the linker.
- * When loaded into postgres the strong symbols from the server override these. */
+ * They must NEVER be linked into the cdylib: the variable stubs would shadow
+ * Postgres's real globals at dlopen time and cause NULL derefs. */
 #include <stddef.h>
 #include <stdarg.h>
 
@@ -65,6 +85,8 @@ __attribute__((weak)) void  pfree(void *ptr)                            {}
 __attribute__((weak)) void *palloc0(size_t size)                        { return NULL; }
 __attribute__((weak)) void *CopyErrorData(void)                         { return NULL; }
 __attribute__((weak)) void  FreeErrorData(void *edata)                  {}
+__attribute__((weak)) void  FlushErrorState(void)                       {}
+__attribute__((weak)) int   message_level_is_interesting(int elevel)    { return 0; }
 
 __attribute__((weak)) void *CurrentMemoryContext  = NULL;
 __attribute__((weak)) void *ErrorContext          = NULL;

@@ -188,16 +188,14 @@ fn test_min_max_recompute_sql_handles_join_aliases() {
                 name: "__bool_or_caav_product_id_is_not_null_true_count".to_string(),
                 pg_type: "BIGINT".to_string(),
                 source_aggregate: "SUM".to_string(),
-                source_arg: "CASE WHEN (caav.product_id IS NOT NULL) THEN 1 ELSE 0 END"
-                    .to_string(),
+                source_arg: "CASE WHEN (caav.product_id IS NOT NULL) THEN 1 ELSE 0 END".to_string(),
             },
             IntermediateColumn {
                 name: "__bool_or_caav_product_id_is_not_null_nonnull_count".to_string(),
                 pg_type: "BIGINT".to_string(),
                 source_aggregate: "SUM".to_string(),
-                source_arg:
-                    "CASE WHEN (caav.product_id IS NOT NULL) IS NOT NULL THEN 1 ELSE 0 END"
-                        .to_string(),
+                source_arg: "CASE WHEN (caav.product_id IS NOT NULL) IS NOT NULL THEN 1 ELSE 0 END"
+                    .to_string(),
             },
         ],
         end_query_mappings: vec![],
@@ -489,7 +487,7 @@ fn test_build_deferred_trigger_ddls_long_source_name_no_truncation() {
 // ========================================================================
 
 #[test]
-fn test_build_delta_sql_emits_do_block_gate_for_group_by_imv() {
+fn test_build_delta_sql_uses_scratch_table_for_group_by_imv() {
     let plan = simple_plan();
     let agg_json = serde_json::to_string(&plan).unwrap();
     let base_q = "SELECT city, SUM(amount) AS \"__sum_amount\", COUNT(*) AS __ivm_count FROM orders GROUP BY city";
@@ -501,24 +499,34 @@ fn test_build_delta_sql_emits_do_block_gate_for_group_by_imv() {
         "DELETE",
         base_q,
         end_q,
-        &agg_json,
+        Some(agg_json.as_str()),
         base_q,
     );
     assert!(
-        sql.contains("DO $reflex_refresh$"),
-        "targeted branch must emit DO block gate: {}",
+        sql.contains("TRUNCATE \"__reflex_scratch_test_view\""),
+        "targeted DELETE must TRUNCATE the scratch table: {}",
         &sql[..sql.len().min(400)]
     );
     assert!(
-        sql.contains("EXISTS(SELECT 1 FROM \"__reflex_affected_test_view\")"),
-        "DO gate must check affected-groups table: {}",
+        sql.contains("USING \"__reflex_scratch_test_view\""),
+        "MERGE must read from scratch table, not inline subquery: {}",
+        &sql[..sql.len().min(400)]
+    );
+    assert!(
+        !sql.contains("USING (SELECT"),
+        "MERGE must never reference a transition table via inline subquery: {}",
+        &sql[..sql.len().min(400)]
+    );
+    assert!(
+        sql.contains("INSERT INTO \"__reflex_affected_test_view\" SELECT DISTINCT"),
+        "affected groups must be populated from scratch: {}",
         &sql[..sql.len().min(400)]
     );
 }
 
 #[test]
-fn test_build_delta_sql_emits_do_block_for_end_query_group_by() {
-    // After #5: end_query_has_group_by now emits a DO-gated targeted refresh instead of full rebuild.
+fn test_build_delta_sql_end_query_group_by_uses_scratch_table() {
+    // end_query_has_group_by: targeted refresh via scratch table (no DO block).
     let plan = simple_plan();
     let agg_json = serde_json::to_string(&plan).unwrap();
     let base_q = "SELECT city, SUM(amount) AS \"__sum_amount\", COUNT(*) AS __ivm_count FROM orders GROUP BY city";
@@ -529,33 +537,40 @@ fn test_build_delta_sql_emits_do_block_for_end_query_group_by() {
         "DELETE",
         base_q,
         end_q,
-        &agg_json,
+        Some(agg_json.as_str()),
         base_q,
     );
     assert!(
-        sql.contains("DO $reflex_refresh$"),
-        "end_query_has_group_by branch must emit DO block: {}",
+        sql.contains("TRUNCATE \"__reflex_scratch_test_view\""),
+        "end_query_has_group_by branch must TRUNCATE scratch: {}",
         &sql[..sql.len().min(600)]
     );
     assert!(
-        sql.contains("EXISTS(SELECT 1 FROM \"__reflex_affected_test_view\")"),
-        "DO gate must check affected-groups table: {}",
+        !sql.contains("USING (SELECT"),
+        "MERGE must never use inline transition-table subquery: {}",
         &sql[..sql.len().min(600)]
     );
-    // The spliced INSERT must have the null-safe filter before GROUP BY.
-    let insert_pos = sql.find("INSERT INTO").expect("INSERT must be present");
+    // The target INSERT (into test_view) must have the null-safe filter before GROUP BY.
+    let insert_pos = sql
+        .find("INSERT INTO \"test_view\"")
+        .expect("target INSERT must be present");
     let tail = &sql[insert_pos..];
-    let filter_pos = tail.find("IS NOT DISTINCT FROM").expect("null-safe filter must be in INSERT");
-    let group_by_pos = tail.find("GROUP BY").expect("GROUP BY must be in INSERT");
+    let filter_pos = tail
+        .find("IS NOT DISTINCT FROM")
+        .expect("null-safe filter must be in target INSERT");
+    let group_by_pos = tail
+        .find("GROUP BY")
+        .expect("GROUP BY must be in target INSERT");
     assert!(
         filter_pos < group_by_pos,
-        "null-safe filter must appear before GROUP BY in INSERT: {}",
+        "null-safe filter must appear before GROUP BY in target INSERT: {}",
         &tail[..tail.len().min(400)]
     );
 }
 
 #[test]
-fn test_build_delta_sql_no_gate_for_sentinel_case() {
+fn test_build_delta_sql_scratch_used_for_sentinel_case() {
+    // No group-by columns: scratch table is still used for MERGE materialization.
     let mut plan = simple_plan();
     plan.group_by_columns = vec![];
     plan.distinct_columns = vec![];
@@ -568,19 +583,25 @@ fn test_build_delta_sql_no_gate_for_sentinel_case() {
         "INSERT",
         base_q,
         end_q,
-        &agg_json,
+        Some(agg_json.as_str()),
         base_q,
     );
     assert!(
-        !sql.contains("DO $reflex_refresh$"),
-        "sentinel (no-group) branch must NOT emit DO block: {}",
+        sql.contains("TRUNCATE \"__reflex_scratch_test_view\""),
+        "no-group INSERT must still use scratch table: {}",
+        &sql[..sql.len().min(400)]
+    );
+    assert!(
+        !sql.contains("USING (SELECT"),
+        "MERGE must never use inline transition-table subquery: {}",
         &sql[..sql.len().min(400)]
     );
 }
 
 #[test]
-fn test_build_delta_sql_do_block_includes_dead_cleanup_when_expected() {
-    let plan = simple_plan(); // needs_ivm_count=true
+fn test_build_delta_sql_dead_cleanup_emitted_as_statement() {
+    // needs_ivm_count=true + DELETE: dead-group cleanup is a plain statement, not wrapped in a DO block.
+    let plan = simple_plan();
     let agg_json = serde_json::to_string(&plan).unwrap();
     let base_q = "SELECT city, SUM(amount) AS \"__sum_amount\", COUNT(*) AS __ivm_count FROM orders GROUP BY city";
     let end_q =
@@ -591,18 +612,24 @@ fn test_build_delta_sql_do_block_includes_dead_cleanup_when_expected() {
         "DELETE",
         base_q,
         end_q,
-        &agg_json,
+        Some(agg_json.as_str()),
         base_q,
     );
-    let do_pos = sql
-        .find("DO $reflex_refresh$")
-        .expect("DO block must be present for targeted DELETE");
     let cleanup_pos = sql
         .find("__ivm_count <= 0")
         .expect("dead cleanup must be present for DELETE with needs_ivm_count");
+    let target_delete_pos = sql
+        .find("DELETE FROM \"test_view\"")
+        .expect("target DELETE must be present");
     assert!(
-        cleanup_pos > do_pos,
-        "dead cleanup must be inside the DO block, not emitted as a separate statement before it"
+        cleanup_pos < target_delete_pos,
+        "dead cleanup must precede target DELETE (both are plain statements): {}",
+        &sql[..sql.len().min(600)]
+    );
+    assert!(
+        !sql.contains("DO $reflex_refresh$"),
+        "dead cleanup must not be wrapped in a DO block: {}",
+        &sql[..sql.len().min(400)]
     );
 }
 
@@ -638,25 +665,43 @@ fn test_build_delta_sql_splice_injects_filter_before_group_by() {
         output_column_order: vec![],
     };
     let agg_json = serde_json::to_string(&plan).unwrap();
-    let base_q = "SELECT \"grp\", \"val\", COUNT(*) AS __ivm_count FROM src GROUP BY \"grp\", \"val\"";
+    let base_q =
+        "SELECT \"grp\", \"val\", COUNT(*) AS __ivm_count FROM src GROUP BY \"grp\", \"val\"";
     let end_q = "SELECT \"grp\", COUNT(\"val\") AS cd FROM \"__reflex_intermediate_test_view\" WHERE __ivm_count > 0 GROUP BY \"grp\"";
-    let sql = reflex_build_delta_sql("test_view", "src", "DELETE", base_q, end_q, &agg_json, base_q);
+    let sql = reflex_build_delta_sql(
+        "test_view",
+        "src",
+        "DELETE",
+        base_q,
+        end_q,
+        Some(agg_json.as_str()),
+        base_q,
+    );
 
     assert!(
-        sql.contains("DO $reflex_refresh$"),
-        "targeted splice must emit DO block: {}",
+        sql.contains("TRUNCATE \"__reflex_scratch_test_view\""),
+        "targeted splice must use scratch table: {}",
         &sql[..sql.len().min(600)]
     );
-    // The INSERT must contain the null-safe filter spliced before GROUP BY.
-    let insert_pos = sql.find("INSERT INTO").expect("INSERT must be present");
+    assert!(
+        !sql.contains("USING (SELECT"),
+        "MERGE must never use inline transition-table subquery: {}",
+        &sql[..sql.len().min(600)]
+    );
+    // The target INSERT (into test_view) must have the null-safe filter spliced before GROUP BY.
+    let insert_pos = sql
+        .find("INSERT INTO \"test_view\"")
+        .expect("target INSERT must be present");
     let tail = &sql[insert_pos..];
     let filter_pos = tail
         .find("IS NOT DISTINCT FROM")
-        .expect("null-safe filter must appear in INSERT");
-    let group_by_pos = tail.find("GROUP BY").expect("GROUP BY must be in INSERT");
+        .expect("null-safe filter must appear in target INSERT");
+    let group_by_pos = tail
+        .find("GROUP BY")
+        .expect("GROUP BY must be in target INSERT");
     assert!(
         filter_pos < group_by_pos,
-        "filter must precede GROUP BY: {}",
+        "filter must precede GROUP BY in target INSERT: {}",
         &tail[..tail.len().min(500)]
     );
 }
@@ -670,7 +715,15 @@ fn test_build_delta_sql_splice_falls_back_when_no_group_by_cols() {
     let agg_json = serde_json::to_string(&plan).unwrap();
     let base_q = "SELECT COUNT(*) AS __ivm_count FROM orders";
     let end_q = "SELECT some_col, COUNT(*) AS cd FROM orders GROUP BY some_col";
-    let sql = reflex_build_delta_sql("test_view", "orders", "DELETE", base_q, end_q, &agg_json, base_q);
+    let sql = reflex_build_delta_sql(
+        "test_view",
+        "orders",
+        "DELETE",
+        base_q,
+        end_q,
+        Some(agg_json.as_str()),
+        base_q,
+    );
 
     assert!(
         !sql.contains("DO $reflex_refresh$"),
@@ -682,20 +735,36 @@ fn test_build_delta_sql_splice_falls_back_when_no_group_by_cols() {
         "full-rebuild fallback must contain DELETE FROM: {}",
         &sql[..sql.len().min(400)]
     );
+    assert!(
+        !sql.contains("USING (SELECT"),
+        "MERGE must never use inline transition-table subquery: {}",
+        &sql[..sql.len().min(400)]
+    );
 }
 
 #[test]
 fn test_splice_helper_handles_having_clause() {
-    let input = "SELECT grp, COUNT(val) FROM int WHERE __ivm_count > 0 GROUP BY grp HAVING COUNT(val) > 0";
+    let input =
+        "SELECT grp, COUNT(val) FROM int WHERE __ivm_count > 0 GROUP BY grp HAVING COUNT(val) > 0";
     let result = inject_affected_filter_before_group_by(input, &["\"grp\"".to_string()], "aff_tbl");
     let spliced = result.expect("should succeed when GROUP BY present");
 
     let filter_pos = spliced.find("EXISTS").expect("filter must be present");
-    let group_by_pos = spliced.find("GROUP BY").expect("GROUP BY must be preserved");
+    let group_by_pos = spliced
+        .find("GROUP BY")
+        .expect("GROUP BY must be preserved");
     let having_pos = spliced.find("HAVING").expect("HAVING must be preserved");
 
-    assert!(filter_pos < group_by_pos, "filter must precede GROUP BY: {}", spliced);
-    assert!(group_by_pos < having_pos, "GROUP BY must precede HAVING: {}", spliced);
+    assert!(
+        filter_pos < group_by_pos,
+        "filter must precede GROUP BY: {}",
+        spliced
+    );
+    assert!(
+        group_by_pos < having_pos,
+        "GROUP BY must precede HAVING: {}",
+        spliced
+    );
 }
 
 #[test]
@@ -705,7 +774,10 @@ fn test_splice_helper_returns_none_when_no_group_by() {
         &["\"grp\"".to_string()],
         "aff_tbl",
     );
-    assert!(result.is_none(), "helper must return None when no GROUP BY marker found");
+    assert!(
+        result.is_none(),
+        "helper must return None when no GROUP BY marker found"
+    );
 }
 
 #[test]
@@ -738,9 +810,18 @@ fn test_build_delta_sql_splice_uses_distinct_projection_for_compound_key() {
         output_column_order: vec![],
     };
     let agg_json = serde_json::to_string(&plan).unwrap();
-    let base_q = "SELECT \"grp\", \"val\", COUNT(*) AS __ivm_count FROM src GROUP BY \"grp\", \"val\"";
+    let base_q =
+        "SELECT \"grp\", \"val\", COUNT(*) AS __ivm_count FROM src GROUP BY \"grp\", \"val\"";
     let end_q = "SELECT \"grp\", COUNT(\"val\") AS cd FROM \"__reflex_intermediate_test_view\" WHERE __ivm_count > 0 GROUP BY \"grp\"";
-    let sql = reflex_build_delta_sql("test_view", "src", "DELETE", base_q, end_q, &agg_json, base_q);
+    let sql = reflex_build_delta_sql(
+        "test_view",
+        "src",
+        "DELETE",
+        base_q,
+        end_q,
+        Some(agg_json.as_str()),
+        base_q,
+    );
 
     // Filter in the INSERT splice must reference "grp" (output group col).
     assert!(
@@ -748,8 +829,10 @@ fn test_build_delta_sql_splice_uses_distinct_projection_for_compound_key() {
         "splice filter must use output group col grp: {}",
         &sql[..sql.len().min(600)]
     );
-    // Filter must NOT reference "val" (distinct col, part of compound intermediate key but not output group).
-    let insert_pos = sql.find("INSERT INTO").expect("INSERT must be present");
+    // Filter must NOT reference "val" in the target INSERT (distinct col, not an output group col).
+    let insert_pos = sql
+        .find("INSERT INTO \"test_view\"")
+        .expect("target INSERT must be present");
     let insert_tail = &sql[insert_pos..];
     assert!(
         !insert_tail.contains("\"val\" IS NOT DISTINCT FROM"),
@@ -868,7 +951,7 @@ fn test_build_delta_sql_bool_or_has_no_recompute() {
         "DELETE",
         base_q,
         end_q,
-        &agg_json,
+        Some(agg_json.as_str()),
         base_q,
     );
 
@@ -878,4 +961,157 @@ fn test_build_delta_sql_bool_or_has_no_recompute() {
         "algebraic BOOL_OR must not emit a recompute UPDATE: {}",
         &sql[..sql.len().min(600)]
     );
+}
+
+fn passthrough_plan(source: &str) -> AggregationPlan {
+    let mut mappings = std::collections::HashMap::new();
+    mappings.insert(
+        source.to_string(),
+        vec![("city".to_string(), "city".to_string())],
+    );
+    AggregationPlan {
+        group_by_columns: vec![],
+        intermediate_columns: vec![],
+        end_query_mappings: vec![],
+        has_distinct: false,
+        needs_ivm_count: false,
+        distinct_columns: vec![],
+        is_passthrough: true,
+        passthrough_columns: vec!["city".to_string()],
+        passthrough_key_mappings: mappings,
+        having_clause: None,
+        not_null_columns: std::collections::HashSet::new(),
+        group_by_aliases: std::collections::HashMap::new(),
+        output_column_order: vec![],
+    }
+}
+
+/// Split generated delta SQL into its constituent statements the same way the
+/// trigger body does (`string_to_array(_, '\n--<<REFLEX_SEP>>--\n')`).
+fn split_reflex_sep(sql: &str) -> Vec<&str> {
+    sql.split("\n--<<REFLEX_SEP>>--\n").collect()
+}
+
+/// A statement is "sanctioned" to touch a transition table iff it's a plain
+/// `INSERT INTO "__reflex_{scratch|pt_new|pt_old}_*" SELECT * FROM "__reflex_{new|old}_*"`.
+/// Everything else referencing `__reflex_new_*` / `__reflex_old_*` is the
+/// SIGABRT pattern and must be rejected by the generator guard.
+fn is_sanctioned_scratch_populate(stmt: &str) -> bool {
+    let t = stmt.trim_start();
+    t.starts_with("INSERT INTO \"__reflex_scratch_")
+        || t.starts_with("INSERT INTO \"__reflex_pt_new_")
+        || t.starts_with("INSERT INTO \"__reflex_pt_old_")
+}
+
+fn assert_no_transition_leaks(sql: &str, context: &str) {
+    for stmt in split_reflex_sep(sql) {
+        let has_new = stmt.contains("\"__reflex_new_");
+        let has_old = stmt.contains("\"__reflex_old_");
+        if !has_new && !has_old {
+            continue;
+        }
+        assert!(
+            is_sanctioned_scratch_populate(stmt),
+            "{context}: transition table leaked into unsanctioned statement:\n{stmt}"
+        );
+    }
+}
+
+#[test]
+fn test_passthrough_insert_materializes_via_pt_new_scratch() {
+    let plan = passthrough_plan("chain_l1");
+    let agg_json = serde_json::to_string(&plan).unwrap();
+    let base_q = "SELECT city, total, cnt FROM chain_l1";
+
+    let sql = reflex_build_delta_sql(
+        "chain_l2",
+        "chain_l1",
+        "INSERT",
+        base_q,
+        "",
+        Some(agg_json.as_str()),
+        base_q,
+    );
+
+    assert!(
+        sql.contains("TRUNCATE \"__reflex_pt_new_chain_l2_chain_l1\""),
+        "INSERT must TRUNCATE the new-side pt scratch: {sql}"
+    );
+    assert!(
+        sql.contains(
+            "INSERT INTO \"__reflex_pt_new_chain_l2_chain_l1\" SELECT * FROM \"__reflex_new_chain_l1\""
+        ),
+        "INSERT must populate pt_new scratch from new transition: {sql}"
+    );
+    assert_no_transition_leaks(&sql, "passthrough INSERT");
+}
+
+#[test]
+fn test_passthrough_delete_reads_pt_old_scratch_not_transition() {
+    let plan = passthrough_plan("chain_l1");
+    let agg_json = serde_json::to_string(&plan).unwrap();
+    let base_q = "SELECT city, total, cnt FROM chain_l1";
+
+    let sql = reflex_build_delta_sql(
+        "chain_l2",
+        "chain_l1",
+        "DELETE",
+        base_q,
+        "",
+        Some(agg_json.as_str()),
+        base_q,
+    );
+
+    assert!(
+        sql.contains("INSERT INTO \"__reflex_pt_old_chain_l2_chain_l1\""),
+        "DELETE must populate pt_old scratch: {sql}"
+    );
+    assert!(
+        sql.contains("FROM \"__reflex_pt_old_chain_l2_chain_l1\""),
+        "DELETE WHERE IN subquery must read from pt_old scratch: {sql}"
+    );
+    assert_no_transition_leaks(&sql, "passthrough DELETE");
+}
+
+#[test]
+fn test_passthrough_update_materializes_both_sides() {
+    let plan = passthrough_plan("chain_l1");
+    let agg_json = serde_json::to_string(&plan).unwrap();
+    let base_q = "SELECT city, total, cnt FROM chain_l1";
+
+    let sql = reflex_build_delta_sql(
+        "chain_l2",
+        "chain_l1",
+        "UPDATE",
+        base_q,
+        "",
+        Some(agg_json.as_str()),
+        base_q,
+    );
+
+    assert!(
+        sql.contains("\"__reflex_pt_new_chain_l2_chain_l1\""),
+        "UPDATE must use pt_new for the insert phase: {sql}"
+    );
+    assert!(
+        sql.contains("\"__reflex_pt_old_chain_l2_chain_l1\""),
+        "UPDATE must use pt_old for the delete phase: {sql}"
+    );
+    assert_no_transition_leaks(&sql, "passthrough UPDATE");
+}
+
+/// Regression guard: the aggregate branch must also keep transition tables
+/// confined to sanctioned scratch-populate statements (Phase B's fix).
+#[test]
+fn test_aggregate_delta_sql_has_no_transition_leaks() {
+    let plan = simple_plan();
+    let agg_json = serde_json::to_string(&plan).unwrap();
+    let base_q = "SELECT city, SUM(amount) AS \"__sum_amount\", COUNT(*) AS __ivm_count FROM \"__reflex_new_t\" GROUP BY city";
+    let end_q = "SELECT \"city\", \"__sum_amount\" AS total FROM \"__reflex_intermediate_v\" WHERE __ivm_count > 0";
+
+    for op in ["INSERT", "DELETE", "UPDATE"] {
+        let sql =
+            reflex_build_delta_sql("v", "t", op, base_q, end_q, Some(agg_json.as_str()), base_q);
+        assert_no_transition_leaks(&sql, &format!("aggregate {op}"));
+    }
 }
