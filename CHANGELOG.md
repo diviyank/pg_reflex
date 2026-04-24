@@ -1,5 +1,52 @@
 # Changelog
 
+## [1.2.0] - 2026-04-24
+
+### Performance
+- **Affected-groups-scoped MIN/MAX recompute** — `build_min_max_recompute_sql` now wraps the `orig_base_query` in a filter that restricts it to groups present in `__reflex_affected_<view>`. On retractions, only groups actually touched by the delta get re-aggregated, instead of every group in the source. For IMVs with MIN/MAX over large sources (stock_chart-style workloads), this turns a full-scan recompute into an O(delta) operation when the affected-group set is small.
+
+### Added
+- **Operational safety — per-IMV SAVEPOINT in cascade flush** — `reflex_flush_deferred` wraps each per-IMV flush body in its own `SAVEPOINT`. One bad IMV (e.g. a broken base_query after a source schema change) logs a `WARNING` and allows the cascade to continue instead of aborting every upstream update.
+- **Event trigger — auto-drop on source drop** — new `reflex_on_sql_drop` event trigger (`sql_drop`). Dropping a source table automatically removes dependent registry rows so the extension no longer carries stale references.
+- **Event trigger — warn on source `ALTER TABLE`** — new `reflex_on_ddl_command_end` event trigger (`ddl_command_end`, tag `ALTER TABLE`). Raises a `WARNING` suggesting `reflex_rebuild_imv` when a tracked source is altered.
+- **`reflex_rebuild_imv(name)`** — public alias over `reflex_reconcile` for consistency with post-schema-change recovery guidance.
+- **Observability — registry columns** — `__reflex_ivm_reference` gains `last_flush_ms`, `last_flush_rows`, `flush_count`, `last_error`. Populated by each per-IMV `SAVEPOINT` block inside `reflex_flush_deferred` (success clears `last_error`; failure records it).
+- **Observability — SPIs** — `reflex_ivm_status()`, `reflex_ivm_stats(view_name)`, `reflex_explain_flush(view_name)` let operators inspect registered IMVs, their sizes, and the next-flush plan without firing a write.
+- **Streaming separator for trigger bodies** — `reflex_execute_separated(sql)` #[pg_extern] consumes a `--<<REFLEX_SEP>>--`-delimited statement stream. Used by the `TRUNCATE` trigger body; INSERT/DELETE/UPDATE trigger bodies still use the `string_to_array` loop because calling an extension function from inside those trigger bodies drops transition-table scope.
+
+### Fixed
+- **Bug #10 — transitive cycle detection** in `create_reflex_ivm`. Walks existing `depends_on` edges before registering the new row; rejects circular dependencies with a clear error.
+- **Bug #11 — 64-bit advisory lock keys** — `pg_advisory_xact_lock(key1, key2)` seeded from a 64-bit hash, replacing the single-`hashtext`-arg form that could collide across names.
+- **Bug #7 — `resolve_column_type` silent TEXT** — emits `pgrx::warning!` on catalog-lookup failure and defaults to `NUMERIC` instead of `TEXT`. Cast errors at CREATE time are preferable to silent behaviour drift.
+- **Bug #4 — reserved CTE alias collision** — `create_reflex_ivm` rejects user CTEs named `__reflex_new_<src>` / `__reflex_old_<src>` / `__reflex_delta_<src>` rather than silently corrupting rewrites.
+- **Bug #13 — STRICT vs nullable `where_predicate`** — handled inside `reflex_flush_deferred` rather than at the function signature, keeping the one-arg extension API stable.
+
+### Tests
+- 485 lib tests (up from 481 in 1.1.3).
+- New: 4 unit tests for the affected-groups-scoped recompute SQL shape (`test_min_max_recompute_scoped_to_affected_groups_when_provided`, `test_min_max_recompute_no_affected_filter_when_none_passed`, `test_min_max_recompute_affected_filter_uses_multiple_group_columns`, `test_min_max_recompute_skips_affected_filter_for_sentinel_plan`).
+
+### Deferred to 1.3.0
+- **MIN/MAX bounded top-K heap (`__min_X_topk`)** — originally scoped for 1.2.0; deferred after evaluating complexity-vs-payoff. The affected-groups-scoped recompute above captures the common-case win at a fraction of the code and migration cost. Top-K revisits once benchmark data shows retractions repeatedly hitting the same hot groups.
+- **Lazy index maintenance on bulk rebuild** — `DROP INDEX … INSERT … CREATE INDEX` when the affected set exceeds 50 % of the intermediate. Niche payoff and risky under concurrent flushers with advisory locks; left out of 1.2.0 pending a realistic workload that benefits.
+
+## [1.1.3] - 2026-04-22
+
+### Performance
+- **Algebraic `BOOL_OR`** — `BOOL_OR(expr)` now decomposes into two BIGINT companion columns (`__bool_or_<arg>_true_count` and `__bool_or_<arg>_nonnull_count`), both maintained with pure `SUM(+)/SUM(-)` algebra. Removes the full-scan recompute on DELETE/UPDATE. End-query maps the two counters back to boolean via a `CASE` expression that preserves Postgres `BOOL_OR` NULL semantics (`NULL` when every input was NULL, `FALSE` when at least one was non-NULL and none TRUE, `TRUE` otherwise).
+- **Empty-affected DO-block gate** — the targeted `DELETE + INSERT` path for group-by IMVs is now wrapped in a `DO $$ … IF EXISTS(…) THEN … END IF; END $$` block that short-circuits when the affected-groups staging table is empty. Avoids a full target-table scan on transactions that produce no matching groups.
+- **`parallel_safe` SQL-building functions** — `reflex_build_delta_sql` and `reflex_build_truncate_sql` are annotated `PARALLEL SAFE`. They read no shared state and produce deterministic SQL given identical arguments.
+- **Staging-delta `ANALYZE`** — `reflex_flush_deferred` runs `ANALYZE` on the staging delta table before processing so the planner gets non-zero row estimates after the `TRUNCATE` that reset stats.
+- **Per-IMV `where_predicate` registry column** — the IMV registry stores each view's `where_predicate`. Deferred UPDATE trigger bodies check the predicate against the transition table before taking the advisory lock; `reflex_flush_deferred` skips IMVs whose predicate matches no staged row. Particularly effective for sub-IMVs of a `UNION` with disjoint filters.
+- **End-query targeted splice for `GROUP BY` end_queries** — `reflex_build_delta_sql` splices `AND (<gb_cols>) IN (SELECT DISTINCT <gb_cols> FROM "<affected_tbl>")` before the `GROUP BY` clause instead of falling back to a full `DELETE + INSERT … end_query`. Primary beneficiary: `COUNT(DISTINCT)` IMVs.
+
+### Fixed
+- **63-char identifier truncation** — `transition_new_table_name`, `transition_old_table_name`, and `staging_delta_table_name` now generate guaranteed-unique, ≤63-byte identifiers via a sanitize-then-truncate helper. Previously, long source names could produce colliding transition-table names across IMVs.
+- **MIN/MAX / BOOL_OR recompute scalar-subquery bug** — `build_min_max_recompute_sql` wraps `orig_base_query` as `(…) AS __src` before referencing group keys. Previously the direct-column reference failed with `missing FROM-clause entry for table "alias"` on JOIN-aliased base queries.
+- **Concurrent-flush advisory-lock collision** — the deferred-flush advisory-lock key now derives from a hash of `(view_name, source_table)` jointly, so two concurrent sessions flushing different IMVs on the same source don't serialize on the same integer key.
+
+### Tests
+- 481 lib tests (up from 406 in 1.1.1).
+
 ## [1.1.1] - 2026-03-29
 
 ### Added

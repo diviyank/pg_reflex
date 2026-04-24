@@ -553,9 +553,25 @@ Trigger overhead only (GROUP BY + SUM/COUNT), measured in isolation.
 
 - **Passthrough DELETE/UPDATE with exact duplicates:** Passthrough IMVs use row-matching for incremental DELETE/UPDATE. If the view contains rows that are identical across ALL columns (exact duplicates), a single-row delete may remove multiple matching rows. This is rare in practice (most queries include a PK or unique column).
 - **Recursive CTEs:** `WITH RECURSIVE` is not supported.
-- **MIN/MAX/BOOL_OR on DELETE:** Requires full group rescan from the source table (no algebraic inverse for extrema or boolean OR).
+- **MIN/MAX on DELETE:** the stored extremum is nulled on every retraction and re-derived from the source, scoped to the groups affected by the delta (not the full table). Workloads that retract from the same hot group repeatedly may still re-scan that group's rows on each flush. `BOOL_OR` is algebraic since 1.1.3 and carries no retraction cost.
 - **Non-deterministic functions:** `NOW()`, `RANDOM()`, `CURRENT_DATE` in WHERE clauses are not supported -- the view definition must be static.
 - **Subqueries with aggregation in FROM:** `SELECT ... FROM (SELECT SUM(x) ... GROUP BY y) AS sub` is not supported — use a CTE (`WITH sub AS (...)`) instead, which pg_reflex decomposes into sub-IMVs automatically. Simple subqueries without aggregation (e.g., WHERE filters) work correctly.
+
+## Monitoring
+
+Since 1.2.0 pg_reflex exposes three read-only SPIs for operational visibility:
+
+- `reflex_ivm_status()` — one row per registered IMV with `graph_depth`, `refresh_mode`, live `row_count`, `last_flush_ms`, `last_flush_rows`, `flush_count`, `last_error`, `last_update_date`.
+- `reflex_ivm_stats(view_name)` — intermediate/target byte sizes, index count, trigger count, last flush timing breakdown.
+- `reflex_explain_flush(view_name)` — `EXPLAIN (ANALYZE FALSE, VERBOSE)` of the SQL that the next flush would emit, without actually running it.
+
+Each per-IMV flush body is wrapped in a `SAVEPOINT`. A failing IMV logs a `WARNING`, records `last_error`, and does not abort the rest of the cascade — cascade correctness is a per-IMV property, not a per-transaction one.
+
+## Operational notes
+
+- **Source `DROP TABLE`** — the `reflex_on_sql_drop` event trigger auto-removes registry rows for IMVs whose source was dropped. Run `SELECT reflex_rebuild_imv('<name>')` if you later recreate the source and want the IMV back.
+- **Source `ALTER TABLE`** — the `reflex_on_ddl_command_end` trigger raises a `WARNING` when a tracked source is altered, with guidance to run `SELECT reflex_rebuild_imv('<name>')`. The extension will not block the ALTER.
+- **Concurrent flushes** — the per-(view, source) advisory lock keys are derived from a 64-bit hash joined into two i32s (`pg_advisory_xact_lock(key1, key2)`), so two sessions flushing distinct IMVs on the same source no longer serialize on the same integer.
 
 ## Project Structure
 

@@ -324,3 +324,70 @@ fn test_flush_records_timing_and_row_count() {
     .expect("v");
     assert!(has_ms, "last_flush_ms must be recorded after flush");
 }
+
+/// Theme 1 — MIN/MAX retraction correctness with affected-groups-scoped recompute.
+/// Creates an IMV with MIN and MAX over a grouped source, deletes rows whose
+/// values are the current extrema for their group, and asserts that the IMV
+/// reflects the new extrema. The scoped recompute must still be correct even
+/// though it only re-aggregates the affected groups.
+#[pg_test]
+fn test_min_max_retraction_scoped_recompute_correctness() {
+    Spi::run("CREATE TABLE mmr_t (id SERIAL, grp TEXT, val NUMERIC)").expect("create");
+    // Seed three groups, each with a distinct min and max.
+    Spi::run(
+        "INSERT INTO mmr_t (grp, val) VALUES \
+         ('A', 10), ('A', 20), ('A', 30), \
+         ('B', 100), ('B', 200), ('B', 300), \
+         ('C', 5), ('C', 15), ('C', 25)",
+    )
+    .expect("seed");
+    let r = crate::create_reflex_ivm(
+        "mmr_v",
+        "SELECT grp, MIN(val) AS lo, MAX(val) AS hi FROM mmr_t GROUP BY grp",
+        None,
+        None,
+        None,
+    );
+    assert_eq!(r, "CREATE REFLEX INCREMENTAL VIEW", "setup: {}", r);
+
+    // Delete the MIN of group A (10) and the MAX of group B (300).
+    // Group C is untouched — its intermediate row should not be recomputed at all.
+    Spi::run("DELETE FROM mmr_t WHERE (grp = 'A' AND val = 10) OR (grp = 'B' AND val = 300)")
+        .expect("delete extrema");
+
+    // Oracle comparison: the IMV must match a fresh aggregation.
+    assert_imv_correct(
+        "mmr_v",
+        "SELECT grp, MIN(val) AS lo, MAX(val) AS hi FROM mmr_t GROUP BY grp",
+    );
+}
+
+/// Theme 1 — MIN/MAX retraction where all rows of a group are removed.
+/// The group must be eliminated from the IMV (via the __ivm_count <= 0 gate),
+/// not resurrected by the scoped recompute with stale values.
+#[pg_test]
+fn test_min_max_retraction_empty_group_eliminated() {
+    Spi::run("CREATE TABLE mmre_t (id SERIAL, grp TEXT, val NUMERIC)").expect("create");
+    Spi::run("INSERT INTO mmre_t (grp, val) VALUES ('X', 1), ('X', 2), ('Y', 10), ('Y', 20)")
+        .expect("seed");
+    let r = crate::create_reflex_ivm(
+        "mmre_v",
+        "SELECT grp, MIN(val) AS lo, MAX(val) AS hi FROM mmre_t GROUP BY grp",
+        None,
+        None,
+        None,
+    );
+    assert_eq!(r, "CREATE REFLEX INCREMENTAL VIEW", "setup: {}", r);
+
+    // Remove every row of group X.
+    Spi::run("DELETE FROM mmre_t WHERE grp = 'X'").expect("delete X");
+
+    let cnt = Spi::get_one::<i64>("SELECT COUNT(*) FROM mmre_v WHERE grp = 'X'")
+        .expect("q")
+        .expect("v");
+    assert_eq!(cnt, 0, "group X must be eliminated after all rows retracted");
+    assert_imv_correct(
+        "mmre_v",
+        "SELECT grp, MIN(val) AS lo, MAX(val) AS hi FROM mmre_t GROUP BY grp",
+    );
+}

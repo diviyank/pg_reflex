@@ -341,7 +341,7 @@ fn test_having_only_max_is_recomputed_on_delete() {
     let plan =
         plan_from_sql("SELECT grp, SUM(x) AS total FROM t GROUP BY grp HAVING MAX(amount) > 100");
     let orig_base = "SELECT grp AS \"grp\", SUM(x) AS \"__sum_x\", MAX(amount) AS \"__max_amount\", COUNT(*) AS __ivm_count FROM t GROUP BY grp";
-    let sql = build_min_max_recompute_sql("__reflex_intermediate_v", &plan, orig_base);
+    let sql = build_min_max_recompute_sql("__reflex_intermediate_v", &plan, orig_base, None);
     let sql = sql.expect("HAVING-only MAX must produce a recompute SQL");
     assert!(
         sql.contains("\"__max_amount\" = __src.\"__max_amount\""),

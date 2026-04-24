@@ -138,7 +138,7 @@ fn test_min_max_recompute_sql() {
         output_column_order: vec![],
     };
     let orig_base = "SELECT city AS \"city\", MIN(price) AS \"__min_price\", SUM(amount) AS \"__sum_amount\", COUNT(*) AS __ivm_count FROM orders GROUP BY city";
-    let sql = build_min_max_recompute_sql("intermediate", &plan, orig_base);
+    let sql = build_min_max_recompute_sql("intermediate", &plan, orig_base, None);
     assert!(sql.is_some());
     let sql = sql.unwrap();
     assert!(
@@ -211,7 +211,7 @@ fn test_min_max_recompute_sql_handles_join_aliases() {
         output_column_order: vec![],
     };
     let orig_base = "SELECT s.product_id AS \"product_id\", SUM(CASE WHEN (caav.product_id IS NOT NULL) THEN 1 ELSE 0 END) AS \"__bool_or_caav_product_id_is_not_null_true_count\", COUNT(*) AS __ivm_count FROM sales_simulation s LEFT JOIN current_assortment_activity caav ON caav.product_id = s.product_id GROUP BY s.product_id";
-    let sql = build_min_max_recompute_sql("intermediate", &plan, orig_base);
+    let sql = build_min_max_recompute_sql("intermediate", &plan, orig_base, None);
     assert!(
         sql.is_none(),
         "algebraic BOOL_OR (SUM counters) must not trigger recompute: {:?}",
@@ -223,8 +223,162 @@ fn test_min_max_recompute_sql_handles_join_aliases() {
 fn test_no_min_max_recompute_for_sum_only() {
     let plan = simple_plan();
     let orig_base = "SELECT city, SUM(amount), COUNT(*) FROM orders GROUP BY city";
-    let sql = build_min_max_recompute_sql("intermediate", &plan, orig_base);
+    let sql = build_min_max_recompute_sql("intermediate", &plan, orig_base, None);
     assert!(sql.is_none());
+}
+
+// ========================================================================
+// Theme 1 (1.2.0): affected-groups-scoped MIN/MAX recompute
+// ========================================================================
+
+fn min_only_plan() -> AggregationPlan {
+    AggregationPlan {
+        group_by_columns: vec!["city".to_string()],
+        intermediate_columns: vec![IntermediateColumn {
+            name: "__min_price".to_string(),
+            pg_type: "NUMERIC".to_string(),
+            source_aggregate: "MIN".to_string(),
+            source_arg: "price".to_string(),
+        }],
+        end_query_mappings: vec![],
+        has_distinct: false,
+        needs_ivm_count: true,
+        distinct_columns: vec![],
+        is_passthrough: false,
+        passthrough_columns: vec![],
+        passthrough_key_mappings: std::collections::HashMap::new(),
+        having_clause: None,
+        not_null_columns: std::collections::HashSet::new(),
+        group_by_aliases: std::collections::HashMap::new(),
+        output_column_order: vec![],
+    }
+}
+
+#[test]
+fn test_min_max_recompute_scoped_to_affected_groups_when_provided() {
+    // When an affected-groups table is passed, the orig_base_query subquery
+    // must be filtered down to only the groups that appear in that table.
+    // Without this filter, the recompute re-aggregates the full source on
+    // every retraction — the cliff that makes stock_chart IMVs unusable.
+    let plan = min_only_plan();
+    let orig_base = "SELECT city AS \"city\", MIN(price) AS \"__min_price\", COUNT(*) AS __ivm_count FROM orders GROUP BY city";
+    let sql = build_min_max_recompute_sql(
+        "intermediate",
+        &plan,
+        orig_base,
+        Some("__reflex_affected_v"),
+    )
+    .expect("MIN plan must produce recompute SQL");
+    assert!(
+        sql.contains("__reflex_affected_v"),
+        "recompute SQL must reference the affected-groups table: {}",
+        sql
+    );
+    // The filter should restrict orig_base_query to groups present in the affected table.
+    assert!(
+        sql.contains("\"city\"") && sql.contains("IN (SELECT"),
+        "recompute SQL must include an IN-filter on the group key(s) referencing the affected table: {}",
+        sql
+    );
+}
+
+#[test]
+fn test_min_max_recompute_no_affected_filter_when_none_passed() {
+    // Backward-compatible path: when no affected-groups table is available
+    // (e.g. no-GROUP-BY sentinel case), the emitted SQL must not reference
+    // any affected-groups table.
+    let plan = min_only_plan();
+    let orig_base = "SELECT city AS \"city\", MIN(price) AS \"__min_price\", COUNT(*) AS __ivm_count FROM orders GROUP BY city";
+    let sql = build_min_max_recompute_sql("intermediate", &plan, orig_base, None)
+        .expect("MIN plan must produce recompute SQL");
+    assert!(
+        !sql.contains("__reflex_affected"),
+        "recompute SQL must NOT reference affected-groups table when none provided: {}",
+        sql
+    );
+}
+
+#[test]
+fn test_min_max_recompute_affected_filter_uses_multiple_group_columns() {
+    // Compound-key groups: the IN-filter must reference both group columns.
+    let plan = AggregationPlan {
+        group_by_columns: vec!["region".to_string(), "product".to_string()],
+        intermediate_columns: vec![IntermediateColumn {
+            name: "__min_price".to_string(),
+            pg_type: "NUMERIC".to_string(),
+            source_aggregate: "MIN".to_string(),
+            source_arg: "price".to_string(),
+        }],
+        end_query_mappings: vec![],
+        has_distinct: false,
+        needs_ivm_count: true,
+        distinct_columns: vec![],
+        is_passthrough: false,
+        passthrough_columns: vec![],
+        passthrough_key_mappings: std::collections::HashMap::new(),
+        having_clause: None,
+        not_null_columns: std::collections::HashSet::new(),
+        group_by_aliases: std::collections::HashMap::new(),
+        output_column_order: vec![],
+    };
+    let orig_base = "SELECT region AS \"region\", product AS \"product\", MIN(price) AS \"__min_price\", COUNT(*) AS __ivm_count FROM orders GROUP BY region, product";
+    let sql = build_min_max_recompute_sql(
+        "intermediate",
+        &plan,
+        orig_base,
+        Some("__reflex_affected_v"),
+    )
+    .expect("MIN plan must produce recompute SQL");
+    assert!(
+        sql.contains("\"region\"") && sql.contains("\"product\""),
+        "compound-key filter must reference both group columns: {}",
+        sql
+    );
+    assert!(
+        sql.contains("__reflex_affected_v"),
+        "compound-key filter must reference affected table: {}",
+        sql
+    );
+}
+
+#[test]
+fn test_min_max_recompute_skips_affected_filter_for_sentinel_plan() {
+    // No GROUP BY (sentinel/single-row aggregate) case: there's only one
+    // intermediate row so the recompute naturally targets it. An affected-
+    // groups filter on an empty grp_cols list would produce invalid SQL.
+    let plan = AggregationPlan {
+        group_by_columns: vec![],
+        intermediate_columns: vec![IntermediateColumn {
+            name: "__min_price".to_string(),
+            pg_type: "NUMERIC".to_string(),
+            source_aggregate: "MIN".to_string(),
+            source_arg: "price".to_string(),
+        }],
+        end_query_mappings: vec![],
+        has_distinct: false,
+        needs_ivm_count: true,
+        distinct_columns: vec![],
+        is_passthrough: false,
+        passthrough_columns: vec![],
+        passthrough_key_mappings: std::collections::HashMap::new(),
+        having_clause: None,
+        not_null_columns: std::collections::HashSet::new(),
+        group_by_aliases: std::collections::HashMap::new(),
+        output_column_order: vec![],
+    };
+    let orig_base = "SELECT MIN(price) AS \"__min_price\", COUNT(*) AS __ivm_count FROM orders";
+    let sql = build_min_max_recompute_sql(
+        "intermediate",
+        &plan,
+        orig_base,
+        Some("__reflex_affected_v"),
+    )
+    .expect("MIN plan must produce recompute SQL");
+    assert!(
+        !sql.contains("__reflex_affected_v"),
+        "sentinel (no GROUP BY) plan must not inject affected-groups filter: {}",
+        sql
+    );
 }
 
 #[test]

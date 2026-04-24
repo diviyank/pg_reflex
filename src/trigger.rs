@@ -268,10 +268,19 @@ fn build_net_delta_query(delta_old: &str, delta_new: &str, plan: &AggregationPla
 /// JOINs and aliases referenced by the aggregated expression. A scalar subquery
 /// `SELECT AGG(expr) FROM source_table WHERE …` would fail for such expressions
 /// because `source_table` alone doesn't expose the JOINs.
+///
+/// When `affected_tbl` is `Some(name)` and the plan has group columns, the
+/// `orig_base_query` is wrapped in a filter that restricts its output to groups
+/// present in the affected-groups table. Without this filter, every MIN/MAX
+/// retraction re-aggregates the full source — the cliff that makes stock_chart
+/// IMVs unusable in practice. The wrapper is `SELECT * FROM (<orig>) AS __all
+/// WHERE (<gb_cols>) IN (SELECT DISTINCT <gb_cols> FROM "<affected_tbl>")`, which
+/// pushes the group-key filter down through the aggregation boundary.
 pub fn build_min_max_recompute_sql(
     intermediate_tbl: &str,
     plan: &AggregationPlan,
     orig_base_query: &str,
+    affected_tbl: Option<&str>,
 ) -> Option<String> {
     let min_max_cols: Vec<&crate::aggregation::IntermediateColumn> = plan
         .intermediate_columns
@@ -301,7 +310,8 @@ pub fn build_min_max_recompute_sql(
         .collect();
 
     // Sentinel-only (no GROUP BY) case: single row, no join keys to match.
-    // The WHERE reduces to the NULL filter only.
+    // The WHERE reduces to the NULL filter only. Affected-groups filter is
+    // meaningless without group columns — skip the wrap.
     if group_cols.is_empty() {
         return Some(format!(
             "UPDATE {} SET {} FROM ({}) AS __src WHERE {}",
@@ -311,6 +321,35 @@ pub fn build_min_max_recompute_sql(
             null_check.join(" OR ")
         ));
     }
+
+    // Scope the recompute to affected groups when a table name is available.
+    // The filter must be injected BEFORE the GROUP BY so it scopes the scan
+    // of the source, not the output of the aggregation. Wrapping the query
+    // in `SELECT * FROM (<orig>) WHERE grp IN (...)` post-aggregation was
+    // insufficient: Postgres' planner does not reliably push a filter through
+    // GROUP BY, leaving the full source scan intact (verified with EXPLAIN).
+    //
+    // The injected WHERE references the raw GROUP BY column expressions on
+    // the LHS (so it applies to pre-aggregation rows) and the normalized
+    // column names in the affected-groups table on the RHS. Postgres matches
+    // by value, not by alias, so a raw/normalized pair works.
+    let scoped_source = match affected_tbl {
+        Some(at) => {
+            let raw_csv = plan.group_by_columns.join(", ");
+            let norm_csv: Vec<String> =
+                group_cols.iter().map(|c| format!("\"{}\"", c)).collect();
+            let norm_csv = norm_csv.join(", ");
+            let filter = format!(
+                " AND ({}) IN (SELECT DISTINCT {} FROM \"{}\")",
+                raw_csv, norm_csv, at
+            );
+            match splice_before_group_by(orig_base_query, &filter) {
+                Some(spliced) => spliced,
+                None => orig_base_query.to_string(),
+            }
+        }
+        None => orig_base_query.to_string(),
+    };
 
     let join_cond: Vec<String> = group_cols
         .iter()
@@ -326,7 +365,7 @@ pub fn build_min_max_recompute_sql(
         "UPDATE {} SET {} FROM ({}) AS __src WHERE {} AND ({})",
         intermediate_tbl,
         set_parts.join(", "),
-        orig_base_query,
+        scoped_source,
         join_cond.join(" AND "),
         null_check.join(" OR ")
     ))
@@ -348,6 +387,42 @@ fn null_safe_in(affected_tbl: &str, cols: &[String]) -> String {
         affected_tbl,
         conditions.join(" AND ")
     )
+}
+
+/// Splice a SQL fragment (already formatted as ` AND (...)` or similar) into a
+/// query immediately before its `GROUP BY` clause. If the query has no
+/// existing `WHERE` clause between `FROM` and `GROUP BY`, the leading `AND`
+/// is rewritten to `WHERE`. Returns `None` if no `GROUP BY` is found.
+///
+/// Used by `build_min_max_recompute_sql` to push an affected-groups filter
+/// through the base-query aggregation boundary so the source scan is scoped.
+fn splice_before_group_by(query: &str, and_fragment: &str) -> Option<String> {
+    let upper = query.to_uppercase();
+    let gb_marker = " GROUP BY ";
+    let gb_pos = upper.rfind(gb_marker)?;
+
+    // Determine whether a WHERE exists between the last FROM/JOIN and GROUP BY.
+    let pre_gb_upper = &upper[..gb_pos];
+    let has_where = pre_gb_upper.contains(" WHERE ");
+
+    let fragment = if has_where {
+        and_fragment.to_string()
+    } else {
+        // Rewrite leading " AND" to " WHERE"
+        let trimmed = and_fragment.trim_start();
+        if let Some(rest) = trimmed.strip_prefix("AND ") {
+            format!(" WHERE {}", rest)
+        } else {
+            // Fallback: just prepend WHERE
+            format!(" WHERE {}", trimmed)
+        }
+    };
+
+    let mut out = String::with_capacity(query.len() + fragment.len());
+    out.push_str(&query[..gb_pos]);
+    out.push_str(&fragment);
+    out.push_str(&query[gb_pos..]);
+    Some(out)
 }
 
 /// Splice an affected-groups filter into `end_query` immediately before its `GROUP BY` clause.
@@ -785,7 +860,7 @@ pub fn reflex_build_delta_sql(
             "DELETE" => {
                 let delta_q = replace_source_with_transition(base_query, source_table, &old_tbl);
 
-                if let Some(ref cols) = grp_cols {
+                let recompute_scope: Option<&str> = if let Some(ref cols) = grp_cols {
                     let select_expr = affected_groups_select(cols);
                     push_materialized_merge_and_affected(
                         &mut stmts,
@@ -798,6 +873,7 @@ pub fn reflex_build_delta_sql(
                         &select_expr,
                         true,
                     );
+                    Some(affected_tbl.as_str())
                 } else {
                     push_materialized_merge(
                         &mut stmts,
@@ -807,11 +883,15 @@ pub fn reflex_build_delta_sql(
                         &plan,
                         DeltaOp::Subtract,
                     );
-                }
+                    None
+                };
                 if has_min_max {
-                    if let Some(recompute) =
-                        build_min_max_recompute_sql(&intermediate_tbl, &plan, orig_base_query)
-                    {
+                    if let Some(recompute) = build_min_max_recompute_sql(
+                        &intermediate_tbl,
+                        &plan,
+                        orig_base_query,
+                        recompute_scope,
+                    ) {
                         stmts.push(recompute);
                     }
                 }
@@ -834,9 +914,12 @@ pub fn reflex_build_delta_sql(
                             &select_expr,
                             true,
                         );
-                        if let Some(recompute) =
-                            build_min_max_recompute_sql(&intermediate_tbl, &plan, orig_base_query)
-                        {
+                        if let Some(recompute) = build_min_max_recompute_sql(
+                            &intermediate_tbl,
+                            &plan,
+                            orig_base_query,
+                            Some(affected_tbl.as_str()),
+                        ) {
                             stmts.push(recompute);
                         }
                         push_materialized_merge_and_affected(
@@ -859,9 +942,12 @@ pub fn reflex_build_delta_sql(
                             &plan,
                             DeltaOp::Subtract,
                         );
-                        if let Some(recompute) =
-                            build_min_max_recompute_sql(&intermediate_tbl, &plan, orig_base_query)
-                        {
+                        if let Some(recompute) = build_min_max_recompute_sql(
+                            &intermediate_tbl,
+                            &plan,
+                            orig_base_query,
+                            None,
+                        ) {
                             stmts.push(recompute);
                         }
                         push_materialized_merge(
