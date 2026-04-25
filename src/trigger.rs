@@ -3,6 +3,10 @@ use pgrx::pg_sys::panic::ErrorReportable;
 use pgrx::prelude::*;
 use pgrx::spi::Spi;
 use pgrx::PgBuiltInOids;
+use std::collections::hash_map::DefaultHasher;
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
+use std::sync::{Mutex, OnceLock};
 
 use crate::aggregation::AggregationPlan;
 use crate::query_decomposer::{
@@ -11,6 +15,44 @@ use crate::query_decomposer::{
     replace_identifier, replace_source_with_delta, safe_identifier, split_qualified_name,
     staging_delta_table_name, transition_new_table_name, transition_old_table_name,
 };
+
+/// Per-backend cache of built delta SQL keyed by a hash of all inputs.
+/// Entries are content-addressable: identical inputs always produce identical
+/// SQL, so a registry rebuild that changes base_query/aggregations naturally
+/// produces a different cache key (no explicit invalidation needed).
+const DELTA_SQL_CACHE_MAX: usize = 256;
+
+fn delta_sql_cache() -> &'static Mutex<HashMap<u64, String>> {
+    static CACHE: OnceLock<Mutex<HashMap<u64, String>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::with_capacity(DELTA_SQL_CACHE_MAX)))
+}
+
+fn delta_sql_cache_key(
+    view_name: &str,
+    source_table: &str,
+    operation: &str,
+    base_query: &str,
+    end_query: &str,
+    aggregations_json: Option<&str>,
+    orig_base_query: &str,
+) -> u64 {
+    let mut h = DefaultHasher::new();
+    view_name.hash(&mut h);
+    source_table.hash(&mut h);
+    operation.hash(&mut h);
+    base_query.hash(&mut h);
+    end_query.hash(&mut h);
+    aggregations_json.unwrap_or("").hash(&mut h);
+    orig_base_query.hash(&mut h);
+    h.finish()
+}
+
+#[cfg(any(test, feature = "pg_test"))]
+pub fn reset_delta_sql_cache() {
+    if let Ok(mut guard) = delta_sql_cache().lock() {
+        guard.clear();
+    }
+}
 
 /// Whether a delta adds or subtracts from the intermediate table.
 #[derive(Clone, Copy)]
@@ -738,6 +780,21 @@ pub fn reflex_build_delta_sql(
     aggregations_json: Option<&str>,
     orig_base_query: &str,
 ) -> String {
+    let cache_key = delta_sql_cache_key(
+        view_name,
+        source_table,
+        operation,
+        base_query,
+        end_query,
+        aggregations_json,
+        orig_base_query,
+    );
+    if let Ok(guard) = delta_sql_cache().lock() {
+        if let Some(cached) = guard.get(&cache_key) {
+            return cached.clone();
+        }
+    }
+
     let json = aggregations_json.unwrap_or("{}");
     let plan: AggregationPlan = match serde_json::from_str(json) {
         Ok(p) => p,
@@ -1062,11 +1119,9 @@ pub fn reflex_build_delta_sql(
                     // topk[1] for groups whose heap survived the subtract,
                     // BEFORE the source-scan recompute. The recompute then
                     // only fires for actually-underflowed groups.
-                    if let Some(refresh) = build_topk_scalar_refresh_sql(
-                        &intermediate_tbl,
-                        &plan,
-                        recompute_scope,
-                    ) {
+                    if let Some(refresh) =
+                        build_topk_scalar_refresh_sql(&intermediate_tbl, &plan, recompute_scope)
+                    {
                         stmts.push(refresh);
                     }
                     if let Some(recompute) = build_min_max_recompute_sql(
@@ -1132,11 +1187,9 @@ pub fn reflex_build_delta_sql(
                             &plan,
                             DeltaOp::Subtract,
                         );
-                        if let Some(refresh) = build_topk_scalar_refresh_sql(
-                            &intermediate_tbl,
-                            &plan,
-                            None,
-                        ) {
+                        if let Some(refresh) =
+                            build_topk_scalar_refresh_sql(&intermediate_tbl, &plan, None)
+                        {
                             stmts.push(refresh);
                         }
                         if let Some(recompute) = build_min_max_recompute_sql(
@@ -1270,7 +1323,16 @@ pub fn reflex_build_delta_sql(
     // `DELETE FROM target; INSERT INTO target <end_query>` where end_query
     // can legitimately read from a transition table in some code paths).
 
-    stmts.join("\n--<<REFLEX_SEP>>--\n")
+    let result = stmts.join("\n--<<REFLEX_SEP>>--\n");
+
+    if let Ok(mut guard) = delta_sql_cache().lock() {
+        if guard.len() >= DELTA_SQL_CACHE_MAX {
+            guard.clear();
+        }
+        guard.insert(cache_key, result.clone());
+    }
+
+    result
 }
 
 /// Generates SQL statements to handle a TRUNCATE on a source table.

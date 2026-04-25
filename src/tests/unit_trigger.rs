@@ -1286,3 +1286,79 @@ fn test_aggregate_delta_sql_has_no_transition_leaks() {
         assert_no_transition_leaks(&sql, &format!("aggregate {op}"));
     }
 }
+
+/// O2 cache: identical inputs must produce identical SQL whether served from
+/// cache or built fresh. Differing inputs must produce distinct outputs.
+#[test]
+fn test_delta_sql_cache_consistency() {
+    use crate::trigger::reset_delta_sql_cache;
+
+    let plan = simple_plan();
+    let agg_json = serde_json::to_string(&plan).unwrap();
+    let base_q = "SELECT city, SUM(amount) AS \"__sum_amount\", COUNT(*) AS __ivm_count FROM orders GROUP BY city";
+    let end_q = "SELECT \"city\", \"__sum_amount\" AS total FROM \"__reflex_intermediate_cache_v\"";
+
+    reset_delta_sql_cache();
+    let cold = reflex_build_delta_sql(
+        "cache_v",
+        "orders",
+        "INSERT",
+        base_q,
+        end_q,
+        Some(agg_json.as_str()),
+        base_q,
+    );
+    let warm = reflex_build_delta_sql(
+        "cache_v",
+        "orders",
+        "INSERT",
+        base_q,
+        end_q,
+        Some(agg_json.as_str()),
+        base_q,
+    );
+    assert_eq!(cold, warm, "cache hit must match cache miss byte-for-byte");
+
+    reset_delta_sql_cache();
+    let rebuilt = reflex_build_delta_sql(
+        "cache_v",
+        "orders",
+        "INSERT",
+        base_q,
+        end_q,
+        Some(agg_json.as_str()),
+        base_q,
+    );
+    assert_eq!(cold, rebuilt, "rebuild after reset must match original");
+
+    let other_op = reflex_build_delta_sql(
+        "cache_v",
+        "orders",
+        "DELETE",
+        base_q,
+        end_q,
+        Some(agg_json.as_str()),
+        base_q,
+    );
+    assert_ne!(
+        cold, other_op,
+        "different op key must miss the cache and produce different SQL"
+    );
+
+    let mut plan2 = simple_plan();
+    plan2.group_by_columns = vec!["region".to_string()];
+    let agg_json2 = serde_json::to_string(&plan2).unwrap();
+    let other_plan = reflex_build_delta_sql(
+        "cache_v",
+        "orders",
+        "INSERT",
+        base_q,
+        end_q,
+        Some(agg_json2.as_str()),
+        base_q,
+    );
+    assert_ne!(
+        cold, other_plan,
+        "different aggregations_json must miss cache"
+    );
+}

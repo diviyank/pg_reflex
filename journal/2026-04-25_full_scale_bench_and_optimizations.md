@@ -314,6 +314,78 @@ above 1M rows, scheduled REFRESH MV remains the right tool; pg_reflex's
 sweet spot is 1K-500K-row deltas where the trigger overhead is amortized
 against avoiding the 24s full rebuild.
 
+## O2 — LANDED (2026-04-26)
+
+Implemented `reflex_build_delta_sql` per-backend cache:
+- Static `OnceLock<Mutex<HashMap<u64, String>>>` keyed on a hash of every
+  input (`view_name`, `source_table`, `operation`, `base_query`, `end_query`,
+  `aggregations_json`, `orig_base_query`).
+- Content-addressable: any IMV rebuild that mutates `base_query` /
+  `aggregations` produces a different hash → natural miss, no explicit
+  invalidation required.
+- Cap at 256 entries; on overflow the cache is cleared (no LRU complexity —
+  the working set is bounded by `#IMVs × #sources × 3 ops`, which sits well
+  under 256 for any realistic deployment).
+- `reset_delta_sql_cache` exposed under `cfg(any(test, feature = "pg_test"))`
+  for the consistency unit test.
+
+**Critical re-read of the journal's own claim**: the original O2 section
+projects "DELETE 1K: 445 ms → ~250 ms" (≈150 ms saved per fire). That
+estimate was not grounded — the actual `reflex_build_delta_sql` body is a
+serde_json parse plus a fixed sequence of `format!` / `replace_identifier`
+calls. On the bench's aggregation JSON (~2-5 KB) that's hundreds of µs to a
+small number of ms, not 150 ms. The 30-50% projection is overstated; the
+realistic per-fire saving is in the 200 µs – 2 ms range. So the ROI is on
+**OLTP-shape workloads** (many trigger fires per session, small batches),
+not on the headline 1K/10K/1M bench numbers.
+
+**Risk profile**: cache is purely a function-output memoization. The
+existing 504-test suite covers SQL correctness; adding the cache could only
+break things by returning a stale entry — which the content-addressable key
+prevents. Added `test_delta_sql_cache_consistency` to lock that in
+explicitly (cold == warm, rebuild-after-reset == cold, key dimensions
+diverge as expected).
+
+**Validation**: `cargo pgrx test --features pg17` → 505 / 505 pass
+(includes 337 #[pg_test] integration tests). `cargo clippy --tests` clean.
+
+**Out of scope for this commit**: re-running `bench_full_scale_1_3_0.sql`
+to quantify the win. Given the realistic per-call saving is sub-ms, the
+bench-level signal will be at the noise floor for the headline shapes; the
+real OLTP-workload measurement belongs in a different bench (high-fire-rate,
+small-batch). Deferred.
+
+## O1b / O3 / O4 — DEFERRED
+
+Critical re-read of the recommended ordering against CLAUDE.md priority
+order (correctness > simplicity > performance):
+
+- **O1b** is a re-attempt of an optimization whose simpler form (O1a
+  iteration 1) already shipped a correctness regression that *all
+  non-targeted tests passed* before `pg_test_correctness_update_join_key`
+  caught it. The ambitious version moves part of the safety logic to
+  IMV-create time (column classification) and part to runtime (which
+  columns this trigger event touched). That widens, rather than narrows,
+  the surface where a hole could hide. The single-table-passthrough
+  iteration 2 of O1a came in within measurement noise on a comparable
+  shape — concrete evidence that the family of optimizations is not the
+  free lunch the bench numbers suggest. Held until a real workload signal
+  forces the issue.
+
+- **O4** as written claims `reflex_reconcile` 28.7 s → 5 s for healthy
+  IMVs, but that math doesn't hold without materializing the fresh view
+  (which is itself the 24 s in the bench). A genuine fast path requires
+  either (a) restricting to passthrough IMVs and PK-keyed FULL OUTER JOIN
+  diff, which is plausibly worth ~80 LOC, or (b) re-deriving aggregate
+  intermediate state from base_query and diffing — which is the same cost
+  as the rebuild it's replacing. Held until we either accept the
+  passthrough-only scope or measure that the bench's healthy-reconcile
+  path is dominated by index-rebuild rather than INSERT.
+
+- **O3** is explicitly tagged 1.5.0 in the recommended ordering, requires
+  `pg_background` integration, and carries deadlock risk on shared
+  graph_child chains. Out of scope for this iteration.
+
 ## Reproduce
 
 ```bash
