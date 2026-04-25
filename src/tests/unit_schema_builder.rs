@@ -10,12 +10,14 @@ fn sample_plan() -> AggregationPlan {
                 pg_type: "NUMERIC".to_string(),
                 source_aggregate: "SUM".to_string(),
                 source_arg: "amount".to_string(),
+                topk_k: None,
             },
             IntermediateColumn {
                 name: "__count_star".to_string(),
                 pg_type: "BIGINT".to_string(),
                 source_aggregate: "COUNT".to_string(),
                 source_arg: "*".to_string(),
+                topk_k: None,
             },
         ],
         end_query_mappings: vec![
@@ -229,12 +231,14 @@ fn test_intermediate_ddl_bool_or_emits_bigint_counters() {
                 pg_type: "BIGINT".to_string(),
                 source_aggregate: "SUM".to_string(),
                 source_arg: "CASE WHEN (flag) THEN 1 ELSE 0 END".to_string(),
+                topk_k: None,
             },
             IntermediateColumn {
                 name: "__bool_or_flag_nonnull_count".to_string(),
                 pg_type: "BIGINT".to_string(),
                 source_aggregate: "SUM".to_string(),
                 source_arg: "CASE WHEN (flag) IS NOT NULL THEN 1 ELSE 0 END".to_string(),
+                topk_k: None,
             },
         ],
         end_query_mappings: vec![EndQueryMapping {

@@ -197,6 +197,71 @@ fn reflex_ivm_stats(
     TableIterator::new(out)
 }
 
+/// One row in the result of `reflex_ivm_histogram`.
+type HistogramRow = (Option<f64>, Option<f64>, Option<f64>, Option<i64>, i64);
+
+/// Returns flush latency percentiles for an IMV computed from the
+/// `flush_ms_history` ring buffer (1.3.0). The buffer holds up to 64 most
+/// recent samples; the SPI returns p50, p95, p99, max, and the sample count.
+/// Returns an empty result if the IMV is not registered or has no recorded
+/// flushes.
+#[pg_extern]
+#[allow(clippy::type_complexity)]
+fn reflex_ivm_histogram(
+    view_name: &str,
+) -> TableIterator<
+    'static,
+    (
+        name!(p50_ms, Option<f64>),
+        name!(p95_ms, Option<f64>),
+        name!(p99_ms, Option<f64>),
+        name!(max_ms, Option<i64>),
+        name!(samples, i64),
+    ),
+> {
+    let args =
+        [
+            unsafe {
+                DatumWithOid::new(view_name.to_string(), PgBuiltInOids::TEXTOID.oid().value())
+            },
+        ];
+    let row: Option<HistogramRow> = Spi::connect(|client| {
+        client
+            .select(
+                "WITH samples AS (\
+                       SELECT v::DOUBLE PRECISION AS ms \
+                       FROM public.__reflex_ivm_reference, \
+                            unnest(COALESCE(flush_ms_history, ARRAY[]::BIGINT[])) AS v \
+                       WHERE name = $1 \
+                     ) \
+                     SELECT \
+                       percentile_cont(0.50) WITHIN GROUP (ORDER BY ms) AS p50, \
+                       percentile_cont(0.95) WITHIN GROUP (ORDER BY ms) AS p95, \
+                       percentile_cont(0.99) WITHIN GROUP (ORDER BY ms) AS p99, \
+                       MAX(ms)::BIGINT AS max_ms, \
+                       COUNT(*)::BIGINT AS samples \
+                     FROM samples",
+                None,
+                &args,
+            )
+            .unwrap_or_report()
+            .next()
+            .map(|r| {
+                (
+                    r.get_by_name::<f64, _>("p50").unwrap_or(None),
+                    r.get_by_name::<f64, _>("p95").unwrap_or(None),
+                    r.get_by_name::<f64, _>("p99").unwrap_or(None),
+                    r.get_by_name::<i64, _>("max_ms").unwrap_or(None),
+                    r.get_by_name::<i64, _>("samples")
+                        .unwrap_or(None)
+                        .unwrap_or(0),
+                )
+            })
+    });
+
+    TableIterator::new(row.into_iter().collect::<Vec<_>>())
+}
+
 /// Returns the EXPLAIN output of what the next flush would execute for a given IMV.
 /// Useful for diagnosing plan regressions without actually firing a flush.
 #[pg_extern]

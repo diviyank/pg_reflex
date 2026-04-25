@@ -549,3 +549,59 @@ fn test_passthrough_join_insert_secondary() {
         .expect("q").expect("v");
     assert_eq!(name, "Beta");
 }
+
+#[pg_test]
+fn test_passthrough_auto_pk_from_source() {
+    Spi::run("CREATE TABLE pt_pk_src (id INTEGER PRIMARY KEY, name TEXT, status TEXT)")
+        .expect("create table");
+    Spi::run("INSERT INTO pt_pk_src VALUES (1, 'a', 'active'), (2, 'b', 'active'), (3, 'c', 'inactive')")
+        .expect("seed");
+
+    let result = crate::create_reflex_ivm(
+        "pt_pk_view",
+        "SELECT id, name, status FROM pt_pk_src WHERE status = 'active'",
+        None,
+        None,
+        None,
+    );
+    assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
+
+    assert_eq!(
+        Spi::get_one::<i64>("SELECT COUNT(*) FROM pt_pk_view").expect("q").expect("v"),
+        2,
+    );
+
+    Spi::run("DELETE FROM pt_pk_src WHERE id = 1").expect("delete");
+    assert_eq!(
+        Spi::get_one::<i64>("SELECT COUNT(*) FROM pt_pk_view").expect("q").expect("v"),
+        1,
+        "DELETE on source should propagate via inferred PK without explicit unique_columns",
+    );
+
+    let remaining_name: String = Spi::get_one("SELECT name FROM pt_pk_view")
+        .expect("q").expect("v");
+    assert_eq!(remaining_name, "b");
+}
+
+#[pg_test]
+fn test_passthrough_no_pk_no_inference() {
+    Spi::run("CREATE TABLE pt_nopk_src (id INTEGER, val TEXT)")
+        .expect("create table");
+    Spi::run("INSERT INTO pt_nopk_src VALUES (1, 'a'), (2, 'b')").expect("seed");
+
+    let result = crate::create_reflex_ivm(
+        "pt_nopk_view",
+        "SELECT id, val FROM pt_nopk_src",
+        None,
+        None,
+        None,
+    );
+    assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
+
+    Spi::run("INSERT INTO pt_nopk_src VALUES (3, 'c')").expect("insert");
+    assert_eq!(
+        Spi::get_one::<i64>("SELECT COUNT(*) FROM pt_nopk_view").expect("q").expect("v"),
+        3,
+        "INSERT should still propagate without a PK",
+    );
+}

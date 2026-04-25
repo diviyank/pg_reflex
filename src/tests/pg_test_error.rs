@@ -517,3 +517,65 @@ fn test_error_non_select_queries() {
     assert!(result.starts_with("ERROR"), "ALTER TABLE should be rejected: {}", result);
     assert!(result.contains("not a SELECT"), "ALTER TABLE error should mention 'not a SELECT': {}", result);
 }
+
+#[pg_test]
+fn test_alter_source_policy_warn_default() {
+    Spi::run("CREATE TABLE asp_warn_src (id SERIAL, grp TEXT, val NUMERIC)")
+        .expect("create table");
+    Spi::run("INSERT INTO asp_warn_src (grp, val) VALUES ('a', 1)").expect("seed");
+
+    crate::create_reflex_ivm(
+        "asp_warn_view",
+        "SELECT grp, SUM(val) AS total FROM asp_warn_src GROUP BY grp",
+        None, None, None,
+    );
+
+    // Default policy is warn (or unset, which coalesces to warn). ALTER should succeed.
+    Spi::run("ALTER TABLE asp_warn_src ADD COLUMN extra TEXT").expect("ALTER under warn policy");
+
+    let still_present = Spi::get_one::<i64>(
+        "SELECT COUNT(*) FROM information_schema.columns WHERE table_name = 'asp_warn_src' AND column_name = 'extra'",
+    ).expect("q").expect("v");
+    assert_eq!(still_present, 1, "ALTER should have succeeded under warn policy");
+}
+
+#[pg_test(
+    error = "pg_reflex: ALTER blocked by pg_reflex.alter_source_policy='error' on tracked source(s); affected: public.asp_err_src -> asp_err_view"
+)]
+fn test_alter_source_policy_error_blocks_alter() {
+    Spi::run("CREATE TABLE asp_err_src (id SERIAL, grp TEXT, val NUMERIC)")
+        .expect("create table");
+    Spi::run("INSERT INTO asp_err_src (grp, val) VALUES ('a', 1)").expect("seed");
+
+    crate::create_reflex_ivm(
+        "asp_err_view",
+        "SELECT grp, SUM(val) AS total FROM asp_err_src GROUP BY grp",
+        None, None, None,
+    );
+
+    Spi::run(
+        "SET LOCAL pg_reflex.alter_source_policy = 'error'; \
+         ALTER TABLE asp_err_src ADD COLUMN extra TEXT;",
+    )
+    .expect("ALTER should error out and abort the transaction");
+}
+
+#[pg_test]
+fn test_alter_source_policy_error_allows_untracked_alter() {
+    Spi::run("CREATE TABLE asp_untrk_src (id SERIAL, grp TEXT, val NUMERIC)")
+        .expect("create table");
+    Spi::run("CREATE TABLE asp_other (id SERIAL, x INT)").expect("create other");
+    Spi::run("INSERT INTO asp_untrk_src (grp, val) VALUES ('a', 1)").expect("seed");
+
+    crate::create_reflex_ivm(
+        "asp_untrk_view",
+        "SELECT grp, SUM(val) AS total FROM asp_untrk_src GROUP BY grp",
+        None, None, None,
+    );
+
+    Spi::run(
+        "SET LOCAL pg_reflex.alter_source_policy = 'error'; \
+         ALTER TABLE asp_other ADD COLUMN y TEXT;",
+    )
+    .expect("ALTER on untracked table should succeed even under error policy");
+}

@@ -1,5 +1,66 @@
 # Changelog
 
+## [1.3.0] - 2026-04-25
+
+### Performance
+- **Bounded top-K heap for MIN/MAX (audit R3)** — opt-in `topk` parameter on
+  `create_reflex_ivm` (6th positional arg, integer K, default disabled). When
+  enabled, each MIN/MAX intermediate column gains a sibling
+  `__<name>_topk <type>[]` array maintained on every flush:
+  - INSERT path: top-K sorted-merge of `t.topk || d.topk` truncated to K.
+  - DELETE/UPDATE path: multi-set subtraction via the new
+    `public.__reflex_array_subtract_multiset(anyarray, anyarray)` plpgsql
+    helper; the scalar `__min_x` / `__max_x` is rebuilt from `topk[1]`.
+  - Heap-underflow fallback: when the array empties, the existing scoped
+    recompute (1.2.0) takes over and rebuilds both the scalar and the array
+    from the source.
+  Existing IMVs continue to use the scoped-recompute path with no migration
+  cost. Closes the `stock_chart_*` cliff documented in
+  `journal/2026-04-22_unsupported_views.md` §6 / audit R3 — the 3 IMVs there
+  become eligible for incremental maintenance once operators opt in.
+
+### Added
+- **Per-IMV flush histogram (audit R6)** — `__reflex_ivm_reference` gains
+  a `flush_ms_history BIGINT[]` ring buffer (size 64) populated by
+  `reflex_flush_deferred`. New SPI
+  `reflex_ivm_histogram(view_name) -> (p50_ms, p95_ms, p99_ms, max_ms, samples)`.
+- **`pg_stat_statements` correlation** — each per-IMV flush body sets
+  `application_name = 'reflex_flush:<view>'` for its duration, so operators
+  with `track_application_name = on` can filter pg_stat_statements rows by
+  IMV.
+- **Scalar MIN/MAX (no GROUP BY)** is now a tested supported shape (audit
+  unsupported §2). Two new correctness tests in `pg_test_correctness.rs`.
+  With `topk=K`, scalar retraction becomes O(K) instead of O(N).
+
+### Tests
+- 503 lib tests (up from 497 in 1.2.1).
+- New: 3 top-K integration tests including a 30-iteration random fuzz with
+  EXCEPT ALL oracle, 2 scalar MIN/MAX tests, 2 histogram tests.
+
+## [1.2.1] - 2026-04-25
+
+### Added
+- **`pg_reflex.alter_source_policy` GUC** — controls how the
+  `reflex_on_ddl_command_end` event trigger reacts when a tracked source is
+  altered. Default `'warn'` preserves 1.2.0 behaviour. Set to `'error'` to roll
+  back the ALTER instead of warning (useful for change-control gates). Closes
+  audit risk R2.
+- **`reflex_scheduled_reconcile(max_age_minutes INTEGER DEFAULT 60)`** — SPI
+  designed for pg_cron-driven drift scans. Iterates IMVs whose
+  `last_update_date` is older than the threshold (or NULL), reconciles each in
+  isolation, and returns `(name, status, ms)` per attempt. Closes audit risk
+  R7 with a code-and-recipe approach instead of a background worker.
+
+### Improved
+- **Passthrough PK auto-detection** (audit R5) — already worked for single-source
+  passthroughs; 1.2.1 adds a clearer info message when the source has a PK but
+  the SELECT list does not include all PK columns, telling operators what to add.
+
+### Tests
+- 493 lib tests (up from 487 in 1.2.0).
+- New: 3 alter-source-policy tests, 2 PK auto-detection tests, 2
+  scheduled-reconcile tests, 3 source-drop cleanup tests.
+
 ## [1.2.0] - 2026-04-24
 
 ### Performance
@@ -7,7 +68,7 @@
 
 ### Added
 - **Operational safety — per-IMV SAVEPOINT in cascade flush** — `reflex_flush_deferred` wraps each per-IMV flush body in its own `SAVEPOINT`. One bad IMV (e.g. a broken base_query after a source schema change) logs a `WARNING` and allows the cascade to continue instead of aborting every upstream update.
-- **Event trigger — auto-drop on source drop** — new `reflex_on_sql_drop` event trigger (`sql_drop`). Dropping a source table automatically removes dependent registry rows so the extension no longer carries stale references.
+- **Event trigger — auto-drop on source drop** — new `reflex_on_sql_drop` event trigger (`sql_drop`). Dropping a source table now drops every artifact owned by the IMV (target, intermediate, affected-groups, delta-scratch and passthrough-scratch tables, plus the standalone trigger functions) and removes the registry row. Cascades through `graph_child` so child IMVs are cleaned up too. Closes audit risk R1.
 - **Event trigger — warn on source `ALTER TABLE`** — new `reflex_on_ddl_command_end` event trigger (`ddl_command_end`, tag `ALTER TABLE`). Raises a `WARNING` suggesting `reflex_rebuild_imv` when a tracked source is altered.
 - **`reflex_rebuild_imv(name)`** — public alias over `reflex_reconcile` for consistency with post-schema-change recovery guidance.
 - **Observability — registry columns** — `__reflex_ivm_reference` gains `last_flush_ms`, `last_flush_rows`, `flush_count`, `last_error`. Populated by each per-IMV `SAVEPOINT` block inside `reflex_flush_deferred` (success clears `last_error`; failure records it).

@@ -1,0 +1,194 @@
+/*
+ * pg_reflex docs theme — palette:
+ *   #FCFCFC  near-white            (light bg)
+ *   #4169E1  royal blue            (primary accent)
+ *   #001556  deep navy             (strong / headers)
+ *   #121212  near-black            (text / dark bg)
+ */
+
+:root {
+  --md-primary-fg-color:        #001556;
+  --md-primary-fg-color--light: #4169E1;
+  --md-primary-fg-color--dark:  #000A2A;
+  --md-primary-bg-color:        #FCFCFC;
+  --md-primary-bg-color--light: #FCFCFC;
+
+  --md-accent-fg-color:         #4169E1;
+  --md-accent-fg-color--transparent: rgba(65, 105, 225, 0.1);
+  --md-accent-bg-color:         #FCFCFC;
+  --md-accent-bg-color--light:  #FCFCFC;
+
+  --md-default-bg-color:        #FCFCFC;
+  --md-default-fg-color:        #121212;
+  --md-default-fg-color--light: #2A2A2A;
+  --md-default-fg-color--lighter:#5A5A5A;
+  --md-default-fg-color--lightest:#E6E9F2;
+
+  --md-typeset-color:           #121212;
+  --md-typeset-a-color:         #4169E1;
+
+  --md-code-bg-color:           #F4F6FB;
+  --md-code-fg-color:           #001556;
+  --md-code-hl-color:           rgba(65, 105, 225, 0.15);
+
+  --md-admonition-bg-color:     #F4F6FB;
+
+  --md-footer-bg-color:         #001556;
+  --md-footer-bg-color--dark:   #000A2A;
+  --md-footer-fg-color:         #FCFCFC;
+  --md-footer-fg-color--light:  #C5CFEA;
+  --md-footer-fg-color--lighter:#7A8AB8;
+}
+
+[data-md-color-scheme="slate"] {
+  --md-default-bg-color:        #121212;
+  --md-default-fg-color:        #FCFCFC;
+  --md-default-fg-color--light: #E0E0E0;
+  --md-default-fg-color--lighter:#A0A0A0;
+  --md-default-fg-color--lightest:#3A3A3A;
+
+  --md-primary-fg-color:        #4169E1;
+  --md-primary-fg-color--light: #7A95E8;
+  --md-primary-fg-color--dark:  #001556;
+
+  --md-accent-fg-color:         #7A95E8;
+  --md-accent-fg-color--transparent: rgba(122, 149, 232, 0.18);
+
+  --md-typeset-color:           #FCFCFC;
+  --md-typeset-a-color:         #7A95E8;
+
+  --md-code-bg-color:           #1A1F2E;
+  --md-code-fg-color:           #E6EAF6;
+
+  --md-admonition-bg-color:     #1A1F2E;
+
+  --md-footer-bg-color:         #000A2A;
+  --md-footer-bg-color--dark:   #000314;
+}
+
+/* Header gradient — navy → royal blue */
+.md-header {
+  background: linear-gradient(90deg, #001556 0%, #4169E1 100%);
+}
+.md-tabs {
+  background: #001556;
+}
+[data-md-color-scheme="slate"] .md-tabs {
+  background: #000A2A;
+}
+
+/* Subtle accent on top-level headings */
+.md-typeset h1 {
+  color: var(--md-primary-fg-color);
+  border-bottom: 2px solid #4169E1;
+  padding-bottom: 0.3em;
+  letter-spacing: -0.01em;
+}
+.md-typeset h2 {
+  color: var(--md-primary-fg-color);
+}
+[data-md-color-scheme="slate"] .md-typeset h1,
+[data-md-color-scheme="slate"] .md-typeset h2 {
+  color: #7A95E8;
+}
+
+/* Code blocks: use code-mode font features */
+.md-typeset code,
+.md-typeset pre code {
+  font-feature-settings: "calt" 1, "liga" 1;
+}
+
+/* Admonition tints */
+.md-typeset .admonition.tip,
+.md-typeset details.tip {
+  border-color: #4169E1;
+}
+.md-typeset .admonition.tip > .admonition-title,
+.md-typeset details.tip > summary {
+  background: rgba(65, 105, 225, 0.12);
+}
+.md-typeset .admonition.warning,
+.md-typeset details.warning {
+  border-color: #001556;
+}
+.md-typeset .admonition.note,
+.md-typeset details.note {
+  border-color: #4169E1;
+}
+
+/* Tables — quietly framed in royal blue */
+.md-typeset table:not([class]) {
+  border: 1px solid var(--md-default-fg-color--lightest);
+  border-radius: 4px;
+  overflow: hidden;
+}
+.md-typeset table:not([class]) th {
+  background: rgba(65, 105, 225, 0.08);
+  color: var(--md-primary-fg-color);
+}
+[data-md-color-scheme="slate"] .md-typeset table:not([class]) th {
+  background: rgba(122, 149, 232, 0.15);
+  color: #7A95E8;
+}
+
+/* Hero box on the index page */
+.reflex-hero {
+  background: linear-gradient(135deg, #001556 0%, #4169E1 100%);
+  color: #FCFCFC;
+  padding: 2.5rem 2rem;
+  border-radius: 8px;
+  margin: 1.5rem 0 2rem;
+  box-shadow: 0 6px 20px rgba(0, 21, 86, 0.18);
+}
+.reflex-hero h1 {
+  color: #FCFCFC;
+  border-bottom: none;
+  margin-top: 0;
+}
+.reflex-hero p {
+  color: #E6EAF6;
+  font-size: 1.05rem;
+}
+
+/* Big-three benchmark cards on the home page */
+.reflex-bench-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 1rem;
+  margin: 1.5rem 0;
+}
+.reflex-bench-card {
+  background: #F4F6FB;
+  border-left: 4px solid #4169E1;
+  padding: 1.2rem 1.4rem;
+  border-radius: 4px;
+}
+.reflex-bench-card .label {
+  color: var(--md-default-fg-color--lighter);
+  font-size: 0.8rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+.reflex-bench-card .value {
+  color: #001556;
+  font-size: 1.6rem;
+  font-weight: 600;
+  margin: 0.3rem 0 0.2rem;
+}
+[data-md-color-scheme="slate"] .reflex-bench-card {
+  background: #1A1F2E;
+}
+[data-md-color-scheme="slate"] .reflex-bench-card .value {
+  color: #7A95E8;
+}
+
+/* Search box bg — match palette */
+.md-search__form {
+  background: rgba(252, 252, 252, 0.18);
+}
+.md-search__input {
+  color: #FCFCFC;
+}
+.md-search__input::placeholder {
+  color: #C5CFEA;
+}

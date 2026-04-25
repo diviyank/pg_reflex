@@ -3190,3 +3190,178 @@ fn test_fuzz_count_distinct() {
         assert_imv_correct("cd_fuzz_view", fresh);
     }
 }
+
+#[pg_test]
+fn pg_test_topk_min_basic() {
+    Spi::run("CREATE TABLE topk_min_src (id SERIAL, grp TEXT, val NUMERIC)")
+        .expect("create");
+    Spi::run("INSERT INTO topk_min_src (grp, val) VALUES \
+              ('a', 5), ('a', 10), ('a', 15), ('a', 20), \
+              ('b', 100), ('b', 50), ('b', 200)")
+        .expect("seed");
+
+    Spi::run("SELECT create_reflex_ivm('topk_min_v', \
+              'SELECT grp, MIN(val) AS lo FROM topk_min_src GROUP BY grp', \
+              NULL, NULL, NULL, 4)")
+        .expect("create IMV with topk");
+
+    let fresh = "SELECT grp, MIN(val) AS lo FROM topk_min_src GROUP BY grp";
+    assert_imv_correct("topk_min_v", fresh);
+
+    // Top-K column should be populated and sorted ascending.
+    let topk_a: Vec<pgrx::AnyNumeric> = Spi::connect(|client| {
+        client.select(
+            "SELECT \"__min_val_topk\" AS t FROM __reflex_intermediate_topk_min_v WHERE grp = 'a'",
+            None, &[],
+        )
+        .expect("q")
+        .first()
+        .get_by_name::<Vec<pgrx::AnyNumeric>, _>("t")
+        .expect("get topk")
+        .expect("topk not null")
+    });
+    assert_eq!(topk_a.len(), 4, "topk_a should have 4 elements");
+    assert_eq!(topk_a[0].to_string(), "5");
+    assert_eq!(topk_a[3].to_string(), "20");
+
+    // Insert a new smaller value
+    Spi::run("INSERT INTO topk_min_src (grp, val) VALUES ('a', 1)").expect("insert");
+    assert_imv_correct("topk_min_v", fresh);
+
+    // Delete the current min — top-K should yield the next-smallest from the heap
+    Spi::run("DELETE FROM topk_min_src WHERE val = 1 AND grp = 'a'").expect("delete");
+    assert_imv_correct("topk_min_v", fresh);
+
+    // Delete enough to underflow the heap (group 'b' had 3 values, K=4 so heap has 3)
+    Spi::run("DELETE FROM topk_min_src WHERE grp = 'b'").expect("delete all b");
+    assert_imv_correct("topk_min_v", fresh);
+}
+
+#[pg_test]
+fn pg_test_topk_max_basic() {
+    Spi::run("CREATE TABLE topk_max_src (id SERIAL, grp TEXT, val NUMERIC)")
+        .expect("create");
+    Spi::run("INSERT INTO topk_max_src (grp, val) VALUES \
+              ('a', 5), ('a', 10), ('a', 15), ('a', 20), ('a', 25), \
+              ('b', 100), ('b', 50), ('b', 200)")
+        .expect("seed");
+
+    Spi::run("SELECT create_reflex_ivm('topk_max_v', \
+              'SELECT grp, MAX(val) AS hi FROM topk_max_src GROUP BY grp', \
+              NULL, NULL, NULL, 3)")
+        .expect("create IMV with topk");
+
+    let fresh = "SELECT grp, MAX(val) AS hi FROM topk_max_src GROUP BY grp";
+    assert_imv_correct("topk_max_v", fresh);
+
+    // Top-K should be sorted descending and capped at K=3
+    let topk_a: Vec<pgrx::AnyNumeric> = Spi::connect(|client| {
+        client.select(
+            "SELECT \"__max_val_topk\" AS t FROM __reflex_intermediate_topk_max_v WHERE grp = 'a'",
+            None, &[],
+        )
+        .expect("q")
+        .first()
+        .get_by_name::<Vec<pgrx::AnyNumeric>, _>("t")
+        .expect("get topk")
+        .expect("topk not null")
+    });
+    assert_eq!(topk_a.len(), 3, "topk should be capped at 3");
+    assert_eq!(topk_a[0].to_string(), "25");
+    assert_eq!(topk_a[2].to_string(), "15");
+
+    // Delete the current max — should yield next-largest
+    Spi::run("DELETE FROM topk_max_src WHERE val = 25").expect("delete max");
+    assert_imv_correct("topk_max_v", fresh);
+
+    // Delete to underflow heap
+    Spi::run("DELETE FROM topk_max_src WHERE val IN (20, 15, 10) AND grp = 'a'")
+        .expect("delete all but one");
+    assert_imv_correct("topk_max_v", fresh);
+}
+
+#[pg_test]
+fn pg_test_topk_fuzz_min() {
+    Spi::run("SELECT setseed(0.42)").expect("seed");
+    Spi::run("CREATE TABLE topk_fuzz (id SERIAL PRIMARY KEY, grp INT NOT NULL, val INT NOT NULL)")
+        .expect("create");
+    Spi::run("INSERT INTO topk_fuzz (grp, val) \
+              SELECT (random()*4)::int, (random()*100)::int FROM generate_series(1, 50)")
+        .expect("seed data");
+
+    Spi::run("SELECT create_reflex_ivm('topk_fuzz_v', \
+              'SELECT grp, MIN(val) AS lo, MAX(val) AS hi FROM topk_fuzz GROUP BY grp', \
+              NULL, NULL, NULL, 8)")
+        .expect("create");
+
+    let fresh = "SELECT grp, MIN(val) AS lo, MAX(val) AS hi FROM topk_fuzz GROUP BY grp";
+    assert_imv_correct("topk_fuzz_v", fresh);
+
+    for _ in 0..30 {
+        let op = Spi::get_one::<i32>("SELECT (random()*3)::int").expect("q").expect("v");
+        match op {
+            0 => Spi::run("INSERT INTO topk_fuzz (grp, val) VALUES ((random()*4)::int, (random()*100)::int)").expect("insert"),
+            1 => Spi::run("DELETE FROM topk_fuzz WHERE id = (SELECT id FROM topk_fuzz ORDER BY random() LIMIT 1)").expect("delete"),
+            _ => Spi::run("UPDATE topk_fuzz SET val = (random()*100)::int WHERE id = (SELECT id FROM topk_fuzz ORDER BY random() LIMIT 1)").expect("update"),
+        };
+        assert_imv_correct("topk_fuzz_v", fresh);
+    }
+}
+
+#[pg_test]
+fn pg_test_scalar_min_max_no_groupby() {
+    // Audit unsupported §2: scalar MIN/MAX without GROUP BY (max_order_date_reflex case)
+    Spi::run("CREATE TABLE scalar_mm_src (id SERIAL, val NUMERIC)").expect("create");
+    Spi::run("INSERT INTO scalar_mm_src (val) VALUES (10), (20), (30), (40)")
+        .expect("seed");
+
+    crate::create_reflex_ivm(
+        "scalar_mm_v",
+        "SELECT MAX(val) AS hi, MIN(val) AS lo FROM scalar_mm_src",
+        None, None, None,
+    );
+
+    let fresh = "SELECT MAX(val) AS hi, MIN(val) AS lo FROM scalar_mm_src";
+    assert_imv_correct("scalar_mm_v", fresh);
+
+    Spi::run("INSERT INTO scalar_mm_src (val) VALUES (100), (5)").expect("insert");
+    assert_imv_correct("scalar_mm_v", fresh);
+
+    // Delete the current MAX — recompute path scans source
+    Spi::run("DELETE FROM scalar_mm_src WHERE val = 100").expect("delete max");
+    assert_imv_correct("scalar_mm_v", fresh);
+
+    // Delete the current MIN — recompute again
+    Spi::run("DELETE FROM scalar_mm_src WHERE val = 5").expect("delete min");
+    assert_imv_correct("scalar_mm_v", fresh);
+
+    // Empty the table → MIN/MAX should be NULL
+    Spi::run("DELETE FROM scalar_mm_src").expect("delete all");
+    assert_imv_correct("scalar_mm_v", fresh);
+
+    // Repopulate
+    Spi::run("INSERT INTO scalar_mm_src (val) VALUES (7), (3), (11)").expect("repop");
+    assert_imv_correct("scalar_mm_v", fresh);
+}
+
+#[pg_test]
+fn pg_test_scalar_min_max_with_topk() {
+    // Same as above but with top-K enabled — the heap path makes scalar
+    // MIN/MAX retraction O(K) instead of O(N) when K is well-stocked.
+    Spi::run("CREATE TABLE scalar_topk_src (id SERIAL, val NUMERIC)").expect("create");
+    Spi::run("INSERT INTO scalar_topk_src (val) SELECT (random()*100)::int FROM generate_series(1, 30)")
+        .expect("seed");
+
+    Spi::run("SELECT create_reflex_ivm('scalar_topk_v', \
+              'SELECT MAX(val) AS hi, MIN(val) AS lo FROM scalar_topk_src', \
+              NULL, NULL, NULL, 8)")
+        .expect("create with topk");
+
+    let fresh = "SELECT MAX(val) AS hi, MIN(val) AS lo FROM scalar_topk_src";
+    assert_imv_correct("scalar_topk_v", fresh);
+
+    // Delete a few random rows including possibly the current extremum
+    Spi::run("DELETE FROM scalar_topk_src WHERE id IN (SELECT id FROM scalar_topk_src ORDER BY random() LIMIT 5)")
+        .expect("delete");
+    assert_imv_correct("scalar_topk_v", fresh);
+}

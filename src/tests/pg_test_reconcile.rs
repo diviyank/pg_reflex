@@ -205,3 +205,62 @@ fn test_refresh_imv_depending_on() {
     .expect("v");
     assert_eq!(v2, 1, "v2 should be fixed after refresh");
 }
+
+#[pg_test]
+fn test_scheduled_reconcile_runs_stale_imvs() {
+    Spi::run("CREATE TABLE sched_src (id SERIAL, grp TEXT, val NUMERIC)")
+        .expect("create table");
+    Spi::run("INSERT INTO sched_src (grp, val) VALUES ('a', 10), ('b', 20)")
+        .expect("seed");
+
+    crate::create_reflex_ivm(
+        "sched_v1",
+        "SELECT grp, SUM(val) AS total FROM sched_src GROUP BY grp",
+        None, None, None,
+    );
+    crate::create_reflex_ivm(
+        "sched_v2",
+        "SELECT grp, COUNT(*) AS cnt FROM sched_src GROUP BY grp",
+        None, None, None,
+    );
+
+    // Force every registry row to look "stale": null out last_update_date.
+    Spi::run("UPDATE public.__reflex_ivm_reference SET last_update_date = NULL WHERE name LIKE 'sched_%'")
+        .expect("null last_update");
+
+    // Corrupt the intermediate of v1 to verify the scheduled reconcile actually rebuilds.
+    Spi::run("UPDATE __reflex_intermediate_sched_v1 SET \"__sum_val\" = 999 WHERE \"grp\" = 'a'")
+        .expect("corrupt intermediate");
+    Spi::run("UPDATE sched_v1 SET total = 999 WHERE grp = 'a'")
+        .expect("corrupt target");
+
+    let reconciled: i64 = Spi::get_one(
+        "SELECT COUNT(*)::BIGINT FROM reflex_scheduled_reconcile(0) WHERE name LIKE 'sched_%' AND status = 'RECONCILED'",
+    ).expect("q").expect("v");
+    assert!(reconciled >= 2, "both stale IMVs should reconcile, got {}", reconciled);
+
+    let v1_total: pgrx::AnyNumeric = Spi::get_one(
+        "SELECT total FROM sched_v1 WHERE grp = 'a'",
+    ).expect("q").expect("v");
+    assert_eq!(v1_total.to_string(), "10", "v1 should be reconciled back to source value");
+}
+
+#[pg_test]
+fn test_scheduled_reconcile_skips_fresh_imvs() {
+    Spi::run("CREATE TABLE sched_fresh_src (id SERIAL, grp TEXT, val NUMERIC)")
+        .expect("create table");
+    Spi::run("INSERT INTO sched_fresh_src (grp, val) VALUES ('x', 1)").expect("seed");
+
+    crate::create_reflex_ivm(
+        "sched_fresh_view",
+        "SELECT grp, SUM(val) AS total FROM sched_fresh_src GROUP BY grp",
+        None, None, None,
+    );
+
+    // last_update_date is set to now() at IMV creation. With a 60-minute
+    // threshold, the row should be considered fresh and skipped.
+    let scanned: i64 = Spi::get_one(
+        "SELECT COUNT(*)::BIGINT FROM reflex_scheduled_reconcile(60) WHERE name = 'sched_fresh_view'",
+    ).expect("q").expect("v");
+    assert_eq!(scanned, 0, "fresh IMV should not be reconciled");
+}

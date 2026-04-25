@@ -5,7 +5,7 @@ use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 use std::collections::HashMap;
 
-use crate::aggregation::plan_aggregation;
+use crate::aggregation::{plan_aggregation, plan_aggregation_with_topk};
 use crate::query_decomposer::{
     bare_column_name, format_pg_text_array_literal, generate_aggregations_json,
     generate_base_query, generate_end_query, intermediate_table_name, normalized_column_name,
@@ -27,6 +27,7 @@ pub(crate) fn create_reflex_ivm_impl(
     if_not_exists: bool,
     storage_mode: &str,
     refresh_mode: &str,
+    topk_k: Option<usize>,
 ) -> &'static str {
     let storage_upper = storage_mode.to_uppercase();
     if storage_upper != "LOGGED" && storage_upper != "UNLOGGED" {
@@ -106,6 +107,7 @@ pub(crate) fn create_reflex_ivm_impl(
                 false,
                 storage_mode,
                 refresh_mode,
+                topk_k,
             );
             if result.starts_with("ERROR") {
                 return result;
@@ -318,6 +320,7 @@ pub(crate) fn create_reflex_ivm_impl(
             false,
             storage_mode,
             refresh_mode,
+            topk_k,
         );
         if result.starts_with("ERROR") {
             return result;
@@ -461,6 +464,7 @@ pub(crate) fn create_reflex_ivm_impl(
             false,
             storage_mode,
             refresh_mode,
+            topk_k,
         );
         if result.starts_with("ERROR") {
             return result;
@@ -581,6 +585,7 @@ pub(crate) fn create_reflex_ivm_impl(
                 false,
                 storage_mode,
                 refresh_mode,
+                topk_k,
             );
             if result.starts_with("ERROR") {
                 return result;
@@ -607,14 +612,28 @@ pub(crate) fn create_reflex_ivm_impl(
         // Check if the main body is passthrough (no aggregation).
         // If so, all its sources are CTE sub-IMVs which don't get triggers,
         // CTE body (passthrough or aggregate) → create as a normal IMV
-        return create_reflex_ivm_impl(view_name, &body_sql, "", false, storage_mode, refresh_mode);
+        return create_reflex_ivm_impl(
+            view_name,
+            &body_sql,
+            "",
+            false,
+            storage_mode,
+            refresh_mode,
+            topk_k,
+        );
     }
     // --- End CTE decomposition ---
 
     let froms = analysis.sources.clone();
 
-    // Build aggregation plan from the analysis
-    let mut plan = plan_aggregation(&analysis);
+    // Build aggregation plan from the analysis. When the caller asked for top-K
+    // MIN/MAX, propagate it here so MIN/MAX intermediate columns gain a
+    // companion top-K array column (`__min_x_topk` / `__max_x_topk`).
+    let mut plan = if topk_k.is_some() {
+        plan_aggregation_with_topk(&analysis, topk_k)
+    } else {
+        plan_aggregation(&analysis)
+    };
 
     // Reject mixed queries: COUNT(DISTINCT) + other aggregates (SUM, AVG, MIN, MAX, BOOL_OR).
     // COUNT(DISTINCT) uses a compound intermediate key (grp, val) which is incompatible
@@ -725,6 +744,15 @@ pub(crate) fn create_reflex_ivm_impl(
                             view_name
                         );
                         break;
+                    } else {
+                        info!(
+                            "pg_reflex: source '{}' has PK ({}) but the SELECT list does not include all PK columns — \
+                             passthrough '{}' will fall back to row-matching for DELETE/UPDATE. \
+                             Add the PK columns to the SELECT list, or pass them as the 3rd argument to create_reflex_ivm.",
+                            source,
+                            pk_lower.join(", "),
+                            view_name
+                        );
                     }
                 }
             }

@@ -477,6 +477,32 @@ pub fn generate_base_query(analysis: &SqlAnalysis, plan: &AggregationPlan) -> St
                 ic.source_aggregate, ic.source_arg, ic.name
             ));
         }
+
+        // For top-K-enabled MIN/MAX columns, also project the K extremum values
+        // per group as a sorted array. The companion is sliced [1:K] from a
+        // FILTER-clause array_agg so NULLs do not consume slots. MIN sorts ASC,
+        // MAX sorts DESC.
+        if let Some(k) = ic.topk_k {
+            let order = if ic.source_aggregate == "MAX" {
+                "DESC"
+            } else {
+                "ASC"
+            };
+            let arg_expr = if ic.source_arg == "*" {
+                // unreachable in practice (MIN/MAX(*) is not valid SQL), but
+                // guard against it by falling back to a constant.
+                "1".to_string()
+            } else {
+                ic.source_arg.clone()
+            };
+            select_parts.push(format!(
+                "(array_agg({arg} ORDER BY {arg} {ord} NULLS LAST) FILTER (WHERE {arg} IS NOT NULL))[1:{k}] AS \"{tname}\"",
+                arg = arg_expr,
+                ord = order,
+                k = k,
+                tname = ic.topk_column_name(),
+            ));
+        }
     }
 
     // Always add __ivm_count for reference counting

@@ -31,6 +31,34 @@ mod window;
 // Collate "C" for faster lookups
 extension_sql!(
     r#"
+    -- Top-K (1.3.0): multi-set subtraction over arrays. Removes one occurrence
+    -- of each value in `remove` from `arr`, preserving multiplicity.
+    -- Used by trigger.rs MERGE codegen when retracting from top-K MIN/MAX heaps.
+    --
+    -- Implementation note: PL/pgSQL forbids declaring local variables of
+    -- pseudo-type `anyarray` / `anyelement`, so we mutate the resolved-type
+    -- input parameter `arr` directly (allowed: parameters have concrete
+    -- runtime types) and index into `remove` by position.
+    CREATE OR REPLACE FUNCTION public.__reflex_array_subtract_multiset(
+        arr anyarray, remove anyarray
+    ) RETURNS anyarray
+    LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE AS $REFLEX$
+    DECLARE
+        i INT;
+        pos INT;
+    BEGIN
+        IF arr IS NULL THEN RETURN NULL; END IF;
+        IF remove IS NULL THEN RETURN arr; END IF;
+        FOR i IN 1..COALESCE(cardinality(remove), 0) LOOP
+            pos := array_position(arr, remove[i]);
+            IF pos IS NOT NULL THEN
+                arr := arr[1:pos-1] || arr[pos+1:];
+            END IF;
+        END LOOP;
+        RETURN arr;
+    END;
+    $REFLEX$;
+
     CREATE TABLE IF NOT EXISTS public.__reflex_ivm_reference (
         name TEXT PRIMARY KEY COLLATE "C",
         graph_depth INT NOT NULL,
@@ -53,7 +81,8 @@ extension_sql!(
         last_flush_ms BIGINT,
         last_flush_rows BIGINT,
         flush_count BIGINT DEFAULT 0,
-        last_error TEXT
+        last_error TEXT,
+        flush_ms_history BIGINT[] DEFAULT ARRAY[]::BIGINT[]
     );
 
     -- Index on name for fast lookups
@@ -100,6 +129,27 @@ fn create_reflex_ivm(
         false,
         storage.unwrap_or("UNLOGGED"),
         mode.unwrap_or("IMMEDIATE"),
+        None,
+    )
+}
+
+#[pg_extern(name = "create_reflex_ivm")]
+fn create_reflex_ivm_with_topk(
+    view_name: &str,
+    sql: &str,
+    unique_columns: Option<&str>,
+    storage: Option<&str>,
+    mode: Option<&str>,
+    topk: i32,
+) -> &'static str {
+    create_ivm::create_reflex_ivm_impl(
+        view_name,
+        sql,
+        unique_columns.unwrap_or(""),
+        false,
+        storage.unwrap_or("UNLOGGED"),
+        mode.unwrap_or("IMMEDIATE"),
+        if topk > 0 { Some(topk as usize) } else { None },
     )
 }
 
@@ -118,6 +168,7 @@ fn create_reflex_ivm_if_not_exists(
         true,
         storage.unwrap_or("UNLOGGED"),
         mode.unwrap_or("IMMEDIATE"),
+        None,
     )
 }
 
@@ -172,15 +223,29 @@ extension_sql!(
     RETURNS event_trigger LANGUAGE plpgsql AS $$
     DECLARE
         _obj RECORD;
+        _imv RECORD;
     BEGIN
         FOR _obj IN
             SELECT object_identity
             FROM pg_event_trigger_dropped_objects()
             WHERE object_type = 'table'
         LOOP
-            DELETE FROM public.__reflex_ivm_reference
-            WHERE depends_on @> ARRAY[_obj.object_identity]
-               OR depends_on @> ARRAY[split_part(_obj.object_identity, '.', 2)];
+            FOR _imv IN
+                SELECT name
+                FROM public.__reflex_ivm_reference
+                WHERE depends_on @> ARRAY[_obj.object_identity]
+                   OR depends_on @> ARRAY[split_part(_obj.object_identity, '.', 2)]
+                ORDER BY graph_depth DESC
+            LOOP
+                BEGIN
+                    PERFORM public.drop_reflex_ivm(_imv.name, TRUE);
+                    RAISE NOTICE 'pg_reflex: dropped IMV % (source % was dropped)', _imv.name, _obj.object_identity;
+                EXCEPTION WHEN OTHERS THEN
+                    RAISE WARNING 'pg_reflex: failed to drop IMV % after source % drop: %',
+                        _imv.name, _obj.object_identity, SQLERRM;
+                    DELETE FROM public.__reflex_ivm_reference WHERE name = _imv.name;
+                END;
+            END LOOP;
         END LOOP;
     END;
     $$;
@@ -195,7 +260,15 @@ extension_sql!(
         _cmd RECORD;
         _imv RECORD;
         _src TEXT;
+        _policy TEXT;
+        _affected TEXT[] := ARRAY[]::TEXT[];
     BEGIN
+        _policy := lower(COALESCE(NULLIF(current_setting('pg_reflex.alter_source_policy', true), ''), 'warn'));
+        IF _policy NOT IN ('warn', 'error') THEN
+            RAISE WARNING 'pg_reflex: invalid pg_reflex.alter_source_policy=%, falling back to ''warn''', _policy;
+            _policy := 'warn';
+        END IF;
+
         FOR _cmd IN
             SELECT object_identity, command_tag
             FROM pg_event_trigger_ddl_commands()
@@ -207,10 +280,19 @@ extension_sql!(
                 WHERE depends_on @> ARRAY[_src]
                    OR depends_on @> ARRAY[split_part(_src, '.', 2)]
             LOOP
-                RAISE WARNING 'pg_reflex: source table % was altered; IMV % may be stale — run SELECT reflex_rebuild_imv(''%'') to recover',
-                    _src, _imv.name, _imv.name;
+                _affected := _affected || (_src || ' -> ' || _imv.name);
+                IF _policy = 'warn' THEN
+                    RAISE WARNING 'pg_reflex: source table % was altered; IMV % may be stale — run SELECT reflex_rebuild_imv(''%'') to recover',
+                        _src, _imv.name, _imv.name;
+                END IF;
             END LOOP;
         END LOOP;
+
+        IF _policy = 'error' AND array_length(_affected, 1) > 0 THEN
+            RAISE EXCEPTION 'pg_reflex: ALTER blocked by pg_reflex.alter_source_policy=''error'' on tracked source(s); affected: %',
+                array_to_string(_affected, ', ')
+                USING HINT = 'Set pg_reflex.alter_source_policy = ''warn'' (default) or drop_reflex_ivm() first.';
+        END IF;
     END;
     $$;
 

@@ -88,15 +88,54 @@ fn build_merge_using(
                     "\"{}\" = LEAST(t.\"{}\", d.\"{}\")",
                     ic.name, ic.name, ic.name
                 ));
+                // Top-K MIN: merge intermediate top-K with delta top-K, keep K smallest.
+                if let Some(k) = ic.topk_k {
+                    let topk = ic.topk_column_name();
+                    set_clauses.push(format!(
+                        "\"{topk}\" = (\
+                         SELECT array_agg(v ORDER BY v ASC) FROM \
+                         (SELECT v FROM unnest(t.\"{topk}\" || COALESCE(d.\"{topk}\", '{{}}'::{ty}[])) v ORDER BY v ASC LIMIT {k}) s)",
+                        topk = topk,
+                        ty = ic.pg_type,
+                        k = k,
+                    ));
+                }
             }
             ("MAX", DeltaOp::Add) => {
                 set_clauses.push(format!(
                     "\"{}\" = GREATEST(t.\"{}\", d.\"{}\")",
                     ic.name, ic.name, ic.name
                 ));
+                if let Some(k) = ic.topk_k {
+                    let topk = ic.topk_column_name();
+                    set_clauses.push(format!(
+                        "\"{topk}\" = (\
+                         SELECT array_agg(v ORDER BY v DESC) FROM \
+                         (SELECT v FROM unnest(t.\"{topk}\" || COALESCE(d.\"{topk}\", '{{}}'::{ty}[])) v ORDER BY v DESC LIMIT {k}) s)",
+                        topk = topk,
+                        ty = ic.pg_type,
+                        k = k,
+                    ));
+                }
             }
             ("MIN", DeltaOp::Subtract) | ("MAX", DeltaOp::Subtract) => {
-                set_clauses.push(format!("\"{}\" = NULL", ic.name));
+                if ic.topk_k.is_some() {
+                    // Top-K retraction: subtract retracted values from the heap
+                    // via the multiset helper, ONCE per row. The scalar
+                    // `__min_x` / `__max_x` is set NULL here; a post-MERGE
+                    // UPDATE emitted by `build_topk_scalar_refresh_sql` reads
+                    // `__min_x = __min_x_topk[1]` for groups whose heap
+                    // survived. Calling the helper twice in a single SET
+                    // clause doubled the per-row cost.
+                    let topk = ic.topk_column_name();
+                    set_clauses.push(format!(
+                        "\"{topk}\" = public.__reflex_array_subtract_multiset(t.\"{topk}\", d.\"{topk}\")",
+                        topk = topk,
+                    ));
+                    set_clauses.push(format!("\"{}\" = NULL", ic.name));
+                } else {
+                    set_clauses.push(format!("\"{}\" = NULL", ic.name));
+                }
             }
             _ => {
                 // COALESCE handles NULL in delta (e.g., SUM(NULL)=NULL but we need 0).
@@ -124,25 +163,31 @@ fn build_merge_using(
     let mut insert_cols: Vec<String> = join_cols.clone();
     for ic in &plan.intermediate_columns {
         insert_cols.push(format!("\"{}\"", ic.name));
+        if ic.has_topk() {
+            insert_cols.push(format!("\"{}\"", ic.topk_column_name()));
+        }
     }
     if plan.needs_ivm_count {
         insert_cols.push("__ivm_count".to_string());
     }
 
     // Determine default values for INSERT COALESCE based on column types.
-    // MIN/MAX columns should NOT be coalesced — NULL is valid (means "no value").
-    // Only SUM/COUNT need COALESCE to 0 (NULL + 0 = 0, not NULL).
+    // MIN/MAX columns and top-K array columns should NOT be coalesced —
+    // NULL/empty is valid (means "no value"). Only SUM/COUNT need COALESCE
+    // to 0 (NULL + 0 = 0, not NULL).
     let insert_vals: Vec<String> = insert_cols
         .iter()
         .map(|c| {
             if c.starts_with("\"__") || c == "__ivm_count" {
-                // Check if this is a MIN/MAX column — don't coalesce
-                let is_min_max = plan.intermediate_columns.iter().any(|ic| {
-                    format!("\"{}\"", ic.name) == *c
-                        && (ic.source_aggregate == "MIN" || ic.source_aggregate == "MAX")
+                // Check if this is a MIN/MAX column or a top-K array column — don't coalesce
+                let is_min_max_or_topk = plan.intermediate_columns.iter().any(|ic| {
+                    let is_main = format!("\"{}\"", ic.name) == *c
+                        && (ic.source_aggregate == "MIN" || ic.source_aggregate == "MAX");
+                    let is_topk = ic.has_topk() && format!("\"{}\"", ic.topk_column_name()) == *c;
+                    is_main || is_topk
                 });
-                if is_min_max {
-                    format!("d.{}", c) // No COALESCE for MIN/MAX
+                if is_min_max_or_topk {
+                    format!("d.{}", c) // No COALESCE for MIN/MAX or top-K array
                 } else {
                     let is_bool = plan
                         .intermediate_columns
@@ -276,6 +321,84 @@ fn build_net_delta_query(delta_old: &str, delta_new: &str, plan: &AggregationPla
 /// IMVs unusable in practice. The wrapper is `SELECT * FROM (<orig>) AS __all
 /// WHERE (<gb_cols>) IN (SELECT DISTINCT <gb_cols> FROM "<affected_tbl>")`, which
 /// pushes the group-key filter down through the aggregation boundary.
+/// Build a UPDATE that refreshes the scalar `__min_x` / `__max_x` from the
+/// companion `__min_x_topk[1]` for groups whose heap is non-empty after a
+/// top-K subtract. Returns `None` when the plan has no top-K MIN/MAX columns.
+///
+/// The MERGE codegen sets `__min_x = NULL` on subtract; this UPDATE reads the
+/// surviving heap top into the scalar. Groups whose heap underflowed (now
+/// NULL/empty) keep `__min_x = NULL` — they're picked up by
+/// `build_min_max_recompute_sql` which scans the source for them.
+pub fn build_topk_scalar_refresh_sql(
+    intermediate_tbl: &str,
+    plan: &AggregationPlan,
+    affected_tbl: Option<&str>,
+) -> Option<String> {
+    let topk_cols: Vec<&crate::aggregation::IntermediateColumn> = plan
+        .intermediate_columns
+        .iter()
+        .filter(|ic| ic.has_topk())
+        .collect();
+
+    if topk_cols.is_empty() {
+        return None;
+    }
+
+    let group_cols: Vec<String> = plan
+        .group_by_columns
+        .iter()
+        .chain(plan.distinct_columns.iter())
+        .map(|c| normalized_column_name(c))
+        .collect();
+
+    let mut set_parts: Vec<String> = Vec::new();
+    for ic in &topk_cols {
+        set_parts.push(format!(
+            "\"{name}\" = \"{topk}\"[1]",
+            name = ic.name,
+            topk = ic.topk_column_name(),
+        ));
+    }
+
+    // Predicate: heap is non-empty for at least one of the topk columns.
+    let heap_predicates: Vec<String> = topk_cols
+        .iter()
+        .map(|ic| {
+            let topk = ic.topk_column_name();
+            format!(
+                "\"{topk}\" IS NOT NULL AND cardinality(\"{topk}\") > 0",
+                topk = topk
+            )
+        })
+        .collect();
+    let heap_pred = heap_predicates.join(" OR ");
+
+    // Scope to affected groups when possible.
+    let scope_filter = match (affected_tbl, !group_cols.is_empty()) {
+        (Some(at), true) => {
+            let cols_csv = group_cols
+                .iter()
+                .map(|c| format!("\"{}\"", c))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                " AND ({cols}) IN (SELECT {cols} FROM \"{at}\")",
+                cols = cols_csv,
+                at = at,
+            )
+        }
+        _ => String::new(),
+    };
+
+    Some(format!(
+        "UPDATE {tbl} SET {sets} WHERE ({heap}){scope}",
+        tbl = intermediate_tbl,
+        sets = set_parts.join(", "),
+        heap = heap_pred,
+        scope = scope_filter,
+    ))
+}
+
 pub fn build_min_max_recompute_sql(
     intermediate_tbl: &str,
     plan: &AggregationPlan,
@@ -299,15 +422,33 @@ pub fn build_min_max_recompute_sql(
         .map(|c| normalized_column_name(c))
         .collect();
 
-    let set_parts: Vec<String> = min_max_cols
-        .iter()
-        .map(|ic| format!("\"{}\" = __src.\"{}\"", ic.name, ic.name))
-        .collect();
+    // For top-K-enabled MIN/MAX columns, also rebuild the companion array.
+    // The `orig_base_query` already projects `__min_x_topk` because
+    // `generate_base_query` emits the slice when `topk_k.is_some()`.
+    let mut set_parts: Vec<String> = Vec::new();
+    for ic in &min_max_cols {
+        set_parts.push(format!("\"{}\" = __src.\"{}\"", ic.name, ic.name));
+        if ic.has_topk() {
+            let topk = ic.topk_column_name();
+            set_parts.push(format!("\"{}\" = __src.\"{}\"", topk, topk));
+        }
+    }
 
-    let null_check: Vec<String> = min_max_cols
-        .iter()
-        .map(|ic| format!("{}.\"{}\" IS NULL", intermediate_tbl, ic.name))
-        .collect();
+    // Trigger recompute when the scalar slot is NULL (legacy path) OR — for
+    // top-K columns — when the companion array is empty/NULL (heap underflow
+    // after a multi-set subtract).
+    let mut null_check: Vec<String> = Vec::new();
+    for ic in &min_max_cols {
+        null_check.push(format!("{}.\"{}\" IS NULL", intermediate_tbl, ic.name));
+        if ic.has_topk() {
+            let topk = ic.topk_column_name();
+            null_check.push(format!(
+                "({tbl}.\"{topk}\" IS NULL OR cardinality({tbl}.\"{topk}\") = 0)",
+                tbl = intermediate_tbl,
+                topk = topk,
+            ));
+        }
+    }
 
     // Sentinel-only (no GROUP BY) case: single row, no join keys to match.
     // The WHERE reduces to the NULL filter only. Affected-groups filter is
@@ -336,8 +477,7 @@ pub fn build_min_max_recompute_sql(
     let scoped_source = match affected_tbl {
         Some(at) => {
             let raw_csv = plan.group_by_columns.join(", ");
-            let norm_csv: Vec<String> =
-                group_cols.iter().map(|c| format!("\"{}\"", c)).collect();
+            let norm_csv: Vec<String> = group_cols.iter().map(|c| format!("\"{}\"", c)).collect();
             let norm_csv = norm_csv.join(", ");
             let filter = format!(
                 " AND ({}) IN (SELECT DISTINCT {} FROM \"{}\")",
@@ -361,14 +501,46 @@ pub fn build_min_max_recompute_sql(
         })
         .collect();
 
-    Some(format!(
+    let update_sql = format!(
         "UPDATE {} SET {} FROM ({}) AS __src WHERE {} AND ({})",
         intermediate_tbl,
         set_parts.join(", "),
         scoped_source,
         join_cond.join(" AND "),
         null_check.join(" OR ")
-    ))
+    );
+
+    // 1.3.0: gate the recompute on `EXISTS (intermediate row with NULL slot
+    // in an affected group)`. The post-MERGE topk-scalar refresh sets the
+    // scalar from `topk[1]` for groups whose heap survived; the recompute
+    // only needs to fire for groups that genuinely underflowed. An always-
+    // executing UPDATE used to trigger the source aggregation even when no
+    // group needed it, which dominated the bench.
+    if let Some(at) = affected_tbl {
+        let aff_join_cond: Vec<String> = group_cols
+            .iter()
+            .map(|gc| {
+                format!(
+                    "{}.\"{}\" IS NOT DISTINCT FROM __aff.\"{}\"",
+                    intermediate_tbl, gc, gc
+                )
+            })
+            .collect();
+        let exists_check = format!(
+            "EXISTS (SELECT 1 FROM {tbl} JOIN \"{at}\" __aff ON {join} WHERE {nullc})",
+            tbl = intermediate_tbl,
+            at = at,
+            join = aff_join_cond.join(" AND "),
+            nullc = null_check.join(" OR "),
+        );
+        return Some(format!(
+            "DO $_reflex_recompute$ BEGIN IF {check} THEN {upd}; END IF; END $_reflex_recompute$",
+            check = exists_check,
+            upd = update_sql,
+        ));
+    }
+
+    Some(update_sql)
 }
 
 /// Build a NULL-safe match condition for affected groups.
@@ -886,6 +1058,17 @@ pub fn reflex_build_delta_sql(
                     None
                 };
                 if has_min_max {
+                    // Top-K (1.3.0): refresh scalar __min_x / __max_x from
+                    // topk[1] for groups whose heap survived the subtract,
+                    // BEFORE the source-scan recompute. The recompute then
+                    // only fires for actually-underflowed groups.
+                    if let Some(refresh) = build_topk_scalar_refresh_sql(
+                        &intermediate_tbl,
+                        &plan,
+                        recompute_scope,
+                    ) {
+                        stmts.push(refresh);
+                    }
                     if let Some(recompute) = build_min_max_recompute_sql(
                         &intermediate_tbl,
                         &plan,
@@ -914,6 +1097,13 @@ pub fn reflex_build_delta_sql(
                             &select_expr,
                             true,
                         );
+                        if let Some(refresh) = build_topk_scalar_refresh_sql(
+                            &intermediate_tbl,
+                            &plan,
+                            Some(affected_tbl.as_str()),
+                        ) {
+                            stmts.push(refresh);
+                        }
                         if let Some(recompute) = build_min_max_recompute_sql(
                             &intermediate_tbl,
                             &plan,
@@ -942,6 +1132,13 @@ pub fn reflex_build_delta_sql(
                             &plan,
                             DeltaOp::Subtract,
                         );
+                        if let Some(refresh) = build_topk_scalar_refresh_sql(
+                            &intermediate_tbl,
+                            &plan,
+                            None,
+                        ) {
+                            stmts.push(refresh);
+                        }
                         if let Some(recompute) = build_min_max_recompute_sql(
                             &intermediate_tbl,
                             &plan,
@@ -1439,20 +1636,35 @@ pub fn reflex_flush_deferred(source_table: &str) -> String {
                 .map(|s| format!("{};", s))
                 .collect::<Vec<_>>()
                 .join("\n");
+            // 1.3.0 observability:
+            //   * `flush_ms_history` ring buffer (size 64) collects recent flush
+            //     wall times. `reflex_ivm_histogram(name)` reads it.
+            //   * `application_name` is set to `reflex_flush:<view>` for the
+            //     duration of this IMV's body so `pg_stat_statements` /
+            //     `log_line_prefix` can correlate query rows back to the IMV.
             let do_block = format!(
                 "DO $_reflex_imv_sp$ \
                  DECLARE _t0 TIMESTAMP := clock_timestamp(); \
                          _rows BIGINT; \
+                         _ms BIGINT; \
+                         _prev_app TEXT := current_setting('application_name', true); \
                  BEGIN \
+                   PERFORM set_config('application_name', 'reflex_flush:{imv_name_esc}', true); \
                    SELECT COUNT(*) INTO _rows FROM {delta_tbl}; \
                    \n{body}\n \
+                   _ms := (EXTRACT(EPOCH FROM (clock_timestamp() - _t0)) * 1000)::BIGINT; \
                    UPDATE public.__reflex_ivm_reference \
-                     SET last_flush_ms = EXTRACT(EPOCH FROM (clock_timestamp() - _t0)) * 1000, \
+                     SET last_flush_ms = _ms, \
                          last_flush_rows = _rows, \
                          flush_count = COALESCE(flush_count, 0) + 1, \
-                         last_error = NULL \
+                         last_error = NULL, \
+                         flush_ms_history = (\
+                             COALESCE(flush_ms_history, ARRAY[]::BIGINT[]) || _ms\
+                         )[GREATEST(1, COALESCE(cardinality(flush_ms_history), 0) + 1 - 63):] \
                      WHERE name = '{imv_name_esc}'; \
+                   PERFORM set_config('application_name', COALESCE(_prev_app, ''), true); \
                  EXCEPTION WHEN OTHERS THEN \
+                   PERFORM set_config('application_name', COALESCE(_prev_app, ''), true); \
                    RAISE WARNING 'pg_reflex: IMV % flush failed at cascade: % (SQLSTATE %)', \
                      '{imv_name_esc}', SQLERRM, SQLSTATE; \
                    UPDATE public.__reflex_ivm_reference \

@@ -482,9 +482,47 @@ Benchmark scripts are in `benchmarks/`. See [`benchmarks/README.md`](benchmarks/
 
 ### Production-Scale Benchmark: Passthrough IMV (5-table JOIN)
 
-Real-world benchmark on a production-like dataset: **76M source rows, 7.7M output rows, 5-table JOIN with LEFT JOINs, 9 source indexes, 5 target indexes.** PostgreSQL 18, shared_buffers = 4GB, 32GB RAM, local SSD.
+Two benchmarks covering different scales. The 1.3.0 number set is the freshest;
+the 76M-row dataset is preserved for the high-end shape comparison.
 
-REFRESH MATERIALIZED VIEW baseline: **39–64s** (depending on pool size).
+#### 1.3.0 — 10M-row source, 5-table JOIN, IMMEDIATE (PG 18, shared_buffers = 4GB)
+
+`benchmarks/bench_full_scale_1_3_0.sql`. Source: 10M rows, 5-table JOIN
+(sales × product 100K × location 1K × calendar 3.3K × pricing 10M).
+**REFRESH MATERIALIZED VIEW baseline: 24,130 ms.** Correctness verified
+byte-for-byte via `EXCEPT ALL` against fresh REFRESH MV after every run.
+
+| Op | Batch | Reflex | Raw | Advantage vs raw + REFRESH |
+|---|---:|---:|---:|---:|
+| INSERT | 1K | 36 ms | 10 ms | **99.8%** |
+| INSERT | 10K | 362 ms | 62 ms | 98.5% |
+| INSERT | 100K | 2.4 s | 546 ms | 90.2% |
+| INSERT | 500K | 11.4 s | 3.0 s | 58.0% |
+| INSERT | 1M | 22.3 s | 6.8 s | 27.9% |
+| DELETE | 1K | 445 ms | 88 ms | 98.2% |
+| DELETE | 10K | 115 ms | 93 ms | **99.5%** |
+| DELETE | 100K | 357 ms | 141 ms | 98.5% |
+| DELETE | 500K | 1.7 s | 464 ms | 93.2% |
+| DELETE | 1M | 3.5 s | 721 ms | **86.0%** |
+| UPDATE | 1K | 363 ms | 92 ms | 98.5% |
+| UPDATE | 10K | 414 ms | 195 ms | 98.3% |
+| UPDATE | 100K | 3.4 s | 1.2 s | 86.5% |
+| UPDATE | 500K | 17.1 s | 5.5 s | 42.2% |
+| UPDATE | 1M | 32.3 s | 11.6 s | parity (≈ REFRESH) |
+
+**pg_reflex wins at every batch size up to 500K rows for all operations.**
+DELETE remains the standout — even 1M-row deletions cost 3.5s vs 24s REFRESH
+(86% advantage). The lone case where pg_reflex matches REFRESH is UPDATE 1M;
+the JOIN cost dominates at that scale. The optimization roadmap (with
+attempted/landed/deferred status) lives at
+[`journal/2026-04-25_full_scale_bench_and_optimizations.md`](journal/2026-04-25_full_scale_bench_and_optimizations.md).
+
+#### 1.1.x — 76M-row source production reference
+
+The legacy production-scale dataset: **76M source rows, 7.7M output rows,
+5-table JOIN with LEFT JOINs, 9 source indexes, 5 target indexes.**
+shared_buffers = 4GB, 32GB RAM, local SSD. REFRESH MATERIALIZED VIEW
+baseline: **39–64s** (depending on pool size).
 
 #### INSERT — pg_reflex advantage (% faster than raw DML + REFRESH)
 
@@ -533,6 +571,31 @@ Framework overhead (EXISTS check, metadata query, advisory lock, Rust FFI) is **
 | 50K | 1,042 ms | 19% |
 | 100K | 2,051 ms | 21% |
 
+### 1.3.0 — Top-K MIN/MAX retraction (audit R3 closed)
+
+The opt-in `topk=K` parameter on `create_reflex_ivm` keeps the K extremum
+values per group and uses multi-set subtraction on retraction, falling back
+to the existing scoped recompute only when the heap underflows. The recompute
+path is gated by an `EXISTS` check so the source scan is skipped when no
+group needs it.
+
+**5M-row source, 5K groups, MIN/MAX IMV — PG 18:**
+
+| DELETE batch | REFRESH MV | IMV (no topk) | IMV (`topk=16`) | top-K vs no-topk | top-K vs REFRESH |
+|---:|---:|---:|---:|---:|---:|
+| 100   | 529 ms | 479 ms     | **93 ms**  | **5.1× faster** | **5.7× faster** |
+| 1,000 | 529 ms | 1,551 ms   | **556 ms** | **2.8× faster** | parity |
+| 10,000| 540 ms | 14,847 ms  | **2,726 ms** | **5.4× faster** | 0.2× (REFRESH wins) |
+| 50,000| 540 ms | 14,888 ms  | **2,908 ms** | **5.1× faster** | 0.2× (REFRESH wins) |
+
+INSERT cost is ~2.5× higher with top-K than without (264 ms vs 109 ms on
+1M rows × 10K inserts) — the price of maintaining the heap on every write.
+For workloads where retraction is common, top-K is a clean win.
+
+> **Reproduce:** `benchmarks/bench_1_3_0_topk.sql` (1M rows) and
+> `benchmarks/bench_1_3_0_topk_5m.sql` (5M rows). The full breakdown lives
+> in [`docs/performance/benchmarks.md`](docs/performance/benchmarks.md).
+
 ### Synthetic Benchmarks (5M rows, 30K groups)
 
 Trigger overhead only (GROUP BY + SUM/COUNT), measured in isolation.
@@ -569,9 +632,57 @@ Each per-IMV flush body is wrapped in a `SAVEPOINT`. A failing IMV logs a `WARNI
 
 ## Operational notes
 
-- **Source `DROP TABLE`** — the `reflex_on_sql_drop` event trigger auto-removes registry rows for IMVs whose source was dropped. Run `SELECT reflex_rebuild_imv('<name>')` if you later recreate the source and want the IMV back.
+- **Source `DROP TABLE`** — the `reflex_on_sql_drop` event trigger auto-drops every artifact owned by the IMV (target, intermediate, affected-groups, delta, and passthrough scratch tables), removes its registry row, and cascades to child IMVs in `graph_child` order. A `NOTICE` is emitted for each IMV cleaned up. To preserve an IMV across a recreated source, drop the source with `drop_reflex_ivm` *first* so you can re-`create_reflex_ivm` against the new table.
 - **Source `ALTER TABLE`** — the `reflex_on_ddl_command_end` trigger raises a `WARNING` when a tracked source is altered, with guidance to run `SELECT reflex_rebuild_imv('<name>')`. The extension will not block the ALTER.
 - **Concurrent flushes** — the per-(view, source) advisory lock keys are derived from a 64-bit hash joined into two i32s (`pg_advisory_xact_lock(key1, key2)`), so two sessions flushing distinct IMVs on the same source no longer serialize on the same integer.
+
+## Troubleshooting
+
+A short operator runbook covering the cases that show up in production. The full guide is on the docs site (link in the project README header).
+
+### Flush keeps failing on one IMV
+
+```sql
+-- Find the bad IMV
+SELECT name, last_error, flush_count, last_flush_ms
+FROM public.__reflex_ivm_reference
+WHERE last_error IS NOT NULL;
+
+-- Inspect what the next flush would run
+SELECT reflex_explain_flush('<name>');
+
+-- If the source schema changed, rebuild from scratch
+SELECT reflex_rebuild_imv('<name>');
+```
+
+A failing IMV no longer aborts the cascade — its `last_error` is recorded and the next IMV runs normally (per-IMV SAVEPOINT, since 1.2.0).
+
+### IMV drifted after a crash
+
+UNLOGGED intermediates are truncated on crash recovery. Run `reflex_rebuild_imv('<name>')` to rebuild from the source, or schedule it via pg_cron (see [`pg-cron` recipes in the docs](#documentation-site)).
+
+### Source `ALTER TABLE` warning emitted
+
+The IMV may now reference dropped or renamed columns. Run `reflex_rebuild_imv('<name>')` as part of your DDL change-control runbook. From 1.2.1 onward, set `pg_reflex.alter_source_policy = 'error'` to reject the ALTER instead.
+
+### Cascade is slow
+
+```sql
+-- Sort by depth, then by last flush latency
+SELECT name, graph_depth, last_flush_ms, last_flush_rows, flush_count
+FROM reflex_ivm_status()
+ORDER BY graph_depth, last_flush_ms DESC NULLS LAST;
+```
+
+If one IMV dominates the latency budget, check `reflex_explain_flush(name)` for an unexpected sequential scan on the source. MIN/MAX-heavy IMVs over wide source tables are a known sharp edge — see the "MIN/MAX retraction" entry in the limitations matrix.
+
+### The IMV was created but DELETE on the source fails
+
+Passthrough IMVs that handle DELETE require a unique key. From 1.2.1 the extension auto-infers `unique_columns` from the source PK; before that, pass `unique_columns` explicitly:
+
+```sql
+SELECT create_reflex_ivm('v', 'SELECT id, name FROM src', 'id');
+```
 
 ## Project Structure
 

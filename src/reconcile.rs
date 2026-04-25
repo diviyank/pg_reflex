@@ -290,6 +290,71 @@ pub(crate) fn reflex_reconcile(view_name: &str) -> &'static str {
     })
 }
 
+/// One row in the result set of `reflex_scheduled_reconcile`.
+type ScheduledReconcileRow = (String, String, i64);
+
+/// Reconcile every IMV whose `last_update_date` is older than `max_age_minutes`,
+/// or which has not been updated yet. Designed to be invoked on a cadence by
+/// pg_cron or another scheduler. Each per-IMV reconcile runs in isolation so
+/// one failure does not block the rest.
+///
+/// Returns one row per attempted IMV: `(name, status, ms)` where `status` is
+/// either `'RECONCILED'` or an error string, and `ms` is the wall time of the
+/// reconcile call.
+///
+/// ```sql
+/// -- Run every 15 minutes via pg_cron
+/// SELECT cron.schedule('reflex-drift-scan', '*/15 * * * *',
+///     'SELECT * FROM reflex_scheduled_reconcile(60)');
+/// ```
+#[pg_extern]
+pub fn reflex_scheduled_reconcile(
+    max_age_minutes: default!(i32, 60),
+) -> TableIterator<'static, (name!(name, String), name!(status, String), name!(ms, i64))> {
+    let candidates: Vec<String> = Spi::connect(|client| {
+        let sql = "SELECT name FROM public.__reflex_ivm_reference \
+                   WHERE COALESCE(enabled, TRUE) = TRUE \
+                     AND (last_update_date IS NULL \
+                          OR last_update_date < (CURRENT_TIMESTAMP - make_interval(mins => $1))) \
+                   ORDER BY graph_depth, name";
+        client
+            .select(
+                sql,
+                None,
+                &[unsafe {
+                    DatumWithOid::new(max_age_minutes, PgBuiltInOids::INT4OID.oid().value())
+                }],
+            )
+            .unwrap_or_report()
+            .filter_map(|row| {
+                row.get_by_name::<&str, _>("name")
+                    .unwrap_or(None)
+                    .map(|s| s.to_string())
+            })
+            .collect()
+    });
+
+    let mut out: Vec<ScheduledReconcileRow> = Vec::with_capacity(candidates.len());
+    for name in candidates {
+        let started = std::time::Instant::now();
+        let result = reflex_reconcile(&name);
+        let ms = started.elapsed().as_millis() as i64;
+        let status = if result == "RECONCILED" {
+            result.to_string()
+        } else {
+            warning!(
+                "pg_reflex: scheduled reconcile of '{}' returned: {}",
+                name,
+                result
+            );
+            result.to_string()
+        };
+        out.push((name, status, ms));
+    }
+
+    TableIterator::new(out)
+}
+
 /// Refresh ALL IMVs that depend on a given source table or materialized view.
 /// Processes IMVs in graph_depth order (L1 before L2).
 pub(crate) fn refresh_imv_depending_on(source: &str) -> &'static str {

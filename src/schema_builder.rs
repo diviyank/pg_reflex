@@ -75,6 +75,19 @@ fn intermediate_column_spec(
             "    \"{}\" {} DEFAULT {}",
             ic.name, effective_type, default
         ));
+
+        // For top-K-enabled MIN/MAX columns, emit the sibling array column.
+        // The element type matches the scalar column; the default empty array
+        // means "heap empty, must scan to populate" — initial population
+        // happens at IMV creation via the base_query.
+        if ic.has_topk() {
+            columns.push(format!(
+                "    \"{}\" {}[] DEFAULT '{{}}'::{}[]",
+                ic.topk_column_name(),
+                effective_type,
+                effective_type
+            ));
+        }
     }
 
     // __ivm_count for reference counting

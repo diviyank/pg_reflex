@@ -231,17 +231,36 @@ pub(crate) fn drop_reflex_ivm_impl(view_name: &str, cascade: bool) -> &'static s
             )
             .unwrap_or_report();
 
-        // 9. Drop consolidated triggers on sources where no other IMV depends
+        // 9. Drop consolidated triggers on sources where no other IMV depends.
+        //    When called from the sql_drop event trigger the source table itself is
+        //    already gone (its triggers cascaded with it). DROP TRIGGER ON <missing>
+        //    would error on "relation does not exist" — gate on to_regclass.
         for (source, safe_source) in &sources_to_cleanup {
+            let source_still_exists: bool = client
+                .select(
+                    "SELECT to_regclass($1) IS NOT NULL AS present",
+                    None,
+                    &[unsafe {
+                        DatumWithOid::new(source.clone(), PgBuiltInOids::TEXTOID.oid().value())
+                    }],
+                )
+                .unwrap_or_report()
+                .first()
+                .get_by_name::<bool, _>("present")
+                .unwrap_or(None)
+                .unwrap_or(false);
+
             for op in &["ins", "del", "upd", "trunc"] {
-                let trig_name = format!("__reflex_trigger_{}_on_{}", op, safe_source);
-                client
-                    .update(
-                        &format!("DROP TRIGGER IF EXISTS \"{}\" ON {}", trig_name, source),
-                        None,
-                        &[],
-                    )
-                    .unwrap_or_report();
+                if source_still_exists {
+                    let trig_name = format!("__reflex_trigger_{}_on_{}", op, safe_source);
+                    client
+                        .update(
+                            &format!("DROP TRIGGER IF EXISTS \"{}\" ON {}", trig_name, source),
+                            None,
+                            &[],
+                        )
+                        .unwrap_or_report();
+                }
 
                 let fn_name = format!("__reflex_{}_trigger_on_{}", op, safe_source);
                 client

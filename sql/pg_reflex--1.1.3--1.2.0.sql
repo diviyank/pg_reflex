@@ -51,3 +51,41 @@ ALTER TABLE public.__reflex_ivm_reference
 -- so installed triggers pick up the new behavior on the next flush; Theme 3
 -- event triggers are installed by extension_sql in lib.rs during UPDATE;
 -- Theme 4 SPIs are new #[pg_extern]s auto-registered by the upgrade.
+
+-- === Source DROP cascading cleanup (Theme 3, R1) ===
+--
+-- 1.2.0 ships an event trigger that not only deletes the registry row but also
+-- drops every artifact owned by the IMV (target, intermediate, affected,
+-- delta-scratch, passthrough-scratch tables and the standalone trigger
+-- functions). The body delegates to public.drop_reflex_ivm(name, TRUE) — which
+-- itself was made resilient to a missing source table in 1.2.0.
+CREATE OR REPLACE FUNCTION public.__reflex_on_sql_drop()
+RETURNS event_trigger LANGUAGE plpgsql AS $$
+DECLARE
+    _obj RECORD;
+    _imv RECORD;
+BEGIN
+    FOR _obj IN
+        SELECT object_identity
+        FROM pg_event_trigger_dropped_objects()
+        WHERE object_type = 'table'
+    LOOP
+        FOR _imv IN
+            SELECT name
+            FROM public.__reflex_ivm_reference
+            WHERE depends_on @> ARRAY[_obj.object_identity]
+               OR depends_on @> ARRAY[split_part(_obj.object_identity, '.', 2)]
+            ORDER BY graph_depth DESC
+        LOOP
+            BEGIN
+                PERFORM public.drop_reflex_ivm(_imv.name, TRUE);
+                RAISE NOTICE 'pg_reflex: dropped IMV % (source % was dropped)', _imv.name, _obj.object_identity;
+            EXCEPTION WHEN OTHERS THEN
+                RAISE WARNING 'pg_reflex: failed to drop IMV % after source % drop: %',
+                    _imv.name, _obj.object_identity, SQLERRM;
+                DELETE FROM public.__reflex_ivm_reference WHERE name = _imv.name;
+            END;
+        END LOOP;
+    END LOOP;
+END;
+$$;

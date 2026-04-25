@@ -663,3 +663,49 @@ fn test_flush_deferred_skips_imv_on_predicate_miss() {
     .expect("v");
     assert_eq!(never_int_count, 0, "intermediate for 'never' IMV must have 0 rows");
 }
+
+#[pg_test]
+fn pg_test_flush_histogram_accumulates() {
+    Spi::run("CREATE TABLE hist_src (id SERIAL, grp TEXT, val NUMERIC)").expect("create");
+    Spi::run("INSERT INTO hist_src (grp, val) VALUES ('a', 1)").expect("seed");
+
+    crate::create_reflex_ivm(
+        "hist_view",
+        "SELECT grp, SUM(val) AS total FROM hist_src GROUP BY grp",
+        None, None, Some("DEFERRED"),
+    );
+
+    // Flush a handful of times so the ring buffer accumulates samples.
+    for i in 0..5 {
+        Spi::run(&format!("INSERT INTO hist_src (grp, val) VALUES ('a', {})", i + 2))
+            .expect("insert");
+        Spi::run("SELECT reflex_flush_deferred('hist_src')").expect("flush");
+    }
+
+    let samples: i64 = Spi::get_one("SELECT samples FROM reflex_ivm_histogram('hist_view')")
+        .expect("q").expect("v");
+    assert!(samples >= 5, "histogram should have at least 5 samples, got {}", samples);
+
+    let p50: Option<f64> = Spi::get_one("SELECT p50_ms FROM reflex_ivm_histogram('hist_view')")
+        .expect("q");
+    assert!(p50.is_some(), "p50 should be populated when samples exist");
+    assert!(p50.unwrap() >= 0.0, "p50 should be non-negative");
+
+    let max: Option<i64> = Spi::get_one("SELECT max_ms FROM reflex_ivm_histogram('hist_view')")
+        .expect("q");
+    assert!(max.is_some());
+}
+
+#[pg_test]
+fn pg_test_flush_histogram_empty_when_never_flushed() {
+    Spi::run("CREATE TABLE hist_empty_src (id SERIAL, grp TEXT)").expect("create");
+    crate::create_reflex_ivm(
+        "hist_empty_view",
+        "SELECT grp, COUNT(*) AS cnt FROM hist_empty_src GROUP BY grp",
+        None, None, Some("DEFERRED"),
+    );
+
+    let samples: i64 = Spi::get_one("SELECT samples FROM reflex_ivm_histogram('hist_empty_view')")
+        .expect("q").expect("v");
+    assert_eq!(samples, 0, "no flushes yet, no samples");
+}

@@ -16,6 +16,30 @@ pub struct IntermediateColumn {
     pub source_aggregate: String,
     /// Argument expression from the original query (e.g., "salary")
     pub source_arg: String,
+    /// When `Some(k)`, this is a MIN/MAX column with a sibling top-K array column
+    /// named `<name>_topk` of type `<pg_type>[]`. The array stores the K extremum
+    /// values seen for each group (smallest K for MIN, largest K for MAX), kept
+    /// in sorted order. On retraction the array is updated via multi-set
+    /// subtraction; the retraction recompute path is invoked only when the
+    /// array underflows.
+    ///
+    /// `None` keeps legacy 1.2.x behaviour (single scalar MIN/MAX column with
+    /// scoped recompute on retraction).
+    #[serde(default)]
+    pub topk_k: Option<usize>,
+}
+
+impl IntermediateColumn {
+    /// Returns the companion top-K array column name, e.g. `__min_x_topk`.
+    /// Only meaningful when `topk_k.is_some()`.
+    pub fn topk_column_name(&self) -> String {
+        format!("{}_topk", self.name)
+    }
+
+    /// True when this column carries a top-K companion array.
+    pub fn has_topk(&self) -> bool {
+        self.topk_k.is_some()
+    }
 }
 
 /// Mapping from intermediate columns to the final output column.
@@ -292,6 +316,7 @@ fn rewrite_expr_aggregates(
                                 pg_type: "BIGINT".to_string(),
                                 source_aggregate: "SUM".to_string(),
                                 source_arg: format!("CASE WHEN ({}) THEN 1 ELSE 0 END", arg),
+                                topk_k: None,
                             });
                         }
                         if !has_nonnull {
@@ -303,6 +328,7 @@ fn rewrite_expr_aggregates(
                                     "CASE WHEN ({}) IS NOT NULL THEN 1 ELSE 0 END",
                                     arg
                                 ),
+                                topk_k: None,
                             });
                         }
                         return format!(
@@ -334,6 +360,7 @@ fn rewrite_expr_aggregates(
                         },
                         source_aggregate: source_agg,
                         source_arg,
+                        topk_k: None,
                     });
                 }
                 return format!("\"{}\"", col_name);
@@ -433,7 +460,32 @@ fn first_arg_string(f: &Function) -> String {
 }
 
 /// Build an AggregationPlan from a SqlAnalysis.
+///
+/// When `topk_k` is `Some(k)`, MIN/MAX columns will be configured to maintain
+/// a sibling top-K array of size `k`. Pass `None` for legacy behaviour.
+pub fn plan_aggregation_with_topk(
+    analysis: &SqlAnalysis,
+    topk_k: Option<usize>,
+) -> AggregationPlan {
+    let mut plan = plan_aggregation_inner(analysis);
+    if let Some(k) = topk_k {
+        if k > 0 {
+            for ic in plan.intermediate_columns.iter_mut() {
+                if ic.source_aggregate == "MIN" || ic.source_aggregate == "MAX" {
+                    ic.topk_k = Some(k);
+                }
+            }
+        }
+    }
+    plan
+}
+
+/// Backwards-compatible plan_aggregation (no top-K).
 pub fn plan_aggregation(analysis: &SqlAnalysis) -> AggregationPlan {
+    plan_aggregation_inner(analysis)
+}
+
+fn plan_aggregation_inner(analysis: &SqlAnalysis) -> AggregationPlan {
     let mut intermediate_columns = Vec::new();
     let mut end_query_mappings = Vec::new();
     let mut count_distinct_columns: Vec<String> = Vec::new();
@@ -482,6 +534,7 @@ pub fn plan_aggregation(analysis: &SqlAnalysis) -> AggregationPlan {
                     pg_type: "NUMERIC".to_string(),
                     source_aggregate: "SUM".to_string(),
                     source_arg: arg.to_string(),
+                    topk_k: None,
                 });
                 // Companion COUNT(col) tracks non-NULL contributors.
                 // When this drops to 0, SUM should be NULL (not 0).
@@ -492,6 +545,7 @@ pub fn plan_aggregation(analysis: &SqlAnalysis) -> AggregationPlan {
                         pg_type: "BIGINT".to_string(),
                         source_aggregate: "COUNT".to_string(),
                         source_arg: arg.to_string(),
+                        topk_k: None,
                     });
                 }
                 // End query: CASE WHEN non-null count > 0 THEN sum END (returns NULL when all values are NULL)
@@ -512,6 +566,7 @@ pub fn plan_aggregation(analysis: &SqlAnalysis) -> AggregationPlan {
                     pg_type: "BIGINT".to_string(),
                     source_aggregate: "COUNT".to_string(),
                     source_arg: arg.to_string(),
+                    topk_k: None,
                 });
                 end_query_mappings.push(EndQueryMapping {
                     intermediate_expr: col_name,
@@ -527,6 +582,7 @@ pub fn plan_aggregation(analysis: &SqlAnalysis) -> AggregationPlan {
                     pg_type: "BIGINT".to_string(),
                     source_aggregate: "COUNT".to_string(),
                     source_arg: "*".to_string(),
+                    topk_k: None,
                 });
                 end_query_mappings.push(EndQueryMapping {
                     intermediate_expr: col_name,
@@ -544,12 +600,14 @@ pub fn plan_aggregation(analysis: &SqlAnalysis) -> AggregationPlan {
                     pg_type: "NUMERIC".to_string(),
                     source_aggregate: "SUM".to_string(),
                     source_arg: arg.to_string(),
+                    topk_k: None,
                 });
                 intermediate_columns.push(IntermediateColumn {
                     name: count_col.clone(),
                     pg_type: "BIGINT".to_string(),
                     source_aggregate: "COUNT".to_string(),
                     source_arg: arg.to_string(),
+                    topk_k: None,
                 });
                 end_query_mappings.push(EndQueryMapping {
                     intermediate_expr: format!("{} / NULLIF({}, 0)", sum_col, count_col),
@@ -565,6 +623,7 @@ pub fn plan_aggregation(analysis: &SqlAnalysis) -> AggregationPlan {
                     pg_type: "NUMERIC".to_string(),
                     source_aggregate: "MIN".to_string(),
                     source_arg: arg.to_string(),
+                    topk_k: None,
                 });
                 end_query_mappings.push(EndQueryMapping {
                     intermediate_expr: col_name,
@@ -580,6 +639,7 @@ pub fn plan_aggregation(analysis: &SqlAnalysis) -> AggregationPlan {
                     pg_type: "NUMERIC".to_string(),
                     source_aggregate: "MAX".to_string(),
                     source_arg: arg.to_string(),
+                    topk_k: None,
                 });
                 end_query_mappings.push(EndQueryMapping {
                     intermediate_expr: col_name,
@@ -596,12 +656,14 @@ pub fn plan_aggregation(analysis: &SqlAnalysis) -> AggregationPlan {
                     pg_type: "BIGINT".to_string(),
                     source_aggregate: "SUM".to_string(),
                     source_arg: format!("CASE WHEN ({}) THEN 1 ELSE 0 END", arg),
+                    topk_k: None,
                 });
                 intermediate_columns.push(IntermediateColumn {
                     name: nonnull_col.clone(),
                     pg_type: "BIGINT".to_string(),
                     source_aggregate: "SUM".to_string(),
                     source_arg: format!("CASE WHEN ({}) IS NOT NULL THEN 1 ELSE 0 END", arg),
+                    topk_k: None,
                 });
                 end_query_mappings.push(EndQueryMapping {
                     intermediate_expr: format!(
@@ -647,6 +709,7 @@ pub fn plan_aggregation(analysis: &SqlAnalysis) -> AggregationPlan {
                             pg_type: "NUMERIC".to_string(),
                             source_aggregate: "SUM".to_string(),
                             source_arg: arg,
+                            topk_k: None,
                         });
                     }
                     AggregateKind::Count => {
@@ -655,6 +718,7 @@ pub fn plan_aggregation(analysis: &SqlAnalysis) -> AggregationPlan {
                             pg_type: "BIGINT".to_string(),
                             source_aggregate: "COUNT".to_string(),
                             source_arg: arg,
+                            topk_k: None,
                         });
                     }
                     AggregateKind::CountStar => {
@@ -663,6 +727,7 @@ pub fn plan_aggregation(analysis: &SqlAnalysis) -> AggregationPlan {
                             pg_type: "BIGINT".to_string(),
                             source_aggregate: "COUNT".to_string(),
                             source_arg: "*".to_string(),
+                            topk_k: None,
                         });
                     }
                     AggregateKind::Avg => {
@@ -672,12 +737,14 @@ pub fn plan_aggregation(analysis: &SqlAnalysis) -> AggregationPlan {
                             pg_type: "NUMERIC".to_string(),
                             source_aggregate: "SUM".to_string(),
                             source_arg: arg.clone(),
+                            topk_k: None,
                         });
                         intermediate_columns.push(IntermediateColumn {
                             name: format!("__count_{}", arg_sanitized),
                             pg_type: "BIGINT".to_string(),
                             source_aggregate: "COUNT".to_string(),
                             source_arg: arg,
+                            topk_k: None,
                         });
                     }
                     AggregateKind::Min => {
@@ -686,6 +753,7 @@ pub fn plan_aggregation(analysis: &SqlAnalysis) -> AggregationPlan {
                             pg_type: "NUMERIC".to_string(),
                             source_aggregate: "MIN".to_string(),
                             source_arg: arg,
+                            topk_k: None,
                         });
                     }
                     AggregateKind::Max => {
@@ -694,6 +762,7 @@ pub fn plan_aggregation(analysis: &SqlAnalysis) -> AggregationPlan {
                             pg_type: "NUMERIC".to_string(),
                             source_aggregate: "MAX".to_string(),
                             source_arg: arg,
+                            topk_k: None,
                         });
                     }
                     AggregateKind::BoolOr => {
@@ -702,6 +771,7 @@ pub fn plan_aggregation(analysis: &SqlAnalysis) -> AggregationPlan {
                             pg_type: "BIGINT".to_string(),
                             source_aggregate: "SUM".to_string(),
                             source_arg: format!("CASE WHEN ({}) THEN 1 ELSE 0 END", arg),
+                            topk_k: None,
                         });
                         intermediate_columns.push(IntermediateColumn {
                             name: format!("__bool_or_{}_nonnull_count", arg_sanitized),
@@ -711,6 +781,7 @@ pub fn plan_aggregation(analysis: &SqlAnalysis) -> AggregationPlan {
                                 "CASE WHEN ({}) IS NOT NULL THEN 1 ELSE 0 END",
                                 arg
                             ),
+                            topk_k: None,
                         });
                     }
                     AggregateKind::CountDistinct => {

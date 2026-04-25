@@ -1,0 +1,148 @@
+site_name: pg_reflex
+site_description: Incremental materialized view maintenance for PostgreSQL
+site_author: Diviyan Kalainathan
+site_url: https://diviyank.github.io/pg_reflex/
+repo_url: https://github.com/diviyank/pg_reflex
+repo_name: diviyank/pg_reflex
+edit_uri: edit/main/docs/
+copyright: Copyright © 2026 Diviyan Kalainathan — Apache 2.0
+
+theme:
+  name: material
+  custom_dir: overrides
+  language: en
+  font:
+    text: Inter
+    code: JetBrains Mono
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: custom
+      accent: custom
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: custom
+      accent: custom
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+  features:
+    - navigation.tabs
+    - navigation.tabs.sticky
+    - navigation.sections
+    - navigation.expand
+    - navigation.top
+    - navigation.indexes
+    - navigation.footer
+    - toc.follow
+    - search.suggest
+    - search.highlight
+    - search.share
+    - content.code.copy
+    - content.code.annotate
+    - content.tabs.link
+    - content.action.edit
+    - content.tooltips
+  icon:
+    repo: fontawesome/brands/github
+    edit: material/pencil
+    view: material/eye
+
+extra_css:
+  - stylesheets/extra.css
+
+plugins:
+  - search
+
+markdown_extensions:
+  - abbr
+  - admonition
+  - attr_list
+  - def_list
+  - footnotes
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+      permalink_title: Anchor link
+  - pymdownx.betterem
+  - pymdownx.caret
+  - pymdownx.details
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - pymdownx.keys
+  - pymdownx.mark
+  - pymdownx.smartsymbols
+  - pymdownx.snippets
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.tasklist:
+      custom_checkbox: true
+  - pymdownx.tilde
+
+nav:
+  - Home: index.md
+  - Getting started:
+      - Installation: getting-started/install.md
+      - First IMV: getting-started/first-imv.md
+      - Upgrading: getting-started/upgrading.md
+  - Concepts:
+      - Architecture: concepts/architecture.md
+      - Sufficient statistics: concepts/sufficient-statistics.md
+      - Decomposition: concepts/decomposition.md
+      - Delta processing: concepts/delta-processing.md
+      - Deferred mode: concepts/deferred-mode.md
+      - Top-K MIN/MAX: concepts/topk.md
+  - SQL reference:
+      - Aggregates: sql-reference/aggregates.md
+      - Clauses: sql-reference/clauses.md
+      - Set operations: sql-reference/set-ops.md
+      - CTE: sql-reference/cte.md
+      - Window functions: sql-reference/window-functions.md
+      - DISTINCT ON: sql-reference/distinct-on.md
+      - FILTER: sql-reference/filter.md
+  - API reference:
+      - create_reflex_ivm: api/create_reflex_ivm.md
+      - drop_reflex_ivm: api/drop_reflex_ivm.md
+      - reflex_reconcile: api/reflex_reconcile.md
+      - reflex_flush_deferred: api/reflex_flush_deferred.md
+      - reflex_scheduled_reconcile: api/reflex_scheduled_reconcile.md
+      - reflex_ivm_status: api/reflex_ivm_status.md
+      - reflex_ivm_stats: api/reflex_ivm_stats.md
+      - reflex_ivm_histogram: api/reflex_ivm_histogram.md
+      - reflex_explain_flush: api/reflex_explain_flush.md
+      - Event triggers: api/event-triggers.md
+      - GUCs: api/gucs.md
+  - Operations:
+      - Deployment profile: operations/deployment-profile.md
+      - Monitoring: operations/monitoring.md
+      - Runbook: operations/runbook.md
+      - pg_cron recipe: operations/pg-cron.md
+      - Schema changes: operations/schema-changes.md
+      - Crash recovery: operations/crash-recovery.md
+      - Multi-tenant guards: operations/multi-tenant-guards.md
+  - Performance:
+      - Benchmarks: performance/benchmarks.md
+      - When to use: performance/when-to-use.md
+      - Cost model: performance/cost-model.md
+  - Limitations:
+      - Unsupported shapes: limitations/unsupported-shapes.md
+      - Known issues: limitations/known-issues.md
+  - Contributing:
+      - Architecture tour: contributing/architecture-tour.md
+      - Testing: contributing/testing.md
+      - Release process: contributing/release-process.md
+  - Changelog: changelog.md
+  - About:
+      - License: about/license.md
