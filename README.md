@@ -638,7 +638,7 @@ Each per-IMV flush body is wrapped in a `SAVEPOINT`. A failing IMV logs a `WARNI
 
 ## Troubleshooting
 
-A short operator runbook covering the cases that show up in production. The full guide is on the docs site (link in the project README header).
+A short operator runbook covering the cases that show up in production. The full guide — including the LOGGED-vs-UNLOGGED decision matrix, top-K caveats, and pg_cron recipes — is on the [docs site](https://diviyank.github.io/pg_reflex/operations/runbook/).
 
 ### Flush keeps failing on one IMV
 
@@ -683,6 +683,25 @@ Passthrough IMVs that handle DELETE require a unique key. From 1.2.1 the extensi
 ```sql
 SELECT create_reflex_ivm('v', 'SELECT id, name FROM src', 'id');
 ```
+
+### Flush is looping or stuck
+
+```sql
+SELECT pid, NOW() - query_start AS elapsed, query
+FROM pg_stat_activity
+WHERE application_name LIKE 'reflex_flush:%'
+ORDER BY elapsed DESC NULLS LAST;
+```
+
+If one IMV is consistently slow, check `reflex_explain_flush(name)` for an unexpected source seq-scan. If genuinely stuck, `pg_cancel_backend(<pid>)` then `reflex_rebuild_imv('<name>')` — the per-IMV SAVEPOINT keeps the cascade consistent.
+
+### Top-K IMV returning stale MIN/MAX
+
+`topk=K` (1.3.0) has a known partial-heap staleness gap on UPDATE patterns where source group cardinality substantially exceeds K. Workaround: `reflex_rebuild_imv('<name>')` to refresh from source. If it recurs, drop `topk` (re-create without the parameter). Full details: [docs/limitations/known-issues](https://diviyank.github.io/pg_reflex/limitations/known-issues/).
+
+### Picking LOGGED vs UNLOGGED for an IMV
+
+UNLOGGED is the default and gives 2-4× lower flush latency. Use LOGGED for IMVs that back SLA-bound reads where post-crash drift is unacceptable, or for very small IMVs where WAL overhead is negligible. Decision matrix: [docs/operations/crash-recovery](https://diviyank.github.io/pg_reflex/operations/crash-recovery/#picking-logged-vs-unlogged-decision-guide).
 
 ## Project Structure
 

@@ -84,3 +84,37 @@ Passthrough IMVs require a unique key for incremental DELETE/UPDATE. Without one
 ```sql
 SELECT create_reflex_ivm('v', 'SELECT id, name FROM src', 'id');
 ```
+
+## Flush is looping or stuck
+
+A "stuck" flush is almost always one of three shapes. Run this first to triage:
+
+```sql
+-- Long-running flushes
+SELECT pid, query_start, NOW() - query_start AS elapsed, state, query
+FROM pg_stat_activity
+WHERE application_name LIKE 'reflex_flush:%'
+ORDER BY elapsed DESC NULLS LAST;
+```
+
+| Pattern | Cause | Fix |
+|---|---|---|
+| Same IMV's flush takes minutes, every time | MIN/MAX recompute hitting full source scan (no `topk` and the affected-groups filter is wider than the source) | Re-create with `topk=K`, or accept the cost as a known shape (see [limitations](../limitations/known-issues.md)) |
+| Flush hangs on `pg_advisory_xact_lock` | Two sessions racing on the same `(view, source)` pair | Wait — they serialize cleanly. If wait > 30 s with no progress, kill the older session |
+| `last_flush_ms` rows growing over time, with `last_error` blank | Cascade fanout — every source UPDATE triggers N IMVs | Audit `reflex_ivm_status()` for `graph_depth ≥ 4` and consider DEFERRED mode for the deep tail |
+
+If a flush is genuinely stuck (no progress for > 5 minutes, no advisory-lock contention), the fastest recovery is:
+
+```sql
+-- Cancel the stuck statement, NOT the backend
+SELECT pg_cancel_backend(<pid>);
+
+-- Reconcile the affected IMV
+SELECT reflex_rebuild_imv('<name>');
+```
+
+`pg_terminate_backend` is heavier and unnecessary here — the per-IMV SAVEPOINT means the cascade rolls back to a consistent state.
+
+## Top-K IMV is returning a stale MIN/MAX
+
+Known limitation: see [partial-heap staleness on UPDATE](../limitations/known-issues.md#partial-heap-staleness-on-update). Workaround: `SELECT reflex_rebuild_imv('<name>')` to refresh the heap from the source. If it recurs, drop `topk` (re-create without the parameter) and accept the 1.2.0 scoped-recompute cost on retraction.
