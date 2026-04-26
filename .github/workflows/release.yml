@@ -35,7 +35,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libpq-dev libreadline-dev zlib1g-dev
 
       - name: Install cargo-pgrx
-        run: cargo install cargo-pgrx --version '=0.16.1' --locked
+        run: cargo install cargo-pgrx --version '=0.18.0' --locked
 
       - name: Initialize pgrx
         run: cargo pgrx init --pg${{ matrix.pg }} download

@@ -37,7 +37,7 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 source ~/.cargo/env
 
 # 3. Install cargo-pgrx (the PostgreSQL extension build tool)
-cargo install cargo-pgrx --version '=0.16.1' --locked
+cargo install cargo-pgrx --version '=0.18.0' --locked
 
 # 4. Initialize pgrx with your PostgreSQL version (downloads PG headers)
 cargo pgrx init --pg17 download    # adjust pg17 to your version (pg15, pg16, pg18)
