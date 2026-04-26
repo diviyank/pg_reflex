@@ -447,6 +447,33 @@ pub fn build_min_max_recompute_sql(
     orig_base_query: &str,
     affected_tbl: Option<&str>,
 ) -> Option<String> {
+    build_min_max_recompute_sql_inner(intermediate_tbl, plan, orig_base_query, affected_tbl, false)
+}
+
+/// UPDATE-flavoured variant: when any MIN/MAX column has top-K enabled, the
+/// algebraic Sub+Add merge can leave the heap with K elements but the *wrong*
+/// K — for groups whose source has unchanged rows that should be in heap and
+/// aren't (because the heap pre-update never held them and the Add step only
+/// merges the delta_new top-K into what survived Sub). Force a recompute for
+/// every affected top-K column so heap+scalar reflect the post-UPDATE source
+/// truthfully. Non-top-K MIN/MAX columns keep the legacy `scalar IS NULL`
+/// gate. INSERT/DELETE flows are unaffected.
+pub fn build_min_max_recompute_sql_force_topk(
+    intermediate_tbl: &str,
+    plan: &AggregationPlan,
+    orig_base_query: &str,
+    affected_tbl: Option<&str>,
+) -> Option<String> {
+    build_min_max_recompute_sql_inner(intermediate_tbl, plan, orig_base_query, affected_tbl, true)
+}
+
+fn build_min_max_recompute_sql_inner(
+    intermediate_tbl: &str,
+    plan: &AggregationPlan,
+    orig_base_query: &str,
+    affected_tbl: Option<&str>,
+    force_topk: bool,
+) -> Option<String> {
     let min_max_cols: Vec<&crate::aggregation::IntermediateColumn> = plan
         .intermediate_columns
         .iter()
@@ -478,9 +505,16 @@ pub fn build_min_max_recompute_sql(
 
     // Trigger recompute when the scalar slot is NULL (legacy path) OR — for
     // top-K columns — when the companion array is empty/NULL (heap underflow
-    // after a multi-set subtract).
+    // after a multi-set subtract). When `force_topk` is set (UPDATE flow on
+    // top-K IMVs) the heap-staleness check becomes an unconditional `TRUE`
+    // for top-K columns so every affected group gets re-derived from source —
+    // the algebraic merge can leave heap with K elements but the wrong K.
     let mut null_check: Vec<String> = Vec::new();
     for ic in &min_max_cols {
+        if force_topk && ic.has_topk() {
+            null_check.push("TRUE".to_string());
+            continue;
+        }
         null_check.push(format!("{}.\"{}\" IS NULL", intermediate_tbl, ic.name));
         if ic.has_topk() {
             let topk = ic.topk_column_name();
@@ -1138,7 +1172,23 @@ pub fn reflex_build_delta_sql(
                 let delta_old = replace_source_with_transition(base_query, source_table, &old_tbl);
                 let delta_new = replace_source_with_transition(base_query, source_table, &new_tbl);
 
+                let has_topk = plan.intermediate_columns.iter().any(|ic| ic.has_topk());
+
                 if has_min_max {
+                    // Two orderings, picked by whether top-K is in play:
+                    //
+                    // - Non-top-K (legacy): Sub → recompute(if scalar NULL) → Add.
+                    //   The recompute MUST run BEFORE Add because Sub leaves
+                    //   `scalar = NULL` and Add would otherwise compute
+                    //   `LEAST(NULL, d.scalar) = d.scalar`, swallowing any unchanged
+                    //   source row that should be the new MIN/MAX.
+                    //
+                    // - Top-K: Sub → topk_refresh → Add → forced recompute. The
+                    //   algebraic merge can land heap on K elements that aren't the
+                    //   true top-K of the post-UPDATE source — heap pre-update never
+                    //   held the unchanged rows that should fill it now. Forcing
+                    //   recompute after Add re-derives heap+scalar from the
+                    //   (post-UPDATE) source for every affected top-K column.
                     if let Some(ref cols) = grp_cols {
                         let select_expr = affected_groups_select(cols);
                         push_materialized_merge_and_affected(
@@ -1159,13 +1209,16 @@ pub fn reflex_build_delta_sql(
                         ) {
                             stmts.push(refresh);
                         }
-                        if let Some(recompute) = build_min_max_recompute_sql(
-                            &intermediate_tbl,
-                            &plan,
-                            orig_base_query,
-                            Some(affected_tbl.as_str()),
-                        ) {
-                            stmts.push(recompute);
+                        if !has_topk {
+                            // Non-top-K: recompute BEFORE Add to avoid LEAST(NULL, d).
+                            if let Some(recompute) = build_min_max_recompute_sql(
+                                &intermediate_tbl,
+                                &plan,
+                                orig_base_query,
+                                Some(affected_tbl.as_str()),
+                            ) {
+                                stmts.push(recompute);
+                            }
                         }
                         push_materialized_merge_and_affected(
                             &mut stmts,
@@ -1178,6 +1231,18 @@ pub fn reflex_build_delta_sql(
                             &select_expr,
                             false,
                         );
+                        if has_topk {
+                            // Top-K: forced recompute AFTER Add to overwrite any stale
+                            // heap content the algebraic merge left behind.
+                            if let Some(recompute) = build_min_max_recompute_sql_force_topk(
+                                &intermediate_tbl,
+                                &plan,
+                                orig_base_query,
+                                Some(affected_tbl.as_str()),
+                            ) {
+                                stmts.push(recompute);
+                            }
+                        }
                     } else {
                         push_materialized_merge(
                             &mut stmts,
@@ -1192,13 +1257,15 @@ pub fn reflex_build_delta_sql(
                         {
                             stmts.push(refresh);
                         }
-                        if let Some(recompute) = build_min_max_recompute_sql(
-                            &intermediate_tbl,
-                            &plan,
-                            orig_base_query,
-                            None,
-                        ) {
-                            stmts.push(recompute);
+                        if !has_topk {
+                            if let Some(recompute) = build_min_max_recompute_sql(
+                                &intermediate_tbl,
+                                &plan,
+                                orig_base_query,
+                                None,
+                            ) {
+                                stmts.push(recompute);
+                            }
                         }
                         push_materialized_merge(
                             &mut stmts,
@@ -1208,6 +1275,16 @@ pub fn reflex_build_delta_sql(
                             &plan,
                             DeltaOp::Add,
                         );
+                        if has_topk {
+                            if let Some(recompute) = build_min_max_recompute_sql_force_topk(
+                                &intermediate_tbl,
+                                &plan,
+                                orig_base_query,
+                                None,
+                            ) {
+                                stmts.push(recompute);
+                            }
+                        }
                     }
                 } else if grp_cols.is_some() {
                     let cols = grp_cols.as_ref().expect("grp_cols is Some — checked above");

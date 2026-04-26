@@ -20,61 +20,48 @@ If a source column's type changes (`ALTER TABLE ... ALTER COLUMN ... TYPE`), the
 
 If session A `drop_reflex_ivm('v')` and session B `create_reflex_ivm('v', ...)` race, the registry `PRIMARY KEY(name)` constraint serialises them — one wins, the other errors cleanly. Tested with up to 4 concurrent sessions; not stress-tested beyond.
 
-## Top-K (1.3.0) — open follow-ups
+## Top-K — closed in 1.3.x
 
-### Partial-heap staleness on UPDATE
-
-When `K < group_size`, an UPDATE that removes a heap element AND leaves
-unchanged source rows that *should* have been promoted into the heap can
-leave the heap in a stale state — the heap is internally consistent but
-no longer reflects the true top-K of the source. The scalar
-`__min_x` / `__max_x` is still correct *immediately* after the UPDATE
-(because heap[1] is read fresh), but a *subsequent* DELETE of a heap
-element exposes the staleness — `heap[1]` then reads a value that is
-not the true MIN/MAX of the now-residual source.
-
-**Reproduction shape** (full trace in
-`journal/2026-04-26_topk_default_and_type_fix.md`):
-
-```text
-Source = {1, 2, 3}   K=2   heap = [1, 2]   scalar = 1
-UPDATE val=1 → val=10
-  → heap = [2, 10]   scalar = 2  ✓
-  (heap is now stale: should be [2, 3], `3` was never in heap)
-DELETE val=2
-  → heap = [10]      scalar = 10  ❌  (true MIN = 3)
-```
-
-**Why the 1.3.0 recompute path doesn't catch this**: the recompute
-trigger fires on `scalar IS NULL OR cardinality(heap) = 0` (heap empty).
-A *partial* heap that's non-empty but missing source rows slips through.
-
-**Workaround**: avoid `topk=K` on IMVs whose source group cardinality
-substantially exceeds `K` *and* whose UPDATE pattern can replace heap
-elements with non-heap-eligible values. The original 1.2.0 scoped
-recompute path (no `topk`) is unaffected.
-
-**Fix path**: widen the recompute trigger to fire on partial-heap
-states using `__ivm_count > cardinality(heap)` as the staleness signal.
-Doing this naïvely fires recompute on every retraction in wide-group
-shapes — reintroducing the source-scan cliff `topk` was meant to
-eliminate. The proper fix needs `delta_old` vs heap-pre-state
-comparison to detect "did this retraction leave a hole that needs
-filling?" That logic is not in tree yet. Tracked for a 1.3.x patch.
-
-### Tracked for 1.3.1
-
-1. **`reflex_enable_topk(name, k)` retrofit SPI** — to opt an existing
-   IMV into top-K without `drop + create`. Internal-only release means
-   we can `drop + create` for now, but eventually warranted.
-2. **Smarter recompute trigger** — see partial-heap-staleness above.
-
-### Closed in 1.3.x
-
-- ~~Element types beyond NUMERIC~~ — `pg_test_topk_{text,date,timestamp}_min_max`
+- ~~**Element types beyond NUMERIC**~~ — `pg_test_topk_{text,date,timestamp}_min_max`
   added 2026-04-26. Schema-builder type resolution now propagates back
   onto `IntermediateColumn.pg_type` so the trigger MERGE codegen emits
   the correct `'{}'::TYPE[]` literal in COALESCE.
+
+- ~~**Partial-heap staleness on UPDATE**~~ — when `K < group_size`, an
+  UPDATE that retracts a heap element AND leaves unchanged source rows
+  that should have been promoted into the heap used to leave the heap
+  in a non-empty-but-wrong state. A subsequent DELETE then read
+  `heap[1]` as authoritative and produced a wrong scalar. **Fix
+  (2026-04-26)**: split the UPDATE flow's recompute trigger into two
+  paths — non-top-K MIN/MAX keeps the legacy `Sub → recompute(if scalar
+  IS NULL) → Add` order; top-K MIN/MAX uses `Sub → topk_refresh → Add →
+  forced recompute` and unconditionally re-derives heap+scalar from
+  source for every affected group. INSERT/DELETE flows are unchanged.
+  Regression locked in by `pg_test_topk_partial_heap_staleness_regression`.
+
+  Cost shape: UPDATEs on top-K MIN/MAX IMVs now pay a scoped source-scan
+  for affected groups (≈ same as the 1.2.0 scoped-recompute path on
+  retraction). INSERT-only and DELETE-only workloads keep the full
+  top-K speedup. This is an explicit correctness-over-perf tradeoff: a
+  smarter UPDATE-time check that distinguishes "delta_old shrunk a
+  heap-eligible element" from "delta_old removed a non-heap row" would
+  let UPDATE skip the recompute in the second case, but requires
+  comparing delta_old against pre-state heap content — out of scope
+  for the correctness fix.
+
+- ~~**Auto-enabled by default**~~ — top-K applies to MIN/MAX
+  intermediate columns automatically when an IMV is created via the
+  5-arg `create_reflex_ivm`. The parameter is a no-op for SUM / COUNT /
+  AVG / BOOL_OR. Operators on append-only MIN/MAX workloads who want
+  to skip the heap-maintenance overhead can call the 6-arg overload
+  with `topk = 0`.
+
+## Top-K — tracked follow-ups
+
+- **`reflex_enable_topk(name, k)` retrofit SPI** — internal-only
+  release means `drop + create` is acceptable for now. A retrofit SPI
+  becomes warranted when an external user wants to flip the parameter
+  on an in-flight IMV without rebuilding it. Out of scope until then.
 
 ## What changed the verdict from "controlled production use"
 

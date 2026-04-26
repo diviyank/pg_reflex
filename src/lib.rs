@@ -114,6 +114,15 @@ fn validate_view_name(name: &str) -> Result<(), &'static str> {
     Ok(())
 }
 
+/// Default top-K heap size auto-applied to every MIN/MAX intermediate column
+/// when the operator does not pass an explicit `topk` argument. Reflex
+/// detects MIN/MAX presence in the IMV's plan; the parameter is a no-op for
+/// SUM / COUNT / AVG / BOOL_OR aggregations. K=16 matches the value used in
+/// the 1.3.0 landing benchmark and trades ~2.5× INSERT overhead for ~5-6×
+/// faster retractions on MIN/MAX IMVs. Operators on append-only MIN/MAX
+/// workloads can opt out by passing `topk = 0` to the 6-arg overload.
+const DEFAULT_TOPK_K: usize = 16;
+
 #[pg_extern]
 fn create_reflex_ivm(
     view_name: &str,
@@ -129,7 +138,7 @@ fn create_reflex_ivm(
         false,
         storage.unwrap_or("UNLOGGED"),
         mode.unwrap_or("IMMEDIATE"),
-        None,
+        Some(DEFAULT_TOPK_K),
     )
 }
 
@@ -168,7 +177,7 @@ fn create_reflex_ivm_if_not_exists(
         true,
         storage.unwrap_or("UNLOGGED"),
         mode.unwrap_or("IMMEDIATE"),
-        None,
+        Some(DEFAULT_TOPK_K),
     )
 }
 

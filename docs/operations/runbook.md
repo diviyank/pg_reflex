@@ -115,6 +115,13 @@ SELECT reflex_rebuild_imv('<name>');
 
 `pg_terminate_backend` is heavier and unnecessary here — the per-IMV SAVEPOINT means the cascade rolls back to a consistent state.
 
-## Top-K IMV is returning a stale MIN/MAX
+## Top-K is enabled by default for MIN/MAX
 
-Known limitation: see [partial-heap staleness on UPDATE](../limitations/known-issues.md#partial-heap-staleness-on-update). Workaround: `SELECT reflex_rebuild_imv('<name>')` to refresh the heap from the source. If it recurs, drop `topk` (re-create without the parameter) and accept the 1.2.0 scoped-recompute cost on retraction.
+Since 2026-04-26, `create_reflex_ivm` auto-enables top-K (K=16) on every MIN/MAX intermediate column. Reflex detects MIN/MAX presence in the plan; the parameter is a no-op for SUM/COUNT/AVG/BOOL_OR. Operators on append-only MIN/MAX workloads (where retraction never happens) can opt out via the 6-arg overload:
+
+```sql
+SELECT create_reflex_ivm('append_only_v', 'SELECT grp, MAX(seen_at) FROM events GROUP BY grp',
+    NULL, NULL, NULL, 0);  -- topk=0 disables
+```
+
+The earlier 1.3.0 partial-heap staleness gap on UPDATE has been fixed — UPDATEs on top-K MIN/MAX IMVs now force a scoped source-scan recompute for affected groups, so heap correctness is no longer dependent on the heap pre-state.

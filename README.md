@@ -695,9 +695,9 @@ ORDER BY elapsed DESC NULLS LAST;
 
 If one IMV is consistently slow, check `reflex_explain_flush(name)` for an unexpected source seq-scan. If genuinely stuck, `pg_cancel_backend(<pid>)` then `reflex_rebuild_imv('<name>')` — the per-IMV SAVEPOINT keeps the cascade consistent.
 
-### Top-K IMV returning stale MIN/MAX
+### Top-K is auto-enabled for MIN/MAX
 
-`topk=K` (1.3.0) has a known partial-heap staleness gap on UPDATE patterns where source group cardinality substantially exceeds K. Workaround: `reflex_rebuild_imv('<name>')` to refresh from source. If it recurs, drop `topk` (re-create without the parameter). Full details: [docs/limitations/known-issues](https://diviyank.github.io/pg_reflex/limitations/known-issues/).
+`create_reflex_ivm` auto-enables top-K (K=16) on MIN/MAX intermediate columns. The parameter is a no-op for SUM/COUNT/AVG/BOOL_OR. To disable for append-only MIN/MAX workloads, call the 6-arg overload with `topk=0`.
 
 ### Picking LOGGED vs UNLOGGED for an IMV
 

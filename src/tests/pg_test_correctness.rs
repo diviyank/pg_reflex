@@ -3447,6 +3447,57 @@ fn pg_test_topk_date_min_max() {
     assert_imv_correct("topk_date_v", fresh);
 }
 
+/// Regression for the partial-heap-staleness bug fixed 2026-04-26: an UPDATE
+/// that retracts a heap element AND leaves unchanged source rows that were
+/// never in the heap used to leave the heap in a non-empty-but-wrong state.
+/// The next DELETE then read `heap[1]` as authoritative and produced a
+/// wrong scalar. The fix forces a recompute after Sub+Add for every affected
+/// top-K column. This test reproduces the minimal failing shape from
+/// `journal/2026-04-26_topk_default_and_type_fix.md` and asserts the IMV
+/// stays correct across two follow-on retractions.
+#[pg_test]
+fn pg_test_topk_partial_heap_staleness_regression() {
+    Spi::run("CREATE TABLE topk_stale_src (id SERIAL PRIMARY KEY, grp TEXT, val NUMERIC)")
+        .expect("create");
+    // Source: 5 rows in one group, K=2. Heap will hold the 2 smallest;
+    // 3 unchanged rows sit outside the heap waiting to be promoted.
+    Spi::run(
+        "INSERT INTO topk_stale_src (grp, val) VALUES \
+         ('a', 1), ('a', 2), ('a', 3), ('a', 4), ('a', 5)",
+    )
+    .expect("seed");
+
+    Spi::run(
+        "SELECT create_reflex_ivm('topk_stale_v', \
+         'SELECT grp, MIN(val) AS lo, MAX(val) AS hi FROM topk_stale_src GROUP BY grp', \
+         NULL, NULL, NULL, 2)",
+    )
+    .expect("create");
+
+    let fresh = "SELECT grp, MIN(val) AS lo, MAX(val) AS hi FROM topk_stale_src GROUP BY grp";
+    assert_imv_correct("topk_stale_v", fresh);
+
+    // UPDATE val=1 → val=10. delta_old removes heap[1]=1, delta_new adds 10.
+    // Algebraic merge would land heap on [2, 10] — true top-2 is [2, 3].
+    // Forced post-Add recompute corrects it to [2, 3].
+    Spi::run("UPDATE topk_stale_src SET val = 10 WHERE val = 1").expect("update");
+    assert_imv_correct("topk_stale_v", fresh);
+
+    // Trigger statement that exposed the bug: DELETE val=2.
+    // Pre-fix: heap was [2, 10] (stale), heap[1]=2 → DELETE leaves [10] →
+    // scalar 10 ≠ true MIN 3. Post-fix: heap was [2, 3] → DELETE leaves [3] →
+    // scalar 3 = true MIN. ✓
+    Spi::run("DELETE FROM topk_stale_src WHERE val = 2").expect("delete");
+    assert_imv_correct("topk_stale_v", fresh);
+
+    // Repeat with MAX side: UPDATE val=5 → val=0 retracts heap[1] for MAX.
+    Spi::run("UPDATE topk_stale_src SET val = 0 WHERE val = 5").expect("update max");
+    assert_imv_correct("topk_stale_v", fresh);
+
+    Spi::run("DELETE FROM topk_stale_src WHERE val = 4").expect("delete max heap");
+    assert_imv_correct("topk_stale_v", fresh);
+}
+
 /// Top-K element type coverage: TIMESTAMP MIN/MAX. Catches the same class of
 /// resolution gap as DATE/TEXT for sub-day-precision time columns.
 #[pg_test]
