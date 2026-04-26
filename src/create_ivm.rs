@@ -1308,22 +1308,46 @@ pub(crate) fn create_reflex_ivm_impl(
             // Uses UNLOGGED for speed; lost on crash but rebuilt by reflex_reconcile.
             if !plan.group_by_columns.is_empty() || !plan.distinct_columns.is_empty() {
                 let bare_view = split_qualified_name(view_name).1;
+                let group_cols_csv = plan
+                    .group_by_columns
+                    .iter()
+                    .chain(plan.distinct_columns.iter())
+                    .map(|c| format!("\"{}\"", normalized_column_name(c)))
+                    .collect::<Vec<_>>()
+                    .join(", ");
                 let affected_name = safe_identifier(&format!("__reflex_affected_{}", bare_view));
                 client
                     .update(
                         &format!(
                             "CREATE UNLOGGED TABLE IF NOT EXISTS \"{}\" AS SELECT {} FROM {} WHERE FALSE",
                             affected_name,
-                            plan.group_by_columns.iter()
-                                .chain(plan.distinct_columns.iter())
-                                .map(|c| format!("\"{}\"", normalized_column_name(c)))
-                                .collect::<Vec<_>>()
-                                .join(", "),
+                            group_cols_csv,
                             intermediate_tbl
                         ),
                         None, &[],
                     )
                     .unwrap_or_report();
+
+                // N1: per-IMV "shrunk groups" capture table — populated post-Sub
+                // on UPDATE for top-K MIN/MAX IMVs to scope the forced recompute
+                // to groups whose heap actually shrank below K. Provisioned only
+                // when the plan has any top-K column; non-top-K IMVs leave it
+                // unallocated.
+                let has_topk = plan.intermediate_columns.iter().any(|ic| ic.has_topk());
+                if has_topk {
+                    let shrunk_name = safe_identifier(&format!("__reflex_shrunk_{}", bare_view));
+                    client
+                        .update(
+                            &format!(
+                                "CREATE UNLOGGED TABLE IF NOT EXISTS \"{}\" AS SELECT {} FROM {} WHERE FALSE",
+                                shrunk_name,
+                                group_cols_csv,
+                                intermediate_tbl
+                            ),
+                            None, &[],
+                        )
+                        .unwrap_or_report();
+                }
             }
 
             // ANALYZE so the query planner has accurate statistics

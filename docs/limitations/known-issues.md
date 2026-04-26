@@ -39,15 +39,27 @@ If session A `drop_reflex_ivm('v')` and session B `create_reflex_ivm('v', ...)` 
   source for every affected group. INSERT/DELETE flows are unchanged.
   Regression locked in by `pg_test_topk_partial_heap_staleness_regression`.
 
-  Cost shape: UPDATEs on top-K MIN/MAX IMVs now pay a scoped source-scan
-  for affected groups (≈ same as the 1.2.0 scoped-recompute path on
-  retraction). INSERT-only and DELETE-only workloads keep the full
-  top-K speedup. This is an explicit correctness-over-perf tradeoff: a
-  smarter UPDATE-time check that distinguishes "delta_old shrunk a
-  heap-eligible element" from "delta_old removed a non-heap row" would
-  let UPDATE skip the recompute in the second case, but requires
-  comparing delta_old against pre-state heap content — out of scope
-  for the correctness fix.
+  Cost shape: UPDATEs on top-K MIN/MAX IMVs used to pay a scoped
+  source-scan for *every* affected group (≈ same as the 1.2.0
+  scoped-recompute path on retraction). INSERT-only and DELETE-only
+  workloads kept the full top-K speedup.
+
+  **Update (1.3.1, 2026-04-26)**: the smarter UPDATE-time check is
+  shipped. A persistent `__reflex_shrunk_<view>` capture table records
+  groups whose heap shrank below K during Sub; the forced recompute
+  is now scoped to that subset. Groups whose heap stayed at K had no
+  heap-eligible row removed and the algebraic Sub+Add merge alone is
+  correct. Bench: ~30 × speedup on 1 K-batch UPDATEs, ~8.5 × on 10 K,
+  ~2 × on 100 K, on a 5 M-row source with K=16 and ~10 K rows per
+  group (`benchmarks/bench_n1_topk_update.sql`). Correctness locked
+  by `pg_test_topk_update_no_heap_shrink_keeps_correctness`,
+  `pg_test_topk_update_mixed_shrink_groups`,
+  `pg_test_topk_update_multi_column_shrink`, plus the existing
+  `pg_test_topk_partial_heap_staleness_regression` and
+  `pg_test_randomized_mutation_sequence`. Workloads with group
+  cardinality ≤ K still pay the recompute on every UPDATE (heap
+  always shrinks); operators on append-only MIN/MAX can still opt out
+  via the 6-arg overload with `topk = 0`.
 
 - ~~**Auto-enabled by default**~~ — top-K applies to MIN/MAX
   intermediate columns automatically when an IMV is created via the

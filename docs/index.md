@@ -51,7 +51,7 @@ On the workloads it targets — append-mostly sources, narrow updates, cascade d
     Analytical dashboards over append-mostly or narrowly-mutated sources. SUM / COUNT / AVG / COUNT(DISTINCT) / BOOL_OR. Cascade depth ≤ 3. Schema changes rare or operator-coordinated.
 
 !!! warning "Yellow light"
-    UPDATE-heavy patterns on top-K MIN/MAX IMVs where group cardinality substantially exceeds K — every UPDATE pays a scoped source-scan recompute for affected groups (correctness fix shipped 2026-04-26). If your workload is overwhelmingly UPDATE rather than INSERT+DELETE, opt out via `topk = 0`. Multi-session concurrent DDL on the same IMV graph: tested with 4 concurrent flush sessions, not stress-tested beyond.
+    UPDATE-heavy patterns on top-K MIN/MAX IMVs where the *group cardinality is at or below K* (heap holds the whole group) — every UPDATE shrinks the heap, so the scoped source-scan recompute fires regardless. Workloads where K ≪ group cardinality recover most of the pre-1.3.0 UPDATE perf via the 1.3.1 heap-shrinkage gate. If your shape is in the bad case, opt out via `topk = 0`. Multi-session concurrent DDL on the same IMV graph: tested with 4 concurrent flush sessions, not stress-tested beyond.
 
 !!! danger "Red light"
     `WITH RECURSIVE`, `FULL OUTER JOIN` deltas, `ARRAY_AGG` / `JSON_AGG`. Mission-critical read paths where stale-on-schema-change is worse than downtime (use `pg_reflex.alter_source_policy = 'error'` from 1.2.1 to gate). Multi-tenant platforms where untrusted users can define IMV SQL.

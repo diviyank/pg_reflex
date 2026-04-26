@@ -3536,3 +3536,156 @@ fn pg_test_topk_timestamp_min_max() {
     Spi::run("DELETE FROM topk_ts_src WHERE grp = 'b'").expect("drain b");
     assert_imv_correct("topk_ts_v", fresh);
 }
+
+/// N1 — heap-shrinkage gate, non-shrink path. UPDATE a row whose value sits
+/// strictly outside the K smallest / K largest of its group. The pre-Sub heap
+/// has K elements; Sub removes nothing (delta_old not in heap); post-Sub
+/// cardinality stays at K. Add then merges delta_new and the heap is correct
+/// without any source-scan recompute. Today (forced recompute) and after N1
+/// (gated recompute, skipped here) must both yield the same answer.
+#[pg_test]
+fn pg_test_topk_update_no_heap_shrink_keeps_correctness() {
+    Spi::run("CREATE TABLE topk_ns_src (id SERIAL PRIMARY KEY, grp TEXT, val NUMERIC)")
+        .expect("create");
+    // 100 rows, one group. K=4 → heap holds the 4 smallest (MIN) and 4 largest (MAX).
+    // Most rows sit outside both heaps.
+    Spi::run(
+        "INSERT INTO topk_ns_src (grp, val) \
+         SELECT 'a', i FROM generate_series(1, 100) i",
+    )
+    .expect("seed");
+
+    Spi::run(
+        "SELECT create_reflex_ivm('topk_ns_v', \
+         'SELECT grp, MIN(val) AS lo, MAX(val) AS hi FROM topk_ns_src GROUP BY grp', \
+         NULL, NULL, NULL, 4)",
+    )
+    .expect("create");
+
+    let fresh = "SELECT grp, MIN(val) AS lo, MAX(val) AS hi FROM topk_ns_src GROUP BY grp";
+    assert_imv_correct("topk_ns_v", fresh);
+
+    // val=50 is strictly between heap_min (top-4 = [1..4]) and heap_max
+    // (top-4 = [97..100]). Updating to val=60 keeps it outside both heaps.
+    Spi::run("UPDATE topk_ns_src SET val = 60 WHERE val = 50").expect("update non-heap row");
+    assert_imv_correct("topk_ns_v", fresh);
+
+    // val=60 → val=55: still outside both heaps.
+    Spi::run("UPDATE topk_ns_src SET val = 55 WHERE val = 60").expect("update non-heap row 2");
+    assert_imv_correct("topk_ns_v", fresh);
+
+    // Cross the heap boundary — UPDATE val=55 → val=2 promotes into MIN heap,
+    // forcing the heap to shrink (cardinality=4, but Sub of 55 leaves it at 4
+    // because 55 wasn't in heap; Add of 2 displaces 4). Correct via Add.
+    // No shrink, no recompute: still the gated path. Heap = [1,2,2,3].
+    Spi::run("UPDATE topk_ns_src SET val = 2 WHERE val = 55").expect("update into heap");
+    assert_imv_correct("topk_ns_v", fresh);
+
+    // True heap-eligible UPDATE — val=1 → val=200. Sub removes 1 (in heap),
+    // post-Sub heap_min cardinality=3 < K=4. Gate fires; recompute reads
+    // source and re-derives. Add of 200 enters heap_max.
+    Spi::run("UPDATE topk_ns_src SET val = 200 WHERE val = 1").expect("update heap row");
+    assert_imv_correct("topk_ns_v", fresh);
+}
+
+/// N1 — heap-shrinkage gate, mixed shrink/non-shrink groups within one
+/// statement. A single UPDATE statement produces a delta covering two groups:
+/// one whose heap shrinks (delta_old.val was in heap), one whose heap stays
+/// at K (delta_old.val outside heap). Asserts both groups stay correct after
+/// the trigger fires once.
+#[pg_test]
+fn pg_test_topk_update_mixed_shrink_groups() {
+    Spi::run("CREATE TABLE topk_mix_src (id SERIAL PRIMARY KEY, grp TEXT, val NUMERIC)")
+        .expect("create");
+    // Group 'a': values 1..10 → heap_min = [1, 2] (K=2), heap_max = [10, 9].
+    // Group 'b': values 1000..1009 → heap_min = [1000, 1001], heap_max = [1009, 1008].
+    Spi::run(
+        "INSERT INTO topk_mix_src (grp, val) \
+         SELECT 'a', i FROM generate_series(1, 10) i \
+         UNION ALL SELECT 'b', 1000+i FROM generate_series(0, 9) i",
+    )
+    .expect("seed");
+
+    Spi::run(
+        "SELECT create_reflex_ivm('topk_mix_v', \
+         'SELECT grp, MIN(val) AS lo, MAX(val) AS hi FROM topk_mix_src GROUP BY grp', \
+         NULL, NULL, NULL, 2)",
+    )
+    .expect("create");
+
+    let fresh = "SELECT grp, MIN(val) AS lo, MAX(val) AS hi FROM topk_mix_src GROUP BY grp";
+    assert_imv_correct("topk_mix_v", fresh);
+
+    // Single UPDATE statement covering both groups:
+    //   - Group 'a': val=1 → val=100. delta_old=1 (in heap_min), shrinks.
+    //   - Group 'b': val=1005 → val=1006. delta_old=1005 (NOT in heap_min
+    //     [1000,1001] nor heap_max [1009,1008]) — no shrink for 'b'.
+    Spi::run(
+        "UPDATE topk_mix_src SET val = CASE val WHEN 1 THEN 100 WHEN 1005 THEN 1006 END \
+         WHERE val IN (1, 1005)",
+    )
+    .expect("mixed update");
+    assert_imv_correct("topk_mix_v", fresh);
+
+    // Follow up with a multi-row delete to flush the queued partial-heap state
+    // for 'b' (mirrors `pg_test_topk_partial_heap_staleness_regression`'s
+    // exposure pattern — a stale heap leaves no symptom until a retraction
+    // reads heap[1]).
+    Spi::run("DELETE FROM topk_mix_src WHERE val IN (2, 1001, 1009)").expect("drain edges");
+    assert_imv_correct("topk_mix_v", fresh);
+}
+
+/// N1 — heap-shrinkage gate, multi-column top-K (MIN and MAX over the same
+/// source column). The capture predicate is an OR over all top-K columns, so
+/// a group whose MIN heap shrinks but MAX heap doesn't (or vice-versa) still
+/// gets flagged and recomputed correctly. Both columns must stay in sync with
+/// the post-update source.
+#[pg_test]
+fn pg_test_topk_update_multi_column_shrink() {
+    Spi::run("CREATE TABLE topk_mc_src (id SERIAL PRIMARY KEY, grp TEXT, val NUMERIC)")
+        .expect("create");
+    // 10 rows in one group → heap_min = [1,2,3], heap_max = [10,9,8] (K=3).
+    Spi::run(
+        "INSERT INTO topk_mc_src (grp, val) \
+         SELECT 'a', i FROM generate_series(1, 10) i",
+    )
+    .expect("seed");
+
+    Spi::run(
+        "SELECT create_reflex_ivm('topk_mc_v', \
+         'SELECT grp, MIN(val) AS lo, MAX(val) AS hi FROM topk_mc_src GROUP BY grp', \
+         NULL, NULL, NULL, 3)",
+    )
+    .expect("create");
+
+    let fresh = "SELECT grp, MIN(val) AS lo, MAX(val) AS hi FROM topk_mc_src GROUP BY grp";
+    assert_imv_correct("topk_mc_v", fresh);
+
+    // val=2 is in heap_min (shrinks MIN side) but NOT in heap_max (no shrink
+    // there). The OR-gated capture must still flag the group. After Add the
+    // heap is potentially partial for MIN — recompute fixes it.
+    Spi::run("UPDATE topk_mc_src SET val = 50 WHERE val = 2").expect("update min-side");
+    assert_imv_correct("topk_mc_v", fresh);
+
+    // Symmetric: val=9 is in heap_max but not heap_min. Shrinks MAX only.
+    Spi::run("UPDATE topk_mc_src SET val = -5 WHERE val = 9").expect("update max-side");
+    assert_imv_correct("topk_mc_v", fresh);
+
+    // Neither shrinks: val=5 sits between heaps. Algebraic Sub+Add must give
+    // the right answer with no recompute (the gate skips this).
+    Spi::run("UPDATE topk_mc_src SET val = 6 WHERE val = 5").expect("update neither-heap");
+    assert_imv_correct("topk_mc_v", fresh);
+
+    // Both shrink: val=1 in heap_min AND val=10 in heap_max. Same statement.
+    Spi::run(
+        "UPDATE topk_mc_src SET val = CASE val WHEN 1 THEN 100 WHEN 10 THEN -100 END \
+         WHERE val IN (1, 10)",
+    )
+    .expect("update both heaps");
+    assert_imv_correct("topk_mc_v", fresh);
+
+    // Follow-on retraction: like the partial-heap regression, a DELETE that
+    // reads heap[1] would surface staleness if heap is wrong post-UPDATE.
+    Spi::run("DELETE FROM topk_mc_src WHERE val IN (3, 8)").expect("drain heaps");
+    assert_imv_correct("topk_mc_v", fresh);
+}

@@ -450,6 +450,87 @@ pub fn build_min_max_recompute_sql(
     build_min_max_recompute_sql_inner(intermediate_tbl, plan, orig_base_query, affected_tbl, false)
 }
 
+/// N1 — Capture the subset of affected groups whose top-K heap shrank below
+/// K during the preceding Sub merge. Only those groups need a source-scan
+/// recompute: groups whose heap stayed at K had no heap-eligible row removed,
+/// so the algebraic Sub+Add merge alone is correct.
+///
+/// Emits two statements: TRUNCATE the per-IMV shrunk table, then INSERT
+/// DISTINCT group keys from `intermediate ⨝ affected` filtered by
+/// `OR-of-(topk_col IS NULL OR cardinality(topk_col) < K)` across every
+/// top-K column in the plan. Designed to run between the Sub MERGE and
+/// `build_topk_scalar_refresh_sql` so the cardinality reflects post-Sub
+/// state.
+///
+/// Returns `false` (and pushes nothing) when the plan has no top-K columns
+/// or no group columns — in those cases the caller should not invoke the
+/// gated recompute path.
+pub fn push_topk_shrunk_groups_capture(
+    stmts: &mut Vec<String>,
+    intermediate_tbl: &str,
+    plan: &AggregationPlan,
+    affected_tbl: &str,
+    shrunk_tbl: &str,
+) -> bool {
+    let topk_cols: Vec<&crate::aggregation::IntermediateColumn> = plan
+        .intermediate_columns
+        .iter()
+        .filter(|ic| ic.has_topk())
+        .collect();
+    if topk_cols.is_empty() {
+        return false;
+    }
+
+    let group_cols: Vec<String> = plan
+        .group_by_columns
+        .iter()
+        .chain(plan.distinct_columns.iter())
+        .map(|c| normalized_column_name(c))
+        .collect();
+    if group_cols.is_empty() {
+        return false;
+    }
+
+    let proj = group_cols
+        .iter()
+        .map(|c| format!("i.\"{}\"", c))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let join_cond = group_cols
+        .iter()
+        .map(|gc| format!("i.\"{gc}\" IS NOT DISTINCT FROM a.\"{gc}\"", gc = gc))
+        .collect::<Vec<_>>()
+        .join(" AND ");
+
+    let predicates: Vec<String> = topk_cols
+        .iter()
+        .map(|ic| {
+            let topk = ic.topk_column_name();
+            let k = ic.topk_k.expect("has_topk() => topk_k is Some");
+            format!(
+                "(i.\"{topk}\" IS NULL OR cardinality(i.\"{topk}\") < {k})",
+                topk = topk,
+                k = k,
+            )
+        })
+        .collect();
+    let where_clause = predicates.join(" OR ");
+
+    stmts.push(format!("TRUNCATE \"{}\"", shrunk_tbl));
+    stmts.push(format!(
+        "INSERT INTO \"{shrunk_tbl}\" SELECT DISTINCT {proj} \
+         FROM {intermediate_tbl} i JOIN \"{affected_tbl}\" a ON {join_cond} \
+         WHERE {where_clause}",
+        shrunk_tbl = shrunk_tbl,
+        proj = proj,
+        intermediate_tbl = intermediate_tbl,
+        affected_tbl = affected_tbl,
+        join_cond = join_cond,
+        where_clause = where_clause,
+    ));
+    true
+}
+
 /// UPDATE-flavoured variant: when any MIN/MAX column has top-K enabled, the
 /// algebraic Sub+Add merge can leave the heap with K elements but the *wrong*
 /// K — for groups whose source has unchanged rows that should be in heap and
@@ -850,6 +931,7 @@ pub fn reflex_build_delta_sql(
     let grp_cols = group_columns(&plan);
     let bare_view = split_qualified_name(view_name).1;
     let affected_tbl = safe_identifier(&format!("__reflex_affected_{}", bare_view));
+    let shrunk_tbl = safe_identifier(&format!("__reflex_shrunk_{}", bare_view));
     let scratch_tbl = delta_scratch_table_name(view_name);
 
     // Detect cases where standard incremental delta is incorrect:
@@ -1202,6 +1284,23 @@ pub fn reflex_build_delta_sql(
                             &select_expr,
                             true,
                         );
+                        // N1: capture groups whose heap shrank below K post-Sub.
+                        // Must run BEFORE Add (which would re-fill the heap and
+                        // hide the shrinkage signal) and BEFORE topk_refresh
+                        // (which doesn't move the cardinality but ordering kept
+                        // contiguous with the Sub for clarity).
+                        let recompute_scope = if has_topk
+                            && push_topk_shrunk_groups_capture(
+                                &mut stmts,
+                                &intermediate_tbl,
+                                &plan,
+                                &affected_tbl,
+                                &shrunk_tbl,
+                            ) {
+                            shrunk_tbl.as_str()
+                        } else {
+                            affected_tbl.as_str()
+                        };
                         if let Some(refresh) = build_topk_scalar_refresh_sql(
                             &intermediate_tbl,
                             &plan,
@@ -1232,13 +1331,18 @@ pub fn reflex_build_delta_sql(
                             false,
                         );
                         if has_topk {
-                            // Top-K: forced recompute AFTER Add to overwrite any stale
-                            // heap content the algebraic merge left behind.
+                            // Top-K: forced recompute AFTER Add to overwrite any
+                            // stale heap content the algebraic merge left behind.
+                            // Scoped to `__reflex_shrunk_*` (groups whose heap
+                            // genuinely shrank) instead of `__reflex_affected_*` —
+                            // groups whose post-Sub heap stayed at K had no
+                            // heap-eligible row removed and Sub+Add alone is
+                            // correct.
                             if let Some(recompute) = build_min_max_recompute_sql_force_topk(
                                 &intermediate_tbl,
                                 &plan,
                                 orig_base_query,
-                                Some(affected_tbl.as_str()),
+                                Some(recompute_scope),
                             ) {
                                 stmts.push(recompute);
                             }

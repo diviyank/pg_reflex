@@ -164,6 +164,20 @@ pub(crate) fn drop_reflex_ivm_impl(view_name: &str, cascade: bool) -> &'static s
             )
             .unwrap_or_report();
 
+        // 6b'. Drop persistent N1 shrunk-groups table (only present for top-K
+        // IMVs; IF EXISTS makes the call safe when the IMV had no top-K cols).
+        client
+            .update(
+                &format!(
+                    "DROP TABLE IF EXISTS \"{}\"{}",
+                    safe_identifier(&format!("__reflex_shrunk_{}", bare_view)),
+                    cascade_suffix
+                ),
+                None,
+                &[],
+            )
+            .unwrap_or_report();
+
         // 6c. Drop delta scratch table
         client
             .update(

@@ -13,7 +13,7 @@ Synthesised from the 2026-04-24 production-readiness audit and refreshed
 
 ## :material-alert:{ .light-amber } Yellow light
 
-- **UPDATE-heavy workloads on top-K MIN/MAX IMVs** where group cardinality substantially exceeds K. Every UPDATE pays a scoped source-scan recompute for affected groups — the correctness guarantee for partial-heap states. If UPDATEs dominate INSERT+DELETE for such IMVs, the recompute scan can outweigh the heap-maintenance benefit. Opt out via `topk = 0` to fall back to the legacy 1.2.0 scoped-recompute behaviour on retraction.
+- **UPDATE-heavy workloads on top-K MIN/MAX IMVs** *with group cardinality at or below K* — heap holds the whole group, so every UPDATE shrinks the heap and pays the scoped source-scan recompute for affected groups. Workloads where K ≪ group cardinality recover most of the pre-1.3.0 UPDATE perf via the 1.3.1 heap-shrinkage gate (~30 × on small batches in `benchmarks/bench_n1_topk_update.sql`). If your shape is in the bad case, opt out via `topk = 0` to fall back to the legacy 1.2.0 scoped-recompute behaviour on retraction.
 - **Multi-session concurrent DDL** on the same IMV graph. Tested with 4 concurrent flush sessions; not stress-tested beyond.
 - **`DEFERRED` cascade fan-out > 1000 IMVs.** Single-session flush at COMMIT means commit latency scales linearly with cascade width. No correctness hazard; latency only.
 
@@ -29,7 +29,7 @@ Synthesised from the 2026-04-24 production-readiness audit and refreshed
 |---|---|
 | R1: source DROP orphans | ✅ Closed — auto-drop event trigger (1.2.0) |
 | R2: ALTER TABLE warns but continues | ✅ Mitigated — `pg_reflex.alter_source_policy='error'` (1.2.1) |
-| R3: top-K retraction cliff | ✅ Closed — auto-enabled K=16 for MIN/MAX (2026-04-26) |
+| R3: top-K retraction cliff | ✅ Closed — auto-enabled K=16 for MIN/MAX (2026-04-26) + heap-shrinkage-gated UPDATE recompute (1.3.1) |
 | R4: DEFERRED single-session flush | ⚠️ Latency-only, no correctness hazard |
 | R5: passthrough unique key | ✅ Closed — auto-PK inference (1.1.x), clearer messaging (1.2.1) |
 | R6: no histogram | ✅ Closed — `reflex_ivm_histogram` + `pg_stat_statements` tagging (1.3.0) |
