@@ -98,22 +98,61 @@
   font-feature-settings: "calt" 1, "liga" 1;
 }
 
-/* Admonition tints */
+/* Admonition tints — keep brand blue for note/tip, traffic-light semantic
+   colors for success / warning / danger. */
 .md-typeset .admonition.tip,
-.md-typeset details.tip {
-  border-color: #4169E1;
-}
-.md-typeset .admonition.tip > .admonition-title,
-.md-typeset details.tip > summary {
-  background: rgba(65, 105, 225, 0.12);
-}
-.md-typeset .admonition.warning,
-.md-typeset details.warning {
-  border-color: #001556;
-}
+.md-typeset details.tip,
 .md-typeset .admonition.note,
 .md-typeset details.note {
   border-color: #4169E1;
+}
+.md-typeset .admonition.tip > .admonition-title,
+.md-typeset details.tip > summary,
+.md-typeset .admonition.note > .admonition-title,
+.md-typeset details.note > summary {
+  background: rgba(65, 105, 225, 0.12);
+}
+
+/* Green — success (used for "Green light") */
+.md-typeset .admonition.success,
+.md-typeset details.success {
+  border-color: #1FA862;
+}
+.md-typeset .admonition.success > .admonition-title,
+.md-typeset details.success > summary {
+  background: rgba(31, 168, 98, 0.12);
+}
+.md-typeset .admonition.success > .admonition-title::before,
+.md-typeset details.success > summary::before {
+  background-color: #1FA862;
+}
+
+/* Amber — warning (used for "Yellow light") */
+.md-typeset .admonition.warning,
+.md-typeset details.warning {
+  border-color: #E2A336;
+}
+.md-typeset .admonition.warning > .admonition-title,
+.md-typeset details.warning > summary {
+  background: rgba(226, 163, 54, 0.14);
+}
+.md-typeset .admonition.warning > .admonition-title::before,
+.md-typeset details.warning > summary::before {
+  background-color: #E2A336;
+}
+
+/* Red — danger (used for "Red light") */
+.md-typeset .admonition.danger,
+.md-typeset details.danger {
+  border-color: #D8423B;
+}
+.md-typeset .admonition.danger > .admonition-title,
+.md-typeset details.danger > summary {
+  background: rgba(216, 66, 59, 0.12);
+}
+.md-typeset .admonition.danger > .admonition-title::before,
+.md-typeset details.danger > summary::before {
+  background-color: #D8423B;
 }
 
 /* Tables — quietly framed in royal blue */
@@ -150,37 +189,74 @@
   font-size: 1.05rem;
 }
 
-/* Big-three benchmark cards on the home page */
-.reflex-bench-grid {
+/* Feature tiles on the home page */
+.reflex-feature-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-  gap: 1rem;
-  margin: 1.5rem 0;
+  /* Wider min so headings don't wrap mid-word at 1080-1280px viewports.
+     auto-fit collapses to 2-up at 800-1100px and 1-up below 800px. */
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  gap: 1.25rem;
+  margin: 2rem 0;
 }
-.reflex-bench-card {
+.reflex-feature-card {
   background: #F4F6FB;
-  border-left: 4px solid #4169E1;
-  padding: 1.2rem 1.4rem;
-  border-radius: 4px;
+  border: 1px solid rgba(65, 105, 225, 0.12);
+  border-left: 3px solid #4169E1;
+  padding: 1.5rem 1.6rem;
+  border-radius: 6px;
+  transition: transform 0.18s ease, box-shadow 0.18s ease, border-color 0.18s ease;
+  display: flex;
+  flex-direction: column;
 }
-.reflex-bench-card .label {
-  color: var(--md-default-fg-color--lighter);
-  font-size: 0.8rem;
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
+.reflex-feature-card:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 8px 24px rgba(0, 21, 86, 0.08);
+  border-left-color: #5577E8;
 }
-.reflex-bench-card .value {
+.reflex-feature-card h3 {
+  margin: 0 0 0.6rem;
   color: #001556;
-  font-size: 1.6rem;
+  font-size: 1.05rem;
   font-weight: 600;
-  margin: 0.3rem 0 0.2rem;
+  letter-spacing: 0;
+  line-height: 1.35;
+  /* Keep heading on a single line when the column is wide enough.
+     Falls back gracefully on narrow viewports. */
+  text-wrap: balance;
 }
-[data-md-color-scheme="slate"] .reflex-bench-card {
+.reflex-feature-card h3 .twemoji,
+.reflex-feature-card h3 svg {
+  height: 1.15em;
+  width: 1.15em;
+  vertical-align: -0.18em;
+  margin-right: 0.45em;
+  flex-shrink: 0;
+}
+.reflex-feature-card p {
+  margin: 0;
+  font-size: 0.92rem;
+  line-height: 1.6;
+  color: var(--md-default-fg-color--light);
+}
+.reflex-feature-card p code {
+  font-size: 0.82em;
+  padding: 0.05em 0.3em;
+}
+[data-md-color-scheme="slate"] .reflex-feature-card {
   background: #1A1F2E;
+  border-color: rgba(122, 149, 232, 0.18);
 }
-[data-md-color-scheme="slate"] .reflex-bench-card .value {
+[data-md-color-scheme="slate"] .reflex-feature-card:hover {
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+}
+[data-md-color-scheme="slate"] .reflex-feature-card h3 {
   color: #7A95E8;
 }
+
+/* Inline traffic-light icon tints — use as `:icon:{ .light-green }` etc. */
+.md-typeset .light-green svg { fill: #1FA862; }
+.md-typeset .light-amber svg { fill: #E2A336; }
+.md-typeset .light-red svg   { fill: #D8423B; }
 
 /* Search box bg — match palette */
 .md-search__form {

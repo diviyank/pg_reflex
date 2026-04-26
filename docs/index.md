@@ -18,24 +18,26 @@ pg_reflex is a PostgreSQL extension (built with [pgrx](https://github.com/pgcent
 
 It is **opt-in per IMV**, **drop-in for SUM / COUNT / AVG / MIN / MAX / BOOL_OR / DISTINCT** workloads, and **safe to deploy alongside plain `MATERIALIZED VIEW`** for the shapes that aren't supported.
 
-<div class="reflex-bench-grid" markdown>
+<div class="reflex-feature-grid" markdown>
 
-<div class="reflex-bench-card" markdown>
-<div class="label">INSERT 1K rows<br>5-table JOIN</div>
-<div class="value">235&nbsp;ms</div>
-vs `REFRESH` 38.9s — **99.4% faster**
+<div class="reflex-feature-card" markdown>
+### :material-flash: Incremental updates
+Triggers maintain the result table on every `INSERT` / `UPDATE` / `DELETE` / `TRUNCATE`. No scheduled `REFRESH`, no full re-scan — only the affected groups are touched.
 </div>
 
-<div class="reflex-bench-card" markdown>
-<div class="label">DELETE 50K rows</div>
-<div class="value">297&nbsp;ms</div>
-vs `REFRESH` 38.9s — **99.2% faster**
+<div class="reflex-feature-card" markdown>
+### :material-function-variant: Broad aggregate coverage
+`SUM`, `COUNT`, `AVG`, `MIN`, `MAX`, `BOOL_OR`, `COUNT(DISTINCT)`, plus CTEs, `FILTER`, `DISTINCT ON`, and a curated set of window functions.
 </div>
 
-<div class="reflex-bench-card" markdown>
-<div class="label">GROUP BY UPDATE 100 rows<br>5M-row source</div>
-<div class="value">4.4&nbsp;ms</div>
-vs `REFRESH` 55ms — **12× faster**
+<div class="reflex-feature-card" markdown>
+### :material-cog-outline: Operationally aware
+Auto-drop event triggers, optional `DEFERRED` mode, per-IMV flush histograms, `pg_stat_statements` correlation, and a `pg_cron` reconcile recipe.
+</div>
+
+<div class="reflex-feature-card" markdown>
+### :material-speedometer: Designed for speed
+On the workloads it targets — append-mostly sources, narrow updates, cascade depth ≤ 3 — incremental flushes are typically much cheaper than a full `REFRESH`. Numbers vary by shape; see the [benchmarks](performance/benchmarks.md) page for the workloads we measured.
 </div>
 
 </div>
@@ -45,11 +47,11 @@ vs `REFRESH` 55ms — **12× faster**
 
 ## When to use
 
-!!! tip "Green light"
+!!! success "Green light"
     Analytical dashboards over append-mostly or narrowly-mutated sources. SUM / COUNT / AVG / COUNT(DISTINCT) / BOOL_OR. Cascade depth ≤ 3. Schema changes rare or operator-coordinated.
 
 !!! warning "Yellow light"
-    MIN/MAX over wide fact tables (>10M rows) where retraction is occasional (<10% of groups per flush). With `topk` enabled (1.3.0), the cliff is much shallower. Multi-session concurrent DDL on the same IMV graph: tested but not stress-tested beyond 4 concurrent flush sessions.
+    UPDATE-heavy patterns on top-K MIN/MAX IMVs where group cardinality substantially exceeds K — every UPDATE pays a scoped source-scan recompute for affected groups (correctness fix shipped 2026-04-26). If your workload is overwhelmingly UPDATE rather than INSERT+DELETE, opt out via `topk = 0`. Multi-session concurrent DDL on the same IMV graph: tested with 4 concurrent flush sessions, not stress-tested beyond.
 
 !!! danger "Red light"
     `WITH RECURSIVE`, `FULL OUTER JOIN` deltas, `ARRAY_AGG` / `JSON_AGG`. Mission-critical read paths where stale-on-schema-change is worse than downtime (use `pg_reflex.alter_source_policy = 'error'` from 1.2.1 to gate). Multi-tenant platforms where untrusted users can define IMV SQL.
@@ -58,7 +60,7 @@ vs `REFRESH` 55ms — **12× faster**
 
 ## Highlights — version 1.3.0
 
-- **Bounded top-K MIN/MAX heap.** Opt-in `topk=K` parameter on `create_reflex_ivm` keeps the K extremum values per group, turning `O(N)` retractions into `O(K)`.
+- **Bounded top-K MIN/MAX heap, auto-enabled.** Reflex applies `topk=16` automatically to every MIN/MAX intermediate column — retractions stay bounded without operator opt-in. Append-only workloads can opt out via `topk = 0`.
 - **Per-IMV flush histogram.** `reflex_ivm_histogram(view)` returns p50 / p95 / p99 / max from a 64-sample ring buffer.
 - **`pg_stat_statements` correlation.** Each flush body sets `application_name = 'reflex_flush:<view>'`.
 - **Scalar MIN/MAX (no `GROUP BY`)** is a tested supported shape.
