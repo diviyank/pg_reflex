@@ -9,4 +9,5 @@ tests/pg_regress/regression.out
 
 # Development discussion notes
 discussion*.md
+.claude/
 site/
