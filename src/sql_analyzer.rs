@@ -114,6 +114,10 @@ pub struct SqlAnalysis {
     pub has_within_group: bool,
     pub has_scalar_subquery: bool,
     pub unsupported_aggregates: Vec<String>,
+    /// Set when any non-deterministic function (NOW, RANDOM, etc.) is found
+    /// anywhere in the query — SELECT, WHERE, HAVING, JOIN ON, ORDER BY all
+    /// flow through `pre_visit_expr`. The flag name is kept for backwards
+    /// compatibility; the rejection is query-wide.
     pub has_nondeterministic_select: bool,
     /// DISTINCT ON columns (e.g., ["city"] from DISTINCT ON (city))
     pub distinct_on_columns: Vec<String>,
@@ -159,7 +163,9 @@ impl SqlAnalysis {
         // one statement execution. E.g., WHERE year >= (SELECT year FROM max_date_view).
         if self.has_nondeterministic_select {
             return Some(
-                "Non-deterministic functions (NOW, RANDOM, etc.) in SELECT are not supported"
+                "Non-deterministic functions (NOW, CURRENT_TIMESTAMP, RANDOM, etc.) \
+                 are not supported anywhere in the query — they would cause the IMV \
+                 to drift over time without a corresponding source mutation"
                     .into(),
             );
         }
@@ -223,7 +229,10 @@ impl<'a> Visitor for AnalysisVisitor<'a> {
                     {
                         self.analysis.unsupported_aggregates.push(func_name.clone());
                     }
-                    // Detect non-deterministic functions in SELECT
+                    // Detect non-deterministic functions anywhere in the query
+                    // (SELECT, WHERE, HAVING, JOIN ON, ORDER BY all flow through
+                    // pre_visit_expr). The flag name retains "select" for
+                    // backwards compatibility; the rejection is query-wide.
                     if is_nondeterministic_function(&func_name) {
                         self.analysis.has_nondeterministic_select = true;
                     }

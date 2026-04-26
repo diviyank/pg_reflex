@@ -54,13 +54,13 @@ Order-sensitive aggregates that depend on the entire group. Maintaining `ARRAY_A
 
 **Status**: rejected.
 
-### Non-deterministic functions in `SELECT`
+### Non-deterministic functions
 
-`NOW()`, `CURRENT_TIMESTAMP`, `RANDOM()`, `GEN_RANDOM_UUID()` in the SELECT list change the IMV's projected value over time without any source mutation — drift by design.
+`NOW()`, `CURRENT_TIMESTAMP`, `CURRENT_DATE`, `CURRENT_TIME`, `CLOCK_TIMESTAMP()`, `STATEMENT_TIMESTAMP()`, `TIMEOFDAY()`, `RANDOM()`, `GEN_RANDOM_UUID()` are rejected anywhere in the query — `SELECT`, `WHERE`, `HAVING`, `JOIN ON`, anywhere `pre_visit_expr` reaches. They would cause the IMV to drift over time (or row-by-row, for `RANDOM`) without a corresponding source mutation, and the algebraic delta engine has nothing to react to.
 
-**Status**: rejected at create time.
+**Status**: rejected at create time. The analyzer flag is named `has_nondeterministic_select` for historical reasons; the rejection is query-wide.
 
-**Note on `WHERE`**: non-deterministic predicates in `WHERE` are currently **not** rejected by the analyzer. `WHERE date > NOW()` will create cleanly, but the IMV will silently drift as `NOW()` advances and rows that match today stop matching tomorrow. **Treat this as the operator's responsibility** until the analyzer catches it — pin the predicate to a specific value (`WHERE date > '2026-01-01'`), or pre-compute the cutoff in the application and pass it as a parameter via a CTE. Tracked as a future analyzer-tightening.
+**Workaround**: pin the value at IMV-creation time (`WHERE date > '2026-01-01'`), or pre-compute the cutoff in the application and pass it as a parameter via a CTE that the engine treats as a static input.
 
 ### Subqueries with aggregation in `FROM`
 

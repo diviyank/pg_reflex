@@ -450,6 +450,27 @@ fn test_error_nondeterministic_random_in_select() {
     assert!(result.starts_with("ERROR"), "RANDOM() in SELECT should be rejected: {}", result);
 }
 
+/// Whether non-deterministic functions in WHERE are rejected. The
+/// `has_nondeterministic_select` flag is set by `pre_visit_expr`, which the
+/// AST visitor calls on every expression in the query — including WHERE
+/// clauses. This test pins down the actual behaviour so the docs can match it.
+#[pg_test]
+fn test_error_nondeterministic_now_in_where() {
+    Spi::run("CREATE TABLE err_now_where (city TEXT, dt TIMESTAMP, val INT)").expect("create");
+    let result = crate::create_reflex_ivm(
+        "err_now_where_v",
+        "SELECT city, SUM(val) AS s FROM err_now_where WHERE dt > NOW() GROUP BY city",
+        None,
+        None,
+        None,
+    );
+    assert!(
+        result.starts_with("ERROR"),
+        "NOW() in WHERE should be rejected (drift hazard): {}",
+        result
+    );
+}
+
 #[pg_test]
 fn test_scalar_subquery_in_where_allowed() {
     // Scalar subqueries are now allowed — they evaluate at trigger time as static values
