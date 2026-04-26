@@ -3365,3 +3365,123 @@ fn pg_test_scalar_min_max_with_topk() {
         .expect("delete");
     assert_imv_correct("scalar_topk_v", fresh);
 }
+
+/// Top-K element type coverage: TEXT MIN/MAX with topk=K. The 1.3.0 schema
+/// builder resolves the source-column type for the scalar; create_ivm.rs
+/// (post-fix) propagates the same resolution onto IntermediateColumn.pg_type
+/// so the trigger MERGE codegen emits the right `'{}'::TEXT[]` literal in
+/// COALESCE on the array column. Without that propagation the MERGE fails
+/// with "COALESCE could not convert type numeric[] to text[]".
+#[pg_test]
+fn pg_test_topk_text_min_max() {
+    Spi::run("CREATE TABLE topk_txt_src (id SERIAL, grp TEXT, val TEXT)").expect("create");
+    Spi::run(
+        "INSERT INTO topk_txt_src (grp, val) VALUES \
+         ('a', 'apple'), ('a', 'banana'), ('a', 'cherry'), ('a', 'date'), \
+         ('b', 'fig'), ('b', 'grape'), ('b', 'honeydew')",
+    )
+    .expect("seed");
+
+    Spi::run(
+        "SELECT create_reflex_ivm('topk_txt_v', \
+         'SELECT grp, MIN(val) AS lo, MAX(val) AS hi FROM topk_txt_src GROUP BY grp', \
+         NULL, NULL, NULL, 4)",
+    )
+    .expect("create");
+
+    let fresh = "SELECT grp, MIN(val) AS lo, MAX(val) AS hi FROM topk_txt_src GROUP BY grp";
+    assert_imv_correct("topk_txt_v", fresh);
+
+    // INSERT — heap merge through array_agg of TEXT
+    Spi::run("INSERT INTO topk_txt_src (grp, val) VALUES ('a', 'avocado')").expect("insert");
+    assert_imv_correct("topk_txt_v", fresh);
+
+    // DELETE current min — multiset_subtract on text[]
+    Spi::run("DELETE FROM topk_txt_src WHERE val = 'apple' AND grp = 'a'").expect("delete");
+    assert_imv_correct("topk_txt_v", fresh);
+
+    // UPDATE
+    Spi::run("UPDATE topk_txt_src SET val = 'aardvark' WHERE val = 'avocado'").expect("update");
+    assert_imv_correct("topk_txt_v", fresh);
+
+    // Drain group 'b' to force heap underflow + recompute on text[]
+    Spi::run("DELETE FROM topk_txt_src WHERE grp = 'b'").expect("drain b");
+    assert_imv_correct("topk_txt_v", fresh);
+}
+
+/// Top-K element type coverage: DATE MIN/MAX. Same shape as TEXT but
+/// exercises a different array element type to catch type-class assumptions
+/// in COALESCE / array_agg / multiset_subtract.
+#[pg_test]
+fn pg_test_topk_date_min_max() {
+    Spi::run("CREATE TABLE topk_date_src (id SERIAL, grp TEXT, dt DATE)").expect("create");
+    Spi::run(
+        "INSERT INTO topk_date_src (grp, dt) VALUES \
+         ('a', '2024-01-15'), ('a', '2024-02-01'), ('a', '2024-03-10'), \
+         ('a', '2024-06-30'), ('a', '2024-12-25'), \
+         ('b', '2025-01-01'), ('b', '2025-07-04')",
+    )
+    .expect("seed");
+
+    Spi::run(
+        "SELECT create_reflex_ivm('topk_date_v', \
+         'SELECT grp, MIN(dt) AS earliest, MAX(dt) AS latest FROM topk_date_src GROUP BY grp', \
+         NULL, NULL, NULL, 4)",
+    )
+    .expect("create");
+
+    let fresh =
+        "SELECT grp, MIN(dt) AS earliest, MAX(dt) AS latest FROM topk_date_src GROUP BY grp";
+    assert_imv_correct("topk_date_v", fresh);
+
+    Spi::run("INSERT INTO topk_date_src (grp, dt) VALUES ('a', '2023-12-31')").expect("insert");
+    assert_imv_correct("topk_date_v", fresh);
+
+    Spi::run("DELETE FROM topk_date_src WHERE dt = '2023-12-31'").expect("delete");
+    assert_imv_correct("topk_date_v", fresh);
+
+    Spi::run("UPDATE topk_date_src SET dt = '2024-01-20' WHERE dt = '2024-01-15'").expect("update");
+    assert_imv_correct("topk_date_v", fresh);
+
+    Spi::run("DELETE FROM topk_date_src WHERE grp = 'b'").expect("drain b");
+    assert_imv_correct("topk_date_v", fresh);
+}
+
+/// Top-K element type coverage: TIMESTAMP MIN/MAX. Catches the same class of
+/// resolution gap as DATE/TEXT for sub-day-precision time columns.
+#[pg_test]
+fn pg_test_topk_timestamp_min_max() {
+    Spi::run("CREATE TABLE topk_ts_src (id SERIAL, grp TEXT, ts TIMESTAMP)").expect("create");
+    Spi::run(
+        "INSERT INTO topk_ts_src (grp, ts) VALUES \
+         ('a', '2026-01-01 09:00:00'), ('a', '2026-01-01 09:30:00'), \
+         ('a', '2026-01-01 10:15:00'), ('a', '2026-01-01 11:00:00'), \
+         ('b', '2026-01-02 08:00:00'), ('b', '2026-01-02 17:45:00')",
+    )
+    .expect("seed");
+
+    Spi::run(
+        "SELECT create_reflex_ivm('topk_ts_v', \
+         'SELECT grp, MIN(ts) AS first_seen, MAX(ts) AS last_seen FROM topk_ts_src GROUP BY grp', \
+         NULL, NULL, NULL, 4)",
+    )
+    .expect("create");
+
+    let fresh =
+        "SELECT grp, MIN(ts) AS first_seen, MAX(ts) AS last_seen FROM topk_ts_src GROUP BY grp";
+    assert_imv_correct("topk_ts_v", fresh);
+
+    Spi::run("INSERT INTO topk_ts_src (grp, ts) VALUES ('a', '2026-01-01 07:30:00')")
+        .expect("insert");
+    assert_imv_correct("topk_ts_v", fresh);
+
+    Spi::run("DELETE FROM topk_ts_src WHERE ts = '2026-01-01 07:30:00'").expect("delete");
+    assert_imv_correct("topk_ts_v", fresh);
+
+    Spi::run("UPDATE topk_ts_src SET ts = '2026-01-01 12:00:00' WHERE ts = '2026-01-01 09:00:00'")
+        .expect("update");
+    assert_imv_correct("topk_ts_v", fresh);
+
+    Spi::run("DELETE FROM topk_ts_src WHERE grp = 'b'").expect("drain b");
+    assert_imv_correct("topk_ts_v", fresh);
+}

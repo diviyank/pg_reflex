@@ -983,6 +983,23 @@ pub(crate) fn create_reflex_ivm_impl(
                 }
             }
 
+            // Fix intermediate MIN/MAX column types from the resolved source-column
+            // catalog type. Without this, `pg_type` stays at the planner default
+            // ("NUMERIC") and trigger codegen emits `'{}'::NUMERIC[]` for the
+            // top-K array even when the actual column is TEXT[] / DATE[] /
+            // TIMESTAMP[]. The schema builder already special-cases this for
+            // DDL, but the trigger MERGE statements read `pg_type` directly.
+            for ic in &mut plan.intermediate_columns {
+                if (ic.source_aggregate == "MIN" || ic.source_aggregate == "MAX")
+                    && ic.pg_type.eq_ignore_ascii_case("NUMERIC")
+                {
+                    let resolved = resolve_column_type(&ic.source_arg, &column_types, "");
+                    if !resolved.is_empty() && !resolved.eq_ignore_ascii_case("NUMERIC") {
+                        ic.pg_type = resolved;
+                    }
+                }
+            }
+
             // Set cast_type on end_query_mappings so the end_query casts intermediate
             // to the correct target type (e.g., BIGINT for SUM(int)).
             for mapping in &mut plan.end_query_mappings {
