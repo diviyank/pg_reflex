@@ -95,7 +95,7 @@ pub fn decompose_window_query(analysis: &SqlAnalysis) -> WindowDecomposition {
         // Replace aggregate expressions with their aliases in the window expression.
         // Sort by length descending to avoid partial matches (e.g., "SUM(amount)" before "amount").
         let mut sorted_mappings = agg_to_alias.clone();
-        sorted_mappings.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+        sorted_mappings.sort_by_key(|m| std::cmp::Reverse(m.0.len()));
         for (agg_expr, alias) in &sorted_mappings {
             expr = expr.replace(agg_expr, alias);
         }
