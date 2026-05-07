@@ -11,3 +11,4 @@ tests/pg_regress/regression.out
 discussion*.md
 .claude/
 site/
+journal/

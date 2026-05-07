@@ -4,6 +4,8 @@
 
 pg_reflex is a PostgreSQL extension that maintains materialized views incrementally. When source data changes (INSERT, UPDATE, DELETE), only the affected groups are recomputed -- not the entire dataset. This turns O(N) `REFRESH MATERIALIZED VIEW` into O(delta) trigger-based updates.
 
+[Documentation available here](https://diviyank.github.io/pg_reflex/)
+
 ## Installation
 
 ### Option A: Pre-built package (recommended)
