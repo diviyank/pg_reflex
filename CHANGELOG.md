@@ -1,5 +1,81 @@
 # Changelog
 
+## [1.4.0] - 2026-05-10
+
+### Behaviour change
+- **Top-K is auto-enabled (`K=16`) on every MIN/MAX intermediate column.**
+  `create_reflex_ivm` and `create_reflex_ivm_if_not_exists` now pass `topk=16`
+  by default; the parameter is a no-op for SUM / COUNT / AVG / BOOL_OR. This
+  closes the audit R3 retraction cliff for MIN/MAX IMVs without operator
+  opt-in. Append-only MIN/MAX workloads that prefer the lower INSERT
+  overhead can opt out via the 6-arg overload with `topk = 0`.
+
+### Performance
+- **N1 — heap-shrinkage-gated UPDATE recompute on top-K MIN/MAX.** UPDATEs
+  that don't displace a top-K element no longer trigger a source-scan
+  recompute. A new persistent `__reflex_shrunk_<view>` UNLOGGED capture
+  table (provisioned at IMV-create time iff the plan has any top-K column)
+  records groups whose heap shrank below `K` during the algebraic Sub step.
+  The forced recompute that follows is then scoped to that subset rather
+  than to every affected group. Bench (5M-row source, K=16, ~10K rows/group):
+  ~30× on 1K-row UPDATE batches, ~8.5× on 10K, ~2× on 100K
+  (`benchmarks/bench_n1_topk_update.sql`). Workloads with group cardinality
+  ≤ K still pay the recompute on every UPDATE — the heap always shrinks.
+- **O2 — `reflex_build_delta_sql` per-backend template cache.** Identical
+  delta-SQL templates fired repeatedly inside one session now reuse the
+  cached string instead of re-running the SQL builder. Benefit is sub-ms
+  per fire; primary win is OLTP-shape sessions with tight trigger loops.
+  No public API surface; bounded at 256 entries per backend.
+
+### Fixed
+- **Top-K MIN/MAX over non-NUMERIC source columns (TEXT / DATE / TIMESTAMP).**
+  `IntermediateColumn.pg_type` was hardcoded to `"NUMERIC"` by the planner;
+  the schema builder special-cased the resolved type for DDL but the trigger
+  MERGE codegen read `pg_type` directly and emitted `'{}'::NUMERIC[]`,
+  producing `COALESCE could not convert type numeric[] to text[]`. After
+  catalog introspection, `create_reflex_ivm_impl` now propagates the
+  resolved source-arg type back onto the MIN/MAX intermediate column.
+- **Top-K partial-heap staleness on UPDATE.** When `K < group_cardinality`,
+  an UPDATE that retracted a heap-resident value left the heap non-empty
+  but missing the unchanged source rows that should have been promoted into
+  it. The 1.3.0 recompute trigger fired only on `cardinality(heap) = 0`,
+  so a *partial* heap slipped through and a subsequent DELETE then read a
+  stale `heap[1]`. Fix: split the UPDATE flow's recompute trigger into two
+  paths — non-top-K MIN/MAX keeps the legacy `Sub → recompute(if scalar
+  IS NULL) → Add` order; top-K MIN/MAX uses
+  `Sub → topk_refresh → Add → forced recompute` (gated to the shrunk-
+  groups capture table from N1 above). Regression locked in by
+  `pg_test_topk_partial_heap_staleness_regression` and the existing
+  50-mutation × 3-group × K=16 fuzzer.
+- **Non-deterministic-function rejection is query-wide.** The analyzer
+  flag `has_nondeterministic_select` always rejected `NOW()` / `RANDOM()` /
+  etc. anywhere `pre_visit_expr` reached (SELECT, WHERE, HAVING, JOIN ON,
+  ORDER BY) — the user-facing message claimed "in SELECT" only. The
+  message now reads "anywhere in the query" and explains why (drift over
+  time without a corresponding source mutation). Behaviour unchanged.
+
+### Tests
+- 513 lib tests (up from 503 in 1.3.0).
+- New: `pg_test_topk_text_min_max`, `pg_test_topk_date_min_max`,
+  `pg_test_topk_timestamp_min_max` (non-NUMERIC element types);
+  `pg_test_topk_partial_heap_staleness_regression` (UPDATE-then-DELETE
+  staleness minimal repro); `pg_test_topk_update_no_heap_shrink_keeps_correctness`,
+  `pg_test_topk_update_mixed_shrink_groups`,
+  `pg_test_topk_update_multi_column_shrink` (N1 gate correctness).
+
+### Docs
+- Operator runbook gains a LOGGED-vs-UNLOGGED decision matrix, a
+  stuck-flush triage recipe (`pg_stat_activity` filter on
+  `application_name = 'reflex_flush:%'` + `reflex_explain_flush`), and an
+  auto-on top-K caveat.
+- `docs/limitations/unsupported-shapes.md` rewritten as a three-bucket
+  taxonomy (hard-rejected / supported-with-fallback / operator workaround)
+  and refreshed against current behaviour. Stale "needs top-K opt-in"
+  language replaced with the auto-on guarantee.
+- `docs/limitations/known-issues.md` pruned: the 1.3.x top-K closed items
+  moved into release notes (this CHANGELOG); only items that are still
+  open or still surprising remain on the page.
+
 ## [1.3.0] - 2026-04-25
 
 ### Performance

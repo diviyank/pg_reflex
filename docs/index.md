@@ -51,19 +51,20 @@ On the workloads it targets — append-mostly sources, narrow updates, cascade d
     Analytical dashboards over append-mostly or narrowly-mutated sources. SUM / COUNT / AVG / COUNT(DISTINCT) / BOOL_OR. Cascade depth ≤ 3. Schema changes rare or operator-coordinated.
 
 !!! warning "Yellow light"
-    UPDATE-heavy patterns on top-K MIN/MAX IMVs where the *group cardinality is at or below K* (heap holds the whole group) — every UPDATE shrinks the heap, so the scoped source-scan recompute fires regardless. Workloads where K ≪ group cardinality recover most of the pre-1.3.0 UPDATE perf via the 1.3.1 heap-shrinkage gate. If your shape is in the bad case, opt out via `topk = 0`. Multi-session concurrent DDL on the same IMV graph: tested with 4 concurrent flush sessions, not stress-tested beyond.
+    UPDATE-heavy patterns on top-K MIN/MAX IMVs where the *group cardinality is at or below K* (heap holds the whole group) — every UPDATE shrinks the heap, so the scoped source-scan recompute fires regardless. Workloads where K ≪ group cardinality recover most of the pre-auto-topk UPDATE perf via the 1.4.0 heap-shrinkage gate. If your shape is in the bad case, opt out via `topk = 0`. Multi-session concurrent DDL on the same IMV graph: tested with 4 concurrent flush sessions, not stress-tested beyond.
 
 !!! danger "Red light"
     `WITH RECURSIVE`, `FULL OUTER JOIN` deltas, `ARRAY_AGG` / `JSON_AGG`. Mission-critical read paths where stale-on-schema-change is worse than downtime (use `pg_reflex.alter_source_policy = 'error'` from 1.2.1 to gate). Multi-tenant platforms where untrusted users can define IMV SQL.
 
 [Full deployment profile :material-arrow-right-bold:](operations/deployment-profile.md){ .md-button }
 
-## Highlights — version 1.3.0
+## Highlights — version 1.4.0
 
-- **Bounded top-K MIN/MAX heap, auto-enabled.** Reflex applies `topk=16` automatically to every MIN/MAX intermediate column — retractions stay bounded without operator opt-in. Append-only workloads can opt out via `topk = 0`.
-- **Per-IMV flush histogram.** `reflex_ivm_histogram(view)` returns p50 / p95 / p99 / max from a 64-sample ring buffer.
-- **`pg_stat_statements` correlation.** Each flush body sets `application_name = 'reflex_flush:<view>'`.
-- **Scalar MIN/MAX (no `GROUP BY`)** is a tested supported shape.
+- **Top-K MIN/MAX is auto-enabled (`K=16`).** Every MIN/MAX intermediate column gets a bounded top-K heap by default; retractions stay `O(K)` without operator opt-in. Append-only workloads can still opt out via `topk = 0`.
+- **Heap-shrinkage-gated UPDATE recompute (N1).** UPDATEs that don't displace a top-K element no longer trigger a source-scan recompute. ~30 × speedup on 1K-row UPDATE batches in `benchmarks/bench_n1_topk_update.sql`.
+- **Top-K over `TEXT` / `DATE` / `TIMESTAMP`** is now correctness-tested. The trigger MERGE codegen used to assume `NUMERIC` element types and failed at INSERT time on non-NUMERIC columns; resolved at IMV-create time.
+- **Top-K UPDATE staleness fixed.** A partial-heap that left non-empty-but-wrong state on UPDATE is now closed by a forced post-Sub recompute path.
+- **Per-backend delta-SQL template cache (O2).** Sub-ms savings per fire on tight trigger loops.
 
 [Full changelog :material-arrow-right-bold:](changelog.md){ .md-button }
 

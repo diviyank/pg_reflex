@@ -1,24 +1,33 @@
-# Top-K MIN / MAX (1.3.0)
+# Top-K MIN / MAX
 
 The audit's flagship perf gap (R3): retracting from a `MIN` / `MAX` IMV historically meant a full source scan to find the next-smallest / next-largest value. The 1.2.0 *scoped recompute* path narrowed the scan to affected groups, but groups still had to be re-aggregated from the source.
 
-Top-K (1.3.0) keeps the **K extremum values per group** in a sibling array column. Retraction = subtract from the array. Falls back to the scoped recompute only when the array underflows.
+Top-K (1.3.0) keeps the **K extremum values per group** in a sibling array column. Retraction = subtract from the array. Falls back to the scoped recompute only when the array underflows. As of **1.4.0** the heap is **auto-enabled with `K=16`** on every MIN/MAX intermediate; UPDATEs additionally pass through the **heap-shrinkage gate (N1)** so groups whose heap stayed at K skip the source scan entirely.
 
-## Opt-in
+## Default (1.4.0+)
+
+```sql
+SELECT create_reflex_ivm(
+    'stock_chart_weekly',
+    'SELECT product_id, week, MIN(price) AS lo, MAX(price) AS hi
+     FROM stock_history GROUP BY product_id, week'
+);
+-- top-K is on with K=16 by default
+```
+
+To opt out (append-only MIN/MAX workloads where the heap-maintenance INSERT cost outweighs the retraction benefit):
 
 ```sql
 SELECT create_reflex_ivm(
     'stock_chart_weekly',
     'SELECT product_id, week, MIN(price) AS lo, MAX(price) AS hi
      FROM stock_history GROUP BY product_id, week',
-    NULL,        -- unique_columns
-    NULL,        -- storage
-    NULL,        -- mode
-    16           -- topk: K=16
+    NULL, NULL, NULL,
+    0            -- topk = 0 disables the heap
 );
 ```
 
-`topk = 0` (or omitted) keeps the legacy 1.2.x behaviour. There is no migration cost for existing IMVs — top-K is a per-IMV decision at create time.
+Existing 1.3.0 IMVs that did not opt into top-K retain their previous behaviour after upgrade — auto-on only applies to freshly created IMVs.
 
 ## What it stores
 
@@ -76,9 +85,11 @@ WHERE grp = 'a';
 
 The first element of the array equals the scalar column when the heap is non-empty.
 
-## Known limitations (tracked for 1.3.1)
+## Known limitations
 
-- `reflex_enable_topk(name, k)` retrofit SPI is not yet shipped. Existing 1.2.x IMVs cannot opt into top-K without `drop + create`.
-- Element types beyond NUMERIC are not yet test-covered; the schema-builder path supports them via `resolve_column_type` but workloads should add coverage.
-
-[See the journal entry :material-arrow-right-bold:](https://github.com/diviyank/pg_reflex/blob/main/journal/2026-04-25_topk_landed.md){ .md-button }
+- `reflex_enable_topk(name, k)` retrofit SPI is not shipped. To retrofit
+  top-K onto an in-flight IMV, drop and recreate it.
+- Group cardinality at or below `K` means every UPDATE shrinks the heap
+  and trips the N1 gate, so the scoped recompute fires on every
+  retraction. Use `topk = 0` for these shapes if you don't need bounded
+  retraction.

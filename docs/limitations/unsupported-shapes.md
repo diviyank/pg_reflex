@@ -130,7 +130,7 @@ Historical concern from the 1.1.2 audit (R3): MIN/MAX retraction without top-K r
 
 **Status**: ✅ Closed. Top-K is auto-enabled (K=16) for every MIN/MAX intermediate column as of 2026-04-26. Retraction is `O(K)` for groups whose heap has surviving elements; `O(group_size)` only for the small fraction of groups whose heap empties (handled by the existing scoped recompute). Append-only operators who want to avoid the heap-maintenance INSERT cost can opt out via `topk = 0`.
 
-The 1.3.0 partial-heap UPDATE-staleness gap was fixed at the same time — UPDATEs on top-K MIN/MAX IMVs now force a scoped source-scan recompute for affected groups (correctness guarantee).
+The 1.3.0 partial-heap UPDATE-staleness gap was fixed in 1.4.0 — UPDATEs on top-K MIN/MAX IMVs now force a scoped source-scan recompute for affected groups (correctness guarantee), gated by the heap-shrinkage capture table so groups whose heap stayed at K skip the scan.
 
 ---
 

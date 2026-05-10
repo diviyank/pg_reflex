@@ -31,6 +31,7 @@ psql -d mydb -c "ALTER EXTENSION pg_reflex UPDATE;"
 | 1.1.3 → 1.2.0 | observability columns, event triggers, scoped MIN/MAX recompute | none |
 | 1.2.0 → 1.2.1 | `pg_reflex.alter_source_policy` GUC, scheduled reconcile, PK inference UX | none |
 | 1.2.1 → 1.3.0 | top-K MIN/MAX (opt-in), flush histogram, pg_stat_statements tagging | none for existing IMVs; opt-in to top-K per IMV |
+| 1.3.0 → 1.4.0 | top-K auto-enabled (K=16) on freshly created IMVs, N1 heap-shrinkage gate, non-NUMERIC top-K element types, UPDATE staleness fix | none for existing IMVs; the migration provisions `__reflex_shrunk_<view>` for IMVs already on top-K. Existing top-K IMVs over `TEXT` / `DATE` / `TIMESTAMP` should run `reflex_rebuild_imv('<name>')` to pick up the corrected trigger codegen. |
 
 `ALTER EXTENSION pg_reflex UPDATE` walks the chain automatically.
 
