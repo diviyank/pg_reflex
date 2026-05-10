@@ -141,6 +141,7 @@ nav:
       - Benchmarks: performance/benchmarks.md
       - When to use: performance/when-to-use.md
       - Cost model: performance/cost-model.md
+      - Optimization: performance/optimization.md
   - Limitations:
       - Unsupported shapes: limitations/unsupported-shapes.md
       - Known issues: limitations/known-issues.md
