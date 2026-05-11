@@ -32,6 +32,7 @@ psql -d mydb -c "ALTER EXTENSION pg_reflex UPDATE;"
 | 1.2.0 → 1.2.1 | `pg_reflex.alter_source_policy` GUC, scheduled reconcile, PK inference UX | none |
 | 1.2.1 → 1.3.0 | top-K MIN/MAX (opt-in), flush histogram, pg_stat_statements tagging | none for existing IMVs; opt-in to top-K per IMV |
 | 1.3.0 → 1.4.0 | top-K auto-enabled (K=16) on freshly created IMVs, N1 heap-shrinkage gate, non-NUMERIC top-K element types, UPDATE staleness fix | none for existing IMVs; the migration provisions `__reflex_shrunk_<view>` for IMVs already on top-K. Existing top-K IMVs over `TEXT` / `DATE` / `TIMESTAMP` should run `reflex_rebuild_imv('<name>')` to pick up the corrected trigger codegen. |
+| 1.4.0 → 1.4.1 | bug fix: internal reflex tables and trigger-body SPI calls are now schema-qualified so DML under `SET search_path = '<schema>'` (excluding `public`) no longer fails with `relation "__reflex_delta_<…>" does not exist` | **breaking for existing IMVs**: the upgrade cannot rewrite already-installed trigger function bodies or move legacy bare-name internal tables. Drop and recreate every existing IMV (`SELECT drop_reflex_ivm('<name>'); SELECT create_reflex_ivm('<name>', '<SELECT …>', …);`). The migration script emits a per-IMV `NOTICE` listing what to rebuild. |
 
 `ALTER EXTENSION pg_reflex UPDATE` walks the chain automatically.
 

@@ -79,7 +79,7 @@ fn test_aggregations_json_valid() {
 fn test_intermediate_table_name() {
     assert_eq!(
         intermediate_table_name("my_view"),
-        "__reflex_intermediate_my_view"
+        "\"__reflex_intermediate_my_view\""
     );
 }
 

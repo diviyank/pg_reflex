@@ -1,5 +1,52 @@
 # Changelog
 
+## [1.4.1] - 2026-05-11
+
+### Fixed
+- **`search_path`-dependent failures in internal trigger bodies.** Internal
+  reflex tables (`__reflex_delta_<src>`, `__reflex_scratch_<view>`,
+  `__reflex_pt_new/old_<view>_<src>`, `__reflex_affected_<view>`,
+  `__reflex_shrunk_<view>`) were created with unqualified names and so
+  ended up in whichever schema topped the *creating* session's
+  `search_path`. Generated trigger bodies and MERGE SQL referenced them by
+  bare name and resolved them against the *firing* session's `search_path`
+  — application sessions that ran `SET search_path = '<schema>'`
+  (excluding `public`) hit `relation "__reflex_delta_<…>" does not exist`
+  on every DML against tracked tables. Reproduced against a customer
+  workload where `alp.demand_planning` fed `alp.ivm_sop_forecast_view`
+  and the writer set `search_path = 'alp'`.
+
+  Fix: every internal artefact is now co-located with its owning IMV
+  (per-IMV scratch / passthrough / affected / shrunk) or source table
+  (staging delta), and both the DDL and every generated SQL reference are
+  schema-qualified. Trigger bodies' internal SPI calls
+  (`reflex_build_delta_sql`, `reflex_build_truncate_sql`,
+  `reflex_execute_separated`, `reflex_flush_deferred`) are qualified to
+  `public.` — they live in the extension's schema (public by convention)
+  and the same `search_path` rule applied to them. `reflex_ivm_stats`
+  also now reads the intermediate table from the IMV's schema instead of
+  hard-coding `public.__reflex_intermediate_<bare>`, fixing a pre-existing
+  reporting bug on schema-qualified IMVs.
+
+### Breaking
+- Existing IMVs upgraded from 1.4.0 (or earlier) carry the old bare-name
+  trigger bodies and old bare-name internal tables in postgres' catalog.
+  `ALTER EXTENSION pg_reflex UPDATE TO '1.4.1'` cannot rewrite them in
+  place. Drop and recreate each affected IMV after upgrade:
+  ```sql
+  SELECT drop_reflex_ivm('<schema>.<view>');
+  SELECT create_reflex_ivm('<schema>.<view>', '<SELECT …>', …);
+  ```
+  The 1.4.0 → 1.4.1 migration script emits a per-IMV `NOTICE` listing
+  what to rebuild.
+
+### Tests
+- 518 lib tests (up from 513 in 1.4.0): 5 new integration tests in
+  `pg_test_search_path.rs` exercising IMMEDIATE / DEFERRED / passthrough /
+  top-K MIN-MAX / shared-source IMVs under `SET search_path = '<custom>'`
+  (excluding `public`), each verifying schema co-location and correctness
+  via an `EXCEPT ALL` oracle against the fresh query.
+
 ## [1.4.0] - 2026-05-10
 
 ### Behaviour change

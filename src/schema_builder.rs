@@ -147,7 +147,7 @@ pub fn build_delta_scratch_table_ddl(
     let table_name = delta_scratch_table_name(view_name);
     let columns_sql = columns.join(",\n");
     Some(format!(
-        "CREATE UNLOGGED TABLE IF NOT EXISTS \"{}\" (\n{}\n)",
+        "CREATE UNLOGGED TABLE IF NOT EXISTS {} (\n{}\n)",
         table_name, columns_sql
     ))
 }
@@ -373,7 +373,7 @@ pub fn build_trigger_ddls(source_table: &str) -> Vec<String> {
                IF NOT _pred_match THEN CONTINUE; END IF; \
              END IF; \
              PERFORM pg_advisory_xact_lock(hashtext(_rec.name), hashtext(reverse(_rec.name))); \
-             _sql := reflex_build_delta_sql(_rec.name, '{source_table}', '{{op}}', _rec.base_query, _rec.end_query, _rec.aggregations, _rec.base_query); \
+             _sql := public.reflex_build_delta_sql(_rec.name, '{source_table}', '{{op}}', _rec.base_query, _rec.end_query, _rec.aggregations, _rec.base_query); \
              IF _sql <> '' THEN \
                FOREACH _stmt IN ARRAY string_to_array(_sql, E'\\n--<<REFLEX_SEP>>--\\n') LOOP \
                  IF _stmt <> '' THEN EXECUTE _stmt; END IF; \
@@ -439,8 +439,8 @@ pub fn build_trigger_ddls(source_table: &str) -> Vec<String> {
              ORDER BY graph_depth \
            LOOP \
              PERFORM pg_advisory_xact_lock(hashtext(_rec.name), hashtext(reverse(_rec.name))); \
-             _stmts := reflex_build_truncate_sql(_rec.name); \
-             IF _stmts <> '' THEN PERFORM reflex_execute_separated(_stmts); END IF; \
+             _stmts := public.reflex_build_truncate_sql(_rec.name); \
+             IF _stmts <> '' THEN PERFORM public.reflex_execute_separated(_stmts); END IF; \
            END LOOP; \
            RETURN NULL; \
          END;"
@@ -489,7 +489,7 @@ pub fn build_deferred_trigger_ddls(source_table: &str) -> Vec<String> {
              END IF; \
              IF _rec.refresh_mode = 'IMMEDIATE' THEN \
                PERFORM pg_advisory_xact_lock(hashtext(_rec.name), hashtext(reverse(_rec.name))); \
-               _sql := reflex_build_delta_sql(_rec.name, '{source_table}', '{{op}}', _rec.base_query, _rec.end_query, _rec.aggregations, _rec.base_query); \
+               _sql := public.reflex_build_delta_sql(_rec.name, '{source_table}', '{{op}}', _rec.base_query, _rec.end_query, _rec.aggregations, _rec.base_query); \
                IF _sql <> '' THEN \
                  FOREACH _stmt IN ARRAY string_to_array(_sql, E'\\n--<<REFLEX_SEP>>--\\n') LOOP \
                    IF _stmt <> '' THEN EXECUTE _stmt; END IF; \
@@ -561,7 +561,7 @@ pub fn build_deferred_trigger_ddls(source_table: &str) -> Vec<String> {
              END IF; \
              IF _rec.refresh_mode = 'IMMEDIATE' THEN \
                PERFORM pg_advisory_xact_lock(hashtext(_rec.name), hashtext(reverse(_rec.name))); \
-               _sql := reflex_build_delta_sql(_rec.name, '{source_table}', 'UPDATE', _rec.base_query, _rec.end_query, _rec.aggregations, _rec.base_query); \
+               _sql := public.reflex_build_delta_sql(_rec.name, '{source_table}', 'UPDATE', _rec.base_query, _rec.end_query, _rec.aggregations, _rec.base_query); \
                IF _sql <> '' THEN \
                  FOREACH _stmt IN ARRAY string_to_array(_sql, E'\\n--<<REFLEX_SEP>>--\\n') LOOP \
                    IF _stmt <> '' THEN EXECUTE _stmt; END IF; \
@@ -601,8 +601,8 @@ pub fn build_deferred_trigger_ddls(source_table: &str) -> Vec<String> {
              ORDER BY graph_depth \
            LOOP \
              PERFORM pg_advisory_xact_lock(hashtext(_rec.name), hashtext(reverse(_rec.name))); \
-             _stmts := reflex_build_truncate_sql(_rec.name); \
-             IF _stmts <> '' THEN PERFORM reflex_execute_separated(_stmts); END IF; \
+             _stmts := public.reflex_build_truncate_sql(_rec.name); \
+             IF _stmts <> '' THEN PERFORM public.reflex_execute_separated(_stmts); END IF; \
            END LOOP; \
            TRUNCATE {delta_tbl}; \
            DELETE FROM public.__reflex_deferred_pending WHERE source_table = '{source_table}'; \
@@ -640,7 +640,7 @@ pub fn build_deferred_flush_ddl() -> Vec<String> {
            FOR _src IN \
              SELECT DISTINCT source_table FROM public.__reflex_deferred_pending \
            LOOP \
-             PERFORM reflex_flush_deferred(_src.source_table); \
+             PERFORM public.reflex_flush_deferred(_src.source_table); \
            END LOOP; \
            RETURN NULL; \
          END; \
@@ -664,7 +664,7 @@ pub fn build_deferred_flush_ddl() -> Vec<String> {
 pub fn build_staging_table_ddl(source_table: &str) -> String {
     let delta_tbl = staging_delta_table_name(source_table);
     format!(
-        "CREATE UNLOGGED TABLE IF NOT EXISTS \"{}\" (\
+        "CREATE UNLOGGED TABLE IF NOT EXISTS {} (\
             __reflex_op TEXT NOT NULL, \
             LIKE {} INCLUDING DEFAULTS\
          )",
@@ -684,11 +684,11 @@ pub fn build_passthrough_scratch_ddls(view_name: &str, source_table: &str) -> Ve
     let old_tbl = passthrough_scratch_old_table_name(view_name, source_table);
     vec![
         format!(
-            "CREATE UNLOGGED TABLE IF NOT EXISTS \"{}\" (LIKE {} INCLUDING DEFAULTS)",
+            "CREATE UNLOGGED TABLE IF NOT EXISTS {} (LIKE {} INCLUDING DEFAULTS)",
             new_tbl, source_table
         ),
         format!(
-            "CREATE UNLOGGED TABLE IF NOT EXISTS \"{}\" (LIKE {} INCLUDING DEFAULTS)",
+            "CREATE UNLOGGED TABLE IF NOT EXISTS {} (LIKE {} INCLUDING DEFAULTS)",
             old_tbl, source_table
         ),
     ]

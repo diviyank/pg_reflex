@@ -1,0 +1,319 @@
+// 1.4.1: internal reflex artifacts (delta scratch, staging delta, passthrough
+// scratch, affected-groups, shrunk-groups) are now co-located in the schema
+// of their owning IMV or source table — so trigger bodies and generated SQL
+// resolve them by qualified name and no longer depend on the session
+// `search_path` containing `public`.
+
+/// IMMEDIATE aggregate: source + IMV both in a non-public schema. DML under
+/// a `search_path` that does NOT include `public` must still maintain the
+/// IMV — the bug 1.4.1 fixes is exactly this regression on a real customer
+/// workload (`alp.demand_planning` feeding `alp.ivm_sop_forecast_view`).
+#[pg_test]
+fn pg_test_immediate_imv_in_custom_schema_under_set_search_path() {
+    Spi::run("CREATE SCHEMA alp").expect("schema");
+    Spi::run("CREATE TABLE alp.demand_planning (id SERIAL, city TEXT, qty INT)")
+        .expect("create source");
+    Spi::run("INSERT INTO alp.demand_planning (city, qty) VALUES ('Paris', 10), ('London', 20)")
+        .expect("seed");
+
+    let r = crate::create_reflex_ivm(
+        "alp.demand_view",
+        "SELECT city, SUM(qty) AS total FROM alp.demand_planning GROUP BY city",
+        None,
+        None,
+        Some("IMMEDIATE"),
+    );
+    assert_eq!(r, "CREATE REFLEX INCREMENTAL VIEW");
+
+    // Sanity: intermediate / scratch / affected co-located in `alp`, not public.
+    let int_schema = Spi::get_one::<String>(
+        "SELECT n.nspname::TEXT FROM pg_class c JOIN pg_namespace n ON c.relnamespace = n.oid \
+         WHERE c.relname = '__reflex_intermediate_demand_view'",
+    )
+    .expect("q")
+    .expect("v");
+    assert_eq!(int_schema, "alp");
+
+    let scratch_schema = Spi::get_one::<String>(
+        "SELECT n.nspname::TEXT FROM pg_class c JOIN pg_namespace n ON c.relnamespace = n.oid \
+         WHERE c.relname = '__reflex_scratch_demand_view'",
+    )
+    .expect("q")
+    .expect("v");
+    assert_eq!(scratch_schema, "alp");
+
+    let aff_schema = Spi::get_one::<String>(
+        "SELECT n.nspname::TEXT FROM pg_class c JOIN pg_namespace n ON c.relnamespace = n.oid \
+         WHERE c.relname = '__reflex_affected_demand_view'",
+    )
+    .expect("q")
+    .expect("v");
+    assert_eq!(aff_schema, "alp");
+
+    // Restrict search_path to `alp` (excludes public). The reported bug fires
+    // here: any unqualified reference to a delta/scratch/affected table inside
+    // the trigger body looks up against this search_path and would fail.
+    Spi::run("SET search_path = alp").expect("set search_path");
+
+    // INSERT, UPDATE, DELETE must all maintain the IMV without errors.
+    Spi::run("INSERT INTO alp.demand_planning (city, qty) VALUES ('Paris', 5)").expect("insert");
+    Spi::run("UPDATE alp.demand_planning SET qty = qty + 100 WHERE city = 'London'")
+        .expect("update");
+    Spi::run("DELETE FROM alp.demand_planning WHERE city = 'Paris' AND qty = 5").expect("delete");
+
+    // Reset search_path so the EXCEPT-ALL oracle (and pg_reflex's own
+    // public-qualified registry reads) work without surprises.
+    Spi::run("SET search_path = public, alp").expect("reset");
+
+    let fresh = "SELECT city, SUM(qty) AS total FROM alp.demand_planning GROUP BY city";
+    let mismatches = Spi::get_one::<i64>(&format!(
+        "SELECT COUNT(*) FROM (\
+            (SELECT * FROM alp.demand_view EXCEPT ALL SELECT * FROM ({fresh}) f1) \
+            UNION ALL \
+            (SELECT * FROM ({fresh}) f2 EXCEPT ALL SELECT * FROM alp.demand_view) \
+         ) o"
+    ))
+    .expect("oracle")
+    .expect("v");
+    assert_eq!(
+        mismatches, 0,
+        "IMV diverged from fresh under non-public search_path",
+    );
+}
+
+/// DEFERRED variant of the same regression. The staging-delta table is per
+/// source (`alp.__reflex_delta_alp_demand_planning`); the deferred trigger
+/// body must reference it qualified. The constraint trigger at COMMIT then
+/// flushes — `reflex_flush_deferred` is itself called from a trigger body
+/// under whatever search_path the writing session had.
+#[pg_test]
+fn pg_test_deferred_imv_in_custom_schema_under_set_search_path() {
+    Spi::run("CREATE SCHEMA def_s").expect("schema");
+    Spi::run("CREATE TABLE def_s.orders (id SERIAL, region TEXT, amt NUMERIC)")
+        .expect("create source");
+    Spi::run("INSERT INTO def_s.orders (region, amt) VALUES ('NA', 100), ('EU', 50)")
+        .expect("seed");
+
+    let r = crate::create_reflex_ivm(
+        "def_s.orders_view",
+        "SELECT region, SUM(amt) AS total FROM def_s.orders GROUP BY region",
+        None,
+        None,
+        Some("DEFERRED"),
+    );
+    assert_eq!(r, "CREATE REFLEX INCREMENTAL VIEW");
+
+    // Staging delta co-located in `def_s`, not public.
+    let delta_schema = Spi::get_one::<String>(
+        "SELECT n.nspname::TEXT FROM pg_class c JOIN pg_namespace n ON c.relnamespace = n.oid \
+         WHERE c.relname = '__reflex_delta_def_s_orders'",
+    )
+    .expect("q")
+    .expect("v");
+    assert_eq!(delta_schema, "def_s");
+
+    // Writer session has narrow search_path: this is the reported regression.
+    Spi::run("SET search_path = def_s").expect("set search_path");
+
+    Spi::run("INSERT INTO def_s.orders (region, amt) VALUES ('NA', 25)").expect("insert");
+    Spi::run("UPDATE def_s.orders SET amt = amt + 1 WHERE region = 'EU'").expect("update");
+
+    // Manual flush — exercises reflex_flush_deferred under the narrow search_path.
+    Spi::run("SELECT public.reflex_flush_deferred('def_s.orders')").expect("flush");
+
+    Spi::run("SET search_path = public, def_s").expect("reset");
+
+    let fresh = "SELECT region, SUM(amt) AS total FROM def_s.orders GROUP BY region";
+    let mismatches = Spi::get_one::<i64>(&format!(
+        "SELECT COUNT(*) FROM (\
+            (SELECT * FROM def_s.orders_view EXCEPT ALL SELECT * FROM ({fresh}) f1) \
+            UNION ALL \
+            (SELECT * FROM ({fresh}) f2 EXCEPT ALL SELECT * FROM def_s.orders_view) \
+         ) o"
+    ))
+    .expect("oracle")
+    .expect("v");
+    assert_eq!(
+        mismatches, 0,
+        "deferred IMV diverged from fresh under non-public search_path",
+    );
+}
+
+/// Passthrough IMV in a custom schema under narrow search_path. Exercises the
+/// per-(IMV, source) passthrough scratch tables (`__reflex_pt_new_*`,
+/// `__reflex_pt_old_*`) — these are now co-located in the IMV's schema.
+#[pg_test]
+fn pg_test_passthrough_imv_in_custom_schema_under_set_search_path() {
+    Spi::run("CREATE SCHEMA pt_s").expect("schema");
+    Spi::run(
+        "CREATE TABLE pt_s.events (\
+            id SERIAL PRIMARY KEY, \
+            user_id INT NOT NULL, \
+            kind TEXT NOT NULL\
+         )",
+    )
+    .expect("create source");
+    Spi::run("INSERT INTO pt_s.events (user_id, kind) VALUES (1, 'click'), (2, 'view')")
+        .expect("seed");
+
+    let r = crate::create_reflex_ivm(
+        "pt_s.events_view",
+        "SELECT id, user_id, kind FROM pt_s.events",
+        Some("id"),
+        None,
+        Some("IMMEDIATE"),
+    );
+    assert_eq!(r, "CREATE REFLEX INCREMENTAL VIEW");
+
+    // pt_new / pt_old in `pt_s`.
+    let pt_new_schema = Spi::get_one::<String>(
+        "SELECT n.nspname::TEXT FROM pg_class c JOIN pg_namespace n ON c.relnamespace = n.oid \
+         WHERE c.relname = '__reflex_pt_new_events_view_pt_s_events'",
+    )
+    .expect("q")
+    .expect("v");
+    assert_eq!(pt_new_schema, "pt_s");
+
+    Spi::run("SET search_path = pt_s").expect("narrow search_path");
+
+    Spi::run("INSERT INTO pt_s.events (user_id, kind) VALUES (3, 'purchase')").expect("insert");
+    Spi::run("UPDATE pt_s.events SET kind = 'CLICK' WHERE user_id = 1").expect("update");
+    Spi::run("DELETE FROM pt_s.events WHERE user_id = 2").expect("delete");
+
+    Spi::run("SET search_path = public, pt_s").expect("reset");
+
+    let mismatches = Spi::get_one::<i64>(
+        "SELECT COUNT(*) FROM (\
+            (SELECT * FROM pt_s.events_view EXCEPT ALL SELECT id, user_id, kind FROM pt_s.events) \
+            UNION ALL \
+            (SELECT id, user_id, kind FROM pt_s.events EXCEPT ALL SELECT * FROM pt_s.events_view) \
+         ) o",
+    )
+    .expect("oracle")
+    .expect("v");
+    assert_eq!(mismatches, 0, "passthrough IMV diverged under narrow search_path");
+}
+
+/// Two IMVs in *different* schemas feeding off the *same* source. Confirms
+/// the per-source staging delta still lives in the source's schema (not
+/// duplicated), and a shared source can fan out cross-schema without
+/// search_path coupling.
+#[pg_test]
+fn pg_test_shared_source_two_imvs_in_distinct_schemas() {
+    Spi::run("CREATE SCHEMA src_s").expect("schema");
+    Spi::run("CREATE SCHEMA imv_a").expect("schema");
+    Spi::run("CREATE SCHEMA imv_b").expect("schema");
+    Spi::run("CREATE TABLE src_s.t (id SERIAL, grp TEXT, val INT)").expect("create source");
+    Spi::run("INSERT INTO src_s.t (grp, val) VALUES ('x', 1), ('y', 2), ('x', 3)").expect("seed");
+
+    crate::create_reflex_ivm(
+        "imv_a.view_one",
+        "SELECT grp, SUM(val) AS s FROM src_s.t GROUP BY grp",
+        None,
+        None,
+        Some("DEFERRED"),
+    );
+    crate::create_reflex_ivm(
+        "imv_b.view_two",
+        "SELECT grp, COUNT(*) AS c FROM src_s.t GROUP BY grp",
+        None,
+        None,
+        Some("DEFERRED"),
+    );
+
+    // The shared staging delta lives in `src_s` (per source), regardless of
+    // which IMV's schema is involved.
+    let delta_schema = Spi::get_one::<String>(
+        "SELECT n.nspname::TEXT FROM pg_class c JOIN pg_namespace n ON c.relnamespace = n.oid \
+         WHERE c.relname = '__reflex_delta_src_s_t'",
+    )
+    .expect("q")
+    .expect("v");
+    assert_eq!(delta_schema, "src_s");
+
+    // Per-IMV artifacts live in each IMV's own schema.
+    let int_a = Spi::get_one::<String>(
+        "SELECT n.nspname::TEXT FROM pg_class c JOIN pg_namespace n ON c.relnamespace = n.oid \
+         WHERE c.relname = '__reflex_intermediate_view_one'",
+    )
+    .expect("q")
+    .expect("v");
+    assert_eq!(int_a, "imv_a");
+
+    let int_b = Spi::get_one::<String>(
+        "SELECT n.nspname::TEXT FROM pg_class c JOIN pg_namespace n ON c.relnamespace = n.oid \
+         WHERE c.relname = '__reflex_intermediate_view_two'",
+    )
+    .expect("q")
+    .expect("v");
+    assert_eq!(int_b, "imv_b");
+
+    // DML under a search_path that includes ONLY the source schema (not public,
+    // not either IMV schema): the trigger body must still resolve everything.
+    Spi::run("SET search_path = src_s").expect("narrow search_path");
+    Spi::run("INSERT INTO src_s.t (grp, val) VALUES ('x', 100), ('z', 50)").expect("insert");
+    Spi::run("SELECT public.reflex_flush_deferred('src_s.t')").expect("flush");
+    Spi::run("SET search_path = public, src_s, imv_a, imv_b").expect("reset");
+
+    let m1 = Spi::get_one::<i64>(
+        "SELECT COUNT(*) FROM (\
+            (SELECT * FROM imv_a.view_one EXCEPT ALL SELECT grp, SUM(val) FROM src_s.t GROUP BY grp) \
+            UNION ALL \
+            (SELECT grp, SUM(val) FROM src_s.t GROUP BY grp EXCEPT ALL SELECT * FROM imv_a.view_one) \
+         ) o",
+    ).expect("oracle a").expect("v");
+    assert_eq!(m1, 0);
+
+    let m2 = Spi::get_one::<i64>(
+        "SELECT COUNT(*) FROM (\
+            (SELECT * FROM imv_b.view_two EXCEPT ALL SELECT grp, COUNT(*) FROM src_s.t GROUP BY grp) \
+            UNION ALL \
+            (SELECT grp, COUNT(*) FROM src_s.t GROUP BY grp EXCEPT ALL SELECT * FROM imv_b.view_two) \
+         ) o",
+    ).expect("oracle b").expect("v");
+    assert_eq!(m2, 0);
+}
+
+/// Top-K MIN/MAX IMV under narrow search_path. Exercises the per-IMV
+/// `__reflex_shrunk_*` capture table during UPDATE (the N1 path).
+#[pg_test]
+fn pg_test_topk_imv_in_custom_schema_under_set_search_path() {
+    Spi::run("CREATE SCHEMA topk_s").expect("schema");
+    Spi::run("CREATE TABLE topk_s.t (id SERIAL, grp TEXT, v INT)").expect("create");
+    Spi::run("INSERT INTO topk_s.t (grp, v) SELECT 'g' || (i % 4), i FROM generate_series(1, 100) i")
+        .expect("seed");
+
+    let r = crate::create_reflex_ivm(
+        "topk_s.minmax",
+        "SELECT grp, MIN(v) AS mn, MAX(v) AS mx FROM topk_s.t GROUP BY grp",
+        None,
+        None,
+        Some("IMMEDIATE"),
+    );
+    assert_eq!(r, "CREATE REFLEX INCREMENTAL VIEW");
+
+    let shrunk_schema = Spi::get_one::<String>(
+        "SELECT n.nspname::TEXT FROM pg_class c JOIN pg_namespace n ON c.relnamespace = n.oid \
+         WHERE c.relname = '__reflex_shrunk_minmax'",
+    )
+    .expect("q")
+    .expect("v");
+    assert_eq!(shrunk_schema, "topk_s");
+
+    Spi::run("SET search_path = topk_s").expect("narrow search_path");
+    Spi::run("UPDATE topk_s.t SET v = v + 1000 WHERE id IN (1, 2, 3, 4, 5)").expect("update");
+    Spi::run("DELETE FROM topk_s.t WHERE id BETWEEN 6 AND 10").expect("delete");
+    Spi::run("SET search_path = public, topk_s").expect("reset");
+
+    let fresh = "SELECT grp, MIN(v) AS mn, MAX(v) AS mx FROM topk_s.t GROUP BY grp";
+    let mismatches = Spi::get_one::<i64>(&format!(
+        "SELECT COUNT(*) FROM (\
+            (SELECT * FROM topk_s.minmax EXCEPT ALL SELECT * FROM ({fresh}) f1) \
+            UNION ALL \
+            (SELECT * FROM ({fresh}) f2 EXCEPT ALL SELECT * FROM topk_s.minmax) \
+         ) o"
+    ))
+    .expect("oracle")
+    .expect("v");
+    assert_eq!(mismatches, 0, "top-K MIN/MAX IMV diverged under narrow search_path");
+}

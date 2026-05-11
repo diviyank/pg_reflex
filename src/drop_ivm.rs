@@ -3,8 +3,9 @@ use pgrx::pg_sys::panic::ErrorReportable;
 use pgrx::prelude::*;
 
 use crate::query_decomposer::{
-    delta_scratch_table_name, intermediate_table_name, passthrough_scratch_new_table_name,
-    passthrough_scratch_old_table_name, quote_identifier, safe_identifier, split_qualified_name,
+    affected_groups_table_name, delta_scratch_table_name, intermediate_table_name,
+    passthrough_scratch_new_table_name, passthrough_scratch_old_table_name, quote_identifier,
+    shrunk_groups_table_name, split_qualified_name,
 };
 
 pub(crate) fn drop_reflex_ivm_impl(view_name: &str, cascade: bool) -> &'static str {
@@ -150,13 +151,12 @@ pub(crate) fn drop_reflex_ivm_impl(view_name: &str, cascade: bool) -> &'static s
             )
             .unwrap_or_report();
 
-        // 6b. Drop persistent affected-groups table
-        let bare_view = split_qualified_name(view_name).1;
+        // 6b. Drop persistent affected-groups table (qualified in IMV's schema, 1.4.1).
         client
             .update(
                 &format!(
-                    "DROP TABLE IF EXISTS \"{}\"{}",
-                    safe_identifier(&format!("__reflex_affected_{}", bare_view)),
+                    "DROP TABLE IF EXISTS {}{}",
+                    affected_groups_table_name(view_name),
                     cascade_suffix
                 ),
                 None,
@@ -169,8 +169,8 @@ pub(crate) fn drop_reflex_ivm_impl(view_name: &str, cascade: bool) -> &'static s
         client
             .update(
                 &format!(
-                    "DROP TABLE IF EXISTS \"{}\"{}",
-                    safe_identifier(&format!("__reflex_shrunk_{}", bare_view)),
+                    "DROP TABLE IF EXISTS {}{}",
+                    shrunk_groups_table_name(view_name),
                     cascade_suffix
                 ),
                 None,
@@ -182,7 +182,7 @@ pub(crate) fn drop_reflex_ivm_impl(view_name: &str, cascade: bool) -> &'static s
         client
             .update(
                 &format!(
-                    "DROP TABLE IF EXISTS \"{}\"{}",
+                    "DROP TABLE IF EXISTS {}{}",
                     delta_scratch_table_name(view_name),
                     cascade_suffix
                 ),
@@ -200,7 +200,7 @@ pub(crate) fn drop_reflex_ivm_impl(view_name: &str, cascade: bool) -> &'static s
             ] {
                 client
                     .update(
-                        &format!("DROP TABLE IF EXISTS \"{}\"{}", tbl, cascade_suffix),
+                        &format!("DROP TABLE IF EXISTS {}{}", tbl, cascade_suffix),
                         None,
                         &[],
                     )

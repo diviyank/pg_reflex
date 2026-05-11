@@ -7,9 +7,10 @@ use std::collections::HashMap;
 
 use crate::aggregation::{plan_aggregation, plan_aggregation_with_topk};
 use crate::query_decomposer::{
-    bare_column_name, format_pg_text_array_literal, generate_aggregations_json,
-    generate_base_query, generate_end_query, intermediate_table_name, normalized_column_name,
-    quote_identifier, replace_identifier, safe_identifier, split_qualified_name,
+    affected_groups_table_name, bare_column_name, format_pg_text_array_literal,
+    generate_aggregations_json, generate_base_query, generate_end_query, intermediate_table_name,
+    normalized_column_name, quote_identifier, replace_identifier, safe_identifier,
+    shrunk_groups_table_name, split_qualified_name,
 };
 use crate::schema_builder::{
     build_deferred_flush_ddl, build_deferred_trigger_ddls, build_delta_scratch_table_ddl,
@@ -1306,8 +1307,8 @@ pub(crate) fn create_reflex_ivm_impl(
 
             // Create persistent affected-groups table (avoids DROP+CREATE per trigger fire).
             // Uses UNLOGGED for speed; lost on crash but rebuilt by reflex_reconcile.
+            // Co-located in the IMV's schema (1.4.1) so SQL works under any `search_path`.
             if !plan.group_by_columns.is_empty() || !plan.distinct_columns.is_empty() {
-                let bare_view = split_qualified_name(view_name).1;
                 let group_cols_csv = plan
                     .group_by_columns
                     .iter()
@@ -1315,12 +1316,12 @@ pub(crate) fn create_reflex_ivm_impl(
                     .map(|c| format!("\"{}\"", normalized_column_name(c)))
                     .collect::<Vec<_>>()
                     .join(", ");
-                let affected_name = safe_identifier(&format!("__reflex_affected_{}", bare_view));
+                let affected_ref = affected_groups_table_name(view_name);
                 client
                     .update(
                         &format!(
-                            "CREATE UNLOGGED TABLE IF NOT EXISTS \"{}\" AS SELECT {} FROM {} WHERE FALSE",
-                            affected_name,
+                            "CREATE UNLOGGED TABLE IF NOT EXISTS {} AS SELECT {} FROM {} WHERE FALSE",
+                            affected_ref,
                             group_cols_csv,
                             intermediate_tbl
                         ),
@@ -1335,12 +1336,12 @@ pub(crate) fn create_reflex_ivm_impl(
                 // unallocated.
                 let has_topk = plan.intermediate_columns.iter().any(|ic| ic.has_topk());
                 if has_topk {
-                    let shrunk_name = safe_identifier(&format!("__reflex_shrunk_{}", bare_view));
+                    let shrunk_ref = shrunk_groups_table_name(view_name);
                     client
                         .update(
                             &format!(
-                                "CREATE UNLOGGED TABLE IF NOT EXISTS \"{}\" AS SELECT {} FROM {} WHERE FALSE",
-                                shrunk_name,
+                                "CREATE UNLOGGED TABLE IF NOT EXISTS {} AS SELECT {} FROM {} WHERE FALSE",
+                                shrunk_ref,
                                 group_cols_csv,
                                 intermediate_tbl
                             ),

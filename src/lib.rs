@@ -360,6 +360,7 @@ mod tests {
     include!("tests/pg_test_distinct_on.rs");
     include!("tests/pg_test_1_2_0.rs");
     include!("tests/pg_test_no_sigabrt.rs");
+    include!("tests/pg_test_search_path.rs");
 }
 
 /// This module is required by `cargo pgrx test` invocations.

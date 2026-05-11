@@ -4,6 +4,8 @@ use pgrx::prelude::*;
 use pgrx::spi::Spi;
 use pgrx::PgBuiltInOids;
 
+use crate::query_decomposer::intermediate_table_name;
+
 /// One row of IMV status summary.  Returned by `reflex_ivm_status`.
 type IvmStatusRow = (
     String,                         // name
@@ -124,7 +126,9 @@ fn reflex_ivm_stats(
 ) -> TableIterator<'static, (name!(metric, String), name!(value, String))> {
     let mut out: Vec<(String, String)> = Vec::new();
     let qv = quote_ident(view_name);
-    let interm = format!("public.__reflex_intermediate_{}", bare_name(view_name));
+    // Co-located intermediate table (1.4.1): same schema as the IMV. The helper
+    // returns either `"schema"."local"` or a bare local name.
+    let interm = intermediate_table_name(view_name);
     let target = qv.clone();
 
     let interm_size: Option<String> = Spi::get_one(&format!(
@@ -315,10 +319,6 @@ fn quote_ident(name: &str) -> String {
     } else {
         format!("\"{}\"", name.replace('"', "\"\""))
     }
-}
-
-fn bare_name(name: &str) -> String {
-    name.rsplit('.').next().unwrap_or(name).to_string()
 }
 
 fn interm_quoted(name: &str) -> String {

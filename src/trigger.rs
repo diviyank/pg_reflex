@@ -10,10 +10,11 @@ use std::sync::{Mutex, OnceLock};
 
 use crate::aggregation::AggregationPlan;
 use crate::query_decomposer::{
-    delta_scratch_table_name, intermediate_table_name, normalized_column_name,
-    passthrough_scratch_new_table_name, passthrough_scratch_old_table_name, quote_identifier,
-    replace_identifier, replace_source_with_delta, safe_identifier, split_qualified_name,
-    staging_delta_table_name, transition_new_table_name, transition_old_table_name,
+    affected_groups_table_name, delta_scratch_table_name, intermediate_table_name,
+    normalized_column_name, passthrough_scratch_new_table_name, passthrough_scratch_old_table_name,
+    quote_identifier, replace_identifier, replace_source_with_delta, shrunk_groups_table_name,
+    split_qualified_name, staging_delta_table_name, transition_new_table_name,
+    transition_old_table_name,
 };
 
 /// Per-backend cache of built delta SQL keyed by a hash of all inputs.
@@ -85,7 +86,9 @@ fn build_merge_from_table_sql(
     plan: &AggregationPlan,
     op: DeltaOp,
 ) -> String {
-    build_merge_using(intermediate_tbl, &format!("\"{}\"", scratch_tbl), plan, op)
+    // `scratch_tbl` is pre-qualified (`"schema"."local"` or bare local) by
+    // `delta_scratch_table_name`, so no extra quoting here.
+    build_merge_using(intermediate_tbl, scratch_tbl, plan, op)
 }
 
 fn build_merge_using(
@@ -416,6 +419,7 @@ pub fn build_topk_scalar_refresh_sql(
     let heap_pred = heap_predicates.join(" OR ");
 
     // Scope to affected groups when possible.
+    // `at` is a fully-formed identifier ref (qualified+quoted or bare local).
     let scope_filter = match (affected_tbl, !group_cols.is_empty()) {
         (Some(at), true) => {
             let cols_csv = group_cols
@@ -424,7 +428,7 @@ pub fn build_topk_scalar_refresh_sql(
                 .collect::<Vec<_>>()
                 .join(", ");
             format!(
-                " AND ({cols}) IN (SELECT {cols} FROM \"{at}\")",
+                " AND ({cols}) IN (SELECT {cols} FROM {at})",
                 cols = cols_csv,
                 at = at,
             )
@@ -516,10 +520,10 @@ pub fn push_topk_shrunk_groups_capture(
         .collect();
     let where_clause = predicates.join(" OR ");
 
-    stmts.push(format!("TRUNCATE \"{}\"", shrunk_tbl));
+    stmts.push(format!("TRUNCATE {}", shrunk_tbl));
     stmts.push(format!(
-        "INSERT INTO \"{shrunk_tbl}\" SELECT DISTINCT {proj} \
-         FROM {intermediate_tbl} i JOIN \"{affected_tbl}\" a ON {join_cond} \
+        "INSERT INTO {shrunk_tbl} SELECT DISTINCT {proj} \
+         FROM {intermediate_tbl} i JOIN {affected_tbl} a ON {join_cond} \
          WHERE {where_clause}",
         shrunk_tbl = shrunk_tbl,
         proj = proj,
@@ -637,7 +641,7 @@ fn build_min_max_recompute_sql_inner(
             let norm_csv: Vec<String> = group_cols.iter().map(|c| format!("\"{}\"", c)).collect();
             let norm_csv = norm_csv.join(", ");
             let filter = format!(
-                " AND ({}) IN (SELECT DISTINCT {} FROM \"{}\")",
+                " AND ({}) IN (SELECT DISTINCT {} FROM {})",
                 raw_csv, norm_csv, at
             );
             match splice_before_group_by(orig_base_query, &filter) {
@@ -684,7 +688,7 @@ fn build_min_max_recompute_sql_inner(
             })
             .collect();
         let exists_check = format!(
-            "EXISTS (SELECT 1 FROM {tbl} JOIN \"{at}\" __aff ON {join} WHERE {nullc})",
+            "EXISTS (SELECT 1 FROM {tbl} JOIN {at} __aff ON {join} WHERE {nullc})",
             tbl = intermediate_tbl,
             at = at,
             join = aff_join_cond.join(" AND "),
@@ -711,8 +715,11 @@ fn null_safe_in(affected_tbl: &str, cols: &[String]) -> String {
         .iter()
         .map(|c| format!("{} IS NOT DISTINCT FROM __a.{}", c, c))
         .collect();
+    // `affected_tbl` is already a fully-formed identifier ref (qualified+quoted
+    // when the IMV has a schema, bare local otherwise) — see
+    // `affected_groups_table_name`.
     format!(
-        "EXISTS (SELECT 1 FROM \"{}\" AS __a WHERE {})",
+        "EXISTS (SELECT 1 FROM {} AS __a WHERE {})",
         affected_tbl,
         conditions.join(" AND ")
     )
@@ -815,7 +822,14 @@ fn replace_source_with_transition(
     source_table: &str,
     transition_tbl: &str,
 ) -> String {
-    let quoted_tbl = format!("\"{}\"", transition_tbl);
+    // `transition_tbl` is either a bare safe-identifier (real transition table
+    // alias like `__reflex_new_<src>`) or an already-quoted/qualified ref like
+    // `"schema"."__reflex_pt_new_v_s"`. Quote bare names; pass refs through.
+    let quoted_tbl = if transition_tbl.contains('"') {
+        transition_tbl.to_string()
+    } else {
+        format!("\"{}\"", transition_tbl)
+    };
     // Use word-boundary-aware replacement to avoid corrupting column names
     // that contain the source table name as a substring (e.g., __bool_or_flag
     // contains "bo" when the source table is "bo").
@@ -842,8 +856,8 @@ fn push_materialized_merge(
     plan: &AggregationPlan,
     op: DeltaOp,
 ) {
-    stmts.push(format!("TRUNCATE \"{}\"", scratch_tbl));
-    stmts.push(format!("INSERT INTO \"{}\" {}", scratch_tbl, delta_query));
+    stmts.push(format!("TRUNCATE {}", scratch_tbl));
+    stmts.push(format!("INSERT INTO {} {}", scratch_tbl, delta_query));
     stmts.push(build_merge_from_table_sql(
         intermediate_tbl,
         scratch_tbl,
@@ -865,10 +879,10 @@ fn push_materialized_merge_and_affected(
     include_cleanup: bool,
 ) {
     if include_cleanup {
-        stmts.push(format!("TRUNCATE \"{}\"", affected_tbl));
+        stmts.push(format!("TRUNCATE {}", affected_tbl));
     }
-    stmts.push(format!("TRUNCATE \"{}\"", scratch_tbl));
-    stmts.push(format!("INSERT INTO \"{}\" {}", scratch_tbl, delta_query));
+    stmts.push(format!("TRUNCATE {}", scratch_tbl));
+    stmts.push(format!("INSERT INTO {} {}", scratch_tbl, delta_query));
     stmts.push(build_merge_from_table_sql(
         intermediate_tbl,
         scratch_tbl,
@@ -876,7 +890,7 @@ fn push_materialized_merge_and_affected(
         op,
     ));
     stmts.push(format!(
-        "INSERT INTO \"{}\" SELECT DISTINCT {} FROM \"{}\" AS __d",
+        "INSERT INTO {} SELECT DISTINCT {} FROM {} AS __d",
         affected_tbl, select_expr, scratch_tbl
     ));
 }
@@ -927,11 +941,12 @@ pub fn reflex_build_delta_sql(
 
     let mut stmts: Vec<String> = Vec::new();
 
-    // Pre-compute group columns and affected-groups table name (used by multiple paths)
+    // Pre-compute group columns and affected-groups table name (used by multiple paths).
+    // Affected / shrunk / scratch live in the IMV's schema (1.4.1) so the generated
+    // SQL works under any session `search_path`.
     let grp_cols = group_columns(&plan);
-    let bare_view = split_qualified_name(view_name).1;
-    let affected_tbl = safe_identifier(&format!("__reflex_affected_{}", bare_view));
-    let shrunk_tbl = safe_identifier(&format!("__reflex_shrunk_{}", bare_view));
+    let affected_tbl = affected_groups_table_name(view_name);
+    let shrunk_tbl = shrunk_groups_table_name(view_name);
     let scratch_tbl = delta_scratch_table_name(view_name);
 
     // Detect cases where standard incremental delta is incorrect:
@@ -1034,11 +1049,11 @@ pub fn reflex_build_delta_sql(
             let delta_q = replace_source_with_transition(base_query, source_table, transition);
 
             // Create affected groups table
-            stmts.push(format!("TRUNCATE \"{}\"", affected_tbl));
+            stmts.push(format!("TRUNCATE {}", affected_tbl));
 
             // Extract affected groups from delta
             stmts.push(format!(
-                "INSERT INTO \"{}\" SELECT DISTINCT {} FROM ({}) AS __d",
+                "INSERT INTO {} SELECT DISTINCT {} FROM ({}) AS __d",
                 affected_tbl, select_expr, delta_q
             ));
 
@@ -1101,16 +1116,16 @@ pub fn reflex_build_delta_sql(
         let needs_new = matches!(operation, "INSERT" | "UPDATE");
         let needs_old = matches!(operation, "DELETE" | "UPDATE");
         if needs_new {
-            stmts.push(format!("TRUNCATE \"{}\"", pt_new));
+            stmts.push(format!("TRUNCATE {}", pt_new));
             stmts.push(format!(
-                "INSERT INTO \"{}\" SELECT * FROM \"{}\"",
+                "INSERT INTO {} SELECT * FROM \"{}\"",
                 pt_new, new_tbl
             ));
         }
         if needs_old {
-            stmts.push(format!("TRUNCATE \"{}\"", pt_old));
+            stmts.push(format!("TRUNCATE {}", pt_old));
             stmts.push(format!(
-                "INSERT INTO \"{}\" SELECT * FROM \"{}\"",
+                "INSERT INTO {} SELECT * FROM \"{}\"",
                 pt_old, old_tbl
             ));
         }
@@ -1129,7 +1144,7 @@ pub fn reflex_build_delta_sql(
                         mappings.iter().map(|(_, s)| format!("\"{}\"", s)).collect();
                     let row = row_expr(&target_cols);
                     stmts.push(format!(
-                        "DELETE FROM {} WHERE {} IN (SELECT {} FROM \"{}\")",
+                        "DELETE FROM {} WHERE {} IN (SELECT {} FROM {})",
                         qv,
                         row,
                         source_cols.join(", "),
@@ -1150,7 +1165,7 @@ pub fn reflex_build_delta_sql(
                         mappings.iter().map(|(_, s)| format!("\"{}\"", s)).collect();
                     let row = row_expr(&target_cols);
                     stmts.push(format!(
-                        "DELETE FROM {} WHERE {} IN (SELECT {} FROM \"{}\")",
+                        "DELETE FROM {} WHERE {} IN (SELECT {} FROM {})",
                         qv,
                         row,
                         source_cols.join(", "),

@@ -79,12 +79,14 @@ pub fn safe_identifier(raw: &str) -> String {
 
 /// Name of the intermediate (unlogged) table for a given view.
 /// For schema-qualified names, the intermediate table is in the same schema.
+/// Always returns a quoted identifier reference (1.4.1) so usage sites can
+/// interpolate it directly without adding outer quotes.
 pub fn intermediate_table_name(view_name: &str) -> String {
     let (schema, name) = split_qualified_name(view_name);
     let int_name = safe_identifier(&format!("__reflex_intermediate_{}", name));
     match schema {
         Some(s) => format!("\"{}\".\"{}\"", s, int_name),
-        None => int_name,
+        None => format!("\"{}\"", int_name),
     }
 }
 
@@ -113,45 +115,87 @@ pub fn transition_old_table_name(source_table: &str) -> String {
     ))
 }
 
+/// Wrap a sanitized local identifier in the schema of `qualified_name`.
+/// Always returns a quoted identifier reference: `"schema"."local"` when
+/// `qualified_name` has a schema, `"local"` otherwise. The local part is run
+/// through `safe_identifier` so it always fits PG's 63-char NAMEDATALEN limit.
+/// Callers use the output directly in SQL without adding outer quotes.
+fn qualify_in_same_schema(qualified_name: &str, local: String) -> String {
+    let local = safe_identifier(&local);
+    match split_qualified_name(qualified_name).0 {
+        Some(s) => format!("\"{}\".\"{}\"", s, local),
+        None => format!("\"{}\"", local),
+    }
+}
+
 /// Name of the deferred-mode staging (delta) table for a source table.
+/// Co-located in the source table's schema so the trigger body can reference
+/// it without depending on the session's `search_path` (1.4.1 fix).
 pub fn staging_delta_table_name(source_table: &str) -> String {
-    safe_identifier(&format!(
-        "__reflex_delta_{}",
-        sanitized_source_suffix(source_table)
-    ))
+    qualify_in_same_schema(
+        source_table,
+        format!("__reflex_delta_{}", sanitized_source_suffix(source_table)),
+    )
 }
 
 /// Name of the per-IMV UNLOGGED delta scratch table used to materialize the
 /// grouped delta before issuing MERGE (avoids referencing transition tables
 /// inside EXECUTE'd MERGE statements, which trips a PG assert).
+/// Co-located in the IMV's schema so generated MERGE SQL works under any
+/// `search_path` (1.4.1 fix).
 pub fn delta_scratch_table_name(view_name: &str) -> String {
-    safe_identifier(&format!(
-        "__reflex_scratch_{}",
-        split_qualified_name(view_name).1
-    ))
+    qualify_in_same_schema(
+        view_name,
+        format!("__reflex_scratch_{}", split_qualified_name(view_name).1),
+    )
 }
 
 /// Name of the per-(IMV, source) UNLOGGED NEW-side passthrough scratch table.
 /// Used to materialize the NEW transition for passthrough IMVs so that
 /// downstream DML never references a transition table inside EXECUTE — which
 /// trips a PG assertion in nested-trigger contexts (cf. delta scratch above).
+/// Lives in the IMV's schema for the same `search_path` safety reason.
 pub fn passthrough_scratch_new_table_name(view_name: &str, source_table: &str) -> String {
-    safe_identifier(&format!(
-        "__reflex_pt_new_{}_{}",
-        split_qualified_name(view_name).1,
-        sanitized_source_suffix(source_table)
-    ))
+    qualify_in_same_schema(
+        view_name,
+        format!(
+            "__reflex_pt_new_{}_{}",
+            split_qualified_name(view_name).1,
+            sanitized_source_suffix(source_table)
+        ),
+    )
 }
 
 /// Name of the per-(IMV, source) UNLOGGED OLD-side passthrough scratch table.
 /// Separate from the NEW-side scratch to keep DELETE-then-INSERT ordering
 /// correct under UPDATE (the DELETE reads OLD while INSERT reads NEW).
 pub fn passthrough_scratch_old_table_name(view_name: &str, source_table: &str) -> String {
-    safe_identifier(&format!(
-        "__reflex_pt_old_{}_{}",
-        split_qualified_name(view_name).1,
-        sanitized_source_suffix(source_table)
-    ))
+    qualify_in_same_schema(
+        view_name,
+        format!(
+            "__reflex_pt_old_{}_{}",
+            split_qualified_name(view_name).1,
+            sanitized_source_suffix(source_table)
+        ),
+    )
+}
+
+/// Name of the per-IMV persistent UNLOGGED "affected groups" table.
+/// Co-located in the IMV's schema.
+pub fn affected_groups_table_name(view_name: &str) -> String {
+    qualify_in_same_schema(
+        view_name,
+        format!("__reflex_affected_{}", split_qualified_name(view_name).1),
+    )
+}
+
+/// Name of the per-IMV persistent UNLOGGED "shrunk groups" table (top-K only).
+/// Co-located in the IMV's schema.
+pub fn shrunk_groups_table_name(view_name: &str) -> String {
+    qualify_in_same_schema(
+        view_name,
+        format!("__reflex_shrunk_{}", split_qualified_name(view_name).1),
+    )
 }
 
 /// Strip table alias/qualifier from a column expression.
