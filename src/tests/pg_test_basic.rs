@@ -353,3 +353,135 @@ fn test_create_logged_passthrough() {
     ).expect("query").expect("value");
     assert_eq!(persist, "p", "Passthrough target should be permanent (logged)");
 }
+
+/// 1.4.4 — the composite intermediate index is UNIQUE NULLS NOT DISTINCT for
+/// multi-column groups, and `reflex_build_delta_sql` emits `=` for NOT NULL
+/// group columns in MERGE ON clauses (so the planner can use that index
+/// instead of seq-scanning the intermediate). Customer-reported regression:
+/// 20-min hang on a single-row UPDATE because the MERGE used hash-join +
+/// seq-scan of an 867 K-row intermediate.
+#[pg_test]
+fn pg_test_intermediate_unique_index_and_merge_eq_for_not_null() {
+    Spi::run("CREATE SCHEMA mrg").expect("schema");
+    Spi::run(
+        "CREATE TABLE mrg.merge_src (\
+            id     BIGINT NOT NULL PRIMARY KEY, \
+            status TEXT   NOT NULL, \
+            qty    INT)",
+    )
+    .expect("create src");
+    Spi::run(
+        "CREATE TABLE mrg.merge_join (\
+            id          BIGINT NOT NULL PRIMARY KEY, \
+            src_id      BIGINT NOT NULL, \
+            grp_a       INT    NOT NULL, \
+            grp_b       INT    NOT NULL, \
+            nullable_g  INT)",
+    )
+    .expect("create join");
+    Spi::run("INSERT INTO mrg.merge_src VALUES (1, 'validated', 10), (2, 'draft', 20)")
+        .expect("seed src");
+    Spi::run("INSERT INTO mrg.merge_join VALUES (1, 1, 100, 200, 9999), (2, 1, 100, 200, NULL)")
+        .expect("seed join");
+
+    // IMV with 4 group cols: 3 NOT NULL (grp_a, grp_b, status) + 1 NULLable
+    // (nullable_g). After 1.4.4 the MERGE ON clause must emit `=` for the
+    // 3 NOT NULL cols and `IS NOT DISTINCT FROM` for the NULLable one.
+    crate::create_reflex_ivm(
+        "mrg.merge_view",
+        "SELECT mrg.merge_src.status, mrg.merge_join.grp_a, mrg.merge_join.grp_b, \
+                mrg.merge_join.nullable_g, \
+                SUM(mrg.merge_src.qty) AS total \
+         FROM mrg.merge_src \
+         INNER JOIN mrg.merge_join ON mrg.merge_join.src_id = mrg.merge_src.id \
+         GROUP BY mrg.merge_src.status, mrg.merge_join.grp_a, mrg.merge_join.grp_b, \
+                  mrg.merge_join.nullable_g",
+        None,
+        None,
+        Some("IMMEDIATE"),
+    );
+
+    // (A) The composite intermediate index must be UNIQUE.
+    let is_unique: bool = Spi::get_one(
+        "SELECT ix.indisunique \
+         FROM pg_index ix \
+         JOIN pg_class cl ON cl.oid = ix.indexrelid \
+         WHERE cl.relname = 'idx__reflex_int_merge_view'",
+    )
+    .expect("read indisunique")
+    .expect("index exists");
+    assert!(
+        is_unique,
+        "1.4.4: composite intermediate index must be UNIQUE"
+    );
+
+    // (B) The composite must also be NULLS NOT DISTINCT — so a NULL nullable_g
+    // counts as one group, not many. PG 15+ exposes this via indnullsnotdistinct.
+    let nulls_not_distinct: bool = Spi::get_one(
+        "SELECT ix.indnullsnotdistinct \
+         FROM pg_index ix \
+         JOIN pg_class cl ON cl.oid = ix.indexrelid \
+         WHERE cl.relname = 'idx__reflex_int_merge_view'",
+    )
+    .expect("read indnullsnotdistinct")
+    .expect("index exists");
+    assert!(
+        nulls_not_distinct,
+        "1.4.4: composite intermediate index must be NULLS NOT DISTINCT so NULL group keys collapse"
+    );
+
+    // (C) reflex_build_delta_sql for INSERT op on this IMV must emit `=`
+    // for status / grp_a / grp_b (NOT NULL) and `IS NOT DISTINCT FROM` for
+    // nullable_g.
+    let sql: String = Spi::get_one(
+        "SELECT public.reflex_build_delta_sql( \
+             'mrg.merge_view', 'mrg.merge_src', 'INSERT', base_query, end_query, \
+             aggregations::TEXT, base_query) \
+         FROM public.__reflex_ivm_reference WHERE name = 'mrg.merge_view'"
+    )
+    .expect("build sql")
+    .expect("non-empty");
+
+    assert!(
+        sql.contains("t.\"status\" = d.\"status\""),
+        "NOT NULL `status` must use `=`: {}",
+        sql
+    );
+    assert!(
+        sql.contains("t.\"grp_a\" = d.\"grp_a\""),
+        "NOT NULL `grp_a` must use `=`: {}",
+        sql
+    );
+    assert!(
+        sql.contains("t.\"grp_b\" = d.\"grp_b\""),
+        "NOT NULL `grp_b` must use `=`: {}",
+        sql
+    );
+    assert!(
+        sql.contains("t.\"nullable_g\" IS NOT DISTINCT FROM d.\"nullable_g\""),
+        "NULLable `nullable_g` must keep `IS NOT DISTINCT FROM`: {}",
+        sql
+    );
+
+    // (D) Correctness end-to-end after an UPDATE.
+    Spi::run("UPDATE mrg.merge_src SET qty = qty + 5 WHERE id = 1").expect("update");
+    let fresh = "SELECT mrg.merge_src.status, mrg.merge_join.grp_a, mrg.merge_join.grp_b, \
+                        mrg.merge_join.nullable_g, SUM(mrg.merge_src.qty) AS total \
+                 FROM mrg.merge_src \
+                 INNER JOIN mrg.merge_join ON mrg.merge_join.src_id = mrg.merge_src.id \
+                 GROUP BY mrg.merge_src.status, mrg.merge_join.grp_a, mrg.merge_join.grp_b, \
+                          mrg.merge_join.nullable_g";
+    let mismatches: i64 = Spi::get_one(&format!(
+        "SELECT COUNT(*) FROM ( \
+            (SELECT * FROM mrg.merge_view EXCEPT ALL SELECT * FROM ({fresh}) f1) \
+            UNION ALL \
+            (SELECT * FROM ({fresh}) f2 EXCEPT ALL SELECT * FROM mrg.merge_view) \
+         ) o"
+    ))
+    .expect("oracle")
+    .expect("v");
+    assert_eq!(
+        mismatches, 0,
+        "IMV must match fresh aggregate after UPDATE with the new MERGE ON clause"
+    );
+}

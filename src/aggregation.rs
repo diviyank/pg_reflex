@@ -102,6 +102,14 @@ impl AggregationPlan {
     /// column is NOT NULL. When a column can't be NULL, SUM can never produce NULL
     /// (empty group case is handled by __ivm_count), so the companion count is redundant.
     pub fn optimize_not_null_sums(&mut self, not_null_columns: &std::collections::HashSet<String>) {
+        // 1.4.4: always record the catalog-derived NOT NULL set on the plan,
+        // not just when the SUM-companion-column optimisation fires. The
+        // MERGE codegen in `build_merge_using` reads `plan.not_null_columns`
+        // to decide between `=` (index-usable) and `IS NOT DISTINCT FROM`
+        // (NULL-safe) per group column, and that decision is independent of
+        // any SUM rewrite.
+        self.not_null_columns = not_null_columns.clone();
+
         let to_remove: std::collections::HashSet<String> = self
             .intermediate_columns
             .iter()
@@ -150,8 +158,6 @@ impl AggregationPlan {
                 }
             }
         }
-
-        self.not_null_columns = not_null_columns.clone();
     }
 }
 

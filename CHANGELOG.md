@@ -1,5 +1,60 @@
 # Changelog
 
+## [1.4.4] - 2026-05-12
+
+### Fixed
+- **IMMEDIATE-mode `MERGE INTO __reflex_intermediate_<view>` hung for 20+
+  minutes** on a customer dev environment when updating a single row of the
+  IMV's source table. Reproduced on a 352 MB / 867 K-row intermediate with
+  8 group columns. Root cause: `build_merge_using` emitted
+  `t.col IS NOT DISTINCT FROM d.col` for *every* group column. PG's btree
+  doesn't support `IS NOT DISTINCT FROM` as an index-usable equality
+  operator (it's NULL-safe; btree's `=` isn't), so the planner fell back to
+  hash join + seq-scan of the intermediate per scratch row. With a
+  moderately-large scratch (the customer's JOIN against `sales_simulation`
+  aggregated to tens of thousands of distinct group tuples), this turned a
+  millisecond MERGE into a minutes-long hang.
+
+  Fix: `build_merge_using` now reads `AggregationPlan.not_null_columns`
+  (already populated at IMV-create time from `information_schema.columns`,
+  stored in the aggregations JSON) and emits `t.col = d.col` for known-NOT
+  NULL columns. NULLable columns keep `IS NOT DISTINCT FROM`. The
+  composite btree index on the intermediate group columns is now
+  index-usable for the NOT NULL prefix.
+
+  Side fix: `AggregationPlan.optimize_not_null_sums` now records the
+  catalog-derived NOT NULL set unconditionally. Previously it only stored
+  it when the SUM-companion-column optimisation fired, so any IMV without
+  a NOT NULL SUM source had an empty set — even though the catalog had
+  the answer all along.
+
+### Performance
+- **Composite index on intermediate group columns is now `UNIQUE NULLS NOT
+  DISTINCT`** (PG 15+) for multi-column groups. Enforces the
+  one-row-per-group invariant the MERGE codegen has always assumed, and
+  pairs with the `=`-for-NOT-NULL ON clause to make the index usable as a
+  range-scan probe. Single-column groups keep the existing non-unique hash
+  index (hash indexes don't support uniqueness; `=` is the only access
+  pattern MERGE needs there anyway).
+
+### Migration
+- `ALTER EXTENSION pg_reflex UPDATE TO '1.4.4'` rebuilds every existing
+  multi-column intermediate composite index as `UNIQUE NULLS NOT DISTINCT`.
+  If the existing intermediate has duplicate rows for some group key —
+  which should never happen but theoretically could from a prior MERGE
+  bug — the unique build fails with `unique_violation`, the migration
+  falls back to recreating the non-unique form, and emits a per-IMV
+  WARNING listing the affected name. The operator can then drop and
+  recreate that IMV (or de-duplicate manually) to enforce the constraint.
+  No backend disruption.
+
+### Tests
+- 516 tests pass (+2 from 1.4.3: 1 new unit test for the index DDL form,
+  1 new pg-level integration `pg_test_intermediate_unique_index_and_merge_eq_for_not_null`
+  verifying both the catalog-derived `UNIQUE NULLS NOT DISTINCT` shape
+  and the `=`-vs-`IS NOT DISTINCT FROM` operator choice in the generated
+  MERGE).
+
 ## [1.4.3] - 2026-05-12
 
 ### Fixed

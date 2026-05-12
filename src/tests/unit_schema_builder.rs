@@ -133,10 +133,41 @@ fn test_indexes_ddl_multiple_group_by() {
     assert_eq!(indexes.len(), 4);
     assert!(indexes[0].contains("idx__reflex_int_"));
     assert!(!indexes[0].contains("USING hash")); // multi-column uses B-tree
+                                                 // 1.4.4: composite intermediate index is now UNIQUE NULLS NOT DISTINCT so
+                                                 // (a) the MERGE planner can pick it over a hash-join + seq-scan plan, and
+                                                 // (b) the one-row-per-group invariant the MERGE codegen assumes is
+                                                 // defensively enforced.
+    assert!(
+        indexes[0].contains("CREATE UNIQUE INDEX"),
+        "multi-col composite must be UNIQUE: {}",
+        indexes[0]
+    );
+    assert!(
+        indexes[0].contains("NULLS NOT DISTINCT"),
+        "multi-col composite must allow NULL group keys to coexist as one group: {}",
+        indexes[0]
+    );
     assert!(indexes[0].contains("\"city\", \"year\""));
     assert!(indexes[1].contains("\"city\""));
     assert!(indexes[2].contains("\"year\""));
     assert!(indexes[3].contains("idx__reflex_target_"));
+}
+
+#[test]
+fn test_indexes_ddl_single_group_by_stays_non_unique_hash() {
+    // Single-column groups keep using a hash index — hash indexes don't
+    // support uniqueness constraints in PG, and `=` lookups (the only access
+    // pattern MERGE needs for a single col) are optimally served by hash.
+    let plan = sample_plan();
+    let indexes = build_indexes_ddl("test_view", &plan);
+    assert_eq!(indexes.len(), 2);
+    assert!(indexes[0].contains("USING hash"));
+    assert!(
+        !indexes[0].contains("UNIQUE"),
+        "single-col hash must not be UNIQUE (PG hash indexes don't support it): {}",
+        indexes[0]
+    );
+    assert!(indexes[0].contains("\"city\""));
 }
 
 #[test]

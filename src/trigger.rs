@@ -115,12 +115,29 @@ fn build_merge_using(
         DeltaOp::Subtract => "-",
     };
 
-    // ON clause: IS NOT DISTINCT FROM handles NULL group keys correctly
-    // (NULL = NULL is false, but NULL IS NOT DISTINCT FROM NULL is true).
-    // Same performance as = (uses same B-tree/hash index).
+    // ON clause: prefer `=` for NOT NULL columns so a composite btree index on
+    // the group columns is usable by the planner. `IS NOT DISTINCT FROM` is
+    // semantically nicer (treats NULL = NULL as true) but is NOT index-usable
+    // on NULLable columns via plain btree, even with a `UNIQUE NULLS NOT
+    // DISTINCT` constraint. For columns known NOT NULL at IMV-create time,
+    // `IS NOT DISTINCT FROM` reduces to `=` semantically; we emit the
+    // index-friendly `=` form. NULLable columns keep `IS NOT DISTINCT FROM`
+    // so groups with NULL group-keys still match.
+    //
+    // The NOT NULL set lives directly on the AggregationPlan (populated at
+    // IMV-create time by `query_column_types_from_catalog` and persisted in
+    // the aggregations JSON). No SPI lookup needed at MERGE-codegen time.
     let on_clause = join_cols
         .iter()
-        .map(|c| format!("t.{} IS NOT DISTINCT FROM d.{}", c, c))
+        .map(|c| {
+            // `c` is `"col"` (already quoted). Unquote for the lookup.
+            let unquoted = c.trim_matches('"');
+            if plan.not_null_columns.contains(unquoted) {
+                format!("t.{} = d.{}", c, c)
+            } else {
+                format!("t.{} IS NOT DISTINCT FROM d.{}", c, c)
+            }
+        })
         .collect::<Vec<_>>()
         .join(" AND ");
 
@@ -1495,9 +1512,19 @@ pub fn reflex_build_delta_sql(
             let qv = quote_identifier(view_name);
             let ns_in = null_safe_in(&affected_tbl, cols);
             if include_dead_cleanup {
+                // Scope dead-row cleanup to groups touched by THIS flush.
+                // The previous unscoped `DELETE FROM intermediate WHERE
+                // __ivm_count <= 0` did a full sequential scan of the
+                // intermediate table — for JOIN'd aggregates with millions
+                // of distinct groups this is the dominant cost of every
+                // UPDATE/DELETE flush even when the flush affects a single
+                // row. Only rows whose `__ivm_count` was changed by this
+                // flush can have newly become non-positive; everything else
+                // was either dead before (and should have been cleaned then)
+                // or has count > 0.
                 stmts.push(format!(
-                    "DELETE FROM {} WHERE __ivm_count <= 0",
-                    intermediate_tbl
+                    "DELETE FROM {} WHERE __ivm_count <= 0 AND {}",
+                    intermediate_tbl, ns_in
                 ));
             }
             stmts.push(format!("DELETE FROM {} WHERE {}", qv, ns_in));

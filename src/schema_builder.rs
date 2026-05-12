@@ -283,19 +283,30 @@ pub fn build_indexes_ddl(view_name: &str, plan: &AggregationPlan) -> Vec<String>
             idx_cols.push(format!("\"{}\"", normalized_column_name(col)));
         }
         if !idx_cols.is_empty() {
-            let using = if idx_cols.len() == 1 {
-                "USING hash"
-            } else {
-                ""
-            };
             let idx_name = safe_identifier(&format!("idx__reflex_int_{}", bare_view));
-            indexes.push(format!(
-                "CREATE INDEX IF NOT EXISTS \"{}\" ON {} {} ({})",
-                idx_name,
-                table_name,
-                using,
-                idx_cols.join(", ")
-            ));
+            // For multi-column groups, emit a UNIQUE btree with NULLS NOT
+            // DISTINCT (PG 15+). The UNIQUE constraint enforces the
+            // one-row-per-group invariant the MERGE codegen assumes, and
+            // pairs with `build_merge_using`'s `=`-for-NOT-NULL ON clauses
+            // so the planner can do an index range scan over the NOT NULL
+            // prefix instead of seq-scanning the intermediate. For
+            // single-column groups, hash is the optimal lookup but doesn't
+            // support uniqueness — keep it non-unique.
+            if idx_cols.len() == 1 {
+                indexes.push(format!(
+                    "CREATE INDEX IF NOT EXISTS \"{}\" ON {} USING hash ({})",
+                    idx_name,
+                    table_name,
+                    idx_cols.join(", ")
+                ));
+            } else {
+                indexes.push(format!(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS \"{}\" ON {} ({}) NULLS NOT DISTINCT",
+                    idx_name,
+                    table_name,
+                    idx_cols.join(", ")
+                ));
+            }
         }
     }
 
