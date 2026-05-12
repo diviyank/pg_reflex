@@ -274,6 +274,121 @@ fn pg_test_shared_source_two_imvs_in_distinct_schemas() {
     assert_eq!(m2, 0);
 }
 
+/// DEFERRED IMV over a JOIN with schema-qualified sources whose base query
+/// uses BARE-name column qualifiers (`demand_planning.id`, not
+/// `alp.demand_planning.id`). Regression for the customer-reported bug where
+/// `UPDATE alp.demand_planning …` produced
+/// `WARNING: pg_reflex: IMV alp.ivm_sop_forecast_view flush failed at cascade:
+///  missing FROM-clause entry for table "__reflex_new_alp_demand_planning"`.
+///
+/// Root cause: `replace_source_with_delta` rewrote only the schema-qualified
+/// column form (`alp.demand_planning.col` → `__dt.col`) and left bare
+/// `demand_planning.col` untouched. The subsequent `replace_source_with_transition`
+/// pass inside `reflex_build_delta_sql` then wholesale-rewrote bare
+/// `demand_planning.col` to `"__reflex_new_alp_demand_planning".col` — but
+/// that transition table is not in the deferred flush's FROM clause.
+#[pg_test]
+fn pg_test_deferred_join_schema_qualified_with_bare_column_qualifiers() {
+    Spi::run("CREATE SCHEMA alp").expect("schema");
+    Spi::run(
+        "CREATE TABLE alp.demand_planning (\
+            id SERIAL PRIMARY KEY, \
+            status TEXT NOT NULL, \
+            qty INT NOT NULL\
+         )",
+    )
+    .expect("create dp");
+    Spi::run(
+        "CREATE TABLE alp.sales_simulation (\
+            id SERIAL PRIMARY KEY, \
+            dem_plan_id INT NOT NULL, \
+            product_id INT NOT NULL, \
+            qty_sales INT NOT NULL\
+         )",
+    )
+    .expect("create ss");
+    Spi::run(
+        "INSERT INTO alp.demand_planning (status, qty) VALUES \
+            ('validated', 10), ('draft', 20), ('validated', 30)",
+    )
+    .expect("seed dp");
+    Spi::run(
+        "INSERT INTO alp.sales_simulation (dem_plan_id, product_id, qty_sales) VALUES \
+            (1, 100, 5), (1, 101, 7), (2, 100, 3), (3, 102, 11)",
+    )
+    .expect("seed ss");
+
+    // JOIN with bare-name column qualifiers — same shape as the customer IMV.
+    let r = crate::create_reflex_ivm(
+        "alp.ivm_sop_forecast_view",
+        "SELECT dem_plan_id, sales_simulation.product_id, \
+                SUM(qty_sales) AS quantity \
+         FROM alp.sales_simulation \
+         INNER JOIN alp.demand_planning \
+           ON demand_planning.id = sales_simulation.dem_plan_id \
+         WHERE demand_planning.status IN ('validated', 'current') \
+         GROUP BY dem_plan_id, sales_simulation.product_id",
+        None,
+        None,
+        Some("DEFERRED"),
+    );
+    assert_eq!(r, "CREATE REFLEX INCREMENTAL VIEW");
+
+    // Customer-reported failing statement.
+    Spi::run("UPDATE alp.demand_planning SET status = 'validated' WHERE id = 2")
+        .expect("update dp");
+    Spi::run("SELECT public.reflex_flush_deferred('alp.demand_planning')").expect("flush dp");
+
+    // Also exercise the sister source (sales_simulation uses bare
+    // `sales_simulation.product_id` qualifiers in the base_query) under all
+    // three op shapes: INSERT, DELETE, UPDATE.
+    Spi::run("INSERT INTO alp.sales_simulation (dem_plan_id, product_id, qty_sales) VALUES (2, 100, 9)")
+        .expect("insert ss");
+    Spi::run("SELECT public.reflex_flush_deferred('alp.sales_simulation')").expect("flush ss insert");
+
+    Spi::run("DELETE FROM alp.sales_simulation WHERE dem_plan_id = 1 AND product_id = 101")
+        .expect("delete ss");
+    Spi::run("SELECT public.reflex_flush_deferred('alp.sales_simulation')").expect("flush ss delete");
+
+    Spi::run("UPDATE alp.sales_simulation SET qty_sales = qty_sales + 100 WHERE dem_plan_id = 1")
+        .expect("update ss");
+    Spi::run("SELECT public.reflex_flush_deferred('alp.sales_simulation')").expect("flush ss update");
+
+    // The flush must not have set last_error.
+    let err: Option<String> = Spi::get_one::<&str>(
+        "SELECT last_error FROM public.__reflex_ivm_reference \
+         WHERE name = 'alp.ivm_sop_forecast_view'",
+    )
+    .expect("read last_error")
+    .map(|s| s.to_string());
+    assert!(
+        err.is_none(),
+        "flush should not record an error, got: {:?}",
+        err
+    );
+
+    let fresh = "SELECT dem_plan_id, sales_simulation.product_id, \
+                        SUM(qty_sales) AS quantity \
+                 FROM alp.sales_simulation \
+                 INNER JOIN alp.demand_planning \
+                   ON demand_planning.id = sales_simulation.dem_plan_id \
+                 WHERE demand_planning.status IN ('validated', 'current') \
+                 GROUP BY dem_plan_id, sales_simulation.product_id";
+    let mismatches = Spi::get_one::<i64>(&format!(
+        "SELECT COUNT(*) FROM (\
+            (SELECT * FROM alp.ivm_sop_forecast_view EXCEPT ALL SELECT * FROM ({fresh}) f1) \
+            UNION ALL \
+            (SELECT * FROM ({fresh}) f2 EXCEPT ALL SELECT * FROM alp.ivm_sop_forecast_view) \
+         ) o"
+    ))
+    .expect("oracle")
+    .expect("v");
+    assert_eq!(
+        mismatches, 0,
+        "deferred IMV diverged from fresh after JOIN-source UPDATE/INSERT",
+    );
+}
+
 /// Top-K MIN/MAX IMV under narrow search_path. Exercises the per-IMV
 /// `__reflex_shrunk_*` capture table during UPDATE (the N1 path).
 #[pg_test]

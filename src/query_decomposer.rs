@@ -302,9 +302,41 @@ pub fn replace_source_with_delta(
     if source_table.is_empty() {
         return sql.to_string();
     }
-    // Pass 1: rewrite qualified refs `<src>.` -> `<alias>.`.
-    let qualified_from = format!("{}.", source_table);
-    let qualified_to = format!("{}.", alias);
+    // Pass 1: rewrite qualified column refs `<src>.` -> `<alias>.`.
+    let mut out = rewrite_dot_qualifier(sql, source_table, alias);
+    // Pass 1b: when source is schema-qualified, base_query commonly mixes
+    // schema-qualified table refs (`alp.demand_planning`) in FROM with bare
+    // column qualifiers (`demand_planning.id`). The bare form must be
+    // rewritten too, otherwise downstream callers of
+    // `replace_source_with_transition` (e.g. deferred flush, which pre-feeds a
+    // pre-rewritten base into `reflex_build_delta_sql`) wholesale-replace the
+    // bare token with a transition-table name that is not in scope, producing
+    // `missing FROM-clause entry for table "__reflex_new_<src>"`.
+    let (schema, bare) = split_qualified_name(source_table);
+    let is_schema_qualified = schema.is_some() && bare != source_table;
+    if is_schema_qualified {
+        out = rewrite_dot_qualifier(&out, bare, alias);
+    }
+    // Pass 2: rewrite standalone `<src>` (FROM/JOIN positions) -> `<subquery> AS <effective_alias>`.
+    out = replace_standalone_source_with_subquery(&out, source_table, subquery, alias);
+    // Pass 2b: when source is schema-qualified, also rewrite standalone
+    // bare-name FROM/JOIN positions (`FROM demand_planning` written without a
+    // schema even though the registered source is `alp.demand_planning`).
+    // Mirrors `replace_source_with_transition`'s symmetric handling so a user
+    // who omits the schema in the SELECT body doesn't end up with an
+    // unrewritten table reference in the deferred-flush SQL.
+    if is_schema_qualified {
+        out = replace_standalone_source_with_subquery(&out, bare, subquery, alias);
+    }
+    out
+}
+
+/// Rewrite `<name>.` to `<replacement>.` respecting left-side word boundaries.
+/// Shared between Pass 1 (schema-qualified) and Pass 1b (bare-name) of
+/// [`replace_source_with_delta`].
+fn rewrite_dot_qualifier(sql: &str, name: &str, replacement: &str) -> String {
+    let qualified_from = format!("{}.", name);
+    let qualified_to = format!("{}.", replacement);
     let mut out = String::with_capacity(sql.len());
     let bytes = sql.as_bytes();
     let pat = qualified_from.as_bytes();
@@ -324,8 +356,50 @@ pub fn replace_source_with_delta(
         out.push(bytes[i] as char);
         i += 1;
     }
-    // Pass 2: rewrite standalone `<src>` (FROM/JOIN positions) -> `<subquery> AS <effective_alias>`.
-    replace_standalone_source_with_subquery(&out, source_table, subquery, alias)
+    out
+}
+
+/// When `source_table` is schema-qualified (`schema.bare`) and the user has
+/// aliased the source with the bare name (`FROM schema.bare AS bare` or
+/// `FROM schema.bare bare`), strip that redundant alias clause.
+///
+/// Motivation: callers that go on to wholesale-replace bare `<bare>.col`
+/// qualifiers (e.g. `replace_source_with_transition`'s step 2) otherwise
+/// produce SQL like `FROM "__reflex_new_<src>" AS <bare> WHERE "__reflex_new_<src>".col`,
+/// which is rejected by PG because the alias `<bare>` hides the table's own
+/// name. Stripping the alias before the rewrite collapses both sides to the
+/// unaliased table.
+pub fn strip_redundant_bare_alias(sql: &str, source_table: &str) -> String {
+    let (schema, bare) = split_qualified_name(source_table);
+    if schema.is_none() || bare == source_table {
+        return sql.to_string();
+    }
+    let bytes = sql.as_bytes();
+    let pat = source_table.as_bytes();
+    let mut out = String::with_capacity(sql.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if i + pat.len() <= bytes.len() && &bytes[i..i + pat.len()] == pat {
+            let before_ok = i == 0
+                || !(bytes[i - 1].is_ascii_alphanumeric()
+                    || bytes[i - 1] == b'_'
+                    || bytes[i - 1] == b'.');
+            let after_pos = i + pat.len();
+            let after_ok = after_pos >= bytes.len()
+                || !(bytes[after_pos].is_ascii_alphanumeric() || bytes[after_pos] == b'_');
+            if before_ok && after_ok {
+                let (user_alias, consumed_to) = consume_table_alias(bytes, after_pos);
+                if matches!(&user_alias, Some(a) if a == bare) {
+                    out.push_str(source_table);
+                    i = consumed_to;
+                    continue;
+                }
+            }
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
 }
 
 /// Byte-scanner variant of [`replace_identifier`] that also consumes an existing
@@ -339,6 +413,7 @@ fn replace_standalone_source_with_subquery(
 ) -> String {
     let bytes = sql.as_bytes();
     let pat = source_table.as_bytes();
+    let bare_source = split_qualified_name(source_table).1;
     let mut out = String::with_capacity(sql.len() + subquery.len());
     let mut i = 0;
     while i < bytes.len() {
@@ -357,7 +432,18 @@ fn replace_standalone_source_with_subquery(
                 || !(bytes[after_pos].is_ascii_alphanumeric() || bytes[after_pos] == b'_');
             if before_ok && after_ok && !after_as {
                 let (user_alias, consumed_to) = consume_table_alias(bytes, after_pos);
-                let effective = user_alias.as_deref().unwrap_or(default_alias);
+                // When the user aliased the source with its bare name
+                // (`FROM alp.t AS t`), the alias hides the table's own name
+                // in PG semantics. Pass 1b will have rewritten `<bare>.col`
+                // qualifiers to `<default_alias>.col`, so the emitted FROM
+                // alias must also be the default — otherwise the qualifier
+                // (`__dt.col`) and the FROM alias (`AS t`) diverge and PG
+                // raises `missing FROM-clause entry`.
+                let effective = match &user_alias {
+                    Some(a) if a == bare_source => default_alias,
+                    Some(a) => a.as_str(),
+                    None => default_alias,
+                };
                 out.push_str(subquery);
                 out.push_str(" AS ");
                 out.push_str(effective);

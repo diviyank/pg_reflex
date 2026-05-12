@@ -1,0 +1,39 @@
+-- Migration: pg_reflex 1.4.1 → 1.4.2
+--
+-- Run via: ALTER EXTENSION pg_reflex UPDATE TO '1.4.2';
+--
+-- Bug fix release. No additive features. No catalog rewrites.
+--
+-- Fixed:
+--
+--   * DEFERRED-mode flush failed with `42P01 missing FROM-clause entry for
+--     table "__reflex_new_<src>"` on schema-qualified IMVs whose base query
+--     uses bare-name column qualifiers (e.g. `demand_planning.id` while the
+--     FROM clause is `FROM alp.demand_planning`). Reproduced against a
+--     customer workload: `UPDATE alp.demand_planning SET status = …` raised
+--     the error inside `reflex_flush_deferred` for any IMV that JOINed
+--     across multiple `alp.*` sources.
+--
+--     Root cause: `replace_source_with_delta` (deferred-flush path) only
+--     rewrote `<schema>.<table>.col` column qualifiers and left bare
+--     `<table>.col` untouched. The subsequent `replace_source_with_transition`
+--     pass then wholesale-replaced the surviving bare `<table>` token with
+--     the transition-table name — but that table is not in the deferred-flush
+--     FROM clause (which uses a delta subquery aliased `__dt`), so PG raised
+--     42P01.
+--
+--   * Two adjacent gaps fixed at the same time, for parity with
+--     `replace_source_with_transition`:
+--       - `FROM bare_table` (no schema) when the registered source is
+--         `schema.bare_table` is now rewritten (Pass 2b).
+--       - `FROM schema.t AS t` (alias = bare-source name): the alias is
+--         dropped/consumed and the default alias `__dt` is emitted instead.
+--         Without this, PG raises 42P01 because the explicit alias `t` hides
+--         the underlying table's own name. Mirrored in immediate-mode
+--         `replace_source_with_transition` via a pre-pass that strips the
+--         redundant alias before the bare-name qualifier rewrite runs.
+--
+-- No IMVs need to be rebuilt. The bug was entirely in SQL generated at
+-- flush time. After `ALTER EXTENSION pg_reflex UPDATE TO '1.4.2'`, existing
+-- backends may still serve cached delta SQL from before the upgrade — open a
+-- fresh connection to pick up the fix.

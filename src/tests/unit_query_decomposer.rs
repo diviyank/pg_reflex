@@ -319,6 +319,147 @@ fn test_replace_source_with_delta_rejects_follow_keyword_as_alias() {
 }
 
 #[test]
+fn test_replace_source_with_delta_schema_qualified_bare_from() {
+    // Gap 1: source registered as `alp.demand_planning` but the user wrote
+    // `FROM demand_planning` (no schema) in the SELECT body. Pass 2's
+    // schema-qualified scan would miss it; Pass 2b on the bare name must
+    // catch it.
+    let result = replace_source_with_delta(
+        "SELECT demand_planning.id FROM demand_planning WHERE demand_planning.status = 'x'",
+        "alp.demand_planning",
+        "(SUBQ)",
+        "__dt",
+    );
+    assert!(
+        result.contains("FROM (SUBQ) AS __dt"),
+        "bare-name FROM must be rewritten: {}",
+        result
+    );
+    assert!(
+        result.contains("__dt.id"),
+        "bare-name column qualifier rewritten: {}",
+        result
+    );
+    assert!(
+        result.contains("__dt.status"),
+        "bare-name column qualifier rewritten: {}",
+        result
+    );
+    assert!(
+        !result.contains("FROM demand_planning"),
+        "no stray bare FROM remains: {}",
+        result
+    );
+}
+
+#[test]
+fn test_replace_source_with_delta_alias_equals_bare_source_name() {
+    // Gap 2: user explicitly aliases the source with its bare name
+    // (`FROM alp.t AS t WHERE t.col = 1`). Pass 1b rewrites `t.col` to
+    // `__dt.col`, so Pass 2 must NOT keep the user's alias `t` (that would
+    // leave a `(SUBQ) AS t` / `__dt.col` divergence). Instead, consume the
+    // alias text and emit the default alias.
+    let result = replace_source_with_delta(
+        "SELECT t.col FROM alp.t AS t WHERE t.col = 1",
+        "alp.t",
+        "(SUBQ)",
+        "__dt",
+    );
+    assert!(
+        result.contains("FROM (SUBQ) AS __dt"),
+        "alias collision: must emit default alias: {}",
+        result
+    );
+    assert!(
+        result.contains("__dt.col"),
+        "column qualifier `t.col` must be rewritten to `__dt.col`: {}",
+        result
+    );
+    assert!(
+        !result.contains(" AS t "),
+        "the colliding user alias must be dropped, not preserved: {}",
+        result
+    );
+}
+
+#[test]
+fn test_replace_source_with_delta_alias_equals_bare_source_name_no_as() {
+    // Same as above but bare-alias form `FROM alp.t t` (no AS keyword).
+    let result = replace_source_with_delta(
+        "SELECT t.col FROM alp.t t WHERE t.col = 1",
+        "alp.t",
+        "(SUBQ)",
+        "__dt",
+    );
+    assert!(
+        result.contains("FROM (SUBQ) AS __dt"),
+        "bare-alias collision: default alias: {}",
+        result
+    );
+    assert!(result.contains("__dt.col"));
+    // The bare alias text `t` must be consumed (not re-emitted as `__dt t`).
+    assert!(
+        !result.contains("__dt t"),
+        "consumed alias must not be left in output: {}",
+        result
+    );
+}
+
+#[test]
+fn test_replace_source_with_delta_schema_qualified_bare_column_qualifiers() {
+    // Regression: when `source_table` is schema-qualified (`alp.demand_planning`),
+    // base_query often uses the BARE form (`demand_planning.col`) for column
+    // qualifiers — even though the FROM/JOIN itself is schema-qualified. The
+    // rewrite must replace BOTH `alp.demand_planning.col` and bare
+    // `demand_planning.col` with `<alias>.col`.
+    //
+    // Why this matters: in the deferred-flush path, the result of this
+    // function is handed back into `reflex_build_delta_sql`, which calls
+    // `replace_source_with_transition` on the bare source name. If bare-name
+    // column qualifiers survive Pass 1, that second pass rewrites every
+    // `demand_planning.<col>` to `"__reflex_new_alp_demand_planning".<col>` —
+    // but the transition table is not in the FROM clause (the FROM was already
+    // rewritten to a delta subquery here). PostgreSQL then raises 42P01
+    // "missing FROM-clause entry for table __reflex_new_alp_demand_planning".
+    let result = replace_source_with_delta(
+        "SELECT demand_planning.id, sales_simulation.dem_plan_id \
+         FROM alp.sales_simulation \
+         INNER JOIN alp.demand_planning \
+           ON demand_planning.id = sales_simulation.dem_plan_id \
+         WHERE demand_planning.status = 'validated'",
+        "alp.demand_planning",
+        "(SUBQ)",
+        "__dt",
+    );
+    assert!(
+        result.contains("__dt.id"),
+        "bare `demand_planning.id` must be rewritten to `__dt.id`: {}",
+        result
+    );
+    assert!(
+        result.contains("__dt.status"),
+        "bare `demand_planning.status` must be rewritten to `__dt.status`: {}",
+        result
+    );
+    assert!(
+        result.contains("JOIN (SUBQ) AS __dt"),
+        "schema-qualified FROM/JOIN must be rewritten to subquery+alias: {}",
+        result
+    );
+    assert!(
+        !result.contains("demand_planning."),
+        "no bare `demand_planning.` qualifier may survive (would be mis-rewritten downstream): {}",
+        result
+    );
+    // `sales_simulation.dem_plan_id` is for a DIFFERENT source — must not be touched.
+    assert!(
+        result.contains("sales_simulation.dem_plan_id"),
+        "unrelated table qualifier must be preserved: {}",
+        result
+    );
+}
+
+#[test]
 fn test_replace_source_with_delta_only_qualified() {
     // If every reference is qualified (no standalone FROM <src>), the
     // helper should still rewrite all of them to use the alias prefix.

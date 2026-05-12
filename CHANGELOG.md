@@ -1,5 +1,62 @@
 # Changelog
 
+## [1.4.2] - 2026-05-12
+
+### Fixed
+- **DEFERRED-mode flush failed on schema-qualified IMVs that JOIN across
+  multiple sources and qualify columns with bare table names.** Customer
+  workload: `UPDATE alp.demand_planning SET status = 'validated' WHERE id = …`
+  on an IMV defined as
+  ```sql
+  SELECT … FROM alp.sales_simulation
+  INNER JOIN alp.demand_planning ON demand_planning.id = sales_simulation.dem_plan_id
+  …
+  ```
+  raised
+  ```
+  WARNING:  pg_reflex: IMV alp.ivm_sop_forecast_view flush failed at cascade:
+  missing FROM-clause entry for table "__reflex_new_alp_demand_planning"
+  (SQLSTATE 42P01)
+  ```
+  inside `reflex_flush_deferred`. Root cause: the deferred path pre-rewrites
+  the base query (`replace_source_with_delta`) and then hands it back into
+  `reflex_build_delta_sql`, which calls `replace_source_with_transition`. The
+  first pass only rewrote schema-qualified column refs (`alp.demand_planning.col`
+  → `__dt.col`) and left bare `demand_planning.col` untouched; the second pass
+  then wholesale-replaced the surviving bare token with the transition-table
+  name — but that table is not in the deferred-flush FROM clause (a delta
+  subquery aliased `__dt` is). Pass 1b in `replace_source_with_delta` now also
+  rewrites bare-name column qualifiers when the source is schema-qualified.
+
+- **Two adjacent gaps in source rewriting fixed for parity:**
+  - `FROM bare_table` written without a schema when the registered source is
+    `schema.bare_table` is now also rewritten (Pass 2b in
+    `replace_source_with_delta`, symmetric with the bare-name pass in
+    `replace_source_with_transition`).
+  - `FROM schema.t AS t` (alias matching the bare-source name): the alias is
+    now consumed and the default alias (`__dt` in deferred, the unaliased
+    transition table in immediate) is emitted instead. Without this, the
+    rewritten qualifiers (`__dt.col` or `"__reflex_new_alp_t".col`) point at
+    a name the user's explicit alias hides, and PG raises 42P01.
+    Mirrored in `replace_source_with_transition` via a new
+    `strip_redundant_bare_alias` pre-pass.
+
+### Tests
+- 526 lib tests (up from 519): 6 new unit tests covering the three
+  qualifier-rewrite shapes (bare column qualifier under schema-qualified
+  source; bare-name FROM under schema-qualified source; alias-equals-bare
+  collision in both `replace_source_with_delta` and
+  `replace_source_with_transition`).
+- 1 new `pg_test_deferred_join_schema_qualified_with_bare_column_qualifiers`
+  integration test reproducing the customer IMV shape end-to-end across
+  INSERT, DELETE and UPDATE on the JOIN sources, with an `EXCEPT ALL` oracle
+  against the fresh query.
+
+### Migration
+- `ALTER EXTENSION pg_reflex UPDATE TO '1.4.2'`. No catalog rewrites; no IMV
+  rebuilds. Existing backends may still serve cached delta SQL from before
+  the upgrade — open a fresh connection to pick up the fix.
+
 ## [1.4.1] - 2026-05-11
 
 ### Fixed

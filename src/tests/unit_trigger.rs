@@ -427,6 +427,81 @@ fn test_replace_source_with_transition_schema_qualified() {
 }
 
 #[test]
+fn test_replace_source_with_transition_alias_equals_bare_source_name() {
+    // Parity with replace_source_with_delta gap 2: when the user has aliased
+    // the schema-qualified source with its bare name (`FROM alp.t AS t`), the
+    // alias hides the underlying table's own name in PG. Without the
+    // pre-pass strip, step 2 of replace_source_with_transition rewrites
+    // `t.col` qualifiers to `"__reflex_new_alp_t".col`, but PG raises 42P01
+    // because the alias hides that name. The fix strips the redundant alias
+    // first so both the FROM and the qualifiers collapse to the bare table.
+    let base = "SELECT t.col FROM alp.t AS t WHERE t.col = 1";
+    let result = replace_source_with_transition(base, "alp.t", "__reflex_new_alp_t");
+    assert!(
+        result.contains("FROM \"__reflex_new_alp_t\""),
+        "FROM rewritten to transition table: {}",
+        result
+    );
+    // The colliding alias must be stripped — otherwise PG raises 42P01 on the
+    // rewritten qualifiers.
+    assert!(
+        !result.contains(" AS t "),
+        "redundant alias must be stripped: {}",
+        result
+    );
+    // Both qualifier occurrences should now reference the transition table.
+    assert_eq!(
+        result.matches("\"__reflex_new_alp_t\".col").count(),
+        2,
+        "both `t.col` qualifiers should resolve to the transition table: {}",
+        result
+    );
+}
+
+#[test]
+fn test_replace_source_with_transition_alias_equals_bare_source_name_no_as() {
+    // Bare-alias form `FROM alp.t t` — same collision.
+    let base = "SELECT t.col FROM alp.t t WHERE t.col = 1";
+    let result = replace_source_with_transition(base, "alp.t", "__reflex_new_alp_t");
+    assert!(
+        result.contains("FROM \"__reflex_new_alp_t\""),
+        "FROM rewritten: {}",
+        result
+    );
+    // The bare alias text must be consumed, not left dangling as `"…" t`.
+    assert!(
+        !result.contains("\"__reflex_new_alp_t\" t "),
+        "consumed bare alias must not be left in output: {}",
+        result
+    );
+    assert_eq!(
+        result.matches("\"__reflex_new_alp_t\".col").count(),
+        2,
+        "both qualifiers point at transition table: {}",
+        result
+    );
+}
+
+#[test]
+fn test_replace_source_with_transition_distinct_user_alias_preserved() {
+    // Counter-test: when the user picks an alias that DOES NOT collide with
+    // the bare-source name (`FROM alp.t AS my_t`), the alias must be
+    // preserved as-is and qualifier rewriting must not touch `my_t.col`.
+    let base = "SELECT my_t.col FROM alp.t AS my_t WHERE my_t.col = 1";
+    let result = replace_source_with_transition(base, "alp.t", "__reflex_new_alp_t");
+    assert!(
+        result.contains("FROM \"__reflex_new_alp_t\" AS my_t"),
+        "distinct user alias must be preserved: {}",
+        result
+    );
+    assert!(
+        result.contains("my_t.col"),
+        "distinct alias qualifiers must not be rewritten: {}",
+        result
+    );
+}
+
+#[test]
 fn test_replace_source_with_transition_unqualified() {
     let base_query = "SELECT city, SUM(amount) FROM orders GROUP BY city";
     let result = replace_source_with_transition(base_query, "orders", "__reflex_new_orders");

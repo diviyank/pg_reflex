@@ -13,8 +13,8 @@ use crate::query_decomposer::{
     affected_groups_table_name, delta_scratch_table_name, intermediate_table_name,
     normalized_column_name, passthrough_scratch_new_table_name, passthrough_scratch_old_table_name,
     quote_identifier, replace_identifier, replace_source_with_delta, shrunk_groups_table_name,
-    split_qualified_name, staging_delta_table_name, transition_new_table_name,
-    transition_old_table_name,
+    split_qualified_name, staging_delta_table_name, strip_redundant_bare_alias,
+    transition_new_table_name, transition_old_table_name,
 };
 
 /// Per-backend cache of built delta SQL keyed by a hash of all inputs.
@@ -830,10 +830,16 @@ fn replace_source_with_transition(
     } else {
         format!("\"{}\"", transition_tbl)
     };
+    // Pre-pass: strip a redundant `AS <bare>` alias when the user aliased the
+    // schema-qualified source with its bare name. Without this, step 2 below
+    // would rewrite `<bare>.col` qualifiers to `<transition_tbl>.col` — but PG
+    // treats the explicit alias as hiding the underlying table's own name, so
+    // those rewritten qualifiers would fail to resolve.
+    let stripped = strip_redundant_bare_alias(base_query, source_table);
     // Use word-boundary-aware replacement to avoid corrupting column names
     // that contain the source table name as a substring (e.g., __bool_or_flag
     // contains "bo" when the source table is "bo").
-    let replaced = replace_identifier(base_query, source_table, &quoted_tbl);
+    let replaced = replace_identifier(&stripped, source_table, &quoted_tbl);
     // Also replace unqualified table name in column qualifiers
     let (_, bare_source) = split_qualified_name(source_table);
     if bare_source != source_table {
