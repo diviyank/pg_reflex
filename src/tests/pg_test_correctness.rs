@@ -1703,6 +1703,201 @@ fn test_correctness_groupby_window_rerank() {
     assert_imv_correct("gwr_view", fresh);
 }
 
+// ========================================================================
+// Group N — null_safe_in outer-column-scope bug regression (2026-05-13)
+//
+// Three integration tests catching the bug that almost shipped in 1.4.4:
+//
+//   1. test_aliased_group_by_no_full_refresh — IMV with `SELECT col AS alias`.
+//      EXCEPT ALL oracle alone does NOT catch the bug (the buggy
+//      DELETE-all + INSERT-all lands at the correct end state). We compare
+//      `ctid` snapshots of the target before / after UPDATE: if every row's
+//      ctid was rewritten, the trigger silently degenerated to full refresh.
+//
+//   2. test_plain_group_by_no_full_refresh — same shape, no aliasing — to
+//      verify the bug fires even without aliasing (inner-scope-wins always
+//      applies when outer and __a share names, which is always true).
+//
+//   3. test_aliased_group_by_delete_no_full_refresh — DELETE shape, same
+//      property check on ctids.
+// ========================================================================
+
+/// Helper: count target rows whose ctid is unchanged between two snapshots.
+/// After a correct incremental UPDATE most rows keep their ctid; after a
+/// buggy full-refresh DELETE+INSERT every ctid changes.
+fn count_unchanged_ctids(target: &str, snapshot: &str, key_expr: &str) -> i64 {
+    let sql = format!(
+        "SELECT COUNT(*) FROM {snapshot} s JOIN {target} t ON {key_expr} WHERE s.__snap_ctid = t.ctid"
+    );
+    Spi::get_one::<i64>(&sql)
+        .expect("count_unchanged_ctids query failed")
+        .expect("count returned NULL")
+}
+
+/// Aliased GROUP BY column (`SELECT dp.id AS dem_plan_id ...`). Target
+/// carries `dem_plan_id`; intermediate / affected carry `id`. Pre-fix, the
+/// generated EXISTS predicate was `"id" = __a."id"` — unqualified outer
+/// resolves to inner `__a` scope, the DELETE FROM target degenerates to a
+/// one-time TRUE filter, and every UPDATE rewrites the whole target.
+#[pg_test]
+fn pg_test_correctness_aliased_group_by_no_full_refresh() {
+    Spi::run("CREATE TABLE alias_dp (id INT NOT NULL PRIMARY KEY, status TEXT NOT NULL)")
+        .expect("create alias_dp");
+    Spi::run("CREATE TABLE alias_ss (dp_id INT NOT NULL, sku INT NOT NULL, qty INT NOT NULL)")
+        .expect("create alias_ss");
+    Spi::run("INSERT INTO alias_dp SELECT i, 'validated' FROM generate_series(1, 10) i")
+        .expect("seed dp");
+    Spi::run(
+        "INSERT INTO alias_ss SELECT (i % 10) + 1, (i % 50) + 1, (i % 100) + 1 \
+         FROM generate_series(1, 5000) i",
+    )
+    .expect("seed ss");
+
+    Spi::run(
+        "SELECT create_reflex_ivm('alias_imv', \
+         'SELECT dp.id AS dem_plan_id, ss.sku, SUM(ss.qty)::BIGINT AS total \
+          FROM alias_ss ss JOIN alias_dp dp ON dp.id = ss.dp_id \
+          WHERE dp.status = ''validated'' \
+          GROUP BY dp.id, ss.sku')",
+    )
+    .expect("create alias_imv");
+
+    let initial = Spi::get_one::<i64>("SELECT COUNT(*) FROM alias_imv")
+        .expect("q")
+        .expect("v");
+    assert!(initial > 0, "IMV must be populated; got {}", initial);
+
+    Spi::run("DROP TABLE IF EXISTS alias_imv_snapshot").expect("drop snapshot");
+    Spi::run(
+        "CREATE TABLE alias_imv_snapshot AS \
+         SELECT dem_plan_id, sku, ctid AS __snap_ctid FROM alias_imv",
+    )
+    .expect("snapshot");
+
+    Spi::run("UPDATE alias_dp SET status = 'validated' WHERE id = 1").expect("update");
+
+    // End-state oracle — passes even when buggy.
+    assert_imv_correct(
+        "alias_imv",
+        "SELECT dp.id AS dem_plan_id, ss.sku, SUM(ss.qty)::BIGINT AS total \
+         FROM alias_ss ss JOIN alias_dp dp ON dp.id = ss.dp_id \
+         WHERE dp.status = 'validated' \
+         GROUP BY dp.id, ss.sku",
+    );
+
+    // Shape oracle: how many ctids survived the UPDATE? Incremental refresh
+    // leaves all non-affected rows' ctids untouched. Buggy full refresh
+    // rewrites every row → unchanged == 0.
+    let unchanged = count_unchanged_ctids(
+        "alias_imv",
+        "alias_imv_snapshot",
+        "s.dem_plan_id = t.dem_plan_id AND s.sku = t.sku",
+    );
+    let post_count = Spi::get_one::<i64>("SELECT COUNT(*) FROM alias_imv")
+        .expect("post-q")
+        .expect("v");
+
+    // dp.id=1 × any sku that has a row → ~50 affected. The other ~450
+    // groups must keep their ctid. Allow generous slack (100) for any
+    // legitimate rewrites.
+    assert!(
+        unchanged >= post_count - 100,
+        "UPDATE rewrote {} of {} target rows (unchanged={}). \
+         This is the 2026-05-13 null_safe_in bug: the EXISTS predicate's \
+         unqualified outer col resolved to inner __a scope, so DELETE FROM \
+         target wiped the whole target on every UPDATE.",
+        post_count - unchanged,
+        post_count,
+        unchanged
+    );
+}
+
+/// Plain GROUP BY (no aliasing). Even when target_col == affected_col by
+/// name, the unqualified outer ref still resolves to inner __a scope. This
+/// test pins the fix for the non-aliased path.
+#[pg_test]
+fn pg_test_correctness_plain_group_by_no_full_refresh() {
+    Spi::run("CREATE TABLE plain_src (id SERIAL, grp INT NOT NULL, val INT NOT NULL)")
+        .expect("create plain_src");
+    Spi::run("INSERT INTO plain_src (grp, val) SELECT i % 20, i FROM generate_series(1, 2000) i")
+        .expect("seed");
+
+    Spi::run(
+        "SELECT create_reflex_ivm('plain_imv', \
+         'SELECT grp, SUM(val)::BIGINT AS s FROM plain_src GROUP BY grp')",
+    )
+    .expect("create plain_imv");
+
+    Spi::run("DROP TABLE IF EXISTS plain_imv_snapshot").expect("drop snapshot");
+    Spi::run("CREATE TABLE plain_imv_snapshot AS SELECT grp, ctid AS __snap_ctid FROM plain_imv")
+        .expect("snapshot");
+
+    Spi::run("UPDATE plain_src SET val = val + 1 WHERE grp = 3").expect("update");
+
+    assert_imv_correct(
+        "plain_imv",
+        "SELECT grp, SUM(val)::BIGINT AS s FROM plain_src GROUP BY grp",
+    );
+
+    let unchanged = count_unchanged_ctids("plain_imv", "plain_imv_snapshot", "s.grp = t.grp");
+    let post_count = Spi::get_one::<i64>("SELECT COUNT(*) FROM plain_imv")
+        .expect("post-q")
+        .expect("v");
+    // 1 group changed (grp=3), 19 others should keep their ctid.
+    assert!(
+        unchanged >= post_count - 2,
+        "Plain-grouped UPDATE rewrote {} of {} rows (unchanged={}). \
+         Expected ~1 row rewritten (the affected group). \
+         null_safe_in outer-scope bug regression.",
+        post_count - unchanged,
+        post_count,
+        unchanged
+    );
+}
+
+/// DELETE shape on the source — same outer-scope bug surfaces here too
+/// (the dead-row cleanup DELETE on intermediate and the DELETE-FROM-target
+/// both go through the same buggy null_safe_in).
+#[pg_test]
+fn pg_test_correctness_aliased_group_by_delete_no_full_refresh() {
+    Spi::run("CREATE TABLE del_src (id SERIAL, grp INT NOT NULL, val INT NOT NULL)")
+        .expect("create del_src");
+    Spi::run("INSERT INTO del_src (grp, val) SELECT i % 20, i FROM generate_series(1, 2000) i")
+        .expect("seed");
+
+    Spi::run(
+        "SELECT create_reflex_ivm('del_imv', \
+         'SELECT grp AS bucket, SUM(val)::BIGINT AS s FROM del_src GROUP BY grp')",
+    )
+    .expect("create del_imv");
+
+    Spi::run("DROP TABLE IF EXISTS del_imv_snapshot").expect("drop snapshot");
+    Spi::run("CREATE TABLE del_imv_snapshot AS SELECT bucket, ctid AS __snap_ctid FROM del_imv")
+        .expect("snapshot");
+
+    Spi::run("DELETE FROM del_src WHERE grp = 7").expect("delete");
+
+    assert_imv_correct(
+        "del_imv",
+        "SELECT grp AS bucket, SUM(val)::BIGINT AS s FROM del_src GROUP BY grp",
+    );
+
+    let unchanged = count_unchanged_ctids("del_imv", "del_imv_snapshot", "s.bucket = t.bucket");
+    let post_count = Spi::get_one::<i64>("SELECT COUNT(*) FROM del_imv")
+        .expect("post-q")
+        .expect("v");
+    // bucket=7 was deleted, so post_count = 19 and unchanged should be 19.
+    assert!(
+        unchanged >= post_count,
+        "Aliased-output DELETE rewrote {} of {} rows (unchanged={}). \
+         Expected 0 rows rewritten (the affected group was deleted entirely from target). \
+         null_safe_in outer-scope bug regression.",
+        post_count - unchanged,
+        post_count,
+        unchanged
+    );
+}
+
 /// Empty INSERT (INSERT ... SELECT ... WHERE FALSE) — 0 rows
 #[pg_test]
 fn test_correctness_empty_insert() {

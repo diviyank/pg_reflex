@@ -732,25 +732,51 @@ fn build_min_max_recompute_sql_inner(
 /// avoids the seq-scan-with-IS-NOT-DISTINCT-FROM fallback that, on a 900K
 /// intermediate and 47K affected rows, costs several seconds per UPDATE.
 ///
-/// `cols` is the list of group column names (already quoted as `"col"`).
-/// `not_null_columns` is `plan.not_null_columns` — bare unquoted source-column
-/// names known NOT NULL at IMV-create time. The lookup uses the unquoted col
-/// name; columns whose output alias differs from the source-bare name (e.g.
-/// `SELECT col AS my_alias`) safely fall back to `IS NOT DISTINCT FROM`.
+/// `outer_qualifier` is the unambiguous reference to the outer table or
+/// subquery the EXISTS predicate is being attached to (e.g.
+/// `"rb"."fcast"` for a DELETE-from-target, or `"rb"."__reflex_intermediate_v"`
+/// for an INSERT-into-target whose SELECT reads from the intermediate, or
+/// `"__full"` for a base_query-derived subquery alias). The outer column
+/// reference is emitted as `<outer_qualifier>.<outer_col>` so the bind is to
+/// the outer scope, NOT the inner `__a.<col>` scope. Without this qualifier
+/// Postgres's name-resolution picks the inner scope whenever the outer and
+/// `__a` share column names (always true in practice — the affected table is
+/// populated from intermediate-named cols), and the predicate degenerates to
+/// `__a.<col> = __a.<col>` (a one-time TRUE filter that wipes the whole
+/// outer relation on DELETE / re-inserts the whole intermediate on INSERT).
+/// See `journal/2026-05-13_null_safe_in_bug.md`.
+///
+/// `outer_cols` and `affected_cols` are parallel quoted column lists. Their
+/// names may differ when the IMV's SELECT aliases a GROUP BY column (e.g.,
+/// `SELECT dp.id AS dem_plan_id ... GROUP BY dp.id` ⇒ target has
+/// `dem_plan_id`, intermediate and affected keep `id`).
+///
+/// `not_null_columns` is keyed on the affected column's bare name; NOT NULL
+/// cols use `=` (sargable / index-usable), NULLable cols use
+/// `IS NOT DISTINCT FROM` (NULL-safe but not sargable).
 fn null_safe_in(
     affected_tbl: &str,
-    cols: &[String],
+    outer_qualifier: &str,
+    outer_cols: &[String],
+    affected_cols: &[String],
     not_null_columns: &std::collections::HashSet<String>,
 ) -> String {
-    let conditions: Vec<String> = cols
+    debug_assert_eq!(
+        outer_cols.len(),
+        affected_cols.len(),
+        "null_safe_in: outer_cols and affected_cols must have the same length"
+    );
+    let conditions: Vec<String> = outer_cols
         .iter()
-        .map(|c| {
-            let unquoted = c.trim_matches('"');
-            if not_null_columns.contains(unquoted) {
-                format!("{} = __a.{}", c, c)
+        .zip(affected_cols.iter())
+        .map(|(outer_col, aff_col)| {
+            let bare = aff_col.trim_matches('"');
+            let op = if not_null_columns.contains(bare) {
+                "="
             } else {
-                format!("{} IS NOT DISTINCT FROM __a.{}", c, c)
-            }
+                "IS NOT DISTINCT FROM"
+            };
+            format!("{}.{} {} __a.{}", outer_qualifier, outer_col, op, aff_col)
         })
         .collect();
     // `affected_tbl` is already a fully-formed identifier ref (qualified+quoted
@@ -802,17 +828,28 @@ fn splice_before_group_by(query: &str, and_fragment: &str) -> Option<String> {
 /// Splice an affected-groups filter into `end_query` immediately before its `GROUP BY` clause.
 ///
 /// `output_gb_cols` must be pre-quoted column names matching `plan.group_by_columns`.
+/// `outer_qualifier` is the table/subquery the EXISTS predicate references in
+/// `end_query`'s scope — typically the intermediate table identifier, since
+/// `end_query`'s FROM is the intermediate. See `null_safe_in` doc for why
+/// qualifying the outer is mandatory.
 /// Returns `None` if `end_query` contains no ` GROUP BY ` marker (defensive fallback).
 fn inject_affected_filter_before_group_by(
     end_query: &str,
     output_gb_cols: &[String],
     affected_tbl: &str,
+    outer_qualifier: &str,
     not_null_columns: &std::collections::HashSet<String>,
 ) -> Option<String> {
     let upper = end_query.to_uppercase();
     let gb_marker = " GROUP BY ";
     let pos = upper.rfind(gb_marker)?;
-    let filter = null_safe_in(affected_tbl, output_gb_cols, not_null_columns);
+    let filter = null_safe_in(
+        affected_tbl,
+        outer_qualifier,
+        output_gb_cols,
+        output_gb_cols,
+        not_null_columns,
+    );
     Some(format!(
         "{} AND {}{}",
         &end_query[..pos],
@@ -823,7 +860,9 @@ fn inject_affected_filter_before_group_by(
 
 /// Build the group column list for targeted refresh.
 /// Returns quoted column names from group_by + distinct columns (bare names).
-/// Returns None if there are no group columns (sentinel-only case).
+/// These are the *intermediate* (and affected) column names — the affected
+/// table is populated from intermediate naming. Returns None if there are no
+/// group columns (sentinel-only case).
 fn group_columns(plan: &AggregationPlan) -> Option<Vec<String>> {
     let cols: Vec<String> = plan
         .group_by_columns
@@ -836,6 +875,41 @@ fn group_columns(plan: &AggregationPlan) -> Option<Vec<String>> {
     } else {
         Some(cols)
     }
+}
+
+/// Build the parallel column list as the columns appear in the *target*
+/// table. When the user aliases a GROUP BY column (`SELECT dp.id AS
+/// dem_plan_id`), the target table is created with the alias (`dem_plan_id`)
+/// while the intermediate / affected tables keep the source-bare name (`id`).
+/// The returned list is positionally aligned with `group_columns(plan)`
+/// followed by `distinct_columns` — i.e. `target_group_columns(plan)[i]` is
+/// the target-side name of the same column whose intermediate-side name is
+/// `group_columns(plan).unwrap()[i]`.
+fn target_group_columns(plan: &AggregationPlan) -> Vec<String> {
+    // Mirrors `group_columns` (group_by_columns then distinct_columns) but
+    // applies `group_by_aliases` to the GROUP BY side so the returned names
+    // match what's actually stored in the target table. Used when the user
+    // aliases a GROUP BY column (`SELECT col AS alias`); for the
+    // SELECT-DISTINCT path the distinct columns are projected to the target
+    // unaliased (caller is responsible for restricting to distinct_columns
+    // by length when the target doesn't carry them — see end_query_has_group_by
+    // branch, where target = GROUP BY only).
+    plan.group_by_columns
+        .iter()
+        .map(|gb| {
+            let output = plan
+                .group_by_aliases
+                .get(gb)
+                .map(String::as_str)
+                .unwrap_or(gb);
+            format!("\"{}\"", normalized_column_name(output))
+        })
+        .chain(
+            plan.distinct_columns
+                .iter()
+                .map(|c| format!("\"{}\"", normalized_column_name(c))),
+        )
+        .collect()
 }
 
 /// Build SELECT DISTINCT clause for affected group columns.
@@ -1102,26 +1176,58 @@ pub fn reflex_build_delta_sql(
                 affected_tbl, select_expr, delta_q
             ));
 
-            // Delete affected groups from intermediate (NULL-safe)
-            let ns_in_int = null_safe_in(&affected_tbl, cols, &plan.not_null_columns);
+            // Delete affected groups from intermediate. Outer is the
+            // intermediate (its column names match `cols`).
+            let ns_in_int = null_safe_in(
+                &affected_tbl,
+                &intermediate_tbl,
+                cols,
+                cols,
+                &plan.not_null_columns,
+            );
             stmts.push(format!(
                 "DELETE FROM {} WHERE {}",
                 intermediate_tbl, ns_in_int
             ));
 
-            // Re-insert ONLY affected groups from the FULL base_query (reads real source).
-            let ns_in_full = null_safe_in(&affected_tbl, cols, &plan.not_null_columns);
+            // Re-insert ONLY affected groups from the FULL base_query (reads
+            // real source). Outer is the `__full` subquery alias — its
+            // projection columns inherit the intermediate naming (because
+            // `base_query`'s SELECT aliases the GROUP BY cols to the
+            // intermediate-side names).
+            let ns_in_full =
+                null_safe_in(&affected_tbl, "__full", cols, cols, &plan.not_null_columns);
             stmts.push(format!(
                 "INSERT INTO {} SELECT * FROM ({}) AS __full WHERE {}",
                 intermediate_tbl, base_query, ns_in_full
             ));
 
-            // Targeted refresh of target (NULL-safe)
-            let ns_in_tgt = null_safe_in(&affected_tbl, cols, &plan.not_null_columns);
-            stmts.push(format!("DELETE FROM {} WHERE {}", qv, ns_in_tgt));
+            // Targeted refresh of target. Outer for the DELETE is the target
+            // table — its column names may differ from `cols` (the
+            // intermediate / affected naming) when the user aliases GROUP BY
+            // cols in their SELECT (e.g., `dp.id AS dem_plan_id`).
+            let target_cols = target_group_columns(&plan);
+            let ns_in_tgt_delete = null_safe_in(
+                &affected_tbl,
+                &qv,
+                &target_cols,
+                cols,
+                &plan.not_null_columns,
+            );
+            stmts.push(format!("DELETE FROM {} WHERE {}", qv, ns_in_tgt_delete));
+            // For the INSERT INTO target via `end_query`, the appended WHERE
+            // executes inside `end_query`'s scope. `end_query`'s FROM is the
+            // intermediate, so outer is intermediate-named (cols match cols).
+            let ns_in_tgt_insert = null_safe_in(
+                &affected_tbl,
+                &intermediate_tbl,
+                cols,
+                cols,
+                &plan.not_null_columns,
+            );
             stmts.push(format!(
                 "INSERT INTO {} {} AND {}",
-                qv, end_query, ns_in_tgt
+                qv, end_query, ns_in_tgt_insert
             ));
         } else {
             // No group columns: full refresh
@@ -1510,20 +1616,41 @@ pub fn reflex_build_delta_sql(
                 stmts.push(format!("DELETE FROM {}", qv));
                 stmts.push(format!("INSERT INTO {} {}", qv, end_query));
             } else {
+                // Intermediate-side column names (== affected column names).
                 let output_cols: Vec<String> = plan
                     .group_by_columns
                     .iter()
                     .map(|c| format!("\"{}\"", normalized_column_name(c)))
                     .collect();
+                // Target-side column names for the GROUP BY prefix only:
+                // for COUNT-DISTINCT IMVs the target carries the GROUP BY
+                // cols (and aggregate output), but NOT the distinct cols
+                // (those are deduplicated by the aggregation).
+                let target_cols: Vec<String> = target_group_columns(&plan)
+                    .into_iter()
+                    .take(plan.group_by_columns.len())
+                    .collect();
                 match inject_affected_filter_before_group_by(
                     end_query,
                     &output_cols,
                     &affected_tbl,
+                    // `end_query` reads from the intermediate, so the
+                    // injected EXISTS predicate's outer is the intermediate.
+                    &intermediate_tbl,
                     &plan.not_null_columns,
                 ) {
                     Some(spliced_end_q) => {
-                        let ns_in = null_safe_in(&affected_tbl, &output_cols, &plan.not_null_columns);
-                        stmts.push(format!("DELETE FROM {} WHERE {}", qv, ns_in));
+                        // DELETE FROM target: outer is the target table —
+                        // use target-side column names mapped to affected
+                        // (intermediate-side) names.
+                        let ns_in_target = null_safe_in(
+                            &affected_tbl,
+                            &qv,
+                            &target_cols,
+                            &output_cols,
+                            &plan.not_null_columns,
+                        );
+                        stmts.push(format!("DELETE FROM {} WHERE {}", qv, ns_in_target));
                         stmts.push(format!("INSERT INTO {} {}", qv, spliced_end_q));
                     }
                     None => {
@@ -1536,7 +1663,33 @@ pub fn reflex_build_delta_sql(
             stmts.push(metadata_sql);
         } else if let Some(ref cols) = grp_cols {
             let qv = quote_identifier(view_name);
-            let ns_in = null_safe_in(&affected_tbl, cols, &plan.not_null_columns);
+            // Three separate filters needed — the outer scope differs per
+            // statement, and the target column names may differ from the
+            // intermediate/affected column names when the user aliases
+            // GROUP BY cols in their SELECT.
+            //
+            // This branch fires when `end_query` does NOT contain GROUP BY
+            // (passthrough projection from the intermediate or
+            // SELECT-DISTINCT). In both shapes the target table carries the
+            // full `cols` set: aliased GROUP BY entries for GROUP-BY IMVs,
+            // distinct_columns for SELECT-DISTINCT IMVs (no aggregation).
+            // So `target_cols.len()` == `cols.len()` and we pass the full
+            // `cols` as the affected-side list.
+            let target_cols = target_group_columns(&plan);
+            let ns_in_intermediate = null_safe_in(
+                &affected_tbl,
+                &intermediate_tbl,
+                cols,
+                cols,
+                &plan.not_null_columns,
+            );
+            let ns_in_target_delete = null_safe_in(
+                &affected_tbl,
+                &qv,
+                &target_cols,
+                cols,
+                &plan.not_null_columns,
+            );
             if include_dead_cleanup {
                 // Scope dead-row cleanup to groups touched by THIS flush.
                 // The previous unscoped `DELETE FROM intermediate WHERE
@@ -1550,11 +1703,17 @@ pub fn reflex_build_delta_sql(
                 // or has count > 0.
                 stmts.push(format!(
                     "DELETE FROM {} WHERE __ivm_count <= 0 AND {}",
-                    intermediate_tbl, ns_in
+                    intermediate_tbl, ns_in_intermediate
                 ));
             }
-            stmts.push(format!("DELETE FROM {} WHERE {}", qv, ns_in));
-            stmts.push(format!("INSERT INTO {} {} AND {}", qv, end_query, ns_in));
+            stmts.push(format!("DELETE FROM {} WHERE {}", qv, ns_in_target_delete));
+            // INSERT INTO target via `end_query` — end_query reads from the
+            // intermediate, so the appended EXISTS predicate's outer is the
+            // intermediate (column names match the affected naming).
+            stmts.push(format!(
+                "INSERT INTO {} {} AND {}",
+                qv, end_query, ns_in_intermediate
+            ));
             stmts.push(metadata_sql);
         } else {
             let qv = quote_identifier(view_name);

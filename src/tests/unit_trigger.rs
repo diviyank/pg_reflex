@@ -991,6 +991,7 @@ fn test_splice_helper_handles_having_clause() {
         input,
         &["\"grp\"".to_string()],
         "aff_tbl",
+        "int",
         &std::collections::HashSet::new(),
     );
     let spliced = result.expect("should succeed when GROUP BY present");
@@ -1019,6 +1020,7 @@ fn test_splice_helper_returns_none_when_no_group_by() {
         "SELECT COUNT(val) FROM int WHERE __ivm_count > 0",
         &["\"grp\"".to_string()],
         "aff_tbl",
+        "int",
         &std::collections::HashSet::new(),
     );
     assert!(
@@ -1442,4 +1444,277 @@ fn test_delta_sql_cache_consistency() {
         cold, other_plan,
         "different aggregations_json must miss cache"
     );
+}
+
+// =============================================================================
+// Regression: null_safe_in must qualify outer column references.
+//
+// The bug (caught 2026-05-13, would have shipped in 1.4.4 unreleased): the
+// generated EXISTS filter emitted bare unqualified outer column refs like
+// `"id" = __a."id"`. Postgres's name resolution prefers the inner subquery
+// scope when a column is unambiguously present there, so the predicate
+// degenerated to `__a.id = __a.id` (a one-time TRUE filter) for every
+// affected-vs-target / affected-vs-intermediate match. Every UPDATE/DELETE
+// on a grouped IMV silently became a full refresh.
+//
+// These tests assert on the SHAPE of the generated SQL: the EXISTS predicate
+// must qualify the outer-side column with the outer table (or subquery
+// alias) so Postgres binds to the outer scope even when both sides share a
+// column name. We verify both the simple-aligned case (no GROUP BY aliasing)
+// AND the aliased case (`SELECT col AS alias` where target column name
+// differs from intermediate column name) — the latter is the customer-shape
+// that surfaced the bug.
+// =============================================================================
+
+/// Plain GROUP BY IMV with NO alias (target col == intermediate col). The
+/// generated EXISTS still has to qualify the outer because the inner-scope
+/// rule fires whenever names match, not only when they differ.
+#[test]
+fn test_null_safe_in_qualifies_outer_when_target_col_matches_intermediate() {
+    let plan = simple_plan(); // group_by = ["city"], no aliases
+    let agg_json = serde_json::to_string(&plan).unwrap();
+    let base_q = "SELECT city, SUM(amount) AS \"__sum_amount\", COUNT(*) AS __ivm_count FROM orders GROUP BY city";
+    let end_q = "SELECT \"city\", \"__sum_amount\" AS total FROM \"__reflex_intermediate_test_view\" WHERE __ivm_count > 0";
+    let sql = reflex_build_delta_sql(
+        "test_view",
+        "orders",
+        "UPDATE",
+        base_q,
+        end_q,
+        Some(agg_json.as_str()),
+        base_q,
+    );
+
+    // Locate the DELETE FROM target — must NOT contain the buggy bare
+    // `"city" = __a."city"` pattern. Outer must be qualified with the
+    // target table identifier.
+    let del_pos = sql
+        .find("DELETE FROM \"test_view\"")
+        .expect("target DELETE must be present");
+    let del_tail = &sql[del_pos..];
+    let next_stmt = del_tail
+        .find("\n--<<REFLEX_SEP>>--\n")
+        .unwrap_or(del_tail.len());
+    let delete_stmt = &del_tail[..next_stmt];
+
+    assert!(
+        !delete_stmt.contains("WHERE \"city\" ="),
+        "buggy unqualified outer: DELETE filter must NOT use bare `\"city\" = __a.\"city\"` (resolves to inner __a scope). Got: {}",
+        delete_stmt
+    );
+    assert!(
+        delete_stmt.contains("\"test_view\".\"city\""),
+        "target DELETE must qualify outer col as `\"test_view\".\"city\"` so name resolution binds to target. Got: {}",
+        delete_stmt
+    );
+}
+
+/// Customer-shape: IMV aliases a GROUP BY column (`dp.id AS dem_plan_id`).
+/// Target carries `dem_plan_id`; intermediate / affected carry `id`. The
+/// generated DELETE FROM target must reference `target."dem_plan_id"` (NOT
+/// `target."id"` — which doesn't exist on target).
+#[test]
+fn test_null_safe_in_handles_aliased_group_by_column() {
+    let mut plan = AggregationPlan {
+        group_by_columns: vec!["dp.id".to_string()],
+        intermediate_columns: vec![IntermediateColumn {
+            name: "__sum_qty".to_string(),
+            pg_type: "NUMERIC".to_string(),
+            source_aggregate: "SUM".to_string(),
+            source_arg: "qty".to_string(),
+            topk_k: None,
+        }],
+        end_query_mappings: vec![EndQueryMapping {
+            intermediate_expr: "__sum_qty".to_string(),
+            output_alias: "total_qty".to_string(),
+            aggregate_type: "SUM".to_string(),
+            cast_type: None,
+        }],
+        has_distinct: false,
+        needs_ivm_count: true,
+        distinct_columns: vec![],
+        is_passthrough: false,
+        passthrough_columns: vec![],
+        passthrough_key_mappings: std::collections::HashMap::new(),
+        having_clause: None,
+        not_null_columns: ["id"].iter().map(|s| s.to_string()).collect(),
+        group_by_aliases: std::collections::HashMap::new(),
+        output_column_order: vec![],
+    };
+    plan.group_by_aliases
+        .insert("dp.id".to_string(), "dem_plan_id".to_string());
+    let agg_json = serde_json::to_string(&plan).unwrap();
+    let base_q = "SELECT dp.id AS \"id\", SUM(ss.qty) AS \"__sum_qty\", COUNT(*) AS __ivm_count FROM ss JOIN dp ON dp.id = ss.dp_id GROUP BY dp.id";
+    let end_q = "SELECT \"id\" AS \"dem_plan_id\", \"__sum_qty\" AS \"total_qty\" FROM \"__reflex_intermediate_aliased_view\" WHERE __ivm_count > 0";
+    let sql = reflex_build_delta_sql(
+        "aliased_view",
+        "dp",
+        "UPDATE",
+        base_q,
+        end_q,
+        Some(agg_json.as_str()),
+        base_q,
+    );
+
+    let del_pos = sql
+        .find("DELETE FROM \"aliased_view\"")
+        .expect("target DELETE must be present");
+    let next_sep = sql[del_pos..]
+        .find("\n--<<REFLEX_SEP>>--\n")
+        .unwrap_or(sql.len() - del_pos);
+    let delete_stmt = &sql[del_pos..del_pos + next_sep];
+
+    // The outer column reference in the target DELETE must be the *target*
+    // column name (`dem_plan_id`), NOT the intermediate column name (`id`)
+    // — the target table doesn't have an `id` column.
+    assert!(
+        delete_stmt.contains("\"aliased_view\".\"dem_plan_id\""),
+        "target DELETE must reference target's `dem_plan_id` column (aliased from dp.id). Got: {}",
+        delete_stmt
+    );
+    assert!(
+        !delete_stmt.contains("\"aliased_view\".\"id\""),
+        "target DELETE must NOT reference `aliased_view.\"id\"` (target has no `id` col). Got: {}",
+        delete_stmt
+    );
+    // And the affected (__a) side must use the intermediate name (`id`),
+    // since the affected table is populated from intermediate naming.
+    assert!(
+        delete_stmt.contains("__a.\"id\""),
+        "affected-side reference must use intermediate naming (`__a.\"id\"`). Got: {}",
+        delete_stmt
+    );
+
+    // The same generated SQL must also have the intermediate dead-cleanup
+    // DELETE qualified with the intermediate table — not bare `"id" = __a."id"`.
+    let int_pos = sql
+        .find("DELETE FROM \"__reflex_intermediate_aliased_view\"")
+        .expect("intermediate DELETE must be present");
+    let int_next = sql[int_pos..]
+        .find("\n--<<REFLEX_SEP>>--\n")
+        .unwrap_or(sql.len() - int_pos);
+    let int_stmt = &sql[int_pos..int_pos + int_next];
+    assert!(
+        int_stmt.contains("\"__reflex_intermediate_aliased_view\".\"id\""),
+        "intermediate DELETE must qualify outer col with intermediate table. Got: {}",
+        int_stmt
+    );
+
+    // The INSERT INTO target via end_query (FROM intermediate) appends the
+    // EXISTS filter — its outer is the intermediate, so the appended
+    // predicate must qualify with the intermediate table.
+    let ins_pos = sql
+        .find("INSERT INTO \"aliased_view\"")
+        .expect("target INSERT must be present");
+    let ins_tail = &sql[ins_pos..];
+    let ins_next = ins_tail
+        .find("\n--<<REFLEX_SEP>>--\n")
+        .unwrap_or(ins_tail.len());
+    let ins_stmt = &ins_tail[..ins_next];
+    assert!(
+        ins_stmt.contains("\"__reflex_intermediate_aliased_view\".\"id\""),
+        "target INSERT's appended EXISTS filter must qualify with the intermediate table (end_query's FROM). Got: {}",
+        ins_stmt
+    );
+}
+
+/// Sentinel: scan every EXISTS-on-__a predicate in the generated SQL and
+/// verify NONE of them use a bare unqualified outer column reference. This
+/// is the property test — even if someone refactors callers later, this
+/// keeps the buggy `"col" = __a."col"` shape out of trigger codegen.
+#[test]
+fn test_null_safe_in_no_unqualified_outer_column_anywhere() {
+    let plan = simple_plan();
+    let agg_json = serde_json::to_string(&plan).unwrap();
+    let base_q = "SELECT city, SUM(amount) AS \"__sum_amount\", COUNT(*) AS __ivm_count FROM orders GROUP BY city";
+    let end_q = "SELECT \"city\", \"__sum_amount\" AS total FROM \"__reflex_intermediate_no_unqual_view\" WHERE __ivm_count > 0";
+
+    for op in ["INSERT", "DELETE", "UPDATE"] {
+        let sql = reflex_build_delta_sql(
+            "no_unqual_view",
+            "orders",
+            op,
+            base_q,
+            end_q,
+            Some(agg_json.as_str()),
+            base_q,
+        );
+        // The buggy shape is `WHERE "<col>" <op> __a."<col>"` — a bare quoted
+        // identifier on the outer side, no `<qualifier>.` prefix. The fixed
+        // shape always has `<qualifier>."<col>" <op> __a."<col>"`. We walk
+        // every EXISTS clause and require that the byte just BEFORE every
+        // outer-side `"<col>"` is `.` (the qualifier separator) — not space
+        // or quote or AND. We identify "outer side" as a quoted identifier
+        // immediately followed by an operator and `__a.`.
+        let mut cursor = 0;
+        while let Some(rel) = sql[cursor..].find("EXISTS (SELECT 1 FROM ") {
+            let abs = cursor + rel;
+            let close = sql[abs..].find(')').expect("EXISTS has closing paren");
+            let exists_clause = &sql[abs..abs + close + 1];
+
+            // Find every `__a."` occurrence; for each, walk backwards through
+            // the predicate to the outer-side `"<col>"` token.
+            let mut search_pos = 0;
+            while let Some(rel_a) = exists_clause[search_pos..].find(" __a.\"") {
+                let abs_a = search_pos + rel_a;
+                // Before __a.<col> there is one of `=` or `IS NOT DISTINCT FROM`.
+                // Walk back: skip whitespace, then the operator, then ws, then
+                // the outer column token which must end with `"`.
+                let before = &exists_clause[..abs_a];
+                // Find the operator
+                let op_end = before.trim_end().len();
+                let head = &before[..op_end];
+                let op_start = head
+                    .rfind(|c: char| c == '=' || c.is_ascii_uppercase())
+                    .map(|i| {
+                        // Walk back to start of operator token
+                        let bytes = head.as_bytes();
+                        let mut k = i;
+                        while k > 0
+                            && (bytes[k - 1].is_ascii_uppercase()
+                                || bytes[k - 1] == b' '
+                                || bytes[k - 1] == b'='
+                                || bytes[k - 1] == b'M')
+                        {
+                            k -= 1;
+                        }
+                        // Skip past trailing whitespace
+                        while k < head.len() && (head.as_bytes()[k] == b' ') {
+                            k += 1;
+                        }
+                        k
+                    })
+                    .unwrap_or(op_end);
+                // The outer-side "<col>" ends just before op_start (after
+                // whitespace). Find the closing `"` of the outer col token.
+                let pre_op = head[..op_start].trim_end();
+                assert!(
+                    pre_op.ends_with('"'),
+                    "op={}: expected outer-side to end with closing quote at byte {} in: {}",
+                    op,
+                    op_start,
+                    exists_clause
+                );
+                // Find the matching opening `"` and look at the char before it.
+                let pre_op_no_close = &pre_op[..pre_op.len() - 1];
+                let open_q = pre_op_no_close
+                    .rfind('"')
+                    .expect("outer col has opening quote");
+                let preceding = if open_q == 0 {
+                    ' '
+                } else {
+                    pre_op_no_close.as_bytes()[open_q - 1] as char
+                };
+                assert_eq!(
+                    preceding, '.',
+                    "op={}: outer-side `\"col\"` is NOT preceded by `.` (qualifier separator). \
+                     This is the 2026-05-13 null_safe_in bug pattern: unqualified outer col \
+                     resolves to inner __a scope. Got predicate: {}",
+                    op, exists_clause
+                );
+                search_pos = abs_a + 1;
+            }
+            cursor = abs + 1;
+        }
+    }
 }
