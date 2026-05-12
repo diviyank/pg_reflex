@@ -178,3 +178,97 @@ BEGIN
     END LOOP;
 END
 $REFLEX_MIG_144$;
+
+-- ----------------------------------------------------------------------
+-- Part 3: drop per-column intermediate indexes (idx__reflex_<view>_<n>)
+-- that pre-1.4.4 emitted alongside the composite. They were never used
+-- by any pg_reflex query path (every code path probes the full
+-- composite key), but added ~480ms of index maintenance per 47K-row
+-- UPDATE cycle on rb.fcast (perftest bench A→B: 691ms → 208ms).
+--
+-- Pattern match: `idx__reflex_<bare_view>_<digit>` on a table named
+-- `__reflex_intermediate_*`. The composite index is named
+-- `idx__reflex_int_<bare_view>` — explicitly excluded by the
+-- "_<digit>$" suffix filter.
+-- ----------------------------------------------------------------------
+DO $REFLEX_MIG_144_PART3$
+DECLARE
+    rec     RECORD;
+    dropped INTEGER := 0;
+BEGIN
+    FOR rec IN
+        SELECT n.nspname AS schema_name,
+               cl.relname AS index_name,
+               t.relname AS table_name
+        FROM pg_index ix
+        JOIN pg_class cl ON cl.oid = ix.indexrelid
+        JOIN pg_class t  ON t.oid  = ix.indrelid
+        JOIN pg_namespace n ON n.oid = t.relnamespace
+        WHERE cl.relname LIKE 'idx\_\_reflex\_%' ESCAPE '\'
+          AND cl.relname ~ '_[0-9]+$'
+          AND t.relname LIKE '\_\_reflex\_intermediate\_%' ESCAPE '\'
+          AND array_length(ix.indkey::int[], 1) = 1
+    LOOP
+        EXECUTE format('DROP INDEX %I.%I', rec.schema_name, rec.index_name);
+        dropped := dropped + 1;
+        RAISE NOTICE 'pg_reflex 1.4.4: dropped vestigial per-column index %.%',
+            rec.schema_name, rec.index_name;
+    END LOOP;
+    IF dropped > 0 THEN
+        RAISE NOTICE 'pg_reflex 1.4.4: dropped % vestigial per-column intermediate indexes', dropped;
+    END IF;
+END
+$REFLEX_MIG_144_PART3$;
+
+-- ----------------------------------------------------------------------
+-- Part 4: set fillfactor=70 on intermediate and target tables so MERGE
+-- WHEN MATCHED UPDATE (touching only non-indexed aggregate columns) can
+-- HOT-update in place. Bench (perftest C vs B, 47K rows): 208ms → 75ms
+-- on intermediate, 169ms → 64ms on target. Verified via pg_stat_user_tables
+-- n_tup_hot_upd: 100% of WHEN MATCHED UPDATEs become HOT.
+--
+-- ALTER TABLE … SET (fillfactor) is a catalog-only change. Existing pages
+-- are NOT rewritten — disk size stays the same immediately after the
+-- migration. New rows and HOT updates will gradually bring pages to the
+-- new fillfactor. Operators wanting an immediate rewrite can VACUUM FULL
+-- the IMV's intermediate and target tables during a maintenance window.
+-- ----------------------------------------------------------------------
+DO $REFLEX_MIG_144_PART4$
+DECLARE
+    rec      RECORD;
+    altered  INTEGER := 0;
+BEGIN
+    FOR rec IN
+        SELECT view_schema,
+               imv_schema,
+               imv_name,
+               view_schema || '.' || quote_ident(view_name)        AS target_qualified,
+               imv_schema  || '.' || quote_ident(imv_name)         AS intermediate_qualified
+        FROM (
+            SELECT
+                COALESCE(NULLIF(split_part(r.name, '.', 2), ''), r.name)::text AS view_name,
+                COALESCE(NULLIF(split_part(r.name, '.', 1), ''), 'public')::text AS view_schema,
+                n.nspname::text AS imv_schema,
+                cl.relname::text AS imv_name
+            FROM public.__reflex_ivm_reference r
+            JOIN pg_class cl ON cl.relname = '__reflex_intermediate_'
+                || COALESCE(NULLIF(split_part(r.name, '.', 2), ''), r.name)
+            JOIN pg_namespace n ON n.oid = cl.relnamespace
+            WHERE n.nspname = COALESCE(NULLIF(split_part(r.name, '.', 1), ''), 'public')
+        ) sub
+    LOOP
+        BEGIN
+            EXECUTE format('ALTER TABLE %s SET (fillfactor = 70)', rec.intermediate_qualified);
+            EXECUTE format('ALTER TABLE %s SET (fillfactor = 70)', rec.target_qualified);
+            altered := altered + 1;
+        EXCEPTION
+            WHEN OTHERS THEN
+                RAISE WARNING 'pg_reflex 1.4.4: failed to set fillfactor on % / % (%)',
+                    rec.intermediate_qualified, rec.target_qualified, SQLERRM;
+        END;
+    END LOOP;
+    IF altered > 0 THEN
+        RAISE NOTICE 'pg_reflex 1.4.4: set fillfactor=70 on % intermediate+target table pairs', altered;
+    END IF;
+END
+$REFLEX_MIG_144_PART4$;

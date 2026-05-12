@@ -123,8 +123,14 @@ pub fn build_intermediate_table_ddl(
     } else {
         "CREATE UNLOGGED TABLE"
     };
+    // fillfactor=70 leaves 30% slack on every heap page so MERGE WHEN
+    // MATCHED UPDATE (which only rewrites aggregate columns — none are
+    // indexed) can fit the new tuple version on the same page → HOT
+    // update → zero index writes. Bench (perftest, 47K rows): 691ms
+    // (fillfactor=100) → 75ms (fillfactor=70). Disk cost: ~14% larger
+    // baseline, but eliminates ~20% bloat per UPDATE cycle.
     Some(format!(
-        "{} IF NOT EXISTS {} (\n{}\n)",
+        "{} IF NOT EXISTS {} (\n{}\n) WITH (fillfactor=70)",
         create_prefix, table_name, columns_sql
     ))
 }
@@ -247,8 +253,13 @@ pub fn build_target_table_ddl(
     } else {
         "CREATE UNLOGGED TABLE"
     };
+    // fillfactor=70: same rationale as build_intermediate_table_ddl.
+    // Target MERGE WHEN MATCHED UPDATE rewrites only the end-query
+    // aggregate columns; group_by columns (which are the only
+    // indexed columns via idx__reflex_target_*) stay untouched →
+    // HOT update eligible.
     format!(
-        "{} IF NOT EXISTS {} (\n{}\n)",
+        "{} IF NOT EXISTS {} (\n{}\n) WITH (fillfactor=70)",
         create_prefix,
         quote_identifier(view_name),
         columns_sql
@@ -310,17 +321,14 @@ pub fn build_indexes_ddl(view_name: &str, plan: &AggregationPlan) -> Vec<String>
         }
     }
 
-    // For multiple group-by columns, create individual B-tree indexes on intermediate table
-    if plan.group_by_columns.len() > 1 {
-        for (i, col) in plan.group_by_columns.iter().enumerate() {
-            let norm = normalized_column_name(col);
-            let idx_name = safe_identifier(&format!("idx__reflex_{}_{}", bare_view, i));
-            indexes.push(format!(
-                "CREATE INDEX IF NOT EXISTS \"{}\" ON {} (\"{}\")",
-                idx_name, table_name, norm
-            ));
-        }
-    }
+    // 1.4.4 (perftest A→B bench, 47K rows): the per-column intermediate
+    // indexes that pre-1.4.4 emitted (one per group-by column) added
+    // ~480ms of index maintenance per UPDATE cycle and were never used
+    // by any pg_reflex query path — every code path (MERGE ON,
+    // EXISTS-by-affected, JOIN to scratch) uses the full composite key,
+    // so the composite UNIQUE NULLS NOT DISTINCT btree above is the
+    // only index actually probed. Dropped here; migration in
+    // sql/pg_reflex--1.4.3--1.4.4.sql drops them on existing IMVs.
 
     // Composite index on target table for targeted refresh DELETE performance
     if !plan.group_by_columns.is_empty() {

@@ -69,6 +69,34 @@ fn test_intermediate_table_ddl() {
     assert!(!ddl.contains("PRIMARY KEY"));
 }
 
+/// HOT-update optimization: MERGE WHEN MATCHED UPDATE rewrites only the
+/// aggregate columns (none of which are indexed). With fillfactor=70, those
+/// updates stay on the same heap page → HOT fires → zero index writes per
+/// touched row. Bench (perftest A→C, 47K rows): 691ms → 75ms (9×).
+#[test]
+fn test_intermediate_table_ddl_has_fillfactor_70() {
+    let plan = sample_plan();
+    let types = sample_types();
+    let ddl = build_intermediate_table_ddl("test_view", &plan, &types, false).unwrap();
+    assert!(
+        ddl.contains("fillfactor=70"),
+        "intermediate table must set fillfactor=70 to enable HOT updates on MERGE: {}",
+        ddl
+    );
+}
+
+#[test]
+fn test_target_table_ddl_has_fillfactor_70() {
+    let plan = sample_plan();
+    let types = sample_types();
+    let ddl = build_target_table_ddl("test_view", &plan, &types, false);
+    assert!(
+        ddl.contains("fillfactor=70"),
+        "target table must set fillfactor=70 to enable HOT updates on MERGE: {}",
+        ddl
+    );
+}
+
 #[test]
 fn test_intermediate_table_ddl_logged() {
     let plan = sample_plan();
@@ -129,8 +157,10 @@ fn test_indexes_ddl_multiple_group_by() {
     let mut plan = sample_plan();
     plan.group_by_columns = vec!["city".to_string(), "year".to_string()];
     let indexes = build_indexes_ddl("test_view", &plan);
-    // B-tree index on intermediate (multi-column, no hash) + 2 individual + 1 target
-    assert_eq!(indexes.len(), 4);
+    // Composite UNIQUE intermediate index + target index. No per-column
+    // single-col indexes (dropped in 1.4.4 — bench-proved vestigial because
+    // every pg_reflex query path uses the full composite key).
+    assert_eq!(indexes.len(), 2);
     assert!(indexes[0].contains("idx__reflex_int_"));
     assert!(!indexes[0].contains("USING hash")); // multi-column uses B-tree
                                                  // 1.4.4: composite intermediate index is now UNIQUE NULLS NOT DISTINCT so
@@ -148,9 +178,37 @@ fn test_indexes_ddl_multiple_group_by() {
         indexes[0]
     );
     assert!(indexes[0].contains("\"city\", \"year\""));
-    assert!(indexes[1].contains("\"city\""));
-    assert!(indexes[2].contains("\"year\""));
-    assert!(indexes[3].contains("idx__reflex_target_"));
+    assert!(indexes[1].contains("idx__reflex_target_"));
+}
+
+/// 1.4.4: assert NO per-column indexes are emitted on the intermediate
+/// table for multi-group-by IMVs. The composite UNIQUE NULLS NOT DISTINCT
+/// btree at index[0] covers every MERGE/EXISTS/JOIN query path
+/// pg_reflex emits (every code path uses the full group-by key). The
+/// individual indexes pre-1.4.4 added ~480ms of index maintenance per
+/// 47K-row UPDATE cycle on rb.fcast (bench: A 691ms → B 208ms).
+#[test]
+fn test_indexes_ddl_no_per_column_intermediate_indexes() {
+    let mut plan = sample_plan();
+    plan.group_by_columns = vec!["city".to_string(), "year".to_string(), "month".to_string()];
+    let indexes = build_indexes_ddl("test_view", &plan);
+    // Should be: composite intermediate + target. No per-column.
+    assert_eq!(
+        indexes.len(),
+        2,
+        "expected only composite + target indexes, got {:?}",
+        indexes
+    );
+    for (i, idx) in indexes.iter().enumerate() {
+        assert!(
+            !idx.contains("idx__reflex_test_view_0")
+                && !idx.contains("idx__reflex_test_view_1")
+                && !idx.contains("idx__reflex_test_view_2"),
+            "index[{}] looks like a per-column index that 1.4.4 dropped: {}",
+            i,
+            idx
+        );
+    }
 }
 
 #[test]
