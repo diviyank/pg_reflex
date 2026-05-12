@@ -721,16 +721,37 @@ fn build_min_max_recompute_sql_inner(
     Some(update_sql)
 }
 
-/// Build a NULL-safe match condition for affected groups.
-/// Uses EXISTS with IS NOT DISTINCT FROM instead of IN (which fails for NULL keys).
-/// `target_alias` is the table being filtered (e.g., target table or intermediate).
-/// `affected_tbl` is the affected-groups table.
-/// `cols` are the group column names (quoted).
-/// `cols` are the group column names (quoted).
-fn null_safe_in(affected_tbl: &str, cols: &[String]) -> String {
+/// Build a match condition for affected groups, used as the WHERE filter on
+/// the target/intermediate during the end_query refresh phase.
+///
+/// 1.4.4: per-column `=` for NOT NULL group cols, `IS NOT DISTINCT FROM` for
+/// NULLable ones. Same motivation as `build_merge_using`'s rewrite — `=` is
+/// btree-index-usable, `IS NOT DISTINCT FROM` is not. The composite index on
+/// the target/intermediate group cols becomes a usable EXISTS-probe target
+/// for the NOT NULL prefix, so the DELETE/INSERT during target refresh
+/// avoids the seq-scan-with-IS-NOT-DISTINCT-FROM fallback that, on a 900K
+/// intermediate and 47K affected rows, costs several seconds per UPDATE.
+///
+/// `cols` is the list of group column names (already quoted as `"col"`).
+/// `not_null_columns` is `plan.not_null_columns` — bare unquoted source-column
+/// names known NOT NULL at IMV-create time. The lookup uses the unquoted col
+/// name; columns whose output alias differs from the source-bare name (e.g.
+/// `SELECT col AS my_alias`) safely fall back to `IS NOT DISTINCT FROM`.
+fn null_safe_in(
+    affected_tbl: &str,
+    cols: &[String],
+    not_null_columns: &std::collections::HashSet<String>,
+) -> String {
     let conditions: Vec<String> = cols
         .iter()
-        .map(|c| format!("{} IS NOT DISTINCT FROM __a.{}", c, c))
+        .map(|c| {
+            let unquoted = c.trim_matches('"');
+            if not_null_columns.contains(unquoted) {
+                format!("{} = __a.{}", c, c)
+            } else {
+                format!("{} IS NOT DISTINCT FROM __a.{}", c, c)
+            }
+        })
         .collect();
     // `affected_tbl` is already a fully-formed identifier ref (qualified+quoted
     // when the IMV has a schema, bare local otherwise) — see
@@ -786,11 +807,12 @@ fn inject_affected_filter_before_group_by(
     end_query: &str,
     output_gb_cols: &[String],
     affected_tbl: &str,
+    not_null_columns: &std::collections::HashSet<String>,
 ) -> Option<String> {
     let upper = end_query.to_uppercase();
     let gb_marker = " GROUP BY ";
     let pos = upper.rfind(gb_marker)?;
-    let filter = null_safe_in(affected_tbl, output_gb_cols);
+    let filter = null_safe_in(affected_tbl, output_gb_cols, not_null_columns);
     Some(format!(
         "{} AND {}{}",
         &end_query[..pos],
@@ -1081,21 +1103,21 @@ pub fn reflex_build_delta_sql(
             ));
 
             // Delete affected groups from intermediate (NULL-safe)
-            let ns_in_int = null_safe_in(&affected_tbl, cols);
+            let ns_in_int = null_safe_in(&affected_tbl, cols, &plan.not_null_columns);
             stmts.push(format!(
                 "DELETE FROM {} WHERE {}",
                 intermediate_tbl, ns_in_int
             ));
 
             // Re-insert ONLY affected groups from the FULL base_query (reads real source).
-            let ns_in_full = null_safe_in(&affected_tbl, cols);
+            let ns_in_full = null_safe_in(&affected_tbl, cols, &plan.not_null_columns);
             stmts.push(format!(
                 "INSERT INTO {} SELECT * FROM ({}) AS __full WHERE {}",
                 intermediate_tbl, base_query, ns_in_full
             ));
 
             // Targeted refresh of target (NULL-safe)
-            let ns_in_tgt = null_safe_in(&affected_tbl, cols);
+            let ns_in_tgt = null_safe_in(&affected_tbl, cols, &plan.not_null_columns);
             stmts.push(format!("DELETE FROM {} WHERE {}", qv, ns_in_tgt));
             stmts.push(format!(
                 "INSERT INTO {} {} AND {}",
@@ -1493,10 +1515,14 @@ pub fn reflex_build_delta_sql(
                     .iter()
                     .map(|c| format!("\"{}\"", normalized_column_name(c)))
                     .collect();
-                match inject_affected_filter_before_group_by(end_query, &output_cols, &affected_tbl)
-                {
+                match inject_affected_filter_before_group_by(
+                    end_query,
+                    &output_cols,
+                    &affected_tbl,
+                    &plan.not_null_columns,
+                ) {
                     Some(spliced_end_q) => {
-                        let ns_in = null_safe_in(&affected_tbl, &output_cols);
+                        let ns_in = null_safe_in(&affected_tbl, &output_cols, &plan.not_null_columns);
                         stmts.push(format!("DELETE FROM {} WHERE {}", qv, ns_in));
                         stmts.push(format!("INSERT INTO {} {}", qv, spliced_end_q));
                     }
@@ -1510,7 +1536,7 @@ pub fn reflex_build_delta_sql(
             stmts.push(metadata_sql);
         } else if let Some(ref cols) = grp_cols {
             let qv = quote_identifier(view_name);
-            let ns_in = null_safe_in(&affected_tbl, cols);
+            let ns_in = null_safe_in(&affected_tbl, cols, &plan.not_null_columns);
             if include_dead_cleanup {
                 // Scope dead-row cleanup to groups touched by THIS flush.
                 // The previous unscoped `DELETE FROM intermediate WHERE

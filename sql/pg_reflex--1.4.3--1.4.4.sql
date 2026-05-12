@@ -47,6 +47,67 @@
 -- SQL with the old `IS NOT DISTINCT FROM` clauses. Reconnect to pick up the
 -- fix.
 
+-- ----------------------------------------------------------------------
+-- Part 1: backfill `not_null_columns` in stored aggregations JSON.
+--
+-- Pre-1.4.4 the MERGE codegen always emitted `IS NOT DISTINCT FROM` for
+-- every group column, so the field went unused and was only set
+-- opportunistically (when the SUM companion-column rewrite happened to
+-- fire). Now that `build_merge_using` reads it to choose
+-- `=` vs `IS NOT DISTINCT FROM`, every existing IMV needs the catalog's
+-- NOT NULL columns recorded — otherwise the fix is a no-op on already-
+-- deployed IMVs.
+--
+-- For each IMV, union the NOT NULL bare column names across every
+-- `depends_on` source table (information_schema.columns is search-path
+-- independent and treats `bench_imm.ss` / unqualified `orders` uniformly).
+-- ----------------------------------------------------------------------
+DO $REFLEX_MIG_144_PART1$
+DECLARE
+    rec        RECORD;
+    nn_set     JSONB;
+BEGIN
+    FOR rec IN
+        SELECT name, depends_on, aggregations
+        FROM public.__reflex_ivm_reference
+    LOOP
+        SELECT COALESCE(jsonb_agg(DISTINCT col.column_name), '[]'::jsonb)
+        INTO nn_set
+        FROM unnest(rec.depends_on) AS dep,
+        LATERAL (
+            SELECT c.column_name
+            FROM information_schema.columns c
+            WHERE c.is_nullable = 'NO'
+              AND (
+                   /* schema-qualified `schema.table` form */
+                   (position('.' in dep) > 0
+                    AND c.table_schema = split_part(dep, '.', 1)
+                    AND c.table_name   = split_part(dep, '.', 2))
+                OR /* unqualified — match across all schemas */
+                   (position('.' in dep) = 0
+                    AND c.table_name = dep)
+              )
+        ) AS col
+        WHERE NOT (dep LIKE '<%>' OR dep LIKE '"%"'); -- skip sub-IMV CTE refs
+
+        UPDATE public.__reflex_ivm_reference
+        SET aggregations = jsonb_set(
+            aggregations::jsonb,
+            '{not_null_columns}',
+            nn_set
+        )
+        WHERE name = rec.name;
+
+        RAISE NOTICE 'pg_reflex 1.4.4: backfilled not_null_columns on % (% cols)',
+            rec.name, jsonb_array_length(nn_set);
+    END LOOP;
+END
+$REFLEX_MIG_144_PART1$;
+
+-- ----------------------------------------------------------------------
+-- Part 2: rebuild every multi-column intermediate composite index as
+-- UNIQUE NULLS NOT DISTINCT. Single-column indexes (hash) are left alone.
+-- ----------------------------------------------------------------------
 DO $REFLEX_MIG_144$
 DECLARE
     rec      RECORD;

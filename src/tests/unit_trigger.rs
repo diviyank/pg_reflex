@@ -987,7 +987,12 @@ fn test_build_delta_sql_splice_falls_back_when_no_group_by_cols() {
 fn test_splice_helper_handles_having_clause() {
     let input =
         "SELECT grp, COUNT(val) FROM int WHERE __ivm_count > 0 GROUP BY grp HAVING COUNT(val) > 0";
-    let result = inject_affected_filter_before_group_by(input, &["\"grp\"".to_string()], "aff_tbl");
+    let result = inject_affected_filter_before_group_by(
+        input,
+        &["\"grp\"".to_string()],
+        "aff_tbl",
+        &std::collections::HashSet::new(),
+    );
     let spliced = result.expect("should succeed when GROUP BY present");
 
     let filter_pos = spliced.find("EXISTS").expect("filter must be present");
@@ -1014,6 +1019,7 @@ fn test_splice_helper_returns_none_when_no_group_by() {
         "SELECT COUNT(val) FROM int WHERE __ivm_count > 0",
         &["\"grp\"".to_string()],
         "aff_tbl",
+        &std::collections::HashSet::new(),
     );
     assert!(
         result.is_none(),
