@@ -709,3 +709,108 @@ fn pg_test_flush_histogram_empty_when_never_flushed() {
         .expect("q").expect("v");
     assert_eq!(samples, 0, "no flushes yet, no samples");
 }
+
+/// 1.4.3 — Spurious-UPDATE short-circuit. When a statement-level UPDATE
+/// stages U_OLD/U_NEW rows whose source-column projections are byte-identical
+/// (the row was "updated" to the value it already had), no IMV can observe a
+/// change. `reflex_flush_deferred` must skip every IMV body, leaving
+/// flush_count unchanged for those IMVs, and still clean up the staging
+/// delta + pending pointer. Customer reproducer: `UPDATE … SET status =
+/// 'validated' WHERE status = 'validated'`.
+#[pg_test]
+fn pg_test_deferred_spurious_update_skips_imv_bodies() {
+    Spi::run("CREATE TABLE sp_src (id SERIAL PRIMARY KEY, status TEXT, amount INT)")
+        .expect("create");
+    Spi::run("INSERT INTO sp_src (status, amount) VALUES ('validated', 10), ('draft', 20)")
+        .expect("seed");
+
+    crate::create_reflex_ivm(
+        "sp_view",
+        "SELECT status, SUM(amount) AS total FROM sp_src GROUP BY status",
+        None,
+        None,
+        Some("DEFERRED"),
+    );
+
+    // Baseline: flush_count after initial materialization (might be 0 or 1
+    // depending on path) — capture it.
+    let count_before: i64 = Spi::get_one(
+        "SELECT COALESCE(flush_count, 0) FROM public.__reflex_ivm_reference WHERE name = 'sp_view'",
+    )
+    .expect("q")
+    .expect("v");
+
+    // Snapshot the target so we can assert it didn't change.
+    let total_before: i64 = Spi::get_one::<i64>(
+        "SELECT SUM(total)::BIGINT FROM sp_view",
+    )
+    .expect("q")
+    .expect("v");
+
+    // Spurious UPDATE — set every column to the value it already has. PG
+    // still fires the statement-level trigger and stages U_OLD/U_NEW rows;
+    // pg_reflex must detect the multiset equality and skip.
+    Spi::run("UPDATE sp_src SET status = status, amount = amount").expect("spurious update");
+    Spi::run("SELECT reflex_flush_deferred('sp_src')").expect("flush");
+
+    let count_after: i64 = Spi::get_one(
+        "SELECT COALESCE(flush_count, 0) FROM public.__reflex_ivm_reference WHERE name = 'sp_view'",
+    )
+    .expect("q")
+    .expect("v");
+    assert_eq!(
+        count_before, count_after,
+        "spurious flush must not increment flush_count (counted: {} -> {})",
+        count_before, count_after
+    );
+
+    // Staging delta must be empty after the flush (skip path still cleans up).
+    let staged_after: i64 = Spi::get_one(
+        "SELECT COUNT(*)::BIGINT FROM __reflex_delta_sp_src",
+    )
+    .expect("q")
+    .expect("v");
+    assert_eq!(staged_after, 0, "staging delta must be cleaned up even on skip");
+
+    // Pending pointer must also be cleared.
+    let pending_after: i64 = Spi::get_one(
+        "SELECT COUNT(*)::BIGINT FROM public.__reflex_deferred_pending WHERE source_table = 'sp_src'",
+    )
+    .expect("q")
+    .expect("v");
+    assert_eq!(pending_after, 0, "deferred-pending pointer must be cleared");
+
+    // Target unchanged.
+    let total_after: i64 = Spi::get_one::<i64>(
+        "SELECT SUM(total)::BIGINT FROM sp_view",
+    )
+    .expect("q")
+    .expect("v");
+    assert_eq!(total_before, total_after, "target must be unchanged");
+
+    // Sanity: a REAL update afterwards still processes correctly.
+    Spi::run("UPDATE sp_src SET amount = amount + 1 WHERE id = 1").expect("real update");
+    Spi::run("SELECT reflex_flush_deferred('sp_src')").expect("flush");
+    let count_after_real: i64 = Spi::get_one(
+        "SELECT COALESCE(flush_count, 0) FROM public.__reflex_ivm_reference WHERE name = 'sp_view'",
+    )
+    .expect("q")
+    .expect("v");
+    assert!(
+        count_after_real > count_after,
+        "real update must increment flush_count (was {}, now {})",
+        count_after,
+        count_after_real
+    );
+    let fresh_total: i64 = Spi::get_one::<i64>(
+        "SELECT SUM(amount)::BIGINT FROM sp_src",
+    )
+    .expect("q")
+    .expect("v");
+    let view_total: i64 = Spi::get_one::<i64>(
+        "SELECT SUM(total)::BIGINT FROM sp_view",
+    )
+    .expect("q")
+    .expect("v");
+    assert_eq!(fresh_total, view_total, "view should match fresh aggregate");
+}

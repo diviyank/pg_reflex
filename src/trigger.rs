@@ -12,9 +12,9 @@ use crate::aggregation::AggregationPlan;
 use crate::query_decomposer::{
     affected_groups_table_name, delta_scratch_table_name, intermediate_table_name,
     normalized_column_name, passthrough_scratch_new_table_name, passthrough_scratch_old_table_name,
-    quote_identifier, replace_identifier, replace_source_with_delta, shrunk_groups_table_name,
-    split_qualified_name, staging_delta_table_name, strip_redundant_bare_alias,
-    transition_new_table_name, transition_old_table_name,
+    quote_identifier, replace_identifier, shrunk_groups_table_name, split_qualified_name,
+    staging_delta_table_name, strip_redundant_bare_alias, transition_new_table_name,
+    transition_old_table_name,
 };
 
 /// Per-backend cache of built delta SQL keyed by a hash of all inputs.
@@ -1617,7 +1617,7 @@ pub fn reflex_flush_deferred(source_table: &str) -> String {
                  FROM public.__reflex_ivm_reference \
                  WHERE $1 = ANY(depends_on) AND enabled = TRUE \
                    AND COALESCE(refresh_mode, 'IMMEDIATE') = 'DEFERRED' \
-                 ORDER BY graph_depth",
+                 ORDER BY graph_depth, name",
                 None,
                 &args,
             )
@@ -1655,6 +1655,30 @@ pub fn reflex_flush_deferred(source_table: &str) -> String {
     let mut total_processed = 0usize;
 
     Spi::connect_mut(|client| {
+        // 1.4.3 — Serialize flushes on the same source.
+        //
+        // ANALYZE (ShareUpdateExclusiveLock) + TRUNCATE (AccessExclusiveLock)
+        // on the same staging-delta table inside the same transaction is a
+        // classic deadlock antipattern when two sessions flush concurrently:
+        // ShareUpdateExclusive is self-conflicting, so the second session
+        // queues behind the first's ANALYZE. When the first then tries to
+        // upgrade to AccessExclusive for the end-of-flush TRUNCATE, the lock
+        // manager queues that request *behind* the second's pending
+        // ShareUpdate request, and a cycle forms. Reproduced as a real
+        // 42P40 deadlock under customer concurrency.
+        //
+        // The advisory lock is acquired before any table-level lock on the
+        // staging delta, so the second session blocks here and the locks
+        // inside execute in single-session order on each turn.
+        let lock_key = format!("reflex_flush:{}", source_table).replace('\'', "''");
+        client
+            .update(
+                &format!("SELECT pg_advisory_xact_lock(hashtext('{}'))", lock_key),
+                None,
+                &[],
+            )
+            .unwrap_or_report();
+
         // Check if staging table has any rows
         let has_rows = client
             .select(
@@ -1739,13 +1763,15 @@ pub fn reflex_flush_deferred(source_table: &str) -> String {
         let projection = src_cols.join(", ");
         let new_view = transition_new_table_name(source_table);
         let old_view = transition_old_table_name(source_table);
-        client
-            .update(&format!("DROP VIEW IF EXISTS {}", new_view), None, &[])
-            .unwrap_or_report();
+        // 1.4.3 — `CREATE OR REPLACE TEMP VIEW` replaces the previous
+        // DROP-IF-EXISTS + CREATE pair. Eliminates the noisy
+        // `NOTICE: view "..." does not exist, skipping` from the first
+        // flush of each session and keeps the views reusable across flushes
+        // in the same backend (subsequent CREATE OR REPLACE rewrites them).
         client
             .update(
                 &format!(
-                    "CREATE TEMP VIEW {} AS SELECT {} FROM {} WHERE __reflex_op IN ('I', 'U_NEW')",
+                    "CREATE OR REPLACE TEMP VIEW {} AS SELECT {} FROM {} WHERE __reflex_op IN ('I', 'U_NEW')",
                     new_view, projection, delta_tbl
                 ),
                 None,
@@ -1753,18 +1779,79 @@ pub fn reflex_flush_deferred(source_table: &str) -> String {
             )
             .unwrap_or_report();
         client
-            .update(&format!("DROP VIEW IF EXISTS {}", old_view), None, &[])
-            .unwrap_or_report();
-        client
             .update(
                 &format!(
-                    "CREATE TEMP VIEW {} AS SELECT {} FROM {} WHERE __reflex_op IN ('D', 'U_OLD')",
+                    "CREATE OR REPLACE TEMP VIEW {} AS SELECT {} FROM {} WHERE __reflex_op IN ('D', 'U_OLD')",
                     old_view, projection, delta_tbl
                 ),
                 None,
                 &[],
             )
             .unwrap_or_report();
+
+        // 1.4.3 — Spurious-UPDATE short-circuit.
+        //
+        // If the staging delta contains only paired U_OLD/U_NEW rows whose
+        // projections to the source columns are identical multisets (i.e.
+        // every UPDATE was a no-op at the column level — e.g. `SET
+        // status='validated'` on a row whose status is already 'validated'),
+        // no IMV can observe a change. Skip every IMV body, clean up, return.
+        //
+        // EXCEPT ALL is multiset subtraction; if both directions are empty
+        // and there are no INSERT/DELETE rows, U_OLD ≡ U_NEW.
+        let cols_csv = src_cols.join(", ");
+        let is_spurious = if cols_csv.is_empty() {
+            false
+        } else {
+            let sql = format!(
+                "WITH \
+                   has_id AS (SELECT 1 FROM {delta} WHERE __reflex_op IN ('I', 'D') LIMIT 1), \
+                   only_old AS ( \
+                     SELECT {cols} FROM {delta} WHERE __reflex_op = 'U_OLD' \
+                     EXCEPT ALL \
+                     SELECT {cols} FROM {delta} WHERE __reflex_op = 'U_NEW' \
+                   ), \
+                   only_new AS ( \
+                     SELECT {cols} FROM {delta} WHERE __reflex_op = 'U_NEW' \
+                     EXCEPT ALL \
+                     SELECT {cols} FROM {delta} WHERE __reflex_op = 'U_OLD' \
+                   ) \
+                 SELECT NOT EXISTS(SELECT 1 FROM has_id) \
+                    AND NOT EXISTS(SELECT 1 FROM only_old) \
+                    AND NOT EXISTS(SELECT 1 FROM only_new) AS sp",
+                delta = delta_tbl,
+                cols = cols_csv,
+            );
+            client
+                .select(&sql, None, &[])
+                .unwrap_or_report()
+                .next()
+                .map(|row| {
+                    row.get_by_name::<bool, _>("sp")
+                        .unwrap_or(None)
+                        .unwrap_or(false)
+                })
+                .unwrap_or(false)
+        };
+
+        if is_spurious {
+            // No IMV processing. Clean up the staging delta and pending rows.
+            // DELETE (not TRUNCATE) — see end-of-function comment.
+            client
+                .update(&format!("DELETE FROM {}", delta_tbl), None, &[])
+                .unwrap_or_report();
+            client
+                .update(
+                    &format!(
+                        "DELETE FROM public.__reflex_deferred_pending WHERE source_table = '{}'",
+                        source_table.replace("'", "''")
+                    ),
+                    None,
+                    &[],
+                )
+                .unwrap_or_report();
+            return;
+        }
 
         for (imv_name, base_query, end_query, agg_json, where_pred) in &imvs {
             // Skip this IMV if where_predicate is set and no staged row matches it.
@@ -1803,86 +1890,30 @@ pub fn reflex_flush_deferred(source_table: &str) -> String {
                 imv_name.replace("'", "''")
             ));
 
-            let ins_subq = format!("(SELECT * FROM {} WHERE __reflex_op = 'I')", delta_tbl);
-            let ins_base = replace_source_with_delta(base_query, source_table, &ins_subq, "__dt");
-            let ins_sql = reflex_build_delta_sql(
+            // 1.4.3 — Single op="UPDATE" call replaces the previous 4-way
+            // dispatch (INSERT / DELETE / U_OLD-as-DELETE / U_NEW-as-INSERT).
+            // The TEMP VIEWs created above (`__reflex_new_<src>` =
+            // I + U_NEW, `__reflex_old_<src>` = D + U_OLD) act exactly like
+            // the IMMEDIATE-mode transition tables, so `reflex_build_delta_sql`
+            // routes through the normal UPDATE path and `build_net_delta_query`
+            // fuses both halves into a single JOIN-scan instead of running
+            // sub + add as two independent scans. Cuts per-flush JOIN cost ~2×
+            // for real updates and exercises a single, well-tested code path.
+            let upd_sql = reflex_build_delta_sql(
                 imv_name,
                 source_table,
-                "INSERT",
-                &ins_base,
+                "UPDATE",
+                base_query,
                 end_query,
                 Some(agg_json.as_str()),
                 base_query,
             );
-            let mut ins_had_stmts = false;
-            if !ins_sql.is_empty() {
-                for stmt in ins_sql.split("\n--<<REFLEX_SEP>>--\n") {
+            let mut had_stmts = false;
+            if !upd_sql.is_empty() {
+                for stmt in upd_sql.split("\n--<<REFLEX_SEP>>--\n") {
                     if !stmt.is_empty() {
                         imv_stmts.push(stmt.to_string());
-                        ins_had_stmts = true;
-                    }
-                }
-            }
-
-            let del_subq = format!("(SELECT * FROM {} WHERE __reflex_op = 'D')", delta_tbl);
-            let del_base = replace_source_with_delta(base_query, source_table, &del_subq, "__dt");
-            let del_sql = reflex_build_delta_sql(
-                imv_name,
-                source_table,
-                "DELETE",
-                &del_base,
-                end_query,
-                Some(agg_json.as_str()),
-                base_query,
-            );
-            let mut del_had_stmts = false;
-            if !del_sql.is_empty() {
-                for stmt in del_sql.split("\n--<<REFLEX_SEP>>--\n") {
-                    if !stmt.is_empty() {
-                        imv_stmts.push(stmt.to_string());
-                        del_had_stmts = true;
-                    }
-                }
-            }
-
-            let upd_old_subq = format!("(SELECT * FROM {} WHERE __reflex_op = 'U_OLD')", delta_tbl);
-            let upd_old_base =
-                replace_source_with_delta(base_query, source_table, &upd_old_subq, "__dt");
-            let upd_old_sql = reflex_build_delta_sql(
-                imv_name,
-                source_table,
-                "DELETE",
-                &upd_old_base,
-                end_query,
-                Some(agg_json.as_str()),
-                base_query,
-            );
-            if !upd_old_sql.is_empty() {
-                for stmt in upd_old_sql.split("\n--<<REFLEX_SEP>>--\n") {
-                    if !stmt.is_empty() {
-                        imv_stmts.push(stmt.to_string());
-                    }
-                }
-            }
-
-            let upd_new_subq = format!("(SELECT * FROM {} WHERE __reflex_op = 'U_NEW')", delta_tbl);
-            let upd_new_base =
-                replace_source_with_delta(base_query, source_table, &upd_new_subq, "__dt");
-            let upd_new_sql = reflex_build_delta_sql(
-                imv_name,
-                source_table,
-                "INSERT",
-                &upd_new_base,
-                end_query,
-                Some(agg_json.as_str()),
-                base_query,
-            );
-            let mut upd_had_stmts = false;
-            if !upd_new_sql.is_empty() {
-                for stmt in upd_new_sql.split("\n--<<REFLEX_SEP>>--\n") {
-                    if !stmt.is_empty() {
-                        imv_stmts.push(stmt.to_string());
-                        upd_had_stmts = true;
+                        had_stmts = true;
                     }
                 }
             }
@@ -1942,27 +1973,27 @@ pub fn reflex_flush_deferred(source_table: &str) -> String {
             );
             client.update(&do_block, None, &[]).unwrap_or_report();
 
-            if ins_had_stmts {
-                total_processed += 1;
-            }
-            if del_had_stmts {
-                total_processed += 1;
-            }
-            if upd_had_stmts {
+            if had_stmts {
                 total_processed += 1;
             }
         }
 
-        // Clean up: truncate staging table, drop the temp view shims,
-        // and remove pending rows.
+        // 1.4.3 — DELETE (not TRUNCATE) for staging cleanup.
+        //
+        // TRUNCATE requires AccessExclusiveLock on the staging delta and
+        // deadlocks against any concurrent session that holds a RowExclusive
+        // on the same staging table from its earlier statement-level INSERT
+        // and is now blocked at the COMMIT-time advisory lock. DELETE only
+        // takes RowExclusive (no conflict at the table level), and MVCC
+        // ensures we only remove rows visible to this transaction — i.e.
+        // exactly the staged rows this flush just processed. Other
+        // sessions' uncommitted staged rows remain for their own flush.
+        //
+        // The terminal DROP VIEW IF EXISTS calls are gone: the temp views
+        // were redefined with CREATE OR REPLACE TEMP VIEW above and are
+        // safe to leave for the next flush in the same session.
         client
-            .update(&format!("DROP VIEW IF EXISTS {}", new_view), None, &[])
-            .unwrap_or_report();
-        client
-            .update(&format!("DROP VIEW IF EXISTS {}", old_view), None, &[])
-            .unwrap_or_report();
-        client
-            .update(&format!("TRUNCATE {}", delta_tbl), None, &[])
+            .update(&format!("DELETE FROM {}", delta_tbl), None, &[])
             .unwrap_or_report();
         client
             .update(

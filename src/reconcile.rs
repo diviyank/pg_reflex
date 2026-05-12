@@ -364,7 +364,7 @@ pub(crate) fn refresh_imv_depending_on(source: &str) -> &'static str {
             .select(
                 "SELECT name FROM public.__reflex_ivm_reference \
                  WHERE $1 = ANY(depends_on) AND enabled = TRUE \
-                 ORDER BY graph_depth",
+                 ORDER BY graph_depth, name",
                 None,
                 &[unsafe {
                     DatumWithOid::new(source.to_string(), PgBuiltInOids::TEXTOID.oid().value())

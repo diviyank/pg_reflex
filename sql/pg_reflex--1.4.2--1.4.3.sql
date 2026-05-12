@@ -1,0 +1,50 @@
+-- Migration: pg_reflex 1.4.2 → 1.4.3
+--
+-- Run via: ALTER EXTENSION pg_reflex UPDATE TO '1.4.3';
+--
+-- Bug fix + performance release. No catalog rewrites; no IMV rebuilds.
+--
+-- Fixed: three deadlock classes in `reflex_flush_deferred`.
+--
+--   1. ANALYZE + TRUNCATE upgrade cycle on the staging delta. Two
+--      concurrent COMMIT-time flushes queued for ShareUpdateExclusiveLock
+--      (self-conflicting); when one then tried to upgrade to
+--      AccessExclusiveLock for the end-of-flush TRUNCATE, the upgrade
+--      was queued behind the other's pending request, forming a cycle.
+--      1.4.3 acquires a per-source pg_advisory_xact_lock at the very
+--      start of the flush, before any table-level lock on the staging
+--      delta.
+--
+--   2. End-of-flush TRUNCATE vs another session's mid-transaction
+--      RowExclusive on the same staging table. 1.4.3 uses DELETE instead
+--      of TRUNCATE (RowExclusive, MVCC-isolated per session).
+--
+--   3. Non-deterministic per-IMV processing order across sessions when
+--      two IMVs shared a graph_depth. 1.4.3 adds `, name` tie-break to
+--      every ORDER BY graph_depth so all sessions take per-IMV advisory
+--      locks in the same order.
+--
+-- Performance:
+--
+--   * Spurious-UPDATE short-circuit. When the staging delta contains only
+--     paired U_OLD/U_NEW rows that project byte-identically to the source
+--     columns (the row was "updated" to the value it already had —
+--     e.g. `UPDATE … SET status='validated' WHERE status='validated'`),
+--     no IMV can observe a change. The flush skips every IMV body, ~5 s →
+--     ~50 ms for such updates.
+--
+--   * Single-call deferred UPDATE path. Replaces the previous 4-way
+--     INSERT/DELETE/U_OLD/U_NEW dispatch with a single op="UPDATE"
+--     call that uses the temp views as transition tables and goes
+--     through the IMMEDIATE-mode `build_net_delta_query` path, fusing
+--     both halves into a single source-scan. ~2× faster on real updates.
+--
+-- Cosmetic: the two `NOTICE: view "__reflex_new_<src>" does not exist,
+-- skipping` lines on every flush are gone — CREATE OR REPLACE TEMP VIEW
+-- now replaces the noisy DROP-IF-EXISTS pair.
+--
+-- No IMV rebuilds are needed. The bug was entirely in SQL generated at
+-- flush time and the changes are confined to `reflex_flush_deferred` and
+-- a handful of trigger-DDL templates. Open a fresh connection after
+-- UPDATE to drop stale per-backend SQL caches; existing backends will
+-- continue to serve cached delta SQL from 1.4.2 until reconnected.

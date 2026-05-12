@@ -366,7 +366,7 @@ pub fn build_trigger_ddls(source_table: &str) -> Vec<String> {
              SELECT name, base_query, end_query, aggregations::text AS aggregations, where_predicate \
              FROM public.__reflex_ivm_reference \
              WHERE '{source_table}' = ANY(depends_on) AND enabled = TRUE \
-             ORDER BY graph_depth \
+             ORDER BY graph_depth, name \
            LOOP \
              IF _rec.where_predicate IS NOT NULL THEN \
                EXECUTE format('SELECT EXISTS(SELECT 1 FROM %I WHERE %s LIMIT 1)', '{{transition_tbl}}', _rec.where_predicate) INTO _pred_match; \
@@ -436,7 +436,7 @@ pub fn build_trigger_ddls(source_table: &str) -> Vec<String> {
              SELECT name \
              FROM public.__reflex_ivm_reference \
              WHERE '{source_table}' = ANY(depends_on) AND enabled = TRUE \
-             ORDER BY graph_depth \
+             ORDER BY graph_depth, name \
            LOOP \
              PERFORM pg_advisory_xact_lock(hashtext(_rec.name), hashtext(reverse(_rec.name))); \
              _stmts := public.reflex_build_truncate_sql(_rec.name); \
@@ -481,7 +481,7 @@ pub fn build_deferred_trigger_ddls(source_table: &str) -> Vec<String> {
                     COALESCE(refresh_mode, 'IMMEDIATE') AS refresh_mode, where_predicate \
              FROM public.__reflex_ivm_reference \
              WHERE '{source_table}' = ANY(depends_on) AND enabled = TRUE \
-             ORDER BY graph_depth \
+             ORDER BY graph_depth, name \
            LOOP \
              IF _rec.where_predicate IS NOT NULL THEN \
                EXECUTE format('SELECT EXISTS(SELECT 1 FROM %I WHERE %s LIMIT 1)', '{{transition_tbl}}', _rec.where_predicate) INTO _pred_match; \
@@ -553,7 +553,7 @@ pub fn build_deferred_trigger_ddls(source_table: &str) -> Vec<String> {
                     COALESCE(refresh_mode, 'IMMEDIATE') AS refresh_mode, where_predicate \
              FROM public.__reflex_ivm_reference \
              WHERE '{source_table}' = ANY(depends_on) AND enabled = TRUE \
-             ORDER BY graph_depth \
+             ORDER BY graph_depth, name \
            LOOP \
              IF _rec.where_predicate IS NOT NULL THEN \
                EXECUTE format('SELECT EXISTS(SELECT 1 FROM %I WHERE %s LIMIT 1)', '{ref_new}', _rec.where_predicate) INTO _pred_match; \
@@ -598,7 +598,7 @@ pub fn build_deferred_trigger_ddls(source_table: &str) -> Vec<String> {
              SELECT name \
              FROM public.__reflex_ivm_reference \
              WHERE '{source_table}' = ANY(depends_on) AND enabled = TRUE \
-             ORDER BY graph_depth \
+             ORDER BY graph_depth, name \
            LOOP \
              PERFORM pg_advisory_xact_lock(hashtext(_rec.name), hashtext(reverse(_rec.name))); \
              _stmts := public.reflex_build_truncate_sql(_rec.name); \

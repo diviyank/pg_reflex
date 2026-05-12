@@ -244,7 +244,7 @@ extension_sql!(
                 FROM public.__reflex_ivm_reference
                 WHERE depends_on @> ARRAY[_obj.object_identity]
                    OR depends_on @> ARRAY[split_part(_obj.object_identity, '.', 2)]
-                ORDER BY graph_depth DESC
+                ORDER BY graph_depth DESC, name DESC
             LOOP
                 BEGIN
                     PERFORM public.drop_reflex_ivm(_imv.name, TRUE);

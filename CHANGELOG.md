@@ -1,5 +1,85 @@
 # Changelog
 
+## [1.4.3] - 2026-05-12
+
+### Fixed
+- **Three deadlock classes in `reflex_flush_deferred`.** Reproduced as a
+  real 42P40 deadlock under customer concurrency
+  (`UPDATE alp.demand_planning … ; SELECT public.reflex_flush_deferred(…)`
+  hanging 2-5 min before PG kicked one side out):
+
+  1. *ANALYZE + TRUNCATE upgrade cycle on the staging delta.* Two
+     concurrent COMMIT-time flushes queue for `ShareUpdateExclusiveLock`
+     (self-conflicting). When the first then tries to upgrade to
+     `AccessExclusiveLock` for the end-of-flush `TRUNCATE`, the lock
+     manager queues the upgrade behind the second's pending request →
+     cycle. **Fix:** acquire a per-source `pg_advisory_xact_lock` at the
+     very start of `reflex_flush_deferred`, before any table-level lock
+     on the staging delta.
+
+  2. *End-of-flush `TRUNCATE` vs another session's mid-transaction
+     `RowExclusive` on staging.* The advisory lock above is acquired at
+     COMMIT time, but another session may already hold
+     `RowExclusive` on the same staging table from its earlier
+     statement-level INSERT and be waiting for the same advisory lock
+     at its own COMMIT. The first session's `TRUNCATE` (needs
+     `AccessExclusive`) then blocks behind it → cycle. **Fix:** replace
+     `TRUNCATE` with `DELETE` for staging cleanup. `DELETE` takes
+     `RowExclusive` (compatible with concurrent inserts), and MVCC
+     ensures each transaction only removes its own visible rows.
+
+  3. *Non-deterministic per-IMV processing order across sessions.*
+     `ORDER BY graph_depth` (no tie-break) let two sessions iterate
+     two same-depth IMVs in different orders and take per-IMV
+     advisory locks in A→B vs B→A cycle. **Fix:** add `, name`
+     tie-break to every `ORDER BY graph_depth` (deferred flush,
+     immediate-trigger DDL, drop-cascade event trigger, reconcile).
+
+### Performance
+- **Spurious-UPDATE short-circuit.** When the staging delta contains
+  only paired U_OLD/U_NEW rows whose projections to the source columns
+  are byte-identical multisets (the row was "updated" to the value it
+  already had — e.g. `UPDATE … SET status = 'validated' WHERE status =
+  'validated'`), no IMV can observe a change. `reflex_flush_deferred`
+  now detects this with a single `EXCEPT ALL` test and skips every IMV
+  body, dropping such flushes from ~5 s to ~50 ms while still cleaning
+  up the staging delta + pending pointer.
+
+- **Single-call deferred UPDATE path.** Replaces the previous 4-way
+  dispatch (separate `INSERT`/`DELETE`/`U_OLD-as-DELETE`/`U_NEW-as-INSERT`
+  calls into `reflex_build_delta_sql`) with a single `op="UPDATE"`
+  call that uses the temp views (`__reflex_new_<src>` = I+U_NEW,
+  `__reflex_old_<src>` = D+U_OLD) as transition tables. The
+  IMMEDIATE-mode `build_net_delta_query` path then fuses both halves
+  into a single source-scan instead of two independent scans. Cuts
+  real-update flush JOIN cost ~2× and shares a single, well-tested
+  code path with immediate mode.
+
+### Cosmetic
+- **No more `NOTICE: view "__reflex_new_<src>" does not exist, skipping`
+  on every flush.** Replaced the `DROP VIEW IF EXISTS` + `CREATE TEMP
+  VIEW` pair with `CREATE OR REPLACE TEMP VIEW` so the first flush of
+  each backend is silent and the views are reused across flushes in
+  the same session.
+
+### Removed
+- `replace_source_with_delta`, `rewrite_dot_qualifier`, and
+  `replace_standalone_source_with_subquery` in `query_decomposer`.
+  These were introduced/extended in 1.4.2 to handle the deferred-mode
+  pre-rewrite. The 1.4.3 single-call deferred path uses the temp views
+  directly through `replace_source_with_transition` (same as immediate
+  mode), so the pre-rewrite helpers and their tests are dead code.
+
+### Tests
+- 514 tests pass (513 lib + 1 new pg-level `pg_test_deferred_spurious_update_skips_imv_bodies`).
+  Net: -13 dead unit tests for the removed pre-rewrite helpers,
+  +1 integration test for the spurious-UPDATE skip.
+
+### Migration
+- `ALTER EXTENSION pg_reflex UPDATE TO '1.4.3'`. No catalog rewrites; no
+  IMV rebuilds. Open a fresh connection to drop any 1.4.2-or-older
+  per-backend delta-SQL cache entries.
+
 ## [1.4.2] - 2026-05-12
 
 ### Fixed
