@@ -377,7 +377,7 @@ Useful columns:
 
 ## API Reference
 
-### `create_reflex_ivm(view_name, sql [, unique_columns [, storage [, mode]]]) -> TEXT`
+### `create_reflex_ivm(view_name, sql [, unique_columns [, storage [, mode [, ignore_sources]]]]) -> TEXT`
 
 Creates an incremental materialized view from a SELECT query. Returns `'CREATE REFLEX INCREMENTAL VIEW'` on success, or `'ERROR: ...'` on failure.
 
@@ -389,6 +389,7 @@ Creates an incremental materialized view from a SELECT query. Returns `'CREATE R
 | `unique_columns` | TEXT | NULL | Comma-separated unique key columns for passthrough IMVs |
 | `storage` | TEXT | `'UNLOGGED'` | `'LOGGED'` for crash-safe WAL-logged tables, `'UNLOGGED'` for max performance |
 | `mode` | TEXT | `'IMMEDIATE'` | `'DEFERRED'` to batch deltas until COMMIT, `'IMMEDIATE'` for per-statement updates |
+| `ignore_sources` | TEXT | NULL | (1.4.5) Comma-separated source list to exclude from trigger installation. DML on listed sources will NOT refresh this IMV; use `reflex_reconcile` or periodic refresh instead. Both schema-qualified (`alp.product`) and bare (`product`) names accepted — use whatever form appears in the IMV's `depends_on`. Persisted in `__reflex_ivm_reference.ignored_sources` so triggers installed by sibling IMVs also skip this IMV when fired by an ignored source. |
 
 **What it creates** depends on the query type:
 
@@ -415,13 +416,19 @@ SELECT create_reflex_ivm('critical_view',
     'SELECT region, SUM(amount) AS total FROM sales GROUP BY region',
     NULL, 'LOGGED');
 
--- Full (5 args)
+-- Deferred mode (5 args)
 SELECT create_reflex_ivm('batch_view',
     'SELECT region, SUM(amount) AS total FROM sales GROUP BY region',
     NULL, 'UNLOGGED', 'DEFERRED');
+
+-- Exclude a source from triggers (6 args, 1.4.5+)
+SELECT create_reflex_ivm('fcst',
+    'SELECT s.fk_id, SUM(s.qty) FROM child s JOIN parent p ON p.id = s.fk_id GROUP BY s.fk_id',
+    NULL, 'UNLOGGED', 'IMMEDIATE',
+    'parent');  -- DML on parent won't refresh fcst; run reflex_reconcile periodically
 ```
 
-### `create_reflex_ivm_if_not_exists(view_name, sql [, unique_columns [, storage [, mode]]]) -> TEXT`
+### `create_reflex_ivm_if_not_exists(view_name, sql [, unique_columns [, storage [, mode [, ignore_sources]]]]) -> TEXT`
 
 Same as `create_reflex_ivm`, but returns `'REFLEX INCREMENTAL VIEW ALREADY EXISTS (skipped)'` instead of an error if the view already exists. Same parameters.
 
@@ -463,6 +470,34 @@ Refreshes all IMVs that depend on the given source table or materialized view. U
 ```sql
 -- Refresh all IMVs that read from the 'orders' table
 SELECT refresh_imv_depending_on('orders');
+```
+
+### `reflex_compact_imv(view_name TEXT) -> TEXT`
+
+(1.4.5+) Runs `VACUUM (FULL)` on both the intermediate and target tables of an IMV. The 1.4.3→1.4.4 migration set `fillfactor=70` on these tables but did not rewrite existing pages — HOT updates only fire once pages have been written with the new fillfactor. Call this once per legacy IMV to materialize the new fillfactor immediately.
+
+Takes `ACCESS EXCLUSIVE` on each table; schedule during a maintenance window for multi-gigabyte IMVs.
+
+```sql
+SELECT reflex_compact_imv('sales_by_region');
+```
+
+### `reflex_compact_all_imv() -> TEXT`
+
+(1.4.5+) Convenience wrapper that runs `reflex_compact_imv` on every enabled IMV in `(graph_depth, name)` order. A failure on one IMV does not abort the rest; the per-IMV outcome is summarized in the return value. Same `ACCESS EXCLUSIVE` caveat applies — typically run during a maintenance window.
+
+```sql
+SELECT reflex_compact_all_imv();
+```
+
+### `reflex_probe_not_null_columns(view_name TEXT) -> TEXT`
+
+(1.4.5+) Re-probes the intermediate of an existing IMV for effectively-NOT-NULL group-by columns and updates the stored aggregations metadata. The trigger codegen consults `not_null_columns` to choose between sargable `=` and NULL-safe `IS NOT DISTINCT FROM` on group-key probes, so re-running this after a data-shape change (e.g. a backfill that introduces NULLs into a previously NULL-free column, or vice-versa) keeps the codegen index-friendly.
+
+Idempotent: a call with no data change reports zero additions.
+
+```sql
+SELECT reflex_probe_not_null_columns('sales_by_region');
 ```
 
 ## Testing

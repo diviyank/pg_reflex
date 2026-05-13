@@ -376,10 +376,10 @@ pub fn build_trigger_ddls(source_table: &str) -> Vec<String> {
     //
     // Early-exit: if the transition table is empty, skip the entire loop (no IMVs to process).
     // This avoids Rust FFI calls and advisory locks when a statement affects 0 relevant rows.
-    // 1.4.5: filter out IMVs that explicitly ignored this source via
-    // create_reflex_ivm_with_ignore_sources. The check covers both
-    // schema-qualified ('alp.product') and bare ('product') forms so users
-    // can write whichever matches their IMV's depends_on entry.
+    // 1.4.5: filter out IMVs that explicitly ignored this source via the
+    // `ignore_sources` parameter of `create_reflex_ivm`. The check covers
+    // both schema-qualified ('alp.product') and bare ('product') forms so
+    // users can write whichever matches their IMV's depends_on entry.
     let bare_source = source_table
         .split('.')
         .next_back()

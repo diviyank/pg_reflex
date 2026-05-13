@@ -89,8 +89,7 @@ fn test_deferred_groupby_insert_oracle() {
 
     crate::create_reflex_ivm("dfi_view",
         "SELECT city, SUM(amount) AS total, COUNT(*) AS cnt FROM dfi GROUP BY city",
-        None, None, Some("DEFERRED")    None,
-        None, None, Some("DEFERRED"));
+        None, None, Some("DEFERRED"), None);
 
     let fresh = "SELECT city, SUM(amount) AS total, COUNT(*) AS cnt FROM dfi GROUP BY city";
     assert_imv_correct("dfi_view", fresh);
@@ -125,8 +124,7 @@ fn test_deferred_batch_coalescing() {
 
     crate::create_reflex_ivm("dbc_view",
         "SELECT grp, SUM(val) AS total FROM dbc GROUP BY grp",
-        None, None, Some("DEFERRED")    None,
-        None, None, Some("DEFERRED"));
+        None, None, Some("DEFERRED"), None);
 
     let fresh = "SELECT grp, SUM(val) AS total FROM dbc GROUP BY grp";
 
@@ -150,8 +148,7 @@ fn test_deferred_delete_oracle() {
 
     crate::create_reflex_ivm("dfd_view",
         "SELECT grp, SUM(val) AS total FROM dfd GROUP BY grp",
-        None, None, Some("DEFERRED")    None,
-        None, None, Some("DEFERRED"));
+        None, None, Some("DEFERRED"), None);
 
     let fresh = "SELECT grp, SUM(val) AS total FROM dfd GROUP BY grp";
     assert_imv_correct("dfd_view", fresh);
@@ -175,8 +172,7 @@ fn test_deferred_update_oracle() {
 
     crate::create_reflex_ivm("dfu_view",
         "SELECT grp, SUM(val) AS total FROM dfu GROUP BY grp",
-        None, None, Some("DEFERRED")    None,
-        None, None, Some("DEFERRED"));
+        None, None, Some("DEFERRED"), None);
 
     let fresh = "SELECT grp, SUM(val) AS total FROM dfu GROUP BY grp";
     assert_imv_correct("dfu_view", fresh);
@@ -200,8 +196,7 @@ fn test_deferred_mixed_mutations() {
 
     crate::create_reflex_ivm("dfm_view",
         "SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM dfm GROUP BY grp",
-        None, None, Some("DEFERRED")    None,
-        None, None, Some("DEFERRED"));
+        None, None, Some("DEFERRED"), None);
 
     let fresh = "SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM dfm GROUP BY grp";
     assert_imv_correct("dfm_view", fresh);
@@ -225,8 +220,7 @@ fn test_deferred_distinct_oracle() {
 
     crate::create_reflex_ivm("dfdst_view",
         "SELECT DISTINCT val FROM dfdst",
-        None, None, Some("DEFERRED")    None,
-        None, None, Some("DEFERRED"));
+        None, None, Some("DEFERRED"), None);
 
     let fresh = "SELECT DISTINCT val FROM dfdst";
     assert_imv_correct("dfdst_view", fresh);
@@ -255,8 +249,7 @@ fn test_deferred_null_values() {
 
     crate::create_reflex_ivm("dfn_view",
         "SELECT grp, SUM(val) AS total, COUNT(val) AS cv, COUNT(*) AS cs FROM dfn GROUP BY grp",
-        None, None, Some("DEFERRED")    None,
-        None, None, Some("DEFERRED"));
+        None, None, Some("DEFERRED"), None);
 
     let fresh = "SELECT grp, SUM(val) AS total, COUNT(val) AS cv, COUNT(*) AS cs FROM dfn GROUP BY grp";
     assert_imv_correct("dfn_view", fresh);
@@ -291,8 +284,7 @@ fn test_deferred_fuzz() {
 
     crate::create_reflex_ivm("df_fuzz_view",
         "SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM df_fuzz GROUP BY grp",
-        None, None, Some("DEFERRED")    None,
-        None, None, Some("DEFERRED"));
+        None, None, Some("DEFERRED"), None);
 
     let fresh = "SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM df_fuzz GROUP BY grp";
     assert_imv_correct("df_fuzz_view", fresh);
@@ -321,8 +313,7 @@ fn test_deferred_update_to_null_all_null_group() {
 
     crate::create_reflex_ivm("dfun_view",
         "SELECT grp, SUM(val) AS total, COUNT(val) AS cv, COUNT(*) AS cs FROM dfun GROUP BY grp",
-        None, None, Some("DEFERRED")    None,
-        None, None, Some("DEFERRED"));
+        None, None, Some("DEFERRED"), None);
 
     let fresh = "SELECT grp, SUM(val) AS total, COUNT(val) AS cv, COUNT(*) AS cs FROM dfun GROUP BY grp";
     assert_imv_correct("dfun_view", fresh);
@@ -342,8 +333,7 @@ fn test_immediate_update_to_null_all_null_group() {
 
     crate::create_reflex_ivm("imun_view",
         "SELECT grp, SUM(val) AS total, COUNT(val) AS cv, COUNT(*) AS cs FROM imun GROUP BY grp",
-        None, None, Some("IMMEDIATE")    None,
-        None, None, Some("IMMEDIATE"));
+        None, None, Some("IMMEDIATE"), None);
 
     let fresh = "SELECT grp, SUM(val) AS total, COUNT(val) AS cv, COUNT(*) AS cs FROM imun GROUP BY grp";
     assert_imv_correct("imun_view", fresh);

@@ -784,7 +784,7 @@ fn pg_test_wipe_dispatch_low_selectivity_uses_merge() {
     );
 }
 
-/// 1.4.5 — `create_reflex_ivm_with_ignore_sources` suppresses trigger
+/// 1.4.5 — `create_reflex_ivm(... ignore_sources)` suppresses trigger
 /// installation on listed sources. DML on those sources must NOT update the
 /// IMV; reconcile picks up the drift.
 #[pg_test]
@@ -800,12 +800,11 @@ fn pg_test_ignore_sources_suppresses_trigger() {
     // Create IMV with parent ignored — UPDATEs on parent should NOT fire
     // a trigger that refreshes the IMV.
     let r = Spi::get_one::<&str>(
-        "SELECT public.create_reflex_ivm_with_ignore_sources( \
+        "SELECT public.create_reflex_ivm( \
             'isr.kv', \
             'SELECT c.fk_id, SUM(c.qty) AS total FROM isr.child c \
              INNER JOIN isr.parent p ON p.id = c.fk_id GROUP BY c.fk_id', \
-            'isr.parent', \
-            NULL, 'UNLOGGED', 'IMMEDIATE' \
+            NULL, 'UNLOGGED', 'IMMEDIATE', 'isr.parent' \
          )",
     )
     .expect("create")
@@ -874,6 +873,23 @@ fn pg_test_ignore_sources_suppresses_trigger() {
     )
     .expect("query");
     assert!(total_for_3.is_some(), "post-reconcile IMV must include fk_id=3");
+}
+
+/// 1.4.5 — `reflex_compact_all_imv()` on an empty catalog returns the
+/// no-op marker. VACUUM FULL itself cannot run inside the pgrx test
+/// transaction wrapper, so we only test the iteration entry / empty
+/// fast-path here. End-to-end VACUUM behavior is exercised by the
+/// 1.4.4→1.4.5 migration and operator-facing benchmarks.
+#[pg_test]
+fn pg_test_reflex_compact_all_imv_empty_catalog() {
+    let summary: String = Spi::get_one("SELECT public.reflex_compact_all_imv()")
+        .expect("compact all")
+        .expect("v");
+    assert!(
+        summary.contains("no enabled IMVs"),
+        "expected empty-catalog marker, got: {}",
+        summary
+    );
 }
 
 /// 1.4.5 — `reflex_probe_not_null_columns(view_name)` re-probes an existing

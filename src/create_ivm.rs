@@ -1871,6 +1871,63 @@ pub(crate) fn reflex_compact_imv_impl(view_name: &str) -> String {
     }
 }
 
+/// 1.4.5 — `reflex_compact_all_imv() RETURNS TEXT`.
+///
+/// VACUUM FULL every enabled IMV's intermediate and target tables. Iterates
+/// the catalog in `(graph_depth, name)` order and dispatches to
+/// `reflex_compact_imv_impl` for each row. Errors on one IMV are recorded
+/// in the result but do not abort processing of the remaining IMVs — this
+/// matches the semantics of a maintenance-window operator who wants
+/// "compact everything you can".
+pub(crate) fn reflex_compact_all_imv_impl() -> String {
+    let names: Vec<String> = Spi::connect(|client| {
+        let mut out: Vec<String> = Vec::new();
+        if let Ok(table) = client.select(
+            "SELECT name FROM public.__reflex_ivm_reference \
+             WHERE enabled = TRUE ORDER BY graph_depth, name",
+            None,
+            &[],
+        ) {
+            for row in table {
+                if let Ok(Some(name)) = row.get::<&str>(1) {
+                    out.push(name.to_string());
+                }
+            }
+        }
+        out
+    });
+    if names.is_empty() {
+        return "pg_reflex: no enabled IMVs to compact".to_string();
+    }
+    let t0 = std::time::Instant::now();
+    let mut successes = 0usize;
+    let mut failures: Vec<String> = Vec::new();
+    let mut details: Vec<String> = Vec::new();
+    for name in &names {
+        let msg = reflex_compact_imv_impl(name);
+        if msg.starts_with("ERROR") {
+            failures.push(format!("{}: {}", name, msg));
+        } else {
+            successes += 1;
+        }
+        details.push(msg);
+    }
+    let total_ms = t0.elapsed().as_millis();
+    let mut summary = format!(
+        "pg_reflex: compacted {}/{} IMV(s) in {} ms",
+        successes,
+        names.len(),
+        total_ms
+    );
+    if !failures.is_empty() {
+        summary.push_str(" — failures: ");
+        summary.push_str(&failures.join("; "));
+    }
+    summary.push('\n');
+    summary.push_str(&details.join("\n"));
+    summary
+}
+
 /// Map information_schema data_type strings to PostgreSQL type names usable in DDL.
 fn map_information_schema_type(data_type: &str) -> String {
     match data_type {

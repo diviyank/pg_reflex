@@ -618,8 +618,7 @@ fn test_correctness_count_with_nulls() {
 
     crate::create_reflex_ivm("ca1_view",
         "SELECT grp, COUNT(*) AS cnt_star, COUNT(val) AS cnt_val FROM ca1 GROUP BY grp",
-        None, None, None    None,
-        None, None, None);
+        None, None, None, None);
 
     let fresh = "SELECT grp, COUNT(*) AS cnt_star, COUNT(val) AS cnt_val FROM ca1 GROUP BY grp";
     assert_imv_correct("ca1_view", fresh);
@@ -641,8 +640,7 @@ fn test_correctness_group_disappears() {
 
     crate::create_reflex_ivm("ca2_view",
         "SELECT grp, SUM(val) AS total FROM ca2 GROUP BY grp",
-        None, None, None    None,
-        None, None, None);
+        None, None, None, None);
 
     let fresh = "SELECT grp, SUM(val) AS total FROM ca2 GROUP BY grp";
     assert_imv_correct("ca2_view", fresh);
@@ -666,8 +664,7 @@ fn test_correctness_empty_table_aggregates() {
 
     crate::create_reflex_ivm("ca3_view",
         "SELECT SUM(val) AS s, COUNT(val) AS c, COUNT(*) AS cs FROM ca3",
-        None, None, None    None,
-        None, None, None);
+        None, None, None, None);
 
     let fresh = "SELECT SUM(val) AS s, COUNT(val) AS c, COUNT(*) AS cs FROM ca3";
     assert_imv_correct("ca3_view", fresh);
@@ -687,8 +684,7 @@ fn test_correctness_min_max_extremum_deleted() {
 
     crate::create_reflex_ivm("ca5_view",
         "SELECT grp, MIN(val) AS lo, MAX(val) AS hi FROM ca5 GROUP BY grp",
-        None, None, None    None,
-        None, None, None);
+        None, None, None, None);
 
     let fresh = "SELECT grp, MIN(val) AS lo, MAX(val) AS hi FROM ca5 GROUP BY grp";
     assert_imv_correct("ca5_view", fresh);
@@ -710,8 +706,7 @@ fn test_correctness_multi_agg_same_col() {
 
     crate::create_reflex_ivm("ca7_view",
         "SELECT grp, COUNT(a) AS c, MIN(a) AS lo, MAX(a) AS hi, SUM(a) AS s FROM ca7 GROUP BY grp",
-        None, None, None    None,
-        None, None, None);
+        None, None, None, None);
 
     let fresh = "SELECT grp, COUNT(a) AS c, MIN(a) AS lo, MAX(a) AS hi, SUM(a) AS s FROM ca7 GROUP BY grp";
     assert_imv_correct("ca7_view", fresh);
@@ -734,8 +729,7 @@ fn test_correctness_having_threshold() {
 
     crate::create_reflex_ivm("ca9_view",
         "SELECT grp, SUM(val) AS total FROM ca9 GROUP BY grp HAVING SUM(val) > 15",
-        None, None, None    None,
-        None, None, None);
+        None, None, None, None);
 
     let fresh = "SELECT grp, SUM(val) AS total FROM ca9 GROUP BY grp HAVING SUM(val) > 15";
     assert_imv_correct("ca9_view", fresh);
@@ -757,8 +751,7 @@ fn test_correctness_self_join() {
 
     crate::create_reflex_ivm("cb1_view",
         "SELECT t1.i, SUM(t1.v + t2.v) AS total FROM cb1 t1 JOIN cb1 t2 ON t1.i = t2.i GROUP BY t1.i",
-        None, None, None    None,
-        None, None, None);
+        None, None, None, None);
 
     let fresh = "SELECT t1.i, SUM(t1.v + t2.v) AS total FROM cb1 t1 JOIN cb1 t2 ON t1.i = t2.i GROUP BY t1.i";
     assert_imv_correct("cb1_view", fresh);
@@ -786,8 +779,7 @@ fn test_correctness_join_duplicates() {
 
     crate::create_reflex_ivm("cb6_view",
         "SELECT a.grp, SUM(b.val) AS total FROM cb6_a a JOIN cb6_b b ON a.grp = b.grp GROUP BY a.grp",
-        None, None, None    None,
-        None, None, None);
+        None, None, None, None);
 
     let fresh = "SELECT a.grp, SUM(b.val) AS total FROM cb6_a a JOIN cb6_b b ON a.grp = b.grp GROUP BY a.grp";
     assert_imv_correct("cb6_view", fresh);
@@ -807,8 +799,7 @@ fn test_correctness_null_mutations() {
 
     crate::create_reflex_ivm("cc_view",
         "SELECT grp, SUM(val) AS total, COUNT(val) AS cv, COUNT(*) AS cs FROM cc GROUP BY grp",
-        None, None, None    None,
-        None, None, None);
+        None, None, None, None);
 
     let fresh = "SELECT grp, SUM(val) AS total, COUNT(val) AS cv, COUNT(*) AS cs FROM cc GROUP BY grp";
     assert_imv_correct("cc_view", fresh);
@@ -857,8 +848,7 @@ fn test_correctness_truncate() {
 
     crate::create_reflex_ivm("cf1_view",
         "SELECT grp, SUM(val) AS total FROM cf1 GROUP BY grp",
-        None, None, None    None,
-        None, None, None);
+        None, None, None, None);
 
     let fresh = "SELECT grp, SUM(val) AS total FROM cf1 GROUP BY grp";
     assert_imv_correct("cf1_view", fresh);
@@ -879,8 +869,7 @@ fn test_correctness_update_group_key() {
 
     crate::create_reflex_ivm("cf3_view",
         "SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM cf3 GROUP BY grp",
-        None, None, None    None,
-        None, None, None);
+        None, None, None, None);
 
     let fresh = "SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM cf3 GROUP BY grp";
     assert_imv_correct("cf3_view", fresh);
@@ -903,8 +892,7 @@ fn test_correctness_batch_insert_10k() {
 
     crate::create_reflex_ivm("cf6_view",
         "SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM cf6 GROUP BY grp",
-        None, None, None    None,
-        None, None, None);
+        None, None, None, None);
 
     // Insert 10K rows across 100 groups
     Spi::run("INSERT INTO cf6 (grp, val) SELECT 'g' || (i % 100), i FROM generate_series(1, 10000) i").expect("batch");
@@ -922,8 +910,7 @@ fn test_correctness_cte_cascade() {
     crate::create_reflex_ivm("cte_view",
         "WITH by_city AS (SELECT region, city, SUM(amount) AS city_total FROM cte_src GROUP BY region, city) \
          SELECT region, SUM(city_total) AS total, COUNT(*) AS num_cities FROM by_city GROUP BY region",
-        None, None, None    None,
-        None, None, None);
+        None, None, None, None);
 
     let fresh = "WITH by_city AS (SELECT region, city, SUM(amount) AS city_total FROM cte_src GROUP BY region, city) \
                  SELECT region, SUM(city_total) AS total, COUNT(*) AS num_cities FROM by_city GROUP BY region";
@@ -949,8 +936,7 @@ fn test_correctness_union_all() {
 
     crate::create_reflex_ivm("cu_view",
         "SELECT val FROM cu_a UNION ALL SELECT val FROM cu_b",
-        None, None, None    None,
-        None, None, None);
+        None, None, None, None);
 
     let fresh = "SELECT val FROM cu_a UNION ALL SELECT val FROM cu_b";
     assert_imv_correct("cu_view", fresh);
@@ -971,8 +957,7 @@ fn test_correctness_window_groupby_rank() {
 
     crate::create_reflex_ivm("cw_view",
         "SELECT city, SUM(amount) AS total, RANK() OVER (ORDER BY SUM(amount) DESC) AS rnk FROM cw GROUP BY city",
-        None, None, None    None,
-        None, None, None);
+        None, None, None, None);
 
     let fresh = "SELECT city, SUM(amount) AS total, RANK() OVER (ORDER BY SUM(amount) DESC) AS rnk FROM cw GROUP BY city";
     assert_imv_correct("cw_view", fresh);
@@ -998,8 +983,7 @@ fn test_correctness_avg_precision() {
 
     crate::create_reflex_ivm("cavg_view",
         "SELECT grp, AVG(val) AS avg_val FROM cavg GROUP BY grp",
-        None, None, None    None,
-        None, None, None);
+        None, None, None, None);
 
     let fresh = "SELECT grp, AVG(val) AS avg_val FROM cavg GROUP BY grp";
     assert_imv_correct("cavg_view", fresh);
@@ -1025,8 +1009,7 @@ fn test_correctness_passthrough_join() {
 
     crate::create_reflex_ivm("cp_view",
         "SELECT s.id, s.val, d.label FROM cp_src s JOIN cp_dim d ON s.did = d.id",
-        Some("id"), None, None    None,
-        Some("id"), None, None);
+        Some("id"), None, None, None);
 
     let fresh = "SELECT s.id, s.val, d.label FROM cp_src s JOIN cp_dim d ON s.did = d.id";
     assert_imv_correct("cp_view", fresh);
@@ -1049,8 +1032,7 @@ fn test_correctness_noop_update() {
 
     crate::create_reflex_ivm("nop_view",
         "SELECT grp, SUM(val) AS total FROM nop GROUP BY grp",
-        None, None, None    None,
-        None, None, None);
+        None, None, None, None);
 
     let fresh = "SELECT grp, SUM(val) AS total FROM nop GROUP BY grp";
     assert_imv_correct("nop_view", fresh);
@@ -1072,8 +1054,7 @@ fn test_correctness_delete_where_false() {
 
     crate::create_reflex_ivm("dwf_view",
         "SELECT grp, SUM(val) AS total FROM dwf GROUP BY grp",
-        None, None, None    None,
-        None, None, None);
+        None, None, None, None);
 
     let fresh = "SELECT grp, SUM(val) AS total FROM dwf GROUP BY grp";
     Spi::run("DELETE FROM dwf WHERE FALSE").expect("delete where false");
@@ -1088,8 +1069,7 @@ fn test_correctness_exact_duplicates() {
 
     crate::create_reflex_ivm("dup_view",
         "SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM dup GROUP BY grp",
-        None, None, None    None,
-        None, None, None);
+        None, None, None, None);
 
     let fresh = "SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM dup GROUP BY grp";
     assert_imv_correct("dup_view", fresh);
@@ -1115,8 +1095,7 @@ fn test_correctness_update_join_key() {
 
     crate::create_reflex_ivm("ujk_view",
         "SELECT s.id, s.val, d.label FROM ujk_src s JOIN ujk_dim d ON s.did = d.id",
-        Some("id"), None, None    None,
-        Some("id"), None, None);
+        Some("id"), None, None, None);
 
     let fresh = "SELECT s.id, s.val, d.label FROM ujk_src s JOIN ujk_dim d ON s.did = d.id";
     assert_imv_correct("ujk_view", fresh);
@@ -1142,8 +1121,7 @@ fn test_correctness_delete_dimension() {
 
     crate::create_reflex_ivm("dd_view",
         "SELECT d.label, SUM(s.val) AS total FROM dd_src s JOIN dd_dim d ON s.did = d.id GROUP BY d.label",
-        None, None, None    None,
-        None, None, None);
+        None, None, None, None);
 
     let fresh = "SELECT d.label, SUM(s.val) AS total FROM dd_src s JOIN dd_dim d ON s.did = d.id GROUP BY d.label";
     assert_imv_correct("dd_view", fresh);
@@ -1180,8 +1158,7 @@ fn test_correctness_bool_or_delete() {
 
     crate::create_reflex_ivm("bo_view",
         "SELECT grp, bool_or(flag) AS any_true FROM bo GROUP BY grp",
-        None, None, None    None,
-        None, None, None);
+        None, None, None, None);
 
     let fresh = "SELECT grp, bool_or(flag) AS any_true FROM bo GROUP BY grp";
     assert_imv_correct("bo_view", fresh);
@@ -1203,8 +1180,7 @@ fn test_correctness_large_single_group() {
 
     crate::create_reflex_ivm("lsg_view",
         "SELECT grp, SUM(val) AS total, COUNT(*) AS cnt, MIN(val) AS lo, MAX(val) AS hi FROM lsg GROUP BY grp",
-        None, None, None    None,
-        None, None, None);
+        None, None, None, None);
 
     let fresh = "SELECT grp, SUM(val) AS total, COUNT(*) AS cnt, MIN(val) AS lo, MAX(val) AS hi FROM lsg GROUP BY grp";
     assert_imv_correct("lsg_view", fresh);
@@ -1230,8 +1206,7 @@ fn test_correctness_rapid_mutations() {
 
     crate::create_reflex_ivm("rm_view",
         "SELECT grp, SUM(val) AS total FROM rm GROUP BY grp",
-        None, None, None    None,
-        None, None, None);
+        None, None, None, None);
 
     let fresh = "SELECT grp, SUM(val) AS total FROM rm GROUP BY grp";
     assert_imv_correct("rm_view", fresh);
@@ -1262,8 +1237,7 @@ fn test_correctness_except_order() {
     // A EXCEPT B should give 'x' (in A but not B)
     crate::create_reflex_ivm("eo_ab",
         "SELECT val FROM eo_a EXCEPT SELECT val FROM eo_b",
-        None, None, None    None,
-        None, None, None);
+        None, None, None, None);
     let fresh_ab = "SELECT val FROM eo_a EXCEPT SELECT val FROM eo_b";
     assert_imv_correct("eo_ab", fresh_ab);
     assert_eq!(
@@ -1295,8 +1269,7 @@ fn test_correctness_intersect_empties() {
 
     crate::create_reflex_ivm("ie_view",
         "SELECT val FROM ie_a INTERSECT SELECT val FROM ie_b",
-        None, None, None    None,
-        None, None, None);
+        None, None, None, None);
 
     let fresh = "SELECT val FROM ie_a INTERSECT SELECT val FROM ie_b";
     assert_imv_correct("ie_view", fresh);
@@ -1332,8 +1305,7 @@ fn test_correctness_window_partition_empty() {
 
     crate::create_reflex_ivm("wpe_view",
         "SELECT dept, name, score, ROW_NUMBER() OVER (PARTITION BY dept ORDER BY score DESC) AS rnk FROM wpe",
-        None, None, None    None,
-        None, None, None);
+        None, None, None, None);
 
     let fresh = "SELECT dept, name, score, ROW_NUMBER() OVER (PARTITION BY dept ORDER BY score DESC) AS rnk FROM wpe";
     assert_imv_correct("wpe_view", fresh);
@@ -1357,8 +1329,7 @@ fn test_correctness_avg_group_vanishes() {
 
     crate::create_reflex_ivm("avg_van_view",
         "SELECT grp, AVG(val) AS avg_val FROM avg_van GROUP BY grp",
-        None, None, None    None,
-        None, None, None);
+        None, None, None, None);
 
     let fresh = "SELECT grp, AVG(val) AS avg_val FROM avg_van GROUP BY grp";
     assert_imv_correct("avg_van_view", fresh);
@@ -1382,8 +1353,7 @@ fn test_correctness_cte_dml_multi_table() {
 
     crate::create_reflex_ivm("cm_view",
         "SELECT SUM(val) AS total FROM cm_a",
-        None, None, None    None,
-        None, None, None);
+        None, None, None, None);
 
     let fresh = "SELECT SUM(val) AS total FROM cm_a";
     assert_imv_correct("cm_view", fresh);
@@ -1403,8 +1373,7 @@ fn test_correctness_passthrough_no_key() {
     // No unique key provided, no PK auto-detection (id not in SELECT)
     crate::create_reflex_ivm("pnk_view",
         "SELECT city, val FROM pnk",
-        None, None, None    None,
-        None, None, None);
+        None, None, None, None);
 
     let fresh = "SELECT city, val FROM pnk";
     assert_imv_correct("pnk_view", fresh);
@@ -1432,8 +1401,7 @@ fn test_correctness_union_agg_mutations() {
         "SELECT grp, SUM(val) AS total FROM uam_a GROUP BY grp \
          UNION ALL \
          SELECT grp, SUM(val) AS total FROM uam_b GROUP BY grp",
-        None, None, None    None,
-        None, None, None);
+        None, None, None, None);
 
     let fresh = "SELECT grp, SUM(val) AS total FROM uam_a GROUP BY grp \
                  UNION ALL \
@@ -1458,8 +1426,7 @@ fn test_correctness_stress_interleaved() {
 
     crate::create_reflex_ivm("stress_view",
         "SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM stress GROUP BY grp",
-        None, None, None    None,
-        None, None, None);
+        None, None, None, None);
 
     let fresh = "SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM stress GROUP BY grp";
     assert_imv_correct("stress_view", fresh);
@@ -1491,8 +1458,7 @@ fn test_correctness_left_join_nulls() {
 
     crate::create_reflex_ivm("lj_view",
         "SELECT l.grp, SUM(r.val) AS total FROM lj_l l LEFT JOIN lj_r r ON l.grp = r.grp GROUP BY l.grp",
-        None, None, None    None,
-        None, None, None);
+        None, None, None, None);
 
     let fresh = "SELECT l.grp, SUM(r.val) AS total FROM lj_l l LEFT JOIN lj_r r ON l.grp = r.grp GROUP BY l.grp";
     assert_imv_correct("lj_view", fresh);
@@ -1518,8 +1484,7 @@ fn test_correctness_cast_propagation() {
 
     crate::create_reflex_ivm("ccast_view",
         "SELECT grp, SUM(val)::BIGINT AS total FROM ccast GROUP BY grp",
-        None, None, None    None,
-        None, None, None);
+        None, None, None, None);
 
     let fresh = "SELECT grp, SUM(val)::BIGINT AS total FROM ccast GROUP BY grp";
     assert_imv_correct("ccast_view", fresh);
@@ -1542,16 +1507,13 @@ fn test_correctness_multi_imv_same_source() {
 
     crate::create_reflex_ivm("m1_view",
         "SELECT grp, SUM(val) AS total FROM msrc GROUP BY grp",
-        None, None, None    None,
-        None, None, None);
+        None, None, None, None);
     crate::create_reflex_ivm("m2_view",
         "SELECT grp, COUNT(*) AS cnt FROM msrc GROUP BY grp",
-        None, None, None    None,
-        None, None, None);
+        None, None, None, None);
     crate::create_reflex_ivm("m3_view",
         "SELECT grp, AVG(val) AS avg_val FROM msrc GROUP BY grp",
-        None, None, None    None,
-        None, None, None);
+        None, None, None, None);
 
     let f1 = "SELECT grp, SUM(val) AS total FROM msrc GROUP BY grp";
     let f2 = "SELECT grp, COUNT(*) AS cnt FROM msrc GROUP BY grp";
@@ -1590,8 +1552,7 @@ fn test_correctness_wide_intermediate() {
         "SELECT grp, SUM(a) AS sa, SUM(b) AS sb, COUNT(*) AS cnt, \
                 MIN(a) AS mina, MAX(b) AS maxb, AVG(a) AS avga \
          FROM wide GROUP BY grp",
-        None, None, None    None,
-        None, None, None);
+        None, None, None, None);
 
     let fresh = "SELECT grp, SUM(a) AS sa, SUM(b) AS sb, COUNT(*) AS cnt, \
                  MIN(a) AS mina, MAX(b) AS maxb, AVG(a) AS avga \
@@ -1616,8 +1577,7 @@ fn test_correctness_delete_all_reinsert() {
 
     crate::create_reflex_ivm("dar_view",
         "SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM dar GROUP BY grp",
-        None, None, None    None,
-        None, None, None);
+        None, None, None, None);
 
     let fresh = "SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM dar GROUP BY grp";
     assert_imv_correct("dar_view", fresh);
@@ -1640,8 +1600,7 @@ fn test_correctness_having_bounce() {
 
     crate::create_reflex_ivm("hb_view",
         "SELECT grp, SUM(val) AS total FROM hb GROUP BY grp HAVING SUM(val) >= 10",
-        None, None, None    None,
-        None, None, None);
+        None, None, None, None);
 
     let fresh = "SELECT grp, SUM(val) AS total FROM hb GROUP BY grp HAVING SUM(val) >= 10";
     // Initial: a=11 (>=10, visible), b=20 (visible)
@@ -1679,8 +1638,7 @@ fn test_correctness_union_three_operands() {
 
     crate::create_reflex_ivm("u3_view",
         "SELECT val FROM u3a UNION ALL SELECT val FROM u3b UNION ALL SELECT val FROM u3c",
-        None, None, None    None,
-        None, None, None);
+        None, None, None, None);
 
     let fresh = "SELECT val FROM u3a UNION ALL SELECT val FROM u3b UNION ALL SELECT val FROM u3c";
     assert_imv_correct("u3_view", fresh);
@@ -1706,8 +1664,7 @@ fn test_correctness_window_multi_partition_mutations() {
 
     crate::create_reflex_ivm("wmp_view",
         "SELECT dept, name, score, ROW_NUMBER() OVER (PARTITION BY dept ORDER BY score DESC) AS rnk FROM wmp",
-        None, None, None    None,
-        None, None, None);
+        None, None, None, None);
 
     let fresh = "SELECT dept, name, score, ROW_NUMBER() OVER (PARTITION BY dept ORDER BY score DESC) AS rnk FROM wmp";
     assert_imv_correct("wmp_view", fresh);
@@ -1740,8 +1697,7 @@ fn test_correctness_groupby_window_rerank() {
         "SELECT city, SUM(amount) AS total, \
                 DENSE_RANK() OVER (ORDER BY SUM(amount) DESC) AS rnk \
          FROM gwr GROUP BY city",
-        None, None, None    None,
-        None, None, None);
+        None, None, None, None);
 
     let fresh = "SELECT city, SUM(amount) AS total, \
                  DENSE_RANK() OVER (ORDER BY SUM(amount) DESC) AS rnk \
@@ -1962,8 +1918,7 @@ fn test_correctness_empty_insert() {
 
     crate::create_reflex_ivm("ei_view",
         "SELECT grp, SUM(val) AS total FROM ei GROUP BY grp",
-        None, None, None    None,
-        None, None, None);
+        None, None, None, None);
 
     let fresh = "SELECT grp, SUM(val) AS total FROM ei GROUP BY grp";
     assert_imv_correct("ei_view", fresh);
@@ -1983,8 +1938,7 @@ fn test_correctness_passthrough_update_both_tables() {
 
     crate::create_reflex_ivm("pub_view",
         "SELECT s.id, s.val, d.label FROM pub_src s JOIN pub_dim d ON s.did = d.id",
-        Some("id"), None, None    None,
-        Some("id"), None, None);
+        Some("id"), None, None, None);
 
     let fresh = "SELECT s.id, s.val, d.label FROM pub_src s JOIN pub_dim d ON s.did = d.id";
     assert_imv_correct("pub_view", fresh);
@@ -2006,8 +1960,7 @@ fn test_correctness_distinct_with_group_by() {
 
     crate::create_reflex_ivm("dg_view",
         "SELECT DISTINCT grp, SUM(val) AS total FROM dg GROUP BY grp",
-        None, None, None    None,
-        None, None, None);
+        None, None, None, None);
 
     let fresh = "SELECT DISTINCT grp, SUM(val) AS total FROM dg GROUP BY grp";
     assert_imv_correct("dg_view", fresh);
@@ -2026,8 +1979,7 @@ fn test_correctness_full_table_agg_lifecycle() {
 
     crate::create_reflex_ivm("fta_view",
         "SELECT SUM(val) AS s, COUNT(*) AS c, COUNT(val) AS cv FROM fta",
-        None, None, None    None,
-        None, None, None);
+        None, None, None, None);
 
     let fresh = "SELECT SUM(val) AS s, COUNT(*) AS c, COUNT(val) AS cv FROM fta";
 
@@ -2064,8 +2016,7 @@ fn test_correctness_cte_passthrough_body() {
     crate::create_reflex_ivm("cpb_view",
         "WITH totals AS (SELECT region, SUM(amount) AS total FROM cpb GROUP BY region) \
          SELECT region, total FROM totals WHERE total > 100",
-        None, None, None    None,
-        None, None, None);
+        None, None, None, None);
 
     let fresh = "WITH totals AS (SELECT region, SUM(amount) AS total FROM cpb GROUP BY region) \
                  SELECT region, total FROM totals WHERE total > 100";
@@ -2088,8 +2039,7 @@ fn test_correctness_negative_values() {
 
     crate::create_reflex_ivm("neg_view",
         "SELECT grp, SUM(val) AS total, MIN(val) AS lo, MAX(val) AS hi FROM neg GROUP BY grp",
-        None, None, None    None,
-        None, None, None);
+        None, None, None, None);
 
     let fresh = "SELECT grp, SUM(val) AS total, MIN(val) AS lo, MAX(val) AS hi FROM neg GROUP BY grp";
     assert_imv_correct("neg_view", fresh);
@@ -2114,8 +2064,7 @@ fn test_correctness_decimal_precision() {
 
     crate::create_reflex_ivm("dp_view",
         "SELECT grp, SUM(val) AS total, AVG(val) AS avg_val FROM dp GROUP BY grp",
-        None, None, None    None,
-        None, None, None);
+        None, None, None, None);
 
     let fresh = "SELECT grp, SUM(val) AS total, AVG(val) AS avg_val FROM dp GROUP BY grp";
     assert_imv_correct("dp_view", fresh);
@@ -2143,8 +2092,7 @@ fn test_correctness_intersect_with_agg() {
         "SELECT grp, SUM(val) AS total FROM ia_a GROUP BY grp \
          INTERSECT \
          SELECT grp, SUM(val) AS total FROM ia_b GROUP BY grp",
-        None, None, None    None,
-        None, None, None);
+        None, None, None, None);
 
     let fresh = "SELECT grp, SUM(val) AS total FROM ia_a GROUP BY grp \
                  INTERSECT \
@@ -2171,8 +2119,7 @@ fn test_correctness_stress_100_mutations() {
 
     crate::create_reflex_ivm("s100_view",
         "SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM s100 GROUP BY grp",
-        None, None, None    None,
-        None, None, None);
+        None, None, None, None);
 
     let fresh = "SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM s100 GROUP BY grp";
 
@@ -2588,8 +2535,7 @@ fn test_correctness_timestamp_groupby() {
 
     crate::create_reflex_ivm("ts_view",
         "SELECT ts, SUM(val) AS total FROM ts_src GROUP BY ts",
-        None, None, None    None,
-        None, None, None);
+        None, None, None, None);
     let fresh = "SELECT ts, SUM(val) AS total FROM ts_src GROUP BY ts";
     assert_imv_correct("ts_view", fresh);
 
@@ -2608,8 +2554,7 @@ fn test_correctness_date_groupby() {
 
     crate::create_reflex_ivm("dt_view",
         "SELECT d, SUM(val) AS total, COUNT(*) AS cnt FROM dt_src GROUP BY d",
-        None, None, None    None,
-        None, None, None);
+        None, None, None, None);
     let fresh = "SELECT d, SUM(val) AS total, COUNT(*) AS cnt FROM dt_src GROUP BY d";
     assert_imv_correct("dt_view", fresh);
 
@@ -2628,8 +2573,7 @@ fn test_correctness_float_sum() {
 
     crate::create_reflex_ivm("fl_view",
         "SELECT grp, SUM(val) AS total FROM fl_src GROUP BY grp",
-        None, None, None    None,
-        None, None, None);
+        None, None, None, None);
     let fresh = "SELECT grp, SUM(val) AS total FROM fl_src GROUP BY grp";
     assert_imv_correct("fl_view", fresh);
 
@@ -2651,8 +2595,7 @@ fn test_correctness_bigint_sum() {
 
     crate::create_reflex_ivm("bi_view",
         "SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM bi_src GROUP BY grp",
-        None, None, None    None,
-        None, None, None);
+        None, None, None, None);
     let fresh = "SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM bi_src GROUP BY grp";
     assert_imv_correct("bi_view", fresh);
 
@@ -2671,8 +2614,7 @@ fn test_correctness_text_min_max() {
 
     crate::create_reflex_ivm("tmm_view",
         "SELECT grp, MIN(val) AS lo, MAX(val) AS hi FROM tmm GROUP BY grp",
-        None, None, None    None,
-        None, None, None);
+        None, None, None, None);
     let fresh = "SELECT grp, MIN(val) AS lo, MAX(val) AS hi FROM tmm GROUP BY grp";
     assert_imv_correct("tmm_view", fresh);
 
@@ -2695,8 +2637,7 @@ fn test_correctness_mixed_type_groupby() {
 
     crate::create_reflex_ivm("mix_view",
         "SELECT region, city, d, SUM(val) AS total FROM mix GROUP BY region, city, d",
-        None, None, None    None,
-        None, None, None);
+        None, None, None, None);
     let fresh = "SELECT region, city, d, SUM(val) AS total FROM mix GROUP BY region, city, d";
     assert_imv_correct("mix_view", fresh);
 
@@ -2715,8 +2656,7 @@ fn test_correctness_cast_sum_bigint_mutations() {
 
     crate::create_reflex_ivm("csb_view",
         "SELECT grp, SUM(val)::BIGINT AS total FROM csb GROUP BY grp",
-        None, None, None    None,
-        None, None, None);
+        None, None, None, None);
     let fresh = "SELECT grp, SUM(val)::BIGINT AS total FROM csb GROUP BY grp";
     assert_imv_correct("csb_view", fresh);
 
@@ -2738,8 +2678,7 @@ fn test_correctness_cast_count_int() {
 
     crate::create_reflex_ivm("cci_view",
         "SELECT grp, COUNT(*)::INT AS cnt FROM cci GROUP BY grp",
-        None, None, None    None,
-        None, None, None);
+        None, None, None, None);
     let fresh = "SELECT grp, COUNT(*)::INT AS cnt FROM cci GROUP BY grp";
     assert_imv_correct("cci_view", fresh);
 
@@ -2758,8 +2697,7 @@ fn test_correctness_underscore_column_names() {
 
     crate::create_reflex_ivm("uc_view",
         "SELECT user_region, SUM(order_amount) AS total_amount, SUM(item_count) AS total_items FROM uc GROUP BY user_region",
-        None, None, None    None,
-        None, None, None);
+        None, None, None, None);
     let fresh = "SELECT user_region, SUM(order_amount) AS total_amount, SUM(item_count) AS total_items FROM uc GROUP BY user_region";
     assert_imv_correct("uc_view", fresh);
 
@@ -2778,8 +2716,7 @@ fn test_correctness_keyword_column_names() {
 
     crate::create_reflex_ivm("kw_view",
         "SELECT \"select\", SUM(\"from\") AS total FROM kw_src GROUP BY \"select\"",
-        None, None, None    None,
-        None, None, None);
+        None, None, None, None);
     let fresh = "SELECT \"select\", SUM(\"from\") AS total FROM kw_src GROUP BY \"select\"";
     assert_imv_correct("kw_view", fresh);
 
@@ -2798,8 +2735,7 @@ fn test_correctness_null_group_key() {
 
     crate::create_reflex_ivm("ngk_view",
         "SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM ngk GROUP BY grp",
-        None, None, None    None,
-        None, None, None);
+        None, None, None, None);
 
     let fresh = "SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM ngk GROUP BY grp";
     assert_imv_correct("ngk_view", fresh);
@@ -2834,8 +2770,7 @@ fn test_correctness_null_multi_column_group_key() {
 
     crate::create_reflex_ivm("nmk_view",
         "SELECT g1, g2, SUM(val) AS total FROM nmk GROUP BY g1, g2",
-        None, None, None    None,
-        None, None, None);
+        None, None, None, None);
 
     let fresh = "SELECT g1, g2, SUM(val) AS total FROM nmk GROUP BY g1, g2";
     assert_imv_correct("nmk_view", fresh);
@@ -2860,8 +2795,7 @@ fn test_correctness_expression_in_aggregate() {
 
     crate::create_reflex_ivm("expr_view",
         "SELECT grp, SUM(price * qty) AS revenue FROM expr_agg GROUP BY grp",
-        None, None, None    None,
-        None, None, None);
+        None, None, None, None);
     let fresh = "SELECT grp, SUM(price * qty) AS revenue FROM expr_agg GROUP BY grp";
     assert_imv_correct("expr_view", fresh);
 
@@ -3354,8 +3288,7 @@ fn test_correctness_count_distinct_basic() {
 
     crate::create_reflex_ivm("cd_view",
         "SELECT grp, COUNT(DISTINCT val) AS cd FROM cd_src GROUP BY grp",
-        None, None, None    None,
-        None, None, None);
+        None, None, None, None);
 
     let fresh = "SELECT grp, COUNT(DISTINCT val) AS cd FROM cd_src GROUP BY grp";
     assert_imv_correct("cd_view", fresh);
@@ -3392,8 +3325,7 @@ fn test_correctness_count_distinct_nullable() {
 
     crate::create_reflex_ivm("cdn_view",
         "SELECT grp, COUNT(DISTINCT val) AS cd FROM cdn_src GROUP BY grp",
-        None, None, None    None,
-        None, None, None);
+        None, None, None, None);
 
     let fresh = "SELECT grp, COUNT(DISTINCT val) AS cd FROM cdn_src GROUP BY grp";
     assert_imv_correct("cdn_view", fresh);
@@ -3427,8 +3359,7 @@ fn test_correctness_count_distinct_update() {
 
     crate::create_reflex_ivm("cdu_view",
         "SELECT grp, COUNT(DISTINCT val) AS cd FROM cdu_src GROUP BY grp",
-        None, None, None    None,
-        None, None, None);
+        None, None, None, None);
 
     let fresh = "SELECT grp, COUNT(DISTINCT val) AS cd FROM cdu_src GROUP BY grp";
     assert_imv_correct("cdu_view", fresh);
@@ -3452,8 +3383,7 @@ fn test_fuzz_count_distinct() {
 
     crate::create_reflex_ivm("cd_fuzz_view",
         "SELECT grp, COUNT(DISTINCT val) AS cd FROM cd_fuzz GROUP BY grp",
-        None, None, None    None,
-        None, None, None);
+        None, None, None, None);
 
     let fresh = "SELECT grp, COUNT(DISTINCT val) AS cd FROM cd_fuzz GROUP BY grp";
     assert_imv_correct("cd_fuzz_view", fresh);

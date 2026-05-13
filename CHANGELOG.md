@@ -30,6 +30,30 @@
   aggregations. Idempotent. Used by the 1.4.4→1.4.5 migration and by
   operators after a data-shape change (e.g. a backfill that introduces or
   removes NULLs in a previously NULL-free column).
+- `public.reflex_compact_imv(view_name TEXT) RETURNS TEXT` —
+  `VACUUM (FULL)` both the intermediate and target tables of an IMV.
+  Materializes the `fillfactor=70` set by the 1.4.3→1.4.4 migration so
+  HOT updates can fire on legacy-populated pages. Takes
+  `ACCESS EXCLUSIVE`; schedule during a maintenance window for
+  multi-gigabyte IMVs.
+- `public.reflex_compact_all_imv() RETURNS TEXT` — convenience wrapper
+  that iterates `__reflex_ivm_reference` in `(graph_depth, name)` order
+  and runs `reflex_compact_imv` on every enabled row. A failure on one
+  IMV does not abort the rest; the per-IMV outcomes are summarized in
+  the return value. Same `ACCESS EXCLUSIVE` caveat as the single-IMV
+  variant.
+- `create_reflex_ivm(... , ignore_sources TEXT DEFAULT NULL)` —
+  optional comma-separated source list. Triggers are *not* installed on
+  the listed sources, and sibling-IMV triggers also skip this IMV when
+  fired by one of them (the list is persisted in
+  `__reflex_ivm_reference.ignored_sources`). Both schema-qualified
+  ('alp.product') and bare ('product') names are accepted — use whatever
+  form appears in the IMV's `depends_on` entry. Use this when an
+  ignored source's correctness is maintained externally (scheduled
+  `reflex_reconcile`, periodic full refresh) or when churn on the source
+  would make incremental maintenance more expensive than batch refreshes.
+  The same parameter is available on `create_reflex_ivm_if_not_exists`
+  and on the `topk`-overloaded variant.
 
 ### Migration
 - `ALTER EXTENSION pg_reflex UPDATE TO '1.4.5'` invokes
@@ -37,6 +61,20 @@
   to backfill effectively-NOT-NULL columns. The probe is read-only on the
   intermediate (one EXISTS query per group-by column, each short-circuits
   on first NULL) and writes only to `__reflex_ivm_reference.aggregations`.
+- Migration emits a `NOTICE` listing existing IMVs that have
+  `fillfactor=70` set but pages still packed (legacy pages from before
+  1.4.4). Operators run `reflex_compact_imv(name)` (or
+  `reflex_compact_all_imv()`) during a maintenance window to materialize
+  the new fillfactor.
+- Migrates the `__reflex_ivm_reference.aggregations` column from `json`
+  to `jsonb` so trigger-codegen reads no longer need explicit
+  `::jsonb` casts.
+- Adds the `__reflex_ivm_reference.ignored_sources TEXT[]` column with
+  default `ARRAY[]::TEXT[]`. Existing rows backfill cleanly.
+- Drops and recreates the `create_reflex_ivm` /
+  `create_reflex_ivm_if_not_exists` SQL signatures to add the
+  trailing optional `ignore_sources TEXT` parameter. Callers using
+  two-to-five positional arguments continue to work unchanged.
 
 ### Tests
 - `pg_test_probe_data_promotes_join_key_to_not_null` — exact yse-shape

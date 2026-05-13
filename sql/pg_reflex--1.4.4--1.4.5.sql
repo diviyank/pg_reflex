@@ -45,6 +45,11 @@ STRICT
 LANGUAGE c
 AS 'MODULE_PATHNAME', 'reflex_compact_imv_wrapper';
 
+CREATE FUNCTION "reflex_compact_all_imv"()
+RETURNS TEXT
+LANGUAGE c
+AS 'MODULE_PATHNAME', 'reflex_compact_all_imv_wrapper';
+
 DO $REFLEX_MIG_145_PART1$
 DECLARE
     rec     RECORD;
@@ -133,24 +138,57 @@ END
 $REFLEX_MIG_145_PART3$;
 
 -- ----------------------------------------------------------------------
--- Part 4: add `ignored_sources` column to __reflex_ivm_reference.
+-- Part 4: add `ignored_sources` column + extend create_reflex_ivm with
+-- an optional `ignore_sources` parameter.
 --
 -- New in 1.4.5: operators can pass an `ignore_sources` parameter to
--- `create_reflex_ivm_with_ignore_sources(...)` to suppress trigger
--- installation on specific sources. The trigger body also reads this
--- column and skips IMVs whose ignore list includes the firing source.
+-- `create_reflex_ivm(...)` to suppress trigger installation on specific
+-- sources. The list is persisted in
+-- `__reflex_ivm_reference.ignored_sources`; the trigger body installed
+-- by sibling IMVs reads the column and skips this IMV when fired by an
+-- ignored source.
+--
+-- Because adding a parameter changes the function signature, we drop the
+-- old 5-arg signatures and recreate the 6-arg ones. Existing calls with
+-- 2-5 arguments continue to work via PostgreSQL default arguments.
 -- ----------------------------------------------------------------------
 ALTER TABLE public.__reflex_ivm_reference
     ADD COLUMN IF NOT EXISTS ignored_sources TEXT[] DEFAULT ARRAY[]::TEXT[];
 
--- New SQL-callable functions added in 1.4.5 (Rust-backed via pgrx).
-CREATE FUNCTION "create_reflex_ivm_with_ignore_sources"(
+DROP FUNCTION IF EXISTS public.create_reflex_ivm(text, text, text, text, text);
+DROP FUNCTION IF EXISTS public.create_reflex_ivm(text, text, text, text, text, int4);
+DROP FUNCTION IF EXISTS public.create_reflex_ivm_if_not_exists(text, text, text, text, text);
+
+CREATE FUNCTION "create_reflex_ivm"(
     "view_name" TEXT,
     "sql" TEXT,
-    "ignore_sources" TEXT,
     "unique_columns" TEXT DEFAULT NULL,
     "storage" TEXT DEFAULT 'UNLOGGED',
-    "mode" TEXT DEFAULT 'IMMEDIATE'
+    "mode" TEXT DEFAULT 'IMMEDIATE',
+    "ignore_sources" TEXT DEFAULT NULL
 ) RETURNS TEXT
 LANGUAGE c
-AS 'MODULE_PATHNAME', 'create_reflex_ivm_with_ignore_sources_wrapper';
+AS 'MODULE_PATHNAME', 'create_reflex_ivm_wrapper';
+
+CREATE FUNCTION "create_reflex_ivm"(
+    "view_name" TEXT,
+    "sql" TEXT,
+    "unique_columns" TEXT,
+    "storage" TEXT,
+    "mode" TEXT,
+    "topk" INT4,
+    "ignore_sources" TEXT DEFAULT NULL
+) RETURNS TEXT
+LANGUAGE c
+AS 'MODULE_PATHNAME', 'create_reflex_ivm_with_topk_wrapper';
+
+CREATE FUNCTION "create_reflex_ivm_if_not_exists"(
+    "view_name" TEXT,
+    "sql" TEXT,
+    "unique_columns" TEXT DEFAULT NULL,
+    "storage" TEXT DEFAULT 'UNLOGGED',
+    "mode" TEXT DEFAULT 'IMMEDIATE',
+    "ignore_sources" TEXT DEFAULT NULL
+) RETURNS TEXT
+LANGUAGE c
+AS 'MODULE_PATHNAME', 'create_reflex_ivm_if_not_exists_wrapper';

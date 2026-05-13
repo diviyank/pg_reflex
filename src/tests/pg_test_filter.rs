@@ -6,8 +6,7 @@ fn test_filter_sum_basic() {
 
     let result = crate::create_reflex_ivm("filt_sum_v",
         "SELECT city, SUM(amount) FILTER (WHERE active) AS active_total FROM filt_sum GROUP BY city",
-        None, None, None    None,
-        None, None, None);
+        None, None, None, None);
     assert!(!result.starts_with("ERROR"), "Should succeed: {}", result);
 
     // A: only 10 counted (20 excluded), B: 30
@@ -40,8 +39,7 @@ fn test_filter_count_star() {
 
     let result = crate::create_reflex_ivm("filt_cnt_v",
         "SELECT city, COUNT(*) FILTER (WHERE active) AS active_cnt FROM filt_cnt GROUP BY city",
-        None, None, None    None,
-        None, None, None);
+        None, None, None, None);
     assert!(!result.starts_with("ERROR"), "Should succeed: {}", result);
 
     let a_cnt = Spi::get_one::<i64>("SELECT active_cnt::BIGINT FROM filt_cnt_v WHERE city = 'A'")
@@ -69,8 +67,7 @@ fn test_filter_avg() {
 
     let result = crate::create_reflex_ivm("filt_avg_v",
         "SELECT city, AVG(salary) FILTER (WHERE active) AS avg_active FROM filt_avg GROUP BY city",
-        None, None, None    None,
-        None, None, None);
+        None, None, None, None);
     assert!(!result.starts_with("ERROR"), "Should succeed: {}", result);
 
     // AVG of active rows: (100+200)/2 = 150
@@ -88,8 +85,7 @@ fn test_filter_min_max() {
 
     let result = crate::create_reflex_ivm("filt_mm_v",
         "SELECT city, MIN(val) FILTER (WHERE active) AS lo, MAX(val) FILTER (WHERE active) AS hi FROM filt_mm GROUP BY city",
-        None, None, None    None,
-        None, None, None);
+        None, None, None, None);
     assert!(!result.starts_with("ERROR"), "Should succeed: {}", result);
 
     // Active values: 10, 50 -> MIN=10, MAX=50
@@ -118,8 +114,7 @@ fn test_filter_with_group_by() {
 
     let result = crate::create_reflex_ivm("filt_gb_v",
         "SELECT city, SUM(amount) FILTER (WHERE billable) AS billable_total FROM filt_gb GROUP BY city",
-        None, None, None    None,
-        None, None, None);
+        None, None, None, None);
     assert!(!result.starts_with("ERROR"), "Should succeed: {}", result);
 
     let a = Spi::get_one::<i64>("SELECT billable_total::BIGINT FROM filt_gb_v WHERE city = 'A'")
@@ -139,8 +134,7 @@ fn test_filter_with_join() {
     let result = crate::create_reflex_ivm("filt_j_v",
         "SELECT j1.city, SUM(j2.amount) FILTER (WHERE j2.premium) AS premium_total \
          FROM filt_j1 j1 JOIN filt_j2 j2 ON j1.id = j2.id GROUP BY j1.city",
-        None, None, None    None,
-        None, None, None);
+        None, None, None, None);
     assert!(!result.starts_with("ERROR"), "Should succeed: {}", result);
 
     let a = Spi::get_one::<i64>("SELECT premium_total::BIGINT FROM filt_j_v WHERE city = 'A'")
@@ -157,8 +151,7 @@ fn test_filter_update_predicate_column() {
 
     let result = crate::create_reflex_ivm("filt_upd_v",
         "SELECT city, SUM(amount) FILTER (WHERE active) AS active_total FROM filt_upd GROUP BY city",
-        None, None, None    None,
-        None, None, None);
+        None, None, None, None);
     assert!(!result.starts_with("ERROR"), "Should succeed: {}", result);
 
     let total = Spi::get_one::<i64>("SELECT active_total::BIGINT FROM filt_upd_v WHERE city = 'A'")
@@ -186,8 +179,7 @@ fn test_filter_multiple_aggregates() {
          SUM(amount) FILTER (WHERE premium) AS premium_sum, \
          COUNT(*) FILTER (WHERE active AND premium) AS both_cnt \
          FROM filt_multi GROUP BY city",
-        None, None, None    None,
-        None, None, None);
+        None, None, None, None);
     assert!(!result.starts_with("ERROR"), "Should succeed: {}", result);
 
     let active = Spi::get_one::<i64>("SELECT active_sum::BIGINT FROM filt_multi_v WHERE city = 'A'")
@@ -212,8 +204,7 @@ fn test_filter_correctness_oracle() {
 
     let result = crate::create_reflex_ivm("filt_oracle_v",
         "SELECT city, SUM(amount) FILTER (WHERE active) AS s, COUNT(*) FILTER (WHERE active) AS c FROM filt_oracle GROUP BY city",
-        None, None, None    None,
-        None, None, None);
+        None, None, None, None);
     assert!(!result.starts_with("ERROR"), "Should succeed: {}", result);
 
     // Perform mutations
