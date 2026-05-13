@@ -12,6 +12,7 @@ fn test_passthrough_simple() {
         None,
         None,
         None,
+        None,
     );
     assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
 
@@ -50,6 +51,7 @@ fn test_passthrough_join() {
         None,
         None,
         None,
+        None,
     );
     assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
 
@@ -70,7 +72,7 @@ fn test_passthrough_delete_refreshes() {
     Spi::run("CREATE TABLE pt_del (id SERIAL, val TEXT)").expect("create");
     Spi::run("INSERT INTO pt_del (val) VALUES ('a'), ('b'), ('c')").expect("seed");
 
-    crate::create_reflex_ivm("pt_del_view", "SELECT id, val FROM pt_del", None, None, None);
+    crate::create_reflex_ivm("pt_del_view", "SELECT id, val FROM pt_del", None, None, None, None);
 
     // DELETE → full refresh
     Spi::run("DELETE FROM pt_del WHERE val = 'b'").expect("delete");
@@ -92,6 +94,7 @@ fn test_passthrough_incremental_delete() {
     crate::create_reflex_ivm(
         "pt_del_view",
         "SELECT id, region, val FROM pt_del_src",
+        None,
         None,
         None,
         None,
@@ -135,6 +138,7 @@ fn test_passthrough_incremental_update() {
     crate::create_reflex_ivm(
         "pt_upd_view",
         "SELECT id, region, val FROM pt_upd_src",
+        None,
         None,
         None,
         None,
@@ -205,6 +209,7 @@ fn test_passthrough_join_delete_secondary_table() {
         Some("id"),
         None,
         None,
+        None,
     );
     assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
 
@@ -259,6 +264,7 @@ fn test_passthrough_join_update_secondary_table() {
         Some("id"),
         None,
         None,
+        None,
     );
 
     // UPDATE the secondary table (product name change)
@@ -287,6 +293,7 @@ fn test_passthrough_join_no_key_delete_secondary() {
     crate::create_reflex_ivm(
         "ptjnk_view",
         "SELECT s.id, s.amount, p.name FROM ptjnk_sales s JOIN ptjnk_products p ON s.product_id = p.id",
+        None,
         None,
         None,
         None,
@@ -327,6 +334,7 @@ fn test_passthrough_join_delete_key_owner_table() {
         "ptjko_view",
         "SELECT s.id, s.product_id, s.amount, p.name FROM ptjko_sales s JOIN ptjko_products p ON s.product_id = p.id",
         Some("id"),
+        None,
         None,
         None,
     );
@@ -374,6 +382,7 @@ fn test_passthrough_three_table_join() {
          JOIN pt3_products p ON s.product_id = p.id \
          JOIN pt3_regions r ON s.region_id = r.id",
         Some("id"),
+        None,
         None,
         None,
     );
@@ -432,6 +441,7 @@ fn test_passthrough_join_composite_key() {
         Some("product_id, region_id"),
         None,
         None,
+        None,
     );
     assert_eq!(
         Spi::get_one::<i64>("SELECT COUNT(*) FROM ptck_view").expect("q").expect("v"),
@@ -483,6 +493,7 @@ fn test_passthrough_join_aliased_key() {
         Some("id"),
         None,
         None,
+        None,
     );
     assert_eq!(
         Spi::get_one::<i64>("SELECT COUNT(*) FROM ptak_view").expect("q").expect("v"),
@@ -521,6 +532,7 @@ fn test_passthrough_join_insert_secondary() {
         "ptjis_view",
         "SELECT s.id, s.amount, p.name FROM ptjis_sales s JOIN ptjis_products p ON s.product_id = p.id",
         Some("id"),
+        None,
         None,
         None,
     );
@@ -563,6 +575,7 @@ fn test_passthrough_auto_pk_from_source() {
         None,
         None,
         None,
+        None,
     );
     assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
 
@@ -592,6 +605,7 @@ fn test_passthrough_no_pk_no_inference() {
     let result = crate::create_reflex_ivm(
         "pt_nopk_view",
         "SELECT id, val FROM pt_nopk_src",
+        None,
         None,
         None,
         None,

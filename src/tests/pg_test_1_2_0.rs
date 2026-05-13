@@ -10,6 +10,7 @@ fn test_cycle_detection() {
         None,
         None,
         None,
+        None,
     );
     assert_eq!(r, "CREATE REFLEX INCREMENTAL VIEW", "setup cyc_a: {}", r);
     // Inject a forward dependency edge: cyc_a.depends_on now contains the not-yet-created cyc_b.
@@ -23,6 +24,7 @@ fn test_cycle_detection() {
     let r2 = crate::create_reflex_ivm(
         "cyc_b",
         "SELECT id, SUM(s) AS total FROM cyc_a GROUP BY id",
+        None,
         None,
         None,
         None,
@@ -46,6 +48,7 @@ fn test_advisory_lock_two_arg_flush() {
         None,
         None,
         Some("DEFERRED"),
+        None,
     );
     assert_eq!(r, "CREATE REFLEX INCREMENTAL VIEW", "setup: {}", r);
     Spi::run("INSERT INTO adv_t VALUES (1, 5)").expect("insert");
@@ -68,6 +71,7 @@ fn test_cte_alias_collision_rejected() {
         None,
         None,
         None,
+        None,
     );
     assert!(r1.starts_with("ERROR"), "__reflex_new_ alias must be rejected: {}", r1);
 
@@ -78,6 +82,7 @@ fn test_cte_alias_collision_rejected() {
         None,
         None,
         None,
+        None,
     );
     assert!(r2.starts_with("ERROR"), "__reflex_old_ alias must be rejected: {}", r2);
 
@@ -85,6 +90,7 @@ fn test_cte_alias_collision_rejected() {
         "cte_col_v3",
         "WITH __reflex_delta_baz AS (SELECT id, val FROM cte_col_t) \
          SELECT id, SUM(val) AS s FROM __reflex_delta_baz GROUP BY id",
+        None,
         None,
         None,
         None,
@@ -104,6 +110,7 @@ fn test_non_strict_delta_sql_passthrough_update() {
         Some("id"),
         None,
         None,
+        None,
     );
     assert_eq!(r, "CREATE REFLEX INCREMENTAL VIEW", "setup: {}", r);
     Spi::run("INSERT INTO nstrict_t VALUES (3, 'c', 30)").expect("insert");
@@ -121,6 +128,7 @@ fn test_rebuild_imv() {
     let r = crate::create_reflex_ivm(
         "rb_v",
         "SELECT grp, SUM(val) AS total FROM rb_t GROUP BY grp",
+        None,
         None,
         None,
         None,
@@ -145,6 +153,7 @@ fn test_source_drop_cleans_registry() {
     let r = crate::create_reflex_ivm(
         "evtdrop_v",
         "SELECT id, SUM(val) AS s FROM evtdrop_t GROUP BY id",
+        None,
         None,
         None,
         None,
@@ -173,6 +182,7 @@ fn test_group_by_cast_expression() {
         None,
         None,
         None,
+        None,
     );
     assert_eq!(r, "CREATE REFLEX INCREMENTAL VIEW", "setup: {}", r);
     // Insert one more row: existing group '100' must aggregate, not insert-new.
@@ -197,6 +207,7 @@ fn test_merge_default_expression_respected() {
     let r = crate::create_reflex_ivm(
         "md_v",
         "SELECT id, SUM(val) AS total FROM md_t GROUP BY id",
+        None,
         None,
         None,
         None,
@@ -234,6 +245,7 @@ fn test_per_imv_savepoint_isolates_failures() {
         None,
         None,
         Some("DEFERRED"),
+        None,
     );
     assert_eq!(good, "CREATE REFLEX INCREMENTAL VIEW", "setup good: {}", good);
 
@@ -243,6 +255,7 @@ fn test_per_imv_savepoint_isolates_failures() {
         None,
         None,
         Some("DEFERRED"),
+        None,
     );
     assert_eq!(bad, "CREATE REFLEX INCREMENTAL VIEW", "setup bad: {}", bad);
 
@@ -280,6 +293,7 @@ fn test_ivm_status_reports_registered_imv() {
         None,
         None,
         None,
+        None,
     );
     assert_eq!(r, "CREATE REFLEX INCREMENTAL VIEW", "setup: {}", r);
     let found = Spi::get_one::<i64>(
@@ -301,6 +315,7 @@ fn test_flush_records_timing_and_row_count() {
         None,
         None,
         Some("DEFERRED"),
+        None,
     );
     assert_eq!(r, "CREATE REFLEX INCREMENTAL VIEW", "setup: {}", r);
     Spi::run("INSERT INTO ftim_t VALUES (2, 20)").expect("insert");
@@ -347,6 +362,7 @@ fn test_min_max_retraction_scoped_recompute_correctness() {
         None,
         None,
         None,
+        None,
     );
     assert_eq!(r, "CREATE REFLEX INCREMENTAL VIEW", "setup: {}", r);
 
@@ -373,6 +389,7 @@ fn test_min_max_retraction_empty_group_eliminated() {
     let r = crate::create_reflex_ivm(
         "mmre_v",
         "SELECT grp, MIN(val) AS lo, MAX(val) AS hi FROM mmre_t GROUP BY grp",
+        None,
         None,
         None,
         None,

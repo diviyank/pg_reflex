@@ -70,7 +70,7 @@ extension_sql!(
         base_query TEXT,
         end_query TEXT,
         parsed_sql_query JSON,
-        aggregations JSON,
+        aggregations JSONB,
         index_columns TEXT[],
         unique_columns TEXT[],
         enabled BOOLEAN DEFAULT TRUE,
@@ -82,7 +82,8 @@ extension_sql!(
         last_flush_rows BIGINT,
         flush_count BIGINT DEFAULT 0,
         last_error TEXT,
-        flush_ms_history BIGINT[] DEFAULT ARRAY[]::BIGINT[]
+        flush_ms_history BIGINT[] DEFAULT ARRAY[]::BIGINT[],
+        ignored_sources TEXT[] DEFAULT ARRAY[]::TEXT[]
     );
 
     -- Index on name for fast lookups
@@ -123,6 +124,23 @@ fn validate_view_name(name: &str) -> Result<(), &'static str> {
 /// workloads can opt out by passing `topk = 0` to the 6-arg overload.
 const DEFAULT_TOPK_K: usize = 16;
 
+/// Parse a comma-separated source list into a Vec<String>. Empty input → empty vec.
+/// Both schema-qualified ("alp.product") and bare ("product") names are accepted.
+fn parse_ignore_sources_list(s: &str) -> Vec<String> {
+    s.split(',')
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty())
+        .collect()
+}
+
+/// Create an IMV. `ignore_sources` is a comma-separated TEXT list of source
+/// tables to exclude from trigger installation; DML on those sources will
+/// NOT refresh this IMV (use `reflex_reconcile` or periodic refresh
+/// instead). Both schema-qualified ('alp.product') and bare ('product')
+/// names are accepted — use the form that appears in the IMV's SQL.
+/// The list is persisted in `__reflex_ivm_reference.ignored_sources` so
+/// triggers installed by sibling IMVs also skip this IMV when fired by
+/// an ignored source.
 #[pg_extern]
 fn create_reflex_ivm(
     view_name: &str,
@@ -130,7 +148,9 @@ fn create_reflex_ivm(
     unique_columns: default!(Option<&str>, "NULL"),
     storage: default!(Option<&str>, "'UNLOGGED'"),
     mode: default!(Option<&str>, "'IMMEDIATE'"),
+    ignore_sources: default!(Option<&str>, "NULL"),
 ) -> &'static str {
+    let ignore_vec = parse_ignore_sources_list(ignore_sources.unwrap_or(""));
     create_ivm::create_reflex_ivm_impl(
         view_name,
         sql,
@@ -139,6 +159,7 @@ fn create_reflex_ivm(
         storage.unwrap_or("UNLOGGED"),
         mode.unwrap_or("IMMEDIATE"),
         Some(DEFAULT_TOPK_K),
+        &ignore_vec,
     )
 }
 
@@ -150,7 +171,9 @@ fn create_reflex_ivm_with_topk(
     storage: Option<&str>,
     mode: Option<&str>,
     topk: i32,
+    ignore_sources: default!(Option<&str>, "NULL"),
 ) -> &'static str {
+    let ignore_vec = parse_ignore_sources_list(ignore_sources.unwrap_or(""));
     create_ivm::create_reflex_ivm_impl(
         view_name,
         sql,
@@ -159,6 +182,7 @@ fn create_reflex_ivm_with_topk(
         storage.unwrap_or("UNLOGGED"),
         mode.unwrap_or("IMMEDIATE"),
         if topk > 0 { Some(topk as usize) } else { None },
+        &ignore_vec,
     )
 }
 
@@ -169,7 +193,9 @@ fn create_reflex_ivm_if_not_exists(
     unique_columns: default!(Option<&str>, "NULL"),
     storage: default!(Option<&str>, "'UNLOGGED'"),
     mode: default!(Option<&str>, "'IMMEDIATE'"),
+    ignore_sources: default!(Option<&str>, "NULL"),
 ) -> &'static str {
+    let ignore_vec = parse_ignore_sources_list(ignore_sources.unwrap_or(""));
     create_ivm::create_reflex_ivm_impl(
         view_name,
         sql,
@@ -178,6 +204,7 @@ fn create_reflex_ivm_if_not_exists(
         storage.unwrap_or("UNLOGGED"),
         mode.unwrap_or("IMMEDIATE"),
         Some(DEFAULT_TOPK_K),
+        &ignore_vec,
     )
 }
 
@@ -204,6 +231,47 @@ fn drop_reflex_ivm_cascade(view_name: &str, cascade: bool) -> &'static str {
 #[pg_extern]
 fn reflex_reconcile(view_name: &str) -> &'static str {
     reconcile::reflex_reconcile(view_name)
+}
+
+/// 1.4.5: VACUUM FULL both the intermediate and target tables of an IMV.
+/// Materializes the fillfactor=70 set by the 1.4.3→1.4.4 migration so HOT
+/// updates can fire on legacy-populated pages.
+///
+/// Takes ACCESS EXCLUSIVE on each table; schedule during a maintenance
+/// window for multi-gigabyte IMVs.
+#[pg_extern]
+fn reflex_compact_imv(view_name: &str) -> String {
+    create_ivm::reflex_compact_imv_impl(view_name)
+}
+
+/// 1.4.5: VACUUM FULL every enabled IMV's intermediate and target tables.
+/// Convenience wrapper around `reflex_compact_imv` that iterates over all
+/// rows of `__reflex_ivm_reference` in graph_depth order. Each call takes
+/// ACCESS EXCLUSIVE on the IMV's tables; schedule during a maintenance
+/// window. Returns a per-IMV summary; failures on one IMV do not abort
+/// the others (the error is recorded in the result).
+#[pg_extern]
+fn reflex_compact_all_imv() -> String {
+    create_ivm::reflex_compact_all_imv_impl()
+}
+
+/// 1.4.5: Re-probe NOT NULL columns from the intermediate's actual data and
+/// update `__reflex_ivm_reference.aggregations.not_null_columns`.
+///
+/// Run this after a data shape change (e.g., a batch load that introduces
+/// NULLs into a previously NULL-free column, or the inverse). The 1.4.4→1.4.5
+/// migration invokes this once per existing IMV to backfill effectively-NOT
+/// NULL columns the catalog heuristic missed.
+///
+/// Trigger codegen reads `not_null_columns` to choose between `=` (sargable,
+/// index-usable) and `IS NOT DISTINCT FROM` (NULL-safe) on group-key probes.
+/// Mismatched membership causes either correctness bugs (false `=` when
+/// NULLs exist → group-key splitting drift) or perf bugs (false `IS NOT
+/// DISTINCT FROM` when NULLs don't exist → composite-index defeat, the
+/// 405 s yse regression).
+#[pg_extern]
+fn reflex_probe_not_null_columns(view_name: &str) -> String {
+    create_ivm::reflex_probe_not_null_columns_impl(view_name)
 }
 
 /// Refresh a single IMV by rebuilding from source. Alias for reflex_reconcile.

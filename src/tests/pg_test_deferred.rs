@@ -12,6 +12,7 @@ fn test_deferred_basic_insert() {
         None,
         None,
         Some("DEFERRED"),
+        None,
     );
     assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
 
@@ -53,6 +54,7 @@ fn test_immediate_mode_explicit() {
         None,
         None,
         Some("IMMEDIATE"),
+        None,
     );
     assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
 
@@ -74,6 +76,7 @@ fn test_invalid_mode() {
         None,
         None,
         Some("INVALID"),
+        None,
     );
     assert!(result.starts_with("ERROR:"), "Invalid mode should return error, got: {}", result);
 }
@@ -86,6 +89,7 @@ fn test_deferred_groupby_insert_oracle() {
 
     crate::create_reflex_ivm("dfi_view",
         "SELECT city, SUM(amount) AS total, COUNT(*) AS cnt FROM dfi GROUP BY city",
+        None, None, Some("DEFERRED")    None,
         None, None, Some("DEFERRED"));
 
     let fresh = "SELECT city, SUM(amount) AS total, COUNT(*) AS cnt FROM dfi GROUP BY city";
@@ -121,6 +125,7 @@ fn test_deferred_batch_coalescing() {
 
     crate::create_reflex_ivm("dbc_view",
         "SELECT grp, SUM(val) AS total FROM dbc GROUP BY grp",
+        None, None, Some("DEFERRED")    None,
         None, None, Some("DEFERRED"));
 
     let fresh = "SELECT grp, SUM(val) AS total FROM dbc GROUP BY grp";
@@ -145,6 +150,7 @@ fn test_deferred_delete_oracle() {
 
     crate::create_reflex_ivm("dfd_view",
         "SELECT grp, SUM(val) AS total FROM dfd GROUP BY grp",
+        None, None, Some("DEFERRED")    None,
         None, None, Some("DEFERRED"));
 
     let fresh = "SELECT grp, SUM(val) AS total FROM dfd GROUP BY grp";
@@ -169,6 +175,7 @@ fn test_deferred_update_oracle() {
 
     crate::create_reflex_ivm("dfu_view",
         "SELECT grp, SUM(val) AS total FROM dfu GROUP BY grp",
+        None, None, Some("DEFERRED")    None,
         None, None, Some("DEFERRED"));
 
     let fresh = "SELECT grp, SUM(val) AS total FROM dfu GROUP BY grp";
@@ -193,6 +200,7 @@ fn test_deferred_mixed_mutations() {
 
     crate::create_reflex_ivm("dfm_view",
         "SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM dfm GROUP BY grp",
+        None, None, Some("DEFERRED")    None,
         None, None, Some("DEFERRED"));
 
     let fresh = "SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM dfm GROUP BY grp";
@@ -217,6 +225,7 @@ fn test_deferred_distinct_oracle() {
 
     crate::create_reflex_ivm("dfdst_view",
         "SELECT DISTINCT val FROM dfdst",
+        None, None, Some("DEFERRED")    None,
         None, None, Some("DEFERRED"));
 
     let fresh = "SELECT DISTINCT val FROM dfdst";
@@ -246,6 +255,7 @@ fn test_deferred_null_values() {
 
     crate::create_reflex_ivm("dfn_view",
         "SELECT grp, SUM(val) AS total, COUNT(val) AS cv, COUNT(*) AS cs FROM dfn GROUP BY grp",
+        None, None, Some("DEFERRED")    None,
         None, None, Some("DEFERRED"));
 
     let fresh = "SELECT grp, SUM(val) AS total, COUNT(val) AS cv, COUNT(*) AS cs FROM dfn GROUP BY grp";
@@ -281,6 +291,7 @@ fn test_deferred_fuzz() {
 
     crate::create_reflex_ivm("df_fuzz_view",
         "SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM df_fuzz GROUP BY grp",
+        None, None, Some("DEFERRED")    None,
         None, None, Some("DEFERRED"));
 
     let fresh = "SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM df_fuzz GROUP BY grp";
@@ -310,6 +321,7 @@ fn test_deferred_update_to_null_all_null_group() {
 
     crate::create_reflex_ivm("dfun_view",
         "SELECT grp, SUM(val) AS total, COUNT(val) AS cv, COUNT(*) AS cs FROM dfun GROUP BY grp",
+        None, None, Some("DEFERRED")    None,
         None, None, Some("DEFERRED"));
 
     let fresh = "SELECT grp, SUM(val) AS total, COUNT(val) AS cv, COUNT(*) AS cs FROM dfun GROUP BY grp";
@@ -330,6 +342,7 @@ fn test_immediate_update_to_null_all_null_group() {
 
     crate::create_reflex_ivm("imun_view",
         "SELECT grp, SUM(val) AS total, COUNT(val) AS cv, COUNT(*) AS cs FROM imun GROUP BY grp",
+        None, None, Some("IMMEDIATE")    None,
         None, None, Some("IMMEDIATE"));
 
     let fresh = "SELECT grp, SUM(val) AS total, COUNT(val) AS cv, COUNT(*) AS cs FROM imun GROUP BY grp";
@@ -356,6 +369,7 @@ fn test_deferred_groupby_unique_index_existing_group() {
         None,
         None,
         Some("DEFERRED"),
+        None,
     );
 
     // Unique index on group key — mirrors the real-world zscore_reflex setup.
@@ -396,6 +410,7 @@ fn test_deferred_qualified_source_refs() {
         None,
         None,
         Some("DEFERRED"),
+        None,
     );
 
     let fresh = "SELECT dfqs.grp, dfqs.raw AS raw_renamed, SUM(dfqs.val) AS total \
@@ -433,6 +448,7 @@ fn test_deferred_passthrough_all_ops() {
         Some("id"),
         None,
         Some("DEFERRED"),
+        None,
     );
 
     let fresh = "SELECT id, k, v FROM dfpa";
@@ -482,6 +498,7 @@ fn test_deferred_bool_or_with_join_alias_recompute() {
         None,
         None,
         Some("DEFERRED"),
+        None,
     );
 
     let fresh = "SELECT brja_src.g, BOOL_OR(d.p IS NOT NULL) AS has_match \
@@ -515,6 +532,7 @@ fn test_deferred_flush_consumes_user_alias_in_from() {
         None,
         None,
         Some("DEFERRED"),
+        None,
     );
 
     let fresh = "SELECT s.grp, SUM(s.val) AS total FROM dfua AS s GROUP BY s.grp";
@@ -549,6 +567,7 @@ fn test_immediate_renamed_grouped_column() {
         None,
         None,
         Some("IMMEDIATE"),
+        None,
     );
 
     let fresh = "SELECT dfrn.src_col AS renamed, SUM(val) AS total FROM dfrn GROUP BY src_col";
@@ -580,6 +599,7 @@ fn test_flush_is_noop_when_affected_empty() {
         None,
         None,
         Some("DEFERRED"),
+        None,
     );
     let fresh = "SELECT grp, SUM(val) AS total FROM noop_src GROUP BY grp";
     assert_imv_correct("noop_view", fresh);
@@ -598,6 +618,7 @@ fn test_flush_correct_after_empty_delta_gate_sequence() {
         None,
         None,
         Some("DEFERRED"),
+        None,
     );
     let fresh = "SELECT grp, SUM(val) AS total FROM gate_src GROUP BY grp";
     assert_imv_correct("gate_view", fresh);
@@ -622,6 +643,7 @@ fn test_deferred_upd_respects_where_predicate() {
         None,
         None,
         Some("DEFERRED"),
+        None,
     );
     let fresh = "SELECT grp, SUM(val) AS total FROM pred_src WHERE status = 'active' GROUP BY grp";
     assert_imv_correct("pred_view", fresh);
@@ -640,6 +662,7 @@ fn test_flush_deferred_skips_imv_on_predicate_miss() {
         None,
         None,
         Some("DEFERRED"),
+        None,
     );
     crate::create_reflex_ivm(
         "two_view_never",
@@ -647,6 +670,7 @@ fn test_flush_deferred_skips_imv_on_predicate_miss() {
         None,
         None,
         Some("DEFERRED"),
+        None,
     );
     let fresh_active = "SELECT grp, SUM(val) AS total FROM two_src WHERE status = 'active' GROUP BY grp";
     let fresh_never = "SELECT grp, SUM(val) AS total FROM two_src WHERE status = 'never' GROUP BY grp";
@@ -673,6 +697,7 @@ fn pg_test_flush_histogram_accumulates() {
         "hist_view",
         "SELECT grp, SUM(val) AS total FROM hist_src GROUP BY grp",
         None, None, Some("DEFERRED"),
+        None,
     );
 
     // Flush a handful of times so the ring buffer accumulates samples.
@@ -703,6 +728,7 @@ fn pg_test_flush_histogram_empty_when_never_flushed() {
         "hist_empty_view",
         "SELECT grp, COUNT(*) AS cnt FROM hist_empty_src GROUP BY grp",
         None, None, Some("DEFERRED"),
+        None,
     );
 
     let samples: i64 = Spi::get_one("SELECT samples FROM reflex_ivm_histogram('hist_empty_view')")
@@ -730,6 +756,7 @@ fn pg_test_deferred_spurious_update_skips_imv_bodies() {
         None,
         None,
         Some("DEFERRED"),
+        None,
     );
 
     // Baseline: flush_count after initial materialization (might be 0 or 1

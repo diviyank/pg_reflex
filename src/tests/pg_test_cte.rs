@@ -12,6 +12,7 @@ fn test_cte_simple_aggregate() {
         None,
         None,
         None,
+        None,
     );
     assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
 
@@ -38,6 +39,7 @@ fn test_cte_trigger_propagation() {
     crate::create_reflex_ivm(
         "cte_prop",
         "WITH totals AS (SELECT region, SUM(amount) AS total FROM cte_src2 GROUP BY region) SELECT region, total FROM totals",
+        None,
         None,
         None,
         None,
@@ -70,6 +72,7 @@ fn test_cte_with_where_filter() {
     crate::create_reflex_ivm(
         "cte_filtered",
         "WITH totals AS (SELECT region, SUM(amount) AS total FROM cte_src3 GROUP BY region) SELECT region, total FROM totals WHERE total > 100",
+        None,
         None,
         None,
         None,
@@ -110,6 +113,7 @@ fn test_cte_multiple_chained() {
         None,
         None,
         None,
+        None,
     );
     assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
 
@@ -137,6 +141,7 @@ fn test_cte_main_body_with_aggregation() {
     let result = crate::create_reflex_ivm(
         "cte_agg_main",
         "WITH totals AS (SELECT region, SUM(amount) AS total FROM cte_src5 GROUP BY region) SELECT COUNT(*) AS num_regions FROM totals",
+        None,
         None,
         None,
         None,
@@ -168,6 +173,7 @@ fn test_cte_passthrough_sub_imv() {
             SELECT id, region, val FROM cte_pt_src WHERE active = true
         )
         SELECT region, SUM(val) AS total FROM active_orders GROUP BY region",
+        None,
         None,
         None,
         None,

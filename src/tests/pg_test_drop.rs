@@ -11,6 +11,7 @@ fn test_drop_reflex_ivm_basic() {
         None,
         None,
         None,
+        None,
     );
 
     // Verify IMV exists
@@ -60,10 +61,12 @@ fn test_drop_reflex_ivm_refuses_with_children() {
         None,
         None,
         None,
+        None,
     );
     crate::create_reflex_ivm(
         "drop_child",
         "SELECT grp, SUM(total) AS grand FROM drop_parent GROUP BY grp",
+        None,
         None,
         None,
         None,
@@ -86,10 +89,12 @@ fn test_drop_reflex_ivm_cascade() {
         None,
         None,
         None,
+        None,
     );
     crate::create_reflex_ivm(
         "drop_cas_child",
         "SELECT grp, SUM(total) AS grand FROM drop_cas_parent GROUP BY grp",
+        None,
         None,
         None,
         None,
@@ -120,10 +125,12 @@ fn test_drop_shared_trigger_lifecycle() {
         None,
         None,
         None,
+        None,
     );
     crate::create_reflex_ivm(
         "drop_sh_v2",
         "SELECT grp, COUNT(*) AS cnt FROM drop_sh_src GROUP BY grp",
+        None,
         None,
         None,
         None,
@@ -169,6 +176,7 @@ fn test_source_drop_removes_aggregate_imv_artifacts() {
         None,
         None,
         None,
+        None,
     );
 
     let registered = Spi::get_one::<i64>(
@@ -211,10 +219,12 @@ fn test_source_drop_cascades_to_child_imvs() {
         None,
         None,
         None,
+        None,
     );
     crate::create_reflex_ivm(
         "sd_chain_l2",
         "SELECT grp, SUM(total) AS grand FROM sd_chain_l1 GROUP BY grp",
+        None,
         None,
         None,
         None,
@@ -249,6 +259,7 @@ fn test_source_drop_passthrough() {
         "sd_pt_view",
         "SELECT id, name FROM sd_pt_src WHERE status = 'active'",
         Some("id"),
+        None,
         None,
         None,
     );

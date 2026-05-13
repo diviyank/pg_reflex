@@ -22,6 +22,7 @@ fn pg_test_immediate_imv_in_custom_schema_under_set_search_path() {
         None,
         None,
         Some("IMMEDIATE"),
+        None,
     );
     assert_eq!(r, "CREATE REFLEX INCREMENTAL VIEW");
 
@@ -100,6 +101,7 @@ fn pg_test_deferred_imv_in_custom_schema_under_set_search_path() {
         None,
         None,
         Some("DEFERRED"),
+        None,
     );
     assert_eq!(r, "CREATE REFLEX INCREMENTAL VIEW");
 
@@ -162,6 +164,7 @@ fn pg_test_passthrough_imv_in_custom_schema_under_set_search_path() {
         Some("id"),
         None,
         Some("IMMEDIATE"),
+        None,
     );
     assert_eq!(r, "CREATE REFLEX INCREMENTAL VIEW");
 
@@ -212,6 +215,7 @@ fn pg_test_shared_source_two_imvs_in_distinct_schemas() {
         None,
         None,
         Some("DEFERRED"),
+        None,
     );
     crate::create_reflex_ivm(
         "imv_b.view_two",
@@ -219,6 +223,7 @@ fn pg_test_shared_source_two_imvs_in_distinct_schemas() {
         None,
         None,
         Some("DEFERRED"),
+        None,
     );
 
     // The shared staging delta lives in `src_s` (per source), regardless of
@@ -331,6 +336,7 @@ fn pg_test_deferred_join_schema_qualified_with_bare_column_qualifiers() {
         None,
         None,
         Some("DEFERRED"),
+        None,
     );
     assert_eq!(r, "CREATE REFLEX INCREMENTAL VIEW");
 
@@ -404,6 +410,7 @@ fn pg_test_topk_imv_in_custom_schema_under_set_search_path() {
         None,
         None,
         Some("IMMEDIATE"),
+        None,
     );
     assert_eq!(r, "CREATE REFLEX INCREMENTAL VIEW");
 

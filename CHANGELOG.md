@@ -1,5 +1,69 @@
 # Changelog
 
+## [1.4.5] - 2026-05-13
+
+### Fixed
+- **Customer regression: 405 s UPDATE on a 1-row source change** of an IMV
+  whose group-by includes JOIN keys that are catalog-NULLable but
+  query-semantics-NOT-NULL (e.g. `INNER JOIN sales_simulation ON dem_plan_id
+  = demand_planning.id` where `sales_simulation.dem_plan_id` is declared
+  NULLable but the INNER JOIN forces non-NULL on the join output).
+
+  1.4.4 introduced a catalog-based heuristic
+  (`query_column_types_from_catalog`) for populating
+  `AggregationPlan.not_null_columns` — the set the trigger reads to choose
+  between `=` (index-usable) and `IS NOT DISTINCT FROM` (NULL-safe) on
+  group-key probes. Pure-catalog heuristic missed the case above. Symptom:
+  MERGE codegen emitted `IS NOT DISTINCT FROM` on the composite index's
+  leading column, the planner couldn't use the index, and a single-row
+  source UPDATE on a 76 M-row source took 405 s.
+
+  Fix: a data-probe pass scans the populated intermediate at IMV-create
+  time, runs `SELECT NOT EXISTS (SELECT 1 FROM <intermediate> WHERE <col>
+  IS NULL)` per group-by column, and adds NULL-free columns to
+  `not_null_columns`. The probe complements the catalog heuristic; it
+  never removes catalog-derived NOT NULL entries, only adds.
+
+### Added
+- `public.reflex_probe_not_null_columns(view_name TEXT) RETURNS TEXT` —
+  re-probe an existing IMV's intermediate and update its stored
+  aggregations. Idempotent. Used by the 1.4.4→1.4.5 migration and by
+  operators after a data-shape change (e.g. a backfill that introduces or
+  removes NULLs in a previously NULL-free column).
+
+### Migration
+- `ALTER EXTENSION pg_reflex UPDATE TO '1.4.5'` invokes
+  `reflex_probe_not_null_columns(name)` once per existing aggregated IMV
+  to backfill effectively-NOT-NULL columns. The probe is read-only on the
+  intermediate (one EXISTS query per group-by column, each short-circuits
+  on first NULL) and writes only to `__reflex_ivm_reference.aggregations`.
+
+### Tests
+- `pg_test_probe_data_promotes_join_key_to_not_null` — exact yse-shape
+  regression: catalog-NULLable FK column promoted to `not_null_columns`
+  by the probe, MERGE emits `=`.
+- `pg_test_probe_data_keeps_truly_nullable_column_as_null_safe` — the
+  probe must NOT promote a column that genuinely contains NULLs (would
+  cause group-key splitting on `=` semantics).
+- `pg_test_reflex_probe_not_null_columns_idempotent` — second call after
+  no data change reports zero additions.
+
+### Performance
+- **High-selectivity dispatch** for grouped IMVs. When the affected-groups
+  count divided by the intermediate's row estimate meets or exceeds the
+  threshold `reflex.wipe_threshold` (default 0.3), the trigger delegates
+  to `public.reflex_reconcile(view_name)` — full IMV rebuild — instead of
+  running per-row MERGE + double-target-rewrite. Bench at 2 M source / 75 %
+  selectivity: MERGE-only path 63.7 s → reconcile-dispatch 23.9 s (2.7×
+  faster, 40 s saved). REFRESH MATERIALIZED VIEW reference at the same
+  scale: 3.8 s (so the dispatch is still ~6× REFRESH MV — closing the
+  remaining gap requires CTAS+swap with full metadata copy, deferred to a
+  future version).
+- Threshold tunable per-session via `SET reflex.wipe_threshold = '0.5'`.
+  Crossover at 2 M scale is ~0.5 (where MERGE catches up to reconcile);
+  default 0.3 is conservative but doesn't regress small-delta workloads
+  because MERGE at <0.3 is still cheap.
+
 ## [1.4.4] - 2026-05-12
 
 ### Fixed

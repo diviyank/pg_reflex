@@ -21,6 +21,7 @@ use crate::sql_analyzer::{analyze, SqlAnalysisError};
 use crate::validate_view_name;
 use crate::window;
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn create_reflex_ivm_impl(
     view_name: &str,
     sql: &str,
@@ -29,6 +30,7 @@ pub(crate) fn create_reflex_ivm_impl(
     storage_mode: &str,
     refresh_mode: &str,
     topk_k: Option<usize>,
+    ignore_sources: &[String],
 ) -> &'static str {
     let storage_upper = storage_mode.to_uppercase();
     if storage_upper != "LOGGED" && storage_upper != "UNLOGGED" {
@@ -109,6 +111,7 @@ pub(crate) fn create_reflex_ivm_impl(
                 storage_mode,
                 refresh_mode,
                 topk_k,
+                ignore_sources,
             );
             if result.starts_with("ERROR") {
                 return result;
@@ -322,6 +325,7 @@ pub(crate) fn create_reflex_ivm_impl(
             storage_mode,
             refresh_mode,
             topk_k,
+            ignore_sources,
         );
         if result.starts_with("ERROR") {
             return result;
@@ -466,6 +470,7 @@ pub(crate) fn create_reflex_ivm_impl(
             storage_mode,
             refresh_mode,
             topk_k,
+            ignore_sources,
         );
         if result.starts_with("ERROR") {
             return result;
@@ -587,6 +592,7 @@ pub(crate) fn create_reflex_ivm_impl(
                 storage_mode,
                 refresh_mode,
                 topk_k,
+                ignore_sources,
             );
             if result.starts_with("ERROR") {
                 return result;
@@ -621,6 +627,7 @@ pub(crate) fn create_reflex_ivm_impl(
             storage_mode,
             refresh_mode,
             topk_k,
+            ignore_sources,
         );
     }
     // --- End CTE decomposition ---
@@ -1057,6 +1064,22 @@ pub(crate) fn create_reflex_ivm_impl(
                 continue;
             }
 
+            // 1.4.5: ignore_sources — operator-requested exclusion of trigger
+            // installation on listed sources. Matches both schema-qualified
+            // ('alp.product') and bare ('product') forms against the IMV's
+            // depends_on entry.
+            let (_, source_bare) = split_qualified_name(source);
+            if ignore_sources
+                .iter()
+                .any(|s| s == source || s == source_bare)
+            {
+                info!(
+                    "pg_reflex: skipping trigger install on source '{}' for IMV '{}' (ignored)",
+                    source, view_name
+                );
+                continue;
+            }
+
             // Check if source is a materialized view (can't have triggers).
             // Use to_regclass() which respects the current search_path.
             let is_matview = client
@@ -1236,13 +1259,14 @@ pub(crate) fn create_reflex_ivm_impl(
             String::new()
         };
 
+        let ignored_sources_vec: Vec<String> = ignore_sources.to_vec();
         client.update(
             "INSERT INTO public.__reflex_ivm_reference
              (name, graph_depth, depends_on, depends_on_imv, unlogged_tables,
               graph_child, sql_query, base_query, end_query,
               aggregations, index_columns, unique_columns, enabled, last_update_date,
-              storage_mode, refresh_mode, where_predicate)
-             VALUES ($1, $2, $3::TEXT[], $4::TEXT[], $5::TEXT[], $6::TEXT[], $7, $8, $9, $10::json, $11::TEXT[], $12::TEXT[], TRUE, NOW(), $13, $14, NULLIF($15, ''))",
+              storage_mode, refresh_mode, where_predicate, ignored_sources)
+             VALUES ($1, $2, $3::TEXT[], $4::TEXT[], $5::TEXT[], $6::TEXT[], $7, $8, $9, $10::jsonb, $11::TEXT[], $12::TEXT[], TRUE, NOW(), $13, $14, NULLIF($15, ''), $16::TEXT[])",
             None,
             &[
                 unsafe { DatumWithOid::new(view_name.to_string(), PgBuiltInOids::TEXTOID.oid().value()) },
@@ -1260,6 +1284,7 @@ pub(crate) fn create_reflex_ivm_impl(
                 unsafe { DatumWithOid::new(storage_upper.clone(), PgBuiltInOids::TEXTOID.oid().value()) },
                 unsafe { DatumWithOid::new(mode_upper.clone(), PgBuiltInOids::TEXTOID.oid().value()) },
                 unsafe { DatumWithOid::new(where_predicate, PgBuiltInOids::TEXTOID.oid().value()) },
+                unsafe { DatumWithOid::new(format_pg_text_array_literal(&ignored_sources_vec), PgBuiltInOids::TEXTOID.oid().value()) },
             ],
         ).unwrap_or_report();
 
@@ -1362,6 +1387,32 @@ pub(crate) fn create_reflex_ivm_impl(
                     &[],
                 )
                 .unwrap_or_report();
+
+            // 1.4.5: data-probe pass. Scan the intermediate for group-by /
+            // distinct columns whose actual data is NULL-free, and add them
+            // to not_null_columns. Catches the case where a catalog-NULLable
+            // column is effectively NOT NULL because the IMV's INNER JOIN
+            // or filter semantics exclude NULLs. Without this, the trigger's
+            // MERGE codegen would emit `IS NOT DISTINCT FROM` on the
+            // composite-index leading column, defeating the index — the
+            // 405 s yse.ivm_sop_forecast_view regression in 1.4.4.
+            let probed_nn = probe_not_null_columns_from_data(client, &intermediate_tbl, &plan);
+            let new_cols: Vec<String> = probed_nn
+                .into_iter()
+                .filter(|c| !plan.not_null_columns.contains(c))
+                .collect();
+            if !new_cols.is_empty() {
+                for c in &new_cols {
+                    plan.not_null_columns.insert(c.clone());
+                }
+                persist_probed_not_null_columns(client, view_name, &new_cols);
+                info!(
+                    "pg_reflex: data-probe added {} effectively-NOT-NULL column(s) to '{}': {:?}",
+                    new_cols.len(),
+                    view_name,
+                    new_cols
+                );
+            }
         }
     });
 
@@ -1604,6 +1655,220 @@ fn query_column_types_from_catalog(
         }
     }
     (types, not_null_cols)
+}
+
+/// 1.4.5: data-probe. Scan the populated intermediate for group-by and
+/// distinct columns whose actual data contains zero NULLs. Returns the set
+/// of normalized column names found to be NULL-free.
+///
+/// Closes the gap left by the pure catalog heuristic
+/// `query_column_types_from_catalog`: a column declared NULLable in
+/// `information_schema.columns` may still be effectively NOT NULL on the
+/// intermediate if the base_query's INNER JOIN keys or filter predicates
+/// exclude NULLs. The probe runs *after* the bulk INSERT into intermediate
+/// so it sees the real data.
+///
+/// Customer-reported regression (yse.ivm_sop_forecast_view, 1.4.4): catalog
+/// declared `sales_simulation.dem_plan_id / product_id / location_id`
+/// NULLable; the IMV's INNER JOIN on `dem_plan_id = demand_planning.id`
+/// makes those columns non-NULL on the join output. Without the probe, the
+/// MERGE codegen emits `IS NOT DISTINCT FROM` on the composite-index
+/// leading column, defeating the index. Symptom: 405 s UPDATE on a 1-row
+/// source change.
+///
+/// Trade-off: one EXISTS scan per group-by column at create time, each
+/// short-circuiting on the first matching NULL. On a NULL-free 867 K
+/// composite key column the scan touches the index leading-column once
+/// per page (~50 ms total for 8 columns). Trivial relative to the
+/// alternative (the 405 s blowup on first UPDATE).
+fn probe_not_null_columns_from_data(
+    client: &mut pgrx::spi::SpiClient<'_>,
+    intermediate_tbl: &str,
+    plan: &crate::aggregation::AggregationPlan,
+) -> std::collections::HashSet<String> {
+    let mut probed = std::collections::HashSet::new();
+    for col_expr in plan
+        .group_by_columns
+        .iter()
+        .chain(plan.distinct_columns.iter())
+    {
+        let norm = normalized_column_name(col_expr);
+        if plan.not_null_columns.contains(&norm) {
+            continue;
+        }
+        // Quote the column name with " escaping (defensive — normalized
+        // names are bare ASCII in practice, but the input came from user SQL).
+        let quoted = norm.replace('"', "\"\"");
+        let sql = format!(
+            "SELECT NOT EXISTS (SELECT 1 FROM {} WHERE \"{}\" IS NULL) AS null_free",
+            intermediate_tbl, quoted
+        );
+        let null_free: Option<bool> = match client.select(&sql, Some(1), &[]) {
+            Ok(mut t) => t
+                .next()
+                .and_then(|r| r.get_by_name::<bool, _>("null_free").ok().flatten()),
+            Err(_) => None,
+        };
+        if null_free == Some(true) {
+            probed.insert(norm);
+        }
+    }
+    probed
+}
+
+/// Persist a delta of newly-discovered NOT NULL columns to
+/// `__reflex_ivm_reference.aggregations`. Performs a JSON-level merge with
+/// the existing array (no overwrite of catalog-derived entries).
+fn persist_probed_not_null_columns(
+    client: &mut pgrx::spi::SpiClient<'_>,
+    view_name: &str,
+    new_cols: &[String],
+) {
+    if new_cols.is_empty() {
+        return;
+    }
+    let arr_literal = format_pg_text_array_literal(new_cols);
+    client
+        .update(
+            "UPDATE public.__reflex_ivm_reference \
+             SET aggregations = jsonb_set( \
+                 aggregations::jsonb, \
+                 '{not_null_columns}', \
+                 ( \
+                     SELECT jsonb_agg(DISTINCT col) \
+                     FROM ( \
+                         SELECT jsonb_array_elements_text( \
+                             COALESCE((aggregations::jsonb)->'not_null_columns', '[]'::jsonb) \
+                         ) AS col \
+                         UNION \
+                         SELECT unnest($1::text[]) AS col \
+                     ) s \
+                 ) \
+             )::json \
+             WHERE name = $2",
+            None,
+            &[
+                unsafe { DatumWithOid::new(arr_literal, PgBuiltInOids::TEXTOID.oid().value()) },
+                unsafe {
+                    DatumWithOid::new(view_name.to_string(), PgBuiltInOids::TEXTOID.oid().value())
+                },
+            ],
+        )
+        .unwrap_or_report();
+}
+
+/// SQL-callable wrapper: re-probe an existing IMV from data and update its
+/// stored aggregations. Used by the 1.4.4→1.4.5 migration to backfill
+/// effectively-NOT-NULL columns the catalog missed on existing IMVs, and by
+/// operators after a data shape change. Returns a human-readable status.
+pub(crate) fn reflex_probe_not_null_columns_impl(view_name: &str) -> String {
+    if let Err(msg) = validate_view_name(view_name) {
+        return msg.to_string();
+    }
+    let result: Result<Vec<String>, String> = Spi::connect_mut(|client| {
+        let rows = client
+            .select(
+                "SELECT aggregations::text AS aggregations \
+                 FROM public.__reflex_ivm_reference \
+                 WHERE name = $1 AND enabled = TRUE",
+                None,
+                &[unsafe {
+                    DatumWithOid::new(view_name.to_string(), PgBuiltInOids::TEXTOID.oid().value())
+                }],
+            )
+            .map_err(|e| format!("lookup failed: {}", e))?
+            .collect::<Vec<_>>();
+        if rows.is_empty() {
+            return Err(format!("IMV '{}' not found or disabled", view_name));
+        }
+        let agg_json: String = rows[0]
+            .get_by_name::<&str, _>("aggregations")
+            .map_err(|e| format!("read aggregations: {}", e))?
+            .unwrap_or("{}")
+            .to_string();
+        let plan: crate::aggregation::AggregationPlan = serde_json::from_str(&agg_json)
+            .map_err(|e| format!("aggregations JSON parse: {}", e))?;
+        if plan.is_passthrough {
+            return Ok(Vec::new());
+        }
+        let intermediate_tbl = intermediate_table_name(view_name);
+        let probed = probe_not_null_columns_from_data(client, &intermediate_tbl, &plan);
+        let new_cols: Vec<String> = probed
+            .into_iter()
+            .filter(|c| !plan.not_null_columns.contains(c))
+            .collect();
+        persist_probed_not_null_columns(client, view_name, &new_cols);
+        Ok(new_cols)
+    });
+    match result {
+        Ok(cols) if cols.is_empty() => {
+            format!(
+                "pg_reflex: probe found no additional NOT NULL columns on '{}'",
+                view_name
+            )
+        }
+        Ok(cols) => format!(
+            "pg_reflex: probe added {} NOT NULL column(s) on '{}': {:?}",
+            cols.len(),
+            view_name,
+            cols
+        ),
+        Err(e) => format!("ERROR: {}", e),
+    }
+}
+
+/// 1.4.5 — `reflex_compact_imv(view_name TEXT) RETURNS TEXT`.
+///
+/// VACUUM FULL both the intermediate and target tables of an IMV. The
+/// 1.4.3→1.4.4 migration set fillfactor=70 on these tables but did not
+/// rewrite existing pages — HOT updates can only fire after pages have
+/// been written with the new fillfactor. Running VACUUM FULL once per
+/// table materializes the fillfactor immediately, restoring HOT-eligibility
+/// on legacy-populated IMVs.
+///
+/// VACUUM FULL takes ACCESS EXCLUSIVE on the rewritten table; for
+/// multi-gigabyte IMVs this is a maintenance-window operation. Caller is
+/// responsible for scheduling.
+///
+/// Returns a status string with per-table elapsed times.
+pub(crate) fn reflex_compact_imv_impl(view_name: &str) -> String {
+    if let Err(msg) = validate_view_name(view_name) {
+        return msg.to_string();
+    }
+    let intermediate_tbl = intermediate_table_name(view_name);
+    let target_tbl = quote_identifier(view_name);
+    let mut messages: Vec<String> = Vec::new();
+    // VACUUM cannot run inside a function or transaction block; we issue it
+    // via a top-level SPI call that pgrx wraps in its own statement.
+    let result: Result<(), String> = Spi::connect_mut(|client| {
+        let t0 = std::time::Instant::now();
+        client
+            .update(&format!("VACUUM (FULL) {}", intermediate_tbl), None, &[])
+            .map_err(|e| format!("VACUUM FULL intermediate failed: {}", e))?;
+        messages.push(format!(
+            "intermediate {}: {} ms",
+            intermediate_tbl,
+            t0.elapsed().as_millis()
+        ));
+        let t1 = std::time::Instant::now();
+        client
+            .update(&format!("VACUUM (FULL) {}", target_tbl), None, &[])
+            .map_err(|e| format!("VACUUM FULL target failed: {}", e))?;
+        messages.push(format!(
+            "target {}: {} ms",
+            target_tbl,
+            t1.elapsed().as_millis()
+        ));
+        Ok(())
+    });
+    match result {
+        Ok(()) => format!(
+            "pg_reflex: compacted '{}' — {}",
+            view_name,
+            messages.join(", ")
+        ),
+        Err(e) => format!("ERROR: {}", e),
+    }
 }
 
 /// Map information_schema data_type strings to PostgreSQL type names usable in DDL.

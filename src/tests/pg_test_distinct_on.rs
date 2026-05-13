@@ -8,6 +8,7 @@ fn test_distinct_on_basic() {
 
     let result = crate::create_reflex_ivm("don_basic_v",
         "SELECT DISTINCT ON (city) city, name, val FROM don_basic ORDER BY city, val DESC",
+        None, None, None    None,
         None, None, None);
     assert!(!result.starts_with("ERROR"), "Should succeed: {}", result);
 
@@ -29,6 +30,7 @@ fn test_distinct_on_insert_reranks() {
 
     let result = crate::create_reflex_ivm("don_ins_v",
         "SELECT DISTINCT ON (city) city, name, val FROM don_ins ORDER BY city, val DESC",
+        None, None, None    None,
         None, None, None);
     assert!(!result.starts_with("ERROR"), "Should succeed: {}", result);
 
@@ -53,6 +55,7 @@ fn test_distinct_on_delete_first() {
 
     let result = crate::create_reflex_ivm("don_del_v",
         "SELECT DISTINCT ON (city) city, name, val FROM don_del ORDER BY city, val DESC",
+        None, None, None    None,
         None, None, None);
     assert!(!result.starts_with("ERROR"), "Should succeed: {}", result);
 
@@ -77,6 +80,7 @@ fn test_distinct_on_update_reranks() {
 
     let result = crate::create_reflex_ivm("don_upd_v",
         "SELECT DISTINCT ON (city) city, name, val FROM don_upd ORDER BY city, val DESC",
+        None, None, None    None,
         None, None, None);
     assert!(!result.starts_with("ERROR"), "Should succeed: {}", result);
 
@@ -103,6 +107,7 @@ fn test_distinct_on_multi_column() {
 
     let result = crate::create_reflex_ivm("don_multi_v",
         "SELECT DISTINCT ON (city, dept) city, dept, name, val FROM don_multi ORDER BY city, dept, val DESC",
+        None, None, None    None,
         None, None, None);
     assert!(!result.starts_with("ERROR"), "Should succeed: {}", result);
 
@@ -126,6 +131,7 @@ fn test_distinct_on_with_where() {
 
     let result = crate::create_reflex_ivm("don_where_v",
         "SELECT DISTINCT ON (city) city, name, val FROM don_where WHERE active ORDER BY city, val DESC",
+        None, None, None    None,
         None, None, None);
     assert!(!result.starts_with("ERROR"), "Should succeed: {}", result);
 
@@ -147,6 +153,7 @@ fn test_distinct_on_with_join() {
     let result = crate::create_reflex_ivm("don_j_v",
         "SELECT DISTINCT ON (j1.city) j1.city, j2.name, j2.val \
          FROM don_j1 j1 JOIN don_j2 j2 ON j1.id = j2.id ORDER BY j1.city, j2.val DESC",
+        None, None, None    None,
         None, None, None);
     assert!(!result.starts_with("ERROR"), "Should succeed: {}", result);
 
@@ -164,6 +171,7 @@ fn test_distinct_on_truncate_reinsert() {
 
     let result = crate::create_reflex_ivm("don_trunc_v",
         "SELECT DISTINCT ON (city) city, name, val FROM don_trunc ORDER BY city, val DESC",
+        None, None, None    None,
         None, None, None);
     assert!(!result.starts_with("ERROR"), "Should succeed: {}", result);
 
@@ -187,6 +195,7 @@ fn test_distinct_on_correctness_oracle() {
 
     let result = crate::create_reflex_ivm("don_oracle_v",
         "SELECT DISTINCT ON (city) city, name, val FROM don_oracle ORDER BY city, val DESC",
+        None, None, None    None,
         None, None, None);
     assert!(!result.starts_with("ERROR"), "Should succeed: {}", result);
 

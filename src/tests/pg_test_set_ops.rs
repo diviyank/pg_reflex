@@ -15,6 +15,7 @@ fn test_union_all_basic() {
         "ua_basic",
         "SELECT city, amount FROM ua_eu UNION ALL SELECT city, amount FROM ua_us",
         None, None, None,
+        None,
     );
     assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
 
@@ -46,6 +47,7 @@ fn test_union_all_insert_source_a() {
         "uaia_view",
         "SELECT city, amount FROM uaia_eu UNION ALL SELECT city, amount FROM uaia_us",
         None, None, None,
+        None,
     );
 
     // INSERT into EU source → should appear in target
@@ -72,6 +74,7 @@ fn test_union_all_insert_source_b() {
         "uaib_view",
         "SELECT city, amount FROM uaib_eu UNION ALL SELECT city, amount FROM uaib_us",
         None, None, None,
+        None,
     );
 
     // INSERT into US source
@@ -93,6 +96,7 @@ fn test_union_all_delete() {
         "uad_view",
         "SELECT id, val FROM uad_a UNION ALL SELECT id, val FROM uad_b",
         None, None, None,
+        None,
     );
     assert_eq!(
         Spi::get_one::<i64>("SELECT COUNT(*) FROM uad_view").expect("q").expect("v"),
@@ -125,6 +129,7 @@ fn test_union_all_update() {
         "uau_view",
         "SELECT id, val FROM uau_a UNION ALL SELECT id, val FROM uau_b",
         None, None, None,
+        None,
     );
 
     Spi::run("UPDATE uau_a SET val = 99 WHERE val = 10").expect("update");
@@ -154,6 +159,7 @@ fn test_union_all_three_operands() {
         "ua3_view",
         "SELECT val FROM ua3_a UNION ALL SELECT val FROM ua3_b UNION ALL SELECT val FROM ua3_c",
         None, None, None,
+        None,
     );
     assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
 
@@ -184,6 +190,7 @@ fn test_union_all_with_aggregates() {
          UNION ALL \
          SELECT city, SUM(amount) AS total FROM uaag_us GROUP BY city",
         None, None, None,
+        None,
     );
     assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
 
@@ -219,6 +226,7 @@ fn test_union_all_same_table_different_filters() {
          UNION ALL \
          SELECT category, SUM(val) AS total FROM uaf_src WHERE category = 'B' GROUP BY category",
         None, None, None,
+        None,
     );
     assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
 
@@ -255,6 +263,7 @@ fn test_union_all_truncate() {
         "uat_view",
         "SELECT val FROM uat_a UNION ALL SELECT val FROM uat_b",
         None, None, None,
+        None,
     );
 
     Spi::run("TRUNCATE uat_a").expect("truncate");
@@ -285,6 +294,7 @@ fn test_union_dedup_basic() {
         "ud_basic",
         "SELECT city FROM ud_a UNION SELECT city FROM ud_b",
         None, None, None,
+        None,
     );
     assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
 
@@ -307,6 +317,7 @@ fn test_union_dedup_delete_one_source() {
         "udd_view",
         "SELECT city FROM udd_a UNION SELECT city FROM udd_b",
         None, None, None,
+        None,
     );
 
     // Delete Paris from source A — still visible via source B
@@ -336,6 +347,7 @@ fn test_union_dedup_delete_both_sources() {
         "uddb_view",
         "SELECT city FROM uddb_a UNION SELECT city FROM uddb_b",
         None, None, None,
+        None,
     );
 
     // Delete Paris from A
@@ -371,6 +383,7 @@ fn test_union_dedup_insert_duplicate() {
         "udi_view",
         "SELECT city FROM udi_a UNION SELECT city FROM udi_b",
         None, None, None,
+        None,
     );
     assert_eq!(
         Spi::get_one::<i64>("SELECT COUNT(*) FROM udi_view").expect("q").expect("v"),
@@ -399,6 +412,7 @@ fn test_union_dedup_with_aggregates() {
          UNION \
          SELECT region, SUM(amount) AS total FROM uda_us GROUP BY region",
         None, None, None,
+        None,
     );
     assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
 
@@ -427,6 +441,7 @@ fn test_intersect_basic() {
         "ix_view",
         "SELECT city FROM ix_a INTERSECT SELECT city FROM ix_b",
         None, None, None,
+        None,
     );
     assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
 
@@ -449,6 +464,7 @@ fn test_intersect_insert_trigger() {
         "ixi_view",
         "SELECT city FROM ixi_a INTERSECT SELECT city FROM ixi_b",
         None, None, None,
+        None,
     );
 
     // No intersection initially
@@ -477,6 +493,7 @@ fn test_except_basic() {
         "ex_view",
         "SELECT city FROM ex_a EXCEPT SELECT city FROM ex_b",
         None, None, None,
+        None,
     );
     assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
 
@@ -503,6 +520,7 @@ fn test_except_delete_trigger() {
         "exd_view",
         "SELECT city FROM exd_a EXCEPT SELECT city FROM exd_b",
         None, None, None,
+        None,
     );
 
     // No rows initially (all in both)

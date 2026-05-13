@@ -376,17 +376,27 @@ pub fn build_trigger_ddls(source_table: &str) -> Vec<String> {
     //
     // Early-exit: if the transition table is empty, skip the entire loop (no IMVs to process).
     // This avoids Rust FFI calls and advisory locks when a statement affects 0 relevant rows.
+    // 1.4.5: filter out IMVs that explicitly ignored this source via
+    // create_reflex_ivm_with_ignore_sources. The check covers both
+    // schema-qualified ('alp.product') and bare ('product') forms so users
+    // can write whichever matches their IMV's depends_on entry.
+    let bare_source = source_table
+        .split('.')
+        .next_back()
+        .unwrap_or(source_table)
+        .to_string();
     let body_core = format!(
         "DECLARE _rec RECORD; _sql TEXT; _stmt TEXT; _has_rows BOOLEAN; _pred_match BOOLEAN; \
          BEGIN \
            SELECT EXISTS(SELECT 1 FROM \"{{transition_tbl}}\" LIMIT 1) INTO _has_rows; \
            IF NOT _has_rows THEN RETURN NULL; END IF; \
            FOR _rec IN \
-             SELECT name, base_query, end_query, aggregations::text AS aggregations, where_predicate \
+             SELECT name, base_query, end_query, aggregations::text AS aggregations, where_predicate, ignored_sources \
              FROM public.__reflex_ivm_reference \
              WHERE '{source_table}' = ANY(depends_on) AND enabled = TRUE \
              ORDER BY graph_depth, name \
            LOOP \
+             IF _rec.ignored_sources IS NOT NULL AND ('{source_table}' = ANY(_rec.ignored_sources) OR '{bare_source}' = ANY(_rec.ignored_sources)) THEN CONTINUE; END IF; \
              IF _rec.where_predicate IS NOT NULL THEN \
                EXECUTE format('SELECT EXISTS(SELECT 1 FROM %I WHERE %s LIMIT 1)', '{{transition_tbl}}', _rec.where_predicate) INTO _pred_match; \
                IF NOT _pred_match THEN CONTINUE; END IF; \

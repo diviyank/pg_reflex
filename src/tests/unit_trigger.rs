@@ -1356,16 +1356,36 @@ fn test_passthrough_update_materializes_both_sides() {
 
 /// Regression guard: the aggregate branch must also keep transition tables
 /// confined to sanctioned scratch-populate statements (Phase B's fix).
+///
+/// 1.4.5 note: `orig_base_query` MUST be the live-source version (it's
+/// what's stored in `__reflex_ivm_reference.base_query` and what
+/// `schema_builder.rs` passes through). The high-selectivity dispatch
+/// block emitted in 1.4.5 embeds `orig_base_query` in a
+/// TRUNCATE+rebuild branch, which is fine in production because
+/// `orig_base_query` doesn't contain transition tables. The test fixture
+/// now passes a realistic live-source query (no transition refs) and
+/// only constructs a transition-substituted variant for the `base_query`
+/// param if a test exercises that codegen path internally.
 #[test]
 fn test_aggregate_delta_sql_has_no_transition_leaks() {
     let plan = simple_plan();
     let agg_json = serde_json::to_string(&plan).unwrap();
-    let base_q = "SELECT city, SUM(amount) AS \"__sum_amount\", COUNT(*) AS __ivm_count FROM \"__reflex_new_t\" GROUP BY city";
+    // Live-source query (stored in __reflex_ivm_reference). The
+    // trigger codegen substitutes transition tables for `t` internally
+    // when building the scratch INSERT.
+    let live_base_q = "SELECT city, SUM(amount) AS \"__sum_amount\", COUNT(*) AS __ivm_count FROM \"t\" GROUP BY city";
     let end_q = "SELECT \"city\", \"__sum_amount\" AS total FROM \"__reflex_intermediate_v\" WHERE __ivm_count > 0";
 
     for op in ["INSERT", "DELETE", "UPDATE"] {
-        let sql =
-            reflex_build_delta_sql("v", "t", op, base_q, end_q, Some(agg_json.as_str()), base_q);
+        let sql = reflex_build_delta_sql(
+            "v",
+            "t",
+            op,
+            live_base_q,
+            end_q,
+            Some(agg_json.as_str()),
+            live_base_q,
+        );
         assert_no_transition_leaks(&sql, &format!("aggregate {op}"));
     }
 }

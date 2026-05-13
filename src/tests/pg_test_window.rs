@@ -9,6 +9,7 @@ fn test_window_function_accepted() {
         None,
         None,
         None,
+        None,
     );
     assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
 }
@@ -28,6 +29,7 @@ fn test_window_row_number_no_partition() {
         "wrn_view",
         "SELECT name, score, ROW_NUMBER() OVER (ORDER BY score DESC) AS rnk FROM wrn_src",
         None, None, None,
+        None,
     );
     assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
 
@@ -54,6 +56,7 @@ fn test_window_row_number_insert_reranks() {
         "wrni_view",
         "SELECT name, score, ROW_NUMBER() OVER (ORDER BY score DESC) AS rnk FROM wrni_src",
         None, None, None,
+        None,
     );
 
     // Insert someone who beats Alice
@@ -86,6 +89,7 @@ fn test_window_row_number_delete_reranks() {
         "wrnd_view",
         "SELECT name, score, ROW_NUMBER() OVER (ORDER BY score DESC) AS rnk FROM wrnd_src",
         None, None, None,
+        None,
     );
 
     // Delete Alice (rank 1)
@@ -121,6 +125,7 @@ fn test_window_row_number_partition_by() {
         "wrnp_view",
         "SELECT dept, name, score, ROW_NUMBER() OVER (PARTITION BY dept ORDER BY score DESC) AS rnk FROM wrnp_src",
         None, None, None,
+        None,
     );
     assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
 
@@ -154,6 +159,7 @@ fn test_window_partition_insert_isolation() {
         "wpi_view",
         "SELECT dept, name, score, ROW_NUMBER() OVER (PARTITION BY dept ORDER BY score DESC) AS rnk FROM wpi_src",
         None, None, None,
+        None,
     );
 
     // Insert into eng partition — sales should be unaffected
@@ -188,6 +194,7 @@ fn test_window_rank_with_ties() {
         "wr_view",
         "SELECT name, score, RANK() OVER (ORDER BY score DESC) AS rnk FROM wr_src",
         None, None, None,
+        None,
     );
     assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
 
@@ -219,6 +226,7 @@ fn test_window_dense_rank() {
         "wdr_view",
         "SELECT name, score, DENSE_RANK() OVER (ORDER BY score DESC) AS rnk FROM wdr_src",
         None, None, None,
+        None,
     );
     assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
 
@@ -239,6 +247,7 @@ fn test_window_sum_partition() {
         "wsp_view",
         "SELECT dept, amount, SUM(amount) OVER (PARTITION BY dept) AS dept_total FROM wsp_src",
         None, None, None,
+        None,
     );
     assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
 
@@ -270,6 +279,7 @@ fn test_window_lag() {
         "wl_view",
         "SELECT ts, val, LAG(val) OVER (ORDER BY ts) AS prev_val FROM wl_src",
         None, None, None,
+        None,
     );
     assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
 
@@ -302,6 +312,7 @@ fn test_window_lead() {
         "wld_view",
         "SELECT ts, val, LEAD(val) OVER (ORDER BY ts) AS next_val FROM wld_src",
         None, None, None,
+        None,
     );
     assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
 
@@ -331,6 +342,7 @@ fn test_window_group_by_plus_window() {
                 RANK() OVER (ORDER BY SUM(amount) DESC) AS rnk \
          FROM wgw_src GROUP BY city",
         None, None, None,
+        None,
     );
     assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
 
@@ -364,6 +376,7 @@ fn test_window_group_by_insert_reranks() {
                 RANK() OVER (ORDER BY SUM(amount) DESC) AS rnk \
          FROM wgwi_src GROUP BY city",
         None, None, None,
+        None,
     );
 
     // Initial: London=200(1), Berlin=150(2), Paris=100(3)
@@ -406,6 +419,7 @@ fn test_window_group_by_partition_by() {
                 ROW_NUMBER() OVER (PARTITION BY region ORDER BY SUM(amount) DESC) AS rnk \
          FROM wgwp_src GROUP BY region, city",
         None, None, None,
+        None,
     );
     assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
 
@@ -448,6 +462,7 @@ fn test_window_group_by_delete_reranks() {
                 ROW_NUMBER() OVER (ORDER BY SUM(amount) DESC) AS rnk \
          FROM wgwd_src GROUP BY city",
         None, None, None,
+        None,
     );
 
     // Delete the top city
@@ -483,6 +498,7 @@ fn test_window_multiple_functions() {
                 DENSE_RANK() OVER (ORDER BY score DESC) AS dense_rnk \
          FROM wmf_src",
         None, None, None,
+        None,
     );
     assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
 
@@ -518,6 +534,7 @@ fn test_window_update_reranks() {
         "wu_view",
         "SELECT name, score, ROW_NUMBER() OVER (ORDER BY score DESC) AS rnk FROM wu_src",
         None, None, None,
+        None,
     );
 
     // Update Charlie to top score
@@ -546,6 +563,7 @@ fn test_window_group_by_except_correctness() {
                 RANK() OVER (ORDER BY SUM(amount) DESC) AS rnk \
          FROM wge_src GROUP BY city",
         None, None, None,
+        None,
     );
 
     // Verify via EXCEPT against fresh computation
@@ -584,6 +602,7 @@ fn test_window_truncate_and_reinsert() {
         "wtr_view",
         "SELECT val, ROW_NUMBER() OVER (ORDER BY val) AS rnk FROM wtr_src",
         None, None, None,
+        None,
     );
 
     Spi::run("TRUNCATE wtr_src").expect("truncate");

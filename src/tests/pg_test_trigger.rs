@@ -11,6 +11,7 @@ fn test_triggers_created() {
         None,
         None,
         None,
+        None,
     );
 
     // Check all 4 consolidated triggers exist (INSERT, DELETE, UPDATE, TRUNCATE)
@@ -35,6 +36,7 @@ fn test_trigger_insert_updates_view() {
     crate::create_reflex_ivm(
         "trig_ins_view",
         "SELECT city, SUM(amount) AS total FROM trig_ins_src GROUP BY city",
+        None,
         None,
         None,
         None,
@@ -75,6 +77,7 @@ fn test_trigger_delete_updates_view() {
         None,
         None,
         None,
+        None,
     );
 
     // Delete one Paris row
@@ -98,6 +101,7 @@ fn test_trigger_delete_all_removes_group() {
     crate::create_reflex_ivm(
         "trig_delall_view",
         "SELECT city, SUM(amount) AS total FROM trig_delall_src GROUP BY city",
+        None,
         None,
         None,
         None,
@@ -136,6 +140,7 @@ fn test_trigger_update_correctness() {
         None,
         None,
         None,
+        None,
     );
 
     // Update: change amount for city 'A'
@@ -161,6 +166,7 @@ fn test_trigger_avg_insert_delete() {
     crate::create_reflex_ivm(
         "trig_avg_view",
         "SELECT dept, AVG(salary) AS avg_sal FROM trig_avg_src GROUP BY dept",
+        None,
         None,
         None,
         None,
@@ -200,6 +206,7 @@ fn test_trigger_distinct_ref_counting() {
     crate::create_reflex_ivm(
         "trig_dist_view",
         "SELECT DISTINCT country FROM trig_dist_src",
+        None,
         None,
         None,
         None,
@@ -244,6 +251,7 @@ fn test_trigger_bulk_insert() {
         None,
         None,
         None,
+        None,
     );
 
     // Bulk insert 100 rows for group 'X'
@@ -274,6 +282,7 @@ fn test_logged_trigger_works() {
         None,
         Some("LOGGED"),
         None,
+        None,
     );
 
     // INSERT trigger
@@ -301,6 +310,7 @@ fn test_default_is_unlogged() {
     crate::create_reflex_ivm(
         "def_city_totals",
         "SELECT city, SUM(amount) AS total FROM def_orders GROUP BY city",
+        None,
         None,
         None,
         None,

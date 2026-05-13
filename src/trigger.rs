@@ -985,6 +985,109 @@ fn push_materialized_merge(
     ));
 }
 
+/// 1.4.5 — high-selectivity dispatch threshold. When the number of affected
+/// groups exceeds this fraction of the intermediate's row count, the trigger
+/// switches from MERGE-based incremental to TRUNCATE+rebuild ("full refresh
+/// of the IMV body").
+///
+/// Rationale: at high selectivity, the per-row MERGE probe cost + the target
+/// DELETE/INSERT round-trip exceed the cost of a bulk INSERT into a freshly
+/// truncated table. The customer's 64 %-selectivity UPDATE on
+/// yse.ivm_sop_forecast_view spent 5.5 s on MERGE + 4.1 s on target ops vs
+/// 2-3 s for REFRESH MATERIALIZED VIEW on the same shape.
+///
+/// 0.3 is a conservative default (rebuilding at 30 % affected is breakeven
+/// or slightly worse than MERGE on small-target IMVs; clearly better on
+/// large ones). Operators can override per-IMV via the
+/// `reflex.wipe_threshold` GUC at session scope.
+const WIPE_THRESHOLD_DEFAULT: f64 = 0.3;
+
+/// 1.4.5 — emit a DO block that dispatches between MERGE-incremental and
+/// TRUNCATE-rebuild based on runtime selectivity.
+///
+/// Replaces these statements in the standard flow:
+///   1. MERGE intermediate USING scratch
+///   2. DELETE intermediate WHERE __ivm_count<=0 AND in_affected (optional)
+///   3. DELETE target WHERE in_affected
+///   4. INSERT target SELECT end_query WHERE in_affected
+///
+/// At high selectivity, instead:
+///   1. TRUNCATE intermediate
+///   2. INSERT INTO intermediate <base_query> -- full re-aggregation
+///   3. TRUNCATE target
+///   4. INSERT INTO target <end_query>
+///
+/// Scratch and affected are populated BEFORE this block (steps 1-3 of the
+/// standard flow remain unchanged). The DO block reads the affected table's
+/// row count and compares to pg_class.reltuples on the intermediate.
+///
+/// Threshold: `current_setting('reflex.wipe_threshold', true)::numeric` if
+/// set, else `WIPE_THRESHOLD_DEFAULT`. Operators can `SET LOCAL` per-session
+/// or per-statement.
+#[allow(clippy::too_many_arguments)]
+fn build_high_selectivity_dispatch_sql(
+    view_name: &str,
+    intermediate_tbl: &str,
+    affected_tbl: &str,
+    merge_sql: &str,
+    dead_cleanup_sql: Option<&str>,
+    target_delete_sql: &str,
+    target_insert_sql: &str,
+) -> String {
+    let dead_cleanup = match dead_cleanup_sql {
+        Some(s) => format!(
+            "        EXECUTE $reflex_inner${}$reflex_inner$;\n",
+            s.replace("$reflex_inner$", "$reflex_inner_alt$")
+        ),
+        None => String::new(),
+    };
+    let safe_merge = merge_sql.replace("$reflex_inner$", "$reflex_inner_alt$");
+    let safe_tdel = target_delete_sql.replace("$reflex_inner$", "$reflex_inner_alt$");
+    let safe_tins = target_insert_sql.replace("$reflex_inner$", "$reflex_inner_alt$");
+    let safe_view = view_name.replace('\'', "''");
+
+    format!(
+        "DO $reflex_dispatch$\n\
+         DECLARE\n\
+             _aff BIGINT;\n\
+             _imm NUMERIC;\n\
+             _thr NUMERIC;\n\
+             _ratio NUMERIC;\n\
+         BEGIN\n\
+             SELECT count(*) INTO _aff FROM {affected};\n\
+             SELECT GREATEST(reltuples::NUMERIC, 1.0) INTO _imm\n\
+                 FROM pg_class WHERE oid = '{intermediate}'::regclass;\n\
+             _thr := COALESCE(current_setting('reflex.wipe_threshold', true)::NUMERIC, {default_thr});\n\
+             _ratio := _aff::NUMERIC / _imm;\n\
+             IF _ratio >= _thr THEN\n\
+                 -- 1.4.5: high-selectivity path — delegate to reflex_reconcile,\n\
+                 -- which implements the optimized drop-index/bulk-INSERT/recreate-\n\
+                 -- index pattern. At >= {default_thr} selectivity the cost of the\n\
+                 -- standard MERGE + target double-rewrite exceeds the cost of a\n\
+                 -- full IMV rebuild; reconcile is REFRESH-MATERIALIZED-VIEW-shape\n\
+                 -- and minimizes per-row WAL/index overhead.\n\
+                 RAISE DEBUG 'pg_reflex wipe: ratio=% thr=% — reconcile', _ratio, _thr;\n\
+                 PERFORM public.reflex_reconcile('{view}');\n\
+             ELSE\n\
+                 RAISE DEBUG 'pg_reflex wipe: ratio=% thr=% — incremental', _ratio, _thr;\n\
+                 EXECUTE $reflex_inner${merge}$reflex_inner$;\n\
+{dead_cleanup}\
+                 EXECUTE $reflex_inner${tdel}$reflex_inner$;\n\
+                 EXECUTE $reflex_inner${tins}$reflex_inner$;\n\
+             END IF;\n\
+         END\n\
+         $reflex_dispatch$",
+        affected = affected_tbl,
+        intermediate = intermediate_tbl,
+        view = safe_view,
+        default_thr = WIPE_THRESHOLD_DEFAULT,
+        merge = safe_merge,
+        dead_cleanup = dead_cleanup,
+        tdel = safe_tdel,
+        tins = safe_tins,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn push_materialized_merge_and_affected(
     stmts: &mut Vec<String>,
@@ -1059,6 +1162,14 @@ pub fn reflex_build_delta_sql(
     let old_tbl = transition_old_table_name(source_table);
 
     let mut stmts: Vec<String> = Vec::new();
+
+    // 1.4.5: when set, the cleanup/target-sync block at the end emits the
+    // high-selectivity dispatch DO block (TRUNCATE+rebuild OR MERGE+cleanup)
+    // instead of the standard MERGE-then-cleanup+target-sync sequence.
+    struct PendingDispatch {
+        merge_sql: String,
+    }
+    let mut pending_dispatch: Option<PendingDispatch> = None;
 
     // Pre-compute group columns and affected-groups table name (used by multiple paths).
     // Affected / shrunk / scratch live in the IMV's schema (1.4.1) so the generated
@@ -1560,17 +1671,29 @@ pub fn reflex_build_delta_sql(
                     let cols = grp_cols.as_ref().expect("grp_cols is Some — checked above");
                     let net_delta = build_net_delta_query(&delta_old, &delta_new, &plan);
                     let select_expr = affected_groups_select(cols);
-                    push_materialized_merge_and_affected(
-                        &mut stmts,
-                        &scratch_tbl,
-                        &net_delta,
+                    // 1.4.5: emit scratch + affected EARLY so the dispatch
+                    // block below can read |affected| for the selectivity
+                    // check before deciding MERGE-vs-rebuild. The MERGE
+                    // statement itself moves into the dispatch DO block at
+                    // the end of this function.
+                    stmts.push(format!("TRUNCATE {}", affected_tbl));
+                    stmts.push(format!("TRUNCATE {}", scratch_tbl));
+                    stmts.push(format!("INSERT INTO {} {}", scratch_tbl, net_delta));
+                    stmts.push(format!(
+                        "INSERT INTO {} SELECT DISTINCT {} FROM {} AS __d",
+                        affected_tbl, select_expr, scratch_tbl
+                    ));
+                    // Capture the MERGE SQL — the dispatch block emits it
+                    // (instead of running it unconditionally).
+                    let merge_sql_for_dispatch = build_merge_from_table_sql(
                         &intermediate_tbl,
+                        &scratch_tbl,
                         &plan,
                         DeltaOp::Add,
-                        &affected_tbl,
-                        &select_expr,
-                        true,
                     );
+                    pending_dispatch = Some(PendingDispatch {
+                        merge_sql: merge_sql_for_dispatch,
+                    });
                 } else {
                     push_materialized_merge(
                         &mut stmts,
@@ -1613,8 +1736,22 @@ pub fn reflex_build_delta_sql(
             let qv = quote_identifier(view_name);
             if plan.group_by_columns.is_empty() {
                 // Global COUNT(DISTINCT) with no output GROUP BY — single output row, full rebuild.
-                stmts.push(format!("DELETE FROM {}", qv));
-                stmts.push(format!("INSERT INTO {} {}", qv, end_query));
+                let tdel = format!("DELETE FROM {}", qv);
+                let tins = format!("INSERT INTO {} {}", qv, end_query);
+                if let Some(pd) = pending_dispatch.take() {
+                    stmts.push(build_high_selectivity_dispatch_sql(
+                        view_name,
+                        &intermediate_tbl,
+                        &affected_tbl,
+                        &pd.merge_sql,
+                        None,
+                        &tdel,
+                        &tins,
+                    ));
+                } else {
+                    stmts.push(tdel);
+                    stmts.push(tins);
+                }
             } else {
                 // Intermediate-side column names (== affected column names).
                 let output_cols: Vec<String> = plan
@@ -1622,10 +1759,6 @@ pub fn reflex_build_delta_sql(
                     .iter()
                     .map(|c| format!("\"{}\"", normalized_column_name(c)))
                     .collect();
-                // Target-side column names for the GROUP BY prefix only:
-                // for COUNT-DISTINCT IMVs the target carries the GROUP BY
-                // cols (and aggregate output), but NOT the distinct cols
-                // (those are deduplicated by the aggregation).
                 let target_cols: Vec<String> = target_group_columns(&plan)
                     .into_iter()
                     .take(plan.group_by_columns.len())
@@ -1634,15 +1767,10 @@ pub fn reflex_build_delta_sql(
                     end_query,
                     &output_cols,
                     &affected_tbl,
-                    // `end_query` reads from the intermediate, so the
-                    // injected EXISTS predicate's outer is the intermediate.
                     &intermediate_tbl,
                     &plan.not_null_columns,
                 ) {
                     Some(spliced_end_q) => {
-                        // DELETE FROM target: outer is the target table —
-                        // use target-side column names mapped to affected
-                        // (intermediate-side) names.
                         let ns_in_target = null_safe_in(
                             &affected_tbl,
                             &qv,
@@ -1650,31 +1778,47 @@ pub fn reflex_build_delta_sql(
                             &output_cols,
                             &plan.not_null_columns,
                         );
-                        stmts.push(format!("DELETE FROM {} WHERE {}", qv, ns_in_target));
-                        stmts.push(format!("INSERT INTO {} {}", qv, spliced_end_q));
+                        let tdel = format!("DELETE FROM {} WHERE {}", qv, ns_in_target);
+                        let tins = format!("INSERT INTO {} {}", qv, spliced_end_q);
+                        if let Some(pd) = pending_dispatch.take() {
+                            stmts.push(build_high_selectivity_dispatch_sql(
+                                view_name,
+                                &intermediate_tbl,
+                                &affected_tbl,
+                                &pd.merge_sql,
+                                None,
+                                &tdel,
+                                &tins,
+                            ));
+                        } else {
+                            stmts.push(tdel);
+                            stmts.push(tins);
+                        }
                     }
                     None => {
                         // No GROUP BY found — defensive fallback to full rebuild.
-                        stmts.push(format!("DELETE FROM {}", qv));
-                        stmts.push(format!("INSERT INTO {} {}", qv, end_query));
+                        let tdel = format!("DELETE FROM {}", qv);
+                        let tins = format!("INSERT INTO {} {}", qv, end_query);
+                        if let Some(pd) = pending_dispatch.take() {
+                            stmts.push(build_high_selectivity_dispatch_sql(
+                                view_name,
+                                &intermediate_tbl,
+                                &affected_tbl,
+                                &pd.merge_sql,
+                                None,
+                                &tdel,
+                                &tins,
+                            ));
+                        } else {
+                            stmts.push(tdel);
+                            stmts.push(tins);
+                        }
                     }
                 }
             }
             stmts.push(metadata_sql);
         } else if let Some(ref cols) = grp_cols {
             let qv = quote_identifier(view_name);
-            // Three separate filters needed — the outer scope differs per
-            // statement, and the target column names may differ from the
-            // intermediate/affected column names when the user aliases
-            // GROUP BY cols in their SELECT.
-            //
-            // This branch fires when `end_query` does NOT contain GROUP BY
-            // (passthrough projection from the intermediate or
-            // SELECT-DISTINCT). In both shapes the target table carries the
-            // full `cols` set: aliased GROUP BY entries for GROUP-BY IMVs,
-            // distinct_columns for SELECT-DISTINCT IMVs (no aggregation).
-            // So `target_cols.len()` == `cols.len()` and we pass the full
-            // `cols` as the affected-side list.
             let target_cols = target_group_columns(&plan);
             let ns_in_intermediate = null_safe_in(
                 &affected_tbl,
@@ -1690,30 +1834,47 @@ pub fn reflex_build_delta_sql(
                 cols,
                 &plan.not_null_columns,
             );
-            if include_dead_cleanup {
-                // Scope dead-row cleanup to groups touched by THIS flush.
-                // The previous unscoped `DELETE FROM intermediate WHERE
-                // __ivm_count <= 0` did a full sequential scan of the
-                // intermediate table — for JOIN'd aggregates with millions
-                // of distinct groups this is the dominant cost of every
-                // UPDATE/DELETE flush even when the flush affects a single
-                // row. Only rows whose `__ivm_count` was changed by this
-                // flush can have newly become non-positive; everything else
-                // was either dead before (and should have been cleaned then)
-                // or has count > 0.
-                stmts.push(format!(
+            let dead_cleanup_sql = if include_dead_cleanup {
+                Some(format!(
                     "DELETE FROM {} WHERE __ivm_count <= 0 AND {}",
                     intermediate_tbl, ns_in_intermediate
-                ));
-            }
-            stmts.push(format!("DELETE FROM {} WHERE {}", qv, ns_in_target_delete));
-            // INSERT INTO target via `end_query` — end_query reads from the
-            // intermediate, so the appended EXISTS predicate's outer is the
-            // intermediate (column names match the affected naming).
-            stmts.push(format!(
+                ))
+            } else {
+                None
+            };
+            let target_delete_sql = format!("DELETE FROM {} WHERE {}", qv, ns_in_target_delete);
+            let target_insert_sql = format!(
                 "INSERT INTO {} {} AND {}",
                 qv, end_query, ns_in_intermediate
-            ));
+            );
+
+            if let Some(pd) = pending_dispatch.take() {
+                // 1.4.5: emit the high-selectivity dispatch DO block — at
+                // runtime, decide between MERGE-incremental and
+                // TRUNCATE+rebuild based on |affected| / |intermediate|.
+                // The TRUNCATE+rebuild branch rebuilds intermediate from
+                // base_query and target from end_query (full refresh of the
+                // IMV body), bypassing the per-row MERGE probe cost and the
+                // target double-rewrite that dominate at high selectivity.
+                stmts.push(build_high_selectivity_dispatch_sql(
+                    view_name,
+                    &intermediate_tbl,
+                    &affected_tbl,
+                    &pd.merge_sql,
+                    dead_cleanup_sql.as_deref(),
+                    &target_delete_sql,
+                    &target_insert_sql,
+                ));
+            } else {
+                // Standard incremental path (no dispatch): MERGE already
+                // pushed by a non-dispatch branch (e.g. outer-join-secondary
+                // or top-K), now push the cleanup + target sync.
+                if let Some(s) = dead_cleanup_sql {
+                    stmts.push(s);
+                }
+                stmts.push(target_delete_sql);
+                stmts.push(target_insert_sql);
+            }
             stmts.push(metadata_sql);
         } else {
             let qv = quote_identifier(view_name);

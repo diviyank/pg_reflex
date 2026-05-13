@@ -12,6 +12,7 @@ fn test_truncate_clears_imv() {
         None,
         None,
         None,
+        None,
     );
 
     // Verify data exists
@@ -46,6 +47,7 @@ fn test_truncate_then_reinsert() {
         None,
         None,
         None,
+        None,
     );
 
     Spi::run("TRUNCATE trunc2_src").expect("truncate");
@@ -72,6 +74,7 @@ fn test_reconcile_fixes_drift() {
     crate::create_reflex_ivm(
         "recon_view",
         "SELECT grp, SUM(val) AS total FROM recon_src GROUP BY grp",
+        None,
         None,
         None,
         None,
@@ -107,7 +110,7 @@ fn test_reconcile_passthrough() {
     Spi::run("INSERT INTO recon_pt_src (name) VALUES ('Alice'), ('Bob')")
         .expect("seed");
 
-    crate::create_reflex_ivm("recon_pt_view", "SELECT id, name FROM recon_pt_src", None, None, None);
+    crate::create_reflex_ivm("recon_pt_view", "SELECT id, name FROM recon_pt_src", None, None, None, None);
 
     // Manually delete a row from target (corrupt)
     Spi::run("DELETE FROM recon_pt_view WHERE name = 'Alice'").expect("corrupt");
@@ -137,6 +140,7 @@ fn test_reconcile_aggregate() {
     crate::create_reflex_ivm(
         "recon_agg_view",
         "SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM recon_agg_src GROUP BY grp",
+        None,
         None,
         None,
         None,
@@ -171,10 +175,12 @@ fn test_refresh_imv_depending_on() {
         None,
         None,
         None,
+        None,
     );
     crate::create_reflex_ivm(
         "rdep_v2",
         "SELECT grp, COUNT(*) AS cnt FROM rdep_src GROUP BY grp",
+        None,
         None,
         None,
         None,
@@ -217,11 +223,13 @@ fn test_scheduled_reconcile_runs_stale_imvs() {
         "sched_v1",
         "SELECT grp, SUM(val) AS total FROM sched_src GROUP BY grp",
         None, None, None,
+        None,
     );
     crate::create_reflex_ivm(
         "sched_v2",
         "SELECT grp, COUNT(*) AS cnt FROM sched_src GROUP BY grp",
         None, None, None,
+        None,
     );
 
     // Force every registry row to look "stale": null out last_update_date.
@@ -255,6 +263,7 @@ fn test_scheduled_reconcile_skips_fresh_imvs() {
         "sched_fresh_view",
         "SELECT grp, SUM(val) AS total FROM sched_fresh_src GROUP BY grp",
         None, None, None,
+        None,
     );
 
     // last_update_date is set to now() at IMV creation. With a 60-minute

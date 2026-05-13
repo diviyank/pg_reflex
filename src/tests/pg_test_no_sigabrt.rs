@@ -20,6 +20,7 @@ fn test_trigger_fired_merge_does_not_crash_backend() {
         None,
         None,
         None,
+        None,
     );
     assert_eq!(r, "CREATE REFLEX INCREMENTAL VIEW", "create IMV: {}", r);
 
@@ -62,6 +63,7 @@ fn test_chained_passthrough_does_not_crash_backend() {
         None,
         None,
         None,
+        None,
     );
     assert_eq!(r1, "CREATE REFLEX INCREMENTAL VIEW", "create L1: {}", r1);
 
@@ -69,6 +71,7 @@ fn test_chained_passthrough_does_not_crash_backend() {
         "chain_l2",
         "SELECT city, total, cnt FROM chain_l1",
         Some("city"),
+        None,
         None,
         None,
     );

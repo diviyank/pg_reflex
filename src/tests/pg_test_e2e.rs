@@ -16,6 +16,7 @@ fn test_join_query_imv() {
         None,
         None,
         None,
+        None,
     );
     assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
 
@@ -43,6 +44,7 @@ fn test_e2e_full_lifecycle() {
     crate::create_reflex_ivm(
         "e2e_view",
         "SELECT city, SUM(amount) AS total, COUNT(*) AS cnt FROM e2e_src GROUP BY city",
+        None,
         None,
         None,
         None,
@@ -117,12 +119,14 @@ fn test_e2e_cascading_propagation() {
         None,
         None,
         None,
+        None,
     );
 
     // L2: SUM of L1 totals (grand total across all categories)
     crate::create_reflex_ivm(
         "cascade_l2",
         "SELECT SUM(total) AS grand_total FROM cascade_l1",
+        None,
         None,
         None,
         None,
@@ -182,6 +186,7 @@ fn test_e2e_join_trigger_insert_delete() {
         None,
         None,
         None,
+        None,
     );
 
     // Verify initial
@@ -224,6 +229,7 @@ fn test_one_source_multiple_imvs() {
         None,
         None,
         None,
+        None,
     );
     // IMV 2: COUNT by city
     crate::create_reflex_ivm(
@@ -232,11 +238,13 @@ fn test_one_source_multiple_imvs() {
         None,
         None,
         None,
+        None,
     );
     // IMV 3: SUM of qty (no group by — global aggregate)
     crate::create_reflex_ivm(
         "multi_v3",
         "SELECT SUM(qty) AS total_qty FROM multi_src",
+        None,
         None,
         None,
         None,
@@ -336,12 +344,14 @@ fn test_4_level_cascade_chain() {
         None,
         None,
         None,
+        None,
     );
 
     // L2: SUM by region (rolls up cities)
     crate::create_reflex_ivm(
         "chain4_l2",
         "SELECT region, SUM(city_total) AS region_total FROM chain4_l1 GROUP BY region",
+        None,
         None,
         None,
         None,
@@ -354,12 +364,14 @@ fn test_4_level_cascade_chain() {
         None,
         None,
         None,
+        None,
     );
 
     // L4: passthrough of L3 (tests cascading through passthrough)
     crate::create_reflex_ivm(
         "chain4_l4",
         "SELECT num_regions FROM chain4_l3",
+        None,
         None,
         None,
         None,
@@ -450,6 +462,7 @@ fn test_schema_qualified_source() {
         None,
         None,
         None,
+        None,
     );
     assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
     let total = Spi::get_one::<pgrx::AnyNumeric>(
@@ -481,6 +494,7 @@ fn test_schema_qualified_view_name() {
     let result = crate::create_reflex_ivm(
         "test_schema.sq_view2",
         "SELECT grp, SUM(val) AS total FROM test_schema.sq_src2 GROUP BY grp",
+        None,
         None,
         None,
         None,
@@ -528,6 +542,7 @@ fn test_multi_level_cascade_propagation() {
         None,
         None,
         None,
+        None,
     );
     assert_eq!(r1, "CREATE REFLEX INCREMENTAL VIEW");
 
@@ -535,6 +550,7 @@ fn test_multi_level_cascade_propagation() {
     let r2 = crate::create_reflex_ivm(
         "mlc_l2",
         "SELECT region, SUM(total) AS grand_total FROM mlc_l1 GROUP BY region",
+        None,
         None,
         None,
         None,
@@ -632,12 +648,14 @@ fn test_chain_passthrough_then_aggregate() {
         None,
         None,
         None,
+        None,
     );
 
     // L2: aggregate on L1 (SUM by region)
     crate::create_reflex_ivm(
         "cpta_l2",
         "SELECT region, SUM(amount) AS total, COUNT(*) AS cnt FROM cpta_l1 GROUP BY region",
+        None,
         None,
         None,
         None,
@@ -730,12 +748,14 @@ fn test_chain_aggregate_then_passthrough() {
         None,
         None,
         None,
+        None,
     );
 
     // L2: passthrough of L1 (reads all rows from the aggregate target)
     crate::create_reflex_ivm(
         "catp_l2",
         "SELECT city, total, cnt FROM catp_l1",
+        None,
         None,
         None,
         None,
@@ -829,12 +849,14 @@ fn test_chain_passthrough_join_then_aggregate() {
         Some("id"),
         None,
         None,
+        None,
     );
 
     // L2: aggregate on L1 (SUM by category)
     crate::create_reflex_ivm(
         "cpja_l2",
         "SELECT category, SUM(amount) AS total, COUNT(*) AS cnt FROM cpja_l1 GROUP BY category",
+        None,
         None,
         None,
         None,
@@ -919,12 +941,14 @@ fn test_multiple_mixed_imvs_on_same_source() {
         None,
         None,
         None,
+        None,
     );
 
     // IMV2: passthrough — all active employees
     crate::create_reflex_ivm(
         "mmis_active",
         "SELECT id, dept, salary FROM mmis_src WHERE active = true",
+        None,
         None,
         None,
         None,
@@ -937,12 +961,14 @@ fn test_multiple_mixed_imvs_on_same_source() {
         None,
         None,
         None,
+        None,
     );
 
     // IMV4: aggregate — AVG salary globally
     crate::create_reflex_ivm(
         "mmis_avg",
         "SELECT AVG(salary) AS avg_sal FROM mmis_src",
+        None,
         None,
         None,
         None,
@@ -1072,6 +1098,7 @@ fn test_having_filters_groups() {
         None,
         None,
         None,
+        None,
     );
 
     // US = 1100, JP = 2000 → both > 200. EU = 150 → excluded.
@@ -1101,6 +1128,7 @@ fn test_having_dynamic_threshold() {
     crate::create_reflex_ivm(
         "hvd_view",
         "SELECT grp, SUM(val) AS total FROM hvd_src GROUP BY grp HAVING SUM(val) > 50",
+        None,
         None,
         None,
         None,
@@ -1147,6 +1175,7 @@ fn test_having_with_aggregate_not_in_select() {
         None,
         None,
         None,
+        None,
     );
 
     // A has 3 rows → passes. B has 2 rows → fails.
@@ -1177,6 +1206,7 @@ fn test_matview_source_skip_triggers() {
     let result = crate::create_reflex_ivm(
         "mv_imv",
         "SELECT grp, SUM(total) AS grand_total FROM mv_src GROUP BY grp",
+        None,
         None,
         None,
         None,
@@ -1228,6 +1258,7 @@ fn test_bool_or_insert_delete_update() {
     crate::create_reflex_ivm(
         "bo_view",
         "SELECT grp, BOOL_OR(flag) AS any_flag FROM bo_src GROUP BY grp",
+        None,
         None,
         None,
         None,
@@ -1297,6 +1328,7 @@ fn test_left_join_aggregate() {
         None,
         None,
         None,
+        None,
     );
 
     // Verify initial: US=100+50+75=225, EU=200
@@ -1351,6 +1383,7 @@ fn test_right_join_passthrough() {
         None,
         None,
         None,
+        None,
     );
 
     // All 3 cats should appear (A has 2 items, B and C have NULL items)
@@ -1391,6 +1424,7 @@ fn test_cast_propagation_sum_bigint() {
     crate::create_reflex_ivm(
         "cast_view",
         "SELECT grp, SUM(val)::BIGINT AS total FROM cast_src GROUP BY grp",
+        None,
         None,
         None,
         None,
@@ -1456,6 +1490,7 @@ fn test_subquery_in_from_with_trigger() {
         None,
         None,
         None,
+        None,
     );
 
     let count = Spi::get_one::<i64>("SELECT COUNT(*) FROM sq_view")
@@ -1504,6 +1539,7 @@ fn test_subquery_only_source() {
     crate::create_reflex_ivm(
         "sqo_view",
         "SELECT id, val FROM (SELECT id, val FROM sqo_src WHERE val > 0) AS sub",
+        None,
         None,
         None,
         None,
@@ -1562,7 +1598,7 @@ fn test_combo_cte_join_having() {
         SELECT cc_cjh1.grp, cc_cjh2.val FROM cc_cjh1 JOIN cc_cjh2 ON cc_cjh1.id = cc_cjh2.id \
     ) \
     SELECT grp, SUM(val) AS total FROM joined GROUP BY grp HAVING SUM(val) > 20";
-    crate::create_reflex_ivm("cc_cjh_v", sql, None, None, None);
+    crate::create_reflex_ivm("cc_cjh_v", sql, None, None, None, None);
     assert_imv_correct("cc_cjh_v", sql);
 
     // Insert to push 'b' above threshold
@@ -1578,7 +1614,7 @@ fn test_combo_distinct_where() {
     Spi::run("INSERT INTO cc_dw (grp, val) VALUES ('a', 10), ('a', 10), ('b', 20), ('b', 30), ('a', 20)").expect("seed");
 
     let sql = "SELECT DISTINCT grp, val FROM cc_dw WHERE val > 5";
-    crate::create_reflex_ivm("cc_dw_v", sql, Some("grp, val"), None, None);
+    crate::create_reflex_ivm("cc_dw_v", sql, Some("grp, val"), None, None, None);
     assert_imv_correct("cc_dw_v", sql);
 
     // Insert duplicate — should not add new row
@@ -1601,7 +1637,7 @@ fn test_combo_union_aggregate_operands() {
     let sql = "SELECT grp, SUM(val) AS total FROM cc_ua1 GROUP BY grp \
                UNION ALL \
                SELECT grp, SUM(val) AS total FROM cc_ua2 GROUP BY grp";
-    crate::create_reflex_ivm("cc_ua_v", sql, None, None, None);
+    crate::create_reflex_ivm("cc_ua_v", sql, None, None, None, None);
     assert_imv_correct("cc_ua_v", sql);
 
     // Insert into first table
@@ -1624,7 +1660,7 @@ fn test_combo_cast_multiple_aggregates() {
     Spi::run("INSERT INTO cc_cast (grp, val) VALUES ('a', 10), ('a', 20), ('b', 30)").expect("seed");
 
     let sql = "SELECT grp, SUM(val)::BIGINT AS s, COUNT(*)::INT AS c FROM cc_cast GROUP BY grp";
-    crate::create_reflex_ivm("cc_cast_v", sql, None, None, None);
+    crate::create_reflex_ivm("cc_cast_v", sql, None, None, None, None);
     assert_imv_correct("cc_cast_v", sql);
 
     Spi::run("INSERT INTO cc_cast (grp, val) VALUES ('a', 5)").expect("insert");
@@ -1641,7 +1677,7 @@ fn test_combo_having_with_avg() {
     Spi::run("INSERT INTO cc_havg (grp, val) VALUES ('a', 10), ('a', 20), ('a', 30), ('b', 5), ('b', 100)").expect("seed");
 
     let sql = "SELECT grp, AVG(val) AS mean, COUNT(*) AS cnt FROM cc_havg GROUP BY grp HAVING AVG(val) > 15";
-    crate::create_reflex_ivm("cc_havg_v", sql, None, None, None);
+    crate::create_reflex_ivm("cc_havg_v", sql, None, None, None, None);
     assert_imv_correct("cc_havg_v", sql);
 
     // Drop 'a' average by adding low values
