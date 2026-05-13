@@ -95,6 +95,29 @@ pub struct AggregationPlan {
     /// Used to generate target DDL and end_query with columns in the user's expected order.
     #[serde(default)]
     pub output_column_order: Vec<String>,
+    /// Per-source IMV-relevant column set (carried verbatim from
+    /// `SqlAnalysis::imv_relevant_columns`). Read by the trigger codegen to
+    /// emit the filter-aware spurious-skip block: when an UPDATE's pre- and
+    /// post-image multisets project identically onto these columns *and*
+    /// both pass the IMV's `where_predicate`, the IMV's output cannot
+    /// change and the entire trigger body for that IMV can be skipped.
+    ///
+    /// An empty value (per-source or overall) disables the optimization for
+    /// the affected source(s) — safe, just falls back to the existing path.
+    /// Values stored as sorted lists for stable codegen output.
+    #[serde(default)]
+    pub imv_relevant_columns: std::collections::HashMap<String, Vec<String>>,
+    /// Per-source restricted WHERE predicate, carried from
+    /// `SqlAnalysis::imv_relevant_where`. Each entry is the AND-joined
+    /// SQL string of conjuncts that reference only the source's columns,
+    /// with alias prefixes stripped so it evaluates directly against the
+    /// trigger's transition table.
+    ///
+    /// Used by the trigger filter-aware skip block to decide which rows
+    /// are "in scope" for the IMV — paired with `imv_relevant_columns` to
+    /// build the EXCEPT ALL check.
+    #[serde(default)]
+    pub imv_relevant_where: std::collections::HashMap<String, String>,
 }
 
 impl AggregationPlan {
@@ -923,6 +946,12 @@ fn plan_aggregation_inner(analysis: &SqlAnalysis) -> AggregationPlan {
         })
         .collect();
 
+    let imv_relevant_columns: std::collections::HashMap<String, Vec<String>> = analysis
+        .imv_relevant_columns
+        .iter()
+        .map(|(source, cols)| (source.clone(), cols.iter().cloned().collect()))
+        .collect();
+
     AggregationPlan {
         group_by_columns,
         intermediate_columns,
@@ -937,6 +966,8 @@ fn plan_aggregation_inner(analysis: &SqlAnalysis) -> AggregationPlan {
         not_null_columns: std::collections::HashSet::new(),
         group_by_aliases,
         output_column_order,
+        imv_relevant_columns,
+        imv_relevant_where: analysis.imv_relevant_where.clone(),
     }
 }
 

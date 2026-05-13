@@ -666,6 +666,276 @@ fn test_expr_contains_aggregate_function() {
     assert!(!expr_contains_aggregate(&expr2));
 }
 
+// ------------------------------------------------------------------
+// imv_relevant_columns — per-source set of columns referenced outside
+// the WHERE clause. Drives the trigger filter-aware spurious-skip.
+// ------------------------------------------------------------------
+
+fn relevant_cols(a: &SqlAnalysis, source: &str) -> Vec<String> {
+    a.imv_relevant_columns
+        .get(source)
+        .map(|s| s.iter().cloned().collect())
+        .unwrap_or_default()
+}
+
+#[test]
+fn imv_relevant_skips_where_only_columns() {
+    // status appears only in WHERE — it must NOT be IMV-relevant.
+    let a = parse_and_analyze("SELECT id, qty FROM orders WHERE status IN ('open', 'paid')");
+    let cols = relevant_cols(&a, "orders");
+    assert_eq!(cols, vec!["id", "qty"]);
+    assert!(!cols.contains(&"status".to_string()));
+}
+
+#[test]
+fn imv_relevant_includes_where_col_if_also_projected() {
+    // status is BOTH in WHERE and in SELECT → must be IMV-relevant.
+    let a = parse_and_analyze(
+        "SELECT status, COUNT(*) FROM orders WHERE status <> 'cancelled' GROUP BY status",
+    );
+    let cols = relevant_cols(&a, "orders");
+    assert!(cols.contains(&"status".to_string()));
+}
+
+#[test]
+fn imv_relevant_with_join_and_alias() {
+    // Customer-shape: GROUP BY a join key, WHERE a filter-only column.
+    let a = parse_and_analyze(
+        "SELECT dp.assortment_id, SUM(s.qty) \
+         FROM yse.sales_simulation s \
+         JOIN yse.demand_planning dp ON s.dem_plan_id = dp.id \
+         WHERE dp.status IN ('validated', 'current') \
+         GROUP BY dp.assortment_id",
+    );
+    let dp_cols = relevant_cols(&a, "yse.demand_planning");
+    let ss_cols = relevant_cols(&a, "yse.sales_simulation");
+    // dp.status is only in WHERE → filter-only.
+    assert!(!dp_cols.contains(&"status".to_string()));
+    // dp.id and dp.assortment_id are used in JOIN / GROUP BY → relevant.
+    assert!(dp_cols.contains(&"id".to_string()));
+    assert!(dp_cols.contains(&"assortment_id".to_string()));
+    // s.dem_plan_id (JOIN) and s.qty (aggregate arg) → relevant.
+    assert!(ss_cols.contains(&"dem_plan_id".to_string()));
+    assert!(ss_cols.contains(&"qty".to_string()));
+}
+
+#[test]
+fn imv_relevant_includes_having_columns() {
+    // count_status appears in HAVING — kept as relevant.
+    let a = parse_and_analyze(
+        "SELECT city, COUNT(*) FROM emp WHERE dept='eng' GROUP BY city HAVING COUNT(distinct city) > 1",
+    );
+    let cols = relevant_cols(&a, "emp");
+    assert!(cols.contains(&"city".to_string()));
+    assert!(!cols.contains(&"dept".to_string()));
+}
+
+#[test]
+fn imv_relevant_aggregate_argument_is_relevant() {
+    let a = parse_and_analyze("SELECT city, SUM(salary) FROM emp GROUP BY city");
+    let cols = relevant_cols(&a, "emp");
+    assert!(cols.contains(&"city".to_string()));
+    assert!(cols.contains(&"salary".to_string()));
+}
+
+#[test]
+fn imv_relevant_using_clause_columns() {
+    let a = parse_and_analyze(
+        "SELECT t.x, COUNT(*) FROM t JOIN u USING (k) WHERE t.f='y' GROUP BY t.x",
+    );
+    // Both t and u should have `k` as IMV-relevant.
+    let t_cols = relevant_cols(&a, "t");
+    let u_cols = relevant_cols(&a, "u");
+    assert!(t_cols.contains(&"k".to_string()));
+    assert!(u_cols.contains(&"k".to_string()));
+    // t.f is filter-only.
+    assert!(!t_cols.contains(&"f".to_string()));
+    // t.x is projected/grouped.
+    assert!(t_cols.contains(&"x".to_string()));
+}
+
+#[test]
+fn imv_relevant_empty_when_select_star() {
+    // Wildcard projection means we'd need the catalog to enumerate
+    // columns. Returning an empty map disables the optimization safely.
+    let a = parse_and_analyze("SELECT * FROM orders WHERE status='open'");
+    assert!(a.imv_relevant_columns.is_empty());
+}
+
+#[test]
+fn imv_relevant_empty_when_query_has_cte() {
+    // CTE refs cross-link to source columns via projection; static
+    // attribution is unsafe. Return empty.
+    let a = parse_and_analyze(
+        "WITH x AS (SELECT id, status FROM orders) \
+         SELECT id FROM x WHERE status='open'",
+    );
+    assert!(a.imv_relevant_columns.is_empty());
+}
+
+#[test]
+fn imv_relevant_single_source_bare_idents_attributed() {
+    // Bare column refs in a single-source query attribute to that source.
+    let a = parse_and_analyze("SELECT id, qty FROM orders WHERE status='open'");
+    let cols = relevant_cols(&a, "orders");
+    assert!(cols.contains(&"id".to_string()));
+    assert!(cols.contains(&"qty".to_string()));
+    assert!(!cols.contains(&"status".to_string()));
+}
+
+#[test]
+fn imv_relevant_computed_group_by_extracts_underlying_columns() {
+    // GROUP BY date_trunc('day', ts) — underlying ts must be relevant.
+    let a = parse_and_analyze(
+        "SELECT date_trunc('day', ts) AS d, COUNT(*) FROM events \
+         WHERE kind='login' GROUP BY date_trunc('day', ts)",
+    );
+    let cols = relevant_cols(&a, "events");
+    assert!(cols.contains(&"ts".to_string()));
+    assert!(!cols.contains(&"kind".to_string()));
+}
+
+#[test]
+fn imv_relevant_subquery_in_where_does_not_leak() {
+    // A scalar subquery inside WHERE references its own table — the refs
+    // belong inside WHERE (excluded) and to a relation NOT in `sources`
+    // (no leak into the relevant set for `orders`).
+    let a = parse_and_analyze(
+        "SELECT id, qty FROM orders \
+         WHERE created_at >= (SELECT cutoff FROM config)",
+    );
+    let cols = relevant_cols(&a, "orders");
+    assert!(cols.contains(&"id".to_string()));
+    assert!(cols.contains(&"qty".to_string()));
+    // created_at lives only in WHERE → filter-only.
+    assert!(!cols.contains(&"created_at".to_string()));
+    // cutoff belongs to `config`, which is not a real source for `orders`.
+    assert!(!cols.contains(&"cutoff".to_string()));
+}
+
+// ------------------------------------------------------------------
+// imv_relevant_where — per-source restricted WHERE conjuncts with
+// alias prefixes stripped.
+// ------------------------------------------------------------------
+
+#[test]
+fn imv_relevant_where_single_source_no_alias() {
+    let a = parse_and_analyze("SELECT id, qty FROM orders WHERE status='open'");
+    let w = a
+        .imv_relevant_where
+        .get("orders")
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(w, "status = 'open'");
+}
+
+#[test]
+fn imv_relevant_where_strips_aliases() {
+    let a = parse_and_analyze(
+        "SELECT o.id, SUM(o.qty) FROM orders o WHERE o.status='open' GROUP BY o.id",
+    );
+    let w = a
+        .imv_relevant_where
+        .get("orders")
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(w, "status = 'open'");
+}
+
+#[test]
+fn imv_relevant_where_keeps_single_source_conjuncts_only() {
+    // Customer-shape: WHERE clause restricted to ONE source's columns in a
+    // multi-source IMV. The conjunct lands in dp's bucket.
+    let a = parse_and_analyze(
+        "SELECT dp.assortment_id, SUM(s.qty) \
+         FROM yse.sales_simulation s \
+         JOIN yse.demand_planning dp ON s.dem_plan_id = dp.id \
+         WHERE dp.status IN ('validated', 'current') \
+         GROUP BY dp.assortment_id",
+    );
+    let dp_w = a
+        .imv_relevant_where
+        .get("yse.demand_planning")
+        .cloned()
+        .unwrap_or_default();
+    assert!(dp_w.contains("status IN"));
+    assert!(!dp_w.contains("dp."));
+    // sales_simulation has no own conjunct.
+    assert!(!a.imv_relevant_where.contains_key("yse.sales_simulation"));
+}
+
+#[test]
+fn imv_relevant_where_drops_cross_source_conjuncts() {
+    // Conjunct references both `dp` and `s` — drop it (cannot evaluate
+    // against a single transition table).
+    let a = parse_and_analyze(
+        "SELECT dp.assortment_id, SUM(s.qty) \
+         FROM yse.sales_simulation s \
+         JOIN yse.demand_planning dp ON s.dem_plan_id = dp.id \
+         WHERE dp.status = 'open' AND s.qty > 0 AND dp.id = s.dem_plan_id \
+         GROUP BY dp.assortment_id",
+    );
+    let dp_w = a
+        .imv_relevant_where
+        .get("yse.demand_planning")
+        .cloned()
+        .unwrap_or_default();
+    let s_w = a
+        .imv_relevant_where
+        .get("yse.sales_simulation")
+        .cloned()
+        .unwrap_or_default();
+    // Each source keeps its own conjunct.
+    assert!(dp_w.contains("status = 'open'"));
+    assert!(s_w.contains("qty > 0"));
+    // The cross-source conjunct (`dp.id = s.dem_plan_id`) is dropped.
+    assert!(!dp_w.contains("dem_plan_id"));
+    assert!(!s_w.contains("dem_plan_id"));
+}
+
+#[test]
+fn imv_relevant_where_multiple_conjuncts_same_source_joined_by_and() {
+    let a = parse_and_analyze("SELECT id, qty FROM orders WHERE status='open' AND qty > 0");
+    let w = a
+        .imv_relevant_where
+        .get("orders")
+        .cloned()
+        .unwrap_or_default();
+    assert!(w.contains("status = 'open'"));
+    assert!(w.contains("qty > 0"));
+    assert!(w.contains(" AND "));
+}
+
+#[test]
+fn imv_relevant_where_empty_when_no_where_clause() {
+    let a = parse_and_analyze("SELECT id, qty FROM orders");
+    assert!(a.imv_relevant_where.is_empty());
+}
+
+#[test]
+fn imv_relevant_where_empty_with_cte() {
+    let a = parse_and_analyze(
+        "WITH x AS (SELECT id, status FROM orders) \
+         SELECT id FROM x WHERE status='open'",
+    );
+    assert!(a.imv_relevant_where.is_empty());
+}
+
+#[test]
+fn imv_relevant_where_drops_disjunctions_within_conjunct() {
+    // OR is NOT split — we treat the whole `(a OR b)` as one conjunct.
+    // If all refs go to one source, kept. Here both refs are to `orders`
+    // so it stays.
+    let a = parse_and_analyze("SELECT id FROM orders WHERE (status='open' OR status='paid')");
+    let w = a
+        .imv_relevant_where
+        .get("orders")
+        .cloned()
+        .unwrap_or_default();
+    assert!(w.contains("status = 'open'"));
+    assert!(w.contains("status = 'paid'"));
+}
+
 mod proptest_tests {
     use super::*;
     use proptest::prelude::*;

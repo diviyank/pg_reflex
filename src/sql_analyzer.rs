@@ -1,9 +1,11 @@
 use serde::Serialize;
 use sqlparser::ast::{
-    Distinct, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr,
-    GroupByWithModifier, Join, JoinConstraint, JoinOperator, Query, SelectItem, SetExpr,
-    SetOperator, SetQuantifier, Statement, TableFactor, Visit, Visitor,
+    BinaryOperator, Distinct, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr,
+    GroupByWithModifier, Ident, Join, JoinConstraint, JoinOperator, Query, Select, SelectItem,
+    SetExpr, SetOperator, SetQuantifier, Statement, TableFactor, Visit, VisitMut, Visitor,
+    VisitorMut,
 };
+use std::collections::{BTreeSet, HashMap};
 use std::ops::ControlFlow;
 
 #[derive(Debug)]
@@ -123,6 +125,37 @@ pub struct SqlAnalysis {
     pub distinct_on_columns: Vec<String>,
     /// ORDER BY expressions as strings (e.g., ["city", "val DESC"])
     pub order_by_exprs: Vec<String>,
+    /// Per-source IMV-relevant column set: source-table-name → columns of that
+    /// source referenced by SELECT projections, JOIN ON / USING conditions,
+    /// GROUP BY expressions, or HAVING — i.e. EVERYWHERE except WHERE.
+    ///
+    /// A column that appears *only* in WHERE is "filter-only": an UPDATE that
+    /// changes its value cannot influence the IMV's output as long as both
+    /// old and new pre-images still pass (or both still fail) the predicate.
+    /// The trigger's filter-aware spurious-skip uses this set as the projection
+    /// for its EXCEPT ALL check.
+    ///
+    /// Empty when the query uses a SELECT *, when CTEs / subqueries make
+    /// attribution ambiguous, or when no non-WHERE column reference resolves
+    /// to a known source. An empty set disables the optimization for that
+    /// source — safe (fall back to the existing path), just not faster.
+    pub imv_relevant_columns: HashMap<String, BTreeSet<String>>,
+    /// Per-source restricted WHERE predicate: source-table-name → the
+    /// conjunction of WHERE conjuncts that reference only columns of that
+    /// source, with alias prefixes stripped so the resulting SQL evaluates
+    /// directly against the trigger's transition table.
+    ///
+    /// Example: for a multi-source IMV with
+    ///   `WHERE dp.status IN ('open', 'paid') AND s.qty > 0`
+    /// (where `dp` aliases `demand_planning` and `s` aliases `sales`), the
+    /// map contains:
+    ///   `demand_planning -> "status IN ('open', 'paid')"`
+    ///   `sales           -> "qty > 0"`
+    ///
+    /// Conjuncts spanning multiple sources are dropped (cannot be evaluated
+    /// against a single transition table). The original `where_clause`
+    /// field is unchanged — it is the full text for downstream uses.
+    pub imv_relevant_where: HashMap<String, String>,
 }
 
 impl SqlAnalysis {
@@ -643,6 +676,412 @@ fn flatten_set_operands(
     }
 }
 
+/// Visitor that records every column reference encountered during traversal.
+/// Each entry is the dotted parts of an identifier expression: a bare
+/// `Identifier("status")` produces `vec!["status"]`; a `CompoundIdentifier`
+/// like `dp.status` produces `vec!["dp", "status"]`.
+///
+/// Used by [`collect_imv_relevant_columns`] to walk every clause of a SELECT
+/// **except** the WHERE clause, so the resulting set captures columns the IMV
+/// actually projects / joins on / groups by — not columns that merely gate
+/// row inclusion.
+#[derive(Default)]
+struct ColumnRefCollector {
+    refs: Vec<Vec<String>>,
+}
+
+impl Visitor for ColumnRefCollector {
+    type Break = ();
+
+    fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<()> {
+        match expr {
+            Expr::Identifier(id) => {
+                self.refs.push(vec![id.value.clone()]);
+            }
+            Expr::CompoundIdentifier(ids) => {
+                self.refs
+                    .push(ids.iter().map(|i| i.value.clone()).collect());
+            }
+            _ => {}
+        }
+        ControlFlow::Continue(())
+    }
+}
+
+/// Test whether `source` names a real base table (i.e., not a CTE marker like
+/// `<subquery:foo>` or a table function). These placeholders are pushed onto
+/// `analysis.sources` by [`AnalysisVisitor::pre_visit_table_factor`] for
+/// derived / function table factors and are not valid trigger sources.
+fn is_real_source(source: &str) -> bool {
+    !source.starts_with('<')
+}
+
+/// Resolve `parts` (the dotted segments of a column reference) to a
+/// `(source_table, column_name)` pair, using `table_aliases` and the list of
+/// real sources to disambiguate.
+///
+/// Returns a list because a bare identifier in a multi-source query is
+/// attributable to all sources (the caller treats that as a conservative
+/// over-include — fewer skips fire, but never an incorrect skip). The
+/// IMV-create-time pass in `create_ivm.rs` then filters this over-set
+/// against each source's actual catalog columns, dropping bogus
+/// attributions like `qty_sales` on `demand_planning`.
+///
+/// Returns an empty vector when the reference clearly belongs to a relation
+/// that is not in `sources` (e.g., references inside a correlated subquery
+/// that names a CTE or extension table).
+fn resolve_column_ref(
+    parts: &[String],
+    aliases: &HashMap<String, String>,
+    sources: &[String],
+) -> Vec<(String, String)> {
+    let real_sources: Vec<&String> = sources.iter().filter(|s| is_real_source(s)).collect();
+
+    if parts.is_empty() {
+        return Vec::new();
+    }
+
+    let column = parts.last().unwrap().clone();
+
+    if parts.len() == 1 {
+        // Bare identifier — attribute to every real source. Safe over-set;
+        // create_ivm filters this against catalog before persisting.
+        return real_sources
+            .iter()
+            .map(|s| ((*s).clone(), column.clone()))
+            .collect();
+    }
+
+    // Compound identifier: the segment immediately before the column is the
+    // table alias or table name. For `schema.table.col` SQL we'd see 3 parts;
+    // the prefix `schema.table` won't match an alias but should match a
+    // schema-qualified entry in `sources`. We try a few lookup forms.
+    let prefix = &parts[parts.len() - 2];
+
+    if let Some(resolved) = aliases.get(prefix) {
+        if real_sources.iter().any(|s| s.as_str() == resolved.as_str()) {
+            return vec![(resolved.clone(), column)];
+        }
+    }
+
+    // Bare table name match (no alias): the alias map only contains entries
+    // when the user wrote `AS foo`. An unaliased FROM table appears in
+    // `sources` directly.
+    for s in &real_sources {
+        if s.as_str() == prefix {
+            return vec![((*s).clone(), column)];
+        }
+        // Schema-qualified vs bare-name match (e.g., source "alp.product"
+        // referenced as "product.id" or vice versa).
+        let bare = s.rsplit('.').next().unwrap_or(s.as_str());
+        if bare == prefix {
+            return vec![((*s).clone(), column)];
+        }
+    }
+
+    // Couldn't attribute — likely a reference to a CTE or out-of-scope name.
+    // Returning empty is the safe choice: we under-attribute, so the column
+    // never becomes "IMV-relevant", which makes the multiset check weaker
+    // (more skips fire). But the missed columns by construction live outside
+    // any real source's transition table, so they can't trigger spurious
+    // skips on the wrong table.
+    Vec::new()
+}
+
+/// Extract just the top-level FROM tables, excluding any tables that
+/// appear only inside subqueries. The bare-identifier resolution in
+/// [`resolve_column_ref`] uses this list so a bare ref in
+/// `SELECT id FROM orders WHERE created_at >= (SELECT cutoff FROM config)`
+/// attributes to `orders` only, ignoring `config` (which lives inside the
+/// WHERE subquery).
+fn top_level_sources(select: &Select) -> Vec<String> {
+    let mut sources = Vec::new();
+    for twj in &select.from {
+        if let TableFactor::Table { name, .. } = &twj.relation {
+            sources.push(name.to_string());
+        }
+        for join in &twj.joins {
+            if let TableFactor::Table { name, .. } = &join.relation {
+                sources.push(name.to_string());
+            }
+        }
+    }
+    sources
+}
+
+/// Compute the IMV-relevant column set for each source by walking every
+/// clause of the SELECT EXCEPT the WHERE clause: projection, GROUP BY,
+/// HAVING, JOIN ON, and JOIN USING column lists.
+///
+/// Returns an empty map when the optimization can't be safely applied:
+/// the query has CTEs, the projection contains a wildcard, or there are no
+/// top-level real sources. Resolution is grounded against TOP-LEVEL FROM
+/// tables only (not the full analyzer-visitor source list, which also
+/// includes relations referenced inside subqueries).
+fn collect_imv_relevant_columns(
+    select: &Select,
+    aliases: &HashMap<String, String>,
+    _all_sources: &[String],
+    has_ctes: bool,
+) -> HashMap<String, BTreeSet<String>> {
+    if has_ctes {
+        return HashMap::new();
+    }
+    let sources: Vec<String> = top_level_sources(select);
+
+    // Any wildcard projection means we don't know the exposed columns
+    // statically. Bail out — the existing byte-identical fast path remains
+    // in place for these IMVs.
+    for item in &select.projection {
+        match item {
+            SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => {
+                return HashMap::new();
+            }
+            _ => {}
+        }
+    }
+
+    let mut collector = ColumnRefCollector::default();
+
+    // Projection
+    for item in &select.projection {
+        match item {
+            SelectItem::UnnamedExpr(e) => {
+                let _ = e.visit(&mut collector);
+            }
+            SelectItem::ExprWithAlias { expr, .. } => {
+                let _ = expr.visit(&mut collector);
+            }
+            _ => {}
+        }
+    }
+
+    // GROUP BY
+    if let GroupByExpr::Expressions(exprs, _) = &select.group_by {
+        for e in exprs {
+            let _ = e.visit(&mut collector);
+        }
+    }
+
+    // HAVING — references aggregate results, but any column refs inside are
+    // refs to source columns that materially shape the aggregate, so include.
+    if let Some(e) = &select.having {
+        let _ = e.visit(&mut collector);
+    }
+
+    // JOIN ON expressions
+    let mut using_column_idents: Vec<String> = Vec::new();
+    for twj in &select.from {
+        for join in &twj.joins {
+            if let Some(c) = join_constraint(&join.join_operator) {
+                match c {
+                    JoinConstraint::On(expr) => {
+                        let _ = expr.visit(&mut collector);
+                    }
+                    JoinConstraint::Using(cols) => {
+                        // USING(col, ...) — the columns appear in every joined
+                        // relation. Conservatively add them to every real
+                        // source. We record them separately so they bypass
+                        // alias-resolution (USING never has table prefixes).
+                        for c in cols {
+                            // ObjectName → take the last segment
+                            for part in c.0.iter() {
+                                if let sqlparser::ast::ObjectNamePart::Identifier(id) = part {
+                                    using_column_idents.push(id.value.clone());
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    // Resolve every captured ref to (source, column).
+    let mut result: HashMap<String, BTreeSet<String>> = HashMap::new();
+    for parts in &collector.refs {
+        for (src, col) in resolve_column_ref(parts, aliases, &sources) {
+            result.entry(src).or_default().insert(col);
+        }
+    }
+
+    // USING() columns apply to every joined real source.
+    let real_sources: Vec<&String> = sources.iter().filter(|s| is_real_source(s)).collect();
+    for col in &using_column_idents {
+        for s in &real_sources {
+            result.entry((*s).clone()).or_default().insert(col.clone());
+        }
+    }
+
+    result
+}
+
+/// Recursively split an Expr by top-level AND into a flat list of conjuncts.
+/// Stops descending at the first non-AND BinaryOp or any other node.
+fn split_top_level_and(expr: &Expr, out: &mut Vec<Expr>) {
+    if let Expr::BinaryOp {
+        left,
+        op: BinaryOperator::And,
+        right,
+    } = expr
+    {
+        split_top_level_and(left, out);
+        split_top_level_and(right, out);
+        return;
+    }
+    if let Expr::Nested(inner) = expr {
+        split_top_level_and(inner, out);
+        return;
+    }
+    out.push(expr.clone());
+}
+
+/// In-place visitor that rewrites `Expr::CompoundIdentifier([prefix, ...rest])`
+/// to drop the prefix when it matches one of `prefixes_to_strip`. Used to
+/// turn `dp.status` into `status` after we've decided a conjunct belongs
+/// exclusively to `dp`'s source — the transition table doesn't have the
+/// alias, only the bare column name.
+///
+/// Only strips a single leading prefix; deeper qualifiers (struct field
+/// access on JSON columns, schema.table.column) are left alone, since
+/// those don't appear when the prefix is just an alias.
+struct AliasPrefixStripper<'a> {
+    prefixes_to_strip: &'a BTreeSet<String>,
+}
+
+impl<'a> VisitorMut for AliasPrefixStripper<'a> {
+    type Break = ();
+
+    fn pre_visit_expr(&mut self, expr: &mut Expr) -> ControlFlow<()> {
+        if let Expr::CompoundIdentifier(ids) = expr {
+            if ids.len() == 2 && self.prefixes_to_strip.contains(&ids[0].value) {
+                let col = ids.last().unwrap().clone();
+                *expr = Expr::Identifier(Ident::new(col.value));
+            }
+        }
+        ControlFlow::Continue(())
+    }
+}
+
+/// Compute per-source restricted WHERE predicates.
+///
+/// For each top-level AND conjunct of the WHERE clause:
+///   1. Collect every column reference inside the conjunct.
+///   2. Resolve each reference to a source table via aliases / source names.
+///   3. If every reference resolves to the same single real source, keep the
+///      conjunct in that source's bucket; otherwise drop it.
+///   4. Strip alias / table-name prefixes so the conjunct evaluates against a
+///      flat transition table (which has no aliases).
+///
+/// Returns a map source-table-name → AND-joined SQL string of the kept
+/// conjuncts. Sources with no kept conjuncts are absent from the map.
+///
+/// Returns an empty map when:
+///   - The query has CTEs (refs may resolve through CTE bodies — unsafe).
+///   - WHERE is absent.
+fn collect_imv_relevant_where(
+    select: &Select,
+    aliases: &HashMap<String, String>,
+    sources: &[String],
+    has_ctes: bool,
+) -> HashMap<String, String> {
+    if has_ctes {
+        return HashMap::new();
+    }
+    let Some(where_expr) = &select.selection else {
+        return HashMap::new();
+    };
+
+    let real_sources: Vec<&String> = sources.iter().filter(|s| is_real_source(s)).collect();
+    if real_sources.is_empty() {
+        return HashMap::new();
+    }
+
+    // Pre-compute the prefixes we'd need to strip per source: every alias
+    // pointing at that source, plus the source's bare table name.
+    let mut prefixes_per_source: HashMap<String, BTreeSet<String>> = HashMap::new();
+    for s in &real_sources {
+        let mut prefixes: BTreeSet<String> = BTreeSet::new();
+        let bare = s.rsplit('.').next().unwrap_or(s.as_str()).to_string();
+        prefixes.insert(bare);
+        prefixes.insert((*s).clone());
+        for (alias, table) in aliases {
+            if table == *s {
+                prefixes.insert(alias.clone());
+            }
+        }
+        prefixes_per_source.insert((*s).clone(), prefixes);
+    }
+
+    let mut conjuncts: Vec<Expr> = Vec::new();
+    split_top_level_and(where_expr, &mut conjuncts);
+
+    let mut buckets: HashMap<String, Vec<String>> = HashMap::new();
+
+    for conj in conjuncts {
+        let mut collector = ColumnRefCollector::default();
+        let _ = conj.visit(&mut collector);
+
+        // For each ref, resolve to its source(s). A bare ref in a multi-source
+        // query attributes to ALL sources — we treat that as "ambiguous" and
+        // drop the conjunct (since we can't know which transition table it'd
+        // evaluate against meaningfully).
+        let mut resolved_sources: BTreeSet<String> = BTreeSet::new();
+        let mut ambiguous_or_unattributable = false;
+
+        for parts in &collector.refs {
+            let resolved = resolve_column_ref(parts, aliases, sources);
+            if parts.len() == 1 && real_sources.len() > 1 {
+                // Bare ident in multi-source query: which source is it?
+                // Conservatively treat as ambiguous and drop the conjunct.
+                ambiguous_or_unattributable = true;
+                break;
+            }
+            if resolved.is_empty() {
+                // Reference to a relation that's not in `sources` — could
+                // be a scalar subquery target or an out-of-scope CTE.
+                // Drop the conjunct.
+                ambiguous_or_unattributable = true;
+                break;
+            }
+            for (src, _col) in &resolved {
+                resolved_sources.insert(src.clone());
+            }
+        }
+
+        if ambiguous_or_unattributable {
+            continue;
+        }
+        if resolved_sources.len() != 1 {
+            // 0 refs: it's a literal predicate (e.g., TRUE). Drop — not
+            // useful and pollutes both sides equally.
+            // 2+ refs: cross-source conjunct, can't evaluate on one
+            // transition table.
+            continue;
+        }
+
+        let source = resolved_sources.into_iter().next().unwrap();
+        let empty = BTreeSet::new();
+        let prefixes = prefixes_per_source.get(&source).unwrap_or(&empty);
+        let mut rewritten = conj.clone();
+        let mut stripper = AliasPrefixStripper {
+            prefixes_to_strip: prefixes,
+        };
+        let _ = <Expr as VisitMut>::visit(&mut rewritten, &mut stripper);
+
+        buckets
+            .entry(source)
+            .or_default()
+            .push(rewritten.to_string());
+    }
+
+    buckets
+        .into_iter()
+        .map(|(src, parts)| (src, parts.join(" AND ")))
+        .collect()
+}
+
 pub fn analyze(statements: &[Statement]) -> Result<SqlAnalysis, SqlAnalysisError> {
     if statements.len() != 1 {
         return Err(SqlAnalysisError::MultipleQueries(statements.len()));
@@ -778,6 +1217,16 @@ pub fn analyze(statements: &[Statement]) -> Result<SqlAnalysis, SqlAnalysisError
             analysis.joins.push(extract_join_info(join));
         }
     }
+
+    // Phase 3: IMV-relevant per-source column set. Walks every clause
+    // EXCEPT the WHERE clause and resolves column refs against sources +
+    // aliases. CTE-using queries get an empty map (safe; the filter-aware
+    // skip is silently disabled). See `collect_imv_relevant_columns`.
+    let has_ctes = !analysis.ctes.is_empty();
+    analysis.imv_relevant_columns =
+        collect_imv_relevant_columns(select, &analysis.table_aliases, &analysis.sources, has_ctes);
+    analysis.imv_relevant_where =
+        collect_imv_relevant_where(select, &analysis.table_aliases, &analysis.sources, has_ctes);
 
     Ok(analysis)
 }

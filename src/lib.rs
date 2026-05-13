@@ -274,6 +274,29 @@ fn reflex_probe_not_null_columns(view_name: &str) -> String {
     create_ivm::reflex_probe_not_null_columns_impl(view_name)
 }
 
+/// 1.4.5: Re-analyze an existing IMV's stored `base_query` and merge the
+/// newly computed `imv_relevant_columns` / `imv_relevant_where` maps into
+/// its `aggregations` JSON. Idempotent.
+///
+/// Used by the 1.4.4→1.4.5 migration to backfill the static analysis the
+/// filter-aware spurious-skip relies on; also useful after a future
+/// analyzer extension shifts what falls into either map.
+#[pg_extern]
+fn reflex_rebuild_imv_metadata(view_name: &str) -> String {
+    create_ivm::reflex_rebuild_imv_metadata_impl(view_name)
+}
+
+/// 1.4.5: Re-emit the consolidated trigger function bodies for a source
+/// table, picking up the latest codegen. CREATE OR REPLACE overwrites
+/// existing function bodies without changing trigger identity.
+///
+/// Used by the 1.4.4→1.4.5 migration to install the filter-aware
+/// spurious-skip block on triggers attached to pre-1.4.5 IMVs.
+#[pg_extern]
+fn reflex_rebuild_triggers(source_table: &str) -> String {
+    create_ivm::reflex_rebuild_triggers_impl(source_table)
+}
+
 /// Refresh a single IMV by rebuilding from source. Alias for reflex_reconcile.
 /// Use after REFRESH MATERIALIZED VIEW on a source that feeds this IMV.
 #[pg_extern]

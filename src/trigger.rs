@@ -2227,28 +2227,127 @@ pub fn reflex_flush_deferred(source_table: &str) -> String {
         }
 
         for (imv_name, base_query, end_query, agg_json, where_pred) in &imvs {
-            // Skip this IMV if where_predicate is set and no staged row matches it.
+            // 1.4.5 — Skip this IMV iff NO staged row matches the
+            // predicate, on either side of the delta. The 1.4.4 check
+            // looked only at NEW-state rows (`I` + `U_NEW`); that silently
+            // dropped row-leaves-filter UPDATEs — when a row transitions
+            // out of the IMV's WHERE the IMV must DELETE its
+            // contribution, which requires the trigger body to run. The OR
+            // below extends the gate to OLD-state passing rows so we no
+            // longer mistake "no new row to add" for "no work at all".
             if let Some(pred) = where_pred {
-                let new_subq = format!(
-                    "(SELECT * FROM {} WHERE __reflex_op IN ('I', 'U_NEW'))",
-                    delta_tbl
-                );
                 let pred_sql = format!(
-                    "SELECT EXISTS(SELECT 1 FROM {} AS __pred_chk WHERE {} LIMIT 1)",
-                    new_subq, pred
+                    "SELECT EXISTS( \
+                        SELECT 1 FROM {delta} WHERE __reflex_op IN ('I', 'U_NEW') AND ({pred}) \
+                     ) OR EXISTS( \
+                        SELECT 1 FROM {delta} WHERE __reflex_op IN ('D', 'U_OLD') AND ({pred}) \
+                     ) AS m",
+                    delta = delta_tbl,
+                    pred = pred,
                 );
                 let matched = client
                     .select(&pred_sql, None, &[])
                     .unwrap_or_report()
                     .next()
                     .map(|row| {
-                        row.get_by_name::<bool, _>("exists")
+                        row.get_by_name::<bool, _>("m")
                             .unwrap_or(None)
                             .unwrap_or(false)
                     })
                     .unwrap_or(false);
                 if !matched {
                     continue;
+                }
+            }
+
+            // 1.4.5 — Per-IMV filter-aware spurious-skip in DEFERRED mode.
+            //
+            // The 1.4.3 byte-identical multiset check above is a *source-wide*
+            // gate — it fires only when EVERY column is byte-equal on every
+            // U_OLD/U_NEW pair AND there are no INSERT/DELETE rows. That's
+            // strong but rare. The check below is per-IMV and runs even when
+            // the source-wide gate didn't fire:
+            //
+            //   * Read the IMV's `imv_relevant_columns[source_table]` — the
+            //     columns the IMV actually projects / joins on / groups by.
+            //     Filter-only columns (in WHERE only) are absent.
+            //   * Read the source-restricted `imv_relevant_where[source]`
+            //     — alias-stripped conjuncts that evaluate against the flat
+            //     staging delta.
+            //   * Compare multisets of (relevant_cols)-projected rows from
+            //     old-state (U_OLD ∪ D) vs new-state (U_NEW ∪ I), each
+            //     filtered by the per-source predicate.
+            //
+            // If multisets match in both directions, the IMV's output cannot
+            // change for any group touched by this delta — skip it.
+            //
+            // Absent metadata (CTE IMVs, SELECT *, or IMVs created before
+            // 1.4.5 metadata backfill) falls through to the existing path.
+            let agg_jsonb: Result<serde_json::Value, _> = serde_json::from_str(agg_json);
+            if let Ok(jv) = agg_jsonb {
+                let cols_arr = jv
+                    .get("imv_relevant_columns")
+                    .and_then(|m| m.get(source_table))
+                    .and_then(|a| a.as_array());
+                if let Some(cols) = cols_arr {
+                    // No runtime catalog filter — the analyzer (1.4.5) only
+                    // attributes a column to a source when the reference is
+                    // unambiguously resolvable, so every column listed here
+                    // is guaranteed to exist on the source's transition /
+                    // delta table.
+                    let cols_csv = cols
+                        .iter()
+                        .filter_map(|v| v.as_str())
+                        .map(|c| format!("\"{}\"", c.replace('"', "\"\"")))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    if !cols_csv.is_empty() {
+                        let pred = jv
+                            .get("imv_relevant_where")
+                            .and_then(|m| m.get(source_table))
+                            .and_then(|s| s.as_str())
+                            .filter(|s| !s.is_empty());
+                        let old_filter = match pred {
+                            Some(p) => format!("__reflex_op IN ('U_OLD', 'D') AND ({})", p),
+                            None => "__reflex_op IN ('U_OLD', 'D')".to_string(),
+                        };
+                        let new_filter = match pred {
+                            Some(p) => format!("__reflex_op IN ('U_NEW', 'I') AND ({})", p),
+                            None => "__reflex_op IN ('U_NEW', 'I')".to_string(),
+                        };
+                        let sql = format!(
+                            "WITH \
+                               diff_o AS ( \
+                                 SELECT {cols} FROM {delta} WHERE {of} \
+                                 EXCEPT ALL \
+                                 SELECT {cols} FROM {delta} WHERE {nf} \
+                               ), \
+                               diff_n AS ( \
+                                 SELECT {cols} FROM {delta} WHERE {nf} \
+                                 EXCEPT ALL \
+                                 SELECT {cols} FROM {delta} WHERE {of} \
+                               ) \
+                             SELECT NOT EXISTS(SELECT 1 FROM diff_o) \
+                                AND NOT EXISTS(SELECT 1 FROM diff_n) AS sp",
+                            cols = cols_csv,
+                            delta = delta_tbl,
+                            of = old_filter,
+                            nf = new_filter,
+                        );
+                        let filter_skip = client
+                            .select(&sql, None, &[])
+                            .unwrap_or_report()
+                            .next()
+                            .map(|row| {
+                                row.get_by_name::<bool, _>("sp")
+                                    .unwrap_or(None)
+                                    .unwrap_or(false)
+                            })
+                            .unwrap_or(false);
+                        if filter_skip {
+                            continue;
+                        }
+                    }
                 }
             }
 

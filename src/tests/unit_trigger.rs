@@ -28,6 +28,8 @@ fn simple_plan() -> AggregationPlan {
         not_null_columns: std::collections::HashSet::new(),
         group_by_aliases: std::collections::HashMap::new(),
         output_column_order: vec![],
+        imv_relevant_columns: std::collections::HashMap::new(),
+        imv_relevant_where: std::collections::HashMap::new(),
     }
 }
 
@@ -76,6 +78,8 @@ fn test_build_merge_min_add() {
         not_null_columns: std::collections::HashSet::new(),
         group_by_aliases: std::collections::HashMap::new(),
         output_column_order: vec![],
+        imv_relevant_columns: std::collections::HashMap::new(),
+        imv_relevant_where: std::collections::HashMap::new(),
     };
     let delta = "SELECT city, MIN(price) AS \"__min_price\", COUNT(*) AS __ivm_count FROM src GROUP BY city";
     let sql = build_merge_sql("intermediate", delta, &plan, DeltaOp::Add);
@@ -104,6 +108,8 @@ fn test_build_upsert_min_subtract_sets_null() {
         not_null_columns: std::collections::HashSet::new(),
         group_by_aliases: std::collections::HashMap::new(),
         output_column_order: vec![],
+        imv_relevant_columns: std::collections::HashMap::new(),
+        imv_relevant_where: std::collections::HashMap::new(),
     };
     let delta = "SELECT city, MIN(price) FROM src GROUP BY city";
     let sql = build_merge_sql("intermediate", delta, &plan, DeltaOp::Subtract);
@@ -141,6 +147,8 @@ fn test_min_max_recompute_sql() {
         not_null_columns: std::collections::HashSet::new(),
         group_by_aliases: std::collections::HashMap::new(),
         output_column_order: vec![],
+        imv_relevant_columns: std::collections::HashMap::new(),
+        imv_relevant_where: std::collections::HashMap::new(),
     };
     let orig_base = "SELECT city AS \"city\", MIN(price) AS \"__min_price\", SUM(amount) AS \"__sum_amount\", COUNT(*) AS __ivm_count FROM orders GROUP BY city";
     let sql = build_min_max_recompute_sql("intermediate", &plan, orig_base, None);
@@ -216,6 +224,8 @@ fn test_min_max_recompute_sql_handles_join_aliases() {
         not_null_columns: std::collections::HashSet::new(),
         group_by_aliases: std::collections::HashMap::new(),
         output_column_order: vec![],
+        imv_relevant_columns: std::collections::HashMap::new(),
+        imv_relevant_where: std::collections::HashMap::new(),
     };
     let orig_base = "SELECT s.product_id AS \"product_id\", SUM(CASE WHEN (caav.product_id IS NOT NULL) THEN 1 ELSE 0 END) AS \"__bool_or_caav_product_id_is_not_null_true_count\", COUNT(*) AS __ivm_count FROM sales_simulation s LEFT JOIN current_assortment_activity caav ON caav.product_id = s.product_id GROUP BY s.product_id";
     let sql = build_min_max_recompute_sql("intermediate", &plan, orig_base, None);
@@ -259,6 +269,8 @@ fn min_only_plan() -> AggregationPlan {
         not_null_columns: std::collections::HashSet::new(),
         group_by_aliases: std::collections::HashMap::new(),
         output_column_order: vec![],
+        imv_relevant_columns: std::collections::HashMap::new(),
+        imv_relevant_where: std::collections::HashMap::new(),
     }
 }
 
@@ -329,6 +341,8 @@ fn test_min_max_recompute_affected_filter_uses_multiple_group_columns() {
         not_null_columns: std::collections::HashSet::new(),
         group_by_aliases: std::collections::HashMap::new(),
         output_column_order: vec![],
+        imv_relevant_columns: std::collections::HashMap::new(),
+        imv_relevant_where: std::collections::HashMap::new(),
     };
     let orig_base = "SELECT region AS \"region\", product AS \"product\", MIN(price) AS \"__min_price\", COUNT(*) AS __ivm_count FROM orders GROUP BY region, product";
     let sql = build_min_max_recompute_sql(
@@ -375,6 +389,8 @@ fn test_min_max_recompute_skips_affected_filter_for_sentinel_plan() {
         not_null_columns: std::collections::HashSet::new(),
         group_by_aliases: std::collections::HashMap::new(),
         output_column_order: vec![],
+        imv_relevant_columns: std::collections::HashMap::new(),
+        imv_relevant_where: std::collections::HashMap::new(),
     };
     let orig_base = "SELECT MIN(price) AS \"__min_price\", COUNT(*) AS __ivm_count FROM orders";
     let sql = build_min_max_recompute_sql(
@@ -512,6 +528,50 @@ fn test_replace_source_with_transition_unqualified() {
 // ========================================================================
 // Bug fix tests: quoted identifiers in trigger names
 // ========================================================================
+
+#[test]
+fn test_update_trigger_emits_filter_aware_skip_block() {
+    // The UPDATE trigger function body must contain the filter-aware skip:
+    // - reads imv_relevant_columns and imv_relevant_where from aggregations
+    // - applies the predicate to both __reflex_old_<src> and __reflex_new_<src>
+    // - EXCEPT-ALL multiset compare → CONTINUE if both directions empty
+    let ddls = build_trigger_ddls("public.orders");
+    // ddls[2] is the UPDATE function (INSERT, DELETE, UPDATE, TRUNCATE order).
+    let upd = &ddls[2];
+    assert!(
+        upd.contains("CREATE OR REPLACE FUNCTION") && upd.contains("AFTER UPDATE"),
+        "Index 2 should be the UPDATE trigger DDL"
+    );
+    assert!(
+        upd.contains("imv_relevant_columns"),
+        "UPDATE body must reference imv_relevant_columns: {}",
+        &upd[..upd.len().min(2000)]
+    );
+    assert!(
+        upd.contains("imv_relevant_where"),
+        "UPDATE body must reference imv_relevant_where"
+    );
+    assert!(
+        upd.contains("EXCEPT ALL"),
+        "UPDATE body must EXCEPT-ALL compare old vs new projections"
+    );
+    assert!(
+        upd.contains("__reflex_old_public_orders") && upd.contains("__reflex_new_public_orders"),
+        "UPDATE body must reference BOTH transition tables for the skip check"
+    );
+    // INSERT and DELETE bodies must NOT contain the skip block —
+    // the optimization only fires on UPDATE.
+    let ins = &ddls[0];
+    let del = &ddls[1];
+    assert!(
+        !ins.contains("imv_relevant_columns"),
+        "INSERT trigger should not have the skip block"
+    );
+    assert!(
+        !del.contains("imv_relevant_columns"),
+        "DELETE trigger should not have the skip block"
+    );
+}
 
 #[test]
 fn test_trigger_ddl_quoted_table_name() {
@@ -677,6 +737,8 @@ fn test_build_merge_count_distinct_nullable_uses_null_safe_join() {
         not_null_columns: std::collections::HashSet::new(),
         group_by_aliases: std::collections::HashMap::new(),
         output_column_order: vec![],
+        imv_relevant_columns: std::collections::HashMap::new(),
+        imv_relevant_where: std::collections::HashMap::new(),
     };
     let delta = "SELECT grp, maybe_null, COUNT(*) AS __ivm_count FROM src GROUP BY grp, maybe_null";
 
@@ -904,6 +966,8 @@ fn test_build_delta_sql_splice_injects_filter_before_group_by() {
         not_null_columns: std::collections::HashSet::new(),
         group_by_aliases: std::collections::HashMap::new(),
         output_column_order: vec![],
+        imv_relevant_columns: std::collections::HashMap::new(),
+        imv_relevant_where: std::collections::HashMap::new(),
     };
     let agg_json = serde_json::to_string(&plan).unwrap();
     let base_q =
@@ -1058,6 +1122,8 @@ fn test_build_delta_sql_splice_uses_distinct_projection_for_compound_key() {
         not_null_columns: std::collections::HashSet::new(),
         group_by_aliases: std::collections::HashMap::new(),
         output_column_order: vec![],
+        imv_relevant_columns: std::collections::HashMap::new(),
+        imv_relevant_where: std::collections::HashMap::new(),
     };
     let agg_json = serde_json::to_string(&plan).unwrap();
     let base_q =
@@ -1126,6 +1192,8 @@ fn test_build_merge_sql_bool_or_algebraic_subtract() {
         not_null_columns: std::collections::HashSet::new(),
         group_by_aliases: std::collections::HashMap::new(),
         output_column_order: vec![],
+        imv_relevant_columns: std::collections::HashMap::new(),
+        imv_relevant_where: std::collections::HashMap::new(),
     };
     let delta = "SELECT grp, SUM(CASE WHEN (flag) THEN 1 ELSE 0 END) AS \"__bool_or_flag_true_count\", SUM(CASE WHEN (flag) IS NOT NULL THEN 1 ELSE 0 END) AS \"__bool_or_flag_nonnull_count\", COUNT(*) AS __ivm_count FROM src GROUP BY grp";
     let sql = build_merge_sql("intermediate", delta, &plan, DeltaOp::Subtract);
@@ -1195,6 +1263,8 @@ fn test_build_delta_sql_bool_or_has_no_recompute() {
         not_null_columns: std::collections::HashSet::new(),
         group_by_aliases: std::collections::HashMap::new(),
         output_column_order: vec![],
+        imv_relevant_columns: std::collections::HashMap::new(),
+        imv_relevant_where: std::collections::HashMap::new(),
     };
     let agg_json = serde_json::to_string(&plan).unwrap();
     let base_q = "SELECT grp, SUM(CASE WHEN (flag) THEN 1 ELSE 0 END) AS \"__bool_or_flag_true_count\", SUM(CASE WHEN (flag) IS NOT NULL THEN 1 ELSE 0 END) AS \"__bool_or_flag_nonnull_count\", COUNT(*) AS __ivm_count FROM t GROUP BY grp";
@@ -1237,6 +1307,8 @@ fn passthrough_plan(source: &str) -> AggregationPlan {
         not_null_columns: std::collections::HashSet::new(),
         group_by_aliases: std::collections::HashMap::new(),
         output_column_order: vec![],
+        imv_relevant_columns: std::collections::HashMap::new(),
+        imv_relevant_where: std::collections::HashMap::new(),
     }
 }
 
@@ -1560,6 +1632,8 @@ fn test_null_safe_in_handles_aliased_group_by_column() {
         not_null_columns: ["id"].iter().map(|s| s.to_string()).collect(),
         group_by_aliases: std::collections::HashMap::new(),
         output_column_order: vec![],
+        imv_relevant_columns: std::collections::HashMap::new(),
+        imv_relevant_where: std::collections::HashMap::new(),
     };
     plan.group_by_aliases
         .insert("dp.id".to_string(), "dem_plan_id".to_string());

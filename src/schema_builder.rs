@@ -385,8 +385,59 @@ pub fn build_trigger_ddls(source_table: &str) -> Vec<String> {
         .next_back()
         .unwrap_or(source_table)
         .to_string();
+    // 1.4.5 — Filter-aware spurious-skip (UPDATE only).
+    //
+    // The IMV's aggregations JSON carries two per-source maps:
+    //   * imv_relevant_columns[source] — columns of `source` that the IMV
+    //     projects / joins on / groups by (i.e. NOT filter-only). The
+    //     analyzer attributes only references that resolve unambiguously
+    //     (qualified refs and bare refs in single-source queries), so every
+    //     column listed is guaranteed to exist on the source.
+    //   * imv_relevant_where[source]   — the source-restricted WHERE
+    //     conjuncts, alias-stripped to evaluate against the flat
+    //     transition table.
+    //
+    // When both pre- and post-image multisets project identically on the
+    // relevant columns (within the relevant WHERE), the IMV's output
+    // cannot change for this UPDATE — skip its body entirely.
+    //
+    // An absent / empty imv_relevant_columns entry disables the check
+    // (CTE-using or SELECT * IMVs land here — they keep the previous path).
+    let filter_skip_block_for_update = format!(
+        "SELECT string_agg(format('%I', col), ', ' ORDER BY col) \
+              INTO _skip_cols \
+              FROM jsonb_array_elements_text( \
+                   COALESCE(_rec.aggregations::jsonb->'imv_relevant_columns'->'{source_table}', '[]'::jsonb) \
+              ) AS t(col); \
+         IF _skip_cols IS NOT NULL AND _skip_cols <> '' THEN \
+           _skip_pred := _rec.aggregations::jsonb->'imv_relevant_where'->>'{source_table}'; \
+           IF _skip_pred IS NULL OR _skip_pred = '' THEN \
+             _skip_pred_clause := ''; \
+           ELSE \
+             _skip_pred_clause := ' WHERE ' || _skip_pred; \
+           END IF; \
+           _skip_sql := format( \
+             'WITH _o AS (SELECT %s FROM %I%s), _n AS (SELECT %s FROM %I%s) ' \
+             || 'SELECT NOT EXISTS(TABLE _o EXCEPT ALL TABLE _n) AND NOT EXISTS(TABLE _n EXCEPT ALL TABLE _o)', \
+             _skip_cols, '{ref_old}', _skip_pred_clause, \
+             _skip_cols, '{ref_new}', _skip_pred_clause \
+           ); \
+           EXECUTE _skip_sql INTO _filter_skip; \
+           IF _filter_skip THEN CONTINUE; END IF; \
+         END IF;"
+    );
+
+    // The where_predicate early-skip needs op-aware semantics:
+    //   * INSERT trigger only sees `ref_new` — skip if no NEW row passes.
+    //   * DELETE trigger only sees `ref_old` — skip if no OLD row passes.
+    //   * UPDATE trigger sees BOTH — must skip ONLY if neither side has a
+    //     passing row. A NEW-only check would incorrectly skip rows leaving
+    //     the IMV's filter (status flips out of whitelist → IMV must delete
+    //     that row's contribution). {pred_check_block} substitutes the
+    //     correct op-specific SQL.
     let body_core = format!(
         "DECLARE _rec RECORD; _sql TEXT; _stmt TEXT; _has_rows BOOLEAN; _pred_match BOOLEAN; \
+                 _skip_cols TEXT; _skip_pred TEXT; _skip_pred_clause TEXT; _skip_sql TEXT; _filter_skip BOOLEAN; \
          BEGIN \
            SELECT EXISTS(SELECT 1 FROM \"{{transition_tbl}}\" LIMIT 1) INTO _has_rows; \
            IF NOT _has_rows THEN RETURN NULL; END IF; \
@@ -397,10 +448,8 @@ pub fn build_trigger_ddls(source_table: &str) -> Vec<String> {
              ORDER BY graph_depth, name \
            LOOP \
              IF _rec.ignored_sources IS NOT NULL AND ('{source_table}' = ANY(_rec.ignored_sources) OR '{bare_source}' = ANY(_rec.ignored_sources)) THEN CONTINUE; END IF; \
-             IF _rec.where_predicate IS NOT NULL THEN \
-               EXECUTE format('SELECT EXISTS(SELECT 1 FROM %I WHERE %s LIMIT 1)', '{{transition_tbl}}', _rec.where_predicate) INTO _pred_match; \
-               IF NOT _pred_match THEN CONTINUE; END IF; \
-             END IF; \
+             {{pred_check_block}} \
+             {{filter_skip_block}} \
              PERFORM pg_advisory_xact_lock(hashtext(_rec.name), hashtext(reverse(_rec.name))); \
              _sql := public.reflex_build_delta_sql(_rec.name, '{source_table}', '{{op}}', _rec.base_query, _rec.end_query, _rec.aggregations, _rec.base_query); \
              IF _sql <> '' THEN \
@@ -413,12 +462,34 @@ pub fn build_trigger_ddls(source_table: &str) -> Vec<String> {
          END;"
     );
 
+    // Op-specific where-predicate early-skip blocks.
+    let pred_check_one = |tbl: &str| -> String {
+        format!(
+            "IF _rec.where_predicate IS NOT NULL THEN \
+               EXECUTE format('SELECT EXISTS(SELECT 1 FROM %I WHERE %s LIMIT 1)', '{tbl}', _rec.where_predicate) INTO _pred_match; \
+               IF NOT _pred_match THEN CONTINUE; END IF; \
+             END IF;"
+        )
+    };
+    let pred_check_two = format!(
+        "IF _rec.where_predicate IS NOT NULL THEN \
+           EXECUTE format('SELECT EXISTS(SELECT 1 FROM %I WHERE %s LIMIT 1) OR EXISTS(SELECT 1 FROM %I WHERE %s LIMIT 1)', \
+                          '{ref_new}', _rec.where_predicate, '{ref_old}', _rec.where_predicate) INTO _pred_match; \
+           IF NOT _pred_match THEN CONTINUE; END IF; \
+         END IF;"
+    );
+    let pred_check_ins = pred_check_one(&ref_new);
+    let pred_check_del = pred_check_one(&ref_old);
+    let pred_check_upd = pred_check_two;
+
     // INSERT
     let ins_fn = safe_identifier(&format!("__reflex_ins_trigger_on_{}", safe_source));
     let ins_trig = safe_identifier(&format!("__reflex_trigger_ins_on_{}", safe_source));
     let ins_body = body_core
         .replace("{op}", "INSERT")
-        .replace("{transition_tbl}", &ref_new);
+        .replace("{transition_tbl}", &ref_new)
+        .replace("{pred_check_block}", &pred_check_ins)
+        .replace("{filter_skip_block}", "");
     let ins_ddl = format!(
         "CREATE OR REPLACE FUNCTION {ins_fn}() RETURNS TRIGGER AS $fn$ {ins_body} $fn$ LANGUAGE plpgsql;\n\
          CREATE OR REPLACE TRIGGER \"{ins_trig}\" \
@@ -432,7 +503,9 @@ pub fn build_trigger_ddls(source_table: &str) -> Vec<String> {
     let del_trig = safe_identifier(&format!("__reflex_trigger_del_on_{}", safe_source));
     let del_body = body_core
         .replace("{op}", "DELETE")
-        .replace("{transition_tbl}", &ref_old);
+        .replace("{transition_tbl}", &ref_old)
+        .replace("{pred_check_block}", &pred_check_del)
+        .replace("{filter_skip_block}", "");
     let del_ddl = format!(
         "CREATE OR REPLACE FUNCTION {del_fn}() RETURNS TRIGGER AS $fn$ {del_body} $fn$ LANGUAGE plpgsql;\n\
          CREATE OR REPLACE TRIGGER \"{del_trig}\" \
@@ -446,7 +519,9 @@ pub fn build_trigger_ddls(source_table: &str) -> Vec<String> {
     let upd_trig = safe_identifier(&format!("__reflex_trigger_upd_on_{}", safe_source));
     let upd_body = body_core
         .replace("{op}", "UPDATE")
-        .replace("{transition_tbl}", &ref_new);
+        .replace("{transition_tbl}", &ref_new)
+        .replace("{pred_check_block}", &pred_check_upd)
+        .replace("{filter_skip_block}", &filter_skip_block_for_update);
     let upd_ddl = format!(
         "CREATE OR REPLACE FUNCTION {upd_fn}() RETURNS TRIGGER AS $fn$ {upd_body} $fn$ LANGUAGE plpgsql;\n\
          CREATE OR REPLACE TRIGGER \"{upd_trig}\" \

@@ -299,3 +299,28 @@ The migration cost is the biggest risk: rebuilding triggers for all IMVs require
 ## Dependency on #7 (already shipped)
 
 #9 supersedes the high-selectivity dispatch path for filter-equivalent UPDATEs (because the skip fires before the dispatch ever runs). For non-filter-equivalent UPDATEs both paths can coexist — the skip doesn't fire and the dispatch decides MERGE vs reconcile. No conflict.
+
+
+#   Summary of work
+
+  Filter-aware spurious-skip — IMMEDIATE + DEFERRED — landed in 1.4.5 dev.
+
+  Answers to your questions:
+  - DEFERRED skip pre-existing? No. The 1.4.3 spurious-skip at trigger.rs:2176 did a byte-identical multiset compare on ALL source columns — only caught true no-op updates, not filter-aware transitions.
+  - WHERE status IN (v1, v2) + SET status=v2 FROM v1? Before 1.4.5: full pipeline runs in both modes. After 1.4.5: filter-aware skip fires (status is filter-only; projection on IMV-relevant columns is unchanged
+   → skip).
+
+  What landed:
+  1. SQL analyzer (src/sql_analyzer.rs): per-source imv_relevant_columns (every clause except WHERE) and per-source alias-stripped imv_relevant_where conjuncts.
+  2. AggregationPlan (src/aggregation.rs): new imv_relevant_columns and imv_relevant_where fields, #[serde(default)] for back-compat.
+  3. Create-time catalog filtering (src/create_ivm.rs): grounds analyzer over-attribution (bare idents in multi-source queries) against information_schema.columns so the persisted JSON never names a column that
+   doesn't exist on the source.
+  4. IMMEDIATE trigger codegen (src/schema_builder.rs): UPDATE-only filter-aware skip block before per-IMV work. Also fixed a pre-existing UPDATE-trigger early-skip bug (NEW-only check) to OR with OLD so rows
+  leaving the filter aren't silently dropped.
+  5. DEFERRED flush (src/trigger.rs): per-IMV filter-aware skip in the existing loop. Same OR fix applied to the DEFERRED where_predicate early-skip.
+  6. Admin SQL fns: reflex_rebuild_imv_metadata(view_name) and reflex_rebuild_triggers(source_table) (src/lib.rs, src/create_ivm.rs).
+  7. Migration (sql/pg_reflex--1.4.4--1.4.5.sql): new Part 5 backfills metadata for all existing IMVs and re-emits trigger function bodies per distinct source.
+  8. Tests: 11 analyzer unit tests for imv_relevant_columns, 8 for imv_relevant_where, 1 codegen unit test verifying the UPDATE-trigger body contains the skip block, 7 end-to-end pg_tests covering positive
+  (filter-equivalent flips skip) and negative (filter-relevant changes don't skip, filter-entry/-exit don't skip) cases for both modes.
+
+  Validation: 562 tests pass (was 532 baseline), cargo clippy and cargo fmt --check both clean.

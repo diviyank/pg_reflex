@@ -927,3 +927,353 @@ fn pg_test_reflex_probe_not_null_columns_idempotent() {
         result
     );
 }
+
+// ================================================================
+// 1.4.5 — Filter-aware spurious-skip end-to-end correctness.
+//
+// The skip fires when an UPDATE's pre- and post-image projections to
+// `imv_relevant_columns` are multiset-equal under the IMV's WHERE
+// predicate. These tests assert the IMV state matches a freshly
+// recomputed aggregate regardless of whether the skip fires.
+// ================================================================
+
+/// Oracle helper: count the symmetric multiset difference between the IMV
+/// and a fresh recomputation. Zero means the IMV is correct.
+fn fas_assert_imv_matches_fresh(imv: &str, fresh_sql: &str, label: &str) {
+    let q = format!(
+        "SELECT COUNT(*) FROM ( \
+            (SELECT * FROM {imv} EXCEPT ALL SELECT * FROM ({fresh_sql}) f) \
+            UNION ALL \
+            (SELECT * FROM ({fresh_sql}) g EXCEPT ALL SELECT * FROM {imv}) \
+         ) o"
+    );
+    let n: i64 = Spi::get_one(&q).expect("oracle").expect("v");
+    assert_eq!(n, 0, "{label}: IMV must match fresh aggregate");
+}
+
+/// Customer-shape: multi-source IMV with `WHERE dp.status IN (whitelist)`.
+/// UPDATE flips `status` between two whitelist values — both pass the
+/// predicate, status is filter-only (not in SELECT/JOIN/GROUP BY) → the
+/// filter-aware skip MUST fire. The IMV state must be unchanged.
+#[pg_test]
+fn pg_test_filter_aware_skip_status_whitelist_flip() {
+    Spi::run("CREATE SCHEMA fas1").expect("schema");
+    Spi::run(
+        "CREATE TABLE fas1.demand_planning ( \
+            id BIGINT PRIMARY KEY, assortment_id BIGINT NOT NULL, status TEXT NOT NULL)",
+    )
+    .expect("c dp");
+    Spi::run(
+        "CREATE TABLE fas1.sales_simulation ( \
+            id BIGINT PRIMARY KEY, dem_plan_id BIGINT NOT NULL, qty NUMERIC NOT NULL)",
+    )
+    .expect("c ss");
+    Spi::run(
+        "INSERT INTO fas1.demand_planning VALUES \
+            (1, 10, 'validated'), (2, 10, 'current'), (3, 20, 'sent_to_sop')",
+    )
+    .expect("seed dp");
+    Spi::run(
+        "INSERT INTO fas1.sales_simulation VALUES \
+            (1, 1, 5), (2, 1, 6), (3, 2, 7), (4, 3, 8)",
+    )
+    .expect("seed ss");
+
+    crate::create_reflex_ivm(
+        "fas1.ivm_sop",
+        "SELECT dp.assortment_id, SUM(s.qty) AS total \
+         FROM fas1.sales_simulation s \
+         JOIN fas1.demand_planning dp ON s.dem_plan_id = dp.id \
+         WHERE dp.status IN ('validated', 'current', 'sent_to_sop') \
+         GROUP BY dp.assortment_id",
+        None, None, Some("IMMEDIATE"), None,
+    );
+
+    let fresh = "SELECT dp.assortment_id, SUM(s.qty) AS total \
+                 FROM fas1.sales_simulation s \
+                 JOIN fas1.demand_planning dp ON s.dem_plan_id = dp.id \
+                 WHERE dp.status IN ('validated', 'current', 'sent_to_sop') \
+                 GROUP BY dp.assortment_id";
+
+    fas_assert_imv_matches_fresh("fas1.ivm_sop", fresh, "initial state");
+
+    // Flip status='validated' → 'current' on id=1. Both pass whitelist.
+    // status is filter-only (not in projection, JOIN, or GROUP BY).
+    // The filter-aware skip MUST fire. IMV state must remain identical.
+    Spi::run("UPDATE fas1.demand_planning SET status='current' WHERE id=1")
+        .expect("flip 1");
+    fas_assert_imv_matches_fresh(
+        "fas1.ivm_sop",
+        fresh,
+        "after status flip validated→current (skip should fire)",
+    );
+
+    // Another flip — different whitelist member. Still skip-eligible.
+    Spi::run("UPDATE fas1.demand_planning SET status='sent_to_sop' WHERE id=1")
+        .expect("flip 2");
+    fas_assert_imv_matches_fresh(
+        "fas1.ivm_sop",
+        fresh,
+        "after status flip current→sent_to_sop (skip should fire)",
+    );
+}
+
+/// Filter-relevant column change: an UPDATE that changes a JOIN key
+/// (assortment_id) must NOT skip. The IMV's contribution to the group
+/// shifts → trigger body must run → IMV must be correctly updated.
+#[pg_test]
+fn pg_test_filter_aware_skip_join_key_change_uses_full_path() {
+    Spi::run("CREATE SCHEMA fas2").expect("schema");
+    Spi::run(
+        "CREATE TABLE fas2.dp (id BIGINT PRIMARY KEY, assortment_id BIGINT NOT NULL, status TEXT NOT NULL)",
+    )
+    .expect("c dp");
+    Spi::run(
+        "CREATE TABLE fas2.ss (id BIGINT PRIMARY KEY, dem_plan_id BIGINT NOT NULL, qty NUMERIC NOT NULL)",
+    )
+    .expect("c ss");
+    Spi::run(
+        "INSERT INTO fas2.dp VALUES (1, 100, 'validated'), (2, 200, 'validated')",
+    )
+    .expect("seed dp");
+    Spi::run("INSERT INTO fas2.ss VALUES (1,1,5), (2,1,5), (3,2,7)").expect("seed ss");
+
+    crate::create_reflex_ivm(
+        "fas2.ivm",
+        "SELECT dp.assortment_id, SUM(s.qty) AS total \
+         FROM fas2.ss s JOIN fas2.dp dp ON s.dem_plan_id=dp.id \
+         WHERE dp.status='validated' GROUP BY dp.assortment_id",
+        None, None, Some("IMMEDIATE"), None,
+    );
+
+    let fresh = "SELECT dp.assortment_id, SUM(s.qty) AS total \
+                 FROM fas2.ss s JOIN fas2.dp dp ON s.dem_plan_id=dp.id \
+                 WHERE dp.status='validated' GROUP BY dp.assortment_id";
+
+    fas_assert_imv_matches_fresh("fas2.ivm", fresh, "initial");
+
+    // Change assortment_id: IMV-relevant column → skip must NOT fire,
+    // full path runs, IMV state must reflect the regrouping.
+    Spi::run("UPDATE fas2.dp SET assortment_id=300 WHERE id=1")
+        .expect("change assort");
+    fas_assert_imv_matches_fresh(
+        "fas2.ivm",
+        fresh,
+        "after JOIN-key (assortment_id) change — full path",
+    );
+}
+
+/// Filter-outcome change: an UPDATE that moves a row OUT of the filter
+/// (status: 'validated' → 'rejected', latter not whitelisted) must NOT
+/// skip. The IMV must drop that row's contribution.
+#[pg_test]
+fn pg_test_filter_aware_skip_filter_outcome_change_does_not_skip() {
+    Spi::run("CREATE SCHEMA fas3").expect("schema");
+    Spi::run(
+        "CREATE TABLE fas3.dp (id BIGINT PRIMARY KEY, assortment_id BIGINT NOT NULL, status TEXT NOT NULL)",
+    )
+    .expect("c dp");
+    Spi::run(
+        "CREATE TABLE fas3.ss (id BIGINT PRIMARY KEY, dem_plan_id BIGINT NOT NULL, qty NUMERIC NOT NULL)",
+    )
+    .expect("c ss");
+    Spi::run(
+        "INSERT INTO fas3.dp VALUES (1, 10, 'validated'), (2, 20, 'validated')",
+    )
+    .expect("seed dp");
+    Spi::run("INSERT INTO fas3.ss VALUES (1,1,5), (2,1,3), (3,2,9)").expect("seed ss");
+
+    crate::create_reflex_ivm(
+        "fas3.ivm",
+        "SELECT dp.assortment_id, SUM(s.qty) AS total \
+         FROM fas3.ss s JOIN fas3.dp dp ON s.dem_plan_id=dp.id \
+         WHERE dp.status IN ('validated', 'current') GROUP BY dp.assortment_id",
+        None, None, Some("IMMEDIATE"), None,
+    );
+
+    let fresh = "SELECT dp.assortment_id, SUM(s.qty) AS total \
+                 FROM fas3.ss s JOIN fas3.dp dp ON s.dem_plan_id=dp.id \
+                 WHERE dp.status IN ('validated', 'current') GROUP BY dp.assortment_id";
+
+    fas_assert_imv_matches_fresh("fas3.ivm", fresh, "initial");
+
+    // Flip dp=1 to 'rejected' (out of whitelist). IMV must drop it.
+    Spi::run("UPDATE fas3.dp SET status='rejected' WHERE id=1")
+        .expect("flip out");
+    fas_assert_imv_matches_fresh(
+        "fas3.ivm",
+        fresh,
+        "after status moves out of whitelist — must NOT skip",
+    );
+
+    // Verify the IMV actually dropped dp=1's contribution: now assortment 10
+    // has no rows passing, so the IMV must NOT show it.
+    let still_there: Option<i64> = Spi::get_one(
+        "SELECT count(*)::bigint FROM fas3.ivm WHERE assortment_id=10",
+    )
+    .expect("query");
+    assert_eq!(
+        still_there.unwrap(),
+        0,
+        "assortment 10 should have been dropped from IMV"
+    );
+}
+
+/// No-op UPDATE on a filter-only column where the new value equals the
+/// old (SET status='X' where status is already 'X' and X is whitelisted):
+/// the filter-aware skip absorbs this on top of the byte-identical case.
+#[pg_test]
+fn pg_test_filter_aware_skip_noop_update_skips() {
+    Spi::run("CREATE SCHEMA fas4").expect("schema");
+    Spi::run(
+        "CREATE TABLE fas4.t (id BIGINT PRIMARY KEY, status TEXT NOT NULL, qty NUMERIC NOT NULL)",
+    )
+    .expect("c");
+    Spi::run("INSERT INTO fas4.t VALUES (1,'open',5), (2,'open',10), (3,'closed',7)")
+        .expect("seed");
+
+    crate::create_reflex_ivm(
+        "fas4.ivm",
+        "SELECT SUM(qty) AS total FROM fas4.t WHERE status='open'",
+        None, None, Some("IMMEDIATE"), None,
+    );
+
+    let fresh = "SELECT SUM(qty) AS total FROM fas4.t WHERE status='open'";
+    fas_assert_imv_matches_fresh("fas4.ivm", fresh, "initial");
+
+    // No-op SET status='open' WHERE status='open' — multisets identical.
+    Spi::run("UPDATE fas4.t SET status='open' WHERE status='open'")
+        .expect("noop update");
+    fas_assert_imv_matches_fresh("fas4.ivm", fresh, "after no-op");
+}
+
+/// Single-source filter-only column transition: SET status from one
+/// allowed value to another. status is filter-only (not in SELECT/GROUP BY
+/// — the IMV only projects SUM). The skip should fire and the IMV state
+/// must remain correct.
+#[pg_test]
+fn pg_test_filter_aware_skip_single_source_filter_only_transition() {
+    Spi::run("CREATE SCHEMA fas5").expect("schema");
+    Spi::run(
+        "CREATE TABLE fas5.t (id BIGINT PRIMARY KEY, status TEXT NOT NULL, qty NUMERIC NOT NULL)",
+    )
+    .expect("c");
+    Spi::run("INSERT INTO fas5.t VALUES (1,'open',5), (2,'paid',10), (3,'closed',7)")
+        .expect("seed");
+
+    crate::create_reflex_ivm(
+        "fas5.ivm",
+        "SELECT SUM(qty) AS total FROM fas5.t WHERE status IN ('open','paid')",
+        None, None, Some("IMMEDIATE"), None,
+    );
+
+    let fresh = "SELECT SUM(qty) AS total FROM fas5.t WHERE status IN ('open','paid')";
+    fas_assert_imv_matches_fresh("fas5.ivm", fresh, "initial");
+
+    // Flip status='open' → 'paid' (both whitelisted, status is filter-only).
+    Spi::run("UPDATE fas5.t SET status='paid' WHERE id=1")
+        .expect("flip");
+    fas_assert_imv_matches_fresh("fas5.ivm", fresh, "after filter-equiv flip");
+}
+
+/// IMMEDIATE single-source filter-exit + GROUP BY. Mirrors the DEFERRED
+/// `pg_test_deferred_filter_aware_skip_filter_exit_runs_full_path` test
+/// — used as the IMMEDIATE baseline so we know the filter-aware skip's
+/// projection / EXCEPT-ALL logic is correct under the same workload.
+#[pg_test]
+fn pg_test_filter_aware_immediate_single_source_filter_exit_groupby() {
+    Spi::run("CREATE TABLE fas_imm_ex (id BIGINT PRIMARY KEY, grp TEXT NOT NULL, status TEXT NOT NULL, amount INT NOT NULL)")
+        .expect("create");
+    Spi::run("INSERT INTO fas_imm_ex VALUES (1,'a','validated',10), (2,'a','current',20), (3,'b','validated',7)")
+        .expect("seed");
+    crate::create_reflex_ivm(
+        "fas_imm_ex_view",
+        "SELECT grp, SUM(amount) AS total FROM fas_imm_ex \
+         WHERE status IN ('validated', 'current') GROUP BY grp",
+        None, None, Some("IMMEDIATE"), None,
+    );
+    let before: i64 = Spi::get_one::<i64>(
+        "SELECT total::BIGINT FROM fas_imm_ex_view WHERE grp='a'"
+    ).expect("q").expect("v");
+    assert_eq!(before, 30);
+    Spi::run("UPDATE fas_imm_ex SET status='rejected' WHERE id=1").expect("flip");
+    let after: i64 = Spi::get_one::<i64>(
+        "SELECT total::BIGINT FROM fas_imm_ex_view WHERE grp='a'"
+    ).expect("q").expect("v");
+    assert_eq!(after, 20, "IMMEDIATE row-leaves-filter must drop its contribution");
+}
+
+/// Mixed-row UPDATE: one row stays filter-equivalent, another moves out
+/// of the filter. The multiset projections differ (one row dropped from
+/// the new-side passing set), so the skip must NOT fire. IMV must reflect
+/// the dropped row.
+#[pg_test]
+fn pg_test_filter_aware_skip_mixed_rows_partial_exit_does_not_skip() {
+    Spi::run("CREATE SCHEMA fas6").expect("schema");
+    Spi::run(
+        "CREATE TABLE fas6.t (id BIGINT PRIMARY KEY, status TEXT NOT NULL, qty NUMERIC NOT NULL)",
+    )
+    .expect("c");
+    Spi::run("INSERT INTO fas6.t VALUES (1,'open',5), (2,'open',10)")
+        .expect("seed");
+
+    crate::create_reflex_ivm(
+        "fas6.ivm",
+        "SELECT SUM(qty) AS total FROM fas6.t WHERE status IN ('open','paid')",
+        None, None, Some("IMMEDIATE"), None,
+    );
+
+    let fresh = "SELECT SUM(qty) AS total FROM fas6.t WHERE status IN ('open','paid')";
+    fas_assert_imv_matches_fresh("fas6.ivm", fresh, "initial");
+
+    // Multi-row UPDATE: id=1 flips inside whitelist (open→paid), id=2 exits
+    // (open→cancelled). Skip must NOT fire because id=2 leaves the filter.
+    Spi::run(
+        "UPDATE fas6.t SET status = CASE id WHEN 1 THEN 'paid' WHEN 2 THEN 'cancelled' END",
+    )
+    .expect("mixed update");
+    fas_assert_imv_matches_fresh(
+        "fas6.ivm",
+        fresh,
+        "after mixed update — must NOT skip",
+    );
+    let total: Option<pgrx::AnyNumeric> =
+        Spi::get_one("SELECT total FROM fas6.ivm").expect("q");
+    assert_eq!(total.map(|v| v.to_string()), Some("5".to_string()));
+}
+
+/// IMV that exposes the filter column in SELECT — the filter-aware skip
+/// must NOT fire even on filter-equivalent transitions, because changing
+/// the column changes the IMV's output row. The static analysis records
+/// status as IMV-relevant (it's in SELECT), so the EXCEPT ALL detects the
+/// projection difference.
+#[pg_test]
+fn pg_test_filter_aware_skip_status_in_select_does_not_skip() {
+    Spi::run("CREATE SCHEMA fas7").expect("schema");
+    Spi::run(
+        "CREATE TABLE fas7.t (id BIGINT PRIMARY KEY, status TEXT NOT NULL, qty NUMERIC NOT NULL)",
+    )
+    .expect("c");
+    Spi::run("INSERT INTO fas7.t VALUES (1,'open',5), (2,'open',10), (3,'paid',7)")
+        .expect("seed");
+
+    crate::create_reflex_ivm(
+        "fas7.ivm",
+        "SELECT status, SUM(qty) AS total FROM fas7.t \
+         WHERE status IN ('open','paid') GROUP BY status",
+        None, None, Some("IMMEDIATE"), None,
+    );
+
+    let fresh = "SELECT status, SUM(qty) AS total FROM fas7.t \
+                 WHERE status IN ('open','paid') GROUP BY status";
+    fas_assert_imv_matches_fresh("fas7.ivm", fresh, "initial");
+
+    // Flip status — must NOT skip (status is in the IMV's projection,
+    // so changing it changes the output row).
+    Spi::run("UPDATE fas7.t SET status='paid' WHERE id=1").expect("flip");
+    fas_assert_imv_matches_fresh(
+        "fas7.ivm",
+        fresh,
+        "status in SELECT — skip must not fire",
+    );
+}

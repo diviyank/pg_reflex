@@ -831,3 +831,123 @@ fn pg_test_deferred_spurious_update_skips_imv_bodies() {
     .expect("v");
     assert_eq!(fresh_total, view_total, "view should match fresh aggregate");
 }
+
+/// 1.4.5 — DEFERRED-mode filter-aware spurious-skip.
+///
+/// An UPDATE that changes a *filter-only* column between two predicate-
+/// matching values must be skipped by the per-IMV filter-aware check at
+/// flush time. The 1.4.3 byte-identical multiset check above did NOT catch
+/// this — the column bytes differ — but the filter-aware check sees that
+/// the IMV-relevant projection is unchanged and skips the IMV body.
+#[pg_test]
+fn pg_test_deferred_filter_aware_skip_status_whitelist_flip() {
+    Spi::run("CREATE TABLE fas_def_src (id SERIAL PRIMARY KEY, status TEXT NOT NULL, amount INT NOT NULL)")
+        .expect("create");
+    Spi::run(
+        "INSERT INTO fas_def_src (status, amount) VALUES \
+            ('validated', 10), ('current', 20), ('draft', 30)",
+    )
+    .expect("seed");
+
+    // IMV: status is filter-only (not in SELECT/GROUP BY).
+    crate::create_reflex_ivm(
+        "fas_def_view",
+        "SELECT SUM(amount) AS total FROM fas_def_src \
+         WHERE status IN ('validated', 'current')",
+        None,
+        None,
+        Some("DEFERRED"),
+        None,
+    );
+
+    let total_before: i64 = Spi::get_one::<i64>(
+        "SELECT total::BIGINT FROM fas_def_view",
+    )
+    .expect("q")
+    .expect("v");
+    let count_before: i64 = Spi::get_one(
+        "SELECT COALESCE(flush_count, 0) FROM public.__reflex_ivm_reference WHERE name = 'fas_def_view'",
+    )
+    .expect("q")
+    .expect("v");
+
+    // Filter-equivalent flip: status='validated' → 'current' on id=1.
+    // Both pass the whitelist, and `status` is filter-only. The
+    // byte-identical 1.4.3 check does NOT fire (`status` differs); the
+    // 1.4.5 filter-aware per-IMV check MUST fire.
+    Spi::run("UPDATE fas_def_src SET status='current' WHERE id=1").expect("flip");
+    Spi::run("SELECT reflex_flush_deferred('fas_def_src')").expect("flush");
+
+    let count_after: i64 = Spi::get_one(
+        "SELECT COALESCE(flush_count, 0) FROM public.__reflex_ivm_reference WHERE name = 'fas_def_view'",
+    )
+    .expect("q")
+    .expect("v");
+    assert_eq!(
+        count_before, count_after,
+        "filter-equivalent flip must NOT increment flush_count for this IMV"
+    );
+
+    let total_after: i64 = Spi::get_one::<i64>(
+        "SELECT total::BIGINT FROM fas_def_view",
+    )
+    .expect("q")
+    .expect("v");
+    assert_eq!(total_before, total_after, "target must be unchanged");
+
+    // Staging delta and pending pointer cleaned up.
+    let staged_after: i64 = Spi::get_one(
+        "SELECT COUNT(*)::BIGINT FROM __reflex_delta_fas_def_src",
+    )
+    .expect("q")
+    .expect("v");
+    assert_eq!(staged_after, 0, "delta must be cleaned up after skip");
+}
+
+/// 1.4.5 — DEFERRED-mode filter-aware skip: row entering the whitelist
+/// from outside must NOT skip. The IMV must add the row's contribution.
+/// Mirrors the customer-shaped filter-entry case in
+/// `pg_test_deferred_join_schema_qualified_with_bare_column_qualifiers`,
+/// but on a single source so the EXCEPT-ALL check is exercised directly
+/// (no JOIN-source noise).
+#[pg_test]
+fn pg_test_deferred_filter_aware_skip_filter_entry_runs_full_path() {
+    Spi::run("CREATE TABLE fas_def_entry (id SERIAL PRIMARY KEY, grp TEXT NOT NULL, status TEXT NOT NULL, amount INT NOT NULL)")
+        .expect("create");
+    // id=1 already in whitelist; id=2 is OUTSIDE the whitelist initially.
+    Spi::run(
+        "INSERT INTO fas_def_entry (grp, status, amount) VALUES \
+            ('a','validated', 10), ('a','draft', 20)",
+    )
+    .expect("seed");
+
+    crate::create_reflex_ivm(
+        "fas_def_entry_view",
+        "SELECT grp, SUM(amount) AS total FROM fas_def_entry \
+         WHERE status IN ('validated', 'current') GROUP BY grp",
+        None,
+        None,
+        Some("DEFERRED"),
+        None,
+    );
+
+    let total_before: i64 = Spi::get_one::<i64>(
+        "SELECT total::BIGINT FROM fas_def_entry_view WHERE grp='a'",
+    )
+    .expect("q")
+    .expect("v");
+    assert_eq!(total_before, 10, "initial: only id=1 passes");
+
+    // Flip id=2 INTO the whitelist (draft → validated). Filter-aware skip
+    // must NOT fire (the multiset projections differ on the entry side),
+    // the IMV body runs, and grp='a' gets id=2's amount.
+    Spi::run("UPDATE fas_def_entry SET status='validated' WHERE id=2").expect("entry");
+    Spi::run("SELECT reflex_flush_deferred('fas_def_entry')").expect("flush");
+
+    let total_after: i64 = Spi::get_one::<i64>(
+        "SELECT total::BIGINT FROM fas_def_entry_view WHERE grp='a'",
+    )
+    .expect("q")
+    .expect("v");
+    assert_eq!(total_after, 30, "must add id=2's contribution");
+}

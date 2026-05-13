@@ -970,8 +970,23 @@ pub(crate) fn create_reflex_ivm_impl(
             }
         } else {
             // Aggregate: build intermediate + target tables from the plan
-            let (mut column_types, not_null_cols) = query_column_types_from_catalog(client, &froms);
+            let (mut column_types, not_null_cols, per_source_cols) =
+                query_column_types_from_catalog_with_per_source(client, &froms);
             plan.optimize_not_null_sums(&not_null_cols);
+            // 1.4.5 — filter `imv_relevant_columns` down to columns that
+            // actually exist per source. The analyzer over-attributes bare
+            // identifiers in multi-source queries to every real source as a
+            // safe-correctness move; without this filter the persisted JSON
+            // would name columns that don't exist on the source's transition
+            // table, and the skip SQL would error at trigger fire time.
+            for (source, cols) in plan.imv_relevant_columns.iter_mut() {
+                if let Some(actual) = per_source_cols.get(source) {
+                    cols.retain(|c| actual.contains(&c.to_lowercase()));
+                } else if source.starts_with('<') {
+                    cols.clear();
+                }
+            }
+            plan.imv_relevant_columns.retain(|_, v| !v.is_empty());
 
             // Discover actual types for computed expressions by introspecting query output.
             // 1. Base query types: resolves GROUP BY expressions (DATE_TRUNC, EXTRACT, etc.)
@@ -1231,6 +1246,14 @@ pub(crate) fn create_reflex_ivm_impl(
         } else {
             generate_end_query(view_name, &plan)
         };
+        // 1.4.5 — `imv_relevant_columns` carries a possibly-over-inclusive
+        // set of columns per source (the analyzer conservatively attributes
+        // bare identifiers in multi-source queries to every real source).
+        // The trigger codegen INTERSECTS this with the source's actual
+        // columns at fire time via pg_attribute, so a column listed here
+        // that doesn't exist on the source is simply ignored — no need to
+        // filter at IMV-create time, which would have to compete with
+        // catalog snapshot visibility for the just-created source table.
         let aggregations_json = generate_aggregations_json(&plan);
         let index_columns: Vec<String> = plan
             .group_by_columns
@@ -1597,13 +1620,29 @@ fn is_from_table(qualified_col: &str, table_bare_name: &str, table_aliases: &[St
     }
 }
 
-/// Query the PostgreSQL catalog for column types of the given source tables.
-fn query_column_types_from_catalog(
+/// Return type of [`query_column_types_from_catalog_with_per_source`]:
+/// `(types, not_null_cols, per_source_columns)`.
+type CatalogColumnInfo = (
+    HashMap<String, String>,
+    std::collections::HashSet<String>,
+    HashMap<String, std::collections::HashSet<String>>,
+);
+
+/// Per-source-aware column-type catalog lookup. Returns the cross-source
+/// type map and not-null set used elsewhere, plus a per-source map
+/// `source-table-name → set of catalog-known column names`.
+///
+/// Used by the 1.4.5 filter-aware spurious-skip metadata to ground the
+/// analyzer's over-inclusive `imv_relevant_columns` (which attributes
+/// bare idents to every real source) in the actual catalog shape, so the
+/// persisted JSON only ever names columns that exist on the named source.
+fn query_column_types_from_catalog_with_per_source(
     client: &pgrx::spi::SpiClient<'_>,
     table_names: &[String],
-) -> (HashMap<String, String>, std::collections::HashSet<String>) {
+) -> CatalogColumnInfo {
     let mut types = HashMap::new();
     let mut not_null_cols = std::collections::HashSet::new();
+    let mut per_source: HashMap<String, std::collections::HashSet<String>> = HashMap::new();
     for table in table_names {
         // Skip non-real tables (subqueries, functions)
         if table.starts_with('<') {
@@ -1651,10 +1690,14 @@ fn query_column_types_from_catalog(
                 if is_nullable == "NO" {
                     not_null_cols.insert(col_name.to_string());
                 }
+                per_source
+                    .entry(table.clone())
+                    .or_default()
+                    .insert(col_name.to_lowercase());
             }
         }
     }
-    (types, not_null_cols)
+    (types, not_null_cols, per_source)
 }
 
 /// 1.4.5: data-probe. Scan the populated intermediate for group-by and
@@ -1926,6 +1969,136 @@ pub(crate) fn reflex_compact_all_imv_impl() -> String {
     summary.push('\n');
     summary.push_str(&details.join("\n"));
     summary
+}
+
+/// 1.4.5 — `reflex_rebuild_imv_metadata(view_name TEXT) RETURNS TEXT`.
+///
+/// Re-analyzes an existing IMV's stored `base_query` and merges the newly
+/// computed `imv_relevant_columns` / `imv_relevant_where` maps into its
+/// `aggregations` JSON. Idempotent: existing fields (group_by_columns,
+/// intermediate_columns, end_query_mappings, not_null_columns, …) are NOT
+/// overwritten beyond the two new metadata maps.
+///
+/// Used by the 1.4.4→1.4.5 migration to backfill IMVs created before the
+/// filter-aware spurious-skip metadata was introduced. Also useful after a
+/// future analyzer extension shifts what falls into either map.
+///
+/// Returns a status string for telemetry.
+pub(crate) fn reflex_rebuild_imv_metadata_impl(view_name: &str) -> String {
+    if let Err(msg) = validate_view_name(view_name) {
+        return msg.to_string();
+    }
+    let result: Result<(usize, usize), String> = Spi::connect_mut(|client| {
+        let rows = client
+            .select(
+                "SELECT base_query FROM public.__reflex_ivm_reference \
+                 WHERE name = $1 AND enabled = TRUE",
+                None,
+                &[unsafe {
+                    DatumWithOid::new(view_name.to_string(), PgBuiltInOids::TEXTOID.oid().value())
+                }],
+            )
+            .map_err(|e| format!("lookup failed: {}", e))?
+            .collect::<Vec<_>>();
+        if rows.is_empty() {
+            return Err(format!("IMV '{}' not found or disabled", view_name));
+        }
+        let base_query: String = rows[0]
+            .get_by_name::<&str, _>("base_query")
+            .map_err(|e| format!("read base_query: {}", e))?
+            .unwrap_or("")
+            .to_string();
+
+        let parsed = Parser::parse_sql(&PostgreSqlDialect {}, &base_query)
+            .map_err(|e| format!("parse base_query: {}", e))?;
+        let analysis =
+            analyze(&parsed).map_err(|e: SqlAnalysisError| format!("analyze base_query: {}", e))?;
+
+        // Trigger codegen intersects with pg_attribute at fire time, so we
+        // don't need to filter the columns set here — the conservative
+        // over-attribution is harmless beyond a (probably-empty) cost of
+        // checking pg_attribute. See create_reflex_ivm comment.
+        let relevant_cols: std::collections::HashMap<String, Vec<String>> = analysis
+            .imv_relevant_columns
+            .iter()
+            .filter(|(s, _)| !s.starts_with('<'))
+            .map(|(s, set)| (s.clone(), set.iter().cloned().collect::<Vec<_>>()))
+            .collect();
+
+        let cols_json = serde_json::to_string(&relevant_cols)
+            .map_err(|e| format!("serialize relevant cols: {}", e))?;
+        let where_json = serde_json::to_string(&analysis.imv_relevant_where)
+            .map_err(|e| format!("serialize relevant where: {}", e))?;
+
+        let n_cols_sources = relevant_cols.len();
+        let n_where_sources = analysis.imv_relevant_where.len();
+
+        client
+            .update(
+                "UPDATE public.__reflex_ivm_reference \
+                 SET aggregations = jsonb_set( \
+                       jsonb_set( \
+                         aggregations::jsonb, \
+                         '{imv_relevant_columns}', \
+                         $1::jsonb, \
+                         TRUE \
+                       ), \
+                       '{imv_relevant_where}', \
+                       $2::jsonb, \
+                       TRUE \
+                     )::json \
+                 WHERE name = $3",
+                None,
+                &[
+                    unsafe { DatumWithOid::new(cols_json, PgBuiltInOids::TEXTOID.oid().value()) },
+                    unsafe { DatumWithOid::new(where_json, PgBuiltInOids::TEXTOID.oid().value()) },
+                    unsafe {
+                        DatumWithOid::new(
+                            view_name.to_string(),
+                            PgBuiltInOids::TEXTOID.oid().value(),
+                        )
+                    },
+                ],
+            )
+            .map_err(|e| format!("update aggregations: {}", e))?;
+        Ok((n_cols_sources, n_where_sources))
+    });
+    match result {
+        Ok((n_cols, n_where)) => format!(
+            "pg_reflex: rebuilt skip-metadata for '{}' ({} source(s) with relevant_columns, {} with relevant_where)",
+            view_name, n_cols, n_where
+        ),
+        Err(e) => format!("ERROR: {}", e),
+    }
+}
+
+/// 1.4.5 — `reflex_rebuild_triggers(source_table TEXT) RETURNS TEXT`.
+///
+/// Re-emits the four CREATE OR REPLACE FUNCTION + CREATE OR REPLACE TRIGGER
+/// statements for INSERT/DELETE/UPDATE/TRUNCATE on `source_table`, picking
+/// up the latest codegen (e.g. the 1.4.5 filter-aware spurious-skip block).
+///
+/// Idempotent — `CREATE OR REPLACE` overwrites the existing function body
+/// without changing trigger identity.
+///
+/// Returns a status string.
+pub(crate) fn reflex_rebuild_triggers_impl(source_table: &str) -> String {
+    let result: Result<usize, String> = Spi::connect_mut(|client| {
+        let ddls = crate::schema_builder::build_trigger_ddls(source_table);
+        for ddl in &ddls {
+            client
+                .update(ddl, None, &[])
+                .map_err(|e| format!("CREATE TRIGGER failed: {}", e))?;
+        }
+        Ok(ddls.len())
+    });
+    match result {
+        Ok(n) => format!(
+            "pg_reflex: rebuilt {} trigger DDL(s) for '{}'",
+            n, source_table
+        ),
+        Err(e) => format!("ERROR: {}", e),
+    }
 }
 
 /// Map information_schema data_type strings to PostgreSQL type names usable in DDL.

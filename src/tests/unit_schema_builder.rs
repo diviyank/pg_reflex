@@ -44,6 +44,8 @@ fn sample_plan() -> AggregationPlan {
         not_null_columns: std::collections::HashSet::new(),
         group_by_aliases: std::collections::HashMap::new(),
         output_column_order: vec![],
+        imv_relevant_columns: std::collections::HashMap::new(),
+        imv_relevant_where: std::collections::HashMap::new(),
     }
 }
 
@@ -255,6 +257,8 @@ fn test_no_intermediate_for_passthrough() {
         not_null_columns: std::collections::HashSet::new(),
         group_by_aliases: std::collections::HashMap::new(),
         output_column_order: vec![],
+        imv_relevant_columns: std::collections::HashMap::new(),
+        imv_relevant_where: std::collections::HashMap::new(),
     };
     let types = HashMap::new();
     assert!(build_intermediate_table_ddl("test_view", &plan, &types, false).is_none());
@@ -346,6 +350,8 @@ fn test_intermediate_ddl_bool_or_emits_bigint_counters() {
         not_null_columns: std::collections::HashSet::new(),
         group_by_aliases: std::collections::HashMap::new(),
         output_column_order: vec![],
+        imv_relevant_columns: std::collections::HashMap::new(),
+        imv_relevant_where: std::collections::HashMap::new(),
     };
     let types = HashMap::new();
     let ddl = build_intermediate_table_ddl("test_view", &plan, &types, false).unwrap();

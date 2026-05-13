@@ -143,6 +143,8 @@ pub(crate) fn reflex_reconcile(view_name: &str) -> &'static str {
                     not_null_columns: std::collections::HashSet::new(),
                     group_by_aliases: std::collections::HashMap::new(),
                     output_column_order: vec![],
+                    imv_relevant_columns: std::collections::HashMap::new(),
+                    imv_relevant_where: std::collections::HashMap::new(),
                 });
 
             let intermediate = intermediate_table_name(view_name);

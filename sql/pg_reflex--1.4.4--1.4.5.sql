@@ -50,6 +50,21 @@ RETURNS TEXT
 LANGUAGE c
 AS 'MODULE_PATHNAME', 'reflex_compact_all_imv_wrapper';
 
+-- 1.4.5 — filter-aware spurious-skip metadata + trigger-body refresh.
+CREATE FUNCTION "reflex_rebuild_imv_metadata"(
+    "view_name" TEXT
+) RETURNS TEXT
+STRICT
+LANGUAGE c
+AS 'MODULE_PATHNAME', 'reflex_rebuild_imv_metadata_wrapper';
+
+CREATE FUNCTION "reflex_rebuild_triggers"(
+    "source_table" TEXT
+) RETURNS TEXT
+STRICT
+LANGUAGE c
+AS 'MODULE_PATHNAME', 'reflex_rebuild_triggers_wrapper';
+
 DO $REFLEX_MIG_145_PART1$
 DECLARE
     rec     RECORD;
@@ -192,3 +207,74 @@ CREATE FUNCTION "create_reflex_ivm_if_not_exists"(
 ) RETURNS TEXT
 LANGUAGE c
 AS 'MODULE_PATHNAME', 'create_reflex_ivm_if_not_exists_wrapper';
+
+-- ----------------------------------------------------------------------
+-- Part 5: backfill filter-aware spurious-skip metadata for existing IMVs.
+--
+-- The 1.4.5 trigger codegen emits a per-IMV skip block that reads two new
+-- JSONB sub-objects from `aggregations`:
+--   * imv_relevant_columns — per-source columns the IMV projects, joins on,
+--     groups by, or HAVINGs on (i.e. everything except WHERE-only refs).
+--   * imv_relevant_where   — per-source restricted WHERE conjuncts with
+--     alias prefixes stripped to apply against a flat transition table.
+--
+-- The skip block reads these at trigger fire time. IMVs created before
+-- 1.4.5 have neither in their JSON; without backfill the skip is silently
+-- disabled. Part 5 runs the analyzer over each IMV's stored `base_query`
+-- and merges the two maps into the existing JSON. Then re-emits the
+-- per-source trigger function bodies so the new skip block is wired up.
+--
+-- Both `reflex_rebuild_imv_metadata` and `reflex_rebuild_triggers` are
+-- idempotent — safe to re-run, and individual failures don't abort the
+-- cascade (we wrap each call in a sub-block with EXCEPTION).
+-- ----------------------------------------------------------------------
+DO $REFLEX_MIG_145_PART5$
+DECLARE
+    rec        RECORD;
+    msg        TEXT;
+    n_imvs     INTEGER := 0;
+    n_sources  INTEGER := 0;
+    n_failures INTEGER := 0;
+BEGIN
+    -- 5a: per-IMV metadata backfill.
+    FOR rec IN
+        SELECT name
+        FROM public.__reflex_ivm_reference
+        WHERE enabled = TRUE
+        ORDER BY graph_depth, name
+    LOOP
+        BEGIN
+            msg := public.reflex_rebuild_imv_metadata(rec.name);
+            n_imvs := n_imvs + 1;
+        EXCEPTION WHEN OTHERS THEN
+            n_failures := n_failures + 1;
+            RAISE WARNING 'pg_reflex 1.4.5: metadata backfill failed for % — %',
+                rec.name, SQLERRM;
+        END;
+    END LOOP;
+    -- 5b: rebuild trigger function bodies for every distinct real source.
+    -- One trigger set per source is shared by every IMV depending on it.
+    FOR rec IN
+        SELECT DISTINCT src
+        FROM (
+            SELECT unnest(depends_on) AS src
+            FROM public.__reflex_ivm_reference
+            WHERE enabled = TRUE
+        ) s
+        WHERE src IS NOT NULL
+          AND src NOT LIKE '<%'
+        ORDER BY src
+    LOOP
+        BEGIN
+            msg := public.reflex_rebuild_triggers(rec.src);
+            n_sources := n_sources + 1;
+        EXCEPTION WHEN OTHERS THEN
+            n_failures := n_failures + 1;
+            RAISE WARNING 'pg_reflex 1.4.5: trigger rebuild failed for % — %',
+                rec.src, SQLERRM;
+        END;
+    END LOOP;
+    RAISE NOTICE 'pg_reflex 1.4.5: filter-aware skip backfill — % IMV(s) metadata, % source(s) triggers, % failure(s)',
+        n_imvs, n_sources, n_failures;
+END
+$REFLEX_MIG_145_PART5$;
