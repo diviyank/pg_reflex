@@ -350,6 +350,288 @@ fn test_having_only_max_is_recomputed_on_delete() {
     );
 }
 
+// ========================================================================
+// 1.4.6 — Item 5: drop redundant __nonnull_count intermediate columns
+// ========================================================================
+// Cases handled by `optimize_not_null_sums`:
+//   (a) SUM(bare_col) where bare_col is NOT NULL in source (existing).
+//   (b) BOOL_OR(X) where X is structurally non-null — e.g. `X IS NOT NULL`,
+//       `X IS NULL`. The `__bool_or_*_nonnull_count` is always == __ivm_count.
+//   (c) SUM(Y * COALESCE(Z, non_null_lit)) where SUM(Y) is also tracked —
+//       same nullability profile as Y, so the new nonnull_count duplicates
+//       SUM(Y)'s nonnull_count. End-query refs are redirected; the duplicate
+//       column is dropped.
+
+use crate::aggregation::{AggregationPlan, EndQueryMapping, IntermediateColumn};
+
+fn plan_with_bool_or_of_is_not_null() -> AggregationPlan {
+    AggregationPlan {
+        group_by_columns: vec!["grp".to_string()],
+        intermediate_columns: vec![
+            IntermediateColumn {
+                name: "__bool_or_x_is_not_null_true_count".to_string(),
+                pg_type: "BIGINT".to_string(),
+                source_aggregate: "SUM".to_string(),
+                source_arg: "CASE WHEN (x IS NOT NULL) THEN 1 ELSE 0 END".to_string(),
+                topk_k: None,
+            },
+            IntermediateColumn {
+                name: "__bool_or_x_is_not_null_nonnull_count".to_string(),
+                pg_type: "BIGINT".to_string(),
+                source_aggregate: "SUM".to_string(),
+                source_arg: "CASE WHEN (x IS NOT NULL) IS NOT NULL THEN 1 ELSE 0 END".to_string(),
+                topk_k: None,
+            },
+        ],
+        end_query_mappings: vec![EndQueryMapping {
+            intermediate_expr:
+                "CASE WHEN \"__bool_or_x_is_not_null_nonnull_count\" > 0 THEN \"__bool_or_x_is_not_null_true_count\" > 0 ELSE NULL END"
+                    .to_string(),
+            output_alias: "has_x".to_string(),
+            aggregate_type: "BOOL_OR".to_string(),
+            cast_type: None,
+        }],
+        has_distinct: false,
+        needs_ivm_count: true,
+        distinct_columns: vec![],
+        is_passthrough: false,
+        passthrough_columns: vec![],
+        passthrough_key_mappings: std::collections::HashMap::new(),
+        having_clause: None,
+        not_null_columns: std::collections::HashSet::new(),
+        group_by_aliases: std::collections::HashMap::new(),
+        output_column_order: vec![],
+        imv_relevant_columns: std::collections::HashMap::new(),
+        imv_relevant_where: std::collections::HashMap::new(),
+    }
+}
+
+#[test]
+fn test_optimize_drops_bool_or_nonnull_count_when_inner_is_is_not_null() {
+    let mut plan = plan_with_bool_or_of_is_not_null();
+    plan.optimize_not_null_sums(&std::collections::HashSet::new());
+
+    assert!(
+        !plan
+            .intermediate_columns
+            .iter()
+            .any(|ic| ic.name == "__bool_or_x_is_not_null_nonnull_count"),
+        "BOOL_OR's nonnull_count must be dropped when inner is `X IS NOT NULL`: {:?}",
+        plan.intermediate_columns
+    );
+    assert!(
+        plan.intermediate_columns
+            .iter()
+            .any(|ic| ic.name == "__bool_or_x_is_not_null_true_count"),
+        "BOOL_OR's true_count must be kept"
+    );
+    let mapping = &plan.end_query_mappings[0];
+    assert!(
+        !mapping
+            .intermediate_expr
+            .contains("__bool_or_x_is_not_null_nonnull_count"),
+        "end_query must no longer reference the dropped nonnull_count: {}",
+        mapping.intermediate_expr
+    );
+    assert!(
+        mapping
+            .intermediate_expr
+            .contains("__bool_or_x_is_not_null_true_count"),
+        "end_query must still reference true_count: {}",
+        mapping.intermediate_expr
+    );
+    assert!(
+        !mapping.intermediate_expr.contains("CASE WHEN"),
+        "end_query CASE must be flattened to just `true_count > 0`: {}",
+        mapping.intermediate_expr
+    );
+}
+
+#[test]
+fn test_optimize_keeps_bool_or_nonnull_count_when_inner_is_arbitrary() {
+    // BOOL_OR(flag) — flag is a plain column that may itself be NULL.
+    // The nonnull_count is needed to distinguish "all-null" from "all-false".
+    let mut plan = plan_with_bool_or_of_is_not_null();
+    plan.intermediate_columns[0].source_arg = "CASE WHEN (flag) THEN 1 ELSE 0 END".to_string();
+    plan.intermediate_columns[1].source_arg =
+        "CASE WHEN (flag) IS NOT NULL THEN 1 ELSE 0 END".to_string();
+    plan.optimize_not_null_sums(&std::collections::HashSet::new());
+
+    assert!(
+        plan.intermediate_columns
+            .iter()
+            .any(|ic| ic.name == "__bool_or_x_is_not_null_nonnull_count"),
+        "nullable inner arg must NOT drop nonnull_count: {:?}",
+        plan.intermediate_columns
+    );
+}
+
+fn plan_with_sum_and_multiplied_coalesce() -> AggregationPlan {
+    AggregationPlan {
+        group_by_columns: vec!["grp".to_string()],
+        intermediate_columns: vec![
+            IntermediateColumn {
+                name: "__sum_qty".to_string(),
+                pg_type: "NUMERIC".to_string(),
+                source_aggregate: "SUM".to_string(),
+                source_arg: "qty".to_string(),
+                topk_k: None,
+            },
+            IntermediateColumn {
+                name: "__nonnull_count_qty".to_string(),
+                pg_type: "BIGINT".to_string(),
+                source_aggregate: "COUNT".to_string(),
+                source_arg: "qty".to_string(),
+                topk_k: None,
+            },
+            IntermediateColumn {
+                name: "__sum_qty_coalesce_price_0".to_string(),
+                pg_type: "NUMERIC".to_string(),
+                source_aggregate: "SUM".to_string(),
+                source_arg: "qty * COALESCE(price, 0)".to_string(),
+                topk_k: None,
+            },
+            IntermediateColumn {
+                name: "__nonnull_count_qty_coalesce_price_0".to_string(),
+                pg_type: "BIGINT".to_string(),
+                source_aggregate: "COUNT".to_string(),
+                source_arg: "qty * COALESCE(price, 0)".to_string(),
+                topk_k: None,
+            },
+        ],
+        end_query_mappings: vec![
+            EndQueryMapping {
+                intermediate_expr:
+                    "CASE WHEN \"__nonnull_count_qty\" > 0 THEN \"__sum_qty\" END".to_string(),
+                output_alias: "total_qty".to_string(),
+                aggregate_type: "SUM".to_string(),
+                cast_type: None,
+            },
+            EndQueryMapping {
+                intermediate_expr:
+                    "CASE WHEN \"__nonnull_count_qty_coalesce_price_0\" > 0 THEN \"__sum_qty_coalesce_price_0\" END"
+                        .to_string(),
+                output_alias: "turnover".to_string(),
+                aggregate_type: "SUM".to_string(),
+                cast_type: None,
+            },
+        ],
+        has_distinct: false,
+        needs_ivm_count: true,
+        distinct_columns: vec![],
+        is_passthrough: false,
+        passthrough_columns: vec![],
+        passthrough_key_mappings: std::collections::HashMap::new(),
+        having_clause: None,
+        not_null_columns: std::collections::HashSet::new(),
+        group_by_aliases: std::collections::HashMap::new(),
+        output_column_order: vec![],
+        imv_relevant_columns: std::collections::HashMap::new(),
+        imv_relevant_where: std::collections::HashMap::new(),
+    }
+}
+
+#[test]
+fn test_optimize_dedups_nonnull_count_for_multiplied_coalesce() {
+    let mut plan = plan_with_sum_and_multiplied_coalesce();
+    plan.optimize_not_null_sums(&std::collections::HashSet::new());
+
+    // The duplicate nonnull_count for `qty * COALESCE(price, 0)` must be dropped.
+    assert!(
+        !plan
+            .intermediate_columns
+            .iter()
+            .any(|ic| ic.name == "__nonnull_count_qty_coalesce_price_0"),
+        "duplicate nonnull_count for `qty * COALESCE(price, 0)` must be dropped: {:?}",
+        plan.intermediate_columns
+    );
+    // The canonical nonnull_count for plain `qty` is kept.
+    assert!(
+        plan.intermediate_columns
+            .iter()
+            .any(|ic| ic.name == "__nonnull_count_qty"),
+        "canonical nonnull_count for qty must be kept"
+    );
+    // Both __sum_* columns are kept (they hold different values).
+    assert!(
+        plan.intermediate_columns
+            .iter()
+            .any(|ic| ic.name == "__sum_qty"),
+        "__sum_qty must be kept"
+    );
+    assert!(
+        plan.intermediate_columns
+            .iter()
+            .any(|ic| ic.name == "__sum_qty_coalesce_price_0"),
+        "__sum_qty_coalesce_price_0 must be kept (different aggregate value)"
+    );
+    // The end_query mapping for `turnover` is rewritten to use the canonical nonnull_count.
+    let turnover = plan
+        .end_query_mappings
+        .iter()
+        .find(|m| m.output_alias == "turnover")
+        .expect("turnover mapping must remain");
+    assert!(
+        !turnover
+            .intermediate_expr
+            .contains("__nonnull_count_qty_coalesce_price_0"),
+        "end_query must no longer reference the dropped column: {}",
+        turnover.intermediate_expr
+    );
+    assert!(
+        turnover.intermediate_expr.contains("__nonnull_count_qty"),
+        "end_query for `turnover` must redirect to the canonical __nonnull_count_qty: {}",
+        turnover.intermediate_expr
+    );
+}
+
+#[test]
+fn test_optimize_dedups_propagates_when_left_is_not_null() {
+    // SUM(qty) where qty is NOT NULL → SUM(qty)'s nonnull_count is dropped
+    // (existing behavior). For SUM(qty * COALESCE(price, 0)), the
+    // nullability profile == qty's, which is NOT NULL. So the multiplier's
+    // nonnull_count is ALSO dropped (no need to redirect since it's
+    // unconditionally true).
+    let mut plan = plan_with_sum_and_multiplied_coalesce();
+    let mut not_null = std::collections::HashSet::new();
+    not_null.insert("qty".to_string());
+    plan.optimize_not_null_sums(&not_null);
+
+    assert!(
+        !plan
+            .intermediate_columns
+            .iter()
+            .any(|ic| ic.name == "__nonnull_count_qty"),
+        "naked qty nonnull_count must be dropped (qty is NOT NULL): {:?}",
+        plan.intermediate_columns
+    );
+    assert!(
+        !plan
+            .intermediate_columns
+            .iter()
+            .any(|ic| ic.name == "__nonnull_count_qty_coalesce_price_0"),
+        "multiplied nonnull_count must also be dropped (qty is NOT NULL): {:?}",
+        plan.intermediate_columns
+    );
+    let turnover = plan
+        .end_query_mappings
+        .iter()
+        .find(|m| m.output_alias == "turnover")
+        .unwrap();
+    assert!(
+        !turnover.intermediate_expr.contains("CASE WHEN"),
+        "end_query CASE must be flattened to just the sum reference: {}",
+        turnover.intermediate_expr
+    );
+    assert!(
+        turnover
+            .intermediate_expr
+            .contains("__sum_qty_coalesce_price_0"),
+        "end_query must reference __sum_qty_coalesce_price_0 directly: {}",
+        turnover.intermediate_expr
+    );
+}
+
 mod proptest_tests {
     use super::*;
     use proptest::prelude::*;

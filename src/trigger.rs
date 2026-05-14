@@ -1111,8 +1111,11 @@ fn push_materialized_merge_and_affected(
         plan,
         op,
     ));
+    // Scratch is the result of GROUP BY in build_merge_from_table_sql's delta,
+    // so it already contains one row per group key. DISTINCT here would add a
+    // redundant hash/sort pass for the same output.
     stmts.push(format!(
-        "INSERT INTO {} SELECT DISTINCT {} FROM {} AS __d",
+        "INSERT INTO {} SELECT {} FROM {} AS __d",
         affected_tbl, select_expr, scratch_tbl
     ));
 }
@@ -1679,8 +1682,10 @@ pub fn reflex_build_delta_sql(
                     stmts.push(format!("TRUNCATE {}", affected_tbl));
                     stmts.push(format!("TRUNCATE {}", scratch_tbl));
                     stmts.push(format!("INSERT INTO {} {}", scratch_tbl, net_delta));
+                    // Scratch is pre-grouped by build_net_delta_query (SUM ... GROUP BY keys),
+                    // so it is already one row per group key — DISTINCT is redundant.
                     stmts.push(format!(
-                        "INSERT INTO {} SELECT DISTINCT {} FROM {} AS __d",
+                        "INSERT INTO {} SELECT {} FROM {} AS __d",
                         affected_tbl, select_expr, scratch_tbl
                     ));
                     // Capture the MERGE SQL — the dispatch block emits it

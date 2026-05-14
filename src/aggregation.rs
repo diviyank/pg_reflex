@@ -121,9 +121,30 @@ pub struct AggregationPlan {
 }
 
 impl AggregationPlan {
-    /// Remove __nonnull_count_* companion columns for SUM aggregates where the source
-    /// column is NOT NULL. When a column can't be NULL, SUM can never produce NULL
-    /// (empty group case is handled by __ivm_count), so the companion count is redundant.
+    /// Remove redundant `__nonnull_count_*` / `__bool_or_*_nonnull_count` companion
+    /// columns from the intermediate.
+    ///
+    /// Three classes of redundancy are detected:
+    ///
+    /// 1. **Bare-column SUM with NOT NULL source** (since 1.4.4). `SUM(col)` where
+    ///    `col` is NOT NULL in the source: the companion `__nonnull_count_col`
+    ///    always equals `__ivm_count` and is dropped. The end-query
+    ///    `CASE WHEN ... > 0 THEN __sum END` is flattened to just `__sum`.
+    ///
+    /// 2. **BOOL_OR over a structurally non-null inner expression** (1.4.6).
+    ///    `BOOL_OR(X IS NOT NULL)`, `BOOL_OR(X IS NULL)`, `BOOL_OR(<bare_not_null_col>)`:
+    ///    the inner argument can never be NULL, so the `__bool_or_*_nonnull_count`
+    ///    companion equals `__ivm_count`. The end-query's
+    ///    `CASE WHEN nonnull > 0 THEN true_count > 0 ELSE NULL END` is flattened
+    ///    to `true_count > 0`.
+    ///
+    /// 3. **Multiplier dedup** (1.4.6). `SUM(<X> * COALESCE(<Y>, <non-null-lit>))`
+    ///    has the same nullability profile as `SUM(<X>)`. When a sibling `SUM(<X>)`
+    ///    is tracked (so `__nonnull_count_<X>` exists), the multiplier's own
+    ///    `__nonnull_count_<X_times_Y_coalesce_lit>` is redundant — end-query
+    ///    references are redirected to `__nonnull_count_<X>` and the duplicate is
+    ///    dropped. When `<X>` is itself in NOT NULL columns, the dedup degenerates
+    ///    to "drop unconditionally and flatten the CASE", same as class 1.
     pub fn optimize_not_null_sums(&mut self, not_null_columns: &std::collections::HashSet<String>) {
         // 1.4.4: always record the catalog-derived NOT NULL set on the plan,
         // not just when the SUM-companion-column optimisation fires. The
@@ -133,55 +154,246 @@ impl AggregationPlan {
         // any SUM rewrite.
         self.not_null_columns = not_null_columns.clone();
 
-        let to_remove: std::collections::HashSet<String> = self
+        // Set of column names to drop and (orig -> canonical) redirects.
+        let mut to_remove: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut redirect: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+
+        // Class 1: SUM(bare_col) where bare_col is NOT NULL.
+        for ic in &self.intermediate_columns {
+            if ic.source_aggregate == "SUM" && not_null_columns.contains(&ic.source_arg) {
+                let arg_sanitized = sanitize_for_col_name(&ic.source_arg);
+                to_remove.insert(format!("__nonnull_count_{}", arg_sanitized));
+            }
+        }
+
+        // Class 2: BOOL_OR(inner) where `inner` is structurally non-null.
+        // The aggregation builder emits a pair:
+        //   __bool_or_<arg_san>_true_count    src_arg = "CASE WHEN (<inner>) THEN 1 ELSE 0 END"
+        //   __bool_or_<arg_san>_nonnull_count src_arg = "CASE WHEN (<inner>) IS NOT NULL THEN 1 ELSE 0 END"
+        // We inspect the true_count's source_arg to recover the original inner.
+        let true_count_suffix = "_true_count";
+        let nonnull_count_suffix = "_nonnull_count";
+        for ic in &self.intermediate_columns {
+            if !ic.name.starts_with("__bool_or_") || !ic.name.ends_with(true_count_suffix) {
+                continue;
+            }
+            let stem = match ic.name.strip_suffix(true_count_suffix) {
+                Some(s) => s,
+                None => continue,
+            };
+            let companion = format!("{}{}", stem, nonnull_count_suffix);
+            if !self
+                .intermediate_columns
+                .iter()
+                .any(|c| c.name == companion)
+            {
+                continue;
+            }
+            if let Some(inner) = extract_bool_or_true_inner(&ic.source_arg) {
+                if expr_is_structurally_not_null(inner, not_null_columns) {
+                    to_remove.insert(companion);
+                }
+            }
+        }
+
+        // Class 3: SUM(X * COALESCE(Y, non-null-lit)) — nullability matches X's.
+        // `__nonnull_count_*` companions for SUM have source_aggregate "COUNT"
+        // (set by the aggregation builder) and source_arg = raw aggregate argument.
+        let intermediates_snapshot: Vec<(String, String, String)> = self
             .intermediate_columns
             .iter()
-            .filter(|ic| ic.source_aggregate == "SUM" && not_null_columns.contains(&ic.source_arg))
             .map(|ic| {
-                let arg_sanitized = ic
-                    .source_arg
-                    .chars()
-                    .map(|c| {
-                        if c.is_alphanumeric() || c == '_' {
-                            c
-                        } else {
-                            '_'
-                        }
-                    })
-                    .collect::<String>()
-                    .to_lowercase();
-                format!("__nonnull_count_{}", arg_sanitized)
+                (
+                    ic.name.clone(),
+                    ic.source_aggregate.clone(),
+                    ic.source_arg.clone(),
+                )
             })
             .collect();
+        for (name, src_agg, src_arg) in &intermediates_snapshot {
+            if src_agg != "COUNT" || !name.starts_with("__nonnull_count_") {
+                continue;
+            }
+            if let Some(canonical_x) = strip_coalesce_multiplier_to_x(src_arg) {
+                if not_null_columns.contains(&canonical_x) {
+                    // X is NOT NULL => the multiplier expression is non-null
+                    // everywhere; flatten without a redirect (CASE collapses).
+                    to_remove.insert(name.clone());
+                    continue;
+                }
+                let canonical_sanitized = sanitize_for_col_name(&canonical_x);
+                let canonical_name = format!("__nonnull_count_{}", canonical_sanitized);
+                if &canonical_name != name
+                    && intermediates_snapshot
+                        .iter()
+                        .any(|(other, ..)| other == &canonical_name)
+                {
+                    to_remove.insert(name.clone());
+                    redirect.insert(name.clone(), canonical_name);
+                }
+            }
+        }
 
         if to_remove.is_empty() {
             return;
         }
 
-        // Remove companion count columns from intermediate
+        // Drop the redundant columns.
         self.intermediate_columns
             .retain(|ic| !to_remove.contains(&ic.name));
 
-        // Update end_query_mappings: replace CASE WHEN __nonnull_count > 0 THEN __sum END
-        // with just the __sum reference (the WHERE __ivm_count > 0 filter or sentinel
-        // CASE WHEN wrapper in generate_end_query handles the empty-group case).
+        // Rewrite end_query_mappings.
         for mapping in &mut self.end_query_mappings {
-            if mapping.aggregate_type == "SUM" {
-                for count_name in &to_remove {
-                    let old_prefix = format!("CASE WHEN \"{}\" > 0 THEN ", count_name);
-                    if mapping.intermediate_expr.starts_with(&old_prefix) {
-                        if let Some(sum_ref) = mapping
-                            .intermediate_expr
-                            .strip_prefix(&old_prefix)
-                            .and_then(|r| r.strip_suffix(" END"))
-                        {
-                            mapping.intermediate_expr = sum_ref.to_string();
-                        }
-                    }
+            // First, apply Pattern-B redirects: replace dropped name with canonical.
+            for (orig, canon) in &redirect {
+                let from = format!("\"{}\"", orig);
+                let to = format!("\"{}\"", canon);
+                mapping.intermediate_expr = mapping.intermediate_expr.replace(&from, &to);
+            }
+            // Then flatten the CASE for any nonnull_count that was dropped without a redirect.
+            for count_name in &to_remove {
+                if redirect.contains_key(count_name) {
+                    continue;
+                }
+                let head = format!("CASE WHEN \"{}\" > 0 THEN ", count_name);
+                if !mapping.intermediate_expr.starts_with(&head) {
+                    continue;
+                }
+                let body = &mapping.intermediate_expr[head.len()..];
+                // BOOL_OR shape: "... ELSE NULL END". Strip first since "ELSE NULL END"
+                // ends with " END" — we'd misclassify it otherwise.
+                if let Some(stripped) = body.strip_suffix(" ELSE NULL END") {
+                    mapping.intermediate_expr = stripped.to_string();
+                    continue;
+                }
+                // SUM shape: "... END"
+                if let Some(stripped) = body.strip_suffix(" END") {
+                    mapping.intermediate_expr = stripped.to_string();
                 }
             }
         }
     }
+}
+
+/// Extract `<inner>` from a `CASE WHEN (<inner>) THEN 1 ELSE 0 END` form.
+fn extract_bool_or_true_inner(s: &str) -> Option<&str> {
+    let trimmed = s.trim();
+    let prefix = "CASE WHEN (";
+    let suffix = ") THEN 1 ELSE 0 END";
+    if trimmed.starts_with(prefix) && trimmed.ends_with(suffix) {
+        Some(&trimmed[prefix.len()..trimmed.len() - suffix.len()])
+    } else {
+        None
+    }
+}
+
+/// Returns true if the expression is structurally always non-null:
+///   * trailing `IS NOT NULL` / `IS NULL` predicate (always boolean, never null)
+///   * bare identifier in `not_null_columns`
+///   * a non-null literal (number / quoted string / TRUE / FALSE)
+fn expr_is_structurally_not_null(
+    expr: &str,
+    not_null_columns: &std::collections::HashSet<String>,
+) -> bool {
+    let t = strip_outer_parens(expr.trim());
+    let upper = t.to_uppercase();
+    if upper.ends_with(" IS NOT NULL") || upper.ends_with(" IS NULL") {
+        return true;
+    }
+    if not_null_columns.contains(t) {
+        return true;
+    }
+    is_non_null_literal(t)
+}
+
+/// Strip a single layer of balanced outer parentheses, if present.
+fn strip_outer_parens(s: &str) -> &str {
+    let t = s.trim();
+    if !(t.starts_with('(') && t.ends_with(')')) {
+        return t;
+    }
+    let inner = &t[1..t.len() - 1];
+    let mut depth: i32 = 0;
+    for ch in inner.chars() {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                if depth == 0 {
+                    return t;
+                }
+                depth -= 1;
+            }
+            _ => {}
+        }
+    }
+    if depth == 0 {
+        inner.trim()
+    } else {
+        t
+    }
+}
+
+fn is_non_null_literal(s: &str) -> bool {
+    let t = s.trim();
+    if t.parse::<f64>().is_ok() {
+        return true;
+    }
+    if t.len() >= 2 && t.starts_with('\'') && t.ends_with('\'') {
+        return true;
+    }
+    matches!(t.to_uppercase().as_str(), "TRUE" | "FALSE")
+}
+
+/// If `expr` has the form `<X> * COALESCE(<Y>, <non-null-lit>)`, return `<X>`.
+/// `<X>` is whatever appears before the top-level ` * COALESCE(`. Case-insensitive
+/// on the keyword `COALESCE`.
+fn strip_coalesce_multiplier_to_x(expr: &str) -> Option<String> {
+    let lc = expr.to_lowercase();
+    let needle = " * coalesce(";
+    let idx = lc.find(needle)?;
+    let x = expr[..idx].trim().to_string();
+    let coalesce_start = idx + needle.len();
+    // Find the matching closing paren of the COALESCE.
+    let bytes = expr.as_bytes();
+    let mut depth = 1usize;
+    let mut end = None;
+    for (i, b) in bytes.iter().enumerate().skip(coalesce_start) {
+        match b {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    end = Some(i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let coalesce_end = end?;
+    let args_str = &expr[coalesce_start..coalesce_end];
+    // Extract the last comma-separated argument at depth 0.
+    let last_comma = find_top_level_last_comma(args_str)?;
+    let last_arg = args_str[last_comma + 1..].trim();
+    if !is_non_null_literal(last_arg) {
+        return None;
+    }
+    Some(x)
+}
+
+fn find_top_level_last_comma(s: &str) -> Option<usize> {
+    let mut depth: i32 = 0;
+    let mut last = None;
+    for (i, ch) in s.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            ',' if depth == 0 => last = Some(i),
+            _ => {}
+        }
+    }
+    last
 }
 
 /// Sanitize a SQL expression to be used as part of a column name.

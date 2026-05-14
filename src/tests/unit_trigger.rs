@@ -820,10 +820,56 @@ fn test_build_delta_sql_uses_scratch_table_for_group_by_imv() {
         &sql[..sql.len().min(400)]
     );
     assert!(
-        sql.contains("INSERT INTO \"__reflex_affected_test_view\" SELECT DISTINCT"),
+        sql.contains("INSERT INTO \"__reflex_affected_test_view\" SELECT"),
         "affected groups must be populated from scratch: {}",
         &sql[..sql.len().min(400)]
     );
+    assert!(
+        !sql.contains("INSERT INTO \"__reflex_affected_test_view\" SELECT DISTINCT"),
+        "scratch is one row per group key; DISTINCT is wasted work: {}",
+        &sql[..sql.len().min(400)]
+    );
+}
+
+#[test]
+fn test_affected_insert_from_scratch_omits_distinct() {
+    let plan = simple_plan();
+    let agg_json = serde_json::to_string(&plan).unwrap();
+    let base_q = "SELECT city, SUM(amount) AS \"__sum_amount\", COUNT(*) AS __ivm_count FROM orders GROUP BY city";
+    let end_q =
+        "SELECT \"city\", \"__sum_amount\" AS total FROM \"__reflex_intermediate_test_view\"";
+
+    for op in ["INSERT", "DELETE", "UPDATE"].iter() {
+        let sql = reflex_build_delta_sql(
+            "test_view",
+            "orders",
+            op,
+            base_q,
+            end_q,
+            Some(agg_json.as_str()),
+            base_q,
+        );
+        let affected_insert_marker = "INSERT INTO \"__reflex_affected_test_view\"";
+        let mut search = sql.as_str();
+        while let Some(pos) = search.find(affected_insert_marker) {
+            let tail = &search[pos..];
+            let line_end = tail.find('\n').unwrap_or(tail.len());
+            let stmt_head = &tail[..line_end.min(200)];
+            // Affected INSERT pulls from the scratch table for grouped IMVs;
+            // scratch is pre-aggregated to one row per group, so DISTINCT is
+            // redundant. Outer-join secondary path is the only exception and
+            // pulls from `(delta_q)` not `__reflex_scratch_…`.
+            if stmt_head.contains("__reflex_scratch_test_view") {
+                assert!(
+                    !stmt_head.contains("SELECT DISTINCT"),
+                    "affected INSERT from scratch must NOT use DISTINCT (op={}): {}",
+                    op,
+                    stmt_head
+                );
+            }
+            search = &search[pos + affected_insert_marker.len()..];
+        }
+    }
 }
 
 #[test]
