@@ -427,6 +427,40 @@ pub fn build_trigger_ddls(source_table: &str) -> Vec<String> {
          END IF;"
     );
 
+    // Item α (2026-05-15) — Directional UPDATE dispatch.
+    //
+    // After filter-aware spurious-skip has decided the multisets differ, probe
+    // each transition table for post-filter rows. The three outcomes route
+    // the call to `reflex_build_delta_sql` with a *promoted* op:
+    //   * OLD empty, NEW has rows → 'INSERT' shape (single-direction add)
+    //   * OLD has rows, NEW empty → 'DELETE' shape (single-direction sub)
+    //   * both have rows          → 'UPDATE' (today's UNION ALL path)
+    //
+    // The INSERT/DELETE codegen paths read only one transition table by name;
+    // they remain visible from the UPDATE trigger's REFERENCING clauses.
+    //
+    // The probe re-uses `_skip_cols` / `_skip_pred_clause` populated by the
+    // filter_skip_block above — same gate (`imv_relevant_columns[source]`
+    // non-empty); same WHERE predicate.
+    //
+    // Promoting UPDATE → INSERT also drops the wasted dead-cleanup DELETE
+    // (gated on op ∈ {DELETE, UPDATE} in trigger.rs) and the target DELETE on
+    // OUT→IN flips finds 0 pre-existing rows for affected keys.
+    let directional_probe_for_update = format!(
+        "_directional_op := 'UPDATE'; \
+         IF _skip_cols IS NOT NULL AND _skip_cols <> '' THEN \
+           EXECUTE format('SELECT EXISTS(SELECT 1 FROM %I%s LIMIT 1)', \
+                          '{ref_old}', _skip_pred_clause) INTO _old_has; \
+           EXECUTE format('SELECT EXISTS(SELECT 1 FROM %I%s LIMIT 1)', \
+                          '{ref_new}', _skip_pred_clause) INTO _new_has; \
+           IF (NOT _old_has) AND _new_has THEN \
+             _directional_op := 'INSERT'; \
+           ELSIF _old_has AND (NOT _new_has) THEN \
+             _directional_op := 'DELETE'; \
+           END IF; \
+         END IF;"
+    );
+
     // The where_predicate early-skip needs op-aware semantics:
     //   * INSERT trigger only sees `ref_new` — skip if no NEW row passes.
     //   * DELETE trigger only sees `ref_old` — skip if no OLD row passes.
@@ -438,6 +472,7 @@ pub fn build_trigger_ddls(source_table: &str) -> Vec<String> {
     let body_core = format!(
         "DECLARE _rec RECORD; _sql TEXT; _stmt TEXT; _has_rows BOOLEAN; _pred_match BOOLEAN; \
                  _skip_cols TEXT; _skip_pred TEXT; _skip_pred_clause TEXT; _skip_sql TEXT; _filter_skip BOOLEAN; \
+                 _old_has BOOLEAN; _new_has BOOLEAN; _directional_op TEXT; \
          BEGIN \
            SELECT EXISTS(SELECT 1 FROM \"{{transition_tbl}}\" LIMIT 1) INTO _has_rows; \
            IF NOT _has_rows THEN RETURN NULL; END IF; \
@@ -450,8 +485,9 @@ pub fn build_trigger_ddls(source_table: &str) -> Vec<String> {
              IF _rec.ignored_sources IS NOT NULL AND ('{source_table}' = ANY(_rec.ignored_sources) OR '{bare_source}' = ANY(_rec.ignored_sources)) THEN CONTINUE; END IF; \
              {{pred_check_block}} \
              {{filter_skip_block}} \
+             {{directional_probe_block}} \
              PERFORM pg_advisory_xact_lock(hashtext(_rec.name), hashtext(reverse(_rec.name))); \
-             _sql := public.reflex_build_delta_sql(_rec.name, '{source_table}', '{{op}}', _rec.base_query, _rec.end_query, _rec.aggregations, _rec.base_query); \
+             _sql := public.reflex_build_delta_sql(_rec.name, '{source_table}', {{op_value}}, _rec.base_query, _rec.end_query, _rec.aggregations, _rec.base_query); \
              IF _sql <> '' THEN \
                FOREACH _stmt IN ARRAY string_to_array(_sql, E'\\n--<<REFLEX_SEP>>--\\n') LOOP \
                  IF _stmt <> '' THEN EXECUTE _stmt; END IF; \
@@ -486,10 +522,11 @@ pub fn build_trigger_ddls(source_table: &str) -> Vec<String> {
     let ins_fn = safe_identifier(&format!("__reflex_ins_trigger_on_{}", safe_source));
     let ins_trig = safe_identifier(&format!("__reflex_trigger_ins_on_{}", safe_source));
     let ins_body = body_core
-        .replace("{op}", "INSERT")
         .replace("{transition_tbl}", &ref_new)
         .replace("{pred_check_block}", &pred_check_ins)
-        .replace("{filter_skip_block}", "");
+        .replace("{filter_skip_block}", "")
+        .replace("{directional_probe_block}", "")
+        .replace("{op_value}", "'INSERT'");
     let ins_ddl = format!(
         "CREATE OR REPLACE FUNCTION {ins_fn}() RETURNS TRIGGER AS $fn$ {ins_body} $fn$ LANGUAGE plpgsql;\n\
          CREATE OR REPLACE TRIGGER \"{ins_trig}\" \
@@ -502,10 +539,11 @@ pub fn build_trigger_ddls(source_table: &str) -> Vec<String> {
     let del_fn = safe_identifier(&format!("__reflex_del_trigger_on_{}", safe_source));
     let del_trig = safe_identifier(&format!("__reflex_trigger_del_on_{}", safe_source));
     let del_body = body_core
-        .replace("{op}", "DELETE")
         .replace("{transition_tbl}", &ref_old)
         .replace("{pred_check_block}", &pred_check_del)
-        .replace("{filter_skip_block}", "");
+        .replace("{filter_skip_block}", "")
+        .replace("{directional_probe_block}", "")
+        .replace("{op_value}", "'DELETE'");
     let del_ddl = format!(
         "CREATE OR REPLACE FUNCTION {del_fn}() RETURNS TRIGGER AS $fn$ {del_body} $fn$ LANGUAGE plpgsql;\n\
          CREATE OR REPLACE TRIGGER \"{del_trig}\" \
@@ -518,10 +556,11 @@ pub fn build_trigger_ddls(source_table: &str) -> Vec<String> {
     let upd_fn = safe_identifier(&format!("__reflex_upd_trigger_on_{}", safe_source));
     let upd_trig = safe_identifier(&format!("__reflex_trigger_upd_on_{}", safe_source));
     let upd_body = body_core
-        .replace("{op}", "UPDATE")
         .replace("{transition_tbl}", &ref_new)
         .replace("{pred_check_block}", &pred_check_upd)
-        .replace("{filter_skip_block}", &filter_skip_block_for_update);
+        .replace("{filter_skip_block}", &filter_skip_block_for_update)
+        .replace("{directional_probe_block}", &directional_probe_for_update)
+        .replace("{op_value}", "_directional_op");
     let upd_ddl = format!(
         "CREATE OR REPLACE FUNCTION {upd_fn}() RETURNS TRIGGER AS $fn$ {upd_body} $fn$ LANGUAGE plpgsql;\n\
          CREATE OR REPLACE TRIGGER \"{upd_trig}\" \

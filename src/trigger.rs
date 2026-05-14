@@ -1036,8 +1036,8 @@ fn build_high_selectivity_dispatch_sql(
 ) -> String {
     let dead_cleanup = match dead_cleanup_sql {
         Some(s) => format!(
-            "        EXECUTE $reflex_inner${}$reflex_inner$;\n",
-            s.replace("$reflex_inner$", "$reflex_inner_alt$")
+            "        EXECUTE $reflex_inner${cleanup}$reflex_inner$;\n",
+            cleanup = s.replace("$reflex_inner$", "$reflex_inner_alt$")
         ),
         None => String::new(),
     };
@@ -1071,6 +1071,15 @@ fn build_high_selectivity_dispatch_sql(
              ELSE\n\
                  RAISE DEBUG 'pg_reflex wipe: ratio=% thr=% — incremental', _ratio, _thr;\n\
                  EXECUTE $reflex_inner${merge}$reflex_inner$;\n\
+                 -- ANALYZE intermediate after MERGE so the planner has\n\
+                 -- accurate stats for downstream dead-cleanup, target_delete,\n\
+                 -- and target_insert. The MERGE modified ~|scratch| rows in\n\
+                 -- the intermediate (UPDATE/INSERT), and the algebraic count\n\
+                 -- column (__ivm_count) just shifted distribution; without\n\
+                 -- fresh stats the planner can pick pathological NestedLoop+\n\
+                 -- SeqScan plans (12+ min on 100K groups). ~150 ms cost on\n\
+                 -- the SOP-forecast shape.\n\
+                 EXECUTE 'ANALYZE {intermediate}';\n\
 {dead_cleanup}\
                  EXECUTE $reflex_inner${tdel}$reflex_inner$;\n\
                  EXECUTE $reflex_inner${tins}$reflex_inner$;\n\
@@ -1111,6 +1120,14 @@ fn push_materialized_merge_and_affected(
         plan,
         op,
     ));
+    // 2026-05-15 (Item α surfaced this): the MERGE just modified
+    // ~|scratch| rows in the intermediate. `pg_class.reltuples` is stale
+    // (last set at IMV creation = 0). Downstream statements that JOIN on
+    // the intermediate via the composite UNIQUE index (target sync's INSERT
+    // and dead-cleanup DELETE) need accurate stats so the planner picks
+    // Index Scan via the composite key instead of a pathological SeqScan
+    // or NestedLoop. A full ANALYZE on a 180K-row intermediate is ~150 ms.
+    stmts.push(format!("ANALYZE {}", intermediate_tbl));
     // Scratch is the result of GROUP BY in build_merge_from_table_sql's delta,
     // so it already contains one row per group key. DISTINCT here would add a
     // redundant hash/sort pass for the same output.
@@ -1118,6 +1135,12 @@ fn push_materialized_merge_and_affected(
         "INSERT INTO {} SELECT {} FROM {} AS __d",
         affected_tbl, select_expr, scratch_tbl
     ));
+    // ANALYZE affected after INSERT — TRUNCATE clobbers reltuples; without
+    // fresh stats the planner estimates 1 row and picks NL+SeqScan for the
+    // downstream dead-cleanup DELETE and target sync EXISTS lookups
+    // (pathological at high affected counts — 12+ minutes on 100K groups).
+    // ~50 ms cost.
+    stmts.push(format!("ANALYZE {}", affected_tbl));
 }
 
 /// Generates the SQL statements to apply a delta to an IMV.
@@ -1688,6 +1711,12 @@ pub fn reflex_build_delta_sql(
                         "INSERT INTO {} SELECT {} FROM {} AS __d",
                         affected_tbl, select_expr, scratch_tbl
                     ));
+                    // ANALYZE the freshly populated affected so downstream
+                    // statements (dead-cleanup DELETE, target DELETE/INSERT,
+                    // dispatch DO block) plan against current row counts. See
+                    // the comment in push_materialized_merge_and_affected for
+                    // the failure mode this avoids.
+                    stmts.push(format!("ANALYZE {}", affected_tbl));
                     // Capture the MERGE SQL — the dispatch block emits it
                     // (instead of running it unconditionally).
                     let merge_sql_for_dispatch = build_merge_from_table_sql(
@@ -1873,7 +1902,11 @@ pub fn reflex_build_delta_sql(
             } else {
                 // Standard incremental path (no dispatch): MERGE already
                 // pushed by a non-dispatch branch (e.g. outer-join-secondary
-                // or top-K), now push the cleanup + target sync.
+                // or top-K). The MERGE's caller (push_materialized_merge /
+                // push_materialized_merge_and_affected) has already ANALYZE'd
+                // the intermediate post-MERGE so the dead-cleanup +
+                // target-sync planners have fresh stats. Now push the
+                // cleanup + target sync statements.
                 if let Some(s) = dead_cleanup_sql {
                     stmts.push(s);
                 }

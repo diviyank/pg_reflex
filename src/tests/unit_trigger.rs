@@ -831,6 +831,101 @@ fn test_build_delta_sql_uses_scratch_table_for_group_by_imv() {
     );
 }
 
+// 2026-05-15 — Item α: ensure intermediate gets ANALYZE'd after the MERGE
+// modifies ~|scratch| rows. Without fresh stats the planner picks
+// pathological plans for downstream target-sync and dead-cleanup
+// statements (12+ min on 100K groups vs ~2 s expected). The MERGE's
+// non-dispatch caller (push_materialized_merge_and_affected) emits the
+// ANALYZE immediately after the MERGE, before the affected-INSERT and
+// downstream EXISTS-based statements.
+#[test]
+fn test_intermediate_analyzed_after_merge_in_non_dispatch_path() {
+    let plan = simple_plan();
+    let agg_json = serde_json::to_string(&plan).unwrap();
+    let base_q = "SELECT city, SUM(amount) AS \"__sum_amount\", COUNT(*) AS __ivm_count FROM orders GROUP BY city";
+    // end_q without GROUP BY → takes the non-dispatch grouped target-sync path
+    // (intermediate is already pre-aggregated; end_query is a pure projection
+    // with WHERE __ivm_count > 0 — the shape of real SOP-style IMVs).
+    let end_q = "SELECT \"city\", \"__sum_amount\" AS total FROM \"__reflex_intermediate_test_view\" WHERE __ivm_count > 0";
+    let intermediate = "\"__reflex_intermediate_test_view\"";
+    let analyze_marker = format!("ANALYZE {}", intermediate);
+    for op in ["INSERT", "DELETE", "UPDATE"].iter() {
+        let sql = reflex_build_delta_sql(
+            "test_view",
+            "orders",
+            op,
+            base_q,
+            end_q,
+            Some(agg_json.as_str()),
+            base_q,
+        );
+        let merge_marker = format!("MERGE INTO {}", intermediate);
+        let merge_pos = sql.find(&merge_marker).unwrap_or_else(|| {
+            panic!(
+                "MERGE statement must be present (op={}): {}",
+                op,
+                &sql[..sql.len().min(2000)]
+            )
+        });
+        // ANALYZE on intermediate must appear after MERGE.
+        let after_merge = &sql[merge_pos..];
+        assert!(
+            after_merge.contains(&analyze_marker),
+            "ANALYZE on intermediate must appear after MERGE (op={}): {}",
+            op,
+            &after_merge[..after_merge.len().min(800)]
+        );
+    }
+}
+
+#[test]
+// 2026-05-15 — Item α: ensure the affected table gets ANALYZE'd after the
+// scratch-fed INSERT, so the planner has fresh row counts for the
+// downstream dead-cleanup DELETE and target sync EXISTS lookups.
+// Without ANALYZE, TRUNCATE clobbers reltuples → planner picks NestedLoop
+// with SeqScan on intermediate per affected row (pathological at scale).
+fn test_affected_table_analyzed_after_scratch_fed_insert() {
+    let plan = simple_plan();
+    let agg_json = serde_json::to_string(&plan).unwrap();
+    let base_q = "SELECT city, SUM(amount) AS \"__sum_amount\", COUNT(*) AS __ivm_count FROM orders GROUP BY city";
+    let end_q = "SELECT \"city\", COUNT(\"amount\") AS total FROM \"__reflex_intermediate_test_view\" WHERE __ivm_count > 0 GROUP BY \"city\"";
+    for op in ["INSERT", "DELETE", "UPDATE"].iter() {
+        let sql = reflex_build_delta_sql(
+            "test_view",
+            "orders",
+            op,
+            base_q,
+            end_q,
+            Some(agg_json.as_str()),
+            base_q,
+        );
+        let affected = "\"__reflex_affected_test_view\"";
+        let analyze_marker = format!("ANALYZE {}", affected);
+        let affected_insert = format!("INSERT INTO {}", affected);
+        let analyze_pos = sql.find(&analyze_marker).unwrap_or_else(|| {
+            panic!(
+                "must emit ANALYZE on affected table after insert (op={}): {}",
+                op,
+                &sql[..sql.len().min(800)]
+            )
+        });
+        let insert_pos = sql.find(&affected_insert).unwrap_or_else(|| {
+            panic!(
+                "affected INSERT must be present (op={}): {}",
+                op,
+                &sql[..sql.len().min(800)]
+            )
+        });
+        assert!(
+            insert_pos < analyze_pos,
+            "ANALYZE must follow the affected INSERT (op={}): insert at {} analyze at {}",
+            op,
+            insert_pos,
+            analyze_pos
+        );
+    }
+}
+
 #[test]
 fn test_affected_insert_from_scratch_omits_distinct() {
     let plan = simple_plan();

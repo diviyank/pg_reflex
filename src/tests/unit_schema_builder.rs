@@ -371,3 +371,164 @@ fn test_intermediate_ddl_bool_or_emits_bigint_counters() {
         ddl
     );
 }
+
+// ========================================================================
+// Item α (2026-05-15) — Directional UPDATE dispatch.
+//
+// The UPDATE trigger function body must contain a directional probe that
+// reads both transition tables (`__reflex_old_<src>` / `__reflex_new_<src>`),
+// applies the IMV's relevant WHERE predicate (when known), and routes to
+// reflex_build_delta_sql with op='INSERT' (NEW-only), 'DELETE' (OLD-only),
+// or 'UPDATE' (both). The probe is gated on the IMV having a non-empty
+// `imv_relevant_columns[source]` entry (same gate as the 1.4.5 filter-aware
+// spurious-skip block).
+// ========================================================================
+
+#[test]
+fn test_upd_body_declares_directional_probe_locals() {
+    let ddls = build_trigger_ddls("orders");
+    let upd_ddl = &ddls[2];
+    assert!(
+        upd_ddl.contains("_old_has BOOLEAN"),
+        "UPDATE trigger DECLARE section must include _old_has: {}",
+        &upd_ddl[..upd_ddl.len().min(800)]
+    );
+    assert!(
+        upd_ddl.contains("_new_has BOOLEAN"),
+        "UPDATE trigger DECLARE section must include _new_has: {}",
+        &upd_ddl[..upd_ddl.len().min(800)]
+    );
+    assert!(
+        upd_ddl.contains("_directional_op TEXT"),
+        "UPDATE trigger DECLARE section must include _directional_op TEXT: {}",
+        &upd_ddl[..upd_ddl.len().min(800)]
+    );
+}
+
+#[test]
+fn test_upd_body_probes_both_transition_tables() {
+    let ddls = build_trigger_ddls("orders");
+    let upd_ddl = &ddls[2];
+    // The probe must reference both transition tables. Their canonical
+    // names are formed via transition_*_table_name(source).
+    assert!(
+        upd_ddl.contains("__reflex_old_orders"),
+        "UPDATE trigger directional probe must read __reflex_old_orders: {}",
+        &upd_ddl[..upd_ddl.len().min(2000)]
+    );
+    assert!(
+        upd_ddl.contains("__reflex_new_orders"),
+        "UPDATE trigger directional probe must read __reflex_new_orders: {}",
+        &upd_ddl[..upd_ddl.len().min(2000)]
+    );
+}
+
+#[test]
+fn test_upd_body_passes_directional_op_to_build_delta_sql() {
+    let ddls = build_trigger_ddls("orders");
+    let upd_ddl = &ddls[2];
+    // The reflex_build_delta_sql call in the UPDATE trigger must pass
+    // _directional_op (the runtime-chosen op) — NOT the literal 'UPDATE'.
+    // INSERT and DELETE triggers continue to pass their literal op.
+    assert!(
+        upd_ddl.contains("reflex_build_delta_sql"),
+        "UPDATE trigger must still call reflex_build_delta_sql: {}",
+        &upd_ddl[..upd_ddl.len().min(800)]
+    );
+    // Find the build_delta_sql call site and inspect its op argument.
+    let call_idx = upd_ddl.find("reflex_build_delta_sql").unwrap();
+    let after_call = &upd_ddl[call_idx..];
+    assert!(
+        after_call.contains("_directional_op"),
+        "UPDATE trigger must pass _directional_op to reflex_build_delta_sql: {}",
+        &after_call[..after_call.len().min(400)]
+    );
+}
+
+#[test]
+fn test_ins_body_still_passes_literal_op() {
+    // INSERT and DELETE triggers are single-direction by construction and
+    // must NOT exercise the directional dispatch *logic* (no probe block,
+    // no assignment to _directional_op). The DECLARE section may carry the
+    // unused locals — that is a body_core artifact and harmless.
+    let ddls = build_trigger_ddls("orders");
+    let ins_ddl = &ddls[0];
+    let del_ddl = &ddls[1];
+    let ins_call_idx = ins_ddl.find("reflex_build_delta_sql").unwrap();
+    let ins_after_call = &ins_ddl[ins_call_idx..];
+    assert!(
+        ins_after_call.contains("'INSERT'"),
+        "INSERT trigger must pass 'INSERT' literal to reflex_build_delta_sql: {}",
+        &ins_after_call[..ins_after_call.len().min(400)]
+    );
+    assert!(
+        !ins_ddl.contains("_directional_op :="),
+        "INSERT trigger must NOT contain probe logic (_directional_op assignment): {}",
+        &ins_ddl[..ins_ddl.len().min(1000)]
+    );
+    let del_call_idx = del_ddl.find("reflex_build_delta_sql").unwrap();
+    let del_after_call = &del_ddl[del_call_idx..];
+    assert!(
+        del_after_call.contains("'DELETE'"),
+        "DELETE trigger must pass 'DELETE' literal to reflex_build_delta_sql: {}",
+        &del_after_call[..del_after_call.len().min(400)]
+    );
+    assert!(
+        !del_ddl.contains("_directional_op :="),
+        "DELETE trigger must NOT contain probe logic (_directional_op assignment): {}",
+        &del_ddl[..del_ddl.len().min(1000)]
+    );
+}
+
+#[test]
+fn test_upd_body_directional_probe_gated_on_relevant_columns() {
+    // The probe must be gated on `imv_relevant_columns[source]` having
+    // entries — the same gate used by the 1.4.5 filter-aware spurious-skip
+    // block. IMVs without that metadata (CTE-using, SELECT * passthrough)
+    // fall through to today's UPDATE path.
+    let ddls = build_trigger_ddls("orders");
+    let upd_ddl = &ddls[2];
+    assert!(
+        upd_ddl.contains("imv_relevant_columns"),
+        "UPDATE trigger probe must check imv_relevant_columns gate: {}",
+        &upd_ddl[..upd_ddl.len().min(2000)]
+    );
+}
+
+#[test]
+fn test_upd_body_directional_probe_uses_relevant_where_when_present() {
+    // When imv_relevant_where[source] is set, the probe must apply that
+    // WHERE clause to the transition tables. When empty/NULL, the probe
+    // checks raw transition-table non-emptiness.
+    let ddls = build_trigger_ddls("orders");
+    let upd_ddl = &ddls[2];
+    assert!(
+        upd_ddl.contains("imv_relevant_where"),
+        "UPDATE trigger probe must read imv_relevant_where: {}",
+        &upd_ddl[..upd_ddl.len().min(2000)]
+    );
+}
+
+#[test]
+fn test_upd_body_probe_after_filter_skip() {
+    // The directional probe must come AFTER the filter-aware spurious-skip
+    // block (which can CONTINUE the loop if NEW≡OLD post-filter). No
+    // point probing direction on a multiset we are about to skip entirely.
+    // We look for the assignment `_directional_op :=` (the probe code),
+    // not the DECLARE-section token.
+    let ddls = build_trigger_ddls("orders");
+    let upd_ddl = &ddls[2];
+    let skip_pos = upd_ddl
+        .find("EXCEPT ALL")
+        .expect("filter-skip block must appear in UPDATE DDL");
+    let probe_pos = upd_ddl
+        .find("_directional_op :=")
+        .expect("directional probe assignment must appear in UPDATE DDL");
+    assert!(
+        skip_pos < probe_pos,
+        "filter-skip block (EXCEPT ALL) must precede directional probe (_directional_op := …): \
+         skip at {} but probe at {}",
+        skip_pos,
+        probe_pos
+    );
+}

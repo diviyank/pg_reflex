@@ -452,6 +452,7 @@ mod tests {
     include!("tests/pg_test_1_2_0.rs");
     include!("tests/pg_test_no_sigabrt.rs");
     include!("tests/pg_test_search_path.rs");
+    include!("tests/pg_test_directional_dispatch.rs");
 }
 
 /// This module is required by `cargo pgrx test` invocations.
