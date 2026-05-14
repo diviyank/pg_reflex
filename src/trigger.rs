@@ -985,22 +985,31 @@ fn push_materialized_merge(
     ));
 }
 
-/// 1.4.5 — high-selectivity dispatch threshold. When the number of affected
-/// groups exceeds this fraction of the intermediate's row count, the trigger
-/// switches from MERGE-based incremental to TRUNCATE+rebuild ("full refresh
-/// of the IMV body").
+/// 2026-05-15 — high-selectivity dispatch threshold. When the number of
+/// affected groups exceeds this fraction of the intermediate's row count, the
+/// trigger switches from MERGE-based incremental to TRUNCATE+rebuild (full
+/// IMV-body refresh via `reflex_reconcile`).
 ///
-/// Rationale: at high selectivity, the per-row MERGE probe cost + the target
-/// DELETE/INSERT round-trip exceed the cost of a bulk INSERT into a freshly
-/// truncated table. The customer's 64 %-selectivity UPDATE on
-/// yse.ivm_sop_forecast_view spent 5.5 s on MERGE + 4.1 s on target ops vs
-/// 2-3 s for REFRESH MATERIALIZED VIEW on the same shape.
+/// History: 1.4.5 introduced this at 0.3 because reconcile (~14 s on
+/// SOP-forecast shape at the time) was faster than the broken incremental
+/// path (~17 s at 100K-affected dead-cleanup pathology, exposed in 2026-05-15).
 ///
-/// 0.3 is a conservative default (rebuilding at 30 % affected is breakeven
-/// or slightly worse than MERGE on small-target IMVs; clearly better on
-/// large ones). Operators can override per-IMV via the
-/// `reflex.wipe_threshold` GUC at session scope.
-const WIPE_THRESHOLD_DEFAULT: f64 = 0.3;
+/// 1.4.6 (Item α + ANALYZE fix) makes incremental fast at ALL reachable
+/// selectivities on the SOP-forecast shape:
+///
+/// | Selectivity | Incremental | reconcile (1.4.5) |
+/// |---:|---:|---:|
+/// | 11 % (20K) | ~620 ms  | ~17 s |
+/// | 33 % (60K) | ~1.3 s   | ~17 s |
+/// | 50 % (100K)| ~1.9 s   | ~17 s |
+/// | 78 % (140K)| ~2.9 s   | ~17 s |
+///
+/// Reconcile never wins on this shape post-α. Raising the default to 1.0
+/// effectively disables auto-dispatch — incremental always runs. For
+/// workloads where reconcile genuinely wins (the `rb.fcast` shape from the
+/// 1.4.4 journal had this property), operators can re-enable via
+/// `SET reflex.wipe_threshold = 0.3` at session or per-IMV scope.
+const WIPE_THRESHOLD_DEFAULT: f64 = 1.0;
 
 /// 1.4.5 — emit a DO block that dispatches between MERGE-incremental and
 /// TRUNCATE-rebuild based on runtime selectivity.

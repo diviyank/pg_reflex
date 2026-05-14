@@ -1,5 +1,66 @@
 # Changelog
 
+## [1.4.6] - 2026-05-15
+
+### Changed (performance)
+- **Directional UPDATE dispatch (Item α)**: the UPDATE trigger function body
+  now probes the OLD/NEW transition tables (gated on the IMV's
+  `imv_relevant_columns` metadata) and routes to
+  `reflex_build_delta_sql` with a *promoted* op:
+    * OLD empty post-filter, NEW has rows → `'INSERT'` (single-direction add)
+    * OLD has rows, NEW empty post-filter → `'DELETE'` (single-direction subtract)
+    * both have rows → `'UPDATE'` (today's UNION ALL path)
+
+  For OUT→IN filter flips (e.g., `UPDATE demand_planning SET status='validated'
+  WHERE id IN (…)` against a `WHERE status IN ('validated','current',…)`
+  IMV), the promotion drops the UNION ALL/outer-GROUP-BY scratch wrapper and
+  the wasted dead-cleanup DELETE that the `'UPDATE'` op would have emitted.
+  ~30 % wall-clock improvement on filter-flip UPDATEs at all scales.
+
+- **ANALYZE plan-guard (surfaced by Item α)**: TRUNCATE+INSERT inside the
+  trigger leaves `pg_class.reltuples` stale on the affected and intermediate
+  tables. The downstream dead-cleanup DELETE and target-sync EXISTS lookups
+  can pick pathological NestedLoop+SeqScan plans (measured 12+ minutes on
+  100K-row affected sets — surfaced by Item α removing the
+  WIPE_THRESHOLD escape hatch). Trigger codegen now emits ANALYZE on both
+  tables at the right points; ~200 ms cost total, restores Hash semi-join /
+  Index Scan plans.
+
+- **`WIPE_THRESHOLD_DEFAULT` 0.3 → 1.0 (Item δ)**: post-Item α, incremental
+  wins over reconcile at every reachable selectivity on the SOP-forecast
+  shape (11 %→78 % swept, incremental 0.6 s→2.9 s vs reconcile ~17 s).
+  Auto-dispatch to reconcile is effectively disabled by default. Operators
+  with workloads where reconcile genuinely wins (e.g. the `rb.fcast` shape
+  from the 1.4.4 journal) can re-enable via `SET reflex.wipe_threshold =
+  0.3` at session or per-IMV scope.
+
+### Benchmark (SOP-forecast, 1M source × 50 dem_plan, post-Items 1+5 baseline)
+
+| Operation                    | Pre-α    | Post-1.4.6 | Δ      |
+| ---------------------------- | -------: | ---------: | -----: |
+| Status pivot (no-op)         |   1.4 ms |     1.0 ms |  ~     |
+| OUT→IN 1 plan (~20K)         |   725 ms |    453 ms  | -37 %  |
+| OUT→IN 3 more (~60K)         |  1790 ms |   1258 ms  | -30 %  |
+| OUT→IN 5 more (~100K)        |  ~3500 ms|   2096 ms  | -40 %  |
+| Pure data UPDATE 1K rows     |  1900 ms |    380 ms  | -80 %  |
+| IN→OUT 1 plan (~20K)         |   502 ms |    641 ms  | +28 %* |
+| IN→OUT 5 plans (~100K)       |  ~17000 ms (reconcile) | 1755 ms | -90 % |
+
+\* IN→OUT 1-plan regresses ~140 ms — that is the ANALYZE-plan-guard cost
+on small workloads (~50 ms intermediate + ~50 ms affected + ~50 ms plan
+overhead). Cost is well amortized by the IN→OUT 5-plan improvement (15+ s
+saved) and the elimination of the dead-cleanup pathology.
+
+EXCEPT-ALL = 0 against fresh `REFRESH MATERIALIZED VIEW`-equivalent on the
+1M-row workload.
+
+### Migration
+Existing IMVs need their trigger functions re-emitted to pick up the
+directional probe and the new ANALYZE statements. The
+`pg_reflex--1.4.5--1.4.6.sql` migration file calls
+`reflex_rebuild_triggers` for each unique source table referenced by any
+enabled IMV.
+
 ## [1.4.5] - 2026-05-13
 
 ### Fixed
