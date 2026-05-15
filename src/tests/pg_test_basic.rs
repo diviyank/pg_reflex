@@ -1277,3 +1277,278 @@ fn pg_test_filter_aware_skip_status_in_select_does_not_skip() {
         "status in SELECT — skip must not fire",
     );
 }
+
+/// 1.4.6 — bulk INSERT correctness under SET reflex.wipe_threshold = 0.
+/// INSERT does NOT dispatch in 1.4.6 (the wasted-scratch regression on alp
+/// forced a revert), but this test still exercises the inline MERGE path
+/// against a multi-group bulk insert with the threshold knob in play —
+/// catches accidental wirings that re-enable dispatch on INSERT without
+/// fixing the scratch-cost problem.
+#[pg_test]
+fn pg_test_dispatch_insert_correctness() {
+    Spi::run("CREATE SCHEMA dins").expect("schema");
+    Spi::run("CREATE TABLE dins.parent (id BIGINT PRIMARY KEY, label TEXT NOT NULL)")
+        .expect("c parent");
+    Spi::run("CREATE TABLE dins.child (id BIGINT PRIMARY KEY, fk_id BIGINT NOT NULL, grp INT NOT NULL, qty INT NOT NULL)")
+        .expect("c child");
+    Spi::run("INSERT INTO dins.parent VALUES (1,'a'),(2,'b'),(3,'c')").expect("seed parent");
+    Spi::run(
+        "INSERT INTO dins.child VALUES \
+            (1,1,10,5),(2,1,10,3),(3,1,20,7), \
+            (4,2,10,2),(5,2,20,8)",
+    )
+    .expect("seed child");
+
+    crate::create_reflex_ivm(
+        "dins.kv",
+        "SELECT c.fk_id, c.grp, SUM(c.qty) AS total \
+         FROM dins.child c INNER JOIN dins.parent p ON p.id = c.fk_id \
+         GROUP BY c.fk_id, c.grp",
+        None,
+        None,
+        Some("IMMEDIATE"),
+        None,
+    );
+
+    Spi::run("SET reflex.wipe_threshold = '0'").expect("set threshold");
+
+    // Bulk INSERT that introduces new groups + adds to existing ones. With
+    // threshold=0 this MUST dispatch to reconcile via the dispatch DO block.
+    Spi::run(
+        "INSERT INTO dins.child VALUES \
+            (10,1,30,100),(11,2,30,200),(12,3,30,300),(13,3,40,400)",
+    )
+    .expect("bulk insert");
+
+    let fresh = "SELECT c.fk_id, c.grp, SUM(c.qty) AS total \
+                 FROM dins.child c INNER JOIN dins.parent p ON p.id = c.fk_id \
+                 GROUP BY c.fk_id, c.grp";
+    let mismatch: i64 = Spi::get_one(&format!(
+        "SELECT COUNT(*) FROM ( \
+            (SELECT * FROM dins.kv EXCEPT ALL SELECT * FROM ({fresh}) f) \
+            UNION ALL \
+            (SELECT * FROM ({fresh}) f2 EXCEPT ALL SELECT * FROM dins.kv) \
+         ) o"
+    ))
+    .expect("oracle")
+    .expect("v");
+    assert_eq!(
+        mismatch, 0,
+        "INSERT dispatched to reconcile must match fresh aggregate"
+    );
+}
+
+/// 1.4.6 — bulk DELETE correctness under SET reflex.wipe_threshold = 0
+/// (also exercises the dead-cleanup branch). DELETE does NOT dispatch in
+/// 1.4.6 (same wasted-scratch revert as INSERT) but the test stays useful
+/// as a regression guard if/when dispatch is re-enabled.
+#[pg_test]
+fn pg_test_dispatch_delete_correctness() {
+    Spi::run("CREATE SCHEMA ddel").expect("schema");
+    Spi::run("CREATE TABLE ddel.parent (id BIGINT PRIMARY KEY, label TEXT NOT NULL)")
+        .expect("c parent");
+    Spi::run("CREATE TABLE ddel.child (id BIGINT PRIMARY KEY, fk_id BIGINT NOT NULL, grp INT NOT NULL, qty INT NOT NULL)")
+        .expect("c child");
+    Spi::run("INSERT INTO ddel.parent VALUES (1,'a'),(2,'b')").expect("seed parent");
+    Spi::run(
+        "INSERT INTO ddel.child VALUES \
+            (1,1,10,5),(2,1,10,3),(3,1,20,7),(4,1,20,4), \
+            (5,2,10,2),(6,2,10,9),(7,2,20,8)",
+    )
+    .expect("seed child");
+
+    crate::create_reflex_ivm(
+        "ddel.kv",
+        "SELECT c.fk_id, c.grp, SUM(c.qty) AS total \
+         FROM ddel.child c INNER JOIN ddel.parent p ON p.id = c.fk_id \
+         GROUP BY c.fk_id, c.grp",
+        None,
+        None,
+        Some("IMMEDIATE"),
+        None,
+    );
+
+    Spi::run("SET reflex.wipe_threshold = '0'").expect("set threshold");
+
+    // Bulk DELETE that empties some groups entirely (dead-cleanup territory).
+    Spi::run("DELETE FROM ddel.child WHERE id IN (1, 2, 3, 4, 5)").expect("bulk delete");
+
+    let fresh = "SELECT c.fk_id, c.grp, SUM(c.qty) AS total \
+                 FROM ddel.child c INNER JOIN ddel.parent p ON p.id = c.fk_id \
+                 GROUP BY c.fk_id, c.grp";
+    let mismatch: i64 = Spi::get_one(&format!(
+        "SELECT COUNT(*) FROM ( \
+            (SELECT * FROM ddel.kv EXCEPT ALL SELECT * FROM ({fresh}) f) \
+            UNION ALL \
+            (SELECT * FROM ({fresh}) f2 EXCEPT ALL SELECT * FROM ddel.kv) \
+         ) o"
+    ))
+    .expect("oracle")
+    .expect("v");
+    assert_eq!(
+        mismatch, 0,
+        "DELETE dispatched to reconcile must match fresh aggregate"
+    );
+}
+
+/// 1.4.6 — per-IMV `wipe_threshold` column in `__reflex_ivm_reference`.
+/// When set, it overrides the GUC and the compiled default. Validates the
+/// precedence chain: per-IMV → GUC → compiled.
+#[pg_test]
+fn pg_test_per_imv_wipe_threshold_override() {
+    Spi::run("CREATE SCHEMA pit").expect("schema");
+    Spi::run("CREATE TABLE pit.parent (id BIGINT PRIMARY KEY, label TEXT NOT NULL)").expect("c");
+    Spi::run("CREATE TABLE pit.child (id BIGINT PRIMARY KEY, fk_id BIGINT NOT NULL, grp INT NOT NULL, qty INT NOT NULL)").expect("c");
+    Spi::run("INSERT INTO pit.parent VALUES (1,'a')").expect("seed");
+    Spi::run(
+        "INSERT INTO pit.child (id, fk_id, grp, qty) \
+         SELECT g, 1, g, 10 FROM generate_series(1, 50) g",
+    )
+    .expect("seed");
+
+    crate::create_reflex_ivm(
+        "pit.kv",
+        "SELECT c.fk_id, c.grp, SUM(c.qty) AS total \
+         FROM pit.child c INNER JOIN pit.parent p ON p.id = c.fk_id \
+         GROUP BY c.fk_id, c.grp",
+        None,
+        None,
+        Some("IMMEDIATE"),
+        None,
+    );
+
+    // Column must exist and default to NULL.
+    let pre_set: Option<f64> = Spi::get_one(
+        "SELECT wipe_threshold::FLOAT8 FROM public.__reflex_ivm_reference WHERE name='pit.kv'",
+    )
+    .expect("read threshold");
+    assert!(
+        pre_set.is_none(),
+        "per-IMV wipe_threshold must default to NULL"
+    );
+
+    // Helper installs the override.
+    let r: Option<&str> = Spi::get_one(
+        "SELECT public.reflex_set_wipe_threshold('pit.kv', 0::NUMERIC)",
+    )
+    .expect("setter");
+    assert!(r.is_some(), "reflex_set_wipe_threshold should return a status string");
+
+    let after_set: f64 = Spi::get_one(
+        "SELECT wipe_threshold::FLOAT8 FROM public.__reflex_ivm_reference WHERE name='pit.kv'",
+    )
+    .expect("read threshold")
+    .expect("v");
+    assert!(
+        after_set < 1e-9,
+        "per-IMV wipe_threshold must reflect what reflex_set_wipe_threshold wrote (got {})",
+        after_set
+    );
+
+    // Even with the GUC unset (or set high), the per-IMV 0 forces dispatch
+    // to reconcile on every non-empty delta. Correctness check below.
+    Spi::run("RESET reflex.wipe_threshold").ok();
+    Spi::run("UPDATE pit.child SET qty = qty + 100 WHERE id = 5").expect("update");
+
+    let fresh = "SELECT c.fk_id, c.grp, SUM(c.qty) AS total \
+                 FROM pit.child c INNER JOIN pit.parent p ON p.id = c.fk_id \
+                 GROUP BY c.fk_id, c.grp";
+    let mismatch: i64 = Spi::get_one(&format!(
+        "SELECT COUNT(*) FROM ( \
+            (SELECT * FROM pit.kv EXCEPT ALL SELECT * FROM ({fresh}) f) \
+            UNION ALL \
+            (SELECT * FROM ({fresh}) f2 EXCEPT ALL SELECT * FROM pit.kv) \
+         ) o"
+    ))
+    .expect("oracle")
+    .expect("v");
+    assert_eq!(
+        mismatch, 0,
+        "per-IMV-overridden dispatch path must preserve correctness"
+    );
+
+    // Clearing the override (NULL) and removing the GUC must fall back to
+    // the compiled default — incremental for a tiny single-row update.
+    let r: Option<&str> = Spi::get_one(
+        "SELECT public.reflex_set_wipe_threshold('pit.kv', NULL::NUMERIC)",
+    )
+    .expect("clear");
+    assert!(r.is_some());
+    let cleared: Option<f64> = Spi::get_one(
+        "SELECT wipe_threshold::FLOAT8 FROM public.__reflex_ivm_reference WHERE name='pit.kv'",
+    )
+    .expect("read");
+    assert!(cleared.is_none(), "NULL must clear per-IMV override");
+}
+
+/// 1.4.6 — migration robustness for IMVs whose `depends_on` entries are
+/// unqualified names referring to tables in a non-default schema. The
+/// 1.4.5→1.4.6 migration must resolve the schema via pg_class instead of
+/// the migrator's search_path.
+#[pg_test]
+fn pg_test_rebuild_triggers_resolves_unqualified_to_correct_schema() {
+    Spi::run("CREATE SCHEMA m17").expect("schema");
+    Spi::run("CREATE TABLE m17.t (id BIGINT PRIMARY KEY, grp INT NOT NULL, qty INT NOT NULL)")
+        .expect("c");
+    Spi::run("INSERT INTO m17.t VALUES (1, 10, 5), (2, 10, 3), (3, 20, 7)").expect("seed");
+
+    crate::create_reflex_ivm(
+        "m17.kv",
+        "SELECT grp, SUM(qty) AS total FROM m17.t GROUP BY grp",
+        None,
+        None,
+        Some("IMMEDIATE"),
+        None,
+    );
+
+    // Simulate the production miss: the registry row's depends_on is
+    // unqualified (1.4.4 IMVs frequently look like this).
+    Spi::run(
+        "UPDATE public.__reflex_ivm_reference \
+         SET depends_on = ARRAY['t'] \
+         WHERE name = 'm17.kv'",
+    )
+    .expect("set depends_on unqualified");
+
+    // Pretend the migrator runs under default search_path = public.
+    Spi::run("SET search_path = public").expect("set search_path");
+
+    // The rebuild must NOT raise — it must resolve `t` to `m17.t` via
+    // pg_class lookup (the only `t` table on the cluster in this test).
+    let r: Option<String> = Spi::get_one::<&str>(
+        "SELECT public.reflex_rebuild_triggers('t')",
+    )
+    .expect("call rebuild")
+    .map(|s| s.to_string());
+    assert!(
+        r.is_some(),
+        "reflex_rebuild_triggers must succeed on an unqualified name when \
+         pg_class has exactly one matching table"
+    );
+    let status = r.unwrap();
+    assert!(
+        !status.starts_with("ERROR"),
+        "reflex_rebuild_triggers must not error: {}",
+        status
+    );
+
+    // Reset the depends_on so downstream tests/operations work normally.
+    Spi::run(
+        "UPDATE public.__reflex_ivm_reference \
+         SET depends_on = ARRAY['m17.t'] \
+         WHERE name = 'm17.kv'",
+    )
+    .expect("restore depends_on");
+
+    Spi::run("SET search_path = public, m17").expect("reset");
+
+    // After rebuild, DML on m17.t must still flow through to m17.kv.
+    Spi::run("INSERT INTO m17.t VALUES (4, 10, 50)").expect("insert");
+    let v: i32 =
+        Spi::get_one("SELECT total::INT4 FROM m17.kv WHERE grp = 10").expect("q").expect("v");
+    assert_eq!(
+        v,
+        5 + 3 + 50,
+        "trigger rebuilt by unqualified name must still maintain the IMV"
+    );
+}

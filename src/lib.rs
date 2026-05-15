@@ -1,3 +1,4 @@
+use pgrx::datum::DatumWithOid;
 use pgrx::prelude::*;
 
 // Stub archive for `cargo test --lib` on Linux.
@@ -83,7 +84,14 @@ extension_sql!(
         flush_count BIGINT DEFAULT 0,
         last_error TEXT,
         flush_ms_history BIGINT[] DEFAULT ARRAY[]::BIGINT[],
-        ignored_sources TEXT[] DEFAULT ARRAY[]::TEXT[]
+        ignored_sources TEXT[] DEFAULT ARRAY[]::TEXT[],
+        -- 1.4.6 — per-IMV override of reflex.wipe_threshold (NULL = inherit
+        -- from session GUC, falls back to compiled default WIPE_THRESHOLD_DEFAULT).
+        -- Set via public.reflex_set_wipe_threshold(name, value). Operators
+        -- tune this when one IMV's shape diverges from the global default —
+        -- e.g. small-row-count IMVs where reconcile takes < 1 s and a low
+        -- threshold (0.10) accelerates moderate bulk operations.
+        wipe_threshold NUMERIC
     );
 
     -- Index on name for fast lookups
@@ -315,6 +323,54 @@ fn refresh_imv_depending_on(source: &str) -> &'static str {
 #[pg_extern]
 fn reflex_rebuild_imv(view_name: &str) -> &'static str {
     reconcile::reflex_reconcile(view_name)
+}
+
+/// 1.4.6 — set or clear the per-IMV wipe_threshold override. The dispatch
+/// DO block emitted by the trigger reads this value before the GUC
+/// reflex.wipe_threshold and the compiled default. Pass `value = NULL` to
+/// clear the override (fall back to GUC / compiled default).
+///
+/// Returns a status string with the new effective threshold for this IMV.
+#[pg_extern]
+fn reflex_set_wipe_threshold(view_name: &str, value: Option<pgrx::AnyNumeric>) -> String {
+    if let Err(msg) = validate_view_name(view_name) {
+        return msg.to_string();
+    }
+    let result: Result<u64, String> = Spi::connect_mut(|client| {
+        let n = client
+            .update(
+                "UPDATE public.__reflex_ivm_reference SET wipe_threshold = $1 WHERE name = $2",
+                None,
+                &[
+                    unsafe {
+                        DatumWithOid::new(value.clone(), PgBuiltInOids::NUMERICOID.oid().value())
+                    },
+                    unsafe {
+                        DatumWithOid::new(
+                            view_name.to_string(),
+                            PgBuiltInOids::TEXTOID.oid().value(),
+                        )
+                    },
+                ],
+            )
+            .map_err(|e| format!("update failed: {}", e))?
+            .len();
+        Ok(n as u64)
+    });
+    match result {
+        Ok(0) => format!(
+            "ERROR: IMV '{}' not found in __reflex_ivm_reference",
+            view_name
+        ),
+        Ok(_) => match value {
+            Some(v) => format!("OK — '{}' wipe_threshold set to {}", view_name, v),
+            None => format!(
+                "OK — '{}' wipe_threshold cleared (uses GUC/default)",
+                view_name
+            ),
+        },
+        Err(e) => format!("ERROR: {}", e),
+    }
 }
 
 extension_sql!(

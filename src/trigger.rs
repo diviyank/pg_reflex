@@ -995,7 +995,8 @@ fn push_materialized_merge(
 /// path (~17 s at 100K-affected dead-cleanup pathology, exposed in 2026-05-15).
 ///
 /// 1.4.6 (Item α + ANALYZE fix) makes incremental fast at ALL reachable
-/// selectivities on the SOP-forecast shape:
+/// selectivities on the SOP-forecast shape (1 M source × 50 dem_plan, ~200 K
+/// intermediate, 20 K rows per plan = 10 % per flip):
 ///
 /// | Selectivity | Incremental | reconcile (1.4.5) |
 /// |---:|---:|---:|
@@ -1004,12 +1005,25 @@ fn push_materialized_merge(
 /// | 50 % (100K)| ~1.9 s   | ~17 s |
 /// | 78 % (140K)| ~2.9 s   | ~17 s |
 ///
-/// Reconcile never wins on this shape post-α. Raising the default to 1.0
-/// effectively disables auto-dispatch — incremental always runs. For
-/// workloads where reconcile genuinely wins (the `rb.fcast` shape from the
-/// 1.4.4 journal had this property), operators can re-enable via
-/// `SET reflex.wipe_threshold = 0.3` at session or per-IMV scope.
-const WIPE_THRESHOLD_DEFAULT: f64 = 1.0;
+/// On that synthetic shape reconcile never wins. **But real db_clone shapes
+/// invert the proportions** (76 M source × 28 dem_plan, 7.7 M intermediate,
+/// 0.9–8.9 M rows per plan = 12–115 % per flip). On those shapes the
+/// per-row MERGE + target double-rewrite hits O(|affected| · log
+/// |intermediate|) and loses 2–8× to reconcile at high selectivity.
+///
+/// 1.4.6 lowers the default to 0.50, a compromise that:
+///   * Keeps small-mutation workloads (< 50 % of intermediate) on the
+///     incremental path — preserves the 60×-faster pure-data UPDATE case.
+///   * Dispatches catastrophic bulk flips (>= 50 % of intermediate) to
+///     reconcile, which on db_clone alp is ~2× faster than the bulk
+///     incremental path.
+///
+/// Per-IMV override via the `wipe_threshold` column in
+/// `__reflex_ivm_reference` (write via `reflex_set_wipe_threshold(name,
+/// value)`) is the right tool when this global default doesn't fit a
+/// specific IMV's shape — e.g. yse-style 419 K intermediate where the
+/// crossover is closer to 0.15.
+const WIPE_THRESHOLD_DEFAULT: f64 = 0.5;
 
 /// 1.4.5 — emit a DO block that dispatches between MERGE-incremental and
 /// TRUNCATE-rebuild based on runtime selectivity.
@@ -1061,20 +1075,26 @@ fn build_high_selectivity_dispatch_sql(
              _aff BIGINT;\n\
              _imm NUMERIC;\n\
              _thr NUMERIC;\n\
+             _per_imv NUMERIC;\n\
              _ratio NUMERIC;\n\
          BEGIN\n\
              SELECT count(*) INTO _aff FROM {affected};\n\
              SELECT GREATEST(reltuples::NUMERIC, 1.0) INTO _imm\n\
                  FROM pg_class WHERE oid = '{intermediate}'::regclass;\n\
-             _thr := COALESCE(current_setting('reflex.wipe_threshold', true)::NUMERIC, {default_thr});\n\
+             -- 1.4.6 precedence: per-IMV wipe_threshold column (operator\n\
+             -- override) → session GUC reflex.wipe_threshold → compiled\n\
+             -- default. Per-IMV is the right granularity when one extension\n\
+             -- instance serves IMVs with shape-divergent crossovers.\n\
+             SELECT wipe_threshold INTO _per_imv\n\
+                 FROM public.__reflex_ivm_reference WHERE name = '{view}';\n\
+             _thr := COALESCE(_per_imv, current_setting('reflex.wipe_threshold', true)::NUMERIC, {default_thr});\n\
              _ratio := _aff::NUMERIC / _imm;\n\
              IF _ratio >= _thr THEN\n\
-                 -- 1.4.5: high-selectivity path — delegate to reflex_reconcile,\n\
-                 -- which implements the optimized drop-index/bulk-INSERT/recreate-\n\
-                 -- index pattern. At >= {default_thr} selectivity the cost of the\n\
-                 -- standard MERGE + target double-rewrite exceeds the cost of a\n\
-                 -- full IMV rebuild; reconcile is REFRESH-MATERIALIZED-VIEW-shape\n\
-                 -- and minimizes per-row WAL/index overhead.\n\
+                 -- High-selectivity path — delegate to reflex_reconcile,\n\
+                 -- which implements the drop-index/bulk-INSERT/recreate-\n\
+                 -- index pattern. At >= threshold selectivity the cost of\n\
+                 -- the standard MERGE + target double-rewrite exceeds the\n\
+                 -- cost of a full IMV rebuild.\n\
                  RAISE DEBUG 'pg_reflex wipe: ratio=% thr=% — reconcile', _ratio, _thr;\n\
                  PERFORM public.reflex_reconcile('{view}');\n\
              ELSE\n\
@@ -1151,6 +1171,24 @@ fn push_materialized_merge_and_affected(
     // ~50 ms cost.
     stmts.push(format!("ANALYZE {}", affected_tbl));
 }
+
+/// 1.4.6 — like push_materialized_merge_and_affected but the MERGE is NOT
+/// pushed (returned instead). The dispatch DO block reads |affected| BEFORE
+/// the MERGE and decides between the MERGE-incremental path (which then runs
+/// the MERGE + ANALYZE intermediate + dead-cleanup + target sync) and the
+/// reflex_reconcile path (which throws the scratch/affected work away and
+/// rebuilds from source). The caller stores the returned merge SQL into
+/// `pending_dispatch` and lets the end-of-function target-sync block wrap
+/// it in a dispatch DO block via `build_high_selectivity_dispatch_sql`.
+///
+// (Reserved for a future revisit of dispatch on INSERT/DELETE paths — see
+// 2026-05-15 journal on dispatch wiring revert. The helper would push
+// scratch+affected without the MERGE so the dispatch DO block could read
+// |affected| before deciding incremental vs reconcile. The current revert
+// keeps INSERT/DELETE on the inline MERGE path; this helper is intentionally
+// unused but kept as a marker for the future refactor.)
+//
+// fn push_scratch_and_affected_for_dispatch(...) -> String { ... }
 
 /// Generates the SQL statements to apply a delta to an IMV.
 ///
@@ -1492,6 +1530,18 @@ pub fn reflex_build_delta_sql(
 
                 if let Some(ref cols) = grp_cols {
                     let select_expr = affected_groups_select(cols);
+                    // 1.4.6 attempt + revert: an earlier draft wired the
+                    // dispatch DO block into the grouped INSERT path so Item α's
+                    // promoted OUT→IN bulk flips could re-route to
+                    // reflex_reconcile. db_clone bench (2026-05-15) showed
+                    // this regresses badly: the scratch+affected fill for an
+                    // 8.9 M-row promoted INSERT is ~50–100 s on alp, and that
+                    // work is wasted when dispatch then picks reconcile (the
+                    // dispatch decision can only fire AFTER |affected| is
+                    // known). Result: A4 (OUT→IN 8.9 M) went 150 s → 264 s.
+                    // INSERT stays on the inline MERGE path until we have a
+                    // way to estimate scratch size before paying the fill —
+                    // see journal/2026-05-15_dispatch_wiring_revert.md.
                     push_materialized_merge_and_affected(
                         &mut stmts,
                         &scratch_tbl,
@@ -1519,6 +1569,12 @@ pub fn reflex_build_delta_sql(
 
                 let recompute_scope: Option<&str> = if let Some(ref cols) = grp_cols {
                     let select_expr = affected_groups_select(cols);
+                    // 1.4.6 attempt + revert: same wasted-scratch problem as
+                    // the INSERT branch above. Bulk DELETE-shape (Item α
+                    // IN→OUT promotion) pays ~50–100 s for scratch fill on
+                    // alp; the dispatch win when reconcile is cheaper is
+                    // smaller than the scratch overhead. Stay on the inline
+                    // MERGE + dead-cleanup path.
                     push_materialized_merge_and_affected(
                         &mut stmts,
                         &scratch_tbl,

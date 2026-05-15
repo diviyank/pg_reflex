@@ -1567,6 +1567,92 @@ fn test_passthrough_update_materializes_both_sides() {
     assert_no_transition_leaks(&sql, "passthrough UPDATE");
 }
 
+// 1.4.6 — the UPDATE path emits the high-selectivity dispatch DO block.
+// INSERT and DELETE intentionally stay on the inline MERGE path: an earlier
+// attempt to extend dispatch to those branches regressed bulk filter flips
+// on db_clone alp by ~70 % (the scratch-then-decide ordering wastes 50–100 s
+// of scratch fill on 8.9 M-row promoted directional flips when dispatch
+// then picks reconcile). See journal/2026-05-15_dispatch_wiring_revert.md
+// for the decision log and the next-step plan.
+#[test]
+fn test_dispatch_block_emitted_only_for_update() {
+    let plan = simple_plan();
+    let agg_json = serde_json::to_string(&plan).unwrap();
+    let base_q = "SELECT city, SUM(amount) AS \"__sum_amount\", COUNT(*) AS __ivm_count FROM orders GROUP BY city";
+    let end_q = "SELECT \"city\", COUNT(\"amount\") AS total FROM \"__reflex_intermediate_test_view\" WHERE __ivm_count > 0 GROUP BY \"city\"";
+
+    let sql_upd = reflex_build_delta_sql(
+        "test_view",
+        "orders",
+        "UPDATE",
+        base_q,
+        end_q,
+        Some(agg_json.as_str()),
+        base_q,
+    );
+    assert!(
+        sql_upd.contains("DO $reflex_dispatch$"),
+        "UPDATE must emit the dispatch DO block: {}",
+        &sql_upd[..sql_upd.len().min(2000)]
+    );
+    assert!(
+        sql_upd.contains("reflex_reconcile"),
+        "UPDATE dispatch block must reference reflex_reconcile: {}",
+        &sql_upd[..sql_upd.len().min(2000)]
+    );
+
+    for op in ["INSERT", "DELETE"].iter() {
+        let sql = reflex_build_delta_sql(
+            "test_view",
+            "orders",
+            op,
+            base_q,
+            end_q,
+            Some(agg_json.as_str()),
+            base_q,
+        );
+        assert!(
+            !sql.contains("DO $reflex_dispatch$"),
+            "op={} must NOT emit dispatch — wasted-scratch regression. \
+             If you re-enable, validate on benchmarks/bench_user_query_workloads_v3.sql \
+             against db_clone alp first.",
+            op,
+        );
+    }
+}
+
+// 1.4.6 — the UPDATE dispatch DO block must consult __reflex_ivm_reference
+// for the per-IMV wipe_threshold override before falling back to the GUC and
+// the compiled default. INSERT/DELETE intentionally stay off dispatch (see
+// test above), so we only assert this on UPDATE.
+#[test]
+fn test_update_dispatch_block_reads_per_imv_threshold_override() {
+    let plan = simple_plan();
+    let agg_json = serde_json::to_string(&plan).unwrap();
+    let base_q = "SELECT city, SUM(amount) AS \"__sum_amount\", COUNT(*) AS __ivm_count FROM orders GROUP BY city";
+    let end_q = "SELECT \"city\", COUNT(\"amount\") AS total FROM \"__reflex_intermediate_test_view\" WHERE __ivm_count > 0 GROUP BY \"city\"";
+    let sql = reflex_build_delta_sql(
+        "test_view",
+        "orders",
+        "UPDATE",
+        base_q,
+        end_q,
+        Some(agg_json.as_str()),
+        base_q,
+    );
+    assert!(
+        sql.contains("wipe_threshold"),
+        "UPDATE dispatch block must read wipe_threshold column from \
+         __reflex_ivm_reference: {}",
+        &sql[..sql.len().min(2000)]
+    );
+    assert!(
+        sql.contains("__reflex_ivm_reference"),
+        "UPDATE dispatch block must reference __reflex_ivm_reference: {}",
+        &sql[..sql.len().min(2000)]
+    );
+}
+
 /// Regression guard: the aggregate branch must also keep transition tables
 /// confined to sanctioned scratch-populate statements (Phase B's fix).
 ///
