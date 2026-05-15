@@ -446,6 +446,16 @@ pub fn build_trigger_ddls(source_table: &str) -> Vec<String> {
     // Promoting UPDATE → INSERT also drops the wasted dead-cleanup DELETE
     // (gated on op ∈ {DELETE, UPDATE} in trigger.rs) and the target DELETE on
     // OUT→IN flips finds 0 pre-existing rows for affected keys.
+    //
+    // 1.4.6 attempt + revert (2026-05-15): a draft promoted OUT→IN to
+    // 'INSERT_PROMOTED' so trigger.rs could replace MERGE with plain INSERT.
+    // The pg_test_directional_with_filter_flip_and_data_change_same_row
+    // integration test caught the safety hole: for single-source IMVs (and
+    // for any IMV where OTHER source rows share the affected group key) the
+    // intermediate is NOT empty for those group keys, and bulk INSERT
+    // produces duplicates. Safe re-enablement needs JOIN-mapping metadata so
+    // we can verify the trigger source's identity uniquely determines the
+    // group keys it touches. Deferred — see journal/2026-05-15_bulk_insert_revert.md.
     let directional_probe_for_update = format!(
         "_directional_op := 'UPDATE'; \
          IF _skip_cols IS NOT NULL AND _skip_cols <> '' THEN \

@@ -1189,6 +1189,25 @@ fn push_materialized_merge_and_affected(
 //         affected_tbl: &str, select_expr: &str,
 //     ) -> String { /* returns merge SQL; pushes scratch+affected fill */ }
 
+// 1.4.6 — bulk-INSERT fast path for Item α OUT→IN flips (attempted +
+// reverted same session). The idea: when the OUT→IN promotion fires, the
+// OLD transition is filter-rejected so the intermediate "ought to" have
+// zero rows for the affected group keys — letting us drop MERGE and the
+// target DELETE in favor of plain INSERTs.
+//
+// Why it was reverted: that precondition only holds when the trigger
+// source's identity uniquely determines the group keys it touches. For
+// single-source IMVs (and for any IMV where OTHER source rows already
+// contribute to the same group key), the intermediate IS non-empty for
+// those keys. pg_test_directional_with_filter_flip_and_data_change_same_row
+// caught a +4 EXCEPT ALL mismatch on the small-fixture single-source case.
+//
+// A safe re-enablement needs JOIN-mapping metadata stored on the
+// AggregationPlan: at create-time we'd identify which sources are
+// "JOIN-secondary with their PK mirrored into a GROUP BY column" (the
+// db_clone alp dim-flip shape) and only those sources get the bulk path.
+// Deferred — see journal/2026-05-15_bulk_insert_revert.md.
+
 /// Generates the SQL statements to apply a delta to an IMV.
 ///
 /// Called from plpgsql trigger wrappers. Returns a delimiter-separated string

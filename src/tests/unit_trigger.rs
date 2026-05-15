@@ -2039,3 +2039,30 @@ fn test_null_safe_in_no_unqualified_outer_column_anywhere() {
         }
     }
 }
+
+// 1.4.6 (attempted + reverted same session, 2026-05-15): an INSERT_PROMOTED
+// fast path for Item α OUT→IN flips was drafted to bypass MERGE in favor of
+// plain INSERT. Reverted after pg_test_directional_with_filter_flip_and_data_change_same_row
+// caught a correctness bug on single-source IMVs where the "no overlapping
+// keys" precondition does NOT hold (other rows in the same source can
+// already contribute to the same GROUP BY value). A safe re-enable needs
+// JOIN-secondary detection metadata. See journal/2026-05-15_bulk_insert_revert.md.
+//
+// The contract this revert preserves: Item α probe emits op='INSERT' (not
+// 'INSERT_PROMOTED') for OUT→IN, and the INSERT codegen stays on the MERGE
+// path — bytewise identical to v2 1.4.6.
+#[test]
+fn test_update_trigger_body_emits_insert_for_out_in_after_revert() {
+    let ddls = build_trigger_ddls("orders");
+    let combined = ddls.join("\n");
+    assert!(
+        !combined.contains("'INSERT_PROMOTED'"),
+        "INSERT_PROMOTED was reverted — must NOT appear in trigger body. Got: {}",
+        &combined[..combined.len().min(4000)]
+    );
+    assert!(
+        combined.contains("'INSERT'"),
+        "OUT→IN promotion must emit 'INSERT' op (standard MERGE path). Got: {}",
+        &combined[..combined.len().min(4000)]
+    );
+}
