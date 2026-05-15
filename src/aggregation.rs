@@ -118,6 +118,36 @@ pub struct AggregationPlan {
     /// build the EXCEPT ALL check.
     #[serde(default)]
     pub imv_relevant_where: std::collections::HashMap<String, String>,
+    /// 1.4.6 — per-source JOIN-key mapping for "safe bulk-INSERT/DELETE"
+    /// detection and pg_stats-based pre-scratch dispatch.
+    ///
+    /// Key: source table name (matches keys in `imv_relevant_columns`).
+    /// Value: list of `(intermediate_col, source_col)` pairs, derived from
+    /// the JOIN equalities where this source's column equals another
+    /// table's column AND that other column projects to a GROUP BY
+    /// column of the intermediate.
+    ///
+    /// Presence of an entry for source S means:
+    ///   * S is JOIN-secondary in the IMV's base_query (not the single
+    ///     source / not a "key owner" that's the natural producer of
+    ///     GROUP BY values).
+    ///   * The source columns listed *uniquely identify* a slice of the
+    ///     intermediate — no other rows in S can produce the same
+    ///     intermediate group keys — making Item α OUT→IN / IN→OUT
+    ///     promotion safe to short-circuit:
+    ///       - OUT→IN: scratch keys do not collide with existing
+    ///         intermediate rows → plain INSERT replaces MERGE.
+    ///       - IN→OUT: all intermediate rows for transition values can
+    ///         be DELETEd directly → skips the scratch-fill JOIN entirely.
+    ///   * pg_stats most_common_freqs on the intermediate's
+    ///     `intermediate_col` can be looked up to estimate affected rows
+    ///     pre-scratch for Path B dispatch.
+    ///
+    /// Empty / missing entry → source is treated as cardinality-driving
+    /// (fact or single-source key-owner) and stays on the standard MERGE
+    /// path. Safe fallback.
+    #[serde(default)]
+    pub source_join_keys: std::collections::HashMap<String, Vec<(String, String)>>,
 }
 
 impl AggregationPlan {
@@ -1180,6 +1210,9 @@ fn plan_aggregation_inner(analysis: &SqlAnalysis) -> AggregationPlan {
         output_column_order,
         imv_relevant_columns,
         imv_relevant_where: analysis.imv_relevant_where.clone(),
+        // Populated separately by `build_source_join_keys` in create_ivm
+        // after the plan is built — see the call site there.
+        source_join_keys: std::collections::HashMap::new(),
     }
 }
 

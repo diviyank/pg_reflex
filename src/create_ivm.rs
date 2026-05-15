@@ -775,6 +775,14 @@ pub(crate) fn create_reflex_ivm_impl(
         }
     }
 
+    // 1.4.6 — populate `source_join_keys` for aggregate plans. Identifies
+    // sources where Item α's directional promotion can short-circuit to
+    // bulk-INSERT (OUT→IN) or bulk-DELETE (IN→OUT) without per-row MERGE
+    // probing. See `build_source_join_keys` for the safety gates.
+    if !plan.is_passthrough && is_join_query {
+        build_source_join_keys(&mut plan, &real_sources, &analysis);
+    }
+
     // Warn about select columns that are neither GROUP BY nor recognized aggregates.
     // Note: passthrough columns not explicitly in GROUP BY are auto-added by plan_aggregation,
     // so we use the plan's group_by_columns (which includes auto-added ones) for validation.
@@ -1537,6 +1545,196 @@ fn build_passthrough_key_mappings(
     }
 }
 
+/// 1.4.6 — Build the per-source JOIN-key mapping for aggregate plans.
+///
+/// For each source in the IMV, find JOIN equalities where the source's
+/// column equals another table's column AND the other column projects to
+/// a GROUP BY column of the intermediate. Then, gate on:
+///   * **All** equalities involving the source map to a GROUP BY column
+///     (any partial mapping → unsafe, falls back to MERGE).
+///   * The mapped source columns cover a UNIQUE key of the source table
+///     (PK or unique index). Without a unique key, multiple source rows
+///     could share the JOIN-col values and collide in bulk-INSERT.
+///
+/// Sets `plan.source_join_keys[source] = Vec<(intermediate_col, source_col)>`
+/// only when both gates pass. Empty / missing entry → standard MERGE path.
+///
+/// Skipped for passthrough plans (they use `passthrough_key_mappings`).
+pub(crate) fn build_source_join_keys(
+    plan: &mut crate::aggregation::AggregationPlan,
+    sources: &[&String],
+    analysis: &crate::sql_analyzer::SqlAnalysis,
+) {
+    use std::collections::{HashMap, HashSet};
+
+    if plan.is_passthrough {
+        return;
+    }
+
+    // 1) Build the lowered set of GROUP BY column names and a target→expr
+    //    map so `parse_join_condition_mappings` can recognize "other side"
+    //    references whether they're bare (`dem_plan_id`) or qualified
+    //    (`sales_simulation.dem_plan_id`).
+    let group_by_lowercased: Vec<String> = plan
+        .group_by_columns
+        .iter()
+        .map(|c| normalized_column_name(c).to_lowercase())
+        .collect();
+    let group_by_set: HashSet<String> = group_by_lowercased.iter().cloned().collect();
+
+    let mut target_col_to_expr: HashMap<String, String> = HashMap::new();
+    for col in &analysis.select_columns {
+        let target_name = col.alias.as_deref().unwrap_or(&col.expr_sql);
+        let target_name = bare_column_name(target_name).to_lowercase();
+        if group_by_set.contains(&target_name) {
+            target_col_to_expr.insert(target_name, col.expr_sql.to_lowercase());
+        }
+    }
+
+    // 2) For each source, parse its JOIN equalities and collect mappings.
+    //    Track partial-mapping cases so we can refuse those (`covered_partially`).
+    for source in sources {
+        let source_str = source.as_str();
+
+        let mut all_mappings: Vec<(String, String)> = Vec::new();
+        let mut all_equalities_count: usize = 0;
+        for join in &analysis.joins {
+            if let Some(ref cond) = join.condition_sql {
+                let n_eq =
+                    count_equalities_involving_source(cond, source_str, &analysis.table_aliases);
+                if n_eq == 0 {
+                    continue;
+                }
+                all_equalities_count += n_eq;
+                let join_mappings = parse_join_condition_mappings(
+                    cond,
+                    source_str,
+                    &analysis.table_aliases,
+                    &group_by_lowercased,
+                    &target_col_to_expr,
+                );
+                all_mappings.extend(join_mappings);
+            }
+        }
+
+        if all_mappings.is_empty() || all_equalities_count == 0 {
+            continue;
+        }
+
+        // Dedup mappings before counting coverage.
+        all_mappings.sort();
+        all_mappings.dedup();
+
+        // Gate A: every JOIN equality involving the source must map to a
+        // GROUP BY column. Partial mappings (some equality components map,
+        // others don't) leave un-pinned dimensions on the source side, so
+        // a single source row's identity doesn't fully determine its
+        // intermediate group keys → bulk path unsafe.
+        if all_mappings.len() < all_equalities_count {
+            continue;
+        }
+
+        // Gate B: the source-side columns of the mapping must cover a
+        // UNIQUE key on the source table. Otherwise multiple source rows
+        // can produce the same mapped values, breaking the "transition row
+        // uniquely identifies a slice of intermediate" assumption.
+        let source_cols: Vec<String> = all_mappings.iter().map(|(_, sc)| sc.clone()).collect();
+        if !source_cols_cover_unique_key(source_str, &source_cols) {
+            continue;
+        }
+
+        plan.source_join_keys
+            .insert(source_str.to_string(), all_mappings);
+    }
+}
+
+/// Count how many "x = y" equalities in a JOIN ON clause reference
+/// `source_table` on one side. Conservative — only counts top-level
+/// AND-joined equality predicates (the same shape
+/// `parse_join_condition_mappings` understands). Stand-alone helper so
+/// the safety gate ("did all equalities map?") can compare against a
+/// concrete denominator.
+pub(crate) fn count_equalities_involving_source(
+    condition: &str,
+    source_table: &str,
+    table_aliases: &std::collections::HashMap<String, String>,
+) -> usize {
+    let source_lower = source_table.to_lowercase();
+    let source_bare = bare_column_name(source_table).to_lowercase();
+    let source_aliases: Vec<String> = table_aliases
+        .iter()
+        .filter(|(_, table)| table.to_lowercase() == source_lower)
+        .map(|(alias, _)| alias.to_lowercase())
+        .collect();
+
+    let mut count = 0;
+    // Case-insensitive AND split: lowercase first, split once. Avoids the
+    // double-iteration footgun that existed in the legacy
+    // `parse_join_condition_mappings` (now fixed).
+    let condition_lower = condition.to_lowercase();
+    for part in condition_lower.split(" and ") {
+        let part = part.trim();
+        let sides: Vec<&str> = part.splitn(2, '=').collect();
+        if sides.len() != 2 {
+            continue;
+        }
+        let left = sides[0].trim();
+        let right = sides[1].trim();
+        if is_from_table(left, &source_bare, &source_aliases)
+            || is_from_table(right, &source_bare, &source_aliases)
+        {
+            count += 1;
+        }
+    }
+    count
+}
+
+/// Query pg_catalog to confirm `cols` cover at least one UNIQUE/PK index
+/// on `source`. Returns `true` if any unique index has all of its columns
+/// contained in `cols` (case-insensitive). Falls back to `false` on any
+/// catalog access error — safe to refuse the bulk path on doubt.
+fn source_cols_cover_unique_key(source: &str, cols: &[String]) -> bool {
+    let (schema, name) = split_qualified_name(source);
+    let schema_str = schema.unwrap_or("public");
+    let cols_lower: std::collections::HashSet<String> =
+        cols.iter().map(|c| c.to_lowercase()).collect();
+
+    let unique_indexes: Vec<Vec<String>> = Spi::connect(|client| {
+        client
+            .select(
+                "SELECT array_agg(a.attname::TEXT ORDER BY k.n) AS cols \
+                 FROM pg_index ix \
+                 JOIN pg_class t ON t.oid = ix.indrelid \
+                 JOIN pg_namespace n ON n.oid = t.relnamespace \
+                 JOIN LATERAL unnest(ix.indkey) WITH ORDINALITY AS k(col, n) ON true \
+                 JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = k.col \
+                 WHERE n.nspname = $1 AND t.relname = $2 AND ix.indisunique \
+                 GROUP BY ix.indexrelid",
+                None,
+                &[
+                    unsafe {
+                        DatumWithOid::new(
+                            schema_str.to_string(),
+                            PgBuiltInOids::TEXTOID.oid().value(),
+                        )
+                    },
+                    unsafe {
+                        DatumWithOid::new(name.to_string(), PgBuiltInOids::TEXTOID.oid().value())
+                    },
+                ],
+            )
+            .unwrap_or_report()
+            .filter_map(|row| row.get_by_name::<Vec<String>, _>("cols").unwrap_or(None))
+            .collect()
+    });
+
+    unique_indexes.iter().any(|idx_cols| {
+        idx_cols
+            .iter()
+            .all(|c| cols_lower.contains(&c.to_lowercase()))
+    })
+}
+
 /// Parse a JOIN condition to extract column mappings between the key-owner table and a secondary table.
 ///
 /// For `s.product_id = p.id AND s.version = p.version`:
@@ -1564,15 +1762,20 @@ fn parse_join_condition_mappings(
     // Build reverse: for each key column, which expr_sql does it correspond to?
     // e.g., "product_id" → "s.product_id"
 
-    // Split condition by AND (case insensitive)
-    for part in condition.split(" AND ").chain(condition.split(" and ")) {
+    // Case-insensitive split on AND: lowercase the condition first, then split
+    // only on the lowercase form. The previous chain-of-two-splits formulation
+    // produced spurious whole-condition iterations when only one of "AND" /
+    // "and" was present in the source string (caught by
+    // pg_test_source_join_keys_skipped_when_composite_join_partial_map).
+    let condition_lower = condition.to_lowercase();
+    for part in condition_lower.split(" and ") {
         let part = part.trim();
         let sides: Vec<&str> = part.splitn(2, '=').collect();
         if sides.len() != 2 {
             continue;
         }
-        let left = sides[0].trim().to_lowercase();
-        let right = sides[1].trim().to_lowercase();
+        let left = sides[0].trim().to_string();
+        let right = sides[1].trim().to_string();
 
         // Determine which side belongs to the secondary table
         let (secondary_side, other_side) =
@@ -2221,3 +2424,7 @@ fn augment_column_types_from_query(base_query: &str, column_types: &mut HashMap<
         let _ = client.update(&format!("DROP VIEW IF EXISTS {}", tmp), None, &[]);
     });
 }
+
+#[cfg(test)]
+#[path = "tests/unit_create_ivm.rs"]
+mod tests;

@@ -403,6 +403,7 @@ fn plan_with_bool_or_of_is_not_null() -> AggregationPlan {
         output_column_order: vec![],
         imv_relevant_columns: std::collections::HashMap::new(),
         imv_relevant_where: std::collections::HashMap::new(),
+        source_join_keys: std::collections::HashMap::new(),
     }
 }
 
@@ -528,6 +529,7 @@ fn plan_with_sum_and_multiplied_coalesce() -> AggregationPlan {
         output_column_order: vec![],
         imv_relevant_columns: std::collections::HashMap::new(),
         imv_relevant_where: std::collections::HashMap::new(),
+        source_join_keys: std::collections::HashMap::new(),
     }
 }
 

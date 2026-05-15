@@ -30,6 +30,7 @@ fn simple_plan() -> AggregationPlan {
         output_column_order: vec![],
         imv_relevant_columns: std::collections::HashMap::new(),
         imv_relevant_where: std::collections::HashMap::new(),
+        source_join_keys: std::collections::HashMap::new(),
     }
 }
 
@@ -80,6 +81,7 @@ fn test_build_merge_min_add() {
         output_column_order: vec![],
         imv_relevant_columns: std::collections::HashMap::new(),
         imv_relevant_where: std::collections::HashMap::new(),
+        source_join_keys: std::collections::HashMap::new(),
     };
     let delta = "SELECT city, MIN(price) AS \"__min_price\", COUNT(*) AS __ivm_count FROM src GROUP BY city";
     let sql = build_merge_sql("intermediate", delta, &plan, DeltaOp::Add);
@@ -110,6 +112,7 @@ fn test_build_upsert_min_subtract_sets_null() {
         output_column_order: vec![],
         imv_relevant_columns: std::collections::HashMap::new(),
         imv_relevant_where: std::collections::HashMap::new(),
+        source_join_keys: std::collections::HashMap::new(),
     };
     let delta = "SELECT city, MIN(price) FROM src GROUP BY city";
     let sql = build_merge_sql("intermediate", delta, &plan, DeltaOp::Subtract);
@@ -149,6 +152,7 @@ fn test_min_max_recompute_sql() {
         output_column_order: vec![],
         imv_relevant_columns: std::collections::HashMap::new(),
         imv_relevant_where: std::collections::HashMap::new(),
+        source_join_keys: std::collections::HashMap::new(),
     };
     let orig_base = "SELECT city AS \"city\", MIN(price) AS \"__min_price\", SUM(amount) AS \"__sum_amount\", COUNT(*) AS __ivm_count FROM orders GROUP BY city";
     let sql = build_min_max_recompute_sql("intermediate", &plan, orig_base, None);
@@ -226,6 +230,7 @@ fn test_min_max_recompute_sql_handles_join_aliases() {
         output_column_order: vec![],
         imv_relevant_columns: std::collections::HashMap::new(),
         imv_relevant_where: std::collections::HashMap::new(),
+        source_join_keys: std::collections::HashMap::new(),
     };
     let orig_base = "SELECT s.product_id AS \"product_id\", SUM(CASE WHEN (caav.product_id IS NOT NULL) THEN 1 ELSE 0 END) AS \"__bool_or_caav_product_id_is_not_null_true_count\", COUNT(*) AS __ivm_count FROM sales_simulation s LEFT JOIN current_assortment_activity caav ON caav.product_id = s.product_id GROUP BY s.product_id";
     let sql = build_min_max_recompute_sql("intermediate", &plan, orig_base, None);
@@ -271,6 +276,7 @@ fn min_only_plan() -> AggregationPlan {
         output_column_order: vec![],
         imv_relevant_columns: std::collections::HashMap::new(),
         imv_relevant_where: std::collections::HashMap::new(),
+        source_join_keys: std::collections::HashMap::new(),
     }
 }
 
@@ -343,6 +349,7 @@ fn test_min_max_recompute_affected_filter_uses_multiple_group_columns() {
         output_column_order: vec![],
         imv_relevant_columns: std::collections::HashMap::new(),
         imv_relevant_where: std::collections::HashMap::new(),
+        source_join_keys: std::collections::HashMap::new(),
     };
     let orig_base = "SELECT region AS \"region\", product AS \"product\", MIN(price) AS \"__min_price\", COUNT(*) AS __ivm_count FROM orders GROUP BY region, product";
     let sql = build_min_max_recompute_sql(
@@ -391,6 +398,7 @@ fn test_min_max_recompute_skips_affected_filter_for_sentinel_plan() {
         output_column_order: vec![],
         imv_relevant_columns: std::collections::HashMap::new(),
         imv_relevant_where: std::collections::HashMap::new(),
+        source_join_keys: std::collections::HashMap::new(),
     };
     let orig_base = "SELECT MIN(price) AS \"__min_price\", COUNT(*) AS __ivm_count FROM orders";
     let sql = build_min_max_recompute_sql(
@@ -739,6 +747,7 @@ fn test_build_merge_count_distinct_nullable_uses_null_safe_join() {
         output_column_order: vec![],
         imv_relevant_columns: std::collections::HashMap::new(),
         imv_relevant_where: std::collections::HashMap::new(),
+        source_join_keys: std::collections::HashMap::new(),
     };
     let delta = "SELECT grp, maybe_null, COUNT(*) AS __ivm_count FROM src GROUP BY grp, maybe_null";
 
@@ -1109,6 +1118,7 @@ fn test_build_delta_sql_splice_injects_filter_before_group_by() {
         output_column_order: vec![],
         imv_relevant_columns: std::collections::HashMap::new(),
         imv_relevant_where: std::collections::HashMap::new(),
+        source_join_keys: std::collections::HashMap::new(),
     };
     let agg_json = serde_json::to_string(&plan).unwrap();
     let base_q =
@@ -1265,6 +1275,7 @@ fn test_build_delta_sql_splice_uses_distinct_projection_for_compound_key() {
         output_column_order: vec![],
         imv_relevant_columns: std::collections::HashMap::new(),
         imv_relevant_where: std::collections::HashMap::new(),
+        source_join_keys: std::collections::HashMap::new(),
     };
     let agg_json = serde_json::to_string(&plan).unwrap();
     let base_q =
@@ -1335,6 +1346,7 @@ fn test_build_merge_sql_bool_or_algebraic_subtract() {
         output_column_order: vec![],
         imv_relevant_columns: std::collections::HashMap::new(),
         imv_relevant_where: std::collections::HashMap::new(),
+        source_join_keys: std::collections::HashMap::new(),
     };
     let delta = "SELECT grp, SUM(CASE WHEN (flag) THEN 1 ELSE 0 END) AS \"__bool_or_flag_true_count\", SUM(CASE WHEN (flag) IS NOT NULL THEN 1 ELSE 0 END) AS \"__bool_or_flag_nonnull_count\", COUNT(*) AS __ivm_count FROM src GROUP BY grp";
     let sql = build_merge_sql("intermediate", delta, &plan, DeltaOp::Subtract);
@@ -1406,6 +1418,7 @@ fn test_build_delta_sql_bool_or_has_no_recompute() {
         output_column_order: vec![],
         imv_relevant_columns: std::collections::HashMap::new(),
         imv_relevant_where: std::collections::HashMap::new(),
+        source_join_keys: std::collections::HashMap::new(),
     };
     let agg_json = serde_json::to_string(&plan).unwrap();
     let base_q = "SELECT grp, SUM(CASE WHEN (flag) THEN 1 ELSE 0 END) AS \"__bool_or_flag_true_count\", SUM(CASE WHEN (flag) IS NOT NULL THEN 1 ELSE 0 END) AS \"__bool_or_flag_nonnull_count\", COUNT(*) AS __ivm_count FROM t GROUP BY grp";
@@ -1450,6 +1463,7 @@ fn passthrough_plan(source: &str) -> AggregationPlan {
         output_column_order: vec![],
         imv_relevant_columns: std::collections::HashMap::new(),
         imv_relevant_where: std::collections::HashMap::new(),
+        source_join_keys: std::collections::HashMap::new(),
     }
 }
 
@@ -1861,6 +1875,7 @@ fn test_null_safe_in_handles_aliased_group_by_column() {
         output_column_order: vec![],
         imv_relevant_columns: std::collections::HashMap::new(),
         imv_relevant_where: std::collections::HashMap::new(),
+        source_join_keys: std::collections::HashMap::new(),
     };
     plan.group_by_aliases
         .insert("dp.id".to_string(), "dem_plan_id".to_string());

@@ -440,3 +440,198 @@ fn test_directional_multi_fire_sequence() {
 
     crate::drop_reflex_ivm("dd_seq_v");
 }
+
+// =============================================================================
+// 1.4.6 — source_join_keys metadata: the AggregationPlan must record
+// (intermediate_col, source_col) mappings ONLY for sources that pass both
+// safety gates (every JOIN equality maps to a GROUP BY column AND the
+// source-side mapping cols cover a UNIQUE key on the source table). Wiring
+// for bulk-INSERT/DELETE and Path B dispatch reads this metadata directly.
+// =============================================================================
+
+fn read_source_join_keys_from_ref(view_name: &str) -> serde_json::Value {
+    let q = format!(
+        "SELECT COALESCE(((aggregations::json)->'source_join_keys')::text, 'null') \
+         FROM public.__reflex_ivm_reference WHERE name = '{}'",
+        view_name.replace('\'', "''")
+    );
+    let s = Spi::get_one::<String>(&q)
+        .expect("read source_join_keys")
+        .unwrap_or_else(|| "null".to_string());
+    serde_json::from_str(&s).expect("parse source_join_keys json")
+}
+
+#[pg_test]
+fn test_source_join_keys_populated_for_dim_with_pk_in_group_by() {
+    // alp-style shape: fact JOIN dim ON fact.dim_id = dim.id (dim.id is PK,
+    // group_by includes dim_id projected from fact). Trigger source = dim →
+    // should appear in source_join_keys with mapping (dim_id, id).
+    Spi::run(
+        "CREATE TABLE sjk_fact (id INT PRIMARY KEY, dim_id INT, val BIGINT); \
+         CREATE TABLE sjk_dim (id INT PRIMARY KEY, status TEXT);",
+    )
+    .expect("create");
+    Spi::run(
+        "INSERT INTO sjk_fact VALUES (1, 10, 100), (2, 10, 200), (3, 20, 300); \
+         INSERT INTO sjk_dim VALUES (10, 'on'), (20, 'off');",
+    )
+    .expect("seed");
+    let result = crate::create_reflex_ivm(
+        "sjk_v",
+        "SELECT dim_id, SUM(val) AS s FROM sjk_fact \
+         INNER JOIN sjk_dim ON sjk_dim.id = sjk_fact.dim_id \
+         WHERE sjk_dim.status = 'on' GROUP BY dim_id",
+        None,
+        None,
+        None,
+        None,
+    );
+    assert!(!result.starts_with("ERROR"), "create: {}", result);
+
+    let sjk = read_source_join_keys_from_ref("sjk_v");
+    let map = sjk
+        .as_object()
+        .expect("source_join_keys should be a JSON object");
+    assert!(
+        map.contains_key("sjk_dim") || map.contains_key("public.sjk_dim"),
+        "sjk_dim should be in source_join_keys (PK-in-GROUP-BY shape). Got keys: {:?}",
+        map.keys().collect::<Vec<_>>()
+    );
+    let entries = map
+        .get("sjk_dim")
+        .or_else(|| map.get("public.sjk_dim"))
+        .and_then(|v| v.as_array())
+        .expect("sjk_dim mapping should be an array");
+    assert!(
+        !entries.is_empty(),
+        "sjk_dim mapping should not be empty: {:?}",
+        entries
+    );
+    // sjk_fact is the cardinality-driving primary FROM. Its JOIN equality
+    // maps to "id" which is NOT a group_by col — so it must NOT appear.
+    assert!(
+        !map.contains_key("sjk_fact") && !map.contains_key("public.sjk_fact"),
+        "sjk_fact (primary FROM) must NOT appear in source_join_keys. Got: {:?}",
+        map.keys().collect::<Vec<_>>()
+    );
+
+    crate::drop_reflex_ivm("sjk_v");
+    Spi::run("DROP TABLE sjk_fact; DROP TABLE sjk_dim;").expect("drop");
+}
+
+#[pg_test]
+fn test_source_join_keys_empty_for_single_source_imv() {
+    // No JOIN ⇒ no source_join_keys entries. Bulk path must stay disabled
+    // for these shapes (this is exactly the dd_combo precondition gap that
+    // forced the previous revert).
+    Spi::run(
+        "CREATE TABLE sjk_single (id INT PRIMARY KEY, city TEXT, amount BIGINT, status TEXT); \
+         INSERT INTO sjk_single VALUES (1, 'A', 10, 'on'), (2, 'A', 20, 'on');",
+    )
+    .expect("create+seed");
+    let result = crate::create_reflex_ivm(
+        "sjk_single_v",
+        "SELECT city, SUM(amount) AS s FROM sjk_single WHERE status = 'on' GROUP BY city",
+        None,
+        None,
+        None,
+        None,
+    );
+    assert!(!result.starts_with("ERROR"), "create: {}", result);
+
+    let sjk = read_source_join_keys_from_ref("sjk_single_v");
+    if let Some(map) = sjk.as_object() {
+        assert!(
+            map.is_empty(),
+            "single-source IMV must have empty source_join_keys, got: {:?}",
+            map
+        );
+    } // null or empty object are both acceptable.
+
+    crate::drop_reflex_ivm("sjk_single_v");
+    Spi::run("DROP TABLE sjk_single").expect("drop");
+}
+
+#[pg_test]
+fn test_source_join_keys_skipped_when_composite_join_partial_map() {
+    // pricing-style shape: composite JOIN on (assortment_id, product_id)
+    // but only product_id is in group_by. The PK on the secondary
+    // (sjk_partial_dim) is composite (a, b) — only `b` would map. Result:
+    // safety gate refuses the mapping → no entry.
+    Spi::run(
+        "CREATE TABLE sjk_partial_fact (id INT PRIMARY KEY, a INT, b INT, val BIGINT); \
+         CREATE TABLE sjk_partial_dim (a INT, b INT, info TEXT, status TEXT, PRIMARY KEY (a, b));",
+    )
+    .expect("create");
+    Spi::run(
+        "INSERT INTO sjk_partial_fact VALUES (1, 1, 100, 50), (2, 1, 100, 60); \
+         INSERT INTO sjk_partial_dim VALUES (1, 100, 'x', 'on');",
+    )
+    .expect("seed");
+
+    // Only `b` is projected/group_by'd; `a` is NOT in the SELECT.
+    let result = crate::create_reflex_ivm(
+        "sjk_partial_v",
+        "SELECT sjk_partial_fact.b AS b, SUM(val) AS s FROM sjk_partial_fact \
+         INNER JOIN sjk_partial_dim d ON d.a = sjk_partial_fact.a AND d.b = sjk_partial_fact.b \
+         WHERE d.status = 'on' GROUP BY sjk_partial_fact.b",
+        None,
+        None,
+        None,
+        None,
+    );
+    assert!(!result.starts_with("ERROR"), "create: {}", result);
+
+    let sjk = read_source_join_keys_from_ref("sjk_partial_v");
+    if let Some(map) = sjk.as_object() {
+        assert!(
+            !map.contains_key("sjk_partial_dim") && !map.contains_key("public.sjk_partial_dim"),
+            "partial composite-mapping must NOT register the dim source. Got: {:?}",
+            map.keys().collect::<Vec<_>>()
+        );
+    }
+
+    crate::drop_reflex_ivm("sjk_partial_v");
+    Spi::run("DROP TABLE sjk_partial_fact; DROP TABLE sjk_partial_dim").expect("drop");
+}
+
+#[pg_test]
+fn test_source_join_keys_skipped_when_secondary_lacks_unique_key() {
+    // Secondary table has no PK / unique index → multiple secondary rows
+    // can share the JOIN col value → bulk path unsafe → no entry recorded.
+    Spi::run(
+        "CREATE TABLE sjk_nounique_fact (id INT PRIMARY KEY, dim_id INT, val BIGINT); \
+         CREATE TABLE sjk_nounique_dim (id INT, status TEXT);", // no PK
+    )
+    .expect("create");
+    Spi::run(
+        "INSERT INTO sjk_nounique_fact VALUES (1, 10, 100); \
+         INSERT INTO sjk_nounique_dim VALUES (10, 'on'), (10, 'on');", // duplicate id
+    )
+    .expect("seed");
+
+    let result = crate::create_reflex_ivm(
+        "sjk_nounique_v",
+        "SELECT dim_id, SUM(val) AS s FROM sjk_nounique_fact \
+         INNER JOIN sjk_nounique_dim ON sjk_nounique_dim.id = sjk_nounique_fact.dim_id \
+         WHERE sjk_nounique_dim.status = 'on' GROUP BY dim_id",
+        None,
+        None,
+        None,
+        None,
+    );
+    assert!(!result.starts_with("ERROR"), "create: {}", result);
+
+    let sjk = read_source_join_keys_from_ref("sjk_nounique_v");
+    if let Some(map) = sjk.as_object() {
+        assert!(
+            !map.contains_key("sjk_nounique_dim")
+                && !map.contains_key("public.sjk_nounique_dim"),
+            "dim with no UNIQUE key must NOT appear in source_join_keys. Got: {:?}",
+            map.keys().collect::<Vec<_>>()
+        );
+    }
+
+    crate::drop_reflex_ivm("sjk_nounique_v");
+    Spi::run("DROP TABLE sjk_nounique_fact; DROP TABLE sjk_nounique_dim").expect("drop");
+}
