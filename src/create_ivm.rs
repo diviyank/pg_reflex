@@ -2081,10 +2081,70 @@ pub(crate) fn reflex_rebuild_imv_metadata_impl(view_name: &str) -> String {
 /// Idempotent — `CREATE OR REPLACE` overwrites the existing function body
 /// without changing trigger identity.
 ///
+/// 1.4.6 — when `source_table` arrives unqualified (`'demand_planning'` from
+/// a legacy `depends_on` array), resolve the actual schema via `pg_class`
+/// instead of letting the DDL fall through to the caller's `search_path`.
+/// Without this, the 1.4.6 migration silently rebuilt triggers on
+/// `public.demand_planning` (which doesn't exist) when the real source was
+/// `alp.demand_planning`, then deferred-flush failures aborted every
+/// UPDATE in the session. If the bare name resolves to multiple schemas,
+/// return an error rather than guess.
+///
 /// Returns a status string.
 pub(crate) fn reflex_rebuild_triggers_impl(source_table: &str) -> String {
+    // Already schema-qualified: trust the caller.
+    let resolved = if source_table.contains('.') {
+        source_table.to_string()
+    } else {
+        // Bare name — resolve via pg_class. We restrict to ordinary tables
+        // and materialized views (the two source kinds pg_reflex supports).
+        let lookup = Spi::connect(|client| {
+            client
+                .select(
+                    "SELECT n.nspname::TEXT AS schema_name \
+                     FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+                     WHERE c.relname = $1 \
+                       AND c.relkind IN ('r', 'm', 'p', 'f') \
+                       AND n.nspname NOT IN ('pg_catalog', 'information_schema') \
+                     ORDER BY n.nspname",
+                    None,
+                    &[unsafe {
+                        DatumWithOid::new(
+                            source_table.to_string(),
+                            PgBuiltInOids::TEXTOID.oid().value(),
+                        )
+                    }],
+                )
+                .unwrap_or_report()
+                .filter_map(|row| {
+                    row.get_by_name::<&str, _>("schema_name")
+                        .unwrap_or(None)
+                        .map(|s| s.to_string())
+                })
+                .collect::<Vec<_>>()
+        });
+        match lookup.len() {
+            0 => {
+                return format!(
+                    "ERROR: source table '{}' not found in any user schema — \
+                     update __reflex_ivm_reference.depends_on with the qualified name",
+                    source_table
+                );
+            }
+            1 => format!("{}.{}", lookup[0], source_table),
+            _ => {
+                return format!(
+                    "ERROR: source name '{}' is ambiguous (found in schemas: {}); \
+                     update __reflex_ivm_reference.depends_on with the qualified name",
+                    source_table,
+                    lookup.join(", ")
+                );
+            }
+        }
+    };
+
     let result: Result<usize, String> = Spi::connect_mut(|client| {
-        let ddls = crate::schema_builder::build_trigger_ddls(source_table);
+        let ddls = crate::schema_builder::build_trigger_ddls(&resolved);
         for ddl in &ddls {
             client
                 .update(ddl, None, &[])
@@ -2093,10 +2153,7 @@ pub(crate) fn reflex_rebuild_triggers_impl(source_table: &str) -> String {
         Ok(ddls.len())
     });
     match result {
-        Ok(n) => format!(
-            "pg_reflex: rebuilt {} trigger DDL(s) for '{}'",
-            n, source_table
-        ),
+        Ok(n) => format!("pg_reflex: rebuilt {} trigger DDL(s) for '{}'", n, resolved),
         Err(e) => format!("ERROR: {}", e),
     }
 }
