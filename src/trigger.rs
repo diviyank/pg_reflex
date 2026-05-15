@@ -1172,23 +1172,22 @@ fn push_materialized_merge_and_affected(
     stmts.push(format!("ANALYZE {}", affected_tbl));
 }
 
-/// 1.4.6 — like push_materialized_merge_and_affected but the MERGE is NOT
-/// pushed (returned instead). The dispatch DO block reads |affected| BEFORE
-/// the MERGE and decides between the MERGE-incremental path (which then runs
-/// the MERGE + ANALYZE intermediate + dead-cleanup + target sync) and the
-/// reflex_reconcile path (which throws the scratch/affected work away and
-/// rebuilds from source). The caller stores the returned merge SQL into
-/// `pending_dispatch` and lets the end-of-function target-sync block wrap
-/// it in a dispatch DO block via `build_high_selectivity_dispatch_sql`.
-///
-// (Reserved for a future revisit of dispatch on INSERT/DELETE paths — see
-// 2026-05-15 journal on dispatch wiring revert. The helper would push
-// scratch+affected without the MERGE so the dispatch DO block could read
-// |affected| before deciding incremental vs reconcile. The current revert
-// keeps INSERT/DELETE on the inline MERGE path; this helper is intentionally
-// unused but kept as a marker for the future refactor.)
+// 1.4.6 — placeholder for a future revisit of dispatch on the INSERT and
+// DELETE codegen paths (currently UPDATE-only). The blocker is that any
+// dispatch decision needs |affected|, which requires scratch + affected
+// fill, which on the bulk-flip shapes that motivate dispatch is the
+// dominant cost being paid (50–100 s on alp 8.9 M rows). A future
+// implementation must estimate |affected| from cheaper signals (pg_stats
+// most_common_freqs on the JOIN key, or per-IMV calibrated cost) so the
+// decision can fire before scratch is built. See
+// journal/2026-05-15_dispatch_wiring_revert.md for the decision log.
 //
-// fn push_scratch_and_affected_for_dispatch(...) -> String { ... }
+// Signature sketch:
+//     fn push_scratch_and_affected_for_dispatch(
+//         stmts: &mut Vec<String>, scratch_tbl: &str, delta_query: &str,
+//         intermediate_tbl: &str, plan: &AggregationPlan, op: DeltaOp,
+//         affected_tbl: &str, select_expr: &str,
+//     ) -> String { /* returns merge SQL; pushes scratch+affected fill */ }
 
 /// Generates the SQL statements to apply a delta to an IMV.
 ///
