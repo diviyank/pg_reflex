@@ -1189,6 +1189,89 @@ fn push_materialized_merge_and_affected(
 //         affected_tbl: &str, select_expr: &str,
 //     ) -> String { /* returns merge SQL; pushes scratch+affected fill */ }
 
+/// 1.4.6 — bulk-DELETE path for Item α IN→OUT (and regular DELETE) on
+/// sources that have passed the `plan.source_join_keys` safety gate.
+///
+/// Pre-conditions (enforced by the caller):
+///   * Source has a mapping in `plan.source_join_keys` (every JOIN
+///     equality maps to a GROUP BY col AND the source side covers a
+///     UNIQUE key on the source). This guarantees the transition row's
+///     identity uniquely identifies a slice of intermediate.
+///   * end_query has no further GROUP BY — target rows are 1:1 with
+///     intermediate after filtering `__ivm_count > 0`. Without this,
+///     bulk DELETE on intermediate could leave target rows that should
+///     be recomputed instead of removed.
+///   * Source is not an outer-join secondary / not self-join (handled
+///     earlier in the function).
+///
+/// Emits two indexed DELETEs (intermediate + target) that scan only the
+/// transition rows against the leading column of the intermediate's
+/// composite unique index. Bypasses the scratch fill — which is the
+/// dominant cost (50-100 s) on bulk dim-flips like db_clone alp A4b.
+fn push_bulk_delete_via_transition(
+    stmts: &mut Vec<String>,
+    intermediate_tbl: &str,
+    target_qv: &str,
+    transition_tbl: &str,
+    mappings: &[(String, String)],
+    plan: &AggregationPlan,
+) {
+    let int_cols: Vec<String> = mappings
+        .iter()
+        .map(|(ic, _)| format!("\"{}\"", ic))
+        .collect();
+    let src_cols: Vec<String> = mappings
+        .iter()
+        .map(|(_, sc)| format!("\"{}\"", sc))
+        .collect();
+    let src_select = src_cols.join(", ");
+    let int_tuple = if int_cols.len() == 1 {
+        int_cols[0].clone()
+    } else {
+        format!("({})", int_cols.join(", "))
+    };
+
+    // 1) DELETE from intermediate — uses the leading-col index because the
+    // mapping always covers a unique key on the source which corresponds to
+    // a prefix of the intermediate's composite UNIQUE index.
+    stmts.push(format!(
+        "DELETE FROM {} WHERE {} IN (SELECT {} FROM \"{}\")",
+        intermediate_tbl, int_tuple, src_select, transition_tbl
+    ));
+
+    // 2) DELETE from target — translate intermediate cols to target cols via
+    // plan.group_by_columns position (target_group_columns mirrors that
+    // ordering with alias resolution applied).
+    let target_cols_all = target_group_columns(plan);
+    let mut target_tuple_cols: Vec<String> = Vec::with_capacity(mappings.len());
+    for (ic, _) in mappings {
+        if let Some(idx) = plan
+            .group_by_columns
+            .iter()
+            .position(|gb| normalized_column_name(gb) == *ic)
+        {
+            if let Some(tc) = target_cols_all.get(idx) {
+                target_tuple_cols.push(tc.clone());
+            }
+        }
+    }
+    if target_tuple_cols.len() == mappings.len() {
+        let tgt_tuple = if target_tuple_cols.len() == 1 {
+            target_tuple_cols[0].clone()
+        } else {
+            format!("({})", target_tuple_cols.join(", "))
+        };
+        stmts.push(format!(
+            "DELETE FROM {} WHERE {} IN (SELECT {} FROM \"{}\")",
+            target_qv, tgt_tuple, src_select, transition_tbl
+        ));
+    }
+
+    // 3) ANALYZE intermediate — like the MERGE path. Future trigger fires
+    // on this IMV want fresh stats on the row count.
+    stmts.push(format!("ANALYZE {}", intermediate_tbl));
+}
+
 /// 1.4.6 — bulk-INSERT path for Item α OUT→IN flips on sources that have
 /// passed the `plan.source_join_keys` safety gate.
 ///
@@ -1346,7 +1429,7 @@ pub fn reflex_build_delta_sql(
     // For FULL OUTER JOIN: ALL operations on BOTH tables need targeted reconcile,
     // because the FULL JOIN delta always includes unmatched rows from the other side.
     let is_outer_join_secondary = (is_outer_join_secondary_table
-        && (operation == "DELETE" || operation == "UPDATE"))
+        && (operation == "DELETE" || operation == "DELETE_PROMOTED" || operation == "UPDATE"))
         || (is_full_outer && !is_self_join);
 
     if is_self_join {
@@ -1625,8 +1708,56 @@ pub fn reflex_build_delta_sql(
                     );
                 }
             }
-            "DELETE" => {
+            "DELETE" | "DELETE_PROMOTED" => {
                 let delta_q = replace_source_with_transition(base_query, source_table, &old_tbl);
+
+                // Bulk-DELETE eligibility:
+                //   * Item α IN→OUT promotion (op = DELETE_PROMOTED) OR a
+                //     regular DELETE on a source that has the safety mapping.
+                //   * plan.source_join_keys has an entry for the trigger
+                //     source (JOIN-secondary, mapping covers a unique key
+                //     on the source).
+                //   * end_query has no further GROUP BY — target rows are
+                //     1:1 with intermediate. Without this, bulk-DELETE on
+                //     intermediate could leave target rows that should be
+                //     recomputed from surviving intermediate rows.
+                let end_q_has_gb = end_query.to_uppercase().contains("GROUP BY");
+                let bulk_delete_eligible = grp_cols.is_some()
+                    && plan.source_join_keys.contains_key(source_table)
+                    && !end_q_has_gb;
+
+                if bulk_delete_eligible {
+                    // Skip scratch fill entirely. Two indexed DELETEs
+                    // (intermediate + target) using the JOIN mapping
+                    // against the OLD transition table.
+                    let mappings = plan
+                        .source_join_keys
+                        .get(source_table)
+                        .expect("eligibility checked above");
+                    push_bulk_delete_via_transition(
+                        &mut stmts,
+                        &intermediate_tbl,
+                        &quote_identifier(view_name),
+                        &old_tbl,
+                        mappings,
+                        &plan,
+                    );
+                    stmts.push(format!(
+                        "UPDATE public.__reflex_ivm_reference SET last_update_date = NOW() \
+                         WHERE name = '{}' AND (last_update_date IS NULL OR last_update_date < NOW() - INTERVAL '1 second')",
+                        view_name.replace("'", "''")
+                    ));
+                    // Cache + return — no target sync needed (bulk-DELETE
+                    // already removed target rows).
+                    let result = stmts.join("\n--<<REFLEX_SEP>>--\n");
+                    if let Ok(mut guard) = delta_sql_cache().lock() {
+                        if guard.len() >= DELTA_SQL_CACHE_MAX {
+                            guard.clear();
+                        }
+                        guard.insert(cache_key, result.clone());
+                    }
+                    return result;
+                }
 
                 let recompute_scope: Option<&str> = if let Some(ref cols) = grp_cols {
                     let select_expr = affected_groups_select(cols);
@@ -1885,7 +2016,7 @@ pub fn reflex_build_delta_sql(
         let end_query_has_group_by = end_query.to_uppercase().contains("GROUP BY");
         let include_dead_cleanup = plan.needs_ivm_count
             && grp_cols.is_some()
-            && (operation == "DELETE" || operation == "UPDATE");
+            && matches!(operation, "DELETE" | "DELETE_PROMOTED" | "UPDATE");
         // 1.4.6 — Item α OUT→IN with the source_join_keys safety gate
         // satisfied: target had zero rows for the affected group keys
         // (OLD-side filter-rejected; bulk-INSERT branch above just added

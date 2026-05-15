@@ -2200,3 +2200,123 @@ fn test_regular_insert_still_uses_merge() {
         &sql[..sql.len().min(2000)]
     );
 }
+
+// =============================================================================
+// 1.4.6 — DELETE_PROMOTED / bulk-DELETE wiring.
+//
+// For Item α IN→OUT (and regular DELETE) on safety-gated sources: skip the
+// scratch fill JOIN, emit two indexed DELETEs (intermediate + target)
+// against transition_old via the source_join_keys mapping.
+// =============================================================================
+
+#[test]
+fn test_update_trigger_body_promotes_in_out_to_delete_promoted() {
+    let ddls = build_trigger_ddls("orders");
+    let combined = ddls.join("\n");
+    assert!(
+        combined.contains("'DELETE_PROMOTED'"),
+        "UPDATE trigger body must emit 'DELETE_PROMOTED' for Item α IN→OUT. Got: {}",
+        &combined[..combined.len().min(4000)]
+    );
+}
+
+#[test]
+fn test_delete_promoted_uses_bulk_delete_when_safety_gate_satisfied() {
+    let plan = plan_with_join_keys();
+    let agg_json = serde_json::to_string(&plan).unwrap();
+    let base_q = "SELECT city, SUM(amount) AS \"__sum_amount\", COUNT(*) AS __ivm_count FROM orders GROUP BY city";
+    let end_q = "SELECT \"city\", \"__sum_amount\" AS total FROM \"__reflex_intermediate_pv\" WHERE __ivm_count > 0";
+    let sql = reflex_build_delta_sql(
+        "pv",
+        "orders",
+        "DELETE_PROMOTED",
+        base_q,
+        end_q,
+        Some(agg_json.as_str()),
+        base_q,
+    );
+    // No MERGE, no scratch fill
+    assert!(
+        !sql.contains("MERGE INTO"),
+        "bulk-DELETE must NOT emit MERGE. Got: {}",
+        &sql[..sql.len().min(2000)]
+    );
+    assert!(
+        !sql.contains("__reflex_scratch_pv"),
+        "bulk-DELETE must NOT touch scratch table. Got: {}",
+        &sql[..sql.len().min(2000)]
+    );
+    // Indexed DELETE on intermediate, sourcing from transition_old
+    assert!(
+        sql.contains("DELETE FROM \"__reflex_intermediate_pv\" WHERE \"city\" IN (SELECT \"loc_id\" FROM \"__reflex_old_orders\")"),
+        "bulk-DELETE must emit indexed DELETE on intermediate. Got: {}",
+        &sql[..sql.len().min(2000)]
+    );
+    // Indexed DELETE on target
+    assert!(
+        sql.contains(
+            "DELETE FROM \"pv\" WHERE \"city\" IN (SELECT \"loc_id\" FROM \"__reflex_old_orders\")"
+        ),
+        "bulk-DELETE must emit indexed DELETE on target. Got: {}",
+        &sql[..sql.len().min(2000)]
+    );
+    // No dead-cleanup either (we removed rows directly)
+    assert!(
+        !sql.contains("__ivm_count <= 0"),
+        "bulk-DELETE must NOT emit dead-cleanup. Got: {}",
+        &sql[..sql.len().min(2000)]
+    );
+}
+
+#[test]
+fn test_delete_promoted_falls_back_to_merge_when_no_source_join_keys() {
+    let plan = simple_plan(); // empty source_join_keys
+    let agg_json = serde_json::to_string(&plan).unwrap();
+    let base_q = "SELECT city, SUM(amount) AS \"__sum_amount\", COUNT(*) AS __ivm_count FROM orders GROUP BY city";
+    let end_q = "SELECT \"city\", \"__sum_amount\" AS total FROM \"__reflex_intermediate_pv\" WHERE __ivm_count > 0";
+    let sql = reflex_build_delta_sql(
+        "pv",
+        "orders",
+        "DELETE_PROMOTED",
+        base_q,
+        end_q,
+        Some(agg_json.as_str()),
+        base_q,
+    );
+    // Falls back to standard DELETE path: MERGE Subtract + dead-cleanup + target sync.
+    assert!(
+        sql.contains("MERGE INTO"),
+        "DELETE_PROMOTED without source_join_keys must fall back to MERGE Subtract. Got: {}",
+        &sql[..sql.len().min(2000)]
+    );
+    assert!(
+        sql.contains("__ivm_count <= 0"),
+        "fallback path must still emit dead-cleanup. Got: {}",
+        &sql[..sql.len().min(2000)]
+    );
+}
+
+#[test]
+fn test_delete_promoted_falls_back_when_end_query_has_group_by() {
+    // Target rows aren't 1:1 with intermediate (further GROUP BY in end_query)
+    // → bulk-DELETE on intermediate could leave target rows stale.
+    let plan = plan_with_join_keys();
+    let agg_json = serde_json::to_string(&plan).unwrap();
+    let base_q = "SELECT city, SUM(amount) AS \"__sum_amount\", COUNT(*) AS __ivm_count FROM orders GROUP BY city";
+    let end_q = "SELECT \"region\", SUM(\"__sum_amount\") AS total FROM \"__reflex_intermediate_pv\" WHERE __ivm_count > 0 GROUP BY \"region\"";
+    let sql = reflex_build_delta_sql(
+        "pv",
+        "orders",
+        "DELETE_PROMOTED",
+        base_q,
+        end_q,
+        Some(agg_json.as_str()),
+        base_q,
+    );
+    // Must NOT take bulk path
+    assert!(
+        sql.contains("MERGE INTO"),
+        "DELETE_PROMOTED with end_query GROUP BY must fall back to MERGE. Got: {}",
+        &sql[..sql.len().min(2000)]
+    );
+}

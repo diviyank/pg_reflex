@@ -436,7 +436,10 @@ pub fn build_trigger_ddls(source_table: &str) -> Vec<String> {
     //     codegen checks plan.source_join_keys: if the source has a
     //     JOIN-secondary mapping to a GROUP BY column → bulk-INSERT path;
     //     otherwise → falls back to the standard MERGE path.)
-    //   * OLD has rows, NEW empty → 'DELETE' shape (single-direction sub).
+    //   * OLD has rows, NEW empty → 'DELETE_PROMOTED' (same gate: if the
+    //     safety mapping exists, trigger.rs uses bulk-DELETE — two
+    //     indexed DELETEs against transition_old, skipping the scratch
+    //     fill JOIN entirely; otherwise → falls back to MERGE Subtract).
     //   * both have rows          → 'UPDATE' (today's UNION ALL path).
     //
     // The INSERT/DELETE codegen paths read only one transition table by name;
@@ -461,7 +464,7 @@ pub fn build_trigger_ddls(source_table: &str) -> Vec<String> {
            IF (NOT _old_has) AND _new_has THEN \
              _directional_op := 'INSERT_PROMOTED'; \
            ELSIF _old_has AND (NOT _new_has) THEN \
-             _directional_op := 'DELETE'; \
+             _directional_op := 'DELETE_PROMOTED'; \
            END IF; \
          END IF;"
     );
