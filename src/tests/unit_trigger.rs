@@ -2296,6 +2296,61 @@ fn test_delete_promoted_falls_back_to_merge_when_no_source_join_keys() {
     );
 }
 
+// =============================================================================
+// 1.4.6 — Path B pre-scratch dispatch in the trigger function body.
+//
+// Before invoking reflex_build_delta_sql, the trigger function estimates
+// |transition rows| / |source reltuples|. If this exceeds the per-IMV /
+// session / compiled threshold, it dispatches to reflex_reconcile and
+// CONTINUEs to the next IMV — saving the entire scratch-fill cost on
+// genuinely sweeping mutations.
+// =============================================================================
+
+#[test]
+fn test_trigger_function_body_emits_path_b_dispatch() {
+    let ddls = build_trigger_ddls("orders");
+    let combined = ddls.join("\n");
+    // Three triggers (ins, del, upd) — each must carry the Path B block.
+    assert!(
+        combined.contains("Path B: dispatching"),
+        "trigger function body must emit Path B dispatch (look for the RAISE DEBUG marker). Got: {}",
+        &combined[..combined.len().min(4000)]
+    );
+    assert!(
+        combined.contains("PERFORM public.reflex_reconcile"),
+        "Path B block must call reflex_reconcile on dispatch. Got: {}",
+        &combined[..combined.len().min(4000)]
+    );
+    // EXCEPTION WHEN OTHERS THEN NULL is the safe-fallback guard for the
+    // pre-scratch dispatch — if any catalog query fails (source dropped,
+    // brand-new table without reltuples), we silently fall through to the
+    // standard codegen rather than aborting the trigger.
+    assert!(
+        combined.contains("EXCEPTION WHEN OTHERS THEN NULL"),
+        "Path B block must have a safe-fallback EXCEPTION handler. Got: {}",
+        &combined[..combined.len().min(4000)]
+    );
+}
+
+#[test]
+fn test_path_b_reads_per_imv_threshold_chain() {
+    let ddls = build_trigger_ddls("orders");
+    let combined = ddls.join("\n");
+    // The threshold chain mirrors the existing UPDATE post-scratch
+    // dispatch: per-IMV wipe_threshold column → reflex.wipe_threshold GUC
+    // → compiled default 0.5.
+    assert!(
+        combined.contains("SELECT wipe_threshold INTO _pre_per_imv"),
+        "Path B must read the per-IMV wipe_threshold column. Got: {}",
+        &combined[..combined.len().min(4000)]
+    );
+    assert!(
+        combined.contains("current_setting('reflex.wipe_threshold', true)::NUMERIC, 0.5"),
+        "Path B must fall through GUC then compiled default. Got: {}",
+        &combined[..combined.len().min(4000)]
+    );
+}
+
 #[test]
 fn test_delete_promoted_falls_back_when_end_query_has_group_by() {
     // Target rows aren't 1:1 with intermediate (further GROUP BY in end_query)

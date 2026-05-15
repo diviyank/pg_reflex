@@ -477,10 +477,32 @@ pub fn build_trigger_ddls(source_table: &str) -> Vec<String> {
     //     the IMV's filter (status flips out of whitelist → IMV must delete
     //     that row's contribution). {pred_check_block} substitutes the
     //     correct op-specific SQL.
+    //
+    // 1.4.6 — Path B pre-scratch dispatch.
+    //
+    // `_path_b_dispatch_block` runs AFTER the filter checks and the Item α
+    // directional probe but BEFORE the call to reflex_build_delta_sql. It
+    // estimates whether the volume of mutations (|transition| / |source|)
+    // is high enough that a full reconcile beats the standard incremental
+    // path's scratch fill. If the per-IMV `wipe_threshold` (or session GUC,
+    // or compiled default) is exceeded, we dispatch to reflex_reconcile
+    // and CONTINUE to the next IMV, skipping reflex_build_delta_sql
+    // entirely.
+    //
+    // Failure mode: any catalog or stats query failure (source dropped,
+    // missing reltuples, divide-by-zero on a brand-new table) falls
+    // through silently to the standard codegen — safe.
+    //
+    // Note: this fires BEFORE bulk-INSERT / bulk-DELETE in trigger.rs. For
+    // small dim flips (the alp A4 case at 1/28 = 3.6 %), the ratio is
+    // well below threshold → no dispatch → bulk path runs. For sweeping
+    // updates of the dim or fact (e.g., 40M out of 76M fact rows), the
+    // ratio clears threshold → reconcile is the cheaper choice.
     let body_core = format!(
         "DECLARE _rec RECORD; _sql TEXT; _stmt TEXT; _has_rows BOOLEAN; _pred_match BOOLEAN; \
                  _skip_cols TEXT; _skip_pred TEXT; _skip_pred_clause TEXT; _skip_sql TEXT; _filter_skip BOOLEAN; \
                  _old_has BOOLEAN; _new_has BOOLEAN; _directional_op TEXT; \
+                 _pre_trans_count BIGINT; _pre_src_total BIGINT; _pre_thr NUMERIC; _pre_per_imv NUMERIC; _pre_ratio NUMERIC; \
          BEGIN \
            SELECT EXISTS(SELECT 1 FROM \"{{transition_tbl}}\" LIMIT 1) INTO _has_rows; \
            IF NOT _has_rows THEN RETURN NULL; END IF; \
@@ -494,6 +516,20 @@ pub fn build_trigger_ddls(source_table: &str) -> Vec<String> {
              {{pred_check_block}} \
              {{filter_skip_block}} \
              {{directional_probe_block}} \
+             BEGIN \
+               SELECT reltuples::BIGINT INTO _pre_src_total FROM pg_class WHERE oid = '{source_table}'::regclass; \
+               IF _pre_src_total IS NOT NULL AND _pre_src_total >= 1000 THEN \
+                 EXECUTE format('SELECT count(*) FROM %I', '{{transition_tbl}}') INTO _pre_trans_count; \
+                 SELECT wipe_threshold INTO _pre_per_imv FROM public.__reflex_ivm_reference WHERE name = _rec.name; \
+                 _pre_thr := COALESCE(_pre_per_imv, current_setting('reflex.wipe_threshold', true)::NUMERIC, 0.5); \
+                 _pre_ratio := _pre_trans_count::NUMERIC / _pre_src_total; \
+                 IF _pre_ratio >= _pre_thr THEN \
+                   RAISE DEBUG 'pg_reflex Path B: dispatching % to reconcile (ratio=% thr=%)', _rec.name, _pre_ratio, _pre_thr; \
+                   PERFORM public.reflex_reconcile(_rec.name); \
+                   CONTINUE; \
+                 END IF; \
+               END IF; \
+             EXCEPTION WHEN OTHERS THEN NULL; END; \
              PERFORM pg_advisory_xact_lock(hashtext(_rec.name), hashtext(reverse(_rec.name))); \
              _sql := public.reflex_build_delta_sql(_rec.name, '{source_table}', {{op_value}}, _rec.base_query, _rec.end_query, _rec.aggregations, _rec.base_query); \
              IF _sql <> '' THEN \
