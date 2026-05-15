@@ -1189,24 +1189,45 @@ fn push_materialized_merge_and_affected(
 //         affected_tbl: &str, select_expr: &str,
 //     ) -> String { /* returns merge SQL; pushes scratch+affected fill */ }
 
-// 1.4.6 — bulk-INSERT fast path for Item α OUT→IN flips (attempted +
-// reverted same session). The idea: when the OUT→IN promotion fires, the
-// OLD transition is filter-rejected so the intermediate "ought to" have
-// zero rows for the affected group keys — letting us drop MERGE and the
-// target DELETE in favor of plain INSERTs.
-//
-// Why it was reverted: that precondition only holds when the trigger
-// source's identity uniquely determines the group keys it touches. For
-// single-source IMVs (and for any IMV where OTHER source rows already
-// contribute to the same group key), the intermediate IS non-empty for
-// those keys. pg_test_directional_with_filter_flip_and_data_change_same_row
-// caught a +4 EXCEPT ALL mismatch on the small-fixture single-source case.
-//
-// A safe re-enablement needs JOIN-mapping metadata stored on the
-// AggregationPlan: at create-time we'd identify which sources are
-// "JOIN-secondary with their PK mirrored into a GROUP BY column" (the
-// db_clone alp dim-flip shape) and only those sources get the bulk path.
-// Deferred — see journal/2026-05-15_bulk_insert_revert.md.
+/// 1.4.6 — bulk-INSERT path for Item α OUT→IN flips on sources that have
+/// passed the `plan.source_join_keys` safety gate.
+///
+/// Pre-condition (enforced by the caller via `plan.source_join_keys.contains`):
+/// the source is JOIN-secondary with all JOIN equalities mapping to GROUP
+/// BY columns AND those source columns cover a UNIQUE key on the source.
+/// Together with Item α's OUT→IN guarantee (OLD post-filter empty), this
+/// means the intermediate has zero rows for the group keys the scratch
+/// will produce — MERGE's per-row probe is wasted, a plain INSERT is
+/// correct.
+///
+/// Companion change in the target-sync block: the target DELETE on the
+/// affected keys is dropped (target had zero rows for those keys by the
+/// same reasoning).
+fn push_bulk_insert_and_affected(
+    stmts: &mut Vec<String>,
+    scratch_tbl: &str,
+    delta_query: &str,
+    intermediate_tbl: &str,
+    affected_tbl: &str,
+    select_expr: &str,
+) {
+    stmts.push(format!("TRUNCATE {}", affected_tbl));
+    stmts.push(format!("TRUNCATE {}", scratch_tbl));
+    stmts.push(format!("INSERT INTO {} {}", scratch_tbl, delta_query));
+    stmts.push(format!(
+        "INSERT INTO {} SELECT * FROM {}",
+        intermediate_tbl, scratch_tbl
+    ));
+    // Same reasoning as push_materialized_merge_and_affected: the
+    // intermediate just grew by ~|scratch| rows. The downstream target-sync
+    // INSERT joins on the composite UNIQUE index and needs accurate stats.
+    stmts.push(format!("ANALYZE {}", intermediate_tbl));
+    stmts.push(format!(
+        "INSERT INTO {} SELECT {} FROM {} AS __d",
+        affected_tbl, select_expr, scratch_tbl
+    ));
+    stmts.push(format!("ANALYZE {}", affected_tbl));
+}
 
 /// Generates the SQL statements to apply a delta to an IMV.
 ///
@@ -1543,35 +1564,57 @@ pub fn reflex_build_delta_sql(
             .any(|ic| ic.source_aggregate == "MIN" || ic.source_aggregate == "MAX");
 
         match operation {
-            "INSERT" => {
+            "INSERT" | "INSERT_PROMOTED" => {
                 let delta_q = replace_source_with_transition(base_query, source_table, &new_tbl);
+
+                // Bulk-INSERT eligibility:
+                //   * Item α promoted OUT→IN (op = INSERT_PROMOTED), AND
+                //   * plan.source_join_keys has an entry for the trigger
+                //     source → the source's identity uniquely determines
+                //     its slice of intermediate group keys; the OLD-side
+                //     was filter-rejected so those keys do not exist in
+                //     intermediate; plain INSERT is correct.
+                //
+                // Regular INSERT (op = INSERT) NEVER takes the bulk path —
+                // new fact rows can legitimately aggregate into existing
+                // groups, so MERGE is required.
+                let bulk_insert_eligible = operation == "INSERT_PROMOTED"
+                    && plan.source_join_keys.contains_key(source_table);
 
                 if let Some(ref cols) = grp_cols {
                     let select_expr = affected_groups_select(cols);
-                    // 1.4.6 attempt + revert: an earlier draft wired the
-                    // dispatch DO block into the grouped INSERT path so Item α's
-                    // promoted OUT→IN bulk flips could re-route to
-                    // reflex_reconcile. db_clone bench (2026-05-15) showed
-                    // this regresses badly: the scratch+affected fill for an
-                    // 8.9 M-row promoted INSERT is ~50–100 s on alp, and that
-                    // work is wasted when dispatch then picks reconcile (the
-                    // dispatch decision can only fire AFTER |affected| is
-                    // known). Result: A4 (OUT→IN 8.9 M) went 150 s → 264 s.
-                    // INSERT stays on the inline MERGE path until we have a
-                    // way to estimate scratch size before paying the fill —
-                    // see journal/2026-05-15_dispatch_wiring_revert.md.
-                    push_materialized_merge_and_affected(
-                        &mut stmts,
-                        &scratch_tbl,
-                        &delta_q,
-                        &intermediate_tbl,
-                        &plan,
-                        DeltaOp::Add,
-                        &affected_tbl,
-                        &select_expr,
-                        true,
-                    );
+                    if bulk_insert_eligible {
+                        push_bulk_insert_and_affected(
+                            &mut stmts,
+                            &scratch_tbl,
+                            &delta_q,
+                            &intermediate_tbl,
+                            &affected_tbl,
+                            &select_expr,
+                        );
+                    } else {
+                        // 1.4.6 attempt + revert (earlier in this same
+                        // session): an earlier draft wired the dispatch
+                        // DO block into the grouped INSERT path so Item α's
+                        // promoted bulk flips could re-route to reconcile.
+                        // Reverted because scratch-fill cost dominates;
+                        // see journal/2026-05-15_dispatch_wiring_revert.md.
+                        push_materialized_merge_and_affected(
+                            &mut stmts,
+                            &scratch_tbl,
+                            &delta_q,
+                            &intermediate_tbl,
+                            &plan,
+                            DeltaOp::Add,
+                            &affected_tbl,
+                            &select_expr,
+                            true,
+                        );
+                    }
                 } else {
+                    // Scalar IMV (no grouping). INSERT_PROMOTED degenerates
+                    // here — a one-row scalar intermediate is incompatible
+                    // with the "no overlap" guarantee. Stay on MERGE.
                     push_materialized_merge(
                         &mut stmts,
                         &scratch_tbl,
@@ -1843,6 +1886,14 @@ pub fn reflex_build_delta_sql(
         let include_dead_cleanup = plan.needs_ivm_count
             && grp_cols.is_some()
             && (operation == "DELETE" || operation == "UPDATE");
+        // 1.4.6 — Item α OUT→IN with the source_join_keys safety gate
+        // satisfied: target had zero rows for the affected group keys
+        // (OLD-side filter-rejected; bulk-INSERT branch above just added
+        // the first rows for those keys). The target DELETE is a
+        // guaranteed-zero-row scan; skip it.
+        let skip_target_delete = operation == "INSERT_PROMOTED"
+            && grp_cols.is_some()
+            && plan.source_join_keys.contains_key(source_table);
         let metadata_sql = format!(
             "UPDATE public.__reflex_ivm_reference SET last_update_date = NOW() \
              WHERE name = '{}' AND (last_update_date IS NULL OR last_update_date < NOW() - INTERVAL '1 second')",
@@ -1866,7 +1917,9 @@ pub fn reflex_build_delta_sql(
                         &tins,
                     ));
                 } else {
-                    stmts.push(tdel);
+                    if !skip_target_delete {
+                        stmts.push(tdel);
+                    }
                     stmts.push(tins);
                 }
             } else {
@@ -1908,7 +1961,9 @@ pub fn reflex_build_delta_sql(
                                 &tins,
                             ));
                         } else {
-                            stmts.push(tdel);
+                            if !skip_target_delete {
+                                stmts.push(tdel);
+                            }
                             stmts.push(tins);
                         }
                     }
@@ -1927,7 +1982,9 @@ pub fn reflex_build_delta_sql(
                                 &tins,
                             ));
                         } else {
-                            stmts.push(tdel);
+                            if !skip_target_delete {
+                                stmts.push(tdel);
+                            }
                             stmts.push(tins);
                         }
                     }
@@ -1993,7 +2050,9 @@ pub fn reflex_build_delta_sql(
                 if let Some(s) = dead_cleanup_sql {
                     stmts.push(s);
                 }
-                stmts.push(target_delete_sql);
+                if !skip_target_delete {
+                    stmts.push(target_delete_sql);
+                }
                 stmts.push(target_insert_sql);
             }
             stmts.push(metadata_sql);

@@ -432,9 +432,12 @@ pub fn build_trigger_ddls(source_table: &str) -> Vec<String> {
     // After filter-aware spurious-skip has decided the multisets differ, probe
     // each transition table for post-filter rows. The three outcomes route
     // the call to `reflex_build_delta_sql` with a *promoted* op:
-    //   * OLD empty, NEW has rows → 'INSERT' shape (single-direction add)
-    //   * OLD has rows, NEW empty → 'DELETE' shape (single-direction sub)
-    //   * both have rows          → 'UPDATE' (today's UNION ALL path)
+    //   * OLD empty, NEW has rows → 'INSERT_PROMOTED' (the trigger.rs
+    //     codegen checks plan.source_join_keys: if the source has a
+    //     JOIN-secondary mapping to a GROUP BY column → bulk-INSERT path;
+    //     otherwise → falls back to the standard MERGE path.)
+    //   * OLD has rows, NEW empty → 'DELETE' shape (single-direction sub).
+    //   * both have rows          → 'UPDATE' (today's UNION ALL path).
     //
     // The INSERT/DELETE codegen paths read only one transition table by name;
     // they remain visible from the UPDATE trigger's REFERENCING clauses.
@@ -443,19 +446,11 @@ pub fn build_trigger_ddls(source_table: &str) -> Vec<String> {
     // filter_skip_block above — same gate (`imv_relevant_columns[source]`
     // non-empty); same WHERE predicate.
     //
-    // Promoting UPDATE → INSERT also drops the wasted dead-cleanup DELETE
-    // (gated on op ∈ {DELETE, UPDATE} in trigger.rs) and the target DELETE on
-    // OUT→IN flips finds 0 pre-existing rows for affected keys.
-    //
-    // 1.4.6 attempt + revert (2026-05-15): a draft promoted OUT→IN to
-    // 'INSERT_PROMOTED' so trigger.rs could replace MERGE with plain INSERT.
-    // The pg_test_directional_with_filter_flip_and_data_change_same_row
-    // integration test caught the safety hole: for single-source IMVs (and
-    // for any IMV where OTHER source rows share the affected group key) the
-    // intermediate is NOT empty for those group keys, and bulk INSERT
-    // produces duplicates. Safe re-enablement needs JOIN-mapping metadata so
-    // we can verify the trigger source's identity uniquely determines the
-    // group keys it touches. Deferred — see journal/2026-05-15_bulk_insert_revert.md.
+    // The 'INSERT_PROMOTED' tag is what makes the bulk-INSERT branch
+    // selectable: trigger.rs ONLY considers the bulk path on this op
+    // string. Regular INSERT triggers (true source INSERTs, not Item α
+    // promotions) stay on op='INSERT' and always take MERGE because new
+    // fact rows can legitimately aggregate into existing groups.
     let directional_probe_for_update = format!(
         "_directional_op := 'UPDATE'; \
          IF _skip_cols IS NOT NULL AND _skip_cols <> '' THEN \
@@ -464,7 +459,7 @@ pub fn build_trigger_ddls(source_table: &str) -> Vec<String> {
            EXECUTE format('SELECT EXISTS(SELECT 1 FROM %I%s LIMIT 1)', \
                           '{ref_new}', _skip_pred_clause) INTO _new_has; \
            IF (NOT _old_has) AND _new_has THEN \
-             _directional_op := 'INSERT'; \
+             _directional_op := 'INSERT_PROMOTED'; \
            ELSIF _old_has AND (NOT _new_has) THEN \
              _directional_op := 'DELETE'; \
            END IF; \

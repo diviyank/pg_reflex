@@ -2055,29 +2055,148 @@ fn test_null_safe_in_no_unqualified_outer_column_anywhere() {
     }
 }
 
-// 1.4.6 (attempted + reverted same session, 2026-05-15): an INSERT_PROMOTED
-// fast path for Item α OUT→IN flips was drafted to bypass MERGE in favor of
-// plain INSERT. Reverted after pg_test_directional_with_filter_flip_and_data_change_same_row
-// caught a correctness bug on single-source IMVs where the "no overlapping
-// keys" precondition does NOT hold (other rows in the same source can
-// already contribute to the same GROUP BY value). A safe re-enable needs
-// JOIN-secondary detection metadata. See journal/2026-05-15_bulk_insert_revert.md.
+// =============================================================================
+// 1.4.6 — INSERT_PROMOTED fast path for Item α OUT→IN flips, gated on
+// `plan.source_join_keys` (the JOIN-mapping metadata that confirms the
+// trigger source's identity uniquely determines the affected intermediate
+// group keys). Re-enable of the earlier-reverted optimization, this time
+// with the safety gate that the dd_combo regression exposed.
 //
-// The contract this revert preserves: Item α probe emits op='INSERT' (not
-// 'INSERT_PROMOTED') for OUT→IN, and the INSERT codegen stays on the MERGE
-// path — bytewise identical to v2 1.4.6.
+// Contract:
+//   * UPDATE trigger body emits 'INSERT_PROMOTED' for OUT→IN.
+//   * reflex_build_delta_sql checks plan.source_join_keys.contains(source) —
+//     if YES → bulk INSERT + skip target DELETE.
+//     if NO  → fall back to MERGE (the standard INSERT path).
+//   * Regular INSERT triggers stay on op='INSERT' (no promotion).
+// =============================================================================
+
 #[test]
-fn test_update_trigger_body_emits_insert_for_out_in_after_revert() {
+fn test_update_trigger_body_promotes_out_in_to_insert_promoted() {
     let ddls = build_trigger_ddls("orders");
     let combined = ddls.join("\n");
     assert!(
-        !combined.contains("'INSERT_PROMOTED'"),
-        "INSERT_PROMOTED was reverted — must NOT appear in trigger body. Got: {}",
+        combined.contains("'INSERT_PROMOTED'"),
+        "UPDATE trigger body must emit 'INSERT_PROMOTED' for Item α OUT→IN. Got: {}",
         &combined[..combined.len().min(4000)]
     );
+    // DELETE promotion stays on op='DELETE' for now — bulk-DELETE wiring is
+    // a separate change.
     assert!(
-        combined.contains("'INSERT'"),
-        "OUT→IN promotion must emit 'INSERT' op (standard MERGE path). Got: {}",
+        combined.contains("'DELETE'"),
+        "UPDATE trigger body must still emit 'DELETE' for IN→OUT. Got: {}",
         &combined[..combined.len().min(4000)]
+    );
+}
+
+fn plan_with_join_keys() -> AggregationPlan {
+    let mut p = simple_plan();
+    // Pretend the IMV's source `orders` has a JOIN-secondary mapping to
+    // the intermediate's `city` GROUP BY column via source col `loc_id`.
+    let mut sjk = std::collections::HashMap::new();
+    sjk.insert(
+        "orders".to_string(),
+        vec![("city".to_string(), "loc_id".to_string())],
+    );
+    p.source_join_keys = sjk;
+    p
+}
+
+#[test]
+fn test_insert_promoted_uses_bulk_insert_when_source_join_keys_present() {
+    let plan = plan_with_join_keys();
+    let agg_json = serde_json::to_string(&plan).unwrap();
+    let base_q = "SELECT city, SUM(amount) AS \"__sum_amount\", COUNT(*) AS __ivm_count FROM orders GROUP BY city";
+    let end_q = "SELECT \"city\", \"__sum_amount\" AS total FROM \"__reflex_intermediate_pv\" WHERE __ivm_count > 0";
+    let sql = reflex_build_delta_sql(
+        "pv",
+        "orders",
+        "INSERT_PROMOTED",
+        base_q,
+        end_q,
+        Some(agg_json.as_str()),
+        base_q,
+    );
+    assert!(
+        !sql.contains("MERGE INTO"),
+        "INSERT_PROMOTED with source_join_keys must NOT emit MERGE. Got: {}",
+        &sql[..sql.len().min(2000)]
+    );
+    assert!(
+        sql.contains("INSERT INTO \"__reflex_intermediate_pv\""),
+        "bulk-INSERT must target the intermediate directly. Got: {}",
+        &sql[..sql.len().min(2000)]
+    );
+    assert!(
+        sql.contains("SELECT * FROM \"__reflex_scratch_pv\""),
+        "bulk-INSERT must source from scratch directly. Got: {}",
+        &sql[..sql.len().min(2000)]
+    );
+    assert!(
+        !sql.contains("DELETE FROM \"pv\""),
+        "INSERT_PROMOTED with safety gate satisfied must skip target DELETE. Got: {}",
+        &sql[..sql.len().min(2000)]
+    );
+    assert!(
+        sql.contains("INSERT INTO \"pv\""),
+        "INSERT_PROMOTED must still INSERT into target. Got: {}",
+        &sql[..sql.len().min(2000)]
+    );
+    // No dead-cleanup either (we only added rows).
+    assert!(
+        !sql.contains("__ivm_count <= 0"),
+        "INSERT_PROMOTED must not emit dead-cleanup DELETE. Got: {}",
+        &sql[..sql.len().min(2000)]
+    );
+}
+
+#[test]
+fn test_insert_promoted_falls_back_to_merge_when_no_source_join_keys() {
+    // Safety gate: no mapping → bulk-INSERT is unsafe → behave like the
+    // standard 'INSERT' path (MERGE + target DELETE+INSERT).
+    let plan = simple_plan(); // empty source_join_keys
+    let agg_json = serde_json::to_string(&plan).unwrap();
+    let base_q = "SELECT city, SUM(amount) AS \"__sum_amount\", COUNT(*) AS __ivm_count FROM orders GROUP BY city";
+    let end_q = "SELECT \"city\", \"__sum_amount\" AS total FROM \"__reflex_intermediate_pv\" WHERE __ivm_count > 0";
+    let sql = reflex_build_delta_sql(
+        "pv",
+        "orders",
+        "INSERT_PROMOTED",
+        base_q,
+        end_q,
+        Some(agg_json.as_str()),
+        base_q,
+    );
+    assert!(
+        sql.contains("MERGE INTO"),
+        "INSERT_PROMOTED without source_join_keys must fall back to MERGE. Got: {}",
+        &sql[..sql.len().min(2000)]
+    );
+    assert!(
+        sql.contains("DELETE FROM \"pv\""),
+        "fallback path must still emit target DELETE+INSERT. Got: {}",
+        &sql[..sql.len().min(2000)]
+    );
+}
+
+#[test]
+fn test_regular_insert_still_uses_merge() {
+    // op='INSERT' (not promoted) → always MERGE, regardless of metadata.
+    let plan = plan_with_join_keys();
+    let agg_json = serde_json::to_string(&plan).unwrap();
+    let base_q = "SELECT city, SUM(amount) AS \"__sum_amount\", COUNT(*) AS __ivm_count FROM orders GROUP BY city";
+    let end_q = "SELECT \"city\", \"__sum_amount\" AS total FROM \"__reflex_intermediate_pv\" WHERE __ivm_count > 0";
+    let sql = reflex_build_delta_sql(
+        "pv",
+        "orders",
+        "INSERT",
+        base_q,
+        end_q,
+        Some(agg_json.as_str()),
+        base_q,
+    );
+    assert!(
+        sql.contains("MERGE INTO"),
+        "Regular INSERT must keep MERGE — new fact rows may aggregate into existing groups. Got: {}",
+        &sql[..sql.len().min(2000)]
     );
 }
