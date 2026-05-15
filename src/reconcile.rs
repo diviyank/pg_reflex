@@ -263,16 +263,18 @@ pub(crate) fn reflex_reconcile(view_name: &str) -> &'static str {
                 client.update(idx_def, None, &[]).unwrap_or_report();
             }
 
-            // ANALYZE for query planner
+            // ANALYZE intermediate so the planner has stats for any
+            // subsequent incremental MERGE / dead-cleanup / target sync.
+            //
+            // 1.4.6 (P1) — target ANALYZE was 3-7 s on alp's 7.7 M-row IMV
+            // and contributed nothing: pg_reflex's own SQL never plans
+            // against the target (only end_query reads from it, and
+            // operator queries are out of scope). User analytic queries
+            // benefit from a separate ANALYZE if needed, but blocking the
+            // reconcile path on it is wasteful. autovacuum picks up the
+            // stats within a few minutes anyway.
             client
                 .update(&format!("ANALYZE {}", intermediate), None, &[])
-                .unwrap_or_report();
-            client
-                .update(
-                    &format!("ANALYZE {}", quote_identifier(view_name)),
-                    None,
-                    &[],
-                )
                 .unwrap_or_report();
         }
 
