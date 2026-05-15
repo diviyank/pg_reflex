@@ -18,7 +18,7 @@ pub(crate) fn reflex_reconcile(view_name: &str) -> &'static str {
     Spi::connect_mut(|client| {
         let rows = client
             .select(
-                "SELECT base_query, end_query, aggregations::text AS aggregations \
+                "SELECT base_query, end_query, aggregations \
                  FROM public.__reflex_ivm_reference WHERE name = $1 AND enabled = TRUE",
                 None,
                 &[unsafe {
@@ -126,18 +126,8 @@ pub(crate) fn reflex_reconcile(view_name: &str) -> &'static str {
                 )
                 .unwrap_or_report();
         } else {
-            // Aggregate: rebuild intermediate via CTAS+rename, target via
-            // TRUNCATE+INSERT.
-            //
-            // The intermediate is internal — no user-visible triggers, FKs,
-            // or grants — so DROP+RENAME of its heap is safe. CTAS gives PG
-            // the bulkload write path and avoids the "empty-table visible
-            // to readers" window of TRUNCATE+INSERT.
-            //
-            // The target table carries user grants, the user's analytic
-            // queries, and (critically) pg_reflex's own propagation
-            // triggers for chained IMVs. DROP+RENAME would lose all three.
-            // Keep TRUNCATE+INSERT for it.
+            // Aggregate: rebuild intermediate + target
+            // Drop pg_reflex-managed indexes first for faster bulk insert
             let plan: aggregation::AggregationPlan = serde_json::from_str(&agg_json)
                 .unwrap_or_else(|_| aggregation::AggregationPlan {
                     group_by_columns: vec![],
@@ -160,120 +150,51 @@ pub(crate) fn reflex_reconcile(view_name: &str) -> &'static str {
 
             let intermediate = intermediate_table_name(view_name);
             let (_, bare_view) = split_qualified_name(view_name);
-            let int_bare = safe_identifier(&format!("__reflex_intermediate_{}", bare_view));
             let int_unquoted = intermediate.replace('"', "");
             let (int_schema, _) = split_qualified_name(&int_unquoted);
             let int_schema_str = int_schema.unwrap_or("public");
 
-            let (tgt_schema, tgt_name) = split_qualified_name(view_name);
-            let tgt_schema_str = tgt_schema.unwrap_or("public");
-
-            // Probe intermediate persistence + owner so the new heap matches.
-            // relpersistence: 'p' = permanent (logged), 'u' = unlogged.
-            let int_logged: bool = client
+            // Collect and drop reflex-managed indexes on intermediate table
+            let int_indexes: Vec<String> = client
                 .select(
-                    "SELECT relpersistence::TEXT FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
-                     WHERE n.nspname = $1 AND c.relname = $2",
+                    "SELECT indexname FROM pg_indexes WHERE schemaname = $1 AND tablename = $2",
                     None,
                     &[
-                        unsafe { DatumWithOid::new(int_schema_str.to_string(), PgBuiltInOids::TEXTOID.oid().value()) },
-                        unsafe { DatumWithOid::new(int_bare.clone(), PgBuiltInOids::TEXTOID.oid().value()) },
+                        unsafe {
+                            DatumWithOid::new(
+                                int_schema_str.to_string(),
+                                PgBuiltInOids::TEXTOID.oid().value(),
+                            )
+                        },
+                        unsafe {
+                            DatumWithOid::new(
+                                safe_identifier(&format!("__reflex_intermediate_{}", bare_view)),
+                                PgBuiltInOids::TEXTOID.oid().value(),
+                            )
+                        },
                     ],
                 )
                 .unwrap_or_report()
-                .next()
-                .and_then(|r| r.get_by_name::<&str, _>("relpersistence").unwrap_or(None).map(|s| s.to_string()))
-                .map(|p| p == "p")
-                .unwrap_or(false);
+                .filter_map(|row| {
+                    row.get_by_name::<&str, _>("indexname")
+                        .unwrap_or(None)
+                        .map(|s| s.to_string())
+                })
+                .collect();
 
-            let int_owner: Option<String> = client
-                .select(
-                    "SELECT pg_get_userbyid(c.relowner) AS owner FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
-                     WHERE n.nspname = $1 AND c.relname = $2",
-                    None,
-                    &[
-                        unsafe { DatumWithOid::new(int_schema_str.to_string(), PgBuiltInOids::TEXTOID.oid().value()) },
-                        unsafe { DatumWithOid::new(int_bare.clone(), PgBuiltInOids::TEXTOID.oid().value()) },
-                    ],
-                )
-                .unwrap_or_report()
-                .next()
-                .and_then(|r| r.get_by_name::<&str, _>("owner").unwrap_or(None).map(|s| s.to_string()));
-
-            // Temp name for the new intermediate heap.
-            let int_new_bare =
-                safe_identifier(&format!("__reflex_intermediate_{}_recon", bare_view));
-            let int_new_q = format!("\"{}\".\"{}\"", int_schema_str, int_new_bare);
-
-            // Cleanup any leftover _recon table from a prior interrupted run.
-            client
-                .update(
-                    &format!("DROP TABLE IF EXISTS {} CASCADE", int_new_q),
-                    None,
-                    &[],
-                )
-                .unwrap_or_report();
-
-            // === Phase A: rebuild intermediate via LIKE-copy + INSERT + atomic rename ===
-            //
-            // `CREATE TABLE ... AS base_query` would infer column types from
-            // the SELECT — for an AVG IMV with INTEGER source, the inferred
-            // `__sum_val` would be BIGINT, breaking the SUM/COUNT division
-            // in end_query (integer truncation). Use LIKE INCLUDING ALL so
-            // the new heap matches the old's explicit column types exactly,
-            // then populate via INSERT.
-            let create_int = if int_logged {
-                "CREATE TABLE"
-            } else {
-                "CREATE UNLOGGED TABLE"
-            };
-            client
-                .update(
-                    &format!(
-                        "{} {} (LIKE {} INCLUDING DEFAULTS INCLUDING CONSTRAINTS INCLUDING STORAGE INCLUDING STATISTICS) WITH (fillfactor=70)",
-                        create_int, int_new_q, intermediate
-                    ),
-                    None,
-                    &[],
-                )
-                .unwrap_or_report();
-            client
-                .update(
-                    &format!("INSERT INTO {} {}", int_new_q, base_query),
-                    None,
-                    &[],
-                )
-                .unwrap_or_report();
-            if let Some(owner) = &int_owner {
+            for idx in &int_indexes {
                 client
                     .update(
-                        &format!("ALTER TABLE {} OWNER TO \"{}\"", int_new_q, owner),
+                        &format!("DROP INDEX IF EXISTS \"{}\".\"{}\"", int_schema_str, idx),
                         None,
                         &[],
                     )
                     .unwrap_or_report();
             }
 
-            // Atomic swap: drop old heap, rename new heap to canonical name.
-            // Both happen in the same SPI transaction, so other backends see
-            // either the old table or the new one — never an empty/half-built
-            // state. The intra-swap DROP is suppressed by the
-            // reconcile_in_progress GUC so chained IMVs don't cascade-drop.
-            client
-                .update(&format!("DROP TABLE {} CASCADE", intermediate), None, &[])
-                .unwrap_or_report();
-            client
-                .update(
-                    &format!("ALTER TABLE {} RENAME TO \"{}\"", int_new_q, int_bare),
-                    None,
-                    &[],
-                )
-                .unwrap_or_report();
-
-            // === Phase B: target rebuild via TRUNCATE+INSERT ===
-            // Save all user-created target indexes (we drop them for bulk
-            // INSERT speed and recreate after). Reflex-managed ones are
-            // rebuilt from `build_indexes_ddl`.
+            // Collect ALL indexes on target table (save DDL for user-created ones)
+            let (tgt_schema, tgt_name) = split_qualified_name(view_name);
+            let tgt_schema_str = tgt_schema.unwrap_or("public");
             let tgt_saved_indexes: Vec<(String, String)> = client
                 .select(
                     "SELECT indexname, indexdef FROM pg_indexes WHERE schemaname = $1 AND tablename = $2",
@@ -304,6 +225,17 @@ pub(crate) fn reflex_reconcile(view_name: &str) -> &'static str {
                     .unwrap_or_report();
             }
 
+            // Bulk insert without indexes
+            client
+                .update(&format!("TRUNCATE {}", intermediate), None, &[])
+                .unwrap_or_report();
+            client
+                .update(
+                    &format!("INSERT INTO {} {}", intermediate, base_query),
+                    None,
+                    &[],
+                )
+                .unwrap_or_report();
             client
                 .update(
                     &format!("TRUNCATE {}", quote_identifier(view_name)),
@@ -319,16 +251,15 @@ pub(crate) fn reflex_reconcile(view_name: &str) -> &'static str {
                 )
                 .unwrap_or_report();
 
-            // === Phase C: rebuild indexes ===
-            // Reflex-managed indexes on both intermediate and target.
+            // Recreate reflex-managed indexes (hash index on intermediate + target indexes)
             for index_ddl in build_indexes_ddl(view_name, &plan) {
                 client.update(&index_ddl, None, &[]).unwrap_or_report();
             }
-            // User-created indexes on target — skip reflex-managed names
-            // already handled above.
+
+            // Recreate user-created indexes on target (skip reflex-managed ones already recreated above)
             for (idx_name, idx_def) in &tgt_saved_indexes {
                 if idx_name.starts_with("idx__reflex_") || idx_name.starts_with("__reflex_") {
-                    continue;
+                    continue; // Already handled by build_indexes_ddl
                 }
                 client.update(idx_def, None, &[]).unwrap_or_report();
             }
@@ -339,7 +270,10 @@ pub(crate) fn reflex_reconcile(view_name: &str) -> &'static str {
             // 1.4.6 (P1) — target ANALYZE was 3-7 s on alp's 7.7 M-row IMV
             // and contributed nothing: pg_reflex's own SQL never plans
             // against the target (only end_query reads from it, and
-            // operator queries are out of scope).
+            // operator queries are out of scope). User analytic queries
+            // benefit from a separate ANALYZE if needed, but blocking the
+            // reconcile path on it is wasteful. autovacuum picks up the
+            // stats within a few minutes anyway.
             client
                 .update(&format!("ANALYZE {}", intermediate), None, &[])
                 .unwrap_or_report();
