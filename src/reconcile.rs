@@ -18,7 +18,7 @@ pub(crate) fn reflex_reconcile(view_name: &str) -> &'static str {
     Spi::connect_mut(|client| {
         let rows = client
             .select(
-                "SELECT base_query, end_query, aggregations \
+                "SELECT base_query, end_query, aggregations::text AS aggregations \
                  FROM public.__reflex_ivm_reference WHERE name = $1 AND enabled = TRUE",
                 None,
                 &[unsafe {
