@@ -59,6 +59,26 @@
 ALTER TABLE public.__reflex_ivm_reference
     ADD COLUMN IF NOT EXISTS wipe_threshold NUMERIC;
 
+-- 1.4.6 — backfill source_join_keys metadata on every IMV. This unlocks
+-- bulk-INSERT (OUT→IN), bulk-DELETE (IN→OUT), and Path B pre-scratch
+-- dispatch for IMVs created on 1.4.5 or earlier.
+DO $$
+DECLARE
+    imv TEXT;
+    res TEXT;
+BEGIN
+    FOR imv IN SELECT name FROM public.__reflex_ivm_reference WHERE enabled = TRUE LOOP
+        BEGIN
+            res := public.reflex_rebuild_imv_metadata(imv);
+            IF res LIKE 'ERROR:%' THEN
+                RAISE NOTICE 'pg_reflex 1.4.6 migration: %', res;
+            END IF;
+        EXCEPTION WHEN OTHERS THEN
+            RAISE NOTICE 'pg_reflex 1.4.6 migration: could not rebuild metadata for %: %', imv, SQLERRM;
+        END;
+    END LOOP;
+END $$;
+
 -- Items 1, 2, 4: re-emit triggers for every source. The schema-resolving
 -- rebuild from item 5 means unqualified `depends_on` entries are now safe.
 DO $$

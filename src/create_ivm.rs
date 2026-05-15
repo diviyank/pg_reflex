@@ -1591,14 +1591,35 @@ pub(crate) fn build_source_join_keys(
         }
     }
 
-    // 2) For each source, parse its JOIN equalities and collect mappings.
-    //    Track partial-mapping cases so we can refuse those (`covered_partially`).
+    // 2) For each source, look only at the JOIN that *introduces* this
+    //    source into the FROM clause — i.e. `analysis.joins[i]` with
+    //    target_table matching `source`. Other JOINs may reference this
+    //    source's columns incidentally (e.g. `pricing` joining on
+    //    `demand_planning.assortment_id`), but those say nothing about
+    //    THIS source's identity. Counting them inflates the
+    //    "all-equalities-mapped" denominator and spuriously refuses the
+    //    bulk path.
+    let source_bare_lc: std::collections::HashMap<&String, String> = sources
+        .iter()
+        .map(|s| (*s, bare_column_name(s).to_lowercase()))
+        .collect();
     for source in sources {
         let source_str = source.as_str();
+        let source_lc = source_str.to_lowercase();
+        let source_bare = source_bare_lc.get(source).cloned().unwrap_or_default();
 
         let mut all_mappings: Vec<(String, String)> = Vec::new();
         let mut all_equalities_count: usize = 0;
         for join in &analysis.joins {
+            let target_lc = join.target_table.to_lowercase();
+            let target_bare = bare_column_name(&join.target_table).to_lowercase();
+            let target_matches = target_lc == source_lc
+                || target_bare == source_bare
+                || target_lc == source_bare
+                || target_bare == source_lc;
+            if !target_matches {
+                continue;
+            }
             if let Some(ref cond) = join.condition_sql {
                 let n_eq =
                     count_equalities_involving_source(cond, source_str, &analysis.table_aliases);
@@ -2191,7 +2212,7 @@ pub(crate) fn reflex_rebuild_imv_metadata_impl(view_name: &str) -> String {
     if let Err(msg) = validate_view_name(view_name) {
         return msg.to_string();
     }
-    let result: Result<(usize, usize), String> = Spi::connect_mut(|client| {
+    let result: Result<(usize, usize, usize), String> = Spi::connect_mut(|client| {
         let rows = client
             .select(
                 "SELECT base_query FROM public.__reflex_ivm_reference \
@@ -2217,16 +2238,35 @@ pub(crate) fn reflex_rebuild_imv_metadata_impl(view_name: &str) -> String {
         let analysis =
             analyze(&parsed).map_err(|e: SqlAnalysisError| format!("analyze base_query: {}", e))?;
 
-        // Trigger codegen intersects with pg_attribute at fire time, so we
-        // don't need to filter the columns set here — the conservative
-        // over-attribution is harmless beyond a (probably-empty) cost of
-        // checking pg_attribute. See create_reflex_ivm comment.
-        let relevant_cols: std::collections::HashMap<String, Vec<String>> = analysis
-            .imv_relevant_columns
-            .iter()
-            .filter(|(s, _)| !s.starts_with('<'))
-            .map(|(s, set)| (s.clone(), set.iter().cloned().collect::<Vec<_>>()))
-            .collect();
+        // Ground analyzer output against the actual catalog shape. The
+        // analyzer attributes bare identifiers to every real source as a
+        // safe-correctness move; if we serialize that raw, the trigger's
+        // filter-aware-skip block SELECTs columns that don't exist on the
+        // source's transition table and errors at fire time. Mirror the
+        // 1.4.5 filter applied at create-time in the create_reflex_ivm
+        // aggregate path (search "1.4.5 — filter `imv_relevant_columns`").
+        let froms_list: Vec<String> = analysis.sources.iter().cloned().collect();
+        let (_types, _nn, per_source_cols) =
+            query_column_types_from_catalog_with_per_source(client, &froms_list);
+        let mut relevant_cols: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        for (source, set) in analysis.imv_relevant_columns.iter() {
+            if source.starts_with('<') {
+                continue;
+            }
+            let filtered: Vec<String> = if let Some(actual) = per_source_cols.get(source) {
+                set.iter()
+                    .filter(|c| actual.contains(&c.to_lowercase()))
+                    .cloned()
+                    .collect()
+            } else {
+                // Source not found in catalog — preserve raw (conservative)
+                set.iter().cloned().collect()
+            };
+            if !filtered.is_empty() {
+                relevant_cols.insert(source.clone(), filtered);
+            }
+        }
 
         let cols_json = serde_json::to_string(&relevant_cols)
             .map_err(|e| format!("serialize relevant cols: {}", e))?;
@@ -2236,18 +2276,41 @@ pub(crate) fn reflex_rebuild_imv_metadata_impl(view_name: &str) -> String {
         let n_cols_sources = relevant_cols.len();
         let n_where_sources = analysis.imv_relevant_where.len();
 
+        // 1.4.6 — also backfill source_join_keys for the bulk-INSERT /
+        // bulk-DELETE / Path B paths. Rebuild a plan from base_query so we
+        // can run the same build_source_join_keys logic the create path
+        // uses. Single-source IMVs skip the call (no JOINs to mine).
+        let mut tmp_plan = crate::aggregation::plan_aggregation(&analysis);
+        let real_sources: Vec<&String> = analysis
+            .sources
+            .iter()
+            .filter(|s| !s.starts_with('<'))
+            .collect();
+        let is_join_query = real_sources.len() > 1;
+        if !tmp_plan.is_passthrough && is_join_query {
+            build_source_join_keys(&mut tmp_plan, &real_sources, &analysis);
+        }
+        let sjk_json = serde_json::to_string(&tmp_plan.source_join_keys)
+            .map_err(|e| format!("serialize source_join_keys: {}", e))?;
+        let n_sjk_sources = tmp_plan.source_join_keys.len();
+
         client
             .update(
                 "UPDATE public.__reflex_ivm_reference \
                  SET aggregations = jsonb_set( \
                        jsonb_set( \
-                         aggregations::jsonb, \
-                         '{imv_relevant_columns}', \
-                         $1::jsonb, \
+                         jsonb_set( \
+                           aggregations::jsonb, \
+                           '{imv_relevant_columns}', \
+                           $1::jsonb, \
+                           TRUE \
+                         ), \
+                         '{imv_relevant_where}', \
+                         $2::jsonb, \
                          TRUE \
                        ), \
-                       '{imv_relevant_where}', \
-                       $2::jsonb, \
+                       '{source_join_keys}', \
+                       $4::jsonb, \
                        TRUE \
                      )::json \
                  WHERE name = $3",
@@ -2261,15 +2324,16 @@ pub(crate) fn reflex_rebuild_imv_metadata_impl(view_name: &str) -> String {
                             PgBuiltInOids::TEXTOID.oid().value(),
                         )
                     },
+                    unsafe { DatumWithOid::new(sjk_json, PgBuiltInOids::TEXTOID.oid().value()) },
                 ],
             )
             .map_err(|e| format!("update aggregations: {}", e))?;
-        Ok((n_cols_sources, n_where_sources))
+        Ok((n_cols_sources, n_where_sources, n_sjk_sources))
     });
     match result {
-        Ok((n_cols, n_where)) => format!(
-            "pg_reflex: rebuilt skip-metadata for '{}' ({} source(s) with relevant_columns, {} with relevant_where)",
-            view_name, n_cols, n_where
+        Ok((n_cols, n_where, n_sjk)) => format!(
+            "pg_reflex: rebuilt metadata for '{}' ({} relevant_columns sources, {} relevant_where sources, {} source_join_keys sources)",
+            view_name, n_cols, n_where, n_sjk
         ),
         Err(e) => format!("ERROR: {}", e),
     }
