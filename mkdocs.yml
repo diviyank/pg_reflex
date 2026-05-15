@@ -109,6 +109,7 @@ nav:
       - Delta processing: concepts/delta-processing.md
       - Deferred mode: concepts/deferred-mode.md
       - Top-K MIN/MAX: concepts/topk.md
+      - Internals: concepts/internals.md
   - SQL reference:
       - Aggregates: sql-reference/aggregates.md
       - Clauses: sql-reference/clauses.md
