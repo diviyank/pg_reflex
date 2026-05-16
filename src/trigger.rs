@@ -1570,8 +1570,8 @@ pub fn reflex_build_delta_sql(
         // is the one pattern that stays safe — so we confine every transition
         // reference to that pattern and route subsequent statements through the
         // scratch tables.
-        let needs_new = matches!(operation, "INSERT" | "UPDATE");
-        let needs_old = matches!(operation, "DELETE" | "UPDATE");
+        let needs_new = matches!(operation, "INSERT" | "INSERT_PROMOTED" | "UPDATE");
+        let needs_old = matches!(operation, "DELETE" | "DELETE_PROMOTED" | "UPDATE");
         if needs_new {
             stmts.push(format!("TRUNCATE {}", pt_new));
             stmts.push(format!(
@@ -1588,11 +1588,27 @@ pub fn reflex_build_delta_sql(
         }
 
         match operation {
-            "INSERT" => {
+            // INSERT_PROMOTED is Item α's OUT→IN flip on a UPDATE: the OLD rows
+            // failed the IMV's where_predicate so they never existed in the
+            // target — the DELETE half of the UPDATE plan is unconditionally
+            // a no-op. Skip it and just INSERT the new rows.
+            //
+            // ANALYZE the target after the bulk INSERT — the next trigger
+            // fire's Path C dispatch reads pg_class.reltuples on this table
+            // to decide reconcile-vs-incremental. Without a fresh ANALYZE,
+            // a doubled-then-halved IMV (T3 dispatch + T3b incremental
+            // delete) leaves reltuples at the old large value and Path C
+            // under-estimates the next flip's relative impact.
+            "INSERT" | "INSERT_PROMOTED" => {
                 let delta_q = replace_source_with_transition(base_query, source_table, &pt_new);
                 stmts.push(format!("INSERT INTO {} {}", qv, delta_q));
+                if operation == "INSERT_PROMOTED" {
+                    stmts.push(format!("ANALYZE {}", qv));
+                }
             }
-            "DELETE" => {
+            // Symmetric: DELETE_PROMOTED is Item α's IN→OUT flip — NEW rows
+            // fail the predicate, so the INSERT half is a no-op.
+            "DELETE" | "DELETE_PROMOTED" => {
                 if let Some(mappings) = mappings {
                     // Targeted delete using per-source column mapping
                     let target_cols: Vec<String> =
@@ -1607,6 +1623,9 @@ pub fn reflex_build_delta_sql(
                         source_cols.join(", "),
                         pt_old
                     ));
+                    if operation == "DELETE_PROMOTED" {
+                        stmts.push(format!("ANALYZE {}", qv));
+                    }
                 } else {
                     // No mapping for this source: full refresh
                     stmts.push(format!("DELETE FROM {}", qv));

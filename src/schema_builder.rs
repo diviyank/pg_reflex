@@ -590,19 +590,34 @@ pub fn build_trigger_ddls(source_table: &str) -> Vec<String> {
     //
     // Failure mode: any catalog / planner / parse error falls through to
     // the standard incremental path via `EXCEPTION WHEN OTHERS`.
+    // Path C tries the intermediate's reltuples first (aggregate IMV), then
+    // falls back to the target table's reltuples (passthrough IMV — no
+    // intermediate). Either way the size denominator approximates "how many
+    // rows the IMV currently holds" so the est/imv ratio is meaningful.
     let path_c_for_update = format!(
         "IF _directional_op = 'INSERT_PROMOTED' THEN \
            DECLARE _pc_sql TEXT; _pc_plan TEXT; _pc_est BIGINT; _pc_imv_rows BIGINT; \
-                   _pc_thr NUMERIC; _pc_per_imv NUMERIC; _pc_ratio NUMERIC; _pc_int_tbl TEXT; \
+                   _pc_thr NUMERIC; _pc_per_imv NUMERIC; _pc_ratio NUMERIC; _pc_tbl TEXT; \
            BEGIN \
              _pc_sql := public.reflex_build_path_c_explain_sql(_rec.name, '{source_table}'); \
              IF _pc_sql <> '' THEN \
                EXECUTE 'EXPLAIN (FORMAT JSON) ' || _pc_sql INTO _pc_plan; \
                _pc_est := (_pc_plan::jsonb -> 0 -> 'Plan' ->> 'Plan Rows')::BIGINT; \
-               _pc_int_tbl := format('%I.%I', \
-                                     split_part(_rec.name, '.', 1), \
-                                     '__reflex_intermediate_' || split_part(_rec.name, '.', 2)); \
-               EXECUTE format('SELECT reltuples::BIGINT FROM pg_class WHERE oid = %L::regclass', _pc_int_tbl) INTO _pc_imv_rows; \
+               BEGIN \
+                 _pc_tbl := format('%I.%I', \
+                                   split_part(_rec.name, '.', 1), \
+                                   '__reflex_intermediate_' || split_part(_rec.name, '.', 2)); \
+                 EXECUTE format('SELECT reltuples::BIGINT FROM pg_class WHERE oid = %L::regclass', _pc_tbl) INTO _pc_imv_rows; \
+               EXCEPTION WHEN OTHERS THEN \
+                 _pc_imv_rows := NULL; \
+               END; \
+               IF _pc_imv_rows IS NULL OR _pc_imv_rows <= 0 THEN \
+                 BEGIN \
+                   EXECUTE format('SELECT reltuples::BIGINT FROM pg_class WHERE oid = %L::regclass', _rec.name) INTO _pc_imv_rows; \
+                 EXCEPTION WHEN OTHERS THEN \
+                   _pc_imv_rows := NULL; \
+                 END; \
+               END IF; \
                SELECT wipe_threshold INTO _pc_per_imv FROM public.__reflex_ivm_reference WHERE name = _rec.name; \
                _pc_thr := COALESCE(_pc_per_imv, current_setting('reflex.wipe_threshold', true)::NUMERIC, 0.5); \
                IF _pc_imv_rows IS NOT NULL AND _pc_imv_rows > 0 AND _pc_est IS NOT NULL THEN \
