@@ -65,10 +65,14 @@ pub(crate) fn reflex_reconcile(view_name: &str) -> &'static str {
             let (tgt_schema, tgt_name) = split_qualified_name(view_name);
             let tgt_schema_str = tgt_schema.unwrap_or("public");
 
-            // Save and drop all indexes on target
+            // Save and drop all indexes on target.
+            // `indexname` is `name` (fixed 64B), not `text` — cast to text or
+            // pgrx's `get_by_name::<&str, _>` silently returns None and we'd
+            // skip every drop, leaving stale indexes that the recreate path
+            // then no-ops via `CREATE … IF NOT EXISTS`. ~30s/100M-row IMV.
             let saved_indexes: Vec<(String, String)> = client
                 .select(
-                    "SELECT indexname, indexdef FROM pg_indexes WHERE schemaname = $1 AND tablename = $2",
+                    "SELECT indexname::TEXT AS indexname, indexdef FROM pg_indexes WHERE schemaname = $1 AND tablename = $2",
                     None,
                     &[
                         unsafe { DatumWithOid::new(tgt_schema_str.to_string(), PgBuiltInOids::TEXTOID.oid().value()) },
@@ -154,10 +158,12 @@ pub(crate) fn reflex_reconcile(view_name: &str) -> &'static str {
             let (int_schema, _) = split_qualified_name(&int_unquoted);
             let int_schema_str = int_schema.unwrap_or("public");
 
-            // Collect and drop reflex-managed indexes on intermediate table
+            // Collect and drop reflex-managed indexes on intermediate table.
+            // `indexname` is `name`, not `text` — cast (see analogous note in
+            // the passthrough path above).
             let int_indexes: Vec<String> = client
                 .select(
-                    "SELECT indexname FROM pg_indexes WHERE schemaname = $1 AND tablename = $2",
+                    "SELECT indexname::TEXT AS indexname FROM pg_indexes WHERE schemaname = $1 AND tablename = $2",
                     None,
                     &[
                         unsafe {
@@ -197,7 +203,7 @@ pub(crate) fn reflex_reconcile(view_name: &str) -> &'static str {
             let tgt_schema_str = tgt_schema.unwrap_or("public");
             let tgt_saved_indexes: Vec<(String, String)> = client
                 .select(
-                    "SELECT indexname, indexdef FROM pg_indexes WHERE schemaname = $1 AND tablename = $2",
+                    "SELECT indexname::TEXT AS indexname, indexdef FROM pg_indexes WHERE schemaname = $1 AND tablename = $2",
                     None,
                     &[
                         unsafe { DatumWithOid::new(tgt_schema_str.to_string(), PgBuiltInOids::TEXTOID.oid().value()) },
