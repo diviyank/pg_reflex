@@ -2221,6 +2221,34 @@ pub fn reflex_build_delta_sql(
     result
 }
 
+/// Returns the rewritten scratch-fill SQL for a Item α `INSERT_PROMOTED`
+/// bulk-INSERT: `base_query` with `source_table` rewritten to its
+/// `__reflex_new_*` transition table, identical to what the bulk-INSERT
+/// codegen runs. The trigger function body wraps this in
+/// `EXPLAIN (FORMAT JSON)` to read the planner's row estimate without
+/// executing the JOIN, then compares against the IMV's wipe threshold.
+///
+/// The PL/pgSQL trigger calls EXPLAIN itself rather than delegating it here
+/// because nested SPI contexts cannot see the transition tables created in
+/// the outer trigger's scope.
+///
+/// Returns the empty string if the IMV has no row in
+/// `__reflex_ivm_reference` (e.g., dropped between scan and call).
+#[pg_extern(parallel_safe)]
+pub fn reflex_build_path_c_explain_sql(view_name: &str, source_table: &str) -> String {
+    let escaped_view = view_name.replace('\'', "''");
+    let lookup_sql = format!(
+        "SELECT base_query FROM public.__reflex_ivm_reference WHERE name = '{}' AND enabled = TRUE",
+        escaped_view
+    );
+    let base_query: String = match Spi::get_one::<&str>(&lookup_sql) {
+        Ok(Some(s)) => s.to_string(),
+        _ => return String::new(),
+    };
+    let transition = transition_new_table_name(source_table);
+    replace_source_with_transition(&base_query, source_table, &transition)
+}
+
 /// Generates SQL statements to handle a TRUNCATE on a source table.
 /// TRUNCATE has no transition tables, so we clear intermediate + target entirely.
 #[pg_extern(parallel_safe)]

@@ -2178,6 +2178,51 @@ fn test_insert_promoted_falls_back_to_merge_when_no_source_join_keys() {
     );
 }
 
+// Path C — EXPLAIN-based fanout dispatch wires only into the UPDATE trigger
+// body (the only place Item α can promote to INSERT_PROMOTED). Verify it's
+// (a) present in UPDATE bodies, (b) absent from INSERT/DELETE/TRUNCATE,
+// (c) gated on `_directional_op = 'INSERT_PROMOTED'`.
+#[test]
+fn test_update_trigger_emits_path_c_dispatch() {
+    let ddls = build_trigger_ddls("orders");
+    let upd = ddls
+        .iter()
+        .find(|d| d.contains("AFTER UPDATE ON"))
+        .expect("UPDATE trigger DDL must exist");
+    assert!(
+        upd.contains("reflex_build_path_c_explain_sql"),
+        "UPDATE trigger body must call reflex_build_path_c_explain_sql (Path C). Got: {}",
+        &upd[..upd.len().min(4000)]
+    );
+    assert!(
+        upd.contains("_directional_op = 'INSERT_PROMOTED'"),
+        "Path C block must be gated on INSERT_PROMOTED. Got: {}",
+        &upd[..upd.len().min(4000)]
+    );
+    assert!(
+        upd.contains("EXPLAIN (FORMAT JSON)"),
+        "Path C must run EXPLAIN locally in the trigger. Got: {}",
+        &upd[..upd.len().min(4000)]
+    );
+}
+
+#[test]
+fn test_ins_del_trunc_trigger_bodies_do_not_emit_path_c() {
+    let ddls = build_trigger_ddls("orders");
+    for d in &ddls {
+        if d.contains("AFTER INSERT ON")
+            || d.contains("AFTER DELETE ON")
+            || d.contains("AFTER TRUNCATE ON")
+        {
+            assert!(
+                !d.contains("reflex_build_path_c_explain_sql"),
+                "Only the UPDATE trigger should emit Path C. Got non-UPDATE body: {}",
+                &d[..d.len().min(2000)]
+            );
+        }
+    }
+}
+
 #[test]
 fn test_regular_insert_still_uses_merge() {
     // op='INSERT' (not promoted) → always MERGE, regardless of metadata.

@@ -530,6 +530,7 @@ pub fn build_trigger_ddls(source_table: &str) -> Vec<String> {
                  END IF; \
                END IF; \
              EXCEPTION WHEN OTHERS THEN NULL; END; \
+             {{path_c_block}} \
              PERFORM pg_advisory_xact_lock(hashtext(_rec.name), hashtext(reverse(_rec.name))); \
              _sql := public.reflex_build_delta_sql(_rec.name, '{source_table}', {{op_value}}, _rec.base_query, _rec.end_query, _rec.aggregations, _rec.base_query); \
              IF _sql <> '' THEN \
@@ -562,6 +563,62 @@ pub fn build_trigger_ddls(source_table: &str) -> Vec<String> {
     let pred_check_del = pred_check_one(&ref_old);
     let pred_check_upd = pred_check_two;
 
+    // Path C — EXPLAIN-based fanout dispatch for INSERT_PROMOTED.
+    //
+    // Only emitted in the UPDATE trigger body (the only place Item α can
+    // promote to INSERT_PROMOTED). For dim-source flips where Path B's
+    // |transition| / |source| signal is misleading (1-row UPDATE on a
+    // 28-row dim that fans out to 8.9M fact rows), Path C asks the planner
+    // for the actual scratch-fill cardinality via
+    // `reflex_should_dispatch_to_reconcile`.
+    //
+    // Wrapped in BEGIN/EXCEPTION so any failure (catalog lookup, planner
+    // error on a transient transition state) falls through to the standard
+    // path — safe.
+    // Path C — EXPLAIN-based fanout dispatch for INSERT_PROMOTED.
+    //
+    // Path B's |transition| / |source| ratio is blind to dim-source bulk
+    // flips (e.g. alp A4: 1-row UPDATE on a 28-row dim that fans out to
+    // 8.9M fact rows — ratio 3.6%, never trips). Path C asks the planner
+    // directly via `EXPLAIN (FORMAT JSON)` of the rewritten scratch-fill
+    // SELECT, then compares against the IMV's `wipe_threshold`.
+    //
+    // The PL/pgSQL trigger runs the EXPLAIN itself because the transition
+    // tables live in the trigger's snapshot/scope; a nested-SPI Rust helper
+    // cannot see them. `reflex_build_path_c_explain_sql` returns only the
+    // rewritten SELECT; this body wraps it in EXPLAIN.
+    //
+    // Failure mode: any catalog / planner / parse error falls through to
+    // the standard incremental path via `EXCEPTION WHEN OTHERS`.
+    let path_c_for_update = format!(
+        "IF _directional_op = 'INSERT_PROMOTED' THEN \
+           DECLARE _pc_sql TEXT; _pc_plan TEXT; _pc_est BIGINT; _pc_imv_rows BIGINT; \
+                   _pc_thr NUMERIC; _pc_per_imv NUMERIC; _pc_ratio NUMERIC; _pc_int_tbl TEXT; \
+           BEGIN \
+             _pc_sql := public.reflex_build_path_c_explain_sql(_rec.name, '{source_table}'); \
+             IF _pc_sql <> '' THEN \
+               EXECUTE 'EXPLAIN (FORMAT JSON) ' || _pc_sql INTO _pc_plan; \
+               _pc_est := (_pc_plan::jsonb -> 0 -> 'Plan' ->> 'Plan Rows')::BIGINT; \
+               _pc_int_tbl := format('%I.%I', \
+                                     split_part(_rec.name, '.', 1), \
+                                     '__reflex_intermediate_' || split_part(_rec.name, '.', 2)); \
+               EXECUTE format('SELECT reltuples::BIGINT FROM pg_class WHERE oid = %L::regclass', _pc_int_tbl) INTO _pc_imv_rows; \
+               SELECT wipe_threshold INTO _pc_per_imv FROM public.__reflex_ivm_reference WHERE name = _rec.name; \
+               _pc_thr := COALESCE(_pc_per_imv, current_setting('reflex.wipe_threshold', true)::NUMERIC, 0.5); \
+               IF _pc_imv_rows IS NOT NULL AND _pc_imv_rows > 0 AND _pc_est IS NOT NULL THEN \
+                 _pc_ratio := _pc_est::NUMERIC / _pc_imv_rows; \
+                 IF _pc_ratio >= _pc_thr THEN \
+                   RAISE DEBUG 'pg_reflex Path C: dispatching % to reconcile (est=% imv=% ratio=% thr=%)', \
+                                _rec.name, _pc_est, _pc_imv_rows, _pc_ratio, _pc_thr; \
+                   PERFORM public.reflex_reconcile(_rec.name); \
+                   CONTINUE; \
+                 END IF; \
+               END IF; \
+             END IF; \
+           EXCEPTION WHEN OTHERS THEN NULL; END; \
+         END IF;"
+    );
+
     // INSERT
     let ins_fn = safe_identifier(&format!("__reflex_ins_trigger_on_{}", safe_source));
     let ins_trig = safe_identifier(&format!("__reflex_trigger_ins_on_{}", safe_source));
@@ -570,6 +627,7 @@ pub fn build_trigger_ddls(source_table: &str) -> Vec<String> {
         .replace("{pred_check_block}", &pred_check_ins)
         .replace("{filter_skip_block}", "")
         .replace("{directional_probe_block}", "")
+        .replace("{path_c_block}", "")
         .replace("{op_value}", "'INSERT'");
     let ins_ddl = format!(
         "CREATE OR REPLACE FUNCTION {ins_fn}() RETURNS TRIGGER AS $fn$ {ins_body} $fn$ LANGUAGE plpgsql;\n\
@@ -587,6 +645,7 @@ pub fn build_trigger_ddls(source_table: &str) -> Vec<String> {
         .replace("{pred_check_block}", &pred_check_del)
         .replace("{filter_skip_block}", "")
         .replace("{directional_probe_block}", "")
+        .replace("{path_c_block}", "")
         .replace("{op_value}", "'DELETE'");
     let del_ddl = format!(
         "CREATE OR REPLACE FUNCTION {del_fn}() RETURNS TRIGGER AS $fn$ {del_body} $fn$ LANGUAGE plpgsql;\n\
@@ -604,6 +663,7 @@ pub fn build_trigger_ddls(source_table: &str) -> Vec<String> {
         .replace("{pred_check_block}", &pred_check_upd)
         .replace("{filter_skip_block}", &filter_skip_block_for_update)
         .replace("{directional_probe_block}", &directional_probe_for_update)
+        .replace("{path_c_block}", &path_c_for_update)
         .replace("{op_value}", "_directional_op");
     let upd_ddl = format!(
         "CREATE OR REPLACE FUNCTION {upd_fn}() RETURNS TRIGGER AS $fn$ {upd_body} $fn$ LANGUAGE plpgsql;\n\
