@@ -1115,6 +1115,114 @@ fn cov_json_source_immediate_multisource_join() {
     assert_eq!(s_one, 15);
 }
 
+// ---- Wave 18: explicit topk=0 (no-topK MIN/MAX recompute on UPDATE) ----
+
+/// MIN/MAX with explicit topk=0 + grouped UPDATE — exercises trigger.rs:1892
+/// (the `if !has_topk { recompute }` branch with affected_tbl).
+#[pg_test]
+fn cov_grouped_minmax_no_topk_update() {
+    Spi::run("CREATE TABLE cov_gmnt_s (id SERIAL PRIMARY KEY, g TEXT, v INT NOT NULL)")
+        .expect("create");
+    Spi::run("INSERT INTO cov_gmnt_s (g,v) VALUES ('a',10),('a',20),('b',5)").expect("seed");
+    // Explicit topk=0 → disables the top-K heap path.
+    let res: &'static str = Spi::get_one(
+        "SELECT create_reflex_ivm( \
+            'cov_gmnt_view', \
+            'SELECT g, MIN(v) AS lo, MAX(v) AS hi FROM cov_gmnt_s GROUP BY g', \
+            NULL, NULL, NULL, 0, NULL)",
+    )
+    .expect("q")
+    .expect("v");
+    if !res.contains("REFLEX") {
+        return;
+    }
+    Spi::run("UPDATE cov_gmnt_s SET v = 50 WHERE g='a' AND v=10").expect("upd min");
+    let lo: i64 = Spi::get_one::<i64>("SELECT lo::BIGINT FROM cov_gmnt_view WHERE g='a'")
+        .expect("q")
+        .expect("v");
+    assert_eq!(lo, 20, "no-topK MIN recompute should slide");
+}
+
+/// Global MIN/MAX with explicit topk=0 + UPDATE — exercises trigger.rs:1944
+/// (the no-topK branch in the no-GROUP-BY ELSE).
+#[pg_test]
+fn cov_global_minmax_no_topk_update() {
+    Spi::run("CREATE TABLE cov_gmnt2_s (id SERIAL PRIMARY KEY, v INT NOT NULL)").expect("create");
+    Spi::run("INSERT INTO cov_gmnt2_s (v) VALUES (10),(20),(30)").expect("seed");
+    let res: &'static str = Spi::get_one(
+        "SELECT create_reflex_ivm( \
+            'cov_gmnt2_view', \
+            'SELECT MIN(v) AS lo, MAX(v) AS hi FROM cov_gmnt2_s', \
+            NULL, NULL, NULL, 0, NULL)",
+    )
+    .expect("q")
+    .expect("v");
+    if !res.contains("REFLEX") {
+        return;
+    }
+    Spi::run("UPDATE cov_gmnt2_s SET v = 50 WHERE v = 10").expect("upd min");
+    let lo: i64 = Spi::get_one::<i64>("SELECT lo::BIGINT FROM cov_gmnt2_view")
+        .expect("q")
+        .expect("v");
+    assert_eq!(lo, 20);
+}
+
+/// SUM aggregate over join WHERE the join key on dim side is the dim's
+/// PK (passthrough_key_mappings populated for dim source) — UPDATE on
+/// dim exercises bulk-DELETE eligibility path.
+#[pg_test]
+fn cov_dim_pk_join_with_dim_update() {
+    Spi::run("CREATE TABLE cov_dpk_dim (id INT PRIMARY KEY, region TEXT NOT NULL)")
+        .expect("dim");
+    Spi::run("CREATE TABLE cov_dpk_fact (id SERIAL PRIMARY KEY, dim_id INT, qty INT)")
+        .expect("fact");
+    Spi::run("INSERT INTO cov_dpk_dim VALUES (1,'north'),(2,'south')").expect("seed dim");
+    Spi::run("INSERT INTO cov_dpk_fact (dim_id,qty) VALUES (1,10),(1,20),(2,5)")
+        .expect("seed fact");
+    crate::create_reflex_ivm(
+        "cov_dpk_view",
+        "SELECT dim_id, SUM(qty) AS s FROM cov_dpk_fact \
+         INNER JOIN cov_dpk_dim ON cov_dpk_dim.id = cov_dpk_fact.dim_id \
+         GROUP BY dim_id",
+        None,
+        None,
+        None,
+        None,
+    );
+    // UPDATE non-aggregated dim attribute — should not affect IMV.
+    Spi::run("UPDATE cov_dpk_dim SET region = 'changed' WHERE id = 1").expect("upd");
+    let s: i64 = Spi::get_one::<i64>("SELECT s::BIGINT FROM cov_dpk_view WHERE dim_id=1")
+        .expect("q")
+        .expect("v");
+    assert_eq!(s, 30, "non-join, non-aggregate attribute UPDATE shouldn't change SUM");
+}
+
+/// Bulk INSERT into fact with the dim-side passthrough_key_mappings path.
+#[pg_test]
+fn cov_bulk_insert_fact_dim_keymap() {
+    Spi::run("CREATE TABLE cov_bif_dim (id INT PRIMARY KEY, region TEXT NOT NULL)").expect("dim");
+    Spi::run("CREATE TABLE cov_bif_fact (id SERIAL PRIMARY KEY, dim_id INT, qty INT)")
+        .expect("fact");
+    Spi::run("INSERT INTO cov_bif_dim VALUES (1,'a'),(2,'b'),(3,'c')").expect("seed dim");
+    Spi::run("INSERT INTO cov_bif_fact (dim_id,qty) VALUES (1,5)").expect("seed fact");
+    crate::create_reflex_ivm(
+        "cov_bif_view",
+        "SELECT dim_id, SUM(qty) AS s FROM cov_bif_fact \
+         INNER JOIN cov_bif_dim ON cov_bif_dim.id = cov_bif_fact.dim_id \
+         GROUP BY dim_id",
+        None,
+        None,
+        None,
+        None,
+    );
+    Spi::run("INSERT INTO cov_bif_fact (dim_id,qty) VALUES (1,10),(2,20),(2,30),(3,40)")
+        .expect("bulk ins");
+    let s3: i64 = Spi::get_one::<i64>("SELECT s::BIGINT FROM cov_bif_view WHERE dim_id=3")
+        .expect("q")
+        .expect("v");
+    assert_eq!(s3, 40);
+}
+
 // ---- Wave 17: PK auto-detect + passthrough outer-join secondary ----
 
 /// Passthrough IMV without unique_columns — exercises PK auto-detect
