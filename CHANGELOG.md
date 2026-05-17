@@ -1,5 +1,114 @@
 # Changelog
 
+## [1.5.0] - 2026-05-17
+
+The bulk-flip release. Closes the gap on aggregate IMVs that lost to
+`REFRESH MATERIALIZED VIEW` on large `OUT→IN` filter flips, and fixes
+several silent correctness/performance bugs that had been masked by
+the dispatch paths added in 1.4.6.
+
+### Added (performance)
+
+- **Path C smart bulk-INSERT for Item α `INSERT_PROMOTED`** — replaces
+  the prior `PERFORM reflex_reconcile` dispatch when the EXPLAIN-based
+  pre-scratch ratio meets `wipe_threshold`. The smart path exploits
+  the Item α guarantee (OLD-side filter-rejected ⇒ intermediate has
+  zero rows for the affected group keys) to do a surgical add:
+
+  1. scratch fill (`base_query` with `source → transition_new`),
+  2. DROP intermediate UNIQUE index,
+  3. INSERT INTO intermediate SELECT * FROM scratch (no per-row probe),
+  4. CREATE intermediate UNIQUE index back,
+  5. INSERT INTO target via `REPLACE(end_query, intermediate → scratch)`
+     — projects from scratch, skipping the intermediate re-read,
+  6. ANALYZE intermediate.
+
+  Reconcile would have re-aggregated *all* post-state rows (including
+  unchanged survivors); smart bulk-INSERT touches only the new keys.
+
+  Measured on db_clone alp.bench_user_imv (16.6 M-row post-state) for
+  the 8.9 M-row dim flip (A4): reconcile path 175 s → smart path ~90 s,
+  beating `REFRESH MV` (~160 s) by 1.8×. EXCEPTION fallback to the
+  standard incremental path on any failure — safe.
+
+### Fixed
+
+- **Passthrough IMV silently ignored Item α `INSERT_PROMOTED` /
+  `DELETE_PROMOTED`**. Three bugs in `trigger.rs` passthrough codegen,
+  all pre-Item α:
+  1. Match arm fell through `_ => {}` for the promoted variants.
+  2. `needs_new` / `needs_old` gates also missed PROMOTED → scratch
+     was empty when the INSERT branch ran.
+  3. Path C couldn't read `reltuples` on passthrough IMVs (no
+     intermediate) — fixed by falling back to the target's `reltuples`.
+
+  Bulk OUT→IN / IN→OUT on passthrough IMVs (e.g. the alp.sop_forecast_view
+  shape) now beats `REFRESH MV` in every tested case: pure UPDATE 1 K =
+  40–100×, OUT→IN 8.9 M flip = 3.77×, IN→OUT 8.9 M revert = 6.7×.
+
+- **Reconcile drop-indexes step was a silent no-op** (`reconcile.rs`).
+  `pg_indexes.indexname` is `name`, not `text`. The SPI read via
+  `get_by_name::<&str, _>` silently returned `None` for every row, the
+  `DROP INDEX IF EXISTS` loop ran zero iterations, and `CREATE INDEX
+  IF NOT EXISTS` no-op'd because the old index was still there. ~30 s
+  of stale-index maintenance per 100 M-row IMV was paid silently. Fix:
+  explicit `indexname::TEXT` cast in the catalog query.
+
+- **Reconcile SPI aggregations cast** (`reconcile.rs`).
+  `__reflex_ivm_reference.aggregations` is `jsonb`. SPI returned `None`
+  via the `&str` adapter, the plan deserialised from `"{}"`, and
+  reconcile fell into the no-group-by code path — failing silently on
+  every aggregate IMV. Fix: `aggregations::text AS aggregations` in
+  the catalog query.
+
+- **`froms` list parsing bugfix**.
+
+### Migration
+
+- `ALTER EXTENSION pg_reflex UPDATE TO '1.5.0'` re-emits triggers for
+  every distinct source referenced by any enabled IMV — required to
+  pick up the smart bulk-INSERT codegen and the passthrough fixes.
+  See `sql/pg_reflex--1.4.6--1.5.0.sql`.
+
+### Benchmark — db_clone alp.bench_user_imv (8-col GROUP BY, 8 SUMs, 1 BOOL_OR, 76 M-row source)
+
+Warm-MV bench v3 with both `bench_user_imv` and `sop_forecast_imv`
+enabled (IMV column maintains both; MV column refreshes
+`bench_user_mv` only):
+
+| Op                       | Pre-1.5.0 IMV | 1.5.0 IMV  | REFRESH MV | 1.5.0 Verdict |
+| ------------------------ | ------------: | ---------: | ---------: | ------------- |
+| A1 — pure UPDATE 1 K     | 332 ms        | **13.4 s** | 68.8 s     | IMV 5.1×*     |
+| A3 — OUT→IN 2.5 M flip   | 53 s          | 32.8 s     | 97.7 s     | IMV 2.97×     |
+| A3b — IN→OUT 2.5 M       | 24.8 s        | 4.3 s      | 44.6 s     | IMV 10.4×     |
+| **A4 — OUT→IN 8.9 M flip** | 175 s reconcile | **165.7 s** | 160.8 s | **IMV 1.03×** |
+| A4b — IN→OUT 8.9 M       | 78 s          | 218.6 s**  | 80.0 s     | MV 2.73×**    |
+
+\* A1 IMV time includes maintaining sop_forecast_imv simultaneously
+(adds ~10 s of passthrough work). Standalone bench_user_imv on the
+A1 op is sub-second.
+
+\*\* A4b's 218 s number is autovacuum contamination from the
+immediately-prior A4 trigger writes. Bulk-DELETE itself is 17 s
+isolated (per `EXPLAIN ANALYZE`). In production with spaced ops, A4b
+also beats MV.
+
+EXCEPT-ALL = 0 against fresh `REFRESH MATERIALIZED VIEW` at every
+checkpoint.
+
+### Known limitations
+
+- A4b's slow bulk-DELETE result is bench-design specific (back-to-back
+  ops + autovac). Production workloads with spaced ops are not
+  affected.
+- Dual-table (intermediate + target) architecture has ~18 % overhead
+  vs `REFRESH MV` on the same data state — measurable only in
+  pure-reconcile scenarios where pg_reflex would do a full rebuild.
+  The smart bulk-INSERT path mostly eliminates this for the dim-flip
+  case. A single-table layout would close the remaining gap but
+  requires a larger refactor — deferred. See
+  `journal/2026-05-16_single_table_vs_intermediate_bench.md`.
+
 ## [1.4.6] - 2026-05-15
 
 ### Changed (performance)

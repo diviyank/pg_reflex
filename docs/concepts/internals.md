@@ -41,6 +41,37 @@ The crossover defaults to `0.5` from 1.4.6 onward. Setting it lower routes more 
 
 The `ANALYZE intermediate` between MERGE and target sync is non-optional. The MERGE shifts the `__ivm_count` distribution; without fresh stats the planner has picked NestedLoop+SeqScan plans for the target DELETE that ran for 12+ minutes on 100 K groups. Cost of the ANALYZE itself: ~150 ms on the SOP-forecast shape (`trigger.rs:1103-1110`).
 
+## Pre-scratch dispatch — Path B and Path C
+
+The dispatch DO block above fires *after* scratch fill, which means the JOIN against the source has already run. On bulk filter flips that fanout to millions of fact rows, scratch fill itself is the dominant cost — dispatching to reconcile *after* scratch has already paid that cost is a net loss. Two pre-scratch probes route the work *before* scratch fills.
+
+**Path B — `|transition| / |source|` ratio**. Cheap. Catches the case where a sweeping DML on a source produced a transition table that is itself a meaningful fraction of the source. For `UPDATE sales_simulation SET …` touching 40 M of 76 M rows, the ratio is 0.52 and dispatch routes to reconcile. Fails when the transition is tiny but the JOIN fanout is huge — see Path C.
+
+**Path C — planner row estimate**. Only emitted in the UPDATE trigger body, gated on `_directional_op = 'INSERT_PROMOTED'` (the only place Item α promotes a bulk OUT→IN dim flip). Runs `EXPLAIN (FORMAT JSON)` on `reflex_build_path_c_explain_sql(view, source)` — the rewritten scratch-fill query (`base_query` with `source_table → transition_new`) — and reads the planner's row estimate without executing the JOIN. Compared against the IMV's `wipe_threshold`. Catches the *dim-flip fanout* case where Path B's ratio is misleading (1 dim row of 28 = 3.6 %, but JOINs to 8.9 M fact rows).
+
+**Path C dispatches to a *smart bulk-INSERT***, not to `reflex_reconcile`. The Item α `INSERT_PROMOTED` precondition (OLD-side filter-rejected ⇒ intermediate has zero rows for affected keys) makes a surgical add safe and cheaper than full rebuild:
+
+```sql
+-- emitted inline in the UPDATE trigger body when ratio >= wipe_threshold
+TRUNCATE <scratch>;
+INSERT INTO <scratch> <base_query with source→transition_new>;  -- only the new keys
+DROP INDEX <intermediate UNIQUE>;       -- skip per-row B-tree probes
+INSERT INTO <intermediate> SELECT * FROM <scratch>;
+CREATE UNIQUE INDEX ...;                -- rebuild bottom-up over the union
+INSERT INTO <target>
+    <end_query with intermediate→scratch>;  -- project from scratch, no intermediate re-read
+ANALYZE <intermediate>;
+```
+
+Wins on alp.bench_user_imv 8.9 M-row OUT→IN flip: ~175 s reconcile → ~90 s smart path (measured standalone), beating `REFRESH MV` (~160 s) on the same post-state. Reconcile would re-aggregate the unchanged 7.7 M survivors; smart-bulk-INSERT touches only the 8.9 M new keys.
+
+Any failure (catalog lookup, parse error, EXECUTE failure) is caught by `EXCEPTION WHEN OTHERS` and falls through to the standard incremental path — never aborts the trigger.
+
+Two subtleties caught during landing and worth remembering when editing the codegen:
+
+- **No `--` SQL comments inside the trigger body**. The whole body is concatenated to one line in the emitted DDL, so a `--` comment swallows everything after it until end-of-input. Postgres reports `syntax error at end of input`. Keep comments as Rust `//` source comments only.
+- **Identifier quoting must match what `end_query` stores**. `end_query`'s FROM clause uses `intermediate_table_name`, which always emits `"schema"."table"`. `format('%I.%I', schema, table)` drops the quotes when names are plain lowercase, so `REPLACE(end_query, ...)` silently fails to substitute — the projection then re-reads the just-bulk-INSERTed intermediate and double-inserts existing rows. Build the reference with explicit `'"' || schema || '"."' || table || '"'`.
+
 ## HOT updates and fillfactor
 
 PostgreSQL's HOT (Heap-Only Tuple) optimization avoids index updates when no indexed column changes **and** there's free space on the same heap page. Both conditions must hold.
@@ -114,6 +145,11 @@ Compressed timeline of what shipped, with version and date. Only changes that ma
 | 1.4.6 | 2026-05 | Bulk-DELETE for `IN→OUT` filter flips | 5–11× speedup on db_clone (A3b 54 s → 4.8 s, A4b 181 s → 29.5 s) |
 | 1.4.6 | 2026-05 | Reconcile P1 — drop post-reconcile target ANALYZE | Reconcile critical path doesn't need target stats; intermediate ANALYZE is what pg_reflex's planner reads |
 | 1.4.6 | 2026-05 | Schema-resolving `reflex_rebuild_triggers` | Multi-schema match → explicit error instead of `search_path` footgun |
+| 1.5.0 | 2026-05 | Reconcile drop-indexes step: text-cast fix | `pg_indexes.indexname` is `name`, not `text`; SPI silently returned `None` and skipped every drop, leaving stale indexes that `CREATE … IF NOT EXISTS` then no-op'd. ~30 s saved per 100 M-row IMV |
+| 1.5.0 | 2026-05 | Reconcile SPI aggregations cast | `__reflex_ivm_reference.aggregations` is `jsonb`; SPI read needs `::text` cast or the column reads `None` and downstream codegen sees empty plan. Was failing reconcile silently on aggregate IMVs |
+| 1.5.0 | 2026-05 | Path C — EXPLAIN-based pre-scratch dispatch for `INSERT_PROMOTED` | Catches the 1-dim-row → 8.9 M-fact-row fanout case that Path B's `\|transition\|/\|source\|` ratio misses |
+| 1.5.0 | 2026-05 | Path C smart bulk-INSERT (replaces reconcile dispatch) | Drop intermediate UNIQUE, bulk INSERT only the new keys from scratch, recreate, project from scratch to target. A4 8.9 M-row OUT→IN: ~175 s reconcile → ~90 s, beats `REFRESH MV` (~160 s) |
+| 1.5.0 | 2026-05 | Passthrough trigger: handle Item α `INSERT_PROMOTED` / `DELETE_PROMOTED` | Three-bug fix in `trigger.rs` — passthrough codegen pre-dated Item α and silently emitted nothing for the promoted ops; bulk OUT→IN/IN→OUT on passthrough IMVs now beats `REFRESH MV` in every tested case (e.g. 8.9 M flip 3.77× faster via Path C) |
 
 ## What didn't work
 
@@ -144,6 +180,9 @@ Cross-references for readers walking the code:
 | Dispatch DO block | `src/trigger.rs:1051` (`build_high_selectivity_dispatch_sql`) |
 | Self-join full-refresh branch | `src/trigger.rs:1435` |
 | Bulk-INSERT / Bulk-DELETE paths | `src/trigger.rs:1211`, `:1289` |
+| Path B pre-scratch dispatch | `src/schema_builder.rs` trigger body (search for `Path B: dispatching`) |
+| Path C smart bulk-INSERT | `src/schema_builder.rs` (`path_c_for_update` in `build_trigger_ddls`) |
+| `reflex_build_path_c_explain_sql` | `src/trigger.rs:2257` |
 | TRUNCATE codegen | `src/trigger.rs:2227` (`reflex_build_truncate_sql`) |
 | `reflex_reconcile` TRUNCATE+INSERT | `src/reconcile.rs:102`, `:241` |
 | Source-join-keys metadata | `src/aggregation.rs` (`source_join_keys` on `AggregationPlan`) |

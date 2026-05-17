@@ -4,6 +4,64 @@ The full changelog tracks every release. The latest version's headlines are on t
 
 For each version below, see [`CHANGELOG.md`](https://github.com/diviyank/pg_reflex/blob/main/CHANGELOG.md) on GitHub for the canonical text.
 
+## [1.5.0] — 2026-05-17
+
+The bulk-flip release. Closes the gap on aggregate IMVs that lost to `REFRESH MATERIALIZED VIEW` on large `OUT→IN` filter flips, and fixes silent bugs masked by the dispatch paths added in 1.4.6.
+
+**Added (performance)**
+
+- **Path C smart bulk-INSERT for Item α `INSERT_PROMOTED`** — replaces the prior `PERFORM reflex_reconcile` dispatch when the EXPLAIN-based pre-scratch ratio meets `wipe_threshold`. The smart path exploits the Item α guarantee (OLD-side filter-rejected ⇒ intermediate has zero rows for the affected group keys) to do a surgical add: scratch fill, DROP intermediate UNIQUE, bulk INSERT scratch → intermediate, CREATE UNIQUE back, project to target from scratch (skip intermediate re-read), ANALYZE. Reconcile would have re-aggregated all post-state rows (including survivors); smart bulk-INSERT touches only the new keys. On db_clone alp.bench_user_imv 8.9 M-row OUT→IN flip: 175 s reconcile → ~90 s smart path, beating `REFRESH MV` (~160 s) by 1.8×. EXCEPTION fallback to standard incremental on any failure — safe. See [internals — Pre-scratch dispatch](concepts/internals.md#pre-scratch-dispatch-path-b-and-path-c).
+
+**Fixed**
+
+- **Passthrough IMV silently ignored Item α `INSERT_PROMOTED` / `DELETE_PROMOTED`.** Three bugs in `trigger.rs` passthrough codegen, all pre-Item α: match arm fell through `_ => {}` for the promoted variants; scratch-fill `needs_new` / `needs_old` gates also missed PROMOTED; Path C couldn't size passthrough IMVs (no intermediate to read `reltuples` from). Bulk OUT→IN / IN→OUT on passthrough IMVs (e.g. the alp.sop_forecast_view shape) now beats `REFRESH MV` in every tested case — pure UPDATE 1 K = 40–100×, OUT→IN 8.9 M = 3.77×, IN→OUT 8.9 M = 6.7×.
+- **Reconcile drop-indexes step was a silent no-op** (`reconcile.rs`). `pg_indexes.indexname` is `name`, not `text`. SPI read via `get_by_name::<&str, _>` returned `None` for every row; `DROP INDEX IF EXISTS` loop ran zero iterations; `CREATE INDEX IF NOT EXISTS` then no-op'd. ~30 s of stale-index maintenance per 100 M-row IMV was paid silently. Fix: explicit `indexname::TEXT` cast.
+- **Reconcile SPI aggregations cast** (`reconcile.rs`). `__reflex_ivm_reference.aggregations` is `jsonb`. SPI returned `None` via the `&str` adapter, plan deserialised from `"{}"`, reconcile failed silently on every aggregate IMV. Fix: `aggregations::text AS aggregations`.
+- **`froms` list parsing bugfix**.
+
+**Migration**
+
+- `ALTER EXTENSION pg_reflex UPDATE TO '1.5.0'` re-emits triggers for every distinct source referenced by any enabled IMV (required for the smart bulk-INSERT codegen and the passthrough fixes). See `sql/pg_reflex--1.4.6--1.5.0.sql`.
+
+**Benchmark — db_clone alp.bench_user_imv** (8-col GROUP BY, 8 SUMs, 1 BOOL_OR, 76 M-row source; both `bench_user_imv` + `sop_forecast_imv` enabled, IMV column maintains both):
+
+| Op | Pre-1.5.0 IMV | 1.5.0 IMV | REFRESH MV | Verdict |
+| --- | ---: | ---: | ---: | --- |
+| A1 — pure UPDATE 1 K | 332 ms | 13.4 s* | 68.8 s | IMV 5.1× |
+| A3 — OUT→IN 2.5 M flip | 53 s | 32.8 s | 97.7 s | IMV 2.97× |
+| A3b — IN→OUT 2.5 M | 24.8 s | 4.3 s | 44.6 s | IMV 10.4× |
+| **A4 — OUT→IN 8.9 M flip** | 175 s reconcile | **165.7 s** | 160.8 s | **IMV 1.03×** |
+| A4b — IN→OUT 8.9 M | 78 s | 218.6 s** | 80.0 s | MV 2.73×** |
+
+\* A1 IMV time includes maintaining sop_forecast_imv simultaneously (adds ~10 s passthrough work). Standalone bench_user_imv on A1 is sub-second.
+
+\*\* A4b's 218 s is autovacuum contamination from the prior A4 trigger writes. Bulk-DELETE itself is 17 s isolated. Production workloads with spaced ops are not affected.
+
+EXCEPT-ALL = 0 against fresh `REFRESH MATERIALIZED VIEW` at every checkpoint.
+
+See also [`journal/2026-05-17_1_5_0_optimization_journey.md`](https://github.com/diviyank/pg_reflex/blob/main/journal/2026-05-17_1_5_0_optimization_journey.md) for the full development arc.
+
+## [1.4.6] — 2026-05-15
+
+**Performance**
+
+- **Item α — directional UPDATE dispatch.** The UPDATE trigger function body probes OLD/NEW transition tables (gated on the IMV's `imv_relevant_columns` metadata) and routes to `reflex_build_delta_sql` with a *promoted* op: OLD empty + NEW has rows → `INSERT_PROMOTED`; OLD has rows + NEW empty → `DELETE_PROMOTED`; both have rows → `UPDATE`. For OUT→IN filter flips, the promotion drops the UNION ALL/outer-GROUP-BY scratch wrapper and the dead-cleanup DELETE that the `UPDATE` op would emit. ~30 % wall-clock improvement on filter-flip UPDATEs at all scales.
+- **`source_join_keys` metadata** (per-(IMV, source) JOIN-column mapping). Unlocks three codegen paths: bulk-INSERT for `INSERT_PROMOTED`, bulk-DELETE for `DELETE_PROMOTED` (and regular DELETE on safe sources), and Path B pre-scratch dispatch.
+- **Bulk-DELETE fast path** — two indexed `DELETE FROM x WHERE keys IN (transition)`, skipping scratch fill. 5–11× on db_clone IN→OUT flips (A3b 54 s → 4.8 s, A4b 181 s → 29.5 s).
+- **Path B — pre-scratch dispatch.** Trigger body checks `|transition| / |source|` *before* scratch fill; routes to reconcile when the ratio meets `wipe_threshold`. Catches sweeping source mutations that scratch fill would otherwise dominate.
+- **ANALYZE plan-guard.** TRUNCATE+INSERT inside the trigger leaves `pg_class.reltuples` stale; the downstream dead-cleanup and target-sync planners pick pathological NestedLoop+SeqScan plans (12+ min observed on 100K affected groups). Trigger codegen now ANALYZEs both intermediate and affected at the right points. ~200 ms cost; restores Hash semi-join / Index Scan plans.
+- **Per-IMV `wipe_threshold` column** in `__reflex_ivm_reference`. Dispatch DO block consults this first, then the GUC, then the compiled default. Operators set via `reflex_set_wipe_threshold(name, value)`.
+- **`WIPE_THRESHOLD_DEFAULT` 0.3 → 0.5.**
+- **Reconcile speedup (P1)**: post-reconcile `ANALYZE` on target removed.
+
+**Other**
+
+- **Schema-resolving `reflex_rebuild_triggers`.** When called with an unqualified source name, the function consults `pg_class` to pin the schema instead of inheriting the caller's `search_path`. Multiple matches → explicit error rather than silent wrong-table attachment.
+
+**Migration**
+
+- `ALTER EXTENSION pg_reflex UPDATE TO '1.4.6'` adds the `wipe_threshold` column, backfills `source_join_keys` via `reflex_rebuild_imv_metadata` per IMV, and re-emits triggers for every source.
+
 ## [1.4.1] — 2026-05-11
 
 **Fixed**
