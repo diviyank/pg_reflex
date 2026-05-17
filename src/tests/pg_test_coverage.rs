@@ -1115,6 +1115,212 @@ fn cov_json_source_immediate_multisource_join() {
     assert_eq!(s_one, 15);
 }
 
+// ---- Wave 21: Item α INSERT_PROMOTED / DELETE_PROMOTED on passthrough,
+//              filter-flip UPDATEs ----
+
+/// Passthrough IMV with WHERE filter — UPDATE that flips a row INTO the
+/// filter (Item α `INSERT_PROMOTED`). Exercises trigger.rs:1606 (the
+/// ANALYZE-after-INSERT_PROMOTED line on passthrough).
+#[pg_test]
+fn cov_passthrough_filter_flip_into_imv() {
+    Spi::run("CREATE TABLE cov_pfi_s (id INT PRIMARY KEY, status TEXT NOT NULL, v INT)")
+        .expect("create");
+    Spi::run(
+        "INSERT INTO cov_pfi_s VALUES (1,'on',10),(2,'off',20),(3,'on',30)",
+    )
+    .expect("seed");
+    let res = crate::create_reflex_ivm(
+        "cov_pfi_view",
+        "SELECT id, v FROM cov_pfi_s WHERE status = 'on'",
+        Some("id"),
+        None,
+        None,
+        None,
+    );
+    if res != "CREATE REFLEX INCREMENTAL VIEW" {
+        return;
+    }
+    let n0: i64 = Spi::get_one("SELECT COUNT(*)::BIGINT FROM cov_pfi_view")
+        .expect("q")
+        .expect("v");
+    assert_eq!(n0, 2);
+    // Flip id=2 INTO the filter — INSERT_PROMOTED
+    Spi::run("UPDATE cov_pfi_s SET status = 'on' WHERE id = 2").expect("flip in");
+    let n1: i64 = Spi::get_one("SELECT COUNT(*)::BIGINT FROM cov_pfi_view")
+        .expect("q")
+        .expect("v");
+    assert_eq!(n1, 3, "id=2 enters the filter");
+}
+
+/// Passthrough IMV with WHERE filter — UPDATE that flips a row OUT of
+/// the filter (Item α `DELETE_PROMOTED`). Exercises trigger.rs:1627
+/// (ANALYZE-after-DELETE_PROMOTED).
+#[pg_test]
+fn cov_passthrough_filter_flip_out_of_imv() {
+    Spi::run("CREATE TABLE cov_pfo_s (id INT PRIMARY KEY, status TEXT NOT NULL, v INT)")
+        .expect("create");
+    Spi::run(
+        "INSERT INTO cov_pfo_s VALUES (1,'on',10),(2,'on',20),(3,'on',30)",
+    )
+    .expect("seed");
+    let res = crate::create_reflex_ivm(
+        "cov_pfo_view",
+        "SELECT id, v FROM cov_pfo_s WHERE status = 'on'",
+        Some("id"),
+        None,
+        None,
+        None,
+    );
+    if res != "CREATE REFLEX INCREMENTAL VIEW" {
+        return;
+    }
+    Spi::run("UPDATE cov_pfo_s SET status = 'off' WHERE id = 2").expect("flip out");
+    let n1: i64 = Spi::get_one("SELECT COUNT(*)::BIGINT FROM cov_pfo_view")
+        .expect("q")
+        .expect("v");
+    assert_eq!(n1, 2);
+}
+
+/// Passthrough IMV — BULK INSERT_PROMOTED on filter flip.
+#[pg_test]
+fn cov_passthrough_bulk_filter_flip_into() {
+    Spi::run("CREATE TABLE cov_pbi_s (id INT PRIMARY KEY, status TEXT NOT NULL, v INT)")
+        .expect("create");
+    for i in 1..=10 {
+        Spi::run(&format!(
+            "INSERT INTO cov_pbi_s VALUES ({}, 'off', {})",
+            i,
+            i * 10
+        ))
+        .expect("seed");
+    }
+    let res = crate::create_reflex_ivm(
+        "cov_pbi_view",
+        "SELECT id, v FROM cov_pbi_s WHERE status = 'on'",
+        Some("id"),
+        None,
+        None,
+        None,
+    );
+    if res != "CREATE REFLEX INCREMENTAL VIEW" {
+        return;
+    }
+    // Bulk flip: all 10 rows enter the filter.
+    Spi::run("UPDATE cov_pbi_s SET status = 'on'").expect("bulk flip");
+    let n: i64 = Spi::get_one("SELECT COUNT(*)::BIGINT FROM cov_pbi_view")
+        .expect("q")
+        .expect("v");
+    assert_eq!(n, 10);
+}
+
+/// Aggregate IMV with WHERE filter — UPDATE flips many fact rows in.
+/// Exercises Path C (smart bulk-INSERT) trigger.rs paths.
+#[pg_test]
+fn cov_aggregate_filter_flip_smart_bulk() {
+    Spi::run("CREATE TABLE cov_afb_s (id INT PRIMARY KEY, status TEXT NOT NULL, g TEXT, v INT)")
+        .expect("create");
+    for i in 1..=20 {
+        let g = if i % 2 == 0 { "a" } else { "b" };
+        Spi::run(&format!(
+            "INSERT INTO cov_afb_s VALUES ({}, 'off', '{}', {})",
+            i, g, i
+        ))
+        .expect("seed");
+    }
+    let res = crate::create_reflex_ivm(
+        "cov_afb_view",
+        "SELECT g, SUM(v) AS s FROM cov_afb_s WHERE status = 'on' GROUP BY g",
+        None,
+        None,
+        None,
+        None,
+    );
+    if res != "CREATE REFLEX INCREMENTAL VIEW" {
+        return;
+    }
+    let n0: i64 = Spi::get_one("SELECT COUNT(*)::BIGINT FROM cov_afb_view")
+        .expect("q")
+        .expect("v");
+    assert_eq!(n0, 0);
+    Spi::run("UPDATE cov_afb_s SET status = 'on'").expect("flip all in");
+    let s_a: i64 = Spi::get_one::<i64>("SELECT s::BIGINT FROM cov_afb_view WHERE g='a'")
+        .expect("q")
+        .expect("v");
+    // Even ids (2,4,6,...,20) → sum = 2+4+...+20 = 110
+    assert_eq!(s_a, 110);
+}
+
+/// Aggregate IMV — bulk DELETE_PROMOTED on filter flip out.
+#[pg_test]
+fn cov_aggregate_filter_flip_out_bulk() {
+    Spi::run("CREATE TABLE cov_afo_s (id INT PRIMARY KEY, status TEXT NOT NULL, g TEXT, v INT)")
+        .expect("create");
+    for i in 1..=20 {
+        Spi::run(&format!(
+            "INSERT INTO cov_afo_s VALUES ({}, 'on', 'a', {})",
+            i, i
+        ))
+        .expect("seed");
+    }
+    crate::create_reflex_ivm(
+        "cov_afo_view",
+        "SELECT g, SUM(v) AS s FROM cov_afo_s WHERE status = 'on' GROUP BY g",
+        None,
+        None,
+        None,
+        None,
+    );
+    Spi::run("UPDATE cov_afo_s SET status = 'off'").expect("flip all out");
+    let cnt: i64 = Spi::get_one("SELECT COUNT(*)::BIGINT FROM cov_afo_view")
+        .expect("q")
+        .expect("v");
+    assert_eq!(cnt, 0, "all rows out of filter → empty");
+}
+
+/// IMV with an IS NULL predicate.
+#[pg_test]
+fn cov_where_is_null_predicate() {
+    Spi::run("CREATE TABLE cov_isn_s (id SERIAL PRIMARY KEY, g TEXT, v INT)").expect("create");
+    Spi::run("INSERT INTO cov_isn_s (g,v) VALUES (NULL,1),('a',2),(NULL,3)").expect("seed");
+    let res = crate::create_reflex_ivm(
+        "cov_isn_view",
+        "SELECT SUM(v) AS s FROM cov_isn_s WHERE g IS NULL",
+        None,
+        None,
+        None,
+        None,
+    );
+    if res != "CREATE REFLEX INCREMENTAL VIEW" {
+        return;
+    }
+    let s: i64 = Spi::get_one::<i64>("SELECT s::BIGINT FROM cov_isn_view")
+        .expect("q")
+        .expect("v");
+    assert_eq!(s, 4);
+}
+
+/// IMV with an IS NOT NULL predicate.
+#[pg_test]
+fn cov_where_is_not_null_predicate() {
+    Spi::run("CREATE TABLE cov_inn_s (id SERIAL PRIMARY KEY, g TEXT, v INT)").expect("create");
+    Spi::run("INSERT INTO cov_inn_s (g,v) VALUES (NULL,1),('a',2),('b',3)").expect("seed");
+    let res = crate::create_reflex_ivm(
+        "cov_inn_view",
+        "SELECT SUM(v) AS s FROM cov_inn_s WHERE g IS NOT NULL",
+        None,
+        None,
+        None,
+        None,
+    );
+    if res != "CREATE REFLEX INCREMENTAL VIEW" {
+        return;
+    }
+    let s: i64 = Spi::get_one::<i64>("SELECT s::BIGINT FROM cov_inn_view")
+        .expect("q")
+        .expect("v");
+    assert_eq!(s, 5);
+}
+
 // ---- Wave 20: reconcile missing IMV + more single-line hits ----
 
 /// `reflex_reconcile` on unknown IMV — exercises reconcile.rs:31-36.

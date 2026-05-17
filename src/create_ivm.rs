@@ -2148,28 +2148,36 @@ pub(crate) fn plan_compact_imv(view_name: &str) -> Result<Vec<String>, String> {
     ])
 }
 
+/// Format the post-execution summary of a compact run. Pure function:
+/// no SPI. Extracted so the message-shaping logic is unit-testable
+/// (the executor path inside `reflex_compact_imv_impl` itself can't run
+/// in a pgrx-test transaction because `VACUUM` is forbidden there).
+pub(crate) fn format_compact_imv_summary(view_name: &str, per_stmt: &[(String, u128)]) -> String {
+    let parts: Vec<String> = per_stmt
+        .iter()
+        .map(|(stmt, ms)| format!("{}: {} ms", stmt, ms))
+        .collect();
+    format!("pg_reflex: compacted '{}' — {}", view_name, parts.join(", "))
+}
+
 pub(crate) fn reflex_compact_imv_impl(view_name: &str) -> String {
     let stmts = match plan_compact_imv(view_name) {
         Ok(s) => s,
         Err(msg) => return msg,
     };
-    let mut messages: Vec<String> = Vec::new();
+    let mut per_stmt: Vec<(String, u128)> = Vec::new();
     let result: Result<(), String> = Spi::connect_mut(|client| {
         for stmt in &stmts {
             let t0 = std::time::Instant::now();
             client
                 .update(stmt, None, &[])
                 .map_err(|e| format!("{} failed: {}", stmt, e))?;
-            messages.push(format!("{}: {} ms", stmt, t0.elapsed().as_millis()));
+            per_stmt.push((stmt.clone(), t0.elapsed().as_millis()));
         }
         Ok(())
     });
     match result {
-        Ok(()) => format!(
-            "pg_reflex: compacted '{}' — {}",
-            view_name,
-            messages.join(", ")
-        ),
+        Ok(()) => format_compact_imv_summary(view_name, &per_stmt),
         Err(e) => format!("ERROR: {}", e),
     }
 }

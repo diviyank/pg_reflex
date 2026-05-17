@@ -158,3 +158,32 @@ fn cov_build_compact_all_summary_all_failures() {
     assert!(summary.contains("compacted 0/1"));
     assert!(summary.contains("a: ERROR: bad"));
 }
+
+// ---- format_compact_imv_summary ----
+
+#[test]
+fn cov_format_compact_imv_summary_two_stmts() {
+    let per_stmt = vec![
+        ("VACUUM (FULL) __reflex_intermediate_v".to_string(), 100u128),
+        ("VACUUM (FULL) v".to_string(), 200u128),
+    ];
+    let summary = format_compact_imv_summary("v", &per_stmt);
+    assert!(summary.contains("compacted 'v'"));
+    assert!(summary.contains("100 ms"));
+    assert!(summary.contains("200 ms"));
+    assert!(summary.contains(", "));
+}
+
+#[test]
+fn cov_format_compact_imv_summary_empty() {
+    let summary = format_compact_imv_summary("v", &[]);
+    assert!(summary.contains("compacted 'v'"));
+    assert!(summary.ends_with("— "));
+}
+
+#[test]
+fn cov_format_compact_imv_summary_single() {
+    let per_stmt = vec![("VACUUM x".to_string(), 50u128)];
+    let summary = format_compact_imv_summary("x", &per_stmt);
+    assert!(summary.contains("50 ms"));
+}
