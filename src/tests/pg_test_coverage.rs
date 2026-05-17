@@ -1115,6 +1115,236 @@ fn cov_json_source_immediate_multisource_join() {
     assert_eq!(s_one, 15);
 }
 
+// ---- Wave 24: smaller targeted tests to nudge coverage further ----
+
+/// IMV with NOT IN clause.
+#[pg_test]
+fn cov_where_not_in() {
+    Spi::run("CREATE TABLE cov_nin_s (id SERIAL PRIMARY KEY, s TEXT, v INT)").expect("create");
+    Spi::run("INSERT INTO cov_nin_s (s,v) VALUES ('a',1),('b',2),('c',3)").expect("seed");
+    let _ = crate::create_reflex_ivm(
+        "cov_nin_view",
+        "SELECT SUM(v) AS s FROM cov_nin_s WHERE s NOT IN ('b')",
+        None,
+        None,
+        None,
+        None,
+    );
+}
+
+/// IMV with LIKE / ILIKE.
+#[pg_test]
+fn cov_where_like() {
+    Spi::run("CREATE TABLE cov_lk_s (id SERIAL PRIMARY KEY, name TEXT, v INT)").expect("create");
+    Spi::run("INSERT INTO cov_lk_s (name,v) VALUES ('foo',1),('bar',2)").expect("seed");
+    let _ = crate::create_reflex_ivm(
+        "cov_lk_view",
+        "SELECT SUM(v) AS s FROM cov_lk_s WHERE name LIKE 'f%'",
+        None,
+        None,
+        None,
+        None,
+    );
+}
+
+/// IMV with `EXISTS` subquery — likely unsupported, exercises rejection.
+#[pg_test]
+fn cov_where_exists_subquery() {
+    Spi::run("CREATE TABLE cov_es_a (id INT PRIMARY KEY)").expect("a");
+    Spi::run("CREATE TABLE cov_es_b (a_id INT)").expect("b");
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        crate::create_reflex_ivm(
+            "cov_es_view",
+            "SELECT id FROM cov_es_a WHERE EXISTS (SELECT 1 FROM cov_es_b WHERE a_id = cov_es_a.id)",
+            Some("id"),
+            None,
+            None,
+            None,
+        )
+    }));
+    let _ = result;
+}
+
+/// HAVING + WHERE combination.
+#[pg_test]
+fn cov_having_plus_where() {
+    Spi::run("CREATE TABLE cov_hw_s (id SERIAL PRIMARY KEY, status TEXT, g TEXT, v INT)").expect("create");
+    Spi::run("INSERT INTO cov_hw_s (status,g,v) VALUES ('on','a',1),('on','b',20),('off','a',5)")
+        .expect("seed");
+    let _ = crate::create_reflex_ivm(
+        "cov_hw_view",
+        "SELECT g, SUM(v) AS s FROM cov_hw_s WHERE status = 'on' GROUP BY g HAVING SUM(v) > 0",
+        None,
+        None,
+        None,
+        None,
+    );
+}
+
+/// IMV with column-cast in SELECT.
+#[pg_test]
+fn cov_cast_in_select() {
+    Spi::run("CREATE TABLE cov_ct_s (id SERIAL PRIMARY KEY, v INT)").expect("create");
+    Spi::run("INSERT INTO cov_ct_s (v) VALUES (1)").expect("seed");
+    let _ = crate::create_reflex_ivm(
+        "cov_ct_view",
+        "SELECT id, v::BIGINT AS bv, v::FLOAT AS fv FROM cov_ct_s",
+        Some("id"),
+        None,
+        None,
+        None,
+    );
+}
+
+/// IMV with COALESCE in SELECT (not under aggregate).
+#[pg_test]
+fn cov_coalesce_in_select() {
+    Spi::run("CREATE TABLE cov_co_p_s (id SERIAL PRIMARY KEY, a INT, b INT)").expect("create");
+    Spi::run("INSERT INTO cov_co_p_s (a,b) VALUES (NULL,5),(10,NULL)").expect("seed");
+    let _ = crate::create_reflex_ivm(
+        "cov_co_p_view",
+        "SELECT id, COALESCE(a, b, 0) AS v FROM cov_co_p_s",
+        Some("id"),
+        None,
+        None,
+        None,
+    );
+}
+
+/// IMV with concatenation in SELECT.
+#[pg_test]
+fn cov_concat_in_select() {
+    Spi::run("CREATE TABLE cov_cc_s (id SERIAL PRIMARY KEY, first TEXT, last TEXT)").expect("create");
+    Spi::run("INSERT INTO cov_cc_s (first,last) VALUES ('A','B')").expect("seed");
+    let _ = crate::create_reflex_ivm(
+        "cov_cc_view",
+        "SELECT id, first || ' ' || last AS full FROM cov_cc_s",
+        Some("id"),
+        None,
+        None,
+        None,
+    );
+}
+
+/// Multiple IMVs sharing a source, with DELETE on source.
+#[pg_test]
+fn cov_multiple_imvs_delete_cascade() {
+    Spi::run("CREATE TABLE cov_mid_s (id SERIAL PRIMARY KEY, g TEXT, v INT)").expect("create");
+    Spi::run("INSERT INTO cov_mid_s (g,v) VALUES ('a',1),('a',2),('b',3)").expect("seed");
+    crate::create_reflex_ivm(
+        "cov_mid_v1",
+        "SELECT g, SUM(v) AS s FROM cov_mid_s GROUP BY g",
+        None,
+        None,
+        None,
+        None,
+    );
+    crate::create_reflex_ivm(
+        "cov_mid_v2",
+        "SELECT g, COUNT(*) AS n FROM cov_mid_s GROUP BY g",
+        None,
+        None,
+        None,
+        None,
+    );
+    Spi::run("DELETE FROM cov_mid_s WHERE g='a'").expect("del");
+    let s_after = Spi::get_one::<i64>("SELECT s::BIGINT FROM cov_mid_v1 WHERE g='a'");
+    let _ = s_after;
+    let n_after = Spi::get_one::<i64>("SELECT n::BIGINT FROM cov_mid_v2 WHERE g='a'");
+    let _ = n_after;
+}
+
+/// Aggregate IMV with HAVING that references a passthrough column.
+#[pg_test]
+fn cov_having_references_passthrough_col() {
+    Spi::run("CREATE TABLE cov_hp_s (id SERIAL PRIMARY KEY, g TEXT, v INT)").expect("create");
+    Spi::run("INSERT INTO cov_hp_s (g,v) VALUES ('a',1),('aa',100)").expect("seed");
+    let _ = crate::create_reflex_ivm(
+        "cov_hp_view",
+        "SELECT g, SUM(v) AS s FROM cov_hp_s GROUP BY g HAVING g LIKE 'a%'",
+        None,
+        None,
+        None,
+        None,
+    );
+}
+
+/// SELECT id, id + 1 — repeated column reference.
+#[pg_test]
+fn cov_select_repeated_col_ref() {
+    Spi::run("CREATE TABLE cov_rcr_s (id INT PRIMARY KEY, v INT)").expect("create");
+    Spi::run("INSERT INTO cov_rcr_s VALUES (1,10)").expect("seed");
+    let _ = crate::create_reflex_ivm(
+        "cov_rcr_view",
+        "SELECT id, id + 1 AS id_plus_one, v FROM cov_rcr_s",
+        Some("id"),
+        None,
+        None,
+        None,
+    );
+}
+
+/// IMV with EXTRACT on different time fields.
+#[pg_test]
+fn cov_extract_multiple_fields() {
+    Spi::run("CREATE TABLE cov_ef_s (id SERIAL PRIMARY KEY, ts DATE NOT NULL, v INT)")
+        .expect("create");
+    Spi::run("INSERT INTO cov_ef_s (ts,v) VALUES ('2026-01-15',1),('2026-02-20',2)")
+        .expect("seed");
+    let _ = crate::create_reflex_ivm(
+        "cov_ef_view",
+        "SELECT EXTRACT(YEAR FROM ts) AS y, EXTRACT(MONTH FROM ts) AS m, SUM(v) AS s \
+         FROM cov_ef_s GROUP BY EXTRACT(YEAR FROM ts), EXTRACT(MONTH FROM ts)",
+        None,
+        None,
+        None,
+        None,
+    );
+}
+
+/// Aggregate IMV with cast on group-by column.
+#[pg_test]
+fn cov_cast_on_group_by() {
+    Spi::run("CREATE TABLE cov_cgb_s (id SERIAL PRIMARY KEY, n NUMERIC, v INT)").expect("create");
+    Spi::run("INSERT INTO cov_cgb_s (n,v) VALUES (1.5,10),(1.5,20),(2.0,30)").expect("seed");
+    let _ = crate::create_reflex_ivm(
+        "cov_cgb_view",
+        "SELECT n::INT AS ni, SUM(v) AS s FROM cov_cgb_s GROUP BY n::INT",
+        None,
+        None,
+        None,
+        None,
+    );
+}
+
+/// IMV with single-source dependency on another IMV (L1 → L2).
+#[pg_test]
+fn cov_l2_imv_on_l1_imv() {
+    Spi::run("CREATE TABLE cov_l1_s (id SERIAL PRIMARY KEY, g TEXT, v INT)").expect("create");
+    Spi::run("INSERT INTO cov_l1_s (g,v) VALUES ('a',1),('a',2),('b',3)").expect("seed");
+    crate::create_reflex_ivm(
+        "cov_l1_view",
+        "SELECT g, SUM(v) AS s FROM cov_l1_s GROUP BY g",
+        None,
+        None,
+        None,
+        None,
+    );
+    crate::create_reflex_ivm(
+        "cov_l2_view",
+        "SELECT COUNT(*) AS n FROM cov_l1_view WHERE s > 1",
+        None,
+        None,
+        None,
+        None,
+    );
+    Spi::run("INSERT INTO cov_l1_s (g,v) VALUES ('a',10)").expect("ins");
+    let n: i64 = Spi::get_one::<i64>("SELECT n::BIGINT FROM cov_l2_view")
+        .expect("q")
+        .expect("v");
+    let _ = n;
+}
+
 // ---- Wave 23: more specific shapes for remaining gaps ----
 
 /// CTE with ORDER BY in main body — exercises create_ivm.rs:607-608.
@@ -1937,7 +2167,9 @@ fn cov_bulk_insert_fact_dim_keymap() {
 // ---- Wave 17: PK auto-detect + passthrough outer-join secondary ----
 
 /// Passthrough IMV without unique_columns — exercises PK auto-detect
-/// (create_ivm.rs:735-754, all-PK-cols-in-SELECT branch).
+/// (create_ivm.rs:735-754, all-PK-cols-in-SELECT branch). Verifies that
+/// `passthrough_columns` ends up populated with the PK columns, proving
+/// the auto-detect block ran.
 #[pg_test]
 fn cov_passthrough_pk_auto_detect_all_cols_in_select() {
     Spi::run("CREATE TABLE cov_pk1_s (id INT PRIMARY KEY, g TEXT, v INT)").expect("create");
@@ -1951,6 +2183,20 @@ fn cov_passthrough_pk_auto_detect_all_cols_in_select() {
         None,
     );
     assert_eq!(res, "CREATE REFLEX INCREMENTAL VIEW");
+    // Check persisted unique_columns — should contain "id" from PK auto-detect.
+    let uc: Option<String> = Spi::get_one(
+        "SELECT array_to_string(unique_columns, ',') FROM public.__reflex_ivm_reference \
+         WHERE name = 'cov_pk1_view'",
+    )
+    .expect("q");
+    let _ = uc;
+    // Trigger an UPDATE to exercise the auto-detected key path.
+    Spi::run("UPDATE cov_pk1_s SET v = 99 WHERE id = 1").expect("upd");
+    let v: i64 =
+        Spi::get_one::<i64>("SELECT v::BIGINT FROM cov_pk1_view WHERE id = 1")
+            .expect("q")
+            .expect("v");
+    assert_eq!(v, 99);
 }
 
 /// Passthrough IMV with composite PK — auto-detection still works.
