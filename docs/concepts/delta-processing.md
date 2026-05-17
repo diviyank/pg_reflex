@@ -68,6 +68,20 @@ The dispatcher's selectivity check (`trigger.rs:1051`, the `DO` block injected a
 
 All locks above are held for the writer's entire transaction, not just the trigger body — because the maintenance runs in the writer's `AFTER STATEMENT` trigger. A long writer transaction therefore extends the lock hold time, even on the non-blocking paths (writers wait on the same `RowExclusiveLock`, readers don't).
 
+### Partitioned IMVs (1.6+)
+
+When an IMV is created with a non-NULL `partition_by` argument (or auto-mirrored from a partitioned source — see [internals](internals.md#partitioning)), the lock scope of every blocking row above changes from the parent table to the *partition child* that holds the affected rows:
+
+| Row above | Same path on a partitioned IMV |
+|---|---|
+| `reflex_reconcile` taking `AccessExclusiveLock` on the target | 1.6.0+ — global reconcile iterates over source partitions and runs the same atomic DETACH/ATTACH swap as `reflex_reconcile_partition` on each child.  `AccessExclusiveLock` on the parent is taken per-child for the metadata DDL window only (~µs); the data fill runs against the orphan swap table.  A reader pruning to a partition that hasn't been swapped yet stays live throughout (it reads the OLD child until that child's swap commits). |
+| Aggregated self-join `AccessExclusiveLock` | Same scope reduction — the lock follows the partition child, not the parent. |
+| Source `TRUNCATE` cascading to the intermediate | Cascades to all intermediate children. |
+| `reflex_reconcile_partition(view, keys)` (1.6.0 swap path) | Build new partition outside the tree, then DETACH old + ATTACH new in a single SPI sub-transaction. `AccessExclusiveLock` on the partition child is held only for the DETACH/ATTACH metadata DDL (~µs), not for the data fill. A `CHECK` constraint matching the partition bound is added before ATTACH so PG skips its validation scan. Readers on every other child stay live; readers on the swapped child see the OLD data until the swap commits, then the NEW data on the next snapshot. |
+| Per-partition trigger dispatch (1.6.0) | A bulk write concentrated in one partition now routes through `reflex_reconcile_partition` instead of the global `reflex_reconcile`. The dispatch DO block GROUPs the affected table by the partition column, classifies partitions as hot / cold via `dirty / GREATEST(reltuples, wipe_floor_rows) >= wipe_threshold`, and runs the standard MERGE on cold partitions with a partition-filter splice. Hot partitions get the atomic swap. Trip-cap (`hot_count > total / 2`) falls back to global reconcile since sequentially DETACHing > half the partitions is worse than one full rebuild. |
+
+Partitioning thus turns the worst-case blocking paths from "whole IMV unreachable" into "one partition unreachable for the metadata DDL window." Readers whose `WHERE` clause prunes to a different partition are unaffected. Cascade to dependent IMVs preserves this scope only when the dependent is partitioned on the same column; on a different (or absent) partition column the cascade falls back to full `reflex_reconcile` (and its lock semantics).
+
 Two effects matter even when the table-level lock is benign:
 
 - **Reader-induced bloat.** Each in-place UPDATE creates new MVCC tuple versions. Autovacuum cannot reclaim dead tuples while a long reader's snapshot still sees them. Sustained writes plus long dashboards grow the IMV heap until the reader finishes.

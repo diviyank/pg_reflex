@@ -31,6 +31,7 @@ pub(crate) fn create_reflex_ivm_impl(
     refresh_mode: &str,
     topk_k: Option<usize>,
     ignore_sources: &[String],
+    partition_by: &[String],
 ) -> &'static str {
     let storage_upper = storage_mode.to_uppercase();
     if storage_upper != "LOGGED" && storage_upper != "UNLOGGED" {
@@ -112,6 +113,7 @@ pub(crate) fn create_reflex_ivm_impl(
                 refresh_mode,
                 topk_k,
                 ignore_sources,
+                partition_by,
             );
             if result.starts_with("ERROR") {
                 return result;
@@ -326,6 +328,7 @@ pub(crate) fn create_reflex_ivm_impl(
             refresh_mode,
             topk_k,
             ignore_sources,
+            partition_by,
         );
         if result.starts_with("ERROR") {
             return result;
@@ -471,6 +474,7 @@ pub(crate) fn create_reflex_ivm_impl(
             refresh_mode,
             topk_k,
             ignore_sources,
+            partition_by,
         );
         if result.starts_with("ERROR") {
             return result;
@@ -593,6 +597,7 @@ pub(crate) fn create_reflex_ivm_impl(
                 refresh_mode,
                 topk_k,
                 ignore_sources,
+                &[],
             );
             if result.starts_with("ERROR") {
                 return result;
@@ -628,6 +633,7 @@ pub(crate) fn create_reflex_ivm_impl(
             refresh_mode,
             topk_k,
             ignore_sources,
+            partition_by,
         );
     }
     // --- End CTE decomposition ---
@@ -783,6 +789,14 @@ pub(crate) fn create_reflex_ivm_impl(
         build_source_join_keys(&mut plan, &real_sources, &analysis);
     }
 
+    // 1.5.3 (plans/partitioning_3.md §4) — populate per-source
+    // partition_join_paths fragments.  Skipped here for the unpartitioned
+    // / passthrough cases; the real computation runs below once
+    // `resolved_partition_cols` is known.  (We can't run it earlier than
+    // build_source_join_keys, and we can't run it later than the catalog
+    // insert that persists `plan.aggregations`.)  This call is a no-op
+    // until the partition path resolves the partition column.
+
     // Warn about select columns that are neither GROUP BY nor recognized aggregates.
     // Note: passthrough columns not explicitly in GROUP BY are auto-added by plan_aggregation,
     // so we use the plan's group_by_columns (which includes auto-added ones) for validation.
@@ -885,6 +899,194 @@ pub(crate) fn create_reflex_ivm_impl(
         return "ERROR: circular dependency detected — this IMV would form a cycle in the dependency graph";
     }
 
+    // --- Partitioning resolution (plans/partitioning_2.md) ---
+    //
+    // Resolve `partition_by` against the source set before any DDL:
+    //   1. Explicit `partition_by` argument → validate against plan + anchor.
+    //   2. Empty arg AND exactly one real source partitioned LIST/RANGE
+    //      AND its partition column is appropriate for this IMV's shape →
+    //      auto-mirror.
+    //   3. Otherwise → IMV stays unpartitioned (legacy behaviour).
+    let real_source_names: Vec<String> = froms
+        .iter()
+        .filter(|s| !s.starts_with('<'))
+        .cloned()
+        .collect();
+    let mut resolved_partition_cols: Vec<String> = partition_by.to_vec();
+    let resolved_strategy: String;
+
+    if !resolved_partition_cols.is_empty() {
+        // Explicit partition_by — validate against plan shape.
+        if !plan.is_passthrough {
+            let gb_lower: std::collections::HashSet<String> = plan
+                .group_by_columns
+                .iter()
+                .map(|c| c.to_lowercase())
+                .collect();
+            // Also normalize qualified GROUP BY columns ("d.region" →
+            // "region") so partition_by can name the bare column even
+            // when the GROUP BY clause uses a `<table>.col` form.
+            let gb_normalized: std::collections::HashSet<String> = plan
+                .group_by_columns
+                .iter()
+                .map(|c| normalized_column_name(c).to_lowercase())
+                .collect();
+            let projected_aliases: std::collections::HashSet<String> = plan
+                .group_by_aliases
+                .values()
+                .map(|v| v.to_lowercase())
+                .collect();
+            // Reverse map from alias → GROUP BY expression (the AST string
+            // before aliasing).  Used to recover the underlying GROUP BY
+            // expression when the user passes the alias in `partition_by`.
+            let alias_to_gb_expr: std::collections::HashMap<String, String> = plan
+                .group_by_aliases
+                .iter()
+                .map(|(k, v)| (v.to_lowercase(), k.clone()))
+                .collect();
+            for col in &resolved_partition_cols {
+                let col_l = col.to_lowercase();
+                if !gb_lower.contains(&col_l)
+                    && !gb_normalized.contains(&col_l)
+                    && !projected_aliases.contains(&col_l)
+                {
+                    return Box::leak(
+                        format!(
+                            "ERROR: partition_by column '{}' is not in GROUP BY; \
+                             partition columns must be a subset of GROUP BY for aggregate IMVs",
+                            col
+                        )
+                        .into_boxed_str(),
+                    );
+                }
+                // Phase B (plans/partitioning_3.md §2): reject when the
+                // matching GROUP BY entry is a computed expression rather
+                // than a bare column reference.  We look up the AST string
+                // that produced this `partition_by` column — either the
+                // group_by_columns entry itself (when partition_by matches
+                // the GROUP BY's lexical form) or, when partition_by names
+                // an alias, the GROUP BY entry whose alias is `col`.
+                let gb_expr: Option<String> = if gb_lower.contains(&col_l) {
+                    plan.group_by_columns
+                        .iter()
+                        .find(|gb| gb.to_lowercase() == col_l)
+                        .cloned()
+                } else if gb_normalized.contains(&col_l) {
+                    plan.group_by_columns
+                        .iter()
+                        .find(|gb| normalized_column_name(gb).to_lowercase() == col_l)
+                        .cloned()
+                } else {
+                    alias_to_gb_expr.get(&col_l).cloned()
+                };
+                if let Some(ref gb) = gb_expr {
+                    if !crate::sql_analyzer::is_bare_column_reference(gb) {
+                        return Box::leak(
+                            format!(
+                                "ERROR: partition_by column '{}' corresponds to a computed \
+                                 GROUP BY expression ('{}'). Partition columns must be bare \
+                                 column references on the source. Workaround: add a generated \
+                                 / computed column to the source and partition on that.",
+                                col, gb
+                            )
+                            .into_boxed_str(),
+                        );
+                    }
+                }
+            }
+        }
+        let validate_result: Result<String, String> = Spi::connect(|client| {
+            let anchor = crate::partition::resolve_anchor_source(
+                client,
+                &resolved_partition_cols[0],
+                &real_source_names,
+            )?;
+            let desc = crate::partition::introspect_partition_descriptor(client, &anchor)
+                .ok_or_else(|| {
+                    format!(
+                        "anchor source '{}' for column '{}' is not partitioned LIST/RANGE",
+                        anchor, resolved_partition_cols[0]
+                    )
+                })?;
+            let part_col_l = resolved_partition_cols[0].to_lowercase();
+            if !desc.column_names.iter().any(|c| c == &part_col_l) {
+                return Err(format!(
+                    "anchor source '{}' is partitioned but not on '{}' (partitioned on: {:?})",
+                    anchor, resolved_partition_cols[0], desc.column_names
+                ));
+            }
+            Ok(desc.strategy)
+        });
+        match validate_result {
+            Ok(s) => resolved_strategy = s,
+            Err(e) => {
+                return Box::leak(
+                    format!("ERROR: partition_by validation failed — {}", e).into_boxed_str(),
+                );
+            }
+        }
+    } else {
+        // Phase 5: auto-mirror when exactly one real source is partitioned.
+        let auto: (Vec<String>, String) = Spi::connect(|client| {
+            let mut partitioned_sources: Vec<(String, crate::partition::PartitionDescriptor)> =
+                Vec::new();
+            for s in &real_source_names {
+                if let Some(desc) = crate::partition::introspect_partition_descriptor(client, s) {
+                    partitioned_sources.push((s.clone(), desc));
+                }
+            }
+            if partitioned_sources.len() != 1 {
+                return (Vec::new(), String::new());
+            }
+            let (_, desc) = partitioned_sources.into_iter().next().unwrap();
+            let part_col = desc.column_names.first().cloned().unwrap_or_default();
+            if part_col.is_empty() {
+                return (Vec::new(), String::new());
+            }
+            if plan.is_passthrough {
+                let pt_cols_l: std::collections::HashSet<String> = plan
+                    .passthrough_columns
+                    .iter()
+                    .map(|c| c.to_lowercase())
+                    .collect();
+                let projected: std::collections::HashSet<String> = analysis
+                    .select_columns
+                    .iter()
+                    .map(|c| {
+                        let n = c.alias.as_deref().unwrap_or(&c.expr_sql);
+                        bare_column_name(n).to_lowercase()
+                    })
+                    .collect();
+                if pt_cols_l.contains(&part_col) || projected.contains(&part_col) {
+                    return (vec![part_col], desc.strategy);
+                }
+            } else {
+                let gb_lower: std::collections::HashSet<String> = plan
+                    .group_by_columns
+                    .iter()
+                    .map(|c| c.to_lowercase())
+                    .collect();
+                let projected_aliases: std::collections::HashSet<String> = plan
+                    .group_by_aliases
+                    .values()
+                    .map(|v| v.to_lowercase())
+                    .collect();
+                if gb_lower.contains(&part_col) || projected_aliases.contains(&part_col) {
+                    return (vec![part_col], desc.strategy);
+                }
+            }
+            (Vec::new(), String::new())
+        });
+        resolved_partition_cols = auto.0;
+        resolved_strategy = auto.1;
+        if !resolved_partition_cols.is_empty() {
+            info!(
+                "pg_reflex: auto-mirroring partition column '{}' from source",
+                resolved_partition_cols[0]
+            );
+        }
+    }
+
     Spi::connect_mut(|client| {
         // Lookup existing IMVs among the source tables
         let args = [unsafe {
@@ -919,6 +1121,65 @@ pub(crate) fn create_reflex_ivm_impl(
 
         let mut unlogged_tables: Vec<String> = Vec::new();
 
+        plan.partition_columns = resolved_partition_cols.clone();
+        plan.partition_strategy = resolved_strategy.clone();
+        // Resolve and persist the anchor source so the trigger codegen can
+        // detect Tier 1 (firing source == anchor) at SQL build time without
+        // an extra SPI round-trip per fire.  Resolution failures (zero or
+        // multiple owners) leave the field empty — the trigger falls
+        // through to global Path B for that source, safe.
+        plan.anchor_source = if resolved_partition_cols.is_empty() {
+            String::new()
+        } else {
+            crate::partition::resolve_anchor_source(
+                client,
+                &resolved_partition_cols[0],
+                &real_source_names,
+            )
+            .unwrap_or_default()
+        };
+        // Phase D (plans/partitioning_3.md §4): compute the per-source
+        // JOIN-derivation SQL for non-anchor sources.  For each source S
+        // ≠ anchor whose `source_join_keys` entry contains the partition
+        // column as the intermediate-side col, emit a SELECT that JOINs
+        // S's transition to the anchor and projects the anchor's
+        // partition column as `pkey`.  `{transition_alias}` is a placeholder
+        // the trigger codegen substitutes at fire time with the actual
+        // transition table name.  Empty / missing entry = no JOIN path =
+        // trigger falls through to global Path B for that source (safe).
+        if !plan.partition_columns.is_empty() && !plan.anchor_source.is_empty() {
+            let partition_col = plan.partition_columns[0].to_lowercase();
+            let anchor = plan.anchor_source.clone();
+            let anchor_quoted = quote_identifier(&anchor);
+            for (source, mappings) in &plan.source_join_keys.clone() {
+                if source.eq_ignore_ascii_case(&anchor)
+                    || split_qualified_name(source)
+                        .1
+                        .eq_ignore_ascii_case(split_qualified_name(&anchor).1)
+                {
+                    continue;
+                }
+                let matched_source_col = mappings
+                    .iter()
+                    .find(|(ic, _)| ic.eq_ignore_ascii_case(&partition_col))
+                    .map(|(_, sc)| sc.clone());
+                if let Some(source_col) = matched_source_col {
+                    // The IMV's partition column matches the GROUP BY by
+                    // design, which (per Phase B) is a bare column ref on
+                    // the anchor.  So anchor's column name = partition_col.
+                    let fragment = format!(
+                        "SELECT a.\"{pc}\" AS pkey, t.* \
+                         FROM {{transition_alias}} t \
+                         JOIN {anchor} a ON a.\"{pc}\" = t.\"{sc}\"",
+                        pc = partition_col,
+                        anchor = anchor_quoted,
+                        sc = source_col,
+                    );
+                    plan.partition_join_paths.insert(source.clone(), fragment);
+                }
+            }
+        }
+
         // 1.5.1 — Filter `imv_relevant_columns` down to columns that
         // actually exist per source. The analyzer over-attributes bare
         // identifiers in multi-source queries to every real source as a
@@ -950,19 +1211,98 @@ pub(crate) fn create_reflex_ivm_impl(
         }
 
         if plan.is_passthrough {
-            // Passthrough: CREATE TABLE AS — Postgres infers columns + types, populates data
+            // Passthrough: CREATE TABLE AS — Postgres infers columns + types, populates data.
+            // Partitioned path: we need an explicit column list to use
+            // `PARTITION BY`, so we first probe the column shape via a
+            // temp scratch (WITH NO DATA), then CREATE the real
+            // partitioned parent + children, then INSERT.
             let create_kw = if logged {
                 "CREATE TABLE"
             } else {
                 "CREATE UNLOGGED TABLE"
             };
-            client
-                .update(
-                    &format!("{} {} AS {}", create_kw, quote_identifier(view_name), sql),
-                    None,
-                    &[],
-                )
-                .unwrap_or_report();
+            if !plan.partition_columns.is_empty() {
+                let scratch_name = format!(
+                    "__reflex_pt_shape_{}",
+                    safe_identifier(split_qualified_name(view_name).1)
+                );
+                client
+                    .update(
+                        &format!("CREATE TEMP TABLE {} AS {} WITH NO DATA", scratch_name, sql),
+                        None,
+                        &[],
+                    )
+                    .unwrap_or_report();
+                let col_defs: Vec<String> = client
+                    .select(
+                        "SELECT attname::text AS name, \
+                                format_type(atttypid, atttypmod) AS pg_type \
+                         FROM pg_attribute \
+                         WHERE attrelid = $1::regclass AND attnum > 0 AND NOT attisdropped \
+                         ORDER BY attnum",
+                        None,
+                        &[unsafe {
+                            DatumWithOid::new(
+                                scratch_name.clone(),
+                                PgBuiltInOids::TEXTOID.oid().value(),
+                            )
+                        }],
+                    )
+                    .unwrap_or_report()
+                    .filter_map(|r| {
+                        let n = r.get_by_name::<&str, _>("name").ok()??.to_string();
+                        let t = r.get_by_name::<&str, _>("pg_type").ok()??.to_string();
+                        Some(format!("\"{}\" {}", n, t))
+                    })
+                    .collect();
+                client
+                    .update(&format!("DROP TABLE {}", scratch_name), None, &[])
+                    .unwrap_or_report();
+                let part_clause = crate::partition::build_partition_by_clause(
+                    &plan.partition_strategy,
+                    &plan.partition_columns,
+                );
+                client
+                    .update(
+                        &format!(
+                            "{} IF NOT EXISTS {} ({}) {}",
+                            create_kw,
+                            quote_identifier(view_name),
+                            col_defs.join(", "),
+                            part_clause
+                        ),
+                        None,
+                        &[],
+                    )
+                    .unwrap_or_report();
+                if let Ok(anchor) = crate::partition::resolve_anchor_source(
+                    client,
+                    &plan.partition_columns[0],
+                    &real_source_names,
+                ) {
+                    let src_children = crate::partition::list_partition_children(client, &anchor);
+                    for src_child in &src_children {
+                        let (_, tgt_ddl) =
+                            crate::partition::build_partition_child_ddl_pair(view_name, src_child);
+                        client.update(&tgt_ddl, None, &[]).unwrap_or_report();
+                    }
+                }
+                client
+                    .update(
+                        &format!("INSERT INTO {} {}", quote_identifier(view_name), sql),
+                        None,
+                        &[],
+                    )
+                    .unwrap_or_report();
+            } else {
+                client
+                    .update(
+                        &format!("{} {} AS {}", create_kw, quote_identifier(view_name), sql),
+                        None,
+                        &[],
+                    )
+                    .unwrap_or_report();
+            }
             // ANALYZE so the query planner has statistics for the new table
             client
                 .update(
@@ -1098,6 +1438,44 @@ pub(crate) fn create_reflex_ivm_impl(
             let target_ddl = build_target_table_ddl(view_name, &plan, &column_types, logged);
             client.update(&target_ddl, None, &[]).unwrap_or_report();
             // Note: indexes are created AFTER bulk insert for performance
+
+            // Partitioned aggregate IMVs: create one partition child on each
+            // of (intermediate, target) per source-side partition.  Bounds
+            // are sourced live from the anchor's `pg_inherits`/`relpartbound`
+            // so we cannot drift.
+            if !plan.partition_columns.is_empty() {
+                match crate::partition::resolve_anchor_source(
+                    client,
+                    &plan.partition_columns[0],
+                    &real_source_names,
+                ) {
+                    Ok(anchor) => {
+                        let src_children =
+                            crate::partition::list_partition_children(client, &anchor);
+                        info!(
+                            "pg_reflex: creating {} partition children for '{}' (anchor='{}')",
+                            src_children.len(),
+                            view_name,
+                            anchor
+                        );
+                        for src_child in &src_children {
+                            let (int_ddl, tgt_ddl) =
+                                crate::partition::build_partition_child_ddl_pair(
+                                    view_name, src_child,
+                                );
+                            client.update(&int_ddl, None, &[]).unwrap_or_report();
+                            client.update(&tgt_ddl, None, &[]).unwrap_or_report();
+                        }
+                    }
+                    Err(e) => {
+                        warning!(
+                            "pg_reflex: could not resolve anchor for '{}' partition children: {}",
+                            view_name,
+                            e
+                        );
+                    }
+                }
+            }
         }
 
         // CREATE consolidated triggers on source tables (one set per source, shared by all IMVs).
@@ -1326,8 +1704,9 @@ pub(crate) fn create_reflex_ivm_impl(
              (name, graph_depth, depends_on, depends_on_imv, unlogged_tables,
               graph_child, sql_query, base_query, end_query,
               aggregations, index_columns, unique_columns, enabled, last_update_date,
-              storage_mode, refresh_mode, where_predicate, ignored_sources)
-             VALUES ($1, $2, $3::TEXT[], $4::TEXT[], $5::TEXT[], $6::TEXT[], $7, $8, $9, $10::jsonb, $11::TEXT[], $12::TEXT[], TRUE, NOW(), $13, $14, NULLIF($15, ''), $16::TEXT[])",
+              storage_mode, refresh_mode, where_predicate, ignored_sources,
+              partition_columns, partition_strategy)
+             VALUES ($1, $2, $3::TEXT[], $4::TEXT[], $5::TEXT[], $6::TEXT[], $7, $8, $9, $10::jsonb, $11::TEXT[], $12::TEXT[], TRUE, NOW(), $13, $14, NULLIF($15, ''), $16::TEXT[], NULLIF($17, '{}')::TEXT[], NULLIF($18, ''))",
             None,
             &[
                 unsafe { DatumWithOid::new(view_name.to_string(), PgBuiltInOids::TEXTOID.oid().value()) },
@@ -1346,6 +1725,8 @@ pub(crate) fn create_reflex_ivm_impl(
                 unsafe { DatumWithOid::new(mode_upper.clone(), PgBuiltInOids::TEXTOID.oid().value()) },
                 unsafe { DatumWithOid::new(where_predicate, PgBuiltInOids::TEXTOID.oid().value()) },
                 unsafe { DatumWithOid::new(format_pg_text_array_literal(&ignored_sources_vec), PgBuiltInOids::TEXTOID.oid().value()) },
+                unsafe { DatumWithOid::new(format_pg_text_array_literal(&plan.partition_columns), PgBuiltInOids::TEXTOID.oid().value()) },
+                unsafe { DatumWithOid::new(plan.partition_strategy.clone(), PgBuiltInOids::TEXTOID.oid().value()) },
             ],
         ).unwrap_or_report();
 

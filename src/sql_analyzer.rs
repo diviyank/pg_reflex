@@ -5,6 +5,8 @@ use sqlparser::ast::{
     SetExpr, SetOperator, SetQuantifier, Statement, TableFactor, Visit, VisitMut, Visitor,
     VisitorMut,
 };
+use sqlparser::dialect::PostgreSqlDialect;
+use sqlparser::parser::Parser;
 use std::collections::{BTreeSet, HashMap};
 use std::ops::ControlFlow;
 
@@ -1073,6 +1075,46 @@ fn collect_imv_relevant_where(
         .into_iter()
         .map(|(src, parts)| (src, parts.join(" AND ")))
         .collect()
+}
+
+/// Returns true if `expr_sql` parses as an `Expr::Identifier(_)` or
+/// `Expr::CompoundIdentifier(_)` — i.e. a bare column reference like
+/// `region` or `t.region`, NOT a function call (`DATE_TRUNC(...)`), cast,
+/// arithmetic, COLLATE, etc.
+///
+/// Used at IMV-create time to validate that the operator's `partition_by`
+/// columns correspond to bare GROUP BY columns rather than computed
+/// expressions.  The trigger codegen for per-partition dispatch needs to
+/// find the partition key on transition tables by simple column reference;
+/// computed GROUP BY expressions would require re-evaluating the function
+/// on every transition row, which is fragile (mutable / opaque /
+/// volatile functions break it).
+pub fn is_bare_column_reference(expr_sql: &str) -> bool {
+    let probe = format!("SELECT {} FROM __reflex_probe", expr_sql);
+    let stmts = match Parser::parse_sql(&PostgreSqlDialect {}, &probe) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    if stmts.len() != 1 {
+        return false;
+    }
+    let body = match &stmts[0] {
+        sqlparser::ast::Statement::Query(q) => q.body.as_ref(),
+        _ => return false,
+    };
+    let sel = match body {
+        sqlparser::ast::SetExpr::Select(s) => s,
+        _ => return false,
+    };
+    if sel.projection.len() != 1 {
+        return false;
+    }
+    let e = match &sel.projection[0] {
+        sqlparser::ast::SelectItem::UnnamedExpr(e) => e,
+        sqlparser::ast::SelectItem::ExprWithAlias { expr, .. } => expr,
+        _ => return false,
+    };
+    matches!(e, Expr::Identifier(_) | Expr::CompoundIdentifier(_))
 }
 
 pub fn analyze(statements: &[Statement]) -> Result<SqlAnalysis, SqlAnalysisError> {

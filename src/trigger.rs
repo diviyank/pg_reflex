@@ -1123,6 +1123,145 @@ fn build_high_selectivity_dispatch_sql(
     )
 }
 
+/// Compiled default for the per-partition denominator floor.  A partition
+/// with `reltuples = 0` (brand-new or never-ANALYZE'd) would otherwise
+/// trip the dispatch on any non-zero |dirty|; the floor caps that to a
+/// meaningful "small partition" size.
+const WIPE_FLOOR_ROWS_DEFAULT: i64 = 1000;
+
+/// 1.5.3 (plans/partitioning_3.md §3) — partition-aware sibling of
+/// `build_high_selectivity_dispatch_sql`.
+///
+/// Emitted only when the plan is partitioned AND the firing source is the
+/// anchor (Tier 1).  The DO block:
+///   1. GROUPs the populated `affected_tbl` by the partition column to get
+///      per-partition dirty counts.
+///   2. For each partition, looks up the actual child via the
+///      `__reflex_partition_child_for_key` SQL helper and reads its
+///      `reltuples` to compute a per-partition ratio
+///      `dirty / GREATEST(reltuples, wipe_floor_rows)`.
+///   3. Classifies partitions as hot / cold using the IMV's
+///      `wipe_threshold` (per-IMV override → GUC → compiled default).
+///   4. Trip-cap: if `hot_count > total_partitions / 2`, falls back to
+///      `reflex_reconcile(view)` (global) since DETACHing many partitions
+///      sequentially is worse than one rebuild.
+///   5. Hot → `PERFORM reflex_reconcile_partition(view, csv_of_hot_keys)`
+///      (uses the atomic swap from Phase A).
+///   6. Cold → runs the standard MERGE / dead-cleanup / target DELETE /
+///      target INSERT with a `<partition_col> <> ALL($1::TEXT[])` filter
+///      added.  `$1` is `_hot_keys` passed via EXECUTE USING.
+///
+/// The cold-path SQL strings MUST already contain the filter splice — the
+/// caller is responsible for wrapping the scratch / WHERE clauses with
+/// the `$1::TEXT[]` parameter binding before passing in.
+#[allow(clippy::too_many_arguments)]
+fn build_partition_aware_dispatch_sql(
+    view_name: &str,
+    intermediate_tbl: &str,
+    intermediate_parent_qual: &str,
+    affected_tbl: &str,
+    partition_col: &str,
+    merge_sql_with_filter: &str,
+    dead_cleanup_sql: Option<&str>,
+    target_delete_sql_with_filter: &str,
+    target_insert_sql_with_filter: &str,
+) -> String {
+    let dead_cleanup = match dead_cleanup_sql {
+        Some(s) => format!(
+            "                EXECUTE $reflex_inner${cleanup}$reflex_inner$ USING _hot_keys;\n",
+            cleanup = s.replace("$reflex_inner$", "$reflex_inner_alt$")
+        ),
+        None => String::new(),
+    };
+    let safe_merge = merge_sql_with_filter.replace("$reflex_inner$", "$reflex_inner_alt$");
+    let safe_tdel = target_delete_sql_with_filter.replace("$reflex_inner$", "$reflex_inner_alt$");
+    let safe_tins = target_insert_sql_with_filter.replace("$reflex_inner$", "$reflex_inner_alt$");
+    let safe_view = view_name.replace('\'', "''");
+    let safe_part_col = partition_col.replace('"', "");
+    let safe_part_col_lit = safe_part_col.replace('\'', "''");
+
+    format!(
+        "DO $reflex_dispatch$\n\
+         DECLARE\n\
+             _thr NUMERIC;\n\
+             _per_imv NUMERIC;\n\
+             _floor BIGINT;\n\
+             _per_imv_floor BIGINT;\n\
+             _hot_keys TEXT[] := ARRAY[]::TEXT[];\n\
+             _hot_count INT;\n\
+             _partition_total INT;\n\
+         BEGIN\n\
+             SELECT wipe_threshold, wipe_floor_rows INTO _per_imv, _per_imv_floor\n\
+                 FROM public.__reflex_ivm_reference WHERE name = '{view}';\n\
+             _thr   := COALESCE(_per_imv, current_setting('reflex.wipe_threshold', true)::NUMERIC, {default_thr});\n\
+             _floor := COALESCE(_per_imv_floor, NULLIF(current_setting('reflex.wipe_floor_rows', true), '')::BIGINT, {default_floor});\n\
+             -- Per-partition dirty counts from the already-populated\n\
+             -- affected table (GROUP BY partition_col).\n\
+             SELECT count(*) INTO _partition_total\n\
+                 FROM pg_inherits WHERE inhparent = '{int_parent}'::regclass;\n\
+             IF _partition_total IS NULL OR _partition_total = 0 THEN\n\
+                 RAISE DEBUG 'pg_reflex partition dispatch: % has no children — fallback to global', '{view}';\n\
+                 EXECUTE $reflex_inner${merge}$reflex_inner$ USING _hot_keys;\n\
+                 EXECUTE 'ANALYZE {intermediate}';\n\
+{dead_cleanup}\
+                 EXECUTE $reflex_inner${tdel}$reflex_inner$ USING _hot_keys;\n\
+                 EXECUTE $reflex_inner${tins}$reflex_inner$ USING _hot_keys;\n\
+                 RETURN;\n\
+             END IF;\n\
+             SELECT COALESCE(array_agg(pp.pkey::text), ARRAY[]::TEXT[])\n\
+                 INTO _hot_keys\n\
+                 FROM (\n\
+                     SELECT \"{part_col}\"::text AS pkey, count(*) AS dirty\n\
+                     FROM {affected}\n\
+                     GROUP BY \"{part_col}\"\n\
+                 ) pp\n\
+                 JOIN LATERAL (\n\
+                     SELECT c.reltuples::NUMERIC AS rt\n\
+                     FROM pg_class c\n\
+                     WHERE c.oid = public.__reflex_partition_child_for_key(\n\
+                                       '{int_parent}'::regclass, '{part_col_lit}', pp.pkey)\n\
+                 ) c ON TRUE\n\
+                 WHERE pp.dirty::NUMERIC\n\
+                       / GREATEST(c.rt, _floor::NUMERIC)\n\
+                       >= _thr;\n\
+             _hot_count := COALESCE(array_length(_hot_keys, 1), 0);\n\
+             RAISE DEBUG 'pg_reflex partition dispatch: hot=% total=% thr=% floor=%', _hot_count, _partition_total, _thr, _floor;\n\
+             -- Trip-cap: sequential DETACH/ATTACH on > half of partitions\n\
+             -- is worse than one full reconcile.\n\
+             IF _hot_count > _partition_total / 2 THEN\n\
+                 RAISE DEBUG 'pg_reflex partition dispatch: % hot of % partitions for %, fallback global', _hot_count, _partition_total, '{view}';\n\
+                 PERFORM public.reflex_reconcile('{view}');\n\
+                 RETURN;\n\
+             END IF;\n\
+             -- Hot partitions: atomic-swap reconcile.\n\
+             IF _hot_count > 0 THEN\n\
+                 RAISE DEBUG 'pg_reflex partition dispatch: % hot partitions for % → reflex_reconcile_partition', _hot_count, '{view}';\n\
+                 PERFORM public.reflex_reconcile_partition('{view}', array_to_string(_hot_keys, ','));\n\
+             END IF;\n\
+             -- Cold partitions: standard MERGE + target sync, restricted\n\
+             -- by partition filter ($1 bound to _hot_keys).\n\
+             EXECUTE $reflex_inner${merge}$reflex_inner$ USING _hot_keys;\n\
+             EXECUTE 'ANALYZE {intermediate}';\n\
+{dead_cleanup}\
+             EXECUTE $reflex_inner${tdel}$reflex_inner$ USING _hot_keys;\n\
+             EXECUTE $reflex_inner${tins}$reflex_inner$ USING _hot_keys;\n\
+         END\n\
+         $reflex_dispatch$",
+        view = safe_view,
+        int_parent = intermediate_parent_qual.replace('"', "").replace('\'', "''"),
+        intermediate = intermediate_tbl,
+        affected = affected_tbl,
+        part_col = safe_part_col,
+        part_col_lit = safe_part_col_lit,
+        default_thr = WIPE_THRESHOLD_DEFAULT,
+        default_floor = WIPE_FLOOR_ROWS_DEFAULT,
+        merge = safe_merge,
+        dead_cleanup = dead_cleanup,
+        tdel = safe_tdel,
+        tins = safe_tins,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn push_materialized_merge_and_affected(
     stmts: &mut Vec<String>,
@@ -2173,22 +2312,101 @@ pub fn reflex_build_delta_sql(
             );
 
             if let Some(pd) = pending_dispatch.take() {
-                // 1.4.5: emit the high-selectivity dispatch DO block — at
-                // runtime, decide between MERGE-incremental and
-                // TRUNCATE+rebuild based on |affected| / |intermediate|.
-                // The TRUNCATE+rebuild branch rebuilds intermediate from
-                // base_query and target from end_query (full refresh of the
-                // IMV body), bypassing the per-row MERGE probe cost and the
-                // target double-rewrite that dominate at high selectivity.
-                stmts.push(build_high_selectivity_dispatch_sql(
-                    view_name,
-                    &intermediate_tbl,
-                    &affected_tbl,
-                    &pd.merge_sql,
-                    dead_cleanup_sql.as_deref(),
-                    &target_delete_sql,
-                    &target_insert_sql,
-                ));
+                // 1.5.3 (plans/partitioning_3.md §3 + §4): when the IMV is
+                // partitioned AND the strategy is LIST, replace the
+                // global high-selectivity dispatch with the
+                // partition-aware dispatch — partition_reconcile for hot
+                // partitions (atomic swap via Phase A), filtered MERGE for
+                // cold.
+                //
+                // The dispatch reads pkey counts from the already-populated
+                // `affected_tbl`.  The affected table carries every GROUP
+                // BY column (including the partition column) regardless of
+                // which source fired the trigger, so the dispatch works
+                // both for the anchor (Tier 1) and for non-anchor sources
+                // that JOIN to the anchor (Tier 2 — affected JOIN already
+                // ran during scratch fill, so the partition column is
+                // populated).
+                //
+                // For non-anchor sources that don't JOIN to the anchor's
+                // partition column (i.e. `partition_join_paths[source]`
+                // empty), the partition column on affected would still be
+                // populated (it comes from the JOIN graph at scratch-fill
+                // time), so the dispatch is correct.  When that JOIN-graph
+                // information is missing or ambiguous, the post-scratch
+                // dispatch is still safe — it merely loses the per-partition
+                // routing optimization.
+                let use_partition_dispatch = !plan.partition_columns.is_empty()
+                    && plan.partition_strategy.eq_ignore_ascii_case("LIST");
+                if use_partition_dispatch {
+                    let part_col = &plan.partition_columns[0];
+                    let part_col_q = format!("\"{}\"", part_col);
+                    // Wrap scratch with the cold-partition filter for the
+                    // MERGE.  The MERGE's USING source becomes a SELECT *
+                    // FROM scratch WHERE pkey <> ALL($1::TEXT[]).
+                    let filtered_scratch = format!(
+                        "(SELECT * FROM {} WHERE {}::text <> ALL($1::TEXT[]))",
+                        scratch_tbl, part_col_q
+                    );
+                    let merge_filtered = build_merge_from_table_sql(
+                        &intermediate_tbl,
+                        &filtered_scratch,
+                        &plan,
+                        DeltaOp::Add,
+                    );
+                    // The dead-cleanup + target paths reference
+                    // affected_tbl; filter by partition col on that table.
+                    let dead_cleanup_filtered = dead_cleanup_sql.as_ref().map(|s| {
+                        format!(
+                            "{} AND EXISTS (SELECT 1 FROM {} __ap \
+                              WHERE __ap.{} = {}.{} AND __ap.{}::text <> ALL($1::TEXT[]))",
+                            s, affected_tbl, part_col_q, intermediate_tbl, part_col_q, part_col_q
+                        )
+                    });
+                    // For target delete: target_delete_sql currently is
+                    // `DELETE FROM qv WHERE <ns_in_target_delete>`. The
+                    // ns_in_target_delete uses affected_tbl. We add an
+                    // extra AND on the target's partition column.
+                    let tdel_filtered = format!(
+                        "{} AND {}.{}::text <> ALL($1::TEXT[])",
+                        target_delete_sql, qv, part_col_q
+                    );
+                    // For target insert: end_query reads from intermediate;
+                    // the WHERE filter on intermediate.partition_col will
+                    // splice naturally.
+                    let tins_filtered = format!(
+                        "{} AND {}.{}::text <> ALL($1::TEXT[])",
+                        target_insert_sql, intermediate_tbl, part_col_q
+                    );
+                    stmts.push(build_partition_aware_dispatch_sql(
+                        view_name,
+                        &intermediate_tbl,
+                        &intermediate_tbl,
+                        &affected_tbl,
+                        part_col,
+                        &merge_filtered,
+                        dead_cleanup_filtered.as_deref(),
+                        &tdel_filtered,
+                        &tins_filtered,
+                    ));
+                } else {
+                    // 1.4.5: emit the high-selectivity dispatch DO block — at
+                    // runtime, decide between MERGE-incremental and
+                    // TRUNCATE+rebuild based on |affected| / |intermediate|.
+                    // The TRUNCATE+rebuild branch rebuilds intermediate from
+                    // base_query and target from end_query (full refresh of the
+                    // IMV body), bypassing the per-row MERGE probe cost and the
+                    // target double-rewrite that dominate at high selectivity.
+                    stmts.push(build_high_selectivity_dispatch_sql(
+                        view_name,
+                        &intermediate_tbl,
+                        &affected_tbl,
+                        &pd.merge_sql,
+                        dead_cleanup_sql.as_deref(),
+                        &target_delete_sql,
+                        &target_insert_sql,
+                    ));
+                }
             } else {
                 // Standard incremental path (no dispatch): MERGE already
                 // pushed by a non-dispatch branch (e.g. outer-join-secondary

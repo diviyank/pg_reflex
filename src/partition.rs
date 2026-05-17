@@ -1,0 +1,1214 @@
+//! Partitioning support for pg_reflex IMVs.
+//!
+//! This module contains:
+//!   * Introspection helpers for source-table partition descriptors.
+//!   * DDL builders for partition children (intermediate + target).
+//!   * Validation helpers used by `create_reflex_ivm_impl`.
+//!   * Implementation of `reflex_sync_partitions` (with `drop_orphans` flag).
+//!   * Implementation of `reflex_reconcile_partition`.
+//!
+//! Design notes (see `plans/partitioning_2.md` and `plans/partition_plan.md`):
+//!   * Only LIST and RANGE are supported in v1 (no HASH).
+//!   * For aggregate IMVs the partition columns MUST be a subset of GROUP BY
+//!     (Postgres requires unique indexes on partitioned tables to include the
+//!     partition key, and our intermediate has a `UNIQUE NULLS NOT DISTINCT`
+//!     index on the group-by columns).
+//!   * The "anchor source" is the single source table that physically owns
+//!     the partition column; that source must itself be partitioned on the
+//!     same column with the same strategy.
+//!   * Bounds are NEVER stored on our side — `pg_get_partition_constraintdef`
+//!     (for the WHERE-clause path) and `pg_get_expr(relpartbound, oid)` (for
+//!     the FOR VALUES path) are queried live from `pg_inherits` so we cannot
+//!     drift from the source.
+
+use pgrx::datum::DatumWithOid;
+use pgrx::prelude::*;
+
+use crate::query_decomposer::{
+    intermediate_table_name, quote_identifier, safe_identifier, split_qualified_name,
+};
+
+/// A description of how a source table is partitioned.
+///
+/// `column_names` are the OUTPUT names (lowercased, unquoted) of the
+/// partition-key columns on the source.  `strategy` is "LIST" or "RANGE"
+/// (uppercased).
+#[derive(Debug, Clone)]
+pub(crate) struct PartitionDescriptor {
+    pub strategy: String,
+    pub column_names: Vec<String>,
+}
+
+/// A single existing child partition of a partitioned table.
+///
+/// `bare_name` is the unqualified relname of the child (e.g. `orders_p1`).
+/// `bound_expr` is the SQL fragment usable after `FOR VALUES`
+/// (e.g. `FOR VALUES IN ('a', 'b')` → `IN ('a', 'b')`).
+#[derive(Debug, Clone)]
+pub(crate) struct PartitionChild {
+    pub bare_name: String,
+    pub bound_expr: String,
+}
+
+/// Read the partition descriptor of `source` (schema-qualified or bare).
+/// Returns None if the table is not partitioned, or if the strategy is
+/// not LIST/RANGE.
+pub(crate) fn introspect_partition_descriptor(
+    client: &pgrx::spi::SpiClient<'_>,
+    source: &str,
+) -> Option<PartitionDescriptor> {
+    // `partattrs` is `int2vector` — not directly castable to int2[].  We
+    // serialize to text (space-separated) then split + cast to int[] for
+    // iteration via `unnest WITH ORDINALITY`.
+    let row = client
+        .select(
+            "SELECT \
+                CASE pt.partstrat WHEN 'l' THEN 'LIST' WHEN 'r' THEN 'RANGE' \
+                                  WHEN 'h' THEN 'HASH' ELSE 'OTHER' END AS strategy, \
+                ARRAY( \
+                    SELECT a.attname::text \
+                    FROM unnest(string_to_array(pt.partattrs::text, ' ')::int[]) \
+                        WITH ORDINALITY AS k(attnum, n) \
+                    JOIN pg_attribute a ON a.attrelid = pt.partrelid \
+                                       AND a.attnum = k.attnum::smallint \
+                    ORDER BY k.n \
+                ) AS cols \
+             FROM pg_partitioned_table pt \
+             WHERE pt.partrelid = to_regclass($1)",
+            None,
+            &[unsafe {
+                DatumWithOid::new(source.to_string(), PgBuiltInOids::TEXTOID.oid().value())
+            }],
+        )
+        .ok()?
+        .next()?;
+
+    let strategy: String = row.get_by_name::<&str, _>("strategy").ok()??.to_string();
+    if strategy != "LIST" && strategy != "RANGE" {
+        return None;
+    }
+    let cols: Vec<String> = row.get_by_name::<Vec<String>, _>("cols").ok()??;
+    let normalized: Vec<String> = cols.iter().map(|c| c.to_lowercase()).collect();
+    Some(PartitionDescriptor {
+        strategy,
+        column_names: normalized,
+    })
+}
+
+/// List existing child partitions of `parent` (schema-qualified or bare).
+/// Returns an empty vector if the parent is not partitioned or has no
+/// children. `bound_expr` is the post-FOR-VALUES fragment.
+pub(crate) fn list_partition_children(
+    client: &pgrx::spi::SpiClient<'_>,
+    parent: &str,
+) -> Vec<PartitionChild> {
+    match client.select(
+        "SELECT c.relname::text AS bare_name, \
+                pg_get_expr(c.relpartbound, c.oid) AS bound_expr \
+         FROM pg_inherits i \
+         JOIN pg_class c ON c.oid = i.inhrelid \
+         WHERE i.inhparent = to_regclass($1) \
+         ORDER BY c.relname",
+        None,
+        &[unsafe { DatumWithOid::new(parent.to_string(), PgBuiltInOids::TEXTOID.oid().value()) }],
+    ) {
+        Ok(iter) => iter
+            .filter_map(|row| {
+                let bare = row.get_by_name::<&str, _>("bare_name").ok()??.to_string();
+                let bound = row.get_by_name::<&str, _>("bound_expr").ok()??.to_string();
+                Some(PartitionChild {
+                    bare_name: bare,
+                    bound_expr: bound,
+                })
+            })
+            .collect(),
+        Err(e) => {
+            pgrx::warning!(
+                "pg_reflex: list_partition_children('{}') SPI error: {}",
+                parent,
+                e
+            );
+            Vec::new()
+        }
+    }
+}
+
+/// Build the `PARTITION BY <strategy> (<cols>)` suffix used in the
+/// `CREATE TABLE` DDL for the intermediate and target.
+pub(crate) fn build_partition_by_clause(strategy: &str, columns: &[String]) -> String {
+    let cols_csv = columns
+        .iter()
+        .map(|c| format!("\"{}\"", c.to_lowercase()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("PARTITION BY {} ({})", strategy.to_uppercase(), cols_csv)
+}
+
+/// Generate the bare child-partition name used for an IMV's intermediate or
+/// target child.  We derive it from the source child's bare relname so the
+/// IMV-side names stay readable and 1:1 with the source.
+pub(crate) fn intermediate_child_name(view_name: &str, source_child_bare: &str) -> String {
+    let (_, bare_view) = split_qualified_name(view_name);
+    safe_identifier(&format!(
+        "__reflex_intermediate_{}_{}",
+        bare_view, source_child_bare
+    ))
+}
+
+pub(crate) fn target_child_name(view_name: &str, source_child_bare: &str) -> String {
+    let (_, bare_view) = split_qualified_name(view_name);
+    safe_identifier(&format!("{}_{}", bare_view, source_child_bare))
+}
+
+/// Schema-prefix the child name with the IMV's schema (defaults to "public").
+fn schema_prefix(view_name: &str, child: &str) -> String {
+    let (schema, _) = split_qualified_name(view_name);
+    let schema = schema.unwrap_or("public");
+    format!("\"{}\".\"{}\"", schema, child)
+}
+
+/// Build the `CREATE TABLE child PARTITION OF parent FOR VALUES …` DDL pair
+/// for one source-child mapping.  Returns (intermediate_ddl, target_ddl).
+pub(crate) fn build_partition_child_ddl_pair(
+    view_name: &str,
+    source_child: &PartitionChild,
+) -> (String, String) {
+    let int_parent = intermediate_table_name(view_name);
+    let tgt_parent = quote_identifier(view_name);
+
+    let int_child_bare = intermediate_child_name(view_name, &source_child.bare_name);
+    let tgt_child_bare = target_child_name(view_name, &source_child.bare_name);
+    let int_child = schema_prefix(view_name, &int_child_bare);
+    let tgt_child = schema_prefix(view_name, &tgt_child_bare);
+
+    let int_ddl = format!(
+        "CREATE TABLE IF NOT EXISTS {} PARTITION OF {} {}",
+        int_child, int_parent, source_child.bound_expr
+    );
+    let tgt_ddl = format!(
+        "CREATE TABLE IF NOT EXISTS {} PARTITION OF {} {}",
+        tgt_child, tgt_parent, source_child.bound_expr
+    );
+    (int_ddl, tgt_ddl)
+}
+
+/// Build the canonical swap-table name for one source-child of a view.
+/// `kind` is "int" (intermediate) or "tgt" (target).
+pub(crate) fn swap_partition_name(view_name: &str, kind: &str, source_child_bare: &str) -> String {
+    let (_, bare_view) = split_qualified_name(view_name);
+    safe_identifier(&format!(
+        "__reflex_swap_{}_{}_{}",
+        kind, bare_view, source_child_bare
+    ))
+}
+
+/// Bundle of SQL statements used by the atomic DETACH/ATTACH swap path of
+/// `reflex_reconcile_partition_impl`.
+///
+/// The statements are produced as a deterministic, side-effect-free list so
+/// they can be unit-tested without an SPI connection; the runtime simply
+/// executes them in order.  The order is significant: build the orphan
+/// swap-children, fill them, ATTACH new + DETACH old (atomic under PG's
+/// catalog snapshot), drop the old children, then rename the swap children
+/// to the canonical partition-child names.
+#[derive(Debug, Clone)]
+pub(crate) struct SwapPartitionDdl {
+    /// Fully-qualified ("schema"."name") name of the new intermediate swap
+    /// child.  Used by tests + by the runtime to add CHECK constraints
+    /// and ANALYZE.
+    pub swap_int_qual: String,
+    /// Fully-qualified name of the new target swap child.
+    pub swap_tgt_qual: String,
+    /// `CREATE TABLE swap_int (LIKE old_int INCLUDING ALL)` (with
+    /// `UNLOGGED` when the parent IMV is UNLOGGED).
+    pub create_swap_int: String,
+    /// Likewise for target.
+    pub create_swap_tgt: String,
+    /// `INSERT INTO swap_int SELECT * FROM (<base_query>) __src WHERE (<constraint>)`
+    /// for aggregate IMVs; None when the IMV is passthrough (no intermediate).
+    pub fill_swap_int: Option<String>,
+    /// `INSERT INTO swap_tgt SELECT * FROM (<end_query OR base_query>) __end WHERE (<constraint>)`
+    pub fill_swap_tgt: String,
+    /// `ALTER TABLE swap_int ADD CONSTRAINT … CHECK (<constraint_def>)` —
+    /// adding the check BEFORE ATTACH causes PG to skip its own validation
+    /// scan, shortening the ACCESS EXCLUSIVE window on the parent.  None
+    /// when the constraint def is empty.
+    pub check_int: Option<String>,
+    /// Likewise for target.
+    pub check_tgt: Option<String>,
+    /// `ALTER TABLE int_parent DETACH PARTITION old_int_child`.
+    pub detach_old_int: String,
+    /// Likewise for target.
+    pub detach_old_tgt: String,
+    /// `ALTER TABLE int_parent ATTACH PARTITION swap_int <FOR VALUES …>`.
+    pub attach_new_int: String,
+    /// Likewise for target.
+    pub attach_new_tgt: String,
+    /// `ALTER TABLE swap_int DROP CONSTRAINT __reflex_swap_check` — the
+    /// CHECK is redundant once attached (the partition bound enforces it),
+    /// and leaving it forces PG to re-validate it on every future ATTACH.
+    pub drop_check_int: Option<String>,
+    pub drop_check_tgt: Option<String>,
+    /// `DROP TABLE old_int_child` — orphaned, no readers reach it after
+    /// DETACH.
+    pub drop_old_int: String,
+    pub drop_old_tgt: String,
+    /// `ALTER TABLE swap_int RENAME TO <canonical int child name>`.
+    pub rename_int: String,
+    pub rename_tgt: String,
+}
+
+/// Build the full list of swap-partition DDL statements for one (view, source_child)
+/// mapping.  Pure function — does not touch SPI or pg_catalog.  Tested directly
+/// via `partition::tests::test_build_swap_partition_ddl_shape`.
+///
+/// Parameters:
+///   * `view_name` — the IMV's possibly-schema-qualified name.
+///   * `source_child` — the source's partition child (bare name + `bound_expr`
+///     in `FOR VALUES …` form).
+///   * `int_constraint_def` / `tgt_constraint_def` — output of
+///     `pg_get_partition_constraintdef` on the OLD intermediate/target
+///     children (used as CHECK constraints so ATTACH skips validation).
+///   * `unlogged` — whether the new tables should be UNLOGGED (mirrors the
+///     parent IMV's storage mode).
+///   * `base_query`, `end_query` — IMV's stored queries; `end_query` empty
+///     when the IMV is passthrough.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_swap_partition_ddl(
+    view_name: &str,
+    source_child: &PartitionChild,
+    int_constraint_def: &str,
+    tgt_constraint_def: &str,
+    unlogged: bool,
+    base_query: &str,
+    end_query: &str,
+) -> SwapPartitionDdl {
+    let int_parent = intermediate_table_name(view_name);
+    let tgt_parent = quote_identifier(view_name);
+
+    let int_child_bare = intermediate_child_name(view_name, &source_child.bare_name);
+    let tgt_child_bare = target_child_name(view_name, &source_child.bare_name);
+    let int_child_qual = schema_prefix(view_name, &int_child_bare);
+    let tgt_child_qual = schema_prefix(view_name, &tgt_child_bare);
+
+    let swap_int_bare = swap_partition_name(view_name, "int", &source_child.bare_name);
+    let swap_tgt_bare = swap_partition_name(view_name, "tgt", &source_child.bare_name);
+    let swap_int_qual = schema_prefix(view_name, &swap_int_bare);
+    let swap_tgt_qual = schema_prefix(view_name, &swap_tgt_bare);
+
+    let unlogged_kw = if unlogged { "UNLOGGED " } else { "" };
+
+    let create_swap_int = format!(
+        "CREATE {kw}TABLE {swap} (LIKE {old} INCLUDING ALL)",
+        kw = unlogged_kw,
+        swap = swap_int_qual,
+        old = int_child_qual
+    );
+    let create_swap_tgt = format!(
+        "CREATE {kw}TABLE {swap} (LIKE {old} INCLUDING ALL)",
+        kw = unlogged_kw,
+        swap = swap_tgt_qual,
+        old = tgt_child_qual
+    );
+
+    let fill_swap_int = if end_query.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "INSERT INTO {swap} SELECT * FROM ({bq}) __src WHERE ({con})",
+            swap = swap_int_qual,
+            bq = base_query,
+            con = int_constraint_def
+        ))
+    };
+
+    let fill_swap_tgt = if end_query.is_empty() {
+        format!(
+            "INSERT INTO {swap} SELECT * FROM ({bq}) __src WHERE ({con})",
+            swap = swap_tgt_qual,
+            bq = base_query,
+            con = tgt_constraint_def
+        )
+    } else {
+        format!(
+            "INSERT INTO {swap} SELECT * FROM ({eq}) __end WHERE ({con})",
+            swap = swap_tgt_qual,
+            eq = end_query,
+            con = tgt_constraint_def
+        )
+    };
+
+    let check_int = if int_constraint_def.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "ALTER TABLE {swap} ADD CONSTRAINT __reflex_swap_check CHECK ({con})",
+            swap = swap_int_qual,
+            con = int_constraint_def
+        ))
+    };
+    let check_tgt = if tgt_constraint_def.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "ALTER TABLE {swap} ADD CONSTRAINT __reflex_swap_check CHECK ({con})",
+            swap = swap_tgt_qual,
+            con = tgt_constraint_def
+        ))
+    };
+
+    let detach_old_int = format!(
+        "ALTER TABLE {} DETACH PARTITION {}",
+        int_parent, int_child_qual
+    );
+    let detach_old_tgt = format!(
+        "ALTER TABLE {} DETACH PARTITION {}",
+        tgt_parent, tgt_child_qual
+    );
+
+    let attach_new_int = format!(
+        "ALTER TABLE {} ATTACH PARTITION {} {}",
+        int_parent, swap_int_qual, source_child.bound_expr
+    );
+    let attach_new_tgt = format!(
+        "ALTER TABLE {} ATTACH PARTITION {} {}",
+        tgt_parent, swap_tgt_qual, source_child.bound_expr
+    );
+
+    let drop_check_int = check_int.as_ref().map(|_| {
+        format!(
+            "ALTER TABLE {} DROP CONSTRAINT __reflex_swap_check",
+            swap_int_qual
+        )
+    });
+    let drop_check_tgt = check_tgt.as_ref().map(|_| {
+        format!(
+            "ALTER TABLE {} DROP CONSTRAINT __reflex_swap_check",
+            swap_tgt_qual
+        )
+    });
+
+    let drop_old_int = format!("DROP TABLE {}", int_child_qual);
+    let drop_old_tgt = format!("DROP TABLE {}", tgt_child_qual);
+
+    let rename_int = format!(
+        "ALTER TABLE {} RENAME TO \"{}\"",
+        swap_int_qual, int_child_bare
+    );
+    let rename_tgt = format!(
+        "ALTER TABLE {} RENAME TO \"{}\"",
+        swap_tgt_qual, tgt_child_bare
+    );
+
+    SwapPartitionDdl {
+        swap_int_qual,
+        swap_tgt_qual,
+        create_swap_int,
+        create_swap_tgt,
+        fill_swap_int,
+        fill_swap_tgt,
+        check_int,
+        check_tgt,
+        detach_old_int,
+        detach_old_tgt,
+        attach_new_int,
+        attach_new_tgt,
+        drop_check_int,
+        drop_check_tgt,
+        drop_old_int,
+        drop_old_tgt,
+        rename_int,
+        rename_tgt,
+    }
+}
+
+/// Parse a TEXT[] partition-column input.  Returns None for NULL/empty.
+///
+/// The user passes column names as a Postgres TEXT[]; pgrx forwards it as
+/// `Option<Vec<Option<String>>>` (TEXT[] permits NULL elements).  We strip
+/// NULLs, lowercase, and reject empty strings.
+pub(crate) fn parse_partition_by_input(input: Option<Vec<Option<String>>>) -> Vec<String> {
+    let Some(v) = input else { return Vec::new() };
+    v.into_iter()
+        .flatten()
+        .map(|s| s.trim().to_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// Resolve the "anchor source" for a given partition column.
+///
+/// The anchor is the source table that physically owns the column.  Returns
+/// Err(message) when zero or multiple sources claim it, since both are
+/// ambiguous.  `sources` are schema-qualified (or bare) source names from
+/// the IMV's `depends_on` list.
+pub(crate) fn resolve_anchor_source(
+    client: &pgrx::spi::SpiClient<'_>,
+    partition_col: &str,
+    sources: &[String],
+) -> Result<String, String> {
+    let col = partition_col.to_lowercase();
+    let mut owners: Vec<String> = Vec::new();
+    for s in sources {
+        if s.starts_with('<') {
+            continue;
+        }
+        let has = client
+            .select(
+                "SELECT 1 FROM pg_attribute a \
+                 JOIN pg_class c ON c.oid = a.attrelid \
+                 JOIN pg_namespace n ON n.oid = c.relnamespace \
+                 WHERE a.attrelid = to_regclass($1) \
+                   AND a.attnum > 0 AND NOT a.attisdropped \
+                   AND lower(a.attname) = $2 \
+                 LIMIT 1",
+                Some(1),
+                &[
+                    unsafe {
+                        DatumWithOid::new(s.to_string(), PgBuiltInOids::TEXTOID.oid().value())
+                    },
+                    unsafe { DatumWithOid::new(col.clone(), PgBuiltInOids::TEXTOID.oid().value()) },
+                ],
+            )
+            .map(|mut it| it.next().is_some())
+            .unwrap_or(false);
+        if has {
+            owners.push(s.clone());
+        }
+    }
+    match owners.len() {
+        0 => Err(format!(
+            "no source table owns partition column '{}'",
+            partition_col
+        )),
+        1 => Ok(owners.into_iter().next().unwrap()),
+        _ => Err(format!(
+            "multiple sources own partition column '{}' — ambiguous: {:?}",
+            partition_col, owners
+        )),
+    }
+}
+
+/// Result of `reflex_sync_partitions`.
+#[derive(Debug, Default)]
+pub(crate) struct SyncResult {
+    pub added_intermediate: usize,
+    pub added_target: usize,
+    pub dropped_intermediate: usize,
+    pub dropped_target: usize,
+    /// Names of source children present on the IMV but absent from source.
+    /// Populated only when drop_orphans = false.
+    pub preserved_orphans: Vec<String>,
+}
+
+impl SyncResult {
+    pub fn into_message(self) -> String {
+        let mut msg = format!(
+            "sync: +{} intermediate, +{} target",
+            self.added_intermediate, self.added_target
+        );
+        if self.dropped_intermediate > 0 || self.dropped_target > 0 {
+            msg.push_str(&format!(
+                ", -{} intermediate, -{} target",
+                self.dropped_intermediate, self.dropped_target
+            ));
+        }
+        if !self.preserved_orphans.is_empty() {
+            msg.push_str(&format!(
+                ", preserved orphans: {}",
+                self.preserved_orphans.join(", ")
+            ));
+        }
+        msg
+    }
+}
+
+/// Implementation of `reflex_sync_partitions(view_name, drop_orphans)`.
+///
+/// 1. Reads (partition_columns, partition_strategy) from the IMV reference
+///    table.  Returns "OK — not partitioned" if not set.
+/// 2. Resolves the anchor source via `depends_on`.
+/// 3. Diffs source partitions against current IMV partitions and creates
+///    missing children on both intermediate and target.
+/// 4. When `drop_orphans` is true (default), drops IMV-side children whose
+///    source counterpart no longer exists (CASCADE — but only touches
+///    pg_reflex-owned objects below the IMV partition).  When false, emits
+///    a NOTICE and preserves them.
+pub(crate) fn reflex_sync_partitions_impl(view_name: &str, drop_orphans: bool) -> String {
+    if let Err(msg) = crate::validate_view_name(view_name) {
+        return msg.to_string();
+    }
+    let outcome: Result<String, String> = Spi::connect_mut(|client| {
+        // Load partition metadata.
+        let meta = client
+            .select(
+                "SELECT partition_columns, partition_strategy, depends_on \
+                 FROM public.__reflex_ivm_reference WHERE name = $1",
+                Some(1),
+                &[unsafe {
+                    DatumWithOid::new(view_name.to_string(), PgBuiltInOids::TEXTOID.oid().value())
+                }],
+            )
+            .map_err(|e| format!("sync: catalog query failed: {}", e))?
+            .next();
+        let row = match meta {
+            Some(r) => r,
+            None => return Err(format!("IMV '{}' not found", view_name)),
+        };
+        let part_cols: Vec<String> = row
+            .get_by_name::<Vec<String>, _>("partition_columns")
+            .unwrap_or(None)
+            .unwrap_or_default();
+        let strategy: String = row
+            .get_by_name::<&str, _>("partition_strategy")
+            .unwrap_or(None)
+            .unwrap_or("")
+            .to_string();
+        if part_cols.is_empty() || strategy.is_empty() {
+            return Ok("OK — not partitioned".to_string());
+        }
+        let sources: Vec<String> = row
+            .get_by_name::<Vec<String>, _>("depends_on")
+            .unwrap_or(None)
+            .unwrap_or_default();
+
+        // Resolve anchor source.
+        let anchor = resolve_anchor_source(client, &part_cols[0], &sources)
+            .map_err(|e| format!("sync: {}", e))?;
+
+        // Read source children and IMV children.
+        let src_children = list_partition_children(client, &anchor);
+        let int_parent = intermediate_table_name(view_name);
+        let tgt_parent = quote_identifier(view_name);
+        let int_children = list_partition_children(client, &int_parent);
+        let tgt_children = list_partition_children(client, &tgt_parent);
+
+        // Build name-keyed views (using the IMV-side bare name format).
+        let int_have: std::collections::HashSet<String> =
+            int_children.iter().map(|c| c.bare_name.clone()).collect();
+        let tgt_have: std::collections::HashSet<String> =
+            tgt_children.iter().map(|c| c.bare_name.clone()).collect();
+        let src_expected_int: std::collections::HashSet<String> = src_children
+            .iter()
+            .map(|c| intermediate_child_name(view_name, &c.bare_name))
+            .collect();
+        let src_expected_tgt: std::collections::HashSet<String> = src_children
+            .iter()
+            .map(|c| target_child_name(view_name, &c.bare_name))
+            .collect();
+
+        let mut out = SyncResult::default();
+
+        // Advisory lock keyed by IMV name (hashed) so concurrent calls
+        // serialize their DDL on this view.
+        let _ = client.update(
+            "SELECT pg_advisory_xact_lock(hashtext($1))",
+            None,
+            &[unsafe {
+                DatumWithOid::new(view_name.to_string(), PgBuiltInOids::TEXTOID.oid().value())
+            }],
+        );
+
+        for src in &src_children {
+            let int_name = intermediate_child_name(view_name, &src.bare_name);
+            let tgt_name = target_child_name(view_name, &src.bare_name);
+            let (int_ddl, tgt_ddl) = build_partition_child_ddl_pair(view_name, src);
+            if !int_have.contains(&int_name) {
+                client
+                    .update(&int_ddl, None, &[])
+                    .map_err(|e| format!("sync: failed to create intermediate child: {}", e))?;
+                out.added_intermediate += 1;
+            }
+            if !tgt_have.contains(&tgt_name) {
+                client
+                    .update(&tgt_ddl, None, &[])
+                    .map_err(|e| format!("sync: failed to create target child: {}", e))?;
+                out.added_target += 1;
+            }
+        }
+
+        if drop_orphans {
+            let (schema_opt, _) = split_qualified_name(view_name);
+            let schema = schema_opt.unwrap_or("public");
+            for c in &int_children {
+                if !src_expected_int.contains(&c.bare_name) {
+                    let q = format!(
+                        "DROP TABLE IF EXISTS \"{}\".\"{}\" CASCADE",
+                        schema, c.bare_name
+                    );
+                    client
+                        .update(&q, None, &[])
+                        .map_err(|e| format!("sync: drop intermediate child failed: {}", e))?;
+                    out.dropped_intermediate += 1;
+                }
+            }
+            for c in &tgt_children {
+                if !src_expected_tgt.contains(&c.bare_name) {
+                    let q = format!(
+                        "DROP TABLE IF EXISTS \"{}\".\"{}\" CASCADE",
+                        schema, c.bare_name
+                    );
+                    client
+                        .update(&q, None, &[])
+                        .map_err(|e| format!("sync: drop target child failed: {}", e))?;
+                    out.dropped_target += 1;
+                }
+            }
+        } else {
+            for c in &int_children {
+                if !src_expected_int.contains(&c.bare_name) {
+                    out.preserved_orphans.push(c.bare_name.clone());
+                    pgrx::notice!(
+                        "pg_reflex: orphan intermediate partition '{}' preserved (drop_orphans=false)",
+                        c.bare_name
+                    );
+                }
+            }
+            for c in &tgt_children {
+                if !src_expected_tgt.contains(&c.bare_name) {
+                    out.preserved_orphans.push(c.bare_name.clone());
+                    pgrx::notice!(
+                        "pg_reflex: orphan target partition '{}' preserved (drop_orphans=false)",
+                        c.bare_name
+                    );
+                }
+            }
+        }
+
+        Ok(out.into_message())
+    });
+    match outcome {
+        Ok(s) => s,
+        Err(e) => format!("ERROR: {}", e),
+    }
+}
+
+/// Implementation of `reflex_reconcile_partition(view_name, partition_keys)`.
+///
+/// Atomic DETACH/ATTACH swap (Phase A of `plans/partitioning_3.md`).
+///
+/// 1. Idempotent cleanup pass: drop any leftover `__reflex_swap_*` tables
+///    for this view from a prior failed swap.  Detected purely by name
+///    prefix — no catalog state to maintain.
+/// 2. Sync source partitions (`reflex_sync_partitions_impl(.., drop_orphans=true)`).
+/// 3. For each provided key, locate the matching child via
+///    `pg_get_partition_constraintdef` and gather (intermediate child,
+///    target child, source child, both constraints, both `FOR VALUES`
+///    bounds, persistence).
+/// 4. For each matching child, build the new partition outside the
+///    partition tree, fill it, add a CHECK constraint matching the
+///    bound (so ATTACH skips its validation scan), DETACH the old
+///    children + ATTACH the new ones, drop the old children, rename the
+///    swap children to the canonical names.  Lock hold on the parent
+///    drops from "full rebuild duration" to "the ALTER TABLE swap
+///    itself" (µs).
+/// 5. Cascade to dependents:
+///    * Same partition column → partition-scoped reconcile.
+///    * Different / non-partitioned → full reconcile.
+///
+/// Atomicity: the entire operation runs inside one `Spi::connect_mut`
+/// sub-transaction; any failure rolls back all changes (including the
+/// catalog-side DETACH/ATTACH), leaving the IMV in its pre-call state.
+pub(crate) fn reflex_reconcile_partition_impl(view_name: &str, partition_keys_csv: &str) -> String {
+    if let Err(msg) = crate::validate_view_name(view_name) {
+        return msg.to_string();
+    }
+    // Idempotent recovery: drop any orphan __reflex_swap_* tables left over
+    // from a prior aborted swap.  Names are deterministic from view +
+    // source-child bare name (see `swap_partition_name`); we identify them
+    // by the `__reflex_swap_int_<bare_view>_` / `__reflex_swap_tgt_<bare_view>_`
+    // prefix, scoped to the IMV's schema.
+    cleanup_orphan_swap_tables(view_name);
+
+    // First, ensure the partition set is in sync with the source.
+    let _ = reflex_sync_partitions_impl(view_name, true);
+
+    let outcome: Result<String, String> = Spi::connect_mut(|client| {
+        let row = client
+            .select(
+                "SELECT base_query, end_query, partition_columns, partition_strategy, depends_on, graph_child, storage_mode \
+                 FROM public.__reflex_ivm_reference WHERE name = $1 AND enabled = TRUE",
+                Some(1),
+                &[unsafe {
+                    DatumWithOid::new(view_name.to_string(), PgBuiltInOids::TEXTOID.oid().value())
+                }],
+            )
+            .map_err(|e| format!("reconcile_partition: catalog query failed: {}", e))?
+            .next();
+        let row = match row {
+            Some(r) => r,
+            None => return Err(format!("IMV '{}' not found or disabled", view_name)),
+        };
+        let base_query: String = row
+            .get_by_name::<&str, _>("base_query")
+            .unwrap_or(None)
+            .unwrap_or("")
+            .to_string();
+        let end_query: String = row
+            .get_by_name::<&str, _>("end_query")
+            .unwrap_or(None)
+            .unwrap_or("")
+            .to_string();
+        let part_cols: Vec<String> = row
+            .get_by_name::<Vec<String>, _>("partition_columns")
+            .unwrap_or(None)
+            .unwrap_or_default();
+        let strategy: String = row
+            .get_by_name::<&str, _>("partition_strategy")
+            .unwrap_or(None)
+            .unwrap_or("")
+            .to_string();
+        let children: Vec<String> = row
+            .get_by_name::<Vec<String>, _>("graph_child")
+            .unwrap_or(None)
+            .unwrap_or_default();
+        let storage_mode: String = row
+            .get_by_name::<&str, _>("storage_mode")
+            .unwrap_or(None)
+            .unwrap_or("UNLOGGED")
+            .to_string();
+        if part_cols.is_empty() || strategy.is_empty() {
+            return Err(format!(
+                "IMV '{}' is not partitioned — use reflex_reconcile",
+                view_name
+            ));
+        }
+
+        let tgt_parent = quote_identifier(view_name);
+
+        let keys: Vec<String> = partition_keys_csv
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if keys.is_empty() {
+            return Err("reconcile_partition: empty partition_keys".to_string());
+        }
+
+        // Gather all current child constraints once.
+        let tgt_children = list_partition_children(client, &tgt_parent);
+
+        // For each key, find the unique child whose constraint matches.  We
+        // test by evaluating the child's constraint as a SQL boolean
+        // expression with the partition column bound to the key literal.
+        // Single-column LIST/RANGE only in v1.
+        let mut to_process: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let part_col = &part_cols[0];
+        for key in &keys {
+            let child_match = tgt_children.iter().find(|c| {
+                let oid_q = "SELECT pg_get_partition_constraintdef(to_regclass($1)::oid) AS def";
+                let qname = format!(
+                    "{}.{}",
+                    split_qualified_name(view_name).0.unwrap_or("public"),
+                    c.bare_name
+                );
+                let def: Option<String> = client
+                    .select(
+                        oid_q,
+                        Some(1),
+                        &[unsafe {
+                            DatumWithOid::new(qname.clone(), PgBuiltInOids::TEXTOID.oid().value())
+                        }],
+                    )
+                    .ok()
+                    .and_then(|mut it| it.next())
+                    .and_then(|r| {
+                        r.get_by_name::<&str, _>("def")
+                            .ok()
+                            .flatten()
+                            .map(|s| s.to_string())
+                    });
+                let def = match def {
+                    Some(d) if !d.is_empty() => d,
+                    _ => return false,
+                };
+                let lit = sql_literal_text(key);
+                let substituted = substitute_identifier(&def, part_col, &lit);
+                let probe = format!("SELECT ({})::boolean AS match", substituted);
+                let matched: Option<bool> = client
+                    .select(&probe, Some(1), &[])
+                    .ok()
+                    .and_then(|mut it| it.next())
+                    .and_then(|r| r.get_by_name::<bool, _>("match").ok().flatten());
+                matched.unwrap_or(false)
+            });
+            if let Some(c) = child_match {
+                to_process.insert(c.bare_name.clone());
+            }
+        }
+        if to_process.is_empty() {
+            return Ok(format!(
+                "reconcile_partition: no children matched any of {:?}",
+                keys
+            ));
+        }
+
+        let schema = split_qualified_name(view_name)
+            .0
+            .unwrap_or("public")
+            .to_string();
+        let unlogged = storage_mode.eq_ignore_ascii_case("UNLOGGED");
+
+        // Process each child via the shared atomic DETACH/ATTACH swap
+        // helper.  The intermediate is swapped before the target so the
+        // target's `end_query` fill reads the fresh intermediate.
+        for child_bare in &to_process {
+            // Recover the source bare-child name from the target bare-
+            // child name (target = "<bare_view>_<src_child>" per
+            // `target_child_name`).
+            let (_, view_bare) = split_qualified_name(view_name);
+            let src_child_bare = child_bare
+                .strip_prefix(&format!("{}_", view_bare))
+                .unwrap_or(child_bare)
+                .to_string();
+            execute_partition_swap_for_child(
+                client,
+                view_name,
+                &schema,
+                &src_child_bare,
+                &base_query,
+                &end_query,
+                unlogged,
+            )
+            .map_err(|e| format!("reconcile_partition: {}", e))?;
+        }
+
+        // Update last_update_date.
+        let _ = client.update(
+            "UPDATE public.__reflex_ivm_reference SET last_update_date = NOW() WHERE name = $1",
+            None,
+            &[unsafe {
+                DatumWithOid::new(view_name.to_string(), PgBuiltInOids::TEXTOID.oid().value())
+            }],
+        );
+
+        // Cascade to dependents.  We resolve each dependent's own partition
+        // metadata; if it's partitioned on the SAME column as this IMV we
+        // call partition-scoped reconcile (with the same keys), otherwise
+        // we fall back to full reconcile.
+        for child in &children {
+            let dep = client
+                .select(
+                    "SELECT partition_columns FROM public.__reflex_ivm_reference WHERE name = $1",
+                    Some(1),
+                    &[unsafe {
+                        DatumWithOid::new(child.to_string(), PgBuiltInOids::TEXTOID.oid().value())
+                    }],
+                )
+                .ok()
+                .and_then(|mut it| it.next());
+            let dep_cols: Vec<String> = dep
+                .and_then(|r| {
+                    r.get_by_name::<Vec<String>, _>("partition_columns")
+                        .ok()
+                        .flatten()
+                })
+                .unwrap_or_default();
+            let same_part = !dep_cols.is_empty()
+                && dep_cols
+                    .first()
+                    .map(|c| c.eq_ignore_ascii_case(part_col))
+                    .unwrap_or(false);
+            // We can't reflex_reconcile_partition / reflex_reconcile from
+            // inside this SPI scope directly — call the inner impls in a
+            // fresh SPI session by deferring via PERFORM at SQL level.
+            if same_part {
+                let q = format!(
+                    "SELECT public.reflex_reconcile_partition({}, {})",
+                    sql_literal_text(child),
+                    sql_literal_text(partition_keys_csv)
+                );
+                let _ = client.update(&q, None, &[]);
+            } else {
+                let q = format!(
+                    "SELECT public.reflex_reconcile({})",
+                    sql_literal_text(child)
+                );
+                let _ = client.update(&q, None, &[]);
+            }
+        }
+
+        Ok(format!(
+            "RECONCILED partitions: {}",
+            to_process.into_iter().collect::<Vec<_>>().join(", ")
+        ))
+    });
+    match outcome {
+        Ok(s) => s,
+        Err(e) => format!("ERROR: {}", e),
+    }
+}
+
+/// Execute the per-child atomic DETACH/ATTACH swap.  Shared between
+/// `reflex_reconcile_partition_impl` (partition-scoped) and the global
+/// partition-aware path in `reconcile::reflex_reconcile` (rebuilds every
+/// partition via swap instead of TRUNCATE-on-parent).
+///
+/// `src_child_bare` is the source-child's bare relname; the intermediate
+/// and target child names are derived from it.  Reads each child's
+/// bound + constraint def live from `pg_class` / `pg_get_partition_*`.
+///
+/// Returns Err(message) on any DDL failure — the caller's
+/// `Spi::connect_mut` sub-transaction rolls back atomically.
+pub(crate) fn execute_partition_swap_for_child(
+    client: &mut pgrx::spi::SpiClient<'_>,
+    view_name: &str,
+    schema: &str,
+    src_child_bare: &str,
+    base_query: &str,
+    end_query: &str,
+    unlogged: bool,
+) -> Result<(), String> {
+    let int_parent = intermediate_table_name(view_name);
+    let int_child_bare = intermediate_child_name(view_name, src_child_bare);
+    let tgt_child_bare = target_child_name(view_name, src_child_bare);
+
+    let int_bound = read_partition_bound(client, schema, &int_child_bare);
+    let tgt_bound = read_partition_bound(client, schema, &tgt_child_bare);
+    let int_def = read_partition_constraint_def(client, schema, &int_child_bare);
+    let tgt_def = read_partition_constraint_def(client, schema, &tgt_child_bare);
+
+    if int_bound.is_empty() && !end_query.is_empty() {
+        return Err(format!(
+            "missing intermediate bound for child '{}'",
+            int_child_bare
+        ));
+    }
+    if tgt_bound.is_empty() {
+        return Err(format!(
+            "missing target bound for child '{}'",
+            tgt_child_bare
+        ));
+    }
+
+    let src_child = PartitionChild {
+        bare_name: src_child_bare.to_string(),
+        bound_expr: tgt_bound.clone(),
+    };
+    let ddl = build_swap_partition_ddl(
+        view_name, &src_child, &int_def, &tgt_def, unlogged, base_query, end_query,
+    );
+
+    // Override intermediate ATTACH bound if it differs textually from the
+    // target's (e.g., multi-column LIST partitioning where the bound
+    // references the column names directly).
+    let attach_new_int = if !int_bound.is_empty() && int_bound != tgt_bound {
+        format!(
+            "ALTER TABLE {} ATTACH PARTITION {} {}",
+            int_parent, ddl.swap_int_qual, int_bound
+        )
+    } else {
+        ddl.attach_new_int.clone()
+    };
+
+    // ============ INTERMEDIATE SWAP ============
+    if !end_query.is_empty() {
+        client
+            .update(&ddl.create_swap_int, None, &[])
+            .map_err(|e| format!("create swap int: {}", e))?;
+        if let Some(ref fill) = ddl.fill_swap_int {
+            client
+                .update(fill, None, &[])
+                .map_err(|e| format!("fill swap int: {}", e))?;
+        }
+        let _ = client.update(&format!("ANALYZE {}", ddl.swap_int_qual), None, &[]);
+        if let Some(ref c) = ddl.check_int {
+            client
+                .update(c, None, &[])
+                .map_err(|e| format!("add check int: {}", e))?;
+        }
+        client
+            .update(&ddl.detach_old_int, None, &[])
+            .map_err(|e| format!("detach old int: {}", e))?;
+        client
+            .update(&attach_new_int, None, &[])
+            .map_err(|e| format!("attach new int: {}", e))?;
+        if let Some(ref c) = ddl.drop_check_int {
+            let _ = client.update(c, None, &[]);
+        }
+        client
+            .update(&ddl.drop_old_int, None, &[])
+            .map_err(|e| format!("drop old int: {}", e))?;
+        client
+            .update(&ddl.rename_int, None, &[])
+            .map_err(|e| format!("rename int: {}", e))?;
+    }
+
+    // ============ TARGET SWAP ============
+    client
+        .update(&ddl.create_swap_tgt, None, &[])
+        .map_err(|e| format!("create swap tgt: {}", e))?;
+    client
+        .update(&ddl.fill_swap_tgt, None, &[])
+        .map_err(|e| format!("fill swap tgt: {}", e))?;
+    let _ = client.update(&format!("ANALYZE {}", ddl.swap_tgt_qual), None, &[]);
+    if let Some(ref c) = ddl.check_tgt {
+        client
+            .update(c, None, &[])
+            .map_err(|e| format!("add check tgt: {}", e))?;
+    }
+    client
+        .update(&ddl.detach_old_tgt, None, &[])
+        .map_err(|e| format!("detach old tgt: {}", e))?;
+    client
+        .update(&ddl.attach_new_tgt, None, &[])
+        .map_err(|e| format!("attach new tgt: {}", e))?;
+    if let Some(ref c) = ddl.drop_check_tgt {
+        let _ = client.update(c, None, &[]);
+    }
+    client
+        .update(&ddl.drop_old_tgt, None, &[])
+        .map_err(|e| format!("drop old tgt: {}", e))?;
+    client
+        .update(&ddl.rename_tgt, None, &[])
+        .map_err(|e| format!("rename tgt: {}", e))?;
+
+    Ok(())
+}
+
+/// SQL-quote a text literal — doubles embedded single quotes.
+fn sql_literal_text(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
+}
+
+/// Return `pg_get_expr(c.relpartbound, c.oid)` for a child, e.g.
+/// `FOR VALUES IN ('N', 'S')`.  Returns the empty string when the child is
+/// not a partition or the lookup fails.
+fn read_partition_bound(client: &pgrx::spi::SpiClient<'_>, schema: &str, bare: &str) -> String {
+    client
+        .select(
+            "SELECT pg_get_expr(c.relpartbound, c.oid) AS bound \
+             FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname = $1 AND c.relname = $2",
+            Some(1),
+            &[
+                unsafe {
+                    DatumWithOid::new(schema.to_string(), PgBuiltInOids::TEXTOID.oid().value())
+                },
+                unsafe {
+                    DatumWithOid::new(bare.to_string(), PgBuiltInOids::TEXTOID.oid().value())
+                },
+            ],
+        )
+        .ok()
+        .and_then(|mut it| it.next())
+        .and_then(|r| {
+            r.get_by_name::<&str, _>("bound")
+                .ok()
+                .flatten()
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_default()
+}
+
+/// Return `pg_get_partition_constraintdef(child_oid)` — the boolean expression
+/// describing the partition bound (e.g. `(region IS NOT NULL) AND (region = 'N')`).
+/// Returns the empty string on lookup failure.
+fn read_partition_constraint_def(
+    client: &pgrx::spi::SpiClient<'_>,
+    schema: &str,
+    bare: &str,
+) -> String {
+    let qname = format!("{}.{}", schema, bare);
+    client
+        .select(
+            "SELECT pg_get_partition_constraintdef(to_regclass($1)::oid) AS def",
+            Some(1),
+            &[unsafe { DatumWithOid::new(qname, PgBuiltInOids::TEXTOID.oid().value()) }],
+        )
+        .ok()
+        .and_then(|mut it| it.next())
+        .and_then(|r| {
+            r.get_by_name::<&str, _>("def")
+                .ok()
+                .flatten()
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_default()
+}
+
+/// Drop any `__reflex_swap_*_<bare_view>_*` orphan TABLES left behind by a
+/// prior failed swap.  Filters `relkind = 'r'` so leftover indexes
+/// (which keep their pre-rename names when their owning swap table is
+/// renamed to the canonical child name) are not touched — they're
+/// functional and dropping them would break the canonical child's
+/// UNIQUE index attachment.
+fn cleanup_orphan_swap_tables(view_name: &str) {
+    let (schema_opt, bare_view) = split_qualified_name(view_name);
+    let schema = schema_opt.unwrap_or("public").to_string();
+    let prefix_int = format!("__reflex_swap_int_{}_", bare_view);
+    let prefix_tgt = format!("__reflex_swap_tgt_{}_", bare_view);
+
+    let _ = Spi::connect_mut(|client| -> Result<(), ()> {
+        let q = "SELECT c.relname::text AS r \
+                 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+                 WHERE n.nspname = $1 \
+                   AND c.relkind = 'r' \
+                   AND (c.relname LIKE $2 || '%' OR c.relname LIKE $3 || '%')";
+        let mut targets: Vec<String> = Vec::new();
+        if let Ok(rows) = client.select(
+            q,
+            None,
+            &[
+                unsafe { DatumWithOid::new(schema.clone(), PgBuiltInOids::TEXTOID.oid().value()) },
+                unsafe {
+                    DatumWithOid::new(prefix_int.clone(), PgBuiltInOids::TEXTOID.oid().value())
+                },
+                unsafe {
+                    DatumWithOid::new(prefix_tgt.clone(), PgBuiltInOids::TEXTOID.oid().value())
+                },
+            ],
+        ) {
+            for row in rows {
+                if let Ok(Some(name)) = row.get_by_name::<&str, _>("r") {
+                    targets.push(name.to_string());
+                }
+            }
+        }
+        for name in targets {
+            let drop_sql = format!("DROP TABLE IF EXISTS \"{}\".\"{}\" CASCADE", schema, name);
+            let _ = client.update(&drop_sql, None, &[]);
+        }
+        Ok(())
+    });
+}
+
+/// Replace bare-identifier occurrences of `ident` in `expr` with `replacement`.
+/// Case-insensitive, only matches whole words (alphanumeric/underscore
+/// boundaries).  Used to substitute a partition column with a literal value
+/// inside `pg_get_partition_constraintdef` output.
+fn substitute_identifier(expr: &str, ident: &str, replacement: &str) -> String {
+    let bytes = expr.as_bytes();
+    let lower_ident = ident.to_lowercase();
+    let mut out = String::with_capacity(expr.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i] as char;
+        if c.is_ascii_alphabetic() || c == '_' {
+            // word start
+            let start = i;
+            while i < bytes.len() {
+                let cc = bytes[i] as char;
+                if cc.is_ascii_alphanumeric() || cc == '_' {
+                    i += 1;
+                } else {
+                    break;
+                }
+            }
+            let word = &expr[start..i];
+            if word.to_lowercase() == lower_ident {
+                out.push_str(replacement);
+            } else {
+                out.push_str(word);
+            }
+        } else {
+            out.push(c);
+            i += 1;
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+#[path = "tests/unit_partition.rs"]
+mod tests;

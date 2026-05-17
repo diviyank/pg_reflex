@@ -148,6 +148,37 @@ pub struct AggregationPlan {
     /// path. Safe fallback.
     #[serde(default)]
     pub source_join_keys: std::collections::HashMap<String, Vec<(String, String)>>,
+    /// Partitioning (plans/partitioning_2.md). Empty means the IMV is
+    /// unpartitioned (legacy byte-for-byte behaviour). When set, the
+    /// intermediate and target tables are declared `PARTITION BY
+    /// <partition_strategy> (<partition_columns>)` and mirror the anchor
+    /// source's partition set.  Names are lowercased and unquoted.
+    #[serde(default)]
+    pub partition_columns: Vec<String>,
+    /// "LIST" or "RANGE"; empty when not partitioned.
+    #[serde(default)]
+    pub partition_strategy: String,
+    /// 1.5.3 (plans/partitioning_3.md §3) — name of the anchor source for
+    /// the partition column.  Empty when not partitioned, or when the
+    /// anchor cannot be resolved unambiguously.  Used by the trigger
+    /// codegen to decide whether the firing source is the anchor (Tier 1)
+    /// or a non-anchor (Tier 2 / fallback).
+    #[serde(default)]
+    pub anchor_source: String,
+    /// 1.5.3 (plans/partitioning_3.md §4) — per-source SQL fragment that
+    /// derives the IMV's partition column from this source's transition
+    /// table by JOINing to the anchor.  Empty for the anchor source itself
+    /// (it projects the partition column directly).  For non-anchor
+    /// sources that have a single-hop JOIN path to the anchor's partition
+    /// column, the fragment is a `SELECT a."<part_col>" AS pkey, t.* FROM
+    /// {transition_alias} t JOIN <anchor> a ON a."<anchor_col>" =
+    /// t."<source_col>"`.  The trigger substitutes `{transition_alias}`
+    /// with the actual transition table name at fire time.
+    ///
+    /// Empty value for a given source → no JOIN path; the trigger falls
+    /// through to global Path B for that source.
+    #[serde(default)]
+    pub partition_join_paths: std::collections::HashMap<String, String>,
 }
 
 impl AggregationPlan {
@@ -1221,6 +1252,12 @@ fn plan_aggregation_inner(analysis: &SqlAnalysis) -> AggregationPlan {
         // Populated separately by `build_source_join_keys` in create_ivm
         // after the plan is built — see the call site there.
         source_join_keys: std::collections::HashMap::new(),
+        // Populated by `create_reflex_ivm_impl` once the partition_by
+        // argument has been validated against the source.
+        partition_columns: Vec::new(),
+        partition_strategy: String::new(),
+        anchor_source: String::new(),
+        partition_join_paths: std::collections::HashMap::new(),
     }
 }
 

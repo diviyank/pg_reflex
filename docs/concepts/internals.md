@@ -128,6 +128,100 @@ The 1.4.4 change above removed the **per-column B-trees** that earlier versions 
 
 Moved to [Contributing → Development log](../contributing/development-log.md). That page is the version-by-version timeline of what shipped, and an index of approaches that were reverted with links to their journal entries.
 
+## Partitioning
+
+pg_reflex supports **declarative partitioning** of the intermediate and target tables as an opt-in feature (`plans/partitioning_2.md`). The motivation is partitioning is the cleanest fix for the "whole IMV unreachable during `reflex_reconcile`" reader-availability problem: a partition-scoped rebuild only locks the affected child.
+
+The public API exposes one new argument and two new functions:
+
+- `create_reflex_ivm(..., partition_by => ARRAY['col'])` — opt-in.
+- `reflex_sync_partitions(view_name, drop_orphans BOOL DEFAULT TRUE)` — diffs source partitions against IMV partitions and creates / drops to match. Idempotent.
+- `reflex_reconcile_partition(view_name, partition_keys TEXT)` — atomic DETACH/ATTACH swap one child instead of the whole IMV (1.6.0).
+- `reflex_set_wipe_floor_rows(view_name, n)` (1.6.0) — per-IMV floor for the per-partition denominator in the trigger-time dispatch ratio.
+- `reflex_set_partition_dispatch_cost_cap(view_name, n)` (1.6.0) — per-IMV cap for the Tier 2 JOIN cost estimate.
+
+The "anchor source" is the single source table that physically owns the partition column. Bounds are never cached — `pg_get_partition_constraintdef` and `pg_get_expr(relpartbound, oid)` are queried live from `pg_inherits` so we cannot drift from the source. v1 supports LIST and RANGE only; HASH is deferred.
+
+### Atomic swap (1.6.0, `plans/partitioning_3.md` §1)
+
+Both `reflex_reconcile_partition` (one partition) and `reflex_reconcile` (every partition, when the IMV is partitioned) use the same per-child swap helper (`partition::execute_partition_swap_for_child`).  The flow per partition:
+
+1. Build the new partition outside the partition tree: `CREATE [UNLOGGED] TABLE __reflex_swap_int_<view>_<src_child> (LIKE old_child INCLUDING ALL)`.
+2. Fill it from `(base_query)` restricted by the partition's constraint def.  The fill happens BEFORE any lock on the parent — `AccessShareLock` only on the source.
+3. Add a `CHECK` constraint matching the partition bound — PG sees this and skips its own ATTACH validation scan, shortening the parent-lock window further.
+4. Atomically inside one SPI sub-transaction:
+   - `DETACH PARTITION` the old child from the parent.
+   - `ATTACH PARTITION` the new (swap) child to the parent with the same bound.
+   - `DROP TABLE` the now-orphaned old child.
+   - `RENAME` the swap table to the canonical child name so a subsequent reconcile / sync can find it.
+
+The intermediate must be swapped before the target — the target swap's fill reads `end_query` from the intermediate, so the intermediate must be at post-rebuild state. Order: build + swap intermediate, build + swap target. Passthrough IMVs skip the intermediate step.
+
+**Idempotent recovery**: every entry point drops leftover `__reflex_swap_*` tables for the view (signaled purely by name prefix). If DETACH+ATTACH fails mid-way, the outer Spi::connect_mut sub-transaction rolls back the entire reconcile call — the IMV stays in its pre-call state.
+
+**Lock window**: AccessExclusiveLock on the parent is taken for the DETACH/ATTACH DDL itself (~µs) and held until the transaction commits. Readers on other partitions are blocked only during the DDL window, not during the data fill.
+
+**Global reconcile**: `reflex_reconcile` on a partitioned IMV (1.6.0 follow-up) iterates over every source partition child and calls the swap helper per child — bypassing the legacy TRUNCATE-on-parent + INSERT-via-tuple-routing pattern that held the parent's AccessExclusiveLock for the entire rebuild.  Per-partition swap is also ~30% faster on the synthetic bench (1474 ms vs 2148 ms on a 10M-row 4-partition IMV) because direct per-child INSERT skips PG's tuple-routing overhead.
+
+### Per-partition trigger dispatch (1.6.0, `plans/partitioning_3.md` §3)
+
+A bulk write concentrated in one or two partitions used to trip the per-IMV `wipe_threshold` and route to global `reflex_reconcile`, rebuilding all partitions. The Phase C dispatch (`build_partition_aware_dispatch_sql`) replaces the global dispatch for partitioned LIST IMVs:
+
+1. After scratch + affected are populated, GROUP the affected table by the partition column to get per-partition dirty counts.
+2. Look up the matching child via `__reflex_partition_child_for_key(parent, part_col, key)` and read its `reltuples`.
+3. Classify partitions as hot (`dirty / GREATEST(reltuples, wipe_floor_rows) >= wipe_threshold`) or cold.
+4. Trip-cap: if `hot_count > total / 2`, fall back to global `reflex_reconcile` (sequentially DETACHing > half the partitions is worse than one rebuild).
+5. Hot partitions → `reflex_reconcile_partition(view, hot_keys_csv)` (uses the atomic swap from §1).
+6. Cold partitions → standard MERGE / dead-cleanup / target DELETE / target INSERT with a `<partition_col> <> ALL($1::TEXT[])` filter spliced into the USING / WHERE clauses (`$1` is the hot-keys array, bound via EXECUTE USING).
+
+The `wipe_floor_rows` floor on the denominator avoids tripping the dispatch on never-ANALYZE'd partitions where `reltuples = 0` would yield infinite ratios.
+
+### `partition_by` must be bare columns (1.6.0, `plans/partitioning_3.md` §2)
+
+`partition_by` columns must correspond to bare column references in `GROUP BY` (`Expr::Identifier` / `Expr::CompoundIdentifier`). Computed GROUP BY expressions (`DATE_TRUNC('month', d)`, `UPPER(col)`, casts, arithmetic) are rejected at `create_reflex_ivm` time. Rationale: the per-partition dispatch needs to find the partition key on transition tables by simple column reference; computed expressions would require re-evaluating the function on every transition row. **Workaround**: add a generated / computed column to the source and partition on that.
+
+### Tier 2 metadata (1.6.0, `plans/partitioning_3.md` §4)
+
+`AggregationPlan.partition_join_paths` is a per-source SQL fragment that derives the IMV's partition column from each non-anchor source's transition table by JOINing to the anchor. Populated at create time for sources where `source_join_keys` contains a `(partition_col, source_col)` pair. Format: `SELECT a."{partition_col}" AS pkey, t.* FROM {transition_alias} t JOIN {anchor} a ON a."{partition_col}" = t."{source_col}"`. The `{transition_alias}` placeholder is substituted at trigger fire time with the actual transition table name.
+
+In the current implementation the post-scratch dispatch reads pkey counts from the affected table directly (which already carries the partition column from the JOIN), so the Tier 2 fragment is held in reserve for a future pre-scratch dispatch optimisation.
+
+### Sync semantics
+
+`reflex_sync_partitions(view, true)` is symmetric: source partitions absent from the IMV are created (CASCADE-safe DDL, advisory-lock protected), and IMV partitions absent from the source are dropped (`DROP TABLE ... CASCADE` — only touches the pg_reflex-owned partition child). `drop_orphans => FALSE` preserves orphans and emits a NOTICE instead. Sync runs automatically at the start of every `reflex_reconcile` and `reflex_reconcile_partition`.
+
+### Auto-mirror
+
+When `partition_by` is NULL, pg_reflex introspects the source tables and *auto-mirrors* if:
+
+- Exactly one source table is partitioned LIST/RANGE.
+- For aggregate IMVs, the partition column is in `GROUP BY`.
+- For passthrough IMVs, the partition column is in the projected SELECT list.
+
+Otherwise a NOTICE is emitted and the IMV stays unpartitioned. The explicit `partition_by` argument always wins over auto-mirror.
+
+### Constraint: partition_by ⊆ GROUP BY (aggregate IMVs)
+
+The intermediate has a `UNIQUE ... NULLS NOT DISTINCT` index on the group-by columns, and PostgreSQL requires a unique index on a partitioned table to include the partition key. So partition columns must be a subset of GROUP BY for aggregate IMVs — validated at `create_reflex_ivm` time.
+
+### Cascade
+
+`reflex_reconcile_partition(B, keys)` cascades to every IMV depending on B. If the dependent IMV is partitioned **on the same column**, the cascade calls `reflex_reconcile_partition(dep, keys)`. Otherwise it falls back to full `reflex_reconcile(dep)` — cross-column partition mapping is not generally well-defined and is deferred.
+
+### Source partition ATTACH auto-propagates (1.6.0)
+
+When the user adds a new partition to a source — `ALTER TABLE parent ATTACH PARTITION child …` or `CREATE TABLE child PARTITION OF parent …` — pg_reflex's `ddl_command_end` event trigger (`reflex_on_ddl_command_end`, function `public.__reflex_on_ddl_command_end`) fires. The function:
+
+1. Iterates `pg_event_trigger_ddl_commands()`.
+2. For each `ALTER TABLE` it treats the object identity as the candidate parent. For each `CREATE TABLE` it looks up `pg_inherits` to determine whether the new table was attached as a partition of some parent (this catches both `CREATE TABLE … PARTITION OF` and `ATTACH PARTITION` paths regardless of how Postgres labels the `object_type`).
+3. For every partitioned IMV (`partition_columns IS NOT NULL`) whose `depends_on` contains that parent, it calls `reflex_sync_partitions(view, drop_orphans=>FALSE)`. The sync is idempotent and advisory-lock protected; duplicates within one transaction collapse harmlessly.
+
+`drop_orphans=FALSE` is deliberate: DETACH on the source is not a delete signal. The IMV partition may still hold data the operator wants to query. To drop orphans, call `reflex_sync_partitions(view, true)` manually.
+
+Non-partition `ALTER TABLE` variants (column add/drop, …) on a tracked source still trip the existing `pg_reflex.alter_source_policy = warn|error` contract — the auto-sync branch is a no-op for IMVs without `partition_columns` set.
+
+`reflex_reconcile` also runs `reflex_sync_partitions` at entry as a defense-in-depth (event triggers can be disabled by superusers via `ALTER EVENT TRIGGER ... DISABLE`).
+
 ## Per-IMV SAVEPOINT in DEFERRED flush
 
 `reflex_flush_deferred` wraps each IMV's drain in its own SAVEPOINT. A failing IMV (e.g. constraint violation on the target) doesn't abort the whole transaction's cascade — the failure is recorded against that IMV and the next one runs. See [crash recovery](../operations/crash-recovery.md) and `__reflex_ivm_reference.last_error`.
@@ -151,6 +245,9 @@ Cross-references for readers walking the code:
 | TRUNCATE codegen | `src/trigger.rs:2227` (`reflex_build_truncate_sql`) |
 | `reflex_reconcile` TRUNCATE+INSERT | `src/reconcile.rs:102`, `:241` |
 | Source-join-keys metadata | `src/aggregation.rs` (`source_join_keys` on `AggregationPlan`) |
+| Partitioning module (introspect, sync, reconcile_partition) | `src/partition.rs` |
+| Partition validation + auto-mirror | `src/create_ivm.rs` (`Partitioning resolution` block) |
+| PARTITION BY clause in intermediate/target DDL | `src/schema_builder.rs:build_intermediate_table_ddl`, `:build_target_table_ddl` |
 
 [Delta processing :material-arrow-right-bold:](delta-processing.md){ .md-button }
 [Architecture tour (contributor) :material-arrow-right-bold:](../contributing/architecture-tour.md){ .md-button }

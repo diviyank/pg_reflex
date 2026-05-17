@@ -19,6 +19,7 @@ mod aggregation;
 mod create_ivm;
 mod drop_ivm;
 mod introspect;
+mod partition;
 mod query_decomposer;
 mod reconcile;
 mod schema_builder;
@@ -96,6 +97,89 @@ extension_sql!(
 
     -- Index on name for fast lookups
     CREATE INDEX IF NOT EXISTS idx__reflex_ivm_name ON public.__reflex_ivm_reference(name);
+
+    -- Partitioning (plans/partitioning_2.md). Opt-in: NULL/empty means the
+    -- IMV is unpartitioned (legacy behaviour, byte-for-byte). When set, the
+    -- intermediate + target tables are created as declarative partitioned
+    -- tables on these columns, with one child per source partition.
+    -- partition_strategy is 'LIST' or 'RANGE'. Bounds are NEVER cached —
+    -- they're looked up live from the anchor source via pg_inherits +
+    -- relpartbound so we cannot drift.
+    ALTER TABLE public.__reflex_ivm_reference
+        ADD COLUMN IF NOT EXISTS partition_columns TEXT[];
+    ALTER TABLE public.__reflex_ivm_reference
+        ADD COLUMN IF NOT EXISTS partition_strategy TEXT;
+
+    -- 1.6.0 (plans/partitioning_3.md §3): per-IMV floor for the per-partition
+    -- denominator in the trigger-time dispatch ratio.  `dirty / GREATEST(
+    -- reltuples, wipe_floor_rows) >= wipe_threshold` is the per-partition
+    -- decision.  Without a floor a partition with reltuples=0 (brand-new or
+    -- never-ANALYZE'd) trips the dispatch at any non-zero |dirty|.  NULL =
+    -- inherit GUC `reflex.wipe_floor_rows` → compiled default (1000).
+    ALTER TABLE public.__reflex_ivm_reference
+        ADD COLUMN IF NOT EXISTS wipe_floor_rows BIGINT;
+
+    -- 1.6.0 (plans/partitioning_3.md §4): Tier 2 partition-derivation cost
+    -- cap.  When the trigger fires on a non-anchor (JOIN-secondary) source
+    -- and would JOIN to the anchor to derive partition keys, EXPLAIN the
+    -- JOIN first; if the planner estimates more than this many rows, skip
+    -- the per-partition dispatch and fall through to global Path B.  NULL =
+    -- inherit GUC `reflex.partition_dispatch_cost_cap` → compiled default
+    -- (100000).
+    ALTER TABLE public.__reflex_ivm_reference
+        ADD COLUMN IF NOT EXISTS partition_dispatch_cost_cap BIGINT;
+
+    -- 1.6.0: SQL helper used by the per-partition dispatch DO block emitted
+    -- by build_partition_aware_dispatch_sql.  Given a partitioned parent +
+    -- partition column name + a single text-form key, returns the regclass
+    -- of the child whose constraint covers the key (NULL if none).
+    --
+    -- Implementation: walk the parent's children via pg_inherits, evaluate
+    -- each child's `pg_get_partition_constraintdef` boolean expression
+    -- with the partition column substituted by the literal key.  Same
+    -- shape used inline by reflex_reconcile_partition (Rust path) — kept
+    -- as a SQL helper so the trigger-time dispatch can reuse it without
+    -- per-fire SPI round-trips through reflex_build_delta_sql.
+    --
+    -- LIST: works directly (constraint is `col = ANY(ARRAY['A','B'])`).
+    -- RANGE: works for single-column RANGE (constraint is a < /<= test).
+    -- Multi-column partition keys: NOT supported (single-key v1 limit).
+    CREATE OR REPLACE FUNCTION public.__reflex_partition_child_for_key(
+        parent regclass, part_col TEXT, k TEXT
+    ) RETURNS regclass
+    LANGUAGE plpgsql STABLE AS $REFLEX$
+    DECLARE
+        _r RECORD;
+        _expr TEXT;
+        _match BOOLEAN;
+        _ident_re TEXT;
+    BEGIN
+        IF parent IS NULL OR part_col IS NULL OR k IS NULL THEN
+            RETURN NULL;
+        END IF;
+        _ident_re := '\m(?:' || regexp_replace(part_col, '([\\.+*?^$()\[\]{}|])', '\\\1', 'g')
+                     || ')\M';
+        FOR _r IN
+            SELECT c.oid::regclass AS rc,
+                   pg_get_partition_constraintdef(c.oid) AS def
+            FROM pg_inherits i
+            JOIN pg_class c ON c.oid = i.inhrelid
+            WHERE i.inhparent = parent
+        LOOP
+            IF _r.def IS NULL OR _r.def = '' THEN CONTINUE; END IF;
+            _expr := regexp_replace(_r.def, _ident_re, quote_literal(k), 'gi');
+            BEGIN
+                EXECUTE 'SELECT (' || _expr || ')::boolean' INTO _match;
+            EXCEPTION WHEN OTHERS THEN
+                _match := FALSE;
+            END;
+            IF _match THEN
+                RETURN _r.rc;
+            END IF;
+        END LOOP;
+        RETURN NULL;
+    END;
+    $REFLEX$;
     "#,
     name = "pg_reflex_init",
 );
@@ -168,6 +252,36 @@ fn create_reflex_ivm(
         mode.unwrap_or("IMMEDIATE"),
         Some(DEFAULT_TOPK_K),
         &ignore_vec,
+        &[],
+    )
+}
+
+/// Partitioned overload of `create_reflex_ivm`. `partition_by` is the
+/// list of OUTPUT column names to partition on (must be ⊆ GROUP BY for
+/// aggregate IMVs); strategy + bounds are derived from the anchor source's
+/// partition descriptor.
+#[pg_extern(name = "create_reflex_ivm")]
+fn create_reflex_ivm_partitioned(
+    view_name: &str,
+    sql: &str,
+    unique_columns: Option<&str>,
+    storage: Option<&str>,
+    mode: Option<&str>,
+    ignore_sources: Option<&str>,
+    partition_by: Vec<Option<String>>,
+) -> &'static str {
+    let ignore_vec = parse_ignore_sources_list(ignore_sources.unwrap_or(""));
+    let part_cols = partition::parse_partition_by_input(Some(partition_by));
+    create_ivm::create_reflex_ivm_impl(
+        view_name,
+        sql,
+        unique_columns.unwrap_or(""),
+        false,
+        storage.unwrap_or("UNLOGGED"),
+        mode.unwrap_or("IMMEDIATE"),
+        Some(DEFAULT_TOPK_K),
+        &ignore_vec,
+        &part_cols,
     )
 }
 
@@ -191,6 +305,34 @@ fn create_reflex_ivm_with_topk(
         mode.unwrap_or("IMMEDIATE"),
         if topk > 0 { Some(topk as usize) } else { None },
         &ignore_vec,
+        &[],
+    )
+}
+
+#[pg_extern(name = "create_reflex_ivm")]
+#[allow(clippy::too_many_arguments)]
+fn create_reflex_ivm_with_topk_partitioned(
+    view_name: &str,
+    sql: &str,
+    unique_columns: Option<&str>,
+    storage: Option<&str>,
+    mode: Option<&str>,
+    topk: i32,
+    ignore_sources: Option<&str>,
+    partition_by: Vec<Option<String>>,
+) -> &'static str {
+    let ignore_vec = parse_ignore_sources_list(ignore_sources.unwrap_or(""));
+    let part_cols = partition::parse_partition_by_input(Some(partition_by));
+    create_ivm::create_reflex_ivm_impl(
+        view_name,
+        sql,
+        unique_columns.unwrap_or(""),
+        false,
+        storage.unwrap_or("UNLOGGED"),
+        mode.unwrap_or("IMMEDIATE"),
+        if topk > 0 { Some(topk as usize) } else { None },
+        &ignore_vec,
+        &part_cols,
     )
 }
 
@@ -213,7 +355,57 @@ fn create_reflex_ivm_if_not_exists(
         mode.unwrap_or("IMMEDIATE"),
         Some(DEFAULT_TOPK_K),
         &ignore_vec,
+        &[],
     )
+}
+
+#[pg_extern(name = "create_reflex_ivm_if_not_exists")]
+fn create_reflex_ivm_if_not_exists_partitioned(
+    view_name: &str,
+    sql: &str,
+    unique_columns: Option<&str>,
+    storage: Option<&str>,
+    mode: Option<&str>,
+    ignore_sources: Option<&str>,
+    partition_by: Vec<Option<String>>,
+) -> &'static str {
+    let ignore_vec = parse_ignore_sources_list(ignore_sources.unwrap_or(""));
+    let part_cols = partition::parse_partition_by_input(Some(partition_by));
+    create_ivm::create_reflex_ivm_impl(
+        view_name,
+        sql,
+        unique_columns.unwrap_or(""),
+        true,
+        storage.unwrap_or("UNLOGGED"),
+        mode.unwrap_or("IMMEDIATE"),
+        Some(DEFAULT_TOPK_K),
+        &ignore_vec,
+        &part_cols,
+    )
+}
+
+/// Sync IMV partitions with the source's partition set.  When
+/// `drop_orphans` is true (default), IMV partitions whose source
+/// counterpart has been dropped are removed via `DROP TABLE ... CASCADE`
+/// (touches only pg_reflex-owned objects below the IMV partition).  When
+/// false, orphans are preserved and a NOTICE is emitted.
+///
+/// Idempotent; safe to call repeatedly.  No-op when the IMV is
+/// unpartitioned.
+#[pg_extern]
+fn reflex_sync_partitions(view_name: &str, drop_orphans: default!(bool, "TRUE")) -> String {
+    partition::reflex_sync_partitions_impl(view_name, drop_orphans)
+}
+
+/// Reconcile only the partition(s) of an IMV that cover the given
+/// `partition_keys` (comma-separated text list).  The partition's
+/// intermediate + target child are TRUNCATEd and rebuilt via the base /
+/// end query restricted by the child's partition constraint.  Cascades
+/// to dependent IMVs partitioned on the same column with the same keys,
+/// or to full reconcile otherwise.
+#[pg_extern]
+fn reflex_reconcile_partition(view_name: &str, partition_keys: &str) -> String {
+    partition::reflex_reconcile_partition_impl(view_name, partition_keys)
 }
 
 /// Drop a reflex IMV and all its artifacts (triggers, tables, reference row).
@@ -373,6 +565,101 @@ fn reflex_set_wipe_threshold(view_name: &str, value: Option<pgrx::AnyNumeric>) -
     }
 }
 
+/// 1.6.0 — set or clear the per-IMV `wipe_floor_rows` override.  The
+/// per-partition dispatch DO block reads this floor on the denominator of
+/// the dirty/partition-size ratio so a tiny / never-ANALYZE'd partition
+/// (`reltuples = 0`) cannot trip the dispatch with a single dirty row.
+/// Pass `value = NULL` to clear (fall back to GUC / compiled default 1000).
+#[pg_extern]
+fn reflex_set_wipe_floor_rows(view_name: &str, value: Option<i64>) -> String {
+    if let Err(msg) = validate_view_name(view_name) {
+        return msg.to_string();
+    }
+    let result: Result<u64, String> = Spi::connect_mut(|client| {
+        let n = client
+            .update(
+                "UPDATE public.__reflex_ivm_reference SET wipe_floor_rows = $1 WHERE name = $2",
+                None,
+                &[
+                    unsafe { DatumWithOid::new(value, PgBuiltInOids::INT8OID.oid().value()) },
+                    unsafe {
+                        DatumWithOid::new(
+                            view_name.to_string(),
+                            PgBuiltInOids::TEXTOID.oid().value(),
+                        )
+                    },
+                ],
+            )
+            .map_err(|e| format!("update failed: {}", e))?
+            .len();
+        Ok(n as u64)
+    });
+    match result {
+        Ok(0) => format!(
+            "ERROR: IMV '{}' not found in __reflex_ivm_reference",
+            view_name
+        ),
+        Ok(_) => match value {
+            Some(v) => format!("OK — '{}' wipe_floor_rows set to {}", view_name, v),
+            None => format!(
+                "OK — '{}' wipe_floor_rows cleared (uses GUC/default)",
+                view_name
+            ),
+        },
+        Err(e) => format!("ERROR: {}", e),
+    }
+}
+
+/// 1.6.0 (plans/partitioning_3.md §4) — set or clear the per-IMV
+/// `partition_dispatch_cost_cap`.  When a Tier 2 (JOIN-secondary)
+/// source-trigger fires on a partitioned IMV, the dispatch JOINs to the
+/// anchor source to derive partition keys; if the planner's estimated row
+/// count of that JOIN exceeds this cap, the per-partition dispatch is
+/// skipped and the trigger falls back to global Path B.  NULL = inherit
+/// GUC `reflex.partition_dispatch_cost_cap` → compiled default (100000).
+#[pg_extern]
+fn reflex_set_partition_dispatch_cost_cap(view_name: &str, value: Option<i64>) -> String {
+    if let Err(msg) = validate_view_name(view_name) {
+        return msg.to_string();
+    }
+    let result: Result<u64, String> = Spi::connect_mut(|client| {
+        let n = client
+            .update(
+                "UPDATE public.__reflex_ivm_reference SET partition_dispatch_cost_cap = $1 WHERE name = $2",
+                None,
+                &[
+                    unsafe { DatumWithOid::new(value, PgBuiltInOids::INT8OID.oid().value()) },
+                    unsafe {
+                        DatumWithOid::new(
+                            view_name.to_string(),
+                            PgBuiltInOids::TEXTOID.oid().value(),
+                        )
+                    },
+                ],
+            )
+            .map_err(|e| format!("update failed: {}", e))?
+            .len();
+        Ok(n as u64)
+    });
+    match result {
+        Ok(0) => format!(
+            "ERROR: IMV '{}' not found in __reflex_ivm_reference",
+            view_name
+        ),
+        Ok(_) => match value {
+            Some(v) => format!(
+                "OK — '{}' partition_dispatch_cost_cap set to {}",
+                view_name, v
+            ),
+            None => format!(
+                "OK — '{}' partition_dispatch_cost_cap cleared (uses GUC/default)",
+                view_name
+            ),
+        },
+        Err(e) => format!("ERROR: {}", e),
+    }
+}
+
 extension_sql!(
     r#"
     CREATE OR REPLACE FUNCTION public.__reflex_on_sql_drop()
@@ -416,8 +703,11 @@ extension_sql!(
         _cmd RECORD;
         _imv RECORD;
         _src TEXT;
+        _parent TEXT;
         _policy TEXT;
         _affected TEXT[] := ARRAY[]::TEXT[];
+        _synced_keys TEXT[] := ARRAY[]::TEXT[];
+        _sync_key TEXT;
     BEGIN
         _policy := lower(COALESCE(NULLIF(current_setting('pg_reflex.alter_source_policy', true), ''), 'warn'));
         IF _policy NOT IN ('warn', 'error') THEN
@@ -425,6 +715,88 @@ extension_sql!(
             _policy := 'warn';
         END IF;
 
+        -- 1.6.0: auto-sync IMV partitions when a source's partition tree changes.
+        --
+        -- Two trigger surfaces matter:
+        --   (a) ALTER TABLE parent ATTACH/DETACH PARTITION child
+        --       → pg_event_trigger_ddl_commands() returns object_identity = parent,
+        --         command_tag = 'ALTER TABLE'.
+        --   (b) CREATE TABLE child PARTITION OF parent FOR VALUES ...
+        --       → command_tag = 'CREATE TABLE'; object_identity = child;
+        --         the parent must be looked up via pg_inherits.
+        --
+        -- For every command we resolve a candidate parent table name, then for
+        -- each partitioned IMV depending on that parent we call
+        -- reflex_sync_partitions(view, drop_orphans=>FALSE) — orphan deletion is
+        -- never automatic (IMV data is the user's, and a DETACH on the source
+        -- side is not a delete signal). reflex_sync_partitions is idempotent
+        -- and advisory-lock protected, so duplicate fires inside one
+        -- transaction collapse harmlessly.
+        --
+        -- The previous (1.5.x) warn/error contract for non-partition ALTERs
+        -- (column add/drop on a tracked source) is preserved below.
+
+        FOR _cmd IN
+            SELECT object_identity, object_type, command_tag
+            FROM pg_event_trigger_ddl_commands()
+            WHERE command_tag IN ('ALTER TABLE', 'CREATE TABLE')
+        LOOP
+            -- Resolve the parent table for partition-tree changes. NULL for
+            -- non-partition events (regular ALTER TABLE on a leaf table).
+            _parent := NULL;
+            IF _cmd.command_tag = 'ALTER TABLE' THEN
+                -- ATTACH / DETACH PARTITION: object_identity is the parent.
+                -- Other ALTER variants (ADD COLUMN, …) also land here with
+                -- object_identity = the altered table — we sync anyway iff
+                -- that table is a partitioned source of a partitioned IMV.
+                _parent := _cmd.object_identity;
+            ELSIF _cmd.command_tag = 'CREATE TABLE' THEN
+                -- CREATE TABLE … PARTITION OF parent: look up parent via
+                -- pg_inherits regardless of `object_type` (PG reports
+                -- 'table' or 'table partition' depending on version).
+                -- Empty result = the new table isn't a partition; _parent
+                -- stays NULL and the branch below skips.
+                BEGIN
+                    SELECT n.nspname || '.' || c.relname INTO _parent
+                    FROM pg_inherits i
+                    JOIN pg_class c   ON c.oid = i.inhparent
+                    JOIN pg_namespace n ON n.oid = c.relnamespace
+                    WHERE i.inhrelid = _cmd.object_identity::regclass;
+                EXCEPTION WHEN OTHERS THEN
+                    _parent := NULL;
+                END;
+            END IF;
+
+            IF _parent IS NOT NULL THEN
+                FOR _imv IN
+                    SELECT name FROM public.__reflex_ivm_reference
+                    WHERE partition_columns IS NOT NULL
+                      AND array_length(partition_columns, 1) > 0
+                      AND (depends_on @> ARRAY[_parent]
+                           OR depends_on @> ARRAY[split_part(_parent, '.', 2)])
+                LOOP
+                    _sync_key := _parent || '|' || _imv.name;
+                    IF _sync_key = ANY(_synced_keys) THEN
+                        CONTINUE;
+                    END IF;
+                    _synced_keys := _synced_keys || _sync_key;
+                    BEGIN
+                        PERFORM public.reflex_sync_partitions(_imv.name, FALSE);
+                        RAISE NOTICE 'pg_reflex: auto-synced partitions for IMV % (source %)',
+                            _imv.name, _parent;
+                    EXCEPTION WHEN OTHERS THEN
+                        RAISE WARNING 'pg_reflex: auto-sync of IMV % failed after source % partition change: % — run SELECT reflex_sync_partitions(''%'') manually',
+                            _imv.name, _parent, SQLERRM, _imv.name;
+                    END;
+                END LOOP;
+            END IF;
+        END LOOP;
+
+        -- Warn/error policy for non-partition ALTERs on tracked sources.
+        -- This branch is unchanged from 1.5.x except that auto-sync above may
+        -- have already healed pure partition-tree changes; the warning still
+        -- fires (column shape may have changed) so the operator knows to
+        -- inspect.
         FOR _cmd IN
             SELECT object_identity, command_tag
             FROM pg_event_trigger_ddl_commands()
@@ -454,7 +826,7 @@ extension_sql!(
 
     CREATE EVENT TRIGGER reflex_on_ddl_command_end
         ON ddl_command_end
-        WHEN TAG IN ('ALTER TABLE')
+        WHEN TAG IN ('ALTER TABLE', 'CREATE TABLE')
         EXECUTE FUNCTION public.__reflex_on_ddl_command_end();
     "#,
     name = "pg_reflex_event_trigger",
@@ -510,6 +882,8 @@ mod tests {
     include!("tests/pg_test_search_path.rs");
     include!("tests/pg_test_directional_dispatch.rs");
     include!("tests/pg_test_coverage.rs");
+    include!("tests/pg_test_partition.rs");
+    include!("tests/pg_test_partition_dispatch.rs");
 }
 
 /// This module is required by `cargo pgrx test` invocations.

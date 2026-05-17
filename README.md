@@ -244,6 +244,71 @@ SELECT create_reflex_ivm('batch_view',
 );
 ```
 
+## Partitioning (1.6.0)
+
+When a source table is declaratively partitioned (LIST or RANGE), pg_reflex
+can partition the IMV's intermediate and target tables to match. A
+partition-scoped reconcile then locks only the affected child, leaving
+readers on every other partition live — solving the "whole IMV unreachable
+during reconcile" problem.
+
+```sql
+-- Source is partitioned LIST by region
+CREATE TABLE sales (id INT, region TEXT, amount NUMERIC)
+    PARTITION BY LIST (region);
+CREATE TABLE sales_us PARTITION OF sales FOR VALUES IN ('US');
+CREATE TABLE sales_eu PARTITION OF sales FOR VALUES IN ('EU');
+
+-- Auto-mirror: partition_by is inferred from the single partitioned source
+SELECT create_reflex_ivm('sales_by_region',
+    'SELECT region, SUM(amount) AS total FROM sales GROUP BY region');
+
+-- Or be explicit
+SELECT create_reflex_ivm('sales_by_region',
+    'SELECT region, SUM(amount) AS total FROM sales GROUP BY region',
+    partition_by => ARRAY['region']);
+
+-- Reconcile a single partition (atomic DETACH/ATTACH swap)
+SELECT reflex_reconcile_partition('sales_by_region', 'US');
+
+-- ATTACH/CREATE PARTITION OF on the source auto-propagates to the IMV
+-- via an event trigger — no manual sync call needed for inserts to land:
+ALTER TABLE sales ATTACH PARTITION sales_apac FOR VALUES IN ('APAC');
+INSERT INTO sales (id, region, amount) VALUES (1, 'APAC', 99);  -- routes cleanly
+```
+
+Highlights:
+
+- **Auto-mirror**: when exactly one source is partitioned LIST/RANGE and
+  the partition column is in `GROUP BY` (aggregate) or projected
+  (passthrough), `partition_by` is inferred automatically. Explicit
+  `partition_by` always wins.
+- **At creation**: `create_reflex_ivm` builds the IMV's intermediate +
+  target with one child per existing source partition. No manual
+  per-child setup.
+- **After ATTACH / CREATE PARTITION OF** on the source: pg_reflex's
+  `ddl_command_end` event trigger calls `reflex_sync_partitions` for
+  every partitioned IMV depending on that source. By default
+  `drop_orphans=FALSE` — DETACH on the source preserves the IMV
+  partition (it may still hold data the operator wants). Run
+  `reflex_sync_partitions(view, true)` manually to drop orphans.
+- **Atomic swap**: `reflex_reconcile_partition` (and `reflex_reconcile` on
+  partitioned IMVs) rebuilds each child outside the partition tree, then
+  flips it in via DETACH/ATTACH inside one sub-transaction. The
+  `AccessExclusiveLock` window on the parent collapses to the metadata
+  DDL (~µs) instead of the rebuild duration.
+- **Per-partition trigger dispatch**: a bulk write concentrated in one
+  partition routes through `reflex_reconcile_partition` instead of
+  rebuilding the whole IMV.
+- **Bare-column-ref constraint**: `partition_by` columns must be bare
+  column references in `GROUP BY`. Computed expressions
+  (`DATE_TRUNC(...)`, `UPPER(...)`, casts) are rejected at create time
+  — add a generated column to the source and partition on that.
+- **Strategies**: LIST and RANGE supported. HASH is not yet implemented.
+
+See [`docs/concepts/internals.md`](docs/concepts/internals.md#partitioning)
+for the full design and reader-blocking semantics.
+
 ## Supported SQL Features
 
 ### Aggregate Functions

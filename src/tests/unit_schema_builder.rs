@@ -47,6 +47,10 @@ fn sample_plan() -> AggregationPlan {
         imv_relevant_columns: std::collections::HashMap::new(),
         imv_relevant_where: std::collections::HashMap::new(),
         source_join_keys: std::collections::HashMap::new(),
+        partition_columns: Vec::new(),
+        partition_strategy: String::new(),
+        anchor_source: String::new(),
+        partition_join_paths: std::collections::HashMap::new(),
     }
 }
 
@@ -261,6 +265,10 @@ fn test_no_intermediate_for_passthrough() {
         imv_relevant_columns: std::collections::HashMap::new(),
         imv_relevant_where: std::collections::HashMap::new(),
         source_join_keys: std::collections::HashMap::new(),
+        partition_columns: Vec::new(),
+        partition_strategy: String::new(),
+        anchor_source: String::new(),
+        partition_join_paths: std::collections::HashMap::new(),
     };
     let types = HashMap::new();
     assert!(build_intermediate_table_ddl("test_view", &plan, &types, false).is_none());
@@ -355,6 +363,10 @@ fn test_intermediate_ddl_bool_or_emits_bigint_counters() {
         imv_relevant_columns: std::collections::HashMap::new(),
         imv_relevant_where: std::collections::HashMap::new(),
         source_join_keys: std::collections::HashMap::new(),
+        partition_columns: Vec::new(),
+        partition_strategy: String::new(),
+        anchor_source: String::new(),
+        partition_join_paths: std::collections::HashMap::new(),
     };
     let types = HashMap::new();
     let ddl = build_intermediate_table_ddl("test_view", &plan, &types, false).unwrap();

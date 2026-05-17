@@ -15,6 +15,15 @@ pub(crate) fn reflex_reconcile(view_name: &str) -> &'static str {
     if let Err(msg) = validate_view_name(view_name) {
         return msg;
     }
+    // Best-effort partition sync: keep the IMV partition set aligned with
+    // the source before rebuilding.  No-op for unpartitioned IMVs.  Sync
+    // failures are surfaced as a NOTICE but do not abort reconcile — the
+    // operator may have deliberately stale state, and the rebuild itself
+    // is the recovery action.
+    let sync_msg = crate::partition::reflex_sync_partitions_impl(view_name, true);
+    if sync_msg.starts_with("ERROR") {
+        pgrx::notice!("pg_reflex: sync before reconcile returned: {}", sync_msg);
+    }
     Spi::connect_mut(|client| {
         let rows = client
             .select(
@@ -53,12 +62,105 @@ pub(crate) fn reflex_reconcile(view_name: &str) -> &'static str {
             .unwrap_or("{}")
             .to_string();
 
-        let is_passthrough =
-            if let Ok(plan) = serde_json::from_str::<aggregation::AggregationPlan>(&agg_json) {
-                plan.is_passthrough
-            } else {
-                false
-            };
+        let parsed_plan: Option<aggregation::AggregationPlan> =
+            serde_json::from_str::<aggregation::AggregationPlan>(&agg_json).ok();
+        let is_passthrough = parsed_plan
+            .as_ref()
+            .map(|p| p.is_passthrough)
+            .unwrap_or(false);
+
+        // 1.5.3 (plans/partitioning_3.md §1 follow-up): partitioned IMVs
+        // skip the TRUNCATE-on-parent pattern and rebuild each child via
+        // the same atomic DETACH/ATTACH swap used by
+        // `reflex_reconcile_partition`.  This keeps the
+        // AccessExclusiveLock window on the parent to per-child DDL only
+        // (microseconds) instead of holding it for the entire rebuild
+        // duration.  Readers pruning to a not-yet-swapped partition stay
+        // live throughout.
+        if let Some(ref plan) = parsed_plan {
+            if !plan.partition_columns.is_empty()
+                && !plan.partition_strategy.is_empty()
+                && !plan.anchor_source.is_empty()
+            {
+                let (schema_opt, _) = split_qualified_name(view_name);
+                let schema = schema_opt.unwrap_or("public").to_string();
+
+                // Resolve storage mode from the catalog so swap tables
+                // match the parent's persistence.
+                let storage_mode: String = client
+                    .select(
+                        "SELECT storage_mode FROM public.__reflex_ivm_reference WHERE name = $1",
+                        Some(1),
+                        &[unsafe {
+                            DatumWithOid::new(
+                                view_name.to_string(),
+                                PgBuiltInOids::TEXTOID.oid().value(),
+                            )
+                        }],
+                    )
+                    .ok()
+                    .and_then(|mut it| it.next())
+                    .and_then(|r| {
+                        r.get_by_name::<&str, _>("storage_mode")
+                            .ok()
+                            .flatten()
+                            .map(|s| s.to_string())
+                    })
+                    .unwrap_or_else(|| "UNLOGGED".to_string());
+                let unlogged = storage_mode.eq_ignore_ascii_case("UNLOGGED");
+
+                // Walk every source partition child and swap each.
+                let src_children =
+                    crate::partition::list_partition_children(client, &plan.anchor_source);
+                for src in &src_children {
+                    if let Err(e) = crate::partition::execute_partition_swap_for_child(
+                        client,
+                        view_name,
+                        &schema,
+                        &src.bare_name,
+                        &base_query,
+                        &end_query,
+                        unlogged,
+                    ) {
+                        warning!(
+                            "pg_reflex: per-partition reconcile of '{}' for child '{}' failed: {}",
+                            view_name,
+                            src.bare_name,
+                            e
+                        );
+                        return "ERROR: partition reconcile failed";
+                    }
+                }
+
+                // ANALYZE the parents so the planner sees the freshly
+                // attached children's stats.
+                let _ = client.update(
+                    &format!("ANALYZE {}", intermediate_table_name(view_name)),
+                    None,
+                    &[],
+                );
+                let _ = client.update(
+                    &format!("ANALYZE {}", quote_identifier(view_name)),
+                    None,
+                    &[],
+                );
+
+                let _ = client.update(
+                    "UPDATE public.__reflex_ivm_reference SET last_update_date = NOW() WHERE name = $1",
+                    None,
+                    &[unsafe {
+                        DatumWithOid::new(view_name.to_string(), PgBuiltInOids::TEXTOID.oid().value())
+                    }],
+                );
+
+                info!(
+                    "pg_reflex: reconciled IMV '{}' (partitioned, {} children swapped)",
+                    view_name,
+                    src_children.len()
+                );
+                return "RECONCILED";
+            }
+        }
 
         if is_passthrough || end_query.is_empty() {
             // Passthrough: optimized refresh — drop indexes, TRUNCATE, INSERT, recreate, ANALYZE

@@ -936,6 +936,43 @@ fn imv_relevant_where_drops_disjunctions_within_conjunct() {
     assert!(w.contains("status = 'paid'"));
 }
 
+#[test]
+fn is_bare_column_reference_accepts_identifier() {
+    assert!(is_bare_column_reference("region"));
+    assert!(is_bare_column_reference("\"region\""));
+}
+
+#[test]
+fn is_bare_column_reference_accepts_compound_identifier() {
+    assert!(is_bare_column_reference("t.region"));
+    assert!(is_bare_column_reference("\"t\".\"region\""));
+}
+
+#[test]
+fn is_bare_column_reference_rejects_function_call() {
+    assert!(!is_bare_column_reference("DATE_TRUNC('month', d)"));
+    assert!(!is_bare_column_reference("UPPER(region)"));
+    assert!(!is_bare_column_reference("COALESCE(a, b)"));
+}
+
+#[test]
+fn is_bare_column_reference_rejects_arithmetic() {
+    assert!(!is_bare_column_reference("a + b"));
+    assert!(!is_bare_column_reference("region || '_x'"));
+}
+
+#[test]
+fn is_bare_column_reference_rejects_cast() {
+    assert!(!is_bare_column_reference("region::TEXT"));
+    assert!(!is_bare_column_reference("CAST(region AS TEXT)"));
+}
+
+#[test]
+fn is_bare_column_reference_rejects_garbage() {
+    assert!(!is_bare_column_reference(""));
+    assert!(!is_bare_column_reference("SELECT 1"));
+}
+
 mod proptest_tests {
     use super::*;
     use proptest::prelude::*;

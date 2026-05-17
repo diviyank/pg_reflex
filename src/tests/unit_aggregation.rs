@@ -404,6 +404,10 @@ fn plan_with_bool_or_of_is_not_null() -> AggregationPlan {
         imv_relevant_columns: std::collections::HashMap::new(),
         imv_relevant_where: std::collections::HashMap::new(),
         source_join_keys: std::collections::HashMap::new(),
+        partition_columns: Vec::new(),
+        partition_strategy: String::new(),
+        anchor_source: String::new(),
+        partition_join_paths: std::collections::HashMap::new(),
     }
 }
 
@@ -530,6 +534,10 @@ fn plan_with_sum_and_multiplied_coalesce() -> AggregationPlan {
         imv_relevant_columns: std::collections::HashMap::new(),
         imv_relevant_where: std::collections::HashMap::new(),
         source_join_keys: std::collections::HashMap::new(),
+        partition_columns: Vec::new(),
+        partition_strategy: String::new(),
+        anchor_source: String::new(),
+        partition_join_paths: std::collections::HashMap::new(),
     }
 }
 
@@ -1334,6 +1342,10 @@ fn cov_legacy_fallback_generate_end_query() {
         imv_relevant_columns: std::collections::HashMap::new(),
         imv_relevant_where: std::collections::HashMap::new(),
         source_join_keys: std::collections::HashMap::new(),
+        partition_columns: Vec::new(),
+        partition_strategy: String::new(),
+        anchor_source: String::new(),
+        partition_join_paths: std::collections::HashMap::new(),
     };
     let q = generate_end_query("v", &plan);
     assert!(q.contains("\"g\""), "should include group col: {}", q);
@@ -1372,6 +1384,10 @@ fn cov_legacy_fallback_with_distinct_and_count_distinct() {
         imv_relevant_columns: std::collections::HashMap::new(),
         imv_relevant_where: std::collections::HashMap::new(),
         source_join_keys: std::collections::HashMap::new(),
+        partition_columns: Vec::new(),
+        partition_strategy: String::new(),
+        anchor_source: String::new(),
+        partition_join_paths: std::collections::HashMap::new(),
     };
     let q = generate_end_query("v", &plan);
     // has_count_distinct_mapping = true (intermediate_expr starts with COUNT()
@@ -1411,6 +1427,10 @@ fn cov_legacy_fallback_build_target_table_ddl() {
         imv_relevant_columns: std::collections::HashMap::new(),
         imv_relevant_where: std::collections::HashMap::new(),
         source_join_keys: std::collections::HashMap::new(),
+        partition_columns: Vec::new(),
+        partition_strategy: String::new(),
+        anchor_source: String::new(),
+        partition_join_paths: std::collections::HashMap::new(),
     };
     let mut types = std::collections::HashMap::new();
     types.insert("g".to_string(), "TEXT".to_string());
@@ -1454,6 +1474,10 @@ fn cov_legacy_fallback_build_target_with_distinct_no_count() {
         imv_relevant_columns: std::collections::HashMap::new(),
         imv_relevant_where: std::collections::HashMap::new(),
         source_join_keys: std::collections::HashMap::new(),
+        partition_columns: Vec::new(),
+        partition_strategy: String::new(),
+        anchor_source: String::new(),
+        partition_join_paths: std::collections::HashMap::new(),
     };
     let mut types = std::collections::HashMap::new();
     types.insert("g".to_string(), "TEXT".to_string());

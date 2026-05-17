@@ -1,10 +1,159 @@
 # Changelog
 
-## [1.5.2] - 2026-05-17
+## [1.6.0] - 2026-05-17
 
-Correctness fix for quoted mixed-case column names.
+Declarative-partitioning support lands as a single bundled release. The
+previously-tagged-but-unreleased 1.5.2 mixed-case fix, Phase 1
+(`plans/partitioning_2.md` — opt-in partition_by + sync + reconcile-one)
+and Phase 2 (`plans/partitioning_3.md` — atomic DETACH/ATTACH swap +
+per-partition trigger dispatch + Tier 2 metadata) ship together.
 
-### Fixed
+Run `ALTER EXTENSION pg_reflex UPDATE TO '1.6.0';` after installing —
+the migration re-emits trigger function bodies so the mixed-case codegen
+takes effect; partitioning is opt-in so non-partitioned IMVs need no
+operator action.
+
+---
+
+### Added — Partitioning Phase 1 (opt-in partition support)
+
+- **`create_reflex_ivm(..., partition_by => ARRAY['col'])`** — explicit
+  partitioning of the IMV's intermediate and target tables. Strategy
+  (`LIST` or `RANGE`) and bounds are derived live from the anchor
+  source's partition descriptor — pg_reflex never caches bounds, so it
+  cannot drift. For aggregate IMVs the partition columns must be a
+  subset of `GROUP BY` (Postgres requires unique indexes on partitioned
+  tables to include the partition key, and the intermediate has a
+  `UNIQUE NULLS NOT DISTINCT` index on group-by columns). Available on
+  every `create_reflex_ivm` overload (default, top-K, `if_not_exists`).
+  HASH partitioning is not yet supported.
+- **`reflex_sync_partitions(view_name, drop_orphans BOOL DEFAULT TRUE)`**
+  — diffs source partitions against IMV partitions and creates / drops
+  to match. Idempotent, advisory-lock protected. `drop_orphans => FALSE`
+  preserves IMV partitions whose source counterpart has been dropped
+  (emits a NOTICE). Called automatically at the top of every
+  `reflex_reconcile`.
+- **`reflex_reconcile_partition(view_name, partition_keys TEXT)`** —
+  rebuilds only the IMV partition(s) covering the supplied keys
+  (comma-separated). Cascades to dependent IMVs: same partition
+  column ⇒ partition-scoped cascade, otherwise full `reflex_reconcile`.
+- **Auto-mirror** — when `partition_by` is NULL and exactly one real
+  source is partitioned LIST/RANGE, pg_reflex auto-derives partition
+  columns from the source iff the partition column is in `GROUP BY`
+  (aggregate IMVs) or in the projected SELECT list (passthrough IMVs).
+  Otherwise a NOTICE is emitted and the IMV stays unpartitioned. Explicit
+  `partition_by` always wins over auto-mirror.
+- **Catalog** — two new columns on `public.__reflex_ivm_reference`:
+  `partition_columns TEXT[]`, `partition_strategy TEXT`. Idempotent
+  `ADD COLUMN IF NOT EXISTS` migration runs at extension load.
+
+#### Reader-blocking semantics (Phase 1)
+
+Partitioned IMVs limit lock scope to the affected partition child. A
+`reflex_reconcile_partition` call takes `AccessExclusiveLock` only on
+the targeted child; readers on other children, or readers whose `WHERE`
+clause prunes to a different partition, run uninterrupted.
+Non-partitioned IMVs keep today's `TRUNCATE`-on-parent semantics —
+accepted operator trade-off. See
+[`docs/concepts/delta-processing.md`](docs/concepts/delta-processing.md#partitioned-imvs-16).
+
+#### Source partition ATTACH is auto-propagated (Phase 2)
+
+`ALTER TABLE parent ATTACH PARTITION child` and `CREATE TABLE child PARTITION OF parent` now auto-sync every partitioned IMV depending on `parent`, via the `reflex_on_ddl_command_end` event trigger. INSERTs to the brand-new partition value route cleanly without any manual call. The auto-sync uses `drop_orphans=FALSE` on purpose — DETACH on the source preserves the IMV partition (call `reflex_sync_partitions(view, true)` manually to drop). See [`docs/concepts/internals.md#source-partition-attach-auto-propagates-160`](docs/concepts/internals.md#source-partition-attach-auto-propagates-160).
+
+---
+
+### Added — Partitioning Phase 2: atomic DETACH/ATTACH swap
+
+- `reflex_reconcile_partition` now rebuilds the new partition outside
+  the partition tree (UNLOGGED swap table — `LIKE old_child INCLUDING
+  ALL`), fills it, then DETACHes the old child and ATTACHes the new
+  one inside a single SPI sub-transaction. A `CHECK` constraint
+  matching the partition bound is added before ATTACH so PG skips its
+  own validation scan, shortening the `AccessExclusiveLock` window on
+  the parent to the metadata DDL itself (~µs).
+- **Global `reflex_reconcile` on partitioned IMVs** now iterates over
+  every source partition child and runs the same per-child swap (via
+  the shared `partition::execute_partition_swap_for_child` helper)
+  instead of `TRUNCATE`-on-parent + INSERT-via-tuple-routing.  Bench:
+  31% faster on a 10M-row 4-partition IMV (2148 ms → 1474 ms), and
+  the parent-lock window drops from "rebuild duration" to "per-child
+  DDL (µs)".  Readers pruning to a not-yet-swapped partition stay live
+  throughout.
+- Idempotent recovery: every `reflex_reconcile_partition` /
+  `reflex_reconcile` entry drops any leftover `__reflex_swap_*` tables
+  from prior failed swaps.
+- `build_swap_partition_ddl` is the pure-Rust DDL builder driving the
+  swap; covered by unit tests in `src/tests/unit_partition.rs`.
+
+### Added — Partitioning Phase 2: `partition_by` validation
+
+- `partition_by` columns must now correspond to bare column references
+  (`Expr::Identifier` / `Expr::CompoundIdentifier`) in `GROUP BY`.
+  Computed GROUP BY expressions (`DATE_TRUNC('month', d)`, `UPPER(col)`,
+  casts, arithmetic) are rejected at `create_reflex_ivm` time with an
+  operator-friendly error message and workaround hint.
+- `sql_analyzer::is_bare_column_reference` is the new pure helper
+  driving the check.
+
+### Added — Partitioning Phase 2: per-partition trigger dispatch (Tier 1)
+
+- New `wipe_floor_rows` column on `__reflex_ivm_reference` plus
+  `reflex_set_wipe_floor_rows(view, n)` setter — the per-partition
+  denominator floor in the dispatch ratio.  Same precedence chain as
+  `wipe_threshold` (per-IMV → GUC → compiled default 1000).
+- `build_partition_aware_dispatch_sql` replaces the per-IMV ratio in
+  `build_high_selectivity_dispatch_sql` when the IMV is partitioned
+  LIST.  The DO block:
+  - GROUPs the populated affected table by the partition column.
+  - Looks up the matching child via the new
+    `__reflex_partition_child_for_key(parent, part_col, key)` SQL
+    helper (LIST + RANGE supported; multi-key partition keys deferred).
+  - Classifies partitions as hot / cold via
+    `dirty / GREATEST(reltuples, wipe_floor_rows) >= wipe_threshold`.
+  - Trip-cap (`hot_count > total / 2`) → falls back to
+    `reflex_reconcile(view)`.
+  - Hot → `reflex_reconcile_partition(view, hot_keys_csv)` (atomic
+    swap from Phase A).
+  - Cold → standard MERGE / dead-cleanup / target DELETE / target
+    INSERT with a `<partition_col> <> ALL($1::TEXT[])` filter spliced
+    into the USING / WHERE clauses.
+
+### Added — Partitioning Phase 2: Tier 2 metadata for JOIN-secondary sources
+
+- New `partition_join_paths` field on the persisted `AggregationPlan`
+  (HashMap<source, fragment>): per-source SQL that derives the IMV's
+  partition column from the source's transition table by JOINing to
+  the anchor.  Empty / missing entry = no JOIN path → trigger falls
+  through to global Path B for that source (safe).
+- New `partition_dispatch_cost_cap` column on
+  `__reflex_ivm_reference` plus
+  `reflex_set_partition_dispatch_cost_cap(view, n)` setter for the
+  Tier 2 EXPLAIN-row cap (default 100000).
+- `anchor_source` is also persisted on the plan so the trigger codegen
+  can detect Tier 1 vs Tier 2 at SQL build time without a per-fire
+  catalog lookup.
+
+### Catalog (Phase 2)
+
+- Two new columns on `__reflex_ivm_reference`: `wipe_floor_rows BIGINT`,
+  `partition_dispatch_cost_cap BIGINT`.  Idempotent `ADD COLUMN IF
+  NOT EXISTS` migration at extension load.
+- New SQL helper `public.__reflex_partition_child_for_key(parent, part_col, k)`
+  → `regclass`.
+
+### Operator note — Phase 2 dispatch coverage
+
+The per-partition trigger dispatch fires on any partitioned LIST IMV
+whose affected table carries the partition column (which is always the
+case for partitioned aggregate IMVs).  Falls back to the global
+high-selectivity dispatch for RANGE / non-LIST.  Strategies for
+extending the per-partition dispatch to RANGE and to pre-scratch (Path B
+replacement) are tracked in `journal/2026-05-17_partitioning_3`.
+
+---
+
+### Fixed — quoted mixed-case column names
 
 - **Quoted mixed-case column names are now preserved** — when a source
   query uses quoted identifiers (`"Grp"`, `"DisplayName"`, `"TotalQty"`),
@@ -18,7 +167,7 @@ Correctness fix for quoted mixed-case column names.
   `grp`, and any downstream `SELECT ... WHERE "Grp" = 'x'` failed with
   `column "Grp" does not exist`.
 
-### Operator action required for affected IMVs
+#### Operator action required for affected IMVs (mixed-case fix)
 
 IMVs created under 1.5.0 or 1.5.1 that use mixed-case quoted source
 columns are internally consistent (target was built lowercase and
@@ -32,17 +181,6 @@ SELECT create_reflex_ivm('my_view', '...original query...', ...);
 ```
 
 IMVs that use only unquoted (lowercase) column names are unaffected.
-
-### Tests
-
-Five tests cover the new contract:
-
-- `cov_bug_mixed_case_grouped_imv_target_preserves_case`
-- `cov_bug_mixed_case_passthrough_imv`
-- `cov_bug_mixed_case_aliased_aggregate_column`
-- `cov_bug_mixed_case_with_schema_qualified_source`
-- `cov_bug_unquoted_mixed_case_still_lowercases` (regression — unquoted
-  refs must still fold to lowercase)
 
 ---
 

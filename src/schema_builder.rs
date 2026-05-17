@@ -129,10 +129,28 @@ pub fn build_intermediate_table_ddl(
     // update → zero index writes. Bench (perftest, 47K rows): 691ms
     // (fillfactor=100) → 75ms (fillfactor=70). Disk cost: ~14% larger
     // baseline, but eliminates ~20% bloat per UPDATE cycle.
-    Some(format!(
-        "{} IF NOT EXISTS {} (\n{}\n) WITH (fillfactor=70)",
-        create_prefix, table_name, columns_sql
-    ))
+    //
+    // Partitioned IMVs append `PARTITION BY <strategy> (cols)` BEFORE the
+    // storage options (Postgres rejects fillfactor on a partitioned parent,
+    // but our intermediate parent never holds tuples — only its children
+    // do, and each child inherits fillfactor on creation via the parent's
+    // reloptions).  We therefore omit the WITH clause on the parent when
+    // partitioning and let each child set fillfactor at PARTITION OF time.
+    if !plan.partition_columns.is_empty() && !plan.partition_strategy.is_empty() {
+        let part = crate::partition::build_partition_by_clause(
+            &plan.partition_strategy,
+            &plan.partition_columns,
+        );
+        Some(format!(
+            "{} IF NOT EXISTS {} (\n{}\n) {}",
+            create_prefix, table_name, columns_sql, part
+        ))
+    } else {
+        Some(format!(
+            "{} IF NOT EXISTS {} (\n{}\n) WITH (fillfactor=70)",
+            create_prefix, table_name, columns_sql
+        ))
+    }
 }
 
 /// Build the DDL for the per-IMV UNLOGGED delta scratch table.
@@ -258,12 +276,29 @@ pub fn build_target_table_ddl(
     // aggregate columns; group_by columns (which are the only
     // indexed columns via idx__reflex_target_*) stay untouched →
     // HOT update eligible.
-    format!(
-        "{} IF NOT EXISTS {} (\n{}\n) WITH (fillfactor=70)",
-        create_prefix,
-        quote_identifier(view_name),
-        columns_sql
-    )
+    //
+    // Partitioned IMVs emit `PARTITION BY` on the parent and skip
+    // fillfactor (see build_intermediate_table_ddl note).
+    if !plan.partition_columns.is_empty() && !plan.partition_strategy.is_empty() {
+        let part = crate::partition::build_partition_by_clause(
+            &plan.partition_strategy,
+            &plan.partition_columns,
+        );
+        format!(
+            "{} IF NOT EXISTS {} (\n{}\n) {}",
+            create_prefix,
+            quote_identifier(view_name),
+            columns_sql,
+            part
+        )
+    } else {
+        format!(
+            "{} IF NOT EXISTS {} (\n{}\n) WITH (fillfactor=70)",
+            create_prefix,
+            quote_identifier(view_name),
+            columns_sql
+        )
+    }
 }
 
 /// Build index DDL statements for the intermediate and target tables.
