@@ -1060,6 +1060,272 @@ fn cov_source_mixed_case_quoted_identifier_create_path() {
     );
 }
 
+// ============================================================================
+// Bug 1.5.2: mixed-case quoted identifier handling
+// ============================================================================
+//
+// Issue discovered 2026-05-17 during the coverage push. When a user creates
+// an IMV with a quoted mixed-case source column (e.g. `"Grp"`), pg_reflex
+// internally lower-cases the column name via
+// `query_decomposer::normalized_column_name`, then emits the target-table
+// DDL with the lowercased name. The target ends up with column `grp`, and
+// any query against the IMV using the original `"Grp"` fails with
+// `column "Grp" does not exist`.
+//
+// PostgreSQL identifier rules: unquoted identifiers fold to lowercase at
+// parse time (so `SELECT Grp` and `SELECT grp` both look up `grp`); quoted
+// identifiers are case-sensitive (so `SELECT "Grp"` is distinct from
+// `SELECT "grp"`). pg_reflex's `normalized_column_name` always lower-cases,
+// which is correct for unquoted refs but wrong for quoted refs — it loses
+// the case information the user explicitly preserved.
+//
+// The tests below are written to PASS when the bug is fixed. They currently
+// FAIL on the unfixed codebase; once the resolution lands, this comment
+// block can be deleted.
+//
+// See `plans/1_5_2_mixed_case_identifier_fix.md` for the resolution plan.
+
+/// Aggregate IMV with a quoted mixed-case GROUP BY column. The target
+/// table must expose the column under the user's case-preserved name so
+/// that SELECT against the IMV with the same quoted name works.
+#[pg_test]
+#[ignore = "bug 1.5.2: pg_reflex lower-cases quoted mixed-case columns; fix pending"]
+fn cov_bug_mixed_case_grouped_imv_target_preserves_case() {
+    Spi::run("CREATE TABLE bug_mc_g_src (\"Id\" SERIAL PRIMARY KEY, \"Grp\" TEXT, v INT)")
+        .expect("create");
+    Spi::run("INSERT INTO bug_mc_g_src (\"Grp\", v) VALUES ('a', 1), ('a', 2), ('b', 30)")
+        .expect("seed");
+    let res = crate::create_reflex_ivm(
+        "bug_mc_g_view",
+        "SELECT \"Grp\", SUM(v) AS s FROM bug_mc_g_src GROUP BY \"Grp\"",
+        None,
+        None,
+        None,
+        None,
+    );
+    assert_eq!(res, "CREATE REFLEX INCREMENTAL VIEW");
+
+    // The IMV target must carry the column under the case-preserved name.
+    let has_grp: bool = Spi::get_one(
+        "SELECT EXISTS ( \
+            SELECT 1 FROM information_schema.columns \
+            WHERE table_name = 'bug_mc_g_view' AND column_name = 'Grp' \
+         )",
+    )
+    .expect("q")
+    .expect("v");
+    assert!(
+        has_grp,
+        "IMV target must expose the column as 'Grp' (case-preserved), not 'grp'"
+    );
+
+    // Initial materialization correct.
+    let s_a: i64 =
+        Spi::get_one::<i64>("SELECT s::BIGINT FROM bug_mc_g_view WHERE \"Grp\" = 'a'")
+            .expect("q")
+            .expect("v");
+    assert_eq!(s_a, 3);
+    let s_b: i64 =
+        Spi::get_one::<i64>("SELECT s::BIGINT FROM bug_mc_g_view WHERE \"Grp\" = 'b'")
+            .expect("q")
+            .expect("v");
+    assert_eq!(s_b, 30);
+
+    // INSERT must update the IMV.
+    Spi::run("INSERT INTO bug_mc_g_src (\"Grp\", v) VALUES ('a', 100)").expect("insert");
+    let s_a_after: i64 =
+        Spi::get_one::<i64>("SELECT s::BIGINT FROM bug_mc_g_view WHERE \"Grp\" = 'a'")
+            .expect("q")
+            .expect("v");
+    assert_eq!(s_a_after, 103);
+
+    // UPDATE that flips group membership.
+    Spi::run("UPDATE bug_mc_g_src SET \"Grp\" = 'c' WHERE v = 100").expect("update");
+    let s_c: i64 =
+        Spi::get_one::<i64>("SELECT s::BIGINT FROM bug_mc_g_view WHERE \"Grp\" = 'c'")
+            .expect("q")
+            .expect("v");
+    assert_eq!(s_c, 100);
+
+    // DELETE.
+    Spi::run("DELETE FROM bug_mc_g_src WHERE \"Grp\" = 'c'").expect("delete");
+    let has_c: bool = Spi::get_one(
+        "SELECT EXISTS(SELECT 1 FROM bug_mc_g_view WHERE \"Grp\" = 'c')",
+    )
+    .expect("q")
+    .expect("v");
+    assert!(!has_c, "group 'c' should disappear after DELETE");
+}
+
+/// Passthrough IMV with a quoted mixed-case projection column.
+#[pg_test]
+#[ignore = "bug 1.5.2: pg_reflex lower-cases quoted mixed-case columns; fix pending"]
+fn cov_bug_mixed_case_passthrough_imv() {
+    Spi::run("CREATE TABLE bug_mc_p_src (\"Id\" INT PRIMARY KEY, \"DisplayName\" TEXT)")
+        .expect("create");
+    Spi::run("INSERT INTO bug_mc_p_src (\"Id\", \"DisplayName\") VALUES (1, 'Alice'), (2, 'Bob')")
+        .expect("seed");
+    let res = crate::create_reflex_ivm(
+        "bug_mc_p_view",
+        "SELECT \"Id\", \"DisplayName\" FROM bug_mc_p_src",
+        Some("\"Id\""),
+        None,
+        None,
+        None,
+    );
+    assert_eq!(res, "CREATE REFLEX INCREMENTAL VIEW");
+
+    // Both quoted columns must be on the target with case preserved.
+    let has_id: bool = Spi::get_one(
+        "SELECT EXISTS ( \
+            SELECT 1 FROM information_schema.columns \
+            WHERE table_name = 'bug_mc_p_view' AND column_name = 'Id' \
+         )",
+    )
+    .expect("q")
+    .expect("v");
+    let has_display: bool = Spi::get_one(
+        "SELECT EXISTS ( \
+            SELECT 1 FROM information_schema.columns \
+            WHERE table_name = 'bug_mc_p_view' AND column_name = 'DisplayName' \
+         )",
+    )
+    .expect("q")
+    .expect("v");
+    let cols: Vec<String> = if has_id && has_display {
+        vec!["Id".to_string(), "DisplayName".to_string()]
+    } else {
+        vec![]
+    };
+    assert!(
+        cols.contains(&"Id".to_string()),
+        "target must have 'Id' (case-preserved). Got: {:?}",
+        cols
+    );
+    assert!(
+        cols.contains(&"DisplayName".to_string()),
+        "target must have 'DisplayName' (case-preserved). Got: {:?}",
+        cols
+    );
+
+    // Query against the quoted names works.
+    let name: String =
+        Spi::get_one::<String>("SELECT \"DisplayName\" FROM bug_mc_p_view WHERE \"Id\" = 1")
+            .expect("q")
+            .expect("v");
+    assert_eq!(name, "Alice");
+
+    // UPDATE through the trigger.
+    Spi::run("UPDATE bug_mc_p_src SET \"DisplayName\" = 'Alicia' WHERE \"Id\" = 1")
+        .expect("upd");
+    let name_after: String =
+        Spi::get_one::<String>("SELECT \"DisplayName\" FROM bug_mc_p_view WHERE \"Id\" = 1")
+            .expect("q")
+            .expect("v");
+    assert_eq!(name_after, "Alicia");
+}
+
+/// Aggregate IMV where the SELECT alias is mixed-case-quoted (independent
+/// of the source column casing). The IMV's user-facing column name must
+/// match the alias the user wrote, not a lowercased version.
+#[pg_test]
+#[ignore = "bug 1.5.2: pg_reflex lower-cases quoted mixed-case aliases; fix pending"]
+fn cov_bug_mixed_case_aliased_aggregate_column() {
+    Spi::run("CREATE TABLE bug_mc_a_src (id SERIAL PRIMARY KEY, g TEXT, v INT)")
+        .expect("create");
+    Spi::run("INSERT INTO bug_mc_a_src (g, v) VALUES ('a', 5), ('a', 7)").expect("seed");
+    let res = crate::create_reflex_ivm(
+        "bug_mc_a_view",
+        "SELECT g, SUM(v) AS \"TotalQty\" FROM bug_mc_a_src GROUP BY g",
+        None,
+        None,
+        None,
+        None,
+    );
+    assert_eq!(res, "CREATE REFLEX INCREMENTAL VIEW");
+    let has_alias: bool = Spi::get_one(
+        "SELECT EXISTS ( \
+            SELECT 1 FROM information_schema.columns \
+            WHERE table_name = 'bug_mc_a_view' AND column_name = 'TotalQty' \
+         )",
+    )
+    .expect("q")
+    .expect("v");
+    assert!(
+        has_alias,
+        "IMV target must expose the aliased column as 'TotalQty', not 'totalqty'"
+    );
+    let total: i64 = Spi::get_one::<i64>(
+        "SELECT \"TotalQty\"::BIGINT FROM bug_mc_a_view WHERE g = 'a'",
+    )
+    .expect("q")
+    .expect("v");
+    assert_eq!(total, 12);
+}
+
+/// Regression: UNquoted mixed-case identifier (`SELECT Grp` without quotes)
+/// must still be folded to lowercase, matching PostgreSQL's parser. This
+/// is the contract that the existing `normalized_column_name` enforces;
+/// the fix must NOT break it.
+#[pg_test]
+fn cov_bug_unquoted_mixed_case_still_lowercases() {
+    Spi::run("CREATE TABLE bug_uq_src (id SERIAL PRIMARY KEY, grp TEXT, v INT)")
+        .expect("create");
+    Spi::run("INSERT INTO bug_uq_src (grp, v) VALUES ('a', 1)").expect("seed");
+    // SELECT uses unquoted `Grp` — PG folds to `grp` at parse, matches source
+    // column `grp`. The IMV must NOT create a target with `"Grp"` (the user
+    // didn't quote anything).
+    let res = crate::create_reflex_ivm(
+        "bug_uq_view",
+        "SELECT Grp, SUM(v) AS s FROM bug_uq_src GROUP BY Grp",
+        None,
+        None,
+        None,
+        None,
+    );
+    assert_eq!(res, "CREATE REFLEX INCREMENTAL VIEW");
+    // Target column is `grp` (unquoted PG identifier).
+    let has_grp_unquoted: bool = Spi::get_one(
+        "SELECT EXISTS ( \
+            SELECT 1 FROM information_schema.columns \
+            WHERE table_name = 'bug_uq_view' AND column_name = 'grp' \
+         )",
+    )
+    .expect("q")
+    .expect("v");
+    assert!(has_grp_unquoted, "unquoted ref must produce lowercase target column");
+}
+
+/// Schema-qualified source with mixed-case quoted column.
+#[pg_test]
+#[ignore = "bug 1.5.2: pg_reflex lower-cases quoted mixed-case columns; fix pending"]
+fn cov_bug_mixed_case_with_schema_qualified_source() {
+    Spi::run("CREATE SCHEMA IF NOT EXISTS bug_mc_sch").expect("schema");
+    Spi::run(
+        "CREATE TABLE bug_mc_sch.t (\"Id\" SERIAL PRIMARY KEY, \"Cat\" TEXT, v INT)",
+    )
+    .expect("create");
+    Spi::run("INSERT INTO bug_mc_sch.t (\"Cat\", v) VALUES ('x', 10), ('y', 20)").expect("seed");
+    let res = crate::create_reflex_ivm(
+        "bug_mc_sch.v",
+        "SELECT \"Cat\", SUM(v) AS s FROM bug_mc_sch.t GROUP BY \"Cat\"",
+        None,
+        None,
+        None,
+        None,
+    );
+    assert_eq!(res, "CREATE REFLEX INCREMENTAL VIEW");
+    let has_cat: bool = Spi::get_one(
+        "SELECT EXISTS ( \
+            SELECT 1 FROM information_schema.columns \
+            WHERE table_schema = 'bug_mc_sch' AND table_name = 'v' AND column_name = 'Cat' \
+         )",
+    )
+    .expect("q")
+    .expect("v");
+    assert!(has_cat, "schema-qualified IMV must also preserve case");
+}
+
 /// Schema-qualified source table.
 #[pg_test]
 fn cov_source_schema_qualified() {
