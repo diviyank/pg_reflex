@@ -594,20 +594,50 @@ pub fn build_trigger_ddls(source_table: &str) -> Vec<String> {
     // falls back to the target table's reltuples (passthrough IMV — no
     // intermediate). Either way the size denominator approximates "how many
     // rows the IMV currently holds" so the est/imv ratio is meaningful.
+    // Path C high-fanout response is a *smart bulk-INSERT*, not a full
+    // reconcile. The Item α INSERT_PROMOTED guarantee says the existing
+    // intermediate has zero rows for the affected group keys, so we can:
+    //   1. scratch-fill (base_query with source→transition) — same JOIN
+    //      cost as reconcile's INSERT INTO intermediate, but restricted
+    //      to the new keys (e.g. 8.9 M rows on alp A4 vs 16.6 M total),
+    //   2. DROP the intermediate's UNIQUE index — avoids per-row B-tree
+    //      probe cost on the bulk INSERT,
+    //   3. bulk INSERT scratch → intermediate,
+    //   4. CREATE the index back (16.6 M rows sorted in memory, ~13 s),
+    //   5. project to target directly from scratch (skip the standard
+    //      target-sync block's re-read of intermediate), and
+    //   6. ANALYZE intermediate.
+    //
+    // Beats reflex_reconcile by skipping (a) the redundant re-aggregation
+    // of the surviving 7.7 M rows that didn't change, and (b) the target
+    // TRUNCATE + re-read of intermediate. Measured ~110 s on alp A4 vs
+    // reconcile's ~175 s vs REFRESH MV's ~155 s.
+    //
+    // For low-fanout cases (ratio < threshold), falls through to the
+    // standard bulk-INSERT path (push_bulk_insert_and_affected) where
+    // per-row index maintenance is cheap.
+    //
+    // EXCEPTION WHEN OTHERS at the outer level: any catalog / planner /
+    // EXECUTE failure falls through to the standard path.
     let path_c_for_update = format!(
         "IF _directional_op = 'INSERT_PROMOTED' THEN \
            DECLARE _pc_sql TEXT; _pc_plan TEXT; _pc_est BIGINT; _pc_imv_rows BIGINT; \
-                   _pc_thr NUMERIC; _pc_per_imv NUMERIC; _pc_ratio NUMERIC; _pc_tbl TEXT; \
+                   _pc_thr NUMERIC; _pc_per_imv NUMERIC; _pc_ratio NUMERIC; \
+                   _pc_schema TEXT; _pc_view TEXT; \
+                   _pc_int_tbl TEXT; _pc_scratch_tbl TEXT; _pc_target_qv TEXT; \
+                   _pc_idx_name TEXT; _pc_idx_def TEXT; _pc_end_q TEXT; \
            BEGIN \
              _pc_sql := public.reflex_build_path_c_explain_sql(_rec.name, '{source_table}'); \
              IF _pc_sql <> '' THEN \
                EXECUTE 'EXPLAIN (FORMAT JSON) ' || _pc_sql INTO _pc_plan; \
                _pc_est := (_pc_plan::jsonb -> 0 -> 'Plan' ->> 'Plan Rows')::BIGINT; \
+               _pc_schema := split_part(_rec.name, '.', 1); \
+               _pc_view := split_part(_rec.name, '.', 2); \
+               _pc_int_tbl := '\"' || _pc_schema || '\".\"__reflex_intermediate_' || _pc_view || '\"'; \
+               _pc_scratch_tbl := '\"' || _pc_schema || '\".\"__reflex_scratch_' || _pc_view || '\"'; \
+               _pc_target_qv := '\"' || _pc_schema || '\".\"' || _pc_view || '\"'; \
                BEGIN \
-                 _pc_tbl := format('%I.%I', \
-                                   split_part(_rec.name, '.', 1), \
-                                   '__reflex_intermediate_' || split_part(_rec.name, '.', 2)); \
-                 EXECUTE format('SELECT reltuples::BIGINT FROM pg_class WHERE oid = %L::regclass', _pc_tbl) INTO _pc_imv_rows; \
+                 EXECUTE format('SELECT reltuples::BIGINT FROM pg_class WHERE oid = %L::regclass', _pc_int_tbl) INTO _pc_imv_rows; \
                EXCEPTION WHEN OTHERS THEN \
                  _pc_imv_rows := NULL; \
                END; \
@@ -623,14 +653,34 @@ pub fn build_trigger_ddls(source_table: &str) -> Vec<String> {
                IF _pc_imv_rows IS NOT NULL AND _pc_imv_rows > 0 AND _pc_est IS NOT NULL THEN \
                  _pc_ratio := _pc_est::NUMERIC / _pc_imv_rows; \
                  IF _pc_ratio >= _pc_thr THEN \
-                   RAISE DEBUG 'pg_reflex Path C: dispatching % to reconcile (est=% imv=% ratio=% thr=%)', \
+                   RAISE DEBUG 'pg_reflex Path C smart bulk-INSERT: % (est=% imv=% ratio=% thr=%)', \
                                 _rec.name, _pc_est, _pc_imv_rows, _pc_ratio, _pc_thr; \
-                   PERFORM public.reflex_reconcile(_rec.name); \
+                   EXECUTE format('TRUNCATE %s', _pc_scratch_tbl); \
+                   EXECUTE format('INSERT INTO %s %s', _pc_scratch_tbl, _pc_sql); \
+                   SELECT i.indexname::TEXT, i.indexdef INTO _pc_idx_name, _pc_idx_def \
+                     FROM pg_indexes i \
+                     WHERE i.schemaname = _pc_schema \
+                       AND i.tablename = '__reflex_intermediate_' || _pc_view \
+                       AND i.indexdef ILIKE '%UNIQUE%' \
+                     LIMIT 1; \
+                   IF _pc_idx_name IS NOT NULL THEN \
+                     EXECUTE format('DROP INDEX %I.%I', _pc_schema, _pc_idx_name); \
+                   END IF; \
+                   EXECUTE format('INSERT INTO %s SELECT * FROM %s', _pc_int_tbl, _pc_scratch_tbl); \
+                   IF _pc_idx_def IS NOT NULL THEN \
+                     EXECUTE _pc_idx_def; \
+                   END IF; \
+                   _pc_end_q := REPLACE(_rec.end_query, _pc_int_tbl, _pc_scratch_tbl); \
+                   EXECUTE format('INSERT INTO %s %s', _pc_target_qv, _pc_end_q); \
+                   EXECUTE format('ANALYZE %s', _pc_int_tbl); \
+                   UPDATE public.__reflex_ivm_reference SET last_update_date = NOW() WHERE name = _rec.name; \
                    CONTINUE; \
                  END IF; \
                END IF; \
              END IF; \
-           EXCEPTION WHEN OTHERS THEN NULL; END; \
+           EXCEPTION WHEN OTHERS THEN \
+             RAISE WARNING 'pg_reflex Path C smart bulk-INSERT failed for %: %, falling through to standard incremental', _rec.name, SQLERRM; \
+           END; \
          END IF;"
     );
 
