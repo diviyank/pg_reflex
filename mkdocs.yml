@@ -151,6 +151,7 @@ nav:
       - Known issues: limitations/known-issues.md
   - Contributing:
       - Architecture tour: contributing/architecture-tour.md
+      - Development log: contributing/development-log.md
       - Testing: contributing/testing.md
       - Release process: contributing/release-process.md
   - Changelog: changelog.md
