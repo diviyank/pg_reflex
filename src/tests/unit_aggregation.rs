@@ -1089,6 +1089,35 @@ fn cov_decomposer_date_trunc_week() {
     assert!(!plan.group_by_columns.is_empty());
 }
 
+// ---- SqlAnalysisError Display impl ----
+
+#[test]
+fn cov_sql_analysis_error_display_multiple_queries() {
+    use crate::sql_analyzer::SqlAnalysisError;
+    let e = SqlAnalysisError::MultipleQueries(3);
+    let s = format!("{}", e);
+    assert!(s.contains("3"));
+    assert!(s.contains("Expected") || s.contains("multiple"));
+}
+
+#[test]
+fn cov_sql_analysis_error_display_not_a_select() {
+    use crate::sql_analyzer::SqlAnalysisError;
+    let e = SqlAnalysisError::NotASelectQuery;
+    let s = format!("{}", e);
+    assert!(s.contains("SELECT"));
+}
+
+#[test]
+fn cov_sql_analysis_error_debug() {
+    use crate::sql_analyzer::SqlAnalysisError;
+    let e1 = SqlAnalysisError::MultipleQueries(2);
+    let e2 = SqlAnalysisError::NotASelectQuery;
+    // Just exercise Debug/format paths.
+    let _ = format!("{:?}", e1);
+    let _ = format!("{:?}", e2);
+}
+
 // ---- Wave 15: legacy fallback paths (output_column_order empty) ----
 // Construct a plan manually with empty output_column_order and call the
 // builders directly. Reaches the `else` legacy-fallback branches in
