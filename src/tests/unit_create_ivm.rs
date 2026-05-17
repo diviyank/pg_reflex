@@ -127,8 +127,14 @@ fn cov_plan_compact_imv_double_dot_returns_error() {
 fn cov_build_compact_all_summary_all_success() {
     let names = vec!["a".to_string(), "b".to_string()];
     let results = vec![
-        ("a".to_string(), "pg_reflex: compacted 'a' — ...".to_string()),
-        ("b".to_string(), "pg_reflex: compacted 'b' — ...".to_string()),
+        (
+            "a".to_string(),
+            "pg_reflex: compacted 'a' — ...".to_string(),
+        ),
+        (
+            "b".to_string(),
+            "pg_reflex: compacted 'b' — ...".to_string(),
+        ),
     ];
     let summary = build_compact_all_summary(&names, &results, 123);
     assert!(summary.contains("compacted 2/2"));

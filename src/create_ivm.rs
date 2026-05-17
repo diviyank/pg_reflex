@@ -2157,7 +2157,11 @@ pub(crate) fn format_compact_imv_summary(view_name: &str, per_stmt: &[(String, u
         .iter()
         .map(|(stmt, ms)| format!("{}: {} ms", stmt, ms))
         .collect();
-    format!("pg_reflex: compacted '{}' — {}", view_name, parts.join(", "))
+    format!(
+        "pg_reflex: compacted '{}' — {}",
+        view_name,
+        parts.join(", ")
+    )
 }
 
 pub(crate) fn reflex_compact_imv_impl(view_name: &str) -> String {

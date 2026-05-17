@@ -1124,18 +1124,20 @@ fn cov_sql_analysis_error_debug() {
 #[test]
 fn cov_derived_with_min() {
     // MIN inside a derived expr → rewrite emits AggregateKind::Min arm (566/568)
-    let plan = plan_from_sql(
-        "SELECT g, MIN(v) - 1 AS m_minus FROM tbl GROUP BY g",
-    );
-    assert!(plan.intermediate_columns.iter().any(|ic| ic.source_aggregate == "MIN"));
+    let plan = plan_from_sql("SELECT g, MIN(v) - 1 AS m_minus FROM tbl GROUP BY g");
+    assert!(plan
+        .intermediate_columns
+        .iter()
+        .any(|ic| ic.source_aggregate == "MIN"));
 }
 
 #[test]
 fn cov_derived_with_max() {
-    let plan = plan_from_sql(
-        "SELECT g, MAX(v) + 1 AS m_plus FROM tbl GROUP BY g",
-    );
-    assert!(plan.intermediate_columns.iter().any(|ic| ic.source_aggregate == "MAX"));
+    let plan = plan_from_sql("SELECT g, MAX(v) + 1 AS m_plus FROM tbl GROUP BY g");
+    assert!(plan
+        .intermediate_columns
+        .iter()
+        .any(|ic| ic.source_aggregate == "MAX"));
 }
 
 #[test]
@@ -1152,9 +1154,7 @@ fn cov_derived_with_count_star() {
 
 #[test]
 fn cov_derived_with_avg() {
-    let plan = plan_from_sql(
-        "SELECT g, AVG(v) * 2 AS double_avg FROM tbl GROUP BY g",
-    );
+    let plan = plan_from_sql("SELECT g, AVG(v) * 2 AS double_avg FROM tbl GROUP BY g");
     // AVG produces SUM + COUNT or some equivalent decomposition.
     assert!(!plan.intermediate_columns.is_empty());
 }
@@ -1162,29 +1162,32 @@ fn cov_derived_with_avg() {
 #[test]
 fn cov_derived_with_unary_minus() {
     // -SUM(x) — UnaryOp wrapping aggregate. Exercises aggregation.rs:662-666.
-    let plan = plan_from_sql(
-        "SELECT g, -SUM(v) AS neg_sum FROM tbl GROUP BY g",
-    );
-    assert!(plan.intermediate_columns.iter().any(|ic| ic.source_aggregate == "SUM"));
+    let plan = plan_from_sql("SELECT g, -SUM(v) AS neg_sum FROM tbl GROUP BY g");
+    assert!(plan
+        .intermediate_columns
+        .iter()
+        .any(|ic| ic.source_aggregate == "SUM"));
 }
 
 #[test]
 fn cov_derived_with_cast() {
     // SUM(v)::BIGINT — Cast wrapping aggregate. Exercises aggregation.rs:702-708.
-    let plan = plan_from_sql(
-        "SELECT g, SUM(v)::BIGINT AS s_big FROM tbl GROUP BY g",
-    );
-    assert!(plan.intermediate_columns.iter().any(|ic| ic.source_aggregate == "SUM"));
+    let plan = plan_from_sql("SELECT g, SUM(v)::BIGINT AS s_big FROM tbl GROUP BY g");
+    assert!(plan
+        .intermediate_columns
+        .iter()
+        .any(|ic| ic.source_aggregate == "SUM"));
 }
 
 #[test]
 fn cov_derived_nested_function_call() {
     // GREATEST(SUM(x), 0) — non-aggregate function wrapping an aggregate.
     // Exercises aggregation.rs:648 (`other => rewritten_args.push(...)`).
-    let plan = plan_from_sql(
-        "SELECT g, GREATEST(SUM(v), 0) AS s_pos FROM tbl GROUP BY g",
-    );
-    assert!(plan.intermediate_columns.iter().any(|ic| ic.source_aggregate == "SUM"));
+    let plan = plan_from_sql("SELECT g, GREATEST(SUM(v), 0) AS s_pos FROM tbl GROUP BY g");
+    assert!(plan
+        .intermediate_columns
+        .iter()
+        .any(|ic| ic.source_aggregate == "SUM"));
 }
 
 #[test]
@@ -1204,9 +1207,7 @@ fn cov_strip_outer_parens_with_wrapped_inner() {
     // BOOL_OR with explicit parens around the inner. The source_arg in
     // the intermediate column will have "(<expr>)" inside the CASE WHEN.
     // strip_outer_parens runs over that inner.
-    let mut plan = plan_from_sql(
-        "SELECT g, BOOL_OR((v IS NOT NULL)) AS any_v FROM tbl GROUP BY g",
-    );
+    let mut plan = plan_from_sql("SELECT g, BOOL_OR((v IS NOT NULL)) AS any_v FROM tbl GROUP BY g");
     plan.optimize_not_null_sums(&std::collections::HashSet::new());
     assert!(!plan.intermediate_columns.is_empty());
 }
@@ -1261,17 +1262,13 @@ fn cov_analyzer_expr_contains_aggregate_unary_op() {
 fn cov_having_unary_not() {
     // NOT (SUM(v) > 0) → UnaryOp around BinaryOp inside HAVING. Exercises
     // query_decomposer.rs:568-569 (rewrite_having_expr UnaryOp arm).
-    let plan = plan_from_sql(
-        "SELECT g, SUM(v) AS s FROM tbl GROUP BY g HAVING NOT (SUM(v) > 100)",
-    );
+    let plan = plan_from_sql("SELECT g, SUM(v) AS s FROM tbl GROUP BY g HAVING NOT (SUM(v) > 100)");
     let _ = plan;
 }
 
 #[test]
 fn cov_having_nested_parens_in_rewrite() {
-    let plan = plan_from_sql(
-        "SELECT g, SUM(v) AS s FROM tbl GROUP BY g HAVING ((SUM(v)) > 0)",
-    );
+    let plan = plan_from_sql("SELECT g, SUM(v) AS s FROM tbl GROUP BY g HAVING ((SUM(v)) > 0)");
     let _ = plan;
 }
 
