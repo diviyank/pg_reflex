@@ -2128,34 +2128,40 @@ pub(crate) fn reflex_probe_not_null_columns_impl(view_name: &str) -> String {
 /// responsible for scheduling.
 ///
 /// Returns a status string with per-table elapsed times.
-pub(crate) fn reflex_compact_imv_impl(view_name: &str) -> String {
+/// Plan the SQL commands `reflex_compact_imv_impl` will issue for a
+/// given IMV name. Pure function: no SPI, no side effects. Extracted so
+/// the planning logic (identifier resolution, command shaping) is
+/// unit-testable independent of `VACUUM`, which cannot run inside a
+/// transaction (the pgrx test framework wraps every test in one).
+///
+/// Returns the ordered list of statements; the caller issues each via
+/// SPI in a top-level statement.
+pub(crate) fn plan_compact_imv(view_name: &str) -> Result<Vec<String>, String> {
     if let Err(msg) = validate_view_name(view_name) {
-        return msg.to_string();
+        return Err(msg.to_string());
     }
     let intermediate_tbl = intermediate_table_name(view_name);
     let target_tbl = quote_identifier(view_name);
+    Ok(vec![
+        format!("VACUUM (FULL) {}", intermediate_tbl),
+        format!("VACUUM (FULL) {}", target_tbl),
+    ])
+}
+
+pub(crate) fn reflex_compact_imv_impl(view_name: &str) -> String {
+    let stmts = match plan_compact_imv(view_name) {
+        Ok(s) => s,
+        Err(msg) => return msg,
+    };
     let mut messages: Vec<String> = Vec::new();
-    // VACUUM cannot run inside a function or transaction block; we issue it
-    // via a top-level SPI call that pgrx wraps in its own statement.
     let result: Result<(), String> = Spi::connect_mut(|client| {
-        let t0 = std::time::Instant::now();
-        client
-            .update(&format!("VACUUM (FULL) {}", intermediate_tbl), None, &[])
-            .map_err(|e| format!("VACUUM FULL intermediate failed: {}", e))?;
-        messages.push(format!(
-            "intermediate {}: {} ms",
-            intermediate_tbl,
-            t0.elapsed().as_millis()
-        ));
-        let t1 = std::time::Instant::now();
-        client
-            .update(&format!("VACUUM (FULL) {}", target_tbl), None, &[])
-            .map_err(|e| format!("VACUUM FULL target failed: {}", e))?;
-        messages.push(format!(
-            "target {}: {} ms",
-            target_tbl,
-            t1.elapsed().as_millis()
-        ));
+        for stmt in &stmts {
+            let t0 = std::time::Instant::now();
+            client
+                .update(stmt, None, &[])
+                .map_err(|e| format!("{} failed: {}", stmt, e))?;
+            messages.push(format!("{}: {} ms", stmt, t0.elapsed().as_millis()));
+        }
         Ok(())
     });
     match result {
@@ -2176,6 +2182,40 @@ pub(crate) fn reflex_compact_imv_impl(view_name: &str) -> String {
 /// in the result but do not abort processing of the remaining IMVs — this
 /// matches the semantics of a maintenance-window operator who wants
 /// "compact everything you can".
+/// Pure summary builder for `reflex_compact_all_imv_impl`. Given the
+/// list of IMV names and per-IMV result messages, return the final
+/// summary string. Extracted so the summary-shaping logic is
+/// unit-testable independent of `VACUUM`.
+pub(crate) fn build_compact_all_summary(
+    names: &[String],
+    results: &[(String, String)],
+    total_ms: u128,
+) -> String {
+    let successes = results
+        .iter()
+        .filter(|(_, msg)| !msg.starts_with("ERROR"))
+        .count();
+    let failures: Vec<String> = results
+        .iter()
+        .filter(|(_, msg)| msg.starts_with("ERROR"))
+        .map(|(name, msg)| format!("{}: {}", name, msg))
+        .collect();
+    let details: Vec<String> = results.iter().map(|(_, msg)| msg.clone()).collect();
+    let mut summary = format!(
+        "pg_reflex: compacted {}/{} IMV(s) in {} ms",
+        successes,
+        names.len(),
+        total_ms
+    );
+    if !failures.is_empty() {
+        summary.push_str(" — failures: ");
+        summary.push_str(&failures.join("; "));
+    }
+    summary.push('\n');
+    summary.push_str(&details.join("\n"));
+    summary
+}
+
 pub(crate) fn reflex_compact_all_imv_impl() -> String {
     let names: Vec<String> = Spi::connect(|client| {
         let mut out: Vec<String> = Vec::new();
@@ -2197,32 +2237,11 @@ pub(crate) fn reflex_compact_all_imv_impl() -> String {
         return "pg_reflex: no enabled IMVs to compact".to_string();
     }
     let t0 = std::time::Instant::now();
-    let mut successes = 0usize;
-    let mut failures: Vec<String> = Vec::new();
-    let mut details: Vec<String> = Vec::new();
-    for name in &names {
-        let msg = reflex_compact_imv_impl(name);
-        if msg.starts_with("ERROR") {
-            failures.push(format!("{}: {}", name, msg));
-        } else {
-            successes += 1;
-        }
-        details.push(msg);
-    }
-    let total_ms = t0.elapsed().as_millis();
-    let mut summary = format!(
-        "pg_reflex: compacted {}/{} IMV(s) in {} ms",
-        successes,
-        names.len(),
-        total_ms
-    );
-    if !failures.is_empty() {
-        summary.push_str(" — failures: ");
-        summary.push_str(&failures.join("; "));
-    }
-    summary.push('\n');
-    summary.push_str(&details.join("\n"));
-    summary
+    let results: Vec<(String, String)> = names
+        .iter()
+        .map(|name| (name.clone(), reflex_compact_imv_impl(name)))
+        .collect();
+    build_compact_all_summary(&names, &results, t0.elapsed().as_millis())
 }
 
 /// 1.4.5 — `reflex_rebuild_imv_metadata(view_name TEXT) RETURNS TEXT`.

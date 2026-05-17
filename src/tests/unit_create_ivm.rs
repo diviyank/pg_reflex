@@ -79,3 +79,82 @@ fn test_count_equalities_case_insensitive() {
     let n = count_equalities_involving_source(cond, "demand_planning", &aliases(&[]));
     assert_eq!(n, 1);
 }
+
+// ---- 1.5.1 coverage: plan_compact_imv ----
+
+#[test]
+fn cov_plan_compact_imv_happy() {
+    let stmts = plan_compact_imv("my_view").expect("happy");
+    assert_eq!(stmts.len(), 2);
+    assert!(stmts[0].starts_with("VACUUM (FULL)"));
+    assert!(stmts[0].contains("__reflex_intermediate_my_view"));
+    assert!(stmts[1].starts_with("VACUUM (FULL)"));
+    assert!(stmts[1].contains("my_view"));
+}
+
+#[test]
+fn cov_plan_compact_imv_schema_qualified() {
+    let stmts = plan_compact_imv("mysch.myview").expect("schema-qual");
+    assert_eq!(stmts.len(), 2);
+    assert!(stmts[0].contains("mysch"));
+    assert!(stmts[1].contains("mysch"));
+    assert!(stmts[1].contains("myview"));
+}
+
+#[test]
+fn cov_plan_compact_imv_invalid_name_returns_error() {
+    let result = plan_compact_imv("1bad-name");
+    assert!(result.is_err());
+    let msg = result.unwrap_err();
+    assert!(msg.starts_with("ERROR"));
+}
+
+#[test]
+fn cov_plan_compact_imv_empty_name_returns_error() {
+    let result = plan_compact_imv("");
+    assert!(result.is_err());
+}
+
+#[test]
+fn cov_plan_compact_imv_double_dot_returns_error() {
+    let result = plan_compact_imv("foo..bar");
+    assert!(result.is_err());
+}
+
+// ---- build_compact_all_summary ----
+
+#[test]
+fn cov_build_compact_all_summary_all_success() {
+    let names = vec!["a".to_string(), "b".to_string()];
+    let results = vec![
+        ("a".to_string(), "pg_reflex: compacted 'a' — ...".to_string()),
+        ("b".to_string(), "pg_reflex: compacted 'b' — ...".to_string()),
+    ];
+    let summary = build_compact_all_summary(&names, &results, 123);
+    assert!(summary.contains("compacted 2/2"));
+    assert!(summary.contains("123 ms"));
+    assert!(!summary.contains("failures"));
+}
+
+#[test]
+fn cov_build_compact_all_summary_with_failures() {
+    let names = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+    let results = vec![
+        ("a".to_string(), "pg_reflex: compacted 'a'".to_string()),
+        ("b".to_string(), "ERROR: boom".to_string()),
+        ("c".to_string(), "pg_reflex: compacted 'c'".to_string()),
+    ];
+    let summary = build_compact_all_summary(&names, &results, 456);
+    assert!(summary.contains("compacted 2/3"));
+    assert!(summary.contains("failures:"));
+    assert!(summary.contains("b: ERROR: boom"));
+}
+
+#[test]
+fn cov_build_compact_all_summary_all_failures() {
+    let names = vec!["a".to_string()];
+    let results = vec![("a".to_string(), "ERROR: bad".to_string())];
+    let summary = build_compact_all_summary(&names, &results, 0);
+    assert!(summary.contains("compacted 0/1"));
+    assert!(summary.contains("a: ERROR: bad"));
+}
