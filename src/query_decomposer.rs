@@ -748,8 +748,11 @@ pub fn generate_end_query(view_name: &str, plan: &AggregationPlan) -> String {
 }
 
 /// Serialize the aggregation plan as JSON for the reference table.
+/// `AggregationPlan` derives Serialize from compile-time-known field
+/// types — serialization cannot fail. The previous fallback was dead
+/// defensive code.
 pub fn generate_aggregations_json(plan: &AggregationPlan) -> String {
-    serde_json::to_string(plan).unwrap_or_else(|_| "{}".to_string())
+    serde_json::to_string(plan).expect("AggregationPlan must serialize (derive Serialize)")
 }
 
 #[cfg(test)]

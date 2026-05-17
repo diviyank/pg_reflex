@@ -131,26 +131,14 @@ pub(crate) fn reflex_reconcile(view_name: &str) -> &'static str {
                 .unwrap_or_report();
         } else {
             // Aggregate: rebuild intermediate + target
-            // Drop pg_reflex-managed indexes first for faster bulk insert
+            // Drop pg_reflex-managed indexes first for faster bulk insert.
+            // The registry's `aggregations` is written by pg_reflex itself
+            // (via `serde_json::to_string` over an AggregationPlan); a
+            // malformed value would mean catalog corruption, not user error.
+            // Failing loudly there beats silently constructing a degenerate
+            // plan that produces wrong output. `expect` is correct.
             let plan: aggregation::AggregationPlan = serde_json::from_str(&agg_json)
-                .unwrap_or_else(|_| aggregation::AggregationPlan {
-                    group_by_columns: vec![],
-                    intermediate_columns: vec![],
-                    end_query_mappings: vec![],
-                    has_distinct: false,
-                    needs_ivm_count: false,
-                    distinct_columns: vec![],
-                    is_passthrough: false,
-                    passthrough_columns: vec![],
-                    passthrough_key_mappings: std::collections::HashMap::new(),
-                    having_clause: None,
-                    not_null_columns: std::collections::HashSet::new(),
-                    group_by_aliases: std::collections::HashMap::new(),
-                    output_column_order: vec![],
-                    imv_relevant_columns: std::collections::HashMap::new(),
-                    imv_relevant_where: std::collections::HashMap::new(),
-                    source_join_keys: std::collections::HashMap::new(),
-                });
+                .expect("pg_reflex: __reflex_ivm_reference.aggregations must be valid JSON written by pg_reflex");
 
             let intermediate = intermediate_table_name(view_name);
             let (_, bare_view) = split_qualified_name(view_name);

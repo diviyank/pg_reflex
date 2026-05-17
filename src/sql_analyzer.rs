@@ -573,7 +573,10 @@ fn extract_select_column(expr: &Expr, alias: Option<String>) -> SelectColumn {
     }
 }
 
-/// Extract join type as a human-readable string.
+/// Extract join type as a human-readable string. SEMI/ANTI/STRAIGHT
+/// variants are MySQL-dialect-only — not reachable from
+/// `PostgreSqlDialect` parsing — so they fall into the `_ => "OTHER"`
+/// catch-all alongside any future sqlparser additions.
 fn join_type_str(op: &JoinOperator) -> &'static str {
     match op {
         JoinOperator::Inner(_) | JoinOperator::Join(_) => "INNER",
@@ -581,16 +584,13 @@ fn join_type_str(op: &JoinOperator) -> &'static str {
         JoinOperator::Right(_) | JoinOperator::RightOuter(_) => "RIGHT",
         JoinOperator::FullOuter(_) => "FULL OUTER",
         JoinOperator::CrossJoin(_) => "CROSS",
-        JoinOperator::Semi(_) | JoinOperator::LeftSemi(_) => "LEFT SEMI",
-        JoinOperator::RightSemi(_) => "RIGHT SEMI",
-        JoinOperator::Anti(_) | JoinOperator::LeftAnti(_) => "LEFT ANTI",
-        JoinOperator::RightAnti(_) => "RIGHT ANTI",
-        JoinOperator::StraightJoin(_) => "STRAIGHT",
         _ => "OTHER",
     }
 }
 
-/// Extract the JoinConstraint from a JoinOperator.
+/// Extract the JoinConstraint from a JoinOperator. SEMI/ANTI/STRAIGHT
+/// variants — not reachable from `PostgreSqlDialect` — fall to None
+/// alongside other constraint-less / future-added variants.
 fn join_constraint(op: &JoinOperator) -> Option<&JoinConstraint> {
     match op {
         JoinOperator::Join(c)
@@ -600,14 +600,7 @@ fn join_constraint(op: &JoinOperator) -> Option<&JoinConstraint> {
         | JoinOperator::Right(c)
         | JoinOperator::RightOuter(c)
         | JoinOperator::FullOuter(c)
-        | JoinOperator::CrossJoin(c)
-        | JoinOperator::Semi(c)
-        | JoinOperator::LeftSemi(c)
-        | JoinOperator::RightSemi(c)
-        | JoinOperator::Anti(c)
-        | JoinOperator::LeftAnti(c)
-        | JoinOperator::RightAnti(c)
-        | JoinOperator::StraightJoin(c) => Some(c),
+        | JoinOperator::CrossJoin(c) => Some(c),
         _ => None,
     }
 }
