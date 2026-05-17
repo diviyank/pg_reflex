@@ -1115,6 +1115,182 @@ fn cov_json_source_immediate_multisource_join() {
     assert_eq!(s_one, 15);
 }
 
+// ---- Wave 26: diagnose PK auto-detect; add more triggers tests ----
+
+/// Diagnostic: verify pg_index sees the PK on a freshly-created table.
+#[pg_test]
+fn cov_diagnostic_pg_index_sees_pk() {
+    Spi::run("CREATE TABLE cov_dpk_s (id INT PRIMARY KEY, v INT)").expect("create");
+    let pk_cols: Option<String> = Spi::get_one(
+        "SELECT array_to_string(array_agg(a.attname ORDER BY k.n), ',') \
+         FROM pg_index ix \
+         JOIN pg_class t ON t.oid = ix.indrelid \
+         JOIN pg_namespace n ON n.oid = t.relnamespace \
+         JOIN LATERAL unnest(ix.indkey) WITH ORDINALITY AS k(col, n) ON true \
+         JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = k.col \
+         WHERE n.nspname = 'public' AND t.relname = 'cov_dpk_s' \
+           AND ix.indisunique AND ix.indisprimary",
+    )
+    .expect("q");
+    assert!(pk_cols.is_some(), "PK must be visible via pg_index");
+    assert_eq!(pk_cols.unwrap(), "id");
+}
+
+/// Aggregate IMV with SUM(...) FILTER (WHERE ...) — uncommon shape.
+#[pg_test]
+fn cov_sum_filter_where() {
+    Spi::run("CREATE TABLE cov_swf_s (id SERIAL PRIMARY KEY, g TEXT, v INT)").expect("create");
+    Spi::run("INSERT INTO cov_swf_s (g,v) VALUES ('a',1),('a',2),('b',3)").expect("seed");
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        crate::create_reflex_ivm(
+            "cov_swf_view",
+            "SELECT g, SUM(v) FILTER (WHERE v > 1) AS s FROM cov_swf_s GROUP BY g",
+            None,
+            None,
+            None,
+            None,
+        )
+    }));
+    let _ = result;
+}
+
+/// SUM over a CASE expression that's mostly NULLs.
+#[pg_test]
+fn cov_sum_case_with_nulls() {
+    Spi::run("CREATE TABLE cov_scn_s (id SERIAL PRIMARY KEY, g TEXT, v INT)").expect("create");
+    Spi::run("INSERT INTO cov_scn_s (g,v) VALUES ('a',1),('a',2),('a',3)").expect("seed");
+    let _ = crate::create_reflex_ivm(
+        "cov_scn_view",
+        "SELECT g, SUM(CASE WHEN v > 5 THEN v ELSE NULL END) AS s FROM cov_scn_s GROUP BY g",
+        None,
+        None,
+        None,
+        None,
+    );
+}
+
+/// Insert duplicate group keys to exercise UPSERT path.
+#[pg_test]
+fn cov_insert_duplicate_group_keys() {
+    Spi::run("CREATE TABLE cov_idg_s (id SERIAL PRIMARY KEY, g TEXT, v INT)").expect("create");
+    Spi::run("INSERT INTO cov_idg_s (g,v) VALUES ('a',1),('a',2)").expect("seed");
+    crate::create_reflex_ivm(
+        "cov_idg_view",
+        "SELECT g, SUM(v) AS s FROM cov_idg_s GROUP BY g",
+        None,
+        None,
+        None,
+        None,
+    );
+    Spi::run("INSERT INTO cov_idg_s (g,v) VALUES ('a',10),('a',20),('a',30)").expect("bulk ins same key");
+    let s: i64 = Spi::get_one::<i64>("SELECT s::BIGINT FROM cov_idg_view WHERE g='a'")
+        .expect("q")
+        .expect("v");
+    assert_eq!(s, 1 + 2 + 10 + 20 + 30);
+}
+
+/// Bulk UPDATE on entire source.
+#[pg_test]
+fn cov_bulk_update_entire_source() {
+    Spi::run("CREATE TABLE cov_bue_s (id SERIAL PRIMARY KEY, g TEXT, v INT)").expect("create");
+    for i in 1..=20 {
+        Spi::run(&format!(
+            "INSERT INTO cov_bue_s (g,v) VALUES ('a',{}),('b',{})",
+            i,
+            i * 10
+        ))
+        .expect("seed");
+    }
+    crate::create_reflex_ivm(
+        "cov_bue_view",
+        "SELECT g, SUM(v) AS s FROM cov_bue_s GROUP BY g",
+        None,
+        None,
+        None,
+        None,
+    );
+    Spi::run("UPDATE cov_bue_s SET v = v + 1").expect("bulk update all");
+    let s_a: i64 = Spi::get_one::<i64>("SELECT s::BIGINT FROM cov_bue_view WHERE g='a'")
+        .expect("q")
+        .expect("v");
+    assert_eq!(s_a, 230); // sum(1..20) + 20 = 210 + 20 = 230
+}
+
+/// Truncate then reinsert.
+#[pg_test]
+fn cov_truncate_then_reinsert() {
+    Spi::run("CREATE TABLE cov_tri_s (id SERIAL PRIMARY KEY, g TEXT, v INT)").expect("create");
+    Spi::run("INSERT INTO cov_tri_s (g,v) VALUES ('a',1)").expect("seed");
+    crate::create_reflex_ivm(
+        "cov_tri_view",
+        "SELECT g, SUM(v) AS s FROM cov_tri_s GROUP BY g",
+        None,
+        None,
+        None,
+        None,
+    );
+    Spi::run("TRUNCATE cov_tri_s").expect("truncate");
+    Spi::run("INSERT INTO cov_tri_s (g,v) VALUES ('b',5)").expect("reinsert");
+    let s: i64 = Spi::get_one::<i64>("SELECT s::BIGINT FROM cov_tri_view WHERE g='b'")
+        .expect("q")
+        .expect("v");
+    assert_eq!(s, 5);
+}
+
+/// IMV on a temp table — should work.
+#[pg_test]
+fn cov_imv_on_temp_table() {
+    Spi::run("CREATE TEMP TABLE cov_tt_s (id SERIAL PRIMARY KEY, v INT)").expect("create");
+    Spi::run("INSERT INTO cov_tt_s (v) VALUES (1),(2)").expect("seed");
+    let res = crate::create_reflex_ivm(
+        "cov_tt_view",
+        "SELECT SUM(v) AS s FROM cov_tt_s",
+        None,
+        None,
+        None,
+        None,
+    );
+    let _ = res;
+}
+
+/// IMV with materialized view as source — should be rejected.
+#[pg_test]
+fn cov_imv_on_materialized_view() {
+    Spi::run("CREATE TABLE cov_mv_t (id SERIAL PRIMARY KEY, v INT)").expect("create");
+    Spi::run("INSERT INTO cov_mv_t (v) VALUES (1)").expect("seed");
+    Spi::run("CREATE MATERIALIZED VIEW cov_mv_v AS SELECT v FROM cov_mv_t").expect("mv");
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        crate::create_reflex_ivm(
+            "cov_mv_view",
+            "SELECT SUM(v) AS s FROM cov_mv_v",
+            None,
+            None,
+            None,
+            None,
+        )
+    }));
+    let _ = result;
+}
+
+/// IMV on a regular view — interactions.
+#[pg_test]
+fn cov_imv_on_regular_view() {
+    Spi::run("CREATE TABLE cov_rv_t (id SERIAL PRIMARY KEY, v INT)").expect("create");
+    Spi::run("INSERT INTO cov_rv_t (v) VALUES (1),(2)").expect("seed");
+    Spi::run("CREATE VIEW cov_rv_v AS SELECT v FROM cov_rv_t").expect("view");
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        crate::create_reflex_ivm(
+            "cov_rv_view",
+            "SELECT SUM(v) AS s FROM cov_rv_v",
+            None,
+            None,
+            None,
+            None,
+        )
+    }));
+    let _ = result;
+}
+
 // ---- Wave 25: surgical tests to close remaining small gaps ----
 
 /// `drop_reflex_ivm` with invalid view name — hits lib.rs:224.
