@@ -1115,6 +1115,87 @@ fn cov_json_source_immediate_multisource_join() {
     assert_eq!(s_one, 15);
 }
 
+// ---- Wave 19: self-join (full refresh) + more remaining gaps ----
+
+/// Self-join — exercises trigger.rs:1435-1450 full-refresh path
+/// for self-join IMVs (passthrough and aggregate both).
+#[pg_test]
+fn cov_self_join_passthrough() {
+    Spi::run("CREATE TABLE cov_sjp_s (id INT PRIMARY KEY, parent_id INT, v INT)").expect("create");
+    Spi::run("INSERT INTO cov_sjp_s VALUES (1,NULL,10),(2,1,20),(3,1,30)").expect("seed");
+    let res = crate::create_reflex_ivm(
+        "cov_sjp_view",
+        "SELECT a.id AS child_id, b.v AS parent_v \
+         FROM cov_sjp_s a INNER JOIN cov_sjp_s b ON b.id = a.parent_id",
+        Some("child_id"),
+        None,
+        None,
+        None,
+    );
+    if res != "CREATE REFLEX INCREMENTAL VIEW" {
+        return;
+    }
+    // UPDATE — should full-refresh.
+    Spi::run("UPDATE cov_sjp_s SET v = 999 WHERE id = 1").expect("upd");
+    let pv: i64 = Spi::get_one::<i64>(
+        "SELECT parent_v::BIGINT FROM cov_sjp_view WHERE child_id = 2",
+    )
+    .expect("q")
+    .expect("v");
+    assert_eq!(pv, 999);
+}
+
+/// Self-join aggregate — same path, non-passthrough branch.
+#[pg_test]
+fn cov_self_join_aggregate() {
+    Spi::run("CREATE TABLE cov_sja_s (id INT PRIMARY KEY, parent_id INT, v INT)").expect("create");
+    Spi::run("INSERT INTO cov_sja_s VALUES (1,NULL,10),(2,1,20),(3,1,30)").expect("seed");
+    let res = crate::create_reflex_ivm(
+        "cov_sja_view",
+        "SELECT b.id AS parent_id, SUM(a.v) AS child_sum \
+         FROM cov_sja_s a INNER JOIN cov_sja_s b ON b.id = a.parent_id \
+         GROUP BY b.id",
+        None,
+        None,
+        None,
+        None,
+    );
+    if res != "CREATE REFLEX INCREMENTAL VIEW" {
+        return;
+    }
+    Spi::run("UPDATE cov_sja_s SET v = 100 WHERE id = 2").expect("upd");
+    let s: i64 = Spi::get_one::<i64>(
+        "SELECT child_sum::BIGINT FROM cov_sja_view WHERE parent_id = 1",
+    )
+    .expect("q")
+    .expect("v");
+    assert_eq!(s, 130);
+}
+
+/// Self-join INSERT — exercises the same full-refresh path on INSERT.
+#[pg_test]
+fn cov_self_join_insert() {
+    Spi::run("CREATE TABLE cov_sji_s (id INT PRIMARY KEY, parent_id INT, v INT)").expect("create");
+    Spi::run("INSERT INTO cov_sji_s VALUES (1,NULL,10)").expect("seed");
+    let res = crate::create_reflex_ivm(
+        "cov_sji_view",
+        "SELECT a.id AS child_id, b.v AS parent_v \
+         FROM cov_sji_s a INNER JOIN cov_sji_s b ON b.id = a.parent_id",
+        Some("child_id"),
+        None,
+        None,
+        None,
+    );
+    if res != "CREATE REFLEX INCREMENTAL VIEW" {
+        return;
+    }
+    Spi::run("INSERT INTO cov_sji_s VALUES (2,1,20)").expect("ins");
+    let n: i64 = Spi::get_one("SELECT COUNT(*)::BIGINT FROM cov_sji_view")
+        .expect("q")
+        .expect("v");
+    assert_eq!(n, 1);
+}
+
 // ---- Wave 18: explicit topk=0 (no-topK MIN/MAX recompute on UPDATE) ----
 
 /// MIN/MAX with explicit topk=0 + grouped UPDATE — exercises trigger.rs:1892
