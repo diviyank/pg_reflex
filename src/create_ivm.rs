@@ -919,6 +919,36 @@ pub(crate) fn create_reflex_ivm_impl(
 
         let mut unlogged_tables: Vec<String> = Vec::new();
 
+        // 1.5.1 — Filter `imv_relevant_columns` down to columns that
+        // actually exist per source. The analyzer over-attributes bare
+        // identifiers in multi-source queries to every real source as a
+        // safe-correctness move; without this filter the persisted JSON
+        // would name columns that don't exist on the source's transition
+        // table (e.g. `sales_simulation.dem_plan_id` getting wrongly
+        // attributed to `demand_planning` too in a join IMV), and the
+        // skip SQL would error at trigger fire time with
+        // `column "X" does not exist`.
+        //
+        // The filter must run for BOTH passthrough and aggregate IMVs.
+        // (Pre-1.5.1 this only ran in the aggregate branch — passthrough
+        // IMVs with bare projections crashed at the first UPDATE.) The
+        // aggregate branch below re-fetches the catalog info (it needs
+        // column_types + not_null_cols too), which is a tiny duplicate
+        // SPI per IMV — acceptable for the simplicity of a single fix
+        // site that covers both paths.
+        {
+            let (_t, _nn, per_source_cols_for_filter) =
+                query_column_types_from_catalog_with_per_source(client, &froms);
+            for (source, cols) in plan.imv_relevant_columns.iter_mut() {
+                if let Some(actual) = per_source_cols_for_filter.get(source) {
+                    cols.retain(|c| actual.contains(&c.to_lowercase()));
+                } else if source.starts_with('<') {
+                    cols.clear();
+                }
+            }
+            plan.imv_relevant_columns.retain(|_, v| !v.is_empty());
+        }
+
         if plan.is_passthrough {
             // Passthrough: CREATE TABLE AS — Postgres infers columns + types, populates data
             let create_kw = if logged {

@@ -1,5 +1,78 @@
 # Changelog
 
+## [1.5.1] - 2026-05-17
+
+Correctness hotfix. Two distinct crashes made 1.5.0 unusable on real
+customer schemas the moment an UPDATE landed (forecast-factory hit
+both in one transaction). Both root-caused and fixed.
+
+### Fixed
+
+- **`could not identify an equality operator for type json`** —
+  fired at COMMIT (DEFERRED mode) or at UPDATE-trigger fire-time
+  (IMMEDIATE mode) on any source carrying a `json` column. The
+  spurious-UPDATE short-circuit and the per-IMV filter-aware skip
+  both project source columns into `EXCEPT ALL`; PG's `json` type
+  (unlike `jsonb`) has no `=` operator, so the comparison crashed.
+
+  Fix: source-column types are now fetched alongside names, and
+  `json` / `xml` columns are cast to `text` in EXCEPT ALL projections
+  only. The TEMP VIEW (DEFERRED) and transition tables (IMMEDIATE)
+  read by downstream IMV codegen still see the raw column. The
+  IMMEDIATE-mode `filter_skip_block` builds `_skip_cols` via a JOIN
+  to `pg_attribute` / `pg_type` so the cast happens at trigger-fire
+  time.
+
+- **`column "X" does not exist` on the wrong source table** at
+  IMMEDIATE-mode UPDATE fire-time. Repro: a passthrough IMV with a
+  multi-source JOIN and a bare column ref in the SELECT — the
+  alp.sop_forecast_view shape:
+
+  ```sql
+  SELECT dem_plan_id, ...
+  FROM sales_simulation
+  INNER JOIN demand_planning ON demand_planning.id = sales_simulation.dem_plan_id
+  ```
+
+  An UPDATE on `demand_planning` fired the trigger and crashed with
+  `column "dem_plan_id" does not exist`.
+
+  Root cause in `create_ivm.rs`: the analyzer intentionally
+  over-attributes bare column refs to every real source as a
+  safe-correctness over-set, with a contract that `create_ivm`
+  filters bogus entries against the catalog before persisting. The
+  filter only ran inside the *aggregate* branch — *passthrough* IMVs
+  persisted the dirty `imv_relevant_columns` JSON, and the
+  IMMEDIATE-mode UPDATE trigger then referenced columns that don't
+  exist on the source. Fix: hoist the per-source catalog filter so
+  it runs for both branches.
+
+  Belt-and-suspenders: the IMMEDIATE-mode trigger `_skip_cols`
+  builder also JOINs `pg_attribute` as a runtime defense, and the
+  DEFERRED-mode per-IMV skip drops absent columns the same way —
+  IMVs created with dirty pre-1.5.1 metadata no longer crash; they
+  just skip the optimisation (safe; never a wrong result).
+
+### Tests
+
+Four regression tests added in `src/tests/pg_test_deferred.rs`
+covering the exact failure modes:
+
+- `pg_test_deferred_json_column_does_not_break_spurious_check`
+- `pg_test_deferred_json_column_in_relevant_set_does_not_break_filter_aware_skip`
+- `pg_test_immediate_json_column_does_not_break_filter_skip_block`
+- `pg_test_passthrough_join_bare_ref_not_wrongly_attributed`
+
+### Migration
+
+`ALTER EXTENSION pg_reflex UPDATE TO '1.5.1'` re-emits trigger
+function bodies on every distinct source — required so the
+IMMEDIATE-mode UPDATE trigger picks up the new `pg_attribute` JOIN
+in `filter_skip_block`. No persisted JSON rewrites; existing IMVs
+keep working. Recreate IMVs at your convenience to drop the dirty
+`imv_relevant_columns` entries and let the per-IMV skip optimisation
+fire again. See `sql/pg_reflex--1.5.0--1.5.1.sql`.
+
 ## [1.5.0] - 2026-05-17
 
 The bulk-flip release. Closes the gap on aggregate IMVs that lost to

@@ -2462,12 +2462,21 @@ pub fn reflex_flush_deferred(source_table: &str) -> String {
         let (src_schema, src_name_only) = split_qualified_name(source_table);
         let src_schema_lit = src_schema.unwrap_or("public").replace("'", "''");
         let src_name_lit = src_name_only.replace("'", "''");
-        let src_cols: Vec<String> = client
+        // Fetch raw column NAME + TYPE-NAME together. The type name is
+        // needed to cast `json` / `xml` to `text` in EXCEPT ALL projections
+        // — those types lack an equality operator and crash the comparison
+        // otherwise. The raw column projection (for the TEMP VIEW that
+        // downstream incremental codegen reads) stays unchanged.
+        let src_cols_with_types: Vec<(String, String)> = client
             .select(
-                "SELECT quote_ident(column_name) AS qc \
-                 FROM information_schema.columns \
-                 WHERE table_schema = $1 AND table_name = $2 \
-                 ORDER BY ordinal_position",
+                "SELECT a.attname::text AS rn, t.typname::text AS tn \
+                 FROM pg_attribute a \
+                 JOIN pg_type t ON t.oid = a.atttypid \
+                 JOIN pg_class c ON c.oid = a.attrelid \
+                 JOIN pg_namespace n ON n.oid = c.relnamespace \
+                 WHERE n.nspname = $1 AND c.relname = $2 \
+                   AND a.attnum > 0 AND NOT a.attisdropped \
+                 ORDER BY a.attnum",
                 None,
                 &[
                     unsafe {
@@ -2486,10 +2495,43 @@ pub fn reflex_flush_deferred(source_table: &str) -> String {
             )
             .unwrap_or_report()
             .filter_map(|row| {
-                row.get_by_name::<&str, _>("qc")
+                let name = row
+                    .get_by_name::<&str, _>("rn")
                     .unwrap_or(None)
-                    .map(|s| s.to_string())
+                    .map(|s| s.to_string());
+                let tn = row
+                    .get_by_name::<&str, _>("tn")
+                    .unwrap_or(None)
+                    .map(|s| s.to_string());
+                match (name, tn) {
+                    (Some(n), Some(t)) => Some((n, t)),
+                    _ => None,
+                }
             })
+            .collect();
+        let quote_ident = |s: &str| format!("\"{}\"", s.replace('"', "\"\""));
+        let needs_text_cast = |t: &str| t == "json" || t == "xml";
+        let src_cols: Vec<String> = src_cols_with_types
+            .iter()
+            .map(|(n, _)| quote_ident(n))
+            .collect();
+        // EXCEPT ALL comparison projection: cast types that lack an
+        // equality operator to text. `json` and `xml` are the two stock
+        // PG types in this category that real schemas commonly use.
+        let cmp_cols: Vec<String> = src_cols_with_types
+            .iter()
+            .map(|(n, t)| {
+                let q = quote_ident(n);
+                if needs_text_cast(t) {
+                    format!("{}::text", q)
+                } else {
+                    q
+                }
+            })
+            .collect();
+        let col_type_map: std::collections::HashMap<String, String> = src_cols_with_types
+            .iter()
+            .map(|(n, t)| (n.clone(), t.clone()))
             .collect();
         let projection = src_cols.join(", ");
         let new_view = transition_new_table_name(source_table);
@@ -2530,7 +2572,7 @@ pub fn reflex_flush_deferred(source_table: &str) -> String {
         //
         // EXCEPT ALL is multiset subtraction; if both directions are empty
         // and there are no INSERT/DELETE rows, U_OLD ≡ U_NEW.
-        let cols_csv = src_cols.join(", ");
+        let cols_csv = cmp_cols.join(", ");
         let is_spurious = if cols_csv.is_empty() {
             false
         } else {
@@ -2653,10 +2695,28 @@ pub fn reflex_flush_deferred(source_table: &str) -> String {
                     // unambiguously resolvable, so every column listed here
                     // is guaranteed to exist on the source's transition /
                     // delta table.
+                    // Cast json/xml to text (no equality operator). Drop
+                    // columns the analyzer wrongly attributed to this
+                    // source: pre-1.5.1 `create_ivm` only filtered the
+                    // attribution catalog for aggregate IMVs, so
+                    // passthrough IMVs created before that fix may have
+                    // `imv_relevant_columns[source]` entries that don't
+                    // exist on the source table. Selecting one would
+                    // crash the EXCEPT ALL with `column "X" does not
+                    // exist`. The `col_type_map` is populated from the
+                    // source's catalog above; absence ⇒ not on the
+                    // source ⇒ drop.
                     let cols_csv = cols
                         .iter()
                         .filter_map(|v| v.as_str())
-                        .map(|c| format!("\"{}\"", c.replace('"', "\"\"")))
+                        .filter_map(|c| {
+                            let q = format!("\"{}\"", c.replace('"', "\"\""));
+                            match col_type_map.get(c) {
+                                Some(t) if needs_text_cast(t) => Some(format!("{}::text", q)),
+                                Some(_) => Some(q),
+                                None => None,
+                            }
+                        })
                         .collect::<Vec<_>>()
                         .join(", ");
                     if !cols_csv.is_empty() {

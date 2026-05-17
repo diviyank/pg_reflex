@@ -951,3 +951,233 @@ fn pg_test_deferred_filter_aware_skip_filter_entry_runs_full_path() {
     .expect("v");
     assert_eq!(total_after, 30, "must add id=2's contribution");
 }
+
+/// 1.5.1 — Regression: DEFERRED flush over a source that has a `json`
+/// column must not blow up the COMMIT.
+///
+/// The 1.4.3 byte-identical spurious-UPDATE short-circuit projects *every*
+/// source column into an `EXCEPT ALL` multiset comparison. The PG `json`
+/// type has no `=` operator (only `jsonb` does), so any UPDATE on a source
+/// with a `json` column used to crash with
+/// `could not identify an equality operator for type json` at COMMIT.
+///
+/// The fix casts `json` / `xml` columns to `text` in the comparison
+/// projection only — the TEMP VIEW that downstream IMV codegen reads still
+/// projects the raw column.
+#[pg_test]
+fn pg_test_deferred_json_column_does_not_break_spurious_check() {
+    Spi::run(
+        "CREATE TABLE jcol_src (id SERIAL PRIMARY KEY, city TEXT, amount INT, meta json)",
+    )
+    .expect("create");
+    Spi::run(
+        "INSERT INTO jcol_src (city, amount, meta) VALUES \
+            ('Paris', 10, '{\"a\":1}'::json), \
+            ('London', 20, '{\"a\":2}'::json)",
+    )
+    .expect("seed");
+
+    crate::create_reflex_ivm(
+        "jcol_view",
+        "SELECT city, SUM(amount) AS total FROM jcol_src GROUP BY city",
+        None,
+        None,
+        Some("DEFERRED"),
+        None,
+    );
+
+    // Real UPDATE that touches an IMV-relevant column. Previously crashed
+    // the spurious-check `EXCEPT ALL` on the json column. Must succeed.
+    Spi::run("UPDATE jcol_src SET amount = amount + 5 WHERE city = 'Paris'")
+        .expect("real update with json column on source");
+    Spi::run("SELECT reflex_flush_deferred('jcol_src')")
+        .expect("flush must succeed despite json column");
+
+    let paris_total: i64 =
+        Spi::get_one::<i64>("SELECT total::BIGINT FROM jcol_view WHERE city = 'Paris'")
+            .expect("q")
+            .expect("v");
+    assert_eq!(paris_total, 15, "Paris should be 10+5 after update");
+
+    // Spurious UPDATE — sets every column to its current value. Spurious
+    // check must run (without crashing on json) AND must detect equality.
+    let count_before: i64 = Spi::get_one(
+        "SELECT COALESCE(flush_count, 0) FROM public.__reflex_ivm_reference WHERE name = 'jcol_view'",
+    )
+    .expect("q")
+    .expect("v");
+    Spi::run("UPDATE jcol_src SET city = city, amount = amount, meta = meta")
+        .expect("spurious update");
+    Spi::run("SELECT reflex_flush_deferred('jcol_src')").expect("spurious flush");
+    let count_after: i64 = Spi::get_one(
+        "SELECT COALESCE(flush_count, 0) FROM public.__reflex_ivm_reference WHERE name = 'jcol_view'",
+    )
+    .expect("q")
+    .expect("v");
+    assert_eq!(
+        count_before, count_after,
+        "spurious flush over json source must skip IMV body"
+    );
+}
+
+/// 1.5.1 — Regression: DEFERRED per-IMV filter-aware skip over a source
+/// that has a `json` column in the IMV's relevant-column set must not
+/// blow up the COMMIT.
+///
+/// The filter-aware skip projects `imv_relevant_columns[source]` into
+/// `EXCEPT ALL`. If the IMV selects/joins/groups on a `json` column,
+/// the same equality-operator gap applies.
+#[pg_test]
+fn pg_test_deferred_json_column_in_relevant_set_does_not_break_filter_aware_skip() {
+    Spi::run(
+        "CREATE TABLE jcol_rel (id SERIAL PRIMARY KEY, city TEXT, amount INT, meta json)",
+    )
+    .expect("create");
+    Spi::run(
+        "INSERT INTO jcol_rel (city, amount, meta) VALUES \
+            ('Paris', 10, '{\"a\":1}'::json), \
+            ('London', 20, '{\"a\":2}'::json)",
+    )
+    .expect("seed");
+
+    // IMV passthrough — projects `meta` so it lands in imv_relevant_columns.
+    crate::create_reflex_ivm(
+        "jcol_rel_view",
+        "SELECT id, city, amount, meta FROM jcol_rel",
+        Some("id"),
+        None,
+        Some("DEFERRED"),
+        None,
+    );
+
+    // UPDATE touches the non-json column only; the filter-aware EXCEPT ALL
+    // path projects ALL of {id, city, amount, meta} — including json.
+    Spi::run("UPDATE jcol_rel SET amount = amount + 1 WHERE city = 'Paris'")
+        .expect("update non-json column");
+    Spi::run("SELECT reflex_flush_deferred('jcol_rel')")
+        .expect("flush must succeed with json in relevant cols");
+
+    let paris_amount: i64 =
+        Spi::get_one::<i64>("SELECT amount::BIGINT FROM jcol_rel_view WHERE city = 'Paris'")
+            .expect("q")
+            .expect("v");
+    assert_eq!(paris_amount, 11);
+}
+
+/// 1.5.1 — Regression: passthrough IMV with multi-source JOIN whose
+/// SELECT list uses bare (unqualified) column refs must not wrongly
+/// attribute those refs to every source.
+///
+/// Reproduction (matches the alp.sop_forecast_view shape the user hit):
+///   SELECT dem_plan_id, week, sales_simulation.product_id, ...
+///   FROM sales_simulation INNER JOIN demand_planning
+///     ON demand_planning.id = sales_simulation.dem_plan_id
+///
+/// `dem_plan_id` is bare in the SELECT. Pre-1.5.1 the analyzer over-
+/// attributed bare refs to every real source as a safe-correctness
+/// move, expecting `create_ivm` to filter against the catalog. The
+/// filter only ran for AGGREGATE IMVs; passthrough IMVs persisted
+/// `dem_plan_id` as a "relevant column" of `demand_planning`. An
+/// UPDATE on `demand_planning` then crashed at trigger fire with
+/// `column "dem_plan_id" does not exist`.
+#[pg_test]
+fn pg_test_passthrough_join_bare_ref_not_wrongly_attributed() {
+    Spi::run("CREATE TABLE br_dp (id SERIAL PRIMARY KEY, status TEXT, modified_date TIMESTAMP)")
+        .expect("create dp");
+    Spi::run(
+        "CREATE TABLE br_ss (id SERIAL PRIMARY KEY, dem_plan_id INT, product_id INT, qty INT)",
+    )
+    .expect("create ss");
+    Spi::run("INSERT INTO br_dp (status, modified_date) VALUES \
+              ('current', now()), ('current', now())")
+        .expect("seed dp");
+    Spi::run("INSERT INTO br_ss (dem_plan_id, product_id, qty) VALUES \
+              (1, 100, 10), (1, 101, 20), (2, 100, 30)")
+        .expect("seed ss");
+
+    // Bare `dem_plan_id` in SELECT — analyzer would over-attribute to
+    // both `br_ss` and `br_dp` without the catalog filter.
+    crate::create_reflex_ivm(
+        "br_join_view",
+        "SELECT dem_plan_id, br_ss.product_id, qty \
+         FROM br_ss \
+         INNER JOIN br_dp ON br_dp.id = br_ss.dem_plan_id \
+         WHERE br_dp.status = 'current'",
+        Some("dem_plan_id,product_id"),
+        None,
+        Some("IMMEDIATE"),
+        None,
+    );
+
+    // Sanity: persisted JSON must NOT carry `dem_plan_id` as a relevant
+    // column of `br_dp` (the demand_planning analog). It must remain in
+    // `br_ss`'s set.
+    let dp_cols: String = Spi::get_one(
+        "SELECT COALESCE( \
+            (aggregations::jsonb->'imv_relevant_columns'->'br_dp')::text, \
+            '[]' \
+         ) FROM public.__reflex_ivm_reference WHERE name = 'br_join_view'",
+    )
+    .expect("q")
+    .expect("v");
+    assert!(
+        !dp_cols.contains("dem_plan_id"),
+        "br_dp's imv_relevant_columns must not contain dem_plan_id, got: {}",
+        dp_cols
+    );
+
+    // The actual crash repro: UPDATE the source that doesn't have
+    // `dem_plan_id`. Pre-fix this errored with
+    // `column "dem_plan_id" does not exist`.
+    Spi::run("UPDATE br_dp SET modified_date = now() WHERE id = 1")
+        .expect("update on dp must not crash on bad column attribution");
+
+    // And the IMV is still correct after a real change.
+    Spi::run("INSERT INTO br_ss (dem_plan_id, product_id, qty) VALUES (2, 200, 5)")
+        .expect("insert into ss");
+    let total: i64 = Spi::get_one::<i64>("SELECT SUM(qty)::BIGINT FROM br_join_view")
+        .expect("q")
+        .expect("v");
+    assert_eq!(total, 10 + 20 + 30 + 5, "IMV must include the new row");
+}
+
+/// 1.5.1 — Regression: IMMEDIATE-mode filter_skip_block in the UPDATE
+/// trigger body must not crash when the IMV's relevant columns include
+/// a `json` column.
+///
+/// The IMMEDIATE trigger builds `_skip_cols` from
+/// `imv_relevant_columns[source]` and runs `EXCEPT ALL` over the OLD/NEW
+/// transition tables. Same equality-operator trap.
+#[pg_test]
+fn pg_test_immediate_json_column_does_not_break_filter_skip_block() {
+    Spi::run(
+        "CREATE TABLE jcol_imm (id SERIAL PRIMARY KEY, city TEXT, amount INT, meta json)",
+    )
+    .expect("create");
+    Spi::run(
+        "INSERT INTO jcol_imm (city, amount, meta) VALUES \
+            ('Paris', 10, '{\"a\":1}'::json), \
+            ('London', 20, '{\"a\":2}'::json)",
+    )
+    .expect("seed");
+
+    crate::create_reflex_ivm(
+        "jcol_imm_view",
+        "SELECT id, city, amount, meta FROM jcol_imm",
+        Some("id"),
+        None,
+        Some("IMMEDIATE"),
+        None,
+    );
+
+    // IMMEDIATE: the UPDATE itself fires the trigger; previously the
+    // filter_skip_block EXCEPT ALL would crash here on the json column.
+    Spi::run("UPDATE jcol_imm SET amount = amount + 5 WHERE city = 'Paris'")
+        .expect("immediate update must succeed with json column");
+
+    let paris_amount: i64 =
+        Spi::get_one::<i64>("SELECT amount::BIGINT FROM jcol_imm_view WHERE city = 'Paris'")
+            .expect("q")
+            .expect("v");
+    assert_eq!(paris_amount, 15);
+}

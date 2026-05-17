@@ -403,12 +403,35 @@ pub fn build_trigger_ddls(source_table: &str) -> Vec<String> {
     //
     // An absent / empty imv_relevant_columns entry disables the check
     // (CTE-using or SELECT * IMVs land here — they keep the previous path).
+    // The CASE on t.typname casts `json` / `xml` columns to `text` in the
+    // EXCEPT ALL projection — neither type has an equality operator, so a
+    // bare projection crashes the comparison at runtime. The TEMP VIEW /
+    // transition table downstream still sees the raw column; only the
+    // skip-check projection casts.
+    //
+    // The JOIN against pg_attribute also acts as a runtime existence
+    // filter: if the analyzer mis-attributes a column to this source
+    // (i.e. names a column that doesn't actually exist on `source_table`),
+    // the JOIN simply drops it instead of letting the EXCEPT ALL crash
+    // with `column "X" does not exist`. The skip-check then runs on a
+    // subset and may be conservative (i.e. doesn't skip) — that's safe;
+    // it never produces wrong results.
     let filter_skip_block_for_update = format!(
-        "SELECT string_agg(format('%I', col), ', ' ORDER BY col) \
+        "SELECT string_agg( \
+              CASE WHEN t.typname IN ('json','xml') \
+                   THEN format('%I::text', sel.col) \
+                   ELSE format('%I', sel.col) \
+              END, \
+              ', ' ORDER BY sel.col) \
               INTO _skip_cols \
               FROM jsonb_array_elements_text( \
                    COALESCE(_rec.aggregations::jsonb->'imv_relevant_columns'->'{source_table}', '[]'::jsonb) \
-              ) AS t(col); \
+              ) AS sel(col) \
+              JOIN pg_attribute a \
+                ON a.attname = sel.col \
+               AND a.attrelid = '{source_table}'::regclass \
+               AND a.attnum > 0 AND NOT a.attisdropped \
+              JOIN pg_type t ON t.oid = a.atttypid; \
          IF _skip_cols IS NOT NULL AND _skip_cols <> '' THEN \
            _skip_pred := _rec.aggregations::jsonb->'imv_relevant_where'->>'{source_table}'; \
            IF _skip_pred IS NULL OR _skip_pred = '' THEN \
