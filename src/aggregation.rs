@@ -771,7 +771,9 @@ fn plan_aggregation_inner(analysis: &SqlAnalysis) -> AggregationPlan {
 
         // Handle aggregate-derived expressions (e.g., CASE WHEN SUM(x) > 0 THEN ...)
         if col.is_aggregate_derived {
-            let output_alias = col.alias.clone().unwrap_or_else(|| col.expr_sql.clone());
+            let output_alias = crate::query_decomposer::normalized_column_name(
+                col.alias.as_deref().unwrap_or(&col.expr_sql),
+            );
             let (rewritten, new_intermediates) =
                 rewrite_aggregate_derived_expr(&col.expr_sql, &intermediate_columns);
             intermediate_columns.extend(new_intermediates);
@@ -792,7 +794,9 @@ fn plan_aggregation_inner(analysis: &SqlAnalysis) -> AggregationPlan {
         let arg_sanitized = sanitize_for_col_name(arg);
 
         // Determine the user-facing alias for the output
-        let output_alias = col.alias.clone().unwrap_or_else(|| col.expr_sql.clone());
+        let output_alias = crate::query_decomposer::normalized_column_name(
+            col.alias.as_deref().unwrap_or(&col.expr_sql),
+        );
 
         let cast_type = col.cast_type.clone();
 
@@ -1095,7 +1099,7 @@ fn plan_aggregation_inner(analysis: &SqlAnalysis) -> AggregationPlan {
             .iter()
             .map(|c| {
                 let name = c.alias.as_deref().unwrap_or(&c.expr_sql);
-                crate::query_decomposer::bare_column_name(name).to_string()
+                crate::query_decomposer::normalized_column_name(name)
             })
             .collect()
     } else {
@@ -1165,7 +1169,9 @@ fn plan_aggregation_inner(analysis: &SqlAnalysis) -> AggregationPlan {
             if col.is_window {
                 Some(format!(
                     "agg:{}",
-                    col.alias.as_deref().unwrap_or(&col.expr_sql)
+                    crate::query_decomposer::normalized_column_name(
+                        col.alias.as_deref().unwrap_or(&col.expr_sql)
+                    )
                 ))
             } else if col.is_passthrough {
                 // Resolve to the matching GROUP BY expression so that keys are consistent
@@ -1180,7 +1186,9 @@ fn plan_aggregation_inner(analysis: &SqlAnalysis) -> AggregationPlan {
             } else if col.aggregate.is_some() || col.is_aggregate_derived {
                 Some(format!(
                     "agg:{}",
-                    col.alias.as_deref().unwrap_or(&col.expr_sql)
+                    crate::query_decomposer::normalized_column_name(
+                        col.alias.as_deref().unwrap_or(&col.expr_sql)
+                    )
                 ))
             } else {
                 None

@@ -210,15 +210,23 @@ pub fn bare_column_name(col: &str) -> &str {
     }
 }
 
-/// Strip qualifier and lowercase to match PostgreSQL's identifier folding.
-/// Unquoted identifiers in SQL are folded to lowercase by PostgreSQL,
-/// so all generated SQL should use lowercase column names for consistency.
-/// For complex expressions (containing parentheses), sanitizes characters
-/// that are invalid in identifiers (parens, commas, spaces, dots) to underscores.
+/// Strip qualifier and normalise to match PostgreSQL's identifier folding:
+/// - Quoted (`"Grp"`)  → strip outer quotes, preserve case verbatim.
+/// - Unquoted (`Grp`)  → fold to lowercase (PG's parse-time rule).
+///
+/// For expressions (containing parentheses), sanitize to a valid identifier suffix.
 pub fn normalized_column_name(col: &str) -> String {
-    let bare = bare_column_name(col).trim_matches('"').to_lowercase();
-    if bare.contains('(') {
-        bare.chars()
+    let bare = bare_column_name(col);
+    let is_quoted = bare.starts_with('"') && bare.ends_with('"') && bare.len() >= 2;
+    let stripped = if is_quoted {
+        // Quoted: preserve case; unescape `""` → `"` per SQL standard.
+        bare[1..bare.len() - 1].replace("\"\"", "\"")
+    } else {
+        bare.to_lowercase()
+    };
+    if stripped.contains('(') {
+        stripped
+            .chars()
             .map(|c| {
                 if c.is_alphanumeric() || c == '_' {
                     c
@@ -230,7 +238,7 @@ pub fn normalized_column_name(col: &str) -> String {
             .trim_matches('_')
             .to_string()
     } else {
-        bare
+        stripped
     }
 }
 

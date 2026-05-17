@@ -1,5 +1,51 @@
 # Changelog
 
+## [1.5.2] - 2026-05-17
+
+Correctness fix for quoted mixed-case column names.
+
+### Fixed
+
+- **Quoted mixed-case column names are now preserved** — when a source
+  query uses quoted identifiers (`"Grp"`, `"DisplayName"`, `"TotalQty"`),
+  the IMV target table is now created with the column name exactly as
+  written, matching PostgreSQL's own identifier-folding rule:
+  unquoted refs fold to lowercase, quoted refs preserve case verbatim.
+
+  Previously, `normalized_column_name` unconditionally lowercased every
+  column name regardless of quoting, so an IMV over
+  `SELECT "Grp", SUM(v) FROM t GROUP BY "Grp"` created a target column
+  `grp`, and any downstream `SELECT ... WHERE "Grp" = 'x'` failed with
+  `column "Grp" does not exist`.
+
+### Operator action required for affected IMVs
+
+IMVs created under 1.5.0 or 1.5.1 that use mixed-case quoted source
+columns are internally consistent (target was built lowercase and
+triggers reference the same lowercase name), so they continue to work
+after the upgrade. To expose the columns under the user's quoted names,
+DROP and recreate the IMV:
+
+```sql
+SELECT reflex_drop_ivm('my_view');
+SELECT create_reflex_ivm('my_view', '...original query...', ...);
+```
+
+IMVs that use only unquoted (lowercase) column names are unaffected.
+
+### Tests
+
+Five tests cover the new contract:
+
+- `cov_bug_mixed_case_grouped_imv_target_preserves_case`
+- `cov_bug_mixed_case_passthrough_imv`
+- `cov_bug_mixed_case_aliased_aggregate_column`
+- `cov_bug_mixed_case_with_schema_qualified_source`
+- `cov_bug_unquoted_mixed_case_still_lowercases` (regression — unquoted
+  refs must still fold to lowercase)
+
+---
+
 ## [1.5.1] - 2026-05-17
 
 Correctness hotfix. Two distinct crashes made 1.5.0 unusable on real

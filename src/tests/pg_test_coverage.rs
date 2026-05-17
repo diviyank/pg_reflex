@@ -1089,7 +1089,6 @@ fn cov_source_mixed_case_quoted_identifier_create_path() {
 /// table must expose the column under the user's case-preserved name so
 /// that SELECT against the IMV with the same quoted name works.
 #[pg_test]
-#[ignore = "bug 1.5.2: pg_reflex lower-cases quoted mixed-case columns; fix pending"]
 fn cov_bug_mixed_case_grouped_imv_target_preserves_case() {
     Spi::run("CREATE TABLE bug_mc_g_src (\"Id\" SERIAL PRIMARY KEY, \"Grp\" TEXT, v INT)")
         .expect("create");
@@ -1159,7 +1158,6 @@ fn cov_bug_mixed_case_grouped_imv_target_preserves_case() {
 
 /// Passthrough IMV with a quoted mixed-case projection column.
 #[pg_test]
-#[ignore = "bug 1.5.2: pg_reflex lower-cases quoted mixed-case columns; fix pending"]
 fn cov_bug_mixed_case_passthrough_imv() {
     Spi::run("CREATE TABLE bug_mc_p_src (\"Id\" INT PRIMARY KEY, \"DisplayName\" TEXT)")
         .expect("create");
@@ -1229,7 +1227,6 @@ fn cov_bug_mixed_case_passthrough_imv() {
 /// of the source column casing). The IMV's user-facing column name must
 /// match the alias the user wrote, not a lowercased version.
 #[pg_test]
-#[ignore = "bug 1.5.2: pg_reflex lower-cases quoted mixed-case aliases; fix pending"]
 fn cov_bug_mixed_case_aliased_aggregate_column() {
     Spi::run("CREATE TABLE bug_mc_a_src (id SERIAL PRIMARY KEY, g TEXT, v INT)")
         .expect("create");
@@ -1298,7 +1295,6 @@ fn cov_bug_unquoted_mixed_case_still_lowercases() {
 
 /// Schema-qualified source with mixed-case quoted column.
 #[pg_test]
-#[ignore = "bug 1.5.2: pg_reflex lower-cases quoted mixed-case columns; fix pending"]
 fn cov_bug_mixed_case_with_schema_qualified_source() {
     Spi::run("CREATE SCHEMA IF NOT EXISTS bug_mc_sch").expect("schema");
     Spi::run(

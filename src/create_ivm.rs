@@ -671,7 +671,7 @@ pub(crate) fn create_reflex_ivm_impl(
             // Explicit unique columns from 3rd parameter
             resolved_unique_columns = unique_columns_str
                 .split(',')
-                .map(|s| s.trim().to_lowercase())
+                .map(|s| normalized_column_name(s.trim()))
                 .filter(|s| !s.is_empty())
                 .collect();
             plan.passthrough_columns = resolved_unique_columns.clone();
@@ -941,7 +941,7 @@ pub(crate) fn create_reflex_ivm_impl(
                 query_column_types_from_catalog_with_per_source(client, &froms);
             for (source, cols) in plan.imv_relevant_columns.iter_mut() {
                 if let Some(actual) = per_source_cols_for_filter.get(source) {
-                    cols.retain(|c| actual.contains(&c.to_lowercase()));
+                    cols.retain(|c| actual.contains(c.as_str()));
                 } else if source.starts_with('<') {
                     cols.clear();
                 }
@@ -1019,7 +1019,7 @@ pub(crate) fn create_reflex_ivm_impl(
             // table, and the skip SQL would error at trigger fire time.
             for (source, cols) in plan.imv_relevant_columns.iter_mut() {
                 if let Some(actual) = per_source_cols.get(source) {
-                    cols.retain(|c| actual.contains(&c.to_lowercase()));
+                    cols.retain(|c| actual.contains(c.as_str()));
                 } else if source.starts_with('<') {
                     cols.clear();
                 }
@@ -1505,8 +1505,8 @@ fn build_passthrough_key_mappings(
     let mut target_col_to_expr: HashMap<String, String> = HashMap::new();
     for col in &analysis.select_columns {
         let target_name = col.alias.as_deref().unwrap_or(&col.expr_sql);
-        let target_name = bare_column_name(target_name).to_lowercase();
-        target_col_to_expr.insert(target_name, col.expr_sql.to_lowercase());
+        let target_name = normalized_column_name(target_name);
+        target_col_to_expr.insert(target_name, col.expr_sql.clone());
     }
 
     // For each source table, determine if it's the key owner or a secondary table
@@ -1544,7 +1544,7 @@ fn build_passthrough_key_mappings(
                     // Extract the bare source column name from the expression
                     let source_col = target_col_to_expr
                         .get(kc.as_str())
-                        .map(|expr| bare_column_name(expr).to_string())
+                        .map(|expr| normalized_column_name(expr))
                         .unwrap_or_else(|| kc.clone());
                     (kc.clone(), source_col)
                 })
@@ -1947,7 +1947,7 @@ fn query_column_types_from_catalog_with_per_source(
                 per_source
                     .entry(table.clone())
                     .or_default()
-                    .insert(col_name.to_lowercase());
+                    .insert(col_name.clone());
             }
         }
     }
