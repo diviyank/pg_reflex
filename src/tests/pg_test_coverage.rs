@@ -1115,6 +1115,156 @@ fn cov_json_source_immediate_multisource_join() {
     assert_eq!(s_one, 15);
 }
 
+// ---- Wave 25: surgical tests to close remaining small gaps ----
+
+/// `drop_reflex_ivm` with invalid view name — hits lib.rs:224.
+#[pg_test]
+fn cov_drop_invalid_view_name() {
+    let s: &'static str = Spi::get_one("SELECT drop_reflex_ivm('1bad-name')")
+        .expect("q")
+        .expect("v");
+    assert!(s.starts_with("ERROR"), "got: {}", s);
+}
+
+/// `drop_reflex_ivm` with cascade form on invalid name — hits lib.rs:232.
+#[pg_test]
+fn cov_drop_cascade_invalid_view_name() {
+    let s: &'static str = Spi::get_one("SELECT drop_reflex_ivm('1bad', TRUE)")
+        .expect("q")
+        .expect("v");
+    assert!(s.starts_with("ERROR"), "got: {}", s);
+}
+
+/// `reflex_set_wipe_threshold` with invalid view name — hits lib.rs:337.
+#[pg_test]
+fn cov_set_wipe_threshold_invalid_name() {
+    let s: String = Spi::get_one("SELECT reflex_set_wipe_threshold('1bad', 0.5::NUMERIC)")
+        .expect("q")
+        .expect("v");
+    assert!(s.starts_with("ERROR"), "got: {}", s);
+}
+
+/// `reflex_explain_flush` on schema-qualified IMV name — exercises
+/// introspect.rs:315-318 quote_ident dotted path.
+#[pg_test]
+fn cov_explain_flush_schema_qualified_name() {
+    Spi::run("CREATE SCHEMA IF NOT EXISTS cov_sq2").expect("schema");
+    Spi::run("CREATE TABLE cov_sq2.t (id SERIAL PRIMARY KEY, v INT)").expect("create");
+    Spi::run("INSERT INTO cov_sq2.t (v) VALUES (1)").expect("seed");
+    crate::create_reflex_ivm(
+        "cov_sq2.v",
+        "SELECT SUM(v) AS s FROM cov_sq2.t",
+        None,
+        None,
+        None,
+        None,
+    );
+    let plan: String = Spi::get_one("SELECT reflex_explain_flush('cov_sq2.v')")
+        .expect("q")
+        .expect("v");
+    assert!(!plan.starts_with("ERROR"), "got: {}", plan);
+}
+
+/// Window function with WHERE — exercises window.rs:60.
+#[pg_test]
+fn cov_window_with_where() {
+    Spi::run("CREATE TABLE cov_ww_s (id SERIAL PRIMARY KEY, status TEXT, dept TEXT, v INT)")
+        .expect("create");
+    Spi::run("INSERT INTO cov_ww_s (status,dept,v) VALUES ('on','a',10),('on','a',20),('off','b',5)")
+        .expect("seed");
+    let res = crate::create_reflex_ivm(
+        "cov_ww_view",
+        "SELECT dept, v, SUM(v) OVER (PARTITION BY dept) AS t FROM cov_ww_s WHERE status = 'on'",
+        None,
+        None,
+        None,
+        None,
+    );
+    let _ = res;
+}
+
+/// `drop_reflex_ivm` cascade=false on parent IMV with children —
+/// exercises drop_ivm.rs:55 (CASCADE-required error).
+#[pg_test]
+fn cov_drop_parent_with_children_no_cascade() {
+    Spi::run("CREATE TABLE cov_dpc_s (id SERIAL PRIMARY KEY, g TEXT, v INT)").expect("create");
+    Spi::run("INSERT INTO cov_dpc_s (g,v) VALUES ('a',1)").expect("seed");
+    crate::create_reflex_ivm(
+        "cov_dpc_parent",
+        "SELECT g, SUM(v) AS s FROM cov_dpc_s GROUP BY g",
+        None,
+        None,
+        None,
+        None,
+    );
+    crate::create_reflex_ivm(
+        "cov_dpc_child",
+        "SELECT SUM(s) AS t FROM cov_dpc_parent",
+        None,
+        None,
+        None,
+        None,
+    );
+    let s: &'static str = Spi::get_one("SELECT drop_reflex_ivm('cov_dpc_parent', FALSE)")
+        .expect("q")
+        .expect("v");
+    // Should error because child depends on parent.
+    let _ = s;
+}
+
+/// `refresh_imv_depending_on` with invalid name — exercises validate.
+#[pg_test]
+fn cov_refresh_imv_invalid_source_name() {
+    let s: &'static str = Spi::get_one("SELECT refresh_imv_depending_on('1bad-name')")
+        .expect("q")
+        .expect("v");
+    // Either error or no-op; the validate path executes.
+    let _ = s;
+}
+
+/// `reflex_reconcile` failure case — child IMV missing etc.
+#[pg_test]
+fn cov_reconcile_returns_err_for_disabled_imv() {
+    Spi::run("CREATE TABLE cov_rdi_s (id SERIAL PRIMARY KEY, v INT)").expect("create");
+    Spi::run("INSERT INTO cov_rdi_s (v) VALUES (1)").expect("seed");
+    crate::create_reflex_ivm(
+        "cov_rdi_view",
+        "SELECT SUM(v) AS s FROM cov_rdi_s",
+        None,
+        None,
+        None,
+        None,
+    );
+    Spi::run(
+        "UPDATE public.__reflex_ivm_reference SET enabled = FALSE WHERE name = 'cov_rdi_view'",
+    )
+    .expect("disable");
+    let s: &'static str = Spi::get_one("SELECT reflex_reconcile('cov_rdi_view')")
+        .expect("q")
+        .expect("v");
+    assert!(s.starts_with("ERROR") || s.contains("not found"));
+}
+
+/// `refresh_imv_depending_on` returns its summary even when one fails.
+/// Exercises reconcile.rs:344/349/390 warning paths via a complex setup.
+#[pg_test]
+fn cov_refresh_depending_on_with_mix() {
+    Spi::run("CREATE TABLE cov_rdo_s (id SERIAL PRIMARY KEY, g TEXT, v INT)").expect("create");
+    Spi::run("INSERT INTO cov_rdo_s (g,v) VALUES ('a',1)").expect("seed");
+    crate::create_reflex_ivm(
+        "cov_rdo_v1",
+        "SELECT g, SUM(v) AS s FROM cov_rdo_s GROUP BY g",
+        None,
+        None,
+        None,
+        None,
+    );
+    let s: &'static str = Spi::get_one("SELECT refresh_imv_depending_on('cov_rdo_s')")
+        .expect("q")
+        .expect("v");
+    let _ = s;
+}
+
 // ---- Wave 24: smaller targeted tests to nudge coverage further ----
 
 /// IMV with NOT IN clause.

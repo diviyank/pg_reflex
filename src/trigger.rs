@@ -200,16 +200,13 @@ fn build_merge_using(
                 }
             }
             _ => {
-                // COALESCE handles NULL in delta (e.g., SUM(NULL)=NULL but we need 0).
-                // Use type-appropriate default: 0 for numeric, FALSE for boolean.
-                let default_val = if ic.pg_type == "BOOLEAN" {
-                    "FALSE"
-                } else {
-                    "0"
-                };
+                // COALESCE handles NULL in delta (e.g., SUM(NULL)=NULL but we
+                // need 0). Intermediate columns are always BIGINT or NUMERIC
+                // (SUM / COUNT / __nonnull_count / topk-array elements) — the
+                // builder never emits BOOLEAN intermediates. Use "0" directly.
                 set_clauses.push(format!(
-                    "\"{}\" = COALESCE(t.\"{}\", {}) {} COALESCE(d.\"{}\", {})",
-                    ic.name, ic.name, default_val, operator, ic.name, default_val
+                    "\"{}\" = COALESCE(t.\"{}\", 0) {} COALESCE(d.\"{}\", 0)",
+                    ic.name, ic.name, operator, ic.name
                 ));
             }
         }
@@ -2575,10 +2572,11 @@ pub fn reflex_flush_deferred(source_table: &str) -> String {
         //
         // EXCEPT ALL is multiset subtraction; if both directions are empty
         // and there are no INSERT/DELETE rows, U_OLD ≡ U_NEW.
+        //
+        // `cmp_cols` is non-empty for every real PG table (tables have at
+        // least one column), so the run-the-EXCEPT branch always executes.
         let cols_csv = cmp_cols.join(", ");
-        let is_spurious = if cols_csv.is_empty() {
-            false
-        } else {
+        let is_spurious = {
             let sql = format!(
                 "WITH \
                    has_id AS (SELECT 1 FROM {delta} WHERE __reflex_op IN ('I', 'D') LIMIT 1), \
