@@ -1341,14 +1341,17 @@ pub fn reflex_build_delta_sql(
         }
     }
 
+    // aggregations_json is written by pg_reflex itself via generate_aggregations_json
+    // (which is now infallible — see query_decomposer.rs:751-754). A malformed
+    // value would mean catalog corruption, not user error; failing loudly
+    // beats silently emitting empty SQL.
     let json = aggregations_json.unwrap_or("{}");
-    let plan: AggregationPlan = match serde_json::from_str(json) {
-        Ok(p) => p,
-        Err(_) => {
-            pgrx::warning!("pg_reflex: invalid aggregations JSON for '{}'", view_name);
-            return String::new();
-        }
-    };
+    let plan: AggregationPlan = serde_json::from_str(json).unwrap_or_else(|e| {
+        panic!(
+            "pg_reflex: __reflex_ivm_reference.aggregations for '{}' must be valid JSON (catalog invariant violated: {})",
+            view_name, e
+        )
+    });
 
     let intermediate_tbl = intermediate_table_name(view_name);
     // Use the transition table names directly (no temp table copy needed).
