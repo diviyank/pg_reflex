@@ -745,6 +745,50 @@ fn resolve_unique_columns(ctx: &mut BuildContext) {
     }
 }
 
+fn populate_source_join_keys(ctx: &mut BuildContext) {
+    if ctx.plan.is_passthrough || !ctx.is_join_query {
+        return;
+    }
+    let real_sources: Vec<&String> = ctx.real_source_names.iter().collect();
+    build_source_join_keys(&mut ctx.plan, &real_sources, &ctx.analysis);
+}
+
+/// Warn on SELECT entries that are neither GROUP BY nor recognized aggregates.
+/// These columns will be missing from the IMV (silent data loss is worse than a warning).
+fn validate_select_columns(ctx: &BuildContext) {
+    if ctx.plan.is_passthrough {
+        return;
+    }
+    let group_by_set: std::collections::HashSet<&str> = ctx
+        .plan
+        .group_by_columns
+        .iter()
+        .map(|s| s.as_str())
+        .collect();
+    for col in &ctx.analysis.select_columns {
+        if !col.is_passthrough && col.aggregate.is_none() && !col.is_aggregate_derived {
+            warning!(
+                "pg_reflex: unsupported expression '{}' in SELECT — column will be missing from IMV '{}'",
+                col.alias.as_deref().unwrap_or(&col.expr_sql),
+                ctx.view_name
+            );
+        } else if col.is_passthrough
+            && !group_by_set.contains(col.expr_sql.as_str())
+            && !ctx.analysis.has_distinct
+        {
+            let bare = bare_column_name(&col.expr_sql);
+            let in_gb = group_by_set.iter().any(|gb| bare_column_name(gb) == bare);
+            if !in_gb {
+                warning!(
+                    "pg_reflex: expression '{}' not in GROUP BY and not a recognized aggregate — column will be missing from IMV '{}'",
+                    col.expr_sql,
+                    ctx.view_name
+                );
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn create_reflex_ivm_impl(
     view_name: &str,
@@ -900,15 +944,6 @@ pub(crate) fn create_reflex_ivm_impl(
 
     resolve_unique_columns(&mut ctx);
 
-    // 1.4.6 — populate `source_join_keys` for aggregate plans. Identifies
-    // sources where Item α's directional promotion can short-circuit to
-    // bulk-INSERT (OUT→IN) or bulk-DELETE (IN→OUT) without per-row MERGE
-    // probing. See `build_source_join_keys` for the safety gates.
-    if !ctx.plan.is_passthrough && ctx.is_join_query {
-        let real_sources: Vec<&String> = ctx.real_source_names.iter().collect();
-        build_source_join_keys(&mut ctx.plan, &real_sources, &ctx.analysis);
-    }
-
     // 1.5.3 (plans/partitioning_3.md §4) — populate per-source
     // partition_join_paths fragments.  Skipped here for the unpartitioned
     // / passthrough cases; the real computation runs below once
@@ -916,43 +951,8 @@ pub(crate) fn create_reflex_ivm_impl(
     // build_source_join_keys, and we can't run it later than the catalog
     // insert that persists `plan.aggregations`.)  This call is a no-op
     // until the partition path resolves the partition column.
-
-    // Warn about select columns that are neither GROUP BY nor recognized aggregates.
-    // Note: passthrough columns not explicitly in GROUP BY are auto-added by plan_aggregation,
-    // so we use the plan's group_by_columns (which includes auto-added ones) for validation.
-    if !ctx.plan.is_passthrough {
-        let group_by_set: std::collections::HashSet<&str> = ctx
-            .plan
-            .group_by_columns
-            .iter()
-            .map(|s| s.as_str())
-            .collect();
-        for col in &ctx.analysis.select_columns {
-            if !col.is_passthrough && col.aggregate.is_none() && !col.is_aggregate_derived {
-                warning!(
-                    "pg_reflex: unsupported expression '{}' in SELECT — column will be missing from IMV '{}'",
-                    col.alias.as_deref().unwrap_or(&col.expr_sql),
-                    ctx.view_name
-                );
-            } else if col.is_passthrough
-                && !group_by_set.contains(col.expr_sql.as_str())
-                && !ctx.analysis.has_distinct
-            {
-                // Passthrough column not in GROUP BY — likely an unrecognized aggregate or expression.
-                // Match on the underlying expression, not the output alias: `src.col AS renamed`
-                // is still a valid grouped passthrough if `col` (bare) is in GROUP BY.
-                let bare = bare_column_name(&col.expr_sql);
-                let in_gb = group_by_set.iter().any(|gb| bare_column_name(gb) == bare);
-                if !in_gb {
-                    warning!(
-                        "pg_reflex: expression '{}' not in GROUP BY and not a recognized aggregate — column will be missing from IMV '{}'",
-                        col.expr_sql,
-                        ctx.view_name
-                    );
-                }
-            }
-        }
-    }
+    populate_source_join_keys(&mut ctx);
+    validate_select_columns(&ctx);
 
     // Check for duplicate view name
     let already_exists = Spi::connect(|client| {
