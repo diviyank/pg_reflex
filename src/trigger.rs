@@ -1844,6 +1844,100 @@ fn self_join_full_refresh_stmts(
     }
 }
 
+/// Outer-join-secondary handling: when source_table is the secondary side of a
+/// LEFT/RIGHT JOIN (or any side of FULL OUTER), the MERGE subtract can't represent
+/// the NULL semantics. Passthrough → full refresh. Aggregate → targeted group
+/// reconcile via the affected_tbl. With no group columns, aggregate falls back
+/// to a full intermediate refresh.
+#[allow(clippy::too_many_arguments)]
+fn outer_join_secondary_stmts(
+    view_name: &str,
+    source_table: &str,
+    operation: &str,
+    base_query: &str,
+    end_query: &str,
+    plan: &AggregationPlan,
+    grp_cols: &Option<Vec<String>>,
+    intermediate_tbl: &str,
+    affected_tbl: &str,
+    old_tbl: &str,
+    new_tbl: &str,
+    stmts: &mut Vec<String>,
+) {
+    let qv = quote_identifier(view_name);
+
+    if plan.is_passthrough {
+        stmts.push(format!("DELETE FROM {}", qv));
+        stmts.push(format!("INSERT INTO {} {}", qv, base_query));
+        return;
+    }
+
+    if let Some(ref cols) = grp_cols {
+        let select_expr = affected_groups_select(cols);
+        let transition = if operation == "DELETE" {
+            old_tbl
+        } else {
+            new_tbl
+        };
+        let delta_q = replace_source_with_transition(base_query, source_table, transition);
+
+        stmts.push(format!("TRUNCATE {}", affected_tbl));
+        stmts.push(format!(
+            "INSERT INTO {} SELECT DISTINCT {} FROM ({}) AS __d",
+            affected_tbl, select_expr, delta_q
+        ));
+
+        let ns_in_int = null_safe_in(
+            affected_tbl,
+            intermediate_tbl,
+            cols,
+            cols,
+            &plan.not_null_columns,
+        );
+        stmts.push(format!(
+            "DELETE FROM {} WHERE {}",
+            intermediate_tbl, ns_in_int
+        ));
+
+        let ns_in_full = null_safe_in(affected_tbl, "__full", cols, cols, &plan.not_null_columns);
+        stmts.push(format!(
+            "INSERT INTO {} SELECT * FROM ({}) AS __full WHERE {}",
+            intermediate_tbl, base_query, ns_in_full
+        ));
+
+        let target_cols = target_group_columns(plan);
+        let ns_in_tgt_delete = null_safe_in(
+            affected_tbl,
+            &qv,
+            &target_cols,
+            cols,
+            &plan.not_null_columns,
+        );
+        stmts.push(format!("DELETE FROM {} WHERE {}", qv, ns_in_tgt_delete));
+
+        let ns_in_tgt_insert = null_safe_in(
+            affected_tbl,
+            intermediate_tbl,
+            cols,
+            cols,
+            &plan.not_null_columns,
+        );
+        stmts.push(format!(
+            "INSERT INTO {} {} AND {}",
+            qv, end_query, ns_in_tgt_insert
+        ));
+    } else {
+        stmts.push(format!("TRUNCATE {}", intermediate_tbl));
+        stmts.push(format!("INSERT INTO {} {}", intermediate_tbl, base_query));
+        stmts.push(format!("TRUNCATE {}", qv));
+        if end_query.is_empty() {
+            stmts.push(format!("INSERT INTO {} {}", qv, base_query));
+        } else {
+            stmts.push(format!("INSERT INTO {} {}", qv, end_query));
+        }
+    }
+}
+
 /// Generates the SQL statements to apply a delta to an IMV.
 ///
 /// Called from plpgsql trigger wrappers. Returns a delimiter-separated string
@@ -1976,111 +2070,21 @@ pub fn reflex_build_delta_sql(
             &plan,
             &mut stmts,
         );
-    } else if is_outer_join_secondary && plan.is_passthrough {
-        // Passthrough outer-join secondary: full refresh from source
-        let qv = quote_identifier(view_name);
-        stmts.push(format!("DELETE FROM {}", qv));
-        stmts.push(format!("INSERT INTO {} {}", qv, base_query));
-    } else if is_outer_join_secondary && !plan.is_passthrough {
-        // LEFT/RIGHT JOIN secondary table DELETE/UPDATE: targeted group reconcile.
-        // The delta correctly identifies WHICH groups changed (affected groups),
-        // but the MERGE subtract produces wrong values (can't represent NULL from LEFT JOIN).
-        // Fix: extract affected groups from delta, delete them from intermediate,
-        // re-insert ONLY those groups from the full base_query.
-        if let Some(ref cols) = grp_cols {
-            let select_expr = affected_groups_select(cols);
-            let qv = quote_identifier(view_name);
-
-            // Determine transition table for affected group extraction
-            let transition = if operation == "DELETE" {
-                &old_tbl
-            } else {
-                &new_tbl
-            };
-            // Build a delta query to extract group keys from transition table
-            let delta_q = replace_source_with_transition(base_query, source_table, transition);
-
-            // Create affected groups table
-            stmts.push(format!("TRUNCATE {}", affected_tbl));
-
-            // Extract affected groups from delta
-            stmts.push(format!(
-                "INSERT INTO {} SELECT DISTINCT {} FROM ({}) AS __d",
-                affected_tbl, select_expr, delta_q
-            ));
-
-            // Delete affected groups from intermediate. Outer is the
-            // intermediate (its column names match `cols`).
-            let ns_in_int = null_safe_in(
-                &affected_tbl,
-                &intermediate_tbl,
-                cols,
-                cols,
-                &plan.not_null_columns,
-            );
-            stmts.push(format!(
-                "DELETE FROM {} WHERE {}",
-                intermediate_tbl, ns_in_int
-            ));
-
-            // Re-insert ONLY affected groups from the FULL base_query (reads
-            // real source). Outer is the `__full` subquery alias — its
-            // projection columns inherit the intermediate naming (because
-            // `base_query`'s SELECT aliases the GROUP BY cols to the
-            // intermediate-side names).
-            let ns_in_full =
-                null_safe_in(&affected_tbl, "__full", cols, cols, &plan.not_null_columns);
-            stmts.push(format!(
-                "INSERT INTO {} SELECT * FROM ({}) AS __full WHERE {}",
-                intermediate_tbl, base_query, ns_in_full
-            ));
-
-            // Targeted refresh of target. Outer for the DELETE is the target
-            // table — its column names may differ from `cols` (the
-            // intermediate / affected naming) when the user aliases GROUP BY
-            // cols in their SELECT (e.g., `dp.id AS dem_plan_id`).
-            let target_cols = target_group_columns(&plan);
-            let ns_in_tgt_delete = null_safe_in(
-                &affected_tbl,
-                &qv,
-                &target_cols,
-                cols,
-                &plan.not_null_columns,
-            );
-            stmts.push(format!("DELETE FROM {} WHERE {}", qv, ns_in_tgt_delete));
-            // For the INSERT INTO target via `end_query`, the appended WHERE
-            // executes inside `end_query`'s scope. `end_query`'s FROM is the
-            // intermediate, so outer is intermediate-named (cols match cols).
-            let ns_in_tgt_insert = null_safe_in(
-                &affected_tbl,
-                &intermediate_tbl,
-                cols,
-                cols,
-                &plan.not_null_columns,
-            );
-            stmts.push(format!(
-                "INSERT INTO {} {} AND {}",
-                qv, end_query, ns_in_tgt_insert
-            ));
-        } else {
-            // No group columns: full refresh
-            stmts.push(format!("TRUNCATE {}", intermediate_tbl));
-            stmts.push(format!("INSERT INTO {} {}", intermediate_tbl, base_query));
-            stmts.push(format!("TRUNCATE {}", quote_identifier(view_name)));
-            if end_query.is_empty() {
-                stmts.push(format!(
-                    "INSERT INTO {} {}",
-                    quote_identifier(view_name),
-                    base_query
-                ));
-            } else {
-                stmts.push(format!(
-                    "INSERT INTO {} {}",
-                    quote_identifier(view_name),
-                    end_query
-                ));
-            }
-        }
+    } else if is_outer_join_secondary {
+        outer_join_secondary_stmts(
+            view_name,
+            source_table,
+            operation,
+            base_query,
+            end_query,
+            &plan,
+            &grp_cols,
+            &intermediate_tbl,
+            &affected_tbl,
+            &old_tbl,
+            &new_tbl,
+            &mut stmts,
+        );
     } else if plan.is_passthrough {
         let qv = quote_identifier(view_name);
         let pt_new = passthrough_scratch_new_table_name(view_name, source_table);
