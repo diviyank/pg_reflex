@@ -1938,6 +1938,98 @@ fn outer_join_secondary_stmts(
     }
 }
 
+/// Passthrough delta: route through per-(IMV, source) UNLOGGED scratch tables to
+/// avoid the transition-table-in-EXECUTE assertion, then run the per-operation
+/// targeted DML (mapping-driven DELETE/UPDATE; INSERT splices the scratch into
+/// base_query).
+#[allow(clippy::too_many_arguments)]
+fn passthrough_op_stmts(
+    view_name: &str,
+    source_table: &str,
+    operation: &str,
+    base_query: &str,
+    plan: &AggregationPlan,
+    new_tbl: &str,
+    old_tbl: &str,
+    stmts: &mut Vec<String>,
+) {
+    let qv = quote_identifier(view_name);
+    let pt_new = passthrough_scratch_new_table_name(view_name, source_table);
+    let pt_old = passthrough_scratch_old_table_name(view_name, source_table);
+    let mappings = plan.passthrough_key_mappings.get(source_table);
+
+    let needs_new = matches!(operation, "INSERT" | "INSERT_PROMOTED" | "UPDATE");
+    let needs_old = matches!(operation, "DELETE" | "DELETE_PROMOTED" | "UPDATE");
+    if needs_new {
+        stmts.push(format!("TRUNCATE {}", pt_new));
+        stmts.push(format!(
+            "INSERT INTO {} SELECT * FROM \"{}\"",
+            pt_new, new_tbl
+        ));
+    }
+    if needs_old {
+        stmts.push(format!("TRUNCATE {}", pt_old));
+        stmts.push(format!(
+            "INSERT INTO {} SELECT * FROM \"{}\"",
+            pt_old, old_tbl
+        ));
+    }
+
+    match operation {
+        "INSERT" | "INSERT_PROMOTED" => {
+            let delta_q = replace_source_with_transition(base_query, source_table, &pt_new);
+            stmts.push(format!("INSERT INTO {} {}", qv, delta_q));
+            if operation == "INSERT_PROMOTED" {
+                stmts.push(format!("ANALYZE {}", qv));
+            }
+        }
+        "DELETE" | "DELETE_PROMOTED" => {
+            if let Some(mappings) = mappings {
+                let target_cols: Vec<String> =
+                    mappings.iter().map(|(t, _)| format!("\"{}\"", t)).collect();
+                let source_cols: Vec<String> =
+                    mappings.iter().map(|(_, s)| format!("\"{}\"", s)).collect();
+                let row = row_expr(&target_cols);
+                stmts.push(format!(
+                    "DELETE FROM {} WHERE {} IN (SELECT {} FROM {})",
+                    qv,
+                    row,
+                    source_cols.join(", "),
+                    pt_old
+                ));
+                if operation == "DELETE_PROMOTED" {
+                    stmts.push(format!("ANALYZE {}", qv));
+                }
+            } else {
+                stmts.push(format!("DELETE FROM {}", qv));
+                stmts.push(format!("INSERT INTO {} {}", qv, base_query));
+            }
+        }
+        "UPDATE" => {
+            if let Some(mappings) = mappings {
+                let target_cols: Vec<String> =
+                    mappings.iter().map(|(t, _)| format!("\"{}\"", t)).collect();
+                let source_cols: Vec<String> =
+                    mappings.iter().map(|(_, s)| format!("\"{}\"", s)).collect();
+                let row = row_expr(&target_cols);
+                stmts.push(format!(
+                    "DELETE FROM {} WHERE {} IN (SELECT {} FROM {})",
+                    qv,
+                    row,
+                    source_cols.join(", "),
+                    pt_old
+                ));
+                let delta_new = replace_source_with_transition(base_query, source_table, &pt_new);
+                stmts.push(format!("INSERT INTO {} {}", qv, delta_new));
+            } else {
+                stmts.push(format!("DELETE FROM {}", qv));
+                stmts.push(format!("INSERT INTO {} {}", qv, base_query));
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Generates the SQL statements to apply a delta to an IMV.
 ///
 /// Called from plpgsql trigger wrappers. Returns a delimiter-separated string
@@ -2086,110 +2178,16 @@ pub fn reflex_build_delta_sql(
             &mut stmts,
         );
     } else if plan.is_passthrough {
-        let qv = quote_identifier(view_name);
-        let pt_new = passthrough_scratch_new_table_name(view_name, source_table);
-        let pt_old = passthrough_scratch_old_table_name(view_name, source_table);
-        // Look up per-source column mappings for targeted DELETE/UPDATE
-        let mappings = plan.passthrough_key_mappings.get(source_table);
-
-        // Materialize the transition tables into per-(IMV, source) UNLOGGED scratch
-        // tables BEFORE any downstream DML references them. This is the key fix for
-        // the nested-trigger SIGABRT: subquery reads of transition tables inside
-        // EXECUTE'd DML (DELETE … WHERE IN (SELECT … FROM transition), INSERT …
-        // SELECT … FROM transition) trip a PG assertion when fired from a
-        // downstream trigger. Plain `INSERT INTO scratch SELECT * FROM transition`
-        // is the one pattern that stays safe — so we confine every transition
-        // reference to that pattern and route subsequent statements through the
-        // scratch tables.
-        let needs_new = matches!(operation, "INSERT" | "INSERT_PROMOTED" | "UPDATE");
-        let needs_old = matches!(operation, "DELETE" | "DELETE_PROMOTED" | "UPDATE");
-        if needs_new {
-            stmts.push(format!("TRUNCATE {}", pt_new));
-            stmts.push(format!(
-                "INSERT INTO {} SELECT * FROM \"{}\"",
-                pt_new, new_tbl
-            ));
-        }
-        if needs_old {
-            stmts.push(format!("TRUNCATE {}", pt_old));
-            stmts.push(format!(
-                "INSERT INTO {} SELECT * FROM \"{}\"",
-                pt_old, old_tbl
-            ));
-        }
-
-        match operation {
-            // INSERT_PROMOTED is Item α's OUT→IN flip on a UPDATE: the OLD rows
-            // failed the IMV's where_predicate so they never existed in the
-            // target — the DELETE half of the UPDATE plan is unconditionally
-            // a no-op. Skip it and just INSERT the new rows.
-            //
-            // ANALYZE the target after the bulk INSERT — the next trigger
-            // fire's Path C dispatch reads pg_class.reltuples on this table
-            // to decide reconcile-vs-incremental. Without a fresh ANALYZE,
-            // a doubled-then-halved IMV (T3 dispatch + T3b incremental
-            // delete) leaves reltuples at the old large value and Path C
-            // under-estimates the next flip's relative impact.
-            "INSERT" | "INSERT_PROMOTED" => {
-                let delta_q = replace_source_with_transition(base_query, source_table, &pt_new);
-                stmts.push(format!("INSERT INTO {} {}", qv, delta_q));
-                if operation == "INSERT_PROMOTED" {
-                    stmts.push(format!("ANALYZE {}", qv));
-                }
-            }
-            // Symmetric: DELETE_PROMOTED is Item α's IN→OUT flip — NEW rows
-            // fail the predicate, so the INSERT half is a no-op.
-            "DELETE" | "DELETE_PROMOTED" => {
-                if let Some(mappings) = mappings {
-                    // Targeted delete using per-source column mapping
-                    let target_cols: Vec<String> =
-                        mappings.iter().map(|(t, _)| format!("\"{}\"", t)).collect();
-                    let source_cols: Vec<String> =
-                        mappings.iter().map(|(_, s)| format!("\"{}\"", s)).collect();
-                    let row = row_expr(&target_cols);
-                    stmts.push(format!(
-                        "DELETE FROM {} WHERE {} IN (SELECT {} FROM {})",
-                        qv,
-                        row,
-                        source_cols.join(", "),
-                        pt_old
-                    ));
-                    if operation == "DELETE_PROMOTED" {
-                        stmts.push(format!("ANALYZE {}", qv));
-                    }
-                } else {
-                    // No mapping for this source: full refresh
-                    stmts.push(format!("DELETE FROM {}", qv));
-                    stmts.push(format!("INSERT INTO {} {}", qv, base_query));
-                }
-            }
-            "UPDATE" => {
-                if let Some(mappings) = mappings {
-                    // Phase 1: delete old rows using per-source column mapping
-                    let target_cols: Vec<String> =
-                        mappings.iter().map(|(t, _)| format!("\"{}\"", t)).collect();
-                    let source_cols: Vec<String> =
-                        mappings.iter().map(|(_, s)| format!("\"{}\"", s)).collect();
-                    let row = row_expr(&target_cols);
-                    stmts.push(format!(
-                        "DELETE FROM {} WHERE {} IN (SELECT {} FROM {})",
-                        qv,
-                        row,
-                        source_cols.join(", "),
-                        pt_old
-                    ));
-                    // Phase 2: insert new rows (base_query with source→pt_new scratch)
-                    let delta_new =
-                        replace_source_with_transition(base_query, source_table, &pt_new);
-                    stmts.push(format!("INSERT INTO {} {}", qv, delta_new));
-                } else {
-                    // No mapping for this source: full refresh
-                    stmts.push(format!("DELETE FROM {}", qv));
-                    stmts.push(format!("INSERT INTO {} {}", qv, base_query));
-                }
-            }
-            _ => {}
-        }
+        passthrough_op_stmts(
+            view_name,
+            source_table,
+            operation,
+            base_query,
+            &plan,
+            &new_tbl,
+            &old_tbl,
+            &mut stmts,
+        );
     } else {
         let has_min_max = plan
             .intermediate_columns
