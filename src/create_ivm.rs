@@ -622,6 +622,129 @@ fn try_decompose_ctes(
     ))
 }
 
+/// For passthrough IMVs, resolve the unique-key column set: explicit
+/// `unique_columns_str` if non-empty, else probe single-source PKs from
+/// pg_index. Multi-source JOINs without an explicit key fall back to
+/// full refresh on DELETE/UPDATE (warned). Populates
+/// `ctx.resolved_unique_columns` and `ctx.plan.passthrough_columns` /
+/// `ctx.plan.passthrough_key_mappings`.
+fn resolve_unique_columns(ctx: &mut BuildContext) {
+    if !ctx.plan.is_passthrough {
+        return;
+    }
+
+    if !ctx.unique_columns_str.is_empty() {
+        // Explicit unique columns from 3rd parameter
+        ctx.resolved_unique_columns = ctx
+            .unique_columns_str
+            .split(',')
+            .map(|s| normalized_column_name(s.trim()))
+            .filter(|s| !s.is_empty())
+            .collect();
+        ctx.plan.passthrough_columns = ctx.resolved_unique_columns.clone();
+        info!(
+            "pg_reflex: using explicit unique key ({}) for '{}'",
+            ctx.resolved_unique_columns.join(", "),
+            ctx.view_name
+        );
+
+        // Build per-source-table column mappings
+        let real_sources: Vec<&String> = ctx.real_source_names.iter().collect();
+        build_passthrough_key_mappings(
+            &mut ctx.plan,
+            &ctx.resolved_unique_columns,
+            &real_sources,
+            &ctx.analysis,
+        );
+    } else if !ctx.is_join_query {
+        // Auto-detect: only for single-source queries (JOINs need explicit key)
+        let select_bare_names: std::collections::HashSet<String> = ctx
+            .analysis
+            .select_columns
+            .iter()
+            .map(|c| {
+                let name = c.alias.as_deref().unwrap_or(&c.expr_sql);
+                bare_column_name(name).to_lowercase()
+            })
+            .collect();
+
+        let real_sources: Vec<&String> = ctx.real_source_names.iter().collect();
+        for source in &real_sources {
+            let (src_schema, src_name) = split_qualified_name(source);
+            let src_schema_str = src_schema.unwrap_or("public");
+
+            let pk_cols: Vec<String> = Spi::connect(|client| {
+                client
+                    .select(
+                        "SELECT array_agg(a.attname ORDER BY k.n) as cols \
+                         FROM pg_index ix \
+                         JOIN pg_class t ON t.oid = ix.indrelid \
+                         JOIN pg_namespace n ON n.oid = t.relnamespace \
+                         JOIN LATERAL unnest(ix.indkey) WITH ORDINALITY AS k(col, n) ON true \
+                         JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = k.col \
+                         WHERE n.nspname = $1 AND t.relname = $2 AND ix.indisunique AND ix.indisprimary \
+                         GROUP BY ix.indexrelid \
+                         ORDER BY count(*) \
+                         LIMIT 1",
+                        None,
+                        &[
+                            unsafe { DatumWithOid::new(src_schema_str.to_string(), PgBuiltInOids::TEXTOID.oid().value()) },
+                            unsafe { DatumWithOid::new(src_name.to_string(), PgBuiltInOids::TEXTOID.oid().value()) },
+                        ],
+                    )
+                    .unwrap_or_report()
+                    .filter_map(|row| {
+                        row.get_by_name::<Vec<String>, _>("cols")
+                            .unwrap_or(None)
+                    })
+                    .next()
+                    .unwrap_or_default()
+            });
+
+            if !pk_cols.is_empty() {
+                let pk_lower: Vec<String> = pk_cols.iter().map(|c| c.to_lowercase()).collect();
+                let all_in_select = pk_lower.iter().all(|c| select_bare_names.contains(c));
+                if all_in_select {
+                    ctx.resolved_unique_columns = pk_lower;
+                    ctx.plan.passthrough_columns = ctx.resolved_unique_columns.clone();
+                    // Single source: 1:1 mapping (target col == source col)
+                    ctx.plan.passthrough_key_mappings.insert(
+                        source.to_string(),
+                        ctx.resolved_unique_columns
+                            .iter()
+                            .map(|c| (c.clone(), c.clone()))
+                            .collect(),
+                    );
+                    info!(
+                        "pg_reflex: auto-detected PK ({}) from '{}' for '{}'",
+                        ctx.resolved_unique_columns.join(", "),
+                        source,
+                        ctx.view_name
+                    );
+                    break;
+                } else {
+                    info!(
+                        "pg_reflex: source '{}' has PK ({}) but the SELECT list does not include all PK columns — \
+                         passthrough '{}' will fall back to row-matching for DELETE/UPDATE. \
+                         Add the PK columns to the SELECT list, or pass them as the 3rd argument to create_reflex_ivm.",
+                        source,
+                        pk_lower.join(", "),
+                        ctx.view_name
+                    );
+                }
+            }
+        }
+    } else {
+        // JOIN query without explicit key: fall back to full refresh on DELETE/UPDATE
+        info!(
+            "pg_reflex: JOIN passthrough '{}' has no unique key. \
+             Provide 3rd argument to create_reflex_ivm for incremental DELETE/UPDATE. \
+             Example: SELECT create_reflex_ivm('{}', '...', 'col1,col2')",
+            ctx.view_name, ctx.view_name
+        );
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn create_reflex_ivm_impl(
     view_name: &str,
@@ -775,118 +898,7 @@ pub(crate) fn create_reflex_ivm_impl(
         unlogged_tables: Vec::new(),
     };
 
-    if ctx.plan.is_passthrough {
-        if !ctx.unique_columns_str.is_empty() {
-            // Explicit unique columns from 3rd parameter
-            ctx.resolved_unique_columns = ctx
-                .unique_columns_str
-                .split(',')
-                .map(|s| normalized_column_name(s.trim()))
-                .filter(|s| !s.is_empty())
-                .collect();
-            ctx.plan.passthrough_columns = ctx.resolved_unique_columns.clone();
-            info!(
-                "pg_reflex: using explicit unique key ({}) for '{}'",
-                ctx.resolved_unique_columns.join(", "),
-                ctx.view_name
-            );
-
-            // Build per-source-table column mappings
-            let real_sources: Vec<&String> = ctx.real_source_names.iter().collect();
-            build_passthrough_key_mappings(
-                &mut ctx.plan,
-                &ctx.resolved_unique_columns,
-                &real_sources,
-                &ctx.analysis,
-            );
-        } else if !ctx.is_join_query {
-            // Auto-detect: only for single-source queries (JOINs need explicit key)
-            let select_bare_names: std::collections::HashSet<String> = ctx
-                .analysis
-                .select_columns
-                .iter()
-                .map(|c| {
-                    let name = c.alias.as_deref().unwrap_or(&c.expr_sql);
-                    bare_column_name(name).to_lowercase()
-                })
-                .collect();
-
-            let real_sources: Vec<&String> = ctx.real_source_names.iter().collect();
-            for source in &real_sources {
-                let (src_schema, src_name) = split_qualified_name(source);
-                let src_schema_str = src_schema.unwrap_or("public");
-
-                let pk_cols: Vec<String> = Spi::connect(|client| {
-                    client
-                        .select(
-                            "SELECT array_agg(a.attname ORDER BY k.n) as cols \
-                             FROM pg_index ix \
-                             JOIN pg_class t ON t.oid = ix.indrelid \
-                             JOIN pg_namespace n ON n.oid = t.relnamespace \
-                             JOIN LATERAL unnest(ix.indkey) WITH ORDINALITY AS k(col, n) ON true \
-                             JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = k.col \
-                             WHERE n.nspname = $1 AND t.relname = $2 AND ix.indisunique AND ix.indisprimary \
-                             GROUP BY ix.indexrelid \
-                             ORDER BY count(*) \
-                             LIMIT 1",
-                            None,
-                            &[
-                                unsafe { DatumWithOid::new(src_schema_str.to_string(), PgBuiltInOids::TEXTOID.oid().value()) },
-                                unsafe { DatumWithOid::new(src_name.to_string(), PgBuiltInOids::TEXTOID.oid().value()) },
-                            ],
-                        )
-                        .unwrap_or_report()
-                        .filter_map(|row| {
-                            row.get_by_name::<Vec<String>, _>("cols")
-                                .unwrap_or(None)
-                        })
-                        .next()
-                        .unwrap_or_default()
-                });
-
-                if !pk_cols.is_empty() {
-                    let pk_lower: Vec<String> = pk_cols.iter().map(|c| c.to_lowercase()).collect();
-                    let all_in_select = pk_lower.iter().all(|c| select_bare_names.contains(c));
-                    if all_in_select {
-                        ctx.resolved_unique_columns = pk_lower;
-                        ctx.plan.passthrough_columns = ctx.resolved_unique_columns.clone();
-                        // Single source: 1:1 mapping (target col == source col)
-                        ctx.plan.passthrough_key_mappings.insert(
-                            source.to_string(),
-                            ctx.resolved_unique_columns
-                                .iter()
-                                .map(|c| (c.clone(), c.clone()))
-                                .collect(),
-                        );
-                        info!(
-                            "pg_reflex: auto-detected PK ({}) from '{}' for '{}'",
-                            ctx.resolved_unique_columns.join(", "),
-                            source,
-                            ctx.view_name
-                        );
-                        break;
-                    } else {
-                        info!(
-                            "pg_reflex: source '{}' has PK ({}) but the SELECT list does not include all PK columns — \
-                             passthrough '{}' will fall back to row-matching for DELETE/UPDATE. \
-                             Add the PK columns to the SELECT list, or pass them as the 3rd argument to create_reflex_ivm.",
-                            source,
-                            pk_lower.join(", "),
-                            ctx.view_name
-                        );
-                    }
-                }
-            }
-        } else {
-            // JOIN query without explicit key: fall back to full refresh on DELETE/UPDATE
-            info!(
-                "pg_reflex: JOIN passthrough '{}' has no unique key. \
-                 Provide 3rd argument to create_reflex_ivm for incremental DELETE/UPDATE. \
-                 Example: SELECT create_reflex_ivm('{}', '...', 'col1,col2')",
-                ctx.view_name, ctx.view_name
-            );
-        }
-    }
+    resolve_unique_columns(&mut ctx);
 
     // 1.4.6 — populate `source_join_keys` for aggregate plans. Identifies
     // sources where Item α's directional promotion can short-circuit to
