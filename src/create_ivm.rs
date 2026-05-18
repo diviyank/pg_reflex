@@ -1,6 +1,7 @@
 use pgrx::datum::DatumWithOid;
 use pgrx::pg_sys::panic::ErrorReportable;
 use pgrx::prelude::*;
+use pgrx::spi::SpiClient;
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 use std::collections::HashMap;
@@ -1560,6 +1561,71 @@ fn install_min_max_indexes(client: &mut pgrx::spi::SpiClient<'_>, ctx: &BuildCon
     }
 }
 
+/// Compute base_query / end_query / aggregations_json / index_columns /
+/// where_predicate, INSERT a RegistryRow into `__reflex_ivm_reference`, and
+/// add this IMV's name to the `graph_child` array of each parent IMV.
+fn persist_metadata(client: &mut SpiClient<'_>, ctx: &BuildContext) {
+    let base_query = if ctx.plan.is_passthrough {
+        ctx.sql.to_string()
+    } else {
+        generate_base_query(&ctx.analysis, &ctx.plan)
+    };
+    let end_query = if ctx.plan.is_passthrough {
+        String::new()
+    } else {
+        generate_end_query(ctx.view_name, &ctx.plan)
+    };
+    let aggregations_json = generate_aggregations_json(&ctx.plan);
+    let index_columns: Vec<String> = ctx
+        .plan
+        .group_by_columns
+        .iter()
+        .chain(ctx.plan.distinct_columns.iter())
+        .map(|c| {
+            if let Some(alias) = ctx.plan.group_by_aliases.get(c) {
+                normalized_column_name(alias)
+            } else {
+                normalized_column_name(c)
+            }
+        })
+        .collect();
+    let real_sources: Vec<&String> = ctx.real_source_names.iter().collect();
+    let where_predicate: String = if real_sources.len() <= 1 {
+        ctx.analysis.where_clause.clone().unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let ignored_sources_vec: Vec<String> = ctx.ignore_sources.to_vec();
+
+    insert_registry_row(
+        client,
+        &RegistryRow {
+            view_name: ctx.view_name,
+            graph_depth: ctx.depth,
+            depends_on: &ctx.froms,
+            depends_on_imv: &ctx.ivm_froms,
+            unlogged_tables: &ctx.unlogged_tables,
+            graph_child: &[],
+            sql_query: ctx.sql,
+            base_query: &base_query,
+            end_query: &end_query,
+            aggregations_json: &aggregations_json,
+            aggregations_cast: AggregationsCast::Jsonb,
+            index_columns: &index_columns,
+            unique_columns: &ctx.resolved_unique_columns,
+            storage_mode: &ctx.storage_upper,
+            refresh_mode: &ctx.mode_upper,
+            where_predicate: Some(&where_predicate),
+            ignored_sources: Some(&ignored_sources_vec),
+            partition_columns: Some(&ctx.plan.partition_columns),
+            partition_strategy: Some(&ctx.plan.partition_strategy),
+        },
+    )
+    .unwrap_or_report();
+
+    add_graph_child_links(client, ctx.view_name, &ctx.ivm_froms).unwrap_or_report();
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn create_reflex_ivm_impl(
     view_name: &str,
@@ -1748,83 +1814,7 @@ pub(crate) fn create_reflex_ivm_impl(
 
         install_min_max_indexes(client, &ctx);
 
-        // Generate decomposed queries and metadata
-        let base_query = if ctx.plan.is_passthrough {
-            ctx.sql.to_string() // Passthrough: base_query = original SQL verbatim
-        } else {
-            generate_base_query(&ctx.analysis, &ctx.plan)
-        };
-        let end_query = if ctx.plan.is_passthrough {
-            String::new() // Passthrough: no intermediate → target stage
-        } else {
-            generate_end_query(ctx.view_name, &ctx.plan)
-        };
-        // 1.4.5 — `imv_relevant_columns` carries a possibly-over-inclusive
-        // set of columns per source (the analyzer conservatively attributes
-        // bare identifiers in multi-source queries to every real source).
-        // The trigger codegen INTERSECTS this with the source's actual
-        // columns at fire time via pg_attribute, so a column listed here
-        // that doesn't exist on the source is simply ignored — no need to
-        // filter at IMV-create time, which would have to compete with
-        // catalog snapshot visibility for the just-created source table.
-        let aggregations_json = generate_aggregations_json(&ctx.plan);
-        let index_columns: Vec<String> = ctx
-            .plan
-            .group_by_columns
-            .iter()
-            .chain(ctx.plan.distinct_columns.iter())
-            .map(|c| {
-                if let Some(alias) = ctx.plan.group_by_aliases.get(c) {
-                    normalized_column_name(alias)
-                } else {
-                    normalized_column_name(c)
-                }
-            })
-            .collect();
-
-        // INSERT into reference table
-        let depends_on: Vec<String> = ctx.froms.clone();
-        let depends_on_imv: Vec<String> = ctx.ivm_froms.clone();
-
-        // Store the WHERE predicate for predicate-filtered trigger skip.
-        // Only safe for single-source queries: multi-table WHERE clauses may reference
-        // joined tables whose columns are not available in the trigger transition table.
-        let real_sources: Vec<&String> = ctx.real_source_names.iter().collect();
-        let where_predicate: String = if real_sources.len() <= 1 {
-            ctx.analysis.where_clause.clone().unwrap_or_default()
-        } else {
-            String::new()
-        };
-
-        let ignored_sources_vec: Vec<String> = ctx.ignore_sources.to_vec();
-        insert_registry_row(
-            client,
-            &RegistryRow {
-                view_name: ctx.view_name,
-                graph_depth: ctx.depth,
-                depends_on: &depends_on,
-                depends_on_imv: &depends_on_imv,
-                unlogged_tables: &ctx.unlogged_tables,
-                graph_child: &[],
-                sql_query: ctx.sql,
-                base_query: &base_query,
-                end_query: &end_query,
-                aggregations_json: &aggregations_json,
-                aggregations_cast: AggregationsCast::Jsonb,
-                index_columns: &index_columns,
-                unique_columns: &ctx.resolved_unique_columns,
-                storage_mode: &ctx.storage_upper,
-                refresh_mode: &ctx.mode_upper,
-                where_predicate: Some(&where_predicate),
-                ignored_sources: Some(&ignored_sources_vec),
-                partition_columns: Some(&ctx.plan.partition_columns),
-                partition_strategy: Some(&ctx.plan.partition_strategy),
-            },
-        )
-        .unwrap_or_report();
-
-        // Update source IMVs with the new child in their graph_child field
-        add_graph_child_links(client, ctx.view_name, &ctx.ivm_froms).unwrap_or_report();
+        persist_metadata(client, &ctx);
 
         // Initial materialization (skip for passthrough — CREATE TABLE AS already populated)
         if !ctx.plan.is_passthrough {
@@ -1833,6 +1823,7 @@ pub(crate) fn create_reflex_ivm_impl(
             let initial_insert = format!("INSERT INTO {} {}", intermediate_tbl, base_q);
             client.update(&initial_insert, None, &[]).unwrap_or_report();
 
+            let end_query = generate_end_query(ctx.view_name, &ctx.plan);
             let target_insert = format!(
                 "INSERT INTO {} {}",
                 quote_identifier(ctx.view_name),
