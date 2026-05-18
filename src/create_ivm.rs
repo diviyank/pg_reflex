@@ -860,6 +860,190 @@ fn check_existence_and_cycle(ctx: &BuildContext) -> Option<&'static str> {
     None
 }
 
+/// Resolve `partition_by`: validate explicit columns against plan + anchor, or
+/// auto-mirror from the single partitioned source. Populates
+/// `ctx.resolved_partition_cols` and `ctx.resolved_strategy`. Returns error
+/// message string on validation failure (caller re-leaks).
+fn resolve_partitioning(ctx: &mut BuildContext) -> Result<(), String> {
+    ctx.resolved_partition_cols = ctx.partition_by.to_vec();
+
+    if !ctx.resolved_partition_cols.is_empty() {
+        // Explicit partition_by — validate against plan shape.
+        if !ctx.plan.is_passthrough {
+            let gb_lower: std::collections::HashSet<String> = ctx
+                .plan
+                .group_by_columns
+                .iter()
+                .map(|c| c.to_lowercase())
+                .collect();
+            // Also normalize qualified GROUP BY columns ("d.region" →
+            // "region") so partition_by can name the bare column even
+            // when the GROUP BY clause uses a `<table>.col` form.
+            let gb_normalized: std::collections::HashSet<String> = ctx
+                .plan
+                .group_by_columns
+                .iter()
+                .map(|c| normalized_column_name(c).to_lowercase())
+                .collect();
+            let projected_aliases: std::collections::HashSet<String> = ctx
+                .plan
+                .group_by_aliases
+                .values()
+                .map(|v| v.to_lowercase())
+                .collect();
+            // Reverse map from alias → GROUP BY expression (the AST string
+            // before aliasing).  Used to recover the underlying GROUP BY
+            // expression when the user passes the alias in `partition_by`.
+            let alias_to_gb_expr: std::collections::HashMap<String, String> = ctx
+                .plan
+                .group_by_aliases
+                .iter()
+                .map(|(k, v)| (v.to_lowercase(), k.clone()))
+                .collect();
+            for col in &ctx.resolved_partition_cols {
+                let col_l = col.to_lowercase();
+                if !gb_lower.contains(&col_l)
+                    && !gb_normalized.contains(&col_l)
+                    && !projected_aliases.contains(&col_l)
+                {
+                    return Err(format!(
+                        "ERROR: partition_by column '{}' is not in GROUP BY; \
+                         partition columns must be a subset of GROUP BY for aggregate IMVs",
+                        col
+                    ));
+                }
+                // Phase B (plans/partitioning_3.md §2): reject when the
+                // matching GROUP BY entry is a computed expression rather
+                // than a bare column reference.  We look up the AST string
+                // that produced this `partition_by` column — either the
+                // group_by_columns entry itself (when partition_by matches
+                // the GROUP BY's lexical form) or, when partition_by names
+                // an alias, the GROUP BY entry whose alias is `col`.
+                let gb_expr: Option<String> = if gb_lower.contains(&col_l) {
+                    ctx.plan
+                        .group_by_columns
+                        .iter()
+                        .find(|gb| gb.to_lowercase() == col_l)
+                        .cloned()
+                } else if gb_normalized.contains(&col_l) {
+                    ctx.plan
+                        .group_by_columns
+                        .iter()
+                        .find(|gb| normalized_column_name(gb).to_lowercase() == col_l)
+                        .cloned()
+                } else {
+                    alias_to_gb_expr.get(&col_l).cloned()
+                };
+                if let Some(ref gb) = gb_expr {
+                    if !crate::sql_analyzer::is_bare_column_reference(gb) {
+                        return Err(format!(
+                            "ERROR: partition_by column '{}' corresponds to a computed \
+                             GROUP BY expression ('{}'). Partition columns must be bare \
+                             column references on the source. Workaround: add a generated \
+                             / computed column to the source and partition on that.",
+                            col, gb
+                        ));
+                    }
+                }
+            }
+        }
+        let validate_result: Result<String, String> = Spi::connect(|client| {
+            let anchor = crate::partition::resolve_anchor_source(
+                client,
+                &ctx.resolved_partition_cols[0],
+                &ctx.real_source_names,
+            )?;
+            let desc = crate::partition::introspect_partition_descriptor(client, &anchor)
+                .ok_or_else(|| {
+                    format!(
+                        "anchor source '{}' for column '{}' is not partitioned LIST/RANGE",
+                        anchor, ctx.resolved_partition_cols[0]
+                    )
+                })?;
+            let part_col_l = ctx.resolved_partition_cols[0].to_lowercase();
+            if !desc.column_names.iter().any(|c| c == &part_col_l) {
+                return Err(format!(
+                    "anchor source '{}' is partitioned but not on '{}' (partitioned on: {:?})",
+                    anchor, ctx.resolved_partition_cols[0], desc.column_names
+                ));
+            }
+            Ok(desc.strategy)
+        });
+        match validate_result {
+            Ok(s) => ctx.resolved_strategy = s,
+            Err(e) => {
+                return Err(format!("ERROR: partition_by validation failed — {}", e));
+            }
+        }
+    } else {
+        // Phase 5: auto-mirror when exactly one real source is partitioned.
+        let auto: (Vec<String>, String) = Spi::connect(|client| {
+            let mut partitioned_sources: Vec<(String, crate::partition::PartitionDescriptor)> =
+                Vec::new();
+            for s in &ctx.real_source_names {
+                if let Some(desc) = crate::partition::introspect_partition_descriptor(client, s) {
+                    partitioned_sources.push((s.clone(), desc));
+                }
+            }
+            if partitioned_sources.len() != 1 {
+                return (Vec::new(), String::new());
+            }
+            let (_, desc) = partitioned_sources.into_iter().next().unwrap();
+            let part_col = desc.column_names.first().cloned().unwrap_or_default();
+            if part_col.is_empty() {
+                return (Vec::new(), String::new());
+            }
+            if ctx.plan.is_passthrough {
+                let pt_cols_l: std::collections::HashSet<String> = ctx
+                    .plan
+                    .passthrough_columns
+                    .iter()
+                    .map(|c| c.to_lowercase())
+                    .collect();
+                let projected: std::collections::HashSet<String> = ctx
+                    .analysis
+                    .select_columns
+                    .iter()
+                    .map(|c| {
+                        let n = c.alias.as_deref().unwrap_or(&c.expr_sql);
+                        bare_column_name(n).to_lowercase()
+                    })
+                    .collect();
+                if pt_cols_l.contains(&part_col) || projected.contains(&part_col) {
+                    return (vec![part_col], desc.strategy);
+                }
+            } else {
+                let gb_lower: std::collections::HashSet<String> = ctx
+                    .plan
+                    .group_by_columns
+                    .iter()
+                    .map(|c| c.to_lowercase())
+                    .collect();
+                let projected_aliases: std::collections::HashSet<String> = ctx
+                    .plan
+                    .group_by_aliases
+                    .values()
+                    .map(|v| v.to_lowercase())
+                    .collect();
+                if gb_lower.contains(&part_col) || projected_aliases.contains(&part_col) {
+                    return (vec![part_col], desc.strategy);
+                }
+            }
+            (Vec::new(), String::new())
+        });
+        ctx.resolved_partition_cols = auto.0;
+        ctx.resolved_strategy = auto.1;
+        if !ctx.resolved_partition_cols.is_empty() {
+            info!(
+                "pg_reflex: auto-mirroring partition column '{}' from source",
+                ctx.resolved_partition_cols[0]
+            );
+        }
+    }
+
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn create_reflex_ivm_impl(
     view_name: &str,
@@ -1029,196 +1213,8 @@ pub(crate) fn create_reflex_ivm_impl(
         return msg;
     }
 
-    // --- Partitioning resolution (plans/partitioning_2.md) ---
-    //
-    // Resolve `partition_by` against the source set before any DDL:
-    //   1. Explicit `partition_by` argument → validate against plan + anchor.
-    //   2. Empty arg AND exactly one real source partitioned LIST/RANGE
-    //      AND its partition column is appropriate for this IMV's shape →
-    //      auto-mirror.
-    //   3. Otherwise → IMV stays unpartitioned (legacy behaviour).
-    ctx.resolved_partition_cols = ctx.partition_by.to_vec();
-
-    if !ctx.resolved_partition_cols.is_empty() {
-        // Explicit partition_by — validate against plan shape.
-        if !ctx.plan.is_passthrough {
-            let gb_lower: std::collections::HashSet<String> = ctx
-                .plan
-                .group_by_columns
-                .iter()
-                .map(|c| c.to_lowercase())
-                .collect();
-            // Also normalize qualified GROUP BY columns ("d.region" →
-            // "region") so partition_by can name the bare column even
-            // when the GROUP BY clause uses a `<table>.col` form.
-            let gb_normalized: std::collections::HashSet<String> = ctx
-                .plan
-                .group_by_columns
-                .iter()
-                .map(|c| normalized_column_name(c).to_lowercase())
-                .collect();
-            let projected_aliases: std::collections::HashSet<String> = ctx
-                .plan
-                .group_by_aliases
-                .values()
-                .map(|v| v.to_lowercase())
-                .collect();
-            // Reverse map from alias → GROUP BY expression (the AST string
-            // before aliasing).  Used to recover the underlying GROUP BY
-            // expression when the user passes the alias in `partition_by`.
-            let alias_to_gb_expr: std::collections::HashMap<String, String> = ctx
-                .plan
-                .group_by_aliases
-                .iter()
-                .map(|(k, v)| (v.to_lowercase(), k.clone()))
-                .collect();
-            for col in &ctx.resolved_partition_cols {
-                let col_l = col.to_lowercase();
-                if !gb_lower.contains(&col_l)
-                    && !gb_normalized.contains(&col_l)
-                    && !projected_aliases.contains(&col_l)
-                {
-                    return Box::leak(
-                        format!(
-                            "ERROR: partition_by column '{}' is not in GROUP BY; \
-                             partition columns must be a subset of GROUP BY for aggregate IMVs",
-                            col
-                        )
-                        .into_boxed_str(),
-                    );
-                }
-                // Phase B (plans/partitioning_3.md §2): reject when the
-                // matching GROUP BY entry is a computed expression rather
-                // than a bare column reference.  We look up the AST string
-                // that produced this `partition_by` column — either the
-                // group_by_columns entry itself (when partition_by matches
-                // the GROUP BY's lexical form) or, when partition_by names
-                // an alias, the GROUP BY entry whose alias is `col`.
-                let gb_expr: Option<String> = if gb_lower.contains(&col_l) {
-                    ctx.plan
-                        .group_by_columns
-                        .iter()
-                        .find(|gb| gb.to_lowercase() == col_l)
-                        .cloned()
-                } else if gb_normalized.contains(&col_l) {
-                    ctx.plan
-                        .group_by_columns
-                        .iter()
-                        .find(|gb| normalized_column_name(gb).to_lowercase() == col_l)
-                        .cloned()
-                } else {
-                    alias_to_gb_expr.get(&col_l).cloned()
-                };
-                if let Some(ref gb) = gb_expr {
-                    if !crate::sql_analyzer::is_bare_column_reference(gb) {
-                        return Box::leak(
-                            format!(
-                                "ERROR: partition_by column '{}' corresponds to a computed \
-                                 GROUP BY expression ('{}'). Partition columns must be bare \
-                                 column references on the source. Workaround: add a generated \
-                                 / computed column to the source and partition on that.",
-                                col, gb
-                            )
-                            .into_boxed_str(),
-                        );
-                    }
-                }
-            }
-        }
-        let validate_result: Result<String, String> = Spi::connect(|client| {
-            let anchor = crate::partition::resolve_anchor_source(
-                client,
-                &ctx.resolved_partition_cols[0],
-                &ctx.real_source_names,
-            )?;
-            let desc = crate::partition::introspect_partition_descriptor(client, &anchor)
-                .ok_or_else(|| {
-                    format!(
-                        "anchor source '{}' for column '{}' is not partitioned LIST/RANGE",
-                        anchor, ctx.resolved_partition_cols[0]
-                    )
-                })?;
-            let part_col_l = ctx.resolved_partition_cols[0].to_lowercase();
-            if !desc.column_names.iter().any(|c| c == &part_col_l) {
-                return Err(format!(
-                    "anchor source '{}' is partitioned but not on '{}' (partitioned on: {:?})",
-                    anchor, ctx.resolved_partition_cols[0], desc.column_names
-                ));
-            }
-            Ok(desc.strategy)
-        });
-        match validate_result {
-            Ok(s) => ctx.resolved_strategy = s,
-            Err(e) => {
-                return Box::leak(
-                    format!("ERROR: partition_by validation failed — {}", e).into_boxed_str(),
-                );
-            }
-        }
-    } else {
-        // Phase 5: auto-mirror when exactly one real source is partitioned.
-        let auto: (Vec<String>, String) = Spi::connect(|client| {
-            let mut partitioned_sources: Vec<(String, crate::partition::PartitionDescriptor)> =
-                Vec::new();
-            for s in &ctx.real_source_names {
-                if let Some(desc) = crate::partition::introspect_partition_descriptor(client, s) {
-                    partitioned_sources.push((s.clone(), desc));
-                }
-            }
-            if partitioned_sources.len() != 1 {
-                return (Vec::new(), String::new());
-            }
-            let (_, desc) = partitioned_sources.into_iter().next().unwrap();
-            let part_col = desc.column_names.first().cloned().unwrap_or_default();
-            if part_col.is_empty() {
-                return (Vec::new(), String::new());
-            }
-            if ctx.plan.is_passthrough {
-                let pt_cols_l: std::collections::HashSet<String> = ctx
-                    .plan
-                    .passthrough_columns
-                    .iter()
-                    .map(|c| c.to_lowercase())
-                    .collect();
-                let projected: std::collections::HashSet<String> = ctx
-                    .analysis
-                    .select_columns
-                    .iter()
-                    .map(|c| {
-                        let n = c.alias.as_deref().unwrap_or(&c.expr_sql);
-                        bare_column_name(n).to_lowercase()
-                    })
-                    .collect();
-                if pt_cols_l.contains(&part_col) || projected.contains(&part_col) {
-                    return (vec![part_col], desc.strategy);
-                }
-            } else {
-                let gb_lower: std::collections::HashSet<String> = ctx
-                    .plan
-                    .group_by_columns
-                    .iter()
-                    .map(|c| c.to_lowercase())
-                    .collect();
-                let projected_aliases: std::collections::HashSet<String> = ctx
-                    .plan
-                    .group_by_aliases
-                    .values()
-                    .map(|v| v.to_lowercase())
-                    .collect();
-                if gb_lower.contains(&part_col) || projected_aliases.contains(&part_col) {
-                    return (vec![part_col], desc.strategy);
-                }
-            }
-            (Vec::new(), String::new())
-        });
-        ctx.resolved_partition_cols = auto.0;
-        ctx.resolved_strategy = auto.1;
-        if !ctx.resolved_partition_cols.is_empty() {
-            info!(
-                "pg_reflex: auto-mirroring partition column '{}' from source",
-                ctx.resolved_partition_cols[0]
-            );
-        }
+    if let Err(msg) = resolve_partitioning(&mut ctx) {
+        return Box::leak(msg.into_boxed_str());
     }
 
     Spi::connect_mut(|client| {
