@@ -1626,6 +1626,112 @@ fn persist_metadata(client: &mut SpiClient<'_>, ctx: &BuildContext) {
     add_graph_child_links(client, ctx.view_name, &ctx.ivm_froms).unwrap_or_report();
 }
 
+/// For aggregate IMVs (skipped for passthrough — CREATE TABLE AS already
+/// populated): execute the initial INSERT into intermediate + target, build
+/// indexes, provision affected-groups + shrunk-groups tables, ANALYZE, and
+/// data-probe NOT-NULL columns. Mutates `ctx.plan.not_null_columns` with
+/// the probed additions.
+fn initial_aggregate_materialization(client: &mut SpiClient<'_>, ctx: &mut BuildContext) {
+    if ctx.plan.is_passthrough {
+        return;
+    }
+    let intermediate_tbl = intermediate_table_name(ctx.view_name);
+    let base_q = generate_base_query(&ctx.analysis, &ctx.plan);
+    let initial_insert = format!("INSERT INTO {} {}", intermediate_tbl, base_q);
+    client.update(&initial_insert, None, &[]).unwrap_or_report();
+
+    let end_q = generate_end_query(ctx.view_name, &ctx.plan);
+    let target_insert = format!("INSERT INTO {} {}", quote_identifier(ctx.view_name), end_q);
+    client.update(&target_insert, None, &[]).unwrap_or_report();
+
+    for index_ddl in build_indexes_ddl(ctx.view_name, &ctx.plan) {
+        client.update(&index_ddl, None, &[]).unwrap_or_report();
+    }
+
+    // Create persistent affected-groups table (avoids DROP+CREATE per trigger fire).
+    // Uses UNLOGGED for speed; lost on crash but rebuilt by reflex_reconcile.
+    // Co-located in the IMV's schema (1.4.1) so SQL works under any `search_path`.
+    if !ctx.plan.group_by_columns.is_empty() || !ctx.plan.distinct_columns.is_empty() {
+        let group_cols_csv = ctx
+            .plan
+            .group_by_columns
+            .iter()
+            .chain(ctx.plan.distinct_columns.iter())
+            .map(|c| format!("\"{}\"", normalized_column_name(c)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let affected_ref = affected_groups_table_name(ctx.view_name);
+        client
+            .update(
+                &format!(
+                    "CREATE UNLOGGED TABLE IF NOT EXISTS {} AS SELECT {} FROM {} WHERE FALSE",
+                    affected_ref, group_cols_csv, intermediate_tbl
+                ),
+                None,
+                &[],
+            )
+            .unwrap_or_report();
+
+        // N1: per-IMV "shrunk groups" capture table — populated post-Sub
+        // on UPDATE for top-K MIN/MAX IMVs to scope the forced recompute
+        // to groups whose heap actually shrank below K. Provisioned only
+        // when the plan has any top-K column; non-top-K IMVs leave it
+        // unallocated.
+        let has_topk = ctx.plan.intermediate_columns.iter().any(|ic| ic.has_topk());
+        if has_topk {
+            let shrunk_ref = shrunk_groups_table_name(ctx.view_name);
+            client
+                .update(
+                    &format!(
+                        "CREATE UNLOGGED TABLE IF NOT EXISTS {} AS SELECT {} FROM {} WHERE FALSE",
+                        shrunk_ref, group_cols_csv, intermediate_tbl
+                    ),
+                    None,
+                    &[],
+                )
+                .unwrap_or_report();
+        }
+    }
+
+    // ANALYZE so the query planner has accurate statistics
+    client
+        .update(&format!("ANALYZE {}", intermediate_tbl), None, &[])
+        .unwrap_or_report();
+    client
+        .update(
+            &format!("ANALYZE {}", quote_identifier(ctx.view_name)),
+            None,
+            &[],
+        )
+        .unwrap_or_report();
+
+    // 1.4.5: data-probe pass. Scan the intermediate for group-by /
+    // distinct columns whose actual data is NULL-free, and add them
+    // to not_null_columns. Catches the case where a catalog-NULLable
+    // column is effectively NOT NULL because the IMV's INNER JOIN
+    // or filter semantics exclude NULLs. Without this, the trigger's
+    // MERGE codegen would emit `IS NOT DISTINCT FROM` on the
+    // composite-index leading column, defeating the index — the
+    // 405 s yse.ivm_sop_forecast_view regression in 1.4.4.
+    let probed_nn = probe_not_null_columns_from_data(client, &intermediate_tbl, &ctx.plan);
+    let new_cols: Vec<String> = probed_nn
+        .into_iter()
+        .filter(|c| !ctx.plan.not_null_columns.contains(c))
+        .collect();
+    if !new_cols.is_empty() {
+        for c in &new_cols {
+            ctx.plan.not_null_columns.insert(c.clone());
+        }
+        persist_probed_not_null_columns(client, ctx.view_name, &new_cols);
+        info!(
+            "pg_reflex: data-probe added {} effectively-NOT-NULL column(s) to '{}': {:?}",
+            new_cols.len(),
+            ctx.view_name,
+            new_cols
+        );
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn create_reflex_ivm_impl(
     view_name: &str,
@@ -1816,111 +1922,7 @@ pub(crate) fn create_reflex_ivm_impl(
 
         persist_metadata(client, &ctx);
 
-        // Initial materialization (skip for passthrough — CREATE TABLE AS already populated)
-        if !ctx.plan.is_passthrough {
-            let intermediate_tbl = intermediate_table_name(ctx.view_name);
-            let base_q = generate_base_query(&ctx.analysis, &ctx.plan);
-            let initial_insert = format!("INSERT INTO {} {}", intermediate_tbl, base_q);
-            client.update(&initial_insert, None, &[]).unwrap_or_report();
-
-            let end_query = generate_end_query(ctx.view_name, &ctx.plan);
-            let target_insert = format!(
-                "INSERT INTO {} {}",
-                quote_identifier(ctx.view_name),
-                end_query
-            );
-            client.update(&target_insert, None, &[]).unwrap_or_report();
-
-            // Create indexes AFTER bulk insert (much faster than indexing during insert)
-            for index_ddl in build_indexes_ddl(ctx.view_name, &ctx.plan) {
-                client.update(&index_ddl, None, &[]).unwrap_or_report();
-            }
-
-            // Create persistent affected-groups table (avoids DROP+CREATE per trigger fire).
-            // Uses UNLOGGED for speed; lost on crash but rebuilt by reflex_reconcile.
-            // Co-located in the IMV's schema (1.4.1) so SQL works under any `search_path`.
-            if !ctx.plan.group_by_columns.is_empty() || !ctx.plan.distinct_columns.is_empty() {
-                let group_cols_csv = ctx
-                    .plan
-                    .group_by_columns
-                    .iter()
-                    .chain(ctx.plan.distinct_columns.iter())
-                    .map(|c| format!("\"{}\"", normalized_column_name(c)))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                let affected_ref = affected_groups_table_name(ctx.view_name);
-                client
-                    .update(
-                        &format!(
-                            "CREATE UNLOGGED TABLE IF NOT EXISTS {} AS SELECT {} FROM {} WHERE FALSE",
-                            affected_ref,
-                            group_cols_csv,
-                            intermediate_tbl
-                        ),
-                        None, &[],
-                    )
-                    .unwrap_or_report();
-
-                // N1: per-IMV "shrunk groups" capture table — populated post-Sub
-                // on UPDATE for top-K MIN/MAX IMVs to scope the forced recompute
-                // to groups whose heap actually shrank below K. Provisioned only
-                // when the plan has any top-K column; non-top-K IMVs leave it
-                // unallocated.
-                let has_topk = ctx.plan.intermediate_columns.iter().any(|ic| ic.has_topk());
-                if has_topk {
-                    let shrunk_ref = shrunk_groups_table_name(ctx.view_name);
-                    client
-                        .update(
-                            &format!(
-                                "CREATE UNLOGGED TABLE IF NOT EXISTS {} AS SELECT {} FROM {} WHERE FALSE",
-                                shrunk_ref,
-                                group_cols_csv,
-                                intermediate_tbl
-                            ),
-                            None, &[],
-                        )
-                        .unwrap_or_report();
-                }
-            }
-
-            // ANALYZE so the query planner has accurate statistics
-            client
-                .update(&format!("ANALYZE {}", intermediate_tbl), None, &[])
-                .unwrap_or_report();
-            client
-                .update(
-                    &format!("ANALYZE {}", quote_identifier(ctx.view_name)),
-                    None,
-                    &[],
-                )
-                .unwrap_or_report();
-
-            // 1.4.5: data-probe pass. Scan the intermediate for group-by /
-            // distinct columns whose actual data is NULL-free, and add them
-            // to not_null_columns. Catches the case where a catalog-NULLable
-            // column is effectively NOT NULL because the IMV's INNER JOIN
-            // or filter semantics exclude NULLs. Without this, the trigger's
-            // MERGE codegen would emit `IS NOT DISTINCT FROM` on the
-            // composite-index leading column, defeating the index — the
-            // 405 s yse.ivm_sop_forecast_view regression in 1.4.4.
-            let probed_nn = probe_not_null_columns_from_data(client, &intermediate_tbl, &ctx.plan);
-            let new_cols: Vec<String> = probed_nn
-                .into_iter()
-                .filter(|c| !ctx.plan.not_null_columns.contains(c))
-                .collect();
-            if !new_cols.is_empty() {
-                for c in &new_cols {
-                    ctx.plan.not_null_columns.insert(c.clone());
-                }
-                persist_probed_not_null_columns(client, ctx.view_name, &new_cols);
-                info!(
-                    "pg_reflex: data-probe added {} effectively-NOT-NULL column(s) to '{}': {:?}",
-                    new_cols.len(),
-                    ctx.view_name,
-                    new_cols
-                );
-            }
-        }
+        initial_aggregate_materialization(client, &mut ctx);
     });
 
     info!("pg_reflex: created IMV '{}'", view_name);
