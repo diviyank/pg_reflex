@@ -1,0 +1,15 @@
+---
+source: src/tests/unit_trigger.rs
+expression: sql
+---
+TRUNCATE "__reflex_scratch_v"
+--<<REFLEX_SEP>>--
+INSERT INTO "__reflex_scratch_v" SELECT SUM(qty) AS qty FROM "__reflex_new_sales"
+--<<REFLEX_SEP>>--
+MERGE INTO "__reflex_intermediate_v" AS t USING "__reflex_scratch_v" AS d ON t.__reflex_group IS NOT DISTINCT FROM d.__reflex_group WHEN MATCHED THEN UPDATE SET "__sum_qty" = COALESCE(t."__sum_qty", 0) + COALESCE(d."__sum_qty", 0) WHEN NOT MATCHED THEN INSERT (__reflex_group, "__sum_qty") VALUES (d.__reflex_group, COALESCE(d."__sum_qty", 0))
+--<<REFLEX_SEP>>--
+TRUNCATE "v"
+--<<REFLEX_SEP>>--
+INSERT INTO "v" SELECT qty FROM __reflex_int_v
+--<<REFLEX_SEP>>--
+UPDATE public.__reflex_ivm_reference SET last_update_date = NOW() WHERE name = 'v' AND (last_update_date IS NULL OR last_update_date < NOW() - INTERVAL '1 second')

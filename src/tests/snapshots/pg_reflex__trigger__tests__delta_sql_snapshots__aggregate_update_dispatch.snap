@@ -1,0 +1,60 @@
+---
+source: src/tests/unit_trigger.rs
+expression: sql
+---
+TRUNCATE "__reflex_affected_v"
+--<<REFLEX_SEP>>--
+TRUNCATE "__reflex_scratch_v"
+--<<REFLEX_SEP>>--
+INSERT INTO "__reflex_scratch_v" SELECT "region", SUM(CASE WHEN __reflex_sign = 1 THEN COALESCE("__sum_qty", 0) ELSE -COALESCE("__sum_qty", 0) END) AS "__sum_qty", SUM(CASE WHEN __reflex_sign = 1 THEN COALESCE(__ivm_count, 0) ELSE -COALESCE(__ivm_count, 0) END) AS __ivm_count FROM (SELECT 1 AS __reflex_sign, __d.* FROM (SELECT region, SUM(qty) AS qty FROM "__reflex_new_sales" GROUP BY region) AS __d UNION ALL SELECT -1 AS __reflex_sign, __d.* FROM (SELECT region, SUM(qty) AS qty FROM "__reflex_old_sales" GROUP BY region) AS __d) AS __net GROUP BY "region"
+--<<REFLEX_SEP>>--
+INSERT INTO "__reflex_affected_v" SELECT "region" FROM "__reflex_scratch_v" AS __d
+--<<REFLEX_SEP>>--
+ANALYZE "__reflex_affected_v"
+--<<REFLEX_SEP>>--
+DO $reflex_dispatch$
+DECLARE
+_aff BIGINT;
+_imm NUMERIC;
+_thr NUMERIC;
+_per_imv NUMERIC;
+_ratio NUMERIC;
+BEGIN
+SELECT count(*) INTO _aff FROM "__reflex_affected_v";
+SELECT GREATEST(reltuples::NUMERIC, 1.0) INTO _imm
+FROM pg_class WHERE oid = '"__reflex_intermediate_v"'::regclass;
+-- 1.4.6 precedence: per-IMV wipe_threshold column (operator
+-- override) → session GUC reflex.wipe_threshold → compiled
+-- default. Per-IMV is the right granularity when one extension
+-- instance serves IMVs with shape-divergent crossovers.
+SELECT wipe_threshold INTO _per_imv
+FROM public.__reflex_ivm_reference WHERE name = 'v';
+_thr := COALESCE(_per_imv, current_setting('reflex.wipe_threshold', true)::NUMERIC, 0.5);
+_ratio := _aff::NUMERIC / _imm;
+IF _ratio >= _thr THEN
+-- High-selectivity path — delegate to reflex_reconcile,
+-- which implements the drop-index/bulk-INSERT/recreate-
+-- index pattern. At >= threshold selectivity the cost of
+-- the standard MERGE + target double-rewrite exceeds the
+-- cost of a full IMV rebuild.
+RAISE DEBUG 'pg_reflex wipe: ratio=% thr=% — reconcile', _ratio, _thr;
+PERFORM public.reflex_reconcile('v');
+ELSE
+RAISE DEBUG 'pg_reflex wipe: ratio=% thr=% — incremental', _ratio, _thr;
+EXECUTE $reflex_inner$MERGE INTO "__reflex_intermediate_v" AS t USING "__reflex_scratch_v" AS d ON t."region" = d."region" WHEN MATCHED THEN UPDATE SET "__sum_qty" = COALESCE(t."__sum_qty", 0) + COALESCE(d."__sum_qty", 0), __ivm_count = COALESCE(t.__ivm_count, 0) + COALESCE(d.__ivm_count, 0) WHEN NOT MATCHED THEN INSERT ("region", "__sum_qty", __ivm_count) VALUES (d."region", COALESCE(d."__sum_qty", 0), COALESCE(d.__ivm_count, 0))$reflex_inner$;
+-- ANALYZE intermediate after MERGE so the planner has
+-- accurate stats for downstream dead-cleanup, target_delete,
+-- and target_insert. The MERGE modified ~|scratch| rows in
+-- the intermediate (UPDATE/INSERT), and the algebraic count
+-- column (__ivm_count) just shifted distribution; without
+-- fresh stats the planner can pick pathological NestedLoop+
+-- SeqScan plans (12+ min on 100K groups). ~150 ms cost on
+-- the SOP-forecast shape.
+EXECUTE 'ANALYZE "__reflex_intermediate_v"';
+EXECUTE $reflex_inner$DELETE FROM "v" WHERE EXISTS (SELECT 1 FROM "__reflex_affected_v" AS __a WHERE "v"."region" = __a."region")$reflex_inner$;
+EXECUTE $reflex_inner$INSERT INTO "v" SELECT region, qty FROM __reflex_int_v AND EXISTS (SELECT 1 FROM "__reflex_affected_v" AS __a WHERE "__reflex_intermediate_v"."region" = __a."region") GROUP BY region$reflex_inner$;
+END IF;
+END
+$reflex_dispatch$
+--<<REFLEX_SEP>>--
+UPDATE public.__reflex_ivm_reference SET last_update_date = NOW() WHERE name = 'v' AND (last_update_date IS NULL OR last_update_date < NOW() - INTERVAL '1 second')

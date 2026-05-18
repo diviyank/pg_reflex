@@ -2538,6 +2538,34 @@ mod delta_sql_snapshots {
         "having_clause": null
     }"#;
 
+    // Single-source aggregate plan (no OJS, no self-join)
+    const AGG_JSON_SINGLE_SOURCE: &str = r#"{
+        "is_passthrough": false,
+        "group_by_columns": ["region"],
+        "group_by_aliases": {},
+        "intermediate_columns": [
+            {"name":"__sum_qty","pg_type":"NUMERIC","source_aggregate":"SUM","source_arg":"qty","topk_k":null}
+        ],
+        "needs_ivm_count": true,
+        "has_distinct": false,
+        "end_query_mappings": [
+            {"intermediate_expr":"__sum_qty","output_alias":"qty","aggregate_type":"SUM","cast_type":null}
+        ],
+        "distinct_columns": [],
+        "passthrough_columns": [],
+        "passthrough_key_mappings": {},
+        "imv_relevant_columns": {},
+        "imv_relevant_where": {},
+        "source_join_keys": {},
+        "not_null_columns": ["region"],
+        "output_column_order": [],
+        "partition_columns": [],
+        "partition_strategy": "",
+        "anchor_source": "",
+        "partition_join_paths": {},
+        "having_clause": null
+    }"#;
+
     #[test]
     fn snapshot_self_join_insert_aggregate() {
         // Self-join: source_table appears twice in base_query → full-refresh path
@@ -2600,5 +2628,81 @@ mod delta_sql_snapshots {
             base_q,
         );
         insta::assert_snapshot!("passthrough_insert", sql);
+    }
+
+    #[test]
+    fn snapshot_aggregate_insert() {
+        let base_q = "SELECT region, SUM(qty) AS qty FROM sales GROUP BY region";
+        let end_q = "SELECT region, qty FROM __reflex_int_v GROUP BY region";
+        let sql = reflex_build_delta_sql(
+            "v",
+            "sales",
+            "INSERT",
+            base_q,
+            end_q,
+            Some(AGG_JSON_SINGLE_SOURCE),
+            base_q,
+        );
+        insta::assert_snapshot!("aggregate_insert", sql);
+    }
+
+    #[test]
+    fn snapshot_aggregate_delete() {
+        let base_q = "SELECT region, SUM(qty) AS qty FROM sales GROUP BY region";
+        let end_q = "SELECT region, qty FROM __reflex_int_v GROUP BY region";
+        let sql = reflex_build_delta_sql(
+            "v",
+            "sales",
+            "DELETE",
+            base_q,
+            end_q,
+            Some(AGG_JSON_SINGLE_SOURCE),
+            base_q,
+        );
+        insta::assert_snapshot!("aggregate_delete", sql);
+    }
+
+    #[test]
+    fn snapshot_aggregate_update_with_dispatch() {
+        // UPDATE on a grouped aggregate without MIN/MAX → pending_dispatch path
+        let base_q = "SELECT region, SUM(qty) AS qty FROM sales GROUP BY region";
+        let end_q = "SELECT region, qty FROM __reflex_int_v GROUP BY region";
+        let sql = reflex_build_delta_sql(
+            "v",
+            "sales",
+            "UPDATE",
+            base_q,
+            end_q,
+            Some(AGG_JSON_SINGLE_SOURCE),
+            base_q,
+        );
+        insta::assert_snapshot!("aggregate_update_dispatch", sql);
+    }
+
+    #[test]
+    fn snapshot_aggregate_epilogue_no_group_by() {
+        // Aggregate IMV with no GROUP BY (global aggregate) → else branch of epilogue
+        let plan = r#"{
+            "is_passthrough": false,
+            "group_by_columns": [],
+            "group_by_aliases": {},
+            "intermediate_columns": [
+                {"name":"__sum_qty","pg_type":"NUMERIC","source_aggregate":"SUM","source_arg":"qty","topk_k":null}
+            ],
+            "needs_ivm_count": false,
+            "has_distinct": false,
+            "end_query_mappings": [
+                {"intermediate_expr":"__sum_qty","output_alias":"qty","aggregate_type":"SUM","cast_type":null}
+            ],
+            "distinct_columns": [], "passthrough_columns": [], "passthrough_key_mappings": {},
+            "imv_relevant_columns": {}, "imv_relevant_where": {}, "source_join_keys": {}, "not_null_columns": [],
+            "output_column_order": [],
+            "partition_columns": [], "partition_strategy": "", "anchor_source": "", "partition_join_paths": {},
+            "having_clause": null
+        }"#;
+        let base_q = "SELECT SUM(qty) AS qty FROM sales";
+        let end_q = "SELECT qty FROM __reflex_int_v";
+        let sql = reflex_build_delta_sql("v", "sales", "INSERT", base_q, end_q, Some(plan), base_q);
+        insta::assert_snapshot!("aggregate_epilogue_no_group_by", sql);
     }
 }

@@ -1,0 +1,23 @@
+---
+source: src/tests/unit_trigger.rs
+expression: sql
+---
+TRUNCATE "__reflex_affected_v"
+--<<REFLEX_SEP>>--
+TRUNCATE "__reflex_scratch_v"
+--<<REFLEX_SEP>>--
+INSERT INTO "__reflex_scratch_v" SELECT region, SUM(qty) AS qty FROM "__reflex_new_sales" GROUP BY region
+--<<REFLEX_SEP>>--
+MERGE INTO "__reflex_intermediate_v" AS t USING "__reflex_scratch_v" AS d ON t."region" = d."region" WHEN MATCHED THEN UPDATE SET "__sum_qty" = COALESCE(t."__sum_qty", 0) + COALESCE(d."__sum_qty", 0), __ivm_count = COALESCE(t.__ivm_count, 0) + COALESCE(d.__ivm_count, 0) WHEN NOT MATCHED THEN INSERT ("region", "__sum_qty", __ivm_count) VALUES (d."region", COALESCE(d."__sum_qty", 0), COALESCE(d.__ivm_count, 0))
+--<<REFLEX_SEP>>--
+ANALYZE "__reflex_intermediate_v"
+--<<REFLEX_SEP>>--
+INSERT INTO "__reflex_affected_v" SELECT "region" FROM "__reflex_scratch_v" AS __d
+--<<REFLEX_SEP>>--
+ANALYZE "__reflex_affected_v"
+--<<REFLEX_SEP>>--
+DELETE FROM "v" WHERE EXISTS (SELECT 1 FROM "__reflex_affected_v" AS __a WHERE "v"."region" = __a."region")
+--<<REFLEX_SEP>>--
+INSERT INTO "v" SELECT region, qty FROM __reflex_int_v AND EXISTS (SELECT 1 FROM "__reflex_affected_v" AS __a WHERE "__reflex_intermediate_v"."region" = __a."region") GROUP BY region
+--<<REFLEX_SEP>>--
+UPDATE public.__reflex_ivm_reference SET last_update_date = NOW() WHERE name = 'v' AND (last_update_date IS NULL OR last_update_date < NOW() - INTERVAL '1 second')
