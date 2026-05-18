@@ -1503,6 +1503,63 @@ fn install_deferred_flush_if_needed(client: &mut pgrx::spi::SpiClient<'_>, ctx: 
     }
 }
 
+/// Source-side indexes on GROUP BY columns for MIN/MAX recompute performance.
+/// Skips IMV sources (the IMV's intermediate has its own indexes) and
+/// `<subquery>` placeholders. Only emits indexes for columns that exist on
+/// the source table.
+fn install_min_max_indexes(client: &mut pgrx::spi::SpiClient<'_>, ctx: &BuildContext) {
+    let has_min_max = ctx
+        .plan
+        .intermediate_columns
+        .iter()
+        .any(|ic| ic.source_aggregate == "MIN" || ic.source_aggregate == "MAX");
+    if !has_min_max || ctx.plan.group_by_columns.is_empty() {
+        return;
+    }
+    for source in &ctx.froms {
+        if source.starts_with('<') || ctx.ivm_froms.contains(source) {
+            continue;
+        }
+        let (src_schema, src_name) = split_qualified_name(source);
+        let src_schema_str = src_schema.unwrap_or("public");
+        let source_cols: Vec<String> = client
+            .select(
+                "SELECT column_name FROM information_schema.columns WHERE table_schema = $1 AND table_name = $2",
+                None,
+                &[
+                    unsafe { DatumWithOid::new(src_schema_str.to_string(), PgBuiltInOids::TEXTOID.oid().value()) },
+                    unsafe { DatumWithOid::new(src_name.to_string(), PgBuiltInOids::TEXTOID.oid().value()) },
+                ],
+            )
+            .unwrap_or_report()
+            .filter_map(|row| row.get_by_name::<&str, _>("column_name").unwrap_or(None).map(|s| s.to_lowercase()))
+            .collect();
+
+        let idx_cols: Vec<String> = ctx
+            .plan
+            .group_by_columns
+            .iter()
+            .map(|c| normalized_column_name(c))
+            .filter(|c| source_cols.contains(c))
+            .map(|c| format!("\"{}\"", c))
+            .collect();
+
+        if idx_cols.is_empty() {
+            continue;
+        }
+        let safe_src = source.replace('.', "_");
+        let bare_view = split_qualified_name(ctx.view_name).1;
+        let idx_name = safe_identifier(&format!("__reflex_idx_{}_{}", bare_view, safe_src));
+        let ddl = format!(
+            "CREATE INDEX IF NOT EXISTS \"{}\" ON {} ({})",
+            idx_name,
+            source,
+            idx_cols.join(", ")
+        );
+        client.update(&ddl, None, &[]).unwrap_or_report();
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn create_reflex_ivm_impl(
     view_name: &str,
@@ -1689,57 +1746,7 @@ pub(crate) fn create_reflex_ivm_impl(
         install_source_triggers(client, &ctx);
         install_deferred_flush_if_needed(client, &ctx);
 
-        // Issue 4: Add index on source GROUP BY columns for MIN/MAX recompute performance
-        let has_min_max = ctx
-            .plan
-            .intermediate_columns
-            .iter()
-            .any(|ic| ic.source_aggregate == "MIN" || ic.source_aggregate == "MAX");
-        if has_min_max && !ctx.plan.group_by_columns.is_empty() {
-            for source in &ctx.froms {
-                if source.starts_with('<') || ctx.ivm_froms.contains(source) {
-                    continue;
-                }
-                // Only index columns that actually exist on this source table
-                let (src_schema, src_name) = split_qualified_name(source);
-                let src_schema_str = src_schema.unwrap_or("public");
-                let source_cols: Vec<String> = client
-                    .select(
-                        "SELECT column_name FROM information_schema.columns WHERE table_schema = $1 AND table_name = $2",
-                        None,
-                        &[
-                            unsafe { DatumWithOid::new(src_schema_str.to_string(), PgBuiltInOids::TEXTOID.oid().value()) },
-                            unsafe { DatumWithOid::new(src_name.to_string(), PgBuiltInOids::TEXTOID.oid().value()) },
-                        ],
-                    )
-                    .unwrap_or_report()
-                    .filter_map(|row| row.get_by_name::<&str, _>("column_name").unwrap_or(None).map(|s| s.to_lowercase()))
-                    .collect();
-
-                let idx_cols: Vec<String> = ctx
-                    .plan
-                    .group_by_columns
-                    .iter()
-                    .map(|c| normalized_column_name(c))
-                    .filter(|c| source_cols.contains(c))
-                    .map(|c| format!("\"{}\"", c))
-                    .collect();
-
-                if idx_cols.is_empty() {
-                    continue;
-                }
-                let safe_src = source.replace('.', "_");
-                let bare_view = split_qualified_name(ctx.view_name).1;
-                let idx_name = safe_identifier(&format!("__reflex_idx_{}_{}", bare_view, safe_src));
-                let ddl = format!(
-                    "CREATE INDEX IF NOT EXISTS \"{}\" ON {} ({})",
-                    idx_name,
-                    source,
-                    idx_cols.join(", ")
-                );
-                client.update(&ddl, None, &[]).unwrap_or_report();
-            }
-        }
+        install_min_max_indexes(client, &ctx);
 
         // Generate decomposed queries and metadata
         let base_query = if ctx.plan.is_passthrough {
