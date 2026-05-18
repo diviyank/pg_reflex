@@ -789,6 +789,77 @@ fn validate_select_columns(ctx: &BuildContext) {
     }
 }
 
+/// Pre-flight checks: reject duplicate view name (or skip-noop on
+/// `if_not_exists`), detect cycles in the IMV dependency DAG. Returns the
+/// short-circuit string when the create should stop, `None` to continue.
+fn check_existence_and_cycle(ctx: &BuildContext) -> Option<&'static str> {
+    let already_exists = Spi::connect(|client| {
+        !client
+            .select(
+                "SELECT 1 FROM public.__reflex_ivm_reference WHERE name = $1",
+                None,
+                &[unsafe {
+                    DatumWithOid::new(
+                        ctx.view_name.to_string(),
+                        PgBuiltInOids::TEXTOID.oid().value(),
+                    )
+                }],
+            )
+            .unwrap_or_report()
+            .collect::<Vec<_>>()
+            .is_empty()
+    });
+    if already_exists {
+        if ctx.if_not_exists {
+            return Some("REFLEX INCREMENTAL VIEW ALREADY EXISTS (skipped)");
+        }
+        return Some("ERROR: IMV with this name already exists");
+    }
+
+    let cycle_detected = if ctx.froms.is_empty() {
+        false
+    } else {
+        Spi::connect(|client| {
+            let args = [
+                unsafe {
+                    DatumWithOid::new(
+                        format_pg_text_array_literal(&ctx.froms),
+                        PgBuiltInOids::TEXTOID.oid().value(),
+                    )
+                },
+                unsafe {
+                    DatumWithOid::new(
+                        ctx.view_name.to_string(),
+                        PgBuiltInOids::TEXTOID.oid().value(),
+                    )
+                },
+            ];
+            !client
+                .select(
+                    "WITH RECURSIVE dep_graph(dep) AS (\
+                        SELECT unnest(depends_on) \
+                        FROM public.__reflex_ivm_reference \
+                        WHERE name = ANY($1::TEXT[]) \
+                        UNION \
+                        SELECT unnest(r.depends_on) \
+                        FROM dep_graph dg \
+                        JOIN public.__reflex_ivm_reference r ON r.name = dg.dep \
+                    ) \
+                    SELECT 1 FROM dep_graph WHERE dep = $2 LIMIT 1",
+                    Some(1),
+                    &args,
+                )
+                .unwrap_or_report()
+                .collect::<Vec<_>>()
+                .is_empty()
+        })
+    };
+    if cycle_detected {
+        return Some("ERROR: circular dependency detected — this IMV would form a cycle in the dependency graph");
+    }
+    None
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn create_reflex_ivm_impl(
     view_name: &str,
@@ -954,79 +1025,8 @@ pub(crate) fn create_reflex_ivm_impl(
     populate_source_join_keys(&mut ctx);
     validate_select_columns(&ctx);
 
-    // Check for duplicate view name
-    let already_exists = Spi::connect(|client| {
-        !client
-            .select(
-                "SELECT 1 FROM public.__reflex_ivm_reference WHERE name = $1",
-                None,
-                &[unsafe {
-                    DatumWithOid::new(
-                        ctx.view_name.to_string(),
-                        PgBuiltInOids::TEXTOID.oid().value(),
-                    )
-                }],
-            )
-            .unwrap_or_report()
-            .collect::<Vec<_>>()
-            .is_empty()
-    });
-    if already_exists {
-        if ctx.if_not_exists {
-            return "REFLEX INCREMENTAL VIEW ALREADY EXISTS (skipped)";
-        }
-        return "ERROR: IMV with this name already exists";
-    }
-
-    // Bug #10: reject creation if it would form a cycle in the dependency DAG.
-    // Traverse depends_on edges reachable from froms; if view_name appears, it's a cycle.
-    // UNION (not UNION ALL) prevents infinite loops when the existing graph already has cycles.
-    //
-    // We deliberately avoid `.first().get_one::<bool>()` here: in pgrx 0.18 that path
-    // calls `PgMemoryContexts::CurrentMemoryContext.parent()`, which segfaults when
-    // CurrentMemoryContext is NULL in this call context (observed on PG 17.7). Instead
-    // we project the match rows directly and check whether the result set is non-empty,
-    // mirroring the duplicate-name probe above (line 776).
-    let cycle_detected = if ctx.froms.is_empty() {
-        false
-    } else {
-        Spi::connect(|client| {
-            let args = [
-                unsafe {
-                    DatumWithOid::new(
-                        format_pg_text_array_literal(&ctx.froms),
-                        PgBuiltInOids::TEXTOID.oid().value(),
-                    )
-                },
-                unsafe {
-                    DatumWithOid::new(
-                        ctx.view_name.to_string(),
-                        PgBuiltInOids::TEXTOID.oid().value(),
-                    )
-                },
-            ];
-            !client
-                .select(
-                    "WITH RECURSIVE dep_graph(dep) AS (\
-                        SELECT unnest(depends_on) \
-                        FROM public.__reflex_ivm_reference \
-                        WHERE name = ANY($1::TEXT[]) \
-                        UNION \
-                        SELECT unnest(r.depends_on) \
-                        FROM dep_graph dg \
-                        JOIN public.__reflex_ivm_reference r ON r.name = dg.dep \
-                    ) \
-                    SELECT 1 FROM dep_graph WHERE dep = $2 LIMIT 1",
-                    Some(1),
-                    &args,
-                )
-                .unwrap_or_report()
-                .collect::<Vec<_>>()
-                .is_empty()
-        })
-    };
-    if cycle_detected {
-        return "ERROR: circular dependency detected — this IMV would form a cycle in the dependency graph";
+    if let Some(msg) = check_existence_and_cycle(&ctx) {
+        return msg;
     }
 
     // --- Partitioning resolution (plans/partitioning_2.md) ---
