@@ -38,6 +38,46 @@ struct ParsedInputs {
     analysis: crate::sql_analyzer::SqlAnalysis,
 }
 
+/// Pipeline state shared across phases of `create_reflex_ivm_impl`. Owns the
+/// mutable `plan`; helpers mutate fields in-place. Input refs (`view_name`,
+/// `sql`, etc.) borrow from the caller's arg slots.
+struct BuildContext<'a> {
+    // Inputs
+    view_name: &'a str,
+    sql: &'a str,
+    unique_columns_str: &'a str,
+    if_not_exists: bool,
+    #[allow(dead_code)]
+    topk_k: Option<usize>,
+    ignore_sources: &'a [String],
+    partition_by: &'a [String],
+
+    // Parsed
+    logged: bool,
+    deferred: bool,
+    storage_upper: String,
+    mode_upper: String,
+    analysis: crate::sql_analyzer::SqlAnalysis,
+
+    // Plan (mutated through pipeline)
+    plan: crate::aggregation::AggregationPlan,
+
+    // Source decomposition (set immediately after plan construction)
+    froms: Vec<String>,
+    real_source_names: Vec<String>,
+    is_join_query: bool,
+
+    // Pre-SPI resolution outputs
+    resolved_unique_columns: Vec<String>,
+    resolved_partition_cols: Vec<String>,
+    resolved_strategy: String,
+
+    // SPI-phase outputs
+    ivm_froms: Vec<String>,
+    depth: i32,
+    unlogged_tables: Vec<String>,
+}
+
 /// Phase 1 of the create-IMV pipeline.
 ///
 /// Normalizes `storage`/`refresh`, validates the view name, parses the SQL
@@ -679,20 +719,8 @@ pub(crate) fn create_reflex_ivm_impl(
         analysis,
     } = parsed;
 
-    let froms = analysis.sources.clone();
-
-    // Build aggregation plan from the analysis. When the caller asked for top-K
-    // MIN/MAX, propagate it here so MIN/MAX intermediate columns gain a
-    // companion top-K array column (`__min_x_topk` / `__max_x_topk`).
-    let mut plan = if topk_k.is_some() {
-        plan_aggregation_with_topk(&analysis, topk_k)
-    } else {
-        plan_aggregation(&analysis)
-    };
-
-    // Reject mixed queries: COUNT(DISTINCT) + other aggregates (SUM, AVG, MIN, MAX, BOOL_OR).
-    // COUNT(DISTINCT) uses a compound intermediate key (grp, val) which is incompatible
-    // with regular aggregates that use (grp) as the key.
+    // COUNT(DISTINCT) mixed-with-other-aggregates check — must reject before
+    // building the ctx.
     let has_cd = analysis.select_columns.iter().any(|c| {
         matches!(
             c.aggregate,
@@ -708,36 +736,73 @@ pub(crate) fn create_reflex_ivm_impl(
                 Use a CTE to separate them: WITH cd AS (SELECT grp, COUNT(DISTINCT col) ...) SELECT ...";
     }
 
-    // Resolve unique key columns for passthrough IMVs (enables targeted DELETE/UPDATE)
-    let mut resolved_unique_columns: Vec<String> = Vec::new();
-    let real_sources: Vec<&String> = froms.iter().filter(|s| !s.starts_with('<')).collect();
-    let is_join_query = real_sources.len() > 1;
+    let froms = analysis.sources.clone();
+    let real_source_names: Vec<String> = froms
+        .iter()
+        .filter(|s| !s.starts_with('<'))
+        .cloned()
+        .collect();
+    let is_join_query = real_source_names.len() > 1;
 
-    if plan.is_passthrough {
-        if !unique_columns_str.is_empty() {
+    let plan = if topk_k.is_some() {
+        plan_aggregation_with_topk(&analysis, topk_k)
+    } else {
+        plan_aggregation(&analysis)
+    };
+
+    let mut ctx = BuildContext {
+        view_name,
+        sql,
+        unique_columns_str,
+        if_not_exists,
+        topk_k,
+        ignore_sources,
+        partition_by,
+        logged,
+        deferred,
+        storage_upper,
+        mode_upper,
+        analysis,
+        plan,
+        froms,
+        real_source_names,
+        is_join_query,
+        resolved_unique_columns: Vec::new(),
+        resolved_partition_cols: Vec::new(),
+        resolved_strategy: String::new(),
+        ivm_froms: Vec::new(),
+        depth: 0,
+        unlogged_tables: Vec::new(),
+    };
+
+    if ctx.plan.is_passthrough {
+        if !ctx.unique_columns_str.is_empty() {
             // Explicit unique columns from 3rd parameter
-            resolved_unique_columns = unique_columns_str
+            ctx.resolved_unique_columns = ctx
+                .unique_columns_str
                 .split(',')
                 .map(|s| normalized_column_name(s.trim()))
                 .filter(|s| !s.is_empty())
                 .collect();
-            plan.passthrough_columns = resolved_unique_columns.clone();
+            ctx.plan.passthrough_columns = ctx.resolved_unique_columns.clone();
             info!(
                 "pg_reflex: using explicit unique key ({}) for '{}'",
-                resolved_unique_columns.join(", "),
-                view_name
+                ctx.resolved_unique_columns.join(", "),
+                ctx.view_name
             );
 
             // Build per-source-table column mappings
+            let real_sources: Vec<&String> = ctx.real_source_names.iter().collect();
             build_passthrough_key_mappings(
-                &mut plan,
-                &resolved_unique_columns,
+                &mut ctx.plan,
+                &ctx.resolved_unique_columns,
                 &real_sources,
-                &analysis,
+                &ctx.analysis,
             );
-        } else if !is_join_query {
+        } else if !ctx.is_join_query {
             // Auto-detect: only for single-source queries (JOINs need explicit key)
-            let select_bare_names: std::collections::HashSet<String> = analysis
+            let select_bare_names: std::collections::HashSet<String> = ctx
+                .analysis
                 .select_columns
                 .iter()
                 .map(|c| {
@@ -746,6 +811,7 @@ pub(crate) fn create_reflex_ivm_impl(
                 })
                 .collect();
 
+            let real_sources: Vec<&String> = ctx.real_source_names.iter().collect();
             for source in &real_sources {
                 let (src_schema, src_name) = split_qualified_name(source);
                 let src_schema_str = src_schema.unwrap_or("public");
@@ -782,21 +848,21 @@ pub(crate) fn create_reflex_ivm_impl(
                     let pk_lower: Vec<String> = pk_cols.iter().map(|c| c.to_lowercase()).collect();
                     let all_in_select = pk_lower.iter().all(|c| select_bare_names.contains(c));
                     if all_in_select {
-                        resolved_unique_columns = pk_lower;
-                        plan.passthrough_columns = resolved_unique_columns.clone();
+                        ctx.resolved_unique_columns = pk_lower;
+                        ctx.plan.passthrough_columns = ctx.resolved_unique_columns.clone();
                         // Single source: 1:1 mapping (target col == source col)
-                        plan.passthrough_key_mappings.insert(
+                        ctx.plan.passthrough_key_mappings.insert(
                             source.to_string(),
-                            resolved_unique_columns
+                            ctx.resolved_unique_columns
                                 .iter()
                                 .map(|c| (c.clone(), c.clone()))
                                 .collect(),
                         );
                         info!(
                             "pg_reflex: auto-detected PK ({}) from '{}' for '{}'",
-                            resolved_unique_columns.join(", "),
+                            ctx.resolved_unique_columns.join(", "),
                             source,
-                            view_name
+                            ctx.view_name
                         );
                         break;
                     } else {
@@ -806,7 +872,7 @@ pub(crate) fn create_reflex_ivm_impl(
                              Add the PK columns to the SELECT list, or pass them as the 3rd argument to create_reflex_ivm.",
                             source,
                             pk_lower.join(", "),
-                            view_name
+                            ctx.view_name
                         );
                     }
                 }
@@ -817,7 +883,7 @@ pub(crate) fn create_reflex_ivm_impl(
                 "pg_reflex: JOIN passthrough '{}' has no unique key. \
                  Provide 3rd argument to create_reflex_ivm for incremental DELETE/UPDATE. \
                  Example: SELECT create_reflex_ivm('{}', '...', 'col1,col2')",
-                view_name, view_name
+                ctx.view_name, ctx.view_name
             );
         }
     }
@@ -826,8 +892,9 @@ pub(crate) fn create_reflex_ivm_impl(
     // sources where Item α's directional promotion can short-circuit to
     // bulk-INSERT (OUT→IN) or bulk-DELETE (IN→OUT) without per-row MERGE
     // probing. See `build_source_join_keys` for the safety gates.
-    if !plan.is_passthrough && is_join_query {
-        build_source_join_keys(&mut plan, &real_sources, &analysis);
+    if !ctx.plan.is_passthrough && ctx.is_join_query {
+        let real_sources: Vec<&String> = ctx.real_source_names.iter().collect();
+        build_source_join_keys(&mut ctx.plan, &real_sources, &ctx.analysis);
     }
 
     // 1.5.3 (plans/partitioning_3.md §4) — populate per-source
@@ -841,19 +908,23 @@ pub(crate) fn create_reflex_ivm_impl(
     // Warn about select columns that are neither GROUP BY nor recognized aggregates.
     // Note: passthrough columns not explicitly in GROUP BY are auto-added by plan_aggregation,
     // so we use the plan's group_by_columns (which includes auto-added ones) for validation.
-    if !plan.is_passthrough {
-        let group_by_set: std::collections::HashSet<&str> =
-            plan.group_by_columns.iter().map(|s| s.as_str()).collect();
-        for col in &analysis.select_columns {
+    if !ctx.plan.is_passthrough {
+        let group_by_set: std::collections::HashSet<&str> = ctx
+            .plan
+            .group_by_columns
+            .iter()
+            .map(|s| s.as_str())
+            .collect();
+        for col in &ctx.analysis.select_columns {
             if !col.is_passthrough && col.aggregate.is_none() && !col.is_aggregate_derived {
                 warning!(
                     "pg_reflex: unsupported expression '{}' in SELECT — column will be missing from IMV '{}'",
                     col.alias.as_deref().unwrap_or(&col.expr_sql),
-                    view_name
+                    ctx.view_name
                 );
             } else if col.is_passthrough
                 && !group_by_set.contains(col.expr_sql.as_str())
-                && !analysis.has_distinct
+                && !ctx.analysis.has_distinct
             {
                 // Passthrough column not in GROUP BY — likely an unrecognized aggregate or expression.
                 // Match on the underlying expression, not the output alias: `src.col AS renamed`
@@ -864,7 +935,7 @@ pub(crate) fn create_reflex_ivm_impl(
                     warning!(
                         "pg_reflex: expression '{}' not in GROUP BY and not a recognized aggregate — column will be missing from IMV '{}'",
                         col.expr_sql,
-                        view_name
+                        ctx.view_name
                     );
                 }
             }
@@ -878,7 +949,10 @@ pub(crate) fn create_reflex_ivm_impl(
                 "SELECT 1 FROM public.__reflex_ivm_reference WHERE name = $1",
                 None,
                 &[unsafe {
-                    DatumWithOid::new(view_name.to_string(), PgBuiltInOids::TEXTOID.oid().value())
+                    DatumWithOid::new(
+                        ctx.view_name.to_string(),
+                        PgBuiltInOids::TEXTOID.oid().value(),
+                    )
                 }],
             )
             .unwrap_or_report()
@@ -886,7 +960,7 @@ pub(crate) fn create_reflex_ivm_impl(
             .is_empty()
     });
     if already_exists {
-        if if_not_exists {
+        if ctx.if_not_exists {
             return "REFLEX INCREMENTAL VIEW ALREADY EXISTS (skipped)";
         }
         return "ERROR: IMV with this name already exists";
@@ -901,19 +975,22 @@ pub(crate) fn create_reflex_ivm_impl(
     // CurrentMemoryContext is NULL in this call context (observed on PG 17.7). Instead
     // we project the match rows directly and check whether the result set is non-empty,
     // mirroring the duplicate-name probe above (line 776).
-    let cycle_detected = if froms.is_empty() {
+    let cycle_detected = if ctx.froms.is_empty() {
         false
     } else {
         Spi::connect(|client| {
             let args = [
                 unsafe {
                     DatumWithOid::new(
-                        format_pg_text_array_literal(&froms),
+                        format_pg_text_array_literal(&ctx.froms),
                         PgBuiltInOids::TEXTOID.oid().value(),
                     )
                 },
                 unsafe {
-                    DatumWithOid::new(view_name.to_string(), PgBuiltInOids::TEXTOID.oid().value())
+                    DatumWithOid::new(
+                        ctx.view_name.to_string(),
+                        PgBuiltInOids::TEXTOID.oid().value(),
+                    )
                 },
             ];
             !client
@@ -948,18 +1025,13 @@ pub(crate) fn create_reflex_ivm_impl(
     //      AND its partition column is appropriate for this IMV's shape →
     //      auto-mirror.
     //   3. Otherwise → IMV stays unpartitioned (legacy behaviour).
-    let real_source_names: Vec<String> = froms
-        .iter()
-        .filter(|s| !s.starts_with('<'))
-        .cloned()
-        .collect();
-    let mut resolved_partition_cols: Vec<String> = partition_by.to_vec();
-    let resolved_strategy: String;
+    ctx.resolved_partition_cols = ctx.partition_by.to_vec();
 
-    if !resolved_partition_cols.is_empty() {
+    if !ctx.resolved_partition_cols.is_empty() {
         // Explicit partition_by — validate against plan shape.
-        if !plan.is_passthrough {
-            let gb_lower: std::collections::HashSet<String> = plan
+        if !ctx.plan.is_passthrough {
+            let gb_lower: std::collections::HashSet<String> = ctx
+                .plan
                 .group_by_columns
                 .iter()
                 .map(|c| c.to_lowercase())
@@ -967,12 +1039,14 @@ pub(crate) fn create_reflex_ivm_impl(
             // Also normalize qualified GROUP BY columns ("d.region" →
             // "region") so partition_by can name the bare column even
             // when the GROUP BY clause uses a `<table>.col` form.
-            let gb_normalized: std::collections::HashSet<String> = plan
+            let gb_normalized: std::collections::HashSet<String> = ctx
+                .plan
                 .group_by_columns
                 .iter()
                 .map(|c| normalized_column_name(c).to_lowercase())
                 .collect();
-            let projected_aliases: std::collections::HashSet<String> = plan
+            let projected_aliases: std::collections::HashSet<String> = ctx
+                .plan
                 .group_by_aliases
                 .values()
                 .map(|v| v.to_lowercase())
@@ -980,12 +1054,13 @@ pub(crate) fn create_reflex_ivm_impl(
             // Reverse map from alias → GROUP BY expression (the AST string
             // before aliasing).  Used to recover the underlying GROUP BY
             // expression when the user passes the alias in `partition_by`.
-            let alias_to_gb_expr: std::collections::HashMap<String, String> = plan
+            let alias_to_gb_expr: std::collections::HashMap<String, String> = ctx
+                .plan
                 .group_by_aliases
                 .iter()
                 .map(|(k, v)| (v.to_lowercase(), k.clone()))
                 .collect();
-            for col in &resolved_partition_cols {
+            for col in &ctx.resolved_partition_cols {
                 let col_l = col.to_lowercase();
                 if !gb_lower.contains(&col_l)
                     && !gb_normalized.contains(&col_l)
@@ -1008,12 +1083,14 @@ pub(crate) fn create_reflex_ivm_impl(
                 // the GROUP BY's lexical form) or, when partition_by names
                 // an alias, the GROUP BY entry whose alias is `col`.
                 let gb_expr: Option<String> = if gb_lower.contains(&col_l) {
-                    plan.group_by_columns
+                    ctx.plan
+                        .group_by_columns
                         .iter()
                         .find(|gb| gb.to_lowercase() == col_l)
                         .cloned()
                 } else if gb_normalized.contains(&col_l) {
-                    plan.group_by_columns
+                    ctx.plan
+                        .group_by_columns
                         .iter()
                         .find(|gb| normalized_column_name(gb).to_lowercase() == col_l)
                         .cloned()
@@ -1039,27 +1116,27 @@ pub(crate) fn create_reflex_ivm_impl(
         let validate_result: Result<String, String> = Spi::connect(|client| {
             let anchor = crate::partition::resolve_anchor_source(
                 client,
-                &resolved_partition_cols[0],
-                &real_source_names,
+                &ctx.resolved_partition_cols[0],
+                &ctx.real_source_names,
             )?;
             let desc = crate::partition::introspect_partition_descriptor(client, &anchor)
                 .ok_or_else(|| {
                     format!(
                         "anchor source '{}' for column '{}' is not partitioned LIST/RANGE",
-                        anchor, resolved_partition_cols[0]
+                        anchor, ctx.resolved_partition_cols[0]
                     )
                 })?;
-            let part_col_l = resolved_partition_cols[0].to_lowercase();
+            let part_col_l = ctx.resolved_partition_cols[0].to_lowercase();
             if !desc.column_names.iter().any(|c| c == &part_col_l) {
                 return Err(format!(
                     "anchor source '{}' is partitioned but not on '{}' (partitioned on: {:?})",
-                    anchor, resolved_partition_cols[0], desc.column_names
+                    anchor, ctx.resolved_partition_cols[0], desc.column_names
                 ));
             }
             Ok(desc.strategy)
         });
         match validate_result {
-            Ok(s) => resolved_strategy = s,
+            Ok(s) => ctx.resolved_strategy = s,
             Err(e) => {
                 return Box::leak(
                     format!("ERROR: partition_by validation failed — {}", e).into_boxed_str(),
@@ -1071,7 +1148,7 @@ pub(crate) fn create_reflex_ivm_impl(
         let auto: (Vec<String>, String) = Spi::connect(|client| {
             let mut partitioned_sources: Vec<(String, crate::partition::PartitionDescriptor)> =
                 Vec::new();
-            for s in &real_source_names {
+            for s in &ctx.real_source_names {
                 if let Some(desc) = crate::partition::introspect_partition_descriptor(client, s) {
                     partitioned_sources.push((s.clone(), desc));
                 }
@@ -1084,13 +1161,15 @@ pub(crate) fn create_reflex_ivm_impl(
             if part_col.is_empty() {
                 return (Vec::new(), String::new());
             }
-            if plan.is_passthrough {
-                let pt_cols_l: std::collections::HashSet<String> = plan
+            if ctx.plan.is_passthrough {
+                let pt_cols_l: std::collections::HashSet<String> = ctx
+                    .plan
                     .passthrough_columns
                     .iter()
                     .map(|c| c.to_lowercase())
                     .collect();
-                let projected: std::collections::HashSet<String> = analysis
+                let projected: std::collections::HashSet<String> = ctx
+                    .analysis
                     .select_columns
                     .iter()
                     .map(|c| {
@@ -1102,12 +1181,14 @@ pub(crate) fn create_reflex_ivm_impl(
                     return (vec![part_col], desc.strategy);
                 }
             } else {
-                let gb_lower: std::collections::HashSet<String> = plan
+                let gb_lower: std::collections::HashSet<String> = ctx
+                    .plan
                     .group_by_columns
                     .iter()
                     .map(|c| c.to_lowercase())
                     .collect();
-                let projected_aliases: std::collections::HashSet<String> = plan
+                let projected_aliases: std::collections::HashSet<String> = ctx
+                    .plan
                     .group_by_aliases
                     .values()
                     .map(|v| v.to_lowercase())
@@ -1118,12 +1199,12 @@ pub(crate) fn create_reflex_ivm_impl(
             }
             (Vec::new(), String::new())
         });
-        resolved_partition_cols = auto.0;
-        resolved_strategy = auto.1;
-        if !resolved_partition_cols.is_empty() {
+        ctx.resolved_partition_cols = auto.0;
+        ctx.resolved_strategy = auto.1;
+        if !ctx.resolved_partition_cols.is_empty() {
             info!(
                 "pg_reflex: auto-mirroring partition column '{}' from source",
-                resolved_partition_cols[0]
+                ctx.resolved_partition_cols[0]
             );
         }
     }
@@ -1132,7 +1213,7 @@ pub(crate) fn create_reflex_ivm_impl(
         // Lookup existing IMVs among the source tables
         let args = [unsafe {
             DatumWithOid::new(
-                format_pg_text_array_literal(&froms),
+                format_pg_text_array_literal(&ctx.froms),
                 PgBuiltInOids::TEXTOID.oid().value(),
             )
         }];
@@ -1146,36 +1227,34 @@ pub(crate) fn create_reflex_ivm_impl(
             .unwrap_or_report()
             .collect::<Vec<_>>();
 
-        let ivm_froms: Vec<String> = matching_froms
+        ctx.ivm_froms = matching_froms
             .iter()
             .filter_map(|row| row.get_by_name::<&str, _>("name").unwrap_or(None))
             .map(|s| s.to_string())
             .collect();
 
         // Calculate graph depth
-        let depth = matching_froms
+        ctx.depth = matching_froms
             .iter()
             .filter_map(|row| row.get_by_name::<i32, _>("graph_depth").unwrap_or(None))
             .max()
             .unwrap_or(0)
             + 1;
 
-        let mut unlogged_tables: Vec<String> = Vec::new();
-
-        plan.partition_columns = resolved_partition_cols.clone();
-        plan.partition_strategy = resolved_strategy.clone();
+        ctx.plan.partition_columns = ctx.resolved_partition_cols.clone();
+        ctx.plan.partition_strategy = ctx.resolved_strategy.clone();
         // Resolve and persist the anchor source so the trigger codegen can
         // detect Tier 1 (firing source == anchor) at SQL build time without
         // an extra SPI round-trip per fire.  Resolution failures (zero or
         // multiple owners) leave the field empty — the trigger falls
         // through to global Path B for that source, safe.
-        plan.anchor_source = if resolved_partition_cols.is_empty() {
+        ctx.plan.anchor_source = if ctx.resolved_partition_cols.is_empty() {
             String::new()
         } else {
             crate::partition::resolve_anchor_source(
                 client,
-                &resolved_partition_cols[0],
-                &real_source_names,
+                &ctx.resolved_partition_cols[0],
+                &ctx.real_source_names,
             )
             .unwrap_or_default()
         };
@@ -1188,11 +1267,11 @@ pub(crate) fn create_reflex_ivm_impl(
         // the trigger codegen substitutes at fire time with the actual
         // transition table name.  Empty / missing entry = no JOIN path =
         // trigger falls through to global Path B for that source (safe).
-        if !plan.partition_columns.is_empty() && !plan.anchor_source.is_empty() {
-            let partition_col = plan.partition_columns[0].to_lowercase();
-            let anchor = plan.anchor_source.clone();
+        if !ctx.plan.partition_columns.is_empty() && !ctx.plan.anchor_source.is_empty() {
+            let partition_col = ctx.plan.partition_columns[0].to_lowercase();
+            let anchor = ctx.plan.anchor_source.clone();
             let anchor_quoted = quote_identifier(&anchor);
-            for (source, mappings) in &plan.source_join_keys.clone() {
+            for (source, mappings) in &ctx.plan.source_join_keys.clone() {
                 if source.eq_ignore_ascii_case(&anchor)
                     || split_qualified_name(source)
                         .1
@@ -1216,7 +1295,9 @@ pub(crate) fn create_reflex_ivm_impl(
                         anchor = anchor_quoted,
                         sc = source_col,
                     );
-                    plan.partition_join_paths.insert(source.clone(), fragment);
+                    ctx.plan
+                        .partition_join_paths
+                        .insert(source.clone(), fragment);
                 }
             }
         }
@@ -1240,36 +1321,39 @@ pub(crate) fn create_reflex_ivm_impl(
         // site that covers both paths.
         {
             let (_t, _nn, per_source_cols_for_filter) =
-                query_column_types_from_catalog_with_per_source(client, &froms);
-            for (source, cols) in plan.imv_relevant_columns.iter_mut() {
+                query_column_types_from_catalog_with_per_source(client, &ctx.froms);
+            for (source, cols) in ctx.plan.imv_relevant_columns.iter_mut() {
                 if let Some(actual) = per_source_cols_for_filter.get(source) {
                     cols.retain(|c| actual.contains(c.as_str()));
                 } else if source.starts_with('<') {
                     cols.clear();
                 }
             }
-            plan.imv_relevant_columns.retain(|_, v| !v.is_empty());
+            ctx.plan.imv_relevant_columns.retain(|_, v| !v.is_empty());
         }
 
-        if plan.is_passthrough {
+        if ctx.plan.is_passthrough {
             // Passthrough: CREATE TABLE AS — Postgres infers columns + types, populates data.
             // Partitioned path: we need an explicit column list to use
             // `PARTITION BY`, so we first probe the column shape via a
             // temp scratch (WITH NO DATA), then CREATE the real
             // partitioned parent + children, then INSERT.
-            let create_kw = if logged {
+            let create_kw = if ctx.logged {
                 "CREATE TABLE"
             } else {
                 "CREATE UNLOGGED TABLE"
             };
-            if !plan.partition_columns.is_empty() {
+            if !ctx.plan.partition_columns.is_empty() {
                 let scratch_name = format!(
                     "__reflex_pt_shape_{}",
-                    safe_identifier(split_qualified_name(view_name).1)
+                    safe_identifier(split_qualified_name(ctx.view_name).1)
                 );
                 client
                     .update(
-                        &format!("CREATE TEMP TABLE {} AS {} WITH NO DATA", scratch_name, sql),
+                        &format!(
+                            "CREATE TEMP TABLE {} AS {} WITH NO DATA",
+                            scratch_name, ctx.sql
+                        ),
                         None,
                         &[],
                     )
@@ -1300,15 +1384,15 @@ pub(crate) fn create_reflex_ivm_impl(
                     .update(&format!("DROP TABLE {}", scratch_name), None, &[])
                     .unwrap_or_report();
                 let part_clause = crate::partition::build_partition_by_clause(
-                    &plan.partition_strategy,
-                    &plan.partition_columns,
+                    &ctx.plan.partition_strategy,
+                    &ctx.plan.partition_columns,
                 );
                 client
                     .update(
                         &format!(
                             "{} IF NOT EXISTS {} ({}) {}",
                             create_kw,
-                            quote_identifier(view_name),
+                            quote_identifier(ctx.view_name),
                             col_defs.join(", "),
                             part_clause
                         ),
@@ -1318,19 +1402,25 @@ pub(crate) fn create_reflex_ivm_impl(
                     .unwrap_or_report();
                 if let Ok(anchor) = crate::partition::resolve_anchor_source(
                     client,
-                    &plan.partition_columns[0],
-                    &real_source_names,
+                    &ctx.plan.partition_columns[0],
+                    &ctx.real_source_names,
                 ) {
                     let src_children = crate::partition::list_partition_children(client, &anchor);
                     for src_child in &src_children {
-                        let (_, tgt_ddl) =
-                            crate::partition::build_partition_child_ddl_pair(view_name, src_child);
+                        let (_, tgt_ddl) = crate::partition::build_partition_child_ddl_pair(
+                            ctx.view_name,
+                            src_child,
+                        );
                         client.update(&tgt_ddl, None, &[]).unwrap_or_report();
                     }
                 }
                 client
                     .update(
-                        &format!("INSERT INTO {} {}", quote_identifier(view_name), sql),
+                        &format!(
+                            "INSERT INTO {} {}",
+                            quote_identifier(ctx.view_name),
+                            ctx.sql
+                        ),
                         None,
                         &[],
                     )
@@ -1338,7 +1428,12 @@ pub(crate) fn create_reflex_ivm_impl(
             } else {
                 client
                     .update(
-                        &format!("{} {} AS {}", create_kw, quote_identifier(view_name), sql),
+                        &format!(
+                            "{} {} AS {}",
+                            create_kw,
+                            quote_identifier(ctx.view_name),
+                            ctx.sql
+                        ),
                         None,
                         &[],
                     )
@@ -1347,16 +1442,17 @@ pub(crate) fn create_reflex_ivm_impl(
             // ANALYZE so the query planner has statistics for the new table
             client
                 .update(
-                    &format!("ANALYZE {}", quote_identifier(view_name)),
+                    &format!("ANALYZE {}", quote_identifier(ctx.view_name)),
                     None,
                     &[],
                 )
                 .unwrap_or_report();
 
             // Create unique index on target for resolved unique key columns
-            if !resolved_unique_columns.is_empty() {
-                let bare_view = split_qualified_name(view_name).1;
-                let uk_cols: Vec<String> = resolved_unique_columns
+            if !ctx.resolved_unique_columns.is_empty() {
+                let bare_view = split_qualified_name(ctx.view_name).1;
+                let uk_cols: Vec<String> = ctx
+                    .resolved_unique_columns
                     .iter()
                     .map(|c| format!("\"{}\"", c))
                     .collect();
@@ -1365,7 +1461,7 @@ pub(crate) fn create_reflex_ivm_impl(
                         &format!(
                             "CREATE UNIQUE INDEX IF NOT EXISTS \"__reflex_uk_{}\" ON {} ({})",
                             bare_view,
-                            quote_identifier(view_name),
+                            quote_identifier(ctx.view_name),
                             uk_cols.join(", ")
                         ),
                         None,
@@ -1379,44 +1475,44 @@ pub(crate) fn create_reflex_ivm_impl(
             // (DELETE ... WHERE IN (SELECT FROM transition), INSERT ... SELECT FROM transition)
             // reads from a plain table, not a transition table — avoids the nested-trigger
             // transition-table-in-EXECUTE assertion.
-            for source in &froms {
+            for source in &ctx.froms {
                 if source.starts_with('<') {
                     continue;
                 }
-                for ddl in build_passthrough_scratch_ddls(view_name, source) {
+                for ddl in build_passthrough_scratch_ddls(ctx.view_name, source) {
                     client.update(&ddl, None, &[]).unwrap_or_report();
                 }
             }
         } else {
             // Aggregate: build intermediate + target tables from the plan
             let (mut column_types, not_null_cols, per_source_cols) =
-                query_column_types_from_catalog_with_per_source(client, &froms);
-            plan.optimize_not_null_sums(&not_null_cols);
+                query_column_types_from_catalog_with_per_source(client, &ctx.froms);
+            ctx.plan.optimize_not_null_sums(&not_null_cols);
             // 1.4.5 — filter `imv_relevant_columns` down to columns that
             // actually exist per source. The analyzer over-attributes bare
             // identifiers in multi-source queries to every real source as a
             // safe-correctness move; without this filter the persisted JSON
             // would name columns that don't exist on the source's transition
             // table, and the skip SQL would error at trigger fire time.
-            for (source, cols) in plan.imv_relevant_columns.iter_mut() {
+            for (source, cols) in ctx.plan.imv_relevant_columns.iter_mut() {
                 if let Some(actual) = per_source_cols.get(source) {
                     cols.retain(|c| actual.contains(c.as_str()));
                 } else if source.starts_with('<') {
                     cols.clear();
                 }
             }
-            plan.imv_relevant_columns.retain(|_, v| !v.is_empty());
+            ctx.plan.imv_relevant_columns.retain(|_, v| !v.is_empty());
 
             // Discover actual types for computed expressions by introspecting query output.
             // 1. Base query types: resolves GROUP BY expressions (DATE_TRUNC, EXTRACT, etc.)
-            let base_q_for_types = generate_base_query(&analysis, &plan);
+            let base_q_for_types = generate_base_query(&ctx.analysis, &ctx.plan);
             augment_column_types_from_query(&base_q_for_types, &mut column_types);
             // 2. Original SQL types: resolves aggregate output types (SUM(int)→BIGINT, etc.)
-            augment_column_types_from_query(sql, &mut column_types);
+            augment_column_types_from_query(ctx.sql, &mut column_types);
 
             // Fix intermediate SUM column types: use DOUBLE PRECISION instead of NUMERIC
             // when the base_query produces DOUBLE PRECISION (preserves float arithmetic path).
-            for ic in &mut plan.intermediate_columns {
+            for ic in &mut ctx.plan.intermediate_columns {
                 if ic.source_aggregate == "SUM" {
                     let base_type = resolve_column_type(&ic.name, &column_types, "").to_uppercase();
                     if base_type == "DOUBLE PRECISION" {
@@ -1431,7 +1527,7 @@ pub(crate) fn create_reflex_ivm_impl(
             // top-K array even when the actual column is TEXT[] / DATE[] /
             // TIMESTAMP[]. The schema builder already special-cases this for
             // DDL, but the trigger MERGE statements read `pg_type` directly.
-            for ic in &mut plan.intermediate_columns {
+            for ic in &mut ctx.plan.intermediate_columns {
                 if (ic.source_aggregate == "MIN" || ic.source_aggregate == "MAX")
                     && ic.pg_type.eq_ignore_ascii_case("NUMERIC")
                 {
@@ -1444,7 +1540,7 @@ pub(crate) fn create_reflex_ivm_impl(
 
             // Set cast_type on end_query_mappings so the end_query casts intermediate
             // to the correct target type (e.g., BIGINT for SUM(int)).
-            for mapping in &mut plan.end_query_mappings {
+            for mapping in &mut ctx.plan.end_query_mappings {
                 if mapping.cast_type.is_none() {
                     let discovered = resolve_column_type(&mapping.output_alias, &column_types, "");
                     if !discovered.is_empty() {
@@ -1462,21 +1558,23 @@ pub(crate) fn create_reflex_ivm_impl(
                 }
             }
 
-            if let Some(ddl) = build_intermediate_table_ddl(view_name, &plan, &column_types, logged)
+            if let Some(ddl) =
+                build_intermediate_table_ddl(ctx.view_name, &ctx.plan, &column_types, ctx.logged)
             {
-                let tbl = intermediate_table_name(view_name);
+                let tbl = intermediate_table_name(ctx.view_name);
                 client.update(&ddl, None, &[]).unwrap_or_report();
-                unlogged_tables.push(tbl);
+                ctx.unlogged_tables.push(tbl.clone());
                 // Delta scratch table: materialized intermediate for MERGE (avoids
                 // transition-table-in-EXECUTE SIGABRT). Always UNLOGGED, no indexes.
                 if let Some(scratch_ddl) =
-                    build_delta_scratch_table_ddl(view_name, &plan, &column_types)
+                    build_delta_scratch_table_ddl(ctx.view_name, &ctx.plan, &column_types)
                 {
                     client.update(&scratch_ddl, None, &[]).unwrap_or_report();
                 }
             }
 
-            let target_ddl = build_target_table_ddl(view_name, &plan, &column_types, logged);
+            let target_ddl =
+                build_target_table_ddl(ctx.view_name, &ctx.plan, &column_types, ctx.logged);
             client.update(&target_ddl, None, &[]).unwrap_or_report();
             // Note: indexes are created AFTER bulk insert for performance
 
@@ -1484,11 +1582,11 @@ pub(crate) fn create_reflex_ivm_impl(
             // of (intermediate, target) per source-side partition.  Bounds
             // are sourced live from the anchor's `pg_inherits`/`relpartbound`
             // so we cannot drift.
-            if !plan.partition_columns.is_empty() {
+            if !ctx.plan.partition_columns.is_empty() {
                 match crate::partition::resolve_anchor_source(
                     client,
-                    &plan.partition_columns[0],
-                    &real_source_names,
+                    &ctx.plan.partition_columns[0],
+                    &ctx.real_source_names,
                 ) {
                     Ok(anchor) => {
                         let src_children =
@@ -1496,13 +1594,14 @@ pub(crate) fn create_reflex_ivm_impl(
                         info!(
                             "pg_reflex: creating {} partition children for '{}' (anchor='{}')",
                             src_children.len(),
-                            view_name,
+                            ctx.view_name,
                             anchor
                         );
                         for src_child in &src_children {
                             let (int_ddl, tgt_ddl) =
                                 crate::partition::build_partition_child_ddl_pair(
-                                    view_name, src_child,
+                                    ctx.view_name,
+                                    src_child,
                                 );
                             client.update(&int_ddl, None, &[]).unwrap_or_report();
                             client.update(&tgt_ddl, None, &[]).unwrap_or_report();
@@ -1511,7 +1610,7 @@ pub(crate) fn create_reflex_ivm_impl(
                     Err(e) => {
                         warning!(
                             "pg_reflex: could not resolve anchor for '{}' partition children: {}",
-                            view_name,
+                            ctx.view_name,
                             e
                         );
                     }
@@ -1521,14 +1620,14 @@ pub(crate) fn create_reflex_ivm_impl(
 
         // CREATE consolidated triggers on source tables (one set per source, shared by all IMVs).
         // Skip if triggers already exist on this source (another IMV already created them).
-        for source in &froms {
+        for source in &ctx.froms {
             if source.starts_with("<subquery:") || source.starts_with("<function:") {
                 warning!(
                     "pg_reflex: source '{}' for '{}' is a subquery — \
                      triggers are created on the underlying tables inside the subquery, \
                      but the subquery itself is re-executed on each delta",
                     source,
-                    view_name
+                    ctx.view_name
                 );
                 continue;
             }
@@ -1541,13 +1640,14 @@ pub(crate) fn create_reflex_ivm_impl(
             // ('alp.product') and bare ('product') forms against the IMV's
             // depends_on entry.
             let (_, source_bare) = split_qualified_name(source);
-            if ignore_sources
+            if ctx
+                .ignore_sources
                 .iter()
                 .any(|s| s == source || s == source_bare)
             {
                 info!(
                     "pg_reflex: skipping trigger install on source '{}' for IMV '{}' (ignored)",
-                    source, view_name
+                    source, ctx.view_name
                 );
                 continue;
             }
@@ -1590,7 +1690,7 @@ pub(crate) fn create_reflex_ivm_impl(
                 .next()
                 .is_some();
 
-            if deferred {
+            if ctx.deferred {
                 // Deferred mode: create staging table if not exists
                 let staging_ddl = build_staging_table_ddl(source);
                 client.update(&staging_ddl, None, &[]).unwrap_or_report();
@@ -1599,7 +1699,7 @@ pub(crate) fn create_reflex_ivm_impl(
             if !trig_exists {
                 // Choose trigger type: if ANY deferred IMV exists on this source,
                 // use deferred triggers (they handle both IMMEDIATE and DEFERRED IMVs).
-                let has_any_deferred = deferred
+                let has_any_deferred = ctx.deferred
                     || {
                         let check = client
                         .select(
@@ -1626,7 +1726,7 @@ pub(crate) fn create_reflex_ivm_impl(
                         client.update(&ddl, None, &[]).unwrap_or_report();
                     }
                 }
-            } else if deferred {
+            } else if ctx.deferred {
                 // Triggers already exist — upgrade to deferred triggers
                 // (which handle both IMMEDIATE and DEFERRED IMVs)
                 for ddl in build_deferred_trigger_ddls(source) {
@@ -1636,20 +1736,21 @@ pub(crate) fn create_reflex_ivm_impl(
         }
 
         // Create deferred flush infrastructure if this IMV uses deferred mode
-        if deferred {
+        if ctx.deferred {
             for ddl in build_deferred_flush_ddl() {
                 client.update(&ddl, None, &[]).unwrap_or_report();
             }
         }
 
         // Issue 4: Add index on source GROUP BY columns for MIN/MAX recompute performance
-        let has_min_max = plan
+        let has_min_max = ctx
+            .plan
             .intermediate_columns
             .iter()
             .any(|ic| ic.source_aggregate == "MIN" || ic.source_aggregate == "MAX");
-        if has_min_max && !plan.group_by_columns.is_empty() {
-            for source in &froms {
-                if source.starts_with('<') || ivm_froms.contains(source) {
+        if has_min_max && !ctx.plan.group_by_columns.is_empty() {
+            for source in &ctx.froms {
+                if source.starts_with('<') || ctx.ivm_froms.contains(source) {
                     continue;
                 }
                 // Only index columns that actually exist on this source table
@@ -1668,7 +1769,8 @@ pub(crate) fn create_reflex_ivm_impl(
                     .filter_map(|row| row.get_by_name::<&str, _>("column_name").unwrap_or(None).map(|s| s.to_lowercase()))
                     .collect();
 
-                let idx_cols: Vec<String> = plan
+                let idx_cols: Vec<String> = ctx
+                    .plan
                     .group_by_columns
                     .iter()
                     .map(|c| normalized_column_name(c))
@@ -1680,7 +1782,7 @@ pub(crate) fn create_reflex_ivm_impl(
                     continue;
                 }
                 let safe_src = source.replace('.', "_");
-                let bare_view = split_qualified_name(view_name).1;
+                let bare_view = split_qualified_name(ctx.view_name).1;
                 let idx_name = safe_identifier(&format!("__reflex_idx_{}_{}", bare_view, safe_src));
                 let ddl = format!(
                     "CREATE INDEX IF NOT EXISTS \"{}\" ON {} ({})",
@@ -1693,15 +1795,15 @@ pub(crate) fn create_reflex_ivm_impl(
         }
 
         // Generate decomposed queries and metadata
-        let base_query = if plan.is_passthrough {
-            sql.to_string() // Passthrough: base_query = original SQL verbatim
+        let base_query = if ctx.plan.is_passthrough {
+            ctx.sql.to_string() // Passthrough: base_query = original SQL verbatim
         } else {
-            generate_base_query(&analysis, &plan)
+            generate_base_query(&ctx.analysis, &ctx.plan)
         };
-        let end_query = if plan.is_passthrough {
+        let end_query = if ctx.plan.is_passthrough {
             String::new() // Passthrough: no intermediate → target stage
         } else {
-            generate_end_query(view_name, &plan)
+            generate_end_query(ctx.view_name, &ctx.plan)
         };
         // 1.4.5 — `imv_relevant_columns` carries a possibly-over-inclusive
         // set of columns per source (the analyzer conservatively attributes
@@ -1711,13 +1813,14 @@ pub(crate) fn create_reflex_ivm_impl(
         // that doesn't exist on the source is simply ignored — no need to
         // filter at IMV-create time, which would have to compete with
         // catalog snapshot visibility for the just-created source table.
-        let aggregations_json = generate_aggregations_json(&plan);
-        let index_columns: Vec<String> = plan
+        let aggregations_json = generate_aggregations_json(&ctx.plan);
+        let index_columns: Vec<String> = ctx
+            .plan
             .group_by_columns
             .iter()
-            .chain(plan.distinct_columns.iter())
+            .chain(ctx.plan.distinct_columns.iter())
             .map(|c| {
-                if let Some(alias) = plan.group_by_aliases.get(c) {
+                if let Some(alias) = ctx.plan.group_by_aliases.get(c) {
                     normalized_column_name(alias)
                 } else {
                     normalized_column_name(c)
@@ -1726,76 +1829,81 @@ pub(crate) fn create_reflex_ivm_impl(
             .collect();
 
         // INSERT into reference table
-        let depends_on: Vec<String> = froms.clone();
-        let depends_on_imv: Vec<String> = ivm_froms.clone();
+        let depends_on: Vec<String> = ctx.froms.clone();
+        let depends_on_imv: Vec<String> = ctx.ivm_froms.clone();
 
         // Store the WHERE predicate for predicate-filtered trigger skip.
         // Only safe for single-source queries: multi-table WHERE clauses may reference
         // joined tables whose columns are not available in the trigger transition table.
+        let real_sources: Vec<&String> = ctx.real_source_names.iter().collect();
         let where_predicate: String = if real_sources.len() <= 1 {
-            analysis.where_clause.clone().unwrap_or_default()
+            ctx.analysis.where_clause.clone().unwrap_or_default()
         } else {
             String::new()
         };
 
-        let ignored_sources_vec: Vec<String> = ignore_sources.to_vec();
+        let ignored_sources_vec: Vec<String> = ctx.ignore_sources.to_vec();
         insert_registry_row(
             client,
             &RegistryRow {
-                view_name,
-                graph_depth: depth,
+                view_name: ctx.view_name,
+                graph_depth: ctx.depth,
                 depends_on: &depends_on,
                 depends_on_imv: &depends_on_imv,
-                unlogged_tables: &unlogged_tables,
+                unlogged_tables: &ctx.unlogged_tables,
                 graph_child: &[],
-                sql_query: sql,
+                sql_query: ctx.sql,
                 base_query: &base_query,
                 end_query: &end_query,
                 aggregations_json: &aggregations_json,
                 aggregations_cast: AggregationsCast::Jsonb,
                 index_columns: &index_columns,
-                unique_columns: &resolved_unique_columns,
-                storage_mode: &storage_upper,
-                refresh_mode: &mode_upper,
+                unique_columns: &ctx.resolved_unique_columns,
+                storage_mode: &ctx.storage_upper,
+                refresh_mode: &ctx.mode_upper,
                 where_predicate: Some(&where_predicate),
                 ignored_sources: Some(&ignored_sources_vec),
-                partition_columns: Some(&plan.partition_columns),
-                partition_strategy: Some(&plan.partition_strategy),
+                partition_columns: Some(&ctx.plan.partition_columns),
+                partition_strategy: Some(&ctx.plan.partition_strategy),
             },
         )
         .unwrap_or_report();
 
         // Update source IMVs with the new child in their graph_child field
-        add_graph_child_links(client, view_name, &ivm_froms).unwrap_or_report();
+        add_graph_child_links(client, ctx.view_name, &ctx.ivm_froms).unwrap_or_report();
 
         // Initial materialization (skip for passthrough — CREATE TABLE AS already populated)
-        if !plan.is_passthrough {
-            let intermediate_tbl = intermediate_table_name(view_name);
-            let base_q = generate_base_query(&analysis, &plan);
+        if !ctx.plan.is_passthrough {
+            let intermediate_tbl = intermediate_table_name(ctx.view_name);
+            let base_q = generate_base_query(&ctx.analysis, &ctx.plan);
             let initial_insert = format!("INSERT INTO {} {}", intermediate_tbl, base_q);
             client.update(&initial_insert, None, &[]).unwrap_or_report();
 
-            let target_insert =
-                format!("INSERT INTO {} {}", quote_identifier(view_name), end_query);
+            let target_insert = format!(
+                "INSERT INTO {} {}",
+                quote_identifier(ctx.view_name),
+                end_query
+            );
             client.update(&target_insert, None, &[]).unwrap_or_report();
 
             // Create indexes AFTER bulk insert (much faster than indexing during insert)
-            for index_ddl in build_indexes_ddl(view_name, &plan) {
+            for index_ddl in build_indexes_ddl(ctx.view_name, &ctx.plan) {
                 client.update(&index_ddl, None, &[]).unwrap_or_report();
             }
 
             // Create persistent affected-groups table (avoids DROP+CREATE per trigger fire).
             // Uses UNLOGGED for speed; lost on crash but rebuilt by reflex_reconcile.
             // Co-located in the IMV's schema (1.4.1) so SQL works under any `search_path`.
-            if !plan.group_by_columns.is_empty() || !plan.distinct_columns.is_empty() {
-                let group_cols_csv = plan
+            if !ctx.plan.group_by_columns.is_empty() || !ctx.plan.distinct_columns.is_empty() {
+                let group_cols_csv = ctx
+                    .plan
                     .group_by_columns
                     .iter()
-                    .chain(plan.distinct_columns.iter())
+                    .chain(ctx.plan.distinct_columns.iter())
                     .map(|c| format!("\"{}\"", normalized_column_name(c)))
                     .collect::<Vec<_>>()
                     .join(", ");
-                let affected_ref = affected_groups_table_name(view_name);
+                let affected_ref = affected_groups_table_name(ctx.view_name);
                 client
                     .update(
                         &format!(
@@ -1813,9 +1921,9 @@ pub(crate) fn create_reflex_ivm_impl(
                 // to groups whose heap actually shrank below K. Provisioned only
                 // when the plan has any top-K column; non-top-K IMVs leave it
                 // unallocated.
-                let has_topk = plan.intermediate_columns.iter().any(|ic| ic.has_topk());
+                let has_topk = ctx.plan.intermediate_columns.iter().any(|ic| ic.has_topk());
                 if has_topk {
-                    let shrunk_ref = shrunk_groups_table_name(view_name);
+                    let shrunk_ref = shrunk_groups_table_name(ctx.view_name);
                     client
                         .update(
                             &format!(
@@ -1836,7 +1944,7 @@ pub(crate) fn create_reflex_ivm_impl(
                 .unwrap_or_report();
             client
                 .update(
-                    &format!("ANALYZE {}", quote_identifier(view_name)),
+                    &format!("ANALYZE {}", quote_identifier(ctx.view_name)),
                     None,
                     &[],
                 )
@@ -1850,20 +1958,20 @@ pub(crate) fn create_reflex_ivm_impl(
             // MERGE codegen would emit `IS NOT DISTINCT FROM` on the
             // composite-index leading column, defeating the index — the
             // 405 s yse.ivm_sop_forecast_view regression in 1.4.4.
-            let probed_nn = probe_not_null_columns_from_data(client, &intermediate_tbl, &plan);
+            let probed_nn = probe_not_null_columns_from_data(client, &intermediate_tbl, &ctx.plan);
             let new_cols: Vec<String> = probed_nn
                 .into_iter()
-                .filter(|c| !plan.not_null_columns.contains(c))
+                .filter(|c| !ctx.plan.not_null_columns.contains(c))
                 .collect();
             if !new_cols.is_empty() {
                 for c in &new_cols {
-                    plan.not_null_columns.insert(c.clone());
+                    ctx.plan.not_null_columns.insert(c.clone());
                 }
-                persist_probed_not_null_columns(client, view_name, &new_cols);
+                persist_probed_not_null_columns(client, ctx.view_name, &new_cols);
                 info!(
                     "pg_reflex: data-probe added {} effectively-NOT-NULL column(s) to '{}': {:?}",
                     new_cols.len(),
-                    view_name,
+                    ctx.view_name,
                     new_cols
                 );
             }
