@@ -1173,41 +1173,12 @@ fn cleanup_orphan_swap_tables(view_name: &str) {
     });
 }
 
-/// Replace bare-identifier occurrences of `ident` in `expr` with `replacement`.
-/// Case-insensitive, only matches whole words (alphanumeric/underscore
-/// boundaries).  Used to substitute a partition column with a literal value
-/// inside `pg_get_partition_constraintdef` output.
-fn substitute_identifier(expr: &str, ident: &str, replacement: &str) -> String {
-    let bytes = expr.as_bytes();
-    let lower_ident = ident.to_lowercase();
-    let mut out = String::with_capacity(expr.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        let c = bytes[i] as char;
-        if c.is_ascii_alphabetic() || c == '_' {
-            // word start
-            let start = i;
-            while i < bytes.len() {
-                let cc = bytes[i] as char;
-                if cc.is_ascii_alphanumeric() || cc == '_' {
-                    i += 1;
-                } else {
-                    break;
-                }
-            }
-            let word = &expr[start..i];
-            if word.to_lowercase() == lower_ident {
-                out.push_str(replacement);
-            } else {
-                out.push_str(word);
-            }
-        } else {
-            out.push(c);
-            i += 1;
-        }
-    }
-    out
-}
+// Phase 1 (plans/1_6_1_refacto.md) — `substitute_identifier` is a re-export
+// of the canonical implementation in
+// [`crate::sql_writer::identifier::substitute_identifier_ci`]. Existing call
+// sites and `unit_partition.rs` tests continue to compile against the
+// original name.
+use crate::sql_writer::identifier::substitute_identifier_ci as substitute_identifier;
 
 #[cfg(test)]
 #[path = "tests/unit_partition.rs"]

@@ -12,9 +12,8 @@ use crate::aggregation::AggregationPlan;
 use crate::query_decomposer::{
     affected_groups_table_name, delta_scratch_table_name, intermediate_table_name,
     normalized_column_name, passthrough_scratch_new_table_name, passthrough_scratch_old_table_name,
-    quote_identifier, replace_identifier, shrunk_groups_table_name, split_qualified_name,
-    staging_delta_table_name, strip_redundant_bare_alias, transition_new_table_name,
-    transition_old_table_name,
+    quote_identifier, shrunk_groups_table_name, split_qualified_name, staging_delta_table_name,
+    transition_new_table_name, transition_old_table_name,
 };
 
 /// Per-backend cache of built delta SQL keyed by a hash of all inputs.
@@ -924,41 +923,11 @@ fn row_expr(cols: &[String]) -> String {
     }
 }
 
-/// Replace a source table reference in a base_query with a transition table name.
-/// Handles both schema-qualified names (e.g., `alp.sales_simulation` in FROM)
-/// and bare table names used as column qualifiers (e.g., `sales_simulation.product_id`).
-fn replace_source_with_transition(
-    base_query: &str,
-    source_table: &str,
-    transition_tbl: &str,
-) -> String {
-    // `transition_tbl` is either a bare safe-identifier (real transition table
-    // alias like `__reflex_new_<src>`) or an already-quoted/qualified ref like
-    // `"schema"."__reflex_pt_new_v_s"`. Quote bare names; pass refs through.
-    let quoted_tbl = if transition_tbl.contains('"') {
-        transition_tbl.to_string()
-    } else {
-        format!("\"{}\"", transition_tbl)
-    };
-    // Pre-pass: strip a redundant `AS <bare>` alias when the user aliased the
-    // schema-qualified source with its bare name. Without this, step 2 below
-    // would rewrite `<bare>.col` qualifiers to `<transition_tbl>.col` — but PG
-    // treats the explicit alias as hiding the underlying table's own name, so
-    // those rewritten qualifiers would fail to resolve.
-    let stripped = strip_redundant_bare_alias(base_query, source_table);
-    // Use word-boundary-aware replacement to avoid corrupting column names
-    // that contain the source table name as a substring (e.g., __bool_or_flag
-    // contains "bo" when the source table is "bo").
-    let replaced = replace_identifier(&stripped, source_table, &quoted_tbl);
-    // Also replace unqualified table name in column qualifiers
-    let (_, bare_source) = split_qualified_name(source_table);
-    if bare_source != source_table {
-        // Only needed when source_table was schema-qualified
-        replace_identifier(&replaced, bare_source, &quoted_tbl)
-    } else {
-        replaced
-    }
-}
+// Phase 1 (plans/1_6_1_refacto.md) — `replace_source_with_transition` is now
+// a re-export of the canonical implementation in
+// [`crate::sql_writer::identifier::replace_source_with_transition`]. Existing
+// call sites in this file (and `unit_trigger.rs` tests) compile unchanged.
+use crate::sql_writer::identifier::replace_source_with_transition;
 
 /// Push MERGE + affected-groups population.
 /// PG17+: single CTE with MERGE RETURNING (captures affected groups in one statement).

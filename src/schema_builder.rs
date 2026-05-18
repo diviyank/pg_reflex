@@ -7,6 +7,7 @@ use crate::query_decomposer::{
     safe_identifier, split_qualified_name, staging_delta_table_name, transition_new_table_name,
     transition_old_table_name,
 };
+use crate::sql_writer::{slot_replace, CreateIndex, CreateTable};
 
 /// Returns the SQL column definition list shared by the intermediate and delta scratch tables.
 /// Returns None if no intermediate table is needed (no aggregation, no group by, no distinct).
@@ -112,17 +113,12 @@ pub fn build_intermediate_table_ddl(
 ) -> Option<String> {
     let columns = intermediate_column_spec(plan, column_types)?;
     let table_name = intermediate_table_name(view_name);
-    let columns_sql = columns.join(",\n");
 
     // No inline PRIMARY KEY — we use a hash index for O(1) lookups instead.
     // The B-tree PK is redundant because MERGE handles insert-or-update correctly,
     // the delta query uses GROUP BY (unique output), and advisory locks prevent
     // concurrent MERGEs on the same IMV.
-    let create_prefix = if logged {
-        "CREATE TABLE"
-    } else {
-        "CREATE UNLOGGED TABLE"
-    };
+    //
     // fillfactor=70 leaves 30% slack on every heap page so MERGE WHEN
     // MATCHED UPDATE (which only rewrites aggregate columns — none are
     // indexed) can fit the new tuple version on the same page → HOT
@@ -136,21 +132,20 @@ pub fn build_intermediate_table_ddl(
     // do, and each child inherits fillfactor on creation via the parent's
     // reloptions).  We therefore omit the WITH clause on the parent when
     // partitioning and let each child set fillfactor at PARTITION OF time.
+    let mut builder = CreateTable::new(table_name)
+        .unlogged(!logged)
+        .if_not_exists(true)
+        .columns(columns);
     if !plan.partition_columns.is_empty() && !plan.partition_strategy.is_empty() {
         let part = crate::partition::build_partition_by_clause(
             &plan.partition_strategy,
             &plan.partition_columns,
         );
-        Some(format!(
-            "{} IF NOT EXISTS {} (\n{}\n) {}",
-            create_prefix, table_name, columns_sql, part
-        ))
+        builder = builder.partition_by(part);
     } else {
-        Some(format!(
-            "{} IF NOT EXISTS {} (\n{}\n) WITH (fillfactor=70)",
-            create_prefix, table_name, columns_sql
-        ))
+        builder = builder.with_options("fillfactor=70");
     }
+    Some(builder.build())
 }
 
 /// Build the DDL for the per-IMV UNLOGGED delta scratch table.
@@ -169,11 +164,13 @@ pub fn build_delta_scratch_table_ddl(
 ) -> Option<String> {
     let columns = intermediate_column_spec(plan, column_types)?;
     let table_name = delta_scratch_table_name(view_name);
-    let columns_sql = columns.join(",\n");
-    Some(format!(
-        "CREATE UNLOGGED TABLE IF NOT EXISTS {} (\n{}\n)",
-        table_name, columns_sql
-    ))
+    Some(
+        CreateTable::new(table_name)
+            .unlogged(true)
+            .if_not_exists(true)
+            .columns(columns)
+            .build(),
+    )
 }
 
 /// Build the DDL for the target (materialized view result) table.
@@ -264,13 +261,6 @@ pub fn build_target_table_ddl(
         }
     }
 
-    let columns_sql = columns.join(",\n");
-
-    let create_prefix = if logged {
-        "CREATE TABLE"
-    } else {
-        "CREATE UNLOGGED TABLE"
-    };
     // fillfactor=70: same rationale as build_intermediate_table_ddl.
     // Target MERGE WHEN MATCHED UPDATE rewrites only the end-query
     // aggregate columns; group_by columns (which are the only
@@ -279,26 +269,20 @@ pub fn build_target_table_ddl(
     //
     // Partitioned IMVs emit `PARTITION BY` on the parent and skip
     // fillfactor (see build_intermediate_table_ddl note).
+    let mut builder = CreateTable::quoted_name(view_name)
+        .unlogged(!logged)
+        .if_not_exists(true)
+        .columns(columns);
     if !plan.partition_columns.is_empty() && !plan.partition_strategy.is_empty() {
         let part = crate::partition::build_partition_by_clause(
             &plan.partition_strategy,
             &plan.partition_columns,
         );
-        format!(
-            "{} IF NOT EXISTS {} (\n{}\n) {}",
-            create_prefix,
-            quote_identifier(view_name),
-            columns_sql,
-            part
-        )
+        builder = builder.partition_by(part);
     } else {
-        format!(
-            "{} IF NOT EXISTS {} (\n{}\n) WITH (fillfactor=70)",
-            create_prefix,
-            quote_identifier(view_name),
-            columns_sql
-        )
+        builder = builder.with_options("fillfactor=70");
     }
+    builder.build()
 }
 
 /// Build index DDL statements for the intermediate and target tables.
@@ -338,21 +322,15 @@ pub fn build_indexes_ddl(view_name: &str, plan: &AggregationPlan) -> Vec<String>
             // prefix instead of seq-scanning the intermediate. For
             // single-column groups, hash is the optimal lookup but doesn't
             // support uniqueness — keep it non-unique.
+            let mut builder = CreateIndex::quoted_name(&idx_name, table_name.clone())
+                .if_not_exists(true)
+                .columns(idx_cols.clone());
             if idx_cols.len() == 1 {
-                indexes.push(format!(
-                    "CREATE INDEX IF NOT EXISTS \"{}\" ON {} USING hash ({})",
-                    idx_name,
-                    table_name,
-                    idx_cols.join(", ")
-                ));
+                builder = builder.using("hash");
             } else {
-                indexes.push(format!(
-                    "CREATE UNIQUE INDEX IF NOT EXISTS \"{}\" ON {} ({}) NULLS NOT DISTINCT",
-                    idx_name,
-                    table_name,
-                    idx_cols.join(", ")
-                ));
+                builder = builder.unique(true).nulls_not_distinct(true);
             }
+            indexes.push(builder.build());
         }
     }
 
@@ -381,12 +359,12 @@ pub fn build_indexes_ddl(view_name: &str, plan: &AggregationPlan) -> Vec<String>
             })
             .collect();
         let idx_name = safe_identifier(&format!("idx__reflex_target_{}", bare_view));
-        indexes.push(format!(
-            "CREATE INDEX IF NOT EXISTS \"{}\" ON {} ({})",
-            idx_name,
-            target_tbl,
-            group_cols.join(", ")
-        ));
+        indexes.push(
+            CreateIndex::quoted_name(&idx_name, target_tbl)
+                .if_not_exists(true)
+                .columns(group_cols)
+                .build(),
+        );
     }
 
     indexes
@@ -420,7 +398,12 @@ pub fn build_trigger_ddls(source_table: &str) -> Vec<String> {
         .next_back()
         .unwrap_or(source_table)
         .to_string();
-    // 1.4.5 — Filter-aware spurious-skip (UPDATE only).
+    // 1.4.5 — Filter-aware spurious-skip (UPDATE only). See
+    // sql/trigger_body.plpgsql.in for the relocated main body; this sub-
+    // template is spliced in at the `__REFLEX_SLOT_FILTER_SKIP_BLOCK__`
+    // sentinel.  References to the source / OLD / NEW transition tables
+    // are themselves `__REFLEX_SLOT_*__` slots that we substitute up-front
+    // (they are static per build_trigger_ddls call).
     //
     // The IMV's aggregations JSON carries two per-source maps:
     //   * imv_relevant_columns[source] — columns of `source` that the IMV
@@ -451,38 +434,13 @@ pub fn build_trigger_ddls(source_table: &str) -> Vec<String> {
     // with `column "X" does not exist`. The skip-check then runs on a
     // subset and may be conservative (i.e. doesn't skip) — that's safe;
     // it never produces wrong results.
-    let filter_skip_block_for_update = format!(
-        "SELECT string_agg( \
-              CASE WHEN t.typname IN ('json','xml') \
-                   THEN format('%I::text', sel.col) \
-                   ELSE format('%I', sel.col) \
-              END, \
-              ', ' ORDER BY sel.col) \
-              INTO _skip_cols \
-              FROM jsonb_array_elements_text( \
-                   COALESCE(_rec.aggregations::jsonb->'imv_relevant_columns'->'{source_table}', '[]'::jsonb) \
-              ) AS sel(col) \
-              JOIN pg_attribute a \
-                ON a.attname = sel.col \
-               AND a.attrelid = '{source_table}'::regclass \
-               AND a.attnum > 0 AND NOT a.attisdropped \
-              JOIN pg_type t ON t.oid = a.atttypid; \
-         IF _skip_cols IS NOT NULL AND _skip_cols <> '' THEN \
-           _skip_pred := _rec.aggregations::jsonb->'imv_relevant_where'->>'{source_table}'; \
-           IF _skip_pred IS NULL OR _skip_pred = '' THEN \
-             _skip_pred_clause := ''; \
-           ELSE \
-             _skip_pred_clause := ' WHERE ' || _skip_pred; \
-           END IF; \
-           _skip_sql := format( \
-             'WITH _o AS (SELECT %s FROM %I%s), _n AS (SELECT %s FROM %I%s) ' \
-             || 'SELECT NOT EXISTS(TABLE _o EXCEPT ALL TABLE _n) AND NOT EXISTS(TABLE _n EXCEPT ALL TABLE _o)', \
-             _skip_cols, '{ref_old}', _skip_pred_clause, \
-             _skip_cols, '{ref_new}', _skip_pred_clause \
-           ); \
-           EXECUTE _skip_sql INTO _filter_skip; \
-           IF _filter_skip THEN CONTINUE; END IF; \
-         END IF;"
+    let filter_skip_block_for_update = slot_replace(
+        include_str!("../sql/trigger_filter_skip_block.plpgsql.in"),
+        &[
+            ("__REFLEX_SLOT_SOURCE_TABLE__", source_table),
+            ("__REFLEX_SLOT_REF_OLD__", &ref_old),
+            ("__REFLEX_SLOT_REF_NEW__", &ref_new),
+        ],
     );
 
     // Item α (2026-05-15) — Directional UPDATE dispatch.
@@ -512,19 +470,12 @@ pub fn build_trigger_ddls(source_table: &str) -> Vec<String> {
     // string. Regular INSERT triggers (true source INSERTs, not Item α
     // promotions) stay on op='INSERT' and always take MERGE because new
     // fact rows can legitimately aggregate into existing groups.
-    let directional_probe_for_update = format!(
-        "_directional_op := 'UPDATE'; \
-         IF _skip_cols IS NOT NULL AND _skip_cols <> '' THEN \
-           EXECUTE format('SELECT EXISTS(SELECT 1 FROM %I%s LIMIT 1)', \
-                          '{ref_old}', _skip_pred_clause) INTO _old_has; \
-           EXECUTE format('SELECT EXISTS(SELECT 1 FROM %I%s LIMIT 1)', \
-                          '{ref_new}', _skip_pred_clause) INTO _new_has; \
-           IF (NOT _old_has) AND _new_has THEN \
-             _directional_op := 'INSERT_PROMOTED'; \
-           ELSIF _old_has AND (NOT _new_has) THEN \
-             _directional_op := 'DELETE_PROMOTED'; \
-           END IF; \
-         END IF;"
+    let directional_probe_for_update = slot_replace(
+        include_str!("../sql/trigger_directional_probe.plpgsql.in"),
+        &[
+            ("__REFLEX_SLOT_REF_OLD__", &ref_old),
+            ("__REFLEX_SLOT_REF_NEW__", &ref_new),
+        ],
     );
 
     // The where_predicate early-skip needs op-aware semantics:
@@ -533,89 +484,28 @@ pub fn build_trigger_ddls(source_table: &str) -> Vec<String> {
     //   * UPDATE trigger sees BOTH — must skip ONLY if neither side has a
     //     passing row. A NEW-only check would incorrectly skip rows leaving
     //     the IMV's filter (status flips out of whitelist → IMV must delete
-    //     that row's contribution). {pred_check_block} substitutes the
-    //     correct op-specific SQL.
+    //     that row's contribution). The __REFLEX_SLOT_PRED_CHECK_BLOCK__
+    //     in the main body picks the correct op-specific SQL.
     //
-    // 1.4.6 — Path B pre-scratch dispatch.
-    //
-    // `_path_b_dispatch_block` runs AFTER the filter checks and the Item α
-    // directional probe but BEFORE the call to reflex_build_delta_sql. It
-    // estimates whether the volume of mutations (|transition| / |source|)
-    // is high enough that a full reconcile beats the standard incremental
-    // path's scratch fill. If the per-IMV `wipe_threshold` (or session GUC,
-    // or compiled default) is exceeded, we dispatch to reflex_reconcile
-    // and CONTINUE to the next IMV, skipping reflex_build_delta_sql
-    // entirely.
-    //
-    // Failure mode: any catalog or stats query failure (source dropped,
-    // missing reltuples, divide-by-zero on a brand-new table) falls
-    // through silently to the standard codegen — safe.
-    //
-    // Note: this fires BEFORE bulk-INSERT / bulk-DELETE in trigger.rs. For
-    // small dim flips (the alp A4 case at 1/28 = 3.6 %), the ratio is
-    // well below threshold → no dispatch → bulk path runs. For sweeping
-    // updates of the dim or fact (e.g., 40M out of 76M fact rows), the
-    // ratio clears threshold → reconcile is the cheaper choice.
-    let body_core = format!(
-        "DECLARE _rec RECORD; _sql TEXT; _stmt TEXT; _has_rows BOOLEAN; _pred_match BOOLEAN; \
-                 _skip_cols TEXT; _skip_pred TEXT; _skip_pred_clause TEXT; _skip_sql TEXT; _filter_skip BOOLEAN; \
-                 _old_has BOOLEAN; _new_has BOOLEAN; _directional_op TEXT; \
-                 _pre_trans_count BIGINT; _pre_src_total BIGINT; _pre_thr NUMERIC; _pre_per_imv NUMERIC; _pre_ratio NUMERIC; \
-         BEGIN \
-           SELECT EXISTS(SELECT 1 FROM \"{{transition_tbl}}\" LIMIT 1) INTO _has_rows; \
-           IF NOT _has_rows THEN RETURN NULL; END IF; \
-           FOR _rec IN \
-             SELECT name, base_query, end_query, aggregations::text AS aggregations, where_predicate, ignored_sources \
-             FROM public.__reflex_ivm_reference \
-             WHERE '{source_table}' = ANY(depends_on) AND enabled = TRUE \
-             ORDER BY graph_depth, name \
-           LOOP \
-             IF _rec.ignored_sources IS NOT NULL AND ('{source_table}' = ANY(_rec.ignored_sources) OR '{bare_source}' = ANY(_rec.ignored_sources)) THEN CONTINUE; END IF; \
-             {{pred_check_block}} \
-             {{filter_skip_block}} \
-             {{directional_probe_block}} \
-             BEGIN \
-               SELECT reltuples::BIGINT INTO _pre_src_total FROM pg_class WHERE oid = '{source_table}'::regclass; \
-               IF _pre_src_total IS NOT NULL AND _pre_src_total >= 1000 THEN \
-                 EXECUTE format('SELECT count(*) FROM %I', '{{transition_tbl}}') INTO _pre_trans_count; \
-                 SELECT wipe_threshold INTO _pre_per_imv FROM public.__reflex_ivm_reference WHERE name = _rec.name; \
-                 _pre_thr := COALESCE(_pre_per_imv, current_setting('reflex.wipe_threshold', true)::NUMERIC, 0.5); \
-                 _pre_ratio := _pre_trans_count::NUMERIC / _pre_src_total; \
-                 IF _pre_ratio >= _pre_thr THEN \
-                   RAISE DEBUG 'pg_reflex Path B: dispatching % to reconcile (ratio=% thr=%)', _rec.name, _pre_ratio, _pre_thr; \
-                   PERFORM public.reflex_reconcile(_rec.name); \
-                   CONTINUE; \
-                 END IF; \
-               END IF; \
-             EXCEPTION WHEN OTHERS THEN NULL; END; \
-             {{path_c_block}} \
-             PERFORM pg_advisory_xact_lock(hashtext(_rec.name), hashtext(reverse(_rec.name))); \
-             _sql := public.reflex_build_delta_sql(_rec.name, '{source_table}', {{op_value}}, _rec.base_query, _rec.end_query, _rec.aggregations, _rec.base_query); \
-             IF _sql <> '' THEN \
-               FOREACH _stmt IN ARRAY string_to_array(_sql, E'\\n--<<REFLEX_SEP>>--\\n') LOOP \
-                 IF _stmt <> '' THEN EXECUTE _stmt; END IF; \
-               END LOOP; \
-             END IF; \
-           END LOOP; \
-           RETURN NULL; \
-         END;"
-    );
+    // 1.4.6 — Path B pre-scratch dispatch.  Static SQL in
+    // sql/trigger_body.plpgsql.in handles the |transition| / |source| ratio
+    // check; the per-IMV `wipe_threshold` override is read at runtime from
+    // `public.__reflex_ivm_reference`.
 
     // Op-specific where-predicate early-skip blocks.
+    let pred_check_one_tpl = include_str!("../sql/trigger_pred_check_one.plpgsql.in");
     let pred_check_one = |tbl: &str| -> String {
-        format!(
-            "IF _rec.where_predicate IS NOT NULL THEN \
-               EXECUTE format('SELECT EXISTS(SELECT 1 FROM %I WHERE %s LIMIT 1)', '{tbl}', _rec.where_predicate) INTO _pred_match; \
-               IF NOT _pred_match THEN CONTINUE; END IF; \
-             END IF;"
+        slot_replace(
+            pred_check_one_tpl,
+            &[("__REFLEX_SLOT_TRANSITION_TBL__", tbl)],
         )
     };
-    let pred_check_two = format!(
-        "IF _rec.where_predicate IS NOT NULL THEN \
-           EXECUTE format('SELECT EXISTS(SELECT 1 FROM %I WHERE %s LIMIT 1) OR EXISTS(SELECT 1 FROM %I WHERE %s LIMIT 1)', \
-                          '{ref_new}', _rec.where_predicate, '{ref_old}', _rec.where_predicate) INTO _pred_match; \
-           IF NOT _pred_match THEN CONTINUE; END IF; \
-         END IF;"
+    let pred_check_two = slot_replace(
+        include_str!("../sql/trigger_pred_check_two.plpgsql.in"),
+        &[
+            ("__REFLEX_SLOT_REF_NEW__", &ref_new),
+            ("__REFLEX_SLOT_REF_OLD__", &ref_old),
+        ],
     );
     let pred_check_ins = pred_check_one(&ref_new);
     let pred_check_del = pred_check_one(&ref_old);
@@ -627,33 +517,15 @@ pub fn build_trigger_ddls(source_table: &str) -> Vec<String> {
     // promote to INSERT_PROMOTED). For dim-source flips where Path B's
     // |transition| / |source| signal is misleading (1-row UPDATE on a
     // 28-row dim that fans out to 8.9M fact rows), Path C asks the planner
-    // for the actual scratch-fill cardinality via
-    // `reflex_should_dispatch_to_reconcile`.
+    // for the actual scratch-fill cardinality via `EXPLAIN (FORMAT JSON)`,
+    // then compares against the IMV's `wipe_threshold`.
     //
     // Wrapped in BEGIN/EXCEPTION so any failure (catalog lookup, planner
     // error on a transient transition state) falls through to the standard
     // path — safe.
-    // Path C — EXPLAIN-based fanout dispatch for INSERT_PROMOTED.
     //
-    // Path B's |transition| / |source| ratio is blind to dim-source bulk
-    // flips (e.g. alp A4: 1-row UPDATE on a 28-row dim that fans out to
-    // 8.9M fact rows — ratio 3.6%, never trips). Path C asks the planner
-    // directly via `EXPLAIN (FORMAT JSON)` of the rewritten scratch-fill
-    // SELECT, then compares against the IMV's `wipe_threshold`.
-    //
-    // The PL/pgSQL trigger runs the EXPLAIN itself because the transition
-    // tables live in the trigger's snapshot/scope; a nested-SPI Rust helper
-    // cannot see them. `reflex_build_path_c_explain_sql` returns only the
-    // rewritten SELECT; this body wraps it in EXPLAIN.
-    //
-    // Failure mode: any catalog / planner / parse error falls through to
-    // the standard incremental path via `EXCEPTION WHEN OTHERS`.
-    // Path C tries the intermediate's reltuples first (aggregate IMV), then
-    // falls back to the target table's reltuples (passthrough IMV — no
-    // intermediate). Either way the size denominator approximates "how many
-    // rows the IMV currently holds" so the est/imv ratio is meaningful.
     // Path C high-fanout response is a *smart bulk-INSERT*, not a full
-    // reconcile. The Item α INSERT_PROMOTED guarantee says the existing
+    // reconcile.  The Item α INSERT_PROMOTED guarantee says the existing
     // intermediate has zero rows for the affected group keys, so we can:
     //   1. scratch-fill (base_query with source→transition) — same JOIN
     //      cost as reconcile's INSERT INTO intermediate, but restricted
@@ -670,88 +542,42 @@ pub fn build_trigger_ddls(source_table: &str) -> Vec<String> {
     // of the surviving 7.7 M rows that didn't change, and (b) the target
     // TRUNCATE + re-read of intermediate. Measured ~110 s on alp A4 vs
     // reconcile's ~175 s vs REFRESH MV's ~155 s.
-    //
-    // For low-fanout cases (ratio < threshold), falls through to the
-    // standard bulk-INSERT path (push_bulk_insert_and_affected) where
-    // per-row index maintenance is cheap.
-    //
-    // EXCEPTION WHEN OTHERS at the outer level: any catalog / planner /
-    // EXECUTE failure falls through to the standard path.
-    let path_c_for_update = format!(
-        "IF _directional_op = 'INSERT_PROMOTED' THEN \
-           DECLARE _pc_sql TEXT; _pc_plan TEXT; _pc_est BIGINT; _pc_imv_rows BIGINT; \
-                   _pc_thr NUMERIC; _pc_per_imv NUMERIC; _pc_ratio NUMERIC; \
-                   _pc_schema TEXT; _pc_view TEXT; \
-                   _pc_int_tbl TEXT; _pc_scratch_tbl TEXT; _pc_target_qv TEXT; \
-                   _pc_idx_name TEXT; _pc_idx_def TEXT; _pc_end_q TEXT; \
-           BEGIN \
-             _pc_sql := public.reflex_build_path_c_explain_sql(_rec.name, '{source_table}'); \
-             IF _pc_sql <> '' THEN \
-               EXECUTE 'EXPLAIN (FORMAT JSON) ' || _pc_sql INTO _pc_plan; \
-               _pc_est := (_pc_plan::jsonb -> 0 -> 'Plan' ->> 'Plan Rows')::BIGINT; \
-               _pc_schema := split_part(_rec.name, '.', 1); \
-               _pc_view := split_part(_rec.name, '.', 2); \
-               _pc_int_tbl := '\"' || _pc_schema || '\".\"__reflex_intermediate_' || _pc_view || '\"'; \
-               _pc_scratch_tbl := '\"' || _pc_schema || '\".\"__reflex_scratch_' || _pc_view || '\"'; \
-               _pc_target_qv := '\"' || _pc_schema || '\".\"' || _pc_view || '\"'; \
-               BEGIN \
-                 EXECUTE format('SELECT reltuples::BIGINT FROM pg_class WHERE oid = %L::regclass', _pc_int_tbl) INTO _pc_imv_rows; \
-               EXCEPTION WHEN OTHERS THEN \
-                 _pc_imv_rows := NULL; \
-               END; \
-               IF _pc_imv_rows IS NULL OR _pc_imv_rows <= 0 THEN \
-                 BEGIN \
-                   EXECUTE format('SELECT reltuples::BIGINT FROM pg_class WHERE oid = %L::regclass', _rec.name) INTO _pc_imv_rows; \
-                 EXCEPTION WHEN OTHERS THEN \
-                   _pc_imv_rows := NULL; \
-                 END; \
-               END IF; \
-               SELECT wipe_threshold INTO _pc_per_imv FROM public.__reflex_ivm_reference WHERE name = _rec.name; \
-               _pc_thr := COALESCE(_pc_per_imv, current_setting('reflex.wipe_threshold', true)::NUMERIC, 0.5); \
-               IF _pc_imv_rows IS NOT NULL AND _pc_imv_rows > 0 AND _pc_est IS NOT NULL THEN \
-                 _pc_ratio := _pc_est::NUMERIC / _pc_imv_rows; \
-                 IF _pc_ratio >= _pc_thr THEN \
-                   RAISE DEBUG 'pg_reflex Path C smart bulk-INSERT: % (est=% imv=% ratio=% thr=%)', \
-                                _rec.name, _pc_est, _pc_imv_rows, _pc_ratio, _pc_thr; \
-                   EXECUTE format('TRUNCATE %s', _pc_scratch_tbl); \
-                   EXECUTE format('INSERT INTO %s %s', _pc_scratch_tbl, _pc_sql); \
-                   SELECT i.indexname::TEXT, i.indexdef INTO _pc_idx_name, _pc_idx_def \
-                     FROM pg_indexes i \
-                     WHERE i.schemaname = _pc_schema \
-                       AND i.tablename = '__reflex_intermediate_' || _pc_view \
-                       AND i.indexdef ILIKE '%UNIQUE%' \
-                     LIMIT 1; \
-                   IF _pc_idx_name IS NOT NULL THEN \
-                     EXECUTE format('DROP INDEX %I.%I', _pc_schema, _pc_idx_name); \
-                   END IF; \
-                   EXECUTE format('INSERT INTO %s SELECT * FROM %s', _pc_int_tbl, _pc_scratch_tbl); \
-                   IF _pc_idx_def IS NOT NULL THEN \
-                     EXECUTE _pc_idx_def; \
-                   END IF; \
-                   _pc_end_q := REPLACE(_rec.end_query, _pc_int_tbl, _pc_scratch_tbl); \
-                   EXECUTE format('INSERT INTO %s %s', _pc_target_qv, _pc_end_q); \
-                   EXECUTE format('ANALYZE %s', _pc_int_tbl); \
-                   UPDATE public.__reflex_ivm_reference SET last_update_date = NOW() WHERE name = _rec.name; \
-                   CONTINUE; \
-                 END IF; \
-               END IF; \
-             END IF; \
-           EXCEPTION WHEN OTHERS THEN \
-             RAISE WARNING 'pg_reflex Path C smart bulk-INSERT failed for %: %, falling through to standard incremental', _rec.name, SQLERRM; \
-           END; \
-         END IF;"
+    let path_c_for_update = slot_replace(
+        include_str!("../sql/trigger_path_c_block.plpgsql.in"),
+        &[("__REFLEX_SLOT_SOURCE_TABLE__", source_table)],
     );
+
+    // Static slot substitutions shared by INSERT/DELETE/UPDATE bodies.
+    let body_template = include_str!("../sql/trigger_body.plpgsql.in");
+    let render_body = |transition_tbl: &str,
+                       pred_check_block: &str,
+                       filter_skip_block: &str,
+                       directional_probe_block: &str,
+                       path_c_block: &str,
+                       op_value: &str|
+     -> String {
+        slot_replace(
+            body_template,
+            &[
+                ("__REFLEX_SLOT_SOURCE_TABLE__", source_table),
+                ("__REFLEX_SLOT_BARE_SOURCE__", &bare_source),
+                ("__REFLEX_SLOT_TRANSITION_TBL__", transition_tbl),
+                ("__REFLEX_SLOT_PRED_CHECK_BLOCK__", pred_check_block),
+                ("__REFLEX_SLOT_FILTER_SKIP_BLOCK__", filter_skip_block),
+                (
+                    "__REFLEX_SLOT_DIRECTIONAL_PROBE_BLOCK__",
+                    directional_probe_block,
+                ),
+                ("__REFLEX_SLOT_PATH_C_BLOCK__", path_c_block),
+                ("__REFLEX_SLOT_OP_VALUE__", op_value),
+            ],
+        )
+    };
 
     // INSERT
     let ins_fn = safe_identifier(&format!("__reflex_ins_trigger_on_{}", safe_source));
     let ins_trig = safe_identifier(&format!("__reflex_trigger_ins_on_{}", safe_source));
-    let ins_body = body_core
-        .replace("{transition_tbl}", &ref_new)
-        .replace("{pred_check_block}", &pred_check_ins)
-        .replace("{filter_skip_block}", "")
-        .replace("{directional_probe_block}", "")
-        .replace("{path_c_block}", "")
-        .replace("{op_value}", "'INSERT'");
+    let ins_body = render_body(&ref_new, &pred_check_ins, "", "", "", "'INSERT'");
     let ins_ddl = format!(
         "CREATE OR REPLACE FUNCTION {ins_fn}() RETURNS TRIGGER AS $fn$ {ins_body} $fn$ LANGUAGE plpgsql;\n\
          CREATE OR REPLACE TRIGGER \"{ins_trig}\" \
@@ -763,13 +589,7 @@ pub fn build_trigger_ddls(source_table: &str) -> Vec<String> {
     // DELETE
     let del_fn = safe_identifier(&format!("__reflex_del_trigger_on_{}", safe_source));
     let del_trig = safe_identifier(&format!("__reflex_trigger_del_on_{}", safe_source));
-    let del_body = body_core
-        .replace("{transition_tbl}", &ref_old)
-        .replace("{pred_check_block}", &pred_check_del)
-        .replace("{filter_skip_block}", "")
-        .replace("{directional_probe_block}", "")
-        .replace("{path_c_block}", "")
-        .replace("{op_value}", "'DELETE'");
+    let del_body = render_body(&ref_old, &pred_check_del, "", "", "", "'DELETE'");
     let del_ddl = format!(
         "CREATE OR REPLACE FUNCTION {del_fn}() RETURNS TRIGGER AS $fn$ {del_body} $fn$ LANGUAGE plpgsql;\n\
          CREATE OR REPLACE TRIGGER \"{del_trig}\" \
@@ -781,13 +601,14 @@ pub fn build_trigger_ddls(source_table: &str) -> Vec<String> {
     // UPDATE
     let upd_fn = safe_identifier(&format!("__reflex_upd_trigger_on_{}", safe_source));
     let upd_trig = safe_identifier(&format!("__reflex_trigger_upd_on_{}", safe_source));
-    let upd_body = body_core
-        .replace("{transition_tbl}", &ref_new)
-        .replace("{pred_check_block}", &pred_check_upd)
-        .replace("{filter_skip_block}", &filter_skip_block_for_update)
-        .replace("{directional_probe_block}", &directional_probe_for_update)
-        .replace("{path_c_block}", &path_c_for_update)
-        .replace("{op_value}", "_directional_op");
+    let upd_body = render_body(
+        &ref_new,
+        &pred_check_upd,
+        &filter_skip_block_for_update,
+        &directional_probe_for_update,
+        &path_c_for_update,
+        "_directional_op",
+    );
     let upd_ddl = format!(
         "CREATE OR REPLACE FUNCTION {upd_fn}() RETURNS TRIGGER AS $fn$ {upd_body} $fn$ LANGUAGE plpgsql;\n\
          CREATE OR REPLACE TRIGGER \"{upd_trig}\" \
@@ -799,21 +620,9 @@ pub fn build_trigger_ddls(source_table: &str) -> Vec<String> {
     // TRUNCATE — no REFERENCING clauses; loops over all dependent IMVs
     let trunc_fn = safe_identifier(&format!("__reflex_trunc_trigger_on_{}", safe_source));
     let trunc_trig = safe_identifier(&format!("__reflex_trigger_trunc_on_{}", safe_source));
-    let trunc_body = format!(
-        "DECLARE _rec RECORD; _stmts TEXT; \
-         BEGIN \
-           FOR _rec IN \
-             SELECT name \
-             FROM public.__reflex_ivm_reference \
-             WHERE '{source_table}' = ANY(depends_on) AND enabled = TRUE \
-             ORDER BY graph_depth, name \
-           LOOP \
-             PERFORM pg_advisory_xact_lock(hashtext(_rec.name), hashtext(reverse(_rec.name))); \
-             _stmts := public.reflex_build_truncate_sql(_rec.name); \
-             IF _stmts <> '' THEN PERFORM public.reflex_execute_separated(_stmts); END IF; \
-           END LOOP; \
-           RETURN NULL; \
-         END;"
+    let trunc_body = slot_replace(
+        include_str!("../sql/trigger_truncate_body.plpgsql.in"),
+        &[("__REFLEX_SLOT_SOURCE_TABLE__", source_table)],
     );
     let trunc_ddl = format!(
         "CREATE OR REPLACE FUNCTION {trunc_fn}() RETURNS TRIGGER AS $fn$ {trunc_body} $fn$ LANGUAGE plpgsql;\n\
@@ -839,53 +648,28 @@ pub fn build_deferred_trigger_ddls(source_table: &str) -> Vec<String> {
     let ref_old = transition_old_table_name(source_table);
     let delta_tbl = staging_delta_table_name(source_table);
 
-    // Mixed-mode body: process IMMEDIATE IMVs inline, stage deltas for DEFERRED IMVs.
-    // Early-exit if transition table is empty.
-    let body_core = format!(
-        "DECLARE _rec RECORD; _sql TEXT; _stmt TEXT; _has_deferred BOOLEAN := FALSE; _has_rows BOOLEAN; _pred_match BOOLEAN; \
-         BEGIN \
-           SELECT EXISTS(SELECT 1 FROM \"{{transition_tbl}}\" LIMIT 1) INTO _has_rows; \
-           IF NOT _has_rows THEN RETURN NULL; END IF; \
-           FOR _rec IN \
-             SELECT name, base_query, end_query, aggregations::text AS aggregations, \
-                    COALESCE(refresh_mode, 'IMMEDIATE') AS refresh_mode, where_predicate \
-             FROM public.__reflex_ivm_reference \
-             WHERE '{source_table}' = ANY(depends_on) AND enabled = TRUE \
-             ORDER BY graph_depth, name \
-           LOOP \
-             IF _rec.where_predicate IS NOT NULL THEN \
-               EXECUTE format('SELECT EXISTS(SELECT 1 FROM %I WHERE %s LIMIT 1)', '{{transition_tbl}}', _rec.where_predicate) INTO _pred_match; \
-               IF NOT _pred_match THEN CONTINUE; END IF; \
-             END IF; \
-             IF _rec.refresh_mode = 'IMMEDIATE' THEN \
-               PERFORM pg_advisory_xact_lock(hashtext(_rec.name), hashtext(reverse(_rec.name))); \
-               _sql := public.reflex_build_delta_sql(_rec.name, '{source_table}', '{{op}}', _rec.base_query, _rec.end_query, _rec.aggregations, _rec.base_query); \
-               IF _sql <> '' THEN \
-                 FOREACH _stmt IN ARRAY string_to_array(_sql, E'\\n--<<REFLEX_SEP>>--\\n') LOOP \
-                   IF _stmt <> '' THEN EXECUTE _stmt; END IF; \
-                 END LOOP; \
-               END IF; \
-             ELSE \
-               _has_deferred := TRUE; \
-             END IF; \
-           END LOOP; \
-           IF _has_deferred THEN \
-             INSERT INTO {delta_tbl} SELECT '{{op_code}}', * FROM \"{{ref_tbl}}\"; \
-             INSERT INTO public.__reflex_deferred_pending (source_table, operation) \
-               VALUES ('{source_table}', '{{op}}'); \
-           END IF; \
-           RETURN NULL; \
-         END;"
-    );
+    // Mixed-mode body for INSERT/DELETE: process IMMEDIATE IMVs inline, stage
+    // deltas for DEFERRED IMVs.  Relocated to sql/deferred_trigger_body.plpgsql.in
+    // (see plans/1_6_1_refacto.md Phase 4).
+    let body_template = include_str!("../sql/deferred_trigger_body.plpgsql.in");
+    let render_ins_del = |transition_tbl: &str, op: &str, op_code: &str, ref_tbl: &str| -> String {
+        slot_replace(
+            body_template,
+            &[
+                ("__REFLEX_SLOT_SOURCE_TABLE__", source_table),
+                ("__REFLEX_SLOT_TRANSITION_TBL__", transition_tbl),
+                ("__REFLEX_SLOT_OP__", op),
+                ("__REFLEX_SLOT_OP_CODE__", op_code),
+                ("__REFLEX_SLOT_REF_TBL__", ref_tbl),
+                ("__REFLEX_SLOT_DELTA_TBL__", &delta_tbl),
+            ],
+        )
+    };
 
     // INSERT
     let ins_fn = safe_identifier(&format!("__reflex_ins_trigger_on_{}", safe_source));
     let ins_trig = safe_identifier(&format!("__reflex_trigger_ins_on_{}", safe_source));
-    let ins_body = body_core
-        .replace("{op}", "INSERT")
-        .replace("{op_code}", "I")
-        .replace("{ref_tbl}", &ref_new)
-        .replace("{transition_tbl}", &ref_new);
+    let ins_body = render_ins_del(&ref_new, "INSERT", "I", &ref_new);
     let ins_ddl = format!(
         "CREATE OR REPLACE FUNCTION {ins_fn}() RETURNS TRIGGER AS $fn$ {ins_body} $fn$ LANGUAGE plpgsql;\n\
          CREATE OR REPLACE TRIGGER \"{ins_trig}\" \
@@ -897,11 +681,7 @@ pub fn build_deferred_trigger_ddls(source_table: &str) -> Vec<String> {
     // DELETE
     let del_fn = safe_identifier(&format!("__reflex_del_trigger_on_{}", safe_source));
     let del_trig = safe_identifier(&format!("__reflex_trigger_del_on_{}", safe_source));
-    let del_body = body_core
-        .replace("{op}", "DELETE")
-        .replace("{op_code}", "D")
-        .replace("{ref_tbl}", &ref_old)
-        .replace("{transition_tbl}", &ref_old);
+    let del_body = render_ins_del(&ref_old, "DELETE", "D", &ref_old);
     let del_ddl = format!(
         "CREATE OR REPLACE FUNCTION {del_fn}() RETURNS TRIGGER AS $fn$ {del_body} $fn$ LANGUAGE plpgsql;\n\
          CREATE OR REPLACE TRIGGER \"{del_trig}\" \
@@ -913,42 +693,14 @@ pub fn build_deferred_trigger_ddls(source_table: &str) -> Vec<String> {
     // UPDATE — capture both old and new rows
     let upd_fn = safe_identifier(&format!("__reflex_upd_trigger_on_{}", safe_source));
     let upd_trig = safe_identifier(&format!("__reflex_trigger_upd_on_{}", safe_source));
-    let upd_body = format!(
-        "DECLARE _rec RECORD; _sql TEXT; _stmt TEXT; _has_deferred BOOLEAN := FALSE; _has_rows BOOLEAN; _pred_match BOOLEAN; \
-         BEGIN \
-           SELECT EXISTS(SELECT 1 FROM \"{ref_new}\" LIMIT 1) INTO _has_rows; \
-           IF NOT _has_rows THEN RETURN NULL; END IF; \
-           FOR _rec IN \
-             SELECT name, base_query, end_query, aggregations::text AS aggregations, \
-                    COALESCE(refresh_mode, 'IMMEDIATE') AS refresh_mode, where_predicate \
-             FROM public.__reflex_ivm_reference \
-             WHERE '{source_table}' = ANY(depends_on) AND enabled = TRUE \
-             ORDER BY graph_depth, name \
-           LOOP \
-             IF _rec.where_predicate IS NOT NULL THEN \
-               EXECUTE format('SELECT EXISTS(SELECT 1 FROM %I WHERE %s LIMIT 1)', '{ref_new}', _rec.where_predicate) INTO _pred_match; \
-               IF NOT _pred_match THEN CONTINUE; END IF; \
-             END IF; \
-             IF _rec.refresh_mode = 'IMMEDIATE' THEN \
-               PERFORM pg_advisory_xact_lock(hashtext(_rec.name), hashtext(reverse(_rec.name))); \
-               _sql := public.reflex_build_delta_sql(_rec.name, '{source_table}', 'UPDATE', _rec.base_query, _rec.end_query, _rec.aggregations, _rec.base_query); \
-               IF _sql <> '' THEN \
-                 FOREACH _stmt IN ARRAY string_to_array(_sql, E'\\n--<<REFLEX_SEP>>--\\n') LOOP \
-                   IF _stmt <> '' THEN EXECUTE _stmt; END IF; \
-                 END LOOP; \
-               END IF; \
-             ELSE \
-               _has_deferred := TRUE; \
-             END IF; \
-           END LOOP; \
-           IF _has_deferred THEN \
-             INSERT INTO {delta_tbl} SELECT 'U_OLD', * FROM \"{ref_old}\"; \
-             INSERT INTO {delta_tbl} SELECT 'U_NEW', * FROM \"{ref_new}\"; \
-             INSERT INTO public.__reflex_deferred_pending (source_table, operation) \
-               VALUES ('{source_table}', 'UPDATE'); \
-           END IF; \
-           RETURN NULL; \
-         END;"
+    let upd_body = slot_replace(
+        include_str!("../sql/deferred_trigger_update_body.plpgsql.in"),
+        &[
+            ("__REFLEX_SLOT_SOURCE_TABLE__", source_table),
+            ("__REFLEX_SLOT_REF_NEW__", &ref_new),
+            ("__REFLEX_SLOT_REF_OLD__", &ref_old),
+            ("__REFLEX_SLOT_DELTA_TBL__", &delta_tbl),
+        ],
     );
     let upd_ddl = format!(
         "CREATE OR REPLACE FUNCTION {upd_fn}() RETURNS TRIGGER AS $fn$ {upd_body} $fn$ LANGUAGE plpgsql;\n\
@@ -961,23 +713,12 @@ pub fn build_deferred_trigger_ddls(source_table: &str) -> Vec<String> {
     // TRUNCATE — same as immediate (no deferred staging for truncate)
     let trunc_fn = safe_identifier(&format!("__reflex_trunc_trigger_on_{}", safe_source));
     let trunc_trig = safe_identifier(&format!("__reflex_trigger_trunc_on_{}", safe_source));
-    let trunc_body = format!(
-        "DECLARE _rec RECORD; _stmts TEXT; \
-         BEGIN \
-           FOR _rec IN \
-             SELECT name \
-             FROM public.__reflex_ivm_reference \
-             WHERE '{source_table}' = ANY(depends_on) AND enabled = TRUE \
-             ORDER BY graph_depth, name \
-           LOOP \
-             PERFORM pg_advisory_xact_lock(hashtext(_rec.name), hashtext(reverse(_rec.name))); \
-             _stmts := public.reflex_build_truncate_sql(_rec.name); \
-             IF _stmts <> '' THEN PERFORM public.reflex_execute_separated(_stmts); END IF; \
-           END LOOP; \
-           TRUNCATE {delta_tbl}; \
-           DELETE FROM public.__reflex_deferred_pending WHERE source_table = '{source_table}'; \
-           RETURN NULL; \
-         END;"
+    let trunc_body = slot_replace(
+        include_str!("../sql/deferred_trigger_truncate_body.plpgsql.in"),
+        &[
+            ("__REFLEX_SLOT_SOURCE_TABLE__", source_table),
+            ("__REFLEX_SLOT_DELTA_TBL__", &delta_tbl),
+        ],
     );
     let trunc_ddl = format!(
         "CREATE OR REPLACE FUNCTION {trunc_fn}() RETURNS TRIGGER AS $fn$ {trunc_body} $fn$ LANGUAGE plpgsql;\n\
@@ -1033,13 +774,12 @@ pub fn build_deferred_flush_ddl() -> Vec<String> {
 /// to identify the operation type (I=insert, D=delete, U_OLD=update old, U_NEW=update new).
 pub fn build_staging_table_ddl(source_table: &str) -> String {
     let delta_tbl = staging_delta_table_name(source_table);
-    format!(
-        "CREATE UNLOGGED TABLE IF NOT EXISTS {} (\
-            __reflex_op TEXT NOT NULL, \
-            LIKE {} INCLUDING DEFAULTS\
-         )",
-        delta_tbl, source_table
-    )
+    CreateTable::new(delta_tbl)
+        .unlogged(true)
+        .if_not_exists(true)
+        .column("__reflex_op TEXT NOT NULL")
+        .like(source_table.to_string())
+        .build()
 }
 
 /// Build DDL for the per-(IMV, source) UNLOGGED passthrough scratch tables.
@@ -1053,14 +793,16 @@ pub fn build_passthrough_scratch_ddls(view_name: &str, source_table: &str) -> Ve
     let new_tbl = passthrough_scratch_new_table_name(view_name, source_table);
     let old_tbl = passthrough_scratch_old_table_name(view_name, source_table);
     vec![
-        format!(
-            "CREATE UNLOGGED TABLE IF NOT EXISTS {} (LIKE {} INCLUDING DEFAULTS)",
-            new_tbl, source_table
-        ),
-        format!(
-            "CREATE UNLOGGED TABLE IF NOT EXISTS {} (LIKE {} INCLUDING DEFAULTS)",
-            old_tbl, source_table
-        ),
+        CreateTable::new(new_tbl)
+            .unlogged(true)
+            .if_not_exists(true)
+            .like(source_table.to_string())
+            .build(),
+        CreateTable::new(old_tbl)
+            .unlogged(true)
+            .if_not_exists(true)
+            .like(source_table.to_string())
+            .build(),
     ]
 }
 

@@ -1,0 +1,12 @@
+_directional_op := 'UPDATE';
+         IF _skip_cols IS NOT NULL AND _skip_cols <> '' THEN
+           EXECUTE format('SELECT EXISTS(SELECT 1 FROM %I%s LIMIT 1)',
+                          '__REFLEX_SLOT_REF_OLD__', _skip_pred_clause) INTO _old_has;
+           EXECUTE format('SELECT EXISTS(SELECT 1 FROM %I%s LIMIT 1)',
+                          '__REFLEX_SLOT_REF_NEW__', _skip_pred_clause) INTO _new_has;
+           IF (NOT _old_has) AND _new_has THEN
+             _directional_op := 'INSERT_PROMOTED';
+           ELSIF _old_has AND (NOT _new_has) THEN
+             _directional_op := 'DELETE_PROMOTED';
+           END IF;
+         END IF;

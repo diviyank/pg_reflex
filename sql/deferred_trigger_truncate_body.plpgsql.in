@@ -1,0 +1,16 @@
+DECLARE _rec RECORD; _stmts TEXT;
+BEGIN
+    FOR _rec IN
+      SELECT name
+      FROM public.__reflex_ivm_reference
+      WHERE '__REFLEX_SLOT_SOURCE_TABLE__' = ANY(depends_on) AND enabled = TRUE
+      ORDER BY graph_depth, name
+    LOOP
+      PERFORM pg_advisory_xact_lock(hashtext(_rec.name), hashtext(reverse(_rec.name)));
+      _stmts := public.reflex_build_truncate_sql(_rec.name);
+      IF _stmts <> '' THEN PERFORM public.reflex_execute_separated(_stmts); END IF;
+    END LOOP;
+    TRUNCATE __REFLEX_SLOT_DELTA_TBL__;
+    DELETE FROM public.__reflex_deferred_pending WHERE source_table = '__REFLEX_SLOT_SOURCE_TABLE__';
+    RETURN NULL;
+END;

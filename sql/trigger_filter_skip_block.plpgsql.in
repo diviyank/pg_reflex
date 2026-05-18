@@ -1,0 +1,31 @@
+SELECT string_agg(
+              CASE WHEN t.typname IN ('json','xml')
+                   THEN format('%I::text', sel.col)
+                   ELSE format('%I', sel.col)
+              END,
+              ', ' ORDER BY sel.col)
+              INTO _skip_cols
+              FROM jsonb_array_elements_text(
+                   COALESCE(_rec.aggregations::jsonb->'imv_relevant_columns'->'__REFLEX_SLOT_SOURCE_TABLE__', '[]'::jsonb)
+              ) AS sel(col)
+              JOIN pg_attribute a
+                ON a.attname = sel.col
+               AND a.attrelid = '__REFLEX_SLOT_SOURCE_TABLE__'::regclass
+               AND a.attnum > 0 AND NOT a.attisdropped
+              JOIN pg_type t ON t.oid = a.atttypid;
+         IF _skip_cols IS NOT NULL AND _skip_cols <> '' THEN
+           _skip_pred := _rec.aggregations::jsonb->'imv_relevant_where'->>'__REFLEX_SLOT_SOURCE_TABLE__';
+           IF _skip_pred IS NULL OR _skip_pred = '' THEN
+             _skip_pred_clause := '';
+           ELSE
+             _skip_pred_clause := ' WHERE ' || _skip_pred;
+           END IF;
+           _skip_sql := format(
+             'WITH _o AS (SELECT %s FROM %I%s), _n AS (SELECT %s FROM %I%s) '
+             || 'SELECT NOT EXISTS(TABLE _o EXCEPT ALL TABLE _n) AND NOT EXISTS(TABLE _n EXCEPT ALL TABLE _o)',
+             _skip_cols, '__REFLEX_SLOT_REF_OLD__', _skip_pred_clause,
+             _skip_cols, '__REFLEX_SLOT_REF_NEW__', _skip_pred_clause
+           );
+           EXECUTE _skip_sql INTO _filter_skip;
+           IF _filter_skip THEN CONTINUE; END IF;
+         END IF;

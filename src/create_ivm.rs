@@ -18,6 +18,9 @@ use crate::schema_builder::{
     build_staging_table_ddl, build_target_table_ddl, build_trigger_ddls, resolve_column_type,
 };
 use crate::sql_analyzer::{analyze, SqlAnalysisError};
+use crate::sql_writer::{
+    add_graph_child_links, insert_registry_row, AggregationsCast, RegistryRow,
+};
 use crate::validate_view_name;
 use crate::window;
 
@@ -149,59 +152,22 @@ pub(crate) fn create_reflex_ivm_impl(
             Spi::connect_mut(|client| {
                 let depends_on: Vec<String> = sub_imv_names.clone();
                 let depends_on_imv: Vec<String> = sub_imv_names.clone();
-                let graph_child: Vec<String> = Vec::new();
                 let depth = sub_imv_names.len() as i32 + 1;
-                client.update(
-                    "INSERT INTO public.__reflex_ivm_reference
-                     (name, graph_depth, depends_on, depends_on_imv, unlogged_tables,
-                      graph_child, sql_query, base_query, end_query,
-                      aggregations, index_columns, unique_columns, enabled, last_update_date,
-                      storage_mode, refresh_mode)
-                     VALUES ($1, $2, $3::TEXT[], $4::TEXT[], $5::TEXT[], $6::TEXT[], $7, $8, $9, $10::json, $11::TEXT[], $12::TEXT[], TRUE, NOW(), $13, $14)",
-                    None,
-                    &[
-                        unsafe { DatumWithOid::new(view_name.to_string(), PgBuiltInOids::TEXTOID.oid().value()) },
-                        unsafe { DatumWithOid::new(depth, PgBuiltInOids::INT4OID.oid().value()) },
-                        unsafe { DatumWithOid::new(format_pg_text_array_literal(&depends_on), PgBuiltInOids::TEXTOID.oid().value()) },
-                        unsafe { DatumWithOid::new(format_pg_text_array_literal(&depends_on_imv), PgBuiltInOids::TEXTOID.oid().value()) },
-                        unsafe { DatumWithOid::new(String::from("{}"), PgBuiltInOids::TEXTOID.oid().value()) },
-                        unsafe { DatumWithOid::new(format_pg_text_array_literal(&graph_child), PgBuiltInOids::TEXTOID.oid().value()) },
-                        unsafe { DatumWithOid::new(sql.to_string(), PgBuiltInOids::TEXTOID.oid().value()) },
-                        unsafe { DatumWithOid::new(view_sql.clone(), PgBuiltInOids::TEXTOID.oid().value()) },
-                        unsafe { DatumWithOid::new(String::new(), PgBuiltInOids::TEXTOID.oid().value()) },
-                        unsafe { DatumWithOid::new("{}".to_string(), PgBuiltInOids::TEXTOID.oid().value()) },
-                        unsafe { DatumWithOid::new(String::from("{}"), PgBuiltInOids::TEXTOID.oid().value()) },
-                        unsafe { DatumWithOid::new(String::from("{}"), PgBuiltInOids::TEXTOID.oid().value()) },
-                        unsafe { DatumWithOid::new(storage_upper.clone(), PgBuiltInOids::TEXTOID.oid().value()) },
-                        unsafe { DatumWithOid::new(mode_upper.clone(), PgBuiltInOids::TEXTOID.oid().value()) },
-                    ],
-                ).unwrap_or_report();
-
-                // Update sub-IMVs graph_child
-                for imv_name in &depends_on_imv {
-                    client
-                        .update(
-                            "UPDATE public.__reflex_ivm_reference
-                         SET graph_child = array_append(COALESCE(graph_child, ARRAY[]::TEXT[]), $1)
-                         WHERE name = $2",
-                            None,
-                            &[
-                                unsafe {
-                                    DatumWithOid::new(
-                                        view_name.to_string(),
-                                        PgBuiltInOids::TEXTOID.oid().value(),
-                                    )
-                                },
-                                unsafe {
-                                    DatumWithOid::new(
-                                        imv_name.to_string(),
-                                        PgBuiltInOids::TEXTOID.oid().value(),
-                                    )
-                                },
-                            ],
-                        )
-                        .unwrap_or_report();
-                }
+                insert_registry_row(
+                    client,
+                    &RegistryRow::decomposed(
+                        view_name,
+                        depth,
+                        &depends_on,
+                        &depends_on_imv,
+                        sql,
+                        &view_sql,
+                        &storage_upper,
+                        &mode_upper,
+                    ),
+                )
+                .unwrap_or_report();
+                add_graph_child_links(client, view_name, &depends_on_imv).unwrap_or_report();
             });
         } else {
             // UNION / INTERSECT / EXCEPT (without ALL): create a VIEW.
@@ -232,58 +198,22 @@ pub(crate) fn create_reflex_ivm_impl(
             Spi::connect_mut(|client| {
                 let depends_on: Vec<String> = sub_imv_names.clone();
                 let depends_on_imv: Vec<String> = sub_imv_names.clone();
-                let graph_child: Vec<String> = Vec::new();
                 let depth = sub_imv_names.len() as i32 + 1;
-                client.update(
-                    "INSERT INTO public.__reflex_ivm_reference
-                     (name, graph_depth, depends_on, depends_on_imv, unlogged_tables,
-                      graph_child, sql_query, base_query, end_query,
-                      aggregations, index_columns, unique_columns, enabled, last_update_date,
-                      storage_mode, refresh_mode)
-                     VALUES ($1, $2, $3::TEXT[], $4::TEXT[], $5::TEXT[], $6::TEXT[], $7, $8, $9, $10::json, $11::TEXT[], $12::TEXT[], TRUE, NOW(), $13, $14)",
-                    None,
-                    &[
-                        unsafe { DatumWithOid::new(view_name.to_string(), PgBuiltInOids::TEXTOID.oid().value()) },
-                        unsafe { DatumWithOid::new(depth, PgBuiltInOids::INT4OID.oid().value()) },
-                        unsafe { DatumWithOid::new(format_pg_text_array_literal(&depends_on), PgBuiltInOids::TEXTOID.oid().value()) },
-                        unsafe { DatumWithOid::new(format_pg_text_array_literal(&depends_on_imv), PgBuiltInOids::TEXTOID.oid().value()) },
-                        unsafe { DatumWithOid::new(String::from("{}"), PgBuiltInOids::TEXTOID.oid().value()) },
-                        unsafe { DatumWithOid::new(format_pg_text_array_literal(&graph_child), PgBuiltInOids::TEXTOID.oid().value()) },
-                        unsafe { DatumWithOid::new(sql.to_string(), PgBuiltInOids::TEXTOID.oid().value()) },
-                        unsafe { DatumWithOid::new(view_sql.clone(), PgBuiltInOids::TEXTOID.oid().value()) },
-                        unsafe { DatumWithOid::new(String::new(), PgBuiltInOids::TEXTOID.oid().value()) },
-                        unsafe { DatumWithOid::new("{}".to_string(), PgBuiltInOids::TEXTOID.oid().value()) },
-                        unsafe { DatumWithOid::new(String::from("{}"), PgBuiltInOids::TEXTOID.oid().value()) },
-                        unsafe { DatumWithOid::new(String::from("{}"), PgBuiltInOids::TEXTOID.oid().value()) },
-                        unsafe { DatumWithOid::new(storage_upper.clone(), PgBuiltInOids::TEXTOID.oid().value()) },
-                        unsafe { DatumWithOid::new(mode_upper.clone(), PgBuiltInOids::TEXTOID.oid().value()) },
-                    ],
-                ).unwrap_or_report();
-
-                for imv_name in &depends_on_imv {
-                    client
-                        .update(
-                            "UPDATE public.__reflex_ivm_reference
-                         SET graph_child = array_append(COALESCE(graph_child, ARRAY[]::TEXT[]), $1)
-                         WHERE name = $2",
-                            None,
-                            &[
-                                unsafe {
-                                    DatumWithOid::new(
-                                        view_name.to_string(),
-                                        PgBuiltInOids::TEXTOID.oid().value(),
-                                    )
-                                },
-                                unsafe {
-                                    DatumWithOid::new(
-                                        imv_name.to_string(),
-                                        PgBuiltInOids::TEXTOID.oid().value(),
-                                    )
-                                },
-                            ],
-                        )
-                        .unwrap_or_report();
-                }
+                insert_registry_row(
+                    client,
+                    &RegistryRow::decomposed(
+                        view_name,
+                        depth,
+                        &depends_on,
+                        &depends_on_imv,
+                        sql,
+                        &view_sql,
+                        &storage_upper,
+                        &mode_upper,
+                    ),
+                )
+                .unwrap_or_report();
+                add_graph_child_links(client, view_name, &depends_on_imv).unwrap_or_report();
             });
         }
 
@@ -397,56 +327,21 @@ pub(crate) fn create_reflex_ivm_impl(
             // Register in reference table for cleanup
             let depends_on = vec![base_name.clone()];
             let depends_on_imv = vec![base_name.clone()];
-            client.update(
-                "INSERT INTO public.__reflex_ivm_reference
-                 (name, graph_depth, depends_on, depends_on_imv, unlogged_tables,
-                  graph_child, sql_query, base_query, end_query,
-                  aggregations, index_columns, unique_columns, enabled, last_update_date,
-                  storage_mode, refresh_mode)
-                 VALUES ($1, 2, $2::TEXT[], $3::TEXT[], $4::TEXT[], $5::TEXT[], $6, $7, $8, $9::json, $10::TEXT[], $11::TEXT[], TRUE, NOW(), $12, $13)",
-                None,
-                &[
-                    unsafe { DatumWithOid::new(view_name.to_string(), PgBuiltInOids::TEXTOID.oid().value()) },
-                    unsafe { DatumWithOid::new(format_pg_text_array_literal(&depends_on), PgBuiltInOids::TEXTOID.oid().value()) },
-                    unsafe { DatumWithOid::new(format_pg_text_array_literal(&depends_on_imv), PgBuiltInOids::TEXTOID.oid().value()) },
-                    unsafe { DatumWithOid::new(String::from("{}"), PgBuiltInOids::TEXTOID.oid().value()) },
-                    unsafe { DatumWithOid::new(String::from("{}"), PgBuiltInOids::TEXTOID.oid().value()) },
-                    unsafe { DatumWithOid::new(sql.to_string(), PgBuiltInOids::TEXTOID.oid().value()) },
-                    unsafe { DatumWithOid::new(view_sql.clone(), PgBuiltInOids::TEXTOID.oid().value()) },
-                    unsafe { DatumWithOid::new(String::new(), PgBuiltInOids::TEXTOID.oid().value()) },
-                    unsafe { DatumWithOid::new("{}".to_string(), PgBuiltInOids::TEXTOID.oid().value()) },
-                    unsafe { DatumWithOid::new(String::from("{}"), PgBuiltInOids::TEXTOID.oid().value()) },
-                    unsafe { DatumWithOid::new(String::from("{}"), PgBuiltInOids::TEXTOID.oid().value()) },
-                    unsafe { DatumWithOid::new(storage_upper.clone(), PgBuiltInOids::TEXTOID.oid().value()) },
-                    unsafe { DatumWithOid::new(mode_upper.clone(), PgBuiltInOids::TEXTOID.oid().value()) },
-                ],
-            ).unwrap_or_report();
-
-            // Update base IMV's graph_child
-            for name in &depends_on_imv {
-                client
-                    .update(
-                        "UPDATE public.__reflex_ivm_reference
-                     SET graph_child = array_append(COALESCE(graph_child, ARRAY[]::TEXT[]), $1)
-                     WHERE name = $2",
-                        None,
-                        &[
-                            unsafe {
-                                DatumWithOid::new(
-                                    view_name.to_string(),
-                                    PgBuiltInOids::TEXTOID.oid().value(),
-                                )
-                            },
-                            unsafe {
-                                DatumWithOid::new(
-                                    name.to_string(),
-                                    PgBuiltInOids::TEXTOID.oid().value(),
-                                )
-                            },
-                        ],
-                    )
-                    .unwrap_or_report();
-            }
+            insert_registry_row(
+                client,
+                &RegistryRow::decomposed(
+                    view_name,
+                    2,
+                    &depends_on,
+                    &depends_on_imv,
+                    sql,
+                    &view_sql,
+                    &storage_upper,
+                    &mode_upper,
+                ),
+            )
+            .unwrap_or_report();
+            add_graph_child_links(client, view_name, &depends_on_imv).unwrap_or_report();
         });
 
         return "CREATE REFLEX INCREMENTAL VIEW";
@@ -502,56 +397,21 @@ pub(crate) fn create_reflex_ivm_impl(
             // Register in reference table for cleanup
             let depends_on = vec![base_name.clone()];
             let depends_on_imv = vec![base_name.clone()];
-            client.update(
-                "INSERT INTO public.__reflex_ivm_reference
-                 (name, graph_depth, depends_on, depends_on_imv, unlogged_tables,
-                  graph_child, sql_query, base_query, end_query,
-                  aggregations, index_columns, unique_columns, enabled, last_update_date,
-                  storage_mode, refresh_mode)
-                 VALUES ($1, 2, $2::TEXT[], $3::TEXT[], $4::TEXT[], $5::TEXT[], $6, $7, $8, $9::json, $10::TEXT[], $11::TEXT[], TRUE, NOW(), $12, $13)",
-                None,
-                &[
-                    unsafe { DatumWithOid::new(view_name.to_string(), PgBuiltInOids::TEXTOID.oid().value()) },
-                    unsafe { DatumWithOid::new(format_pg_text_array_literal(&depends_on), PgBuiltInOids::TEXTOID.oid().value()) },
-                    unsafe { DatumWithOid::new(format_pg_text_array_literal(&depends_on_imv), PgBuiltInOids::TEXTOID.oid().value()) },
-                    unsafe { DatumWithOid::new(String::from("{}"), PgBuiltInOids::TEXTOID.oid().value()) },
-                    unsafe { DatumWithOid::new(String::from("{}"), PgBuiltInOids::TEXTOID.oid().value()) },
-                    unsafe { DatumWithOid::new(sql.to_string(), PgBuiltInOids::TEXTOID.oid().value()) },
-                    unsafe { DatumWithOid::new(view_sql.clone(), PgBuiltInOids::TEXTOID.oid().value()) },
-                    unsafe { DatumWithOid::new(String::new(), PgBuiltInOids::TEXTOID.oid().value()) },
-                    unsafe { DatumWithOid::new("{}".to_string(), PgBuiltInOids::TEXTOID.oid().value()) },
-                    unsafe { DatumWithOid::new(String::from("{}"), PgBuiltInOids::TEXTOID.oid().value()) },
-                    unsafe { DatumWithOid::new(String::from("{}"), PgBuiltInOids::TEXTOID.oid().value()) },
-                    unsafe { DatumWithOid::new(storage_upper.clone(), PgBuiltInOids::TEXTOID.oid().value()) },
-                    unsafe { DatumWithOid::new(mode_upper.clone(), PgBuiltInOids::TEXTOID.oid().value()) },
-                ],
-            ).unwrap_or_report();
-
-            // Update base IMV's graph_child
-            for name in &depends_on_imv {
-                client
-                    .update(
-                        "UPDATE public.__reflex_ivm_reference
-                     SET graph_child = array_append(COALESCE(graph_child, ARRAY[]::TEXT[]), $1)
-                     WHERE name = $2",
-                        None,
-                        &[
-                            unsafe {
-                                DatumWithOid::new(
-                                    view_name.to_string(),
-                                    PgBuiltInOids::TEXTOID.oid().value(),
-                                )
-                            },
-                            unsafe {
-                                DatumWithOid::new(
-                                    name.to_string(),
-                                    PgBuiltInOids::TEXTOID.oid().value(),
-                                )
-                            },
-                        ],
-                    )
-                    .unwrap_or_report();
-            }
+            insert_registry_row(
+                client,
+                &RegistryRow::decomposed(
+                    view_name,
+                    2,
+                    &depends_on,
+                    &depends_on_imv,
+                    sql,
+                    &view_sql,
+                    &storage_upper,
+                    &mode_upper,
+                ),
+            )
+            .unwrap_or_report();
+            add_graph_child_links(client, view_name, &depends_on_imv).unwrap_or_report();
         });
 
         return "CREATE REFLEX INCREMENTAL VIEW";
@@ -1687,7 +1547,6 @@ pub(crate) fn create_reflex_ivm_impl(
         // INSERT into reference table
         let depends_on: Vec<String> = froms.clone();
         let depends_on_imv: Vec<String> = ivm_froms.clone();
-        let graph_child: Vec<String> = Vec::new();
 
         // Store the WHERE predicate for predicate-filtered trigger skip.
         // Only safe for single-source queries: multi-table WHERE clauses may reference
@@ -1699,62 +1558,34 @@ pub(crate) fn create_reflex_ivm_impl(
         };
 
         let ignored_sources_vec: Vec<String> = ignore_sources.to_vec();
-        client.update(
-            "INSERT INTO public.__reflex_ivm_reference
-             (name, graph_depth, depends_on, depends_on_imv, unlogged_tables,
-              graph_child, sql_query, base_query, end_query,
-              aggregations, index_columns, unique_columns, enabled, last_update_date,
-              storage_mode, refresh_mode, where_predicate, ignored_sources,
-              partition_columns, partition_strategy)
-             VALUES ($1, $2, $3::TEXT[], $4::TEXT[], $5::TEXT[], $6::TEXT[], $7, $8, $9, $10::jsonb, $11::TEXT[], $12::TEXT[], TRUE, NOW(), $13, $14, NULLIF($15, ''), $16::TEXT[], NULLIF($17, '{}')::TEXT[], NULLIF($18, ''))",
-            None,
-            &[
-                unsafe { DatumWithOid::new(view_name.to_string(), PgBuiltInOids::TEXTOID.oid().value()) },
-                unsafe { DatumWithOid::new(depth, PgBuiltInOids::INT4OID.oid().value()) },
-                unsafe { DatumWithOid::new(format_pg_text_array_literal(&depends_on), PgBuiltInOids::TEXTOID.oid().value()) },
-                unsafe { DatumWithOid::new(format_pg_text_array_literal(&depends_on_imv), PgBuiltInOids::TEXTOID.oid().value()) },
-                unsafe { DatumWithOid::new(format_pg_text_array_literal(&unlogged_tables), PgBuiltInOids::TEXTOID.oid().value()) },
-                unsafe { DatumWithOid::new(format_pg_text_array_literal(&graph_child), PgBuiltInOids::TEXTOID.oid().value()) },
-                unsafe { DatumWithOid::new(sql.to_string(), PgBuiltInOids::TEXTOID.oid().value()) },
-                unsafe { DatumWithOid::new(base_query, PgBuiltInOids::TEXTOID.oid().value()) },
-                unsafe { DatumWithOid::new(end_query.clone(), PgBuiltInOids::TEXTOID.oid().value()) },
-                unsafe { DatumWithOid::new(aggregations_json, PgBuiltInOids::TEXTOID.oid().value()) },
-                unsafe { DatumWithOid::new(format_pg_text_array_literal(&index_columns), PgBuiltInOids::TEXTOID.oid().value()) },
-                unsafe { DatumWithOid::new(format_pg_text_array_literal(&resolved_unique_columns), PgBuiltInOids::TEXTOID.oid().value()) },
-                unsafe { DatumWithOid::new(storage_upper.clone(), PgBuiltInOids::TEXTOID.oid().value()) },
-                unsafe { DatumWithOid::new(mode_upper.clone(), PgBuiltInOids::TEXTOID.oid().value()) },
-                unsafe { DatumWithOid::new(where_predicate, PgBuiltInOids::TEXTOID.oid().value()) },
-                unsafe { DatumWithOid::new(format_pg_text_array_literal(&ignored_sources_vec), PgBuiltInOids::TEXTOID.oid().value()) },
-                unsafe { DatumWithOid::new(format_pg_text_array_literal(&plan.partition_columns), PgBuiltInOids::TEXTOID.oid().value()) },
-                unsafe { DatumWithOid::new(plan.partition_strategy.clone(), PgBuiltInOids::TEXTOID.oid().value()) },
-            ],
-        ).unwrap_or_report();
+        insert_registry_row(
+            client,
+            &RegistryRow {
+                view_name,
+                graph_depth: depth,
+                depends_on: &depends_on,
+                depends_on_imv: &depends_on_imv,
+                unlogged_tables: &unlogged_tables,
+                graph_child: &[],
+                sql_query: sql,
+                base_query: &base_query,
+                end_query: &end_query,
+                aggregations_json: &aggregations_json,
+                aggregations_cast: AggregationsCast::Jsonb,
+                index_columns: &index_columns,
+                unique_columns: &resolved_unique_columns,
+                storage_mode: &storage_upper,
+                refresh_mode: &mode_upper,
+                where_predicate: Some(&where_predicate),
+                ignored_sources: Some(&ignored_sources_vec),
+                partition_columns: Some(&plan.partition_columns),
+                partition_strategy: Some(&plan.partition_strategy),
+            },
+        )
+        .unwrap_or_report();
 
         // Update source IMVs with the new child in their graph_child field
-        for imv_name in &ivm_froms {
-            client
-                .update(
-                    "UPDATE public.__reflex_ivm_reference
-                 SET graph_child = array_append(COALESCE(graph_child, ARRAY[]::TEXT[]), $1)
-                 WHERE name = $2",
-                    None,
-                    &[
-                        unsafe {
-                            DatumWithOid::new(
-                                view_name.to_string(),
-                                PgBuiltInOids::TEXTOID.oid().value(),
-                            )
-                        },
-                        unsafe {
-                            DatumWithOid::new(
-                                imv_name.to_string(),
-                                PgBuiltInOids::TEXTOID.oid().value(),
-                            )
-                        },
-                    ],
-                )
-                .unwrap_or_report();
-        }
+        add_graph_child_links(client, view_name, &ivm_froms).unwrap_or_report();
 
         // Initial materialization (skip for passthrough — CREATE TABLE AS already populated)
         if !plan.is_passthrough {

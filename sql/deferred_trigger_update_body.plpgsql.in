@@ -1,0 +1,35 @@
+DECLARE _rec RECORD; _sql TEXT; _stmt TEXT; _has_deferred BOOLEAN := FALSE; _has_rows BOOLEAN; _pred_match BOOLEAN;
+BEGIN
+    SELECT EXISTS(SELECT 1 FROM "__REFLEX_SLOT_REF_NEW__" LIMIT 1) INTO _has_rows;
+    IF NOT _has_rows THEN RETURN NULL; END IF;
+    FOR _rec IN
+      SELECT name, base_query, end_query, aggregations::text AS aggregations,
+             COALESCE(refresh_mode, 'IMMEDIATE') AS refresh_mode, where_predicate
+      FROM public.__reflex_ivm_reference
+      WHERE '__REFLEX_SLOT_SOURCE_TABLE__' = ANY(depends_on) AND enabled = TRUE
+      ORDER BY graph_depth, name
+    LOOP
+      IF _rec.where_predicate IS NOT NULL THEN
+        EXECUTE format('SELECT EXISTS(SELECT 1 FROM %I WHERE %s LIMIT 1)', '__REFLEX_SLOT_REF_NEW__', _rec.where_predicate) INTO _pred_match;
+        IF NOT _pred_match THEN CONTINUE; END IF;
+      END IF;
+      IF _rec.refresh_mode = 'IMMEDIATE' THEN
+        PERFORM pg_advisory_xact_lock(hashtext(_rec.name), hashtext(reverse(_rec.name)));
+        _sql := public.reflex_build_delta_sql(_rec.name, '__REFLEX_SLOT_SOURCE_TABLE__', 'UPDATE', _rec.base_query, _rec.end_query, _rec.aggregations, _rec.base_query);
+        IF _sql <> '' THEN
+          FOREACH _stmt IN ARRAY string_to_array(_sql, E'\n--<<REFLEX_SEP>>--\n') LOOP
+            IF _stmt <> '' THEN EXECUTE _stmt; END IF;
+          END LOOP;
+        END IF;
+      ELSE
+        _has_deferred := TRUE;
+      END IF;
+    END LOOP;
+    IF _has_deferred THEN
+      INSERT INTO __REFLEX_SLOT_DELTA_TBL__ SELECT 'U_OLD', * FROM "__REFLEX_SLOT_REF_OLD__";
+      INSERT INTO __REFLEX_SLOT_DELTA_TBL__ SELECT 'U_NEW', * FROM "__REFLEX_SLOT_REF_NEW__";
+      INSERT INTO public.__reflex_deferred_pending (source_table, operation)
+        VALUES ('__REFLEX_SLOT_SOURCE_TABLE__', 'UPDATE');
+    END IF;
+    RETURN NULL;
+END;

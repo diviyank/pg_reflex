@@ -24,6 +24,7 @@ mod query_decomposer;
 mod reconcile;
 mod schema_builder;
 mod sql_analyzer;
+mod sql_writer;
 mod trigger;
 mod window;
 

@@ -1,0 +1,5 @@
+IF _rec.where_predicate IS NOT NULL THEN
+           EXECUTE format('SELECT EXISTS(SELECT 1 FROM %I WHERE %s LIMIT 1) OR EXISTS(SELECT 1 FROM %I WHERE %s LIMIT 1)',
+                          '__REFLEX_SLOT_REF_NEW__', _rec.where_predicate, '__REFLEX_SLOT_REF_OLD__', _rec.where_predicate) INTO _pred_match;
+           IF NOT _pred_match THEN CONTINUE; END IF;
+         END IF;
