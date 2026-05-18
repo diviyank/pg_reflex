@@ -1383,6 +1383,126 @@ fn materialize_aggregate(client: &mut pgrx::spi::SpiClient<'_>, ctx: &mut BuildC
     }
 }
 
+/// Install consolidated triggers on every real source of the IMV. Skips
+/// `<subquery:...>`/`<function:...>` placeholders, ignored sources, and
+/// materialized-view sources. Upgrades existing triggers to deferred when
+/// any deferred IMV depends on the source.
+fn install_source_triggers(client: &mut pgrx::spi::SpiClient<'_>, ctx: &BuildContext) {
+    for source in &ctx.froms {
+        if source.starts_with("<subquery:") || source.starts_with("<function:") {
+            warning!(
+                "pg_reflex: source '{}' for '{}' is a subquery — \
+                 triggers are created on the underlying tables inside the subquery, \
+                 but the subquery itself is re-executed on each delta",
+                source,
+                ctx.view_name
+            );
+            continue;
+        }
+        if source.starts_with('<') {
+            continue;
+        }
+
+        let (_, source_bare) = split_qualified_name(source);
+        if ctx
+            .ignore_sources
+            .iter()
+            .any(|s| s == source || s == source_bare)
+        {
+            info!(
+                "pg_reflex: skipping trigger install on source '{}' for IMV '{}' (ignored)",
+                source, ctx.view_name
+            );
+            continue;
+        }
+
+        let is_matview = client
+            .select(
+                "SELECT 1 FROM pg_class WHERE oid = to_regclass($1) AND relkind = 'm'",
+                None,
+                &[unsafe {
+                    DatumWithOid::new(source.to_string(), PgBuiltInOids::TEXTOID.oid().value())
+                }],
+            )
+            .unwrap_or_report()
+            .next()
+            .is_some();
+
+        if is_matview {
+            warning!(
+                "pg_reflex: source '{}' is a materialized view — triggers skipped. \
+                 Use SELECT refresh_imv_depending_on('{}') after REFRESH MATERIALIZED VIEW.",
+                source,
+                source
+            );
+            continue;
+        }
+
+        let safe_source = source.replace('.', "_");
+        let trig_exists = client
+            .select(
+                &format!(
+                    "SELECT 1 FROM pg_trigger WHERE tgname = '__reflex_trigger_ins_on_{}'",
+                    safe_source
+                ),
+                None,
+                &[],
+            )
+            .unwrap_or_report()
+            .next()
+            .is_some();
+
+        if ctx.deferred {
+            let staging_ddl = build_staging_table_ddl(source);
+            client.update(&staging_ddl, None, &[]).unwrap_or_report();
+        }
+
+        if !trig_exists {
+            let has_any_deferred = ctx.deferred
+                || {
+                    let check = client
+                    .select(
+                        &format!(
+                            "SELECT 1 FROM public.__reflex_ivm_reference \
+                             WHERE '{}' = ANY(depends_on) AND refresh_mode = 'DEFERRED' AND enabled = TRUE",
+                            source.replace("'", "''")
+                        ),
+                        None,
+                        &[],
+                    )
+                    .unwrap_or_report()
+                    .next()
+                    .is_some();
+                    check
+                };
+
+            if has_any_deferred {
+                for ddl in build_deferred_trigger_ddls(source) {
+                    client.update(&ddl, None, &[]).unwrap_or_report();
+                }
+            } else {
+                for ddl in build_trigger_ddls(source) {
+                    client.update(&ddl, None, &[]).unwrap_or_report();
+                }
+            }
+        } else if ctx.deferred {
+            for ddl in build_deferred_trigger_ddls(source) {
+                client.update(&ddl, None, &[]).unwrap_or_report();
+            }
+        }
+    }
+}
+
+/// When the IMV uses deferred refresh, ensure the deferred-flush
+/// infrastructure (function + per-source helpers) exists.
+fn install_deferred_flush_if_needed(client: &mut pgrx::spi::SpiClient<'_>, ctx: &BuildContext) {
+    if ctx.deferred {
+        for ddl in build_deferred_flush_ddl() {
+            client.update(&ddl, None, &[]).unwrap_or_report();
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn create_reflex_ivm_impl(
     view_name: &str,
@@ -1566,129 +1686,8 @@ pub(crate) fn create_reflex_ivm_impl(
             materialize_aggregate(client, &mut ctx);
         }
 
-        // CREATE consolidated triggers on source tables (one set per source, shared by all IMVs).
-        // Skip if triggers already exist on this source (another IMV already created them).
-        for source in &ctx.froms {
-            if source.starts_with("<subquery:") || source.starts_with("<function:") {
-                warning!(
-                    "pg_reflex: source '{}' for '{}' is a subquery — \
-                     triggers are created on the underlying tables inside the subquery, \
-                     but the subquery itself is re-executed on each delta",
-                    source,
-                    ctx.view_name
-                );
-                continue;
-            }
-            if source.starts_with('<') {
-                continue;
-            }
-
-            // 1.4.5: ignore_sources — operator-requested exclusion of trigger
-            // installation on listed sources. Matches both schema-qualified
-            // ('alp.product') and bare ('product') forms against the IMV's
-            // depends_on entry.
-            let (_, source_bare) = split_qualified_name(source);
-            if ctx
-                .ignore_sources
-                .iter()
-                .any(|s| s == source || s == source_bare)
-            {
-                info!(
-                    "pg_reflex: skipping trigger install on source '{}' for IMV '{}' (ignored)",
-                    source, ctx.view_name
-                );
-                continue;
-            }
-
-            // Check if source is a materialized view (can't have triggers).
-            // Use to_regclass() which respects the current search_path.
-            let is_matview = client
-                .select(
-                    "SELECT 1 FROM pg_class WHERE oid = to_regclass($1) AND relkind = 'm'",
-                    None,
-                    &[unsafe {
-                        DatumWithOid::new(source.to_string(), PgBuiltInOids::TEXTOID.oid().value())
-                    }],
-                )
-                .unwrap_or_report()
-                .next()
-                .is_some();
-
-            if is_matview {
-                warning!(
-                    "pg_reflex: source '{}' is a materialized view — triggers skipped. \
-                     Use SELECT refresh_imv_depending_on('{}') after REFRESH MATERIALIZED VIEW.",
-                    source,
-                    source
-                );
-                continue;
-            }
-
-            let safe_source = source.replace('.', "_");
-            let trig_exists = client
-                .select(
-                    &format!(
-                        "SELECT 1 FROM pg_trigger WHERE tgname = '__reflex_trigger_ins_on_{}'",
-                        safe_source
-                    ),
-                    None,
-                    &[],
-                )
-                .unwrap_or_report()
-                .next()
-                .is_some();
-
-            if ctx.deferred {
-                // Deferred mode: create staging table if not exists
-                let staging_ddl = build_staging_table_ddl(source);
-                client.update(&staging_ddl, None, &[]).unwrap_or_report();
-            }
-
-            if !trig_exists {
-                // Choose trigger type: if ANY deferred IMV exists on this source,
-                // use deferred triggers (they handle both IMMEDIATE and DEFERRED IMVs).
-                let has_any_deferred = ctx.deferred
-                    || {
-                        let check = client
-                        .select(
-                            &format!(
-                                "SELECT 1 FROM public.__reflex_ivm_reference \
-                                 WHERE '{}' = ANY(depends_on) AND refresh_mode = 'DEFERRED' AND enabled = TRUE",
-                                source.replace("'", "''")
-                            ),
-                            None,
-                            &[],
-                        )
-                        .unwrap_or_report()
-                        .next()
-                        .is_some();
-                        check
-                    };
-
-                if has_any_deferred {
-                    for ddl in build_deferred_trigger_ddls(source) {
-                        client.update(&ddl, None, &[]).unwrap_or_report();
-                    }
-                } else {
-                    for ddl in build_trigger_ddls(source) {
-                        client.update(&ddl, None, &[]).unwrap_or_report();
-                    }
-                }
-            } else if ctx.deferred {
-                // Triggers already exist — upgrade to deferred triggers
-                // (which handle both IMMEDIATE and DEFERRED IMVs)
-                for ddl in build_deferred_trigger_ddls(source) {
-                    client.update(&ddl, None, &[]).unwrap_or_report();
-                }
-            }
-        }
-
-        // Create deferred flush infrastructure if this IMV uses deferred mode
-        if ctx.deferred {
-            for ddl in build_deferred_flush_ddl() {
-                client.update(&ddl, None, &[]).unwrap_or_report();
-            }
-        }
+        install_source_triggers(client, &ctx);
+        install_deferred_flush_if_needed(client, &ctx);
 
         // Issue 4: Add index on source GROUP BY columns for MIN/MAX recompute performance
         let has_min_max = ctx
