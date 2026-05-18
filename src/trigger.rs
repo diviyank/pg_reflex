@@ -1816,6 +1816,13 @@ fn aggregate_update_stmts(
     }
 }
 
+/// 1.4.5: when set, the cleanup/target-sync block at the end emits the
+/// high-selectivity dispatch DO block (TRUNCATE+rebuild OR MERGE+cleanup)
+/// instead of the standard MERGE-then-cleanup+target-sync sequence.
+struct PendingDispatch {
+    merge_sql: String,
+}
+
 /// Self-join full refresh: source_table appears multiple times in base_query, so
 /// the standard delta is wrong (every alias gets replaced with the same transition).
 /// Both passthrough and aggregate paths rebuild from base_query.
@@ -2030,6 +2037,229 @@ fn passthrough_op_stmts(
     }
 }
 
+/// Aggregate-branch epilogue: refresh target from intermediate, clean up dead groups,
+/// stamp metadata. Takes `pending_dispatch` by value because the UPDATE arm may have
+/// produced a deferred MERGE that the epilogue must splice into either the
+/// high-selectivity dispatch DO block or the partition-aware dispatch.
+#[allow(clippy::too_many_arguments)]
+fn aggregate_epilogue_stmts(
+    view_name: &str,
+    source_table: &str,
+    operation: &str,
+    end_query: &str,
+    plan: &AggregationPlan,
+    grp_cols: &Option<Vec<String>>,
+    intermediate_tbl: &str,
+    affected_tbl: &str,
+    scratch_tbl: &str,
+    pending_dispatch: Option<PendingDispatch>,
+    stmts: &mut Vec<String>,
+) {
+    let end_query_has_group_by = end_query.to_uppercase().contains("GROUP BY");
+    let include_dead_cleanup = plan.needs_ivm_count
+        && grp_cols.is_some()
+        && matches!(operation, "DELETE" | "DELETE_PROMOTED" | "UPDATE");
+    let skip_target_delete = operation == "INSERT_PROMOTED"
+        && grp_cols.is_some()
+        && plan.source_join_keys.contains_key(source_table);
+    let metadata_sql = format!(
+        "UPDATE public.__reflex_ivm_reference SET last_update_date = NOW() \
+         WHERE name = '{}' AND (last_update_date IS NULL OR last_update_date < NOW() - INTERVAL '1 second')",
+        view_name.replace("'", "''")
+    );
+
+    let mut pending_dispatch = pending_dispatch;
+
+    if end_query_has_group_by {
+        let qv = quote_identifier(view_name);
+        if plan.group_by_columns.is_empty() {
+            let tdel = format!("DELETE FROM {}", qv);
+            let tins = format!("INSERT INTO {} {}", qv, end_query);
+            if let Some(pd) = pending_dispatch.take() {
+                stmts.push(build_high_selectivity_dispatch_sql(
+                    view_name,
+                    intermediate_tbl,
+                    affected_tbl,
+                    &pd.merge_sql,
+                    None,
+                    &tdel,
+                    &tins,
+                ));
+            } else {
+                if !skip_target_delete {
+                    stmts.push(tdel);
+                }
+                stmts.push(tins);
+            }
+        } else {
+            let output_cols: Vec<String> = plan
+                .group_by_columns
+                .iter()
+                .map(|c| format!("\"{}\"", normalized_column_name(c)))
+                .collect();
+            let target_cols: Vec<String> = target_group_columns(plan)
+                .into_iter()
+                .take(plan.group_by_columns.len())
+                .collect();
+            match inject_affected_filter_before_group_by(
+                end_query,
+                &output_cols,
+                affected_tbl,
+                intermediate_tbl,
+                &plan.not_null_columns,
+            ) {
+                Some(spliced_end_q) => {
+                    let ns_in_target = null_safe_in(
+                        affected_tbl,
+                        &qv,
+                        &target_cols,
+                        &output_cols,
+                        &plan.not_null_columns,
+                    );
+                    let tdel = format!("DELETE FROM {} WHERE {}", qv, ns_in_target);
+                    let tins = format!("INSERT INTO {} {}", qv, spliced_end_q);
+                    if let Some(pd) = pending_dispatch.take() {
+                        stmts.push(build_high_selectivity_dispatch_sql(
+                            view_name,
+                            intermediate_tbl,
+                            affected_tbl,
+                            &pd.merge_sql,
+                            None,
+                            &tdel,
+                            &tins,
+                        ));
+                    } else {
+                        if !skip_target_delete {
+                            stmts.push(tdel);
+                        }
+                        stmts.push(tins);
+                    }
+                }
+                None => {
+                    let tdel = format!("DELETE FROM {}", qv);
+                    let tins = format!("INSERT INTO {} {}", qv, end_query);
+                    if let Some(pd) = pending_dispatch.take() {
+                        stmts.push(build_high_selectivity_dispatch_sql(
+                            view_name,
+                            intermediate_tbl,
+                            affected_tbl,
+                            &pd.merge_sql,
+                            None,
+                            &tdel,
+                            &tins,
+                        ));
+                    } else {
+                        if !skip_target_delete {
+                            stmts.push(tdel);
+                        }
+                        stmts.push(tins);
+                    }
+                }
+            }
+        }
+        stmts.push(metadata_sql);
+    } else if let Some(ref cols) = grp_cols {
+        let qv = quote_identifier(view_name);
+        let target_cols = target_group_columns(plan);
+        let ns_in_intermediate = null_safe_in(
+            affected_tbl,
+            intermediate_tbl,
+            cols,
+            cols,
+            &plan.not_null_columns,
+        );
+        let ns_in_target_delete = null_safe_in(
+            affected_tbl,
+            &qv,
+            &target_cols,
+            cols,
+            &plan.not_null_columns,
+        );
+        let dead_cleanup_sql = if include_dead_cleanup {
+            Some(format!(
+                "DELETE FROM {} WHERE __ivm_count <= 0 AND {}",
+                intermediate_tbl, ns_in_intermediate
+            ))
+        } else {
+            None
+        };
+        let target_delete_sql = format!("DELETE FROM {} WHERE {}", qv, ns_in_target_delete);
+        let target_insert_sql = format!(
+            "INSERT INTO {} {} AND {}",
+            qv, end_query, ns_in_intermediate
+        );
+
+        if let Some(pd) = pending_dispatch.take() {
+            let use_partition_dispatch = !plan.partition_columns.is_empty()
+                && plan.partition_strategy.eq_ignore_ascii_case("LIST");
+            if use_partition_dispatch {
+                let part_col = &plan.partition_columns[0];
+                let part_col_q = format!("\"{}\"", part_col);
+                let filtered_scratch = format!(
+                    "(SELECT * FROM {} WHERE {}::text <> ALL($1::TEXT[]))",
+                    scratch_tbl, part_col_q
+                );
+                let merge_filtered = build_merge_from_table_sql(
+                    intermediate_tbl,
+                    &filtered_scratch,
+                    plan,
+                    DeltaOp::Add,
+                );
+                let dead_cleanup_filtered = dead_cleanup_sql.as_ref().map(|s| {
+                    format!(
+                        "{} AND EXISTS (SELECT 1 FROM {} __ap \
+                          WHERE __ap.{} = {}.{} AND __ap.{}::text <> ALL($1::TEXT[]))",
+                        s, affected_tbl, part_col_q, intermediate_tbl, part_col_q, part_col_q
+                    )
+                });
+                let tdel_filtered = format!(
+                    "{} AND {}.{}::text <> ALL($1::TEXT[])",
+                    target_delete_sql, qv, part_col_q
+                );
+                let tins_filtered = format!(
+                    "{} AND {}.{}::text <> ALL($1::TEXT[])",
+                    target_insert_sql, intermediate_tbl, part_col_q
+                );
+                stmts.push(build_partition_aware_dispatch_sql(
+                    view_name,
+                    intermediate_tbl,
+                    intermediate_tbl,
+                    affected_tbl,
+                    part_col,
+                    &merge_filtered,
+                    dead_cleanup_filtered.as_deref(),
+                    &tdel_filtered,
+                    &tins_filtered,
+                ));
+            } else {
+                stmts.push(build_high_selectivity_dispatch_sql(
+                    view_name,
+                    intermediate_tbl,
+                    affected_tbl,
+                    &pd.merge_sql,
+                    dead_cleanup_sql.as_deref(),
+                    &target_delete_sql,
+                    &target_insert_sql,
+                ));
+            }
+        } else {
+            if let Some(s) = dead_cleanup_sql {
+                stmts.push(s);
+            }
+            if !skip_target_delete {
+                stmts.push(target_delete_sql);
+            }
+            stmts.push(target_insert_sql);
+        }
+        stmts.push(metadata_sql);
+    } else {
+        let qv = quote_identifier(view_name);
+        stmts.push(format!("TRUNCATE {}", qv));
+        stmts.push(format!("INSERT INTO {} {}", qv, end_query));
+        stmts.push(metadata_sql);
+    }
+}
+
 /// Generates the SQL statements to apply a delta to an IMV.
 ///
 /// Called from plpgsql trigger wrappers. Returns a delimiter-separated string
@@ -2079,12 +2309,6 @@ pub fn reflex_build_delta_sql(
 
     let mut stmts: Vec<String> = Vec::new();
 
-    // 1.4.5: when set, the cleanup/target-sync block at the end emits the
-    // high-selectivity dispatch DO block (TRUNCATE+rebuild OR MERGE+cleanup)
-    // instead of the standard MERGE-then-cleanup+target-sync sequence.
-    struct PendingDispatch {
-        merge_sql: String,
-    }
     let mut pending_dispatch: Option<PendingDispatch> = None;
 
     // Pre-compute group columns and affected-groups table name (used by multiple paths).
@@ -2260,271 +2484,19 @@ pub fn reflex_build_delta_sql(
             _ => {}
         }
 
-        // Refresh target from intermediate, clean up dead groups, and update metadata.
-        //
-        // Emitted as separate statements (not a single CTE chain): sibling CTEs
-        // in Postgres share a snapshot, so an `INSERT` sibling cannot observe
-        // a `DELETE` sibling — when the target has a unique index on the group
-        // key, re-inserting the refreshed row hits a duplicate-key error.
-        let end_query_has_group_by = end_query.to_uppercase().contains("GROUP BY");
-        let include_dead_cleanup = plan.needs_ivm_count
-            && grp_cols.is_some()
-            && matches!(operation, "DELETE" | "DELETE_PROMOTED" | "UPDATE");
-        // 1.4.6 — Item α OUT→IN with the source_join_keys safety gate
-        // satisfied: target had zero rows for the affected group keys
-        // (OLD-side filter-rejected; bulk-INSERT branch above just added
-        // the first rows for those keys). The target DELETE is a
-        // guaranteed-zero-row scan; skip it.
-        let skip_target_delete = operation == "INSERT_PROMOTED"
-            && grp_cols.is_some()
-            && plan.source_join_keys.contains_key(source_table);
-        let metadata_sql = format!(
-            "UPDATE public.__reflex_ivm_reference SET last_update_date = NOW() \
-             WHERE name = '{}' AND (last_update_date IS NULL OR last_update_date < NOW() - INTERVAL '1 second')",
-            view_name.replace("'", "''")
+        aggregate_epilogue_stmts(
+            view_name,
+            source_table,
+            operation,
+            end_query,
+            &plan,
+            &grp_cols,
+            &intermediate_tbl,
+            &affected_tbl,
+            &scratch_tbl,
+            pending_dispatch.take(),
+            &mut stmts,
         );
-
-        if end_query_has_group_by {
-            let qv = quote_identifier(view_name);
-            if plan.group_by_columns.is_empty() {
-                // Global COUNT(DISTINCT) with no output GROUP BY — single output row, full rebuild.
-                let tdel = format!("DELETE FROM {}", qv);
-                let tins = format!("INSERT INTO {} {}", qv, end_query);
-                if let Some(pd) = pending_dispatch.take() {
-                    stmts.push(build_high_selectivity_dispatch_sql(
-                        view_name,
-                        &intermediate_tbl,
-                        &affected_tbl,
-                        &pd.merge_sql,
-                        None,
-                        &tdel,
-                        &tins,
-                    ));
-                } else {
-                    if !skip_target_delete {
-                        stmts.push(tdel);
-                    }
-                    stmts.push(tins);
-                }
-            } else {
-                // Intermediate-side column names (== affected column names).
-                let output_cols: Vec<String> = plan
-                    .group_by_columns
-                    .iter()
-                    .map(|c| format!("\"{}\"", normalized_column_name(c)))
-                    .collect();
-                let target_cols: Vec<String> = target_group_columns(&plan)
-                    .into_iter()
-                    .take(plan.group_by_columns.len())
-                    .collect();
-                match inject_affected_filter_before_group_by(
-                    end_query,
-                    &output_cols,
-                    &affected_tbl,
-                    &intermediate_tbl,
-                    &plan.not_null_columns,
-                ) {
-                    Some(spliced_end_q) => {
-                        let ns_in_target = null_safe_in(
-                            &affected_tbl,
-                            &qv,
-                            &target_cols,
-                            &output_cols,
-                            &plan.not_null_columns,
-                        );
-                        let tdel = format!("DELETE FROM {} WHERE {}", qv, ns_in_target);
-                        let tins = format!("INSERT INTO {} {}", qv, spliced_end_q);
-                        if let Some(pd) = pending_dispatch.take() {
-                            stmts.push(build_high_selectivity_dispatch_sql(
-                                view_name,
-                                &intermediate_tbl,
-                                &affected_tbl,
-                                &pd.merge_sql,
-                                None,
-                                &tdel,
-                                &tins,
-                            ));
-                        } else {
-                            if !skip_target_delete {
-                                stmts.push(tdel);
-                            }
-                            stmts.push(tins);
-                        }
-                    }
-                    None => {
-                        // No GROUP BY found — defensive fallback to full rebuild.
-                        let tdel = format!("DELETE FROM {}", qv);
-                        let tins = format!("INSERT INTO {} {}", qv, end_query);
-                        if let Some(pd) = pending_dispatch.take() {
-                            stmts.push(build_high_selectivity_dispatch_sql(
-                                view_name,
-                                &intermediate_tbl,
-                                &affected_tbl,
-                                &pd.merge_sql,
-                                None,
-                                &tdel,
-                                &tins,
-                            ));
-                        } else {
-                            if !skip_target_delete {
-                                stmts.push(tdel);
-                            }
-                            stmts.push(tins);
-                        }
-                    }
-                }
-            }
-            stmts.push(metadata_sql);
-        } else if let Some(ref cols) = grp_cols {
-            let qv = quote_identifier(view_name);
-            let target_cols = target_group_columns(&plan);
-            let ns_in_intermediate = null_safe_in(
-                &affected_tbl,
-                &intermediate_tbl,
-                cols,
-                cols,
-                &plan.not_null_columns,
-            );
-            let ns_in_target_delete = null_safe_in(
-                &affected_tbl,
-                &qv,
-                &target_cols,
-                cols,
-                &plan.not_null_columns,
-            );
-            let dead_cleanup_sql = if include_dead_cleanup {
-                Some(format!(
-                    "DELETE FROM {} WHERE __ivm_count <= 0 AND {}",
-                    intermediate_tbl, ns_in_intermediate
-                ))
-            } else {
-                None
-            };
-            let target_delete_sql = format!("DELETE FROM {} WHERE {}", qv, ns_in_target_delete);
-            let target_insert_sql = format!(
-                "INSERT INTO {} {} AND {}",
-                qv, end_query, ns_in_intermediate
-            );
-
-            if let Some(pd) = pending_dispatch.take() {
-                // 1.5.3 (plans/partitioning_3.md §3 + §4): when the IMV is
-                // partitioned AND the strategy is LIST, replace the
-                // global high-selectivity dispatch with the
-                // partition-aware dispatch — partition_reconcile for hot
-                // partitions (atomic swap via Phase A), filtered MERGE for
-                // cold.
-                //
-                // The dispatch reads pkey counts from the already-populated
-                // `affected_tbl`.  The affected table carries every GROUP
-                // BY column (including the partition column) regardless of
-                // which source fired the trigger, so the dispatch works
-                // both for the anchor (Tier 1) and for non-anchor sources
-                // that JOIN to the anchor (Tier 2 — affected JOIN already
-                // ran during scratch fill, so the partition column is
-                // populated).
-                //
-                // For non-anchor sources that don't JOIN to the anchor's
-                // partition column (i.e. `partition_join_paths[source]`
-                // empty), the partition column on affected would still be
-                // populated (it comes from the JOIN graph at scratch-fill
-                // time), so the dispatch is correct.  When that JOIN-graph
-                // information is missing or ambiguous, the post-scratch
-                // dispatch is still safe — it merely loses the per-partition
-                // routing optimization.
-                let use_partition_dispatch = !plan.partition_columns.is_empty()
-                    && plan.partition_strategy.eq_ignore_ascii_case("LIST");
-                if use_partition_dispatch {
-                    let part_col = &plan.partition_columns[0];
-                    let part_col_q = format!("\"{}\"", part_col);
-                    // Wrap scratch with the cold-partition filter for the
-                    // MERGE.  The MERGE's USING source becomes a SELECT *
-                    // FROM scratch WHERE pkey <> ALL($1::TEXT[]).
-                    let filtered_scratch = format!(
-                        "(SELECT * FROM {} WHERE {}::text <> ALL($1::TEXT[]))",
-                        scratch_tbl, part_col_q
-                    );
-                    let merge_filtered = build_merge_from_table_sql(
-                        &intermediate_tbl,
-                        &filtered_scratch,
-                        &plan,
-                        DeltaOp::Add,
-                    );
-                    // The dead-cleanup + target paths reference
-                    // affected_tbl; filter by partition col on that table.
-                    let dead_cleanup_filtered = dead_cleanup_sql.as_ref().map(|s| {
-                        format!(
-                            "{} AND EXISTS (SELECT 1 FROM {} __ap \
-                              WHERE __ap.{} = {}.{} AND __ap.{}::text <> ALL($1::TEXT[]))",
-                            s, affected_tbl, part_col_q, intermediate_tbl, part_col_q, part_col_q
-                        )
-                    });
-                    // For target delete: target_delete_sql currently is
-                    // `DELETE FROM qv WHERE <ns_in_target_delete>`. The
-                    // ns_in_target_delete uses affected_tbl. We add an
-                    // extra AND on the target's partition column.
-                    let tdel_filtered = format!(
-                        "{} AND {}.{}::text <> ALL($1::TEXT[])",
-                        target_delete_sql, qv, part_col_q
-                    );
-                    // For target insert: end_query reads from intermediate;
-                    // the WHERE filter on intermediate.partition_col will
-                    // splice naturally.
-                    let tins_filtered = format!(
-                        "{} AND {}.{}::text <> ALL($1::TEXT[])",
-                        target_insert_sql, intermediate_tbl, part_col_q
-                    );
-                    stmts.push(build_partition_aware_dispatch_sql(
-                        view_name,
-                        &intermediate_tbl,
-                        &intermediate_tbl,
-                        &affected_tbl,
-                        part_col,
-                        &merge_filtered,
-                        dead_cleanup_filtered.as_deref(),
-                        &tdel_filtered,
-                        &tins_filtered,
-                    ));
-                } else {
-                    // 1.4.5: emit the high-selectivity dispatch DO block — at
-                    // runtime, decide between MERGE-incremental and
-                    // TRUNCATE+rebuild based on |affected| / |intermediate|.
-                    // The TRUNCATE+rebuild branch rebuilds intermediate from
-                    // base_query and target from end_query (full refresh of the
-                    // IMV body), bypassing the per-row MERGE probe cost and the
-                    // target double-rewrite that dominate at high selectivity.
-                    stmts.push(build_high_selectivity_dispatch_sql(
-                        view_name,
-                        &intermediate_tbl,
-                        &affected_tbl,
-                        &pd.merge_sql,
-                        dead_cleanup_sql.as_deref(),
-                        &target_delete_sql,
-                        &target_insert_sql,
-                    ));
-                }
-            } else {
-                // Standard incremental path (no dispatch): MERGE already
-                // pushed by a non-dispatch branch (e.g. outer-join-secondary
-                // or top-K). The MERGE's caller (push_materialized_merge /
-                // push_materialized_merge_and_affected) has already ANALYZE'd
-                // the intermediate post-MERGE so the dead-cleanup +
-                // target-sync planners have fresh stats. Now push the
-                // cleanup + target sync statements.
-                if let Some(s) = dead_cleanup_sql {
-                    stmts.push(s);
-                }
-                if !skip_target_delete {
-                    stmts.push(target_delete_sql);
-                }
-                stmts.push(target_insert_sql);
-            }
-            stmts.push(metadata_sql);
-        } else {
-            let qv = quote_identifier(view_name);
-            stmts.push(format!("TRUNCATE {}", qv));
-            stmts.push(format!("INSERT INTO {} {}", qv, end_query));
-            stmts.push(metadata_sql);
-        }
     }
 
     // Historical note (2026-04-24): an earlier version of this function
