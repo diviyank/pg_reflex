@@ -167,11 +167,18 @@ fn schema_prefix(view_name: &str, child: &str) -> String {
     format!("\"{}\".\"{}\"", schema, child)
 }
 
-/// Build the `CREATE TABLE child PARTITION OF parent FOR VALUES …` DDL pair
-/// for one source-child mapping.  Returns (intermediate_ddl, target_ddl).
+/// Build the `CREATE [UNLOGGED] TABLE child PARTITION OF parent FOR VALUES …`
+/// DDL pair for one source-child mapping.  Returns (intermediate_ddl,
+/// target_ddl).
+///
+/// `unlogged` controls whether the children inherit UNLOGGED storage.
+/// Partitioned parents themselves are always LOGGED (see
+/// `build_intermediate_table_ddl` / `build_target_table_ddl`), so the
+/// UNLOGGED keyword must be set per-child here.
 pub(crate) fn build_partition_child_ddl_pair(
     view_name: &str,
     source_child: &PartitionChild,
+    unlogged: bool,
 ) -> (String, String) {
     let int_parent = intermediate_table_name(view_name);
     let tgt_parent = quote_identifier(view_name);
@@ -181,13 +188,18 @@ pub(crate) fn build_partition_child_ddl_pair(
     let int_child = schema_prefix(view_name, &int_child_bare);
     let tgt_child = schema_prefix(view_name, &tgt_child_bare);
 
+    let create_kw = if unlogged {
+        "CREATE UNLOGGED TABLE"
+    } else {
+        "CREATE TABLE"
+    };
     let int_ddl = format!(
-        "CREATE TABLE IF NOT EXISTS {} PARTITION OF {} {}",
-        int_child, int_parent, source_child.bound_expr
+        "{} IF NOT EXISTS {} PARTITION OF {} {}",
+        create_kw, int_child, int_parent, source_child.bound_expr
     );
     let tgt_ddl = format!(
-        "CREATE TABLE IF NOT EXISTS {} PARTITION OF {} {}",
-        tgt_child, tgt_parent, source_child.bound_expr
+        "{} IF NOT EXISTS {} PARTITION OF {} {}",
+        create_kw, tgt_child, tgt_parent, source_child.bound_expr
     );
     (int_ddl, tgt_ddl)
 }
@@ -542,7 +554,7 @@ pub(crate) fn reflex_sync_partitions_impl(view_name: &str, drop_orphans: bool) -
         // Load partition metadata.
         let meta = client
             .select(
-                "SELECT partition_columns, partition_strategy, depends_on \
+                "SELECT partition_columns, partition_strategy, depends_on, storage_mode \
                  FROM public.__reflex_ivm_reference WHERE name = $1",
                 Some(1),
                 &[unsafe {
@@ -571,6 +583,11 @@ pub(crate) fn reflex_sync_partitions_impl(view_name: &str, drop_orphans: bool) -
             .get_by_name::<Vec<String>, _>("depends_on")
             .unwrap_or(None)
             .unwrap_or_default();
+        let unlogged = row
+            .get_by_name::<&str, _>("storage_mode")
+            .unwrap_or(None)
+            .unwrap_or("UNLOGGED")
+            .eq_ignore_ascii_case("UNLOGGED");
 
         // Resolve anchor source.
         let anchor = resolve_anchor_source(client, &part_cols[0], &sources)
@@ -612,7 +629,7 @@ pub(crate) fn reflex_sync_partitions_impl(view_name: &str, drop_orphans: bool) -
         for src in &src_children {
             let int_name = intermediate_child_name(view_name, &src.bare_name);
             let tgt_name = target_child_name(view_name, &src.bare_name);
-            let (int_ddl, tgt_ddl) = build_partition_child_ddl_pair(view_name, src);
+            let (int_ddl, tgt_ddl) = build_partition_child_ddl_pair(view_name, src, unlogged);
             if !int_have.contains(&int_name) {
                 client
                     .update(&int_ddl, None, &[])

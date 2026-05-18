@@ -134,6 +134,40 @@ fn test_target_table_ddl_logged() {
     assert!(!ddl.contains("UNLOGGED"));
 }
 
+/// Partitioned parents must never be UNLOGGED: PG18 rejects the combination
+/// outright ("partitioned tables cannot be unlogged") and pre-PG18 silently
+/// ignored the keyword.  Storage mode is carried by the partition children
+/// (see `build_partition_child_ddl_pair`).
+#[test]
+fn test_intermediate_partitioned_parent_is_never_unlogged() {
+    let mut plan = sample_plan();
+    plan.partition_columns = vec!["city".to_string()];
+    plan.partition_strategy = "LIST".to_string();
+    let types = sample_types();
+    let ddl = build_intermediate_table_ddl("test_view", &plan, &types, false).unwrap();
+    assert!(
+        !ddl.contains("UNLOGGED"),
+        "partitioned intermediate parent must not carry UNLOGGED: {}",
+        ddl
+    );
+    assert!(ddl.contains("PARTITION BY"));
+}
+
+#[test]
+fn test_target_partitioned_parent_is_never_unlogged() {
+    let mut plan = sample_plan();
+    plan.partition_columns = vec!["city".to_string()];
+    plan.partition_strategy = "LIST".to_string();
+    let types = sample_types();
+    let ddl = build_target_table_ddl("test_view", &plan, &types, false);
+    assert!(
+        !ddl.contains("UNLOGGED"),
+        "partitioned target parent must not carry UNLOGGED: {}",
+        ddl
+    );
+    assert!(ddl.contains("PARTITION BY"));
+}
+
 #[test]
 fn test_trigger_ddls_format() {
     let ddls = build_trigger_ddls("orders");

@@ -132,11 +132,18 @@ pub fn build_intermediate_table_ddl(
     // do, and each child inherits fillfactor on creation via the parent's
     // reloptions).  We therefore omit the WITH clause on the parent when
     // partitioning and let each child set fillfactor at PARTITION OF time.
+    //
+    // UNLOGGED on a partitioned parent: PG18 rejects this outright
+    // ("partitioned tables cannot be unlogged"), and pre-PG18 silently
+    // ignored it.  Either way the parent holds no rows, so storage mode
+    // there is meaningless — the children carry UNLOGGED instead (see
+    // `build_partition_child_ddl_pair`).
+    let is_partitioned = !plan.partition_columns.is_empty() && !plan.partition_strategy.is_empty();
     let mut builder = CreateTable::new(table_name)
-        .unlogged(!logged)
+        .unlogged(!logged && !is_partitioned)
         .if_not_exists(true)
         .columns(columns);
-    if !plan.partition_columns.is_empty() && !plan.partition_strategy.is_empty() {
+    if is_partitioned {
         let part = crate::partition::build_partition_by_clause(
             &plan.partition_strategy,
             &plan.partition_columns,
@@ -268,12 +275,15 @@ pub fn build_target_table_ddl(
     // HOT update eligible.
     //
     // Partitioned IMVs emit `PARTITION BY` on the parent and skip
-    // fillfactor (see build_intermediate_table_ddl note).
+    // fillfactor (see build_intermediate_table_ddl note).  UNLOGGED is
+    // never emitted on partitioned parents (PG18 rejects it, pre-PG18
+    // ignored it); children carry UNLOGGED instead.
+    let is_partitioned = !plan.partition_columns.is_empty() && !plan.partition_strategy.is_empty();
     let mut builder = CreateTable::quoted_name(view_name)
-        .unlogged(!logged)
+        .unlogged(!logged && !is_partitioned)
         .if_not_exists(true)
         .columns(columns);
-    if !plan.partition_columns.is_empty() && !plan.partition_strategy.is_empty() {
+    if is_partitioned {
         let part = crate::partition::build_partition_by_clause(
             &plan.partition_strategy,
             &plan.partition_columns,

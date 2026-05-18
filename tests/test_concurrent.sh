@@ -37,8 +37,31 @@ fi
 PASS=0
 FAIL=0
 
+# Surface SQL errors: `psql -c` returns non-zero on SQL failure and the
+# script runs under `set -e`, so any silenced stderr would kill the run
+# without a diagnostic.  Always show errors so CI logs are actionable.
+# ON_ERROR_STOP makes the exit status correspond to the SQL outcome even
+# when psql is fed multiple statements via -c.
 run_sql() {
-    $PSQL_CMD -tAq -c "$1" 2>/dev/null
+    $PSQL_CMD -v ON_ERROR_STOP=1 -tAq -c "$1"
+}
+
+# Wait for a list of background PIDs and report the first non-zero exit.
+# Without this, `set -e` collapses concurrent failures into a bare
+# "exit code 1" with no context about which session failed.
+wait_pids() {
+    local rc=0
+    local failed_pid=""
+    for pid in "$@"; do
+        if ! wait "$pid"; then
+            rc=$?
+            failed_pid="$pid"
+        fi
+    done
+    if [ "$rc" -ne 0 ]; then
+        echo "  FATAL: background psql session pid=$failed_pid exited $rc (see stderr above for SQL error)" >&2
+        return "$rc"
+    fi
 }
 
 report() {
@@ -72,14 +95,11 @@ run_sql "SELECT create_reflex_ivm('conc_view', 'SELECT grp, SUM(val) AS total, C
 # Spawn N parallel sessions, each inserting ROWS rows with value = session_id
 PIDS=()
 for s in $(seq 1 "$SESSIONS"); do
-    $PSQL_CMD -c "INSERT INTO conc_src (grp, val) SELECT 'A', $s FROM generate_series(1, $ROWS)" &
+    $PSQL_CMD -v ON_ERROR_STOP=1 -c "INSERT INTO conc_src (grp, val) SELECT 'A', $s FROM generate_series(1, $ROWS)" &
     PIDS+=($!)
 done
 
-# Wait for all
-for pid in "${PIDS[@]}"; do
-    wait "$pid"
-done
+wait_pids "${PIDS[@]}"
 
 # Verify: total rows = SESSIONS * ROWS
 EXPECTED_CNT=$((SESSIONS * ROWS))
@@ -102,13 +122,11 @@ run_sql "SELECT create_reflex_ivm('conc2_view', 'SELECT grp, SUM(val) AS total, 
 
 PIDS=()
 for s in $(seq 1 "$SESSIONS"); do
-    $PSQL_CMD -c "INSERT INTO conc2_src (grp, val) SELECT 'G$s', $s FROM generate_series(1, $ROWS)" &
+    $PSQL_CMD -v ON_ERROR_STOP=1 -c "INSERT INTO conc2_src (grp, val) SELECT 'G$s', $s FROM generate_series(1, $ROWS)" &
     PIDS+=($!)
 done
 
-for pid in "${PIDS[@]}"; do
-    wait "$pid"
-done
+wait_pids "${PIDS[@]}"
 
 # Verify: each group has ROWS rows
 MISMATCHES=$(run_sql "
@@ -136,7 +154,7 @@ PIDS=()
 
 # INSERT sessions
 for s in $(seq 1 "$HALF"); do
-    $PSQL_CMD -c "INSERT INTO conc3_src (grp, val) SELECT 'A', 1 FROM generate_series(1, $ROWS)" &
+    $PSQL_CMD -v ON_ERROR_STOP=1 -c "INSERT INTO conc3_src (grp, val) SELECT 'A', 1 FROM generate_series(1, $ROWS)" &
     PIDS+=($!)
 done
 
@@ -144,13 +162,11 @@ done
 for s in $(seq 1 "$HALF"); do
     OFFSET=$(( (s - 1) * (ROWS / 2) + 1 ))
     LIMIT=$((ROWS / 2))
-    $PSQL_CMD -c "DELETE FROM conc3_src WHERE id IN (SELECT id FROM conc3_src ORDER BY id OFFSET $OFFSET LIMIT $LIMIT)" &
+    $PSQL_CMD -v ON_ERROR_STOP=1 -c "DELETE FROM conc3_src WHERE id IN (SELECT id FROM conc3_src ORDER BY id OFFSET $OFFSET LIMIT $LIMIT)" &
     PIDS+=($!)
 done
 
-for pid in "${PIDS[@]}"; do
-    wait "$pid"
-done
+wait_pids "${PIDS[@]}"
 
 # After concurrent ops, reconcile and verify
 run_sql "SELECT reflex_reconcile('conc3_view');"

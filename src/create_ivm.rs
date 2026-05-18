@@ -1145,12 +1145,15 @@ fn filter_imv_relevant_columns(client: &mut pgrx::spi::SpiClient<'_>, ctx: &mut 
 /// Passthrough materialization: CREATE TABLE AS (or partitioned variant),
 /// ANALYZE, unique-index, scratch tables.
 fn materialize_passthrough(client: &mut pgrx::spi::SpiClient<'_>, ctx: &mut BuildContext) {
-    let create_kw = if ctx.logged {
+    let is_partitioned = !ctx.plan.partition_columns.is_empty();
+    // Partitioned parents are never UNLOGGED — PG18 rejects it and pre-PG18
+    // ignored it (children carry UNLOGGED via `build_partition_child_ddl_pair`).
+    let create_kw = if ctx.logged || is_partitioned {
         "CREATE TABLE"
     } else {
         "CREATE UNLOGGED TABLE"
     };
-    if !ctx.plan.partition_columns.is_empty() {
+    if is_partitioned {
         let scratch_name = format!(
             "__reflex_pt_shape_{}",
             safe_identifier(split_qualified_name(ctx.view_name).1)
@@ -1211,8 +1214,11 @@ fn materialize_passthrough(client: &mut pgrx::spi::SpiClient<'_>, ctx: &mut Buil
         ) {
             let src_children = crate::partition::list_partition_children(client, &anchor);
             for src_child in &src_children {
-                let (_, tgt_ddl) =
-                    crate::partition::build_partition_child_ddl_pair(ctx.view_name, src_child);
+                let (_, tgt_ddl) = crate::partition::build_partition_child_ddl_pair(
+                    ctx.view_name,
+                    src_child,
+                    !ctx.logged,
+                );
                 client.update(&tgt_ddl, None, &[]).unwrap_or_report();
             }
         }
@@ -1367,8 +1373,11 @@ fn materialize_aggregate(client: &mut pgrx::spi::SpiClient<'_>, ctx: &mut BuildC
                     anchor
                 );
                 for src_child in &src_children {
-                    let (int_ddl, tgt_ddl) =
-                        crate::partition::build_partition_child_ddl_pair(ctx.view_name, src_child);
+                    let (int_ddl, tgt_ddl) = crate::partition::build_partition_child_ddl_pair(
+                        ctx.view_name,
+                        src_child,
+                        !ctx.logged,
+                    );
                     client.update(&int_ddl, None, &[]).unwrap_or_report();
                     client.update(&tgt_ddl, None, &[]).unwrap_or_report();
                 }

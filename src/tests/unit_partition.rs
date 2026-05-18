@@ -110,13 +110,26 @@ fn test_build_partition_child_ddl_pair_shape() {
         bare_name: "orders_p_north".to_string(),
         bound_expr: "FOR VALUES IN ('NORTH')".to_string(),
     };
-    let (int_ddl, tgt_ddl) = build_partition_child_ddl_pair("sales_view", &src_child);
+    let (int_ddl, tgt_ddl) = build_partition_child_ddl_pair("sales_view", &src_child, false);
     assert!(int_ddl.contains("__reflex_intermediate_sales_view_orders_p_north"));
     assert!(int_ddl.contains("__reflex_intermediate_sales_view"));
     assert!(int_ddl.contains("FOR VALUES IN ('NORTH')"));
     assert!(tgt_ddl.contains("\"sales_view_orders_p_north\""));
     assert!(tgt_ddl.contains("\"sales_view\""));
     assert!(tgt_ddl.contains("FOR VALUES IN ('NORTH')"));
+    assert!(!int_ddl.contains("UNLOGGED"));
+    assert!(!tgt_ddl.contains("UNLOGGED"));
+}
+
+#[test]
+fn test_build_partition_child_ddl_pair_unlogged() {
+    let src_child = PartitionChild {
+        bare_name: "orders_p_north".to_string(),
+        bound_expr: "FOR VALUES IN ('NORTH')".to_string(),
+    };
+    let (int_ddl, tgt_ddl) = build_partition_child_ddl_pair("sales_view", &src_child, true);
+    assert!(int_ddl.starts_with("CREATE UNLOGGED TABLE"));
+    assert!(tgt_ddl.starts_with("CREATE UNLOGGED TABLE"));
 }
 
 #[test]
