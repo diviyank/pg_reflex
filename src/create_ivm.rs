@@ -24,49 +24,66 @@ use crate::sql_writer::{
 use crate::validate_view_name;
 use crate::window;
 
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn create_reflex_ivm_impl(
+/// Outputs of the parse-and-validate prelude of [`create_reflex_ivm_impl`].
+///
+/// Bundles the normalized storage/refresh flags, the parsed sqlparser AST and
+/// the [`crate::sql_analyzer::SqlAnalysis`] so the decomposition helpers and
+/// the main pipeline can read them without re-parsing.
+struct ParsedInputs {
+    logged: bool,
+    deferred: bool,
+    storage_upper: String,
+    mode_upper: String,
+    parsed_sql: Vec<sqlparser::ast::Statement>,
+    analysis: crate::sql_analyzer::SqlAnalysis,
+}
+
+/// Phase 1 of the create-IMV pipeline.
+///
+/// Normalizes `storage`/`refresh`, validates the view name, parses the SQL
+/// and runs [`crate::sql_analyzer::analyze`] on it. Also rejects DISTINCT on
+/// aggregates other than COUNT (only COUNT(DISTINCT) is incrementally
+/// maintainable).
+///
+/// Returns the error string verbatim on the `Err` arm so the caller can
+/// `return` it unchanged — preserves byte-identical error reporting.
+fn validate_and_parse_inputs(
     view_name: &str,
     sql: &str,
-    unique_columns_str: &str,
-    if_not_exists: bool,
     storage_mode: &str,
     refresh_mode: &str,
-    topk_k: Option<usize>,
-    ignore_sources: &[String],
-    partition_by: &[String],
-) -> &'static str {
+) -> Result<ParsedInputs, &'static str> {
     let storage_upper = storage_mode.to_uppercase();
     if storage_upper != "LOGGED" && storage_upper != "UNLOGGED" {
-        return "ERROR: storage must be 'LOGGED' or 'UNLOGGED'";
+        return Err("ERROR: storage must be 'LOGGED' or 'UNLOGGED'");
     }
     let logged = storage_upper == "LOGGED";
     let mode_upper = refresh_mode.to_uppercase();
     if mode_upper != "IMMEDIATE" && mode_upper != "DEFERRED" {
-        return "ERROR: mode must be 'IMMEDIATE' or 'DEFERRED'";
+        return Err("ERROR: mode must be 'IMMEDIATE' or 'DEFERRED'");
     }
     let deferred = mode_upper == "DEFERRED";
-    if let Err(msg) = validate_view_name(view_name) {
-        return msg;
-    }
+    validate_view_name(view_name)?;
     let dialect = PostgreSqlDialect {};
     let parsed_sql = match Parser::parse_sql(&dialect, sql) {
         Ok(stmts) => stmts,
         Err(e) => {
             warning!("pg_reflex: failed to parse SQL for '{}': {}", view_name, e);
-            return Box::leak(format!("ERROR: Failed to parse SQL: {}", e).into_boxed_str());
+            return Err(Box::leak(
+                format!("ERROR: Failed to parse SQL: {}", e).into_boxed_str(),
+            ));
         }
     };
     let analysis = match analyze(&parsed_sql) {
         Err(SqlAnalysisError::MultipleQueries(_)) => {
-            return "ERROR: Expected 1 query, got multiple";
+            return Err("ERROR: Expected 1 query, got multiple");
         }
         Err(SqlAnalysisError::NotASelectQuery) => {
-            return "ERROR: Query is not a SELECT";
+            return Err("ERROR: Query is not a SELECT");
         }
         Ok(a) => {
             if let Some(reason) = a.unsupported_reason() {
-                return Box::leak(format!("ERROR: {}", reason).into_boxed_str());
+                return Err(Box::leak(format!("ERROR: {}", reason).into_boxed_str()));
             }
             // Reject SUM(DISTINCT), AVG(DISTINCT), etc. — DISTINCT modifier is only
             // supported on COUNT. Check the original SQL for the pattern.
@@ -82,176 +99,61 @@ pub(crate) fn create_reflex_ivm_impl(
                 || sql_upper.contains("BOOL_OR(DISTINCT")
                 || sql_upper.contains("BOOL_OR (DISTINCT");
             if has_distinct_agg {
-                return "ERROR: DISTINCT modifier on SUM/AVG/MIN/MAX/BOOL_OR is not supported. \
+                return Err("ERROR: DISTINCT modifier on SUM/AVG/MIN/MAX/BOOL_OR is not supported. \
                         Only COUNT(DISTINCT col) is supported. Use a CTE with SELECT DISTINCT \
-                        to pre-deduplicate: WITH d AS (SELECT DISTINCT grp, val FROM t) SELECT grp, SUM(val) FROM d GROUP BY grp";
+                        to pre-deduplicate: WITH d AS (SELECT DISTINCT grp, val FROM t) SELECT grp, SUM(val) FROM d GROUP BY grp");
             }
             a
         }
     };
+    Ok(ParsedInputs {
+        logged,
+        deferred,
+        storage_upper,
+        mode_upper,
+        parsed_sql,
+        analysis,
+    })
+}
 
-    // --- Set operation decomposition: UNION / INTERSECT / EXCEPT ---
-    if let Some(ref set_op) = analysis.set_operation {
-        match set_op.op {
-            sqlparser::ast::SetOperator::Union
-            | sqlparser::ast::SetOperator::Intersect
-            | sqlparser::ast::SetOperator::Except => {}
-            _ => {
-                return "ERROR: Unsupported set operation. Supported: UNION, INTERSECT, EXCEPT.";
-            }
+/// Decomposition phase: UNION / INTERSECT / EXCEPT.
+///
+/// Each operand is materialised as its own sub-IMV (recursively); the user-
+/// visible name becomes a `CREATE VIEW` over those sub-IMVs that PostgreSQL
+/// evaluates on read. Returns `Some(result)` to short-circuit
+/// [`create_reflex_ivm_impl`]; `None` if the query has no top-level set
+/// operator.
+#[allow(clippy::too_many_arguments)]
+fn try_decompose_set_op(
+    view_name: &str,
+    sql: &str,
+    unique_columns_str: &str,
+    storage_mode: &str,
+    refresh_mode: &str,
+    topk_k: Option<usize>,
+    ignore_sources: &[String],
+    partition_by: &[String],
+    parsed: &ParsedInputs,
+) -> Option<&'static str> {
+    let set_op = parsed.analysis.set_operation.as_ref()?;
+    match set_op.op {
+        sqlparser::ast::SetOperator::Union
+        | sqlparser::ast::SetOperator::Intersect
+        | sqlparser::ast::SetOperator::Except => {}
+        _ => {
+            return Some("ERROR: Unsupported set operation. Supported: UNION, INTERSECT, EXCEPT.");
         }
-
-        // Each operand becomes its own sub-IMV.
-        // Propagate unique_columns so passthrough sub-IMVs can use targeted DELETE/UPDATE
-        // instead of falling back to full refresh.
-        let mut sub_imv_names: Vec<String> = Vec::new();
-        for (i, operand_sql) in set_op.operand_sqls.iter().enumerate() {
-            let sub_name = safe_identifier(&format!("{}__union_{}", view_name, i));
-            let result = create_reflex_ivm_impl(
-                &sub_name,
-                operand_sql,
-                unique_columns_str,
-                false,
-                storage_mode,
-                refresh_mode,
-                topk_k,
-                ignore_sources,
-                partition_by,
-            );
-            if result.starts_with("ERROR") {
-                return result;
-            }
-            sub_imv_names.push(sub_name);
-        }
-
-        // Build the union query over sub-IMV targets
-        let union_selects: Vec<String> = sub_imv_names
-            .iter()
-            .map(|name| format!("SELECT * FROM {}", quote_identifier(name)))
-            .collect();
-
-        if set_op.is_all {
-            // UNION ALL: create a VIEW (zero overhead, always up-to-date)
-            let view_sql = union_selects.join(" UNION ALL ");
-            Spi::connect_mut(|client| {
-                client
-                    .update(
-                        &format!(
-                            "CREATE OR REPLACE VIEW {} AS {}",
-                            quote_identifier(view_name),
-                            view_sql
-                        ),
-                        None,
-                        &[],
-                    )
-                    .unwrap_or_report();
-            });
-
-            // Register in reference table so drop_reflex_ivm can clean up.
-            // depends_on = sub-IMV names (the VIEW reads from them, not from real sources)
-            Spi::connect_mut(|client| {
-                let depends_on: Vec<String> = sub_imv_names.clone();
-                let depends_on_imv: Vec<String> = sub_imv_names.clone();
-                let depth = sub_imv_names.len() as i32 + 1;
-                insert_registry_row(
-                    client,
-                    &RegistryRow::decomposed(
-                        view_name,
-                        depth,
-                        &depends_on,
-                        &depends_on_imv,
-                        sql,
-                        &view_sql,
-                        &storage_upper,
-                        &mode_upper,
-                    ),
-                )
-                .unwrap_or_report();
-                add_graph_child_links(client, view_name, &depends_on_imv).unwrap_or_report();
-            });
-        } else {
-            // UNION / INTERSECT / EXCEPT (without ALL): create a VIEW.
-            // The sub-IMVs maintain data incrementally; PostgreSQL handles
-            // the set operation semantics at query time.
-            let set_keyword = match set_op.op {
-                sqlparser::ast::SetOperator::Union => "UNION",
-                sqlparser::ast::SetOperator::Intersect => "INTERSECT",
-                sqlparser::ast::SetOperator::Except => "EXCEPT",
-                _ => "UNION",
-            };
-            let view_sql = union_selects.join(&format!(" {} ", set_keyword));
-            Spi::connect_mut(|client| {
-                client
-                    .update(
-                        &format!(
-                            "CREATE OR REPLACE VIEW {} AS {}",
-                            quote_identifier(view_name),
-                            view_sql
-                        ),
-                        None,
-                        &[],
-                    )
-                    .unwrap_or_report();
-            });
-
-            // Register in reference table
-            Spi::connect_mut(|client| {
-                let depends_on: Vec<String> = sub_imv_names.clone();
-                let depends_on_imv: Vec<String> = sub_imv_names.clone();
-                let depth = sub_imv_names.len() as i32 + 1;
-                insert_registry_row(
-                    client,
-                    &RegistryRow::decomposed(
-                        view_name,
-                        depth,
-                        &depends_on,
-                        &depends_on_imv,
-                        sql,
-                        &view_sql,
-                        &storage_upper,
-                        &mode_upper,
-                    ),
-                )
-                .unwrap_or_report();
-                add_graph_child_links(client, view_name, &depends_on_imv).unwrap_or_report();
-            });
-        }
-
-        return "CREATE REFLEX INCREMENTAL VIEW";
     }
-    // --- End set operation decomposition ---
 
-    // --- DISTINCT ON decomposition: passthrough sub-IMV + ROW_NUMBER VIEW ---
-    // DISTINCT ON (cols) ORDER BY ... selects one row per group. We decompose into:
-    //   1. A sub-IMV for the base data (passthrough) — incrementally maintained
-    //   2. A VIEW with ROW_NUMBER() OVER (PARTITION BY <cols> ORDER BY <order>) WHERE rn = 1
-    if analysis.has_distinct_on && !analysis.distinct_on_columns.is_empty() {
-        // Build base SQL: original SELECT without DISTINCT ON and ORDER BY
-        let select_items: Vec<String> = analysis
-            .select_columns
-            .iter()
-            .map(|c| {
-                if let Some(ref alias) = c.alias {
-                    format!("{} AS {}", c.expr_sql, alias)
-                } else {
-                    c.expr_sql.clone()
-                }
-            })
-            .collect();
-        let mut base_sql = format!(
-            "SELECT {} FROM {}",
-            select_items.join(", "),
-            analysis.from_clause_sql
-        );
-        if let Some(ref wc) = analysis.where_clause {
-            base_sql.push_str(&format!(" WHERE {}", wc));
-        }
-
-        // Create sub-IMV for the base data
-        let base_name = format!("{}__base", view_name);
+    // Each operand becomes its own sub-IMV.
+    // Propagate unique_columns so passthrough sub-IMVs can use targeted DELETE/UPDATE
+    // instead of falling back to full refresh.
+    let mut sub_imv_names: Vec<String> = Vec::new();
+    for (i, operand_sql) in set_op.operand_sqls.iter().enumerate() {
+        let sub_name = safe_identifier(&format!("{}__union_{}", view_name, i));
         let result = create_reflex_ivm_impl(
-            &base_name,
-            &base_sql,
+            &sub_name,
+            operand_sql,
             unique_columns_str,
             false,
             storage_mode,
@@ -261,56 +163,20 @@ pub(crate) fn create_reflex_ivm_impl(
             partition_by,
         );
         if result.starts_with("ERROR") {
-            return result;
+            return Some(result);
         }
+        sub_imv_names.push(sub_name);
+    }
 
-        // Build the VIEW: SELECT <cols> FROM (SELECT *, ROW_NUMBER() OVER (...) AS __reflex_rn FROM base) WHERE __reflex_rn = 1
-        // Strip table qualifiers — the VIEW reads from the base sub-IMV which has bare column names
-        let partition_cols: Vec<String> = analysis
-            .distinct_on_columns
-            .iter()
-            .map(|c| format!("\"{}\"", bare_column_name(c)))
-            .collect();
-        let partition_by = partition_cols.join(", ");
+    // Build the union query over sub-IMV targets
+    let union_selects: Vec<String> = sub_imv_names
+        .iter()
+        .map(|name| format!("SELECT * FROM {}", quote_identifier(name)))
+        .collect();
 
-        // For ORDER BY, strip table qualifiers but preserve ASC/DESC/NULLS modifiers
-        let order_parts: Vec<String> = analysis
-            .order_by_exprs
-            .iter()
-            .map(|expr| {
-                // Split on first space to separate column from modifiers (e.g., "j2.val DESC")
-                let parts: Vec<&str> = expr.splitn(2, ' ').collect();
-                let col = format!("\"{}\"", bare_column_name(parts[0]));
-                if parts.len() > 1 {
-                    format!("{} {}", col, parts[1])
-                } else {
-                    col
-                }
-            })
-            .collect();
-        let order_by = order_parts.join(", ");
-
-        // Output column list (just names/aliases, no expressions)
-        let output_cols: Vec<String> = analysis
-            .select_columns
-            .iter()
-            .map(|c| {
-                if let Some(ref alias) = c.alias {
-                    format!("\"{}\"", alias)
-                } else {
-                    format!("\"{}\"", bare_column_name(&c.expr_sql))
-                }
-            })
-            .collect();
-
-        let view_sql = format!(
-            "SELECT {} FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY {} ORDER BY {}) AS __reflex_rn FROM {}) __sub WHERE __reflex_rn = 1",
-            output_cols.join(", "),
-            partition_by,
-            order_by,
-            quote_identifier(&base_name)
-        );
-
+    if set_op.is_all {
+        // UNION ALL: create a VIEW (zero overhead, always up-to-date)
+        let view_sql = union_selects.join(" UNION ALL ");
         Spi::connect_mut(|client| {
             client
                 .update(
@@ -323,180 +189,495 @@ pub(crate) fn create_reflex_ivm_impl(
                     &[],
                 )
                 .unwrap_or_report();
-
-            // Register in reference table for cleanup
-            let depends_on = vec![base_name.clone()];
-            let depends_on_imv = vec![base_name.clone()];
-            insert_registry_row(
-                client,
-                &RegistryRow::decomposed(
-                    view_name,
-                    2,
-                    &depends_on,
-                    &depends_on_imv,
-                    sql,
-                    &view_sql,
-                    &storage_upper,
-                    &mode_upper,
-                ),
-            )
-            .unwrap_or_report();
-            add_graph_child_links(client, view_name, &depends_on_imv).unwrap_or_report();
         });
 
-        return "CREATE REFLEX INCREMENTAL VIEW";
-    }
-    // --- End DISTINCT ON decomposition ---
-
-    // --- Window function decomposition: base sub-IMV + VIEW wrapper ---
-    // Window functions can't be incrementally maintained (ROW_NUMBER, RANK, LAG
-    // depend on the full result set). Instead, we decompose into:
-    //   1. A sub-IMV for the base query (aggregate or passthrough) — incrementally maintained
-    //   2. A VIEW that applies window functions at read time over the sub-IMV result
-    // For GROUP BY + WINDOW, the sub-IMV result is small (one row per group),
-    // so the window computation at read time is fast.
-    if analysis.has_window_function {
-        let decomp = window::decompose_window_query(&analysis);
-
-        // Create a sub-IMV for the base query (aggregate or passthrough, no windows)
-        let base_name = format!("{}__base", view_name);
-        let result = create_reflex_ivm_impl(
-            &base_name,
-            &decomp.base_query,
-            unique_columns_str,
-            false,
-            storage_mode,
-            refresh_mode,
-            topk_k,
-            ignore_sources,
-            partition_by,
-        );
-        if result.starts_with("ERROR") {
-            return result;
-        }
-
-        // Create a VIEW that applies window functions to the base sub-IMV
-        let view_sql = format!(
-            "SELECT {} FROM {}",
-            decomp.view_select,
-            quote_identifier(&base_name)
-        );
+        // Register in reference table so drop_reflex_ivm can clean up.
+        // depends_on = sub-IMV names (the VIEW reads from them, not from real sources)
         Spi::connect_mut(|client| {
-            client
-                .update(
-                    &format!(
-                        "CREATE OR REPLACE VIEW {} AS {}",
-                        quote_identifier(view_name),
-                        view_sql
-                    ),
-                    None,
-                    &[],
-                )
-                .unwrap_or_report();
-
-            // Register in reference table for cleanup
-            let depends_on = vec![base_name.clone()];
-            let depends_on_imv = vec![base_name.clone()];
+            let depends_on: Vec<String> = sub_imv_names.clone();
+            let depends_on_imv: Vec<String> = sub_imv_names.clone();
+            let depth = sub_imv_names.len() as i32 + 1;
             insert_registry_row(
                 client,
                 &RegistryRow::decomposed(
                     view_name,
-                    2,
+                    depth,
                     &depends_on,
                     &depends_on_imv,
                     sql,
                     &view_sql,
-                    &storage_upper,
-                    &mode_upper,
+                    &parsed.storage_upper,
+                    &parsed.mode_upper,
                 ),
             )
             .unwrap_or_report();
             add_graph_child_links(client, view_name, &depends_on_imv).unwrap_or_report();
         });
-
-        return "CREATE REFLEX INCREMENTAL VIEW";
-    }
-    // --- End window function decomposition ---
-
-    // Reject subqueries with aggregation in FROM — the trigger replaces the inner table
-    // with the transition table, so inner aggregations would only see delta rows.
-    let has_subquery_with_agg = analysis.sources.iter().any(|s| s.starts_with("<subquery:"))
-        && analysis.from_clause_sql.to_uppercase().contains("GROUP BY");
-    if has_subquery_with_agg {
-        return "ERROR: Subqueries with aggregation in FROM are not supported. \
-                Use a CTE (WITH clause) instead — pg_reflex decomposes CTEs into sub-IMVs automatically.";
-    }
-
-    // --- CTE decomposition: each CTE becomes its own sub-IMV ---
-    if !analysis.ctes.is_empty() {
-        let mut cte_name_map: Vec<(String, String)> = Vec::new();
-
-        for cte in &analysis.ctes {
-            let alias_lower = cte.alias.to_lowercase();
-            if alias_lower.starts_with("__reflex_new_")
-                || alias_lower.starts_with("__reflex_old_")
-                || alias_lower.starts_with("__reflex_delta_")
-            {
-                return "ERROR: CTE alias conflicts with pg_reflex reserved prefix (__reflex_new_/old_/delta_)";
-            }
-
-            // Rewrite references to earlier CTEs in this CTE's query
-            let mut cte_query = cte.query_sql.clone();
-            for (earlier_alias, earlier_imv) in &cte_name_map {
-                let quoted = quote_identifier(earlier_imv);
-                cte_query = replace_identifier(&cte_query, earlier_alias, &quoted);
-            }
-
-            let cte_view_name = safe_identifier(&format!("{}__cte_{}", view_name, cte.alias));
-            let result = create_reflex_ivm_impl(
-                &cte_view_name,
-                &cte_query,
-                "",
-                false,
-                storage_mode,
-                refresh_mode,
-                topk_k,
-                ignore_sources,
-                &[],
-            );
-            if result.starts_with("ERROR") {
-                return result;
-            }
-            cte_name_map.push((cte.alias.clone(), cte_view_name));
-        }
-
-        // Rewrite main query body: serialize without WITH, replace CTE names
-        let body_sql = if let sqlparser::ast::Statement::Query(ref query) = parsed_sql[0] {
-            let mut body = query.body.to_string();
-            // Append ORDER BY / LIMIT if present (shouldn't be for valid IMV queries)
-            if let Some(ref ob) = query.order_by {
-                body = format!("{} {}", body, ob);
-            }
-            for (cte_alias, cte_imv_name) in &cte_name_map {
-                let quoted = quote_identifier(cte_imv_name);
-                body = replace_identifier(&body, cte_alias, &quoted);
-            }
-            body
-        } else {
-            return "ERROR: Query is not a SELECT";
+    } else {
+        // UNION / INTERSECT / EXCEPT (without ALL): create a VIEW.
+        // The sub-IMVs maintain data incrementally; PostgreSQL handles
+        // the set operation semantics at query time.
+        let set_keyword = match set_op.op {
+            sqlparser::ast::SetOperator::Union => "UNION",
+            sqlparser::ast::SetOperator::Intersect => "INTERSECT",
+            sqlparser::ast::SetOperator::Except => "EXCEPT",
+            _ => "UNION",
         };
+        let view_sql = union_selects.join(&format!(" {} ", set_keyword));
+        Spi::connect_mut(|client| {
+            client
+                .update(
+                    &format!(
+                        "CREATE OR REPLACE VIEW {} AS {}",
+                        quote_identifier(view_name),
+                        view_sql
+                    ),
+                    None,
+                    &[],
+                )
+                .unwrap_or_report();
+        });
 
-        // Check if the main body is passthrough (no aggregation).
-        // If so, all its sources are CTE sub-IMVs which don't get triggers,
-        // CTE body (passthrough or aggregate) → create as a normal IMV
-        return create_reflex_ivm_impl(
-            view_name,
-            &body_sql,
+        // Register in reference table
+        Spi::connect_mut(|client| {
+            let depends_on: Vec<String> = sub_imv_names.clone();
+            let depends_on_imv: Vec<String> = sub_imv_names.clone();
+            let depth = sub_imv_names.len() as i32 + 1;
+            insert_registry_row(
+                client,
+                &RegistryRow::decomposed(
+                    view_name,
+                    depth,
+                    &depends_on,
+                    &depends_on_imv,
+                    sql,
+                    &view_sql,
+                    &parsed.storage_upper,
+                    &parsed.mode_upper,
+                ),
+            )
+            .unwrap_or_report();
+            add_graph_child_links(client, view_name, &depends_on_imv).unwrap_or_report();
+        });
+    }
+
+    Some("CREATE REFLEX INCREMENTAL VIEW")
+}
+
+/// Decomposition phase: `SELECT DISTINCT ON (...) ... ORDER BY ...`.
+///
+/// `DISTINCT ON` keeps one row per `(distinct-on-cols)` group. We can't IMV
+/// it directly, so we materialise the underlying SELECT as a passthrough
+/// sub-IMV and place a `CREATE VIEW` over it that picks `__reflex_rn = 1`
+/// via `ROW_NUMBER()`. The window evaluates at read time.
+#[allow(clippy::too_many_arguments)]
+fn try_decompose_distinct_on(
+    view_name: &str,
+    sql: &str,
+    unique_columns_str: &str,
+    storage_mode: &str,
+    refresh_mode: &str,
+    topk_k: Option<usize>,
+    ignore_sources: &[String],
+    partition_by: &[String],
+    parsed: &ParsedInputs,
+) -> Option<&'static str> {
+    let analysis = &parsed.analysis;
+    if !analysis.has_distinct_on || analysis.distinct_on_columns.is_empty() {
+        return None;
+    }
+
+    // Build base SQL: original SELECT without DISTINCT ON and ORDER BY
+    let select_items: Vec<String> = analysis
+        .select_columns
+        .iter()
+        .map(|c| {
+            if let Some(ref alias) = c.alias {
+                format!("{} AS {}", c.expr_sql, alias)
+            } else {
+                c.expr_sql.clone()
+            }
+        })
+        .collect();
+    let mut base_sql = format!(
+        "SELECT {} FROM {}",
+        select_items.join(", "),
+        analysis.from_clause_sql
+    );
+    if let Some(ref wc) = analysis.where_clause {
+        base_sql.push_str(&format!(" WHERE {}", wc));
+    }
+
+    // Create sub-IMV for the base data
+    let base_name = format!("{}__base", view_name);
+    let result = create_reflex_ivm_impl(
+        &base_name,
+        &base_sql,
+        unique_columns_str,
+        false,
+        storage_mode,
+        refresh_mode,
+        topk_k,
+        ignore_sources,
+        partition_by,
+    );
+    if result.starts_with("ERROR") {
+        return Some(result);
+    }
+
+    // Build the VIEW: SELECT <cols> FROM (SELECT *, ROW_NUMBER() OVER (...) AS __reflex_rn FROM base) WHERE __reflex_rn = 1
+    // Strip table qualifiers — the VIEW reads from the base sub-IMV which has bare column names
+    let partition_cols: Vec<String> = analysis
+        .distinct_on_columns
+        .iter()
+        .map(|c| format!("\"{}\"", bare_column_name(c)))
+        .collect();
+    let partition_by_clause = partition_cols.join(", ");
+
+    // For ORDER BY, strip table qualifiers but preserve ASC/DESC/NULLS modifiers
+    let order_parts: Vec<String> = analysis
+        .order_by_exprs
+        .iter()
+        .map(|expr| {
+            // Split on first space to separate column from modifiers (e.g., "j2.val DESC")
+            let parts: Vec<&str> = expr.splitn(2, ' ').collect();
+            let col = format!("\"{}\"", bare_column_name(parts[0]));
+            if parts.len() > 1 {
+                format!("{} {}", col, parts[1])
+            } else {
+                col
+            }
+        })
+        .collect();
+    let order_by = order_parts.join(", ");
+
+    // Output column list (just names/aliases, no expressions)
+    let output_cols: Vec<String> = analysis
+        .select_columns
+        .iter()
+        .map(|c| {
+            if let Some(ref alias) = c.alias {
+                format!("\"{}\"", alias)
+            } else {
+                format!("\"{}\"", bare_column_name(&c.expr_sql))
+            }
+        })
+        .collect();
+
+    let view_sql = format!(
+        "SELECT {} FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY {} ORDER BY {}) AS __reflex_rn FROM {}) __sub WHERE __reflex_rn = 1",
+        output_cols.join(", "),
+        partition_by_clause,
+        order_by,
+        quote_identifier(&base_name)
+    );
+
+    Spi::connect_mut(|client| {
+        client
+            .update(
+                &format!(
+                    "CREATE OR REPLACE VIEW {} AS {}",
+                    quote_identifier(view_name),
+                    view_sql
+                ),
+                None,
+                &[],
+            )
+            .unwrap_or_report();
+
+        // Register in reference table for cleanup
+        let depends_on = vec![base_name.clone()];
+        let depends_on_imv = vec![base_name.clone()];
+        insert_registry_row(
+            client,
+            &RegistryRow::decomposed(
+                view_name,
+                2,
+                &depends_on,
+                &depends_on_imv,
+                sql,
+                &view_sql,
+                &parsed.storage_upper,
+                &parsed.mode_upper,
+            ),
+        )
+        .unwrap_or_report();
+        add_graph_child_links(client, view_name, &depends_on_imv).unwrap_or_report();
+    });
+
+    Some("CREATE REFLEX INCREMENTAL VIEW")
+}
+
+/// Decomposition phase: queries with window functions.
+///
+/// Window functions like `ROW_NUMBER`, `RANK`, `LAG` depend on the full
+/// result set, so they can't be incrementally maintained. We split the query
+/// into a base sub-IMV (the aggregate or passthrough underneath) and a
+/// `CREATE VIEW` over it that applies the windows at read time. For
+/// `GROUP BY + WINDOW` the base result is small, so read-time cost is low.
+#[allow(clippy::too_many_arguments)]
+fn try_decompose_window(
+    view_name: &str,
+    sql: &str,
+    unique_columns_str: &str,
+    storage_mode: &str,
+    refresh_mode: &str,
+    topk_k: Option<usize>,
+    ignore_sources: &[String],
+    partition_by: &[String],
+    parsed: &ParsedInputs,
+) -> Option<&'static str> {
+    if !parsed.analysis.has_window_function {
+        return None;
+    }
+    let decomp = window::decompose_window_query(&parsed.analysis);
+
+    // Create a sub-IMV for the base query (aggregate or passthrough, no windows)
+    let base_name = format!("{}__base", view_name);
+    let result = create_reflex_ivm_impl(
+        &base_name,
+        &decomp.base_query,
+        unique_columns_str,
+        false,
+        storage_mode,
+        refresh_mode,
+        topk_k,
+        ignore_sources,
+        partition_by,
+    );
+    if result.starts_with("ERROR") {
+        return Some(result);
+    }
+
+    // Create a VIEW that applies window functions to the base sub-IMV
+    let view_sql = format!(
+        "SELECT {} FROM {}",
+        decomp.view_select,
+        quote_identifier(&base_name)
+    );
+    Spi::connect_mut(|client| {
+        client
+            .update(
+                &format!(
+                    "CREATE OR REPLACE VIEW {} AS {}",
+                    quote_identifier(view_name),
+                    view_sql
+                ),
+                None,
+                &[],
+            )
+            .unwrap_or_report();
+
+        // Register in reference table for cleanup
+        let depends_on = vec![base_name.clone()];
+        let depends_on_imv = vec![base_name.clone()];
+        insert_registry_row(
+            client,
+            &RegistryRow::decomposed(
+                view_name,
+                2,
+                &depends_on,
+                &depends_on_imv,
+                sql,
+                &view_sql,
+                &parsed.storage_upper,
+                &parsed.mode_upper,
+            ),
+        )
+        .unwrap_or_report();
+        add_graph_child_links(client, view_name, &depends_on_imv).unwrap_or_report();
+    });
+
+    Some("CREATE REFLEX INCREMENTAL VIEW")
+}
+
+/// Decomposition phase: `WITH ... ` (Common Table Expressions).
+///
+/// Each CTE becomes its own sub-IMV (recursively) and the main body is
+/// rewritten to reference those sub-IMVs in place of the original CTE
+/// aliases, then re-entered through [`create_reflex_ivm_impl`] without the
+/// WITH clause. Tail-recursive: the final `Some(...)` here is the result of
+/// the rewritten-body call.
+#[allow(clippy::too_many_arguments)]
+fn try_decompose_ctes(
+    view_name: &str,
+    storage_mode: &str,
+    refresh_mode: &str,
+    topk_k: Option<usize>,
+    ignore_sources: &[String],
+    partition_by: &[String],
+    parsed: &ParsedInputs,
+) -> Option<&'static str> {
+    let analysis = &parsed.analysis;
+    if analysis.ctes.is_empty() {
+        return None;
+    }
+    let mut cte_name_map: Vec<(String, String)> = Vec::new();
+
+    for cte in &analysis.ctes {
+        let alias_lower = cte.alias.to_lowercase();
+        if alias_lower.starts_with("__reflex_new_")
+            || alias_lower.starts_with("__reflex_old_")
+            || alias_lower.starts_with("__reflex_delta_")
+        {
+            return Some(
+                "ERROR: CTE alias conflicts with pg_reflex reserved prefix (__reflex_new_/old_/delta_)",
+            );
+        }
+
+        // Rewrite references to earlier CTEs in this CTE's query
+        let mut cte_query = cte.query_sql.clone();
+        for (earlier_alias, earlier_imv) in &cte_name_map {
+            let quoted = quote_identifier(earlier_imv);
+            cte_query = replace_identifier(&cte_query, earlier_alias, &quoted);
+        }
+
+        let cte_view_name = safe_identifier(&format!("{}__cte_{}", view_name, cte.alias));
+        let result = create_reflex_ivm_impl(
+            &cte_view_name,
+            &cte_query,
             "",
             false,
             storage_mode,
             refresh_mode,
             topk_k,
             ignore_sources,
-            partition_by,
+            &[],
         );
+        if result.starts_with("ERROR") {
+            return Some(result);
+        }
+        cte_name_map.push((cte.alias.clone(), cte_view_name));
     }
-    // --- End CTE decomposition ---
+
+    // Rewrite main query body: serialize without WITH, replace CTE names
+    let body_sql = if let sqlparser::ast::Statement::Query(ref query) = parsed.parsed_sql[0] {
+        let mut body = query.body.to_string();
+        // Append ORDER BY / LIMIT if present (shouldn't be for valid IMV queries)
+        if let Some(ref ob) = query.order_by {
+            body = format!("{} {}", body, ob);
+        }
+        for (cte_alias, cte_imv_name) in &cte_name_map {
+            let quoted = quote_identifier(cte_imv_name);
+            body = replace_identifier(&body, cte_alias, &quoted);
+        }
+        body
+    } else {
+        return Some("ERROR: Query is not a SELECT");
+    };
+
+    // Check if the main body is passthrough (no aggregation).
+    // If so, all its sources are CTE sub-IMVs which don't get triggers,
+    // CTE body (passthrough or aggregate) → create as a normal IMV
+    Some(create_reflex_ivm_impl(
+        view_name,
+        &body_sql,
+        "",
+        false,
+        storage_mode,
+        refresh_mode,
+        topk_k,
+        ignore_sources,
+        partition_by,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn create_reflex_ivm_impl(
+    view_name: &str,
+    sql: &str,
+    unique_columns_str: &str,
+    if_not_exists: bool,
+    storage_mode: &str,
+    refresh_mode: &str,
+    topk_k: Option<usize>,
+    ignore_sources: &[String],
+    partition_by: &[String],
+) -> &'static str {
+    let parsed = match validate_and_parse_inputs(view_name, sql, storage_mode, refresh_mode) {
+        Ok(p) => p,
+        Err(msg) => return msg,
+    };
+
+    if let Some(result) = try_decompose_set_op(
+        view_name,
+        sql,
+        unique_columns_str,
+        storage_mode,
+        refresh_mode,
+        topk_k,
+        ignore_sources,
+        partition_by,
+        &parsed,
+    ) {
+        return result;
+    }
+
+    if let Some(result) = try_decompose_distinct_on(
+        view_name,
+        sql,
+        unique_columns_str,
+        storage_mode,
+        refresh_mode,
+        topk_k,
+        ignore_sources,
+        partition_by,
+        &parsed,
+    ) {
+        return result;
+    }
+
+    if let Some(result) = try_decompose_window(
+        view_name,
+        sql,
+        unique_columns_str,
+        storage_mode,
+        refresh_mode,
+        topk_k,
+        ignore_sources,
+        partition_by,
+        &parsed,
+    ) {
+        return result;
+    }
+
+    // Reject subqueries with aggregation in FROM — the trigger replaces the inner table
+    // with the transition table, so inner aggregations would only see delta rows.
+    let has_subquery_with_agg = parsed
+        .analysis
+        .sources
+        .iter()
+        .any(|s| s.starts_with("<subquery:"))
+        && parsed
+            .analysis
+            .from_clause_sql
+            .to_uppercase()
+            .contains("GROUP BY");
+    if has_subquery_with_agg {
+        return "ERROR: Subqueries with aggregation in FROM are not supported. \
+                Use a CTE (WITH clause) instead — pg_reflex decomposes CTEs into sub-IMVs automatically.";
+    }
+
+    if let Some(result) = try_decompose_ctes(
+        view_name,
+        storage_mode,
+        refresh_mode,
+        topk_k,
+        ignore_sources,
+        partition_by,
+        &parsed,
+    ) {
+        return result;
+    }
+
+    let ParsedInputs {
+        logged,
+        deferred,
+        storage_upper,
+        mode_upper,
+        parsed_sql: _,
+        analysis,
+    } = parsed;
 
     let froms = analysis.sources.clone();
 

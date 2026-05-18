@@ -1417,6 +1417,405 @@ fn push_bulk_insert_and_affected(
     stmts.push(format!("ANALYZE {}", affected_tbl));
 }
 
+/// Aggregate-IMV `INSERT` / `INSERT_PROMOTED` arm of [`reflex_build_delta_sql`].
+///
+/// Pushes the materialized scratch fill + MERGE statements onto `stmts`.
+/// Bulk-INSERT (skipping MERGE) only fires when the operation is an Item α
+/// `INSERT_PROMOTED` *and* the source has a `source_join_keys` entry — see
+/// the in-body comment for why regular `INSERT` always takes the MERGE path.
+#[allow(clippy::too_many_arguments)]
+fn aggregate_insert_stmts(
+    operation: &str,
+    plan: &AggregationPlan,
+    base_query: &str,
+    source_table: &str,
+    grp_cols: &Option<Vec<String>>,
+    intermediate_tbl: &str,
+    affected_tbl: &str,
+    scratch_tbl: &str,
+    new_tbl: &str,
+    stmts: &mut Vec<String>,
+) {
+    let delta_q = replace_source_with_transition(base_query, source_table, new_tbl);
+
+    // Bulk-INSERT eligibility:
+    //   * Item α promoted OUT→IN (op = INSERT_PROMOTED), AND
+    //   * plan.source_join_keys has an entry for the trigger
+    //     source → the source's identity uniquely determines
+    //     its slice of intermediate group keys; the OLD-side
+    //     was filter-rejected so those keys do not exist in
+    //     intermediate; plain INSERT is correct.
+    //
+    // Regular INSERT (op = INSERT) NEVER takes the bulk path —
+    // new fact rows can legitimately aggregate into existing
+    // groups, so MERGE is required.
+    let bulk_insert_eligible =
+        operation == "INSERT_PROMOTED" && plan.source_join_keys.contains_key(source_table);
+
+    if let Some(ref cols) = grp_cols {
+        let select_expr = affected_groups_select(cols);
+        if bulk_insert_eligible {
+            push_bulk_insert_and_affected(
+                stmts,
+                scratch_tbl,
+                &delta_q,
+                intermediate_tbl,
+                affected_tbl,
+                &select_expr,
+            );
+        } else {
+            // 1.4.6 attempt + revert (earlier in this same
+            // session): an earlier draft wired the dispatch
+            // DO block into the grouped INSERT path so Item α's
+            // promoted bulk flips could re-route to reconcile.
+            // Reverted because scratch-fill cost dominates;
+            // see journal/2026-05-15_dispatch_wiring_revert.md.
+            push_materialized_merge_and_affected(
+                stmts,
+                scratch_tbl,
+                &delta_q,
+                intermediate_tbl,
+                plan,
+                DeltaOp::Add,
+                affected_tbl,
+                &select_expr,
+                true,
+            );
+        }
+    } else {
+        // Scalar IMV (no grouping). INSERT_PROMOTED degenerates
+        // here — a one-row scalar intermediate is incompatible
+        // with the "no overlap" guarantee. Stay on MERGE.
+        push_materialized_merge(
+            stmts,
+            scratch_tbl,
+            &delta_q,
+            intermediate_tbl,
+            plan,
+            DeltaOp::Add,
+        );
+    }
+}
+
+/// Aggregate-IMV `DELETE` / `DELETE_PROMOTED` arm of [`reflex_build_delta_sql`].
+///
+/// Returns `true` when the bulk-eligible early-return path was taken — the
+/// caller MUST then cache the result and `return` immediately, skipping the
+/// target-sync / cleanup epilogue (the bulk path already removed target rows
+/// via the JOIN mapping). Returns `false` to signal the standard scratch +
+/// MERGE shape; the caller continues into the epilogue.
+#[allow(clippy::too_many_arguments)]
+fn aggregate_delete_stmts(
+    plan: &AggregationPlan,
+    view_name: &str,
+    source_table: &str,
+    base_query: &str,
+    end_query: &str,
+    orig_base_query: &str,
+    has_min_max: bool,
+    grp_cols: &Option<Vec<String>>,
+    intermediate_tbl: &str,
+    affected_tbl: &str,
+    scratch_tbl: &str,
+    old_tbl: &str,
+    stmts: &mut Vec<String>,
+) -> bool {
+    let delta_q = replace_source_with_transition(base_query, source_table, old_tbl);
+
+    // Bulk-DELETE eligibility:
+    //   * Item α IN→OUT promotion (op = DELETE_PROMOTED) OR a
+    //     regular DELETE on a source that has the safety mapping.
+    //   * plan.source_join_keys has an entry for the trigger
+    //     source (JOIN-secondary, mapping covers a unique key
+    //     on the source).
+    //   * end_query has no further GROUP BY — target rows are
+    //     1:1 with intermediate. Without this, bulk-DELETE on
+    //     intermediate could leave target rows that should be
+    //     recomputed from surviving intermediate rows.
+    let end_q_has_gb = end_query.to_uppercase().contains("GROUP BY");
+    let bulk_delete_eligible =
+        grp_cols.is_some() && plan.source_join_keys.contains_key(source_table) && !end_q_has_gb;
+
+    if bulk_delete_eligible {
+        // Skip scratch fill entirely. Two indexed DELETEs
+        // (intermediate + target) using the JOIN mapping
+        // against the OLD transition table.
+        let mappings = plan
+            .source_join_keys
+            .get(source_table)
+            .expect("eligibility checked above");
+        push_bulk_delete_via_transition(
+            stmts,
+            intermediate_tbl,
+            &quote_identifier(view_name),
+            old_tbl,
+            mappings,
+            plan,
+        );
+        stmts.push(format!(
+            "UPDATE public.__reflex_ivm_reference SET last_update_date = NOW() \
+             WHERE name = '{}' AND (last_update_date IS NULL OR last_update_date < NOW() - INTERVAL '1 second')",
+            view_name.replace("'", "''")
+        ));
+        return true;
+    }
+
+    let recompute_scope: Option<&str> = if let Some(ref cols) = grp_cols {
+        let select_expr = affected_groups_select(cols);
+        // 1.4.6 attempt + revert: same wasted-scratch problem as
+        // the INSERT branch above. Bulk DELETE-shape (Item α
+        // IN→OUT promotion) pays ~50–100 s for scratch fill on
+        // alp; the dispatch win when reconcile is cheaper is
+        // smaller than the scratch overhead. Stay on the inline
+        // MERGE + dead-cleanup path.
+        push_materialized_merge_and_affected(
+            stmts,
+            scratch_tbl,
+            &delta_q,
+            intermediate_tbl,
+            plan,
+            DeltaOp::Subtract,
+            affected_tbl,
+            &select_expr,
+            true,
+        );
+        Some(affected_tbl)
+    } else {
+        push_materialized_merge(
+            stmts,
+            scratch_tbl,
+            &delta_q,
+            intermediate_tbl,
+            plan,
+            DeltaOp::Subtract,
+        );
+        None
+    };
+    if has_min_max {
+        // Top-K (1.3.0): refresh scalar __min_x / __max_x from
+        // topk[1] for groups whose heap survived the subtract,
+        // BEFORE the source-scan recompute. The recompute then
+        // only fires for actually-underflowed groups.
+        if let Some(refresh) =
+            build_topk_scalar_refresh_sql(intermediate_tbl, plan, recompute_scope)
+        {
+            stmts.push(refresh);
+        }
+        if let Some(recompute) =
+            build_min_max_recompute_sql(intermediate_tbl, plan, orig_base_query, recompute_scope)
+        {
+            stmts.push(recompute);
+        }
+    }
+    false
+}
+
+/// Aggregate-IMV `UPDATE` arm of [`reflex_build_delta_sql`].
+///
+/// Returns `Some(merge_sql)` when the non-MIN/MAX grouped path stashed the
+/// MERGE SQL for the target-sync dispatch (the epilogue then routes it
+/// through `build_high_selectivity_dispatch_sql` or the partition-aware
+/// equivalent). Returns `None` for every shape that emitted the MERGE
+/// inline.
+#[allow(clippy::too_many_arguments)]
+fn aggregate_update_stmts(
+    plan: &AggregationPlan,
+    source_table: &str,
+    base_query: &str,
+    orig_base_query: &str,
+    has_min_max: bool,
+    grp_cols: &Option<Vec<String>>,
+    intermediate_tbl: &str,
+    affected_tbl: &str,
+    shrunk_tbl: &str,
+    scratch_tbl: &str,
+    old_tbl: &str,
+    new_tbl: &str,
+    stmts: &mut Vec<String>,
+) -> Option<String> {
+    let delta_old = replace_source_with_transition(base_query, source_table, old_tbl);
+    let delta_new = replace_source_with_transition(base_query, source_table, new_tbl);
+
+    let has_topk = plan.intermediate_columns.iter().any(|ic| ic.has_topk());
+
+    if has_min_max {
+        // Two orderings, picked by whether top-K is in play:
+        //
+        // - Non-top-K (legacy): Sub → recompute(if scalar NULL) → Add.
+        //   The recompute MUST run BEFORE Add because Sub leaves
+        //   `scalar = NULL` and Add would otherwise compute
+        //   `LEAST(NULL, d.scalar) = d.scalar`, swallowing any unchanged
+        //   source row that should be the new MIN/MAX.
+        //
+        // - Top-K: Sub → topk_refresh → Add → forced recompute. The
+        //   algebraic merge can land heap on K elements that aren't the
+        //   true top-K of the post-UPDATE source — heap pre-update never
+        //   held the unchanged rows that should fill it now. Forcing
+        //   recompute after Add re-derives heap+scalar from the
+        //   (post-UPDATE) source for every affected top-K column.
+        if let Some(ref cols) = grp_cols {
+            let select_expr = affected_groups_select(cols);
+            push_materialized_merge_and_affected(
+                stmts,
+                scratch_tbl,
+                &delta_old,
+                intermediate_tbl,
+                plan,
+                DeltaOp::Subtract,
+                affected_tbl,
+                &select_expr,
+                true,
+            );
+            // N1: capture groups whose heap shrank below K post-Sub.
+            // Must run BEFORE Add (which would re-fill the heap and
+            // hide the shrinkage signal) and BEFORE topk_refresh
+            // (which doesn't move the cardinality but ordering kept
+            // contiguous with the Sub for clarity).
+            let recompute_scope = if has_topk
+                && push_topk_shrunk_groups_capture(
+                    stmts,
+                    intermediate_tbl,
+                    plan,
+                    affected_tbl,
+                    shrunk_tbl,
+                ) {
+                shrunk_tbl
+            } else {
+                affected_tbl
+            };
+            if let Some(refresh) =
+                build_topk_scalar_refresh_sql(intermediate_tbl, plan, Some(affected_tbl))
+            {
+                stmts.push(refresh);
+            }
+            if !has_topk {
+                // Non-top-K: recompute BEFORE Add to avoid LEAST(NULL, d).
+                if let Some(recompute) = build_min_max_recompute_sql(
+                    intermediate_tbl,
+                    plan,
+                    orig_base_query,
+                    Some(affected_tbl),
+                ) {
+                    stmts.push(recompute);
+                }
+            }
+            push_materialized_merge_and_affected(
+                stmts,
+                scratch_tbl,
+                &delta_new,
+                intermediate_tbl,
+                plan,
+                DeltaOp::Add,
+                affected_tbl,
+                &select_expr,
+                false,
+            );
+            if has_topk {
+                // Top-K: forced recompute AFTER Add to overwrite any
+                // stale heap content the algebraic merge left behind.
+                // Scoped to `__reflex_shrunk_*` (groups whose heap
+                // genuinely shrank) instead of `__reflex_affected_*` —
+                // groups whose post-Sub heap stayed at K had no
+                // heap-eligible row removed and Sub+Add alone is
+                // correct.
+                if let Some(recompute) = build_min_max_recompute_sql_force_topk(
+                    intermediate_tbl,
+                    plan,
+                    orig_base_query,
+                    Some(recompute_scope),
+                ) {
+                    stmts.push(recompute);
+                }
+            }
+        } else {
+            push_materialized_merge(
+                stmts,
+                scratch_tbl,
+                &delta_old,
+                intermediate_tbl,
+                plan,
+                DeltaOp::Subtract,
+            );
+            if let Some(refresh) = build_topk_scalar_refresh_sql(intermediate_tbl, plan, None) {
+                stmts.push(refresh);
+            }
+            if !has_topk {
+                if let Some(recompute) =
+                    build_min_max_recompute_sql(intermediate_tbl, plan, orig_base_query, None)
+                {
+                    stmts.push(recompute);
+                }
+            }
+            push_materialized_merge(
+                stmts,
+                scratch_tbl,
+                &delta_new,
+                intermediate_tbl,
+                plan,
+                DeltaOp::Add,
+            );
+            if has_topk {
+                if let Some(recompute) = build_min_max_recompute_sql_force_topk(
+                    intermediate_tbl,
+                    plan,
+                    orig_base_query,
+                    None,
+                ) {
+                    stmts.push(recompute);
+                }
+            }
+        }
+        None
+    } else if grp_cols.is_some() {
+        let cols = grp_cols.as_ref().expect("grp_cols is Some — checked above");
+        let net_delta = build_net_delta_query(&delta_old, &delta_new, plan);
+        let select_expr = affected_groups_select(cols);
+        // 1.4.5: emit scratch + affected EARLY so the dispatch
+        // block below can read |affected| for the selectivity
+        // check before deciding MERGE-vs-rebuild. The MERGE
+        // statement itself moves into the dispatch DO block at
+        // the end of this function.
+        stmts.push(format!("TRUNCATE {}", affected_tbl));
+        stmts.push(format!("TRUNCATE {}", scratch_tbl));
+        stmts.push(format!("INSERT INTO {} {}", scratch_tbl, net_delta));
+        // Scratch is pre-grouped by build_net_delta_query (SUM ... GROUP BY keys),
+        // so it is already one row per group key — DISTINCT is redundant.
+        stmts.push(format!(
+            "INSERT INTO {} SELECT {} FROM {} AS __d",
+            affected_tbl, select_expr, scratch_tbl
+        ));
+        // ANALYZE the freshly populated affected so downstream
+        // statements (dead-cleanup DELETE, target DELETE/INSERT,
+        // dispatch DO block) plan against current row counts. See
+        // the comment in push_materialized_merge_and_affected for
+        // the failure mode this avoids.
+        stmts.push(format!("ANALYZE {}", affected_tbl));
+        // Capture the MERGE SQL — the dispatch block emits it
+        // (instead of running it unconditionally).
+        let merge_sql_for_dispatch =
+            build_merge_from_table_sql(intermediate_tbl, scratch_tbl, plan, DeltaOp::Add);
+        Some(merge_sql_for_dispatch)
+    } else {
+        push_materialized_merge(
+            stmts,
+            scratch_tbl,
+            &delta_old,
+            intermediate_tbl,
+            plan,
+            DeltaOp::Subtract,
+        );
+        push_materialized_merge(
+            stmts,
+            scratch_tbl,
+            &delta_new,
+            intermediate_tbl,
+            plan,
+            DeltaOp::Add,
+        );
+        None
+    }
+}
+
 /// Generates the SQL statements to apply a delta to an IMV.
 ///
 /// Called from plpgsql trigger wrappers. Returns a delimiter-separated string
@@ -1775,105 +2174,36 @@ pub fn reflex_build_delta_sql(
 
         match operation {
             "INSERT" | "INSERT_PROMOTED" => {
-                let delta_q = replace_source_with_transition(base_query, source_table, &new_tbl);
-
-                // Bulk-INSERT eligibility:
-                //   * Item α promoted OUT→IN (op = INSERT_PROMOTED), AND
-                //   * plan.source_join_keys has an entry for the trigger
-                //     source → the source's identity uniquely determines
-                //     its slice of intermediate group keys; the OLD-side
-                //     was filter-rejected so those keys do not exist in
-                //     intermediate; plain INSERT is correct.
-                //
-                // Regular INSERT (op = INSERT) NEVER takes the bulk path —
-                // new fact rows can legitimately aggregate into existing
-                // groups, so MERGE is required.
-                let bulk_insert_eligible = operation == "INSERT_PROMOTED"
-                    && plan.source_join_keys.contains_key(source_table);
-
-                if let Some(ref cols) = grp_cols {
-                    let select_expr = affected_groups_select(cols);
-                    if bulk_insert_eligible {
-                        push_bulk_insert_and_affected(
-                            &mut stmts,
-                            &scratch_tbl,
-                            &delta_q,
-                            &intermediate_tbl,
-                            &affected_tbl,
-                            &select_expr,
-                        );
-                    } else {
-                        // 1.4.6 attempt + revert (earlier in this same
-                        // session): an earlier draft wired the dispatch
-                        // DO block into the grouped INSERT path so Item α's
-                        // promoted bulk flips could re-route to reconcile.
-                        // Reverted because scratch-fill cost dominates;
-                        // see journal/2026-05-15_dispatch_wiring_revert.md.
-                        push_materialized_merge_and_affected(
-                            &mut stmts,
-                            &scratch_tbl,
-                            &delta_q,
-                            &intermediate_tbl,
-                            &plan,
-                            DeltaOp::Add,
-                            &affected_tbl,
-                            &select_expr,
-                            true,
-                        );
-                    }
-                } else {
-                    // Scalar IMV (no grouping). INSERT_PROMOTED degenerates
-                    // here — a one-row scalar intermediate is incompatible
-                    // with the "no overlap" guarantee. Stay on MERGE.
-                    push_materialized_merge(
-                        &mut stmts,
-                        &scratch_tbl,
-                        &delta_q,
-                        &intermediate_tbl,
-                        &plan,
-                        DeltaOp::Add,
-                    );
-                }
+                aggregate_insert_stmts(
+                    operation,
+                    &plan,
+                    base_query,
+                    source_table,
+                    &grp_cols,
+                    &intermediate_tbl,
+                    &affected_tbl,
+                    &scratch_tbl,
+                    &new_tbl,
+                    &mut stmts,
+                );
             }
             "DELETE" | "DELETE_PROMOTED" => {
-                let delta_q = replace_source_with_transition(base_query, source_table, &old_tbl);
-
-                // Bulk-DELETE eligibility:
-                //   * Item α IN→OUT promotion (op = DELETE_PROMOTED) OR a
-                //     regular DELETE on a source that has the safety mapping.
-                //   * plan.source_join_keys has an entry for the trigger
-                //     source (JOIN-secondary, mapping covers a unique key
-                //     on the source).
-                //   * end_query has no further GROUP BY — target rows are
-                //     1:1 with intermediate. Without this, bulk-DELETE on
-                //     intermediate could leave target rows that should be
-                //     recomputed from surviving intermediate rows.
-                let end_q_has_gb = end_query.to_uppercase().contains("GROUP BY");
-                let bulk_delete_eligible = grp_cols.is_some()
-                    && plan.source_join_keys.contains_key(source_table)
-                    && !end_q_has_gb;
-
-                if bulk_delete_eligible {
-                    // Skip scratch fill entirely. Two indexed DELETEs
-                    // (intermediate + target) using the JOIN mapping
-                    // against the OLD transition table.
-                    let mappings = plan
-                        .source_join_keys
-                        .get(source_table)
-                        .expect("eligibility checked above");
-                    push_bulk_delete_via_transition(
-                        &mut stmts,
-                        &intermediate_tbl,
-                        &quote_identifier(view_name),
-                        &old_tbl,
-                        mappings,
-                        &plan,
-                    );
-                    stmts.push(format!(
-                        "UPDATE public.__reflex_ivm_reference SET last_update_date = NOW() \
-                         WHERE name = '{}' AND (last_update_date IS NULL OR last_update_date < NOW() - INTERVAL '1 second')",
-                        view_name.replace("'", "''")
-                    ));
+                let took_bulk_early_return = aggregate_delete_stmts(
+                    &plan,
+                    view_name,
+                    source_table,
+                    base_query,
+                    end_query,
+                    orig_base_query,
+                    has_min_max,
+                    &grp_cols,
+                    &intermediate_tbl,
+                    &affected_tbl,
+                    &scratch_tbl,
+                    &old_tbl,
+                    &mut stmts,
+                );
+                if took_bulk_early_return {
                     // Cache + return — no target sync needed (bulk-DELETE
                     // already removed target rows).
                     let result = stmts.join("\n--<<REFLEX_SEP>>--\n");
@@ -1885,250 +2215,24 @@ pub fn reflex_build_delta_sql(
                     }
                     return result;
                 }
-
-                let recompute_scope: Option<&str> = if let Some(ref cols) = grp_cols {
-                    let select_expr = affected_groups_select(cols);
-                    // 1.4.6 attempt + revert: same wasted-scratch problem as
-                    // the INSERT branch above. Bulk DELETE-shape (Item α
-                    // IN→OUT promotion) pays ~50–100 s for scratch fill on
-                    // alp; the dispatch win when reconcile is cheaper is
-                    // smaller than the scratch overhead. Stay on the inline
-                    // MERGE + dead-cleanup path.
-                    push_materialized_merge_and_affected(
-                        &mut stmts,
-                        &scratch_tbl,
-                        &delta_q,
-                        &intermediate_tbl,
-                        &plan,
-                        DeltaOp::Subtract,
-                        &affected_tbl,
-                        &select_expr,
-                        true,
-                    );
-                    Some(affected_tbl.as_str())
-                } else {
-                    push_materialized_merge(
-                        &mut stmts,
-                        &scratch_tbl,
-                        &delta_q,
-                        &intermediate_tbl,
-                        &plan,
-                        DeltaOp::Subtract,
-                    );
-                    None
-                };
-                if has_min_max {
-                    // Top-K (1.3.0): refresh scalar __min_x / __max_x from
-                    // topk[1] for groups whose heap survived the subtract,
-                    // BEFORE the source-scan recompute. The recompute then
-                    // only fires for actually-underflowed groups.
-                    if let Some(refresh) =
-                        build_topk_scalar_refresh_sql(&intermediate_tbl, &plan, recompute_scope)
-                    {
-                        stmts.push(refresh);
-                    }
-                    if let Some(recompute) = build_min_max_recompute_sql(
-                        &intermediate_tbl,
-                        &plan,
-                        orig_base_query,
-                        recompute_scope,
-                    ) {
-                        stmts.push(recompute);
-                    }
-                }
             }
             "UPDATE" => {
-                let delta_old = replace_source_with_transition(base_query, source_table, &old_tbl);
-                let delta_new = replace_source_with_transition(base_query, source_table, &new_tbl);
-
-                let has_topk = plan.intermediate_columns.iter().any(|ic| ic.has_topk());
-
-                if has_min_max {
-                    // Two orderings, picked by whether top-K is in play:
-                    //
-                    // - Non-top-K (legacy): Sub → recompute(if scalar NULL) → Add.
-                    //   The recompute MUST run BEFORE Add because Sub leaves
-                    //   `scalar = NULL` and Add would otherwise compute
-                    //   `LEAST(NULL, d.scalar) = d.scalar`, swallowing any unchanged
-                    //   source row that should be the new MIN/MAX.
-                    //
-                    // - Top-K: Sub → topk_refresh → Add → forced recompute. The
-                    //   algebraic merge can land heap on K elements that aren't the
-                    //   true top-K of the post-UPDATE source — heap pre-update never
-                    //   held the unchanged rows that should fill it now. Forcing
-                    //   recompute after Add re-derives heap+scalar from the
-                    //   (post-UPDATE) source for every affected top-K column.
-                    if let Some(ref cols) = grp_cols {
-                        let select_expr = affected_groups_select(cols);
-                        push_materialized_merge_and_affected(
-                            &mut stmts,
-                            &scratch_tbl,
-                            &delta_old,
-                            &intermediate_tbl,
-                            &plan,
-                            DeltaOp::Subtract,
-                            &affected_tbl,
-                            &select_expr,
-                            true,
-                        );
-                        // N1: capture groups whose heap shrank below K post-Sub.
-                        // Must run BEFORE Add (which would re-fill the heap and
-                        // hide the shrinkage signal) and BEFORE topk_refresh
-                        // (which doesn't move the cardinality but ordering kept
-                        // contiguous with the Sub for clarity).
-                        let recompute_scope = if has_topk
-                            && push_topk_shrunk_groups_capture(
-                                &mut stmts,
-                                &intermediate_tbl,
-                                &plan,
-                                &affected_tbl,
-                                &shrunk_tbl,
-                            ) {
-                            shrunk_tbl.as_str()
-                        } else {
-                            affected_tbl.as_str()
-                        };
-                        if let Some(refresh) = build_topk_scalar_refresh_sql(
-                            &intermediate_tbl,
-                            &plan,
-                            Some(affected_tbl.as_str()),
-                        ) {
-                            stmts.push(refresh);
-                        }
-                        if !has_topk {
-                            // Non-top-K: recompute BEFORE Add to avoid LEAST(NULL, d).
-                            if let Some(recompute) = build_min_max_recompute_sql(
-                                &intermediate_tbl,
-                                &plan,
-                                orig_base_query,
-                                Some(affected_tbl.as_str()),
-                            ) {
-                                stmts.push(recompute);
-                            }
-                        }
-                        push_materialized_merge_and_affected(
-                            &mut stmts,
-                            &scratch_tbl,
-                            &delta_new,
-                            &intermediate_tbl,
-                            &plan,
-                            DeltaOp::Add,
-                            &affected_tbl,
-                            &select_expr,
-                            false,
-                        );
-                        if has_topk {
-                            // Top-K: forced recompute AFTER Add to overwrite any
-                            // stale heap content the algebraic merge left behind.
-                            // Scoped to `__reflex_shrunk_*` (groups whose heap
-                            // genuinely shrank) instead of `__reflex_affected_*` —
-                            // groups whose post-Sub heap stayed at K had no
-                            // heap-eligible row removed and Sub+Add alone is
-                            // correct.
-                            if let Some(recompute) = build_min_max_recompute_sql_force_topk(
-                                &intermediate_tbl,
-                                &plan,
-                                orig_base_query,
-                                Some(recompute_scope),
-                            ) {
-                                stmts.push(recompute);
-                            }
-                        }
-                    } else {
-                        push_materialized_merge(
-                            &mut stmts,
-                            &scratch_tbl,
-                            &delta_old,
-                            &intermediate_tbl,
-                            &plan,
-                            DeltaOp::Subtract,
-                        );
-                        if let Some(refresh) =
-                            build_topk_scalar_refresh_sql(&intermediate_tbl, &plan, None)
-                        {
-                            stmts.push(refresh);
-                        }
-                        if !has_topk {
-                            if let Some(recompute) = build_min_max_recompute_sql(
-                                &intermediate_tbl,
-                                &plan,
-                                orig_base_query,
-                                None,
-                            ) {
-                                stmts.push(recompute);
-                            }
-                        }
-                        push_materialized_merge(
-                            &mut stmts,
-                            &scratch_tbl,
-                            &delta_new,
-                            &intermediate_tbl,
-                            &plan,
-                            DeltaOp::Add,
-                        );
-                        if has_topk {
-                            if let Some(recompute) = build_min_max_recompute_sql_force_topk(
-                                &intermediate_tbl,
-                                &plan,
-                                orig_base_query,
-                                None,
-                            ) {
-                                stmts.push(recompute);
-                            }
-                        }
-                    }
-                } else if grp_cols.is_some() {
-                    let cols = grp_cols.as_ref().expect("grp_cols is Some — checked above");
-                    let net_delta = build_net_delta_query(&delta_old, &delta_new, &plan);
-                    let select_expr = affected_groups_select(cols);
-                    // 1.4.5: emit scratch + affected EARLY so the dispatch
-                    // block below can read |affected| for the selectivity
-                    // check before deciding MERGE-vs-rebuild. The MERGE
-                    // statement itself moves into the dispatch DO block at
-                    // the end of this function.
-                    stmts.push(format!("TRUNCATE {}", affected_tbl));
-                    stmts.push(format!("TRUNCATE {}", scratch_tbl));
-                    stmts.push(format!("INSERT INTO {} {}", scratch_tbl, net_delta));
-                    // Scratch is pre-grouped by build_net_delta_query (SUM ... GROUP BY keys),
-                    // so it is already one row per group key — DISTINCT is redundant.
-                    stmts.push(format!(
-                        "INSERT INTO {} SELECT {} FROM {} AS __d",
-                        affected_tbl, select_expr, scratch_tbl
-                    ));
-                    // ANALYZE the freshly populated affected so downstream
-                    // statements (dead-cleanup DELETE, target DELETE/INSERT,
-                    // dispatch DO block) plan against current row counts. See
-                    // the comment in push_materialized_merge_and_affected for
-                    // the failure mode this avoids.
-                    stmts.push(format!("ANALYZE {}", affected_tbl));
-                    // Capture the MERGE SQL — the dispatch block emits it
-                    // (instead of running it unconditionally).
-                    let merge_sql_for_dispatch = build_merge_from_table_sql(
-                        &intermediate_tbl,
-                        &scratch_tbl,
-                        &plan,
-                        DeltaOp::Add,
-                    );
-                    pending_dispatch = Some(PendingDispatch {
-                        merge_sql: merge_sql_for_dispatch,
-                    });
-                } else {
-                    push_materialized_merge(
-                        &mut stmts,
-                        &scratch_tbl,
-                        &delta_old,
-                        &intermediate_tbl,
-                        &plan,
-                        DeltaOp::Subtract,
-                    );
-                    push_materialized_merge(
-                        &mut stmts,
-                        &scratch_tbl,
-                        &delta_new,
-                        &intermediate_tbl,
-                        &plan,
-                        DeltaOp::Add,
-                    );
+                if let Some(merge_sql) = aggregate_update_stmts(
+                    &plan,
+                    source_table,
+                    base_query,
+                    orig_base_query,
+                    has_min_max,
+                    &grp_cols,
+                    &intermediate_tbl,
+                    &affected_tbl,
+                    &shrunk_tbl,
+                    &scratch_tbl,
+                    &old_tbl,
+                    &new_tbl,
+                    &mut stmts,
+                ) {
+                    pending_dispatch = Some(PendingDispatch { merge_sql });
                 }
             }
             _ => {}
