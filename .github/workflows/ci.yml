@@ -113,9 +113,14 @@ jobs:
 
       - name: Create test database
         run: |
+          # ~/.pgrx/ (including data-17/) is cached across CI runs, so an old
+          # bench_db schema may persist from a previous extension version.
+          # Drop + recreate to force the extension's init SQL (which adds
+          # columns via ALTER TABLE ... ADD COLUMN IF NOT EXISTS) to run.
           PGRX_BIN=$(find ~/.pgrx -path "*/17.*/pgrx-install/bin/psql" -print -quit | xargs dirname)
-          ${PGRX_BIN}/createdb -h localhost -p 28817 bench_db 2>/dev/null || true
-          ${PGRX_BIN}/psql -h localhost -p 28817 -d bench_db -c "CREATE EXTENSION IF NOT EXISTS pg_reflex"
+          ${PGRX_BIN}/dropdb -h localhost -p 28817 --if-exists bench_db
+          ${PGRX_BIN}/createdb -h localhost -p 28817 bench_db
+          ${PGRX_BIN}/psql -h localhost -p 28817 -d bench_db -c "CREATE EXTENSION pg_reflex"
 
       - name: Run concurrent tests
         run: PG_VERSION=17 ./tests/test_concurrent.sh
