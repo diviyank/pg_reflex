@@ -1044,6 +1044,345 @@ fn resolve_partitioning(ctx: &mut BuildContext) -> Result<(), String> {
     Ok(())
 }
 
+/// Resolve existing IMV dependencies among `ctx.froms` and compute graph_depth.
+/// Populates `ctx.ivm_froms` and `ctx.depth`.
+fn resolve_existing_imv_deps(client: &mut pgrx::spi::SpiClient<'_>, ctx: &mut BuildContext) {
+    let args = [unsafe {
+        DatumWithOid::new(
+            format_pg_text_array_literal(&ctx.froms),
+            PgBuiltInOids::TEXTOID.oid().value(),
+        )
+    }];
+
+    let matching_froms = client
+        .select(
+            "SELECT name, graph_depth FROM public.__reflex_ivm_reference WHERE name = ANY($1::TEXT[])",
+            None,
+            &args,
+        )
+        .unwrap_or_report()
+        .collect::<Vec<_>>();
+
+    ctx.ivm_froms = matching_froms
+        .iter()
+        .filter_map(|row| row.get_by_name::<&str, _>("name").unwrap_or(None))
+        .map(|s| s.to_string())
+        .collect();
+
+    ctx.depth = matching_froms
+        .iter()
+        .filter_map(|row| row.get_by_name::<i32, _>("graph_depth").unwrap_or(None))
+        .max()
+        .unwrap_or(0)
+        + 1;
+}
+
+/// Stage partition + anchor + partition_join_paths fields onto `ctx.plan`.
+/// Mutates: `ctx.plan.partition_columns`, `partition_strategy`, `anchor_source`,
+/// `partition_join_paths`.
+fn apply_partition_plan(client: &mut pgrx::spi::SpiClient<'_>, ctx: &mut BuildContext) {
+    ctx.plan.partition_columns = ctx.resolved_partition_cols.clone();
+    ctx.plan.partition_strategy = ctx.resolved_strategy.clone();
+    ctx.plan.anchor_source = if ctx.resolved_partition_cols.is_empty() {
+        String::new()
+    } else {
+        crate::partition::resolve_anchor_source(
+            client,
+            &ctx.resolved_partition_cols[0],
+            &ctx.real_source_names,
+        )
+        .unwrap_or_default()
+    };
+    if !ctx.plan.partition_columns.is_empty() && !ctx.plan.anchor_source.is_empty() {
+        let partition_col = ctx.plan.partition_columns[0].to_lowercase();
+        let anchor = ctx.plan.anchor_source.clone();
+        let anchor_quoted = quote_identifier(&anchor);
+        for (source, mappings) in &ctx.plan.source_join_keys.clone() {
+            if source.eq_ignore_ascii_case(&anchor)
+                || split_qualified_name(source)
+                    .1
+                    .eq_ignore_ascii_case(split_qualified_name(&anchor).1)
+            {
+                continue;
+            }
+            let matched_source_col = mappings
+                .iter()
+                .find(|(ic, _)| ic.eq_ignore_ascii_case(&partition_col))
+                .map(|(_, sc)| sc.clone());
+            if let Some(source_col) = matched_source_col {
+                let fragment = format!(
+                    "SELECT a.\"{pc}\" AS pkey, t.* \
+                     FROM {{transition_alias}} t \
+                     JOIN {anchor} a ON a.\"{pc}\" = t.\"{sc}\"",
+                    pc = partition_col,
+                    anchor = anchor_quoted,
+                    sc = source_col,
+                );
+                ctx.plan
+                    .partition_join_paths
+                    .insert(source.clone(), fragment);
+            }
+        }
+    }
+}
+
+/// Drop `imv_relevant_columns` entries that don't exist on the source table.
+/// Mutates: `ctx.plan.imv_relevant_columns`.
+fn filter_imv_relevant_columns(client: &mut pgrx::spi::SpiClient<'_>, ctx: &mut BuildContext) {
+    let (_t, _nn, per_source_cols_for_filter) =
+        query_column_types_from_catalog_with_per_source(client, &ctx.froms);
+    for (source, cols) in ctx.plan.imv_relevant_columns.iter_mut() {
+        if let Some(actual) = per_source_cols_for_filter.get(source) {
+            cols.retain(|c| actual.contains(c.as_str()));
+        } else if source.starts_with('<') {
+            cols.clear();
+        }
+    }
+    ctx.plan.imv_relevant_columns.retain(|_, v| !v.is_empty());
+}
+
+/// Passthrough materialization: CREATE TABLE AS (or partitioned variant),
+/// ANALYZE, unique-index, scratch tables.
+fn materialize_passthrough(client: &mut pgrx::spi::SpiClient<'_>, ctx: &mut BuildContext) {
+    let create_kw = if ctx.logged {
+        "CREATE TABLE"
+    } else {
+        "CREATE UNLOGGED TABLE"
+    };
+    if !ctx.plan.partition_columns.is_empty() {
+        let scratch_name = format!(
+            "__reflex_pt_shape_{}",
+            safe_identifier(split_qualified_name(ctx.view_name).1)
+        );
+        client
+            .update(
+                &format!(
+                    "CREATE TEMP TABLE {} AS {} WITH NO DATA",
+                    scratch_name, ctx.sql
+                ),
+                None,
+                &[],
+            )
+            .unwrap_or_report();
+        let col_defs: Vec<String> = client
+            .select(
+                "SELECT attname::text AS name, \
+                        format_type(atttypid, atttypmod) AS pg_type \
+                 FROM pg_attribute \
+                 WHERE attrelid = $1::regclass AND attnum > 0 AND NOT attisdropped \
+                 ORDER BY attnum",
+                None,
+                &[unsafe {
+                    DatumWithOid::new(scratch_name.clone(), PgBuiltInOids::TEXTOID.oid().value())
+                }],
+            )
+            .unwrap_or_report()
+            .filter_map(|r| {
+                let n = r.get_by_name::<&str, _>("name").ok()??.to_string();
+                let t = r.get_by_name::<&str, _>("pg_type").ok()??.to_string();
+                Some(format!("\"{}\" {}", n, t))
+            })
+            .collect();
+        client
+            .update(&format!("DROP TABLE {}", scratch_name), None, &[])
+            .unwrap_or_report();
+        let part_clause = crate::partition::build_partition_by_clause(
+            &ctx.plan.partition_strategy,
+            &ctx.plan.partition_columns,
+        );
+        client
+            .update(
+                &format!(
+                    "{} IF NOT EXISTS {} ({}) {}",
+                    create_kw,
+                    quote_identifier(ctx.view_name),
+                    col_defs.join(", "),
+                    part_clause
+                ),
+                None,
+                &[],
+            )
+            .unwrap_or_report();
+        if let Ok(anchor) = crate::partition::resolve_anchor_source(
+            client,
+            &ctx.plan.partition_columns[0],
+            &ctx.real_source_names,
+        ) {
+            let src_children = crate::partition::list_partition_children(client, &anchor);
+            for src_child in &src_children {
+                let (_, tgt_ddl) =
+                    crate::partition::build_partition_child_ddl_pair(ctx.view_name, src_child);
+                client.update(&tgt_ddl, None, &[]).unwrap_or_report();
+            }
+        }
+        client
+            .update(
+                &format!(
+                    "INSERT INTO {} {}",
+                    quote_identifier(ctx.view_name),
+                    ctx.sql
+                ),
+                None,
+                &[],
+            )
+            .unwrap_or_report();
+    } else {
+        client
+            .update(
+                &format!(
+                    "{} {} AS {}",
+                    create_kw,
+                    quote_identifier(ctx.view_name),
+                    ctx.sql
+                ),
+                None,
+                &[],
+            )
+            .unwrap_or_report();
+    }
+    client
+        .update(
+            &format!("ANALYZE {}", quote_identifier(ctx.view_name)),
+            None,
+            &[],
+        )
+        .unwrap_or_report();
+
+    if !ctx.resolved_unique_columns.is_empty() {
+        let bare_view = split_qualified_name(ctx.view_name).1;
+        let uk_cols: Vec<String> = ctx
+            .resolved_unique_columns
+            .iter()
+            .map(|c| format!("\"{}\"", c))
+            .collect();
+        client
+            .update(
+                &format!(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS \"__reflex_uk_{}\" ON {} ({})",
+                    bare_view,
+                    quote_identifier(ctx.view_name),
+                    uk_cols.join(", ")
+                ),
+                None,
+                &[],
+            )
+            .unwrap_or_report();
+    }
+
+    for source in &ctx.froms {
+        if source.starts_with('<') {
+            continue;
+        }
+        for ddl in build_passthrough_scratch_ddls(ctx.view_name, source) {
+            client.update(&ddl, None, &[]).unwrap_or_report();
+        }
+    }
+}
+
+/// Aggregate materialization: catalog type discovery, intermediate + target + delta-scratch
+/// DDL, partition children. Pushes intermediate table name onto `ctx.unlogged_tables`.
+fn materialize_aggregate(client: &mut pgrx::spi::SpiClient<'_>, ctx: &mut BuildContext) {
+    let (mut column_types, not_null_cols, per_source_cols) =
+        query_column_types_from_catalog_with_per_source(client, &ctx.froms);
+    ctx.plan.optimize_not_null_sums(&not_null_cols);
+    for (source, cols) in ctx.plan.imv_relevant_columns.iter_mut() {
+        if let Some(actual) = per_source_cols.get(source) {
+            cols.retain(|c| actual.contains(c.as_str()));
+        } else if source.starts_with('<') {
+            cols.clear();
+        }
+    }
+    ctx.plan.imv_relevant_columns.retain(|_, v| !v.is_empty());
+
+    let base_q_for_types = generate_base_query(&ctx.analysis, &ctx.plan);
+    augment_column_types_from_query(&base_q_for_types, &mut column_types);
+    augment_column_types_from_query(ctx.sql, &mut column_types);
+
+    for ic in &mut ctx.plan.intermediate_columns {
+        if ic.source_aggregate == "SUM" {
+            let base_type = resolve_column_type(&ic.name, &column_types, "").to_uppercase();
+            if base_type == "DOUBLE PRECISION" {
+                ic.pg_type = "DOUBLE PRECISION".to_string();
+            }
+        }
+    }
+
+    for ic in &mut ctx.plan.intermediate_columns {
+        if (ic.source_aggregate == "MIN" || ic.source_aggregate == "MAX")
+            && ic.pg_type.eq_ignore_ascii_case("NUMERIC")
+        {
+            let resolved = resolve_column_type(&ic.source_arg, &column_types, "");
+            if !resolved.is_empty() && !resolved.eq_ignore_ascii_case("NUMERIC") {
+                ic.pg_type = resolved;
+            }
+        }
+    }
+
+    for mapping in &mut ctx.plan.end_query_mappings {
+        if mapping.cast_type.is_none() {
+            let discovered = resolve_column_type(&mapping.output_alias, &column_types, "");
+            if !discovered.is_empty() {
+                let default_type = match mapping.aggregate_type.as_str() {
+                    "SUM" | "AVG" | "DERIVED" => "NUMERIC",
+                    "COUNT" => "BIGINT",
+                    "BOOL_OR" => "BOOLEAN",
+                    _ => "",
+                };
+                if !default_type.is_empty() && discovered.to_uppercase() != default_type {
+                    mapping.cast_type = Some(discovered);
+                }
+            }
+        }
+    }
+
+    if let Some(ddl) =
+        build_intermediate_table_ddl(ctx.view_name, &ctx.plan, &column_types, ctx.logged)
+    {
+        let tbl = intermediate_table_name(ctx.view_name);
+        client.update(&ddl, None, &[]).unwrap_or_report();
+        ctx.unlogged_tables.push(tbl.clone());
+        if let Some(scratch_ddl) =
+            build_delta_scratch_table_ddl(ctx.view_name, &ctx.plan, &column_types)
+        {
+            client.update(&scratch_ddl, None, &[]).unwrap_or_report();
+        }
+    }
+
+    let target_ddl = build_target_table_ddl(ctx.view_name, &ctx.plan, &column_types, ctx.logged);
+    client.update(&target_ddl, None, &[]).unwrap_or_report();
+
+    if !ctx.plan.partition_columns.is_empty() {
+        match crate::partition::resolve_anchor_source(
+            client,
+            &ctx.plan.partition_columns[0],
+            &ctx.real_source_names,
+        ) {
+            Ok(anchor) => {
+                let src_children = crate::partition::list_partition_children(client, &anchor);
+                info!(
+                    "pg_reflex: creating {} partition children for '{}' (anchor='{}')",
+                    src_children.len(),
+                    ctx.view_name,
+                    anchor
+                );
+                for src_child in &src_children {
+                    let (int_ddl, tgt_ddl) =
+                        crate::partition::build_partition_child_ddl_pair(ctx.view_name, src_child);
+                    client.update(&int_ddl, None, &[]).unwrap_or_report();
+                    client.update(&tgt_ddl, None, &[]).unwrap_or_report();
+                }
+            }
+            Err(e) => {
+                warning!(
+                    "pg_reflex: could not resolve anchor for '{}' partition children: {}",
+                    ctx.view_name,
+                    e
+                );
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn create_reflex_ivm_impl(
     view_name: &str,
@@ -1218,412 +1557,13 @@ pub(crate) fn create_reflex_ivm_impl(
     }
 
     Spi::connect_mut(|client| {
-        // Lookup existing IMVs among the source tables
-        let args = [unsafe {
-            DatumWithOid::new(
-                format_pg_text_array_literal(&ctx.froms),
-                PgBuiltInOids::TEXTOID.oid().value(),
-            )
-        }];
-
-        let matching_froms = client
-            .select(
-                "SELECT name, graph_depth FROM public.__reflex_ivm_reference WHERE name = ANY($1::TEXT[])",
-                None,
-                &args,
-            )
-            .unwrap_or_report()
-            .collect::<Vec<_>>();
-
-        ctx.ivm_froms = matching_froms
-            .iter()
-            .filter_map(|row| row.get_by_name::<&str, _>("name").unwrap_or(None))
-            .map(|s| s.to_string())
-            .collect();
-
-        // Calculate graph depth
-        ctx.depth = matching_froms
-            .iter()
-            .filter_map(|row| row.get_by_name::<i32, _>("graph_depth").unwrap_or(None))
-            .max()
-            .unwrap_or(0)
-            + 1;
-
-        ctx.plan.partition_columns = ctx.resolved_partition_cols.clone();
-        ctx.plan.partition_strategy = ctx.resolved_strategy.clone();
-        // Resolve and persist the anchor source so the trigger codegen can
-        // detect Tier 1 (firing source == anchor) at SQL build time without
-        // an extra SPI round-trip per fire.  Resolution failures (zero or
-        // multiple owners) leave the field empty — the trigger falls
-        // through to global Path B for that source, safe.
-        ctx.plan.anchor_source = if ctx.resolved_partition_cols.is_empty() {
-            String::new()
-        } else {
-            crate::partition::resolve_anchor_source(
-                client,
-                &ctx.resolved_partition_cols[0],
-                &ctx.real_source_names,
-            )
-            .unwrap_or_default()
-        };
-        // Phase D (plans/partitioning_3.md §4): compute the per-source
-        // JOIN-derivation SQL for non-anchor sources.  For each source S
-        // ≠ anchor whose `source_join_keys` entry contains the partition
-        // column as the intermediate-side col, emit a SELECT that JOINs
-        // S's transition to the anchor and projects the anchor's
-        // partition column as `pkey`.  `{transition_alias}` is a placeholder
-        // the trigger codegen substitutes at fire time with the actual
-        // transition table name.  Empty / missing entry = no JOIN path =
-        // trigger falls through to global Path B for that source (safe).
-        if !ctx.plan.partition_columns.is_empty() && !ctx.plan.anchor_source.is_empty() {
-            let partition_col = ctx.plan.partition_columns[0].to_lowercase();
-            let anchor = ctx.plan.anchor_source.clone();
-            let anchor_quoted = quote_identifier(&anchor);
-            for (source, mappings) in &ctx.plan.source_join_keys.clone() {
-                if source.eq_ignore_ascii_case(&anchor)
-                    || split_qualified_name(source)
-                        .1
-                        .eq_ignore_ascii_case(split_qualified_name(&anchor).1)
-                {
-                    continue;
-                }
-                let matched_source_col = mappings
-                    .iter()
-                    .find(|(ic, _)| ic.eq_ignore_ascii_case(&partition_col))
-                    .map(|(_, sc)| sc.clone());
-                if let Some(source_col) = matched_source_col {
-                    // The IMV's partition column matches the GROUP BY by
-                    // design, which (per Phase B) is a bare column ref on
-                    // the anchor.  So anchor's column name = partition_col.
-                    let fragment = format!(
-                        "SELECT a.\"{pc}\" AS pkey, t.* \
-                         FROM {{transition_alias}} t \
-                         JOIN {anchor} a ON a.\"{pc}\" = t.\"{sc}\"",
-                        pc = partition_col,
-                        anchor = anchor_quoted,
-                        sc = source_col,
-                    );
-                    ctx.plan
-                        .partition_join_paths
-                        .insert(source.clone(), fragment);
-                }
-            }
-        }
-
-        // 1.5.1 — Filter `imv_relevant_columns` down to columns that
-        // actually exist per source. The analyzer over-attributes bare
-        // identifiers in multi-source queries to every real source as a
-        // safe-correctness move; without this filter the persisted JSON
-        // would name columns that don't exist on the source's transition
-        // table (e.g. `sales_simulation.dem_plan_id` getting wrongly
-        // attributed to `demand_planning` too in a join IMV), and the
-        // skip SQL would error at trigger fire time with
-        // `column "X" does not exist`.
-        //
-        // The filter must run for BOTH passthrough and aggregate IMVs.
-        // (Pre-1.5.1 this only ran in the aggregate branch — passthrough
-        // IMVs with bare projections crashed at the first UPDATE.) The
-        // aggregate branch below re-fetches the catalog info (it needs
-        // column_types + not_null_cols too), which is a tiny duplicate
-        // SPI per IMV — acceptable for the simplicity of a single fix
-        // site that covers both paths.
-        {
-            let (_t, _nn, per_source_cols_for_filter) =
-                query_column_types_from_catalog_with_per_source(client, &ctx.froms);
-            for (source, cols) in ctx.plan.imv_relevant_columns.iter_mut() {
-                if let Some(actual) = per_source_cols_for_filter.get(source) {
-                    cols.retain(|c| actual.contains(c.as_str()));
-                } else if source.starts_with('<') {
-                    cols.clear();
-                }
-            }
-            ctx.plan.imv_relevant_columns.retain(|_, v| !v.is_empty());
-        }
-
+        resolve_existing_imv_deps(client, &mut ctx);
+        apply_partition_plan(client, &mut ctx);
+        filter_imv_relevant_columns(client, &mut ctx);
         if ctx.plan.is_passthrough {
-            // Passthrough: CREATE TABLE AS — Postgres infers columns + types, populates data.
-            // Partitioned path: we need an explicit column list to use
-            // `PARTITION BY`, so we first probe the column shape via a
-            // temp scratch (WITH NO DATA), then CREATE the real
-            // partitioned parent + children, then INSERT.
-            let create_kw = if ctx.logged {
-                "CREATE TABLE"
-            } else {
-                "CREATE UNLOGGED TABLE"
-            };
-            if !ctx.plan.partition_columns.is_empty() {
-                let scratch_name = format!(
-                    "__reflex_pt_shape_{}",
-                    safe_identifier(split_qualified_name(ctx.view_name).1)
-                );
-                client
-                    .update(
-                        &format!(
-                            "CREATE TEMP TABLE {} AS {} WITH NO DATA",
-                            scratch_name, ctx.sql
-                        ),
-                        None,
-                        &[],
-                    )
-                    .unwrap_or_report();
-                let col_defs: Vec<String> = client
-                    .select(
-                        "SELECT attname::text AS name, \
-                                format_type(atttypid, atttypmod) AS pg_type \
-                         FROM pg_attribute \
-                         WHERE attrelid = $1::regclass AND attnum > 0 AND NOT attisdropped \
-                         ORDER BY attnum",
-                        None,
-                        &[unsafe {
-                            DatumWithOid::new(
-                                scratch_name.clone(),
-                                PgBuiltInOids::TEXTOID.oid().value(),
-                            )
-                        }],
-                    )
-                    .unwrap_or_report()
-                    .filter_map(|r| {
-                        let n = r.get_by_name::<&str, _>("name").ok()??.to_string();
-                        let t = r.get_by_name::<&str, _>("pg_type").ok()??.to_string();
-                        Some(format!("\"{}\" {}", n, t))
-                    })
-                    .collect();
-                client
-                    .update(&format!("DROP TABLE {}", scratch_name), None, &[])
-                    .unwrap_or_report();
-                let part_clause = crate::partition::build_partition_by_clause(
-                    &ctx.plan.partition_strategy,
-                    &ctx.plan.partition_columns,
-                );
-                client
-                    .update(
-                        &format!(
-                            "{} IF NOT EXISTS {} ({}) {}",
-                            create_kw,
-                            quote_identifier(ctx.view_name),
-                            col_defs.join(", "),
-                            part_clause
-                        ),
-                        None,
-                        &[],
-                    )
-                    .unwrap_or_report();
-                if let Ok(anchor) = crate::partition::resolve_anchor_source(
-                    client,
-                    &ctx.plan.partition_columns[0],
-                    &ctx.real_source_names,
-                ) {
-                    let src_children = crate::partition::list_partition_children(client, &anchor);
-                    for src_child in &src_children {
-                        let (_, tgt_ddl) = crate::partition::build_partition_child_ddl_pair(
-                            ctx.view_name,
-                            src_child,
-                        );
-                        client.update(&tgt_ddl, None, &[]).unwrap_or_report();
-                    }
-                }
-                client
-                    .update(
-                        &format!(
-                            "INSERT INTO {} {}",
-                            quote_identifier(ctx.view_name),
-                            ctx.sql
-                        ),
-                        None,
-                        &[],
-                    )
-                    .unwrap_or_report();
-            } else {
-                client
-                    .update(
-                        &format!(
-                            "{} {} AS {}",
-                            create_kw,
-                            quote_identifier(ctx.view_name),
-                            ctx.sql
-                        ),
-                        None,
-                        &[],
-                    )
-                    .unwrap_or_report();
-            }
-            // ANALYZE so the query planner has statistics for the new table
-            client
-                .update(
-                    &format!("ANALYZE {}", quote_identifier(ctx.view_name)),
-                    None,
-                    &[],
-                )
-                .unwrap_or_report();
-
-            // Create unique index on target for resolved unique key columns
-            if !ctx.resolved_unique_columns.is_empty() {
-                let bare_view = split_qualified_name(ctx.view_name).1;
-                let uk_cols: Vec<String> = ctx
-                    .resolved_unique_columns
-                    .iter()
-                    .map(|c| format!("\"{}\"", c))
-                    .collect();
-                client
-                    .update(
-                        &format!(
-                            "CREATE UNIQUE INDEX IF NOT EXISTS \"__reflex_uk_{}\" ON {} ({})",
-                            bare_view,
-                            quote_identifier(ctx.view_name),
-                            uk_cols.join(", ")
-                        ),
-                        None,
-                        &[],
-                    )
-                    .unwrap_or_report();
-            }
-
-            // Passthrough scratch tables: one new-side + one old-side per real source.
-            // Populated at trigger time from the transition tables so downstream DML
-            // (DELETE ... WHERE IN (SELECT FROM transition), INSERT ... SELECT FROM transition)
-            // reads from a plain table, not a transition table — avoids the nested-trigger
-            // transition-table-in-EXECUTE assertion.
-            for source in &ctx.froms {
-                if source.starts_with('<') {
-                    continue;
-                }
-                for ddl in build_passthrough_scratch_ddls(ctx.view_name, source) {
-                    client.update(&ddl, None, &[]).unwrap_or_report();
-                }
-            }
+            materialize_passthrough(client, &mut ctx);
         } else {
-            // Aggregate: build intermediate + target tables from the plan
-            let (mut column_types, not_null_cols, per_source_cols) =
-                query_column_types_from_catalog_with_per_source(client, &ctx.froms);
-            ctx.plan.optimize_not_null_sums(&not_null_cols);
-            // 1.4.5 — filter `imv_relevant_columns` down to columns that
-            // actually exist per source. The analyzer over-attributes bare
-            // identifiers in multi-source queries to every real source as a
-            // safe-correctness move; without this filter the persisted JSON
-            // would name columns that don't exist on the source's transition
-            // table, and the skip SQL would error at trigger fire time.
-            for (source, cols) in ctx.plan.imv_relevant_columns.iter_mut() {
-                if let Some(actual) = per_source_cols.get(source) {
-                    cols.retain(|c| actual.contains(c.as_str()));
-                } else if source.starts_with('<') {
-                    cols.clear();
-                }
-            }
-            ctx.plan.imv_relevant_columns.retain(|_, v| !v.is_empty());
-
-            // Discover actual types for computed expressions by introspecting query output.
-            // 1. Base query types: resolves GROUP BY expressions (DATE_TRUNC, EXTRACT, etc.)
-            let base_q_for_types = generate_base_query(&ctx.analysis, &ctx.plan);
-            augment_column_types_from_query(&base_q_for_types, &mut column_types);
-            // 2. Original SQL types: resolves aggregate output types (SUM(int)→BIGINT, etc.)
-            augment_column_types_from_query(ctx.sql, &mut column_types);
-
-            // Fix intermediate SUM column types: use DOUBLE PRECISION instead of NUMERIC
-            // when the base_query produces DOUBLE PRECISION (preserves float arithmetic path).
-            for ic in &mut ctx.plan.intermediate_columns {
-                if ic.source_aggregate == "SUM" {
-                    let base_type = resolve_column_type(&ic.name, &column_types, "").to_uppercase();
-                    if base_type == "DOUBLE PRECISION" {
-                        ic.pg_type = "DOUBLE PRECISION".to_string();
-                    }
-                }
-            }
-
-            // Fix intermediate MIN/MAX column types from the resolved source-column
-            // catalog type. Without this, `pg_type` stays at the planner default
-            // ("NUMERIC") and trigger codegen emits `'{}'::NUMERIC[]` for the
-            // top-K array even when the actual column is TEXT[] / DATE[] /
-            // TIMESTAMP[]. The schema builder already special-cases this for
-            // DDL, but the trigger MERGE statements read `pg_type` directly.
-            for ic in &mut ctx.plan.intermediate_columns {
-                if (ic.source_aggregate == "MIN" || ic.source_aggregate == "MAX")
-                    && ic.pg_type.eq_ignore_ascii_case("NUMERIC")
-                {
-                    let resolved = resolve_column_type(&ic.source_arg, &column_types, "");
-                    if !resolved.is_empty() && !resolved.eq_ignore_ascii_case("NUMERIC") {
-                        ic.pg_type = resolved;
-                    }
-                }
-            }
-
-            // Set cast_type on end_query_mappings so the end_query casts intermediate
-            // to the correct target type (e.g., BIGINT for SUM(int)).
-            for mapping in &mut ctx.plan.end_query_mappings {
-                if mapping.cast_type.is_none() {
-                    let discovered = resolve_column_type(&mapping.output_alias, &column_types, "");
-                    if !discovered.is_empty() {
-                        let default_type = match mapping.aggregate_type.as_str() {
-                            "SUM" | "AVG" | "DERIVED" => "NUMERIC",
-                            "COUNT" => "BIGINT",
-                            "BOOL_OR" => "BOOLEAN",
-                            _ => "",
-                        };
-                        // Only set cast if discovered type differs from the intermediate default
-                        if !default_type.is_empty() && discovered.to_uppercase() != default_type {
-                            mapping.cast_type = Some(discovered);
-                        }
-                    }
-                }
-            }
-
-            if let Some(ddl) =
-                build_intermediate_table_ddl(ctx.view_name, &ctx.plan, &column_types, ctx.logged)
-            {
-                let tbl = intermediate_table_name(ctx.view_name);
-                client.update(&ddl, None, &[]).unwrap_or_report();
-                ctx.unlogged_tables.push(tbl.clone());
-                // Delta scratch table: materialized intermediate for MERGE (avoids
-                // transition-table-in-EXECUTE SIGABRT). Always UNLOGGED, no indexes.
-                if let Some(scratch_ddl) =
-                    build_delta_scratch_table_ddl(ctx.view_name, &ctx.plan, &column_types)
-                {
-                    client.update(&scratch_ddl, None, &[]).unwrap_or_report();
-                }
-            }
-
-            let target_ddl =
-                build_target_table_ddl(ctx.view_name, &ctx.plan, &column_types, ctx.logged);
-            client.update(&target_ddl, None, &[]).unwrap_or_report();
-            // Note: indexes are created AFTER bulk insert for performance
-
-            // Partitioned aggregate IMVs: create one partition child on each
-            // of (intermediate, target) per source-side partition.  Bounds
-            // are sourced live from the anchor's `pg_inherits`/`relpartbound`
-            // so we cannot drift.
-            if !ctx.plan.partition_columns.is_empty() {
-                match crate::partition::resolve_anchor_source(
-                    client,
-                    &ctx.plan.partition_columns[0],
-                    &ctx.real_source_names,
-                ) {
-                    Ok(anchor) => {
-                        let src_children =
-                            crate::partition::list_partition_children(client, &anchor);
-                        info!(
-                            "pg_reflex: creating {} partition children for '{}' (anchor='{}')",
-                            src_children.len(),
-                            ctx.view_name,
-                            anchor
-                        );
-                        for src_child in &src_children {
-                            let (int_ddl, tgt_ddl) =
-                                crate::partition::build_partition_child_ddl_pair(
-                                    ctx.view_name,
-                                    src_child,
-                                );
-                            client.update(&int_ddl, None, &[]).unwrap_or_report();
-                            client.update(&tgt_ddl, None, &[]).unwrap_or_report();
-                        }
-                    }
-                    Err(e) => {
-                        warning!(
-                            "pg_reflex: could not resolve anchor for '{}' partition children: {}",
-                            ctx.view_name,
-                            e
-                        );
-                    }
-                }
-            }
+            materialize_aggregate(client, &mut ctx);
         }
 
         // CREATE consolidated triggers on source tables (one set per source, shared by all IMVs).
