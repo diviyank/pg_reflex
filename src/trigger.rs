@@ -1816,6 +1816,34 @@ fn aggregate_update_stmts(
     }
 }
 
+/// Self-join full refresh: source_table appears multiple times in base_query, so
+/// the standard delta is wrong (every alias gets replaced with the same transition).
+/// Both passthrough and aggregate paths rebuild from base_query.
+fn self_join_full_refresh_stmts(
+    view_name: &str,
+    base_query: &str,
+    end_query: &str,
+    intermediate_tbl: &str,
+    plan: &AggregationPlan,
+    stmts: &mut Vec<String>,
+) {
+    let qv = quote_identifier(view_name);
+    if plan.is_passthrough {
+        stmts.push(format!("DELETE FROM {}", qv));
+        stmts.push(format!("INSERT INTO {} {}", qv, base_query));
+    } else {
+        stmts.push(format!("TRUNCATE {}", intermediate_tbl));
+        stmts.push(format!("INSERT INTO {} {}", intermediate_tbl, base_query));
+        if end_query.is_empty() {
+            stmts.push(format!("TRUNCATE {}", qv));
+            stmts.push(format!("INSERT INTO {} {}", qv, base_query));
+        } else {
+            stmts.push(format!("TRUNCATE {}", qv));
+            stmts.push(format!("INSERT INTO {} {}", qv, end_query));
+        }
+    }
+}
+
 /// Generates the SQL statements to apply a delta to an IMV.
 ///
 /// Called from plpgsql trigger wrappers. Returns a delimiter-separated string
@@ -1940,22 +1968,14 @@ pub fn reflex_build_delta_sql(
         || (is_full_outer && !is_self_join);
 
     if is_self_join {
-        // Self-join: full refresh (delta itself is wrong — both aliases get replaced).
-        let qv = quote_identifier(view_name);
-        if plan.is_passthrough {
-            stmts.push(format!("DELETE FROM {}", qv));
-            stmts.push(format!("INSERT INTO {} {}", qv, base_query));
-        } else {
-            stmts.push(format!("TRUNCATE {}", intermediate_tbl));
-            stmts.push(format!("INSERT INTO {} {}", intermediate_tbl, base_query));
-            if end_query.is_empty() {
-                stmts.push(format!("TRUNCATE {}", qv));
-                stmts.push(format!("INSERT INTO {} {}", qv, base_query));
-            } else {
-                stmts.push(format!("TRUNCATE {}", qv));
-                stmts.push(format!("INSERT INTO {} {}", qv, end_query));
-            }
-        }
+        self_join_full_refresh_stmts(
+            view_name,
+            base_query,
+            end_query,
+            &intermediate_tbl,
+            &plan,
+            &mut stmts,
+        );
     } else if is_outer_join_secondary && plan.is_passthrough {
         // Passthrough outer-join secondary: full refresh from source
         let qv = quote_identifier(view_name);
