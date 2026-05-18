@@ -1,0 +1,9 @@
+---
+source: src/tests/unit_trigger.rs
+expression: sql
+---
+TRUNCATE "__reflex_pt_new_v_orders"
+--<<REFLEX_SEP>>--
+INSERT INTO "__reflex_pt_new_v_orders" SELECT * FROM "__reflex_new_orders"
+--<<REFLEX_SEP>>--
+INSERT INTO "v" SELECT id, qty FROM "__reflex_pt_new_v_orders"

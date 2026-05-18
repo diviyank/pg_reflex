@@ -1,0 +1,7 @@
+---
+source: src/tests/unit_trigger.rs
+expression: sql
+---
+DELETE FROM "v"
+--<<REFLEX_SEP>>--
+INSERT INTO "v" SELECT a.id, a.qty FROM sales a JOIN sales b ON a.id = b.parent_id

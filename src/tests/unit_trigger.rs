@@ -2480,3 +2480,125 @@ fn test_delete_promoted_falls_back_when_end_query_has_group_by() {
         &sql[..sql.len().min(2000)]
     );
 }
+
+#[cfg(test)]
+mod delta_sql_snapshots {
+    use crate::trigger::reflex_build_delta_sql;
+
+    // Minimal AggregationPlan JSON for an aggregate IMV: GROUP BY `region`, SUM(qty).
+    // Two real sources to enable the OJS detection.
+    const AGG_JSON_TWO_SOURCES: &str = r#"{
+        "is_passthrough": false,
+        "group_by_columns": ["region"],
+        "group_by_aliases": {},
+        "intermediate_columns": [
+            {"name":"__sum_qty","pg_type":"NUMERIC","source_aggregate":"SUM","source_arg":"qty","topk_k":null}
+        ],
+        "needs_ivm_count": true,
+        "has_distinct": false,
+        "end_query_mappings": [
+            {"intermediate_expr":"__sum_qty","output_alias":"qty","aggregate_type":"SUM","cast_type":null}
+        ],
+        "distinct_columns": [],
+        "passthrough_columns": [],
+        "passthrough_key_mappings": {},
+        "imv_relevant_columns": {},
+        "imv_relevant_where": {},
+        "source_join_keys": {},
+        "not_null_columns": [],
+        "output_column_order": [],
+        "partition_columns": [],
+        "partition_strategy": "",
+        "anchor_source": "",
+        "partition_join_paths": {},
+        "having_clause": null
+    }"#;
+
+    // Minimal passthrough plan with a per-source unique-key mapping.
+    const PASSTHROUGH_JSON_WITH_MAPPING: &str = r#"{
+        "is_passthrough": true,
+        "group_by_columns": [],
+        "group_by_aliases": {},
+        "intermediate_columns": [],
+        "needs_ivm_count": false,
+        "has_distinct": false,
+        "end_query_mappings": [],
+        "distinct_columns": [],
+        "passthrough_columns": ["id"],
+        "passthrough_key_mappings": {"orders":[["id","id"]]},
+        "imv_relevant_columns": {},
+        "imv_relevant_where": {},
+        "source_join_keys": {},
+        "not_null_columns": ["id"],
+        "output_column_order": [],
+        "partition_columns": [],
+        "partition_strategy": "",
+        "anchor_source": "",
+        "partition_join_paths": {},
+        "having_clause": null
+    }"#;
+
+    #[test]
+    fn snapshot_self_join_insert_aggregate() {
+        // Self-join: source_table appears twice in base_query → full-refresh path
+        let base_q = "SELECT a.region, SUM(a.qty) AS qty FROM sales a JOIN sales b ON a.id = b.parent_id GROUP BY a.region";
+        let end_q = "SELECT region, qty FROM __reflex_int_v GROUP BY region";
+        let sql = reflex_build_delta_sql(
+            "v",
+            "sales",
+            "INSERT",
+            base_q,
+            end_q,
+            Some(AGG_JSON_TWO_SOURCES),
+            base_q,
+        );
+        insta::assert_snapshot!("self_join_insert_aggregate", sql);
+    }
+
+    #[test]
+    fn snapshot_self_join_delete_passthrough() {
+        let base_q = "SELECT a.id, a.qty FROM sales a JOIN sales b ON a.id = b.parent_id";
+        let sql = reflex_build_delta_sql(
+            "v",
+            "sales",
+            "DELETE",
+            base_q,
+            "",
+            Some(PASSTHROUGH_JSON_WITH_MAPPING),
+            base_q,
+        );
+        insta::assert_snapshot!("self_join_delete_passthrough", sql);
+    }
+
+    #[test]
+    fn snapshot_outer_join_secondary_delete_aggregate() {
+        // `customers` is secondary in a LEFT JOIN, DELETE on customers
+        let base_q = "SELECT o.region, SUM(o.qty) AS qty FROM orders o LEFT JOIN customers c ON c.id = o.customer_id GROUP BY o.region";
+        let end_q = "SELECT region, qty FROM __reflex_int_v GROUP BY region";
+        let sql = reflex_build_delta_sql(
+            "v",
+            "customers",
+            "DELETE",
+            base_q,
+            end_q,
+            Some(AGG_JSON_TWO_SOURCES),
+            base_q,
+        );
+        insta::assert_snapshot!("outer_join_secondary_delete_aggregate", sql);
+    }
+
+    #[test]
+    fn snapshot_passthrough_insert() {
+        let base_q = "SELECT id, qty FROM orders";
+        let sql = reflex_build_delta_sql(
+            "v",
+            "orders",
+            "INSERT",
+            base_q,
+            "",
+            Some(PASSTHROUGH_JSON_WITH_MAPPING),
+            base_q,
+        );
+        insta::assert_snapshot!("passthrough_insert", sql);
+    }
+}

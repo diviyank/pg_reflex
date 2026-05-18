@@ -1,0 +1,15 @@
+---
+source: src/tests/unit_trigger.rs
+expression: sql
+---
+TRUNCATE "__reflex_affected_v"
+--<<REFLEX_SEP>>--
+INSERT INTO "__reflex_affected_v" SELECT DISTINCT "region" FROM (SELECT o.region, SUM(o.qty) AS qty FROM orders o LEFT JOIN "__reflex_old_customers" c ON c.id = o.customer_id GROUP BY o.region) AS __d
+--<<REFLEX_SEP>>--
+DELETE FROM "__reflex_intermediate_v" WHERE EXISTS (SELECT 1 FROM "__reflex_affected_v" AS __a WHERE "__reflex_intermediate_v"."region" IS NOT DISTINCT FROM __a."region")
+--<<REFLEX_SEP>>--
+INSERT INTO "__reflex_intermediate_v" SELECT * FROM (SELECT o.region, SUM(o.qty) AS qty FROM orders o LEFT JOIN customers c ON c.id = o.customer_id GROUP BY o.region) AS __full WHERE EXISTS (SELECT 1 FROM "__reflex_affected_v" AS __a WHERE __full."region" IS NOT DISTINCT FROM __a."region")
+--<<REFLEX_SEP>>--
+DELETE FROM "v" WHERE EXISTS (SELECT 1 FROM "__reflex_affected_v" AS __a WHERE "v"."region" IS NOT DISTINCT FROM __a."region")
+--<<REFLEX_SEP>>--
+INSERT INTO "v" SELECT region, qty FROM __reflex_int_v GROUP BY region AND EXISTS (SELECT 1 FROM "__reflex_affected_v" AS __a WHERE "__reflex_intermediate_v"."region" IS NOT DISTINCT FROM __a."region")
