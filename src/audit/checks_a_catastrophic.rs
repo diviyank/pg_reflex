@@ -1,0 +1,339 @@
+#![allow(unused_imports)]
+
+use pgrx::datum::DatumWithOid;
+use pgrx::pg_sys::panic::ErrorReportable;
+use pgrx::prelude::*;
+use pgrx::spi::SpiClient;
+use pgrx::PgBuiltInOids;
+
+use super::{read_attname_set, relation_exists};
+use super::{Check, Finding, ImvRow, Severity};
+
+pub(super) struct StagingShape;
+
+impl Check for StagingShape {
+    fn id(&self) -> &'static str {
+        "staging-shape"
+    }
+    fn run(&self, client: &SpiClient<'_>, imv: Option<&ImvRow>) -> Vec<Finding> {
+        let imv = match imv {
+            Some(i) => i,
+            None => return vec![],
+        };
+        if imv.refresh_mode != "DEFERRED" || !imv.enabled {
+            return vec![];
+        }
+        let mut out = Vec::new();
+        for src in imv.real_sources() {
+            let staging = crate::query_decomposer::staging_delta_table_name(src);
+
+            // Resolve schema + local for both sides via to_regclass.
+            let staging_oid = match client
+                .select(
+                    "SELECT to_regclass($1)::oid::bigint AS oid",
+                    None,
+                    &[unsafe {
+                        DatumWithOid::new(staging.clone(), PgBuiltInOids::TEXTOID.oid().value())
+                    }],
+                )
+                .unwrap_or_report()
+                .first()
+                .get_by_name::<i64, _>("oid")
+                .unwrap_or(None)
+            {
+                Some(0) | None => continue,
+                Some(o) => o,
+            };
+            let source_oid = match client
+                .select(
+                    "SELECT to_regclass($1)::oid::bigint AS oid",
+                    None,
+                    &[unsafe {
+                        DatumWithOid::new(src.to_string(), PgBuiltInOids::TEXTOID.oid().value())
+                    }],
+                )
+                .unwrap_or_report()
+                .first()
+                .get_by_name::<i64, _>("oid")
+                .unwrap_or(None)
+            {
+                Some(0) | None => continue,
+                Some(o) => o,
+            };
+
+            let src_cols = read_attname_set(client, source_oid, &[]);
+            let stg_cols = read_attname_set(client, staging_oid, &["__reflex_op"]);
+
+            if src_cols != stg_cols {
+                out.push(Finding {
+                    imv: Some(imv.name.clone()),
+                    severity: Severity::Error,
+                    category: "staging-shape",
+                    finding: format!(
+                        "{} has columns\n  {{{}}}\nbut source {} has\n  {{{}}}\n\
+                         Trigger INSERTs would mismatch on differing column set.",
+                        staging,
+                        stg_cols.join(", "),
+                        src,
+                        src_cols.join(", "),
+                    ),
+                    suggested_fix: format!(
+                        "SELECT count(*) FROM {staging};\n\
+                         -- if 0:\n\
+                         DROP TABLE {staging} CASCADE;\n\
+                         SELECT reflex_rebuild_triggers('{src}');\n\
+                         -- if >0:\n\
+                         SELECT reflex_flush_deferred('{src}');\n\
+                         -- then re-run the above DROP + rebuild."
+                    ),
+                });
+            }
+        }
+        out
+    }
+}
+
+pub(super) struct TriggerAttached;
+
+impl Check for TriggerAttached {
+    fn id(&self) -> &'static str {
+        "trigger-attached"
+    }
+    fn run(&self, client: &SpiClient<'_>, imv: Option<&ImvRow>) -> Vec<Finding> {
+        let imv = match imv {
+            Some(i) => i,
+            None => return vec![],
+        };
+        if !imv.enabled {
+            return vec![];
+        }
+        let mut out = Vec::new();
+        for src in imv.real_sources() {
+            let suffix = crate::query_decomposer::sanitized_source_suffix(src);
+            let expected = [
+                format!("__reflex_trigger_ins_on_{}", suffix),
+                format!("__reflex_trigger_del_on_{}", suffix),
+                format!("__reflex_trigger_upd_on_{}", suffix),
+                format!("__reflex_trigger_trunc_on_{}", suffix),
+            ];
+            // Resolve source oid; skip if missing (source-exists check covers it).
+            let source_oid = match client
+                .select(
+                    "SELECT to_regclass($1)::oid::bigint AS oid",
+                    None,
+                    &[unsafe {
+                        DatumWithOid::new(src.to_string(), PgBuiltInOids::TEXTOID.oid().value())
+                    }],
+                )
+                .unwrap_or_report()
+                .first()
+                .get_by_name::<i64, _>("oid")
+                .unwrap_or(None)
+            {
+                Some(0) | None => continue,
+                Some(o) => o,
+            };
+            let mut present: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let rs = client
+                .select(
+                    "SELECT tgname::text AS n FROM pg_trigger \
+                     WHERE tgrelid = $1::oid AND NOT tgisinternal",
+                    None,
+                    &[unsafe {
+                        DatumWithOid::new(source_oid, PgBuiltInOids::INT8OID.oid().value())
+                    }],
+                )
+                .unwrap_or_report();
+            for row in rs {
+                if let Ok(Some(n)) = row.get_by_name::<&str, _>("n") {
+                    present.insert(n.to_string());
+                }
+            }
+            let missing: Vec<&String> = expected.iter().filter(|e| !present.contains(*e)).collect();
+            if !missing.is_empty() {
+                let names: Vec<String> = missing.iter().map(|s| (*s).clone()).collect();
+                out.push(Finding {
+                    imv: Some(imv.name.clone()),
+                    severity: Severity::Error,
+                    category: "trigger-attached",
+                    finding: format!("Source {} is missing trigger(s): {}", src, names.join(", ")),
+                    suggested_fix: format!("SELECT reflex_rebuild_triggers('{}');", src),
+                });
+            }
+        }
+        out
+    }
+}
+
+pub(super) struct TriggerModeMatches;
+
+impl Check for TriggerModeMatches {
+    fn id(&self) -> &'static str {
+        "trigger-mode-matches"
+    }
+    fn run(&self, client: &SpiClient<'_>, imv: Option<&ImvRow>) -> Vec<Finding> {
+        let imv = match imv {
+            Some(i) => i,
+            None => return vec![],
+        };
+        if !imv.enabled {
+            return vec![];
+        }
+        let mut out = Vec::new();
+        for src in imv.real_sources() {
+            let suffix = crate::query_decomposer::sanitized_source_suffix(src);
+            let fn_names = [
+                format!("__reflex_ins_trigger_on_{}", suffix),
+                format!("__reflex_del_trigger_on_{}", suffix),
+                format!("__reflex_upd_trigger_on_{}", suffix),
+                format!("__reflex_trunc_trigger_on_{}", suffix),
+            ];
+            // Check each trigger function for consistency with refresh_mode.
+            for fn_name in &fn_names {
+                let body: Option<String> = client
+                    .select(
+                        "SELECT prosrc::text AS body FROM pg_proc p \
+                         JOIN pg_namespace n ON n.oid = p.pronamespace \
+                         WHERE p.proname = $1 AND n.nspname = 'public' LIMIT 1",
+                        None,
+                        &[unsafe {
+                            DatumWithOid::new(fn_name.clone(), PgBuiltInOids::TEXTOID.oid().value())
+                        }],
+                    )
+                    .unwrap_or_report()
+                    .first()
+                    .get_by_name::<&str, _>("body")
+                    .unwrap_or(None)
+                    .map(|s| s.to_string());
+                let body = match body {
+                    Some(b) => b,
+                    None => continue, // trigger-attached check covers absence
+                };
+                let body_is_deferred = body.contains("__reflex_delta_");
+                let expected_deferred = imv.refresh_mode == "DEFERRED";
+                if body_is_deferred != expected_deferred {
+                    out.push(Finding {
+                        imv: Some(imv.name.clone()),
+                        severity: Severity::Error,
+                        category: "trigger-mode-matches",
+                        finding: format!(
+                            "Trigger function {} is in {} mode but IMV {} refresh_mode is {}.",
+                            fn_name,
+                            if body_is_deferred {
+                                "DEFERRED"
+                            } else {
+                                "IMMEDIATE"
+                            },
+                            imv.name,
+                            imv.refresh_mode,
+                        ),
+                        suggested_fix: format!("SELECT reflex_rebuild_triggers('{}');", src),
+                    });
+                }
+            }
+        }
+        out
+    }
+}
+
+pub(super) struct InternalTablesExist;
+
+impl Check for InternalTablesExist {
+    fn id(&self) -> &'static str {
+        "internal-tables-exist"
+    }
+    fn run(&self, client: &SpiClient<'_>, imv: Option<&ImvRow>) -> Vec<Finding> {
+        let imv = match imv {
+            Some(i) => i,
+            None => return vec![],
+        };
+        if !imv.enabled {
+            return vec![];
+        }
+
+        let mut required: Vec<String> = Vec::new();
+
+        if imv.is_passthrough() {
+            // Passthrough IMVs use per-source scratch tables instead of an intermediate
+            for src in imv.real_sources() {
+                required.push(crate::query_decomposer::passthrough_scratch_new_table_name(
+                    &imv.name, src,
+                ));
+                required.push(crate::query_decomposer::passthrough_scratch_old_table_name(
+                    &imv.name, src,
+                ));
+            }
+        } else {
+            // Aggregate IMVs use an intermediate table and affected groups table
+            required.push(crate::query_decomposer::intermediate_table_name(&imv.name));
+            required.push(crate::query_decomposer::affected_groups_table_name(
+                &imv.name,
+            ));
+        }
+
+        let mut missing: Vec<String> = Vec::new();
+        for name in &required {
+            if !relation_exists(client, name) {
+                missing.push(name.clone());
+            }
+        }
+
+        if missing.is_empty() {
+            return vec![];
+        }
+        vec![Finding {
+            imv: Some(imv.name.clone()),
+            severity: Severity::Error,
+            category: "internal-tables-exist",
+            finding: format!(
+                "Missing internal table(s) for IMV {}:\n  {}",
+                imv.name,
+                missing.join("\n  ")
+            ),
+            suggested_fix: format!("SELECT reflex_rebuild_imv('{}');", imv.name),
+        }]
+    }
+}
+
+pub(super) struct SourceExists;
+
+impl Check for SourceExists {
+    fn id(&self) -> &'static str {
+        "source-exists"
+    }
+    fn run(&self, client: &SpiClient<'_>, imv: Option<&ImvRow>) -> Vec<Finding> {
+        let imv = match imv {
+            Some(i) => i,
+            None => return vec![],
+        };
+        if !imv.enabled {
+            return vec![];
+        }
+        let mut missing: Vec<String> = Vec::new();
+        for dep in &imv.depends_on {
+            if dep.starts_with("<subquery:") || dep.starts_with("<function:") {
+                continue;
+            }
+            if !relation_exists(client, dep) {
+                missing.push(dep.clone());
+            }
+        }
+        if missing.is_empty() {
+            return vec![];
+        }
+        vec![Finding {
+            imv: Some(imv.name.clone()),
+            severity: Severity::Error,
+            category: "source-exists",
+            finding: format!(
+                "IMV {} depends on source(s) that do not exist: {}",
+                imv.name,
+                missing.join(", ")
+            ),
+            suggested_fix: format!(
+                "-- Recreate the source(s) listed above OR drop the IMV:\nSELECT drop_reflex_ivm('{}');",
+                imv.name
+            ),
+        }]
+    }
+}
