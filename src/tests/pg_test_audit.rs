@@ -553,3 +553,109 @@ fn pg_test_audit_scoped_skips_orphan_checks() {
     );
     Spi::run("DROP TABLE __reflex_intermediate_audit_no_orph_GHOST").expect("cleanup");
 }
+
+#[pg_test]
+fn pg_test_audit_composition_two_findings_at_once() {
+    // Two unrelated IMVs with two distinct drifts. Audit should report both.
+    Spi::run("CREATE TABLE audit_comp_src_a (id BIGINT PRIMARY KEY, a INT)").expect("src a");
+    Spi::run("CREATE TABLE audit_comp_src_b (id BIGINT PRIMARY KEY, b INT)").expect("src b");
+    crate::create_reflex_ivm(
+        "audit_comp_view_a",
+        "SELECT id, a FROM audit_comp_src_a",
+        Some("id"),
+        None,
+        Some("IMMEDIATE"),
+        None,
+    );
+    // Use an aggregate query so the intermediate table is created
+    crate::create_reflex_ivm(
+        "audit_comp_view_b",
+        "SELECT id, COUNT(*) as cnt FROM audit_comp_src_b GROUP BY id",
+        Some("id"),
+        None,
+        Some("IMMEDIATE"),
+        None,
+    );
+    Spi::run("DROP TRIGGER __reflex_trigger_ins_on_audit_comp_src_a ON audit_comp_src_a")
+        .expect("drop trig on a");
+    Spi::run("DROP TABLE \"__reflex_intermediate_audit_comp_view_b\" CASCADE")
+        .expect("drop intermediate of b");
+
+    let report: String = Spi::get_one("SELECT reflex_audit()")
+        .expect("ok")
+        .expect("non-null");
+    assert!(
+        report.contains("trigger-attached") && report.contains("audit_comp_view_a"),
+        "expected trigger-attached on view_a:\n{}",
+        report
+    );
+    assert!(
+        report.contains("internal-tables-exist") && report.contains("audit_comp_view_b"),
+        "expected internal-tables-exist on view_b:\n{}",
+        report
+    );
+}
+
+#[pg_test]
+fn pg_test_audit_end_to_end_stale_staging_post_source_recreate() {
+    // Set up a stale staging drift: source with dropped columns but
+    // stale staging delta with old column set.
+
+    // v1: source with columns a, b, c, d
+    Spi::run(
+        "CREATE TABLE audit_e2e_src (\
+            id BIGINT PRIMARY KEY, a INT, b INT, c INT, d INT)",
+    )
+    .expect("v1");
+
+    // Create the stale staging delta with v1 schema
+    // (simulating what would exist after drop_ivm from v1, before columns dropped).
+    Spi::run(
+        "CREATE UNLOGGED TABLE __reflex_delta_audit_e2e_src \
+         (__reflex_op TEXT NOT NULL, id BIGINT, a INT, b INT, c INT, d INT)",
+    )
+    .expect("create stale staging with v1 schema");
+
+    // v2: drop + recreate source, but drop columns c and d
+    Spi::run("DROP TABLE audit_e2e_src").expect("drop v1");
+
+    Spi::run(
+        "CREATE TABLE audit_e2e_src (\
+            id BIGINT PRIMARY KEY, a INT, b INT)",
+    )
+    .expect("v2 with fewer columns");
+
+    // Bypass the create_ivm staging-shape guard by inserting the reference
+    // row directly. The stale staging persists with v1 columns (a, b, c, d),
+    // but v2 source only has (a, b). The column SETS no longer match!
+    // In normal operation this is unreachable; the audit must catch the
+    // resulting drift if such bypass ever happened.
+    Spi::run(
+        "INSERT INTO public.__reflex_ivm_reference \
+         (name, graph_depth, depends_on, refresh_mode, base_query, end_query, enabled) \
+         VALUES ('audit_e2e_bypass_view', 0, ARRAY['audit_e2e_src'], 'DEFERRED', \
+                 'SELECT id, a, b FROM audit_e2e_src', \
+                 'SELECT id, a, b FROM audit_e2e_src', TRUE)",
+    )
+    .expect("direct bypass insert");
+
+    let report: String = Spi::get_one("SELECT reflex_audit('audit_e2e_bypass_view')")
+        .expect("ok")
+        .expect("non-null");
+    assert!(
+        report.contains("[ERROR]") && report.contains("staging-shape"),
+        "expected ERROR/staging-shape on 1.6.2 fixture:\n{}",
+        report
+    );
+    assert!(
+        report.to_lowercase().contains("suggested fix"),
+        "expected suggested-fix block:\n{}",
+        report
+    );
+
+    // Cleanup so siblings don't see this row.
+    Spi::run(
+        "DELETE FROM public.__reflex_ivm_reference WHERE name = 'audit_e2e_bypass_view'",
+    )
+    .expect("cleanup");
+}
