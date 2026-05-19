@@ -4,6 +4,56 @@ The full changelog tracks every release. The latest version's headlines are on t
 
 For each version below, see [`CHANGELOG.md`](https://github.com/diviyank/pg_reflex/blob/main/CHANGELOG.md) on GitHub for the canonical text.
 
+## [1.6.1] — 2026-05-18
+
+PG 18 compatibility, CI hygiene, and an internal pipeline refactor.  No catalog schema changes, no trigger body changes, no API changes — existing IMVs operate without intervention.  Run `ALTER EXTENSION pg_reflex UPDATE TO '1.6.1';` to register the new version; the migration file is a no-op marker.
+
+**Fixed**
+
+- **PG 18: partitioned IMV creation rejected with "partitioned tables cannot be unlogged."** PG 18 hard-rejects `CREATE UNLOGGED TABLE … PARTITION BY …`; PG 15–17 silently ignored the keyword on the parent.  pg_reflex now emits partitioned PARENTS as LOGGED and carries `UNLOGGED` on the partition CHILDREN instead (storage on the parent has no effect — it holds no rows).  Works on PG 15 through PG 18.
+- **CI concurrent-test job failure: `column "partition_columns" of relation "__reflex_ivm_reference" does not exist`.** The Actions cache for `~/.pgrx/` includes the postgres data directory; a stale `bench_db` carried an older `__reflex_ivm_reference` and `CREATE EXTENSION IF NOT EXISTS pg_reflex` is a no-op when the extension is already registered, so the in-extension `ALTER TABLE … ADD COLUMN IF NOT EXISTS` migrations never ran.  The workflow now drops and recreates `bench_db` so init runs on a fresh database.
+
+**Changed**
+
+- **`tests/test_concurrent.sh` surfaces errors.**  The script was suppressing stderr under `set -e`; failures collapsed into a bare `exit 1`.  `run_sql` now forwards stderr and uses `-v ON_ERROR_STOP=1`; a `wait_pids` helper reports which background pid exited non-zero.
+
+**Internal (no behaviour change)**
+
+- `create_reflex_ivm_impl` decomposed into a sequence of small helpers threaded through a `BuildContext`.  `reflex_build_delta_sql` branches (self-join, outer-join secondary, passthrough, aggregate) extracted into focused helpers.  Snapshot tests confirm byte-for-byte parity of emitted DDL/SQL.
+- `sql_writer` simplifications; `CreateTable` learned `.partition_by(...)`.
+
+**Migration**
+
+- `ALTER EXTENSION pg_reflex UPDATE TO '1.6.1';`.  No DDL runs.  See [`sql/pg_reflex--1.6.0--1.6.1.sql`](https://github.com/diviyank/pg_reflex/blob/main/sql/pg_reflex--1.6.0--1.6.1.sql).
+- **Advisory** for partitioned IMVs created on 1.6.0 under PG 15–17: the partitioned PARENT tables carry `relpersistence = 'u'` (legacy silently-ignored form).  Children store the rows and were never affected, so existing IMVs continue to work normally.  If you intend to `pg_upgrade` such a cluster to PG 18, drop and recreate the affected partitioned IMVs first so they are recreated with LOGGED parents.
+
+## [1.6.0] — 2026-05-17
+
+Declarative-partitioning support lands as a single bundled release.  Phase 1 (`plans/partitioning_2.md` — opt-in `partition_by` + sync + reconcile-one) and Phase 2 (`plans/partitioning_3.md` — atomic DETACH/ATTACH swap + per-partition trigger dispatch + Tier 2 metadata) ship together, alongside the previously-tagged-but-unreleased 1.5.2 mixed-case fix.
+
+**Added — Partitioning Phase 1 (opt-in)**
+
+- `create_reflex_ivm(..., partition_by => ARRAY['col'])` — explicit partitioning of intermediate and target tables.  Strategy (`LIST` / `RANGE`) and bounds are derived live from the anchor source's partition descriptor — never cached, cannot drift.  For aggregate IMVs the partition columns must be a subset of `GROUP BY`.  Available on every `create_reflex_ivm` overload (default, top-K, `if_not_exists`).  HASH is not yet supported.
+- `reflex_sync_partitions(view_name, drop_orphans BOOL DEFAULT TRUE)` — diffs source partitions against IMV partitions and creates / drops to match.  Idempotent, advisory-lock protected.  `drop_orphans => FALSE` preserves IMV partitions whose source counterpart was dropped.  Called automatically at the top of every `reflex_reconcile`.
+- `reflex_reconcile_partition(view_name, partition_keys TEXT)` — rebuilds only the IMV partition(s) covering the supplied keys.  Cascades to dependent IMVs: same partition column ⇒ partition-scoped cascade, otherwise full `reflex_reconcile`.
+- **Auto-mirror** — when `partition_by` is NULL and exactly one real source is partitioned, the IMV mirrors that source's partition shape automatically (with a guard for "partition column not in GROUP BY").
+
+**Added — Partitioning Phase 2 (atomic swap + dispatch)**
+
+- **Atomic DETACH/ATTACH swap** for `reflex_reconcile_partition` and the global `reflex_reconcile` on partitioned IMVs.  New partition built outside the tree, ATTACH'd with a pre-validated `CHECK` constraint so PG skips its scan; `AccessExclusiveLock` on the partition child is held only for the metadata DDL (~µs).
+- **Per-partition trigger dispatch.**  Bulk writes concentrated in one partition route through `reflex_reconcile_partition` instead of the global reconcile.  Hot/cold classification per partition; cold partitions run the standard MERGE with a partition-filter splice.
+- **Bare-column-ref validation for `partition_by`.** Reject computed expressions early with a clear error.
+- **Tier 2 partition-derivation metadata** for non-anchor (JOIN-secondary) sources: `partition_join_paths` lets the dispatch derive partition keys via single-hop JOINs when safe.
+- **Event-trigger auto-sync.** `__reflex_on_ddl_command_end` now fires on `CREATE TABLE … PARTITION OF` (in addition to `ALTER TABLE ATTACH/DETACH PARTITION`), so adding a partition to a source automatically extends every partitioned IMV that depends on it.
+
+**Fixed (carry-over from unreleased 1.5.2)**
+
+- **Mixed-case quoted column names** preserved end-to-end in trigger codegen and intermediate-table column naming.
+
+**Migration**
+
+- `ALTER EXTENSION pg_reflex UPDATE TO '1.6.0';` adds catalog columns (`partition_columns`, `partition_strategy`, `wipe_floor_rows`, `partition_dispatch_cost_cap`), installs `__reflex_partition_child_for_key`, replaces the event-trigger function with the widened tag list, and re-emits trigger function bodies (mixed-case carry-over).  Non-partitioned IMVs need no operator action.  See [`sql/pg_reflex--1.5.1--1.6.0.sql`](https://github.com/diviyank/pg_reflex/blob/main/sql/pg_reflex--1.5.1--1.6.0.sql).
+
 ## [1.5.0] — 2026-05-17
 
 The bulk-flip release. Closes the gap on aggregate IMVs that lost to `REFRESH MATERIALIZED VIEW` on large `OUT→IN` filter flips, and fixes silent bugs masked by the dispatch paths added in 1.4.6.

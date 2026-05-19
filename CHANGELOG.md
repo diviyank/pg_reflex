@@ -1,5 +1,79 @@
 # Changelog
 
+## [1.6.1] - 2026-05-18
+
+PG 18 compatibility, CI hygiene, and an internal pipeline refactor.  No
+catalog schema changes, no trigger body changes, no API changes —
+existing IMVs operate without intervention.  Run `ALTER EXTENSION
+pg_reflex UPDATE TO '1.6.1';` to register the new version (the migration
+file is a no-op marker).
+
+---
+
+### Fixed
+
+- **PG 18: partitioned IMV creation rejected with "partitioned tables
+  cannot be unlogged."**  PG 18 hard-rejects `CREATE UNLOGGED TABLE …
+  PARTITION BY …`; PG 15–17 silently ignored the keyword on the parent
+  (children stored the actual rows).  pg_reflex now emits the
+  intermediate and target partitioned PARENTS without `UNLOGGED` and
+  carries the keyword on the partition CHILDREN instead — `relkind='p'`
+  parents are now `relpersistence='p'`, `relkind='r'` children remain
+  `relpersistence='u'`.  Works on PG 15 through PG 18.  Affects
+  `build_intermediate_table_ddl`, `build_target_table_ddl`,
+  `materialize_passthrough`, `build_partition_child_ddl_pair` (now
+  takes an `unlogged: bool`), and `reflex_sync_partitions_impl` (now
+  reads `storage_mode` from the catalog).
+- **CI concurrent-test job: `column "partition_columns" of relation
+  "__reflex_ivm_reference" does not exist`.**  The GitHub Actions cache
+  for `~/.pgrx/` includes the `data-17/` postgres data directory, so a
+  pre-existing `bench_db` carried an older `__reflex_ivm_reference`
+  table.  `CREATE EXTENSION IF NOT EXISTS pg_reflex` is a no-op when
+  the extension is already registered, so the in-extension `ALTER TABLE
+  … ADD COLUMN IF NOT EXISTS partition_columns` never ran.  The
+  workflow now drops and recreates `bench_db` so the install SQL runs
+  on a fresh database.
+
+### Changed
+
+- **`tests/test_concurrent.sh` no longer swallows stderr.**  The script
+  ran psql with `2>/dev/null` under `set -e`, so any SQL failure
+  collapsed to a bare `exit 1` with no diagnostic in CI.  `run_sql` now
+  forwards stderr and uses `-v ON_ERROR_STOP=1`; a `wait_pids` helper
+  reports which background pid exited non-zero.  This is what surfaced
+  the cached-bench_db bug above.
+
+### Internal (no behaviour change)
+
+- `create_reflex_ivm_impl` was decomposed into a sequence of small
+  helpers: `resolve_unique_columns`, `validate_select_columns`,
+  `populate_source_join_keys`, `check_existence_and_cycle`,
+  `resolve_partitioning`, `materialize_storage` (with
+  passthrough/aggregate sub-helpers), `install_min_max_indexes`,
+  `install_source_triggers`, `install_deferred_flush_if_needed`,
+  `persist_metadata`, and `initial_aggregate_materialization`.  Threaded
+  through a `BuildContext` to keep parameter lists sane.  Snapshot tests
+  added in `tests/snapshots/` confirm byte-for-byte parity of the
+  emitted DDL/SQL for every aggregate / self-join / outer-join /
+  passthrough branch of `reflex_build_delta_sql`.
+- `sql_writer` simplifications: removed heavier SQL builder paths in
+  favour of focused helpers; `CreateTable` learned `.partition_by(...)`.
+
+### Migration
+
+`ALTER EXTENSION pg_reflex UPDATE TO '1.6.1';`.  No DDL is run.  See
+`sql/pg_reflex--1.6.0--1.6.1.sql`.
+
+**Advisory for partitioned IMVs created on 1.6.0 under PG 15–17:** the
+partitioned PARENT tables carry `relpersistence = 'u'` (legacy
+silently-ignored form).  Children store the rows and were never
+affected, so existing IMVs continue to operate normally.  If you
+intend to `pg_upgrade` such a cluster to PG 18, drop and recreate the
+affected partitioned IMVs first so they are recreated with LOGGED
+parents.
+
+---
+
 ## [1.6.0] - 2026-05-17
 
 Declarative-partitioning support lands as a single bundled release. The

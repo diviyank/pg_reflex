@@ -1,0 +1,49 @@
+-- Migration: pg_reflex 1.6.0 → 1.6.1
+--
+-- Run via: ALTER EXTENSION pg_reflex UPDATE TO '1.6.1';
+--
+-- 1.6.1 is a compatibility + tooling release. There are NO catalog schema
+-- changes, NO trigger body changes, and NO function signature changes —
+-- existing IMVs continue to operate without intervention.
+--
+-- Notable changes:
+--
+--   (a) PG 18 compatibility for partitioned IMVs. PG 18 hard-rejects
+--       `CREATE UNLOGGED TABLE … PARTITION BY …`; earlier versions silently
+--       ignored UNLOGGED on partitioned parents.  Starting with 1.6.1 the
+--       partitioned PARENT is always emitted LOGGED and per-partition
+--       CHILDREN carry the UNLOGGED keyword (storage on the parent has no
+--       effect anyway — it holds no rows).  This change affects only the
+--       DDL emitted for new partitioned IMVs; existing IMVs are untouched.
+--
+--   (b) Internal pipeline refactor.  `create_reflex_ivm_impl` was
+--       decomposed into a sequence of small helpers (`resolve_unique_columns`,
+--       `validate_select_columns`, `populate_source_join_keys`,
+--       `check_existence_and_cycle`, `resolve_partitioning`,
+--       `materialize_storage`, `install_min_max_indexes`,
+--       `install_source_triggers`, `install_deferred_flush_if_needed`,
+--       `persist_metadata`, `initial_aggregate_materialization`).  Snapshot
+--       tests confirm byte-for-byte parity of the emitted DDL/SQL.  No
+--       observable behaviour change.
+--
+--   (c) CI/test hygiene.  The concurrent test harness no longer swallows
+--       stderr, and the CI workflow drops + recreates the test database
+--       before each concurrent-test run so a cached pgrx data directory
+--       cannot mask schema migrations.
+--
+-- Migration steps:
+--
+--   No DDL is required.  This file exists purely to register the
+--   1.6.0 → 1.6.1 upgrade path with PostgreSQL's extension machinery.
+--
+-- Advisory note for partitioned IMVs created under 1.6.0 on PG 15–17:
+--
+--   The intermediate and target partitioned PARENT tables carry
+--   `relpersistence = 'u'` (UNLOGGED).  This is the legacy silently-ignored
+--   form — the children store the actual rows and were never affected.
+--   Existing IMVs continue to operate normally on PG 15–17.  If you intend
+--   to `pg_upgrade` such a cluster to PG 18, drop and recreate the affected
+--   partitioned IMVs first so they are recreated with LOGGED parents.
+
+-- No-op marker: ALTER EXTENSION needs a non-empty migration file.
+SELECT 1 WHERE FALSE;
