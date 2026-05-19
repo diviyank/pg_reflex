@@ -79,3 +79,55 @@ fn pg_test_audit_staging_shape_green_when_aligned() {
         report
     );
 }
+
+#[pg_test]
+fn pg_test_audit_trigger_attached_detects_dropped_trigger() {
+    Spi::run("CREATE TABLE audit_ta_src (id BIGINT PRIMARY KEY, a INT)")
+        .expect("create src");
+    crate::create_reflex_ivm(
+        "audit_ta_view",
+        "SELECT id, a FROM audit_ta_src",
+        Some("id"),
+        None,
+        Some("IMMEDIATE"),
+        None,
+    );
+    Spi::run("DROP TRIGGER __reflex_trigger_ins_on_audit_ta_src ON audit_ta_src")
+        .expect("drop trigger");
+
+    let report: String = Spi::get_one("SELECT reflex_audit('audit_ta_view')")
+        .expect("ok")
+        .expect("non-null");
+    assert!(
+        report.contains("[ERROR]") && report.contains("trigger-attached"),
+        "expected ERROR/trigger-attached:\n{}",
+        report
+    );
+    assert!(
+        report.contains("__reflex_trigger_ins_on_audit_ta_src"),
+        "expected missing-trigger name in body:\n{}",
+        report
+    );
+}
+
+#[pg_test]
+fn pg_test_audit_trigger_attached_green_when_all_present() {
+    Spi::run("CREATE TABLE audit_ta_ok_src (id BIGINT PRIMARY KEY, a INT)")
+        .expect("create");
+    crate::create_reflex_ivm(
+        "audit_ta_ok_view",
+        "SELECT id, a FROM audit_ta_ok_src",
+        Some("id"),
+        None,
+        Some("IMMEDIATE"),
+        None,
+    );
+    let report: String = Spi::get_one("SELECT reflex_audit('audit_ta_ok_view')")
+        .expect("ok")
+        .expect("non-null");
+    assert!(
+        !report.contains("trigger-attached"),
+        "expected no trigger-attached finding:\n{}",
+        report
+    );
+}

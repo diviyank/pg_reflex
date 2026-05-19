@@ -168,8 +168,80 @@ impl Check for StagingShape {
     }
 }
 
+struct TriggerAttached;
+
+impl Check for TriggerAttached {
+    fn id(&self) -> &'static str {
+        "trigger-attached"
+    }
+    fn run(&self, client: &SpiClient<'_>, imv: Option<&ImvRow>) -> Vec<Finding> {
+        let imv = match imv {
+            Some(i) => i,
+            None => return vec![],
+        };
+        if !imv.enabled {
+            return vec![];
+        }
+        let mut out = Vec::new();
+        for src in imv.real_sources() {
+            let suffix = crate::query_decomposer::sanitized_source_suffix(src);
+            let expected = [
+                format!("__reflex_trigger_ins_on_{}", suffix),
+                format!("__reflex_trigger_del_on_{}", suffix),
+                format!("__reflex_trigger_upd_on_{}", suffix),
+                format!("__reflex_trigger_trunc_on_{}", suffix),
+            ];
+            // Resolve source oid; skip if missing (source-exists check covers it).
+            let source_oid = match client
+                .select(
+                    "SELECT to_regclass($1)::oid::bigint AS oid",
+                    None,
+                    &[unsafe {
+                        DatumWithOid::new(src.to_string(), PgBuiltInOids::TEXTOID.oid().value())
+                    }],
+                )
+                .unwrap_or_report()
+                .first()
+                .get_by_name::<i64, _>("oid")
+                .unwrap_or(None)
+            {
+                Some(0) | None => continue,
+                Some(o) => o,
+            };
+            let mut present: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let rs = client
+                .select(
+                    "SELECT tgname::text AS n FROM pg_trigger \
+                     WHERE tgrelid = $1::oid AND NOT tgisinternal",
+                    None,
+                    &[unsafe {
+                        DatumWithOid::new(source_oid, PgBuiltInOids::INT8OID.oid().value())
+                    }],
+                )
+                .unwrap_or_report();
+            for row in rs {
+                if let Ok(Some(n)) = row.get_by_name::<&str, _>("n") {
+                    present.insert(n.to_string());
+                }
+            }
+            let missing: Vec<&String> = expected.iter().filter(|e| !present.contains(*e)).collect();
+            if !missing.is_empty() {
+                let names: Vec<String> = missing.iter().map(|s| (*s).clone()).collect();
+                out.push(Finding {
+                    imv: Some(imv.name.clone()),
+                    severity: Severity::Error,
+                    category: "trigger-attached",
+                    finding: format!("Source {} is missing trigger(s): {}", src, names.join(", ")),
+                    suggested_fix: format!("SELECT reflex_rebuild_triggers('{}');", src),
+                });
+            }
+        }
+        out
+    }
+}
+
 fn registry() -> Vec<Box<dyn Check>> {
-    vec![Box::new(StagingShape)]
+    vec![Box::new(StagingShape), Box::new(TriggerAttached)]
 }
 
 fn load_imv_rows(client: &SpiClient<'_>, scope: &AuditScope) -> Vec<ImvRow> {
