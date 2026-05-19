@@ -370,6 +370,49 @@ impl Check for InternalTablesExist {
     }
 }
 
+struct SourceExists;
+
+impl Check for SourceExists {
+    fn id(&self) -> &'static str {
+        "source-exists"
+    }
+    fn run(&self, client: &SpiClient<'_>, imv: Option<&ImvRow>) -> Vec<Finding> {
+        let imv = match imv {
+            Some(i) => i,
+            None => return vec![],
+        };
+        if !imv.enabled {
+            return vec![];
+        }
+        let mut missing: Vec<String> = Vec::new();
+        for dep in &imv.depends_on {
+            if dep.starts_with("<subquery:") || dep.starts_with("<function:") {
+                continue;
+            }
+            if !relation_exists(client, dep) {
+                missing.push(dep.clone());
+            }
+        }
+        if missing.is_empty() {
+            return vec![];
+        }
+        vec![Finding {
+            imv: Some(imv.name.clone()),
+            severity: Severity::Error,
+            category: "source-exists",
+            finding: format!(
+                "IMV {} depends on source(s) that do not exist: {}",
+                imv.name,
+                missing.join(", ")
+            ),
+            suggested_fix: format!(
+                "-- Recreate the source(s) listed above OR drop the IMV:\nSELECT drop_reflex_ivm('{}');",
+                imv.name
+            ),
+        }]
+    }
+}
+
 fn relation_exists(client: &SpiClient<'_>, qualified: &str) -> bool {
     let oid: Option<i64> = client
         .select(
@@ -392,6 +435,7 @@ fn registry() -> Vec<Box<dyn Check>> {
         Box::new(TriggerAttached),
         Box::new(TriggerModeMatches),
         Box::new(InternalTablesExist),
+        Box::new(SourceExists),
     ]
 }
 

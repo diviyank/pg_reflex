@@ -235,3 +235,53 @@ fn pg_test_audit_internal_tables_green_when_present() {
         report
     );
 }
+
+#[pg_test]
+fn pg_test_audit_source_exists_detects_dropped_source() {
+    Spi::run("CREATE TABLE audit_se_src (id BIGINT PRIMARY KEY, a INT)").expect("src");
+    crate::create_reflex_ivm(
+        "audit_se_view",
+        "SELECT id, a FROM audit_se_src",
+        Some("id"),
+        None,
+        Some("IMMEDIATE"),
+        None,
+    );
+    // Disable the auto-drop event trigger so the __reflex_ivm_reference row persists.
+    Spi::run("ALTER EVENT TRIGGER reflex_on_sql_drop DISABLE").expect("disable trigger");
+    // Drop the source out from under the IMV (CASCADE pulls down the IMV
+    // internal tables too, but the __reflex_ivm_reference row remains).
+    Spi::run("DROP TABLE audit_se_src CASCADE").expect("drop source");
+    // Re-enable for other tests
+    Spi::run("ALTER EVENT TRIGGER reflex_on_sql_drop ENABLE").expect("enable trigger");
+
+    let report: String = Spi::get_one("SELECT reflex_audit('audit_se_view')")
+        .expect("ok")
+        .expect("non-null");
+    assert!(
+        report.contains("[ERROR]") && report.contains("source-exists"),
+        "expected ERROR/source-exists:\n{}",
+        report
+    );
+}
+
+#[pg_test]
+fn pg_test_audit_source_exists_green_when_live() {
+    Spi::run("CREATE TABLE audit_se_ok_src (id BIGINT PRIMARY KEY, a INT)").expect("src");
+    crate::create_reflex_ivm(
+        "audit_se_ok_view",
+        "SELECT id, a FROM audit_se_ok_src",
+        Some("id"),
+        None,
+        Some("IMMEDIATE"),
+        None,
+    );
+    let report: String = Spi::get_one("SELECT reflex_audit('audit_se_ok_view')")
+        .expect("ok")
+        .expect("non-null");
+    assert!(
+        !report.contains("source-exists"),
+        "expected no source-exists finding:\n{}",
+        report
+    );
+}
