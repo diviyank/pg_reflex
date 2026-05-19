@@ -378,8 +378,8 @@ fn read_attname_set(client: &SpiClient<'_>, relid: i64, exclude: &[&str]) -> Vec
         )
         .unwrap_or_report();
     for row in rs {
-        if let Some(Some(n)) = row.get_by_name::<&str, _>("n").ok() {
-            if !exclude.iter().any(|e| *e == n) {
+        if let Ok(Some(n)) = row.get_by_name::<&str, _>("n") {
+            if !exclude.contains(&n) {
                 names.push(n.to_string());
             }
         }
