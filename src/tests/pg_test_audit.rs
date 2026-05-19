@@ -182,3 +182,56 @@ fn pg_test_audit_trigger_mode_green_when_consistent() {
         report
     );
 }
+
+#[pg_test]
+fn pg_test_audit_internal_tables_detects_missing_intermediate() {
+    Spi::run("CREATE TABLE audit_it_src (id BIGINT PRIMARY KEY, a INT)").expect("src");
+    // Use an aggregate query so the intermediate table is created
+    crate::create_reflex_ivm(
+        "audit_it_view",
+        "SELECT id, COUNT(*) as cnt FROM audit_it_src GROUP BY id",
+        Some("id"),
+        None,
+        Some("IMMEDIATE"),
+        None,
+    );
+    // Drop the intermediate out from under the IMV.
+    Spi::run("DROP TABLE \"__reflex_intermediate_audit_it_view\" CASCADE")
+        .expect("drop intermediate");
+
+    let report: String = Spi::get_one("SELECT reflex_audit('audit_it_view')")
+        .expect("ok")
+        .expect("non-null");
+    assert!(
+        report.contains("[ERROR]") && report.contains("internal-tables-exist"),
+        "expected ERROR/internal-tables-exist:\n{}",
+        report
+    );
+    assert!(
+        report.contains("__reflex_intermediate_audit_it_view"),
+        "expected missing-table name in body:\n{}",
+        report
+    );
+}
+
+#[pg_test]
+fn pg_test_audit_internal_tables_green_when_present() {
+    Spi::run("CREATE TABLE audit_it_ok_src (id BIGINT PRIMARY KEY, a INT)").expect("src");
+    // Use an aggregate query so the intermediate table is created
+    crate::create_reflex_ivm(
+        "audit_it_ok_view",
+        "SELECT id, COUNT(*) as cnt FROM audit_it_ok_src GROUP BY id",
+        Some("id"),
+        None,
+        Some("IMMEDIATE"),
+        None,
+    );
+    let report: String = Spi::get_one("SELECT reflex_audit('audit_it_ok_view')")
+        .expect("ok")
+        .expect("non-null");
+    assert!(
+        !report.contains("internal-tables-exist"),
+        "expected no internal-tables finding:\n{}",
+        report
+    );
+}

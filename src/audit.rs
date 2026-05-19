@@ -311,11 +311,87 @@ impl Check for TriggerModeMatches {
     }
 }
 
+struct InternalTablesExist;
+
+impl Check for InternalTablesExist {
+    fn id(&self) -> &'static str {
+        "internal-tables-exist"
+    }
+    fn run(&self, client: &SpiClient<'_>, imv: Option<&ImvRow>) -> Vec<Finding> {
+        let imv = match imv {
+            Some(i) => i,
+            None => return vec![],
+        };
+        if !imv.enabled {
+            return vec![];
+        }
+
+        let mut required: Vec<String> = Vec::new();
+
+        if imv.is_passthrough() {
+            // Passthrough IMVs use per-source scratch tables instead of an intermediate
+            for src in imv.real_sources() {
+                required.push(crate::query_decomposer::passthrough_scratch_new_table_name(
+                    &imv.name, src,
+                ));
+                required.push(crate::query_decomposer::passthrough_scratch_old_table_name(
+                    &imv.name, src,
+                ));
+            }
+        } else {
+            // Aggregate IMVs use an intermediate table and affected groups table
+            required.push(crate::query_decomposer::intermediate_table_name(&imv.name));
+            required.push(crate::query_decomposer::affected_groups_table_name(
+                &imv.name,
+            ));
+        }
+
+        let mut missing: Vec<String> = Vec::new();
+        for name in &required {
+            if !relation_exists(client, name) {
+                missing.push(name.clone());
+            }
+        }
+
+        if missing.is_empty() {
+            return vec![];
+        }
+        vec![Finding {
+            imv: Some(imv.name.clone()),
+            severity: Severity::Error,
+            category: "internal-tables-exist",
+            finding: format!(
+                "Missing internal table(s) for IMV {}:\n  {}",
+                imv.name,
+                missing.join("\n  ")
+            ),
+            suggested_fix: format!("SELECT reflex_rebuild_imv('{}');", imv.name),
+        }]
+    }
+}
+
+fn relation_exists(client: &SpiClient<'_>, qualified: &str) -> bool {
+    let oid: Option<i64> = client
+        .select(
+            "SELECT to_regclass($1)::oid::bigint AS oid",
+            None,
+            &[unsafe {
+                DatumWithOid::new(qualified.to_string(), PgBuiltInOids::TEXTOID.oid().value())
+            }],
+        )
+        .unwrap_or_report()
+        .first()
+        .get_by_name::<i64, _>("oid")
+        .unwrap_or(None);
+    !matches!(oid, None | Some(0))
+}
+
 fn registry() -> Vec<Box<dyn Check>> {
     vec![
         Box::new(StagingShape),
         Box::new(TriggerAttached),
         Box::new(TriggerModeMatches),
+        Box::new(InternalTablesExist),
     ]
 }
 
