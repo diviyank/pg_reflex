@@ -353,3 +353,52 @@ fn pg_test_audit_shape_green_when_aligned() {
         report
     );
 }
+
+#[pg_test]
+fn pg_test_audit_base_query_runs_detects_dropped_column() {
+    Spi::run("CREATE TABLE audit_bq_src (id BIGINT PRIMARY KEY, a INT, b INT)").expect("src");
+    crate::create_reflex_ivm(
+        "audit_bq_view",
+        "SELECT id, a, b FROM audit_bq_src",
+        Some("id"),
+        None,
+        Some("IMMEDIATE"),
+        None,
+    );
+    // Disable the auto-drop event trigger so the registry row persists
+    // after we drop column `b` (the registry stores base_query that still
+    // references it).
+    Spi::run("ALTER EVENT TRIGGER reflex_on_sql_drop DISABLE").expect("disable");
+    Spi::run("ALTER TABLE audit_bq_src DROP COLUMN b").expect("drop col b");
+    Spi::run("ALTER EVENT TRIGGER reflex_on_sql_drop ENABLE").expect("enable");
+
+    let report: String = Spi::get_one("SELECT reflex_audit('audit_bq_view')")
+        .expect("ok")
+        .expect("non-null");
+    assert!(
+        report.contains("[WARNING]") && report.contains("base-query-runs"),
+        "expected WARNING/base-query-runs:\n{}",
+        report
+    );
+}
+
+#[pg_test]
+fn pg_test_audit_base_query_runs_green() {
+    Spi::run("CREATE TABLE audit_bq_ok_src (id BIGINT PRIMARY KEY, a INT)").expect("src");
+    crate::create_reflex_ivm(
+        "audit_bq_ok_view",
+        "SELECT id, a FROM audit_bq_ok_src",
+        Some("id"),
+        None,
+        Some("IMMEDIATE"),
+        None,
+    );
+    let report: String = Spi::get_one("SELECT reflex_audit('audit_bq_ok_view')")
+        .expect("ok")
+        .expect("non-null");
+    assert!(
+        !report.contains("base-query-runs"),
+        "expected no base-query-runs finding:\n{}",
+        report
+    );
+}

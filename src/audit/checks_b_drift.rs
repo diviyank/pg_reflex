@@ -94,3 +94,38 @@ impl Check for TargetShape {
         }]
     }
 }
+
+pub(super) struct BaseQueryRuns;
+
+impl Check for BaseQueryRuns {
+    fn id(&self) -> &'static str {
+        "base-query-runs"
+    }
+    fn run(&self, _client: &SpiClient<'_>, imv: Option<&ImvRow>) -> Vec<Finding> {
+        let imv = match imv {
+            Some(i) => i,
+            None => return vec![],
+        };
+        if !imv.enabled {
+            return vec![];
+        }
+        match probe_query_columns(&imv.base_query) {
+            Ok(_) => vec![],
+            Err(e) => vec![Finding {
+                imv: Some(imv.name.clone()),
+                severity: Severity::Warning,
+                category: "base-query-runs",
+                finding: format!(
+                    "Probe of base_query failed: {}\nbase_query: {}",
+                    e, imv.base_query
+                ),
+                suggested_fix: format!(
+                    "-- Inspect: SELECT base_query FROM public.__reflex_ivm_reference WHERE name = '{}';\n\
+                     -- Then either ALTER the source(s) to restore referenced columns or:\n\
+                     SELECT drop_reflex_ivm('{}');",
+                    imv.name, imv.name
+                ),
+            }],
+        }
+    }
+}

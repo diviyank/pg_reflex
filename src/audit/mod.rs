@@ -11,7 +11,7 @@ pub mod checks_c_orphan;
 use checks_a_catastrophic::{
     InternalTablesExist, SourceExists, StagingShape, TriggerAttached, TriggerModeMatches,
 };
-use checks_b_drift::{IntermediateShape, TargetShape};
+use checks_b_drift::{BaseQueryRuns, IntermediateShape, TargetShape};
 
 pub enum AuditScope {
     All,
@@ -102,6 +102,7 @@ fn registry() -> Vec<Box<dyn Check>> {
         Box::new(SourceExists),
         Box::new(IntermediateShape),
         Box::new(TargetShape),
+        Box::new(BaseQueryRuns),
     ]
 }
 
