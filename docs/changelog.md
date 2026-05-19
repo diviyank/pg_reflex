@@ -4,6 +4,24 @@ The full changelog tracks every release. The latest version's headlines are on t
 
 For each version below, see [`CHANGELOG.md`](https://github.com/diviyank/pg_reflex/blob/main/CHANGELOG.md) on GitHub for the canonical text.
 
+## [1.6.2] — 2026-05-19
+
+Patch release fixing a catastrophic deferred-trigger failure on sources whose `__reflex_delta_<src>` staging table outlived a source DDL change (IMV drop+recreate, source DROP/CREATE — unavoidable on PG ≤ 17 when adding partitioning to an existing table).  Run `ALTER EXTENSION pg_reflex UPDATE TO '1.6.2';`.
+
+**Fixed**
+
+- **Deferred trigger fails with `column "X" is of type Y but expression is of type Z` after the source's column order drifts.**  The deferred trigger used positional `INSERT INTO __reflex_delta_<src> SELECT '<op>', * FROM <transition>`; the per-source staging delta is created with `IF NOT EXISTS` and outlives the IMV / source, so column reorders (commonly: adding partitioning on PG ≤ 17, which forces a DROP/CREATE) silently corrupted the positional alignment.  The trigger DDL now embeds the live source column list and emits `INSERT INTO staging (__reflex_op, "col_a", "col_b", …) SELECT '<op>', "col_a", "col_b", … FROM transition`.
+- **`reflex_rebuild_triggers` silently downgraded DEFERRED IMVs to IMMEDIATE-only trigger bodies.**  It now picks the deferred or immediate body based on `__reflex_ivm_reference.refresh_mode`.
+
+**Added**
+
+- **Staging shape guard in `create_reflex_ivm` (DEFERRED).**  Before installing the deferred trigger, compares the staging's column NAMES against the source's live shape: identical sets ⇒ reuse, drift + empty staging ⇒ drop+recreate (CASCADE; sweeps the per-session TEMP views from a prior flush), drift + pending rows ⇒ refuse with a clear error directing the operator to flush first.
+- **`reflex_audit()` — operator-callable structural audit.** Two overloads (`reflex_audit()` audits every enabled IMV + orphan-artifact checks; `reflex_audit('<view_name>')` scopes to one IMV and skips orphan checks). Returns a multi-line text report with severity-tagged findings (ERROR / WARNING / INFO) and copy-pastable `Suggested fix` blocks. Read-only; safe during DML; intended for monitoring scrapes. Checks the 1.6.2 root-cause `staging-shape` invariant plus eleven others (trigger attachment, trigger-mode agreement, internal-table existence, source existence, base/target shape, base_query parses, partition-mirror drift, and orphan intermediate / staging / scratch tables).
+
+**Migration**
+
+- `ALTER EXTENSION pg_reflex UPDATE TO '1.6.2';` runs [`sql/pg_reflex--1.6.1--1.6.2.sql`](https://github.com/diviyank/pg_reflex/blob/main/sql/pg_reflex--1.6.1--1.6.2.sql), which validates and repairs the staging shape for every source with a DEFERRED IMV and re-emits trigger function bodies via the now-deferred-aware `reflex_rebuild_triggers`.  **Pre-drift rows in stale staging are discarded** — they reference an older column layout and cannot be replayed safely; flush BEFORE upgrading if you care about them.
+
 ## [1.6.1] — 2026-05-18
 
 PG 18 compatibility, CI hygiene, and an internal pipeline refactor.  No catalog schema changes, no trigger body changes, no API changes — existing IMVs operate without intervention.  Run `ALTER EXTENSION pg_reflex UPDATE TO '1.6.1';` to register the new version; the migration file is a no-op marker.

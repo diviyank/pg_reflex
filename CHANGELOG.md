@@ -1,5 +1,107 @@
 # Changelog
 
+## [1.6.2] - 2026-05-19
+
+Patch release fixing a catastrophic deferred-trigger failure on sources
+whose `__reflex_delta_<src>` staging table outlived a source DDL change
+(IMV drop+recreate, source DROP/CREATE — the latter unavoidable on PG ≤ 17
+when adding partitioning to an existing table).  Run `ALTER EXTENSION
+pg_reflex UPDATE TO '1.6.2';` to apply the staging-shape repair and pick
+up the new trigger codegen.
+
+---
+
+### Fixed
+
+- **Deferred trigger fails after the source's column order drifts** —
+  e.g. `column "creation_date" is of type timestamp with time zone but
+  expression is of type integer` on any INSERT/UPDATE/DELETE that fires
+  the deferred trigger.  Root cause: the deferred trigger body did
+  `INSERT INTO __reflex_delta_<src> SELECT '<op>', * FROM <transition>`
+  — a **positional** bind.  The per-source staging delta is created
+  with `IF NOT EXISTS` and is not dropped by `drop_reflex_ivm`, so it
+  outlives the IMV and the source.  When the source's column ORDER
+  changed (typically because a partitioned table replaced its
+  unpartitioned predecessor with a different layout), the staging's
+  column positions no longer matched the transition table's, and the
+  trigger died on every DML.
+  - `sql/deferred_trigger_body.plpgsql.in` and
+    `sql/deferred_trigger_update_body.plpgsql.in` now emit
+    `INSERT INTO staging (__reflex_op, "col_a", "col_b", …) SELECT
+    '<op>', "col_a", "col_b", … FROM transition`.  Column names are
+    resolved at trigger DDL build time from the live source catalog.
+- **`reflex_rebuild_triggers` silently broke DEFERRED IMVs.**  The
+  function always emitted the immediate-mode trigger body, so calling
+  it on a source that fed at least one DEFERRED IMV replaced the
+  deferred body with the immediate one — staging stopped accumulating
+  and `reflex_flush_deferred` had nothing to flush.  It now inspects
+  `__reflex_ivm_reference.refresh_mode` and picks the correct builder.
+
+### Added
+
+- **Staging shape guard in `create_reflex_ivm` (DEFERRED).** Before
+  installing the deferred trigger on a source, the create path
+  compares the staging table's column NAMES against the source's live
+  shape.  Three outcomes:
+  - identical sets (any order) → reuse the staging,
+  - sets differ + staging empty → drop+recreate the staging from the
+    current source shape (`CASCADE` to clear the per-session TEMP
+    views from any prior `reflex_flush_deferred` call),
+  - sets differ + staging has pending rows → **refuse with a clear
+    error** directing the operator to flush first.  Silent drops
+    would lose other IMVs' staged work; silent reuse would crash the
+    new named-column INSERT.
+- **`reflex_audit()` — operator-callable structural audit.** Two overloads:
+  `reflex_audit()` audits every enabled IMV plus orphan-artifact checks;
+  `reflex_audit('<view_name>')` scopes to a single IMV and skips orphan
+  checks. Returns a multi-line text report with severity-tagged findings
+  (ERROR / WARNING / INFO) and a copy-pastable `Suggested fix` block per
+  finding. Read-only — safe to invoke at any time, including during DML,
+  and intended for monitoring-scrape use at low cadence. Catches the
+  1.6.2 root-cause invariant (`staging-shape`) plus eleven others:
+  trigger attachment, trigger-mode / refresh-mode agreement, internal-
+  table existence, source existence, base / target shape agreement,
+  base_query parses, partition-mirror drift, and orphan-intermediate /
+  -staging / -scratch tables. Example:
+  ```sql
+  SELECT reflex_audit();
+  -- pg_reflex audit: OK (12 IMV(s), 3 source(s) checked, no findings)
+  ```
+
+### Tests
+
+- `pg_test_deferred_stale_staging_after_source_recreate` — drop+
+  recreate a source with reordered columns, confirm the new trigger
+  body handles INSERT/UPDATE/DELETE end-to-end against the
+  reorder-stale staging.
+- `pg_test_deferred_empty_stale_staging_with_column_set_drift_recreated`
+  — column SET drift (added/removed column) with empty staging gets
+  recreated by the guard; trigger round-trip + oracle pass.
+
+### Migration
+
+`ALTER EXTENSION pg_reflex UPDATE TO '1.6.2';` runs
+`sql/pg_reflex--1.6.1--1.6.2.sql`, which:
+
+1. For each source with at least one enabled DEFERRED IMV, validates
+   the `__reflex_delta_<src>` staging table's column set against the
+   source's current shape.  Drops+recreates the staging when they
+   differ (emitting a NOTICE that names the source and the row count
+   discarded).  **Pre-drift rows are dropped** — they reference an
+   older column layout and cannot be replayed safely.  Operators with
+   critical pending state should call `reflex_flush_deferred(...)` on
+   each affected source BEFORE running the upgrade.
+2. Re-emits trigger function bodies for every tracked source via the
+   now-deferred-aware `reflex_rebuild_triggers`, so existing IMVs
+   pick up the named-column INSERT codegen.
+
+Sources whose generated staging name would exceed PG's 63-char
+identifier limit (sanitized source suffix > 48 chars) are skipped
+with a NOTICE — drop and recreate the staging manually if drift is
+suspected on those.
+
+---
+
 ## [1.6.1] - 2026-05-18
 
 PG 18 compatibility, CI hygiene, and an internal pipeline refactor.  No
