@@ -240,8 +240,83 @@ impl Check for TriggerAttached {
     }
 }
 
+struct TriggerModeMatches;
+
+impl Check for TriggerModeMatches {
+    fn id(&self) -> &'static str {
+        "trigger-mode-matches"
+    }
+    fn run(&self, client: &SpiClient<'_>, imv: Option<&ImvRow>) -> Vec<Finding> {
+        let imv = match imv {
+            Some(i) => i,
+            None => return vec![],
+        };
+        if !imv.enabled {
+            return vec![];
+        }
+        let mut out = Vec::new();
+        for src in imv.real_sources() {
+            let suffix = crate::query_decomposer::sanitized_source_suffix(src);
+            let fn_names = [
+                format!("__reflex_ins_trigger_on_{}", suffix),
+                format!("__reflex_del_trigger_on_{}", suffix),
+                format!("__reflex_upd_trigger_on_{}", suffix),
+                format!("__reflex_trunc_trigger_on_{}", suffix),
+            ];
+            // Check each trigger function for consistency with refresh_mode.
+            for fn_name in &fn_names {
+                let body: Option<String> = client
+                    .select(
+                        "SELECT prosrc::text AS body FROM pg_proc p \
+                         JOIN pg_namespace n ON n.oid = p.pronamespace \
+                         WHERE p.proname = $1 AND n.nspname = 'public' LIMIT 1",
+                        None,
+                        &[unsafe {
+                            DatumWithOid::new(fn_name.clone(), PgBuiltInOids::TEXTOID.oid().value())
+                        }],
+                    )
+                    .unwrap_or_report()
+                    .first()
+                    .get_by_name::<&str, _>("body")
+                    .unwrap_or(None)
+                    .map(|s| s.to_string());
+                let body = match body {
+                    Some(b) => b,
+                    None => continue, // trigger-attached check covers absence
+                };
+                let body_is_deferred = body.contains("__reflex_delta_");
+                let expected_deferred = imv.refresh_mode == "DEFERRED";
+                if body_is_deferred != expected_deferred {
+                    out.push(Finding {
+                        imv: Some(imv.name.clone()),
+                        severity: Severity::Error,
+                        category: "trigger-mode-matches",
+                        finding: format!(
+                            "Trigger function {} is in {} mode but IMV {} refresh_mode is {}.",
+                            fn_name,
+                            if body_is_deferred {
+                                "DEFERRED"
+                            } else {
+                                "IMMEDIATE"
+                            },
+                            imv.name,
+                            imv.refresh_mode,
+                        ),
+                        suggested_fix: format!("SELECT reflex_rebuild_triggers('{}');", src),
+                    });
+                }
+            }
+        }
+        out
+    }
+}
+
 fn registry() -> Vec<Box<dyn Check>> {
-    vec![Box::new(StagingShape), Box::new(TriggerAttached)]
+    vec![
+        Box::new(StagingShape),
+        Box::new(TriggerAttached),
+        Box::new(TriggerModeMatches),
+    ]
 }
 
 fn load_imv_rows(client: &SpiClient<'_>, scope: &AuditScope) -> Vec<ImvRow> {

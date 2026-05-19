@@ -131,3 +131,54 @@ fn pg_test_audit_trigger_attached_green_when_all_present() {
         report
     );
 }
+
+#[pg_test]
+fn pg_test_audit_trigger_mode_detects_downgrade() {
+    Spi::run("CREATE TABLE audit_tm_src (id BIGINT PRIMARY KEY, a INT)").expect("src");
+    crate::create_reflex_ivm(
+        "audit_tm_view",
+        "SELECT id, a FROM audit_tm_src",
+        Some("id"),
+        None,
+        Some("DEFERRED"),
+        None,
+    );
+    // Simulate the pre-1.6.2 silent downgrade: replace the trigger function
+    // body with an immediate-mode no-op stub that does not reference the
+    // staging delta.
+    Spi::run(
+        "CREATE OR REPLACE FUNCTION public.__reflex_ins_trigger_on_audit_tm_src () RETURNS TRIGGER \
+         LANGUAGE plpgsql AS $$BEGIN RETURN NULL; END$$",
+    )
+    .expect("downgrade fn");
+
+    let report: String = Spi::get_one("SELECT reflex_audit('audit_tm_view')")
+        .expect("ok")
+        .expect("non-null");
+    assert!(
+        report.contains("[ERROR]") && report.contains("trigger-mode-matches"),
+        "expected ERROR/trigger-mode-matches:\n{}",
+        report
+    );
+}
+
+#[pg_test]
+fn pg_test_audit_trigger_mode_green_when_consistent() {
+    Spi::run("CREATE TABLE audit_tm_ok_src (id BIGINT PRIMARY KEY, a INT)").expect("src");
+    crate::create_reflex_ivm(
+        "audit_tm_ok_view",
+        "SELECT id, a FROM audit_tm_ok_src",
+        Some("id"),
+        None,
+        Some("DEFERRED"),
+        None,
+    );
+    let report: String = Spi::get_one("SELECT reflex_audit('audit_tm_ok_view')")
+        .expect("ok")
+        .expect("non-null");
+    assert!(
+        !report.contains("trigger-mode-matches"),
+        "expected no mode mismatch:\n{}",
+        report
+    );
+}
