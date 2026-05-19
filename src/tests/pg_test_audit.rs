@@ -402,3 +402,78 @@ fn pg_test_audit_base_query_runs_green() {
         report
     );
 }
+
+#[pg_test]
+fn pg_test_audit_partition_mirror_detects_missing_partition() {
+    // Create a partitioned source table with regions and amounts.
+    Spi::run(
+        "CREATE TABLE audit_pm_src (id BIGINT, region TEXT NOT NULL, amount NUMERIC) \
+         PARTITION BY LIST (region)",
+    )
+    .expect("partitioned src");
+    Spi::run("CREATE TABLE audit_pm_src_us PARTITION OF audit_pm_src FOR VALUES IN ('us')")
+        .expect("us partition");
+    Spi::run("CREATE TABLE audit_pm_src_eu PARTITION OF audit_pm_src FOR VALUES IN ('eu')")
+        .expect("eu partition");
+    Spi::run("INSERT INTO audit_pm_src VALUES (1, 'us', 100), (2, 'eu', 200)")
+        .expect("seed");
+
+    // Create the IMV with explicit partition_by=region
+    Spi::run(
+        "SELECT create_reflex_ivm( \
+            'audit_pm_view', \
+            'SELECT region, SUM(amount) AS total FROM audit_pm_src GROUP BY region', \
+            NULL, NULL, NULL, NULL, \
+            ARRAY['region'] \
+         )",
+    )
+    .expect("create IMV");
+
+    // Get the actual intermediate partition names to detach one.
+    let int_children: Vec<String> = Spi::get_one::<Vec<String>>(
+        "SELECT array_agg(c.relname::text ORDER BY c.relname) FROM pg_inherits i \
+         JOIN pg_class c ON c.oid = i.inhrelid \
+         WHERE i.inhparent = '__reflex_intermediate_audit_pm_view'::regclass",
+    )
+    .expect("ok")
+    .expect("should have children");
+
+    // Manually detach one intermediate partition to simulate drift.
+    if !int_children.is_empty() {
+        let detach_cmd = format!(
+            "ALTER TABLE __reflex_intermediate_audit_pm_view DETACH PARTITION {}",
+            int_children[0]
+        );
+        Spi::run(&detach_cmd).expect("detach");
+    }
+
+    let report: String = Spi::get_one("SELECT reflex_audit('audit_pm_view')")
+        .expect("ok")
+        .expect("non-null");
+    assert!(
+        report.contains("[WARNING]") && report.contains("partition-mirror"),
+        "expected WARNING/partition-mirror:\n{}",
+        report
+    );
+}
+
+#[pg_test]
+fn pg_test_audit_partition_mirror_green_when_unpartitioned() {
+    // Non-partitioned IMV should not trigger this check.
+    Spi::run("CREATE TABLE audit_pm_np_src (id BIGINT PRIMARY KEY, a INT)").expect("src");
+    Spi::run(
+        "SELECT create_reflex_ivm( \
+            'audit_pm_np_view', \
+            'SELECT id, a FROM audit_pm_np_src' \
+         )",
+    )
+    .expect("create IMV");
+    let report: String = Spi::get_one("SELECT reflex_audit('audit_pm_np_view')")
+        .expect("ok")
+        .expect("non-null");
+    assert!(
+        !report.contains("partition-mirror"),
+        "expected no partition-mirror finding on non-partitioned IMV:\n{}",
+        report
+    );
+}
