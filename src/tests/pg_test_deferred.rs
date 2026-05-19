@@ -1181,3 +1181,164 @@ fn pg_test_immediate_json_column_does_not_break_filter_skip_block() {
             .expect("v");
     assert_eq!(paris_amount, 15);
 }
+
+/// 1.6.2 — Regression: when a per-source staging delta table outlives the
+/// source's column layout (e.g. user dropped the source and recreated it
+/// with reordered columns to add partitioning), the deferred trigger's
+/// `INSERT INTO staging SELECT 'U_OLD', * FROM transition` previously
+/// failed with `column "X" is of type … but expression is of type …`
+/// because the SELECT * positions no longer matched the staging's columns.
+///
+/// The fix is to emit named-column inserts in the deferred trigger DDL so
+/// that column ORDER drift does not poison the trigger. Column NAMES are
+/// looked up at IMV-create time from the current source shape.
+///
+/// This test recreates the exact failure shape on a tiny source.
+#[pg_test]
+fn pg_test_deferred_stale_staging_after_source_recreate() {
+    // v1 source: creation_date at position 7 (last)
+    Spi::run(
+        "CREATE TABLE stale_src (\
+            id BIGINT PRIMARY KEY, \
+            a INT NOT NULL, \
+            b INT NOT NULL, \
+            c INT NOT NULL, \
+            d INT NOT NULL, \
+            e INT NOT NULL, \
+            creation_date TIMESTAMPTZ)",
+    )
+    .expect("create v1");
+
+    // Create + drop a DEFERRED IMV — this leaves the staging delta behind.
+    crate::create_reflex_ivm(
+        "stale_v1_view",
+        "SELECT id, a, b, c, d, e, creation_date FROM stale_src",
+        Some("id"),
+        None,
+        Some("DEFERRED"),
+        None,
+    );
+    crate::drop_reflex_ivm("stale_v1_view");
+
+    // Confirm staging persisted across IMV drop (the precondition for
+    // the stale-shape failure mode).
+    let staging_kept = Spi::get_one::<bool>(
+        "SELECT EXISTS(SELECT 1 FROM pg_class WHERE relname = '__reflex_delta_stale_src')",
+    )
+    .expect("q")
+    .expect("v");
+    assert!(staging_kept, "staging delta must persist across IMV drop");
+
+    // Drop + recreate source with reordered columns (creation_date now at
+    // position 4). This mirrors the user's situation where the partitioned
+    // source was built from scratch with a different column order.
+    Spi::run("DROP TABLE stale_src").expect("drop source");
+    Spi::run(
+        "CREATE TABLE stale_src (\
+            id BIGINT PRIMARY KEY, \
+            a INT NOT NULL, \
+            b INT NOT NULL, \
+            creation_date TIMESTAMPTZ, \
+            c INT NOT NULL, \
+            d INT NOT NULL, \
+            e INT NOT NULL)",
+    )
+    .expect("create v2");
+
+    // Seed BEFORE creating the IMV so seed rows are picked up by the
+    // initial materialization (not by the deferred trigger path). This
+    // keeps the regression focused on the trigger's named-column INSERT
+    // and avoids exercising orthogonal flush coalescing behaviour.
+    Spi::run(
+        "INSERT INTO stale_src (id, a, b, creation_date, c, d, e) VALUES \
+            (1, 10, 20, now(), 30, 40, 50), \
+            (2, 11, 21, now(), 31, 41, 51)",
+    )
+    .expect("seed insert");
+
+    // Create a new DEFERRED IMV on the recreated source. The fix path
+    // must ensure the trigger does NOT issue a positional INSERT that
+    // would mismatch the stale staging's column order.
+    crate::create_reflex_ivm(
+        "stale_v2_view",
+        "SELECT id, a, b, creation_date, c, d, e FROM stale_src",
+        Some("id"),
+        None,
+        Some("DEFERRED"),
+        None,
+    );
+
+    // UPDATE — the original user-reported failure path. Pre-fix, this
+    // tripped the trigger with `column "X" is of type … but expression
+    // is of type …` because `INSERT INTO staging SELECT 'U_OLD', * FROM
+    // transition` mismatched the stale staging positionally.
+    Spi::run("UPDATE stale_src SET a = 99 WHERE id = 1")
+        .expect("update must succeed despite stale staging shape");
+
+    // DELETE — symmetry check across all three trigger ops.
+    Spi::run("DELETE FROM stale_src WHERE id = 2")
+        .expect("delete must succeed despite stale staging shape");
+
+    // Flush + correctness oracle.
+    Spi::run("SELECT reflex_flush_deferred('stale_src')").expect("flush");
+    let fresh = "SELECT id, a, b, creation_date, c, d, e FROM stale_src";
+    assert_imv_correct("stale_v2_view", fresh);
+}
+
+/// 1.6.2 — Companion to the reorder-only regression above. When the
+/// source's column SET (not just order) drifts between IMV incarnations,
+/// the staging delta column names no longer match either. With an EMPTY
+/// staging, `ensure_staging_matches_source` must drop+recreate it so the
+/// new named-column INSERT path finds the columns it expects.
+#[pg_test]
+fn pg_test_deferred_empty_stale_staging_with_column_set_drift_recreated() {
+    Spi::run("CREATE TABLE setdrift_src (id BIGINT PRIMARY KEY, a INT, extra TEXT)")
+        .expect("v1");
+    crate::create_reflex_ivm(
+        "setdrift_v1",
+        "SELECT id, a, extra FROM setdrift_src",
+        Some("id"),
+        None,
+        Some("DEFERRED"),
+        None,
+    );
+    crate::drop_reflex_ivm("setdrift_v1");
+
+    // Source loses a column.
+    Spi::run("DROP TABLE setdrift_src").expect("drop");
+    Spi::run("CREATE TABLE setdrift_src (id BIGINT PRIMARY KEY, a INT)").expect("v2");
+
+    // Empty staging + column-set drift: the guard should silently drop+
+    // recreate the staging so create_reflex_ivm succeeds.
+    crate::create_reflex_ivm(
+        "setdrift_v2",
+        "SELECT id, a FROM setdrift_src",
+        Some("id"),
+        None,
+        Some("DEFERRED"),
+        None,
+    );
+
+    // The staging must now have the v2 shape (no `extra` column).
+    let extra_in_staging = Spi::get_one::<bool>(
+        "SELECT EXISTS(SELECT 1 FROM pg_attribute \
+         WHERE attrelid = '__reflex_delta_setdrift_src'::regclass \
+           AND attname = 'extra' AND NOT attisdropped)",
+    )
+    .expect("q")
+    .expect("v");
+    assert!(
+        !extra_in_staging,
+        "stale staging must have been recreated without the dropped 'extra' column"
+    );
+
+    // Trigger must work end-to-end.
+    Spi::run("INSERT INTO setdrift_src VALUES (1, 10), (2, 20)")
+        .expect("insert seed via initial materialization is not what we want");
+    // ^ note: this INSERT goes through the trigger (IMV already exists), so
+    // the named-column INSERT in the deferred trigger body must agree with
+    // the recreated staging's columns.
+    Spi::run("SELECT reflex_flush_deferred('setdrift_src')").expect("flush");
+    let fresh = "SELECT id, a FROM setdrift_src";
+    assert_imv_correct("setdrift_v2", fresh);
+}

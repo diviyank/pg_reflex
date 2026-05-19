@@ -326,7 +326,8 @@ fn test_resolve_column_type() {
 
 #[test]
 fn test_deferred_upd_body_contains_where_predicate_check() {
-    let ddls = build_deferred_trigger_ddls("orders");
+    let cols = vec!["id".to_string(), "amount".to_string()];
+    let ddls = build_deferred_trigger_ddls("orders", &cols);
     let upd_ddl = &ddls[2];
     assert!(
         upd_ddl.contains("_rec.where_predicate IS NOT NULL"),
@@ -347,7 +348,8 @@ fn test_deferred_upd_body_contains_where_predicate_check() {
 
 #[test]
 fn test_deferred_upd_body_declares_pred_match() {
-    let ddls = build_deferred_trigger_ddls("orders");
+    let cols = vec!["id".to_string(), "amount".to_string()];
+    let ddls = build_deferred_trigger_ddls("orders", &cols);
     let upd_ddl = &ddls[2];
     assert!(
         upd_ddl.contains("_pred_match BOOLEAN"),

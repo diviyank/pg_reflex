@@ -1463,6 +1463,7 @@ fn install_source_triggers(client: &mut pgrx::spi::SpiClient<'_>, ctx: &BuildCon
             .is_some();
 
         if ctx.deferred {
+            ensure_staging_matches_source(client, source);
             let staging_ddl = build_staging_table_ddl(source);
             client.update(&staging_ddl, None, &[]).unwrap_or_report();
         }
@@ -1487,7 +1488,8 @@ fn install_source_triggers(client: &mut pgrx::spi::SpiClient<'_>, ctx: &BuildCon
                 };
 
             if has_any_deferred {
-                for ddl in build_deferred_trigger_ddls(source) {
+                let cols = fetch_source_columns(client, source);
+                for ddl in build_deferred_trigger_ddls(source, &cols) {
                     client.update(&ddl, None, &[]).unwrap_or_report();
                 }
             } else {
@@ -1496,11 +1498,142 @@ fn install_source_triggers(client: &mut pgrx::spi::SpiClient<'_>, ctx: &BuildCon
                 }
             }
         } else if ctx.deferred {
-            for ddl in build_deferred_trigger_ddls(source) {
+            let cols = fetch_source_columns(client, source);
+            for ddl in build_deferred_trigger_ddls(source, &cols) {
                 client.update(&ddl, None, &[]).unwrap_or_report();
             }
         }
     }
+}
+
+/// Read the ordered list of live column names for `source_table` from
+/// `pg_attribute`.  Used at deferred-trigger DDL time so the trigger body
+/// can name the columns it stages instead of relying on `SELECT *`'s
+/// positional binding (which broke when a per-source staging delta
+/// outlived a source DROP+CREATE that reordered columns — see the 1.6.2
+/// regression in `pg_test_deferred.rs`).
+fn fetch_source_columns(client: &pgrx::spi::SpiClient<'_>, source_table: &str) -> Vec<String> {
+    client
+        .select(
+            "SELECT attname::text AS name \
+             FROM pg_attribute \
+             WHERE attrelid = $1::regclass AND attnum > 0 AND NOT attisdropped \
+             ORDER BY attnum",
+            None,
+            &[unsafe {
+                DatumWithOid::new(
+                    source_table.to_string(),
+                    PgBuiltInOids::TEXTOID.oid().value(),
+                )
+            }],
+        )
+        .unwrap_or_report()
+        .filter_map(|row| {
+            row.get_by_name::<&str, _>("name")
+                .ok()
+                .flatten()
+                .map(|s| s.to_string())
+        })
+        .collect()
+}
+
+/// Guard the create_ivm path against a pre-existing staging delta whose
+/// column NAMES no longer agree with the source's live shape.  Two cases:
+///
+///   * staging column set == source column set (any order):
+///     `LIKE source` would produce the same column NAMES, so the named-
+///     column INSERT emitted by `build_deferred_trigger_ddls` will route
+///     rows correctly.  Leave staging in place (it may carry pending
+///     deferred deltas for other DEFERRED IMVs on this source).
+///
+///   * staging column set differs from source:
+///     - if staging is empty → drop + let `build_staging_table_ddl`
+///       recreate it from the current source shape.
+///     - if staging holds rows → refuse with a clear error directing the
+///       user to flush.  Dropping silently would lose other IMVs' staged
+///       work; quietly proceeding would mean the new named-column INSERT
+///       references columns that don't exist on staging.
+fn ensure_staging_matches_source(client: &mut pgrx::spi::SpiClient<'_>, source_table: &str) {
+    let staging_qual = crate::query_decomposer::staging_delta_table_name(source_table);
+    let staging_exists = client
+        .select(
+            "SELECT 1 FROM pg_class WHERE oid = to_regclass($1)",
+            None,
+            &[unsafe {
+                DatumWithOid::new(
+                    staging_qual.replace('"', ""),
+                    PgBuiltInOids::TEXTOID.oid().value(),
+                )
+            }],
+        )
+        .unwrap_or_report()
+        .next()
+        .is_some();
+    if !staging_exists {
+        return;
+    }
+
+    let source_cols: std::collections::HashSet<String> = fetch_source_columns(client, source_table)
+        .into_iter()
+        .collect();
+    let staging_cols: std::collections::HashSet<String> = client
+        .select(
+            "SELECT attname::text AS name \
+             FROM pg_attribute \
+             WHERE attrelid = $1::regclass AND attnum > 0 AND NOT attisdropped \
+               AND attname <> '__reflex_op' \
+             ORDER BY attnum",
+            None,
+            &[unsafe {
+                DatumWithOid::new(
+                    staging_qual.replace('"', ""),
+                    PgBuiltInOids::TEXTOID.oid().value(),
+                )
+            }],
+        )
+        .unwrap_or_report()
+        .filter_map(|row| {
+            row.get_by_name::<&str, _>("name")
+                .ok()
+                .flatten()
+                .map(|s| s.to_string())
+        })
+        .collect();
+
+    if source_cols == staging_cols {
+        return;
+    }
+
+    let has_rows = client
+        .select(
+            &format!("SELECT 1 FROM {} LIMIT 1", staging_qual),
+            None,
+            &[],
+        )
+        .unwrap_or_report()
+        .next()
+        .is_some();
+    if has_rows {
+        let added: Vec<&String> = source_cols.difference(&staging_cols).collect();
+        let dropped: Vec<&String> = staging_cols.difference(&source_cols).collect();
+        pgrx::error!(
+            "pg_reflex: staging delta table {} is out of sync with source '{}' \
+             (added columns: {:?}, removed columns: {:?}) and has pending deferred rows. \
+             Run SELECT reflex_flush_deferred('{}') first (or DROP it manually if the rows \
+             are no longer needed), then retry create_reflex_ivm.",
+            staging_qual,
+            source_table,
+            added,
+            dropped,
+            source_table
+        );
+    }
+    // CASCADE because reflex_flush_deferred installs per-session TEMP VIEWs
+    // (`__reflex_new_<src>`, `__reflex_old_<src>`) against the staging delta;
+    // they outlive the flush call and would otherwise block the DROP.
+    client
+        .update(&format!("DROP TABLE {} CASCADE", staging_qual), None, &[])
+        .unwrap_or_report();
 }
 
 /// When the IMV uses deferred refresh, ensure the deferred-flush
@@ -2929,7 +3062,34 @@ pub(crate) fn reflex_rebuild_triggers_impl(source_table: &str) -> String {
     };
 
     let result: Result<usize, String> = Spi::connect_mut(|client| {
-        let ddls = crate::schema_builder::build_trigger_ddls(&resolved);
+        // 1.6.2: pick the correct trigger flavour by inspecting the live
+        // dependency graph.  If any enabled IMV depending on this source is
+        // DEFERRED, the source's trigger function must use the deferred
+        // body (which stages into `__reflex_delta_<src>`); otherwise the
+        // immediate body suffices.  Pre-1.6.2 this always emitted the
+        // immediate body, which silently broke deferred IMVs whose trigger
+        // had been rebuilt via this entry point.
+        let has_deferred = client
+            .select(
+                "SELECT 1 FROM public.__reflex_ivm_reference \
+                 WHERE $1 = ANY(depends_on) \
+                   AND refresh_mode = 'DEFERRED' \
+                   AND enabled = TRUE \
+                 LIMIT 1",
+                None,
+                &[unsafe {
+                    DatumWithOid::new(resolved.clone(), PgBuiltInOids::TEXTOID.oid().value())
+                }],
+            )
+            .map_err(|e| format!("dependency lookup failed: {}", e))?
+            .next()
+            .is_some();
+        let ddls = if has_deferred {
+            let cols = fetch_source_columns(client, &resolved);
+            crate::schema_builder::build_deferred_trigger_ddls(&resolved, &cols)
+        } else {
+            crate::schema_builder::build_trigger_ddls(&resolved)
+        };
         for ddl in &ddls {
             client
                 .update(ddl, None, &[])

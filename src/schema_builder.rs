@@ -652,11 +652,24 @@ pub fn build_trigger_ddls(source_table: &str) -> Vec<String> {
 ///
 /// The immediate triggers still handle IMMEDIATE-mode IMVs on the same source
 /// (mixed mode: some IMVs IMMEDIATE, some DEFERRED).
-pub fn build_deferred_trigger_ddls(source_table: &str) -> Vec<String> {
+///
+/// `source_columns` is the ordered list of bare column names of `source_table`
+/// (resolved by the caller from `pg_attribute` against the live catalog).
+/// It is baked into the trigger body as a named-column INSERT list so that a
+/// staging delta from an older incarnation of the source — whose physical
+/// column ORDER may differ from the current shape — still receives the rows
+/// at the correct named columns instead of mismatching positionally. See the
+/// 1.6.2 regression added in `pg_test_deferred.rs`.
+pub fn build_deferred_trigger_ddls(source_table: &str, source_columns: &[String]) -> Vec<String> {
     let safe_source = source_table.replace('.', "_").replace('"', "");
     let ref_new = transition_new_table_name(source_table);
     let ref_old = transition_old_table_name(source_table);
     let delta_tbl = staging_delta_table_name(source_table);
+    let col_list = source_columns
+        .iter()
+        .map(|c| format!("\"{}\"", c.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(", ");
 
     // Mixed-mode body for INSERT/DELETE: process IMMEDIATE IMVs inline, stage
     // deltas for DEFERRED IMVs.  Relocated to sql/deferred_trigger_body.plpgsql.in
@@ -672,6 +685,7 @@ pub fn build_deferred_trigger_ddls(source_table: &str) -> Vec<String> {
                 ("__REFLEX_SLOT_OP_CODE__", op_code),
                 ("__REFLEX_SLOT_REF_TBL__", ref_tbl),
                 ("__REFLEX_SLOT_DELTA_TBL__", &delta_tbl),
+                ("__REFLEX_SLOT_COL_LIST__", &col_list),
             ],
         )
     };
@@ -710,6 +724,7 @@ pub fn build_deferred_trigger_ddls(source_table: &str) -> Vec<String> {
             ("__REFLEX_SLOT_REF_NEW__", &ref_new),
             ("__REFLEX_SLOT_REF_OLD__", &ref_old),
             ("__REFLEX_SLOT_DELTA_TBL__", &delta_tbl),
+            ("__REFLEX_SLOT_COL_LIST__", &col_list),
         ],
     );
     let upd_ddl = format!(

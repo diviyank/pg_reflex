@@ -816,7 +816,8 @@ fn test_build_merge_count_distinct_nullable_uses_null_safe_join() {
 fn test_build_deferred_trigger_ddls_long_source_name_no_truncation() {
     use crate::schema_builder::build_deferred_trigger_ddls;
     let long_src = "demand_planning_characteristics_reflex__cte_sales_stats";
-    let ddls = build_deferred_trigger_ddls(long_src);
+    let cols = vec!["id".to_string(), "amount".to_string()];
+    let ddls = build_deferred_trigger_ddls(long_src, &cols);
     for ddl in &ddls {
         for ident in extract_quoted_identifiers(ddl) {
             assert!(

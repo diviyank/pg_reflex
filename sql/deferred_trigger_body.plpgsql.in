@@ -26,7 +26,7 @@ BEGIN
       END IF;
     END LOOP;
     IF _has_deferred THEN
-      INSERT INTO __REFLEX_SLOT_DELTA_TBL__ SELECT '__REFLEX_SLOT_OP_CODE__', * FROM "__REFLEX_SLOT_REF_TBL__";
+      INSERT INTO __REFLEX_SLOT_DELTA_TBL__ (__reflex_op, __REFLEX_SLOT_COL_LIST__) SELECT '__REFLEX_SLOT_OP_CODE__', __REFLEX_SLOT_COL_LIST__ FROM "__REFLEX_SLOT_REF_TBL__";
       INSERT INTO public.__reflex_deferred_pending (source_table, operation)
         VALUES ('__REFLEX_SLOT_SOURCE_TABLE__', '__REFLEX_SLOT_OP__');
     END IF;
