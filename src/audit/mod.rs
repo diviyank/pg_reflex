@@ -12,6 +12,7 @@ use checks_a_catastrophic::{
     InternalTablesExist, SourceExists, StagingShape, TriggerAttached, TriggerModeMatches,
 };
 use checks_b_drift::{BaseQueryRuns, IntermediateShape, PartitionMirror, TargetShape};
+use checks_c_orphan::{OrphanIntermediate, OrphanScratch, OrphanStaging};
 
 pub enum AuditScope {
     All,
@@ -87,9 +88,14 @@ impl ImvRow {
 pub trait Check {
     #[allow(dead_code)]
     fn id(&self) -> &'static str;
-    fn run(&self, client: &SpiClient<'_>, imv: Option<&ImvRow>) -> Vec<Finding>;
+    fn run(&self, _client: &SpiClient<'_>, _imv: Option<&ImvRow>) -> Vec<Finding> {
+        vec![]
+    }
     fn is_per_imv(&self) -> bool {
         true
+    }
+    fn run_global(&self, _client: &SpiClient<'_>, _imvs: &[ImvRow]) -> Vec<Finding> {
+        vec![]
     }
 }
 
@@ -104,6 +110,9 @@ fn registry() -> Vec<Box<dyn Check>> {
         Box::new(TargetShape),
         Box::new(BaseQueryRuns),
         Box::new(PartitionMirror),
+        Box::new(OrphanIntermediate),
+        Box::new(OrphanStaging),
+        Box::new(OrphanScratch),
     ]
 }
 
@@ -431,7 +440,7 @@ pub fn reflex_audit_impl(scope: AuditScope) -> String {
                     findings.extend(chk.run(client, Some(imv)));
                 }
             } else if matches!(scope, AuditScope::All) {
-                findings.extend(chk.run(client, None));
+                findings.extend(chk.run_global(client, &imvs));
             }
         }
 

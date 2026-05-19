@@ -477,3 +477,79 @@ fn pg_test_audit_partition_mirror_green_when_unpartitioned() {
         report
     );
 }
+
+#[pg_test]
+fn pg_test_audit_orphan_intermediate_detects() {
+    Spi::run("CREATE TABLE __reflex_intermediate_audit_orph_view (id BIGINT)")
+        .expect("plant orphan");
+
+    let report: String = Spi::get_one("SELECT reflex_audit()")
+        .expect("ok")
+        .expect("non-null");
+    assert!(
+        report.contains("orphan-intermediate"),
+        "expected orphan-intermediate finding:\n{}",
+        report
+    );
+    Spi::run("DROP TABLE __reflex_intermediate_audit_orph_view").expect("cleanup");
+}
+
+#[pg_test]
+fn pg_test_audit_orphan_staging_detects() {
+    Spi::run(
+        "CREATE UNLOGGED TABLE __reflex_delta_audit_orph_src \
+         (__reflex_op TEXT NOT NULL, id BIGINT)",
+    )
+    .expect("plant orphan staging");
+
+    let report: String = Spi::get_one("SELECT reflex_audit()")
+        .expect("ok")
+        .expect("non-null");
+    assert!(
+        report.contains("orphan-staging"),
+        "expected orphan-staging finding:\n{}",
+        report
+    );
+    Spi::run("DROP TABLE __reflex_delta_audit_orph_src").expect("cleanup");
+}
+
+#[pg_test]
+fn pg_test_audit_orphan_scratch_is_info_severity() {
+    Spi::run("CREATE TABLE __reflex_scratch_audit_orph_view (id BIGINT)")
+        .expect("plant orphan scratch");
+
+    let report: String = Spi::get_one("SELECT reflex_audit()")
+        .expect("ok")
+        .expect("non-null");
+    assert!(
+        report.contains("[INFO]") && report.contains("orphan-scratch"),
+        "expected INFO/orphan-scratch:\n{}",
+        report
+    );
+    Spi::run("DROP TABLE __reflex_scratch_audit_orph_view").expect("cleanup");
+}
+
+#[pg_test]
+fn pg_test_audit_scoped_skips_orphan_checks() {
+    Spi::run("CREATE TABLE audit_no_orph_src (id BIGINT PRIMARY KEY, a INT)").expect("src");
+    crate::create_reflex_ivm(
+        "audit_no_orph_view",
+        "SELECT id, a FROM audit_no_orph_src",
+        Some("id"),
+        None,
+        Some("IMMEDIATE"),
+        None,
+    );
+    Spi::run("CREATE TABLE __reflex_intermediate_audit_no_orph_GHOST (id BIGINT)")
+        .expect("plant orphan");
+
+    let report: String = Spi::get_one("SELECT reflex_audit('audit_no_orph_view')")
+        .expect("ok")
+        .expect("non-null");
+    assert!(
+        !report.contains("orphan-"),
+        "scoped audit must skip orphan checks:\n{}",
+        report
+    );
+    Spi::run("DROP TABLE __reflex_intermediate_audit_no_orph_GHOST").expect("cleanup");
+}
