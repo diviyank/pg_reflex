@@ -429,6 +429,99 @@ fn relation_exists(client: &SpiClient<'_>, qualified: &str) -> bool {
     !matches!(oid, None | Some(0))
 }
 
+struct IntermediateShape;
+
+impl Check for IntermediateShape {
+    fn id(&self) -> &'static str {
+        "intermediate-shape"
+    }
+    fn run(&self, client: &SpiClient<'_>, imv: Option<&ImvRow>) -> Vec<Finding> {
+        let imv = match imv {
+            Some(i) => i,
+            None => return vec![],
+        };
+        if !imv.enabled {
+            return vec![];
+        }
+        let intermediate = crate::query_decomposer::intermediate_table_name(&imv.name);
+        let actual = match relation_attname_set_quoted(client, &intermediate) {
+            Some(v) => v,
+            None => return vec![], // internal-tables-exist covers absence
+        };
+        let expected = match probe_query_columns(&imv.base_query) {
+            Ok(v) => v,
+            Err(_) => return vec![], // base-query-runs covers parse/plan failures
+        };
+        if shape_matches(&actual, &expected) {
+            return vec![];
+        }
+        vec![Finding {
+            imv: Some(imv.name.clone()),
+            severity: Severity::Warning,
+            category: "intermediate-shape",
+            finding: format!(
+                "{} has columns\n  {{{}}}\nbut base_query produces\n  {{{}}}",
+                intermediate,
+                actual.join(", "),
+                expected.join(", "),
+            ),
+            suggested_fix: format!("SELECT reflex_rebuild_imv('{}');", imv.name),
+        }]
+    }
+}
+
+struct TargetShape;
+
+impl Check for TargetShape {
+    fn id(&self) -> &'static str {
+        "target-shape"
+    }
+    fn run(&self, client: &SpiClient<'_>, imv: Option<&ImvRow>) -> Vec<Finding> {
+        let imv = match imv {
+            Some(i) => i,
+            None => return vec![],
+        };
+        if !imv.enabled {
+            return vec![];
+        }
+        // For passthrough IMVs, end_query is empty and target-shape check doesn't apply
+        if imv.end_query.is_empty() {
+            return vec![];
+        }
+        let target_quoted = quote_qualified_for_regclass(&imv.name);
+        let actual = match relation_attname_set_quoted(client, &target_quoted) {
+            Some(v) => v,
+            None => return vec![],
+        };
+        let expected = match probe_query_columns(&imv.end_query) {
+            Ok(v) => v,
+            Err(_) => return vec![],
+        };
+        if shape_matches(&actual, &expected) {
+            return vec![];
+        }
+        vec![Finding {
+            imv: Some(imv.name.clone()),
+            severity: Severity::Warning,
+            category: "target-shape",
+            finding: format!(
+                "{} has columns\n  {{{}}}\nbut end_query produces\n  {{{}}}",
+                imv.name,
+                actual.join(", "),
+                expected.join(", "),
+            ),
+            suggested_fix: format!("SELECT reflex_rebuild_imv('{}');", imv.name),
+        }]
+    }
+}
+
+fn quote_qualified_for_regclass(name: &str) -> String {
+    match name.split_once('.') {
+        Some((schema, local)) => format!("\"{}\".\"{}\"", schema, local),
+        None => format!("\"{}\"", name),
+    }
+}
+
 fn registry() -> Vec<Box<dyn Check>> {
     vec![
         Box::new(StagingShape),
@@ -436,6 +529,8 @@ fn registry() -> Vec<Box<dyn Check>> {
         Box::new(TriggerModeMatches),
         Box::new(InternalTablesExist),
         Box::new(SourceExists),
+        Box::new(IntermediateShape),
+        Box::new(TargetShape),
     ]
 }
 
@@ -652,6 +747,66 @@ fn read_attname_set(client: &SpiClient<'_>, relid: i64, exclude: &[&str]) -> Vec
         }
     }
     names
+}
+
+fn probe_query_columns(query: &str) -> Result<Vec<String>, String> {
+    // Try to execute the query and extract column names from the result set
+    let limited_query = format!("SELECT * FROM ({}) AS subq LIMIT 0", query);
+
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        Spi::connect(|client| {
+            match client.select(&limited_query, None, &[]) {
+                Ok(rs) => {
+                    let mut cols: Vec<String> = Vec::new();
+                    // Iterate through ordinals to get column names
+                    for ordinal in 1..=128 {
+                        // Reasonable upper limit for column count
+                        match rs.column_name(ordinal) {
+                            Ok(name) => cols.push(name),
+                            Err(_) => break, // No more columns
+                        }
+                    }
+
+                    if cols.is_empty() {
+                        Err("no columns found in query".to_string())
+                    } else {
+                        Ok(cols)
+                    }
+                }
+                Err(_) => Err("query execution failed".to_string()),
+            }
+        })
+    })) {
+        Ok(result) => result,
+        Err(_) => Err("query crashed during execution".to_string()),
+    }
+}
+
+fn relation_attname_set_quoted(client: &SpiClient<'_>, qualified: &str) -> Option<Vec<String>> {
+    let oid: Option<i64> = client
+        .select(
+            "SELECT to_regclass($1)::oid::bigint AS oid",
+            None,
+            &[unsafe {
+                DatumWithOid::new(qualified.to_string(), PgBuiltInOids::TEXTOID.oid().value())
+            }],
+        )
+        .unwrap_or_report()
+        .first()
+        .get_by_name::<i64, _>("oid")
+        .unwrap_or(None);
+    match oid {
+        None | Some(0) => None,
+        Some(o) => Some(read_attname_set(client, o, &[])),
+    }
+}
+
+fn shape_matches(actual: &[String], expected: &[String]) -> bool {
+    let mut a: Vec<&String> = actual.iter().collect();
+    a.sort();
+    let mut e: Vec<&String> = expected.iter().collect();
+    e.sort();
+    a == e
 }
 
 pub fn reflex_audit_impl(scope: AuditScope) -> String {

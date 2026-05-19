@@ -285,3 +285,71 @@ fn pg_test_audit_source_exists_green_when_live() {
         report
     );
 }
+
+#[pg_test]
+fn pg_test_audit_intermediate_shape_detects_extra_column() {
+    Spi::run("CREATE TABLE audit_is_src (id BIGINT PRIMARY KEY, a INT)").expect("src");
+    crate::create_reflex_ivm(
+        "audit_is_view",
+        "SELECT id, COUNT(*) as cnt FROM audit_is_src GROUP BY id",
+        Some("id"),
+        None,
+        Some("IMMEDIATE"),
+        None,
+    );
+    Spi::run("ALTER TABLE __reflex_intermediate_audit_is_view ADD COLUMN extra INT")
+        .expect("add column");
+
+    let report: String = Spi::get_one("SELECT reflex_audit('audit_is_view')")
+        .expect("ok")
+        .expect("non-null");
+    assert!(
+        report.contains("[WARNING]") && report.contains("intermediate-shape"),
+        "expected WARNING/intermediate-shape:\n{}",
+        report
+    );
+}
+
+#[pg_test]
+fn pg_test_audit_target_shape_detects_dropped_column() {
+    Spi::run("CREATE TABLE audit_ts_src (id BIGINT PRIMARY KEY, a INT, b INT)").expect("src");
+    crate::create_reflex_ivm(
+        "audit_ts_view",
+        "SELECT id, a, b, COUNT(*) as cnt FROM audit_ts_src GROUP BY id, a, b",
+        Some("id"),
+        None,
+        Some("IMMEDIATE"),
+        None,
+    );
+    Spi::run("ALTER TABLE audit_ts_view DROP COLUMN b").expect("drop col");
+
+    let report: String = Spi::get_one("SELECT reflex_audit('audit_ts_view')")
+        .expect("ok")
+        .expect("non-null");
+    assert!(
+        report.contains("[WARNING]") && report.contains("target-shape"),
+        "expected WARNING/target-shape:\n{}",
+        report
+    );
+}
+
+#[pg_test]
+fn pg_test_audit_shape_green_when_aligned() {
+    Spi::run("CREATE TABLE audit_sh_ok_src (id BIGINT PRIMARY KEY, a INT)").expect("src");
+    crate::create_reflex_ivm(
+        "audit_sh_ok_view",
+        "SELECT id, COUNT(*) as cnt FROM audit_sh_ok_src GROUP BY id",
+        Some("id"),
+        None,
+        Some("IMMEDIATE"),
+        None,
+    );
+    let report: String = Spi::get_one("SELECT reflex_audit('audit_sh_ok_view')")
+        .expect("ok")
+        .expect("non-null");
+    assert!(
+        !report.contains("intermediate-shape") && !report.contains("target-shape"),
+        "expected no shape findings:\n{}",
+        report
+    );
+}
