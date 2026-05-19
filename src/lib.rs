@@ -16,6 +16,7 @@ use pgrx::prelude::*;
 unsafe extern "C" {}
 
 mod aggregation;
+mod audit;
 mod create_ivm;
 mod drop_ivm;
 mod introspect;
@@ -661,6 +662,16 @@ fn reflex_set_partition_dispatch_cost_cap(view_name: &str, value: Option<i64>) -
     }
 }
 
+#[pg_extern(name = "reflex_audit")]
+fn reflex_audit_all() -> String {
+    audit::reflex_audit_impl(audit::AuditScope::All)
+}
+
+#[pg_extern(name = "reflex_audit")]
+fn reflex_audit_one(view_name: &str) -> String {
+    audit::reflex_audit_impl(audit::AuditScope::One(view_name.to_string()))
+}
+
 extension_sql!(
     r#"
     CREATE OR REPLACE FUNCTION public.__reflex_on_sql_drop()
@@ -885,6 +896,7 @@ mod tests {
     include!("tests/pg_test_coverage.rs");
     include!("tests/pg_test_partition.rs");
     include!("tests/pg_test_partition_dispatch.rs");
+    include!("tests/pg_test_audit.rs");
 }
 
 /// This module is required by `cargo pgrx test` invocations.
