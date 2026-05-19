@@ -84,8 +84,92 @@ pub trait Check {
     }
 }
 
+struct StagingShape;
+
+impl Check for StagingShape {
+    fn id(&self) -> &'static str {
+        "staging-shape"
+    }
+    fn run(&self, client: &SpiClient<'_>, imv: Option<&ImvRow>) -> Vec<Finding> {
+        let imv = match imv {
+            Some(i) => i,
+            None => return vec![],
+        };
+        if imv.refresh_mode != "DEFERRED" || !imv.enabled {
+            return vec![];
+        }
+        let mut out = Vec::new();
+        for src in imv.real_sources() {
+            let staging = crate::query_decomposer::staging_delta_table_name(src);
+
+            // Resolve schema + local for both sides via to_regclass.
+            let staging_oid = match client
+                .select(
+                    "SELECT to_regclass($1)::oid::bigint AS oid",
+                    None,
+                    &[unsafe {
+                        DatumWithOid::new(staging.clone(), PgBuiltInOids::TEXTOID.oid().value())
+                    }],
+                )
+                .unwrap_or_report()
+                .first()
+                .get_by_name::<i64, _>("oid")
+                .unwrap_or(None)
+            {
+                Some(0) | None => continue,
+                Some(o) => o,
+            };
+            let source_oid = match client
+                .select(
+                    "SELECT to_regclass($1)::oid::bigint AS oid",
+                    None,
+                    &[unsafe {
+                        DatumWithOid::new(src.to_string(), PgBuiltInOids::TEXTOID.oid().value())
+                    }],
+                )
+                .unwrap_or_report()
+                .first()
+                .get_by_name::<i64, _>("oid")
+                .unwrap_or(None)
+            {
+                Some(0) | None => continue,
+                Some(o) => o,
+            };
+
+            let src_cols = read_attname_set(client, source_oid, &[]);
+            let stg_cols = read_attname_set(client, staging_oid, &["__reflex_op"]);
+
+            if src_cols != stg_cols {
+                out.push(Finding {
+                    imv: Some(imv.name.clone()),
+                    severity: Severity::Error,
+                    category: "staging-shape",
+                    finding: format!(
+                        "{} has columns\n  {{{}}}\nbut source {} has\n  {{{}}}\n\
+                         Trigger INSERTs would mismatch on differing column set.",
+                        staging,
+                        stg_cols.join(", "),
+                        src,
+                        src_cols.join(", "),
+                    ),
+                    suggested_fix: format!(
+                        "SELECT count(*) FROM {staging};\n\
+                         -- if 0:\n\
+                         DROP TABLE {staging} CASCADE;\n\
+                         SELECT reflex_rebuild_triggers('{src}');\n\
+                         -- if >0:\n\
+                         SELECT reflex_flush_deferred('{src}');\n\
+                         -- then re-run the above DROP + rebuild."
+                    ),
+                });
+            }
+        }
+        out
+    }
+}
+
 fn registry() -> Vec<Box<dyn Check>> {
-    vec![]
+    vec![Box::new(StagingShape)]
 }
 
 fn load_imv_rows(client: &SpiClient<'_>, scope: &AuditScope) -> Vec<ImvRow> {
@@ -280,6 +364,27 @@ fn format_report(scope: &AuditScope, imvs: &[ImvRow], mut findings: Vec<Finding>
         i
     ));
     out
+}
+
+fn read_attname_set(client: &SpiClient<'_>, relid: i64, exclude: &[&str]) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    let rs = client
+        .select(
+            "SELECT attname::text AS n FROM pg_attribute \
+             WHERE attrelid = $1::oid AND attnum > 0 AND NOT attisdropped \
+             ORDER BY attname",
+            None,
+            &[unsafe { DatumWithOid::new(relid, PgBuiltInOids::INT8OID.oid().value()) }],
+        )
+        .unwrap_or_report();
+    for row in rs {
+        if let Some(Some(n)) = row.get_by_name::<&str, _>("n").ok() {
+            if !exclude.iter().any(|e| *e == n) {
+                names.push(n.to_string());
+            }
+        }
+    }
+    names
 }
 
 pub fn reflex_audit_impl(scope: AuditScope) -> String {
