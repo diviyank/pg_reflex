@@ -292,3 +292,90 @@ fn test_cte_sibling_with_window() {
     .expect("v");
     assert_eq!(val_sum_a, 300i64, "A values in tcte_src2: 100 + 200 = 300");
 }
+
+#[pg_test]
+fn test_cte_sibling_with_window_main_query() {
+    // This test adds a variant of test_cte_sibling_with_window covering the scenario:
+    // - Two CTEs, one with aggregation, one with passthrough (no window in CTE itself)
+    // - Main query applies a window function and references BOTH CTEs
+    // Bug: CTE decomposition must run BEFORE window decomposition.
+    // Old behavior: window decomposition would detect has_window_function=true on the query,
+    //   then attempt to drop the WITH clause to build a base query. This caused:
+    //   "relation <sibling_cte> does not exist" because the other CTE hadn't been decomposed yet.
+    // Fix: CTE decomposition runs first (in src/create_ivm.rs at line ~1908), turning each CTE
+    //   into its own sub-IMV recursively. The main body is rewritten to reference sub-IMVs
+    //   (no longer containing WITH clauses). Then window decomposition safely processes any
+    //   window functions without dropping CTEs.
+
+    Spi::run(
+        "CREATE TABLE tcte_winpass_src1 (id SERIAL, grp TEXT)",
+    )
+    .expect("create src1");
+    Spi::run(
+        "INSERT INTO tcte_winpass_src1 VALUES (1, 'A'), (2, 'A'), (3, 'B'), (4, 'B')",
+    )
+    .expect("seed src1");
+
+    Spi::run(
+        "CREATE TABLE tcte_winpass_src2 (id INT, grp TEXT, val INT)",
+    )
+    .expect("create src2");
+    Spi::run(
+        "INSERT INTO tcte_winpass_src2 VALUES (10, 'A', 100), (11, 'A', 200), (12, 'B', 150), (13, 'B', 250)",
+    )
+    .expect("seed src2");
+
+    // agg_cte: aggregation (non-window)
+    // vals_cte: passthrough, no aggregation
+    // Main query: window function applied to joined result
+    let result = crate::create_reflex_ivm(
+        "cte_winpass_view",
+        "WITH agg_cte AS (
+            SELECT grp, COUNT(*) AS cnt FROM tcte_winpass_src1 GROUP BY grp
+        ), vals_cte AS (
+            SELECT grp, val FROM tcte_winpass_src2
+        )
+        SELECT grp, cnt, val, RANK() OVER (ORDER BY val DESC) AS rnk
+        FROM (
+            SELECT a.grp, a.cnt, v.val
+            FROM agg_cte a
+            LEFT JOIN vals_cte v ON v.grp = a.grp
+        ) t",
+        None,
+        None,
+        None,
+        None,
+    );
+    assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW", "Two sibling CTEs with window in main query should decompose without 'does not exist' error");
+
+    // Verify row count
+    let cnt = Spi::get_one::<i64>(
+        "SELECT COUNT(*) FROM cte_winpass_view",
+    )
+    .expect("q")
+    .expect("v");
+    assert_eq!(cnt, 4i64, "Should have 4 rows");
+
+    // Verify correctness: aggregation is preserved
+    let cnt_a = Spi::get_one::<i64>(
+        "SELECT cnt FROM cte_winpass_view WHERE grp = 'A' AND val IS NOT NULL LIMIT 1",
+    )
+    .expect("q")
+    .expect("v");
+    assert_eq!(cnt_a, 2i64, "Group A has cnt=2");
+
+    // Verify window ranking works
+    let rnk_200 = Spi::get_one::<i64>(
+        "SELECT rnk FROM cte_winpass_view WHERE val = 200",
+    )
+    .expect("q")
+    .expect("v");
+    assert_eq!(rnk_200, 2i64, "Val 200 should have rank 2 (after 250)");
+
+    let rnk_250 = Spi::get_one::<i64>(
+        "SELECT rnk FROM cte_winpass_view WHERE val = 250",
+    )
+    .expect("q")
+    .expect("v");
+    assert_eq!(rnk_250, 1i64, "Val 250 should have rank 1 (highest)");
+}
