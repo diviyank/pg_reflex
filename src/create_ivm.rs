@@ -740,24 +740,16 @@ with kind: mv.",
         // that appear in this CTE's output.
         let cte_partition_by = if let Some(cte_output_cols) = extract_cte_output_columns(&cte_query)
         {
-            let subset = compute_cte_partition_subset(partition_by, &cte_output_cols);
-            info!(
-                "pg_reflex: CTE '{}': parent partition_by={:?}, output_cols={:?}, computed subset={:?}",
-                cte.alias,
-                partition_by,
-                cte_output_cols,
-                subset
-            );
-            subset
+            compute_cte_partition_subset(partition_by, &cte_output_cols)
         } else {
             // Wildcard projection or analysis failed — cannot propagate partitioning
-            info!(
-                "pg_reflex: CTE '{}': wildcard or analysis failed, skipping partition propagation",
-                cte.alias
-            );
             Vec::new()
         };
 
+        // Note: nested CTEs (CTE body containing WITH) re-enter try_decompose_ctes with
+        // view_name = "<view>__cte_<cte_alias>", producing names like "<view>__cte_a__cte_b".
+        // A sibling CTE literally named "a__cte_b" would collide with nested CTE "b" inside "a",
+        // but this is a pathological edge case requiring an adversarial alias — accepted risk.
         let cte_view_name = safe_identifier(&format!("{}__cte_{}", view_name, cte.alias));
         let result = create_reflex_ivm_impl(
             &cte_view_name,
@@ -792,14 +784,6 @@ with kind: mv.",
         return Some("ERROR: Query is not a SELECT");
     };
 
-    // For the main body, do NOT pass partition_by from the parent IMV.
-    // The main body sources from CTE sub-IMVs (not real tables), so:
-    // 1. The partition columns may not be available in the CTE outputs
-    // 2. CTE sub-IMVs don't get triggers anyway
-    // If the user wants partitioning on the final result, they should define
-    // a separate IMV without CTEs that sources from the CTE sub-IMVs.
-    let main_partition_by: Vec<String> = Vec::new();
-
     // Check if the main body is passthrough (no aggregation).
     // If so, all its sources are CTE sub-IMVs which don't get triggers,
     // CTE body (passthrough or aggregate) → create as a normal IMV
@@ -812,7 +796,7 @@ with kind: mv.",
         refresh_mode,
         topk_k,
         ignore_sources,
-        &main_partition_by,
+        partition_by,
     ))
 }
 

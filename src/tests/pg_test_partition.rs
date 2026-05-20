@@ -997,6 +997,26 @@ fn pg_part_cte_partition_propagation_basic() {
     .expect("count");
     assert_eq!(cte_children, 2, "CTE sub-IMV should have 2 partition children");
 
+    // CRITICAL: Verify the PARENT (main) IMV is also partitioned.
+    // This ensures that partition_by is actually passed to the main-body re-entry,
+    // not dropped (regression guard for Problem 1).
+    let main_imv_partstrat = Spi::get_one::<String>(
+        "SELECT pt.partstrat::text FROM pg_partitioned_table pt \
+         JOIN pg_class c ON c.oid = pt.partrelid \
+         WHERE c.relname = 'cte_part_main'",
+    );
+    match main_imv_partstrat {
+        Ok(Some(strat)) => {
+            assert_eq!(strat, "l", "Main IMV should be LIST partitioned on region");
+        }
+        Ok(None) => {
+            panic!("REGRESSION: Main IMV 'cte_part_main' not found or not partitioned — partition_by was silently dropped");
+        }
+        Err(e) => {
+            panic!("Failed to query main IMV partitioning: {e}");
+        }
+    }
+
     // Verify initial data is correct in the main IMV
     let n_total = Spi::get_one::<pgrx::AnyNumeric>(
         "SELECT total FROM cte_part_main WHERE region = 'N'",
@@ -1027,7 +1047,10 @@ fn pg_part_cte_partition_no_propagation_when_col_not_in_output() {
         .expect("seed");
 
     // Create IMV with CTE that does NOT output region (partition column).
-    // partition_by=[region] should NOT be propagated to CTE (no matching output column).
+    // User requests partition_by=[region], but CTE doesn't output it.
+    // This is now correctly detected: partition_by is NOT propagated to the CTE sub-IMV
+    // (since 'region' is not in its output), but IS passed to the main body,
+    // which then fails validation because 'region' is not a source column.
     let result = Spi::get_one::<String>(
         "SELECT create_reflex_ivm( \
             'cte_no_prop', \
@@ -1042,27 +1065,13 @@ fn pg_part_cte_partition_no_propagation_when_col_not_in_output() {
     .expect("create call")
     .expect("create result");
     assert!(
-        !result.starts_with("ERROR"),
-        "CTE without partition column should still be created: {result}"
+        result.starts_with("ERROR"),
+        "Creating an IMV with partition_by on a column not in CTE outputs should fail: {result}"
     );
-
-    // Verify the CTE sub-IMV is NOT partitioned (partition_by was not applicable).
-    let is_cte_partitioned = Spi::get_one::<i64>(
-        "SELECT count(*) FROM pg_partitioned_table pt \
-         JOIN pg_class c ON c.oid = pt.partrelid \
-         WHERE c.relname LIKE 'cte_no_prop__cte%'",
-    )
-    .expect("partitioned table query")
-    .expect("count");
-    assert_eq!(is_cte_partitioned, 0, "CTE sub-IMV should not be partitioned");
-
-    // Main IMV should still work and have correct data
-    let total = Spi::get_one::<pgrx::AnyNumeric>(
-        "SELECT total FROM cte_no_prop",
-    )
-    .expect("query")
-    .expect("total");
-    assert_eq!(total.to_string(), "50");
+    assert!(
+        result.contains("no source table owns partition column"),
+        "Error should indicate partition column not found in sources: {result}"
+    );
 }
 
 #[pg_test]
