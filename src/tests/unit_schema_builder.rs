@@ -583,3 +583,156 @@ fn test_upd_body_probe_after_filter_skip() {
         probe_pos
     );
 }
+
+// ========================================================================
+// MIN/MAX type resolution for qualified columns (bug fix)
+// ========================================================================
+
+#[test]
+fn test_target_table_qualified_max_timestamptz() {
+    // Reproduces the bug: qualified MAX(e.ts) where ts is TIMESTAMPTZ
+    // The intermediate column __max_e_ts is built with source_arg="e.ts"
+    // and resolved correctly to TIMESTAMPTZ.
+    // The target column must also be TIMESTAMPTZ, not NUMERIC.
+    let mut plan = sample_plan();
+    plan.group_by_columns = vec!["grp".to_string()];
+    plan.intermediate_columns = vec![IntermediateColumn {
+        name: "__max_e_ts".to_string(),
+        pg_type: "NUMERIC".to_string(), // Default, will be resolved
+        source_aggregate: "MAX".to_string(),
+        source_arg: "e.ts".to_string(),
+        topk_k: None,
+    }];
+    plan.end_query_mappings = vec![EndQueryMapping {
+        intermediate_expr: "__max_e_ts".to_string(),
+        output_alias: "max_ts".to_string(),
+        aggregate_type: "MAX".to_string(),
+        cast_type: None,
+    }];
+
+    let mut types = sample_types();
+    types.insert("e.ts".to_string(), "TIMESTAMPTZ".to_string());
+    types.insert("grp".to_string(), "TEXT".to_string());
+
+    let ddl = build_target_table_ddl("test_view", &plan, &types, false);
+
+    // The target column max_ts must be TIMESTAMPTZ, not NUMERIC
+    assert!(
+        ddl.contains("\"max_ts\" TIMESTAMPTZ"),
+        "target column max_ts must resolve to TIMESTAMPTZ, not NUMERIC: {}",
+        ddl
+    );
+    assert!(
+        !ddl.contains("\"max_ts\" NUMERIC"),
+        "target column max_ts must NOT be NUMERIC: {}",
+        ddl
+    );
+}
+
+#[test]
+fn test_target_table_qualified_min_date() {
+    let mut plan = sample_plan();
+    plan.group_by_columns = vec!["grp".to_string()];
+    plan.intermediate_columns = vec![IntermediateColumn {
+        name: "__min_e_order_date".to_string(),
+        pg_type: "NUMERIC".to_string(),
+        source_aggregate: "MIN".to_string(),
+        source_arg: "e.order_date".to_string(),
+        topk_k: None,
+    }];
+    plan.end_query_mappings = vec![EndQueryMapping {
+        intermediate_expr: "__min_e_order_date".to_string(),
+        output_alias: "min_date".to_string(),
+        aggregate_type: "MIN".to_string(),
+        cast_type: None,
+    }];
+
+    let mut types = sample_types();
+    types.insert("e.order_date".to_string(), "DATE".to_string());
+    types.insert("grp".to_string(), "TEXT".to_string());
+
+    let ddl = build_target_table_ddl("test_view", &plan, &types, false);
+
+    // The target column min_date must be DATE, not NUMERIC
+    assert!(
+        ddl.contains("\"min_date\" DATE"),
+        "target column min_date must resolve to DATE, not NUMERIC: {}",
+        ddl
+    );
+    assert!(
+        !ddl.contains("\"min_date\" NUMERIC"),
+        "target column min_date must NOT be NUMERIC: {}",
+        ddl
+    );
+}
+
+#[test]
+fn test_target_table_qualified_max_text() {
+    let mut plan = sample_plan();
+    plan.group_by_columns = vec!["grp".to_string()];
+    plan.intermediate_columns = vec![IntermediateColumn {
+        name: "__max_e_code".to_string(),
+        pg_type: "NUMERIC".to_string(),
+        source_aggregate: "MAX".to_string(),
+        source_arg: "e.code".to_string(),
+        topk_k: None,
+    }];
+    plan.end_query_mappings = vec![EndQueryMapping {
+        intermediate_expr: "__max_e_code".to_string(),
+        output_alias: "max_code".to_string(),
+        aggregate_type: "MAX".to_string(),
+        cast_type: None,
+    }];
+
+    let mut types = sample_types();
+    types.insert("e.code".to_string(), "TEXT".to_string());
+    types.insert("grp".to_string(), "TEXT".to_string());
+
+    let ddl = build_target_table_ddl("test_view", &plan, &types, false);
+
+    // The target column max_code must be TEXT, not NUMERIC
+    assert!(
+        ddl.contains("\"max_code\" TEXT"),
+        "target column max_code must resolve to TEXT, not NUMERIC: {}",
+        ddl
+    );
+    assert!(
+        !ddl.contains("\"max_code\" NUMERIC"),
+        "target column max_code must NOT be NUMERIC: {}",
+        ddl
+    );
+}
+
+#[test]
+fn test_target_table_unqualified_max_still_works() {
+    // Regression test: unqualified MAX(ts) should still work
+    // (this always worked because stripping __max_ leaves "ts" which resolves)
+    let mut plan = sample_plan();
+    plan.group_by_columns = vec!["grp".to_string()];
+    plan.intermediate_columns = vec![IntermediateColumn {
+        name: "__max_ts".to_string(),
+        pg_type: "NUMERIC".to_string(),
+        source_aggregate: "MAX".to_string(),
+        source_arg: "ts".to_string(),
+        topk_k: None,
+    }];
+    plan.end_query_mappings = vec![EndQueryMapping {
+        intermediate_expr: "__max_ts".to_string(),
+        output_alias: "max_ts".to_string(),
+        aggregate_type: "MAX".to_string(),
+        cast_type: None,
+    }];
+
+    let mut types = sample_types();
+    types.insert("ts".to_string(), "TIMESTAMPTZ".to_string());
+    types.insert("grp".to_string(), "TEXT".to_string());
+
+    let ddl = build_target_table_ddl("test_view", &plan, &types, false);
+
+    // The target column max_ts must be TIMESTAMPTZ (backward compatible)
+    assert!(
+        ddl.contains("\"max_ts\" TIMESTAMPTZ"),
+        "target column max_ts (unqualified) must resolve to TIMESTAMPTZ: {}",
+        ddl
+    );
+}

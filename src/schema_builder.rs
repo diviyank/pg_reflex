@@ -201,11 +201,26 @@ pub fn build_target_table_ddl(
                 "SUM" | "AVG" | "DERIVED" => "NUMERIC".to_string(),
                 "COUNT" => "BIGINT".to_string(),
                 "MIN" | "MAX" => {
-                    let source_arg = mapping
-                        .intermediate_expr
-                        .trim_start_matches("__min_")
-                        .trim_start_matches("__max_");
-                    resolve_column_type(source_arg, column_types, "NUMERIC")
+                    // For MIN/MAX, find the matching IntermediateColumn from the plan
+                    // and resolve its source_arg (e.g., "e.ts") to get the correct type.
+                    // This handles qualified columns like MAX(e.ts) where intermediate_expr
+                    // is "__max_e_ts" and source_arg is "e.ts" → resolves to TIMESTAMPTZ
+                    // instead of falling back to NUMERIC.
+                    if let Some(ic) = plan
+                        .intermediate_columns
+                        .iter()
+                        .find(|ic| ic.name == mapping.intermediate_expr)
+                    {
+                        resolve_column_type(&ic.source_arg, column_types, "NUMERIC")
+                    } else {
+                        // Fallback: if no matching IntermediateColumn found, use the old
+                        // prefix-stripping logic (defensive, should rarely happen).
+                        let source_arg = mapping
+                            .intermediate_expr
+                            .trim_start_matches("__min_")
+                            .trim_start_matches("__max_");
+                        resolve_column_type(source_arg, column_types, "NUMERIC")
+                    }
                 }
                 "BOOL_OR" => "BOOLEAN".to_string(),
                 _ => "TEXT".to_string(),

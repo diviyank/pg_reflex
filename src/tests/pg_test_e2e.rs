@@ -1688,3 +1688,166 @@ fn test_combo_having_with_avg() {
     Spi::run("DELETE FROM cc_havg WHERE grp = 'b' AND val = 5").expect("delete");
     assert_imv_correct("cc_havg_v", sql);
 }
+
+/// Test for table-qualified MAX over timestamptz column (bug fix for type mismatch)
+#[pg_test]
+fn test_qualified_max_timestamptz() {
+    Spi::run("CREATE TABLE maxtz_src (id INT, grp TEXT, ts TIMESTAMPTZ)")
+        .expect("create table");
+    Spi::run(
+        "INSERT INTO maxtz_src (id, grp, ts) VALUES \
+         (1, 'group_a', '2025-01-01 10:00:00+00'), \
+         (2, 'group_a', '2025-01-02 15:30:00+00'), \
+         (3, 'group_b', '2025-01-03 08:00:00+00'), \
+         (4, 'group_b', '2025-01-04 12:00:00+00')"
+    )
+    .expect("insert rows");
+
+    // This should NOT fail with "is of type numeric but expression is of type timestamp with time zone"
+    // The intermediate and target columns for __max_e_ts must have the same type (TIMESTAMPTZ)
+    let result = crate::create_reflex_ivm(
+        "maxtz_imv",
+        "SELECT e.grp, MAX(e.ts) AS max_ts FROM maxtz_src e GROUP BY e.grp",
+        None,
+        None,
+        None,
+        None,
+    );
+    assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
+
+    // Verify correctness: max_ts for each group matches the true maximum
+    // Cast to text for comparison since pgrx doesn't have a direct TIMESTAMPTZ type
+    let max_a = Spi::get_one::<String>(
+        "SELECT max_ts::TEXT FROM maxtz_imv WHERE grp = 'group_a'",
+    )
+    .expect("query")
+    .expect("value");
+    assert!(max_a.contains("2025-01-02"), "max_a should contain 2025-01-02: {}", max_a);
+
+    let max_b = Spi::get_one::<String>(
+        "SELECT max_ts::TEXT FROM maxtz_imv WHERE grp = 'group_b'",
+    )
+    .expect("query")
+    .expect("value");
+    assert!(max_b.contains("2025-01-04"), "max_b should contain 2025-01-04: {}", max_b);
+
+    // Test maintenance: insert a newer timestamp and verify it updates
+    Spi::run(
+        "INSERT INTO maxtz_src (id, grp, ts) VALUES \
+         (5, 'group_a', '2025-01-05 20:00:00+00')"
+    )
+    .expect("insert newer");
+
+    let max_a_after = Spi::get_one::<String>(
+        "SELECT max_ts::TEXT FROM maxtz_imv WHERE grp = 'group_a'",
+    )
+    .expect("query")
+    .expect("value");
+    assert!(max_a_after.contains("2025-01-05"), "max_a_after should contain 2025-01-05: {}", max_a_after);
+}
+
+/// Test for table-qualified MIN over DATE column
+#[pg_test]
+fn test_qualified_min_date() {
+    Spi::run("CREATE TABLE mindate_src (id INT, grp TEXT, order_date DATE)")
+        .expect("create table");
+    Spi::run(
+        "INSERT INTO mindate_src (id, grp, order_date) VALUES \
+         (1, 'group_x', '2025-01-10'), \
+         (2, 'group_x', '2025-01-15'), \
+         (3, 'group_y', '2025-02-01'), \
+         (4, 'group_y', '2025-02-10')"
+    )
+    .expect("insert rows");
+
+    let result = crate::create_reflex_ivm(
+        "mindate_imv",
+        "SELECT e.grp, MIN(e.order_date) AS min_date FROM mindate_src e GROUP BY e.grp",
+        None,
+        None,
+        None,
+        None,
+    );
+    assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
+
+    let min_x = Spi::get_one::<String>(
+        "SELECT min_date::TEXT FROM mindate_imv WHERE grp = 'group_x'",
+    )
+    .expect("query")
+    .expect("value");
+    assert!(min_x.contains("2025-01-10"), "min_x should contain 2025-01-10: {}", min_x);
+
+    let min_y = Spi::get_one::<String>(
+        "SELECT min_date::TEXT FROM mindate_imv WHERE grp = 'group_y'",
+    )
+    .expect("query")
+    .expect("value");
+    assert!(min_y.contains("2025-02-01"), "min_y should contain 2025-02-01: {}", min_y);
+
+    // Test maintenance: insert an earlier date
+    Spi::run(
+        "INSERT INTO mindate_src (id, grp, order_date) VALUES \
+         (5, 'group_x', '2024-12-20')"
+    )
+    .expect("insert earlier");
+
+    let min_x_after = Spi::get_one::<String>(
+        "SELECT min_date::TEXT FROM mindate_imv WHERE grp = 'group_x'",
+    )
+    .expect("query")
+    .expect("value");
+    assert!(min_x_after.contains("2024-12-20"), "min_x_after should contain 2024-12-20: {}", min_x_after);
+}
+
+/// Test for table-qualified MAX over TEXT column
+#[pg_test]
+fn test_qualified_max_text() {
+    Spi::run("CREATE TABLE maxtext_src (id INT, grp TEXT, code TEXT)")
+        .expect("create table");
+    Spi::run(
+        "INSERT INTO maxtext_src (id, grp, code) VALUES \
+         (1, 'cat_a', 'AAA'), \
+         (2, 'cat_a', 'BBB'), \
+         (3, 'cat_b', 'XXX'), \
+         (4, 'cat_b', 'ZZZ')"
+    )
+    .expect("insert rows");
+
+    let result = crate::create_reflex_ivm(
+        "maxtext_imv",
+        "SELECT e.grp, MAX(e.code) AS max_code FROM maxtext_src e GROUP BY e.grp",
+        None,
+        None,
+        None,
+        None,
+    );
+    assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
+
+    let max_a = Spi::get_one::<String>(
+        "SELECT max_code::TEXT FROM maxtext_imv WHERE grp = 'cat_a'",
+    )
+    .expect("query")
+    .expect("value");
+    assert!(max_a.contains("BBB"), "max_a should contain BBB: {}", max_a);
+
+    let max_b = Spi::get_one::<String>(
+        "SELECT max_code::TEXT FROM maxtext_imv WHERE grp = 'cat_b'",
+    )
+    .expect("query")
+    .expect("value");
+    assert!(max_b.contains("ZZZ"), "max_b should contain ZZZ: {}", max_b);
+
+    // Test maintenance: insert a larger code
+    Spi::run(
+        "INSERT INTO maxtext_src (id, grp, code) VALUES \
+         (5, 'cat_a', 'CCC')"
+    )
+    .expect("insert larger");
+
+    let max_a_after = Spi::get_one::<String>(
+        "SELECT max_code::TEXT FROM maxtext_imv WHERE grp = 'cat_a'",
+    )
+    .expect("query")
+    .expect("value");
+    assert!(max_a_after.contains("CCC"), "max_a_after should contain CCC: {}", max_a_after);
+}
