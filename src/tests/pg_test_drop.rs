@@ -281,3 +281,40 @@ fn test_source_drop_passthrough() {
     ).expect("q").expect("v");
     assert_eq!(target_gone, 0, "passthrough target table should be dropped");
 }
+
+#[pg_test]
+fn test_drop_aggregate_over_union_all_subquery_source() {
+    Spi::run("CREATE TABLE drop_sq_t1 (k TEXT, v NUMERIC)").expect("create t1");
+    Spi::run("CREATE TABLE drop_sq_t2 (k TEXT, v NUMERIC)").expect("create t2");
+    Spi::run("INSERT INTO drop_sq_t1 VALUES ('a', 1), ('b', 2)").expect("seed t1");
+    Spi::run("INSERT INTO drop_sq_t2 VALUES ('a', 10), ('c', 3)").expect("seed t2");
+
+    // An inline FROM-subquery source registers a synthetic `<subquery:s>` source
+    // in `depends_on`. The drop path must skip it the way create does — otherwise
+    // it interpolates `<subquery:s>` into teardown DDL and fails to parse.
+    crate::create_reflex_ivm(
+        "drop_sq_view",
+        "SELECT k, SUM(v) AS total FROM ( \
+             SELECT k, v FROM drop_sq_t1 \
+             UNION ALL \
+             SELECT k, v FROM drop_sq_t2 \
+         ) AS s GROUP BY k",
+        Some("k"),
+        None,
+        None,
+        None,
+    );
+
+    let registered = Spi::get_one::<i64>(
+        "SELECT COUNT(*) FROM public.__reflex_ivm_reference WHERE name = 'drop_sq_view'",
+    ).expect("q").expect("v");
+    assert_eq!(registered, 1);
+
+    let result = crate::drop_reflex_ivm("drop_sq_view");
+    assert_eq!(result, "DROP REFLEX INCREMENTAL VIEW");
+
+    let gone = Spi::get_one::<i64>(
+        "SELECT COUNT(*) FROM public.__reflex_ivm_reference WHERE name = 'drop_sq_view'",
+    ).expect("q").expect("v");
+    assert_eq!(gone, 0);
+}

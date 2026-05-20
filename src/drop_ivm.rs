@@ -65,6 +65,14 @@ pub(crate) fn drop_reflex_ivm_impl(view_name: &str, cascade: bool) -> &'static s
         //    For now, just collect sources that need trigger cleanup.
         let mut sources_to_cleanup: Vec<(String, String)> = Vec::new(); // (source, safe_source)
         for source in &depends_on {
+            // Synthetic `<subquery:...>`/`<function:...>` placeholders own no
+            // relation of their own — triggers live on the real underlying tables,
+            // which appear as separate real sources. Skip them, mirroring the guard
+            // in create's install_source_triggers; interpolating the placeholder into
+            // teardown DDL would emit an unparsable identifier.
+            if source.starts_with('<') {
+                continue;
+            }
             let safe_source = source.replace('.', "_");
             let other_count = client
                 .select(
@@ -194,6 +202,9 @@ pub(crate) fn drop_reflex_ivm_impl(view_name: &str, cascade: bool) -> &'static s
         // 6d. Drop passthrough scratch tables (one new-side + one old-side per source).
         //     DROP ... IF EXISTS is harmless when the IMV is an aggregate.
         for source in &depends_on {
+            if source.starts_with('<') {
+                continue;
+            }
             for tbl in [
                 passthrough_scratch_new_table_name(view_name, source),
                 passthrough_scratch_old_table_name(view_name, source),
