@@ -1,0 +1,55 @@
+-- Migration: pg_reflex 1.6.2 → 1.6.3
+--
+-- Run via: ALTER EXTENSION pg_reflex UPDATE TO '1.6.3';
+--
+-- 1.6.3 is a correctness release for CTE / window-function decomposition and
+-- MIN/MAX type resolution. There are NO catalog schema changes, NO trigger
+-- body changes, and NO function signature changes — every change is in the
+-- Rust decomposition / type-resolution / DDL codegen, which is recompiled
+-- into the module. Existing IMVs continue to operate without intervention.
+--
+-- Notable changes (all in-process, no migration DDL):
+--
+--   (a) CTE decomposition now runs BEFORE window / DISTINCT ON decomposition.
+--       A window function in the TOP-LEVEL SELECT over CTEs previously
+--       dropped the sibling CTEs from the generated base query and failed
+--       with `relation "<sibling_cte>" does not exist`; it now works.
+--
+--   (b) Window decomposition is gated on a TOP-LEVEL-SELECT window. A window
+--       function nested in a subquery / derived table (with no top-level
+--       window to split off) previously re-fed an identical base query into
+--       the pipeline and recursed until the backend crashed (SIGSEGV); it is
+--       now rejected up front with a clear error.
+--
+--   (c) A window function or DISTINCT ON inside a CTE that an outer query
+--       references is rejected with an actionable error. Such a CTE
+--       decomposes to a read-time VIEW, and a parent IMV cannot install
+--       row-level triggers on a VIEW — so the shape cannot be incrementally
+--       maintained. The error directs the operator to move the window /
+--       DISTINCT ON to the outermost SELECT, or define the view with
+--       `kind: mv`. Previously this surfaced as a cryptic
+--       `"… is a view — Triggers on views cannot have transition tables"`.
+--
+--   (d) Partitioning propagates to CTE sub-IMVs. When a partitioned IMV is
+--       built from a CTE query, each CTE sub-IMV inherits the parent's
+--       partition_by columns that appear in that CTE's output projection.
+--
+--   (e) MIN/MAX over a non-numeric column with a TABLE-QUALIFIED argument
+--       (e.g. `MAX(t.ts)` where `ts` is timestamptz / date / text) no longer
+--       fails at creation with `column "…" is of type numeric but expression
+--       is of type timestamp with time zone`. The target-table column type is
+--       now derived from the aggregate's source column (matching the
+--       intermediate column) instead of defaulting to NUMERIC.
+--
+-- Migration steps:
+--
+--   No DDL is required. This file exists purely to register the
+--   1.6.2 → 1.6.3 upgrade path with PostgreSQL's extension machinery.
+--
+--   Views that were kept as `kind: mv` because they nest a window /
+--   DISTINCT ON inside a CTE referenced by an outer query stay `kind: mv` —
+--   that shape is still not an IMV, but it now fails fast with guidance
+--   rather than crashing or erroring obscurely.
+
+-- No-op marker: ALTER EXTENSION needs a non-empty migration file.
+SELECT 1 WHERE FALSE;

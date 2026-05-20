@@ -4,6 +4,24 @@ The full changelog tracks every release. The latest version's headlines are on t
 
 For each version below, see [`CHANGELOG.md`](https://github.com/diviyank/pg_reflex/blob/main/CHANGELOG.md) on GitHub for the canonical text.
 
+## [1.6.3] — 2026-05-20
+
+Correctness release for CTE / window-function decomposition and MIN/MAX type resolution.  No catalog schema, trigger body, or API changes — existing IMVs operate without intervention.  Run `ALTER EXTENSION pg_reflex UPDATE TO '1.6.3';` (no-op migration marker).
+
+**Fixed**
+
+- **Window function over CTEs dropped sibling CTEs or crashed the backend.**  A window in the **top-level SELECT** over CTEs (`WITH a AS (…), b AS (…) SELECT a.x, b.y, ROW_NUMBER() OVER (…) FROM a JOIN b …`) built a `__base` sub-IMV that omitted the `WITH` list and failed with `relation "<sibling_cte>" does not exist`; a window nested in a derived-table subquery (`… FROM (SELECT …, ROW_NUMBER() OVER (…) AS rn FROM t) s WHERE s.rn = 1`, including inside a CTE) re-fed an identical base query and recursed until the backend **crashed (SIGSEGV)**.  CTE decomposition now runs **before** window / DISTINCT-ON decomposition (sibling CTEs preserved; top-level-window-over-CTEs works), and window decomposition is gated on an actual top-level-SELECT window (a window only in a subquery / derived table is rejected cleanly).
+- **`MAX` / `MIN` over a table-qualified non-numeric column failed at creation** with `column "…" is of type numeric but expression is of type timestamp with time zone` (also `date` / `text`).  The target column type was resolved by stripping the `__max_`/`__min_` prefix off the sanitized name (`__max_e_ts` → `e_ts`) and defaulted to `NUMERIC`, diverging from the intermediate column.  It is now derived from the aggregate's source column, matching the intermediate.  Bare args (`MAX(ts)`) were unaffected.
+
+**Changed**
+
+- **Window functions / `DISTINCT ON` inside a CTE referenced by an outer query are now rejected up front** with an actionable error (move the window / `DISTINCT ON` to the outermost SELECT, or use `kind: mv`) instead of failing obscurely or crashing.  Such a CTE decomposes to a read-time VIEW, and a parent IMV cannot install transition-table triggers on a VIEW.
+- **Partitioning propagates to CTE sub-IMVs.**  When a partitioned IMV is built from a `WITH … SELECT …` query, each CTE sub-IMV inherits the parent's `partition_by` columns that appear in that CTE's output.
+
+**Migration**
+
+- `ALTER EXTENSION pg_reflex UPDATE TO '1.6.3';` runs [`sql/pg_reflex--1.6.2--1.6.3.sql`](https://github.com/diviyank/pg_reflex/blob/main/sql/pg_reflex--1.6.2--1.6.3.sql), a no-op marker — all changes are in the recompiled module.  Views kept as `kind: mv` because they nest a window / `DISTINCT ON` inside a referenced CTE stay `kind: mv`.
+
 ## [1.6.2] — 2026-05-19
 
 Patch release fixing a catastrophic deferred-trigger failure on sources whose `__reflex_delta_<src>` staging table outlived a source DDL change (IMV drop+recreate, source DROP/CREATE — unavoidable on PG ≤ 17 when adding partitioning to an existing table).  Run `ALTER EXTENSION pg_reflex UPDATE TO '1.6.2';`.

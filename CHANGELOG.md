@@ -1,5 +1,71 @@
 # Changelog
 
+## [1.6.3] - 2026-05-20
+
+Correctness release for CTE / window-function decomposition and MIN/MAX type
+resolution.  No catalog schema changes, no trigger body changes, no API
+changes — existing IMVs operate without intervention.  Run `ALTER EXTENSION
+pg_reflex UPDATE TO '1.6.3';` to register the new version; the migration file
+is a no-op marker.
+
+---
+
+### Fixed
+
+- **Window function over CTEs dropped sibling CTEs / crashed the backend.**
+  A query with a window function and `WITH` CTEs hit the window-decomposition
+  path on the query-wide "has a window anywhere" flag.  Two failure modes:
+  - A window in the **top-level SELECT** over CTEs (e.g. `WITH a AS (…),
+    b AS (…) SELECT a.x, b.y, ROW_NUMBER() OVER (…) FROM a JOIN b …`) built a
+    `__base` sub-IMV that omitted the `WITH` list, so it referenced a CTE that
+    no longer existed and failed with `relation "<sibling_cte>" does not exist`.
+  - A window nested in a derived-table subquery (e.g. the classic
+    `… FROM (SELECT …, ROW_NUMBER() OVER (…) AS rn FROM t) s WHERE s.rn = 1`,
+    including when wrapped in a CTE) had no top-level window to split off, so
+    decomposition re-fed an identical base query into the pipeline and recursed
+    until the backend **crashed (SIGSEGV)**.
+  - Fixes: CTE decomposition now runs **before** distinct-on / window
+    decomposition (so sibling CTEs are preserved and the top-level-window-over-
+    CTEs case works); and window decomposition is gated on an actual
+    **top-level-SELECT** window — a window that exists only in a subquery /
+    derived table now returns a clean error instead of recursing.
+- **`MAX` / `MIN` over a table-qualified non-numeric column failed at
+  creation** with `column "…" is of type numeric but expression is of type
+  timestamp with time zone` (also for `date` / `text`).  The intermediate
+  column resolved its type correctly from the aggregate's `source_arg`
+  (`e.ts` → `timestamptz`), but the **target** table column type was resolved
+  by stripping the `__max_`/`__min_` prefix off the *sanitized* column name
+  (`__max_e_ts` → `e_ts`, no qualifier), which could not be resolved and
+  defaulted to `NUMERIC` — so the two tables disagreed.  The target column
+  type is now derived from the matching intermediate column's source argument,
+  guaranteeing it equals the intermediate column type.  Bare args
+  (`MAX(ts)`) were unaffected; only qualified args (`MAX(e.ts)`) over a
+  non-numeric column triggered the mismatch.
+
+### Changed
+
+- **Window functions / `DISTINCT ON` inside a CTE referenced by an outer query
+  are now rejected up front** with an actionable error instead of failing
+  obscurely or crashing.  Such a CTE decomposes into a read-time VIEW (windows
+  and `DISTINCT ON` cannot be incrementally maintained), and a parent IMV
+  cannot install row-level triggers with transition tables on a VIEW.  The
+  error directs the operator to move the window / `DISTINCT ON` to the
+  outermost SELECT, or define the view with `kind: mv`.
+- **Partitioning propagates to CTE sub-IMVs.**  When a partitioned IMV is built
+  from a `WITH … SELECT …` query, each CTE sub-IMV now inherits the parent's
+  `partition_by` columns that appear in that CTE's output projection.  The
+  parent view remains partitioned as before.
+
+### Migration
+
+- `ALTER EXTENSION pg_reflex UPDATE TO '1.6.3';` runs
+  [`sql/pg_reflex--1.6.2--1.6.3.sql`](https://github.com/diviyank/pg_reflex/blob/main/sql/pg_reflex--1.6.2--1.6.3.sql),
+  a **no-op marker** — all changes are in the recompiled module
+  (decomposition / type-resolution / DDL codegen), with no catalog, trigger,
+  or API changes.  Views previously kept as `kind: mv` because they nest a
+  window / `DISTINCT ON` inside a CTE referenced by an outer query stay
+  `kind: mv`; that shape is still not an IMV, but now fails fast with guidance.
+
 ## [1.6.2] - 2026-05-19
 
 Patch release fixing a catastrophic deferred-trigger failure on sources

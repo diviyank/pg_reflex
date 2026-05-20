@@ -24,6 +24,20 @@ The journal entry [`2026-04-22_unsupported_views.md`](https://github.com/diviyan
 
 **Status**: rejected. The `DISTINCT ON ... ORDER BY` shape *is* supported (see §2 below) because the ORDER BY scopes a per-group selection rather than a global row order.
 
+### Window functions nested in a subquery or derived table
+
+```sql
+SELECT * FROM (
+    SELECT id, amount,
+           ROW_NUMBER() OVER (ORDER BY amount DESC) AS rn
+    FROM orders
+) s WHERE s.rn = 1;
+```
+
+Window functions cannot be decomposed when nested inside a subquery, derived table, or CTE body. The supported pattern is to apply the window in the outermost SELECT.
+
+**Status**: rejected at create time. Workaround: rewrite with the window function in the top-level SELECT, or use `kind: mv` with manual `REFRESH`.
+
 ### `LATERAL` joins
 
 `LATERAL` lets the right side of a join reference the left side row-by-row. Delta semantics across LATERAL would require re-evaluating the right-hand-side per left delta row — algebraically tractable for some shapes, but the engine doesn't have the rewrite logic.
@@ -47,6 +61,21 @@ Non-deterministic — the same query against the same relation returns different
 `PERCENTILE_DISC`, `MODE`, etc. require the entire group's sorted distribution — not algebraically maintainable without storing intermediate sorted state per group.
 
 **Status**: rejected.
+
+### Window functions or `DISTINCT ON` inside a referenced CTE
+
+```sql
+WITH ranked_data AS (
+    SELECT id, amount,
+           ROW_NUMBER() OVER (ORDER BY amount DESC) AS rn
+    FROM orders
+)
+SELECT id, amount FROM ranked_data WHERE rn = 1;
+```
+
+A CTE with a window function or `DISTINCT ON` materializes as a read-time VIEW. An IMV cannot install row-level triggers on a VIEW, so the outer query cannot be incrementally maintained.
+
+**Status**: rejected at create time. Workaround: move the window function or `DISTINCT ON` to the outermost `SELECT`, or define the CTE as a plain `MATERIALIZED VIEW` instead.
 
 ### `ARRAY_AGG` / `JSON_AGG` / `STRING_AGG`
 
