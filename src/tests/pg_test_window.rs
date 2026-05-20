@@ -690,6 +690,11 @@ fn test_cte_with_window_in_subquery_rejects_cleanly() {
         "CTE with window-in-subquery should reject, got: {}",
         result
     );
+    assert!(
+        result.contains("top-level SELECT") || result.contains("top-level") || result.contains("subquery") || result.contains("derived table"),
+        "Error message should mention top-level SELECT, subquery, or derived table, got: {}",
+        result
+    );
 }
 
 /// Test 3: Regression guard — top-level window still works
