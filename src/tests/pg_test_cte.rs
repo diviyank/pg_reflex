@@ -379,3 +379,157 @@ fn test_cte_sibling_with_window_main_query() {
     .expect("v");
     assert_eq!(rnk_250, 1i64, "Val 250 should have rank 1 (highest)");
 }
+
+#[pg_test]
+fn test_cte_window_in_cte_referenced_by_parent() {
+    // Test Task 5: Window function inside a CTE that is referenced by an outer query
+    // should be rejected with a clear error message before any sub-IMV is created.
+    // This prevents orphan tables/views and avoids the cryptic PostgreSQL error:
+    // "ERROR: "<view>__cte_<alias>" is a view — Triggers on views cannot have transition tables."
+
+    Spi::run(
+        "CREATE TABLE tcte_win_events (id SERIAL, grp TEXT, ts TIMESTAMP, val INT)",
+    )
+    .expect("create events table");
+    Spi::run(
+        "INSERT INTO tcte_win_events (grp, ts, val) VALUES \
+         ('A', '2024-01-01', 10), ('A', '2024-01-02', 20), ('B', '2024-01-01', 30)",
+    )
+    .expect("seed events");
+
+    Spi::run(
+        "CREATE TABLE tcte_win_items (id SERIAL, grp TEXT, val INT)",
+    )
+    .expect("create items table");
+    Spi::run(
+        "INSERT INTO tcte_win_items (grp, val) VALUES ('A', 100), ('B', 200)",
+    )
+    .expect("seed items");
+
+    let result = crate::create_reflex_ivm(
+        "tcte_win_rejected",
+        "WITH ranked AS (
+            SELECT grp, val, ROW_NUMBER() OVER (PARTITION BY grp ORDER BY val DESC) AS rn
+            FROM tcte_win_items
+        )
+        SELECT e.grp, e.val, r.rn
+        FROM tcte_win_events e
+        LEFT JOIN ranked r ON r.grp = e.grp",
+        None,
+        None,
+        None,
+        None,
+    );
+
+    assert!(
+        result.starts_with("ERROR"),
+        "Window function in CTE referenced by outer query should be rejected, got: {}",
+        result
+    );
+    assert!(
+        result.contains("window") || result.contains("kind: mv"),
+        "Error should mention window function or kind: mv suggestion, got: {}",
+        result
+    );
+}
+
+#[pg_test]
+fn test_cte_distinct_on_in_cte_referenced_by_parent() {
+    // Test Task 5: DISTINCT ON inside a CTE that is referenced by an outer query
+    // should be rejected with a clear error message before any sub-IMV is created.
+    // Note: DISTINCT ON without ORDER BY is simpler and avoids the ORDER BY rejection
+    // that happens during base query decomposition.
+
+    Spi::run(
+        "CREATE TABLE tcte_don_events (id SERIAL, grp TEXT, val INT)",
+    )
+    .expect("create events table");
+    Spi::run(
+        "INSERT INTO tcte_don_events (grp, val) VALUES ('A', 20), ('A', 10), ('B', 30)",
+    )
+    .expect("seed events");
+
+    Spi::run(
+        "CREATE TABLE tcte_don_items (id SERIAL, grp TEXT, val INT)",
+    )
+    .expect("create items table");
+    Spi::run(
+        "INSERT INTO tcte_don_items (grp, val) VALUES ('A', 100), ('A', 50), ('B', 200)",
+    )
+    .expect("seed items");
+
+    let result = crate::create_reflex_ivm(
+        "tcte_don_rejected",
+        "WITH latest AS (
+            SELECT DISTINCT ON (grp) grp, val FROM tcte_don_items
+        )
+        SELECT e.grp, e.val, l.val AS latest_val
+        FROM tcte_don_events e
+        LEFT JOIN latest l ON l.grp = e.grp",
+        None,
+        None,
+        None,
+        None,
+    );
+
+    assert!(
+        result.starts_with("ERROR"),
+        "DISTINCT ON in CTE referenced by outer query should be rejected, got: {}",
+        result
+    );
+    assert!(
+        result.contains("DISTINCT ON") || result.contains("kind: mv"),
+        "Error should mention DISTINCT ON or kind: mv suggestion, got: {}",
+        result
+    );
+}
+
+#[pg_test]
+fn test_cte_without_window_or_distinct_on_still_works() {
+    // Regression guard: ensure the pre-scan does not over-reject normal CTEs.
+    // A plain CTE with no window/DISTINCT-ON should still work correctly.
+
+    Spi::run(
+        "CREATE TABLE tcte_normal_src (id SERIAL, grp TEXT NOT NULL, val INT NOT NULL)",
+    )
+    .expect("create table");
+    Spi::run(
+        "INSERT INTO tcte_normal_src (grp, val) VALUES ('A', 10), ('A', 20), ('B', 30)",
+    )
+    .expect("seed");
+
+    let result = crate::create_reflex_ivm(
+        "tcte_normal_ok",
+        "WITH agg AS (
+            SELECT grp, SUM(val) AS total FROM tcte_normal_src GROUP BY grp
+        )
+        SELECT grp, total FROM agg",
+        Some("grp"),
+        None,
+        None,
+        None,
+    );
+
+    assert_eq!(
+        result,
+        "CREATE REFLEX INCREMENTAL VIEW",
+        "Normal CTE without window/DISTINCT-ON should still succeed: {}",
+        result
+    );
+
+    // Verify row count
+    let count = Spi::get_one::<i64>(
+        "SELECT COUNT(*) FROM tcte_normal_ok",
+    )
+    .expect("q")
+    .expect("v");
+    assert_eq!(count, 2, "Should have 2 groups: A and B");
+
+    // Verify data is correct
+    let total_a = Spi::get_one::<i64>(
+        "SELECT total FROM tcte_normal_ok WHERE grp = 'A'",
+    )
+    .expect("q")
+    .expect("v");
+    assert_eq!(total_a, 30, "A: 10 + 20 = 30");
+}

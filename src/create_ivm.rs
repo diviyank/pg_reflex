@@ -569,6 +569,53 @@ fn try_decompose_ctes(
     if analysis.ctes.is_empty() {
         return None;
     }
+
+    // PRE-SCAN: Check if any CTE has a window function or DISTINCT ON at the top level.
+    // These CTEs would be decomposed into a sub-IMV + VIEW, and a VIEW cannot have
+    // row-level triggers with transition tables. Reject early before creating any
+    // orphan objects.
+    for cte in &analysis.ctes {
+        // Parse and analyze the CTE's query to check for top-level window/DISTINCT-ON
+        let dialect = PostgreSqlDialect {};
+        match Parser::parse_sql(&dialect, &cte.query_sql) {
+            Ok(parsed_cte_stmts) => {
+                match analyze(&parsed_cte_stmts) {
+                    Ok(cte_analysis) => {
+                        // Check for top-level window function
+                        let has_top_level_window =
+                            cte_analysis.select_columns.iter().any(|c| c.is_window);
+                        if has_top_level_window {
+                            return Some(
+                                "ERROR: A CTE uses a window function at the top level and is \
+referenced by an outer query. A window-function result is a read-time view that cannot be \
+incrementally maintained as a join source. Move the window function to the outermost \
+SELECT, or define this view with kind: mv.",
+                            );
+                        }
+
+                        // Check for DISTINCT ON
+                        if cte_analysis.has_distinct_on {
+                            return Some(
+                                "ERROR: A CTE uses DISTINCT ON at the top level and is referenced \
+by an outer query. A DISTINCT-ON result is a read-time view that cannot be incrementally \
+maintained as a join source. Move DISTINCT ON to the outermost SELECT, or define this view \
+with kind: mv.",
+                            );
+                        }
+                    }
+                    Err(_) => {
+                        // If analysis fails, skip the pre-scan for this CTE and let
+                        // the normal creation path surface the error.
+                    }
+                }
+            }
+            Err(_) => {
+                // If parsing fails, skip the pre-scan and let the normal creation path
+                // surface the error.
+            }
+        }
+    }
+
     let mut cte_name_map: Vec<(String, String)> = Vec::new();
 
     for cte in &analysis.ctes {
