@@ -468,7 +468,23 @@ fn try_decompose_window(
     partition_by: &[String],
     parsed: &ParsedInputs,
 ) -> Option<&'static str> {
-    if !parsed.analysis.has_window_function {
+    // Check if the top-level SELECT contains a window function.
+    // select_columns are the MAIN query's top-level projection columns.
+    // is_window is true iff the column is a top-level ... OVER (...) expression.
+    let has_top_level_window = parsed.analysis.select_columns.iter().any(|c| c.is_window);
+
+    if !has_top_level_window {
+        // If there's no top-level window, but has_window_function is true, then
+        // a window exists somewhere deeper (subquery or derived table).
+        // CTEs and set-ops were already decomposed earlier in the pipeline,
+        // so any remaining window in a subquery cannot be incrementally maintained.
+        if parsed.analysis.has_window_function {
+            return Some(
+                "ERROR: Window functions are only supported in the top-level SELECT. \
+A window function inside a subquery or derived table cannot be incrementally \
+maintained — move it to the outermost SELECT, or define this view with kind: mv.",
+            );
+        }
         return None;
     }
     let decomp = window::decompose_window_query(&parsed.analysis);

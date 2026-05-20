@@ -626,3 +626,99 @@ fn test_window_truncate_and_reinsert() {
         2
     );
 }
+
+/// Test 1: Window-in-subquery rejection (crash regression guard)
+/// A window function buried in a derived-table subquery with a WHERE filter.
+/// This USED to segfault due to infinite recursion; should now reject cleanly with ERROR.
+#[pg_test]
+fn test_window_in_subquery_rejects_cleanly() {
+    Spi::run("CREATE TABLE ws_src (id SERIAL, grp TEXT, ts INT, val INT)").expect("create table");
+    Spi::run("INSERT INTO ws_src (grp, ts, val) VALUES \
+        ('A', 1, 10), ('A', 2, 20), ('B', 1, 30), ('B', 2, 40)").expect("seed");
+
+    let result = crate::create_reflex_ivm(
+        "ws_view",
+        "SELECT grp, val FROM (SELECT grp, val, ROW_NUMBER() OVER (PARTITION BY grp ORDER BY ts DESC) AS rn FROM ws_src) s WHERE s.rn = 1",
+        None,
+        None,
+        None,
+        None,
+    );
+
+    assert!(
+        result.starts_with("ERROR"),
+        "Window-in-subquery should reject with ERROR, got: {}",
+        result
+    );
+    assert!(
+        result.contains("top-level SELECT") || result.contains("top-level") || result.contains("subquery"),
+        "Error message should mention top-level SELECT or subquery, got: {}",
+        result
+    );
+}
+
+/// Test 2: CTE with window-in-subquery rejection (crash regression guard)
+/// A CTE that contains a window function in a subquery.
+/// After CTE decomposition recurses into the CTE, it should reject the windowed-subquery
+/// CTE with ERROR (not crash).
+#[pg_test]
+fn test_cte_with_window_in_subquery_rejects_cleanly() {
+    Spi::run("CREATE TABLE cws_src (id SERIAL, grp TEXT, ts INT, val NUMERIC)").expect("create table");
+    Spi::run("INSERT INTO cws_src (grp, ts, val) VALUES \
+        ('A', 1, 100), ('A', 2, 200), ('B', 1, 50), ('B', 2, 75)").expect("seed");
+
+    let result = crate::create_reflex_ivm(
+        "cws_view",
+        "WITH windowed_cte AS (
+            SELECT grp, val FROM (
+                SELECT grp, val, ROW_NUMBER() OVER (PARTITION BY grp ORDER BY ts DESC) AS rn
+                FROM cws_src
+            ) s WHERE s.rn = 1
+        ),
+        plain_cte AS (
+            SELECT grp, SUM(val) AS total FROM cws_src GROUP BY grp
+        )
+        SELECT w.grp, w.val, p.total FROM windowed_cte w JOIN plain_cte p ON w.grp = p.grp",
+        None,
+        None,
+        None,
+        None,
+    );
+
+    assert!(
+        result.starts_with("ERROR"),
+        "CTE with window-in-subquery should reject, got: {}",
+        result
+    );
+}
+
+/// Test 3: Regression guard — top-level window still works
+/// This ensures the fix doesn't break the normal, supported case of top-level window functions.
+#[pg_test]
+fn test_window_top_level_still_works() {
+    Spi::run("CREATE TABLE wts_src (id SERIAL, name TEXT, score INT)").expect("create table");
+    Spi::run("INSERT INTO wts_src (name, score) VALUES \
+        ('Alice', 90), ('Bob', 80), ('Charlie', 70)").expect("seed");
+
+    let result = crate::create_reflex_ivm(
+        "wts_view",
+        "SELECT name, score, ROW_NUMBER() OVER (ORDER BY score DESC) AS rnk FROM wts_src",
+        None,
+        None,
+        None,
+        None,
+    );
+
+    assert_eq!(
+        result,
+        "CREATE REFLEX INCREMENTAL VIEW",
+        "Top-level window should succeed after the fix, got: {}",
+        result
+    );
+
+    // Verify the view works correctly
+    let alice_rank = Spi::get_one::<i64>(
+        "SELECT rnk FROM wts_view WHERE name = 'Alice'",
+    ).expect("q").expect("v");
+    assert_eq!(alice_rank, 1);
+}
