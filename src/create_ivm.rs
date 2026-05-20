@@ -158,77 +158,6 @@ fn validate_and_parse_inputs(
 }
 
 /// Extract the output column names from a CTE's query.
-/// Returns `None` if the query contains a wildcard projection (* or table.*),
-/// in which case we cannot determine the exact output columns.
-fn extract_cte_output_columns(cte_query_sql: &str) -> Option<Vec<String>> {
-    let dialect = PostgreSqlDialect {};
-    let parsed = match Parser::parse_sql(&dialect, cte_query_sql) {
-        Ok(stmts) => stmts,
-        Err(_) => return None,
-    };
-
-    // Extract the SELECT statement
-    let query = match parsed.first() {
-        Some(sqlparser::ast::Statement::Query(q)) => q,
-        _ => return None,
-    };
-
-    // Get the SELECT body (the main SELECT, not UNION/INTERSECT/etc.)
-    let select = match query.body.as_ref() {
-        sqlparser::ast::SetExpr::Select(s) => s,
-        _ => return None, // Only support simple SELECT, not compound queries
-    };
-
-    // Extract column names from the projection list
-    let mut output_names = Vec::new();
-    for projection in &select.projection {
-        match projection {
-            sqlparser::ast::SelectItem::Wildcard(_)
-            | sqlparser::ast::SelectItem::QualifiedWildcard(_, _) => {
-                // Wildcard projection — cannot determine output columns
-                return None;
-            }
-            sqlparser::ast::SelectItem::ExprWithAlias { alias, .. } => {
-                // Aliased column — use the alias
-                output_names.push(alias.value.to_lowercase());
-            }
-            sqlparser::ast::SelectItem::UnnamedExpr(expr) => {
-                // Unaliased expression — extract column name from the expression
-                let col_name = extract_column_name_from_expr(expr);
-                output_names.push(col_name);
-            }
-        }
-    }
-
-    if output_names.is_empty() {
-        return None;
-    }
-
-    Some(output_names)
-}
-
-/// Helper: extract a simple column name from an expression (handles qualified and unqualified names)
-fn extract_column_name_from_expr(expr: &sqlparser::ast::Expr) -> String {
-    match expr {
-        sqlparser::ast::Expr::Identifier(ident) => {
-            // Simple column reference like "total" or "region"
-            ident.value.to_lowercase()
-        }
-        sqlparser::ast::Expr::CompoundIdentifier(idents) => {
-            // Qualified column reference like "t.column"
-            if let Some(last) = idents.last() {
-                last.value.to_lowercase()
-            } else {
-                "unknown".to_string()
-            }
-        }
-        _ => {
-            // For other expressions (function calls, arithmetic, etc.), use a generic name
-            "expr".to_string()
-        }
-    }
-}
-
 /// Compute the subset of partition_by columns that appear in the CTE's output.
 /// Case-insensitive comparison per PostgreSQL identifier folding.
 fn compute_cte_partition_subset(
@@ -667,12 +596,16 @@ fn try_decompose_ctes(
         return None;
     }
 
-    // PRE-SCAN: Check if any CTE has a window function or DISTINCT ON at the top level.
-    // These CTEs would be decomposed into a sub-IMV + VIEW, and a VIEW cannot have
-    // row-level triggers with transition tables. Reject early before creating any
-    // orphan objects.
+    // PRE-SCAN: Parse and analyze each CTE exactly once.
+    // (1) Check for top-level window function or DISTINCT ON, rejecting early before
+    //     creating any orphan objects.
+    // (2) Extract output column names for partition propagation in the creation loop.
+    //
+    // For each CTE, store `None` if it has wildcard projection (cannot determine columns),
+    // or `Some(Vec<String>)` if output columns are known. Store separately for quick lookup.
+    let mut cte_output_columns: Vec<Option<Vec<String>>> = Vec::new();
+
     for cte in &analysis.ctes {
-        // Parse and analyze the CTE's query to check for top-level window/DISTINCT-ON
         let dialect = PostgreSqlDialect {};
         match Parser::parse_sql(&dialect, &cte.query_sql) {
             Ok(parsed_cte_stmts) => {
@@ -699,23 +632,54 @@ maintained as a join source. Move DISTINCT ON to the outermost SELECT, or define
 with kind: mv.",
                             );
                         }
+
+                        // Extract output column names from the CTE's analysis.
+                        // If the CTE has a wildcard projection (*, table.*), we cannot
+                        // determine output columns, so record None.
+                        let mut has_wildcard = false;
+                        let mut output_cols = Vec::new();
+
+                        for select_col in &cte_analysis.select_columns {
+                            // Check if this is a wildcard projection
+                            if select_col.expr_sql == "*" || select_col.expr_sql.ends_with(".*") {
+                                has_wildcard = true;
+                                break;
+                            }
+
+                            // Determine the output column name
+                            let col_name = if let Some(alias) = &select_col.alias {
+                                alias.to_lowercase()
+                            } else {
+                                bare_column_name(&select_col.expr_sql).to_lowercase()
+                            };
+                            output_cols.push(col_name);
+                        }
+
+                        let output = if has_wildcard || output_cols.is_empty() {
+                            None
+                        } else {
+                            Some(output_cols)
+                        };
+                        cte_output_columns.push(output);
                     }
                     Err(_) => {
-                        // If analysis fails, skip the pre-scan for this CTE and let
-                        // the normal creation path surface the error.
+                        // If analysis fails, treat output columns as unknown.
+                        // This skips partition propagation (safe behavior).
+                        cte_output_columns.push(None);
                     }
                 }
             }
             Err(_) => {
-                // If parsing fails, skip the pre-scan and let the normal creation path
-                // surface the error.
+                // If parsing fails, treat output columns as unknown.
+                // The normal creation path will surface the error.
+                cte_output_columns.push(None);
             }
         }
     }
 
     let mut cte_name_map: Vec<(String, String)> = Vec::new();
 
-    for cte in &analysis.ctes {
+    for (cte_idx, cte) in analysis.ctes.iter().enumerate() {
         let alias_lower = cte.alias.to_lowercase();
         if alias_lower.starts_with("__reflex_new_")
             || alias_lower.starts_with("__reflex_old_")
@@ -733,14 +697,10 @@ with kind: mv.",
             cte_query = replace_identifier(&cte_query, earlier_alias, &quoted);
         }
 
-        // Extract CTE output columns and compute partition subset to propagate.
-        // If the CTE contains a wildcard projection, we cannot determine which
-        // columns are available, so we skip partition propagation (pass &[]).
-        // Otherwise, we pass only the subset of parent's partition_by columns
-        // that appear in this CTE's output.
-        let cte_partition_by = if let Some(cte_output_cols) = extract_cte_output_columns(&cte_query)
-        {
-            compute_cte_partition_subset(partition_by, &cte_output_cols)
+        // Compute partition subset using the pre-computed output columns.
+        // If output columns are unknown, pass &[] to skip partition propagation.
+        let cte_partition_by = if let Some(cte_output_cols) = &cte_output_columns[cte_idx] {
+            compute_cte_partition_subset(partition_by, cte_output_cols)
         } else {
             // Wildcard projection or analysis failed — cannot propagate partitioning
             Vec::new()
