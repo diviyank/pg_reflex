@@ -157,6 +157,103 @@ fn validate_and_parse_inputs(
     })
 }
 
+/// Extract the output column names from a CTE's query.
+/// Returns `None` if the query contains a wildcard projection (* or table.*),
+/// in which case we cannot determine the exact output columns.
+fn extract_cte_output_columns(cte_query_sql: &str) -> Option<Vec<String>> {
+    let dialect = PostgreSqlDialect {};
+    let parsed = match Parser::parse_sql(&dialect, cte_query_sql) {
+        Ok(stmts) => stmts,
+        Err(_) => return None,
+    };
+
+    // Extract the SELECT statement
+    let query = match parsed.first() {
+        Some(sqlparser::ast::Statement::Query(q)) => q,
+        _ => return None,
+    };
+
+    // Get the SELECT body (the main SELECT, not UNION/INTERSECT/etc.)
+    let select = match query.body.as_ref() {
+        sqlparser::ast::SetExpr::Select(s) => s,
+        _ => return None, // Only support simple SELECT, not compound queries
+    };
+
+    // Extract column names from the projection list
+    let mut output_names = Vec::new();
+    for projection in &select.projection {
+        match projection {
+            sqlparser::ast::SelectItem::Wildcard(_)
+            | sqlparser::ast::SelectItem::QualifiedWildcard(_, _) => {
+                // Wildcard projection — cannot determine output columns
+                return None;
+            }
+            sqlparser::ast::SelectItem::ExprWithAlias { alias, .. } => {
+                // Aliased column — use the alias
+                output_names.push(alias.value.to_lowercase());
+            }
+            sqlparser::ast::SelectItem::UnnamedExpr(expr) => {
+                // Unaliased expression — extract column name from the expression
+                let col_name = extract_column_name_from_expr(expr);
+                output_names.push(col_name);
+            }
+        }
+    }
+
+    if output_names.is_empty() {
+        return None;
+    }
+
+    Some(output_names)
+}
+
+/// Helper: extract a simple column name from an expression (handles qualified and unqualified names)
+fn extract_column_name_from_expr(expr: &sqlparser::ast::Expr) -> String {
+    match expr {
+        sqlparser::ast::Expr::Identifier(ident) => {
+            // Simple column reference like "total" or "region"
+            ident.value.to_lowercase()
+        }
+        sqlparser::ast::Expr::CompoundIdentifier(idents) => {
+            // Qualified column reference like "t.column"
+            if let Some(last) = idents.last() {
+                last.value.to_lowercase()
+            } else {
+                "unknown".to_string()
+            }
+        }
+        _ => {
+            // For other expressions (function calls, arithmetic, etc.), use a generic name
+            "expr".to_string()
+        }
+    }
+}
+
+/// Compute the subset of partition_by columns that appear in the CTE's output.
+/// Case-insensitive comparison per PostgreSQL identifier folding.
+fn compute_cte_partition_subset(
+    partition_by: &[String],
+    cte_output_columns: &[String],
+) -> Vec<String> {
+    if partition_by.is_empty() {
+        return Vec::new();
+    }
+
+    let output_lower: Vec<String> = cte_output_columns
+        .iter()
+        .map(|c| c.to_lowercase())
+        .collect();
+
+    partition_by
+        .iter()
+        .filter(|part_col| {
+            let part_col_lower = part_col.to_lowercase();
+            output_lower.contains(&part_col_lower)
+        })
+        .cloned()
+        .collect()
+}
+
 /// Decomposition phase: UNION / INTERSECT / EXCEPT.
 ///
 /// Each operand is materialised as its own sub-IMV (recursively); the user-
@@ -636,6 +733,31 @@ with kind: mv.",
             cte_query = replace_identifier(&cte_query, earlier_alias, &quoted);
         }
 
+        // Extract CTE output columns and compute partition subset to propagate.
+        // If the CTE contains a wildcard projection, we cannot determine which
+        // columns are available, so we skip partition propagation (pass &[]).
+        // Otherwise, we pass only the subset of parent's partition_by columns
+        // that appear in this CTE's output.
+        let cte_partition_by = if let Some(cte_output_cols) = extract_cte_output_columns(&cte_query)
+        {
+            let subset = compute_cte_partition_subset(partition_by, &cte_output_cols);
+            info!(
+                "pg_reflex: CTE '{}': parent partition_by={:?}, output_cols={:?}, computed subset={:?}",
+                cte.alias,
+                partition_by,
+                cte_output_cols,
+                subset
+            );
+            subset
+        } else {
+            // Wildcard projection or analysis failed — cannot propagate partitioning
+            info!(
+                "pg_reflex: CTE '{}': wildcard or analysis failed, skipping partition propagation",
+                cte.alias
+            );
+            Vec::new()
+        };
+
         let cte_view_name = safe_identifier(&format!("{}__cte_{}", view_name, cte.alias));
         let result = create_reflex_ivm_impl(
             &cte_view_name,
@@ -646,7 +768,7 @@ with kind: mv.",
             refresh_mode,
             topk_k,
             ignore_sources,
-            &[],
+            &cte_partition_by,
         );
         if result.starts_with("ERROR") {
             return Some(result);
@@ -670,6 +792,14 @@ with kind: mv.",
         return Some("ERROR: Query is not a SELECT");
     };
 
+    // For the main body, do NOT pass partition_by from the parent IMV.
+    // The main body sources from CTE sub-IMVs (not real tables), so:
+    // 1. The partition columns may not be available in the CTE outputs
+    // 2. CTE sub-IMVs don't get triggers anyway
+    // If the user wants partitioning on the final result, they should define
+    // a separate IMV without CTEs that sources from the CTE sub-IMVs.
+    let main_partition_by: Vec<String> = Vec::new();
+
     // Check if the main body is passthrough (no aggregation).
     // If so, all its sources are CTE sub-IMVs which don't get triggers,
     // CTE body (passthrough or aggregate) → create as a normal IMV
@@ -682,7 +812,7 @@ with kind: mv.",
         refresh_mode,
         topk_k,
         ignore_sources,
-        partition_by,
+        &main_partition_by,
     ))
 }
 

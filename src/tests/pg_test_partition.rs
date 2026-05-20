@@ -927,3 +927,314 @@ fn pg_part_event_trigger_detach_keeps_orphan_partition() {
     .expect("c");
     assert_eq!(imv_part_count, 2, "auto-sync should NOT drop orphans");
 }
+
+// CTE partition propagation tests (Task 2, Part A)
+
+#[pg_test]
+fn pg_part_cte_partition_propagation_basic() {
+    // Setup: partitioned source with LIST(region)
+    Spi::run(
+        "CREATE TABLE cte_part_src1 (id BIGINT, region TEXT NOT NULL, amount NUMERIC) \
+         PARTITION BY LIST (region)",
+    )
+    .expect("create source");
+    Spi::run("CREATE TABLE cte_part_src1_n PARTITION OF cte_part_src1 FOR VALUES IN ('N')")
+        .expect("north partition");
+    Spi::run("CREATE TABLE cte_part_src1_s PARTITION OF cte_part_src1 FOR VALUES IN ('S')")
+        .expect("south partition");
+    Spi::run(
+        "INSERT INTO cte_part_src1 (id, region, amount) VALUES \
+         (1, 'N', 100), (2, 'N', 200), (3, 'S', 50)",
+    )
+    .expect("seed data");
+
+    // Create IMV with CTE that outputs region (partition column).
+    // partition_by=[region] should propagate to the CTE sub-IMV.
+    let result = Spi::get_one::<String>(
+        "SELECT create_reflex_ivm( \
+            'cte_part_main', \
+            'WITH regional_totals AS ( \
+                SELECT region, SUM(amount) AS total FROM cte_part_src1 GROUP BY region \
+             ) \
+             SELECT region, total FROM regional_totals', \
+            NULL, NULL, NULL, NULL, \
+            ARRAY['region'] \
+         )",
+    )
+    .expect("create call")
+    .expect("create result");
+    assert!(
+        !result.starts_with("ERROR"),
+        "CTE with partition column in output should succeed: {result}"
+    );
+
+    // Verify the CTE sub-IMV is partitioned.
+    // Expected name: cte_part_main__cte_regional_totals
+    let cte_sub_imv_partstrat = Spi::get_one::<String>(
+        "SELECT pt.partstrat::text FROM pg_partitioned_table pt \
+         JOIN pg_class c ON c.oid = pt.partrelid \
+         WHERE c.relname LIKE 'cte_part_main__cte_regional%'",
+    );
+    match cte_sub_imv_partstrat {
+        Ok(Some(strat)) => {
+            assert_eq!(strat, "l", "CTE sub-IMV should be LIST partitioned");
+        }
+        Ok(None) => {
+            panic!("CTE sub-IMV not found or not partitioned");
+        }
+        Err(e) => {
+            panic!("Failed to query partitioned_table: {e}");
+        }
+    }
+
+    // Verify CTE sub-IMV has 2 children (N, S)
+    let cte_children = Spi::get_one::<i64>(
+        "SELECT count(*) FROM pg_inherits i \
+         JOIN pg_class c ON c.oid = i.inhparent \
+         WHERE c.relname LIKE 'cte_part_main__cte_regional%'",
+    )
+    .expect("child count query")
+    .expect("count");
+    assert_eq!(cte_children, 2, "CTE sub-IMV should have 2 partition children");
+
+    // Verify initial data is correct in the main IMV
+    let n_total = Spi::get_one::<pgrx::AnyNumeric>(
+        "SELECT total FROM cte_part_main WHERE region = 'N'",
+    )
+    .expect("n query")
+    .expect("n total");
+    assert_eq!(n_total.to_string(), "300");
+
+    let s_total = Spi::get_one::<pgrx::AnyNumeric>(
+        "SELECT total FROM cte_part_main WHERE region = 'S'",
+    )
+    .expect("s query")
+    .expect("s total");
+    assert_eq!(s_total.to_string(), "50");
+}
+
+#[pg_test]
+fn pg_part_cte_partition_no_propagation_when_col_not_in_output() {
+    // Setup: partitioned source with LIST(region)
+    Spi::run(
+        "CREATE TABLE cte_part_src2 (id BIGINT, region TEXT NOT NULL, amount NUMERIC) \
+         PARTITION BY LIST (region)",
+    )
+    .expect("create source");
+    Spi::run("CREATE TABLE cte_part_src2_x PARTITION OF cte_part_src2 FOR VALUES IN ('X')")
+        .expect("child");
+    Spi::run("INSERT INTO cte_part_src2 (id, region, amount) VALUES (1, 'X', 50)")
+        .expect("seed");
+
+    // Create IMV with CTE that does NOT output region (partition column).
+    // partition_by=[region] should NOT be propagated to CTE (no matching output column).
+    let result = Spi::get_one::<String>(
+        "SELECT create_reflex_ivm( \
+            'cte_no_prop', \
+            'WITH totals AS ( \
+                SELECT SUM(amount) AS total FROM cte_part_src2 \
+             ) \
+             SELECT total FROM totals', \
+            NULL, NULL, NULL, NULL, \
+            ARRAY['region'] \
+         )",
+    )
+    .expect("create call")
+    .expect("create result");
+    assert!(
+        !result.starts_with("ERROR"),
+        "CTE without partition column should still be created: {result}"
+    );
+
+    // Verify the CTE sub-IMV is NOT partitioned (partition_by was not applicable).
+    let is_cte_partitioned = Spi::get_one::<i64>(
+        "SELECT count(*) FROM pg_partitioned_table pt \
+         JOIN pg_class c ON c.oid = pt.partrelid \
+         WHERE c.relname LIKE 'cte_no_prop__cte%'",
+    )
+    .expect("partitioned table query")
+    .expect("count");
+    assert_eq!(is_cte_partitioned, 0, "CTE sub-IMV should not be partitioned");
+
+    // Main IMV should still work and have correct data
+    let total = Spi::get_one::<pgrx::AnyNumeric>(
+        "SELECT total FROM cte_no_prop",
+    )
+    .expect("query")
+    .expect("total");
+    assert_eq!(total.to_string(), "50");
+}
+
+#[pg_test]
+fn pg_part_cte_multiple_partitions_same_key() {
+    // Two separate parent IMVs with the same-named CTE should NOT collide.
+    Spi::run(
+        "CREATE TABLE cte_part_src3 (id BIGINT, dept TEXT NOT NULL, amount NUMERIC) \
+         PARTITION BY LIST (dept)",
+    )
+    .expect("create source");
+    Spi::run("CREATE TABLE cte_part_src3_e PARTITION OF cte_part_src3 FOR VALUES IN ('eng')")
+        .expect("eng");
+    Spi::run("CREATE TABLE cte_part_src3_s PARTITION OF cte_part_src3 FOR VALUES IN ('sales')")
+        .expect("sales");
+    Spi::run(
+        "INSERT INTO cte_part_src3 (id, dept, amount) VALUES (1, 'eng', 100), (2, 'sales', 200)",
+    )
+    .expect("seed");
+
+    // First IMV: parent1
+    let r1 = Spi::get_one::<String>(
+        "SELECT create_reflex_ivm( \
+            'parent1_cte_test', \
+            'WITH dept_totals AS ( \
+                SELECT dept, SUM(amount) AS total FROM cte_part_src3 GROUP BY dept \
+             ) \
+             SELECT dept, total FROM dept_totals', \
+            NULL, NULL, NULL, NULL, \
+            ARRAY['dept'] \
+         )",
+    )
+    .expect("create1 call")
+    .expect("create1 result");
+    assert!(!r1.starts_with("ERROR"), "parent1 creation should succeed: {r1}");
+
+    // Second IMV: parent2 with same CTE alias (dept_totals)
+    let r2 = Spi::get_one::<String>(
+        "SELECT create_reflex_ivm( \
+            'parent2_cte_test', \
+            'WITH dept_totals AS ( \
+                SELECT dept, SUM(amount) AS total FROM cte_part_src3 GROUP BY dept \
+             ) \
+             SELECT dept, total FROM dept_totals', \
+            NULL, NULL, NULL, NULL, \
+            ARRAY['dept'] \
+         )",
+    )
+    .expect("create2 call")
+    .expect("create2 result");
+    assert!(!r2.starts_with("ERROR"), "parent2 creation should succeed: {r2}");
+
+    // Both should have independent sub-IMVs with distinct names.
+    // parent1__cte_dept_totals should exist and be partitioned
+    let p1_exists = Spi::get_one::<i64>(
+        "SELECT count(*) FROM pg_class WHERE relname = 'parent1_cte_test__cte_dept_totals'",
+    )
+    .expect("p1 query")
+    .expect("count");
+    assert_eq!(p1_exists, 1, "parent1 CTE sub-IMV should exist");
+
+    // parent2__cte_dept_totals should exist and be partitioned
+    let p2_exists = Spi::get_one::<i64>(
+        "SELECT count(*) FROM pg_class WHERE relname = 'parent2_cte_test__cte_dept_totals'",
+    )
+    .expect("p2 query")
+    .expect("count");
+    assert_eq!(p2_exists, 1, "parent2 CTE sub-IMV should exist");
+
+    // Both should work independently
+    let p1_eng = Spi::get_one::<pgrx::AnyNumeric>(
+        "SELECT total FROM parent1_cte_test WHERE dept = 'eng'",
+    )
+    .expect("p1 query")
+    .expect("total");
+    assert_eq!(p1_eng.to_string(), "100");
+
+    let p2_eng = Spi::get_one::<pgrx::AnyNumeric>(
+        "SELECT total FROM parent2_cte_test WHERE dept = 'eng'",
+    )
+    .expect("p2 query")
+    .expect("total");
+    assert_eq!(p2_eng.to_string(), "100");
+}
+
+#[pg_test]
+fn pg_part_cte_nested_ctes_naming_collision_safety() {
+    // Test that nested CTEs (CTEs that reference other CTEs) don't cause
+    // naming collisions due to the parent-prefixing strategy.
+    // A CTE sub-IMV is named: parent_imv_name__cte_cte_alias
+    // When a CTE sources from another CTE, that second CTE's sub-IMV is ALSO
+    // prefixed with the same parent, ensuring uniqueness.
+
+    Spi::run(
+        "CREATE TABLE nested_cte_src (id BIGINT, category TEXT NOT NULL, value NUMERIC) \
+         PARTITION BY LIST (category)",
+    )
+    .expect("create source");
+    Spi::run(
+        "CREATE TABLE nested_cte_src_a PARTITION OF nested_cte_src FOR VALUES IN ('a')",
+    )
+    .expect("a");
+    Spi::run(
+        "CREATE TABLE nested_cte_src_b PARTITION OF nested_cte_src FOR VALUES IN ('b')",
+    )
+    .expect("b");
+    Spi::run(
+        "INSERT INTO nested_cte_src (id, category, value) VALUES \
+         (1, 'a', 100), (2, 'a', 200), (3, 'b', 300), (4, 'b', 400)",
+    )
+    .expect("seed");
+
+    // Create an IMV with nested CTEs:
+    // - level_1_cte: sources from the table
+    // - level_2_cte: sources from level_1_cte
+    // - main: sources from level_2_cte
+    let r = Spi::get_one::<String>(
+        "SELECT create_reflex_ivm( \
+            'nested_ivm', \
+            'WITH level_1_cte AS ( \
+                SELECT category, SUM(value) AS total FROM nested_cte_src GROUP BY category \
+             ), \
+             level_2_cte AS ( \
+                SELECT category, total FROM level_1_cte WHERE total > 200 \
+             ) \
+             SELECT category, total FROM level_2_cte', \
+            NULL, NULL, NULL, NULL, \
+            ARRAY['category'] \
+         )",
+    )
+    .expect("create call")
+    .expect("result");
+    assert!(!r.starts_with("ERROR"), "nested CTE IMV creation should succeed: {r}");
+
+    // Verify that both CTE sub-IMVs were created with correct parent-prefixed names
+    let level1_exists = Spi::get_one::<i64>(
+        "SELECT count(*) FROM pg_class WHERE relname = 'nested_ivm__cte_level_1_cte'",
+    )
+    .expect("level1 query")
+    .expect("count");
+    assert_eq!(level1_exists, 1, "level_1_cte sub-IMV should exist");
+
+    let level2_exists = Spi::get_one::<i64>(
+        "SELECT count(*) FROM pg_class WHERE relname = 'nested_ivm__cte_level_2_cte'",
+    )
+    .expect("level2 query")
+    .expect("count");
+    assert_eq!(level2_exists, 1, "level_2_cte sub-IMV should exist");
+
+    // Verify partitioning was propagated correctly
+    let level1_children = Spi::get_one::<i64>(
+        "SELECT count(*) FROM pg_inherits \
+         WHERE inhrelid IN (SELECT oid FROM pg_class WHERE relname LIKE 'nested_ivm__cte_level_1_cte%')",
+    )
+    .expect("level1 children query")
+    .expect("count");
+    assert!(
+        level1_children >= 2,
+        "level_1_cte sub-IMV should be partitioned: {level1_children} children"
+    );
+
+    // Verify data is correct
+    let total_a = Spi::get_one::<pgrx::AnyNumeric>(
+        "SELECT total FROM nested_ivm WHERE category = 'a'",
+    )
+    .expect("query")
+    .expect("total");
+    assert_eq!(total_a.to_string(), "300", "category a total should be 300 (100+200)");
+
+    let total_b = Spi::get_one::<pgrx::AnyNumeric>(
+        "SELECT total FROM nested_ivm WHERE category = 'b'",
+    )
+    .expect("query")
+    .expect("total");
+    assert_eq!(total_b.to_string(), "700", "category b total should be 700 (300+400)");
+}
