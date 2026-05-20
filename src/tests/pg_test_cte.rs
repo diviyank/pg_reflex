@@ -210,3 +210,85 @@ fn test_cte_passthrough_sub_imv() {
     .expect("v");
     assert_eq!(a3, 15i64, "Inactive row should not affect view");
 }
+
+#[pg_test]
+fn test_cte_sibling_with_window() {
+    // This test reproduces the core bug: CTE decomposition must run BEFORE window decomposition.
+    // Bug: when a query has CTEs AND a window function in the main body, the old order
+    // would run window decomposition first. Window decomposition drops the WITH clause to build
+    // the base query, causing "relation <sibling_cte> does not exist".
+    // Fix: CTE decomposition runs first, turning each CTE into its own sub-IMV (recursively).
+    // Then the main body (which still has window functions) is processed without the WITH clause.
+    // Window decomposition can then safely drop the WITH clause since there are no more CTEs.
+
+    Spi::run(
+        "CREATE TABLE tcte_src1 (id INT, grp TEXT)",
+    )
+    .expect("create src1");
+    Spi::run(
+        "INSERT INTO tcte_src1 VALUES (1, 'A'), (2, 'A'), (3, 'B')",
+    )
+    .expect("seed src1");
+
+    Spi::run(
+        "CREATE TABLE tcte_src2 (id INT, grp TEXT, val INT)",
+    )
+    .expect("create src2");
+    Spi::run(
+        "INSERT INTO tcte_src2 VALUES (10, 'A', 100), (11, 'A', 200), (12, 'B', 150)",
+    )
+    .expect("seed src2");
+
+    // Two sibling CTEs (no window functions):
+    // - agg_cte: aggregate, counts rows per group
+    // - sum_cte: aggregate, sums values per group
+    // Main query: aggregate from one CTE with window function RANK() in top-level SELECT
+    // With old order: window decomposition fires on "has_window_function=true",
+    //   drops WITH, tries to build base from just SELECT...FROM (without agg_cte, sum_cte),
+    //   ERROR: relation "agg_cte" does not exist
+    // With fix: CTE decomposition fires first, agg_cte → sub-IMV, sum_cte → sub-IMV,
+    //   main body is rewritten to reference sub-IMVs (no longer has WITH clause),
+    //   then window decomposition safely processes the window function without dropping CTEs
+    let result = crate::create_reflex_ivm(
+        "cte_sibling_window",
+        "WITH agg_cte AS (
+            SELECT grp, COUNT(*) AS cnt FROM tcte_src1 GROUP BY grp
+        ), sum_cte AS (
+            SELECT grp, SUM(val) AS total_val FROM tcte_src2 GROUP BY grp
+        )
+        SELECT grp, cnt, total_val, RANK() OVER (ORDER BY total_val DESC) AS rnk
+        FROM (
+            SELECT a.grp, a.cnt, s.total_val
+            FROM agg_cte a
+            JOIN sum_cte s ON s.grp = a.grp
+        ) t",
+        None,
+        None,
+        None,
+        None,
+    );
+    assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW", "CTE decomposition should succeed without 'does not exist' error");
+
+    // Verify row count
+    let cnt = Spi::get_one::<i64>(
+        "SELECT COUNT(*) FROM cte_sibling_window",
+    )
+    .expect("q")
+    .expect("v");
+    assert_eq!(cnt, 2i64, "Should have 2 rows (one per group A, B)");
+
+    // Verify correctness
+    let cnt_a = Spi::get_one::<i64>(
+        "SELECT cnt FROM cte_sibling_window WHERE grp = 'A'",
+    )
+    .expect("q")
+    .expect("v");
+    assert_eq!(cnt_a, 2i64, "A has 2 rows in tcte_src1");
+
+    let val_sum_a = Spi::get_one::<i64>(
+        "SELECT total_val FROM cte_sibling_window WHERE grp = 'A'",
+    )
+    .expect("q")
+    .expect("v");
+    assert_eq!(val_sum_a, 300i64, "A values in tcte_src2: 100 + 200 = 300");
+}

@@ -1905,6 +1905,18 @@ pub(crate) fn create_reflex_ivm_impl(
         return result;
     }
 
+    if let Some(result) = try_decompose_ctes(
+        view_name,
+        storage_mode,
+        refresh_mode,
+        topk_k,
+        ignore_sources,
+        partition_by,
+        &parsed,
+    ) {
+        return result;
+    }
+
     if let Some(result) = try_decompose_distinct_on(
         view_name,
         sql,
@@ -1948,18 +1960,6 @@ pub(crate) fn create_reflex_ivm_impl(
     if has_subquery_with_agg {
         return "ERROR: Subqueries with aggregation in FROM are not supported. \
                 Use a CTE (WITH clause) instead — pg_reflex decomposes CTEs into sub-IMVs automatically.";
-    }
-
-    if let Some(result) = try_decompose_ctes(
-        view_name,
-        storage_mode,
-        refresh_mode,
-        topk_k,
-        ignore_sources,
-        partition_by,
-        &parsed,
-    ) {
-        return result;
     }
 
     let ParsedInputs {
