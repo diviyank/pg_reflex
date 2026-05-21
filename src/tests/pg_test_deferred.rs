@@ -1400,3 +1400,43 @@ fn pg_test_deferred_empty_stale_staging_with_column_set_drift_recreated() {
     let fresh = "SELECT id, a FROM setdrift_src";
     assert_imv_correct("setdrift_v2", fresh);
 }
+
+/// Mirrors `__reflex_deferred_flush_fn` at COMMIT, including re-queued cascades:
+/// loops over DISTINCT pending sources and flushes each, repeating until the
+/// queue drains. `reconcile(C)` (fired by the cross-source guard) re-enqueues C
+/// via its downstream's staging trigger, whose flush in turn feeds D. The
+/// `SELECT DISTINCT` has no `ORDER BY` — matching the orchestrator's
+/// nondeterministic source ordering. The 10_000 iteration cap converts a
+/// non-converging queue into a loud failure instead of a hung test.
+fn drain_deferred_pending() {
+    use pgrx::pg_sys::panic::ErrorReportable;
+    for _ in 0..10_000 {
+        let srcs: Vec<String> = Spi::connect(|client| {
+            client
+                .select(
+                    "SELECT DISTINCT source_table FROM public.__reflex_deferred_pending",
+                    None,
+                    &[],
+                )
+                .unwrap_or_report()
+                .filter_map(|row| {
+                    row.get_by_name::<&str, _>("source_table")
+                        .ok()
+                        .flatten()
+                        .map(|s| s.to_string())
+                })
+                .collect()
+        });
+        if srcs.is_empty() {
+            return;
+        }
+        for s in srcs {
+            Spi::run(&format!(
+                "SELECT reflex_flush_deferred('{}')",
+                s.replace('\'', "''")
+            ))
+            .expect("flush");
+        }
+    }
+    panic!("drain_deferred_pending did not converge after 10000 iterations");
+}
