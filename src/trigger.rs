@@ -2912,7 +2912,140 @@ pub fn reflex_flush_deferred(source_table: &str) -> String {
             return;
         }
 
+        // Cross-source consistency gate (deferred mode). When 2+ distinct
+        // sources staged deltas in the same transaction, an IMV that joins two
+        // of them would double-count the ΔA⋈ΔB cross product if each source's
+        // net delta were applied independently: every per-source delta joins
+        // against the OTHER sources' already-committed NEW state, so the cross
+        // product is added once per mutated source instead of once total.
+        // IMMEDIATE mode is immune (per-statement triggers apply deltas
+        // sequentially, each seeing the correct intermediate state); the
+        // hazard is unique to the commit-time batch flush. Detect the batch
+        // shape once here — the per-IMV loop full-reconciles any affected IMV
+        // exactly once via the transaction-local marker below.
+        let batch_has_multiple_sources = client
+            .select(
+                "SELECT count(DISTINCT source_table) >= 2 AS m FROM public.__reflex_deferred_pending",
+                None,
+                &[],
+            )
+            .unwrap_or_report()
+            .next()
+            .map(|row| row.get_by_name::<bool, _>("m").unwrap_or(None).unwrap_or(false))
+            .unwrap_or(false);
+        // The marker (created below) survives across the batch's per-source
+        // flush calls. A later flush sees a shrunken pending set (each flush
+        // deletes its own pending rows), so `batch_has_multiple_sources` may
+        // already read false by then — but if the marker exists, a
+        // multi-source reconcile happened earlier in this batch and this flush
+        // MUST still skip the reconciled IMVs. `pg_my_temp_schema()` scopes the
+        // lookup to this session's temp schema (0 ⇒ no temp schema yet).
+        let marker_exists = client
+            .select(
+                "SELECT EXISTS(SELECT 1 FROM pg_class \
+                   WHERE relname = '__reflex_deferred_reconciled_batch' \
+                     AND relnamespace = pg_my_temp_schema()) AS e",
+                None,
+                &[],
+            )
+            .unwrap_or_report()
+            .next()
+            .map(|row| {
+                row.get_by_name::<bool, _>("e")
+                    .unwrap_or(None)
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false);
+        let engage_cross_source_guard = batch_has_multiple_sources || marker_exists;
+        if engage_cross_source_guard {
+            // ON COMMIT DROP: one marker per transaction, shared across the
+            // per-source flush calls (the constraint trigger flushes each
+            // mutated source separately), auto-removed at commit. Records the
+            // IMVs already full-reconciled in this batch so a later source's
+            // flush skips them — its net delta would otherwise corrupt the
+            // just-reconciled state.
+            client
+                .update(
+                    "CREATE TEMP TABLE IF NOT EXISTS __reflex_deferred_reconciled_batch \
+                     (name TEXT PRIMARY KEY) ON COMMIT DROP",
+                    None,
+                    &[],
+                )
+                .unwrap_or_report();
+        }
+
         for (imv_name, base_query, end_query, agg_json, where_pred) in &imvs {
+            if engage_cross_source_guard {
+                let imv_esc = imv_name.replace('\'', "''");
+                let already_reconciled = client
+                    .select(
+                        &format!(
+                            "SELECT EXISTS(SELECT 1 FROM __reflex_deferred_reconciled_batch \
+                             WHERE name = '{}') AS e",
+                            imv_esc
+                        ),
+                        None,
+                        &[],
+                    )
+                    .unwrap_or_report()
+                    .next()
+                    .map(|row| {
+                        row.get_by_name::<bool, _>("e")
+                            .unwrap_or(None)
+                            .unwrap_or(false)
+                    })
+                    .unwrap_or(false);
+                if already_reconciled {
+                    continue;
+                }
+                // Count this IMV's own sources that are pending in the batch.
+                // The first of the IMV's sources to be flushed still sees all
+                // of them pending (per-source cleanup only runs for sources
+                // already processed, none of which are this IMV's), so it
+                // reliably detects the multi-source shape and reconciles.
+                let imv_has_multiple_sources = client
+                    .select(
+                        &format!(
+                            "SELECT count(DISTINCT p.source_table) >= 2 AS m \
+                             FROM public.__reflex_deferred_pending p \
+                             JOIN public.__reflex_ivm_reference r ON r.name = '{}' \
+                             WHERE p.source_table = ANY(r.depends_on)",
+                            imv_esc
+                        ),
+                        None,
+                        &[],
+                    )
+                    .unwrap_or_report()
+                    .next()
+                    .map(|row| {
+                        row.get_by_name::<bool, _>("m")
+                            .unwrap_or(None)
+                            .unwrap_or(false)
+                    })
+                    .unwrap_or(false);
+                if imv_has_multiple_sources {
+                    client
+                        .update(
+                            &format!(
+                                "INSERT INTO __reflex_deferred_reconciled_batch (name) \
+                                 VALUES ('{}') ON CONFLICT DO NOTHING",
+                                imv_esc
+                            ),
+                            None,
+                            &[],
+                        )
+                        .unwrap_or_report();
+                    client
+                        .update(
+                            &format!("SELECT public.reflex_reconcile('{}')", imv_esc),
+                            None,
+                            &[],
+                        )
+                        .unwrap_or_report();
+                    total_processed += 1;
+                    continue;
+                }
+            }
             // 1.4.5 — Skip this IMV iff NO staged row matches the
             // predicate, on either side of the delta. The 1.4.4 check
             // looked only at NEW-state rows (`I` + `U_NEW`); that silently

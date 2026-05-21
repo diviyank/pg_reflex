@@ -505,6 +505,64 @@ fn test_deferred_bool_or_with_join_alias_recompute() {
     assert_imv_correct("brja_view", fresh);
 }
 
+/// Cross-source consistency: a join IMV over two DEFERRED sources where BOTH
+/// sources are mutated in the same transaction.
+///
+/// In deferred mode the base-table writes land immediately; only IMV
+/// maintenance is deferred to the COMMIT constraint trigger, which calls
+/// `reflex_flush_deferred(src)` once per distinct mutated source. By the time
+/// the first flush runs, BOTH base tables already hold their new rows — so
+/// `flush('jbs_a')` computes ΔA ⋈ B_new and `flush('jbs_b')` computes
+/// ΔB ⋈ A_new. Their net deltas each include the ΔA×ΔB cross product, so the
+/// additive MERGE applies it TWICE; the correct view delta contains it once.
+/// Running the two manual flushes after both inserts reproduces the
+/// commit-time ordering exactly.
+///
+/// The 100 seed groups matter: with a large intermediate the per-flush
+/// MERGE-vs-rebuild dispatch (1.4.5) takes the additive MERGE path for the
+/// single affected group. A small (2-group) intermediate instead trips the
+/// high-selectivity rebuild path, which recomputes the affected group from the
+/// live base query and accidentally masks the double-count. Key 200 is
+/// brand-new in both sources, so ΔA⋈ΔB is non-empty and the bug surfaces as
+/// cnt=2/total=200 for k=200 instead of the correct cnt=1/total=100.
+#[pg_test]
+fn test_deferred_join_both_sources_mutated_oracle() {
+    Spi::run("CREATE TABLE jbs_a (k INT NOT NULL, amt INT NOT NULL)").expect("create a");
+    Spi::run("CREATE TABLE jbs_b (k INT NOT NULL, w INT NOT NULL)").expect("create b");
+    Spi::run("INSERT INTO jbs_a (k, amt) SELECT g, 10 FROM generate_series(1, 100) g")
+        .expect("seed a");
+    Spi::run("INSERT INTO jbs_b (k, w) SELECT g, 5 FROM generate_series(1, 100) g")
+        .expect("seed b");
+
+    crate::create_reflex_ivm(
+        "jbs_view",
+        "SELECT jbs_a.k, COUNT(*) AS cnt, SUM(jbs_a.amt) AS total \
+         FROM jbs_a JOIN jbs_b ON jbs_a.k = jbs_b.k \
+         GROUP BY jbs_a.k",
+        None,
+        None,
+        Some("DEFERRED"),
+        None,
+    );
+
+    let fresh = "SELECT jbs_a.k, COUNT(*) AS cnt, SUM(jbs_a.amt) AS total \
+                 FROM jbs_a JOIN jbs_b ON jbs_a.k = jbs_b.k \
+                 GROUP BY jbs_a.k";
+    assert_imv_correct("jbs_view", fresh);
+
+    // Both sources mutated with a brand-new shared key — deltas staged, view
+    // not yet updated.
+    Spi::run("INSERT INTO jbs_a (k, amt) VALUES (200, 100)").expect("insert a");
+    Spi::run("INSERT INTO jbs_b (k, w) VALUES (200, 7)").expect("insert b");
+
+    // Mirror the COMMIT constraint trigger: flush every mutated source, both
+    // base tables already populated.
+    Spi::run("SELECT reflex_flush_deferred('jbs_a')").expect("flush a");
+    Spi::run("SELECT reflex_flush_deferred('jbs_b')").expect("flush b");
+
+    assert_imv_correct("jbs_view", fresh);
+}
+
 /// Regression for journal/2026-04-21_db_clone_benchmark.md bug 2/3:
 /// DEFERRED flush on a source that is referenced with a user alias
 /// (`FROM src AS s` or bare `FROM src s`) used to emit invalid SQL like
