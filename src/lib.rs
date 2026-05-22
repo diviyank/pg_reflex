@@ -31,6 +31,20 @@ mod window;
 
 ::pgrx::pg_module_magic!(name, version);
 
+/// Machine-recognizable tag embedded in every *deliberate* rejection message
+/// returned by `create_reflex_ivm_impl`. The differential fuzz harness uses it
+/// to distinguish an intended limitation (function returns this string) from a
+/// codegen defect (Postgres raises an exception on generated SQL). Inserted
+/// right after the `ERROR: ` prefix so existing `.starts_with("ERROR")` and
+/// message-substring assertions keep passing.
+pub(crate) const REFLEX_UNSUPPORTED_TAG: &str = "[reflex-unsupported]";
+
+/// Format a deliberate-rejection message: `ERROR: [reflex-unsupported] <msg>`.
+/// Returns a leaked `&'static str` to match the existing rejection return type.
+pub(crate) fn reflex_reject(msg: &str) -> &'static str {
+    Box::leak(format!("ERROR: {} {}", REFLEX_UNSUPPORTED_TAG, msg).into_boxed_str())
+}
+
 // This SQL will be executed exactly once when 'CREATE EXTENSION' is run.
 // Collate "C" for faster lookups
 extension_sql!(

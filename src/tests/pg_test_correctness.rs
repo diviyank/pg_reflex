@@ -3957,7 +3957,7 @@ fn test_unprojected_group_key_rejected() {
                 FROM jgw_t t LEFT JOIN agg a ON a.g = t.g GROUP BY t.g, a.sx";
     let r = crate::create_reflex_ivm("jgw_v", body, None, None, None, Some("g"));
     assert!(
-        r.starts_with("ERROR: GROUP BY key 'a.sx' is not projected"),
+        r.starts_with("ERROR: [reflex-unsupported] GROUP BY key 'a.sx' is not projected"),
         "expected clear unprojected-group-key error, got: {}",
         r
     );

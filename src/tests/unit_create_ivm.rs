@@ -193,3 +193,13 @@ fn cov_format_compact_imv_summary_single() {
     let summary = format_compact_imv_summary("x", &per_stmt);
     assert!(summary.contains("50 ms"));
 }
+
+#[test]
+fn reflex_reject_carries_tag_and_error_prefix() {
+    let msg = crate::reflex_reject("storage must be 'LOGGED' or 'UNLOGGED'");
+    assert!(msg.starts_with("ERROR: "), "must keep ERROR: prefix: {msg}");
+    assert!(
+        msg.contains(crate::REFLEX_UNSUPPORTED_TAG),
+        "must carry the unsupported tag: {msg}"
+    );
+}

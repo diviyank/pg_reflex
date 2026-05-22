@@ -96,12 +96,12 @@ fn validate_and_parse_inputs(
 ) -> Result<ParsedInputs, &'static str> {
     let storage_upper = storage_mode.to_uppercase();
     if storage_upper != "LOGGED" && storage_upper != "UNLOGGED" {
-        return Err("ERROR: storage must be 'LOGGED' or 'UNLOGGED'");
+        return Err(crate::reflex_reject("storage must be 'LOGGED' or 'UNLOGGED'"));
     }
     let logged = storage_upper == "LOGGED";
     let mode_upper = refresh_mode.to_uppercase();
     if mode_upper != "IMMEDIATE" && mode_upper != "DEFERRED" {
-        return Err("ERROR: mode must be 'IMMEDIATE' or 'DEFERRED'");
+        return Err(crate::reflex_reject("mode must be 'IMMEDIATE' or 'DEFERRED'"));
     }
     let deferred = mode_upper == "DEFERRED";
     validate_view_name(view_name)?;
@@ -110,21 +110,19 @@ fn validate_and_parse_inputs(
         Ok(stmts) => stmts,
         Err(e) => {
             warning!("pg_reflex: failed to parse SQL for '{}': {}", view_name, e);
-            return Err(Box::leak(
-                format!("ERROR: Failed to parse SQL: {}", e).into_boxed_str(),
-            ));
+            return Err(crate::reflex_reject(&format!("Failed to parse SQL: {}", e)));
         }
     };
     let analysis = match analyze(&parsed_sql) {
         Err(SqlAnalysisError::MultipleQueries(_)) => {
-            return Err("ERROR: Expected 1 query, got multiple");
+            return Err(crate::reflex_reject("Expected 1 query, got multiple"));
         }
         Err(SqlAnalysisError::NotASelectQuery) => {
-            return Err("ERROR: Query is not a SELECT");
+            return Err(crate::reflex_reject("Query is not a SELECT"));
         }
         Ok(a) => {
             if let Some(reason) = a.unsupported_reason() {
-                return Err(Box::leak(format!("ERROR: {}", reason).into_boxed_str()));
+                return Err(crate::reflex_reject(&reason));
             }
             // Reject SUM(DISTINCT), AVG(DISTINCT), etc. — DISTINCT modifier is only
             // supported on COUNT. Check the original SQL for the pattern.
@@ -140,9 +138,11 @@ fn validate_and_parse_inputs(
                 || sql_upper.contains("BOOL_OR(DISTINCT")
                 || sql_upper.contains("BOOL_OR (DISTINCT");
             if has_distinct_agg {
-                return Err("ERROR: DISTINCT modifier on SUM/AVG/MIN/MAX/BOOL_OR is not supported. \
-                        Only COUNT(DISTINCT col) is supported. Use a CTE with SELECT DISTINCT \
-                        to pre-deduplicate: WITH d AS (SELECT DISTINCT grp, val FROM t) SELECT grp, SUM(val) FROM d GROUP BY grp");
+                return Err(crate::reflex_reject(
+                    "DISTINCT modifier on SUM/AVG/MIN/MAX/BOOL_OR is not supported. \
+                     Only COUNT(DISTINCT col) is supported. Use a CTE with SELECT DISTINCT \
+                     to pre-deduplicate: WITH d AS (SELECT DISTINCT grp, val FROM t) SELECT grp, SUM(val) FROM d GROUP BY grp"
+                ));
             }
             a
         }
@@ -208,7 +208,7 @@ fn try_decompose_set_op(
         | sqlparser::ast::SetOperator::Intersect
         | sqlparser::ast::SetOperator::Except => {}
         _ => {
-            return Some("ERROR: Unsupported set operation. Supported: UNION, INTERSECT, EXCEPT.");
+            return Some(crate::reflex_reject("Unsupported set operation. Supported: UNION, INTERSECT, EXCEPT."));
         }
     }
 
@@ -505,11 +505,11 @@ fn try_decompose_window(
         // CTEs and set-ops were already decomposed earlier in the pipeline,
         // so any remaining window in a subquery cannot be incrementally maintained.
         if parsed.analysis.has_window_function {
-            return Some(
-                "ERROR: Window functions are only supported in the top-level SELECT. \
+            return Some(crate::reflex_reject(
+                "Window functions are only supported in the top-level SELECT. \
 A window function inside a subquery or derived table cannot be incrementally \
 maintained — move it to the outermost SELECT, or define this view with kind: mv.",
-            );
+            ));
         }
         return None;
     }
@@ -615,22 +615,22 @@ fn try_decompose_ctes(
                         let has_top_level_window =
                             cte_analysis.select_columns.iter().any(|c| c.is_window);
                         if has_top_level_window {
-                            return Some(
-                                "ERROR: A CTE uses a window function at the top level and is \
+                            return Some(crate::reflex_reject(
+                                "A CTE uses a window function at the top level and is \
 referenced by an outer query. A window-function result is a read-time view that cannot be \
 incrementally maintained as a join source. Move the window function to the outermost \
 SELECT, or define this view with kind: mv.",
-                            );
+                            ));
                         }
 
                         // Check for DISTINCT ON
                         if cte_analysis.has_distinct_on {
-                            return Some(
-                                "ERROR: A CTE uses DISTINCT ON at the top level and is referenced \
+                            return Some(crate::reflex_reject(
+                                "A CTE uses DISTINCT ON at the top level and is referenced \
 by an outer query. A DISTINCT-ON result is a read-time view that cannot be incrementally \
 maintained as a join source. Move DISTINCT ON to the outermost SELECT, or define this view \
 with kind: mv.",
-                            );
+                            ));
                         }
 
                         // Extract output column names from the CTE's analysis.
@@ -685,9 +685,9 @@ with kind: mv.",
             || alias_lower.starts_with("__reflex_old_")
             || alias_lower.starts_with("__reflex_delta_")
         {
-            return Some(
-                "ERROR: CTE alias conflicts with pg_reflex reserved prefix (__reflex_new_/old_/delta_)",
-            );
+            return Some(crate::reflex_reject(
+                "CTE alias conflicts with pg_reflex reserved prefix (__reflex_new_/old_/delta_)",
+            ));
         }
 
         // Rewrite references to earlier CTEs in this CTE's query
@@ -741,7 +741,7 @@ with kind: mv.",
         }
         body
     } else {
-        return Some("ERROR: Query is not a SELECT");
+        return Some(crate::reflex_reject("Query is not a SELECT"));
     };
 
     // Check if the main body is passthrough (no aggregation).
@@ -951,7 +951,7 @@ fn check_existence_and_cycle(ctx: &BuildContext) -> Option<&'static str> {
         if ctx.if_not_exists {
             return Some("REFLEX INCREMENTAL VIEW ALREADY EXISTS (skipped)");
         }
-        return Some("ERROR: IMV with this name already exists");
+        return Some(crate::reflex_reject("IMV with this name already exists"));
     }
 
     let cycle_detected = if ctx.froms.is_empty() {
@@ -993,7 +993,7 @@ fn check_existence_and_cycle(ctx: &BuildContext) -> Option<&'static str> {
         })
     };
     if cycle_detected {
-        return Some("ERROR: circular dependency detected — this IMV would form a cycle in the dependency graph");
+        return Some(crate::reflex_reject("circular dependency detected — this IMV would form a cycle in the dependency graph"));
     }
     None
 }
@@ -1044,11 +1044,11 @@ fn resolve_partitioning(ctx: &mut BuildContext) -> Result<(), String> {
                     && !gb_normalized.contains(&col_l)
                     && !projected_aliases.contains(&col_l)
                 {
-                    return Err(format!(
-                        "ERROR: partition_by column '{}' is not in GROUP BY; \
+                    return Err(crate::reflex_reject(&format!(
+                        "partition_by column '{}' is not in GROUP BY; \
                          partition columns must be a subset of GROUP BY for aggregate IMVs",
                         col
-                    ));
+                    )).to_string());
                 }
                 // Phase B (plans/partitioning_3.md §2): reject when the
                 // matching GROUP BY entry is a computed expression rather
@@ -1074,13 +1074,13 @@ fn resolve_partitioning(ctx: &mut BuildContext) -> Result<(), String> {
                 };
                 if let Some(ref gb) = gb_expr {
                     if !crate::sql_analyzer::is_bare_column_reference(gb) {
-                        return Err(format!(
-                            "ERROR: partition_by column '{}' corresponds to a computed \
+                        return Err(crate::reflex_reject(&format!(
+                            "partition_by column '{}' corresponds to a computed \
                              GROUP BY expression ('{}'). Partition columns must be bare \
                              column references on the source. Workaround: add a generated \
                              / computed column to the source and partition on that.",
                             col, gb
-                        ));
+                        )).to_string());
                     }
                 }
             }
@@ -1110,7 +1110,7 @@ fn resolve_partitioning(ctx: &mut BuildContext) -> Result<(), String> {
         match validate_result {
             Ok(s) => ctx.resolved_strategy = s,
             Err(e) => {
-                return Err(format!("ERROR: partition_by validation failed — {}", e));
+                return Err(crate::reflex_reject(&format!("partition_by validation failed — {}", e)).to_string());
             }
         }
     } else {
@@ -2071,18 +2071,15 @@ pub(crate) fn create_reflex_ivm_impl(
     };
 
     if let Some(gb) = first_unprojected_group_key(&parsed.analysis) {
-        return Box::leak(
-            format!(
-                "ERROR: GROUP BY key '{gb}' is not projected in the SELECT list. \
-                 An aggregate reflex IMV requires every GROUP BY column to appear bare in \
-                 SELECT — a key used only inside an expression (e.g. COALESCE({gb}, 0)) or \
-                 omitted from SELECT has no column in the result table, which the target \
-                 index and incremental refresh both rely on. Fix: add '{gb}' to the SELECT \
-                 list, or move the wrapping expression into a passthrough outer layer \
-                 (an outer SELECT over a CTE that projects the bare key + aggregates)."
-            )
-            .into_boxed_str(),
-        );
+        return crate::reflex_reject(&format!(
+            "GROUP BY key '{gb}' is not projected in the SELECT list. \
+             An aggregate reflex IMV requires every GROUP BY column to appear bare in \
+             SELECT — a key used only inside an expression (e.g. COALESCE({gb}, 0)) or \
+             omitted from SELECT has no column in the result table, which the target \
+             index and incremental refresh both rely on. Fix: add '{gb}' to the SELECT \
+             list, or move the wrapping expression into a passthrough outer layer \
+             (an outer SELECT over a CTE that projects the bare key + aggregates)."
+        ));
     }
 
     if let Some(result) = try_decompose_set_op(
@@ -2152,8 +2149,8 @@ pub(crate) fn create_reflex_ivm_impl(
             .to_uppercase()
             .contains("GROUP BY");
     if has_subquery_with_agg {
-        return "ERROR: Subqueries with aggregation in FROM are not supported. \
-                Use a CTE (WITH clause) instead — pg_reflex decomposes CTEs into sub-IMVs automatically.";
+        return crate::reflex_reject("Subqueries with aggregation in FROM are not supported. \
+                Use a CTE (WITH clause) instead — pg_reflex decomposes CTEs into sub-IMVs automatically.");
     }
 
     let ParsedInputs {
@@ -2178,8 +2175,8 @@ pub(crate) fn create_reflex_ivm_impl(
             crate::sql_analyzer::AggregateKind::CountDistinct))
     });
     if has_cd && has_other_agg {
-        return "ERROR: COUNT(DISTINCT col) cannot be mixed with other aggregates in the same query. \
-                Use a CTE to separate them: WITH cd AS (SELECT grp, COUNT(DISTINCT col) ...) SELECT ...";
+        return crate::reflex_reject("COUNT(DISTINCT col) cannot be mixed with other aggregates in the same query. \
+                Use a CTE to separate them: WITH cd AS (SELECT grp, COUNT(DISTINCT col) ...) SELECT ...");
     }
 
     let froms = analysis.sources.clone();

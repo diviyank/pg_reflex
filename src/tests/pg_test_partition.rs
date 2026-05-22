@@ -110,7 +110,7 @@ fn pg_part_partition_by_not_in_group_by_errors() {
     .expect("call")
     .expect("result");
     assert!(
-        r.starts_with("ERROR: partition_by column 'amount' is not in GROUP BY"),
+        r.starts_with("ERROR: [reflex-unsupported] partition_by column 'amount' is not in GROUP BY"),
         "got: {r}"
     );
 }
