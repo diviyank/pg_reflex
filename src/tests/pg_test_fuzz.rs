@@ -1092,32 +1092,27 @@ pub mod findings {
     #[pg_test]
     #[ignore]
     fn finding_2_deferred_mode_duplicate_key_violation() {
-        Spi::run("CREATE TABLE f2_t0 (id int primary key, m numeric, d text)").unwrap();
-
-        // Create the MV
-        let body = "SELECT id, m, d FROM f2_t0";
+        // Minimal verified repro: in DEFERRED mode, INSERTing a new key and then
+        // UPDATEing that SAME key within one deferred batch (before flush) makes the
+        // flush MERGE violate the target unique constraint __reflex_uk_*. (A batch of
+        // only-updates-of-existing-keys + only-inserts-of-new-keys flushes fine; the
+        // trigger is insert+update of the SAME key in one batch.) flush takes the
+        // SOURCE table name (f2_t0), not the IMV name.
+        Spi::run("CREATE TABLE f2_t0 (id int primary key, m numeric)").unwrap();
+        Spi::run("INSERT INTO f2_t0 VALUES (1, 1.0)").unwrap();
+        let body = "SELECT id, m FROM f2_t0";
         Spi::run(&format!("CREATE MATERIALIZED VIEW f2_mv AS {body}")).unwrap();
-
-        // Create the IMV with DEFERRED mode
         let r = crate::create_reflex_ivm("f2_imv", body, Some("id"), None, Some("DEFERRED"), None);
         assert!(r.starts_with("CREATE REFLEX"), "IMV creation failed: {r}");
 
-        // Seed the table
-        Spi::run("INSERT INTO f2_t0 VALUES (0,0.0,'g0'),(1,1.1,'g1'),(2,2.2,'g2'),(3,3.0,'g3'),(4,4.1,'g0'),(5,0.2,'g1'),(6,1.0,'g2'),(7,2.1,'g3')")
-            .unwrap();
+        // One deferred batch: insert id=2, then update id=2.
+        Spi::run("INSERT INTO f2_t0 VALUES (2, 5.0)").unwrap();
+        Spi::run("UPDATE f2_t0 SET m = m + 1 WHERE id = 2").unwrap();
 
-        // Perform mutations in a single transaction
-        Spi::run("UPDATE f2_t0 SET m = m + 1 WHERE id % 2 = 0").unwrap();
-        Spi::run("INSERT INTO f2_t0 (id, m, d) VALUES (8, 3.2, 'g0')").unwrap();
-
-        // Flush deferred changes (this should not raise a duplicate key error)
-        let flush_result = Spi::run("SELECT reflex_flush_deferred('f2_imv')");
-        assert!(flush_result.is_ok(), "flush_deferred failed: {:?}", flush_result.err());
-
-        // Refresh the MV
+        // flush must NOT raise duplicate-key; IMV must then match a refreshed MV.
+        Spi::run("SELECT reflex_flush_deferred('f2_t0')").unwrap();
         Spi::run("REFRESH MATERIALIZED VIEW f2_mv").unwrap();
 
-        // Compare the two views
         let diff = Spi::get_one::<i64>(
             "SELECT count(*)::bigint FROM ( \
                (SELECT * FROM f2_mv EXCEPT SELECT * FROM f2_imv) UNION ALL \

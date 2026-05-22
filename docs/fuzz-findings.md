@@ -72,38 +72,39 @@ cargo pgrx test pg17 finding_1_leftjoin_unmatched_primary_insert_drops_row -- --
 
 **Status:** OPEN
 
-**Title:** A single-table passthrough view with DEFERRED incremental maintenance, after DML mutations, fails during reflex_flush_deferred() with "duplicate key value violates unique constraint" error. This suggests the maintenance logic is attempting to insert or merge rows that would create duplicate key violations in the target IMV.
+**Title:** In DEFERRED mode, INSERTing a new key and then UPDATEing that **same key** within one deferred batch (before flush) makes `reflex_flush_deferred()` fail with `duplicate key value violates unique constraint "__reflex_uk_*"` (SQLSTATE 23505), corrupting/dropping the row.
 
-**Exact Repro:**
+**Minimal repro (verified — controller-confirmed standalone):**
 
 ```sql
-CREATE TABLE f2_t0 (id int primary key, m numeric, d text);
+CREATE TABLE f2_t0 (id int primary key, m numeric);
+INSERT INTO f2_t0 VALUES (1, 1.0);                       -- materialized at create
+CREATE MATERIALIZED VIEW f2_mv AS SELECT id, m FROM f2_t0;
+SELECT create_reflex_ivm('f2_imv', 'SELECT id, m FROM f2_t0', 'id', 'UNLOGGED', 'DEFERRED');
 
-CREATE MATERIALIZED VIEW f2_mv AS
-  SELECT id, m, d FROM f2_t0;
+-- one deferred batch: insert a NEW key then UPDATE the SAME key, before flushing
+INSERT INTO f2_t0 VALUES (2, 5.0);
+UPDATE f2_t0 SET m = m + 1 WHERE id = 2;
 
-SELECT create_reflex_ivm('f2_imv', '<same body>', 'id', deferred:=true);
-
-INSERT INTO f2_t0 VALUES (0,0.0,'g0'),(1,1.1,'g1'),(2,2.2,'g2'),(3,3.0,'g3'),(4,4.1,'g0'),(5,0.2,'g1'),(6,1.0,'g2'),(7,2.1,'g3');
-UPDATE f2_t0 SET m = m + 1 WHERE id % 2 = 0;
-INSERT INTO f2_t0 (id,m,d) VALUES (8,3.2,'g0');
-
-SELECT reflex_flush_deferred('f2_imv');
+SELECT reflex_flush_deferred('f2_t0');   -- SOURCE table name, not the IMV name
 REFRESH MATERIALIZED VIEW f2_mv;
+-- flush raises: duplicate key value violates unique constraint "__reflex_uk_f2_imv"
 ```
+
+**Verified boundary (what does / doesn't trigger it):**
+
+- A deferred batch that only UPDATEs existing keys and only INSERTs brand-new keys (no key both inserted and updated) flushes fine — confirmed PASS.
+- A batch that INSERTs a key and then UPDATEs that same key (Pattern C above) FAILS — confirmed.
+- The harness's original failure (DEFERRED IMV created on an empty table, then the whole seed inserted *and* some of those same rows updated in one deferred batch) is the same root cause amplified.
 
 **Expected vs Actual:**
 
-- **Expected:** reflex_flush_deferred() succeeds; IMV rows match MV rows after flush.
-- **Actual:** reflex_flush_deferred() raises "duplicate key value violates unique constraint" during the MERGE operation into the target table.
+- **Expected:** flush succeeds; IMV rows match a refreshed MV.
+- **Actual:** flush raises `duplicate key value violates unique constraint "__reflex_uk_<imv>"` (SQLSTATE 23505) during the MERGE into the target.
 
 **Suspected Root Cause:**
 
-The DEFERRED mode incremental maintenance logic in pg_reflex accumulates changes in a temporary staging/delta table during DML, then applies them via a MERGE on flush. The issue appears to be that:
-
-1. When multiple rows are modified or inserted in the same transaction, the delta tracking may not properly coalesce them (e.g., old key value and new key value for the same logical row).
-2. The MERGE statement generated for DEFERRED flush may not have correct source deduplication or handling of source row cardinality > 1 per key, leading to duplicate key violation on the target.
-3. Alternatively, the incremental trigger/delta-capture logic may be capturing the same row twice or with conflicting state (both inserted and updated).
+The deferred delta-capture / coalescing does not collapse an INSERT followed by an UPDATE of the same key into a single net INSERT. On flush, the source delta presents that key with cardinality > 1 (or as both an insert and an update), so the generated MERGE attempts two INSERTs for the one target key → unique-constraint violation. Fix direction: coalesce per-key deltas in the deferred batch (insert+update of same key → one insert with the final values; insert+delete → no-op) before the flush MERGE, or make the MERGE source deduplicate to the final state per key.
 
 **Affected Shapes (Parked):**
 
