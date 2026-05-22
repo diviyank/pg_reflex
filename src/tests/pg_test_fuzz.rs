@@ -333,16 +333,11 @@ pub mod oracle {
             .unwrap_or_default()
     }
 
-    fn exact_diff_count(mv: &str, imv: &str) -> i64 {
-        let sql = format!(
-            "SELECT count(*)::bigint FROM ( \
-               (SELECT * FROM {mv} EXCEPT SELECT * FROM {imv}) UNION ALL \
-               (SELECT * FROM {imv} EXCEPT SELECT * FROM {mv})) d"
-        );
-        Spi::get_one::<i64>(&sql)
-            .ok()
-            .flatten()
-            .unwrap_or(-1)
+    fn diff_subquery(mv: &str, imv: &str) -> String {
+        format!(
+            "( (SELECT * FROM {mv} EXCEPT SELECT * FROM {imv}) UNION ALL \
+             (SELECT * FROM {imv} EXCEPT SELECT * FROM {mv}) ) d"
+        )
     }
 
     fn rename_case(case: &FuzzCase, suffix: &str) -> FuzzCase {
@@ -382,96 +377,124 @@ pub mod oracle {
         let suffix = format!("_fz{seq}");
         let case = rename_case(case, &suffix);
 
+        // DETERMINISTIC SETUP: Create base tables and MV. These never raise from codegen,
+        // so they're safe to run in the outer transaction.
         for t in &case.tables {
-            if let Err(_) = Spi::run(&render::create_table_sql(t)) {
-                return Outcome::Bug("failed to create base table".to_string());
-            }
+            Spi::run(&render::create_table_sql(t))
+                .expect("setup ddl: create base table failed");
         }
 
         let mv = format!("mv{suffix}");
         let imv = format!("imv{suffix}");
+        let result_table = format!("result{suffix}");
 
-        if let Err(_) = Spi::run(&render::create_mv_sql(&mv, &case.select_body)) {
-            return Outcome::Bug("failed to create mv".to_string());
+        Spi::run(&render::create_mv_sql(&mv, &case.select_body))
+            .expect("setup ddl: create mv failed");
+
+        // Build the DML statements for the DO block.
+        let mut dml_lines = Vec::new();
+        for txn in &case.dml {
+            for stmt in &txn.statements {
+                let cols = cols_of(&case, match stmt {
+                    DmlStmt::Insert { table, .. }
+                    | DmlStmt::Delete { table, .. }
+                    | DmlStmt::Update { table, .. }
+                    | DmlStmt::Truncate { table } => table,
+                });
+                let sql = render::dml_sql(stmt, &|_t: &str| cols.clone());
+                dml_lines.push(format!("    {sql};"));
+            }
         }
+        let dml_block = dml_lines.join("\n");
 
-        // Try to create a savepoint for isolation, but don't fail if already in a
-        // transaction (e.g., #[pg_test] context). The PgTryBuilder will catch
-        // exceptions anyway.
-        let savepoint_ok = Spi::run(&format!("SAVEPOINT sp{suffix}")).is_ok();
+        // Build flush lines if deferred.
+        let mut flush_lines = Vec::new();
+        if case.deferred {
+            for t in &case.tables {
+                flush_lines.push(format!("    PERFORM reflex_flush_deferred('{}');", t.name));
+            }
+        }
+        let flush_block = flush_lines.join("\n");
 
+        // Build the diff subquery (without the outer SELECT).
+        let diff_subquery_str = diff_subquery(&mv, &imv);
+
+        // Construct the DO block as a string. Use $reflexbody$ for body dollar-quoting
+        // to avoid collisions with the DO block's outer $$ quotes.
         let keys = case.unique_columns.join(",");
         let mode = if case.deferred { "DEFERRED" } else { "IMMEDIATE" };
         let body = case.select_body.rendered_sql.clone();
-        let case_in = case.clone();
-        let mv_in = mv.clone();
-        let imv_in = imv.clone();
-        let suffix_in = suffix.clone();
 
-        let outcome = PgTryBuilder::new(move || {
-            let msg = crate::create_reflex_ivm(
-                &imv_in,
-                &body,
-                Some(&keys),
-                None,
-                Some(mode),
-                None,
-            );
-            if msg.contains(crate::REFLEX_UNSUPPORTED_TAG) {
-                return Outcome::Skip(msg.to_string());
-            }
-            if !msg.starts_with("CREATE REFLEX") {
-                return Outcome::Bug(format!("unexpected create return: {msg}"));
-            }
+        // Build a PL/pgSQL function that encodes the result as JSON for transport across SPI.
+        // This avoids pgrx type deserialization issues with RETURNS TABLE.
+        let func_name = format!("oracle_func_{}", seq);
+        let create_func_sql = format!(
+            r#"CREATE OR REPLACE FUNCTION public.{} () RETURNS text AS $func$
+DECLARE
+  v_msg text;
+  v_diff bigint;
+  v_status text := 'MATCH';
+  v_detail text := '';
+BEGIN
+  v_msg := create_reflex_ivm('{}', $reflexbody${}$reflexbody$, '{}', NULL, '{}', NULL);
+  IF position('{}' in v_msg) > 0 THEN
+    v_status := 'SKIP';
+    v_detail := v_msg;
+  ELSIF v_msg NOT LIKE 'CREATE REFLEX%%' THEN
+    v_status := 'BUG';
+    v_detail := 'unexpected create return: ' || v_msg;
+  ELSE
+{}
+{}
+    REFRESH MATERIALIZED VIEW {};
 
-            for txn in &case_in.dml {
-                for stmt in &txn.statements {
-                    let cols = cols_of(&case_in, match stmt {
-                        DmlStmt::Insert { table, .. }
-                        | DmlStmt::Delete { table, .. }
-                        | DmlStmt::Update { table, .. }
-                        | DmlStmt::Truncate { table } => table,
-                    });
-                    let sql = render::dml_sql(stmt, &|_t: &str| cols.clone());
-                    let _ = Spi::run(&sql);
-                }
-            }
+    SELECT count(*)::bigint INTO v_diff FROM {};
 
-            if case_in.deferred {
-                for t in &case_in.tables {
-                    let _ = Spi::run(&format!("SELECT reflex_flush_deferred('{}')", t.name));
-                }
-            }
+    IF v_diff > 0 THEN
+      v_status := 'BUG';
+      v_detail := v_diff || ' mismatched rows';
+    END IF;
+  END IF;
 
-            if let Err(_) = Spi::run(&render::refresh_mv_sql(&mv_in)) {
-                return Outcome::Bug("failed to refresh mv".to_string());
-            }
+  RETURN v_status || '|||' || v_detail;
+EXCEPTION WHEN OTHERS THEN
+  RETURN 'BUG' || '|||' || ('codegen exception: ' || SQLERRM);
+END;
+$func$ LANGUAGE plpgsql;
+"#,
+            func_name,
+            imv,               // create_reflex_ivm arg
+            body,              // $reflexbody content
+            keys,              // third arg to create_reflex_ivm
+            mode,              // fifth arg to create_reflex_ivm
+            crate::REFLEX_UNSUPPORTED_TAG,  // position check
+            dml_block,         // DML statements
+            flush_block,       // flush statements
+            mv,                // REFRESH target
+            diff_subquery_str, // SELECT FROM subquery
+        );
 
-            let diff = exact_diff_count(&mv_in, &imv_in);
-            if diff == 0 {
-                Outcome::Match
-            } else {
-                Outcome::Bug(format!("contents diverge: {diff} mismatched rows"))
-            }
-        })
-        .catch_others(|_caught| {
-            Outcome::Bug("codegen exception (caught)".to_string())
-        })
-        .execute();
-
-        // Only attempt to release/rollback savepoint if it was created successfully.
-        if savepoint_ok {
-            match &outcome {
-                Outcome::Bug(_) => {
-                    let _ = Spi::run(&format!("ROLLBACK TO SAVEPOINT sp{suffix_in}"));
-                }
-                _ => {
-                    let _ = Spi::run(&format!("RELEASE SAVEPOINT sp{suffix_in}"));
-                }
-            }
+        // Create the function.
+        if let Err(e) = Spi::run(&create_func_sql) {
+            return Outcome::Bug(format!("create function error: {e:?}"));
         }
 
-        outcome
+        // Call the function and parse the result.
+        let call_func_sql = format!("SELECT {}();", func_name);
+        match Spi::get_one::<&str>(&call_func_sql) {
+            Ok(Some(result_str)) => {
+                let parts: Vec<&str> = result_str.splitn(2, "|||").collect();
+                let status = if parts.len() > 0 { parts[0] } else { "UNKNOWN" };
+                let detail = if parts.len() > 1 { parts[1].to_string() } else { String::new() };
+                match status {
+                    "MATCH" => Outcome::Match,
+                    "SKIP" => Outcome::Skip(detail),
+                    "BUG" => Outcome::Bug(detail),
+                    _ => Outcome::Bug(format!("unknown status: {}", status)),
+                }
+            }
+            e => Outcome::Bug(format!("function call error: {:?}", e)),
+        }
     }
 
     pub fn repro_sql(case: &FuzzCase) -> String {
@@ -498,6 +521,27 @@ pub mod oracle {
             case.unique_columns.join(",")
         ));
         out
+    }
+}
+
+#[cfg(any(test, feature = "pg_test"))]
+#[pg_test]
+fn oracle_recovery_survives_internal_exception() {
+    // Prove that the DO/EXCEPTION pattern leaves the outer transaction clean.
+    // We deliberately raise an exception in a DO block, then call evaluate() on
+    // a normal case to prove the outer transaction is still usable.
+    Spi::run("DO $$ BEGIN RAISE EXCEPTION 'boom'; EXCEPTION WHEN OTHERS THEN NULL; END $$")
+        .unwrap();
+    // outer txn must still be usable:
+    use proptest::strategy::{Strategy, ValueTree};
+    use proptest::test_runner::TestRunner;
+    let mut runner = TestRunner::default();
+    let c = generate::fuzz_case().new_tree(&mut runner).unwrap().current();
+    match oracle::evaluate(&c) {
+        oracle::Outcome::Match | oracle::Outcome::Skip(_) => {}
+        oracle::Outcome::Bug(msg) => {
+            panic!("expected Match/Skip after internal exception, got bug: {msg}")
+        }
     }
 }
 
