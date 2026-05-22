@@ -238,13 +238,135 @@ pub mod generate {
         }
     }
 
+    /// Two-table schema: t0 (id, m, d) and t1 (id, fk, w).
+    fn two_tables() -> impl Strategy<Value = (Table, Table)> {
+        Just((
+            Table {
+                name: "t0".into(),
+                pk: "id".into(),
+                columns: vec![
+                    Column { name: "id".into(), ty: ColType::Int, nullable: false },
+                    Column { name: "m".into(), ty: ColType::Numeric, nullable: true },
+                    Column { name: "d".into(), ty: ColType::Text, nullable: true },
+                ],
+            },
+            Table {
+                name: "t1".into(),
+                pk: "id".into(),
+                columns: vec![
+                    Column { name: "id".into(), ty: ColType::Int, nullable: false },
+                    Column { name: "fk".into(), ty: ColType::Int, nullable: true },
+                    Column { name: "w".into(), ty: ColType::Numeric, nullable: true },
+                ],
+            },
+        ))
+    }
+
+    fn seed_two(a: &Table, b: &Table) -> DmlTxn {
+        DmlTxn {
+            statements: vec![
+                DmlStmt::Insert { table: a.name.clone(), rows: seed_rows(a, 8) },
+                DmlStmt::Insert { table: b.name.clone(), rows: seed_rows(b, 8) },
+            ],
+        }
+    }
+
+    /// Join aggregate: SELECT t0.d, SUM(t0.m) AS s, COUNT(t1.w) AS c
+    /// FROM t0 LEFT JOIN t1 ON t1.fk = t0.id GROUP BY t0.d.
+    fn join_aggregate_case(a: Table, b: Table) -> FuzzCase {
+        let body = SelectBody {
+            rendered_sql:
+                "SELECT t0.d, SUM(t0.m) AS s, COUNT(t1.w) AS c FROM t0 LEFT JOIN t1 ON t1.fk = t0.id GROUP BY t0.d".into(),
+        };
+        let output_columns = vec![
+            Column { name: "d".into(), ty: ColType::Text, nullable: true },
+            Column { name: "s".into(), ty: ColType::Numeric, nullable: true },
+            Column { name: "c".into(), ty: ColType::BigInt, nullable: false },
+        ];
+        FuzzCase {
+            tables: vec![a.clone(), b.clone()],
+            select_body: body,
+            unique_columns: vec!["d".into()],
+            deferred: false,
+            dml: vec![seed_two(&a, &b)],
+            output_columns,
+        }
+    }
+
+    /// Carried scalar case: SELECT t0.id, SUM(t0.m) AS s, <carried>
+    /// FROM t0 LEFT JOIN t1 ON t1.fk = t0.id GROUP BY t0.id.
+    /// The carried expression varies by pick % 4.
+    fn carried_scalar_case(a: Table, b: Table, pick: usize) -> FuzzCase {
+        let (carried_sql, carried_col) = match pick % 4 {
+            0 => (
+                "COALESCE(SUM(t0.m), 0) AS s0".to_string(),
+                Column { name: "s0".into(), ty: ColType::Numeric, nullable: true },
+            ),
+            1 => (
+                "CASE WHEN COUNT(*) > 1 THEN 't' ELSE 'f' END AS lbl".to_string(),
+                Column { name: "lbl".into(), ty: ColType::Text, nullable: true },
+            ),
+            2 => (
+                "(t0.id)::text AS idt".to_string(),
+                Column { name: "idt".into(), ty: ColType::Text, nullable: true },
+            ),
+            _ => (
+                "EXISTS(SELECT 1 FROM t1 c WHERE c.fk = t0.id AND c.w > 0) AS flag".to_string(),
+                Column { name: "flag".into(), ty: ColType::Bool, nullable: true },
+            ),
+        };
+        let body = SelectBody {
+            rendered_sql: format!(
+                "SELECT t0.id, SUM(t0.m) AS s, {} FROM t0 LEFT JOIN t1 ON t1.fk = t0.id GROUP BY t0.id",
+                carried_sql
+            ),
+        };
+        let mut output_columns = vec![
+            Column { name: "id".into(), ty: ColType::Int, nullable: false },
+            Column { name: "s".into(), ty: ColType::Numeric, nullable: true },
+        ];
+        output_columns.push(carried_col);
+        FuzzCase {
+            tables: vec![a.clone(), b.clone()],
+            select_body: body,
+            unique_columns: vec!["id".into()],
+            deferred: false,
+            dml: vec![seed_two(&a, &b)],
+            output_columns,
+        }
+    }
+
+    /// CTE-decomposed: WITH agg AS (SELECT fk AS g, SUM(w) AS sw FROM t1 GROUP BY fk)
+    /// SELECT t0.id, SUM(t0.m) AS s, a.sw FROM t0 LEFT JOIN agg a ON a.g = t0.id GROUP BY t0.id, a.sw.
+    fn cte_decomposed_case(a: Table, b: Table) -> FuzzCase {
+        let body = SelectBody {
+            rendered_sql:
+                "WITH agg AS (SELECT fk AS g, SUM(w) AS sw FROM t1 GROUP BY fk) \
+                 SELECT t0.id, SUM(t0.m) AS s, a.sw FROM t0 LEFT JOIN agg a ON a.g = t0.id GROUP BY t0.id, a.sw".into(),
+        };
+        let output_columns = vec![
+            Column { name: "id".into(), ty: ColType::Int, nullable: false },
+            Column { name: "s".into(), ty: ColType::Numeric, nullable: true },
+            Column { name: "sw".into(), ty: ColType::Numeric, nullable: true },
+        ];
+        FuzzCase {
+            tables: vec![a.clone(), b.clone()],
+            select_body: body,
+            unique_columns: vec!["id".into()],
+            deferred: false,
+            dml: vec![seed_two(&a, &b)],
+            output_columns,
+        }
+    }
+
     pub fn fuzz_case() -> impl Strategy<Value = FuzzCase> {
-        single_table().prop_flat_map(|t| {
-            prop_oneof![
-                Just(passthrough_case(t.clone())),
-                Just(aggregate_case(t.clone())),
-            ]
-        })
+        prop_oneof![
+            single_table().prop_map(passthrough_case),
+            single_table().prop_map(aggregate_case),
+            two_tables().prop_map(|(a, b)| join_aggregate_case(a, b)),
+            (two_tables(), any::<usize>()).prop_map(|((a, b), p)| carried_scalar_case(a, b, p)),
+            two_tables().prop_map(|(a, b)| cte_decomposed_case(a, b)),
+        ]
     }
 }
 
@@ -305,6 +427,23 @@ mod generate_tests {
         assert!(case.select_body.rendered_sql.to_uppercase().contains("SELECT"));
         assert!(!case.unique_columns.is_empty());
         assert!(!case.output_columns.is_empty());
+    }
+
+    #[test]
+    fn generator_can_emit_join_and_cte_and_carried_shapes() {
+        use super::generate::fuzz_case;
+        let mut runner = TestRunner::default();
+        let (mut saw_join, mut saw_cte, mut saw_carried) = (false, false, false);
+        for _ in 0..400 {
+            let case = fuzz_case().new_tree(&mut runner).unwrap().current();
+            let sql = case.select_body.rendered_sql.to_uppercase();
+            saw_join |= sql.contains("JOIN");
+            saw_cte |= sql.contains("WITH ");
+            saw_carried |= sql.contains("COALESCE") || sql.contains("EXISTS") || sql.contains("CASE");
+            if saw_join && saw_cte && saw_carried { break; }
+        }
+        assert!(saw_join && saw_cte && saw_carried,
+            "generator must reach join/cte/carried shapes (join={saw_join} cte={saw_cte} carried={saw_carried})");
     }
 }
 
@@ -480,7 +619,7 @@ $func$ LANGUAGE plpgsql;
 
         // Call the function and parse the result.
         let call_func_sql = format!("SELECT {}();", func_name);
-        match Spi::get_one::<&str>(&call_func_sql) {
+        let outcome = match Spi::get_one::<&str>(&call_func_sql) {
             Ok(Some(result_str)) => {
                 let parts: Vec<&str> = result_str.splitn(2, "|||").collect();
                 let status = if parts.len() > 0 { parts[0] } else { "UNKNOWN" };
@@ -493,7 +632,14 @@ $func$ LANGUAGE plpgsql;
                 }
             }
             e => Outcome::Bug(format!("function call error: {:?}", e)),
-        }
+        };
+
+        // Note: No explicit cleanup of tables/MVs/IMVs here. The test runs in a transaction
+        // that rolls back at the end, so all objects are cleaned up automatically.
+        // Attempting to drop with CASCADE triggers pg_reflex's drop handlers which can cause
+        // side effects. We rely on the outer transaction rollback for cleanup.
+
+        outcome
     }
 
     pub fn repro_sql(case: &FuzzCase) -> String {
@@ -576,7 +722,9 @@ fn fuzz_case_count() -> u32 {
 #[cfg(any(test, feature = "pg_test"))]
 #[pg_test]
 fn fuzz_differential_exact() {
-    use proptest::test_runner::{Config, TestCaseError, TestError, TestRunner};
+    use proptest::test_runner::{Config, TestCaseError, TestRunner};
+
+    use std::cell::RefCell;
 
     let cfg = Config {
         cases: fuzz_case_count(),
@@ -584,15 +732,25 @@ fn fuzz_differential_exact() {
         ..Config::default()
     };
     let mut runner = TestRunner::new(cfg);
+    let first_bug = RefCell::new(None);
     let result = runner.run(&generate::fuzz_case(), |case| match oracle::evaluate(&case) {
         oracle::Outcome::Match | oracle::Outcome::Skip(_) => Ok(()),
-        oracle::Outcome::Bug(msg) => Err(TestCaseError::fail(format!(
-            "{msg}\n--- minimal repro ---\n{}",
-            oracle::repro_sql(&case)
-        ))),
+        oracle::Outcome::Bug(msg) => {
+            if first_bug.borrow().is_none() {
+                *first_bug.borrow_mut() = Some((msg.clone(), oracle::repro_sql(&case)));
+            }
+            Err(TestCaseError::fail(format!(
+                "{msg}\n--- minimal repro ---\n{}",
+                oracle::repro_sql(&case)
+            )))
+        }
     });
-    if let Err(TestError::Fail(reason, case)) = result {
-        panic!("differential fuzz found a bug: {reason}\nshrunk case: {case:?}");
+    if let Err(e) = result {
+        if let Some((msg, repro)) = first_bug.into_inner() {
+            panic!("differential fuzz found a bug:\n{msg}\n--- minimal repro ---\n{repro}");
+        } else {
+            panic!("differential fuzz failed with no bug captured. proptest error: {e:?}");
+        }
     }
 }
 
