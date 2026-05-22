@@ -1019,31 +1019,28 @@ fn fuzz_case_count() -> u32 {
         .unwrap_or(64)
 }
 
-#[cfg(any(test, feature = "pg_test"))]
-#[allow(dead_code)]
-pub mod findings {
-    use pgrx::prelude::*;
-
-    /// OPEN finding #1 — see docs/fuzz-findings.md. Remove #[ignore] when fixed.
+/// FIXED finding #1 — see docs/fuzz-findings.md. Root cause: the data-probe
+    /// (probe_not_null_columns_from_data) marked the LEFT-joined column NOT NULL
+    /// from the create-time all-matched intermediate, so MERGE maintenance dropped
+    /// a later unmatched primary-insert row. Fixed by skipping outer-join-nullable
+    /// columns in the probe.
     ///
     /// A two-table LEFT JOIN aggregate, after inserting a new PRIMARY-side (t0) row
-    /// that matches NO secondary row, DROPS that row from the IMV instead of keeping
-    /// it with the secondary columns NULL.
+    /// that matches NO secondary row, must KEEP that row with the secondary columns NULL.
     #[cfg(any(test, feature = "pg_test"))]
     #[pg_test]
-    #[ignore]
     fn finding_1_leftjoin_unmatched_primary_insert_drops_row() {
         Spi::run("CREATE TABLE f1_t0 (id int primary key, m numeric, d text)").unwrap();
         Spi::run("CREATE TABLE f1_t1 (id int primary key, fk int, w numeric)").unwrap();
 
-        // Seed both tables
-        Spi::run("INSERT INTO f1_t0 VALUES (0,0.0,'g0'),(1,1.1,'g1'),(2,2.2,'g2'),(3,3.0,'g3'),(4,4.1,'g0'),(5,0.2,'g1'),(6,1.0,'g2'),(7,2.1,'g3')")
-            .unwrap();
-        Spi::run("INSERT INTO f1_t1 VALUES (0,0,0.0),(1,1,1.1),(2,2,2.2),(3,3,3.0),(4,4,4.1),(5,0,0.2),(6,1,1.0),(7,2,2.1)")
-            .unwrap();
-
-        // Mutate secondary side
-        Spi::run("UPDATE f1_t1 SET w = w + 1 WHERE id % 2 = 0").unwrap();
+        // Seed ONLY matched rows: every t0.id has a matching agg.g (= t1.fk), so
+        // the LEFT-joined column `sw` is NULL-free in the create-time intermediate.
+        // This is the precondition that makes the data-probe optimization wrongly
+        // mark `sw` NOT NULL — the trigger for finding #1. (A seed where some rows
+        // are already unmatched at create time would leave `sw` already-NULL and
+        // never exercise the bug.)
+        Spi::run("INSERT INTO f1_t0 VALUES (0,0.0,'g0'),(1,1.1,'g1'),(2,2.2,'g2')").unwrap();
+        Spi::run("INSERT INTO f1_t1 VALUES (10,0,5.0),(11,1,6.0),(12,2,7.0)").unwrap();
 
         // Create the MV
         let body = "WITH agg AS (SELECT fk AS g, SUM(w) AS sw FROM f1_t1 GROUP BY fk) \
@@ -1054,7 +1051,9 @@ pub mod findings {
         let r = crate::create_reflex_ivm("f1_imv", body, Some("id"), None, None, None);
         assert!(r.starts_with("CREATE REFLEX"), "IMV creation failed: {r}");
 
-        // Insert a new primary-side row (id=8) that matches NO secondary row
+        // Insert a new primary-side row (id=8) that matches NO secondary row →
+        // its `sw` must be NULL in the IMV, but a NOT-NULL-marked `sw` would make
+        // MERGE maintenance drop the row entirely.
         Spi::run("INSERT INTO f1_t0 (id, m, d) VALUES (8, 3.2, 'g0')").unwrap();
 
         // Refresh the MV
@@ -1126,6 +1125,70 @@ pub mod findings {
 
         assert_eq!(diff, 0, "finding #2: IMV diverged from MV by {diff} rows after DEFERRED flush");
     }
+
+/// FIXED finding #3 — see docs/fuzz-findings.md. The former data-probe marked a
+/// group-by column NOT NULL whenever the create-time data happened to be
+/// null-free, even on a plain nullable column with no INNER-join / filter
+/// guarantee. A later legitimately-NULL group was then dropped by `=`-matching
+/// MERGE maintenance. Fixed by inferring NOT NULL only from query structure.
+///
+/// `GROUP BY d` on a nullable `d` that is null-free at create time, then inserting
+/// NULL-`d` rows, must keep the NULL group in the IMV.
+#[cfg(any(test, feature = "pg_test"))]
+#[pg_test]
+fn finding_3_nullable_groupby_key_drops_null_group() {
+    Spi::run("CREATE TABLE g3_t0 (id int primary key, m numeric, d text)").unwrap();
+    // Seed with NO nulls in `d`: the precondition that made the old data-probe
+    // wrongly mark `d` NOT NULL.
+    Spi::run("INSERT INTO g3_t0 VALUES (1,1.0,'a'),(2,2.0,'b'),(3,3.0,'a')").unwrap();
+    let body = "SELECT d, SUM(m) AS s FROM g3_t0 GROUP BY d";
+    Spi::run(&format!("CREATE MATERIALIZED VIEW g3_mv AS {body}")).unwrap();
+    let r = crate::create_reflex_ivm("g3_imv", body, Some("d"), None, None, None);
+    assert!(r.starts_with("CREATE REFLEX"), "IMV creation failed: {r}");
+    // Introduce a legitimate NULL group.
+    Spi::run("INSERT INTO g3_t0 VALUES (4,4.0,NULL),(5,5.0,NULL)").unwrap();
+    Spi::run("REFRESH MATERIALIZED VIEW g3_mv").unwrap();
+    let diff = Spi::get_one::<i64>(
+        "SELECT count(*)::bigint FROM ( \
+           (SELECT * FROM g3_mv EXCEPT SELECT * FROM g3_imv) UNION ALL \
+           (SELECT * FROM g3_imv EXCEPT SELECT * FROM g3_mv)) d",
+    )
+    .unwrap()
+    .unwrap();
+    let mv = Spi::get_one::<String>("SELECT string_agg(CAST((d,s) AS text), '; ' ORDER BY d NULLS LAST) FROM g3_mv").unwrap().unwrap_or_default();
+    let imv = Spi::get_one::<String>("SELECT string_agg(CAST((d,s) AS text), '; ' ORDER BY d NULLS LAST) FROM g3_imv").unwrap().unwrap_or_default();
+    assert_eq!(diff, 0, "finding #3: nullable-groupby diverged by {diff}\nMV:  {mv}\nIMV: {imv}");
+}
+
+/// Perf-preservation guard for the structural NOT-NULL inference. A
+/// catalog-NULLable column made non-NULL by an INNER-join equi-condition (the
+/// yse.ivm_sop_forecast_view 405 s shape) MUST still be promoted to NOT NULL so
+/// MERGE maintenance keeps `=` matching (index-friendly). If this regresses, the
+/// inference lost the INNER-join equi-key case.
+#[cfg(any(test, feature = "pg_test"))]
+#[pg_test]
+fn inner_join_equikey_promoted_not_null() {
+    Spi::run("CREATE TABLE ij_dp (id int primary key)").unwrap();
+    // dpid is catalog-NULLABLE, but the INNER join below makes it non-NULL.
+    Spi::run("CREATE TABLE ij_ss (id int primary key, dpid int, m numeric)").unwrap();
+    Spi::run("INSERT INTO ij_dp VALUES (10),(20),(30)").unwrap();
+    Spi::run("INSERT INTO ij_ss VALUES (1,10,1.0),(2,20,2.0),(3,10,3.0)").unwrap();
+    let body = "SELECT ss.dpid, SUM(ss.m) AS s FROM ij_ss ss \
+                INNER JOIN ij_dp dp ON dp.id = ss.dpid GROUP BY ss.dpid";
+    let r = crate::create_reflex_ivm("ij_imv", body, Some("dpid"), None, None, None);
+    assert!(r.starts_with("CREATE REFLEX"), "IMV creation failed: {r}");
+
+    // The INNER-join equi-key dpid must be inferred NOT NULL.
+    let promoted = Spi::get_one::<bool>(
+        "SELECT COALESCE((aggregations::jsonb->'not_null_columns') @> '[\"dpid\"]'::jsonb, false) \
+         FROM public.__reflex_ivm_reference WHERE name = 'ij_imv'",
+    )
+    .unwrap()
+    .unwrap_or(false);
+    assert!(
+        promoted,
+        "INNER-join equi-key 'dpid' was not inferred NOT NULL — 405s index optimization lost"
+    );
 }
 
 #[cfg(any(test, feature = "pg_test"))]

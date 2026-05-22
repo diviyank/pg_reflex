@@ -4,7 +4,7 @@ This document catalogs open findings from the differential correctness fuzz harn
 
 ## Finding #1: LEFT JOIN Unmatched Primary Insert Drops Row
 
-**Status:** OPEN
+**Status:** FIXED (structural NOT-NULL inference, `src/create_ivm.rs`)
 
 **Title:** A two-table LEFT JOIN aggregate, after inserting a new PRIMARY-side row that matches NO secondary row, DROPS that row from the IMV instead of keeping it with the secondary columns NULL.
 
@@ -33,9 +33,13 @@ REFRESH MATERIALIZED VIEW v_mv;
 - **MV (correct):** Contains row `(8, 3.2, NULL)` — the new primary-side row with secondary columns NULL (no matching secondary rows).
 - **IMV (bug):** MISSING row `(8, 3.2, NULL)` — the row is dropped entirely.
 
-**Suspected Root Cause:**
+**Confirmed Root Cause:**
 
-The data-probe (initial population of the IMV) marks outer-join columns as NOT NULL based on the initial all-matched state. During incremental MERGE maintenance, when a new primary-side row is inserted with no secondary matches, the NULL secondary columns fail the NOT NULL constraint or are filtered by the maintenance logic, causing the entire row to be dropped instead of being inserted with NULLs.
+The former data-probe (`probe_not_null_columns_from_data`) marked a group-by/distinct column NOT NULL whenever the **create-time intermediate data** happened to be NULL-free — using transient data as a proxy for "the query guarantees non-NULL". For a LEFT-joined column whose create-time rows all matched (or an empty/all-matched create), the probe wrongly marked it NOT NULL. MERGE maintenance then matched that key with `=` instead of `IS NOT DISTINCT FROM`; a later unmatched primary insert produced a NULL in that column that `=` could not match, so the row was dropped.
+
+**Fix:** Replaced the data-probe with `infer_not_null_columns`, which promotes a column to NOT NULL only when the query *structurally* guarantees it: an INNER-join equi-key, or a catalog-NOT-NULL base column on a non-nullable join side. Outer-join columns and unconstrained nullable columns are never promoted and keep the always-correct `IS NOT DISTINCT FROM`.
+
+**Note on the trigger shape:** the divergence requires the column to be NULL-free **at create time** (so the probe promotes it) and become NULL **later** (the unmatched insert). A seed where rows are already unmatched at create time leaves the column already-NULL and never exercises the bug — the regression test seeds only matched rows before create.
 
 **Affected Shapes (Parked):**
 
@@ -60,12 +64,45 @@ All three shapes are currently parked (disabled) in the `fuzz_case()` random gat
 
 **Test Reference:**
 
-The exact repro is encoded as an `#[ignore]`'d regression test:
-`src/tests/pg_test_fuzz.rs::findings::finding_1_leftjoin_unmatched_primary_insert_drops_row`
+Regression test (active, passes with the fix, fails when the fix is reverted):
+`src/tests/pg_test_fuzz.rs::finding_1_leftjoin_unmatched_primary_insert_drops_row`
 
-To run it (after fix):
 ```bash
-cargo pgrx test pg17 finding_1_leftjoin_unmatched_primary_insert_drops_row -- --ignored
+cargo pgrx test pg17 finding_1_leftjoin_unmatched_primary_insert_drops_row
+```
+
+## Finding #3: Nullable GROUP BY Key Drops the NULL Group
+
+**Status:** FIXED (same structural NOT-NULL inference as finding #1)
+
+**Title:** A single-table aggregate `GROUP BY <nullable col>` whose column is NULL-free at create time drops the legitimate NULL group when NULL values are later inserted.
+
+**Exact Repro:**
+
+```sql
+CREATE TABLE t (id int primary key, m numeric, d text);
+INSERT INTO t VALUES (1,1.0,'a'),(2,2.0,'b'),(3,3.0,'a');   -- no NULL d at create
+CREATE MATERIALIZED VIEW v_mv AS SELECT d, SUM(m) AS s FROM t GROUP BY d;
+SELECT create_reflex_ivm('v_imv', 'SELECT d, SUM(m) AS s FROM t GROUP BY d', 'd');
+
+INSERT INTO t VALUES (4,4.0,NULL),(5,5.0,NULL);            -- a legitimate NULL group
+REFRESH MATERIALIZED VIEW v_mv;
+```
+
+**Expected vs Actual:**
+
+- **MV (correct):** has the NULL group `(NULL, 9.0)`.
+- **IMV (bug, pre-fix):** MISSING the NULL group entirely.
+
+**Root Cause / Fix:** Identical to finding #1 — the data-probe marked the catalog-nullable `d` NOT NULL because it was null-free at create. `GROUP BY d` then matched with `=`, which never matches the later NULL key, so the NULL group's MERGE found no target row and the group was lost. The structural inference does not promote `d` (no INNER-join equi-key, catalog-nullable, no NOT-NULL filter), so maintenance uses `IS NOT DISTINCT FROM` and the NULL group is maintained correctly.
+
+**Perf preservation:** the INNER-join equi-key case that the original data-probe existed to optimize (yse.ivm_sop_forecast_view, 405 s) is still promoted — guarded by `inner_join_equikey_promoted_not_null`.
+
+**Test References:**
+
+```bash
+cargo pgrx test pg17 finding_3_nullable_groupby_key_drops_null_group
+cargo pgrx test pg17 inner_join_equikey_promoted_not_null   # perf-preservation guard
 ```
 
 ## Finding #2: DEFERRED Mode Duplicate Key Violation During Flush

@@ -2013,15 +2013,15 @@ fn initial_aggregate_materialization(client: &mut SpiClient<'_>, ctx: &mut Build
         )
         .unwrap_or_report();
 
-    // 1.4.5: data-probe pass. Scan the intermediate for group-by /
-    // distinct columns whose actual data is NULL-free, and add them
-    // to not_null_columns. Catches the case where a catalog-NULLable
-    // column is effectively NOT NULL because the IMV's INNER JOIN
-    // or filter semantics exclude NULLs. Without this, the trigger's
-    // MERGE codegen would emit `IS NOT DISTINCT FROM` on the
-    // composite-index leading column, defeating the index — the
-    // 405 s yse.ivm_sop_forecast_view regression in 1.4.4.
-    let probed_nn = probe_not_null_columns_from_data(client, &intermediate_tbl, &ctx.plan);
+    // Structural NOT-NULL inference. Promote group-by / distinct columns that
+    // are *provably* non-NULL from the query (INNER-join equi-keys or catalog
+    // NOT-NULL base columns on a non-nullable side), so MERGE maintenance can
+    // match keys with `=` instead of `IS NOT DISTINCT FROM` — the index-defeating
+    // 405 s yse.ivm_sop_forecast_view regression in 1.4.4. Unlike the former
+    // data-probe this never trusts transient null-freeness, so a later NULL on a
+    // genuinely nullable / outer-join column cannot silently drop rows
+    // (docs/fuzz-findings.md findings #1 and #3).
+    let probed_nn = infer_not_null_columns(client, &ctx.plan, Some(&ctx.analysis));
     let new_cols: Vec<String> = probed_nn
         .into_iter()
         .filter(|c| !ctx.plan.not_null_columns.contains(c))
@@ -2749,36 +2749,258 @@ fn query_column_types_from_catalog_with_per_source(
     (types, not_null_cols, per_source)
 }
 
-/// 1.4.5: data-probe. Scan the populated intermediate for group-by and
-/// distinct columns whose actual data contains zero NULLs. Returns the set
-/// of normalized column names found to be NULL-free.
-///
-/// Closes the gap left by the pure catalog heuristic
-/// `query_column_types_from_catalog`: a column declared NULLable in
-/// `information_schema.columns` may still be effectively NOT NULL on the
-/// intermediate if the base_query's INNER JOIN keys or filter predicates
-/// exclude NULLs. The probe runs *after* the bulk INSERT into intermediate
-/// so it sees the real data.
-///
-/// Customer-reported regression (yse.ivm_sop_forecast_view, 1.4.4): catalog
-/// declared `sales_simulation.dem_plan_id / product_id / location_id`
-/// NULLable; the IMV's INNER JOIN on `dem_plan_id = demand_planning.id`
-/// makes those columns non-NULL on the join output. Without the probe, the
-/// MERGE codegen emits `IS NOT DISTINCT FROM` on the composite-index
-/// leading column, defeating the index. Symptom: 405 s UPDATE on a 1-row
-/// source change.
-///
-/// Trade-off: one EXISTS scan per group-by column at create time, each
-/// short-circuiting on the first matching NULL. On a NULL-free 867 K
-/// composite key column the scan touches the index leading-column once
-/// per page (~50 ms total for 8 columns). Trivial relative to the
-/// alternative (the 405 s blowup on first UPDATE).
-fn probe_not_null_columns_from_data(
-    client: &mut pgrx::spi::SpiClient<'_>,
-    intermediate_tbl: &str,
-    plan: &crate::aggregation::AggregationPlan,
+/// Canonicalize a column reference for comparison: lower-case, trim, and strip
+/// the double-quotes around each dotted part. `"ss"."Dem_Plan_Id"` → `ss.dem_plan_id`.
+fn canon_col_ref(s: &str) -> String {
+    s.trim()
+        .split('.')
+        .map(|p| p.trim().trim_matches('"').to_lowercase())
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+/// True if `s` is a bare column reference (`ident` or `qualifier.ident`) rather
+/// than a function call, literal, or compound expression. Only such refs can be
+/// safely treated as join-key operands.
+fn is_simple_col_ref(s: &str) -> bool {
+    let t = s.trim();
+    if t.is_empty() {
+        return false;
+    }
+    t.split('.').all(|p| {
+        let p = p.trim().trim_matches('"');
+        !p.is_empty()
+            && p.chars()
+                .all(|c| c.is_alphanumeric() || c == '_' || c == '$')
+    })
+}
+
+/// Split a boolean expression on top-level ` AND `, respecting parentheses and
+/// single-quoted string literals.
+fn split_top_level_and(cond: &str) -> Vec<String> {
+    let bytes = cond.as_bytes();
+    let upper = cond.to_uppercase();
+    let mut parts = Vec::new();
+    let mut depth = 0i32;
+    let mut in_str = false;
+    let mut start = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let c = bytes[i] as char;
+        if in_str {
+            if c == '\'' {
+                in_str = false;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            '\'' => in_str = true,
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            _ => {
+                if depth == 0 && upper[i..].starts_with(" AND ") {
+                    parts.push(cond[start..i].to_string());
+                    i += 5;
+                    start = i;
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+    parts.push(cond[start..].to_string());
+    parts
+}
+
+/// If `conj` is a top-level equality `lhs = rhs` (not `<=`, `>=`, `<>`, `!=`),
+/// return the two operands. Respects parentheses and string literals.
+fn split_top_level_eq(conj: &str) -> Option<(&str, &str)> {
+    let bytes = conj.as_bytes();
+    let mut depth = 0i32;
+    let mut in_str = false;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let c = bytes[i] as char;
+        if in_str {
+            if c == '\'' {
+                in_str = false;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            '\'' => in_str = true,
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            '=' if depth == 0 => {
+                let prev = if i > 0 { bytes[i - 1] as char } else { ' ' };
+                let next = if i + 1 < bytes.len() {
+                    bytes[i + 1] as char
+                } else {
+                    ' '
+                };
+                if !matches!(prev, '<' | '>' | '!') && next != '=' {
+                    return Some((&conj[..i], &conj[i + 1..]));
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Collect the canonical column references that are guaranteed non-NULL because
+/// they appear as an operand of a conjunctive equality in an INNER-join ON
+/// condition. An equi-join `x = y` cannot match a NULL on either side, so both
+/// operands are non-NULL in the join output. Conditions containing a top-level
+/// `OR` are skipped (a disjunct could re-admit a NULL).
+fn inner_join_equi_non_null_refs(
+    analysis: &crate::sql_analyzer::SqlAnalysis,
 ) -> std::collections::HashSet<String> {
-    let mut probed = std::collections::HashSet::new();
+    let mut refs = std::collections::HashSet::new();
+    for j in &analysis.joins {
+        if !j.join_type.to_uppercase().contains("INNER") {
+            continue;
+        }
+        let Some(cond) = &j.condition_sql else {
+            continue;
+        };
+        if cond.to_uppercase().contains(" OR ") {
+            continue;
+        }
+        for conj in split_top_level_and(cond) {
+            if let Some((l, r)) = split_top_level_eq(&conj) {
+                if is_simple_col_ref(l) {
+                    refs.insert(canon_col_ref(l));
+                }
+                if is_simple_col_ref(r) {
+                    refs.insert(canon_col_ref(r));
+                }
+            }
+        }
+    }
+    refs
+}
+
+/// Resolve a (possibly aliased) column reference to its real source table.
+/// Returns `(real_table, bare_column)` when the reference is a simple
+/// `qualifier.col` or a bare `col` with a single source; `None` otherwise.
+fn resolve_column_source(
+    analysis: &crate::sql_analyzer::SqlAnalysis,
+    col_expr: &str,
+) -> Option<(String, String)> {
+    if !is_simple_col_ref(col_expr) {
+        return None;
+    }
+    let canon = canon_col_ref(col_expr);
+    if let Some((qual, col)) = canon.split_once('.') {
+        let real = analysis
+            .table_aliases
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(qual))
+            .map(|(_, v)| v.trim_matches('"').to_lowercase())
+            .unwrap_or_else(|| qual.to_string());
+        Some((real, col.to_string()))
+    } else if analysis.sources.len() == 1 {
+        Some((analysis.sources[0].trim_matches('"').to_lowercase(), canon))
+    } else {
+        None
+    }
+}
+
+/// True if `col_expr` resolves to a base-table column declared NOT NULL in the
+/// catalog AND that table is not on the nullable side of an outer join. Such a
+/// column can never be NULL in the IMV.
+fn column_base_not_null(
+    client: &mut pgrx::spi::SpiClient<'_>,
+    analysis: &crate::sql_analyzer::SqlAnalysis,
+    col_expr: &str,
+    left_target_tables: &std::collections::HashSet<String>,
+) -> bool {
+    let Some((table, col)) = resolve_column_source(analysis, col_expr) else {
+        return false;
+    };
+    if left_target_tables.contains(&table) {
+        return false;
+    }
+    client
+        .select(
+            "SELECT a.attnotnull AS nn FROM pg_attribute a \
+             WHERE a.attrelid = to_regclass($1) AND a.attname = $2 \
+               AND a.attnum > 0 AND NOT a.attisdropped",
+            Some(1),
+            &[
+                unsafe { DatumWithOid::new(table, PgBuiltInOids::TEXTOID.oid().value()) },
+                unsafe { DatumWithOid::new(col, PgBuiltInOids::TEXTOID.oid().value()) },
+            ],
+        )
+        .ok()
+        .and_then(|mut t| {
+            t.next()
+                .and_then(|r| r.get_by_name::<bool, _>("nn").ok().flatten())
+        })
+        == Some(true)
+}
+
+/// Infer the group-by / distinct columns that are *provably* NOT NULL from the
+/// query's structure (NOT from transient create-time data). A column is promoted
+/// only when it can never be NULL in the IMV:
+///
+///   * it is an equi-join operand of an INNER join (`dp.id = ss.dem_plan_id`
+///     keeps `ss.dem_plan_id` non-NULL — the yse.ivm_sop_forecast_view 405 s
+///     case), or
+///   * its base column is declared NOT NULL in the catalog and its table is not
+///     on the nullable side of an outer join.
+///
+/// Promoting a column lets MERGE maintenance match keys with `=` (index-friendly)
+/// instead of `IS NOT DISTINCT FROM`. Doing so on a column that can later become
+/// NULL silently drops rows (docs/fuzz-findings.md findings #1 and #3), so the
+/// inference is deliberately conservative: anything not provably non-NULL (outer-
+/// join columns, unconstrained nullable columns, computed expressions, output
+/// aliases) is left alone and matched with the always-correct `IS NOT DISTINCT
+/// FROM`. With no analysis available, nothing is promoted.
+fn infer_not_null_columns(
+    client: &mut pgrx::spi::SpiClient<'_>,
+    plan: &crate::aggregation::AggregationPlan,
+    analysis: Option<&crate::sql_analyzer::SqlAnalysis>,
+) -> std::collections::HashSet<String> {
+    let mut proven = std::collections::HashSet::new();
+    let Some(a) = analysis else {
+        return proven;
+    };
+
+    // Map the LEFT-join target tables (the nullable side). RIGHT/FULL joins make
+    // the nullable side ambiguous, so we promote nothing for those queries.
+    let mut left_target_tables: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    for j in &a.joins {
+        let jt = j.join_type.to_uppercase();
+        if jt.contains("RIGHT") || jt.contains("FULL") {
+            return proven;
+        }
+        if jt.contains("LEFT") {
+            left_target_tables.insert(j.target_table.trim_matches('"').to_lowercase());
+        }
+    }
+
+    let from_outer_join = |col_expr: &str| -> bool {
+        if left_target_tables.is_empty() || !col_expr.contains('.') {
+            return false;
+        }
+        let alias = col_expr.split('.').next().unwrap_or("").trim_matches('"');
+        if left_target_tables.contains(&alias.to_lowercase()) {
+            return true;
+        }
+        a.table_aliases.iter().any(|(k, real)| {
+            k.eq_ignore_ascii_case(alias)
+                && left_target_tables.contains(&real.trim_matches('"').to_lowercase())
+        })
+    };
+
+    let equi_refs = inner_join_equi_non_null_refs(a);
+
     for col_expr in plan
         .group_by_columns
         .iter()
@@ -2788,24 +3010,16 @@ fn probe_not_null_columns_from_data(
         if plan.not_null_columns.contains(&norm) {
             continue;
         }
-        // Quote the column name with " escaping (defensive — normalized
-        // names are bare ASCII in practice, but the input came from user SQL).
-        let quoted = norm.replace('"', "\"\"");
-        let sql = format!(
-            "SELECT NOT EXISTS (SELECT 1 FROM {} WHERE \"{}\" IS NULL) AS null_free",
-            intermediate_tbl, quoted
-        );
-        let null_free: Option<bool> = match client.select(&sql, Some(1), &[]) {
-            Ok(mut t) => t
-                .next()
-                .and_then(|r| r.get_by_name::<bool, _>("null_free").ok().flatten()),
-            Err(_) => None,
-        };
-        if null_free == Some(true) {
-            probed.insert(norm);
+        if from_outer_join(col_expr) {
+            continue;
+        }
+        let proven_not_null = equi_refs.contains(&canon_col_ref(col_expr))
+            || column_base_not_null(client, a, col_expr, &left_target_tables);
+        if proven_not_null {
+            proven.insert(norm);
         }
     }
-    probed
+    proven
 }
 
 /// Persist a delta of newly-discovered NOT NULL columns to
@@ -2860,7 +3074,7 @@ pub(crate) fn reflex_probe_not_null_columns_impl(view_name: &str) -> String {
     let result: Result<Vec<String>, String> = Spi::connect_mut(|client| {
         let rows = client
             .select(
-                "SELECT aggregations::text AS aggregations \
+                "SELECT aggregations::text AS aggregations, sql_query \
                  FROM public.__reflex_ivm_reference \
                  WHERE name = $1 AND enabled = TRUE",
                 None,
@@ -2883,8 +3097,20 @@ pub(crate) fn reflex_probe_not_null_columns_impl(view_name: &str) -> String {
         if plan.is_passthrough {
             return Ok(Vec::new());
         }
-        let intermediate_tbl = intermediate_table_name(view_name);
-        let probed = probe_not_null_columns_from_data(client, &intermediate_tbl, &plan);
+        // Re-derive the join analysis from the stored query so the same
+        // structural NOT-NULL inference used at create time applies here. If the
+        // query is missing or unparseable, `analysis` stays None and nothing is
+        // promoted — conservative, never unsound.
+        let analysis = rows[0]
+            .get_by_name::<&str, _>("sql_query")
+            .ok()
+            .flatten()
+            .and_then(|q| {
+                Parser::parse_sql(&PostgreSqlDialect {}, q)
+                    .ok()
+                    .and_then(|stmts| crate::sql_analyzer::analyze(&stmts).ok())
+            });
+        let probed = infer_not_null_columns(client, &plan, analysis.as_ref());
         let new_cols: Vec<String> = probed
             .into_iter()
             .filter(|c| !plan.not_null_columns.contains(c))
