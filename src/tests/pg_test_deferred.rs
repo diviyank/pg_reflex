@@ -1440,3 +1440,199 @@ fn drain_deferred_pending() {
     }
     panic!("drain_deferred_pending did not converge after 10000 iterations");
 }
+
+/// Cascade correctness — stacked `a,b → casc_c → casc_d`. Mutating BOTH of
+/// casc_c's sources in one transaction makes the cross-source guard reconcile
+/// casc_c (`TRUNCATE casc_c; INSERT INTO casc_c …`). The TRUNCATE fires casc_c's
+/// deferred AFTER TRUNCATE trigger, which propagates a truncate to its dependent
+/// casc_d (ordered by graph_depth), emptying casc_d's intermediate BEFORE the
+/// reconcile's insert-only casc_c delta is staged. casc_d's additive MERGE then
+/// lands on a clean slate, so pre-existing keys are NOT double-counted.
+///
+/// Regression: an earlier analysis predicted casc_d would additively double-count
+/// the insert-only reconcile delta; the AFTER TRUNCATE propagation prevents it.
+/// Kept as proof that reconcile-driven cascades stay correct.
+#[pg_test]
+fn test_deferred_cascade_reconcile_insert_only_delta_oracle() {
+    Spi::run("CREATE TABLE t1_a (k INT NOT NULL, amt INT NOT NULL)").expect("create a");
+    Spi::run("CREATE TABLE t1_b (k INT NOT NULL, w INT NOT NULL)").expect("create b");
+    Spi::run("INSERT INTO t1_a (k, amt) SELECT g, 10 FROM generate_series(1, 100) g")
+        .expect("seed a");
+    Spi::run("INSERT INTO t1_b (k, w) SELECT g, 5 FROM generate_series(1, 100) g")
+        .expect("seed b");
+
+    crate::create_reflex_ivm(
+        "t1_casc_c",
+        "SELECT t1_a.k, COUNT(*) AS cnt, SUM(t1_a.amt) AS total \
+         FROM t1_a JOIN t1_b ON t1_a.k = t1_b.k \
+         GROUP BY t1_a.k",
+        None,
+        None,
+        Some("DEFERRED"),
+        None,
+    );
+    crate::create_reflex_ivm(
+        "t1_casc_d",
+        "SELECT k, SUM(total) AS d_total, SUM(cnt) AS d_cnt \
+         FROM t1_casc_c GROUP BY k",
+        None,
+        None,
+        Some("DEFERRED"),
+        None,
+    );
+
+    let fresh_d = "SELECT cc.k, SUM(cc.total) AS d_total, SUM(cc.cnt) AS d_cnt FROM ( \
+                       SELECT t1_a.k AS k, COUNT(*) AS cnt, SUM(t1_a.amt) AS total \
+                       FROM t1_a JOIN t1_b ON t1_a.k = t1_b.k GROUP BY t1_a.k \
+                   ) cc GROUP BY cc.k";
+    assert_imv_correct("t1_casc_d", fresh_d);
+
+    // Mutate BOTH direct sources of casc_c with a brand-new shared key.
+    Spi::run("INSERT INTO t1_a (k, amt) VALUES (200, 100)").expect("insert a");
+    Spi::run("INSERT INTO t1_b (k, w) VALUES (200, 7)").expect("insert b");
+
+    // Commit-time flush: casc_c reconciles (2 sources pending); its TRUNCATE
+    // propagates a truncate to casc_d, then the re-queued insert-only casc_c
+    // delta rebuilds casc_d on the now-empty intermediate.
+    drain_deferred_pending();
+
+    assert_imv_correct("t1_casc_d", fresh_d);
+}
+
+/// Cascade correctness under an adversarial flush order — `a,b → casc_c → casc_d ← e`.
+///
+/// casc_d's two sources become pending at different times: e from the start,
+/// casc_c only after casc_c is reconciled and re-queued. Adversarial order
+/// (e, a, b, drain):
+///   1. flush e first — casc_c not yet pending, so the guard sees only 1 of
+///      casc_d's 2 sources → casc_d goes incremental: Δe ⋈ STALE casc_c (no
+///      shared key yet) → no-op for the new key.
+///   2. flush a — reconciles casc_c (a,b both pending). casc_c's TRUNCATE fires
+///      the AFTER TRUNCATE trigger, which propagates a truncate to casc_d,
+///      EMPTYING its intermediate (discarding step 1), then stages the
+///      insert-only casc_c delta. Sets the session reconcile marker.
+///   3. flush b — casc_c already reconciled (marker) → skipped.
+///   4. drain — the re-queued casc_c flush rebuilds casc_d on the now-empty
+///      intermediate from casc_c ⋈ live e → correct.
+///
+/// Regression: predicted to double-count because casc_d goes incremental twice;
+/// the AFTER TRUNCATE propagation wipes the first increment so the second lands
+/// on an empty intermediate. Kept as proof the adversarial order stays correct.
+#[pg_test]
+fn test_deferred_cascade_cross_level_ordering_oracle() {
+    Spi::run("CREATE TABLE t2_a (k INT NOT NULL, amt INT NOT NULL)").expect("create a");
+    Spi::run("CREATE TABLE t2_b (k INT NOT NULL, w INT NOT NULL)").expect("create b");
+    Spi::run("CREATE TABLE t2_e (k INT NOT NULL, bonus INT NOT NULL)").expect("create e");
+    Spi::run("INSERT INTO t2_a (k, amt) SELECT g, 10 FROM generate_series(1, 100) g")
+        .expect("seed a");
+    Spi::run("INSERT INTO t2_b (k, w) SELECT g, 5 FROM generate_series(1, 100) g")
+        .expect("seed b");
+    Spi::run("INSERT INTO t2_e (k, bonus) SELECT g, 3 FROM generate_series(1, 100) g")
+        .expect("seed e");
+
+    crate::create_reflex_ivm(
+        "t2_casc_c",
+        "SELECT t2_a.k, COUNT(*) AS cnt, SUM(t2_a.amt) AS total \
+         FROM t2_a JOIN t2_b ON t2_a.k = t2_b.k \
+         GROUP BY t2_a.k",
+        None,
+        None,
+        Some("DEFERRED"),
+        None,
+    );
+    crate::create_reflex_ivm(
+        "t2_casc_d",
+        "SELECT t2_casc_c.k, SUM(t2_casc_c.total) AS d_total, SUM(t2_e.bonus) AS d_bonus \
+         FROM t2_casc_c JOIN t2_e ON t2_casc_c.k = t2_e.k \
+         GROUP BY t2_casc_c.k",
+        None,
+        None,
+        Some("DEFERRED"),
+        None,
+    );
+
+    let fresh_d = "SELECT cc.k, SUM(cc.total) AS d_total, SUM(t2_e.bonus) AS d_bonus FROM ( \
+                       SELECT t2_a.k AS k, COUNT(*) AS cnt, SUM(t2_a.amt) AS total \
+                       FROM t2_a JOIN t2_b ON t2_a.k = t2_b.k GROUP BY t2_a.k \
+                   ) cc JOIN t2_e ON cc.k = t2_e.k GROUP BY cc.k";
+    assert_imv_correct("t2_casc_d", fresh_d);
+
+    // Mutate all three leaf sources with a brand-new shared key.
+    Spi::run("INSERT INTO t2_a (k, amt) VALUES (200, 100)").expect("insert a");
+    Spi::run("INSERT INTO t2_b (k, w) VALUES (200, 7)").expect("insert b");
+    Spi::run("INSERT INTO t2_e (k, bonus) VALUES (200, 9)").expect("insert e");
+
+    // Adversarial order: e BEFORE a/b so casc_d is evaluated while casc_c is
+    // not yet pending. Bypasses the drain helper for the pinned prefix.
+    Spi::run("SELECT reflex_flush_deferred('t2_e')").expect("flush e");
+    Spi::run("SELECT reflex_flush_deferred('t2_a')").expect("flush a");
+    Spi::run("SELECT reflex_flush_deferred('t2_b')").expect("flush b");
+    // Drain the re-queued casc_c (→ casc_d incremental again).
+    drain_deferred_pending();
+
+    assert_imv_correct("t2_casc_d", fresh_d);
+}
+
+/// Cascade correctness under a favorable flush order — same cascade and
+/// mutations as test_deferred_cascade_cross_level_ordering_oracle, order
+/// (a, b, e, drain). Flushing a,b first reconciles casc_c and re-queues it; the
+/// subsequent e flush then sees BOTH of casc_d's sources (casc_c + e) pending,
+/// so the cross-source guard reconciles casc_d exactly once (reading live casc_c
+/// and live e → correct) and records it in the session marker. The trailing
+/// drained casc_c flush finds casc_d already in the marker and skips it.
+///
+/// Together with the adversarial-order test, shows both flush orders converge to
+/// the correct result — guard reconcile here, AFTER TRUNCATE propagation there.
+#[pg_test]
+fn test_deferred_cascade_favorable_order_control() {
+    Spi::run("CREATE TABLE t3_a (k INT NOT NULL, amt INT NOT NULL)").expect("create a");
+    Spi::run("CREATE TABLE t3_b (k INT NOT NULL, w INT NOT NULL)").expect("create b");
+    Spi::run("CREATE TABLE t3_e (k INT NOT NULL, bonus INT NOT NULL)").expect("create e");
+    Spi::run("INSERT INTO t3_a (k, amt) SELECT g, 10 FROM generate_series(1, 100) g")
+        .expect("seed a");
+    Spi::run("INSERT INTO t3_b (k, w) SELECT g, 5 FROM generate_series(1, 100) g")
+        .expect("seed b");
+    Spi::run("INSERT INTO t3_e (k, bonus) SELECT g, 3 FROM generate_series(1, 100) g")
+        .expect("seed e");
+
+    crate::create_reflex_ivm(
+        "t3_casc_c",
+        "SELECT t3_a.k, COUNT(*) AS cnt, SUM(t3_a.amt) AS total \
+         FROM t3_a JOIN t3_b ON t3_a.k = t3_b.k \
+         GROUP BY t3_a.k",
+        None,
+        None,
+        Some("DEFERRED"),
+        None,
+    );
+    crate::create_reflex_ivm(
+        "t3_casc_d",
+        "SELECT t3_casc_c.k, SUM(t3_casc_c.total) AS d_total, SUM(t3_e.bonus) AS d_bonus \
+         FROM t3_casc_c JOIN t3_e ON t3_casc_c.k = t3_e.k \
+         GROUP BY t3_casc_c.k",
+        None,
+        None,
+        Some("DEFERRED"),
+        None,
+    );
+
+    let fresh_d = "SELECT cc.k, SUM(cc.total) AS d_total, SUM(t3_e.bonus) AS d_bonus FROM ( \
+                       SELECT t3_a.k AS k, COUNT(*) AS cnt, SUM(t3_a.amt) AS total \
+                       FROM t3_a JOIN t3_b ON t3_a.k = t3_b.k GROUP BY t3_a.k \
+                   ) cc JOIN t3_e ON cc.k = t3_e.k GROUP BY cc.k";
+    assert_imv_correct("t3_casc_d", fresh_d);
+
+    Spi::run("INSERT INTO t3_a (k, amt) VALUES (200, 100)").expect("insert a");
+    Spi::run("INSERT INTO t3_b (k, w) VALUES (200, 7)").expect("insert b");
+    Spi::run("INSERT INTO t3_e (k, bonus) VALUES (200, 9)").expect("insert e");
+
+    // Favorable order: a,b BEFORE e. casc_c reconciles + re-queues, so when e
+    // is flushed casc_d sees both its sources pending → reconciles once.
+    Spi::run("SELECT reflex_flush_deferred('t3_a')").expect("flush a");
+    Spi::run("SELECT reflex_flush_deferred('t3_b')").expect("flush b");
+    Spi::run("SELECT reflex_flush_deferred('t3_e')").expect("flush e");
+    // Drain the re-queued casc_c; casc_d is already in the reconcile marker → skipped.
+    drain_deferred_pending();
+
+    assert_imv_correct("t3_casc_d", fresh_d);
+}
