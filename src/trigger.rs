@@ -1851,11 +1851,73 @@ fn self_join_full_refresh_stmts(
     }
 }
 
+/// Identifiers (lowercased) that refer to `source_table` in `base_query`: its
+/// bare name plus any alias bound immediately after the JOIN keyword
+/// (`JOIN src a` or `JOIN src AS a`). Used to decide which GROUP BY columns are
+/// sourced from the (mutated) secondary side of an outer join — those are the
+/// ones whose value can migrate when the secondary changes.
+fn secondary_ref_identifiers(base_query: &str, source_table: &str) -> Vec<String> {
+    // `source_table` may be quoted (`"v__cte_agg"`); compare on the unquoted form.
+    let src_unquoted = source_table.trim_matches('"');
+    let bare = split_qualified_name(src_unquoted)
+        .1
+        .trim_matches('"')
+        .to_lowercase();
+    let src_l = src_unquoted.to_lowercase();
+    let toks: Vec<String> = base_query
+        .split(|c: char| c.is_whitespace())
+        .filter(|t| !t.is_empty())
+        .map(|t| t.trim_matches('"').to_string())
+        .collect();
+    const KW: [&str; 17] = [
+        "on",
+        "group",
+        "where",
+        "left",
+        "right",
+        "inner",
+        "join",
+        "full",
+        "outer",
+        "order",
+        "having",
+        "limit",
+        "union",
+        "except",
+        "intersect",
+        "cross",
+        "natural",
+    ];
+    let mut ids = vec![bare.clone()];
+    for (i, tok) in toks.iter().enumerate() {
+        let t = tok.to_lowercase();
+        if t == src_l || t == bare {
+            if let Some(next) = toks.get(i + 1) {
+                let mut nx = next.trim_matches(',').to_lowercase();
+                if nx == "as" {
+                    if let Some(n2) = toks.get(i + 2) {
+                        nx = n2.trim_matches(',').to_lowercase();
+                    }
+                }
+                if !nx.is_empty()
+                    && nx.chars().all(|c| c.is_alphanumeric() || c == '_')
+                    && !KW.contains(&nx.as_str())
+                {
+                    ids.push(nx);
+                }
+            }
+        }
+    }
+    ids
+}
+
 /// Outer-join-secondary handling: when source_table is the secondary side of a
 /// LEFT/RIGHT JOIN (or any side of FULL OUTER), the MERGE subtract can't represent
 /// the NULL semantics. Passthrough → full refresh. Aggregate → targeted group
-/// reconcile via the affected_tbl. With no group columns, aggregate falls back
-/// to a full intermediate refresh.
+/// reconcile via the affected_tbl, scoped to the *stable* (non-secondary) group
+/// columns so a secondary-derived group key that migrates is fully rebuilt for
+/// the affected join keys. With no stable group column, falls back to a full
+/// intermediate + target refresh.
 #[allow(clippy::too_many_arguments)]
 fn outer_join_secondary_stmts(
     view_name: &str,
@@ -1880,6 +1942,58 @@ fn outer_join_secondary_stmts(
     }
 
     if let Some(ref cols) = grp_cols {
+        // Scope the recompute to the STABLE group columns — those NOT sourced
+        // from the mutated secondary table. A secondary-derived group column
+        // (e.g. `a.sx` in `GROUP BY t.g, a.sx`) can MIGRATE when the secondary
+        // changes (NULL<->value, value<->value); matching the recompute on the
+        // full group key would miss the OLD value's row (it isn't in the delta,
+        // which only sees the new state), leaving a stale/phantom group. Matching
+        // on the stable cols only deletes every row sharing the affected join
+        // keys, so the migrated groups are fully rebuilt from the live query.
+        // (For the common case where every group key is from the primary side,
+        // the stable set equals the full set — behaviour is unchanged.)
+        let sec_ids = secondary_ref_identifiers(base_query, source_table);
+        let target_cols_all = target_group_columns(plan);
+        let mut scope_cols: Vec<String> = Vec::new();
+        let mut scope_target_cols: Vec<String> = Vec::new();
+        for (i, gb) in plan.group_by_columns.iter().enumerate() {
+            let qualifier = gb
+                .split_once('.')
+                .map(|(q, _)| q.trim().trim_matches('"').to_lowercase());
+            // Stable only when confidently qualified by a non-secondary table.
+            // Unqualified columns are excluded (treated as possibly migrating),
+            // which only ever broadens the recompute — never narrows it.
+            let stable = qualifier.is_some_and(|q| !sec_ids.contains(&q));
+            if stable {
+                if let Some(c) = cols.get(i) {
+                    scope_cols.push(c.clone());
+                }
+                if let Some(tc) = target_cols_all.get(i) {
+                    scope_target_cols.push(tc.clone());
+                }
+            }
+        }
+        // DISTINCT keys (DISTINCT-without-GROUP-BY) sit after group_by_columns in
+        // `cols`/`target_cols_all` and are always projection keys → stable.
+        for (c, tc) in cols
+            .iter()
+            .zip(target_cols_all.iter())
+            .skip(plan.group_by_columns.len())
+        {
+            scope_cols.push(c.clone());
+            scope_target_cols.push(tc.clone());
+        }
+
+        if scope_cols.is_empty() {
+            // Every group key derives from the mutated secondary — no stable key
+            // to scope by. Fall back to a full intermediate + target refresh.
+            stmts.push(format!("TRUNCATE {}", intermediate_tbl));
+            stmts.push(format!("INSERT INTO {} {}", intermediate_tbl, base_query));
+            stmts.push(format!("DELETE FROM {}", qv));
+            stmts.push(format!("INSERT INTO {} {}", qv, end_query));
+            return;
+        }
+
         let select_expr = affected_groups_select(cols);
         let transition = if operation == "DELETE" {
             old_tbl
@@ -1897,8 +2011,8 @@ fn outer_join_secondary_stmts(
         let ns_in_int = null_safe_in(
             affected_tbl,
             intermediate_tbl,
-            cols,
-            cols,
+            &scope_cols,
+            &scope_cols,
             &plan.not_null_columns,
         );
         stmts.push(format!(
@@ -1906,18 +2020,23 @@ fn outer_join_secondary_stmts(
             intermediate_tbl, ns_in_int
         ));
 
-        let ns_in_full = null_safe_in(affected_tbl, "__full", cols, cols, &plan.not_null_columns);
+        let ns_in_full = null_safe_in(
+            affected_tbl,
+            "__full",
+            &scope_cols,
+            &scope_cols,
+            &plan.not_null_columns,
+        );
         stmts.push(format!(
             "INSERT INTO {} SELECT * FROM ({}) AS __full WHERE {}",
             intermediate_tbl, base_query, ns_in_full
         ));
 
-        let target_cols = target_group_columns(plan);
         let ns_in_tgt_delete = null_safe_in(
             affected_tbl,
             &qv,
-            &target_cols,
-            cols,
+            &scope_target_cols,
+            &scope_cols,
             &plan.not_null_columns,
         );
         stmts.push(format!("DELETE FROM {} WHERE {}", qv, ns_in_tgt_delete));
@@ -1925,8 +2044,8 @@ fn outer_join_secondary_stmts(
         let ns_in_tgt_insert = null_safe_in(
             affected_tbl,
             intermediate_tbl,
-            cols,
-            cols,
+            &scope_cols,
+            &scope_cols,
             &plan.not_null_columns,
         );
         stmts.push(format!(
@@ -2339,8 +2458,11 @@ pub fn reflex_build_delta_sql(
     // The source is secondary if it appears as the table being outer-joined,
     // i.e. directly after "LEFT JOIN", "RIGHT JOIN", or "FULL JOIN".
     // Do NOT match if source_table only appears in ON conditions (that's the primary table).
-    let src_upper = source_table.to_uppercase();
-    let bare_upper = bare_source.to_uppercase();
+    // Strip surrounding quotes: a CTE sub-IMV / schema-qualified secondary is
+    // registered (and passed here) quoted, e.g. `"v__cte_agg"`, but the
+    // JOIN-keyword scan compares against the unquoted token in base_query.
+    let src_upper = source_table.trim_matches('"').to_uppercase();
+    let bare_upper = bare_source.trim_matches('"').to_uppercase();
     let is_outer_join_secondary_table = !is_self_join
         && (bq_upper.contains("LEFT JOIN")
             || bq_upper.contains("RIGHT JOIN")
@@ -2361,7 +2483,16 @@ pub fn reflex_build_delta_sql(
                 let mut search_from = 0;
                 while let Some(pos) = bq_upper[search_from..].find(pat) {
                     let after = &bq_upper[search_from + pos + pat.len()..];
-                    let next_token = after.split_whitespace().next().unwrap_or("");
+                    // Strip surrounding double-quotes: a CTE sub-IMV or schema-
+                    // qualified secondary is emitted quoted (`LEFT JOIN "v__cte_x" a`),
+                    // and the source_table registry name is unquoted — without
+                    // this the match (and thus the whole outer-join-secondary
+                    // handling) silently misses every quoted secondary.
+                    let next_token = after
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or("")
+                        .trim_matches('"');
                     if next_token == src_upper || next_token == bare_upper {
                         return true;
                     }
@@ -2370,11 +2501,18 @@ pub fn reflex_build_delta_sql(
                 false
             })
         };
-    // For LEFT/RIGHT JOIN: only the secondary table's DELETE/UPDATE needs special handling.
-    // For FULL OUTER JOIN: ALL operations on BOTH tables need targeted reconcile,
-    // because the FULL JOIN delta always includes unmatched rows from the other side.
+    // For LEFT/RIGHT JOIN: EVERY operation on the secondary table needs special
+    // handling. The plain `L LEFT JOIN Δsecondary` delta re-emits all left rows
+    // NULL-extended, which double-counts non-matching left rows on INSERT (breaks
+    // COUNT(*) and any secondary-derived group key) and can't represent NULL
+    // semantics on DELETE/UPDATE. For FULL OUTER JOIN: ALL operations on BOTH
+    // tables need targeted reconcile, because the FULL JOIN delta always includes
+    // unmatched rows from the other side.
     let is_outer_join_secondary = (is_outer_join_secondary_table
-        && (operation == "DELETE" || operation == "DELETE_PROMOTED" || operation == "UPDATE"))
+        && matches!(
+            operation,
+            "DELETE" | "DELETE_PROMOTED" | "UPDATE" | "INSERT" | "INSERT_PROMOTED"
+        ))
         || (is_full_outer && !is_self_join);
 
     if is_self_join {

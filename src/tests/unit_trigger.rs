@@ -2515,6 +2515,37 @@ mod delta_sql_snapshots {
         "having_clause": null
     }"#;
 
+    // Same as AGG_JSON_TWO_SOURCES but with the GROUP BY key written QUALIFIED
+    // (`o.region`), matching what the real planner stores for a join query. The
+    // qualifier lets the outer-join-secondary recompute classify the key as
+    // primary-side (stable) and scope by it.
+    const AGG_JSON_LEFT_JOIN_QUALIFIED: &str = r#"{
+        "is_passthrough": false,
+        "group_by_columns": ["o.region"],
+        "group_by_aliases": {},
+        "intermediate_columns": [
+            {"name":"__sum_qty","pg_type":"NUMERIC","source_aggregate":"SUM","source_arg":"qty","topk_k":null}
+        ],
+        "needs_ivm_count": true,
+        "has_distinct": false,
+        "end_query_mappings": [
+            {"intermediate_expr":"__sum_qty","output_alias":"qty","aggregate_type":"SUM","cast_type":null}
+        ],
+        "distinct_columns": [],
+        "passthrough_columns": [],
+        "passthrough_key_mappings": {},
+        "imv_relevant_columns": {},
+        "imv_relevant_where": {},
+        "source_join_keys": {},
+        "not_null_columns": [],
+        "output_column_order": [],
+        "partition_columns": [],
+        "partition_strategy": "",
+        "anchor_source": "",
+        "partition_join_paths": {},
+        "having_clause": null
+    }"#;
+
     // Minimal passthrough plan with a per-source unique-key mapping.
     const PASSTHROUGH_JSON_WITH_MAPPING: &str = r#"{
         "is_passthrough": true,
@@ -2601,7 +2632,9 @@ mod delta_sql_snapshots {
 
     #[test]
     fn snapshot_outer_join_secondary_delete_aggregate() {
-        // `customers` is secondary in a LEFT JOIN, DELETE on customers
+        // `customers` is secondary in a LEFT JOIN, DELETE on customers. The group
+        // key `o.region` is from the primary side, so the recompute scopes by it
+        // (qualified so the codegen can tell it is not secondary-derived).
         let base_q = "SELECT o.region, SUM(o.qty) AS qty FROM orders o LEFT JOIN customers c ON c.id = o.customer_id GROUP BY o.region";
         let end_q = "SELECT region, qty FROM __reflex_int_v GROUP BY region";
         let sql = reflex_build_delta_sql(
@@ -2610,7 +2643,7 @@ mod delta_sql_snapshots {
             "DELETE",
             base_q,
             end_q,
-            Some(AGG_JSON_TWO_SOURCES),
+            Some(AGG_JSON_LEFT_JOIN_QUALIFIED),
             base_q,
         );
         insta::assert_snapshot!("outer_join_secondary_delete_aggregate", sql);

@@ -3985,3 +3985,69 @@ fn test_projected_joined_group_key_ok() {
     assert_eq!(r, "CREATE REFLEX INCREMENTAL VIEW", "create failed: {}", r);
     assert_imv_correct("jgo_v", body);
 }
+
+/// Regression — COUNT(*) over a LEFT JOIN, INSERT into the secondary side.
+/// The group key is from the primary table; the non-matching left rows must NOT
+/// be re-added (which previously doubled COUNT(*)). SUM survives the old bug but
+/// COUNT(*) did not.
+#[pg_test]
+fn test_left_join_secondary_insert_count() {
+    Spi::run("CREATE TABLE ljc_l(grp TEXT PRIMARY KEY)").expect("l");
+    Spi::run("CREATE TABLE ljc_r(grp TEXT, val INT)").expect("r");
+    Spi::run("INSERT INTO ljc_l VALUES ('a'),('b'),('c')").expect("sl");
+    Spi::run("INSERT INTO ljc_r VALUES ('a',10),('b',20)").expect("sr");
+    let body = "SELECT l.grp, COUNT(r.val) AS n, COUNT(*) AS rows, SUM(r.val) AS tot \
+                FROM ljc_l l LEFT JOIN ljc_r r ON l.grp = r.grp GROUP BY l.grp";
+    let r = crate::create_reflex_ivm("ljc_v", body, None, None, None, Some("grp"));
+    assert_eq!(r, "CREATE REFLEX INCREMENTAL VIEW", "create: {}", r);
+    assert_imv_correct("ljc_v", body);
+    Spi::run("INSERT INTO ljc_r VALUES ('c',50)").expect("sec-ins");
+    assert_imv_correct("ljc_v", body);
+    Spi::run("INSERT INTO ljc_r VALUES ('a',5)").expect("sec-ins2");
+    assert_imv_correct("ljc_v", body);
+}
+
+/// Regression — a secondary-derived column used as a GROUP BY key, mutated via
+/// INSERT/UPDATE/DELETE on the secondary base table. The group key migrates
+/// (NULL<->value, value<->value), which must fully rebuild the affected
+/// join-key's groups (no stale/phantom rows).
+#[pg_test]
+fn test_left_join_secondary_group_key_migration() {
+    Spi::run("CREATE TABLE ljm_t(g INT PRIMARY KEY, v INT)").expect("t");
+    Spi::run("CREATE TABLE ljm_a(g INT, x INT)").expect("a");
+    Spi::run("INSERT INTO ljm_t VALUES (1,10),(2,20)").expect("st");
+    Spi::run("INSERT INTO ljm_a VALUES (1,5),(2,4)").expect("sa");
+    let body = "SELECT t.g, SUM(t.v) AS s, a.x AS ax \
+                FROM ljm_t t LEFT JOIN ljm_a a ON a.g = t.g GROUP BY t.g, a.x";
+    let r = crate::create_reflex_ivm("ljm_v", body, None, None, None, None);
+    assert_eq!(r, "CREATE REFLEX INCREMENTAL VIEW", "create: {}", r);
+    assert_imv_correct("ljm_v", body);
+    Spi::run("UPDATE ljm_a SET x = 99 WHERE g = 1").expect("upd"); // ax migrates 5->99
+    assert_imv_correct("ljm_v", body);
+    Spi::run("DELETE FROM ljm_a WHERE g = 2").expect("del");       // ax migrates 4->NULL
+    assert_imv_correct("ljm_v", body);
+    Spi::run("INSERT INTO ljm_a VALUES (2,7)").expect("ins");      // ax migrates NULL->7
+    assert_imv_correct("ljm_v", body);
+}
+
+/// Regression — the originally reported case: CTE-decomposed LEFT JOIN +
+/// aggregate, joined sub-IMV key projected bare, INSERT into both base tables.
+#[pg_test]
+fn test_cte_left_join_cascade_maintenance() {
+    Spi::run("CREATE TABLE clc_t(g INT PRIMARY KEY, v INT)").expect("t");
+    Spi::run("CREATE TABLE clc_a(g INT, x INT)").expect("a");
+    Spi::run("INSERT INTO clc_t VALUES (1,10),(2,20)").expect("st");
+    Spi::run("INSERT INTO clc_a VALUES (1,5),(1,7)").expect("sa");
+    let body = "WITH agg AS (SELECT g, SUM(x) AS sx FROM clc_a GROUP BY g) \
+                SELECT t.g, SUM(t.v) AS s, a.sx \
+                FROM clc_t t LEFT JOIN agg a ON a.g = t.g GROUP BY t.g, a.sx";
+    let r = crate::create_reflex_ivm("clc_v", body, None, None, None, Some("g"));
+    assert_eq!(r, "CREATE REFLEX INCREMENTAL VIEW", "create: {}", r);
+    assert_imv_correct("clc_v", body);
+    Spi::run("INSERT INTO clc_t VALUES (3,30)").expect("ins t");
+    assert_imv_correct("clc_v", body);
+    Spi::run("INSERT INTO clc_a VALUES (2,4)").expect("ins a2"); // creates agg g=2 (secondary insert)
+    assert_imv_correct("clc_v", body);
+    Spi::run("INSERT INTO clc_a VALUES (3,9)").expect("ins a3");
+    assert_imv_correct("clc_v", body);
+}
