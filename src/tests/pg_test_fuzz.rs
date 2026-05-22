@@ -129,6 +129,126 @@ mod render {
 }
 
 #[cfg(test)]
+mod generate {
+    use super::model::*;
+    use proptest::prelude::*;
+
+    /// Exact-only column types for the CI gate (Task 10 adds Float8).
+    fn exact_coltype() -> impl Strategy<Value = ColType> {
+        prop_oneof![
+            Just(ColType::Int),
+            Just(ColType::BigInt),
+            Just(ColType::Numeric),
+            Just(ColType::Bool),
+            Just(ColType::Text),
+            Just(ColType::Date),
+        ]
+    }
+
+    /// One base table `t0` with an int PK `id`, a numeric measure `m`, a text
+    /// dimension `d`, and one extra random-typed nullable column.
+    fn single_table() -> impl Strategy<Value = Table> {
+        exact_coltype().prop_map(|extra_ty| Table {
+            name: "t0".into(),
+            pk: "id".into(),
+            columns: vec![
+                Column { name: "id".into(), ty: ColType::Int, nullable: false },
+                Column { name: "m".into(), ty: ColType::Numeric, nullable: true },
+                Column { name: "d".into(), ty: ColType::Text, nullable: true },
+                Column { name: "x".into(), ty: extra_ty, nullable: true },
+            ],
+        })
+    }
+
+    /// Render a literal for a column type (deterministic small domain so joins
+    /// and groups actually collide).
+    fn literal(ty: ColType, n: i64) -> String {
+        match ty {
+            ColType::Int | ColType::BigInt => format!("{}", n % 5),
+            ColType::Numeric | ColType::Float8 => format!("{}.{}", n % 5, n % 3),
+            ColType::Bool => if n % 2 == 0 { "true".into() } else { "false".into() },
+            ColType::Text => format!("'g{}'", n % 4),
+            ColType::Date => format!("date '2024-01-{:02}'", (n % 27) + 1),
+        }
+    }
+
+    fn seed_rows(t: &Table, count: usize) -> Vec<Vec<String>> {
+        (0..count)
+            .map(|i| {
+                t.columns
+                    .iter()
+                    .map(|c| {
+                        if c.name == t.pk {
+                            format!("{}", i)
+                        } else {
+                            literal(c.ty, i as i64)
+                        }
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// Passthrough: SELECT id, m, d FROM t0; unique key = id.
+    fn passthrough_case(t: Table) -> FuzzCase {
+        let body = SelectBody {
+            rendered_sql: format!("SELECT {pk}, m, d FROM {tbl}", pk = t.pk, tbl = t.name),
+        };
+        let output_columns = vec![
+            Column { name: t.pk.clone(), ty: ColType::Int, nullable: false },
+            Column { name: "m".into(), ty: ColType::Numeric, nullable: true },
+            Column { name: "d".into(), ty: ColType::Text, nullable: true },
+        ];
+        let seed = DmlTxn {
+            statements: vec![DmlStmt::Insert { table: t.name.clone(), rows: seed_rows(&t, 8) }],
+        };
+        FuzzCase {
+            tables: vec![t.clone()],
+            select_body: body,
+            unique_columns: vec![t.pk.clone()],
+            deferred: false,
+            dml: vec![seed],
+            output_columns,
+        }
+    }
+
+    /// Single-table aggregate: SELECT d, SUM(m) AS s, COUNT(*) AS c FROM t0 GROUP BY d.
+    fn aggregate_case(t: Table) -> FuzzCase {
+        let body = SelectBody {
+            rendered_sql: format!(
+                "SELECT d, SUM(m) AS s, COUNT(*) AS c FROM {tbl} GROUP BY d",
+                tbl = t.name
+            ),
+        };
+        let output_columns = vec![
+            Column { name: "d".into(), ty: ColType::Text, nullable: true },
+            Column { name: "s".into(), ty: ColType::Numeric, nullable: true },
+            Column { name: "c".into(), ty: ColType::BigInt, nullable: false },
+        ];
+        let seed = DmlTxn {
+            statements: vec![DmlStmt::Insert { table: t.name.clone(), rows: seed_rows(&t, 8) }],
+        };
+        FuzzCase {
+            tables: vec![t.clone()],
+            select_body: body,
+            unique_columns: vec!["d".into()],
+            deferred: false,
+            dml: vec![seed],
+            output_columns,
+        }
+    }
+
+    pub fn fuzz_case() -> impl Strategy<Value = FuzzCase> {
+        single_table().prop_flat_map(|t| {
+            prop_oneof![
+                Just(passthrough_case(t.clone())),
+                Just(aggregate_case(t.clone())),
+            ]
+        })
+    }
+}
+
+#[cfg(test)]
 mod model_tests {
     use super::model::*;
 
@@ -167,5 +287,23 @@ mod render_tests {
         };
         let cols = |_t: &str| vec!["id".to_string(), "v".to_string()];
         assert_eq!(dml_sql(&stmt, &cols), "INSERT INTO t0 (id, v) VALUES (1, 2.5)");
+    }
+}
+
+#[cfg(test)]
+mod generate_tests {
+    use super::generate::*;
+    use proptest::strategy::{Strategy, ValueTree};
+    use proptest::test_runner::TestRunner;
+
+    #[test]
+    fn generates_a_buildable_case() {
+        let mut runner = TestRunner::default();
+        let tree = fuzz_case().new_tree(&mut runner).unwrap();
+        let case = tree.current();
+        assert!(!case.tables.is_empty());
+        assert!(case.select_body.rendered_sql.to_uppercase().contains("SELECT"));
+        assert!(!case.unique_columns.is_empty());
+        assert!(!case.output_columns.is_empty());
     }
 }
