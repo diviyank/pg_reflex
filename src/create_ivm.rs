@@ -2762,13 +2762,20 @@ fn canon_col_ref(s: &str) -> String {
 /// True if `s` is a bare column reference (`ident` or `qualifier.ident`) rather
 /// than a function call, literal, or compound expression. Only such refs can be
 /// safely treated as join-key operands.
+///
+/// Quoted identifiers are rejected: a quoted name may contain a literal `.`
+/// (`"weird.name"`), which the dot-splitting in [`canon_col_ref`] /
+/// [`resolve_column_source`] would mis-read as a `qualifier.column`, possibly
+/// resolving to the wrong table. Treating any quoted ref as non-simple means it
+/// is never promoted to NOT NULL — correct (it falls back to `IS NOT DISTINCT
+/// FROM`), just not index-optimized.
 fn is_simple_col_ref(s: &str) -> bool {
     let t = s.trim();
-    if t.is_empty() {
+    if t.is_empty() || t.contains('"') {
         return false;
     }
     t.split('.').all(|p| {
-        let p = p.trim().trim_matches('"');
+        let p = p.trim();
         !p.is_empty()
             && p.chars()
                 .all(|c| c.is_alphanumeric() || c == '_' || c == '$')
@@ -3013,8 +3020,11 @@ fn infer_not_null_columns(
         if from_outer_join(col_expr) {
             continue;
         }
-        let proven_not_null = equi_refs.contains(&canon_col_ref(col_expr))
-            || column_base_not_null(client, a, col_expr, &left_target_tables);
+        // Only reason about simple (unquoted) column references; `canon_col_ref`
+        // dot-splitting is unsafe for quoted names that may contain a literal dot.
+        let proven_not_null = is_simple_col_ref(col_expr)
+            && (equi_refs.contains(&canon_col_ref(col_expr))
+                || column_base_not_null(client, a, col_expr, &left_target_tables));
         if proven_not_null {
             proven.insert(norm);
         }
