@@ -76,6 +76,7 @@ pub mod model {
         Insert { table: String, rows: Vec<Vec<String>> }, // pre-rendered SQL literals per column
         Delete { table: String, where_sql: String },
         Update { table: String, set_sql: String, where_sql: String },
+        #[allow(dead_code)] // rendered + parked; mutation generator does not yet emit TRUNCATE (see Task 13 follow-up)
         Truncate { table: String },
     }
 }
@@ -105,6 +106,7 @@ pub mod render {
         format!("CREATE MATERIALIZED VIEW {} AS {}", mv_name, body.rendered_sql)
     }
 
+    #[allow(dead_code)] // the oracle inlines REFRESH inside its plpgsql function; kept for parity
     pub fn refresh_mv_sql(mv_name: &str) -> String {
         format!("REFRESH MATERIALIZED VIEW {}", mv_name)
     }
@@ -264,7 +266,7 @@ pub mod generate {
             Column { name: "m".into(), ty: ColType::Numeric, nullable: true },
             Column { name: "d".into(), ty: ColType::Text, nullable: true },
             Column { name: "f".into(), ty: ColType::Float8, nullable: true },
-            Column { name: "x".into(), ty: t.columns[4].ty.clone(), nullable: true },
+            Column { name: "x".into(), ty: t.columns[4].ty, nullable: true },
         ];
         let seed = DmlTxn {
             statements: vec![DmlStmt::Insert { table: t.name.clone(), rows: seed_rows(&t, 8) }],
@@ -414,6 +416,7 @@ pub mod generate {
     }
 
     /// Two-table schema: t0 (id, m, d, f) and t1 (id, fk, w).
+    #[allow(dead_code)] // only used by the parked LEFT-JOIN constructors (finding #1)
     fn two_tables() -> impl Strategy<Value = (Table, Table)> {
         Just((
             Table {
@@ -900,7 +903,7 @@ $func$ LANGUAGE plpgsql;
         let outcome = match Spi::get_one::<&str>(&call_func_sql) {
             Ok(Some(result_str)) => {
                 let parts: Vec<&str> = result_str.splitn(2, "|||").collect();
-                let status = if parts.len() > 0 { parts[0] } else { "UNKNOWN" };
+                let status = if !parts.is_empty() { parts[0] } else { "UNKNOWN" };
                 let detail = if parts.len() > 1 { parts[1].to_string() } else { String::new() };
                 match status {
                     "MATCH" => Outcome::Match,

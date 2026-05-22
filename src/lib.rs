@@ -924,8 +924,12 @@ pub mod pg_test {
 
     #[must_use]
     pub fn postgresql_conf_options() -> Vec<&'static str> {
-        // return any postgresql.conf settings that are required for your tests
-        vec![]
+        // The differential fuzz gate (fuzz_differential_exact) builds many IMVs +
+        // MVs in a single test transaction; each holds locks released only at
+        // transaction end. Raise the per-transaction lock budget so larger ad-hoc
+        // runs (PG_REFLEX_FUZZ_CASES up to a few hundred) don't hit "out of shared
+        // memory". Very large runs still need batching.
+        vec!["max_locks_per_transaction = 4096"]
     }
 }
 

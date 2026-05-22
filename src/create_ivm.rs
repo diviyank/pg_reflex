@@ -96,12 +96,16 @@ fn validate_and_parse_inputs(
 ) -> Result<ParsedInputs, &'static str> {
     let storage_upper = storage_mode.to_uppercase();
     if storage_upper != "LOGGED" && storage_upper != "UNLOGGED" {
-        return Err(crate::reflex_reject("storage must be 'LOGGED' or 'UNLOGGED'"));
+        return Err(crate::reflex_reject(
+            "storage must be 'LOGGED' or 'UNLOGGED'",
+        ));
     }
     let logged = storage_upper == "LOGGED";
     let mode_upper = refresh_mode.to_uppercase();
     if mode_upper != "IMMEDIATE" && mode_upper != "DEFERRED" {
-        return Err(crate::reflex_reject("mode must be 'IMMEDIATE' or 'DEFERRED'"));
+        return Err(crate::reflex_reject(
+            "mode must be 'IMMEDIATE' or 'DEFERRED'",
+        ));
     }
     let deferred = mode_upper == "DEFERRED";
     validate_view_name(view_name)?;
@@ -208,7 +212,9 @@ fn try_decompose_set_op(
         | sqlparser::ast::SetOperator::Intersect
         | sqlparser::ast::SetOperator::Except => {}
         _ => {
-            return Some(crate::reflex_reject("Unsupported set operation. Supported: UNION, INTERSECT, EXCEPT."));
+            return Some(crate::reflex_reject(
+                "Unsupported set operation. Supported: UNION, INTERSECT, EXCEPT.",
+            ));
         }
     }
 
@@ -993,7 +999,9 @@ fn check_existence_and_cycle(ctx: &BuildContext) -> Option<&'static str> {
         })
     };
     if cycle_detected {
-        return Some(crate::reflex_reject("circular dependency detected — this IMV would form a cycle in the dependency graph"));
+        return Some(crate::reflex_reject(
+            "circular dependency detected — this IMV would form a cycle in the dependency graph",
+        ));
     }
     None
 }
@@ -1048,7 +1056,8 @@ fn resolve_partitioning(ctx: &mut BuildContext) -> Result<(), String> {
                         "partition_by column '{}' is not in GROUP BY; \
                          partition columns must be a subset of GROUP BY for aggregate IMVs",
                         col
-                    )).to_string());
+                    ))
+                    .to_string());
                 }
                 // Phase B (plans/partitioning_3.md §2): reject when the
                 // matching GROUP BY entry is a computed expression rather
@@ -1080,7 +1089,8 @@ fn resolve_partitioning(ctx: &mut BuildContext) -> Result<(), String> {
                              column references on the source. Workaround: add a generated \
                              / computed column to the source and partition on that.",
                             col, gb
-                        )).to_string());
+                        ))
+                        .to_string());
                     }
                 }
             }
@@ -1110,7 +1120,11 @@ fn resolve_partitioning(ctx: &mut BuildContext) -> Result<(), String> {
         match validate_result {
             Ok(s) => ctx.resolved_strategy = s,
             Err(e) => {
-                return Err(crate::reflex_reject(&format!("partition_by validation failed — {}", e)).to_string());
+                return Err(crate::reflex_reject(&format!(
+                    "partition_by validation failed — {}",
+                    e
+                ))
+                .to_string());
             }
         }
     } else {

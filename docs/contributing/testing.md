@@ -57,3 +57,51 @@ The harness runs each scenario multiple times and reports variance. Setseed is u
 - `cargo pgrx test pg18`
 
 …on every push to `main` and every pull request.
+
+## Differential fuzzing
+
+`fuzz_differential_exact` (in `src/tests/pg_test_fuzz.rs`) generates random query
+shapes + data + DML, builds a pg_reflex IMV **and** an equivalent plain
+`MATERIALIZED VIEW` from the same body, applies identical DML, refreshes/flushes,
+and asserts their contents match (`SELECT * EXCEPT`, with a relative-epsilon
+compare for `float8`/`AVG` columns). The MV is ground truth.
+
+Run it:
+
+```bash
+cargo pgrx test pg17 fuzz_differential_exact
+PG_REFLEX_FUZZ_CASES=200 cargo pgrx test pg17 fuzz_differential_exact   # deeper run
+```
+
+Default is 64 cases. Each case accumulates relations/locks in one test
+transaction, so very large runs can still exhaust locks even with the raised
+`max_locks_per_transaction` (see `pg_test::postgresql_conf_options`); a few
+hundred cases is the practical ceiling per run.
+
+Triage is automatic: a deliberate pg_reflex rejection RETURNS a string tagged
+`[reflex-unsupported]` (skipped); a codegen defect RAISES a Postgres error
+(caught by the oracle's PL/pgSQL `EXCEPTION` block and reported as a bug);
+content divergence is a bug.
+
+### When the fuzzer (or the sweep) finds a bug
+
+Findings are catalogued in `docs/fuzz-findings.md` and frozen as `#[ignore]`'d
+`#[pg_test]`s in `mod findings`. The shape that triggers an open finding is
+"parked" out of `fuzz_case()` (commented), so the gate stays green (= no NEW,
+uncatalogued bugs) while known bugs await a fix. To work a finding:
+
+1. Reduce it to a minimal repro; add a Finding entry + an `#[ignore]`'d regression.
+2. Fix the bug on the feature branch (TDD); remove `#[ignore]` and un-park the shape.
+3. Never weaken the comparator or generator to make a finding disappear.
+
+`scripts/imv_sweep.py` (see `scripts/README-imv-sweep.md`) runs the same
+IMV-vs-MV diff against real views on a live database — an external, manual
+complement to the in-CI fuzzer.
+
+### Open follow-ups
+
+- The mutation generator emits a fixed INSERT/UPDATE/DELETE per case; randomize
+  to 2–5 statements and add low-probability TRUNCATE (mind PK collisions).
+- The runner reports the first failing case, not the shrunk-minimal one.
+- Partitioned-IMV variants are not yet generated (need partitioned base tables).
+- LEFT-JOIN and DEFERRED shapes are parked pending findings #1 and #2.
