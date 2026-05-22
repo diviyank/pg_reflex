@@ -565,3 +565,33 @@ fn oracle_matches_on_a_simple_generated_case() {
         }
     }
 }
+
+fn fuzz_case_count() -> u32 {
+    std::env::var("PG_REFLEX_FUZZ_CASES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(64)
+}
+
+#[cfg(any(test, feature = "pg_test"))]
+#[pg_test]
+fn fuzz_differential_exact() {
+    use proptest::test_runner::{Config, TestCaseError, TestError, TestRunner};
+
+    let cfg = Config {
+        cases: fuzz_case_count(),
+        failure_persistence: None,
+        ..Config::default()
+    };
+    let mut runner = TestRunner::new(cfg);
+    let result = runner.run(&generate::fuzz_case(), |case| match oracle::evaluate(&case) {
+        oracle::Outcome::Match | oracle::Outcome::Skip(_) => Ok(()),
+        oracle::Outcome::Bug(msg) => Err(TestCaseError::fail(format!(
+            "{msg}\n--- minimal repro ---\n{}",
+            oracle::repro_sql(&case)
+        ))),
+    });
+    if let Err(TestError::Fail(reason, case)) = result {
+        panic!("differential fuzz found a bug: {reason}\nshrunk case: {case:?}");
+    }
+}
