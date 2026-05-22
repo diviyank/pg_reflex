@@ -192,9 +192,17 @@ pub mod generate {
             .collect()
     }
 
-    /// Generate a fixed set of mutation statements for a transaction.
-    /// Returns 3 statements: INSERT (PK 100), UPDATE, DELETE.
-    fn mutation_txn(t: &Table) -> impl Strategy<Value = DmlTxn> {
+    /// Build a fixed multi-statement mutation for a table. Four statements:
+    ///   * INSERT a new row with PK=100. In a two-table LEFT JOIN this is an
+    ///     UNMATCHED primary-side insert (no secondary row with fk=100), and in
+    ///     DEFERRED mode it is also re-touched by the UPDATE below — exercising
+    ///     findings #1 and #2.
+    ///   * INSERT a new row with PK=200 whose nullable dimension columns are NULL,
+    ///     so an aggregate `GROUP BY <dim>` gains a legitimate NULL group —
+    ///     exercising finding #3.
+    ///   * UPDATE the measure column where id % 2 = 0 (includes the PK=100 row).
+    ///   * DELETE id=0.
+    fn build_mutation(t: &Table) -> DmlTxn {
         // Detect which measure column is available: prefer 'm', fall back to 'w', else 'id'.
         let measure = if t.columns.iter().any(|c| c.name == "m") {
             "m"
@@ -204,41 +212,68 @@ pub mod generate {
             "id"
         };
 
-        let t = t.clone();
-        Just({
-            let mut statements = Vec::new();
+        let mut statements = Vec::new();
 
-            // INSERT: one new row with PK=100 (safe, doesn't collide with seed 0-7)
-            let insert_row: Vec<String> = t.columns
-                .iter()
-                .map(|c| {
-                    if c.name == t.pk {
-                        "100".to_string()
-                    } else {
-                        literal(c.ty, 100)
-                    }
-                })
-                .collect();
-            statements.push(DmlStmt::Insert {
-                table: t.name.clone(),
-                rows: vec![insert_row],
-            });
+        // INSERT: one new row with PK=100 (safe, doesn't collide with seed 0-7).
+        let insert_row: Vec<String> = t
+            .columns
+            .iter()
+            .map(|c| {
+                if c.name == t.pk {
+                    "100".to_string()
+                } else {
+                    literal(c.ty, 100)
+                }
+            })
+            .collect();
+        statements.push(DmlStmt::Insert {
+            table: t.name.clone(),
+            rows: vec![insert_row],
+        });
 
-            // UPDATE: increment measure column where id % 2 = 0
-            statements.push(DmlStmt::Update {
-                table: t.name.clone(),
-                set_sql: format!("{measure} = {measure} + 1"),
-                where_sql: "id % 2 = 0".into(),
-            });
+        // INSERT: a row whose nullable non-measure columns are NULL.
+        let null_row: Vec<String> = t
+            .columns
+            .iter()
+            .map(|c| {
+                if c.name == t.pk {
+                    "200".to_string()
+                } else if c.name == measure || !c.nullable {
+                    literal(c.ty, 200)
+                } else {
+                    "NULL".to_string()
+                }
+            })
+            .collect();
+        statements.push(DmlStmt::Insert {
+            table: t.name.clone(),
+            rows: vec![null_row],
+        });
 
-            // DELETE: remove id=0
-            statements.push(DmlStmt::Delete {
-                table: t.name.clone(),
-                where_sql: "id = 0".into(),
-            });
+        // UPDATE: increment measure column where id % 2 = 0.
+        statements.push(DmlStmt::Update {
+            table: t.name.clone(),
+            set_sql: format!("{measure} = {measure} + 1"),
+            where_sql: "id % 2 = 0".into(),
+        });
 
-            DmlTxn { statements }
-        })
+        // DELETE: remove id=0.
+        statements.push(DmlStmt::Delete {
+            table: t.name.clone(),
+            where_sql: "id = 0".into(),
+        });
+
+        DmlTxn { statements }
+    }
+
+    fn mutation_txn(t: &Table) -> impl Strategy<Value = DmlTxn> {
+        Just(build_mutation(t))
+    }
+
+    /// Mark a case for DEFERRED incremental maintenance (flushed at end of batch).
+    fn deferred(mut case: FuzzCase) -> FuzzCase {
+        case.deferred = true;
+        case
     }
 
     /// Helper: append a mutation transaction to a case's DML list.
@@ -416,7 +451,6 @@ pub mod generate {
     }
 
     /// Two-table schema: t0 (id, m, d, f) and t1 (id, fk, w).
-    #[allow(dead_code)] // only used by the parked LEFT-JOIN constructors (finding #1)
     fn two_tables() -> impl Strategy<Value = (Table, Table)> {
         Just((
             Table {
@@ -451,8 +485,6 @@ pub mod generate {
 
     /// Join aggregate: SELECT t0.d, SUM(t0.m) AS s, COUNT(t1.w) AS c
     /// FROM t0 LEFT JOIN t1 ON t1.fk = t0.id GROUP BY t0.d.
-    /// PARKED: LEFT-JOIN shapes excluded from the random gate while finding #1 (docs/fuzz-findings.md) is open.
-    #[allow(dead_code)]
     fn join_aggregate_case(a: Table, b: Table) -> FuzzCase {
         let body = SelectBody {
             rendered_sql:
@@ -476,8 +508,6 @@ pub mod generate {
     /// Carried scalar case: SELECT t0.id, SUM(t0.m) AS s, <carried>
     /// FROM t0 LEFT JOIN t1 ON t1.fk = t0.id GROUP BY t0.id.
     /// The carried expression varies by pick % 4.
-    /// PARKED: LEFT-JOIN shapes excluded from the random gate while finding #1 (docs/fuzz-findings.md) is open.
-    #[allow(dead_code)]
     fn carried_scalar_case(a: Table, b: Table, pick: usize) -> FuzzCase {
         let (carried_sql, carried_col) = match pick % 4 {
             0 => (
@@ -520,8 +550,6 @@ pub mod generate {
 
     /// CTE-decomposed: WITH agg AS (SELECT fk AS g, SUM(w) AS sw FROM t1 GROUP BY fk)
     /// SELECT t0.id, SUM(t0.m) AS s, a.sw FROM t0 LEFT JOIN agg a ON a.g = t0.id GROUP BY t0.id, a.sw.
-    /// PARKED: LEFT-JOIN shapes excluded from the random gate while finding #1 (docs/fuzz-findings.md) is open.
-    #[allow(dead_code)]
     fn cte_decomposed_case(a: Table, b: Table) -> FuzzCase {
         let body = SelectBody {
             rendered_sql:
@@ -544,26 +572,43 @@ pub mod generate {
     }
 
     pub fn fuzz_case() -> impl Strategy<Value = FuzzCase> {
-        // PARKED: LEFT-JOIN shapes excluded from the random gate while finding #1 (docs/fuzz-findings.md) is open.
-        // PARKED: DEFERRED mode excluded while finding #2 (docs/fuzz-findings.md) is open.
-        // Only single-table cases with multi-op mutation txns are enabled, IMMEDIATE mode only.
+        prop_oneof![single_table_cases(), join_cases()]
+    }
+
+    /// Single-table shapes (passthrough / aggregate / aggregate-with-float, each
+    /// unfiltered and filtered) under the multi-statement mutation, in both
+    /// IMMEDIATE and DEFERRED maintenance modes.
+    fn single_table_cases() -> impl Strategy<Value = FuzzCase> {
         single_table()
             .prop_flat_map(|t| {
                 let t2 = t.clone();
-                (Just(t), mutation_txn(&t2), any::<usize>())
+                (Just(t), mutation_txn(&t2), any::<usize>(), any::<bool>())
             })
-            .prop_flat_map(|(t, mtx, filter_choice)| {
+            .prop_flat_map(|(t, mtx, filter_choice, defer)| {
+                let mode = move |c: FuzzCase| if defer { deferred(c) } else { c };
                 prop_oneof![
-                    // Unfiltered passthrough, aggregate, aggregate_float
-                    Just(with_mutation(passthrough_case(t.clone()), mtx.clone())),
-                    Just(with_mutation(aggregate_case(t.clone()), mtx.clone())),
-                    Just(with_mutation(aggregate_float_case(t.clone()), mtx.clone())),
-                    // Filtered passthrough, aggregate, aggregate_float
-                    Just(with_mutation(passthrough_filtered_case(t.clone(), filter_choice), mtx.clone())),
-                    Just(with_mutation(aggregate_filtered_case(t.clone(), filter_choice), mtx.clone())),
-                    Just(with_mutation(aggregate_float_filtered_case(t.clone(), filter_choice), mtx.clone())),
+                    Just(mode(with_mutation(passthrough_case(t.clone()), mtx.clone()))),
+                    Just(mode(with_mutation(aggregate_case(t.clone()), mtx.clone()))),
+                    Just(mode(with_mutation(aggregate_float_case(t.clone()), mtx.clone()))),
+                    Just(mode(with_mutation(passthrough_filtered_case(t.clone(), filter_choice), mtx.clone()))),
+                    Just(mode(with_mutation(aggregate_filtered_case(t.clone(), filter_choice), mtx.clone()))),
+                    Just(mode(with_mutation(aggregate_float_filtered_case(t.clone(), filter_choice), mtx.clone()))),
                 ]
             })
+    }
+
+    /// Two-table LEFT-JOIN shapes (direct join aggregate, carried scalar, and
+    /// CTE-decomposed) with a primary-side mutation that inserts an UNMATCHED row
+    /// (id=100, no secondary fk match) and a NULL-dimension row.
+    fn join_cases() -> impl Strategy<Value = FuzzCase> {
+        (two_tables(), any::<usize>()).prop_map(|((a, b), pick)| {
+            let mtx = build_mutation(&a);
+            match pick % 3 {
+                0 => with_mutation(join_aggregate_case(a, b), mtx),
+                1 => with_mutation(carried_scalar_case(a.clone(), b, pick), mtx),
+                _ => with_mutation(cte_decomposed_case(a, b), mtx),
+            }
+        })
     }
 }
 
@@ -627,7 +672,6 @@ mod generate_tests {
     }
 
     #[test]
-    #[ignore]  // PARKED: LEFT-JOIN shapes excluded while finding #1 (docs/fuzz-findings.md) is open.
     fn generator_can_emit_join_and_cte_and_carried_shapes() {
         use super::generate::fuzz_case;
         let mut runner = TestRunner::default();
@@ -671,7 +715,6 @@ mod generate_tests {
             filt |= c.select_body.rendered_sql.to_uppercase().contains("WHERE");
             if filt { break; }
         }
-        // PARKED: DEFERRED mode excluded while finding #2 (docs/fuzz-findings.md) is open.
         assert!(filt, "must reach filtered variants with WHERE predicates ({filt})");
     }
 }
@@ -708,50 +751,51 @@ pub mod oracle {
         )
     }
 
-    /// Build the FROM..WHERE clause that counts rows differing between mv and imv,
-    /// using exact `IS DISTINCT FROM` for non-float columns and a relative epsilon
-    /// for float columns. Used when the case has any float output column.
-    pub fn float_diff_from_where(mv: &str, imv: &str, keys: &[String], cols: &[Column]) -> String {
-        if keys.is_empty() {
-            panic!("float_diff_from_where requires at least one key column");
-        }
-        // Build ON clause for the join: match on all key columns
-        let on: Vec<String> = keys.iter()
-            .map(|k| format!("a.\"{}\" = b.\"{}\"", k, k)).collect();
-
-        // Build WHERE predicates to find differences (for matched rows) or missing rows
-        let mut preds: Vec<String> = Vec::new();
-
-        // Check for missing rows (FULL JOIN unmatched rows)
-        preds.push(format!("a.\"{}\" IS NULL", &keys[0]));
-        preds.push(format!("b.\"{}\" IS NULL", &keys[0]));
-
-        // Check for data differences in non-key columns
-        for c in cols {
-            if keys.iter().any(|k| k == &c.name) { continue; }
-            let n = &c.name;
-            if c.ty.is_float() {
-                // Float comparison with epsilon tolerance
-                preds.push(format!(
-                    "(abs(COALESCE(a.\"{}\",0) - COALESCE(b.\"{}\",0)) > 1e-9 * GREATEST(abs(COALESCE(a.\"{}\",0)), abs(COALESCE(b.\"{}\",0)), 1))",
-                    n, n, n, n));
-            } else {
-                // Exact comparison for non-float columns
-                preds.push(format!("a.\"{}\" IS DISTINCT FROM b.\"{}\"", n, n));
-            }
-        }
-
-        let where_clause = preds.join(" OR ");
-
-        // Return as a subquery with aliased columns to avoid duplicate column names
-        // Use COALESCE to select from whichever side has the row (for unmatched rows)
-        let col_list = cols.iter()
-            .map(|c| format!("COALESCE(a.\"{}\", b.\"{}\") AS \"{}\"", c.name, c.name, c.name))
+    /// Build the FROM clause that returns rows differing between mv and imv,
+    /// exact for non-float columns and within a relative epsilon for float columns.
+    /// Used when the case has any float output column.
+    ///
+    /// A row counts as differing when it has no counterpart on the other side that
+    /// agrees on every non-float column (`IS NOT DISTINCT FROM`, so NULL keys and
+    /// NULL groups match) and is within 1e-9 relative on every float column. This
+    /// uses correlated `NOT EXISTS` rather than a `FULL JOIN ... ON a.k = b.k`
+    /// precisely because `=` is not NULL-safe: a NULL group key never satisfies it,
+    /// so the old FULL-JOIN form reported the (correct) NULL group as two phantom
+    /// unmatched rows.
+    pub fn float_diff_from_where(mv: &str, imv: &str, _keys: &[String], cols: &[Column]) -> String {
+        let match_pred = |aa: &str, bb: &str| -> String {
+            cols.iter()
+                .map(|c| {
+                    let n = &c.name;
+                    if c.ty.is_float() {
+                        format!(
+                            "(({aa}.\"{n}\" IS NULL AND {bb}.\"{n}\" IS NULL) OR \
+                              ({aa}.\"{n}\" IS NOT NULL AND {bb}.\"{n}\" IS NOT NULL AND \
+                               abs({aa}.\"{n}\" - {bb}.\"{n}\") <= 1e-9 * \
+                               GREATEST(abs({aa}.\"{n}\"), abs({bb}.\"{n}\"), 1)))"
+                        )
+                    } else {
+                        format!("{aa}.\"{n}\" IS NOT DISTINCT FROM {bb}.\"{n}\"")
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" AND ")
+        };
+        let col_list = cols
+            .iter()
+            .map(|c| format!("\"{}\"", c.name))
             .collect::<Vec<_>>()
             .join(", ");
-
-        format!("( SELECT {} FROM {} a FULL JOIN {} b ON {} WHERE {} ) d",
-            col_list, mv, imv, on.join(" AND "), where_clause)
+        format!(
+            "( SELECT {cl} FROM {mv} a WHERE NOT EXISTS (SELECT 1 FROM {imv} b WHERE {mab}) \
+              UNION ALL \
+              SELECT {cl} FROM {imv} b WHERE NOT EXISTS (SELECT 1 FROM {mv} a WHERE {mba}) ) d",
+            cl = col_list,
+            mv = mv,
+            imv = imv,
+            mab = match_pred("a", "b"),
+            mba = match_pred("b", "a"),
+        )
     }
 
     fn rename_case(case: &FuzzCase, suffix: &str) -> FuzzCase {
@@ -956,7 +1000,7 @@ mod oracle_unit_tests {
     use super::oracle::float_diff_from_where;
 
     #[test]
-    fn float_compare_uses_relative_epsilon_and_full_join() {
+    fn float_compare_uses_relative_epsilon_and_null_safe_match() {
         let cols = vec![
             Column { name: "g".into(), ty: ColType::Int, nullable: false },
             Column { name: "s".into(), ty: ColType::Float8, nullable: true },
@@ -964,8 +1008,10 @@ mod oracle_unit_tests {
         ];
         let sql = float_diff_from_where("v_mv", "v_imv", &["g".to_string()], &cols);
         assert!(sql.contains("1e-9"), "must use relative epsilon: {sql}");
-        assert!(sql.contains("FULL JOIN"), "must full-join on key: {sql}");
-        assert!(sql.contains("IS DISTINCT FROM"), "non-float exact: {sql}");
+        // NULL-safe correlated anti-join, not an equi FULL JOIN (finding #4).
+        assert!(sql.contains("NOT EXISTS"), "must use NOT EXISTS anti-join: {sql}");
+        assert!(!sql.contains("FULL JOIN"), "must not use a non-NULL-safe FULL JOIN: {sql}");
+        assert!(sql.contains("IS NOT DISTINCT FROM"), "non-float cols matched NULL-safe: {sql}");
     }
 }
 
@@ -1019,14 +1065,14 @@ fn fuzz_case_count() -> u32 {
         .unwrap_or(64)
 }
 
-/// FIXED finding #1 — see docs/fuzz-findings.md. Root cause: the data-probe
-    /// (probe_not_null_columns_from_data) marked the LEFT-joined column NOT NULL
-    /// from the create-time all-matched intermediate, so MERGE maintenance dropped
-    /// a later unmatched primary-insert row. Fixed by skipping outer-join-nullable
-    /// columns in the probe.
-    ///
-    /// A two-table LEFT JOIN aggregate, after inserting a new PRIMARY-side (t0) row
-    /// that matches NO secondary row, must KEEP that row with the secondary columns NULL.
+/// FIXED finding #1 — see docs/fuzz-findings.md. Root cause: the former data-probe
+/// marked the LEFT-joined column NOT NULL from a create-time intermediate that
+/// happened to be null-free, so MERGE maintenance dropped a later unmatched
+/// primary-insert row. Fixed by `infer_not_null_columns`, which promotes a column
+/// only when the query structurally guarantees non-NULL.
+///
+/// A two-table LEFT JOIN aggregate, after inserting a new PRIMARY-side (t0) row
+/// that matches NO secondary row, must KEEP that row with the secondary columns NULL.
     #[cfg(any(test, feature = "pg_test"))]
     #[pg_test]
     fn finding_1_leftjoin_unmatched_primary_insert_drops_row() {
@@ -1157,6 +1203,50 @@ fn finding_3_nullable_groupby_key_drops_null_group() {
     let mv = Spi::get_one::<String>("SELECT string_agg(CAST((d,s) AS text), '; ' ORDER BY d NULLS LAST) FROM g3_mv").unwrap().unwrap_or_default();
     let imv = Spi::get_one::<String>("SELECT string_agg(CAST((d,s) AS text), '; ' ORDER BY d NULLS LAST) FROM g3_imv").unwrap().unwrap_or_default();
     assert_eq!(diff, 0, "finding #3: nullable-groupby diverged by {diff}\nMV:  {mv}\nIMV: {imv}");
+}
+
+/// FIXED finding #4 (fuzz-harness false positive) — see docs/fuzz-findings.md.
+/// A filtered float-aggregate with a NULL group is maintained correctly by
+/// pg_reflex (exact NULL-safe diff is 0), but the harness's float comparator used
+/// a `FULL JOIN ... ON a.k = b.k` that is not NULL-safe, so the NULL group showed
+/// as two phantom unmatched rows. Guards both the IMV correctness and the now
+/// NULL-safe `float_diff_from_where`.
+#[cfg(any(test, feature = "pg_test"))]
+#[pg_test]
+fn finding_4_filtered_float_aggregate_null_group_diff_safe() {
+    Spi::run("CREATE TABLE q4_t0 (id int primary key, m numeric, d text, f float8, x text)").unwrap();
+    let body = "SELECT d, SUM(m) AS s, COUNT(*) AS c, AVG(m) AS avg_m, SUM(f) AS sf FROM q4_t0 WHERE id % 2 = 0 GROUP BY d";
+    Spi::run(&format!("CREATE MATERIALIZED VIEW q4_mv AS {body}")).unwrap();
+    // Create IMV on the EMPTY table (mirrors the fuzzer's incremental path).
+    let r = crate::create_reflex_ivm("q4_imv", body, Some("d"), None, None, None);
+    assert!(r.starts_with("CREATE REFLEX"), "IMV creation failed: {r}");
+    // Apply DML incrementally, including a NULL-group row (id=200, d=NULL).
+    Spi::run("INSERT INTO q4_t0 (id,m,d,f,x) VALUES (0,0.0,'g0',0.0,'g0'),(1,1.1,'g1',1.1,'g1'),(2,2.2,'g2',2.2,'g2'),(3,3.0,'g3',3.0,'g3'),(4,4.1,'g0',4.1,'g0'),(5,0.2,'g1',0.2,'g1'),(6,1.0,'g2',1.0,'g2'),(7,2.1,'g3',2.1,'g3')").unwrap();
+    Spi::run("INSERT INTO q4_t0 (id,m,d,f,x) VALUES (100,0.1,'g0',0.1,'g0')").unwrap();
+    Spi::run("INSERT INTO q4_t0 (id,m,d,f,x) VALUES (200,0.2,NULL,NULL,NULL)").unwrap();
+    Spi::run("UPDATE q4_t0 SET m = m + 1 WHERE id % 2 = 0").unwrap();
+    Spi::run("DELETE FROM q4_t0 WHERE id = 0").unwrap();
+    Spi::run("REFRESH MATERIALIZED VIEW q4_mv").unwrap();
+
+    // pg_reflex is correct: the exact NULL-safe diff is 0.
+    let exact_diff = Spi::get_one::<i64>(
+        "SELECT count(*)::bigint FROM ((SELECT * FROM q4_mv EXCEPT SELECT * FROM q4_imv) \
+         UNION ALL (SELECT * FROM q4_imv EXCEPT SELECT * FROM q4_mv)) d").unwrap().unwrap();
+    assert_eq!(exact_diff, 0, "pg_reflex diverged on filtered float aggregate with NULL group");
+
+    // The harness float comparator must also see 0 (it must be NULL-safe).
+    let cols = [
+        model::Column { name: "d".into(), ty: model::ColType::Text, nullable: true },
+        model::Column { name: "s".into(), ty: model::ColType::Numeric, nullable: true },
+        model::Column { name: "c".into(), ty: model::ColType::BigInt, nullable: false },
+        model::Column { name: "avg_m".into(), ty: model::ColType::Float8, nullable: true },
+        model::Column { name: "sf".into(), ty: model::ColType::Float8, nullable: true },
+    ];
+    let float_diff = Spi::get_one::<i64>(&format!(
+        "SELECT count(*)::bigint FROM {}",
+        oracle::float_diff_from_where("q4_mv", "q4_imv", &["d".into()], &cols)
+    )).unwrap().unwrap();
+    assert_eq!(float_diff, 0, "harness float_diff_from_where is not NULL-group-safe");
 }
 
 /// Perf-preservation guard for the structural NOT-NULL inference. A

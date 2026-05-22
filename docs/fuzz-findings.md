@@ -175,3 +175,21 @@ Regression test (active, passes with the fix, fails when the fix is reverted):
 ```bash
 cargo pgrx test pg17 finding_2_deferred_mode_duplicate_key_violation
 ```
+
+## Finding #4: Harness Float Comparator Not NULL-Group-Safe (NOT a pg_reflex bug)
+
+**Status:** FIXED (NULL-safe `float_diff_from_where` in `src/tests/pg_test_fuzz.rs`)
+
+**Title:** After un-parking the float-aggregate shapes and injecting NULL-group rows, the fuzzer reported "2 mismatched rows" on a filtered float aggregate (`SELECT d, SUM(m), COUNT(*), AVG(m), SUM(f) FROM t0 WHERE id%2=0 GROUP BY d`) with a NULL `d` group. pg_reflex was actually correct — the bug was in the harness comparator.
+
+**Diagnosis:** the exact, NULL-safe `EXCEPT`-based diff was 0 (IMV identical to MV), but the float-tolerant comparator joined the two sides with `FULL JOIN ... ON a.d = b.d`. `=` is not NULL-safe, so the NULL group never matched and surfaced as two phantom unmatched rows. The float path is used whenever a case has any float output column, so every NULL-group float aggregate was at risk of a false positive.
+
+**Fix:** rewrote `float_diff_from_where` to find rows with no within-tolerance counterpart via correlated `NOT EXISTS` using `IS NOT DISTINCT FROM` on the non-float columns (NULL-safe) and a relative-epsilon test on float columns. NULL groups now match correctly.
+
+**Lesson:** a differential harness is only as trustworthy as its comparator. The exact path (`diff_subquery`) was already NULL-safe via `EXCEPT`; only the float path regressed it by switching to an equi-join. Both comparators must treat NULL keys as equal.
+
+**Test Reference:**
+
+```bash
+cargo pgrx test pg17 finding_4_filtered_float_aggregate_null_group_diff_safe
+```
