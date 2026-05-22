@@ -911,6 +911,7 @@ mod tests {
     include!("tests/pg_test_partition.rs");
     include!("tests/pg_test_partition_dispatch.rs");
     include!("tests/pg_test_audit.rs");
+    include!("tests/pg_test_fuzz.rs");
 }
 
 /// This module is required by `cargo pgrx test` invocations.
