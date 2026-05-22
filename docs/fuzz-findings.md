@@ -107,7 +107,7 @@ cargo pgrx test pg17 inner_join_equikey_promoted_not_null   # perf-preservation 
 
 ## Finding #2: DEFERRED Mode Duplicate Key Violation During Flush
 
-**Status:** OPEN
+**Status:** FIXED (net the new/old delta sides in `reflex_flush_deferred`, `src/trigger.rs`)
 
 **Title:** In DEFERRED mode, INSERTing a new key and then UPDATEing that **same key** within one deferred batch (before flush) makes `reflex_flush_deferred()` fail with `duplicate key value violates unique constraint "__reflex_uk_*"` (SQLSTATE 23505), corrupting/dropping the row.
 
@@ -139,9 +139,11 @@ REFRESH MATERIALIZED VIEW f2_mv;
 - **Expected:** flush succeeds; IMV rows match a refreshed MV.
 - **Actual:** flush raises `duplicate key value violates unique constraint "__reflex_uk_<imv>"` (SQLSTATE 23505) during the MERGE into the target.
 
-**Suspected Root Cause:**
+**Confirmed Root Cause:**
 
-The deferred delta-capture / coalescing does not collapse an INSERT followed by an UPDATE of the same key into a single net INSERT. On flush, the source delta presents that key with cardinality > 1 (or as both an insert and an update), so the generated MERGE attempts two INSERTs for the one target key → unique-constraint violation. Fix direction: coalesce per-key deltas in the deferred batch (insert+update of same key → one insert with the final values; insert+delete → no-op) before the flush MERGE, or make the MERGE source deduplicate to the final state per key.
+`reflex_flush_deferred` built the new-side transition view as `__reflex_op IN ('I','U_NEW')` and the old-side as `IN ('D','U_OLD')` directly off the staging delta. INSERT k then UPDATE k stages `I(v0)`, `U_OLD(v0)`, `U_NEW(v1)`, so the new side carried BOTH `v0` and `v1` for key k. Passthrough maintenance then inserted two rows for k → unique-constraint violation. The multiset arithmetic was actually correct (`{v0,v1} − {v0} = {v1}`); only the *execution* (insert both, then delete) violated the target's unique key.
+
+**Fix:** Net the two sides against each other before maintenance — each view now drops rows that appear identically on the opposite side (`row_number()` + `IS NOT DISTINCT FROM` over `cmp_cols` = a json/xml-safe `EXCEPT ALL`). This telescopes any I→U→…→U chain to the single final row per key (`v0` cancels, `v1` survives) and is a semantic no-op for every IMV shape, since an identical old/new pair already nets to zero in both passthrough delete+insert and aggregate decrement+increment.
 
 **Affected Shapes (Parked):**
 
@@ -167,10 +169,9 @@ To re-enable DEFERRED variants, add this to `fuzz_case()`:
 
 **Test Reference:**
 
-The exact repro is encoded as an `#[ignore]`'d regression test:
-`src/tests/pg_test_fuzz.rs::findings::finding_2_deferred_mode_duplicate_key_violation`
+Regression test (active, passes with the fix, fails when the fix is reverted):
+`src/tests/pg_test_fuzz.rs::finding_2_deferred_mode_duplicate_key_violation`
 
-To run it (after fix):
 ```bash
-cargo pgrx test pg17 finding_2_deferred_mode_duplicate_key_violation -- --ignored
+cargo pgrx test pg17 finding_2_deferred_mode_duplicate_key_violation
 ```

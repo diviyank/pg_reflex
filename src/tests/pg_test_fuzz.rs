@@ -1092,7 +1092,6 @@ fn fuzz_case_count() -> u32 {
     /// to insert or merge rows that would create duplicate key violations.
     #[cfg(any(test, feature = "pg_test"))]
     #[pg_test]
-    #[ignore]
     fn finding_2_deferred_mode_duplicate_key_violation() {
         // Minimal verified repro: in DEFERRED mode, INSERTing a new key and then
         // UPDATEing that SAME key within one deferred batch (before flush) makes the

@@ -2959,27 +2959,63 @@ pub fn reflex_flush_deferred(source_table: &str) -> String {
         let projection = src_cols.join(", ");
         let new_view = transition_new_table_name(source_table);
         let old_view = transition_old_table_name(source_table);
-        // 1.4.3 — `CREATE OR REPLACE TEMP VIEW` replaces the previous
-        // DROP-IF-EXISTS + CREATE pair. Eliminates the noisy
-        // `NOTICE: view "..." does not exist, skipping` from the first
-        // flush of each session and keeps the views reusable across flushes
-        // in the same backend (subsequent CREATE OR REPLACE rewrites them).
+        // The new-side (I, U_NEW) and old-side (D, U_OLD) of a batch can both
+        // carry a row for the same key when one key is touched more than once
+        // before the flush — e.g. INSERT k then UPDATE k stages I(v0), U_OLD(v0),
+        // U_NEW(v1): the new side then holds BOTH v0 and v1 for k. Feeding that
+        // straight into maintenance makes the passthrough INSERT add two rows for
+        // k → "duplicate key value violates unique constraint __reflex_uk_*"
+        // (docs/fuzz-findings.md finding #2).
+        //
+        // Net the two sides against each other (multiset difference): a row that
+        // appears identically on both sides contributes zero net change, so it is
+        // dropped from both. This telescopes any I→U→…→U chain down to the single
+        // final row per key (v0 cancels, v1 survives) and is semantically a no-op
+        // for every IMV shape — an old/new pair already nets to zero in both the
+        // passthrough delete+insert and the aggregate decrement+increment.
+        //
+        // Matching uses `cmp_cols` (json/xml cast to text) so types without an
+        // equality operator do not break the comparison, `IS NOT DISTINCT FROM`
+        // so NULLs match, and `row_number()` over the identical-row partition so
+        // the cancellation preserves multiplicity (true `EXCEPT ALL` semantics).
+        let cmp_aliased = cmp_cols
+            .iter()
+            .enumerate()
+            .map(|(i, c)| format!("{} AS __reflex_c{}", c, i))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let cmp_partition = cmp_cols.join(", ");
+        let cmp_indf = (0..cmp_cols.len())
+            .map(|i| format!("n.__reflex_c{i} IS NOT DISTINCT FROM o.__reflex_c{i}"))
+            .collect::<Vec<_>>()
+            .join(" AND ");
+        let netted_view = |view: &str, keep: &str, drop: &str| {
+            format!(
+                "CREATE OR REPLACE TEMP VIEW {view} AS \
+                 SELECT {projection} FROM ( \
+                   SELECT {projection}, {cmp_aliased}, \
+                          row_number() OVER (PARTITION BY {cmp_partition}) AS __reflex_rn \
+                   FROM {delta_tbl} WHERE __reflex_op IN ({keep}) \
+                 ) n \
+                 WHERE NOT EXISTS ( \
+                   SELECT 1 FROM ( \
+                     SELECT {cmp_aliased}, \
+                            row_number() OVER (PARTITION BY {cmp_partition}) AS __reflex_rn \
+                     FROM {delta_tbl} WHERE __reflex_op IN ({drop}) \
+                   ) o WHERE o.__reflex_rn = n.__reflex_rn AND {cmp_indf} \
+                 )"
+            )
+        };
         client
             .update(
-                &format!(
-                    "CREATE OR REPLACE TEMP VIEW {} AS SELECT {} FROM {} WHERE __reflex_op IN ('I', 'U_NEW')",
-                    new_view, projection, delta_tbl
-                ),
+                &netted_view(&new_view, "'I', 'U_NEW'", "'D', 'U_OLD'"),
                 None,
                 &[],
             )
             .unwrap_or_report();
         client
             .update(
-                &format!(
-                    "CREATE OR REPLACE TEMP VIEW {} AS SELECT {} FROM {} WHERE __reflex_op IN ('D', 'U_OLD')",
-                    old_view, projection, delta_tbl
-                ),
+                &netted_view(&old_view, "'D', 'U_OLD'", "'I', 'U_NEW'"),
                 None,
                 &[],
             )
