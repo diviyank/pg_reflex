@@ -218,3 +218,66 @@ fn test_filter_correctness_oracle() {
 
     crate::drop_reflex_ivm("filt_oracle_v");
 }
+
+/// Regression — a query-level `WHERE` predicate on an aggregate IMV (here on
+/// the measure column itself) must survive incremental maintenance. The stored
+/// `where_predicate` is evaluated against the flat transition table in the
+/// per-op early-skip; if it keeps the original `source.col` qualifier it errors
+/// with `missing FROM-clause entry for table "<source>"`. INSERT of a new
+/// in-filter row.
+#[pg_test]
+fn test_query_where_filter_insert_maintenance() {
+    Spi::run("CREATE TABLE qwf_ins (k INT NOT NULL, amt INT NOT NULL)").expect("create");
+    Spi::run("INSERT INTO qwf_ins SELECT g, 100 FROM generate_series(1, 100) g").expect("seed");
+    let result = crate::create_reflex_ivm(
+        "qwf_ins_v",
+        "SELECT qwf_ins.k, SUM(qwf_ins.amt) AS total FROM qwf_ins WHERE qwf_ins.amt > 50 GROUP BY qwf_ins.k",
+        None, None, None, None);
+    assert!(!result.starts_with("ERROR"), "create: {}", result);
+    let fresh = "SELECT qwf_ins.k, SUM(qwf_ins.amt) AS total FROM qwf_ins WHERE qwf_ins.amt > 50 GROUP BY qwf_ins.k";
+    assert_imv_correct("qwf_ins_v", fresh);
+
+    Spi::run("INSERT INTO qwf_ins VALUES (200, 100)").expect("insert in-filter");
+    assert_imv_correct("qwf_ins_v", fresh);
+}
+
+/// Regression — query-level `WHERE` on an aggregate IMV, immediate mode, where a
+/// row flips OUT→IN of the filter via UPDATE. Same `where_predicate` codegen
+/// path as the INSERT case.
+#[pg_test]
+fn test_query_where_filter_update_flip_immediate() {
+    Spi::run("CREATE TABLE qwf_upd (k INT NOT NULL, amt INT NOT NULL)").expect("create");
+    Spi::run("INSERT INTO qwf_upd SELECT g, 100 FROM generate_series(1, 100) g").expect("seed");
+    Spi::run("UPDATE qwf_upd SET amt = 10 WHERE k = 50").expect("start-out");
+    let result = crate::create_reflex_ivm(
+        "qwf_upd_v",
+        "SELECT qwf_upd.k, SUM(qwf_upd.amt) AS total FROM qwf_upd WHERE qwf_upd.amt > 50 GROUP BY qwf_upd.k",
+        None, None, None, None);
+    assert!(!result.starts_with("ERROR"), "create: {}", result);
+    let fresh = "SELECT qwf_upd.k, SUM(qwf_upd.amt) AS total FROM qwf_upd WHERE qwf_upd.amt > 50 GROUP BY qwf_upd.k";
+    assert_imv_correct("qwf_upd_v", fresh);
+
+    Spi::run("UPDATE qwf_upd SET amt = 100 WHERE k = 50").expect("flip-in");
+    assert_imv_correct("qwf_upd_v", fresh);
+}
+
+/// Regression — query-level `WHERE` on an aggregate IMV, DEFERRED mode, OUT→IN
+/// flip. Exercises the deferred flush's where_predicate early-skip, which runs
+/// the same predicate against the staged transition rows.
+#[pg_test]
+fn test_query_where_filter_update_flip_deferred() {
+    Spi::run("CREATE TABLE qwf_def (k INT NOT NULL, amt INT NOT NULL)").expect("create");
+    Spi::run("INSERT INTO qwf_def SELECT g, 100 FROM generate_series(1, 100) g").expect("seed");
+    Spi::run("UPDATE qwf_def SET amt = 10 WHERE k = 50").expect("start-out");
+    let result = crate::create_reflex_ivm(
+        "qwf_def_v",
+        "SELECT qwf_def.k, SUM(qwf_def.amt) AS total FROM qwf_def WHERE qwf_def.amt > 50 GROUP BY qwf_def.k",
+        None, None, Some("DEFERRED"), None);
+    assert!(!result.starts_with("ERROR"), "create: {}", result);
+    let fresh = "SELECT qwf_def.k, SUM(qwf_def.amt) AS total FROM qwf_def WHERE qwf_def.amt > 50 GROUP BY qwf_def.k";
+    assert_imv_correct("qwf_def_v", fresh);
+
+    Spi::run("UPDATE qwf_def SET amt = 100 WHERE k = 50").expect("flip-in");
+    Spi::run("SELECT reflex_flush_deferred('qwf_def')").expect("flush");
+    assert_imv_correct("qwf_def_v", fresh);
+}

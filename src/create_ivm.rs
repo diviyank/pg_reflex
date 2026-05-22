@@ -1869,8 +1869,23 @@ fn persist_metadata(client: &mut SpiClient<'_>, ctx: &BuildContext) {
         })
         .collect();
     let real_sources: Vec<&String> = ctx.real_source_names.iter().collect();
+    // The per-op early-skip evaluates `where_predicate` against the flat
+    // transition table (sql/trigger_pred_check_*.plpgsql.in and the deferred
+    // flush run `SELECT 1 FROM <transition> WHERE <where_predicate>`). The
+    // transition table is NOT aliased as the source, so the predicate must use
+    // bare column names — `imv_relevant_where` is exactly that alias-stripped
+    // form. Storing the raw qualified `where_clause` (e.g. `src.amt > 50`)
+    // instead errors at maintenance time with "missing FROM-clause entry for
+    // table src". Only single-source IMVs carry a predicate, so the lone
+    // entry is the full (possibly conservative) stripped predicate; an empty
+    // string is coerced to NULL by the registry insert.
     let where_predicate: String = if real_sources.len() <= 1 {
-        ctx.analysis.where_clause.clone().unwrap_or_default()
+        ctx.analysis
+            .imv_relevant_where
+            .values()
+            .next()
+            .cloned()
+            .unwrap_or_default()
     } else {
         String::new()
     };
