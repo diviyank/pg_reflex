@@ -245,6 +245,15 @@ pub mod generate {
         case
     }
 
+    /// Filter predicate variants for filtered cases. Returns (sql_where_clause, some description).
+    fn filter_predicate(choice: usize) -> String {
+        match choice % 3 {
+            0 => "m > 1".to_string(),
+            1 => "d <> 'g0'".to_string(),
+            _ => "id % 2 = 0".to_string(),
+        }
+    }
+
     /// Passthrough: SELECT id, m, d, f FROM t0; unique key = id.
     fn passthrough_case(t: Table) -> FuzzCase {
         let body = SelectBody {
@@ -256,6 +265,30 @@ pub mod generate {
             Column { name: "d".into(), ty: ColType::Text, nullable: true },
             Column { name: "f".into(), ty: ColType::Float8, nullable: true },
             Column { name: "x".into(), ty: t.columns[4].ty.clone(), nullable: true },
+        ];
+        let seed = DmlTxn {
+            statements: vec![DmlStmt::Insert { table: t.name.clone(), rows: seed_rows(&t, 8) }],
+        };
+        FuzzCase {
+            tables: vec![t.clone()],
+            select_body: body,
+            unique_columns: vec![t.pk.clone()],
+            deferred: false,
+            dml: vec![seed],
+            output_columns,
+        }
+    }
+
+    /// Passthrough with WHERE filter: SELECT id, m, d FROM t0 WHERE <filter>.
+    fn passthrough_filtered_case(t: Table, filter_choice: usize) -> FuzzCase {
+        let filter = filter_predicate(filter_choice);
+        let body = SelectBody {
+            rendered_sql: format!("SELECT {pk}, m, d FROM {tbl} WHERE {filter}", pk = t.pk, tbl = t.name),
+        };
+        let output_columns = vec![
+            Column { name: t.pk.clone(), ty: ColType::Int, nullable: false },
+            Column { name: "m".into(), ty: ColType::Numeric, nullable: true },
+            Column { name: "d".into(), ty: ColType::Text, nullable: true },
         ];
         let seed = DmlTxn {
             statements: vec![DmlStmt::Insert { table: t.name.clone(), rows: seed_rows(&t, 8) }],
@@ -296,11 +329,67 @@ pub mod generate {
         }
     }
 
+    /// Single-table aggregate with WHERE filter: SELECT d, SUM(m) AS s, COUNT(*) AS c FROM t0 WHERE <filter> GROUP BY d.
+    fn aggregate_filtered_case(t: Table, filter_choice: usize) -> FuzzCase {
+        let filter = filter_predicate(filter_choice);
+        let body = SelectBody {
+            rendered_sql: format!(
+                "SELECT d, SUM(m) AS s, COUNT(*) AS c FROM {tbl} WHERE {filter} GROUP BY d",
+                tbl = t.name
+            ),
+        };
+        let output_columns = vec![
+            Column { name: "d".into(), ty: ColType::Text, nullable: true },
+            Column { name: "s".into(), ty: ColType::Numeric, nullable: true },
+            Column { name: "c".into(), ty: ColType::BigInt, nullable: false },
+        ];
+        let seed = DmlTxn {
+            statements: vec![DmlStmt::Insert { table: t.name.clone(), rows: seed_rows(&t, 8) }],
+        };
+        FuzzCase {
+            tables: vec![t.clone()],
+            select_body: body,
+            unique_columns: vec!["d".into()],
+            deferred: false,
+            dml: vec![seed],
+            output_columns,
+        }
+    }
+
     /// Single-table aggregate with float: SELECT d, SUM(m) AS s, COUNT(*) AS c, AVG(m) AS avg_m, SUM(f) AS sf FROM t0 GROUP BY d.
     fn aggregate_float_case(t: Table) -> FuzzCase {
         let body = SelectBody {
             rendered_sql: format!(
                 "SELECT d, SUM(m) AS s, COUNT(*) AS c, AVG(m) AS avg_m, SUM(f) AS sf FROM {tbl} GROUP BY d",
+                tbl = t.name
+            ),
+        };
+        let output_columns = vec![
+            Column { name: "d".into(), ty: ColType::Text, nullable: true },
+            Column { name: "s".into(), ty: ColType::Numeric, nullable: true },
+            Column { name: "c".into(), ty: ColType::BigInt, nullable: false },
+            Column { name: "avg_m".into(), ty: ColType::Float8, nullable: true },
+            Column { name: "sf".into(), ty: ColType::Float8, nullable: true },
+        ];
+        let seed = DmlTxn {
+            statements: vec![DmlStmt::Insert { table: t.name.clone(), rows: seed_rows(&t, 8) }],
+        };
+        FuzzCase {
+            tables: vec![t.clone()],
+            select_body: body,
+            unique_columns: vec!["d".into()],
+            deferred: false,
+            dml: vec![seed],
+            output_columns,
+        }
+    }
+
+    /// Single-table aggregate with float and WHERE filter: SELECT d, SUM(m) AS s, COUNT(*) AS c, AVG(m) AS avg_m, SUM(f) AS sf FROM t0 WHERE <filter> GROUP BY d.
+    fn aggregate_float_filtered_case(t: Table, filter_choice: usize) -> FuzzCase {
+        let filter = filter_predicate(filter_choice);
+        let body = SelectBody {
+            rendered_sql: format!(
+                "SELECT d, SUM(m) AS s, COUNT(*) AS c, AVG(m) AS avg_m, SUM(f) AS sf FROM {tbl} WHERE {filter} GROUP BY d",
                 tbl = t.name
             ),
         };
@@ -453,19 +542,23 @@ pub mod generate {
 
     pub fn fuzz_case() -> impl Strategy<Value = FuzzCase> {
         // PARKED: LEFT-JOIN shapes excluded from the random gate while finding #1 (docs/fuzz-findings.md) is open.
-        // Only single-table cases with multi-op mutation txns are enabled.
+        // PARKED: DEFERRED mode excluded while finding #2 (docs/fuzz-findings.md) is open.
+        // Only single-table cases with multi-op mutation txns are enabled, IMMEDIATE mode only.
         single_table()
             .prop_flat_map(|t| {
                 let t2 = t.clone();
-                (Just(t), mutation_txn(&t2))
+                (Just(t), mutation_txn(&t2), any::<usize>())
             })
-            .prop_flat_map(|(t, mtx)| {
-                let t2 = t.clone();
-                let t3 = t.clone();
+            .prop_flat_map(|(t, mtx, filter_choice)| {
                 prop_oneof![
+                    // Unfiltered passthrough, aggregate, aggregate_float
                     Just(with_mutation(passthrough_case(t.clone()), mtx.clone())),
-                    Just(with_mutation(aggregate_case(t2), mtx.clone())),
-                    Just(with_mutation(aggregate_float_case(t3), mtx)),
+                    Just(with_mutation(aggregate_case(t.clone()), mtx.clone())),
+                    Just(with_mutation(aggregate_float_case(t.clone()), mtx.clone())),
+                    // Filtered passthrough, aggregate, aggregate_float
+                    Just(with_mutation(passthrough_filtered_case(t.clone(), filter_choice), mtx.clone())),
+                    Just(with_mutation(aggregate_filtered_case(t.clone(), filter_choice), mtx.clone())),
+                    Just(with_mutation(aggregate_float_filtered_case(t.clone(), filter_choice), mtx.clone())),
                 ]
             })
     }
@@ -563,6 +656,20 @@ mod generate_tests {
             }
         }
         assert!(saw_multi_stmt, "generator must emit multi-statement transactions");
+    }
+
+    #[test]
+    fn generator_reaches_filtered_variants() {
+        use super::generate::fuzz_case;
+        let mut runner = TestRunner::default();
+        let mut filt = false;
+        for _ in 0..400 {
+            let c = fuzz_case().new_tree(&mut runner).unwrap().current();
+            filt |= c.select_body.rendered_sql.to_uppercase().contains("WHERE");
+            if filt { break; }
+        }
+        // PARKED: DEFERRED mode excluded while finding #2 (docs/fuzz-findings.md) is open.
+        assert!(filt, "must reach filtered variants with WHERE predicates ({filt})");
     }
 }
 
@@ -973,6 +1080,53 @@ pub mod findings {
         .unwrap_or_else(|| "empty".into());
 
         assert_eq!(diff, 0, "finding #1: IMV diverged from MV by {diff} rows\nMV: {mv_rows}\nIMV: {imv_rows}");
+    }
+
+    /// OPEN finding #2 — see docs/fuzz-findings.md. Remove #[ignore] when fixed.
+    ///
+    /// A single-table passthrough view with DEFERRED incremental maintenance, after
+    /// DML mutations, fails during reflex_flush_deferred() with "duplicate key value
+    /// violates unique constraint" error, suggesting the maintenance logic is attempting
+    /// to insert or merge rows that would create duplicate key violations.
+    #[cfg(any(test, feature = "pg_test"))]
+    #[pg_test]
+    #[ignore]
+    fn finding_2_deferred_mode_duplicate_key_violation() {
+        Spi::run("CREATE TABLE f2_t0 (id int primary key, m numeric, d text)").unwrap();
+
+        // Create the MV
+        let body = "SELECT id, m, d FROM f2_t0";
+        Spi::run(&format!("CREATE MATERIALIZED VIEW f2_mv AS {body}")).unwrap();
+
+        // Create the IMV with DEFERRED mode
+        let r = crate::create_reflex_ivm("f2_imv", body, Some("id"), None, Some("DEFERRED"), None);
+        assert!(r.starts_with("CREATE REFLEX"), "IMV creation failed: {r}");
+
+        // Seed the table
+        Spi::run("INSERT INTO f2_t0 VALUES (0,0.0,'g0'),(1,1.1,'g1'),(2,2.2,'g2'),(3,3.0,'g3'),(4,4.1,'g0'),(5,0.2,'g1'),(6,1.0,'g2'),(7,2.1,'g3')")
+            .unwrap();
+
+        // Perform mutations in a single transaction
+        Spi::run("UPDATE f2_t0 SET m = m + 1 WHERE id % 2 = 0").unwrap();
+        Spi::run("INSERT INTO f2_t0 (id, m, d) VALUES (8, 3.2, 'g0')").unwrap();
+
+        // Flush deferred changes (this should not raise a duplicate key error)
+        let flush_result = Spi::run("SELECT reflex_flush_deferred('f2_imv')");
+        assert!(flush_result.is_ok(), "flush_deferred failed: {:?}", flush_result.err());
+
+        // Refresh the MV
+        Spi::run("REFRESH MATERIALIZED VIEW f2_mv").unwrap();
+
+        // Compare the two views
+        let diff = Spi::get_one::<i64>(
+            "SELECT count(*)::bigint FROM ( \
+               (SELECT * FROM f2_mv EXCEPT SELECT * FROM f2_imv) UNION ALL \
+               (SELECT * FROM f2_imv EXCEPT SELECT * FROM f2_mv)) d",
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(diff, 0, "finding #2: IMV diverged from MV by {diff} rows after DEFERRED flush");
     }
 }
 
