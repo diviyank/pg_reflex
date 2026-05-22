@@ -3897,3 +3897,45 @@ fn pg_test_topk_update_multi_column_shrink() {
     Spi::run("DELETE FROM topk_mc_src WHERE val IN (3, 8)").expect("drain heaps");
     assert_imv_correct("topk_mc_v", fresh);
 }
+
+/// Regression — a carried scalar group-key expression whose normalized name
+/// exceeds Postgres's 63-char identifier limit. The intermediate column name and
+/// the type-probe `column_types` key must agree after Postgres truncates both to
+/// 63 chars; if codegen looks the column type up by the untruncated name it
+/// misses and defaults to NUMERIC, so a boolean EXISTS fails to create with
+/// "column ... is of type numeric but expression is of type boolean".
+#[pg_test]
+fn test_carried_exists_boolean_conjunct_long_name() {
+    Spi::run("CREATE TABLE cebug_t(g INT PRIMARY KEY, v INT)").expect("t");
+    Spi::run("CREATE TABLE cebug_products(product_id INT, is_active BOOL)").expect("pt");
+    Spi::run("INSERT INTO cebug_t VALUES (1,10),(2,20),(3,30)").expect("seed t");
+    Spi::run("INSERT INTO cebug_products VALUES (1,true),(3,false)").expect("seed pt");
+    let body = "SELECT t.g, SUM(t.v) AS s, \
+        EXISTS(SELECT 1 FROM cebug_products c WHERE c.product_id = t.g AND c.is_active) AS flag \
+        FROM cebug_t t GROUP BY t.g";
+    let r = crate::create_reflex_ivm("cebug_v", body, None, None, None, None);
+    assert_eq!(r, "CREATE REFLEX INCREMENTAL VIEW", "create failed: {}", r);
+    assert_imv_correct("cebug_v", body);
+    Spi::run("INSERT INTO cebug_t VALUES (4,40)").expect("ins");
+    Spi::run("INSERT INTO cebug_products VALUES (4,true)").expect("ins pt");
+    assert_imv_correct("cebug_v", body);
+}
+
+/// Regression — same 63-char-truncation root cause, isolated from any boolean
+/// term: a LONG carried EXISTS predicate built only from non-boolean comparisons.
+/// Proves the trigger is the >63-char normalized name, not a boolean conjunct.
+#[pg_test]
+fn test_carried_exists_long_predicate_no_boolean() {
+    Spi::run("CREATE TABLE celp_t(g INT PRIMARY KEY, v INT)").expect("t");
+    Spi::run("CREATE TABLE celp_products(product_id INT, qty INT)").expect("pt");
+    Spi::run("INSERT INTO celp_t VALUES (1,10),(2,20)").expect("seed t");
+    Spi::run("INSERT INTO celp_products VALUES (1,5)").expect("seed pt");
+    // No boolean column anywhere; predicate padded with numeric comparisons so
+    // the normalized column name exceeds 63 chars.
+    let body = "SELECT t.g, SUM(t.v) AS s, \
+        EXISTS(SELECT 1 FROM celp_products c WHERE c.product_id = t.g AND c.qty <> -1 AND c.qty <> -2) AS flag \
+        FROM celp_t t GROUP BY t.g";
+    let r = crate::create_reflex_ivm("celp_v", body, None, None, None, None);
+    assert_eq!(r, "CREATE REFLEX INCREMENTAL VIEW", "create failed: {}", r);
+    assert_imv_correct("celp_v", body);
+}

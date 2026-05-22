@@ -153,6 +153,25 @@ pub fn bare_column_name(col: &str) -> &str {
 /// - Unquoted (`Grp`)  → fold to lowercase (PG's parse-time rule).
 ///
 /// For expressions (containing parentheses), sanitize to a valid identifier suffix.
+/// Postgres truncates identifiers to `NAMEDATALEN - 1` (63 bytes by default,
+/// respecting multibyte char boundaries). Generated column names that exceed
+/// this are silently truncated by Postgres when it stores the attname / creates
+/// the column. We must truncate identically so a name we later look up (e.g. in
+/// the type-probe `column_types` map keyed by Postgres's stored attname) matches
+/// the stored, truncated name — otherwise the lookup misses and the column is
+/// mis-typed (see the carried-EXISTS / long-group-key-expression regressions).
+fn truncate_identifier(mut s: String) -> String {
+    const MAX_IDENT_BYTES: usize = 63;
+    if s.len() > MAX_IDENT_BYTES {
+        let mut end = MAX_IDENT_BYTES;
+        while end > 0 && !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        s.truncate(end);
+    }
+    s
+}
+
 pub fn normalized_column_name(col: &str) -> String {
     let bare = bare_column_name(col);
     let is_quoted = bare.starts_with('"') && bare.ends_with('"') && bare.len() >= 2;
@@ -162,7 +181,7 @@ pub fn normalized_column_name(col: &str) -> String {
     } else {
         bare.to_lowercase()
     };
-    if stripped.contains('(') {
+    let result = if stripped.contains('(') {
         stripped
             .chars()
             .map(|c| {
@@ -177,7 +196,8 @@ pub fn normalized_column_name(col: &str) -> String {
             .to_string()
     } else {
         stripped
-    }
+    };
+    truncate_identifier(result)
 }
 
 // `replace_identifier` is re-exported at the top of this file (see the
