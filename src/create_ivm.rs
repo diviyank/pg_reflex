@@ -2026,6 +2026,33 @@ fn initial_aggregate_materialization(client: &mut SpiClient<'_>, ctx: &mut Build
     }
 }
 
+/// Returns the first GROUP BY key that is not projected *bare* in the SELECT
+/// list (it appears only inside an expression, e.g. `GROUP BY a.sx` with
+/// `SELECT COALESCE(a.sx, 0)`, or is omitted from SELECT entirely).
+///
+/// Such a key becomes an intermediate-table column but has NO column in the
+/// result (target) table, since the target carries only the projected outputs.
+/// Every target-side operation — the target composite index and the
+/// target-sync row matching (`target_group_columns`) — then references a column
+/// that does not exist, surfacing as a cryptic `column "<key>" does not exist`
+/// at create or a crash on the first incremental maintenance. Reject up front
+/// with an actionable message instead. (A query that groups *by the expression*
+/// — `GROUP BY DATE_TRUNC('month', ts)` projecting `DATE_TRUNC('month', ts)` —
+/// is fine: the key is the expression and it is projected.)
+fn first_unprojected_group_key(analysis: &crate::sql_analyzer::SqlAnalysis) -> Option<String> {
+    for gb in &analysis.group_by_columns {
+        let gb_norm = crate::query_decomposer::normalized_column_name(gb);
+        let projected = analysis.select_columns.iter().any(|sc| {
+            sc.is_passthrough
+                && crate::query_decomposer::normalized_column_name(&sc.expr_sql) == gb_norm
+        });
+        if !projected {
+            return Some(gb.clone());
+        }
+    }
+    None
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn create_reflex_ivm_impl(
     view_name: &str,
@@ -2042,6 +2069,21 @@ pub(crate) fn create_reflex_ivm_impl(
         Ok(p) => p,
         Err(msg) => return msg,
     };
+
+    if let Some(gb) = first_unprojected_group_key(&parsed.analysis) {
+        return Box::leak(
+            format!(
+                "ERROR: GROUP BY key '{gb}' is not projected in the SELECT list. \
+                 An aggregate reflex IMV requires every GROUP BY column to appear bare in \
+                 SELECT — a key used only inside an expression (e.g. COALESCE({gb}, 0)) or \
+                 omitted from SELECT has no column in the result table, which the target \
+                 index and incremental refresh both rely on. Fix: add '{gb}' to the SELECT \
+                 list, or move the wrapping expression into a passthrough outer layer \
+                 (an outer SELECT over a CTE that projects the bare key + aggregates)."
+            )
+            .into_boxed_str(),
+        );
+    }
 
     if let Some(result) = try_decompose_set_op(
         view_name,

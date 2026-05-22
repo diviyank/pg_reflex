@@ -3939,3 +3939,49 @@ fn test_carried_exists_long_predicate_no_boolean() {
     assert_eq!(r, "CREATE REFLEX INCREMENTAL VIEW", "create failed: {}", r);
     assert_imv_correct("celp_v", body);
 }
+
+
+/// Regression — a GROUP BY key projected ONLY inside an expression (here
+/// `GROUP BY a.sx` with `SELECT COALESCE(a.sx, 0)`) has no column in the result
+/// table, so the target index and incremental refresh would reference a
+/// nonexistent column (cryptic "column sx does not exist", or a crash on first
+/// maintenance). Such a query is rejected up front with an actionable message.
+#[pg_test]
+fn test_unprojected_group_key_rejected() {
+    Spi::run("CREATE TABLE jgw_t(g INT PRIMARY KEY, v INT)").expect("t");
+    Spi::run("CREATE TABLE jgw_a(g INT, x INT)").expect("a");
+    Spi::run("INSERT INTO jgw_t VALUES (1,10),(2,20)").expect("seed t");
+    Spi::run("INSERT INTO jgw_a VALUES (1,5),(1,7)").expect("seed a");
+    let body = "WITH agg AS (SELECT g, SUM(x) AS sx FROM jgw_a GROUP BY g) \
+                SELECT t.g, SUM(t.v) AS s, COALESCE(a.sx, 0) AS sx0 \
+                FROM jgw_t t LEFT JOIN agg a ON a.g = t.g GROUP BY t.g, a.sx";
+    let r = crate::create_reflex_ivm("jgw_v", body, None, None, None, Some("g"));
+    assert!(
+        r.starts_with("ERROR: GROUP BY key 'a.sx' is not projected"),
+        "expected clear unprojected-group-key error, got: {}",
+        r
+    );
+    // No sub-IMV should leak from the rejected CTE decomposition.
+    let leaked = Spi::get_one::<i64>(
+        "SELECT COUNT(*) FROM public.__reflex_ivm_reference WHERE name LIKE 'jgw_v%'",
+    )
+    .expect("count")
+    .unwrap_or(0);
+    assert_eq!(leaked, 0, "rejected create leaked {} registry rows", leaked);
+}
+
+/// Control — projecting the GROUP BY key `a.sx` bare is NOT rejected (the
+/// fail-fast guard targets only unprojected keys) and is correct at creation.
+#[pg_test]
+fn test_projected_joined_group_key_ok() {
+    Spi::run("CREATE TABLE jgo_t(g INT PRIMARY KEY, v INT)").expect("t");
+    Spi::run("CREATE TABLE jgo_a(g INT, x INT)").expect("a");
+    Spi::run("INSERT INTO jgo_t VALUES (1,10),(2,20)").expect("seed t");
+    Spi::run("INSERT INTO jgo_a VALUES (1,5),(1,7)").expect("seed a");
+    let body = "WITH agg AS (SELECT g, SUM(x) AS sx FROM jgo_a GROUP BY g) \
+                SELECT t.g, SUM(t.v) AS s, a.sx \
+                FROM jgo_t t LEFT JOIN agg a ON a.g = t.g GROUP BY t.g, a.sx";
+    let r = crate::create_reflex_ivm("jgo_v", body, None, None, None, Some("g"));
+    assert_eq!(r, "CREATE REFLEX INCREMENTAL VIEW", "create failed: {}", r);
+    assert_imv_correct("jgo_v", body);
+}
