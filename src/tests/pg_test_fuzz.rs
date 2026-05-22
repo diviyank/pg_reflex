@@ -386,7 +386,6 @@ pub mod oracle {
 
         let mv = format!("mv{suffix}");
         let imv = format!("imv{suffix}");
-        let result_table = format!("result{suffix}");
 
         Spi::run(&render::create_mv_sql(&mv, &case.select_body))
             .expect("setup ddl: create mv failed");
