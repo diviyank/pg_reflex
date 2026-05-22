@@ -2,7 +2,7 @@
 // docs/superpowers/specs/2026-05-22-imv-differential-correctness-design.md
 // and docs/superpowers/plans/2026-05-22-imv-differential-correctness.md.
 
-mod model {
+pub mod model {
     /// Exact-comparable scalar types plus float (float8 uses epsilon compare).
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum ColType {
@@ -80,7 +80,7 @@ mod model {
     }
 }
 
-mod render {
+pub mod render {
     use super::model::*;
 
     pub fn create_table_sql(t: &Table) -> String {
@@ -128,8 +128,8 @@ mod render {
     }
 }
 
-#[cfg(test)]
-mod generate {
+#[cfg(any(test, feature = "pg_test"))]
+pub mod generate {
     use super::model::*;
     use proptest::prelude::*;
 
@@ -305,5 +305,220 @@ mod generate_tests {
         assert!(case.select_body.rendered_sql.to_uppercase().contains("SELECT"));
         assert!(!case.unique_columns.is_empty());
         assert!(!case.output_columns.is_empty());
+    }
+}
+
+#[cfg(any(test, feature = "pg_test"))]
+pub mod oracle {
+    use super::model::*;
+    use super::render;
+    use pgrx::prelude::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static CASE_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    #[derive(Debug)]
+    pub enum Outcome {
+        Match,
+        #[allow(dead_code)]
+        Skip(String),
+        Bug(String),
+    }
+
+    fn cols_of(case: &FuzzCase, table: &str) -> Vec<String> {
+        case.tables
+            .iter()
+            .find(|t| t.name == table)
+            .map(|t| t.columns.iter().map(|c| c.name.clone()).collect())
+            .unwrap_or_default()
+    }
+
+    fn exact_diff_count(mv: &str, imv: &str) -> i64 {
+        let sql = format!(
+            "SELECT count(*)::bigint FROM ( \
+               (SELECT * FROM {mv} EXCEPT SELECT * FROM {imv}) UNION ALL \
+               (SELECT * FROM {imv} EXCEPT SELECT * FROM {mv})) d"
+        );
+        Spi::get_one::<i64>(&sql)
+            .ok()
+            .flatten()
+            .unwrap_or(-1)
+    }
+
+    fn rename_case(case: &FuzzCase, suffix: &str) -> FuzzCase {
+        let mut c = case.clone();
+        // longest names first to avoid prefix corruption
+        let mut names: Vec<String> = case.tables.iter().map(|t| t.name.clone()).collect();
+        names.sort_by_key(|n| std::cmp::Reverse(n.len()));
+        for old in names {
+            let new = format!("{old}{suffix}");
+            for t in &mut c.tables {
+                if t.name == old {
+                    t.name = new.clone();
+                }
+            }
+            c.select_body.rendered_sql =
+                c.select_body.rendered_sql.replace(&old, &new);
+            for txn in &mut c.dml {
+                for stmt in &mut txn.statements {
+                    match stmt {
+                        DmlStmt::Insert { table, .. }
+                        | DmlStmt::Delete { table, .. }
+                        | DmlStmt::Update { table, .. }
+                        | DmlStmt::Truncate { table } => {
+                            if *table == old {
+                                *table = new.clone();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        c
+    }
+
+    pub fn evaluate(case: &FuzzCase) -> Outcome {
+        let seq = CASE_SEQ.fetch_add(1, Ordering::Relaxed);
+        let suffix = format!("_fz{seq}");
+        let case = rename_case(case, &suffix);
+
+        for t in &case.tables {
+            if let Err(_) = Spi::run(&render::create_table_sql(t)) {
+                return Outcome::Bug("failed to create base table".to_string());
+            }
+        }
+
+        let mv = format!("mv{suffix}");
+        let imv = format!("imv{suffix}");
+
+        if let Err(_) = Spi::run(&render::create_mv_sql(&mv, &case.select_body)) {
+            return Outcome::Bug("failed to create mv".to_string());
+        }
+
+        // Try to create a savepoint for isolation, but don't fail if already in a
+        // transaction (e.g., #[pg_test] context). The PgTryBuilder will catch
+        // exceptions anyway.
+        let savepoint_ok = Spi::run(&format!("SAVEPOINT sp{suffix}")).is_ok();
+
+        let keys = case.unique_columns.join(",");
+        let mode = if case.deferred { "DEFERRED" } else { "IMMEDIATE" };
+        let body = case.select_body.rendered_sql.clone();
+        let case_in = case.clone();
+        let mv_in = mv.clone();
+        let imv_in = imv.clone();
+        let suffix_in = suffix.clone();
+
+        let outcome = PgTryBuilder::new(move || {
+            let msg = crate::create_reflex_ivm(
+                &imv_in,
+                &body,
+                Some(&keys),
+                None,
+                Some(mode),
+                None,
+            );
+            if msg.contains(crate::REFLEX_UNSUPPORTED_TAG) {
+                return Outcome::Skip(msg.to_string());
+            }
+            if !msg.starts_with("CREATE REFLEX") {
+                return Outcome::Bug(format!("unexpected create return: {msg}"));
+            }
+
+            for txn in &case_in.dml {
+                for stmt in &txn.statements {
+                    let cols = cols_of(&case_in, match stmt {
+                        DmlStmt::Insert { table, .. }
+                        | DmlStmt::Delete { table, .. }
+                        | DmlStmt::Update { table, .. }
+                        | DmlStmt::Truncate { table } => table,
+                    });
+                    let sql = render::dml_sql(stmt, &|_t: &str| cols.clone());
+                    let _ = Spi::run(&sql);
+                }
+            }
+
+            if case_in.deferred {
+                for t in &case_in.tables {
+                    let _ = Spi::run(&format!("SELECT reflex_flush_deferred('{}')", t.name));
+                }
+            }
+
+            if let Err(_) = Spi::run(&render::refresh_mv_sql(&mv_in)) {
+                return Outcome::Bug("failed to refresh mv".to_string());
+            }
+
+            let diff = exact_diff_count(&mv_in, &imv_in);
+            if diff == 0 {
+                Outcome::Match
+            } else {
+                Outcome::Bug(format!("contents diverge: {diff} mismatched rows"))
+            }
+        })
+        .catch_others(|_caught| {
+            Outcome::Bug("codegen exception (caught)".to_string())
+        })
+        .execute();
+
+        // Only attempt to release/rollback savepoint if it was created successfully.
+        if savepoint_ok {
+            match &outcome {
+                Outcome::Bug(_) => {
+                    let _ = Spi::run(&format!("ROLLBACK TO SAVEPOINT sp{suffix_in}"));
+                }
+                _ => {
+                    let _ = Spi::run(&format!("RELEASE SAVEPOINT sp{suffix_in}"));
+                }
+            }
+        }
+
+        outcome
+    }
+
+    pub fn repro_sql(case: &FuzzCase) -> String {
+        let mut out = String::new();
+        for t in &case.tables {
+            out.push_str(&render::create_table_sql(t));
+            out.push_str(";\n");
+        }
+        for txn in &case.dml {
+            for stmt in &txn.statements {
+                let cols = cols_of(case, match stmt {
+                    DmlStmt::Insert { table, .. }
+                    | DmlStmt::Delete { table, .. }
+                    | DmlStmt::Update { table, .. }
+                    | DmlStmt::Truncate { table } => table,
+                });
+                out.push_str(&render::dml_sql(stmt, &|_t: &str| cols.clone()));
+                out.push_str(";\n");
+            }
+        }
+        out.push_str(&format!(
+            "SELECT create_reflex_ivm('imv_repro', $body${}$body$, '{}');\n",
+            case.select_body.rendered_sql,
+            case.unique_columns.join(",")
+        ));
+        out
+    }
+}
+
+#[cfg(any(test, feature = "pg_test"))]
+#[pg_test]
+fn oracle_matches_on_a_simple_generated_case() {
+    use proptest::strategy::{Strategy, ValueTree};
+    use proptest::test_runner::TestRunner;
+
+    let mut runner = TestRunner::default();
+    let case = generate::fuzz_case()
+        .new_tree(&mut runner)
+        .unwrap()
+        .current();
+    match oracle::evaluate(&case) {
+        oracle::Outcome::Match | oracle::Outcome::Skip(_) => {}
+        oracle::Outcome::Bug(msg) => {
+            panic!(
+                "expected match/skip on simple case, got bug: {msg}\n{}",
+                oracle::repro_sql(&case)
+            )
+        }
     }
 }
