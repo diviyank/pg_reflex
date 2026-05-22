@@ -595,3 +595,74 @@ fn fuzz_differential_exact() {
         panic!("differential fuzz found a bug: {reason}\nshrunk case: {case:?}");
     }
 }
+
+/// Bug 1: COALESCE over a joined GROUP BY key. Either it builds and matches
+/// the MV, or pg_reflex deliberately rejects it (tagged). It must NOT raise
+/// a Postgres exception (the old failure: column "sx" does not exist).
+#[cfg(any(test, feature = "pg_test"))]
+#[pg_test]
+fn regression_bug1_coalesce_over_joined_group_key() {
+    use pgrx::prelude::*;
+    Spi::run("CREATE TABLE b1_t(g int primary key, v int)").unwrap();
+    Spi::run("CREATE TABLE b1_a(g int, x int)").unwrap();
+    Spi::run("INSERT INTO b1_t VALUES (1,10),(2,20)").unwrap();
+    Spi::run("INSERT INTO b1_a VALUES (1,5),(1,7)").unwrap();
+    let body = "WITH agg AS (SELECT g, SUM(x) AS sx FROM b1_a GROUP BY g) \
+                SELECT t.g, SUM(t.v) AS s, COALESCE(a.sx, 0) AS sx0 \
+                FROM b1_t t LEFT JOIN agg a ON a.g = t.g GROUP BY t.g, a.sx";
+    let r = crate::create_reflex_ivm("b1_imv", body, Some("g"), None, None, None);
+    assert!(
+        r.starts_with("CREATE REFLEX") || r.contains(crate::REFLEX_UNSUPPORTED_TAG),
+        "Bug 1 regressed: create must succeed or be cleanly rejected, got: {r}"
+    );
+}
+
+/// Bug 2: carried EXISTS with a boolean conjunct. Old failure: column ...
+/// "is of type numeric but expression is of type boolean".
+#[cfg(any(test, feature = "pg_test"))]
+#[pg_test]
+fn regression_bug2_exists_with_boolean_conjunct() {
+    use pgrx::prelude::*;
+    Spi::run("CREATE TABLE b2_t(g int primary key, v int)").unwrap();
+    Spi::run("CREATE TABLE b2_pt(product_id int, is_active bool)").unwrap();
+    Spi::run("INSERT INTO b2_t VALUES (1,10),(2,20)").unwrap();
+    Spi::run("INSERT INTO b2_pt VALUES (1,true)").unwrap();
+    let body = "SELECT t.g, SUM(t.v) AS s, \
+                EXISTS(SELECT 1 FROM b2_pt c WHERE c.product_id = t.g AND c.is_active) AS flag \
+                FROM b2_t t GROUP BY t.g";
+    let r = crate::create_reflex_ivm("b2_imv", body, Some("g"), None, None, None);
+    assert!(
+        r.starts_with("CREATE REFLEX") || r.contains(crate::REFLEX_UNSUPPORTED_TAG),
+        "Bug 2 regressed: create must succeed or be cleanly rejected, got: {r}"
+    );
+}
+
+/// Bug 3 (commit 4d1d382): COUNT over a LEFT JOIN — secondary-side
+/// incremental maintenance. Build, mutate the secondary side, and assert
+/// the IMV matches a refreshed MV.
+#[cfg(any(test, feature = "pg_test"))]
+#[pg_test]
+fn regression_bug3_count_over_left_join_secondary_side() {
+    use pgrx::prelude::*;
+    Spi::run("CREATE TABLE b3_t(g int primary key, v int)").unwrap();
+    Spi::run("CREATE TABLE b3_s(g int, w int)").unwrap();
+    Spi::run("INSERT INTO b3_t VALUES (1,10),(2,20),(3,30)").unwrap();
+    Spi::run("INSERT INTO b3_s VALUES (1,1),(1,1),(2,1)").unwrap();
+    let body = "SELECT t.g, COUNT(s.w) AS c FROM b3_t t \
+                LEFT JOIN b3_s s ON s.g = t.g GROUP BY t.g";
+    Spi::run(&format!("CREATE MATERIALIZED VIEW b3_mv AS {body}")).unwrap();
+    let r = crate::create_reflex_ivm("b3_imv", body, Some("g"), None, None, None);
+    assert!(r.starts_with("CREATE REFLEX"), "create failed: {r}");
+    // Mutate the secondary (LEFT) side.
+    Spi::run("INSERT INTO b3_s VALUES (3,1),(1,1)").unwrap();
+    Spi::run("DELETE FROM b3_s WHERE g = 2").unwrap();
+    Spi::run("REFRESH MATERIALIZED VIEW b3_mv").unwrap();
+    let diff = Spi::get_one::<i64>(
+        "SELECT count(*)::bigint FROM ( \
+           (SELECT * FROM b3_mv EXCEPT SELECT * FROM b3_imv) UNION ALL \
+           (SELECT * FROM b3_imv EXCEPT SELECT * FROM b3_mv)) d",
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(diff, 0, "Bug 3 regressed: IMV diverged from MV by {diff} rows");
+}
