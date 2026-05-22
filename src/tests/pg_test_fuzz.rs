@@ -146,7 +146,7 @@ pub mod generate {
     }
 
     /// One base table `t0` with an int PK `id`, a numeric measure `m`, a text
-    /// dimension `d`, and one extra random-typed nullable column.
+    /// dimension `d`, a float column `f`, and one extra random-typed nullable column.
     fn single_table() -> impl Strategy<Value = Table> {
         exact_coltype().prop_map(|extra_ty| Table {
             name: "t0".into(),
@@ -155,6 +155,7 @@ pub mod generate {
                 Column { name: "id".into(), ty: ColType::Int, nullable: false },
                 Column { name: "m".into(), ty: ColType::Numeric, nullable: true },
                 Column { name: "d".into(), ty: ColType::Text, nullable: true },
+                Column { name: "f".into(), ty: ColType::Float8, nullable: true },
                 Column { name: "x".into(), ty: extra_ty, nullable: true },
             ],
         })
@@ -244,15 +245,17 @@ pub mod generate {
         case
     }
 
-    /// Passthrough: SELECT id, m, d FROM t0; unique key = id.
+    /// Passthrough: SELECT id, m, d, f FROM t0; unique key = id.
     fn passthrough_case(t: Table) -> FuzzCase {
         let body = SelectBody {
-            rendered_sql: format!("SELECT {pk}, m, d FROM {tbl}", pk = t.pk, tbl = t.name),
+            rendered_sql: format!("SELECT {pk}, m, d, f, x FROM {tbl}", pk = t.pk, tbl = t.name),
         };
         let output_columns = vec![
             Column { name: t.pk.clone(), ty: ColType::Int, nullable: false },
             Column { name: "m".into(), ty: ColType::Numeric, nullable: true },
             Column { name: "d".into(), ty: ColType::Text, nullable: true },
+            Column { name: "f".into(), ty: ColType::Float8, nullable: true },
+            Column { name: "x".into(), ty: t.columns[4].ty.clone(), nullable: true },
         ];
         let seed = DmlTxn {
             statements: vec![DmlStmt::Insert { table: t.name.clone(), rows: seed_rows(&t, 8) }],
@@ -293,7 +296,35 @@ pub mod generate {
         }
     }
 
-    /// Two-table schema: t0 (id, m, d) and t1 (id, fk, w).
+    /// Single-table aggregate with float: SELECT d, SUM(m) AS s, COUNT(*) AS c, AVG(m) AS avg_m, SUM(f) AS sf FROM t0 GROUP BY d.
+    fn aggregate_float_case(t: Table) -> FuzzCase {
+        let body = SelectBody {
+            rendered_sql: format!(
+                "SELECT d, SUM(m) AS s, COUNT(*) AS c, AVG(m) AS avg_m, SUM(f) AS sf FROM {tbl} GROUP BY d",
+                tbl = t.name
+            ),
+        };
+        let output_columns = vec![
+            Column { name: "d".into(), ty: ColType::Text, nullable: true },
+            Column { name: "s".into(), ty: ColType::Numeric, nullable: true },
+            Column { name: "c".into(), ty: ColType::BigInt, nullable: false },
+            Column { name: "avg_m".into(), ty: ColType::Float8, nullable: true },
+            Column { name: "sf".into(), ty: ColType::Float8, nullable: true },
+        ];
+        let seed = DmlTxn {
+            statements: vec![DmlStmt::Insert { table: t.name.clone(), rows: seed_rows(&t, 8) }],
+        };
+        FuzzCase {
+            tables: vec![t.clone()],
+            select_body: body,
+            unique_columns: vec!["d".into()],
+            deferred: false,
+            dml: vec![seed],
+            output_columns,
+        }
+    }
+
+    /// Two-table schema: t0 (id, m, d, f) and t1 (id, fk, w).
     fn two_tables() -> impl Strategy<Value = (Table, Table)> {
         Just((
             Table {
@@ -430,9 +461,11 @@ pub mod generate {
             })
             .prop_flat_map(|(t, mtx)| {
                 let t2 = t.clone();
+                let t3 = t.clone();
                 prop_oneof![
                     Just(with_mutation(passthrough_case(t.clone()), mtx.clone())),
-                    Just(with_mutation(aggregate_case(t2), mtx)),
+                    Just(with_mutation(aggregate_case(t2), mtx.clone())),
+                    Just(with_mutation(aggregate_float_case(t3), mtx)),
                 ]
             })
     }
@@ -565,6 +598,52 @@ pub mod oracle {
         )
     }
 
+    /// Build the FROM..WHERE clause that counts rows differing between mv and imv,
+    /// using exact `IS DISTINCT FROM` for non-float columns and a relative epsilon
+    /// for float columns. Used when the case has any float output column.
+    pub fn float_diff_from_where(mv: &str, imv: &str, keys: &[String], cols: &[Column]) -> String {
+        if keys.is_empty() {
+            panic!("float_diff_from_where requires at least one key column");
+        }
+        // Build ON clause for the join: match on all key columns
+        let on: Vec<String> = keys.iter()
+            .map(|k| format!("a.\"{}\" = b.\"{}\"", k, k)).collect();
+
+        // Build WHERE predicates to find differences (for matched rows) or missing rows
+        let mut preds: Vec<String> = Vec::new();
+
+        // Check for missing rows (FULL JOIN unmatched rows)
+        preds.push(format!("a.\"{}\" IS NULL", &keys[0]));
+        preds.push(format!("b.\"{}\" IS NULL", &keys[0]));
+
+        // Check for data differences in non-key columns
+        for c in cols {
+            if keys.iter().any(|k| k == &c.name) { continue; }
+            let n = &c.name;
+            if c.ty.is_float() {
+                // Float comparison with epsilon tolerance
+                preds.push(format!(
+                    "(abs(COALESCE(a.\"{}\",0) - COALESCE(b.\"{}\",0)) > 1e-9 * GREATEST(abs(COALESCE(a.\"{}\",0)), abs(COALESCE(b.\"{}\",0)), 1))",
+                    n, n, n, n));
+            } else {
+                // Exact comparison for non-float columns
+                preds.push(format!("a.\"{}\" IS DISTINCT FROM b.\"{}\"", n, n));
+            }
+        }
+
+        let where_clause = preds.join(" OR ");
+
+        // Return as a subquery with aliased columns to avoid duplicate column names
+        // Use COALESCE to select from whichever side has the row (for unmatched rows)
+        let col_list = cols.iter()
+            .map(|c| format!("COALESCE(a.\"{}\", b.\"{}\") AS \"{}\"", c.name, c.name, c.name))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        format!("( SELECT {} FROM {} a FULL JOIN {} b ON {} WHERE {} ) d",
+            col_list, mv, imv, on.join(" AND "), where_clause)
+    }
+
     fn rename_case(case: &FuzzCase, suffix: &str) -> FuzzCase {
         let mut c = case.clone();
         // longest names first to avoid prefix corruption
@@ -641,7 +720,13 @@ pub mod oracle {
         let flush_block = flush_lines.join("\n");
 
         // Build the diff subquery (without the outer SELECT).
-        let diff_subquery_str = diff_subquery(&mv, &imv);
+        // Use float-tolerant comparison if the case has any float output columns.
+        let has_float = case.output_columns.iter().any(|c| c.ty.is_float());
+        let diff_from = if has_float {
+            float_diff_from_where(&mv, &imv, &case.unique_columns, &case.output_columns)
+        } else {
+            diff_subquery(&mv, &imv)
+        };
 
         // Construct the DO block as a string. Use $reflexbody$ for body dollar-quoting
         // to avoid collisions with the DO block's outer $$ quotes.
@@ -695,7 +780,7 @@ $func$ LANGUAGE plpgsql;
             dml_block,         // DML statements
             flush_block,       // flush statements
             mv,                // REFRESH target
-            diff_subquery_str, // SELECT FROM subquery
+            diff_from,         // SELECT FROM (exact or float-tolerant)
         );
 
         // Create the function.
@@ -752,6 +837,25 @@ $func$ LANGUAGE plpgsql;
             case.unique_columns.join(",")
         ));
         out
+    }
+}
+
+#[cfg(test)]
+mod oracle_unit_tests {
+    use super::model::{Column, ColType};
+    use super::oracle::float_diff_from_where;
+
+    #[test]
+    fn float_compare_uses_relative_epsilon_and_full_join() {
+        let cols = vec![
+            Column { name: "g".into(), ty: ColType::Int, nullable: false },
+            Column { name: "s".into(), ty: ColType::Float8, nullable: true },
+            Column { name: "t".into(), ty: ColType::Text, nullable: true },
+        ];
+        let sql = float_diff_from_where("v_mv", "v_imv", &["g".to_string()], &cols);
+        assert!(sql.contains("1e-9"), "must use relative epsilon: {sql}");
+        assert!(sql.contains("FULL JOIN"), "must full-join on key: {sql}");
+        assert!(sql.contains("IS DISTINCT FROM"), "non-float exact: {sql}");
     }
 }
 
