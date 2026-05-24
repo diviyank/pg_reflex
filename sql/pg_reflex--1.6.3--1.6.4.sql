@@ -1,0 +1,77 @@
+-- Migration: pg_reflex 1.6.3 → 1.6.4
+--
+-- Run via: ALTER EXTENSION pg_reflex UPDATE TO '1.6.4';
+--
+-- 1.6.4 is a correctness release hardened by a new differential fuzz harness
+-- (builds a real MATERIALIZED VIEW and a pg_reflex IMV from the same query,
+-- mutates the base tables, and asserts the two agree row-for-row). There are
+-- NO catalog schema changes, NO trigger function-body changes, and NO function
+-- signature changes — every fix is in the recompiled Rust module. This file is
+-- a no-op marker; the table below states which fixes reach EXISTING IMVs and
+-- which only affect newly-created ones.
+--
+-- Where each fix takes effect (the installed AFTER-row trigger body is generic
+-- and regenerates its maintenance SQL on every fire via
+-- `reflex_build_delta_sql(...)`, reading base_query / end_query / aggregations
+-- fresh from `__reflex_ivm_reference`):
+--
+--   (a) RUNTIME — applies to existing IMVs automatically once the new module
+--       is loaded; no per-IMV action.
+--
+--       * LEFT / RIGHT JOIN secondary-side maintenance. Inserting, updating, or
+--         deleting a row on the SECONDARY side of an outer join could drop or
+--         duplicate joined rows, and a primary row that gained/lost its match
+--         could be deleted instead of reverting to NULL-filled. INSERT routing,
+--         affected-group scoping, and quoted-source detection are corrected
+--         inside `reflex_build_delta_sql`.
+--
+--       * DEFERRED-mode duplicate-key flush. A batch that INSERTed a new key and
+--         then UPDATEd that SAME key before flush emitted both the new-side and
+--         old-side delta for the key, so `reflex_flush_deferred` raised
+--         "duplicate key value violates unique constraint". The two delta sides
+--         are now netted per unique key before the MERGE.
+--
+--       * Filtered-IMV WHERE predicate. A query-level WHERE carried into
+--         maintenance is now alias-stripped so the generated SQL is valid
+--         against the transition table.
+--
+--   (b) CREATE-TIME — applies to IMVs created on or after 1.6.4. Existing IMVs
+--       keep whatever was baked at their creation and must be recreated to pick
+--       these up.
+--
+--       * Structural NOT-NULL inference replaces the old runtime data-probe.
+--         The probe marked a column NOT NULL whenever the create-time data
+--         happened to be NULL-free, even when the query did not guarantee it.
+--         Maintenance then matched that key with `=` instead of
+--         `IS NOT DISTINCT FROM` and SILENTLY DROPPED rows when a NULL appeared
+--         later (an unmatched LEFT-join insert, or a later-NULL GROUP BY key).
+--         NOT NULL is now promoted only when the query structurally guarantees
+--         it (an INNER-join equi-key, or a catalog-NOT-NULL base column on a
+--         non-nullable join side); quoted / qualified column references are
+--         rejected from the inference. This decision is baked into the stored
+--         `aggregations.not_null_columns` AND the intermediate-table schema, so
+--         it CANNOT be corrected in place — see the migration note below.
+--
+--       * Generated column identifiers are truncated to Postgres's 63-byte
+--         limit, fixing a creation failure on long carried-expression names.
+--
+--       * An aggregate IMV whose GROUP BY key is not projected bare in the
+--         SELECT is now rejected up front with a clear error instead of failing
+--         later in codegen.
+--
+-- Migration note:
+--
+--   No DDL is required to register 1.6.4. The runtime fixes in (a) apply to
+--   every existing IMV at its next trigger fire.
+--
+--   The NOT-NULL inference fix in (b) does NOT reach an aggregate IMV that was
+--   created under an earlier version: any over-promotion baked at create time
+--   stays in that IMV's stored metadata and intermediate-table schema, and
+--   neither this migration nor `reflex_rebuild_triggers` can undo it. To clear a
+--   latent over-promotion, DROP and recreate the affected aggregate IMV:
+--
+--       SELECT drop_reflex_ivm('<name>');
+--       SELECT create_reflex_ivm('<name>', '<SELECT …>', …);
+
+-- No-op marker: ALTER EXTENSION needs a non-empty migration file.
+SELECT 1 WHERE FALSE;

@@ -762,6 +762,11 @@ pub mod oracle {
     /// precisely because `=` is not NULL-safe: a NULL group key never satisfies it,
     /// so the old FULL-JOIN form reported the (correct) NULL group as two phantom
     /// unmatched rows.
+    ///
+    /// The 1e-9 relative tolerance absorbs the float8 round-off between the IMV's
+    /// incremental accumulation (running SUM/AVG via deltas) and the MV's full
+    /// re-aggregation — orders of magnitude below any genuine divergence, which shows
+    /// up as a wrong row count or a value off by a real term, not a last-ULP wobble.
     pub fn float_diff_from_where(mv: &str, imv: &str, _keys: &[String], cols: &[Column]) -> String {
         let match_pred = |aa: &str, bb: &str| -> String {
             cols.iter()
@@ -1130,12 +1135,13 @@ fn fuzz_case_count() -> u32 {
         assert_eq!(diff, 0, "finding #1: IMV diverged from MV by {diff} rows\nMV: {mv_rows}\nIMV: {imv_rows}");
     }
 
-    /// OPEN finding #2 — see docs/fuzz-findings.md. Remove #[ignore] when fixed.
+    /// FIXED finding #2 — see docs/fuzz-findings.md. Active regression test.
     ///
-    /// A single-table passthrough view with DEFERRED incremental maintenance, after
-    /// DML mutations, fails during reflex_flush_deferred() with "duplicate key value
-    /// violates unique constraint" error, suggesting the maintenance logic is attempting
-    /// to insert or merge rows that would create duplicate key violations.
+    /// A single-table passthrough view with DEFERRED incremental maintenance used to
+    /// fail during reflex_flush_deferred() with "duplicate key value violates unique
+    /// constraint" when one batch INSERTed a new key and then UPDATEd that same key:
+    /// the flush emitted both the new-side and old-side delta for the key. Fixed by
+    /// netting the two delta sides per unique key before the MERGE (commit ae1faa0).
     #[cfg(any(test, feature = "pg_test"))]
     #[pg_test]
     fn finding_2_deferred_mode_duplicate_key_violation() {

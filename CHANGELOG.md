@@ -1,5 +1,83 @@
 # Changelog
 
+## [1.6.4] - 2026-05-24
+
+Correctness release hardened by a new differential fuzz harness.  No catalog
+schema changes, no trigger body changes, no API changes.  Run `ALTER EXTENSION
+pg_reflex UPDATE TO '1.6.4';` to register the new version; the migration file is
+a no-op marker.  The runtime fixes below reach existing IMVs automatically once
+the new module is loaded; the create-time fixes only affect newly-created IMVs.
+
+---
+
+### Fixed
+
+- **LEFT / RIGHT JOIN secondary-side maintenance dropped or duplicated rows.**
+  Inserting, updating, or deleting a row on the **secondary** side of an outer
+  join could drop or duplicate the joined rows, and a primary row that gained or
+  lost its match could be deleted outright instead of reverting to a NULL-filled
+  row.  Secondary-side `INSERT` routing, affected-group scoping (by stable key),
+  and quoted-source detection are corrected inside `reflex_build_delta_sql`.
+  *Runtime fix — applies to existing IMVs on recompile.*
+- **DEFERRED-mode duplicate-key flush.**  A deferred batch that `INSERT`ed a new
+  key and then `UPDATE`d that **same** key before flush emitted both the
+  new-side and the old-side delta for the key, so `reflex_flush_deferred` failed
+  with `duplicate key value violates unique constraint`.  The two delta sides
+  are now netted per unique key before the `MERGE`.  *Runtime fix.*
+- **Silent row loss from unsound NOT-NULL inference.**  The former runtime
+  data-probe marked a column `NOT NULL` whenever the **create-time** data
+  happened to be NULL-free — using transient data as a proxy for a query
+  guarantee.  Maintenance then matched that key with `=` instead of
+  `IS NOT DISTINCT FROM` and **silently dropped rows** when a NULL appeared
+  later: an unmatched primary-side `LEFT JOIN` insert, or a `GROUP BY` key that
+  became NULL.  `NOT NULL` is now promoted only when the query **structurally**
+  guarantees it (an INNER-join equi-key, or a catalog-`NOT NULL` base column on a
+  non-nullable join side); quoted / qualified column references are rejected from
+  the inference.  *Create-time fix — recreate existing aggregate IMVs to clear a
+  stale over-promotion (see Migration).*
+- **Filtered-IMV maintenance emitted invalid SQL from a qualified WHERE.**  A
+  query-level `WHERE` carried into maintenance kept its table-qualified column
+  references and failed against the transition table; the predicate is now
+  alias-stripped.  *Runtime fix.*
+- **Long generated column identifiers exceeded the 63-byte limit.**  A carried
+  expression with a long derived name (e.g. a `EXISTS` projection) produced an
+  identifier over Postgres's `NAMEDATALEN` and failed at creation; generated
+  identifiers are now truncated to 63 bytes on a char boundary.  *Create-time
+  fix.*
+
+### Changed
+
+- **An aggregate IMV whose `GROUP BY` key is not projected bare in the `SELECT`
+  is now rejected up front** with a clear error, instead of failing later in
+  codegen with a confusing message.  *Create-time validation.*
+
+### Testing
+
+- **Differential fuzz harness** (`src/tests/pg_test_fuzz.rs`, proptest under the
+  `pg_test` feature).  For each generated query it builds a real
+  `MATERIALIZED VIEW` and a pg_reflex IMV, applies the same DML, and asserts the
+  two agree row-for-row (exact for non-float columns; NULL-safe relative epsilon
+  for float columns).  Covers single-table aggregates, 2-source `LEFT JOIN`
+  aggregates, carried scalars, CTE decomposition, and basic `WHERE` filters in
+  both `IMMEDIATE` and `DEFERRED` modes.  The three NOT-NULL / deferred fixes
+  above were found by this harness and are frozen as regression tests.  See
+  [`docs/contributing/testing.md`](docs/contributing/testing.md) and
+  [`docs/fuzz-findings.md`](docs/fuzz-findings.md).
+
+### Migration
+
+- `ALTER EXTENSION pg_reflex UPDATE TO '1.6.4';` runs
+  [`sql/pg_reflex--1.6.3--1.6.4.sql`](https://github.com/diviyank/pg_reflex/blob/main/sql/pg_reflex--1.6.3--1.6.4.sql),
+  a **no-op marker** — all fixes are in the recompiled module.  The runtime
+  fixes (JOIN secondary-side, deferred netting, filtered WHERE) reach every
+  existing IMV at its next trigger fire.  The create-time NOT-NULL fix does
+  **not** reach an aggregate IMV created under an earlier version — its
+  over-promotion is baked into the stored `aggregations.not_null_columns` and the
+  intermediate-table schema, and neither the migration nor
+  `reflex_rebuild_triggers` can undo it.  **Drop and recreate any aggregate IMV
+  created before 1.6.4** to clear a latent over-promotion:
+  `SELECT drop_reflex_ivm('<name>'); SELECT create_reflex_ivm('<name>', '<SELECT …>', …);`
+
 ## [1.6.3] - 2026-05-20
 
 Correctness release for CTE / window-function decomposition and MIN/MAX type

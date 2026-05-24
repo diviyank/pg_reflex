@@ -194,6 +194,38 @@ fn cov_format_compact_imv_summary_single() {
     assert!(summary.contains("50 ms"));
 }
 
+// ---- split_top_level_and / split_top_level_eq: string-literal tokenizing ----
+// These guard the NOT-NULL equi-join inference (inner_join_equi_non_null_refs):
+// a misparsed string literal must never let an in-literal ` AND ` / `=` be
+// mistaken for a top-level token. SQL escaped quotes are adjacent pairs (`''`),
+// so toggling in_str on every quote is correct — these tests freeze that.
+
+#[test]
+fn split_and_keeps_plain_literal_with_and_intact() {
+    let parts = split_top_level_and("a.x = b.y AND c.note = 'foo AND bar'");
+    assert_eq!(parts, vec!["a.x = b.y", "c.note = 'foo AND bar'"]);
+}
+
+#[test]
+fn split_and_keeps_escaped_quote_literal_with_and_intact() {
+    // 'it''s AND fine' is ONE literal (escaped quote); its inner AND must not split.
+    let parts = split_top_level_and("a.x = b.y AND c.note = 'it''s AND fine'");
+    assert_eq!(parts, vec!["a.x = b.y", "c.note = 'it''s AND fine'"]);
+}
+
+#[test]
+fn split_eq_ignores_equals_inside_literal() {
+    // The only top-level `=` is after `c.note`; the `=` inside 'a=b' must be skipped.
+    let (l, r) = split_top_level_eq("c.note = 'a=b'").expect("top-level eq present");
+    assert_eq!(l.trim(), "c.note");
+    assert_eq!(r.trim(), "'a=b'");
+}
+
+#[test]
+fn split_eq_none_when_only_equals_is_inside_literal() {
+    assert!(split_top_level_eq("'a=b'").is_none());
+}
+
 #[test]
 fn reflex_reject_carries_tag_and_error_prefix() {
     let msg = crate::reflex_reject("storage must be 'LOGGED' or 'UNLOGGED'");

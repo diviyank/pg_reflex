@@ -77,6 +77,18 @@ A CTE with a window function or `DISTINCT ON` materializes as a read-time VIEW. 
 
 **Status**: rejected at create time. Workaround: move the window function or `DISTINCT ON` to the outermost `SELECT`, or define the CTE as a plain `MATERIALIZED VIEW` instead.
 
+### `GROUP BY` key not projected bare in the `SELECT`
+
+```sql
+-- rejected: the grouped key `g` reaches the SELECT only wrapped in COALESCE,
+-- never as a bare column, so the generated end query cannot resolve it.
+SELECT COALESCE(g, 0) AS g0, SUM(v) AS s FROM t GROUP BY g;
+```
+
+Each `GROUP BY` key must appear as a bare column somewhere in the `SELECT` list so maintenance can join the delta back to the materialized group. A key that surfaces only inside an expression (`COALESCE(g, 0)`, `g + 1`, a `CASE`, a cast) leaves the end query with no column to match on. Since 1.6.4 this is rejected up front with a clear error instead of failing later in codegen.
+
+**Status**: rejected at create time. Workaround: also project the key bare — `SELECT g, COALESCE(g, 0) AS g0, SUM(v) AS s FROM t GROUP BY g` — and derive the expression in the consuming query, or use `kind: mv`.
+
 ### `ARRAY_AGG` / `JSON_AGG` / `STRING_AGG`
 
 Order-sensitive aggregates that depend on the entire group. Maintaining `ARRAY_AGG ORDER BY` brings in the same problem as `DISTINCT ON` retraction; without ordering, the array contents would still need full membership tracking.
