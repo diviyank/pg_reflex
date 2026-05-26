@@ -286,6 +286,176 @@ fn test_cte_passthrough_threads_explicit_unique_columns() {
     );
 }
 
+// Part A — structural inference: a JOIN passthrough whose anchor's PRIMARY KEY
+// is projected and whose every other source is reached by an equi-join covering
+// a UNIQUE key (to-one) has a sound unique key = the anchor PK. It must be
+// inferred so DELETE/UPDATE is targeted instead of a full refresh.
+#[pg_test]
+fn test_join_passthrough_infers_key_from_to_one_join() {
+    Spi::run("CREATE TABLE jk_o (id INT PRIMARY KEY, cid INT NOT NULL, amt INT NOT NULL)")
+        .expect("o");
+    Spi::run("CREATE TABLE jk_c (id INT PRIMARY KEY, label TEXT NOT NULL)").expect("c");
+    Spi::run("INSERT INTO jk_c VALUES (1,'x'),(2,'y')").expect("seedc");
+    Spi::run("INSERT INTO jk_o VALUES (10,1,100),(11,1,200),(12,2,300)").expect("seedo");
+
+    let result = crate::create_reflex_ivm(
+        "jk_view",
+        "SELECT o.id, o.amt, c.label FROM jk_o o JOIN jk_c c ON c.id = o.cid",
+        None,
+        None,
+        None,
+        None,
+    );
+    assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
+
+    let uk = Spi::get_one::<Vec<String>>(
+        "SELECT unique_columns FROM public.__reflex_ivm_reference WHERE name = 'jk_view'",
+    )
+    .expect("q")
+    .expect("inferred key");
+    assert_eq!(uk, vec!["id".to_string()], "anchor PK inferred as unique key");
+
+    assert_eq!(
+        Spi::get_one::<i64>("SELECT COUNT(*) FROM jk_view")
+            .unwrap()
+            .unwrap(),
+        3
+    );
+    Spi::run("DELETE FROM jk_o WHERE id = 11").expect("del");
+    assert_eq!(
+        Spi::get_one::<i64>("SELECT COUNT(*) FROM jk_view WHERE id = 11")
+            .unwrap()
+            .unwrap(),
+        0,
+        "targeted DELETE removed the row"
+    );
+    assert_eq!(
+        Spi::get_one::<i64>("SELECT COUNT(*) FROM jk_view")
+            .unwrap()
+            .unwrap(),
+        2
+    );
+}
+
+// Part A — negative: when the joined side is NOT unique on the join column the
+// join is to-many, the anchor PK is no longer unique in the result, so NO key
+// may be inferred (and the unsound unique index must not be built).
+#[pg_test]
+fn test_join_passthrough_no_key_when_to_many() {
+    Spi::run("CREATE TABLE jm_o (id INT PRIMARY KEY, gid INT NOT NULL, amt INT NOT NULL)")
+        .expect("o");
+    Spi::run("CREATE TABLE jm_c (gid INT NOT NULL, label TEXT NOT NULL)").expect("c");
+    Spi::run("INSERT INTO jm_c VALUES (1,'x'),(1,'y')").expect("seedc");
+    Spi::run("INSERT INTO jm_o VALUES (10,1,100)").expect("seedo");
+
+    let result = crate::create_reflex_ivm(
+        "jm_view",
+        "SELECT o.id, o.amt, c.label FROM jm_o o JOIN jm_c c ON c.gid = o.gid",
+        None,
+        None,
+        None,
+        None,
+    );
+    assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
+
+    let uk: Option<Vec<String>> = Spi::get_one::<Vec<String>>(
+        "SELECT unique_columns FROM public.__reflex_ivm_reference WHERE name = 'jm_view'",
+    )
+    .expect("q");
+    assert!(
+        uk.is_none_or(|v| v.is_empty()),
+        "to-many join must not infer a key"
+    );
+    // The result genuinely has two rows for the single order; a wrongly-built
+    // unique index would have failed creation above.
+    assert_eq!(
+        Spi::get_one::<i64>("SELECT COUNT(*) FROM jm_view")
+            .unwrap()
+            .unwrap(),
+        2
+    );
+}
+
+// Part A — negative: a date-RANGE join (the shape in forecast_analysis_view) is
+// to-many and has no equality covering a unique key, so no key is inferred.
+#[pg_test]
+fn test_join_passthrough_no_key_for_range_join() {
+    Spi::run("CREATE TABLE rj_o (id INT PRIMARY KEY, d INT NOT NULL)").expect("o");
+    Spi::run("CREATE TABLE rj_w (lo INT NOT NULL, hi INT NOT NULL, tag TEXT NOT NULL)")
+        .expect("w");
+    Spi::run("INSERT INTO rj_w VALUES (0, 100, 'a'), (0, 100, 'b')").expect("seedw");
+    Spi::run("INSERT INTO rj_o VALUES (1, 50)").expect("seedo");
+
+    let result = crate::create_reflex_ivm(
+        "rj_view",
+        "SELECT o.id, o.d, w.tag FROM rj_o o JOIN rj_w w ON o.d >= w.lo AND o.d <= w.hi",
+        None,
+        None,
+        None,
+        None,
+    );
+    assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
+    let uk: Option<Vec<String>> = Spi::get_one::<Vec<String>>(
+        "SELECT unique_columns FROM public.__reflex_ivm_reference WHERE name = 'rj_view'",
+    )
+    .expect("q");
+    assert!(
+        uk.is_none_or(|v| v.is_empty()),
+        "range join must not infer a key"
+    );
+}
+
+// Part B — explicit per-CTE unique key via the `alias : cols` extension to the
+// `unique_columns` argument. The anchor sources have no PK, so structural
+// inference yields nothing; only the explicit spec gives the CTE sub-IMV a key.
+#[pg_test]
+fn test_cte_explicit_per_cte_unique_key() {
+    Spi::run("CREATE TABLE pc_a (k INT NOT NULL, v INT NOT NULL)").expect("a");
+    Spi::run("CREATE TABLE pc_b (k INT NOT NULL, w INT NOT NULL)").expect("b");
+    Spi::run("INSERT INTO pc_a VALUES (1,10),(2,20)").expect("seeda");
+    Spi::run("INSERT INTO pc_b VALUES (1,100),(2,200)").expect("seedb");
+
+    let result = crate::create_reflex_ivm(
+        "pc_view",
+        "WITH j AS (SELECT a.k, a.v, b.w FROM pc_a a JOIN pc_b b ON b.k = a.k) \
+         SELECT k, v, w FROM j",
+        Some("k ; j : k"),
+        None,
+        None,
+        None,
+    );
+    assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
+
+    let cte_uk = Spi::get_one::<Vec<String>>(
+        "SELECT unique_columns FROM public.__reflex_ivm_reference WHERE name = 'pc_view__cte_j'",
+    )
+    .expect("q")
+    .expect("explicit CTE key");
+    assert_eq!(cte_uk, vec!["k".to_string()], "explicit per-CTE key applied");
+
+    let outer_uk = Spi::get_one::<Vec<String>>(
+        "SELECT unique_columns FROM public.__reflex_ivm_reference WHERE name = 'pc_view'",
+    )
+    .expect("q")
+    .expect("outer key");
+    assert_eq!(outer_uk, vec!["k".to_string()], "outer key still threaded");
+
+    // Targeted DELETE through the keyed CTE sub-IMV.
+    Spi::run("DELETE FROM pc_a WHERE k = 1").expect("del");
+    assert_eq!(
+        Spi::get_one::<i64>("SELECT COUNT(*) FROM pc_view WHERE k = 1")
+            .unwrap()
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        Spi::get_one::<i64>("SELECT COUNT(*) FROM pc_view")
+            .unwrap()
+            .unwrap(),
+        1
+    );
+}
+
 #[pg_test]
 fn test_cte_sibling_with_window() {
     // This test reproduces the core bug: CTE decomposition must run BEFORE window decomposition.

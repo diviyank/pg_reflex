@@ -585,12 +585,35 @@ maintained — move it to the outermost SELECT, or define this view with kind: m
 /// Each CTE becomes its own sub-IMV (recursively) and the main body is
 /// rewritten to reference those sub-IMVs in place of the original CTE
 /// aliases, then re-entered through [`create_reflex_ivm_impl`] without the
+/// Split the `unique_columns` argument into the outer view's key and an optional
+/// per-CTE key map. The extended form is
+/// `'<outer cols> ; <cte alias> : <cols> ; <cte alias2> : <cols>'` — segments
+/// separated by `;`, each per-CTE segment binding a CTE alias to its columns
+/// with `:`. A plain comma list (no `;`) is unchanged and yields an empty map.
+/// CTE aliases match case-insensitively.
+fn parse_unique_columns_spec(spec: &str) -> (String, std::collections::HashMap<String, String>) {
+    let mut segments = spec.split(';');
+    let outer = segments.next().unwrap_or("").trim().to_string();
+    let mut cte_map = std::collections::HashMap::new();
+    for seg in segments {
+        if let Some((alias, cols)) = seg.split_once(':') {
+            let alias = alias.trim().to_lowercase();
+            let cols = cols.trim().to_string();
+            if !alias.is_empty() && !cols.is_empty() {
+                cte_map.insert(alias, cols);
+            }
+        }
+    }
+    (outer, cte_map)
+}
+
 /// WITH clause. Tail-recursive: the final `Some(...)` here is the result of
 /// the rewritten-body call.
 #[allow(clippy::too_many_arguments)]
 fn try_decompose_ctes(
     view_name: &str,
     unique_columns_str: &str,
+    cte_unique_columns: &std::collections::HashMap<String, String>,
     storage_mode: &str,
     refresh_mode: &str,
     topk_k: Option<usize>,
@@ -718,10 +741,14 @@ with kind: mv.",
         // A sibling CTE literally named "a__cte_b" would collide with nested CTE "b" inside "a",
         // but this is a pathological edge case requiring an adversarial alias — accepted risk.
         let cte_view_name = safe_identifier(&format!("{}__cte_{}", view_name, cte.alias));
+        let cte_key = cte_unique_columns
+            .get(&alias_lower)
+            .map(|s| s.as_str())
+            .unwrap_or("");
         let result = create_reflex_ivm_impl(
             &cte_view_name,
             &cte_query,
-            "",
+            cte_key,
             false,
             storage_mode,
             refresh_mode,
@@ -879,8 +906,25 @@ fn resolve_unique_columns(ctx: &mut BuildContext) {
                 }
             }
         }
+    } else if let Some(inferred) = infer_join_passthrough_unique_key(ctx) {
+        // JOIN passthrough with a structurally-sound unique key (anchor PK
+        // preserved through to-one equi-joins).
+        ctx.resolved_unique_columns = inferred;
+        ctx.plan.passthrough_columns = ctx.resolved_unique_columns.clone();
+        let real_sources: Vec<&String> = ctx.real_source_names.iter().collect();
+        build_passthrough_key_mappings(
+            &mut ctx.plan,
+            &ctx.resolved_unique_columns,
+            &real_sources,
+            &ctx.analysis,
+        );
+        info!(
+            "pg_reflex: inferred unique key ({}) for JOIN passthrough '{}'",
+            ctx.resolved_unique_columns.join(", "),
+            ctx.view_name
+        );
     } else {
-        // JOIN query without explicit key: fall back to full refresh on DELETE/UPDATE
+        // JOIN query without a provable key: fall back to full refresh on DELETE/UPDATE
         info!(
             "pg_reflex: JOIN passthrough '{}' has no unique key. \
              Provide 3rd argument to create_reflex_ivm for incremental DELETE/UPDATE. \
@@ -2085,6 +2129,12 @@ pub(crate) fn create_reflex_ivm_impl(
         Err(msg) => return msg,
     };
 
+    // The `unique_columns` argument may carry per-CTE keys after the outer key
+    // (`'<outer> ; <cte alias> : <cols> ; ...'`). Strip them so only the outer
+    // key reaches the non-CTE paths; the map is consumed by CTE decomposition.
+    let (outer_unique_columns, cte_unique_columns) = parse_unique_columns_spec(unique_columns_str);
+    let unique_columns_str = outer_unique_columns.as_str();
+
     if let Some(gb) = first_unprojected_group_key(&parsed.analysis) {
         return crate::reflex_reject(&format!(
             "GROUP BY key '{gb}' is not projected in the SELECT list. \
@@ -2114,6 +2164,7 @@ pub(crate) fn create_reflex_ivm_impl(
     if let Some(result) = try_decompose_ctes(
         view_name,
         unique_columns_str,
+        &cte_unique_columns,
         storage_mode,
         refresh_mode,
         topk_k,
@@ -2581,6 +2632,214 @@ fn source_cols_cover_unique_key(source: &str, cols: &[String]) -> bool {
             .iter()
             .all(|c| cols_lower.contains(&c.to_lowercase()))
     })
+}
+
+/// PRIMARY KEY columns of `source` (lower-cased, in key order). Empty when the
+/// table has no primary key or on any catalog error. PK columns are NOT NULL,
+/// so they are a true unique key (unlike a nullable UNIQUE index).
+fn source_primary_key_columns(source: &str) -> Vec<String> {
+    let (schema, name) = split_qualified_name(source);
+    let schema_str = schema.unwrap_or("public");
+    Spi::connect(|client| {
+        client
+            .select(
+                "SELECT a.attname::TEXT AS col \
+                 FROM pg_index ix \
+                 JOIN pg_class t ON t.oid = ix.indrelid \
+                 JOIN pg_namespace n ON n.oid = t.relnamespace \
+                 JOIN LATERAL unnest(ix.indkey) WITH ORDINALITY AS k(col, ord) ON true \
+                 JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = k.col \
+                 WHERE n.nspname = $1 AND t.relname = $2 AND ix.indisprimary \
+                 ORDER BY k.ord",
+                None,
+                &[
+                    unsafe {
+                        DatumWithOid::new(
+                            schema_str.to_string(),
+                            PgBuiltInOids::TEXTOID.oid().value(),
+                        )
+                    },
+                    unsafe {
+                        DatumWithOid::new(name.to_string(), PgBuiltInOids::TEXTOID.oid().value())
+                    },
+                ],
+            )
+            .unwrap_or_report()
+            .filter_map(|row| {
+                row.get_by_name::<&str, _>("col")
+                    .unwrap_or(None)
+                    .map(|c| c.to_lowercase())
+            })
+            .collect()
+    })
+}
+
+/// Collect `source`'s own bare column names that appear on one side of a
+/// top-level `x = y` equality in any JOIN ON clause, plus the total count of
+/// equalities involving the source. Used to decide whether the source is
+/// reached by a to-one join (its equi-join columns cover a unique key).
+fn source_equi_join_columns(
+    source: &str,
+    joins: &[crate::sql_analyzer::JoinInfo],
+    table_aliases: &std::collections::HashMap<String, String>,
+) -> (Vec<String>, usize) {
+    let source_lower = source.to_lowercase();
+    let source_bare = bare_column_name(source).to_lowercase();
+    let source_aliases: Vec<String> = table_aliases
+        .iter()
+        .filter(|(_, table)| table.to_lowercase() == source_lower)
+        .map(|(alias, _)| alias.to_lowercase())
+        .collect();
+
+    let mut cols: Vec<String> = Vec::new();
+    let mut n_eq = 0usize;
+    for join in joins {
+        let Some(ref cond) = join.condition_sql else {
+            continue;
+        };
+        let cond_lower = cond.to_lowercase();
+        for part in cond_lower.split(" and ") {
+            let part = part.trim();
+            let sides: Vec<&str> = part.splitn(2, '=').collect();
+            if sides.len() != 2 {
+                continue;
+            }
+            let left = sides[0].trim();
+            let right = sides[1].trim();
+            let source_side = if is_from_table(left, &source_bare, &source_aliases) {
+                Some(left)
+            } else if is_from_table(right, &source_bare, &source_aliases) {
+                Some(right)
+            } else {
+                None
+            };
+            if let Some(side) = source_side {
+                n_eq += 1;
+                cols.push(bare_column_name(side).to_lowercase());
+            }
+        }
+    }
+    cols.sort();
+    cols.dedup();
+    (cols, n_eq)
+}
+
+/// Structural unique-key inference for a JOIN passthrough that was given no
+/// explicit key. Returns the OUTPUT column names forming a sound unique key, or
+/// `None` when none can be proven.
+///
+/// Sound rule: pick an anchor source whose PRIMARY KEY is fully projected; the
+/// result is unique on that PK iff every other source is reached by a to-one
+/// equi-join (its equi-join columns cover a UNIQUE key of that source). Only
+/// INNER and LEFT joins qualify — for LEFT joins the anchor must be the
+/// preserved base table; RIGHT/FULL/CROSS, `OR`/`USING` conditions, and range
+/// joins are refused (they can multiply or NULL-pad the anchor's rows).
+fn infer_join_passthrough_unique_key(ctx: &BuildContext) -> Option<Vec<String>> {
+    let analysis = &ctx.analysis;
+    if analysis.joins.is_empty() {
+        return None;
+    }
+
+    let mut has_left = false;
+    for join in &analysis.joins {
+        match join.join_type.as_str() {
+            "INNER" => {}
+            "LEFT" => has_left = true,
+            _ => return None,
+        }
+        match &join.condition_sql {
+            None => return None,
+            Some(cond) => {
+                let lc = cond.to_lowercase();
+                if lc.contains(" or ") || lc.trim_start().starts_with("using") {
+                    return None;
+                }
+            }
+        }
+    }
+
+    let real_sources: Vec<&String> = ctx.real_source_names.iter().collect();
+    if real_sources.iter().any(|s| s.starts_with('<')) {
+        return None;
+    }
+
+    // Base source = the one not introduced by any JOIN. A LEFT join only
+    // preserves the base table's rows, so it is the only valid anchor then.
+    let join_targets: std::collections::HashSet<String> = analysis
+        .joins
+        .iter()
+        .map(|j| bare_column_name(&j.target_table).to_lowercase())
+        .collect();
+    let is_base = |s: &str| !join_targets.contains(&bare_column_name(s).to_lowercase());
+
+    // target output name → its SELECT expression (e.g. "id" → "o.id")
+    let mut target_to_expr: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    for col in &analysis.select_columns {
+        let name = normalized_column_name(col.alias.as_deref().unwrap_or(&col.expr_sql));
+        target_to_expr.insert(name, col.expr_sql.to_lowercase());
+    }
+
+    for anchor in &real_sources {
+        if has_left && !is_base(anchor) {
+            continue;
+        }
+        let pk = source_primary_key_columns(anchor);
+        if pk.is_empty() {
+            continue;
+        }
+
+        let anchor_bare = bare_column_name(anchor).to_lowercase();
+        let anchor_aliases: Vec<String> = analysis
+            .table_aliases
+            .iter()
+            .filter(|(_, t)| t.to_lowercase() == anchor.to_lowercase())
+            .map(|(a, _)| a.to_lowercase())
+            .collect();
+
+        // Every PK column must be projected as a bare reference from the anchor.
+        let mut key_outputs: Vec<String> = Vec::new();
+        let mut all_projected = true;
+        for pk_col in &pk {
+            let mut found: Option<String> = None;
+            for (out_name, expr) in &target_to_expr {
+                if is_from_table(expr, &anchor_bare, &anchor_aliases)
+                    && bare_column_name(expr) == *pk_col
+                {
+                    found = Some(out_name.clone());
+                    break;
+                }
+            }
+            match found {
+                Some(o) => key_outputs.push(o),
+                None => {
+                    all_projected = false;
+                    break;
+                }
+            }
+        }
+        if !all_projected {
+            continue;
+        }
+
+        // Every other source must be reached by a to-one equi-join.
+        let mut all_to_one = true;
+        for other in &real_sources {
+            if other.eq_ignore_ascii_case(anchor) {
+                continue;
+            }
+            let (eq_cols, n_eq) =
+                source_equi_join_columns(other, &analysis.joins, &analysis.table_aliases);
+            if n_eq == 0 || eq_cols.is_empty() || !source_cols_cover_unique_key(other, &eq_cols) {
+                all_to_one = false;
+                break;
+            }
+        }
+        if all_to_one {
+            return Some(key_outputs);
+        }
+    }
+    None
 }
 
 /// Parse a JOIN condition to extract column mappings between the key-owner table and a secondary table.

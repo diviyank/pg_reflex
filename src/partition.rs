@@ -494,10 +494,23 @@ pub(crate) fn resolve_anchor_source(
             partition_col
         )),
         1 => Ok(owners.into_iter().next().unwrap()),
-        _ => Err(format!(
-            "multiple sources own partition column '{}' — ambiguous: {:?}",
-            partition_col, owners
-        )),
+        _ => {
+            // The partition column is commonly the join key, so it appears on
+            // several sources. The anchor — whose partition children we mirror
+            // — must itself be a partitioned table, so disambiguate to the sole
+            // partitioned owner. A bare column name on non-partitioned sources
+            // (e.g. a sibling sub-IMV) cannot be the anchor.
+            let mut partitioned_owners = owners
+                .iter()
+                .filter(|s| introspect_partition_descriptor(client, s).is_some());
+            match (partitioned_owners.next(), partitioned_owners.next()) {
+                (Some(anchor), None) => Ok(anchor.clone()),
+                _ => Err(format!(
+                    "multiple sources own partition column '{}' — ambiguous: {:?}",
+                    partition_col, owners
+                )),
+            }
+        }
     }
 }
 

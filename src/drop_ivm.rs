@@ -73,7 +73,12 @@ pub(crate) fn drop_reflex_ivm_impl(view_name: &str, cascade: bool) -> &'static s
             if source.starts_with('<') {
                 continue;
             }
-            let safe_source = source.replace('.', "_");
+            // Sub-IMV sources are persisted in `depends_on` already double-quoted
+            // (`"schema"."view__cte_x"`), but the source triggers were installed
+            // under the unquoted, dot-flattened name. Strip the quotes so the
+            // trigger/function names rebuilt below match what create produced —
+            // otherwise the embedded quotes break the surrounding identifier.
+            let safe_source = source.replace('"', "").replace('.', "_");
             let other_count = client
                 .select(
                     "SELECT COUNT(*) AS cnt FROM public.__reflex_ivm_reference \

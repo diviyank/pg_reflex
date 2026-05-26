@@ -111,6 +111,45 @@ fn test_drop_reflex_ivm_cascade() {
     assert_eq!(count, 0);
 }
 
+// Regression: a CTE that joins another CTE stores the sibling sub-IMV in
+// `depends_on` already double-quoted (`"v__cte_x"`). Dropping such an IMV must
+// strip those quotes when rebuilding the source-trigger / function names, else
+// the generated DDL is `... "__reflex_trigger_ins_on_"v__cte_x"" ...` and PG
+// raises `syntax error at or near "v__cte_x"`.
+#[pg_test]
+fn test_drop_imv_with_quoted_sub_imv_source() {
+    Spi::run("CREATE TABLE dq_s (gid INT NOT NULL, pid INT NOT NULL, qty INT NOT NULL)")
+        .expect("s");
+    Spi::run("CREATE TABLE dq_d (gid INT PRIMARY KEY, status TEXT)").expect("d");
+    Spi::run("INSERT INTO dq_s VALUES (1,100,5)").expect("seed s");
+    Spi::run("INSERT INTO dq_d VALUES (1,'a')").expect("seed d");
+
+    let r = crate::create_reflex_ivm(
+        "dq_v",
+        "WITH lim AS (SELECT gid, COUNT(*) AS n FROM dq_d WHERE status = 'a' GROUP BY gid), \
+              j AS (SELECT s.gid, s.pid, s.qty FROM dq_s s JOIN lim l ON s.gid = l.gid) \
+         SELECT gid, pid, qty FROM j",
+        Some("gid,pid"),
+        None,
+        None,
+        None,
+    );
+    assert_eq!(r, "CREATE REFLEX INCREMENTAL VIEW");
+
+    // `dq_v__cte_j` depends on the quoted sub-IMV "dq_v__cte_lim".
+    let d = crate::drop_reflex_ivm("dq_v__cte_j");
+    assert_eq!(
+        d, "DROP REFLEX INCREMENTAL VIEW",
+        "drop must not raise a syntax error on the quoted sub-IMV source"
+    );
+    let gone = Spi::get_one::<i64>(
+        "SELECT COUNT(*) FROM public.__reflex_ivm_reference WHERE name = 'dq_v__cte_j'",
+    )
+    .expect("q")
+    .expect("v");
+    assert_eq!(gone, 0);
+}
+
 #[pg_test]
 fn test_drop_shared_trigger_lifecycle() {
     // Two IMVs on the same source. Dropping one should keep triggers;

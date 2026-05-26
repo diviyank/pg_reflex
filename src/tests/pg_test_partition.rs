@@ -171,6 +171,52 @@ fn pg_part_auto_mirror_aggregate_partition_col_in_group_by() {
 }
 
 #[pg_test]
+fn pg_part_auto_mirror_join_shared_partition_key() {
+    // A partitioned source joined to a second source that ALSO owns the
+    // partition column (the join key itself). The anchor must disambiguate
+    // to the partitioned source instead of erroring on "multiple sources own
+    // partition column", which previously left the parent with zero children
+    // and made the seeding INSERT fail with "no partition of relation found".
+    Spi::run("CREATE TABLE part_jk_s (dem_plan_id BIGINT, product_id BIGINT, qty NUMERIC) PARTITION BY LIST (dem_plan_id)").expect("create s");
+    Spi::run("CREATE TABLE part_jk_s_p1 PARTITION OF part_jk_s FOR VALUES IN (1, 2)").expect("p1");
+    Spi::run("CREATE TABLE part_jk_s_p2 PARTITION OF part_jk_s FOR VALUES IN (7057)").expect("p2");
+    Spi::run("INSERT INTO part_jk_s VALUES (1,100,5),(2,101,7),(7057,102,9)").expect("seed s");
+    Spi::run("CREATE TABLE part_jk_d (dem_plan_id BIGINT PRIMARY KEY, status TEXT)").expect("create d");
+    Spi::run("INSERT INTO part_jk_d VALUES (1,'a'),(2,'a'),(7057,'a')").expect("seed d");
+
+    Spi::run(
+        "SELECT create_reflex_ivm( \
+            'part_jk_v', \
+            'SELECT s.dem_plan_id, s.product_id, s.qty FROM part_jk_s s \
+             JOIN part_jk_d d ON d.dem_plan_id = s.dem_plan_id', \
+            'dem_plan_id,product_id' \
+         )",
+    )
+    .expect("create");
+
+    let strategy = Spi::get_one::<String>(
+        "SELECT pt.partstrat::text FROM pg_partitioned_table pt \
+         JOIN pg_class c ON c.oid = pt.partrelid WHERE c.relname = 'part_jk_v'",
+    )
+    .expect("strategy")
+    .expect("v");
+    assert_eq!(strategy, "l");
+
+    let children = Spi::get_one::<i64>(
+        "SELECT count(*) FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid \
+         WHERE i.inhparent = 'part_jk_v'::regclass",
+    )
+    .expect("children query")
+    .expect("count");
+    assert_eq!(children, 2, "both source partitions must be mirrored");
+
+    let n = Spi::get_one::<i64>("SELECT count(*) FROM part_jk_v")
+        .expect("count query")
+        .expect("n");
+    assert_eq!(n, 3, "all source rows must be seeded across partitions");
+}
+
+#[pg_test]
 fn pg_part_auto_mirror_skipped_when_col_not_in_group_by() {
     Spi::run("CREATE TABLE part_skip_a (id BIGINT, region TEXT NOT NULL, amount NUMERIC) PARTITION BY LIST (region)").expect("create");
     Spi::run("CREATE TABLE part_skip_a_n PARTITION OF part_skip_a FOR VALUES IN ('N')").expect("p1");
