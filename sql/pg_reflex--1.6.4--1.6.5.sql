@@ -1,0 +1,59 @@
+-- Migration: pg_reflex 1.6.4 → 1.6.5
+--
+-- Run via: ALTER EXTENSION pg_reflex UPDATE TO '1.6.5';
+--
+-- 1.6.5 is a correctness release fixing three independent create-time defects
+-- hit while migrating real views (CTE-decomposed, DEFERRED, matview-sourced)
+-- to IMVs. There are NO catalog schema changes, NO trigger function-body
+-- changes, and NO function signature changes — every fix is in the recompiled
+-- Rust module. This file is a no-op marker; the notes below state which fixes
+-- reach EXISTING IMVs and which only affect newly-created ones.
+--
+-- All three fixes are CREATE-TIME: each previously caused create_reflex_ivm to
+-- either error outright or bake the wrong value into the new IMV's metadata.
+-- They do NOT change maintenance of an IMV that was already created
+-- successfully, so no existing IMV is silently incorrect because of them.
+--
+--   (1) DEFERRED CTE IMV creation failed with
+--       `zero-length delimited identifier at or near ""`.
+--       A CTE-decomposed sub-IMV is referenced by the rewritten outer query in
+--       already-quoted form (`"schema"."view__cte_x"`, needed to preserve
+--       identifier case). In DEFERRED mode the staging-delta table name builder
+--       re-quoted the already-quoted schema, emitting `""schema""` — which PG
+--       rejects as a zero-length delimited identifier. The schema component is
+--       now unquoted before being re-quoted. IMMEDIATE mode was unaffected (its
+--       trigger names strip quotes). No IMV with this shape could be created
+--       before, so there are no affected existing IMVs.
+--
+--   (2) Explicit `unique_columns` were dropped for any query with CTEs.
+--       The CTE-decomposition path did not thread the caller's `unique_columns`
+--       into the outer passthrough IMV (the set-op and DISTINCT-ON paths did),
+--       so a JOIN passthrough over CTEs reported "no unique key" and silently
+--       fell back to FULL REFRESH on DELETE/UPDATE even when a key was supplied.
+--       The key now reaches the outer IMV's stored metadata.
+--
+--   (3) MIN / MAX over a column whose source is a MATERIALIZED VIEW failed at
+--       creation with `column "…" is of type numeric but expression is of type
+--       timestamp with time zone` (or any non-numeric type). Source column
+--       types were collected from `information_schema.columns`, which omits
+--       materialized views — so the column type was never found and the
+--       MIN/MAX intermediate column defaulted to NUMERIC. Types are now read
+--       from `pg_catalog`, which covers every relkind. This completes the
+--       1.6.3 MIN/MAX type-resolution fix, which handled table-qualified
+--       columns but not matview-sourced ones.
+--
+-- Migration note:
+--
+--   No DDL is required to register 1.6.5.
+--
+--   Fixes (1) and (3) unblock creation of view shapes that could not be created
+--   before, so they have no existing-IMV impact. Fix (2) is baked into stored
+--   metadata at create time: an IMV built from a CTE query under <= 1.6.4 keeps
+--   its empty unique key (FULL REFRESH on DELETE/UPDATE). To pick up incremental
+--   DELETE/UPDATE, DROP and recreate it with an explicit key:
+--
+--       SELECT drop_reflex_ivm('<name>');
+--       SELECT create_reflex_ivm('<name>', '<SELECT …>', '<key cols>');
+
+-- No-op marker: ALTER EXTENSION needs a non-empty migration file.
+SELECT 1 WHERE FALSE;

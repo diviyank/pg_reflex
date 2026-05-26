@@ -590,6 +590,7 @@ maintained — move it to the outermost SELECT, or define this view with kind: m
 #[allow(clippy::too_many_arguments)]
 fn try_decompose_ctes(
     view_name: &str,
+    unique_columns_str: &str,
     storage_mode: &str,
     refresh_mode: &str,
     topk_k: Option<usize>,
@@ -756,7 +757,7 @@ with kind: mv.",
     Some(create_reflex_ivm_impl(
         view_name,
         &body_sql,
-        "",
+        unique_columns_str,
         false,
         storage_mode,
         refresh_mode,
@@ -2112,6 +2113,7 @@ pub(crate) fn create_reflex_ivm_impl(
 
     if let Some(result) = try_decompose_ctes(
         view_name,
+        unique_columns_str,
         storage_mode,
         refresh_mode,
         topk_k,
@@ -2704,12 +2706,19 @@ fn query_column_types_from_catalog_with_per_source(
         } else {
             ("public", table.as_str())
         };
+        // pg_catalog (not information_schema.columns) because the latter omits
+        // materialized views — a MIN/MAX over a matview column would then get no
+        // type and default to NUMERIC. `format_type` covers every relkind.
         let rows = client
             .select(
-                "SELECT column_name::text AS col_name, data_type::text AS data_type, \
-                        is_nullable::text AS is_nullable \
-                 FROM information_schema.columns \
-                 WHERE table_schema = $1 AND table_name = $2",
+                "SELECT a.attname::text AS col_name, \
+                        format_type(a.atttypid, a.atttypmod) AS data_type, \
+                        CASE WHEN a.attnotnull THEN 'NO' ELSE 'YES' END AS is_nullable \
+                 FROM pg_catalog.pg_attribute a \
+                 JOIN pg_catalog.pg_class c ON c.oid = a.attrelid \
+                 JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+                 WHERE n.nspname = $1 AND c.relname = $2 \
+                   AND a.attnum > 0 AND NOT a.attisdropped",
                 None,
                 &[
                     unsafe {
@@ -3546,6 +3555,10 @@ pub(crate) fn reflex_rebuild_triggers_impl(source_table: &str) -> String {
 
 /// Map information_schema data_type strings to PostgreSQL type names usable in DDL.
 fn map_information_schema_type(data_type: &str) -> String {
+    // `format_type` appends type modifiers (`numeric(10,2)`, `character
+    // varying(255)`); strip them so the base type matches the arms below.
+    // information_schema spellings have no parens, so this is a no-op for them.
+    let data_type = data_type.split('(').next().unwrap_or(data_type).trim();
     match data_type {
         "integer" => "INTEGER".to_string(),
         "bigint" => "BIGINT".to_string(),

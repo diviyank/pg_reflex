@@ -1534,6 +1534,34 @@ fn cov_imv_on_materialized_view() {
     let _ = result;
 }
 
+/// Regression: MIN/MAX over a non-numeric column (TIMESTAMPTZ) whose source is a
+/// materialized view. `information_schema.columns` omits materialized views, so
+/// the column's type was never collected and the MIN/MAX intermediate column
+/// defaulted to NUMERIC — the INSERT then failed with
+/// "column ... is of type numeric but expression is of type timestamp with time zone".
+#[pg_test]
+fn cov_min_max_timestamptz_from_matview() {
+    Spi::run("CREATE TABLE cov_mxt_t (id SERIAL PRIMARY KEY, ts TIMESTAMPTZ NOT NULL)")
+        .expect("create");
+    Spi::run("INSERT INTO cov_mxt_t (ts) VALUES ('2026-01-01'),('2026-02-01')").expect("seed");
+    Spi::run("CREATE MATERIALIZED VIEW cov_mxt_mv AS SELECT ts FROM cov_mxt_t").expect("mv");
+
+    let result = crate::create_reflex_ivm(
+        "cov_mxt_view",
+        "SELECT MAX(mv.ts) AS mx, MIN(mv.ts) AS mn FROM cov_mxt_mv mv",
+        None,
+        None,
+        None,
+        None,
+    );
+    assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
+
+    let later = Spi::get_one::<bool>("SELECT mx > mn FROM cov_mxt_view")
+        .expect("q")
+        .expect("v");
+    assert!(later, "MAX(ts) must exceed MIN(ts) — both must be timestamptz");
+}
+
 /// IMV on a regular view — interactions.
 #[pg_test]
 fn cov_imv_on_regular_view() {

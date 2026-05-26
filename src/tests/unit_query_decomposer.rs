@@ -169,6 +169,26 @@ fn test_intermediate_table_name_qualified() {
     );
 }
 
+// A CTE sub-IMV source is stored in `froms` already quoted (the body rewrite
+// injects `quote_identifier(cte_imv_name)` to preserve case). The deferred
+// staging-name builder must not re-quote the already-quoted schema, or it
+// emits `""schema""` — a zero-length delimited identifier PG rejects.
+#[test]
+fn test_staging_delta_table_name_quoted_source() {
+    assert_eq!(
+        staging_delta_table_name("\"rfx\".\"v__cte_lsb\""),
+        "\"rfx\".\"__reflex_delta_rfx_v__cte_lsb\""
+    );
+}
+
+#[test]
+fn test_staging_delta_table_name_bare_source() {
+    assert_eq!(
+        staging_delta_table_name("rfx.ss"),
+        "\"rfx\".\"__reflex_delta_rfx_ss\""
+    );
+}
+
 #[test]
 fn test_rewrite_having_simple_sum() {
     let plan = decompose("SELECT city, SUM(amount) AS total FROM emp GROUP BY city").1;

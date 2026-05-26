@@ -211,6 +211,81 @@ fn test_cte_passthrough_sub_imv() {
     assert_eq!(a3, 15i64, "Inactive row should not affect view");
 }
 
+// Regression: a DEFERRED passthrough IMV that joins a CTE-decomposed sub-IMV
+// used to fail at creation with `zero-length delimited identifier at or near ""`.
+// The sub-IMV source is stored already-quoted (`"schema"."view__cte_x"`); the
+// deferred staging-name builder re-quoted the schema into `""schema""`. Immediate
+// mode was unaffected (its trigger names strip quotes), so this exercises the
+// deferred path specifically and verifies maintenance still runs.
+#[pg_test]
+fn test_cte_deferred_passthrough_sub_imv_staging() {
+    Spi::run("CREATE TABLE cte_def_main (pid INT NOT NULL, val INT NOT NULL)").expect("t1");
+    Spi::run("CREATE TABLE cte_def_agg (pid INT NOT NULL, qty INT NOT NULL)").expect("t2");
+    Spi::run("INSERT INTO cte_def_main VALUES (1, 10), (2, 20)").expect("seed1");
+    Spi::run("INSERT INTO cte_def_agg VALUES (1, 5), (1, 7), (2, 3)").expect("seed2");
+
+    let result = crate::create_reflex_ivm(
+        "cte_def_view",
+        "WITH agg AS (SELECT pid, SUM(qty)::BIGINT AS sq FROM cte_def_agg GROUP BY pid)
+         SELECT m.pid, m.val, a.sq FROM cte_def_main m LEFT JOIN agg a ON a.pid = m.pid",
+        None,
+        Some("UNLOGGED"),
+        Some("DEFERRED"),
+        None,
+    );
+    assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
+
+    let sq = Spi::get_one::<i64>("SELECT sq FROM cte_def_view WHERE pid = 1")
+        .expect("q")
+        .expect("v");
+    assert_eq!(sq, 12i64, "pid=1: 5+7=12");
+
+    // Mutate the base table, then flush manually (the commit-time constraint
+    // trigger never fires inside the rolled-back pg_test transaction). The
+    // staging delta named off the quoted sub-IMV source must resolve here.
+    Spi::run("INSERT INTO cte_def_main VALUES (1, 99)").expect("insert");
+    Spi::run("SELECT reflex_flush_deferred('cte_def_main')").expect("flush");
+    let cnt = Spi::get_one::<i64>("SELECT COUNT(*) FROM cte_def_view WHERE pid = 1")
+        .expect("q")
+        .expect("v");
+    assert_eq!(cnt, 2i64, "two pid=1 rows after deferred insert flush");
+}
+
+// Regression: the CTE-decomposition path did not thread the caller's explicit
+// `unique_columns` into the outer passthrough IMV (unlike the set-op and
+// distinct-on paths). The outer body was re-created with an empty key, so a
+// JOIN passthrough silently fell back to full-refresh on DELETE/UPDATE even
+// when the user supplied a key.
+#[pg_test]
+fn test_cte_passthrough_threads_explicit_unique_columns() {
+    Spi::run("CREATE TABLE cte_uk_main (pid INT NOT NULL, val INT NOT NULL)").expect("t1");
+    Spi::run("CREATE TABLE cte_uk_agg (pid INT NOT NULL, qty INT NOT NULL)").expect("t2");
+    Spi::run("INSERT INTO cte_uk_main VALUES (1, 10), (2, 20)").expect("seed1");
+    Spi::run("INSERT INTO cte_uk_agg VALUES (1, 5), (2, 3)").expect("seed2");
+
+    let result = crate::create_reflex_ivm(
+        "cte_uk_view",
+        "WITH agg AS (SELECT pid, SUM(qty)::BIGINT AS sq FROM cte_uk_agg GROUP BY pid)
+         SELECT m.pid, m.val, a.sq FROM cte_uk_main m LEFT JOIN agg a ON a.pid = m.pid",
+        Some("pid"),
+        None,
+        None,
+        None,
+    );
+    assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
+
+    let uk = Spi::get_one::<Vec<String>>(
+        "SELECT unique_columns FROM public.__reflex_ivm_reference WHERE name LIKE '%cte_uk_view'",
+    )
+    .expect("q")
+    .expect("v");
+    assert_eq!(
+        uk,
+        vec!["pid".to_string()],
+        "explicit unique key must reach the outer passthrough through CTE decomposition"
+    );
+}
+
 #[pg_test]
 fn test_cte_sibling_with_window() {
     // This test reproduces the core bug: CTE decomposition must run BEFORE window decomposition.

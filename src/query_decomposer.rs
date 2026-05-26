@@ -61,9 +61,20 @@ pub fn transition_old_table_name(source_table: &str) -> String {
 fn qualify_in_same_schema(qualified_name: &str, local: String) -> String {
     let local = safe_identifier(&local);
     match split_qualified_name(qualified_name).0 {
-        Some(s) => format!("\"{}\".\"{}\"", s, local),
+        Some(s) => format!("\"{}\".\"{}\"", unquote_ident_component(s), local),
         None => format!("\"{}\"", local),
     }
+}
+
+/// Strip one surrounding pair of double-quotes from an identifier component.
+/// A CTE sub-IMV source arrives here already quoted (`"schema"."view"`), so the
+/// raw schema slice from `split_qualified_name` is `"schema"`; re-quoting it
+/// verbatim would yield `""schema""` (a zero-length delimited identifier). Only
+/// the outer pair is removed, so an embedded escaped quote (`"a""b"`) survives.
+fn unquote_ident_component(part: &str) -> &str {
+    part.strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .unwrap_or(part)
 }
 
 /// Name of the deferred-mode staging (delta) table for a source table.

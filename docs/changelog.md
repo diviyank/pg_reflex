@@ -4,6 +4,20 @@ The full changelog tracks every release. The latest version's headlines are on t
 
 For each version below, see [`CHANGELOG.md`](https://github.com/diviyank/pg_reflex/blob/main/CHANGELOG.md) on GitHub for the canonical text.
 
+## [1.6.5] — 2026-05-26
+
+Correctness release fixing three independent create-time defects hit while migrating real views (CTE-decomposed, `DEFERRED`, materialized-view-sourced) to IMVs.  No catalog schema, trigger body, or API changes.  Run `ALTER EXTENSION pg_reflex UPDATE TO '1.6.5';` (no-op migration marker).  All three are create-time fixes; an IMV already created successfully is unaffected.
+
+**Fixed**
+
+- **`DEFERRED` IMV over a CTE failed at creation with `zero-length delimited identifier at or near ""`.**  A CTE-decomposed sub-IMV is referenced in already-quoted form (`"schema"."view__cte_x"`); in `DEFERRED` mode the staging-delta name builder re-quoted the already-quoted schema, emitting `""schema""`.  The schema component is now unquoted before re-quoting.  `IMMEDIATE` mode was unaffected.  *Create-time fix — unblocks a previously-uncreatable shape.*
+- **Explicit `unique_columns` were silently dropped for any query containing CTEs.**  The CTE-decomposition path did not thread `unique_columns` into the outer passthrough IMV (the set-op and `DISTINCT ON` paths did), so a JOIN passthrough over CTEs fell back to **full refresh** on `DELETE`/`UPDATE` despite a supplied key.  The key now reaches the stored metadata.  *Create-time fix — recreate CTE IMVs built under ≤1.6.4 to gain incremental `DELETE`/`UPDATE`.*
+- **`MIN`/`MAX` over a materialized-view column failed at creation with `… is of type numeric but expression is of type timestamp with time zone`.**  Source types came from `information_schema.columns`, which **omits materialized views**, so `MIN`/`MAX` defaulted to `NUMERIC`.  Types are now read from `pg_catalog` (all relkinds), completing the 1.6.3 type-resolution fix for matview sources.  *Create-time fix — unblocks a previously-uncreatable shape.*
+
+**Migration**
+
+No DDL required.  Fixes 1 and 3 have no existing-IMV impact.  For fix 2, drop and recreate a CTE IMV with an explicit key to gain incremental `DELETE`/`UPDATE`: `SELECT drop_reflex_ivm('<name>'); SELECT create_reflex_ivm('<name>', '<SELECT …>', '<key cols>');`
+
 ## [1.6.4] — 2026-05-24
 
 Correctness release hardened by a new differential fuzz harness.  No catalog schema, trigger body, or API changes.  Run `ALTER EXTENSION pg_reflex UPDATE TO '1.6.4';` (no-op migration marker).  Runtime fixes reach existing IMVs on recompile; create-time fixes affect only newly-created IMVs.
