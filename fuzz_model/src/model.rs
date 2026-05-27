@@ -8,6 +8,7 @@ pub enum ColType {
     Text,
     Date,
     Float8,
+    Timestamptz,
 }
 
 impl ColType {
@@ -20,6 +21,7 @@ impl ColType {
             ColType::Text => "text",
             ColType::Date => "date",
             ColType::Float8 => "float8",
+            ColType::Timestamptz => "timestamptz",
         }
     }
     pub fn is_float(self) -> bool {
@@ -84,5 +86,11 @@ mod tests {
         assert_eq!(ColType::BigInt.sql(), "bigint");
         assert!(ColType::Float8.is_float());
         assert!(!ColType::Numeric.is_float());
+    }
+
+    #[test]
+    fn timestamptz_renders_and_is_not_float() {
+        assert_eq!(ColType::Timestamptz.sql(), "timestamptz");
+        assert!(!ColType::Timestamptz.is_float());
     }
 }

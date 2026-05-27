@@ -10,6 +10,7 @@ fn exact_coltype() -> impl Strategy<Value = ColType> {
         Just(ColType::Bool),
         Just(ColType::Text),
         Just(ColType::Date),
+        Just(ColType::Timestamptz),
     ]
 }
 
@@ -38,6 +39,7 @@ pub fn literal(ty: ColType, n: i64) -> String {
         ColType::Bool => if n % 2 == 0 { "true".into() } else { "false".into() },
         ColType::Text => format!("'g{}'", n % 4),
         ColType::Date => format!("date '2024-01-{:02}'", (n % 27) + 1),
+        ColType::Timestamptz => format!("timestamptz '2024-01-01 00:00:00+00' + ({} || ' seconds')::interval", n % 100),
     }
 }
 
