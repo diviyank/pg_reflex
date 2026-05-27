@@ -25,7 +25,7 @@ use pgrx::datum::DatumWithOid;
 use pgrx::prelude::*;
 
 use crate::query_decomposer::{
-    intermediate_table_name, quote_identifier, safe_identifier, split_qualified_name,
+    canonical_source, intermediate_table_name, quote_identifier, safe_identifier, split_qualified_name,
 };
 
 /// A description of how a source table is partitioned.
@@ -502,7 +502,15 @@ pub(crate) fn resolve_anchor_source(
             // (e.g. a sibling sub-IMV) cannot be the anchor.
             let mut partitioned_owners = owners
                 .iter()
-                .filter(|s| introspect_partition_descriptor(client, s).is_some());
+                .filter(|s| {
+                    let (schema_opt, bare) = canonical_source(s);
+                    let canonical_name = if let Some(schema) = schema_opt {
+                        format!("{}.{}", schema, bare)
+                    } else {
+                        bare
+                    };
+                    introspect_partition_descriptor(client, &canonical_name).is_some()
+                });
             match (partitioned_owners.next(), partitioned_owners.next()) {
                 (Some(anchor), None) => Ok(anchor.clone()),
                 _ => Err(format!(

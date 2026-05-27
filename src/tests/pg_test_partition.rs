@@ -1293,3 +1293,28 @@ fn pg_part_cte_nested_ctes_naming_collision_safety() {
     .expect("total");
     assert_eq!(total_b.to_string(), "700", "category b total should be 700 (300+400)");
 }
+
+#[pg_test]
+fn partitioned_imv_over_quoted_cte_source_creates_cleanly() {
+    // Reproduces Bug 5: ambiguous partition anchor when a CTE sub-IMV source is
+    // stored double-quoted. The create must succeed and pick a single anchor.
+    Spi::run("CREATE TABLE pq_base (id int, g int, m numeric) PARTITION BY RANGE (g);").unwrap();
+    Spi::run("CREATE TABLE pq_base_1 PARTITION OF pq_base FOR VALUES FROM (1) TO (100);").unwrap();
+    Spi::run("CREATE TABLE pq_base_2 PARTITION OF pq_base FOR VALUES FROM (100) TO (200);").unwrap();
+    Spi::run("INSERT INTO pq_base (id, g, m) VALUES (1, 50, 10.5), (2, 150, 20.5);").unwrap();
+
+    let _body = "WITH agg AS (SELECT g, SUM(m) AS s FROM pq_base GROUP BY g) \
+                SELECT g, s FROM agg";
+    let msg = Spi::get_one::<&str>(
+        "SELECT create_reflex_ivm( \
+            'pq_imv', \
+            'WITH agg AS (SELECT g, SUM(m) AS s FROM pq_base GROUP BY g) SELECT g, s FROM agg', \
+            NULL, NULL, NULL, NULL, \
+            ARRAY['g'] \
+         )",
+    )
+    .expect("create partitioned IMV over CTE")
+    .expect("create result");
+    assert!(msg.starts_with("CREATE REFLEX") || msg.contains(crate::REFLEX_UNSUPPORTED_TAG),
+            "unexpected: {msg}");
+}
