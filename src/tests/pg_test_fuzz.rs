@@ -157,36 +157,76 @@ $func$ LANGUAGE plpgsql;
     }
 
     pub fn evaluate_planned(pc: &PlannedCase) -> Outcome {
+        // Use catch_unwind to safely handle any panics that might occur
+        let pc = pc.clone();
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            evaluate_planned_inner(&pc)
+        })) {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                // Try to extract panic message from various types
+                let msg = if let Some(s) = e.downcast_ref::<String>() {
+                    format!("string: {}", s)
+                } else if let Some(s) = e.downcast_ref::<&str>() {
+                    format!("&str: {}", s)
+                } else {
+                    format!("unknown type (this may be a pgrx SPI exception)")
+                };
+                Outcome::Bug(format!("evaluate panic: {msg}"))
+            }
+        }
+    }
+
+    fn evaluate_planned_inner(pc: &PlannedCase) -> Outcome {
         let seq = CASE_SEQ.fetch_add(1, Ordering::Relaxed);
         let suffix = format!("_pfz{seq}");
 
         // Rename case with a different suffix to distinguish from evaluate()
         let case = rename_case(&pc.case, &suffix);
 
+        // Build a mapping of old table names to new names for renaming source objects.
+        let mut table_renames: Vec<(String, String)> = Vec::new();
+        for old_t in &pc.case.tables {
+            let new_name = format!("{}{}", old_t.name, &suffix);
+            table_renames.push((old_t.name.clone(), new_name));
+        }
+
         // Step 1: Create base tables and seed them.
         for t in &case.tables {
-            Spi::run(&render::create_table_sql(t))
-                .expect("setup ddl: create base table failed");
+            if let Err(e) = Spi::run(&render::create_table_sql(t)) {
+                return Outcome::Bug(format!("create base table failed: {e:?}"));
+            }
         }
 
         // Step 2: Create source objects (View/MatView/SubImv) in order.
+        // Source objects from pc.source_objects are based on the original (non-renamed) case.
+        // However, the base tables have been renamed. So we need to rename table references
+        // in the source object definitions.
         for src_obj in &pc.source_objects {
             match src_obj.kind {
                 SourceObjectKind::Table => {
                     // Base tables already created above; skip
                 }
                 SourceObjectKind::View => {
-                    // Execute the VIEW DDL directly
+                    // Execute the VIEW DDL directly, renaming table references
                     if let Some(define_sql) = &src_obj.define_sql {
-                        if let Err(e) = Spi::run(define_sql) {
+                        let mut renamed_sql = define_sql.clone();
+                        for (old_name, new_name) in &table_renames {
+                            renamed_sql = renamed_sql.replace(old_name, new_name);
+                        }
+                        if let Err(e) = Spi::run(&renamed_sql) {
                             return Outcome::Bug(format!("create view {} failed: {e:?}", src_obj.name));
                         }
                     }
                 }
                 SourceObjectKind::MatView => {
-                    // Execute the MATERIALIZED VIEW DDL directly
+                    // Execute the MATERIALIZED VIEW DDL directly, renaming table references
                     if let Some(define_sql) = &src_obj.define_sql {
-                        if let Err(e) = Spi::run(define_sql) {
+                        let mut renamed_sql = define_sql.clone();
+                        for (old_name, new_name) in &table_renames {
+                            renamed_sql = renamed_sql.replace(old_name, new_name);
+                        }
+                        if let Err(e) = Spi::run(&renamed_sql) {
                             return Outcome::Bug(format!("create matview {} failed: {e:?}", src_obj.name));
                         }
                     }
@@ -194,16 +234,20 @@ $func$ LANGUAGE plpgsql;
                 SourceObjectKind::SubImv => {
                     // Extract the SELECT body from the placeholder define_sql.
                     // The placeholder format is: "CREATE REFLEX IMV <name> AS SELECT ..."
-                    // We need to extract everything after "AS ".
                     if let Some(define_sql) = &src_obj.define_sql {
                         // Find " AS " and extract the SELECT part
                         if let Some(as_pos) = define_sql.find(" AS ") {
                             let select_body = &define_sql[as_pos + 4..];
+                            // Rename table references in the select body
+                            let mut renamed_select_body = select_body.to_string();
+                            for (old_name, new_name) in &table_renames {
+                                renamed_select_body = renamed_select_body.replace(old_name, new_name);
+                            }
                             // Get unique columns from the base case
                             let keys = case.unique_columns.join(",");
                             let create_result = Spi::get_one::<&str>(&format!(
                                 "SELECT create_reflex_ivm('{}', $body${}$body$, '{}', NULL, 'IMMEDIATE', NULL)",
-                                src_obj.name, select_body, keys
+                                src_obj.name, renamed_select_body, keys
                             ));
                             match create_result {
                                 Ok(Some(msg)) => {
@@ -226,11 +270,7 @@ $func$ LANGUAGE plpgsql;
         let mv = format!("mv{suffix}");
         let imv = format!("imv{suffix}");
 
-        // Step 3: Create oracle MV over the (possibly source-wrapped) rendered_sql.
-        Spi::run(&render::create_mv_sql(&mv, &case.select_body))
-            .expect("setup ddl: create mv failed");
-
-        // Step 4: Build the DML statements for the DO block.
+        // Step 3: Build the DML statements for the DO block.
         let mut dml_lines = Vec::new();
         for txn in &case.dml {
             for stmt in &txn.statements {
@@ -246,7 +286,7 @@ $func$ LANGUAGE plpgsql;
         }
         let dml_block = dml_lines.join("\n");
 
-        // Step 5: Build flush lines if deferred.
+        // Step 4: Build flush lines if deferred.
         let mut flush_lines = Vec::new();
         if case.deferred {
             for t in &case.tables {
@@ -255,7 +295,7 @@ $func$ LANGUAGE plpgsql;
         }
         let flush_block = flush_lines.join("\n");
 
-        // Step 6: Build maintenance block based on source_is_refresh_driven.
+        // Step 5: Build maintenance block based on source_is_refresh_driven.
         let maint_block = if pc.source_is_refresh_driven {
             // For refresh-driven sources (MatView), refresh them explicitly
             let mut maint_lines = Vec::new();
@@ -272,6 +312,37 @@ $func$ LANGUAGE plpgsql;
             String::new()
         };
 
+        // Step 6: Prepare the oracle MV body.
+        // FIX: Don't use rename_case()'s renamed body directly because it renames
+        // source object names (View/MatView) which are NOT actually renamed in SQL.
+        // Only base tables get the _pfz suffix. Source objects keep original names.
+        let mut body = case.select_body.rendered_sql.clone();
+
+        // Undo source object renames that rename_case() applied, BUT ONLY for non-Table sources.
+        // Table sources DO get the _pfz suffix applied (they are base tables that were created with it).
+        // View/MatView/SubImv sources do NOT get the suffix (they are created with original names).
+        for src_obj in &pc.source_objects {
+            if matches!(src_obj.kind, SourceObjectKind::Table) {
+                // Table sources: the body correctly has the _pfz suffix, no undo needed.
+                continue;
+            }
+            // For View/MatView/SubImv: undo the rename that rename_case() applied.
+            let wrongly_renamed = format!("{}{}", src_obj.name, &suffix);
+            // Only replace if the wrongly_renamed version exists in the body
+            if body.contains(&wrongly_renamed) {
+                body = body.replace(&wrongly_renamed, &src_obj.name);
+            }
+        }
+
+        // Step 7: Now create oracle MV with the corrected body (after undo-rename).
+        let oracle_body = SelectBody {
+            rendered_sql: body.clone(),
+        };
+        let create_mv_sql_str = render::create_mv_sql(&mv, &oracle_body);
+        if let Err(e) = Spi::run(&create_mv_sql_str) {
+            return Outcome::Bug(format!("create oracle mv failed: {e:?}"));
+        }
+
         // Build the diff subquery.
         let has_float = case.output_columns.iter().any(|c| c.ty.is_float());
         let diff_from = if has_float {
@@ -282,7 +353,7 @@ $func$ LANGUAGE plpgsql;
 
         // Construct the DO block as a string.
         let keys = case.unique_columns.join(",");
-        let body = case.select_body.rendered_sql.clone();
+
         let cascade_arg = match pc.axes.lifecycle {
             fuzz_model::axes::Lifecycle::CascadeDrop => ", true",
             _ => "",
@@ -364,9 +435,15 @@ $func$ LANGUAGE plpgsql;
         }
 
         // Call the function and parse the result.
+        // Note: Spi::get_one can panic if the query execution raises an exception.
+        // We're relying on the outer catch_unwind to catch these panics.
         let call_func_sql = format!("SELECT {}();", func_name);
-        let outcome = match Spi::get_one::<&str>(&call_func_sql) {
-            Ok(Some(result_str)) => {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            Spi::get_one::<&str>(&call_func_sql)
+        }));
+
+        match result {
+            Ok(Ok(Some(result_str))) => {
                 let parts: Vec<&str> = result_str.splitn(2, "|||").collect();
                 let status = if !parts.is_empty() { parts[0] } else { "UNKNOWN" };
                 let detail = if parts.len() > 1 { parts[1].to_string() } else { String::new() };
@@ -377,10 +454,19 @@ $func$ LANGUAGE plpgsql;
                     _ => Outcome::Bug(format!("unknown status: {}", status)),
                 }
             }
-            e => Outcome::Bug(format!("function call error: {:?}", e)),
-        };
-
-        outcome
+            Ok(Ok(None)) => Outcome::Bug("function returned NULL".to_string()),
+            Ok(Err(e)) => Outcome::Bug(format!("function call error: {:?}", e)),
+            Err(panic_e) => {
+                let msg = if let Some(s) = panic_e.downcast_ref::<String>() {
+                    format!("string: {}", s)
+                } else if let Some(s) = panic_e.downcast_ref::<&str>() {
+                    format!("&str: {}", s)
+                } else {
+                    "unknown panic type".to_string()
+                };
+                Outcome::Bug(format!("function call panicked: {msg}"))
+            }
+        }
     }
 }
 
@@ -776,4 +862,71 @@ fn regression_bug3_count_over_left_join_secondary_side() {
     .unwrap()
     .unwrap();
     assert_eq!(diff, 0, "Bug 3 regressed: IMV diverged from MV by {diff} rows");
+}
+
+/// Deterministic pairwise matrix CI gate.
+///
+/// Runs the full pairwise set of axes combinations through `evaluate_planned`.
+/// This is a permanent gate that ensures every axis combination can be created,
+/// mutated, maintained, and dropped without bugs. Unlike the proptest-driven
+/// fuzz_differential_exact, this gate is deterministic, fast, and runs in CI.
+///
+/// Each pairwise case is identified by its axes combination. A Bug outcome
+/// collects a full list and fails the gate, allowing the controller to triage
+/// and fix real pg_reflex bugs vs harness/codegen artifacts.
+///
+/// Each case runs in its own savepoint to isolate failures and prevent cascading
+/// errors from one case affecting the next.
+#[cfg(any(test, feature = "pg_test"))]
+#[pg_test]
+fn fuzz_pairwise_matrix_gate() {
+    use fuzz_model::axes::{pairwise, valid_space};
+    use pgrx::prelude::*;
+    let mut failures: Vec<String> = Vec::new();
+    let pairwise_cases = pairwise(&valid_space());
+    let total = pairwise_cases.len();
+
+    for (i, a) in pairwise_cases.into_iter().enumerate() {
+        let pc = match fuzz_model::axes::plan_case(&a, 100_000 + i as u64) {
+            Some(pc) => pc,
+            None => continue, // no template yet; tracked, never silent
+        };
+
+        // Each case runs in its own savepoint to isolate failures
+        let sp_name = format!("sp_pairwise_{}", i);
+        let _ = Spi::run(&format!("SAVEPOINT {}", sp_name));
+
+        // Wrap evaluate_planned to catch panics from invalid SQL that's generated
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            oracle::evaluate_planned(&pc)
+        }));
+
+        match outcome {
+            Ok(oracle::Outcome::Match) => {
+                let _ = Spi::run(&format!("RELEASE {}", sp_name));
+            }
+            Ok(oracle::Outcome::Skip(_)) => {
+                let _ = Spi::run(&format!("RELEASE {}", sp_name));
+            }
+            Ok(oracle::Outcome::Bug(detail)) => {
+                // Rollback this savepoint to clean up partial state
+                let _ = Spi::run(&format!("ROLLBACK TO {}", sp_name));
+                failures.push(format!("case {}/{} axes {a:?} => BUG: {detail}", i, total, a = a));
+            }
+            Err(e) => {
+                // Panic occurred during evaluation (e.g., SQL exception at SPI level)
+                let _ = Spi::run(&format!("ROLLBACK TO {}", sp_name));
+                let msg = if let Some(s) = e.downcast_ref::<String>() {
+                    s.clone()
+                } else if let Some(s) = e.downcast_ref::<&str>() {
+                    s.to_string()
+                } else {
+                    "unknown error".to_string()
+                };
+                failures.push(format!("case {}/{} axes {a:?} => PANIC: {msg}", i, total, a = a));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "pairwise gate found {} failures:\n{}",
+            failures.len(), failures.join("\n"));
 }
