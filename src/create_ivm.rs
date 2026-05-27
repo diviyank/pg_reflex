@@ -79,6 +79,24 @@ struct BuildContext<'a> {
     unlogged_tables: Vec<String>,
 }
 
+/// Shared, by-reference parameter bundle for the decomposition entry points
+/// (`try_decompose_set_op`, `try_decompose_ctes`, `try_decompose_distinct_on`).
+///
+/// One struct so threading a new field reaches every path uniformly — a path
+/// cannot silently lack one (this is exactly how Bug 2 happened).
+struct DecomposeCtx<'a> {
+    view_name: &'a str,
+    sql: &'a str,
+    unique_columns_str: &'a str,
+    cte_unique_columns: &'a std::collections::HashMap<String, String>,
+    storage_mode: &'a str,
+    refresh_mode: &'a str,
+    topk_k: Option<usize>,
+    ignore_sources: &'a [String],
+    partition_by: &'a [String],
+    parsed: &'a ParsedInputs,
+}
+
 /// Phase 1 of the create-IMV pipeline.
 ///
 /// Normalizes `storage`/`refresh`, validates the view name, parses the SQL
@@ -195,18 +213,8 @@ fn compute_cte_partition_subset(
 /// [`create_reflex_ivm_impl`]; `None` if the query has no top-level set
 /// operator.
 #[allow(clippy::too_many_arguments)]
-fn try_decompose_set_op(
-    view_name: &str,
-    sql: &str,
-    unique_columns_str: &str,
-    storage_mode: &str,
-    refresh_mode: &str,
-    topk_k: Option<usize>,
-    ignore_sources: &[String],
-    partition_by: &[String],
-    parsed: &ParsedInputs,
-) -> Option<&'static str> {
-    let set_op = parsed.analysis.set_operation.as_ref()?;
+fn try_decompose_set_op(ctx: &DecomposeCtx) -> Option<&'static str> {
+    let set_op = ctx.parsed.analysis.set_operation.as_ref()?;
     match set_op.op {
         sqlparser::ast::SetOperator::Union
         | sqlparser::ast::SetOperator::Intersect
@@ -223,17 +231,17 @@ fn try_decompose_set_op(
     // instead of falling back to full refresh.
     let mut sub_imv_names: Vec<String> = Vec::new();
     for (i, operand_sql) in set_op.operand_sqls.iter().enumerate() {
-        let sub_name = safe_identifier(&format!("{}__union_{}", view_name, i));
+        let sub_name = safe_identifier(&format!("{}__union_{}", ctx.view_name, i));
         let result = create_reflex_ivm_impl(
             &sub_name,
             operand_sql,
-            unique_columns_str,
+            ctx.unique_columns_str,
             false,
-            storage_mode,
-            refresh_mode,
-            topk_k,
-            ignore_sources,
-            partition_by,
+            ctx.storage_mode,
+            ctx.refresh_mode,
+            ctx.topk_k,
+            ctx.ignore_sources,
+            ctx.partition_by,
         );
         if result.starts_with("ERROR") {
             return Some(result);
@@ -255,7 +263,7 @@ fn try_decompose_set_op(
                 .update(
                     &format!(
                         "CREATE OR REPLACE VIEW {} AS {}",
-                        quote_identifier(view_name),
+                        quote_identifier(ctx.view_name),
                         view_sql
                     ),
                     None,
@@ -273,18 +281,18 @@ fn try_decompose_set_op(
             insert_registry_row(
                 client,
                 &RegistryRow::decomposed(
-                    view_name,
+                    ctx.view_name,
                     depth,
                     &depends_on,
                     &depends_on_imv,
-                    sql,
+                    ctx.sql,
                     &view_sql,
-                    &parsed.storage_upper,
-                    &parsed.mode_upper,
+                    &ctx.parsed.storage_upper,
+                    &ctx.parsed.mode_upper,
                 ),
             )
             .unwrap_or_report();
-            add_graph_child_links(client, view_name, &depends_on_imv).unwrap_or_report();
+            add_graph_child_links(client, ctx.view_name, &depends_on_imv).unwrap_or_report();
         });
     } else {
         // UNION / INTERSECT / EXCEPT (without ALL): create a VIEW.
@@ -302,7 +310,7 @@ fn try_decompose_set_op(
                 .update(
                     &format!(
                         "CREATE OR REPLACE VIEW {} AS {}",
-                        quote_identifier(view_name),
+                        quote_identifier(ctx.view_name),
                         view_sql
                     ),
                     None,
@@ -319,18 +327,18 @@ fn try_decompose_set_op(
             insert_registry_row(
                 client,
                 &RegistryRow::decomposed(
-                    view_name,
+                    ctx.view_name,
                     depth,
                     &depends_on,
                     &depends_on_imv,
-                    sql,
+                    ctx.sql,
                     &view_sql,
-                    &parsed.storage_upper,
-                    &parsed.mode_upper,
+                    &ctx.parsed.storage_upper,
+                    &ctx.parsed.mode_upper,
                 ),
             )
             .unwrap_or_report();
-            add_graph_child_links(client, view_name, &depends_on_imv).unwrap_or_report();
+            add_graph_child_links(client, ctx.view_name, &depends_on_imv).unwrap_or_report();
         });
     }
 
@@ -2147,17 +2155,23 @@ pub(crate) fn create_reflex_ivm_impl(
         ));
     }
 
-    if let Some(result) = try_decompose_set_op(
+    // Build the decomposition context once, covering all fields needed by the three
+    // decomposition functions. This ensures every path has access to every field
+    // (including sql and cte_unique_columns, even if some functions don't use them).
+    let dctx = DecomposeCtx {
         view_name,
         sql,
         unique_columns_str,
+        cte_unique_columns: &cte_unique_columns,
         storage_mode,
         refresh_mode,
         topk_k,
         ignore_sources,
         partition_by,
-        &parsed,
-    ) {
+        parsed: &parsed,
+    };
+
+    if let Some(result) = try_decompose_set_op(&dctx) {
         return result;
     }
 
