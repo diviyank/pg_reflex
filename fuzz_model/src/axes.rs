@@ -4,22 +4,50 @@
 use crate::model::ColType;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum SourceKind { Table, View, MatView, CteSubImv }
+pub enum SourceKind {
+    Table,
+    View,
+    MatView,
+    CteSubImv,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum QueryShape { Passthrough, SingleAggregate, JoinInner, JoinLeft, CteDecomposed, SetOpUnionAll }
+pub enum QueryShape {
+    Passthrough,
+    SingleAggregate,
+    JoinInner,
+    JoinLeft,
+    CteDecomposed,
+    SetOpUnionAll,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum RefreshMode { Immediate, Deferred }
+pub enum RefreshMode {
+    Immediate,
+    Deferred,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum AggFn { Sum, Count, Min, Max, Avg }
+pub enum AggFn {
+    Sum,
+    Count,
+    Min,
+    Max,
+    Avg,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum UniqueCols { Absent, Provided }
+pub enum UniqueCols {
+    Absent,
+    Provided,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Lifecycle { CreateMutateDrop, CascadeDrop, Partitioned }
+pub enum Lifecycle {
+    CreateMutateDrop,
+    CascadeDrop,
+    Partitioned,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Axes {
@@ -35,7 +63,10 @@ pub struct Axes {
 impl ColType {
     /// SUM/AVG operands and the numeric MIN/MAX family.
     pub fn is_numeric_family(self) -> bool {
-        matches!(self, ColType::Int | ColType::BigInt | ColType::Numeric | ColType::Float8)
+        matches!(
+            self,
+            ColType::Int | ColType::BigInt | ColType::Numeric | ColType::Float8
+        )
     }
     /// Types MIN/MAX accept (ordered types).
     pub fn is_orderable(self) -> bool {
@@ -55,7 +86,10 @@ pub fn is_valid(a: &Axes) -> bool {
     }
 
     // Aggregate-fn axis presence must match the shape.
-    let shape_is_aggregate = matches!(a.shape, SingleAggregate | JoinInner | JoinLeft | CteDecomposed);
+    let shape_is_aggregate = matches!(
+        a.shape,
+        SingleAggregate | JoinInner | JoinLeft | CteDecomposed
+    );
     match (shape_is_aggregate, a.agg.is_some()) {
         (true, false) | (false, true) => return false,
         _ => {}
@@ -64,8 +98,16 @@ pub fn is_valid(a: &Axes) -> bool {
     // Aggregate-fn / measure-type compatibility.
     if let Some(f) = a.agg {
         match f {
-            Sum | Avg => if !a.measure_ty.is_numeric_family() { return false; },
-            Min | Max => if !a.measure_ty.is_orderable() { return false; },
+            Sum | Avg => {
+                if !a.measure_ty.is_numeric_family() {
+                    return false;
+                }
+            }
+            Min | Max => {
+                if !a.measure_ty.is_orderable() {
+                    return false;
+                }
+            }
             Count => {} // count(*) accepts any type
         }
     }
@@ -88,22 +130,184 @@ pub fn is_valid(a: &Axes) -> bool {
     true
 }
 
+fn all_source() -> Vec<SourceKind> {
+    vec![
+        SourceKind::Table,
+        SourceKind::View,
+        SourceKind::MatView,
+        SourceKind::CteSubImv,
+    ]
+}
+
+fn all_shape() -> Vec<QueryShape> {
+    use QueryShape::*;
+    vec![
+        Passthrough,
+        SingleAggregate,
+        JoinInner,
+        JoinLeft,
+        CteDecomposed,
+        SetOpUnionAll,
+    ]
+}
+
+fn all_refresh() -> Vec<RefreshMode> {
+    vec![RefreshMode::Immediate, RefreshMode::Deferred]
+}
+
+fn all_agg() -> Vec<Option<AggFn>> {
+    use AggFn::*;
+    vec![None, Some(Sum), Some(Count), Some(Min), Some(Max), Some(Avg)]
+}
+
+fn all_ty() -> Vec<ColType> {
+    use ColType::*;
+    vec![Int, Numeric, Timestamptz, Date, Text, Bool]
+}
+
+fn all_unique() -> Vec<UniqueCols> {
+    vec![UniqueCols::Absent, UniqueCols::Provided]
+}
+
+fn all_lifecycle() -> Vec<Lifecycle> {
+    vec![
+        Lifecycle::CreateMutateDrop,
+        Lifecycle::CascadeDrop,
+        Lifecycle::Partitioned,
+    ]
+}
+
+/// The full cartesian product, filtered to the legal subspace.
+pub fn valid_space() -> Vec<Axes> {
+    let mut out = Vec::new();
+    for &source in &all_source() {
+        for &shape in &all_shape() {
+            for &refresh in &all_refresh() {
+                for &agg in &all_agg() {
+                    for &measure_ty in &all_ty() {
+                        for &unique in &all_unique() {
+                            for &lifecycle in &all_lifecycle() {
+                                let a = Axes {
+                                    source,
+                                    shape,
+                                    refresh,
+                                    agg,
+                                    measure_ty,
+                                    unique,
+                                    lifecycle,
+                                };
+                                if is_valid(&a) {
+                                    out.push(a);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// A 2-way interaction: two (field-index, value-discriminant) pairs.
+type Pair = ((u8, u32), (u8, u32));
+
+fn field_values(a: &Axes) -> [(u8, u32); 7] {
+    [
+        (0, a.source as u32),
+        (1, a.shape as u32),
+        (2, a.refresh as u32),
+        (3, match a.agg {
+            None => 0,
+            Some(f) => 1 + f as u32,
+        }),
+        (4, a.measure_ty as u32),
+        (5, a.unique as u32),
+        (6, a.lifecycle as u32),
+    ]
+}
+
+pub fn required_pairs(space: &[Axes]) -> std::collections::HashSet<Pair> {
+    let mut set = std::collections::HashSet::new();
+    for a in space {
+        let fv = field_values(a);
+        for i in 0..fv.len() {
+            for j in (i + 1)..fv.len() {
+                set.insert((fv[i], fv[j]));
+            }
+        }
+    }
+    set
+}
+
+/// Deterministic greedy all-pairs: repeatedly pick the valid assignment that
+/// covers the most still-uncovered pairs (ties broken by first occurrence).
+pub fn pairwise(space: &[Axes]) -> Vec<Axes> {
+    let need = required_pairs(space);
+    let mut covered: std::collections::HashSet<Pair> = std::collections::HashSet::new();
+    let mut chosen: Vec<Axes> = Vec::new();
+    while covered.len() < need.len() {
+        let mut best: Option<(usize, &Axes)> = None;
+        for a in space {
+            let fv = field_values(a);
+            let mut gain = 0usize;
+            for i in 0..fv.len() {
+                for j in (i + 1)..fv.len() {
+                    if !covered.contains(&(fv[i], fv[j])) {
+                        gain += 1;
+                    }
+                }
+            }
+            if best.is_none_or(|(g, _)| gain > g) {
+                best = Some((gain, a));
+            }
+        }
+        let (gain, a) = best.expect("non-empty space");
+        if gain == 0 {
+            break;
+        }
+        let fv = field_values(a);
+        for i in 0..fv.len() {
+            for j in (i + 1)..fv.len() {
+                covered.insert((fv[i], fv[j]));
+            }
+        }
+        chosen.push(*a);
+    }
+    chosen
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::model::ColType;
 
-    fn axes(source: SourceKind, shape: QueryShape, refresh: RefreshMode, agg: Option<AggFn>) -> Axes {
-        Axes { source, shape, refresh, agg, measure_ty: ColType::Numeric,
-               unique: UniqueCols::Absent, lifecycle: Lifecycle::CreateMutateDrop }
+    fn axes(
+        source: SourceKind,
+        shape: QueryShape,
+        refresh: RefreshMode,
+        agg: Option<AggFn>,
+    ) -> Axes {
+        Axes {
+            source,
+            shape,
+            refresh,
+            agg,
+            measure_ty: ColType::Numeric,
+            unique: UniqueCols::Absent,
+            lifecycle: Lifecycle::CreateMutateDrop,
+        }
     }
 
     #[test]
     fn axes_is_constructible_and_hashable() {
         let a = Axes {
-            source: SourceKind::Table, shape: QueryShape::SingleAggregate,
-            refresh: RefreshMode::Immediate, agg: Some(AggFn::Sum),
-            measure_ty: ColType::Numeric, unique: UniqueCols::Absent,
+            source: SourceKind::Table,
+            shape: QueryShape::SingleAggregate,
+            refresh: RefreshMode::Immediate,
+            agg: Some(AggFn::Sum),
+            measure_ty: ColType::Numeric,
+            unique: UniqueCols::Absent,
             lifecycle: Lifecycle::CreateMutateDrop,
         };
         let mut set = std::collections::HashSet::new();
@@ -113,55 +317,134 @@ mod tests {
 
     #[test]
     fn matview_source_cannot_be_deferred() {
-        let a = axes(SourceKind::MatView, QueryShape::Passthrough, RefreshMode::Deferred, None);
+        let a = axes(
+            SourceKind::MatView,
+            QueryShape::Passthrough,
+            RefreshMode::Deferred,
+            None,
+        );
         assert!(!is_valid(&a));
-        let b = axes(SourceKind::MatView, QueryShape::Passthrough, RefreshMode::Immediate, None);
+        let b = axes(
+            SourceKind::MatView,
+            QueryShape::Passthrough,
+            RefreshMode::Immediate,
+            None,
+        );
         assert!(is_valid(&b));
     }
 
     #[test]
     fn passthrough_has_no_aggregate_fn() {
-        let with_agg = axes(SourceKind::Table, QueryShape::Passthrough, RefreshMode::Immediate, Some(AggFn::Sum));
+        let with_agg = axes(
+            SourceKind::Table,
+            QueryShape::Passthrough,
+            RefreshMode::Immediate,
+            Some(AggFn::Sum),
+        );
         assert!(!is_valid(&with_agg));
-        let no_agg = axes(SourceKind::Table, QueryShape::Passthrough, RefreshMode::Immediate, None);
+        let no_agg = axes(
+            SourceKind::Table,
+            QueryShape::Passthrough,
+            RefreshMode::Immediate,
+            None,
+        );
         assert!(is_valid(&no_agg));
     }
 
     #[test]
     fn aggregate_shapes_require_an_agg_fn() {
-        let missing = axes(SourceKind::Table, QueryShape::SingleAggregate, RefreshMode::Immediate, None);
+        let missing = axes(
+            SourceKind::Table,
+            QueryShape::SingleAggregate,
+            RefreshMode::Immediate,
+            None,
+        );
         assert!(!is_valid(&missing));
     }
 
     #[test]
     fn minmax_over_bool_is_invalid() {
-        let mut a = axes(SourceKind::Table, QueryShape::SingleAggregate, RefreshMode::Immediate, Some(AggFn::Min));
+        let mut a = axes(
+            SourceKind::Table,
+            QueryShape::SingleAggregate,
+            RefreshMode::Immediate,
+            Some(AggFn::Min),
+        );
         a.measure_ty = ColType::Bool;
         assert!(!is_valid(&a));
     }
 
     #[test]
     fn sum_avg_require_numeric_family() {
-        let mut a = axes(SourceKind::Table, QueryShape::SingleAggregate, RefreshMode::Immediate, Some(AggFn::Sum));
+        let mut a = axes(
+            SourceKind::Table,
+            QueryShape::SingleAggregate,
+            RefreshMode::Immediate,
+            Some(AggFn::Sum),
+        );
         a.measure_ty = ColType::Text;
         assert!(!is_valid(&a));
     }
 
     #[test]
     fn provided_unique_cols_only_for_passthrough_or_join() {
-        let mut agg = axes(SourceKind::Table, QueryShape::SingleAggregate, RefreshMode::Immediate, Some(AggFn::Sum));
+        let mut agg = axes(
+            SourceKind::Table,
+            QueryShape::SingleAggregate,
+            RefreshMode::Immediate,
+            Some(AggFn::Sum),
+        );
         agg.unique = UniqueCols::Provided;
         assert!(!is_valid(&agg));
-        let mut pass = axes(SourceKind::Table, QueryShape::Passthrough, RefreshMode::Immediate, None);
+        let mut pass = axes(
+            SourceKind::Table,
+            QueryShape::Passthrough,
+            RefreshMode::Immediate,
+            None,
+        );
         pass.unique = UniqueCols::Provided;
         assert!(is_valid(&pass));
     }
 
     #[test]
     fn cte_subimv_source_pairs_only_with_decomposable_shapes() {
-        let pass = axes(SourceKind::CteSubImv, QueryShape::Passthrough, RefreshMode::Immediate, None);
+        let pass = axes(
+            SourceKind::CteSubImv,
+            QueryShape::Passthrough,
+            RefreshMode::Immediate,
+            None,
+        );
         assert!(!is_valid(&pass));
-        let dec = axes(SourceKind::CteSubImv, QueryShape::CteDecomposed, RefreshMode::Immediate, Some(AggFn::Sum));
+        let dec = axes(
+            SourceKind::CteSubImv,
+            QueryShape::CteDecomposed,
+            RefreshMode::Immediate,
+            Some(AggFn::Sum),
+        );
         assert!(is_valid(&dec));
+    }
+
+    #[test]
+    fn all_axes_are_all_valid_and_nonempty() {
+        let space = valid_space();
+        assert!(!space.is_empty());
+        assert!(space.iter().all(is_valid));
+    }
+
+    #[test]
+    fn pairwise_covers_every_valid_2way_interaction() {
+        let space = valid_space();
+        let chosen = pairwise(&space);
+        let needed = required_pairs(&space);
+        let covered = required_pairs(&chosen);
+        for p in &needed {
+            assert!(covered.contains(p), "uncovered pair: {p:?}");
+        }
+        assert!(chosen.len() < space.len());
+    }
+
+    #[test]
+    fn pairwise_is_deterministic() {
+        assert_eq!(pairwise(&valid_space()), pairwise(&valid_space()));
     }
 }
