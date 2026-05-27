@@ -99,8 +99,7 @@ pub fn rename_case(case: &FuzzCase, suffix: &str) -> FuzzCase {
                 t.name = new.clone();
             }
         }
-        c.select_body.rendered_sql =
-            c.select_body.rendered_sql.replace(&old, &new);
+        c.select_body.rendered_sql = c.select_body.rendered_sql.replace(&old, &new);
         for txn in &mut c.dml {
             for stmt in &mut txn.statements {
                 match stmt {
@@ -129,12 +128,15 @@ pub fn repro_sql(case: &FuzzCase) -> String {
     }
     for txn in &case.dml {
         for stmt in &txn.statements {
-            let cols = cols_of(case, match stmt {
-                DmlStmt::Insert { table, .. }
-                | DmlStmt::Delete { table, .. }
-                | DmlStmt::Update { table, .. }
-                | DmlStmt::Truncate { table } => table,
-            });
+            let cols = cols_of(
+                case,
+                match stmt {
+                    DmlStmt::Insert { table, .. }
+                    | DmlStmt::Delete { table, .. }
+                    | DmlStmt::Update { table, .. }
+                    | DmlStmt::Truncate { table } => table,
+                },
+            );
             out.push_str(&render::dml_sql(stmt, &|_t: &str| cols.clone()));
             out.push_str(";\n");
         }
@@ -154,15 +156,36 @@ mod tests {
     #[test]
     fn float_compare_uses_relative_epsilon_and_null_safe_match() {
         let cols = vec![
-            Column { name: "g".into(), ty: ColType::Int, nullable: false },
-            Column { name: "s".into(), ty: ColType::Float8, nullable: true },
-            Column { name: "t".into(), ty: ColType::Text, nullable: true },
+            Column {
+                name: "g".into(),
+                ty: ColType::Int,
+                nullable: false,
+            },
+            Column {
+                name: "s".into(),
+                ty: ColType::Float8,
+                nullable: true,
+            },
+            Column {
+                name: "t".into(),
+                ty: ColType::Text,
+                nullable: true,
+            },
         ];
         let sql = float_diff_from_where("v_mv", "v_imv", &["g".to_string()], &cols);
         assert!(sql.contains("1e-9"), "must use relative epsilon: {sql}");
         // NULL-safe correlated anti-join, not an equi FULL JOIN (finding #4).
-        assert!(sql.contains("NOT EXISTS"), "must use NOT EXISTS anti-join: {sql}");
-        assert!(!sql.contains("FULL JOIN"), "must not use a non-NULL-safe FULL JOIN: {sql}");
-        assert!(sql.contains("IS NOT DISTINCT FROM"), "non-float cols matched NULL-safe: {sql}");
+        assert!(
+            sql.contains("NOT EXISTS"),
+            "must use NOT EXISTS anti-join: {sql}"
+        );
+        assert!(
+            !sql.contains("FULL JOIN"),
+            "must not use a non-NULL-safe FULL JOIN: {sql}"
+        );
+        assert!(
+            sql.contains("IS NOT DISTINCT FROM"),
+            "non-float cols matched NULL-safe: {sql}"
+        );
     }
 }

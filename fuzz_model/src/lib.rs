@@ -3,7 +3,7 @@
 //! descriptors only — no SPI, no pgrx runtime dependency.
 
 pub mod axes;
-pub mod model;
-pub mod render;
 pub mod generate;
+pub mod model;
 pub mod oracle_pure;
+pub mod render;

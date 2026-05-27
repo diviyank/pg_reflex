@@ -12,14 +12,19 @@ pub fn create_table_sql(t: &Table) -> String {
             } else {
                 "not null".to_string()
             };
-            format!("{} {} {}", c.name, c.ty.sql(), null).trim().to_string()
+            format!("{} {} {}", c.name, c.ty.sql(), null)
+                .trim()
+                .to_string()
         })
         .collect();
     format!("CREATE TABLE {} ({})", t.name, cols.join(", "))
 }
 
 pub fn create_mv_sql(mv_name: &str, body: &SelectBody) -> String {
-    format!("CREATE MATERIALIZED VIEW {} AS {}", mv_name, body.rendered_sql)
+    format!(
+        "CREATE MATERIALIZED VIEW {} AS {}",
+        mv_name, body.rendered_sql
+    )
 }
 
 #[allow(dead_code)] // the oracle inlines REFRESH inside its plpgsql function; kept for parity
@@ -31,14 +36,22 @@ pub fn dml_sql(stmt: &DmlStmt, columns_of: &dyn Fn(&str) -> Vec<String>) -> Stri
     match stmt {
         DmlStmt::Insert { table, rows } => {
             let cols = columns_of(table).join(", ");
-            let values: Vec<String> =
-                rows.iter().map(|r| format!("({})", r.join(", "))).collect();
-            format!("INSERT INTO {} ({}) VALUES {}", table, cols, values.join(", "))
+            let values: Vec<String> = rows.iter().map(|r| format!("({})", r.join(", "))).collect();
+            format!(
+                "INSERT INTO {} ({}) VALUES {}",
+                table,
+                cols,
+                values.join(", ")
+            )
         }
         DmlStmt::Delete { table, where_sql } => {
             format!("DELETE FROM {} WHERE {}", table, where_sql)
         }
-        DmlStmt::Update { table, set_sql, where_sql } => {
+        DmlStmt::Update {
+            table,
+            set_sql,
+            where_sql,
+        } => {
             format!("UPDATE {} SET {} WHERE {}", table, set_sql, where_sql)
         }
         DmlStmt::Truncate { table } => format!("TRUNCATE {}", table),
@@ -55,8 +68,16 @@ mod tests {
             name: "t0".into(),
             pk: "id".into(),
             columns: vec![
-                Column { name: "id".into(), ty: ColType::Int, nullable: false },
-                Column { name: "v".into(), ty: ColType::Numeric, nullable: true },
+                Column {
+                    name: "id".into(),
+                    ty: ColType::Int,
+                    nullable: false,
+                },
+                Column {
+                    name: "v".into(),
+                    ty: ColType::Numeric,
+                    nullable: true,
+                },
             ],
         };
         let sql = create_table_sql(&t);
@@ -70,6 +91,9 @@ mod tests {
             rows: vec![vec!["1".into(), "2.5".into()]],
         };
         let cols = |_t: &str| vec!["id".to_string(), "v".to_string()];
-        assert_eq!(dml_sql(&stmt, &cols), "INSERT INTO t0 (id, v) VALUES (1, 2.5)");
+        assert_eq!(
+            dml_sql(&stmt, &cols),
+            "INSERT INTO t0 (id, v) VALUES (1, 2.5)"
+        );
     }
 }

@@ -1002,7 +1002,7 @@ fn cte_decomposed_case_with(a: Table, b: Table, agg_fn: AggFn) -> FuzzCase {
     // - For Sum/Avg/Min/Max: use the aggregation function on the measure column
     // - For Count: use COUNT(*)
     let main_select_agg = if matches!(agg_fn, AggFn::Count) {
-        format!("COUNT(*)").into()
+        "COUNT(*)".to_string()
     } else {
         format!("{}({}.m)", main_agg, a.name)
     };

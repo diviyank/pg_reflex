@@ -39,7 +39,7 @@ pub struct Column {
 #[derive(Debug, Clone)]
 pub struct Table {
     pub name: String,
-    pub pk: String,        // single-column integer PK name
+    pub pk: String,           // single-column integer PK name
     pub columns: Vec<Column>, // includes the pk column
 }
 
@@ -70,11 +70,24 @@ pub struct DmlTxn {
 
 #[derive(Debug, Clone)]
 pub enum DmlStmt {
-    Insert { table: String, rows: Vec<Vec<String>> }, // pre-rendered SQL literals per column
-    Delete { table: String, where_sql: String },
-    Update { table: String, set_sql: String, where_sql: String },
-    #[allow(dead_code)] // rendered + parked; mutation generator does not yet emit TRUNCATE (see Task 13 follow-up)
-    Truncate { table: String },
+    Insert {
+        table: String,
+        rows: Vec<Vec<String>>,
+    }, // pre-rendered SQL literals per column
+    Delete {
+        table: String,
+        where_sql: String,
+    },
+    Update {
+        table: String,
+        set_sql: String,
+        where_sql: String,
+    },
+    #[allow(dead_code)]
+    // rendered + parked; mutation generator does not yet emit TRUNCATE (see Task 13 follow-up)
+    Truncate {
+        table: String,
+    },
 }
 
 #[cfg(test)]

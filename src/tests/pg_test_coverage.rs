@@ -4303,7 +4303,7 @@ fn cov_sanitize_long_expression() {
     assert_eq!(s, 20);
 }
 
-/// Window function — pg_test_window already covers most window paths;
+// Window function — pg_test_window already covers most window paths;
 //             create_reflex_ivm_if_not_exists, no-group full refresh ----
 
 /// Top-K MIN with an explicit topk arg — exercises the top-K MIN/MAX
@@ -4545,8 +4545,7 @@ fn cov_multiple_sums_different_args() {
     // AVG(a) where a in {1,2} → 1.5
     assert!(
         aa_x.to_string().starts_with("1.5"),
-        "avg should be ~1.5, got: {}",
-        aa_x.to_string()
+        "avg should be ~1.5, got: {aa_x}"
     );
 }
 

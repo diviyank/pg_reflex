@@ -186,7 +186,14 @@ fn all_refresh() -> Vec<RefreshMode> {
 
 fn all_agg() -> Vec<Option<AggFn>> {
     use AggFn::*;
-    vec![None, Some(Sum), Some(Count), Some(Min), Some(Max), Some(Avg)]
+    vec![
+        None,
+        Some(Sum),
+        Some(Count),
+        Some(Min),
+        Some(Max),
+        Some(Avg),
+    ]
 }
 
 fn all_ty() -> Vec<ColType> {
@@ -246,10 +253,13 @@ fn field_values(a: &Axes) -> [(u8, u32); 7] {
         (0, a.source as u32),
         (1, a.shape as u32),
         (2, a.refresh as u32),
-        (3, match a.agg {
-            None => 0,
-            Some(f) => 1 + f as u32,
-        }),
+        (
+            3,
+            match a.agg {
+                None => 0,
+                Some(f) => 1 + f as u32,
+            },
+        ),
         (4, a.measure_ty as u32),
         (5, a.unique as u32),
         (6, a.lifecycle as u32),
@@ -497,15 +507,28 @@ mod tests {
 
     #[test]
     fn planned_case_marks_matview_source_for_refresh_path() {
-        let a = axes(SourceKind::MatView, QueryShape::SingleAggregate, RefreshMode::Immediate, Some(AggFn::Sum));
+        let a = axes(
+            SourceKind::MatView,
+            QueryShape::SingleAggregate,
+            RefreshMode::Immediate,
+            Some(AggFn::Sum),
+        );
         let pc = plan_case(&a, 7).unwrap();
         assert!(pc.source_is_refresh_driven);
-        assert!(pc.source_objects.iter().any(|o| matches!(o.kind, SourceObjectKind::MatView)));
+        assert!(pc
+            .source_objects
+            .iter()
+            .any(|o| matches!(o.kind, SourceObjectKind::MatView)));
     }
 
     #[test]
     fn planned_case_seq_makes_names_unique() {
-        let a = axes(SourceKind::Table, QueryShape::Passthrough, RefreshMode::Immediate, None);
+        let a = axes(
+            SourceKind::Table,
+            QueryShape::Passthrough,
+            RefreshMode::Immediate,
+            None,
+        );
         let p0 = plan_case(&a, 0).unwrap();
         let p1 = plan_case(&a, 1).unwrap();
         assert_ne!(p0.case.tables[0].name, p1.case.tables[0].name);

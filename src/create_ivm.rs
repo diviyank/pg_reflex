@@ -729,7 +729,8 @@ with kind: mv.",
         // A sibling CTE literally named "a__cte_b" would collide with nested CTE "b" inside "a",
         // but this is a pathological edge case requiring an adversarial alias — accepted risk.
         let cte_view_name = safe_identifier(&format!("{}__cte_{}", ctx.view_name, cte.alias));
-        let cte_key = ctx.cte_unique_columns
+        let cte_key = ctx
+            .cte_unique_columns
             .get(&alias_lower)
             .map(|s| s.as_str())
             .unwrap_or("");
