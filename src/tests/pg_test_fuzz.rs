@@ -5,124 +5,18 @@
 // SPI-free model now lives in the pgrx-free `fuzz_model` crate; re-export under
 // the historical local paths so the SPI oracle + #[pg_test]s read unchanged.
 pub use fuzz_model::model;
-pub use fuzz_model::render;
 pub use fuzz_model::generate;
 
 #[cfg(any(test, feature = "pg_test"))]
 pub mod oracle {
-    use super::model::*;
-    use super::render;
+    use fuzz_model::model::*;
+    use fuzz_model::oracle_pure::{
+        cols_of, diff_subquery, rename_case, CASE_SEQ,
+    };
+    pub use fuzz_model::oracle_pure::{repro_sql, Outcome, float_diff_from_where};
+    use fuzz_model::render;
     use pgrx::prelude::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    static CASE_SEQ: AtomicU64 = AtomicU64::new(0);
-
-    #[derive(Debug)]
-    pub enum Outcome {
-        Match,
-        #[allow(dead_code)]
-        Skip(String),
-        Bug(String),
-    }
-
-    fn cols_of(case: &FuzzCase, table: &str) -> Vec<String> {
-        case.tables
-            .iter()
-            .find(|t| t.name == table)
-            .map(|t| t.columns.iter().map(|c| c.name.clone()).collect())
-            .unwrap_or_default()
-    }
-
-    fn diff_subquery(mv: &str, imv: &str) -> String {
-        format!(
-            "( (SELECT * FROM {mv} EXCEPT SELECT * FROM {imv}) UNION ALL \
-             (SELECT * FROM {imv} EXCEPT SELECT * FROM {mv}) ) d"
-        )
-    }
-
-    /// Build the FROM clause that returns rows differing between mv and imv,
-    /// exact for non-float columns and within a relative epsilon for float columns.
-    /// Used when the case has any float output column.
-    ///
-    /// A row counts as differing when it has no counterpart on the other side that
-    /// agrees on every non-float column (`IS NOT DISTINCT FROM`, so NULL keys and
-    /// NULL groups match) and is within 1e-9 relative on every float column. This
-    /// uses correlated `NOT EXISTS` rather than a `FULL JOIN ... ON a.k = b.k`
-    /// precisely because `=` is not NULL-safe: a NULL group key never satisfies it,
-    /// so the old FULL-JOIN form reported the (correct) NULL group as two phantom
-    /// unmatched rows.
-    ///
-    /// The 1e-9 relative tolerance absorbs the float8 round-off between the IMV's
-    /// incremental accumulation (running SUM/AVG via deltas) and the MV's full
-    /// re-aggregation — orders of magnitude below any genuine divergence, which shows
-    /// up as a wrong row count or a value off by a real term, not a last-ULP wobble.
-    pub fn float_diff_from_where(mv: &str, imv: &str, _keys: &[String], cols: &[Column]) -> String {
-        let match_pred = |aa: &str, bb: &str| -> String {
-            cols.iter()
-                .map(|c| {
-                    let n = &c.name;
-                    if c.ty.is_float() {
-                        format!(
-                            "(({aa}.\"{n}\" IS NULL AND {bb}.\"{n}\" IS NULL) OR \
-                              ({aa}.\"{n}\" IS NOT NULL AND {bb}.\"{n}\" IS NOT NULL AND \
-                               abs({aa}.\"{n}\" - {bb}.\"{n}\") <= 1e-9 * \
-                               GREATEST(abs({aa}.\"{n}\"), abs({bb}.\"{n}\"), 1)))"
-                        )
-                    } else {
-                        format!("{aa}.\"{n}\" IS NOT DISTINCT FROM {bb}.\"{n}\"")
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join(" AND ")
-        };
-        let col_list = cols
-            .iter()
-            .map(|c| format!("\"{}\"", c.name))
-            .collect::<Vec<_>>()
-            .join(", ");
-        format!(
-            "( SELECT {cl} FROM {mv} a WHERE NOT EXISTS (SELECT 1 FROM {imv} b WHERE {mab}) \
-              UNION ALL \
-              SELECT {cl} FROM {imv} b WHERE NOT EXISTS (SELECT 1 FROM {mv} a WHERE {mba}) ) d",
-            cl = col_list,
-            mv = mv,
-            imv = imv,
-            mab = match_pred("a", "b"),
-            mba = match_pred("b", "a"),
-        )
-    }
-
-    fn rename_case(case: &FuzzCase, suffix: &str) -> FuzzCase {
-        let mut c = case.clone();
-        // longest names first to avoid prefix corruption
-        let mut names: Vec<String> = case.tables.iter().map(|t| t.name.clone()).collect();
-        names.sort_by_key(|n| std::cmp::Reverse(n.len()));
-        for old in names {
-            let new = format!("{old}{suffix}");
-            for t in &mut c.tables {
-                if t.name == old {
-                    t.name = new.clone();
-                }
-            }
-            c.select_body.rendered_sql =
-                c.select_body.rendered_sql.replace(&old, &new);
-            for txn in &mut c.dml {
-                for stmt in &mut txn.statements {
-                    match stmt {
-                        DmlStmt::Insert { table, .. }
-                        | DmlStmt::Delete { table, .. }
-                        | DmlStmt::Update { table, .. }
-                        | DmlStmt::Truncate { table } => {
-                            if *table == old {
-                                *table = new.clone();
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        c
-    }
+    use std::sync::atomic::Ordering;
 
     pub fn evaluate(case: &FuzzCase) -> Outcome {
         let seq = CASE_SEQ.fetch_add(1, Ordering::Relaxed);
@@ -171,7 +65,7 @@ pub mod oracle {
         // Use float-tolerant comparison if the case has any float output columns.
         let has_float = case.output_columns.iter().any(|c| c.ty.is_float());
         let diff_from = if has_float {
-            float_diff_from_where(&mv, &imv, &case.unique_columns, &case.output_columns)
+            fuzz_model::oracle_pure::float_diff_from_where(&mv, &imv, &case.unique_columns, &case.output_columns)
         } else {
             diff_subquery(&mv, &imv)
         };
@@ -259,53 +153,6 @@ $func$ LANGUAGE plpgsql;
         // side effects. We rely on the outer transaction rollback for cleanup.
 
         outcome
-    }
-
-    pub fn repro_sql(case: &FuzzCase) -> String {
-        let mut out = String::new();
-        for t in &case.tables {
-            out.push_str(&render::create_table_sql(t));
-            out.push_str(";\n");
-        }
-        for txn in &case.dml {
-            for stmt in &txn.statements {
-                let cols = cols_of(case, match stmt {
-                    DmlStmt::Insert { table, .. }
-                    | DmlStmt::Delete { table, .. }
-                    | DmlStmt::Update { table, .. }
-                    | DmlStmt::Truncate { table } => table,
-                });
-                out.push_str(&render::dml_sql(stmt, &|_t: &str| cols.clone()));
-                out.push_str(";\n");
-            }
-        }
-        out.push_str(&format!(
-            "SELECT create_reflex_ivm('imv_repro', $body${}$body$, '{}');\n",
-            case.select_body.rendered_sql,
-            case.unique_columns.join(",")
-        ));
-        out
-    }
-}
-
-#[cfg(test)]
-mod oracle_unit_tests {
-    use super::model::{Column, ColType};
-    use super::oracle::float_diff_from_where;
-
-    #[test]
-    fn float_compare_uses_relative_epsilon_and_null_safe_match() {
-        let cols = vec![
-            Column { name: "g".into(), ty: ColType::Int, nullable: false },
-            Column { name: "s".into(), ty: ColType::Float8, nullable: true },
-            Column { name: "t".into(), ty: ColType::Text, nullable: true },
-        ];
-        let sql = float_diff_from_where("v_mv", "v_imv", &["g".to_string()], &cols);
-        assert!(sql.contains("1e-9"), "must use relative epsilon: {sql}");
-        // NULL-safe correlated anti-join, not an equi FULL JOIN (finding #4).
-        assert!(sql.contains("NOT EXISTS"), "must use NOT EXISTS anti-join: {sql}");
-        assert!(!sql.contains("FULL JOIN"), "must not use a non-NULL-safe FULL JOIN: {sql}");
-        assert!(sql.contains("IS NOT DISTINCT FROM"), "non-float cols matched NULL-safe: {sql}");
     }
 }
 

@@ -5,3 +5,4 @@
 pub mod model;
 pub mod render;
 pub mod generate;
+pub mod oracle_pure;
