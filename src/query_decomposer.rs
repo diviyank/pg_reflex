@@ -78,10 +78,11 @@ pub fn transition_old_table_name(source_table: &str) -> String {
 /// `qualified_name` has a schema, `"local"` otherwise. The local part is run
 /// through `safe_identifier` so it always fits PG's 63-char NAMEDATALEN limit.
 /// Callers use the output directly in SQL without adding outer quotes.
+/// Routes through `canonical_source` to extract the schema unquoted from any form.
 fn qualify_in_same_schema(qualified_name: &str, local: String) -> String {
     let local = safe_identifier(&local);
-    match split_qualified_name(qualified_name).0 {
-        Some(s) => format!("\"{}\".\"{}\"", unquote_ident_component(s), local),
+    match canonical_source(qualified_name).0 {
+        Some(s) => format!("\"{}\".\"{}\"", s, local),
         None => format!("\"{}\"", local),
     }
 }
