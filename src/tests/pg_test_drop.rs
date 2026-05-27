@@ -375,19 +375,71 @@ fn drop_cte_subimv_source_leaves_no_orphans() {
     assert!(msg.starts_with("CREATE REFLEX") || msg.contains(crate::REFLEX_UNSUPPORTED_TAG),
         "create failed: {msg}");
 
-    // If the create succeeded (returned CREATE REFLEX), verify drop path
+    // If the create succeeded (returned CREATE REFLEX), verify drop path.
+    // Dropping the parent must also remove its synthetic CTE sub-IMV
+    // (`dq_imv__cte_agg`) — no separate manual drop is needed.
     if msg.starts_with("CREATE REFLEX") {
         let drop_msg = crate::drop_reflex_ivm("dq_imv");
         assert_eq!(drop_msg, "DROP REFLEX INCREMENTAL VIEW", "drop failed: {drop_msg}");
 
-        // Drop the sub-IMVs created by CTE decomposition
-        let sub_imv_result = crate::drop_reflex_ivm("dq_imv__cte_agg");
-        assert_eq!(sub_imv_result, "DROP REFLEX INCREMENTAL VIEW", "drop sub-IMV failed");
-
-        // No leftover reflex objects after dropping the full hierarchy.
+        // No leftover reflex objects after dropping the parent alone.
         let leftover = Spi::get_one::<i64>(
             "SELECT count(*) FROM pg_class WHERE relname LIKE '%dq_imv%' OR relname LIKE '%cte%dq%'"
         ).unwrap().unwrap();
         assert_eq!(leftover, 0, "orphan objects remain after drop");
+
+        let ref_left = Spi::get_one::<i64>(
+            "SELECT count(*) FROM public.__reflex_ivm_reference WHERE name LIKE 'dq_imv%'"
+        ).unwrap().unwrap();
+        assert_eq!(ref_left, 0, "reference rows remain after drop");
     }
+}
+
+/// Regression: a NON-cascade drop of a CTE-decomposed IMV must remove its
+/// internal synthetic sub-IMV (`<view>__cte_…`) and every backing object, with
+/// zero orphans. Before the fix, the sub-IMV was recorded only in the parent's
+/// `depends_on` (not `depends_on_imv`), so the cascade-gated cleanup never ran
+/// on a plain drop and left the sub-IMV's table/intermediate/scratch/indexes
+/// plus its reference row behind.
+#[pg_test]
+fn drop_decomposed_imv_noncascade_leaves_no_subimv_orphans() {
+    Spi::run("CREATE TABLE nd_a (id int primary key, g int, m numeric);").unwrap();
+    Spi::run("CREATE TABLE nd_b (id int primary key, fk int, w numeric);").unwrap();
+    let body = "WITH agg AS (SELECT fk AS g, SUM(w) AS sw FROM nd_b GROUP BY fk) \
+                SELECT nd_a.id, SUM(nd_a.m) AS s, a.sw FROM nd_a LEFT JOIN agg a ON a.g = nd_a.id GROUP BY nd_a.id, a.sw";
+    let create_msg = crate::create_reflex_ivm("nd_imv", body, Some("id"), None, None, None);
+    if !create_msg.starts_with("CREATE REFLEX") {
+        assert!(
+            create_msg.contains(crate::REFLEX_UNSUPPORTED_TAG),
+            "unexpected create failure: {create_msg}"
+        );
+        return;
+    }
+
+    // The CTE was decomposed into at least one synthetic sub-IMV.
+    let sub_imv_count = Spi::get_one::<i64>(
+        "SELECT count(*) FROM public.__reflex_ivm_reference \
+         WHERE name LIKE 'nd_imv%' AND name <> 'nd_imv'",
+    )
+    .unwrap()
+    .unwrap();
+    assert!(sub_imv_count >= 1, "expected a decomposition sub-IMV before drop");
+
+    // NON-cascade drop of the parent alone.
+    let drop_msg = crate::drop_reflex_ivm("nd_imv");
+    assert_eq!(drop_msg, "DROP REFLEX INCREMENTAL VIEW", "drop failed: {drop_msg}");
+
+    let ref_left = Spi::get_one::<i64>(
+        "SELECT count(*) FROM public.__reflex_ivm_reference WHERE name LIKE 'nd_imv%'",
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(ref_left, 0, "reference rows remain after non-cascade drop");
+
+    let class_left = Spi::get_one::<i64>(
+        "SELECT count(*) FROM pg_class WHERE relname LIKE '%nd_imv%' AND relkind IN ('r', 'i')",
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(class_left, 0, "orphan tables/indexes remain after non-cascade drop");
 }

@@ -469,8 +469,15 @@ $func$ LANGUAGE plpgsql;
         // Construct the DO block as a string.
         let keys = case.unique_columns.join(",");
 
-        // Always use cascade=true in test cleanup to handle union branch sub-IMVs
-        let cascade_arg = ", true";
+        // Honor the Lifecycle axis for the drop step. CascadeDrop exercises the
+        // cascade path; CreateMutateDrop/Partitioned exercise a plain drop, which
+        // must still clean a decomposed view's internal sub-IMVs on its own.
+        let cascade_arg = match pc.axes.lifecycle {
+            fuzz_model::axes::Lifecycle::CascadeDrop => ", true",
+            fuzz_model::axes::Lifecycle::CreateMutateDrop | fuzz_model::axes::Lifecycle::Partitioned => {
+                ""
+            }
+        };
 
         // Build a PL/pgSQL function that encodes the result as JSON for transport across SPI.
         let func_name = format!("oracle_planned_func_{}", seq);
@@ -511,13 +518,13 @@ BEGIN
       ELSE
         SELECT count(*)::bigint INTO v_orphans
         FROM pg_class
-        WHERE relname LIKE '%{{}}_%%'
+        WHERE relname LIKE '%{1}%'
               AND relkind IN ('r', 'i');
         IF v_orphans > 0 THEN
           v_status := 'BUG';
           v_detail := v_orphans || ' orphan objects after drop: ' ||
                       (SELECT string_agg(relname, ', ') FROM pg_class
-                       WHERE relname LIKE '%{{}}_%%' AND relkind IN ('r', 'i'));
+                       WHERE relname LIKE '%{1}%' AND relkind IN ('r', 'i'));
         END IF;
       END IF;
     END IF;

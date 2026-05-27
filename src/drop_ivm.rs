@@ -3,13 +3,19 @@ use pgrx::pg_sys::panic::ErrorReportable;
 use pgrx::prelude::*;
 
 use crate::query_decomposer::{
-    affected_groups_table_name, delta_scratch_table_name, intermediate_table_name,
-    passthrough_scratch_new_table_name, passthrough_scratch_old_table_name, quote_identifier,
-    shrunk_groups_table_name, split_qualified_name,
+    affected_groups_table_name, canonical_source, delta_scratch_table_name,
+    intermediate_table_name, passthrough_scratch_new_table_name,
+    passthrough_scratch_old_table_name, quote_identifier, shrunk_groups_table_name,
+    split_qualified_name,
 };
 
 pub(crate) fn drop_reflex_ivm_impl(view_name: &str, cascade: bool) -> &'static str {
-    Spi::connect_mut(|client| {
+    // The closure tears down the view's own objects and reports the synthetic
+    // sub-IMVs (recorded as quoted `<view>__…` sources in `depends_on`) that must
+    // be dropped afterwards. Those sub-IMVs are dropped as fresh top-level calls
+    // below rather than via a nested `Spi::connect_mut`, whose teardown does not
+    // persist.
+    let (status, sub_imvs_to_drop): (&'static str, Vec<String>) = Spi::connect_mut(|client| {
         // 1. Check if view exists
         let exists = client
             .select(
@@ -25,7 +31,7 @@ pub(crate) fn drop_reflex_ivm_impl(view_name: &str, cascade: bool) -> &'static s
 
         if exists.is_empty() {
             warning!("pg_reflex: drop failed — IMV '{}' not found", view_name);
-            return "ERROR: IMV not found";
+            return ("ERROR: IMV not found", Vec::new());
         }
 
         let row = &exists[0];
@@ -44,7 +50,10 @@ pub(crate) fn drop_reflex_ivm_impl(view_name: &str, cascade: bool) -> &'static s
 
         // 2. Check children
         if !children.is_empty() && !cascade {
-            return "ERROR: IMV has children. Use drop_reflex_ivm(name, true) to cascade.";
+            return (
+                "ERROR: IMV has children. Use drop_reflex_ivm(name, true) to cascade.",
+                Vec::new(),
+            );
         }
 
         // 3. Cascade: drop children first
@@ -52,57 +61,7 @@ pub(crate) fn drop_reflex_ivm_impl(view_name: &str, cascade: bool) -> &'static s
             for child in &children {
                 let result = drop_reflex_ivm_impl(child, true);
                 if result.starts_with("ERROR") {
-                    return result;
-                }
-            }
-        }
-
-        // 3b. For decomposed views (SetOpUnionAll, CteDecomposed, DistinctOn), also drop
-        // the sub-IMVs listed in depends_on_imv. These are synthetic IMVs created exclusively
-        // for this decomposed view. When the parent is dropped with cascade=true, these
-        // sub-IMVs should also be dropped (they serve no purpose without the parent).
-        if cascade && !depends_on_imv.is_empty() {
-            for sub_imv in &depends_on_imv {
-                // First, remove the parent from the sub-IMV's graph_child to break the circular
-                // dependency before we recursively drop the sub-IMV.
-                client
-                    .update(
-                        "UPDATE public.__reflex_ivm_reference \
-                         SET graph_child = array_remove(graph_child, $1) \
-                         WHERE name = $2",
-                        None,
-                        &[
-                            unsafe {
-                                DatumWithOid::new(
-                                    view_name.to_string(),
-                                    PgBuiltInOids::TEXTOID.oid().value(),
-                                )
-                            },
-                            unsafe {
-                                DatumWithOid::new(sub_imv.clone(), PgBuiltInOids::TEXTOID.oid().value())
-                            },
-                        ],
-                    )
-                    .unwrap_or_report();
-
-                // Check if this sub_imv is actually an IMV in the reference table
-                // (it should be, but check to be safe)
-                let sub_exists = client
-                    .select(
-                        "SELECT 1 FROM public.__reflex_ivm_reference WHERE name = $1",
-                        None,
-                        &[unsafe {
-                            DatumWithOid::new(sub_imv.clone(), PgBuiltInOids::TEXTOID.oid().value())
-                        }],
-                    )
-                    .unwrap_or_report()
-                    .is_empty() == false;
-
-                if sub_exists {
-                    let result = drop_reflex_ivm_impl(sub_imv, true);
-                    if result.starts_with("ERROR") {
-                        return result;
-                    }
+                    return (result, Vec::new());
                 }
             }
         }
@@ -212,7 +171,6 @@ pub(crate) fn drop_reflex_ivm_impl(view_name: &str, cascade: bool) -> &'static s
                 &[],
             )
             .unwrap_or_report();
-
 
         // 6b. Drop persistent affected-groups table (qualified in IMV's schema, 1.4.1).
         client
@@ -349,7 +307,63 @@ pub(crate) fn drop_reflex_ivm_impl(view_name: &str, cascade: bool) -> &'static s
             }
         }
 
+        // Collect this view's synthetic sub-IMVs. Decomposition (CTE / set-op /
+        // DISTINCT ON / window) records them as quoted sources in `depends_on`
+        // and names them deterministically `<view>__…` (`__cte_`, `__union_`,
+        // `__base`). An entry qualifies as a synthetic child only when it is
+        // both a registered IMV AND prefixed with `<view>__`; the prefix guard
+        // keeps a user-chained IMV that this view legitimately reads from out of
+        // the teardown set.
+        let (_, parent_bare) = canonical_source(view_name);
+        let child_prefix = format!("{parent_bare}__");
+        let mut sub_imvs_to_drop: Vec<String> = Vec::new();
+        for source in &depends_on {
+            if source.starts_with('<') {
+                continue;
+            }
+            let (child_schema, child_bare) = canonical_source(source);
+            if !child_bare.starts_with(&child_prefix) {
+                continue;
+            }
+            let candidate = match child_schema {
+                Some(s) => format!("{s}.{child_bare}"),
+                None => child_bare,
+            };
+            let is_registered_imv = !client
+                .select(
+                    "SELECT 1 FROM public.__reflex_ivm_reference WHERE name = $1",
+                    None,
+                    &[unsafe {
+                        DatumWithOid::new(candidate.clone(), PgBuiltInOids::TEXTOID.oid().value())
+                    }],
+                )
+                .unwrap_or_report()
+                .is_empty();
+            if is_registered_imv {
+                sub_imvs_to_drop.push(candidate);
+            }
+        }
+
         info!("pg_reflex: dropped IMV '{}'", view_name);
-        "DROP REFLEX INCREMENTAL VIEW"
-    })
+        ("DROP REFLEX INCREMENTAL VIEW", sub_imvs_to_drop)
+    });
+
+    if status.starts_with("ERROR") {
+        return status;
+    }
+
+    // Decomposed views (SetOpUnionAll, CteDecomposed, DistinctOn) own synthetic
+    // sub-IMVs that exist exclusively for this parent. The parent has just been
+    // unlinked from each sub-IMV's graph_child (step 7), so dropping them now —
+    // cascade or not — leaves them childless and fully removable. We drop them as
+    // top-level calls (each its own SPI connection) because a nested drop inside
+    // the closure above does not persist its teardown.
+    for sub_imv in &sub_imvs_to_drop {
+        let result = drop_reflex_ivm_impl(sub_imv, true);
+        if result.starts_with("ERROR") {
+            return result;
+        }
+    }
+
+    status
 }
