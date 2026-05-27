@@ -1,0 +1,9 @@
+[package]
+name = "fuzz_model"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "pgrx-free model, validity predicate and SQL generators for the pg_reflex differential fuzz harness"
+
+[dependencies]
+proptest = "1"
