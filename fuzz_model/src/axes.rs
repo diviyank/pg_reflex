@@ -158,12 +158,14 @@ pub fn is_valid(a: &Axes) -> bool {
 }
 
 fn all_source() -> Vec<SourceKind> {
-    vec![
-        SourceKind::Table,
-        SourceKind::View,
-        SourceKind::MatView,
-        SourceKind::CteSubImv,
-    ]
+    // Gate scope: Table sources only. pg_reflex's supported source for an IMV is a
+    // base table; View/MatView/CteSubImv as *sources* are out of scope for the
+    // in-backend differential gate (a view source is rejected by codegen, and the
+    // matview/sub-IMV source paths are not modeled end-to-end). The `SourceKind`
+    // enum and `is_valid` retain the full model so the axis can be re-enabled later
+    // without reshaping the design. Note: decomposed query SHAPES (CteDecomposed,
+    // SetOpUnionAll) still run over Table sources, so decomposition is still covered.
+    vec![SourceKind::Table]
 }
 
 fn all_shape() -> Vec<QueryShape> {

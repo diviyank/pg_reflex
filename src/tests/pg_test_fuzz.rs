@@ -161,18 +161,17 @@ $func$ LANGUAGE plpgsql;
     }
 
     fn evaluate_planned_inner(pc: &PlannedCase) -> Outcome {
-        // Skip non-Table sources: pg_reflex's codegen doesn't support View/MatView/SubImv
-        // sources. Views don't allow transition-table triggers. MatViews are REFRESH-driven
-        // and use a different maintenance model. CteSubImv sources are synthetic internal
-        // structures, not user-accessible tables. TODO: Task E2 follow-up for support.
-        for src_obj in &pc.source_objects {
-            if !matches!(src_obj.kind, fuzz_model::axes::SourceObjectKind::Table) {
-                return Outcome::Skip(format!(
-                    "non-Table source not yet supported: {:?}",
-                    src_obj.kind
-                ));
-            }
-        }
+        // The gate generates Table sources only (see fuzz_model::axes::all_source), so the
+        // only source objects here are base tables. A non-Table source would mean the gate
+        // scope was widened without wiring up the source-object creation path — fail loudly
+        // rather than silently skipping, so coverage gaps can never hide behind a green gate.
+        assert!(
+            pc.source_objects
+                .iter()
+                .all(|o| matches!(o.kind, fuzz_model::axes::SourceObjectKind::Table)),
+            "evaluate_planned reached a non-Table source, which is out of the gate's scope; \
+             wire up source-object creation before widening all_source()"
+        );
 
         let seq = CASE_SEQ.fetch_add(1, Ordering::Relaxed);
         let suffix = format!("_pfz{seq}");
