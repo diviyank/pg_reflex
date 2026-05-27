@@ -914,6 +914,33 @@ fn fuzz_differential_exact() {
     }
 }
 
+/// Random axes-driven differential proptest. Samples valid axis assignments and
+/// runs each through the planned oracle. Complements the deterministic all-pairs
+/// gate by reaching higher-order interactions; case count is env-driven
+/// (`PG_REFLEX_FUZZ_CASES`).
+#[cfg(any(test, feature = "pg_test"))]
+#[pg_test]
+fn fuzz_planned_random() {
+    use proptest::strategy::{Strategy, ValueTree};
+    use proptest::test_runner::TestRunner;
+    let mut runner = TestRunner::default();
+    let n = fuzz_case_count();
+    for i in 0..n {
+        let a = fuzz_model::generate::axes_strategy()
+            .new_tree(&mut runner)
+            .unwrap()
+            .current();
+        if let Some(pc) = fuzz_model::axes::plan_case(&a, 300_000 + i as u64) {
+            if let oracle::Outcome::Bug(d) = oracle::evaluate_planned(&pc) {
+                panic!(
+                    "random axes {a:?} => BUG: {d}\n--- minimal repro ---\n{}",
+                    fuzz_model::oracle_pure::repro_sql(&pc.case)
+                );
+            }
+        }
+    }
+}
+
 /// Bug 1: COALESCE over a joined GROUP BY key. Either it builds and matches
 /// the MV, or pg_reflex deliberately rejects it (tagged). It must NOT raise
 /// a Postgres exception (the old failure: column "sx" does not exist).

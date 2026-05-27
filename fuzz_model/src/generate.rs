@@ -1,6 +1,8 @@
+use crate::axes::{
+    AggFn, Axes, PlannedCase, QueryShape, RefreshMode, SourceKind, SourceObject, SourceObjectKind,
+    UniqueCols,
+};
 use crate::model::*;
-use crate::axes::{Axes, AggFn, PlannedCase, QueryShape, RefreshMode,
-                  SourceKind, SourceObject, SourceObjectKind, UniqueCols};
 use proptest::prelude::*;
 
 /// Exact-only column types for the CI gate (Task 10 adds Float8).
@@ -23,11 +25,31 @@ fn single_table() -> impl Strategy<Value = Table> {
         name: "t0".into(),
         pk: "id".into(),
         columns: vec![
-            Column { name: "id".into(), ty: ColType::Int, nullable: false },
-            Column { name: "m".into(), ty: ColType::Numeric, nullable: true },
-            Column { name: "d".into(), ty: ColType::Text, nullable: true },
-            Column { name: "f".into(), ty: ColType::Float8, nullable: true },
-            Column { name: "x".into(), ty: extra_ty, nullable: true },
+            Column {
+                name: "id".into(),
+                ty: ColType::Int,
+                nullable: false,
+            },
+            Column {
+                name: "m".into(),
+                ty: ColType::Numeric,
+                nullable: true,
+            },
+            Column {
+                name: "d".into(),
+                ty: ColType::Text,
+                nullable: true,
+            },
+            Column {
+                name: "f".into(),
+                ty: ColType::Float8,
+                nullable: true,
+            },
+            Column {
+                name: "x".into(),
+                ty: extra_ty,
+                nullable: true,
+            },
         ],
     })
 }
@@ -38,10 +60,19 @@ pub fn literal(ty: ColType, n: i64) -> String {
     match ty {
         ColType::Int | ColType::BigInt => format!("{}", n % 5),
         ColType::Numeric | ColType::Float8 => format!("{}.{}", n % 5, n % 3),
-        ColType::Bool => if n % 2 == 0 { "true".into() } else { "false".into() },
+        ColType::Bool => {
+            if n % 2 == 0 {
+                "true".into()
+            } else {
+                "false".into()
+            }
+        }
         ColType::Text => format!("'g{}'", n % 4),
         ColType::Date => format!("date '2024-01-{:02}'", (n % 27) + 1),
-        ColType::Timestamptz => format!("timestamptz '2024-01-01 00:00:00+00' + ({} || ' seconds')::interval", n % 100),
+        ColType::Timestamptz => format!(
+            "timestamptz '2024-01-01 00:00:00+00' + ({} || ' seconds')::interval",
+            n % 100
+        ),
     }
 }
 
@@ -164,17 +195,44 @@ fn filter_predicate(choice: usize) -> String {
 /// Passthrough: SELECT id, m, d, f FROM t0; unique key = id.
 fn passthrough_case(t: Table) -> FuzzCase {
     let body = SelectBody {
-        rendered_sql: format!("SELECT {pk}, m, d, f, x FROM {tbl}", pk = t.pk, tbl = t.name),
+        rendered_sql: format!(
+            "SELECT {pk}, m, d, f, x FROM {tbl}",
+            pk = t.pk,
+            tbl = t.name
+        ),
     };
     let output_columns = vec![
-        Column { name: t.pk.clone(), ty: ColType::Int, nullable: false },
-        Column { name: "m".into(), ty: ColType::Numeric, nullable: true },
-        Column { name: "d".into(), ty: ColType::Text, nullable: true },
-        Column { name: "f".into(), ty: ColType::Float8, nullable: true },
-        Column { name: "x".into(), ty: t.columns[4].ty, nullable: true },
+        Column {
+            name: t.pk.clone(),
+            ty: ColType::Int,
+            nullable: false,
+        },
+        Column {
+            name: "m".into(),
+            ty: ColType::Numeric,
+            nullable: true,
+        },
+        Column {
+            name: "d".into(),
+            ty: ColType::Text,
+            nullable: true,
+        },
+        Column {
+            name: "f".into(),
+            ty: ColType::Float8,
+            nullable: true,
+        },
+        Column {
+            name: "x".into(),
+            ty: t.columns[4].ty,
+            nullable: true,
+        },
     ];
     let seed = DmlTxn {
-        statements: vec![DmlStmt::Insert { table: t.name.clone(), rows: seed_rows(&t, 8) }],
+        statements: vec![DmlStmt::Insert {
+            table: t.name.clone(),
+            rows: seed_rows(&t, 8),
+        }],
     };
     FuzzCase {
         tables: vec![t.clone()],
@@ -190,15 +248,34 @@ fn passthrough_case(t: Table) -> FuzzCase {
 fn passthrough_filtered_case(t: Table, filter_choice: usize) -> FuzzCase {
     let filter = filter_predicate(filter_choice);
     let body = SelectBody {
-        rendered_sql: format!("SELECT {pk}, m, d FROM {tbl} WHERE {filter}", pk = t.pk, tbl = t.name),
+        rendered_sql: format!(
+            "SELECT {pk}, m, d FROM {tbl} WHERE {filter}",
+            pk = t.pk,
+            tbl = t.name
+        ),
     };
     let output_columns = vec![
-        Column { name: t.pk.clone(), ty: ColType::Int, nullable: false },
-        Column { name: "m".into(), ty: ColType::Numeric, nullable: true },
-        Column { name: "d".into(), ty: ColType::Text, nullable: true },
+        Column {
+            name: t.pk.clone(),
+            ty: ColType::Int,
+            nullable: false,
+        },
+        Column {
+            name: "m".into(),
+            ty: ColType::Numeric,
+            nullable: true,
+        },
+        Column {
+            name: "d".into(),
+            ty: ColType::Text,
+            nullable: true,
+        },
     ];
     let seed = DmlTxn {
-        statements: vec![DmlStmt::Insert { table: t.name.clone(), rows: seed_rows(&t, 8) }],
+        statements: vec![DmlStmt::Insert {
+            table: t.name.clone(),
+            rows: seed_rows(&t, 8),
+        }],
     };
     FuzzCase {
         tables: vec![t.clone()],
@@ -219,12 +296,27 @@ fn aggregate_case(t: Table) -> FuzzCase {
         ),
     };
     let output_columns = vec![
-        Column { name: "d".into(), ty: ColType::Text, nullable: true },
-        Column { name: "s".into(), ty: ColType::Numeric, nullable: true },
-        Column { name: "c".into(), ty: ColType::BigInt, nullable: false },
+        Column {
+            name: "d".into(),
+            ty: ColType::Text,
+            nullable: true,
+        },
+        Column {
+            name: "s".into(),
+            ty: ColType::Numeric,
+            nullable: true,
+        },
+        Column {
+            name: "c".into(),
+            ty: ColType::BigInt,
+            nullable: false,
+        },
     ];
     let seed = DmlTxn {
-        statements: vec![DmlStmt::Insert { table: t.name.clone(), rows: seed_rows(&t, 8) }],
+        statements: vec![DmlStmt::Insert {
+            table: t.name.clone(),
+            rows: seed_rows(&t, 8),
+        }],
     };
     FuzzCase {
         tables: vec![t.clone()],
@@ -246,12 +338,27 @@ fn aggregate_filtered_case(t: Table, filter_choice: usize) -> FuzzCase {
         ),
     };
     let output_columns = vec![
-        Column { name: "d".into(), ty: ColType::Text, nullable: true },
-        Column { name: "s".into(), ty: ColType::Numeric, nullable: true },
-        Column { name: "c".into(), ty: ColType::BigInt, nullable: false },
+        Column {
+            name: "d".into(),
+            ty: ColType::Text,
+            nullable: true,
+        },
+        Column {
+            name: "s".into(),
+            ty: ColType::Numeric,
+            nullable: true,
+        },
+        Column {
+            name: "c".into(),
+            ty: ColType::BigInt,
+            nullable: false,
+        },
     ];
     let seed = DmlTxn {
-        statements: vec![DmlStmt::Insert { table: t.name.clone(), rows: seed_rows(&t, 8) }],
+        statements: vec![DmlStmt::Insert {
+            table: t.name.clone(),
+            rows: seed_rows(&t, 8),
+        }],
     };
     FuzzCase {
         tables: vec![t.clone()],
@@ -272,14 +379,37 @@ fn aggregate_float_case(t: Table) -> FuzzCase {
         ),
     };
     let output_columns = vec![
-        Column { name: "d".into(), ty: ColType::Text, nullable: true },
-        Column { name: "s".into(), ty: ColType::Numeric, nullable: true },
-        Column { name: "c".into(), ty: ColType::BigInt, nullable: false },
-        Column { name: "avg_m".into(), ty: ColType::Float8, nullable: true },
-        Column { name: "sf".into(), ty: ColType::Float8, nullable: true },
+        Column {
+            name: "d".into(),
+            ty: ColType::Text,
+            nullable: true,
+        },
+        Column {
+            name: "s".into(),
+            ty: ColType::Numeric,
+            nullable: true,
+        },
+        Column {
+            name: "c".into(),
+            ty: ColType::BigInt,
+            nullable: false,
+        },
+        Column {
+            name: "avg_m".into(),
+            ty: ColType::Float8,
+            nullable: true,
+        },
+        Column {
+            name: "sf".into(),
+            ty: ColType::Float8,
+            nullable: true,
+        },
     ];
     let seed = DmlTxn {
-        statements: vec![DmlStmt::Insert { table: t.name.clone(), rows: seed_rows(&t, 8) }],
+        statements: vec![DmlStmt::Insert {
+            table: t.name.clone(),
+            rows: seed_rows(&t, 8),
+        }],
     };
     FuzzCase {
         tables: vec![t.clone()],
@@ -301,14 +431,37 @@ fn aggregate_float_filtered_case(t: Table, filter_choice: usize) -> FuzzCase {
         ),
     };
     let output_columns = vec![
-        Column { name: "d".into(), ty: ColType::Text, nullable: true },
-        Column { name: "s".into(), ty: ColType::Numeric, nullable: true },
-        Column { name: "c".into(), ty: ColType::BigInt, nullable: false },
-        Column { name: "avg_m".into(), ty: ColType::Float8, nullable: true },
-        Column { name: "sf".into(), ty: ColType::Float8, nullable: true },
+        Column {
+            name: "d".into(),
+            ty: ColType::Text,
+            nullable: true,
+        },
+        Column {
+            name: "s".into(),
+            ty: ColType::Numeric,
+            nullable: true,
+        },
+        Column {
+            name: "c".into(),
+            ty: ColType::BigInt,
+            nullable: false,
+        },
+        Column {
+            name: "avg_m".into(),
+            ty: ColType::Float8,
+            nullable: true,
+        },
+        Column {
+            name: "sf".into(),
+            ty: ColType::Float8,
+            nullable: true,
+        },
     ];
     let seed = DmlTxn {
-        statements: vec![DmlStmt::Insert { table: t.name.clone(), rows: seed_rows(&t, 8) }],
+        statements: vec![DmlStmt::Insert {
+            table: t.name.clone(),
+            rows: seed_rows(&t, 8),
+        }],
     };
     FuzzCase {
         tables: vec![t.clone()],
@@ -327,18 +480,42 @@ fn two_tables() -> impl Strategy<Value = (Table, Table)> {
             name: "t0".into(),
             pk: "id".into(),
             columns: vec![
-                Column { name: "id".into(), ty: ColType::Int, nullable: false },
-                Column { name: "m".into(), ty: ColType::Numeric, nullable: true },
-                Column { name: "d".into(), ty: ColType::Text, nullable: true },
+                Column {
+                    name: "id".into(),
+                    ty: ColType::Int,
+                    nullable: false,
+                },
+                Column {
+                    name: "m".into(),
+                    ty: ColType::Numeric,
+                    nullable: true,
+                },
+                Column {
+                    name: "d".into(),
+                    ty: ColType::Text,
+                    nullable: true,
+                },
             ],
         },
         Table {
             name: "t1".into(),
             pk: "id".into(),
             columns: vec![
-                Column { name: "id".into(), ty: ColType::Int, nullable: false },
-                Column { name: "fk".into(), ty: ColType::Int, nullable: true },
-                Column { name: "w".into(), ty: ColType::Numeric, nullable: true },
+                Column {
+                    name: "id".into(),
+                    ty: ColType::Int,
+                    nullable: false,
+                },
+                Column {
+                    name: "fk".into(),
+                    ty: ColType::Int,
+                    nullable: true,
+                },
+                Column {
+                    name: "w".into(),
+                    ty: ColType::Numeric,
+                    nullable: true,
+                },
             ],
         },
     ))
@@ -347,8 +524,14 @@ fn two_tables() -> impl Strategy<Value = (Table, Table)> {
 fn seed_two(a: &Table, b: &Table) -> DmlTxn {
     DmlTxn {
         statements: vec![
-            DmlStmt::Insert { table: a.name.clone(), rows: seed_rows(a, 8) },
-            DmlStmt::Insert { table: b.name.clone(), rows: seed_rows(b, 8) },
+            DmlStmt::Insert {
+                table: a.name.clone(),
+                rows: seed_rows(a, 8),
+            },
+            DmlStmt::Insert {
+                table: b.name.clone(),
+                rows: seed_rows(b, 8),
+            },
         ],
     }
 }
@@ -361,9 +544,21 @@ fn join_aggregate_case(a: Table, b: Table) -> FuzzCase {
             "SELECT t0.d, SUM(t0.m) AS s, COUNT(t1.w) AS c FROM t0 LEFT JOIN t1 ON t1.fk = t0.id GROUP BY t0.d".into(),
     };
     let output_columns = vec![
-        Column { name: "d".into(), ty: ColType::Text, nullable: true },
-        Column { name: "s".into(), ty: ColType::Numeric, nullable: true },
-        Column { name: "c".into(), ty: ColType::BigInt, nullable: false },
+        Column {
+            name: "d".into(),
+            ty: ColType::Text,
+            nullable: true,
+        },
+        Column {
+            name: "s".into(),
+            ty: ColType::Numeric,
+            nullable: true,
+        },
+        Column {
+            name: "c".into(),
+            ty: ColType::BigInt,
+            nullable: false,
+        },
     ];
     FuzzCase {
         tables: vec![a.clone(), b.clone()],
@@ -382,19 +577,35 @@ fn carried_scalar_case(a: Table, b: Table, pick: usize) -> FuzzCase {
     let (carried_sql, carried_col) = match pick % 4 {
         0 => (
             "COALESCE(SUM(t0.m), 0) AS s0".to_string(),
-            Column { name: "s0".into(), ty: ColType::Numeric, nullable: true },
+            Column {
+                name: "s0".into(),
+                ty: ColType::Numeric,
+                nullable: true,
+            },
         ),
         1 => (
             "CASE WHEN COUNT(*) > 1 THEN 't' ELSE 'f' END AS lbl".to_string(),
-            Column { name: "lbl".into(), ty: ColType::Text, nullable: true },
+            Column {
+                name: "lbl".into(),
+                ty: ColType::Text,
+                nullable: true,
+            },
         ),
         2 => (
             "(t0.id)::text AS idt".to_string(),
-            Column { name: "idt".into(), ty: ColType::Text, nullable: true },
+            Column {
+                name: "idt".into(),
+                ty: ColType::Text,
+                nullable: true,
+            },
         ),
         _ => (
             "EXISTS(SELECT 1 FROM t1 c WHERE c.fk = t0.id AND c.w > 0) AS flag".to_string(),
-            Column { name: "flag".into(), ty: ColType::Bool, nullable: true },
+            Column {
+                name: "flag".into(),
+                ty: ColType::Bool,
+                nullable: true,
+            },
         ),
     };
     let body = SelectBody {
@@ -404,8 +615,16 @@ fn carried_scalar_case(a: Table, b: Table, pick: usize) -> FuzzCase {
         ),
     };
     let mut output_columns = vec![
-        Column { name: "id".into(), ty: ColType::Int, nullable: false },
-        Column { name: "s".into(), ty: ColType::Numeric, nullable: true },
+        Column {
+            name: "id".into(),
+            ty: ColType::Int,
+            nullable: false,
+        },
+        Column {
+            name: "s".into(),
+            ty: ColType::Numeric,
+            nullable: true,
+        },
     ];
     output_columns.push(carried_col);
     FuzzCase {
@@ -427,9 +646,21 @@ fn cte_decomposed_case(a: Table, b: Table) -> FuzzCase {
              SELECT t0.id, SUM(t0.m) AS s, a.sw FROM t0 LEFT JOIN agg a ON a.g = t0.id GROUP BY t0.id, a.sw".into(),
     };
     let output_columns = vec![
-        Column { name: "id".into(), ty: ColType::Int, nullable: false },
-        Column { name: "s".into(), ty: ColType::Numeric, nullable: true },
-        Column { name: "sw".into(), ty: ColType::Numeric, nullable: true },
+        Column {
+            name: "id".into(),
+            ty: ColType::Int,
+            nullable: false,
+        },
+        Column {
+            name: "s".into(),
+            ty: ColType::Numeric,
+            nullable: true,
+        },
+        Column {
+            name: "sw".into(),
+            ty: ColType::Numeric,
+            nullable: true,
+        },
     ];
     FuzzCase {
         tables: vec![a.clone(), b.clone()],
@@ -445,6 +676,15 @@ pub fn fuzz_case() -> impl Strategy<Value = FuzzCase> {
     prop_oneof![single_table_cases(), join_cases()]
 }
 
+/// Uniformly sample a valid axis assignment from the legal subspace. Backs the
+/// random axes-driven differential proptest (`fuzz_planned_random`), which
+/// complements the deterministic all-pairs gate by reaching higher-order
+/// (3+-way) interactions the pairwise matrix does not guarantee.
+pub fn axes_strategy() -> impl Strategy<Value = crate::axes::Axes> {
+    let space = crate::axes::valid_space();
+    (0..space.len()).prop_map(move |i| space[i])
+}
+
 /// Single-table shapes (passthrough / aggregate / aggregate-with-float, each
 /// unfiltered and filtered) under the multi-statement mutation, in both
 /// IMMEDIATE and DEFERRED maintenance modes.
@@ -457,12 +697,27 @@ fn single_table_cases() -> impl Strategy<Value = FuzzCase> {
         .prop_flat_map(|(t, mtx, filter_choice, defer)| {
             let mode = move |c: FuzzCase| if defer { deferred(c) } else { c };
             prop_oneof![
-                Just(mode(with_mutation(passthrough_case(t.clone()), mtx.clone()))),
+                Just(mode(with_mutation(
+                    passthrough_case(t.clone()),
+                    mtx.clone()
+                ))),
                 Just(mode(with_mutation(aggregate_case(t.clone()), mtx.clone()))),
-                Just(mode(with_mutation(aggregate_float_case(t.clone()), mtx.clone()))),
-                Just(mode(with_mutation(passthrough_filtered_case(t.clone(), filter_choice), mtx.clone()))),
-                Just(mode(with_mutation(aggregate_filtered_case(t.clone(), filter_choice), mtx.clone()))),
-                Just(mode(with_mutation(aggregate_float_filtered_case(t.clone(), filter_choice), mtx.clone()))),
+                Just(mode(with_mutation(
+                    aggregate_float_case(t.clone()),
+                    mtx.clone()
+                ))),
+                Just(mode(with_mutation(
+                    passthrough_filtered_case(t.clone(), filter_choice),
+                    mtx.clone()
+                ))),
+                Just(mode(with_mutation(
+                    aggregate_filtered_case(t.clone(), filter_choice),
+                    mtx.clone()
+                ))),
+                Just(mode(with_mutation(
+                    aggregate_float_filtered_case(t.clone(), filter_choice),
+                    mtx.clone()
+                ))),
             ]
         })
 }
@@ -489,11 +744,31 @@ fn det_table(seq: u64, idx: usize, measure_ty: ColType) -> Table {
         name,
         pk: "id".into(),
         columns: vec![
-            Column { name: "id".into(), ty: ColType::Int, nullable: false },
-            Column { name: "m".into(), ty: measure_ty, nullable: true },
-            Column { name: "d".into(), ty: ColType::Text, nullable: true },
-            Column { name: "f".into(), ty: ColType::Float8, nullable: true },
-            Column { name: "x".into(), ty: measure_ty, nullable: true },
+            Column {
+                name: "id".into(),
+                ty: ColType::Int,
+                nullable: false,
+            },
+            Column {
+                name: "m".into(),
+                ty: measure_ty,
+                nullable: true,
+            },
+            Column {
+                name: "d".into(),
+                ty: ColType::Text,
+                nullable: true,
+            },
+            Column {
+                name: "f".into(),
+                ty: ColType::Float8,
+                nullable: true,
+            },
+            Column {
+                name: "x".into(),
+                ty: measure_ty,
+                nullable: true,
+            },
         ],
     }
 }
@@ -517,14 +792,14 @@ fn agg_result_ty(agg_fn: AggFn, input_ty: ColType) -> ColType {
     match agg_fn {
         Count => ColType::BigInt, // COUNT always returns bigint
         Sum => match input_ty {
-            ColType::Int => ColType::BigInt,      // SUM(int) → bigint
+            ColType::Int => ColType::BigInt, // SUM(int) → bigint
             ColType::BigInt | ColType::Numeric => ColType::Numeric, // SUM(bigint|numeric) → numeric
-            ColType::Float8 => ColType::Float8,   // SUM(float8) → float8
-            other => other, // Defensive: SUM is only generated over numeric-family
+            ColType::Float8 => ColType::Float8, // SUM(float8) → float8
+            other => other,                  // Defensive: SUM is only generated over numeric-family
         },
         Avg => match input_ty {
             ColType::Float8 => ColType::Float8, // AVG(float8) → float8
-            _ => ColType::Numeric, // AVG(int|bigint|numeric) → numeric
+            _ => ColType::Numeric,              // AVG(int|bigint|numeric) → numeric
         },
         Min | Max => input_ty, // MIN/MAX preserve input type
     }
@@ -533,7 +808,9 @@ fn agg_result_ty(agg_fn: AggFn, input_ty: ColType) -> ColType {
 /// Single-table aggregate with a parameterized agg function.
 fn aggregate_case_with(t: Table, agg_fn: AggFn) -> FuzzCase {
     // Find the measure column type (column 'm' in the table).
-    let measure_ty = t.columns.iter()
+    let measure_ty = t
+        .columns
+        .iter()
         .find(|c| c.name == "m")
         .map(|c| c.ty)
         .unwrap_or(ColType::Numeric); // Defensive default
@@ -546,12 +823,27 @@ fn aggregate_case_with(t: Table, agg_fn: AggFn) -> FuzzCase {
         ),
     };
     let output_columns = vec![
-        Column { name: "d".into(), ty: ColType::Text, nullable: true },
-        Column { name: "s".into(), ty: agg_result_ty(agg_fn, measure_ty), nullable: true },
-        Column { name: "c".into(), ty: ColType::BigInt, nullable: false },
+        Column {
+            name: "d".into(),
+            ty: ColType::Text,
+            nullable: true,
+        },
+        Column {
+            name: "s".into(),
+            ty: agg_result_ty(agg_fn, measure_ty),
+            nullable: true,
+        },
+        Column {
+            name: "c".into(),
+            ty: ColType::BigInt,
+            nullable: false,
+        },
     ];
     let seed = DmlTxn {
-        statements: vec![DmlStmt::Insert { table: t.name.clone(), rows: seed_rows(&t, 8) }],
+        statements: vec![DmlStmt::Insert {
+            table: t.name.clone(),
+            rows: seed_rows(&t, 8),
+        }],
     };
     FuzzCase {
         tables: vec![t.clone()],
@@ -566,7 +858,9 @@ fn aggregate_case_with(t: Table, agg_fn: AggFn) -> FuzzCase {
 /// Two-table join aggregate with parameterized agg function and join type.
 fn join_aggregate_case_with(a: Table, b: Table, agg_fn: AggFn, is_left: bool) -> FuzzCase {
     // Find the measure column type (column 'm' in table a, the primary side).
-    let measure_ty = a.columns.iter()
+    let measure_ty = a
+        .columns
+        .iter()
         .find(|c| c.name == "m")
         .map(|c| c.ty)
         .unwrap_or(ColType::Numeric); // Defensive default
@@ -581,9 +875,21 @@ fn join_aggregate_case_with(a: Table, b: Table, agg_fn: AggFn, is_left: bool) ->
     };
     // COUNT(b.m) counts the right-hand/joined side column to measure match count
     let output_columns = vec![
-        Column { name: "d".into(), ty: ColType::Text, nullable: true },
-        Column { name: "s".into(), ty: agg_result_ty(agg_fn, measure_ty), nullable: true },
-        Column { name: "c".into(), ty: ColType::BigInt, nullable: false },
+        Column {
+            name: "d".into(),
+            ty: ColType::Text,
+            nullable: true,
+        },
+        Column {
+            name: "s".into(),
+            ty: agg_result_ty(agg_fn, measure_ty),
+            nullable: true,
+        },
+        Column {
+            name: "c".into(),
+            ty: ColType::BigInt,
+            nullable: false,
+        },
     ];
     FuzzCase {
         tables: vec![a.clone(), b.clone()],
@@ -604,11 +910,31 @@ fn set_op_union_all_case(a: Table, b: Table) -> FuzzCase {
         ),
     };
     let output_columns = vec![
-        Column { name: "id".into(), ty: ColType::Int, nullable: false },
-        Column { name: "m".into(), ty: ColType::Numeric, nullable: true },
-        Column { name: "d".into(), ty: ColType::Text, nullable: true },
-        Column { name: "f".into(), ty: ColType::Float8, nullable: true },
-        Column { name: "x".into(), ty: ColType::Numeric, nullable: true },
+        Column {
+            name: "id".into(),
+            ty: ColType::Int,
+            nullable: false,
+        },
+        Column {
+            name: "m".into(),
+            ty: ColType::Numeric,
+            nullable: true,
+        },
+        Column {
+            name: "d".into(),
+            ty: ColType::Text,
+            nullable: true,
+        },
+        Column {
+            name: "f".into(),
+            ty: ColType::Float8,
+            nullable: true,
+        },
+        Column {
+            name: "x".into(),
+            ty: ColType::Numeric,
+            nullable: true,
+        },
     ];
     FuzzCase {
         tables: vec![a.clone(), b.clone()],
@@ -629,23 +955,47 @@ fn set_op_union_all_case(a: Table, b: Table) -> FuzzCase {
 /// - Min/Max: inner {agg}(m), outer {agg}(agg_col)
 fn cte_decomposed_case_with(a: Table, b: Table, agg_fn: AggFn) -> FuzzCase {
     let (inner_agg, main_agg, outer_agg, output_ty, col_name) = match agg_fn {
-        AggFn::Sum => {
-            ("SUM(m) AS sm", "SUM", "MAX(agg.sm) AS sm", ColType::Numeric, "sm")
-        }
+        AggFn::Sum => (
+            "SUM(m) AS sm",
+            "SUM",
+            "MAX(agg.sm) AS sm",
+            ColType::Numeric,
+            "sm",
+        ),
         AggFn::Avg => {
             // AVG decomposition: For simplicity, treat like SUM (store sum, apply MAX)
-            ("SUM(m) AS sm", "AVG", "MAX(agg.sm) AS sm", ColType::Numeric, "sm")
+            (
+                "SUM(m) AS sm",
+                "AVG",
+                "MAX(agg.sm) AS sm",
+                ColType::Numeric,
+                "sm",
+            )
         }
         AggFn::Count => {
             // COUNT: inner COUNT(*), outer SUM to aggregate counts across groups
-            ("COUNT(*) AS cnt", "COUNT", "SUM(agg.cnt) AS cnt", ColType::BigInt, "cnt")
+            (
+                "COUNT(*) AS cnt",
+                "COUNT",
+                "SUM(agg.cnt) AS cnt",
+                ColType::BigInt,
+                "cnt",
+            )
         }
-        AggFn::Min => {
-            ("MIN(m) AS mn", "MIN", "MIN(agg.mn) AS mn", ColType::Numeric, "mn")
-        }
-        AggFn::Max => {
-            ("MAX(m) AS mx", "MAX", "MAX(agg.mx) AS mx", ColType::Numeric, "mx")
-        }
+        AggFn::Min => (
+            "MIN(m) AS mn",
+            "MIN",
+            "MIN(agg.mn) AS mn",
+            ColType::Numeric,
+            "mn",
+        ),
+        AggFn::Max => (
+            "MAX(m) AS mx",
+            "MAX",
+            "MAX(agg.mx) AS mx",
+            ColType::Numeric,
+            "mx",
+        ),
     };
 
     // Build the main SELECT aggregation:
@@ -661,21 +1011,26 @@ fn cte_decomposed_case_with(a: Table, b: Table, agg_fn: AggFn) -> FuzzCase {
         rendered_sql: format!(
             "WITH agg AS (SELECT d AS g, {} FROM {} GROUP BY d) \
              SELECT {}.id, {} AS s, {} FROM {} LEFT JOIN agg ON agg.g = {}.d GROUP BY {}.id",
-            inner_agg,
-            b.name,
-            a.name,
-            main_select_agg,
-            outer_agg,
-            a.name,
-            a.name,
-            a.name
+            inner_agg, b.name, a.name, main_select_agg, outer_agg, a.name, a.name, a.name
         ),
     };
 
     let output_columns = vec![
-        Column { name: "id".into(), ty: ColType::Int, nullable: false },
-        Column { name: "s".into(), ty: output_ty, nullable: true },
-        Column { name: col_name.into(), ty: output_ty, nullable: true },
+        Column {
+            name: "id".into(),
+            ty: ColType::Int,
+            nullable: false,
+        },
+        Column {
+            name: "s".into(),
+            ty: output_ty,
+            nullable: true,
+        },
+        Column {
+            name: col_name.into(),
+            ty: output_ty,
+            nullable: true,
+        },
     ];
     FuzzCase {
         tables: vec![a.clone(), b.clone()],
@@ -690,41 +1045,31 @@ fn cte_decomposed_case_with(a: Table, b: Table, agg_fn: AggFn) -> FuzzCase {
 /// Build the base SELECT + tables for a shape, ignoring source kind.
 fn base_case_for_shape(a: &Axes, seq: u64) -> Option<FuzzCase> {
     match a.shape {
-        QueryShape::Passthrough => {
-            Some(passthrough_case(det_table(seq, 0, a.measure_ty)))
-        }
+        QueryShape::Passthrough => Some(passthrough_case(det_table(seq, 0, a.measure_ty))),
         QueryShape::SingleAggregate => {
             Some(aggregate_case_with(det_table(seq, 0, a.measure_ty), a.agg?))
         }
-        QueryShape::JoinInner => {
-            Some(join_aggregate_case_with(
-                det_table(seq, 0, a.measure_ty),
-                det_table(seq, 1, a.measure_ty),
-                a.agg?,
-                false,
-            ))
-        }
-        QueryShape::JoinLeft => {
-            Some(join_aggregate_case_with(
-                det_table(seq, 0, a.measure_ty),
-                det_table(seq, 1, a.measure_ty),
-                a.agg?,
-                true,
-            ))
-        }
-        QueryShape::CteDecomposed => {
-            Some(cte_decomposed_case_with(
-                det_table(seq, 0, a.measure_ty),
-                det_table(seq, 1, a.measure_ty),
-                a.agg?,
-            ))
-        }
-        QueryShape::SetOpUnionAll => {
-            Some(set_op_union_all_case(
-                det_table(seq, 0, a.measure_ty),
-                det_table(seq, 1, a.measure_ty),
-            ))
-        }
+        QueryShape::JoinInner => Some(join_aggregate_case_with(
+            det_table(seq, 0, a.measure_ty),
+            det_table(seq, 1, a.measure_ty),
+            a.agg?,
+            false,
+        )),
+        QueryShape::JoinLeft => Some(join_aggregate_case_with(
+            det_table(seq, 0, a.measure_ty),
+            det_table(seq, 1, a.measure_ty),
+            a.agg?,
+            true,
+        )),
+        QueryShape::CteDecomposed => Some(cte_decomposed_case_with(
+            det_table(seq, 0, a.measure_ty),
+            det_table(seq, 1, a.measure_ty),
+            a.agg?,
+        )),
+        QueryShape::SetOpUnionAll => Some(set_op_union_all_case(
+            det_table(seq, 0, a.measure_ty),
+            det_table(seq, 1, a.measure_ty),
+        )),
     }
 }
 
@@ -778,7 +1123,10 @@ fn wrap_sources(a: &Axes, case: &mut FuzzCase, seq: u64) -> (Vec<SourceObject>, 
             let mut objects = Vec::new();
             for t in &case.tables {
                 let mv_name = format!("mv_{}", t.name);
-                let define_sql = format!("CREATE MATERIALIZED VIEW {} AS SELECT * FROM {}", mv_name, t.name);
+                let define_sql = format!(
+                    "CREATE MATERIALIZED VIEW {} AS SELECT * FROM {}",
+                    mv_name, t.name
+                );
 
                 // Add the base table as a source object.
                 objects.push(SourceObject {
@@ -808,7 +1156,10 @@ fn wrap_sources(a: &Axes, case: &mut FuzzCase, seq: u64) -> (Vec<SourceObject>, 
                 let sub_imv_name = format!("simv_{}_{}", seq, idx);
                 // The define_sql would be the create_reflex_ivm call or the sub-IMV's defining SELECT.
                 // For now, a simple placeholder.
-                let define_sql = format!("CREATE REFLEX IMV {} AS SELECT * FROM {}", sub_imv_name, t.name);
+                let define_sql = format!(
+                    "CREATE REFLEX IMV {} AS SELECT * FROM {}",
+                    sub_imv_name, t.name
+                );
 
                 // Add the base table as a source object.
                 objects.push(SourceObject {
@@ -825,8 +1176,10 @@ fn wrap_sources(a: &Axes, case: &mut FuzzCase, seq: u64) -> (Vec<SourceObject>, 
                 });
 
                 // Rewrite references from t.name to sub_imv_name in rendered_sql.
-                case.select_body.rendered_sql =
-                    case.select_body.rendered_sql.replace(&t.name, &sub_imv_name);
+                case.select_body.rendered_sql = case
+                    .select_body
+                    .rendered_sql
+                    .replace(&t.name, &sub_imv_name);
             }
             (objects, false)
         }
@@ -871,7 +1224,11 @@ mod tests {
         let tree = fuzz_case().new_tree(&mut runner).unwrap();
         let case = tree.current();
         assert!(!case.tables.is_empty());
-        assert!(case.select_body.rendered_sql.to_uppercase().contains("SELECT"));
+        assert!(case
+            .select_body
+            .rendered_sql
+            .to_uppercase()
+            .contains("SELECT"));
         assert!(!case.unique_columns.is_empty());
         assert!(!case.output_columns.is_empty());
     }
@@ -886,8 +1243,11 @@ mod tests {
             let sql = case.select_body.rendered_sql.to_uppercase();
             saw_join |= sql.contains("JOIN");
             saw_cte |= sql.contains("WITH ");
-            saw_carried |= sql.contains("COALESCE") || sql.contains("EXISTS") || sql.contains("CASE");
-            if saw_join && saw_cte && saw_carried { break; }
+            saw_carried |=
+                sql.contains("COALESCE") || sql.contains("EXISTS") || sql.contains("CASE");
+            if saw_join && saw_cte && saw_carried {
+                break;
+            }
         }
         assert!(saw_join && saw_cte && saw_carried,
             "generator must reach join/cte/carried shapes (join={saw_join} cte={saw_cte} carried={saw_carried})");
@@ -907,7 +1267,10 @@ mod tests {
                 break;
             }
         }
-        assert!(saw_multi_stmt, "generator must emit multi-statement transactions");
+        assert!(
+            saw_multi_stmt,
+            "generator must emit multi-statement transactions"
+        );
     }
 
     #[test]
@@ -918,8 +1281,13 @@ mod tests {
         for _ in 0..400 {
             let c = fuzz_case().new_tree(&mut runner).unwrap().current();
             filt |= c.select_body.rendered_sql.to_uppercase().contains("WHERE");
-            if filt { break; }
+            if filt {
+                break;
+            }
         }
-        assert!(filt, "must reach filtered variants with WHERE predicates ({filt})");
+        assert!(
+            filt,
+            "must reach filtered variants with WHERE predicates ({filt})"
+        );
     }
 }
