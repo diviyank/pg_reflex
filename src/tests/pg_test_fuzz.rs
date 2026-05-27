@@ -10,6 +10,7 @@ pub use fuzz_model::generate;
 #[cfg(any(test, feature = "pg_test"))]
 pub mod oracle {
     use fuzz_model::model::*;
+    use fuzz_model::axes::{PlannedCase, SourceObjectKind};
     use fuzz_model::oracle_pure::{
         cols_of, diff_subquery, rename_case, CASE_SEQ,
     };
@@ -154,6 +155,233 @@ $func$ LANGUAGE plpgsql;
 
         outcome
     }
+
+    pub fn evaluate_planned(pc: &PlannedCase) -> Outcome {
+        let seq = CASE_SEQ.fetch_add(1, Ordering::Relaxed);
+        let suffix = format!("_pfz{seq}");
+
+        // Rename case with a different suffix to distinguish from evaluate()
+        let case = rename_case(&pc.case, &suffix);
+
+        // Step 1: Create base tables and seed them.
+        for t in &case.tables {
+            Spi::run(&render::create_table_sql(t))
+                .expect("setup ddl: create base table failed");
+        }
+
+        // Step 2: Create source objects (View/MatView/SubImv) in order.
+        for src_obj in &pc.source_objects {
+            match src_obj.kind {
+                SourceObjectKind::Table => {
+                    // Base tables already created above; skip
+                }
+                SourceObjectKind::View => {
+                    // Execute the VIEW DDL directly
+                    if let Some(define_sql) = &src_obj.define_sql {
+                        if let Err(e) = Spi::run(define_sql) {
+                            return Outcome::Bug(format!("create view {} failed: {e:?}", src_obj.name));
+                        }
+                    }
+                }
+                SourceObjectKind::MatView => {
+                    // Execute the MATERIALIZED VIEW DDL directly
+                    if let Some(define_sql) = &src_obj.define_sql {
+                        if let Err(e) = Spi::run(define_sql) {
+                            return Outcome::Bug(format!("create matview {} failed: {e:?}", src_obj.name));
+                        }
+                    }
+                }
+                SourceObjectKind::SubImv => {
+                    // Extract the SELECT body from the placeholder define_sql.
+                    // The placeholder format is: "CREATE REFLEX IMV <name> AS SELECT ..."
+                    // We need to extract everything after "AS ".
+                    if let Some(define_sql) = &src_obj.define_sql {
+                        // Find " AS " and extract the SELECT part
+                        if let Some(as_pos) = define_sql.find(" AS ") {
+                            let select_body = &define_sql[as_pos + 4..];
+                            // Get unique columns from the base case
+                            let keys = case.unique_columns.join(",");
+                            let create_result = Spi::get_one::<&str>(&format!(
+                                "SELECT create_reflex_ivm('{}', $body${}$body$, '{}', NULL, 'IMMEDIATE', NULL)",
+                                src_obj.name, select_body, keys
+                            ));
+                            match create_result {
+                                Ok(Some(msg)) => {
+                                    if msg.contains(crate::REFLEX_UNSUPPORTED_TAG) {
+                                        return Outcome::Skip(format!("SubImv {} creation returned UNSUPPORTED: {}", src_obj.name, msg));
+                                    } else if !msg.starts_with("CREATE REFLEX") {
+                                        return Outcome::Bug(format!("unexpected SubImv create return: {}", msg));
+                                    }
+                                }
+                                e => return Outcome::Bug(format!("SubImv {} create_reflex_ivm call error: {:?}", src_obj.name, e)),
+                            }
+                        } else {
+                            return Outcome::Bug(format!("SubImv {} define_sql missing ' AS ': {}", src_obj.name, define_sql));
+                        }
+                    }
+                }
+            }
+        }
+
+        let mv = format!("mv{suffix}");
+        let imv = format!("imv{suffix}");
+
+        // Step 3: Create oracle MV over the (possibly source-wrapped) rendered_sql.
+        Spi::run(&render::create_mv_sql(&mv, &case.select_body))
+            .expect("setup ddl: create mv failed");
+
+        // Step 4: Build the DML statements for the DO block.
+        let mut dml_lines = Vec::new();
+        for txn in &case.dml {
+            for stmt in &txn.statements {
+                let cols = cols_of(&case, match stmt {
+                    DmlStmt::Insert { table, .. }
+                    | DmlStmt::Delete { table, .. }
+                    | DmlStmt::Update { table, .. }
+                    | DmlStmt::Truncate { table } => table,
+                });
+                let sql = render::dml_sql(stmt, &|_t: &str| cols.clone());
+                dml_lines.push(format!("    {sql};"));
+            }
+        }
+        let dml_block = dml_lines.join("\n");
+
+        // Step 5: Build flush lines if deferred.
+        let mut flush_lines = Vec::new();
+        if case.deferred {
+            for t in &case.tables {
+                flush_lines.push(format!("    PERFORM reflex_flush_deferred('{}');", t.name));
+            }
+        }
+        let flush_block = flush_lines.join("\n");
+
+        // Step 6: Build maintenance block based on source_is_refresh_driven.
+        let maint_block = if pc.source_is_refresh_driven {
+            // For refresh-driven sources (MatView), refresh them explicitly
+            let mut maint_lines = Vec::new();
+            for src_obj in &pc.source_objects {
+                if matches!(src_obj.kind, SourceObjectKind::MatView) {
+                    maint_lines.push(format!("    REFRESH MATERIALIZED VIEW {};", src_obj.name));
+                    maint_lines.push(format!("    PERFORM refresh_imv_depending_on('{}');", src_obj.name));
+                }
+            }
+            maint_lines.join("\n")
+        } else {
+            // For table sources with immediate triggers, no explicit maintenance needed.
+            // For deferred sources, flush_block already handles it.
+            String::new()
+        };
+
+        // Build the diff subquery.
+        let has_float = case.output_columns.iter().any(|c| c.ty.is_float());
+        let diff_from = if has_float {
+            fuzz_model::oracle_pure::float_diff_from_where(&mv, &imv, &case.unique_columns, &case.output_columns)
+        } else {
+            diff_subquery(&mv, &imv)
+        };
+
+        // Construct the DO block as a string.
+        let keys = case.unique_columns.join(",");
+        let body = case.select_body.rendered_sql.clone();
+        let cascade_arg = match pc.axes.lifecycle {
+            fuzz_model::axes::Lifecycle::CascadeDrop => ", true",
+            _ => "",
+        };
+
+        // Build a PL/pgSQL function that encodes the result as JSON for transport across SPI.
+        let func_name = format!("oracle_planned_func_{}", seq);
+        let create_func_sql = format!(
+            r#"CREATE OR REPLACE FUNCTION public.{} () RETURNS text AS $func$
+DECLARE
+  v_msg text;
+  v_diff bigint;
+  v_drop_result text;
+  v_orphans bigint;
+  v_status text := 'MATCH';
+  v_detail text := '';
+BEGIN
+  v_msg := create_reflex_ivm('{}', $reflexbody${}$reflexbody$, '{}', NULL, 'IMMEDIATE', NULL);
+  IF position('{}' in v_msg) > 0 THEN
+    v_status := 'SKIP';
+    v_detail := v_msg;
+  ELSIF v_msg NOT LIKE 'CREATE REFLEX%%' THEN
+    v_status := 'BUG';
+    v_detail := 'unexpected create return: ' || v_msg;
+  ELSE
+{}
+{}
+{}
+    REFRESH MATERIALIZED VIEW {};
+
+    SELECT count(*)::bigint INTO v_diff FROM {};
+
+    IF v_diff > 0 THEN
+      v_status := 'BUG';
+      v_detail := v_diff || ' mismatched rows';
+    ELSE
+      -- Drop the IMV and check for orphans
+      v_drop_result := drop_reflex_ivm('{}'{});
+      IF position('DROP' in v_drop_result) = 0 THEN
+        v_status := 'BUG';
+        v_detail := 'drop did not report DROP: ' || v_drop_result;
+      ELSE
+        SELECT count(*)::bigint INTO v_orphans
+        FROM pg_class
+        WHERE relname LIKE '%{}_%%'
+              AND relkind IN ('r', 'i');
+        IF v_orphans > 0 THEN
+          v_status := 'BUG';
+          v_detail := v_orphans || ' orphan objects after drop';
+        END IF;
+      END IF;
+    END IF;
+  END IF;
+
+  RETURN v_status || '|||' || v_detail;
+EXCEPTION WHEN OTHERS THEN
+  RETURN 'BUG' || '|||' || ('codegen exception: ' || SQLERRM);
+END;
+$func$ LANGUAGE plpgsql;
+"#,
+            func_name,
+            imv,               // create_reflex_ivm arg
+            body,              // $reflexbody content
+            keys,              // third arg to create_reflex_ivm
+            crate::REFLEX_UNSUPPORTED_TAG,  // position check
+            dml_block,         // DML statements
+            flush_block,       // flush statements (may be empty)
+            maint_block,       // maintenance block
+            mv,                // REFRESH target
+            diff_from,         // SELECT FROM (exact or float-tolerant)
+            imv,               // drop_reflex_ivm arg
+            cascade_arg,       // cascade flag
+            imv,               // orphan check pattern prefix
+        );
+
+        // Create the function.
+        if let Err(e) = Spi::run(&create_func_sql) {
+            return Outcome::Bug(format!("create function error: {e:?}"));
+        }
+
+        // Call the function and parse the result.
+        let call_func_sql = format!("SELECT {}();", func_name);
+        let outcome = match Spi::get_one::<&str>(&call_func_sql) {
+            Ok(Some(result_str)) => {
+                let parts: Vec<&str> = result_str.splitn(2, "|||").collect();
+                let status = if !parts.is_empty() { parts[0] } else { "UNKNOWN" };
+                let detail = if parts.len() > 1 { parts[1].to_string() } else { String::new() };
+                match status {
+                    "MATCH" => Outcome::Match,
+                    "SKIP" => Outcome::Skip(detail),
+                    "BUG" => Outcome::Bug(detail),
+                    _ => Outcome::Bug(format!("unknown status: {}", status)),
+                }
+            }
+            e => Outcome::Bug(format!("function call error: {:?}", e)),
+        };
+
+        outcome
+    }
 }
 
 #[cfg(any(test, feature = "pg_test"))]
@@ -196,6 +424,28 @@ fn oracle_matches_on_a_simple_generated_case() {
                 oracle::repro_sql(&case)
             )
         }
+    }
+}
+
+/// Test evaluate_planned with a simple table-passthrough case.
+#[cfg(any(test, feature = "pg_test"))]
+#[pg_test]
+fn evaluate_planned_table_passthrough_matches_and_drops_clean() {
+    use fuzz_model::axes::{plan_case, Axes, Lifecycle, QueryShape, RefreshMode, SourceKind, UniqueCols};
+    use fuzz_model::model::ColType;
+    let a = Axes {
+        source: SourceKind::Table,
+        shape: QueryShape::Passthrough,
+        refresh: RefreshMode::Immediate,
+        agg: None,
+        measure_ty: ColType::Numeric,
+        unique: UniqueCols::Absent,
+        lifecycle: Lifecycle::CreateMutateDrop,
+    };
+    let pc = plan_case(&a, 9001).unwrap();
+    match oracle::evaluate_planned(&pc) {
+        oracle::Outcome::Match => {}
+        other => panic!("expected Match, got {other:?}"),
     }
 }
 
