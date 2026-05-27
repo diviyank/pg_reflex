@@ -352,18 +352,8 @@ fn try_decompose_set_op(ctx: &DecomposeCtx) -> Option<&'static str> {
 /// sub-IMV and place a `CREATE VIEW` over it that picks `__reflex_rn = 1`
 /// via `ROW_NUMBER()`. The window evaluates at read time.
 #[allow(clippy::too_many_arguments)]
-fn try_decompose_distinct_on(
-    view_name: &str,
-    sql: &str,
-    unique_columns_str: &str,
-    storage_mode: &str,
-    refresh_mode: &str,
-    topk_k: Option<usize>,
-    ignore_sources: &[String],
-    partition_by: &[String],
-    parsed: &ParsedInputs,
-) -> Option<&'static str> {
-    let analysis = &parsed.analysis;
+fn try_decompose_distinct_on(ctx: &DecomposeCtx) -> Option<&'static str> {
+    let analysis = &ctx.parsed.analysis;
     if !analysis.has_distinct_on || analysis.distinct_on_columns.is_empty() {
         return None;
     }
@@ -390,17 +380,17 @@ fn try_decompose_distinct_on(
     }
 
     // Create sub-IMV for the base data
-    let base_name = format!("{}__base", view_name);
+    let base_name = format!("{}__base", ctx.view_name);
     let result = create_reflex_ivm_impl(
         &base_name,
         &base_sql,
-        unique_columns_str,
+        ctx.unique_columns_str,
         false,
-        storage_mode,
-        refresh_mode,
-        topk_k,
-        ignore_sources,
-        partition_by,
+        ctx.storage_mode,
+        ctx.refresh_mode,
+        ctx.topk_k,
+        ctx.ignore_sources,
+        ctx.partition_by,
     );
     if result.starts_with("ERROR") {
         return Some(result);
@@ -458,7 +448,7 @@ fn try_decompose_distinct_on(
             .update(
                 &format!(
                     "CREATE OR REPLACE VIEW {} AS {}",
-                    quote_identifier(view_name),
+                    quote_identifier(ctx.view_name),
                     view_sql
                 ),
                 None,
@@ -472,18 +462,18 @@ fn try_decompose_distinct_on(
         insert_registry_row(
             client,
             &RegistryRow::decomposed(
-                view_name,
+                ctx.view_name,
                 2,
                 &depends_on,
                 &depends_on_imv,
-                sql,
+                ctx.sql,
                 &view_sql,
-                &parsed.storage_upper,
-                &parsed.mode_upper,
+                &ctx.parsed.storage_upper,
+                &ctx.parsed.mode_upper,
             ),
         )
         .unwrap_or_report();
-        add_graph_child_links(client, view_name, &depends_on_imv).unwrap_or_report();
+        add_graph_child_links(client, ctx.view_name, &depends_on_imv).unwrap_or_report();
     });
 
     Some("CREATE REFLEX INCREMENTAL VIEW")
@@ -618,18 +608,8 @@ fn parse_unique_columns_spec(spec: &str) -> (String, std::collections::HashMap<S
 /// WITH clause. Tail-recursive: the final `Some(...)` here is the result of
 /// the rewritten-body call.
 #[allow(clippy::too_many_arguments)]
-fn try_decompose_ctes(
-    view_name: &str,
-    unique_columns_str: &str,
-    cte_unique_columns: &std::collections::HashMap<String, String>,
-    storage_mode: &str,
-    refresh_mode: &str,
-    topk_k: Option<usize>,
-    ignore_sources: &[String],
-    partition_by: &[String],
-    parsed: &ParsedInputs,
-) -> Option<&'static str> {
-    let analysis = &parsed.analysis;
+fn try_decompose_ctes(ctx: &DecomposeCtx) -> Option<&'static str> {
+    let analysis = &ctx.parsed.analysis;
     if analysis.ctes.is_empty() {
         return None;
     }
@@ -738,7 +718,7 @@ with kind: mv.",
         // Compute partition subset using the pre-computed output columns.
         // If output columns are unknown, pass &[] to skip partition propagation.
         let cte_partition_by = if let Some(cte_output_cols) = &cte_output_columns[cte_idx] {
-            compute_cte_partition_subset(partition_by, cte_output_cols)
+            compute_cte_partition_subset(ctx.partition_by, cte_output_cols)
         } else {
             // Wildcard projection or analysis failed — cannot propagate partitioning
             Vec::new()
@@ -748,8 +728,8 @@ with kind: mv.",
         // view_name = "<view>__cte_<cte_alias>", producing names like "<view>__cte_a__cte_b".
         // A sibling CTE literally named "a__cte_b" would collide with nested CTE "b" inside "a",
         // but this is a pathological edge case requiring an adversarial alias — accepted risk.
-        let cte_view_name = safe_identifier(&format!("{}__cte_{}", view_name, cte.alias));
-        let cte_key = cte_unique_columns
+        let cte_view_name = safe_identifier(&format!("{}__cte_{}", ctx.view_name, cte.alias));
+        let cte_key = ctx.cte_unique_columns
             .get(&alias_lower)
             .map(|s| s.as_str())
             .unwrap_or("");
@@ -758,10 +738,10 @@ with kind: mv.",
             &cte_query,
             cte_key,
             false,
-            storage_mode,
-            refresh_mode,
-            topk_k,
-            ignore_sources,
+            ctx.storage_mode,
+            ctx.refresh_mode,
+            ctx.topk_k,
+            ctx.ignore_sources,
             &cte_partition_by,
         );
         if result.starts_with("ERROR") {
@@ -771,7 +751,7 @@ with kind: mv.",
     }
 
     // Rewrite main query body: serialize without WITH, replace CTE names
-    let body_sql = if let sqlparser::ast::Statement::Query(ref query) = parsed.parsed_sql[0] {
+    let body_sql = if let sqlparser::ast::Statement::Query(ref query) = ctx.parsed.parsed_sql[0] {
         let mut body = query.body.to_string();
         // Append ORDER BY / LIMIT if present (shouldn't be for valid IMV queries)
         if let Some(ref ob) = query.order_by {
@@ -790,15 +770,15 @@ with kind: mv.",
     // If so, all its sources are CTE sub-IMVs which don't get triggers,
     // CTE body (passthrough or aggregate) → create as a normal IMV
     Some(create_reflex_ivm_impl(
-        view_name,
+        ctx.view_name,
         &body_sql,
-        unique_columns_str,
+        ctx.unique_columns_str,
         false,
-        storage_mode,
-        refresh_mode,
-        topk_k,
-        ignore_sources,
-        partition_by,
+        ctx.storage_mode,
+        ctx.refresh_mode,
+        ctx.topk_k,
+        ctx.ignore_sources,
+        ctx.partition_by,
     ))
 }
 
@@ -2175,31 +2155,11 @@ pub(crate) fn create_reflex_ivm_impl(
         return result;
     }
 
-    if let Some(result) = try_decompose_ctes(
-        view_name,
-        unique_columns_str,
-        &cte_unique_columns,
-        storage_mode,
-        refresh_mode,
-        topk_k,
-        ignore_sources,
-        partition_by,
-        &parsed,
-    ) {
+    if let Some(result) = try_decompose_ctes(&dctx) {
         return result;
     }
 
-    if let Some(result) = try_decompose_distinct_on(
-        view_name,
-        sql,
-        unique_columns_str,
-        storage_mode,
-        refresh_mode,
-        topk_k,
-        ignore_sources,
-        partition_by,
-        &parsed,
-    ) {
+    if let Some(result) = try_decompose_distinct_on(&dctx) {
         return result;
     }
 
