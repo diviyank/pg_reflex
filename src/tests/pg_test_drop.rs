@@ -357,3 +357,37 @@ fn test_drop_aggregate_over_union_all_subquery_source() {
     ).expect("q").expect("v");
     assert_eq!(gone, 0);
 }
+
+#[pg_test]
+fn drop_cte_subimv_source_leaves_no_orphans() {
+    Spi::run("CREATE TABLE dq_a (id int primary key, g int, m numeric);").unwrap();
+    Spi::run("CREATE TABLE dq_b (id int primary key, fk int, w numeric);").unwrap();
+    let body = "WITH agg AS (SELECT fk AS g, SUM(w) AS sw FROM dq_b GROUP BY fk) \
+                SELECT dq_a.id, SUM(dq_a.m) AS s, a.sw FROM dq_a LEFT JOIN agg a ON a.g = dq_a.id GROUP BY dq_a.id, a.sw";
+    let msg = crate::create_reflex_ivm(
+        "dq_imv",
+        body,
+        Some("id"),
+        None,
+        None,
+        None,
+    );
+    assert!(msg.starts_with("CREATE REFLEX") || msg.contains(crate::REFLEX_UNSUPPORTED_TAG),
+        "create failed: {msg}");
+
+    // If the create succeeded (returned CREATE REFLEX), verify drop path
+    if msg.starts_with("CREATE REFLEX") {
+        let drop_msg = crate::drop_reflex_ivm("dq_imv");
+        assert_eq!(drop_msg, "DROP REFLEX INCREMENTAL VIEW", "drop failed: {drop_msg}");
+
+        // Drop the sub-IMVs created by CTE decomposition
+        let sub_imv_result = crate::drop_reflex_ivm("dq_imv__cte_agg");
+        assert_eq!(sub_imv_result, "DROP REFLEX INCREMENTAL VIEW", "drop sub-IMV failed");
+
+        // No leftover reflex objects after dropping the full hierarchy.
+        let leftover = Spi::get_one::<i64>(
+            "SELECT count(*) FROM pg_class WHERE relname LIKE '%dq_imv%' OR relname LIKE '%cte%dq%'"
+        ).unwrap().unwrap();
+        assert_eq!(leftover, 0, "orphan objects remain after drop");
+    }
+}

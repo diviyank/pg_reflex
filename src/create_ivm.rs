@@ -1644,7 +1644,7 @@ fn install_source_triggers(client: &mut pgrx::spi::SpiClient<'_>, ctx: &BuildCon
             continue;
         }
 
-        let safe_source = source.replace('.', "_");
+        let safe_source = crate::query_decomposer::sanitized_source_suffix(source);
         let trig_exists = client
             .select(
                 &format!(
