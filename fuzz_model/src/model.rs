@@ -1,5 +1,5 @@
 /// Exact-comparable scalar types plus float (float8 uses epsilon compare).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ColType {
     Int,
     BigInt,

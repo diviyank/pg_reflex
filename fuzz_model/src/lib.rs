@@ -2,6 +2,7 @@
 //! standalone `fuzz_sweep` discovery binary. Produces SQL strings and case
 //! descriptors only — no SPI, no pgrx runtime dependency.
 
+pub mod axes;
 pub mod model;
 pub mod render;
 pub mod generate;
