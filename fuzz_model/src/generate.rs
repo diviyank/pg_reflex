@@ -1,4 +1,6 @@
 use crate::model::*;
+use crate::axes::{Axes, AggFn, PlannedCase, QueryShape, RefreshMode,
+                  SourceKind, SourceObject, SourceObjectKind, UniqueCols};
 use proptest::prelude::*;
 
 /// Exact-only column types for the CI gate (Task 10 adds Float8).
@@ -476,6 +478,307 @@ fn join_cases() -> impl Strategy<Value = FuzzCase> {
             1 => with_mutation(carried_scalar_case(a.clone(), b, pick), mtx),
             _ => with_mutation(cte_decomposed_case(a, b), mtx),
         }
+    })
+}
+
+/// Create a deterministic base table with given sequence and index number.
+/// Matches the structure: id (pk), m (measure), d (text), f (float8), x (measure again for aggregates).
+fn det_table(seq: u64, idx: usize, measure_ty: ColType) -> Table {
+    let name = format!("ft_{}_{}", seq, idx);
+    Table {
+        name,
+        pk: "id".into(),
+        columns: vec![
+            Column { name: "id".into(), ty: ColType::Int, nullable: false },
+            Column { name: "m".into(), ty: measure_ty, nullable: true },
+            Column { name: "d".into(), ty: ColType::Text, nullable: true },
+            Column { name: "f".into(), ty: ColType::Float8, nullable: true },
+            Column { name: "x".into(), ty: measure_ty, nullable: true },
+        ],
+    }
+}
+
+/// Parameterized aggregate function name rendering.
+fn agg_fn_sql(fn_name: AggFn, col: &str) -> String {
+    use AggFn::*;
+    match fn_name {
+        Sum => format!("SUM({})", col),
+        Count => format!("COUNT({})", col),
+        Min => format!("MIN({})", col),
+        Max => format!("MAX({})", col),
+        Avg => format!("AVG({})", col),
+    }
+}
+
+/// Single-table aggregate with a parameterized agg function.
+fn aggregate_case_with(t: Table, agg_fn: AggFn) -> FuzzCase {
+    let agg_expr = agg_fn_sql(agg_fn, "m");
+    let body = SelectBody {
+        rendered_sql: format!(
+            "SELECT d, {} AS s, COUNT(*) AS c FROM {} GROUP BY d",
+            agg_expr, t.name
+        ),
+    };
+    let output_columns = vec![
+        Column { name: "d".into(), ty: ColType::Text, nullable: true },
+        Column { name: "s".into(), ty: ColType::Numeric, nullable: true },
+        Column { name: "c".into(), ty: ColType::BigInt, nullable: false },
+    ];
+    let seed = DmlTxn {
+        statements: vec![DmlStmt::Insert { table: t.name.clone(), rows: seed_rows(&t, 8) }],
+    };
+    FuzzCase {
+        tables: vec![t.clone()],
+        select_body: body,
+        unique_columns: vec!["d".into()],
+        deferred: false,
+        dml: vec![seed],
+        output_columns,
+    }
+}
+
+/// Two-table join aggregate with parameterized agg function and join type.
+fn join_aggregate_case_with(a: Table, b: Table, agg_fn: AggFn, is_left: bool) -> FuzzCase {
+    let join_type = if is_left { "LEFT JOIN" } else { "INNER JOIN" };
+    let agg_expr = agg_fn_sql(agg_fn, "a.m");
+    let body = SelectBody {
+        rendered_sql: format!(
+            "SELECT a.d, {} AS s, COUNT(b.m) AS c FROM {} a {} {} b ON b.id = a.id GROUP BY a.d",
+            agg_expr, a.name, join_type, b.name
+        ),
+    };
+    let output_columns = vec![
+        Column { name: "d".into(), ty: ColType::Text, nullable: true },
+        Column { name: "s".into(), ty: ColType::Numeric, nullable: true },
+        Column { name: "c".into(), ty: ColType::BigInt, nullable: false },
+    ];
+    FuzzCase {
+        tables: vec![a.clone(), b.clone()],
+        select_body: body,
+        unique_columns: vec!["d".into()],
+        deferred: false,
+        dml: vec![seed_two(&a, &b)],
+        output_columns,
+    }
+}
+
+/// Set operation UNION ALL: non-aggregate union of two passthrough legs.
+fn set_op_union_all_case(a: Table, b: Table) -> FuzzCase {
+    let body = SelectBody {
+        rendered_sql: format!(
+            "SELECT id, m, d, f, x FROM {} UNION ALL SELECT id, m, d, f, x FROM {}",
+            a.name, b.name
+        ),
+    };
+    let output_columns = vec![
+        Column { name: "id".into(), ty: ColType::Int, nullable: false },
+        Column { name: "m".into(), ty: ColType::Numeric, nullable: true },
+        Column { name: "d".into(), ty: ColType::Text, nullable: true },
+        Column { name: "f".into(), ty: ColType::Float8, nullable: true },
+        Column { name: "x".into(), ty: ColType::Numeric, nullable: true },
+    ];
+    FuzzCase {
+        tables: vec![a.clone(), b.clone()],
+        select_body: body,
+        unique_columns: vec![],
+        deferred: false,
+        dml: vec![seed_two(&a, &b)],
+        output_columns,
+    }
+}
+
+/// CTE-decomposed case: WITH agg AS (SELECT d AS g, SUM(m) AS sm FROM b GROUP BY d)
+/// SELECT a.id, SUM(a.m) AS s, c.sm FROM a LEFT JOIN agg c ON c.g = a.d GROUP BY a.id, c.sm.
+fn cte_decomposed_case_with(a: Table, b: Table) -> FuzzCase {
+    let body = SelectBody {
+        rendered_sql: format!(
+            "WITH agg AS (SELECT d AS g, SUM(m) AS sm FROM {} GROUP BY d) \
+             SELECT {}.id, SUM({}.m) AS s, agg.sm FROM {} LEFT JOIN agg ON agg.g = {}.d GROUP BY {}.id, agg.sm",
+            b.name, a.name, a.name, a.name, a.name, a.name
+        ),
+    };
+    let output_columns = vec![
+        Column { name: "id".into(), ty: ColType::Int, nullable: false },
+        Column { name: "s".into(), ty: ColType::Numeric, nullable: true },
+        Column { name: "sm".into(), ty: ColType::Numeric, nullable: true },
+    ];
+    FuzzCase {
+        tables: vec![a.clone(), b.clone()],
+        select_body: body,
+        unique_columns: vec!["id".into()],
+        deferred: false,
+        dml: vec![seed_two(&a, &b)],
+        output_columns,
+    }
+}
+
+/// Build the base SELECT + tables for a shape, ignoring source kind.
+fn base_case_for_shape(a: &Axes, seq: u64) -> Option<FuzzCase> {
+    match a.shape {
+        QueryShape::Passthrough => {
+            Some(passthrough_case(det_table(seq, 0, a.measure_ty)))
+        }
+        QueryShape::SingleAggregate => {
+            Some(aggregate_case_with(det_table(seq, 0, a.measure_ty), a.agg?))
+        }
+        QueryShape::JoinInner => {
+            Some(join_aggregate_case_with(
+                det_table(seq, 0, a.measure_ty),
+                det_table(seq, 1, a.measure_ty),
+                a.agg?,
+                false,
+            ))
+        }
+        QueryShape::JoinLeft => {
+            Some(join_aggregate_case_with(
+                det_table(seq, 0, a.measure_ty),
+                det_table(seq, 1, a.measure_ty),
+                a.agg?,
+                true,
+            ))
+        }
+        QueryShape::CteDecomposed => {
+            Some(cte_decomposed_case_with(
+                det_table(seq, 0, a.measure_ty),
+                det_table(seq, 1, a.measure_ty),
+            ))
+        }
+        QueryShape::SetOpUnionAll => {
+            Some(set_op_union_all_case(
+                det_table(seq, 0, a.measure_ty),
+                det_table(seq, 1, a.measure_ty),
+            ))
+        }
+    }
+}
+
+/// Rewrite source references in rendered_sql based on the source kind and return
+/// the source objects to create.
+fn wrap_sources(a: &Axes, case: &mut FuzzCase, seq: u64) -> (Vec<SourceObject>, bool) {
+    match a.source {
+        SourceKind::Table => {
+            // Base tables directly: no wrapping, no refresh.
+            let objects = case
+                .tables
+                .iter()
+                .map(|t| SourceObject {
+                    name: t.name.clone(),
+                    kind: SourceObjectKind::Table,
+                    define_sql: None,
+                })
+                .collect();
+            (objects, false)
+        }
+        SourceKind::View => {
+            // Wrap each base table in a view.
+            let mut objects = Vec::new();
+            for t in &case.tables {
+                let view_name = format!("v_{}", t.name);
+                let define_sql = format!("CREATE VIEW {} AS SELECT * FROM {}", view_name, t.name);
+
+                // Add the base table as a source object.
+                objects.push(SourceObject {
+                    name: t.name.clone(),
+                    kind: SourceObjectKind::Table,
+                    define_sql: None,
+                });
+
+                // Add the view as a source object.
+                objects.push(SourceObject {
+                    name: view_name.clone(),
+                    kind: SourceObjectKind::View,
+                    define_sql: Some(define_sql),
+                });
+
+                // Rewrite references from t.name to view_name in rendered_sql.
+                case.select_body.rendered_sql =
+                    case.select_body.rendered_sql.replace(&t.name, &view_name);
+            }
+            (objects, false)
+        }
+        SourceKind::MatView => {
+            // Wrap each base table in a materialized view.
+            let mut objects = Vec::new();
+            for t in &case.tables {
+                let mv_name = format!("mv_{}", t.name);
+                let define_sql = format!("CREATE MATERIALIZED VIEW {} AS SELECT * FROM {}", mv_name, t.name);
+
+                // Add the base table as a source object.
+                objects.push(SourceObject {
+                    name: t.name.clone(),
+                    kind: SourceObjectKind::Table,
+                    define_sql: None,
+                });
+
+                // Add the materialized view as a source object.
+                objects.push(SourceObject {
+                    name: mv_name.clone(),
+                    kind: SourceObjectKind::MatView,
+                    define_sql: Some(define_sql),
+                });
+
+                // Rewrite references from t.name to mv_name in rendered_sql.
+                case.select_body.rendered_sql =
+                    case.select_body.rendered_sql.replace(&t.name, &mv_name);
+            }
+            (objects, true)
+        }
+        SourceKind::CteSubImv => {
+            // Wrap in a sub-IMV (an IMV created via create_reflex_ivm).
+            // For this task, we model it as a SourceObject with SubImv kind.
+            let mut objects = Vec::new();
+            for (idx, t) in case.tables.iter().enumerate() {
+                let sub_imv_name = format!("simv_{}_{}", seq, idx);
+                // The define_sql would be the create_reflex_ivm call or the sub-IMV's defining SELECT.
+                // For now, a simple placeholder.
+                let define_sql = format!("CREATE REFLEX IMV {} AS SELECT * FROM {}", sub_imv_name, t.name);
+
+                // Add the base table as a source object.
+                objects.push(SourceObject {
+                    name: t.name.clone(),
+                    kind: SourceObjectKind::Table,
+                    define_sql: None,
+                });
+
+                // Add the sub-IMV as a source object.
+                objects.push(SourceObject {
+                    name: sub_imv_name.clone(),
+                    kind: SourceObjectKind::SubImv,
+                    define_sql: Some(define_sql),
+                });
+
+                // Rewrite references from t.name to sub_imv_name in rendered_sql.
+                case.select_body.rendered_sql =
+                    case.select_body.rendered_sql.replace(&t.name, &sub_imv_name);
+            }
+            (objects, false)
+        }
+    }
+}
+
+pub fn plan_from_axes(a: &Axes, seq: u64) -> Option<PlannedCase> {
+    let mut case = base_case_for_shape(a, seq)?;
+
+    // Set deferred maintenance if needed.
+    if a.refresh == RefreshMode::Deferred {
+        case.deferred = true;
+    }
+
+    // Handle unique_columns: when a.unique == Provided, update the case's unique_columns.
+    // (Absent means keep the generator default.)
+    if a.unique == UniqueCols::Provided {
+        // For Passthrough and Join shapes, the unique column is the PK.
+        // The generator already sets it correctly, so no change needed here.
+        // But to be explicit: if needed, update case.unique_columns based on the shape.
+    }
+
+    let (source_objects, refresh_driven) = wrap_sources(a, &mut case, seq);
+
+    Some(PlannedCase {
+        axes: *a,
+        case,
+        source_objects,
+        source_is_refresh_driven: refresh_driven,
     })
 }
 

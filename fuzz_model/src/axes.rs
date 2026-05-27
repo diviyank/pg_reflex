@@ -1,7 +1,7 @@
 //! The orthogonal axes whose 2-way interactions defined the creation-bug class.
 //! A validity predicate prunes impossible combinations before generation.
 
-use crate::model::ColType;
+use crate::model::{ColType, FuzzCase};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SourceKind {
@@ -47,6 +47,33 @@ pub enum Lifecycle {
     CreateMutateDrop,
     CascadeDrop,
     Partitioned,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceObjectKind {
+    Table,
+    View,
+    MatView,
+    SubImv,
+}
+
+#[derive(Debug, Clone)]
+pub struct SourceObject {
+    pub name: String,
+    pub kind: SourceObjectKind,
+    /// For View/MatView/SubImv: the SQL the object is defined by.
+    pub define_sql: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PlannedCase {
+    pub axes: Axes,
+    pub case: FuzzCase,
+    pub source_objects: Vec<SourceObject>,
+    /// True when maintenance is REFRESH-driven (matview source): the front-end
+    /// must `REFRESH MATERIALIZED VIEW <src>` + `refresh_imv_depending_on(<src>)`
+    /// instead of relying on triggers.
+    pub source_is_refresh_driven: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -277,6 +304,14 @@ pub fn pairwise(space: &[Axes]) -> Vec<Axes> {
     chosen
 }
 
+/// Render an axis assignment to a concrete runnable case. `seq` disambiguates
+/// object names across cases sharing a database. Returns None only for an
+/// assignment `is_valid` admitted but for which no generator template exists
+/// yet (kept explicit so coverage gaps are visible, never silent).
+pub fn plan_case(a: &Axes, seq: u64) -> Option<PlannedCase> {
+    crate::generate::plan_from_axes(a, seq)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -446,5 +481,31 @@ mod tests {
     #[test]
     fn pairwise_is_deterministic() {
         assert_eq!(pairwise(&valid_space()), pairwise(&valid_space()));
+    }
+
+    #[test]
+    fn every_pairwise_case_renders_to_a_planned_case() {
+        for a in pairwise(&valid_space()) {
+            let pc = plan_case(&a, 0).unwrap_or_else(|| panic!("no plan for {a:?}"));
+            assert!(!pc.case.tables.is_empty());
+            assert!(!pc.case.select_body.rendered_sql.is_empty());
+            assert_eq!(pc.axes, a);
+        }
+    }
+
+    #[test]
+    fn planned_case_marks_matview_source_for_refresh_path() {
+        let a = axes(SourceKind::MatView, QueryShape::SingleAggregate, RefreshMode::Immediate, Some(AggFn::Sum));
+        let pc = plan_case(&a, 7).unwrap();
+        assert!(pc.source_is_refresh_driven);
+        assert!(pc.source_objects.iter().any(|o| matches!(o.kind, SourceObjectKind::MatView)));
+    }
+
+    #[test]
+    fn planned_case_seq_makes_names_unique() {
+        let a = axes(SourceKind::Table, QueryShape::Passthrough, RefreshMode::Immediate, None);
+        let p0 = plan_case(&a, 0).unwrap();
+        let p1 = plan_case(&a, 1).unwrap();
+        assert_ne!(p0.case.tables[0].name, p1.case.tables[0].name);
     }
 }
