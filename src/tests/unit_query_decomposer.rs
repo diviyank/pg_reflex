@@ -182,6 +182,17 @@ fn test_staging_delta_table_name_quoted_source() {
 }
 
 #[test]
+fn qualify_in_same_schema_handles_quoted_source() {
+    // Regression lock: a quoted qualified source must yield a single-quoted
+    // schema qualifier, never an empty `""`. Exercised via staging_delta_table_name,
+    // which attaches the schema via qualify_in_same_schema.
+    use crate::query_decomposer::staging_delta_table_name;
+    let out = staging_delta_table_name("\"schema\".\"v__cte_a\"");
+    assert!(out.starts_with("\"schema\".\""), "got {out:?}");
+    assert!(!out.contains("\"\""));
+}
+
+#[test]
 fn test_staging_delta_table_name_bare_source() {
     assert_eq!(
         staging_delta_table_name("rfx.ss"),
