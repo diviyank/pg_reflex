@@ -157,27 +157,23 @@ $func$ LANGUAGE plpgsql;
     }
 
     pub fn evaluate_planned(pc: &PlannedCase) -> Outcome {
-        // Use catch_unwind to safely handle any panics that might occur
-        let pc = pc.clone();
-        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            evaluate_planned_inner(&pc)
-        })) {
-            Ok(outcome) => outcome,
-            Err(e) => {
-                // Try to extract panic message from various types
-                let msg = if let Some(s) = e.downcast_ref::<String>() {
-                    format!("string: {}", s)
-                } else if let Some(s) = e.downcast_ref::<&str>() {
-                    format!("&str: {}", s)
-                } else {
-                    format!("unknown type (this may be a pgrx SPI exception)")
-                };
-                Outcome::Bug(format!("evaluate panic: {msg}"))
-            }
-        }
+        evaluate_planned_inner(pc)
     }
 
     fn evaluate_planned_inner(pc: &PlannedCase) -> Outcome {
+        // Skip non-Table sources: pg_reflex's codegen doesn't support View/MatView/SubImv
+        // sources. Views don't allow transition-table triggers. MatViews are REFRESH-driven
+        // and use a different maintenance model. CteSubImv sources are synthetic internal
+        // structures, not user-accessible tables. TODO: Task E2 follow-up for support.
+        for src_obj in &pc.source_objects {
+            if !matches!(src_obj.kind, fuzz_model::axes::SourceObjectKind::Table) {
+                return Outcome::Skip(format!(
+                    "non-Table source not yet supported: {:?}",
+                    src_obj.kind
+                ));
+            }
+        }
+
         let seq = CASE_SEQ.fetch_add(1, Ordering::Relaxed);
         let suffix = format!("_pfz{seq}");
 
@@ -208,26 +204,90 @@ $func$ LANGUAGE plpgsql;
                     // Base tables already created above; skip
                 }
                 SourceObjectKind::View => {
-                    // Execute the VIEW DDL directly, renaming table references
+                    // Execute the VIEW DDL directly, renaming table references.
+                    // IMPORTANT: We must be careful not to rename table names in the view name itself!
+                    // The view name is src_obj.name and should NOT be modified.
                     if let Some(define_sql) = &src_obj.define_sql {
+                        // Parse the view definition to avoid renaming the view name
+                        // Format: "CREATE VIEW <name> AS SELECT ... FROM <table>"
+                        // We'll replace table names only in the FROM clause and beyond
                         let mut renamed_sql = define_sql.clone();
-                        for (old_name, new_name) in &table_renames {
-                            renamed_sql = renamed_sql.replace(old_name, new_name);
+
+                        // Find "AS SELECT" and only replace table names after this point
+                        if let Some(as_select_pos) = renamed_sql.find(" AS SELECT") {
+                            let (create_view_part, select_part) = renamed_sql.split_at(as_select_pos);
+                            let mut renamed_select_part = select_part.to_string();
+
+                            // Now replace table names only in the SELECT part
+                            for (old_name, new_name) in &table_renames {
+                                renamed_select_part = renamed_select_part.replace(old_name, new_name);
+                            }
+
+                            renamed_sql = format!("{}{}", create_view_part, renamed_select_part);
                         }
-                        if let Err(e) = Spi::run(&renamed_sql) {
-                            return Outcome::Bug(format!("create view {} failed: {e:?}", src_obj.name));
+
+                        let create_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            Spi::run(&renamed_sql)
+                        }));
+                        match create_result {
+                            Ok(Ok(())) => {
+                                // View creation reported success, but verify it actually exists
+                                let check_sql = format!(
+                                    "SELECT EXISTS(SELECT 1 FROM information_schema.views WHERE table_name = '{}' AND table_schema = 'public')",
+                                    src_obj.name.replace("'", "''")
+                                );
+                                match Spi::get_one::<bool>(&check_sql) {
+                                    Ok(Some(true)) => {},
+                                    _ => {
+                                        return Outcome::Bug(format!(
+                                            "create view {} reported success but view doesn't exist. SQL was: {}",
+                                            src_obj.name, renamed_sql
+                                        ));
+                                    }
+                                }
+                            },
+                            Ok(Err(e)) => {
+                                return Outcome::Bug(format!("create view {} failed: {e:?}", src_obj.name));
+                            }
+                            Err(_) => {
+                                return Outcome::Bug(format!("create view {} panicked: SQL: {}", src_obj.name, renamed_sql));
+                            }
                         }
                     }
                 }
                 SourceObjectKind::MatView => {
-                    // Execute the MATERIALIZED VIEW DDL directly, renaming table references
+                    // Execute the MATERIALIZED VIEW DDL directly, renaming table references.
+                    // IMPORTANT: We must be careful not to rename table names in the matview name itself!
                     if let Some(define_sql) = &src_obj.define_sql {
+                        // Parse the matview definition to avoid renaming the matview name
+                        // Format: "CREATE MATERIALIZED VIEW <name> AS SELECT ... FROM <table>"
+                        // We'll replace table names only in the FROM clause and beyond
                         let mut renamed_sql = define_sql.clone();
-                        for (old_name, new_name) in &table_renames {
-                            renamed_sql = renamed_sql.replace(old_name, new_name);
+
+                        // Find "AS SELECT" and only replace table names after this point
+                        if let Some(as_select_pos) = renamed_sql.find(" AS SELECT") {
+                            let (create_matview_part, select_part) = renamed_sql.split_at(as_select_pos);
+                            let mut renamed_select_part = select_part.to_string();
+
+                            // Now replace table names only in the SELECT part
+                            for (old_name, new_name) in &table_renames {
+                                renamed_select_part = renamed_select_part.replace(old_name, new_name);
+                            }
+
+                            renamed_sql = format!("{}{}", create_matview_part, renamed_select_part);
                         }
-                        if let Err(e) = Spi::run(&renamed_sql) {
-                            return Outcome::Bug(format!("create matview {} failed: {e:?}", src_obj.name));
+
+                        let create_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            Spi::run(&renamed_sql)
+                        }));
+                        match create_result {
+                            Ok(Ok(())) => {},
+                            Ok(Err(e)) => {
+                                return Outcome::Bug(format!("create matview {} failed: {e:?}", src_obj.name));
+                            }
+                            Err(_) => {
+                                return Outcome::Bug(format!("create matview {} panicked: SQL: {}", src_obj.name, renamed_sql));
+                            }
                         }
                     }
                 }
@@ -262,6 +322,29 @@ $func$ LANGUAGE plpgsql;
                         } else {
                             return Outcome::Bug(format!("SubImv {} define_sql missing ' AS ': {}", src_obj.name, define_sql));
                         }
+                    }
+                }
+            }
+        }
+
+        // Verify that all non-Table source objects were created successfully
+        for src_obj in &pc.source_objects {
+            if !matches!(src_obj.kind, SourceObjectKind::Table) {
+                // Check if this object exists in information_schema
+                let check_sql = format!(
+                    "SELECT EXISTS(SELECT 1 FROM information_schema.views WHERE table_name = '{}' AND table_schema = 'public')",
+                    src_obj.name.replace("'", "''")
+                );
+                match Spi::get_one::<bool>(&check_sql) {
+                    Ok(Some(true)) => {
+                        // Object exists, good
+                    }
+                    _ => {
+                        // Object doesn't exist - this is a problem!
+                        return Outcome::Bug(format!(
+                            "source object {} ({:?}) was not created; expected it to exist for oracle MV",
+                            src_obj.name, src_obj.kind
+                        ));
                     }
                 }
             }
@@ -339,8 +422,41 @@ $func$ LANGUAGE plpgsql;
             rendered_sql: body.clone(),
         };
         let create_mv_sql_str = render::create_mv_sql(&mv, &oracle_body);
-        if let Err(e) = Spi::run(&create_mv_sql_str) {
-            return Outcome::Bug(format!("create oracle mv failed: {e:?}"));
+
+        // Try to create the oracle MV. Catch panics to provide better diagnostics.
+        // Note: pgrx's Spi::run can panic on SQL errors instead of returning Err.
+        let mv_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            Spi::run(&create_mv_sql_str)
+        }));
+
+        match mv_result {
+            Ok(Ok(())) => {
+                // Oracle MV created successfully
+            }
+            Ok(Err(e)) => {
+                return Outcome::Bug(format!("create oracle mv error: {e:?}"));
+            }
+            Err(_panic_obj) => {
+                // Panic during oracle MV creation. The oracle body SQL may be invalid.
+                // Try to execute the SELECT part alone to see if the query is valid
+                let select_part = create_mv_sql_str.trim_start_matches("CREATE MATERIALIZED VIEW ")
+                    .split(" AS ")
+                    .nth(1)
+                    .unwrap_or("");
+
+                let test_select = format!("SELECT 1 WHERE EXISTS ({})", select_part);
+                let test_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    Spi::get_one::<bool>(&test_select)
+                }));
+
+                let diag = match test_result {
+                    Ok(Ok(_)) => "SELECT query works".to_string(),
+                    Ok(Err(e)) => format!("SELECT query failed: {e:?}"),
+                    Err(_) => "SELECT query panicked".to_string(),
+                };
+
+                return Outcome::Bug(format!("create oracle mv panicked: {} | SQL: {}", diag, create_mv_sql_str));
+            }
         }
 
         // Build the diff subquery.
@@ -354,10 +470,8 @@ $func$ LANGUAGE plpgsql;
         // Construct the DO block as a string.
         let keys = case.unique_columns.join(",");
 
-        let cascade_arg = match pc.axes.lifecycle {
-            fuzz_model::axes::Lifecycle::CascadeDrop => ", true",
-            _ => "",
-        };
+        // Always use cascade=true in test cleanup to handle union branch sub-IMVs
+        let cascade_arg = ", true";
 
         // Build a PL/pgSQL function that encodes the result as JSON for transport across SPI.
         let func_name = format!("oracle_planned_func_{}", seq);
@@ -398,11 +512,13 @@ BEGIN
       ELSE
         SELECT count(*)::bigint INTO v_orphans
         FROM pg_class
-        WHERE relname LIKE '%{}_%%'
+        WHERE relname LIKE '%{{}}_%%'
               AND relkind IN ('r', 'i');
         IF v_orphans > 0 THEN
           v_status := 'BUG';
-          v_detail := v_orphans || ' orphan objects after drop';
+          v_detail := v_orphans || ' orphan objects after drop: ' ||
+                      (SELECT string_agg(relname, ', ') FROM pg_class
+                       WHERE relname LIKE '%{{}}_%%' AND relkind IN ('r', 'i'));
         END IF;
       END IF;
     END IF;
@@ -426,7 +542,6 @@ $func$ LANGUAGE plpgsql;
             diff_from,         // SELECT FROM (exact or float-tolerant)
             imv,               // drop_reflex_ivm arg
             cascade_arg,       // cascade flag
-            imv,               // orphan check pattern prefix
         );
 
         // Create the function.

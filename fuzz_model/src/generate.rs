@@ -620,20 +620,62 @@ fn set_op_union_all_case(a: Table, b: Table) -> FuzzCase {
     }
 }
 
-/// CTE-decomposed case: WITH agg AS (SELECT d AS g, SUM(m) AS sm FROM b GROUP BY d)
-/// SELECT a.id, SUM(a.m) AS s, c.sm FROM a LEFT JOIN agg c ON c.g = a.d GROUP BY a.id, c.sm.
-fn cte_decomposed_case_with(a: Table, b: Table) -> FuzzCase {
+/// CTE-decomposed case: WITH agg AS (SELECT d AS g, {agg}(m) AS agg_col FROM b GROUP BY d)
+/// SELECT a.id, {agg}(a.m) AS s, {outer_agg}(agg.agg_col) AS agg_col FROM a LEFT JOIN agg ON agg.g = a.d GROUP BY a.id.
+/// The inner and outer aggregations depend on the aggregation function:
+/// - Sum: inner SUM(m), outer MAX(agg_col)
+/// - Avg: inner SUM(m), outer MAX(agg_col) -- similar to Sum for simplicity
+/// - Count: inner COUNT(*), outer SUM(agg_col) -- summing counts to get total
+/// - Min/Max: inner {agg}(m), outer {agg}(agg_col)
+fn cte_decomposed_case_with(a: Table, b: Table, agg_fn: AggFn) -> FuzzCase {
+    let (inner_agg, main_agg, outer_agg, output_ty, col_name) = match agg_fn {
+        AggFn::Sum => {
+            ("SUM(m) AS sm", "SUM", "MAX(agg.sm) AS sm", ColType::Numeric, "sm")
+        }
+        AggFn::Avg => {
+            // AVG decomposition: For simplicity, treat like SUM (store sum, apply MAX)
+            ("SUM(m) AS sm", "AVG", "MAX(agg.sm) AS sm", ColType::Numeric, "sm")
+        }
+        AggFn::Count => {
+            // COUNT: inner COUNT(*), outer SUM to aggregate counts across groups
+            ("COUNT(*) AS cnt", "COUNT", "SUM(agg.cnt) AS cnt", ColType::BigInt, "cnt")
+        }
+        AggFn::Min => {
+            ("MIN(m) AS mn", "MIN", "MIN(agg.mn) AS mn", ColType::Numeric, "mn")
+        }
+        AggFn::Max => {
+            ("MAX(m) AS mx", "MAX", "MAX(agg.mx) AS mx", ColType::Numeric, "mx")
+        }
+    };
+
+    // Build the main SELECT aggregation:
+    // - For Sum/Avg/Min/Max: use the aggregation function on the measure column
+    // - For Count: use COUNT(*)
+    let main_select_agg = if matches!(agg_fn, AggFn::Count) {
+        format!("COUNT(*)").into()
+    } else {
+        format!("{}({}.m)", main_agg, a.name)
+    };
+
     let body = SelectBody {
         rendered_sql: format!(
-            "WITH agg AS (SELECT d AS g, SUM(m) AS sm FROM {} GROUP BY d) \
-             SELECT {}.id, SUM({}.m) AS s, agg.sm FROM {} LEFT JOIN agg ON agg.g = {}.d GROUP BY {}.id, agg.sm",
-            b.name, a.name, a.name, a.name, a.name, a.name
+            "WITH agg AS (SELECT d AS g, {} FROM {} GROUP BY d) \
+             SELECT {}.id, {} AS s, {} FROM {} LEFT JOIN agg ON agg.g = {}.d GROUP BY {}.id",
+            inner_agg,
+            b.name,
+            a.name,
+            main_select_agg,
+            outer_agg,
+            a.name,
+            a.name,
+            a.name
         ),
     };
+
     let output_columns = vec![
         Column { name: "id".into(), ty: ColType::Int, nullable: false },
-        Column { name: "s".into(), ty: ColType::Numeric, nullable: true },
-        Column { name: "sm".into(), ty: ColType::Numeric, nullable: true },
+        Column { name: "s".into(), ty: output_ty, nullable: true },
+        Column { name: col_name.into(), ty: output_ty, nullable: true },
     ];
     FuzzCase {
         tables: vec![a.clone(), b.clone()],
@@ -674,6 +716,7 @@ fn base_case_for_shape(a: &Axes, seq: u64) -> Option<FuzzCase> {
             Some(cte_decomposed_case_with(
                 det_table(seq, 0, a.measure_ty),
                 det_table(seq, 1, a.measure_ty),
+                a.agg?,
             ))
         }
         QueryShape::SetOpUnionAll => {

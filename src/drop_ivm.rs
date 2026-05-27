@@ -57,6 +57,56 @@ pub(crate) fn drop_reflex_ivm_impl(view_name: &str, cascade: bool) -> &'static s
             }
         }
 
+        // 3b. For decomposed views (SetOpUnionAll, CteDecomposed, DistinctOn), also drop
+        // the sub-IMVs listed in depends_on_imv. These are synthetic IMVs created exclusively
+        // for this decomposed view. When the parent is dropped with cascade=true, these
+        // sub-IMVs should also be dropped (they serve no purpose without the parent).
+        if cascade && !depends_on_imv.is_empty() {
+            for sub_imv in &depends_on_imv {
+                // First, remove the parent from the sub-IMV's graph_child to break the circular
+                // dependency before we recursively drop the sub-IMV.
+                client
+                    .update(
+                        "UPDATE public.__reflex_ivm_reference \
+                         SET graph_child = array_remove(graph_child, $1) \
+                         WHERE name = $2",
+                        None,
+                        &[
+                            unsafe {
+                                DatumWithOid::new(
+                                    view_name.to_string(),
+                                    PgBuiltInOids::TEXTOID.oid().value(),
+                                )
+                            },
+                            unsafe {
+                                DatumWithOid::new(sub_imv.clone(), PgBuiltInOids::TEXTOID.oid().value())
+                            },
+                        ],
+                    )
+                    .unwrap_or_report();
+
+                // Check if this sub_imv is actually an IMV in the reference table
+                // (it should be, but check to be safe)
+                let sub_exists = client
+                    .select(
+                        "SELECT 1 FROM public.__reflex_ivm_reference WHERE name = $1",
+                        None,
+                        &[unsafe {
+                            DatumWithOid::new(sub_imv.clone(), PgBuiltInOids::TEXTOID.oid().value())
+                        }],
+                    )
+                    .unwrap_or_report()
+                    .is_empty() == false;
+
+                if sub_exists {
+                    let result = drop_reflex_ivm_impl(sub_imv, true);
+                    if result.starts_with("ERROR") {
+                        return result;
+                    }
+                }
+            }
+        }
+
         // 4. Drop consolidated triggers only if no OTHER IMV depends on this source.
         //    The trigger function is shared; it discovers IMVs via the reference table.
         //    We must delete the reference row FIRST (step 8) so the trigger stops
@@ -162,6 +212,7 @@ pub(crate) fn drop_reflex_ivm_impl(view_name: &str, cascade: bool) -> &'static s
                 &[],
             )
             .unwrap_or_report();
+
 
         // 6b. Drop persistent affected-groups table (qualified in IMV's schema, 1.4.1).
         client
