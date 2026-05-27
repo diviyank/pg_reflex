@@ -510,8 +510,34 @@ fn agg_fn_sql(fn_name: AggFn, col: &str) -> String {
     }
 }
 
+/// Map aggregate function and input column type to the PostgreSQL result type.
+/// Follows PostgreSQL semantics for aggregate return types.
+fn agg_result_ty(agg_fn: AggFn, input_ty: ColType) -> ColType {
+    use AggFn::*;
+    match agg_fn {
+        Count => ColType::BigInt, // COUNT always returns bigint
+        Sum => match input_ty {
+            ColType::Int => ColType::BigInt,      // SUM(int) → bigint
+            ColType::BigInt | ColType::Numeric => ColType::Numeric, // SUM(bigint|numeric) → numeric
+            ColType::Float8 => ColType::Float8,   // SUM(float8) → float8
+            other => other, // Defensive: SUM is only generated over numeric-family
+        },
+        Avg => match input_ty {
+            ColType::Float8 => ColType::Float8, // AVG(float8) → float8
+            _ => ColType::Numeric, // AVG(int|bigint|numeric) → numeric
+        },
+        Min | Max => input_ty, // MIN/MAX preserve input type
+    }
+}
+
 /// Single-table aggregate with a parameterized agg function.
 fn aggregate_case_with(t: Table, agg_fn: AggFn) -> FuzzCase {
+    // Find the measure column type (column 'm' in the table).
+    let measure_ty = t.columns.iter()
+        .find(|c| c.name == "m")
+        .map(|c| c.ty)
+        .unwrap_or(ColType::Numeric); // Defensive default
+
     let agg_expr = agg_fn_sql(agg_fn, "m");
     let body = SelectBody {
         rendered_sql: format!(
@@ -521,7 +547,7 @@ fn aggregate_case_with(t: Table, agg_fn: AggFn) -> FuzzCase {
     };
     let output_columns = vec![
         Column { name: "d".into(), ty: ColType::Text, nullable: true },
-        Column { name: "s".into(), ty: ColType::Numeric, nullable: true },
+        Column { name: "s".into(), ty: agg_result_ty(agg_fn, measure_ty), nullable: true },
         Column { name: "c".into(), ty: ColType::BigInt, nullable: false },
     ];
     let seed = DmlTxn {
@@ -539,6 +565,12 @@ fn aggregate_case_with(t: Table, agg_fn: AggFn) -> FuzzCase {
 
 /// Two-table join aggregate with parameterized agg function and join type.
 fn join_aggregate_case_with(a: Table, b: Table, agg_fn: AggFn, is_left: bool) -> FuzzCase {
+    // Find the measure column type (column 'm' in table a, the primary side).
+    let measure_ty = a.columns.iter()
+        .find(|c| c.name == "m")
+        .map(|c| c.ty)
+        .unwrap_or(ColType::Numeric); // Defensive default
+
     let join_type = if is_left { "LEFT JOIN" } else { "INNER JOIN" };
     let agg_expr = agg_fn_sql(agg_fn, "a.m");
     let body = SelectBody {
@@ -547,9 +579,10 @@ fn join_aggregate_case_with(a: Table, b: Table, agg_fn: AggFn, is_left: bool) ->
             agg_expr, a.name, join_type, b.name
         ),
     };
+    // COUNT(b.m) counts the right-hand/joined side column to measure match count
     let output_columns = vec![
         Column { name: "d".into(), ty: ColType::Text, nullable: true },
-        Column { name: "s".into(), ty: ColType::Numeric, nullable: true },
+        Column { name: "s".into(), ty: agg_result_ty(agg_fn, measure_ty), nullable: true },
         Column { name: "c".into(), ty: ColType::BigInt, nullable: false },
     ];
     FuzzCase {
@@ -653,7 +686,8 @@ fn base_case_for_shape(a: &Axes, seq: u64) -> Option<FuzzCase> {
 }
 
 /// Rewrite source references in rendered_sql based on the source kind and return
-/// the source objects to create.
+/// the source objects to create. String replacement is safe: det_table names (ft_<seq>_<idx>)
+/// are unique and unambiguous.
 fn wrap_sources(a: &Axes, case: &mut FuzzCase, seq: u64) -> (Vec<SourceObject>, bool) {
     match a.source {
         SourceKind::Table => {
