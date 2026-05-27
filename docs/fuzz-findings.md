@@ -1,6 +1,11 @@
 # Differential Fuzz Harness Findings
 
-This document catalogs open findings from the differential correctness fuzz harness (`src/tests/pg_test_fuzz.rs`).
+This document catalogs findings from the differential correctness fuzz harness (`src/tests/pg_test_fuzz.rs`).
+
+The harness has two in-backend front-ends (`cargo pgrx test pg17`):
+
+- **`fuzz_differential_exact` / `fuzz_planned_random`** — randomized property tests over a pgrx-free axis model (`fuzz_model`), comparing an incrementally-maintained IMV against an independently-refreshed `MATERIALIZED VIEW`.
+- **`fuzz_pairwise_matrix_gate`** — a *deterministic* all-pairs (pairwise) gate over seven axes (source kind, query shape, refresh mode, aggregate fn, measure type, unique-key presence, lifecycle). It guarantees every 2-way feature interaction is exercised once and is the standing regression gate against the "creation-bug class". Scope is currently **Table sources** (View/MatView/CteSubImv as IMV *sources* are out of scope; decomposed query *shapes* over Table sources are covered). Each session bug is additionally pinned to a named `regression_*` row, revert-verified.
 
 ## Finding #1: LEFT JOIN Unmatched Primary Insert Drops Row
 
@@ -192,4 +197,39 @@ cargo pgrx test pg17 finding_2_deferred_mode_duplicate_key_violation
 
 ```bash
 cargo pgrx test pg17 finding_4_filtered_float_aggregate_null_group_diff_safe
+```
+
+## Finding #5: Non-Cascade Drop of a Decomposed View Orphans Its Sub-IMVs
+
+**Status:** FIXED (`src/drop_ivm.rs`)
+
+**Title:** Dropping a CTE/set-op/DISTINCT-ON-decomposed IMV without `cascade=true` left every internal synthetic sub-IMV behind — its result table, intermediate, scratch, affected-groups table, indexes, and its `__reflex_ivm_reference` row.
+
+**Exact Repro:**
+
+```sql
+CREATE TABLE nd_a (id int primary key, g int, m numeric);
+CREATE TABLE nd_b (id int primary key, fk int, w numeric);
+SELECT create_reflex_ivm('nd_imv',
+  'WITH agg AS (SELECT fk AS g, SUM(w) AS sw FROM nd_b GROUP BY fk)
+   SELECT nd_a.id, SUM(nd_a.m) AS s, a.sw FROM nd_a LEFT JOIN agg a ON a.g = nd_a.id GROUP BY nd_a.id, a.sw',
+  'id');
+SELECT drop_reflex_ivm('nd_imv');   -- non-cascade
+-- BUG: nd_imv__cte_agg + __reflex_{intermediate,scratch,affected}_nd_imv__cte_agg
+--      + its indexes + its reference row all remain.
+```
+
+**Confirmed Root Cause:**
+
+`try_decompose_ctes` creates each CTE as a recursive sub-IMV named `<view>__cte_<alias>`, then creates the parent as a *normal* IMV whose body references those sub-IMVs as quoted sources. The sub-IMV therefore lands in the parent's **`depends_on`** (as `"<view>__cte_x"`), and its `depends_on_imv`/`graph_child` columns stay **empty**. The old cleanup (`drop_ivm.rs` step 3b) looped over `depends_on_imv` and so was **dead code**. Cascade *appeared* to work only because `DROP ... CASCADE` plus a broken orphan check in the gate (`LIKE '%{{}}_%%'` — a `format!` escape rendering the literal SQL `'%{}_%'`, matching nothing) hid the leftovers. A nested `Spi::connect_mut` recursive drop also silently fails to persist its teardown.
+
+**Fix:** `drop_reflex_ivm_impl` now collects `depends_on` entries that are registered IMVs **prefixed `<view>__`** (the deterministic synthetic-sub-IMV naming; the prefix guard excludes user-chained IMVs the view legitimately reads from) and drops them as **fresh top-level calls** after the parent's own teardown — unconditionally, cascade or not. The pairwise gate now derives the drop's cascade flag from the Lifecycle axis and its orphan check matches the real IMV name.
+
+**Lesson:** dead cleanup code can masquerade as working when a second mechanism (here `DROP ... CASCADE`) and a no-op verification (the literal-brace orphan check) both happen to hide its absence. Verify the check fires before trusting that it passes.
+
+**Test References:**
+
+```bash
+cargo pgrx test pg17 drop_decomposed_imv_noncascade_leaves_no_subimv_orphans
+cargo pgrx test pg17 regression_decomp_cte_cascade_drop
 ```
