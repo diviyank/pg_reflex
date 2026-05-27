@@ -15,6 +15,20 @@ pub use crate::sql_writer::identifier::{
     replace_identifier, safe as safe_identifier, split_qualified as split_qualified_name,
 };
 
+/// The single normalization point for a stored source name. A CTE-decomposed
+/// sub-IMV source is persisted double-quoted (`"schema"."view__cte_x"`) to
+/// preserve identifier case, while real-table sources are stored bare
+/// (`schema.table`). This returns both components **unquoted** so every
+/// name-builder works from one canonical form. Routing all consumers through
+/// here makes the quoting-bug family (1, 4, 5) structurally impossible.
+pub fn canonical_source(name: &str) -> (Option<String>, String) {
+    let (schema, bare) = split_qualified_name(name);
+    (
+        schema.map(|s| unquote_ident_component(s).to_string()),
+        unquote_ident_component(bare).to_string(),
+    )
+}
+
 /// Name of the intermediate (unlogged) table for a given view.
 /// For schema-qualified names, the intermediate table is in the same schema.
 /// Always returns a quoted identifier reference (1.4.1) so usage sites can
@@ -30,9 +44,15 @@ pub fn intermediate_table_name(view_name: &str) -> String {
 
 /// Canonical sanitized form of a source_table name used as a suffix in
 /// generated trigger-side identifiers (transition tables, staging delta).
-/// Strips schema dots and quotes so the suffix is a bare identifier body.
+/// Routes through `canonical_source` to unquote both components, then builds
+/// the suffix from the canonical form. Strips schema dots and quotes so the
+/// suffix is a bare identifier body.
 pub fn sanitized_source_suffix(source_table: &str) -> String {
-    source_table.replace('.', "_").replace('"', "")
+    let (schema, bare) = canonical_source(source_table);
+    match schema {
+        Some(s) => format!("{s}_{bare}"),
+        None => bare,
+    }
 }
 
 /// Name of the NEW transition table for a source table's triggers.

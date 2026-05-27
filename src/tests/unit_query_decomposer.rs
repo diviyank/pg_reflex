@@ -261,3 +261,43 @@ mod proptest_tests {
         }
     }
 }
+
+#[test]
+fn canonical_source_unquotes_both_components() {
+    use crate::query_decomposer::canonical_source;
+    assert_eq!(
+        canonical_source("schema.table"),
+        (Some("schema".to_string()), "table".to_string())
+    );
+    assert_eq!(
+        canonical_source("\"schema\".\"view__cte_x\""),
+        (Some("schema".to_string()), "view__cte_x".to_string())
+    );
+    assert_eq!(canonical_source("bare"), (None, "bare".to_string()));
+    assert_eq!(
+        canonical_source("\"Mixed\""),
+        (None, "Mixed".to_string())
+    );
+}
+
+#[test]
+fn name_builders_never_emit_doubled_or_empty_quotes() {
+    use crate::query_decomposer::{
+        sanitized_source_suffix, staging_delta_table_name, transition_new_table_name,
+        transition_old_table_name,
+    };
+    for src in ["schema.table", "\"schema\".\"view__cte_x\"", "bare", "\"Mixed\""] {
+        let outputs = vec![
+            ("sanitized_source_suffix", sanitized_source_suffix(src)),
+            ("staging_delta_table_name", staging_delta_table_name(src)),
+            ("transition_new_table_name", transition_new_table_name(src)),
+            ("transition_old_table_name", transition_old_table_name(src)),
+        ];
+        for (fn_name, out) in outputs {
+            assert!(
+                !out.contains("\"\""),
+                "doubled quote in {fn_name}({src:?}) = {out:?}"
+            );
+        }
+    }
+}
