@@ -985,6 +985,129 @@ fn regression_bug3_count_over_left_join_secondary_side() {
     assert_eq!(diff, 0, "Bug 3 regressed: IMV diverged from MV by {diff} rows");
 }
 
+// ---------------------------------------------------------------------------
+// Creation-bug class regression rows (this session's 2-way interaction bugs).
+//
+// Each pins one feature interaction from the b41f4fb/1.6.5 bug family to a
+// deterministic, axes-driven case run through the full differential oracle
+// (create → mutate → refresh → diff → drop → orphan-check). The gate is scoped
+// to Table sources (see fuzz_model::axes::all_source), so each row drives the
+// machinery the bug lived in (CTE/set-op decomposition, deferred maintenance,
+// non-numeric aggregate output typing, partition propagation, cascade vs plain
+// drop) over Table sources rather than via View/MatView/CteSubImv *sources*,
+// which are out of scope. A revert of the corresponding fix turns the row red.
+// ---------------------------------------------------------------------------
+
+/// Asserts the planned case is valid and the oracle does not flag a divergence.
+#[cfg(any(test, feature = "pg_test"))]
+fn assert_planned_matches(a: &fuzz_model::axes::Axes, seq: u64, label: &str) {
+    let pc = fuzz_model::axes::plan_case(a, seq)
+        .unwrap_or_else(|| panic!("{label}: axes must be valid: {a:?}"));
+    match oracle::evaluate_planned(&pc) {
+        oracle::Outcome::Match | oracle::Outcome::Skip(_) => {}
+        oracle::Outcome::Bug(d) => panic!("{label} regressed: {d}"),
+    }
+}
+
+/// Bug 1 analog — a CTE-decomposed IMV under DEFERRED maintenance. The internal
+/// sub-IMV is created with a quoted `<view>__cte_…` source; the quoting/trigger
+/// path (canonical_source) must round-trip so deferred maintenance matches.
+#[cfg(any(test, feature = "pg_test"))]
+#[pg_test]
+fn regression_decomp_cte_deferred_creates() {
+    use fuzz_model::axes::*;
+    use fuzz_model::model::ColType;
+    let a = Axes {
+        source: SourceKind::Table,
+        shape: QueryShape::CteDecomposed,
+        refresh: RefreshMode::Deferred,
+        agg: Some(AggFn::Sum),
+        measure_ty: ColType::Numeric,
+        unique: UniqueCols::Absent,
+        lifecycle: Lifecycle::CreateMutateDrop,
+    };
+    assert_planned_matches(&a, 200_001, "decomposed CTE × deferred");
+}
+
+/// Bug 2 analog — an explicit unique key threaded through a JOIN-aggregate IMV.
+/// Locks that the provided key reaches the create path (the threading fix),
+/// keeping the IMV populated and matching the MV.
+#[cfg(any(test, feature = "pg_test"))]
+#[pg_test]
+fn regression_join_provided_unique_key_threads() {
+    use fuzz_model::axes::*;
+    use fuzz_model::model::ColType;
+    let a = Axes {
+        source: SourceKind::Table,
+        shape: QueryShape::JoinInner,
+        refresh: RefreshMode::Immediate,
+        agg: Some(AggFn::Sum),
+        measure_ty: ColType::Numeric,
+        unique: UniqueCols::Provided,
+        lifecycle: Lifecycle::CreateMutateDrop,
+    };
+    assert_planned_matches(&a, 200_002, "join × provided unique key");
+}
+
+/// Bug 3 analog — MIN over a non-numeric (timestamptz) measure. Locks the
+/// aggregate output-type inference (agg_result_ty): the result column must be
+/// typed timestamptz, not hardcoded numeric.
+#[cfg(any(test, feature = "pg_test"))]
+#[pg_test]
+fn regression_minmax_nonnumeric_output_type() {
+    use fuzz_model::axes::*;
+    use fuzz_model::model::ColType;
+    let a = Axes {
+        source: SourceKind::Table,
+        shape: QueryShape::SingleAggregate,
+        refresh: RefreshMode::Immediate,
+        agg: Some(AggFn::Min),
+        measure_ty: ColType::Timestamptz,
+        unique: UniqueCols::Absent,
+        lifecycle: Lifecycle::CreateMutateDrop,
+    };
+    assert_planned_matches(&a, 200_003, "min × timestamptz output type");
+}
+
+/// Bug 4 analog — CASCADE drop of a CTE-decomposed IMV must remove its internal
+/// sub-IMVs with no orphans (complements the non-cascade lock in
+/// drop_decomposed_imv_noncascade_leaves_no_subimv_orphans).
+#[cfg(any(test, feature = "pg_test"))]
+#[pg_test]
+fn regression_decomp_cte_cascade_drop() {
+    use fuzz_model::axes::*;
+    use fuzz_model::model::ColType;
+    let a = Axes {
+        source: SourceKind::Table,
+        shape: QueryShape::CteDecomposed,
+        refresh: RefreshMode::Immediate,
+        agg: Some(AggFn::Sum),
+        measure_ty: ColType::Numeric,
+        unique: UniqueCols::Absent,
+        lifecycle: Lifecycle::CascadeDrop,
+    };
+    assert_planned_matches(&a, 200_004, "decomposed CTE × cascade drop");
+}
+
+/// Bug 5 analog — a partitioned CTE-decomposed IMV. Locks partition-subset
+/// propagation into the decomposition sub-IMVs.
+#[cfg(any(test, feature = "pg_test"))]
+#[pg_test]
+fn regression_decomp_cte_partitioned() {
+    use fuzz_model::axes::*;
+    use fuzz_model::model::ColType;
+    let a = Axes {
+        source: SourceKind::Table,
+        shape: QueryShape::CteDecomposed,
+        refresh: RefreshMode::Immediate,
+        agg: Some(AggFn::Sum),
+        measure_ty: ColType::Numeric,
+        unique: UniqueCols::Absent,
+        lifecycle: Lifecycle::Partitioned,
+    };
+    assert_planned_matches(&a, 200_005, "decomposed CTE × partitioned");
+}
+
 /// Deterministic pairwise matrix CI gate.
 ///
 /// Runs the full pairwise set of axes combinations through `evaluate_planned`.
