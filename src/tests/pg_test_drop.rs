@@ -443,3 +443,59 @@ fn drop_decomposed_imv_noncascade_leaves_no_subimv_orphans() {
     .unwrap();
     assert_eq!(class_left, 0, "orphan tables/indexes remain after non-cascade drop");
 }
+
+#[pg_test]
+fn test_union_all_intermediate_wrapper_has_src_idx_column() {
+    Spi::run(
+        "CREATE TABLE us_orders(id INT PRIMARY KEY, country TEXT, amount NUMERIC);
+         CREATE TABLE eu_orders(id INT PRIMARY KEY, country TEXT, amount NUMERIC);
+         INSERT INTO us_orders VALUES (1, 'US', 100);
+         INSERT INTO eu_orders VALUES (1, 'FR', 200);",
+    )
+    .unwrap();
+
+    let res = Spi::get_one::<String>(
+        "SELECT create_reflex_ivm(
+           view_name => 'ord_imv',
+           sql       => 'WITH all_ord AS (
+                           SELECT id, country, amount FROM us_orders
+                           UNION ALL
+                           SELECT id, country, amount FROM eu_orders
+                         )
+                         SELECT country, SUM(amount) AS total
+                         FROM all_ord
+                         GROUP BY country',
+           storage   => 'UNLOGGED'
+         )",
+    )
+    .unwrap()
+    .unwrap_or_default();
+    assert!(res.contains("CREATE"), "create_reflex_ivm returned: {res}");
+
+    // The CTE wrapper is registered as `ord_imv__cte_all_ord`.
+    // It must carry __reflex_src_idx as a SMALLINT NOT NULL column.
+    let idx_col_type: Option<String> = Spi::get_one(
+        "SELECT format_type(a.atttypid, a.atttypmod)
+         FROM pg_attribute a
+         JOIN pg_class c ON c.oid = a.attrelid
+         WHERE c.relname = 'ord_imv__cte_all_ord'
+           AND a.attname = '__reflex_src_idx'
+           AND a.attnum > 0",
+    )
+    .unwrap();
+    assert_eq!(
+        idx_col_type.as_deref(),
+        Some("smallint"),
+        "__reflex_src_idx column missing or wrong type on wrapper table"
+    );
+
+    let notnull: Option<bool> = Spi::get_one(
+        "SELECT a.attnotnull
+         FROM pg_attribute a
+         JOIN pg_class c ON c.oid = a.attrelid
+         WHERE c.relname = 'ord_imv__cte_all_ord'
+           AND a.attname = '__reflex_src_idx'",
+    )
+    .unwrap();
+    assert_eq!(notnull, Some(true), "__reflex_src_idx must be NOT NULL");
+}
