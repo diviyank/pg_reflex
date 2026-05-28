@@ -4,6 +4,14 @@ This page lists behaviours that surprise operators and are still open. Items
 that have been resolved live in the [release notes](../changelog.md) and are
 not duplicated here.
 
+## Intra-operand duplicate over-delete in `UNION ALL` CTE wrappers
+
+An intermediate `UNION ALL` CTE wrapper (e.g. `WITH x AS (SELECT … FROM a UNION ALL SELECT … FROM b) SELECT … FROM x …`) matches per-operand DELETEs by `__reflex_src_idx = <operand_idx> AND (cols) IS NOT DISTINCT FROM (old cols)`. If a single operand projects multiple rows that are **identical across every projected column**, a DELETE of one of those rows from the source removes all the wrapper rows that came from that operand and matched those values.
+
+The `__reflex_src_idx` discriminator (1.7.0+) fixes the orthogonal cross-operand case (rows with identical values contributed by *different* operands are now isolated).
+
+**Workaround**: include a primary key or unique column in each operand's projection. The wrapper then matches by that column and no over-delete occurs.
+
 ## Passthrough duplicate-row collapse
 
 Passthrough IMVs match rows by content for incremental DELETE/UPDATE. If the

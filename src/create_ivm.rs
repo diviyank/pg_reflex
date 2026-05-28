@@ -562,35 +562,24 @@ fn install_union_all_intermediate_wrapper(
 
     // 1. Discover operand columns from operand 0 (UNION-ALL operands are
     //    union-compatible, so operand 0 defines the column shape).
+    //    Resolve via `to_regclass($1)` so the session's `search_path` is
+    //    honoured — operand sub-IMV names are created unqualified, so the
+    //    earlier `nspname = $1` form silently looked in `public` and missed
+    //    tenant-schema operands.
     let operand0 = &operand_sub_imv_names[0];
-    let (operand0_schema, operand0_bare) = split_qualified_name(operand0);
-    let operand0_schema_str = operand0_schema.unwrap_or("public");
     let col_rows: Vec<(String, String)> = client
         .select(
             "SELECT a.attname::text AS name, \
                     format_type(a.atttypid, a.atttypmod) AS pg_type \
              FROM pg_catalog.pg_attribute a \
              JOIN pg_catalog.pg_class c ON c.oid = a.attrelid \
-             JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
-             WHERE n.nspname = $1 \
-               AND c.relname = $2 \
+             WHERE c.oid = to_regclass($1) \
                AND a.attnum > 0 AND NOT a.attisdropped \
              ORDER BY a.attnum",
             None,
-            &[
-                unsafe {
-                    DatumWithOid::new(
-                        operand0_schema_str.to_string(),
-                        PgBuiltInOids::TEXTOID.oid().value(),
-                    )
-                },
-                unsafe {
-                    DatumWithOid::new(
-                        operand0_bare.to_string(),
-                        PgBuiltInOids::TEXTOID.oid().value(),
-                    )
-                },
-            ],
+            &[unsafe {
+                DatumWithOid::new(operand0.to_string(), PgBuiltInOids::TEXTOID.oid().value())
+            }],
         )
         .unwrap_or_report()
         .filter_map(|r| {
@@ -1188,33 +1177,28 @@ fn resolve_unique_columns(ctx: &mut BuildContext) {
 
         let real_sources: Vec<&String> = ctx.real_source_names.iter().collect();
         for source in &real_sources {
-            let (src_schema, src_name) = split_qualified_name(source);
-            let src_schema_str = src_schema.unwrap_or("public");
-
             let pk_cols: Vec<String> = Spi::connect(|client| {
                 client
                     .select(
                         "SELECT array_agg(a.attname ORDER BY k.n) as cols \
                          FROM pg_index ix \
-                         JOIN pg_class t ON t.oid = ix.indrelid \
-                         JOIN pg_namespace n ON n.oid = t.relnamespace \
                          JOIN LATERAL unnest(ix.indkey) WITH ORDINALITY AS k(col, n) ON true \
-                         JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = k.col \
-                         WHERE n.nspname = $1 AND t.relname = $2 AND ix.indisunique AND ix.indisprimary \
+                         JOIN pg_attribute a ON a.attrelid = ix.indrelid AND a.attnum = k.col \
+                         WHERE ix.indrelid = to_regclass($1) \
+                           AND ix.indisunique AND ix.indisprimary \
                          GROUP BY ix.indexrelid \
                          ORDER BY count(*) \
                          LIMIT 1",
                         None,
-                        &[
-                            unsafe { DatumWithOid::new(src_schema_str.to_string(), PgBuiltInOids::TEXTOID.oid().value()) },
-                            unsafe { DatumWithOid::new(src_name.to_string(), PgBuiltInOids::TEXTOID.oid().value()) },
-                        ],
+                        &[unsafe {
+                            DatumWithOid::new(
+                                source.to_string(),
+                                PgBuiltInOids::TEXTOID.oid().value(),
+                            )
+                        }],
                     )
                     .unwrap_or_report()
-                    .filter_map(|row| {
-                        row.get_by_name::<Vec<String>, _>("cols")
-                            .unwrap_or(None)
-                    })
+                    .filter_map(|row| row.get_by_name::<Vec<String>, _>("cols").unwrap_or(None))
                     .next()
                     .unwrap_or_default()
             });
@@ -3036,8 +3020,6 @@ pub(crate) fn count_equalities_involving_source(
 /// contained in `cols` (case-insensitive). Falls back to `false` on any
 /// catalog access error — safe to refuse the bulk path on doubt.
 fn source_cols_cover_unique_key(source: &str, cols: &[String]) -> bool {
-    let (schema, name) = split_qualified_name(source);
-    let schema_str = schema.unwrap_or("public");
     let cols_lower: std::collections::HashSet<String> =
         cols.iter().map(|c| c.to_lowercase()).collect();
 
@@ -3046,24 +3028,14 @@ fn source_cols_cover_unique_key(source: &str, cols: &[String]) -> bool {
             .select(
                 "SELECT array_agg(a.attname::TEXT ORDER BY k.n) AS cols \
                  FROM pg_index ix \
-                 JOIN pg_class t ON t.oid = ix.indrelid \
-                 JOIN pg_namespace n ON n.oid = t.relnamespace \
                  JOIN LATERAL unnest(ix.indkey) WITH ORDINALITY AS k(col, n) ON true \
-                 JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = k.col \
-                 WHERE n.nspname = $1 AND t.relname = $2 AND ix.indisunique \
+                 JOIN pg_attribute a ON a.attrelid = ix.indrelid AND a.attnum = k.col \
+                 WHERE ix.indrelid = to_regclass($1) AND ix.indisunique \
                  GROUP BY ix.indexrelid",
                 None,
-                &[
-                    unsafe {
-                        DatumWithOid::new(
-                            schema_str.to_string(),
-                            PgBuiltInOids::TEXTOID.oid().value(),
-                        )
-                    },
-                    unsafe {
-                        DatumWithOid::new(name.to_string(), PgBuiltInOids::TEXTOID.oid().value())
-                    },
-                ],
+                &[unsafe {
+                    DatumWithOid::new(source.to_string(), PgBuiltInOids::TEXTOID.oid().value())
+                }],
             )
             .unwrap_or_report()
             .filter_map(|row| row.get_by_name::<Vec<String>, _>("cols").unwrap_or(None))
@@ -3081,31 +3053,19 @@ fn source_cols_cover_unique_key(source: &str, cols: &[String]) -> bool {
 /// table has no primary key or on any catalog error. PK columns are NOT NULL,
 /// so they are a true unique key (unlike a nullable UNIQUE index).
 fn source_primary_key_columns(source: &str) -> Vec<String> {
-    let (schema, name) = split_qualified_name(source);
-    let schema_str = schema.unwrap_or("public");
     Spi::connect(|client| {
         client
             .select(
                 "SELECT a.attname::TEXT AS col \
                  FROM pg_index ix \
-                 JOIN pg_class t ON t.oid = ix.indrelid \
-                 JOIN pg_namespace n ON n.oid = t.relnamespace \
                  JOIN LATERAL unnest(ix.indkey) WITH ORDINALITY AS k(col, ord) ON true \
-                 JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = k.col \
-                 WHERE n.nspname = $1 AND t.relname = $2 AND ix.indisprimary \
+                 JOIN pg_attribute a ON a.attrelid = ix.indrelid AND a.attnum = k.col \
+                 WHERE ix.indrelid = to_regclass($1) AND ix.indisprimary \
                  ORDER BY k.ord",
                 None,
-                &[
-                    unsafe {
-                        DatumWithOid::new(
-                            schema_str.to_string(),
-                            PgBuiltInOids::TEXTOID.oid().value(),
-                        )
-                    },
-                    unsafe {
-                        DatumWithOid::new(name.to_string(), PgBuiltInOids::TEXTOID.oid().value())
-                    },
-                ],
+                &[unsafe {
+                    DatumWithOid::new(source.to_string(), PgBuiltInOids::TEXTOID.oid().value())
+                }],
             )
             .unwrap_or_report()
             .filter_map(|row| {

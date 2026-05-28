@@ -1,5 +1,116 @@
 # Changelog
 
+## [1.7.0] - 2026-05-28
+
+Refactor + correctness release for intermediate `UNION ALL` CTE-body wrappers.
+The inline wrapper-construction code in `try_decompose_set_op` is centralised
+into one helper; the wrapper table gains a `__reflex_src_idx` discriminator
+column that fixes a cross-operand `DELETE` over-delete; non-`ALL` set ops
+used as CTE bodies are now rejected at create time with an actionable error;
+and `drop_reflex_ivm` cascade no longer leaks `__reflex_union_mirror_*` trigger
+functions in `pg_proc`. No catalog schema changes, no trigger body changes,
+no API changes. Run `ALTER EXTENSION pg_reflex UPDATE TO '1.7.0';` to register
+the new version; the migration file is a no-op marker. **Existing UNION-ALL
+CTE IMVs created under ≤1.6.5 must be dropped and recreated** to pick up the
+cross-operand `DELETE` fix (see Migration).
+
+---
+
+### Fixed
+
+- **Cross-operand `DELETE` over-delete in intermediate `UNION ALL` CTE
+  wrappers.**  A `DELETE` from operand A would over-delete a wrapper row
+  contributed by operand B when both operands projected the same column
+  values for the deleted row.  The per-operand mirror trigger matched by
+  all-column `IS NOT DISTINCT FROM` with no operand-identity filter, so it
+  also removed B's row.  The wrapper table now carries a leading
+  `__reflex_src_idx SMALLINT NOT NULL` discriminator column populated with
+  the operand index; the mirror `DELETE` predicate now scopes to
+  `__reflex_src_idx = <operand_idx> AND <cols> IS NOT DISTINCT FROM <old>`.
+  *Create-time fix — recreate any UNION-ALL CTE IMV built under ≤1.6.5
+  (see Migration).*
+- **`__reflex_union_mirror_*` trigger functions orphaned in `pg_proc`
+  after `drop_reflex_ivm` cascade.**  Operand-sub-IMV cascade dropped the
+  mirror triggers themselves but not their plpgsql functions, leaving
+  three orphans per operand in `public` until a same-named overwrite.
+  `drop_reflex_ivm_impl_inner` now detects UNION-ALL wrappers by the
+  `__union_<i>` suffix on `depends_on_imv` entries and issues
+  `DROP FUNCTION IF EXISTS … CASCADE` per operand index per op.
+  *Drop-time fix — applies to any UNION-ALL IMV dropped under 1.7.0,
+  regardless of when it was created.*
+
+### Changed
+
+- **`UNION` / `INTERSECT` / `EXCEPT` (without `ALL`) used as a CTE body
+  consumed by an outer IMV are now rejected at create time** with an
+  actionable error pointing to three workarounds: hoist to the outermost
+  SELECT (stays a VIEW), use `kind: mv`, or rewrite as `UNION ALL` if
+  operands are guaranteed disjoint.  Previously these shapes silently
+  emitted a VIEW that failed deep in the consumer's trigger install with
+  `Triggers on views cannot have transition tables`.  Outer-level (top of
+  SELECT) `UNION` / `INTERSECT` / `EXCEPT` continue to work as VIEW
+  wrappers; only the intermediate-position (CTE body) case is rejected.
+  *Create-time validation — strictly better error UX, no shape that
+  worked before stops working.*
+- **Intermediate `UNION ALL` wrapper construction is centralised** into a
+  new private helper `install_union_all_intermediate_wrapper` in
+  `src/create_ivm.rs`.  `try_decompose_set_op` no longer carries inline
+  `CREATE UNLOGGED TABLE` + per-operand trigger-install + registry-insert
+  code.  The dropped helper `query_table_column_names` was its only
+  remaining caller and is removed.  No user-visible change beyond what
+  Fixed and Changed entries describe.
+
+### Testing
+
+- **Six regression tests added.**  In `src/tests/pg_test_drop.rs`: wrapper
+  table carries `__reflex_src_idx SMALLINT NOT NULL` (column-presence
+  check via `pg_attribute`); cross-operand DELETE isolation (operand A
+  delete preserves operand B's same-valued row); `__reflex_union_mirror_*`
+  functions in `pg_proc` are zero after `drop_reflex_ivm(…, TRUE)`.  In
+  `src/tests/pg_test_error.rs`: explicit-reject tests for `UNION`,
+  `INTERSECT`, and `EXCEPT` (no `ALL`) used as CTE body.  Full suite:
+  **1102 tests pass**.
+
+### Migration
+
+- `ALTER EXTENSION pg_reflex UPDATE TO '1.7.0';` runs
+  [`sql/pg_reflex--1.6.5--1.7.0.sql`](https://github.com/diviyank/pg_reflex/blob/main/sql/pg_reflex--1.6.5--1.7.0.sql),
+  a **no-op marker** — there are no catalog or function-body changes.
+- **UNION-ALL CTE-body IMVs created under ≤1.6.5** were built without
+  `__reflex_src_idx` on their wrapper table, and the corresponding mirror
+  trigger function bodies do not reference it.  Cross-operand `DELETE`
+  over-delete remains until the IMV is recreated.  Recipe:
+
+  ```sql
+  SELECT drop_reflex_ivm('<top-level-imv>', TRUE);
+  SELECT create_reflex_ivm('<top-level-imv>', '<SELECT …>', …);
+  ```
+
+  The cascade drop in ≤1.6.5 also leaks `__reflex_union_mirror_*`
+  functions in `pg_proc`; under 1.7.0 the cascade cleans them.  Operators
+  who upgraded a database with pre-1.7.0 wrappers in place can clear the
+  pre-existing orphans manually after the upgrade:
+
+  ```sql
+  DO $do$ DECLARE r RECORD;
+  BEGIN
+    FOR r IN
+      SELECT 'public.' || p.proname || '()' AS sig
+      FROM pg_proc p
+      JOIN pg_namespace n ON n.oid = p.pronamespace
+      WHERE n.nspname = 'public'
+        AND p.proname LIKE '__reflex_union_mirror_%'
+    LOOP
+      EXECUTE 'DROP FUNCTION IF EXISTS ' || r.sig || ' CASCADE';
+    END LOOP;
+  END $do$;
+  ```
+
+- **Non-UNION-ALL IMVs** are unaffected.
+- **Outer-level (top of SELECT) `UNION ALL` IMVs** continue to be
+  maintained as zero-overhead VIEW wrappers over operand sub-IMVs
+  (unchanged).
+
 ## [1.6.5] - 2026-05-26
 
 Correctness release fixing three independent create-time defects hit while

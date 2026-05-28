@@ -6,7 +6,6 @@ use crate::query_decomposer::{
     affected_groups_table_name, canonical_source, delta_scratch_table_name,
     intermediate_table_name, passthrough_scratch_new_table_name,
     passthrough_scratch_old_table_name, quote_identifier, shrunk_groups_table_name,
-    split_qualified_name,
 };
 
 pub(crate) fn drop_reflex_ivm_impl(view_name: &str, cascade: bool) -> &'static str {
@@ -130,19 +129,19 @@ fn drop_reflex_ivm_impl_inner(view_name: &str, cascade: bool, root: &str) -> &'s
             }
         }
 
-        // 5. Drop target (could be a TABLE or a VIEW for window/DISTINCT ON decompositions)
+        // 5. Drop target (could be a TABLE or a VIEW for window/DISTINCT ON decompositions).
+        //    Resolve via `to_regclass($1)` so a bare `view_name` honours the
+        //    session search_path — the legacy `(nspname, relname)` form fell
+        //    back to `public` and would mis-classify the target relkind for
+        //    IMVs living outside public.
         let cascade_suffix = if cascade { " CASCADE" } else { "" };
-        let (tgt_schema, tgt_name) = split_qualified_name(view_name);
-        let tgt_schema_str = tgt_schema.unwrap_or("public");
         let relkind: String = client
             .select(
-                "SELECT COALESCE((SELECT relkind::TEXT FROM pg_class c JOIN pg_namespace n ON c.relnamespace = n.oid \
-                 WHERE n.nspname = $1 AND c.relname = $2), 'r')",
+                "SELECT COALESCE((SELECT relkind::TEXT FROM pg_class WHERE oid = to_regclass($1)), 'r')",
                 None,
-                &[
-                    unsafe { DatumWithOid::new(tgt_schema_str.to_string(), PgBuiltInOids::TEXTOID.oid().value()) },
-                    unsafe { DatumWithOid::new(tgt_name.to_string(), PgBuiltInOids::TEXTOID.oid().value()) },
-                ],
+                &[unsafe {
+                    DatumWithOid::new(view_name.to_string(), PgBuiltInOids::TEXTOID.oid().value())
+                }],
             )
             .unwrap_or_report()
             .first()

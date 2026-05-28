@@ -77,6 +77,24 @@ A CTE with a window function or `DISTINCT ON` materializes as a read-time VIEW. 
 
 **Status**: rejected at create time. Workaround: move the window function or `DISTINCT ON` to the outermost `SELECT`, or define the CTE as a plain `MATERIALIZED VIEW` instead.
 
+### `UNION` / `INTERSECT` / `EXCEPT` (without `ALL`) as a CTE body
+
+```sql
+WITH dedup AS (
+    SELECT x FROM a
+    UNION                  -- or INTERSECT, or EXCEPT
+    SELECT x FROM b
+)
+SELECT x, COUNT(*) FROM dedup GROUP BY x;
+```
+
+The deduplicating set operations depend on the entire input multiset, not on a per-operand delta, so they cannot be maintained incrementally as an intermediate sub-IMV. Pre-1.7.0 these silently emitted a VIEW that then failed deep in the consumer's trigger install with `Triggers on views cannot have transition tables`; 1.7.0 rejects them at create time with a clear error.
+
+**Status**: rejected at create time (1.7.0+). Workarounds:
+1. Hoist the set operation to the outermost `SELECT` so it stays a VIEW that PostgreSQL evaluates at query time.
+2. Define the view with `kind: mv` (plain `MATERIALIZED VIEW`).
+3. Rewrite as `UNION ALL` if the operands are guaranteed to produce disjoint rows — the `UNION ALL` form *is* supported as a CTE body (see §2).
+
 ### `GROUP BY` key not projected bare in the `SELECT`
 
 ```sql
@@ -175,24 +193,22 @@ The 1.3.0 partial-heap UPDATE-staleness gap was fixed in 1.4.0 — UPDATEs on to
 
 ---
 
-## 3. Operator-side workarounds
-
 ### `UNION ALL` inside a CTE
 
 ```sql
--- Doesn't decompose:
 WITH x AS (SELECT a FROM t1 UNION ALL SELECT a FROM t2)
 SELECT a, COUNT(*) FROM x GROUP BY a;
 ```
 
-The CTE decomposer doesn't recurse into set operations inside a CTE body. Workaround: lift the set operation to the top level.
+**Status**: ✅ Supported (1.6.5+ via the intermediate-table wrapper path; 1.7.0+ adds a `__reflex_src_idx` discriminator). Each operand of the `UNION ALL` becomes its own sub-IMV (`<view>__union_<i>`), and the CTE wrapper itself materializes as an UNLOGGED TABLE populated per-operand and maintained by per-operand mirror triggers that propagate INSERT / DELETE / UPDATE 1:1 into the wrapper.
 
-```sql
--- Decomposes:
-SELECT a, COUNT(*) FROM (
-    SELECT a FROM t1 UNION ALL SELECT a FROM t2
-) AS x GROUP BY a;
-```
+**Cost shape**: the wrapper carries one extra `SMALLINT` (`__reflex_src_idx`) column per row and the per-operand DELETE predicate adds one extra equality. Otherwise identical to the algebraic delta cost of the operand IMVs themselves.
+
+**Caveat — intra-operand duplicate over-delete** ([known issue](known-issues.md#intra-operand-duplicate-over-delete-in-union-all-cte-wrappers)). If an operand projects three rows whose every column value is identical and then deletes one of them, the wrapper's mirror DELETE removes all three because the `IS NOT DISTINCT FROM` match predicate matches all three. The `__reflex_src_idx` discriminator fixes cross-operand collisions but does not address intra-operand duplicates. Workaround: include a primary-key / unique column in each operand's projection.
+
+---
+
+## 3. Operator-side workarounds
 
 ### Passthrough over a non-IMV `MATERIALIZED VIEW`
 

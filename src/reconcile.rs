@@ -3,9 +3,7 @@ use pgrx::pg_sys::panic::ErrorReportable;
 use pgrx::prelude::*;
 
 use crate::aggregation;
-use crate::query_decomposer::{
-    intermediate_table_name, quote_identifier, safe_identifier, split_qualified_name,
-};
+use crate::query_decomposer::{intermediate_table_name, quote_identifier, split_qualified_name};
 use crate::schema_builder::build_indexes_ddl;
 use crate::validate_view_name;
 
@@ -163,42 +161,56 @@ pub(crate) fn reflex_reconcile(view_name: &str) -> &'static str {
         }
 
         if is_passthrough || end_query.is_empty() {
-            // Passthrough: optimized refresh — drop indexes, TRUNCATE, INSERT, recreate, ANALYZE
-            let (tgt_schema, tgt_name) = split_qualified_name(view_name);
-            let tgt_schema_str = tgt_schema.unwrap_or("public");
-
-            // Save and drop all indexes on target.
+            // Passthrough: optimized refresh — drop indexes, TRUNCATE, INSERT, recreate, ANALYZE.
             // `indexname` is `name` (fixed 64B), not `text` — cast to text or
             // pgrx's `get_by_name::<&str, _>` silently returns None and we'd
             // skip every drop, leaving stale indexes that the recreate path
             // then no-ops via `CREATE … IF NOT EXISTS`. ~30s/100M-row IMV.
-            let saved_indexes: Vec<(String, String)> = client
+            //
+            // Resolve via `to_regclass($1)` so a bare `view_name` honours the
+            // session search_path (the legacy `(schemaname, tablename)` form
+            // silently fell back to `public` for non-public tenants).
+            // `qname` is the pre-quoted `"schema"."idx"` string used directly
+            // by the DROP loop below — sourced from the same row so the index
+            // we found is the index we drop, with no parallel schema-string
+            // computation that could disagree with the catalog.
+            let saved_indexes: Vec<(String, String, String)> = client
                 .select(
-                    "SELECT indexname::TEXT AS indexname, indexdef FROM pg_indexes WHERE schemaname = $1 AND tablename = $2",
+                    "SELECT format('%I.%I', n.nspname, i.relname) AS qname, \
+                            i.relname::TEXT AS indexname, \
+                            pg_get_indexdef(ix.indexrelid) AS indexdef \
+                     FROM pg_index ix JOIN pg_class i ON i.oid = ix.indexrelid \
+                     JOIN pg_namespace n ON n.oid = i.relnamespace \
+                     WHERE ix.indrelid = to_regclass($1)",
                     None,
-                    &[
-                        unsafe { DatumWithOid::new(tgt_schema_str.to_string(), PgBuiltInOids::TEXTOID.oid().value()) },
-                        unsafe { DatumWithOid::new(tgt_name.to_string(), PgBuiltInOids::TEXTOID.oid().value()) },
-                    ],
+                    &[unsafe {
+                        DatumWithOid::new(
+                            view_name.to_string(),
+                            PgBuiltInOids::TEXTOID.oid().value(),
+                        )
+                    }],
                 )
                 .unwrap_or_report()
                 .filter_map(|row| {
-                    let name = row.get_by_name::<&str, _>("indexname").unwrap_or(None)?.to_string();
-                    let def = row.get_by_name::<&str, _>("indexdef").unwrap_or(None)?.to_string();
-                    Some((name, def))
+                    let qname = row
+                        .get_by_name::<&str, _>("qname")
+                        .unwrap_or(None)?
+                        .to_string();
+                    let name = row
+                        .get_by_name::<&str, _>("indexname")
+                        .unwrap_or(None)?
+                        .to_string();
+                    let def = row
+                        .get_by_name::<&str, _>("indexdef")
+                        .unwrap_or(None)?
+                        .to_string();
+                    Some((qname, name, def))
                 })
                 .collect();
 
-            for (idx_name, _) in &saved_indexes {
+            for (qname, _, _) in &saved_indexes {
                 client
-                    .update(
-                        &format!(
-                            "DROP INDEX IF EXISTS \"{}\".\"{}\"",
-                            tgt_schema_str, idx_name
-                        ),
-                        None,
-                        &[],
-                    )
+                    .update(&format!("DROP INDEX IF EXISTS {qname}"), None, &[])
                     .unwrap_or_report();
             }
 
@@ -219,7 +231,7 @@ pub(crate) fn reflex_reconcile(view_name: &str) -> &'static str {
                 .unwrap_or_report();
 
             // Recreate all indexes
-            for (_, idx_def) in &saved_indexes {
+            for (_, _, idx_def) in &saved_indexes {
                 client.update(idx_def, None, &[]).unwrap_or_report();
             }
 
@@ -243,81 +255,84 @@ pub(crate) fn reflex_reconcile(view_name: &str) -> &'static str {
                 .expect("pg_reflex: __reflex_ivm_reference.aggregations must be valid JSON written by pg_reflex");
 
             let intermediate = intermediate_table_name(view_name);
-            let (_, bare_view) = split_qualified_name(view_name);
-            let int_unquoted = intermediate.replace('"', "");
-            let (int_schema, _) = split_qualified_name(&int_unquoted);
-            let int_schema_str = int_schema.unwrap_or("public");
 
             // Collect and drop reflex-managed indexes on intermediate table.
             // `indexname` is `name`, not `text` — cast (see analogous note in
             // the passthrough path above).
+            //
+            // `intermediate_table_name` returns the already-qualified quoted
+            // form (`"schema"."__reflex_intermediate_<view>"`), so feeding it
+            // to `to_regclass($1)` resolves to the exact relation regardless
+            // of session search_path.
             let int_indexes: Vec<String> = client
                 .select(
-                    "SELECT indexname::TEXT AS indexname FROM pg_indexes WHERE schemaname = $1 AND tablename = $2",
+                    "SELECT format('%I.%I', n.nspname, i.relname) AS qname \
+                     FROM pg_index ix JOIN pg_class i ON i.oid = ix.indexrelid \
+                     JOIN pg_namespace n ON n.oid = i.relnamespace \
+                     WHERE ix.indrelid = to_regclass($1)",
                     None,
-                    &[
-                        unsafe {
-                            DatumWithOid::new(
-                                int_schema_str.to_string(),
-                                PgBuiltInOids::TEXTOID.oid().value(),
-                            )
-                        },
-                        unsafe {
-                            DatumWithOid::new(
-                                safe_identifier(&format!("__reflex_intermediate_{}", bare_view)),
-                                PgBuiltInOids::TEXTOID.oid().value(),
-                            )
-                        },
-                    ],
+                    &[unsafe {
+                        DatumWithOid::new(
+                            intermediate.clone(),
+                            PgBuiltInOids::TEXTOID.oid().value(),
+                        )
+                    }],
                 )
                 .unwrap_or_report()
                 .filter_map(|row| {
-                    row.get_by_name::<&str, _>("indexname")
+                    row.get_by_name::<&str, _>("qname")
                         .unwrap_or(None)
                         .map(|s| s.to_string())
                 })
                 .collect();
 
-            for idx in &int_indexes {
+            for qname in &int_indexes {
                 client
-                    .update(
-                        &format!("DROP INDEX IF EXISTS \"{}\".\"{}\"", int_schema_str, idx),
-                        None,
-                        &[],
-                    )
+                    .update(&format!("DROP INDEX IF EXISTS {qname}"), None, &[])
                     .unwrap_or_report();
             }
 
-            // Collect ALL indexes on target table (save DDL for user-created ones)
-            let (tgt_schema, tgt_name) = split_qualified_name(view_name);
-            let tgt_schema_str = tgt_schema.unwrap_or("public");
-            let tgt_saved_indexes: Vec<(String, String)> = client
+            // Collect ALL indexes on target table (save DDL for user-created ones).
+            // Lookup via `to_regclass($1)` — the legacy `(schemaname, tablename)`
+            // form fell back to `public` when `view_name` was bare, missing
+            // non-public tenants.
+            let tgt_saved_indexes: Vec<(String, String, String)> = client
                 .select(
-                    "SELECT indexname::TEXT AS indexname, indexdef FROM pg_indexes WHERE schemaname = $1 AND tablename = $2",
+                    "SELECT format('%I.%I', n.nspname, i.relname) AS qname, \
+                            i.relname::TEXT AS indexname, \
+                            pg_get_indexdef(ix.indexrelid) AS indexdef \
+                     FROM pg_index ix JOIN pg_class i ON i.oid = ix.indexrelid \
+                     JOIN pg_namespace n ON n.oid = i.relnamespace \
+                     WHERE ix.indrelid = to_regclass($1)",
                     None,
-                    &[
-                        unsafe { DatumWithOid::new(tgt_schema_str.to_string(), PgBuiltInOids::TEXTOID.oid().value()) },
-                        unsafe { DatumWithOid::new(tgt_name.to_string(), PgBuiltInOids::TEXTOID.oid().value()) },
-                    ],
+                    &[unsafe {
+                        DatumWithOid::new(
+                            view_name.to_string(),
+                            PgBuiltInOids::TEXTOID.oid().value(),
+                        )
+                    }],
                 )
                 .unwrap_or_report()
                 .filter_map(|row| {
-                    let name = row.get_by_name::<&str, _>("indexname").unwrap_or(None)?.to_string();
-                    let def = row.get_by_name::<&str, _>("indexdef").unwrap_or(None)?.to_string();
-                    Some((name, def))
+                    let qname = row
+                        .get_by_name::<&str, _>("qname")
+                        .unwrap_or(None)?
+                        .to_string();
+                    let name = row
+                        .get_by_name::<&str, _>("indexname")
+                        .unwrap_or(None)?
+                        .to_string();
+                    let def = row
+                        .get_by_name::<&str, _>("indexdef")
+                        .unwrap_or(None)?
+                        .to_string();
+                    Some((qname, name, def))
                 })
                 .collect();
 
-            for (idx_name, _) in &tgt_saved_indexes {
+            for (qname, _, _) in &tgt_saved_indexes {
                 client
-                    .update(
-                        &format!(
-                            "DROP INDEX IF EXISTS \"{}\".\"{}\"",
-                            tgt_schema_str, idx_name
-                        ),
-                        None,
-                        &[],
-                    )
+                    .update(&format!("DROP INDEX IF EXISTS {qname}"), None, &[])
                     .unwrap_or_report();
             }
 
@@ -353,7 +368,7 @@ pub(crate) fn reflex_reconcile(view_name: &str) -> &'static str {
             }
 
             // Recreate user-created indexes on target (skip reflex-managed ones already recreated above)
-            for (idx_name, idx_def) in &tgt_saved_indexes {
+            for (_, idx_name, idx_def) in &tgt_saved_indexes {
                 if idx_name.starts_with("idx__reflex_") || idx_name.starts_with("__reflex_") {
                     continue; // Already handled by build_indexes_ddl
                 }

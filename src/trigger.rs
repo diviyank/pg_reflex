@@ -2882,39 +2882,33 @@ pub fn reflex_flush_deferred(source_table: &str) -> String {
         // including `INSERT INTO pt_scratch SELECT * FROM view` where pt_scratch
         // is shaped `LIKE source` — sees the same column list as a real
         // transition table.
-        let (src_schema, src_name_only) = split_qualified_name(source_table);
-        let src_schema_lit = src_schema.unwrap_or("public").replace("'", "''");
-        let src_name_lit = src_name_only.replace("'", "''");
         // Fetch raw column NAME + TYPE-NAME together. The type name is
         // needed to cast `json` / `xml` to `text` in EXCEPT ALL projections
         // — those types lack an equality operator and crash the comparison
         // otherwise. The raw column projection (for the TEMP VIEW that
         // downstream incremental codegen reads) stays unchanged.
+        //
+        // Resolve via `to_regclass($1)`: this is the original schema-mismatch
+        // bug site (pre-fix, an unwrap_or("public") fallback projected the
+        // wrong homonym's columns when `source_table` arrived bare). Upstream
+        // canonicalization at IMV-create time keeps `source_table` qualified
+        // for non-public sources, but feeding the lookup through `to_regclass`
+        // makes correctness independent of caller hygiene.
         let src_cols_with_types: Vec<(String, String)> = client
             .select(
                 "SELECT a.attname::text AS rn, t.typname::text AS tn \
                  FROM pg_attribute a \
                  JOIN pg_type t ON t.oid = a.atttypid \
-                 JOIN pg_class c ON c.oid = a.attrelid \
-                 JOIN pg_namespace n ON n.oid = c.relnamespace \
-                 WHERE n.nspname = $1 AND c.relname = $2 \
+                 WHERE a.attrelid = to_regclass($1) \
                    AND a.attnum > 0 AND NOT a.attisdropped \
                  ORDER BY a.attnum",
                 None,
-                &[
-                    unsafe {
-                        DatumWithOid::new(
-                            src_schema_lit.clone(),
-                            PgBuiltInOids::TEXTOID.oid().value(),
-                        )
-                    },
-                    unsafe {
-                        DatumWithOid::new(
-                            src_name_lit.clone(),
-                            PgBuiltInOids::TEXTOID.oid().value(),
-                        )
-                    },
-                ],
+                &[unsafe {
+                    DatumWithOid::new(
+                        source_table.to_string(),
+                        PgBuiltInOids::TEXTOID.oid().value(),
+                    )
+                }],
             )
             .unwrap_or_report()
             .filter_map(|row| {

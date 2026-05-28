@@ -1,0 +1,76 @@
+-- Migration: pg_reflex 1.6.5 → 1.7.0
+--
+-- Run via: ALTER EXTENSION pg_reflex UPDATE TO '1.7.0';
+--
+-- 1.7.0 is a refactor + correctness release targeting intermediate UNION-ALL
+-- CTE-body wrappers. The wrapper-construction code (previously inline in
+-- `try_decompose_set_op`) is centralised into a single helper, and three
+-- defects are addressed. There are NO catalog schema changes, NO trigger
+-- function-body changes, and NO function signature changes — every behaviour
+-- change is in the recompiled Rust module.
+--
+-- What changed:
+--
+--   (1) Intermediate UNION-ALL wrapper tables now carry a leading
+--       `__reflex_src_idx SMALLINT NOT NULL` discriminator column. The
+--       per-operand mirror trigger DELETE predicate filters by this column
+--       (`w.__reflex_src_idx = <operand_idx> AND <cols> IS NOT DISTINCT
+--       FROM <old>`), so an operand DELETE no longer over-deletes a row
+--       contributed by a different operand that happens to have the same
+--       column values. The mirror INSERT trigger tags every new row with
+--       its operand index.
+--
+--   (2) `UNION` / `INTERSECT` / `EXCEPT` (without `ALL`) used as a CTE
+--       body consumed by an outer IMV are now rejected at create time
+--       with an actionable error message pointing to three workarounds:
+--       hoist to the outermost SELECT (stays a VIEW), use `kind: mv`, or
+--       rewrite as UNION ALL when operands are guaranteed disjoint.
+--       Previously these shapes silently emitted a VIEW that failed
+--       deep in the consumer's transition-trigger install with
+--       `Triggers on views cannot have transition tables`.
+--
+--   (3) `drop_reflex_ivm` cascade now removes the three
+--       `__reflex_union_mirror_<safe_wrapper>_<i>_{ins,del,upd}` trigger
+--       functions per operand of a dropped UNION-ALL wrapper. Previously
+--       only the triggers were dropped (via operand-sub-IMV cascade);
+--       the functions leaked in `pg_proc` until a same-named overwrite.
+--
+-- Migration note:
+--
+--   No DDL is required to register 1.7.0; this file is a no-op marker.
+--
+--   Effect on existing IMVs:
+--
+--     * **UNION-ALL CTE-body IMVs created under ≤1.6.5** were built without
+--       `__reflex_src_idx` on their wrapper table, and their mirror trigger
+--       function bodies do not reference it. Cross-operand DELETE
+--       over-delete (defect 1) remains until they are recreated. To pick
+--       up the fix:
+--
+--         SELECT drop_reflex_ivm('<top-level-imv>', TRUE);
+--         SELECT create_reflex_ivm('<top-level-imv>', '<SELECT …>', …);
+--
+--       The cascade drop in ≤1.6.5 also leaks the
+--       `__reflex_union_mirror_*` functions; under 1.7.0 the cascade
+--       cleans them. Operators with pre-1.7.0 wrappers can drop the
+--       leftover functions manually after upgrading:
+--
+--         DO $do$ DECLARE r RECORD;
+--         BEGIN
+--           FOR r IN SELECT 'public.' || p.proname || '()' AS sig
+--             FROM pg_proc p
+--             JOIN pg_namespace n ON n.oid = p.pronamespace
+--             WHERE n.nspname = 'public'
+--               AND p.proname LIKE '__reflex_union_mirror_%'
+--           LOOP
+--             EXECUTE 'DROP FUNCTION IF EXISTS ' || r.sig || ' CASCADE';
+--           END LOOP;
+--         END $do$;
+--
+--     * **Non-UNION-ALL IMVs** are unaffected.
+--
+--     * **Outer-level (top-of-SELECT) UNION ALL IMVs** continue to be
+--       maintained as VIEW wrappers over operand sub-IMVs (unchanged).
+
+-- No-op marker: ALTER EXTENSION needs a non-empty migration file.
+SELECT 1 WHERE FALSE;
