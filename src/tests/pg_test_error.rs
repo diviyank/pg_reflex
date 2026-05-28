@@ -611,3 +611,87 @@ fn test_alter_source_policy_error_allows_untracked_alter() {
     )
     .expect("ALTER on untracked table should succeed even under error policy");
 }
+
+#[pg_test]
+fn test_reject_union_no_all_as_cte_body() {
+    Spi::run(
+        "CREATE TABLE u_a(id INT PRIMARY KEY, x INT);
+         CREATE TABLE u_b(id INT PRIMARY KEY, x INT);",
+    )
+    .expect("create source tables");
+
+    let result = crate::create_reflex_ivm(
+        "rej_union",
+        "WITH dedup AS (
+           SELECT x FROM u_a
+           UNION
+           SELECT x FROM u_b
+         )
+         SELECT x, COUNT(*) FROM dedup GROUP BY x",
+        None,
+        None,
+        None,
+        None,
+    );
+    assert!(
+        result.starts_with("ERROR") && result.contains("UNION/INTERSECT/EXCEPT"),
+        "expected explicit rejection of UNION (no ALL) as CTE body, got: {}",
+        result
+    );
+}
+
+#[pg_test]
+fn test_reject_intersect_as_cte_body() {
+    Spi::run(
+        "CREATE TABLE i_a(id INT PRIMARY KEY, x INT);
+         CREATE TABLE i_b(id INT PRIMARY KEY, x INT);",
+    )
+    .expect("create source tables");
+
+    let result = crate::create_reflex_ivm(
+        "rej_inter",
+        "WITH inter AS (
+           SELECT x FROM i_a
+           INTERSECT
+           SELECT x FROM i_b
+         )
+         SELECT x, COUNT(*) FROM inter GROUP BY x",
+        None,
+        None,
+        None,
+        None,
+    );
+    assert!(
+        result.starts_with("ERROR") && result.contains("UNION/INTERSECT/EXCEPT"),
+        "expected explicit rejection of INTERSECT as CTE body, got: {}",
+        result
+    );
+}
+
+#[pg_test]
+fn test_reject_except_as_cte_body() {
+    Spi::run(
+        "CREATE TABLE e_a(id INT PRIMARY KEY, x INT);
+         CREATE TABLE e_b(id INT PRIMARY KEY, x INT);",
+    )
+    .expect("create source tables");
+
+    let result = crate::create_reflex_ivm(
+        "rej_except",
+        "WITH diff AS (
+           SELECT x FROM e_a
+           EXCEPT
+           SELECT x FROM e_b
+         )
+         SELECT x, COUNT(*) FROM diff GROUP BY x",
+        None,
+        None,
+        None,
+        None,
+    );
+    assert!(
+        result.starts_with("ERROR") && result.contains("UNION/INTERSECT/EXCEPT"),
+        "expected explicit rejection of EXCEPT as CTE body, got: {}",
+        result
+    );
+}
