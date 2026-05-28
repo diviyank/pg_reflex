@@ -10,6 +10,18 @@ use crate::query_decomposer::{
 };
 
 pub(crate) fn drop_reflex_ivm_impl(view_name: &str, cascade: bool) -> &'static str {
+    drop_reflex_ivm_impl_inner(view_name, cascade, view_name)
+}
+
+/// Internal entry point that threads the **top-level** view name (`root`)
+/// through recursion. The synthetic-sub-IMV prefix check at the bottom needs
+/// the outermost view's bare name, not the current recursion level's name:
+/// sub-IMVs born of CTE decomposition are named `<root>__cte_<…>` regardless
+/// of which intermediate sub-IMV references them, so a sibling sub-IMV (e.g.
+/// `<root>__cte_date_limits` referenced by both `<root>__cte_forecast_sales`
+/// and `<root>__cte_history_sales`) only matches the prefix check when keyed
+/// off `<root>`, not off the immediate recursive parent.
+fn drop_reflex_ivm_impl_inner(view_name: &str, cascade: bool, root: &str) -> &'static str {
     // The closure tears down the view's own objects and reports the synthetic
     // sub-IMVs (recorded as quoted `<view>__…` sources in `depends_on`) that must
     // be dropped afterwards. Those sub-IMVs are dropped as fresh top-level calls
@@ -56,10 +68,13 @@ pub(crate) fn drop_reflex_ivm_impl(view_name: &str, cascade: bool) -> &'static s
             );
         }
 
-        // 3. Cascade: drop children first
+        // 3. Cascade: drop children first.
+        //    `graph_child` lists IMVs that depend on THIS view as a source — they
+        //    are independent user-facing IMVs with their own synthetic descendant
+        //    trees, so each one becomes its own root for the recursive drop.
         if cascade {
             for child in &children {
-                let result = drop_reflex_ivm_impl(child, true);
+                let result = drop_reflex_ivm_impl_inner(child, true, child);
                 if result.starts_with("ERROR") {
                     return (result, Vec::new());
                 }
@@ -309,13 +324,13 @@ pub(crate) fn drop_reflex_ivm_impl(view_name: &str, cascade: bool) -> &'static s
 
         // Collect this view's synthetic sub-IMVs. Decomposition (CTE / set-op /
         // DISTINCT ON / window) records them as quoted sources in `depends_on`
-        // and names them deterministically `<view>__…` (`__cte_`, `__union_`,
-        // `__base`). An entry qualifies as a synthetic child only when it is
-        // both a registered IMV AND prefixed with `<view>__`; the prefix guard
-        // keeps a user-chained IMV that this view legitimately reads from out of
-        // the teardown set.
-        let (_, parent_bare) = canonical_source(view_name);
-        let child_prefix = format!("{parent_bare}__");
+        // and names them deterministically `<root>__…` (`__cte_`, `__union_`,
+        // `__base`), where `<root>` is the OUTERMOST user-facing view — every
+        // sub-IMV shares that prefix even when nested several decomposition
+        // layers deep. The prefix guard keeps user-chained IMVs (which this
+        // view legitimately reads from) out of the teardown set.
+        let (_, root_bare) = canonical_source(root);
+        let child_prefix = format!("{root_bare}__");
         let mut sub_imvs_to_drop: Vec<String> = Vec::new();
         for source in &depends_on {
             if source.starts_with('<') {
@@ -357,9 +372,11 @@ pub(crate) fn drop_reflex_ivm_impl(view_name: &str, cascade: bool) -> &'static s
     // unlinked from each sub-IMV's graph_child (step 7), so dropping them now —
     // cascade or not — leaves them childless and fully removable. We drop them as
     // top-level calls (each its own SPI connection) because a nested drop inside
-    // the closure above does not persist its teardown.
+    // the closure above does not persist its teardown. Pass `root` through so a
+    // sub-IMV that holds a transitive reference to a sibling sub-IMV (e.g. a
+    // shared CTE) is still recognised as part of this teardown.
     for sub_imv in &sub_imvs_to_drop {
-        let result = drop_reflex_ivm_impl(sub_imv, true);
+        let result = drop_reflex_ivm_impl_inner(sub_imv, true, root);
         if result.starts_with("ERROR") {
             return result;
         }

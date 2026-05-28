@@ -95,6 +95,14 @@ struct DecomposeCtx<'a> {
     ignore_sources: &'a [String],
     partition_by: &'a [String],
     parsed: &'a ParsedInputs,
+    /// When true, decompositions that would otherwise emit a `CREATE VIEW`
+    /// wrapper (UNION ALL today; DISTINCT ON / window in future) MUST instead
+    /// materialise the wrapper as an UNLOGGED TABLE maintained by per-operand
+    /// mirror triggers. Set on every recursive `create_reflex_ivm_impl` call
+    /// that builds an intermediate sub-IMV (e.g. a CTE sub-IMV), because
+    /// downstream consumers will try to install transition-table triggers on
+    /// the wrapper, which PostgreSQL rejects for views.
+    materialize_as_table: bool,
 }
 
 /// Phase 1 of the create-IMV pipeline.
@@ -232,7 +240,10 @@ fn try_decompose_set_op(ctx: &DecomposeCtx) -> Option<&'static str> {
     let mut sub_imv_names: Vec<String> = Vec::new();
     for (i, operand_sql) in set_op.operand_sqls.iter().enumerate() {
         let sub_name = safe_identifier(&format!("{}__union_{}", ctx.view_name, i));
-        let result = create_reflex_ivm_impl(
+        // Propagate materialize_as_table: if this wrapper has to be a table,
+        // any nested set-op operands of an operand must also be tables (their
+        // wrappers will themselves serve as trigger sources further down).
+        let result = create_reflex_ivm_impl_with_materialization(
             &sub_name,
             operand_sql,
             ctx.unique_columns_str,
@@ -242,6 +253,7 @@ fn try_decompose_set_op(ctx: &DecomposeCtx) -> Option<&'static str> {
             ctx.topk_k,
             ctx.ignore_sources,
             ctx.partition_by,
+            ctx.materialize_as_table,
         );
         if result.starts_with("ERROR") {
             return Some(result);
@@ -256,21 +268,61 @@ fn try_decompose_set_op(ctx: &DecomposeCtx) -> Option<&'static str> {
         .collect();
 
     if set_op.is_all {
-        // UNION ALL: create a VIEW (zero overhead, always up-to-date)
         let view_sql = union_selects.join(" UNION ALL ");
-        Spi::connect_mut(|client| {
-            client
-                .update(
-                    &format!(
-                        "CREATE OR REPLACE VIEW {} AS {}",
-                        quote_identifier(ctx.view_name),
-                        view_sql
-                    ),
-                    None,
-                    &[],
-                )
-                .unwrap_or_report();
-        });
+        if ctx.materialize_as_table {
+            // Wrapper must be a TABLE because a downstream consumer (the IMV
+            // that referenced this set-op as a CTE / sub-query) will install
+            // transition-table triggers on it — PostgreSQL rejects those on
+            // VIEWs (`"…" is a view: Triggers on views cannot have transition
+            // tables`). We CTAS the union, then install per-operand mirror
+            // triggers that propagate INSERT/UPDATE/DELETE 1:1 into the
+            // wrapper. NOTE: the mirror DELETE matches all columns via
+            // `IS NOT DISTINCT FROM`, which assumes operands have no intra-
+            // operand duplicate rows — true for typical CTE shapes; document
+            // and lift later if a use case appears.
+            Spi::connect_mut(|client| {
+                client
+                    .update(
+                        &format!(
+                            "DROP TABLE IF EXISTS {} CASCADE",
+                            quote_identifier(ctx.view_name)
+                        ),
+                        None,
+                        &[],
+                    )
+                    .unwrap_or_report();
+                client
+                    .update(
+                        &format!(
+                            "CREATE UNLOGGED TABLE {} AS {}",
+                            quote_identifier(ctx.view_name),
+                            view_sql
+                        ),
+                        None,
+                        &[],
+                    )
+                    .unwrap_or_report();
+                let cols = query_table_column_names(client, ctx.view_name);
+                for (i, operand) in sub_imv_names.iter().enumerate() {
+                    install_union_mirror_triggers(client, ctx.view_name, operand, i, &cols);
+                }
+            });
+        } else {
+            // UNION ALL: create a VIEW (zero overhead, always up-to-date)
+            Spi::connect_mut(|client| {
+                client
+                    .update(
+                        &format!(
+                            "CREATE OR REPLACE VIEW {} AS {}",
+                            quote_identifier(ctx.view_name),
+                            view_sql
+                        ),
+                        None,
+                        &[],
+                    )
+                    .unwrap_or_report();
+            });
+        }
 
         // Register in reference table so drop_reflex_ivm can clean up.
         // depends_on = sub-IMV names (the VIEW reads from them, not from real sources)
@@ -343,6 +395,168 @@ fn try_decompose_set_op(ctx: &DecomposeCtx) -> Option<&'static str> {
     }
 
     Some("CREATE REFLEX INCREMENTAL VIEW")
+}
+
+/// Return the user column names of `table_name` in attnum order. Used by the
+/// UNION-ALL TABLE-materialisation path to build per-operand mirror trigger
+/// bodies. Excludes dropped and system columns.
+fn query_table_column_names(client: &mut pgrx::spi::SpiClient<'_>, table_name: &str) -> Vec<String> {
+    client
+        .select(
+            "SELECT a.attname::text AS col_name \
+             FROM pg_catalog.pg_attribute a \
+             WHERE a.attrelid = to_regclass($1) \
+               AND a.attnum > 0 AND NOT a.attisdropped \
+             ORDER BY a.attnum",
+            None,
+            &[unsafe {
+                DatumWithOid::new(table_name.to_string(), PgBuiltInOids::TEXTOID.oid().value())
+            }],
+        )
+        .unwrap_or_report()
+        .filter_map(|row| row.get_by_name::<String, _>("col_name").unwrap_or(None))
+        .collect()
+}
+
+/// Install per-operand mirror triggers on `operand` that propagate every
+/// INSERT / UPDATE / DELETE 1:1 into the wrapper TABLE `wrapper`. One pair of
+/// trigger function + trigger per DML kind (INS / DEL / UPD). The trigger
+/// function lives in `public` and is named per (wrapper, operand_idx) so it
+/// doesn't collide with the consolidated source triggers used by aggregate
+/// IMVs.
+fn install_union_mirror_triggers(
+    client: &mut pgrx::spi::SpiClient<'_>,
+    wrapper: &str,
+    operand: &str,
+    operand_idx: usize,
+    cols: &[String],
+) {
+    if cols.is_empty() {
+        warning!(
+            "pg_reflex: wrapper '{}' has no columns; UNION-ALL mirror triggers skipped",
+            wrapper
+        );
+        return;
+    }
+    let wrapper_q = quote_identifier(wrapper);
+    let operand_q = quote_identifier(operand);
+    let safe_wrapper = crate::query_decomposer::sanitized_source_suffix(wrapper);
+    let col_list: String = cols.iter().map(|c| quote_identifier(c)).collect::<Vec<_>>().join(", ");
+    let new_select: String = cols
+        .iter()
+        .map(|c| format!("__reflex_new.{}", quote_identifier(c)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let match_pred: String = cols
+        .iter()
+        .map(|c| {
+            let q = quote_identifier(c);
+            format!("w.{q} IS NOT DISTINCT FROM o.{q}")
+        })
+        .collect::<Vec<_>>()
+        .join(" AND ");
+
+    let fn_base = format!("__reflex_union_mirror_{safe_wrapper}_{operand_idx}");
+    let fn_ins = format!("{fn_base}_ins");
+    let fn_del = format!("{fn_base}_del");
+    let fn_upd = format!("{fn_base}_upd");
+
+    // INSERT mirror: copy every NEW row into the wrapper.
+    let ins_body = format!(
+        "CREATE OR REPLACE FUNCTION public.{fn_ins}() \
+         RETURNS TRIGGER LANGUAGE plpgsql AS $body$\n\
+         BEGIN\n  \
+           INSERT INTO {wrapper_q} ({col_list}) \
+           SELECT {new_select} FROM __reflex_new;\n  \
+           RETURN NULL;\n\
+         END;\n$body$"
+    );
+
+    // DELETE mirror: remove every wrapper row that matches an OLD row.
+    // Assumes operands have no intra-operand duplicates (typical for CTE
+    // sub-IMVs); duplicates would over-delete in the wrapper.
+    let del_body = format!(
+        "CREATE OR REPLACE FUNCTION public.{fn_del}() \
+         RETURNS TRIGGER LANGUAGE plpgsql AS $body$\n\
+         BEGIN\n  \
+           DELETE FROM {wrapper_q} w \
+           WHERE EXISTS (SELECT 1 FROM __reflex_old o WHERE {match_pred});\n  \
+           RETURN NULL;\n\
+         END;\n$body$"
+    );
+
+    // UPDATE mirror: DELETE old + INSERT new (sequenced in one statement to
+    // avoid mid-trigger inconsistency observed by other triggers in the
+    // chain).
+    let upd_new_select: String = cols
+        .iter()
+        .map(|c| format!("__reflex_new.{}", quote_identifier(c)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let upd_body = format!(
+        "CREATE OR REPLACE FUNCTION public.{fn_upd}() \
+         RETURNS TRIGGER LANGUAGE plpgsql AS $body$\n\
+         BEGIN\n  \
+           DELETE FROM {wrapper_q} w \
+           WHERE EXISTS (SELECT 1 FROM __reflex_old o WHERE {match_pred});\n  \
+           INSERT INTO {wrapper_q} ({col_list}) \
+           SELECT {upd_new_select} FROM __reflex_new;\n  \
+           RETURN NULL;\n\
+         END;\n$body$"
+    );
+
+    for stmt in [&ins_body, &del_body, &upd_body] {
+        client.update(stmt, None, &[]).unwrap_or_report();
+    }
+
+    let trg_ins = format!("__reflex_union_mirror_ins_{safe_wrapper}_{operand_idx}");
+    let trg_del = format!("__reflex_union_mirror_del_{safe_wrapper}_{operand_idx}");
+    let trg_upd = format!("__reflex_union_mirror_upd_{safe_wrapper}_{operand_idx}");
+
+    // Drop any stale triggers from a prior failed create before re-installing.
+    for trg in [&trg_ins, &trg_del, &trg_upd] {
+        client
+            .update(
+                &format!("DROP TRIGGER IF EXISTS {trg} ON {operand_q}"),
+                None,
+                &[],
+            )
+            .unwrap_or_report();
+    }
+
+    client
+        .update(
+            &format!(
+                "CREATE TRIGGER {trg_ins} AFTER INSERT ON {operand_q} \
+                 REFERENCING NEW TABLE AS __reflex_new \
+                 FOR EACH STATEMENT EXECUTE FUNCTION public.{fn_ins}()"
+            ),
+            None,
+            &[],
+        )
+        .unwrap_or_report();
+    client
+        .update(
+            &format!(
+                "CREATE TRIGGER {trg_del} AFTER DELETE ON {operand_q} \
+                 REFERENCING OLD TABLE AS __reflex_old \
+                 FOR EACH STATEMENT EXECUTE FUNCTION public.{fn_del}()"
+            ),
+            None,
+            &[],
+        )
+        .unwrap_or_report();
+    client
+        .update(
+            &format!(
+                "CREATE TRIGGER {trg_upd} AFTER UPDATE ON {operand_q} \
+                 REFERENCING NEW TABLE AS __reflex_new OLD TABLE AS __reflex_old \
+                 FOR EACH STATEMENT EXECUTE FUNCTION public.{fn_upd}()"
+            ),
+            None,
+            &[],
+        )
+        .unwrap_or_report();
 }
 
 /// Decomposition phase: `SELECT DISTINCT ON (...) ... ORDER BY ...`.
@@ -734,7 +948,12 @@ with kind: mv.",
             .get(&alias_lower)
             .map(|s| s.as_str())
             .unwrap_or("");
-        let result = create_reflex_ivm_impl(
+        // Sub-IMVs born of CTE decomposition are joined back into the outer
+        // query and are themselves trigger sources for it. Anything they would
+        // otherwise emit as a VIEW (UNION ALL today) must instead be a TABLE so
+        // PostgreSQL can install the consumer's transition-table triggers on
+        // them. Force materialisation here, regardless of the parent's setting.
+        let result = create_reflex_ivm_impl_with_materialization(
             &cte_view_name,
             &cte_query,
             cte_key,
@@ -744,6 +963,7 @@ with kind: mv.",
             ctx.topk_k,
             ctx.ignore_sources,
             &cte_partition_by,
+            true,
         );
         if result.starts_with("ERROR") {
             return Some(result);
@@ -769,8 +989,10 @@ with kind: mv.",
 
     // Check if the main body is passthrough (no aggregation).
     // If so, all its sources are CTE sub-IMVs which don't get triggers,
-    // CTE body (passthrough or aggregate) → create as a normal IMV
-    Some(create_reflex_ivm_impl(
+    // CTE body (passthrough or aggregate) → create as a normal IMV.
+    // Preserve `materialize_as_table` so the outer body itself ends up as a
+    // TABLE when this CTE-decomposed IMV is itself an intermediate sub-IMV.
+    Some(create_reflex_ivm_impl_with_materialization(
         ctx.view_name,
         &body_sql,
         ctx.unique_columns_str,
@@ -780,6 +1002,7 @@ with kind: mv.",
         ctx.topk_k,
         ctx.ignore_sources,
         ctx.partition_by,
+        ctx.materialize_as_table,
     ))
 }
 
@@ -2113,6 +2336,33 @@ pub(crate) fn create_reflex_ivm_impl(
     ignore_sources: &[String],
     partition_by: &[String],
 ) -> &'static str {
+    create_reflex_ivm_impl_with_materialization(
+        view_name,
+        sql,
+        unique_columns_str,
+        if_not_exists,
+        storage_mode,
+        refresh_mode,
+        topk_k,
+        ignore_sources,
+        partition_by,
+        false, // top-level call: zero-overhead VIEW wrappers are still fine
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn create_reflex_ivm_impl_with_materialization(
+    view_name: &str,
+    sql: &str,
+    unique_columns_str: &str,
+    if_not_exists: bool,
+    storage_mode: &str,
+    refresh_mode: &str,
+    topk_k: Option<usize>,
+    ignore_sources: &[String],
+    partition_by: &[String],
+    materialize_as_table: bool,
+) -> &'static str {
     let parsed = match validate_and_parse_inputs(view_name, sql, storage_mode, refresh_mode) {
         Ok(p) => p,
         Err(msg) => return msg,
@@ -2150,6 +2400,7 @@ pub(crate) fn create_reflex_ivm_impl(
         ignore_sources,
         partition_by,
         parsed: &parsed,
+        materialize_as_table,
     };
 
     if let Some(result) = try_decompose_set_op(&dctx) {
@@ -2933,44 +3184,42 @@ fn query_column_types_from_catalog_with_per_source(
         if table.starts_with('<') {
             continue;
         }
-        // Handle schema-qualified names
-        let (schema, tbl) = if table.contains('.') {
-            let parts: Vec<&str> = table.splitn(2, '.').collect();
-            (parts[0], parts[1])
-        } else {
-            ("public", table.as_str())
-        };
+        // Resolve the table via `to_regclass($1)` so we honour the session's
+        // `search_path` instead of hard-coding the `public` schema. This is the
+        // only way an unqualified source name from the IMV body (e.g.
+        // `FROM history_sales_view`) finds the tenant-schema relation when the
+        // caller has done `SET search_path = <tenant>, public`. We pull the
+        // actual `relname` back out of pg_class so the `table.column` keys in
+        // the returned map are consistent regardless of whether the caller
+        // passed a qualified or unqualified name.
+        //
         // pg_catalog (not information_schema.columns) because the latter omits
-        // materialized views — a MIN/MAX over a matview column would then get no
-        // type and default to NUMERIC. `format_type` covers every relkind.
+        // materialized views — a MIN/MAX over a matview column would then get
+        // no type and default to NUMERIC. `format_type` covers every relkind.
         let rows = client
             .select(
                 "SELECT a.attname::text AS col_name, \
                         format_type(a.atttypid, a.atttypmod) AS data_type, \
+                        c.relname::text AS relname, \
                         CASE WHEN a.attnotnull THEN 'NO' ELSE 'YES' END AS is_nullable \
                  FROM pg_catalog.pg_attribute a \
                  JOIN pg_catalog.pg_class c ON c.oid = a.attrelid \
-                 JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
-                 WHERE n.nspname = $1 AND c.relname = $2 \
+                 WHERE c.oid = to_regclass($1) \
                    AND a.attnum > 0 AND NOT a.attisdropped",
                 None,
-                &[
-                    unsafe {
-                        DatumWithOid::new(schema.to_string(), PgBuiltInOids::TEXTOID.oid().value())
-                    },
-                    unsafe {
-                        DatumWithOid::new(tbl.to_string(), PgBuiltInOids::TEXTOID.oid().value())
-                    },
-                ],
+                &[unsafe {
+                    DatumWithOid::new(table.to_string(), PgBuiltInOids::TEXTOID.oid().value())
+                }],
             )
             .unwrap_or_report();
         for row in rows {
-            if let (Some(col_name), Some(data_type)) = (
+            if let (Some(col_name), Some(data_type), Some(relname)) = (
                 row.get_by_name::<String, _>("col_name").unwrap_or(None),
                 row.get_by_name::<String, _>("data_type").unwrap_or(None),
+                row.get_by_name::<String, _>("relname").unwrap_or(None),
             ) {
                 let pg_type = map_information_schema_type(&data_type);
-                types.insert(format!("{}.{}", tbl, col_name), pg_type.clone());
+                types.insert(format!("{}.{}", relname, col_name), pg_type.clone());
                 // Also insert bare column name for simpler lookups
                 types.entry(col_name.to_string()).or_insert(pg_type);
 
