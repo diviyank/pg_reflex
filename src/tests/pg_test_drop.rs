@@ -499,3 +499,69 @@ fn test_union_all_intermediate_wrapper_has_src_idx_column() {
     .unwrap();
     assert_eq!(notnull, Some(true), "__reflex_src_idx must be NOT NULL");
 }
+
+#[pg_test]
+fn test_union_all_cross_operand_delete_isolation() {
+    Spi::run(
+        "CREATE TABLE pool_a(id INT PRIMARY KEY, label TEXT);
+         CREATE TABLE pool_b(id INT PRIMARY KEY, label TEXT);
+         INSERT INTO pool_a VALUES (1, 'shared');
+         INSERT INTO pool_b VALUES (1, 'shared');  -- same id+label, different operand",
+    )
+    .unwrap();
+
+    Spi::get_one::<String>(
+        "SELECT create_reflex_ivm(
+           view_name => 'pool_imv',
+           sql       => 'WITH pooled AS (
+                           SELECT id, label FROM pool_a
+                           UNION ALL
+                           SELECT id, label FROM pool_b
+                         )
+                         SELECT label, COUNT(*) AS cnt
+                         FROM pooled
+                         GROUP BY label',
+           storage   => 'UNLOGGED'
+         )",
+    )
+    .unwrap()
+    .unwrap_or_default();
+
+    // Initially: cnt for 'shared' = 2 (one row from each operand).
+    let cnt_before = Spi::get_one::<i64>(
+        "SELECT cnt FROM pool_imv WHERE label = 'shared'",
+    )
+    .expect("q1").expect("v1");
+    assert_eq!(cnt_before, 2, "expected 2 'shared' rows after setup");
+
+    // Delete from operand A only. Cross-operand collision: operand A and B
+    // each have ('shared'). After this DELETE, only A's row should disappear
+    // from the wrapper. The aggregate cnt should be 1 (B's row still there).
+    Spi::run("DELETE FROM pool_a WHERE id = 1").expect("delete");
+
+    // The bug: the mirror DELETE removes ANY wrapper row matching the column values,
+    // not scoped to the operand. So both rows get deleted, and this query returns empty.
+    // We verify this by checking if the row still exists; we expect it to exist with cnt=1.
+    let cnt_exists = Spi::get_one::<i64>(
+        "SELECT COUNT(*) FROM pool_imv WHERE label = 'shared'",
+    )
+    .expect("count_q").expect("count_v");
+
+    // If cnt_exists == 0, the bug manifested (both rows deleted).
+    // If cnt_exists == 1, the row still exists.
+    if cnt_exists > 0 {
+        let cnt_result = Spi::get_one::<i64>(
+            "SELECT cnt FROM pool_imv WHERE label = 'shared'",
+        )
+        .expect("q2").expect("v2");
+        assert_eq!(
+            cnt_result, 1,
+            "cross-operand DELETE over-deleted: expected cnt=1 (B's row preserved), got {cnt_result}"
+        );
+    } else {
+        panic!(
+            "cross-operand DELETE over-deleted: expected cnt=1 (B's row preserved), \
+             but the entire 'shared' row disappeared from pool_imv"
+        );
+    }
+}
