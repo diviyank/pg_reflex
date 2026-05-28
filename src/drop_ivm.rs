@@ -359,6 +359,42 @@ fn drop_reflex_ivm_impl_inner(view_name: &str, cascade: bool, root: &str) -> &'s
             }
         }
 
+        // Drop UNION-ALL mirror trigger FUNCTIONS for this wrapper, if any.
+        // Functions are not auto-dropped when the trigger is dropped by
+        // operand-sub-IMV cascade. We identify a UNION-ALL wrapper by the
+        // `__union_<i>` suffix on at least one of its depends_on_imv
+        // entries; for those we drop the three deterministic functions
+        // per operand index (IF EXISTS keeps the call safe when the
+        // function was already cleaned up by a prior pass or never
+        // existed because the operand had no columns).
+        let is_union_all_wrapper = depends_on_imv.iter().any(|d| {
+            let (_, bare) = crate::query_decomposer::canonical_source(d);
+            // Match `<anything>__union_<digits>` suffix.
+            if let Some(idx) = bare.rfind("__union_") {
+                bare[idx + "__union_".len()..]
+                    .chars()
+                    .all(|c| c.is_ascii_digit())
+                    && !bare[idx + "__union_".len()..].is_empty()
+            } else {
+                false
+            }
+        });
+        if is_union_all_wrapper {
+            let safe_wrapper = crate::query_decomposer::sanitized_source_suffix(view_name);
+            for i in 0..depends_on_imv.len() {
+                for op in &["ins", "del", "upd"] {
+                    let fn_name = format!("__reflex_union_mirror_{safe_wrapper}_{i}_{op}");
+                    client
+                        .update(
+                            &format!("DROP FUNCTION IF EXISTS public.{fn_name}() CASCADE"),
+                            None,
+                            &[],
+                        )
+                        .unwrap_or_report();
+                }
+            }
+        }
+
         info!("pg_reflex: dropped IMV '{}'", view_name);
         ("DROP REFLEX INCREMENTAL VIEW", sub_imvs_to_drop)
     });
