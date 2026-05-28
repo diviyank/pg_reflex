@@ -565,3 +565,54 @@ fn test_union_all_cross_operand_delete_isolation() {
         );
     }
 }
+
+#[pg_test]
+fn test_drop_cleans_up_union_mirror_functions() {
+    Spi::run(
+        "CREATE TABLE clean_a(id INT PRIMARY KEY, x INT);
+         CREATE TABLE clean_b(id INT PRIMARY KEY, x INT);",
+    )
+    .unwrap();
+
+    Spi::get_one::<String>(
+        "SELECT create_reflex_ivm(
+           view_name => 'clean_imv',
+           sql       => 'WITH pooled AS (
+                           SELECT id, x FROM clean_a
+                           UNION ALL
+                           SELECT id, x FROM clean_b
+                         )
+                         SELECT x, COUNT(*) AS cnt FROM pooled GROUP BY x',
+           storage   => 'UNLOGGED'
+         )",
+    )
+    .unwrap();
+
+    // Before drop: at least 6 mirror functions exist (2 operands × 3 ops).
+    let before: Option<i64> = Spi::get_one(
+        "SELECT COUNT(*)
+         FROM pg_proc p
+         JOIN pg_namespace n ON n.oid = p.pronamespace
+         WHERE n.nspname = 'public'
+           AND p.proname LIKE '\\_\\_reflex\\_union\\_mirror\\_clean\\_imv\\_\\_cte\\_pooled\\_%' ESCAPE '\\'",
+    )
+    .unwrap();
+    assert!(before.unwrap_or(0) >= 6, "expected ≥6 mirror functions before drop, got {before:?}");
+
+    Spi::run("SELECT drop_reflex_ivm('clean_imv', TRUE)").unwrap();
+
+    // After drop: zero mirror functions remain.
+    let after: Option<i64> = Spi::get_one(
+        "SELECT COUNT(*)
+         FROM pg_proc p
+         JOIN pg_namespace n ON n.oid = p.pronamespace
+         WHERE n.nspname = 'public'
+           AND p.proname LIKE '\\_\\_reflex\\_union\\_mirror\\_clean\\_imv\\_\\_cte\\_pooled\\_%' ESCAPE '\\'",
+    )
+    .unwrap();
+    assert_eq!(
+        after,
+        Some(0),
+        "expected 0 mirror functions after drop, got {after:?} — function orphan"
+    );
+}
