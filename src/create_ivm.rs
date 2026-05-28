@@ -2452,8 +2452,19 @@ pub(crate) fn create_reflex_ivm_impl_with_materialization(
         storage_upper,
         mode_upper,
         parsed_sql: _,
-        analysis,
+        mut analysis,
     } = parsed;
+
+    // Resolve every bare source against the current `search_path` so the
+    // identifiers stored in `__reflex_ivm_reference.depends_on`, baked into the
+    // generated trigger bodies, and pushed into `__reflex_deferred_pending`
+    // all carry the qualified `schema.table` form of the relation the trigger
+    // is actually attached to. Without this, a bare `FROM foo` whose
+    // search_path-resolved schema is e.g. `alp.foo` flows through unqualified;
+    // `reflex_flush_deferred` (trigger.rs ~2885) later splits the schemaless
+    // name, falls back to `nspname='public'`, and projects columns from a
+    // public-side homonym, crashing the COMMIT-time flush.
+    canonicalize_analysis_sources(&mut analysis);
 
     // COUNT(DISTINCT) mixed-with-other-aggregates check — must reject before
     // building the ctx.
@@ -2553,6 +2564,78 @@ pub(crate) fn create_reflex_ivm_impl_with_materialization(
 
     info!("pg_reflex: created IMV '{}'", view_name);
     "CREATE REFLEX INCREMENTAL VIEW"
+}
+
+/// Resolve every real-table entry in `analysis.sources` (and the matching
+/// `analysis.table_aliases` values) to its `schema.table` form via the
+/// current session's `search_path`. Synthetic markers (`<subquery:…>`,
+/// `<function:…>`, `<…>`) are left untouched. Entries that do not resolve
+/// (typo, race against a DROP, or already passing through as a CTE label) are
+/// kept verbatim — downstream catalog lookups will surface a clear error in
+/// that case rather than this helper guessing.
+///
+/// Sources that resolve to the `public` schema are intentionally left bare:
+/// the legacy code path's `unwrap_or("public")` fallback (e.g. trigger.rs's
+/// `nspname=$1` lookup) lands on the same relation, so there is nothing for
+/// canonicalization to fix and rewriting would churn identifier suffixes
+/// across already-deployed installs. The bug class only manifests when a
+/// non-`public` source shares a bare name with a `public` homonym — there
+/// the canonical form keeps DDL-time and trigger-fire-time in agreement.
+///
+/// The IMV's persistent identity for a source (depends_on, trigger-body slot,
+/// pending-table value) is the canonical form returned here.
+fn canonicalize_analysis_sources(analysis: &mut crate::sql_analyzer::SqlAnalysis) {
+    use std::collections::HashMap;
+    let mut resolutions: HashMap<String, String> = HashMap::new();
+
+    Spi::connect(|client| {
+        for raw in &analysis.sources {
+            if raw.starts_with('<') || resolutions.contains_key(raw) {
+                continue;
+            }
+            let qualified: Option<String> = client
+                .select(
+                    "SELECT n.nspname::TEXT || '.' || c.relname::TEXT AS q \
+                     FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+                     WHERE c.oid = to_regclass($1)",
+                    None,
+                    &[unsafe {
+                        DatumWithOid::new(raw.to_string(), PgBuiltInOids::TEXTOID.oid().value())
+                    }],
+                )
+                .ok()
+                .and_then(|mut it| it.next())
+                .and_then(|row| {
+                    row.get_by_name::<&str, _>("q")
+                        .ok()
+                        .flatten()
+                        .map(|s| s.to_string())
+                });
+            if let Some(q) = qualified {
+                if q.starts_with("public.") {
+                    continue;
+                }
+                if q != *raw {
+                    resolutions.insert(raw.clone(), q);
+                }
+            }
+        }
+    });
+
+    if resolutions.is_empty() {
+        return;
+    }
+
+    for source in analysis.sources.iter_mut() {
+        if let Some(q) = resolutions.get(source) {
+            *source = q.clone();
+        }
+    }
+    for table in analysis.table_aliases.values_mut() {
+        if let Some(q) = resolutions.get(table) {
+            *table = q.clone();
+        }
+    }
 }
 
 /// Build per-source-table column mappings for passthrough DELETE/UPDATE.

@@ -439,3 +439,96 @@ fn pg_test_topk_imv_in_custom_schema_under_set_search_path() {
     .expect("v");
     assert_eq!(mismatches, 0, "top-K MIN/MAX IMV diverged under narrow search_path");
 }
+
+/// DEFERRED IMV created from a search_path-relative bare source name, where a
+/// homonym table exists in `public` with a DIFFERENT column shape. Reproduces
+/// the customer-reported error
+///   `column "company_id" does not exist`
+/// that fires at COMMIT-time flush: `reflex_flush_deferred('foo')` split a
+/// schemaless name, fell back to `nspname='public'`, projected the wrong
+/// (public-homonym) column set, then applied it on the actual source schema's
+/// staging delta.
+///
+/// The IMV must canonicalize bare sources to their search_path-resolved schema
+/// at create time so depends_on, pending storage, and catalog lookups all key
+/// off the same `schema.table`.
+#[pg_test]
+fn pg_test_deferred_imv_bare_source_with_public_homonym() {
+    // Custom schema's `foo` — narrow column shape (id, value).
+    Spi::run("CREATE SCHEMA hsch").expect("schema");
+    Spi::run("CREATE TABLE hsch.foo (id INT PRIMARY KEY, value INT)").expect("create custom foo");
+    Spi::run("INSERT INTO hsch.foo VALUES (1, 10), (2, 20)").expect("seed");
+
+    // public.foo — homonym with an EXTRA column not present in hsch.foo.
+    // Mirrors `public.location` carrying `company_id` in the customer DB.
+    Spi::run(
+        "CREATE TABLE public.foo (\
+            extra_company_id INT NOT NULL DEFAULT 0, \
+            id INT PRIMARY KEY, \
+            value INT)",
+    )
+    .expect("create public foo");
+
+    // Create the IMV with a BARE source reference under a search_path whose
+    // first entry is the custom schema. PG resolves bare `foo` to `hsch.foo`
+    // at IMV-build time.
+    Spi::run("SET search_path = hsch, public").expect("set search_path");
+
+    let r = crate::create_reflex_ivm(
+        "hsch.foo_view",
+        "SELECT id, SUM(value) AS s FROM foo GROUP BY id",
+        None,
+        None,
+        Some("DEFERRED"),
+        None,
+    );
+    assert_eq!(r, "CREATE REFLEX INCREMENTAL VIEW");
+
+    // The trigger must be on hsch.foo (search_path-resolved at DDL time).
+    // After canonicalization the trigger-name suffix is `schema_table`.
+    let trig_schema = Spi::get_one::<String>(
+        "SELECT n.nspname::TEXT FROM pg_trigger t \
+         JOIN pg_class c ON c.oid = t.tgrelid \
+         JOIN pg_namespace n ON n.oid = c.relnamespace \
+         WHERE t.tgname = '__reflex_trigger_upd_on_hsch_foo'",
+    )
+    .expect("trig lookup")
+    .expect("trigger row");
+    assert_eq!(trig_schema, "hsch", "trigger should be on hsch.foo");
+
+    // The reported bug fires at COMMIT-time flush: `reflex_flush_deferred`
+    // splits a schemaless `'foo'`, falls back to `nspname='public'`, projects
+    // the wrong (public.foo) column set, then crashes when it can't find
+    // `extra_company_id` on the actual staging delta. Drive the flush manually
+    // using whatever the trigger stored in `__reflex_deferred_pending` — the
+    // value that the COMMIT-time constraint trigger would itself pass.
+    Spi::run("UPDATE hsch.foo SET value = 99 WHERE id = 1").expect("update under deferred");
+
+    let stored_source: String = Spi::get_one::<String>(
+        "SELECT source_table FROM public.__reflex_deferred_pending LIMIT 1",
+    )
+    .expect("pending")
+    .expect("a row should be queued for the bare source");
+
+    Spi::run(&format!(
+        "SELECT public.reflex_flush_deferred('{}')",
+        stored_source.replace('\'', "''")
+    ))
+    .expect("flush must not crash on homonym schema mis-resolution");
+
+    // And the IMV must still equal a fresh recomputation.
+    let fresh = "SELECT id, SUM(value) AS s FROM hsch.foo GROUP BY id";
+    let mismatches = Spi::get_one::<i64>(&format!(
+        "SELECT COUNT(*) FROM (\
+            (SELECT * FROM hsch.foo_view EXCEPT ALL SELECT * FROM ({fresh}) f1) \
+            UNION ALL \
+            (SELECT * FROM ({fresh}) f2 EXCEPT ALL SELECT * FROM hsch.foo_view) \
+         ) o"
+    ))
+    .expect("oracle")
+    .expect("v");
+    assert_eq!(
+        mismatches, 0,
+        "deferred IMV over bare source diverged from fresh (homonym in public)"
+    );
+}
