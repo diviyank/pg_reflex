@@ -268,47 +268,28 @@ fn try_decompose_set_op(ctx: &DecomposeCtx) -> Option<&'static str> {
         .collect();
 
     if set_op.is_all {
-        let view_sql = union_selects.join(" UNION ALL ");
         if ctx.materialize_as_table {
             // Wrapper must be a TABLE because a downstream consumer (the IMV
             // that referenced this set-op as a CTE / sub-query) will install
             // transition-table triggers on it — PostgreSQL rejects those on
-            // VIEWs (`"…" is a view: Triggers on views cannot have transition
-            // tables`). We CTAS the union, then install per-operand mirror
-            // triggers that propagate INSERT/UPDATE/DELETE 1:1 into the
-            // wrapper. NOTE: the mirror DELETE matches all columns via
-            // `IS NOT DISTINCT FROM`, which assumes operands have no intra-
-            // operand duplicate rows — true for typical CTE shapes; document
-            // and lift later if a use case appears.
+            // VIEWs. Build via the dedicated helper.
             Spi::connect_mut(|client| {
-                client
-                    .update(
-                        &format!(
-                            "DROP TABLE IF EXISTS {} CASCADE",
-                            quote_identifier(ctx.view_name)
-                        ),
-                        None,
-                        &[],
-                    )
-                    .unwrap_or_report();
-                client
-                    .update(
-                        &format!(
-                            "CREATE UNLOGGED TABLE {} AS {}",
-                            quote_identifier(ctx.view_name),
-                            view_sql
-                        ),
-                        None,
-                        &[],
-                    )
-                    .unwrap_or_report();
-                let cols = query_table_column_names(client, ctx.view_name);
-                for (i, operand) in sub_imv_names.iter().enumerate() {
-                    install_union_mirror_triggers(client, ctx.view_name, operand, i, &cols);
-                }
+                install_union_all_intermediate_wrapper(
+                    client,
+                    ctx.view_name,
+                    &sub_imv_names,
+                    ctx.sql,
+                    &ctx.parsed.storage_upper,
+                    &ctx.parsed.mode_upper,
+                );
             });
         } else {
-            // UNION ALL: create a VIEW (zero overhead, always up-to-date)
+            // Top-level UNION ALL with no downstream consumer: zero-overhead VIEW.
+            let view_sql = sub_imv_names
+                .iter()
+                .map(|name| format!("SELECT * FROM {}", quote_identifier(name)))
+                .collect::<Vec<_>>()
+                .join(" UNION ALL ");
             Spi::connect_mut(|client| {
                 client
                     .update(
@@ -321,35 +302,43 @@ fn try_decompose_set_op(ctx: &DecomposeCtx) -> Option<&'static str> {
                         &[],
                     )
                     .unwrap_or_report();
+                let depends_on: Vec<String> = sub_imv_names.clone();
+                let depends_on_imv: Vec<String> = sub_imv_names.clone();
+                let depth = sub_imv_names.len() as i32 + 1;
+                insert_registry_row(
+                    client,
+                    &RegistryRow::decomposed(
+                        ctx.view_name,
+                        depth,
+                        &depends_on,
+                        &depends_on_imv,
+                        ctx.sql,
+                        &view_sql,
+                        &ctx.parsed.storage_upper,
+                        &ctx.parsed.mode_upper,
+                    ),
+                )
+                .unwrap_or_report();
+                add_graph_child_links(client, ctx.view_name, &depends_on_imv).unwrap_or_report();
             });
         }
-
-        // Register in reference table so drop_reflex_ivm can clean up.
-        // depends_on = sub-IMV names (the VIEW reads from them, not from real sources)
-        Spi::connect_mut(|client| {
-            let depends_on: Vec<String> = sub_imv_names.clone();
-            let depends_on_imv: Vec<String> = sub_imv_names.clone();
-            let depth = sub_imv_names.len() as i32 + 1;
-            insert_registry_row(
-                client,
-                &RegistryRow::decomposed(
-                    ctx.view_name,
-                    depth,
-                    &depends_on,
-                    &depends_on_imv,
-                    ctx.sql,
-                    &view_sql,
-                    &ctx.parsed.storage_upper,
-                    &ctx.parsed.mode_upper,
-                ),
-            )
-            .unwrap_or_report();
-            add_graph_child_links(client, ctx.view_name, &depends_on_imv).unwrap_or_report();
-        });
     } else {
-        // UNION / INTERSECT / EXCEPT (without ALL): create a VIEW.
-        // The sub-IMVs maintain data incrementally; PostgreSQL handles
-        // the set operation semantics at query time.
+        // UNION / INTERSECT / EXCEPT (without ALL): VIEW-based set operation.
+        // These cannot be materialised as tables (they need deduplication at
+        // query time), so they can only be used at the top level (not in a CTE
+        // body that a downstream aggregate IMV tries to install transition-table
+        // triggers on). Reject if materialize_as_table is true.
+        if ctx.materialize_as_table {
+            return Some(crate::reflex_reject(
+                "UNION/INTERSECT/EXCEPT (without ALL) cannot be used as an intermediate \
+                 sub-IMV because their result is dedup-/order-dependent on the full input \
+                 and cannot be incrementally maintained on each operand delta. Options: \
+                 (1) hoist this set op to the outermost SELECT so it stays a VIEW; \
+                 (2) define this view with kind: mv; \
+                 (3) rewrite as UNION ALL if operands are guaranteed disjoint.",
+            ));
+        }
+
         let set_keyword = match set_op.op {
             sqlparser::ast::SetOperator::Union => "UNION",
             sqlparser::ast::SetOperator::Intersect => "INTERSECT",
@@ -397,27 +386,6 @@ fn try_decompose_set_op(ctx: &DecomposeCtx) -> Option<&'static str> {
     Some("CREATE REFLEX INCREMENTAL VIEW")
 }
 
-/// Return the user column names of `table_name` in attnum order. Used by the
-/// UNION-ALL TABLE-materialisation path to build per-operand mirror trigger
-/// bodies. Excludes dropped and system columns.
-fn query_table_column_names(client: &mut pgrx::spi::SpiClient<'_>, table_name: &str) -> Vec<String> {
-    client
-        .select(
-            "SELECT a.attname::text AS col_name \
-             FROM pg_catalog.pg_attribute a \
-             WHERE a.attrelid = to_regclass($1) \
-               AND a.attnum > 0 AND NOT a.attisdropped \
-             ORDER BY a.attnum",
-            None,
-            &[unsafe {
-                DatumWithOid::new(table_name.to_string(), PgBuiltInOids::TEXTOID.oid().value())
-            }],
-        )
-        .unwrap_or_report()
-        .filter_map(|row| row.get_by_name::<String, _>("col_name").unwrap_or(None))
-        .collect()
-}
-
 /// Install per-operand mirror triggers on `operand` that propagate every
 /// INSERT / UPDATE / DELETE 1:1 into the wrapper TABLE `wrapper`. One pair of
 /// trigger function + trigger per DML kind (INS / DEL / UPD). The trigger
@@ -441,7 +409,14 @@ fn install_union_mirror_triggers(
     let wrapper_q = quote_identifier(wrapper);
     let operand_q = quote_identifier(operand);
     let safe_wrapper = crate::query_decomposer::sanitized_source_suffix(wrapper);
-    let col_list: String = cols.iter().map(|c| quote_identifier(c)).collect::<Vec<_>>().join(", ");
+
+    // Column list for INSERTs. We always write __reflex_src_idx first.
+    let payload_col_list: String = cols
+        .iter()
+        .map(|c| quote_identifier(c))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let full_col_list = format!("__reflex_src_idx, {payload_col_list}");
     let new_select: String = cols
         .iter()
         .map(|c| format!("__reflex_new.{}", quote_identifier(c)))
@@ -461,33 +436,32 @@ fn install_union_mirror_triggers(
     let fn_del = format!("{fn_base}_del");
     let fn_upd = format!("{fn_base}_upd");
 
-    // INSERT mirror: copy every NEW row into the wrapper.
+    // INSERT mirror: tag every NEW row with this operand's index.
     let ins_body = format!(
         "CREATE OR REPLACE FUNCTION public.{fn_ins}() \
          RETURNS TRIGGER LANGUAGE plpgsql AS $body$\n\
          BEGIN\n  \
-           INSERT INTO {wrapper_q} ({col_list}) \
-           SELECT {new_select} FROM __reflex_new;\n  \
+           INSERT INTO {wrapper_q} ({full_col_list}) \
+           SELECT {operand_idx}::SMALLINT, {new_select} FROM __reflex_new;\n  \
            RETURN NULL;\n\
          END;\n$body$"
     );
 
-    // DELETE mirror: remove every wrapper row that matches an OLD row.
-    // Assumes operands have no intra-operand duplicates (typical for CTE
-    // sub-IMVs); duplicates would over-delete in the wrapper.
+    // DELETE mirror: remove operand-i rows in the wrapper that match the OLD rows.
+    // The __reflex_src_idx = operand_idx filter prevents cross-operand over-delete.
+    // Intra-operand duplicate over-delete is still possible (documented).
     let del_body = format!(
         "CREATE OR REPLACE FUNCTION public.{fn_del}() \
          RETURNS TRIGGER LANGUAGE plpgsql AS $body$\n\
          BEGIN\n  \
            DELETE FROM {wrapper_q} w \
-           WHERE EXISTS (SELECT 1 FROM __reflex_old o WHERE {match_pred});\n  \
+           WHERE w.__reflex_src_idx = {operand_idx}::SMALLINT \
+             AND EXISTS (SELECT 1 FROM __reflex_old o WHERE {match_pred});\n  \
            RETURN NULL;\n\
          END;\n$body$"
     );
 
-    // UPDATE mirror: DELETE old + INSERT new (sequenced in one statement to
-    // avoid mid-trigger inconsistency observed by other triggers in the
-    // chain).
+    // UPDATE mirror: DEL then INS (single statement to avoid mid-trigger inconsistency).
     let upd_new_select: String = cols
         .iter()
         .map(|c| format!("__reflex_new.{}", quote_identifier(c)))
@@ -498,9 +472,10 @@ fn install_union_mirror_triggers(
          RETURNS TRIGGER LANGUAGE plpgsql AS $body$\n\
          BEGIN\n  \
            DELETE FROM {wrapper_q} w \
-           WHERE EXISTS (SELECT 1 FROM __reflex_old o WHERE {match_pred});\n  \
-           INSERT INTO {wrapper_q} ({col_list}) \
-           SELECT {upd_new_select} FROM __reflex_new;\n  \
+           WHERE w.__reflex_src_idx = {operand_idx}::SMALLINT \
+             AND EXISTS (SELECT 1 FROM __reflex_old o WHERE {match_pred});\n  \
+           INSERT INTO {wrapper_q} ({full_col_list}) \
+           SELECT {operand_idx}::SMALLINT, {upd_new_select} FROM __reflex_new;\n  \
            RETURN NULL;\n\
          END;\n$body$"
     );
@@ -513,7 +488,6 @@ fn install_union_mirror_triggers(
     let trg_del = format!("__reflex_union_mirror_del_{safe_wrapper}_{operand_idx}");
     let trg_upd = format!("__reflex_union_mirror_upd_{safe_wrapper}_{operand_idx}");
 
-    // Drop any stale triggers from a prior failed create before re-installing.
     for trg in [&trg_ins, &trg_del, &trg_upd] {
         client
             .update(
@@ -557,6 +531,166 @@ fn install_union_mirror_triggers(
             &[],
         )
         .unwrap_or_report();
+}
+
+/// Build an intermediate UNION-ALL wrapper as an UNLOGGED TABLE with a
+/// `__reflex_src_idx SMALLINT NOT NULL` discriminator column followed by
+/// the operand columns. Populates it per-operand, installs per-operand
+/// mirror triggers, and registers the wrapper in the catalog as a
+/// decomposed row.
+///
+/// The wrapper is decomposed (aggregations_json = "{}") so the consolidated
+/// reflex trigger no-ops it; maintenance is done entirely by the per-
+/// operand mirror triggers installed here.
+///
+/// Caller invariant: `operand_sub_imv_names` is non-empty and every name
+/// in it already exists as a real relation (TABLE or VIEW). UNION-ALL
+/// operand recursion (which builds the sub-IMVs) must have completed
+/// before this helper is invoked.
+fn install_union_all_intermediate_wrapper(
+    client: &mut pgrx::spi::SpiClient<'_>,
+    view_name: &str,
+    operand_sub_imv_names: &[String],
+    user_sql: &str,
+    storage_upper: &str,
+    mode_upper: &str,
+) {
+    assert!(
+        !operand_sub_imv_names.is_empty(),
+        "install_union_all_intermediate_wrapper called with no operands"
+    );
+
+    // 1. Discover operand columns from operand 0 (UNION-ALL operands are
+    //    union-compatible, so operand 0 defines the column shape).
+    let operand0 = &operand_sub_imv_names[0];
+    let (operand0_schema, operand0_bare) = split_qualified_name(operand0);
+    let operand0_schema_str = operand0_schema.unwrap_or("public");
+    let col_rows: Vec<(String, String)> = client
+        .select(
+            "SELECT a.attname::text AS name, \
+                    format_type(a.atttypid, a.atttypmod) AS pg_type \
+             FROM pg_catalog.pg_attribute a \
+             JOIN pg_catalog.pg_class c ON c.oid = a.attrelid \
+             JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname = $1 \
+               AND c.relname = $2 \
+               AND a.attnum > 0 AND NOT a.attisdropped \
+             ORDER BY a.attnum",
+            None,
+            &[
+                unsafe {
+                    DatumWithOid::new(
+                        operand0_schema_str.to_string(),
+                        PgBuiltInOids::TEXTOID.oid().value(),
+                    )
+                },
+                unsafe {
+                    DatumWithOid::new(
+                        operand0_bare.to_string(),
+                        PgBuiltInOids::TEXTOID.oid().value(),
+                    )
+                },
+            ],
+        )
+        .unwrap_or_report()
+        .filter_map(|r| {
+            let n = r.get_by_name::<&str, _>("name").ok()??.to_string();
+            // Skip __reflex_src_idx in case an operand is itself a
+            // UNION-ALL wrapper — we re-tag at this level, not inherit.
+            if n == "__reflex_src_idx" {
+                return None;
+            }
+            let t = r.get_by_name::<&str, _>("pg_type").ok()??.to_string();
+            Some((n, t))
+        })
+        .collect();
+    if col_rows.is_empty() {
+        warning!(
+            "pg_reflex: operand '{}' has no columns; UNION-ALL wrapper '{}' creation skipped",
+            operand0,
+            view_name
+        );
+        return;
+    }
+    let payload_cols: Vec<String> = col_rows.iter().map(|(n, _)| n.clone()).collect();
+
+    // 2. Build wrapper DDL: __reflex_src_idx first, then operand columns.
+    let wrapper_q = quote_identifier(view_name);
+    let col_defs: Vec<String> = col_rows
+        .iter()
+        .map(|(n, t)| format!("{} {}", quote_identifier(n), t))
+        .collect();
+    client
+        .update(
+            &format!("DROP TABLE IF EXISTS {} CASCADE", wrapper_q),
+            None,
+            &[],
+        )
+        .unwrap_or_report();
+    client
+        .update(
+            &format!(
+                "CREATE UNLOGGED TABLE {} (__reflex_src_idx SMALLINT NOT NULL, {})",
+                wrapper_q,
+                col_defs.join(", ")
+            ),
+            None,
+            &[],
+        )
+        .unwrap_or_report();
+
+    // 3. Populate initial rows per operand with the operand index tag.
+    let payload_col_list = payload_cols
+        .iter()
+        .map(|c| quote_identifier(c))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let full_col_list = format!("__reflex_src_idx, {payload_col_list}");
+    for (i, operand) in operand_sub_imv_names.iter().enumerate() {
+        let operand_q = quote_identifier(operand);
+        client
+            .update(
+                &format!(
+                    "INSERT INTO {wrapper_q} ({full_col_list}) \
+                     SELECT {i}::SMALLINT, {payload_col_list} FROM {operand_q}"
+                ),
+                None,
+                &[],
+            )
+            .unwrap_or_report();
+    }
+
+    // 4. Install per-operand mirror triggers.
+    for (i, operand) in operand_sub_imv_names.iter().enumerate() {
+        install_union_mirror_triggers(client, view_name, operand, i, &payload_cols);
+    }
+
+    // 5. Register in catalog. Use the user's original SQL as sql_query; the
+    //    base_query field stores the UNION-ALL over operand sub-IMVs for
+    //    introspection consistency with the previous code.
+    let view_sql_for_catalog: String = operand_sub_imv_names
+        .iter()
+        .map(|n| format!("SELECT * FROM {}", quote_identifier(n)))
+        .collect::<Vec<_>>()
+        .join(" UNION ALL ");
+    let depends_on: Vec<String> = operand_sub_imv_names.to_vec();
+    let depends_on_imv: Vec<String> = operand_sub_imv_names.to_vec();
+    let depth = operand_sub_imv_names.len() as i32 + 1;
+    insert_registry_row(
+        client,
+        &RegistryRow::decomposed(
+            view_name,
+            depth,
+            &depends_on,
+            &depends_on_imv,
+            user_sql,
+            &view_sql_for_catalog,
+            storage_upper,
+            mode_upper,
+        ),
+    )
+    .unwrap_or_report();
+    add_graph_child_links(client, view_name, &depends_on_imv).unwrap_or_report();
 }
 
 /// Decomposition phase: `SELECT DISTINCT ON (...) ... ORDER BY ...`.
