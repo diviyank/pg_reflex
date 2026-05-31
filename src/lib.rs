@@ -108,7 +108,13 @@ extension_sql!(
         -- tune this when one IMV's shape diverges from the global default —
         -- e.g. small-row-count IMVs where reconcile takes < 1 s and a low
         -- threshold (0.10) accelerates moderate bulk operations.
-        wipe_threshold NUMERIC
+        wipe_threshold NUMERIC,
+        -- 1.7.1 — schema the IMV's objects (target + aux tables) were created
+        -- in, captured from current_schema() at create time for bare names.
+        -- drop_reflex_ivm reuses it to qualify teardown DDL so cleanup no longer
+        -- depends on the session search_path at drop time. NULL for legacy rows
+        -- (drop falls back to search_path resolution, preserving old behavior).
+        target_schema TEXT
     );
 
     -- Index on name for fast lookups

@@ -96,47 +96,56 @@ STRICT PARALLEL SAFE IMMUTABLE
 LANGUAGE c
 AS 'MODULE_PATHNAME', 'reflex_quote_identifier_wrapper';
 
--- Rebuild the immediate / deferred trigger functions for every distinct
--- source referenced by an enabled IMV.  The trigger body templates are
--- baked into `reflex_rebuild_triggers` at extension build time, so
--- re-running it picks up the new Path C body.  Errors from individual
--- sources (e.g., a `depends_on` entry that no longer resolves) are
--- demoted to WARNINGs so a stale row cannot block the rest of the
--- migration; the unreached IMV's trigger keeps its 1.7.0 body and will
--- continue to fall through to MERGE (still correct, just less optimal
--- on schema-qualified joined aggregates with a populated
--- `source_join_keys`).
+-- NOTE: we deliberately do NOT call `reflex_rebuild_triggers` from inside
+-- this migration script.  ALTER EXTENSION sets PG's `creating_extension`
+-- flag for the entire command; `CREATE OR REPLACE FUNCTION` on a function
+-- that exists but is not an extension member then errors with
+--   function "__reflex_ins_trigger_on_<src>" is not a member of extension "pg_reflex"
+-- The per-source trigger functions were created from `create_reflex_ivm`
+-- (outside any extension-creation context) so they belong to the database,
+-- not the extension — and PG refuses to silently adopt them mid-upgrade.
+-- The trigger functions keep their 1.7.0 body and are still correct
+-- (Path C silently falls through to the MERGE path for bare-name or
+-- long-name IMVs), so leaving them untouched here is safe.
 --
--- We deduplicate via `SELECT DISTINCT` and drop sub-IMV refs (entries
--- prefixed with `<` mark CTE / set-op decompositions that are not
--- materialised as real relations).
+-- After `ALTER EXTENSION pg_reflex UPDATE TO '1.7.1'` completes, run the
+-- block below in a normal SQL session (outside `creating_extension`) to
+-- pick up the new Path C body on every existing trigger:
+--
+--   DO $$
+--   DECLARE _src TEXT; _msg TEXT; _ok INT := 0; _err INT := 0;
+--   BEGIN
+--     FOR _src IN
+--       SELECT DISTINCT s
+--       FROM public.__reflex_ivm_reference, unnest(depends_on) AS s
+--       WHERE enabled = TRUE AND s NOT LIKE '<%'
+--       ORDER BY 1
+--     LOOP
+--       BEGIN
+--         _msg := public.reflex_rebuild_triggers(_src);
+--         IF _msg LIKE 'ERROR:%' THEN
+--           RAISE NOTICE 'skipped %: %', _src, _msg;
+--           _err := _err + 1;
+--         ELSE
+--           _ok := _ok + 1;
+--         END IF;
+--       EXCEPTION WHEN OTHERS THEN
+--         RAISE NOTICE 'skipped %: %', _src, SQLERRM;
+--         _err := _err + 1;
+--       END;
+--     END LOOP;
+--     RAISE NOTICE 'rebuilt % source(s); % skipped', _ok, _err;
+--   END $$;
+--
+-- View / matview sources (PG raises "relation ... cannot have triggers")
+-- are expected to be skipped — those sources don't have pg_reflex
+-- triggers anyway and are maintained via cascade from upstream IMVs.
+-- Bare `depends_on` entries that resolve to multiple schemas raise
+-- "source name 'X' is ambiguous"; qualify those rows in
+-- `public.__reflex_ivm_reference.depends_on` and re-run.
+
 DO $migrate$
-DECLARE
-    _src TEXT;
-    _msg TEXT;
-    _ok INT := 0;
-    _err INT := 0;
 BEGIN
-    FOR _src IN
-        SELECT DISTINCT s
-        FROM public.__reflex_ivm_reference, unnest(depends_on) AS s
-        WHERE enabled = TRUE
-          AND s NOT LIKE '<%'
-        ORDER BY 1
-    LOOP
-        BEGIN
-            _msg := public.reflex_rebuild_triggers(_src);
-            IF _msg LIKE 'ERROR:%' THEN
-                RAISE WARNING 'pg_reflex 1.7.1 migration: reflex_rebuild_triggers(%) returned: %', quote_literal(_src), _msg;
-                _err := _err + 1;
-            ELSE
-                _ok := _ok + 1;
-            END IF;
-        EXCEPTION WHEN OTHERS THEN
-            RAISE WARNING 'pg_reflex 1.7.1 migration: reflex_rebuild_triggers(%) raised: %', quote_literal(_src), SQLERRM;
-            _err := _err + 1;
-        END;
-    END LOOP;
-    RAISE NOTICE 'pg_reflex 1.7.1 migration: rebuilt triggers for % source(s); % skipped', _ok, _err;
+    RAISE NOTICE 'pg_reflex 1.7.1: new SQL helpers registered. To pick up the new Path C body on every existing trigger, run the rebuild loop in this file''s header comment (in a normal SQL session, outside ALTER EXTENSION).';
 END
 $migrate$;

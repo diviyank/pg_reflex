@@ -4,6 +4,22 @@ The full changelog tracks every release. The latest version's headlines are on t
 
 For each version below, see [`CHANGELOG.md`](https://github.com/diviyank/pg_reflex/blob/main/CHANGELOG.md) on GitHub for the canonical text.
 
+## [1.7.2] — 2026-05-31
+
+Correctness release fixing `drop_reflex_ivm`, which silently orphaned the target + auxiliary tables of any IMV created with a bare (unqualified) name under a non-`public` `search_path`. All teardown DDL derived its relation names from the stored bare `name` and resolved the target via `to_regclass(name)`, both honouring the session `search_path` *at drop time* — so an IMV whose objects landed in `alp` (created while `search_path = alp`) was torn down with unqualified `DROP TABLE IF EXISTS …` that resolved against the wrong schema, deleted only the catalog row, and left the table + `__reflex_intermediate_*` / `__reflex_affected_*` / `__reflex_uk_*` behind. A same-named decoy relation of a different relkind in the path (e.g. a materialized view) could be hit instead (`ERROR: "<name>" is not a table`). Run `ALTER EXTENSION pg_reflex UPDATE TO '1.7.2';`.
+
+**Fixed**
+
+- **`drop_reflex_ivm` orphaned bare-name IMVs created under a non-`public` `search_path`.** Creation now records the object schema (`current_schema()` for bare names, the explicit schema for qualified names) in a new nullable catalog column `__reflex_ivm_reference.target_schema`, and `drop_reflex_ivm` re-qualifies the relkind probe + target DROP + every aux-table DROP with it — making teardown independent of the session `search_path`. Legacy rows with a NULL `target_schema` fall back to the prior `search_path` resolution.
+
+**Testing**
+
+- New regression `test_drop_resolves_creation_schema_for_bare_name` in `src/tests/pg_test_drop.rs` (create bare-name IMV under `search_path = drop_sch`, drop under `search_path = public`, assert target + intermediate are removed from `drop_sch`). Full suite: 1105 tests pass.
+
+**Migration**
+
+`ALTER EXTENSION pg_reflex UPDATE TO '1.7.2';` runs [`sql/pg_reflex--1.7.1--1.7.2.sql`](https://github.com/diviyank/pg_reflex/blob/main/sql/pg_reflex--1.7.1--1.7.2.sql) which adds the nullable `target_schema` column. No data backfill — existing rows keep NULL and use the legacy fallback; IMVs created after the upgrade get search_path-independent teardown automatically. No IMV needs to be dropped or recreated.
+
 ## [1.7.1] — 2026-05-31
 
 Correctness release fixing Path C (the INSERT_PROMOTED smart bulk-INSERT dispatch fired only by UPDATE triggers). Two compounding defects: derived relation names were re-built by raw `split_part` + string concat that bypassed the canonical `safe_identifier` hash (manifesting as `ERROR: relation "<…>" does not exist` for bare-name and long-name IMVs, surfaced as a `WARNING: pg_reflex Path C smart bulk-INSERT failed for <imv>` log line), and the bulk-INSERT entry gate did not match the Rust-side `aggregate_insert_stmts` safety check (silently duplicate-counted group rows for single-source aggregates). Run `ALTER EXTENSION pg_reflex UPDATE TO '1.7.1';` — the migration registers three new SQL-callable name helpers and automatically calls `reflex_rebuild_triggers` for every distinct source in `__reflex_ivm_reference.depends_on`, so existing IMVs pick up the fix without operator intervention. No catalog schema changes; no IMV needs to be dropped or recreated.
@@ -19,7 +35,7 @@ Correctness release fixing Path C (the INSERT_PROMOTED smart bulk-INSERT dispatc
 
 **Migration**
 
-`ALTER EXTENSION pg_reflex UPDATE TO '1.7.1';` runs [`sql/pg_reflex--1.7.0--1.7.1.sql`](https://github.com/diviyank/pg_reflex/blob/main/sql/pg_reflex--1.7.0--1.7.1.sql) which (1) registers the three new helper functions and (2) iterates over every distinct source in `__reflex_ivm_reference.depends_on` calling `reflex_rebuild_triggers(<source>)` so each source's trigger function body picks up the new Path C. Per-source rebuild failures are demoted to `WARNING`s (a stale `depends_on` row cannot block the rest of the migration; the unreached source keeps its 1.7.0 trigger body — still correct, Path C just falls through to MERGE for those IMVs).
+`ALTER EXTENSION pg_reflex UPDATE TO '1.7.1';` runs [`sql/pg_reflex--1.7.0--1.7.1.sql`](https://github.com/diviyank/pg_reflex/blob/main/sql/pg_reflex--1.7.0--1.7.1.sql) which registers the three new SQL-callable name-helper functions. To pick up the new Path C body on every existing trigger, run the rebuild loop printed in that file's header comment **after** the ALTER EXTENSION completes, in a normal SQL session — the per-source trigger functions were created outside any extension-creation context, so PG's `creating_extension`-mode safety check refuses to `CREATE OR REPLACE` them mid-upgrade with `"function … is not a member of extension \"pg_reflex\""`. Running the loop separately sidesteps the check. View / matview sources (`relation … cannot have triggers`) are expected to be skipped — those don't have pg_reflex triggers and are maintained via cascade. No IMV needs to be dropped or recreated.
 
 ## [1.7.0] — 2026-05-28
 

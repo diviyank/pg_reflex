@@ -30,7 +30,7 @@ fn drop_reflex_ivm_impl_inner(view_name: &str, cascade: bool, root: &str) -> &'s
         // 1. Check if view exists
         let exists = client
             .select(
-                "SELECT name, graph_child, depends_on, depends_on_imv \
+                "SELECT name, graph_child, depends_on, depends_on_imv, target_schema \
                  FROM public.__reflex_ivm_reference WHERE name = $1",
                 None,
                 &[unsafe {
@@ -58,6 +58,22 @@ fn drop_reflex_ivm_impl_inner(view_name: &str, cascade: bool, root: &str) -> &'s
             .get_by_name::<Vec<String>, _>("depends_on_imv")
             .unwrap_or(None)
             .unwrap_or_default();
+        let target_schema: Option<String> = row
+            .get_by_name::<String, _>("target_schema")
+            .unwrap_or(None)
+            .filter(|s| !s.is_empty());
+
+        // Name used for all relation-level teardown DDL (target + aux tables).
+        // When the stored name is bare we re-qualify it with the schema the
+        // objects were created in (1.7.1 `target_schema`), so DROPs no longer
+        // depend on the session search_path at drop time — the bug that
+        // orphaned bare-name IMVs created under a non-public search_path.
+        // Already-qualified names and legacy rows (no target_schema) are used
+        // verbatim, preserving prior behavior.
+        let resolved_name: String = match (&target_schema, canonical_source(view_name).0) {
+            (Some(schema), None) => format!("{schema}.{view_name}"),
+            _ => view_name.to_string(),
+        };
 
         // 2. Check children
         if !children.is_empty() && !cascade {
@@ -130,17 +146,17 @@ fn drop_reflex_ivm_impl_inner(view_name: &str, cascade: bool, root: &str) -> &'s
         }
 
         // 5. Drop target (could be a TABLE or a VIEW for window/DISTINCT ON decompositions).
-        //    Resolve via `to_regclass($1)` so a bare `view_name` honours the
-        //    session search_path — the legacy `(nspname, relname)` form fell
-        //    back to `public` and would mis-classify the target relkind for
-        //    IMVs living outside public.
+        //    `resolved_name` carries the schema the target was created in (1.7.1),
+        //    so `to_regclass` and the DROP resolve the real relation regardless of
+        //    the session search_path at drop time. Legacy rows fall back to the
+        //    bare name + search_path resolution.
         let cascade_suffix = if cascade { " CASCADE" } else { "" };
         let relkind: String = client
             .select(
                 "SELECT COALESCE((SELECT relkind::TEXT FROM pg_class WHERE oid = to_regclass($1)), 'r')",
                 None,
                 &[unsafe {
-                    DatumWithOid::new(view_name.to_string(), PgBuiltInOids::TEXTOID.oid().value())
+                    DatumWithOid::new(resolved_name.clone(), PgBuiltInOids::TEXTOID.oid().value())
                 }],
             )
             .unwrap_or_report()
@@ -155,7 +171,7 @@ fn drop_reflex_ivm_impl_inner(view_name: &str, cascade: bool, root: &str) -> &'s
                 .update(
                     &format!(
                         "DROP VIEW IF EXISTS {}{}",
-                        quote_identifier(view_name),
+                        quote_identifier(&resolved_name),
                         cascade_suffix
                     ),
                     None,
@@ -167,7 +183,7 @@ fn drop_reflex_ivm_impl_inner(view_name: &str, cascade: bool, root: &str) -> &'s
                 .update(
                     &format!(
                         "DROP TABLE IF EXISTS {}{}",
-                        quote_identifier(view_name),
+                        quote_identifier(&resolved_name),
                         cascade_suffix
                     ),
                     None,
@@ -177,7 +193,7 @@ fn drop_reflex_ivm_impl_inner(view_name: &str, cascade: bool, root: &str) -> &'s
         }
 
         // 6. Drop intermediate table
-        let intermediate = intermediate_table_name(view_name);
+        let intermediate = intermediate_table_name(&resolved_name);
         client
             .update(
                 &format!("DROP TABLE IF EXISTS {}{}", intermediate, cascade_suffix),
@@ -191,7 +207,7 @@ fn drop_reflex_ivm_impl_inner(view_name: &str, cascade: bool, root: &str) -> &'s
             .update(
                 &format!(
                     "DROP TABLE IF EXISTS {}{}",
-                    affected_groups_table_name(view_name),
+                    affected_groups_table_name(&resolved_name),
                     cascade_suffix
                 ),
                 None,
@@ -205,7 +221,7 @@ fn drop_reflex_ivm_impl_inner(view_name: &str, cascade: bool, root: &str) -> &'s
             .update(
                 &format!(
                     "DROP TABLE IF EXISTS {}{}",
-                    shrunk_groups_table_name(view_name),
+                    shrunk_groups_table_name(&resolved_name),
                     cascade_suffix
                 ),
                 None,
@@ -218,7 +234,7 @@ fn drop_reflex_ivm_impl_inner(view_name: &str, cascade: bool, root: &str) -> &'s
             .update(
                 &format!(
                     "DROP TABLE IF EXISTS {}{}",
-                    delta_scratch_table_name(view_name),
+                    delta_scratch_table_name(&resolved_name),
                     cascade_suffix
                 ),
                 None,
@@ -233,8 +249,8 @@ fn drop_reflex_ivm_impl_inner(view_name: &str, cascade: bool, root: &str) -> &'s
                 continue;
             }
             for tbl in [
-                passthrough_scratch_new_table_name(view_name, source),
-                passthrough_scratch_old_table_name(view_name, source),
+                passthrough_scratch_new_table_name(&resolved_name, source),
+                passthrough_scratch_old_table_name(&resolved_name, source),
             ] {
                 client
                     .update(

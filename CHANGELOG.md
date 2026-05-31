@@ -1,5 +1,36 @@
 # Changelog
 
+## [1.7.2] - 2026-05-31
+
+Correctness release fixing `drop_reflex_ivm`, which silently orphaned the
+target + auxiliary tables of any IMV created with a bare (unqualified) name
+under a non-`public` `search_path`. Run
+`ALTER EXTENSION pg_reflex UPDATE TO '1.7.2';` — the migration adds one
+nullable catalog column (`__reflex_ivm_reference.target_schema`) so teardown
+is independent of the session `search_path`. No data backfill; pre-existing
+rows keep NULL and use the legacy `search_path` fallback.
+
+---
+
+### Fixed
+
+- **`drop_reflex_ivm` silently orphaned the target + aux tables of any IMV
+  created with a bare name under a non-`public` `search_path`.** All
+  teardown DDL derived its relation names from the stored (bare) `name` and
+  resolved the target via `to_regclass(name)`, both honouring the session
+  `search_path` *at drop time*. An IMV created while `search_path = alp`
+  landed its objects in `alp`, but a later `drop_reflex_ivm` run under a
+  different `search_path` issued unqualified `DROP TABLE IF EXISTS …` that
+  resolved against the wrong schema, skipped every real object, deleted only
+  the catalog row, and left the table + `__reflex_intermediate_*` /
+  `__reflex_affected_*` / `__reflex_uk_*` artifacts behind. A same-named
+  decoy relation of a different kind in the `search_path` (e.g. a
+  materialized view) could also be hit instead, surfacing as
+  `ERROR: "<name>" is not a table`. Creation now records the object schema
+  in `target_schema` (`current_schema()` for bare names), and
+  `drop_reflex_ivm` re-qualifies all teardown DDL with it. Legacy rows with
+  a NULL `target_schema` fall back to the prior `search_path` behaviour.
+
 ## [1.7.1] - 2026-05-31
 
 Correctness release fixing Path C — the INSERT_PROMOTED smart bulk-INSERT
@@ -73,15 +104,56 @@ trigger body without operator intervention. No catalog schema changes.
 ### Migration
 
 `ALTER EXTENSION pg_reflex UPDATE TO '1.7.1';` runs
-[`sql/pg_reflex--1.7.0--1.7.1.sql`](https://github.com/diviyank/pg_reflex/blob/main/sql/pg_reflex--1.7.0--1.7.1.sql).
-The script (1) registers the three new name-helper functions and (2)
-loops over every distinct source in `__reflex_ivm_reference.depends_on`
-calling `reflex_rebuild_triggers(<source>)` so each source's trigger
-function body picks up the new Path C. Per-source rebuild failures are
-demoted to `WARNING`s so a stale `depends_on` row cannot block the rest
-of the migration; the unreached source keeps its 1.7.0 trigger body
-(still correct — Path C just falls through to MERGE for the affected
-IMVs). No data is migrated; no IMV needs to be dropped or recreated.
+[`sql/pg_reflex--1.7.0--1.7.1.sql`](https://github.com/diviyank/pg_reflex/blob/main/sql/pg_reflex--1.7.0--1.7.1.sql)
+which registers the three new SQL-callable name-helper functions. No
+data is migrated; no IMV needs to be dropped or recreated.
+
+After the `ALTER EXTENSION` completes, run the rebuild loop below in a
+normal SQL session (outside the `creating_extension` flag PG sets for
+ALTER EXTENSION) to pick up the new Path C body on every existing
+trigger. The per-source trigger functions (`__reflex_*_trigger_on_*`)
+were created from `create_reflex_ivm` outside any extension-creation
+context, so they belong to the database — PG's
+`creating_extension`-mode safety check refuses to `CREATE OR REPLACE`
+them mid-upgrade with `"function … is not a member of extension
+\"pg_reflex\""`. Running the loop separately sidesteps the check:
+
+```sql
+DO $$
+DECLARE _src TEXT; _msg TEXT; _ok INT := 0; _err INT := 0;
+BEGIN
+  FOR _src IN
+    SELECT DISTINCT s
+    FROM public.__reflex_ivm_reference, unnest(depends_on) AS s
+    WHERE enabled = TRUE AND s NOT LIKE '<%'
+    ORDER BY 1
+  LOOP
+    BEGIN
+      _msg := public.reflex_rebuild_triggers(_src);
+      IF _msg LIKE 'ERROR:%' THEN
+        RAISE NOTICE 'skipped %: %', _src, _msg;
+        _err := _err + 1;
+      ELSE
+        _ok := _ok + 1;
+      END IF;
+    EXCEPTION WHEN OTHERS THEN
+      RAISE NOTICE 'skipped %: %', _src, SQLERRM;
+      _err := _err + 1;
+    END;
+  END LOOP;
+  RAISE NOTICE 'rebuilt % source(s); % skipped', _ok, _err;
+END $$;
+```
+
+View / matview sources (PG raises `relation … cannot have triggers`)
+are expected to be skipped — pg_reflex doesn't put triggers on views,
+those sources are maintained via cascade from upstream IMVs. Bare
+`depends_on` entries that resolve to multiple schemas raise
+`source name 'X' is ambiguous` — qualify those rows in
+`public.__reflex_ivm_reference.depends_on` and re-run the loop. The
+unreached source keeps its 1.7.0 trigger body (still correct — Path C
+just falls through to MERGE for the affected IMVs); no IMV is wrong as
+a result of skipping a source.
 
 ## [1.7.0] - 2026-05-28
 

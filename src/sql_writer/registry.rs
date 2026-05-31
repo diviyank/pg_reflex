@@ -121,6 +121,14 @@ pub fn insert_registry_row(
     let oid_text = PgBuiltInOids::TEXTOID.oid().value();
     let oid_int4 = PgBuiltInOids::INT4OID.oid().value();
 
+    // Schema the IMV's objects land in: the explicit schema when the name is
+    // qualified, else the empty string so the INSERT's COALESCE falls back to
+    // current_schema() at create time. Persisted so drop teardown can qualify
+    // its DDL independently of the session search_path at drop time.
+    let explicit_schema_owned = crate::query_decomposer::canonical_source(row.view_name)
+        .0
+        .unwrap_or_default();
+
     let view_name_owned = row.view_name.to_string();
     let sql_query_owned = row.sql_query.to_string();
     let base_query_owned = row.base_query.to_string();
@@ -140,8 +148,8 @@ pub fn insert_registry_row(
                      (name, graph_depth, depends_on, depends_on_imv, unlogged_tables,
                       graph_child, sql_query, base_query, end_query,
                       aggregations, index_columns, unique_columns, enabled, last_update_date,
-                      storage_mode, refresh_mode)
-                     VALUES ($1, $2, $3::TEXT[], $4::TEXT[], $5::TEXT[], $6::TEXT[], $7, $8, $9, $10::json, $11::TEXT[], $12::TEXT[], TRUE, NOW(), $13, $14)";
+                      storage_mode, refresh_mode, target_schema)
+                     VALUES ($1, $2, $3::TEXT[], $4::TEXT[], $5::TEXT[], $6::TEXT[], $7, $8, $9, $10::json, $11::TEXT[], $12::TEXT[], TRUE, NOW(), $13, $14, COALESCE(NULLIF($15, ''), current_schema()))";
         client
             .update(
                 sql,
@@ -161,6 +169,7 @@ pub fn insert_registry_row(
                     unsafe { DatumWithOid::new(unique_cols_owned, oid_text) },
                     unsafe { DatumWithOid::new(storage_owned, oid_text) },
                     unsafe { DatumWithOid::new(refresh_owned, oid_text) },
+                    unsafe { DatumWithOid::new(explicit_schema_owned, oid_text) },
                 ],
             )
             .map(|_| ())
@@ -181,8 +190,8 @@ pub fn insert_registry_row(
                       graph_child, sql_query, base_query, end_query,
                       aggregations, index_columns, unique_columns, enabled, last_update_date,
                       storage_mode, refresh_mode, where_predicate, ignored_sources,
-                      partition_columns, partition_strategy)
-                     VALUES ($1, $2, $3::TEXT[], $4::TEXT[], $5::TEXT[], $6::TEXT[], $7, $8, $9, $10::jsonb, $11::TEXT[], $12::TEXT[], TRUE, NOW(), $13, $14, NULLIF($15, ''), $16::TEXT[], NULLIF($17, '{}')::TEXT[], NULLIF($18, ''))";
+                      partition_columns, partition_strategy, target_schema)
+                     VALUES ($1, $2, $3::TEXT[], $4::TEXT[], $5::TEXT[], $6::TEXT[], $7, $8, $9, $10::jsonb, $11::TEXT[], $12::TEXT[], TRUE, NOW(), $13, $14, NULLIF($15, ''), $16::TEXT[], NULLIF($17, '{}')::TEXT[], NULLIF($18, ''), COALESCE(NULLIF($19, ''), current_schema()))";
         client
             .update(
                 sql,
@@ -206,6 +215,7 @@ pub fn insert_registry_row(
                     unsafe { DatumWithOid::new(ignored_sources_owned, oid_text) },
                     unsafe { DatumWithOid::new(part_cols_owned, oid_text) },
                     unsafe { DatumWithOid::new(part_strat_owned, oid_text) },
+                    unsafe { DatumWithOid::new(explicit_schema_owned, oid_text) },
                 ],
             )
             .map(|_| ())

@@ -616,3 +616,64 @@ fn test_drop_cleans_up_union_mirror_functions() {
         "expected 0 mirror functions after drop, got {after:?} — function orphan"
     );
 }
+
+// Regression: an IMV created with a BARE name while `search_path` points at a
+// non-public schema lands every object (target + aux tables) in that schema.
+// The reference row stores the bare name, so `drop_reflex_ivm` must record the
+// creation schema and reuse it for teardown DDL — otherwise the unqualified
+// DROPs resolve against the session `search_path` at drop time, silently skip
+// the real objects, and orphan the target + aux tables in the non-public schema.
+#[pg_test]
+fn test_drop_resolves_creation_schema_for_bare_name() {
+    Spi::run("CREATE SCHEMA drop_sch").expect("schema");
+    Spi::run("CREATE TABLE drop_sch.bsrc (id SERIAL, grp TEXT, val NUMERIC)").expect("table");
+    Spi::run("INSERT INTO drop_sch.bsrc (grp, val) VALUES ('a', 1)").expect("seed");
+
+    // Create with a BARE name while search_path's head schema is non-public.
+    Spi::run("SET search_path = drop_sch, public").expect("set sp");
+    crate::create_reflex_ivm(
+        "bview",
+        "SELECT grp, SUM(val) AS total FROM bsrc GROUP BY grp",
+        None,
+        None,
+        None,
+        None,
+    );
+
+    // Target + intermediate aux table landed in drop_sch.
+    let tgt = Spi::get_one::<i64>(
+        "SELECT COUNT(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+         WHERE n.nspname = 'drop_sch' AND c.relname = 'bview'",
+    )
+    .expect("q")
+    .expect("v");
+    assert_eq!(tgt, 1, "target should be created in drop_sch");
+
+    // Drop from a DIFFERENT search_path (public only) — the orphan repro.
+    Spi::run("SET search_path = public").expect("reset sp");
+    let result = crate::drop_reflex_ivm("bview");
+    assert_eq!(result, "DROP REFLEX INCREMENTAL VIEW");
+
+    let ref_gone = Spi::get_one::<i64>(
+        "SELECT COUNT(*) FROM public.__reflex_ivm_reference WHERE name = 'bview'",
+    )
+    .expect("q")
+    .expect("v");
+    assert_eq!(ref_gone, 0, "reference row must be deleted");
+
+    let tgt_gone = Spi::get_one::<i64>(
+        "SELECT COUNT(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+         WHERE n.nspname = 'drop_sch' AND c.relname = 'bview'",
+    )
+    .expect("q")
+    .expect("v");
+    assert_eq!(tgt_gone, 0, "target table must be dropped, not orphaned in drop_sch");
+
+    let int_gone = Spi::get_one::<i64>(
+        "SELECT COUNT(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+         WHERE n.nspname = 'drop_sch' AND c.relname = '__reflex_intermediate_bview'",
+    )
+    .expect("q")
+    .expect("v");
+    assert_eq!(int_gone, 0, "intermediate aux table must be dropped, not orphaned");
+}
