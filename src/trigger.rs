@@ -2678,17 +2678,86 @@ pub fn reflex_build_delta_sql(
 /// `__reflex_ivm_reference` (e.g., dropped between scan and call).
 #[pg_extern(parallel_safe)]
 pub fn reflex_build_path_c_explain_sql(view_name: &str, source_table: &str) -> String {
+    // Path C bulk-INSERT skips the conflict-aware MERGE on the assumption
+    // that the affected slice of intermediate group keys cannot already be
+    // populated. That assumption only holds when the source's identity
+    // uniquely determines its slice of keys — i.e., when the analyser
+    // captured a `source_join_keys` entry for this source. For single-source
+    // aggregates one source row can feed many group keys, and other rows
+    // (filter-passed before this UPDATE) may already be contributing to
+    // those groups; bulk-INSERT then duplicates rows in the intermediate /
+    // target and silently wrong-answers. Match the Rust-side
+    // `aggregate_insert_stmts` gate (`plan.source_join_keys.contains_key`)
+    // by returning the empty string here, which the trigger body's
+    // `IF _pc_sql <> ''` check turns into a Path C skip → falls into the
+    // standard MERGE path.
     let escaped_view = view_name.replace('\'', "''");
     let lookup_sql = format!(
-        "SELECT base_query FROM public.__reflex_ivm_reference WHERE name = '{}' AND enabled = TRUE",
+        "SELECT base_query, aggregations::text AS agg \
+         FROM public.__reflex_ivm_reference WHERE name = '{}' AND enabled = TRUE",
         escaped_view
     );
-    let base_query: String = match Spi::get_one::<&str>(&lookup_sql) {
-        Ok(Some(s)) => s.to_string(),
-        _ => return String::new(),
+    let (base_query, agg_json): (String, String) = match Spi::connect(|client| {
+        client
+            .select(&lookup_sql, None, &[])
+            .ok()
+            .and_then(|mut it| it.next())
+            .and_then(|row| {
+                let bq = row
+                    .get_by_name::<&str, _>("base_query")
+                    .ok()
+                    .flatten()
+                    .map(|s| s.to_string())?;
+                let agg = row
+                    .get_by_name::<&str, _>("agg")
+                    .ok()
+                    .flatten()
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "{}".to_string());
+                Some((bq, agg))
+            })
+    }) {
+        Some(t) => t,
+        None => return String::new(),
     };
+    match serde_json::from_str::<AggregationPlan>(&agg_json) {
+        Ok(plan) if plan.source_join_keys.contains_key(source_table) => {}
+        _ => return String::new(),
+    }
     let transition = transition_new_table_name(source_table);
     replace_source_with_transition(&base_query, source_table, &transition)
+}
+
+/// Resolve an IMV name to its already-quoted intermediate-table reference.
+///
+/// Thin SQL wrapper over [`intermediate_table_name`]: the canonical builder
+/// handles schema-qualified vs bare names uniformly and routes long names
+/// through `safe_identifier` so the returned string always matches the
+/// real relation pg_reflex created. Path C in the UPDATE trigger body uses
+/// this instead of constructing `'"' || split_part(name, '.', 1) || '"."__reflex_intermediate_' || split_part(name, '.', 2) || '"'`
+/// — that ad-hoc form silently breaks on bare IMV names (the second
+/// `split_part` returns empty) and on long view names that need the
+/// `safe()` truncation+hash suffix.
+#[pg_extern(parallel_safe, immutable)]
+pub fn reflex_intermediate_table_name(view_name: &str) -> String {
+    intermediate_table_name(view_name)
+}
+
+/// Resolve an IMV name to its already-quoted delta-scratch-table reference.
+/// Same reason as [`reflex_intermediate_table_name`].
+#[pg_extern(parallel_safe, immutable)]
+pub fn reflex_delta_scratch_table_name(view_name: &str) -> String {
+    delta_scratch_table_name(view_name)
+}
+
+/// Quote a (possibly schema-qualified) identifier the same way every other
+/// pg_reflex name-builder does. Path C uses this for the IMV's target-table
+/// reference inside the plpgsql trigger body, where it would otherwise
+/// re-do the dot-split + double-quote concat by hand and get the bare-name
+/// case wrong.
+#[pg_extern(parallel_safe, immutable)]
+pub fn reflex_quote_identifier(name: &str) -> String {
+    quote_identifier(name)
 }
 
 /// Generates SQL statements to handle a TRUNCATE on a source table.

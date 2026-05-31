@@ -1,19 +1,24 @@
 IF _directional_op = 'INSERT_PROMOTED' THEN
            DECLARE _pc_sql TEXT; _pc_plan TEXT; _pc_est BIGINT; _pc_imv_rows BIGINT;
                    _pc_thr NUMERIC; _pc_per_imv NUMERIC; _pc_ratio NUMERIC;
-                   _pc_schema TEXT; _pc_view TEXT;
                    _pc_int_tbl TEXT; _pc_scratch_tbl TEXT; _pc_target_qv TEXT;
-                   _pc_idx_name TEXT; _pc_idx_def TEXT; _pc_end_q TEXT;
+                   _pc_idx_def TEXT; _pc_end_q TEXT;
            BEGIN
              _pc_sql := public.reflex_build_path_c_explain_sql(_rec.name, '__REFLEX_SLOT_SOURCE_TABLE__');
              IF _pc_sql <> '' THEN
                EXECUTE 'EXPLAIN (FORMAT JSON) ' || _pc_sql INTO _pc_plan;
                _pc_est := (_pc_plan::jsonb -> 0 -> 'Plan' ->> 'Plan Rows')::BIGINT;
-               _pc_schema := split_part(_rec.name, '.', 1);
-               _pc_view := split_part(_rec.name, '.', 2);
-               _pc_int_tbl := '"' || _pc_schema || '"."__reflex_intermediate_' || _pc_view || '"';
-               _pc_scratch_tbl := '"' || _pc_schema || '"."__reflex_scratch_' || _pc_view || '"';
-               _pc_target_qv := '"' || _pc_schema || '"."' || _pc_view || '"';
+               -- Resolve derived relation names through the same Rust helpers
+               -- that built them, so bare IMV names and long names truncated
+               -- by `safe_identifier` are handled identically here and at
+               -- create time. The previous implementation re-derived the
+               -- names by parsing the IMV name with a `.` split + raw string
+               -- concat, which silently broke on bare names and on view
+               -- names whose intermediate-table name exceeded PG's 63-char
+               -- NAMEDATALEN limit.
+               _pc_int_tbl     := public.reflex_intermediate_table_name(_rec.name);
+               _pc_scratch_tbl := public.reflex_delta_scratch_table_name(_rec.name);
+               _pc_target_qv   := public.reflex_quote_identifier(_rec.name);
                BEGIN
                  EXECUTE format('SELECT reltuples::BIGINT FROM pg_class WHERE oid = %L::regclass', _pc_int_tbl) INTO _pc_imv_rows;
                EXCEPTION WHEN OTHERS THEN
@@ -35,14 +40,26 @@ IF _directional_op = 'INSERT_PROMOTED' THEN
                                 _rec.name, _pc_est, _pc_imv_rows, _pc_ratio, _pc_thr;
                    EXECUTE format('TRUNCATE %s', _pc_scratch_tbl);
                    EXECUTE format('INSERT INTO %s %s', _pc_scratch_tbl, _pc_sql);
-                   SELECT i.indexname::TEXT, i.indexdef INTO _pc_idx_name, _pc_idx_def
-                     FROM pg_indexes i
-                     WHERE i.schemaname = _pc_schema
-                       AND i.tablename = '__reflex_intermediate_' || _pc_view
-                       AND i.indexdef ILIKE '%UNIQUE%'
+                   -- Look up the unique index on the intermediate table by
+                   -- relation OID (so the lookup uses the same canonical
+                   -- name as the relation we just resolved), and by
+                   -- `indisunique` (an `indexdef ILIKE '%UNIQUE%'` match
+                   -- false-positives on comments / column names).
+                   SELECT pg_get_indexdef(ix.indexrelid) INTO _pc_idx_def
+                     FROM pg_index ix
+                     WHERE ix.indrelid = _pc_int_tbl::regclass
+                       AND ix.indisunique
                      LIMIT 1;
-                   IF _pc_idx_name IS NOT NULL THEN
-                     EXECUTE format('DROP INDEX %I.%I', _pc_schema, _pc_idx_name);
+                   IF _pc_idx_def IS NOT NULL THEN
+                     EXECUTE format('DROP INDEX %s', (
+                       SELECT format('%I.%I', n.nspname, i.relname)
+                       FROM pg_index ix
+                       JOIN pg_class i ON i.oid = ix.indexrelid
+                       JOIN pg_namespace n ON n.oid = i.relnamespace
+                       WHERE ix.indrelid = _pc_int_tbl::regclass
+                         AND ix.indisunique
+                       LIMIT 1
+                     ));
                    END IF;
                    EXECUTE format('INSERT INTO %s SELECT * FROM %s', _pc_int_tbl, _pc_scratch_tbl);
                    IF _pc_idx_def IS NOT NULL THEN

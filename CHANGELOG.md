@@ -1,5 +1,88 @@
 # Changelog
 
+## [1.7.1] - 2026-05-31
+
+Correctness release fixing Path C — the INSERT_PROMOTED smart bulk-INSERT
+dispatch fired only by UPDATE triggers. Two compounding defects: derived
+relation names were re-built by raw `split_part` + string concat that
+bypassed the canonical `safe_identifier` hash, and the bulk-INSERT entry
+gate did not match the Rust-side `aggregate_insert_stmts` safety check.
+Run `ALTER EXTENSION pg_reflex UPDATE TO '1.7.1';` — the migration script
+registers three new SQL-callable name helpers **and** automatically calls
+`reflex_rebuild_triggers` for every distinct source in
+`__reflex_ivm_reference.depends_on`, so existing IMVs pick up the new
+trigger body without operator intervention. No catalog schema changes.
+
+---
+
+### Fixed
+
+- **`ERROR: relation "<…>" does not exist` during UPDATE, surfaced as a
+  `WARNING: pg_reflex Path C smart bulk-INSERT failed for <imv>` log
+  line followed by silent fallback to MERGE.** The Path C plpgsql block
+  derived the intermediate / scratch / target relation names by parsing
+  the IMV name with `split_part(name, '.', 1|2)` and concatenating
+  `'"<schema>"."__reflex_intermediate_<view>"'` by hand. Two manifestations:
+
+    * **Bare-name IMVs** (default-schema, no `schema.` prefix): the second
+      `split_part` returned the empty string and the constructed
+      `"foo"."__reflex_intermediate_"` was not a real relation. The outer
+      EXCEPTION caught it and Path C was silently disabled for every
+      default-schema IMV.
+
+    * **Long IMV names:** when `__reflex_intermediate_<bare>` crossed PG's
+      63-char NAMEDATALEN, the real relation got the 8-hex `safe()` hash
+      suffix while the Path C concat did not, so the constructed name
+      pointed at a relation that did not exist. The outer EXCEPTION
+      degraded Path C to a fall-through, but the WARNING surfaced.
+
+  Three new SQL-callable wrappers — `reflex_intermediate_table_name`,
+  `reflex_delta_scratch_table_name`, `reflex_quote_identifier` — expose
+  the same Rust helpers every other call site uses (`split_qualified_name`
+  + `safe_identifier`). The Path C body calls them instead of
+  `split_part` + concat. The unique-index lookup is rewritten to join
+  via `to_regclass(...)::regclass` + `pg_index.indisunique` (the previous
+  `pg_indexes.indexdef ILIKE '%UNIQUE%'` form false-positived on
+  comments / column names).
+
+- **Silent double-counting in Path C for single-source aggregates.** The
+  bulk-INSERT path skips MERGE on the assumption that the affected slice
+  of intermediate group keys cannot already be populated. That holds
+  only when the source's identity uniquely determines its slice of keys
+  — i.e., when the analyser captured a `source_join_keys` entry for the
+  trigger source. For single-source aggregates one row can feed many
+  group keys, and other rows (filter-passed before this UPDATE) may
+  already be contributing; bulk-INSERT then duplicated the affected
+  groups in the intermediate / target. Pre-1.7.1 the concat bug masked
+  this for bare-name IMVs (Path C errored out before any DML), but
+  schema-qualified single-source aggregates with the right shape hit
+  the silent duplicate-rows path. `reflex_build_path_c_explain_sql`
+  now returns the empty string when the plan has no `source_join_keys`
+  entry for the trigger source — matching the Rust-side
+  `aggregate_insert_stmts` gate — and the trigger body falls through
+  to the standard MERGE path.
+
+### Testing
+
+- Two regression locks added in `src/tests/unit_trigger.rs`:
+  `test_path_c_block_does_not_split_part_imv_name` and
+  `test_path_c_block_does_not_concat_raw_reflex_names`. Both fail
+  against the 1.7.0 Path C template and pass with the 1.7.1 body.
+- Full suite: **1104 tests pass** (was 1102 in 1.7.0, +2 from above).
+
+### Migration
+
+`ALTER EXTENSION pg_reflex UPDATE TO '1.7.1';` runs
+[`sql/pg_reflex--1.7.0--1.7.1.sql`](https://github.com/diviyank/pg_reflex/blob/main/sql/pg_reflex--1.7.0--1.7.1.sql).
+The script (1) registers the three new name-helper functions and (2)
+loops over every distinct source in `__reflex_ivm_reference.depends_on`
+calling `reflex_rebuild_triggers(<source>)` so each source's trigger
+function body picks up the new Path C. Per-source rebuild failures are
+demoted to `WARNING`s so a stale `depends_on` row cannot block the rest
+of the migration; the unreached source keeps its 1.7.0 trigger body
+(still correct — Path C just falls through to MERGE for the affected
+IMVs). No data is migrated; no IMV needs to be dropped or recreated.
+
 ## [1.7.0] - 2026-05-28
 
 Refactor + correctness release for intermediate `UNION ALL` CTE-body wrappers.

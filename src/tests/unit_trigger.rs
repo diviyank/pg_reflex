@@ -2284,6 +2284,65 @@ fn test_ins_del_trunc_trigger_bodies_do_not_emit_path_c() {
     }
 }
 
+// Regression — Path C body must NOT derive its int/scratch/target table names by
+// `split_part(_rec.name, '.', 1|2)`. That pattern silently breaks on bare IMV
+// names (no schema prefix): `split_part('foo', '.', 2)` returns the empty
+// string, so the constructed `"__reflex_intermediate_"` (with a trailing
+// underscore and no view part) is not a real relation and the trigger throws
+// "relation does not exist" inside the UPDATE path. The fix is to delegate to
+// a Rust helper that handles bare and qualified names uniformly (same way
+// `intermediate_table_name`, `delta_scratch_table_name`, and
+// `quote_identifier` do).
+#[test]
+fn test_path_c_block_does_not_split_part_imv_name() {
+    let ddls = build_trigger_ddls("orders");
+    let upd = ddls
+        .iter()
+        .find(|d| d.contains("AFTER UPDATE ON"))
+        .expect("UPDATE trigger DDL must exist");
+    assert!(
+        !upd.contains("split_part(_rec.name"),
+        "Path C must not parse the IMV name with split_part — it breaks on bare \
+         (un-qualified) names. Replace with a Rust-side name helper. Got: {}",
+        &upd[..upd.len().min(4000)]
+    );
+}
+
+// Regression — Path C body must NOT construct derived relation names by raw
+// string concatenation of `'__reflex_intermediate_' || _pc_view` (or analogous
+// for scratch / target). Every other site in the codebase routes through
+// `safe_identifier`, which truncates and appends an 8-hex hash when the
+// formatted name exceeds PG's 63-char NAMEDATALEN. A raw concat therefore
+// silently diverges from the actual stored relation name as soon as the IMV
+// name pushes `__reflex_intermediate_<bare>` past 63 chars — manifesting as
+// "relation does not exist" inside the UPDATE path. The user-reported symptom
+// ("hash result differs with/without the schema prefix") is a consequence of
+// this: schema-qualified IMVs happen to land short enough to skip the hash,
+// bare names of the same view body cross the threshold.
+#[test]
+fn test_path_c_block_does_not_concat_raw_reflex_names() {
+    let ddls = build_trigger_ddls("orders");
+    let upd = ddls
+        .iter()
+        .find(|d| d.contains("AFTER UPDATE ON"))
+        .expect("UPDATE trigger DDL must exist");
+    for prefix in &[
+        "'__reflex_intermediate_'",
+        "'__reflex_scratch_'",
+        "'\".\"__reflex_intermediate_'",
+        "'\".\"__reflex_scratch_'",
+    ] {
+        assert!(
+            !upd.contains(prefix),
+            "Path C must not build derived relation names by raw concat of {} — \
+             that bypasses safe_identifier's 63-char hash and breaks for long \
+             view names. Use a Rust-side name helper instead. Got: {}",
+            prefix,
+            &upd[..upd.len().min(4000)]
+        );
+    }
+}
+
 #[test]
 fn test_regular_insert_still_uses_merge() {
     // op='INSERT' (not promoted) → always MERGE, regardless of metadata.

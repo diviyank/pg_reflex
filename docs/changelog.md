@@ -4,6 +4,23 @@ The full changelog tracks every release. The latest version's headlines are on t
 
 For each version below, see [`CHANGELOG.md`](https://github.com/diviyank/pg_reflex/blob/main/CHANGELOG.md) on GitHub for the canonical text.
 
+## [1.7.1] — 2026-05-31
+
+Correctness release fixing Path C (the INSERT_PROMOTED smart bulk-INSERT dispatch fired only by UPDATE triggers). Two compounding defects: derived relation names were re-built by raw `split_part` + string concat that bypassed the canonical `safe_identifier` hash (manifesting as `ERROR: relation "<…>" does not exist` for bare-name and long-name IMVs, surfaced as a `WARNING: pg_reflex Path C smart bulk-INSERT failed for <imv>` log line), and the bulk-INSERT entry gate did not match the Rust-side `aggregate_insert_stmts` safety check (silently duplicate-counted group rows for single-source aggregates). Run `ALTER EXTENSION pg_reflex UPDATE TO '1.7.1';` — the migration registers three new SQL-callable name helpers and automatically calls `reflex_rebuild_triggers` for every distinct source in `__reflex_ivm_reference.depends_on`, so existing IMVs pick up the fix without operator intervention. No catalog schema changes; no IMV needs to be dropped or recreated.
+
+**Fixed**
+
+- **`ERROR: relation "<…>" does not exist` during UPDATE** for default-schema IMVs and for any IMV whose `__reflex_intermediate_<bare>` crosses PG's 63-char NAMEDATALEN. Path C now resolves intermediate / scratch / target names through three new SQL-callable wrappers (`reflex_intermediate_table_name`, `reflex_delta_scratch_table_name`, `reflex_quote_identifier`) that route through the same `split_qualified_name` + `safe_identifier` helpers every other call site uses. The unique-index lookup is rewritten to join via `to_regclass(...)::regclass` + `pg_index.indisunique` instead of `pg_indexes.indexdef ILIKE '%UNIQUE%'` (which false-positived on comments / column names).
+- **Silent double-counting in Path C for single-source aggregates.** `reflex_build_path_c_explain_sql` now returns the empty string when the plan has no `source_join_keys` entry for the trigger source — matching the Rust-side `aggregate_insert_stmts` gate — so Path C falls through to the standard MERGE path for shapes where bulk-INSERT cannot prove that the affected group keys are absent from the intermediate.
+
+**Testing**
+
+- Two new regression locks in `src/tests/unit_trigger.rs` assert Path C never re-introduces `split_part(_rec.name` or raw `'__reflex_*_' || …` concat. Full suite: 1104 tests pass.
+
+**Migration**
+
+`ALTER EXTENSION pg_reflex UPDATE TO '1.7.1';` runs [`sql/pg_reflex--1.7.0--1.7.1.sql`](https://github.com/diviyank/pg_reflex/blob/main/sql/pg_reflex--1.7.0--1.7.1.sql) which (1) registers the three new helper functions and (2) iterates over every distinct source in `__reflex_ivm_reference.depends_on` calling `reflex_rebuild_triggers(<source>)` so each source's trigger function body picks up the new Path C. Per-source rebuild failures are demoted to `WARNING`s (a stale `depends_on` row cannot block the rest of the migration; the unreached source keeps its 1.7.0 trigger body — still correct, Path C just falls through to MERGE for those IMVs).
+
 ## [1.7.0] — 2026-05-28
 
 Refactor + correctness release for intermediate `UNION ALL` CTE-body wrappers. The inline wrapper construction in `try_decompose_set_op` is centralised into one helper; the wrapper table gains a `__reflex_src_idx SMALLINT NOT NULL` discriminator column that fixes a cross-operand `DELETE` over-delete; non-`ALL` set ops used as CTE bodies are now rejected at create time with an actionable error; and `drop_reflex_ivm` cascade no longer leaks `__reflex_union_mirror_*` trigger functions in `pg_proc`. No catalog schema changes, no trigger body changes, no API changes. Run `ALTER EXTENSION pg_reflex UPDATE TO '1.7.0';` (no-op migration marker). **Existing UNION-ALL CTE IMVs created under ≤1.6.5 must be dropped and recreated** to pick up the cross-operand `DELETE` fix.
