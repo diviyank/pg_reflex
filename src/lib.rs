@@ -114,7 +114,12 @@ extension_sql!(
         -- drop_reflex_ivm reuses it to qualify teardown DDL so cleanup no longer
         -- depends on the session search_path at drop time. NULL for legacy rows
         -- (drop falls back to search_path resolution, preserving old behavior).
-        target_schema TEXT
+        target_schema TEXT,
+        -- 1.7.5 — TRUE for an ungrouped aggregate sub-IMV (aggregate with empty
+        -- GROUP BY → at most one row). Read by JOIN unique-key inference so a
+        -- CROSS JOIN to such a relation (e.g. a single-row history_bounds CTE)
+        -- is classified to-one. NULL/FALSE for everything else.
+        max_one_row BOOLEAN DEFAULT FALSE
     );
 
     -- Index on name for fast lookups
@@ -150,6 +155,9 @@ extension_sql!(
     -- (100000).
     ALTER TABLE public.__reflex_ivm_reference
         ADD COLUMN IF NOT EXISTS partition_dispatch_cost_cap BIGINT;
+
+    ALTER TABLE public.__reflex_ivm_reference
+        ADD COLUMN IF NOT EXISTS max_one_row BOOLEAN DEFAULT FALSE;
 
     -- 1.6.0: SQL helper used by the per-partition dispatch DO block emitted
     -- by build_partition_aware_dispatch_sql.  Given a partitioned parent +
