@@ -3166,36 +3166,120 @@ fn source_equi_join_columns(
     (cols, n_eq)
 }
 
+/// Fetch all sound unique keys (PRIMARY KEY + NOT-NULL UNIQUE indexes) of
+/// a table. Each key is a Vec of column names in definition order.
+#[allow(dead_code)]
+fn source_sound_unique_keys(source: &str) -> Vec<Vec<String>> {
+    let mut result = Vec::new();
+
+    // PRIMARY KEY
+    let pk = source_primary_key_columns(source);
+    if !pk.is_empty() {
+        result.push(pk);
+    }
+
+    // NOT-NULL UNIQUE indexes (via pg_index.indnullsnotdistinct)
+    let uks: Vec<Vec<String>> = Spi::connect(|client| {
+        client
+            .select(
+                "SELECT array_agg(a.attname::TEXT ORDER BY k.n) AS cols \
+                 FROM pg_index ix \
+                 JOIN LATERAL unnest(ix.indkey) WITH ORDINALITY AS k(col, n) ON true \
+                 JOIN pg_attribute a ON a.attrelid = ix.indrelid AND a.attnum = k.col \
+                 WHERE ix.indrelid = to_regclass($1) AND ix.indisunique \
+                   AND ix.indnullsnotdistinct \
+                   AND NOT ix.indisprimary \
+                 GROUP BY ix.indexrelid",
+                None,
+                &[unsafe {
+                    DatumWithOid::new(source.to_string(), PgBuiltInOids::TEXTOID.oid().value())
+                }],
+            )
+            .unwrap_or_report()
+            .filter_map(|row| row.get_by_name::<Vec<String>, _>("cols").unwrap_or(None))
+            .collect()
+    });
+    result.extend(uks);
+    result
+}
+
+/// TRUE when `source` is a registered IMV flagged `max_one_row` (ungrouped
+/// aggregate → at most one row). Base tables / unknown names → FALSE.
+#[allow(dead_code)]
+fn source_is_max_one_row(source: &str) -> bool {
+    Spi::connect(|client| {
+        client
+            .select(
+                "SELECT COALESCE(max_one_row, FALSE) AS m \
+                 FROM public.__reflex_ivm_reference \
+                 WHERE name = $1 OR name = $2 \
+                 ORDER BY (name = $1) DESC LIMIT 1",
+                None,
+                &[
+                    unsafe {
+                        DatumWithOid::new(
+                            source.to_string(),
+                            PgBuiltInOids::TEXTOID.oid().value(),
+                        )
+                    },
+                    unsafe {
+                        DatumWithOid::new(
+                            bare_column_name(source).to_string(),
+                            PgBuiltInOids::TEXTOID.oid().value(),
+                        )
+                    },
+                ],
+            )
+            .unwrap_or_report()
+            .filter_map(|row| row.get_by_name::<bool, _>("m").unwrap_or(None))
+            .next()
+            .unwrap_or(false)
+    })
+}
+
+/// Find the join type (INNER, LEFT, CROSS, etc.) that reaches a particular
+/// target source. Returns the first match or None.
+#[allow(dead_code)]
+fn join_type_for_target(target: &str, joins: &[crate::sql_analyzer::JoinInfo]) -> Option<String> {
+    let target_bare = bare_column_name(target).to_lowercase();
+    joins
+        .iter()
+        .find(|j| bare_column_name(&j.target_table).to_lowercase() == target_bare)
+        .map(|j| j.join_type.clone())
+}
+
 /// Structural unique-key inference for a JOIN passthrough that was given no
 /// explicit key. Returns the OUTPUT column names forming a sound unique key, or
 /// `None` when none can be proven.
 ///
-/// Sound rule: pick an anchor source whose PRIMARY KEY is fully projected; the
-/// result is unique on that PK iff every other source is reached by a to-one
-/// equi-join (its equi-join columns cover a UNIQUE key of that source). Only
-/// INNER and LEFT joins qualify — for LEFT joins the anchor must be the
-/// preserved base table; RIGHT/FULL/CROSS, `OR`/`USING` conditions, and range
-/// joins are refused (they can multiply or NULL-pad the anchor's rows).
+/// Sound rule: pick an anchor whose sound unique key (PK or NOT-NULL / NULLS
+/// NOT DISTINCT unique index — see [`source_sound_unique_keys`]) is fully
+/// projected. Then every other source must be either (a) to-one — its equi-join
+/// columns cover a unique key, or it is `max_one_row` (single-row aggregate,
+/// incl. CROSS joins) — contributing nothing, or (b) a to-many INNER join whose
+/// own sound key is fully projected, contributing that key (K_anchor ∪ K_other
+/// is unique). INNER/LEFT/CROSS anchors qualify; RIGHT/FULL, OR/USING, LEFT or
+/// CROSS to-many, and any source without a projectable key are refused.
 fn infer_join_passthrough_unique_key(ctx: &BuildContext) -> Option<Vec<String>> {
     let analysis = &ctx.analysis;
     if analysis.joins.is_empty() {
         return None;
     }
 
+    // Per-join admissibility. CROSS is now allowed (to-one iff the joined
+    // relation is single-row). RIGHT/FULL multiply or NULL-pad the anchor's
+    // rows → refuse. OR / USING conditions defeat the equi analysis → refuse.
     let mut has_left = false;
     for join in &analysis.joins {
         match join.join_type.as_str() {
-            "INNER" => {}
+            "INNER" | "CROSS" => {}
             "LEFT" => has_left = true,
             _ => return None,
         }
-        match &join.condition_sql {
-            None => return None,
-            Some(cond) => {
-                let lc = cond.to_lowercase();
-                if lc.contains(" or ") || lc.trim_start().starts_with("using") {
-                    return None;
-                }
+        if let Some(cond) = &join.condition_sql {
+            let lc = cond.to_lowercase();
+            if lc.contains(" or ") || lc.trim_start().starts_with("using") {
+                return None;
             }
         }
     }
@@ -3214,7 +3298,7 @@ fn infer_join_passthrough_unique_key(ctx: &BuildContext) -> Option<Vec<String>> 
         .collect();
     let is_base = |s: &str| !join_targets.contains(&bare_column_name(s).to_lowercase());
 
-    // target output name → its SELECT expression (e.g. "id" → "o.id")
+    // output name → its SELECT expression (lower-cased), e.g. "id" → "o.id".
     let mut target_to_expr: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
     for col in &analysis.select_columns {
@@ -3222,63 +3306,95 @@ fn infer_join_passthrough_unique_key(ctx: &BuildContext) -> Option<Vec<String>> 
         target_to_expr.insert(name, col.expr_sql.to_lowercase());
     }
 
+    // The output name that projects `source.key_col` as a bare column reference,
+    // or None when that key column is not passed through unaltered.
+    let projected_output = |source: &str, key_col: &str| -> Option<String> {
+        let bare = bare_column_name(source).to_lowercase();
+        let aliases: Vec<String> = analysis
+            .table_aliases
+            .iter()
+            .filter(|(_, t)| t.to_lowercase() == source.to_lowercase())
+            .map(|(a, _)| a.to_lowercase())
+            .collect();
+        for (out_name, expr) in &target_to_expr {
+            if is_from_table(expr, &bare, &aliases) && bare_column_name(expr) == key_col {
+                return Some(out_name.clone());
+            }
+        }
+        None
+    };
+
+    // The first sound unique key of `source` that is fully projected as bare
+    // output columns, mapped to those output names. None when no key qualifies.
+    let projected_sound_key = |source: &str| -> Option<Vec<String>> {
+        for key in source_sound_unique_keys(source) {
+            let mut outs = Vec::with_capacity(key.len());
+            let mut all = true;
+            for kc in &key {
+                match projected_output(source, kc) {
+                    Some(o) => outs.push(o),
+                    None => {
+                        all = false;
+                        break;
+                    }
+                }
+            }
+            if all {
+                return Some(outs);
+            }
+        }
+        None
+    };
+
     for anchor in &real_sources {
         if has_left && !is_base(anchor) {
             continue;
         }
-        let pk = source_primary_key_columns(anchor);
-        if pk.is_empty() {
+        let Some(mut result_key) = projected_sound_key(anchor) else {
             continue;
-        }
+        };
 
-        let anchor_bare = bare_column_name(anchor).to_lowercase();
-        let anchor_aliases: Vec<String> = analysis
-            .table_aliases
-            .iter()
-            .filter(|(_, t)| t.to_lowercase() == anchor.to_lowercase())
-            .map(|(a, _)| a.to_lowercase())
-            .collect();
-
-        // Every PK column must be projected as a bare reference from the anchor.
-        let mut key_outputs: Vec<String> = Vec::new();
-        let mut all_projected = true;
-        for pk_col in &pk {
-            let mut found: Option<String> = None;
-            for (out_name, expr) in &target_to_expr {
-                if is_from_table(expr, &anchor_bare, &anchor_aliases)
-                    && bare_column_name(expr) == *pk_col
-                {
-                    found = Some(out_name.clone());
-                    break;
-                }
-            }
-            match found {
-                Some(o) => key_outputs.push(o),
-                None => {
-                    all_projected = false;
-                    break;
-                }
-            }
-        }
-        if !all_projected {
-            continue;
-        }
-
-        // Every other source must be reached by a to-one equi-join.
-        let mut all_to_one = true;
+        // Classify every other source against this anchor.
+        let mut composable = true;
         for other in &real_sources {
             if other.eq_ignore_ascii_case(anchor) {
                 continue;
             }
+
             let (eq_cols, n_eq) =
                 source_equi_join_columns(other, &analysis.joins, &analysis.table_aliases);
-            if n_eq == 0 || eq_cols.is_empty() || !source_cols_cover_unique_key(other, &eq_cols) {
-                all_to_one = false;
+            let to_one = (n_eq > 0
+                && !eq_cols.is_empty()
+                && source_cols_cover_unique_key(other, &eq_cols))
+                || source_is_max_one_row(other);
+            if to_one {
+                // Collapses to ≤1 matching row — contributes nothing to the key.
+                continue;
+            }
+
+            // to-many: sound only for an INNER join whose joined relation has a
+            // fully-projected sound key. Each output row is one distinct
+            // (anchor-row, other-row) pair, so K_anchor ∪ K_other is unique.
+            // LEFT/CROSS to-many can NULL-pad or multiply unbounded → refuse.
+            if join_type_for_target(other, &analysis.joins).as_deref() != Some("INNER") {
+                composable = false;
                 break;
             }
+            match projected_sound_key(other) {
+                Some(outs) => result_key.extend(outs),
+                None => {
+                    composable = false;
+                    break;
+                }
+            }
         }
-        if all_to_one {
-            return Some(key_outputs);
+
+        if composable {
+            result_key.sort();
+            result_key.dedup();
+            if !result_key.is_empty() {
+                return Some(result_key);
+            }
         }
     }
     None

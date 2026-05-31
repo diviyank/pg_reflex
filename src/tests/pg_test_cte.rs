@@ -820,3 +820,187 @@ fn test_ungrouped_aggregate_sets_max_one_row() {
     .expect("flag2");
     assert!(!flag2, "grouped aggregate must NOT set max_one_row");
 }
+
+// 1.7.5 — anchor probe must accept a sound UNIQUE index (not only a PRIMARY
+// KEY). A CTE sub-IMV keyed via the explicit per-CTE spec gets a
+// `__reflex_uk_*` NULLS NOT DISTINCT unique index; a downstream JOIN must be
+// able to anchor on it. Here `j` (no PK on its sources) is keyed via the spec,
+// then the outer body joins it to a to-one lookup.
+#[pg_test]
+fn test_anchor_accepts_reflex_unique_index() {
+    Spi::run("CREATE TABLE au_a (k INT NOT NULL, v INT NOT NULL)").expect("a");
+    Spi::run("CREATE TABLE au_lk (k INT PRIMARY KEY, label TEXT NOT NULL)").expect("lk");
+    Spi::run("INSERT INTO au_a VALUES (1,10),(2,20)").expect("seeda");
+    Spi::run("INSERT INTO au_lk VALUES (1,'x'),(2,'y')").expect("seedlk");
+
+    // `j` keyed on k via the explicit per-CTE spec → builds __reflex_uk_*.
+    // Outer body: j JOIN au_lk ON k (to-one), anchor must be `j` via its uk.
+    // NO explicit outer key given; must infer from anchor.
+    let result = crate::create_reflex_ivm(
+        "au_view",
+        "WITH j AS (SELECT k, v FROM au_a) \
+         SELECT j.k, j.v, lk.label FROM j JOIN au_lk lk ON lk.k = j.k",
+        Some("; j : k"),
+        None,
+        None,
+        None,
+    );
+    assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
+
+    let uk = Spi::get_one::<Vec<String>>(
+        "SELECT unique_columns FROM public.__reflex_ivm_reference WHERE name = 'au_view'",
+    )
+    .expect("q")
+    .expect("outer key inferred from reflex unique index anchor");
+    assert_eq!(uk, vec!["k".to_string()]);
+}
+
+// 1.7.5 — CROSS JOIN to a single-row (ungrouped aggregate) relation is to-one;
+// the anchor's key survives. Shape mirrors date_limits' history_bounds arm.
+#[pg_test]
+fn test_infer_cross_join_to_single_row() {
+    Spi::run("CREATE TABLE cj_dp (id INT PRIMARY KEY)").expect("dp");
+    Spi::run("CREATE TABLE cj_amt (v INT NOT NULL)").expect("amt");
+    Spi::run("INSERT INTO cj_dp VALUES (1),(2),(3)").expect("seeddp");
+    Spi::run("INSERT INTO cj_amt VALUES (10),(20)").expect("seedamt");
+
+    let result = crate::create_reflex_ivm(
+        "cj_view",
+        "WITH hb AS (SELECT MAX(v) AS mx FROM cj_amt) \
+         SELECT d.id, hb.mx FROM cj_dp d CROSS JOIN hb",
+        None,
+        None,
+        None,
+        None,
+    );
+    assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
+    let uk = Spi::get_one::<Vec<String>>(
+        "SELECT unique_columns FROM public.__reflex_ivm_reference WHERE name = 'cj_view'",
+    )
+    .expect("q")
+    .expect("anchor key survives CROSS-to-single-row");
+    assert_eq!(uk, vec!["id".to_string()]);
+}
+
+// 1.7.5 — mixed equi + range condition is to-one when the equi alone covers a
+// unique key of the joined relation; the range is just an extra filter. Mirrors
+// forecast_sales (JOIN ON dpid = dpid AND order_date BETWEEN …).
+#[pg_test]
+fn test_infer_equi_plus_range_is_to_one() {
+    Spi::run("CREATE TABLE er_f (id INT PRIMARY KEY, gid INT NOT NULL, d INT NOT NULL)")
+        .expect("f");
+    Spi::run("CREATE TABLE er_w (gid INT PRIMARY KEY, lo INT NOT NULL, hi INT NOT NULL)")
+        .expect("w");
+    Spi::run("INSERT INTO er_w VALUES (1,0,100),(2,0,100)").expect("seedw");
+    Spi::run("INSERT INTO er_f VALUES (10,1,50),(11,2,60)").expect("seedf");
+
+    let result = crate::create_reflex_ivm(
+        "er_view",
+        "SELECT f.id, f.d, w.lo FROM er_f f \
+         JOIN er_w w ON w.gid = f.gid AND f.d >= w.lo AND f.d <= w.hi",
+        None,
+        None,
+        None,
+        None,
+    );
+    assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
+    let uk = Spi::get_one::<Vec<String>>(
+        "SELECT unique_columns FROM public.__reflex_ivm_reference WHERE name = 'er_view'",
+    )
+    .expect("q")
+    .expect("equi covers key → to-one → anchor PK inferred");
+    assert_eq!(uk, vec!["id".to_string()]);
+}
+
+// 1.7.5 — pure-range to-many INNER join: result key = anchor key ∪ joined
+// relation's projected key. Mirrors history_sales (hsv range-join date_limits;
+// key = hsv key ∪ dem_plan_id). Both sides keyed + projected, so it is provable.
+#[pg_test]
+fn test_infer_to_many_inner_key_union() {
+    Spi::run("CREATE TABLE tm_h (hid INT PRIMARY KEY, d INT NOT NULL)").expect("h");
+    Spi::run("CREATE TABLE tm_w (dp INT PRIMARY KEY, lo INT NOT NULL, hi INT NOT NULL)")
+        .expect("w");
+    Spi::run("INSERT INTO tm_w VALUES (1,0,50),(2,60,100)").expect("seedw");
+    Spi::run("INSERT INTO tm_h VALUES (10,25),(11,70)").expect("seedh");
+
+    let result = crate::create_reflex_ivm(
+        "tm_view",
+        "SELECT h.hid, w.dp, h.d FROM tm_h h \
+         JOIN tm_w w ON h.d >= w.lo AND h.d <= w.hi",
+        None,
+        None,
+        None,
+        None,
+    );
+    assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
+    let mut uk = Spi::get_one::<Vec<String>>(
+        "SELECT unique_columns FROM public.__reflex_ivm_reference WHERE name = 'tm_view'",
+    )
+    .expect("q")
+    .expect("to-many key union inferred");
+    uk.sort();
+    assert_eq!(uk, vec!["dp".to_string(), "hid".to_string()]);
+
+    assert_eq!(
+        Spi::get_one::<i64>("SELECT COUNT(*) FROM tm_view").unwrap().unwrap(),
+        2
+    );
+}
+
+// 1.7.5 — to-many INNER join where the joined relation has NO projectable sound
+// key → still unprovable → no key (keeps full-refresh fallback).
+#[pg_test]
+fn test_infer_to_many_without_joined_key_stays_none() {
+    Spi::run("CREATE TABLE tk_h (hid INT PRIMARY KEY, d INT NOT NULL)").expect("h");
+    Spi::run("CREATE TABLE tk_w (lo INT NOT NULL, hi INT NOT NULL, tag TEXT NOT NULL)")
+        .expect("w");
+    Spi::run("INSERT INTO tk_w VALUES (0,100,'a'),(0,100,'b')").expect("seedw");
+    Spi::run("INSERT INTO tk_h VALUES (10,50)").expect("seedh");
+
+    let result = crate::create_reflex_ivm(
+        "tk_view",
+        "SELECT h.hid, h.d, w.tag FROM tk_h h JOIN tk_w w ON h.d >= w.lo AND h.d <= w.hi",
+        None,
+        None,
+        None,
+        None,
+    );
+    assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
+    let uk: Option<Vec<String>> = Spi::get_one::<Vec<String>>(
+        "SELECT unique_columns FROM public.__reflex_ivm_reference WHERE name = 'tk_view'",
+    )
+    .expect("q");
+    assert!(
+        uk.is_none_or(|v| v.is_empty()),
+        "to-many with unkeyed joined relation must not infer a key"
+    );
+}
+
+// 1.7.5 — LEFT to-many must NOT compose a key (NULL-padding); stays None.
+#[pg_test]
+fn test_infer_left_to_many_stays_none() {
+    Spi::run("CREATE TABLE lm_h (hid INT PRIMARY KEY, d INT NOT NULL)").expect("h");
+    Spi::run("CREATE TABLE lm_w (dp INT PRIMARY KEY, lo INT NOT NULL, hi INT NOT NULL)")
+        .expect("w");
+    Spi::run("INSERT INTO lm_w VALUES (1,0,100),(2,0,100)").expect("seedw");
+    Spi::run("INSERT INTO lm_h VALUES (10,50)").expect("seedh");
+
+    let result = crate::create_reflex_ivm(
+        "lm_view",
+        "SELECT h.hid, w.dp, h.d FROM lm_h h \
+         LEFT JOIN lm_w w ON h.d >= w.lo AND h.d <= w.hi",
+        None,
+        None,
+        None,
+        None,
+    );
+    assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
+    let uk: Option<Vec<String>> = Spi::get_one::<Vec<String>>(
+        "SELECT unique_columns FROM public.__reflex_ivm_reference WHERE name = 'lm_view'",
+    )
+    .expect("q");
+    assert!(
+        uk.is_none_or(|v| v.is_empty()),
+        "LEFT to-many must not compose a key"
+    );
+}
