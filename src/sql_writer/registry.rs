@@ -51,6 +51,9 @@ pub struct RegistryRow<'a> {
     pub ignored_sources: Option<&'a [String]>,
     pub partition_columns: Option<&'a [String]>,
     pub partition_strategy: Option<&'a str>,
+    /// TRUE for an ungrouped aggregate IMV (empty GROUP BY → at most one row).
+    /// Written by the main create path; the decomposed paths leave it false.
+    pub max_one_row: bool,
 }
 
 impl<'a> RegistryRow<'a> {
@@ -88,6 +91,7 @@ impl<'a> RegistryRow<'a> {
             ignored_sources: None,
             partition_columns: None,
             partition_strategy: None,
+            max_one_row: false,
         }
     }
 }
@@ -120,6 +124,7 @@ pub fn insert_registry_row(
 
     let oid_text = PgBuiltInOids::TEXTOID.oid().value();
     let oid_int4 = PgBuiltInOids::INT4OID.oid().value();
+    let oid_bool = PgBuiltInOids::BOOLOID.oid().value();
 
     // Schema the IMV's objects land in: the explicit schema when the name is
     // qualified, else the empty string so the INSERT's COALESCE falls back to
@@ -190,8 +195,8 @@ pub fn insert_registry_row(
                       graph_child, sql_query, base_query, end_query,
                       aggregations, index_columns, unique_columns, enabled, last_update_date,
                       storage_mode, refresh_mode, where_predicate, ignored_sources,
-                      partition_columns, partition_strategy, target_schema)
-                     VALUES ($1, $2, $3::TEXT[], $4::TEXT[], $5::TEXT[], $6::TEXT[], $7, $8, $9, $10::jsonb, $11::TEXT[], $12::TEXT[], TRUE, NOW(), $13, $14, NULLIF($15, ''), $16::TEXT[], NULLIF($17, '{}')::TEXT[], NULLIF($18, ''), COALESCE(NULLIF($19, ''), current_schema()))";
+                      partition_columns, partition_strategy, target_schema, max_one_row)
+                     VALUES ($1, $2, $3::TEXT[], $4::TEXT[], $5::TEXT[], $6::TEXT[], $7, $8, $9, $10::jsonb, $11::TEXT[], $12::TEXT[], TRUE, NOW(), $13, $14, NULLIF($15, ''), $16::TEXT[], NULLIF($17, '{}')::TEXT[], NULLIF($18, ''), COALESCE(NULLIF($19, ''), current_schema()), $20)";
         client
             .update(
                 sql,
@@ -216,6 +221,7 @@ pub fn insert_registry_row(
                     unsafe { DatumWithOid::new(part_cols_owned, oid_text) },
                     unsafe { DatumWithOid::new(part_strat_owned, oid_text) },
                     unsafe { DatumWithOid::new(explicit_schema_owned, oid_text) },
+                    unsafe { DatumWithOid::new(row.max_one_row, oid_bool) },
                 ],
             )
             .map(|_| ())

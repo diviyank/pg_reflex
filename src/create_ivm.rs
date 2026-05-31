@@ -2316,6 +2316,7 @@ fn persist_metadata(client: &mut SpiClient<'_>, ctx: &BuildContext) {
         String::new()
     };
     let ignored_sources_vec: Vec<String> = ctx.ignore_sources.to_vec();
+    let max_one_row = !ctx.plan.is_passthrough && ctx.plan.group_by_columns.is_empty();
 
     insert_registry_row(
         client,
@@ -2339,6 +2340,7 @@ fn persist_metadata(client: &mut SpiClient<'_>, ctx: &BuildContext) {
             ignored_sources: Some(&ignored_sources_vec),
             partition_columns: Some(&ctx.plan.partition_columns),
             partition_strategy: Some(&ctx.plan.partition_strategy),
+            max_one_row,
         },
     )
     .unwrap_or_report();

@@ -778,3 +778,45 @@ fn test_cte_without_window_or_distinct_on_still_works() {
     .expect("v");
     assert_eq!(total_a, 30, "A: 10 + 20 = 30");
 }
+
+// 1.7.5 — an ungrouped aggregate IMV (no GROUP BY → exactly one row) must be
+// flagged max_one_row so JOIN inference can treat a CROSS JOIN to it as to-one.
+#[pg_test]
+fn test_ungrouped_aggregate_sets_max_one_row() {
+    Spi::run("CREATE TABLE mor_src (id INT PRIMARY KEY, amt INT NOT NULL)").expect("t");
+    Spi::run("INSERT INTO mor_src VALUES (1,10),(2,20)").expect("seed");
+
+    let result = crate::create_reflex_ivm(
+        "mor_view",
+        "SELECT SUM(amt)::BIGINT AS total FROM mor_src",
+        None,
+        None,
+        None,
+        None,
+    );
+    assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
+
+    let flag = Spi::get_one::<bool>(
+        "SELECT max_one_row FROM public.__reflex_ivm_reference WHERE name = 'mor_view'",
+    )
+    .expect("q")
+    .expect("flag");
+    assert!(flag, "ungrouped aggregate must set max_one_row = TRUE");
+
+    // A grouped aggregate must NOT be flagged.
+    let result2 = crate::create_reflex_ivm(
+        "mor_grouped",
+        "SELECT id, SUM(amt)::BIGINT AS total FROM mor_src GROUP BY id",
+        None,
+        None,
+        None,
+        None,
+    );
+    assert_eq!(result2, "CREATE REFLEX INCREMENTAL VIEW");
+    let flag2 = Spi::get_one::<bool>(
+        "SELECT COALESCE(max_one_row, FALSE) FROM public.__reflex_ivm_reference WHERE name = 'mor_grouped'",
+    )
+    .expect("q")
+    .expect("flag2");
+    assert!(!flag2, "grouped aggregate must NOT set max_one_row");
+}
