@@ -3234,8 +3234,8 @@ fn source_is_max_one_row(source: &str) -> bool {
             .select(
                 "SELECT COALESCE(max_one_row, FALSE) AS m \
                  FROM public.__reflex_ivm_reference \
-                 WHERE name = $1 OR name = $2 OR name LIKE '%__cte_' || $2 \
-                 ORDER BY (name = $1) DESC, (name = $2) DESC LIMIT 1",
+                 WHERE name = $1 OR name = $2 \
+                 ORDER BY (name = $1) DESC LIMIT 1",
                 None,
                 &[
                     unsafe { DatumWithOid::new(canonical, PgBuiltInOids::TEXTOID.oid().value()) },
@@ -3251,8 +3251,10 @@ fn source_is_max_one_row(source: &str) -> bool {
 
 /// Return the GROUP BY columns of an aggregate IMV (from the registry), or None
 /// if not a grouped aggregate. Group-by keys are sound unique keys because
-/// GROUP BY collapses duplicates (one row per group). Normalizes the source name
-/// exactly like source_is_max_one_row. Also matches CTE sub-IMV names.
+/// GROUP BY collapses duplicates (one row per group). The source name (already
+/// the full `<parent>__cte_<alias>` sub-IMV name after the CTE body rewrite, or a
+/// plain table name) is matched exactly on its canonical or bare form — never by
+/// wildcard, which could match a same-named CTE sub-IMV of a different parent.
 #[allow(dead_code)]
 fn source_registered_group_key(source: &str) -> Option<Vec<String>> {
     let (schema_part, bare_name) = canonical_source(source);
@@ -3266,8 +3268,8 @@ fn source_registered_group_key(source: &str) -> Option<Vec<String>> {
             .select(
                 "SELECT index_columns \
                  FROM public.__reflex_ivm_reference \
-                 WHERE (name = $1 OR name = $2 OR name LIKE '%__cte_' || $2) AND index_columns IS NOT NULL \
-                 ORDER BY (name = $1) DESC, (name = $2) DESC LIMIT 1",
+                 WHERE (name = $1 OR name = $2) AND index_columns IS NOT NULL \
+                 ORDER BY (name = $1) DESC LIMIT 1",
                 None,
                 &[
                     unsafe { DatumWithOid::new(canonical, PgBuiltInOids::TEXTOID.oid().value()) },
@@ -3275,7 +3277,10 @@ fn source_registered_group_key(source: &str) -> Option<Vec<String>> {
                 ],
             )
             .unwrap_or_report()
-            .filter_map(|row| row.get_by_name::<Vec<String>, _>("index_columns").unwrap_or(None))
+            .filter_map(|row| {
+                row.get_by_name::<Vec<String>, _>("index_columns")
+                    .unwrap_or(None)
+            })
             .next()
             .and_then(|cols| if cols.is_empty() { None } else { Some(cols) })
     })
