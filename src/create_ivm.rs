@@ -8,7 +8,7 @@ use std::collections::HashMap;
 
 use crate::aggregation::{plan_aggregation, plan_aggregation_with_topk};
 use crate::query_decomposer::{
-    affected_groups_table_name, bare_column_name, format_pg_text_array_literal,
+    affected_groups_table_name, bare_column_name, canonical_source, format_pg_text_array_literal,
     generate_aggregations_json, generate_base_query, generate_end_query, intermediate_table_name,
     normalized_column_name, quote_identifier, replace_identifier, safe_identifier,
     shrunk_groups_table_name, split_qualified_name,
@@ -1828,7 +1828,7 @@ fn materialize_passthrough(client: &mut pgrx::spi::SpiClient<'_>, ctx: &mut Buil
         client
             .update(
                 &format!(
-                    "CREATE UNIQUE INDEX IF NOT EXISTS \"__reflex_uk_{}\" ON {} ({})",
+                    "CREATE UNIQUE INDEX IF NOT EXISTS \"__reflex_uk_{}\" ON {} ({}) NULLS NOT DISTINCT",
                     bare_view,
                     quote_identifier(ctx.view_name),
                     uk_cols.join(", ")
@@ -3179,7 +3179,8 @@ fn source_sound_unique_keys(source: &str) -> Vec<Vec<String>> {
         result.push(pk);
     }
 
-    // UNIQUE indexes: both NOT-NULL (indnullsnotdistinct) and __reflex_uk_* indexes
+    // UNIQUE indexes: sound keys are those with NULLS NOT DISTINCT, or all columns NOT NULL
+    // Excludes partial indexes (indpred IS NOT NULL) and expression indexes (indkey contains 0)
     let uks: Vec<Vec<String>> = Spi::connect(|client| {
         client
             .select(
@@ -3187,11 +3188,11 @@ fn source_sound_unique_keys(source: &str) -> Vec<Vec<String>> {
                  FROM pg_index ix \
                  JOIN LATERAL unnest(ix.indkey) WITH ORDINALITY AS k(col, n) ON true \
                  JOIN pg_attribute a ON a.attrelid = ix.indrelid AND a.attnum = k.col \
-                 JOIN pg_class idx ON idx.oid = ix.indexrelid \
                  WHERE ix.indrelid = to_regclass($1) AND ix.indisunique \
                    AND NOT ix.indisprimary \
-                   AND (ix.indnullsnotdistinct OR idx.relname LIKE '__reflex_uk_%') \
-                 GROUP BY ix.indexrelid",
+                   AND ix.indpred IS NULL AND k.col <> 0 \
+                 GROUP BY ix.indexrelid, ix.indnullsnotdistinct \
+                 HAVING ix.indnullsnotdistinct OR bool_and(a.attnotnull)",
                 None,
                 &[unsafe {
                     DatumWithOid::new(source.to_string(), PgBuiltInOids::TEXTOID.oid().value())
@@ -3207,8 +3208,15 @@ fn source_sound_unique_keys(source: &str) -> Vec<Vec<String>> {
 
 /// TRUE when `source` is a registered IMV flagged `max_one_row` (ungrouped
 /// aggregate → at most one row). Base tables / unknown names → FALSE.
+/// Normalizes the source name to unquoted canonical form to match registry storage.
 #[allow(dead_code)]
 fn source_is_max_one_row(source: &str) -> bool {
+    let (schema_part, bare_name) = canonical_source(source);
+    let canonical = match schema_part {
+        Some(s) => format!("{}.{}", s, bare_name),
+        None => bare_name.clone(),
+    };
+
     Spi::connect(|client| {
         client
             .select(
@@ -3218,18 +3226,8 @@ fn source_is_max_one_row(source: &str) -> bool {
                  ORDER BY (name = $1) DESC LIMIT 1",
                 None,
                 &[
-                    unsafe {
-                        DatumWithOid::new(
-                            source.to_string(),
-                            PgBuiltInOids::TEXTOID.oid().value(),
-                        )
-                    },
-                    unsafe {
-                        DatumWithOid::new(
-                            bare_column_name(source).to_string(),
-                            PgBuiltInOids::TEXTOID.oid().value(),
-                        )
-                    },
+                    unsafe { DatumWithOid::new(canonical, PgBuiltInOids::TEXTOID.oid().value()) },
+                    unsafe { DatumWithOid::new(bare_name, PgBuiltInOids::TEXTOID.oid().value()) },
                 ],
             )
             .unwrap_or_report()
@@ -3365,10 +3363,9 @@ fn infer_join_passthrough_unique_key(ctx: &BuildContext) -> Option<Vec<String>> 
 
             let (eq_cols, n_eq) =
                 source_equi_join_columns(other, &analysis.joins, &analysis.table_aliases);
-            let to_one = (n_eq > 0
-                && !eq_cols.is_empty()
-                && source_cols_cover_unique_key(other, &eq_cols))
-                || source_is_max_one_row(other);
+            let to_one =
+                (n_eq > 0 && !eq_cols.is_empty() && source_cols_cover_unique_key(other, &eq_cols))
+                    || source_is_max_one_row(other);
             if to_one {
                 // Collapses to ≤1 matching row — contributes nothing to the key.
                 continue;
