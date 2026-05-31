@@ -1366,3 +1366,128 @@ fn pg_part_anchor_prefers_base_over_cte_intermediate() {
         .expect("v2");
     assert_eq!(total_2.to_string(), "30", "dp_id=2 total");
 }
+
+/// Co-partitioned FULL OUTER JOIN: both sources are partitioned on the SAME
+/// column and joined on it, so the result partition key is
+/// COALESCE(l.dp_id, r.dp_id) and NEITHER side is uniquely "the" anchor. The
+/// single-anchor resolver rejected this with "multiple sources own partition
+/// column … ambiguous", blocking the whole IMV (this is the shape of
+/// forecast_analysis_view: forecast_sales FULL JOIN history_sales on dem_plan_id).
+/// The IMV must create AND preserve the FULL JOIN's outer rows from BOTH sides.
+#[pg_test]
+fn pg_part_anchor_copartitioned_full_join() {
+    Spi::run(
+        "CREATE TABLE fj_l (dp_id BIGINT NOT NULL, item INT NOT NULL, lval NUMERIC, \
+         PRIMARY KEY (dp_id, item)) PARTITION BY LIST (dp_id)",
+    )
+    .expect("create left");
+    Spi::run("CREATE TABLE fj_l_1 PARTITION OF fj_l FOR VALUES IN (1)").expect("l1");
+    Spi::run("CREATE TABLE fj_l_2 PARTITION OF fj_l FOR VALUES IN (2)").expect("l2");
+    Spi::run(
+        "CREATE TABLE fj_r (dp_id BIGINT NOT NULL, item INT NOT NULL, rval NUMERIC, \
+         PRIMARY KEY (dp_id, item)) PARTITION BY LIST (dp_id)",
+    )
+    .expect("create right");
+    Spi::run("CREATE TABLE fj_r_1 PARTITION OF fj_r FOR VALUES IN (1)").expect("r1");
+    Spi::run("CREATE TABLE fj_r_2 PARTITION OF fj_r FOR VALUES IN (2)").expect("r2");
+
+    // Identical dp_id universe ({1,2}); the outer rows differ by `item` so the
+    // FULL JOIN yields a matched row, a left-only row, and a right-only row all
+    // inside partition dp_id=1.
+    Spi::run("INSERT INTO fj_l VALUES (1, 1, 10), (1, 2, 20), (2, 1, 30)").expect("seed l");
+    Spi::run("INSERT INTO fj_r VALUES (1, 1, 100), (1, 3, 300), (2, 1, 300)").expect("seed r");
+
+    let msg = Spi::get_one::<&str>(
+        "SELECT create_reflex_ivm( \
+            'fj_av', \
+            'SELECT COALESCE(l.dp_id, r.dp_id) AS dp_id, \
+                    COALESCE(l.item, r.item) AS item, \
+                    l.lval, r.rval \
+             FROM fj_l l FULL JOIN fj_r r \
+               ON l.dp_id = r.dp_id AND l.item = r.item', \
+            'dp_id,item', 'UNLOGGED', 'DEFERRED', NULL, \
+            ARRAY['dp_id'] \
+         )",
+    )
+    .expect("create call")
+    .expect("create result");
+    assert!(
+        !msg.starts_with("ERROR"),
+        "co-partitioned FULL JOIN should create, got: {msg}"
+    );
+
+    // Partition dp_id=1 must hold matched (item 1) + left-only (item 2) +
+    // right-only (item 3): outer rows on BOTH sides survive.
+    let n = Spi::get_one::<i64>("SELECT count(*) FROM fj_av WHERE dp_id = 1")
+        .expect("count q")
+        .expect("count v");
+    assert_eq!(n, 3, "dp_id=1 must keep matched + left-only + right-only rows");
+    let right_only = Spi::get_one::<pgrx::AnyNumeric>(
+        "SELECT rval FROM fj_av WHERE dp_id = 1 AND item = 3",
+    )
+    .expect("right-only q")
+    .expect("right-only present");
+    assert_eq!(right_only.to_string(), "300", "right-only row preserved");
+    let left_only = Spi::get_one::<pgrx::AnyNumeric>(
+        "SELECT lval FROM fj_av WHERE dp_id = 1 AND item = 2",
+    )
+    .expect("left-only q")
+    .expect("left-only present");
+    assert_eq!(left_only.to_string(), "20", "left-only row preserved");
+}
+
+/// Incremental soundness for the co-partitioned FULL JOIN: a right-only INSERT
+/// on the NON-anchor side, in a partition the anchor has NO rows for, must
+/// still reach the IMV. The buggy single-anchor JOIN-path
+/// (`JOIN anchor a ON a.dp_id = t.dp_id`) would find no anchor row for that
+/// dp_id and silently drop the delta. The fix gives a co-partitioned source no
+/// JOIN-path, so it falls through to Path B and the row propagates.
+#[pg_test]
+fn pg_part_copartitioned_full_join_right_only_delta_propagates() {
+    Spi::run(
+        "CREATE TABLE fjd_l (dp_id BIGINT NOT NULL, item INT NOT NULL, lval NUMERIC, \
+         PRIMARY KEY (dp_id, item)) PARTITION BY LIST (dp_id)",
+    )
+    .expect("create left");
+    Spi::run("CREATE TABLE fjd_l_1 PARTITION OF fjd_l FOR VALUES IN (1)").expect("l1");
+    Spi::run("CREATE TABLE fjd_l_2 PARTITION OF fjd_l FOR VALUES IN (2)").expect("l2");
+    Spi::run(
+        "CREATE TABLE fjd_r (dp_id BIGINT NOT NULL, item INT NOT NULL, rval NUMERIC, \
+         PRIMARY KEY (dp_id, item)) PARTITION BY LIST (dp_id)",
+    )
+    .expect("create right");
+    Spi::run("CREATE TABLE fjd_r_1 PARTITION OF fjd_r FOR VALUES IN (1)").expect("r1");
+    Spi::run("CREATE TABLE fjd_r_2 PARTITION OF fjd_r FOR VALUES IN (2)").expect("r2");
+
+    // Anchor (lexicographically first = fjd_l) has rows ONLY in dp_id=1. dp_id=2
+    // is empty on the anchor side at create time.
+    Spi::run("INSERT INTO fjd_l VALUES (1, 1, 10)").expect("seed l");
+    Spi::run("INSERT INTO fjd_r VALUES (1, 1, 100)").expect("seed r");
+
+    let msg = Spi::get_one::<&str>(
+        "SELECT create_reflex_ivm( \
+            'fjd_av', \
+            'SELECT COALESCE(l.dp_id, r.dp_id) AS dp_id, \
+                    COALESCE(l.item, r.item) AS item, \
+                    l.lval, r.rval \
+             FROM fjd_l l FULL JOIN fjd_r r \
+               ON l.dp_id = r.dp_id AND l.item = r.item', \
+            'dp_id,item', 'LOGGED', 'IMMEDIATE', NULL, \
+            ARRAY['dp_id'] \
+         )",
+    )
+    .expect("create call")
+    .expect("create result");
+    assert!(!msg.starts_with("ERROR"), "create failed: {msg}");
+
+    // Right-only delta into a dp_id the anchor never had rows for. The anchor
+    // JOIN-path would miss partition 2 entirely; Path B must catch it.
+    Spi::run("INSERT INTO fjd_r VALUES (2, 7, 700)").expect("right-only delta");
+
+    let rval = Spi::get_one::<pgrx::AnyNumeric>(
+        "SELECT rval FROM fjd_av WHERE dp_id = 2 AND item = 7",
+    )
+    .expect("delta q")
+    .expect("right-only delta must reach the IMV");
+    assert_eq!(rval.to_string(), "700", "right-only delta propagated to IMV");
+}

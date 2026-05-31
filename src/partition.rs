@@ -96,6 +96,25 @@ pub(crate) fn introspect_partition_descriptor(
     })
 }
 
+/// True when `source` is itself a partitioned table whose partition key
+/// includes `col`. Such a source is "co-partitioned" on the column: its own
+/// rows already carry the partition key, so it never needs an anchor JOIN to
+/// recover it. Accepts schema-qualified or bare names.
+pub(crate) fn source_partitioned_on(
+    client: &pgrx::spi::SpiClient<'_>,
+    source: &str,
+    col: &str,
+) -> bool {
+    let (schema_opt, bare) = canonical_source(source);
+    let canonical_name = match schema_opt {
+        Some(schema) => format!("{}.{}", schema, bare),
+        None => bare,
+    };
+    introspect_partition_descriptor(client, &canonical_name)
+        .map(|d| d.column_names.iter().any(|c| c.eq_ignore_ascii_case(col)))
+        .unwrap_or(false)
+}
+
 /// List existing child partitions of `parent` (schema-qualified or bare).
 /// Returns an empty vector if the parent is not partitioned or has no
 /// children. `bound_expr` is the post-FOR-VALUES fragment.
@@ -498,47 +517,53 @@ pub(crate) fn resolve_anchor_source(
         _ => {
             // The partition column is commonly the join key, so it appears on
             // several sources. The anchor — whose partition children we mirror
-            // — must itself be a partitioned table, so disambiguate to the sole
-            // partitioned owner. A bare column name on non-partitioned sources
-            // (e.g. a sibling sub-IMV) cannot be the anchor.
-            let partitioned_owners: Vec<String> = owners
+            // — must itself be partitioned ON that column. A bare column on a
+            // non-partitioned source (e.g. a sibling sub-IMV) cannot be the
+            // anchor, and a source partitioned on a *different* column is not a
+            // candidate either.
+            let mut owners_on_col: Vec<String> = owners
                 .iter()
-                .filter(|s| {
-                    let (schema_opt, bare) = canonical_source(s);
-                    let canonical_name = if let Some(schema) = schema_opt {
-                        format!("{}.{}", schema, bare)
-                    } else {
-                        bare
-                    };
-                    introspect_partition_descriptor(client, &canonical_name).is_some()
-                })
+                .filter(|s| source_partitioned_on(client, s, &col))
                 .cloned()
                 .collect();
 
             // A reflex-generated intermediate (`__cte_`/`__union_`/`__base`) can
             // inherit the partition column and descriptor from a base source it
-            // reads, so a decomposed query (e.g. a CTE that joins a base
-            // partitioned table to a partition-inheriting sub-IMV) ends up with
-            // two partitioned owners. The anchor whose partition children we
-            // physically mirror must be the underlying base table, not the
-            // derived intermediate, so prefer base sources when exactly one
-            // exists; fall back to the sole partitioned owner otherwise.
+            // reads, so a decomposed query ends up with several partitioned
+            // owners. The anchor whose partition children we physically mirror
+            // must be a real base table, not a derived intermediate, so prefer
+            // base sources when any exist.
             let is_intermediate = |s: &String| {
                 let (_, bare) = canonical_source(s);
                 bare.contains("__cte_") || bare.contains("__union_") || bare.contains("__base")
             };
-            let base_owners: Vec<&String> = partitioned_owners
+            let mut base_on_col: Vec<String> = owners_on_col
                 .iter()
                 .filter(|s| !is_intermediate(s))
+                .cloned()
                 .collect();
 
-            match (base_owners.as_slice(), partitioned_owners.as_slice()) {
-                ([only], _) => Ok((*only).clone()),
-                (_, [only]) => Ok(only.clone()),
-                _ => Err(format!(
-                    "multiple sources own partition column '{}' — ambiguous: {:?}",
+            // When several sources are co-partitioned on the SAME column (e.g. a
+            // FULL/INNER JOIN whose key IS the partition column, as in
+            // forecast_analysis_view), their partition layouts align, so ANY of
+            // them is a sound anchor for child DDL — this is no longer ambiguous.
+            // Pick deterministically (lexicographically) for a stable choice
+            // across rebuilds. Non-anchor co-owners are handled in
+            // apply_partition_plan: they own the column natively, so they get NO
+            // anchor JOIN-path and fall through to Path B (sound for outer rows).
+            let pool = if !base_on_col.is_empty() {
+                &mut base_on_col
+            } else {
+                &mut owners_on_col
+            };
+            if pool.is_empty() {
+                Err(format!(
+                    "multiple sources own partition column '{}' but none is partitioned on it — ambiguous: {:?}",
                     partition_col, owners
-                )),
+                ))
+            } else {
+                pool.sort();
+                Ok(pool[0].clone())
             }
         }
     }
