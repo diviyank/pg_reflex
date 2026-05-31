@@ -501,17 +501,40 @@ pub(crate) fn resolve_anchor_source(
             // — must itself be a partitioned table, so disambiguate to the sole
             // partitioned owner. A bare column name on non-partitioned sources
             // (e.g. a sibling sub-IMV) cannot be the anchor.
-            let mut partitioned_owners = owners.iter().filter(|s| {
-                let (schema_opt, bare) = canonical_source(s);
-                let canonical_name = if let Some(schema) = schema_opt {
-                    format!("{}.{}", schema, bare)
-                } else {
-                    bare
-                };
-                introspect_partition_descriptor(client, &canonical_name).is_some()
-            });
-            match (partitioned_owners.next(), partitioned_owners.next()) {
-                (Some(anchor), None) => Ok(anchor.clone()),
+            let partitioned_owners: Vec<String> = owners
+                .iter()
+                .filter(|s| {
+                    let (schema_opt, bare) = canonical_source(s);
+                    let canonical_name = if let Some(schema) = schema_opt {
+                        format!("{}.{}", schema, bare)
+                    } else {
+                        bare
+                    };
+                    introspect_partition_descriptor(client, &canonical_name).is_some()
+                })
+                .cloned()
+                .collect();
+
+            // A reflex-generated intermediate (`__cte_`/`__union_`/`__base`) can
+            // inherit the partition column and descriptor from a base source it
+            // reads, so a decomposed query (e.g. a CTE that joins a base
+            // partitioned table to a partition-inheriting sub-IMV) ends up with
+            // two partitioned owners. The anchor whose partition children we
+            // physically mirror must be the underlying base table, not the
+            // derived intermediate, so prefer base sources when exactly one
+            // exists; fall back to the sole partitioned owner otherwise.
+            let is_intermediate = |s: &String| {
+                let (_, bare) = canonical_source(s);
+                bare.contains("__cte_") || bare.contains("__union_") || bare.contains("__base")
+            };
+            let base_owners: Vec<&String> = partitioned_owners
+                .iter()
+                .filter(|s| !is_intermediate(s))
+                .collect();
+
+            match (base_owners.as_slice(), partitioned_owners.as_slice()) {
+                ([only], _) => Ok((*only).clone()),
+                (_, [only]) => Ok(only.clone()),
                 _ => Err(format!(
                     "multiple sources own partition column '{}' — ambiguous: {:?}",
                     partition_col, owners

@@ -1318,3 +1318,51 @@ fn partitioned_imv_over_quoted_cte_source_creates_cleanly() {
     assert!(msg.starts_with("CREATE REFLEX") || msg.contains(crate::REFLEX_UNSUPPORTED_TAG),
             "unexpected: {msg}");
 }
+
+/// Anchor disambiguation: when a CTE joins a base partitioned table to a
+/// partition-inheriting sub-IMV, both own the partition column AND both are
+/// partitioned. The anchor — whose partition children we physically mirror —
+/// must be the base table, not the reflex-generated `__cte_` intermediate.
+/// Before the fix this failed with "multiple sources own partition column …
+/// ambiguous", blocking the whole IMV.
+#[pg_test]
+fn pg_part_anchor_prefers_base_over_cte_intermediate() {
+    Spi::run(
+        "CREATE TABLE anc_fact (dp_id BIGINT NOT NULL, item INT NOT NULL, amount NUMERIC, \
+         PRIMARY KEY (dp_id, item)) PARTITION BY LIST (dp_id)",
+    )
+    .expect("create fact");
+    Spi::run("CREATE TABLE anc_fact_1 PARTITION OF anc_fact FOR VALUES IN (1)").expect("p1");
+    Spi::run("CREATE TABLE anc_fact_2 PARTITION OF anc_fact FOR VALUES IN (2)").expect("p2");
+    Spi::run("INSERT INTO anc_fact VALUES (1, 1, 10), (1, 2, 20), (2, 1, 30)").expect("seed");
+
+    let msg = Spi::get_one::<&str>(
+        "SELECT create_reflex_ivm( \
+            'anc_av', \
+            'WITH bounds AS ( \
+                 SELECT dp_id, MAX(amount) AS mx FROM anc_fact GROUP BY dp_id \
+             ), joined AS ( \
+                 SELECT f.dp_id, f.item, f.amount FROM anc_fact f \
+                 JOIN bounds b ON f.dp_id = b.dp_id \
+             ) \
+             SELECT dp_id, SUM(amount) AS total FROM joined GROUP BY dp_id', \
+            NULL, NULL, NULL, NULL, \
+            ARRAY['dp_id'] \
+         )",
+    )
+    .expect("create call")
+    .expect("create result");
+    assert!(
+        !msg.starts_with("ERROR"),
+        "anchor disambiguation should let the partitioned CTE IMV create, got: {msg}"
+    );
+
+    let total_1 = Spi::get_one::<pgrx::AnyNumeric>("SELECT total FROM anc_av WHERE dp_id = 1")
+        .expect("q1")
+        .expect("v1");
+    assert_eq!(total_1.to_string(), "30", "dp_id=1 total");
+    let total_2 = Spi::get_one::<pgrx::AnyNumeric>("SELECT total FROM anc_av WHERE dp_id = 2")
+        .expect("q2")
+        .expect("v2");
+    assert_eq!(total_2.to_string(), "30", "dp_id=2 total");
+}

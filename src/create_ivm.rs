@@ -213,6 +213,28 @@ fn compute_cte_partition_subset(
         .collect()
 }
 
+/// Roll back the sub-IMVs a decomposition step has already materialised when a
+/// later step fails with a *soft* (returned-`"ERROR…"`-string) error.
+///
+/// Hard failures raise a PostgreSQL error and abort the whole transaction, which
+/// self-rolls-back every object created so far. Soft errors return normally, so
+/// without this the partially-built sub-IMVs would commit and orphan themselves
+/// in the IMV space. Each name is dropped with `cascade = true`, in reverse
+/// creation order (dependents before the dependencies they read from), which also
+/// tears down any nested descendants the sub-IMV itself decomposed into.
+fn rollback_partial_sub_imvs(sub_imv_names: &[String]) {
+    for name in sub_imv_names.iter().rev() {
+        let drop_result = crate::drop_ivm::drop_reflex_ivm_impl(name, true);
+        if drop_result.starts_with("ERROR") {
+            warning!(
+                "pg_reflex: could not roll back partial sub-IMV '{}' after a failed create: {}",
+                name,
+                drop_result
+            );
+        }
+    }
+}
+
 /// Decomposition phase: UNION / INTERSECT / EXCEPT.
 ///
 /// Each operand is materialised as its own sub-IMV (recursively); the user-
@@ -256,6 +278,7 @@ fn try_decompose_set_op(ctx: &DecomposeCtx) -> Option<&'static str> {
             ctx.materialize_as_table,
         );
         if result.starts_with("ERROR") {
+            rollback_partial_sub_imvs(&sub_imv_names);
             return Some(result);
         }
         sub_imv_names.push(sub_name);
@@ -329,6 +352,7 @@ fn try_decompose_set_op(ctx: &DecomposeCtx) -> Option<&'static str> {
         // body that a downstream aggregate IMV tries to install transition-table
         // triggers on). Reject if materialize_as_table is true.
         if ctx.materialize_as_table {
+            rollback_partial_sub_imvs(&sub_imv_names);
             return Some(crate::reflex_reject(
                 "UNION/INTERSECT/EXCEPT (without ALL) cannot be used as an intermediate \
                  sub-IMV because their result is dedup-/order-dependent on the full input \
@@ -1040,6 +1064,7 @@ with kind: mv.",
             || alias_lower.starts_with("__reflex_old_")
             || alias_lower.starts_with("__reflex_delta_")
         {
+            rollback_partial_sub_imvs(&created_sub_imv_names(&cte_name_map));
             return Some(crate::reflex_reject(
                 "CTE alias conflicts with pg_reflex reserved prefix (__reflex_new_/old_/delta_)",
             ));
@@ -1089,6 +1114,7 @@ with kind: mv.",
             true,
         );
         if result.starts_with("ERROR") {
+            rollback_partial_sub_imvs(&created_sub_imv_names(&cte_name_map));
             return Some(result);
         }
         cte_name_map.push((cte.alias.clone(), cte_view_name));
@@ -1107,6 +1133,7 @@ with kind: mv.",
         }
         body
     } else {
+        rollback_partial_sub_imvs(&created_sub_imv_names(&cte_name_map));
         return Some(crate::reflex_reject("Query is not a SELECT"));
     };
 
@@ -1115,7 +1142,7 @@ with kind: mv.",
     // CTE body (passthrough or aggregate) → create as a normal IMV.
     // Preserve `materialize_as_table` so the outer body itself ends up as a
     // TABLE when this CTE-decomposed IMV is itself an intermediate sub-IMV.
-    Some(create_reflex_ivm_impl_with_materialization(
+    let body_result = create_reflex_ivm_impl_with_materialization(
         ctx.view_name,
         &body_sql,
         ctx.unique_columns_str,
@@ -1126,7 +1153,17 @@ with kind: mv.",
         ctx.ignore_sources,
         ctx.partition_by,
         ctx.materialize_as_table,
-    ))
+    );
+    if body_result.starts_with("ERROR") {
+        rollback_partial_sub_imvs(&created_sub_imv_names(&cte_name_map));
+    }
+    Some(body_result)
+}
+
+/// The materialised sub-IMV names from a CTE decomposition's `(alias, name)` map,
+/// in creation order — the input to [`rollback_partial_sub_imvs`].
+fn created_sub_imv_names(cte_name_map: &[(String, String)]) -> Vec<String> {
+    cte_name_map.iter().map(|(_, name)| name.clone()).collect()
 }
 
 /// For passthrough IMVs, resolve the unique-key column set: explicit

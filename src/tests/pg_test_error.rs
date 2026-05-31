@@ -695,3 +695,98 @@ fn test_reject_except_as_cte_body() {
         result
     );
 }
+
+// When a multi-sub-IMV decomposition (CTE / set-op) creates one or more sub-IMVs
+// and a LATER step fails with a soft (returned-string) error, the already-created
+// sub-IMVs must be rolled back rather than left as orphans polluting the IMV space.
+
+#[pg_test]
+fn test_cte_decomposition_failure_rolls_back_sub_imvs() {
+    Spi::run("CREATE TABLE orphan_cte_src (grp TEXT, val INT)").expect("create table");
+    Spi::run("INSERT INTO orphan_cte_src VALUES ('a', 1), ('a', 1), ('b', 2)").expect("seed");
+
+    // CTE `a` is a valid passthrough → created as `orphan_cte__cte_a`.
+    // The outer body mixes COUNT(DISTINCT) with SUM → soft reject AFTER the CTE
+    // sub-IMV is already materialized.
+    let result = crate::create_reflex_ivm(
+        "orphan_cte",
+        "WITH a AS (SELECT grp, val FROM orphan_cte_src) \
+         SELECT grp, COUNT(DISTINCT val) AS cd, SUM(val) AS s FROM a GROUP BY grp",
+        None,
+        None,
+        None,
+        None,
+    );
+    assert!(
+        result.starts_with("ERROR"),
+        "expected the mixed-aggregate body to be rejected, got: {}",
+        result
+    );
+
+    let registered = Spi::get_one::<i64>(
+        "SELECT COUNT(*) FROM public.__reflex_ivm_reference WHERE name = 'orphan_cte__cte_a'",
+    )
+    .expect("q")
+    .expect("v");
+    assert_eq!(
+        registered, 0,
+        "sub-IMV 'orphan_cte__cte_a' must be removed from the registry after the parent create failed"
+    );
+
+    let relation_exists = Spi::get_one::<bool>(
+        "SELECT to_regclass('orphan_cte__cte_a') IS NOT NULL",
+    )
+    .expect("q")
+    .expect("v");
+    assert!(
+        !relation_exists,
+        "the orphaned sub-IMV relation 'orphan_cte__cte_a' must be dropped after the parent create failed"
+    );
+}
+
+#[pg_test]
+fn test_set_op_decomposition_failure_rolls_back_sub_imvs() {
+    Spi::run("CREATE TABLE orphan_uni_a (id INT, val INT, amt INT)").expect("create a");
+    Spi::run("CREATE TABLE orphan_uni_b (id INT, val INT, amt INT)").expect("create b");
+    Spi::run("INSERT INTO orphan_uni_a VALUES (1, 10, 100)").expect("seed a");
+    Spi::run("INSERT INTO orphan_uni_b VALUES (2, 20, 200)").expect("seed b");
+
+    // First operand is a valid passthrough → created as `orphan_setop__union_0`.
+    // Second operand mixes COUNT(DISTINCT) with SUM → soft reject AFTER the first
+    // operand sub-IMV is already materialized.
+    let result = crate::create_reflex_ivm(
+        "orphan_setop",
+        "SELECT id, val, amt FROM orphan_uni_a \
+         UNION ALL \
+         SELECT id, COUNT(DISTINCT val) AS val, SUM(amt) AS amt FROM orphan_uni_b GROUP BY id",
+        None,
+        None,
+        None,
+        None,
+    );
+    assert!(
+        result.starts_with("ERROR"),
+        "expected the mixed-aggregate operand to be rejected, got: {}",
+        result
+    );
+
+    let registered = Spi::get_one::<i64>(
+        "SELECT COUNT(*) FROM public.__reflex_ivm_reference WHERE name = 'orphan_setop__union_0'",
+    )
+    .expect("q")
+    .expect("v");
+    assert_eq!(
+        registered, 0,
+        "operand sub-IMV 'orphan_setop__union_0' must be removed from the registry after the parent create failed"
+    );
+
+    let relation_exists = Spi::get_one::<bool>(
+        "SELECT to_regclass('orphan_setop__union_0') IS NOT NULL",
+    )
+    .expect("q")
+    .expect("v");
+    assert!(
+        !relation_exists,
+        "the orphaned operand sub-IMV 'orphan_setop__union_0' must be dropped after the parent create failed"
+    );
+}

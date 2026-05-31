@@ -4,6 +4,19 @@ The full changelog tracks every release. The latest version's headlines are on t
 
 For each version below, see [`CHANGELOG.md`](https://github.com/diviyank/pg_reflex/blob/main/CHANGELOG.md) on GitHub for the canonical text.
 
+## [1.7.3] — 2026-05-31
+
+Correctness release for IMV creation. Two compiled-only fixes (no catalog or SQL-signature change). Run `ALTER EXTENSION pg_reflex UPDATE TO '1.7.3';` and replace the `.so`.
+
+**Fixed**
+
+- **Failed creation of a decomposed IMV no longer orphans its sub-IMVs.** Creation rejections return as `"ERROR…"` strings, so the function returns normally and the transaction is not aborted — a CTE/`UNION ALL` query that materialises several sub-IMVs and is then soft-rejected on a later operand/CTE or the outer body used to leave the already-created sub-IMVs behind. Every soft-reject path in `try_decompose_ctes` and `try_decompose_set_op` now rolls back the sub-IMVs it created (cascade, reverse order). Hard failures were already covered by transaction abort.
+- **Partition-anchor resolution prefers the base source over derived intermediates.** When a decomposed query has two partitioned owners of the partition column (a base partitioned table and a partition-inheriting `__cte_`/`__union_`/`__base` sub-IMV), `resolve_anchor_source` no longer errors `multiple sources own partition column … ambiguous`; it picks the sole base partitioned owner — the table whose partition children are mirrored — and errors only on genuine ambiguity.
+
+**Testing**
+
+- 1108 tests pass; `clippy` + `fmt` clean. New: `test_cte_decomposition_failure_rolls_back_sub_imvs`, `test_set_op_decomposition_failure_rolls_back_sub_imvs`, `pg_part_anchor_prefers_base_over_cte_intermediate`.
+
 ## [1.7.2] — 2026-05-31
 
 Correctness release fixing `drop_reflex_ivm`, which silently orphaned the target + auxiliary tables of any IMV created with a bare (unqualified) name under a non-`public` `search_path`. All teardown DDL derived its relation names from the stored bare `name` and resolved the target via `to_regclass(name)`, both honouring the session `search_path` *at drop time* — so an IMV whose objects landed in `alp` (created while `search_path = alp`) was torn down with unqualified `DROP TABLE IF EXISTS …` that resolved against the wrong schema, deleted only the catalog row, and left the table + `__reflex_intermediate_*` / `__reflex_affected_*` / `__reflex_uk_*` behind. A same-named decoy relation of a different relkind in the path (e.g. a materialized view) could be hit instead (`ERROR: "<name>" is not a table`). Run `ALTER EXTENSION pg_reflex UPDATE TO '1.7.2';`.

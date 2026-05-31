@@ -1,5 +1,49 @@
 # Changelog
 
+## [1.7.3] - 2026-05-31
+
+Correctness release for IMV **creation**. Both fixes are entirely in the
+compiled extension — no catalog schema change and no SQL function signature
+change — so the migration only bumps the installed version. Run
+`ALTER EXTENSION pg_reflex UPDATE TO '1.7.3';` and replace the `.so`.
+
+---
+
+### Fixed
+
+- **Failed creation of a decomposed IMV no longer orphans its sub-IMVs.**
+  Creation rejections are returned as `"ERROR…"` strings, so the function
+  returns normally and the surrounding transaction is *not* aborted. A query
+  that decomposes into several sub-IMVs (a CTE `WITH` chain, or a `UNION ALL`
+  set-op) materialises them one at a time; when a *later* operand/CTE — or the
+  final outer body — was soft-rejected, the sub-IMVs already created were
+  committed and left behind, polluting the IMV space. Every soft-reject path in
+  `try_decompose_ctes` (reserved-prefix conflict, a sub-IMV create failing,
+  non-SELECT body, body create failing) and `try_decompose_set_op` (an operand
+  create failing, the non-`ALL` "cannot be intermediate" rejection) now rolls
+  back the sub-IMVs it had already created — `cascade`, in reverse creation
+  order, so nested descendants go too. Hard failures (a raised PostgreSQL error)
+  were already rolled back by the transaction abort and are unaffected.
+
+- **Partition-anchor resolution now prefers the base source over derived
+  intermediates.** A decomposed query can produce two *partitioned* owners of
+  the partition column: a base partitioned table AND a partition-inheriting
+  reflex sub-IMV (e.g. a CTE that joins `sop_forecast_view` to a
+  `…__cte_date_limits` sub-IMV that inherited partitioning). `resolve_anchor_source`
+  treated that as `multiple sources own partition column '<col>' — ambiguous`
+  and blocked the whole IMV. It now prefers the sole *base* (non
+  `__cte_`/`__union_`/`__base`) partitioned owner — the table whose partition
+  children are physically mirrored — falling back to the sole partitioned owner,
+  and erroring only when the choice is still genuinely ambiguous. All four
+  anchor call sites benefit.
+
+### Testing
+
+- `pg_test_error.rs`: `test_cte_decomposition_failure_rolls_back_sub_imvs`,
+  `test_set_op_decomposition_failure_rolls_back_sub_imvs`.
+- `pg_test_partition.rs`: `pg_part_anchor_prefers_base_over_cte_intermediate`.
+- Full suite: 1108 tests pass; `cargo clippy` and `cargo fmt` clean.
+
 ## [1.7.2] - 2026-05-31
 
 Correctness release fixing `drop_reflex_ivm`, which silently orphaned the
