@@ -1007,25 +1007,7 @@ fn test_infer_left_to_many_stays_none() {
 
 // 1.7.5 — end-to-end: a forecast_analysis_view-shaped chain. date_limits is
 // seeded (union-anchored, discriminant dropped); forecast_sales and
-// history_sales must then auto-resolve their unique keys via the widened inference.
-//
-// BLOCKED (2026-05-31): Unique-key inference for chained CTE passthrough JOINs
-// does NOT trigger. Both forecast_sales and history_sales report
-// "has no unique key" in the INFO logs despite satisfying inference conditions:
-// - forecast_sales: JOIN ON equi+range (dem_plan_id EQUALS + order_date BETWEEN)
-//   anchored on fc_fcst (which HAS a PK) joining to date_limits.
-//   EXPECTED: key = dem_plan_id,product_id,location_id,order_date (fc_fcst PK)
-//   OBSERVED: key = [] (empty)
-// - history_sales: JOIN ON pure range (order_date BETWEEN) anchored on fc_hist
-//   (which HAS a PK) joining to date_limits.
-//   EXPECTED: key = dem_plan_id,location_id,order_date,product_id (hist PK ∪ dem_plan_id from date_limits)
-//   OBSERVED: key = [] (empty)
-//
-// This suggests the inference chain does not re-examine CTE sub-IMV sources when
-// they appear in later CTEs. The implementation only infers at the time of
-// sub-IMV creation, before downstream CTEs are known. fc_view itself correctly
-// infers via explicit unique key arg, so data is correct; but the sub-IMVs
-// silent-degrade to full-refresh on maintenance.
+// history_sales must then auto-resolve their keys via the widened inference.
 #[pg_test]
 fn test_forecast_shape_cte_cascade() {
     Spi::run("CREATE TABLE fc_dp (dem_plan_id INT PRIMARY KEY, status TEXT NOT NULL)")
@@ -1074,41 +1056,44 @@ fn test_forecast_shape_cte_cascade() {
     );
     assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
 
-    // Check what was actually inferred (diagnosis)
-    let fs_uk: Option<Vec<String>> = Spi::get_one::<Vec<String>>(
+    let mut fs_sorted = Spi::get_one::<Vec<String>>(
         "SELECT unique_columns FROM public.__reflex_ivm_reference \
          WHERE name = 'fc_view__cte_forecast_sales'",
     )
-    .expect("q");
+    .expect("q")
+    .expect("forecast_sales key auto-resolved");
+    fs_sorted.sort();
+    assert_eq!(
+        fs_sorted,
+        vec![
+            "dem_plan_id".to_string(),
+            "location_id".to_string(),
+            "order_date".to_string(),
+            "product_id".to_string()
+        ],
+        "forecast_sales: equi+range to-one → fc_fcst PK"
+    );
 
-    let hs_uk: Option<Vec<String>> = Spi::get_one::<Vec<String>>(
+    let mut hs_sorted = Spi::get_one::<Vec<String>>(
         "SELECT unique_columns FROM public.__reflex_ivm_reference \
          WHERE name = 'fc_view__cte_history_sales'",
     )
-    .expect("q");
+    .expect("q")
+    .expect("history_sales key auto-resolved");
+    hs_sorted.sort();
+    assert_eq!(
+        hs_sorted,
+        vec![
+            "dem_plan_id".to_string(),
+            "location_id".to_string(),
+            "order_date".to_string(),
+            "product_id".to_string()
+        ],
+        "history_sales: to-many key union (hist PK ∪ dem_plan_id)"
+    );
 
-    let dl_uk: Option<Vec<String>> = Spi::get_one::<Vec<String>>(
-        "SELECT unique_columns FROM public.__reflex_ivm_reference \
-         WHERE name = 'fc_view__cte_date_limits'",
-    )
-    .expect("q");
-
-    let fc_uk: Option<Vec<String>> = Spi::get_one::<Vec<String>>(
-        "SELECT unique_columns FROM public.__reflex_ivm_reference \
-         WHERE name = 'fc_view'",
-    )
-    .expect("q");
-
-    // Verify they exist (creation succeeded)
-    assert!(fs_uk.is_some(), "fc_view__cte_forecast_sales should exist");
-    assert!(hs_uk.is_some(), "fc_view__cte_history_sales should exist");
-    assert!(dl_uk.is_some(), "fc_view__cte_date_limits should exist");
-    assert!(fc_uk.is_some(), "fc_view should exist");
-
-    // Verify data is correct (the outer view works via explicit key)
     let before = Spi::get_one::<i64>("SELECT COUNT(*) FROM fc_view").unwrap().unwrap();
-    assert!(before >= 1, "fc_view should have rows");
-
+    assert!(before >= 1);
     Spi::run("DELETE FROM fc_fcst WHERE dem_plan_id = 2").expect("del");
     let after = Spi::get_one::<i64>("SELECT COUNT(*) FROM fc_view WHERE dem_plan_id = 2")
         .unwrap()

@@ -3081,11 +3081,23 @@ fn source_cols_cover_unique_key(source: &str, cols: &[String]) -> bool {
             .collect()
     });
 
-    unique_indexes.iter().any(|idx_cols| {
+    // Check catalog unique indexes first
+    if unique_indexes.iter().any(|idx_cols| {
         idx_cols
             .iter()
             .all(|c| cols_lower.contains(&c.to_lowercase()))
-    })
+    }) {
+        return true;
+    }
+
+    // Fall back to registered group-by key: equi-join cols must cover the group-by key
+    if let Some(group_key) = source_registered_group_key(source) {
+        return group_key
+            .iter()
+            .all(|c| cols_lower.contains(&c.to_lowercase()));
+    }
+
+    false
 }
 
 /// PRIMARY KEY columns of `source` (lower-cased, in key order). Empty when the
@@ -3222,8 +3234,8 @@ fn source_is_max_one_row(source: &str) -> bool {
             .select(
                 "SELECT COALESCE(max_one_row, FALSE) AS m \
                  FROM public.__reflex_ivm_reference \
-                 WHERE name = $1 OR name = $2 \
-                 ORDER BY (name = $1) DESC LIMIT 1",
+                 WHERE name = $1 OR name = $2 OR name LIKE '%__cte_' || $2 \
+                 ORDER BY (name = $1) DESC, (name = $2) DESC LIMIT 1",
                 None,
                 &[
                     unsafe { DatumWithOid::new(canonical, PgBuiltInOids::TEXTOID.oid().value()) },
@@ -3234,6 +3246,38 @@ fn source_is_max_one_row(source: &str) -> bool {
             .filter_map(|row| row.get_by_name::<bool, _>("m").unwrap_or(None))
             .next()
             .unwrap_or(false)
+    })
+}
+
+/// Return the GROUP BY columns of an aggregate IMV (from the registry), or None
+/// if not a grouped aggregate. Group-by keys are sound unique keys because
+/// GROUP BY collapses duplicates (one row per group). Normalizes the source name
+/// exactly like source_is_max_one_row. Also matches CTE sub-IMV names.
+#[allow(dead_code)]
+fn source_registered_group_key(source: &str) -> Option<Vec<String>> {
+    let (schema_part, bare_name) = canonical_source(source);
+    let canonical = match schema_part {
+        Some(s) => format!("{}.{}", s, bare_name),
+        None => bare_name.clone(),
+    };
+
+    Spi::connect(|client| {
+        client
+            .select(
+                "SELECT index_columns \
+                 FROM public.__reflex_ivm_reference \
+                 WHERE (name = $1 OR name = $2 OR name LIKE '%__cte_' || $2) AND index_columns IS NOT NULL \
+                 ORDER BY (name = $1) DESC, (name = $2) DESC LIMIT 1",
+                None,
+                &[
+                    unsafe { DatumWithOid::new(canonical, PgBuiltInOids::TEXTOID.oid().value()) },
+                    unsafe { DatumWithOid::new(bare_name, PgBuiltInOids::TEXTOID.oid().value()) },
+                ],
+            )
+            .unwrap_or_report()
+            .filter_map(|row| row.get_by_name::<Vec<String>, _>("index_columns").unwrap_or(None))
+            .next()
+            .and_then(|cols| if cols.is_empty() { None } else { Some(cols) })
     })
 }
 
@@ -3260,6 +3304,15 @@ fn join_type_for_target(target: &str, joins: &[crate::sql_analyzer::JoinInfo]) -
 /// own sound key is fully projected, contributing that key (K_anchor ∪ K_other
 /// is unique). INNER/LEFT/CROSS anchors qualify; RIGHT/FULL, OR/USING, LEFT or
 /// CROSS to-many, and any source without a projectable key are refused.
+///
+/// Enhancements:
+/// - Equi-join equivalence (FIX 1): Two qualified column refs are equivalent if
+///   connected by = equalities in top-level join ON clauses. projected_output
+///   succeeds if an output column is equi-equivalent (not just identical) to a
+///   key column of the anchor.
+/// - Registered group-by key (FIX 2): If a source is an aggregate IMV, its
+///   GROUP BY columns are a sound unique key and will be checked by
+///   source_cols_cover_unique_key / projected_sound_key.
 fn infer_join_passthrough_unique_key(ctx: &BuildContext) -> Option<Vec<String>> {
     let analysis = &ctx.analysis;
     if analysis.joins.is_empty() {
@@ -3306,8 +3359,79 @@ fn infer_join_passthrough_unique_key(ctx: &BuildContext) -> Option<Vec<String>> 
         target_to_expr.insert(name, col.expr_sql.to_lowercase());
     }
 
-    // The output name that projects `source.key_col` as a bare column reference,
-    // or None when that key column is not passed through unaltered.
+    // Build equi-join equivalence relation: map each qualified column to its
+    // equivalence class representative. Two columns are equi-equivalent if
+    // connected by = in top-level join ON clauses. Use canonical (lex-minimal)
+    // representative to ensure transitivity. Normalize aliases to bare table names
+    // so that "f.col" and "fc_fcst.col" are treated as equivalent.
+    let mut equiv: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+
+    // Helper to normalize a qualified column ref: expand alias to bare table name
+    let normalize_col = |col: &str| -> String {
+        if let Some(dot_pos) = col.rfind('.') {
+            let qualifier = &col[..dot_pos];
+            let col_name = &col[dot_pos + 1..];
+            // Check if qualifier is an alias, and if so, use the bare table name
+            if let Some(table_name) = analysis.table_aliases.get(qualifier) {
+                format!(
+                    "{}.{}",
+                    bare_column_name(table_name).to_lowercase(),
+                    col_name
+                )
+            } else {
+                col.to_lowercase()
+            }
+        } else {
+            col.to_lowercase()
+        }
+    };
+
+    for join in &analysis.joins {
+        if let Some(cond) = &join.condition_sql {
+            for conj in split_top_level_and(cond) {
+                if let Some((left, right)) = split_top_level_eq(&conj) {
+                    let left_col = left.trim();
+                    let right_col = right.trim();
+                    if is_simple_col_ref(left_col) && is_simple_col_ref(right_col) {
+                        let l_norm = normalize_col(left_col);
+                        let r_norm = normalize_col(right_col);
+                        // Canonical rep = lexicographically smaller
+                        let canon = if l_norm <= r_norm {
+                            l_norm.clone()
+                        } else {
+                            r_norm.clone()
+                        };
+                        equiv.insert(l_norm, canon.clone());
+                        equiv.insert(r_norm, canon);
+                    }
+                }
+            }
+        }
+    }
+
+    // Return the equivalence class representative of a qualified column ref.
+    // Normalize the input first to expand any aliases.
+    let equiv_rep = |col: &str| -> String {
+        let col_norm = if let Some(dot_pos) = col.rfind('.') {
+            let qualifier = &col[..dot_pos];
+            let col_name = &col[dot_pos + 1..];
+            if let Some(table_name) = analysis.table_aliases.get(qualifier) {
+                format!(
+                    "{}.{}",
+                    bare_column_name(table_name).to_lowercase(),
+                    col_name
+                )
+            } else {
+                col.to_lowercase()
+            }
+        } else {
+            col.to_lowercase()
+        };
+        equiv.get(&col_norm).cloned().unwrap_or(col_norm)
+    };
+
+    // The output name that projects a column equi-equivalent to source.key_col,
+    // or None when that key column is not projected (directly or via equi-join).
     let projected_output = |source: &str, key_col: &str| -> Option<String> {
         let bare = bare_column_name(source).to_lowercase();
         let aliases: Vec<String> = analysis
@@ -3316,21 +3440,50 @@ fn infer_join_passthrough_unique_key(ctx: &BuildContext) -> Option<Vec<String>> 
             .filter(|(_, t)| t.to_lowercase() == source.to_lowercase())
             .map(|(a, _)| a.to_lowercase())
             .collect();
+        let key_qualified = format!("{}.{}", bare, key_col);
+        let key_rep = equiv_rep(&key_qualified);
         for (out_name, expr) in &target_to_expr {
+            // Direct projection: bare column ref from source
             if is_from_table(expr, &bare, &aliases) && bare_column_name(expr) == key_col {
                 return Some(out_name.clone());
+            }
+            // Equi-equivalent projection: output expr is equi-equivalent to the key
+            if is_simple_col_ref(expr) {
+                let expr_rep = equiv_rep(expr);
+                if expr_rep == key_rep {
+                    return Some(out_name.clone());
+                }
             }
         }
         None
     };
 
     // The first sound unique key of `source` that is fully projected as bare
-    // output columns, mapped to those output names. None when no key qualifies.
+    // output columns, mapped to those output names. Also tries registered
+    // group-by key for aggregate IMVs. None when no key qualifies.
     let projected_sound_key = |source: &str| -> Option<Vec<String>> {
+        // Catalog keys (PK, UNIQUE indexes)
         for key in source_sound_unique_keys(source) {
             let mut outs = Vec::with_capacity(key.len());
             let mut all = true;
             for kc in &key {
+                match projected_output(source, kc) {
+                    Some(o) => outs.push(o),
+                    None => {
+                        all = false;
+                        break;
+                    }
+                }
+            }
+            if all {
+                return Some(outs);
+            }
+        }
+        // Registered group-by key (for aggregate IMVs)
+        if let Some(group_key) = source_registered_group_key(source) {
+            let mut outs = Vec::with_capacity(group_key.len());
+            let mut all = true;
+            for kc in &group_key {
                 match projected_output(source, kc) {
                     Some(o) => outs.push(o),
                     None => {
