@@ -3168,6 +3168,7 @@ fn source_equi_join_columns(
 
 /// Fetch all sound unique keys (PRIMARY KEY + NOT-NULL UNIQUE indexes) of
 /// a table. Each key is a Vec of column names in definition order.
+/// Includes __reflex_uk_* indexes created for keyed CTE sub-IMVs.
 #[allow(dead_code)]
 fn source_sound_unique_keys(source: &str) -> Vec<Vec<String>> {
     let mut result = Vec::new();
@@ -3178,7 +3179,7 @@ fn source_sound_unique_keys(source: &str) -> Vec<Vec<String>> {
         result.push(pk);
     }
 
-    // NOT-NULL UNIQUE indexes (via pg_index.indnullsnotdistinct)
+    // UNIQUE indexes: both NOT-NULL (indnullsnotdistinct) and __reflex_uk_* indexes
     let uks: Vec<Vec<String>> = Spi::connect(|client| {
         client
             .select(
@@ -3186,9 +3187,10 @@ fn source_sound_unique_keys(source: &str) -> Vec<Vec<String>> {
                  FROM pg_index ix \
                  JOIN LATERAL unnest(ix.indkey) WITH ORDINALITY AS k(col, n) ON true \
                  JOIN pg_attribute a ON a.attrelid = ix.indrelid AND a.attnum = k.col \
+                 JOIN pg_class idx ON idx.oid = ix.indexrelid \
                  WHERE ix.indrelid = to_regclass($1) AND ix.indisunique \
-                   AND ix.indnullsnotdistinct \
                    AND NOT ix.indisprimary \
+                   AND (ix.indnullsnotdistinct OR idx.relname LIKE '__reflex_uk_%') \
                  GROUP BY ix.indexrelid",
                 None,
                 &[unsafe {
