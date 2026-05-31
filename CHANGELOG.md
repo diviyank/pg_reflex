@@ -1,5 +1,44 @@
 # Changelog
 
+## [1.7.4] - 2026-05-31
+
+Correctness release for **partitioned IMV creation**. The fix is entirely in
+the compiled extension — no catalog schema change and no SQL function signature
+change — so the migration only bumps the installed version. Run
+`ALTER EXTENSION pg_reflex UPDATE TO '1.7.4';` and replace the `.so`.
+
+---
+
+### Fixed
+
+- **Partition-anchor resolution now accepts sources co-partitioned on the join
+  key, and ignores sources partitioned on a *different* column.** This extends
+  the 1.7.3 anchor fix along two axes:
+  - A candidate anchor must be partitioned **on the partition column itself**,
+    not merely partitioned on something. The looser "partitioned at all" check
+    is replaced by the new `source_partitioned_on(source, col)` helper, so a
+    source partitioned on an unrelated column is no longer treated as a
+    candidate.
+  - When several sources are **co-partitioned on the same column** (a JOIN whose
+    key *is* the partition column), their partition layouts align, so any of
+    them is a sound anchor for the child DDL — this is no longer reported as
+    `multiple sources own partition column '<col>' — ambiguous`. This covers the
+    case where *every* owner is a reflex intermediate and there is no base
+    table at all — the `forecast_analysis_view` shape, where
+    `…__cte_forecast_sales FULL JOIN …__cte_history_sales ON dem_plan_id`
+    produces two partitioned `__cte_` owners and zero base owners. Base owners
+    are still preferred when present; otherwise the anchor is chosen
+    deterministically (lexicographically) for stability across rebuilds, and
+    non-anchor co-owners (which own the column natively) fall through to Path B.
+    The error now fires only when **no** source is partitioned on the column.
+
+### Testing
+
+- `pg_test_partition.rs`: `pg_part_copartitioned_full_join_of_cte_intermediates`
+  (two partitioned `__cte_` owners, zero base — the `forecast_analysis_view`
+  branch) plus the co-partitioned base-table cases.
+- Full suite: 1111 tests pass; `cargo clippy` and `cargo fmt` clean.
+
 ## [1.7.3] - 2026-05-31
 
 Correctness release for IMV **creation**. Both fixes are entirely in the

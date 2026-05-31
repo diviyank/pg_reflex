@@ -4,6 +4,18 @@ The full changelog tracks every release. The latest version's headlines are on t
 
 For each version below, see [`CHANGELOG.md`](https://github.com/diviyank/pg_reflex/blob/main/CHANGELOG.md) on GitHub for the canonical text.
 
+## [1.7.4] — 2026-05-31
+
+Correctness release for partitioned IMV creation. Compiled-only fix (no catalog or SQL-signature change). Run `ALTER EXTENSION pg_reflex UPDATE TO '1.7.4';` and replace the `.so`.
+
+**Fixed**
+
+- **Partition-anchor resolution accepts sources co-partitioned on the join key, and ignores sources partitioned on a different column.** Extends the 1.7.3 anchor fix: (1) a candidate anchor must be partitioned *on the partition column itself* (new `source_partitioned_on` helper), so a source partitioned on an unrelated column is no longer a candidate; (2) several sources co-partitioned on the *same* column are no longer "ambiguous" — when the JOIN key is the partition column their layouts align, so any is a sound anchor. This covers the case where every owner is a reflex intermediate with no base table — the `forecast_analysis_view` shape (`…__cte_forecast_sales FULL JOIN …__cte_history_sales ON dem_plan_id` → two partitioned `__cte_` owners, zero base). Base owners are still preferred; otherwise the anchor is chosen deterministically, and non-anchor co-owners fall through to Path B. The error fires only when no source is partitioned on the column.
+
+**Testing**
+
+- 1111 tests pass; `clippy` + `fmt` clean. New: `pg_part_copartitioned_full_join_of_cte_intermediates`.
+
 ## [1.7.3] — 2026-05-31
 
 Correctness release for IMV creation. Two compiled-only fixes (no catalog or SQL-signature change). Run `ALTER EXTENSION pg_reflex UPDATE TO '1.7.3';` and replace the `.so`.

@@ -1491,3 +1491,60 @@ fn pg_part_copartitioned_full_join_right_only_delta_propagates() {
     .expect("right-only delta must reach the IMV");
     assert_eq!(rval.to_string(), "700", "right-only delta propagated to IMV");
 }
+
+/// The forecast_analysis_view shape: the FULL JOIN's two sides are reflex
+/// `__cte_` INTERMEDIATES (not base tables), each a passthrough over a
+/// partitioned source so each inherits the partition column. The top-level
+/// anchor resolution then has TWO partitioned owners and ZERO base owners —
+/// the `owners_on_col` branch, distinct from the base-table case above. This
+/// is the exact branch forecast_analysis_view exercises
+/// (__cte_forecast_sales FULL JOIN __cte_history_sales on dem_plan_id).
+#[pg_test]
+fn pg_part_copartitioned_full_join_of_cte_intermediates() {
+    Spi::run(
+        "CREATE TABLE cti_l (dp_id BIGINT NOT NULL, item INT NOT NULL, lval NUMERIC, \
+         PRIMARY KEY (dp_id, item)) PARTITION BY LIST (dp_id)",
+    )
+    .expect("create left base");
+    Spi::run("CREATE TABLE cti_l_1 PARTITION OF cti_l FOR VALUES IN (1)").expect("l1");
+    Spi::run("CREATE TABLE cti_l_2 PARTITION OF cti_l FOR VALUES IN (2)").expect("l2");
+    Spi::run(
+        "CREATE TABLE cti_r (dp_id BIGINT NOT NULL, item INT NOT NULL, rval NUMERIC, \
+         PRIMARY KEY (dp_id, item)) PARTITION BY LIST (dp_id)",
+    )
+    .expect("create right base");
+    Spi::run("CREATE TABLE cti_r_1 PARTITION OF cti_r FOR VALUES IN (1)").expect("r1");
+    Spi::run("CREATE TABLE cti_r_2 PARTITION OF cti_r FOR VALUES IN (2)").expect("r2");
+
+    Spi::run("INSERT INTO cti_l VALUES (1, 1, 10), (1, 2, 20), (2, 1, 30)").expect("seed l");
+    Spi::run("INSERT INTO cti_r VALUES (1, 1, 100), (1, 3, 300), (2, 1, 300)").expect("seed r");
+
+    // Each CTE is a passthrough over a partitioned base, so decomposition makes
+    // `cti_av__cte_lc` / `cti_av__cte_rc` partitioned sub-IMVs; the top-level
+    // FULL JOIN then sees two partitioned `__cte_` owners and no base owner.
+    let msg = Spi::get_one::<&str>(
+        "SELECT create_reflex_ivm( \
+            'cti_av', \
+            'WITH lc AS (SELECT dp_id, item, lval FROM cti_l), \
+                  rc AS (SELECT dp_id, item, rval FROM cti_r) \
+             SELECT COALESCE(l.dp_id, r.dp_id) AS dp_id, \
+                    COALESCE(l.item, r.item) AS item, \
+                    l.lval, r.rval \
+             FROM lc l FULL JOIN rc r \
+               ON l.dp_id = r.dp_id AND l.item = r.item', \
+            'dp_id,item', 'UNLOGGED', 'DEFERRED', NULL, \
+            ARRAY['dp_id'] \
+         )",
+    )
+    .expect("create call")
+    .expect("create result");
+    assert!(
+        !msg.starts_with("ERROR"),
+        "co-partitioned FULL JOIN of CTE intermediates should create, got: {msg}"
+    );
+
+    let n = Spi::get_one::<i64>("SELECT count(*) FROM cti_av WHERE dp_id = 1")
+        .expect("count q")
+        .expect("count v");
+    assert_eq!(n, 3, "dp_id=1 must keep matched + left-only + right-only rows");
+}
