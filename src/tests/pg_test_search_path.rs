@@ -608,3 +608,56 @@ fn test_drop_removes_public_qualified_per_source_fns() {
     ).unwrap().unwrap();
     assert_eq!(after, 0, "drop must remove the public per-source fns, {after} left");
 }
+
+/// Tasks 1-3 commit: the deferred-flush function is created as `public.__reflex_deferred_flush_fn`,
+/// the single constraint trigger `__reflex_deferred_flush_trigger` on `public.__reflex_deferred_pending`
+/// binds the public copy, and the function self-registers as a `pg_reflex` extension member.
+/// This test asserts that when multiple DEFERRED IMVs are created under different schemas,
+/// only ONE public `__reflex_deferred_flush_fn` exists as an extension member, and the
+/// shared constraint trigger binds the public copy.
+#[pg_test]
+fn test_deferred_imv_under_two_schemas_keeps_single_public_member_flush_fn() {
+    for sch in ["s_one", "s_two"] {
+        Spi::run(&format!("CREATE SCHEMA IF NOT EXISTS {sch}")).unwrap();
+        Spi::run(&format!("SET search_path = {sch}, public")).unwrap();
+        Spi::run(&format!("CREATE TABLE {sch}.t (id INT PRIMARY KEY, g TEXT, v INT)")).unwrap();
+        Spi::run(&format!("INSERT INTO {sch}.t VALUES (1,'a',10)")).unwrap();
+        crate::create_reflex_ivm(
+            &format!("{sch}.mv"),
+            &format!("SELECT g, sum(v) AS total FROM {sch}.t GROUP BY g"),
+            None,
+            None,
+            Some("DEFERRED"),
+            None,
+        );
+    }
+    Spi::run("SET search_path = public").unwrap();
+
+    let copies: i64 = Spi::get_one(
+        "SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace \
+         WHERE p.proname = '__reflex_deferred_flush_fn'",
+    ).unwrap().unwrap();
+    assert_eq!(copies, 1, "expected one flush fn copy, got {copies}");
+
+    let schema: String = Spi::get_one(
+        "SELECT n.nspname::text FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace \
+         WHERE p.proname = '__reflex_deferred_flush_fn'",
+    ).unwrap().unwrap();
+    assert_eq!(schema, "public", "flush fn must be in public schema");
+
+    let is_member: bool = Spi::get_one(
+        "SELECT EXISTS(SELECT 1 FROM pg_depend d \
+           JOIN pg_extension e ON e.oid=d.refobjid AND e.extname='pg_reflex' \
+           JOIN pg_proc p ON p.oid=d.objid \
+           JOIN pg_namespace n ON n.oid=p.pronamespace \
+           WHERE d.deptype='e' AND p.proname='__reflex_deferred_flush_fn' AND n.nspname='public')",
+    ).unwrap().unwrap();
+    assert!(is_member, "flush fn must be a pg_reflex extension member");
+
+    let trig_fn_schema: String = Spi::get_one(
+        "SELECT pn.nspname::text FROM pg_trigger t \
+           JOIN pg_proc p ON p.oid=t.tgfoid JOIN pg_namespace pn ON pn.oid=p.pronamespace \
+           WHERE t.tgname='__reflex_deferred_flush_trigger' AND NOT t.tgisinternal",
+    ).unwrap().unwrap();
+    assert_eq!(trig_fn_schema, "public", "trigger must bind the public flush fn");
+}
