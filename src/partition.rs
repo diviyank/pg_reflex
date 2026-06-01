@@ -700,7 +700,29 @@ pub(crate) fn reflex_sync_partitions_impl(view_name: &str, drop_orphans: bool) -
         let src_children = list_partition_children(client, &anchor);
         let int_parent = intermediate_table_name(view_name);
         let tgt_parent = quote_identifier(view_name);
-        let int_children = list_partition_children(client, &int_parent);
+        // Passthrough IMVs (no aggregation / ivm-count) have no intermediate
+        // table — `intermediate_column_spec` returns None at create time, so
+        // `__reflex_intermediate_<view>` never exists. Creating intermediate
+        // partition children of an absent parent raises 42P01; skip all
+        // intermediate-child management when the relation is absent, mirroring
+        // the `end_query.is_empty()` guard in execute_partition_swap_for_child.
+        let has_intermediate: bool = client
+            .select(
+                "SELECT to_regclass($1) IS NOT NULL AS present",
+                Some(1),
+                &[unsafe {
+                    DatumWithOid::new(int_parent.clone(), PgBuiltInOids::TEXTOID.oid().value())
+                }],
+            )
+            .map_err(|e| format!("sync: intermediate existence probe failed: {}", e))?
+            .next()
+            .and_then(|r| r.get_by_name::<bool, _>("present").ok().flatten())
+            .unwrap_or(false);
+        let int_children = if has_intermediate {
+            list_partition_children(client, &int_parent)
+        } else {
+            Vec::new()
+        };
         let tgt_children = list_partition_children(client, &tgt_parent);
 
         // Build name-keyed views (using the IMV-side bare name format).
@@ -733,7 +755,7 @@ pub(crate) fn reflex_sync_partitions_impl(view_name: &str, drop_orphans: bool) -
             let int_name = intermediate_child_name(view_name, &src.bare_name);
             let tgt_name = target_child_name(view_name, &src.bare_name);
             let (int_ddl, tgt_ddl) = build_partition_child_ddl_pair(view_name, src, unlogged);
-            if !int_have.contains(&int_name) {
+            if has_intermediate && !int_have.contains(&int_name) {
                 client
                     .update(&int_ddl, None, &[])
                     .map_err(|e| format!("sync: failed to create intermediate child: {}", e))?;

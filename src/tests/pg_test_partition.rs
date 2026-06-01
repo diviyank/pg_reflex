@@ -287,6 +287,73 @@ fn pg_part_sync_partitions_adds_new_child() {
     assert!(msg.contains("+0 target"),       "manual sync should be a no-op, got: {msg}");
 }
 
+/// Regression: a partitioned PASSTHROUGH IMV (no aggregation, needs_ivm_count
+/// = false) has NO intermediate table — `intermediate_column_spec` returns
+/// None, so `__reflex_intermediate_<view>` is never created. Both the
+/// create-time child loop and `reflex_sync_partitions` must skip every
+/// intermediate-child DDL; otherwise they raise `relation
+/// "…__reflex_intermediate_<view>" does not exist`. Mirrors prod
+/// alp.sop_forecast_view, where ALTER TABLE … DETACH/ATTACH PARTITION failed.
+#[pg_test]
+fn pg_part_passthrough_imv_without_intermediate_syncs_target_only() {
+    Spi::run("CREATE TABLE part_pt_s (dem_plan_id BIGINT, product_id BIGINT, qty NUMERIC) PARTITION BY LIST (dem_plan_id)").expect("create s");
+    Spi::run("CREATE TABLE part_pt_s_p1 PARTITION OF part_pt_s FOR VALUES IN (1)").expect("p1");
+    Spi::run("INSERT INTO part_pt_s VALUES (1, 100, 5)").expect("seed");
+
+    // Passthrough IMV (no GROUP BY/aggregate) with a sound unique key → no
+    // ivm-count intermediate. The source already has a partition at create
+    // time, so the create-time child loop runs against the (absent) intermediate.
+    Spi::run(
+        "SELECT create_reflex_ivm( \
+            'part_pt_v', \
+            'SELECT dem_plan_id, product_id, qty FROM part_pt_s', \
+            'dem_plan_id,product_id', NULL, NULL, NULL, \
+            ARRAY['dem_plan_id'] \
+         )",
+    )
+    .expect("create passthrough partitioned IMV");
+
+    let int_tables = Spi::get_one::<i64>(
+        "SELECT count(*) FROM pg_class WHERE relname = '__reflex_intermediate_part_pt_v'",
+    )
+    .expect("q")
+    .expect("c");
+    assert_eq!(int_tables, 0, "passthrough IMV must have no intermediate table");
+
+    let children_after_create = Spi::get_one::<i64>(
+        "SELECT count(*) FROM pg_inherits WHERE inhparent = 'part_pt_v'::regclass",
+    )
+    .expect("q")
+    .expect("c");
+    assert_eq!(
+        children_after_create, 1,
+        "target must mirror the source partition present at create time"
+    );
+
+    // Adding a source partition fires the ddl_command_end auto-sync.
+    Spi::run("CREATE TABLE part_pt_s_p2 PARTITION OF part_pt_s FOR VALUES IN (7057)")
+        .expect("attach p2 triggers auto-sync without error");
+
+    let children_after_attach = Spi::get_one::<i64>(
+        "SELECT count(*) FROM pg_inherits WHERE inhparent = 'part_pt_v'::regclass",
+    )
+    .expect("q")
+    .expect("c");
+    assert_eq!(
+        children_after_attach, 2,
+        "auto-sync must mirror the new source partition onto the target"
+    );
+
+    // Explicit sync is clean and idempotent — no intermediate work attempted.
+    let msg = Spi::get_one::<String>("SELECT reflex_sync_partitions('part_pt_v')")
+        .expect("sync")
+        .expect("msg");
+    assert_eq!(
+        msg, "sync: +0 intermediate, +0 target",
+        "manual sync must be a no-op, got: {msg}"
+    );
+}
+
 #[pg_test]
 fn pg_part_sync_partitions_drops_orphans_by_default() {
     Spi::run("CREATE TABLE part_drop_a (id BIGINT, region TEXT NOT NULL, amount NUMERIC) PARTITION BY LIST (region)").expect("create");
