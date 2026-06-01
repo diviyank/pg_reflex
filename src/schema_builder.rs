@@ -807,7 +807,7 @@ pub fn build_deferred_trigger_ddls(source_table: &str, source_columns: &[String]
 ///
 /// `fn_name` must be the already-`safe_identifier`-truncated bare name (≤63
 /// chars, no special chars), matching what `pg_proc.proname` stores.
-fn member_register_ddl(fn_name: &str) -> String {
+pub(crate) fn member_register_ddl(fn_name: &str) -> String {
     format!(
         "DO $reflex_member$ \
          BEGIN \

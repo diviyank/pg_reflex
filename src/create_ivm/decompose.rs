@@ -332,6 +332,13 @@ pub(crate) fn install_union_mirror_triggers(
         client.update(stmt, None, &[]).unwrap_or_report();
     }
 
+    // Register the newly created functions as pg_reflex extension members
+    for fn_name in [&fn_ins, &fn_del, &fn_upd] {
+        client
+            .update(&crate::schema_builder::member_register_ddl(fn_name), None, &[])
+            .unwrap_or_report();
+    }
+
     let trg_ins = format!("__reflex_union_mirror_ins_{safe_wrapper}_{operand_idx}");
     let trg_del = format!("__reflex_union_mirror_del_{safe_wrapper}_{operand_idx}");
     let trg_upd = format!("__reflex_union_mirror_upd_{safe_wrapper}_{operand_idx}");

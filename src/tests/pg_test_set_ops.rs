@@ -536,3 +536,40 @@ fn test_except_delete_trigger() {
         1
     );
 }
+
+// ========================================================================
+// Extension membership tests
+// ========================================================================
+
+/// Verify all UNION mirror trigger functions are extension members
+#[pg_test]
+fn test_union_mirror_fns_are_extension_members() {
+    Spi::run("CREATE TABLE umem_eu (id SERIAL, city TEXT, amount NUMERIC)").expect("create");
+    Spi::run("CREATE TABLE umem_us (id SERIAL, city TEXT, amount NUMERIC)").expect("create");
+    Spi::run("INSERT INTO umem_eu (city, amount) VALUES ('Paris', 100)").expect("seed");
+    Spi::run("INSERT INTO umem_us (city, amount) VALUES ('NYC', 200)").expect("seed");
+
+    // Use UNION in a CTE so materialize_as_table=true and union-mirror functions are created
+    crate::create_reflex_ivm(
+        "umem_view",
+        "WITH um AS (SELECT city, amount FROM umem_eu UNION ALL SELECT city, amount FROM umem_us) \
+         SELECT * FROM um",
+        None, None, None,
+        None,
+    );
+
+    // every public __reflex_union_mirror_* fn must exist AND be a pg_reflex member
+    let total: i64 = Spi::get_one::<i64>(
+        "SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace \
+         WHERE n.nspname='public' AND p.proname LIKE '__reflex_union_mirror%'",
+    ).expect("q").expect("c");
+    assert!(total >= 3, "expected >=3 union-mirror fns, got {total}");
+
+    let non_members: i64 = Spi::get_one::<i64>(
+        "SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace \
+         WHERE n.nspname='public' AND p.proname LIKE '__reflex_union_mirror%' \
+           AND NOT EXISTS (SELECT 1 FROM pg_depend d JOIN pg_extension e ON e.oid=d.refobjid \
+                WHERE e.extname='pg_reflex' AND d.objid=p.oid AND d.deptype='e')",
+    ).expect("q").expect("c");
+    assert_eq!(non_members, 0, "all union-mirror fns must be pg_reflex members, {non_members} are not");
+}
