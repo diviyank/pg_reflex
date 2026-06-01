@@ -661,3 +661,103 @@ fn test_deferred_imv_under_two_schemas_keeps_single_public_member_flush_fn() {
     ).unwrap().unwrap();
     assert_eq!(trig_fn_schema, "public", "trigger must bind the public flush fn");
 }
+
+/// 1.8.0 self-heal migration: consolidates per-schema duplicate copies of
+/// __reflex_deferred_flush_fn (created when IMVs were built under non-public
+/// search_path) into a single canonical public copy. Test reproduces a split
+/// state and validates the inline heal SQL logic.
+#[pg_test]
+fn test_self_heal_consolidates_split_flush_fn() {
+    // Ensure baseline deferred infra exists (public flush fn + trigger + queue).
+    for stmt in crate::schema_builder::build_deferred_flush_ddl() {
+        Spi::run(&stmt).unwrap();
+    }
+
+    // Reproduce split state: a non-public copy bound to the live trigger, non-member.
+    Spi::run("CREATE SCHEMA IF NOT EXISTS s_heal").unwrap();
+    Spi::run(
+        "CREATE OR REPLACE FUNCTION s_heal.__reflex_deferred_flush_fn() RETURNS TRIGGER AS $fn$ \
+         BEGIN PERFORM public.reflex_flush_deferred(NEW.source_table); RETURN NULL; END; \
+         $fn$ LANGUAGE plpgsql",
+    ).unwrap();
+    Spi::run("DROP TRIGGER IF EXISTS __reflex_deferred_flush_trigger ON public.__reflex_deferred_pending")
+        .unwrap();
+    Spi::run(
+        "CREATE CONSTRAINT TRIGGER __reflex_deferred_flush_trigger \
+         AFTER INSERT ON public.__reflex_deferred_pending DEFERRABLE INITIALLY DEFERRED \
+         FOR EACH ROW EXECUTE FUNCTION s_heal.__reflex_deferred_flush_fn()",
+    ).unwrap();
+
+    // Verify split state: two copies exist, one non-public.
+    let copies_before: i64 = Spi::get_one(
+        "SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace \
+         WHERE p.proname='__reflex_deferred_flush_fn'",
+    ).unwrap().unwrap();
+    assert_eq!(copies_before, 2, "expected two copies before heal");
+
+    // --- Heal SQL (mirror of sql/pg_reflex--1.7.7--1.8.0.sql steps 1-3 + 5) ---
+
+    // Step 1: Adopt-if-orphan the public copy so step 2's CREATE OR REPLACE is allowed.
+    Spi::run(
+        "DO $heal$ BEGIN \
+           IF EXISTS (SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace \
+                      WHERE p.proname='__reflex_deferred_flush_fn' AND n.nspname='public') \
+              AND NOT EXISTS (SELECT 1 FROM pg_depend d \
+                JOIN pg_extension e ON e.oid=d.refobjid AND e.extname='pg_reflex' \
+                JOIN pg_proc p ON p.oid=d.objid JOIN pg_namespace n ON n.oid=p.pronamespace \
+                WHERE d.deptype='e' AND p.proname='__reflex_deferred_flush_fn' AND n.nspname='public') \
+           THEN ALTER EXTENSION pg_reflex ADD FUNCTION public.__reflex_deferred_flush_fn(); \
+           END IF; END $heal$;",
+    ).unwrap();
+
+    // Step 2: Canonical public flush fn (auto-members via CREATE in extension).
+    Spi::run(
+        "CREATE OR REPLACE FUNCTION public.__reflex_deferred_flush_fn() RETURNS TRIGGER AS $fn$ \
+         BEGIN PERFORM public.reflex_flush_deferred(NEW.source_table); RETURN NULL; END; \
+         $fn$ LANGUAGE plpgsql",
+    ).unwrap();
+
+    // Step 3: Re-point the single live trigger at the public copy.
+    Spi::run("DROP TRIGGER IF EXISTS __reflex_deferred_flush_trigger ON public.__reflex_deferred_pending")
+        .unwrap();
+    Spi::run(
+        "CREATE CONSTRAINT TRIGGER __reflex_deferred_flush_trigger \
+         AFTER INSERT ON public.__reflex_deferred_pending DEFERRABLE INITIALLY DEFERRED \
+         FOR EACH ROW EXECUTE FUNCTION public.__reflex_deferred_flush_fn()",
+    ).unwrap();
+
+    // Step 5: Orphan sweep — drop every __reflex_* function in a non-public schema bound
+    // to no live trigger (the now-unbound per-schema copies).
+    Spi::run(
+        "DO $sweep$ DECLARE r RECORD; BEGIN \
+           FOR r IN SELECT n.nspname AS schema, p.proname AS fn FROM pg_proc p \
+             JOIN pg_namespace n ON n.oid=p.pronamespace \
+             WHERE p.proname LIKE '__reflex\\_%' AND n.nspname <> 'public' \
+               AND NOT EXISTS (SELECT 1 FROM pg_trigger t WHERE t.tgfoid=p.oid AND NOT t.tgisinternal) \
+           LOOP EXECUTE format('DROP FUNCTION IF EXISTS %I.%I()', r.schema, r.fn); END LOOP; \
+         END $sweep$;",
+    ).unwrap();
+
+    // --- Assert clean state ---
+    let copies_after: i64 = Spi::get_one(
+        "SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace \
+         WHERE p.proname='__reflex_deferred_flush_fn'",
+    ).unwrap().unwrap();
+    assert_eq!(copies_after, 1, "expected single flush fn after heal, got {copies_after}");
+
+    let trig_schema: String = Spi::get_one(
+        "SELECT pn.nspname::text FROM pg_trigger t JOIN pg_proc p ON p.oid=t.tgfoid \
+         JOIN pg_namespace pn ON pn.oid=p.pronamespace \
+         WHERE t.tgname='__reflex_deferred_flush_trigger' AND NOT t.tgisinternal",
+    ).unwrap().unwrap();
+    assert_eq!(trig_schema, "public", "trigger must bind the public flush fn after heal");
+
+    let is_member: bool = Spi::get_one(
+        "SELECT EXISTS(SELECT 1 FROM pg_depend d \
+           JOIN pg_extension e ON e.oid=d.refobjid AND e.extname='pg_reflex' \
+           JOIN pg_proc p ON p.oid=d.objid \
+           JOIN pg_namespace n ON n.oid=p.pronamespace \
+           WHERE d.deptype='e' AND p.proname='__reflex_deferred_flush_fn' AND n.nspname='public')",
+    ).unwrap().unwrap();
+    assert!(is_member, "flush fn must be extension member after heal");
+}
