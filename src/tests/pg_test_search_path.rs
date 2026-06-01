@@ -564,3 +564,47 @@ fn pg_test_bare_name_under_nonpublic_search_path_warns_and_creates() {
     .expect("v");
     assert_eq!(int_schema, "gtnt");
 }
+
+/// Drop must remove per-source trigger functions qualified with public. schema.
+/// Tasks 1-3 made per-source trigger functions be created as
+/// `public.__reflex_{ins,del,upd,trunc}_trigger_on_<safe_source>`. The DROP
+/// path must use the same qualification so that under a non-public search_path,
+/// it actually finds and drops the `public.` copies (not just unqualified
+/// names that resolve elsewhere or not at all).
+#[pg_test]
+fn test_drop_removes_public_qualified_per_source_fns() {
+    Spi::run("CREATE SCHEMA s_drop").unwrap();
+    Spi::run("CREATE TABLE s_drop.orders (id INT PRIMARY KEY, amount INT)").unwrap();
+    Spi::run("INSERT INTO s_drop.orders VALUES (1, 10)").unwrap();
+    crate::create_reflex_ivm(
+        "s_drop.orders_mv",
+        "SELECT id, amount FROM s_drop.orders",
+        None,
+        None,
+        None,
+        None,
+    );
+
+    // Check that per-source trigger functions exist in public schema.
+    let before: i64 = Spi::get_one(
+        "SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace \
+         WHERE n.nspname='public' AND p.proname LIKE '__reflex_%trigger_on_s_drop_orders'",
+    ).unwrap().unwrap();
+    assert!(before >= 1, "expected public per-source fns after create, got {before}");
+
+    // Now restrict search_path to s_drop only (excludes public).
+    // The DROP statements will run under this search_path.
+    Spi::run("SET search_path = s_drop").unwrap();
+
+    crate::drop_reflex_ivm("s_drop.orders_mv");
+
+    // Reset to a path that includes public so the query works.
+    Spi::run("SET search_path = public, s_drop").unwrap();
+
+    // Verify all per-source trigger functions in public were removed.
+    let after: i64 = Spi::get_one(
+        "SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace \
+         WHERE n.nspname='public' AND p.proname LIKE '__reflex_%trigger_on_s_drop_orders'",
+    ).unwrap().unwrap();
+    assert_eq!(after, 0, "drop must remove the public per-source fns, {after} left");
+}
