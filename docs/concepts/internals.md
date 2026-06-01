@@ -23,7 +23,7 @@ The trigger body loops over `__reflex_ivm_reference` and computes the delta per 
 
 ## The dispatch DO block
 
-Every grouped non-MIN/MAX flush is wrapped in a per-IMV `DO` block that picks one of two paths based on selectivity (`trigger.rs:1051`):
+Every grouped non-MIN/MAX flush is wrapped in a per-IMV `DO` block that picks one of two paths based on selectivity (`src/trigger/dispatch.rs` · `build_high_selectivity_dispatch_sql`):
 
 ```sql
 SELECT count(*) INTO _aff FROM <affected>;
@@ -39,7 +39,7 @@ END IF;
 
 The crossover defaults to `0.5` from 1.4.6 onward. Setting it lower routes more workloads through the rebuild branch; setting it higher keeps everything incremental at the cost of pathological in-place updates on bulk filter flips. Per-IMV tuning via `reflex_set_wipe_threshold` is preferred — the right threshold is shape-dependent (see [optimization](../performance/optimization.md)).
 
-The `ANALYZE intermediate` between MERGE and target sync is non-optional. The MERGE shifts the `__ivm_count` distribution; without fresh stats the planner has picked NestedLoop+SeqScan plans for the target DELETE that ran for 12+ minutes on 100 K groups. Cost of the ANALYZE itself: ~150 ms on the SOP-forecast shape (`trigger.rs:1103-1110`).
+The `ANALYZE intermediate` between MERGE and target sync is non-optional. The MERGE shifts the `__ivm_count` distribution; without fresh stats the planner has picked NestedLoop+SeqScan plans for the target DELETE that ran for 12+ minutes on 100 K groups. Cost of the ANALYZE itself: ~150 ms on the SOP-forecast shape (`src/trigger/dispatch.rs`).
 
 ## Pre-scratch dispatch — Path B and Path C
 
@@ -236,21 +236,21 @@ release; grep the symbol or hint to land on the current location.
 | Topic | File · symbol / search hint |
 |---|---|
 | Empty-delta short-circuit | `src/schema_builder.rs` trigger body |
-| Per-source DEFERRED-flush serialisation lock | `src/trigger.rs` · `reflex_flush_deferred` (lock key `reflex_flush:<source>`) |
-| Per-IMV advisory lock (2-arg hash form) | `src/trigger.rs` · search `hashtext(reverse(` |
-| MERGE codegen | `src/trigger.rs` · `build_merge_sql` |
-| Dispatch DO block | `src/trigger.rs` · `build_high_selectivity_dispatch_sql` |
-| Self-join full-refresh branch | `src/trigger.rs` · `self_join_full_refresh_stmts` |
-| Bulk-INSERT / Bulk-DELETE paths | `src/trigger.rs` · `push_bulk_insert_and_affected`, `push_bulk_delete_via_transition` |
+| Per-source DEFERRED-flush serialisation lock | `src/trigger/deferred.rs` · `reflex_flush_deferred` (lock key `reflex_flush:<source>`) |
+| Per-IMV advisory lock (2-arg hash form) | `src/trigger/deferred.rs` · search `hashtext(reverse(` |
+| MERGE codegen | `src/trigger/merge.rs` · `build_merge_sql` |
+| Dispatch DO block | `src/trigger/dispatch.rs` · `build_high_selectivity_dispatch_sql` |
+| Self-join full-refresh branch | `src/trigger/ops.rs` · `self_join_full_refresh_stmts` |
+| Bulk-INSERT / Bulk-DELETE paths | `src/trigger/dispatch.rs` · `push_bulk_insert_and_affected`, `push_bulk_delete_via_transition` |
 | Path B pre-scratch dispatch | `src/schema_builder.rs` trigger body (search `Path B: dispatching`) |
 | Path C smart bulk-INSERT | `src/schema_builder.rs` · `path_c_for_update` in `build_trigger_ddls` |
-| Path C EXPLAIN dispatch | `src/trigger.rs` · `reflex_build_path_c_explain_sql` |
-| TRUNCATE codegen | `src/trigger.rs` · `reflex_build_truncate_sql` |
-| `ignore_sources` runtime skip | `sql/trigger_body.plpgsql.in` + `sql/deferred_trigger_*.plpgsql.in` (search `ignored_sources`); flush side in `src/trigger.rs` · `reflex_flush_deferred` |
+| Path C EXPLAIN dispatch | `src/trigger/mod.rs` · `reflex_build_path_c_explain_sql` |
+| TRUNCATE codegen | `src/trigger/mod.rs` · `reflex_build_truncate_sql` |
+| `ignore_sources` runtime skip | `sql/trigger_body.plpgsql.in` + `sql/deferred_trigger_*.plpgsql.in` (search `ignored_sources`); flush side in `src/trigger/deferred.rs` · `reflex_flush_deferred` |
 | `reflex_reconcile` TRUNCATE+INSERT | `src/reconcile.rs` · `reflex_reconcile` |
 | Source-join-keys metadata | `src/aggregation.rs` (`source_join_keys` on `AggregationPlan`) |
 | Partitioning module (introspect, sync, reconcile_partition) | `src/partition.rs` |
-| Partition validation + auto-mirror | `src/create_ivm.rs` (`Partitioning resolution` block) |
+| Partition validation + auto-mirror | `src/create_ivm/mod.rs` (`resolve_partitioning`) |
 | PARTITION BY clause in intermediate/target DDL | `src/schema_builder.rs:build_intermediate_table_ddl`, `:build_target_table_ddl` |
 
 [Delta processing :material-arrow-right-bold:](delta-processing.md){ .md-button }

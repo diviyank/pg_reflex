@@ -814,11 +814,15 @@ src/
   aggregation.rs        -- Maps user aggregates to sufficient statistics
   query_decomposer.rs   -- Generates base_query (source->intermediate) and end_query (intermediate->target)
   schema_builder.rs     -- DDL generation: tables, indexes, triggers
-  trigger.rs            -- Delta processing: MERGE-based delta application, targeted refresh
+  create_ivm/           -- IMV creation pipeline (mod, decompose, soundness, admin)
+  trigger/              -- Delta processing engine (mod dispatcher, merge, dispatch, ops, deferred)
   bin/pgrx_embed.rs     -- pgrx binary entry point
 benchmarks/             -- SQL benchmark scripts (1K to 1M rows)
 tests/pg_regress/       -- PostgreSQL regression tests
 ```
+
+See [`ARCHITECTURE.md`](ARCHITECTURE.md) for a navigation map and
+`docs/contributing/architecture-tour.md` for the full code architecture.
 
 ## License
 
