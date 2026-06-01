@@ -792,15 +792,21 @@ pub fn build_deferred_flush_ddl() -> Vec<String> {
             batch_ts TIMESTAMPTZ DEFAULT now()\
          )"
         .to_string(),
-        // Constraint trigger function: flushes all pending deltas at COMMIT
+        // Constraint trigger function: at COMMIT flush only the source this
+        // transaction staged. The trigger is FOR EACH ROW, so NEW.source_table
+        // is precisely the pending row this transaction inserted — flushing it
+        // (rather than scanning the shared, cross-schema pending queue) keeps
+        // deferred maintenance transaction-local: a commit in one schema no
+        // longer flushes, advisory-locks, or TRUNCATE-locks the staging tables
+        // of sources owned by other, independent schemas. The per-source
+        // advisory lock inside reflex_flush_deferred makes the redundant fires
+        // for a source touched by several statements collapse into one
+        // effective flush, and the cross-source guard still sees every source
+        // this transaction staged (all pending rows are present at COMMIT
+        // before any flush deletes its own).
         "CREATE OR REPLACE FUNCTION __reflex_deferred_flush_fn() RETURNS TRIGGER AS $fn$ \
-         DECLARE _src RECORD; \
          BEGIN \
-           FOR _src IN \
-             SELECT DISTINCT source_table FROM public.__reflex_deferred_pending \
-           LOOP \
-             PERFORM public.reflex_flush_deferred(_src.source_table); \
-           END LOOP; \
+           PERFORM public.reflex_flush_deferred(NEW.source_table); \
            RETURN NULL; \
          END; \
          $fn$ LANGUAGE plpgsql"

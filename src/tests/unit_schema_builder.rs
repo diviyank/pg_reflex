@@ -194,6 +194,30 @@ fn test_trigger_ddls_format() {
 }
 
 #[test]
+fn test_deferred_flush_dispatch_is_transaction_local() {
+    // Regression: the COMMIT-time dispatcher is a FOR EACH ROW constraint
+    // trigger, so NEW.source_table is exactly the source the *current*
+    // transaction staged. It must flush only that source. The previous body
+    // looped `SELECT DISTINCT source_table` over the shared, cross-schema
+    // public.__reflex_deferred_pending queue, so a commit in one schema would
+    // flush — and advisory-lock + TRUNCATE-lock the staging table of — sources
+    // owned by other, independent schemas.
+    let ddls = build_deferred_flush_ddl();
+    let dispatch_fn = ddls
+        .iter()
+        .find(|d| d.contains("FUNCTION __reflex_deferred_flush_fn"))
+        .expect("deferred flush function DDL present");
+    assert!(
+        dispatch_fn.contains("NEW.source_table"),
+        "dispatcher must flush only NEW.source_table: {dispatch_fn}"
+    );
+    assert!(
+        !dispatch_fn.contains("SELECT DISTINCT source_table"),
+        "dispatcher must not scan the global pending queue: {dispatch_fn}"
+    );
+}
+
+#[test]
 fn test_indexes_ddl_multiple_group_by() {
     let mut plan = sample_plan();
     plan.group_by_columns = vec!["city".to_string(), "year".to_string()];

@@ -1401,13 +1401,18 @@ fn pg_test_deferred_empty_stale_staging_with_column_set_drift_recreated() {
     assert_imv_correct("setdrift_v2", fresh);
 }
 
-/// Mirrors `__reflex_deferred_flush_fn` at COMMIT, including re-queued cascades:
-/// loops over DISTINCT pending sources and flushes each, repeating until the
-/// queue drains. `reconcile(C)` (fired by the cross-source guard) re-enqueues C
-/// via its downstream's staging trigger, whose flush in turn feeds D. The
-/// `SELECT DISTINCT` has no `ORDER BY` — matching the orchestrator's
-/// nondeterministic source ordering. The 10_000 iteration cap converts a
-/// non-converging queue into a loud failure instead of a hung test.
+/// Test-time stand-in for the COMMIT-time deferred flush: pgrx tests run inside
+/// a single never-committed transaction, so the real `__reflex_deferred_flush_fn`
+/// constraint trigger never fires. This drains the whole queue instead — looping
+/// over DISTINCT pending sources and flushing each, repeating until empty. Note
+/// the production dispatcher flushes only its own `NEW.source_table` per fire
+/// (transaction-local, see `build_deferred_flush_ddl`); draining every source is
+/// fine here because a test transaction owns all of them. Repetition handles
+/// re-queued cascades: `reconcile(C)` (fired by the cross-source guard)
+/// re-enqueues C via its downstream's staging trigger, whose flush in turn feeds
+/// D. The `SELECT DISTINCT` has no `ORDER BY`, exercising nondeterministic source
+/// ordering. The 10_000 iteration cap converts a non-converging queue into a loud
+/// failure instead of a hung test.
 fn drain_deferred_pending() {
     use pgrx::pg_sys::panic::ErrorReportable;
     for _ in 0..10_000 {
