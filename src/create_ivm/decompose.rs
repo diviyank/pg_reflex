@@ -332,10 +332,20 @@ pub(crate) fn install_union_mirror_triggers(
         client.update(stmt, None, &[]).unwrap_or_report();
     }
 
-    // Register the newly created functions as pg_reflex extension members
+    // Register the newly created functions as pg_reflex extension members.
+    // Pass the RAW name (not `safe_identifier`): these fns are created above
+    // with the raw `fn_*` name, so for names >63 chars PostgreSQL truncates them
+    // naively to the first 63 chars. The ADD inside member_register_ddl truncates
+    // the same naive way, so it resolves to the same function. `safe_identifier`
+    // would instead produce a `<54chars>_<hash>` name that diverges from the
+    // stored one and break registration — do NOT wrap these in it.
     for fn_name in [&fn_ins, &fn_del, &fn_upd] {
         client
-            .update(&crate::schema_builder::member_register_ddl(fn_name), None, &[])
+            .update(
+                &crate::schema_builder::member_register_ddl(fn_name),
+                None,
+                &[],
+            )
             .unwrap_or_report();
     }
 
