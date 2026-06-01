@@ -205,7 +205,7 @@ fn test_deferred_flush_dispatch_is_transaction_local() {
     let ddls = build_deferred_flush_ddl();
     let dispatch_fn = ddls
         .iter()
-        .find(|d| d.contains("FUNCTION __reflex_deferred_flush_fn"))
+        .find(|d| d.contains("FUNCTION public.__reflex_deferred_flush_fn"))
         .expect("deferred flush function DDL present");
     assert!(
         dispatch_fn.contains("NEW.source_table"),
@@ -758,5 +758,23 @@ fn test_target_table_unqualified_max_still_works() {
         ddl.contains("\"max_ts\" TIMESTAMPTZ"),
         "target column max_ts (unqualified) must resolve to TIMESTAMPTZ: {}",
         ddl
+    );
+}
+
+#[test]
+fn test_flush_fn_is_public_qualified_and_member_registered() {
+    let ddls = crate::schema_builder::build_deferred_flush_ddl();
+    let joined = ddls.join("\n");
+    assert!(
+        joined.contains("CREATE OR REPLACE FUNCTION public.__reflex_deferred_flush_fn()"),
+        "flush fn must be created in public: {joined}"
+    );
+    assert!(
+        joined.contains("EXECUTE FUNCTION public.__reflex_deferred_flush_fn()"),
+        "constraint trigger must bind the public copy: {joined}"
+    );
+    assert!(
+        joined.contains("ALTER EXTENSION pg_reflex ADD FUNCTION public.__reflex_deferred_flush_fn()"),
+        "flush fn must self-register as an extension member: {joined}"
     );
 }

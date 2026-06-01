@@ -778,6 +778,40 @@ pub fn build_deferred_trigger_ddls(source_table: &str, source_columns: &[String]
     vec![ins_ddl, del_ddl, upd_ddl, trunc_ddl]
 }
 
+/// DDL that registers `public.<fn_name>` as a member of the pg_reflex extension.
+///
+/// Idempotent and defensive: no-op if already a member; the inner
+/// `ALTER EXTENSION … ADD` is wrapped in an exception block so it cannot abort
+/// the surrounding work when it is disallowed (e.g. during `CREATE EXTENSION`'s
+/// `creating_extension` window) or when the caller lacks privilege — those
+/// paths leave the function correct, just not yet a member, which the next
+/// migration's adopt-if-orphan step (or a manual `ALTER EXTENSION ADD`) fixes.
+///
+/// `fn_name` must be the already-`safe_identifier`-truncated bare name (≤63
+/// chars, no special chars), matching what `pg_proc.proname` stores.
+fn member_register_ddl(fn_name: &str) -> String {
+    format!(
+        "DO $reflex_member$ \
+         BEGIN \
+           IF EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'pg_reflex') \
+              AND NOT EXISTS ( \
+                SELECT 1 FROM pg_depend d \
+                JOIN pg_extension e ON e.oid = d.refobjid AND e.extname = 'pg_reflex' \
+                JOIN pg_proc p ON p.oid = d.objid \
+                JOIN pg_namespace n ON n.oid = p.pronamespace \
+                WHERE d.deptype = 'e' AND p.proname = '{fname}' AND n.nspname = 'public') \
+           THEN \
+             BEGIN \
+               EXECUTE 'ALTER EXTENSION pg_reflex ADD FUNCTION public.{fname}()'; \
+             EXCEPTION WHEN OTHERS THEN \
+               RAISE NOTICE 'pg_reflex: could not add public.{fname} to extension: %', SQLERRM; \
+             END; \
+           END IF; \
+         END $reflex_member$",
+        fname = fn_name
+    )
+}
+
 /// Build DDL for the deferred-pending table and its constraint trigger.
 ///
 /// The constraint trigger fires at COMMIT time and processes all accumulated
@@ -804,20 +838,21 @@ pub fn build_deferred_flush_ddl() -> Vec<String> {
         // effective flush, and the cross-source guard still sees every source
         // this transaction staged (all pending rows are present at COMMIT
         // before any flush deletes its own).
-        "CREATE OR REPLACE FUNCTION __reflex_deferred_flush_fn() RETURNS TRIGGER AS $fn$ \
+        "CREATE OR REPLACE FUNCTION public.__reflex_deferred_flush_fn() RETURNS TRIGGER AS $fn$ \
          BEGIN \
            PERFORM public.reflex_flush_deferred(NEW.source_table); \
            RETURN NULL; \
          END; \
          $fn$ LANGUAGE plpgsql"
             .to_string(),
+        member_register_ddl("__reflex_deferred_flush_fn"),
         // Constraint trigger — fires at COMMIT for any INSERT into the pending table
         "DROP TRIGGER IF EXISTS __reflex_deferred_flush_trigger ON public.__reflex_deferred_pending"
             .to_string(),
         "CREATE CONSTRAINT TRIGGER __reflex_deferred_flush_trigger \
          AFTER INSERT ON public.__reflex_deferred_pending \
          DEFERRABLE INITIALLY DEFERRED \
-         FOR EACH ROW EXECUTE FUNCTION __reflex_deferred_flush_fn()"
+         FOR EACH ROW EXECUTE FUNCTION public.__reflex_deferred_flush_fn()"
             .to_string(),
     ]
 }
