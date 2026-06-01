@@ -8,7 +8,18 @@ Drains the pending-delta queue for a source table. Used in `DEFERRED` mode eithe
 reflex_flush_deferred(source_table TEXT) RETURNS TEXT
 ```
 
-Returns a status string with the count of IMVs processed.
+Returns a status string with the count of IMVs processed (e.g.
+`'FLUSHED 3 DEFERRED OPERATIONS'`, or `'NO DEFERRED IMVS'` when nothing depends
+on the source).
+
+## `ignore_sources` is honored
+
+Since 1.7.6, a DEFERRED IMV that listed `source_table` in its `ignore_sources`
+is **excluded** from the flush (the registry lookup skips IMVs whose
+`ignored_sources` overlaps the qualified or bare source name), mirroring the
+IMMEDIATE trigger-body skip. Such IMVs are maintained only via
+`reflex_reconcile` / periodic refresh. Before 1.7.6 the flush ignored
+`ignore_sources` and maintained them anyway.
 
 ## When to call manually
 

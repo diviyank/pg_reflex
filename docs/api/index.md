@@ -6,8 +6,8 @@ Every SQL-callable function pg_reflex installs. Click a name for the full page.
 
 | Function | Returns | Purpose |
 |---|---|---|
-| [`create_reflex_ivm(view_name, sql [, unique_columns [, storage [, mode [, topk]]]])`](create_reflex_ivm.md) | `TEXT` | Register and build an IMV. |
-| [`create_reflex_ivm_if_not_exists(view_name, sql [, unique_columns [, storage [, mode]]])`](create_reflex_ivm_if_not_exists.md) | `TEXT` | Idempotent variant — skips silently if `view_name` already exists. |
+| [`create_reflex_ivm(view_name, sql [, unique_columns [, storage [, mode [, ignore_sources]]]])`](create_reflex_ivm.md) | `TEXT` | Register and build an IMV. Overloads add `topk` (1.3.0+) and `partition_by` (1.5.0+). |
+| [`create_reflex_ivm_if_not_exists(view_name, sql [, unique_columns [, storage [, mode [, ignore_sources]]]])`](create_reflex_ivm_if_not_exists.md) | `TEXT` | Idempotent variant — skips silently if `view_name` already exists. Same overloads. |
 | [`drop_reflex_ivm(view_name)`](drop_reflex_ivm.md) | `TEXT` | Drop an IMV. Refuses if children exist. |
 | [`drop_reflex_ivm(view_name, cascade)`](drop_reflex_ivm.md) | `TEXT` | Drop an IMV, recursively dropping children when `cascade = true`. |
 

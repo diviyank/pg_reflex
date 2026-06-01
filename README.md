@@ -454,7 +454,7 @@ Creates an incremental materialized view from a SELECT query. Returns `'CREATE R
 | `unique_columns` | TEXT | NULL | Comma-separated unique key columns for passthrough IMVs |
 | `storage` | TEXT | `'UNLOGGED'` | `'LOGGED'` for crash-safe WAL-logged tables, `'UNLOGGED'` for max performance |
 | `mode` | TEXT | `'IMMEDIATE'` | `'DEFERRED'` to batch deltas until COMMIT, `'IMMEDIATE'` for per-statement updates |
-| `ignore_sources` | TEXT | NULL | (1.4.5) Comma-separated source list to exclude from trigger installation. DML on listed sources will NOT refresh this IMV; use `reflex_reconcile` or periodic refresh instead. Both schema-qualified (`alp.product`) and bare (`product`) names accepted — use whatever form appears in the IMV's `depends_on`. Persisted in `__reflex_ivm_reference.ignored_sources` so triggers installed by sibling IMVs also skip this IMV when fired by an ignored source. |
+| `ignore_sources` | TEXT | NULL | (1.4.5) Comma-separated source list to exclude from trigger installation. DML on listed sources will NOT refresh this IMV; use `reflex_reconcile` or periodic refresh instead. Both schema-qualified (`alp.product`) and bare (`product`) names accepted — use whatever form appears in the IMV's `depends_on`. Persisted in `__reflex_ivm_reference.ignored_sources` so triggers installed by sibling IMVs also skip this IMV when fired by an ignored source. The skip is honored on **both** the IMMEDIATE and the DEFERRED trigger paths (the latter, including `reflex_flush_deferred`, since 1.7.6 — earlier versions skipped only on the IMMEDIATE path). |
 
 **What it creates** depends on the query type:
 

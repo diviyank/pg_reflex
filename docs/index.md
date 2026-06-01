@@ -58,13 +58,12 @@ On the workloads it targets — append-mostly sources, narrow updates, cascade d
 
 [Full deployment profile :material-arrow-right-bold:](operations/deployment-profile.md){ .md-button }
 
-## Highlights — version 1.4.0
+## Recent highlights
 
-- **Top-K MIN/MAX is auto-enabled (`K=16`).** Every MIN/MAX intermediate column gets a bounded top-K heap by default; retractions stay `O(K)` without operator opt-in. Append-only workloads can still opt out via `topk = 0`.
-- **Heap-shrinkage-gated UPDATE recompute (N1).** UPDATEs that don't displace a top-K element no longer trigger a source-scan recompute. ~30 × speedup on 1K-row UPDATE batches in `benchmarks/bench_n1_topk_update.sql`.
-- **Top-K over `TEXT` / `DATE` / `TIMESTAMP`** is now correctness-tested. The trigger MERGE codegen used to assume `NUMERIC` element types and failed at INSERT time on non-NUMERIC columns; resolved at IMV-create time.
-- **Top-K UPDATE staleness fixed.** A partial-heap that left non-empty-but-wrong state on UPDATE is now closed by a forced post-Sub recompute path.
-- **Per-backend delta-SQL template cache (O2).** Sub-ms savings per fire on tight trigger loops.
+- **`ignore_sources` honored on the DEFERRED path (1.7.6).** A source excluded via `ignore_sources` is now skipped on both the IMMEDIATE and DEFERRED trigger paths (including `reflex_flush_deferred`); earlier versions skipped only on IMMEDIATE.
+- **Widened CTE/JOIN unique-key inference (1.7.5).** Chained-CTE cascades auto-resolve sound unique keys (equi-join equivalence, aggregate GROUP BY keys, CROSS-to-single-row), so they get incremental DELETE/UPDATE instead of full refresh.
+- **Partitioned IMVs (1.5.0–1.7.4).** `partition_by`, per-partition reconcile/dispatch, atomic DETACH/ATTACH swap, and partition-anchor resolution across co-partitioned join keys.
+- **Top-K MIN/MAX auto-enabled (`K=16`, 1.4.0).** MIN/MAX columns get a bounded top-K heap by default; retractions stay `O(K)`. Append-only workloads can opt out via `topk = 0`.
 
 [Full changelog :material-arrow-right-bold:](changelog.md){ .md-button }
 

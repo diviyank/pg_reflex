@@ -491,7 +491,9 @@ pub(crate) fn resolve_anchor_source(
         .unwrap_or_default();
     pgrx::notice!(
         "REFLEX-DBG resolve_anchor col={:?} search_path={:?} sources={:?}",
-        partition_col, dbg_path, sources
+        partition_col,
+        dbg_path,
+        sources
     );
     let mut owners: Vec<String> = Vec::new();
     for s in sources {
@@ -520,15 +522,23 @@ pub(crate) fn resolve_anchor_source(
         // TEMP reflex-debug — per-source ownership + regclass resolution.
         let dbg_regclass = client
             .select(
-                "SELECT to_regclass($1)::text AS rc", Some(1),
-                &[unsafe { DatumWithOid::new(s.to_string(), PgBuiltInOids::TEXTOID.oid().value()) }],
+                "SELECT to_regclass($1)::text AS rc",
+                Some(1),
+                &[unsafe {
+                    DatumWithOid::new(s.to_string(), PgBuiltInOids::TEXTOID.oid().value())
+                }],
             )
             .ok()
             .and_then(|mut it| it.next())
             .and_then(|r| r.get_by_name::<&str, _>("rc").ok().flatten())
             .map(|s| s.to_string())
             .unwrap_or_else(|| "NULL".to_string());
-        pgrx::notice!("REFLEX-DBG   source={:?} to_regclass={:?} owns_col={}", s, dbg_regclass, has);
+        pgrx::notice!(
+            "REFLEX-DBG   source={:?} to_regclass={:?} owns_col={}",
+            s,
+            dbg_regclass,
+            has
+        );
         if has {
             owners.push(s.clone());
         }

@@ -49,6 +49,17 @@ SELECT reflex_flush_deferred('orders');
 SELECT * FROM batch_view;  -- already updated
 ```
 
+## `ignore_sources` on the deferred path
+
+An IMV that lists a source in [`ignore_sources`](../api/create_reflex_ivm.md)
+is skipped when that source mutates — and since 1.7.6 this holds on the DEFERRED
+path too. Both the deferred trigger bodies (which also process any IMMEDIATE
+IMVs inline) and `reflex_flush_deferred` consult `ignored_sources` and skip
+matching IMVs. Before 1.7.6 the skip lived only in the IMMEDIATE trigger body,
+so an ignored source whose trigger was the *deferred flavour* (installed because
+a sibling IMV on it is DEFERRED) still maintained the ignoring IMV. Keep those
+IMVs fresh with `reflex_reconcile` or a periodic refresh.
+
 ## Tradeoffs
 
 - **Pros**: deltas coalesce — many writes against the same group fold into a single MERGE. Lower aggregate cost on bulk loads.

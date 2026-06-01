@@ -1,5 +1,69 @@
 # Changelog
 
+## [1.7.6] - 2026-06-01
+
+Correctness release: **`ignore_sources` is now honored on the DEFERRED trigger
+path**, closing a gap where it only worked for IMMEDIATE IMVs. Run
+`ALTER EXTENSION pg_reflex UPDATE TO '1.7.6';` and replace the `.so`. The
+migration rebuilds existing source triggers so the fix takes effect without
+re-creating IMVs.
+
+---
+
+### Fixed
+
+- **`ignore_sources` was silently ignored on the DEFERRED path.** The guard
+  that skips an IMV when DML hits a source it listed in `ignore_sources` existed
+  only in the IMMEDIATE trigger body. The three deferred trigger bodies
+  (INSERT/DELETE, UPDATE, TRUNCATE) and the commit-time `reflex_flush_deferred`
+  never consulted `ignored_sources`. So whenever a source's trigger was the
+  *deferred flavour* (installed because some sibling IMV on that source is
+  DEFERRED), an IMV that had ignored that source was maintained anyway — both
+  inline (for IMMEDIATE IMVs processed within the deferred trigger) and at flush
+  (for DEFERRED IMVs). The deferred bodies now emit the same `ignored_sources`
+  skip guard as the immediate body (via a new `__REFLEX_SLOT_BARE_SOURCE__`
+  slot), and `reflex_flush_deferred` excludes IMVs whose `ignored_sources`
+  overlaps the (qualified, bare) source name. No catalog schema change; the
+  migration rebuilds trigger bodies via `reflex_rebuild_triggers`.
+
+### Testing
+
+- `pg_test_deferred.rs`: `pg_test_deferred_ignore_sources_skips_imv` — a
+  non-ignoring DEFERRED sibling installs the deferred trigger; an ignoring
+  DEFERRED IMV (flush path) and an ignoring IMMEDIATE IMV (inline path) must
+  both stay stale after the source mutates.
+- Full suite: 1120 tests pass; `cargo clippy` and `cargo fmt` clean.
+
+## [1.7.5] - 2026-05-31
+
+Feature release: **widened CTE/JOIN passthrough unique-key inference**, so
+chained-CTE cascades (e.g. the `forecast_analysis_view` shape) auto-resolve
+sound unique keys and get incremental DELETE/UPDATE instead of full refresh. Run
+`ALTER EXTENSION pg_reflex UPDATE TO '1.7.5';` and replace the `.so`. One
+additive catalog column (`max_one_row`), no data backfill.
+
+---
+
+### Added
+
+- **Sound unique-key inference across JOINs and chained CTEs.** Equi-join
+  equivalence in projected-key matching (a key projected through
+  `f.k = dl.k` is recognized on either side), aggregate-IMV GROUP BY keys are
+  registered as sound unique keys, CROSS JOIN to an ungrouped aggregate is
+  classified to-one, and the anchor probe now detects `__reflex_uk_*` indexes.
+  A new `__reflex_ivm_reference.max_one_row` flag (default FALSE) records when a
+  sub-IMV yields at most one row. Existing IMVs keep their stored keys;
+  inference re-runs at create time.
+
+### Fixed
+
+- Dropped an unsound `LIKE` wildcard in registry lookups.
+
+### Testing
+
+- `pg_test_cte.rs`: forecast-shape unique-key cascade integration test, plus
+  cross-join and chained-CTE coverage.
+
 ## [1.7.4] - 2026-05-31
 
 Correctness release for **partitioned IMV creation**. The fix is entirely in

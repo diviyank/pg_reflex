@@ -2825,14 +2825,25 @@ pub fn reflex_execute_separated(sql: &str) {
 pub fn reflex_flush_deferred(source_table: &str) -> String {
     let delta_tbl = staging_delta_table_name(source_table);
 
-    // Read all DEFERRED IMVs that depend on this source
+    // Read all DEFERRED IMVs that depend on this source. IMVs that listed this
+    // source in `ignore_sources` are excluded — the array-overlap check matches
+    // both the qualified ($1) and bare ($2) forms, mirroring the trigger-body
+    // runtime skip so the ignore contract holds on the deferred path too.
+    let bare_source = source_table
+        .split('.')
+        .next_back()
+        .unwrap_or(source_table)
+        .to_string();
     let imvs: Vec<(String, String, String, String, Option<String>)> = Spi::connect(|client| {
-        let args = [unsafe {
-            DatumWithOid::new(
-                source_table.to_string(),
-                PgBuiltInOids::TEXTOID.oid().value(),
-            )
-        }];
+        let args = [
+            unsafe {
+                DatumWithOid::new(
+                    source_table.to_string(),
+                    PgBuiltInOids::TEXTOID.oid().value(),
+                )
+            },
+            unsafe { DatumWithOid::new(bare_source.clone(), PgBuiltInOids::TEXTOID.oid().value()) },
+        ];
         client
             .select(
                 "SELECT name, base_query, end_query, aggregations::text AS aggregations, \
@@ -2840,6 +2851,7 @@ pub fn reflex_flush_deferred(source_table: &str) -> String {
                  FROM public.__reflex_ivm_reference \
                  WHERE $1 = ANY(depends_on) AND enabled = TRUE \
                    AND COALESCE(refresh_mode, 'IMMEDIATE') = 'DEFERRED' \
+                   AND NOT (COALESCE(ignored_sources, ARRAY[]::TEXT[]) && ARRAY[$1, $2]::TEXT[]) \
                  ORDER BY graph_depth, name",
                 None,
                 &args,

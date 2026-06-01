@@ -230,20 +230,24 @@ Non-partition `ALTER TABLE` variants (column add/drop, …) on a tracked source 
 
 Cross-references for readers walking the code:
 
-| Topic | File:line |
+Referenced by symbol rather than line number — line numbers drift every
+release; grep the symbol or hint to land on the current location.
+
+| Topic | File · symbol / search hint |
 |---|---|
 | Empty-delta short-circuit | `src/schema_builder.rs` trigger body |
-| Per-source DEFERRED-flush serialisation lock | `src/trigger.rs:2357` (`reflex_flush:<source>`) |
-| Per-IMV advisory lock (2-arg hash form) | `src/trigger.rs:2671` |
-| MERGE codegen | `src/trigger.rs:70` (`build_merge_sql`) |
-| Dispatch DO block | `src/trigger.rs:1051` (`build_high_selectivity_dispatch_sql`) |
-| Self-join full-refresh branch | `src/trigger.rs:1435` |
-| Bulk-INSERT / Bulk-DELETE paths | `src/trigger.rs:1211`, `:1289` |
-| Path B pre-scratch dispatch | `src/schema_builder.rs` trigger body (search for `Path B: dispatching`) |
-| Path C smart bulk-INSERT | `src/schema_builder.rs` (`path_c_for_update` in `build_trigger_ddls`) |
-| `reflex_build_path_c_explain_sql` | `src/trigger.rs:2257` |
-| TRUNCATE codegen | `src/trigger.rs:2227` (`reflex_build_truncate_sql`) |
-| `reflex_reconcile` TRUNCATE+INSERT | `src/reconcile.rs:102`, `:241` |
+| Per-source DEFERRED-flush serialisation lock | `src/trigger.rs` · `reflex_flush_deferred` (lock key `reflex_flush:<source>`) |
+| Per-IMV advisory lock (2-arg hash form) | `src/trigger.rs` · search `hashtext(reverse(` |
+| MERGE codegen | `src/trigger.rs` · `build_merge_sql` |
+| Dispatch DO block | `src/trigger.rs` · `build_high_selectivity_dispatch_sql` |
+| Self-join full-refresh branch | `src/trigger.rs` · `self_join_full_refresh_stmts` |
+| Bulk-INSERT / Bulk-DELETE paths | `src/trigger.rs` · `push_bulk_insert_and_affected`, `push_bulk_delete_via_transition` |
+| Path B pre-scratch dispatch | `src/schema_builder.rs` trigger body (search `Path B: dispatching`) |
+| Path C smart bulk-INSERT | `src/schema_builder.rs` · `path_c_for_update` in `build_trigger_ddls` |
+| Path C EXPLAIN dispatch | `src/trigger.rs` · `reflex_build_path_c_explain_sql` |
+| TRUNCATE codegen | `src/trigger.rs` · `reflex_build_truncate_sql` |
+| `ignore_sources` runtime skip | `sql/trigger_body.plpgsql.in` + `sql/deferred_trigger_*.plpgsql.in` (search `ignored_sources`); flush side in `src/trigger.rs` · `reflex_flush_deferred` |
+| `reflex_reconcile` TRUNCATE+INSERT | `src/reconcile.rs` · `reflex_reconcile` |
 | Source-join-keys metadata | `src/aggregation.rs` (`source_join_keys` on `AggregationPlan`) |
 | Partitioning module (introspect, sync, reconcile_partition) | `src/partition.rs` |
 | Partition validation + auto-mirror | `src/create_ivm.rs` (`Partitioning resolution` block) |

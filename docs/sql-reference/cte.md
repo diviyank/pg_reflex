@@ -38,6 +38,28 @@ SELECT create_reflex_ivm('my_ivm',
     FROM order_data');
 ```
 
+## Unique-key inference across CTEs and JOINs (1.7.5+)
+
+A passthrough sub-IMV (a projection / filter / JOIN over CTE results, with no
+aggregation of its own) needs a unique key to maintain `DELETE`/`UPDATE`
+incrementally — without one it falls back to a full refresh. Since 1.7.5 the
+engine infers a sound key for far more chained-CTE and JOIN shapes
+automatically, so you usually no longer have to pass `unique_columns` by hand:
+
+- **Equi-join equivalence** — a key projected through an `ON a.k = b.k` join is
+  recognized on either side of the equality.
+- **Aggregate GROUP BY keys** — a CTE that is itself an aggregate sub-IMV
+  exposes its `GROUP BY` columns as a sound unique key for consumers.
+- **Cardinality classification** — to-one and to-many INNER joins, and a
+  `CROSS JOIN` to an ungrouped (single-row) aggregate, propagate keys correctly
+  (tracked via the `max_one_row` flag in `__reflex_ivm_reference`).
+
+The inferred key is validated at build time by a `__reflex_uk_*` unique index;
+if no sound key can be proven, the sub-IMV keeps an empty key and falls back to
+full refresh (still correct, just not incremental). Pass `unique_columns`
+explicitly to override. The `forecast_analysis_view` chained-CTE cascade is the
+canonical shape this unlocked.
+
 ## Partition propagation to CTE sub-IMVs
 
 When a partitioned IMV is built from a query with CTEs, the parent's `partition_by` columns automatically propagate to each CTE sub-IMV — but only if that partition column appears in the CTE's output.

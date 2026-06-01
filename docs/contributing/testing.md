@@ -1,7 +1,7 @@
 # Testing
 
 ```bash
-# Full integration suite (504 tests as of 1.3.0)
+# Full integration suite (1120 tests as of 1.7.6)
 cargo pgrx test pg17
 
 # Unit tests only — no Postgres needed

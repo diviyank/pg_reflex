@@ -677,6 +677,11 @@ pub fn build_trigger_ddls(source_table: &str) -> Vec<String> {
 /// 1.6.2 regression added in `pg_test_deferred.rs`.
 pub fn build_deferred_trigger_ddls(source_table: &str, source_columns: &[String]) -> Vec<String> {
     let safe_source = source_table.replace('.', "_").replace('"', "");
+    let bare_source = source_table
+        .split('.')
+        .next_back()
+        .unwrap_or(source_table)
+        .to_string();
     let ref_new = transition_new_table_name(source_table);
     let ref_old = transition_old_table_name(source_table);
     let delta_tbl = staging_delta_table_name(source_table);
@@ -695,6 +700,7 @@ pub fn build_deferred_trigger_ddls(source_table: &str, source_columns: &[String]
             body_template,
             &[
                 ("__REFLEX_SLOT_SOURCE_TABLE__", source_table),
+                ("__REFLEX_SLOT_BARE_SOURCE__", &bare_source),
                 ("__REFLEX_SLOT_TRANSITION_TBL__", transition_tbl),
                 ("__REFLEX_SLOT_OP__", op),
                 ("__REFLEX_SLOT_OP_CODE__", op_code),
@@ -736,6 +742,7 @@ pub fn build_deferred_trigger_ddls(source_table: &str, source_columns: &[String]
         include_str!("../sql/deferred_trigger_update_body.plpgsql.in"),
         &[
             ("__REFLEX_SLOT_SOURCE_TABLE__", source_table),
+            ("__REFLEX_SLOT_BARE_SOURCE__", &bare_source),
             ("__REFLEX_SLOT_REF_NEW__", &ref_new),
             ("__REFLEX_SLOT_REF_OLD__", &ref_old),
             ("__REFLEX_SLOT_DELTA_TBL__", &delta_tbl),
@@ -757,6 +764,7 @@ pub fn build_deferred_trigger_ddls(source_table: &str, source_columns: &[String]
         include_str!("../sql/deferred_trigger_truncate_body.plpgsql.in"),
         &[
             ("__REFLEX_SLOT_SOURCE_TABLE__", source_table),
+            ("__REFLEX_SLOT_BARE_SOURCE__", &bare_source),
             ("__REFLEX_SLOT_DELTA_TBL__", &delta_tbl),
         ],
     );

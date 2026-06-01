@@ -68,10 +68,11 @@ Common causes:
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| MIN/MAX IMV with full-source seq-scan in EXPLAIN | Scoped recompute path with too many affected groups | Opt into `topk=K` (1.3.0) — re-create with the topk parameter |
+| MIN/MAX IMV with full-source seq-scan in EXPLAIN | Scoped recompute path with too many affected groups | Top-K is auto-enabled (`K=16`) since 1.4.0; the scan fires only for groups whose heap empties. Raise K (re-create with a larger `topk`) for high-churn groups, or `topk=0` to opt out if append-only. |
 | Passthrough DELETE doing full refresh | No `unique_columns` and no inferable PK | Add a PK to the source, or pass `unique_columns` explicitly |
 | `__reflex_intermediate_*` table much larger than expected | Aggregate state is wider than user output | Check `reflex_ivm_stats(name)` — `BOOL_OR` and `AVG` add companion columns |
 | First flush after cold start is slow | Stats not analysed yet | Run `ANALYZE __reflex_intermediate_<name>` |
+| Bulk load / no-op UPDATE on a reference (`product`, `location`, …) table hangs for minutes | Statement triggers are column-blind: any DML on the source fires full maintenance, even an UPDATE touching only columns no IMV reads | Exclude the source via `ignore_sources` at create time, then `reflex_reconcile` after the batch. To add it to existing IMVs: `UPDATE public.__reflex_ivm_reference SET ignored_sources = ... WHERE 'src' = ANY(depends_on)` (honored at runtime on both paths since 1.7.6). Unconditional kill switch: drop the four `__reflex_trigger_{ins,del,upd,trunc}_on_<src>` triggers. |
 
 ## DELETE on source fails with "missing FROM-clause entry"
 

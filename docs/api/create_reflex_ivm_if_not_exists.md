@@ -10,11 +10,13 @@ create_reflex_ivm_if_not_exists(
     sql              TEXT,
     unique_columns   TEXT  DEFAULT NULL,
     storage          TEXT  DEFAULT 'UNLOGGED',
-    mode             TEXT  DEFAULT 'IMMEDIATE'
+    mode             TEXT  DEFAULT 'IMMEDIATE',
+    ignore_sources   TEXT  DEFAULT NULL    -- 1.4.5+
 ) RETURNS TEXT
 ```
 
-Parameters match `create_reflex_ivm` exactly — see that page for the per-argument semantics.
+Parameters — and the `topk` (1.3.0+) and `partition_by` (1.5.0+) overloads —
+match `create_reflex_ivm` exactly; see that page for the per-argument semantics.
 
 ## Return values
 
@@ -36,5 +38,5 @@ SELECT create_reflex_ivm_if_not_exists('sales_by_region',
 
 ## See also
 
-- [`create_reflex_ivm`](create_reflex_ivm.md) — full reference, including the 6-argument `topk` overload.
+- [`create_reflex_ivm`](create_reflex_ivm.md) — full reference, including the `ignore_sources`, `topk`, and `partition_by` overloads.
 - [`drop_reflex_ivm`](drop_reflex_ivm.md) — required when you need to change an IMV's definition.

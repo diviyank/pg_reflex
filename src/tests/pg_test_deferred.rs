@@ -1636,3 +1636,74 @@ fn test_deferred_cascade_favorable_order_control() {
 
     assert_imv_correct("t3_casc_d", fresh_d);
 }
+
+/// `ignore_sources` must be honored by the DEFERRED trigger path too. A
+/// sibling DEFERRED IMV that does NOT ignore the source installs the
+/// deferred-flavour trigger on it; IMVs that DO ignore the source must still
+/// be skipped at runtime — both the inline-immediate branch of the deferred
+/// trigger body and the commit-time flush. Pre-fix, the deferred bodies and
+/// `reflex_flush_deferred` never consulted `ignored_sources`, so the ignoring
+/// IMVs were maintained anyway, silently breaking the ignore contract.
+#[pg_test]
+fn pg_test_deferred_ignore_sources_skips_imv() {
+    Spi::run("CREATE TABLE dis_src (grp INT NOT NULL, val INT NOT NULL)").expect("create src");
+    Spi::run("INSERT INTO dis_src (grp, val) VALUES (1, 10), (2, 20)").expect("seed");
+
+    // Non-ignoring DEFERRED IMV — installs the deferred-flavour trigger on dis_src.
+    crate::create_reflex_ivm(
+        "dis_keep",
+        "SELECT grp, SUM(val) AS total FROM dis_src GROUP BY grp",
+        None,
+        None,
+        Some("DEFERRED"),
+        None,
+    );
+    // Ignoring DEFERRED IMV — exercises the commit-time flush skip.
+    crate::create_reflex_ivm(
+        "dis_ign_def",
+        "SELECT grp, SUM(val) AS total FROM dis_src GROUP BY grp",
+        None,
+        None,
+        Some("DEFERRED"),
+        Some("dis_src"),
+    );
+    // Ignoring IMMEDIATE IMV — exercises the inline-immediate skip inside the
+    // deferred trigger body (its source's trigger is the deferred flavour
+    // because dis_keep is DEFERRED).
+    crate::create_reflex_ivm(
+        "dis_ign_imm",
+        "SELECT grp, SUM(val) AS total FROM dis_src GROUP BY grp",
+        None,
+        None,
+        Some("IMMEDIATE"),
+        Some("dis_src"),
+    );
+
+    let sum_of = |t: &str| -> i64 {
+        Spi::get_one::<i64>(&format!("SELECT SUM(total)::BIGINT FROM {}", t))
+            .expect("query")
+            .expect("value")
+    };
+    assert_eq!(sum_of("dis_keep"), 30, "baseline keep");
+    assert_eq!(sum_of("dis_ign_def"), 30, "baseline ign_def");
+    assert_eq!(sum_of("dis_ign_imm"), 30, "baseline ign_imm");
+
+    Spi::run("INSERT INTO dis_src (grp, val) VALUES (1, 100)").expect("insert");
+    drain_deferred_pending();
+
+    assert_eq!(
+        sum_of("dis_keep"),
+        130,
+        "non-ignoring IMV must be maintained by the deferred trigger"
+    );
+    assert_eq!(
+        sum_of("dis_ign_def"),
+        30,
+        "DEFERRED IMV ignoring the source must NOT be maintained at flush"
+    );
+    assert_eq!(
+        sum_of("dis_ign_imm"),
+        30,
+        "IMMEDIATE IMV ignoring the source must NOT be maintained inline by the deferred trigger"
+    );
+}

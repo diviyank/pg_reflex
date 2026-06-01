@@ -11,11 +11,28 @@ create_reflex_ivm(
     unique_columns   TEXT     DEFAULT NULL,
     storage          TEXT     DEFAULT 'UNLOGGED',
     mode             TEXT     DEFAULT 'IMMEDIATE',
-    topk             INTEGER  DEFAULT NULL    -- 1.3.0+
+    ignore_sources   TEXT     DEFAULT NULL    -- 1.4.5+
 ) RETURNS TEXT
 ```
 
 Returns `'CREATE REFLEX INCREMENTAL VIEW'` on success, `'ERROR: …'` on failure.
+
+### Overloads
+
+`create_reflex_ivm` is overloaded; pick the form that carries the extra
+argument you need:
+
+```sql
+-- Top-K MIN/MAX (1.3.0+): topk in position 6, ignore_sources moves to 7
+create_reflex_ivm(view_name, sql, unique_columns, storage, mode,
+                  topk INTEGER, ignore_sources TEXT DEFAULT NULL)
+
+-- Partitioned (1.5.0+): partition_by is the trailing argument
+create_reflex_ivm(view_name, sql, unique_columns, storage, mode,
+                  ignore_sources, partition_by TEXT[])
+create_reflex_ivm(view_name, sql, unique_columns, storage, mode,
+                  topk INTEGER, ignore_sources, partition_by TEXT[])
+```
 
 ## Parameters
 
@@ -26,7 +43,9 @@ Returns `'CREATE REFLEX INCREMENTAL VIEW'` on success, `'ERROR: …'` on failure
 | `unique_columns` | Comma-separated unique key columns for passthrough IMVs. Auto-inferred from source PK in 1.2.1+ for single-source passthroughs. |
 | `storage` | `'UNLOGGED'` (default, max perf) or `'LOGGED'` (WAL-logged, crash-safe) |
 | `mode` | `'IMMEDIATE'` (default, per-statement flush) or `'DEFERRED'` (flush at COMMIT) |
-| `topk` | 1.3.0+. Integer K. When > 0, MIN/MAX columns maintain a sibling top-K array. Disabled by default. |
+| `ignore_sources` | 1.4.5+. Comma-separated source list to exclude from maintenance. DML on listed sources will NOT refresh this IMV — use `reflex_reconcile` or periodic refresh instead. Schema-qualified (`alp.product`) or bare (`product`) names both accepted. Honored on the IMMEDIATE and (since 1.7.6) DEFERRED trigger paths. |
+| `topk` | 1.3.0+ (overload). Integer K. When > 0, MIN/MAX columns maintain a sibling top-K array. Disabled by default. |
+| `partition_by` | 1.5.0+ (overload). `TEXT[]` of output column names to partition the target on; see the partitioning guide. |
 
 ## What gets created
 
@@ -71,7 +90,10 @@ SELECT create_reflex_ivm('stock_chart',
 ## Idempotent variant
 
 ```sql
-create_reflex_ivm_if_not_exists(view_name, sql [, unique_columns [, storage [, mode]]]) RETURNS TEXT
+create_reflex_ivm_if_not_exists(view_name, sql [, unique_columns [, storage [, mode [, ignore_sources]]]]) RETURNS TEXT
 ```
+
+Mirrors `create_reflex_ivm`'s argument list (including the `topk` and
+`partition_by` overloads).
 
 Returns `'REFLEX INCREMENTAL VIEW ALREADY EXISTS (skipped)'` instead of erroring when `view_name` is already registered.

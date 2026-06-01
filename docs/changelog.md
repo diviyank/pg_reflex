@@ -4,6 +4,34 @@ The full changelog tracks every release. The latest version's headlines are on t
 
 For each version below, see [`CHANGELOG.md`](https://github.com/diviyank/pg_reflex/blob/main/CHANGELOG.md) on GitHub for the canonical text.
 
+## [1.7.6] — 2026-06-01
+
+Correctness release: `ignore_sources` is now honored on the DEFERRED trigger path (previously only IMMEDIATE). Run `ALTER EXTENSION pg_reflex UPDATE TO '1.7.6';` and replace the `.so`; the migration rebuilds source triggers so the fix applies without re-creating IMVs.
+
+**Fixed**
+
+- **`ignore_sources` silently ignored on the DEFERRED path.** The skip guard existed only in the IMMEDIATE trigger body; the three deferred trigger bodies and `reflex_flush_deferred` never checked `ignored_sources`. When a source's trigger was the *deferred flavour* (some sibling IMV on it is DEFERRED), an IMV that ignored that source was maintained anyway — both inline (IMMEDIATE IMVs in the deferred trigger) and at flush (DEFERRED IMVs). Deferred bodies now emit the same skip guard, and `reflex_flush_deferred` excludes IMVs whose `ignored_sources` overlaps the (qualified, bare) source name.
+
+**Testing**
+
+- 1120 tests pass; `clippy` + `fmt` clean. New: `pg_test_deferred_ignore_sources_skips_imv`.
+
+## [1.7.5] — 2026-05-31
+
+Feature release: widened CTE/JOIN passthrough unique-key inference so chained-CTE cascades (e.g. `forecast_analysis_view`) auto-resolve sound unique keys and get incremental DELETE/UPDATE instead of full refresh. Run `ALTER EXTENSION pg_reflex UPDATE TO '1.7.5';` and replace the `.so`. One additive catalog column (`max_one_row`), no backfill.
+
+**Added**
+
+- **Sound unique-key inference across JOINs and chained CTEs.** Equi-join equivalence in projected-key matching, aggregate-IMV GROUP BY keys registered as sound keys, CROSS-JOIN-to-ungrouped-aggregate classified to-one, and `__reflex_uk_*` index detection in the anchor probe. New `__reflex_ivm_reference.max_one_row` flag (default FALSE).
+
+**Fixed**
+
+- Dropped an unsound `LIKE` wildcard in registry lookups.
+
+**Testing**
+
+- forecast-shape unique-key cascade integration test + cross-join/chained-CTE coverage.
+
 ## [1.7.4] — 2026-05-31
 
 Correctness release for partitioned IMV creation. Compiled-only fix (no catalog or SQL-signature change). Run `ALTER EXTENSION pg_reflex UPDATE TO '1.7.4';` and replace the `.so`.
