@@ -573,3 +573,61 @@ fn test_union_mirror_fns_are_extension_members() {
     ).expect("q").expect("c");
     assert_eq!(non_members, 0, "all union-mirror fns must be pg_reflex members, {non_members} are not");
 }
+
+/// Migration test: pre-1.8.0 orphan union-mirror fns in public are adopted as extension members
+#[pg_test]
+fn test_migration_adopts_orphan_union_mirror_fns() {
+    Spi::run("CREATE TABLE umadopt_eu (id SERIAL, city TEXT, amount NUMERIC)").expect("create");
+    Spi::run("CREATE TABLE umadopt_us (id SERIAL, city TEXT, amount NUMERIC)").expect("create");
+    Spi::run("INSERT INTO umadopt_eu (city, amount) VALUES ('Paris', 100)").expect("seed");
+    Spi::run("INSERT INTO umadopt_us (city, amount) VALUES ('NYC', 200)").expect("seed");
+
+    // Use the SAME query shape as test_union_mirror_fns_are_extension_members:
+    // UNION ALL inside a CTE to guarantee install_union_mirror_triggers runs
+    crate::create_reflex_ivm(
+        "umadopt_view",
+        "WITH um AS (SELECT city, amount FROM umadopt_eu UNION ALL SELECT city, amount FROM umadopt_us) \
+         SELECT * FROM um",
+        None, None, None,
+        None,
+    );
+
+    // Simulate the pre-1.8.0 state: detach every union-mirror fn from the extension
+    // (they remain in public, just as non-members)
+    Spi::run(
+        "DO $$ DECLARE r RECORD; BEGIN \
+           FOR r IN SELECT p.proname FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace \
+             WHERE n.nspname='public' AND p.proname LIKE '__reflex_union_mirror_%' LOOP \
+             EXECUTE format('ALTER EXTENSION pg_reflex DROP FUNCTION public.%I()', r.proname); \
+           END LOOP; END $$;",
+    ).expect("detach");
+
+    let non_members_before: i64 = Spi::get_one::<i64>(
+        "SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace \
+         WHERE n.nspname='public' AND p.proname LIKE '__reflex_union_mirror_%' \
+           AND NOT EXISTS (SELECT 1 FROM pg_depend d JOIN pg_extension e ON e.oid=d.refobjid \
+                WHERE e.extname='pg_reflex' AND d.objid=p.oid AND d.deptype='e')",
+    ).expect("q").expect("c");
+    assert!(non_members_before >= 1, "setup must leave >=1 non-member mirror fn, got {}", non_members_before);
+
+    // --- The migration's union-mirror adopt step (mirror of sql/pg_reflex--1.7.7--1.8.0.sql) ---
+    Spi::run(
+        "DO $um$ DECLARE r RECORD; BEGIN \
+           FOR r IN SELECT p.proname FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace \
+             WHERE n.nspname='public' AND p.proname LIKE '__reflex_union_mirror_%' \
+               AND NOT EXISTS (SELECT 1 FROM pg_depend d JOIN pg_extension e ON e.oid=d.refobjid \
+                    WHERE e.extname='pg_reflex' AND d.objid=p.oid AND d.deptype='e') \
+           LOOP \
+             BEGIN EXECUTE format('ALTER EXTENSION pg_reflex ADD FUNCTION public.%I()', r.proname); \
+             EXCEPTION WHEN OTHERS THEN RAISE NOTICE 'adopt failed for %: %', r.proname, SQLERRM; END; \
+           END LOOP; END $um$;",
+    ).expect("adopt");
+
+    let non_members_after: i64 = Spi::get_one::<i64>(
+        "SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace \
+         WHERE n.nspname='public' AND p.proname LIKE '__reflex_union_mirror_%' \
+           AND NOT EXISTS (SELECT 1 FROM pg_depend d JOIN pg_extension e ON e.oid=d.refobjid \
+                WHERE e.extname='pg_reflex' AND d.objid=p.oid AND d.deptype='e')",
+    ).expect("q").expect("c");
+    assert_eq!(non_members_after, 0, "adopt must register all mirror fns, {} left non-member", non_members_after);
+}

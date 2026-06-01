@@ -78,6 +78,32 @@ BEGIN
 END
 $sweep$;
 
+-- 6. Adopt pre-existing union-mirror fns (set-op IMVs) as extension members.
+--    They are always created in public (never split), but pre-1.8.0 were not
+--    registered as members. Independent of the sweep (those are public, live).
+--    Idempotent; per-fn exception isolation. Names are read from the catalog
+--    (already truncated) and quoted with %I, so this is robust to >63-char names.
+DO $um$
+DECLARE r RECORD;
+BEGIN
+  FOR r IN
+    SELECT p.proname
+    FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+    WHERE n.nspname = 'public'
+      AND p.proname LIKE '__reflex_union_mirror_%'
+      AND NOT EXISTS (
+        SELECT 1 FROM pg_depend d JOIN pg_extension e ON e.oid = d.refobjid
+        WHERE e.extname = 'pg_reflex' AND d.objid = p.oid AND d.deptype = 'e')
+  LOOP
+    BEGIN
+      EXECUTE format('ALTER EXTENSION pg_reflex ADD FUNCTION public.%I()', r.proname);
+    EXCEPTION WHEN OTHERS THEN
+      RAISE NOTICE 'pg_reflex 1.8.0: could not adopt public.% into extension: %', r.proname, SQLERRM;
+    END;
+  END LOOP;
+END
+$um$;
+
 DO $note$
 BEGIN
   RAISE NOTICE 'pg_reflex 1.8.0: trigger functions consolidated to public and registered as extension members.';
