@@ -780,7 +780,8 @@ fn test_flush_fn_is_public_qualified_and_member_registered() {
         "constraint trigger must bind the public copy: {joined}"
     );
     assert!(
-        joined.contains("ALTER EXTENSION pg_reflex ADD FUNCTION public.__reflex_deferred_flush_fn()"),
+        joined
+            .contains("ALTER EXTENSION pg_reflex ADD FUNCTION public.__reflex_deferred_flush_fn()"),
         "flush fn must self-register as an extension member: {joined}"
     );
 }
@@ -800,7 +801,9 @@ fn test_immediate_per_source_fns_are_public_qualified_and_member_registered() {
             "{op} trigger must bind the public copy: {joined}"
         );
         assert!(
-            joined.contains(&format!("ALTER EXTENSION pg_reflex ADD FUNCTION public.{fname}()")),
+            joined.contains(&format!(
+                "ALTER EXTENSION pg_reflex ADD FUNCTION public.{fname}()"
+            )),
             "{op} fn must self-register as a member: {joined}"
         );
     }
@@ -822,7 +825,9 @@ fn test_deferred_per_source_fns_are_public_qualified_and_member_registered() {
             "{op} trigger must bind the public copy: {joined}"
         );
         assert!(
-            joined.contains(&format!("ALTER EXTENSION pg_reflex ADD FUNCTION public.{fname}()")),
+            joined.contains(&format!(
+                "ALTER EXTENSION pg_reflex ADD FUNCTION public.{fname}()"
+            )),
             "{op} fn must self-register as a member: {joined}"
         );
     }

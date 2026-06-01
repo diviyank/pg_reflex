@@ -384,7 +384,11 @@ fn drop_reflex_ivm_impl_inner(view_name: &str, cascade: bool, root: &str) -> &'s
                 let qualified = format!("public.{}", fn_name);
                 detach_function_from_extension(client, &qualified);
                 client
-                    .update(&format!("DROP FUNCTION IF EXISTS {}()", qualified), None, &[])
+                    .update(
+                        &format!("DROP FUNCTION IF EXISTS {}()", qualified),
+                        None,
+                        &[],
+                    )
                     .unwrap_or_report();
             }
         }
