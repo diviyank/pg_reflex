@@ -702,11 +702,8 @@ fn test_drop_self_heals_extension_member_trigger_fn() {
         None,
     );
 
-    // Reproduce the inconsistent state an upgrade-window CREATE leaves behind:
-    // adopt the per-source INSERT trigger function as a pg_reflex member.
-    Spi::run("ALTER EXTENSION pg_reflex ADD FUNCTION __reflex_ins_trigger_on_drop_extfn_src()")
-        .expect("attach trigger fn to extension");
-
+    // As of 1.7.7, per-source trigger functions are automatically registered as
+    // extension members during IMV creation. Verify that they are indeed members.
     let member_before = Spi::get_one::<i64>(
         "SELECT COUNT(*) FROM pg_depend d \
          JOIN pg_extension e ON e.oid = d.refobjid \
@@ -715,9 +712,9 @@ fn test_drop_self_heals_extension_member_trigger_fn() {
     )
     .expect("q")
     .expect("v");
-    assert_eq!(member_before, 1, "precondition: trigger fn is an extension member");
+    assert_eq!(member_before, 1, "precondition: trigger fn is an extension member after create_reflex_ivm");
 
-    // Must self-heal rather than abort.
+    // Must self-heal rather than abort when dropping a function that's an extension member.
     let result = crate::drop_reflex_ivm("drop_extfn_view");
     assert_eq!(result, "DROP REFLEX INCREMENTAL VIEW");
 

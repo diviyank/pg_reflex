@@ -171,7 +171,8 @@ fn test_target_partitioned_parent_is_never_unlogged() {
 #[test]
 fn test_trigger_ddls_format() {
     let ddls = build_trigger_ddls("orders");
-    assert_eq!(ddls.len(), 4);
+    // 4 trigger DDL blocks + 4 member registration blocks = 8 total
+    assert_eq!(ddls.len(), 8);
     // INSERT trigger: references transition table directly, loops over IMVs
     assert!(ddls[0].contains("AFTER INSERT ON orders"));
     assert!(ddls[0].contains("REFERENCING NEW TABLE AS"));
@@ -191,6 +192,11 @@ fn test_trigger_ddls_format() {
     assert!(ddls[3].contains("AFTER TRUNCATE ON orders"));
     assert!(ddls[3].contains("reflex_build_truncate_sql"));
     assert!(ddls[3].contains("FOR _rec IN"));
+    // Member registration blocks (indices 4-7)
+    assert!(ddls[4].contains("ALTER EXTENSION pg_reflex ADD FUNCTION"));
+    assert!(ddls[5].contains("ALTER EXTENSION pg_reflex ADD FUNCTION"));
+    assert!(ddls[6].contains("ALTER EXTENSION pg_reflex ADD FUNCTION"));
+    assert!(ddls[7].contains("ALTER EXTENSION pg_reflex ADD FUNCTION"));
 }
 
 #[test]
@@ -777,4 +783,25 @@ fn test_flush_fn_is_public_qualified_and_member_registered() {
         joined.contains("ALTER EXTENSION pg_reflex ADD FUNCTION public.__reflex_deferred_flush_fn()"),
         "flush fn must self-register as an extension member: {joined}"
     );
+}
+
+#[test]
+fn test_immediate_per_source_fns_are_public_qualified_and_member_registered() {
+    let ddls = crate::schema_builder::build_trigger_ddls("myschema.orders");
+    let joined = ddls.join("\n");
+    for op in ["ins", "del", "upd", "trunc"] {
+        let fname = format!("__reflex_{op}_trigger_on_myschema_orders");
+        assert!(
+            joined.contains(&format!("CREATE OR REPLACE FUNCTION public.{fname}()")),
+            "{op} fn must be created in public: {joined}"
+        );
+        assert!(
+            joined.contains(&format!("EXECUTE FUNCTION public.{fname}()")),
+            "{op} trigger must bind the public copy: {joined}"
+        );
+        assert!(
+            joined.contains(&format!("ALTER EXTENSION pg_reflex ADD FUNCTION public.{fname}()")),
+            "{op} fn must self-register as a member: {joined}"
+        );
+    }
 }

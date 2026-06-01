@@ -617,7 +617,9 @@ fn test_update_trigger_emits_filter_aware_skip_block() {
 fn test_trigger_ddl_quoted_table_name() {
     // Tables with reserved-word names like "order" should not break trigger naming
     let ddls = build_trigger_ddls("alp.\"order\"");
-    for ddl in &ddls {
+    // Check the first 4 trigger/function DDL blocks (indices 0-3); skip the member
+    // registration blocks (indices 4-7) which don't reference the source table.
+    for ddl in &ddls[0..4] {
         // Trigger function names should NOT contain literal quote characters
         assert!(
             !ddl.contains("__reflex_ins_trigger_on_alp_\"order\""),
@@ -641,7 +643,9 @@ fn test_trigger_ddl_quoted_table_name() {
 #[test]
 fn test_trigger_ddl_unquoted_table_name_unchanged() {
     let ddls = build_trigger_ddls("public.sales");
-    for ddl in &ddls {
+    // Check the first 4 trigger/function DDL blocks (indices 0-3); skip the member
+    // registration blocks (indices 4-7) which don't reference the source table.
+    for ddl in &ddls[0..4] {
         assert!(
             ddl.contains("_on_public_sales"),
             "Unquoted table names should work normally"

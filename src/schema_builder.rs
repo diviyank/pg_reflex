@@ -604,11 +604,11 @@ pub fn build_trigger_ddls(source_table: &str) -> Vec<String> {
     let ins_trig = safe_identifier(&format!("__reflex_trigger_ins_on_{}", safe_source));
     let ins_body = render_body(&ref_new, &pred_check_ins, "", "", "", "'INSERT'");
     let ins_ddl = format!(
-        "CREATE OR REPLACE FUNCTION {ins_fn}() RETURNS TRIGGER AS $fn$ {ins_body} $fn$ LANGUAGE plpgsql;\n\
+        "CREATE OR REPLACE FUNCTION public.{ins_fn}() RETURNS TRIGGER AS $fn$ {ins_body} $fn$ LANGUAGE plpgsql;\n\
          CREATE OR REPLACE TRIGGER \"{ins_trig}\" \
          AFTER INSERT ON {source_table} \
          REFERENCING NEW TABLE AS \"{ref_new}\" \
-         FOR EACH STATEMENT EXECUTE FUNCTION {ins_fn}()"
+         FOR EACH STATEMENT EXECUTE FUNCTION public.{ins_fn}()"
     );
 
     // DELETE
@@ -616,11 +616,11 @@ pub fn build_trigger_ddls(source_table: &str) -> Vec<String> {
     let del_trig = safe_identifier(&format!("__reflex_trigger_del_on_{}", safe_source));
     let del_body = render_body(&ref_old, &pred_check_del, "", "", "", "'DELETE'");
     let del_ddl = format!(
-        "CREATE OR REPLACE FUNCTION {del_fn}() RETURNS TRIGGER AS $fn$ {del_body} $fn$ LANGUAGE plpgsql;\n\
+        "CREATE OR REPLACE FUNCTION public.{del_fn}() RETURNS TRIGGER AS $fn$ {del_body} $fn$ LANGUAGE plpgsql;\n\
          CREATE OR REPLACE TRIGGER \"{del_trig}\" \
          AFTER DELETE ON {source_table} \
          REFERENCING OLD TABLE AS \"{ref_old}\" \
-         FOR EACH STATEMENT EXECUTE FUNCTION {del_fn}()"
+         FOR EACH STATEMENT EXECUTE FUNCTION public.{del_fn}()"
     );
 
     // UPDATE
@@ -635,11 +635,11 @@ pub fn build_trigger_ddls(source_table: &str) -> Vec<String> {
         "_directional_op",
     );
     let upd_ddl = format!(
-        "CREATE OR REPLACE FUNCTION {upd_fn}() RETURNS TRIGGER AS $fn$ {upd_body} $fn$ LANGUAGE plpgsql;\n\
+        "CREATE OR REPLACE FUNCTION public.{upd_fn}() RETURNS TRIGGER AS $fn$ {upd_body} $fn$ LANGUAGE plpgsql;\n\
          CREATE OR REPLACE TRIGGER \"{upd_trig}\" \
          AFTER UPDATE ON {source_table} \
          REFERENCING NEW TABLE AS \"{ref_new}\" OLD TABLE AS \"{ref_old}\" \
-         FOR EACH STATEMENT EXECUTE FUNCTION {upd_fn}()"
+         FOR EACH STATEMENT EXECUTE FUNCTION public.{upd_fn}()"
     );
 
     // TRUNCATE — no REFERENCING clauses; loops over all dependent IMVs
@@ -650,13 +650,22 @@ pub fn build_trigger_ddls(source_table: &str) -> Vec<String> {
         &[("__REFLEX_SLOT_SOURCE_TABLE__", source_table)],
     );
     let trunc_ddl = format!(
-        "CREATE OR REPLACE FUNCTION {trunc_fn}() RETURNS TRIGGER AS $fn$ {trunc_body} $fn$ LANGUAGE plpgsql;\n\
+        "CREATE OR REPLACE FUNCTION public.{trunc_fn}() RETURNS TRIGGER AS $fn$ {trunc_body} $fn$ LANGUAGE plpgsql;\n\
          CREATE OR REPLACE TRIGGER \"{trunc_trig}\" \
          AFTER TRUNCATE ON {source_table} \
-         FOR EACH STATEMENT EXECUTE FUNCTION {trunc_fn}()"
+         FOR EACH STATEMENT EXECUTE FUNCTION public.{trunc_fn}()"
     );
 
-    vec![ins_ddl, del_ddl, upd_ddl, trunc_ddl]
+    vec![
+        ins_ddl,
+        del_ddl,
+        upd_ddl,
+        trunc_ddl,
+        member_register_ddl(&ins_fn),
+        member_register_ddl(&del_fn),
+        member_register_ddl(&upd_fn),
+        member_register_ddl(&trunc_fn),
+    ]
 }
 
 /// Build deferred-mode trigger DDL statements for a source table.
