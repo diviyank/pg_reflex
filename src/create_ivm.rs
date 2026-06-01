@@ -2507,6 +2507,37 @@ pub(crate) fn create_reflex_ivm_impl(
     )
 }
 
+/// Guardrail for the search_path footgun behind "intermediate tables sometimes
+/// land in public". A *bare* IMV name created under a non-`public` search_path
+/// puts the IMV's maintenance tables (intermediate / scratch / affected) in that
+/// head schema, but the generated maintenance SQL references them by bare name —
+/// so any DML that fires the source triggers from a session whose search_path
+/// excludes that schema cannot resolve them (it errors, or silently hits a
+/// `public` homonym). Schema-qualified IMV names are immune. We can't safely
+/// auto-qualify (it would change the catalog key every other entry point looks
+/// up by) nor reject (a consistent create+maintain search_path works fine), so
+/// we surface the risk with the concrete fix at creation time.
+fn warn_on_bare_name_under_nonpublic_search_path(view_name: &str) {
+    if canonical_source(view_name).0.is_some() {
+        return; // already schema-qualified — search_path-independent
+    }
+    let current_schema: Option<String> = Spi::get_one::<String>("SELECT current_schema()::text")
+        .ok()
+        .flatten();
+    if let Some(schema) = current_schema {
+        if schema != "public" {
+            warning!(
+                "pg_reflex: IMV '{view_name}' created with a bare name under search_path schema \
+                 '{schema}'. Its maintenance tables (intermediate/scratch/affected) live in \
+                 '{schema}', but the generated maintenance SQL references them unqualified — DML \
+                 firing the source triggers from a session whose search_path excludes '{schema}' \
+                 will fail to find them. Create with a schema-qualified name \
+                 ('{schema}.{view_name}') to make maintenance search_path-independent."
+            );
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn create_reflex_ivm_impl_with_materialization(
     view_name: &str,
@@ -2524,6 +2555,8 @@ pub(crate) fn create_reflex_ivm_impl_with_materialization(
         Ok(p) => p,
         Err(msg) => return msg,
     };
+
+    warn_on_bare_name_under_nonpublic_search_path(view_name);
 
     // The `unique_columns` argument may carry per-CTE keys after the outer key
     // (`'<outer> ; <cte alias> : <cols> ; ...'`). Strip them so only the outer

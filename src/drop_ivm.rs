@@ -12,6 +12,56 @@ pub(crate) fn drop_reflex_ivm_impl(view_name: &str, cascade: bool) -> &'static s
     drop_reflex_ivm_impl_inner(view_name, cascade, view_name)
 }
 
+/// Detach a parameterless function from any extension that owns it as a
+/// `deptype='e'` member so the subsequent `DROP FUNCTION` cannot be blocked by
+/// `cannot drop function … because extension … requires it`.
+///
+/// pg_reflex's per-source trigger functions and UNION-ALL mirror functions are
+/// created at runtime from `create_reflex_ivm`, so they normally belong to the
+/// database, not the extension. But a `CREATE`/`CREATE OR REPLACE` that runs
+/// while PG's `creating_extension` flag is set — any `ALTER EXTENSION pg_reflex
+/// UPDATE` window — adopts them as members (see `sql/pg_reflex--1.7.0--1.7.1.sql`).
+/// Once a migration leaves a tenant in that state a plain drop hits a hard wall.
+/// `fn_ref` is the function reference exactly as the following `DROP FUNCTION`
+/// names it (bare or schema-qualified, no argument list); the membership probe
+/// resolves it through the same search_path via `to_regprocedure`, so a missing
+/// or non-member function is a silent no-op.
+fn detach_function_from_extension(client: &mut pgrx::spi::SpiClient<'_>, fn_ref: &str) {
+    // `extname` is PG's `name` type — selecting it `::text` keeps SPI's
+    // `String` extraction from silently coercing a type mismatch into `None`.
+    let owning_extension: Option<String> = client
+        .select(
+            "SELECT e.extname::text AS extname FROM pg_depend d \
+             JOIN pg_extension e ON e.oid = d.refobjid \
+             WHERE d.classid = 'pg_proc'::regclass \
+               AND d.refclassid = 'pg_extension'::regclass \
+               AND d.deptype = 'e' \
+               AND d.objid = to_regprocedure($1)::oid",
+            None,
+            &[unsafe {
+                DatumWithOid::new(format!("{fn_ref}()"), PgBuiltInOids::TEXTOID.oid().value())
+            }],
+        )
+        .unwrap_or_report()
+        .first()
+        .get_by_name::<String, _>("extname")
+        .unwrap_or(None);
+
+    if let Some(extension) = owning_extension {
+        client
+            .update(
+                &format!(
+                    "ALTER EXTENSION {} DROP FUNCTION {}()",
+                    quote_identifier(&extension),
+                    fn_ref
+                ),
+                None,
+                &[],
+            )
+            .unwrap_or_report();
+    }
+}
+
 /// Internal entry point that threads the **top-level** view name (`root`)
 /// through recursion. The synthetic-sub-IMV prefix check at the bottom needs
 /// the outermost view's bare name, not the current recursion level's name:
@@ -331,6 +381,7 @@ fn drop_reflex_ivm_impl_inner(view_name: &str, cascade: bool, root: &str) -> &'s
                 }
 
                 let fn_name = format!("__reflex_{}_trigger_on_{}", op, safe_source);
+                detach_function_from_extension(client, &fn_name);
                 client
                     .update(&format!("DROP FUNCTION IF EXISTS {}()", fn_name), None, &[])
                     .unwrap_or_report();
@@ -399,6 +450,7 @@ fn drop_reflex_ivm_impl_inner(view_name: &str, cascade: bool, root: &str) -> &'s
             for i in 0..depends_on_imv.len() {
                 for op in &["ins", "del", "upd"] {
                     let fn_name = format!("__reflex_union_mirror_{safe_wrapper}_{i}_{op}");
+                    detach_function_from_extension(client, &format!("public.{fn_name}"));
                     client
                         .update(
                             &format!("DROP FUNCTION IF EXISTS public.{fn_name}() CASCADE"),

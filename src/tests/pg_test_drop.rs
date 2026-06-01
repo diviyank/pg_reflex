@@ -677,3 +677,55 @@ fn test_drop_resolves_creation_schema_for_bare_name() {
     .expect("v");
     assert_eq!(int_gone, 0, "intermediate aux table must be dropped, not orphaned");
 }
+
+// Regression: a per-source trigger function that a schema migration left as an
+// extension member (deptype='e') must not turn drop_reflex_ivm into a hard wall.
+// pg_reflex's runtime trigger functions are created from create_reflex_ivm and
+// normally belong to the database, but a CREATE/CREATE OR REPLACE that runs while
+// PG's `creating_extension` flag is set (any `ALTER EXTENSION pg_reflex UPDATE`
+// window) adopts them as members. Once that happens, a plain `DROP FUNCTION`
+// fails with "cannot drop function … because extension pg_reflex requires it"
+// and `unwrap_or_report()` aborts the entire teardown. The drop must detach the
+// function from the extension first, then drop it.
+#[pg_test]
+fn test_drop_self_heals_extension_member_trigger_fn() {
+    Spi::run("CREATE TABLE drop_extfn_src (id SERIAL, grp TEXT, val NUMERIC)")
+        .expect("create table");
+    Spi::run("INSERT INTO drop_extfn_src (grp, val) VALUES ('a', 1)").expect("seed");
+
+    crate::create_reflex_ivm(
+        "drop_extfn_view",
+        "SELECT grp, SUM(val) AS total FROM drop_extfn_src GROUP BY grp",
+        None,
+        None,
+        None,
+        None,
+    );
+
+    // Reproduce the inconsistent state an upgrade-window CREATE leaves behind:
+    // adopt the per-source INSERT trigger function as a pg_reflex member.
+    Spi::run("ALTER EXTENSION pg_reflex ADD FUNCTION __reflex_ins_trigger_on_drop_extfn_src()")
+        .expect("attach trigger fn to extension");
+
+    let member_before = Spi::get_one::<i64>(
+        "SELECT COUNT(*) FROM pg_depend d \
+         JOIN pg_extension e ON e.oid = d.refobjid \
+         WHERE d.deptype = 'e' AND e.extname = 'pg_reflex' \
+           AND d.objid = to_regprocedure('__reflex_ins_trigger_on_drop_extfn_src()')",
+    )
+    .expect("q")
+    .expect("v");
+    assert_eq!(member_before, 1, "precondition: trigger fn is an extension member");
+
+    // Must self-heal rather than abort.
+    let result = crate::drop_reflex_ivm("drop_extfn_view");
+    assert_eq!(result, "DROP REFLEX INCREMENTAL VIEW");
+
+    // The function must actually be gone, not merely detached.
+    let fn_left = Spi::get_one::<i64>(
+        "SELECT COUNT(*) FROM pg_proc WHERE proname = '__reflex_ins_trigger_on_drop_extfn_src'",
+    )
+    .expect("q")
+    .expect("v");
+    assert_eq!(fn_left, 0, "trigger function must be dropped");
+}

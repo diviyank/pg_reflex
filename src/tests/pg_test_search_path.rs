@@ -532,3 +532,35 @@ fn pg_test_deferred_imv_bare_source_with_public_homonym() {
         "deferred IMV over bare source diverged from fresh (homonym in public)"
     );
 }
+
+/// Guardrail: creating a bare-named IMV under a non-public search_path still
+/// succeeds and co-locates its maintenance tables in the head schema, but emits
+/// a warning recommending a schema-qualified name (bare maintenance SQL is
+/// search_path-fragile). This test pins the non-breaking behavior; the warning
+/// itself is surfaced to the operator at creation time.
+#[pg_test]
+fn pg_test_bare_name_under_nonpublic_search_path_warns_and_creates() {
+    Spi::run("CREATE SCHEMA gtnt").expect("schema");
+    Spi::run("CREATE TABLE gtnt.s (id SERIAL, grp TEXT, val NUMERIC)").expect("source");
+    Spi::run("INSERT INTO gtnt.s (grp, val) VALUES ('a', 1)").expect("seed");
+    Spi::run("SET search_path = gtnt").expect("narrow search_path");
+
+    let r = crate::create_reflex_ivm(
+        "gv",
+        "SELECT grp, SUM(val) AS total FROM s GROUP BY grp",
+        None,
+        None,
+        None,
+        None,
+    );
+    assert_eq!(r, "CREATE REFLEX INCREMENTAL VIEW");
+
+    // Aux tables co-located in gtnt (the head schema), not public.
+    let int_schema = Spi::get_one::<String>(
+        "SELECT n.nspname::text FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+         WHERE c.relname = '__reflex_intermediate_gv'",
+    )
+    .expect("q")
+    .expect("v");
+    assert_eq!(int_schema, "gtnt");
+}
