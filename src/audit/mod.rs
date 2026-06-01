@@ -12,7 +12,7 @@ use checks_a_catastrophic::{
     InternalTablesExist, SourceExists, StagingShape, TriggerAttached, TriggerModeMatches,
 };
 use checks_b_drift::{BaseQueryRuns, IntermediateShape, PartitionMirror, TargetShape};
-use checks_c_orphan::{OrphanIntermediate, OrphanScratch, OrphanStaging};
+use checks_c_orphan::{DuplicateTriggerFunction, OrphanIntermediate, OrphanScratch, OrphanStaging};
 
 pub enum AuditScope {
     All,
@@ -113,6 +113,7 @@ fn registry() -> Vec<Box<dyn Check>> {
         Box::new(OrphanIntermediate),
         Box::new(OrphanStaging),
         Box::new(OrphanScratch),
+        Box::new(DuplicateTriggerFunction),
     ]
 }
 

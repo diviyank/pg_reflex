@@ -190,3 +190,60 @@ impl Check for OrphanScratch {
         findings
     }
 }
+
+// --- duplicate-function --------------------------------------------------
+
+pub(super) struct DuplicateTriggerFunction;
+
+impl Check for DuplicateTriggerFunction {
+    fn id(&self) -> &'static str {
+        "duplicate-function"
+    }
+    fn is_per_imv(&self) -> bool {
+        false
+    }
+    fn run_global(&self, client: &SpiClient<'_>, _imvs: &[ImvRow]) -> Vec<Finding> {
+        let mut findings = Vec::new();
+        let rs = client
+            .select(
+                "SELECT p.proname::text AS fn, \
+                        count(*)::bigint AS n, \
+                        string_agg(n.nspname, ', ' ORDER BY n.nspname)::text AS schemas \
+                 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
+                 WHERE p.proname LIKE '__reflex\\_%' \
+                 GROUP BY p.proname HAVING count(*) > 1",
+                None,
+                &[],
+            )
+            .unwrap_or_report();
+        for row in rs {
+            let fname = row
+                .get_by_name::<&str, _>("fn")
+                .ok()
+                .flatten()
+                .unwrap_or("")
+                .to_string();
+            let schemas = row
+                .get_by_name::<&str, _>("schemas")
+                .ok()
+                .flatten()
+                .unwrap_or("")
+                .to_string();
+            let n = row.get_by_name::<i64, _>("n").ok().flatten().unwrap_or(0);
+            if fname.is_empty() {
+                continue;
+            }
+            findings.push(Finding {
+                imv: None,
+                severity: Severity::Warning,
+                category: "duplicate-function",
+                finding: format!("{fname} has {n} copies across schemas: [{schemas}]"),
+                suggested_fix: format!(
+                    "Consolidate to public: re-point any trigger to the public copy, then \
+                     DROP the non-public copies of {fname}; or run reflex_rebuild_triggers(<source>)."
+                ),
+            });
+        }
+        findings
+    }
+}

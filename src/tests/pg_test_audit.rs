@@ -659,3 +659,34 @@ fn pg_test_audit_end_to_end_stale_staging_post_source_recreate() {
     )
     .expect("cleanup");
 }
+
+#[pg_test]
+fn test_audit_flags_duplicate_trigger_function() {
+    Spi::run("CREATE SCHEMA IF NOT EXISTS s_dup").expect("create schema");
+    Spi::run(
+        "CREATE OR REPLACE FUNCTION public.__reflex_ins_trigger_on_dup_demo() \
+         RETURNS TRIGGER AS $$ BEGIN RETURN NULL; END; $$ LANGUAGE plpgsql",
+    )
+    .expect("create public fn");
+    Spi::run(
+        "CREATE OR REPLACE FUNCTION s_dup.__reflex_ins_trigger_on_dup_demo() \
+         RETURNS TRIGGER AS $$ BEGIN RETURN NULL; END; $$ LANGUAGE plpgsql",
+    )
+    .expect("create s_dup fn");
+
+    let report: String = Spi::get_one("SELECT reflex_audit()")
+        .expect("query ok")
+        .expect("non-null result");
+    assert!(
+        report.contains("duplicate-function") && report.contains("__reflex_ins_trigger_on_dup_demo"),
+        "audit must flag the duplicate function. report:\n{}",
+        report
+    );
+
+    // Cleanup
+    Spi::run("DROP FUNCTION IF EXISTS s_dup.__reflex_ins_trigger_on_dup_demo() CASCADE")
+        .expect("drop s_dup fn");
+    Spi::run("DROP FUNCTION IF EXISTS public.__reflex_ins_trigger_on_dup_demo() CASCADE")
+        .expect("drop public fn");
+    Spi::run("DROP SCHEMA IF EXISTS s_dup CASCADE").expect("drop schema");
+}
