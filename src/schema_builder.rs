@@ -725,11 +725,11 @@ pub fn build_deferred_trigger_ddls(source_table: &str, source_columns: &[String]
     let ins_trig = safe_identifier(&format!("__reflex_trigger_ins_on_{}", safe_source));
     let ins_body = render_ins_del(&ref_new, "INSERT", "I", &ref_new);
     let ins_ddl = format!(
-        "CREATE OR REPLACE FUNCTION {ins_fn}() RETURNS TRIGGER AS $fn$ {ins_body} $fn$ LANGUAGE plpgsql;\n\
+        "CREATE OR REPLACE FUNCTION public.{ins_fn}() RETURNS TRIGGER AS $fn$ {ins_body} $fn$ LANGUAGE plpgsql;\n\
          CREATE OR REPLACE TRIGGER \"{ins_trig}\" \
          AFTER INSERT ON {source_table} \
          REFERENCING NEW TABLE AS \"{ref_new}\" \
-         FOR EACH STATEMENT EXECUTE FUNCTION {ins_fn}()"
+         FOR EACH STATEMENT EXECUTE FUNCTION public.{ins_fn}()"
     );
 
     // DELETE
@@ -737,11 +737,11 @@ pub fn build_deferred_trigger_ddls(source_table: &str, source_columns: &[String]
     let del_trig = safe_identifier(&format!("__reflex_trigger_del_on_{}", safe_source));
     let del_body = render_ins_del(&ref_old, "DELETE", "D", &ref_old);
     let del_ddl = format!(
-        "CREATE OR REPLACE FUNCTION {del_fn}() RETURNS TRIGGER AS $fn$ {del_body} $fn$ LANGUAGE plpgsql;\n\
+        "CREATE OR REPLACE FUNCTION public.{del_fn}() RETURNS TRIGGER AS $fn$ {del_body} $fn$ LANGUAGE plpgsql;\n\
          CREATE OR REPLACE TRIGGER \"{del_trig}\" \
          AFTER DELETE ON {source_table} \
          REFERENCING OLD TABLE AS \"{ref_old}\" \
-         FOR EACH STATEMENT EXECUTE FUNCTION {del_fn}()"
+         FOR EACH STATEMENT EXECUTE FUNCTION public.{del_fn}()"
     );
 
     // UPDATE — capture both old and new rows
@@ -759,11 +759,11 @@ pub fn build_deferred_trigger_ddls(source_table: &str, source_columns: &[String]
         ],
     );
     let upd_ddl = format!(
-        "CREATE OR REPLACE FUNCTION {upd_fn}() RETURNS TRIGGER AS $fn$ {upd_body} $fn$ LANGUAGE plpgsql;\n\
+        "CREATE OR REPLACE FUNCTION public.{upd_fn}() RETURNS TRIGGER AS $fn$ {upd_body} $fn$ LANGUAGE plpgsql;\n\
          CREATE OR REPLACE TRIGGER \"{upd_trig}\" \
          AFTER UPDATE ON {source_table} \
          REFERENCING NEW TABLE AS \"{ref_new}\" OLD TABLE AS \"{ref_old}\" \
-         FOR EACH STATEMENT EXECUTE FUNCTION {upd_fn}()"
+         FOR EACH STATEMENT EXECUTE FUNCTION public.{upd_fn}()"
     );
 
     // TRUNCATE — same as immediate (no deferred staging for truncate)
@@ -778,13 +778,22 @@ pub fn build_deferred_trigger_ddls(source_table: &str, source_columns: &[String]
         ],
     );
     let trunc_ddl = format!(
-        "CREATE OR REPLACE FUNCTION {trunc_fn}() RETURNS TRIGGER AS $fn$ {trunc_body} $fn$ LANGUAGE plpgsql;\n\
+        "CREATE OR REPLACE FUNCTION public.{trunc_fn}() RETURNS TRIGGER AS $fn$ {trunc_body} $fn$ LANGUAGE plpgsql;\n\
          CREATE OR REPLACE TRIGGER \"{trunc_trig}\" \
          AFTER TRUNCATE ON {source_table} \
-         FOR EACH STATEMENT EXECUTE FUNCTION {trunc_fn}()"
+         FOR EACH STATEMENT EXECUTE FUNCTION public.{trunc_fn}()"
     );
 
-    vec![ins_ddl, del_ddl, upd_ddl, trunc_ddl]
+    vec![
+        ins_ddl,
+        del_ddl,
+        upd_ddl,
+        trunc_ddl,
+        member_register_ddl(&ins_fn),
+        member_register_ddl(&del_fn),
+        member_register_ddl(&upd_fn),
+        member_register_ddl(&trunc_fn),
+    ]
 }
 
 /// DDL that registers `public.<fn_name>` as a member of the pg_reflex extension.

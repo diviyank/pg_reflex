@@ -805,3 +805,25 @@ fn test_immediate_per_source_fns_are_public_qualified_and_member_registered() {
         );
     }
 }
+
+#[test]
+fn test_deferred_per_source_fns_are_public_qualified_and_member_registered() {
+    let cols = vec!["id".to_string(), "amount".to_string()];
+    let ddls = crate::schema_builder::build_deferred_trigger_ddls("myschema.orders", &cols);
+    let joined = ddls.join("\n");
+    for op in ["ins", "del", "upd", "trunc"] {
+        let fname = format!("__reflex_{op}_trigger_on_myschema_orders");
+        assert!(
+            joined.contains(&format!("CREATE OR REPLACE FUNCTION public.{fname}()")),
+            "{op} fn must be created in public: {joined}"
+        );
+        assert!(
+            joined.contains(&format!("EXECUTE FUNCTION public.{fname}()")),
+            "{op} trigger must bind the public copy: {joined}"
+        );
+        assert!(
+            joined.contains(&format!("ALTER EXTENSION pg_reflex ADD FUNCTION public.{fname}()")),
+            "{op} fn must self-register as a member: {joined}"
+        );
+    }
+}
