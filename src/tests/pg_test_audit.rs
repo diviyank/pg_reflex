@@ -479,6 +479,58 @@ fn pg_test_audit_partition_mirror_green_when_unpartitioned() {
 }
 
 #[pg_test]
+fn pg_test_audit_detects_partition_tree_drift() {
+    // Create a multi-level partitioned source: LIST -> RANGE
+    Spi::run(
+        "CREATE TABLE ssb (dem_plan_id BIGINT NOT NULL, order_date DATE NOT NULL, product_id BIGINT, qty INT) \
+         PARTITION BY LIST (dem_plan_id)",
+    )
+    .expect("root");
+    Spi::run(
+        "CREATE TABLE ssb_172 PARTITION OF ssb FOR VALUES IN (172) \
+         PARTITION BY RANGE (order_date)",
+    )
+    .expect("list");
+    Spi::run(
+        "CREATE TABLE ssb_172_2025_01 PARTITION OF ssb_172 \
+         FOR VALUES FROM ('2025-01-01') TO ('2025-02-01')",
+    )
+    .expect("l1");
+
+    // Create IMV with partitioning
+    Spi::run(
+        "SELECT create_reflex_ivm(\
+            'fcstb', \
+            'SELECT dem_plan_id, order_date, product_id, qty FROM ssb', \
+            'dem_plan_id,product_id,order_date', \
+            NULL, NULL, NULL, \
+            ARRAY['dem_plan_id'])",
+    )
+    .expect("create IMV");
+
+    // Induce drift: attach a new source leaf but deliberately skip the flush.
+    Spi::run(
+        "CREATE TABLE ssb_172_2025_02 PARTITION OF ssb_172 \
+         FOR VALUES FROM ('2025-02-01') TO ('2025-03-01')",
+    )
+    .expect("attach new source leaf");
+
+    // Simulate a forgotten flush by truncating the partition pending table
+    Spi::run("TRUNCATE public.__reflex_partition_pending").expect("simulate forgotten flush");
+
+    // Force drift by dropping the auto-synced IMV leaf if it was created
+    Spi::run("DROP TABLE IF EXISTS public.fcstb_ssb_172_2025_02 CASCADE").expect("force drift");
+
+    let report: String = Spi::get_one("SELECT reflex_audit('fcstb')")
+        .expect("audit")
+        .expect("audit result");
+    assert!(
+        report.to_lowercase().contains("partition") && report.to_lowercase().contains("drift"),
+        "audit should flag partition drift: {report}"
+    );
+}
+
+#[pg_test]
 fn pg_test_audit_orphan_intermediate_detects() {
     Spi::run("CREATE TABLE __reflex_intermediate_audit_orph_view (id BIGINT)")
         .expect("plant orphan");

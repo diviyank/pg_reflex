@@ -232,3 +232,95 @@ impl Check for PartitionMirror {
         }]
     }
 }
+
+pub(super) struct PartitionTreeDrift;
+
+impl Check for PartitionTreeDrift {
+    fn id(&self) -> &'static str {
+        "partition-tree-drift"
+    }
+    fn run(&self, client: &SpiClient<'_>, imv: Option<&ImvRow>) -> Vec<Finding> {
+        let imv = match imv {
+            Some(i) => i,
+            None => return vec![],
+        };
+        if !imv.enabled {
+            return vec![];
+        }
+        let part_cols = match imv.partition_columns.as_ref() {
+            Some(p) if !p.is_empty() => p,
+            _ => return vec![],
+        };
+
+        // Anchor source = the source in depends_on that owns part_cols[0].
+        let sources: Vec<String> = imv.real_sources().map(|s| s.to_string()).collect();
+        let anchor = match crate::partition::resolve_anchor_source(client, &part_cols[0], &sources)
+        {
+            Ok(a) => a,
+            Err(_) => return vec![],
+        };
+
+        // Get the full recursive partition trees (including all levels: leaves have sub_strategy == None)
+        let src_tree = crate::partition::list_partition_tree(client, &anchor);
+        let imv_tree = crate::partition::list_partition_tree(
+            client,
+            &crate::query_decomposer::quote_identifier(&imv.name),
+        );
+
+        // Filter to leaves only (nodes with no sub-partitioning)
+        let src_leaves: HashSet<String> = src_tree
+            .iter()
+            .filter(|node| node.sub_strategy.is_none())
+            .map(|node| crate::partition::target_child_name(&imv.name, &node.bare_name))
+            .collect();
+
+        let imv_leaves: HashSet<String> = imv_tree
+            .iter()
+            .filter(|node| node.sub_strategy.is_none())
+            .map(|node| node.bare_name.clone())
+            .collect();
+
+        let missing_leaves: Vec<String> = src_leaves.difference(&imv_leaves).cloned().collect();
+        let extra_leaves: Vec<String> = imv_leaves.difference(&src_leaves).cloned().collect();
+
+        if missing_leaves.is_empty() && extra_leaves.is_empty() {
+            return vec![];
+        }
+
+        let mut findings: Vec<Finding> = Vec::new();
+
+        for leaf in missing_leaves {
+            findings.push(Finding {
+                imv: Some(imv.name.clone()),
+                severity: Severity::Warning,
+                category: "partition-tree-drift",
+                finding: format!(
+                    "Partition drift: source leaf maps to IMV leaf '{}' which is missing",
+                    leaf
+                ),
+                suggested_fix: format!(
+                    "SELECT reflex_flush_partitions(); -- or SELECT reflex_sync_partitions('{}', TRUE);",
+                    imv.name
+                ),
+            });
+        }
+
+        for leaf in extra_leaves {
+            findings.push(Finding {
+                imv: Some(imv.name.clone()),
+                severity: Severity::Warning,
+                category: "partition-tree-drift",
+                finding: format!(
+                    "Partition drift: IMV leaf '{}' has no source counterpart",
+                    leaf
+                ),
+                suggested_fix: format!(
+                    "SELECT reflex_sync_partitions('{}', TRUE); -- drop_orphans=TRUE to clean up",
+                    imv.name
+                ),
+            });
+        }
+
+        findings
+    }
+}

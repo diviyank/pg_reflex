@@ -11,7 +11,9 @@ pub mod checks_c_orphan;
 use checks_a_catastrophic::{
     InternalTablesExist, SourceExists, StagingShape, TriggerAttached, TriggerModeMatches,
 };
-use checks_b_drift::{BaseQueryRuns, IntermediateShape, PartitionMirror, TargetShape};
+use checks_b_drift::{
+    BaseQueryRuns, IntermediateShape, PartitionMirror, PartitionTreeDrift, TargetShape,
+};
 use checks_c_orphan::{DuplicateTriggerFunction, OrphanIntermediate, OrphanScratch, OrphanStaging};
 
 pub enum AuditScope {
@@ -110,6 +112,7 @@ fn registry() -> Vec<Box<dyn Check>> {
         Box::new(TargetShape),
         Box::new(BaseQueryRuns),
         Box::new(PartitionMirror),
+        Box::new(PartitionTreeDrift),
         Box::new(OrphanIntermediate),
         Box::new(OrphanStaging),
         Box::new(OrphanScratch),
