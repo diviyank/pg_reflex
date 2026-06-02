@@ -462,6 +462,21 @@ fn reflex_reconcile_partition(
     partition::reflex_reconcile_partition_impl(view_name, partition_keys, source_partition)
 }
 
+/// Resolve pending source-partition changes: oid-diff each dirty source root
+/// against the snapshot, then swap-fill / create / drop the matching IMV
+/// partitions (cascading to dependents). Call after a batch of DETACH/ATTACH
+/// swaps. Drains __reflex_partition_pending.
+#[pg_extern]
+fn reflex_flush_partitions() -> String {
+    partition::reflex_flush_partitions_impl(None)
+}
+
+/// Flush a single source root (skips the pending-queue scan).
+#[pg_extern]
+fn reflex_flush_partition_source(source_root: &str) -> String {
+    partition::reflex_flush_partitions_impl(Some(source_root))
+}
+
 /// Drop a reflex IMV and all its artifacts (triggers, tables, reference row).
 /// Refuses to drop if the IMV has children unless cascade is true.
 #[pg_extern]

@@ -201,3 +201,30 @@ fn pg_subpart_snapshot_seeded_at_create() {
     ).expect("q").expect("c");
     assert_eq!(cnt, 1);
 }
+
+#[pg_test]
+fn pg_subpart_flush_applies_attach() {
+    Spi::run("CREATE TABLE ss8 (dem_plan_id BIGINT NOT NULL, order_date DATE NOT NULL, product_id BIGINT, qty INT) PARTITION BY LIST (dem_plan_id)").expect("root");
+    Spi::run("CREATE TABLE ss8_172 PARTITION OF ss8 FOR VALUES IN (172) PARTITION BY RANGE (order_date)").expect("list");
+    Spi::run("CREATE TABLE ss8_172_2025_01 PARTITION OF ss8_172 FOR VALUES FROM ('2025-01-01') TO ('2025-02-01')").expect("l1");
+    Spi::run("INSERT INTO ss8 VALUES (172,'2025-01-15',5,10)").expect("seed");
+    Spi::get_one::<String>(
+        "SELECT create_reflex_ivm('fcst8','SELECT dem_plan_id, order_date, product_id, qty FROM ss8', \
+         'dem_plan_id,product_id,order_date', NULL, NULL, NULL, ARRAY['dem_plan_id'])",
+    ).expect("c").expect("c");
+
+    // Build a fresh Feb leaf as a standalone table and ATTACH it (a swap of a
+    // new partition). The pre-existing DDL event trigger auto-syncs structure;
+    // the flush is what fills the data.
+    Spi::run("CREATE TABLE ss8_172_2025_02 (LIKE ss8 INCLUDING ALL)").expect("staging");
+    Spi::run("INSERT INTO ss8_172_2025_02 VALUES (172,'2025-02-15',5,20)").expect("fill staging");
+    Spi::run("ALTER TABLE ss8_172 ATTACH PARTITION ss8_172_2025_02 FOR VALUES FROM ('2025-02-01') TO ('2025-03-01')").expect("attach");
+
+    let r = Spi::get_one::<String>("SELECT reflex_flush_partition_source('public.ss8')").expect("flush").expect("flush");
+    assert!(!r.starts_with("ERROR"), "flush: {r}");
+    let feb = Spi::get_one::<i32>("SELECT qty FROM fcst8 WHERE order_date='2025-02-15'").expect("q").expect("feb");
+    assert_eq!(feb, 20, "attached Feb leaf flushed into IMV");
+    // Jan still present.
+    let jan = Spi::get_one::<i32>("SELECT qty FROM fcst8 WHERE order_date='2025-01-15'").expect("q").expect("jan");
+    assert_eq!(jan, 10);
+}

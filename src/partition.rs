@@ -1619,6 +1619,132 @@ pub(crate) fn refresh_source_snapshot(client: &mut pgrx::spi::SpiClient<'_>, sou
     }
 }
 
+/// Flush pending partition changes. When `only` is Some, flush just that
+/// source root; otherwise drain `__reflex_partition_pending`. For each dirty
+/// root, oid-diff the live leaf set against the snapshot and apply: AttachNew /
+/// SwapFill -> partition-scoped reconcile of the matching IMV leaf (creates it
+/// via sync if new, then swap-fills); Drop -> DROP the orphaned IMV leaf.
+/// Refreshes the snapshot and clears the pending row(s) afterward.
+pub(crate) fn reflex_flush_partitions_impl(only: Option<&str>) -> String {
+    let outcome: Result<String, String> = Spi::connect_mut(|client| {
+        let roots: Vec<String> = match only {
+            Some(r) => vec![r.to_string()],
+            None => client
+                .select(
+                    "SELECT source_root FROM public.__reflex_partition_pending",
+                    None,
+                    &[],
+                )
+                .map_err(|e| format!("flush: pending scan failed: {}", e))?
+                .filter_map(|row| {
+                    row.get_by_name::<&str, _>("source_root")
+                        .ok()
+                        .flatten()
+                        .map(|s| s.to_string())
+                })
+                .collect(),
+        };
+
+        let mut summary: Vec<String> = Vec::new();
+        for root in &roots {
+            // Partitioned IMVs depending on this source root.
+            let imvs: Vec<String> = client
+                .select(
+                    "SELECT name FROM public.__reflex_ivm_reference \
+                     WHERE partition_columns IS NOT NULL AND array_length(partition_columns,1) > 0 \
+                       AND (depends_on @> ARRAY[$1] OR depends_on @> ARRAY[split_part($1,'.',2)])",
+                    None,
+                    &[unsafe { DatumWithOid::new(root.to_string(), pgrx::pg_sys::TEXTOID) }],
+                )
+                .map_err(|e| format!("flush: imv lookup failed: {}", e))?
+                .filter_map(|r| {
+                    r.get_by_name::<&str, _>("name")
+                        .ok()
+                        .flatten()
+                        .map(|s| s.to_string())
+                })
+                .collect();
+
+            // Snapshot (child_name, oid) for this root.
+            let snapshot: Vec<(String, u32)> = client
+                .select(
+                    "SELECT child_name, child_oid FROM public.__reflex_source_partition_snapshot WHERE source_root = $1",
+                    None,
+                    &[unsafe { DatumWithOid::new(root.to_string(), pgrx::pg_sys::TEXTOID) }],
+                )
+                .map_err(|e| format!("flush: snapshot read failed: {}", e))?
+                .filter_map(|r| {
+                    let n = r.get_by_name::<&str, _>("child_name").ok().flatten()?.to_string();
+                    let o = r.get_by_name::<i64, _>("child_oid").ok().flatten()? as u32;
+                    Some((n, o))
+                })
+                .collect();
+
+            let current = current_source_leaf_oids(client, root);
+            let actions = classify_partition_diff(&snapshot, &current);
+
+            for imv in &imvs {
+                for (src_leaf, action) in &actions {
+                    match action {
+                        PartitionDiffAction::AttachNew | PartitionDiffAction::SwapFill => {
+                            let q = format!(
+                                "SELECT public.reflex_reconcile_partition({}, '', {})",
+                                sql_literal_text(imv),
+                                sql_literal_text(src_leaf)
+                            );
+                            client.update(&q, None, &[]).map_err(|e| {
+                                format!("flush reconcile {} {}: {}", imv, src_leaf, e)
+                            })?;
+                        }
+                        PartitionDiffAction::Drop => {
+                            let (schema_opt, _) = split_qualified_name(imv);
+                            let schema = schema_opt.unwrap_or("public");
+                            let tgt = target_child_name(imv, src_leaf);
+                            let int = intermediate_child_name(imv, src_leaf);
+                            let _ = client.update(
+                                &format!("DROP TABLE IF EXISTS \"{}\".\"{}\" CASCADE", schema, tgt),
+                                None,
+                                &[],
+                            );
+                            let _ = client.update(
+                                &format!("DROP TABLE IF EXISTS \"{}\".\"{}\" CASCADE", schema, int),
+                                None,
+                                &[],
+                            );
+                        }
+                    }
+                }
+                summary.push(format!("{}: {} change(s)", imv, actions.len()));
+            }
+
+            refresh_source_snapshot(client, root);
+        }
+
+        match only {
+            Some(r) => {
+                let _ = client.update(
+                    "DELETE FROM public.__reflex_partition_pending WHERE source_root = $1",
+                    None,
+                    &[unsafe { DatumWithOid::new(r.to_string(), pgrx::pg_sys::TEXTOID) }],
+                );
+            }
+            None => {
+                let _ = client.update("TRUNCATE public.__reflex_partition_pending", None, &[]);
+            }
+        }
+
+        Ok(if summary.is_empty() {
+            "OK — nothing pending".to_string()
+        } else {
+            summary.join("; ")
+        })
+    });
+    match outcome {
+        Ok(s) => s,
+        Err(e) => format!("ERROR: {}", e),
+    }
+}
+
 // Phase 1 (plans/1_6_1_refacto.md) — `substitute_identifier` is a re-export
 // of the canonical implementation in
 // [`crate::sql_writer::identifier::substitute_identifier_ci`]. Existing call
