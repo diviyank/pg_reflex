@@ -242,7 +242,80 @@ BEGIN
 END $$;
 
 \echo ''
+\echo '=== Scenario 7: multi-level (sub-partition) source — leaf swap vs region reconcile vs full ==='
+\echo '    Source: LIST(region) -> RANGE(month). IMV mirrors the full tree.'
+\echo '    plans/sub_partitioning.md — validates atomic LEAF swap granularity.'
+DROP TABLE IF EXISTS subpart_bench CASCADE;
+CREATE TABLE subpart_bench (
+    region TEXT   NOT NULL,
+    d      DATE   NOT NULL,
+    pid    BIGINT,
+    amount INT    NOT NULL
+) PARTITION BY LIST (region);
+
+DO $$
+DECLARE r TEXT; m INT;
+BEGIN
+    FOREACH r IN ARRAY ARRAY['A','B'] LOOP
+        EXECUTE format(
+            'CREATE TABLE subpart_bench_%s PARTITION OF subpart_bench FOR VALUES IN (%L) PARTITION BY RANGE (d)',
+            lower(r), r);
+        FOR m IN 1..6 LOOP
+            EXECUTE format(
+                'CREATE TABLE subpart_bench_%s_2025_%s PARTITION OF subpart_bench_%s FOR VALUES FROM (%L) TO (%L)',
+                lower(r), lpad(m::text, 2, '0'), lower(r),
+                make_date(2025, m, 1), make_date(2025, m + 1, 1));
+        END LOOP;
+    END LOOP;
+END $$;
+
+\echo '--- Seeding ~2.4M rows (2 regions x 6 months) ---'
+INSERT INTO subpart_bench (region, d, pid, amount)
+SELECT CASE WHEN i % 2 = 0 THEN 'A' ELSE 'B' END,
+       make_date(2025, ((i / 200000) % 6) + 1, 15),
+       i, (i % 1000)
+FROM generate_series(1, 2400000) AS i;
+ANALYZE subpart_bench;
+
+SELECT public.create_reflex_ivm(
+    'subpart_bench_v',
+    'SELECT region, d, pid, amount FROM subpart_bench',
+    'region,pid,d', NULL, NULL, NULL, ARRAY['region']);
+
+\timing on
+\echo '--- (3) FULL reconcile (baseline: rebuilds every leaf of every region) ---'
+SELECT public.reflex_reconcile('subpart_bench_v');
+
+\echo '--- (2) whole-region reconcile (rebuilds all 6 months of region A) ---'
+SELECT public.reflex_reconcile_partition('subpart_bench_v', '', 'subpart_bench_a');
+
+\echo '--- (1) single-leaf swap: detach A/2025-03, attach fresh leaf, flush (rebuilds 1/12 of a region) ---'
+ALTER TABLE subpart_bench_a DETACH PARTITION subpart_bench_a_2025_03;
+CREATE TABLE subpart_bench_a_2025_03_new (LIKE subpart_bench INCLUDING ALL);
+INSERT INTO subpart_bench_a_2025_03_new
+    SELECT region, d, pid, amount + 1 FROM subpart_bench_a_2025_03;
+DROP TABLE subpart_bench_a_2025_03;
+ALTER TABLE subpart_bench_a ATTACH PARTITION subpart_bench_a_2025_03_new
+    FOR VALUES FROM ('2025-03-01') TO ('2025-04-01');
+SELECT public.reflex_flush_partitions();
+\timing off
+
+\echo '--- Correctness: IMV must equal a fresh recompute of the source ---'
+SELECT CASE WHEN count(*) = 0 THEN 'OK: IMV matches source'
+            ELSE 'DRIFT: ' || count(*)::text || ' mismatched rows' END AS subpart_oracle
+FROM (
+    (SELECT region, d, pid, amount FROM subpart_bench_v
+     EXCEPT SELECT region, d, pid, amount FROM subpart_bench)
+    UNION ALL
+    (SELECT region, d, pid, amount FROM subpart_bench
+     EXCEPT SELECT region, d, pid, amount FROM subpart_bench_v)
+) q;
+\echo '    Expect: (1) single-leaf swap << (2) region reconcile << (3) full reconcile.'
+
+\echo ''
 \echo '=== Cleanup ==='
+SELECT public.drop_reflex_ivm('subpart_bench_v', TRUE);
+DROP TABLE IF EXISTS subpart_bench CASCADE;
 SELECT public.drop_reflex_ivm('part_bench_csw_c', TRUE);
 SELECT public.drop_reflex_ivm('part_bench_v', TRUE);
 SELECT public.drop_reflex_ivm('part_bench_t2_v', TRUE);
