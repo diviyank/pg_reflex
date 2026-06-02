@@ -127,3 +127,29 @@ fn pg_subpart_sync_creates_new_leaf_and_drops_orphan() {
     ).expect("q2").expect("b2");
     assert!(gone, "orphan IMV leaf should be dropped after sync");
 }
+
+#[pg_test]
+fn pg_subpart_reconcile_leaf_swaps_only_that_leaf() {
+    Spi::run("CREATE TABLE ss5 (dem_plan_id BIGINT NOT NULL, order_date DATE NOT NULL, product_id BIGINT, qty INT) PARTITION BY LIST (dem_plan_id)").expect("root");
+    Spi::run("CREATE TABLE ss5_172 PARTITION OF ss5 FOR VALUES IN (172) PARTITION BY RANGE (order_date)").expect("list");
+    Spi::run("CREATE TABLE ss5_172_2025_01 PARTITION OF ss5_172 FOR VALUES FROM ('2025-01-01') TO ('2025-02-01')").expect("leaf1");
+    Spi::run("CREATE TABLE ss5_172_2025_02 PARTITION OF ss5_172 FOR VALUES FROM ('2025-02-01') TO ('2025-03-01')").expect("leaf2");
+    Spi::run("INSERT INTO ss5 VALUES (172,'2025-01-15',5,10),(172,'2025-02-15',5,20)").expect("seed");
+    Spi::get_one::<String>(
+        "SELECT create_reflex_ivm('fcst5','SELECT dem_plan_id, order_date, product_id, qty FROM ss5', \
+         'dem_plan_id,product_id,order_date', NULL, NULL, NULL, ARRAY['dem_plan_id'])",
+    ).expect("c").expect("c");
+
+    // Mutate Jan data directly on the source leaf (stand-in for a swap), then
+    // reconcile just that source leaf by name.
+    Spi::run("UPDATE ss5_172_2025_01 SET qty = 999 WHERE product_id = 5").expect("mutate jan");
+    let r = Spi::get_one::<String>(
+        "SELECT reflex_reconcile_partition('fcst5', '', 'ss5_172_2025_01')",
+    ).expect("reconcile").expect("reconcile");
+    assert!(!r.starts_with("ERROR"), "reconcile: {r}");
+
+    let jan = Spi::get_one::<i32>("SELECT qty FROM fcst5 WHERE order_date = '2025-01-15'").expect("q").expect("jan");
+    let feb = Spi::get_one::<i32>("SELECT qty FROM fcst5 WHERE order_date = '2025-02-15'").expect("q").expect("feb");
+    assert_eq!(jan, 999, "Jan leaf reconciled");
+    assert_eq!(feb, 20, "Feb leaf untouched");
+}

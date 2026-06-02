@@ -1020,7 +1020,11 @@ pub(crate) fn reflex_sync_partitions_impl(view_name: &str, drop_orphans: bool) -
 /// Atomicity: the entire operation runs inside one `Spi::connect_mut`
 /// sub-transaction; any failure rolls back all changes (including the
 /// catalog-side DETACH/ATTACH), leaving the IMV in its pre-call state.
-pub(crate) fn reflex_reconcile_partition_impl(view_name: &str, partition_keys_csv: &str) -> String {
+pub(crate) fn reflex_reconcile_partition_impl(
+    view_name: &str,
+    partition_keys_csv: &str,
+    source_partition: &str,
+) -> String {
     if let Err(msg) = crate::validate_view_name(view_name) {
         return msg.to_string();
     }
@@ -1086,79 +1090,92 @@ pub(crate) fn reflex_reconcile_partition_impl(view_name: &str, partition_keys_cs
         }
 
         let tgt_parent = quote_identifier(view_name);
-
-        let keys: Vec<String> = partition_keys_csv
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
-        if keys.is_empty() {
-            return Err("reconcile_partition: empty partition_keys".to_string());
-        }
-
-        // Gather all current child constraints once.
-        let tgt_children = list_partition_children(client, &tgt_parent);
-
-        // For each key, find the unique child whose constraint matches.  We
-        // test by evaluating the child's constraint as a SQL boolean
-        // expression with the partition column bound to the key literal.
-        // Single-column LIST/RANGE only in v1.
-        let mut to_process: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let part_col = &part_cols[0];
-        for key in &keys {
-            let child_match = tgt_children.iter().find(|c| {
-                let oid_q = "SELECT pg_get_partition_constraintdef(to_regclass($1)::oid) AS def";
-                let qname = format!(
-                    "{}.{}",
-                    split_qualified_name(view_name).0.unwrap_or("public"),
-                    c.bare_name
-                );
-                let def: Option<String> = client
-                    .select(
-                        oid_q,
-                        Some(1),
-                        &[unsafe {
-                            DatumWithOid::new(qname.clone(), PgBuiltInOids::TEXTOID.oid().value())
-                        }],
-                    )
-                    .ok()
-                    .and_then(|mut it| it.next())
-                    .and_then(|r| {
-                        r.get_by_name::<&str, _>("def")
-                            .ok()
-                            .flatten()
-                            .map(|s| s.to_string())
-                    });
-                let def = match def {
-                    Some(d) if !d.is_empty() => d,
-                    _ => return false,
-                };
-                let lit = sql_literal_text(key);
-                let substituted = substitute_identifier(&def, part_col, &lit);
-                let probe = format!("SELECT ({})::boolean AS match", substituted);
-                let matched: Option<bool> = client
-                    .select(&probe, Some(1), &[])
-                    .ok()
-                    .and_then(|mut it| it.next())
-                    .and_then(|r| r.get_by_name::<bool, _>("match").ok().flatten());
-                matched.unwrap_or(false)
-            });
-            if let Some(c) = child_match {
-                to_process.insert(c.bare_name.clone());
-            }
-        }
-        if to_process.is_empty() {
-            return Ok(format!(
-                "reconcile_partition: no children matched any of {:?}",
-                keys
-            ));
-        }
-
         let schema = split_qualified_name(view_name)
             .0
             .unwrap_or("public")
             .to_string();
         let unlogged = storage_mode.eq_ignore_ascii_case("UNLOGGED");
+        let part_col = &part_cols[0];
+
+        let mut to_process: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        if !source_partition.trim().is_empty() {
+            // Level-agnostic path: expand the named source partition to source leaves,
+            // map each to its IMV target child name.
+            for src_leaf in expand_source_partition_to_leaves(client, source_partition) {
+                to_process.insert(target_child_name(view_name, &src_leaf));
+            }
+        } else {
+            let keys: Vec<String> = partition_keys_csv
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if keys.is_empty() {
+                return Err(
+                    "reconcile_partition: empty partition_keys (or pass source_partition)"
+                        .to_string(),
+                );
+            }
+            let tgt_children = list_partition_children(client, &tgt_parent);
+            for key in &keys {
+                let child_match = tgt_children.iter().find(|c| {
+                    let oid_q =
+                        "SELECT pg_get_partition_constraintdef(to_regclass($1)::oid) AS def";
+                    let qname = format!(
+                        "{}.{}",
+                        split_qualified_name(view_name).0.unwrap_or("public"),
+                        c.bare_name
+                    );
+                    let def: Option<String> = client
+                        .select(
+                            oid_q,
+                            Some(1),
+                            &[unsafe {
+                                DatumWithOid::new(
+                                    qname.clone(),
+                                    PgBuiltInOids::TEXTOID.oid().value(),
+                                )
+                            }],
+                        )
+                        .ok()
+                        .and_then(|mut it| it.next())
+                        .and_then(|r| {
+                            r.get_by_name::<&str, _>("def")
+                                .ok()
+                                .flatten()
+                                .map(|s| s.to_string())
+                        });
+                    let def = match def {
+                        Some(d) if !d.is_empty() => d,
+                        _ => return false,
+                    };
+                    let lit = sql_literal_text(key);
+                    let substituted = substitute_identifier(&def, part_col, &lit);
+                    let probe = format!("SELECT ({})::boolean AS match", substituted);
+                    let matched: Option<bool> = client
+                        .select(&probe, Some(1), &[])
+                        .ok()
+                        .and_then(|mut it| it.next())
+                        .and_then(|r| r.get_by_name::<bool, _>("match").ok().flatten());
+                    matched.unwrap_or(false)
+                });
+                if let Some(c) = child_match {
+                    // A matched top-level child may itself be partitioned (internal
+                    // node) on a multi-level IMV: expand to its leaves (or itself).
+                    for leaf in target_leaves_under(client, &schema, &c.bare_name) {
+                        to_process.insert(leaf);
+                    }
+                }
+            }
+        }
+
+        if to_process.is_empty() {
+            return Ok(format!(
+                "reconcile_partition: no children matched (keys={:?}, source_partition={:?})",
+                partition_keys_csv, source_partition
+            ));
+        }
 
         // Process each child via the shared atomic DETACH/ATTACH swap
         // helper.  The intermediate is swapped before the target so the
@@ -1271,6 +1288,7 @@ pub(crate) fn execute_partition_swap_for_child(
     unlogged: bool,
 ) -> Result<(), String> {
     let int_parent = intermediate_table_name(view_name);
+    let tgt_parent = quote_identifier(view_name);
     let int_child_bare = intermediate_child_name(view_name, src_child_bare);
     let tgt_child_bare = target_child_name(view_name, src_child_bare);
 
@@ -1300,17 +1318,37 @@ pub(crate) fn execute_partition_swap_for_child(
         view_name, &src_child, &int_def, &tgt_def, unlogged, base_query, end_query,
     );
 
-    // Override intermediate ATTACH bound if it differs textually from the
-    // target's (e.g., multi-column LIST partitioning where the bound
-    // references the column names directly).
-    let attach_new_int = if !int_bound.is_empty() && int_bound != tgt_bound {
-        format!(
-            "ALTER TABLE {} ATTACH PARTITION {} {}",
-            int_parent, ddl.swap_int_qual, int_bound
-        )
+    // Compute immediate parents for multi-level support. For single-level partitions,
+    // these will match the root (int_parent / tgt_parent).
+    let int_child_qual = schema_prefix(view_name, &int_child_bare);
+    let tgt_child_qual = schema_prefix(view_name, &tgt_child_bare);
+    let int_immediate_parent = read_immediate_parent_qual(client, schema, &int_child_bare)
+        .unwrap_or_else(|| int_parent.clone());
+    let tgt_immediate_parent = read_immediate_parent_qual(client, schema, &tgt_child_bare)
+        .unwrap_or_else(|| tgt_parent.clone());
+
+    // Build parent-aware DDL statements for all four operations.
+    let int_attach_bound: &str = if !int_bound.is_empty() && int_bound != tgt_bound {
+        int_bound.as_str()
     } else {
-        ddl.attach_new_int.clone()
+        tgt_bound.as_str()
     };
+    let detach_old_int = format!(
+        "ALTER TABLE {} DETACH PARTITION {}",
+        int_immediate_parent, int_child_qual
+    );
+    let attach_new_int = format!(
+        "ALTER TABLE {} ATTACH PARTITION {} {}",
+        int_immediate_parent, ddl.swap_int_qual, int_attach_bound
+    );
+    let detach_old_tgt = format!(
+        "ALTER TABLE {} DETACH PARTITION {}",
+        tgt_immediate_parent, tgt_child_qual
+    );
+    let attach_new_tgt = format!(
+        "ALTER TABLE {} ATTACH PARTITION {} {}",
+        tgt_immediate_parent, ddl.swap_tgt_qual, tgt_bound
+    );
 
     // ============ INTERMEDIATE SWAP ============
     if !end_query.is_empty() {
@@ -1329,7 +1367,7 @@ pub(crate) fn execute_partition_swap_for_child(
                 .map_err(|e| format!("add check int: {}", e))?;
         }
         client
-            .update(&ddl.detach_old_int, None, &[])
+            .update(&detach_old_int, None, &[])
             .map_err(|e| format!("detach old int: {}", e))?;
         client
             .update(&attach_new_int, None, &[])
@@ -1359,10 +1397,10 @@ pub(crate) fn execute_partition_swap_for_child(
             .map_err(|e| format!("add check tgt: {}", e))?;
     }
     client
-        .update(&ddl.detach_old_tgt, None, &[])
+        .update(&detach_old_tgt, None, &[])
         .map_err(|e| format!("detach old tgt: {}", e))?;
     client
-        .update(&ddl.attach_new_tgt, None, &[])
+        .update(&attach_new_tgt, None, &[])
         .map_err(|e| format!("attach new tgt: {}", e))?;
     if let Some(ref c) = ddl.drop_check_tgt {
         let _ = client.update(c, None, &[]);
@@ -1378,6 +1416,78 @@ pub(crate) fn execute_partition_swap_for_child(
 }
 
 /// SQL-quote a text literal — doubles embedded single quotes.
+/// Expand a source partition (any level, schema-qualified or bare) to the set
+/// of its source LEAF bare-names. A leaf (or non-partitioned relation) expands
+/// to itself.
+fn expand_source_partition_to_leaves(
+    client: &pgrx::spi::SpiClient<'_>,
+    source_partition: &str,
+) -> Vec<String> {
+    let (_, bare) = canonical_source(source_partition);
+    let subtree = list_partition_tree(client, source_partition);
+    if subtree.is_empty() {
+        vec![bare]
+    } else {
+        subtree
+            .into_iter()
+            .filter(|n| n.sub_strategy.is_none())
+            .map(|n| n.bare_name)
+            .collect()
+    }
+}
+
+/// Target-side LEAF bare-names under an IMV child `bare` (or `[bare]` if it is
+/// already a leaf). Used to expand a matched top-level child (which on a
+/// multi-level IMV is an internal node) to the leaves the swap operates on.
+fn target_leaves_under(client: &pgrx::spi::SpiClient<'_>, schema: &str, bare: &str) -> Vec<String> {
+    let qual = format!("{}.{}", schema, bare);
+    let sub = list_partition_tree(client, &qual);
+    if sub.is_empty() {
+        vec![bare.to_string()]
+    } else {
+        sub.into_iter()
+            .filter(|n| n.sub_strategy.is_none())
+            .map(|n| n.bare_name)
+            .collect()
+    }
+}
+
+/// Resolve the CURRENT immediate parent of partition child `<schema>.<bare>`,
+/// returned as a quoted `"schema"."parent"` reference, or None if it is not a
+/// partition.
+fn read_immediate_parent_qual(
+    client: &pgrx::spi::SpiClient<'_>,
+    schema: &str,
+    child_bare: &str,
+) -> Option<String> {
+    client
+        .select(
+            "SELECT pn.nspname::text AS s, pc.relname::text AS r \
+             FROM pg_inherits i \
+             JOIN pg_class child ON child.oid = i.inhrelid \
+             JOIN pg_namespace cn ON cn.oid = child.relnamespace \
+             JOIN pg_class pc ON pc.oid = i.inhparent \
+             JOIN pg_namespace pn ON pn.oid = pc.relnamespace \
+             WHERE cn.nspname = $1 AND child.relname = $2",
+            Some(1),
+            &[
+                unsafe {
+                    DatumWithOid::new(schema.to_string(), PgBuiltInOids::TEXTOID.oid().value())
+                },
+                unsafe {
+                    DatumWithOid::new(child_bare.to_string(), PgBuiltInOids::TEXTOID.oid().value())
+                },
+            ],
+        )
+        .ok()
+        .and_then(|mut it| it.next())
+        .and_then(|r| {
+            let s = r.get_by_name::<&str, _>("s").ok().flatten()?.to_string();
+            let p = r.get_by_name::<&str, _>("r").ok().flatten()?.to_string();
+            Some(format!("\"{}\".\"{}\"", s, p))
+        })
+}
+
 fn sql_literal_text(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
 }

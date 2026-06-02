@@ -434,8 +434,12 @@ fn reflex_sync_partitions(view_name: &str, drop_orphans: default!(bool, "TRUE"))
 /// to dependent IMVs partitioned on the same column with the same keys,
 /// or to full reconcile otherwise.
 #[pg_extern]
-fn reflex_reconcile_partition(view_name: &str, partition_keys: &str) -> String {
-    partition::reflex_reconcile_partition_impl(view_name, partition_keys)
+fn reflex_reconcile_partition(
+    view_name: &str,
+    partition_keys: &str,
+    source_partition: default!(&str, "''"),
+) -> String {
+    partition::reflex_reconcile_partition_impl(view_name, partition_keys, source_partition)
 }
 
 /// Drop a reflex IMV and all its artifacts (triggers, tables, reference row).
