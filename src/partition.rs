@@ -561,6 +561,41 @@ pub(crate) fn build_swap_partition_ddl(
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PartitionDiffAction {
+    SwapFill,
+    AttachNew,
+    Drop,
+}
+
+/// Diff a stored snapshot of (child_name, oid) against the current leaf set.
+/// Same name + changed oid = same-bound swap (detach+attach). New name =
+/// attach. Missing name = detach/remove. Unchanged names are omitted.
+pub(crate) fn classify_partition_diff(
+    snapshot: &[(String, u32)],
+    current: &[(String, u32)],
+) -> Vec<(String, PartitionDiffAction)> {
+    use std::collections::HashMap;
+    let snap: HashMap<&str, u32> = snapshot.iter().map(|(n, o)| (n.as_str(), *o)).collect();
+    let cur: HashMap<&str, u32> = current.iter().map(|(n, o)| (n.as_str(), *o)).collect();
+    let mut out = Vec::new();
+    for (name, oid) in current {
+        match snap.get(name.as_str()) {
+            None => out.push((name.clone(), PartitionDiffAction::AttachNew)),
+            Some(&snap_oid) if snap_oid != *oid => {
+                out.push((name.clone(), PartitionDiffAction::SwapFill))
+            }
+            Some(_) => {}
+        }
+    }
+    for (name, _) in snapshot {
+        if !cur.contains_key(name.as_str()) {
+            out.push((name.clone(), PartitionDiffAction::Drop));
+        }
+    }
+    out
+}
+
 /// Parse a TEXT[] partition-column input.  Returns None for NULL/empty.
 ///
 /// The user passes column names as a Postgres TEXT[]; pgrx forwards it as

@@ -321,3 +321,28 @@ fn test_node_ddl_leaf_under_internal_parent_is_unlogged() {
         r#"CREATE UNLOGGED TABLE IF NOT EXISTS "public"."fcst_ss_172_2025_01" PARTITION OF "public"."fcst_ss_172" FOR VALUES FROM ('2025-01-01') TO ('2025-02-01')"#
     );
 }
+
+#[test]
+fn test_classify_partition_diff() {
+    let snapshot = vec![
+        ("c_jan".to_string(), 100u32),
+        ("c_feb".to_string(), 200u32),
+        ("c_mar".to_string(), 300u32),
+    ];
+    let current = vec![
+        ("c_jan".to_string(), 100u32), // unchanged
+        ("c_feb".to_string(), 999u32), // oid changed -> swap
+        ("c_apr".to_string(), 400u32), // new -> attach
+                                       // c_mar gone -> drop
+    ];
+    let mut got = classify_partition_diff(&snapshot, &current);
+    got.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(
+        got,
+        vec![
+            ("c_apr".to_string(), PartitionDiffAction::AttachNew),
+            ("c_feb".to_string(), PartitionDiffAction::SwapFill),
+            ("c_mar".to_string(), PartitionDiffAction::Drop),
+        ]
+    );
+}
