@@ -1594,12 +1594,38 @@ pub(crate) fn current_source_leaf_oids(
         .collect()
 }
 
+/// Canonical, schema-qualified `"schema.relname"` key for a source root, so the
+/// snapshot is keyed identically whether the caller passes a bare name (the
+/// create-time anchor, e.g. `fz`) or the `pg_partition_root` form the event
+/// trigger enqueues (e.g. `public.fz`). Falls back to the input on lookup
+/// failure.
+pub(crate) fn canonical_root_key(client: &pgrx::spi::SpiClient<'_>, name: &str) -> String {
+    client
+        .select(
+            "SELECT n.nspname || '.' || c.relname AS k \
+             FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE c.oid = to_regclass($1)",
+            Some(1),
+            &[unsafe { DatumWithOid::new(name.to_string(), pgrx::pg_sys::TEXTOID) }],
+        )
+        .ok()
+        .and_then(|mut it| it.next())
+        .and_then(|r| {
+            r.get_by_name::<&str, _>("k")
+                .ok()
+                .flatten()
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_else(|| name.to_string())
+}
+
 /// Replace the snapshot rows for `source_root` with the current leaf set.
 pub(crate) fn refresh_source_snapshot(client: &mut pgrx::spi::SpiClient<'_>, source_root: &str) {
+    let key = canonical_root_key(client, source_root);
     let _ = client.update(
         "DELETE FROM public.__reflex_source_partition_snapshot WHERE source_root = $1",
         None,
-        &[unsafe { DatumWithOid::new(source_root.to_string(), pgrx::pg_sys::TEXTOID) }],
+        &[unsafe { DatumWithOid::new(key.clone(), pgrx::pg_sys::TEXTOID) }],
     );
     let leaves = current_source_leaf_oids(client, source_root);
     for (name, oid) in leaves {
@@ -1611,7 +1637,7 @@ pub(crate) fn refresh_source_snapshot(client: &mut pgrx::spi::SpiClient<'_>, sou
                  DO UPDATE SET child_oid = EXCLUDED.child_oid",
             None,
             &[
-                unsafe { DatumWithOid::new(source_root.to_string(), pgrx::pg_sys::TEXTOID) },
+                unsafe { DatumWithOid::new(key.clone(), pgrx::pg_sys::TEXTOID) },
                 unsafe { DatumWithOid::new(name, pgrx::pg_sys::TEXTOID) },
                 unsafe { DatumWithOid::new(oid as i64, pgrx::pg_sys::INT8OID) },
             ],
@@ -1647,6 +1673,9 @@ pub(crate) fn reflex_flush_partitions_impl(only: Option<&str>) -> String {
 
         let mut summary: Vec<String> = Vec::new();
         for root in &roots {
+            // Canonical key so the snapshot read matches the key written at
+            // create-time seed / prior flush, regardless of bare vs qualified.
+            let root_key = canonical_root_key(client, root);
             // Partitioned IMVs depending on this source root.
             let imvs: Vec<String> = client
                 .select(
@@ -1670,7 +1699,7 @@ pub(crate) fn reflex_flush_partitions_impl(only: Option<&str>) -> String {
                 .select(
                     "SELECT child_name, child_oid FROM public.__reflex_source_partition_snapshot WHERE source_root = $1",
                     None,
-                    &[unsafe { DatumWithOid::new(root.to_string(), pgrx::pg_sys::TEXTOID) }],
+                    &[unsafe { DatumWithOid::new(root_key.clone(), pgrx::pg_sys::TEXTOID) }],
                 )
                 .map_err(|e| format!("flush: snapshot read failed: {}", e))?
                 .filter_map(|r| {
@@ -1684,35 +1713,46 @@ pub(crate) fn reflex_flush_partitions_impl(only: Option<&str>) -> String {
             let actions = classify_partition_diff(&snapshot, &current);
 
             for imv in &imvs {
-                for (src_leaf, action) in &actions {
-                    match action {
-                        PartitionDiffAction::AttachNew | PartitionDiffAction::SwapFill => {
-                            let q = format!(
-                                "SELECT public.reflex_reconcile_partition({}, '', {})",
-                                sql_literal_text(imv),
-                                sql_literal_text(src_leaf)
-                            );
-                            client.update(&q, None, &[]).map_err(|e| {
-                                format!("flush reconcile {} {}: {}", imv, src_leaf, e)
-                            })?;
-                        }
-                        PartitionDiffAction::Drop => {
-                            let (schema_opt, _) = split_qualified_name(imv);
-                            let schema = schema_opt.unwrap_or("public");
-                            let tgt = target_child_name(imv, src_leaf);
-                            let int = intermediate_child_name(imv, src_leaf);
-                            let _ = client.update(
-                                &format!("DROP TABLE IF EXISTS \"{}\".\"{}\" CASCADE", schema, tgt),
-                                None,
-                                &[],
-                            );
-                            let _ = client.update(
-                                &format!("DROP TABLE IF EXISTS \"{}\".\"{}\" CASCADE", schema, int),
-                                None,
-                                &[],
-                            );
-                        }
-                    }
+                // Drops MUST run before attaches: when a source leaf is replaced
+                // by a differently-named partition (e.g. detach old, attach a
+                // freshly-built table), the diff yields a Drop (old) plus an
+                // AttachNew (new) sharing the same bound. Attaching the new IMV
+                // leaf before dropping the old one would overlap its partition
+                // range. Same-name swaps (SwapFill) replace in place via the
+                // executor's atomic DETACH/ATTACH and never overlap.
+                for (src_leaf, _) in actions
+                    .iter()
+                    .filter(|(_, a)| *a == PartitionDiffAction::Drop)
+                {
+                    let (schema_opt, _) = split_qualified_name(imv);
+                    let schema = schema_opt.unwrap_or("public");
+                    let tgt = target_child_name(imv, src_leaf);
+                    let int = intermediate_child_name(imv, src_leaf);
+                    let _ = client.update(
+                        &format!("DROP TABLE IF EXISTS \"{}\".\"{}\" CASCADE", schema, tgt),
+                        None,
+                        &[],
+                    );
+                    let _ = client.update(
+                        &format!("DROP TABLE IF EXISTS \"{}\".\"{}\" CASCADE", schema, int),
+                        None,
+                        &[],
+                    );
+                }
+                for (src_leaf, _) in actions.iter().filter(|(_, a)| {
+                    matches!(
+                        a,
+                        PartitionDiffAction::AttachNew | PartitionDiffAction::SwapFill
+                    )
+                }) {
+                    let q = format!(
+                        "SELECT public.reflex_reconcile_partition({}, '', {})",
+                        sql_literal_text(imv),
+                        sql_literal_text(src_leaf)
+                    );
+                    client
+                        .update(&q, None, &[])
+                        .map_err(|e| format!("flush reconcile {} {}: {}", imv, src_leaf, e))?;
                 }
                 summary.push(format!("{}: {} change(s)", imv, actions.len()));
             }

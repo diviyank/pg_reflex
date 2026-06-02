@@ -280,3 +280,50 @@ fn pg_subpart_detach_remove_drops_imv_leaf_via_flush() {
     let feb = Spi::get_one::<i32>("SELECT qty FROM fcsta WHERE order_date='2025-02-15'").expect("q").expect("feb");
     assert_eq!(feb, 20, "Feb untouched");
 }
+
+// Differential oracle: a deterministic sequence of leaf swaps (detach old,
+// attach a freshly-built table with mutated data, flush) must leave the IMV
+// byte-for-byte equal to a fresh recompute of the base query over the source.
+// Uses the freshly-built-table attach form so the partition oid changes and
+// the snapshot oid-diff fires (the documented supported path).
+#[pg_test]
+fn pg_fuzz_subpartition_swap_sequence_matches_recompute() {
+    Spi::run("CREATE TABLE fz (dem_plan_id BIGINT NOT NULL, order_date DATE NOT NULL, product_id BIGINT, qty INT) PARTITION BY LIST (dem_plan_id)").expect("root");
+    Spi::run("CREATE TABLE fz_1 PARTITION OF fz FOR VALUES IN (1) PARTITION BY RANGE (order_date)").expect("list");
+    Spi::run("CREATE TABLE fz_1_2025_01 PARTITION OF fz_1 FOR VALUES FROM ('2025-01-01') TO ('2025-02-01')").expect("m1");
+    Spi::run("CREATE TABLE fz_1_2025_02 PARTITION OF fz_1 FOR VALUES FROM ('2025-02-01') TO ('2025-03-01')").expect("m2");
+    Spi::run("CREATE TABLE fz_1_2025_03 PARTITION OF fz_1 FOR VALUES FROM ('2025-03-01') TO ('2025-04-01')").expect("m3");
+    Spi::run("INSERT INTO fz SELECT 1, make_date(2025, (g % 3) + 1, 10), g, g * 10 FROM generate_series(1,30) g").expect("seed");
+    Spi::get_one::<String>(
+        "SELECT create_reflex_ivm('fzv','SELECT dem_plan_id, order_date, product_id, qty FROM fz', \
+         'dem_plan_id,product_id,order_date', NULL, NULL, NULL, ARRAY['dem_plan_id'])",
+    ).expect("c").expect("c");
+
+    for m in 1..=3 {
+        let lo = format!("2025-0{}-01", m);
+        let hi = format!("2025-0{}-01", m + 1);
+        Spi::run(&format!("ALTER TABLE fz_1 DETACH PARTITION fz_1_2025_0{}", m)).expect("detach");
+        Spi::run(&format!("CREATE TABLE fz_1_2025_0{}_new (LIKE fz INCLUDING ALL)", m)).expect("stage");
+        Spi::run(&format!(
+            "INSERT INTO fz_1_2025_0{m}_new SELECT dem_plan_id, order_date, product_id, qty + 1000 FROM fz_1_2025_0{m}",
+            m = m
+        )).expect("fill");
+        Spi::run(&format!("DROP TABLE fz_1_2025_0{}", m)).expect("dropold");
+        Spi::run(&format!(
+            "ALTER TABLE fz_1 ATTACH PARTITION fz_1_2025_0{m}_new FOR VALUES FROM ('{lo}') TO ('{hi}')",
+            m = m, lo = lo, hi = hi
+        )).expect("attach");
+        let _ = Spi::get_one::<String>("SELECT reflex_flush_partitions()").expect("flush").expect("flush");
+    }
+
+    let drift = Spi::get_one::<i64>(
+        "SELECT count(*) FROM ( \
+            (SELECT dem_plan_id, order_date, product_id, qty FROM fzv \
+             EXCEPT SELECT dem_plan_id, order_date, product_id, qty FROM fz) \
+            UNION ALL \
+            (SELECT dem_plan_id, order_date, product_id, qty FROM fz \
+             EXCEPT SELECT dem_plan_id, order_date, product_id, qty FROM fzv) \
+         ) d",
+    ).expect("oracle").expect("count");
+    assert_eq!(drift, 0, "IMV diverged from source recompute after swap sequence");
+}
