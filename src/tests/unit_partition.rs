@@ -105,34 +105,6 @@ fn test_sql_literal_text_doubles_single_quotes() {
 }
 
 #[test]
-fn test_build_partition_child_ddl_pair_shape() {
-    let src_child = PartitionChild {
-        bare_name: "orders_p_north".to_string(),
-        bound_expr: "FOR VALUES IN ('NORTH')".to_string(),
-    };
-    let (int_ddl, tgt_ddl) = build_partition_child_ddl_pair("sales_view", &src_child, false);
-    assert!(int_ddl.contains("__reflex_intermediate_sales_view_orders_p_north"));
-    assert!(int_ddl.contains("__reflex_intermediate_sales_view"));
-    assert!(int_ddl.contains("FOR VALUES IN ('NORTH')"));
-    assert!(tgt_ddl.contains("\"sales_view_orders_p_north\""));
-    assert!(tgt_ddl.contains("\"sales_view\""));
-    assert!(tgt_ddl.contains("FOR VALUES IN ('NORTH')"));
-    assert!(!int_ddl.contains("UNLOGGED"));
-    assert!(!tgt_ddl.contains("UNLOGGED"));
-}
-
-#[test]
-fn test_build_partition_child_ddl_pair_unlogged() {
-    let src_child = PartitionChild {
-        bare_name: "orders_p_north".to_string(),
-        bound_expr: "FOR VALUES IN ('NORTH')".to_string(),
-    };
-    let (int_ddl, tgt_ddl) = build_partition_child_ddl_pair("sales_view", &src_child, true);
-    assert!(int_ddl.starts_with("CREATE UNLOGGED TABLE"));
-    assert!(tgt_ddl.starts_with("CREATE UNLOGGED TABLE"));
-}
-
-#[test]
 fn test_sync_result_message_basic() {
     let r = SyncResult {
         added_intermediate: 2,
@@ -226,13 +198,8 @@ fn test_build_swap_partition_ddl_shape_aggregate_logged() {
         .as_deref()
         .unwrap()
         .contains("ADD CONSTRAINT __reflex_swap_check"));
-    // DETACH then ATTACH.
-    assert!(ddl.detach_old_int.contains(
-        "DETACH PARTITION \"public\".\"__reflex_intermediate_sales_view_orders_p_north\""
-    ));
-    assert!(ddl
-        .attach_new_int
-        .contains("ATTACH PARTITION \"public\".\"__reflex_swap_int_sales_view_orders_p_north\" FOR VALUES IN ('NORTH')"));
+    // (DETACH/ATTACH are built parent-aware in execute_partition_swap_for_child,
+    // not in build_swap_partition_ddl — see SwapPartitionDdl doc.)
     // Drop old + rename to canonical names.
     assert!(ddl
         .drop_old_int
@@ -308,12 +275,19 @@ fn test_build_swap_partition_ddl_range_bound() {
         "SELECT d, SUM(x) FROM t GROUP BY d",
         "SELECT d, s FROM __reflex_intermediate_v",
     );
+    // The RANGE bound flows into ATTACH (built parent-aware in the executor);
+    // the builder carries the range predicate via the pre-ATTACH CHECK that
+    // lets PG skip its validation scan.
     assert!(ddl
-        .attach_new_int
-        .contains("FOR VALUES FROM ('2026-01-01') TO ('2027-01-01')"));
+        .check_int
+        .as_deref()
+        .unwrap()
+        .contains("d >= '2026-01-01' AND d < '2027-01-01'"));
     assert!(ddl
-        .attach_new_tgt
-        .contains("FOR VALUES FROM ('2026-01-01') TO ('2027-01-01')"));
+        .check_tgt
+        .as_deref()
+        .unwrap()
+        .contains("d >= '2026-01-01' AND d < '2027-01-01'"));
 }
 
 #[test]

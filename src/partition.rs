@@ -48,6 +48,11 @@ pub(crate) struct PartitionDescriptor {
 #[derive(Debug, Clone)]
 pub(crate) struct PartitionChild {
     pub bare_name: String,
+    // Faithful introspection of the child's `FOR VALUES …` bound. Current
+    // consumers (reconcile's CSV-key probe, the swap executor) key off
+    // `bare_name` only and read bounds live via `read_partition_bound`, but the
+    // DTO carries the bound so callers needn't re-query it.
+    #[allow(dead_code)]
     pub bound_expr: String,
 }
 
@@ -287,49 +292,15 @@ fn schema_prefix(view_name: &str, child: &str) -> String {
     format!("\"{}\".\"{}\"", schema, child)
 }
 
-/// Build the `CREATE [UNLOGGED] TABLE child PARTITION OF parent FOR VALUES …`
-/// DDL pair for one source-child mapping.  Returns (intermediate_ddl,
-/// target_ddl).
+/// Build the `CREATE [UNLOGGED] TABLE child PARTITION OF parent FOR VALUES …
+/// [PARTITION BY …]` DDL pair for one node of a source partition tree.
 ///
-/// `unlogged` controls whether the children inherit UNLOGGED storage.
-/// Partitioned parents themselves are always LOGGED (see
-/// `build_intermediate_table_ddl` / `build_target_table_ddl`), so the
-/// UNLOGGED keyword must be set per-child here.
-pub(crate) fn build_partition_child_ddl_pair(
-    view_name: &str,
-    source_child: &PartitionChild,
-    unlogged: bool,
-) -> (String, String) {
-    let int_parent = intermediate_table_name(view_name);
-    let tgt_parent = quote_identifier(view_name);
-
-    let int_child_bare = intermediate_child_name(view_name, &source_child.bare_name);
-    let tgt_child_bare = target_child_name(view_name, &source_child.bare_name);
-    let int_child = schema_prefix(view_name, &int_child_bare);
-    let tgt_child = schema_prefix(view_name, &tgt_child_bare);
-
-    let create_kw = if unlogged {
-        "CREATE UNLOGGED TABLE"
-    } else {
-        "CREATE TABLE"
-    };
-    let int_ddl = format!(
-        "{} IF NOT EXISTS {} PARTITION OF {} {}",
-        create_kw, int_child, int_parent, source_child.bound_expr
-    );
-    let tgt_ddl = format!(
-        "{} IF NOT EXISTS {} PARTITION OF {} {}",
-        create_kw, tgt_child, tgt_parent, source_child.bound_expr
-    );
-    (int_ddl, tgt_ddl)
-}
-
-/// Tree-aware DDL pair builder.  Unlike `build_partition_child_ddl_pair`
-/// (which always attaches to the IMV root), this resolves the parent from
-/// `node.parent_bare`: when it equals `anchor_root_bare` the parent is the
-/// IMV root, otherwise it is the IMV child mirroring that source node.
-/// Internal nodes (own partition strategy) get a `PARTITION BY` suffix and
-/// are always LOGGED; only leaves honour `unlogged`.
+/// Resolves the parent from `node.parent_bare`: when it equals
+/// `anchor_root_bare` (quote-insensitively) the parent is the IMV root,
+/// otherwise it is the IMV child mirroring that source node. Internal nodes
+/// (own partition strategy) get a `PARTITION BY` suffix and are always LOGGED;
+/// only leaves honour `unlogged`. Partitioned parents are always LOGGED, so
+/// the UNLOGGED keyword must be set per-leaf here.
 pub(crate) fn build_partition_node_ddl_pair(
     view_name: &str,
     node: &PartitionNode,
@@ -433,14 +404,10 @@ pub(crate) struct SwapPartitionDdl {
     pub check_int: Option<String>,
     /// Likewise for target.
     pub check_tgt: Option<String>,
-    /// `ALTER TABLE int_parent DETACH PARTITION old_int_child`.
-    pub detach_old_int: String,
-    /// Likewise for target.
-    pub detach_old_tgt: String,
-    /// `ALTER TABLE int_parent ATTACH PARTITION swap_int <FOR VALUES …>`.
-    pub attach_new_int: String,
-    /// Likewise for target.
-    pub attach_new_tgt: String,
+    // NOTE: the DETACH/ATTACH statements are intentionally NOT produced here.
+    // A multi-level leaf's immediate parent is an internal node, not the IMV
+    // root, and resolving it requires SPI (pg_inherits). They are therefore
+    // built parent-aware in `execute_partition_swap_for_child`.
     /// `ALTER TABLE swap_int DROP CONSTRAINT __reflex_swap_check` — the
     /// CHECK is redundant once attached (the partition bound enforces it),
     /// and leaving it forces PG to re-validate it on every future ATTACH.
@@ -480,9 +447,6 @@ pub(crate) fn build_swap_partition_ddl(
     base_query: &str,
     end_query: &str,
 ) -> SwapPartitionDdl {
-    let int_parent = intermediate_table_name(view_name);
-    let tgt_parent = quote_identifier(view_name);
-
     let int_child_bare = intermediate_child_name(view_name, &source_child.bare_name);
     let tgt_child_bare = target_child_name(view_name, &source_child.bare_name);
     let int_child_qual = schema_prefix(view_name, &int_child_bare);
@@ -554,24 +518,6 @@ pub(crate) fn build_swap_partition_ddl(
         ))
     };
 
-    let detach_old_int = format!(
-        "ALTER TABLE {} DETACH PARTITION {}",
-        int_parent, int_child_qual
-    );
-    let detach_old_tgt = format!(
-        "ALTER TABLE {} DETACH PARTITION {}",
-        tgt_parent, tgt_child_qual
-    );
-
-    let attach_new_int = format!(
-        "ALTER TABLE {} ATTACH PARTITION {} {}",
-        int_parent, swap_int_qual, source_child.bound_expr
-    );
-    let attach_new_tgt = format!(
-        "ALTER TABLE {} ATTACH PARTITION {} {}",
-        tgt_parent, swap_tgt_qual, source_child.bound_expr
-    );
-
     let drop_check_int = check_int.as_ref().map(|_| {
         format!(
             "ALTER TABLE {} DROP CONSTRAINT __reflex_swap_check",
@@ -606,10 +552,6 @@ pub(crate) fn build_swap_partition_ddl(
         fill_swap_tgt,
         check_int,
         check_tgt,
-        detach_old_int,
-        detach_old_tgt,
-        attach_new_int,
-        attach_new_tgt,
         drop_check_int,
         drop_check_tgt,
         drop_old_int,
