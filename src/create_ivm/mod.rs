@@ -546,6 +546,37 @@ fn resolve_partitioning(ctx: &mut BuildContext) -> Result<(), String> {
                     anchor, ctx.resolved_partition_cols[0], desc.column_names
                 ));
             }
+
+            // Validate sub-level partition columns are in the unique key.
+            // Gather all sub-level partition columns from the full partition tree.
+            let tree = crate::partition::list_partition_tree(client, &anchor);
+            let mut all_sub_cols: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            for node in &tree {
+                for col in &node.sub_columns {
+                    all_sub_cols.insert(col.to_lowercase());
+                }
+            }
+
+            // Build the set of projected/key columns (unique_columns lowercased).
+            let unique_key_cols: std::collections::HashSet<String> = ctx
+                .resolved_unique_columns
+                .iter()
+                .map(|c| c.to_lowercase())
+                .collect();
+
+            // Check each sub-level partition column is present in the unique key.
+            for sub_col in &all_sub_cols {
+                if !unique_key_cols.contains(sub_col) {
+                    return Err(format!(
+                        "partition key column '{}' (a partition level of source '{}') \
+                         is not a bare projected output column in the IMV's unique key. Add it \
+                         to the SELECT list and unique_columns.",
+                        sub_col, anchor
+                    ));
+                }
+            }
+
             Ok(desc.strategy)
         });
         match validate_result {

@@ -72,3 +72,30 @@ fn pg_subpart_create_mirrors_full_tree() {
     .expect("qty");
     assert_eq!(leaf_qty, 10);
 }
+
+#[pg_test]
+fn pg_subpart_rejects_sublevel_column_not_in_unique_key() {
+    Spi::run(
+        "CREATE TABLE ss3 (dem_plan_id BIGINT NOT NULL, order_date DATE NOT NULL, qty INT) \
+         PARTITION BY LIST (dem_plan_id)",
+    )
+    .expect("root");
+    Spi::run("CREATE TABLE ss3_172 PARTITION OF ss3 FOR VALUES IN (172) PARTITION BY RANGE (order_date)")
+        .expect("list child");
+    Spi::run("CREATE TABLE ss3_172_2025_01 PARTITION OF ss3_172 FOR VALUES FROM ('2025-01-01') TO ('2025-02-01')")
+        .expect("leaf");
+
+    // unique_key omits order_date (a sub-level partition key) -> must be rejected
+    // with a clean error string (NOT a panic / PG hard error).
+    let r = Spi::get_one::<String>(
+        "SELECT create_reflex_ivm('fcst3', \
+            'SELECT dem_plan_id, qty FROM ss3', \
+            'dem_plan_id', NULL, NULL, NULL, ARRAY['dem_plan_id'])",
+    )
+    .expect("create call")
+    .expect("create result");
+    assert!(
+        r.starts_with("ERROR") && r.contains("order_date"),
+        "expected rejection naming order_date, got: {r}"
+    );
+}
