@@ -794,11 +794,13 @@ fn materialize_passthrough(client: &mut pgrx::spi::SpiClient<'_>, ctx: &mut Buil
             &ctx.plan.partition_columns[0],
             &ctx.real_source_names,
         ) {
-            let src_children = crate::partition::list_partition_children(client, &anchor);
-            for src_child in &src_children {
-                let (_, tgt_ddl) = crate::partition::build_partition_child_ddl_pair(
+            let (_, anchor_root_bare) = split_qualified_name(&anchor);
+            let nodes = crate::partition::list_partition_tree(client, &anchor);
+            for node in &nodes {
+                let (_, tgt_ddl) = crate::partition::build_partition_node_ddl_pair(
                     ctx.view_name,
-                    src_child,
+                    node,
+                    anchor_root_bare,
                     !ctx.logged,
                 );
                 client.update(&tgt_ddl, None, &[]).unwrap_or_report();
@@ -947,17 +949,19 @@ fn materialize_aggregate(client: &mut pgrx::spi::SpiClient<'_>, ctx: &mut BuildC
             &ctx.real_source_names,
         ) {
             Ok(anchor) => {
-                let src_children = crate::partition::list_partition_children(client, &anchor);
+                let (_, anchor_root_bare) = split_qualified_name(&anchor);
+                let nodes = crate::partition::list_partition_tree(client, &anchor);
                 info!(
-                    "pg_reflex: creating {} partition children for '{}' (anchor='{}')",
-                    src_children.len(),
+                    "pg_reflex: creating {} partition nodes for '{}' (anchor='{}')",
+                    nodes.len(),
                     ctx.view_name,
                     anchor
                 );
-                for src_child in &src_children {
-                    let (int_ddl, tgt_ddl) = crate::partition::build_partition_child_ddl_pair(
+                for node in &nodes {
+                    let (int_ddl, tgt_ddl) = crate::partition::build_partition_node_ddl_pair(
                         ctx.view_name,
-                        src_child,
+                        node,
+                        anchor_root_bare,
                         !ctx.logged,
                     );
                     client.update(&int_ddl, None, &[]).unwrap_or_report();
