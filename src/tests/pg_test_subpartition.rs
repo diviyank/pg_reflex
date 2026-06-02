@@ -99,3 +99,31 @@ fn pg_subpart_rejects_sublevel_column_not_in_unique_key() {
         "expected rejection naming order_date, got: {r}"
     );
 }
+
+#[pg_test]
+fn pg_subpart_sync_creates_new_leaf_and_drops_orphan() {
+    Spi::run("CREATE TABLE ss4 (dem_plan_id BIGINT NOT NULL, order_date DATE NOT NULL, product_id BIGINT, qty INT) PARTITION BY LIST (dem_plan_id)").expect("root");
+    Spi::run("CREATE TABLE ss4_172 PARTITION OF ss4 FOR VALUES IN (172) PARTITION BY RANGE (order_date)").expect("list");
+    Spi::run("CREATE TABLE ss4_172_2025_01 PARTITION OF ss4_172 FOR VALUES FROM ('2025-01-01') TO ('2025-02-01')").expect("leaf1");
+    Spi::get_one::<String>(
+        "SELECT create_reflex_ivm('fcst4', 'SELECT dem_plan_id, order_date, product_id, qty FROM ss4', \
+         'dem_plan_id,product_id,order_date', NULL, NULL, NULL, ARRAY['dem_plan_id'])",
+    ).expect("c").expect("c");
+
+    // Attach a brand-new month leaf on the source, then sync.
+    Spi::run("CREATE TABLE ss4_172_2025_02 PARTITION OF ss4_172 FOR VALUES FROM ('2025-02-01') TO ('2025-03-01')").expect("leaf2");
+    let _ = Spi::get_one::<String>("SELECT reflex_sync_partitions('fcst4', TRUE)").expect("sync").expect("sync");
+
+    let exists = Spi::get_one::<bool>(
+        "SELECT to_regclass('public.fcst4_ss4_172_2025_02') IS NOT NULL",
+    ).expect("q").expect("b");
+    assert!(exists, "new month leaf should be mirrored after sync");
+
+    // Drop a source leaf, sync with drop_orphans -> IMV leaf dropped.
+    Spi::run("DROP TABLE ss4_172_2025_01").expect("drop source leaf");
+    let _ = Spi::get_one::<String>("SELECT reflex_sync_partitions('fcst4', TRUE)").expect("sync2").expect("sync2");
+    let gone = Spi::get_one::<bool>(
+        "SELECT to_regclass('public.fcst4_ss4_172_2025_01') IS NULL",
+    ).expect("q2").expect("b2");
+    assert!(gone, "orphan IMV leaf should be dropped after sync");
+}

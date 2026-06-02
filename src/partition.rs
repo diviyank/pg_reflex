@@ -861,8 +861,9 @@ pub(crate) fn reflex_sync_partitions_impl(view_name: &str, drop_orphans: bool) -
         let anchor = resolve_anchor_source(client, &part_cols[0], &sources)
             .map_err(|e| format!("sync: {}", e))?;
 
-        // Read source children and IMV children.
-        let src_children = list_partition_children(client, &anchor);
+        // Read source partition tree (all descendants, not just one level).
+        let (_, anchor_root_bare) = split_qualified_name(&anchor);
+        let nodes = list_partition_tree(client, &anchor);
         let int_parent = intermediate_table_name(view_name);
         let tgt_parent = quote_identifier(view_name);
         // Passthrough IMVs (no aggregation / ivm-count) have no intermediate
@@ -883,25 +884,26 @@ pub(crate) fn reflex_sync_partitions_impl(view_name: &str, drop_orphans: bool) -
             .next()
             .and_then(|r| r.get_by_name::<bool, _>("present").ok().flatten())
             .unwrap_or(false);
+        // Read IMV partition tree (all descendants).
         let int_children = if has_intermediate {
-            list_partition_children(client, &int_parent)
+            list_partition_tree(client, &int_parent)
         } else {
             Vec::new()
         };
-        let tgt_children = list_partition_children(client, &tgt_parent);
+        let tgt_children = list_partition_tree(client, &tgt_parent);
 
         // Build name-keyed views (using the IMV-side bare name format).
         let int_have: std::collections::HashSet<String> =
             int_children.iter().map(|c| c.bare_name.clone()).collect();
         let tgt_have: std::collections::HashSet<String> =
             tgt_children.iter().map(|c| c.bare_name.clone()).collect();
-        let src_expected_int: std::collections::HashSet<String> = src_children
+        let src_expected_int: std::collections::HashSet<String> = nodes
             .iter()
-            .map(|c| intermediate_child_name(view_name, &c.bare_name))
+            .map(|n| intermediate_child_name(view_name, &n.bare_name))
             .collect();
-        let src_expected_tgt: std::collections::HashSet<String> = src_children
+        let src_expected_tgt: std::collections::HashSet<String> = nodes
             .iter()
-            .map(|c| target_child_name(view_name, &c.bare_name))
+            .map(|n| target_child_name(view_name, &n.bare_name))
             .collect();
 
         let mut out = SyncResult::default();
@@ -916,20 +918,21 @@ pub(crate) fn reflex_sync_partitions_impl(view_name: &str, drop_orphans: bool) -
             }],
         );
 
-        for src in &src_children {
-            let int_name = intermediate_child_name(view_name, &src.bare_name);
-            let tgt_name = target_child_name(view_name, &src.bare_name);
-            let (int_ddl, tgt_ddl) = build_partition_child_ddl_pair(view_name, src, unlogged);
+        for node in &nodes {
+            let int_name = intermediate_child_name(view_name, &node.bare_name);
+            let tgt_name = target_child_name(view_name, &node.bare_name);
+            let (int_ddl, tgt_ddl) =
+                build_partition_node_ddl_pair(view_name, node, anchor_root_bare, unlogged);
             if has_intermediate && !int_have.contains(&int_name) {
                 client
                     .update(&int_ddl, None, &[])
-                    .map_err(|e| format!("sync: failed to create intermediate child: {}", e))?;
+                    .map_err(|e| format!("sync: create intermediate node: {}", e))?;
                 out.added_intermediate += 1;
             }
             if !tgt_have.contains(&tgt_name) {
                 client
                     .update(&tgt_ddl, None, &[])
-                    .map_err(|e| format!("sync: failed to create target child: {}", e))?;
+                    .map_err(|e| format!("sync: create target node: {}", e))?;
                 out.added_target += 1;
             }
         }
@@ -937,7 +940,8 @@ pub(crate) fn reflex_sync_partitions_impl(view_name: &str, drop_orphans: bool) -
         if drop_orphans {
             let (schema_opt, _) = split_qualified_name(view_name);
             let schema = schema_opt.unwrap_or("public");
-            for c in &int_children {
+            // Drop bottom-up (children before parents) to avoid depending on CASCADE.
+            for c in int_children.iter().rev() {
                 if !src_expected_int.contains(&c.bare_name) {
                     let q = format!(
                         "DROP TABLE IF EXISTS \"{}\".\"{}\" CASCADE",
@@ -949,7 +953,7 @@ pub(crate) fn reflex_sync_partitions_impl(view_name: &str, drop_orphans: bool) -
                     out.dropped_intermediate += 1;
                 }
             }
-            for c in &tgt_children {
+            for c in tgt_children.iter().rev() {
                 if !src_expected_tgt.contains(&c.bare_name) {
                     let q = format!(
                         "DROP TABLE IF EXISTS \"{}\".\"{}\" CASCADE",
