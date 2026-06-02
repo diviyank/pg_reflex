@@ -255,3 +255,28 @@ fn pg_subpart_event_trigger_enqueues_source_not_reflex_owned() {
     ).expect("q").expect("c");
     assert_eq!(bad, 0, "reflex-owned tables must never be enqueued");
 }
+
+#[pg_test]
+fn pg_subpart_detach_remove_drops_imv_leaf_via_flush() {
+    Spi::run("CREATE TABLE ssa (dem_plan_id BIGINT NOT NULL, order_date DATE NOT NULL, product_id BIGINT, qty INT) PARTITION BY LIST (dem_plan_id)").expect("root");
+    Spi::run("CREATE TABLE ssa_172 PARTITION OF ssa FOR VALUES IN (172) PARTITION BY RANGE (order_date)").expect("list");
+    Spi::run("CREATE TABLE ssa_172_2025_01 PARTITION OF ssa_172 FOR VALUES FROM ('2025-01-01') TO ('2025-02-01')").expect("l1");
+    Spi::run("CREATE TABLE ssa_172_2025_02 PARTITION OF ssa_172 FOR VALUES FROM ('2025-02-01') TO ('2025-03-01')").expect("l2");
+    Spi::run("INSERT INTO ssa VALUES (172,'2025-01-15',5,10),(172,'2025-02-15',5,20)").expect("seed");
+    Spi::get_one::<String>(
+        "SELECT create_reflex_ivm('fcsta','SELECT dem_plan_id, order_date, product_id, qty FROM ssa', \
+         'dem_plan_id,product_id,order_date', NULL, NULL, NULL, ARRAY['dem_plan_id'])",
+    ).expect("c").expect("c");
+
+    // Detach + drop the Jan source leaf (removal). The DETACH fires the event
+    // trigger which enqueues the root 'public.ssa'; the flush oid-diff sees the
+    // Jan leaf gone and DROPs the matching IMV leaf.
+    Spi::run("ALTER TABLE ssa_172 DETACH PARTITION ssa_172_2025_01").expect("detach");
+    Spi::run("DROP TABLE ssa_172_2025_01").expect("drop");
+    let _ = Spi::get_one::<String>("SELECT reflex_flush_partitions()").expect("flush").expect("flush");
+
+    let jan_gone = Spi::get_one::<bool>("SELECT to_regclass('public.fcsta_ssa_172_2025_01') IS NULL").expect("q").expect("b");
+    assert!(jan_gone, "Jan IMV leaf dropped");
+    let feb = Spi::get_one::<i32>("SELECT qty FROM fcsta WHERE order_date='2025-02-15'").expect("q").expect("feb");
+    assert_eq!(feb, 20, "Feb untouched");
+}
