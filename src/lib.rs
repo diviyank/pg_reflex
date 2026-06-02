@@ -159,6 +159,26 @@ extension_sql!(
     ALTER TABLE public.__reflex_ivm_reference
         ADD COLUMN IF NOT EXISTS max_one_row BOOLEAN DEFAULT FALSE;
 
+    -- Multi-level partition capture (plans/sub_partitioning.md). Snapshot of
+    -- each tracked source root's recursive LEAF set, keyed by (root, child).
+    -- reflex_flush_partitions oid-diffs the live leaf set against this to
+    -- classify attach (new) / swap (oid changed) / detach (gone).
+    CREATE TABLE IF NOT EXISTS public.__reflex_source_partition_snapshot (
+        source_root TEXT NOT NULL,
+        child_name  TEXT NOT NULL,
+        child_oid   OID  NOT NULL,
+        bound       TEXT,
+        PRIMARY KEY (source_root, child_name)
+    );
+
+    -- Roots enqueued by the DDL event trigger when a source partition is
+    -- attached/detached; drained by reflex_flush_partitions.
+    CREATE TABLE IF NOT EXISTS public.__reflex_partition_pending (
+        source_root TEXT NOT NULL,
+        enqueued_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        PRIMARY KEY (source_root)
+    );
+
     -- 1.6.0: SQL helper used by the per-partition dispatch DO block emitted
     -- by build_partition_aware_dispatch_sql.  Given a partitioned parent +
     -- partition column name + a single text-form key, returns the regclass

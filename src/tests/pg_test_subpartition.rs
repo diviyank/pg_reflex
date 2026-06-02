@@ -176,3 +176,10 @@ fn pg_subpart_reconcile_internal_node_swaps_all_leaves() {
     let feb = Spi::get_one::<i32>("SELECT qty FROM fcst6 WHERE order_date='2025-02-15'").expect("q").expect("f");
     assert_eq!((jan, feb), (111, 222));
 }
+
+#[pg_test]
+fn pg_subpart_catalog_tables_exist() {
+    let snap = Spi::get_one::<bool>("SELECT to_regclass('public.__reflex_source_partition_snapshot') IS NOT NULL").expect("q").expect("b");
+    let pend = Spi::get_one::<bool>("SELECT to_regclass('public.__reflex_partition_pending') IS NOT NULL").expect("q").expect("b");
+    assert!(snap && pend, "snapshot={snap} pending={pend}");
+}
