@@ -1,12 +1,18 @@
 # Changelog
 
-## [Unreleased]
+## [1.8.1] - 2026-06-02
 
 Multi-level (sub-partition) source support: an IMV whose source is partitioned
 more than one level deep (e.g. `LIST (dem_plan_id) → RANGE (order_date)`) now
 mirrors the **entire** source partition hierarchy and can be reconciled at any
 level. Partition `DETACH`/`ATTACH` swaps — which fire no DML trigger — are
 captured by the DDL event trigger and applied by a new flush.
+
+Run `ALTER EXTENSION pg_reflex UPDATE TO '1.8.1';` and replace the `.so`. The
+migration adds the two capture catalog tables, the flush functions, the
+`source_partition` argument on `reflex_reconcile_partition`, the enqueue branch
+on the `ddl_command_end` event trigger, and **seeds the partition snapshot for
+existing partitioned IMVs** so the first post-upgrade swap is incremental.
 
 ### Added
 
