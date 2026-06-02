@@ -51,6 +51,22 @@ pub(crate) struct PartitionChild {
     pub bound_expr: String,
 }
 
+/// A node in a source table's (possibly multi-level) partition tree.
+///
+/// `bare_name` is the unqualified relname of this node.  `parent_bare` is the
+/// immediate parent's relname (the root's own parent is the anchor root).
+/// `bound_expr` is the `FOR VALUES …` fragment relative to the immediate
+/// parent.  `sub_strategy`/`sub_columns` are `Some`/non-empty only when this
+/// node is *itself* partitioned (an internal node); leaves have `None`/empty.
+#[derive(Debug, Clone)]
+pub(crate) struct PartitionNode {
+    pub bare_name: String,
+    pub parent_bare: String,
+    pub bound_expr: String,
+    pub sub_strategy: Option<String>,
+    pub sub_columns: Vec<String>,
+}
+
 /// Read the partition descriptor of `source` (schema-qualified or bare).
 /// Returns None if the table is not partitioned, or if the strategy is
 /// not LIST/RANGE.
@@ -146,6 +162,90 @@ pub(crate) fn list_partition_children(
             pgrx::warning!(
                 "pg_reflex: list_partition_children('{}') SPI error: {}",
                 parent,
+                e
+            );
+            Vec::new()
+        }
+    }
+}
+
+/// Recursively list every descendant partition node of `root`
+/// (schema-qualified or bare), ordered top-down (parents before children) so
+/// callers can create IMV-side parents before their children.  Each node
+/// carries its own sub-partition strategy/columns when it is itself
+/// partitioned.  Returns an empty vector when `root` is not partitioned.
+pub(crate) fn list_partition_tree(
+    client: &pgrx::spi::SpiClient<'_>,
+    root: &str,
+) -> Vec<PartitionNode> {
+    let sql = "\
+        WITH RECURSIVE tree AS ( \
+            SELECT i.inhrelid AS child_oid, i.inhparent AS parent_oid, 1 AS depth \
+            FROM pg_inherits i \
+            WHERE i.inhparent = to_regclass($1) \
+          UNION ALL \
+            SELECT i.inhrelid, i.inhparent, t.depth + 1 \
+            FROM pg_inherits i JOIN tree t ON i.inhparent = t.child_oid \
+        ) \
+        SELECT \
+            c.relname::text AS bare_name, \
+            pc.relname::text AS parent_bare, \
+            pg_get_expr(c.relpartbound, c.oid) AS bound_expr, \
+            CASE pt.partstrat WHEN 'l' THEN 'LIST' WHEN 'r' THEN 'RANGE' \
+                              WHEN 'h' THEN 'HASH' ELSE NULL END AS sub_strategy, \
+            COALESCE(( \
+                SELECT array_agg(a.attname::text ORDER BY k.n) \
+                FROM unnest(string_to_array(pt.partattrs::text, ' ')::int[]) \
+                    WITH ORDINALITY AS k(attnum, n) \
+                JOIN pg_attribute a ON a.attrelid = pt.partrelid \
+                                   AND a.attnum = k.attnum::smallint \
+            ), ARRAY[]::text[]) AS sub_columns \
+        FROM tree t \
+        JOIN pg_class c  ON c.oid = t.child_oid \
+        JOIN pg_class pc ON pc.oid = t.parent_oid \
+        LEFT JOIN pg_partitioned_table pt ON pt.partrelid = c.oid \
+        ORDER BY t.depth, c.relname";
+    match client.select(
+        sql,
+        None,
+        &[unsafe { DatumWithOid::new(root.to_string(), PgBuiltInOids::TEXTOID.oid().value()) }],
+    ) {
+        Ok(iter) => iter
+            .filter_map(|row| {
+                let bare = row.get_by_name::<&str, _>("bare_name").ok()??.to_string();
+                let parent = row.get_by_name::<&str, _>("parent_bare").ok()??.to_string();
+                let bound = row
+                    .get_by_name::<&str, _>("bound_expr")
+                    .ok()
+                    .flatten()
+                    .unwrap_or("")
+                    .to_string();
+                let sub_strategy = row
+                    .get_by_name::<&str, _>("sub_strategy")
+                    .ok()
+                    .flatten()
+                    .map(|s| s.to_string());
+                let sub_columns: Vec<String> = row
+                    .get_by_name::<Vec<String>, _>("sub_columns")
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|c| c.to_lowercase())
+                    .collect();
+                Some(PartitionNode {
+                    bare_name: bare,
+                    parent_bare: parent,
+                    bound_expr: bound,
+                    sub_strategy: sub_strategy.filter(|s| s == "LIST" || s == "RANGE"),
+                    sub_columns,
+                })
+            })
+            .collect(),
+        Err(e) => {
+            pgrx::warning!(
+                "pg_reflex: list_partition_tree('{}') SPI error: {}",
+                root,
                 e
             );
             Vec::new()

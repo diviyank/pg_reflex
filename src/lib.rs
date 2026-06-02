@@ -903,6 +903,11 @@ mod tests {
         );
     }
 
+    #[pg_extern]
+    fn crate_test_list_partition_tree(root: &str) -> i64 {
+        Spi::connect(|client| crate::partition::list_partition_tree(&client, root).len() as i64)
+    }
+
     include!("tests/pg_test_basic.rs");
     include!("tests/pg_test_trigger.rs");
     include!("tests/pg_test_passthrough.rs");
@@ -923,6 +928,7 @@ mod tests {
     include!("tests/pg_test_directional_dispatch.rs");
     include!("tests/pg_test_coverage.rs");
     include!("tests/pg_test_partition.rs");
+    include!("tests/pg_test_subpartition.rs");
     include!("tests/pg_test_partition_dispatch.rs");
     include!("tests/pg_test_audit.rs");
     include!("tests/pg_test_fuzz.rs");
