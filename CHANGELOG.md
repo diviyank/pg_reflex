@@ -1,5 +1,48 @@
 # Changelog
 
+## [Unreleased]
+
+Multi-level (sub-partition) source support: an IMV whose source is partitioned
+more than one level deep (e.g. `LIST (dem_plan_id) → RANGE (order_date)`) now
+mirrors the **entire** source partition hierarchy and can be reconciled at any
+level. Partition `DETACH`/`ATTACH` swaps — which fire no DML trigger — are
+captured by the DDL event trigger and applied by a new flush.
+
+### Added
+
+- **Full-hierarchy partition mirroring.** `create_reflex_ivm(..., partition_by)`
+  and `reflex_sync_partitions` now walk the source's whole partition tree
+  recursively and build a matching multi-level IMV tree (internal nodes carry a
+  sub-`PARTITION BY`). All partition-key columns at every level must be bare
+  projected columns in the IMV's unique key / GROUP BY.
+- **`reflex_reconcile_partition(view, partition_keys, source_partition DEFAULT '')`.**
+  The new third argument reconciles a named source partition at any level by
+  expanding it to its leaves and atomic-swapping each. The legacy 2-arg form is
+  unchanged and now also correct on sub-partitioned sources.
+- **`reflex_flush_partitions()` / `reflex_flush_partition_source(root)`.** Apply
+  pending source partition swaps. The `ddl_command_end` event trigger enqueues
+  the affected source root (resolved via `pg_partition_root`, pg_reflex-owned
+  tables excluded) into `__reflex_partition_pending`; the flush oid-diffs the
+  live leaf set against `__reflex_source_partition_snapshot` to classify each
+  change as attach (new) / swap (oid changed) / detach (dropped) and reconciles
+  or drops the matching IMV leaf. New catalog tables
+  `__reflex_source_partition_snapshot` and `__reflex_partition_pending`.
+- **Audit drift-check.** `reflex_audit(view)` now flags any divergence between a
+  partitioned source's recursive leaf set and the IMV's mirrored leaves — a
+  correctness backstop for a forgotten flush or an uncaptured write vector.
+
+### Notes
+
+- No triggers are placed on sub-partitions: swaps are DDL (captured by the event
+  trigger + flush) and root-routed DML is covered by the existing root trigger,
+  so newly-attached sub-partitions need no trigger management.
+- Known limitation: `detach → modify the same table in place → re-attach the
+  same table` (unchanged oid) is not auto-detected; attach a freshly-built table
+  (the supported pattern) or call `reflex_reconcile_partition(view, '', leaf)`
+  explicitly. The audit drift-check surfaces it either way.
+
+---
+
 ## [1.7.6] - 2026-06-01
 
 Correctness release: **`ignore_sources` is now honored on the DEFERRED trigger

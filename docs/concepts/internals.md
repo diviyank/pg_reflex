@@ -136,7 +136,8 @@ The public API exposes one new argument and two new functions:
 
 - `create_reflex_ivm(..., partition_by => ARRAY['col'])` — opt-in.
 - `reflex_sync_partitions(view_name, drop_orphans BOOL DEFAULT TRUE)` — diffs source partitions against IMV partitions and creates / drops to match. Idempotent.
-- `reflex_reconcile_partition(view_name, partition_keys TEXT)` — atomic DETACH/ATTACH swap one child instead of the whole IMV (1.6.0).
+- `reflex_reconcile_partition(view_name, partition_keys TEXT, source_partition TEXT DEFAULT '')` — atomic DETACH/ATTACH swap (1.6.0). `source_partition` (unreleased) reconciles a named source partition at **any** level (expands to its leaves) — see "Multi-level (sub-partition) sources" below.
+- `reflex_flush_partitions()` / `reflex_flush_partition_source(root)` (unreleased) — apply pending source `DETACH`/`ATTACH` swaps captured by the event trigger, via a snapshot oid-diff. Call once after a batch of partition swaps.
 - `reflex_set_wipe_floor_rows(view_name, n)` (1.6.0) — per-IMV floor for the per-partition denominator in the trigger-time dispatch ratio.
 - `reflex_set_partition_dispatch_cost_cap(view_name, n)` (1.6.0) — per-IMV cap for the Tier 2 JOIN cost estimate.
 
@@ -221,6 +222,66 @@ When the user adds a new partition to a source — `ALTER TABLE parent ATTACH PA
 Non-partition `ALTER TABLE` variants (column add/drop, …) on a tracked source still trip the existing `pg_reflex.alter_source_policy = warn|error` contract — the auto-sync branch is a no-op for IMVs without `partition_columns` set.
 
 `reflex_reconcile` also runs `reflex_sync_partitions` at entry as a defense-in-depth (event triggers can be disabled by superusers via `ALTER EVENT TRIGGER ... DISABLE`).
+
+## Multi-level (sub-partition) sources and partition-change capture
+
+`plans/sub_partitioning.md`. Production sources are often **multi-level** partitioned — e.g. `yse.sales_simulation` is `LIST (dem_plan_id)` at level 1 and each LIST child is itself `RANGE (order_date)` at level 2. pg_reflex mirrors the **entire** source partition hierarchy onto the IMV and can reconcile at **any level**. This section is the end-to-end description of how partition changes are detected and applied.
+
+### How writes to a partitioned source are captured
+
+The capture mechanism depends on *how* rows reach the source. The full coverage map:
+
+| Write vector | Captured by | Per-sub-partition trigger? |
+|---|---|---|
+| `DETACH`/`ATTACH PARTITION` swap | **Event trigger → enqueue → flush** (this section) | No |
+| Ordinary DML through the **root** (`INSERT/UPDATE/DELETE yse.sales_simulation`) | The root statement trigger — its transition table captures all routed rows, including rows landing in newly-attached sub-partitions | No |
+| Ordinary DML **directly against a leaf** (`UPDATE sales_simulation_p_172_2025_03 …`) | Not captured automatically — detectable via the audit drift-check | No |
+
+The key fact: **statement-level triggers with transition tables fire only for the table named in the SQL command, and `ATTACH`/`DETACH` are DDL that fire no DML trigger at all** (and an attached partition's rows pre-exist any trigger). So a swap can only be captured by a *reconcile*, driven by a PostgreSQL **event trigger** — never by a row/statement trigger on the partition. This is why pg_reflex places **no triggers on sub-partitions**: a newly-attached sub-partition needs zero trigger management.
+
+### Full-hierarchy mirroring
+
+At `create_reflex_ivm` (and on every `reflex_sync_partitions`) the source tree is walked recursively (`partition::list_partition_tree`, a `WITH RECURSIVE` over `pg_inherits`, returned top-down). Each `PartitionNode` records its immediate parent, its `FOR VALUES` bound, and — when it is itself partitioned — its sub-strategy/columns. `build_partition_node_ddl_pair` emits a matching IMV child per node: an internal node gets a `… PARTITION OF <parent-imv-child> FOR VALUES … PARTITION BY <sub-strategy> (<sub-cols>)` (always LOGGED), a leaf gets `… PARTITION OF <parent-imv-child> FOR VALUES …` (honouring the IMV's storage mode). IMV node names are `<bare_view>_<source_node_bare>` — source relnames are globally unique across levels, so the mapping is 1:1 at every level. Validation requires **every** partition-key column at **every** level to be a bare projected column in the IMV's unique key / GROUP BY (else PG could not build the required unique index, and the swap-fill constraint could not resolve).
+
+### Reconcile is level-agnostic
+
+`reflex_reconcile_partition(view, partition_keys, source_partition DEFAULT '')` resolves to a set of IMV **leaves** and swaps each via `execute_partition_swap_for_child`:
+
+- `source_partition := '<source partition at any level>'` — expands to that node's source leaves (a leaf expands to itself), each mapped to its IMV leaf. This is the form the pipeline calls after a swap.
+- `partition_keys := '172'` (legacy CSV of LIST keys) — probes the top-level child whose constraint matches the key, then expands that (internal) node to its leaves. Backward-compatible, and now correct on sub-partitioned sources.
+
+The swap engine fills each IMV leaf from `SELECT * FROM (base_query) WHERE (<pg_get_partition_constraintdef>)`; on a sub-leaf that constraint is the **full ancestral predicate** (`dem_plan_id = 172 AND order_date >= … AND order_date < …`), so the fill is exact. Because a leaf's immediate parent is an *internal node* (not the IMV root), the executor resolves each leaf's current immediate parent live (`read_immediate_parent_qual` via `pg_inherits`) and DETACH/ATTACHes against it — for single-level IMVs the immediate parent *is* the root, so behaviour is byte-identical to before.
+
+### Capture pipeline: event trigger → enqueue → flush → oid-diff
+
+1. **Event trigger** (`public.__reflex_on_ddl_command_end`, on `ddl_command_end`): for each `ALTER TABLE`/`CREATE TABLE` it resolves the affected relation's **partition root** via `pg_partition_root` (a multi-level attach reports an *intermediate* level, but IMVs depend on the top-level source). If that root is a registered source of a partitioned IMV and is **not** pg_reflex-owned, it enqueues the root into `public.__reflex_partition_pending`. The reflex-owned exclusion is mandatory: pg_reflex's own atomic swap DETACH/ATTACHes IMV partitions, and reacting to those would race the code-driven cascade.
+2. **Flush** (`reflex_flush_partitions()` drains the queue; `reflex_flush_partition_source(root)` flushes one). For each dirty root it **oid-diffs** the live recursive leaf set against `public.__reflex_source_partition_snapshot`:
+
+   | Diff result | Meaning | Action |
+   |---|---|---|
+   | name present, **oid changed** | same-bound swap (detach + attach a freshly-built table) | `SwapFill` — partition-scoped reconcile of that IMV leaf |
+   | name new | attach-new | `AttachNew` — sync creates the IMV leaf, then swap-fills |
+   | name gone | detach / remove | `Drop` — `DROP` the matching IMV leaf (O(1), no row scan) |
+   | unchanged | no-op | skip |
+
+   The oid change is what makes a *same-bound* swap detectable without parsing the DDL. **Drops are applied before attaches** within a flush: a rename-style swap yields `Drop(old)+AttachNew(new)` on the same bound, and attaching first would overlap the old leaf's range. After applying, the snapshot is refreshed and the pending row cleared. Dependent IMVs propagate through the existing `graph_child` cascade inside `reflex_reconcile_partition`.
+
+3. **Snapshot key.** `__reflex_source_partition_snapshot` is keyed by a **canonical schema-qualified** root (`partition::canonical_root_key`) on both write (create-time seed, post-flush refresh) and read, so the bare anchor used at create (`fz`) and the `pg_partition_root` form enqueued by the trigger (`public.fz`) resolve to the same key.
+
+Typical pipeline usage: after a batch of `DETACH`/`ATTACH` swaps, call `SELECT reflex_flush_partitions();` once (so intermediate states are not reconciled). A removal (`DETACH` then `DROP`/leave-detached) needs no special call — the flush sees the leaf gone and drops the IMV leaf.
+
+### Lifecycle summary
+
+- New month leaf attached under an existing `dem_plan_id` → flush creates + fills the matching IMV leaf.
+- New `dem_plan_id` attached → flush (via sync) creates the internal node + its leaves, then fills.
+- Source leaf detached/removed → flush drops the orphaned IMV leaf.
+- The whole `dem_plan_id` regenerated → `reflex_reconcile_partition(view, source_partition := '…_p_172')` (or the flush, if swapped leaf-by-leaf).
+
+### Correctness backstop and limitations
+
+- **Audit drift-check** (`audit::checks_b_drift::PartitionTreeDrift`, surfaced by `reflex_audit(view)`): compares the source's recursive leaf set against the IMV's and flags any divergence — so a forgotten flush or any uncaptured vector is always *detectable*.
+- **Known limitation:** `detach → modify the same table in place → re-attach the same table` is invisible to the oid-diff (the oid is unchanged). The supported pipeline pattern attaches a freshly-built table (new oid). For the in-place pattern, call `reflex_reconcile_partition(view, source_partition := '<leaf>')` explicitly; the audit check catches it otherwise.
+- HASH at any level, and finer-than-top-level cascade to dependents, are out of scope (dependents reconcile at their own LIST level — correct, possibly coarser).
 
 ## Per-IMV SAVEPOINT in DEFERRED flush
 
