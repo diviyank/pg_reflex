@@ -66,6 +66,11 @@ pub(crate) struct PartitionChild {
 #[derive(Debug, Clone)]
 pub(crate) struct PartitionNode {
     pub bare_name: String,
+    /// The node's `pg_class.oid`. Captured during the tree walk so snapshot
+    /// diffing keys off the actual relation (not a bare-name re-lookup, which
+    /// could match a homonym in another schema — partition children are not
+    /// required to share the parent's schema).
+    pub oid: u32,
     pub parent_bare: String,
     pub bound_expr: String,
     pub sub_strategy: Option<String>,
@@ -194,6 +199,7 @@ pub(crate) fn list_partition_tree(
         ) \
         SELECT \
             c.relname::text AS bare_name, \
+            c.oid::int8 AS node_oid, \
             pc.relname::text AS parent_bare, \
             pg_get_expr(c.relpartbound, c.oid) AS bound_expr, \
             CASE pt.partstrat WHEN 'l' THEN 'LIST' WHEN 'r' THEN 'RANGE' \
@@ -218,6 +224,7 @@ pub(crate) fn list_partition_tree(
         Ok(iter) => iter
             .filter_map(|row| {
                 let bare = row.get_by_name::<&str, _>("bare_name").ok()??.to_string();
+                let oid = row.get_by_name::<i64, _>("node_oid").ok()?? as u32;
                 let parent = row.get_by_name::<&str, _>("parent_bare").ok()??.to_string();
                 let bound = row
                     .get_by_name::<&str, _>("bound_expr")
@@ -240,6 +247,7 @@ pub(crate) fn list_partition_tree(
                     .collect();
                 Some(PartitionNode {
                     bare_name: bare,
+                    oid,
                     parent_bare: parent,
                     bound_expr: bound,
                     sub_strategy: sub_strategy.filter(|s| s == "LIST" || s == "RANGE"),
@@ -1579,18 +1587,7 @@ pub(crate) fn current_source_leaf_oids(
     list_partition_tree(client, source_root)
         .into_iter()
         .filter(|n| n.sub_strategy.is_none())
-        .filter_map(|n| {
-            let oid: Option<i64> = client
-                .select(
-                    "SELECT c.oid::int8 AS oid FROM pg_class c WHERE c.relname = $1",
-                    Some(1),
-                    &[unsafe { DatumWithOid::new(n.bare_name.clone(), pgrx::pg_sys::TEXTOID) }],
-                )
-                .ok()
-                .and_then(|mut it| it.next())
-                .and_then(|r| r.get_by_name::<i64, _>("oid").ok().flatten());
-            oid.map(|o| (n.bare_name, o as u32))
-        })
+        .map(|n| (n.bare_name, n.oid))
         .collect()
 }
 

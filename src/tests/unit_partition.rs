@@ -294,6 +294,7 @@ fn test_build_swap_partition_ddl_range_bound() {
 fn test_node_ddl_internal_node_has_sub_partition_by() {
     let node = PartitionNode {
         bare_name: "ss_172".to_string(),
+        oid: 0,
         parent_bare: "ss".to_string(), // == anchor root
         bound_expr: "FOR VALUES IN ('172')".to_string(),
         sub_strategy: Some("RANGE".to_string()),
@@ -310,6 +311,7 @@ fn test_node_ddl_internal_node_has_sub_partition_by() {
 fn test_node_ddl_leaf_under_internal_parent_is_unlogged() {
     let node = PartitionNode {
         bare_name: "ss_172_2025_01".to_string(),
+        oid: 0,
         parent_bare: "ss_172".to_string(), // not the root → parent is an IMV child
         bound_expr: "FOR VALUES FROM ('2025-01-01') TO ('2025-02-01')".to_string(),
         sub_strategy: None,
