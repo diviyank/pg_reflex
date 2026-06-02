@@ -315,3 +315,35 @@ fn test_build_swap_partition_ddl_range_bound() {
         .attach_new_tgt
         .contains("FOR VALUES FROM ('2026-01-01') TO ('2027-01-01')"));
 }
+
+#[test]
+fn test_node_ddl_internal_node_has_sub_partition_by() {
+    let node = PartitionNode {
+        bare_name: "ss_172".to_string(),
+        parent_bare: "ss".to_string(), // == anchor root
+        bound_expr: "FOR VALUES IN ('172')".to_string(),
+        sub_strategy: Some("RANGE".to_string()),
+        sub_columns: vec!["order_date".to_string()],
+    };
+    let (_int, tgt) = build_partition_node_ddl_pair("fcst", &node, "ss", true);
+    assert_eq!(
+        tgt,
+        r#"CREATE TABLE IF NOT EXISTS "public"."fcst_ss_172" PARTITION OF "public"."fcst" FOR VALUES IN ('172') PARTITION BY RANGE ("order_date")"#
+    );
+}
+
+#[test]
+fn test_node_ddl_leaf_under_internal_parent_is_unlogged() {
+    let node = PartitionNode {
+        bare_name: "ss_172_2025_01".to_string(),
+        parent_bare: "ss_172".to_string(), // not the root → parent is an IMV child
+        bound_expr: "FOR VALUES FROM ('2025-01-01') TO ('2025-02-01')".to_string(),
+        sub_strategy: None,
+        sub_columns: vec![],
+    };
+    let (_int, tgt) = build_partition_node_ddl_pair("fcst", &node, "ss", true);
+    assert_eq!(
+        tgt,
+        r#"CREATE UNLOGGED TABLE IF NOT EXISTS "public"."fcst_ss_172_2025_01" PARTITION OF "public"."fcst_ss_172" FOR VALUES FROM ('2025-01-01') TO ('2025-02-01')"#
+    );
+}

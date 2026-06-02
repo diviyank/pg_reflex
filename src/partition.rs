@@ -324,6 +324,64 @@ pub(crate) fn build_partition_child_ddl_pair(
     (int_ddl, tgt_ddl)
 }
 
+/// Tree-aware DDL pair builder.  Unlike `build_partition_child_ddl_pair`
+/// (which always attaches to the IMV root), this resolves the parent from
+/// `node.parent_bare`: when it equals `anchor_root_bare` the parent is the
+/// IMV root, otherwise it is the IMV child mirroring that source node.
+/// Internal nodes (own partition strategy) get a `PARTITION BY` suffix and
+/// are always LOGGED; only leaves honour `unlogged`.
+pub(crate) fn build_partition_node_ddl_pair(
+    view_name: &str,
+    node: &PartitionNode,
+    anchor_root_bare: &str,
+    unlogged: bool,
+) -> (String, String) {
+    let (schema_opt, bare_view) = split_qualified_name(view_name);
+    let schema = schema_opt.unwrap_or("public");
+
+    let int_parent = if node.parent_bare == anchor_root_bare {
+        intermediate_table_name(view_name)
+    } else {
+        schema_prefix(
+            view_name,
+            &intermediate_child_name(view_name, &node.parent_bare),
+        )
+    };
+    let tgt_parent = if node.parent_bare == anchor_root_bare {
+        format!("\"{}\".\"{}", schema, bare_view) + "\""
+    } else {
+        schema_prefix(view_name, &target_child_name(view_name, &node.parent_bare))
+    };
+    let int_child = schema_prefix(
+        view_name,
+        &intermediate_child_name(view_name, &node.bare_name),
+    );
+    let tgt_child = schema_prefix(view_name, &target_child_name(view_name, &node.bare_name));
+
+    let sub_clause = match &node.sub_strategy {
+        Some(strat) if !node.sub_columns.is_empty() => {
+            format!(" {}", build_partition_by_clause(strat, &node.sub_columns))
+        }
+        _ => String::new(),
+    };
+    let is_leaf = node.sub_strategy.is_none();
+    let create_kw = if unlogged && is_leaf {
+        "CREATE UNLOGGED TABLE"
+    } else {
+        "CREATE TABLE"
+    };
+
+    let int_ddl = format!(
+        "{} IF NOT EXISTS {} PARTITION OF {} {}{}",
+        create_kw, int_child, int_parent, node.bound_expr, sub_clause
+    );
+    let tgt_ddl = format!(
+        "{} IF NOT EXISTS {} PARTITION OF {} {}{}",
+        create_kw, tgt_child, tgt_parent, node.bound_expr, sub_clause
+    );
+    (int_ddl, tgt_ddl)
+}
+
 /// Build the canonical swap-table name for one source-child of a view.
 /// `kind` is "int" (intermediate) or "tgt" (target).
 pub(crate) fn swap_partition_name(view_name: &str, kind: &str, source_child_bare: &str) -> String {
