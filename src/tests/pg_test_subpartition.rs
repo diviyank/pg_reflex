@@ -153,3 +153,26 @@ fn pg_subpart_reconcile_leaf_swaps_only_that_leaf() {
     assert_eq!(jan, 999, "Jan leaf reconciled");
     assert_eq!(feb, 20, "Feb leaf untouched");
 }
+
+#[pg_test]
+fn pg_subpart_reconcile_internal_node_swaps_all_leaves() {
+    Spi::run("CREATE TABLE ss6 (dem_plan_id BIGINT NOT NULL, order_date DATE NOT NULL, product_id BIGINT, qty INT) PARTITION BY LIST (dem_plan_id)").expect("root");
+    Spi::run("CREATE TABLE ss6_172 PARTITION OF ss6 FOR VALUES IN (172) PARTITION BY RANGE (order_date)").expect("list");
+    Spi::run("CREATE TABLE ss6_172_2025_01 PARTITION OF ss6_172 FOR VALUES FROM ('2025-01-01') TO ('2025-02-01')").expect("l1");
+    Spi::run("CREATE TABLE ss6_172_2025_02 PARTITION OF ss6_172 FOR VALUES FROM ('2025-02-01') TO ('2025-03-01')").expect("l2");
+    Spi::run("INSERT INTO ss6 VALUES (172,'2025-01-15',5,10),(172,'2025-02-15',5,20)").expect("seed");
+    Spi::get_one::<String>(
+        "SELECT create_reflex_ivm('fcst6','SELECT dem_plan_id, order_date, product_id, qty FROM ss6', \
+         'dem_plan_id,product_id,order_date', NULL, NULL, NULL, ARRAY['dem_plan_id'])",
+    ).expect("c").expect("c");
+
+    // Mutate both month leaves, then reconcile the WHOLE dem_plan_id internal
+    // node by source name -> resolution expands it to all its leaves.
+    Spi::run("UPDATE ss6_172_2025_01 SET qty = 111").expect("m1");
+    Spi::run("UPDATE ss6_172_2025_02 SET qty = 222").expect("m2");
+    let r = Spi::get_one::<String>("SELECT reflex_reconcile_partition('fcst6', '', 'ss6_172')").expect("rec").expect("rec");
+    assert!(!r.starts_with("ERROR"), "{r}");
+    let jan = Spi::get_one::<i32>("SELECT qty FROM fcst6 WHERE order_date='2025-01-15'").expect("q").expect("j");
+    let feb = Spi::get_one::<i32>("SELECT qty FROM fcst6 WHERE order_date='2025-02-15'").expect("q").expect("f");
+    assert_eq!((jan, feb), (111, 222));
+}
