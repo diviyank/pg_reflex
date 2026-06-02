@@ -703,6 +703,60 @@ fn pg_part_global_reconcile_swaps_each_partition() {
     assert_eq!(leftover, 0);
 }
 
+/// Regression: global `reflex_reconcile` on a partitioned *passthrough* IMV
+/// (no intermediate table) must rebuild every child without touching the
+/// absent `__reflex_intermediate_<view>` relation.  Before the fix the
+/// partitioned reconcile branch unconditionally ran
+/// `ANALYZE __reflex_intermediate_<view>`, raising 42P01 for passthrough IMVs
+/// and aborting the whole reconcile.
+#[pg_test]
+fn pg_part_global_reconcile_passthrough_no_intermediate() {
+    Spi::run(
+        "CREATE TABLE part_grecp (dem_plan_id BIGINT, product_id BIGINT, qty NUMERIC) \
+         PARTITION BY LIST (dem_plan_id)",
+    )
+    .expect("create");
+    for id in [1, 2, 3] {
+        Spi::run(&format!(
+            "CREATE TABLE part_grecp_{id} PARTITION OF part_grecp FOR VALUES IN ({id})"
+        ))
+        .expect("p");
+    }
+    Spi::run("INSERT INTO part_grecp VALUES (1, 100, 10), (2, 200, 20), (3, 300, 30)")
+        .expect("seed");
+    Spi::run(
+        "SELECT create_reflex_ivm( \
+            'part_grecp_v', \
+            'SELECT dem_plan_id, product_id, qty FROM part_grecp', \
+            'dem_plan_id,product_id', NULL, NULL, NULL, \
+            ARRAY['dem_plan_id'] \
+         )",
+    )
+    .expect("imv");
+
+    // Precondition: passthrough → no intermediate table exists.
+    let int_tables = Spi::get_one::<i64>(
+        "SELECT count(*) FROM pg_class WHERE relname = '__reflex_intermediate_part_grecp_v'",
+    )
+    .expect("q")
+    .expect("c");
+    assert_eq!(int_tables, 0, "passthrough IMV must have no intermediate table");
+
+    // Drift every child, then global-reconcile.
+    Spi::run("UPDATE part_grecp_v SET qty = -1").expect("drift");
+
+    let res = Spi::get_one::<&str>("SELECT reflex_reconcile('part_grecp_v')")
+        .expect("rec")
+        .expect("res");
+    assert_eq!(res, "RECONCILED");
+
+    for (id, expected) in [(1, "10"), (2, "20"), (3, "30")] {
+        let q = format!("SELECT qty FROM part_grecp_v WHERE dem_plan_id = {id}");
+        let v = Spi::get_one::<pgrx::AnyNumeric>(&q).expect("q").expect("v");
+        assert_eq!(v.to_string(), expected, "dem_plan_id {id}");
+    }
+}
+
 /// Cascade post-swap: a partitioned parent IMV with a partitioned child
 /// IMV.  When the parent's partition is reconciled via the atomic swap,
 /// the cascade picks up the new partition data correctly.

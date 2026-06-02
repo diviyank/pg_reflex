@@ -903,25 +903,12 @@ pub(crate) fn reflex_sync_partitions_impl(view_name: &str, drop_orphans: bool) -
             }],
         );
 
-        for node in &nodes {
-            let int_name = intermediate_child_name(view_name, &node.bare_name);
-            let tgt_name = target_child_name(view_name, &node.bare_name);
-            let (int_ddl, tgt_ddl) =
-                build_partition_node_ddl_pair(view_name, node, anchor_root_bare, unlogged);
-            if has_intermediate && !int_have.contains(&int_name) {
-                client
-                    .update(&int_ddl, None, &[])
-                    .map_err(|e| format!("sync: create intermediate node: {}", e))?;
-                out.added_intermediate += 1;
-            }
-            if !tgt_have.contains(&tgt_name) {
-                client
-                    .update(&tgt_ddl, None, &[])
-                    .map_err(|e| format!("sync: create target node: {}", e))?;
-                out.added_target += 1;
-            }
-        }
-
+        // When dropping orphans, drop BEFORE adding. A source leaf that was
+        // swap-renamed (detach old / attach a freshly-built table with the same
+        // bounds) leaves an orphan IMV child whose bounds equal the incoming
+        // child's; adding first would raise "would overlap partition". This is
+        // the multi-level reconcile path: a sub-level swap renames the sub-IMV
+        // leaf, and reconcile(parent) must heal its mirror without overlap.
         if drop_orphans {
             let (schema_opt, _) = split_qualified_name(view_name);
             let schema = schema_opt.unwrap_or("public");
@@ -950,7 +937,28 @@ pub(crate) fn reflex_sync_partitions_impl(view_name: &str, drop_orphans: bool) -
                     out.dropped_target += 1;
                 }
             }
-        } else {
+        }
+
+        for node in &nodes {
+            let int_name = intermediate_child_name(view_name, &node.bare_name);
+            let tgt_name = target_child_name(view_name, &node.bare_name);
+            let (int_ddl, tgt_ddl) =
+                build_partition_node_ddl_pair(view_name, node, anchor_root_bare, unlogged);
+            if has_intermediate && !int_have.contains(&int_name) {
+                client
+                    .update(&int_ddl, None, &[])
+                    .map_err(|e| format!("sync: create intermediate node: {}", e))?;
+                out.added_intermediate += 1;
+            }
+            if !tgt_have.contains(&tgt_name) {
+                client
+                    .update(&tgt_ddl, None, &[])
+                    .map_err(|e| format!("sync: create target node: {}", e))?;
+                out.added_target += 1;
+            }
+        }
+
+        if !drop_orphans {
             for c in &int_children {
                 if !src_expected_int.contains(&c.bare_name) {
                     out.preserved_orphans.push(c.bare_name.clone());

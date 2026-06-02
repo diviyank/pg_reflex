@@ -131,12 +131,18 @@ pub(crate) fn reflex_reconcile(view_name: &str) -> &'static str {
                 }
 
                 // ANALYZE the parents so the planner sees the freshly
-                // attached children's stats.
-                let _ = client.update(
-                    &format!("ANALYZE {}", intermediate_table_name(view_name)),
-                    None,
-                    &[],
-                );
+                // attached children's stats. Passthrough IMVs have no
+                // intermediate table (`execute_partition_swap_for_child`
+                // skips it via the `end_query.is_empty()` guard), so
+                // ANALYZE-ing `__reflex_intermediate_<view>` would raise
+                // 42P01 and abort the whole reconcile.
+                if !is_passthrough {
+                    let _ = client.update(
+                        &format!("ANALYZE {}", intermediate_table_name(view_name)),
+                        None,
+                        &[],
+                    );
+                }
                 let _ = client.update(
                     &format!("ANALYZE {}", quote_identifier(view_name)),
                     None,
