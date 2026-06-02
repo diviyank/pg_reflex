@@ -1571,6 +1571,54 @@ fn cleanup_orphan_swap_tables(view_name: &str) {
     });
 }
 
+/// Current (child_name, oid) LEAF set of `source_root`, for snapshot diffing.
+pub(crate) fn current_source_leaf_oids(
+    client: &pgrx::spi::SpiClient<'_>,
+    source_root: &str,
+) -> Vec<(String, u32)> {
+    list_partition_tree(client, source_root)
+        .into_iter()
+        .filter(|n| n.sub_strategy.is_none())
+        .filter_map(|n| {
+            let oid: Option<i64> = client
+                .select(
+                    "SELECT c.oid::int8 AS oid FROM pg_class c WHERE c.relname = $1",
+                    Some(1),
+                    &[unsafe { DatumWithOid::new(n.bare_name.clone(), pgrx::pg_sys::TEXTOID) }],
+                )
+                .ok()
+                .and_then(|mut it| it.next())
+                .and_then(|r| r.get_by_name::<i64, _>("oid").ok().flatten());
+            oid.map(|o| (n.bare_name, o as u32))
+        })
+        .collect()
+}
+
+/// Replace the snapshot rows for `source_root` with the current leaf set.
+pub(crate) fn refresh_source_snapshot(client: &mut pgrx::spi::SpiClient<'_>, source_root: &str) {
+    let _ = client.update(
+        "DELETE FROM public.__reflex_source_partition_snapshot WHERE source_root = $1",
+        None,
+        &[unsafe { DatumWithOid::new(source_root.to_string(), pgrx::pg_sys::TEXTOID) }],
+    );
+    let leaves = current_source_leaf_oids(client, source_root);
+    for (name, oid) in leaves {
+        let _ = client.update(
+            "INSERT INTO public.__reflex_source_partition_snapshot \
+                 (source_root, child_name, child_oid, bound) \
+             VALUES ($1, $2, $3, NULL) \
+             ON CONFLICT (source_root, child_name) \
+                 DO UPDATE SET child_oid = EXCLUDED.child_oid",
+            None,
+            &[
+                unsafe { DatumWithOid::new(source_root.to_string(), pgrx::pg_sys::TEXTOID) },
+                unsafe { DatumWithOid::new(name, pgrx::pg_sys::TEXTOID) },
+                unsafe { DatumWithOid::new(oid as i64, pgrx::pg_sys::INT8OID) },
+            ],
+        );
+    }
+}
+
 // Phase 1 (plans/1_6_1_refacto.md) — `substitute_identifier` is a re-export
 // of the canonical implementation in
 // [`crate::sql_writer::identifier::substitute_identifier_ci`]. Existing call

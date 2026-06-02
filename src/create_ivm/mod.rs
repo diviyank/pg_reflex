@@ -836,6 +836,7 @@ fn materialize_passthrough(client: &mut pgrx::spi::SpiClient<'_>, ctx: &mut Buil
                 );
                 client.update(&tgt_ddl, None, &[]).unwrap_or_report();
             }
+            crate::partition::refresh_source_snapshot(client, &anchor);
         }
         client
             .update(
@@ -998,6 +999,7 @@ fn materialize_aggregate(client: &mut pgrx::spi::SpiClient<'_>, ctx: &mut BuildC
                     client.update(&int_ddl, None, &[]).unwrap_or_report();
                     client.update(&tgt_ddl, None, &[]).unwrap_or_report();
                 }
+                crate::partition::refresh_source_snapshot(client, &anchor);
             }
             Err(e) => {
                 warning!(

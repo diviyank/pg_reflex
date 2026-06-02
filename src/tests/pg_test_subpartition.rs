@@ -183,3 +183,21 @@ fn pg_subpart_catalog_tables_exist() {
     let pend = Spi::get_one::<bool>("SELECT to_regclass('public.__reflex_partition_pending') IS NOT NULL").expect("q").expect("b");
     assert!(snap && pend, "snapshot={snap} pending={pend}");
 }
+
+#[pg_test]
+fn pg_subpart_snapshot_seeded_at_create() {
+    Spi::run("CREATE TABLE ss7 (dem_plan_id BIGINT NOT NULL, order_date DATE NOT NULL, product_id BIGINT, qty INT) PARTITION BY LIST (dem_plan_id)").expect("root");
+    Spi::run("CREATE TABLE ss7_172 PARTITION OF ss7 FOR VALUES IN (172) PARTITION BY RANGE (order_date)").expect("list");
+    Spi::run("CREATE TABLE ss7_172_2025_01 PARTITION OF ss7_172 FOR VALUES FROM ('2025-01-01') TO ('2025-02-01')").expect("leaf");
+    Spi::get_one::<String>(
+        "SELECT create_reflex_ivm('fcst7','SELECT dem_plan_id, order_date, product_id, qty FROM ss7', \
+         'dem_plan_id,product_id,order_date', NULL, NULL, NULL, ARRAY['dem_plan_id'])",
+    ).expect("c").expect("c");
+
+    // Snapshot holds the source's single leaf.
+    let cnt = Spi::get_one::<i64>(
+        "SELECT count(*) FROM public.__reflex_source_partition_snapshot \
+         WHERE child_name = 'ss7_172_2025_01'",
+    ).expect("q").expect("c");
+    assert_eq!(cnt, 1);
+}

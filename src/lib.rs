@@ -166,7 +166,7 @@ extension_sql!(
     CREATE TABLE IF NOT EXISTS public.__reflex_source_partition_snapshot (
         source_root TEXT NOT NULL,
         child_name  TEXT NOT NULL,
-        child_oid   OID  NOT NULL,
+        child_oid   BIGINT NOT NULL,
         bound       TEXT,
         PRIMARY KEY (source_root, child_name)
     );
