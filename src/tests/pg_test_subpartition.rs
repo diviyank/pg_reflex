@@ -228,3 +228,30 @@ fn pg_subpart_flush_applies_attach() {
     let jan = Spi::get_one::<i32>("SELECT qty FROM fcst8 WHERE order_date='2025-01-15'").expect("q").expect("jan");
     assert_eq!(jan, 10);
 }
+
+#[pg_test]
+fn pg_subpart_event_trigger_enqueues_source_not_reflex_owned() {
+    Spi::run("CREATE TABLE ss9 (dem_plan_id BIGINT NOT NULL, order_date DATE NOT NULL, product_id BIGINT, qty INT) PARTITION BY LIST (dem_plan_id)").expect("root");
+    Spi::run("CREATE TABLE ss9_172 PARTITION OF ss9 FOR VALUES IN (172) PARTITION BY RANGE (order_date)").expect("list");
+    Spi::run("CREATE TABLE ss9_172_2025_01 PARTITION OF ss9_172 FOR VALUES FROM ('2025-01-01') TO ('2025-02-01')").expect("l1");
+    Spi::get_one::<String>(
+        "SELECT create_reflex_ivm('fcst9','SELECT dem_plan_id, order_date, product_id, qty FROM ss9', \
+         'dem_plan_id,product_id,order_date', NULL, NULL, NULL, ARRAY['dem_plan_id'])",
+    ).expect("c").expect("c");
+
+    // Clear any enqueue from create-time DDL.
+    Spi::run("TRUNCATE public.__reflex_partition_pending").expect("clear");
+
+    // Attach a new sub-leaf on the source -> event trigger must enqueue the ROOT 'public.ss9'.
+    Spi::run("CREATE TABLE ss9_172_2025_02 PARTITION OF ss9_172 FOR VALUES FROM ('2025-02-01') TO ('2025-03-01')").expect("attach");
+    let enq = Spi::get_one::<i64>(
+        "SELECT count(*) FROM public.__reflex_partition_pending WHERE source_root = 'public.ss9'",
+    ).expect("q").expect("c");
+    assert_eq!(enq, 1, "source root should be enqueued");
+
+    // pg_reflex's own IMV partition (fcst9_*) must NOT be enqueued.
+    let bad = Spi::get_one::<i64>(
+        "SELECT count(*) FROM public.__reflex_partition_pending WHERE source_root LIKE '%fcst9%'",
+    ).expect("q").expect("c");
+    assert_eq!(bad, 0, "reflex-owned tables must never be enqueued");
+}

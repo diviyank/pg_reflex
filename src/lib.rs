@@ -783,6 +783,7 @@ extension_sql!(
         _imv RECORD;
         _src TEXT;
         _parent TEXT;
+        _part_root TEXT;
         _policy TEXT;
         _affected TEXT[] := ARRAY[]::TEXT[];
         _synced_keys TEXT[] := ARRAY[]::TEXT[];
@@ -847,6 +848,40 @@ extension_sql!(
             END IF;
 
             IF _parent IS NOT NULL THEN
+                -- Capture for flush: resolve the partition ROOT (a multi-level
+                -- attach reports an intermediate level as _parent, but IMVs depend
+                -- on the top-level source) and enqueue it, unless it is
+                -- pg_reflex-owned (our own atomic swap ATTACH/DETACHes IMV
+                -- partitions; reacting to those would race the code-driven cascade).
+                BEGIN
+                    SELECT n.nspname || '.' || c.relname
+                      INTO _part_root
+                      FROM pg_class c
+                      JOIN pg_namespace n ON n.oid = c.relnamespace
+                     WHERE c.oid = pg_partition_root(_parent::regclass);
+                EXCEPTION WHEN OTHERS THEN
+                    _part_root := NULL;
+                END;
+
+                IF _part_root IS NOT NULL
+                   AND _part_root NOT LIKE '%\_\_reflex\_%'
+                   AND NOT EXISTS (
+                       SELECT 1 FROM public.__reflex_ivm_reference r
+                       WHERE r.name = _part_root OR r.name = split_part(_part_root, '.', 2)
+                   )
+                   AND EXISTS (
+                       SELECT 1 FROM public.__reflex_ivm_reference r
+                       WHERE r.partition_columns IS NOT NULL
+                         AND array_length(r.partition_columns, 1) > 0
+                         AND (r.depends_on @> ARRAY[_part_root]
+                              OR r.depends_on @> ARRAY[split_part(_part_root, '.', 2)])
+                   )
+                THEN
+                    INSERT INTO public.__reflex_partition_pending (source_root)
+                    VALUES (_part_root)
+                    ON CONFLICT (source_root) DO NOTHING;
+                END IF;
+
                 FOR _imv IN
                     SELECT name FROM public.__reflex_ivm_reference
                     WHERE partition_columns IS NOT NULL
