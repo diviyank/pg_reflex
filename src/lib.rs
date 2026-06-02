@@ -905,7 +905,7 @@ mod tests {
 
     #[pg_extern]
     fn crate_test_list_partition_tree(root: &str) -> i64 {
-        Spi::connect(|client| crate::partition::list_partition_tree(&client, root).len() as i64)
+        Spi::connect(|client| crate::partition::list_partition_tree(client, root).len() as i64)
     }
 
     include!("tests/pg_test_basic.rs");

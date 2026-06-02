@@ -339,7 +339,14 @@ pub(crate) fn build_partition_node_ddl_pair(
     let (schema_opt, bare_view) = split_qualified_name(view_name);
     let schema = schema_opt.unwrap_or("public");
 
-    let int_parent = if node.parent_bare == anchor_root_bare {
+    // Root detection must be quote-insensitive: `parent_bare` comes from
+    // `pg_class.relname` (always unquoted) while `anchor_root_bare` may carry
+    // surrounding quotes when the anchor is a quoted/decomposed source (e.g. a
+    // CTE sub-IMV passed as `"view__cte_x"`). Comparing the raw strings would
+    // treat a top-level child as nested and resolve a non-existent parent.
+    let is_top_level = node.parent_bare.trim_matches('"') == anchor_root_bare.trim_matches('"');
+
+    let int_parent = if is_top_level {
         intermediate_table_name(view_name)
     } else {
         schema_prefix(
@@ -347,7 +354,7 @@ pub(crate) fn build_partition_node_ddl_pair(
             &intermediate_child_name(view_name, &node.parent_bare),
         )
     };
-    let tgt_parent = if node.parent_bare == anchor_root_bare {
+    let tgt_parent = if is_top_level {
         format!("\"{}\".\"{}", schema, bare_view) + "\""
     } else {
         schema_prefix(view_name, &target_child_name(view_name, &node.parent_bare))
