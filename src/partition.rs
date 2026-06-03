@@ -28,6 +28,7 @@ use crate::query_decomposer::{
     canonical_source, intermediate_table_name, quote_identifier, safe_identifier,
     split_qualified_name,
 };
+use crate::sql_writer::identifier::format_pg_text_array;
 
 /// A description of how a source table is partitioned.
 ///
@@ -339,6 +340,48 @@ pub(crate) fn source_level_columns(
         }
     }
     levels
+}
+
+/// Root-first list of a node's ancestor bare-names within `tree` (excluding
+/// the node itself). Walks `parent_bare` until the parent is no longer a node
+/// in the tree (i.e. it is the anchor root). Used so a swapped-out leaf can
+/// still be mapped to its mirror-depth ancestor from the snapshot.
+pub(crate) fn leaf_ancestor_chain(tree: &[PartitionNode], leaf_bare: &str) -> Vec<String> {
+    use std::collections::HashMap;
+    let by_name: HashMap<&str, &PartitionNode> =
+        tree.iter().map(|n| (n.bare_name.as_str(), n)).collect();
+    let mut chain: Vec<String> = Vec::new();
+    let mut cursor = leaf_bare;
+    while let Some(node) = by_name.get(cursor) {
+        let parent = node.parent_bare.as_str();
+        if by_name.contains_key(parent) {
+            chain.push(parent.to_string());
+            cursor = parent;
+        } else {
+            break;
+        }
+    }
+    chain.reverse(); // root-first
+    chain
+}
+
+/// Given a leaf's root-first `ancestor_chain` and the leaf's own bare-name,
+/// return the bare-name of the node at absolute depth `mirror_depth`. The
+/// chain holds depths 1..=(leaf_depth-1); the leaf is at depth
+/// `chain.len()+1`. A `mirror_depth` >= the leaf's own depth returns the leaf.
+pub(crate) fn ancestor_bare_at_depth(
+    ancestor_chain: &[String],
+    leaf_bare: &str,
+    mirror_depth: usize,
+) -> Option<String> {
+    if mirror_depth == 0 {
+        return None;
+    }
+    if mirror_depth <= ancestor_chain.len() {
+        ancestor_chain.get(mirror_depth - 1).cloned()
+    } else {
+        Some(leaf_bare.to_string())
+    }
 }
 
 /// Build the `PARTITION BY <strategy> (<cols>)` suffix used in the
@@ -1713,19 +1756,23 @@ pub(crate) fn refresh_source_snapshot(client: &mut pgrx::spi::SpiClient<'_>, sou
         None,
         &[unsafe { DatumWithOid::new(key.clone(), pgrx::pg_sys::TEXTOID) }],
     );
-    let leaves = current_source_leaf_oids(client, source_root);
-    for (name, oid) in leaves {
+    let tree = list_partition_tree(client, source_root);
+    let leaves: Vec<&PartitionNode> = tree.iter().filter(|n| n.sub_strategy.is_none()).collect();
+    for leaf in leaves {
+        let ancestors = leaf_ancestor_chain(&tree, &leaf.bare_name);
+        let ancestors_arr = format_pg_text_array(&ancestors);
         let _ = client.update(
             "INSERT INTO public.__reflex_source_partition_snapshot \
-                 (source_root, child_name, child_oid, bound) \
-             VALUES ($1, $2, $3, NULL) \
+                 (source_root, child_name, child_oid, bound, ancestors) \
+             VALUES ($1, $2, $3, NULL, $4::TEXT[]) \
              ON CONFLICT (source_root, child_name) \
-                 DO UPDATE SET child_oid = EXCLUDED.child_oid",
+                 DO UPDATE SET child_oid = EXCLUDED.child_oid, ancestors = EXCLUDED.ancestors",
             None,
             &[
                 unsafe { DatumWithOid::new(key.clone(), pgrx::pg_sys::TEXTOID) },
-                unsafe { DatumWithOid::new(name, pgrx::pg_sys::TEXTOID) },
-                unsafe { DatumWithOid::new(oid as i64, pgrx::pg_sys::INT8OID) },
+                unsafe { DatumWithOid::new(leaf.bare_name.clone(), pgrx::pg_sys::TEXTOID) },
+                unsafe { DatumWithOid::new(leaf.oid as i64, pgrx::pg_sys::INT8OID) },
+                unsafe { DatumWithOid::new(ancestors_arr, pgrx::pg_sys::TEXTOID) },
             ],
         );
     }

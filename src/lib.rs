@@ -177,8 +177,12 @@ extension_sql!(
         child_name  TEXT NOT NULL,
         child_oid   BIGINT NOT NULL,
         bound       TEXT,
+        ancestors   TEXT[],
         PRIMARY KEY (source_root, child_name)
     );
+
+    ALTER TABLE public.__reflex_source_partition_snapshot
+        ADD COLUMN IF NOT EXISTS ancestors TEXT[];
 
     -- Roots enqueued by the DDL event trigger when a source partition is
     -- attached/detached; drained by reflex_flush_partitions.

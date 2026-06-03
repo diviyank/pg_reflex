@@ -423,3 +423,43 @@ fn test_truncate_depth_beyond_tree_is_noop() {
     assert_eq!(out.len(), 1);
     assert_eq!(out[0].sub_strategy, None);
 }
+
+#[test]
+fn test_leaf_ancestor_chain_root_first() {
+    // ss_172 (depth1, internal) -> ss_172_2025_01 (depth2, leaf)
+    let tree = vec![
+        node("ss_172", "ss", 1, Some("RANGE")),
+        node("ss_172_2025_01", "ss_172", 2, None),
+    ];
+    // Ancestor chain of the leaf, root-first, EXCLUDING the leaf itself.
+    let chain = leaf_ancestor_chain(&tree, "ss_172_2025_01");
+    assert_eq!(chain, vec!["ss_172".to_string()]);
+}
+
+#[test]
+fn test_leaf_ancestor_chain_of_top_level_leaf_is_empty() {
+    let tree = vec![node("ss_a", "ss", 1, None)];
+    assert!(leaf_ancestor_chain(&tree, "ss_a").is_empty());
+}
+
+#[test]
+fn test_ancestor_at_depth_picks_correct_level() {
+    // chain root-first for a depth-3 leaf: [lvl1, lvl2]; leaf itself is lvl3.
+    let chain = vec!["p_172".to_string(), "p_172_2025".to_string()];
+    assert_eq!(
+        ancestor_bare_at_depth(&chain, "p_172_2025_03", 1).as_deref(),
+        Some("p_172")
+    );
+    assert_eq!(
+        ancestor_bare_at_depth(&chain, "p_172_2025_03", 2).as_deref(),
+        Some("p_172_2025")
+    );
+    assert_eq!(
+        ancestor_bare_at_depth(&chain, "p_172_2025_03", 3).as_deref(),
+        Some("p_172_2025_03")
+    );
+    assert_eq!(
+        ancestor_bare_at_depth(&chain, "p_172_2025_03", 9).as_deref(),
+        Some("p_172_2025_03")
+    );
+}
