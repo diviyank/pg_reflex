@@ -799,3 +799,32 @@ fn pg_subpart_null_depth_mirrors_full_source() {
     assert!(is_partitioned_rel("fcst_full_ssf_172"),
         "NULL partition_depth must mirror full source depth (no truncation)");
 }
+
+#[pg_test]
+fn pg_subpart_shallow_reconcile_refills_dem_plan_node() {
+    Spi::run(
+        "CREATE TABLE ssr (dem_plan_id BIGINT NOT NULL, order_date DATE NOT NULL, qty INT) \
+         PARTITION BY LIST (dem_plan_id)",
+    ).expect("root");
+    Spi::run("CREATE TABLE ssr_172 PARTITION OF ssr FOR VALUES IN (172) PARTITION BY RANGE (order_date)").expect("c");
+    Spi::run("CREATE TABLE ssr_172_2025_01 PARTITION OF ssr_172 FOR VALUES FROM ('2025-01-01') TO ('2025-02-01')").expect("l1");
+    Spi::run("CREATE TABLE ssr_172_2025_02 PARTITION OF ssr_172 FOR VALUES FROM ('2025-02-01') TO ('2025-03-01')").expect("l2");
+    Spi::run("INSERT INTO ssr VALUES (172, '2025-01-15', 10), (172, '2025-02-15', 20)").expect("seed");
+    let c = Spi::get_one::<&str>(
+        "SELECT create_reflex_ivm('fcst_rec', \
+            'SELECT dem_plan_id, COALESCE(order_date, order_date) AS order_date, qty FROM ssr', \
+            'dem_plan_id,order_date', NULL, NULL, NULL, ARRAY['dem_plan_id'])",
+    ).expect("c").expect("r");
+    assert!(!c.starts_with("ERROR"), "create failed: {c}");
+
+    // Mutate one month directly, then reconcile via the source SUB-leaf name.
+    Spi::run("INSERT INTO ssr VALUES (172, '2025-02-20', 5)").expect("mutate");
+    let res = Spi::get_one::<String>(
+        "SELECT reflex_reconcile_partition('fcst_rec', '', 'ssr_172_2025_02')",
+    ).expect("reconcile").expect("res");
+    assert!(!res.starts_with("ERROR"), "reconcile failed: {}", res);
+
+    // The whole dem_plan_id=172 IMV node is refilled (all 3 rows).
+    let n = Spi::get_one::<i64>("SELECT count(*)::int8 FROM fcst_rec WHERE dem_plan_id = 172").unwrap().unwrap();
+    assert_eq!(n, 3);
+}

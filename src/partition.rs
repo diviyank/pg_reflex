@@ -1158,7 +1158,7 @@ pub(crate) fn reflex_reconcile_partition_impl(
     let outcome: Result<String, String> = Spi::connect_mut(|client| {
         let row = client
             .select(
-                "SELECT base_query, end_query, partition_columns, partition_strategy, depends_on, graph_child, storage_mode \
+                "SELECT base_query, end_query, partition_columns, partition_strategy, depends_on, graph_child, storage_mode, partition_depth \
                  FROM public.__reflex_ivm_reference WHERE name = $1 AND enabled = TRUE",
                 Some(1),
                 &[unsafe {
@@ -1199,6 +1199,12 @@ pub(crate) fn reflex_reconcile_partition_impl(
             .unwrap_or(None)
             .unwrap_or("UNLOGGED")
             .to_string();
+        let partition_depth: Option<i32> =
+            row.get_by_name::<i32, _>("partition_depth").unwrap_or(None);
+        let depends_on: Vec<String> = row
+            .get_by_name::<Vec<String>, _>("depends_on")
+            .unwrap_or(None)
+            .unwrap_or_default();
         if part_cols.is_empty() || strategy.is_empty() {
             return Err(format!(
                 "IMV '{}' is not partitioned — use reflex_reconcile",
@@ -1217,10 +1223,24 @@ pub(crate) fn reflex_reconcile_partition_impl(
         let mut to_process: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         if !source_partition.trim().is_empty() {
-            // Level-agnostic path: expand the named source partition to source leaves,
-            // map each to its IMV target child name.
+            // Level-agnostic + depth-aware path: expand the named source
+            // partition to source leaves, map each UP to the IMV's mirror-depth
+            // node, then to its IMV target child name. When the IMV mirrors the
+            // full source depth this is the identity (leaf -> leaf).
+            let anchor = resolve_anchor_source(client, part_col, &depends_on).unwrap_or_default();
+            let full_tree = if anchor.is_empty() {
+                Vec::new()
+            } else {
+                list_partition_tree(client, &anchor)
+            };
+            let mirror_depth = partition_depth
+                .map(|d| d as usize)
+                .unwrap_or_else(|| max_tree_depth(&full_tree));
             for src_leaf in expand_source_partition_to_leaves(client, source_partition) {
-                to_process.insert(target_child_name(view_name, &src_leaf));
+                let chain = leaf_ancestor_chain(&full_tree, &src_leaf);
+                let node = ancestor_bare_at_depth(&chain, &src_leaf, mirror_depth)
+                    .unwrap_or_else(|| src_leaf.clone());
+                to_process.insert(target_child_name(view_name, &node));
             }
         } else {
             let keys: Vec<String> = partition_keys_csv
