@@ -108,41 +108,34 @@ Tree-depth is computed from the `pg_inherits` recursion already present in
 
 ## Section 2 — Catalog / metadata
 
-The IMV's depth must be persisted, because today `partition_columns` holds only the
-**root** column (`[dem_plan_id]`, length 1) even for a full multi-level auto-mirror — so
-its length cannot be trusted as the depth.
+The IMV's depth cannot be derived from `partition_columns`: that array is fed **directly
+into the root table's `PARTITION BY` clause** (`build_partition_by_clause(strategy,
+partition_columns)` at `src/create_ivm/mod.rs:806`, `src/schema_builder.rs:147`, `:302`).
+It must stay the **root-level** column(s) only — putting `[dem_plan_id, order_date]` there
+would generate a composite `PARTITION BY LIST (dem_plan_id, order_date)` root, which is
+wrong. So depth needs its own home.
 
-**Decision:** repurpose `partition_columns` in `public.__reflex_ivm_reference` to carry
-the full **ordered level-column list** (`[dem_plan_id]` or `[dem_plan_id, order_date]`),
-and derive `mirror_depth = partition_columns.len()`. `resolve_partitioning` populates it
-with the resolved level list (declared columns, or the auto-pruned satisfiable prefix);
-for an auto full mirror this now lists *all* source level columns, not just the root.
+**Decision:** add a dedicated nullable column `partition_depth INT` to
+`public.__reflex_ivm_reference`.
 
-`reflex_sync_partitions_impl` (`src/partition.rs:823`) reads `partition_columns`, derives
-`mirror_depth = partition_columns.len()`, and passes it into `truncate_partition_tree`.
+- **New IMVs:** `resolve_partitioning` computes the resolved `mirror_depth` (declared
+  `partition_by` length, or the auto-pruned satisfiable prefix length) and persist writes
+  it.
+- **Legacy / full-mirror IMVs:** `partition_depth IS NULL` means **mirror the full source
+  depth** — the pre-existing behavior. So existing partitioned IMVs keep working with **no
+  recreate and no backfill**; NULL is correct for every row created before this change
+  (all of which are full-depth, since shallower-than-source did not exist before).
+- `partition_columns` is unchanged: still the root-level partition column(s).
 
-**No migration / backfill for existing IMVs.** Pre-1.8.1-era rows store a length-1
-`partition_columns` (root column only) whose length would now be misread as `mirror_depth
-= 1`, truncating a previously full-depth IMV on its next sync. We do **not** handle this
-in code. Instead, this is a **breaking representation change**: IMVs created before this
-version must be **dropped and recreated** to pick up the new `partition_columns` semantics.
-The package emits a startup / sync notice (see Upgrade notice below) so the requirement is
-visible; no self-healing is attempted.
+`reflex_sync_partitions_impl` (`src/partition.rs:823`) reads `partition_depth`, resolves
+`mirror_depth = partition_depth.unwrap_or(full_source_depth)` (full source depth = the
+max absolute tree-depth of `list_partition_tree(anchor)`), and passes it into
+`truncate_partition_tree`. A NULL depth therefore truncates to the full depth — a no-op —
+preserving existing IMVs exactly.
 
-### Upgrade notice
-
-`CHANGELOG.md` and `docs/concepts/internals.md` state plainly:
-
-> **Breaking (partitioned IMVs):** `partition_columns` now records the full ordered
-> partition **level list**, not just the root column. IMVs created on an earlier version
-> must be **recreated** (drop + `create_reflex_ivm`); otherwise a sync would truncate them
-> to a single level. Unpartitioned IMVs are unaffected.
-
-`reflex_sync_partitions` additionally raises a one-line `warning!` when it encounters a
-partitioned IMV whose stored `partition_columns` length is **shorter** than its
-materialized target-tree depth — the signature of an un-recreated legacy row — pointing the
-user at the recreate requirement rather than silently truncating without a word. (It still
-proceeds per the new semantics; the warning is advisory, not a backfill.)
+**Non-breaking.** No migration required. The change is additive (one nullable column). The
+CHANGELOG notes the new `partition_depth` column and the new shallow-IMV capability; it is
+**not** a breaking-change notice.
 
 ## Section 3 — Reconcile / capture resolution
 
@@ -156,6 +149,29 @@ depth-`mirror_depth` ancestor, then mapping that ancestor's bare name to the IMV
 via the existing `target_child_name` / `intermediate_child_name` scheme. Multiple deeper
 source nodes under the same depth-`mirror_depth` ancestor **dedupe to a single** IMV-leaf
 refill.
+
+**Why the diff must stay leaf-granular and map up (not diff at `mirror_depth`).** Detaching
+or attaching a sub-partition does **not** change the parent node's oid — so an oid-diff at
+the `mirror_depth` node level is *blind* to sub-level swaps. The snapshot must therefore
+keep tracking the **deepest leaves** (as today), detect the changed/new/gone leaf, and map
+that leaf up to its `mirror_depth` ancestor for the swap-fill.
+
+**Snapshot carries the ancestor chain.** A *gone* leaf (present in the snapshot, absent from
+the live tree) has no live parent to climb, yet we still need its `mirror_depth` ancestor to
+decide swap-fill-survivor vs drop. So `__reflex_source_partition_snapshot` gains an
+`ancestors TEXT[]` column: the root-first list of the leaf's ancestor bare-names, captured
+at snapshot-refresh time from the live tree. Resolution then:
+- **changed / new leaf** (in live tree) → climb the live tree to the depth-`mirror_depth`
+  ancestor → swap-fill that IMV node.
+- **gone leaf** (snapshot only) → read `ancestors[mirror_depth-1]` from the snapshot row; if
+  that ancestor still exists in the live tree → swap-fill it (a sibling month was removed,
+  parent survives); if it is also gone → the whole `mirror_depth` node was removed, and
+  `reflex_sync_partitions(drop_orphans=true)` (called at reconcile entry, `:1032`) drops the
+  orphan IMV node.
+
+When `partition_depth IS NULL` (full mirror) `mirror_depth == leaf depth`, every climb is a
+no-op, and this collapses to **exactly today's leaf-to-leaf behavior** — zero behavior change
+for existing IMVs.
 
 The swap-fill itself is **unchanged**: `pg_get_partition_constraintdef` on the IMV leaf
 `<view>_p_172` returns `dem_plan_id = 172`, and the existing
@@ -227,8 +243,8 @@ same `mirror_depth` (the intermediate and target stay shape-identical). The
 - Attach-new-month under existing `dem_plan_id` → **no** new IMV leaf (collapses into the
   existing one), data correct.
 - `reflex_sync_partitions` does **not** re-deepen the IMV (target tree stays depth 1).
-- `reflex_sync_partitions` warns (does not error) when `partition_columns` is shorter than
-  the materialized target-tree depth (legacy un-recreated row signature).
+- Legacy / full-mirror IMV (`partition_depth IS NULL`): sync still mirrors the full source
+  depth (no truncation) — proving NULL = full depth is a no-op.
 - Audit drift-check clean on the deliberately-shallow IMV.
 - Explicit `partition_by:[dem_plan_id, order_date]` on a shape where `order_date` *is*
   bare-projected → two-level IMV (opt-in finer granularity still works).
@@ -273,8 +289,11 @@ regardless.
   (derive `mirror_depth` from `partition_columns` + legacy-row warning); reconcile
   up-mapping resolution; snapshot/flush up-mapping.
 - `src/create_ivm/mod.rs` — depth resolution in `resolve_partitioning` (explicit-honored +
-  auto-prune); bounded validation; write resolved level list to `partition_columns`;
-  truncate at create-time mirroring (`:829`, `:985`).
+  auto-prune); bounded validation; compute + carry `mirror_depth`; truncate at create-time
+  mirroring (`:829`, `:985`).
+- `src/lib.rs` — add `partition_depth INT` to the `__reflex_ivm_reference` DDL; add
+  `ancestors TEXT[]` to `__reflex_source_partition_snapshot`.
+- `src/sql_writer/registry.rs` — `RegistryRow.partition_depth: Option<i32>` + INSERT column.
 - `src/audit/checks_b_drift.rs` — compare source leaf set aggregated to `mirror_depth`.
 - `src/tests/pg_test_subpartition.rs`, `src/tests/pg_test_fuzz.rs`,
   `src/tests/unit_partition.rs` (or equivalent unit module).
@@ -288,9 +307,9 @@ Each phase independently committable + testable:
   (Sections 1, 4, 5; create-time half of Section 2). The motivating IMV creates as a
   single-level `LIST(dem_plan_id)` table. Tests: unit truncation/resolution, create-shape
   integration.
-- **Phase 2 — Depth-aware sync** (Section 2 sync half). Sync derives `mirror_depth` from
-  `partition_columns` and respects it; warns on the legacy-row signature. Tests:
-  no-re-deepen, legacy-row warning.
+- **Phase 2 — Depth-aware sync + `partition_depth` column** (Section 2). Add the column;
+  sync derives `mirror_depth = partition_depth.unwrap_or(full_source_depth)` and respects
+  it. Tests: no-re-deepen at depth 1, NULL = full-depth no-op.
 - **Phase 3 — Reconcile / snapshot / flush up-mapping** (Section 3). Source-side swaps at
   any depth refill the correct IMV node. Tests: leaf swap, attach-new-month collapse,
   end-to-end flush.
