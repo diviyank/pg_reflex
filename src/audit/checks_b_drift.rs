@@ -1,8 +1,10 @@
 #![allow(unused_imports)]
 
+use pgrx::datum::DatumWithOid;
 use pgrx::pg_sys::panic::ErrorReportable;
 use pgrx::prelude::*;
 use pgrx::spi::SpiClient;
+use pgrx::PgBuiltInOids;
 use std::collections::HashSet;
 
 use super::{
@@ -260,8 +262,28 @@ impl Check for PartitionTreeDrift {
             Err(_) => return vec![],
         };
 
-        // Get the full recursive partition trees (including all levels: leaves have sub_strategy == None)
-        let src_tree = crate::partition::list_partition_tree(client, &anchor);
+        // Respect the IMV's mirror depth: a deliberately-shallow IMV mirrors
+        // fewer levels than the source, so compare the source tree TRUNCATED to
+        // that depth (NULL partition_depth = full source depth = no truncation).
+        let partition_depth: Option<i32> = client
+            .select(
+                "SELECT partition_depth FROM public.__reflex_ivm_reference WHERE name = $1",
+                Some(1),
+                &[unsafe {
+                    DatumWithOid::new(imv.name.clone(), PgBuiltInOids::TEXTOID.oid().value())
+                }],
+            )
+            .ok()
+            .and_then(|mut it| it.next())
+            .and_then(|r| r.get_by_name::<i32, _>("partition_depth").ok().flatten());
+        let full_src_tree = crate::partition::list_partition_tree(client, &anchor);
+        let mirror_depth = partition_depth
+            .map(|d| d as usize)
+            .unwrap_or_else(|| crate::partition::max_tree_depth(&full_src_tree));
+        let src_tree = crate::partition::truncate_partition_tree(full_src_tree, mirror_depth);
+
+        // Get the IMV's recursive partition tree
+        // (including all levels: leaves have sub_strategy == None)
         let imv_tree = crate::partition::list_partition_tree(
             client,
             &crate::query_decomposer::quote_identifier(&imv.name),

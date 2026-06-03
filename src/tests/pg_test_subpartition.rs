@@ -859,3 +859,42 @@ fn pg_subpart_shallow_flush_attach_month_collapses_into_node() {
     let n = Spi::get_one::<i64>("SELECT count(*)::int8 FROM fcst_flush").unwrap().unwrap();
     assert_eq!(n, 2);
 }
+
+#[pg_test]
+fn pg_subpart_shallow_imv_audit_no_drift() {
+    Spi::run(
+        "CREATE TABLE ssaud (dem_plan_id BIGINT NOT NULL, order_date DATE NOT NULL, qty INT) \
+         PARTITION BY LIST (dem_plan_id)",
+    )
+    .expect("root");
+    Spi::run("CREATE TABLE ssaud_172 PARTITION OF ssaud FOR VALUES IN (172) PARTITION BY RANGE (order_date)")
+        .expect("c");
+    Spi::run(
+        "CREATE TABLE ssaud_172_2025_01 PARTITION OF ssaud_172 \
+         FOR VALUES FROM ('2025-01-01') TO ('2025-02-01')",
+    )
+    .expect("l");
+    Spi::run("INSERT INTO ssaud VALUES (172, '2025-01-15', 10)").expect("seed");
+
+    // Create a shallow IMV that mirrors only the dem_plan_id level (not the order_date sub-level).
+    let c = Spi::get_one::<&str>(
+        "SELECT create_reflex_ivm('fcst_audit', \
+            'SELECT dem_plan_id, COALESCE(order_date, order_date) AS order_date, qty FROM ssaud', \
+            'dem_plan_id,order_date', NULL, NULL, NULL, ARRAY['dem_plan_id'])",
+    )
+    .expect("c")
+    .expect("r");
+    assert!(!c.starts_with("ERROR"), "create failed: {c}");
+
+    // The drift audit must NOT flag the shallow IMV for "missing" the source's
+    // order_date sub-level. reflex_audit(name) returns a text report.
+    let report = Spi::get_one::<String>(
+        "SELECT reflex_audit('fcst_audit')",
+    )
+    .expect("audit")
+    .expect("report");
+    assert!(
+        !report.contains("Partition drift"),
+        "shallow IMV must not be flagged as drifted; report:\n{report}"
+    );
+}
