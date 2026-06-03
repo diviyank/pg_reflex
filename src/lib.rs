@@ -119,7 +119,13 @@ extension_sql!(
         -- GROUP BY → at most one row). Read by JOIN unique-key inference so a
         -- CROSS JOIN to such a relation (e.g. a single-row history_bounds CTE)
         -- is classified to-one. NULL/FALSE for everything else.
-        max_one_row BOOLEAN DEFAULT FALSE
+        max_one_row BOOLEAN DEFAULT FALSE,
+        -- 1.8.2 — IMV partition mirror depth: how many source partition
+        -- levels this IMV mirrors. NULL = mirror the FULL source depth
+        -- (legacy/default behavior). Set by resolve_partitioning when the
+        -- IMV is shallower than its source (explicit partition_by or
+        -- auto-prune). See plans/2026-06-03-imv-partition-depth.md.
+        partition_depth INT
     );
 
     -- Index on name for fast lookups
@@ -159,6 +165,9 @@ extension_sql!(
     ALTER TABLE public.__reflex_ivm_reference
         ADD COLUMN IF NOT EXISTS max_one_row BOOLEAN DEFAULT FALSE;
 
+    ALTER TABLE public.__reflex_ivm_reference
+        ADD COLUMN IF NOT EXISTS partition_depth INT;
+
     -- Multi-level partition capture (plans/sub_partitioning.md). Snapshot of
     -- each tracked source root's recursive LEAF set, keyed by (root, child).
     -- reflex_flush_partitions oid-diffs the live leaf set against this to
@@ -168,8 +177,12 @@ extension_sql!(
         child_name  TEXT NOT NULL,
         child_oid   BIGINT NOT NULL,
         bound       TEXT,
+        ancestors   TEXT[],
         PRIMARY KEY (source_root, child_name)
     );
+
+    ALTER TABLE public.__reflex_source_partition_snapshot
+        ADD COLUMN IF NOT EXISTS ancestors TEXT[];
 
     -- Roots enqueued by the DDL event trigger when a source partition is
     -- attached/detached; drained by reflex_flush_partitions.

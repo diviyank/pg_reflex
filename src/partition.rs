@@ -28,6 +28,7 @@ use crate::query_decomposer::{
     canonical_source, intermediate_table_name, quote_identifier, safe_identifier,
     split_qualified_name,
 };
+use crate::sql_writer::identifier::format_pg_text_array;
 
 /// A description of how a source table is partitioned.
 ///
@@ -75,6 +76,11 @@ pub(crate) struct PartitionNode {
     pub bound_expr: String,
     pub sub_strategy: Option<String>,
     pub sub_columns: Vec<String>,
+    /// Absolute tree-depth from the anchor root: the anchor's direct
+    /// children are depth 1, their children depth 2, etc. Populated by
+    /// `list_partition_tree` from the recursive CTE's `depth` column;
+    /// `truncate_partition_tree` keys the level cutoff off it.
+    pub depth: usize,
 }
 
 /// Read the partition descriptor of `source` (schema-qualified or bare).
@@ -200,6 +206,7 @@ pub(crate) fn list_partition_tree(
         SELECT \
             c.relname::text AS bare_name, \
             c.oid::int8 AS node_oid, \
+            t.depth AS node_depth, \
             pc.relname::text AS parent_bare, \
             pg_get_expr(c.relpartbound, c.oid) AS bound_expr, \
             CASE pt.partstrat WHEN 'l' THEN 'LIST' WHEN 'r' THEN 'RANGE' \
@@ -225,6 +232,7 @@ pub(crate) fn list_partition_tree(
             .filter_map(|row| {
                 let bare = row.get_by_name::<&str, _>("bare_name").ok()??.to_string();
                 let oid = row.get_by_name::<i64, _>("node_oid").ok()?? as u32;
+                let depth = row.get_by_name::<i32, _>("node_depth").ok()?? as usize;
                 let parent = row.get_by_name::<&str, _>("parent_bare").ok()??.to_string();
                 let bound = row
                     .get_by_name::<&str, _>("bound_expr")
@@ -252,6 +260,7 @@ pub(crate) fn list_partition_tree(
                     bound_expr: bound,
                     sub_strategy: sub_strategy.filter(|s| s == "LIST" || s == "RANGE"),
                     sub_columns,
+                    depth,
                 })
             })
             .collect(),
@@ -263,6 +272,115 @@ pub(crate) fn list_partition_tree(
             );
             Vec::new()
         }
+    }
+}
+
+/// Truncate a source partition tree to `mirror_depth` absolute levels.
+///
+/// Keeps every node at `depth <= mirror_depth`, drops everything deeper, and
+/// **demotes** the nodes sitting exactly at `mirror_depth` to leaves (clears
+/// `sub_strategy` / `sub_columns`) so `build_partition_node_ddl_pair` emits no
+/// `PARTITION BY` suffix for them — a `LIST(a) -> RANGE(b)` source truncated to
+/// depth 1 becomes plain `LIST(a)` leaves, each holding all of that key's rows.
+///
+/// `mirror_depth == 0` is treated as "no truncation" (defensive; callers pass
+/// the resolved full source depth for NULL `partition_depth`). A `mirror_depth`
+/// at or beyond the tree's max depth is a no-op.
+pub(crate) fn truncate_partition_tree(
+    nodes: Vec<PartitionNode>,
+    mirror_depth: usize,
+) -> Vec<PartitionNode> {
+    if mirror_depth == 0 {
+        return nodes;
+    }
+    nodes
+        .into_iter()
+        .filter(|n| n.depth <= mirror_depth)
+        .map(|mut n| {
+            if n.depth == mirror_depth {
+                n.sub_strategy = None;
+                n.sub_columns = Vec::new();
+            }
+            n
+        })
+        .collect()
+}
+
+/// Maximum absolute tree-depth across `nodes` (0 when empty / unpartitioned).
+/// Used to resolve a NULL `partition_depth` to "mirror the full source depth".
+pub(crate) fn max_tree_depth(nodes: &[PartitionNode]) -> usize {
+    nodes.iter().map(|n| n.depth).max().unwrap_or(0)
+}
+
+/// Ordered partition-key columns per source level, top-down: index 0 is the
+/// root's partition column, index 1 the first sub-level's, etc. Derived by
+/// following ONE path down the tree (a well-formed hierarchy partitions all
+/// siblings at a level by the same key). Level 0 comes from the descriptor;
+/// deeper levels from each internal node's `sub_columns`.
+pub(crate) fn source_level_columns(
+    desc: &PartitionDescriptor,
+    tree: &[PartitionNode],
+) -> Vec<String> {
+    let mut levels: Vec<String> = Vec::new();
+    if let Some(c) = desc.column_names.first() {
+        levels.push(c.to_lowercase());
+    }
+    // Walk down: at each depth, find an internal node and take its sub key.
+    let mut current_depth = 1usize;
+    loop {
+        let internal = tree
+            .iter()
+            .find(|n| n.depth == current_depth && !n.sub_columns.is_empty());
+        match internal {
+            Some(n) => {
+                levels.push(n.sub_columns[0].to_lowercase());
+                current_depth += 1;
+            }
+            None => break,
+        }
+    }
+    levels
+}
+
+/// Root-first list of a node's ancestor bare-names within `tree` (excluding
+/// the node itself). Walks `parent_bare` until the parent is no longer a node
+/// in the tree (i.e. it is the anchor root). Used so a swapped-out leaf can
+/// still be mapped to its mirror-depth ancestor from the snapshot.
+pub(crate) fn leaf_ancestor_chain(tree: &[PartitionNode], leaf_bare: &str) -> Vec<String> {
+    use std::collections::HashMap;
+    let by_name: HashMap<&str, &PartitionNode> =
+        tree.iter().map(|n| (n.bare_name.as_str(), n)).collect();
+    let mut chain: Vec<String> = Vec::new();
+    let mut cursor = leaf_bare;
+    while let Some(node) = by_name.get(cursor) {
+        let parent = node.parent_bare.as_str();
+        if by_name.contains_key(parent) {
+            chain.push(parent.to_string());
+            cursor = parent;
+        } else {
+            break;
+        }
+    }
+    chain.reverse(); // root-first
+    chain
+}
+
+/// Given a leaf's root-first `ancestor_chain` and the leaf's own bare-name,
+/// return the bare-name of the node at absolute depth `mirror_depth`. The
+/// chain holds depths 1..=(leaf_depth-1); the leaf is at depth
+/// `chain.len()+1`. A `mirror_depth` >= the leaf's own depth returns the leaf.
+pub(crate) fn ancestor_bare_at_depth(
+    ancestor_chain: &[String],
+    leaf_bare: &str,
+    mirror_depth: usize,
+) -> Option<String> {
+    if mirror_depth == 0 {
+        return None;
+    }
+    if mirror_depth <= ancestor_chain.len() {
+        ancestor_chain.get(mirror_depth - 1).cloned()
+    } else {
+        Some(leaf_bare.to_string())
     }
 }
 
@@ -807,7 +925,7 @@ pub(crate) fn reflex_sync_partitions_impl(view_name: &str, drop_orphans: bool) -
         // Load partition metadata.
         let meta = client
             .select(
-                "SELECT partition_columns, partition_strategy, depends_on, storage_mode \
+                "SELECT partition_columns, partition_strategy, depends_on, storage_mode, partition_depth \
                  FROM public.__reflex_ivm_reference WHERE name = $1",
                 Some(1),
                 &[unsafe {
@@ -841,6 +959,8 @@ pub(crate) fn reflex_sync_partitions_impl(view_name: &str, drop_orphans: bool) -
             .unwrap_or(None)
             .unwrap_or("UNLOGGED")
             .eq_ignore_ascii_case("UNLOGGED");
+        let partition_depth: Option<i32> =
+            row.get_by_name::<i32, _>("partition_depth").unwrap_or(None);
 
         // Resolve anchor source.
         let anchor = resolve_anchor_source(client, &part_cols[0], &sources)
@@ -848,7 +968,11 @@ pub(crate) fn reflex_sync_partitions_impl(view_name: &str, drop_orphans: bool) -
 
         // Read source partition tree (all descendants, not just one level).
         let (_, anchor_root_bare) = split_qualified_name(&anchor);
-        let nodes = list_partition_tree(client, &anchor);
+        let full_nodes = list_partition_tree(client, &anchor);
+        let mirror_depth = partition_depth
+            .map(|d| d as usize)
+            .unwrap_or_else(|| max_tree_depth(&full_nodes));
+        let nodes = truncate_partition_tree(full_nodes, mirror_depth);
         let int_parent = intermediate_table_name(view_name);
         let tgt_parent = quote_identifier(view_name);
         // Passthrough IMVs (no aggregation / ivm-count) have no intermediate
@@ -1034,7 +1158,7 @@ pub(crate) fn reflex_reconcile_partition_impl(
     let outcome: Result<String, String> = Spi::connect_mut(|client| {
         let row = client
             .select(
-                "SELECT base_query, end_query, partition_columns, partition_strategy, depends_on, graph_child, storage_mode \
+                "SELECT base_query, end_query, partition_columns, partition_strategy, depends_on, graph_child, storage_mode, partition_depth \
                  FROM public.__reflex_ivm_reference WHERE name = $1 AND enabled = TRUE",
                 Some(1),
                 &[unsafe {
@@ -1075,6 +1199,12 @@ pub(crate) fn reflex_reconcile_partition_impl(
             .unwrap_or(None)
             .unwrap_or("UNLOGGED")
             .to_string();
+        let partition_depth: Option<i32> =
+            row.get_by_name::<i32, _>("partition_depth").unwrap_or(None);
+        let depends_on: Vec<String> = row
+            .get_by_name::<Vec<String>, _>("depends_on")
+            .unwrap_or(None)
+            .unwrap_or_default();
         if part_cols.is_empty() || strategy.is_empty() {
             return Err(format!(
                 "IMV '{}' is not partitioned — use reflex_reconcile",
@@ -1093,10 +1223,24 @@ pub(crate) fn reflex_reconcile_partition_impl(
         let mut to_process: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         if !source_partition.trim().is_empty() {
-            // Level-agnostic path: expand the named source partition to source leaves,
-            // map each to its IMV target child name.
+            // Level-agnostic + depth-aware path: expand the named source
+            // partition to source leaves, map each UP to the IMV's mirror-depth
+            // node, then to its IMV target child name. When the IMV mirrors the
+            // full source depth this is the identity (leaf -> leaf).
+            let anchor = resolve_anchor_source(client, part_col, &depends_on).unwrap_or_default();
+            let full_tree = if anchor.is_empty() {
+                Vec::new()
+            } else {
+                list_partition_tree(client, &anchor)
+            };
+            let mirror_depth = partition_depth
+                .map(|d| d as usize)
+                .unwrap_or_else(|| max_tree_depth(&full_tree));
             for src_leaf in expand_source_partition_to_leaves(client, source_partition) {
-                to_process.insert(target_child_name(view_name, &src_leaf));
+                let chain = leaf_ancestor_chain(&full_tree, &src_leaf);
+                let node = ancestor_bare_at_depth(&chain, &src_leaf, mirror_depth)
+                    .unwrap_or_else(|| src_leaf.clone());
+                to_process.insert(target_child_name(view_name, &node));
             }
         } else {
             let keys: Vec<String> = partition_keys_csv
@@ -1632,19 +1776,23 @@ pub(crate) fn refresh_source_snapshot(client: &mut pgrx::spi::SpiClient<'_>, sou
         None,
         &[unsafe { DatumWithOid::new(key.clone(), pgrx::pg_sys::TEXTOID) }],
     );
-    let leaves = current_source_leaf_oids(client, source_root);
-    for (name, oid) in leaves {
+    let tree = list_partition_tree(client, source_root);
+    let leaves: Vec<&PartitionNode> = tree.iter().filter(|n| n.sub_strategy.is_none()).collect();
+    for leaf in leaves {
+        let ancestors = leaf_ancestor_chain(&tree, &leaf.bare_name);
+        let ancestors_arr = format_pg_text_array(&ancestors);
         let _ = client.update(
             "INSERT INTO public.__reflex_source_partition_snapshot \
-                 (source_root, child_name, child_oid, bound) \
-             VALUES ($1, $2, $3, NULL) \
+                 (source_root, child_name, child_oid, bound, ancestors) \
+             VALUES ($1, $2, $3, NULL, $4::TEXT[]) \
              ON CONFLICT (source_root, child_name) \
-                 DO UPDATE SET child_oid = EXCLUDED.child_oid",
+                 DO UPDATE SET child_oid = EXCLUDED.child_oid, ancestors = EXCLUDED.ancestors",
             None,
             &[
                 unsafe { DatumWithOid::new(key.clone(), pgrx::pg_sys::TEXTOID) },
-                unsafe { DatumWithOid::new(name, pgrx::pg_sys::TEXTOID) },
-                unsafe { DatumWithOid::new(oid as i64, pgrx::pg_sys::INT8OID) },
+                unsafe { DatumWithOid::new(leaf.bare_name.clone(), pgrx::pg_sys::TEXTOID) },
+                unsafe { DatumWithOid::new(leaf.oid as i64, pgrx::pg_sys::INT8OID) },
+                unsafe { DatumWithOid::new(ancestors_arr, pgrx::pg_sys::TEXTOID) },
             ],
         );
     }
@@ -1682,9 +1830,9 @@ pub(crate) fn reflex_flush_partitions_impl(only: Option<&str>) -> String {
             // create-time seed / prior flush, regardless of bare vs qualified.
             let root_key = canonical_root_key(client, root);
             // Partitioned IMVs depending on this source root.
-            let imvs: Vec<String> = client
+            let imvs: Vec<(String, Option<i32>, Vec<String>)> = client
                 .select(
-                    "SELECT name FROM public.__reflex_ivm_reference \
+                    "SELECT name, partition_depth, depends_on FROM public.__reflex_ivm_reference \
                      WHERE partition_columns IS NOT NULL AND array_length(partition_columns,1) > 0 \
                        AND (depends_on @> ARRAY[$1] OR depends_on @> ARRAY[split_part($1,'.',2)])",
                     None,
@@ -1692,10 +1840,14 @@ pub(crate) fn reflex_flush_partitions_impl(only: Option<&str>) -> String {
                 )
                 .map_err(|e| format!("flush: imv lookup failed: {}", e))?
                 .filter_map(|r| {
-                    r.get_by_name::<&str, _>("name")
+                    let name = r.get_by_name::<&str, _>("name").ok().flatten()?.to_string();
+                    let depth = r.get_by_name::<i32, _>("partition_depth").ok().flatten();
+                    let deps = r
+                        .get_by_name::<Vec<String>, _>("depends_on")
                         .ok()
                         .flatten()
-                        .map(|s| s.to_string())
+                        .unwrap_or_default();
+                    Some((name, depth, deps))
                 })
                 .collect();
 
@@ -1714,25 +1866,78 @@ pub(crate) fn reflex_flush_partitions_impl(only: Option<&str>) -> String {
                 })
                 .collect();
 
+            // Snapshot ancestors (per child_name, for up-mapping drops in shallow IMVs).
+            let snapshot_ancestors: std::collections::HashMap<String, Vec<String>> = client
+                .select(
+                    "SELECT child_name, COALESCE(ancestors, ARRAY[]::TEXT[]) AS ancestors \
+                     FROM public.__reflex_source_partition_snapshot WHERE source_root = $1",
+                    None,
+                    &[unsafe { DatumWithOid::new(root_key.clone(), pgrx::pg_sys::TEXTOID) }],
+                )
+                .map_err(|e| format!("flush: snapshot ancestors read failed: {}", e))?
+                .filter_map(|r| {
+                    let n = r
+                        .get_by_name::<&str, _>("child_name")
+                        .ok()
+                        .flatten()?
+                        .to_string();
+                    let a = r
+                        .get_by_name::<Vec<String>, _>("ancestors")
+                        .ok()
+                        .flatten()
+                        .unwrap_or_default();
+                    Some((n, a))
+                })
+                .collect();
+
             let current = current_source_leaf_oids(client, root);
             let actions = classify_partition_diff(&snapshot, &current);
+            let live_tree = list_partition_tree(client, root);
 
-            for imv in &imvs {
-                // Drops MUST run before attaches: when a source leaf is replaced
-                // by a differently-named partition (e.g. detach old, attach a
-                // freshly-built table), the diff yields a Drop (old) plus an
-                // AttachNew (new) sharing the same bound. Attaching the new IMV
-                // leaf before dropping the old one would overlap its partition
-                // range. Same-name swaps (SwapFill) replace in place via the
-                // executor's atomic DETACH/ATTACH and never overlap.
-                for (src_leaf, _) in actions
-                    .iter()
-                    .filter(|(_, a)| *a == PartitionDiffAction::Drop)
-                {
-                    let (schema_opt, _) = split_qualified_name(imv);
-                    let schema = schema_opt.unwrap_or("public");
-                    let tgt = target_child_name(imv, src_leaf);
-                    let int = intermediate_child_name(imv, src_leaf);
+            for (imv, depth_opt, _deps) in &imvs {
+                let mirror_depth = depth_opt
+                    .map(|d| d as usize)
+                    .unwrap_or_else(|| max_tree_depth(&live_tree));
+
+                use std::collections::BTreeSet;
+                let mut to_swap: BTreeSet<String> = BTreeSet::new();
+                let mut to_drop: BTreeSet<String> = BTreeSet::new();
+
+                let live_names: std::collections::HashSet<&str> =
+                    live_tree.iter().map(|n| n.bare_name.as_str()).collect();
+
+                for (leaf, action) in &actions {
+                    match action {
+                        PartitionDiffAction::SwapFill | PartitionDiffAction::AttachNew => {
+                            let chain = leaf_ancestor_chain(&live_tree, leaf);
+                            let node = ancestor_bare_at_depth(&chain, leaf, mirror_depth)
+                                .unwrap_or_else(|| leaf.clone());
+                            to_swap.insert(node);
+                        }
+                        PartitionDiffAction::Drop => {
+                            let chain = snapshot_ancestors.get(leaf).cloned().unwrap_or_default();
+                            let node = ancestor_bare_at_depth(&chain, leaf, mirror_depth)
+                                .unwrap_or_else(|| leaf.clone());
+                            if live_names.contains(node.as_str()) {
+                                // Sibling removed, ancestor survives -> refill it.
+                                to_swap.insert(node);
+                            } else {
+                                // Whole mirror-depth node gone -> drop IMV node.
+                                to_drop.insert(node);
+                            }
+                        }
+                    }
+                }
+                // A node both dropped and swap-filled: drop wins (it is gone).
+                for d in &to_drop {
+                    to_swap.remove(d);
+                }
+
+                let (schema_opt, _) = split_qualified_name(imv);
+                let schema = schema_opt.unwrap_or("public");
+                for node in &to_drop {
+                    let tgt = target_child_name(imv, node);
+                    let int = intermediate_child_name(imv, node);
                     let _ = client.update(
                         &format!("DROP TABLE IF EXISTS \"{}\".\"{}\" CASCADE", schema, tgt),
                         None,
@@ -1744,20 +1949,15 @@ pub(crate) fn reflex_flush_partitions_impl(only: Option<&str>) -> String {
                         &[],
                     );
                 }
-                for (src_leaf, _) in actions.iter().filter(|(_, a)| {
-                    matches!(
-                        a,
-                        PartitionDiffAction::AttachNew | PartitionDiffAction::SwapFill
-                    )
-                }) {
+                for node in &to_swap {
                     let q = format!(
                         "SELECT public.reflex_reconcile_partition({}, '', {})",
                         sql_literal_text(imv),
-                        sql_literal_text(src_leaf)
+                        sql_literal_text(node)
                     );
                     client
                         .update(&q, None, &[])
-                        .map_err(|e| format!("flush reconcile {} {}: {}", imv, src_leaf, e))?;
+                        .map_err(|e| format!("flush reconcile {} {}: {}", imv, node, e))?;
                 }
                 summary.push(format!("{}: {} change(s)", imv, actions.len()));
             }

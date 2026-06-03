@@ -283,6 +283,17 @@ Typical pipeline usage: after a batch of `DETACH`/`ATTACH` swaps, call `SELECT r
 - **Known limitation:** `detach → modify the same table in place → re-attach the same table` is invisible to the oid-diff (the oid is unchanged). The supported pipeline pattern attaches a freshly-built table (new oid). For the in-place pattern, call `reflex_reconcile_partition(view, source_partition := '<leaf>')` explicitly; the audit check catches it otherwise.
 - HASH at any level, and finer-than-top-level cascade to dependents, are out of scope (dependents reconcile at their own LIST level — correct, possibly coarser).
 
+### Shallow mirroring (partition depth, 1.8.2)
+
+An IMV may mirror **fewer** partition levels than its source has. The mirror depth is resolved at create time and stored in `__reflex_ivm_reference.partition_depth` (`NULL` = mirror the full source depth — the default, so pre-1.8.2 IMVs are unaffected):
+
+- **Explicit `partition_by` is authoritative.** `partition_by => ARRAY['dem_plan_id']` on a `LIST(dem_plan_id) → RANGE(order_date)` source mirrors **only** `dem_plan_id` (depth 1). Declaring `ARRAY['dem_plan_id','order_date']` opts into both levels. Each declared level must be a bare projected output column in the unique key, matching the source's partition key top-down.
+- **Auto-mirror prunes.** With `partition_by` omitted, auto-mirror keeps the longest prefix of source levels whose partition column is a **bare projected output column**, and stops at the first that isn't — instead of rejecting. This is what lets a `FULL JOIN`-coalesced key like `COALESCE(a.order_date, b.order_date) AS order_date` (which is not a bare column, so cannot be a partition level) mirror at `dem_plan_id` only.
+
+The lever is one pure function, `partition::truncate_partition_tree(nodes, mirror_depth)`: it drops source nodes deeper than `mirror_depth` and **demotes** the depth-`mirror_depth` nodes to leaves (clears their sub-`PARTITION BY`). Every site that mirrors/syncs/snapshots the source tree feeds it through this, so create / `reflex_sync_partitions` / the audit drift-check all agree on shape — a shallow IMV is never re-deepened.
+
+Capture stays **leaf-granular and maps up**: a sub-partition `DETACH`/`ATTACH` does not change the parent node's oid, so the snapshot keeps tracking the deepest source leaves; the changed leaf is mapped up to its depth-`mirror_depth` ancestor (via `ancestor_bare_at_depth` over the live tree, or the snapshot's `ancestors TEXT[]` column for a vanished leaf) and that whole top-level IMV partition is atomically refilled. Coarser than a month-granular swap, never incorrect. When `partition_depth` is `NULL`, `mirror_depth == leaf depth` and every up-map is the identity, so full-depth IMVs behave exactly as in 1.8.1.
+
 ## Per-IMV SAVEPOINT in DEFERRED flush
 
 `reflex_flush_deferred` wraps each IMV's drain in its own SAVEPOINT. A failing IMV (e.g. constraint violation on the target) doesn't abort the whole transaction's cascade — the failure is recorded against that IMV and the next one runs. See [crash recovery](../operations/crash-recovery.md) and `__reflex_ivm_reference.last_error`.

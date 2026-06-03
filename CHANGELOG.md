@@ -1,5 +1,44 @@
 # Changelog
 
+## [1.8.2] - 2026-06-03
+
+Partitioned IMVs can now mirror their source at a **shallower depth** than the
+source is partitioned. Declaring `partition_by => ARRAY['dem_plan_id']` on a
+`LIST (dem_plan_id) → RANGE (order_date)` source now mirrors **only** the
+`dem_plan_id` level (a single-level IMV) instead of being rejected when the
+deeper level's column isn't a bare projected output column. This unblocks IMVs
+whose deeper partition key only exists as a computed projection — e.g. a
+`FULL JOIN`-coalesced `COALESCE(a.order_date, b.order_date) AS order_date`,
+which cannot be a partition level.
+
+`partition_by` is now **authoritative** for the IMV's partition depth: it
+mirrors exactly the declared levels. With `partition_by` omitted, auto-mirror
+keeps as many leading levels as have a bare projected column and **prunes** the
+rest (instead of rejecting). Capture stays correct at the coarser granularity:
+a source sub-partition (`order_date`) swap/attach/detach collapses to an atomic
+refill of the whole matching top-level (`dem_plan_id`) IMV partition.
+
+Run `ALTER EXTENSION pg_reflex UPDATE TO '1.8.2';` and replace the `.so`. The
+migration is **additive and non-breaking**: it adds a nullable
+`__reflex_ivm_reference.partition_depth` column (`NULL` = mirror the full source
+depth, so existing partitioned IMVs are unaffected — no recreate needed) and an
+`ancestors TEXT[]` column on `__reflex_source_partition_snapshot`.
+
+### Added
+
+- **Shallow partition mirroring.** Explicit `partition_by` declares the IMV's
+  partition depth; auto-mirror prunes to the deepest level whose column is a
+  bare projected output column. New nullable catalog column
+  `partition_depth INT` (`NULL` = full source depth). See
+  `plans/2026-06-03-imv-partition-depth.md`.
+
+### Fixed
+
+- `reflex_sync_partitions`, `reflex_reconcile_partition`, `reflex_flush_*`, and
+  the audit partition-tree-drift check are all depth-aware: a shallow IMV is
+  never re-deepened by a sync, and a source leaf change reconciles up to the
+  IMV's mirror-depth partition.
+
 ## [1.8.1] - 2026-06-02
 
 Multi-level (sub-partition) source support: an IMV whose source is partitioned

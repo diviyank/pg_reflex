@@ -144,9 +144,14 @@ pub fn build_intermediate_table_ddl(
         .if_not_exists(true)
         .columns(columns);
     if is_partitioned {
+        // Root PARTITION BY uses ONLY the top-level column; deeper levels are
+        // carried by the truncated partition-child DDL (sub-`PARTITION BY`),
+        // not the root. `partition_columns` may hold the full declared level
+        // list (e.g. [dem_plan_id, order_date]) for an explicit multi-level
+        // IMV, so slice to the root to avoid a composite-LIST root.
         let part = crate::partition::build_partition_by_clause(
             &plan.partition_strategy,
-            &plan.partition_columns,
+            &plan.partition_columns[..1],
         );
         builder = builder.partition_by(part);
     } else {
@@ -299,9 +304,14 @@ pub fn build_target_table_ddl(
         .if_not_exists(true)
         .columns(columns);
     if is_partitioned {
+        // Root PARTITION BY uses ONLY the top-level column; deeper levels are
+        // carried by the truncated partition-child DDL (sub-`PARTITION BY`),
+        // not the root. `partition_columns` may hold the full declared level
+        // list (e.g. [dem_plan_id, order_date]) for an explicit multi-level
+        // IMV, so slice to the root to avoid a composite-LIST root.
         let part = crate::partition::build_partition_by_clause(
             &plan.partition_strategy,
-            &plan.partition_columns,
+            &plan.partition_columns[..1],
         );
         builder = builder.partition_by(part);
     } else {

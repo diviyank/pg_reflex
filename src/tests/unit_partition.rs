@@ -299,6 +299,7 @@ fn test_node_ddl_internal_node_has_sub_partition_by() {
         bound_expr: "FOR VALUES IN ('172')".to_string(),
         sub_strategy: Some("RANGE".to_string()),
         sub_columns: vec!["order_date".to_string()],
+        depth: 1,
     };
     let (_int, tgt) = build_partition_node_ddl_pair("fcst", &node, "ss", true);
     assert_eq!(
@@ -316,6 +317,7 @@ fn test_node_ddl_leaf_under_internal_parent_is_unlogged() {
         bound_expr: "FOR VALUES FROM ('2025-01-01') TO ('2025-02-01')".to_string(),
         sub_strategy: None,
         sub_columns: vec![],
+        depth: 2,
     };
     let (_int, tgt) = build_partition_node_ddl_pair("fcst", &node, "ss", true);
     assert_eq!(
@@ -346,5 +348,118 @@ fn test_classify_partition_diff() {
             ("c_feb".to_string(), PartitionDiffAction::SwapFill),
             ("c_mar".to_string(), PartitionDiffAction::Drop),
         ]
+    );
+}
+
+#[test]
+fn test_partition_node_has_depth_field() {
+    // A leaf node constructed directly carries an absolute tree-depth.
+    let n = PartitionNode {
+        bare_name: "ss_172".to_string(),
+        oid: 1,
+        parent_bare: "ss".to_string(),
+        bound_expr: "FOR VALUES IN (172)".to_string(),
+        sub_strategy: None,
+        sub_columns: vec![],
+        depth: 1,
+    };
+    assert_eq!(n.depth, 1);
+}
+
+fn node(bare: &str, parent: &str, depth: usize, sub: Option<&str>) -> PartitionNode {
+    PartitionNode {
+        bare_name: bare.to_string(),
+        oid: 0,
+        parent_bare: parent.to_string(),
+        bound_expr: "FOR VALUES IN (1)".to_string(),
+        sub_strategy: sub.map(|s| s.to_string()),
+        sub_columns: if sub.is_some() {
+            vec!["order_date".to_string()]
+        } else {
+            vec![]
+        },
+        depth,
+    }
+}
+
+#[test]
+fn test_truncate_drops_below_depth_and_demotes_boundary() {
+    // ss_172 (internal, depth 1) -> ss_172_2025_01 (leaf, depth 2)
+    let tree = vec![
+        node("ss_172", "ss", 1, Some("RANGE")),
+        node("ss_172_2025_01", "ss_172", 2, None),
+    ];
+    let out = truncate_partition_tree(tree, 1);
+    // Only the depth-1 node remains, demoted to a leaf.
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].bare_name, "ss_172");
+    assert!(
+        out[0].sub_strategy.is_none(),
+        "boundary node must be demoted to leaf"
+    );
+    assert!(
+        out[0].sub_columns.is_empty(),
+        "boundary node must drop sub_columns"
+    );
+}
+
+#[test]
+fn test_truncate_full_depth_is_noop() {
+    let tree = vec![
+        node("ss_172", "ss", 1, Some("RANGE")),
+        node("ss_172_2025_01", "ss_172", 2, None),
+    ];
+    let out = truncate_partition_tree(tree.clone(), 2);
+    assert_eq!(out.len(), 2);
+    // Internal node keeps its sub-partitioning.
+    assert_eq!(out[0].sub_strategy.as_deref(), Some("RANGE"));
+    assert_eq!(out[1].bare_name, "ss_172_2025_01");
+}
+
+#[test]
+fn test_truncate_depth_beyond_tree_is_noop() {
+    let tree = vec![node("ss_172", "ss", 1, None)];
+    let out = truncate_partition_tree(tree, 5);
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].sub_strategy, None);
+}
+
+#[test]
+fn test_leaf_ancestor_chain_root_first() {
+    // ss_172 (depth1, internal) -> ss_172_2025_01 (depth2, leaf)
+    let tree = vec![
+        node("ss_172", "ss", 1, Some("RANGE")),
+        node("ss_172_2025_01", "ss_172", 2, None),
+    ];
+    // Ancestor chain of the leaf, root-first, EXCLUDING the leaf itself.
+    let chain = leaf_ancestor_chain(&tree, "ss_172_2025_01");
+    assert_eq!(chain, vec!["ss_172".to_string()]);
+}
+
+#[test]
+fn test_leaf_ancestor_chain_of_top_level_leaf_is_empty() {
+    let tree = vec![node("ss_a", "ss", 1, None)];
+    assert!(leaf_ancestor_chain(&tree, "ss_a").is_empty());
+}
+
+#[test]
+fn test_ancestor_at_depth_picks_correct_level() {
+    // chain root-first for a depth-3 leaf: [lvl1, lvl2]; leaf itself is lvl3.
+    let chain = vec!["p_172".to_string(), "p_172_2025".to_string()];
+    assert_eq!(
+        ancestor_bare_at_depth(&chain, "p_172_2025_03", 1).as_deref(),
+        Some("p_172")
+    );
+    assert_eq!(
+        ancestor_bare_at_depth(&chain, "p_172_2025_03", 2).as_deref(),
+        Some("p_172_2025")
+    );
+    assert_eq!(
+        ancestor_bare_at_depth(&chain, "p_172_2025_03", 3).as_deref(),
+        Some("p_172_2025_03")
+    );
+    assert_eq!(
+        ancestor_bare_at_depth(&chain, "p_172_2025_03", 9).as_deref(),
+        Some("p_172_2025_03")
     );
 }

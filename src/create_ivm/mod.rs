@@ -70,6 +70,10 @@ pub(crate) struct BuildContext<'a> {
     resolved_unique_columns: Vec<String>,
     resolved_partition_cols: Vec<String>,
     resolved_strategy: String,
+    /// Resolved IMV partition mirror-depth (number of source levels to
+    /// mirror). `None` until `resolve_partitioning` runs; persisted to
+    /// `__reflex_ivm_reference.partition_depth`. `Some(k)` = mirror k levels.
+    resolved_partition_depth: Option<i32>,
 
     // SPI-phase outputs
     ivm_froms: Vec<String>,
@@ -547,32 +551,55 @@ fn resolve_partitioning(ctx: &mut BuildContext) -> Result<(), String> {
                 ));
             }
 
-            // Validate sub-level partition columns are in the unique key.
-            // Gather all sub-level partition columns from the full partition tree.
+            // Depth-bounded validation: only the levels the user explicitly
+            // declared in `partition_by` are mirrored. Build the source's
+            // ordered level columns (top-down) and check each declared level.
             let tree = crate::partition::list_partition_tree(client, &anchor);
-            let mut all_sub_cols: std::collections::HashSet<String> =
-                std::collections::HashSet::new();
-            for node in &tree {
-                for col in &node.sub_columns {
-                    all_sub_cols.insert(col.to_lowercase());
-                }
-            }
+            let source_level_cols = crate::partition::source_level_columns(&desc, &tree);
 
-            // Build the set of projected/key columns (unique_columns lowercased).
             let unique_key_cols: std::collections::HashSet<String> = ctx
                 .resolved_unique_columns
                 .iter()
                 .map(|c| c.to_lowercase())
                 .collect();
 
-            // Check each sub-level partition column is present in the unique key.
-            for sub_col in &all_sub_cols {
-                if !unique_key_cols.contains(sub_col) {
+            let declared = &ctx.resolved_partition_cols;
+            for (i, declared_col) in declared.iter().enumerate() {
+                let dl = declared_col.to_lowercase();
+                match source_level_cols.get(i) {
+                    None => {
+                        return Err(format!(
+                            "partition_by declares {} level(s) but source '{}' has only {} \
+                             partition level(s)",
+                            declared.len(),
+                            anchor,
+                            source_level_cols.len()
+                        ));
+                    }
+                    Some(src_col) if src_col.to_lowercase() != dl => {
+                        return Err(format!(
+                            "partition_by level {} is '{}' but source '{}' is partitioned on \
+                             '{}' at that level; declared levels must match the source's \
+                             partition key columns top-down",
+                            i + 1,
+                            declared_col,
+                            anchor,
+                            src_col
+                        ));
+                    }
+                    Some(_) => {}
+                }
+                // Only validate sub-levels (i >= 1) for unique key presence.
+                // Level 0 (root) is already validated above in the aggregate/passthrough
+                // check that ensured it's in GROUP BY or passthrough columns.
+                if i > 0 && !unique_key_cols.contains(&dl) {
                     return Err(format!(
-                        "partition key column '{}' (a partition level of source '{}') \
-                         is not a bare projected output column in the IMV's unique key. Add it \
-                         to the SELECT list and unique_columns.",
-                        sub_col, anchor
+                        "partition key column '{}' (level {} of source '{}') is not a bare \
+                         projected output column in the IMV's unique key. Add it to the SELECT \
+                         list and unique_columns, or declare a shallower partition_by.",
+                        declared_col,
+                        i + 1,
+                        anchor
                     ));
                 }
             }
@@ -580,7 +607,10 @@ fn resolve_partitioning(ctx: &mut BuildContext) -> Result<(), String> {
             Ok(desc.strategy)
         });
         match validate_result {
-            Ok(s) => ctx.resolved_strategy = s,
+            Ok(s) => {
+                ctx.resolved_strategy = s;
+                ctx.resolved_partition_depth = Some(ctx.resolved_partition_cols.len() as i32);
+            }
             Err(e) => {
                 return Err(crate::reflex_reject(&format!(
                     "partition_by validation failed — {}",
@@ -590,8 +620,11 @@ fn resolve_partitioning(ctx: &mut BuildContext) -> Result<(), String> {
             }
         }
     } else {
-        // Phase 5: auto-mirror when exactly one real source is partitioned.
-        let auto: (Vec<String>, String) = Spi::connect(|client| {
+        // Phase 5 + depth-prune: auto-mirror when exactly one real source is
+        // partitioned. Walk levels top-down; keep a level while its partition
+        // column is a bare projected output column; stop at the first that is
+        // not. The kept prefix length is the mirror depth.
+        let auto: (Vec<String>, String, Option<i32>) = Spi::connect(|client| {
             let mut partitioned_sources: Vec<(String, crate::partition::PartitionDescriptor)> =
                 Vec::new();
             for s in &ctx.real_source_names {
@@ -600,57 +633,82 @@ fn resolve_partitioning(ctx: &mut BuildContext) -> Result<(), String> {
                 }
             }
             if partitioned_sources.len() != 1 {
-                return (Vec::new(), String::new());
+                return (Vec::new(), String::new(), None);
             }
-            let (_, desc) = partitioned_sources.into_iter().next().unwrap();
+            let (anchor, desc) = partitioned_sources.into_iter().next().unwrap();
             let part_col = desc.column_names.first().cloned().unwrap_or_default();
             if part_col.is_empty() {
-                return (Vec::new(), String::new());
+                return (Vec::new(), String::new(), None);
             }
-            if ctx.plan.is_passthrough {
-                let pt_cols_l: std::collections::HashSet<String> = ctx
-                    .plan
-                    .passthrough_columns
-                    .iter()
-                    .map(|c| c.to_lowercase())
-                    .collect();
-                let projected: std::collections::HashSet<String> = ctx
-                    .analysis
-                    .select_columns
-                    .iter()
-                    .map(|c| {
-                        let n = c.alias.as_deref().unwrap_or(&c.expr_sql);
-                        bare_column_name(n).to_lowercase()
-                    })
-                    .collect();
-                if pt_cols_l.contains(&part_col) || projected.contains(&part_col) {
-                    return (vec![part_col], desc.strategy);
+
+            // Bare projected output columns of the IMV. A level is mirrorable
+            // only when its partition column appears as a BARE column reference
+            // in the SELECT (not a computed expression like COALESCE). We must
+            // NOT seed from passthrough_columns / the unique key — a column can
+            // be in the unique key yet projected via COALESCE (e.g. a FULL JOIN
+            // coalesced key), which is exactly the case that must prune.
+            let projected: std::collections::HashSet<String> = if ctx.plan.is_passthrough {
+                let mut set: std::collections::HashSet<String> = std::collections::HashSet::new();
+                for c in &ctx.analysis.select_columns {
+                    if crate::sql_analyzer::is_bare_column_reference(&c.expr_sql) {
+                        let name = c.alias.as_deref().unwrap_or(&c.expr_sql);
+                        set.insert(bare_column_name(name).to_lowercase());
+                    }
                 }
+                set
             } else {
-                let gb_lower: std::collections::HashSet<String> = ctx
+                // Aggregate: GROUP BY columns / aliases that are bare refs.
+                let mut set: std::collections::HashSet<String> = ctx
                     .plan
                     .group_by_columns
                     .iter()
-                    .map(|c| c.to_lowercase())
+                    .filter(|c| crate::sql_analyzer::is_bare_column_reference(c))
+                    .map(|c| normalized_column_name(c).to_lowercase())
                     .collect();
-                let projected_aliases: std::collections::HashSet<String> = ctx
-                    .plan
-                    .group_by_aliases
-                    .values()
-                    .map(|v| v.to_lowercase())
-                    .collect();
-                if gb_lower.contains(&part_col) || projected_aliases.contains(&part_col) {
-                    return (vec![part_col], desc.strategy);
+                for v in ctx.plan.group_by_aliases.values() {
+                    set.insert(v.to_lowercase());
+                }
+                set
+            };
+
+            // Root level must be projected for ANY partitioning at all.
+            if !projected.contains(&part_col.to_lowercase()) {
+                return (Vec::new(), String::new(), None);
+            }
+
+            let tree = crate::partition::list_partition_tree(client, &anchor);
+            let level_cols = crate::partition::source_level_columns(&desc, &tree);
+            // Keep the longest prefix of levels whose column is bare-projected.
+            let mut depth = 0usize;
+            for col in &level_cols {
+                if projected.contains(&col.to_lowercase()) {
+                    depth += 1;
+                } else {
+                    break;
                 }
             }
-            (Vec::new(), String::new())
+            if depth == 0 {
+                return (Vec::new(), String::new(), None);
+            }
+            if depth < level_cols.len() {
+                info!(
+                    "pg_reflex: auto-mirror pruning '{}' at depth {} — level {} column '{}' \
+                     is not a bare projected output column",
+                    anchor,
+                    depth,
+                    depth + 1,
+                    level_cols[depth]
+                );
+            }
+            (vec![part_col], desc.strategy, Some(depth as i32))
         });
         ctx.resolved_partition_cols = auto.0;
         ctx.resolved_strategy = auto.1;
+        ctx.resolved_partition_depth = auto.2;
         if !ctx.resolved_partition_cols.is_empty() {
             info!(
-                "pg_reflex: auto-mirroring partition column '{}' from source",
-                ctx.resolved_partition_cols[0]
+                "pg_reflex: auto-mirroring partition column '{}' from source (depth {:?})",
+                ctx.resolved_partition_cols[0], ctx.resolved_partition_depth
             );
         }
     }
@@ -803,9 +861,16 @@ fn materialize_passthrough(client: &mut pgrx::spi::SpiClient<'_>, ctx: &mut Buil
         client
             .update(&format!("DROP TABLE {}", scratch_name), None, &[])
             .unwrap_or_report();
+        // Root table partitions only on the first column; deeper levels are
+        // handled by building child nodes below (lines 884-896).
+        let root_partition_cols = if ctx.plan.partition_columns.len() > 1 {
+            vec![ctx.plan.partition_columns[0].clone()]
+        } else {
+            ctx.plan.partition_columns.clone()
+        };
         let part_clause = crate::partition::build_partition_by_clause(
             &ctx.plan.partition_strategy,
-            &ctx.plan.partition_columns,
+            &root_partition_cols,
         );
         client
             .update(
@@ -826,7 +891,10 @@ fn materialize_passthrough(client: &mut pgrx::spi::SpiClient<'_>, ctx: &mut Buil
             &ctx.real_source_names,
         ) {
             let (_, anchor_root_bare) = split_qualified_name(&anchor);
-            let nodes = crate::partition::list_partition_tree(client, &anchor);
+            let mut nodes = crate::partition::list_partition_tree(client, &anchor);
+            if let Some(depth) = ctx.resolved_partition_depth {
+                nodes = crate::partition::truncate_partition_tree(nodes, depth as usize);
+            }
             for node in &nodes {
                 let (_, tgt_ddl) = crate::partition::build_partition_node_ddl_pair(
                     ctx.view_name,
@@ -982,7 +1050,10 @@ fn materialize_aggregate(client: &mut pgrx::spi::SpiClient<'_>, ctx: &mut BuildC
         ) {
             Ok(anchor) => {
                 let (_, anchor_root_bare) = split_qualified_name(&anchor);
-                let nodes = crate::partition::list_partition_tree(client, &anchor);
+                let mut nodes = crate::partition::list_partition_tree(client, &anchor);
+                if let Some(depth) = ctx.resolved_partition_depth {
+                    nodes = crate::partition::truncate_partition_tree(nodes, depth as usize);
+                }
                 info!(
                     "pg_reflex: creating {} partition nodes for '{}' (anchor='{}')",
                     nodes.len(),
@@ -1396,6 +1467,7 @@ fn persist_metadata(client: &mut SpiClient<'_>, ctx: &BuildContext) {
             ignored_sources: Some(&ignored_sources_vec),
             partition_columns: Some(&ctx.plan.partition_columns),
             partition_strategy: Some(&ctx.plan.partition_strategy),
+            partition_depth: ctx.resolved_partition_depth,
             max_one_row,
         },
     )
@@ -1763,6 +1835,7 @@ pub(crate) fn create_reflex_ivm_impl_with_materialization(
         resolved_unique_columns: Vec::new(),
         resolved_partition_cols: Vec::new(),
         resolved_strategy: String::new(),
+        resolved_partition_depth: None,
         ivm_froms: Vec::new(),
         depth: 0,
         unlogged_tables: Vec::new(),

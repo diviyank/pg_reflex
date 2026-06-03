@@ -1,6 +1,29 @@
 // Integration tests for multi-level (sub-partition) source support.
 // Plan: plans/sub_partitioning_impl_plan.md. Included from src/lib.rs tests module.
 
+// Helper: count target-side partition children of an IMV (any depth).
+fn imv_child_count(view: &str) -> i64 {
+    Spi::get_one::<i64>(&format!(
+        "SELECT count(*)::int8 FROM pg_inherits i \
+         JOIN pg_class p ON p.oid = i.inhparent \
+         WHERE p.relname = '{}'",
+        view
+    ))
+    .unwrap()
+    .unwrap()
+}
+
+// Helper: is `child` itself partitioned (an internal node)?
+fn is_partitioned_rel(child: &str) -> bool {
+    Spi::get_one::<bool>(&format!(
+        "SELECT EXISTS(SELECT 1 FROM pg_partitioned_table pt \
+         JOIN pg_class c ON c.oid = pt.partrelid WHERE c.relname = '{}')",
+        child
+    ))
+    .unwrap()
+    .unwrap()
+}
+
 #[pg_test]
 fn pg_subpart_tree_walk_lists_all_levels() {
     Spi::run(
@@ -49,7 +72,7 @@ fn pg_subpart_create_mirrors_full_tree() {
         "SELECT create_reflex_ivm('fcst2', \
             'SELECT dem_plan_id, order_date, product_id, qty FROM ss2', \
             'dem_plan_id,order_date,product_id', NULL, NULL, NULL, \
-            ARRAY['dem_plan_id'] )",
+            ARRAY['dem_plan_id','order_date'] )",
     )
     .expect("create call")
     .expect("create result");
@@ -87,10 +110,11 @@ fn pg_subpart_rejects_sublevel_column_not_in_unique_key() {
 
     // unique_key omits order_date (a sub-level partition key) -> must be rejected
     // with a clean error string (NOT a panic / PG hard error).
+    // Declare both levels explicitly so level-2 validation catches the missing order_date in unique_key.
     let r = Spi::get_one::<String>(
         "SELECT create_reflex_ivm('fcst3', \
             'SELECT dem_plan_id, qty FROM ss3', \
-            'dem_plan_id', NULL, NULL, NULL, ARRAY['dem_plan_id'])",
+            'dem_plan_id', NULL, NULL, NULL, ARRAY['dem_plan_id','order_date'])",
     )
     .expect("create call")
     .expect("create result");
@@ -101,13 +125,51 @@ fn pg_subpart_rejects_sublevel_column_not_in_unique_key() {
 }
 
 #[pg_test]
+fn pg_subpart_explicit_shallow_partition_by_creates_single_level() {
+    Spi::run(
+        "CREATE TABLE ssd (dem_plan_id BIGINT NOT NULL, order_date DATE NOT NULL, \
+         product_id BIGINT, qty INT) PARTITION BY LIST (dem_plan_id)",
+    )
+    .expect("root");
+    Spi::run("CREATE TABLE ssd_172 PARTITION OF ssd FOR VALUES IN (172) PARTITION BY RANGE (order_date)")
+        .expect("list child");
+    Spi::run("CREATE TABLE ssd_172_2025_01 PARTITION OF ssd_172 FOR VALUES FROM ('2025-01-01') TO ('2025-02-01')")
+        .expect("leaf");
+    Spi::run(
+        "INSERT INTO ssd (dem_plan_id, order_date, product_id, qty) VALUES (172, '2025-01-15', 5, 10)",
+    )
+    .expect("seed");
+
+    // order_date is projected only via a COALESCE-like rename — declare
+    // partition_by:[dem_plan_id] so we mirror ONLY the dem_plan_id level.
+    let r = Spi::get_one::<String>(
+        "SELECT create_reflex_ivm('fcst_shallow', \
+            'SELECT dem_plan_id, COALESCE(order_date, order_date) AS order_date, product_id, qty FROM ssd', \
+            'dem_plan_id,order_date,product_id', NULL, NULL, NULL, ARRAY['dem_plan_id'])",
+    )
+    .expect("create call")
+    .expect("create result");
+    assert!(!r.starts_with("ERROR"), "creation failed: {}", r);
+
+    // Exactly ONE target child (the dem_plan_id=172 leaf), and it is NOT
+    // itself partitioned (no order_date sub-level mirrored).
+    assert_eq!(imv_child_count("fcst_shallow"), 1);
+    assert!(!is_partitioned_rel("fcst_shallow_ssd_172"),
+        "dem_plan_id leaf must be a plain table, not sub-partitioned");
+
+    // Data is correct.
+    let n = Spi::get_one::<i64>("SELECT count(*)::int8 FROM fcst_shallow").unwrap().unwrap();
+    assert_eq!(n, 1);
+}
+
+#[pg_test]
 fn pg_subpart_sync_creates_new_leaf_and_drops_orphan() {
     Spi::run("CREATE TABLE ss4 (dem_plan_id BIGINT NOT NULL, order_date DATE NOT NULL, product_id BIGINT, qty INT) PARTITION BY LIST (dem_plan_id)").expect("root");
     Spi::run("CREATE TABLE ss4_172 PARTITION OF ss4 FOR VALUES IN (172) PARTITION BY RANGE (order_date)").expect("list");
     Spi::run("CREATE TABLE ss4_172_2025_01 PARTITION OF ss4_172 FOR VALUES FROM ('2025-01-01') TO ('2025-02-01')").expect("leaf1");
     Spi::get_one::<String>(
         "SELECT create_reflex_ivm('fcst4', 'SELECT dem_plan_id, order_date, product_id, qty FROM ss4', \
-         'dem_plan_id,product_id,order_date', NULL, NULL, NULL, ARRAY['dem_plan_id'])",
+         'dem_plan_id,product_id,order_date', NULL, NULL, NULL, ARRAY['dem_plan_id','order_date'])",
     ).expect("c").expect("c");
 
     // Attach a brand-new month leaf on the source, then sync.
@@ -137,7 +199,7 @@ fn pg_subpart_reconcile_leaf_swaps_only_that_leaf() {
     Spi::run("INSERT INTO ss5 VALUES (172,'2025-01-15',5,10),(172,'2025-02-15',5,20)").expect("seed");
     Spi::get_one::<String>(
         "SELECT create_reflex_ivm('fcst5','SELECT dem_plan_id, order_date, product_id, qty FROM ss5', \
-         'dem_plan_id,product_id,order_date', NULL, NULL, NULL, ARRAY['dem_plan_id'])",
+         'dem_plan_id,product_id,order_date', NULL, NULL, NULL, ARRAY['dem_plan_id','order_date'])",
     ).expect("c").expect("c");
 
     // Mutate Jan data directly on the source leaf (stand-in for a swap), then
@@ -163,7 +225,7 @@ fn pg_subpart_reconcile_internal_node_swaps_all_leaves() {
     Spi::run("INSERT INTO ss6 VALUES (172,'2025-01-15',5,10),(172,'2025-02-15',5,20)").expect("seed");
     Spi::get_one::<String>(
         "SELECT create_reflex_ivm('fcst6','SELECT dem_plan_id, order_date, product_id, qty FROM ss6', \
-         'dem_plan_id,product_id,order_date', NULL, NULL, NULL, ARRAY['dem_plan_id'])",
+         'dem_plan_id,product_id,order_date', NULL, NULL, NULL, ARRAY['dem_plan_id','order_date'])",
     ).expect("c").expect("c");
 
     // Mutate both month leaves, then reconcile the WHOLE dem_plan_id internal
@@ -210,7 +272,7 @@ fn pg_subpart_flush_applies_attach() {
     Spi::run("INSERT INTO ss8 VALUES (172,'2025-01-15',5,10)").expect("seed");
     Spi::get_one::<String>(
         "SELECT create_reflex_ivm('fcst8','SELECT dem_plan_id, order_date, product_id, qty FROM ss8', \
-         'dem_plan_id,product_id,order_date', NULL, NULL, NULL, ARRAY['dem_plan_id'])",
+         'dem_plan_id,product_id,order_date', NULL, NULL, NULL, ARRAY['dem_plan_id','order_date'])",
     ).expect("c").expect("c");
 
     // Build a fresh Feb leaf as a standalone table and ATTACH it (a swap of a
@@ -269,7 +331,7 @@ fn pg_subpart_attach_toplevel_branch_autosyncs_full_subtree_via_event_trigger() 
     Spi::run("INSERT INTO sb VALUES (172,'2025-01-15',5,10)").expect("seed");
     Spi::get_one::<String>(
         "SELECT create_reflex_ivm('sbv','SELECT dem_plan_id, order_date, product_id, qty FROM sb', \
-         'dem_plan_id,product_id,order_date', NULL, NULL, NULL, ARRAY['dem_plan_id'])",
+         'dem_plan_id,product_id,order_date', NULL, NULL, NULL, ARRAY['dem_plan_id','order_date'])",
     ).expect("c").expect("c");
 
     // Build the new branch (dem_plan_id=173) standalone, fill it, then ATTACH
@@ -307,7 +369,7 @@ fn pg_subpart_global_reconcile_passthrough_multilevel() {
     Spi::run("INSERT INTO sc VALUES (172,'2025-01-15',5,10),(172,'2025-02-15',5,20)").expect("seed");
     Spi::get_one::<String>(
         "SELECT create_reflex_ivm('scv','SELECT dem_plan_id, order_date, product_id, qty FROM sc', \
-         'dem_plan_id,product_id,order_date', NULL, NULL, NULL, ARRAY['dem_plan_id'])",
+         'dem_plan_id,product_id,order_date', NULL, NULL, NULL, ARRAY['dem_plan_id','order_date'])",
     ).expect("c").expect("c");
 
     // Precondition: passthrough → no intermediate table.
@@ -587,7 +649,7 @@ fn pg_fuzz_subpartition_swap_sequence_matches_recompute() {
     Spi::run("INSERT INTO fz SELECT 1, make_date(2025, (g % 3) + 1, 10), g, g * 10 FROM generate_series(1,30) g").expect("seed");
     Spi::get_one::<String>(
         "SELECT create_reflex_ivm('fzv','SELECT dem_plan_id, order_date, product_id, qty FROM fz', \
-         'dem_plan_id,product_id,order_date', NULL, NULL, NULL, ARRAY['dem_plan_id'])",
+         'dem_plan_id,product_id,order_date', NULL, NULL, NULL, ARRAY['dem_plan_id','order_date'])",
     ).expect("c").expect("c");
 
     for m in 1..=3 {
@@ -617,4 +679,271 @@ fn pg_fuzz_subpartition_swap_sequence_matches_recompute() {
          ) d",
     ).expect("oracle").expect("count");
     assert_eq!(drift, 0, "IMV diverged from source recompute after swap sequence");
+}
+
+// Same swap sequence as above, but the IMV is SHALLOW (partition_by depth 1,
+// order_date projected via COALESCE so it can't be a partition level). Each
+// source month swap collapses to a whole-dem_plan_id refill on flush; the
+// logical output must still match a full recompute of the source.
+#[pg_test]
+fn pg_fuzz_subpartition_shallow_swap_sequence_matches_recompute() {
+    Spi::run("CREATE TABLE fzs (dem_plan_id BIGINT NOT NULL, order_date DATE NOT NULL, product_id BIGINT, qty INT) PARTITION BY LIST (dem_plan_id)").expect("root");
+    Spi::run("CREATE TABLE fzs_1 PARTITION OF fzs FOR VALUES IN (1) PARTITION BY RANGE (order_date)").expect("list");
+    Spi::run("CREATE TABLE fzs_1_2025_01 PARTITION OF fzs_1 FOR VALUES FROM ('2025-01-01') TO ('2025-02-01')").expect("m1");
+    Spi::run("CREATE TABLE fzs_1_2025_02 PARTITION OF fzs_1 FOR VALUES FROM ('2025-02-01') TO ('2025-03-01')").expect("m2");
+    Spi::run("CREATE TABLE fzs_1_2025_03 PARTITION OF fzs_1 FOR VALUES FROM ('2025-03-01') TO ('2025-04-01')").expect("m3");
+    Spi::run("INSERT INTO fzs SELECT 1, make_date(2025, (g % 3) + 1, 10), g, g * 10 FROM generate_series(1,30) g").expect("seed");
+    let c = Spi::get_one::<&str>(
+        "SELECT create_reflex_ivm('fzsv','SELECT dem_plan_id, COALESCE(order_date, order_date) AS order_date, product_id, qty FROM fzs', \
+         'dem_plan_id,product_id,order_date', NULL, NULL, NULL, ARRAY['dem_plan_id'])",
+    ).expect("c").expect("c");
+    assert!(!c.starts_with("ERROR"), "create failed: {c}");
+    // The IMV mirrors only the dem_plan_id level (no order_date sub-level).
+    assert!(!is_partitioned_rel("fzsv_fzs_1"), "shallow IMV must not sub-partition");
+
+    for m in 1..=3 {
+        let lo = format!("2025-0{}-01", m);
+        let hi = format!("2025-0{}-01", m + 1);
+        Spi::run(&format!("ALTER TABLE fzs_1 DETACH PARTITION fzs_1_2025_0{}", m)).expect("detach");
+        Spi::run(&format!("CREATE TABLE fzs_1_2025_0{}_new (LIKE fzs INCLUDING ALL)", m)).expect("stage");
+        Spi::run(&format!(
+            "INSERT INTO fzs_1_2025_0{m}_new SELECT dem_plan_id, order_date, product_id, qty + 1000 FROM fzs_1_2025_0{m}",
+            m = m
+        )).expect("fill");
+        Spi::run(&format!("DROP TABLE fzs_1_2025_0{}", m)).expect("dropold");
+        Spi::run(&format!(
+            "ALTER TABLE fzs_1 ATTACH PARTITION fzs_1_2025_0{m}_new FOR VALUES FROM ('{lo}') TO ('{hi}')",
+            m = m, lo = lo, hi = hi
+        )).expect("attach");
+        let _ = Spi::get_one::<String>("SELECT reflex_flush_partitions()").expect("flush").expect("flush");
+    }
+
+    let drift = Spi::get_one::<i64>(
+        "SELECT count(*) FROM ( \
+            (SELECT dem_plan_id, order_date, product_id, qty FROM fzsv \
+             EXCEPT SELECT dem_plan_id, order_date, product_id, qty FROM fzs) \
+            UNION ALL \
+            (SELECT dem_plan_id, order_date, product_id, qty FROM fzs \
+             EXCEPT SELECT dem_plan_id, order_date, product_id, qty FROM fzsv) \
+         ) d",
+    ).expect("oracle").expect("count");
+    assert_eq!(drift, 0, "shallow IMV diverged from source recompute after swap sequence");
+}
+
+#[pg_test]
+fn pg_subpart_explicit_two_level_opts_into_subpartitioning() {
+    Spi::run(
+        "CREATE TABLE sstwo (dem_plan_id BIGINT NOT NULL, order_date DATE NOT NULL, qty INT) \
+         PARTITION BY LIST (dem_plan_id)",
+    ).expect("root");
+    Spi::run("CREATE TABLE sstwo_172 PARTITION OF sstwo FOR VALUES IN (172) PARTITION BY RANGE (order_date)")
+        .expect("list child");
+    Spi::run("CREATE TABLE sstwo_172_2025_01 PARTITION OF sstwo_172 FOR VALUES FROM ('2025-01-01') TO ('2025-02-01')")
+        .expect("leaf");
+    Spi::run("INSERT INTO sstwo VALUES (172, '2025-01-15', 10)").expect("seed");
+
+    let r = Spi::get_one::<String>(
+        "SELECT create_reflex_ivm('fcst_deep', \
+            'SELECT dem_plan_id, order_date, qty FROM sstwo', \
+            'dem_plan_id,order_date', NULL, NULL, NULL, ARRAY['dem_plan_id','order_date'])",
+    ).expect("create call").expect("create result");
+    assert!(!r.starts_with("ERROR"), "create failed: {}", r);
+
+    assert!(is_partitioned_rel("fcst_deep_sstwo_172"),
+        "with explicit 2-level partition_by, the dem_plan_id node must sub-partition");
+}
+
+#[pg_test]
+fn pg_subpart_auto_prune_stops_at_non_projected_sublevel() {
+    Spi::run(
+        "CREATE TABLE ssauto (dem_plan_id BIGINT NOT NULL, order_date DATE NOT NULL, qty INT) \
+         PARTITION BY LIST (dem_plan_id)",
+    ).expect("root");
+    Spi::run("CREATE TABLE ssauto_172 PARTITION OF ssauto FOR VALUES IN (172) PARTITION BY RANGE (order_date)")
+        .expect("list child");
+    Spi::run("CREATE TABLE ssauto_172_2025_01 PARTITION OF ssauto_172 FOR VALUES FROM ('2025-01-01') TO ('2025-02-01')")
+        .expect("leaf");
+    Spi::run("INSERT INTO ssauto VALUES (172, '2025-01-15', 10)").expect("seed");
+
+    // 6-arg overload (no partition_by) → auto-mirror. Passing NULL for the
+    // 7-arg text[] partition_by is ambiguous/panics, so auto-mirror must use
+    // the 6-arg form with concrete storage/mode to disambiguate the overload.
+    let r = Spi::get_one::<&str>(
+        "SELECT create_reflex_ivm('fcst_auto', \
+            'SELECT dem_plan_id, COALESCE(order_date, order_date) AS order_date, qty FROM ssauto', \
+            'dem_plan_id,order_date', 'UNLOGGED', 'IMMEDIATE', NULL)",
+    ).expect("create call").expect("create result");
+    assert!(!r.starts_with("ERROR"), "create failed: {}", r);
+
+    assert!(!is_partitioned_rel("fcst_auto_ssauto_172"),
+        "auto-mirror must prune the order_date sub-level (not bare-projected)");
+    assert_eq!(imv_child_count("fcst_auto"), 1);
+}
+
+#[pg_test]
+fn pg_subpart_shallow_imv_persists_partition_depth() {
+    Spi::run(
+        "CREATE TABLE ssp (dem_plan_id BIGINT NOT NULL, order_date DATE NOT NULL, qty INT) \
+         PARTITION BY LIST (dem_plan_id)",
+    ).expect("root");
+    Spi::run("CREATE TABLE ssp_172 PARTITION OF ssp FOR VALUES IN (172) PARTITION BY RANGE (order_date)").expect("c");
+    Spi::run("CREATE TABLE ssp_172_2025_01 PARTITION OF ssp_172 FOR VALUES FROM ('2025-01-01') TO ('2025-02-01')").expect("l");
+    Spi::run("INSERT INTO ssp VALUES (172, '2025-01-15', 1)").expect("seed");
+    let r = Spi::get_one::<&str>(
+        "SELECT create_reflex_ivm('fcst_depth', \
+            'SELECT dem_plan_id, COALESCE(order_date, order_date) AS order_date, qty FROM ssp', \
+            'dem_plan_id,order_date', NULL, NULL, NULL, ARRAY['dem_plan_id'])",
+    ).expect("c").expect("r");
+    assert!(!r.starts_with("ERROR"), "create failed: {r}");
+
+    let d = Spi::get_one::<i32>(
+        "SELECT partition_depth FROM public.__reflex_ivm_reference WHERE name = 'fcst_depth'",
+    ).unwrap();
+    assert_eq!(d, Some(1));
+}
+
+#[pg_test]
+fn pg_subpart_sync_does_not_redeepen_shallow_imv() {
+    Spi::run(
+        "CREATE TABLE ssn (dem_plan_id BIGINT NOT NULL, order_date DATE NOT NULL, qty INT) \
+         PARTITION BY LIST (dem_plan_id)",
+    ).expect("root");
+    Spi::run("CREATE TABLE ssn_172 PARTITION OF ssn FOR VALUES IN (172) PARTITION BY RANGE (order_date)").expect("c");
+    Spi::run("CREATE TABLE ssn_172_2025_01 PARTITION OF ssn_172 FOR VALUES FROM ('2025-01-01') TO ('2025-02-01')").expect("l");
+    Spi::run("INSERT INTO ssn VALUES (172, '2025-01-15', 1)").expect("seed");
+    let r = Spi::get_one::<&str>(
+        "SELECT create_reflex_ivm('fcst_sync', \
+            'SELECT dem_plan_id, COALESCE(order_date, order_date) AS order_date, qty FROM ssn', \
+            'dem_plan_id,order_date', NULL, NULL, NULL, ARRAY['dem_plan_id'])",
+    ).expect("c").expect("r");
+    assert!(!r.starts_with("ERROR"), "create failed: {r}");
+
+    // Sync must NOT add the order_date sub-level back.
+    Spi::run("SELECT reflex_sync_partitions('fcst_sync', true)").expect("sync");
+    assert!(!is_partitioned_rel("fcst_sync_ssn_172"),
+        "sync must respect mirror_depth=1 and not re-deepen");
+    assert_eq!(imv_child_count("fcst_sync"), 1);
+}
+
+#[pg_test]
+fn pg_subpart_null_depth_mirrors_full_source() {
+    Spi::run(
+        "CREATE TABLE ssf (dem_plan_id BIGINT NOT NULL, order_date DATE NOT NULL, qty INT) \
+         PARTITION BY LIST (dem_plan_id)",
+    ).expect("root");
+    Spi::run("CREATE TABLE ssf_172 PARTITION OF ssf FOR VALUES IN (172) PARTITION BY RANGE (order_date)").expect("c");
+    Spi::run("CREATE TABLE ssf_172_2025_01 PARTITION OF ssf_172 FOR VALUES FROM ('2025-01-01') TO ('2025-02-01')").expect("l");
+    Spi::run("INSERT INTO ssf VALUES (172, '2025-01-15', 1)").expect("seed");
+    // 2-level explicit -> full depth; partition_depth = 2.
+    let r = Spi::get_one::<&str>(
+        "SELECT create_reflex_ivm('fcst_full', \
+            'SELECT dem_plan_id, order_date, qty FROM ssf', \
+            'dem_plan_id,order_date', NULL, NULL, NULL, ARRAY['dem_plan_id','order_date'])",
+    ).expect("c").expect("r");
+    assert!(!r.starts_with("ERROR"), "create failed: {r}");
+    // Simulate a legacy row: NULL out partition_depth; sync must STILL mirror
+    // the full 2 levels (NULL => full depth).
+    Spi::run("UPDATE public.__reflex_ivm_reference SET partition_depth = NULL WHERE name = 'fcst_full'").expect("u");
+    Spi::run("SELECT reflex_sync_partitions('fcst_full', true)").expect("sync");
+    assert!(is_partitioned_rel("fcst_full_ssf_172"),
+        "NULL partition_depth must mirror full source depth (no truncation)");
+}
+
+#[pg_test]
+fn pg_subpart_shallow_reconcile_refills_dem_plan_node() {
+    Spi::run(
+        "CREATE TABLE ssr (dem_plan_id BIGINT NOT NULL, order_date DATE NOT NULL, qty INT) \
+         PARTITION BY LIST (dem_plan_id)",
+    ).expect("root");
+    Spi::run("CREATE TABLE ssr_172 PARTITION OF ssr FOR VALUES IN (172) PARTITION BY RANGE (order_date)").expect("c");
+    Spi::run("CREATE TABLE ssr_172_2025_01 PARTITION OF ssr_172 FOR VALUES FROM ('2025-01-01') TO ('2025-02-01')").expect("l1");
+    Spi::run("CREATE TABLE ssr_172_2025_02 PARTITION OF ssr_172 FOR VALUES FROM ('2025-02-01') TO ('2025-03-01')").expect("l2");
+    Spi::run("INSERT INTO ssr VALUES (172, '2025-01-15', 10), (172, '2025-02-15', 20)").expect("seed");
+    let c = Spi::get_one::<&str>(
+        "SELECT create_reflex_ivm('fcst_rec', \
+            'SELECT dem_plan_id, COALESCE(order_date, order_date) AS order_date, qty FROM ssr', \
+            'dem_plan_id,order_date', NULL, NULL, NULL, ARRAY['dem_plan_id'])",
+    ).expect("c").expect("r");
+    assert!(!c.starts_with("ERROR"), "create failed: {c}");
+
+    // Mutate one month directly, then reconcile via the source SUB-leaf name.
+    Spi::run("INSERT INTO ssr VALUES (172, '2025-02-20', 5)").expect("mutate");
+    let res = Spi::get_one::<String>(
+        "SELECT reflex_reconcile_partition('fcst_rec', '', 'ssr_172_2025_02')",
+    ).expect("reconcile").expect("res");
+    assert!(!res.starts_with("ERROR"), "reconcile failed: {}", res);
+
+    // The whole dem_plan_id=172 IMV node is refilled (all 3 rows).
+    let n = Spi::get_one::<i64>("SELECT count(*)::int8 FROM fcst_rec WHERE dem_plan_id = 172").unwrap().unwrap();
+    assert_eq!(n, 3);
+}
+
+#[pg_test]
+fn pg_subpart_shallow_flush_attach_month_collapses_into_node() {
+    Spi::run(
+        "CREATE TABLE ssm (dem_plan_id BIGINT NOT NULL, order_date DATE NOT NULL, qty INT) \
+         PARTITION BY LIST (dem_plan_id)",
+    ).expect("root");
+    Spi::run("CREATE TABLE ssm_172 PARTITION OF ssm FOR VALUES IN (172) PARTITION BY RANGE (order_date)").expect("c");
+    Spi::run("CREATE TABLE ssm_172_2025_01 PARTITION OF ssm_172 FOR VALUES FROM ('2025-01-01') TO ('2025-02-01')").expect("l1");
+    Spi::run("INSERT INTO ssm VALUES (172, '2025-01-15', 10)").expect("seed");
+    let c = Spi::get_one::<&str>(
+        "SELECT create_reflex_ivm('fcst_flush', \
+            'SELECT dem_plan_id, COALESCE(order_date, order_date) AS order_date, qty FROM ssm', \
+            'dem_plan_id,order_date', NULL, NULL, NULL, ARRAY['dem_plan_id'])",
+    ).expect("c").expect("r");
+    assert!(!c.starts_with("ERROR"), "create failed: {c}");
+
+    // Attach a brand-new month leaf to the source (DDL — no DML trigger).
+    Spi::run("CREATE TABLE ssm_172_2025_02 (LIKE ssm_172 INCLUDING ALL)").expect("staging");
+    Spi::run("INSERT INTO ssm_172_2025_02 VALUES (172, '2025-02-15', 20)").expect("fill staging");
+    Spi::run("ALTER TABLE ssm_172 ATTACH PARTITION ssm_172_2025_02 FOR VALUES FROM ('2025-02-01') TO ('2025-03-01')").expect("attach");
+
+    // Flush the source root.
+    let res = Spi::get_one::<String>("SELECT reflex_flush_partition_source('public.ssm')").expect("flush").expect("res");
+    assert!(!res.starts_with("ERROR"), "flush failed: {}", res);
+
+    // IMV still has exactly ONE child (dem_plan_id node), now holding both months.
+    assert_eq!(imv_child_count("fcst_flush"), 1);
+    let n = Spi::get_one::<i64>("SELECT count(*)::int8 FROM fcst_flush").unwrap().unwrap();
+    assert_eq!(n, 2);
+}
+
+#[pg_test]
+fn pg_subpart_shallow_imv_audit_no_drift() {
+    Spi::run(
+        "CREATE TABLE ssaud (dem_plan_id BIGINT NOT NULL, order_date DATE NOT NULL, qty INT) \
+         PARTITION BY LIST (dem_plan_id)",
+    )
+    .expect("root");
+    Spi::run("CREATE TABLE ssaud_172 PARTITION OF ssaud FOR VALUES IN (172) PARTITION BY RANGE (order_date)")
+        .expect("c");
+    Spi::run(
+        "CREATE TABLE ssaud_172_2025_01 PARTITION OF ssaud_172 \
+         FOR VALUES FROM ('2025-01-01') TO ('2025-02-01')",
+    )
+    .expect("l");
+    Spi::run("INSERT INTO ssaud VALUES (172, '2025-01-15', 10)").expect("seed");
+
+    // Create a shallow IMV that mirrors only the dem_plan_id level (not the order_date sub-level).
+    let c = Spi::get_one::<&str>(
+        "SELECT create_reflex_ivm('fcst_audit', \
+            'SELECT dem_plan_id, COALESCE(order_date, order_date) AS order_date, qty FROM ssaud', \
+            'dem_plan_id,order_date', NULL, NULL, NULL, ARRAY['dem_plan_id'])",
+    )
+    .expect("c")
+    .expect("r");
+    assert!(!c.starts_with("ERROR"), "create failed: {c}");
+
+    // The drift audit must NOT flag the shallow IMV for "missing" the source's
+    // order_date sub-level. reflex_audit(name) returns a text report.
+    let report = Spi::get_one::<String>(
+        "SELECT reflex_audit('fcst_audit')",
+    )
+    .expect("audit")
+    .expect("report");
+    assert!(
+        !report.contains("Partition drift"),
+        "shallow IMV must not be flagged as drifted; report:\n{report}"
+    );
 }
