@@ -299,6 +299,7 @@ fn test_node_ddl_internal_node_has_sub_partition_by() {
         bound_expr: "FOR VALUES IN ('172')".to_string(),
         sub_strategy: Some("RANGE".to_string()),
         sub_columns: vec!["order_date".to_string()],
+        depth: 1,
     };
     let (_int, tgt) = build_partition_node_ddl_pair("fcst", &node, "ss", true);
     assert_eq!(
@@ -316,6 +317,7 @@ fn test_node_ddl_leaf_under_internal_parent_is_unlogged() {
         bound_expr: "FOR VALUES FROM ('2025-01-01') TO ('2025-02-01')".to_string(),
         sub_strategy: None,
         sub_columns: vec![],
+        depth: 2,
     };
     let (_int, tgt) = build_partition_node_ddl_pair("fcst", &node, "ss", true);
     assert_eq!(
@@ -347,4 +349,19 @@ fn test_classify_partition_diff() {
             ("c_mar".to_string(), PartitionDiffAction::Drop),
         ]
     );
+}
+
+#[test]
+fn test_partition_node_has_depth_field() {
+    // A leaf node constructed directly carries an absolute tree-depth.
+    let n = PartitionNode {
+        bare_name: "ss_172".to_string(),
+        oid: 1,
+        parent_bare: "ss".to_string(),
+        bound_expr: "FOR VALUES IN (172)".to_string(),
+        sub_strategy: None,
+        sub_columns: vec![],
+        depth: 1,
+    };
+    assert_eq!(n.depth, 1);
 }

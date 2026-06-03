@@ -75,6 +75,11 @@ pub(crate) struct PartitionNode {
     pub bound_expr: String,
     pub sub_strategy: Option<String>,
     pub sub_columns: Vec<String>,
+    /// Absolute tree-depth from the anchor root: the anchor's direct
+    /// children are depth 1, their children depth 2, etc. Populated by
+    /// `list_partition_tree` from the recursive CTE's `depth` column;
+    /// `truncate_partition_tree` keys the level cutoff off it.
+    pub depth: usize,
 }
 
 /// Read the partition descriptor of `source` (schema-qualified or bare).
@@ -200,6 +205,7 @@ pub(crate) fn list_partition_tree(
         SELECT \
             c.relname::text AS bare_name, \
             c.oid::int8 AS node_oid, \
+            t.depth AS node_depth, \
             pc.relname::text AS parent_bare, \
             pg_get_expr(c.relpartbound, c.oid) AS bound_expr, \
             CASE pt.partstrat WHEN 'l' THEN 'LIST' WHEN 'r' THEN 'RANGE' \
@@ -225,6 +231,7 @@ pub(crate) fn list_partition_tree(
             .filter_map(|row| {
                 let bare = row.get_by_name::<&str, _>("bare_name").ok()??.to_string();
                 let oid = row.get_by_name::<i64, _>("node_oid").ok()?? as u32;
+                let depth = row.get_by_name::<i32, _>("node_depth").ok()?? as usize;
                 let parent = row.get_by_name::<&str, _>("parent_bare").ok()??.to_string();
                 let bound = row
                     .get_by_name::<&str, _>("bound_expr")
@@ -252,6 +259,7 @@ pub(crate) fn list_partition_tree(
                     bound_expr: bound,
                     sub_strategy: sub_strategy.filter(|s| s == "LIST" || s == "RANGE"),
                     sub_columns,
+                    depth,
                 })
             })
             .collect(),
