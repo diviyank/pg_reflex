@@ -641,14 +641,14 @@ fn resolve_partitioning(ctx: &mut BuildContext) -> Result<(), String> {
                 return (Vec::new(), String::new(), None);
             }
 
-            // Bare projected output columns of the IMV.
+            // Bare projected output columns of the IMV. A level is mirrorable
+            // only when its partition column appears as a BARE column reference
+            // in the SELECT (not a computed expression like COALESCE). We must
+            // NOT seed from passthrough_columns / the unique key — a column can
+            // be in the unique key yet projected via COALESCE (e.g. a FULL JOIN
+            // coalesced key), which is exactly the case that must prune.
             let projected: std::collections::HashSet<String> = if ctx.plan.is_passthrough {
-                let mut set: std::collections::HashSet<String> = ctx
-                    .plan
-                    .passthrough_columns
-                    .iter()
-                    .map(|c| c.to_lowercase())
-                    .collect();
+                let mut set: std::collections::HashSet<String> = std::collections::HashSet::new();
                 for c in &ctx.analysis.select_columns {
                     if crate::sql_analyzer::is_bare_column_reference(&c.expr_sql) {
                         let name = c.alias.as_deref().unwrap_or(&c.expr_sql);

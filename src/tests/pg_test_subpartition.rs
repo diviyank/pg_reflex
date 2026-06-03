@@ -680,3 +680,53 @@ fn pg_fuzz_subpartition_swap_sequence_matches_recompute() {
     ).expect("oracle").expect("count");
     assert_eq!(drift, 0, "IMV diverged from source recompute after swap sequence");
 }
+
+#[pg_test]
+fn pg_subpart_explicit_two_level_opts_into_subpartitioning() {
+    Spi::run(
+        "CREATE TABLE sstwo (dem_plan_id BIGINT NOT NULL, order_date DATE NOT NULL, qty INT) \
+         PARTITION BY LIST (dem_plan_id)",
+    ).expect("root");
+    Spi::run("CREATE TABLE sstwo_172 PARTITION OF sstwo FOR VALUES IN (172) PARTITION BY RANGE (order_date)")
+        .expect("list child");
+    Spi::run("CREATE TABLE sstwo_172_2025_01 PARTITION OF sstwo_172 FOR VALUES FROM ('2025-01-01') TO ('2025-02-01')")
+        .expect("leaf");
+    Spi::run("INSERT INTO sstwo VALUES (172, '2025-01-15', 10)").expect("seed");
+
+    let r = Spi::get_one::<String>(
+        "SELECT create_reflex_ivm('fcst_deep', \
+            'SELECT dem_plan_id, order_date, qty FROM sstwo', \
+            'dem_plan_id,order_date', NULL, NULL, NULL, ARRAY['dem_plan_id','order_date'])",
+    ).expect("create call").expect("create result");
+    assert!(!r.starts_with("ERROR"), "create failed: {}", r);
+
+    assert!(is_partitioned_rel("fcst_deep_sstwo_172"),
+        "with explicit 2-level partition_by, the dem_plan_id node must sub-partition");
+}
+
+#[pg_test]
+fn pg_subpart_auto_prune_stops_at_non_projected_sublevel() {
+    Spi::run(
+        "CREATE TABLE ssauto (dem_plan_id BIGINT NOT NULL, order_date DATE NOT NULL, qty INT) \
+         PARTITION BY LIST (dem_plan_id)",
+    ).expect("root");
+    Spi::run("CREATE TABLE ssauto_172 PARTITION OF ssauto FOR VALUES IN (172) PARTITION BY RANGE (order_date)")
+        .expect("list child");
+    Spi::run("CREATE TABLE ssauto_172_2025_01 PARTITION OF ssauto_172 FOR VALUES FROM ('2025-01-01') TO ('2025-02-01')")
+        .expect("leaf");
+    Spi::run("INSERT INTO ssauto VALUES (172, '2025-01-15', 10)").expect("seed");
+
+    // 6-arg overload (no partition_by) → auto-mirror. Passing NULL for the
+    // 7-arg text[] partition_by is ambiguous/panics, so auto-mirror must use
+    // the 6-arg form with concrete storage/mode to disambiguate the overload.
+    let r = Spi::get_one::<&str>(
+        "SELECT create_reflex_ivm('fcst_auto', \
+            'SELECT dem_plan_id, COALESCE(order_date, order_date) AS order_date, qty FROM ssauto', \
+            'dem_plan_id,order_date', 'UNLOGGED', 'IMMEDIATE', NULL)",
+    ).expect("create call").expect("create result");
+    assert!(!r.starts_with("ERROR"), "create failed: {}", r);
+
+    assert!(!is_partitioned_rel("fcst_auto_ssauto_172"),
+        "auto-mirror must prune the order_date sub-level (not bare-projected)");
+    assert_eq!(imv_child_count("fcst_auto"), 1);
+}
