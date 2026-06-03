@@ -1,5 +1,34 @@
 # Changelog
 
+## [1.8.3] - 2026-06-03
+
+Opt out of partitioning on a partitioned source: an **empty** `partition_by`
+array (`ARRAY[]::text[]`) now forces an **unpartitioned** target IMV, instead of
+auto-mirroring the source's partitioning. (Omitting `partition_by` still
+auto-mirrors as before — only an explicit empty array opts out.) This is the
+floor of the partition-depth ladder: depth N → … → 1 → **0 (unpartitioned)**.
+
+Such an IMV captures ordinary DML through the source-root trigger normally.
+Source **partition swaps** (`DETACH`/`ATTACH`, which fire no DML trigger) are now
+captured for it too: the `ddl_command_end` event trigger enqueues the source root
+for **any** enabled dependent IMV (previously only partitioned ones), and
+`reflex_flush_partitions` issues a **full reconcile** for each unpartitioned
+dependent of a dirty root. This also fixes a prior silent-staleness gap for *any*
+unpartitioned IMV on a swap-driven partitioned source.
+
+Run `ALTER EXTENSION pg_reflex UPDATE TO '1.8.3';` and replace the `.so`. The
+migration redefines only the event-trigger function (no schema change).
+
+### Added
+
+- **Unpartitioned IMV on a partitioned source** via `partition_by => ARRAY[]::text[]`.
+
+### Fixed
+
+- Unpartitioned IMVs on a partitioned source no longer go silently stale on a
+  source partition swap — the flush full-reconciles them. (Tradeoff: a swap
+  triggers a whole-IMV reconcile, since there are no partitions to scope it.)
+
 ## [1.8.2] - 2026-06-03
 
 Partitioned IMVs can now mirror their source at a **shallower depth** than the
