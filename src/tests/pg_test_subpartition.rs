@@ -947,3 +947,73 @@ fn pg_subpart_shallow_imv_audit_no_drift() {
         "shallow IMV must not be flagged as drifted; report:\n{report}"
     );
 }
+
+// Explicit opt-out: empty partition_by array on a partitioned source forces an
+// UNPARTITIONED target IMV (instead of auto-mirroring into a partitioned one).
+#[pg_test]
+fn pg_subpart_explicit_empty_partition_by_forces_unpartitioned() {
+    Spi::run("CREATE TABLE ssu (dem_plan_id BIGINT NOT NULL, order_date DATE NOT NULL, qty INT) PARTITION BY LIST (dem_plan_id)").expect("root");
+    Spi::run("CREATE TABLE ssu_172 PARTITION OF ssu FOR VALUES IN (172) PARTITION BY RANGE (order_date)").expect("c");
+    Spi::run("CREATE TABLE ssu_172_2025_01 PARTITION OF ssu_172 FOR VALUES FROM ('2025-01-01') TO ('2025-02-01')").expect("l");
+    Spi::run("INSERT INTO ssu VALUES (172, '2025-01-15', 10)").expect("seed");
+
+    // Empty text[] partition_by => explicit unpartitioned (NOT auto-mirror).
+    let r = Spi::get_one::<String>(
+        "SELECT create_reflex_ivm('uimv', 'SELECT dem_plan_id, order_date, qty FROM ssu', \
+         'dem_plan_id,order_date', NULL, NULL, NULL, ARRAY[]::text[])",
+    ).expect("c").expect("r");
+    assert!(!r.starts_with("ERROR"), "create failed: {r}");
+
+    // Plain unpartitioned target: no partition children, not partitioned.
+    assert_eq!(imv_child_count("uimv"), 0);
+    assert!(!is_partitioned_rel("uimv"), "uimv must be a plain unpartitioned table");
+    let parts = Spi::get_one::<i64>(
+        "SELECT COALESCE(array_length(partition_columns,1),0)::int8 FROM public.__reflex_ivm_reference WHERE name='uimv'",
+    ).unwrap().unwrap();
+    assert_eq!(parts, 0, "partition_columns must be empty/NULL");
+    let n = Spi::get_one::<i64>("SELECT count(*)::int8 FROM uimv").unwrap().unwrap();
+    assert_eq!(n, 1);
+}
+
+// An unpartitioned IMV on a partitioned source cannot capture a swap via DML
+// triggers (DETACH/ATTACH fire none). The event trigger enqueues the root and
+// the flush full-reconciles the unpartitioned IMV.
+#[pg_test]
+fn pg_subpart_unpartitioned_imv_full_reconciles_on_source_swap() {
+    Spi::run("CREATE TABLE ssw (dem_plan_id BIGINT NOT NULL, order_date DATE NOT NULL, qty INT) PARTITION BY LIST (dem_plan_id)").expect("root");
+    Spi::run("CREATE TABLE ssw_1 PARTITION OF ssw FOR VALUES IN (1) PARTITION BY RANGE (order_date)").expect("c");
+    Spi::run("CREATE TABLE ssw_1_2025_01 PARTITION OF ssw_1 FOR VALUES FROM ('2025-01-01') TO ('2025-02-01')").expect("l");
+    Spi::run("INSERT INTO ssw VALUES (1, '2025-01-15', 10)").expect("seed");
+
+    let r = Spi::get_one::<String>(
+        "SELECT create_reflex_ivm('uimv2', 'SELECT dem_plan_id, order_date, qty FROM ssw', \
+         'dem_plan_id,order_date', NULL, NULL, NULL, ARRAY[]::text[])",
+    ).expect("c").expect("r");
+    assert!(!r.starts_with("ERROR"), "create failed: {r}");
+    assert_eq!(Spi::get_one::<i64>("SELECT count(*)::int8 FROM uimv2").unwrap().unwrap(), 1);
+
+    // Swap the month leaf for a freshly-built one carrying qty + 1000.
+    Spi::run("ALTER TABLE ssw_1 DETACH PARTITION ssw_1_2025_01").expect("detach");
+    Spi::run("CREATE TABLE ssw_1_2025_01_new (LIKE ssw INCLUDING ALL)").expect("stage");
+    Spi::run("INSERT INTO ssw_1_2025_01_new SELECT dem_plan_id, order_date, qty + 1000 FROM ssw_1_2025_01").expect("fill");
+    Spi::run("DROP TABLE ssw_1_2025_01").expect("dropold");
+    Spi::run("ALTER TABLE ssw_1 ATTACH PARTITION ssw_1_2025_01_new FOR VALUES FROM ('2025-01-01') TO ('2025-02-01')").expect("attach");
+
+    // Targeted flush (not the global no-arg drain) so this test does not race
+    // other parallel #[pg_test]s that share the global pending queue.
+    let res = Spi::get_one::<String>("SELECT reflex_flush_partition_source('public.ssw')").expect("flush").expect("flush");
+    assert!(!res.starts_with("ERROR"), "flush: {res}");
+
+    let q = Spi::get_one::<i64>("SELECT qty::int8 FROM uimv2 WHERE dem_plan_id = 1").unwrap().unwrap();
+    assert_eq!(q, 1010, "unpartitioned IMV must reflect the swap after flush");
+    let drift = Spi::get_one::<i64>(
+        "SELECT count(*) FROM ( \
+            (SELECT dem_plan_id, order_date, qty FROM uimv2 \
+             EXCEPT SELECT dem_plan_id, order_date, qty FROM ssw) \
+            UNION ALL \
+            (SELECT dem_plan_id, order_date, qty FROM ssw \
+             EXCEPT SELECT dem_plan_id, order_date, qty FROM uimv2) \
+         ) d",
+    ).unwrap().unwrap();
+    assert_eq!(drift, 0, "unpartitioned IMV diverged from source after swap+flush");
+}

@@ -50,6 +50,11 @@ pub(crate) struct BuildContext<'a> {
     topk_k: Option<usize>,
     ignore_sources: &'a [String],
     partition_by: &'a [String],
+    /// True when the user explicitly requested an UNPARTITIONED IMV on a
+    /// partitioned source (empty `partition_by` array via the partitioned
+    /// overload). Suppresses auto-mirror so the target stays a plain table.
+    /// Distinct from omitting `partition_by` (which auto-mirrors).
+    explicit_unpartitioned: bool,
 
     // Parsed
     logged: bool,
@@ -446,6 +451,20 @@ fn check_existence_and_cycle(ctx: &BuildContext) -> Option<&'static str> {
 /// `ctx.resolved_partition_cols` and `ctx.resolved_strategy`. Returns error
 /// message string on validation failure (caller re-leaks).
 fn resolve_partitioning(ctx: &mut BuildContext) -> Result<(), String> {
+    // Explicit opt-out: the user asked for an unpartitioned IMV (empty
+    // `partition_by`) even though a source may be partitioned. Skip both the
+    // explicit-validation and auto-mirror paths — leave the IMV a plain table.
+    if ctx.explicit_unpartitioned {
+        ctx.resolved_partition_cols = Vec::new();
+        ctx.resolved_partition_depth = None;
+        info!(
+            "pg_reflex: '{}' created UNPARTITIONED by request (partition_by => []); \
+             source partition swaps will trigger a full reconcile via flush",
+            ctx.view_name
+        );
+        return Ok(());
+    }
+
     ctx.resolved_partition_cols = ctx.partition_by.to_vec();
 
     if !ctx.resolved_partition_cols.is_empty() {
@@ -1620,6 +1639,7 @@ pub(crate) fn create_reflex_ivm_impl(
     topk_k: Option<usize>,
     ignore_sources: &[String],
     partition_by: &[String],
+    explicit_unpartitioned: bool,
 ) -> &'static str {
     create_reflex_ivm_impl_with_materialization(
         view_name,
@@ -1632,6 +1652,7 @@ pub(crate) fn create_reflex_ivm_impl(
         ignore_sources,
         partition_by,
         false, // top-level call: zero-overhead VIEW wrappers are still fine
+        explicit_unpartitioned,
     )
 }
 
@@ -1678,6 +1699,7 @@ pub(crate) fn create_reflex_ivm_impl_with_materialization(
     ignore_sources: &[String],
     partition_by: &[String],
     materialize_as_table: bool,
+    explicit_unpartitioned: bool,
 ) -> &'static str {
     let parsed = match validate_and_parse_inputs(view_name, sql, storage_mode, refresh_mode) {
         Ok(p) => p,
@@ -1823,6 +1845,7 @@ pub(crate) fn create_reflex_ivm_impl_with_materialization(
         topk_k,
         ignore_sources,
         partition_by,
+        explicit_unpartitioned,
         logged,
         deferred,
         storage_upper,
