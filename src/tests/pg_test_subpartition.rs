@@ -681,6 +681,55 @@ fn pg_fuzz_subpartition_swap_sequence_matches_recompute() {
     assert_eq!(drift, 0, "IMV diverged from source recompute after swap sequence");
 }
 
+// Same swap sequence as above, but the IMV is SHALLOW (partition_by depth 1,
+// order_date projected via COALESCE so it can't be a partition level). Each
+// source month swap collapses to a whole-dem_plan_id refill on flush; the
+// logical output must still match a full recompute of the source.
+#[pg_test]
+fn pg_fuzz_subpartition_shallow_swap_sequence_matches_recompute() {
+    Spi::run("CREATE TABLE fzs (dem_plan_id BIGINT NOT NULL, order_date DATE NOT NULL, product_id BIGINT, qty INT) PARTITION BY LIST (dem_plan_id)").expect("root");
+    Spi::run("CREATE TABLE fzs_1 PARTITION OF fzs FOR VALUES IN (1) PARTITION BY RANGE (order_date)").expect("list");
+    Spi::run("CREATE TABLE fzs_1_2025_01 PARTITION OF fzs_1 FOR VALUES FROM ('2025-01-01') TO ('2025-02-01')").expect("m1");
+    Spi::run("CREATE TABLE fzs_1_2025_02 PARTITION OF fzs_1 FOR VALUES FROM ('2025-02-01') TO ('2025-03-01')").expect("m2");
+    Spi::run("CREATE TABLE fzs_1_2025_03 PARTITION OF fzs_1 FOR VALUES FROM ('2025-03-01') TO ('2025-04-01')").expect("m3");
+    Spi::run("INSERT INTO fzs SELECT 1, make_date(2025, (g % 3) + 1, 10), g, g * 10 FROM generate_series(1,30) g").expect("seed");
+    let c = Spi::get_one::<&str>(
+        "SELECT create_reflex_ivm('fzsv','SELECT dem_plan_id, COALESCE(order_date, order_date) AS order_date, product_id, qty FROM fzs', \
+         'dem_plan_id,product_id,order_date', NULL, NULL, NULL, ARRAY['dem_plan_id'])",
+    ).expect("c").expect("c");
+    assert!(!c.starts_with("ERROR"), "create failed: {c}");
+    // The IMV mirrors only the dem_plan_id level (no order_date sub-level).
+    assert!(!is_partitioned_rel("fzsv_fzs_1"), "shallow IMV must not sub-partition");
+
+    for m in 1..=3 {
+        let lo = format!("2025-0{}-01", m);
+        let hi = format!("2025-0{}-01", m + 1);
+        Spi::run(&format!("ALTER TABLE fzs_1 DETACH PARTITION fzs_1_2025_0{}", m)).expect("detach");
+        Spi::run(&format!("CREATE TABLE fzs_1_2025_0{}_new (LIKE fzs INCLUDING ALL)", m)).expect("stage");
+        Spi::run(&format!(
+            "INSERT INTO fzs_1_2025_0{m}_new SELECT dem_plan_id, order_date, product_id, qty + 1000 FROM fzs_1_2025_0{m}",
+            m = m
+        )).expect("fill");
+        Spi::run(&format!("DROP TABLE fzs_1_2025_0{}", m)).expect("dropold");
+        Spi::run(&format!(
+            "ALTER TABLE fzs_1 ATTACH PARTITION fzs_1_2025_0{m}_new FOR VALUES FROM ('{lo}') TO ('{hi}')",
+            m = m, lo = lo, hi = hi
+        )).expect("attach");
+        let _ = Spi::get_one::<String>("SELECT reflex_flush_partitions()").expect("flush").expect("flush");
+    }
+
+    let drift = Spi::get_one::<i64>(
+        "SELECT count(*) FROM ( \
+            (SELECT dem_plan_id, order_date, product_id, qty FROM fzsv \
+             EXCEPT SELECT dem_plan_id, order_date, product_id, qty FROM fzs) \
+            UNION ALL \
+            (SELECT dem_plan_id, order_date, product_id, qty FROM fzs \
+             EXCEPT SELECT dem_plan_id, order_date, product_id, qty FROM fzsv) \
+         ) d",
+    ).expect("oracle").expect("count");
+    assert_eq!(drift, 0, "shallow IMV diverged from source recompute after swap sequence");
+}
+
 #[pg_test]
 fn pg_subpart_explicit_two_level_opts_into_subpartitioning() {
     Spi::run(
