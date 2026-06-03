@@ -882,7 +882,7 @@ pub(crate) fn reflex_sync_partitions_impl(view_name: &str, drop_orphans: bool) -
         // Load partition metadata.
         let meta = client
             .select(
-                "SELECT partition_columns, partition_strategy, depends_on, storage_mode \
+                "SELECT partition_columns, partition_strategy, depends_on, storage_mode, partition_depth \
                  FROM public.__reflex_ivm_reference WHERE name = $1",
                 Some(1),
                 &[unsafe {
@@ -916,6 +916,8 @@ pub(crate) fn reflex_sync_partitions_impl(view_name: &str, drop_orphans: bool) -
             .unwrap_or(None)
             .unwrap_or("UNLOGGED")
             .eq_ignore_ascii_case("UNLOGGED");
+        let partition_depth: Option<i32> =
+            row.get_by_name::<i32, _>("partition_depth").unwrap_or(None);
 
         // Resolve anchor source.
         let anchor = resolve_anchor_source(client, &part_cols[0], &sources)
@@ -923,7 +925,11 @@ pub(crate) fn reflex_sync_partitions_impl(view_name: &str, drop_orphans: bool) -
 
         // Read source partition tree (all descendants, not just one level).
         let (_, anchor_root_bare) = split_qualified_name(&anchor);
-        let nodes = list_partition_tree(client, &anchor);
+        let full_nodes = list_partition_tree(client, &anchor);
+        let mirror_depth = partition_depth
+            .map(|d| d as usize)
+            .unwrap_or_else(|| max_tree_depth(&full_nodes));
+        let nodes = truncate_partition_tree(full_nodes, mirror_depth);
         let int_parent = intermediate_table_name(view_name);
         let tgt_parent = quote_identifier(view_name);
         // Passthrough IMVs (no aggregation / ivm-count) have no intermediate

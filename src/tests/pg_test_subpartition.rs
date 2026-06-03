@@ -752,3 +752,50 @@ fn pg_subpart_shallow_imv_persists_partition_depth() {
     ).unwrap();
     assert_eq!(d, Some(1));
 }
+
+#[pg_test]
+fn pg_subpart_sync_does_not_redeepen_shallow_imv() {
+    Spi::run(
+        "CREATE TABLE ssn (dem_plan_id BIGINT NOT NULL, order_date DATE NOT NULL, qty INT) \
+         PARTITION BY LIST (dem_plan_id)",
+    ).expect("root");
+    Spi::run("CREATE TABLE ssn_172 PARTITION OF ssn FOR VALUES IN (172) PARTITION BY RANGE (order_date)").expect("c");
+    Spi::run("CREATE TABLE ssn_172_2025_01 PARTITION OF ssn_172 FOR VALUES FROM ('2025-01-01') TO ('2025-02-01')").expect("l");
+    Spi::run("INSERT INTO ssn VALUES (172, '2025-01-15', 1)").expect("seed");
+    let r = Spi::get_one::<&str>(
+        "SELECT create_reflex_ivm('fcst_sync', \
+            'SELECT dem_plan_id, COALESCE(order_date, order_date) AS order_date, qty FROM ssn', \
+            'dem_plan_id,order_date', NULL, NULL, NULL, ARRAY['dem_plan_id'])",
+    ).expect("c").expect("r");
+    assert!(!r.starts_with("ERROR"), "create failed: {r}");
+
+    // Sync must NOT add the order_date sub-level back.
+    Spi::run("SELECT reflex_sync_partitions('fcst_sync', true)").expect("sync");
+    assert!(!is_partitioned_rel("fcst_sync_ssn_172"),
+        "sync must respect mirror_depth=1 and not re-deepen");
+    assert_eq!(imv_child_count("fcst_sync"), 1);
+}
+
+#[pg_test]
+fn pg_subpart_null_depth_mirrors_full_source() {
+    Spi::run(
+        "CREATE TABLE ssf (dem_plan_id BIGINT NOT NULL, order_date DATE NOT NULL, qty INT) \
+         PARTITION BY LIST (dem_plan_id)",
+    ).expect("root");
+    Spi::run("CREATE TABLE ssf_172 PARTITION OF ssf FOR VALUES IN (172) PARTITION BY RANGE (order_date)").expect("c");
+    Spi::run("CREATE TABLE ssf_172_2025_01 PARTITION OF ssf_172 FOR VALUES FROM ('2025-01-01') TO ('2025-02-01')").expect("l");
+    Spi::run("INSERT INTO ssf VALUES (172, '2025-01-15', 1)").expect("seed");
+    // 2-level explicit -> full depth; partition_depth = 2.
+    let r = Spi::get_one::<&str>(
+        "SELECT create_reflex_ivm('fcst_full', \
+            'SELECT dem_plan_id, order_date, qty FROM ssf', \
+            'dem_plan_id,order_date', NULL, NULL, NULL, ARRAY['dem_plan_id','order_date'])",
+    ).expect("c").expect("r");
+    assert!(!r.starts_with("ERROR"), "create failed: {r}");
+    // Simulate a legacy row: NULL out partition_depth; sync must STILL mirror
+    // the full 2 levels (NULL => full depth).
+    Spi::run("UPDATE public.__reflex_ivm_reference SET partition_depth = NULL WHERE name = 'fcst_full'").expect("u");
+    Spi::run("SELECT reflex_sync_partitions('fcst_full', true)").expect("sync");
+    assert!(is_partitioned_rel("fcst_full_ssf_172"),
+        "NULL partition_depth must mirror full source depth (no truncation)");
+}
