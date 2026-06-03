@@ -294,7 +294,7 @@ The lever is one pure function, `partition::truncate_partition_tree(nodes, mirro
 
 Capture stays **leaf-granular and maps up**: a sub-partition `DETACH`/`ATTACH` does not change the parent node's oid, so the snapshot keeps tracking the deepest source leaves; the changed leaf is mapped up to its depth-`mirror_depth` ancestor (via `ancestor_bare_at_depth` over the live tree, or the snapshot's `ancestors TEXT[]` column for a vanished leaf) and that whole top-level IMV partition is atomically refilled. Coarser than a month-granular swap, never incorrect. When `partition_depth` is `NULL`, `mirror_depth == leaf depth` and every up-map is the identity, so full-depth IMVs behave exactly as in 1.8.1.
 
-#### Depth 0 — unpartitioned target on a partitioned source (1.8.3)
+#### Depth 0 — unpartitioned target on a partitioned source
 
 The floor of the ladder is an **unpartitioned** IMV on a partitioned source. Passing an **empty** `partition_by` (`ARRAY[]::text[]`, the `explicit_unpartitioned` flag) suppresses auto-mirror so the target is a plain table; omitting `partition_by` still auto-mirrors. Ordinary DML is captured by the source-root statement trigger as usual. Partition **swaps** fire no DML trigger and the IMV has no partitions to scope a reconcile, so capture is by **full reconcile**: the `ddl_command_end` event trigger enqueues the source root for *any* enabled dependent IMV (not only partitioned ones), and `reflex_flush_partitions` runs `reflex_reconcile(view)` for each unpartitioned dependent of a dirty root. This also closes a prior silent-staleness gap for any unpartitioned IMV on a swap-driven source. The cost is a whole-IMV reconcile per swap (no partition-scoped reader availability) — the documented tradeoff of opting out of partitioning.
 
