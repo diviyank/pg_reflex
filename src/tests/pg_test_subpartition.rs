@@ -730,3 +730,25 @@ fn pg_subpart_auto_prune_stops_at_non_projected_sublevel() {
         "auto-mirror must prune the order_date sub-level (not bare-projected)");
     assert_eq!(imv_child_count("fcst_auto"), 1);
 }
+
+#[pg_test]
+fn pg_subpart_shallow_imv_persists_partition_depth() {
+    Spi::run(
+        "CREATE TABLE ssp (dem_plan_id BIGINT NOT NULL, order_date DATE NOT NULL, qty INT) \
+         PARTITION BY LIST (dem_plan_id)",
+    ).expect("root");
+    Spi::run("CREATE TABLE ssp_172 PARTITION OF ssp FOR VALUES IN (172) PARTITION BY RANGE (order_date)").expect("c");
+    Spi::run("CREATE TABLE ssp_172_2025_01 PARTITION OF ssp_172 FOR VALUES FROM ('2025-01-01') TO ('2025-02-01')").expect("l");
+    Spi::run("INSERT INTO ssp VALUES (172, '2025-01-15', 1)").expect("seed");
+    let r = Spi::get_one::<&str>(
+        "SELECT create_reflex_ivm('fcst_depth', \
+            'SELECT dem_plan_id, COALESCE(order_date, order_date) AS order_date, qty FROM ssp', \
+            'dem_plan_id,order_date', NULL, NULL, NULL, ARRAY['dem_plan_id'])",
+    ).expect("c").expect("r");
+    assert!(!r.starts_with("ERROR"), "create failed: {r}");
+
+    let d = Spi::get_one::<i32>(
+        "SELECT partition_depth FROM public.__reflex_ivm_reference WHERE name = 'fcst_depth'",
+    ).unwrap();
+    assert_eq!(d, Some(1));
+}

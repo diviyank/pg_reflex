@@ -1467,6 +1467,7 @@ fn persist_metadata(client: &mut SpiClient<'_>, ctx: &BuildContext) {
             ignored_sources: Some(&ignored_sources_vec),
             partition_columns: Some(&ctx.plan.partition_columns),
             partition_strategy: Some(&ctx.plan.partition_strategy),
+            partition_depth: ctx.resolved_partition_depth,
             max_one_row,
         },
     )
