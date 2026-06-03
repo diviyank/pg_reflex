@@ -2,6 +2,64 @@ use super::*;
 use crate::aggregation::{AggregationPlan, EndQueryMapping, IntermediateColumn};
 use crate::schema_builder::build_trigger_ddls;
 
+/// No column needs a `::text` cast → the net-delta view must be a plain
+/// `EXCEPT ALL` (O(n) multiset difference), not the row_number anti-join.
+#[test]
+fn netted_view_without_text_cast_uses_except_all() {
+    let sql = build_netted_view_sql(
+        "__reflex_new_src",
+        "\"id\", \"v\"",
+        "\"id\", \"v\"",
+        "__reflex_delta_src",
+        "'I', 'U_NEW'",
+        "'D', 'U_OLD'",
+        false,
+    );
+    assert!(sql.contains("EXCEPT ALL"), "must use EXCEPT ALL: {sql}");
+    assert!(
+        !sql.contains("row_number"),
+        "no-cast path needs no row_number machinery: {sql}"
+    );
+    assert!(
+        !sql.contains("IS NOT DISTINCT FROM"),
+        "no-cast path needs no per-column filter join: {sql}"
+    );
+}
+
+/// A `json`/`xml` column forces `::text` in the cmp columns (no equality
+/// operator → `EXCEPT ALL` impossible). The fallback must compare a sortable
+/// `ROW(...)` record as the equi-join key — NOT the old `row_number`-only
+/// equi-key with the per-column `IS NOT DISTINCT FROM` relegated to the join
+/// filter, which collapsed to O(n²) when every row is unique.
+#[test]
+fn netted_view_with_text_cast_uses_record_key_antijoin() {
+    let sql = build_netted_view_sql(
+        "__reflex_new_src",
+        "\"id\", \"doc\"",
+        "\"id\", \"doc\"::text",
+        "__reflex_delta_src",
+        "'I', 'U_NEW'",
+        "'D', 'U_OLD'",
+        true,
+    );
+    assert!(
+        sql.contains("ROW(\"id\", \"doc\"::text) AS __reflex_nk"),
+        "must build a record comparison key: {sql}"
+    );
+    assert!(
+        sql.contains("o.__reflex_nk = n.__reflex_nk"),
+        "record key must be an equi-join condition (hashable/sortable): {sql}"
+    );
+    assert!(
+        sql.contains("row_number()"),
+        "fallback must keep row_number for multiplicity: {sql}"
+    );
+    assert!(
+        !sql.contains("IS NOT DISTINCT FROM"),
+        "the un-hashable per-column filter join must be gone: {sql}"
+    );
+}
+
 fn simple_plan() -> AggregationPlan {
     AggregationPlan {
         group_by_columns: vec!["city".to_string()],

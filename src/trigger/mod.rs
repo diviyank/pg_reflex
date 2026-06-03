@@ -501,6 +501,8 @@ mod dispatch;
 mod merge;
 mod ops;
 
+#[cfg(test)]
+pub(crate) use deferred::build_netted_view_sql;
 pub(crate) use dispatch::*;
 pub(crate) use merge::*;
 pub(crate) use ops::*;

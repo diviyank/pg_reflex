@@ -3,6 +3,66 @@ use crate::query_decomposer::staging_delta_table_name;
 use pgrx::datum::DatumWithOid;
 use pgrx::PgBuiltInOids;
 
+/// Builds the `CREATE TEMP VIEW` that nets one side of a staged delta against
+/// the other (multiset difference / `EXCEPT ALL` semantics): a row appearing
+/// identically on both the new side (`I`, `U_NEW`) and the old side (`D`,
+/// `U_OLD`) contributes zero net change and is dropped from both. This
+/// telescopes `I→U→…→U` chains to the single surviving row per key and is a
+/// no-op for every IMV shape (an old/new pair already nets to zero in both the
+/// passthrough delete+insert and the aggregate decrement+increment). Without it
+/// a key touched twice before the flush stages two new-side rows and trips the
+/// unique constraint (docs/fuzz-findings.md finding #2).
+///
+/// Two equivalent strategies, chosen by `any_text_cast`:
+///
+/// * No column needs a text cast (the common case): emit `EXCEPT ALL` directly.
+///   It is exactly multiset difference, NULL-safe, and the planner runs it as a
+///   single hashed/sorted set op — O(n).
+///
+/// * A `json`/`xml` column is present: those types have no equality operator, so
+///   `EXCEPT ALL` over the raw projection cannot run. Fall back to an anti-join
+///   that compares a `ROW(...)` of the text-cast `cmp` columns. Comparing the
+///   materialised record with `=` uses NULL-safe `record_eq` (so identical
+///   NULL-bearing rows still cancel), and `row_number()` over the identical-row
+///   partition preserves multiplicity. The record key is sortable/hashable, so
+///   the planner uses a merge/hash anti-join — O(n log n). The earlier form put
+///   the per-column `IS NOT DISTINCT FROM` in the join *filter* with only
+///   `row_number` as the equi-key; when every row is unique that key collapses
+///   to the constant 1, collapsing the anti-join to an O(n²) cross-comparison.
+pub(crate) fn build_netted_view_sql(
+    view: &str,
+    projection: &str,
+    cmp_csv: &str,
+    delta_tbl: &str,
+    keep: &str,
+    drop: &str,
+    any_text_cast: bool,
+) -> String {
+    if !any_text_cast {
+        return format!(
+            "CREATE OR REPLACE TEMP VIEW {view} AS \
+             SELECT {projection} FROM {delta_tbl} WHERE __reflex_op IN ({keep}) \
+             EXCEPT ALL \
+             SELECT {projection} FROM {delta_tbl} WHERE __reflex_op IN ({drop})"
+        );
+    }
+    format!(
+        "CREATE OR REPLACE TEMP VIEW {view} AS \
+         SELECT {projection} FROM ( \
+           SELECT {projection}, ROW({cmp_csv}) AS __reflex_nk, \
+                  row_number() OVER (PARTITION BY {cmp_csv}) AS __reflex_rn \
+           FROM {delta_tbl} WHERE __reflex_op IN ({keep}) \
+         ) n \
+         WHERE NOT EXISTS ( \
+           SELECT 1 FROM ( \
+             SELECT ROW({cmp_csv}) AS __reflex_nk, \
+                    row_number() OVER (PARTITION BY {cmp_csv}) AS __reflex_rn \
+             FROM {delta_tbl} WHERE __reflex_op IN ({drop}) \
+           ) o WHERE o.__reflex_rn = n.__reflex_rn AND o.__reflex_nk = n.__reflex_nk \
+         )"
+    )
+}
+
 /// Flushes all accumulated deferred deltas for a given source table.
 ///
 /// Called by the deferred constraint trigger at COMMIT time.
@@ -237,47 +297,37 @@ pub fn reflex_flush_deferred(source_table: &str) -> String {
         // passthrough delete+insert and the aggregate decrement+increment.
         //
         // Matching uses `cmp_cols` (json/xml cast to text) so types without an
-        // equality operator do not break the comparison, `IS NOT DISTINCT FROM`
-        // so NULLs match, and `row_number()` over the identical-row partition so
-        // the cancellation preserves multiplicity (true `EXCEPT ALL` semantics).
-        let cmp_aliased = cmp_cols
-            .iter()
-            .enumerate()
-            .map(|(i, c)| format!("{} AS __reflex_c{}", c, i))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let cmp_partition = cmp_cols.join(", ");
-        let cmp_indf = (0..cmp_cols.len())
-            .map(|i| format!("n.__reflex_c{i} IS NOT DISTINCT FROM o.__reflex_c{i}"))
-            .collect::<Vec<_>>()
-            .join(" AND ");
-        let netted_view = |view: &str, keep: &str, drop: &str| {
-            format!(
-                "CREATE OR REPLACE TEMP VIEW {view} AS \
-                 SELECT {projection} FROM ( \
-                   SELECT {projection}, {cmp_aliased}, \
-                          row_number() OVER (PARTITION BY {cmp_partition}) AS __reflex_rn \
-                   FROM {delta_tbl} WHERE __reflex_op IN ({keep}) \
-                 ) n \
-                 WHERE NOT EXISTS ( \
-                   SELECT 1 FROM ( \
-                     SELECT {cmp_aliased}, \
-                            row_number() OVER (PARTITION BY {cmp_partition}) AS __reflex_rn \
-                     FROM {delta_tbl} WHERE __reflex_op IN ({drop}) \
-                   ) o WHERE o.__reflex_rn = n.__reflex_rn AND {cmp_indf} \
-                 )"
-            )
-        };
+        // equality operator do not break the comparison. See
+        // `build_netted_view_sql` for the two equivalent strategies (set-op vs
+        // record-key anti-join) and why the choice hinges on `any_text_cast`.
+        let cmp_csv = cmp_cols.join(", ");
+        let any_text_cast = src_cols_with_types.iter().any(|(_, t)| needs_text_cast(t));
         client
             .update(
-                &netted_view(&new_view, "'I', 'U_NEW'", "'D', 'U_OLD'"),
+                &build_netted_view_sql(
+                    &new_view,
+                    &projection,
+                    &cmp_csv,
+                    &delta_tbl,
+                    "'I', 'U_NEW'",
+                    "'D', 'U_OLD'",
+                    any_text_cast,
+                ),
                 None,
                 &[],
             )
             .unwrap_or_report();
         client
             .update(
-                &netted_view(&old_view, "'D', 'U_OLD'", "'I', 'U_NEW'"),
+                &build_netted_view_sql(
+                    &old_view,
+                    &projection,
+                    &cmp_csv,
+                    &delta_tbl,
+                    "'D', 'U_OLD'",
+                    "'I', 'U_NEW'",
+                    any_text_cast,
+                ),
                 None,
                 &[],
             )

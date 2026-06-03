@@ -467,6 +467,66 @@ fn test_deferred_passthrough_all_ops() {
     assert_imv_correct("dfpa_view", fresh);
 }
 
+/// Net-delta dedup: same-batch telescope + spurious no-op update.
+/// INSERTing a key then UPDATEing it before the flush stages I(v0),
+/// U_OLD(v0), U_NEW(v1) for that key; the netting must cancel v0 so the
+/// passthrough INSERT adds only v1 (else duplicate key on __reflex_uk). A
+/// genuine no-op UPDATE (U_OLD == U_NEW) must net to zero. Exercises the
+/// EXCEPT ALL path (no json/xml column).
+#[pg_test]
+fn test_deferred_netting_telescope_no_dupkey() {
+    Spi::run("CREATE TABLE dnt (id INT PRIMARY KEY, k TEXT NOT NULL, v INT)").expect("create");
+    Spi::run("INSERT INTO dnt VALUES (1,'a',10),(2,'b',20)").expect("seed");
+    crate::create_reflex_ivm(
+        "dnt_view",
+        "SELECT id, k, v FROM dnt",
+        Some("id"),
+        None,
+        Some("DEFERRED"),
+        None,
+    );
+    let fresh = "SELECT id, k, v FROM dnt";
+    assert_imv_correct("dnt_view", fresh);
+
+    Spi::run("INSERT INTO dnt VALUES (3,'c',30)").expect("insert");
+    Spi::run("UPDATE dnt SET v = 31 WHERE id = 3").expect("telescope update");
+    Spi::run("UPDATE dnt SET v = 10 WHERE id = 1").expect("no-op update");
+    Spi::run("SELECT reflex_flush_deferred('dnt')").expect("flush");
+    assert_imv_correct("dnt_view", fresh);
+}
+
+/// Net-delta dedup on the pathological all-rows-unique batch (the O(n²)
+/// regression): bulk-UPDATE every row of a passthrough IMV with distinct
+/// keys, including NULL-bearing columns to exercise NULL-safe cancellation.
+#[pg_test]
+fn test_deferred_passthrough_bulk_unique_update_with_nulls() {
+    Spi::run("CREATE TABLE dbu (id INT PRIMARY KEY, k TEXT NOT NULL, v INT, note TEXT)")
+        .expect("create");
+    Spi::run(
+        "INSERT INTO dbu SELECT g, 'k'||g, g, \
+         CASE WHEN g % 5 = 0 THEN NULL ELSE 'n'||g END FROM generate_series(1, 2000) g",
+    )
+    .expect("seed");
+    crate::create_reflex_ivm(
+        "dbu_view",
+        "SELECT id, k, v, note FROM dbu",
+        Some("id"),
+        None,
+        Some("DEFERRED"),
+        None,
+    );
+    let fresh = "SELECT id, k, v, note FROM dbu";
+    assert_imv_correct("dbu_view", fresh);
+
+    Spi::run(
+        "UPDATE dbu SET v = v + 1000, \
+         note = CASE WHEN id % 3 = 0 THEN NULL ELSE note || 'x' END",
+    )
+    .expect("bulk update");
+    Spi::run("SELECT reflex_flush_deferred('dbu')").expect("flush");
+    assert_imv_correct("dbu_view", fresh);
+}
+
 /// Regression for journal/2026-04-21_min_max_recompute_bug.md:
 /// DEFERRED DELETE on a source feeding a BOOL_OR aggregate whose argument
 /// references a LEFT JOIN alias. The recompute step used to emit a scalar

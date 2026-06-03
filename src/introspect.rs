@@ -266,9 +266,19 @@ fn reflex_ivm_histogram(
     TableIterator::new(row.into_iter().collect::<Vec<_>>())
 }
 
-/// Returns the EXPLAIN output of what the next flush would execute for a given IMV.
-/// Useful for diagnosing plan regressions without actually firing a flush.
-#[pg_extern]
+/// Returns the `EXPLAIN` statement for what the next flush would execute for a
+/// given IMV, ready to run. Useful for diagnosing plan regressions without
+/// firing a flush.
+///
+/// It returns the SQL rather than executing `EXPLAIN` itself: `EXPLAIN` is a
+/// utility statement, and PostgreSQL forbids utility statements under a
+/// read-only SPI context — which is the context of this function when it is
+/// called from a plain top-level `SELECT` (raising the misleadingly worded
+/// "EXPLAIN is not allowed in a non-volatile function" even though this function
+/// is `VOLATILE`). Returning the statement sidesteps that entirely: it works in
+/// any context (including read-only transactions and standbys) and lets the
+/// caller choose `EXPLAIN ANALYZE`, `FORMAT JSON`, etc.
+#[pg_extern(volatile)]
 fn reflex_explain_flush(view_name: &str) -> String {
     let args =
         [
@@ -291,23 +301,10 @@ fn reflex_explain_flush(view_name: &str) -> String {
                     .map(|s| s.to_string())
             })
     });
-    let base = match base {
-        Some(b) if !b.is_empty() => b,
-        _ => return format!("ERROR: no registered IMV '{}'", view_name),
-    };
-    let explain_sql = format!("EXPLAIN (VERBOSE, COSTS ON) {}", base);
-    let lines: Vec<String> = Spi::connect(|client| {
-        client
-            .select(&explain_sql, None, &[])
-            .unwrap_or_report()
-            .filter_map(|r| {
-                r.get_by_name::<&str, _>("QUERY PLAN")
-                    .unwrap_or(None)
-                    .map(|s| s.to_string())
-            })
-            .collect()
-    });
-    lines.join("\n")
+    match base {
+        Some(b) if !b.is_empty() => format!("EXPLAIN (VERBOSE, COSTS ON) {}", b),
+        _ => format!("ERROR: no registered IMV '{}'", view_name),
+    }
 }
 
 fn quote_ident(name: &str) -> String {
