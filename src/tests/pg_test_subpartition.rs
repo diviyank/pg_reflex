@@ -828,3 +828,34 @@ fn pg_subpart_shallow_reconcile_refills_dem_plan_node() {
     let n = Spi::get_one::<i64>("SELECT count(*)::int8 FROM fcst_rec WHERE dem_plan_id = 172").unwrap().unwrap();
     assert_eq!(n, 3);
 }
+
+#[pg_test]
+fn pg_subpart_shallow_flush_attach_month_collapses_into_node() {
+    Spi::run(
+        "CREATE TABLE ssm (dem_plan_id BIGINT NOT NULL, order_date DATE NOT NULL, qty INT) \
+         PARTITION BY LIST (dem_plan_id)",
+    ).expect("root");
+    Spi::run("CREATE TABLE ssm_172 PARTITION OF ssm FOR VALUES IN (172) PARTITION BY RANGE (order_date)").expect("c");
+    Spi::run("CREATE TABLE ssm_172_2025_01 PARTITION OF ssm_172 FOR VALUES FROM ('2025-01-01') TO ('2025-02-01')").expect("l1");
+    Spi::run("INSERT INTO ssm VALUES (172, '2025-01-15', 10)").expect("seed");
+    let c = Spi::get_one::<&str>(
+        "SELECT create_reflex_ivm('fcst_flush', \
+            'SELECT dem_plan_id, COALESCE(order_date, order_date) AS order_date, qty FROM ssm', \
+            'dem_plan_id,order_date', NULL, NULL, NULL, ARRAY['dem_plan_id'])",
+    ).expect("c").expect("r");
+    assert!(!c.starts_with("ERROR"), "create failed: {c}");
+
+    // Attach a brand-new month leaf to the source (DDL — no DML trigger).
+    Spi::run("CREATE TABLE ssm_172_2025_02 (LIKE ssm_172 INCLUDING ALL)").expect("staging");
+    Spi::run("INSERT INTO ssm_172_2025_02 VALUES (172, '2025-02-15', 20)").expect("fill staging");
+    Spi::run("ALTER TABLE ssm_172 ATTACH PARTITION ssm_172_2025_02 FOR VALUES FROM ('2025-02-01') TO ('2025-03-01')").expect("attach");
+
+    // Flush the source root.
+    let res = Spi::get_one::<String>("SELECT reflex_flush_partition_source('public.ssm')").expect("flush").expect("res");
+    assert!(!res.starts_with("ERROR"), "flush failed: {}", res);
+
+    // IMV still has exactly ONE child (dem_plan_id node), now holding both months.
+    assert_eq!(imv_child_count("fcst_flush"), 1);
+    let n = Spi::get_one::<i64>("SELECT count(*)::int8 FROM fcst_flush").unwrap().unwrap();
+    assert_eq!(n, 2);
+}

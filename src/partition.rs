@@ -1830,9 +1830,9 @@ pub(crate) fn reflex_flush_partitions_impl(only: Option<&str>) -> String {
             // create-time seed / prior flush, regardless of bare vs qualified.
             let root_key = canonical_root_key(client, root);
             // Partitioned IMVs depending on this source root.
-            let imvs: Vec<String> = client
+            let imvs: Vec<(String, Option<i32>, Vec<String>)> = client
                 .select(
-                    "SELECT name FROM public.__reflex_ivm_reference \
+                    "SELECT name, partition_depth, depends_on FROM public.__reflex_ivm_reference \
                      WHERE partition_columns IS NOT NULL AND array_length(partition_columns,1) > 0 \
                        AND (depends_on @> ARRAY[$1] OR depends_on @> ARRAY[split_part($1,'.',2)])",
                     None,
@@ -1840,10 +1840,14 @@ pub(crate) fn reflex_flush_partitions_impl(only: Option<&str>) -> String {
                 )
                 .map_err(|e| format!("flush: imv lookup failed: {}", e))?
                 .filter_map(|r| {
-                    r.get_by_name::<&str, _>("name")
+                    let name = r.get_by_name::<&str, _>("name").ok().flatten()?.to_string();
+                    let depth = r.get_by_name::<i32, _>("partition_depth").ok().flatten();
+                    let deps = r
+                        .get_by_name::<Vec<String>, _>("depends_on")
                         .ok()
                         .flatten()
-                        .map(|s| s.to_string())
+                        .unwrap_or_default();
+                    Some((name, depth, deps))
                 })
                 .collect();
 
@@ -1862,25 +1866,78 @@ pub(crate) fn reflex_flush_partitions_impl(only: Option<&str>) -> String {
                 })
                 .collect();
 
+            // Snapshot ancestors (per child_name, for up-mapping drops in shallow IMVs).
+            let snapshot_ancestors: std::collections::HashMap<String, Vec<String>> = client
+                .select(
+                    "SELECT child_name, COALESCE(ancestors, ARRAY[]::TEXT[]) AS ancestors \
+                     FROM public.__reflex_source_partition_snapshot WHERE source_root = $1",
+                    None,
+                    &[unsafe { DatumWithOid::new(root_key.clone(), pgrx::pg_sys::TEXTOID) }],
+                )
+                .map_err(|e| format!("flush: snapshot ancestors read failed: {}", e))?
+                .filter_map(|r| {
+                    let n = r
+                        .get_by_name::<&str, _>("child_name")
+                        .ok()
+                        .flatten()?
+                        .to_string();
+                    let a = r
+                        .get_by_name::<Vec<String>, _>("ancestors")
+                        .ok()
+                        .flatten()
+                        .unwrap_or_default();
+                    Some((n, a))
+                })
+                .collect();
+
             let current = current_source_leaf_oids(client, root);
             let actions = classify_partition_diff(&snapshot, &current);
+            let live_tree = list_partition_tree(client, root);
 
-            for imv in &imvs {
-                // Drops MUST run before attaches: when a source leaf is replaced
-                // by a differently-named partition (e.g. detach old, attach a
-                // freshly-built table), the diff yields a Drop (old) plus an
-                // AttachNew (new) sharing the same bound. Attaching the new IMV
-                // leaf before dropping the old one would overlap its partition
-                // range. Same-name swaps (SwapFill) replace in place via the
-                // executor's atomic DETACH/ATTACH and never overlap.
-                for (src_leaf, _) in actions
-                    .iter()
-                    .filter(|(_, a)| *a == PartitionDiffAction::Drop)
-                {
-                    let (schema_opt, _) = split_qualified_name(imv);
-                    let schema = schema_opt.unwrap_or("public");
-                    let tgt = target_child_name(imv, src_leaf);
-                    let int = intermediate_child_name(imv, src_leaf);
+            for (imv, depth_opt, _deps) in &imvs {
+                let mirror_depth = depth_opt
+                    .map(|d| d as usize)
+                    .unwrap_or_else(|| max_tree_depth(&live_tree));
+
+                use std::collections::BTreeSet;
+                let mut to_swap: BTreeSet<String> = BTreeSet::new();
+                let mut to_drop: BTreeSet<String> = BTreeSet::new();
+
+                let live_names: std::collections::HashSet<&str> =
+                    live_tree.iter().map(|n| n.bare_name.as_str()).collect();
+
+                for (leaf, action) in &actions {
+                    match action {
+                        PartitionDiffAction::SwapFill | PartitionDiffAction::AttachNew => {
+                            let chain = leaf_ancestor_chain(&live_tree, leaf);
+                            let node = ancestor_bare_at_depth(&chain, leaf, mirror_depth)
+                                .unwrap_or_else(|| leaf.clone());
+                            to_swap.insert(node);
+                        }
+                        PartitionDiffAction::Drop => {
+                            let chain = snapshot_ancestors.get(leaf).cloned().unwrap_or_default();
+                            let node = ancestor_bare_at_depth(&chain, leaf, mirror_depth)
+                                .unwrap_or_else(|| leaf.clone());
+                            if live_names.contains(node.as_str()) {
+                                // Sibling removed, ancestor survives -> refill it.
+                                to_swap.insert(node);
+                            } else {
+                                // Whole mirror-depth node gone -> drop IMV node.
+                                to_drop.insert(node);
+                            }
+                        }
+                    }
+                }
+                // A node both dropped and swap-filled: drop wins (it is gone).
+                for d in &to_drop {
+                    to_swap.remove(d);
+                }
+
+                let (schema_opt, _) = split_qualified_name(imv);
+                let schema = schema_opt.unwrap_or("public");
+                for node in &to_drop {
+                    let tgt = target_child_name(imv, node);
+                    let int = intermediate_child_name(imv, node);
                     let _ = client.update(
                         &format!("DROP TABLE IF EXISTS \"{}\".\"{}\" CASCADE", schema, tgt),
                         None,
@@ -1892,20 +1949,15 @@ pub(crate) fn reflex_flush_partitions_impl(only: Option<&str>) -> String {
                         &[],
                     );
                 }
-                for (src_leaf, _) in actions.iter().filter(|(_, a)| {
-                    matches!(
-                        a,
-                        PartitionDiffAction::AttachNew | PartitionDiffAction::SwapFill
-                    )
-                }) {
+                for node in &to_swap {
                     let q = format!(
                         "SELECT public.reflex_reconcile_partition({}, '', {})",
                         sql_literal_text(imv),
-                        sql_literal_text(src_leaf)
+                        sql_literal_text(node)
                     );
                     client
                         .update(&q, None, &[])
-                        .map_err(|e| format!("flush reconcile {} {}: {}", imv, src_leaf, e))?;
+                        .map_err(|e| format!("flush reconcile {} {}: {}", imv, node, e))?;
                 }
                 summary.push(format!("{}: {} change(s)", imv, actions.len()));
             }
