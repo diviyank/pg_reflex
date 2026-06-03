@@ -316,6 +316,7 @@ fn create_reflex_ivm(
         Some(DEFAULT_TOPK_K),
         &ignore_vec,
         &[],
+        false,
     )
 }
 
@@ -345,6 +346,8 @@ fn create_reflex_ivm_partitioned(
         Some(DEFAULT_TOPK_K),
         &ignore_vec,
         &part_cols,
+        // empty partition_by (explicit) => force unpartitioned on a partitioned source
+        part_cols.is_empty(),
     )
 }
 
@@ -369,6 +372,7 @@ fn create_reflex_ivm_with_topk(
         if topk > 0 { Some(topk as usize) } else { None },
         &ignore_vec,
         &[],
+        false,
     )
 }
 
@@ -396,6 +400,8 @@ fn create_reflex_ivm_with_topk_partitioned(
         if topk > 0 { Some(topk as usize) } else { None },
         &ignore_vec,
         &part_cols,
+        // empty partition_by (explicit) => force unpartitioned on a partitioned source
+        part_cols.is_empty(),
     )
 }
 
@@ -419,6 +425,7 @@ fn create_reflex_ivm_if_not_exists(
         Some(DEFAULT_TOPK_K),
         &ignore_vec,
         &[],
+        false,
     )
 }
 
@@ -444,6 +451,8 @@ fn create_reflex_ivm_if_not_exists_partitioned(
         Some(DEFAULT_TOPK_K),
         &ignore_vec,
         &part_cols,
+        // empty partition_by (explicit) => force unpartitioned on a partitioned source
+        part_cols.is_empty(),
     )
 }
 
@@ -883,9 +892,12 @@ extension_sql!(
                        WHERE r.name = _part_root OR r.name = split_part(_part_root, '.', 2)
                    )
                    AND EXISTS (
+                       -- Enqueue for ANY enabled IMV depending on this root:
+                       -- partitioned IMVs reconcile per-partition; unpartitioned
+                       -- IMVs get a full reconcile (flush handles both). Without
+                       -- this, an unpartitioned IMV on a swap source goes stale.
                        SELECT 1 FROM public.__reflex_ivm_reference r
-                       WHERE r.partition_columns IS NOT NULL
-                         AND array_length(r.partition_columns, 1) > 0
+                       WHERE r.enabled
                          AND (r.depends_on @> ARRAY[_part_root]
                               OR r.depends_on @> ARRAY[split_part(_part_root, '.', 2)])
                    )

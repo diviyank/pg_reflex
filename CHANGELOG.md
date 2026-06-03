@@ -2,27 +2,40 @@
 
 ## [1.8.2] - 2026-06-03
 
-Partitioned IMVs can now mirror their source at a **shallower depth** than the
-source is partitioned. Declaring `partition_by => ARRAY['dem_plan_id']` on a
+The IMV's partition depth is now decoupled from the source's: it can mirror the
+source at a **shallower depth**, all the way down to **unpartitioned**.
+
+**Shallow mirroring.** Declaring `partition_by => ARRAY['dem_plan_id']` on a
 `LIST (dem_plan_id) → RANGE (order_date)` source now mirrors **only** the
 `dem_plan_id` level (a single-level IMV) instead of being rejected when the
 deeper level's column isn't a bare projected output column. This unblocks IMVs
 whose deeper partition key only exists as a computed projection — e.g. a
 `FULL JOIN`-coalesced `COALESCE(a.order_date, b.order_date) AS order_date`,
-which cannot be a partition level.
+which cannot be a partition level. `partition_by` is now **authoritative** for
+the IMV's partition depth: it mirrors exactly the declared levels. With
+`partition_by` omitted, auto-mirror keeps as many leading levels as have a bare
+projected column and **prunes** the rest (instead of rejecting). Capture stays
+correct at the coarser granularity: a source sub-partition (`order_date`)
+swap/attach/detach collapses to an atomic refill of the whole matching
+top-level (`dem_plan_id`) IMV partition.
 
-`partition_by` is now **authoritative** for the IMV's partition depth: it
-mirrors exactly the declared levels. With `partition_by` omitted, auto-mirror
-keeps as many leading levels as have a bare projected column and **prunes** the
-rest (instead of rejecting). Capture stays correct at the coarser granularity:
-a source sub-partition (`order_date`) swap/attach/detach collapses to an atomic
-refill of the whole matching top-level (`dem_plan_id`) IMV partition.
+**Unpartitioned target (depth 0).** An **empty** `partition_by`
+(`ARRAY[]::text[]`) forces an **unpartitioned** target IMV on a partitioned
+source, instead of auto-mirroring. (Omitting `partition_by` still auto-mirrors —
+only an explicit empty array opts out.) Such an IMV captures ordinary DML
+through the source-root trigger; source **partition swaps** (which fire no DML
+trigger) are captured by a **full reconcile** — the `ddl_command_end` event
+trigger enqueues the source root for **any** enabled dependent IMV, and
+`reflex_flush_partitions` full-reconciles each unpartitioned dependent of a
+dirty root. This also closes a prior silent-staleness gap for any unpartitioned
+IMV on a swap-driven source.
 
 Run `ALTER EXTENSION pg_reflex UPDATE TO '1.8.2';` and replace the `.so`. The
 migration is **additive and non-breaking**: it adds a nullable
 `__reflex_ivm_reference.partition_depth` column (`NULL` = mirror the full source
-depth, so existing partitioned IMVs are unaffected — no recreate needed) and an
-`ancestors TEXT[]` column on `__reflex_source_partition_snapshot`.
+depth, so existing partitioned IMVs are unaffected — no recreate needed), an
+`ancestors TEXT[]` column on `__reflex_source_partition_snapshot`, and redefines
+the `ddl_command_end` event-trigger function (relaxed enqueue).
 
 ### Added
 
@@ -31,6 +44,7 @@ depth, so existing partitioned IMVs are unaffected — no recreate needed) and a
   bare projected output column. New nullable catalog column
   `partition_depth INT` (`NULL` = full source depth). See
   `plans/2026-06-03-imv-partition-depth.md`.
+- **Unpartitioned IMV on a partitioned source** via `partition_by => ARRAY[]::text[]`.
 
 ### Fixed
 
@@ -38,6 +52,9 @@ depth, so existing partitioned IMVs are unaffected — no recreate needed) and a
   the audit partition-tree-drift check are all depth-aware: a shallow IMV is
   never re-deepened by a sync, and a source leaf change reconciles up to the
   IMV's mirror-depth partition.
+- Unpartitioned IMVs on a partitioned source no longer go silently stale on a
+  source partition swap — the flush full-reconciles them. (Tradeoff: a swap
+  triggers a whole-IMV reconcile, since there are no partitions to scope it.)
 
 ## [1.8.1] - 2026-06-02
 

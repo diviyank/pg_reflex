@@ -100,6 +100,7 @@ pub(crate) fn try_decompose_set_op(ctx: &DecomposeCtx) -> Option<&'static str> {
             ctx.ignore_sources,
             ctx.partition_by,
             ctx.materialize_as_table,
+            false, // sub-IMVs auto-mirror; never force-unpartitioned
         );
         if result.starts_with("ERROR") {
             rollback_partial_sub_imvs(&sub_imv_names);
@@ -593,6 +594,7 @@ pub(crate) fn try_decompose_distinct_on(ctx: &DecomposeCtx) -> Option<&'static s
         ctx.topk_k,
         ctx.ignore_sources,
         ctx.partition_by,
+        false, // sub-IMVs auto-mirror; never force-unpartitioned
     );
     if result.starts_with("ERROR") {
         return Some(result);
@@ -733,6 +735,7 @@ maintained — move it to the outermost SELECT, or define this view with kind: m
         topk_k,
         ignore_sources,
         partition_by,
+        false, // sub-IMVs auto-mirror; never force-unpartitioned
     );
     if result.starts_with("ERROR") {
         return Some(result);
@@ -955,6 +958,7 @@ with kind: mv.",
             ctx.ignore_sources,
             &cte_partition_by,
             true,
+            false, // sub-IMVs auto-mirror; never force-unpartitioned
         );
         if result.starts_with("ERROR") {
             rollback_partial_sub_imvs(&created_sub_imv_names(&cte_name_map));
@@ -996,6 +1000,7 @@ with kind: mv.",
         ctx.ignore_sources,
         ctx.partition_by,
         ctx.materialize_as_table,
+        false, // sub-IMVs auto-mirror; never force-unpartitioned
     );
     if body_result.starts_with("ERROR") {
         rollback_partial_sub_imvs(&created_sub_imv_names(&cte_name_map));

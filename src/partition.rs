@@ -1962,6 +1962,34 @@ pub(crate) fn reflex_flush_partitions_impl(only: Option<&str>) -> String {
                 summary.push(format!("{}: {} change(s)", imv, actions.len()));
             }
 
+            // Unpartitioned IMVs depending on this root cannot capture a swap
+            // incrementally (no per-partition reconcile), so a source partition
+            // change makes them stale. Trigger a full reconcile for each.
+            let unpartitioned_imvs: Vec<String> = client
+                .select(
+                    "SELECT name FROM public.__reflex_ivm_reference \
+                     WHERE enabled = TRUE \
+                       AND COALESCE(array_length(partition_columns, 1), 0) = 0 \
+                       AND (depends_on @> ARRAY[$1] OR depends_on @> ARRAY[split_part($1,'.',2)])",
+                    None,
+                    &[unsafe { DatumWithOid::new(root.to_string(), pgrx::pg_sys::TEXTOID) }],
+                )
+                .map_err(|e| format!("flush: unpartitioned imv lookup failed: {}", e))?
+                .filter_map(|r| {
+                    r.get_by_name::<&str, _>("name")
+                        .ok()
+                        .flatten()
+                        .map(|s| s.to_string())
+                })
+                .collect();
+            for imv in &unpartitioned_imvs {
+                let q = format!("SELECT public.reflex_reconcile({})", sql_literal_text(imv));
+                client
+                    .update(&q, None, &[])
+                    .map_err(|e| format!("flush full-reconcile {}: {}", imv, e))?;
+                summary.push(format!("{}: full reconcile (unpartitioned)", imv));
+            }
+
             refresh_source_snapshot(client, root);
         }
 
