@@ -365,3 +365,61 @@ fn test_partition_node_has_depth_field() {
     };
     assert_eq!(n.depth, 1);
 }
+
+fn node(bare: &str, parent: &str, depth: usize, sub: Option<&str>) -> PartitionNode {
+    PartitionNode {
+        bare_name: bare.to_string(),
+        oid: 0,
+        parent_bare: parent.to_string(),
+        bound_expr: "FOR VALUES IN (1)".to_string(),
+        sub_strategy: sub.map(|s| s.to_string()),
+        sub_columns: if sub.is_some() {
+            vec!["order_date".to_string()]
+        } else {
+            vec![]
+        },
+        depth,
+    }
+}
+
+#[test]
+fn test_truncate_drops_below_depth_and_demotes_boundary() {
+    // ss_172 (internal, depth 1) -> ss_172_2025_01 (leaf, depth 2)
+    let tree = vec![
+        node("ss_172", "ss", 1, Some("RANGE")),
+        node("ss_172_2025_01", "ss_172", 2, None),
+    ];
+    let out = truncate_partition_tree(tree, 1);
+    // Only the depth-1 node remains, demoted to a leaf.
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].bare_name, "ss_172");
+    assert!(
+        out[0].sub_strategy.is_none(),
+        "boundary node must be demoted to leaf"
+    );
+    assert!(
+        out[0].sub_columns.is_empty(),
+        "boundary node must drop sub_columns"
+    );
+}
+
+#[test]
+fn test_truncate_full_depth_is_noop() {
+    let tree = vec![
+        node("ss_172", "ss", 1, Some("RANGE")),
+        node("ss_172_2025_01", "ss_172", 2, None),
+    ];
+    let out = truncate_partition_tree(tree.clone(), 2);
+    assert_eq!(out.len(), 2);
+    // Internal node keeps its sub-partitioning.
+    assert_eq!(out[0].sub_strategy.as_deref(), Some("RANGE"));
+    assert_eq!(out[1].bare_name, "ss_172_2025_01");
+}
+
+#[test]
+fn test_truncate_depth_beyond_tree_is_noop() {
+    let tree = vec![node("ss_172", "ss", 1, None)];
+    let out = truncate_partition_tree(tree, 5);
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].sub_strategy, None);
+}

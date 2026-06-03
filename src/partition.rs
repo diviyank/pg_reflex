@@ -274,6 +274,43 @@ pub(crate) fn list_partition_tree(
     }
 }
 
+/// Truncate a source partition tree to `mirror_depth` absolute levels.
+///
+/// Keeps every node at `depth <= mirror_depth`, drops everything deeper, and
+/// **demotes** the nodes sitting exactly at `mirror_depth` to leaves (clears
+/// `sub_strategy` / `sub_columns`) so `build_partition_node_ddl_pair` emits no
+/// `PARTITION BY` suffix for them — a `LIST(a) -> RANGE(b)` source truncated to
+/// depth 1 becomes plain `LIST(a)` leaves, each holding all of that key's rows.
+///
+/// `mirror_depth == 0` is treated as "no truncation" (defensive; callers pass
+/// the resolved full source depth for NULL `partition_depth`). A `mirror_depth`
+/// at or beyond the tree's max depth is a no-op.
+pub(crate) fn truncate_partition_tree(
+    nodes: Vec<PartitionNode>,
+    mirror_depth: usize,
+) -> Vec<PartitionNode> {
+    if mirror_depth == 0 {
+        return nodes;
+    }
+    nodes
+        .into_iter()
+        .filter(|n| n.depth <= mirror_depth)
+        .map(|mut n| {
+            if n.depth == mirror_depth {
+                n.sub_strategy = None;
+                n.sub_columns = Vec::new();
+            }
+            n
+        })
+        .collect()
+}
+
+/// Maximum absolute tree-depth across `nodes` (0 when empty / unpartitioned).
+/// Used to resolve a NULL `partition_depth` to "mirror the full source depth".
+pub(crate) fn max_tree_depth(nodes: &[PartitionNode]) -> usize {
+    nodes.iter().map(|n| n.depth).max().unwrap_or(0)
+}
+
 /// Build the `PARTITION BY <strategy> (<cols>)` suffix used in the
 /// `CREATE TABLE` DDL for the intermediate and target.
 pub(crate) fn build_partition_by_clause(strategy: &str, columns: &[String]) -> String {
