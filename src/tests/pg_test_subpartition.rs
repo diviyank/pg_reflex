@@ -72,7 +72,7 @@ fn pg_subpart_create_mirrors_full_tree() {
         "SELECT create_reflex_ivm('fcst2', \
             'SELECT dem_plan_id, order_date, product_id, qty FROM ss2', \
             'dem_plan_id,order_date,product_id', NULL, NULL, NULL, \
-            ARRAY['dem_plan_id'] )",
+            ARRAY['dem_plan_id','order_date'] )",
     )
     .expect("create call")
     .expect("create result");
@@ -110,10 +110,11 @@ fn pg_subpart_rejects_sublevel_column_not_in_unique_key() {
 
     // unique_key omits order_date (a sub-level partition key) -> must be rejected
     // with a clean error string (NOT a panic / PG hard error).
+    // Declare both levels explicitly so level-2 validation catches the missing order_date in unique_key.
     let r = Spi::get_one::<String>(
         "SELECT create_reflex_ivm('fcst3', \
             'SELECT dem_plan_id, qty FROM ss3', \
-            'dem_plan_id', NULL, NULL, NULL, ARRAY['dem_plan_id'])",
+            'dem_plan_id', NULL, NULL, NULL, ARRAY['dem_plan_id','order_date'])",
     )
     .expect("create call")
     .expect("create result");
@@ -168,7 +169,7 @@ fn pg_subpart_sync_creates_new_leaf_and_drops_orphan() {
     Spi::run("CREATE TABLE ss4_172_2025_01 PARTITION OF ss4_172 FOR VALUES FROM ('2025-01-01') TO ('2025-02-01')").expect("leaf1");
     Spi::get_one::<String>(
         "SELECT create_reflex_ivm('fcst4', 'SELECT dem_plan_id, order_date, product_id, qty FROM ss4', \
-         'dem_plan_id,product_id,order_date', NULL, NULL, NULL, ARRAY['dem_plan_id'])",
+         'dem_plan_id,product_id,order_date', NULL, NULL, NULL, ARRAY['dem_plan_id','order_date'])",
     ).expect("c").expect("c");
 
     // Attach a brand-new month leaf on the source, then sync.
@@ -198,7 +199,7 @@ fn pg_subpart_reconcile_leaf_swaps_only_that_leaf() {
     Spi::run("INSERT INTO ss5 VALUES (172,'2025-01-15',5,10),(172,'2025-02-15',5,20)").expect("seed");
     Spi::get_one::<String>(
         "SELECT create_reflex_ivm('fcst5','SELECT dem_plan_id, order_date, product_id, qty FROM ss5', \
-         'dem_plan_id,product_id,order_date', NULL, NULL, NULL, ARRAY['dem_plan_id'])",
+         'dem_plan_id,product_id,order_date', NULL, NULL, NULL, ARRAY['dem_plan_id','order_date'])",
     ).expect("c").expect("c");
 
     // Mutate Jan data directly on the source leaf (stand-in for a swap), then
@@ -224,7 +225,7 @@ fn pg_subpart_reconcile_internal_node_swaps_all_leaves() {
     Spi::run("INSERT INTO ss6 VALUES (172,'2025-01-15',5,10),(172,'2025-02-15',5,20)").expect("seed");
     Spi::get_one::<String>(
         "SELECT create_reflex_ivm('fcst6','SELECT dem_plan_id, order_date, product_id, qty FROM ss6', \
-         'dem_plan_id,product_id,order_date', NULL, NULL, NULL, ARRAY['dem_plan_id'])",
+         'dem_plan_id,product_id,order_date', NULL, NULL, NULL, ARRAY['dem_plan_id','order_date'])",
     ).expect("c").expect("c");
 
     // Mutate both month leaves, then reconcile the WHOLE dem_plan_id internal
@@ -271,7 +272,7 @@ fn pg_subpart_flush_applies_attach() {
     Spi::run("INSERT INTO ss8 VALUES (172,'2025-01-15',5,10)").expect("seed");
     Spi::get_one::<String>(
         "SELECT create_reflex_ivm('fcst8','SELECT dem_plan_id, order_date, product_id, qty FROM ss8', \
-         'dem_plan_id,product_id,order_date', NULL, NULL, NULL, ARRAY['dem_plan_id'])",
+         'dem_plan_id,product_id,order_date', NULL, NULL, NULL, ARRAY['dem_plan_id','order_date'])",
     ).expect("c").expect("c");
 
     // Build a fresh Feb leaf as a standalone table and ATTACH it (a swap of a
@@ -330,7 +331,7 @@ fn pg_subpart_attach_toplevel_branch_autosyncs_full_subtree_via_event_trigger() 
     Spi::run("INSERT INTO sb VALUES (172,'2025-01-15',5,10)").expect("seed");
     Spi::get_one::<String>(
         "SELECT create_reflex_ivm('sbv','SELECT dem_plan_id, order_date, product_id, qty FROM sb', \
-         'dem_plan_id,product_id,order_date', NULL, NULL, NULL, ARRAY['dem_plan_id'])",
+         'dem_plan_id,product_id,order_date', NULL, NULL, NULL, ARRAY['dem_plan_id','order_date'])",
     ).expect("c").expect("c");
 
     // Build the new branch (dem_plan_id=173) standalone, fill it, then ATTACH
@@ -368,7 +369,7 @@ fn pg_subpart_global_reconcile_passthrough_multilevel() {
     Spi::run("INSERT INTO sc VALUES (172,'2025-01-15',5,10),(172,'2025-02-15',5,20)").expect("seed");
     Spi::get_one::<String>(
         "SELECT create_reflex_ivm('scv','SELECT dem_plan_id, order_date, product_id, qty FROM sc', \
-         'dem_plan_id,product_id,order_date', NULL, NULL, NULL, ARRAY['dem_plan_id'])",
+         'dem_plan_id,product_id,order_date', NULL, NULL, NULL, ARRAY['dem_plan_id','order_date'])",
     ).expect("c").expect("c");
 
     // Precondition: passthrough → no intermediate table.
@@ -648,7 +649,7 @@ fn pg_fuzz_subpartition_swap_sequence_matches_recompute() {
     Spi::run("INSERT INTO fz SELECT 1, make_date(2025, (g % 3) + 1, 10), g, g * 10 FROM generate_series(1,30) g").expect("seed");
     Spi::get_one::<String>(
         "SELECT create_reflex_ivm('fzv','SELECT dem_plan_id, order_date, product_id, qty FROM fz', \
-         'dem_plan_id,product_id,order_date', NULL, NULL, NULL, ARRAY['dem_plan_id'])",
+         'dem_plan_id,product_id,order_date', NULL, NULL, NULL, ARRAY['dem_plan_id','order_date'])",
     ).expect("c").expect("c");
 
     for m in 1..=3 {
