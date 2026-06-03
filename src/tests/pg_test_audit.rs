@@ -497,14 +497,17 @@ fn pg_test_audit_detects_partition_tree_drift() {
     )
     .expect("l1");
 
-    // Create IMV with partitioning
+    // Create IMV with FULL-depth partitioning (both levels) so the IMV mirrors
+    // the order_date month leaves — required for this test to exercise
+    // partition-tree-drift detection (a depth-1 IMV deliberately would NOT
+    // mirror months, so a new source month is not drift).
     Spi::run(
         "SELECT create_reflex_ivm(\
             'fcstb', \
             'SELECT dem_plan_id, order_date, product_id, qty FROM ssb', \
             'dem_plan_id,product_id,order_date', \
             NULL, NULL, NULL, \
-            ARRAY['dem_plan_id'])",
+            ARRAY['dem_plan_id','order_date'])",
     )
     .expect("create IMV");
 
