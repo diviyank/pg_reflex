@@ -113,24 +113,36 @@ The IMV's depth must be persisted, because today `partition_columns` holds only 
 its length cannot be trusted as the depth.
 
 **Decision:** repurpose `partition_columns` in `public.__reflex_ivm_reference` to carry
-the full **ordered level-column list** going forward (`[dem_plan_id]` or
-`[dem_plan_id, order_date]`), and derive `mirror_depth = partition_columns.len()`.
+the full **ordered level-column list** (`[dem_plan_id]` or `[dem_plan_id, order_date]`),
+and derive `mirror_depth = partition_columns.len()`. `resolve_partitioning` populates it
+with the resolved level list (declared columns, or the auto-pruned satisfiable prefix);
+for an auto full mirror this now lists *all* source level columns, not just the root.
 
-- **New IMVs:** `resolve_partitioning` populates `partition_columns` with the resolved
-  level list (declared columns, or the auto-pruned satisfiable prefix). For an auto full
-  mirror this now lists *all* source level columns, not just the root.
-- **Existing IMVs (1.8.1 rows, length-1, full-mirror semantics):** a length-1
-  `partition_columns` is ambiguous — it could mean "depth 1" or "legacy full mirror". To
-  avoid mis-truncating an existing multi-level IMV, **backfill at sync**: when an IMV's
-  stored `partition_columns` length is shorter than its *materialized* target-tree depth,
-  treat its depth as the materialized depth and rewrite `partition_columns` to the full
-  level list (read from the live IMV tree's `sub_columns` per level). This makes existing
-  multi-level IMVs self-heal to the new representation on their next sync without a
-  separate migration, and is a no-op for IMVs already at the stored depth.
+`reflex_sync_partitions_impl` (`src/partition.rs:823`) reads `partition_columns`, derives
+`mirror_depth = partition_columns.len()`, and passes it into `truncate_partition_tree`.
 
-`reflex_sync_partitions_impl` (`src/partition.rs:823`) reads `partition_columns`; it gains
-the `mirror_depth` derivation + backfill and passes the depth into
-`truncate_partition_tree`.
+**No migration / backfill for existing IMVs.** Pre-1.8.1-era rows store a length-1
+`partition_columns` (root column only) whose length would now be misread as `mirror_depth
+= 1`, truncating a previously full-depth IMV on its next sync. We do **not** handle this
+in code. Instead, this is a **breaking representation change**: IMVs created before this
+version must be **dropped and recreated** to pick up the new `partition_columns` semantics.
+The package emits a startup / sync notice (see Upgrade notice below) so the requirement is
+visible; no self-healing is attempted.
+
+### Upgrade notice
+
+`CHANGELOG.md` and `docs/concepts/internals.md` state plainly:
+
+> **Breaking (partitioned IMVs):** `partition_columns` now records the full ordered
+> partition **level list**, not just the root column. IMVs created on an earlier version
+> must be **recreated** (drop + `create_reflex_ivm`); otherwise a sync would truncate them
+> to a single level. Unpartitioned IMVs are unaffected.
+
+`reflex_sync_partitions` additionally raises a one-line `warning!` when it encounters a
+partitioned IMV whose stored `partition_columns` length is **shorter** than its
+materialized target-tree depth — the signature of an un-recreated legacy row — pointing the
+user at the recreate requirement rather than silently truncating without a word. (It still
+proceeds per the new semantics; the warning is advisory, not a backfill.)
 
 ## Section 3 — Reconcile / capture resolution
 
@@ -215,8 +227,8 @@ same `mirror_depth` (the intermediate and target stay shape-identical). The
 - Attach-new-month under existing `dem_plan_id` → **no** new IMV leaf (collapses into the
   existing one), data correct.
 - `reflex_sync_partitions` does **not** re-deepen the IMV (target tree stays depth 1).
-- Existing 1.8.1 multi-level IMV: sync backfills `partition_columns` to the full level list
-  and leaves the tree depth unchanged (no truncation regression).
+- `reflex_sync_partitions` warns (does not error) when `partition_columns` is shorter than
+  the materialized target-tree depth (legacy un-recreated row signature).
 - Audit drift-check clean on the deliberately-shallow IMV.
 - Explicit `partition_by:[dem_plan_id, order_date]` on a shape where `order_date` *is*
   bare-projected → two-level IMV (opt-in finer granularity still works).
@@ -257,9 +269,9 @@ regardless.
 ## Files to touch
 
 - `src/partition.rs` — `truncate_partition_tree` primitive; `PartitionNode.depth` (or
-  ancestor-chain depth derivation); depth-aware `reflex_sync_partitions_impl` +
-  `partition_columns` backfill; reconcile up-mapping resolution; snapshot/flush
-  up-mapping.
+  ancestor-chain depth derivation); depth-aware `reflex_sync_partitions_impl`
+  (derive `mirror_depth` from `partition_columns` + legacy-row warning); reconcile
+  up-mapping resolution; snapshot/flush up-mapping.
 - `src/create_ivm/mod.rs` — depth resolution in `resolve_partitioning` (explicit-honored +
   auto-prune); bounded validation; write resolved level list to `partition_columns`;
   truncate at create-time mirroring (`:829`, `:985`).
@@ -276,8 +288,9 @@ Each phase independently committable + testable:
   (Sections 1, 4, 5; create-time half of Section 2). The motivating IMV creates as a
   single-level `LIST(dem_plan_id)` table. Tests: unit truncation/resolution, create-shape
   integration.
-- **Phase 2 — Depth-aware sync + metadata backfill** (Section 2 sync half). Sync respects
-  and persists depth; existing multi-level IMVs self-heal. Tests: no-re-deepen, backfill.
+- **Phase 2 — Depth-aware sync** (Section 2 sync half). Sync derives `mirror_depth` from
+  `partition_columns` and respects it; warns on the legacy-row signature. Tests:
+  no-re-deepen, legacy-row warning.
 - **Phase 3 — Reconcile / snapshot / flush up-mapping** (Section 3). Source-side swaps at
   any depth refill the correct IMV node. Tests: leaf swap, attach-new-month collapse,
   end-to-end flush.
