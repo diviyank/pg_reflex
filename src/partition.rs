@@ -311,6 +311,36 @@ pub(crate) fn max_tree_depth(nodes: &[PartitionNode]) -> usize {
     nodes.iter().map(|n| n.depth).max().unwrap_or(0)
 }
 
+/// Ordered partition-key columns per source level, top-down: index 0 is the
+/// root's partition column, index 1 the first sub-level's, etc. Derived by
+/// following ONE path down the tree (a well-formed hierarchy partitions all
+/// siblings at a level by the same key). Level 0 comes from the descriptor;
+/// deeper levels from each internal node's `sub_columns`.
+pub(crate) fn source_level_columns(
+    desc: &PartitionDescriptor,
+    tree: &[PartitionNode],
+) -> Vec<String> {
+    let mut levels: Vec<String> = Vec::new();
+    if let Some(c) = desc.column_names.first() {
+        levels.push(c.to_lowercase());
+    }
+    // Walk down: at each depth, find an internal node and take its sub key.
+    let mut current_depth = 1usize;
+    loop {
+        let internal = tree
+            .iter()
+            .find(|n| n.depth == current_depth && !n.sub_columns.is_empty());
+        match internal {
+            Some(n) => {
+                levels.push(n.sub_columns[0].to_lowercase());
+                current_depth += 1;
+            }
+            None => break,
+        }
+    }
+    levels
+}
+
 /// Build the `PARTITION BY <strategy> (<cols>)` suffix used in the
 /// `CREATE TABLE` DDL for the intermediate and target.
 pub(crate) fn build_partition_by_clause(strategy: &str, columns: &[String]) -> String {

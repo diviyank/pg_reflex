@@ -1,6 +1,29 @@
 // Integration tests for multi-level (sub-partition) source support.
 // Plan: plans/sub_partitioning_impl_plan.md. Included from src/lib.rs tests module.
 
+// Helper: count target-side partition children of an IMV (any depth).
+fn imv_child_count(view: &str) -> i64 {
+    Spi::get_one::<i64>(&format!(
+        "SELECT count(*)::int8 FROM pg_inherits i \
+         JOIN pg_class p ON p.oid = i.inhparent \
+         WHERE p.relname = '{}'",
+        view
+    ))
+    .unwrap()
+    .unwrap()
+}
+
+// Helper: is `child` itself partitioned (an internal node)?
+fn is_partitioned_rel(child: &str) -> bool {
+    Spi::get_one::<bool>(&format!(
+        "SELECT EXISTS(SELECT 1 FROM pg_partitioned_table pt \
+         JOIN pg_class c ON c.oid = pt.partrelid WHERE c.relname = '{}')",
+        child
+    ))
+    .unwrap()
+    .unwrap()
+}
+
 #[pg_test]
 fn pg_subpart_tree_walk_lists_all_levels() {
     Spi::run(
@@ -98,6 +121,44 @@ fn pg_subpart_rejects_sublevel_column_not_in_unique_key() {
         r.starts_with("ERROR") && r.contains("order_date"),
         "expected rejection naming order_date, got: {r}"
     );
+}
+
+#[pg_test]
+fn pg_subpart_explicit_shallow_partition_by_creates_single_level() {
+    Spi::run(
+        "CREATE TABLE ssd (dem_plan_id BIGINT NOT NULL, order_date DATE NOT NULL, \
+         product_id BIGINT, qty INT) PARTITION BY LIST (dem_plan_id)",
+    )
+    .expect("root");
+    Spi::run("CREATE TABLE ssd_172 PARTITION OF ssd FOR VALUES IN (172) PARTITION BY RANGE (order_date)")
+        .expect("list child");
+    Spi::run("CREATE TABLE ssd_172_2025_01 PARTITION OF ssd_172 FOR VALUES FROM ('2025-01-01') TO ('2025-02-01')")
+        .expect("leaf");
+    Spi::run(
+        "INSERT INTO ssd (dem_plan_id, order_date, product_id, qty) VALUES (172, '2025-01-15', 5, 10)",
+    )
+    .expect("seed");
+
+    // order_date is projected only via a COALESCE-like rename — declare
+    // partition_by:[dem_plan_id] so we mirror ONLY the dem_plan_id level.
+    let r = Spi::get_one::<String>(
+        "SELECT create_reflex_ivm('fcst_shallow', \
+            'SELECT dem_plan_id, COALESCE(order_date, order_date) AS order_date, product_id, qty FROM ssd', \
+            'dem_plan_id,order_date,product_id', NULL, NULL, NULL, ARRAY['dem_plan_id'])",
+    )
+    .expect("create call")
+    .expect("create result");
+    assert!(!r.starts_with("ERROR"), "creation failed: {}", r);
+
+    // Exactly ONE target child (the dem_plan_id=172 leaf), and it is NOT
+    // itself partitioned (no order_date sub-level mirrored).
+    assert_eq!(imv_child_count("fcst_shallow"), 1);
+    assert!(!is_partitioned_rel("fcst_shallow_ssd_172"),
+        "dem_plan_id leaf must be a plain table, not sub-partitioned");
+
+    // Data is correct.
+    let n = Spi::get_one::<i64>("SELECT count(*)::int8 FROM fcst_shallow").unwrap().unwrap();
+    assert_eq!(n, 1);
 }
 
 #[pg_test]
