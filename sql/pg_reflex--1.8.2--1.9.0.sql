@@ -1,8 +1,8 @@
--- Migration: pg_reflex 1.8.2 → 1.8.3
+-- Migration: pg_reflex 1.8.2 → 1.9.0
 --
--- Run via: ALTER EXTENSION pg_reflex UPDATE TO '1.8.3';
+-- Run via: ALTER EXTENSION pg_reflex UPDATE TO '1.9.0';
 --
--- 1.8.3 is a performance + correctness release for passthrough maintenance.
+-- 1.9.0 is a performance + correctness release for passthrough maintenance.
 -- There are NO catalog schema changes, NO function signature changes, and NO
 -- SPI additions — every change is in the Rust trigger/dispatch codegen and the
 -- key-resolution logic, which is recompiled into the module. Existing IMVs
@@ -39,9 +39,9 @@
 -- Migration steps:
 --
 --   No DDL is required. This file exists purely to register the
---   1.8.2 → 1.8.3 upgrade path with PostgreSQL's extension machinery. Replace
+--   1.8.2 → 1.9.0 upgrade path with PostgreSQL's extension machinery. Replace
 --   the module (.so) before running `ALTER EXTENSION pg_reflex UPDATE TO
---   '1.8.3';` so the new dispatch / key-resolution behavior is loaded.
+--   '1.9.0';` so the new dispatch / key-resolution behavior is loaded.
 
 -- No-op marker: ALTER EXTENSION needs a non-empty migration file.
 SELECT 1 WHERE FALSE;

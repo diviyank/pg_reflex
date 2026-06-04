@@ -4,9 +4,9 @@ The full changelog tracks every release. The latest version's headlines are on t
 
 For each version below, see [`CHANGELOG.md`](https://github.com/diviyank/pg_reflex/blob/main/CHANGELOG.md) on GitHub for the canonical text.
 
-## [1.8.3] — 2026-06-04
+## [1.9.0] — 2026-06-04
 
-Performance + correctness release for passthrough maintenance: partitioned passthrough/aggregate IMVs dispatch DML only to affected child partitions, passthrough LEFT-JOIN secondaries are maintained with a keyed delete + delta insert instead of a full rebuild, and inner CTE sub-IMVs (and single-source passthrough IMVs generally) now detect a source PRIMARY KEY and maintain incrementally instead of full-rebuilding every flush. No catalog/schema or function-signature changes — all changes ship in the recompiled module: `ALTER EXTENSION pg_reflex UPDATE TO '1.8.3';`.
+Performance + correctness release for passthrough maintenance: partitioned passthrough/aggregate IMVs dispatch DML only to affected child partitions, passthrough LEFT-JOIN secondaries are maintained with a keyed delete + delta insert instead of a full rebuild, and inner CTE sub-IMVs (and single-source passthrough IMVs generally) now detect a source PRIMARY KEY and maintain incrementally instead of full-rebuilding every flush. No catalog/schema or function-signature changes — all changes ship in the recompiled module: `ALTER EXTENSION pg_reflex UPDATE TO '1.9.0';`.
 
 **Added**
 
@@ -29,7 +29,25 @@ Performance + correctness release for passthrough maintenance: partitioned passt
 
 **Migration**
 
-- No-op marker: [`sql/pg_reflex--1.8.2--1.8.3.sql`](https://github.com/diviyank/pg_reflex/blob/main/sql/pg_reflex--1.8.2--1.8.3.sql) — no DDL; replace the `.so`, then `ALTER EXTENSION pg_reflex UPDATE TO '1.8.3';`.
+- No-op marker: [`sql/pg_reflex--1.8.2--1.9.0.sql`](https://github.com/diviyank/pg_reflex/blob/main/sql/pg_reflex--1.8.2--1.9.0.sql) — no DDL; replace the `.so`, then `ALTER EXTENSION pg_reflex UPDATE TO '1.9.0';`.
+
+## [1.8.2] — 2026-06-03
+
+Partition depth is decoupled from the source's: a partitioned IMV can mirror its source at a shallower depth, all the way down to unpartitioned. Explicit `partition_by` is now authoritative for the IMV's depth; omitting it auto-mirrors the leading levels that have a bare projected column and prunes the rest. An empty `partition_by => ARRAY[]::text[]` forces an unpartitioned target on a partitioned source. Additive, non-breaking migration: `ALTER EXTENSION pg_reflex UPDATE TO '1.8.2';`.
+
+**Added**
+
+- Shallow partition mirroring — explicit `partition_by` declares the IMV's depth; auto-mirror prunes to the deepest bare-projected level. New nullable catalog column `partition_depth INT` (NULL = full source depth).
+- Unpartitioned IMV on a partitioned source via `partition_by => ARRAY[]::text[]`.
+
+**Fixed**
+
+- `reflex_sync_partitions`, `reflex_reconcile_partition`, `reflex_flush_*`, and the audit partition-tree-drift check are depth-aware: a shallow IMV is never re-deepened by a sync, and a source leaf change reconciles up to the IMV's mirror-depth partition.
+- Unpartitioned IMVs on a partitioned source no longer go silently stale on a source partition swap — the flush full-reconciles them.
+
+**Migration**
+
+- [`sql/pg_reflex--1.8.1--1.8.2.sql`](https://github.com/diviyank/pg_reflex/blob/main/sql/pg_reflex--1.8.1--1.8.2.sql) — additive/non-breaking: adds nullable `__reflex_ivm_reference.partition_depth` and `__reflex_source_partition_snapshot.ancestors TEXT[]` columns and redefines the `ddl_command_end` event trigger. `ALTER EXTENSION pg_reflex UPDATE TO '1.8.2';`.
 
 ## [1.7.6] — 2026-06-01
 

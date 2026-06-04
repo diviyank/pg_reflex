@@ -1,6 +1,6 @@
 # Changelog
 
-## [1.8.3] - 2026-06-04
+## [1.9.0] - 2026-06-04
 
 A performance + correctness release for passthrough maintenance. Partitioned
 passthrough/aggregate IMVs now dispatch DML to only the affected child
@@ -10,7 +10,7 @@ single-source passthrough IMVs generally) now detect a source PRIMARY KEY and
 maintain incrementally instead of full-rebuilding on every flush. There are no
 catalog/schema changes and no function-signature changes — every change ships in
 the recompiled module, so existing IMVs keep working: `ALTER EXTENSION pg_reflex
-UPDATE TO '1.8.3';`.
+UPDATE TO '1.9.0';`.
 
 ---
 
@@ -55,8 +55,8 @@ UPDATE TO '1.8.3';`.
 
 ### Migration
 
-- No-op marker (`sql/pg_reflex--1.8.2--1.8.3.sql`): no DDL — all changes ship in
-  the module. Run `ALTER EXTENSION pg_reflex UPDATE TO '1.8.3';` after replacing
+- No-op marker (`sql/pg_reflex--1.8.2--1.9.0.sql`): no DDL — all changes ship in
+  the module. Run `ALTER EXTENSION pg_reflex UPDATE TO '1.9.0';` after replacing
   the `.so`.
 
 ---
