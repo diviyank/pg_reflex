@@ -3005,3 +3005,35 @@ fn full_outer_secondary_passthrough_falls_back_to_rebuild() {
         "FULL OUTER must NOT be keyed: {joined}"
     );
 }
+
+#[test]
+fn partition_dispatch_keeps_hot_swap_and_trip_cap_markers() {
+    let sql = build_partition_aware_dispatch_sql(
+        "v",
+        "__int",
+        "__int",
+        "__aff",
+        "region",
+        "MERGE_SQL_$1",
+        None,
+        "TDEL_$1",
+        "TINS_$1",
+    );
+    assert!(
+        sql.contains("reflex_reconcile_partition"),
+        "hot path present: {sql}"
+    );
+    assert!(
+        sql.contains("reflex_reconcile('v')"),
+        "trip-cap present: {sql}"
+    );
+    assert!(
+        sql.contains("__reflex_partition_child_for_key"),
+        "child resolution present: {sql}"
+    );
+    // Unified classification groups dirty by child:
+    assert!(
+        sql.contains("GROUP BY"),
+        "classification groups present: {sql}"
+    );
+}

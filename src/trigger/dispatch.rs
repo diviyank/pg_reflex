@@ -228,21 +228,36 @@ pub(crate) fn build_partition_aware_dispatch_sql(
                  EXECUTE $reflex_inner${tins}$reflex_inner$ USING _hot_keys;\n\
                  RETURN;\n\
              END IF;\n\
-             SELECT COALESCE(array_agg(pp.pkey::text), ARRAY[]::TEXT[])\n\
+             -- Classify by RESOLVED CHILD, not by raw partition value: sum the\n\
+             -- dirty counts of every value that maps to the same child, then\n\
+             -- compare the child's total dirty against its reltuples. For LIST\n\
+             -- (1 value = 1 child) this is identical to per-value grouping; for\n\
+             -- RANGE (many values per child) it is the only correct grouping.\n\
+             -- _hot_keys carries one REPRESENTATIVE value per hot child, which\n\
+             -- reflex_reconcile_partition re-resolves back to that child.\n\
+             WITH per_val AS (\n\
+                 SELECT \"{part_col}\"::text AS pkey, count(*) AS dirty\n\
+                 FROM {affected}\n\
+                 GROUP BY \"{part_col}\"\n\
+             ),\n\
+             per_child AS (\n\
+                 SELECT cfk.child AS child_oid,\n\
+                        sum(pv.dirty) AS dirty,\n\
+                        min(pv.pkey)  AS rep_key\n\
+                 FROM per_val pv\n\
+                 CROSS JOIN LATERAL (\n\
+                     SELECT public.__reflex_partition_child_for_key(\n\
+                                '{int_parent}'::regclass, '{part_col_lit}', pv.pkey) AS child\n\
+                 ) cfk\n\
+                 WHERE cfk.child IS NOT NULL\n\
+                 GROUP BY cfk.child\n\
+             )\n\
+             SELECT COALESCE(array_agg(pc.rep_key::text), ARRAY[]::TEXT[])\n\
                  INTO _hot_keys\n\
-                 FROM (\n\
-                     SELECT \"{part_col}\"::text AS pkey, count(*) AS dirty\n\
-                     FROM {affected}\n\
-                     GROUP BY \"{part_col}\"\n\
-                 ) pp\n\
-                 JOIN LATERAL (\n\
-                     SELECT c.reltuples::NUMERIC AS rt\n\
-                     FROM pg_class c\n\
-                     WHERE c.oid = public.__reflex_partition_child_for_key(\n\
-                                       '{int_parent}'::regclass, '{part_col_lit}', pp.pkey)\n\
-                 ) c ON TRUE\n\
-                 WHERE pp.dirty::NUMERIC\n\
-                       / GREATEST(c.rt, _floor::NUMERIC)\n\
+                 FROM per_child pc\n\
+                 JOIN pg_class c ON c.oid = pc.child_oid\n\
+                 WHERE pc.dirty::NUMERIC\n\
+                       / GREATEST(c.reltuples::NUMERIC, _floor::NUMERIC)\n\
                        >= _thr;\n\
              _hot_count := COALESCE(array_length(_hot_keys, 1), 0);\n\
              RAISE DEBUG 'pg_reflex partition dispatch: hot=% total=% thr=% floor=%', _hot_count, _partition_total, _thr, _floor;\n\
