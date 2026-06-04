@@ -1766,3 +1766,30 @@ fn pg_part_range_aggregate_dispatch_correct() {
     Spi::run("UPDATE rga_src SET amount = amount + 1 WHERE d < '2026-04-01' OR d = '2026-05-15'").expect("bulk");
     assert_imv_correct("rgav", sql);
 }
+
+/// Component 4: RANGE-partitioned PASSTHROUGH IMV — keyed prune + per-child
+/// classification correctness in DEFERRED mode. A hot Q1 child is swapped while
+/// a single cold Q2 row is keyed-maintained in the same flush; the RANGE
+/// cold-exclusion (by child name) must drop exactly the swapped child's rows.
+#[pg_test]
+fn pg_part_range_passthrough_dispatch_correct() {
+    Spi::run("CREATE TABLE rgp_src (d DATE NOT NULL, id INT NOT NULL, qty INT) PARTITION BY RANGE (d)").expect("src");
+    Spi::run("CREATE TABLE rgp_q1 PARTITION OF rgp_src FOR VALUES FROM ('2026-01-01') TO ('2026-04-01')").expect("q1");
+    Spi::run("CREATE TABLE rgp_q2 PARTITION OF rgp_src FOR VALUES FROM ('2026-04-01') TO ('2026-07-01')").expect("q2");
+    Spi::run("INSERT INTO rgp_src SELECT '2026-02-10'::date + (g%30), g, g FROM generate_series(1,60) g").expect("s1");
+    Spi::run("INSERT INTO rgp_src SELECT '2026-05-10'::date + (g%30), 1000+g, g FROM generate_series(1,60) g").expect("s2");
+    let sql = "SELECT d, id, qty FROM rgp_src";
+    let res = Spi::get_one::<String>(&format!(
+        "SELECT create_reflex_ivm('rgpv', '{}', 'd,id', NULL, 'DEFERRED', NULL, ARRAY['d'])",
+        sql.replace('\'', "''")
+    )).expect("create call").expect("create result");
+    assert!(!res.starts_with("ERROR"), "create returned: {res}");
+    Spi::run("ANALYZE rgp_src").expect("analyze");
+    assert_imv_correct("rgpv", sql);
+
+    Spi::run("UPDATE public.__reflex_ivm_reference SET wipe_threshold = 0.01 WHERE name = 'rgpv'").expect("thr");
+    Spi::run("UPDATE rgp_src SET qty = qty + 1 WHERE d < '2026-04-01'").expect("hot q1");
+    Spi::run("UPDATE rgp_src SET qty = qty + 5 WHERE id = 1001").expect("cold q2 single");
+    Spi::run("SELECT reflex_flush_deferred('rgp_src')").expect("flush");
+    assert_imv_correct("rgpv", sql);
+}

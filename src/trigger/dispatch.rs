@@ -336,11 +336,13 @@ pub(crate) fn build_partition_aware_dispatch_sql_strategy(
 /// `affected_select` must be shaped as `SELECT <expr> AS pkey FROM <delta>` — the
 /// touched partition values (read from the scratch tables). `cold_insert_with_filter`
 /// may be empty (DELETE-only operations); the INSERT EXECUTE is then omitted.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_passthrough_partition_dispatch_sql(
     view_name: &str,
     target_parent_qual: &str,
     affected_select: &str,
     partition_col: &str,
+    strategy: &str,
     cold_delete_with_filter: &str,
     cold_insert_with_filter: &str,
 ) -> String {
@@ -349,12 +351,20 @@ pub(crate) fn build_passthrough_partition_dispatch_sql(
     let parent = target_parent_qual.replace('"', "").replace('\'', "''");
     let safe_del = cold_delete_with_filter.replace("$reflex_inner$", "$reflex_inner_alt$");
     let safe_ins = cold_insert_with_filter.replace("$reflex_inner$", "$reflex_inner_alt$");
+    // RANGE cold filters reference $2 (hot child NAMES — stable across the swap's
+    // DETACH/ATTACH+RENAME, unlike the OID); LIST references only $1 (hot values).
+    let using = if strategy.eq_ignore_ascii_case("RANGE") {
+        "_hot_keys, _hot_child_names"
+    } else {
+        "_hot_keys"
+    };
     let ins_block = if cold_insert_with_filter.is_empty() {
         String::new()
     } else {
         format!(
-            "             EXECUTE $reflex_inner${ins}$reflex_inner$ USING _hot_keys;\n",
-            ins = safe_ins
+            "             EXECUTE $reflex_inner${ins}$reflex_inner$ USING {using};\n",
+            ins = safe_ins,
+            using = using
         )
     };
     format!(
@@ -365,6 +375,7 @@ pub(crate) fn build_passthrough_partition_dispatch_sql(
              _floor BIGINT;\n\
              _per_imv_floor BIGINT;\n\
              _hot_keys TEXT[] := ARRAY[]::TEXT[];\n\
+             _hot_child_names TEXT[] := ARRAY[]::TEXT[];\n\
              _hot_count INT;\n\
              _partition_total INT;\n\
          BEGIN\n\
@@ -376,13 +387,14 @@ pub(crate) fn build_passthrough_partition_dispatch_sql(
                  FROM pg_inherits WHERE inhparent = '{parent}'::regclass;\n\
              IF _partition_total IS NULL OR _partition_total = 0 THEN\n\
                  -- Target not partitioned (defensive) — run the cold body over\n\
-                 -- everything (empty _hot_keys excludes nothing).\n\
-                 EXECUTE $reflex_inner${del}$reflex_inner$ USING _hot_keys;\n\
+                 -- everything (empty _hot_keys / _hot_child_names excludes nothing).\n\
+                 EXECUTE $reflex_inner${del}$reflex_inner$ USING {using};\n\
 {ins_block}\
                  RETURN;\n\
              END IF;\n\
              -- Classify dirty partition values by RESOLVED CHILD (see\n\
-             -- build_partition_aware_dispatch_sql): one representative key per hot child.\n\
+             -- build_partition_aware_dispatch_sql_strategy): one representative key\n\
+             -- per hot child, plus the hot child NAMES for the RANGE cold filter.\n\
              WITH per_val AS (\n\
                  SELECT pkey::text AS pkey, count(*) AS dirty FROM ({aff}) __pv GROUP BY pkey\n\
              ),\n\
@@ -394,10 +406,16 @@ pub(crate) fn build_passthrough_partition_dispatch_sql(
                  ) cfk\n\
                  WHERE cfk.child IS NOT NULL\n\
                  GROUP BY cfk.child\n\
-             )\n\
-             SELECT COALESCE(array_agg(pc.rep_key::text), ARRAY[]::TEXT[]) INTO _hot_keys\n\
+             ),\n\
+             classified AS (\n\
+                 SELECT pc.rep_key, pc.child_oid::text AS child_name,\n\
+                        (pc.dirty::NUMERIC / GREATEST(c.reltuples::NUMERIC, _floor::NUMERIC) >= _thr) AS hot\n\
                  FROM per_child pc JOIN pg_class c ON c.oid = pc.child_oid\n\
-                 WHERE pc.dirty::NUMERIC / GREATEST(c.reltuples::NUMERIC, _floor::NUMERIC) >= _thr;\n\
+             )\n\
+             SELECT COALESCE(array_agg(rep_key::text) FILTER (WHERE hot), ARRAY[]::TEXT[]),\n\
+                    COALESCE(array_agg(child_name)    FILTER (WHERE hot), ARRAY[]::TEXT[])\n\
+                 INTO _hot_keys, _hot_child_names\n\
+                 FROM classified;\n\
              _hot_count := COALESCE(array_length(_hot_keys, 1), 0);\n\
              -- Trip-cap: swapping > half the partitions costs more than one full reconcile.\n\
              IF _hot_count > _partition_total / 2 THEN\n\
@@ -409,8 +427,8 @@ pub(crate) fn build_passthrough_partition_dispatch_sql(
                  PERFORM public.reflex_reconcile_partition('{view}', array_to_string(_hot_keys, ','));\n\
              END IF;\n\
              -- Cold children: keyed delete + delta insert, hot children excluded\n\
-             -- via the $1 (_hot_keys) filter the caller spliced into the SQL.\n\
-             EXECUTE $reflex_inner${del}$reflex_inner$ USING _hot_keys;\n\
+             -- via the strategy-specific filter the caller spliced into the SQL.\n\
+             EXECUTE $reflex_inner${del}$reflex_inner$ USING {using};\n\
 {ins_block}\
          END\n\
          $reflex_pt_dispatch$",
@@ -422,6 +440,7 @@ pub(crate) fn build_passthrough_partition_dispatch_sql(
         default_floor = WIPE_FLOOR_ROWS_DEFAULT,
         del = safe_del,
         ins_block = ins_block,
+        using = using,
     )
 }
 

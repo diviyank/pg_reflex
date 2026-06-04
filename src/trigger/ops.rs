@@ -723,16 +723,19 @@ pub(crate) fn outer_join_secondary_stmts(
 /// base_query).
 #[allow(clippy::too_many_arguments)]
 /// For a partition-dispatchable passthrough, resolve the partition column's
-/// quoted forms: the target (IMV output) name used to filter `view`/the delta
-/// projection, and the source name used to read the touched partition values
-/// from the scratch tables (the two differ when the partition column is aliased
-/// in the projection). Returns `None` when the plan is not LIST-partitioned, so
-/// the caller emits the plain keyed delete/insert.
+/// quoted forms and the strategy: the target (IMV output) name used to filter
+/// `view`/the delta projection, the source name used to read the touched
+/// partition values from the scratch tables (the two differ when the partition
+/// column is aliased in the projection), and the partition strategy ("LIST" |
+/// "RANGE"). Returns `None` when the plan is not LIST/RANGE-partitioned, so the
+/// caller emits the plain keyed delete/insert.
 fn passthrough_partition_dispatch_cols(
     plan: &AggregationPlan,
     mappings: &[(String, String)],
-) -> Option<(String, String, String)> {
-    if plan.partition_columns.is_empty() || !plan.partition_strategy.eq_ignore_ascii_case("LIST") {
+) -> Option<(String, String, String, String)> {
+    let is_list = plan.partition_strategy.eq_ignore_ascii_case("LIST");
+    let is_range = plan.partition_strategy.eq_ignore_ascii_case("RANGE");
+    if plan.partition_columns.is_empty() || !(is_list || is_range) {
         return None;
     }
     let part_col = plan.partition_columns[0].clone();
@@ -744,7 +747,35 @@ fn passthrough_partition_dispatch_cols(
         .map(|(_, s)| s.clone())
         .unwrap_or_else(|| part_col.clone());
     let part_src_q = format!("\"{}\"", part_src.replace('"', ""));
-    Some((part_col, part_col_q, part_src_q))
+    Some((
+        part_col,
+        part_col_q,
+        part_src_q,
+        plan.partition_strategy.clone(),
+    ))
+}
+
+/// Strategy-specific cold-exclusion predicate for the passthrough dispatch.
+/// LIST excludes hot partition VALUES (`$1::TEXT[]`); RANGE excludes rows of hot
+/// CHILDREN by resolving the value to its child of `view_parent` and comparing
+/// the child NAME (`$2::text[]`) — a value filter is wrong (many values per range
+/// child) and an OID filter is wrong (the swap changes the child OID).
+fn passthrough_cold_pred(
+    strategy_is_range: bool,
+    view_parent_lit: &str,
+    part_col_lit: &str,
+    qualified_col: &str,
+) -> String {
+    if strategy_is_range {
+        format!(
+            "public.__reflex_partition_child_for_key('{parent}'::regclass, '{col}', {qc}::text)::text <> ALL($2::text[])",
+            parent = view_parent_lit,
+            col = part_col_lit,
+            qc = qualified_col
+        )
+    } else {
+        format!("{qc}::text <> ALL($1::TEXT[])", qc = qualified_col)
+    }
 }
 
 pub(crate) fn passthrough_op_stmts(
@@ -802,19 +833,28 @@ pub(crate) fn passthrough_op_stmts(
                     pt_old
                 );
 
-                if let Some((part_col, part_col_q, part_src_q)) =
+                if let Some((part_col, part_col_q, part_src_q, strategy)) =
                     passthrough_partition_dispatch_cols(plan, mappings)
                 {
                     // Hybrid partition dispatch (audit #2): DELETE-only, so no
                     // cold INSERT body. Hot leaves are swapped (rebuilt from the
                     // post-delete source state); cold leaves get the keyed delete.
+                    let strategy_is_range = strategy.eq_ignore_ascii_case("RANGE");
+                    let parent_lit = qv.replace('"', "").replace('\'', "''");
+                    let part_col_lit = part_col.replace('\'', "''");
                     let del_cold = format!(
-                        "{} AND {}.{}::text <> ALL($1::TEXT[])",
-                        base_del, qv, part_col_q
+                        "{} AND {}",
+                        base_del,
+                        passthrough_cold_pred(
+                            strategy_is_range,
+                            &parent_lit,
+                            &part_col_lit,
+                            &format!("{}.{}", qv, part_col_q)
+                        )
                     );
                     let aff = format!("SELECT {}::text AS pkey FROM {}", part_src_q, pt_old);
                     stmts.push(build_passthrough_partition_dispatch_sql(
-                        view_name, &qv, &aff, &part_col, &del_cold, "",
+                        view_name, &qv, &aff, &part_col, &strategy, &del_cold, "",
                     ));
                 } else {
                     stmts.push(base_del);
@@ -844,7 +884,7 @@ pub(crate) fn passthrough_op_stmts(
                 let delta_new = replace_source_with_transition(base_query, source_table, &pt_new);
                 let base_ins = format!("INSERT INTO {} {}", qv, delta_new);
 
-                if let Some((part_col, part_col_q, part_src_q)) =
+                if let Some((part_col, part_col_q, part_src_q, strategy)) =
                     passthrough_partition_dispatch_cols(plan, mappings)
                 {
                     // Hybrid partition dispatch (audit #2): hot leaves swapped,
@@ -852,13 +892,29 @@ pub(crate) fn passthrough_op_stmts(
                     // keyed predicate with the hot-exclusion filter; the cold
                     // INSERT re-runs the delta projection (which reads pt_new) for
                     // cold partitions only.
+                    let strategy_is_range = strategy.eq_ignore_ascii_case("RANGE");
+                    let parent_lit = qv.replace('"', "").replace('\'', "''");
+                    let part_col_lit = part_col.replace('\'', "''");
                     let del_cold = format!(
-                        "{} AND {}.{}::text <> ALL($1::TEXT[])",
-                        base_del, qv, part_col_q
+                        "{} AND {}",
+                        base_del,
+                        passthrough_cold_pred(
+                            strategy_is_range,
+                            &parent_lit,
+                            &part_col_lit,
+                            &format!("{}.{}", qv, part_col_q)
+                        )
                     );
                     let ins_cold = format!(
-                        "INSERT INTO {} SELECT * FROM ({}) __pt WHERE __pt.{}::text <> ALL($1::TEXT[])",
-                        qv, delta_new, part_col_q
+                        "INSERT INTO {} SELECT * FROM ({}) __pt WHERE {}",
+                        qv,
+                        delta_new,
+                        passthrough_cold_pred(
+                            strategy_is_range,
+                            &parent_lit,
+                            &part_col_lit,
+                            &format!("__pt.{}", part_col_q)
+                        )
                     );
                     let aff = format!(
                         "SELECT {sc}::text AS pkey FROM {old} UNION SELECT {sc}::text AS pkey FROM {new}",
@@ -867,7 +923,7 @@ pub(crate) fn passthrough_op_stmts(
                         new = pt_new
                     );
                     stmts.push(build_passthrough_partition_dispatch_sql(
-                        view_name, &qv, &aff, &part_col, &del_cold, &ins_cold,
+                        view_name, &qv, &aff, &part_col, &strategy, &del_cold, &ins_cold,
                     ));
                 } else {
                     stmts.push(base_del);
