@@ -297,6 +297,105 @@ pub(crate) fn build_partition_aware_dispatch_sql(
     )
 }
 
+/// Passthrough sibling of [`build_partition_aware_dispatch_sql`] (audit #2). Same
+/// group-dirty-by-child classification, trip-cap, and atomic-swap hot path, but
+/// the cold body is the passthrough keyed delete + delta insert (no intermediate,
+/// no MERGE, no dead-cleanup). Hot children are rebuilt by `reflex_reconcile_partition`;
+/// the cold body maintains the rest, each statement restricted to COLD partitions
+/// via the `$1::TEXT[]` (_hot_keys) filter the caller already spliced in.
+///
+/// `affected_select` must be shaped as `SELECT <expr> AS pkey FROM <delta>` — the
+/// touched partition values (read from the scratch tables). `cold_insert_with_filter`
+/// may be empty (DELETE-only operations); the INSERT EXECUTE is then omitted.
+pub(crate) fn build_passthrough_partition_dispatch_sql(
+    view_name: &str,
+    target_parent_qual: &str,
+    affected_select: &str,
+    partition_col: &str,
+    cold_delete_with_filter: &str,
+    cold_insert_with_filter: &str,
+) -> String {
+    let safe_view = view_name.replace('\'', "''");
+    let safe_part_col_lit = partition_col.replace('"', "").replace('\'', "''");
+    let parent = target_parent_qual.replace('"', "").replace('\'', "''");
+    let safe_del = cold_delete_with_filter.replace("$reflex_inner$", "$reflex_inner_alt$");
+    let safe_ins = cold_insert_with_filter.replace("$reflex_inner$", "$reflex_inner_alt$");
+    let ins_block = if cold_insert_with_filter.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "             EXECUTE $reflex_inner${ins}$reflex_inner$ USING _hot_keys;\n",
+            ins = safe_ins
+        )
+    };
+    format!(
+        "DO $reflex_pt_dispatch$\n\
+         DECLARE\n\
+             _thr NUMERIC;\n\
+             _per_imv NUMERIC;\n\
+             _floor BIGINT;\n\
+             _per_imv_floor BIGINT;\n\
+             _hot_keys TEXT[] := ARRAY[]::TEXT[];\n\
+             _hot_count INT;\n\
+             _partition_total INT;\n\
+         BEGIN\n\
+             SELECT wipe_threshold, wipe_floor_rows INTO _per_imv, _per_imv_floor\n\
+                 FROM public.__reflex_ivm_reference WHERE name = '{view}';\n\
+             _thr   := COALESCE(_per_imv, current_setting('reflex.wipe_threshold', true)::NUMERIC, {default_thr});\n\
+             _floor := COALESCE(_per_imv_floor, NULLIF(current_setting('reflex.wipe_floor_rows', true), '')::BIGINT, {default_floor});\n\
+             SELECT count(*) INTO _partition_total\n\
+                 FROM pg_inherits WHERE inhparent = '{parent}'::regclass;\n\
+             IF _partition_total IS NULL OR _partition_total = 0 THEN\n\
+                 -- Target not partitioned (defensive) — run the cold body over\n\
+                 -- everything (empty _hot_keys excludes nothing).\n\
+                 EXECUTE $reflex_inner${del}$reflex_inner$ USING _hot_keys;\n\
+{ins_block}\
+                 RETURN;\n\
+             END IF;\n\
+             -- Classify dirty partition values by RESOLVED CHILD (see\n\
+             -- build_partition_aware_dispatch_sql): one representative key per hot child.\n\
+             WITH per_val AS (\n\
+                 SELECT pkey::text AS pkey, count(*) AS dirty FROM ({aff}) __pv GROUP BY pkey\n\
+             ),\n\
+             per_child AS (\n\
+                 SELECT cfk.child AS child_oid, sum(pv.dirty) AS dirty, min(pv.pkey) AS rep_key\n\
+                 FROM per_val pv\n\
+                 CROSS JOIN LATERAL (\n\
+                     SELECT public.__reflex_partition_child_for_key('{parent}'::regclass, '{part_col_lit}', pv.pkey) AS child\n\
+                 ) cfk\n\
+                 WHERE cfk.child IS NOT NULL\n\
+                 GROUP BY cfk.child\n\
+             )\n\
+             SELECT COALESCE(array_agg(pc.rep_key::text), ARRAY[]::TEXT[]) INTO _hot_keys\n\
+                 FROM per_child pc JOIN pg_class c ON c.oid = pc.child_oid\n\
+                 WHERE pc.dirty::NUMERIC / GREATEST(c.reltuples::NUMERIC, _floor::NUMERIC) >= _thr;\n\
+             _hot_count := COALESCE(array_length(_hot_keys, 1), 0);\n\
+             -- Trip-cap: swapping > half the partitions costs more than one full reconcile.\n\
+             IF _hot_count > _partition_total / 2 THEN\n\
+                 PERFORM public.reflex_reconcile('{view}');\n\
+                 RETURN;\n\
+             END IF;\n\
+             -- Hot children: atomic-swap rebuild.\n\
+             IF _hot_count > 0 THEN\n\
+                 PERFORM public.reflex_reconcile_partition('{view}', array_to_string(_hot_keys, ','));\n\
+             END IF;\n\
+             -- Cold children: keyed delete + delta insert, hot children excluded\n\
+             -- via the $1 (_hot_keys) filter the caller spliced into the SQL.\n\
+             EXECUTE $reflex_inner${del}$reflex_inner$ USING _hot_keys;\n\
+{ins_block}\
+         END\n\
+         $reflex_pt_dispatch$",
+        view = safe_view,
+        parent = parent,
+        aff = affected_select,
+        part_col_lit = safe_part_col_lit,
+        default_thr = WIPE_THRESHOLD_DEFAULT,
+        default_floor = WIPE_FLOOR_ROWS_DEFAULT,
+        del = safe_del,
+        ins_block = ins_block,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn push_materialized_merge_and_affected(
     stmts: &mut Vec<String>,

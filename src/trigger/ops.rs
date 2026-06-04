@@ -722,6 +722,31 @@ pub(crate) fn outer_join_secondary_stmts(
 /// targeted DML (mapping-driven DELETE/UPDATE; INSERT splices the scratch into
 /// base_query).
 #[allow(clippy::too_many_arguments)]
+/// For a partition-dispatchable passthrough, resolve the partition column's
+/// quoted forms: the target (IMV output) name used to filter `view`/the delta
+/// projection, and the source name used to read the touched partition values
+/// from the scratch tables (the two differ when the partition column is aliased
+/// in the projection). Returns `None` when the plan is not LIST-partitioned, so
+/// the caller emits the plain keyed delete/insert.
+fn passthrough_partition_dispatch_cols(
+    plan: &AggregationPlan,
+    mappings: &[(String, String)],
+) -> Option<(String, String, String)> {
+    if plan.partition_columns.is_empty() || !plan.partition_strategy.eq_ignore_ascii_case("LIST") {
+        return None;
+    }
+    let part_col = plan.partition_columns[0].clone();
+    let part_col_q = format!("\"{}\"", part_col.replace('"', ""));
+    let part_col_norm = normalized_column_name(&part_col);
+    let part_src = mappings
+        .iter()
+        .find(|(t, _)| normalized_column_name(t) == part_col_norm)
+        .map(|(_, s)| s.clone())
+        .unwrap_or_else(|| part_col.clone());
+    let part_src_q = format!("\"{}\"", part_src.replace('"', ""));
+    Some((part_col, part_col_q, part_src_q))
+}
+
 pub(crate) fn passthrough_op_stmts(
     view_name: &str,
     source_table: &str,
@@ -769,13 +794,31 @@ pub(crate) fn passthrough_op_stmts(
                 let source_cols: Vec<String> =
                     mappings.iter().map(|(_, s)| format!("\"{}\"", s)).collect();
                 let row = row_expr(&target_cols);
-                stmts.push(format!(
+                let base_del = format!(
                     "DELETE FROM {} WHERE {} IN (SELECT {} FROM {})",
                     qv,
                     row,
                     source_cols.join(", "),
                     pt_old
-                ));
+                );
+
+                if let Some((part_col, part_col_q, part_src_q)) =
+                    passthrough_partition_dispatch_cols(plan, mappings)
+                {
+                    // Hybrid partition dispatch (audit #2): DELETE-only, so no
+                    // cold INSERT body. Hot leaves are swapped (rebuilt from the
+                    // post-delete source state); cold leaves get the keyed delete.
+                    let del_cold = format!(
+                        "{} AND {}.{}::text <> ALL($1::TEXT[])",
+                        base_del, qv, part_col_q
+                    );
+                    let aff = format!("SELECT {}::text AS pkey FROM {}", part_src_q, pt_old);
+                    stmts.push(build_passthrough_partition_dispatch_sql(
+                        view_name, &qv, &aff, &part_col, &del_cold, "",
+                    ));
+                } else {
+                    stmts.push(base_del);
+                }
                 if operation == "DELETE_PROMOTED" {
                     stmts.push(format!("ANALYZE {}", qv));
                 }
@@ -791,15 +834,45 @@ pub(crate) fn passthrough_op_stmts(
                 let source_cols: Vec<String> =
                     mappings.iter().map(|(_, s)| format!("\"{}\"", s)).collect();
                 let row = row_expr(&target_cols);
-                stmts.push(format!(
+                let base_del = format!(
                     "DELETE FROM {} WHERE {} IN (SELECT {} FROM {})",
                     qv,
                     row,
                     source_cols.join(", "),
                     pt_old
-                ));
+                );
                 let delta_new = replace_source_with_transition(base_query, source_table, &pt_new);
-                stmts.push(format!("INSERT INTO {} {}", qv, delta_new));
+                let base_ins = format!("INSERT INTO {} {}", qv, delta_new);
+
+                if let Some((part_col, part_col_q, part_src_q)) =
+                    passthrough_partition_dispatch_cols(plan, mappings)
+                {
+                    // Hybrid partition dispatch (audit #2): hot leaves swapped,
+                    // cold leaves keyed-maintained. The cold DELETE extends the
+                    // keyed predicate with the hot-exclusion filter; the cold
+                    // INSERT re-runs the delta projection (which reads pt_new) for
+                    // cold partitions only.
+                    let del_cold = format!(
+                        "{} AND {}.{}::text <> ALL($1::TEXT[])",
+                        base_del, qv, part_col_q
+                    );
+                    let ins_cold = format!(
+                        "INSERT INTO {} SELECT * FROM ({}) __pt WHERE __pt.{}::text <> ALL($1::TEXT[])",
+                        qv, delta_new, part_col_q
+                    );
+                    let aff = format!(
+                        "SELECT {sc}::text AS pkey FROM {old} UNION SELECT {sc}::text AS pkey FROM {new}",
+                        sc = part_src_q,
+                        old = pt_old,
+                        new = pt_new
+                    );
+                    stmts.push(build_passthrough_partition_dispatch_sql(
+                        view_name, &qv, &aff, &part_col, &del_cold, &ins_cold,
+                    ));
+                } else {
+                    stmts.push(base_del);
+                    stmts.push(base_ins);
+                }
             } else {
                 stmts.push(format!("DELETE FROM {}", qv));
                 stmts.push(format!("INSERT INTO {} {}", qv, base_query));

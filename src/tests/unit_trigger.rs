@@ -3037,3 +3037,75 @@ fn partition_dispatch_keeps_hot_swap_and_trip_cap_markers() {
         "classification groups present: {sql}"
     );
 }
+
+fn passthrough_partitioned_plan() -> AggregationPlan {
+    let mut p = simple_plan();
+    p.is_passthrough = true;
+    p.group_by_columns = vec![];
+    p.partition_columns = vec!["dem_plan_id".to_string()];
+    p.partition_strategy = "LIST".to_string();
+    p.passthrough_key_mappings = std::collections::HashMap::from([(
+        "ss".to_string(),
+        vec![
+            ("dem_plan_id".to_string(), "dem_plan_id".to_string()),
+            ("product_id".to_string(), "product_id".to_string()),
+        ],
+    )]);
+    p
+}
+
+#[test]
+fn passthrough_update_partitioned_emits_dispatch() {
+    let plan = passthrough_partitioned_plan();
+    let mut stmts = Vec::new();
+    passthrough_op_stmts(
+        "fc",
+        "ss",
+        "UPDATE",
+        "SELECT dem_plan_id, product_id FROM ss",
+        &plan,
+        "__reflex_new_ss",
+        "__reflex_old_ss",
+        &mut stmts,
+    );
+    let joined = stmts.join("\n");
+    assert!(
+        joined.contains("reflex_reconcile_partition"),
+        "hot swap present: {joined}"
+    );
+    assert!(
+        joined.contains("__reflex_partition_child_for_key"),
+        "classification present: {joined}"
+    );
+    assert!(
+        joined.contains("dem_plan_id"),
+        "cold filter references partition col: {joined}"
+    );
+}
+
+#[test]
+fn passthrough_update_nonpartitioned_unchanged() {
+    let mut plan = passthrough_partitioned_plan();
+    plan.partition_columns = vec![];
+    plan.partition_strategy = String::new();
+    let mut stmts = Vec::new();
+    passthrough_op_stmts(
+        "fc",
+        "ss",
+        "UPDATE",
+        "SELECT dem_plan_id, product_id FROM ss",
+        &plan,
+        "__reflex_new_ss",
+        "__reflex_old_ss",
+        &mut stmts,
+    );
+    let joined = stmts.join("\n");
+    assert!(
+        !joined.contains("reflex_reconcile_partition"),
+        "no dispatch when unpartitioned: {joined}"
+    );
+    assert!(
+        joined.contains(") IN (SELECT"),
+        "still keyed delete: {joined}"
+    );
+}

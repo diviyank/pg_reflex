@@ -1701,3 +1701,41 @@ fn pg_part_deferred_hot_swap_aggregate_is_correct() {
     Spi::run("SELECT reflex_flush_deferred('dhs_src')").expect("flush");
     assert_imv_correct("dhsv", sql);
 }
+
+/// audit #2: partitioned passthrough UPDATE — correctness across one leaf and a
+/// near-full (hot) leaf, in DEFERRED mode. Exercises the hybrid dispatch:
+/// cold leaves get keyed delete/insert, the hot leaf is atomic-swapped, and the
+/// cold body must exclude the swapped leaf (no double-processing).
+#[pg_test]
+fn pg_part_passthrough_update_dispatch_deferred_correct() {
+    Spi::run("CREATE TABLE ppd_src (dem_plan_id INT NOT NULL, product_id INT NOT NULL, qty INT) PARTITION BY LIST (dem_plan_id)").expect("src");
+    Spi::run("CREATE TABLE ppd_1 PARTITION OF ppd_src FOR VALUES IN (1)").expect("p1");
+    Spi::run("CREATE TABLE ppd_2 PARTITION OF ppd_src FOR VALUES IN (2)").expect("p2");
+    Spi::run("CREATE TABLE ppd_3 PARTITION OF ppd_src FOR VALUES IN (3)").expect("p3");
+    Spi::run("INSERT INTO ppd_src SELECT (g%3)+1, g, g FROM generate_series(1,90) g").expect("seed");
+    let sql = "SELECT dem_plan_id, product_id, qty FROM ppd_src";
+    let res = Spi::get_one::<String>(&format!(
+        "SELECT create_reflex_ivm('ppdv', '{}', 'dem_plan_id,product_id', NULL, 'DEFERRED', NULL, ARRAY['dem_plan_id'])",
+        sql.replace('\'', "''")
+    )).expect("create call").expect("create result");
+    assert!(!res.starts_with("ERROR"), "create returned: {res}");
+    Spi::run("ANALYZE ppd_src").expect("analyze");
+    assert_imv_correct("ppdv", sql);
+
+    // 1 leaf, low selectivity → keyed cold path.
+    Spi::run("UPDATE ppd_src SET qty = qty + 1 WHERE dem_plan_id = 1 AND product_id = 1").expect("u1");
+    Spi::run("SELECT reflex_flush_deferred('ppd_src')").expect("f1");
+    assert_imv_correct("ppdv", sql);
+
+    // near-full leaf (hot) — low threshold forces the atomic swap path.
+    Spi::run("UPDATE public.__reflex_ivm_reference SET wipe_threshold = 0.01 WHERE name = 'ppdv'").expect("thr");
+    Spi::run("UPDATE ppd_src SET qty = qty + 100 WHERE dem_plan_id = 2").expect("u2");
+    Spi::run("SELECT reflex_flush_deferred('ppd_src')").expect("f2");
+    assert_imv_correct("ppdv", sql);
+
+    // mixed: one hot leaf + one cold single-row touch in the same flush.
+    Spi::run("UPDATE ppd_src SET qty = qty + 7 WHERE dem_plan_id = 3").expect("u3-hot");
+    Spi::run("UPDATE ppd_src SET qty = qty + 1 WHERE dem_plan_id = 1 AND product_id = 4").expect("u3-cold");
+    Spi::run("SELECT reflex_flush_deferred('ppd_src')").expect("f3");
+    assert_imv_correct("ppdv", sql);
+}
