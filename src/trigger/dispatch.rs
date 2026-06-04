@@ -175,6 +175,8 @@ pub(crate) const WIPE_FLOOR_ROWS_DEFAULT: i64 = 1000;
 /// caller is responsible for wrapping the scratch / WHERE clauses with
 /// the `$1::TEXT[]` parameter binding before passing in.
 #[allow(clippy::too_many_arguments)]
+/// LIST-strategy wrapper over [`build_partition_aware_dispatch_sql_strategy`].
+/// Preserved so existing LIST callers and snapshots are unchanged.
 pub(crate) fn build_partition_aware_dispatch_sql(
     view_name: &str,
     intermediate_tbl: &str,
@@ -186,10 +188,55 @@ pub(crate) fn build_partition_aware_dispatch_sql(
     target_delete_sql_with_filter: &str,
     target_insert_sql_with_filter: &str,
 ) -> String {
+    build_partition_aware_dispatch_sql_strategy(
+        view_name,
+        intermediate_tbl,
+        intermediate_parent_qual,
+        affected_tbl,
+        partition_col,
+        "LIST",
+        merge_sql_with_filter,
+        dead_cleanup_sql,
+        target_delete_sql_with_filter,
+        target_insert_sql_with_filter,
+    )
+}
+
+/// Aggregate-path hot/cold partition dispatch (audit #2 / Component 4).
+///
+/// Classification groups dirty counts by RESOLVED CHILD (see the in-SQL note),
+/// emitting both `_hot_keys` (one representative value per hot child, for
+/// `reflex_reconcile_partition`) and `_hot_child_oids` (the hot child OIDs).
+/// The cold body's hot-exclusion filter is strategy-specific and lives in the
+/// caller's SQL strings:
+///   * **LIST**  → `<part_col> <> ALL($1::TEXT[])` (hot VALUES) — bind `_hot_keys`.
+///   * **RANGE** → `__reflex_partition_child_for_key(...) <> ALL($2::oid[])`
+///     (hot CHILD oids; a value-array filter is wrong because many values map to
+///     one range child) — bind `_hot_keys, _hot_child_oids`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_partition_aware_dispatch_sql_strategy(
+    view_name: &str,
+    intermediate_tbl: &str,
+    intermediate_parent_qual: &str,
+    affected_tbl: &str,
+    partition_col: &str,
+    strategy: &str,
+    merge_sql_with_filter: &str,
+    dead_cleanup_sql: Option<&str>,
+    target_delete_sql_with_filter: &str,
+    target_insert_sql_with_filter: &str,
+) -> String {
+    // RANGE cold filters reference $2 (hot child oids); LIST references only $1.
+    let using = if strategy.eq_ignore_ascii_case("RANGE") {
+        "_hot_keys, _hot_child_oids"
+    } else {
+        "_hot_keys"
+    };
     let dead_cleanup = match dead_cleanup_sql {
         Some(s) => format!(
-            "                EXECUTE $reflex_inner${cleanup}$reflex_inner$ USING _hot_keys;\n",
-            cleanup = s.replace("$reflex_inner$", "$reflex_inner_alt$")
+            "                EXECUTE $reflex_inner${cleanup}$reflex_inner$ USING {using};\n",
+            cleanup = s.replace("$reflex_inner$", "$reflex_inner_alt$"),
+            using = using,
         ),
         None => String::new(),
     };
@@ -208,6 +255,7 @@ pub(crate) fn build_partition_aware_dispatch_sql(
              _floor BIGINT;\n\
              _per_imv_floor BIGINT;\n\
              _hot_keys TEXT[] := ARRAY[]::TEXT[];\n\
+             _hot_child_oids OID[] := ARRAY[]::OID[];\n\
              _hot_count INT;\n\
              _partition_total INT;\n\
          BEGIN\n\
@@ -221,11 +269,11 @@ pub(crate) fn build_partition_aware_dispatch_sql(
                  FROM pg_inherits WHERE inhparent = '{int_parent}'::regclass;\n\
              IF _partition_total IS NULL OR _partition_total = 0 THEN\n\
                  RAISE DEBUG 'pg_reflex partition dispatch: % has no children — fallback to global', '{view}';\n\
-                 EXECUTE $reflex_inner${merge}$reflex_inner$ USING _hot_keys;\n\
+                 EXECUTE $reflex_inner${merge}$reflex_inner$ USING {using};\n\
                  EXECUTE 'ANALYZE {intermediate}';\n\
 {dead_cleanup}\
-                 EXECUTE $reflex_inner${tdel}$reflex_inner$ USING _hot_keys;\n\
-                 EXECUTE $reflex_inner${tins}$reflex_inner$ USING _hot_keys;\n\
+                 EXECUTE $reflex_inner${tdel}$reflex_inner$ USING {using};\n\
+                 EXECUTE $reflex_inner${tins}$reflex_inner$ USING {using};\n\
                  RETURN;\n\
              END IF;\n\
              -- Classify by RESOLVED CHILD, not by raw partition value: sum the\n\
@@ -233,8 +281,9 @@ pub(crate) fn build_partition_aware_dispatch_sql(
              -- compare the child's total dirty against its reltuples. For LIST\n\
              -- (1 value = 1 child) this is identical to per-value grouping; for\n\
              -- RANGE (many values per child) it is the only correct grouping.\n\
-             -- _hot_keys carries one REPRESENTATIVE value per hot child, which\n\
-             -- reflex_reconcile_partition re-resolves back to that child.\n\
+             -- _hot_keys carries one REPRESENTATIVE value per hot child (for\n\
+             -- reflex_reconcile_partition); _hot_child_oids carries the hot child\n\
+             -- OIDs (for the RANGE cold-exclusion filter, $2).\n\
              WITH per_val AS (\n\
                  SELECT \"{part_col}\"::text AS pkey, count(*) AS dirty\n\
                  FROM {affected}\n\
@@ -251,14 +300,16 @@ pub(crate) fn build_partition_aware_dispatch_sql(
                  ) cfk\n\
                  WHERE cfk.child IS NOT NULL\n\
                  GROUP BY cfk.child\n\
+             ),\n\
+             classified AS (\n\
+                 SELECT pc.rep_key, pc.child_oid,\n\
+                        (pc.dirty::NUMERIC / GREATEST(c.reltuples::NUMERIC, _floor::NUMERIC) >= _thr) AS hot\n\
+                 FROM per_child pc JOIN pg_class c ON c.oid = pc.child_oid\n\
              )\n\
-             SELECT COALESCE(array_agg(pc.rep_key::text), ARRAY[]::TEXT[])\n\
-                 INTO _hot_keys\n\
-                 FROM per_child pc\n\
-                 JOIN pg_class c ON c.oid = pc.child_oid\n\
-                 WHERE pc.dirty::NUMERIC\n\
-                       / GREATEST(c.reltuples::NUMERIC, _floor::NUMERIC)\n\
-                       >= _thr;\n\
+             SELECT COALESCE(array_agg(rep_key::text) FILTER (WHERE hot), ARRAY[]::TEXT[]),\n\
+                    COALESCE(array_agg(child_oid)     FILTER (WHERE hot), ARRAY[]::oid[])\n\
+                 INTO _hot_keys, _hot_child_oids\n\
+                 FROM classified;\n\
              _hot_count := COALESCE(array_length(_hot_keys, 1), 0);\n\
              RAISE DEBUG 'pg_reflex partition dispatch: hot=% total=% thr=% floor=%', _hot_count, _partition_total, _thr, _floor;\n\
              -- Trip-cap: sequential DETACH/ATTACH on > half of partitions\n\
@@ -274,12 +325,12 @@ pub(crate) fn build_partition_aware_dispatch_sql(
                  PERFORM public.reflex_reconcile_partition('{view}', array_to_string(_hot_keys, ','));\n\
              END IF;\n\
              -- Cold partitions: standard MERGE + target sync, restricted\n\
-             -- by partition filter ($1 bound to _hot_keys).\n\
-             EXECUTE $reflex_inner${merge}$reflex_inner$ USING _hot_keys;\n\
+             -- by the strategy-specific partition filter the caller spliced in.\n\
+             EXECUTE $reflex_inner${merge}$reflex_inner$ USING {using};\n\
              EXECUTE 'ANALYZE {intermediate}';\n\
 {dead_cleanup}\
-             EXECUTE $reflex_inner${tdel}$reflex_inner$ USING _hot_keys;\n\
-             EXECUTE $reflex_inner${tins}$reflex_inner$ USING _hot_keys;\n\
+             EXECUTE $reflex_inner${tdel}$reflex_inner$ USING {using};\n\
+             EXECUTE $reflex_inner${tins}$reflex_inner$ USING {using};\n\
          END\n\
          $reflex_dispatch$",
         view = safe_view,
@@ -294,6 +345,7 @@ pub(crate) fn build_partition_aware_dispatch_sql(
         dead_cleanup = dead_cleanup,
         tdel = safe_tdel,
         tins = safe_tins,
+        using = using,
     )
 }
 

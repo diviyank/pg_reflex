@@ -3109,3 +3109,33 @@ fn passthrough_update_nonpartitioned_unchanged() {
         "still keyed delete: {joined}"
     );
 }
+
+#[test]
+fn partition_dispatch_range_uses_child_oid_filter() {
+    let sql = build_partition_aware_dispatch_sql_strategy(
+        "v", "__int", "__int", "__aff", "d", "RANGE", "MERGE_$2", None, "TDEL_$2", "TINS_$2",
+    );
+    assert!(
+        sql.contains("_hot_child_oids"),
+        "RANGE binds hot child oids: {sql}"
+    );
+    assert!(
+        sql.contains("USING _hot_keys, _hot_child_oids"),
+        "RANGE cold filter binds child oids as $2: {sql}"
+    );
+}
+
+#[test]
+fn partition_dispatch_list_unchanged_strategy_api() {
+    let sql = build_partition_aware_dispatch_sql_strategy(
+        "v", "__int", "__int", "__aff", "region", "LIST", "MERGE_$1", None, "TDEL_$1", "TINS_$1",
+    );
+    assert!(
+        sql.contains("$reflex_inner$MERGE_$1$reflex_inner$ USING _hot_keys"),
+        "LIST still binds only _hot_keys: {sql}"
+    );
+    assert!(
+        !sql.contains("USING _hot_keys, _hot_child_oids"),
+        "LIST must NOT bind child oids: {sql}"
+    );
+}
