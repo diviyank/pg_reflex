@@ -1469,10 +1469,11 @@ fn install_secondary_key_indexes(client: &mut SpiClient<'_>, ctx: &BuildContext)
         if mappings.is_empty() {
             continue;
         }
-        let cols: Vec<String> = mappings
-            .iter()
-            .map(|(t, _)| normalized_column_name(t))
-            .collect();
+        // Mapping target names are ALREADY normalized (case-preserved, unquoted)
+        // — use them as-is. Re-normalizing an unquoted mixed-case name would
+        // lowercase it (e.g. "Id" -> id) and break both the coverage probe and
+        // the CREATE INDEX against a case-preserved column.
+        let cols: Vec<String> = mappings.iter().map(|(t, _)| t.clone()).collect();
         if index_covers_prefix(client, ctx.view_name, &cols) {
             continue;
         }
