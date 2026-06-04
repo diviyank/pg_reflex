@@ -631,3 +631,25 @@ fn pg_part_passthrough_cold_multi_partition_update_oracle() {
         .expect("cold insert");
     assert_imv_correct("pt_cold_v", sql);
 }
+
+/// The LIST dispatch SQL must carry a typed partition-key pruning predicate;
+/// RANGE must not (pruning is LIST-only). Guards the codegen shape directly.
+#[pg_test]
+fn pg_part_list_dispatch_sql_has_pruning_predicate() {
+    let list_sql = crate::trigger::build_passthrough_partition_dispatch_sql(
+        "v", "\"public\".\"v\"", "SELECT 1 AS pkey", "region", "\"public\".\"v\".\"region\"",
+        "LIST", "DELETE FROM \"public\".\"v\" WHERE id IN (SELECT id FROM pt_old)", "",
+    );
+    assert!(
+        list_sql.contains("= ANY($2::text[]::"),
+        "LIST dispatch must prune on the partition key; got:\n{list_sql}"
+    );
+    let range_sql = crate::trigger::build_passthrough_partition_dispatch_sql(
+        "v", "\"public\".\"v\"", "SELECT 1 AS pkey", "ts", "\"public\".\"v\".\"ts\"",
+        "RANGE", "DELETE FROM \"public\".\"v\" WHERE id IN (SELECT id FROM pt_old)", "",
+    );
+    assert!(
+        !range_sql.contains("= ANY($2::text[]::"),
+        "RANGE dispatch must not add value-ANY pruning (LIST-only); got:\n{range_sql}"
+    );
+}
