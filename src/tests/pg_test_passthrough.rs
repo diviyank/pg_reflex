@@ -763,3 +763,66 @@ fn test_passthrough_auto_pk_recorded_in_catalog() {
         "single-source passthrough must record the auto-detected PK as its unique key"
     );
 }
+
+/// Partitioned passthrough IMV with a WHERE filter and a LEFT JOIN. Forces the
+/// COLD dispatch path (high wipe_threshold) so it exercises the keyed cold
+/// maintenance that Phase 2 turns into an in-place upsert. Covers: (a) pure-data
+/// UPDATE, (b) a row LEAVING the filter without the source row vanishing, (c) a
+/// new key entering, (d) a key-column change, (e) a delete. The IMV must match a
+/// fresh recompute after each op (today via DELETE+INSERT; Phase 2 via upsert).
+#[pg_test]
+fn pt_inplace_upsert_filter_and_keychange_oracle() {
+    Spi::run("CREATE TABLE up_src (id BIGINT NOT NULL, region TEXT NOT NULL, status TEXT NOT NULL, qty BIGINT, PRIMARY KEY (id, region)) PARTITION BY LIST (region)").expect("src");
+    for r in ["A", "B"] {
+        Spi::run(&format!("CREATE TABLE up_src_{} PARTITION OF up_src FOR VALUES IN ('{}')", r, r)).expect("p");
+    }
+    Spi::run("CREATE TABLE up_price (id BIGINT PRIMARY KEY, price BIGINT)").expect("price");
+    Spi::run("INSERT INTO up_price VALUES (1,10),(2,20),(3,30),(4,40)").expect("seed price");
+    Spi::run("INSERT INTO up_src VALUES (1,'A','ok',5),(2,'A','ok',6),(3,'B','ok',7)").expect("seed src");
+
+    let sql = "SELECT s.id, s.region, s.qty * COALESCE(p.price,0) AS turnover \
+               FROM up_src s LEFT JOIN up_price p ON p.id = s.id WHERE s.status = 'ok'";
+
+    // Call create_reflex_ivm via SQL to pass partition_by as ARRAY.
+    // The Rust wrapper only supports 6 parameters; the 7th partition_by
+    // parameter requires the PostgreSQL overload. Partition by 'region' only,
+    // matching the source table's LIST partition strategy.
+    let res = Spi::get_one::<String>(
+        &format!(
+            "SELECT create_reflex_ivm('up_v', '{}', 'id,region', NULL, NULL, NULL, ARRAY['region'])",
+            sql.replace("'", "''")
+        ),
+    )
+    .expect("create_reflex_ivm call")
+    .expect("create_reflex_ivm result");
+    assert_eq!(res, "CREATE REFLEX INCREMENTAL VIEW");
+
+    // Force the COLD dispatch path by setting an impossible wipe_threshold (2.0).
+    // With default wipe_threshold (0.5), small changes on small partitions would
+    // get classified HOT and take the atomic-swap reconcile path, bypassing the
+    // keyed-maintenance code that Phase 2 optimizes. This guard ensures Phase 2's
+    // in-place upsert actually exercises the cold path.
+    Spi::run("SELECT reflex_set_wipe_threshold('up_v', 2.0::NUMERIC)").expect("force cold");
+
+    assert_imv_correct("up_v", sql);
+
+    // (a) pure-data update: qty changes, key + region unchanged.
+    Spi::run("UPDATE up_src SET qty = qty + 100 WHERE id = 1").expect("pure-data");
+    assert_imv_correct("up_v", sql);
+
+    // (b) row leaves the filter (status -> not ok) WITHOUT the source row vanishing.
+    Spi::run("UPDATE up_src SET status = 'archived' WHERE id = 2").expect("filter-exit");
+    assert_imv_correct("up_v", sql);
+
+    // (c) brand-new key entering the filter.
+    Spi::run("INSERT INTO up_src VALUES (4,'B','ok',8)").expect("new key");
+    assert_imv_correct("up_v", sql);
+
+    // (d) key change: move id=3 to region B->A (the key col `region` changes).
+    Spi::run("UPDATE up_src SET region = 'A' WHERE id = 3").expect("key change");
+    assert_imv_correct("up_v", sql);
+
+    // (e) delete a key.
+    Spi::run("DELETE FROM up_src WHERE id = 1").expect("delete");
+    assert_imv_correct("up_v", sql);
+}
