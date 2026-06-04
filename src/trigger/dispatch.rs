@@ -261,7 +261,13 @@ pub(crate) fn build_partition_aware_dispatch_sql_strategy(
              -- reflex_reconcile_partition); _hot_child_names carries the hot child\n\
              -- names (for the RANGE cold-exclusion filter, $2 — names survive the\n\
              -- swap's DETACH/ATTACH+RENAME, OIDs do not).\n\
-             WITH per_val AS (\n\
+             -- per_val is MATERIALIZED as an optimization barrier: it forces the\n\
+             -- dedup-to-distinct-values to run BEFORE the LATERAL child resolution\n\
+             -- below. Without it the planner flattens the CTEs and pushes the\n\
+             -- VOLATILE __reflex_partition_child_for_key down into the row scan,\n\
+             -- calling it once PER CHANGED ROW (O(delta), ~seconds at 10-100k rows)\n\
+             -- instead of once per DISTINCT touched partition (O(partitions), ms).\n\
+             WITH per_val AS MATERIALIZED (\n\
                  SELECT \"{part_col}\"::text AS pkey, count(*) AS dirty\n\
                  FROM {affected}\n\
                  GROUP BY \"{part_col}\"\n\
@@ -395,7 +401,13 @@ pub(crate) fn build_passthrough_partition_dispatch_sql(
              -- Classify dirty partition values by RESOLVED CHILD (see\n\
              -- build_partition_aware_dispatch_sql_strategy): one representative key\n\
              -- per hot child, plus the hot child NAMES for the RANGE cold filter.\n\
-             WITH per_val AS (\n\
+             -- per_val is MATERIALIZED as an optimization barrier: it forces the\n\
+             -- dedup-to-distinct-values to run BEFORE the LATERAL child resolution\n\
+             -- below. Without it the planner flattens the CTEs and pushes the\n\
+             -- VOLATILE __reflex_partition_child_for_key down into the row scan,\n\
+             -- calling it once PER CHANGED ROW (O(delta), ~seconds at 10-100k rows)\n\
+             -- instead of once per DISTINCT touched partition (O(partitions), ms).\n\
+             WITH per_val AS MATERIALIZED (\n\
                  SELECT pkey::text AS pkey, count(*) AS dirty FROM ({aff}) __pv GROUP BY pkey\n\
              ),\n\
              per_child AS (\n\
