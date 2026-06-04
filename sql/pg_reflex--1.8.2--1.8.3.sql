@@ -1,0 +1,47 @@
+-- Migration: pg_reflex 1.8.2 → 1.8.3
+--
+-- Run via: ALTER EXTENSION pg_reflex UPDATE TO '1.8.3';
+--
+-- 1.8.3 is a performance + correctness release for passthrough maintenance.
+-- There are NO catalog schema changes, NO function signature changes, and NO
+-- SPI additions — every change is in the Rust trigger/dispatch codegen and the
+-- key-resolution logic, which is recompiled into the module. Existing IMVs
+-- continue to operate without intervention.
+--
+-- Notable changes (all in-process, no migration DDL):
+--
+--   (a) Partition-aware trigger dispatch for partitioned passthrough and
+--       aggregate IMVs (LIST and RANGE). A DML batch is now routed to only the
+--       affected child partitions ("hot" children) instead of re-scanning the
+--       whole mirrored tree; RANGE binds the hot child OIDs and excludes the
+--       cold ones. Per-value materialization makes child resolution
+--       O(partitions) rather than O(rows).
+--
+--   (b) Keyed incremental maintenance for passthrough LEFT-JOIN secondaries
+--       (audit #3). A change on a to-one secondary source is now applied via a
+--       keyed delete + delta insert instead of a full rebuild. FULL OUTER
+--       passthrough secondaries retain the (correct) full-rebuild fallback.
+--       Secondary join keys are auto-indexed (coverage-checked) so the keyed
+--       path has an index to probe.
+--
+--   (c) Inner CTE sub-IMVs (and single-source passthrough IMVs generally) now
+--       auto-detect a source PRIMARY KEY and maintain incrementally (keyed
+--       delete + delta insert) instead of full-rebuilding on every flush. A
+--       single-source PK was previously never detected because the catalog
+--       lookup read `pg_attribute.attname` (type `name`) into a `text[]`
+--       binding and silently discarded the type mismatch; the lookup now casts
+--       `attname::text`. A CTE whose source has no provable unique key keeps
+--       the (correct) keyless full-rebuild fallback.
+--
+--   (d) Case is preserved in the secondary-key auto-index for mixed-case
+--       columns.
+--
+-- Migration steps:
+--
+--   No DDL is required. This file exists purely to register the
+--   1.8.2 → 1.8.3 upgrade path with PostgreSQL's extension machinery. Replace
+--   the module (.so) before running `ALTER EXTENSION pg_reflex UPDATE TO
+--   '1.8.3';` so the new dispatch / key-resolution behavior is loaded.
+
+-- No-op marker: ALTER EXTENSION needs a non-empty migration file.
+SELECT 1 WHERE FALSE;

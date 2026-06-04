@@ -1,5 +1,66 @@
 # Changelog
 
+## [1.8.3] - 2026-06-04
+
+A performance + correctness release for passthrough maintenance. Partitioned
+passthrough/aggregate IMVs now dispatch DML to only the affected child
+partitions; passthrough LEFT-JOIN secondaries are maintained with a keyed
+delete + delta insert instead of a full rebuild; and inner CTE sub-IMVs (and
+single-source passthrough IMVs generally) now detect a source PRIMARY KEY and
+maintain incrementally instead of full-rebuilding on every flush. There are no
+catalog/schema changes and no function-signature changes — every change ships in
+the recompiled module, so existing IMVs keep working: `ALTER EXTENSION pg_reflex
+UPDATE TO '1.8.3';`.
+
+---
+
+### Added
+
+- **Keyed incremental maintenance for passthrough LEFT-JOIN secondaries**
+  (audit #3). A change on a to-one secondary source is applied via a keyed
+  delete + delta insert rather than a full rebuild. FULL OUTER passthrough
+  secondaries retain the (correct) full-rebuild fallback.
+- **Auto-indexing of passthrough secondary join keys** (coverage-checked), so
+  the keyed secondary path has an index to probe.
+
+### Performance
+
+- **Partition-aware trigger dispatch** for partitioned passthrough and aggregate
+  IMVs (LIST and RANGE). A DML batch is routed to only the affected ("hot")
+  child partitions instead of re-scanning the mirrored tree; RANGE binds the hot
+  child OIDs and excludes the cold ones.
+- Child resolution during dispatch is now **O(partitions), not O(rows)** —
+  per-value materialization replaces a per-row child lookup.
+
+### Fixed
+
+- **Inner CTE sub-IMVs now maintain incrementally.** A single-source passthrough
+  (including the inner `__cte_<alias>` IMV of a CTE chain) never detected its
+  source PRIMARY KEY because the catalog lookup read `pg_attribute.attname`
+  (type `name`) into a `text[]` binding and silently swallowed the resulting
+  type mismatch, leaving the IMV keyless and forcing a full rebuild on every
+  flush (and, in a CTE chain, an oversized inner delta that re-scanned the outer
+  level too). The lookup now casts `attname::text` (matching the three sibling
+  catalog queries). A CTE whose source has no provable unique key keeps the
+  (correct) keyless full-rebuild fallback — no unsound key is ever assigned.
+- Case is preserved in the secondary-key auto-index for mixed-case columns.
+
+### Tests
+
+- Oracle coverage for keyed passthrough secondaries (IMMEDIATE + DEFERRED),
+  partitioned-passthrough hot/cold dispatch (LIST + RANGE), and keyed inner CTE
+  maintenance: catalog key detection, IMMEDIATE correctness under all DML
+  including rows entering/leaving a CTE's WHERE filter, O(K) inner delta in
+  DEFERRED mode, and the retained keyless fallback.
+
+### Migration
+
+- No-op marker (`sql/pg_reflex--1.8.2--1.8.3.sql`): no DDL — all changes ship in
+  the module. Run `ALTER EXTENSION pg_reflex UPDATE TO '1.8.3';` after replacing
+  the `.so`.
+
+---
+
 ## [1.8.2] - 2026-06-03
 
 The IMV's partition depth is now decoupled from the source's: it can mirror the

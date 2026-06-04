@@ -4,6 +4,33 @@ The full changelog tracks every release. The latest version's headlines are on t
 
 For each version below, see [`CHANGELOG.md`](https://github.com/diviyank/pg_reflex/blob/main/CHANGELOG.md) on GitHub for the canonical text.
 
+## [1.8.3] — 2026-06-04
+
+Performance + correctness release for passthrough maintenance: partitioned passthrough/aggregate IMVs dispatch DML only to affected child partitions, passthrough LEFT-JOIN secondaries are maintained with a keyed delete + delta insert instead of a full rebuild, and inner CTE sub-IMVs (and single-source passthrough IMVs generally) now detect a source PRIMARY KEY and maintain incrementally instead of full-rebuilding every flush. No catalog/schema or function-signature changes — all changes ship in the recompiled module: `ALTER EXTENSION pg_reflex UPDATE TO '1.8.3';`.
+
+**Added**
+
+- Keyed incremental maintenance for passthrough LEFT-JOIN secondaries (audit #3); FULL OUTER secondaries keep the correct full-rebuild fallback.
+- Auto-indexing of passthrough secondary join keys (coverage-checked).
+
+**Performance**
+
+- Partition-aware trigger dispatch (LIST + RANGE): a DML batch touches only the affected ("hot") child partitions instead of re-scanning the mirrored tree.
+- Child resolution during dispatch is now O(partitions), not O(rows).
+
+**Fixed**
+
+- Inner CTE sub-IMVs (and single-source passthrough IMVs) now maintain incrementally: the source-PK catalog lookup read `attname` (type `name`) into a `text[]` binding and silently swallowed the type mismatch, so no key was ever detected and the IMV full-rebuilt every flush; it now casts `attname::text`. Sources with no provable key keep the correct keyless full-rebuild fallback.
+- Case preserved in the secondary-key auto-index for mixed-case columns.
+
+**Tests**
+
+- Oracle coverage for keyed passthrough secondaries (IMMEDIATE + DEFERRED), LIST/RANGE hot-cold dispatch, and keyed inner CTE maintenance (catalog key, IMMEDIATE correctness incl. filter transitions, O(K) DEFERRED delta, keyless fallback).
+
+**Migration**
+
+- No-op marker: [`sql/pg_reflex--1.8.2--1.8.3.sql`](https://github.com/diviyank/pg_reflex/blob/main/sql/pg_reflex--1.8.2--1.8.3.sql) — no DDL; replace the `.so`, then `ALTER EXTENSION pg_reflex UPDATE TO '1.8.3';`.
+
 ## [1.7.6] — 2026-06-01
 
 Correctness release: `ignore_sources` is now honored on the DEFERRED trigger path (previously only IMMEDIATE). Run `ALTER EXTENSION pg_reflex UPDATE TO '1.7.6';` and replace the `.so`; the migration rebuilds source triggers so the fix applies without re-creating IMVs.
