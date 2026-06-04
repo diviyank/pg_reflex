@@ -527,6 +527,15 @@ pub(crate) fn outer_join_secondary_stmts(
     if plan.is_passthrough {
         match plan.passthrough_key_mappings.get(source_table) {
             Some(mappings) if !mappings.is_empty() => {
+                let bq_upper = base_query.to_uppercase();
+                if bq_upper.contains("FULL JOIN") || bq_upper.contains("FULL OUTER") {
+                    // A FULL JOIN delta surfaces unmatched rows from the OTHER
+                    // side that keyed scoping (on this secondary's join keys)
+                    // cannot capture — keep the safe full rebuild.
+                    stmts.push(format!("DELETE FROM {}", qv));
+                    stmts.push(format!("INSERT INTO {} {}", qv, base_query));
+                    return;
+                }
                 let target_cols: Vec<String> =
                     mappings.iter().map(|(t, _)| format!("\"{}\"", t)).collect();
                 // Changed secondary join keys, drawn only from the transition

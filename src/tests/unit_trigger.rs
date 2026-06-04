@@ -2973,3 +2973,35 @@ fn secondary_passthrough_without_mapping_falls_back_to_rebuild() {
         "no mapping → full rebuild retained: {joined}"
     );
 }
+
+#[test]
+fn full_outer_secondary_passthrough_falls_back_to_rebuild() {
+    let plan = passthrough_secondary_plan(); // has a mapping
+    let mut stmts = Vec::new();
+    // base_query containing FULL OUTER JOIN must force the rebuild fallback:
+    // a FULL JOIN delta surfaces unmatched rows from the other side that keyed
+    // scoping cannot capture.
+    outer_join_secondary_stmts(
+        "fc_view",
+        "caav",
+        "UPDATE",
+        "SELECT s.product_id, s.location_id FROM s FULL OUTER JOIN caav ON caav.product_id = s.product_id",
+        "",
+        &plan,
+        &None,
+        "__int",
+        "__aff",
+        "__reflex_old_caav",
+        "__reflex_new_caav",
+        &mut stmts,
+    );
+    let joined = stmts.join("\n");
+    assert!(
+        joined.contains("DELETE FROM \"fc_view\""),
+        "FULL OUTER → full rebuild: {joined}"
+    );
+    assert!(
+        !joined.contains(") IN ("),
+        "FULL OUTER must NOT be keyed: {joined}"
+    );
+}
