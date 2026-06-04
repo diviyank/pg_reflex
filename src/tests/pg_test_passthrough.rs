@@ -619,3 +619,54 @@ fn test_passthrough_no_pk_no_inference() {
         "INSERT should still propagate without a PK",
     );
 }
+
+/// audit #3: passthrough IMV with a LEFT JOIN secondary. Exercise INSERT /
+/// DELETE / UPDATE on the secondary (incl. NULL↔value and a no-match key) and
+/// assert the IMV matches a fresh recompute after each op. Keyed maintenance
+/// must produce identical results to the full rebuild it replaces.
+#[pg_test]
+fn pt_secondary_keyed_left_join_all_ops_immediate() {
+    Spi::run("CREATE TABLE sk_anchor (id INT PRIMARY KEY, product_id INT NOT NULL, location_id INT NOT NULL, qty INT)").expect("anchor");
+    Spi::run("CREATE TABLE sk_act (product_id INT NOT NULL, location_id INT NOT NULL, is_active BOOL)").expect("sec");
+    Spi::run("INSERT INTO sk_anchor VALUES (1,10,100,5),(2,10,101,6),(3,11,100,7)").expect("seed anchor");
+    Spi::run("INSERT INTO sk_act VALUES (10,100,TRUE)").expect("seed sec");
+    let sql = "SELECT a.id, a.product_id, a.location_id, a.qty, COALESCE(c.is_active, FALSE) AS active \
+               FROM sk_anchor a LEFT JOIN sk_act c ON c.product_id = a.product_id AND c.location_id = a.location_id";
+    let res = crate::create_reflex_ivm("skv", sql, Some("id"), None, None, None);
+    assert_eq!(res, "CREATE REFLEX INCREMENTAL VIEW");
+    assert_imv_correct("skv", sql);
+
+    // INSERT into secondary: activate a key that exists in the anchor.
+    Spi::run("INSERT INTO sk_act VALUES (10,101,TRUE)").expect("insert sec (activate key)");
+    assert_imv_correct("skv", sql);
+    // UPDATE the secondary's value (TRUE -> FALSE).
+    Spi::run("UPDATE sk_act SET is_active = FALSE WHERE product_id = 10 AND location_id = 100").expect("update sec");
+    assert_imv_correct("skv", sql);
+    // DELETE from secondary: affected anchor rows revert to COALESCE(NULL,FALSE).
+    Spi::run("DELETE FROM sk_act WHERE product_id = 10 AND location_id = 101").expect("delete sec");
+    assert_imv_correct("skv", sql);
+    // no-match key: secondary row for a (product,location) not present in anchor.
+    Spi::run("INSERT INTO sk_act VALUES (99,999,TRUE)").expect("insert no-match");
+    assert_imv_correct("skv", sql);
+}
+
+/// Same as above but DEFERRED: the whole batch collapses into one flush, and
+/// the keyed delete/reinsert runs once over the netted union of changed keys.
+#[pg_test]
+fn pt_secondary_keyed_left_join_all_ops_deferred() {
+    Spi::run("CREATE TABLE skd_anchor (id INT PRIMARY KEY, product_id INT NOT NULL, location_id INT NOT NULL, qty INT)").expect("anchor");
+    Spi::run("CREATE TABLE skd_act (product_id INT NOT NULL, location_id INT NOT NULL, is_active BOOL)").expect("sec");
+    Spi::run("INSERT INTO skd_anchor VALUES (1,10,100,5),(2,10,101,6),(3,11,100,7)").expect("seed anchor");
+    Spi::run("INSERT INTO skd_act VALUES (10,100,TRUE)").expect("seed sec");
+    let sql = "SELECT a.id, a.product_id, a.location_id, a.qty, COALESCE(c.is_active, FALSE) AS active \
+               FROM skd_anchor a LEFT JOIN skd_act c ON c.product_id = a.product_id AND c.location_id = a.location_id";
+    let res = crate::create_reflex_ivm("skdv", sql, Some("id"), None, Some("DEFERRED"), None);
+    assert_eq!(res, "CREATE REFLEX INCREMENTAL VIEW");
+    assert_imv_correct("skdv", sql);
+
+    Spi::run("INSERT INTO skd_act VALUES (10,101,TRUE)").expect("ins");
+    Spi::run("UPDATE skd_act SET is_active = FALSE WHERE product_id = 10 AND location_id = 100").expect("upd");
+    Spi::run("DELETE FROM skd_act WHERE product_id = 11 AND location_id = 100").expect("del-nomatch");
+    Spi::run("SELECT reflex_flush_deferred('skd_act')").expect("flush");
+    assert_imv_correct("skdv", sql);
+}
