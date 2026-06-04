@@ -851,6 +851,48 @@ fn test_cte_inner_keyed_correctness_immediate() {
     assert_imv_correct("ckc_view", fresh);
 }
 
+// Component 1: in DEFERRED mode, a small edit to the source must produce an
+// O(K) staging delta on the inner CTE sub-IMV (keyed delete + delta insert),
+// not a full-table rebuild, and the inner level must stay correct after flush.
+#[pg_test]
+fn test_cte_inner_delta_is_bounded_deferred() {
+    Spi::run("CREATE TABLE cdb_s (id INT PRIMARY KEY, grp INT NOT NULL, qty INT, flag BOOL)")
+        .expect("create");
+    Spi::run("INSERT INTO cdb_s SELECT i, i % 10, i, (i % 2 = 0) FROM generate_series(1, 1000) i")
+        .expect("seed");
+
+    crate::create_reflex_ivm(
+        "cdb_view",
+        "WITH f AS (SELECT id, grp, qty FROM cdb_s WHERE flag) SELECT id, grp, qty FROM f",
+        Some("id"),
+        None,
+        Some("DEFERRED"),
+        None,
+    );
+
+    // 500 rows pass the filter; edit exactly 3 of them.
+    Spi::run("UPDATE cdb_s SET qty = qty + 1 WHERE id IN (2, 4, 6)").expect("update");
+    Spi::run("SELECT reflex_flush_deferred('cdb_s')").expect("flush");
+
+    // Inner staging delta must be O(K): 3 updated rows -> at most 6 delta rows
+    // (delete + insert per row). A full rebuild would be ~1000 (2 * 500).
+    let inner_delta = Spi::get_one::<i64>("SELECT count(*) FROM __reflex_delta_cdb_view__cte_f")
+        .expect("q")
+        .expect("v");
+    assert!(
+        inner_delta <= 6,
+        "inner delta must be O(K) for a 3-row edit, got {} (full rebuild would be ~1000)",
+        inner_delta
+    );
+
+    // The inner level is directly maintained by the source flush; assert it is correct.
+    // (The chained OUTER's mid-transaction freshness is Component 2's concern.)
+    assert_imv_correct(
+        "cdb_view__cte_f",
+        "SELECT id, grp, qty FROM cdb_s WHERE flag",
+    );
+}
+
 // 1.7.5 — an ungrouped aggregate IMV (no GROUP BY → exactly one row) must be
 // flagged max_one_row so JOIN inference can treat a CROSS JOIN to it as to-one.
 #[pg_test]
