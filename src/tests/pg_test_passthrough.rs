@@ -670,3 +670,65 @@ fn pt_secondary_keyed_left_join_all_ops_deferred() {
     Spi::run("SELECT reflex_flush_deferred('skd_act')").expect("flush");
     assert_imv_correct("skdv", sql);
 }
+
+/// audit #3: a passthrough IMV with a LEFT JOIN secondary gets an index on the
+/// secondary join-key columns auto-created on the IMV, so the keyed secondary
+/// DELETE is index-served. A secondary mapping is only derived when the join's
+/// other side is a UNIQUE-KEY column, so the key is composite
+/// (region, product_id, location_id) and the secondary maps the NON-leading
+/// subset (product_id, location_id) — which the `__reflex_uk_*` index (leading
+/// with region) does NOT cover, so a dedicated index must be created. The
+/// prefix is matched via the 0-indexed `indkey` int2vector (no fragile
+/// `int2vector::int2[]` cast). This mirrors the audit's sop_forecast_view, whose
+/// key leads with dem_plan_id and whose caav secondary maps product_id/location_id.
+#[pg_test]
+fn pt_secondary_autoindex_created() {
+    Spi::run("CREATE TABLE ai_anchor (region INT NOT NULL, product_id INT NOT NULL, location_id INT NOT NULL, qty INT)").expect("anchor");
+    Spi::run("CREATE TABLE ai_act (product_id INT NOT NULL, location_id INT NOT NULL, is_active BOOL)").expect("sec");
+    let sql = "SELECT a.region, a.product_id, a.location_id, a.qty, COALESCE(c.is_active, FALSE) AS active \
+               FROM ai_anchor a LEFT JOIN ai_act c ON c.product_id = a.product_id AND c.location_id = a.location_id";
+    let res = crate::create_reflex_ivm("aiv", sql, Some("region,product_id,location_id"), None, None, None);
+    assert_eq!(res, "CREATE REFLEX INCREMENTAL VIEW");
+
+    let has_idx = Spi::get_one::<bool>(
+        "SELECT EXISTS ( \
+            SELECT 1 FROM pg_index i \
+            WHERE i.indrelid = 'aiv'::regclass \
+              AND i.indnkeyatts >= 2 \
+              AND NOT EXISTS ( \
+                  SELECT 1 FROM unnest(ARRAY['product_id','location_id']::text[]) \
+                       WITH ORDINALITY t(cname, ord) \
+                  WHERE i.indkey[ord - 1] IS DISTINCT FROM ( \
+                      SELECT a.attnum FROM pg_attribute a \
+                      WHERE a.attrelid = i.indrelid AND a.attname = t.cname \
+                            AND NOT a.attisdropped ) ) )",
+    ).expect("q").expect("c");
+    assert!(has_idx, "secondary-key index leading with (product_id, location_id) must be auto-created on the IMV");
+}
+
+/// The coverage check must skip creation when an index already covers the
+/// secondary columns as a leading prefix. Here the key IS (product_id,
+/// location_id), so the secondary's mapped columns are exactly the unique key —
+/// the `__reflex_uk_*` index already covers them and no second index is added.
+#[pg_test]
+fn pt_secondary_autoindex_skipped_when_covered() {
+    Spi::run("CREATE TABLE aic_anchor (product_id INT NOT NULL, location_id INT NOT NULL, qty INT)").expect("anchor");
+    Spi::run("CREATE TABLE aic_act (product_id INT NOT NULL, location_id INT NOT NULL, is_active BOOL)").expect("sec");
+    let sql = "SELECT a.product_id, a.location_id, a.qty, COALESCE(c.is_active, FALSE) AS active \
+               FROM aic_anchor a LEFT JOIN aic_act c ON c.product_id = a.product_id AND c.location_id = a.location_id";
+    let res = crate::create_reflex_ivm("aicv", sql, Some("product_id,location_id"), None, None, None);
+    assert_eq!(res, "CREATE REFLEX INCREMENTAL VIEW");
+    let n = Spi::get_one::<i64>(
+        "SELECT count(*) FROM pg_index i \
+         WHERE i.indrelid = 'aicv'::regclass \
+           AND i.indnkeyatts >= 2 \
+           AND NOT EXISTS ( \
+               SELECT 1 FROM unnest(ARRAY['product_id','location_id']::text[]) \
+                    WITH ORDINALITY t(cname, ord) \
+               WHERE i.indkey[ord - 1] IS DISTINCT FROM ( \
+                   SELECT a.attnum FROM pg_attribute a \
+                   WHERE a.attrelid = i.indrelid AND a.attname = t.cname \
+                         AND NOT a.attisdropped ) )",
+    ).expect("q").expect("c");
+    assert!(n == 1, "exactly the unique-key index should cover (product_id, location_id) — no duplicate, found {n}");
+}

@@ -1412,6 +1412,85 @@ fn install_min_max_indexes(client: &mut pgrx::spi::SpiClient<'_>, ctx: &BuildCon
     }
 }
 
+/// Returns true when `view` already has an index whose leading key columns are
+/// exactly `cols` (in order) — i.e. an existing index already serves a keyed
+/// lookup on `cols`. `cols` are bare (unquoted, normalized) column names.
+///
+/// `indkey` is a 0-indexed `int2vector`; comparing `indkey[ord-1]` (per desired
+/// column at 1-based ordinal `ord`) against the column's `attnum` avoids the
+/// fragile `int2vector::int2[]` cast and any array lower-bound mismatch.
+fn index_covers_prefix(client: &mut SpiClient<'_>, view: &str, cols: &[String]) -> bool {
+    if cols.is_empty() {
+        return true;
+    }
+    let cols_literal = cols
+        .iter()
+        .map(|c| format!("'{}'", c.replace('\'', "''")))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let n = cols.len();
+    let v = view.replace('\'', "''");
+    let sql = format!(
+        "SELECT EXISTS ( \
+            SELECT 1 FROM pg_index i \
+            WHERE i.indrelid = '{v}'::regclass \
+              AND i.indnkeyatts >= {n} \
+              AND NOT EXISTS ( \
+                  SELECT 1 FROM unnest(ARRAY[{cols_literal}]::text[]) \
+                       WITH ORDINALITY t(cname, ord) \
+                  WHERE i.indkey[ord - 1] IS DISTINCT FROM ( \
+                      SELECT a.attnum FROM pg_attribute a \
+                      WHERE a.attrelid = i.indrelid AND a.attname = t.cname \
+                            AND NOT a.attisdropped ) ) ) AS covered",
+        v = v,
+        n = n,
+        cols_literal = cols_literal,
+    );
+    client
+        .select(&sql, None, &[])
+        .unwrap_or_report()
+        .next()
+        .and_then(|r| r.get_by_name::<bool, _>("covered").unwrap_or(None))
+        .unwrap_or(false)
+}
+
+/// Auto-create an index on the IMV for each passthrough secondary's join-key
+/// columns, so the keyed secondary DELETE (audit #3) is index-served (per-leaf
+/// on a partitioned IMV). Skipped when an existing index already covers the
+/// columns as a leading prefix — including the `__reflex_uk_*` unique key, which
+/// covers the primary source's full key, so the key-owner mapping is naturally
+/// skipped and only genuine secondaries get a new index.
+fn install_secondary_key_indexes(client: &mut SpiClient<'_>, ctx: &BuildContext) {
+    if !ctx.plan.is_passthrough {
+        return;
+    }
+    let bare_view = split_qualified_name(ctx.view_name).1;
+    for (source, mappings) in &ctx.plan.passthrough_key_mappings {
+        if mappings.is_empty() {
+            continue;
+        }
+        let cols: Vec<String> = mappings
+            .iter()
+            .map(|(t, _)| normalized_column_name(t))
+            .collect();
+        if index_covers_prefix(client, ctx.view_name, &cols) {
+            continue;
+        }
+        let cols_q = cols
+            .iter()
+            .map(|c| format!("\"{}\"", c))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let safe_src = source.replace('.', "_");
+        let idx_name = safe_identifier(&format!("__reflex_skidx_{}_{}", bare_view, safe_src));
+        let ddl = format!(
+            "CREATE INDEX IF NOT EXISTS \"{}\" ON {} ({})",
+            idx_name, ctx.view_name, cols_q
+        );
+        client.update(&ddl, None, &[]).unwrap_or_report();
+    }
+}
+
 /// Compute base_query / end_query / aggregations_json / index_columns /
 /// where_predicate, INSERT a RegistryRow into `__reflex_ivm_reference`, and
 /// add this IMV's name to the `graph_child` array of each parent IMV.
@@ -1898,6 +1977,7 @@ pub(crate) fn create_reflex_ivm_impl_with_materialization(
         install_deferred_flush_if_needed(client, &ctx);
 
         install_min_max_indexes(client, &ctx);
+        install_secondary_key_indexes(client, &ctx);
 
         persist_metadata(client, &ctx);
 
