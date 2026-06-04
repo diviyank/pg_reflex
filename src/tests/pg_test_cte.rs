@@ -811,6 +811,46 @@ fn test_cte_without_window_or_distinct_on_still_works() {
     assert_eq!(total_a, 30, "A: 10 + 20 = 30");
 }
 
+// Component 1: IMMEDIATE-mode CTE IMV stays correct under INSERT/UPDATE/DELETE,
+// including rows entering and leaving the CTE's WHERE filter.
+#[pg_test]
+fn test_cte_inner_keyed_correctness_immediate() {
+    Spi::run("CREATE TABLE ckc_s (id INT PRIMARY KEY, grp INT NOT NULL, qty INT, flag BOOL)")
+        .expect("create");
+    Spi::run("INSERT INTO ckc_s SELECT i, i % 10, i, (i % 2 = 0) FROM generate_series(1, 100) i")
+        .expect("seed");
+
+    crate::create_reflex_ivm(
+        "ckc_view",
+        "WITH f AS (SELECT id, grp, qty FROM ckc_s WHERE flag) SELECT id, grp, qty FROM f",
+        Some("id"),
+        None,
+        None,
+        None,
+    );
+
+    let fresh =
+        "WITH f AS (SELECT id, grp, qty FROM ckc_s WHERE flag) SELECT id, grp, qty FROM f";
+    assert_imv_correct("ckc_view", fresh);
+
+    Spi::run("UPDATE ckc_s SET qty = qty + 1 WHERE id = 2").expect("update");
+    assert_imv_correct("ckc_view", fresh);
+
+    Spi::run("DELETE FROM ckc_s WHERE id = 4").expect("delete");
+    assert_imv_correct("ckc_view", fresh);
+
+    Spi::run("INSERT INTO ckc_s VALUES (201, 1, 99, true)").expect("insert");
+    assert_imv_correct("ckc_view", fresh);
+
+    // Row entering the filter (flag false -> true).
+    Spi::run("UPDATE ckc_s SET flag = true WHERE id = 3").expect("enter filter");
+    assert_imv_correct("ckc_view", fresh);
+
+    // Row leaving the filter (flag true -> false).
+    Spi::run("UPDATE ckc_s SET flag = false WHERE id = 6").expect("leave filter");
+    assert_imv_correct("ckc_view", fresh);
+}
+
 // 1.7.5 — an ungrouped aggregate IMV (no GROUP BY → exactly one row) must be
 // flagged max_one_row so JOIN inference can treat a CROSS JOIN to it as to-one.
 #[pg_test]
