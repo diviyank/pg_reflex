@@ -855,7 +855,7 @@ pub(crate) fn passthrough_op_stmts(
                     );
                     let aff = format!("SELECT {}::text AS pkey FROM {}", part_src_q, pt_old);
                     stmts.push(build_passthrough_partition_dispatch_sql(
-                        view_name, &qv, &aff, &part_col, &strategy, &del_cold, "",
+                        view_name, &qv, &aff, &part_col, &format!("{}.{}", qv, part_col_q), &strategy, &del_cold, "",
                     ));
                 } else {
                     stmts.push(base_del);
@@ -924,7 +924,7 @@ pub(crate) fn passthrough_op_stmts(
                         new = pt_new
                     );
                     stmts.push(build_passthrough_partition_dispatch_sql(
-                        view_name, &qv, &aff, &part_col, &strategy, &del_cold, &ins_cold,
+                        view_name, &qv, &aff, &part_col, &format!("{}.{}", qv, part_col_q), &strategy, &del_cold, &ins_cold,
                     ));
                 } else {
                     stmts.push(base_del);

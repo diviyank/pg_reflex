@@ -348,6 +348,7 @@ pub(crate) fn build_passthrough_partition_dispatch_sql(
     target_parent_qual: &str,
     affected_select: &str,
     partition_col: &str,
+    target_part_ref: &str,
     strategy: &str,
     cold_delete_with_filter: &str,
     cold_insert_with_filter: &str,
@@ -359,11 +360,68 @@ pub(crate) fn build_passthrough_partition_dispatch_sql(
     let safe_ins = cold_insert_with_filter.replace("$reflex_inner$", "$reflex_inner_alt$");
     // RANGE cold filters reference $2 (hot child NAMES — stable across the swap's
     // DETACH/ATTACH+RENAME, unlike the OID); LIST references only $1 (hot values).
+    let is_list = strategy.eq_ignore_ascii_case("LIST");
+
     let using = if strategy.eq_ignore_ascii_case("RANGE") {
         "_hot_keys, _hot_child_names"
     } else {
         "_hot_keys"
     };
+
+    // For use in SQL format() strings, extract just the column name from target_part_ref
+    // (target_part_ref is typically "table"."column", we need just the "column" part).
+    let target_col_only = if target_part_ref.contains('.') {
+        target_part_ref.rsplit('.').next().unwrap_or(target_part_ref)
+    } else {
+        target_part_ref
+    };
+
+
+    // Build the cold-body execution block for the main partition dispatch (post-trip-cap).
+    // For LIST: wrap in format() to inject _part_type, guard with IF _cold_keys non-empty, bind _hot_keys,_cold_keys.
+    // For RANGE: simple EXECUTE, bind _hot_keys,_hot_child_names (use literal USING clause here, not a placeholder).
+    let cold_dispatch_block = if is_list {
+        // LIST: cold DELETE with pruning
+        let del_part = format!(
+            "             IF array_length(_cold_keys,1) IS NOT NULL THEN\n\
+             EXECUTE format($reflex_cold_list${sql} AND {col} = ANY($2::text[]::%s[])$reflex_cold_list$, _part_type)\n\
+                 USING _hot_keys, _cold_keys;\n",
+            sql = safe_del,
+            col = target_col_only
+        );
+        // LIST: cold INSERT with pruning (if present)
+        let ins_part = if cold_insert_with_filter.is_empty() {
+            "             END IF;\n".to_string()
+        } else {
+            format!(
+                "             EXECUTE format($reflex_cold_list${sql} AND {col} = ANY($2::text[]::%s[])$reflex_cold_list$, _part_type)\n\
+                 USING _hot_keys, _cold_keys;\n\
+             END IF;\n",
+                sql = safe_ins,
+                col = target_col_only
+            )
+        };
+        format!("{}{}", del_part, ins_part)
+    } else {
+        // RANGE: cold DELETE (no pruning needed — hot-exclusion by child name suffices)
+        // Note: literal USING clause here (not a placeholder), since this block is embedded into the template.
+        let del_part = format!(
+            "             EXECUTE $reflex_inner${del}$reflex_inner$ USING _hot_keys, _hot_child_names;\n",
+            del = safe_del
+        );
+        // RANGE: cold INSERT (if present)
+        let ins_part = if cold_insert_with_filter.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "             EXECUTE $reflex_inner${ins}$reflex_inner$ USING _hot_keys, _hot_child_names;\n",
+                ins = safe_ins
+            )
+        };
+        format!("{}{}", del_part, ins_part)
+    };
+
+    // For the defensive branch (unpartitioned target), use the original simple behavior.
     let ins_block = if cold_insert_with_filter.is_empty() {
         String::new()
     } else {
@@ -382,6 +440,8 @@ pub(crate) fn build_passthrough_partition_dispatch_sql(
              _per_imv_floor BIGINT;\n\
              _hot_keys TEXT[] := ARRAY[]::TEXT[];\n\
              _hot_child_names TEXT[] := ARRAY[]::TEXT[];\n\
+             _cold_keys TEXT[] := ARRAY[]::TEXT[];\n\
+             _part_type TEXT;\n\
              _hot_count INT;\n\
              _partition_total INT;\n\
          BEGIN\n\
@@ -425,10 +485,14 @@ pub(crate) fn build_passthrough_partition_dispatch_sql(
                  FROM per_child pc JOIN pg_class c ON c.oid = pc.child_oid\n\
              )\n\
              SELECT COALESCE(array_agg(rep_key::text) FILTER (WHERE hot), ARRAY[]::TEXT[]),\n\
-                    COALESCE(array_agg(child_name)    FILTER (WHERE hot), ARRAY[]::TEXT[])\n\
-                 INTO _hot_keys, _hot_child_names\n\
+                    COALESCE(array_agg(child_name)    FILTER (WHERE hot), ARRAY[]::TEXT[]),\n\
+                    COALESCE(array_agg(rep_key::text) FILTER (WHERE NOT hot), ARRAY[]::TEXT[])\n\
+                 INTO _hot_keys, _hot_child_names, _cold_keys\n\
                  FROM classified;\n\
              _hot_count := COALESCE(array_length(_hot_keys, 1), 0);\n\
+             SELECT atttypid::regtype::text INTO _part_type\n\
+                 FROM pg_attribute\n\
+                 WHERE attrelid = '{parent}'::regclass AND attname = '{part_col_lit}' AND attnum > 0;\n\
              -- Trip-cap: swapping > half the partitions costs more than one full reconcile.\n\
              IF _hot_count > _partition_total / 2 THEN\n\
                  PERFORM public.reflex_reconcile('{view}');\n\
@@ -440,8 +504,8 @@ pub(crate) fn build_passthrough_partition_dispatch_sql(
              END IF;\n\
              -- Cold children: keyed delete + delta insert, hot children excluded\n\
              -- via the strategy-specific filter the caller spliced into the SQL.\n\
-             EXECUTE $reflex_inner${del}$reflex_inner$ USING {using};\n\
-{ins_block}\
+             -- For LIST: append partition-key pruning when _cold_keys is non-empty.\n\
+{cold_dispatch_block}\
          END\n\
          $reflex_pt_dispatch$",
         view = safe_view,
@@ -453,6 +517,7 @@ pub(crate) fn build_passthrough_partition_dispatch_sql(
         del = safe_del,
         ins_block = ins_block,
         using = using,
+        cold_dispatch_block = cold_dispatch_block,
     )
 }
 
