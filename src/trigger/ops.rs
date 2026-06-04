@@ -1035,14 +1035,38 @@ pub(crate) fn aggregate_epilogue_stmts(
         );
 
         if let Some(pd) = pending_dispatch.take() {
+            let strategy_is_range = plan.partition_strategy.eq_ignore_ascii_case("RANGE");
             let use_partition_dispatch = !plan.partition_columns.is_empty()
-                && plan.partition_strategy.eq_ignore_ascii_case("LIST");
+                && (plan.partition_strategy.eq_ignore_ascii_case("LIST") || strategy_is_range);
             if use_partition_dispatch {
                 let part_col = &plan.partition_columns[0];
                 let part_col_q = format!("\"{}\"", part_col);
+                let parent_lit = intermediate_tbl.replace('"', "").replace('\'', "''");
+                let part_col_lit = part_col.replace('\'', "''");
+                // Cold-exclusion predicate, strategy-specific:
+                //   LIST  → exclude hot partition VALUES   ($1::TEXT[])
+                //   RANGE → exclude rows of hot CHILDs      ($2::text[]), resolving
+                //           each value to its child of the (partitioned) intermediate
+                //           and comparing the child NAME — a value-array filter is
+                //           wrong because many values map to one range child, and a
+                //           child-OID filter is wrong because the hot swap changes
+                //           the child OID (the name survives the swap's RENAME).
+                let cold_pred = |qualified_col: &str| -> String {
+                    if strategy_is_range {
+                        format!(
+                            "public.__reflex_partition_child_for_key('{parent}'::regclass, '{col}', {qc}::text)::text <> ALL($2::text[])",
+                            parent = parent_lit,
+                            col = part_col_lit,
+                            qc = qualified_col
+                        )
+                    } else {
+                        format!("{qc}::text <> ALL($1::TEXT[])", qc = qualified_col)
+                    }
+                };
                 let filtered_scratch = format!(
-                    "(SELECT * FROM {} WHERE {}::text <> ALL($1::TEXT[]))",
-                    scratch_tbl, part_col_q
+                    "(SELECT * FROM {} WHERE {})",
+                    scratch_tbl,
+                    cold_pred(&part_col_q)
                 );
                 let merge_filtered = build_merge_from_table_sql(
                     intermediate_tbl,
@@ -1053,24 +1077,32 @@ pub(crate) fn aggregate_epilogue_stmts(
                 let dead_cleanup_filtered = dead_cleanup_sql.as_ref().map(|s| {
                     format!(
                         "{} AND EXISTS (SELECT 1 FROM {} __ap \
-                          WHERE __ap.{} = {}.{} AND __ap.{}::text <> ALL($1::TEXT[]))",
-                        s, affected_tbl, part_col_q, intermediate_tbl, part_col_q, part_col_q
+                          WHERE __ap.{} = {}.{} AND {})",
+                        s,
+                        affected_tbl,
+                        part_col_q,
+                        intermediate_tbl,
+                        part_col_q,
+                        cold_pred(&format!("__ap.{}", part_col_q))
                     )
                 });
                 let tdel_filtered = format!(
-                    "{} AND {}.{}::text <> ALL($1::TEXT[])",
-                    target_delete_sql, qv, part_col_q
+                    "{} AND {}",
+                    target_delete_sql,
+                    cold_pred(&format!("{}.{}", qv, part_col_q))
                 );
                 let tins_filtered = format!(
-                    "{} AND {}.{}::text <> ALL($1::TEXT[])",
-                    target_insert_sql, intermediate_tbl, part_col_q
+                    "{} AND {}",
+                    target_insert_sql,
+                    cold_pred(&format!("{}.{}", intermediate_tbl, part_col_q))
                 );
-                stmts.push(build_partition_aware_dispatch_sql(
+                stmts.push(build_partition_aware_dispatch_sql_strategy(
                     view_name,
                     intermediate_tbl,
                     intermediate_tbl,
                     affected_tbl,
                     part_col,
+                    &plan.partition_strategy,
                     &merge_filtered,
                     dead_cleanup_filtered.as_deref(),
                     &tdel_filtered,

@@ -1739,3 +1739,30 @@ fn pg_part_passthrough_update_dispatch_deferred_correct() {
     Spi::run("SELECT reflex_flush_deferred('ppd_src')").expect("f3");
     assert_imv_correct("ppdv", sql);
 }
+
+/// Component 4: RANGE-partitioned AGGREGATE IMV — per-child dispatch correctness.
+/// One statement touches many rows in Q1 (hot child → swap) plus a couple in Q2
+/// (cold). The cold-exclusion filter MUST drop rows of the hot CHILD (via child
+/// OID), not specific values — a value-array filter would re-process the hot
+/// child's non-representative rows that the swap already rebuilt.
+#[pg_test]
+fn pg_part_range_aggregate_dispatch_correct() {
+    Spi::run("CREATE TABLE rga_src (d DATE NOT NULL, region TEXT, amount NUMERIC) PARTITION BY RANGE (d)").expect("src");
+    Spi::run("CREATE TABLE rga_q1 PARTITION OF rga_src FOR VALUES FROM ('2026-01-01') TO ('2026-04-01')").expect("q1");
+    Spi::run("CREATE TABLE rga_q2 PARTITION OF rga_src FOR VALUES FROM ('2026-04-01') TO ('2026-07-01')").expect("q2");
+    Spi::run("INSERT INTO rga_src SELECT '2026-02-15'::date + (g % 30), 'r'||(g%3), g FROM generate_series(1,90) g").expect("seedq1");
+    Spi::run("INSERT INTO rga_src SELECT '2026-05-15'::date + (g % 30), 'r'||(g%3), g FROM generate_series(1,90) g").expect("seedq2");
+    let sql = "SELECT d, sum(amount) AS s, count(*) AS c FROM rga_src GROUP BY d";
+    let res = Spi::get_one::<String>(&format!(
+        "SELECT create_reflex_ivm('rgav', '{}', 'd', NULL, NULL, NULL, ARRAY['d'])",
+        sql.replace('\'', "''")
+    )).expect("create call").expect("create result");
+    assert!(!res.starts_with("ERROR"), "create returned: {res}");
+    Spi::run("ANALYZE rga_src").expect("analyze");
+    assert_imv_correct("rgav", sql);
+
+    // Touch many rows in Q1 (hot) + a couple in Q2 (cold) in one statement.
+    Spi::run("UPDATE public.__reflex_ivm_reference SET wipe_threshold = 0.01 WHERE name = 'rgav'").expect("thr");
+    Spi::run("UPDATE rga_src SET amount = amount + 1 WHERE d < '2026-04-01' OR d = '2026-05-15'").expect("bulk");
+    assert_imv_correct("rgav", sql);
+}

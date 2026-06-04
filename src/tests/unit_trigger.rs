@@ -3008,12 +3008,13 @@ fn full_outer_secondary_passthrough_falls_back_to_rebuild() {
 
 #[test]
 fn partition_dispatch_keeps_hot_swap_and_trip_cap_markers() {
-    let sql = build_partition_aware_dispatch_sql(
+    let sql = build_partition_aware_dispatch_sql_strategy(
         "v",
         "__int",
         "__int",
         "__aff",
         "region",
+        "LIST",
         "MERGE_SQL_$1",
         None,
         "TDEL_$1",
@@ -3111,17 +3112,17 @@ fn passthrough_update_nonpartitioned_unchanged() {
 }
 
 #[test]
-fn partition_dispatch_range_uses_child_oid_filter() {
+fn partition_dispatch_range_uses_child_name_filter() {
     let sql = build_partition_aware_dispatch_sql_strategy(
         "v", "__int", "__int", "__aff", "d", "RANGE", "MERGE_$2", None, "TDEL_$2", "TINS_$2",
     );
     assert!(
-        sql.contains("_hot_child_oids"),
-        "RANGE binds hot child oids: {sql}"
+        sql.contains("_hot_child_names"),
+        "RANGE binds hot child names: {sql}"
     );
     assert!(
-        sql.contains("USING _hot_keys, _hot_child_oids"),
-        "RANGE cold filter binds child oids as $2: {sql}"
+        sql.contains("USING _hot_keys, _hot_child_names"),
+        "RANGE cold filter binds child names as $2: {sql}"
     );
 }
 

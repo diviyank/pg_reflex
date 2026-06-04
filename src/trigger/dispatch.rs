@@ -175,33 +175,6 @@ pub(crate) const WIPE_FLOOR_ROWS_DEFAULT: i64 = 1000;
 /// caller is responsible for wrapping the scratch / WHERE clauses with
 /// the `$1::TEXT[]` parameter binding before passing in.
 #[allow(clippy::too_many_arguments)]
-/// LIST-strategy wrapper over [`build_partition_aware_dispatch_sql_strategy`].
-/// Preserved so existing LIST callers and snapshots are unchanged.
-pub(crate) fn build_partition_aware_dispatch_sql(
-    view_name: &str,
-    intermediate_tbl: &str,
-    intermediate_parent_qual: &str,
-    affected_tbl: &str,
-    partition_col: &str,
-    merge_sql_with_filter: &str,
-    dead_cleanup_sql: Option<&str>,
-    target_delete_sql_with_filter: &str,
-    target_insert_sql_with_filter: &str,
-) -> String {
-    build_partition_aware_dispatch_sql_strategy(
-        view_name,
-        intermediate_tbl,
-        intermediate_parent_qual,
-        affected_tbl,
-        partition_col,
-        "LIST",
-        merge_sql_with_filter,
-        dead_cleanup_sql,
-        target_delete_sql_with_filter,
-        target_insert_sql_with_filter,
-    )
-}
-
 /// Aggregate-path hot/cold partition dispatch (audit #2 / Component 4).
 ///
 /// Classification groups dirty counts by RESOLVED CHILD (see the in-SQL note),
@@ -226,9 +199,12 @@ pub(crate) fn build_partition_aware_dispatch_sql_strategy(
     target_delete_sql_with_filter: &str,
     target_insert_sql_with_filter: &str,
 ) -> String {
-    // RANGE cold filters reference $2 (hot child oids); LIST references only $1.
+    // RANGE cold filters reference $2 (hot child NAMES); LIST references only $1.
+    // Child NAMES (not OIDs) because the hot swap DETACHes/re-ATTACHes the child,
+    // changing its OID — the name is preserved by the swap's final RENAME, so a
+    // name captured before the swap still matches the rebuilt child after it.
     let using = if strategy.eq_ignore_ascii_case("RANGE") {
-        "_hot_keys, _hot_child_oids"
+        "_hot_keys, _hot_child_names"
     } else {
         "_hot_keys"
     };
@@ -255,7 +231,7 @@ pub(crate) fn build_partition_aware_dispatch_sql_strategy(
              _floor BIGINT;\n\
              _per_imv_floor BIGINT;\n\
              _hot_keys TEXT[] := ARRAY[]::TEXT[];\n\
-             _hot_child_oids OID[] := ARRAY[]::OID[];\n\
+             _hot_child_names TEXT[] := ARRAY[]::TEXT[];\n\
              _hot_count INT;\n\
              _partition_total INT;\n\
          BEGIN\n\
@@ -282,8 +258,9 @@ pub(crate) fn build_partition_aware_dispatch_sql_strategy(
              -- (1 value = 1 child) this is identical to per-value grouping; for\n\
              -- RANGE (many values per child) it is the only correct grouping.\n\
              -- _hot_keys carries one REPRESENTATIVE value per hot child (for\n\
-             -- reflex_reconcile_partition); _hot_child_oids carries the hot child\n\
-             -- OIDs (for the RANGE cold-exclusion filter, $2).\n\
+             -- reflex_reconcile_partition); _hot_child_names carries the hot child\n\
+             -- names (for the RANGE cold-exclusion filter, $2 — names survive the\n\
+             -- swap's DETACH/ATTACH+RENAME, OIDs do not).\n\
              WITH per_val AS (\n\
                  SELECT \"{part_col}\"::text AS pkey, count(*) AS dirty\n\
                  FROM {affected}\n\
@@ -302,13 +279,13 @@ pub(crate) fn build_partition_aware_dispatch_sql_strategy(
                  GROUP BY cfk.child\n\
              ),\n\
              classified AS (\n\
-                 SELECT pc.rep_key, pc.child_oid,\n\
+                 SELECT pc.rep_key, pc.child_oid::text AS child_name,\n\
                         (pc.dirty::NUMERIC / GREATEST(c.reltuples::NUMERIC, _floor::NUMERIC) >= _thr) AS hot\n\
                  FROM per_child pc JOIN pg_class c ON c.oid = pc.child_oid\n\
              )\n\
              SELECT COALESCE(array_agg(rep_key::text) FILTER (WHERE hot), ARRAY[]::TEXT[]),\n\
-                    COALESCE(array_agg(child_oid)     FILTER (WHERE hot), ARRAY[]::oid[])\n\
-                 INTO _hot_keys, _hot_child_oids\n\
+                    COALESCE(array_agg(child_name)    FILTER (WHERE hot), ARRAY[]::TEXT[])\n\
+                 INTO _hot_keys, _hot_child_names\n\
                  FROM classified;\n\
              _hot_count := COALESCE(array_length(_hot_keys, 1), 0);\n\
              RAISE DEBUG 'pg_reflex partition dispatch: hot=% total=% thr=% floor=%', _hot_count, _partition_total, _thr, _floor;\n\
