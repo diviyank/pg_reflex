@@ -732,3 +732,34 @@ fn pt_secondary_autoindex_skipped_when_covered() {
     ).expect("q").expect("c");
     assert!(n == 1, "exactly the unique-key index should cover (product_id, location_id) — no duplicate, found {n}");
 }
+
+// Single-source passthrough must auto-detect the source PK into unique_columns
+// (catalog-level guard for the attname::text cast; row-count tests alone pass
+// even when keyless full-rebuild silently substitutes for keyed maintenance).
+#[pg_test]
+fn test_passthrough_auto_pk_recorded_in_catalog() {
+    Spi::run("CREATE TABLE ptkr_src (id INT PRIMARY KEY, name TEXT, status TEXT)")
+        .expect("create table");
+    Spi::run("INSERT INTO ptkr_src VALUES (1, 'a', 'active'), (2, 'b', 'active')")
+        .expect("seed");
+
+    crate::create_reflex_ivm(
+        "ptkr_view",
+        "SELECT id, name, status FROM ptkr_src WHERE status = 'active'",
+        None,
+        None,
+        None,
+        None,
+    );
+
+    let uk = Spi::get_one::<Vec<String>>(
+        "SELECT unique_columns FROM public.__reflex_ivm_reference WHERE name = 'ptkr_view'",
+    )
+    .expect("q")
+    .expect("auto-detected key");
+    assert_eq!(
+        uk,
+        vec!["id".to_string()],
+        "single-source passthrough must record the auto-detected PK as its unique key"
+    );
+}
