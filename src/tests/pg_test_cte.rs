@@ -893,6 +893,44 @@ fn test_cte_inner_delta_is_bounded_deferred() {
     );
 }
 
+// Component 1 correctness gate: an inner CTE over a source with NO unique
+// constraint must stay keyless (no fabricated key) and remain correct via the
+// retained full-rebuild fallback.
+#[pg_test]
+fn test_cte_inner_keyless_fallback_retained() {
+    Spi::run("CREATE TABLE ckf_s (k INT NOT NULL, v INT NOT NULL)").expect("create");
+    Spi::run("INSERT INTO ckf_s SELECT i % 5, i FROM generate_series(1, 50) i").expect("seed");
+
+    crate::create_reflex_ivm(
+        "ckf_view",
+        "WITH f AS (SELECT k, v FROM ckf_s WHERE v > 0) SELECT k, v FROM f",
+        None,
+        None,
+        None,
+        None,
+    );
+
+    // No PK/unique on ckf_s, no explicit per-CTE key => inner must be keyless.
+    let inner_uk: Option<Vec<String>> = Spi::get_one::<Vec<String>>(
+        "SELECT unique_columns FROM public.__reflex_ivm_reference WHERE name = 'ckf_view__cte_f'",
+    )
+    .expect("q");
+    let is_keyless = inner_uk.as_ref().is_none_or(|v| v.is_empty());
+    assert!(
+        is_keyless,
+        "inner CTE with no provable key must stay keyless, got {:?}",
+        inner_uk
+    );
+
+    // Still correct under DML via full-rebuild fallback.
+    let fresh = "WITH f AS (SELECT k, v FROM ckf_s WHERE v > 0) SELECT k, v FROM f";
+    assert_imv_correct("ckf_view", fresh);
+    Spi::run("INSERT INTO ckf_s VALUES (1, 100)").expect("insert");
+    assert_imv_correct("ckf_view", fresh);
+    Spi::run("DELETE FROM ckf_s WHERE v = 100").expect("delete");
+    assert_imv_correct("ckf_view", fresh);
+}
+
 // 1.7.5 — an ungrouped aggregate IMV (no GROUP BY → exactly one row) must be
 // flagged max_one_row so JOIN inference can treat a CROSS JOIN to it as to-one.
 #[pg_test]
