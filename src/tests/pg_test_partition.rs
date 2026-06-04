@@ -1669,3 +1669,35 @@ fn pg_part_copartitioned_full_join_of_cte_intermediates() {
         .expect("count v");
     assert_eq!(n, 3, "dp_id=1 must keep matched + left-only + right-only rows");
 }
+
+/// gap 2 proof: an aggregate, LIST-partitioned IMV in DEFERRED mode whose flush
+/// makes one partition "hot" must drive reflex_reconcile_partition (DETACH/ATTACH)
+/// from inside the per-IMV savepoint DO-block at COMMIT — and stay correct.
+///
+/// Decision point for the plan's Task 9 contingency: if DDL-at-commit is unsafe
+/// inside the deferred flush, this test exposes it (lock/subtransaction error or
+/// a wrong result). It passing means the swap escalation is safe in DEFERRED for
+/// both the aggregate and (by parity) the passthrough dispatch.
+#[pg_test]
+fn pg_part_deferred_hot_swap_aggregate_is_correct() {
+    Spi::run("CREATE TABLE dhs_src (region TEXT NOT NULL, amount NUMERIC) PARTITION BY LIST (region)").expect("src");
+    Spi::run("CREATE TABLE dhs_a PARTITION OF dhs_src FOR VALUES IN ('A')").expect("pa");
+    Spi::run("CREATE TABLE dhs_b PARTITION OF dhs_src FOR VALUES IN ('B')").expect("pb");
+    Spi::run("INSERT INTO dhs_src SELECT 'A', g FROM generate_series(1,50) g").expect("seedA");
+    Spi::run("INSERT INTO dhs_src SELECT 'B', g FROM generate_series(1,50) g").expect("seedB");
+    let sql = "SELECT region, sum(amount) AS s, count(*) AS c FROM dhs_src GROUP BY region";
+    let res = Spi::get_one::<String>(&format!(
+        "SELECT create_reflex_ivm('dhsv', '{}', 'region', NULL, 'DEFERRED', NULL, ARRAY['region'])",
+        sql.replace('\'', "''")
+    )).expect("create call").expect("create result");
+    assert!(!res.starts_with("ERROR"), "create returned: {res}");
+    // Force a very low wipe threshold so any sizeable touch is "hot".
+    Spi::run("UPDATE public.__reflex_ivm_reference SET wipe_threshold = 0.01 WHERE name = 'dhsv'").expect("thr");
+    Spi::run("ANALYZE dhs_src").expect("analyze");
+    assert_imv_correct("dhsv", sql);
+
+    // Bulk update partition A → hot → swap path at commit.
+    Spi::run("UPDATE dhs_src SET amount = amount + 1000 WHERE region = 'A'").expect("bulk A");
+    Spi::run("SELECT reflex_flush_deferred('dhs_src')").expect("flush");
+    assert_imv_correct("dhsv", sql);
+}
