@@ -122,7 +122,10 @@ fn membership_predicate_multi_col_uses_row() {
 #[test]
 fn distinct_partition_keys_builds_select_distinct() {
     let sql = build_distinct_partition_keys("__reflex_pt_old_v_s", "\"dem_plan_id\"");
-    assert_eq!(sql, "SELECT DISTINCT \"dem_plan_id\" FROM __reflex_pt_old_v_s");
+    assert_eq!(
+        sql,
+        "SELECT DISTINCT \"dem_plan_id\" FROM __reflex_pt_old_v_s"
+    );
 }
 
 #[test]
@@ -2889,4 +2892,84 @@ mod delta_sql_snapshots {
         let sql = reflex_build_delta_sql("v", "sales", "INSERT", base_q, end_q, Some(plan), base_q);
         insta::assert_snapshot!("aggregate_epilogue_no_group_by", sql);
     }
+}
+
+fn passthrough_secondary_plan() -> AggregationPlan {
+    let mut p = simple_plan();
+    p.is_passthrough = true;
+    p.group_by_columns = vec![];
+    p.partition_columns = vec![];
+    p.partition_strategy = String::new();
+    p.passthrough_key_mappings = std::collections::HashMap::from([(
+        "caav".to_string(),
+        vec![
+            ("product_id".to_string(), "product_id".to_string()),
+            ("location_id".to_string(), "location_id".to_string()),
+        ],
+    )]);
+    p
+}
+
+#[test]
+fn secondary_passthrough_with_mapping_is_keyed() {
+    let plan = passthrough_secondary_plan();
+    let mut stmts = Vec::new();
+    outer_join_secondary_stmts(
+        "fc_view",
+        "caav",
+        "UPDATE",
+        "SELECT s.product_id, s.location_id FROM s LEFT JOIN caav ON caav.product_id = s.product_id",
+        "",
+        &plan,
+        &None,
+        "__int",
+        "__aff",
+        "__reflex_old_caav",
+        "__reflex_new_caav",
+        &mut stmts,
+    );
+    let joined = stmts.join("\n");
+    assert!(
+        !joined.contains("DELETE FROM \"fc_view\"\n")
+            && !joined.trim_end().ends_with("DELETE FROM \"fc_view\""),
+        "must not emit a bare full-table DELETE: {joined}"
+    );
+    assert!(
+        joined.contains("(\"product_id\", \"location_id\") IN"),
+        "DELETE/INSERT must be keyed on the secondary join cols: {joined}"
+    );
+    assert!(
+        joined.contains("UNION"),
+        "changed keys must come from old ∪ new transition: {joined}"
+    );
+}
+
+#[test]
+fn secondary_passthrough_without_mapping_falls_back_to_rebuild() {
+    let mut plan = passthrough_secondary_plan();
+    plan.passthrough_key_mappings.clear();
+    let mut stmts = Vec::new();
+    outer_join_secondary_stmts(
+        "fc_view",
+        "caav",
+        "UPDATE",
+        "SELECT 1",
+        "",
+        &plan,
+        &None,
+        "__int",
+        "__aff",
+        "__reflex_old_caav",
+        "__reflex_new_caav",
+        &mut stmts,
+    );
+    let joined = stmts.join("\n");
+    assert!(
+        joined.contains("DELETE FROM \"fc_view\""),
+        "no mapping → full rebuild retained: {joined}"
+    );
+    assert!(
+        joined.contains("INSERT INTO \"fc_view\""),
+        "no mapping → full rebuild retained: {joined}"
+    );
 }

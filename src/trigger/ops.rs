@@ -525,9 +525,64 @@ pub(crate) fn outer_join_secondary_stmts(
     let qv = quote_identifier(view_name);
 
     if plan.is_passthrough {
-        stmts.push(format!("DELETE FROM {}", qv));
-        stmts.push(format!("INSERT INTO {} {}", qv, base_query));
-        return;
+        match plan.passthrough_key_mappings.get(source_table) {
+            Some(mappings) if !mappings.is_empty() => {
+                let target_cols: Vec<String> =
+                    mappings.iter().map(|(t, _)| format!("\"{}\"", t)).collect();
+                // Changed secondary join keys, drawn only from the transition
+                // tables that EXIST for this operation's trigger:
+                //   INSERT(_PROMOTED) → NEW only, DELETE(_PROMOTED) → OLD only,
+                //   UPDATE → both. The DELETE trigger declares only OLD TABLE and
+                //   the INSERT trigger only NEW TABLE, so referencing the absent
+                //   side raises `relation "__reflex_new_*" does not exist`. (The
+                //   *_PROMOTED ops fire from the UPDATE trigger where both tables
+                //   exist, but one side is empty post-filter, so a single side is
+                //   both safe and sufficient.) Alias each source column to its
+                //   target name so the membership subquery's projection matches the
+                //   target columns being filtered (the secondary's join column may
+                //   differ from the IMV output name, e.g. b.a_id projected as "id").
+                let alias_pairs: Vec<String> = mappings
+                    .iter()
+                    .map(|(t, s)| format!("\"{}\" AS \"{}\"", s, t))
+                    .collect();
+                let ap = alias_pairs.join(", ");
+                let needs_new = matches!(operation, "INSERT" | "INSERT_PROMOTED" | "UPDATE");
+                let needs_old = matches!(operation, "DELETE" | "DELETE_PROMOTED" | "UPDATE");
+                let mut sides: Vec<String> = Vec::new();
+                if needs_old {
+                    sides.push(format!(
+                        "SELECT {ap} FROM \"{old}\"",
+                        ap = ap,
+                        old = old_tbl
+                    ));
+                }
+                if needs_new {
+                    sides.push(format!(
+                        "SELECT {ap} FROM \"{new}\"",
+                        ap = ap,
+                        new = new_tbl
+                    ));
+                }
+                let changed_keys = sides.join(" UNION ");
+                let pred = build_membership_predicate(
+                    &target_cols,
+                    &target_cols,
+                    &format!("({})", changed_keys),
+                );
+                stmts.push(format!("DELETE FROM {} WHERE {}", qv, pred));
+                stmts.push(format!(
+                    "INSERT INTO {} SELECT * FROM ({}) __bq WHERE {}",
+                    qv, base_query, pred
+                ));
+                return;
+            }
+            _ => {
+                // No derivable mapping → safe full-rebuild fallback.
+                stmts.push(format!("DELETE FROM {}", qv));
+                stmts.push(format!("INSERT INTO {} {}", qv, base_query));
+                return;
+            }
+        }
     }
 
     if let Some(ref cols) = grp_cols {
