@@ -500,12 +500,14 @@ mod deferred;
 mod dispatch;
 mod merge;
 mod ops;
+mod scope;
 
 #[cfg(test)]
 pub(crate) use deferred::build_netted_view_sql;
 pub(crate) use dispatch::*;
 pub(crate) use merge::*;
 pub(crate) use ops::*;
+pub(crate) use scope::*;
 
 #[cfg(test)]
 #[path = "../tests/unit_trigger.rs"]
