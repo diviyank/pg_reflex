@@ -855,7 +855,7 @@ pub(crate) fn passthrough_op_stmts(
                     );
                     let aff = format!("SELECT {}::text AS pkey FROM {}", part_src_q, pt_old);
                     stmts.push(build_passthrough_partition_dispatch_sql(
-                        view_name, &qv, &aff, &part_col, &format!("{}.{}", qv, part_col_q), &strategy, &del_cold, "",
+                        view_name, &qv, &aff, &part_col, &format!("{}.{}", qv, part_col_q), &strategy, &del_cold, "", None,
                     ));
                 } else {
                     stmts.push(base_del);
@@ -923,8 +923,15 @@ pub(crate) fn passthrough_op_stmts(
                         old = pt_old,
                         new = pt_new
                     );
+                    debug_assert!(operation == "UPDATE" && !mappings.is_empty(),
+                        "in-place cold path only valid for keyed passthrough UPDATE");
+                    let spec = crate::trigger::dispatch::InplaceSpec {
+                        delta_new: &delta_new, key_target_cols: &target_cols,
+                        key_source_cols: &source_cols, pt_old: &pt_old,
+                        partition_col_lit: &part_col_lit,
+                    };
                     stmts.push(build_passthrough_partition_dispatch_sql(
-                        view_name, &qv, &aff, &part_col, &format!("{}.{}", qv, part_col_q), &strategy, &del_cold, &ins_cold,
+                        view_name, &qv, &aff, &part_col, &format!("{}.{}", qv, part_col_q), &strategy, &del_cold, &ins_cold, Some(&spec),
                     ));
                 } else {
                     stmts.push(base_del);

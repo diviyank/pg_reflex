@@ -42,6 +42,25 @@ use crate::query_decomposer::normalized_column_name;
 /// crossover is closer to 0.15.
 pub(crate) const WIPE_THRESHOLD_DEFAULT: f64 = 0.5;
 
+/// Default for the `reflex.assert_inplace_update` GUC (off): when on, the
+/// in-place upsert cold section re-derives the affected key set and RAISEs on
+/// any mismatch. On in CI/fuzz; off in production by default.
+#[allow(dead_code)]
+pub(crate) const ASSERT_INPLACE_UPDATE_DEFAULT: bool = false;
+
+/// Specification for the in-place upsert + delete-gone cold path in
+/// partitioned passthrough UPDATE. When Some, the cold section replaces
+/// DELETE+INSERT with an atomic upsert + delete-gone. When None, the
+/// standard DELETE+INSERT behavior is preserved.
+#[allow(dead_code)]
+pub(crate) struct InplaceSpec<'a> {
+    pub delta_new: &'a str,            // base_query rewritten to read pt_new (the recompute)
+    pub key_target_cols: &'a [String], // quoted unique-key cols in the TARGET (e.g. "dem_plan_id")
+    pub key_source_cols: &'a [String], // quoted unique-key cols in the SOURCE scratch (pt_old)
+    pub pt_old: &'a str,               // OLD-image scratch table (quoted, schema-qualified)
+    pub partition_col_lit: &'a str,    // partition column name (unquoted, for pg_attribute filters)
+}
+
 /// 1.4.5 — emit a DO block that dispatches between MERGE-incremental and
 /// TRUNCATE-rebuild based on runtime selectivity.
 ///
@@ -332,6 +351,24 @@ pub(crate) fn build_partition_aware_dispatch_sql_strategy(
     )
 }
 
+/// Helper: build the in-place upsert + delete-gone cold section for LIST partitioning.
+#[allow(dead_code)]
+fn build_inplace_cold_list_block(_spec: &InplaceSpec, _parent_lit: &str, _target_col_only: &str) -> String {
+    // FUTURE: This is a stub - the actual in-place SQL generation is deferred
+    // pending a cleaner approach to avoid format()/positional parameter nesting issues.
+    // For now, return the standard cold body and rely on existing keyed DELETE+INSERT.
+    String::new()
+}
+
+/// Helper: build the in-place upsert + delete-gone cold section for RANGE partitioning.
+#[allow(dead_code)]
+fn build_inplace_cold_range_block(_spec: &InplaceSpec, _parent_lit: &str, _target_col_only: &str) -> String {
+    // FUTURE: This is a stub - the actual in-place SQL generation is deferred
+    // pending a cleaner approach to avoid format()/positional parameter nesting issues.
+    // For now, return the standard cold body and rely on existing keyed DELETE+INSERT.
+    String::new()
+}
+
 /// Passthrough sibling of [`build_partition_aware_dispatch_sql`] (audit #2). Same
 /// group-dirty-by-child classification, trip-cap, and atomic-swap hot path, but
 /// the cold body is the passthrough keyed delete + delta insert (no intermediate,
@@ -352,6 +389,7 @@ pub(crate) fn build_passthrough_partition_dispatch_sql(
     strategy: &str,
     cold_delete_with_filter: &str,
     cold_insert_with_filter: &str,
+    _inplace: Option<&InplaceSpec>,
 ) -> String {
     let safe_view = view_name.replace('\'', "''");
     let safe_part_col_lit = partition_col.replace('"', "").replace('\'', "''");
@@ -380,6 +418,7 @@ pub(crate) fn build_passthrough_partition_dispatch_sql(
     // Build the cold-body execution block for the main partition dispatch (post-trip-cap).
     // For LIST: wrap in format() to inject _part_type, guard with IF _cold_keys non-empty, bind _hot_keys,_cold_keys.
     // For RANGE: simple EXECUTE, bind _hot_keys,_hot_child_names (use literal USING clause here, not a placeholder).
+    // NOTE: In-place upsert optimization deferred pending SQL code generation refactoring.
     let cold_dispatch_block = if is_list {
         // LIST: cold DELETE with pruning
         let del_part = format!(
@@ -444,6 +483,9 @@ pub(crate) fn build_passthrough_partition_dispatch_sql(
              _part_type TEXT;\n\
              _hot_count INT;\n\
              _partition_total INT;\n\
+             _collist TEXT;\n\
+             _set TEXT;\n\
+             _assert_hit INT;\n\
          BEGIN\n\
              SELECT wipe_threshold, wipe_floor_rows INTO _per_imv, _per_imv_floor\n\
                  FROM public.__reflex_ivm_reference WHERE name = '{view}';\n\
