@@ -778,6 +778,7 @@ fn passthrough_cold_pred(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn passthrough_op_stmts(
     view_name: &str,
     source_table: &str,

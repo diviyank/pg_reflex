@@ -174,18 +174,18 @@ pub(crate) const WIPE_FLOOR_ROWS_DEFAULT: i64 = 1000;
 /// The cold-path SQL strings MUST already contain the filter splice — the
 /// caller is responsible for wrapping the scratch / WHERE clauses with
 /// the `$1::TEXT[]` parameter binding before passing in.
-#[allow(clippy::too_many_arguments)]
 /// Aggregate-path hot/cold partition dispatch (audit #2 / Component 4).
 ///
 /// Classification groups dirty counts by RESOLVED CHILD (see the in-SQL note),
 /// emitting both `_hot_keys` (one representative value per hot child, for
-/// `reflex_reconcile_partition`) and `_hot_child_oids` (the hot child OIDs).
+/// `reflex_reconcile_partition`) and `_hot_child_names` (the hot child names).
 /// The cold body's hot-exclusion filter is strategy-specific and lives in the
 /// caller's SQL strings:
 ///   * **LIST**  → `<part_col> <> ALL($1::TEXT[])` (hot VALUES) — bind `_hot_keys`.
-///   * **RANGE** → `__reflex_partition_child_for_key(...) <> ALL($2::oid[])`
-///     (hot CHILD oids; a value-array filter is wrong because many values map to
-///     one range child) — bind `_hot_keys, _hot_child_oids`.
+///   * **RANGE** → `__reflex_partition_child_for_key(...)::text <> ALL($2::text[])`
+///     (hot CHILD names; a value-array filter is wrong because many values map to
+///     one range child, and an OID filter is wrong because the swap changes the
+///     child OID) — bind `_hot_keys, _hot_child_names`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_partition_aware_dispatch_sql_strategy(
     view_name: &str,

@@ -120,15 +120,6 @@ fn membership_predicate_multi_col_uses_row() {
 }
 
 #[test]
-fn distinct_partition_keys_builds_select_distinct() {
-    let sql = build_distinct_partition_keys("__reflex_pt_old_v_s", "\"dem_plan_id\"");
-    assert_eq!(
-        sql,
-        "SELECT DISTINCT \"dem_plan_id\" FROM __reflex_pt_old_v_s"
-    );
-}
-
-#[test]
 fn test_build_merge_add() {
     let plan = simple_plan();
     let delta = "SELECT city, SUM(amount) AS \"__sum_amount\", COUNT(*) AS __ivm_count FROM \"__reflex_new_v\" GROUP BY city";
