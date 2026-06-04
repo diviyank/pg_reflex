@@ -456,6 +456,38 @@ fn test_cte_explicit_per_cte_unique_key() {
     );
 }
 
+// Component 1: an inner CTE sub-IMV whose single source has a PRIMARY KEY that
+// the CTE projects must auto-detect that PK as its unique key (keyed maintenance),
+// without any explicit per-CTE unique_columns spec.
+#[pg_test]
+fn test_cte_inner_auto_detects_source_pk() {
+    Spi::run("CREATE TABLE cik_s (id INT PRIMARY KEY, grp INT NOT NULL, qty INT, flag BOOL)")
+        .expect("create");
+    Spi::run("INSERT INTO cik_s SELECT i, i % 10, i, (i % 2 = 0) FROM generate_series(1, 100) i")
+        .expect("seed");
+
+    let result = crate::create_reflex_ivm(
+        "cik_view",
+        "WITH f AS (SELECT id, grp, qty FROM cik_s WHERE flag) SELECT id, grp, qty FROM f",
+        Some("id"),
+        None,
+        None,
+        None,
+    );
+    assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
+
+    let inner_uk = Spi::get_one::<Vec<String>>(
+        "SELECT unique_columns FROM public.__reflex_ivm_reference WHERE name = 'cik_view__cte_f'",
+    )
+    .expect("q")
+    .expect("inner key");
+    assert_eq!(
+        inner_uk,
+        vec!["id".to_string()],
+        "inner CTE sub-IMV must auto-detect the source PK as its unique key"
+    );
+}
+
 #[pg_test]
 fn test_cte_sibling_with_window() {
     // This test reproduces the core bug: CTE decomposition must run BEFORE window decomposition.

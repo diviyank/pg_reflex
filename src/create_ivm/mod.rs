@@ -245,7 +245,7 @@ fn resolve_unique_columns(ctx: &mut BuildContext) {
             let pk_cols: Vec<String> = Spi::connect(|client| {
                 client
                     .select(
-                        "SELECT array_agg(a.attname ORDER BY k.n) as cols \
+                        "SELECT array_agg(a.attname::text ORDER BY k.n) as cols \
                          FROM pg_index ix \
                          JOIN LATERAL unnest(ix.indkey) WITH ORDINALITY AS k(col, n) ON true \
                          JOIN pg_attribute a ON a.attrelid = ix.indrelid AND a.attnum = k.col \
