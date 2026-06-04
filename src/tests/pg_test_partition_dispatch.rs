@@ -576,3 +576,58 @@ fn pg_part_partition_child_for_key_helper_resolves_list_correctly() {
     .expect("call");
     assert!(none.is_none());
 }
+
+/// LIST passthrough IMV, multi-partition UPDATE that stays COLD (small fraction
+/// per partition). The keyed cold delete+insert must keep the IMV byte-identical
+/// to a fresh recompute. This is the regression guard for Phase 1 pruning
+/// (which must not change results) and Phase 2 (in-place upsert).
+#[pg_test]
+fn pg_part_passthrough_cold_multi_partition_update_oracle() {
+    Spi::run(
+        "CREATE TABLE pt_cold_src (id BIGINT NOT NULL, region TEXT NOT NULL, amount BIGINT, PRIMARY KEY (id, region)) \
+         PARTITION BY LIST (region)",
+    )
+    .expect("create src");
+    for r in ["A", "B", "C", "D"] {
+        Spi::run(&format!(
+            "CREATE TABLE pt_cold_src_{r} PARTITION OF pt_cold_src FOR VALUES IN ('{r}')"
+        ))
+        .expect("p");
+        for i in 0..200 {
+            let id_base = match r {
+                "A" => 0,
+                "B" => 1000,
+                "C" => 2000,
+                _ => 3000,
+            };
+            Spi::run(&format!(
+                "INSERT INTO pt_cold_src (id, region, amount) VALUES ({}, '{}', {})",
+                id_base + i,
+                r, i
+            ))
+            .expect("seed");
+        }
+    }
+    let sql = "SELECT id, region, amount FROM pt_cold_src";
+    Spi::run(
+        "SELECT create_reflex_ivm('pt_cold_v', 'SELECT id, region, amount FROM pt_cold_src', \
+         'id,region', NULL, NULL, NULL, ARRAY['region'])",
+    )
+    .expect("create_imv");
+    assert_imv_correct("pt_cold_v", sql);
+
+    // Cold update: touch a handful of rows across TWO partitions (small fraction).
+    Spi::run("UPDATE pt_cold_src SET amount = amount + 1 WHERE region IN ('A','C') AND id % 100 < 3")
+        .expect("cold update");
+    assert_imv_correct("pt_cold_v", sql);
+
+    // Cold delete across partitions.
+    Spi::run("DELETE FROM pt_cold_src WHERE region IN ('B','D') AND id % 100 = 0")
+        .expect("cold delete");
+    assert_imv_correct("pt_cold_v", sql);
+
+    // Cold insert into existing partitions.
+    Spi::run("INSERT INTO pt_cold_src (id, region, amount) VALUES (501,'A',999),(2501,'C',999)")
+        .expect("cold insert");
+    assert_imv_correct("pt_cold_v", sql);
+}
