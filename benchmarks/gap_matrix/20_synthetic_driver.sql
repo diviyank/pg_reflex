@@ -8,7 +8,15 @@
 \else
 \set RUN_TS '2026-06-05 12:00:00+00'
 \endif
+-- bench.base_rows is set by 10_synthetic_setup.sql in its own session; this is
+-- a separate psql session, so re-establish it here. MUST match the BASE_ROWS the
+-- sources were built with, or the id-lanes miss the seeded rows.
+\if :{?BASE_ROWS}
+\else
+\set BASE_ROWS 1000000
+\endif
 SET bench.maxvol = :MAXVOL;
+SET bench.base_rows = :BASE_ROWS;
 
 -- Given op + lane cursor, returns the [lo,hi] id window for an edit of size v.
 -- Lanes carve disjoint id ranges so ops never collide:
