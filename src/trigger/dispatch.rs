@@ -52,13 +52,12 @@ pub(crate) const ASSERT_INPLACE_UPDATE_DEFAULT: bool = false;
 /// partitioned passthrough UPDATE. When Some, the cold section replaces
 /// DELETE+INSERT with an atomic upsert + delete-gone. When None, the
 /// standard DELETE+INSERT behavior is preserved.
-#[allow(dead_code)]
 pub(crate) struct InplaceSpec<'a> {
     pub delta_new: &'a str,            // base_query rewritten to read pt_new (the recompute)
-    pub key_target_cols: &'a [String], // quoted unique-key cols in the TARGET (e.g. "dem_plan_id")
+    pub key_target_cols: &'a [String], // quoted unique-key cols in the TARGET (e.g. "\"id\"", "\"region\"")
     pub key_source_cols: &'a [String], // quoted unique-key cols in the SOURCE scratch (pt_old)
+    pub non_key_cols: &'a [String],    // quoted NON-key target cols (resolved at codegen time)
     pub pt_old: &'a str,               // OLD-image scratch table (quoted, schema-qualified)
-    pub partition_col_lit: &'a str,    // partition column name (unquoted, for pg_attribute filters)
 }
 
 /// 1.4.5 — emit a DO block that dispatches between MERGE-incremental and
@@ -352,21 +351,113 @@ pub(crate) fn build_partition_aware_dispatch_sql_strategy(
 }
 
 /// Helper: build the in-place upsert + delete-gone cold section for LIST partitioning.
-#[allow(dead_code)]
-fn build_inplace_cold_list_block(_spec: &InplaceSpec, _parent_lit: &str, _target_col_only: &str) -> String {
-    // FUTURE: This is a stub - the actual in-place SQL generation is deferred
-    // pending a cleaner approach to avoid format()/positional parameter nesting issues.
-    // For now, return the standard cold body and rely on existing keyed DELETE+INSERT.
-    String::new()
+fn build_inplace_cold_list_block(
+    spec: &InplaceSpec,
+    qv: &str,
+    pcol: &str,
+) -> String {
+    let k_csv = spec.key_target_cols.join(", ");
+    let ksrc_csv = spec.key_source_cols.join(", ");
+    let nk_csv = spec.non_key_cols.join(", ");
+    let all_cols = if nk_csv.is_empty() {
+        k_csv.clone()
+    } else {
+        format!("{}, {}", k_csv, nk_csv)
+    };
+    let on_conflict = if spec.non_key_cols.is_empty() {
+        "DO NOTHING".to_string()
+    } else {
+        let set_csv = spec
+            .non_key_cols
+            .iter()
+            .map(|c| format!("{} = EXCLUDED.{}", c, c))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("DO UPDATE SET {}", set_csv)
+    };
+    let key_join = spec
+        .key_target_cols
+        .iter()
+        .map(|c| format!("__t.{} IS NOT DISTINCT FROM __r.{}", c, c))
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    let dn = spec.delta_new;
+    let pt_old = spec.pt_old;
+    let assert_default = ASSERT_INPLACE_UPDATE_DEFAULT;
+    let qvmsg = qv.replace('\'', "''");
+
+    let block = format!(
+        "             DROP TABLE IF EXISTS __reflex_pt_proj;\n\
+         \x20            EXECUTE format($reflex_dn$CREATE TEMP TABLE __reflex_pt_proj ON COMMIT DROP AS SELECT * FROM ({dn}) __r WHERE __r.{pcol}::text <> ALL($1::text[]) AND __r.{pcol} = ANY($2::text[]::%s[])$reflex_dn$, _part_type) USING _hot_keys, _cold_keys;\n\
+         \x20            EXECUTE $reflex_up$INSERT INTO {qv} ({all_cols}) SELECT {all_cols} FROM __reflex_pt_proj ON CONFLICT ({k_csv}) {on_conflict}$reflex_up$;\n\
+         \x20            EXECUTE format($reflex_del$DELETE FROM {qv} __t WHERE ({k_csv}) IN (SELECT {ksrc_csv} FROM {pt_old}) AND __t.{pcol}::text <> ALL($1::text[]) AND __t.{pcol} = ANY($2::text[]::%s[]) AND NOT EXISTS (SELECT 1 FROM __reflex_pt_proj __r WHERE {key_join})$reflex_del$, _part_type) USING _hot_keys, _cold_keys;\n\
+         \x20            IF COALESCE(current_setting('reflex.assert_inplace_update', true)::bool, {assert_default}) THEN\n\
+         \x20                EXECUTE format($reflex_as$SELECT 1 WHERE EXISTS ((SELECT {k_csv} FROM {qv} __t WHERE ({k_csv}) IN (SELECT {ksrc_csv} FROM {pt_old}) AND __t.{pcol} = ANY($1::text[]::%1$s[]) EXCEPT ALL SELECT {k_csv} FROM __reflex_pt_proj) UNION ALL (SELECT {k_csv} FROM __reflex_pt_proj EXCEPT ALL SELECT {k_csv} FROM {qv} __t WHERE ({k_csv}) IN (SELECT {ksrc_csv} FROM {pt_old}) AND __t.{pcol} = ANY($1::text[]::%1$s[])))$reflex_as$, _part_type) INTO _assert_hit USING _cold_keys;\n\
+         \x20                IF _assert_hit IS NOT NULL THEN RAISE EXCEPTION 'pg_reflex in-place assertion failed for {qvmsg}: affected key set diverged'; END IF;\n\
+         \x20            END IF;\n",
+        dn=dn, pcol=pcol, qv=qv, k_csv=k_csv, all_cols=all_cols, on_conflict=on_conflict,
+        ksrc_csv=ksrc_csv, pt_old=pt_old, key_join=key_join,
+        assert_default=assert_default, qvmsg=qvmsg
+    );
+    block
 }
 
 /// Helper: build the in-place upsert + delete-gone cold section for RANGE partitioning.
-#[allow(dead_code)]
-fn build_inplace_cold_range_block(_spec: &InplaceSpec, _parent_lit: &str, _target_col_only: &str) -> String {
-    // FUTURE: This is a stub - the actual in-place SQL generation is deferred
-    // pending a cleaner approach to avoid format()/positional parameter nesting issues.
-    // For now, return the standard cold body and rely on existing keyed DELETE+INSERT.
-    String::new()
+fn build_inplace_cold_range_block(
+    spec: &InplaceSpec,
+    qv: &str,
+    parent_lit: &str,
+    part_col_lit: &str,
+    part_col_qualified: &str,
+) -> String {
+    let k_csv = spec.key_target_cols.join(", ");
+    let ksrc_csv = spec.key_source_cols.join(", ");
+    let nk_csv = spec.non_key_cols.join(", ");
+    let all_cols = if nk_csv.is_empty() {
+        k_csv.clone()
+    } else {
+        format!("{}, {}", k_csv, nk_csv)
+    };
+    let on_conflict = if spec.non_key_cols.is_empty() {
+        "DO NOTHING".to_string()
+    } else {
+        let set_csv = spec
+            .non_key_cols
+            .iter()
+            .map(|c| format!("{} = EXCLUDED.{}", c, c))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("DO UPDATE SET {}", set_csv)
+    };
+    let key_join = spec
+        .key_target_cols
+        .iter()
+        .map(|c| format!("__t.{} IS NOT DISTINCT FROM __r.{}", c, c))
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    let dn = spec.delta_new;
+    let pt_old = spec.pt_old;
+    let assert_default = ASSERT_INPLACE_UPDATE_DEFAULT;
+    let qvmsg = qv.replace('\'', "''");
+    // For RANGE, the partition column reference is needed in three places (recompute projection, target delete, assert)
+    let pt_col_ref = format!("__r.{}", part_col_qualified);
+    let tgt_col_ref = format!("__t.{}", part_col_qualified);
+
+    let block = format!(
+        "             DROP TABLE IF EXISTS __reflex_pt_proj;\n\
+         \x20            CREATE TEMP TABLE __reflex_pt_proj ON COMMIT DROP AS SELECT * FROM ({dn}) __r WHERE public.__reflex_partition_child_for_key('{parent_lit}'::regclass, '{part_col_lit}', {pt_col_ref}::text)::text <> ALL($1::text[]);\n\
+         \x20            EXECUTE $reflex_up$INSERT INTO {qv} ({all_cols}) SELECT {all_cols} FROM __reflex_pt_proj ON CONFLICT ({k_csv}) {on_conflict}$reflex_up$;\n\
+         \x20            DELETE FROM {qv} __t WHERE ({k_csv}) IN (SELECT {ksrc_csv} FROM {pt_old}) AND public.__reflex_partition_child_for_key('{parent_lit}'::regclass, '{part_col_lit}', {tgt_col_ref}::text)::text <> ALL($1::text[]) AND NOT EXISTS (SELECT 1 FROM __reflex_pt_proj __r WHERE {key_join}) USING _hot_child_names;\n\
+         \x20            IF COALESCE(current_setting('reflex.assert_inplace_update', true)::bool, {assert_default}) THEN\n\
+         \x20                SELECT 1 WHERE EXISTS ((SELECT {k_csv} FROM {qv} __t WHERE ({k_csv}) IN (SELECT {ksrc_csv} FROM {pt_old}) AND public.__reflex_partition_child_for_key('{parent_lit}'::regclass, '{part_col_lit}', {tgt_col_ref}::text)::text <> ALL($1::text[]) EXCEPT ALL SELECT {k_csv} FROM __reflex_pt_proj) UNION ALL (SELECT {k_csv} FROM __reflex_pt_proj EXCEPT ALL SELECT {k_csv} FROM {qv} __t WHERE ({k_csv}) IN (SELECT {ksrc_csv} FROM {pt_old}) AND public.__reflex_partition_child_for_key('{parent_lit}'::regclass, '{part_col_lit}', {tgt_col_ref}::text)::text <> ALL($1::text[]))) INTO _assert_hit USING _hot_child_names;\n\
+         \x20                IF _assert_hit IS NOT NULL THEN RAISE EXCEPTION 'pg_reflex in-place assertion failed for {qvmsg}: affected key set diverged'; END IF;\n\
+         \x20            END IF;\n",
+        dn=dn, parent_lit=parent_lit, part_col_lit=part_col_lit, pt_col_ref=pt_col_ref,
+        qv=qv, all_cols=all_cols, on_conflict=on_conflict, k_csv=k_csv,
+        ksrc_csv=ksrc_csv, pt_old=pt_old, tgt_col_ref=tgt_col_ref, key_join=key_join,
+        assert_default=assert_default, qvmsg=qvmsg
+    );
+    block
 }
 
 /// Passthrough sibling of [`build_partition_aware_dispatch_sql`] (audit #2). Same
@@ -416,48 +507,57 @@ pub(crate) fn build_passthrough_partition_dispatch_sql(
 
 
     // Build the cold-body execution block for the main partition dispatch (post-trip-cap).
-    // For LIST: wrap in format() to inject _part_type, guard with IF _cold_keys non-empty, bind _hot_keys,_cold_keys.
-    // For RANGE: simple EXECUTE, bind _hot_keys,_hot_child_names (use literal USING clause here, not a placeholder).
-    // NOTE: In-place upsert optimization deferred pending SQL code generation refactoring.
-    let cold_dispatch_block = if is_list {
-        // LIST: cold DELETE with pruning
-        let del_part = format!(
-            "             IF array_length(_cold_keys,1) IS NOT NULL THEN\n\
-             EXECUTE format($reflex_cold_list${sql} AND {col} = ANY($2::text[]::%s[])$reflex_cold_list$, _part_type)\n\
-                 USING _hot_keys, _cold_keys;\n",
-            sql = safe_del,
-            col = target_col_only
-        );
-        // LIST: cold INSERT with pruning (if present)
-        let ins_part = if cold_insert_with_filter.is_empty() {
-            "             END IF;\n".to_string()
+    // For in-place upsert (when spec is Some), emit the specialized block.
+    // Otherwise, fall back to the standard DELETE+INSERT path.
+    let cold_dispatch_block = if let Some(spec) = _inplace {
+        if is_list {
+            build_inplace_cold_list_block(spec, target_parent_qual, target_col_only)
         } else {
-            format!(
-                "             EXECUTE format($reflex_cold_list${sql} AND {col} = ANY($2::text[]::%s[])$reflex_cold_list$, _part_type)\n\
-                 USING _hot_keys, _cold_keys;\n\
-             END IF;\n",
-                sql = safe_ins,
-                col = target_col_only
-            )
-        };
-        format!("{}{}", del_part, ins_part)
+            // RANGE: need the qualified partition column reference for the helper
+            build_inplace_cold_range_block(spec, target_parent_qual, &parent, &safe_part_col_lit, target_part_ref)
+        }
     } else {
-        // RANGE: cold DELETE (no pruning needed — hot-exclusion by child name suffices)
-        // Note: literal USING clause here (not a placeholder), since this block is embedded into the template.
-        let del_part = format!(
-            "             EXECUTE $reflex_inner${del}$reflex_inner$ USING _hot_keys, _hot_child_names;\n",
-            del = safe_del
-        );
-        // RANGE: cold INSERT (if present)
-        let ins_part = if cold_insert_with_filter.is_empty() {
-            String::new()
+        // Standard cold DELETE+INSERT path (no in-place optimization)
+        if is_list {
+            // LIST: cold DELETE with pruning
+            let del_part = format!(
+                "             IF array_length(_cold_keys,1) IS NOT NULL THEN\n\
+                 EXECUTE format($reflex_cold_list${sql} AND {col} = ANY($2::text[]::%s[])$reflex_cold_list$, _part_type)\n\
+                     USING _hot_keys, _cold_keys;\n",
+                sql = safe_del,
+                col = target_col_only
+            );
+            // LIST: cold INSERT with pruning (if present)
+            let ins_part = if cold_insert_with_filter.is_empty() {
+                "             END IF;\n".to_string()
+            } else {
+                format!(
+                    "             EXECUTE format($reflex_cold_list${sql} AND {col} = ANY($2::text[]::%s[])$reflex_cold_list$, _part_type)\n\
+                     USING _hot_keys, _cold_keys;\n\
+                 END IF;\n",
+                    sql = safe_ins,
+                    col = target_col_only
+                )
+            };
+            format!("{}{}", del_part, ins_part)
         } else {
-            format!(
-                "             EXECUTE $reflex_inner${ins}$reflex_inner$ USING _hot_keys, _hot_child_names;\n",
-                ins = safe_ins
-            )
-        };
-        format!("{}{}", del_part, ins_part)
+            // RANGE: cold DELETE (no pruning needed — hot-exclusion by child name suffices)
+            // Note: literal USING clause here (not a placeholder), since this block is embedded into the template.
+            let del_part = format!(
+                "             EXECUTE $reflex_inner${del}$reflex_inner$ USING _hot_keys, _hot_child_names;\n",
+                del = safe_del
+            );
+            // RANGE: cold INSERT (if present)
+            let ins_part = if cold_insert_with_filter.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "             EXECUTE $reflex_inner${ins}$reflex_inner$ USING _hot_keys, _hot_child_names;\n",
+                    ins = safe_ins
+                )
+            };
+            format!("{}{}", del_part, ins_part)
+        }
     };
 
     // For the defensive branch (unpartitioned target), use the original simple behavior.
