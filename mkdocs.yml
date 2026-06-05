@@ -107,6 +107,7 @@ nav:
       - Sufficient statistics: concepts/sufficient-statistics.md
       - Decomposition: concepts/decomposition.md
       - Delta processing: concepts/delta-processing.md
+      - Inner workings: concepts/inner-workings.md
       - Deferred mode: concepts/deferred-mode.md
       - Top-K MIN/MAX: concepts/topk.md
       - Internals: concepts/internals.md

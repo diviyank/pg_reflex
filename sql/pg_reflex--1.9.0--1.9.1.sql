@@ -1,0 +1,40 @@
+-- Migration: pg_reflex 1.9.0 → 1.9.1
+--
+-- Run via: ALTER EXTENSION pg_reflex UPDATE TO '1.9.1';
+--
+-- 1.9.1 is a performance release for partitioned passthrough maintenance.
+-- There are NO catalog schema changes, NO function signature changes, and NO
+-- SPI additions — every change is in the Rust trigger/dispatch codegen, which
+-- is recompiled into the module. The one new knob, the
+-- `reflex.assert_inplace_update` GUC, is registered in `_PG_init` (in the .so),
+-- not via catalog DDL. Existing IMVs continue to operate without intervention.
+--
+-- Notable changes (all in-process, no migration DDL):
+--
+--   (a) In-place upsert for the partitioned passthrough UPDATE cold path. The
+--       cold dispatch branch maintains a pure-data UPDATE with
+--       `INSERT … ON CONFLICT (<key>) DO UPDATE` on the existing
+--       `__reflex_uk_` index, plus a keyed delete-gone for rows that
+--       disappeared or left the query's WHERE filter, instead of a full
+--       DELETE + recompute INSERT. Falls back to the prior DELETE+INSERT for
+--       non-partitioned, keyless, or non-UPDATE cases.
+--
+--   (b) `reflex.assert_inplace_update` GUC (boolean, default `off`). When on,
+--       the in-place path re-derives the affected key set after maintenance and
+--       raises on any divergence from a fresh recompute — a runtime correctness
+--       self-check for CI/fuzz and first-rollout canary use.
+--
+--   (c) LIST partition-key pruning of the cold passthrough DELETE/INSERT. The
+--       cold body constrains the partition key to the touched cold partitions
+--       so the planner prunes to the affected leaves. Semantic no-op; LIST
+--       only (RANGE unchanged).
+--
+-- Migration steps:
+--
+--   No DDL is required. This file exists purely to register the
+--   1.9.0 → 1.9.1 upgrade path with PostgreSQL's extension machinery. Replace
+--   the module (.so) before running `ALTER EXTENSION pg_reflex UPDATE TO
+--   '1.9.1';` so the new dispatch behavior is loaded.
+
+-- No-op marker: ALTER EXTENSION needs a non-empty migration file.
+SELECT 1 WHERE FALSE;

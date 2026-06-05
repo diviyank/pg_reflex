@@ -2,8 +2,13 @@
 
 ## [Unreleased]
 
-Performance for partitioned passthrough maintenance. No catalog/schema or
-function-signature changes — everything ships in the recompiled module.
+## [1.9.1] - 2026-06-05
+
+A performance release for partitioned passthrough maintenance. No catalog/schema
+or function-signature changes — everything ships in the recompiled module, so
+existing IMVs keep working: `ALTER EXTENSION pg_reflex UPDATE TO '1.9.1';`. (The
+new `reflex.assert_inplace_update` GUC is registered in `_PG_init`, not via
+catalog DDL.)
 
 ### Added
 
@@ -27,6 +32,13 @@ function-signature changes — everything ships in the recompiled module.
   planner prunes to the affected leaves (cold keyed-delete planning ~110 ms →
   ~7 ms and execution ~3.7× on the 837-leaf benchmark). Semantic no-op; LIST
   only (RANGE unchanged).
+
+### Migration
+
+`ALTER EXTENSION pg_reflex UPDATE TO '1.9.1';` after replacing the module. No
+DDL runs — the migration file is a no-op marker. Nothing to recreate; the new
+cold-UPDATE codegen applies to the next flush of every existing partitioned
+passthrough IMV.
 
 ## [1.9.0] - 2026-06-04
 

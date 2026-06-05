@@ -1,6 +1,6 @@
 # Internals
 
-Engine-level details behind the public API. Useful when tuning, debugging, or reading the source. Separate from [architecture](architecture.md), which covers *what* objects exist; this page covers *how* they behave at the PostgreSQL level.
+Engine-level details behind the public API. Useful when tuning, debugging, or reading the source. Separate from [architecture](architecture.md), which covers *what* objects exist; this page covers *how* they behave at the PostgreSQL level. For the exact statement-by-statement SQL emitted for each maintenance path, see [inner workings](inner-workings.md).
 
 ## Trigger model
 

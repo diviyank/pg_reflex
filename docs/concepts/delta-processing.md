@@ -1,6 +1,6 @@
 # Delta processing
 
-When a source table is mutated, pg_reflex's statement-level trigger applies the delta in five steps.
+When a source table is mutated, pg_reflex's statement-level trigger applies the delta in five steps. This page is the mental model; for the exact SQL emitted for every shape and operation, see [inner workings](inner-workings.md).
 
 ## 1. Empty-delta short-circuit
 
@@ -89,5 +89,6 @@ Two effects matter even when the table-level lock is benign:
 
 Practical operator notes: if your workload sits below the wipe threshold on every IMV — or your bulk flips qualify for Path B / Path C — readers run uninterrupted. The remaining blocking paths (`reflex_reconcile` and aggregated self-join sources) are the regimes where in-place IMV maintenance is more expensive than a full rebuild. A source `TRUNCATE` is not in this group: it issues `DELETE FROM target`, so readers keep running. Lowering `wipe_threshold` per IMV (`reflex_set_wipe_threshold`) routes more workloads through the rebuild branch in exchange for cheaper individual rebuilds; whether that rebuild blocks readers depends on whether it qualifies for Path B / Path C (non-blocking) or falls through to `reflex_reconcile` (blocking).
 
+[Inner workings :material-arrow-right-bold:](inner-workings.md){ .md-button }
 [Deferred mode :material-arrow-right-bold:](deferred-mode.md){ .md-button }
 [Internals :material-arrow-right-bold:](internals.md){ .md-button }

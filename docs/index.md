@@ -60,6 +60,8 @@ On the workloads it targets — append-mostly sources, narrow updates, cascade d
 
 ## Recent highlights
 
+- **In-place partitioned passthrough UPDATE (1.9.1).** The cold partition path now applies a pure-data UPDATE via `INSERT … ON CONFLICT DO UPDATE` plus a keyed delete-gone, instead of a full DELETE + recompute INSERT — ~3–4.5× faster flush on a 33.7M-row, 837-leaf passthrough IMV. See the [inner workings](concepts/inner-workings.md) walkthrough.
+- **Partition-aware trigger dispatch + keyed passthrough secondaries (1.9.0).** Partitioned passthrough/aggregate IMVs route DML only to the affected child partitions; passthrough LEFT-JOIN secondaries and single-source PK passthrough/CTE IMVs now maintain incrementally instead of full-rebuilding.
 - **`ignore_sources` honored on the DEFERRED path (1.7.6).** A source excluded via `ignore_sources` is now skipped on both the IMMEDIATE and DEFERRED trigger paths (including `reflex_flush_deferred`); earlier versions skipped only on IMMEDIATE.
 - **Widened CTE/JOIN unique-key inference (1.7.5).** Chained-CTE cascades auto-resolve sound unique keys (equi-join equivalence, aggregate GROUP BY keys, CROSS-to-single-row), so they get incremental DELETE/UPDATE instead of full refresh.
 - **Partitioned IMVs (1.5.0–1.7.4).** `partition_by`, per-partition reconcile/dispatch, atomic DETACH/ATTACH swap, and partition-anchor resolution across co-partitioned join keys.

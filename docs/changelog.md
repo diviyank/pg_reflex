@@ -4,6 +4,23 @@ The full changelog tracks every release. The latest version's headlines are on t
 
 For each version below, see [`CHANGELOG.md`](https://github.com/diviyank/pg_reflex/blob/main/CHANGELOG.md) on GitHub for the canonical text.
 
+## [1.9.1] — 2026-06-05
+
+Performance release for partitioned passthrough maintenance. No catalog/schema or function-signature changes — all changes ship in the recompiled module: `ALTER EXTENSION pg_reflex UPDATE TO '1.9.1';`. The one new knob, the `reflex.assert_inplace_update` GUC, is registered in `_PG_init`, not via catalog DDL.
+
+**Added**
+
+- In-place upsert for the partitioned passthrough UPDATE cold path: a pure-data UPDATE is applied via `INSERT … ON CONFLICT (<key>) DO UPDATE` on the existing `__reflex_uk_` index plus a keyed delete-gone for rows that disappeared or left the query's `WHERE` filter, instead of a full DELETE + recompute INSERT. ~3–4.5× faster flush on a 33.7M-row, 837-leaf passthrough IMV (~11.2 s → ~2.5–3.9 s for 100–110k pure-data rows). Falls back to DELETE+INSERT for non-partitioned, keyless, or non-UPDATE cases.
+- `reflex.assert_inplace_update` GUC (boolean, default `off`): re-derives the affected key set after the in-place path and raises on any divergence from a fresh recompute — a runtime correctness self-check for CI/fuzz and canary rollout.
+
+**Changed**
+
+- LIST partition-key pruning of the cold passthrough DELETE/INSERT: the cold body constrains the partition key to the touched cold partitions so the planner prunes to the affected leaves (cold keyed-delete planning ~110 ms → ~7 ms, execution ~3.7× on the 837-leaf benchmark). Semantic no-op; LIST only.
+
+**Migration**
+
+`ALTER EXTENSION pg_reflex UPDATE TO '1.9.1';` after replacing the module. No DDL runs; the new cold-UPDATE codegen applies to the next flush of every existing partitioned passthrough IMV.
+
 ## [1.9.0] — 2026-06-04
 
 Performance + correctness release for passthrough maintenance: partitioned passthrough/aggregate IMVs dispatch DML only to affected child partitions, passthrough LEFT-JOIN secondaries are maintained with a keyed delete + delta insert instead of a full rebuild, and inner CTE sub-IMVs (and single-source passthrough IMVs generally) now detect a source PRIMARY KEY and maintain incrementally instead of full-rebuilding every flush. No catalog/schema or function-signature changes — all changes ship in the recompiled module: `ALTER EXTENSION pg_reflex UPDATE TO '1.9.0';`.
