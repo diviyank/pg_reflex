@@ -1,5 +1,33 @@
 # Changelog
 
+## [Unreleased]
+
+Performance for partitioned passthrough maintenance. No catalog/schema or
+function-signature changes — everything ships in the recompiled module.
+
+### Added
+
+- **In-place upsert for partitioned passthrough UPDATE.** The cold dispatch
+  branch now maintains a pure-data UPDATE with `INSERT … ON CONFLICT (<key>) DO
+  UPDATE` (on the existing `__reflex_uk_` index) plus a keyed delete-gone for
+  rows that disappeared or left the query's WHERE filter, instead of a full
+  DELETE + recompute INSERT. Measured ~3–4.5× faster flush on a 33.7M-row,
+  837-leaf passthrough IMV (100–110k pure-data rows: ~11.2 s → ~2.5–3.9 s).
+  Falls back to the prior DELETE+INSERT for non-partitioned, keyless, or
+  non-UPDATE cases.
+- **`reflex.assert_inplace_update` GUC** (boolean, default `off`). When on, the
+  in-place path re-derives the affected key set after maintenance and raises on
+  any divergence from a fresh recompute — a runtime correctness self-check for
+  CI/fuzz (always on in the test suite) and first-rollout canary use.
+
+### Changed
+
+- **LIST partition-key pruning of the cold passthrough DELETE/INSERT.** The cold
+  body now constrains the partition key to the touched cold partitions, so the
+  planner prunes to the affected leaves (cold keyed-delete planning ~110 ms →
+  ~7 ms and execution ~3.7× on the 837-leaf benchmark). Semantic no-op; LIST
+  only (RANGE unchanged).
+
 ## [1.9.0] - 2026-06-04
 
 A performance + correctness release for passthrough maintenance. Partitioned
