@@ -83,13 +83,43 @@ __attribute__((weak)) int   errhint(const char *fmt, ...)               { return
 __attribute__((weak)) int   errcontext_msg(const char *fmt, ...)        { return 0; }
 __attribute__((weak)) void  pfree(void *ptr)                            {}
 __attribute__((weak)) void *palloc0(size_t size)                        { return NULL; }
+__attribute__((weak)) void *palloc(size_t size)                         { return NULL; }
 __attribute__((weak)) void *CopyErrorData(void)                         { return NULL; }
 __attribute__((weak)) void  FreeErrorData(void *edata)                  {}
 __attribute__((weak)) void  FlushErrorState(void)                       {}
 __attribute__((weak)) int   message_level_is_interesting(int elevel)    { return 0; }
 
+/* SPI + memory-context + type helpers referenced by pgrx's Spi APIs in the
+ * test orchestrator binary. Never called there (the #[pg_test] bodies run in
+ * the loaded .so where Postgres provides the real strong symbols); these weak
+ * stubs exist only so the cfg(test) binary links. They are NOT in the cdylib. */
+__attribute__((weak)) int   SPI_connect(void)                           { return 0; }
+__attribute__((weak)) int   SPI_finish(void)                            { return 0; }
+__attribute__((weak)) int   SPI_execute(const char *s, int r, long c)   { return 0; }
+__attribute__((weak)) int   SPI_execute_with_args()                     { return 0; }
+__attribute__((weak)) int   SPI_fnumber(void *td, const char *cn)       { return 0; }
+__attribute__((weak)) unsigned long SPI_getbinval()                     { return 0; }
+__attribute__((weak)) unsigned int  SPI_gettypeid()                     { return 0; }
+__attribute__((weak)) void *format_type_extended()                      { return NULL; }
+__attribute__((weak)) int   IsBinaryCoercible()                         { return 0; }
+__attribute__((weak)) int   GetDatabaseEncoding(void)                   { return 0; }
+__attribute__((weak)) unsigned int GetCurrentTransactionIdIfAny(void)   { return 0; }
+__attribute__((weak)) void  MemoryContextDelete(void *c)                {}
+__attribute__((weak)) void *MemoryContextGetParent(void *c)             { return NULL; }
+__attribute__((weak)) void *AllocSetContextCreateInternal()             { return NULL; }
+__attribute__((weak)) void *pg_detoast_datum_packed(void *d)            { return NULL; }
+
 __attribute__((weak)) void *CurrentMemoryContext  = NULL;
 __attribute__((weak)) void *ErrorContext          = NULL;
 __attribute__((weak)) void *PG_exception_stack    = NULL;
 __attribute__((weak)) void *error_context_stack   = NULL;
+__attribute__((weak)) void *TopMemoryContext      = NULL;
+__attribute__((weak)) void *CacheMemoryContext    = NULL;
+__attribute__((weak)) void *MessageContext        = NULL;
+__attribute__((weak)) void *PortalContext         = NULL;
+__attribute__((weak)) void *PostmasterContext     = NULL;
+__attribute__((weak)) void *TopTransactionContext = NULL;
+__attribute__((weak)) void *CurTransactionContext = NULL;
+__attribute__((weak)) void *SPI_tuptable          = NULL;
+__attribute__((weak)) unsigned long long SPI_processed = 0;
 "#;
