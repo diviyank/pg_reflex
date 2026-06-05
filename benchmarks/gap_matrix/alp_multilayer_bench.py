@@ -59,11 +59,19 @@ SCHEMA = os.environ.get("DB_CLONE_SCHEMA", "alp")
 # Correct mutation: re-forecast a whole demand plan (one dem_plan_id partition) —
 # prunes to a single partition, realistic. SCENARIOS are filled at runtime from a
 # few dem_plan_ids of differing size (see main()).
-def _dp_update(dp):
-    return f"UPDATE {SCHEMA}.sales_simulation SET qty_sales = qty_sales + 1 WHERE dem_plan_id = {dp}"
+def _bounded_update(dp, n):
+    # Update exactly n rows within ONE dem_plan partition via a full-PK key-join
+    # (index-driven, partition-pruned, deterministic-bounded). NOT ctid (collides
+    # across the 1,062 leaf partitions) and NOT composite-IN-over-self (bad plan).
+    return (
+        f"UPDATE {SCHEMA}.sales_simulation s SET qty_sales = qty_sales + 1 "
+        f"FROM (SELECT order_date, dem_plan_id, id FROM {SCHEMA}.sales_simulation "
+        f"      WHERE dem_plan_id = {dp} LIMIT {n}) k "
+        f"WHERE s.order_date=k.order_date AND s.dem_plan_id=k.dem_plan_id AND s.id=k.id"
+    )
 
 
-SCENARIOS = []  # populated in main() from real dem_plan_id partition sizes
+SCENARIOS = []  # populated in main(): bounded deltas within one large dem_plan
 
 
 def imv_specs_in_order(r: Registry):
@@ -161,18 +169,22 @@ def main() -> int:
     for s in imv_order:
         print(f"  - {s.name}")
 
-    # Build scenarios from the smallest few dem_plan_id partitions (a realistic
-    # "re-forecast one demand plan" delta that prunes to a single partition).
+    # Pick the largest dem_plan_id and sweep bounded delta sizes within it, so the
+    # IMV cost curve (delta-proportional) is visible against the constant MV
+    # refresh-all baseline. The 'all' scenario updates the whole partition.
     with engine.connect() as c:
-        rows = c.execute(text(
+        dp, dp_rows = c.execute(text(
             f"SELECT dem_plan_id, count(*) FROM {SCHEMA}.sales_simulation "
-            f"GROUP BY 1 ORDER BY 2 ASC LIMIT 3"
-        )).fetchall()
-    for dp, n in rows:
+            f"GROUP BY 1 ORDER BY 2 DESC LIMIT 1"
+        )).fetchone()
+    print(f"\nmutating within dem_plan_id={dp} ({dp_rows:,} rows)")
+    for n in (1_000, 100_000, 1_000_000):
+        if n > dp_rows:
+            break
         SCENARIOS.append((
-            f"re-forecast dem_plan_id={dp} ({n:,} rows)",
+            f"delta {n:,} rows in dem_plan {dp}",
             f"{SCHEMA}.sales_simulation",
-            _dp_update(dp),
+            _bounded_update(dp, n),
             [f"{SCHEMA}.sales_simulation"],
         ))
 
@@ -185,20 +197,35 @@ def main() -> int:
         print(f"  {label:<60} {ms:9.1f} ms", flush=True)
 
     # Phase 2 — MV variant: build the 7 top views as MVs, then time REFRESH-all.
-    print("\n=== building top views as MVs (one-time, not timed) ===", flush=True)
-    build_top_views_as_mv(engine, imv_order)
-    print("\n=== MV variant (full REFRESH of all top views in topo order) ===", flush=True)
+    # KNOWN LIMITATION: build_top_views_as_mv drops IMV targets with CASCADE, which
+    # can remove a dependency MV (e.g. history_sales_view) that a sibling top view
+    # needs — the full 7-view refresh-all then fails. A proper fix rebuilds the MV
+    # DAG dependency-aware. Until then, the per-view REFRESH baseline is each view's
+    # build time (a fair full-recompute proxy), and we hard-restore via setup_alp_mvs.
     mv_results = []
-    for label, _src, mut, flush_srcs in SCENARIOS:
-        ms, per_view = time_mv_variant(engine, imv_order, mut)
-        mv_results.append((label, ms))
-        print(f"  {label:<60} {ms:9.1f} ms  (refresh-all)", flush=True)
-        for name, vms in sorted(per_view, key=lambda x: -x[1])[:5]:
-            print(f"      {name:<46} {vms:9.1f} ms", flush=True)
+    try:
+        print("\n=== building top views as MVs (one-time, not timed) ===", flush=True)
+        build_top_views_as_mv(engine, imv_order)
+        print("\n=== MV variant (full REFRESH of all top views in topo order) ===", flush=True)
+        for label, _src, mut, flush_srcs in SCENARIOS:
+            ms, per_view = time_mv_variant(engine, imv_order, mut)
+            mv_results.append((label, ms))
+            print(f"  {label:<60} {ms:9.1f} ms  (refresh-all)", flush=True)
+            for name, vms in sorted(per_view, key=lambda x: -x[1])[:5]:
+                print(f"      {name:<46} {vms:9.1f} ms", flush=True)
+    except Exception as e:
+        print(f"\nMV phase failed: {str(e).splitlines()[0]}", flush=True)
+        print("DAG is now partially MV-converted — restore with:", flush=True)
+        print("  DB_CLONE_SCHEMA=alp uv run python setup_alp_mvs.py", flush=True)
 
-    # Restore the IMV DAG so db_clone is left as we found it.
+    # Best-effort restore of the IMV DAG (insufficient if a dependency MV was
+    # CASCADE-dropped above — then run setup_alp_mvs.py as printed).
     print("\n=== restoring top views as IMVs ===", flush=True)
-    build_top_views_as_imv(engine, imv_order)
+    try:
+        build_top_views_as_imv(engine, imv_order)
+    except Exception as e:
+        print(f"  in-script restore incomplete ({str(e).splitlines()[0]}); "
+              f"run setup_alp_mvs.py", flush=True)
 
     # Summary.
     print("\n" + "=" * 78)
