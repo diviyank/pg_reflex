@@ -47,28 +47,23 @@ SCHEMA = os.environ.get("DB_CLONE_SCHEMA", "alp")
 # sop_current_view is empty), so a caav->sop_forecast cascade scenario is
 # degenerate here. We focus on sales_simulation, which sop_forecast_view (33.7M
 # rows) reads directly.
-def _batch_update(n):
-    return (
-        f"UPDATE {SCHEMA}.sales_simulation SET qty_sales = qty_sales + 1 "
-        f"WHERE ctid IN (SELECT ctid FROM {SCHEMA}.sales_simulation LIMIT {n})"
-    )
+# CORRECTION (2026-06-05): an earlier version used
+#   WHERE ctid IN (SELECT ctid FROM sales_simulation LIMIT n)
+# which is BROKEN on a partitioned table — ctid is not unique across partitions, so
+# a "1,000-row" update actually changed 216,001 rows (the same block/offset in every
+# one of the ~50 partitions). That artifact produced bogus 17s/101s/44min flush
+# times and a fake "super-linear gap". Verified ground truth: a correctly bounded
+# delta flushes in milliseconds with a pruned, index-driven DELETE — there is NO
+# maintenance gap. See journal/2026-06-05_sop_forecast_flush_analysis.md.
+#
+# Correct mutation: re-forecast a whole demand plan (one dem_plan_id partition) —
+# prunes to a single partition, realistic. SCENARIOS are filled at runtime from a
+# few dem_plan_ids of differing size (see main()).
+def _dp_update(dp):
+    return f"UPDATE {SCHEMA}.sales_simulation SET qty_sales = qty_sales + 1 WHERE dem_plan_id = {dp}"
 
 
-# FINDING (2026-06-05, db_clone): IMV incremental maintenance of sop_forecast_view
-# (5-table-join passthrough, 33.7M rows) is super-linear and slow —
-#   1k-row delta flush  = 17.4 s
-#   10k-row delta flush = 101.4 s  (≈ the full MV-refresh cost of ~110 s)
-#   100k-row UPDATE     = the capture-trigger statement alone ran >44 min (killed)
-# i.e. the IMV/MV crossover for this wide-join view is at a *tiny* ~10k-row delta,
-# and large updates are impractical — a real gap, not a win. Default scenarios are
-# kept small so a re-run completes; raise with care.
-SCENARIOS = [
-    (f"sales_simulation +1 qty ({n:,} rows)",
-     f"{SCHEMA}.sales_simulation",
-     _batch_update(n),
-     [f"{SCHEMA}.sales_simulation"])
-    for n in (100, 1000)
-]
+SCENARIOS = []  # populated in main() from real dem_plan_id partition sizes
 
 
 def imv_specs_in_order(r: Registry):
@@ -165,6 +160,21 @@ def main() -> int:
     print(f"Top-level IMV views ({len(imv_order)}), topo order:")
     for s in imv_order:
         print(f"  - {s.name}")
+
+    # Build scenarios from the smallest few dem_plan_id partitions (a realistic
+    # "re-forecast one demand plan" delta that prunes to a single partition).
+    with engine.connect() as c:
+        rows = c.execute(text(
+            f"SELECT dem_plan_id, count(*) FROM {SCHEMA}.sales_simulation "
+            f"GROUP BY 1 ORDER BY 2 ASC LIMIT 3"
+        )).fetchall()
+    for dp, n in rows:
+        SCENARIOS.append((
+            f"re-forecast dem_plan_id={dp} ({n:,} rows)",
+            f"{SCHEMA}.sales_simulation",
+            _dp_update(dp),
+            [f"{SCHEMA}.sales_simulation"],
+        ))
 
     # Phase 1 — IMV variant (DAG already built as IMVs by setup_alp_mvs.py).
     print("\n=== IMV variant (incremental cascade flush) ===", flush=True)
