@@ -386,6 +386,7 @@ fn build_inplace_cold_list_block(
     let assert_default = ASSERT_INPLACE_UPDATE_DEFAULT;
     let qvmsg = qv.replace('\'', "''");
 
+    // delete-gone: rows still in pt_old (cold) but dropped by the recompute (source-deleted OR left the WHERE filter).
     let block = format!(
         "             DROP TABLE IF EXISTS __reflex_pt_proj;\n\
          \x20            EXECUTE format($reflex_dn$CREATE TEMP TABLE __reflex_pt_proj ON COMMIT DROP AS SELECT * FROM ({dn}) __r WHERE __r.{pcol}::text <> ALL($1::text[]) AND __r.{pcol} = ANY($2::text[]::%s[])$reflex_dn$, _part_type) USING _hot_keys, _cold_keys;\n\
@@ -443,6 +444,7 @@ fn build_inplace_cold_range_block(
     let pt_col_ref = format!("__r.{}", part_col_qualified);
     let tgt_col_ref = format!("__t.{}", part_col_qualified);
 
+    // delete-gone: rows still in pt_old (cold) but dropped by the recompute (source-deleted OR left the WHERE filter).
     let block = format!(
         "             DROP TABLE IF EXISTS __reflex_pt_proj;\n\
          \x20            CREATE TEMP TABLE __reflex_pt_proj ON COMMIT DROP AS SELECT * FROM ({dn}) __r WHERE public.__reflex_partition_child_for_key('{parent_lit}'::regclass, '{part_col_lit}', {pt_col_ref}::text)::text <> ALL($1::text[]);\n\
@@ -583,8 +585,6 @@ pub(crate) fn build_passthrough_partition_dispatch_sql(
              _part_type TEXT;\n\
              _hot_count INT;\n\
              _partition_total INT;\n\
-             _collist TEXT;\n\
-             _set TEXT;\n\
              _assert_hit INT;\n\
          BEGIN\n\
              SELECT wipe_threshold, wipe_floor_rows INTO _per_imv, _per_imv_floor\n\
