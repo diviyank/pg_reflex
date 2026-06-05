@@ -53,7 +53,7 @@ pub(crate) const ASSERT_INPLACE_UPDATE_DEFAULT: bool = false;
 /// DELETE+INSERT with an atomic upsert + delete-gone. When None, the
 /// standard DELETE+INSERT behavior is preserved.
 pub(crate) struct InplaceSpec<'a> {
-    pub delta_new: &'a str,            // base_query rewritten to read pt_new (the recompute)
+    pub delta_new: &'a str, // base_query rewritten to read pt_new (the recompute)
     pub key_target_cols: &'a [String], // quoted unique-key cols in the TARGET (e.g. "\"id\"", "\"region\"")
     pub key_source_cols: &'a [String], // quoted unique-key cols in the SOURCE scratch (pt_old)
     pub non_key_cols: &'a [String],    // quoted NON-key target cols (resolved at codegen time)
@@ -351,11 +351,7 @@ pub(crate) fn build_partition_aware_dispatch_sql_strategy(
 }
 
 /// Helper: build the in-place upsert + delete-gone cold section for LIST partitioning.
-fn build_inplace_cold_list_block(
-    spec: &InplaceSpec,
-    qv: &str,
-    pcol: &str,
-) -> String {
+fn build_inplace_cold_list_block(spec: &InplaceSpec, qv: &str, pcol: &str) -> String {
     let k_csv = spec.key_target_cols.join(", ");
     let ksrc_csv = spec.key_source_cols.join(", ");
     let nk_csv = spec.non_key_cols.join(", ");
@@ -502,11 +498,13 @@ pub(crate) fn build_passthrough_partition_dispatch_sql(
     // For use in SQL format() strings, extract just the column name from target_part_ref
     // (target_part_ref is typically "table"."column", we need just the "column" part).
     let target_col_only = if target_part_ref.contains('.') {
-        target_part_ref.rsplit('.').next().unwrap_or(target_part_ref)
+        target_part_ref
+            .rsplit('.')
+            .next()
+            .unwrap_or(target_part_ref)
     } else {
         target_part_ref
     };
-
 
     // Build the cold-body execution block for the main partition dispatch (post-trip-cap).
     // For in-place upsert (when spec is Some), emit the specialized block.
@@ -516,7 +514,13 @@ pub(crate) fn build_passthrough_partition_dispatch_sql(
             build_inplace_cold_list_block(spec, target_parent_qual, target_col_only)
         } else {
             // RANGE: need the qualified partition column reference for the helper
-            build_inplace_cold_range_block(spec, target_parent_qual, &parent, &safe_part_col_lit, target_part_ref)
+            build_inplace_cold_range_block(
+                spec,
+                target_parent_qual,
+                &parent,
+                &safe_part_col_lit,
+                target_part_ref,
+            )
         }
     } else {
         // Standard cold DELETE+INSERT path (no in-place optimization)

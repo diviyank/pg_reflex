@@ -732,8 +732,8 @@ pub(crate) fn outer_join_secondary_stmts(
 /// the key columns. If the target cannot be resolved or has no non-key columns,
 /// returns an empty Vec (which signals fallback to standard DELETE+INSERT).
 fn resolve_inplace_non_key_cols(view_name: &str, key_target_cols: &[String]) -> Vec<String> {
-    use pgrx::spi::Spi;
     use pgrx::datum::DatumWithOid;
+    use pgrx::spi::Spi;
     use pgrx::PgBuiltInOids;
 
     // Codegen also runs in plain #[test] unit tests with no backend, where Spi
@@ -764,10 +764,7 @@ fn resolve_inplace_non_key_cols(view_name: &str, key_target_cols: &[String]) -> 
                  ORDER BY attnum",
                 None,
                 &[unsafe {
-                    DatumWithOid::new(
-                        view_name.to_string(),
-                        PgBuiltInOids::TEXTOID.oid().value(),
-                    )
+                    DatumWithOid::new(view_name.to_string(), PgBuiltInOids::TEXTOID.oid().value())
                 }],
             )
             .unwrap_or_report();
@@ -919,7 +916,15 @@ pub(crate) fn passthrough_op_stmts(
                     );
                     let aff = format!("SELECT {}::text AS pkey FROM {}", part_src_q, pt_old);
                     stmts.push(build_passthrough_partition_dispatch_sql(
-                        view_name, &qv, &aff, &part_col, &format!("{}.{}", qv, part_col_q), &strategy, &del_cold, "", None,
+                        view_name,
+                        &qv,
+                        &aff,
+                        &part_col,
+                        &format!("{}.{}", qv, part_col_q),
+                        &strategy,
+                        &del_cold,
+                        "",
+                        None,
                     ));
                 } else {
                     stmts.push(base_del);
@@ -987,8 +992,10 @@ pub(crate) fn passthrough_op_stmts(
                         old = pt_old,
                         new = pt_new
                     );
-                    debug_assert!(operation == "UPDATE" && !mappings.is_empty(),
-                        "in-place cold path only valid for keyed passthrough UPDATE");
+                    debug_assert!(
+                        operation == "UPDATE" && !mappings.is_empty(),
+                        "in-place cold path only valid for keyed passthrough UPDATE"
+                    );
 
                     // Resolve non-key columns at codegen time via SPI.
                     // This avoids runtime column list construction and ensures the upsert
@@ -1005,13 +1012,29 @@ pub(crate) fn passthrough_op_stmts(
                             pt_old: &pt_old,
                         };
                         stmts.push(build_passthrough_partition_dispatch_sql(
-                            view_name, &qv, &aff, &part_col, &format!("{}.{}", qv, part_col_q), &strategy, &del_cold, &ins_cold, Some(&spec),
+                            view_name,
+                            &qv,
+                            &aff,
+                            &part_col,
+                            &format!("{}.{}", qv, part_col_q),
+                            &strategy,
+                            &del_cold,
+                            &ins_cold,
+                            Some(&spec),
                         ));
                     } else {
                         // Fallback: non-key resolution failed or target cannot be resolved.
                         // Use standard DELETE+INSERT path (passes None for inplace).
                         stmts.push(build_passthrough_partition_dispatch_sql(
-                            view_name, &qv, &aff, &part_col, &format!("{}.{}", qv, part_col_q), &strategy, &del_cold, &ins_cold, None,
+                            view_name,
+                            &qv,
+                            &aff,
+                            &part_col,
+                            &format!("{}.{}", qv, part_col_q),
+                            &strategy,
+                            &del_cold,
+                            &ins_cold,
+                            None,
                         ));
                     }
                 } else {
