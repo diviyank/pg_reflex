@@ -11,7 +11,10 @@ BEGIN
     LOOP
       IF _rec.ignored_sources IS NOT NULL AND ('__REFLEX_SLOT_SOURCE_TABLE__' = ANY(_rec.ignored_sources) OR '__REFLEX_SLOT_BARE_SOURCE__' = ANY(_rec.ignored_sources)) THEN CONTINUE; END IF;
       IF _rec.where_predicate IS NOT NULL THEN
-        EXECUTE format('SELECT EXISTS(SELECT 1 FROM %I WHERE %s LIMIT 1)', '__REFLEX_SLOT_REF_NEW__', _rec.where_predicate) INTO _pred_match;
+        -- An UPDATE is relevant if the NEW image enters/stays in the filter OR
+        -- the OLD image was in it (a row leaving the filter must be DELETEd).
+        -- Checking NEW only silently drops row-leaves-filter updates.
+        EXECUTE format('SELECT EXISTS(SELECT 1 FROM %I WHERE %s LIMIT 1) OR EXISTS(SELECT 1 FROM %I WHERE %s LIMIT 1)', '__REFLEX_SLOT_REF_NEW__', _rec.where_predicate, '__REFLEX_SLOT_REF_OLD__', _rec.where_predicate) INTO _pred_match;
         IF NOT _pred_match THEN CONTINUE; END IF;
       END IF;
       IF _rec.refresh_mode = 'IMMEDIATE' THEN

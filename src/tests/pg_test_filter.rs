@@ -281,3 +281,46 @@ fn test_query_where_filter_update_flip_deferred() {
     Spi::run("SELECT reflex_flush_deferred('qwf_def')").expect("flush");
     assert_imv_correct("qwf_def_v", fresh);
 }
+
+/// Regression — query-level `WHERE` on an aggregate IMV, DEFERRED mode, IN→OUT
+/// flip (predicate EXIT). The deferred UPDATE trigger's relevance gate must
+/// match the predicate on OLD *or* NEW rows; a NEW-only check silently drops
+/// the row-leaves-filter update, leaking a stale aggregate group.
+#[pg_test]
+fn test_query_where_filter_update_exit_deferred() {
+    Spi::run("CREATE TABLE qwf_exit (k INT NOT NULL, amt INT NOT NULL)").expect("create");
+    Spi::run("INSERT INTO qwf_exit SELECT g, 100 FROM generate_series(1, 100) g").expect("seed");
+    let result = crate::create_reflex_ivm(
+        "qwf_exit_v",
+        "SELECT qwf_exit.k, SUM(qwf_exit.amt) AS total FROM qwf_exit WHERE qwf_exit.amt > 50 GROUP BY qwf_exit.k",
+        None, None, Some("DEFERRED"), None);
+    assert!(!result.starts_with("ERROR"), "create: {}", result);
+    let fresh = "SELECT qwf_exit.k, SUM(qwf_exit.amt) AS total FROM qwf_exit WHERE qwf_exit.amt > 50 GROUP BY qwf_exit.k";
+    assert_imv_correct("qwf_exit_v", fresh);
+
+    // IN -> OUT: row k=50 leaves the filter and must be DELETEd from the IMV.
+    Spi::run("UPDATE qwf_exit SET amt = 10 WHERE k = 50").expect("flip-out");
+    Spi::run("SELECT reflex_flush_deferred('qwf_exit')").expect("flush");
+    assert_imv_correct("qwf_exit_v", fresh);
+}
+
+/// Regression — passthrough IMV with a row-level `WHERE`, DEFERRED mode, IN→OUT
+/// flip (predicate EXIT). The exited rows must be DELETEd from the IMV, not
+/// retained as stale pre-update rows.
+#[pg_test]
+fn test_passthrough_where_filter_update_exit_deferred() {
+    Spi::run("CREATE TABLE pwf_exit (id INT PRIMARY KEY, qty INT NOT NULL)").expect("create");
+    Spi::run("INSERT INTO pwf_exit SELECT g, 5 FROM generate_series(1, 100) g").expect("seed");
+    let result = crate::create_reflex_ivm(
+        "pwf_exit_v",
+        "SELECT pwf_exit.id, pwf_exit.qty FROM pwf_exit WHERE pwf_exit.qty > 0",
+        Some("id"), None, Some("DEFERRED"), None);
+    assert!(!result.starts_with("ERROR"), "create: {}", result);
+    let fresh = "SELECT pwf_exit.id, pwf_exit.qty FROM pwf_exit WHERE pwf_exit.qty > 0";
+    assert_imv_correct("pwf_exit_v", fresh);
+
+    // IN -> OUT: ids 21..40 go negative and must be removed from the IMV.
+    Spi::run("UPDATE pwf_exit SET qty = -5 WHERE id BETWEEN 21 AND 40").expect("flip-out");
+    Spi::run("SELECT reflex_flush_deferred('pwf_exit')").expect("flush");
+    assert_imv_correct("pwf_exit_v", fresh);
+}
