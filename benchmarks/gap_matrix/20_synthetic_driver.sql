@@ -125,3 +125,89 @@ CALL gap_core_sweep(:'RUN_TS'::timestamptz);
 SELECT count(*) AS cells, count(*) FILTER (WHERE mismatches<>0) AS invalid,
        count(*) FILTER (WHERE advantage_pct<0) AS gaps
   FROM bench_gap_results WHERE run_ts = :'RUN_TS'::timestamptz;
+
+-- Cascade sweep: UPDATE on a CTE shape's source. Only meaningful for CTE shapes;
+-- non-CTE shapes are pruned and logged. Creates a fresh IMV, then measures
+-- a cascade operation (which drives the CTE source through deferred batching).
+CREATE OR REPLACE PROCEDURE gap_cascade_sweep(_run_ts timestamptz) LANGUAGE plpgsql AS $$
+DECLARE
+    skeys text[]; k text; s gap_shape;
+    v bigint := LEAST(10000, current_setting('bench.maxvol')::bigint);
+    base bigint := current_setting('bench.base_rows')::bigint;
+    lo bigint; hi bigint; cur bigint := NULL; imv_sql text;
+BEGIN
+    SELECT array_agg(skey ORDER BY skey) INTO skeys FROM gap_shape;
+    FOREACH k IN ARRAY skeys LOOP
+        SELECT * INTO s FROM gap_shape WHERE skey = k;
+        IF NOT s.cte THEN
+            INSERT INTO bench_gap_results VALUES (
+                _run_ts,'synthetic',format('%s/%s/cascade',s.shape,s.skey),s.shape,s.cte,
+                NULL,s.partitioned,'CASCADE',base,NULL,NULL,NULL,NULL,NULL,NULL,'pruned: cascade requires CTE');
+            CONTINUE;
+        END IF;
+        CALL gap_drop_imv(s.skey||'_v');
+        imv_sql := format(s.body_tmpl, s.skey||'_imv');
+        IF s.part_by IS NULL THEN
+            PERFORM create_reflex_ivm(s.skey||'_v', imv_sql, s.unique_cols, NULL, 'DEFERRED', NULL);
+        ELSE
+            PERFORM create_reflex_ivm(s.skey||'_v', imv_sql, s.unique_cols, NULL, 'DEFERRED', NULL, ARRAY[s.part_by]);
+        END IF;
+        SELECT w.lo, w.hi INTO lo, hi FROM gap_window('UPDATE', base, v, cur) w;
+        CALL gap_measure(_run_ts,'synthetic',format('%s/%s/cascade v=%s',s.shape,s.skey,v),
+            s.shape,s.cte,'DEFERRED',s.partitioned,'CASCADE',base,v,
+            gap_edit_sql('UPDATE', s.skey||'_imv', lo, hi),
+            gap_edit_sql('UPDATE', s.skey||'_base', lo, hi),
+            NULL, s.skey||'_v', 'mv_'||s.skey, imv_sql);
+    END LOOP;
+END $$;
+
+-- Scaling sweep: 4 representative shapes at base sizes {100k,1M,10M}, fixed v=10k.
+-- Rebuilds the *_imv/*_base/mv for each size in-place. Only run with -v SCALING=1.
+CREATE OR REPLACE PROCEDURE gap_scaling_sweep(_run_ts timestamptz, _sizes bigint[]) LANGUAGE plpgsql AS $$
+DECLARE
+    keys text[] := ARRAY['p_nc_np','p_nc_lp','c_nc_np','c_nc_lp'];
+    k text; s gap_shape; n bigint; lo bigint; hi bigint; cur bigint; imv_sql text; src text; p int;
+    v bigint := 10000;
+BEGIN
+    FOREACH n IN ARRAY _sizes LOOP
+        FOREACH k IN ARRAY keys LOOP
+            SELECT * INTO s FROM gap_shape WHERE skey=k;
+            -- rebuild both sources at size n
+            FOREACH src IN ARRAY ARRAY['imv','base'] LOOP
+                EXECUTE format('DROP TABLE IF EXISTS %I CASCADE', k||'_'||src);
+                IF s.partitioned='LIST' THEN
+                    EXECUTE format('CREATE TABLE %I (id int NOT NULL, region int NOT NULL, grp int NOT NULL, qty int) PARTITION BY LIST (region)', k||'_'||src);
+                    FOR p IN 0..19 LOOP EXECUTE format('CREATE TABLE %I PARTITION OF %I FOR VALUES IN (%s)', k||'_'||src||'_'||p, k||'_'||src, p); END LOOP;
+                ELSE
+                    EXECUTE format('CREATE TABLE %I (id int PRIMARY KEY, region int NOT NULL, grp int NOT NULL, qty int)', k||'_'||src);
+                END IF;
+                EXECUTE format('INSERT INTO %I SELECT i, i%%20, i%%1000, (random()*99)::int+1 FROM generate_series(1,%s) i', k||'_'||src, n);
+                EXECUTE format('ANALYZE %I', k||'_'||src);
+            END LOOP;
+            EXECUTE format('DROP MATERIALIZED VIEW IF EXISTS %I', 'mv_'||k);
+            EXECUTE format('CREATE MATERIALIZED VIEW %I AS %s', 'mv_'||k, format(s.body_tmpl, k||'_base'));
+            CALL gap_drop_imv(k||'_v');
+            imv_sql := format(s.body_tmpl, k||'_imv');
+            IF s.part_by IS NULL THEN
+                PERFORM create_reflex_ivm(k||'_v', imv_sql, s.unique_cols, NULL, 'DEFERRED', NULL);
+            ELSE
+                PERFORM create_reflex_ivm(k||'_v', imv_sql, s.unique_cols, NULL, 'DEFERRED', NULL, ARRAY[s.part_by]);
+            END IF;
+            cur := NULL;
+            SELECT w.lo, w.hi INTO lo, hi FROM gap_window('UPDATE', n, v, cur) w;
+            CALL gap_measure(_run_ts,'synthetic',format('%s/%s/scale base=%s',s.shape,k,n),
+                s.shape,s.cte,'DEFERRED',s.partitioned,'UPDATE',n,v,
+                gap_edit_sql('UPDATE', k||'_imv', lo, hi),
+                gap_edit_sql('UPDATE', k||'_base', lo, hi),
+                k||'_imv', k||'_v', 'mv_'||k, imv_sql);
+        END LOOP;
+    END LOOP;
+END $$;
+
+\echo '=== cascade sweep ==='
+CALL gap_cascade_sweep(:'RUN_TS'::timestamptz);
+
+\if :{?SCALING}
+\echo '=== scaling sweep ==='
+CALL gap_scaling_sweep(:'RUN_TS'::timestamptz, ARRAY[100000,1000000,10000000]::bigint[]);
+\endif
