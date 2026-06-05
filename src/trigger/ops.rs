@@ -736,6 +736,14 @@ fn resolve_inplace_non_key_cols(view_name: &str, key_target_cols: &[String]) -> 
     use pgrx::datum::DatumWithOid;
     use pgrx::PgBuiltInOids;
 
+    // Codegen also runs in plain #[test] unit tests with no backend, where Spi
+    // would panic on the weak SPI_connect stub. CurrentMemoryContext is NULL only
+    // in that stub context; in a real backend (create/flush, #[pg_test]) it is set.
+    // No backend → return empty so the caller falls back to DELETE+INSERT.
+    if unsafe { pgrx::pg_sys::CurrentMemoryContext.is_null() } {
+        return Vec::new();
+    }
+
     // Build a normalized set of key column names for filtering.
     let key_names: std::collections::HashSet<String> = key_target_cols
         .iter()
