@@ -646,6 +646,65 @@ fn test_replace_source_with_transition_unqualified() {
     assert!(!result.contains(" orders "));
 }
 
+#[test]
+fn test_replace_source_with_transition_quoted_source_in_base_query() {
+    // Regression (zero-length delimited identifier): a CTE sub-IMV cascade
+    // flushes the aggregate parent with the source passed in *unquoted*
+    // schema-qualified form (`petrone.stock_kind__cte_base`, as enqueued by the
+    // sub-IMV's deferred triggers), while the parent's stored `base_query`
+    // references that source *quoted* (`"petrone"."stock_kind__cte_base"`).
+    //
+    // The exact-source pass cannot match across the `"."` boundary, so the
+    // bare-token pass replaced `stock_kind__cte_base` *inside* the existing
+    // quotes, injecting the quoted transition name to yield
+    // `"petrone".""__reflex_old_petrone_stock_kind__cte_base""` — a `.""`
+    // zero-length delimited identifier that the scanner rejects (42601).
+    let base_query = "SELECT EXTRACT('year' FROM stock_date)::INT AS year, MIN(stock_date) \
+                      FROM \"petrone\".\"stock_kind__cte_base\" GROUP BY year";
+    let result = replace_source_with_transition(
+        base_query,
+        "petrone.stock_kind__cte_base",
+        "__reflex_old_petrone_stock_kind__cte_base",
+    );
+    // No empty/zero-length delimited identifier may appear.
+    assert!(
+        !result.contains("\"\""),
+        "zero-length delimited identifier emitted: {}",
+        result
+    );
+    // The quoted source reference must be rewritten to the transition table.
+    assert!(
+        result.contains("FROM \"__reflex_old_petrone_stock_kind__cte_base\""),
+        "quoted source not rewritten to transition table: {}",
+        result
+    );
+    // The original quoted source must be gone.
+    assert!(
+        !result.contains("\"petrone\".\"stock_kind__cte_base\""),
+        "original quoted source ref still present: {}",
+        result
+    );
+}
+
+#[test]
+fn test_replace_source_with_transition_unqualified_quoted_in_base_query() {
+    // Same nested-quote hazard for an *unqualified* source that the base_query
+    // happens to quote (`FROM "orders"`). The bare match sits inside the
+    // quotes; replacing it must not produce `""orders""`-style garbage.
+    let base_query = "SELECT city FROM \"orders\" GROUP BY city";
+    let result = replace_source_with_transition(base_query, "orders", "__reflex_new_orders");
+    assert!(
+        !result.contains("\"\""),
+        "zero-length delimited identifier emitted: {}",
+        result
+    );
+    assert!(
+        result.contains("FROM \"__reflex_new_orders\""),
+        "quoted source not rewritten: {}",
+        result
+    );
+}
+
 // ========================================================================
 // Bug fix tests: quoted identifiers in trigger names
 // ========================================================================

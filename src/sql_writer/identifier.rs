@@ -246,13 +246,34 @@ pub fn replace_source_with_transition(
         format!("\"{}\"", transition_tbl)
     };
     let stripped = strip_redundant_bare_alias(base_query, source_table);
-    let replaced = replace_identifier(&stripped, source_table, &quoted_tbl);
-    let (_, bare_source) = split_qualified(source_table);
-    if bare_source != source_table {
-        replace_identifier(&replaced, bare_source, &quoted_tbl)
-    } else {
-        replaced
+
+    // A stored source can be *referenced* in `base_query` in any quoting
+    // spelling, independent of how it was registered: a CTE sub-IMV source is
+    // registered bare (`schema.bare`) but emitted **quoted**
+    // (`"schema"."bare"`) in the decomposed parent's `base_query`. The quoted
+    // spellings MUST be rewritten before the bare-token pass, otherwise that
+    // pass matches `bare` *inside* the existing quotes (`"bare"`) and injects
+    // the already-quoted transition name, producing `"schema".""__reflex_…""`
+    // — a zero-length delimited identifier the scanner rejects (42601).
+    let (schema, bare_source) = split_qualified(source_table);
+    let bare_unq = bare_source.trim_matches('"');
+    let mut out = stripped;
+    if let Some(s) = schema {
+        let schema_unq = s.trim_matches('"');
+        out = replace_identifier(
+            &out,
+            &format!("\"{}\".\"{}\"", schema_unq, bare_unq),
+            &quoted_tbl,
+        );
     }
+    out = replace_identifier(&out, &format!("\"{}\"", bare_unq), &quoted_tbl);
+    out = replace_identifier(&out, source_table, &quoted_tbl);
+    if bare_source != source_table {
+        // Bare column qualifiers (`bare.col`). Quoted spellings are already
+        // consumed above, so every remaining match here is genuinely unquoted.
+        out = replace_identifier(&out, bare_unq, &quoted_tbl);
+    }
+    out
 }
 
 /// Scan forward from `start` looking for an optional table alias. Returns

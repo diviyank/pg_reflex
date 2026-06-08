@@ -2,6 +2,51 @@
 
 ## [Unreleased]
 
+## [1.9.2] - 2026-06-08
+
+A correctness fix for the commit-time cascade flush of CTE-decomposed views.
+No catalog/schema or function-signature changes — the fix is in the Rust
+trigger-time SQL rewriter, recompiled into the module, so existing IMVs keep
+working: `ALTER EXTENSION pg_reflex UPDATE TO '1.9.2';`.
+
+### Fixed
+
+- **`zero-length delimited identifier` (SQLSTATE 42601) at COMMIT for
+  DEFERRED CTE-decomposed views.** A CTE whose inner body is a passthrough
+  feeding an outer aggregate decomposes into a passthrough sub-IMV
+  (`s.v__cte_base`) plus an aggregate parent (`s.v`). On a base mutation, the
+  sub-IMV's maintenance cascades to the parent, which is flushed with its
+  source passed **unquoted** (`s.v__cte_base`, as enqueued by the sub-IMV's
+  deferred triggers) while the parent's stored `base_query` references that
+  source **quoted** (`"s"."v__cte_base"`). The trigger-time delta rewriter
+  `replace_source_with_transition` could not match across the `"."`, so its
+  bare-token pass replaced the bare name *inside* the existing quotes and
+  injected the transition name, emitting `"s".""__reflex_old_…""` — a `.""`
+  zero-length delimited identifier the scanner rejects, aborting the user's
+  transaction at commit. (Where the per-IMV flush swallowed it as a warning,
+  the parent IMV silently went stale — a correctness violation.) The fix
+  rewrites the source's **quoted spellings first**, so the bare-token pass can
+  never inject quotes inside an existing delimited identifier. It generalizes
+  to any schema-qualified source whose `base_query` references it quoted, not
+  just CTE sub-IMVs. The earlier `canonical_source` quoting fix hardened the
+  name-builders but had not reached this rewriter.
+
+### Tests
+
+- Unit regressions in `replace_source_with_transition` for a schema-qualified
+  source referenced quoted in `base_query`, and for an unqualified source the
+  `base_query` happens to quote (both assert no `""` is emitted and the
+  transition reference is correct).
+- End-to-end `#[pg_test]` reproducing the schema-qualified passthrough→aggregate
+  DEFERRED cascade: deleting the row holding a group's `MIN` must advance the
+  maintained aggregate, proving the parent is flushed (not silently skipped).
+
+### Migration
+
+`ALTER EXTENSION pg_reflex UPDATE TO '1.9.2';` after replacing the module. No
+DDL runs — the migration file is a no-op marker. Nothing to recreate; the
+corrected rewriter applies to the next flush of every affected IMV.
+
 ## [1.9.1] - 2026-06-05
 
 A performance release for partitioned passthrough maintenance. No catalog/schema

@@ -1,0 +1,40 @@
+-- Migration: pg_reflex 1.9.1 → 1.9.2
+--
+-- Run via: ALTER EXTENSION pg_reflex UPDATE TO '1.9.2';
+--
+-- 1.9.2 is a correctness fix for the deferred-cascade flush of CTE-decomposed
+-- views. There are NO catalog schema changes, NO function signature changes,
+-- and NO SPI additions — the fix is entirely in the Rust trigger-time SQL
+-- rewriter, which is recompiled into the module. Existing IMVs continue to
+-- operate without intervention.
+--
+-- What was wrong (all in-process, no migration DDL):
+--
+--   A CTE view whose inner CTE is a passthrough feeding an outer aggregate
+--   decomposes into a passthrough sub-IMV (`s.v__cte_base`) plus an aggregate
+--   parent (`s.v`). On a base mutation in DEFERRED mode, maintaining the
+--   sub-IMV cascades to the parent at COMMIT; the parent is flushed with its
+--   source passed UNQUOTED (`s.v__cte_base`, as enqueued by the sub-IMV's
+--   deferred triggers) while its stored `base_query` references that source
+--   QUOTED (`"s"."v__cte_base"`). The trigger-time delta rewriter
+--   (`replace_source_with_transition`) could not match across the `"."`, so its
+--   bare-token pass replaced the bare name INSIDE the existing quotes and
+--   injected the transition name, emitting `"s".""__reflex_old_…""` — a `.""`
+--   zero-length delimited identifier that PostgreSQL's scanner rejects (42601),
+--   aborting the user's transaction at commit. The earlier `canonical_source`
+--   quoting fix had hardened the name-builders but not this rewriter.
+--
+--   The fix rewrites the quoted spellings of the source first, so the
+--   bare-token pass can never inject quotes inside an existing delimited
+--   identifier. It generalizes to any schema-qualified source whose
+--   `base_query` references it quoted, not just CTE sub-IMVs.
+--
+-- Migration steps:
+--
+--   No DDL is required. This file exists purely to register the
+--   1.9.1 → 1.9.2 upgrade path with PostgreSQL's extension machinery. Replace
+--   the module (.so) before running `ALTER EXTENSION pg_reflex UPDATE TO
+--   '1.9.2';` so the corrected rewriter is loaded.
+
+-- No-op marker: ALTER EXTENSION needs a non-empty migration file.
+SELECT 1 WHERE FALSE;

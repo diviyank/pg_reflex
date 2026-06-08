@@ -251,6 +251,64 @@ fn test_cte_deferred_passthrough_sub_imv_staging() {
     assert_eq!(cnt, 2i64, "two pid=1 rows after deferred insert flush");
 }
 
+// Regression (zero-length delimited identifier at COMMIT): a *schema-qualified*
+// CTE view whose inner CTE is a PASSTHROUGH feeding an OUTER AGGREGATE decomposes
+// into a passthrough sub-IMV (`s.v__cte_base`) plus an aggregate parent (`s.v`).
+// On a base mutation, maintaining the sub-IMV cascades to the parent; the parent
+// is flushed with its source UNQUOTED (`s.v__cte_base`, as enqueued by the
+// sub-IMV's deferred triggers) while its stored `base_query` references that
+// source QUOTED (`"s"."v__cte_base"`). `replace_source_with_transition` could not
+// match across the `"."` and the bare-token pass injected the transition name
+// inside the existing quotes -> `"s".""__reflex_old_..."" ` -> 42601 `zero-length
+// delimited identifier`, aborting the user's transaction at commit. Unlike the
+// prior staging-name fix, this is the aggregate parent's delta codegen.
+#[pg_test]
+fn test_cte_deferred_aggregate_on_passthrough_schema_qualified_cascade() {
+    Spi::run("CREATE SCHEMA ckr").expect("schema");
+    Spi::run("CREATE TABLE ckr.inv (id INT NOT NULL, d DATE NOT NULL)").expect("t");
+    Spi::run("INSERT INTO ckr.inv VALUES (1, '2026-01-05'), (2, '2026-02-10'), (3, '2027-03-01')")
+        .expect("seed");
+
+    let result = crate::create_reflex_ivm(
+        "ckr.kind",
+        "WITH base AS (SELECT EXTRACT('year' FROM d)::INT AS y, d FROM ckr.inv) \
+         SELECT 'Stock' AS kind, y, MIN(d) AS mn, MAX(d) AS mx FROM base GROUP BY y",
+        None,
+        Some("UNLOGGED"),
+        Some("DEFERRED"),
+        None,
+    );
+    assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
+
+    let mn0 = Spi::get_one::<String>("SELECT mn::text FROM ckr.kind WHERE y = 2026")
+        .expect("q")
+        .expect("v");
+    assert_eq!(mn0, "2026-01-05", "baseline 2026 minimum");
+
+    // Reproduce the commit-time cascade the constraint trigger performs: flush
+    // the base source, then the sub-IMV source it enqueues. The second flush is
+    // where the parent's aggregate delta codegen previously emitted the `""`.
+    // Read the enqueued source name from the catalog rather than hardcoding the
+    // `__cte_base` suffix.
+    let cte_src = Spi::get_one::<String>(
+        "SELECT depends_on[1] FROM public.__reflex_ivm_reference WHERE name = 'ckr.kind'",
+    )
+    .expect("q")
+    .expect("v");
+
+    Spi::run("DELETE FROM ckr.inv WHERE id = 1").expect("del");
+    Spi::run("SELECT reflex_flush_deferred('ckr.inv')").expect("flush base");
+    Spi::run(&format!("SELECT reflex_flush_deferred('{}')", cte_src)).expect("flush parent cascade");
+
+    // Deleting the row holding the 2026 minimum must advance it to 2026-02-10 —
+    // proving the parent aggregate was actually maintained (not silently skipped
+    // by a swallowed error).
+    let mn1 = Spi::get_one::<String>("SELECT mn::text FROM ckr.kind WHERE y = 2026")
+        .expect("q")
+        .expect("v");
+    assert_eq!(mn1, "2026-02-10", "2026 minimum after deleting the min row via cascade");
+}
+
 // Regression: the CTE-decomposition path did not thread the caller's explicit
 // `unique_columns` into the outer passthrough IMV (unlike the set-op and
 // distinct-on paths). The outer body was re-created with an empty key, so a

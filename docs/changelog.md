@@ -4,6 +4,22 @@ The full changelog tracks every release. The latest version's headlines are on t
 
 For each version below, see [`CHANGELOG.md`](https://github.com/diviyank/pg_reflex/blob/main/CHANGELOG.md) on GitHub for the canonical text.
 
+## [1.9.2] — 2026-06-08
+
+Correctness fix for the commit-time cascade flush of CTE-decomposed views. No catalog/schema or function-signature changes — the fix is in the Rust trigger-time SQL rewriter, recompiled into the module: `ALTER EXTENSION pg_reflex UPDATE TO '1.9.2';`.
+
+**Fixed**
+
+- `zero-length delimited identifier` (SQLSTATE 42601) at COMMIT for DEFERRED CTE-decomposed views: a CTE whose inner body is a passthrough feeding an outer aggregate decomposes into a passthrough sub-IMV (`s.v__cte_base`) and an aggregate parent (`s.v`); the cascade flushed the parent with its source **unquoted** while its `base_query` referenced it **quoted** (`"s"."v__cte_base"`). `replace_source_with_transition` then replaced the bare name inside the existing quotes, emitting `"s".""__reflex_old_…""` and aborting the transaction at commit (or, where swallowed as a warning, silently leaving the parent stale). The fix rewrites the source's quoted spellings first; it generalizes to any schema-qualified source quoted in `base_query`, not just CTE sub-IMVs.
+
+**Tests**
+
+- Unit regressions for `replace_source_with_transition` (quoted schema-qualified and quoted-unqualified sources) plus an end-to-end `#[pg_test]` for the schema-qualified passthrough→aggregate DEFERRED cascade.
+
+**Migration**
+
+`ALTER EXTENSION pg_reflex UPDATE TO '1.9.2';` after replacing the module. No DDL runs; the corrected rewriter applies to the next flush of every affected IMV. [`sql/pg_reflex--1.9.1--1.9.2.sql`](https://github.com/diviyank/pg_reflex/blob/main/sql/pg_reflex--1.9.1--1.9.2.sql)
+
 ## [1.9.1] — 2026-06-05
 
 Performance release for partitioned passthrough maintenance. No catalog/schema or function-signature changes — all changes ship in the recompiled module: `ALTER EXTENSION pg_reflex UPDATE TO '1.9.1';`. The one new knob, the `reflex.assert_inplace_update` GUC, is registered in `_PG_init`, not via catalog DDL.
