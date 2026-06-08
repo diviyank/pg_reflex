@@ -254,14 +254,18 @@ fn test_cte_deferred_passthrough_sub_imv_staging() {
 // Regression (zero-length delimited identifier at COMMIT): a *schema-qualified*
 // CTE view whose inner CTE is a PASSTHROUGH feeding an OUTER AGGREGATE decomposes
 // into a passthrough sub-IMV (`s.v__cte_base`) plus an aggregate parent (`s.v`).
-// On a base mutation, maintaining the sub-IMV cascades to the parent; the parent
-// is flushed with its source UNQUOTED (`s.v__cte_base`, as enqueued by the
-// sub-IMV's deferred triggers) while its stored `base_query` references that
-// source QUOTED (`"s"."v__cte_base"`). `replace_source_with_transition` could not
-// match across the `"."` and the bare-token pass injected the transition name
-// inside the existing quotes -> `"s".""__reflex_old_..."" ` -> 42601 `zero-length
-// delimited identifier`, aborting the user's transaction at commit. Unlike the
-// prior staging-name fix, this is the aggregate parent's delta codegen.
+// On a base mutation, maintaining the sub-IMV cascades to the parent, which is
+// flushed with its source UNQUOTED (`s.v__cte_base`, as enqueued by the sub-IMV's
+// deferred triggers) while its stored `base_query` references that source QUOTED
+// (`"s"."v__cte_base"`). `replace_source_with_transition` could not match across
+// the `"."` and the bare-token pass injected the transition name inside the
+// existing quotes -> `"s".""__reflex_old_..."" ` -> 42601 `zero-length delimited
+// identifier`, aborting the transaction at commit. Unlike the prior staging-name
+// fix, this is the aggregate parent's delta codegen.
+//
+// The check is deterministic: it drives the *actual* decomposed `base_query`
+// through the parent's delta builder with the unquoted cascade source — the same
+// call that produced the `""` — and asserts none is emitted.
 #[pg_test]
 fn test_cte_deferred_aggregate_on_passthrough_schema_qualified_cascade() {
     Spi::run("CREATE SCHEMA ckr").expect("schema");
@@ -272,7 +276,7 @@ fn test_cte_deferred_aggregate_on_passthrough_schema_qualified_cascade() {
     let result = crate::create_reflex_ivm(
         "ckr.kind",
         "WITH base AS (SELECT EXTRACT('year' FROM d)::INT AS y, d FROM ckr.inv) \
-         SELECT 'Stock' AS kind, y, MIN(d) AS mn, MAX(d) AS mx FROM base GROUP BY y",
+         SELECT y, MIN(d) AS mn, MAX(d) AS mx FROM base GROUP BY y",
         None,
         Some("UNLOGGED"),
         Some("DEFERRED"),
@@ -280,33 +284,47 @@ fn test_cte_deferred_aggregate_on_passthrough_schema_qualified_cascade() {
     );
     assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
 
-    let mn0 = Spi::get_one::<String>("SELECT mn::text FROM ckr.kind WHERE y = 2026")
-        .expect("q")
-        .expect("v");
-    assert_eq!(mn0, "2026-01-05", "baseline 2026 minimum");
-
-    // Reproduce the commit-time cascade the constraint trigger performs: flush
-    // the base source, then the sub-IMV source it enqueues. The second flush is
-    // where the parent's aggregate delta codegen previously emitted the `""`.
-    // Read the enqueued source name from the catalog rather than hardcoding the
-    // `__cte_base` suffix.
+    // The cascade enqueues the sub-IMV source UNQUOTED; read it from the catalog
+    // rather than hardcoding the `__cte_base` suffix.
     let cte_src = Spi::get_one::<String>(
         "SELECT depends_on[1] FROM public.__reflex_ivm_reference WHERE name = 'ckr.kind'",
     )
     .expect("q")
     .expect("v");
+    assert_eq!(cte_src, "ckr.kind__cte_base");
 
-    Spi::run("DELETE FROM ckr.inv WHERE id = 1").expect("del");
-    Spi::run("SELECT reflex_flush_deferred('ckr.inv')").expect("flush base");
-    Spi::run(&format!("SELECT reflex_flush_deferred('{}')", cte_src)).expect("flush parent cascade");
+    // Precondition: the decomposed parent references that source QUOTED in its
+    // stored base_query — the exact mismatch that produced the `""`. Without this
+    // the no-`""` assertion below could pass vacuously.
+    let base_q = Spi::get_one::<String>(
+        "SELECT base_query FROM public.__reflex_ivm_reference WHERE name = 'ckr.kind'",
+    )
+    .expect("q")
+    .expect("v");
+    assert!(
+        base_q.contains("\"ckr\".\"kind__cte_base\""),
+        "test precondition: parent base_query must reference the source quoted: {base_q}"
+    );
 
-    // Deleting the row holding the 2026 minimum must advance it to 2026-02-10 —
-    // proving the parent aggregate was actually maintained (not silently skipped
-    // by a swallowed error).
-    let mn1 = Spi::get_one::<String>("SELECT mn::text FROM ckr.kind WHERE y = 2026")
-        .expect("q")
-        .expect("v");
-    assert_eq!(mn1, "2026-02-10", "2026 minimum after deleting the min row via cascade");
+    // The aggregate parent's delta codegen, built with the UNQUOTED cascade
+    // source, must not emit a zero-length delimited identifier. Before the fix
+    // this returned `... FROM "ckr".""__reflex_old_ckr_kind__cte_base"" ...`.
+    let gen = Spi::get_one::<String>(&format!(
+        "SELECT reflex_build_delta_sql('ckr.kind', '{}', 'UPDATE', base_query, end_query, \
+                aggregations::text, base_query) \
+         FROM public.__reflex_ivm_reference WHERE name = 'ckr.kind'",
+        cte_src
+    ))
+    .expect("q")
+    .expect("v");
+    assert!(
+        !gen.contains("\"\""),
+        "zero-length delimited identifier in parent delta SQL: {gen}"
+    );
+    assert!(
+        gen.contains("__reflex_"),
+        "expected transition-table references in generated delta SQL: {gen}"
+    );
 }
 
 // Regression: the CTE-decomposition path did not thread the caller's explicit

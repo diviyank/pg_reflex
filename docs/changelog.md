@@ -14,7 +14,7 @@ Correctness fix for the commit-time cascade flush of CTE-decomposed views. No ca
 
 **Tests**
 
-- Unit regressions for `replace_source_with_transition` (quoted schema-qualified and quoted-unqualified sources) plus an end-to-end `#[pg_test]` for the schema-qualified passthrough→aggregate DEFERRED cascade.
+- Unit regressions for `replace_source_with_transition` (quoted schema-qualified and quoted-unqualified sources) plus a `#[pg_test]` that drives a real decomposed passthrough→aggregate `base_query` through the parent's delta builder with the unquoted cascade source and asserts no `""` is emitted.
 
 **Migration**
 

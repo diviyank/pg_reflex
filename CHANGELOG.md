@@ -37,9 +37,11 @@ working: `ALTER EXTENSION pg_reflex UPDATE TO '1.9.2';`.
   source referenced quoted in `base_query`, and for an unqualified source the
   `base_query` happens to quote (both assert no `""` is emitted and the
   transition reference is correct).
-- End-to-end `#[pg_test]` reproducing the schema-qualified passthrough→aggregate
-  DEFERRED cascade: deleting the row holding a group's `MIN` must advance the
-  maintained aggregate, proving the parent is flushed (not silently skipped).
+- End-to-end `#[pg_test]` for the schema-qualified passthrough→aggregate
+  DEFERRED decomposition: drives the real decomposed `base_query` through the
+  aggregate parent's delta builder with the unquoted cascade source (the call
+  that previously emitted the `""`) and asserts none is produced, guarded by a
+  precondition that the parent really does reference the source quoted.
 
 ### Migration
 
