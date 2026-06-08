@@ -573,10 +573,14 @@ pub(crate) fn outer_join_secondary_stmts(
                     ));
                 }
                 let changed_keys = sides.join(" UNION ");
+                // The membership source is a derived table (a UNION over the
+                // transition tables), so it MUST carry an alias — an unaliased
+                // subquery in FROM is rejected by every Postgres version with
+                // "subquery in FROM must have an alias".
                 let pred = build_membership_predicate(
                     &target_cols,
                     &target_cols,
-                    &format!("({})", changed_keys),
+                    &format!("({}) __ck", changed_keys),
                 );
                 stmts.push(format!("DELETE FROM {} WHERE {}", qv, pred));
                 stmts.push(format!(

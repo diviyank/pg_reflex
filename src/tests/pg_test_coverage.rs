@@ -2867,13 +2867,34 @@ fn cov_passthrough_left_join_secondary_update() {
         None,
         None,
     );
-    if res != "CREATE REFLEX INCREMENTAL VIEW" {
-        return;
-    }
-    // UPDATE on secondary (cov_pj_b) — triggers full refresh.
+    assert_eq!(
+        res, "CREATE REFLEX INCREMENTAL VIEW",
+        "create failed: {res}"
+    );
+
+    // The keyed secondary path builds a membership predicate over a UNION of the
+    // transition tables; that derived table must be aliased or Postgres rejects
+    // the generated SQL with "subquery in FROM must have an alias".
+    let recompute = "SELECT cov_pj_a.id, cov_pj_a.x, cov_pj_b.y \
+                     FROM cov_pj_a LEFT JOIN cov_pj_b ON cov_pj_b.a_id = cov_pj_a.id";
+    let drift_sql = format!(
+        "SELECT count(*) FROM ( \
+            (SELECT * FROM cov_pj_view EXCEPT ALL {rc}) \
+            UNION ALL \
+            ({rc} EXCEPT ALL SELECT * FROM cov_pj_view) \
+         ) d",
+        rc = recompute
+    );
+
+    // UPDATE on secondary (cov_pj_b) — keyed secondary refresh.
     Spi::run("UPDATE cov_pj_b SET y = 999 WHERE a_id = 1").expect("upd b");
-    // DELETE on secondary — also triggers full refresh.
+    let drift_after_update = Spi::get_one::<i64>(&drift_sql).expect("drift").expect("drift");
+    assert_eq!(drift_after_update, 0, "IMV diverged after secondary UPDATE");
+
+    // DELETE on secondary — left row must survive NULL-extended.
     Spi::run("DELETE FROM cov_pj_b WHERE a_id = 1").expect("del b");
+    let drift_after_delete = Spi::get_one::<i64>(&drift_sql).expect("drift").expect("drift");
+    assert_eq!(drift_after_delete, 0, "IMV diverged after secondary DELETE");
 }
 
 /// HAVING aggregate with non-trivial nested expression — exercises

@@ -1993,17 +1993,22 @@ pub(crate) fn reflex_flush_partitions_impl(only: Option<&str>) -> String {
             refresh_source_snapshot(client, root);
         }
 
-        match only {
-            Some(r) => {
-                let _ = client.update(
-                    "DELETE FROM public.__reflex_partition_pending WHERE source_root = $1",
-                    None,
-                    &[unsafe { DatumWithOid::new(r.to_string(), pgrx::pg_sys::TEXTOID) }],
-                );
-            }
-            None => {
-                let _ = client.update("TRUNCATE public.__reflex_partition_pending", None, &[]);
-            }
+        // Drain only the roots this flush actually processed, with a scoped
+        // DELETE (RowExclusive). A blanket `TRUNCATE` here would take an
+        // AccessExclusiveLock on the globally-shared pending table; two
+        // concurrent flushes — each already holding RowExclusive on it from the
+        // event trigger's INSERT — would both try to upgrade to AccessExclusive
+        // and deadlock (confirmed: deadlock on __reflex_partition_pending). The
+        // blanket TRUNCATE would also silently wipe pending rows a concurrent
+        // backend enqueued after `roots` was scanned but before this point,
+        // losing that flush. `roots` is `[r]` in the `Some(r)` case, so a single
+        // scoped delete per root is correct for both entry points.
+        for root in &roots {
+            let _ = client.update(
+                "DELETE FROM public.__reflex_partition_pending WHERE source_root = $1",
+                None,
+                &[unsafe { DatumWithOid::new(root.to_string(), pgrx::pg_sys::TEXTOID) }],
+            );
         }
 
         Ok(if summary.is_empty() {
