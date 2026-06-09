@@ -440,6 +440,27 @@ Useful columns:
 - `depends_on_imv` -- other IMVs this view depends on
 - `graph_child` -- downstream IMVs that depend on this one
 
+## Configuration (GUCs)
+
+pg_reflex reads a handful of runtime settings via `current_setting`. None require a restart — set them per-session with `SET`, per-database/role with `ALTER DATABASE/ROLE ... SET`, or globally in `postgresql.conf`. All are optional; the compiled defaults below apply when unset.
+
+| Setting | Type | Default | Effect |
+|---|---|---|---|
+| `reflex.wipe_threshold` | float `0`–`1` | `0.5` | Dirty-row fraction at or above which a maintenance batch wipes-and-rebuilds the (partition of the) IMV instead of applying a row-by-row delta. Per-IMV override via [`reflex_set_wipe_threshold`](#reflex_set_wipe_thresholdview_name-text-value-numeric---text). |
+| `reflex.wipe_floor_rows` | integer | `1000` | Floor on the partition-size denominator of the dirty/size ratio, so a tiny or never-`ANALYZE`d partition (`reltuples = 0`) cannot trip a wipe on one dirty row. Per-IMV override via [`reflex_set_wipe_floor_rows`](#reflex_set_wipe_floor_rowsview_name-text-value-bigint---text). |
+| `reflex.assert_inplace_update` | boolean | `off` | When on, the in-place UPDATE path re-derives the affected key set and `RAISE`s on any mismatch — a correctness assertion for CI/fuzz runs. Leave off in production. |
+| `pg_reflex.alter_source_policy` | enum `warn` \| `error` | `warn` | What the `ddl_command_end` event trigger does when a tracked source table is altered: `warn` emits a `WARNING` and lets the ALTER through (run `reflex_rebuild_imv` afterward); `error` rejects the ALTER. |
+
+```sql
+-- Session-scoped: make a bulk-load session prefer full rebuilds
+SET reflex.wipe_threshold = 0.3;
+
+-- Persist for a database
+ALTER DATABASE analytics SET pg_reflex.alter_source_policy = 'error';
+```
+
+> **Note:** `reflex.partition_dispatch_cost_cap` (and the matching `reflex_set_partition_dispatch_cost_cap` setter) is reserved for the Tier 2 per-partition JOIN-dispatch cost gate. The metadata column and setter exist, but the value is **not yet consulted at runtime** — setting it currently has no effect.
+
 ## API Reference
 
 ### `create_reflex_ivm(view_name, sql [, unique_columns [, storage [, mode [, ignore_sources]]]]) -> TEXT`
@@ -563,6 +584,118 @@ Idempotent: a call with no data change reports zero additions.
 
 ```sql
 SELECT reflex_probe_not_null_columns('sales_by_region');
+```
+
+### `reflex_rebuild_imv(view_name TEXT) -> TEXT`
+
+Alias for `reflex_reconcile`. Rebuilds the IMV from source to fix drift. Use after a source `ALTER TABLE`, after crash recovery of an UNLOGGED intermediate, or when an IMV is reported inconsistent by `reflex_audit`.
+
+```sql
+SELECT reflex_rebuild_imv('sales_by_region');
+```
+
+### `reflex_scheduled_reconcile(max_age_minutes INT DEFAULT 60) -> TABLE(name TEXT, status TEXT, ms BIGINT)`
+
+Reconciles every enabled IMV whose `last_update_date` is older than `max_age_minutes` (or null), in `(graph_depth, name)` order. Each per-IMV reconcile runs in isolation, so one failure does not block the rest. Returns one row per attempted IMV with the per-IMV `status` (`'RECONCILED'` or an error string) and wall time in `ms`. Intended as a periodic drift-scan safety net via `pg_cron`.
+
+```sql
+-- Run every 15 minutes via pg_cron
+SELECT cron.schedule('reflex-drift-scan', '*/15 * * * *',
+    'SELECT * FROM reflex_scheduled_reconcile(60)');
+```
+
+### `reflex_sync_partitions(view_name TEXT, drop_orphans BOOLEAN DEFAULT TRUE) -> TEXT`
+
+Reconciles the *partition structure* (not row data) of a partitioned IMV against its source: creates IMV child partitions for any source partitions that lack one. When `drop_orphans` is true, IMV partitions whose source counterpart was dropped are removed via `DROP TABLE ... CASCADE` (touches only pg_reflex-owned objects); when false, orphans are preserved and a NOTICE is emitted. Idempotent; a no-op on unpartitioned IMVs. Normally called automatically by the `ddl_command_end` event trigger after a source ATTACH / CREATE PARTITION OF — call it manually to drop orphans after a source DETACH. See [Partitioning](#partitioning-160).
+
+```sql
+SELECT reflex_sync_partitions('sales_by_region');        -- create missing children, drop orphans
+SELECT reflex_sync_partitions('sales_by_region', false); -- preserve orphaned IMV partitions
+```
+
+### `reflex_reconcile_partition(view_name TEXT, partition_keys TEXT, source_partition TEXT DEFAULT '') -> TEXT`
+
+Reconciles only the partition(s) of an IMV covering the given comma-separated `partition_keys`. The matching intermediate + target children are rebuilt from the base/end query restricted by the child's partition constraint, then flipped in via an atomic DETACH/ATTACH swap — so the `AccessExclusiveLock` window collapses to the metadata DDL and readers on every other partition stay live. Cascades to dependent IMVs partitioned on the same column (with the same keys), or to a full reconcile otherwise. `source_partition` optionally names the source child to read from. See [Partitioning](#partitioning-160).
+
+```sql
+SELECT reflex_reconcile_partition('sales_by_region', 'US');
+SELECT reflex_reconcile_partition('sales_by_month', '2026-01,2026-02');
+```
+
+### `reflex_flush_partitions() -> TEXT`
+
+Resolves pending source-partition changes: oid-diffs each dirty source root against the stored snapshot, then swap-fills / creates / drops the matching IMV partitions (cascading to dependents). Drains the `__reflex_partition_pending` queue. Call after a batch of source DETACH/ATTACH swaps to propagate them to the IMVs at once.
+
+```sql
+SELECT reflex_flush_partitions();
+```
+
+### `reflex_flush_partition_source(source_root TEXT) -> TEXT`
+
+Same as `reflex_flush_partitions`, but resolves a single source root and skips the pending-queue scan. Use when you know exactly which partitioned source changed.
+
+```sql
+SELECT reflex_flush_partition_source('sales');
+```
+
+### `reflex_set_wipe_threshold(view_name TEXT, value NUMERIC) -> TEXT`
+
+(1.4.6+) Sets or clears the per-IMV `wipe_threshold` override. When a single batch dirties a fraction of an IMV's rows above this threshold, the trigger dispatch wipes-and-rebuilds the (partition of the) IMV instead of applying a row-by-row delta. The per-IMV value takes precedence over the `reflex.wipe_threshold` GUC and the compiled default. Pass `value = NULL` to clear the override.
+
+```sql
+SELECT reflex_set_wipe_threshold('sales_by_region', 0.4);  -- wipe when >40% dirty
+SELECT reflex_set_wipe_threshold('sales_by_region', NULL); -- back to GUC/default
+```
+
+### `reflex_set_wipe_floor_rows(view_name TEXT, value BIGINT) -> TEXT`
+
+(1.6.0+) Sets or clears the per-IMV `wipe_floor_rows` override. The dispatch uses this as a floor on the denominator of the dirty/partition-size ratio, so a tiny or never-`ANALYZE`d partition (`reltuples = 0`) cannot trip a wipe on a single dirty row. Pass `value = NULL` to clear (falls back to GUC / compiled default `1000`).
+
+```sql
+SELECT reflex_set_wipe_floor_rows('sales_by_region', 5000);
+```
+
+### `reflex_set_partition_dispatch_cost_cap(view_name TEXT, value BIGINT) -> TEXT`
+
+(1.6.0+) Sets or clears the per-IMV `partition_dispatch_cost_cap`. Intended for the Tier 2 (JOIN-secondary) per-partition dispatch gate: when such a source trigger fires on a partitioned IMV, the dispatch JOINs to the anchor source to derive partition keys, and if the planner's estimated row count of that JOIN exceeds this cap, per-partition dispatch is skipped in favor of the global Path B flush. Pass `value = NULL` to inherit the `reflex.partition_dispatch_cost_cap` GUC → compiled default (`100000`).
+
+> **Reserved:** the metadata column and this setter exist, but the value is **not yet consulted at runtime** — setting it currently has no effect.
+
+```sql
+SELECT reflex_set_partition_dispatch_cost_cap('sales_by_region', 250000);
+```
+
+### `reflex_rebuild_imv_metadata(view_name TEXT) -> TEXT`
+
+(1.4.5+) Re-analyzes the IMV's stored `base_query` and merges the freshly computed `imv_relevant_columns` / `imv_relevant_where` maps back into its `aggregations` JSON. Idempotent. Primarily a migration helper (1.4.4→1.4.5 backfilled the static analysis the filter-aware spurious-skip relies on); also useful after an analyzer change shifts what falls into either map.
+
+```sql
+SELECT reflex_rebuild_imv_metadata('sales_by_region');
+```
+
+### `reflex_rebuild_triggers(source_table TEXT) -> TEXT`
+
+(1.4.5+) Re-emits the consolidated trigger function bodies for a **source table** (not an IMV name), picking up the latest codegen via `CREATE OR REPLACE` without changing trigger identity. Use to install codegen fixes on triggers attached to IMVs created by an older version.
+
+```sql
+SELECT reflex_rebuild_triggers('sales');   -- note: takes the source table, not the IMV
+```
+
+### `reflex_audit() -> TEXT` / `reflex_audit(view_name TEXT) -> TEXT`
+
+Runs the consistency audit over all enabled IMVs (no-arg form) or a single IMV. Checks fall into three tiers: catastrophic (missing source/internal tables, trigger attachment and mode mismatches, staging shape), drift (base-query runnability, intermediate/target/partition shape, partition-tree mirror), and orphans (stray intermediate/scratch/staging tables, duplicate trigger functions). Returns a human-readable report; use it to verify integrity after migrations, crashes, or manual DDL.
+
+```sql
+SELECT reflex_audit();                    -- audit every IMV
+SELECT reflex_audit('sales_by_region');   -- audit one IMV
+```
+
+### `reflex_ivm_histogram(view_name TEXT) -> TABLE(p50_ms FLOAT8, p95_ms FLOAT8, p99_ms FLOAT8, max_ms BIGINT, samples BIGINT)`
+
+(1.3.0+) Returns flush-latency percentiles for an IMV computed from its `flush_ms_history` ring buffer (up to the 64 most recent samples): p50, p95, p99, max, and the sample count. Returns an empty result if the IMV is not registered or has no recorded flushes. Complements `reflex_ivm_stats` (point-in-time sizes/timing) for tail-latency monitoring.
+
+```sql
+SELECT * FROM reflex_ivm_histogram('sales_by_region');
 ```
 
 ## Testing
