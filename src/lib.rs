@@ -499,6 +499,17 @@ fn reflex_flush_partition_source(source_root: &str) -> String {
     partition::reflex_flush_partitions_impl(Some(source_root))
 }
 
+/// Internal: replace the source-partition snapshot for `source_root` with the
+/// live leaf set. SQL-callable so the per-root flush subtransaction can refresh
+/// the snapshot atomically with its reconciles. Not part of the public API.
+#[pg_extern(name = "__reflex_refresh_partition_snapshot")]
+fn reflex_refresh_partition_snapshot(source_root: &str) -> &'static str {
+    pgrx::Spi::connect_mut(|client| {
+        partition::refresh_source_snapshot(client, source_root);
+    });
+    "OK"
+}
+
 /// Drop a reflex IMV and all its artifacts (triggers, tables, reference row).
 /// Refuses to drop if the IMV has children unless cascade is true.
 #[pg_extern]
