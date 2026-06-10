@@ -2,6 +2,71 @@
 
 ## [Unreleased]
 
+## [1.10.0] - 2026-06-10
+
+Fixes the long-standing hole where `ALTER TABLE source ATTACH PARTITION
+child_with_data` created the IMV partition but never synced its data, leaving
+it empty (row count 0). ATTACH re-parents existing rows without firing row
+triggers, so the reconcile path is the only thing that can capture them — and
+nothing drained the partition pending queue automatically. Apply after
+replacing the module: `ALTER EXTENSION pg_reflex UPDATE TO '1.10.0';` (the
+migration installs the new auto-drain trigger and drains any pre-existing
+wedged queue rows).
+
+### Fixed
+
+- **ATTACH PARTITION with data left the IMV partition empty.** The
+  `ddl_command_end` event trigger enqueued the source root into
+  `__reflex_partition_pending` and created the empty IMV partition structure,
+  but no code path ever drained the queue, so the data-filling reconcile never
+  ran. A new commit-time auto-drain (below) closes this.
+- **One broken root wedged the entire partition flush.**
+  `reflex_flush_partitions` drained all pending roots in a single transaction
+  with `?`-error propagation and a trailing cross-root `DELETE`, so the first
+  failing root aborted and rolled back the whole batch — draining nothing and
+  re-wedging on every retry. Each root is now reconciled, snapshot-refreshed,
+  and drained atomically inside its own PL/pgSQL subtransaction; a failing root
+  is left pending with a `WARNING` and the next root proceeds.
+- **Shape drift made reconcile throw `"… is not partitioned"`.** When a source
+  child was rebuilt partitioned under the same name (gaining a sub-level), the
+  mirrored IMV child — left a plain table by `CREATE … IF NOT EXISTS`, which
+  silently skips wrong-shape children — became fatal to every reconcile of that
+  node. `reflex_sync_partitions` now detects the `relkind` mismatch, drops the
+  stale child top-down, and rebuilds it with the correct shape.
+
+### Added
+
+- **Commit-time auto-drain of the partition pending queue.** A `DEFERRABLE
+  INITIALLY DEFERRED` constraint trigger on `__reflex_partition_pending` fires
+  a scoped `reflex_flush_partition_source` per enqueued root at COMMIT, so
+  ATTACH-with-data syncs the IMV automatically with no manual
+  `reflex_flush_partitions()` call. Mirrors the deferred-DML flush; recursion is
+  bounded by the existing `NOT LIKE '%__reflex_%'` enqueue guard.
+- **`__reflex_refresh_partition_snapshot(text)`** — internal SQL-callable
+  wrapper so the per-root flush subtransaction refreshes the source snapshot
+  atomically with its reconciles. Not part of the public API.
+
+### Tests
+
+- `#[pg_test] flush_isolates_failing_root_from_healthy_root`: a corrupted root
+  no longer prevents a healthy root from reconciling and draining.
+- `#[pg_test] sync_heals_leaf_child_into_partitioned`: a depth-2 IMV whose
+  same-named source child is rebuilt partitioned is healed from `relkind='r'`
+  to `'p'` with data preserved (reproduces the production poison).
+- `#[pg_test] attach_with_data_auto_syncs_at_commit`: ATTACH of a pre-populated
+  partition auto-syncs the IMV data at COMMIT with no manual flush.
+- Unit `shape_mismatch_detects_leaf_where_partitioned_expected` for the pure
+  `partition_shape_mismatch` helper.
+
+### Migration
+
+`ALTER EXTENSION pg_reflex UPDATE TO '1.10.0';` after replacing the module. The
+migration registers `__reflex_refresh_partition_snapshot`, installs the
+`__reflex_partition_flush_trigger` auto-drain constraint trigger, and runs a
+one-time `reflex_flush_partitions()` to drain rows left pending by pre-1.10.0
+ATTACHes. The two Rust fixes (per-root isolation, shape heal) ship in the
+recompiled module and need no DDL.
+
 ## [1.9.2] - 2026-06-08
 
 A correctness fix for the commit-time cascade flush of CTE-decomposed views.
