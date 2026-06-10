@@ -518,8 +518,11 @@ fn pg_test_audit_detects_partition_tree_drift() {
     )
     .expect("attach new source leaf");
 
-    // Simulate a forgotten flush by truncating the partition pending table
-    Spi::run("TRUNCATE public.__reflex_partition_pending").expect("simulate forgotten flush");
+    // Simulate a forgotten flush by emptying the partition pending table.
+    // DELETE, not TRUNCATE: the 1.10.0 deferred flush trigger queues an AFTER
+    // INSERT event on this table at enqueue time, and Postgres forbids
+    // TRUNCATE on a table with pending trigger events in the same transaction.
+    Spi::run("DELETE FROM public.__reflex_partition_pending").expect("simulate forgotten flush");
 
     // Force drift by dropping the auto-synced IMV leaf if it was created
     Spi::run("DROP TABLE IF EXISTS public.fcstb_ssb_172_2025_02 CASCADE").expect("force drift");
