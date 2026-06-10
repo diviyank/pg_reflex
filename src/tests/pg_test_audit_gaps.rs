@@ -135,9 +135,13 @@ fn audit_in_subquery_filter_skips_out_of_filter_update() {
     Spi::run("CREATE TABLE ais (k INT, period INT, v NUMERIC)").unwrap();
     Spi::run("CREATE TABLE ais_active (period INT)").unwrap();
     Spi::run("INSERT INTO ais_active VALUES (1)").unwrap();
+    // (k=1,p=1) is IN-filter; (k=1,p=2) is OUT-of-filter but shares the IMV
+    // unique key k=1 — the exact collision shape of the 1.10.2 silent-delete bug.
     Spi::run("INSERT INTO ais VALUES (1,1,10),(1,2,999)").unwrap();
     let sql = "SELECT k, period, v FROM ais WHERE period IN (SELECT period FROM ais_active)";
-    crate::create_reflex_ivm("ais_v", sql, None, None, None, None);
+    crate::create_reflex_ivm("ais_v", sql, Some("k"), None, None, None);
+    // Update the OUT-of-filter row. A buggy keyed maintenance would DELETE the
+    // in-filter row sharing k=1; the IMV must instead stay equal to the recompute.
     Spi::run("UPDATE ais SET v = 123 WHERE period = 2").unwrap();
     assert_imv_correct("ais_v", sql);
 }

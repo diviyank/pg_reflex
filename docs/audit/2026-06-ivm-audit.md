@@ -110,7 +110,9 @@ Task 5 — window ROW_NUMBER update re-rank: PASS — correctness Proven.
 
 Task 6 — DISTINCT ON winner demotion: PASS — correctness Proven.
 
-Task 7 — IN-subquery filter relevance: PASS — correctness Proven.
+Task 7 — IN-subquery filter relevance: PASS — correctness Proven. Strengthened to be faithful to the 1.10.2 class: the IMV declares unique key `k`, and the out-of-filter row (k=1,p=2) collides on `k` with the in-filter row (k=1,p=1), so the keyed-delete path that silently removed in-filter rows in 1.10.2 is actually exercised. The fix covers `IN (SELECT …)`, not just `= (SELECT …)`.
+
+**Verdict-reading caveat (honest framing).** All four instrumented probes PASSED. That is genuine, confidence-restoring evidence that the recent fixes generalize — but each probe refutes a *specific named hypothesis* under *one* mutation; it is "not refuted," not "proven correct in general." Adversarial, multi-mutation, key-colliding coverage of these same shapes is exactly what Phase 2's combinatorial fuzz must add (see §4).
 
 ## §4 Risk-ranked gap backlog
 _(Task 8)_
