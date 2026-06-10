@@ -1054,6 +1054,36 @@ mod tests {
         );
     }
 
+    /// Read the last recorded flush wall-time (ms) for an IMV.
+    /// Returns 0 if no flush has been recorded yet (NULL).
+    fn last_flush_ms_of(imv: &str) -> i64 {
+        let result = Spi::get_one::<i64>(&format!(
+            "SELECT COALESCE(last_flush_ms, 0) FROM reflex_ivm_status() WHERE name = '{}'",
+            imv
+        ))
+        .expect("status query failed")
+        .expect("coalesced result must not be NULL");
+        result
+    }
+
+    /// Plan-quality probe: an O(1) delta must not cost O(base).
+    /// `small_ms`/`big_ms` are flush times for an identical single-row delta against
+    /// a small vs a `base_ratio`x-larger base. An O(base) plan grows ~`base_ratio`x;
+    /// an O(delta) plan stays flat. Fail only well below `base_ratio` to absorb noise.
+    fn assert_sublinear(label: &str, small_ms: i64, big_ms: i64, base_ratio: i64) {
+        let allowed = std::cmp::max(small_ms * 5, 75);
+        assert!(
+            big_ms <= allowed,
+            "PLAN-QUALITY GAP [{}]: base grew {}x, flush grew {}ms -> {}ms (>{}ms allowed) \
+             => maintenance is O(base), not O(delta)",
+            label,
+            base_ratio,
+            small_ms,
+            big_ms,
+            allowed
+        );
+    }
+
     #[pg_extern]
     fn crate_test_list_partition_tree(root: &str) -> i64 {
         Spi::connect(|client| crate::partition::list_partition_tree(client, root).len() as i64)
@@ -1083,6 +1113,7 @@ mod tests {
     include!("tests/pg_test_partition_dispatch.rs");
     include!("tests/pg_test_audit.rs");
     include!("tests/pg_test_fuzz.rs");
+    include!("tests/pg_test_audit_gaps.rs");
 }
 
 /// This module is required by `cargo pgrx test` invocations.
