@@ -70,3 +70,33 @@ fn audit_probe_calibration_passthrough_is_sublinear() {
         "discriminator wrongly flagged a heavy-but-flat shape (70ms->95ms)"
     );
 }
+
+/// PLAN-QUALITY: an aggregate IMV joining a secondary dimension table must
+/// maintain a 1-row primary delta in O(delta), not re-aggregate the whole base.
+#[pg_test]
+fn audit_multisource_aggregate_secondary_join_is_sublinear() {
+    for (suf, n) in [("s", 20000_i32), ("b", 500000_i32)] {
+        Spi::run(&format!(
+            "CREATE TABLE ma_fact_{s} (id INT PRIMARY KEY, dim INT, amt NUMERIC)", s = suf)).unwrap();
+        Spi::run(&format!(
+            "CREATE TABLE ma_dim_{s} (dim INT PRIMARY KEY, label TEXT)", s = suf)).unwrap();
+        Spi::run(&format!(
+            "INSERT INTO ma_dim_{s} SELECT d, 'L'||d FROM generate_series(1,100) d", s = suf)).unwrap();
+        Spi::run(&format!(
+            "INSERT INTO ma_fact_{s} SELECT i, i % 100 + 1, i FROM generate_series(1,{n}) i",
+            s = suf, n = n)).unwrap();
+        crate::create_reflex_ivm(
+            &format!("ma_v_{s}", s = suf),
+            &format!(
+                "SELECT f.dim, d.label, SUM(f.amt) AS s FROM ma_fact_{s} f \
+                 LEFT JOIN ma_dim_{s} d ON d.dim = f.dim GROUP BY f.dim, d.label", s = suf),
+            None, None, Some("DEFERRED"), None);
+        Spi::run(&format!(
+            "INSERT INTO ma_fact_{s} VALUES (900001, 7, 5)", s = suf)).unwrap();
+        Spi::run(&format!("SELECT reflex_flush_deferred('ma_fact_{s}')", s = suf)).unwrap();
+    }
+    let small = last_flush_ms_of("ma_v_s");
+    let big = last_flush_ms_of("ma_v_b");
+    eprintln!("AUDIT_T4 multisource-aggregate small={}ms big={}ms", small, big);
+    assert_sublinear("multisource-aggregate-secondary-join", small, big, 25);
+}

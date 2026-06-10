@@ -104,7 +104,9 @@ Calibration (Task 1): `audit_probe_calibration_passthrough_is_sublinear` PASSED 
 keyed passthrough judged sublinear at 20k→500k, discriminator confirmed to fire
 on a 2ms→60ms (25x) pattern and stay quiet on flat/​sublinear ones.
 
-_(Tasks 4–7 append verdicts here)_
+Task 4 — multi-source aggregate + LEFT JOIN secondary: **PASS** (small=18ms, big=8ms) — maintenance O(delta), VERDICT Proven.
+
+_(Tasks 5–7 append verdicts here)_
 
 ## §4 Risk-ranked gap backlog
 _(Task 8)_
