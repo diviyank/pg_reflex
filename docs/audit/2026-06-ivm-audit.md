@@ -106,7 +106,11 @@ on a 2ms→60ms (25x) pattern and stay quiet on flat/​sublinear ones.
 
 Task 4 — multi-source aggregate + LEFT JOIN secondary: **PASS** (small=18ms, big=8ms) — maintenance O(delta), VERDICT Proven.
 
-_(Tasks 5–7 append verdicts here)_
+Task 5 — window ROW_NUMBER update re-rank: PASS — correctness Proven.
+
+Task 6 — DISTINCT ON winner demotion: PASS — correctness Proven.
+
+Task 7 — IN-subquery filter relevance: PASS — correctness Proven.
 
 ## §4 Risk-ranked gap backlog
 _(Task 8)_

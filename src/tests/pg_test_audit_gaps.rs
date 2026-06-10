@@ -100,3 +100,44 @@ fn audit_multisource_aggregate_secondary_join_is_sublinear() {
     eprintln!("AUDIT_T4 multisource-aggregate small={}ms big={}ms", small, big);
     assert_sublinear("multisource-aggregate-secondary-join", small, big, 25);
 }
+
+/// CORRECTNESS: updating one row's score must re-rank the whole partition in a
+/// ROW_NUMBER window IMV. Oracle = fresh recompute via EXCEPT ALL.
+#[pg_test]
+fn audit_window_row_number_update_reranks_correctly() {
+    Spi::run("CREATE TABLE awr (id INT PRIMARY KEY, grp INT, score INT)").unwrap();
+    Spi::run("INSERT INTO awr VALUES (1,1,90),(2,1,80),(3,1,70),(4,2,50)").unwrap();
+    let sql = "SELECT id, grp, score, \
+               ROW_NUMBER() OVER (PARTITION BY grp ORDER BY score DESC) AS rnk FROM awr";
+    crate::create_reflex_ivm("awr_v", sql, None, None, None, None);
+    Spi::run("UPDATE awr SET score = 999 WHERE id = 3").unwrap();
+    assert_imv_correct("awr_v", sql);
+}
+
+/// CORRECTNESS: demoting the current DISTINCT ON winner must promote the
+/// runner-up in the same group. Oracle = fresh recompute via EXCEPT ALL.
+#[pg_test]
+fn audit_distinct_on_winner_demotion_promotes_runner_up() {
+    Spi::run("CREATE TABLE ado (id INT PRIMARY KEY, city TEXT, name TEXT, val INT)").unwrap();
+    Spi::run("INSERT INTO ado VALUES \
+        (1,'Paris','A',100),(2,'Paris','B',90),(3,'Lyon','C',50)").unwrap();
+    let sql = "SELECT DISTINCT ON (city) city, name, val FROM ado ORDER BY city, val DESC";
+    crate::create_reflex_ivm("ado_v", sql, None, None, None, None);
+    Spi::run("UPDATE ado SET val = 1 WHERE id = 1").unwrap();
+    assert_imv_correct("ado_v", sql);
+}
+
+/// CORRECTNESS: a passthrough IMV filtered by `IN (SELECT ...)` must skip an
+/// update to a row OUTSIDE the filter, even when it collides on the unique key
+/// with an in-filter row. Oracle = fresh recompute via EXCEPT ALL.
+#[pg_test]
+fn audit_in_subquery_filter_skips_out_of_filter_update() {
+    Spi::run("CREATE TABLE ais (k INT, period INT, v NUMERIC)").unwrap();
+    Spi::run("CREATE TABLE ais_active (period INT)").unwrap();
+    Spi::run("INSERT INTO ais_active VALUES (1)").unwrap();
+    Spi::run("INSERT INTO ais VALUES (1,1,10),(1,2,999)").unwrap();
+    let sql = "SELECT k, period, v FROM ais WHERE period IN (SELECT period FROM ais_active)";
+    crate::create_reflex_ivm("ais_v", sql, None, None, None, None);
+    Spi::run("UPDATE ais SET v = 123 WHERE period = 2").unwrap();
+    assert_imv_correct("ais_v", sql);
+}
