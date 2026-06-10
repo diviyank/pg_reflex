@@ -1018,62 +1018,59 @@ fn pg_subpart_unpartitioned_imv_full_reconciles_on_source_swap() {
     assert_eq!(drift, 0, "unpartitioned IMV diverged from source after swap+flush");
 }
 
-/// Fix #3: a partition child created as a leaf by a prior sync, whose source
-/// counterpart later becomes partitioned (gains sub-partitioning), must be
-/// rebuilt as a partitioned node by a subsequent sync — not left as a plain
-/// table that makes reconcile throw "… is not partitioned".
+/// Fix #3: a depth-2 IMV's top-level child created as a LEAF, whose same-named
+/// source child is later rebuilt as a partitioned (sub-partitioned) table, must
+/// be healed by sync from relkind 'r' to 'p' — not left as a plain table that
+/// makes reconcile throw "… is not partitioned". Reproduces the production
+/// poison (sop_forecast_view child created flat; the source child later gained
+/// a sub-level under the SAME name). A depth-2 IMV is required: a depth-1 IMV
+/// correctly keeps the mirror child a leaf, so the heal would (rightly) not fire.
 #[pg_test]
 fn sync_heals_leaf_child_into_partitioned() {
-    // Source starts depth-1: top child `heal_s_a` is a LEAF.
-    Spi::run("CREATE TABLE heal_s (k text, sub text, amount int) PARTITION BY LIST (k)").unwrap();
-    Spi::run("CREATE TABLE heal_s_a PARTITION OF heal_s FOR VALUES IN ('a')").unwrap();
-    Spi::run("INSERT INTO heal_s VALUES ('a', 'x', 5)").unwrap();
+    // Depth-2 source: LIST(dem_plan_id) -> RANGE(order_date). Branch 172 is
+    // partitioned; branch 999 starts as a LEAF.
+    Spi::run("CREATE TABLE ds (dem_plan_id bigint NOT NULL, order_date date NOT NULL, product_id bigint, qty int) PARTITION BY LIST (dem_plan_id)").unwrap();
+    Spi::run("CREATE TABLE ds_172 PARTITION OF ds FOR VALUES IN (172) PARTITION BY RANGE (order_date)").unwrap();
+    Spi::run("CREATE TABLE ds_172_jan PARTITION OF ds_172 FOR VALUES FROM ('2025-01-01') TO ('2025-02-01')").unwrap();
+    Spi::run("CREATE TABLE ds_999 PARTITION OF ds FOR VALUES IN (999)").unwrap();
+    Spi::run("INSERT INTO ds VALUES (172,'2025-01-15',5,10),(999,'2025-01-20',7,3)").unwrap();
 
-    // IMV mirrors the source (depth = 1): `heal_imv_heal_s_a` is a leaf 'r'.
-    Spi::run(
-        "SELECT create_reflex_ivm('heal_imv', \
-         'SELECT k, sub, sum(amount) AS total FROM heal_s GROUP BY k, sub', \
-         'k,sub', 'UNLOGGED', 'IMMEDIATE', NULL, ARRAY['k'])",
-    ).unwrap();
+    // Depth-2 passthrough IMV (partition_depth = 2).
+    let r = Spi::get_one::<String>(
+        "SELECT create_reflex_ivm('dimv','SELECT dem_plan_id, order_date, product_id, qty FROM ds', \
+         'dem_plan_id,order_date,product_id', NULL, NULL, NULL, ARRAY['dem_plan_id','order_date'])",
+    ).unwrap().unwrap();
+    assert!(!r.starts_with("ERROR"), "create returned: {r}");
 
-    // Manually sync to ensure heal_imv_heal_s_a is created.
-    let sync_result = Spi::get_one::<String>("SELECT reflex_sync_partitions('heal_imv')").unwrap();
-    assert!(sync_result.is_some(), "sync should succeed");
+    // The leaf-branch mirror child starts as a plain table 'r'.
+    let before = Spi::get_one::<String>(
+        "SELECT relkind::text FROM pg_class WHERE relname = 'dimv_ds_999'",
+    ).unwrap().unwrap();
+    assert_eq!(before, "r", "leaf-branch mirror child must start as a plain table");
 
-    // Verify the child was created as a leaf.
-    let relkind_before = Spi::get_one::<String>(
-        "SELECT relkind FROM pg_class WHERE relname = 'heal_imv_heal_s_a'",
-    )
-    .expect("relkind query")
-    .expect("relkind result");
-    assert_eq!(relkind_before, "r", "initially created child must be a leaf");
+    // Rebuild ds_999 UNDER THE SAME NAME as a partitioned table (you cannot add a
+    // partition level in place; the operator detaches, recreates, re-attaches).
+    Spi::run("ALTER TABLE ds DETACH PARTITION ds_999").unwrap();
+    Spi::run("ALTER TABLE ds_999 RENAME TO ds_999_old").unwrap();
+    Spi::run("CREATE TABLE ds_999 (dem_plan_id bigint NOT NULL, order_date date NOT NULL, product_id bigint, qty int) PARTITION BY RANGE (order_date)").unwrap();
+    Spi::run("CREATE TABLE ds_999_jan PARTITION OF ds_999 FOR VALUES FROM ('2025-01-01') TO ('2025-02-01')").unwrap();
+    Spi::run("INSERT INTO ds_999 SELECT * FROM ds_999_old").unwrap();
+    Spi::run("DROP TABLE ds_999_old").unwrap();
+    Spi::run("ALTER TABLE ds ATTACH PARTITION ds_999 FOR VALUES IN (999)").unwrap();
 
-    // Now grow the source by making heal_s_a partitioned (same bound, but with sub-partitioning).
-    // This simulates an ALTER that adds sub-partitioning to an existing partition.
-    Spi::run("ALTER TABLE heal_s DETACH PARTITION heal_s_a").unwrap();
-    Spi::run("CREATE TABLE heal_s_a_new (k text, sub text, amount int) PARTITION BY LIST (sub)").unwrap();
-    Spi::run("CREATE TABLE heal_s_a_new_x PARTITION OF heal_s_a_new FOR VALUES IN ('x')").unwrap();
-    Spi::run("INSERT INTO heal_s_a_new SELECT * FROM heal_s_a").unwrap();
-    Spi::run("DROP TABLE heal_s_a").unwrap();
-    Spi::run("ALTER TABLE heal_s ATTACH PARTITION heal_s_a_new FOR VALUES IN ('a')").unwrap();
+    // The ATTACH's event-trigger auto-sync (or this explicit sync) heals the
+    // drift: dimv_ds_999 must now be PARTITIONED ('p').
+    let sync = Spi::get_one::<String>("SELECT reflex_sync_partitions('dimv')").unwrap().unwrap();
+    assert!(!sync.starts_with("ERROR"), "sync returned: {sync}");
+    let after = Spi::get_one::<String>(
+        "SELECT relkind::text FROM pg_class WHERE relname = 'dimv_ds_999'",
+    ).unwrap().unwrap();
+    assert_eq!(after, "p", "healed child must be partitioned, not a plain leaf");
 
-    // Sync again. The heal block should detect that heal_imv_heal_s_a (a leaf) mismatches
-    // the source's heal_s_a_new (now partitioned), drop it, and the create loop rebuilds it as partitioned.
-    let sync_result = Spi::get_one::<String>("SELECT reflex_sync_partitions('heal_imv')").unwrap();
-    assert!(sync_result.is_some(), "sync should succeed");
-
-    // The IMV's child should now be PARTITIONED ('p'), not a plain table.
-    // Note: the child name changes from heal_imv_heal_s_a to heal_imv_heal_s_a_new
-    // because it mirrors the new source child name.
-    let relkind_after = Spi::get_one::<String>(
-        "SELECT relkind FROM pg_class WHERE relname = 'heal_imv_heal_s_a_new'",
-    )
-    .expect("relkind query")
-    .expect("relkind result");
-    assert_eq!(relkind_after, "p", "rebuilt child must be partitioned");
-
-    // Data is present at the correct leaf.
-    let total = Spi::get_one::<i64>("SELECT total FROM heal_imv WHERE k='a' AND sub='x'")
-        .unwrap().unwrap_or(-1);
-    assert_eq!(total, 5, "data must survive the shape heal");
+    // Data correct after reconcile (both branches present).
+    let _ = Spi::get_one::<String>("SELECT reflex_flush_partition_source('public.ds')").unwrap();
+    let cnt = Spi::get_one::<i64>("SELECT count(*)::int8 FROM dimv").unwrap().unwrap_or(-1);
+    assert_eq!(cnt, 2, "both source rows present after heal + reconcile");
+    let qty999 = Spi::get_one::<i64>("SELECT qty::int8 FROM dimv WHERE dem_plan_id = 999").unwrap().unwrap_or(-1);
+    assert_eq!(qty999, 3, "healed branch row present with correct value");
 }
