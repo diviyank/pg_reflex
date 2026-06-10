@@ -1126,6 +1126,7 @@ mod tests {
     include!("tests/pg_test_audit.rs");
     include!("tests/pg_test_fuzz.rs");
     include!("tests/pg_test_audit_gaps.rs");
+    include!("tests/pg_test_cross_source.rs");
 }
 
 /// This module is required by `cargo pgrx test` invocations.
