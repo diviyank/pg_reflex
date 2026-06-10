@@ -4,6 +4,18 @@ The full changelog tracks every release. The latest version's headlines are on t
 
 For each version below, see [`CHANGELOG.md`](https://github.com/diviyank/pg_reflex/blob/main/CHANGELOG.md) on GitHub for the canonical text.
 
+## [1.10.2] — 2026-06-10
+
+Correctness + efficiency fix for IMVs filtered by an uncorrelated scalar subquery (e.g. `WHERE assortment_id = (SELECT assortment_id FROM sop_current_view)`). The filter was dropped from per-source metadata, so the relevance-skip never fired — irrelevant updates were maintained anyway, and an out-of-filter update colliding on the unique key silently deleted in-filter rows. Pure Rust analyzer fix, recompiled into the module: `ALTER EXTENSION pg_reflex UPDATE TO '1.10.2';`.
+
+**Fixed**
+
+- Scalar-subquery WHERE filters were dropped from per-source metadata — `collect_imv_relevant_where` attributed conjuncts against every relation including the subquery's (also a registered source), so `col = (SELECT … FROM other)` looked cross-source and was discarded, leaving `imv_relevant_where` empty and the relevance-skip off (needless maintenance + silent wrong-deletes). The analyzer now attributes against the outer FROM's sources only and treats scalar subqueries as opaque, so single-outer-source IMVs with a subquery filter capture the predicate. Multi-source IMVs unchanged.
+
+**Migration**
+
+- [`sql/pg_reflex--1.10.1--1.10.2.sql`](https://github.com/diviyank/pg_reflex/blob/main/sql/pg_reflex--1.10.1--1.10.2.sql) — no-op marker. Per-source metadata is persisted at CREATE time, so **existing** IMVs with a scalar-subquery filter need an in-place refresh (no DROP/recreate): after the upgrade run `SELECT reflex_rebuild_imv_metadata('<schema.imv>');` for each. New IMVs get it automatically.
+
 ## [1.10.1] — 2026-06-10
 
 Performance fix for the incremental maintenance of aggregate IMVs that `LEFT JOIN` a secondary table: a tiny change to the secondary re-aggregated the entire base instead of the few affected groups, so a single-row source update propagating through such an IMV took minutes (18 min for a 2-row delta on a 9-source view). Pure Rust codegen fix, recompiled into the module: `ALTER EXTENSION pg_reflex UPDATE TO '1.10.1';`.

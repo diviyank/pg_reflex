@@ -2,6 +2,50 @@
 
 ## [Unreleased]
 
+## [1.10.2] - 2026-06-10
+
+Correctness + efficiency fix for IMVs filtered by an uncorrelated scalar
+subquery, e.g. `WHERE assortment_id = (SELECT assortment_id FROM
+sop_current_view)`. The filter was dropped from the IMV's per-source metadata,
+so the relevance-skip never fired: updates to rows *outside* the filter were
+maintained anyway, and — because the keyed passthrough DELETE matches only the
+unique key — an out-of-filter update sharing those key values silently deleted
+in-filter rows. No catalog/schema or function-signature changes; the fix is in
+the Rust query analyzer, recompiled into the module: `ALTER EXTENSION pg_reflex
+UPDATE TO '1.10.2';`.
+
+### Fixed
+
+- **Scalar-subquery WHERE filters were dropped from per-source metadata.**
+  `collect_imv_relevant_where` attributed each WHERE conjunct against *every*
+  relation in the query — including one that appears only inside the subquery
+  (and is therefore also registered as a source). So `col = (SELECT … FROM
+  other)` looked "cross-source" and was discarded, leaving the source's
+  `imv_relevant_where` empty and the filter-aware relevance-skip permanently
+  off. Result: needless maintenance (and downstream cascade) for irrelevant
+  updates, plus silent loss of correct rows when an out-of-filter update
+  collided on the unique key. The analyzer now attributes conjuncts against the
+  **outer FROM**'s sources only and treats scalar subqueries as opaque values
+  (a subquery-depth-aware ref collector), so single-outer-source IMVs with a
+  subquery filter capture the predicate and the skip fires. Multi-source IMVs
+  are unchanged.
+
+### Tests
+
+- `test_passthrough_subquery_filter_skips_noncurrent_group_deferred` — oracle
+  reproducing the wrong-delete (RED before the fix); and
+  `cov_rebuild_metadata_restores_subquery_filter_skip` — verifies the in-place
+  migration path below. Full unit + `pg_test` oracle suites stay green.
+
+### Migration
+
+- `ALTER EXTENSION pg_reflex UPDATE TO '1.10.2';` — no-op marker
+  (`sql/pg_reflex--1.10.1--1.10.2.sql`). The per-source metadata is persisted at
+  CREATE time, so **existing** IMVs with a scalar-subquery filter must be
+  refreshed in place — no DROP/recreate needed — by running, after the upgrade,
+  `SELECT reflex_rebuild_imv_metadata('<schema.imv>');` for each. New IMVs get
+  the correct metadata automatically.
+
 ## [1.10.1] - 2026-06-10
 
 Performance fix for the incremental maintenance of aggregate IMVs that

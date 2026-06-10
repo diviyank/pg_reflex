@@ -1,0 +1,50 @@
+-- Migration: pg_reflex 1.10.1 → 1.10.2
+--
+-- Run via: ALTER EXTENSION pg_reflex UPDATE TO '1.10.2';
+--
+-- 1.10.2 is a correctness + efficiency fix for IMVs whose WHERE clause filters
+-- on an UNCORRELATED scalar subquery, e.g.
+--   SELECT ... FROM src WHERE col = (SELECT c FROM other_relation)
+-- There are NO catalog schema changes, NO function signature changes, and NO
+-- SPI additions — the fix is entirely in the Rust query analyzer, recompiled
+-- into the module.
+--
+-- What was wrong (all in-process, no migration DDL):
+--
+--   `collect_imv_relevant_where` attributed each WHERE conjunct against EVERY
+--   relation in the query, including a relation that appears only inside a
+--   scalar subquery (which is also registered as a source). So a filter like
+--   `assortment_id = (SELECT assortment_id FROM sop_current_view)` looked
+--   "cross-source" and was dropped, leaving the source's `imv_relevant_where`
+--   metadata empty. The filter-aware relevance-skip then never fired, so every
+--   update — even to rows OUTSIDE the filter — was maintained. Worse, the keyed
+--   passthrough DELETE matches only the IMV's unique key, so an out-of-filter
+--   update sharing those key values would DELETE in-filter rows: needless
+--   maintenance (and cascade) plus silent loss of correct rows.
+--
+--   The fix attributes conjuncts against the OUTER FROM's sources only and
+--   treats scalar subqueries as opaque values, so single-outer-source IMVs with
+--   a subquery filter now capture the predicate and the relevance-skip fires.
+--
+-- Backfilling EXISTING IMVs (important):
+--
+--   The per-source `imv_relevant_where` is persisted in
+--   `__reflex_ivm_reference.aggregations` at CREATE time, so IMVs created before
+--   1.10.2 keep the stale (empty) metadata after a module swap. Re-derive it IN
+--   PLACE — no DROP/recreate, which matters when the IMV feeds downstream IMVs —
+--   by running, AFTER this upgrade, as its own statement(s):
+--
+--     SELECT reflex_rebuild_imv_metadata('<schema.your_imv>');
+--
+--   for each IMV with a scalar-subquery WHERE filter (e.g.
+--   `current_assortment_activity_view`). New IMVs get the correct metadata
+--   automatically.
+--
+-- Migration steps:
+--
+--   No DDL is required by this file. Replace the module (.so) before running
+--   `ALTER EXTENSION pg_reflex UPDATE TO '1.10.2';`, then run
+--   `reflex_rebuild_imv_metadata(...)` for affected pre-existing IMVs.
+
+-- No-op marker: ALTER EXTENSION needs a non-empty migration file.
+SELECT 1 WHERE FALSE;

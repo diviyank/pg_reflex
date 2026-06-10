@@ -324,3 +324,49 @@ fn test_passthrough_where_filter_update_exit_deferred() {
     Spi::run("SELECT reflex_flush_deferred('pwf_exit')").expect("flush");
     assert_imv_correct("pwf_exit_v", fresh);
 }
+
+/// Regression (db_dev current_assortment_activity_view): a passthrough IMV
+/// filtered by an UNCORRELATED scalar subquery —
+///   `WHERE grp = (SELECT cur FROM sqf_current)`
+/// — had its `where_predicate` dropped, because `collect_imv_relevant_where`
+/// sees the subquery's column ref (a second relation) and treats the conjunct
+/// as cross-source. With no `where_predicate` the trigger never skips updates
+/// to a NON-current `grp`, and the keyed passthrough DELETE matches only
+/// `(k1, k2)` — so an update to a non-current row whose `(k1, k2)` collide with
+/// a current row WRONGLY deletes the current IMV row (the re-INSERT, filtered
+/// to the current grp, adds nothing back).
+#[pg_test]
+fn test_passthrough_subquery_filter_skips_noncurrent_group_deferred() {
+    Spi::run("CREATE TABLE sqf_current (cur INT NOT NULL)").expect("create current");
+    Spi::run("INSERT INTO sqf_current (cur) VALUES (4)").expect("seed current");
+    Spi::run(
+        "CREATE TABLE sqf_src (grp INT NOT NULL, k1 INT NOT NULL, k2 INT NOT NULL, active BOOL NOT NULL)",
+    )
+    .expect("create src");
+    // Current group (grp=4) and a non-current one (grp=14) sharing (k1,k2)=(1,1).
+    Spi::run(
+        "INSERT INTO sqf_src (grp, k1, k2, active) VALUES \
+         (4, 1, 1, true), (4, 2, 2, true), (14, 1, 1, false)",
+    )
+    .expect("seed src");
+
+    let result = crate::create_reflex_ivm(
+        "sqf_view",
+        "SELECT k1, k2, active FROM sqf_src WHERE grp = (SELECT cur FROM sqf_current)",
+        Some("k1, k2"),
+        None,
+        Some("DEFERRED"),
+        None,
+    );
+    assert!(!result.starts_with("ERROR"), "create: {}", result);
+    let fresh = "SELECT k1, k2, active FROM sqf_src WHERE grp = (SELECT cur FROM sqf_current)";
+    assert_imv_correct("sqf_view", fresh);
+
+    // Update a NON-current row (grp=14) whose (k1,k2)=(1,1) collide with the
+    // current grp=4 row. This is irrelevant to the IMV and must not change it.
+    Spi::run("UPDATE sqf_src SET active = NOT active WHERE grp = 14 AND k1 = 1 AND k2 = 1")
+        .expect("update non-current");
+    Spi::run("SELECT reflex_flush_deferred('sqf_src')").expect("flush");
+
+    assert_imv_correct("sqf_view", fresh);
+}

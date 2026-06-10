@@ -703,6 +703,67 @@ impl Visitor for ColumnRefCollector {
     }
 }
 
+/// Like [`ColumnRefCollector`] but ignores column references nested inside a
+/// subquery — only the OUTER expression's refs are collected. Used by
+/// [`collect_imv_relevant_where`] so a WHERE conjunct of the form
+/// `outer_col <op> (SELECT … FROM other)` attributes to the outer source and is
+/// kept (the scalar subquery is treated as an opaque value), instead of looking
+/// "cross-source" because of the subquery's internal refs and being dropped —
+/// which left filters like `assortment_id = (SELECT … FROM sop_current_view)`
+/// with no `where_predicate` and thus no relevance-skip for the IMV.
+#[derive(Default)]
+struct OuterColumnRefCollector {
+    refs: Vec<Vec<String>>,
+    subquery_depth: usize,
+}
+
+impl Visitor for OuterColumnRefCollector {
+    type Break = ();
+
+    fn pre_visit_query(&mut self, _query: &Query) -> ControlFlow<()> {
+        self.subquery_depth += 1;
+        ControlFlow::Continue(())
+    }
+
+    fn post_visit_query(&mut self, _query: &Query) -> ControlFlow<()> {
+        self.subquery_depth = self.subquery_depth.saturating_sub(1);
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<()> {
+        if self.subquery_depth == 0 {
+            match expr {
+                Expr::Identifier(id) => self.refs.push(vec![id.value.clone()]),
+                Expr::CompoundIdentifier(ids) => self
+                    .refs
+                    .push(ids.iter().map(|i| i.value.clone()).collect()),
+                _ => {}
+            }
+        }
+        ControlFlow::Continue(())
+    }
+}
+
+/// The real (non-derived) table names appearing in the OUTER FROM clause of
+/// `select` — the relations whose rows the WHERE clause filters. Relations that
+/// appear only inside a subquery are excluded, so a scalar-subquery filter does
+/// not make every WHERE conjunct look cross-source. Names match the
+/// `name.to_string()` form pushed onto `analysis.sources`.
+fn outer_from_real_sources(select: &Select) -> Vec<String> {
+    let mut names = Vec::new();
+    for twj in &select.from {
+        if let TableFactor::Table { name, .. } = &twj.relation {
+            names.push(name.to_string());
+        }
+        for join in &twj.joins {
+            if let TableFactor::Table { name, .. } = &join.relation {
+                names.push(name.to_string());
+            }
+        }
+    }
+    names
+}
+
 /// Test whether `source` names a real base table (i.e., not a CTE marker like
 /// `<subquery:foo>` or a table function). These placeholders are pushed onto
 /// `analysis.sources` by [`AnalysisVisitor::pre_visit_table_factor`] for
@@ -988,10 +1049,20 @@ fn collect_imv_relevant_where(
         return HashMap::new();
     };
 
-    let real_sources: Vec<&String> = sources.iter().filter(|s| is_real_source(s)).collect();
+    // Attribute conjuncts against the OUTER FROM's sources only. A relation
+    // that appears solely inside a scalar subquery (e.g.
+    // `WHERE col = (SELECT … FROM other)`) is in `sources` but does NOT own the
+    // filtered rows; counting it makes the conjunct look cross-source and drops
+    // it, leaving the IMV with no `where_predicate` (no relevance-skip).
+    let outer_names: BTreeSet<String> = outer_from_real_sources(select).into_iter().collect();
+    let real_sources: Vec<&String> = sources
+        .iter()
+        .filter(|s| is_real_source(s) && outer_names.contains(*s))
+        .collect();
     if real_sources.is_empty() {
         return HashMap::new();
     }
+    let outer_sources: Vec<String> = real_sources.iter().map(|s| (*s).clone()).collect();
 
     // Pre-compute the prefixes we'd need to strip per source: every alias
     // pointing at that source, plus the source's bare table name.
@@ -1015,7 +1086,9 @@ fn collect_imv_relevant_where(
     let mut buckets: HashMap<String, Vec<String>> = HashMap::new();
 
     for conj in conjuncts {
-        let mut collector = ColumnRefCollector::default();
+        // Only OUTER-level refs attribute the conjunct; a scalar subquery is an
+        // opaque value evaluated against its own tables at maintenance time.
+        let mut collector = OuterColumnRefCollector::default();
         let _ = conj.visit(&mut collector);
 
         // For each ref, resolve to its source(s). A bare ref in a multi-source
@@ -1026,7 +1099,7 @@ fn collect_imv_relevant_where(
         let mut ambiguous_or_unattributable = false;
 
         for parts in &collector.refs {
-            let resolved = resolve_column_ref(parts, aliases, sources);
+            let resolved = resolve_column_ref(parts, aliases, &outer_sources);
             if parts.len() == 1 && real_sources.len() > 1 {
                 // Bare ident in multi-source query: which source is it?
                 // Conservatively treat as ambiguous and drop the conjunct.

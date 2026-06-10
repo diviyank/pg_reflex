@@ -4657,3 +4657,49 @@ fn cov_window_min_via_partition_smoke() {
         res
     );
 }
+
+/// 1.10.2 migration path — a pre-1.10.2 IMV with a scalar-subquery WHERE filter
+/// has a STALE `aggregations.imv_relevant_where` (the old analyzer dropped the
+/// subquery conjunct), so the filter-aware relevance-skip never fires and
+/// non-current-key updates corrupt the IMV. `reflex_rebuild_imv_metadata`
+/// re-derives the metadata in place (no DROP+recreate needed, which matters
+/// when the IMV has downstream dependents) and restores the skip.
+#[pg_test]
+fn cov_rebuild_metadata_restores_subquery_filter_skip() {
+    Spi::run("CREATE TABLE rbf_cur (cur INT NOT NULL)").expect("create cur");
+    Spi::run("INSERT INTO rbf_cur (cur) VALUES (4)").expect("seed cur");
+    Spi::run("CREATE TABLE rbf_src (grp INT NOT NULL, k1 INT NOT NULL, k2 INT NOT NULL, active BOOL NOT NULL)")
+        .expect("create src");
+    Spi::run("INSERT INTO rbf_src (grp, k1, k2, active) VALUES (4, 1, 1, true), (14, 1, 1, false)")
+        .expect("seed src");
+    crate::create_reflex_ivm(
+        "rbf_view",
+        "SELECT k1, k2, active FROM rbf_src WHERE grp = (SELECT cur FROM rbf_cur)",
+        Some("k1, k2"),
+        None,
+        Some("DEFERRED"),
+        None,
+    );
+
+    // Simulate a pre-1.10.2 catalog: the subquery conjunct was dropped, so the
+    // source's imv_relevant_where entry is missing.
+    Spi::run(
+        "UPDATE public.__reflex_ivm_reference \
+         SET aggregations = jsonb_set(aggregations::jsonb, '{imv_relevant_where}', '{}'::jsonb, true)::json \
+         WHERE name = 'rbf_view'",
+    )
+    .expect("stale metadata");
+
+    // Migration: rebuild the metadata in place.
+    let s: String = Spi::get_one("SELECT reflex_rebuild_imv_metadata('rbf_view')")
+        .expect("q")
+        .expect("v");
+    assert!(!s.starts_with("ERROR"), "rebuild: {}", s);
+
+    // A non-current (grp=14) update colliding on (k1,k2) must now be skipped.
+    let fresh = "SELECT k1, k2, active FROM rbf_src WHERE grp = (SELECT cur FROM rbf_cur)";
+    Spi::run("UPDATE rbf_src SET active = NOT active WHERE grp = 14 AND k1 = 1 AND k2 = 1")
+        .expect("update non-current");
+    Spi::run("SELECT reflex_flush_deferred('rbf_src')").expect("flush");
+    assert_imv_correct("rbf_view", fresh);
+}
