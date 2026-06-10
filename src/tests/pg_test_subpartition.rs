@@ -1074,3 +1074,36 @@ fn sync_heals_leaf_child_into_partitioned() {
     let qty999 = Spi::get_one::<i64>("SELECT qty::int8 FROM dimv WHERE dem_plan_id = 999").unwrap().unwrap_or(-1);
     assert_eq!(qty999, 3, "healed branch row present with correct value");
 }
+
+/// Fix #1: attaching a pre-populated partition to a source must auto-sync the
+/// IMV partition's DATA at COMMIT — no manual reflex_flush_partitions() call.
+#[pg_test]
+fn attach_with_data_auto_syncs_at_commit() {
+    Spi::run("CREATE TABLE auto_s (region text, amount int) PARTITION BY LIST (region)").unwrap();
+    Spi::run("CREATE TABLE auto_s_us PARTITION OF auto_s FOR VALUES IN ('us')").unwrap();
+    Spi::run("INSERT INTO auto_s VALUES ('us', 10)").unwrap();
+    Spi::run(
+        "SELECT create_reflex_ivm('auto_imv', \
+         'SELECT region, sum(amount) AS total FROM auto_s GROUP BY region', \
+         'region', 'UNLOGGED', 'IMMEDIATE', NULL, ARRAY['region'])",
+    ).unwrap();
+
+    // Attach a NEW partition that ALREADY holds data. No manual flush below.
+    Spi::run("CREATE TABLE auto_s_eu (region text, amount int)").unwrap();
+    Spi::run("INSERT INTO auto_s_eu VALUES ('eu', 100), ('eu', 200)").unwrap();
+    Spi::run("ALTER TABLE auto_s ATTACH PARTITION auto_s_eu FOR VALUES IN ('eu')").unwrap();
+
+    // The deferred constraint trigger fires at the COMMIT of the statement(s)
+    // above. Inside a single #[pg_test] transaction, force the deferred trigger
+    // to run by issuing SET CONSTRAINTS ALL IMMEDIATE before asserting.
+    Spi::run("SET CONSTRAINTS ALL IMMEDIATE").unwrap();
+
+    let eu = Spi::get_one::<i64>("SELECT total FROM auto_imv WHERE region = 'eu'")
+        .unwrap().unwrap_or(-1);
+    assert_eq!(eu, 300, "ATTACH-with-data must auto-sync the IMV partition's data");
+
+    let pending = Spi::get_one::<i64>(
+        "SELECT count(*) FROM public.__reflex_partition_pending WHERE source_root LIKE '%auto_s%'",
+    ).unwrap().unwrap_or(-1);
+    assert_eq!(pending, 0, "auto-drain must clear the pending row");
+}
