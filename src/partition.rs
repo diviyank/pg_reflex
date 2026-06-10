@@ -486,6 +486,28 @@ pub(crate) fn build_partition_node_ddl_pair(
     (int_ddl, tgt_ddl)
 }
 
+/// True when an existing IMV partition child's actual shape disagrees with the
+/// shape its mirror node requires, i.e. it must be dropped and recreated.
+///
+/// `expect_partitioned` is `node.sub_strategy.is_some()` (post-truncation).
+/// `actual_relkind` is the existing child's `pg_class.relkind` (`Some('p')` for
+/// a partitioned table, `Some('r')`/etc. for a leaf, `None` when no such child
+/// exists yet — nothing to heal). `CREATE TABLE IF NOT EXISTS … PARTITION OF`
+/// cannot convert one shape into the other in place, so a mismatch is fatal to
+/// reconcile until the child is rebuilt.
+pub(crate) fn partition_shape_mismatch(
+    expect_partitioned: bool,
+    actual_relkind: Option<char>,
+) -> bool {
+    match actual_relkind {
+        None => false,
+        Some(rk) => {
+            let actual_partitioned = rk == 'p';
+            actual_partitioned != expect_partitioned
+        }
+    }
+}
+
 /// Build the canonical swap-table name for one source-child of a view.
 /// `kind` is "int" (intermediate) or "tgt" (target).
 pub(crate) fn swap_partition_name(view_name: &str, kind: &str, source_child_bare: &str) -> String {
