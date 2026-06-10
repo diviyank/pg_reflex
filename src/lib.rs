@@ -1054,33 +1054,45 @@ mod tests {
         );
     }
 
-    /// Read the last recorded flush wall-time (ms) for an IMV.
-    /// Returns 0 if no flush has been recorded yet (NULL).
+    /// Read the last recorded flush wall-time (ms) for an IMV. Panics loudly if
+    /// no flush was recorded (NULL) — in immediate mode that means the DML did
+    /// not maintain the IMV, which is itself a defect worth surfacing.
     fn last_flush_ms_of(imv: &str) -> i64 {
-        let result = Spi::get_one::<i64>(&format!(
-            "SELECT COALESCE(last_flush_ms, 0) FROM reflex_ivm_status() WHERE name = '{}'",
+        Spi::get_one::<i64>(&format!(
+            "SELECT last_flush_ms FROM reflex_ivm_status() WHERE name = '{}'",
             imv
         ))
         .expect("status query failed")
-        .expect("coalesced result must not be NULL");
-        result
+        .expect("last_flush_ms was NULL — no flush recorded for this IMV")
     }
 
-    /// Plan-quality probe: an O(1) delta must not cost O(base).
-    /// `small_ms`/`big_ms` are flush times for an identical single-row delta against
-    /// a small vs a `base_ratio`x-larger base. An O(base) plan grows ~`base_ratio`x;
-    /// an O(delta) plan stays flat. Fail only well below `base_ratio` to absorb noise.
+    /// Plan-quality discriminator. Given flush wall-times for an identical O(1)
+    /// delta against a small base and a `base_ratio`x-larger base, decide whether
+    /// the shape's maintenance cost SCALES with base size (an O(base) plan grows
+    /// ~`base_ratio`x; an O(delta) plan stays flat). Returns `false` when the
+    /// large-base flush is cheap (< 30ms) — at that point the shape is fast
+    /// enough at scale that O(base) vs O(delta) is not an operational concern
+    /// (the bugs this guards against are multi-second/​minute flushes). Only when
+    /// the large-base flush is operationally heavy do we require it to stay near
+    /// the small-base cost rather than tracking base growth.
+    fn flush_scales_with_base(small_ms: i64, big_ms: i64, base_ratio: i64) -> bool {
+        if big_ms < 30 {
+            return false;
+        }
+        big_ms as f64 > std::cmp::max(small_ms, 1) as f64 * (base_ratio as f64 / 3.0)
+    }
+
+    /// Plan-quality probe: a fixed O(1) delta must not cost O(base). Panics with
+    /// the recorded numbers when the shape scales with base size.
     fn assert_sublinear(label: &str, small_ms: i64, big_ms: i64, base_ratio: i64) {
-        let allowed = std::cmp::max(small_ms * 5, 75);
         assert!(
-            big_ms <= allowed,
-            "PLAN-QUALITY GAP [{}]: base grew {}x, flush grew {}ms -> {}ms (>{}ms allowed) \
-             => maintenance is O(base), not O(delta)",
+            !flush_scales_with_base(small_ms, big_ms, base_ratio),
+            "PLAN-QUALITY GAP [{}]: base grew {}x, flush grew {}ms -> {}ms \
+             => maintenance scales with base (O(base), not O(delta))",
             label,
             base_ratio,
             small_ms,
-            big_ms,
-            allowed
+            big_ms
         );
     }
 
