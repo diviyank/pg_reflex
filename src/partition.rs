@@ -2003,7 +2003,12 @@ pub(crate) fn reflex_flush_partitions_impl(only: Option<&str>) -> String {
 
             // Emit the per-root DO block. The EXCEPTION branch leaves the snapshot + pending row
             // intact (rolled back) so the root retries on the next flush, and logs a WARNING
-            // instead of aborting the batch.
+            // instead of aborting the batch. The pending drain is a scoped DELETE (RowExclusive) per root,
+            // never a blanket TRUNCATE: two concurrent flushes each holding RowExclusive on the
+            // globally-shared __reflex_partition_pending table (from event trigger INSERTs) would
+            // both try to upgrade to AccessExclusive and deadlock. Also, TRUNCATE would silently
+            // wipe pending rows a concurrent backend enqueued after `roots` was scanned but before
+            // this point, losing that flush. The per-root DELETE is correct for both entry points.
             let root_esc = root.replace('\'', "''");
             let body = root_stmts
                 .into_iter()
