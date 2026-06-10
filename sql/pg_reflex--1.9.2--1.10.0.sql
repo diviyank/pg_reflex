@@ -24,8 +24,15 @@
 -- The two Rust fixes need no migration DDL — they are recompiled into the
 -- module; replace the `.so` BEFORE running `ALTER EXTENSION … UPDATE` so the
 -- corrected paths are loaded. The DDL below installs the one new SPI and the
--- auto-drain trigger on existing databases, then drains any queue rows left
--- pending by pre-1.10.0 ATTACHes that never had a commit-time drain.
+-- auto-drain trigger on existing databases.
+--
+-- NOTE: this migration deliberately does NOT drain the pending queue. An
+-- `ALTER EXTENSION … UPDATE` script runs in `creating_extension` mode, where
+-- DDL on non-extension-member tables (the runtime partition children) is
+-- rejected with SQLSTATE 55000 "is not a member of extension" — so a flush
+-- here cannot succeed and would build/fill swap tables before failing per
+-- root. Drain any pre-1.10.0 backlog AFTER this upgrade, as a normal
+-- statement:  SELECT public.reflex_flush_partitions();
 
 -- === New SPI: SQL-callable snapshot refresh (used by the per-root flush DO block) ===
 CREATE OR REPLACE FUNCTION public."__reflex_refresh_partition_snapshot"(
@@ -58,9 +65,7 @@ CREATE CONSTRAINT TRIGGER __reflex_partition_flush_trigger
     DEFERRABLE INITIALLY DEFERRED
     FOR EACH ROW EXECUTE FUNCTION public.__reflex_partition_flush_fn();
 
--- === One-time drain of pre-1.10.0 wedged queue rows ===
--- Rows enqueued by ATTACHes before this upgrade never fired a commit-time
--- trigger and may have been blocked by the (now-fixed) all-or-nothing drain.
--- This scoped, per-root, isolated flush heals them; a root that still fails
--- emits a WARNING and stays pending for inspection rather than aborting.
-SELECT public.reflex_flush_partitions();
+-- Draining the pre-1.10.0 backlog is a POST-upgrade step (see the note in the
+-- header) — run `SELECT public.reflex_flush_partitions();` as its own statement
+-- after this migration commits, or DELETE obsolete rows from
+-- public.__reflex_partition_pending directly.

@@ -61,11 +61,14 @@ wedged queue rows).
 ### Migration
 
 `ALTER EXTENSION pg_reflex UPDATE TO '1.10.0';` after replacing the module. The
-migration registers `__reflex_refresh_partition_snapshot`, installs the
-`__reflex_partition_flush_trigger` auto-drain constraint trigger, and runs a
-one-time `reflex_flush_partitions()` to drain rows left pending by pre-1.10.0
-ATTACHes. The two Rust fixes (per-root isolation, shape heal) ship in the
-recompiled module and need no DDL.
+migration registers `__reflex_refresh_partition_snapshot` and installs the
+`__reflex_partition_flush_trigger` auto-drain constraint trigger (pure DDL). The
+two Rust fixes (per-root isolation, shape heal) ship in the recompiled module
+and need no DDL. To clear any pre-1.10.0 backlog, run
+`SELECT reflex_flush_partitions();` **after** the upgrade as its own statement —
+it must not run inside the `ALTER EXTENSION` script, which runs in
+extension-creation mode and rejects DDL on the runtime partition tables
+(SQLSTATE 55000 "is not a member of extension").
 
 ## [1.9.2] - 2026-06-08
 

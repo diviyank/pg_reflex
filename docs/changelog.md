@@ -21,7 +21,7 @@ Fixes the hole where `ALTER TABLE source ATTACH PARTITION child_with_data` creat
 
 **Migration**
 
-- [`sql/pg_reflex--1.9.2--1.10.0.sql`](https://github.com/diviyank/pg_reflex/blob/main/sql/pg_reflex--1.9.2--1.10.0.sql) registers the new wrapper, installs the auto-drain trigger, and runs a one-time `reflex_flush_partitions()` to drain pre-1.10.0 wedged rows. The two Rust fixes ship in the recompiled module and need no DDL.
+- [`sql/pg_reflex--1.9.2--1.10.0.sql`](https://github.com/diviyank/pg_reflex/blob/main/sql/pg_reflex--1.9.2--1.10.0.sql) registers the new wrapper and installs the auto-drain trigger (pure DDL). The two Rust fixes ship in the recompiled module and need no DDL. Clear any pre-1.10.0 backlog by running `SELECT reflex_flush_partitions();` **after** the upgrade as its own statement — it cannot run inside the `ALTER EXTENSION` script (extension-creation mode rejects DDL on the runtime partition tables, SQLSTATE 55000).
 
 ## [1.9.2] — 2026-06-08
 
