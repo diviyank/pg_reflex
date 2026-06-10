@@ -145,3 +145,112 @@ fn audit_in_subquery_filter_skips_out_of_filter_update() {
     Spi::run("UPDATE ais SET v = 123 WHERE period = 2").unwrap();
     assert_imv_correct("ais_v", sql);
 }
+
+/// PLAN-QUALITY: a single-source GROUP BY aggregate must maintain a 1-row delta
+/// by recomputing only the affected group, not re-aggregating the whole base.
+#[pg_test]
+fn audit_single_source_aggregate_is_sublinear() {
+    for (suf, n) in [("s", 20000_i32), ("b", 500000_i32)] {
+        Spi::run(&format!(
+            "CREATE TABLE sa_{s} (id INT PRIMARY KEY, g INT, v NUMERIC)", s = suf)).unwrap();
+        Spi::run(&format!(
+            "INSERT INTO sa_{s} SELECT i, i % 1000, i FROM generate_series(1,{n}) i",
+            s = suf, n = n)).unwrap();
+        crate::create_reflex_ivm(
+            &format!("sa_v_{s}", s = suf),
+            &format!("SELECT g, SUM(v) AS s, COUNT(*) AS c FROM sa_{s} GROUP BY g", s = suf),
+            None, None, Some("DEFERRED"), None);
+        Spi::run(&format!("INSERT INTO sa_{s} VALUES (900001, 7, 5)", s = suf)).unwrap();
+        Spi::run(&format!("SELECT reflex_flush_deferred('sa_{s}')", s = suf)).unwrap();
+    }
+    let small = last_flush_ms_of("sa_v_s");
+    let big = last_flush_ms_of("sa_v_b");
+    eprintln!("AUDIT_M2 single-source-aggregate small={}ms big={}ms", small, big);
+    assert_sublinear("single-source-aggregate", small, big, 25);
+}
+
+/// PLAN-QUALITY: inner-join aggregate, 1-row primary delta stays O(delta).
+#[pg_test]
+fn audit_inner_join_aggregate_is_sublinear() {
+    for (suf, n) in [("s", 20000_i32), ("b", 500000_i32)] {
+        Spi::run(&format!(
+            "CREATE TABLE ija_fact_{s} (id INT PRIMARY KEY, dim INT, amt NUMERIC)", s = suf)).unwrap();
+        Spi::run(&format!(
+            "CREATE TABLE ija_dim_{s} (dim INT PRIMARY KEY, label TEXT)", s = suf)).unwrap();
+        Spi::run(&format!(
+            "INSERT INTO ija_dim_{s} SELECT d, 'L'||d FROM generate_series(1,100) d", s = suf)).unwrap();
+        Spi::run(&format!(
+            "INSERT INTO ija_fact_{s} SELECT i, i % 100 + 1, i FROM generate_series(1,{n}) i",
+            s = suf, n = n)).unwrap();
+        crate::create_reflex_ivm(
+            &format!("ija_v_{s}", s = suf),
+            &format!(
+                "SELECT f.dim, d.label, SUM(f.amt) AS s FROM ija_fact_{s} f \
+                 JOIN ija_dim_{s} d ON d.dim = f.dim GROUP BY f.dim, d.label", s = suf),
+            None, None, Some("DEFERRED"), None);
+        Spi::run(&format!("INSERT INTO ija_fact_{s} VALUES (900001, 7, 5)", s = suf)).unwrap();
+        Spi::run(&format!("SELECT reflex_flush_deferred('ija_fact_{s}')", s = suf)).unwrap();
+    }
+    let small = last_flush_ms_of("ija_v_s");
+    let big = last_flush_ms_of("ija_v_b");
+    eprintln!("AUDIT_M2 inner-join-aggregate small={}ms big={}ms", small, big);
+    assert_sublinear("inner-join-aggregate", small, big, 25);
+}
+
+/// PLAN-QUALITY: CTE-decomposed aggregate, 1-row delta stays O(delta).
+/// NOTE: CTE-decomposed views create sub-IMVs with generated names (__cte_agg).
+/// We query the sub-IMV timing, not the main IMV, since that's where the work is recorded.
+#[pg_test]
+fn audit_cte_decomposed_is_sublinear() {
+    for (suf, n) in [("s", 20000_i32), ("b", 500000_i32)] {
+        Spi::run(&format!(
+            "CREATE TABLE cd_fact_{s} (id INT PRIMARY KEY, dim INT, amt NUMERIC)", s = suf)).unwrap();
+        Spi::run(&format!(
+            "INSERT INTO cd_fact_{s} SELECT i, i % 100 + 1, i FROM generate_series(1,{n}) i",
+            s = suf, n = n)).unwrap();
+        crate::create_reflex_ivm(
+            &format!("cd_v_{s}", s = suf),
+            &format!(
+                "WITH agg AS (SELECT dim, SUM(amt) AS s FROM cd_fact_{s} GROUP BY dim) \
+                 SELECT dim, s FROM agg", s = suf),
+            None, None, Some("DEFERRED"), None);
+        Spi::run(&format!("INSERT INTO cd_fact_{s} VALUES (900001, 7, 5)", s = suf)).unwrap();
+        Spi::run(&format!("SELECT reflex_flush_deferred('cd_fact_{s}')", s = suf)).unwrap();
+    }
+    // For CTE-decomposed views, query the sub-IMV __cte_agg that records the flush
+    let small = last_flush_ms_of("cd_v_s__cte_agg");
+    let big = last_flush_ms_of("cd_v_b__cte_agg");
+    eprintln!("AUDIT_M2 cte-decomposed small={}ms big={}ms", small, big);
+    assert_sublinear("cte-decomposed", small, big, 25);
+}
+
+/// PLAN-QUALITY: UNION ALL set-op, 1-row delta into one operand stays O(delta).
+/// NOTE: UNION decomposed views create sub-IMVs with generated names (__union_0, __union_1).
+/// We query the first operand's sub-IMV since that's where we insert.
+#[pg_test]
+fn audit_union_all_is_sublinear() {
+    for (suf, n) in [("s", 20000_i32), ("b", 500000_i32)] {
+        Spi::run(&format!(
+            "CREATE TABLE ua_p_{s} (id INT PRIMARY KEY, g INT, v NUMERIC)", s = suf)).unwrap();
+        Spi::run(&format!(
+            "CREATE TABLE ua_q_{s} (id INT PRIMARY KEY, g INT, v NUMERIC)", s = suf)).unwrap();
+        Spi::run(&format!(
+            "INSERT INTO ua_p_{s} SELECT i, i % 100, i FROM generate_series(1,{n}) i",
+            s = suf, n = n)).unwrap();
+        Spi::run(&format!(
+            "INSERT INTO ua_q_{s} SELECT i, i % 100, i FROM generate_series(1,{n}) i",
+            s = suf, n = n)).unwrap();
+        crate::create_reflex_ivm(
+            &format!("ua_v_{s}", s = suf),
+            &format!(
+                "SELECT id, g, v FROM ua_p_{s} UNION ALL SELECT id, g, v FROM ua_q_{s}", s = suf),
+            None, None, Some("DEFERRED"), None);
+        Spi::run(&format!("INSERT INTO ua_p_{s} VALUES (900001, 7, 5)", s = suf)).unwrap();
+        Spi::run(&format!("SELECT reflex_flush_deferred('ua_p_{s}')", s = suf)).unwrap();
+    }
+    // For UNION decomposed views, query the sub-IMV __union_0 that corresponds to the first operand
+    let small = last_flush_ms_of("ua_v_s__union_0");
+    let big = last_flush_ms_of("ua_v_b__union_0");
+    eprintln!("AUDIT_M2 union-all small={}ms big={}ms", small, big);
+    assert_sublinear("union-all", small, big, 25);
+}

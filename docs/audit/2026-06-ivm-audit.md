@@ -112,6 +112,15 @@ Task 6 — DISTINCT ON winner demotion: PASS — correctness Proven.
 
 Task 7 — IN-subquery filter relevance: PASS — correctness Proven. Strengthened to be faithful to the 1.10.2 class: the IMV declares unique key `k`, and the out-of-filter row (k=1,p=2) collides on `k` with the in-filter row (k=1,p=1), so the keyed-delete path that silently removed in-filter rows in 1.10.2 is actually exercised. The fix covers `IN (SELECT …)`, not just `= (SELECT …)`.
 
+### Phase 2 M2 — Plan-quality scaling
+
+Four aggregate shapes instrumented with `assert_sublinear` across 20k and 500k row bases with identical 1-row deltas:
+
+- M2.1 — `audit_single_source_aggregate_is_sublinear`: **PASS** (small=9ms, big=6ms) — O(delta), GROUP BY on single source scopes recompute to affected group.
+- M2.2 — `audit_inner_join_aggregate_is_sublinear`: **PASS** (small=14ms, big=6ms) — O(delta), inner-join dimension lookup stays bounded.
+- M2.3 — `audit_cte_decomposed_is_sublinear`: **PASS** (small=9ms, big=8ms) — O(delta), CTE sub-IMV recompute scoped by aggregation keys.
+- M2.4 — `audit_union_all_is_sublinear`: **PASS** (small=6ms, big=4ms) — O(delta), delta routed to correct operand sub-IMV.
+
 **Verdict-reading caveat (honest framing).** All four instrumented probes PASSED. That is genuine, confidence-restoring evidence that the recent fixes generalize — but each probe refutes a *specific named hypothesis* under *one* mutation; it is "not refuted," not "proven correct in general." Adversarial, multi-mutation, key-colliding coverage of these same shapes is exactly what Phase 2's combinatorial fuzz must add (see §4).
 
 ## §4 Risk-ranked gap backlog
