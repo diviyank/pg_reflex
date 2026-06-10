@@ -115,4 +115,32 @@ Task 7 — IN-subquery filter relevance: PASS — correctness Proven. Strengthen
 **Verdict-reading caveat (honest framing).** All four instrumented probes PASSED. That is genuine, confidence-restoring evidence that the recent fixes generalize — but each probe refutes a *specific named hypothesis* under *one* mutation; it is "not refuted," not "proven correct in general." Adversarial, multi-mutation, key-colliding coverage of these same shapes is exactly what Phase 2's combinatorial fuzz must add (see §4).
 
 ## §4 Risk-ranked gap backlog
-_(Task 8)_
+
+Ranked by impact, with the project's priority order (correctness > simplicity >
+performance) but with plan-quality elevated this cycle because it is the
+specific pain that triggered the audit ("absolute worst query plans"). Each row
+names its target phase. P2 = harden the combinatorial harness; P3 = field-replay.
+
+| # | Gap | Axis | Evidence | Target |
+|---|-----|------|----------|--------|
+| 1 | **Cross-source consistency guard is entirely untested** — the anti-double-count mechanism has zero oracle coverage. A regression here is a *silent wrong result* (worst failure class). | correctness | §1 row "Cross-source consistency guard" = Untested | **P2** — add a multi-source/self-join double-count axis with oracle + an adversarial refuter |
+| 2 | **No plan-quality assertion for any aggregate shape** — the entire 1.10.1 bug class (correct-but-O(base)) is unguarded; the field found it as "18 minutes". This audit added the *only* two plan probes (passthrough calib + multi-source-agg, both PASS). | plan | §1 plan-quality column = Untested everywhere; §3 Task 4 | **P2** — extend `assert_sublinear` to single-source, multi-source, and LEFT-JOIN-secondary aggregates; add white-box `EXPLAIN`-rows successor |
+| 3 | **The pairwise gate has no axis for the field-bug regions** — all 20 escapes (§2) lived in WHERE-filters, scalar subqueries, partition DDL, or multi-source aggregates, none of which the gate exercises systematically before release. | both | §2 escape table (every "covered today? = yes" was field-found, not gate-found) | **P2** — add axes: WHERE-filter shapes, scalar/IN subquery filters, partition-DDL (ATTACH/DETACH/SWAP), IMV lifecycle (create/drop/decomposition rollback) |
+| 4 | **Weak correctness coverage on window, DISTINCT ON, inner join, multi-source aggregate, ignore_sources** — point-value checks, no full-relation oracle except the single mutation each this audit just added (§3 Tasks 5–7 PASS, now active regressions). | correctness | §1 rows rated Weak; §3 Tasks 5–7 | **P2** — fuzz these shapes adversarially: multi-mutation, key-colliding, winner-change, mid-frame |
+| 5 | **Plan-quality probe is a wall-clock heuristic** — trustworthy enough for Phase 1 confirm/refute, but not a structural guarantee. | plan (tooling) | §3 "Known limitation" | **P2** — white-box assertion on the generated maintenance plan (`EXPLAIN` actual-rows at the base relation) |
+| 6 | **No regression derived from real production queries** — every field bug came from base-db views the suite never replayed. | both | §2 "found in field, not gate" meta-pattern | **P3** — distil base-db views (`current_assortment_activity_view`, `sop_incoming_stock_baseline_view`, …) into minimal oracle-checked regressions |
+
+### Phase-2 entry point (deduplicated axis list to brainstorm from)
+
+The next phase starts from this list, not a blank page (distilled from §2 §4):
+
+1. **Cross-source double-count** oracle + adversarial refuter (rank 1 — correctness, silent-wrong).
+2. **Plan-quality axis** — `assert_sublinear` for every aggregate shape, then a white-box `EXPLAIN`-rows successor (ranks 2, 5).
+3. **WHERE-filter / subquery-filter axis** — `= (SELECT)`, `IN (SELECT)`, correlated, with relevance-skip + key-collision (rank 3; §3 Task 7 shows the shape).
+4. **Partition-DDL axis** — ATTACH/DETACH/SWAP + pending-queue drain + per-root isolation (rank 3).
+5. **IMV-lifecycle axis** — create/drop/decomposition-rollback/anchor-inference (rank 3; the 10 DDL-family escapes).
+6. **Adversarial multi-mutation fuzz** for the Weak shapes — window, DISTINCT ON, inner join, ignore_sources (rank 4).
+
+### Phase-1 bottom line
+
+Four named suspected gaps were instrumented; **all four PASSED**, converting Weak/Untested cells into live oracle regressions and showing the 1.10.1/1.10.2 fixes generalize. The audit found **no new live bug** — but it found the *real* systemic holes: the cross-source guard is untested (rank 1), plan-quality is unguarded everywhere (rank 2), and the release gate never exercises the regions where all 20 field bugs lived (rank 3). Those are Phase 2's mandate.
