@@ -1894,6 +1894,11 @@ pub(crate) fn reflex_flush_partitions_impl(only: Option<&str>) -> String {
             let actions = classify_partition_diff(&snapshot, &current);
             let live_tree = list_partition_tree(client, root);
 
+            // Collect all mutating statements for this root to run in one atomically-isolated
+            // subtransaction. This ensures one failing root doesn't abort the whole flush or block
+            // other roots from draining.
+            let mut root_stmts: Vec<String> = Vec::new();
+
             for (imv, depth_opt, _deps) in &imvs {
                 let mirror_depth = depth_opt
                     .map(|d| d as usize)
@@ -1938,26 +1943,21 @@ pub(crate) fn reflex_flush_partitions_impl(only: Option<&str>) -> String {
                 for node in &to_drop {
                     let tgt = target_child_name(imv, node);
                     let int = intermediate_child_name(imv, node);
-                    let _ = client.update(
-                        &format!("DROP TABLE IF EXISTS \"{}\".\"{}\" CASCADE", schema, tgt),
-                        None,
-                        &[],
-                    );
-                    let _ = client.update(
-                        &format!("DROP TABLE IF EXISTS \"{}\".\"{}\" CASCADE", schema, int),
-                        None,
-                        &[],
-                    );
+                    root_stmts.push(format!(
+                        "DROP TABLE IF EXISTS \"{}\".\"{}\" CASCADE",
+                        schema, tgt
+                    ));
+                    root_stmts.push(format!(
+                        "DROP TABLE IF EXISTS \"{}\".\"{}\" CASCADE",
+                        schema, int
+                    ));
                 }
                 for node in &to_swap {
-                    let q = format!(
-                        "SELECT public.reflex_reconcile_partition({}, '', {})",
+                    root_stmts.push(format!(
+                        "PERFORM public.reflex_reconcile_partition({}, '', {})",
                         sql_literal_text(imv),
                         sql_literal_text(node)
-                    );
-                    client
-                        .update(&q, None, &[])
-                        .map_err(|e| format!("flush reconcile {} {}: {}", imv, node, e))?;
+                    ));
                 }
                 summary.push(format!("{}: {} change(s)", imv, actions.len()));
             }
@@ -1983,32 +1983,46 @@ pub(crate) fn reflex_flush_partitions_impl(only: Option<&str>) -> String {
                 })
                 .collect();
             for imv in &unpartitioned_imvs {
-                let q = format!("SELECT public.reflex_reconcile({})", sql_literal_text(imv));
-                client
-                    .update(&q, None, &[])
-                    .map_err(|e| format!("flush full-reconcile {}: {}", imv, e))?;
+                root_stmts.push(format!(
+                    "PERFORM public.reflex_reconcile({})",
+                    sql_literal_text(imv)
+                ));
                 summary.push(format!("{}: full reconcile (unpartitioned)", imv));
             }
 
-            refresh_source_snapshot(client, root);
-        }
+            // Append the snapshot refresh and pending drain to the same root's statement list
+            // so they commit/rollback atomically with the reconciles.
+            root_stmts.push(format!(
+                "PERFORM public.__reflex_refresh_partition_snapshot({})",
+                sql_literal_text(root)
+            ));
+            root_stmts.push(format!(
+                "DELETE FROM public.__reflex_partition_pending WHERE source_root = {}",
+                sql_literal_text(root)
+            ));
 
-        // Drain only the roots this flush actually processed, with a scoped
-        // DELETE (RowExclusive). A blanket `TRUNCATE` here would take an
-        // AccessExclusiveLock on the globally-shared pending table; two
-        // concurrent flushes — each already holding RowExclusive on it from the
-        // event trigger's INSERT — would both try to upgrade to AccessExclusive
-        // and deadlock (confirmed: deadlock on __reflex_partition_pending). The
-        // blanket TRUNCATE would also silently wipe pending rows a concurrent
-        // backend enqueued after `roots` was scanned but before this point,
-        // losing that flush. `roots` is `[r]` in the `Some(r)` case, so a single
-        // scoped delete per root is correct for both entry points.
-        for root in &roots {
-            let _ = client.update(
-                "DELETE FROM public.__reflex_partition_pending WHERE source_root = $1",
-                None,
-                &[unsafe { DatumWithOid::new(root.to_string(), pgrx::pg_sys::TEXTOID) }],
+            // Emit the per-root DO block. The EXCEPTION branch leaves the snapshot + pending row
+            // intact (rolled back) so the root retries on the next flush, and logs a WARNING
+            // instead of aborting the batch.
+            let root_esc = root.replace('\'', "''");
+            let body = root_stmts
+                .into_iter()
+                .map(|s| format!("{};", s))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let do_block = format!(
+                "DO $_reflex_part_sp$ \
+                 BEGIN \
+                   \n{body}\n \
+                 EXCEPTION WHEN OTHERS THEN \
+                   RAISE WARNING 'pg_reflex: partition flush for root % failed: % (SQLSTATE %) — left pending for retry', \
+                     '{root_esc}', SQLERRM, SQLSTATE; \
+                 END \
+                 $_reflex_part_sp$"
             );
+            client
+                .update(&do_block, None, &[])
+                .map_err(|e| format!("flush: DO block dispatch for root {} failed: {}", root, e))?;
         }
 
         Ok(if summary.is_empty() {
