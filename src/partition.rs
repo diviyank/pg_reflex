@@ -1085,22 +1085,90 @@ pub(crate) fn reflex_sync_partitions_impl(view_name: &str, drop_orphans: bool) -
             }
         }
 
+        // Fix #3: heal shape drift. An IMV child created as a leaf whose source
+        // counterpart later became partitioned (or vice versa) was previously skipped
+        // by `CREATE TABLE IF NOT EXISTS`, leaving a plain table where reconcile
+        // expects a partitioned one ("… is not partitioned"). Drop such mismatched
+        // children top-down so the create loop below rebuilds them with the right
+        // shape. Nodes are depth-ordered, so a dropped internal node's CASCADE removes
+        // stale descendants that the create loop then re-creates.
+        {
+            let (schema_opt, _) = split_qualified_name(view_name);
+            let schema = schema_opt.unwrap_or("public");
+            for node in &nodes {
+                let expect_partitioned = node.sub_strategy.is_some();
+                for child_bare in [
+                    intermediate_child_name(view_name, &node.bare_name),
+                    target_child_name(view_name, &node.bare_name),
+                ] {
+                    let relkind: Option<char> = client
+                        .select(
+                            "SELECT relkind::text AS rk FROM pg_class c \
+                             JOIN pg_namespace n ON n.oid = c.relnamespace \
+                             WHERE n.nspname = $1 AND c.relname = $2",
+                            Some(1),
+                            &[
+                                unsafe {
+                                    DatumWithOid::new(
+                                        schema.to_string(),
+                                        PgBuiltInOids::TEXTOID.oid().value(),
+                                    )
+                                },
+                                unsafe {
+                                    DatumWithOid::new(
+                                        child_bare.clone(),
+                                        PgBuiltInOids::TEXTOID.oid().value(),
+                                    )
+                                },
+                            ],
+                        )
+                        .ok()
+                        .and_then(|mut it| it.next())
+                        .and_then(|r| r.get_by_name::<&str, _>("rk").ok().flatten())
+                        .and_then(|s| s.chars().next());
+
+                    if partition_shape_mismatch(expect_partitioned, relkind) {
+                        let q = format!(
+                            "DROP TABLE IF EXISTS \"{}\".\"{}\" CASCADE",
+                            schema, child_bare
+                        );
+                        client.update(&q, None, &[]).map_err(|e| {
+                            format!("sync: heal drop of mismatched child {}: {}", child_bare, e)
+                        })?;
+                        pgrx::notice!(
+                            "pg_reflex: rebuilt partition child '{}' (shape drift: expected {})",
+                            child_bare,
+                            if expect_partitioned {
+                                "partitioned"
+                            } else {
+                                "leaf"
+                            }
+                        );
+                    }
+                }
+            }
+        }
+
         for node in &nodes {
             let int_name = intermediate_child_name(view_name, &node.bare_name);
             let tgt_name = target_child_name(view_name, &node.bare_name);
             let (int_ddl, tgt_ddl) =
                 build_partition_node_ddl_pair(view_name, node, anchor_root_bare, unlogged);
-            if has_intermediate && !int_have.contains(&int_name) {
+            if has_intermediate {
                 client
                     .update(&int_ddl, None, &[])
                     .map_err(|e| format!("sync: create intermediate node: {}", e))?;
-                out.added_intermediate += 1;
+                if !int_have.contains(&int_name) {
+                    out.added_intermediate += 1;
+                }
             }
-            if !tgt_have.contains(&tgt_name) {
+            {
                 client
                     .update(&tgt_ddl, None, &[])
                     .map_err(|e| format!("sync: create target node: {}", e))?;
-                out.added_target += 1;
+                if !tgt_have.contains(&tgt_name) {
+                    out.added_target += 1;
+                }
             }
         }
 
