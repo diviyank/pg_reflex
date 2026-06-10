@@ -499,6 +499,17 @@ fn reflex_flush_partition_source(source_root: &str) -> String {
     partition::reflex_flush_partitions_impl(Some(source_root))
 }
 
+/// Internal: replace the source-partition snapshot for `source_root` with the
+/// live leaf set. SQL-callable so the per-root flush subtransaction can refresh
+/// the snapshot atomically with its reconciles. Not part of the public API.
+#[pg_extern(name = "__reflex_refresh_partition_snapshot")]
+fn reflex_refresh_partition_snapshot(source_root: &str) -> &'static str {
+    pgrx::Spi::connect_mut(|client| {
+        partition::refresh_source_snapshot(client, source_root);
+    });
+    "OK"
+}
+
 /// Drop a reflex IMV and all its artifacts (triggers, tables, reference row).
 /// Refuses to drop if the IMV has children unless cascade is true.
 #[pg_extern]
@@ -967,6 +978,32 @@ extension_sql!(
         ON ddl_command_end
         WHEN TAG IN ('ALTER TABLE', 'CREATE TABLE')
         EXECUTE FUNCTION public.__reflex_on_ddl_command_end();
+
+    -- 1.10.0: auto-drain the partition pending queue at COMMIT. Mirrors the
+    -- deferred-DML flush mechanism (schema_builder.rs): a DEFERRABLE INITIALLY
+    -- DEFERRED constraint trigger on __reflex_partition_pending fires once per
+    -- enqueued root at COMMIT, running a SCOPED flush of just that root. Scoped
+    -- (not the all-roots reflex_flush_partitions) so each root drains
+    -- independently; combined with the per-root subtransaction inside
+    -- reflex_flush_partition_source, one broken root cannot wedge the queue.
+    -- Recursion is bounded: the flush's own ATTACH/DETACH on __reflex_-owned
+    -- tables is ignored by the ddl_command_end enqueue guard (NOT LIKE
+    -- '%__reflex_%'), so no new pending rows are produced.
+    CREATE OR REPLACE FUNCTION public.__reflex_partition_flush_fn()
+    RETURNS TRIGGER LANGUAGE plpgsql AS $fn$
+    BEGIN
+        PERFORM public.reflex_flush_partition_source(NEW.source_root);
+        RETURN NULL;
+    END;
+    $fn$;
+
+    DROP TRIGGER IF EXISTS __reflex_partition_flush_trigger
+        ON public.__reflex_partition_pending;
+
+    CREATE CONSTRAINT TRIGGER __reflex_partition_flush_trigger
+        AFTER INSERT ON public.__reflex_partition_pending
+        DEFERRABLE INITIALLY DEFERRED
+        FOR EACH ROW EXECUTE FUNCTION public.__reflex_partition_flush_fn();
     "#,
     name = "pg_reflex_event_trigger",
     requires = ["pg_reflex_init"],

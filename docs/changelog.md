@@ -4,6 +4,25 @@ The full changelog tracks every release. The latest version's headlines are on t
 
 For each version below, see [`CHANGELOG.md`](https://github.com/diviyank/pg_reflex/blob/main/CHANGELOG.md) on GitHub for the canonical text.
 
+## [1.10.0] — 2026-06-10
+
+Fixes the hole where `ALTER TABLE source ATTACH PARTITION child_with_data` created the IMV partition but never synced its data (it stayed empty): ATTACH re-parents rows without firing row triggers, and nothing drained the partition pending queue automatically. `ALTER EXTENSION pg_reflex UPDATE TO '1.10.0';` after replacing the module.
+
+**Fixed**
+
+- ATTACH-with-data left the IMV partition empty — the event trigger enqueued the source root and created the empty structure, but no path ever drained the queue to run the data-filling reconcile.
+- One broken root wedged the whole partition flush — `reflex_flush_partitions` drained all roots in one transaction with `?`-propagation, so the first failure rolled back the batch and drained nothing; each root now reconciles/drains atomically in its own subtransaction, failing roots stay pending with a `WARNING`.
+- Shape drift threw `"… is not partitioned"` — a same-name source child rebuilt partitioned left the IMV child a plain table (skipped by `CREATE … IF NOT EXISTS`); `reflex_sync_partitions` now drops and rebuilds the mismatched child with the correct shape.
+
+**Added**
+
+- Commit-time auto-drain: a `DEFERRABLE INITIALLY DEFERRED` constraint trigger on `__reflex_partition_pending` runs a scoped flush per enqueued root at COMMIT, so ATTACH-with-data auto-syncs with no manual `reflex_flush_partitions()` call.
+- Internal `__reflex_refresh_partition_snapshot(text)` wrapper so the per-root flush refreshes the snapshot atomically (not public API).
+
+**Migration**
+
+- [`sql/pg_reflex--1.9.2--1.10.0.sql`](https://github.com/diviyank/pg_reflex/blob/main/sql/pg_reflex--1.9.2--1.10.0.sql) registers the new wrapper, installs the auto-drain trigger, and runs a one-time `reflex_flush_partitions()` to drain pre-1.10.0 wedged rows. The two Rust fixes ship in the recompiled module and need no DDL.
+
 ## [1.9.2] — 2026-06-08
 
 Correctness fix for the commit-time cascade flush of CTE-decomposed views. No catalog/schema or function-signature changes — the fix is in the Rust trigger-time SQL rewriter, recompiled into the module: `ALTER EXTENSION pg_reflex UPDATE TO '1.9.2';`.

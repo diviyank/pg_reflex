@@ -1017,3 +1017,93 @@ fn pg_subpart_unpartitioned_imv_full_reconciles_on_source_swap() {
     ).unwrap().unwrap();
     assert_eq!(drift, 0, "unpartitioned IMV diverged from source after swap+flush");
 }
+
+/// Fix #3: a depth-2 IMV's top-level child created as a LEAF, whose same-named
+/// source child is later rebuilt as a partitioned (sub-partitioned) table, must
+/// be healed by sync from relkind 'r' to 'p' — not left as a plain table that
+/// makes reconcile throw "… is not partitioned". Reproduces the production
+/// poison (sop_forecast_view child created flat; the source child later gained
+/// a sub-level under the SAME name). A depth-2 IMV is required: a depth-1 IMV
+/// correctly keeps the mirror child a leaf, so the heal would (rightly) not fire.
+#[pg_test]
+fn sync_heals_leaf_child_into_partitioned() {
+    // Depth-2 source: LIST(dem_plan_id) -> RANGE(order_date). Branch 172 is
+    // partitioned; branch 999 starts as a LEAF.
+    Spi::run("CREATE TABLE ds (dem_plan_id bigint NOT NULL, order_date date NOT NULL, product_id bigint, qty int) PARTITION BY LIST (dem_plan_id)").unwrap();
+    Spi::run("CREATE TABLE ds_172 PARTITION OF ds FOR VALUES IN (172) PARTITION BY RANGE (order_date)").unwrap();
+    Spi::run("CREATE TABLE ds_172_jan PARTITION OF ds_172 FOR VALUES FROM ('2025-01-01') TO ('2025-02-01')").unwrap();
+    Spi::run("CREATE TABLE ds_999 PARTITION OF ds FOR VALUES IN (999)").unwrap();
+    Spi::run("INSERT INTO ds VALUES (172,'2025-01-15',5,10),(999,'2025-01-20',7,3)").unwrap();
+
+    // Depth-2 passthrough IMV (partition_depth = 2).
+    let r = Spi::get_one::<String>(
+        "SELECT create_reflex_ivm('dimv','SELECT dem_plan_id, order_date, product_id, qty FROM ds', \
+         'dem_plan_id,order_date,product_id', NULL, NULL, NULL, ARRAY['dem_plan_id','order_date'])",
+    ).unwrap().unwrap();
+    assert!(!r.starts_with("ERROR"), "create returned: {r}");
+
+    // The leaf-branch mirror child starts as a plain table 'r'.
+    let before = Spi::get_one::<String>(
+        "SELECT relkind::text FROM pg_class WHERE relname = 'dimv_ds_999'",
+    ).unwrap().unwrap();
+    assert_eq!(before, "r", "leaf-branch mirror child must start as a plain table");
+
+    // Rebuild ds_999 UNDER THE SAME NAME as a partitioned table (you cannot add a
+    // partition level in place; the operator detaches, recreates, re-attaches).
+    Spi::run("ALTER TABLE ds DETACH PARTITION ds_999").unwrap();
+    Spi::run("ALTER TABLE ds_999 RENAME TO ds_999_old").unwrap();
+    Spi::run("CREATE TABLE ds_999 (dem_plan_id bigint NOT NULL, order_date date NOT NULL, product_id bigint, qty int) PARTITION BY RANGE (order_date)").unwrap();
+    Spi::run("CREATE TABLE ds_999_jan PARTITION OF ds_999 FOR VALUES FROM ('2025-01-01') TO ('2025-02-01')").unwrap();
+    Spi::run("INSERT INTO ds_999 SELECT * FROM ds_999_old").unwrap();
+    Spi::run("DROP TABLE ds_999_old").unwrap();
+    Spi::run("ALTER TABLE ds ATTACH PARTITION ds_999 FOR VALUES IN (999)").unwrap();
+
+    // The ATTACH's event-trigger auto-sync (or this explicit sync) heals the
+    // drift: dimv_ds_999 must now be PARTITIONED ('p').
+    let sync = Spi::get_one::<String>("SELECT reflex_sync_partitions('dimv')").unwrap().unwrap();
+    assert!(!sync.starts_with("ERROR"), "sync returned: {sync}");
+    let after = Spi::get_one::<String>(
+        "SELECT relkind::text FROM pg_class WHERE relname = 'dimv_ds_999'",
+    ).unwrap().unwrap();
+    assert_eq!(after, "p", "healed child must be partitioned, not a plain leaf");
+
+    // Data correct after reconcile (both branches present).
+    let _ = Spi::get_one::<String>("SELECT reflex_flush_partition_source('public.ds')").unwrap();
+    let cnt = Spi::get_one::<i64>("SELECT count(*)::int8 FROM dimv").unwrap().unwrap_or(-1);
+    assert_eq!(cnt, 2, "both source rows present after heal + reconcile");
+    let qty999 = Spi::get_one::<i64>("SELECT qty::int8 FROM dimv WHERE dem_plan_id = 999").unwrap().unwrap_or(-1);
+    assert_eq!(qty999, 3, "healed branch row present with correct value");
+}
+
+/// Fix #1: attaching a pre-populated partition to a source must auto-sync the
+/// IMV partition's DATA at COMMIT — no manual reflex_flush_partitions() call.
+#[pg_test]
+fn attach_with_data_auto_syncs_at_commit() {
+    Spi::run("CREATE TABLE auto_s (region text, amount int) PARTITION BY LIST (region)").unwrap();
+    Spi::run("CREATE TABLE auto_s_us PARTITION OF auto_s FOR VALUES IN ('us')").unwrap();
+    Spi::run("INSERT INTO auto_s VALUES ('us', 10)").unwrap();
+    Spi::run(
+        "SELECT create_reflex_ivm('auto_imv', \
+         'SELECT region, sum(amount) AS total FROM auto_s GROUP BY region', \
+         'region', 'UNLOGGED', 'IMMEDIATE', NULL, ARRAY['region'])",
+    ).unwrap();
+
+    // Attach a NEW partition that ALREADY holds data. No manual flush below.
+    Spi::run("CREATE TABLE auto_s_eu (region text, amount int)").unwrap();
+    Spi::run("INSERT INTO auto_s_eu VALUES ('eu', 100), ('eu', 200)").unwrap();
+    Spi::run("ALTER TABLE auto_s ATTACH PARTITION auto_s_eu FOR VALUES IN ('eu')").unwrap();
+
+    // The deferred constraint trigger fires at the COMMIT of the statement(s)
+    // above. Inside a single #[pg_test] transaction, force the deferred trigger
+    // to run by issuing SET CONSTRAINTS ALL IMMEDIATE before asserting.
+    Spi::run("SET CONSTRAINTS ALL IMMEDIATE").unwrap();
+
+    let eu = Spi::get_one::<i64>("SELECT total FROM auto_imv WHERE region = 'eu'")
+        .unwrap().unwrap_or(-1);
+    assert_eq!(eu, 300, "ATTACH-with-data must auto-sync the IMV partition's data");
+
+    let pending = Spi::get_one::<i64>(
+        "SELECT count(*) FROM public.__reflex_partition_pending WHERE source_root LIKE '%auto_s%'",
+    ).unwrap().unwrap_or(-1);
+    assert_eq!(pending, 0, "auto-drain must clear the pending row");
+}

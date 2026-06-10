@@ -1793,3 +1793,62 @@ fn pg_part_range_passthrough_dispatch_correct() {
     Spi::run("SELECT reflex_flush_deferred('rgp_src')").expect("flush");
     assert_imv_correct("rgpv", sql);
 }
+
+/// Fix #2: a reconcile failure on one pending root must NOT prevent a healthy
+/// root from being reconciled and drained. Before the fix, the whole flush
+/// aborts on the first failing root and drains nothing.
+#[pg_test]
+fn flush_isolates_failing_root_from_healthy_root() {
+    // Healthy partitioned source + IMV.
+    Spi::run("CREATE TABLE iso_ok (region text, amount int) PARTITION BY LIST (region)").unwrap();
+    Spi::run("CREATE TABLE iso_ok_us PARTITION OF iso_ok FOR VALUES IN ('us')").unwrap();
+    Spi::run("INSERT INTO iso_ok VALUES ('us', 10)").unwrap();
+    Spi::run(
+        "SELECT create_reflex_ivm('iso_ok_imv', \
+         'SELECT region, sum(amount) AS total FROM iso_ok GROUP BY region', \
+         'region', 'UNLOGGED', 'IMMEDIATE', NULL, ARRAY['region'])",
+    ).unwrap();
+
+    // Broken partitioned source + IMV: we corrupt the IMV after creation by
+    // dropping a required target partition child, so reconcile of this root
+    // throws. (Independent of Fix #3 so this test stays valid afterwards.)
+    Spi::run("CREATE TABLE iso_bad (region text, amount int) PARTITION BY LIST (region)").unwrap();
+    Spi::run("CREATE TABLE iso_bad_us PARTITION OF iso_bad FOR VALUES IN ('us')").unwrap();
+    Spi::run("INSERT INTO iso_bad VALUES ('us', 1)").unwrap();
+    Spi::run(
+        "SELECT create_reflex_ivm('iso_bad_imv', \
+         'SELECT region, sum(amount) AS total FROM iso_bad GROUP BY region', \
+         'region', 'UNLOGGED', 'IMMEDIATE', NULL, ARRAY['region'])",
+    ).unwrap();
+    // Corrupt: drop the IMV's target table so reconcile errors hard.
+    Spi::run("DROP TABLE public.iso_bad_imv CASCADE").unwrap();
+
+    // Attach NEW data partitions to BOTH sources (event trigger enqueues both,
+    // creates empty structure, no data fill yet).
+    Spi::run("CREATE TABLE iso_ok_eu (region text, amount int)").unwrap();
+    Spi::run("INSERT INTO iso_ok_eu VALUES ('eu', 100)").unwrap();
+    Spi::run("ALTER TABLE iso_ok ATTACH PARTITION iso_ok_eu FOR VALUES IN ('eu')").unwrap();
+
+    Spi::run("CREATE TABLE iso_bad_eu (region text, amount int)").unwrap();
+    Spi::run("INSERT INTO iso_bad_eu VALUES ('eu', 200)").unwrap();
+    Spi::run("ALTER TABLE iso_bad ATTACH PARTITION iso_bad_eu FOR VALUES IN ('eu')").unwrap();
+
+    // Drain ALL pending roots. Must not raise even though iso_bad fails.
+    let _ = Spi::get_one::<String>("SELECT reflex_flush_partitions()").unwrap();
+
+    // Healthy root reconciled + drained.
+    let ok_eu = Spi::get_one::<i64>("SELECT total FROM iso_ok_imv WHERE region = 'eu'")
+        .unwrap()
+        .unwrap_or(-1);
+    assert_eq!(ok_eu, 100, "healthy root must be reconciled despite a sibling failing");
+    let ok_pending = Spi::get_one::<i64>(
+        "SELECT count(*) FROM public.__reflex_partition_pending WHERE source_root LIKE '%iso_ok%'",
+    ).unwrap().unwrap_or(-1);
+    assert_eq!(ok_pending, 0, "healthy root must be drained from the pending queue");
+
+    // Broken root left pending for retry (NOT silently dropped).
+    let bad_pending = Spi::get_one::<i64>(
+        "SELECT count(*) FROM public.__reflex_partition_pending WHERE source_root LIKE '%iso_bad%'",
+    ).unwrap().unwrap_or(-1);
+    assert_eq!(bad_pending, 1, "failing root must remain pending, not block others");
+}

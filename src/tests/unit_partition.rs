@@ -463,3 +463,18 @@ fn test_ancestor_at_depth_picks_correct_level() {
         Some("p_172_2025_03")
     );
 }
+
+#[test]
+fn shape_mismatch_detects_leaf_where_partitioned_expected() {
+    // Node expects partitioned (sub_strategy Some), existing child is plain 'r'.
+    assert!(partition_shape_mismatch(true, Some('r')));
+    // Node expects partitioned, existing child already partitioned 'p' -> ok.
+    assert!(!partition_shape_mismatch(true, Some('p')));
+    // Node expects leaf, existing child is partitioned 'p' -> mismatch.
+    assert!(partition_shape_mismatch(false, Some('p')));
+    // Node expects leaf, existing child is plain 'r' -> ok.
+    assert!(!partition_shape_mismatch(false, Some('r')));
+    // No existing child (None) -> never a mismatch (nothing to heal).
+    assert!(!partition_shape_mismatch(true, None));
+    assert!(!partition_shape_mismatch(false, None));
+}

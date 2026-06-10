@@ -486,6 +486,28 @@ pub(crate) fn build_partition_node_ddl_pair(
     (int_ddl, tgt_ddl)
 }
 
+/// True when an existing IMV partition child's actual shape disagrees with the
+/// shape its mirror node requires, i.e. it must be dropped and recreated.
+///
+/// `expect_partitioned` is `node.sub_strategy.is_some()` (post-truncation).
+/// `actual_relkind` is the existing child's `pg_class.relkind` (`Some('p')` for
+/// a partitioned table, `Some('r')`/etc. for a leaf, `None` when no such child
+/// exists yet — nothing to heal). `CREATE TABLE IF NOT EXISTS … PARTITION OF`
+/// cannot convert one shape into the other in place, so a mismatch is fatal to
+/// reconcile until the child is rebuilt.
+pub(crate) fn partition_shape_mismatch(
+    expect_partitioned: bool,
+    actual_relkind: Option<char>,
+) -> bool {
+    match actual_relkind {
+        None => false,
+        Some(rk) => {
+            let actual_partitioned = rk == 'p';
+            actual_partitioned != expect_partitioned
+        }
+    }
+}
+
 /// Build the canonical swap-table name for one source-child of a view.
 /// `kind` is "int" (intermediate) or "tgt" (target).
 pub(crate) fn swap_partition_name(view_name: &str, kind: &str, source_child_bare: &str) -> String {
@@ -1063,22 +1085,90 @@ pub(crate) fn reflex_sync_partitions_impl(view_name: &str, drop_orphans: bool) -
             }
         }
 
+        // Fix #3: heal shape drift. An IMV child created as a leaf whose source
+        // counterpart later became partitioned (or vice versa) was previously skipped
+        // by `CREATE TABLE IF NOT EXISTS`, leaving a plain table where reconcile
+        // expects a partitioned one ("… is not partitioned"). Drop such mismatched
+        // children top-down so the create loop below rebuilds them with the right
+        // shape. Nodes are depth-ordered, so a dropped internal node's CASCADE removes
+        // stale descendants that the create loop then re-creates.
+        {
+            let (schema_opt, _) = split_qualified_name(view_name);
+            let schema = schema_opt.unwrap_or("public");
+            for node in &nodes {
+                let expect_partitioned = node.sub_strategy.is_some();
+                for child_bare in [
+                    intermediate_child_name(view_name, &node.bare_name),
+                    target_child_name(view_name, &node.bare_name),
+                ] {
+                    let relkind: Option<char> = client
+                        .select(
+                            "SELECT relkind::text AS rk FROM pg_class c \
+                             JOIN pg_namespace n ON n.oid = c.relnamespace \
+                             WHERE n.nspname = $1 AND c.relname = $2",
+                            Some(1),
+                            &[
+                                unsafe {
+                                    DatumWithOid::new(
+                                        schema.to_string(),
+                                        PgBuiltInOids::TEXTOID.oid().value(),
+                                    )
+                                },
+                                unsafe {
+                                    DatumWithOid::new(
+                                        child_bare.clone(),
+                                        PgBuiltInOids::TEXTOID.oid().value(),
+                                    )
+                                },
+                            ],
+                        )
+                        .ok()
+                        .and_then(|mut it| it.next())
+                        .and_then(|r| r.get_by_name::<&str, _>("rk").ok().flatten())
+                        .and_then(|s| s.chars().next());
+
+                    if partition_shape_mismatch(expect_partitioned, relkind) {
+                        let q = format!(
+                            "DROP TABLE IF EXISTS \"{}\".\"{}\" CASCADE",
+                            schema, child_bare
+                        );
+                        client.update(&q, None, &[]).map_err(|e| {
+                            format!("sync: heal drop of mismatched child {}: {}", child_bare, e)
+                        })?;
+                        pgrx::notice!(
+                            "pg_reflex: rebuilt partition child '{}' (shape drift: expected {})",
+                            child_bare,
+                            if expect_partitioned {
+                                "partitioned"
+                            } else {
+                                "leaf"
+                            }
+                        );
+                    }
+                }
+            }
+        }
+
         for node in &nodes {
             let int_name = intermediate_child_name(view_name, &node.bare_name);
             let tgt_name = target_child_name(view_name, &node.bare_name);
             let (int_ddl, tgt_ddl) =
                 build_partition_node_ddl_pair(view_name, node, anchor_root_bare, unlogged);
-            if has_intermediate && !int_have.contains(&int_name) {
+            if has_intermediate {
                 client
                     .update(&int_ddl, None, &[])
                     .map_err(|e| format!("sync: create intermediate node: {}", e))?;
-                out.added_intermediate += 1;
+                if !int_have.contains(&int_name) {
+                    out.added_intermediate += 1;
+                }
             }
-            if !tgt_have.contains(&tgt_name) {
+            {
                 client
                     .update(&tgt_ddl, None, &[])
                     .map_err(|e| format!("sync: create target node: {}", e))?;
-                out.added_target += 1;
+                if !tgt_have.contains(&tgt_name) {
+                    out.added_target += 1;
+                }
             }
         }
 
@@ -1894,6 +1984,11 @@ pub(crate) fn reflex_flush_partitions_impl(only: Option<&str>) -> String {
             let actions = classify_partition_diff(&snapshot, &current);
             let live_tree = list_partition_tree(client, root);
 
+            // Collect all mutating statements for this root to run in one atomically-isolated
+            // subtransaction. This ensures one failing root doesn't abort the whole flush or block
+            // other roots from draining.
+            let mut root_stmts: Vec<String> = Vec::new();
+
             for (imv, depth_opt, _deps) in &imvs {
                 let mirror_depth = depth_opt
                     .map(|d| d as usize)
@@ -1938,26 +2033,21 @@ pub(crate) fn reflex_flush_partitions_impl(only: Option<&str>) -> String {
                 for node in &to_drop {
                     let tgt = target_child_name(imv, node);
                     let int = intermediate_child_name(imv, node);
-                    let _ = client.update(
-                        &format!("DROP TABLE IF EXISTS \"{}\".\"{}\" CASCADE", schema, tgt),
-                        None,
-                        &[],
-                    );
-                    let _ = client.update(
-                        &format!("DROP TABLE IF EXISTS \"{}\".\"{}\" CASCADE", schema, int),
-                        None,
-                        &[],
-                    );
+                    root_stmts.push(format!(
+                        "DROP TABLE IF EXISTS \"{}\".\"{}\" CASCADE",
+                        schema, tgt
+                    ));
+                    root_stmts.push(format!(
+                        "DROP TABLE IF EXISTS \"{}\".\"{}\" CASCADE",
+                        schema, int
+                    ));
                 }
                 for node in &to_swap {
-                    let q = format!(
-                        "SELECT public.reflex_reconcile_partition({}, '', {})",
+                    root_stmts.push(format!(
+                        "PERFORM public.reflex_reconcile_partition({}, '', {})",
                         sql_literal_text(imv),
                         sql_literal_text(node)
-                    );
-                    client
-                        .update(&q, None, &[])
-                        .map_err(|e| format!("flush reconcile {} {}: {}", imv, node, e))?;
+                    ));
                 }
                 summary.push(format!("{}: {} change(s)", imv, actions.len()));
             }
@@ -1983,32 +2073,51 @@ pub(crate) fn reflex_flush_partitions_impl(only: Option<&str>) -> String {
                 })
                 .collect();
             for imv in &unpartitioned_imvs {
-                let q = format!("SELECT public.reflex_reconcile({})", sql_literal_text(imv));
-                client
-                    .update(&q, None, &[])
-                    .map_err(|e| format!("flush full-reconcile {}: {}", imv, e))?;
+                root_stmts.push(format!(
+                    "PERFORM public.reflex_reconcile({})",
+                    sql_literal_text(imv)
+                ));
                 summary.push(format!("{}: full reconcile (unpartitioned)", imv));
             }
 
-            refresh_source_snapshot(client, root);
-        }
+            // Append the snapshot refresh and pending drain to the same root's statement list
+            // so they commit/rollback atomically with the reconciles.
+            root_stmts.push(format!(
+                "PERFORM public.__reflex_refresh_partition_snapshot({})",
+                sql_literal_text(root)
+            ));
+            root_stmts.push(format!(
+                "DELETE FROM public.__reflex_partition_pending WHERE source_root = {}",
+                sql_literal_text(root)
+            ));
 
-        // Drain only the roots this flush actually processed, with a scoped
-        // DELETE (RowExclusive). A blanket `TRUNCATE` here would take an
-        // AccessExclusiveLock on the globally-shared pending table; two
-        // concurrent flushes — each already holding RowExclusive on it from the
-        // event trigger's INSERT — would both try to upgrade to AccessExclusive
-        // and deadlock (confirmed: deadlock on __reflex_partition_pending). The
-        // blanket TRUNCATE would also silently wipe pending rows a concurrent
-        // backend enqueued after `roots` was scanned but before this point,
-        // losing that flush. `roots` is `[r]` in the `Some(r)` case, so a single
-        // scoped delete per root is correct for both entry points.
-        for root in &roots {
-            let _ = client.update(
-                "DELETE FROM public.__reflex_partition_pending WHERE source_root = $1",
-                None,
-                &[unsafe { DatumWithOid::new(root.to_string(), pgrx::pg_sys::TEXTOID) }],
+            // Emit the per-root DO block. The EXCEPTION branch leaves the snapshot + pending row
+            // intact (rolled back) so the root retries on the next flush, and logs a WARNING
+            // instead of aborting the batch. The pending drain is a scoped DELETE (RowExclusive) per root,
+            // never a blanket TRUNCATE: two concurrent flushes each holding RowExclusive on the
+            // globally-shared __reflex_partition_pending table (from event trigger INSERTs) would
+            // both try to upgrade to AccessExclusive and deadlock. Also, TRUNCATE would silently
+            // wipe pending rows a concurrent backend enqueued after `roots` was scanned but before
+            // this point, losing that flush. The per-root DELETE is correct for both entry points.
+            let root_esc = root.replace('\'', "''");
+            let body = root_stmts
+                .into_iter()
+                .map(|s| format!("{};", s))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let do_block = format!(
+                "DO $_reflex_part_sp$ \
+                 BEGIN \
+                   \n{body}\n \
+                 EXCEPTION WHEN OTHERS THEN \
+                   RAISE WARNING 'pg_reflex: partition flush for root % failed: % (SQLSTATE %) — left pending for retry', \
+                     '{root_esc}', SQLERRM, SQLSTATE; \
+                 END \
+                 $_reflex_part_sp$"
             );
+            client
+                .update(&do_block, None, &[])
+                .map_err(|e| format!("flush: DO block dispatch for root {} failed: {}", root, e))?;
         }
 
         Ok(if summary.is_empty() {
