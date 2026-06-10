@@ -342,6 +342,96 @@ fn test_min_max_recompute_sql_handles_join_aliases() {
     );
 }
 
+/// Regression (2026-06-10, db_dev sop_incoming_stock_baseline_view): an
+/// aggregate IMV with a LEFT JOIN secondary used to build its "affected
+/// groups" by re-aggregating the ENTIRE base with the secondary swapped for
+/// its transition table. Because the secondary is OUTER-joined, that join
+/// preserves every primary row → the affected set is ALL groups → the
+/// recompute re-aggregates the whole base TWICE. A 2-row secondary change
+/// took 18 minutes.
+///
+/// When `source_join_keys` carries the secondary's join-key→group-column
+/// mapping, the recompute must instead be SCOPED to the changed join keys,
+/// drawn from OLD∪NEW transition (a secondary key change moves a group: the
+/// old key loses its contribution, the new key gains one). That predicate is
+/// on GROUP BY columns, so Postgres pushes it below the aggregation into the
+/// indexed base scan (18 min → ms).
+#[test]
+fn test_outer_join_secondary_aggregate_scopes_recompute_by_join_keys() {
+    let mut source_join_keys = std::collections::HashMap::new();
+    source_join_keys.insert(
+        "caav".to_string(),
+        vec![
+            ("product_id".to_string(), "product_id".to_string()),
+            ("location_id".to_string(), "location_id".to_string()),
+        ],
+    );
+    let plan = AggregationPlan {
+        group_by_columns: vec!["s.product_id".to_string(), "s.location_id".to_string()],
+        intermediate_columns: vec![IntermediateColumn {
+            name: "__sum_qty".to_string(),
+            pg_type: "BIGINT".to_string(),
+            source_aggregate: "SUM".to_string(),
+            source_arg: "s.qty".to_string(),
+            topk_k: None,
+        }],
+        end_query_mappings: vec![],
+        has_distinct: false,
+        needs_ivm_count: true,
+        distinct_columns: vec![],
+        is_passthrough: false,
+        passthrough_columns: vec![],
+        passthrough_key_mappings: std::collections::HashMap::new(),
+        having_clause: None,
+        not_null_columns: std::collections::HashSet::new(),
+        group_by_aliases: std::collections::HashMap::new(),
+        output_column_order: vec![],
+        imv_relevant_columns: std::collections::HashMap::new(),
+        imv_relevant_where: std::collections::HashMap::new(),
+        source_join_keys,
+        partition_columns: Vec::new(),
+        partition_strategy: String::new(),
+        anchor_source: String::new(),
+        partition_join_paths: std::collections::HashMap::new(),
+    };
+    let agg_json = serde_json::to_string(&plan).unwrap();
+    let base_q = "SELECT s.product_id AS \"product_id\", s.location_id AS \"location_id\", \
+                  SUM(s.qty) AS \"__sum_qty\", COUNT(*) AS __ivm_count \
+                  FROM sales s \
+                  LEFT JOIN caav ON caav.product_id = s.product_id AND caav.location_id = s.location_id \
+                  GROUP BY s.product_id, s.location_id";
+    let end_q = "SELECT \"product_id\", \"location_id\", \"__sum_qty\" AS qty \
+                 FROM \"__reflex_intermediate_v\" WHERE __ivm_count > 0";
+    let sql = reflex_build_delta_sql(
+        "v",
+        "caav",
+        "UPDATE",
+        base_q,
+        end_q,
+        Some(agg_json.as_str()),
+        base_q,
+    );
+
+    // Changed keys must be drawn from BOTH transition sides — a secondary key
+    // change moves a group (old key loses, new key gains).
+    assert!(
+        sql.contains("__reflex_old_caav") && sql.contains("__reflex_new_caav"),
+        "scoped recompute must read changed join keys from OLD∪NEW transition: {sql}"
+    );
+    // The scoped path replaces the full-base "affected groups" table with a
+    // join-key membership predicate. The presence of the affected table means
+    // the broad re-aggregation path ran (the bug).
+    assert!(
+        !sql.contains("__reflex_affected_v"),
+        "scoped path must use a join-key membership predicate, not the full-base affected table: {sql}"
+    );
+    // The recompute into the intermediate must be scoped by the join keys.
+    assert!(
+        sql.contains("(\"product_id\", \"location_id\") IN (SELECT"),
+        "intermediate recompute must be scoped by a (product_id, location_id) membership predicate: {sql}"
+    );
+}
+
 #[test]
 fn test_no_min_max_recompute_for_sum_only() {
     let plan = simple_plan();

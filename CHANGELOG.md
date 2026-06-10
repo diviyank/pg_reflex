@@ -2,6 +2,55 @@
 
 ## [Unreleased]
 
+## [1.10.1] - 2026-06-10
+
+Performance fix for the incremental maintenance of aggregate IMVs that
+`LEFT JOIN` a secondary table. A tiny change to the secondary re-aggregated
+the ENTIRE base instead of the few affected groups, so propagating a
+single-row source update through such an IMV took minutes — observed as 18
+minutes for a 2-row delta on a 9-source view. No catalog/schema or
+function-signature changes; the fix is in the Rust trigger-time SQL generator,
+recompiled into the module: `ALTER EXTENSION pg_reflex UPDATE TO '1.10.1';`.
+
+### Fixed
+
+- **Aggregate `LEFT JOIN`-secondary updates re-aggregated the whole base.**
+  `outer_join_secondary_stmts` built its "affected groups" set by re-running
+  the full base aggregation with the secondary swapped for its transition
+  table. Because the secondary is outer-joined, the join preserves every
+  primary row, so the affected set was *every* group and the recompute then
+  re-scanned the entire base a second time. When the secondary carries a
+  `source_join_keys` mapping (its join keys map to GROUP BY columns and cover a
+  unique key), the maintenance is now scoped by `(group_cols) IN (changed keys
+  from OLD∪NEW transition)` — a predicate on GROUP BY columns that the planner
+  pushes below the aggregation into the indexed base scan. Falls back to the
+  prior broad recompute when no mapping is available, so no shape regresses.
+  (18 min → ~50 ms on the `sop_incoming_stock_baseline_view` shape.)
+
+### Tests
+
+- New `test_outer_join_secondary_aggregate_scopes_recompute_by_join_keys`
+  pins the scoped maintenance SQL. The full `pg_test` oracle suite — including
+  the both-sources-mutated double-count guard and the secondary keyed
+  LEFT-JOIN all-ops oracles — stays green.
+
+### Internal (no behaviour change)
+
+- The weak-stub archive that lets the test binaries link against postgres
+  backend globals is now also built on macOS and force-loaded
+  (`+whole-archive`) into the `cfg(test)` binary, so `cargo test` and
+  `cargo pgrx test` run locally on macOS (previously aborted at load with
+  `dyld: symbol not found in flat namespace '_CacheMemoryContext'`). The
+  cdylib is unaffected — the stubs stay `cfg(test)`-scoped and never reach the
+  module postgres dlopens.
+
+### Migration
+
+- `ALTER EXTENSION pg_reflex UPDATE TO '1.10.1';` — no-op marker
+  (`sql/pg_reflex--1.10.0--1.10.1.sql`). The fix is pure Rust codegen in the
+  recompiled module; replace the `.so` first. Existing IMVs continue operating
+  without intervention.
+
 ## [1.10.0] - 2026-06-10
 
 Fixes the long-standing hole where `ALTER TABLE source ATTACH PARTITION

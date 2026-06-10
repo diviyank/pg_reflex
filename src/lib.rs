@@ -15,6 +15,21 @@ use pgrx::prelude::*;
 #[link(name = "pg_reflex_pg_stubs", kind = "static")]
 unsafe extern "C" {}
 
+// macOS: same stub archive, but force-loaded. Under -Wl,-undefined,
+// dynamic_lookup the linker would otherwise defer the (undefined) data
+// globals to runtime flat-namespace lookup and never pull the weak
+// definitions from the archive — so the standalone test binary aborts at
+// load with `symbol not found in flat namespace '_CacheMemoryContext'`.
+// `+whole-archive` includes every stub object unconditionally; cfg(test)
+// keeps it out of the cdylib postgres dlopens.
+#[cfg(all(test, target_os = "macos"))]
+#[link(
+    name = "pg_reflex_pg_stubs",
+    kind = "static",
+    modifiers = "+whole-archive"
+)]
+unsafe extern "C" {}
+
 mod aggregation;
 mod audit;
 mod create_ivm;

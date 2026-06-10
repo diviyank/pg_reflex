@@ -4,6 +4,22 @@ The full changelog tracks every release. The latest version's headlines are on t
 
 For each version below, see [`CHANGELOG.md`](https://github.com/diviyank/pg_reflex/blob/main/CHANGELOG.md) on GitHub for the canonical text.
 
+## [1.10.1] — 2026-06-10
+
+Performance fix for the incremental maintenance of aggregate IMVs that `LEFT JOIN` a secondary table: a tiny change to the secondary re-aggregated the entire base instead of the few affected groups, so a single-row source update propagating through such an IMV took minutes (18 min for a 2-row delta on a 9-source view). Pure Rust codegen fix, recompiled into the module: `ALTER EXTENSION pg_reflex UPDATE TO '1.10.1';`.
+
+**Fixed**
+
+- Aggregate `LEFT JOIN`-secondary updates re-aggregated the whole base — `outer_join_secondary_stmts` built its affected-groups set by re-running the full aggregation with the secondary swapped for its transition table, but the outer join preserves every primary row so the affected set was *all* groups (then recomputed a second time). With a `source_join_keys` mapping the recompute is now scoped by `(group_cols) IN (changed keys from OLD∪NEW)`, pushed below the aggregation into the indexed base scan (18 min → ~50 ms). Falls back to the broad recompute when no mapping is available.
+
+**Internal**
+
+- The weak-stub archive is now built and force-loaded (`+whole-archive`) on macOS too, so `cargo test` / `cargo pgrx test` run locally on mac (previously aborted with `dyld: … '_CacheMemoryContext'`). The cdylib is unaffected (`cfg(test)`-scoped).
+
+**Migration**
+
+- [`sql/pg_reflex--1.10.0--1.10.1.sql`](https://github.com/diviyank/pg_reflex/blob/main/sql/pg_reflex--1.10.0--1.10.1.sql) — no-op marker; the fix ships in the recompiled module. Replace the `.so`, then `ALTER EXTENSION pg_reflex UPDATE TO '1.10.1';`.
+
 ## [1.10.0] — 2026-06-10
 
 Fixes the hole where `ALTER TABLE source ATTACH PARTITION child_with_data` created the IMV partition but never synced its data (it stayed empty): ATTACH re-parents rows without firing row triggers, and nothing drained the partition pending queue automatically. `ALTER EXTENSION pg_reflex UPDATE TO '1.10.0';` after replacing the module.

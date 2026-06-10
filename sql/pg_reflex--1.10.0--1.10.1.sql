@@ -1,0 +1,38 @@
+-- Migration: pg_reflex 1.10.0 → 1.10.1
+--
+-- Run via: ALTER EXTENSION pg_reflex UPDATE TO '1.10.1';
+--
+-- 1.10.1 is a performance fix for the incremental maintenance of aggregate
+-- IMVs that LEFT JOIN a secondary table. There are NO catalog schema changes,
+-- NO function signature changes, and NO SPI additions — the fix is entirely in
+-- the Rust trigger-time SQL generator, which is recompiled into the module.
+-- Existing IMVs continue to operate without intervention.
+--
+-- What was wrong (all in-process, no migration DDL):
+--
+--   For an aggregate IMV with a LEFT JOIN secondary (e.g.
+--   `... GROUP BY ... LEFT JOIN current_assortment_activity_view caav ON ...`),
+--   `outer_join_secondary_stmts` built its "affected groups" set by re-running
+--   the FULL base aggregation with the secondary swapped for its transition
+--   table. Because the secondary is OUTER-joined, that join preserves every
+--   primary row, so the affected set was EVERY group — and the recompute then
+--   re-scanned and re-aggregated the entire base a second time. A 2-row change
+--   to the secondary therefore cost a full rebuild (observed: 18 minutes for a
+--   single-row source update propagating through a 9-source view).
+--
+--   The fix: when the secondary carries a `source_join_keys` mapping (its join
+--   keys map to GROUP BY columns AND cover a unique key of the secondary), the
+--   maintenance is scoped by `(group_cols) IN (changed keys from OLD∪NEW
+--   transition)` — a predicate on GROUP BY columns that PostgreSQL pushes below
+--   the aggregation into the indexed base scan. It falls back to the prior
+--   broad recompute when no such mapping is available, so no shape regresses.
+--
+-- Migration steps:
+--
+--   No DDL is required. This file exists purely to register the
+--   1.10.0 → 1.10.1 upgrade path with PostgreSQL's extension machinery. Replace
+--   the module (.so) before running `ALTER EXTENSION pg_reflex UPDATE TO
+--   '1.10.1';` so the corrected SQL generator is loaded.
+
+-- No-op marker: ALTER EXTENSION needs a non-empty migration file.
+SELECT 1 WHERE FALSE;

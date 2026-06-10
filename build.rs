@@ -22,13 +22,18 @@ fn main() {
     // rebuilds the .so without `cfg(test)` active, so the cdylib stays
     // clean and postgres resolves all server symbols at dlopen.
     //
-    // macOS handles the same need via -Wl,-undefined,dynamic_lookup in
-    // .cargo/config.toml, so no archive is needed there.
-    #[cfg(target_os = "linux")]
+    // macOS also needs the archive for `cargo test`: -Wl,-undefined,
+    // dynamic_lookup (.cargo/config.toml) lets the *cdylib* resolve server
+    // symbols at runtime from the loaded backend, but a standalone test
+    // binary has no backend, so data globals (CacheMemoryContext, ...) fail
+    // flat-namespace lookup at load. The cfg(test) #[link] in src/lib.rs
+    // force-loads (+whole-archive) the weak stubs into the test binary only;
+    // the cdylib stays clean.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     emit_postgres_stubs_archive();
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn emit_postgres_stubs_archive() {
     use std::path::PathBuf;
     use std::process::Command;
@@ -65,7 +70,7 @@ fn emit_postgres_stubs_archive() {
     println!("cargo:rerun-if-changed=build.rs");
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 const PG_STUBS_C: &str = r#"
 /* Weak stubs for postgres server symbols used by pgrx in test binaries.
  * These are never called in #[test] paths — they exist only to satisfy the linker.

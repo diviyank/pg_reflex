@@ -598,6 +598,67 @@ pub(crate) fn outer_join_secondary_stmts(
         }
     }
 
+    // Scoped recompute for an aggregate outer-join secondary that carries a
+    // join-key→group-column mapping (`source_join_keys`). The broad path below
+    // builds its "affected groups" by re-aggregating the ENTIRE base with the
+    // secondary swapped for its transition table — but the LEFT JOIN preserves
+    // every primary row, so the affected set is ALL groups and a tiny secondary
+    // delta costs a full rebuild (18 min on db_dev sop_incoming_stock_baseline).
+    //
+    // `source_join_keys` is populated only when every join equality maps to a
+    // GROUP BY column AND the source columns cover a unique key of the secondary
+    // (see build_source_join_keys). That is exactly the condition under which we
+    // can scope by `(group_cols) IN (changed source keys from OLD∪NEW)`: a
+    // predicate on GROUP BY columns the planner pushes below the aggregation
+    // into the indexed base scan. OLD∪NEW because a secondary key change moves a
+    // group (old key loses its contribution, new key gains one); a non-key
+    // column change keeps the same join key, so both the old and new (possibly
+    // migrated) group rows share it and are recomputed together.
+    if let Some(join_keys) = plan.source_join_keys.get(source_table) {
+        if !join_keys.is_empty() {
+            let interm_cols: Vec<String> = join_keys
+                .iter()
+                .map(|(interm, _)| format!("\"{}\"", interm))
+                .collect();
+            let alias_pairs = join_keys
+                .iter()
+                .map(|(interm, src)| format!("\"{}\" AS \"{}\"", src, interm))
+                .collect::<Vec<_>>()
+                .join(", ");
+
+            let needs_new = matches!(operation, "INSERT" | "INSERT_PROMOTED" | "UPDATE");
+            let needs_old = matches!(operation, "DELETE" | "DELETE_PROMOTED" | "UPDATE");
+            let mut sides: Vec<String> = Vec::new();
+            if needs_old {
+                sides.push(format!("SELECT {alias_pairs} FROM \"{old_tbl}\""));
+            }
+            if needs_new {
+                sides.push(format!("SELECT {alias_pairs} FROM \"{new_tbl}\""));
+            }
+            let changed_keys = format!("({}) __ck", sides.join(" UNION "));
+            let pred = build_membership_predicate(&interm_cols, &interm_cols, &changed_keys);
+
+            // Recompute exactly the affected groups into the intermediate, then
+            // resync the target — every statement scoped by the same membership
+            // predicate so the base scan prunes to the changed join keys.
+            stmts.push(format!("DELETE FROM {} WHERE {}", intermediate_tbl, pred));
+            stmts.push(format!(
+                "INSERT INTO {} SELECT * FROM ({}) AS __full WHERE {}",
+                intermediate_tbl, base_query, pred
+            ));
+            stmts.push(format!("DELETE FROM {} WHERE {}", qv, pred));
+            if end_query.is_empty() {
+                stmts.push(format!(
+                    "INSERT INTO {} SELECT * FROM ({}) AS __full WHERE {}",
+                    qv, base_query, pred
+                ));
+            } else {
+                stmts.push(format!("INSERT INTO {} {} AND {}", qv, end_query, pred));
+            }
+            return;
+        }
+    }
+
     if let Some(ref cols) = grp_cols {
         // Scope the recompute to the STABLE group columns — those NOT sourced
         // from the mutated secondary table. A secondary-derived group column
