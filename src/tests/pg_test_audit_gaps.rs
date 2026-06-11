@@ -262,9 +262,10 @@ fn audit_union_all_is_sublinear() {
 /// __reflex_uk_<imv>__base` fails with "Key (d)=(g0) is duplicated". Aggregates
 /// with the same GROUP BY key do NOT hit this (they are not passthrough, so they
 /// skip resolve_unique_columns). Desired: create succeeds and the IMV equals a
-/// fresh recompute. Fix target: src/create_ivm/mod.rs resolve_unique_columns /
-/// the DISTINCT ON decomposition must not place the output key on `__base`.
-#[ignore = "CONFIRMED bug: DISTINCT ON + declared output key crashes CREATE on __base unique index; see docs/audit/2026-06-ivm-audit.md §3 Phase 2B; Phase-2 RED"]
+/// fresh recompute. Root cause: `try_decompose_distinct_on` (decompose.rs) passed
+/// the outer view's declared `unique_columns` to the pre-dedup `__base` sub-IMV;
+/// `__base`'s natural key is the source PK, not the DISTINCT-ON output key. Fixed:
+/// `__base` auto-infers its source key (empty unique_columns).
 #[pg_test]
 fn audit_distinct_on_declared_output_key_should_not_crash_create() {
     Spi::run("CREATE TABLE dok (id INT PRIMARY KEY, m NUMERIC, d TEXT)").unwrap();

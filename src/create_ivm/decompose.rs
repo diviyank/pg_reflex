@@ -582,12 +582,17 @@ pub(crate) fn try_decompose_distinct_on(ctx: &DecomposeCtx) -> Option<&'static s
         base_sql.push_str(&format!(" WHERE {}", wc));
     }
 
-    // Create sub-IMV for the base data
+    // Create sub-IMV for the base data. The `__base` holds the PRE-dedup rows, so
+    // its natural key is the source's own key — NOT the outer view's declared
+    // `unique_columns`, which is the DISTINCT-ON output key (by definition NOT
+    // unique in `__base`; forcing it crashes the `__base` unique index at CREATE).
+    // Pass empty so `__base` auto-infers its source PK; the outer read-time VIEW
+    // (ROW_NUMBER = 1) provides the DISTINCT-ON dedup.
     let base_name = format!("{}__base", ctx.view_name);
     let result = create_reflex_ivm_impl(
         &base_name,
         &base_sql,
-        ctx.unique_columns_str,
+        "",
         false,
         ctx.storage_mode,
         ctx.refresh_mode,
