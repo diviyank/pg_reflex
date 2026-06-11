@@ -290,7 +290,35 @@ Per §4 gap #6 (rank 3), two production views that caused the worst field incide
 - **R2a (1.10.1) — `sop_incoming_stock_baseline_view` correctness**: Multi-source mutation (INSERT primary + UPDATE secondary in one deferred batch) on the aggregate + UNION ALL + LEFT-JOIN secondary shape. **PASS** — correctness oracle validates the fix.
 - **R2b (1.10.1) — plan-quality**: A 1-row primary delta over 20k vs 500k row bases. **FAIL** — CONFIRMED O(base) regression (small=74ms, big=1150ms; ratio 15.5x, threshold 25x). The 1.10.1 fix did NOT resolve the plan-quality issue at the distilled shape. Marked `#[ignore = "CONFIRMED plan-quality regression"]` (RED).
 
-**Verdict:** Correctness is proven at both 1.10.1 and 1.10.2 shapes (3 active tests). Plan-quality regression at sop_baseline is confirmed a 1.10.1-class bug that still scales with base; filed for the Phase 3 fix-pass. The real shapes now have CI coverage.
+**Verdict:** Correctness is proven at both 1.10.1 and 1.10.2 shapes (3 active tests). Plan-quality regression at sop_baseline is confirmed a 1.10.1-class bug that still scales with base; filed for the fix-pass. The real shapes now have CI coverage.
+
+#### B2 root cause — INVESTIGATED (systematic-debugging)
+
+Three hypotheses were tested and **refuted** before the real cause was pinned:
+1. ❌ *"`source_join_keys` isn't populated (qualified-vs-bare name bug)"* — disproven:
+   `(aggregations->'source_join_keys')` = `{"unit_pricing": [["product_id","product_id"]]}`,
+   correctly populated. The scoped secondary path IS reachable.
+2. ❌ *"missing index on the group key in the synthetic tables"* — disproven: adding
+   `INDEX (product_id, location_id, delivery_date)` left it O(base) (66ms→1232ms).
+3. ❌ *"the full-scan double-counts the unchanged branch's aggregate"* — disproven:
+   correctness holds even when a `pb` delta lands in a group that overlaps a `stb`
+   row, including with a `stb`-driven second aggregate. **B2 is correctness-neutral.**
+
+**Real cause:** the *primary-delta* aggregate recompute (`reflex_build_delta_sql`,
+INSERT path) rebuilds the scratch as
+`SELECT … FROM ( <changed branch over __reflex_new_pb> UNION ALL <UNCHANGED branch
+over the FULL stb> ) … GROUP BY …`. It correctly swaps the *changed* union operand
+for its transition table, but **scans every *unchanged* UNION-ALL operand in full**
+— that full scan of `stb` (and any other operands) is the O(base) cost. Correctness
+is preserved by the affected-group recompute, so this is purely plan quality.
+
+**Fix direction (deferred — deep):** restrict the unchanged operands to the
+affected groups (push `(group keys) IN (affected)` into each unchanged branch) so
+the recompute touches only delta-sized slices. This is aggregate-maintenance
+codegen surgery whose correctness invariant must be preserved exactly; it warrants
+a **focused standalone effort**, not a tail-of-session patch. Severity: **plan
+quality only** (operationally severe — the production "slow view" — but not wrong
+results). RED repro: `replay_sop_baseline_secondary_is_sublinear` (`#[ignore]`).
 
 ### Phase-1 bottom line
 
