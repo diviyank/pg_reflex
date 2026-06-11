@@ -120,6 +120,36 @@ Task 6 — DISTINCT ON winner demotion: PASS — correctness Proven.
 
 Task 7 — IN-subquery filter relevance: PASS — correctness Proven. Strengthened to be faithful to the 1.10.2 class: the IMV declares unique key `k`, and the out-of-filter row (k=1,p=2) collides on `k` with the in-filter row (k=1,p=1), so the keyed-delete path that silently removed in-filter rows in 1.10.2 is actually exercised. The fix covers `IN (SELECT …)`, not just `= (SELECT …)`.
 
+### Phase 2B M6 — New gate shapes (WindowFn, DistinctOn) — **first gate-found bug**
+
+Added `WindowFn` and `DistinctOn` as pairwise-gate `QueryShape`s (they were absent,
+so the gate could not catch *any* window/DISTINCT-ON maintenance bug). Pairwise
+case count 42 → 54.
+
+- **WindowFn:** gate GREEN across the pairwise space — `ROW_NUMBER() OVER
+  (PARTITION BY d ORDER BY id)` maintains correctly.
+- **DistinctOn:** gate GREEN on the auto-inferred-key path (the path Phase 1
+  proved correct). **BUT** the gate surfaced a real bug on the *declared-output-key*
+  path:
+
+**🐛 CONFIRMED BUG #1 (gate-found): DISTINCT ON + declared output key crashes CREATE.**
+A `SELECT DISTINCT ON (d) …` IMV that declares its natural output unique key `d`
+(via `unique_columns`) fails at CREATE:
+```
+INFO:  pg_reflex: using explicit unique key (d) for 'v__base'
+ERROR: could not create unique index "__reflex_uk_v__base"
+DETAIL:  Key (d)=(g0) is duplicated.
+```
+Root cause: pg_reflex classifies DISTINCT ON as **passthrough**, so
+`resolve_unique_columns` (`src/create_ivm/mod.rs:208`) applies the declared key to
+the `__base` decomposition table — but `__base` holds the **pre-dedup** rows where
+`d` repeats. Aggregates with the same `GROUP BY d` key are immune (not passthrough
+→ they skip that path). Declaring the *correct* output key crashes creation.
+Repro: `audit_distinct_on_declared_output_key_should_not_crash_create` (`#[ignore]`,
+RED). Fix target: don't put the output key on `__base` for dedup shapes. Severity:
+medium (create-time hard error, not silent corruption; workaround = omit the key
+and let pg_reflex auto-infer). Tracked in §4.
+
 ### Phase 2 M1 — Cross-source consistency guard
 
 The rank-1 Untested item. The guard (`src/trigger/deferred.rs:401-533`) engages
@@ -169,6 +199,7 @@ names its target phase. P2 = harden the combinatorial harness; P3 = field-replay
 | 4 | **Weak correctness coverage on window, DISTINCT ON, inner join, multi-source aggregate, ignore_sources** — point-value checks, no full-relation oracle except the single mutation each this audit just added (§3 Tasks 5–7 PASS, now active regressions). | correctness | §1 rows rated Weak; §3 Tasks 5–7 | **P2** — fuzz these shapes adversarially: multi-mutation, key-colliding, winner-change, mid-frame |
 | 5 | **Plan-quality probe is a wall-clock heuristic** — trustworthy enough for Phase 1 confirm/refute, but not a structural guarantee. | plan (tooling) | §3 "Known limitation" | **P2** — white-box assertion on the generated maintenance plan (`EXPLAIN` actual-rows at the base relation) |
 | 6 | **No regression derived from real production queries** — every field bug came from base-db views the suite never replayed. | both | §2 "found in field, not gate" meta-pattern | **P3** — distil base-db views (`current_assortment_activity_view`, `sop_incoming_stock_baseline_view`, …) into minimal oracle-checked regressions |
+| **B1** | **🐛 GATE-FOUND BUG: DISTINCT ON + declared output key crashes CREATE** — pg_reflex applies the declared passthrough key to the pre-dedup `__base`, failing its unique index. Declaring the correct output key for a DISTINCT ON IMV is a hard create error. | correctness (create-time) | §3 Phase 2B M6; RED `audit_distinct_on_declared_output_key_should_not_crash_create` | **fix** — `resolve_unique_columns` / DISTINCT ON decomposition must not key `__base` by the output key. Medium severity (hard error, not silent; workaround = auto-infer). |
 
 ### Phase-2 entry point (deduplicated axis list to brainstorm from)
 

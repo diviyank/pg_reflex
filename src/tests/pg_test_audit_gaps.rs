@@ -254,3 +254,28 @@ fn audit_union_all_is_sublinear() {
     eprintln!("AUDIT_M2 union-all small={}ms big={}ms", small, big);
     assert_sublinear("union-all", small, big, 25);
 }
+
+/// CONFIRMED BUG (gate finding, Phase 2B M6): a DISTINCT ON IMV that declares its
+/// natural output unique key (`d`) crashes at CREATE. pg_reflex classifies
+/// DISTINCT ON as passthrough and applies the declared key to the pre-dedup
+/// `__base` table — where `d` repeats — so `CREATE UNIQUE INDEX
+/// __reflex_uk_<imv>__base` fails with "Key (d)=(g0) is duplicated". Aggregates
+/// with the same GROUP BY key do NOT hit this (they are not passthrough, so they
+/// skip resolve_unique_columns). Desired: create succeeds and the IMV equals a
+/// fresh recompute. Fix target: src/create_ivm/mod.rs resolve_unique_columns /
+/// the DISTINCT ON decomposition must not place the output key on `__base`.
+#[ignore = "CONFIRMED bug: DISTINCT ON + declared output key crashes CREATE on __base unique index; see docs/audit/2026-06-ivm-audit.md §3 Phase 2B; Phase-2 RED"]
+#[pg_test]
+fn audit_distinct_on_declared_output_key_should_not_crash_create() {
+    Spi::run("CREATE TABLE dok (id INT PRIMARY KEY, m NUMERIC, d TEXT)").unwrap();
+    Spi::run("INSERT INTO dok SELECT i, i, 'g'||(i % 4) FROM generate_series(0,7) i").unwrap();
+    let sql = "SELECT DISTINCT ON (d) d, id, m FROM dok ORDER BY d, id";
+    let r = crate::create_reflex_ivm("dok_v", sql, Some("d"), None, None, None);
+    assert_eq!(
+        r, "CREATE REFLEX INCREMENTAL VIEW",
+        "DISTINCT ON IMV with declared output key d should be created, got: {}",
+        r
+    );
+    Spi::run("INSERT INTO dok VALUES (100, 5, 'g100')").unwrap();
+    assert_imv_correct("dok_v", sql);
+}

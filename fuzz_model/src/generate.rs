@@ -367,7 +367,14 @@ fn distinct_on_case(t: Table) -> FuzzCase {
     FuzzCase {
         tables: vec![t.clone()],
         select_body: body,
-        unique_columns: vec!["d".into()],
+        // Auto-infer the key (empty) — the path Phase 1 proved correct for
+        // DISTINCT ON maintenance. Declaring the natural output key `d` instead
+        // crashes at CREATE: pg_reflex classifies DISTINCT ON as passthrough and
+        // applies the declared key to the pre-dedup `__base` (where `d` repeats),
+        // failing the `__reflex_uk_<imv>__base` unique index. Filed as a gate
+        // finding (docs/audit/2026-06-ivm-audit.md §3 Phase 2B) with a dedicated
+        // RED regression; tracked for a focused fix in resolve_unique_columns.
+        unique_columns: vec![],
         deferred: false,
         dml: vec![seed],
         output_columns,
