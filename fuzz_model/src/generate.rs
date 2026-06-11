@@ -1,6 +1,6 @@
 use crate::axes::{
-    AggFn, Axes, PlannedCase, QueryShape, RefreshMode, SourceKind, SourceObject, SourceObjectKind,
-    UniqueCols,
+    AggFn, Axes, MutationSpread, PlannedCase, QueryShape, RefreshMode, SourceKind, SourceObject,
+    SourceObjectKind, UniqueCols,
 };
 use crate::model::*;
 use proptest::prelude::*;
@@ -1325,6 +1325,23 @@ pub fn plan_from_axes(a: &Axes, seq: u64) -> Option<PlannedCase> {
         // For Passthrough and Join shapes, the unique column is the PK.
         // The generator already sets it correctly, so no change needed here.
         // But to be explicit: if needed, update case.unique_columns based on the shape.
+    }
+
+    // Handle AllSources spread: add a second mutation txn that mutates both source tables.
+    // This exercises the cross-source consistency gate in deferred mode.
+    if a.spread == MutationSpread::AllSources {
+        // Multi-source shapes have exactly 2 tables.
+        if case.tables.len() == 2 {
+            let t0 = case.tables[0].clone();
+            let t1 = case.tables[1].clone();
+            // Build mutations for both tables and combine them in one transaction.
+            let mut cross_source_mutations = Vec::new();
+            cross_source_mutations.extend(build_mutation(&t0).statements);
+            cross_source_mutations.extend(build_mutation(&t1).statements);
+            case.dml.push(DmlTxn {
+                statements: cross_source_mutations,
+            });
+        }
     }
 
     let (source_objects, refresh_driven) = wrap_sources(a, &mut case, seq);

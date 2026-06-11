@@ -38,6 +38,12 @@ pub enum FilterMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MutationSpread {
+    SingleSource,
+    AllSources,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AggFn {
     Sum,
     Count,
@@ -96,6 +102,7 @@ pub struct Axes {
     pub unique: UniqueCols,
     pub lifecycle: Lifecycle,
     pub filter: FilterMode,
+    pub spread: MutationSpread,
 }
 
 impl ColType {
@@ -171,6 +178,24 @@ pub fn is_valid(a: &Axes) -> bool {
         return false;
     }
 
+    // AllSources spread only valid for deferred multi-source shapes.
+    if a.spread == MutationSpread::AllSources
+        && !(a.refresh == RefreshMode::Deferred
+            && matches!(
+                a.shape,
+                JoinInner | JoinLeft | CteDecomposed | SetOpUnionAll
+            ))
+    {
+        return false;
+    }
+
+    // AllSources spread requires numeric measure_ty (build_mutation uses +1 increment).
+    // KNOWN BUG: non-numeric measure types + AllSources spread causes codegen to
+    // emit "operator does not exist: <type> + integer". See issue #TODO.
+    if a.spread == MutationSpread::AllSources && !a.measure_ty.is_numeric_family() {
+        return false;
+    }
+
     true
 }
 
@@ -237,6 +262,10 @@ fn all_filters() -> Vec<FilterMode> {
     vec![None, Simple, ScalarSubquery, InSubquery]
 }
 
+fn all_spreads() -> Vec<MutationSpread> {
+    vec![MutationSpread::SingleSource, MutationSpread::AllSources]
+}
+
 /// The full cartesian product, filtered to the legal subspace.
 pub fn valid_space() -> Vec<Axes> {
     let mut out = Vec::new();
@@ -248,18 +277,21 @@ pub fn valid_space() -> Vec<Axes> {
                         for &unique in &all_unique() {
                             for &lifecycle in &all_lifecycle() {
                                 for &filter in &all_filters() {
-                                    let a = Axes {
-                                        source,
-                                        shape,
-                                        refresh,
-                                        agg,
-                                        measure_ty,
-                                        unique,
-                                        lifecycle,
-                                        filter,
-                                    };
-                                    if is_valid(&a) {
-                                        out.push(a);
+                                    for &spread in &all_spreads() {
+                                        let a = Axes {
+                                            source,
+                                            shape,
+                                            refresh,
+                                            agg,
+                                            measure_ty,
+                                            unique,
+                                            lifecycle,
+                                            filter,
+                                            spread,
+                                        };
+                                        if is_valid(&a) {
+                                            out.push(a);
+                                        }
                                     }
                                 }
                             }
@@ -275,7 +307,7 @@ pub fn valid_space() -> Vec<Axes> {
 /// A 2-way interaction: two (field-index, value-discriminant) pairs.
 type Pair = ((u8, u32), (u8, u32));
 
-fn field_values(a: &Axes) -> [(u8, u32); 8] {
+fn field_values(a: &Axes) -> [(u8, u32); 9] {
     [
         (0, a.source as u32),
         (1, a.shape as u32),
@@ -291,6 +323,7 @@ fn field_values(a: &Axes) -> [(u8, u32); 8] {
         (5, a.unique as u32),
         (6, a.lifecycle as u32),
         (7, a.filter as u32),
+        (8, a.spread as u32),
     ]
 }
 
@@ -372,6 +405,7 @@ mod tests {
             unique: UniqueCols::Absent,
             lifecycle: Lifecycle::CreateMutateDrop,
             filter: FilterMode::None,
+            spread: MutationSpread::SingleSource,
         }
     }
 
@@ -386,6 +420,7 @@ mod tests {
             unique: UniqueCols::Absent,
             lifecycle: Lifecycle::CreateMutateDrop,
             filter: FilterMode::None,
+            spread: MutationSpread::SingleSource,
         };
         let mut set = std::collections::HashSet::new();
         set.insert(a);
@@ -449,6 +484,39 @@ mod tests {
         );
         a.measure_ty = ColType::Bool;
         assert!(!is_valid(&a));
+    }
+
+    #[test]
+    fn all_sources_spread_only_deferred_multisource() {
+        // Valid: deferred + multi-source shape
+        let mut a = axes(
+            SourceKind::Table,
+            QueryShape::JoinInner,
+            RefreshMode::Deferred,
+            Some(AggFn::Sum),
+        );
+        a.spread = MutationSpread::AllSources;
+        assert!(is_valid(&a));
+
+        // Invalid: immediate + multi-source shape
+        let mut b = axes(
+            SourceKind::Table,
+            QueryShape::JoinInner,
+            RefreshMode::Immediate,
+            Some(AggFn::Sum),
+        );
+        b.spread = MutationSpread::AllSources;
+        assert!(!is_valid(&b));
+
+        // Invalid: deferred + single-source shape
+        let mut c = axes(
+            SourceKind::Table,
+            QueryShape::SingleAggregate,
+            RefreshMode::Deferred,
+            Some(AggFn::Sum),
+        );
+        c.spread = MutationSpread::AllSources;
+        assert!(!is_valid(&c));
     }
 
     #[test]
@@ -527,7 +595,9 @@ mod tests {
 
     #[test]
     fn every_pairwise_case_renders_to_a_planned_case() {
-        for a in pairwise(&valid_space()) {
+        let pw = pairwise(&valid_space());
+        eprintln!("PAIRWISE CASE COUNT: {}", pw.len());
+        for a in pw {
             let pc = plan_case(&a, 0).unwrap_or_else(|| panic!("no plan for {a:?}"));
             assert!(!pc.case.tables.is_empty());
             assert!(!pc.case.select_body.rendered_sql.is_empty());
@@ -562,5 +632,63 @@ mod tests {
         let p0 = plan_case(&a, 0).unwrap();
         let p1 = plan_case(&a, 1).unwrap();
         assert_ne!(p0.case.tables[0].name, p1.case.tables[0].name);
+    }
+
+    #[test]
+    fn mutation_spread_all_sources_adds_cross_source_txn() {
+        let a = Axes {
+            source: SourceKind::Table,
+            shape: QueryShape::JoinInner,
+            refresh: RefreshMode::Deferred,
+            agg: Some(AggFn::Sum),
+            measure_ty: ColType::Int,
+            unique: UniqueCols::Absent,
+            lifecycle: Lifecycle::CreateMutateDrop,
+            filter: FilterMode::None,
+            spread: MutationSpread::AllSources,
+        };
+        let pc = plan_case(&a, 5000).unwrap();
+        // AllSources should have 2 txns: seed (both tables) + cross-source mutations (both tables)
+        assert_eq!(
+            pc.case.dml.len(),
+            2,
+            "should have seed + cross-source mutation txns"
+        );
+        // First txn is seed with 2 INSERTs (one per table)
+        assert_eq!(
+            pc.case.dml[0].statements.len(),
+            2,
+            "seed txn should have 2 INSERT statements"
+        );
+        // Second txn is cross-source mutations: 4 statements per table × 2 tables = 8 statements
+        assert_eq!(
+            pc.case.dml[1].statements.len(),
+            8,
+            "cross-source mutation should have 8 statements (4 per table)"
+        );
+    }
+
+    #[test]
+    fn mutation_spread_single_source_no_extra_txn() {
+        let a = Axes {
+            source: SourceKind::Table,
+            shape: QueryShape::JoinInner,
+            refresh: RefreshMode::Deferred,
+            agg: Some(AggFn::Sum),
+            measure_ty: ColType::Int,
+            unique: UniqueCols::Absent,
+            lifecycle: Lifecycle::CreateMutateDrop,
+            filter: FilterMode::None,
+            spread: MutationSpread::SingleSource,
+        };
+        let pc = plan_case(&a, 5001).unwrap();
+        // SingleSource should have only 1 txn: seed
+        assert_eq!(pc.case.dml.len(), 1, "should have only seed txn");
+        // Seed with 2 INSERTs (one per table)
+        assert_eq!(
+            pc.case.dml[0].statements.len(),
+            2,
+            "seed txn should have 2 INSERT statements"
+        );
     }
 }

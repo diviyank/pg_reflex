@@ -638,7 +638,7 @@ fn oracle_matches_on_a_simple_generated_case() {
 #[cfg(any(test, feature = "pg_test"))]
 #[pg_test]
 fn evaluate_planned_table_passthrough_matches_and_drops_clean() {
-    use fuzz_model::axes::{plan_case, Axes, FilterMode, Lifecycle, QueryShape, RefreshMode, SourceKind, UniqueCols};
+    use fuzz_model::axes::{plan_case, Axes, FilterMode, Lifecycle, MutationSpread, QueryShape, RefreshMode, SourceKind, UniqueCols};
     use fuzz_model::model::ColType;
     let a = Axes {
         source: SourceKind::Table,
@@ -649,6 +649,7 @@ fn evaluate_planned_table_passthrough_matches_and_drops_clean() {
         unique: UniqueCols::Absent,
         lifecycle: Lifecycle::CreateMutateDrop,
         filter: FilterMode::None,
+        spread: MutationSpread::SingleSource,
     };
     let pc = plan_case(&a, 9001).unwrap();
     match oracle::evaluate_planned(&pc) {
@@ -1054,6 +1055,7 @@ fn regression_decomp_cte_deferred_creates() {
         unique: UniqueCols::Absent,
         lifecycle: Lifecycle::CreateMutateDrop,
         filter: FilterMode::None,
+        spread: MutationSpread::SingleSource,
     };
     assert_planned_matches(&a, 200_001, "decomposed CTE × deferred");
 }
@@ -1075,6 +1077,7 @@ fn regression_join_provided_unique_key_threads() {
         unique: UniqueCols::Provided,
         lifecycle: Lifecycle::CreateMutateDrop,
         filter: FilterMode::None,
+        spread: MutationSpread::SingleSource,
     };
     assert_planned_matches(&a, 200_002, "join × provided unique key");
 }
@@ -1096,6 +1099,7 @@ fn regression_minmax_nonnumeric_output_type() {
         unique: UniqueCols::Absent,
         lifecycle: Lifecycle::CreateMutateDrop,
         filter: FilterMode::None,
+        spread: MutationSpread::SingleSource,
     };
     assert_planned_matches(&a, 200_003, "min × timestamptz output type");
 }
@@ -1117,6 +1121,7 @@ fn regression_decomp_cte_cascade_drop() {
         unique: UniqueCols::Absent,
         lifecycle: Lifecycle::CascadeDrop,
         filter: FilterMode::None,
+        spread: MutationSpread::SingleSource,
     };
     assert_planned_matches(&a, 200_004, "decomposed CTE × cascade drop");
 }
@@ -1137,6 +1142,7 @@ fn regression_decomp_cte_partitioned() {
         unique: UniqueCols::Absent,
         lifecycle: Lifecycle::Partitioned,
         filter: FilterMode::None,
+        spread: MutationSpread::SingleSource,
     };
     assert_planned_matches(&a, 200_005, "decomposed CTE × partitioned");
 }
