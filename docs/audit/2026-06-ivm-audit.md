@@ -150,6 +150,46 @@ RED). Fix target: don't put the output key on `__base` for dedup shapes. Severit
 medium (create-time hard error, not silent corruption; workaround = omit the key
 and let pg_reflex auto-infer). Tracked in §4.
 
+### Phase 2B M4 / M1-axis — new gate axes
+
+- **M4 `FilterMode` axis** (None / Simple / ScalarSubquery / InSubquery), scoped to
+  Passthrough + SingleAggregate (the 1.10.2 region). Pairwise 54 → 63 cases, gate
+  GREEN — no bug. The gate now systematically exercises `= (SELECT)` / `IN (SELECT)`
+  filters × shape × refresh.
+- **M1 `MutationSpread` axis** (SingleSource / AllSources). AllSources mutates ≥2
+  sources in one deferred batch so the cross-source guard engages inside the gate
+  (complements the Phase-2A oracle tests). Pairwise 63 → 64, gate GREEN.
+  Model limitation recorded: AllSources is numeric-measure-only because the
+  generator's `m = m + 1` update is numeric (not a pg_reflex bug).
+
+**Gate-scope honesty.** The pairwise gate cases carry only the **seed INSERTs**
+(`base_case_for_shape` sets `dml: vec![seed]`); the IMV is created first, then the
+rows are inserted and maintained incrementally — so the gate tests CREATE +
+**INSERT-maintenance** per axis combo, plus UPDATE/DELETE only on the AllSources
+path. Full UPDATE/DELETE maintenance for the new shapes is covered by the Phase-1
+targeted oracle tests (window re-rank, DISTINCT ON winner-change — both PASS) and
+the random proptest path. The new shapes/axes are tested at the same fidelity as
+every existing gate shape.
+
+### Phase 2B M3 / M5 — worth-assessment (DEFER, with rationale)
+
+Per the project's "assess the worth / don't over-complexify" rule, the two
+remaining §4 items were assessed rather than force-built:
+
+- **M3 (white-box `EXPLAIN`-rows plan probe): DEFER.** It would deterministically
+  assert delta-scoping by EXPLAINing `reflex_build_delta_sql` output — but that SQL
+  references transient transition tables (`__reflex_new_<src>`) that exist only
+  inside a live trigger, so the probe must fabricate stand-in temp tables and parse
+  FORMAT JSON (brittle to codegen changes). Marginal value is currently low: the
+  wall-clock `assert_sublinear` probe already covered all six aggregate/passthrough
+  shapes and found **zero** O(base) plans. Revisit if a future plan regression slips
+  the heuristic. Design recorded here for when it's needed.
+- **M5 (PartitionOp axis — ATTACH/DETACH/SWAP in the gate): DEFER.** Highest harness
+  cost (partition-DDL rendering + a partition-aware oracle + multi-level depth)
+  against an already-fixed, already-regression-tested region (1.8.x / 1.10.0 each
+  shipped with targeted `#[pg_test]` coverage). Disproportionate cost-to-value now;
+  a dedicated partition-DDL fuzz is a sensible future standalone effort.
+
 ### Phase 2 M1 — Cross-source consistency guard
 
 The rank-1 Untested item. The guard (`src/trigger/deferred.rs:401-533`) engages
