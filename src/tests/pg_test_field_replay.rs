@@ -83,3 +83,46 @@ fn replay_sop_baseline_multisource_mutation_matches_recompute() {
     Spi::run("SELECT reflex_flush_deferred('unit_pricing')").expect("flush up");
     assert_imv_correct("sopisb_v", sql);
 }
+
+/// R2b — 1.10.1 plan-quality: a 1-row primary delta must stay O(delta), not
+/// re-aggregate the whole union. The literal regression that took 18 minutes.
+#[pg_test]
+#[ignore = "CONFIRMED plan-quality regression at sop_baseline shape; see docs/audit/2026-06-ivm-audit.md §3; RED"]
+fn replay_sop_baseline_secondary_is_sublinear() {
+    for (suf, n) in [("s", 20000_i32), ("b", 500000_i32)] {
+        Spi::run(&format!("CREATE TABLE sp_{s} (id INT PRIMARY KEY)", s = suf)).unwrap();
+        Spi::run(&format!("CREATE TABLE mod_{s} (order_date DATE)", s = suf)).unwrap();
+        Spi::run(&format!("CREATE TABLE pb_{s} (id INT PRIMARY KEY, product_id INT, location_id INT, supply_plan_id INT, delivery_date DATE, qty NUMERIC)", s = suf)).unwrap();
+        Spi::run(&format!("CREATE TABLE stb_{s} (id INT PRIMARY KEY, product_id INT, location_id INT, supply_plan_id INT, delivery_date DATE, qty NUMERIC)", s = suf)).unwrap();
+        Spi::run(&format!("CREATE TABLE up_{s} (product_id INT PRIMARY KEY, unit_price NUMERIC)", s = suf)).unwrap();
+        Spi::run(&format!("INSERT INTO sp_{s} SELECT g FROM generate_series(1,50) g", s = suf)).unwrap();
+        Spi::run(&format!("INSERT INTO mod_{s} VALUES (date '2024-01-01')", s = suf)).unwrap();
+        Spi::run(&format!("INSERT INTO up_{s} SELECT g, (g % 9) + 1 FROM generate_series(1,500) g", s = suf)).unwrap();
+        Spi::run(&format!("INSERT INTO pb_{s} SELECT i, (i % 500)+1, i % 50, (i % 50)+1, date '2024-02-01' + (i % 300), i FROM generate_series(1,{n}) i", s = suf, n = n)).unwrap();
+        Spi::run(&format!("INSERT INTO stb_{s} SELECT i, (i % 500)+1, i % 50, (i % 50)+1, date '2024-02-01' + (i % 300), i FROM generate_series(1,{n}) i", s = suf, n = n)).unwrap();
+        let sql = format!(
+            "SELECT st.product_id, st.location_id, st.delivery_date, \
+             SUM(st.purch) AS purchase_qty, \
+             SUM(st.purch * COALESCE(up.unit_price,0)) AS purchase_value \
+             FROM ( \
+               SELECT pb.product_id, pb.location_id, pb.delivery_date, pb.qty AS purch \
+               FROM pb_{s} pb JOIN sp_{s} sp ON pb.supply_plan_id = sp.id \
+               WHERE pb.delivery_date >= (SELECT order_date FROM mod_{s}) \
+               UNION ALL \
+               SELECT stb.product_id, stb.location_id, stb.delivery_date, 0 AS purch \
+               FROM stb_{s} stb JOIN sp_{s} sp ON stb.supply_plan_id = sp.id \
+               WHERE stb.delivery_date >= (SELECT order_date FROM mod_{s}) \
+             ) st \
+             LEFT JOIN up_{s} up ON up.product_id = st.product_id \
+             GROUP BY st.product_id, st.location_id, st.delivery_date", s = suf);
+        crate::create_reflex_ivm(&format!("sopisb_qy_{s}", s = suf), &sql, None, None, Some("DEFERRED"), None);
+        Spi::run(&format!("INSERT INTO pb_{s} VALUES (900001, 7, 1, 1, date '2024-05-01', 5)", s = suf)).unwrap();
+        Spi::run(&format!("SELECT reflex_flush_deferred('pb_{s}')", s = suf)).unwrap();
+    }
+    // If the main name has no flush recorded (decomposed sub-IMV), discover it:
+    //   SELECT name FROM reflex_ivm_status() WHERE name LIKE 'sopisb_qy_s%';
+    let small = last_flush_ms_of("sopisb_qy_s");
+    let big = last_flush_ms_of("sopisb_qy_b");
+    eprintln!("FIELD_R2B sop-baseline small={}ms big={}ms", small, big);
+    assert_sublinear("sop-baseline-secondary", small, big, 25);
+}

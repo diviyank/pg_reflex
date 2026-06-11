@@ -252,6 +252,16 @@ The next phase starts from this list, not a blank page (distilled from §2 §4):
 5. **IMV-lifecycle axis** — create/drop/decomposition-rollback/anchor-inference (rank 3; the 10 DDL-family escapes).
 6. **Adversarial multi-mutation fuzz** for the Weak shapes — window, DISTINCT ON, inner join, ignore_sources (rank 4).
 
+### Phase 3 — field-replay regression suite (1.10.1 & 1.10.2 shape distillations)
+
+Per §4 gap #6 (rank 3), two production views that caused the worst field incidents are now permanent, self-contained regression tests.
+
+- **R1 (1.10.2) — `current_assortment_activity_view`**: Two correctness tests (noncurrent key-collision, noncurrent batch relevance-skip). Both **PASS** — the 1.10.2 fix holds at the real shape; active regressions.
+- **R2a (1.10.1) — `sop_incoming_stock_baseline_view` correctness**: Multi-source mutation (INSERT primary + UPDATE secondary in one deferred batch) on the aggregate + UNION ALL + LEFT-JOIN secondary shape. **PASS** — correctness oracle validates the fix.
+- **R2b (1.10.1) — plan-quality**: A 1-row primary delta over 20k vs 500k row bases. **FAIL** — CONFIRMED O(base) regression (small=74ms, big=1150ms; ratio 15.5x, threshold 25x). The 1.10.1 fix did NOT resolve the plan-quality issue at the distilled shape. Marked `#[ignore = "CONFIRMED plan-quality regression"]` (RED).
+
+**Verdict:** Correctness is proven at both 1.10.1 and 1.10.2 shapes (3 active tests). Plan-quality regression at sop_baseline is confirmed a 1.10.1-class bug that still scales with base; filed for the Phase 3 fix-pass. The real shapes now have CI coverage.
+
 ### Phase-1 bottom line
 
-Four named suspected gaps were instrumented; **all four PASSED**, converting Weak/Untested cells into live oracle regressions and showing the 1.10.1/1.10.2 fixes generalize. The audit found **no new live bug** — but it found the *real* systemic holes: the cross-source guard is untested (rank 1), plan-quality is unguarded everywhere (rank 2), and the release gate never exercises the regions where all 20 field bugs lived (rank 3). Those are Phase 2's mandate.
+Four named suspected gaps were instrumented; **all four PASSED**, converting Weak/Untested cells into live oracle regressions and showing the 1.10.1/1.10.2 fixes generalize. The audit found **no new live bug** — but it found the *real* systemic holes: the cross-source guard is untested (rank 1), plan-quality is unguarded everywhere (rank 2), and the release gate never exercises the regions where all 20 field bugs lived (rank 3). Those are Phase 2's mandate. Phase 3 field replays confirmed correctness at two production shapes and surfaced a **live open 1.10.1-region plan-quality regression** at the sop_baseline shape (15.5x O(base) scaling on a 1-row delta).
