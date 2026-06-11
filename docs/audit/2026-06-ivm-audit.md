@@ -23,12 +23,16 @@ PASS. The pairwise gate gained `WindowFn` + `DistinctOn` shapes and `FilterMode`
 self-contained regressions: `current_assortment_activity_view` (1.10.2) — correct;
 `sop_incoming_stock_baseline_view` (1.10.1) — correct but **not plan-scoped**.
 
-**Bugs found by the hardened audit (2), both filed as `#[ignore]`'d RED + fix-pass):**
-- **B1** — DISTINCT ON + declared output key crashes CREATE (gate-found; §3 Phase 2B).
-- **B2** — `sop_incoming_stock_baseline` shape maintains a 1-row delta in **O(base)**
-  (74ms→1150ms at 25× base; §3 Phase 3 R2b). The 1.10.1 fix didn't generalize to
-  the union-aggregate + subquery-filter + LEFT-JOIN-secondary shape — i.e. the
-  production "slow view" pain is reproduced and pinned.
+**Bugs found by the hardened audit (2):**
+- **B1 — FIXED** ✅ DISTINCT ON + declared output key crashed CREATE (gate-found;
+  §3 Phase 2B). Root cause: `try_decompose_distinct_on` passed the outer view's key
+  to the pre-dedup `__base` sub-IMV. Fix (`decompose.rs`): `__base` auto-infers its
+  source key. RED→GREEN; 20 DISTINCT ON + 99 CTE + gate tests unaffected.
+- **B2 — root-caused, fix deferred** (a focused effort). `sop_incoming_stock_baseline`
+  maintains a 1-row delta in **O(base)** (74ms→1150ms at 25×; §3 Phase 3 R2b +
+  "B2 root cause"). The primary-delta recompute swaps the *changed* UNION-ALL operand
+  for its transition table but **full-scans the unchanged operands**. Correctness-
+  neutral; the production "slow view" pain, reproduced and precisely pinned.
 
 **Net:** correctness 9 Proven / 7 Weak / 0 Untested; plan-quality 6 shapes Proven
 (was 0); +20 new regression tests; the gate now exercises the field-bug regions;
@@ -269,7 +273,7 @@ names its target phase. P2 = harden the combinatorial harness; P3 = field-replay
 | 4 | **Weak correctness coverage on window, DISTINCT ON, inner join, multi-source aggregate, ignore_sources** — point-value checks, no full-relation oracle except the single mutation each this audit just added (§3 Tasks 5–7 PASS, now active regressions). | correctness | §1 rows rated Weak; §3 Tasks 5–7 | **P2** — fuzz these shapes adversarially: multi-mutation, key-colliding, winner-change, mid-frame |
 | 5 | **Plan-quality probe is a wall-clock heuristic** — trustworthy enough for Phase 1 confirm/refute, but not a structural guarantee. | plan (tooling) | §3 "Known limitation" | **P2** — white-box assertion on the generated maintenance plan (`EXPLAIN` actual-rows at the base relation) |
 | 6 | **No regression derived from real production queries** — every field bug came from base-db views the suite never replayed. | both | §2 "found in field, not gate" meta-pattern | **P3** — distil base-db views (`current_assortment_activity_view`, `sop_incoming_stock_baseline_view`, …) into minimal oracle-checked regressions |
-| **B1** | **🐛 GATE-FOUND BUG: DISTINCT ON + declared output key crashes CREATE** — pg_reflex applies the declared passthrough key to the pre-dedup `__base`, failing its unique index. Declaring the correct output key for a DISTINCT ON IMV is a hard create error. | correctness (create-time) | §3 Phase 2B M6; RED `audit_distinct_on_declared_output_key_should_not_crash_create` | **fix** — `resolve_unique_columns` / DISTINCT ON decomposition must not key `__base` by the output key. Medium severity (hard error, not silent; workaround = auto-infer). |
+| **B1** ✅FIXED | **GATE-FOUND BUG (fixed): DISTINCT ON + declared output key crashed CREATE** — pg_reflex applies the declared passthrough key to the pre-dedup `__base`, failing its unique index. Declaring the correct output key for a DISTINCT ON IMV is a hard create error. | correctness (create-time) | §3 Phase 2B M6; RED `audit_distinct_on_declared_output_key_should_not_crash_create` | **fix** — `resolve_unique_columns` / DISTINCT ON decomposition must not key `__base` by the output key. Medium severity (hard error, not silent; workaround = auto-infer). |
 
 ### Phase-2 entry point (deduplicated axis list to brainstorm from)
 
