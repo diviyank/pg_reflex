@@ -189,9 +189,13 @@ pub fn is_valid(a: &Axes) -> bool {
         return false;
     }
 
-    // AllSources spread requires numeric measure_ty (build_mutation uses +1 increment).
-    // KNOWN BUG: non-numeric measure types + AllSources spread causes codegen to
-    // emit "operator does not exist: <type> + integer". See issue #TODO.
+    // MODEL LIMITATION (not a pg_reflex bug): the AllSources spread is the only
+    // gate path that emits an UPDATE, and `build_mutation` updates the measure as
+    // `m = m + 1`, which is valid SQL only for numeric `m`. For non-numeric
+    // measure types the SOURCE update itself is rejected by Postgres ("operator
+    // does not exist: <type> + integer") before pg_reflex maintenance runs, so
+    // this is a generator constraint, not a defect. Restrict AllSources to
+    // numeric measures. (A type-aware mutation generator would lift this.)
     if a.spread == MutationSpread::AllSources && !a.measure_ty.is_numeric_family() {
         return false;
     }
