@@ -287,6 +287,93 @@ fn passthrough_filtered_case(t: Table, filter_choice: usize) -> FuzzCase {
     }
 }
 
+/// Window: SELECT id, d, ROW_NUMBER() OVER (PARTITION BY d ORDER BY id) AS rn FROM t.
+/// Output cardinality = input cardinality, keyed by id.
+fn window_case(t: Table) -> FuzzCase {
+    let body = SelectBody {
+        rendered_sql: format!(
+            "SELECT {pk}, d, ROW_NUMBER() OVER (PARTITION BY d ORDER BY {pk}) AS rn FROM {tbl}",
+            pk = t.pk,
+            tbl = t.name
+        ),
+    };
+    let output_columns = vec![
+        Column {
+            name: t.pk.clone(),
+            ty: ColType::Int,
+            nullable: false,
+        },
+        Column {
+            name: "d".into(),
+            ty: ColType::Text,
+            nullable: true,
+        },
+        Column {
+            name: "rn".into(),
+            ty: ColType::BigInt,
+            nullable: false,
+        },
+    ];
+    let seed = DmlTxn {
+        statements: vec![DmlStmt::Insert {
+            table: t.name.clone(),
+            rows: seed_rows(&t, 8),
+        }],
+    };
+    FuzzCase {
+        tables: vec![t.clone()],
+        select_body: body,
+        unique_columns: vec![t.pk.clone()],
+        deferred: false,
+        dml: vec![seed],
+        output_columns,
+    }
+}
+
+/// DISTINCT ON: SELECT DISTINCT ON (d) d, id, m FROM t ORDER BY d, id.
+/// One output row per distinct d; keyed by d.
+fn distinct_on_case(t: Table) -> FuzzCase {
+    let m_ty = t.columns[1].ty;
+    let body = SelectBody {
+        rendered_sql: format!(
+            "SELECT DISTINCT ON (d) d, {pk}, m FROM {tbl} ORDER BY d, {pk}",
+            pk = t.pk,
+            tbl = t.name
+        ),
+    };
+    let output_columns = vec![
+        Column {
+            name: "d".into(),
+            ty: ColType::Text,
+            nullable: true,
+        },
+        Column {
+            name: t.pk.clone(),
+            ty: ColType::Int,
+            nullable: false,
+        },
+        Column {
+            name: "m".into(),
+            ty: m_ty,
+            nullable: true,
+        },
+    ];
+    let seed = DmlTxn {
+        statements: vec![DmlStmt::Insert {
+            table: t.name.clone(),
+            rows: seed_rows(&t, 8),
+        }],
+    };
+    FuzzCase {
+        tables: vec![t.clone()],
+        select_body: body,
+        unique_columns: vec!["d".into()],
+        deferred: false,
+        dml: vec![seed],
+        output_columns,
+    }
+}
+
 /// Single-table aggregate: SELECT d, SUM(m) AS s, COUNT(*) AS c FROM t0 GROUP BY d.
 fn aggregate_case(t: Table) -> FuzzCase {
     let body = SelectBody {
@@ -1070,6 +1157,8 @@ fn base_case_for_shape(a: &Axes, seq: u64) -> Option<FuzzCase> {
             det_table(seq, 0, a.measure_ty),
             det_table(seq, 1, a.measure_ty),
         )),
+        QueryShape::WindowFn => Some(window_case(det_table(seq, 0, a.measure_ty))),
+        QueryShape::DistinctOn => Some(distinct_on_case(det_table(seq, 0, a.measure_ty))),
     }
 }
 

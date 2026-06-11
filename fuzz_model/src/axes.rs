@@ -19,6 +19,8 @@ pub enum QueryShape {
     JoinLeft,
     CteDecomposed,
     SetOpUnionAll,
+    WindowFn,
+    DistinctOn,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -177,6 +179,8 @@ fn all_shape() -> Vec<QueryShape> {
         JoinLeft,
         CteDecomposed,
         SetOpUnionAll,
+        WindowFn,
+        DistinctOn,
     ]
 }
 
