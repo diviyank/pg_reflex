@@ -1888,6 +1888,38 @@ pub(crate) fn refresh_source_snapshot(client: &mut pgrx::spi::SpiClient<'_>, sou
     }
 }
 
+/// Resolve a relation `oid` to a quoted, schema-qualified name (`"schema"."rel"`),
+/// or None if the relation no longer exists (e.g. a DETACHed-then-DROPped child).
+fn oid_to_qualified_name(client: &pgrx::spi::SpiClient<'_>, oid: u32) -> Option<String> {
+    client
+        .select(
+            &format!(
+                "SELECT format('%I.%I', n.nspname, c.relname) AS q \
+                 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+                 WHERE c.oid = {}",
+                oid
+            ),
+            Some(1),
+            &[],
+        )
+        .ok()
+        .and_then(|mut it| it.next())
+        .and_then(|r| r.get_by_name::<&str, _>("q").ok().flatten())
+        .map(|s| s.to_string())
+}
+
+/// Pick the `depends_on` entry that names `root` (qualified or bare). This is the
+/// exact source string the IMV's INSERT/DELETE triggers were built with, so the
+/// synthesized transition table and `reflex_build_delta_sql`'s source-rewrite stay
+/// mutually consistent. Falls back to `root` when no entry matches.
+fn source_matching_root(deps: &[String], root: &str) -> String {
+    let bare_root = split_qualified_name(root).1;
+    deps.iter()
+        .find(|d| d.as_str() == root || split_qualified_name(d).1 == bare_root)
+        .cloned()
+        .unwrap_or_else(|| root.to_string())
+}
+
 /// Flush pending partition changes. When `only` is Some, flush just that
 /// source root; otherwise drain `__reflex_partition_pending`. For each dirty
 /// root, oid-diff the live leaf set against the snapshot and apply: AttachNew /
@@ -2052,12 +2084,18 @@ pub(crate) fn reflex_flush_partitions_impl(only: Option<&str>) -> String {
                 summary.push(format!("{}: {} change(s)", imv, actions.len()));
             }
 
-            // Unpartitioned IMVs depending on this root cannot capture a swap
-            // incrementally (no per-partition reconcile), so a source partition
-            // change makes them stale. Trigger a full reconcile for each.
-            let unpartitioned_imvs: Vec<String> = client
+            // Unpartitioned IMVs depending on this root can't capture a swap via
+            // per-partition reconcile. Instead of a blunt full reconcile on every
+            // partition change (which TRUNCATE+rebuilds the IMV and full-cascades
+            // to every dependent), apply each attached/detached child as the bulk
+            // INSERT/DELETE it semantically is (plans/2026-06-11) — the same
+            // pipeline the INSERT/DELETE triggers use, so propagation is
+            // write-driven and dies wherever the delta nets to zero. Falls back to
+            // full reconcile when a baseline is missing or a child can't be
+            // resolved (always correct).
+            let unpartitioned_imvs: Vec<(String, Vec<String>)> = client
                 .select(
-                    "SELECT name FROM public.__reflex_ivm_reference \
+                    "SELECT name, depends_on FROM public.__reflex_ivm_reference \
                      WHERE enabled = TRUE \
                        AND COALESCE(array_length(partition_columns, 1), 0) = 0 \
                        AND (depends_on @> ARRAY[$1] OR depends_on @> ARRAY[split_part($1,'.',2)])",
@@ -2066,18 +2104,79 @@ pub(crate) fn reflex_flush_partitions_impl(only: Option<&str>) -> String {
                 )
                 .map_err(|e| format!("flush: unpartitioned imv lookup failed: {}", e))?
                 .filter_map(|r| {
-                    r.get_by_name::<&str, _>("name")
+                    let name = r.get_by_name::<&str, _>("name").ok().flatten()?.to_string();
+                    let deps = r
+                        .get_by_name::<Vec<String>, _>("depends_on")
                         .ok()
                         .flatten()
-                        .map(|s| s.to_string())
+                        .unwrap_or_default();
+                    Some((name, deps))
                 })
                 .collect();
-            for imv in &unpartitioned_imvs {
-                root_stmts.push(format!(
-                    "PERFORM public.reflex_reconcile({})",
-                    sql_literal_text(imv)
-                ));
-                summary.push(format!("{}: full reconcile (unpartitioned)", imv));
+
+            for (imv, deps) in &unpartitioned_imvs {
+                let source = source_matching_root(deps, root);
+                let trans_new = crate::query_decomposer::transition_new_table_name(&source);
+                let trans_old = crate::query_decomposer::transition_old_table_name(&source);
+
+                // A missing baseline (IMV predating snapshot seeding) or a SwapFill
+                // (needs DELETE-old + INSERT-new, old child often already gone) is
+                // handled by a single correct full reconcile.
+                let mut force_reconcile = snapshot.is_empty()
+                    || actions
+                        .iter()
+                        .any(|(_, a)| matches!(a, PartitionDiffAction::SwapFill));
+
+                let mut delta_stmts: Vec<String> = Vec::new();
+                if !force_reconcile {
+                    for (leaf, action) in &actions {
+                        let (op, trans, oid) = match action {
+                            PartitionDiffAction::AttachNew => (
+                                "INSERT",
+                                &trans_new,
+                                current.iter().find(|(n, _)| n == leaf).map(|(_, o)| *o),
+                            ),
+                            PartitionDiffAction::Drop => (
+                                "DELETE",
+                                &trans_old,
+                                snapshot.iter().find(|(n, _)| n == leaf).map(|(_, o)| *o),
+                            ),
+                            PartitionDiffAction::SwapFill => {
+                                force_reconcile = true;
+                                break;
+                            }
+                        };
+                        match oid.and_then(|o| oid_to_qualified_name(client, o)) {
+                            Some(child) => delta_stmts.push(format!(
+                                "PERFORM public.reflex_apply_partition_delta({}, {}, '{}', {}, {})",
+                                sql_literal_text(imv),
+                                sql_literal_text(&source),
+                                op,
+                                sql_literal_text(&child),
+                                sql_literal_text(trans),
+                            )),
+                            None => {
+                                force_reconcile = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                if force_reconcile {
+                    root_stmts.push(format!(
+                        "PERFORM public.reflex_reconcile({})",
+                        sql_literal_text(imv)
+                    ));
+                    summary.push(format!("{}: full reconcile (unpartitioned)", imv));
+                } else if !delta_stmts.is_empty() {
+                    root_stmts.extend(delta_stmts);
+                    summary.push(format!(
+                        "{}: incremental partition delta ({} change(s))",
+                        imv,
+                        actions.len()
+                    ));
+                }
             }
 
             // Append the snapshot refresh and pending drain to the same root's statement list

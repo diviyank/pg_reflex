@@ -1053,6 +1053,335 @@ fn pg_part_event_trigger_skips_unpartitioned_imv() {
     assert!(!is_partitioned_after, "non-partitioned IMV should stay unpartitioned");
 }
 
+/// Incremental partition delta (plans/2026-06-11): attaching a partition whose
+/// rows BELONG in an unpartitioned IMV must be maintained incrementally — as the
+/// bulk INSERT it semantically is — NOT by a full TRUNCATE+rebuild reconcile.
+/// Observable: the IMV target's `relfilenode` is reassigned by TRUNCATE but
+/// stable across an incremental MERGE/INSERT.
+#[pg_test]
+fn pg_part_attach_matching_partition_maintains_unpartitioned_imv_incrementally() {
+    Spi::run(
+        "CREATE TABLE iamp_src (id BIGINT, region TEXT NOT NULL, amount NUMERIC) \
+         PARTITION BY LIST (region)",
+    )
+    .expect("create source");
+    Spi::run("CREATE TABLE iamp_src_n PARTITION OF iamp_src FOR VALUES IN ('N')").expect("p1");
+    Spi::run("INSERT INTO iamp_src (id, region, amount) VALUES (1, 'N', 10)").expect("seed");
+
+    // Unpartitioned passthrough IMV, single source, filter keeps regions N and S.
+    Spi::run(
+        "SELECT create_reflex_ivm( \
+            'iamp_v', \
+            'SELECT id, amount FROM iamp_src WHERE region IN (''N'',''S'')', \
+            'id' \
+         )",
+    )
+    .expect("create imv");
+
+    let before_cnt =
+        Spi::get_one::<i64>("SELECT count(*) FROM iamp_v").expect("q").expect("c");
+    assert_eq!(before_cnt, 1, "baseline: only the N row");
+    let before_node = Spi::get_one::<i64>(
+        "SELECT relfilenode::BIGINT FROM pg_class WHERE relname = 'iamp_v'",
+    )
+    .expect("q")
+    .expect("n");
+
+    // Attach a NEW partition 'S' WITH data — these rows belong in the IMV.
+    Spi::run("CREATE TABLE iamp_src_s (id BIGINT, region TEXT NOT NULL, amount NUMERIC)")
+        .expect("detached child");
+    Spi::run("INSERT INTO iamp_src_s (id, region, amount) VALUES (2, 'S', 50)").expect("child data");
+    Spi::run("ALTER TABLE iamp_src ATTACH PARTITION iamp_src_s FOR VALUES IN ('S')")
+        .expect("attach");
+
+    // Drive the deferred flush (the COMMIT-time constraint trigger doesn't fire
+    // inside the test transaction).
+    Spi::run("SELECT reflex_flush_partition_source('iamp_src')").expect("flush");
+
+    let after_cnt =
+        Spi::get_one::<i64>("SELECT count(*) FROM iamp_v").expect("q").expect("c");
+    assert_eq!(
+        after_cnt, 2,
+        "matching attached partition rows must appear in the IMV"
+    );
+
+    let after_node = Spi::get_one::<i64>(
+        "SELECT relfilenode::BIGINT FROM pg_class WHERE relname = 'iamp_v'",
+    )
+    .expect("q")
+    .expect("n");
+    assert_eq!(
+        before_node, after_node,
+        "attach must be maintained incrementally, not by a full TRUNCATE reconcile"
+    );
+}
+
+/// Incremental partition delta (plans/2026-06-11): attaching a partition whose
+/// rows are entirely rejected by the IMV's WHERE filter is a no-op — the IMV must
+/// be neither reconciled nor written. Observable: target relfilenode stable +
+/// content unchanged.
+#[pg_test]
+fn pg_part_attach_irrelevant_partition_is_noop_for_unpartitioned_imv() {
+    Spi::run(
+        "CREATE TABLE ian_src (id BIGINT, region TEXT NOT NULL, amount NUMERIC) \
+         PARTITION BY LIST (region)",
+    )
+    .expect("create source");
+    Spi::run("CREATE TABLE ian_src_n PARTITION OF ian_src FOR VALUES IN ('N')").expect("p1");
+    Spi::run("INSERT INTO ian_src (id, region, amount) VALUES (1, 'N', 10)").expect("seed");
+
+    // Filter keeps ONLY region 'N'.
+    Spi::run(
+        "SELECT create_reflex_ivm('ian_v', 'SELECT id, amount FROM ian_src WHERE region = ''N''', 'id')",
+    )
+    .expect("create imv");
+
+    let before_node = Spi::get_one::<i64>(
+        "SELECT relfilenode::BIGINT FROM pg_class WHERE relname = 'ian_v'",
+    )
+    .expect("q")
+    .expect("n");
+
+    // Attach a NEW partition 'S' WITH data — all rows are filtered out.
+    Spi::run("CREATE TABLE ian_src_s (id BIGINT, region TEXT NOT NULL, amount NUMERIC)")
+        .expect("child");
+    Spi::run("INSERT INTO ian_src_s (id, region, amount) VALUES (2, 'S', 50)").expect("child data");
+    Spi::run("ALTER TABLE ian_src ATTACH PARTITION ian_src_s FOR VALUES IN ('S')").expect("attach");
+    Spi::run("SELECT reflex_flush_partition_source('ian_src')").expect("flush");
+
+    let after_cnt = Spi::get_one::<i64>("SELECT count(*) FROM ian_v").expect("q").expect("c");
+    assert_eq!(after_cnt, 1, "filtered-out partition must not change IMV content");
+    let after_node = Spi::get_one::<i64>(
+        "SELECT relfilenode::BIGINT FROM pg_class WHERE relname = 'ian_v'",
+    )
+    .expect("q")
+    .expect("n");
+    assert_eq!(
+        before_node, after_node,
+        "an irrelevant partition attach must not reconcile (no TRUNCATE) the IMV"
+    );
+}
+
+/// Incremental partition delta (plans/2026-06-11): the headline payoff — an
+/// irrelevant attach produces no write to the base IMV, so the trigger-driven
+/// cascade never fires and a downstream child IMV is left completely untouched.
+#[pg_test]
+fn pg_part_attach_irrelevant_partition_does_not_cascade_to_child() {
+    Spi::run(
+        "CREATE TABLE iac_src (id BIGINT, region TEXT NOT NULL, amount NUMERIC) \
+         PARTITION BY LIST (region)",
+    )
+    .expect("create source");
+    Spi::run("CREATE TABLE iac_src_n PARTITION OF iac_src FOR VALUES IN ('N')").expect("p1");
+    Spi::run("INSERT INTO iac_src (id, region, amount) VALUES (1, 'N', 10)").expect("seed");
+
+    // Base unpartitioned IMV filtered to region 'N'; child aggregate on top of it.
+    Spi::run(
+        "SELECT create_reflex_ivm('iac_base', 'SELECT id, amount FROM iac_src WHERE region = ''N''', 'id')",
+    )
+    .expect("create base imv");
+    Spi::run(
+        "SELECT create_reflex_ivm('iac_child', 'SELECT count(*) AS c, sum(amount) AS s FROM iac_base')",
+    )
+    .expect("create child imv");
+
+    let child_node_before = Spi::get_one::<i64>(
+        "SELECT relfilenode::BIGINT FROM pg_class WHERE relname = 'iac_child'",
+    )
+    .expect("q")
+    .expect("n");
+
+    // Attach an irrelevant partition 'S' with data.
+    Spi::run("CREATE TABLE iac_src_s (id BIGINT, region TEXT NOT NULL, amount NUMERIC)")
+        .expect("child tbl");
+    Spi::run("INSERT INTO iac_src_s (id, region, amount) VALUES (2, 'S', 50)").expect("child data");
+    Spi::run("ALTER TABLE iac_src ATTACH PARTITION iac_src_s FOR VALUES IN ('S')").expect("attach");
+    Spi::run("SELECT reflex_flush_partition_source('iac_src')").expect("flush");
+
+    // Child content correct (still only the N row counted)...
+    let child_c = Spi::get_one::<i64>("SELECT c FROM iac_child").expect("q").expect("c");
+    assert_eq!(child_c, 1, "child must still reflect only the in-filter row");
+    // ...and the cascade never touched the child target (no TRUNCATE/rebuild).
+    let child_node_after = Spi::get_one::<i64>(
+        "SELECT relfilenode::BIGINT FROM pg_class WHERE relname = 'iac_child'",
+    )
+    .expect("q")
+    .expect("n");
+    assert_eq!(
+        child_node_before, child_node_after,
+        "irrelevant attach must not cascade a rebuild to downstream child IMVs"
+    );
+}
+
+/// Incremental partition delta (plans/2026-06-11): DETACH of an in-filter
+/// partition removes its rows from the unpartitioned IMV via a DELETE delta.
+#[pg_test]
+fn pg_part_detach_in_filter_partition_removes_rows_incrementally() {
+    Spi::run(
+        "CREATE TABLE idd_src (id BIGINT, region TEXT NOT NULL, amount NUMERIC) \
+         PARTITION BY LIST (region)",
+    )
+    .expect("create source");
+    Spi::run("CREATE TABLE idd_src_n PARTITION OF idd_src FOR VALUES IN ('N')").expect("p1");
+    Spi::run("CREATE TABLE idd_src_s PARTITION OF idd_src FOR VALUES IN ('S')").expect("p2");
+    Spi::run("INSERT INTO idd_src (id, region, amount) VALUES (1, 'N', 10), (2, 'S', 50)")
+        .expect("seed");
+
+    Spi::run(
+        "SELECT create_reflex_ivm('idd_v', 'SELECT id, amount FROM idd_src WHERE region IN (''N'',''S'')', 'id')",
+    )
+    .expect("create imv");
+    assert_eq!(
+        Spi::get_one::<i64>("SELECT count(*) FROM idd_v").expect("q").expect("c"),
+        2,
+        "baseline: both rows"
+    );
+
+    Spi::run("ALTER TABLE idd_src DETACH PARTITION idd_src_s").expect("detach");
+    Spi::run("SELECT reflex_flush_partition_source('idd_src')").expect("flush");
+
+    assert_eq!(
+        Spi::get_one::<i64>("SELECT count(*) FROM idd_v").expect("q").expect("c"),
+        1,
+        "detached partition's rows must be removed"
+    );
+    assert_eq!(
+        Spi::get_one::<i64>("SELECT count(*) FROM idd_v WHERE id = 2").expect("q").expect("c"),
+        0,
+        "the S row (id=2) must be gone"
+    );
+}
+
+/// Incremental partition delta (plans/2026-06-11): creating an EMPTY new
+/// partition is a no-op — empty transition produces no write.
+#[pg_test]
+fn pg_part_attach_empty_partition_is_noop() {
+    Spi::run(
+        "CREATE TABLE iep_src (id BIGINT, region TEXT NOT NULL, amount NUMERIC) \
+         PARTITION BY LIST (region)",
+    )
+    .expect("create source");
+    Spi::run("CREATE TABLE iep_src_n PARTITION OF iep_src FOR VALUES IN ('N')").expect("p1");
+    Spi::run("INSERT INTO iep_src (id, region, amount) VALUES (1, 'N', 10)").expect("seed");
+
+    Spi::run(
+        "SELECT create_reflex_ivm('iep_v', 'SELECT id, amount FROM iep_src WHERE region IN (''N'',''S'')', 'id')",
+    )
+    .expect("create imv");
+
+    let before_node = Spi::get_one::<i64>(
+        "SELECT relfilenode::BIGINT FROM pg_class WHERE relname = 'iep_v'",
+    )
+    .expect("q")
+    .expect("n");
+
+    // CREATE an empty new partition (no data).
+    Spi::run("CREATE TABLE iep_src_s PARTITION OF iep_src FOR VALUES IN ('S')").expect("p2");
+    Spi::run("SELECT reflex_flush_partition_source('iep_src')").expect("flush");
+
+    assert_eq!(
+        Spi::get_one::<i64>("SELECT count(*) FROM iep_v").expect("q").expect("c"),
+        1,
+        "empty partition must not change content"
+    );
+    let after_node = Spi::get_one::<i64>(
+        "SELECT relfilenode::BIGINT FROM pg_class WHERE relname = 'iep_v'",
+    )
+    .expect("q")
+    .expect("n");
+    assert_eq!(before_node, after_node, "empty partition must not reconcile the IMV");
+}
+
+/// Incremental partition delta (plans/2026-06-11): an AGGREGATE unpartitioned IMV
+/// folds an attached partition's rows into its groups incrementally; result
+/// matches a from-scratch recomputation (oracle).
+#[pg_test]
+fn pg_part_attach_matching_partition_updates_aggregate_imv() {
+    Spi::run(
+        "CREATE TABLE iag_src (id BIGINT, region TEXT NOT NULL, amount NUMERIC) \
+         PARTITION BY LIST (region)",
+    )
+    .expect("create source");
+    Spi::run("CREATE TABLE iag_src_n PARTITION OF iag_src FOR VALUES IN ('N')").expect("p1");
+    Spi::run("INSERT INTO iag_src (id, region, amount) VALUES (1, 'N', 10)").expect("seed");
+
+    Spi::run(
+        "SELECT create_reflex_ivm('iag_v', 'SELECT sum(amount) AS total FROM iag_src WHERE region IN (''N'',''S'')')",
+    )
+    .expect("create imv");
+    assert_eq!(
+        Spi::get_one::<pgrx::AnyNumeric>("SELECT total FROM iag_v").expect("q").expect("t").to_string(),
+        "10"
+    );
+
+    Spi::run("CREATE TABLE iag_src_s (id BIGINT, region TEXT NOT NULL, amount NUMERIC)").expect("child");
+    Spi::run("INSERT INTO iag_src_s (id, region, amount) VALUES (2, 'S', 50)").expect("child data");
+    Spi::run("ALTER TABLE iag_src ATTACH PARTITION iag_src_s FOR VALUES IN ('S')").expect("attach");
+    Spi::run("SELECT reflex_flush_partition_source('iag_src')").expect("flush");
+
+    // Oracle: incremental result equals a fresh recomputation.
+    let imv_total = Spi::get_one::<pgrx::AnyNumeric>("SELECT total FROM iag_v")
+        .expect("q")
+        .expect("t")
+        .to_string();
+    let fresh_total = Spi::get_one::<pgrx::AnyNumeric>(
+        "SELECT sum(amount) FROM iag_src WHERE region IN ('N','S')",
+    )
+    .expect("q")
+    .expect("t")
+    .to_string();
+    assert_eq!(imv_total, fresh_total, "aggregate IMV must match fresh recomputation");
+    assert_eq!(imv_total, "60");
+}
+
+/// Incremental partition delta (plans/2026-06-11): a JOIN IMV (multi-source, so
+/// empty where_predicate) on a partitioned source still applies an attached
+/// partition correctly — the delta joins the transition to the dimension table.
+/// Oracle: incremental result equals a fresh recomputation.
+#[pg_test]
+fn pg_part_attach_partition_join_imv_matches_fresh() {
+    Spi::run(
+        "CREATE TABLE ijn_src (id BIGINT, region TEXT NOT NULL, amount NUMERIC) \
+         PARTITION BY LIST (region)",
+    )
+    .expect("create source");
+    Spi::run("CREATE TABLE ijn_src_n PARTITION OF ijn_src FOR VALUES IN ('N')").expect("p1");
+    Spi::run("CREATE TABLE ijn_dim (id BIGINT, label TEXT)").expect("dim");
+    Spi::run("INSERT INTO ijn_dim (id, label) VALUES (1, 'a'), (2, 'b')").expect("dim seed");
+    Spi::run("INSERT INTO ijn_src (id, region, amount) VALUES (1, 'N', 10)").expect("seed");
+
+    Spi::run(
+        "SELECT create_reflex_ivm('ijn_v', \
+            'SELECT s.id, s.amount, d.label FROM ijn_src s JOIN ijn_dim d ON d.id = s.id', 'id')",
+    )
+    .expect("create join imv");
+
+    Spi::run("CREATE TABLE ijn_src_s (id BIGINT, region TEXT NOT NULL, amount NUMERIC)")
+        .expect("child");
+    Spi::run("INSERT INTO ijn_src_s (id, region, amount) VALUES (2, 'S', 50)").expect("child data");
+    Spi::run("ALTER TABLE ijn_src ATTACH PARTITION ijn_src_s FOR VALUES IN ('S')").expect("attach");
+    Spi::run("SELECT reflex_flush_partition_source('ijn_src')").expect("flush");
+
+    // Oracle: the IMV exactly equals a from-scratch join.
+    let diff = Spi::get_one::<i64>(
+        "SELECT count(*) FROM ( \
+            (SELECT * FROM ijn_v \
+               EXCEPT ALL SELECT s.id, s.amount, d.label FROM ijn_src s JOIN ijn_dim d ON d.id = s.id) \
+            UNION ALL \
+            (SELECT s.id, s.amount, d.label FROM ijn_src s JOIN ijn_dim d ON d.id = s.id \
+               EXCEPT ALL SELECT * FROM ijn_v) \
+         ) __oracle",
+    )
+    .expect("q")
+    .expect("c");
+    assert_eq!(diff, 0, "join IMV must equal a fresh recomputation after attach");
+    assert_eq!(
+        Spi::get_one::<i64>("SELECT count(*) FROM ijn_v").expect("q").expect("c"),
+        2,
+        "both joined rows present"
+    );
+}
+
 #[pg_test]
 fn pg_part_event_trigger_detach_keeps_orphan_partition() {
     // drop_orphans=FALSE is the safety default for auto-sync — DETACH on the

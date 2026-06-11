@@ -1573,6 +1573,19 @@ fn persist_metadata(client: &mut SpiClient<'_>, ctx: &BuildContext) {
     .unwrap_or_report();
 
     add_graph_child_links(client, ctx.view_name, &ctx.ivm_froms).unwrap_or_report();
+
+    // Seed the source-partition snapshot for every partitioned source this IMV
+    // depends on, capturing the leaf set the IMV was just built over. The
+    // partition-attach flush diffs against this baseline; without it an
+    // unpartitioned IMV's first flush would see every existing leaf as newly
+    // attached and re-apply already-present partitions. The partitioned-IMV path
+    // seeds this via its mirror build; this covers unpartitioned IMVs. Idempotent
+    // (refresh does DELETE+INSERT).
+    for source in &ctx.real_source_names {
+        if crate::partition::introspect_partition_descriptor(client, source).is_some() {
+            crate::partition::refresh_source_snapshot(client, source);
+        }
+    }
 }
 
 /// For aggregate IMVs (skipped for passthrough — CREATE TABLE AS already
