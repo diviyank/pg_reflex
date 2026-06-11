@@ -34,6 +34,14 @@ Plan-quality coverage is uniformly **Untested** across all constructs (only the 
 
 **Plan-quality axis:** All constructs **Untested** except the calibration baseline. The audit suite does not yet assert O(delta) scaling for individual constructs; only `assert_sublinear` exists in `pg_test_audit_gaps.rs` and has validated passthrough's O(delta) behavior as proof-of-concept.
 
+### Phase 2 update (supersedes the cells above)
+
+Phase 2 (modules M1+M2) moved several cells. Current state:
+
+- **Cross-source consistency guard — correctness: Untested → Proven** (`pg_test_cross_source.rs`, 7 oracle tests; §3 M1). The single remaining correctness gap from the Phase-1 snapshot is closed; correctness is now **9 Proven / 7 Weak / 0 Untested**.
+- **Plan-quality: Untested → Proven** for **passthrough** (calibration), **single-source aggregate**, **multi-source / inner-join aggregate**, **aggregate + LEFT-JOIN secondary** (Phase-1 Task 4), **CTE-decomposed**, and **UNION ALL** (`audit_*_is_sublinear`, §3 M2). Plan-quality is no longer "uniformly Untested": the six aggregate/passthrough shapes are Proven O(delta); DISTINCT ON, window, inner-join-passthrough, partitioned, filter shapes remain Untested on plan-quality (Phase 2B).
+- Caveat unchanged: these are wall-clock heuristics under one mutation each; the white-box `EXPLAIN`-rows probe (Phase 2B M3) and the combinatorial gate axes (M4–M6) are the rigorous generalization.
+
 ## §2 Escape analysis — why each field bug since 1.7.2 slipped
 
 | Release | Bug (1 line) | Escaped axis-combo | Root cause | Covered today? | Phase-2 axis that closes it |
@@ -111,6 +119,29 @@ Task 5 — window ROW_NUMBER update re-rank: PASS — correctness Proven.
 Task 6 — DISTINCT ON winner demotion: PASS — correctness Proven.
 
 Task 7 — IN-subquery filter relevance: PASS — correctness Proven. Strengthened to be faithful to the 1.10.2 class: the IMV declares unique key `k`, and the out-of-filter row (k=1,p=2) collides on `k` with the in-filter row (k=1,p=1), so the keyed-delete path that silently removed in-filter rows in 1.10.2 is actually exercised. The fix covers `IN (SELECT …)`, not just `= (SELECT …)`.
+
+### Phase 2 M1 — Cross-source consistency guard
+
+The rank-1 Untested item. The guard (`src/trigger/deferred.rs:401-533`) engages
+when ≥2 distinct sources stage deltas in one transaction and an IMV joins ≥2 of
+them, full-reconciling that IMV once (via the `__reflex_deferred_reconciled_batch`
+marker) so ΔA⋈ΔB is not double-counted. Seven oracle tests
+(`src/tests/pg_test_cross_source.rs`), each diffing the IMV against a fresh
+recompute via `assert_imv_correct`, **all PASS** (0 mismatches):
+
+- `xs_inner_join_both_sources_mutated_matches_recompute` — inner join, both mutated.
+- `xs_left_join_both_sources_mutated_matches_recompute` — left join, both mutated.
+- `xs_insert_a_delete_b_matches_recompute` — INSERT×DELETE.
+- `xs_update_a_update_b_matches_recompute` — UPDATE×UPDATE.
+- `xs_single_source_mutated_incremental_matches_recompute` — one source only
+  (guard must NOT engage; incremental path still correct).
+- `xs_three_source_two_mutated_matches_recompute` — 3-source join, 2 mutated.
+- `xs_two_imvs_shared_source_each_reconciled_once` — marker-skip path.
+
+Verdict: the guard is correct across join types, mutation kinds, the no-engage
+path, multi-way joins, and the marker. The rank-1 gap is closed as live coverage;
+no bug found. (Same honest caveat as below: one mutation batch per shape; the
+combinatorial gate axis — Phase 2B `MutationSpread` — generalizes it.)
 
 ### Phase 2 M2 — Plan-quality scaling
 
