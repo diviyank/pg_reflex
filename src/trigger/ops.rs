@@ -1,3 +1,4 @@
+use super::union_delta::scoped_delta_query;
 use super::*;
 use crate::aggregation::AggregationPlan;
 use crate::query_decomposer::{
@@ -25,7 +26,7 @@ pub(crate) fn aggregate_insert_stmts(
     new_tbl: &str,
     stmts: &mut Vec<String>,
 ) {
-    let delta_q = replace_source_with_transition(base_query, source_table, new_tbl);
+    let delta_q = scoped_delta_query(base_query, source_table, new_tbl);
 
     // Bulk-INSERT eligibility:
     //   * Item α promoted OUT→IN (op = INSERT_PROMOTED), AND
@@ -109,7 +110,7 @@ pub(crate) fn aggregate_delete_stmts(
     old_tbl: &str,
     stmts: &mut Vec<String>,
 ) -> bool {
-    let delta_q = replace_source_with_transition(base_query, source_table, old_tbl);
+    let delta_q = scoped_delta_query(base_query, source_table, old_tbl);
 
     // Bulk-DELETE eligibility:
     //   * Item α IN→OUT promotion (op = DELETE_PROMOTED) OR a
@@ -222,8 +223,8 @@ pub(crate) fn aggregate_update_stmts(
     new_tbl: &str,
     stmts: &mut Vec<String>,
 ) -> Option<String> {
-    let delta_old = replace_source_with_transition(base_query, source_table, old_tbl);
-    let delta_new = replace_source_with_transition(base_query, source_table, new_tbl);
+    let delta_old = scoped_delta_query(base_query, source_table, old_tbl);
+    let delta_new = scoped_delta_query(base_query, source_table, new_tbl);
 
     let has_topk = plan.intermediate_columns.iter().any(|ic| ic.has_topk());
 
@@ -412,10 +413,12 @@ pub(crate) struct PendingDispatch {
     pub(crate) merge_sql: String,
 }
 
-/// Self-join full refresh: source_table appears multiple times in base_query, so
-/// the standard delta is wrong (every alias gets replaced with the same transition).
-/// Both passthrough and aggregate paths rebuild from base_query.
-pub(crate) fn self_join_full_refresh_stmts(
+/// Full refresh: rebuild the IMV from `base_query`/`end_query` when no valid
+/// incremental delta exists. Used for self-joins (the source appears multiple
+/// times, so a single transition swap is wrong) and for a source inside a
+/// non-distributive set-op (UNION/INTERSECT/EXCEPT) subquery. Both passthrough
+/// and aggregate shapes rebuild from `base_query`.
+pub(crate) fn full_refresh_stmts(
     view_name: &str,
     base_query: &str,
     end_query: &str,
@@ -939,7 +942,7 @@ pub(crate) fn passthrough_op_stmts(
 
     match operation {
         "INSERT" | "INSERT_PROMOTED" => {
-            let delta_q = replace_source_with_transition(base_query, source_table, &pt_new);
+            let delta_q = scoped_delta_query(base_query, source_table, &pt_new);
             stmts.push(format!("INSERT INTO {} {}", qv, delta_q));
             if operation == "INSERT_PROMOTED" {
                 stmts.push(format!("ANALYZE {}", qv));
@@ -1016,7 +1019,7 @@ pub(crate) fn passthrough_op_stmts(
                     source_cols.join(", "),
                     pt_old
                 );
-                let delta_new = replace_source_with_transition(base_query, source_table, &pt_new);
+                let delta_new = scoped_delta_query(base_query, source_table, &pt_new);
                 let base_ins = format!("INSERT INTO {} {}", qv, delta_new);
 
                 if let Some((part_col, part_col_q, part_src_q, strategy)) =

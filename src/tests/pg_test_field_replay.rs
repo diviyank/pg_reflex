@@ -87,7 +87,6 @@ fn replay_sop_baseline_multisource_mutation_matches_recompute() {
 /// R2b — 1.10.1 plan-quality: a 1-row primary delta must stay O(delta), not
 /// re-aggregate the whole union. The literal regression that took 18 minutes.
 #[pg_test]
-#[ignore = "CONFIRMED plan-quality regression at sop_baseline shape; see docs/audit/2026-06-ivm-audit.md §3; RED"]
 fn replay_sop_baseline_secondary_is_sublinear() {
     for (suf, n) in [("s", 20000_i32), ("b", 500000_i32)] {
         Spi::run(&format!("CREATE TABLE sp_{s} (id INT PRIMARY KEY)", s = suf)).unwrap();

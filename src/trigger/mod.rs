@@ -196,7 +196,7 @@ pub fn reflex_build_delta_sql(
         || (is_full_outer && !is_self_join);
 
     if is_self_join {
-        self_join_full_refresh_stmts(
+        full_refresh_stmts(
             view_name,
             base_query,
             end_query,
@@ -217,6 +217,19 @@ pub fn reflex_build_delta_sql(
             &affected_tbl,
             &old_tbl,
             &new_tbl,
+            &mut stmts,
+        );
+    } else if union_delta::source_requires_recompute(base_query, source_table) {
+        // The mutated source sits inside a non-distributive set-op
+        // (UNION/INTERSECT/EXCEPT) subquery: no incremental delta is valid, so
+        // recompute the affected IMV in full. Covers both passthrough and
+        // aggregate shapes (full_refresh_stmts branches on plan.is_passthrough).
+        full_refresh_stmts(
+            view_name,
+            base_query,
+            end_query,
+            &intermediate_tbl,
+            &plan,
             &mut stmts,
         );
     } else if plan.is_passthrough {
@@ -501,6 +514,7 @@ mod dispatch;
 mod merge;
 mod ops;
 mod scope;
+mod union_delta;
 
 #[cfg(test)]
 pub(crate) use deferred::build_netted_view_sql;

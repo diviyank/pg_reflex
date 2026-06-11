@@ -28,11 +28,19 @@ self-contained regressions: `current_assortment_activity_view` (1.10.2) — corr
   §3 Phase 2B). Root cause: `try_decompose_distinct_on` passed the outer view's key
   to the pre-dedup `__base` sub-IMV. Fix (`decompose.rs`): `__base` auto-infers its
   source key. RED→GREEN; 20 DISTINCT ON + 99 CTE + gate tests unaffected.
-- **B2 — root-caused, fix deferred** (a focused effort). `sop_incoming_stock_baseline`
-  maintains a 1-row delta in **O(base)** (74ms→1150ms at 25×; §3 Phase 3 R2b +
-  "B2 root cause"). The primary-delta recompute swaps the *changed* UNION-ALL operand
-  for its transition table but **full-scans the unchanged operands**. Correctness-
-  neutral; the production "slow view" pain, reproduced and precisely pinned.
+- **B2 — FIXED** ✅ (2026-06-11). Originally logged as "correctness-neutral, O(base),
+  deferred." Re-investigation **disproved** the correctness-neutral claim: for an
+  aggregate over a `UNION ALL` subquery, a mutation to a table in one operand built
+  the delta by swapping only that operand's table and leaving siblings full, then
+  **MERGE-added** the result — double-counting every sibling row. Proven silent
+  wrong answer (`SUM` = 14 vs correct 12 when a sibling contributes non-zero); the
+  production view only looked correct because its `stb` branch projects `0 AS purch`.
+  Same root cause drove the O(base) scan. Fix (`src/trigger/union_delta.rs`): the
+  delta query prunes the `UNION ALL` subquery to only the operand(s) referencing the
+  changed source (SUM/COUNT distribute over multiset union) → correct **and** O(delta);
+  non-distributive `UNION`/`INTERSECT`/`EXCEPT` fall back to a correct full recompute.
+  The same bug existed in the passthrough path and is fixed by the same scoping.
+  R2b now passes (un-ignored); +7 regression tests; full suite green.
 
 **Net:** correctness 9 Proven / 7 Weak / 0 Untested; plan-quality 6 shapes Proven
 (was 0); +20 new regression tests; the gate now exercises the field-bug regions;
@@ -292,38 +300,47 @@ Per §4 gap #6 (rank 3), two production views that caused the worst field incide
 
 - **R1 (1.10.2) — `current_assortment_activity_view`**: Two correctness tests (noncurrent key-collision, noncurrent batch relevance-skip). Both **PASS** — the 1.10.2 fix holds at the real shape; active regressions.
 - **R2a (1.10.1) — `sop_incoming_stock_baseline_view` correctness**: Multi-source mutation (INSERT primary + UPDATE secondary in one deferred batch) on the aggregate + UNION ALL + LEFT-JOIN secondary shape. **PASS** — correctness oracle validates the fix.
-- **R2b (1.10.1) — plan-quality**: A 1-row primary delta over 20k vs 500k row bases. **FAIL** — CONFIRMED O(base) regression (small=74ms, big=1150ms; ratio 15.5x, threshold 25x). The 1.10.1 fix did NOT resolve the plan-quality issue at the distilled shape. Marked `#[ignore = "CONFIRMED plan-quality regression"]` (RED).
+- **R2b (1.10.1) — plan-quality**: A 1-row primary delta over 20k vs 500k row bases. Originally **FAIL** — O(base) (small=74ms, big=1150ms; 15.5x). **NOW PASS** after the B2 fix (operand-scoped delta): the delta no longer scans the unchanged operand, so maintenance is O(delta). The `#[ignore]` was removed; it is an active sublinear guard.
 
-**Verdict:** Correctness is proven at both 1.10.1 and 1.10.2 shapes (3 active tests). Plan-quality regression at sop_baseline is confirmed a 1.10.1-class bug that still scales with base; filed for the fix-pass. The real shapes now have CI coverage.
+**Verdict:** Correctness is proven at both 1.10.1 and 1.10.2 shapes (3 active tests). The sop_baseline plan-quality regression was traced to the same root cause as a newly-discovered silent correctness bug (B2) and **fixed** — both O(delta) and correct. The real shapes now have CI coverage.
 
-#### B2 root cause — INVESTIGATED (systematic-debugging)
+#### B2 root cause — FIXED (systematic-debugging, 2026-06-11)
 
-Three hypotheses were tested and **refuted** before the real cause was pinned:
-1. ❌ *"`source_join_keys` isn't populated (qualified-vs-bare name bug)"* — disproven:
-   `(aggregations->'source_join_keys')` = `{"unit_pricing": [["product_id","product_id"]]}`,
-   correctly populated. The scoped secondary path IS reachable.
-2. ❌ *"missing index on the group key in the synthetic tables"* — disproven: adding
-   `INDEX (product_id, location_id, delivery_date)` left it O(base) (66ms→1232ms).
-3. ❌ *"the full-scan double-counts the unchanged branch's aggregate"* — disproven:
-   correctness holds even when a `pb` delta lands in a group that overlaps a `stb`
-   row, including with a `stb`-driven second aggregate. **B2 is correctness-neutral.**
+**The earlier "correctness-neutral / plan-quality only" verdict was wrong.** The
+hypothesis-3 refutation ("the full-scan double-counts the unchanged branch") was a
+false negative: it was tested only against the production shape, whose `stb` branch
+projects `0 AS purch`, so the double-scanned operand contributes **0** to every SUM
+and the corruption is invisible in the output (only `__ivm_count`/`__nonnull_count`
+inflate, and they only gate via `> 0`). A probe with a **non-zero** sibling operand
+produced a **silent wrong answer**: `SUM` = 14 vs correct 12.
 
-**Real cause:** the *primary-delta* aggregate recompute (`reflex_build_delta_sql`,
-INSERT path) rebuilds the scratch as
-`SELECT … FROM ( <changed branch over __reflex_new_pb> UNION ALL <UNCHANGED branch
-over the FULL stb> ) … GROUP BY …`. It correctly swaps the *changed* union operand
-for its transition table, but **scans every *unchanged* UNION-ALL operand in full**
-— that full scan of `stb` (and any other operands) is the O(base) cost. Correctness
-is preserved by the affected-group recompute, so this is purely plan quality.
+**Real cause:** for an aggregate over a `( op_a UNION ALL op_b )` subquery, the
+trigger-time delta rewriter (`replace_source_with_transition`) swaps only the
+changed operand's table for its transition table and leaves the sibling operand
+referencing the FULL base table. The result — `agg( Δop_a ⊎ full op_b )` — is then
+MERGE-**added** (`aggregate_insert_stmts`), so every sibling row is re-counted on
+every mutation. Two symptoms, one cause: **(1) double-count** (correctness, masked
+only when siblings add 0 to SUMs) and **(2) O(base)** full sibling scan. DELETE and
+UPDATE shared the bug via the same rewriter + MERGE-subtract/net-delta.
 
-**Fix direction (deferred — deep):** restrict the unchanged operands to the
-affected groups (push `(group keys) IN (affected)` into each unchanged branch) so
-the recompute touches only delta-sized slices. This is aggregate-maintenance
-codegen surgery whose correctness invariant must be preserved exactly; it warrants
-a **focused standalone effort**, not a tail-of-session patch. Severity: **plan
-quality only** (operationally severe — the production "slow view" — but not wrong
-results). RED repro: `replay_sop_baseline_secondary_is_sublinear` (`#[ignore]`).
+**Fix (`src/trigger/union_delta.rs`):** `UNION ALL` is a multiset sum, so SUM/COUNT
+distribute over it — the delta equals the aggregate of the changed operand's delta
+alone. `scoped_delta_query` parses `base_query` and prunes the `UNION ALL` FROM-
+subquery to only the operand(s) referencing the changed source before applying the
+transition swap. Wired into the aggregate INSERT/DELETE/UPDATE arms *and* the
+passthrough INSERT/UPDATE arms (the same double-count surfaced there as duplicate
+rows). Sources spanning *all* operands fall through to the existing self-join full
+refresh (unchanged); non-distributive `UNION`/`INTERSECT`/`EXCEPT` subqueries
+referencing the source route to a correct full recompute via
+`source_requires_recompute` (guard placed before the passthrough branch, so it
+covers both shapes). Result: correct **and** O(delta).
+
+**Verification:** `replay_sop_baseline_secondary_is_sublinear` un-ignored → GREEN;
+`src/tests/pg_test_union_subquery_delta.rs` adds 7 regressions (aggregate
+INSERT/DELETE/UPDATE with a non-zero sibling, zero-sibling production shape,
+passthrough INSERT + keyed UPDATE/DELETE, `UNION`-distinct recompute); full suite
+green, unit tests green, clippy+fmt clean.
 
 ### Phase-1 bottom line
 
-Four named suspected gaps were instrumented; **all four PASSED**, converting Weak/Untested cells into live oracle regressions and showing the 1.10.1/1.10.2 fixes generalize. The audit found **no new live bug** — but it found the *real* systemic holes: the cross-source guard is untested (rank 1), plan-quality is unguarded everywhere (rank 2), and the release gate never exercises the regions where all 20 field bugs lived (rank 3). Those are Phase 2's mandate. Phase 3 field replays confirmed correctness at two production shapes and surfaced a **live open 1.10.1-region plan-quality regression** at the sop_baseline shape (15.5x O(base) scaling on a 1-row delta).
+Four named suspected gaps were instrumented; **all four PASSED**, converting Weak/Untested cells into live oracle regressions and showing the 1.10.1/1.10.2 fixes generalize. The audit found systemic holes — the cross-source guard untested (rank 1), plan-quality unguarded everywhere (rank 2), the release gate blind to the field-bug regions (rank 3) — which were Phase 2's mandate. Phase 3 field replays confirmed correctness at two production shapes and surfaced what was logged as a plan-quality regression at the sop_baseline shape. **That regression was later traced to a silent correctness bug (B2) for `UNION ALL`-subquery aggregates and fixed** (operand-scoped delta; §3 "B2 root cause — FIXED"): one root cause, both the wrong answer and the O(base) scan resolved together.

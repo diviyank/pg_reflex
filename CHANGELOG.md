@@ -2,6 +2,55 @@
 
 ## [Unreleased]
 
+Correctness + performance fix for incremental maintenance of IMVs whose FROM
+clause contains a `UNION ALL` subquery, e.g. `SELECT g, SUM(x) FROM (… FROM a
+UNION ALL … FROM b) st GROUP BY g`. A mutation to a table in one operand was
+maintained as if the whole subquery were the delta, re-scanning and re-counting
+the *unchanged* sibling operands — a silent wrong answer (previously logged as
+"correctness-neutral") plus an O(base) full scan. No catalog/schema or
+function-signature changes; the fix is in the Rust trigger codegen, recompiled
+into the module.
+
+### Fixed
+
+- **`UNION ALL`-subquery aggregates double-counted unchanged operands.** The
+  trigger-time delta rewriter swapped only the mutated operand's table for its
+  transition table and left the sibling operands referencing their full base
+  tables, then MERGE-**added** the result as if it were a delta. So every
+  sibling row was re-counted on every mutation: a silent wrong `SUM` in
+  overlapping groups (masked in the field only because the production
+  `sop_incoming_stock_baseline_view` projects `0 AS purch` for its second
+  operand, so the double-count summed to zero) and a full-base re-scan
+  (O(base) — a 1-row delta took ~18 min on the production view). `UNION ALL`
+  is a multiset sum, so `SUM`/`COUNT` distribute over it; the delta query now
+  prunes the subquery to only the operand(s) referencing the changed source
+  before the transition swap, so maintenance is both correct **and** O(delta).
+  DELETE/UPDATE shared the bug via the same rewriter and are fixed the same way.
+- **Passthrough over a `UNION ALL` subquery duplicated sibling rows.** The same
+  root cause surfaced in the non-aggregate path as an INSERT re-appending the
+  full unchanged operand. Fixed by the same operand scoping (INSERT + UPDATE).
+- **Non-distributive set-op subqueries now recompute correctly.** A source
+  inside a `UNION` (distinct) / `INTERSECT` / `EXCEPT` subquery has no valid
+  incremental delta; such mutations now fall back to a correct full recompute
+  (both aggregate and passthrough) instead of the invalid operand swap.
+
+### Tests
+
+- New `src/tests/pg_test_union_subquery_delta.rs` (8 oracle regressions):
+  aggregate INSERT/DELETE/UPDATE with a non-zero sibling operand, the
+  zero-sibling production shape, passthrough INSERT + keyed UPDATE/DELETE, the
+  no-key cross-operand collision (full-refresh) case, and the `UNION`-distinct
+  recompute fallback. `replay_sop_baseline_secondary_is_sublinear` (the field
+  replay that took 18 min) is un-ignored and now an active sublinear guard.
+  Full `pg_test` + unit suites stay green; `clippy`/`fmt` clean.
+
+### Migration
+
+- No catalog/schema or function-signature change. The corrected delta SQL is
+  generated at trigger time from the unchanged stored `base_query`, so existing
+  IMVs are fixed automatically once the recompiled module is loaded — no
+  rebuild, refresh, or DROP/recreate needed.
+
 ## [1.10.2] - 2026-06-10
 
 Correctness + efficiency fix for IMVs filtered by an uncorrelated scalar
