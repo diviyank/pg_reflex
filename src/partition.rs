@@ -1871,12 +1871,18 @@ pub(crate) fn refresh_source_snapshot(client: &mut pgrx::spi::SpiClient<'_>, sou
     for leaf in leaves {
         let ancestors = leaf_ancestor_chain(&tree, &leaf.bare_name);
         let ancestors_arr = format_pg_text_array(&ancestors);
+        // Capture the leaf's `FOR VALUES …` bound. The detach-then-drop flush
+        // path proves an irrelevant dropped partition was a no-op by probing the
+        // IMV filter against this bound (the child itself is gone by flush time).
         let _ = client.update(
             "INSERT INTO public.__reflex_source_partition_snapshot \
                  (source_root, child_name, child_oid, bound, ancestors) \
-             VALUES ($1, $2, $3, NULL, $4::TEXT[]) \
+             SELECT $1, $2, $3, pg_get_expr(c.relpartbound, c.oid), $4::TEXT[] \
+             FROM pg_class c WHERE c.oid = $3::oid \
              ON CONFLICT (source_root, child_name) \
-                 DO UPDATE SET child_oid = EXCLUDED.child_oid, ancestors = EXCLUDED.ancestors",
+                 DO UPDATE SET child_oid = EXCLUDED.child_oid, \
+                              bound = EXCLUDED.bound, \
+                              ancestors = EXCLUDED.ancestors",
             None,
             &[
                 unsafe { DatumWithOid::new(key.clone(), pgrx::pg_sys::TEXTOID) },
@@ -1905,6 +1911,19 @@ fn oid_to_qualified_name(client: &pgrx::spi::SpiClient<'_>, oid: u32) -> Option<
         .ok()
         .and_then(|mut it| it.next())
         .and_then(|r| r.get_by_name::<&str, _>("q").ok().flatten())
+        .map(|s| s.to_string())
+}
+
+/// Extract the inner value list of a single-key LIST partition bound, i.e. the
+/// `…` of `FOR VALUES IN (…)`. Returns None for RANGE/HASH/DEFAULT bounds (whose
+/// text does not match the prefix) — those callers fall back to reconcile. The
+/// prefix is fixed and the closing `)` is always the last character, so stripping
+/// is robust regardless of the value literals' content (no comma-splitting).
+fn list_bound_inner(bound: &str) -> Option<String> {
+    bound
+        .trim()
+        .strip_prefix("FOR VALUES IN (")
+        .and_then(|s| s.strip_suffix(')'))
         .map(|s| s.to_string())
 }
 
@@ -2011,6 +2030,38 @@ pub(crate) fn reflex_flush_partitions_impl(only: Option<&str>) -> String {
                     Some((n, a))
                 })
                 .collect();
+
+            // Captured `FOR VALUES …` bound per snapshot leaf, keyed by child_name.
+            // Used to prove a detached-then-dropped partition was irrelevant to an
+            // unpartitioned IMV's filter once the child itself is gone.
+            let snapshot_bounds: std::collections::HashMap<String, Option<String>> = client
+                .select(
+                    "SELECT child_name, bound FROM public.__reflex_source_partition_snapshot \
+                     WHERE source_root = $1",
+                    None,
+                    &[unsafe { DatumWithOid::new(root_key.clone(), pgrx::pg_sys::TEXTOID) }],
+                )
+                .map_err(|e| format!("flush: snapshot bounds read failed: {}", e))?
+                .filter_map(|r| {
+                    let n = r
+                        .get_by_name::<&str, _>("child_name")
+                        .ok()
+                        .flatten()?
+                        .to_string();
+                    let b = r
+                        .get_by_name::<&str, _>("bound")
+                        .ok()
+                        .flatten()
+                        .map(|s| s.to_string());
+                    Some((n, b))
+                })
+                .collect();
+
+            // Single partition-key column (lowercased) for the bound probe; only a
+            // single-key LIST source is eligible (multi-key/RANGE → reconcile).
+            let part_key_col: Option<String> = introspect_partition_descriptor(client, root)
+                .filter(|d| d.column_names.len() == 1)
+                .map(|d| d.column_names[0].clone());
 
             let current = current_source_leaf_oids(client, root);
             let actions = classify_partition_diff(&snapshot, &current);
@@ -2155,9 +2206,30 @@ pub(crate) fn reflex_flush_partitions_impl(only: Option<&str>) -> String {
                                 sql_literal_text(&child),
                                 sql_literal_text(trans),
                             )),
+                            // Child gone (detached then dropped before this flush).
+                            // For a DROP we can still prove the partition was
+                            // irrelevant — and thus a guaranteed no-op — by probing
+                            // the IMV filter against the captured LIST bound. The
+                            // SQL helper reconciles for any inconclusive case, so
+                            // an unprovable drop stays correct.
                             None => {
-                                force_reconcile = true;
-                                break;
+                                let bound_inner = matches!(action, PartitionDiffAction::Drop)
+                                    .then(|| snapshot_bounds.get(leaf))
+                                    .flatten()
+                                    .and_then(|b| b.as_deref())
+                                    .and_then(list_bound_inner);
+                                match (&part_key_col, bound_inner) {
+                                    (Some(keycol), Some(inner)) => delta_stmts.push(format!(
+                                        "PERFORM public.reflex_partition_drop_maybe_skip({}, {}, {})",
+                                        sql_literal_text(imv),
+                                        sql_literal_text(keycol),
+                                        sql_literal_text(&inner),
+                                    )),
+                                    _ => {
+                                        force_reconcile = true;
+                                        break;
+                                    }
+                                }
                             }
                         }
                     }

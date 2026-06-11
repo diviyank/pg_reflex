@@ -1080,6 +1080,62 @@ extension_sql!(
     END;
     $fn$;
 
+    -- Detach-then-drop no-op proof. When a partition is DETACHed and DROPped in
+    -- the same transaction, the deferred flush at COMMIT finds the child gone and
+    -- cannot probe its rows (reflex_apply_partition_delta's path). For a DROP we
+    -- can still prove the partition was irrelevant to an UNPARTITIONED IMV's
+    -- filter — and therefore that its removal is a guaranteed no-op — from its
+    -- captured LIST bound: if no value the partition could hold passes
+    -- where_predicate, the IMV never held one of its rows. The synthetic probe
+    -- relation exposes ONLY the partition key column, so any predicate touching a
+    -- non-key column raises "column does not exist", which is trapped and
+    -- conservatively reconciled. Postgres parses the bound value list itself
+    -- (`unnest(ARRAY[…])`), so there is no fragile text splitting. Every
+    -- inconclusive branch falls back to reflex_reconcile (always correct).
+    CREATE OR REPLACE FUNCTION public.reflex_partition_drop_maybe_skip(
+        _imv TEXT, _keycol TEXT, _bound_inner TEXT
+    ) RETURNS TEXT LANGUAGE plpgsql AS $fn$
+    DECLARE
+        _wp TEXT;
+        _hit BOOLEAN;
+    BEGIN
+        SELECT where_predicate INTO _wp
+          FROM public.__reflex_ivm_reference
+         WHERE name = _imv AND enabled = TRUE;
+        IF NOT FOUND THEN RETURN 'SKIPPED (imv not found)'; END IF;
+
+        PERFORM pg_advisory_xact_lock(hashtext(_imv), hashtext(reverse(_imv)));
+
+        -- No filter → every dropped partition's rows were in the IMV; we cannot
+        -- prove a no-op, so reconcile.
+        IF _wp IS NULL OR _wp = '' THEN
+            PERFORM public.reflex_reconcile(_imv);
+            RETURN 'RECONCILED (no predicate)';
+        END IF;
+
+        BEGIN
+            EXECUTE format(
+                'SELECT bool_or(%s) FROM (SELECT unnest(ARRAY[%s]) AS %I) AS s',
+                _wp, _bound_inner, _keycol
+            ) INTO _hit;
+        EXCEPTION WHEN OTHERS THEN
+            PERFORM public.reflex_reconcile(_imv);
+            RETURN 'RECONCILED (probe inconclusive)';
+        END;
+
+        -- bool_or IS NOT TRUE  ⇔  no partition value passes the filter  ⇔  the
+        -- partition never contributed a row to the IMV  ⇔  its removal is a no-op.
+        IF _hit IS NOT TRUE THEN
+            RETURN 'SKIPPED (bound excluded by filter)';
+        END IF;
+
+        -- A value passes the filter, so the partition may have held IMV rows; they
+        -- are gone with the dropped child, so a DELETE delta is impossible.
+        PERFORM public.reflex_reconcile(_imv);
+        RETURN 'RECONCILED (bound relevant)';
+    END;
+    $fn$;
+
     CREATE OR REPLACE FUNCTION public.__reflex_partition_flush_fn()
     RETURNS TRIGGER LANGUAGE plpgsql AS $fn$
     BEGIN

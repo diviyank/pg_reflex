@@ -49,6 +49,81 @@ fn test_drop_reflex_ivm_basic() {
     assert_eq!(trig_gone, 0);
 }
 
+// Maintenance tables are persistent extension infrastructure (the registry and
+// the deferred / partition bookkeeping queues). They are NOT per-IMV and must
+// survive every create→drop cycle. Every other relation under the `__reflex_`
+// prefix is a per-IMV / per-source artifact that a complete drop must wipe.
+const COUNT_REFLEX_ARTIFACT_TABLES: &str = "SELECT COUNT(*) FROM pg_class c \
+     JOIN pg_namespace n ON n.oid = c.relnamespace \
+     WHERE c.relkind = 'r' AND c.relname LIKE '\\_\\_reflex\\_%' ESCAPE '\\' \
+       AND c.relname NOT IN ( \
+           '__reflex_ivm_reference', '__reflex_deferred_pending', \
+           '__reflex_source_partition_snapshot', '__reflex_partition_pending')";
+
+// A DEFERRED IMV is the most artifact-heavy shape: it materializes a per-source
+// staging delta table (`__reflex_delta_<source>`) on top of the per-IMV
+// intermediate / affected / scratch tables. Counting every non-maintenance
+// `__reflex_` table before create, after create, and after drop proves the
+// teardown is complete: the count must return to its pre-create baseline. The
+// staging delta table was the relation the drop path historically orphaned.
+#[pg_test]
+fn drop_deferred_imv_wipes_every_nonmaintenance_table() {
+    let baseline = Spi::get_one::<i64>(COUNT_REFLEX_ARTIFACT_TABLES)
+        .expect("q")
+        .expect("v");
+
+    Spi::run("CREATE TABLE ddw_src (id SERIAL, grp TEXT, val NUMERIC)").expect("create table");
+    Spi::run("INSERT INTO ddw_src (grp, val) VALUES ('a', 1)").expect("seed");
+
+    crate::create_reflex_ivm(
+        "ddw_view",
+        "SELECT grp, SUM(val) AS total FROM ddw_src GROUP BY grp",
+        None,
+        None,
+        Some("DEFERRED"),
+        None,
+    );
+
+    let after_create = Spi::get_one::<i64>(COUNT_REFLEX_ARTIFACT_TABLES)
+        .expect("q")
+        .expect("v");
+    assert!(
+        after_create > baseline,
+        "create should materialize per-IMV artifact tables (baseline {baseline}, after {after_create})"
+    );
+
+    // The staging delta table specifically must exist for a DEFERRED IMV — this
+    // is the relation the drop path used to leak.
+    let staging_present = Spi::get_one::<i64>(
+        "SELECT COUNT(*) FROM pg_class WHERE relkind = 'r' AND relname = '__reflex_delta_ddw_src'",
+    )
+    .expect("q")
+    .expect("v");
+    assert_eq!(staging_present, 1, "deferred IMV must create a staging delta table");
+
+    let result = crate::drop_reflex_ivm("ddw_view");
+    assert_eq!(result, "DROP REFLEX INCREMENTAL VIEW");
+
+    let after_drop = Spi::get_one::<i64>(COUNT_REFLEX_ARTIFACT_TABLES)
+        .expect("q")
+        .expect("v");
+    assert_eq!(
+        after_drop, baseline,
+        "drop must wipe every non-maintenance artifact table; \
+         a leftover count ({after_drop} vs baseline {baseline}) means an orphan — \
+         e.g. the staging delta table __reflex_delta_ddw_src"
+    );
+
+    // Belt-and-braces: the target table (not `__reflex_`-prefixed, so outside the
+    // generic count) must also be gone.
+    let target_gone = Spi::get_one::<i64>(
+        "SELECT COUNT(*) FROM information_schema.tables WHERE table_name = 'ddw_view'",
+    )
+    .expect("q")
+    .expect("v");
+    assert_eq!(target_gone, 0, "target table must be dropped");
+}
+
 #[pg_test]
 fn test_drop_reflex_ivm_refuses_with_children() {
     Spi::run("CREATE TABLE drop_ch_src (id SERIAL, grp TEXT, val NUMERIC)")

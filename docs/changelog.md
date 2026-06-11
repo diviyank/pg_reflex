@@ -4,6 +4,19 @@ The full changelog tracks every release. The latest version's headlines are on t
 
 For each version below, see [`CHANGELOG.md`](https://github.com/diviyank/pg_reflex/blob/main/CHANGELOG.md) on GitHub for the canonical text.
 
+## [1.10.4] — 2026-06-11
+
+Two follow-up fixes to 1.10.x: the partition attach/detach no-op skip now also covers DETACH-then-DROP, and `drop_reflex_ivm` no longer leaks the per-source DEFERRED staging delta table. Replace the `.so`, then `ALTER EXTENSION pg_reflex UPDATE TO '1.10.4';`.
+
+**Fixed**
+
+- DETACH-then-DROP of an irrelevant partition force-reconciled dependent unpartitioned IMVs. The 1.10.3 no-op skip works by probing the partition child's rows against the IMV `WHERE` filter, but the partition flush is a DEFERRED trigger firing at COMMIT — so detaching **and** dropping a partition in the *same transaction* (the common migration-tool pattern) leaves no child to probe, and the IMV fell back to a full `reflex_reconcile` + downstream cascade. On `base-db-anchor-evm`, dropping a non-`sop_current_view` assortment partition rebuilt the whole `current_assortment_activity_view` ~20-IMV subtree. Performance only — the reconcile was correct. The fix proves irrelevance from the partition's captured `LIST` bound (now stored in `__reflex_source_partition_snapshot.bound`) via the new `reflex_partition_drop_maybe_skip` SPI: sound by construction, since the probe exposes only the partition key column and every inconclusive case (non-key predicate, `RANGE`/`HASH`, multi-key, no filter) falls back to `reflex_reconcile`.
+- `drop_reflex_ivm` leaked the per-source DEFERRED staging delta table (`__reflex_delta_<source>`) — flagged by `reflex_audit`'s `OrphanStaging` check. It is now dropped when the last DEFERRED IMV on a source is dropped (`IF EXISTS`, so a no-op for IMMEDIATE IMVs). Pre-1.10.4 orphans heal at create time.
+
+**Migration**
+
+- Both fixes recompile into the module. The DETACH-then-DROP fix adds one new SQL function: [`sql/pg_reflex--1.10.3--1.10.4.sql`](https://github.com/diviyank/pg_reflex/blob/main/sql/pg_reflex--1.10.3--1.10.4.sql) installs `reflex_partition_drop_maybe_skip`. The `drop_reflex_ivm` staging fix is pure Rust — no migration DDL. No IMV rebuild required; existing partitioned-source snapshots gain bounds on their next flush (the *first* detach-drop after upgrade still reconciles, then self-heals).
+
 ## [1.10.3] — 2026-06-11
 
 Two independent changes: a correctness + performance fix for IMVs whose FROM clause contains a `UNION ALL` subquery, and a new incremental partition-delta path so partition attach/detach no longer full-rebuilds dependent unpartitioned IMVs. Replace the `.so`, then `ALTER EXTENSION pg_reflex UPDATE TO '1.10.3';`.

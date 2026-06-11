@@ -2,6 +2,69 @@
 
 ## [Unreleased]
 
+## [1.10.4] - 2026-06-11
+
+Two follow-up fixes to 1.10.x: the partition attach/detach no-op skip now also
+covers DETACH-then-DROP, and `drop_reflex_ivm` no longer leaks the per-source
+DEFERRED staging delta table. Replace the `.so`, then `ALTER EXTENSION pg_reflex
+UPDATE TO '1.10.4';`.
+
+### Fixed
+
+- **DETACH-then-DROP of an irrelevant partition force-reconciled dependent
+  unpartitioned IMVs.** The 1.10.3 incremental partition-delta path skips
+  updating a dependent unpartitioned IMV when an attached/detached partition
+  holds no rows the IMV's `WHERE` filter keeps — by probing the partition
+  child's rows against `where_predicate`. The partition flush is a DEFERRED
+  constraint trigger firing at COMMIT, so ATTACH and DETACH-without-drop both
+  leave the child alive to probe. But when a partition is DETACHed **and**
+  DROPped in the *same transaction* (what migration tools that wrap in a txn
+  do), the child is gone by flush time: `reflex_flush_partitions_impl`'s `Drop`
+  branch can no longer resolve its OID and fell back to a full `reflex_reconcile`
+  (TRUNCATE + rebuild + the whole downstream cascade — the exact cost the
+  optimization removes). On `base-db-anchor-evm`, detaching+dropping a
+  non-`sop_current_view` assortment partition of `assortment_activity_relation`
+  rebuilt the entire `current_assortment_activity_view` ~20-IMV subtree. This was
+  a performance regression only; the reconcile produced correct data. The fix
+  proves the dropped partition was irrelevant from its captured `LIST` bound
+  rather than its (now-gone) rows: `refresh_source_snapshot` now records each
+  leaf's `FOR VALUES …` bound in `__reflex_source_partition_snapshot.bound`, and
+  the new `reflex_partition_drop_maybe_skip` SPI probes the IMV filter against
+  that bound. It is sound by construction — the probe relation exposes only the
+  partition key column, so a predicate touching a non-key column errors → trap →
+  reconcile, and `RANGE`/`HASH`/multi-key/no-filter/inconclusive branches all
+  fall back to `reflex_reconcile`. Only a clean "no partition value passes the
+  filter" proves the no-op and skips.
+- **`drop_reflex_ivm` leaked the per-source DEFERRED staging delta table.**
+  Dropping an IMV tore down every per-IMV artifact (target, intermediate,
+  affected, shrunk, scratch, partition transition tables) but never dropped the
+  per-source `__reflex_delta_<source>` staging delta shared by all DEFERRED IMVs
+  on a source — leaving an orphan relation that `reflex_audit`'s `OrphanStaging`
+  check flagged. `drop_reflex_ivm` now drops it when the last IMV on the source
+  goes away (`other_count == 0`); `IF EXISTS` makes it a no-op for IMMEDIATE
+  IMVs that never created one. Pre-1.10.4 orphans are also healed at create time
+  by `ensure_staging_matches_source`.
+
+### Migration
+
+- Both fixes recompile into the module. The DETACH-then-DROP fix adds one new SQL
+  function: [`sql/pg_reflex--1.10.3--1.10.4.sql`](https://github.com/diviyank/pg_reflex/blob/main/sql/pg_reflex--1.10.3--1.10.4.sql)
+  installs `reflex_partition_drop_maybe_skip` on existing databases. The
+  `drop_reflex_ivm` staging fix is pure Rust (the C-language function's `CREATE`
+  is unchanged) — no migration DDL. No IMV rebuild or refresh required. Existing
+  partitioned-source snapshots gain bounds on their next flush, so the *first*
+  detach-drop after upgrade still reconciles, then self-heals.
+
+### Tests
+
+- New `src/tests/pg_test_partition.rs` regressions: `detach_irrelevant_partition_not_dropped_is_noop`
+  (working baseline), `detach_then_drop_irrelevant_partition_is_noop` (the
+  regression — RED before the fix), `detach_then_drop_in_filter_partition_removes_rows`
+  (relevant drop must reconcile), and `detach_then_drop_nonkey_predicate_reconciles`
+  (soundness guard — a non-key-column filter must never skip). New
+  `pg_test_drop.rs::drop_deferred_imv_wipes_every_nonmaintenance_table` count
+  baseline for the staging-delta cleanup. 1256 tests pass; clippy + fmt clean.
+
 ## [1.10.3] - 2026-06-11
 
 Two independent changes: a correctness + performance fix for incremental

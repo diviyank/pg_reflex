@@ -2181,3 +2181,160 @@ fn flush_isolates_failing_root_from_healthy_root() {
     ).unwrap().unwrap_or(-1);
     assert_eq!(bad_pending, 1, "failing root must remain pending, not block others");
 }
+
+/// Root-cause pin (contrast / working baseline): DETACH of an IRRELEVANT
+/// partition whose child still EXISTS at flush time must be a no-op — the
+/// DELETE delta's pred-check probes the surviving child, finds no rows pass the
+/// IMV filter, and SKIPs (no reconcile → stable relfilenode).
+#[pg_test]
+fn pg_part_detach_irrelevant_partition_not_dropped_is_noop() {
+    Spi::run(
+        "CREATE TABLE ddn_src (id BIGINT, region TEXT NOT NULL, amount NUMERIC) \
+         PARTITION BY LIST (region)",
+    )
+    .expect("create source");
+    Spi::run("CREATE TABLE ddn_src_n PARTITION OF ddn_src FOR VALUES IN ('N')").expect("p1");
+    Spi::run("CREATE TABLE ddn_src_s PARTITION OF ddn_src FOR VALUES IN ('S')").expect("p2");
+    Spi::run("INSERT INTO ddn_src (id, region, amount) VALUES (1, 'N', 10), (2, 'S', 50)")
+        .expect("seed");
+    Spi::run("SELECT create_reflex_ivm('ddn_v', 'SELECT id, amount FROM ddn_src WHERE region = ''N''', 'id')")
+        .expect("create imv");
+
+    let before_node =
+        Spi::get_one::<i64>("SELECT relfilenode::BIGINT FROM pg_class WHERE relname = 'ddn_v'")
+            .expect("q")
+            .expect("n");
+
+    // DETACH the irrelevant 'S' partition but DO NOT drop it.
+    Spi::run("ALTER TABLE ddn_src DETACH PARTITION ddn_src_s").expect("detach");
+    Spi::run("SELECT reflex_flush_partition_source('ddn_src')").expect("flush");
+
+    assert_eq!(
+        Spi::get_one::<i64>("SELECT count(*) FROM ddn_v").expect("q").expect("c"),
+        1,
+        "content unchanged (S was never in the filter)"
+    );
+    let after_node =
+        Spi::get_one::<i64>("SELECT relfilenode::BIGINT FROM pg_class WHERE relname = 'ddn_v'")
+            .expect("q")
+            .expect("n");
+    assert_eq!(
+        before_node, after_node,
+        "detaching an irrelevant (still-existing) partition must not reconcile the IMV"
+    );
+}
+
+/// Root-cause pin (the reported regression): DETACH-then-DROP of an IRRELEVANT
+/// partition in the same transaction. By flush time the child is gone, so the
+/// DELETE-delta path cannot probe it and currently force-reconciles — the
+/// expensive full TRUNCATE+rebuild + downstream cascade the optimization was
+/// meant to avoid. It must instead be a no-op (stable relfilenode), exactly as
+/// the not-dropped case above.
+#[pg_test]
+fn pg_part_detach_then_drop_irrelevant_partition_is_noop() {
+    Spi::run(
+        "CREATE TABLE ddd_src (id BIGINT, region TEXT NOT NULL, amount NUMERIC) \
+         PARTITION BY LIST (region)",
+    )
+    .expect("create source");
+    Spi::run("CREATE TABLE ddd_src_n PARTITION OF ddd_src FOR VALUES IN ('N')").expect("p1");
+    Spi::run("CREATE TABLE ddd_src_s PARTITION OF ddd_src FOR VALUES IN ('S')").expect("p2");
+    Spi::run("INSERT INTO ddd_src (id, region, amount) VALUES (1, 'N', 10), (2, 'S', 50)")
+        .expect("seed");
+    Spi::run("SELECT create_reflex_ivm('ddd_v', 'SELECT id, amount FROM ddd_src WHERE region = ''N''', 'id')")
+        .expect("create imv");
+
+    let before_node =
+        Spi::get_one::<i64>("SELECT relfilenode::BIGINT FROM pg_class WHERE relname = 'ddd_v'")
+            .expect("q")
+            .expect("n");
+
+    // DETACH then DROP the irrelevant 'S' partition before the flush runs.
+    Spi::run("ALTER TABLE ddd_src DETACH PARTITION ddd_src_s").expect("detach");
+    Spi::run("DROP TABLE ddd_src_s").expect("drop");
+    Spi::run("SELECT reflex_flush_partition_source('ddd_src')").expect("flush");
+
+    assert_eq!(
+        Spi::get_one::<i64>("SELECT count(*) FROM ddd_v").expect("q").expect("c"),
+        1,
+        "content unchanged (S was never in the filter)"
+    );
+    let after_node =
+        Spi::get_one::<i64>("SELECT relfilenode::BIGINT FROM pg_class WHERE relname = 'ddd_v'")
+            .expect("q")
+            .expect("n");
+    assert_eq!(
+        before_node, after_node,
+        "detach-then-drop of an irrelevant partition must not reconcile the IMV"
+    );
+}
+
+/// Correctness guard: DETACH-then-DROP of an IN-FILTER partition must still
+/// remove its rows. The bound probe finds the partition relevant, so it cannot
+/// build a DELETE delta (child gone) and must reconcile — yielding correct
+/// (shrunken) content.
+#[pg_test]
+fn pg_part_detach_then_drop_in_filter_partition_removes_rows() {
+    Spi::run(
+        "CREATE TABLE drr_src (id BIGINT, region TEXT NOT NULL, amount NUMERIC) \
+         PARTITION BY LIST (region)",
+    )
+    .expect("create source");
+    Spi::run("CREATE TABLE drr_src_n PARTITION OF drr_src FOR VALUES IN ('N')").expect("p1");
+    Spi::run("CREATE TABLE drr_src_s PARTITION OF drr_src FOR VALUES IN ('S')").expect("p2");
+    Spi::run("INSERT INTO drr_src (id, region, amount) VALUES (1, 'N', 10), (2, 'S', 50)")
+        .expect("seed");
+    Spi::run("SELECT create_reflex_ivm('drr_v', 'SELECT id, amount FROM drr_src WHERE region = ''N''', 'id')")
+        .expect("create imv");
+    assert_eq!(
+        Spi::get_one::<i64>("SELECT count(*) FROM drr_v").expect("q").expect("c"),
+        1,
+        "baseline: only the N row is kept"
+    );
+
+    // DETACH then DROP the in-filter 'N' partition before the flush.
+    Spi::run("ALTER TABLE drr_src DETACH PARTITION drr_src_n").expect("detach");
+    Spi::run("DROP TABLE drr_src_n").expect("drop");
+    Spi::run("SELECT reflex_flush_partition_source('drr_src')").expect("flush");
+
+    assert_eq!(
+        Spi::get_one::<i64>("SELECT count(*) FROM drr_v").expect("q").expect("c"),
+        0,
+        "the dropped in-filter partition's rows must be gone (reconciled)"
+    );
+}
+
+/// Soundness guard: when the IMV filter references a NON-partition-key column,
+/// the bound probe (which exposes only the key column) MUST NOT be trusted to
+/// prove a no-op — it must reconcile. Here the dropped partition held a row that
+/// passes `amount > 100`, so a wrong skip would leave stale data.
+#[pg_test]
+fn pg_part_detach_then_drop_nonkey_predicate_reconciles() {
+    Spi::run(
+        "CREATE TABLE dnk_src (id BIGINT, region TEXT NOT NULL, amount NUMERIC) \
+         PARTITION BY LIST (region)",
+    )
+    .expect("create source");
+    Spi::run("CREATE TABLE dnk_src_n PARTITION OF dnk_src FOR VALUES IN ('N')").expect("p1");
+    Spi::run("CREATE TABLE dnk_src_s PARTITION OF dnk_src FOR VALUES IN ('S')").expect("p2");
+    Spi::run("INSERT INTO dnk_src (id, region, amount) VALUES (1, 'N', 500), (2, 'S', 50)")
+        .expect("seed");
+    Spi::run("SELECT create_reflex_ivm('dnk_v', 'SELECT id, amount FROM dnk_src WHERE amount > 100', 'id')")
+        .expect("create imv");
+    assert_eq!(
+        Spi::get_one::<i64>("SELECT count(*) FROM dnk_v").expect("q").expect("c"),
+        1,
+        "baseline: id=1 (amount 500) is kept"
+    );
+
+    // The N partition held the only passing row; detach+drop it.
+    Spi::run("ALTER TABLE dnk_src DETACH PARTITION dnk_src_n").expect("detach");
+    Spi::run("DROP TABLE dnk_src_n").expect("drop");
+    Spi::run("SELECT reflex_flush_partition_source('dnk_src')").expect("flush");
+
+    assert_eq!(
+        Spi::get_one::<i64>("SELECT count(*) FROM dnk_v").expect("q").expect("c"),
+        0,
+        "non-key-column filter must reconcile (not wrongly skip), removing the dropped row"
+    );
+}

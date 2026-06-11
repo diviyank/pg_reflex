@@ -6,6 +6,7 @@ use crate::query_decomposer::{
     affected_groups_table_name, canonical_source, delta_scratch_table_name,
     intermediate_table_name, passthrough_scratch_new_table_name,
     passthrough_scratch_old_table_name, quote_identifier, shrunk_groups_table_name,
+    staging_delta_table_name,
 };
 
 pub(crate) fn drop_reflex_ivm_impl(view_name: &str, cascade: bool) -> &'static str {
@@ -391,6 +392,25 @@ fn drop_reflex_ivm_impl_inner(view_name: &str, cascade: bool, root: &str) -> &'s
                     )
                     .unwrap_or_report();
             }
+
+            // Drop the per-source DEFERRED staging delta table. It is shared by
+            // every DEFERRED IMV on this source, so we only reach here once no
+            // other IMV depends on the source (other_count == 0) — meaning any
+            // un-flushed deltas it holds belong to the IMV being dropped. Unlike
+            // the triggers above it is a standalone relation, not cascaded by the
+            // source's own drop, so IF EXISTS (harmless for IMMEDIATE IMVs that
+            // never created one) drops it independently of `source_still_exists`.
+            client
+                .update(
+                    &format!(
+                        "DROP TABLE IF EXISTS {}{}",
+                        staging_delta_table_name(source),
+                        cascade_suffix
+                    ),
+                    None,
+                    &[],
+                )
+                .unwrap_or_report();
         }
 
         // Collect this view's synthetic sub-IMVs. Decomposition (CTE / set-op /

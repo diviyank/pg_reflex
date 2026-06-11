@@ -1306,12 +1306,17 @@ fn pg_test_immediate_json_column_does_not_break_filter_skip_block() {
 /// `INSERT INTO staging SELECT 'U_OLD', * FROM transition` previously
 /// failed with `column "X" is of type … but expression is of type …`
 /// because the SELECT * positions no longer matched the staging's columns.
+/// The fix emits named-column inserts so column ORDER drift can't poison the
+/// trigger (column NAMES are looked up at IMV-create time).
 ///
-/// The fix is to emit named-column inserts in the deferred trigger DDL so
-/// that column ORDER drift does not poison the trigger. Column NAMES are
-/// looked up at IMV-create time from the current source shape.
-///
-/// This test recreates the exact failure shape on a tiny source.
+/// Drop-cleanup update: `drop_reflex_ivm` now wipes the per-source staging
+/// delta once the last DEFERRED IMV on the source is dropped, so the leaked
+/// stale staging this test originally relied on no longer arises via the
+/// drop→recreate path. The test now pins the new contract (drop wipes the
+/// staging) and keeps the end-to-end check that a fresh DEFERRED IMV on a
+/// recreated source maintains correctly. The named-column INSERT defense is
+/// still covered for legacy/mis-shaped staging by
+/// `ensure_staging_matches_source` and its companion test.
 #[pg_test]
 fn pg_test_deferred_stale_staging_after_source_recreate() {
     // v1 source: creation_date at position 7 (last)
@@ -1338,14 +1343,15 @@ fn pg_test_deferred_stale_staging_after_source_recreate() {
     );
     crate::drop_reflex_ivm("stale_v1_view");
 
-    // Confirm staging persisted across IMV drop (the precondition for
-    // the stale-shape failure mode).
+    // Dropping the last DEFERRED IMV on the source wipes its staging delta
+    // (drop-cleanup fix) — the stale-shape failure mode can no longer arise
+    // via the drop→recreate path.
     let staging_kept = Spi::get_one::<bool>(
         "SELECT EXISTS(SELECT 1 FROM pg_class WHERE relname = '__reflex_delta_stale_src')",
     )
     .expect("q")
     .expect("v");
-    assert!(staging_kept, "staging delta must persist across IMV drop");
+    assert!(!staging_kept, "staging delta must be wiped when the last IMV is dropped");
 
     // Drop + recreate source with reordered columns (creation_date now at
     // position 4). This mirrors the user's situation where the partitioned
