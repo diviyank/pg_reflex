@@ -1,7 +1,7 @@
 # Incremental partition delta for unpartitioned IMVs
 
 **Date:** 2026-06-11
-**Status:** Design approved — TDD in progress
+**Status:** Landed in 1.10.3 (commit 6dff787)
 
 ## Problem
 

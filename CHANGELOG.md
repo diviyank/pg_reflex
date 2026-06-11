@@ -2,14 +2,45 @@
 
 ## [Unreleased]
 
-Correctness + performance fix for incremental maintenance of IMVs whose FROM
-clause contains a `UNION ALL` subquery, e.g. `SELECT g, SUM(x) FROM (… FROM a
-UNION ALL … FROM b) st GROUP BY g`. A mutation to a table in one operand was
-maintained as if the whole subquery were the delta, re-scanning and re-counting
-the *unchanged* sibling operands — a silent wrong answer (previously logged as
-"correctness-neutral") plus an O(base) full scan. No catalog/schema or
-function-signature changes; the fix is in the Rust trigger codegen, recompiled
-into the module.
+## [1.10.3] - 2026-06-11
+
+Two independent changes: a correctness + performance fix for incremental
+maintenance of IMVs whose FROM clause contains a `UNION ALL` subquery, and a new
+incremental partition-delta path that stops partition attach/detach from
+full-rebuilding dependent unpartitioned IMVs.
+
+The `UNION ALL` fix targets IMVs like `SELECT g, SUM(x) FROM (… FROM a UNION ALL
+… FROM b) st GROUP BY g`. A mutation to a table in one operand was maintained as
+if the whole subquery were the delta, re-scanning and re-counting the *unchanged*
+sibling operands — a silent wrong answer (previously logged as
+"correctness-neutral") plus an O(base) full scan. That fix is in the Rust trigger
+codegen, recompiled into the module — no catalog/schema or function-signature
+change. The partition-delta optimization adds one new SQL function (installed by
+the migration below). Upgrade with `ALTER EXTENSION pg_reflex UPDATE TO '1.10.3';`
+after replacing the `.so`.
+
+### Added
+
+- **Incremental partition delta for unpartitioned IMVs.** Attaching or detaching
+  a partition on a `LIST`/`RANGE`-partitioned source previously forced a full
+  `reflex_reconcile` (TRUNCATE + rebuild) of every dependent *unpartitioned* IMV,
+  detonating the entire downstream cascade even when the partition change kept no
+  rows the IMV actually retains. A partition change is semantically a bulk DML on
+  the source (ATTACH-with-data ≡ bulk `INSERT`, DETACH ≡ bulk `DELETE`), so the
+  new `reflex_apply_partition_delta(imv, source, op, child, trans)` SPI feeds the
+  partition child through the *same* incremental maintenance pipeline the
+  INSERT/DELETE triggers use (`reflex_build_delta_sql`): a `where_predicate`
+  pred-check skip short-circuits a filtered-out partition in O(1), a Path B ratio
+  check falls back to reconcile for large bulk changes, and every uncertain
+  branch (no incremental delta available, e.g. FULL-JOIN secondary) falls back to
+  `reflex_reconcile`. Propagation is now write-driven: a net-zero delta writes
+  nothing, so the cascade dies at whatever depth it nets to zero. Attaching a
+  non-current LIST partition to a filtered IMV (the `base-db-anchor-evm`
+  `current_assortment_activity_view` case) now skips the full rebuild of its
+  ~20-IMV downstream subtree entirely. The trigger hot path is unchanged; the
+  flush wiring (`src/partition.rs`) dispatches per changed partition, with
+  `SwapFill` and inaccessible-detached-child still taking the conservative
+  reconcile. See `plans/2026-06-11-incremental-partition-delta-unpartitioned-imv.md`.
 
 ### Fixed
 
@@ -43,13 +74,23 @@ into the module.
   recompute fallback. `replay_sop_baseline_secondary_is_sublinear` (the field
   replay that took 18 min) is un-ignored and now an active sublinear guard.
   Full `pg_test` + unit suites stay green; `clippy`/`fmt` clean.
+- New partition-delta oracle regressions in `src/tests/pg_test_partition.rs`:
+  no-op attach of a non-current LIST partition (content unchanged + downstream
+  child `last_update_date` unchanged), relevant attach, empty partition
+  (`SKIPPED`), DETACH no-op vs. current-partition removal, Path B fallback,
+  join-IMV incremental match, and the `''`→reconcile fallback shape.
 
 ### Migration
 
-- No catalog/schema or function-signature change. The corrected delta SQL is
-  generated at trigger time from the unchanged stored `base_query`, so existing
-  IMVs are fixed automatically once the recompiled module is loaded — no
-  rebuild, refresh, or DROP/recreate needed.
+- The `UNION ALL` fix needs no catalog/schema or function-signature change. The
+  corrected delta SQL is generated at trigger time from the unchanged stored
+  `base_query`, so existing IMVs are fixed automatically once the recompiled
+  module is loaded — no rebuild, refresh, or DROP/recreate needed.
+- The partition-delta optimization adds one new SQL function. Replace the `.so`
+  with the 1.10.3 build, then run `ALTER EXTENSION pg_reflex UPDATE TO '1.10.3';`
+  — [`sql/pg_reflex--1.10.2--1.10.3.sql`](https://github.com/diviyank/pg_reflex/blob/main/sql/pg_reflex--1.10.2--1.10.3.sql)
+  installs `reflex_apply_partition_delta` on existing databases. No IMV rebuild
+  or refresh is required.
 
 ## [1.10.2] - 2026-06-10
 

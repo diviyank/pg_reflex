@@ -4,6 +4,22 @@ The full changelog tracks every release. The latest version's headlines are on t
 
 For each version below, see [`CHANGELOG.md`](https://github.com/diviyank/pg_reflex/blob/main/CHANGELOG.md) on GitHub for the canonical text.
 
+## [1.10.3] — 2026-06-11
+
+Two independent changes: a correctness + performance fix for IMVs whose FROM clause contains a `UNION ALL` subquery, and a new incremental partition-delta path so partition attach/detach no longer full-rebuilds dependent unpartitioned IMVs. Replace the `.so`, then `ALTER EXTENSION pg_reflex UPDATE TO '1.10.3';`.
+
+**Added**
+
+- Incremental partition delta for unpartitioned IMVs — attaching/detaching a partition on a `LIST`/`RANGE`-partitioned source previously forced a full `reflex_reconcile` (TRUNCATE + rebuild) of every dependent unpartitioned IMV, detonating the whole downstream cascade even when no kept rows changed. The new `reflex_apply_partition_delta` SPI feeds the partition child through the same incremental INSERT/DELETE pipeline (`reflex_build_delta_sql`): a `where_predicate` pred-check skips a filtered-out partition in O(1), Path B falls back to reconcile for large bulk changes, and any unsupported shape falls back to `reflex_reconcile`. Propagation is write-driven, so a net-zero delta dies at whatever depth it nets to zero — attaching a non-current LIST assortment to a filtered IMV now skips its ~20-IMV downstream subtree entirely.
+
+**Fixed**
+
+- `UNION ALL`-subquery aggregates double-counted unchanged operands — a mutation to one operand was maintained as if the whole subquery were the delta, re-counting the unchanged sibling operands (silent wrong `SUM` in overlapping groups) and full-scanning the base (O(base); a 1-row delta took ~18 min on production `sop_incoming_stock_baseline_view`). The delta query now prunes the subquery to only operands referencing the changed source before the transition swap — correct and O(delta). Passthrough over a `UNION ALL` subquery (duplicated sibling rows) and non-distributive set-ops (`UNION`/`INTERSECT`/`EXCEPT`, now a correct full recompute) are fixed by the same scoping.
+
+**Migration**
+
+- The `UNION ALL` fix is pure Rust codegen — existing IMVs are fixed automatically once the recompiled module is loaded. The partition-delta optimization adds one new SQL function: [`sql/pg_reflex--1.10.2--1.10.3.sql`](https://github.com/diviyank/pg_reflex/blob/main/sql/pg_reflex--1.10.2--1.10.3.sql) installs `reflex_apply_partition_delta` on existing databases. No IMV rebuild or refresh required.
+
 ## [1.10.2] — 2026-06-10
 
 Correctness + efficiency fix for IMVs filtered by an uncorrelated scalar subquery (e.g. `WHERE assortment_id = (SELECT assortment_id FROM sop_current_view)`). The filter was dropped from per-source metadata, so the relevance-skip never fired — irrelevant updates were maintained anyway, and an out-of-filter update colliding on the unique key silently deleted in-filter rows. Pure Rust analyzer fix, recompiled into the module: `ALTER EXTENSION pg_reflex UPDATE TO '1.10.2';`.
