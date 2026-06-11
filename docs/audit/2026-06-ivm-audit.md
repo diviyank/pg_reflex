@@ -1,9 +1,39 @@
 # pg_reflex IVM Correctness & Performance Audit — 2026-06
 
 Spec: `docs/superpowers/specs/2026-06-10-pg-reflex-ivm-audit-design.md`.
-Dual axis: **correctness** (Postgres `EXCEPT ALL` recompute via `assert_imv_correct`,
-cross-checked by `oracle_pure.rs`) and **plan quality** (`assert_sublinear` over
-`reflex_ivm_status().last_flush_ms`). Phase 1 documents holes; it fixes nothing.
+Dual axis: **correctness** (Postgres `EXCEPT ALL` recompute via `assert_imv_correct`)
+and **plan quality** (`assert_sublinear` over `reflex_ivm_status().last_flush_ms`).
+A 3-phase program: Phase 1 mapped/​documented holes; Phase 2 hardened the harness;
+Phase 3 replayed the real field-bug views.
+
+## Audit summary (3 phases)
+
+**Phase 1 — map & confirm.** Coverage matrix (§1, 16 constructs), escape analysis
+(§2, all 20 field bugs since 1.7.2 — found in production, not the gate), and four
+instrumented probes (§3) — all PASS, showing the 1.10.1/1.10.2 fixes generalize.
+Headline holes: cross-source guard untested, plan-quality unguarded everywhere,
+the gate blind to the field-bug regions.
+
+**Phase 2 — harden the harness.** Cross-source guard got 7 oracle tests (§3 M1);
+plan-quality got scaling probes for 6 aggregate/passthrough shapes (§3 M2) — all
+PASS. The pairwise gate gained `WindowFn` + `DistinctOn` shapes and `FilterMode` +
+`MutationSpread` axes (§3 M4/M1-axis). M3/M5 assessed → DEFER (rationale in §3).
+
+**Phase 3 — field replay.** The two worst-incident base-db views distilled into
+self-contained regressions: `current_assortment_activity_view` (1.10.2) — correct;
+`sop_incoming_stock_baseline_view` (1.10.1) — correct but **not plan-scoped**.
+
+**Bugs found by the hardened audit (2), both filed as `#[ignore]`'d RED + fix-pass):**
+- **B1** — DISTINCT ON + declared output key crashes CREATE (gate-found; §3 Phase 2B).
+- **B2** — `sop_incoming_stock_baseline` shape maintains a 1-row delta in **O(base)**
+  (74ms→1150ms at 25× base; §3 Phase 3 R2b). The 1.10.1 fix didn't generalize to
+  the union-aggregate + subquery-filter + LEFT-JOIN-secondary shape — i.e. the
+  production "slow view" pain is reproduced and pinned.
+
+**Net:** correctness 9 Proven / 7 Weak / 0 Untested; plan-quality 6 shapes Proven
+(was 0); +20 new regression tests; the gate now exercises the field-bug regions;
+2 real bugs pinned for the fix-pass. The package's two most painful field-incident
+shapes now have permanent CI coverage.
 
 ## §1 Coverage matrix
 
