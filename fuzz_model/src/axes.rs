@@ -29,6 +29,14 @@ pub enum RefreshMode {
     Deferred,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum FilterMode {
+    None,
+    Simple,
+    ScalarSubquery,
+    InSubquery,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AggFn {
     Sum,
@@ -87,6 +95,7 @@ pub struct Axes {
     pub measure_ty: ColType,
     pub unique: UniqueCols,
     pub lifecycle: Lifecycle,
+    pub filter: FilterMode,
 }
 
 impl ColType {
@@ -156,6 +165,12 @@ pub fn is_valid(a: &Axes) -> bool {
         return false;
     }
 
+    // WHERE/subquery filters are modeled only on single-source Passthrough and
+    // SingleAggregate (the 1.10.2 region); other shapes keep filter = None.
+    if a.filter != FilterMode::None && !matches!(a.shape, Passthrough | SingleAggregate) {
+        return false;
+    }
+
     true
 }
 
@@ -217,6 +232,11 @@ fn all_lifecycle() -> Vec<Lifecycle> {
     ]
 }
 
+fn all_filters() -> Vec<FilterMode> {
+    use FilterMode::*;
+    vec![None, Simple, ScalarSubquery, InSubquery]
+}
+
 /// The full cartesian product, filtered to the legal subspace.
 pub fn valid_space() -> Vec<Axes> {
     let mut out = Vec::new();
@@ -227,17 +247,20 @@ pub fn valid_space() -> Vec<Axes> {
                     for &measure_ty in &all_ty() {
                         for &unique in &all_unique() {
                             for &lifecycle in &all_lifecycle() {
-                                let a = Axes {
-                                    source,
-                                    shape,
-                                    refresh,
-                                    agg,
-                                    measure_ty,
-                                    unique,
-                                    lifecycle,
-                                };
-                                if is_valid(&a) {
-                                    out.push(a);
+                                for &filter in &all_filters() {
+                                    let a = Axes {
+                                        source,
+                                        shape,
+                                        refresh,
+                                        agg,
+                                        measure_ty,
+                                        unique,
+                                        lifecycle,
+                                        filter,
+                                    };
+                                    if is_valid(&a) {
+                                        out.push(a);
+                                    }
                                 }
                             }
                         }
@@ -252,7 +275,7 @@ pub fn valid_space() -> Vec<Axes> {
 /// A 2-way interaction: two (field-index, value-discriminant) pairs.
 type Pair = ((u8, u32), (u8, u32));
 
-fn field_values(a: &Axes) -> [(u8, u32); 7] {
+fn field_values(a: &Axes) -> [(u8, u32); 8] {
     [
         (0, a.source as u32),
         (1, a.shape as u32),
@@ -267,6 +290,7 @@ fn field_values(a: &Axes) -> [(u8, u32); 7] {
         (4, a.measure_ty as u32),
         (5, a.unique as u32),
         (6, a.lifecycle as u32),
+        (7, a.filter as u32),
     ]
 }
 
@@ -347,6 +371,7 @@ mod tests {
             measure_ty: ColType::Numeric,
             unique: UniqueCols::Absent,
             lifecycle: Lifecycle::CreateMutateDrop,
+            filter: FilterMode::None,
         }
     }
 
@@ -360,6 +385,7 @@ mod tests {
             measure_ty: ColType::Numeric,
             unique: UniqueCols::Absent,
             lifecycle: Lifecycle::CreateMutateDrop,
+            filter: FilterMode::None,
         };
         let mut set = std::collections::HashSet::new();
         set.insert(a);

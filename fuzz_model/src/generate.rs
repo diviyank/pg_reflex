@@ -192,13 +192,34 @@ fn filter_predicate(choice: usize) -> String {
     }
 }
 
+/// The WHERE clause for a FilterMode, or None for FilterMode::None.
+/// All predicates use `id` (int) so they are type-agnostic across measure types,
+/// and all subqueries are UNCORRELATED over the same source (valid, and exercises
+/// the subquery-filter maintenance path — the 1.10.2 region).
+fn filter_clause(filter: crate::axes::FilterMode, tbl: &str, pk: &str) -> Option<String> {
+    use crate::axes::FilterMode::*;
+    match filter {
+        None => Option::None,
+        Simple => Some(format!("{pk} % 2 = 0")),
+        ScalarSubquery => Some(format!("{pk} >= (SELECT MIN({pk}) FROM {tbl})")),
+        InSubquery => Some(format!(
+            "{pk} IN (SELECT {pk} FROM {tbl} WHERE {pk} % 2 = 0)"
+        )),
+    }
+}
+
 /// Passthrough: SELECT id, m, d, f FROM t0; unique key = id.
-fn passthrough_case(t: Table) -> FuzzCase {
+fn passthrough_case(t: Table, filter: crate::axes::FilterMode) -> FuzzCase {
+    let where_sql = match filter_clause(filter, &t.name, &t.pk) {
+        Some(c) => format!(" WHERE {}", c),
+        None => String::new(),
+    };
     let body = SelectBody {
         rendered_sql: format!(
-            "SELECT {pk}, m, d, f, x FROM {tbl}",
+            "SELECT {pk}, m, d, f, x FROM {tbl}{w}",
             pk = t.pk,
-            tbl = t.name
+            tbl = t.name,
+            w = where_sql
         ),
     };
     let output_columns = vec![
@@ -792,7 +813,7 @@ fn single_table_cases() -> impl Strategy<Value = FuzzCase> {
             let mode = move |c: FuzzCase| if defer { deferred(c) } else { c };
             prop_oneof![
                 Just(mode(with_mutation(
-                    passthrough_case(t.clone()),
+                    passthrough_case(t.clone(), crate::axes::FilterMode::None),
                     mtx.clone()
                 ))),
                 Just(mode(with_mutation(aggregate_case(t.clone()), mtx.clone()))),
@@ -900,7 +921,7 @@ fn agg_result_ty(agg_fn: AggFn, input_ty: ColType) -> ColType {
 }
 
 /// Single-table aggregate with a parameterized agg function.
-fn aggregate_case_with(t: Table, agg_fn: AggFn) -> FuzzCase {
+fn aggregate_case_with(t: Table, agg_fn: AggFn, filter: crate::axes::FilterMode) -> FuzzCase {
     // Find the measure column type (column 'm' in the table).
     let measure_ty = t
         .columns
@@ -909,11 +930,15 @@ fn aggregate_case_with(t: Table, agg_fn: AggFn) -> FuzzCase {
         .map(|c| c.ty)
         .unwrap_or(ColType::Numeric); // Defensive default
 
+    let where_sql = match filter_clause(filter, &t.name, &t.pk) {
+        Some(c) => format!(" WHERE {}", c),
+        None => String::new(),
+    };
     let agg_expr = agg_fn_sql(agg_fn, "m");
     let body = SelectBody {
         rendered_sql: format!(
-            "SELECT d, {} AS s, COUNT(*) AS c FROM {} GROUP BY d",
-            agg_expr, t.name
+            "SELECT d, {} AS s, COUNT(*) AS c FROM {}{} GROUP BY d",
+            agg_expr, t.name, where_sql
         ),
     };
     let output_columns = vec![
@@ -1139,10 +1164,14 @@ fn cte_decomposed_case_with(a: Table, b: Table, agg_fn: AggFn) -> FuzzCase {
 /// Build the base SELECT + tables for a shape, ignoring source kind.
 fn base_case_for_shape(a: &Axes, seq: u64) -> Option<FuzzCase> {
     match a.shape {
-        QueryShape::Passthrough => Some(passthrough_case(det_table(seq, 0, a.measure_ty))),
-        QueryShape::SingleAggregate => {
-            Some(aggregate_case_with(det_table(seq, 0, a.measure_ty), a.agg?))
+        QueryShape::Passthrough => {
+            Some(passthrough_case(det_table(seq, 0, a.measure_ty), a.filter))
         }
+        QueryShape::SingleAggregate => Some(aggregate_case_with(
+            det_table(seq, 0, a.measure_ty),
+            a.agg?,
+            a.filter,
+        )),
         QueryShape::JoinInner => Some(join_aggregate_case_with(
             det_table(seq, 0, a.measure_ty),
             det_table(seq, 1, a.measure_ty),
