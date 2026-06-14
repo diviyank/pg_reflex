@@ -2,6 +2,46 @@
 
 ## [Unreleased]
 
+## [1.10.5] - 2026-06-14
+
+Attaching a new top-level partition with many empty sub-partitions is now far
+cheaper. Replace the `.so`, then `ALTER EXTENSION pg_reflex UPDATE TO '1.10.5';`
+(the migration drops and recreates `reflex_reconcile_partition` to add a 4th
+argument — see below).
+
+### Changed
+
+- **`reflex_reconcile_partition` gained a 4th `skip_sync boolean DEFAULT false`
+  argument.** When true, the per-partition reconcile skips its orphan-swap
+  cleanup and its internal whole-tree `reflex_sync_partitions` — used by the
+  batch flush, which now syncs the tree once up front instead of once per leaf.
+  The `DEFAULT false` keeps every existing 2-/3-arg call site working unchanged.
+
+### Fixed
+
+- **Attaching a partition whose sub-partitions are mostly empty reconciled every
+  leaf, one by one.** A demand-plan macro-partition attaches a fixed window of
+  monthly sub-partitions (e.g. 48 months), but typically only a handful hold
+  data. `reflex_flush_partitions_impl` emitted one `reflex_reconcile_partition`
+  per attached leaf, and each call (a) re-ran `reflex_sync_partitions` over the
+  whole tree and (b) paid the fixed per-leaf swap DDL (`CREATE … LIKE` + fill +
+  `ANALYZE` + `DETACH`/`ATTACH`/`DROP`) — a cost independent of row count, so the
+  empty months cost the same as the populated ones. On `base-db-anchor-evm`,
+  attaching one `sales_simulation` demand plan to `sop_forecast_view` took ~46s
+  at COMMIT regardless of how few months actually held forecast rows.
+
+  The flush now syncs each IMV's partition tree **once** up front, then drives the
+  per-leaf reconciles with `skip_sync => true`. A brand-new (`AttachNew`) leaf
+  whose **source is empty** is a provable empty→empty no-op — the up-front sync
+  has already created its empty mirror partition and there is no prior target
+  data to clear — so its per-leaf swap (and its downstream cascade) is skipped
+  entirely. `SwapFill` (the partition's OID changed) and surviving-ancestor
+  refills always fill, since they may hold stale target rows; any source-probe
+  failure falls back to filling, so the skip never trades correctness for speed.
+  A/B on a 48-leaf attach with 44 empty months: the isolated flush dropped from
+  898s to 51s (~17.6×, debug build); the IMV remains exactly equal to the source
+  with all 48 months mirrored (empty months present but empty).
+
 ## [1.10.4] - 2026-06-11
 
 Two follow-up fixes to 1.10.x: the partition attach/detach no-op skip now also
