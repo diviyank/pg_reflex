@@ -495,8 +495,14 @@ fn reflex_reconcile_partition(
     view_name: &str,
     partition_keys: &str,
     source_partition: default!(&str, "''"),
+    skip_sync: default!(bool, "FALSE"),
 ) -> String {
-    partition::reflex_reconcile_partition_impl(view_name, partition_keys, source_partition)
+    partition::reflex_reconcile_partition_impl(
+        view_name,
+        partition_keys,
+        source_partition,
+        skip_sync,
+    )
 }
 
 /// Resolve pending source-partition changes: oid-diff each dirty source root

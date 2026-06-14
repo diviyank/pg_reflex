@@ -1107,3 +1107,79 @@ fn attach_with_data_auto_syncs_at_commit() {
     ).unwrap().unwrap_or(-1);
     assert_eq!(pending, 0, "auto-drain must clear the pending row");
 }
+
+/// `reflex_reconcile_partition(..., skip_sync => true)` reconciles a leaf
+/// WITHOUT re-syncing the whole partition tree first — the batch-flush fast
+/// path, where the flush has already synced once up front. Correctness must be
+/// identical to the default sync-first call.
+#[pg_test]
+fn pg_subpart_reconcile_partition_skip_sync_still_reconciles() {
+    Spi::run("CREATE TABLE sk (dem_plan_id BIGINT NOT NULL, order_date DATE NOT NULL, product_id BIGINT, qty INT) PARTITION BY LIST (dem_plan_id)").expect("root");
+    Spi::run("CREATE TABLE sk_172 PARTITION OF sk FOR VALUES IN (172) PARTITION BY RANGE (order_date)").expect("list");
+    Spi::run("CREATE TABLE sk_172_2025_01 PARTITION OF sk_172 FOR VALUES FROM ('2025-01-01') TO ('2025-02-01')").expect("leaf");
+    Spi::run("INSERT INTO sk VALUES (172,'2025-01-15',5,10)").expect("seed");
+    Spi::get_one::<String>(
+        "SELECT create_reflex_ivm('skv','SELECT dem_plan_id, order_date, product_id, qty FROM sk', \
+         'dem_plan_id,product_id,order_date', NULL, NULL, NULL, ARRAY['dem_plan_id','order_date'])",
+    ).expect("c").expect("c");
+
+    // Tree already synced at create-time. Drift the leaf, then reconcile it
+    // with skip_sync => true (no internal reflex_sync_partitions).
+    Spi::run("UPDATE skv SET qty = -1").expect("drift");
+    let r = Spi::get_one::<String>(
+        "SELECT reflex_reconcile_partition('skv', '', 'sk_172_2025_01', true)",
+    ).expect("rec").expect("rec");
+    assert!(!r.starts_with("ERROR"), "skip_sync reconcile errored: {r}");
+    let jan = Spi::get_one::<i32>("SELECT qty FROM skv WHERE order_date='2025-01-15'").expect("q").expect("jan");
+    assert_eq!(jan, 10, "skip_sync reconcile must rebuild the leaf from source");
+}
+
+/// A brand-new top-level branch whose monthly sub-partitions are a MIX of
+/// empty and populated months (the production demand-planning shape). The
+/// flush must fill the populated months, leave each empty month as an
+/// existing-but-empty mirror partition, and never lose or duplicate data.
+/// Perf: empty months are skipped (no per-leaf swap) — this test pins the
+/// correctness that the skip must preserve.
+#[pg_test]
+fn pg_subpart_attach_branch_skips_empty_months_keeps_correctness() {
+    Spi::run("CREATE TABLE se (dem_plan_id BIGINT NOT NULL, order_date DATE NOT NULL, product_id BIGINT, qty INT) PARTITION BY LIST (dem_plan_id)").expect("root");
+    Spi::run("CREATE TABLE se_172 PARTITION OF se FOR VALUES IN (172) PARTITION BY RANGE (order_date)").expect("list");
+    Spi::run("CREATE TABLE se_172_2025_01 PARTITION OF se_172 FOR VALUES FROM ('2025-01-01') TO ('2025-02-01')").expect("leaf");
+    Spi::run("INSERT INTO se VALUES (172,'2025-01-15',5,10)").expect("seed");
+    Spi::get_one::<String>(
+        "SELECT create_reflex_ivm('sev','SELECT dem_plan_id, order_date, product_id, qty FROM se', \
+         'dem_plan_id,product_id,order_date', NULL, NULL, NULL, ARRAY['dem_plan_id','order_date'])",
+    ).expect("c").expect("c");
+
+    // New branch dem_plan_id=173 with THREE monthly leaves: Jan populated,
+    // Feb EMPTY, Mar populated. Fill Jan+Mar, leave Feb empty, then attach the
+    // whole branch at the top level.
+    Spi::run("CREATE TABLE se_173 (LIKE se INCLUDING ALL) PARTITION BY RANGE (order_date)").expect("branch");
+    Spi::run("CREATE TABLE se_173_2025_01 PARTITION OF se_173 FOR VALUES FROM ('2025-01-01') TO ('2025-02-01')").expect("jan");
+    Spi::run("CREATE TABLE se_173_2025_02 PARTITION OF se_173 FOR VALUES FROM ('2025-02-01') TO ('2025-03-01')").expect("feb empty");
+    Spi::run("CREATE TABLE se_173_2025_03 PARTITION OF se_173 FOR VALUES FROM ('2025-03-01') TO ('2025-04-01')").expect("mar");
+    Spi::run("INSERT INTO se_173 VALUES (173,'2025-01-20',5,11),(173,'2025-03-20',5,33)").expect("fill jan+mar");
+    Spi::run("ALTER TABLE se ATTACH PARTITION se_173 FOR VALUES IN (173)").expect("attach branch");
+
+    // Drain the deferred flush at this txn's logical commit.
+    Spi::run("SET CONSTRAINTS ALL IMMEDIATE").expect("flush");
+
+    // Populated months filled correctly.
+    let jan = Spi::get_one::<i32>("SELECT qty FROM sev WHERE dem_plan_id=173 AND order_date='2025-01-20'").expect("q").expect("jan");
+    assert_eq!(jan, 11);
+    let mar = Spi::get_one::<i32>("SELECT qty FROM sev WHERE dem_plan_id=173 AND order_date='2025-03-20'").expect("q").expect("mar");
+    assert_eq!(mar, 33);
+
+    // Empty Feb month: mirror partition exists but holds no rows.
+    let feb_part = Spi::get_one::<bool>("SELECT to_regclass('public.sev_se_173_2025_02') IS NOT NULL").expect("q").expect("b");
+    assert!(feb_part, "empty month's IMV partition must still be mirrored");
+    let feb_rows = Spi::get_one::<i64>("SELECT count(*) FROM sev WHERE dem_plan_id=173 AND order_date >= '2025-02-01' AND order_date < '2025-03-01'").expect("q").expect("c");
+    assert_eq!(feb_rows, 0, "empty month must contribute no rows");
+
+    // No data lost or duplicated: branch 173 holds exactly its 2 seeded rows.
+    let total = Spi::get_one::<i64>("SELECT count(*) FROM sev WHERE dem_plan_id=173").expect("q").expect("c");
+    assert_eq!(total, 2);
+    // Original branch 172 untouched.
+    let orig = Spi::get_one::<i32>("SELECT qty FROM sev WHERE dem_plan_id=172 AND order_date='2025-01-15'").expect("q").expect("o");
+    assert_eq!(orig, 10);
+}

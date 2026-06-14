@@ -1231,19 +1231,26 @@ pub(crate) fn reflex_reconcile_partition_impl(
     view_name: &str,
     partition_keys_csv: &str,
     source_partition: &str,
+    skip_sync: bool,
 ) -> String {
     if let Err(msg) = crate::validate_view_name(view_name) {
         return msg.to_string();
     }
-    // Idempotent recovery: drop any orphan __reflex_swap_* tables left over
-    // from a prior aborted swap.  Names are deterministic from view +
-    // source-child bare name (see `swap_partition_name`); we identify them
-    // by the `__reflex_swap_int_<bare_view>_` / `__reflex_swap_tgt_<bare_view>_`
-    // prefix, scoped to the IMV's schema.
-    cleanup_orphan_swap_tables(view_name);
+    // The batch flush path (`reflex_flush_partitions_impl`) syncs the tree and
+    // cleans orphan swaps once up front, then drives many per-leaf reconciles
+    // with `skip_sync = true` so this O(tree) prep isn't repeated per leaf.
+    // The standalone / cascade entry points pass `false` and stay self-contained.
+    if !skip_sync {
+        // Idempotent recovery: drop any orphan __reflex_swap_* tables left over
+        // from a prior aborted swap.  Names are deterministic from view +
+        // source-child bare name (see `swap_partition_name`); we identify them
+        // by the `__reflex_swap_int_<bare_view>_` / `__reflex_swap_tgt_<bare_view>_`
+        // prefix, scoped to the IMV's schema.
+        cleanup_orphan_swap_tables(view_name);
 
-    // First, ensure the partition set is in sync with the source.
-    let _ = reflex_sync_partitions_impl(view_name, true);
+        // First, ensure the partition set is in sync with the source.
+        let _ = reflex_sync_partitions_impl(view_name, true);
+    }
 
     let outcome: Result<String, String> = Spi::connect_mut(|client| {
         let row = client
@@ -1914,6 +1921,23 @@ fn oid_to_qualified_name(client: &pgrx::spi::SpiClient<'_>, oid: u32) -> Option<
         .map(|s| s.to_string())
 }
 
+/// Cheap emptiness probe: does the relation named by `qualified` (a quoted,
+/// regclass-resolvable name from `oid_to_qualified_name`) hold at least one row?
+/// On probe failure we assume non-empty so the caller still does the swap — the
+/// skip is an optimization and must never trade correctness for speed.
+fn relation_has_rows(client: &pgrx::spi::SpiClient<'_>, qualified: &str) -> bool {
+    client
+        .select(
+            &format!("SELECT EXISTS(SELECT 1 FROM {}) AS has_rows", qualified),
+            Some(1),
+            &[],
+        )
+        .ok()
+        .and_then(|mut it| it.next())
+        .and_then(|r| r.get_by_name::<bool, _>("has_rows").ok().flatten())
+        .unwrap_or(true)
+}
+
 /// Extract the inner value list of a single-key LIST partition bound, i.e. the
 /// `…` of `FOR VALUES IN (…)`. Returns None for RANGE/HASH/DEFAULT bounds (whose
 /// text does not match the prefix) — those callers fall back to reconcile. The
@@ -2077,20 +2101,42 @@ pub(crate) fn reflex_flush_partitions_impl(only: Option<&str>) -> String {
                     .map(|d| d as usize)
                     .unwrap_or_else(|| max_tree_depth(&live_tree));
 
-                use std::collections::BTreeSet;
-                let mut to_swap: BTreeSet<String> = BTreeSet::new();
+                use std::collections::{BTreeMap, BTreeSet};
+                // node -> must actually fill it. A brand-new (`AttachNew`) leaf
+                // whose source is EMPTY is a provable empty->empty no-op: the
+                // up-front sync below creates its mirror partition empty and
+                // there is no prior target data to clear, so its per-leaf swap
+                // is pure waste (the dominant cost when a demand-plan partition
+                // attaches dozens of empty monthly leaves). A `SwapFill`
+                // (oid changed) or a surviving-ancestor refill may need to clear
+                // stale target rows, so those always fill regardless of source
+                // emptiness.
+                let mut fill_node: BTreeMap<String, bool> = BTreeMap::new();
                 let mut to_drop: BTreeSet<String> = BTreeSet::new();
 
                 let live_names: std::collections::HashSet<&str> =
                     live_tree.iter().map(|n| n.bare_name.as_str()).collect();
+                let cur_oid: std::collections::HashMap<&str, u32> =
+                    current.iter().map(|(n, o)| (n.as_str(), *o)).collect();
 
                 for (leaf, action) in &actions {
                     match action {
-                        PartitionDiffAction::SwapFill | PartitionDiffAction::AttachNew => {
+                        PartitionDiffAction::AttachNew => {
                             let chain = leaf_ancestor_chain(&live_tree, leaf);
                             let node = ancestor_bare_at_depth(&chain, leaf, mirror_depth)
                                 .unwrap_or_else(|| leaf.clone());
-                            to_swap.insert(node);
+                            let source_nonempty = cur_oid
+                                .get(leaf.as_str())
+                                .and_then(|o| oid_to_qualified_name(client, *o))
+                                .map(|q| relation_has_rows(client, &q))
+                                .unwrap_or(true);
+                            *fill_node.entry(node).or_insert(false) |= source_nonempty;
+                        }
+                        PartitionDiffAction::SwapFill => {
+                            let chain = leaf_ancestor_chain(&live_tree, leaf);
+                            let node = ancestor_bare_at_depth(&chain, leaf, mirror_depth)
+                                .unwrap_or_else(|| leaf.clone());
+                            *fill_node.entry(node).or_insert(false) = true;
                         }
                         PartitionDiffAction::Drop => {
                             let chain = snapshot_ancestors.get(leaf).cloned().unwrap_or_default();
@@ -2098,7 +2144,7 @@ pub(crate) fn reflex_flush_partitions_impl(only: Option<&str>) -> String {
                                 .unwrap_or_else(|| leaf.clone());
                             if live_names.contains(node.as_str()) {
                                 // Sibling removed, ancestor survives -> refill it.
-                                to_swap.insert(node);
+                                *fill_node.entry(node).or_insert(false) = true;
                             } else {
                                 // Whole mirror-depth node gone -> drop IMV node.
                                 to_drop.insert(node);
@@ -2106,13 +2152,24 @@ pub(crate) fn reflex_flush_partitions_impl(only: Option<&str>) -> String {
                         }
                     }
                 }
-                // A node both dropped and swap-filled: drop wins (it is gone).
+                // A node both dropped and refilled: drop wins (it is gone).
                 for d in &to_drop {
-                    to_swap.remove(d);
+                    fill_node.remove(d);
                 }
 
                 let (schema_opt, _) = split_qualified_name(imv);
                 let schema = schema_opt.unwrap_or("public");
+
+                // Sync the IMV's partition tree against the source ONCE per flush
+                // here, then drive the per-leaf reconciles with skip_sync => true
+                // so they don't each re-walk the whole tree. This also creates the
+                // (empty) mirror partitions for the skipped empty leaves above.
+                if !fill_node.is_empty() || !to_drop.is_empty() {
+                    root_stmts.push(format!(
+                        "PERFORM public.reflex_sync_partitions({}, true)",
+                        sql_literal_text(imv)
+                    ));
+                }
                 for node in &to_drop {
                     let tgt = target_child_name(imv, node);
                     let int = intermediate_child_name(imv, node);
@@ -2125,9 +2182,9 @@ pub(crate) fn reflex_flush_partitions_impl(only: Option<&str>) -> String {
                         schema, int
                     ));
                 }
-                for node in &to_swap {
+                for (node, _) in fill_node.iter().filter(|(_, fill)| **fill) {
                     root_stmts.push(format!(
-                        "PERFORM public.reflex_reconcile_partition({}, '', {})",
+                        "PERFORM public.reflex_reconcile_partition({}, '', {}, true)",
                         sql_literal_text(imv),
                         sql_literal_text(node)
                     ));
