@@ -1267,6 +1267,7 @@ mod tests {
     include!("tests/pg_test_cross_source.rs");
     include!("tests/pg_test_field_replay.rs");
     include!("tests/pg_test_union_subquery_delta.rs");
+    include!("tests/pg_test_registry.rs");
 }
 
 /// This module is required by `cargo pgrx test` invocations.
