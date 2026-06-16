@@ -295,7 +295,7 @@ pub struct ImvRecord {
 /// not registered). Disabled rows are still returned — callers that require
 /// `enabled = TRUE` check [`ImvRecord::enabled`] themselves (matching the
 /// historical per-caller `WHERE enabled = TRUE` filters).
-pub fn read_imv(client: &mut pgrx::spi::SpiClient<'_>, name: &str) -> Option<ImvRecord> {
+pub fn read_imv(client: &pgrx::spi::SpiClient<'_>, name: &str) -> Option<ImvRecord> {
     let rows =
         client
             .select(
