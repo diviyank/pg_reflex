@@ -265,8 +265,8 @@ impl Check for PartitionTreeDrift {
         // Respect the IMV's mirror depth: a deliberately-shallow IMV mirrors
         // fewer levels than the source, so compare the source tree TRUNCATED to
         // that depth (NULL partition_depth = full source depth = no truncation).
-        let partition_depth: Option<i32> =
-            crate::sql_writer::registry::read_imv(client, &imv.name).and_then(|r| r.partition_depth);
+        let partition_depth: Option<i32> = crate::sql_writer::registry::read_imv(client, &imv.name)
+            .and_then(|r| r.partition_depth);
         let full_src_tree = crate::partition::list_partition_tree(client, &anchor);
         let mirror_depth = partition_depth
             .map(|d| d as usize)
