@@ -10,8 +10,10 @@
 //! `partition_strategy` simply leave them at their defaults here and the
 //! catalog row ends up identical.
 
+use crate::aggregation::AggregationPlan;
 use crate::sql_writer::identifier::format_pg_text_array;
 use pgrx::datum::DatumWithOid;
+use pgrx::pg_sys::panic::ErrorReportable;
 use pgrx::prelude::*;
 use pgrx::spi;
 
@@ -256,5 +258,203 @@ pub fn add_graph_child_links(
             ],
         )?;
     }
+    Ok(())
+}
+
+/// Owned, typed view of one `public.__reflex_ivm_reference` row — the read
+/// counterpart to [`RegistryRow`]. Carries the single-row fields the catalog
+/// readers consume (reconcile, drop, audit) and parses the `aggregations`
+/// JSONB into an [`AggregationPlan`] exactly once. Reporting projections
+/// (introspect's status query, audit's all-rows scan) are deliberately NOT
+/// served by this struct — they read column subsets across many rows.
+#[derive(Clone, Debug)]
+#[allow(dead_code)]
+pub struct ImvRecord {
+    pub view_name: String,
+    pub base_query: String,
+    pub end_query: String,
+    /// Parsed once from the `aggregations` JSONB column. `None` when the
+    /// stored JSON is absent or unparseable (legacy/empty rows).
+    pub plan: Option<AggregationPlan>,
+    pub storage_mode: String,
+    pub refresh_mode: String,
+    pub enabled: bool,
+    pub depends_on: Vec<String>,
+    pub depends_on_imv: Vec<String>,
+    pub graph_child: Vec<String>,
+    /// Schema the IMV's objects were created in (1.7.1). `None` for legacy rows.
+    pub target_schema: Option<String>,
+    /// IMV partition mirror depth (1.8.2). `None` => mirror full source depth.
+    pub partition_depth: Option<i32>,
+}
+
+/// Read one IMV row by name. Returns `None` when no row matches (the IMV is
+/// not registered). Disabled rows are still returned — callers that require
+/// `enabled = TRUE` check [`ImvRecord::enabled`] themselves (matching the
+/// historical per-caller `WHERE enabled = TRUE` filters).
+#[allow(dead_code)]
+pub fn read_imv(client: &mut pgrx::spi::SpiClient<'_>, name: &str) -> Option<ImvRecord> {
+    let rows =
+        client
+            .select(
+                "SELECT name, base_query, end_query, aggregations::text AS aggregations, \
+                    storage_mode, refresh_mode, enabled, depends_on, depends_on_imv, \
+                    graph_child, target_schema, partition_depth \
+             FROM public.__reflex_ivm_reference WHERE name = $1",
+                Some(1),
+                &[unsafe {
+                    DatumWithOid::new(name.to_string(), PgBuiltInOids::TEXTOID.oid().value())
+                }],
+            )
+            .unwrap_or_report()
+            .collect::<Vec<_>>();
+
+    let row = rows.first()?;
+
+    let agg_json: String = row
+        .get_by_name::<&str, _>("aggregations")
+        .unwrap_or(None)
+        .unwrap_or("{}")
+        .to_string();
+
+    Some(ImvRecord {
+        view_name: row
+            .get_by_name::<&str, _>("name")
+            .unwrap_or(None)
+            .unwrap_or("")
+            .to_string(),
+        base_query: row
+            .get_by_name::<&str, _>("base_query")
+            .unwrap_or(None)
+            .unwrap_or("")
+            .to_string(),
+        end_query: row
+            .get_by_name::<&str, _>("end_query")
+            .unwrap_or(None)
+            .unwrap_or("")
+            .to_string(),
+        plan: serde_json::from_str::<AggregationPlan>(&agg_json).ok(),
+        storage_mode: row
+            .get_by_name::<&str, _>("storage_mode")
+            .unwrap_or(None)
+            .unwrap_or("UNLOGGED")
+            .to_string(),
+        refresh_mode: row
+            .get_by_name::<&str, _>("refresh_mode")
+            .unwrap_or(None)
+            .unwrap_or("IMMEDIATE")
+            .to_string(),
+        enabled: row
+            .get_by_name::<bool, _>("enabled")
+            .unwrap_or(None)
+            .unwrap_or(true),
+        depends_on: row
+            .get_by_name::<Vec<String>, _>("depends_on")
+            .unwrap_or(None)
+            .unwrap_or_default(),
+        depends_on_imv: row
+            .get_by_name::<Vec<String>, _>("depends_on_imv")
+            .unwrap_or(None)
+            .unwrap_or_default(),
+        graph_child: row
+            .get_by_name::<Vec<String>, _>("graph_child")
+            .unwrap_or(None)
+            .unwrap_or_default(),
+        target_schema: row
+            .get_by_name::<&str, _>("target_schema")
+            .unwrap_or(None)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string()),
+        partition_depth: row.get_by_name::<i32, _>("partition_depth").unwrap_or(None),
+    })
+}
+
+/// Set or clear (`value = None`) the per-IMV `wipe_threshold` override.
+/// Returns the number of catalog rows updated (0 = IMV not found).
+#[allow(dead_code)]
+pub fn set_wipe_threshold(
+    client: &mut pgrx::spi::SpiClient<'_>,
+    name: &str,
+    value: Option<pgrx::AnyNumeric>,
+) -> Result<u64, spi::Error> {
+    let oid_text = PgBuiltInOids::TEXTOID.oid().value();
+    let n = client
+        .update(
+            "UPDATE public.__reflex_ivm_reference SET wipe_threshold = $1 WHERE name = $2",
+            None,
+            &[
+                unsafe {
+                    DatumWithOid::new(value.clone(), PgBuiltInOids::NUMERICOID.oid().value())
+                },
+                unsafe { DatumWithOid::new(name.to_string(), oid_text) },
+            ],
+        )?
+        .len();
+    Ok(n as u64)
+}
+
+/// Internal: set or clear a single `BIGINT` config column by name. The
+/// `column` argument is always a compile-time `&'static str` literal from
+/// this module — never user input — so interpolating it is injection-safe.
+fn set_int8_column(
+    client: &mut pgrx::spi::SpiClient<'_>,
+    column: &'static str,
+    name: &str,
+    value: Option<i64>,
+) -> Result<u64, spi::Error> {
+    let oid_text = PgBuiltInOids::TEXTOID.oid().value();
+    let sql = format!("UPDATE public.__reflex_ivm_reference SET {column} = $1 WHERE name = $2");
+    let n = client
+        .update(
+            &sql,
+            None,
+            &[
+                unsafe { DatumWithOid::new(value, PgBuiltInOids::INT8OID.oid().value()) },
+                unsafe { DatumWithOid::new(name.to_string(), oid_text) },
+            ],
+        )?
+        .len();
+    Ok(n as u64)
+}
+
+/// Set or clear (`value = None`) the per-IMV `wipe_floor_rows` override.
+#[allow(dead_code)]
+pub fn set_wipe_floor_rows(
+    client: &mut pgrx::spi::SpiClient<'_>,
+    name: &str,
+    value: Option<i64>,
+) -> Result<u64, spi::Error> {
+    set_int8_column(client, "wipe_floor_rows", name, value)
+}
+
+/// Set or clear (`value = None`) the per-IMV `partition_dispatch_cost_cap`.
+#[allow(dead_code)]
+pub fn set_partition_dispatch_cost_cap(
+    client: &mut pgrx::spi::SpiClient<'_>,
+    name: &str,
+    value: Option<i64>,
+) -> Result<u64, spi::Error> {
+    set_int8_column(client, "partition_dispatch_cost_cap", name, value)
+}
+
+/// Remove `child_view` from `parent_view`'s `graph_child` array. The read
+/// counterpart of one iteration of [`add_graph_child_links`]; used by
+/// `drop_reflex_ivm` to unlink a dropped IMV from each parent.
+#[allow(dead_code)]
+pub fn remove_graph_child(
+    client: &mut pgrx::spi::SpiClient<'_>,
+    parent_view: &str,
+    child_view: &str,
+) -> Result<(), spi::Error> {
+    let oid_text = PgBuiltInOids::TEXTOID.oid().value();
+    client.update(
+        "UPDATE public.__reflex_ivm_reference \
+         SET graph_child = array_remove(graph_child, $1) WHERE name = $2",
+        None,
+        &[
+            unsafe { DatumWithOid::new(child_view.to_string(), oid_text) },
+            unsafe { DatumWithOid::new(parent_view.to_string(), oid_text) },
+        ],
+    )?;
     Ok(())
 }

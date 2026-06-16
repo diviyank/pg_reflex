@@ -30,7 +30,11 @@ pub use identifier::{
     split_qualified, strip_redundant_bare_alias, substitute_identifier_ci,
 };
 #[allow(unused_imports)]
-pub use registry::{add_graph_child_links, insert_registry_row, AggregationsCast, RegistryRow};
+pub use registry::{
+    add_graph_child_links, insert_registry_row, read_imv, remove_graph_child,
+    set_partition_dispatch_cost_cap, set_wipe_floor_rows, set_wipe_threshold, AggregationsCast,
+    ImvRecord, RegistryRow,
+};
 #[allow(unused_imports)]
 pub use slot::slot_replace;
 
