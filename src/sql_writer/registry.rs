@@ -268,7 +268,6 @@ pub fn add_graph_child_links(
 /// (introspect's status query, audit's all-rows scan) are deliberately NOT
 /// served by this struct — they read column subsets across many rows.
 #[derive(Clone, Debug)]
-#[allow(dead_code)]
 pub struct ImvRecord {
     pub view_name: String,
     pub base_query: String,
@@ -292,7 +291,6 @@ pub struct ImvRecord {
 /// not registered). Disabled rows are still returned — callers that require
 /// `enabled = TRUE` check [`ImvRecord::enabled`] themselves (matching the
 /// historical per-caller `WHERE enabled = TRUE` filters).
-#[allow(dead_code)]
 pub fn read_imv(client: &mut pgrx::spi::SpiClient<'_>, name: &str) -> Option<ImvRecord> {
     let rows =
         client

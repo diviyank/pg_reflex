@@ -23,45 +23,20 @@ pub(crate) fn reflex_reconcile(view_name: &str) -> &'static str {
         pgrx::notice!("pg_reflex: sync before reconcile returned: {}", sync_msg);
     }
     Spi::connect_mut(|client| {
-        let rows = client
-            .select(
-                "SELECT base_query, end_query, aggregations::text AS aggregations \
-                 FROM public.__reflex_ivm_reference WHERE name = $1 AND enabled = TRUE",
-                None,
-                &[unsafe {
-                    DatumWithOid::new(view_name.to_string(), PgBuiltInOids::TEXTOID.oid().value())
-                }],
-            )
-            .unwrap_or_report()
-            .collect::<Vec<_>>();
+        let record = match crate::sql_writer::registry::read_imv(client, view_name) {
+            Some(r) if r.enabled => r,
+            _ => {
+                warning!(
+                    "pg_reflex: reconcile failed — IMV '{}' not found or disabled",
+                    view_name
+                );
+                return "ERROR: IMV not found or disabled";
+            }
+        };
 
-        if rows.is_empty() {
-            warning!(
-                "pg_reflex: reconcile failed — IMV '{}' not found or disabled",
-                view_name
-            );
-            return "ERROR: IMV not found or disabled";
-        }
-
-        let row = &rows[0];
-        let base_query: String = row
-            .get_by_name::<&str, _>("base_query")
-            .unwrap_or(None)
-            .unwrap_or("")
-            .to_string();
-        let end_query: String = row
-            .get_by_name::<&str, _>("end_query")
-            .unwrap_or(None)
-            .unwrap_or("")
-            .to_string();
-        let agg_json: String = row
-            .get_by_name::<&str, _>("aggregations")
-            .unwrap_or(None)
-            .unwrap_or("{}")
-            .to_string();
-
-        let parsed_plan: Option<aggregation::AggregationPlan> =
-            serde_json::from_str::<aggregation::AggregationPlan>(&agg_json).ok();
+        let base_query: String = record.base_query.clone();
+        let end_query: String = record.end_query.clone();
+        let parsed_plan: Option<aggregation::AggregationPlan> = record.plan.clone();
         let is_passthrough = parsed_plan
             .as_ref()
             .map(|p| p.is_passthrough)
@@ -85,26 +60,7 @@ pub(crate) fn reflex_reconcile(view_name: &str) -> &'static str {
 
                 // Resolve storage mode from the catalog so swap tables
                 // match the parent's persistence.
-                let storage_mode: String = client
-                    .select(
-                        "SELECT storage_mode FROM public.__reflex_ivm_reference WHERE name = $1",
-                        Some(1),
-                        &[unsafe {
-                            DatumWithOid::new(
-                                view_name.to_string(),
-                                PgBuiltInOids::TEXTOID.oid().value(),
-                            )
-                        }],
-                    )
-                    .ok()
-                    .and_then(|mut it| it.next())
-                    .and_then(|r| {
-                        r.get_by_name::<&str, _>("storage_mode")
-                            .ok()
-                            .flatten()
-                            .map(|s| s.to_string())
-                    })
-                    .unwrap_or_else(|| "UNLOGGED".to_string());
+                let storage_mode: String = record.storage_mode.clone();
                 let unlogged = storage_mode.eq_ignore_ascii_case("UNLOGGED");
 
                 // Walk every source partition child and swap each.
@@ -251,14 +207,17 @@ pub(crate) fn reflex_reconcile(view_name: &str) -> &'static str {
                 .unwrap_or_report();
         } else {
             // Aggregate: rebuild intermediate + target
-            // Drop pg_reflex-managed indexes first for faster bulk insert.
             // The registry's `aggregations` is written by pg_reflex itself
             // (via `serde_json::to_string` over an AggregationPlan); a
             // malformed value would mean catalog corruption, not user error.
-            // Failing loudly there beats silently constructing a degenerate
-            // plan that produces wrong output. `expect` is correct.
-            let plan: aggregation::AggregationPlan = serde_json::from_str(&agg_json)
-                .expect("pg_reflex: __reflex_ivm_reference.aggregations must be valid JSON written by pg_reflex");
+            // We already parsed it once above as `parsed_plan` — if it was
+            // invalid, we wouldn't have reached here (it would be None,
+            // and passthrough would be false, landing us in the passthrough
+            // branch, not the aggregate branch). So `parsed_plan` is
+            // guaranteed to be Some(valid_plan) here.
+            let plan: aggregation::AggregationPlan = parsed_plan
+                .clone()
+                .expect("pg_reflex: parsed_plan must be valid in aggregate branch");
 
             let intermediate = intermediate_table_name(view_name);
 
