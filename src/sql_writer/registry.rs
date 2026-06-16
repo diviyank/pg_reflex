@@ -439,7 +439,6 @@ pub fn set_partition_dispatch_cost_cap(
 /// Remove `child_view` from `parent_view`'s `graph_child` array. The read
 /// counterpart of one iteration of [`add_graph_child_links`]; used by
 /// `drop_reflex_ivm` to unlink a dropped IMV from each parent.
-#[allow(dead_code)]
 pub fn remove_graph_child(
     client: &mut pgrx::spi::SpiClient<'_>,
     parent_view: &str,

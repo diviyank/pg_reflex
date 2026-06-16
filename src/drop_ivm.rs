@@ -79,40 +79,17 @@ fn drop_reflex_ivm_impl_inner(view_name: &str, cascade: bool, root: &str) -> &'s
     // persist.
     let (status, sub_imvs_to_drop): (&'static str, Vec<String>) = Spi::connect_mut(|client| {
         // 1. Check if view exists
-        let exists = client
-            .select(
-                "SELECT name, graph_child, depends_on, depends_on_imv, target_schema \
-                 FROM public.__reflex_ivm_reference WHERE name = $1",
-                None,
-                &[unsafe {
-                    DatumWithOid::new(view_name.to_string(), PgBuiltInOids::TEXTOID.oid().value())
-                }],
-            )
-            .unwrap_or_report()
-            .collect::<Vec<_>>();
-
-        if exists.is_empty() {
-            warning!("pg_reflex: drop failed — IMV '{}' not found", view_name);
-            return ("ERROR: IMV not found", Vec::new());
-        }
-
-        let row = &exists[0];
-        let children: Vec<String> = row
-            .get_by_name::<Vec<String>, _>("graph_child")
-            .unwrap_or(None)
-            .unwrap_or_default();
-        let depends_on: Vec<String> = row
-            .get_by_name::<Vec<String>, _>("depends_on")
-            .unwrap_or(None)
-            .unwrap_or_default();
-        let depends_on_imv: Vec<String> = row
-            .get_by_name::<Vec<String>, _>("depends_on_imv")
-            .unwrap_or(None)
-            .unwrap_or_default();
-        let target_schema: Option<String> = row
-            .get_by_name::<String, _>("target_schema")
-            .unwrap_or(None)
-            .filter(|s| !s.is_empty());
+        let record = match crate::sql_writer::registry::read_imv(client, view_name) {
+            Some(r) => r,
+            None => {
+                warning!("pg_reflex: drop failed — IMV '{}' not found", view_name);
+                return ("ERROR: IMV not found", Vec::new());
+            }
+        };
+        let children: Vec<String> = record.graph_child.clone();
+        let depends_on: Vec<String> = record.depends_on.clone();
+        let depends_on_imv: Vec<String> = record.depends_on_imv.clone();
+        let target_schema: Option<String> = record.target_schema.clone();
 
         // Name used for all relation-level teardown DDL (target + aux tables).
         // When the stored name is bare we re-qualify it with the schema the
@@ -315,27 +292,7 @@ fn drop_reflex_ivm_impl_inner(view_name: &str, cascade: bool, root: &str) -> &'s
 
         // 7. Update parent IMVs: remove this view from their graph_child
         for parent in &depends_on_imv {
-            client
-                .update(
-                    "UPDATE public.__reflex_ivm_reference \
-                     SET graph_child = array_remove(graph_child, $1) \
-                     WHERE name = $2",
-                    None,
-                    &[
-                        unsafe {
-                            DatumWithOid::new(
-                                view_name.to_string(),
-                                PgBuiltInOids::TEXTOID.oid().value(),
-                            )
-                        },
-                        unsafe {
-                            DatumWithOid::new(
-                                parent.to_string(),
-                                PgBuiltInOids::TEXTOID.oid().value(),
-                            )
-                        },
-                    ],
-                )
+            crate::sql_writer::registry::remove_graph_child(client, parent, view_name)
                 .unwrap_or_report();
         }
 
