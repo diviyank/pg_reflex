@@ -267,9 +267,11 @@ pub fn add_graph_child_links(
 /// JSONB into an [`AggregationPlan`] exactly once. Reporting projections
 /// (introspect's status query, audit's all-rows scan) are deliberately NOT
 /// served by this struct — they read column subsets across many rows.
-// Some fields gain their first reader only as Phase 3 wires drop/audit onto
-// this seam; the allow keeps the tree warning-clean until then and is
-// reconsidered (trim or justify any still-unread field) at the final gate.
+// `ImvRecord` is a faithful typed mirror of the catalog row: most fields have
+// a production reader (reconcile/drop/audit), `view_name` is asserted by the
+// read seam's round-trip test, and a field like `refresh_mode` is carried for
+// completeness ahead of a reader. The allow keeps a complete read DTO clean
+// without trimming fields the cdylib build would otherwise flag.
 #[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub struct ImvRecord {
