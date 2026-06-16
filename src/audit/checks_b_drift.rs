@@ -265,17 +265,9 @@ impl Check for PartitionTreeDrift {
         // Respect the IMV's mirror depth: a deliberately-shallow IMV mirrors
         // fewer levels than the source, so compare the source tree TRUNCATED to
         // that depth (NULL partition_depth = full source depth = no truncation).
-        let partition_depth: Option<i32> = client
-            .select(
-                "SELECT partition_depth FROM public.__reflex_ivm_reference WHERE name = $1",
-                Some(1),
-                &[unsafe {
-                    DatumWithOid::new(imv.name.clone(), PgBuiltInOids::TEXTOID.oid().value())
-                }],
-            )
-            .ok()
-            .and_then(|mut it| it.next())
-            .and_then(|r| r.get_by_name::<i32, _>("partition_depth").ok().flatten());
+        let partition_depth: Option<i32> = pgrx::spi::Spi::connect_mut(|client| {
+            crate::sql_writer::registry::read_imv(client, &imv.name).and_then(|r| r.partition_depth)
+        });
         let full_src_tree = crate::partition::list_partition_tree(client, &anchor);
         let mirror_depth = partition_depth
             .map(|d| d as usize)
