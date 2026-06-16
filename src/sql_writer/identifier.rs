@@ -38,8 +38,12 @@ pub fn split_qualified(name: &str) -> (Option<&str>, &str) {
 pub fn quote(name: &str) -> String {
     let (schema, tbl) = split_qualified(name);
     match schema {
-        Some(s) => format!("\"{}\".\"{}\"", s, tbl),
-        None => format!("\"{}\"", tbl),
+        Some(s) => format!(
+            "\"{}\".\"{}\"",
+            s.replace('"', "\"\""),
+            tbl.replace('"', "\"\"")
+        ),
+        None => format!("\"{}\"", tbl.replace('"', "\"\"")),
     }
 }
 
