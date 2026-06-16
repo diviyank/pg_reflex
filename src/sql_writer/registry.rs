@@ -267,6 +267,10 @@ pub fn add_graph_child_links(
 /// JSONB into an [`AggregationPlan`] exactly once. Reporting projections
 /// (introspect's status query, audit's all-rows scan) are deliberately NOT
 /// served by this struct — they read column subsets across many rows.
+// Some fields gain their first reader only as Phase 3 wires drop/audit onto
+// this seam; the allow keeps the tree warning-clean until then and is
+// reconsidered (trim or justify any still-unread field) at the final gate.
+#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub struct ImvRecord {
     pub view_name: String,
