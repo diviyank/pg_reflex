@@ -5,6 +5,7 @@ use pgrx::spi::Spi;
 use pgrx::PgBuiltInOids;
 
 use crate::query_decomposer::intermediate_table_name;
+use crate::sql_writer::identifier::quote;
 
 /// One row of IMV status summary.  Returned by `reflex_ivm_status`.
 type IvmStatusRow = (
@@ -106,7 +107,7 @@ fn reflex_ivm_status() -> TableIterator<
         .into_iter()
         .map(|mut row| {
             let name = &row.0;
-            let count_sql = format!("SELECT COUNT(*)::BIGINT AS c FROM {}", quote_ident(name));
+            let count_sql = format!("SELECT COUNT(*)::BIGINT AS c FROM {}", quote(name));
             let c = Spi::get_one::<i64>(&count_sql)
                 .unwrap_or(None)
                 .unwrap_or(-1);
@@ -125,7 +126,7 @@ fn reflex_ivm_stats(
     view_name: &str,
 ) -> TableIterator<'static, (name!(metric, String), name!(value, String))> {
     let mut out: Vec<(String, String)> = Vec::new();
-    let qv = quote_ident(view_name);
+    let qv = quote(view_name);
     // Co-located intermediate table (1.4.1): same schema as the IMV. The helper
     // returns either `"schema"."local"` or a bare local name.
     let interm = intermediate_table_name(view_name);
@@ -304,17 +305,6 @@ fn reflex_explain_flush(view_name: &str) -> String {
     match base {
         Some(b) if !b.is_empty() => format!("EXPLAIN (VERBOSE, COSTS ON) {}", b),
         _ => format!("ERROR: no registered IMV '{}'", view_name),
-    }
-}
-
-fn quote_ident(name: &str) -> String {
-    if name.contains('.') {
-        name.split('.')
-            .map(|p| format!("\"{}\"", p.replace('"', "\"\"")))
-            .collect::<Vec<_>>()
-            .join(".")
-    } else {
-        format!("\"{}\"", name.replace('"', "\"\""))
     }
 }
 
