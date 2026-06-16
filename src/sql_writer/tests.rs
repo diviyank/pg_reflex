@@ -201,6 +201,27 @@ fn format_pg_text_array_escapes() {
     );
 }
 
+#[test]
+fn quote_escapes_embedded_double_quote() {
+    // A bare identifier containing a double-quote must double it,
+    // otherwise the generated SQL is malformed / injectable.
+    assert_eq!(quote(r#"weird"name"#), r#""weird""name""#);
+}
+
+#[test]
+fn quote_escapes_each_qualified_component() {
+    // schema.table where BOTH parts contain a quote — each component
+    // is escaped independently and the dot separator is preserved.
+    assert_eq!(quote(r#"sch"ema.ta"ble"#), r#""sch""ema"."ta""ble""#);
+}
+
+#[test]
+fn quote_plain_identifier_unchanged() {
+    // The common case (no embedded quote) is byte-for-byte unchanged.
+    assert_eq!(quote("my_view"), r#""my_view""#);
+    assert_eq!(quote("myschema.my_view"), r#""myschema"."my_view""#);
+}
+
 // ---------- DDL builders ----------
 
 #[test]
