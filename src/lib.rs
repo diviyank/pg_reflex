@@ -1,4 +1,3 @@
-use pgrx::datum::DatumWithOid;
 use pgrx::prelude::*;
 
 // Stub archive for `cargo test --lib` on Linux.
@@ -652,25 +651,8 @@ fn reflex_set_wipe_threshold(view_name: &str, value: Option<pgrx::AnyNumeric>) -
         return msg.to_string();
     }
     let result: Result<u64, String> = Spi::connect_mut(|client| {
-        let n = client
-            .update(
-                "UPDATE public.__reflex_ivm_reference SET wipe_threshold = $1 WHERE name = $2",
-                None,
-                &[
-                    unsafe {
-                        DatumWithOid::new(value.clone(), PgBuiltInOids::NUMERICOID.oid().value())
-                    },
-                    unsafe {
-                        DatumWithOid::new(
-                            view_name.to_string(),
-                            PgBuiltInOids::TEXTOID.oid().value(),
-                        )
-                    },
-                ],
-            )
-            .map_err(|e| format!("update failed: {}", e))?
-            .len();
-        Ok(n as u64)
+        crate::sql_writer::registry::set_wipe_threshold(client, view_name, value.clone())
+            .map_err(|e| format!("update failed: {}", e))
     });
     match result {
         Ok(0) => format!(
@@ -699,23 +681,8 @@ fn reflex_set_wipe_floor_rows(view_name: &str, value: Option<i64>) -> String {
         return msg.to_string();
     }
     let result: Result<u64, String> = Spi::connect_mut(|client| {
-        let n = client
-            .update(
-                "UPDATE public.__reflex_ivm_reference SET wipe_floor_rows = $1 WHERE name = $2",
-                None,
-                &[
-                    unsafe { DatumWithOid::new(value, PgBuiltInOids::INT8OID.oid().value()) },
-                    unsafe {
-                        DatumWithOid::new(
-                            view_name.to_string(),
-                            PgBuiltInOids::TEXTOID.oid().value(),
-                        )
-                    },
-                ],
-            )
-            .map_err(|e| format!("update failed: {}", e))?
-            .len();
-        Ok(n as u64)
+        crate::sql_writer::registry::set_wipe_floor_rows(client, view_name, value)
+            .map_err(|e| format!("update failed: {}", e))
     });
     match result {
         Ok(0) => format!(
@@ -746,23 +713,8 @@ fn reflex_set_partition_dispatch_cost_cap(view_name: &str, value: Option<i64>) -
         return msg.to_string();
     }
     let result: Result<u64, String> = Spi::connect_mut(|client| {
-        let n = client
-            .update(
-                "UPDATE public.__reflex_ivm_reference SET partition_dispatch_cost_cap = $1 WHERE name = $2",
-                None,
-                &[
-                    unsafe { DatumWithOid::new(value, PgBuiltInOids::INT8OID.oid().value()) },
-                    unsafe {
-                        DatumWithOid::new(
-                            view_name.to_string(),
-                            PgBuiltInOids::TEXTOID.oid().value(),
-                        )
-                    },
-                ],
-            )
-            .map_err(|e| format!("update failed: {}", e))?
-            .len();
-        Ok(n as u64)
+        crate::sql_writer::registry::set_partition_dispatch_cost_cap(client, view_name, value)
+            .map_err(|e| format!("update failed: {}", e))
     });
     match result {
         Ok(0) => format!(

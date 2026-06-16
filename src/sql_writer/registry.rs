@@ -373,7 +373,6 @@ pub fn read_imv(client: &mut pgrx::spi::SpiClient<'_>, name: &str) -> Option<Imv
 
 /// Set or clear (`value = None`) the per-IMV `wipe_threshold` override.
 /// Returns the number of catalog rows updated (0 = IMV not found).
-#[allow(dead_code)]
 pub fn set_wipe_threshold(
     client: &mut pgrx::spi::SpiClient<'_>,
     name: &str,
@@ -420,7 +419,6 @@ fn set_int8_column(
 }
 
 /// Set or clear (`value = None`) the per-IMV `wipe_floor_rows` override.
-#[allow(dead_code)]
 pub fn set_wipe_floor_rows(
     client: &mut pgrx::spi::SpiClient<'_>,
     name: &str,
@@ -430,7 +428,6 @@ pub fn set_wipe_floor_rows(
 }
 
 /// Set or clear (`value = None`) the per-IMV `partition_dispatch_cost_cap`.
-#[allow(dead_code)]
 pub fn set_partition_dispatch_cost_cap(
     client: &mut pgrx::spi::SpiClient<'_>,
     name: &str,
