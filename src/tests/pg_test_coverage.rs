@@ -1611,7 +1611,7 @@ fn cov_set_wipe_threshold_invalid_name() {
 }
 
 /// `reflex_explain_flush` on schema-qualified IMV name — exercises
-/// introspect.rs:315-318 quote_ident dotted path.
+/// introspect.rs schema-qualified name handling via the canonical quote().
 #[pg_test]
 fn cov_explain_flush_schema_qualified_name() {
     Spi::run("CREATE SCHEMA IF NOT EXISTS cov_sq2").expect("schema");
