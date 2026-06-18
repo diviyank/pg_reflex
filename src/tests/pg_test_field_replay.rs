@@ -115,13 +115,15 @@ fn replay_sop_baseline_secondary_is_sublinear() {
              LEFT JOIN up_{s} up ON up.product_id = st.product_id \
              GROUP BY st.product_id, st.location_id, st.delivery_date", s = suf);
         crate::create_reflex_ivm(&format!("sopisb_qy_{s}", s = suf), &sql, None, None, Some("DEFERRED"), None);
-        Spi::run(&format!("INSERT INTO pb_{s} VALUES (900001, 7, 1, 1, date '2024-05-01', 5)", s = suf)).unwrap();
-        Spi::run(&format!("SELECT reflex_flush_deferred('pb_{s}')", s = suf)).unwrap();
     }
     // If the main name has no flush recorded (decomposed sub-IMV), discover it:
     //   SELECT name FROM reflex_ivm_status() WHERE name LIKE 'sopisb_qy_s%';
-    let small = last_flush_ms_of("sopisb_qy_s");
-    let big = last_flush_ms_of("sopisb_qy_b");
+    let small = min_flush_ms_sampled("pb_s", "sopisb_qy_s",
+        |k| format!("INSERT INTO pb_s VALUES ({}, 7, 1, 1, date '2024-05-01', 5)", 900001 + k),
+        PLAN_PROBE_SAMPLES);
+    let big = min_flush_ms_sampled("pb_b", "sopisb_qy_b",
+        |k| format!("INSERT INTO pb_b VALUES ({}, 7, 1, 1, date '2024-05-01', 5)", 900001 + k),
+        PLAN_PROBE_SAMPLES);
     eprintln!("FIELD_R2B sop-baseline small={}ms big={}ms", small, big);
     assert_sublinear("sop-baseline-secondary", small, big, 25);
 }

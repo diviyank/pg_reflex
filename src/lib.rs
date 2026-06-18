@@ -1181,6 +1181,35 @@ mod tests {
         .expect("last_flush_ms was NULL — no flush recorded for this IMV")
     }
 
+    /// Apply an identical single-row delta `samples` times (one flush each) and
+    /// return the MIN recorded flush wall-time. `make_insert(k)` must produce a
+    /// distinct-PK INSERT for sample `k` so each cycle enqueues fresh work.
+    ///
+    /// At this scale the flush wall-time is dominated by base-INDEPENDENT fixed
+    /// overhead (registry reads, scratch/affected build, advisory lock, DO-block
+    /// dispatch, target-sync setup) whose run-to-run jitter is large — observed
+    /// ~2x on a quiet box and ~10x on a loaded CI runner (a fixed-group aggregate
+    /// flush that costs 25ms locally stretched to 242ms on CI, tripping a
+    /// single-sample ratio test on pure noise). MIN collapses those outliers to
+    /// the genuine floor cost, which is what the O(base)-vs-O(delta) comparison
+    /// in `assert_sublinear` is actually meant to measure.
+    const PLAN_PROBE_SAMPLES: i32 = 5;
+
+    fn min_flush_ms_sampled(
+        source: &str,
+        imv: &str,
+        make_insert: impl Fn(i32) -> String,
+        samples: i32,
+    ) -> i64 {
+        let mut best = i64::MAX;
+        for k in 0..samples {
+            Spi::run(&make_insert(k)).expect("delta insert");
+            Spi::run(&format!("SELECT reflex_flush_deferred('{}')", source)).expect("flush");
+            best = best.min(last_flush_ms_of(imv));
+        }
+        best
+    }
+
     /// Plan-quality discriminator. Given flush wall-times for an identical O(1)
     /// delta against a small base and a `base_ratio`x-larger base, decide whether
     /// the shape's maintenance cost SCALES with base size (an O(base) plan grows

@@ -31,9 +31,8 @@ fn audit_probe_calibration_passthrough_is_sublinear() {
         Some("DEFERRED"),
         None,
     );
-    Spi::run("INSERT INTO cal_s VALUES (900001, 7, 5)").unwrap();
-    Spi::run("SELECT reflex_flush_deferred('cal_s')").expect("flush small");
-    let small = last_flush_ms_of("cal_s_v");
+    let small = min_flush_ms_sampled("cal_s", "cal_s_v",
+        |k| format!("INSERT INTO cal_s VALUES ({}, 7, 5)", 900001 + k), PLAN_PROBE_SAMPLES);
 
     Spi::run("CREATE TABLE cal_b (id INT PRIMARY KEY, g INT, v NUMERIC)").unwrap();
     Spi::run("INSERT INTO cal_b SELECT i, i % 100, i FROM generate_series(1,500000) i").unwrap();
@@ -45,9 +44,8 @@ fn audit_probe_calibration_passthrough_is_sublinear() {
         Some("DEFERRED"),
         None,
     );
-    Spi::run("INSERT INTO cal_b VALUES (900001, 7, 5)").unwrap();
-    Spi::run("SELECT reflex_flush_deferred('cal_b')").expect("flush big");
-    let big = last_flush_ms_of("cal_b_v");
+    let big = min_flush_ms_sampled("cal_b", "cal_b_v",
+        |k| format!("INSERT INTO cal_b VALUES ({}, 7, 5)", 900001 + k), PLAN_PROBE_SAMPLES);
 
     // Keyed passthrough is O(delta): a 1-row insert touches one IMV row whether
     // the base holds 20k or 500k rows.
@@ -91,12 +89,11 @@ fn audit_multisource_aggregate_secondary_join_is_sublinear() {
                 "SELECT f.dim, d.label, SUM(f.amt) AS s FROM ma_fact_{s} f \
                  LEFT JOIN ma_dim_{s} d ON d.dim = f.dim GROUP BY f.dim, d.label", s = suf),
             None, None, Some("DEFERRED"), None);
-        Spi::run(&format!(
-            "INSERT INTO ma_fact_{s} VALUES (900001, 7, 5)", s = suf)).unwrap();
-        Spi::run(&format!("SELECT reflex_flush_deferred('ma_fact_{s}')", s = suf)).unwrap();
     }
-    let small = last_flush_ms_of("ma_v_s");
-    let big = last_flush_ms_of("ma_v_b");
+    let small = min_flush_ms_sampled("ma_fact_s", "ma_v_s",
+        |k| format!("INSERT INTO ma_fact_s VALUES ({}, 7, 5)", 900001 + k), PLAN_PROBE_SAMPLES);
+    let big = min_flush_ms_sampled("ma_fact_b", "ma_v_b",
+        |k| format!("INSERT INTO ma_fact_b VALUES ({}, 7, 5)", 900001 + k), PLAN_PROBE_SAMPLES);
     eprintln!("AUDIT_T4 multisource-aggregate small={}ms big={}ms", small, big);
     assert_sublinear("multisource-aggregate-secondary-join", small, big, 25);
 }
@@ -160,11 +157,11 @@ fn audit_single_source_aggregate_is_sublinear() {
             &format!("sa_v_{s}", s = suf),
             &format!("SELECT g, SUM(v) AS s, COUNT(*) AS c FROM sa_{s} GROUP BY g", s = suf),
             None, None, Some("DEFERRED"), None);
-        Spi::run(&format!("INSERT INTO sa_{s} VALUES (900001, 7, 5)", s = suf)).unwrap();
-        Spi::run(&format!("SELECT reflex_flush_deferred('sa_{s}')", s = suf)).unwrap();
     }
-    let small = last_flush_ms_of("sa_v_s");
-    let big = last_flush_ms_of("sa_v_b");
+    let small = min_flush_ms_sampled("sa_s", "sa_v_s",
+        |k| format!("INSERT INTO sa_s VALUES ({}, 7, 5)", 900001 + k), PLAN_PROBE_SAMPLES);
+    let big = min_flush_ms_sampled("sa_b", "sa_v_b",
+        |k| format!("INSERT INTO sa_b VALUES ({}, 7, 5)", 900001 + k), PLAN_PROBE_SAMPLES);
     eprintln!("AUDIT_M2 single-source-aggregate small={}ms big={}ms", small, big);
     assert_sublinear("single-source-aggregate", small, big, 25);
 }
@@ -188,11 +185,11 @@ fn audit_inner_join_aggregate_is_sublinear() {
                 "SELECT f.dim, d.label, SUM(f.amt) AS s FROM ija_fact_{s} f \
                  JOIN ija_dim_{s} d ON d.dim = f.dim GROUP BY f.dim, d.label", s = suf),
             None, None, Some("DEFERRED"), None);
-        Spi::run(&format!("INSERT INTO ija_fact_{s} VALUES (900001, 7, 5)", s = suf)).unwrap();
-        Spi::run(&format!("SELECT reflex_flush_deferred('ija_fact_{s}')", s = suf)).unwrap();
     }
-    let small = last_flush_ms_of("ija_v_s");
-    let big = last_flush_ms_of("ija_v_b");
+    let small = min_flush_ms_sampled("ija_fact_s", "ija_v_s",
+        |k| format!("INSERT INTO ija_fact_s VALUES ({}, 7, 5)", 900001 + k), PLAN_PROBE_SAMPLES);
+    let big = min_flush_ms_sampled("ija_fact_b", "ija_v_b",
+        |k| format!("INSERT INTO ija_fact_b VALUES ({}, 7, 5)", 900001 + k), PLAN_PROBE_SAMPLES);
     eprintln!("AUDIT_M2 inner-join-aggregate small={}ms big={}ms", small, big);
     assert_sublinear("inner-join-aggregate", small, big, 25);
 }
@@ -214,12 +211,12 @@ fn audit_cte_decomposed_is_sublinear() {
                 "WITH agg AS (SELECT dim, SUM(amt) AS s FROM cd_fact_{s} GROUP BY dim) \
                  SELECT dim, s FROM agg", s = suf),
             None, None, Some("DEFERRED"), None);
-        Spi::run(&format!("INSERT INTO cd_fact_{s} VALUES (900001, 7, 5)", s = suf)).unwrap();
-        Spi::run(&format!("SELECT reflex_flush_deferred('cd_fact_{s}')", s = suf)).unwrap();
     }
     // For CTE-decomposed views, query the sub-IMV __cte_agg that records the flush
-    let small = last_flush_ms_of("cd_v_s__cte_agg");
-    let big = last_flush_ms_of("cd_v_b__cte_agg");
+    let small = min_flush_ms_sampled("cd_fact_s", "cd_v_s__cte_agg",
+        |k| format!("INSERT INTO cd_fact_s VALUES ({}, 7, 5)", 900001 + k), PLAN_PROBE_SAMPLES);
+    let big = min_flush_ms_sampled("cd_fact_b", "cd_v_b__cte_agg",
+        |k| format!("INSERT INTO cd_fact_b VALUES ({}, 7, 5)", 900001 + k), PLAN_PROBE_SAMPLES);
     eprintln!("AUDIT_M2 cte-decomposed small={}ms big={}ms", small, big);
     assert_sublinear("cte-decomposed", small, big, 25);
 }
@@ -245,12 +242,12 @@ fn audit_union_all_is_sublinear() {
             &format!(
                 "SELECT id, g, v FROM ua_p_{s} UNION ALL SELECT id, g, v FROM ua_q_{s}", s = suf),
             None, None, Some("DEFERRED"), None);
-        Spi::run(&format!("INSERT INTO ua_p_{s} VALUES (900001, 7, 5)", s = suf)).unwrap();
-        Spi::run(&format!("SELECT reflex_flush_deferred('ua_p_{s}')", s = suf)).unwrap();
     }
     // For UNION decomposed views, query the sub-IMV __union_0 that corresponds to the first operand
-    let small = last_flush_ms_of("ua_v_s__union_0");
-    let big = last_flush_ms_of("ua_v_b__union_0");
+    let small = min_flush_ms_sampled("ua_p_s", "ua_v_s__union_0",
+        |k| format!("INSERT INTO ua_p_s VALUES ({}, 7, 5)", 900001 + k), PLAN_PROBE_SAMPLES);
+    let big = min_flush_ms_sampled("ua_p_b", "ua_v_b__union_0",
+        |k| format!("INSERT INTO ua_p_b VALUES ({}, 7, 5)", 900001 + k), PLAN_PROBE_SAMPLES);
     eprintln!("AUDIT_M2 union-all small={}ms big={}ms", small, big);
     assert_sublinear("union-all", small, big, 25);
 }
