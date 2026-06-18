@@ -2,6 +2,47 @@
 
 ## [Unreleased]
 
+## [1.10.6] - 2026-06-18
+
+Dropping an IMV's target table (or the schema/view it lives on) now cleans the
+IMV up instead of orphaning its registry row. Replace the `.so`, then
+`ALTER EXTENSION pg_reflex UPDATE TO '1.10.6';` (the migration re-creates the
+`__reflex_on_sql_drop` event-trigger function — see Migration below).
+
+### Fixed
+
+- **The `sql_drop` event trigger only reacted to a *source* table being dropped,
+  so dropping an IMV's own *target* table left an orphaned `__reflex_ivm_reference`
+  row pointing at a relation that no longer exists.** Two paths hit this: a target
+  removed via `DROP SCHEMA … CASCADE` while its sources lived elsewhere, and IMVs
+  built on a **view** (a dropped view is `object_type = 'view'`, which the source
+  branch's `object_type = 'table'` filter skips entirely). Observed as 8 surviving
+  `yse.*` registry rows after `DROP SCHEMA yse CASCADE`. `__reflex_on_sql_drop` now
+  also tears down the IMV whose registered target table *is* the dropped table,
+  matched on the exact target identity (`target_schema` + bare name) — never a
+  prefix, so a partition-swap maintenance cycle dropping child / `__reflex_swap_*`
+  tables can never be mistaken for the registered target.
+- **Identifier quoting did not escape an embedded double-quote.** `quote` now
+  doubles embedded `"`, so IMV / source names containing a `"` no longer generate
+  malformed teardown and maintenance DDL.
+
+### Changed
+
+- **Internal: registry reads go through a single typed seam.** `read_imv` returns
+  a typed `ImvRecord` DTO and the `reflex_set_*` setters delegate to typed registry
+  writers, replacing hand-rolled `SELECT … FROM __reflex_ivm_reference` across the
+  drop, reconcile, and audit paths. Behavior-neutral — no user-facing change.
+
+### Migration
+
+- The orphan fix re-creates the `__reflex_on_sql_drop` plpgsql function (no
+  signature or schema change): [`sql/pg_reflex--1.10.5--1.10.6.sql`](https://github.com/diviyank/pg_reflex/blob/main/sql/pg_reflex--1.10.5--1.10.6.sql).
+  The quoting fix and the registry-read-seam refactor are pure Rust — no migration
+  DDL. No IMV rebuild required. Pre-1.10.6 orphaned rows are not retroactively
+  cleaned: drop them with `drop_reflex_ivm(name, true)`, or a bare
+  `DELETE FROM public.__reflex_ivm_reference WHERE …` for rows whose target is
+  already gone.
+
 ## [1.10.5] - 2026-06-14
 
 Attaching a new top-level partition with many empty sub-partitions is now far

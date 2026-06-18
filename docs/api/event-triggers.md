@@ -4,7 +4,12 @@ pg_reflex installs two database-wide event triggers (1.2.0+).
 
 ## `reflex_on_sql_drop`
 
-Fires on the `sql_drop` event. For each dropped table, it looks up the IMV registry for IMVs whose `depends_on` includes that table, and calls `drop_reflex_ivm(name, true)` for each.
+Fires on the `sql_drop` event. For each dropped table it cleans up two sets of IMVs:
+
+- **Source dropped** — IMVs whose `depends_on` includes that table.
+- **Target dropped** (1.10.6+) — the IMV whose own registered target table *is* that table. This catches an IMV whose target is dropped directly or via `DROP SCHEMA … CASCADE`, and IMVs built on a **view** (a dropped view is `object_type = 'view'`, which the source branch's table filter never matches) — both previously left an orphaned registry row pointing at a relation that no longer exists. The match is on the exact target identity (`target_schema` + bare name), so a partition-swap maintenance cycle dropping child / swap tables is never mistaken for the registered target.
+
+For each match it calls `drop_reflex_ivm(name, true)`.
 
 The cleanup drops:
 

@@ -4,6 +4,39 @@ The full changelog tracks every release. The latest version's headlines are on t
 
 For each version below, see [`CHANGELOG.md`](https://github.com/diviyank/pg_reflex/blob/main/CHANGELOG.md) on GitHub for the canonical text.
 
+## [1.10.6] — 2026-06-18
+
+Dropping an IMV's target table no longer orphans its registry row. Replace the `.so`, then `ALTER EXTENSION pg_reflex UPDATE TO '1.10.6';`.
+
+**Fixed**
+
+- The `sql_drop` event trigger only reacted to a *source* table being dropped, so dropping an IMV's own *target* table left an orphaned `__reflex_ivm_reference` row pointing at a relation that no longer exists. Two paths hit this: a target removed via `DROP SCHEMA … CASCADE` while its sources lived elsewhere, and IMVs built on a **view** (a dropped view is `object_type = 'view'`, which the source branch's `object_type = 'table'` filter skips entirely) — observed as 8 surviving `yse.*` rows after `DROP SCHEMA yse CASCADE`. `reflex_on_sql_drop` now also tears down the IMV whose registered target table *is* the dropped table, matched on the exact target identity (`target_schema` + bare name) so a partition-swap dropping child / `__reflex_swap_*` tables is never mistaken for the registered target.
+- Identifier quoting did not escape an embedded double-quote; `quote` now doubles embedded `"`, so names containing a `"` no longer generate malformed DDL.
+
+**Changed**
+
+- Internal: registry reads go through a single typed `read_imv` seam (returns an `ImvRecord` DTO) and the `reflex_set_*` setters delegate to typed registry writers, replacing hand-rolled `SELECT`s across the drop / reconcile / audit paths. Behavior-neutral.
+
+**Migration**
+
+- The orphan fix re-creates the `reflex_on_sql_drop` plpgsql function (no signature or schema change): [`sql/pg_reflex--1.10.5--1.10.6.sql`](https://github.com/diviyank/pg_reflex/blob/main/sql/pg_reflex--1.10.5--1.10.6.sql). Quoting fix and refactor are pure Rust. No IMV rebuild. Pre-1.10.6 orphans are not retroactively cleaned — drop them with `drop_reflex_ivm(name, true)`, or a bare `DELETE FROM public.__reflex_ivm_reference` for rows whose target is already gone.
+
+## [1.10.5] — 2026-06-14
+
+Attaching a new top-level partition with many empty sub-partitions is now far cheaper. Replace the `.so`, then `ALTER EXTENSION pg_reflex UPDATE TO '1.10.5';`.
+
+**Changed**
+
+- `reflex_reconcile_partition` gained a 4th `skip_sync boolean DEFAULT false` argument. When true the per-partition reconcile skips its orphan-swap cleanup and its whole-tree `reflex_sync_partitions` — used by the batch flush, which now syncs the tree once up front instead of once per leaf. `DEFAULT false` keeps every existing 2-/3-arg call site working.
+
+**Fixed**
+
+- Attaching a partition whose sub-partitions are mostly empty reconciled every leaf one by one — each call re-ran `reflex_sync_partitions` over the whole tree and paid fixed per-leaf swap DDL regardless of row count. The flush now syncs each tree once, drives per-leaf reconciles with `skip_sync => true`, and skips outright any brand-new (`AttachNew`) leaf whose source is empty (a provable empty→empty no-op). A 48-leaf attach with 44 empty months dropped 898s → 51s (~17.6×, debug build), the IMV staying exactly equal to the source.
+
+**Migration**
+
+- [`sql/pg_reflex--1.10.4--1.10.5.sql`](https://github.com/diviyank/pg_reflex/blob/main/sql/pg_reflex--1.10.4--1.10.5.sql) drops and recreates `reflex_reconcile_partition` to add the 4th argument. The flush wiring is pure Rust. No IMV rebuild required.
+
 ## [1.10.4] — 2026-06-11
 
 Two follow-up fixes to 1.10.x: the partition attach/detach no-op skip now also covers DETACH-then-DROP, and `drop_reflex_ivm` no longer leaks the per-source DEFERRED staging delta table. Replace the `.so`, then `ALTER EXTENSION pg_reflex UPDATE TO '1.10.4';`.
