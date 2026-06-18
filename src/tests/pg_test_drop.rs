@@ -801,3 +801,115 @@ fn test_drop_self_heals_extension_member_trigger_fn() {
     .expect("v");
     assert_eq!(fn_left, 0, "trigger function must be dropped");
 }
+
+// Dropping the IMV's own *target* table (e.g. via `DROP SCHEMA … CASCADE`, or a
+// stray `DROP TABLE`) must tear the IMV down completely: registry row, aux
+// tables, and source-side triggers. Before this branch the sql_drop trigger
+// only reacted to *source* drops, so an IMV whose target vanished left an
+// orphaned registry row pointing at a non-existent table — exactly the `yse.*`
+// orphans observed in db_qa, where the sources were views the trigger ignored.
+#[pg_test]
+fn test_target_table_drop_removes_imv() {
+    Spi::run("CREATE TABLE ttd_src (id SERIAL, grp TEXT, val NUMERIC)").expect("create table");
+    Spi::run("INSERT INTO ttd_src (grp, val) VALUES ('a', 1), ('b', 2)").expect("seed");
+
+    crate::create_reflex_ivm(
+        "ttd_view",
+        "SELECT grp, SUM(val) AS total FROM ttd_src GROUP BY grp",
+        None,
+        None,
+        None,
+        None,
+    );
+
+    let registered = Spi::get_one::<i64>(
+        "SELECT COUNT(*) FROM public.__reflex_ivm_reference WHERE name = 'ttd_view'",
+    )
+    .expect("q")
+    .expect("v");
+    assert_eq!(registered, 1);
+
+    // Drop the IMV's target table directly — the source survives.
+    Spi::run("DROP TABLE ttd_view").expect("drop target");
+
+    let registry_gone = Spi::get_one::<i64>(
+        "SELECT COUNT(*) FROM public.__reflex_ivm_reference WHERE name = 'ttd_view'",
+    )
+    .expect("q")
+    .expect("v");
+    assert_eq!(
+        registry_gone, 0,
+        "registry row must be deleted when the target table is dropped"
+    );
+
+    let interm_gone = Spi::get_one::<i64>(
+        "SELECT COUNT(*) FROM information_schema.tables \
+         WHERE table_name = '__reflex_intermediate_ttd_view'",
+    )
+    .expect("q")
+    .expect("v");
+    assert_eq!(interm_gone, 0, "intermediate table must be cleaned up");
+
+    let trig_gone = Spi::get_one::<i64>(
+        "SELECT COUNT(*) FROM pg_trigger WHERE tgname LIKE '__reflex_trigger_%_on_ttd_src'",
+    )
+    .expect("q")
+    .expect("v");
+    assert_eq!(trig_gone, 0, "source-side triggers must be removed");
+}
+
+// Guard against the target-drop branch firing during a normal maintenance path.
+// A global `reflex_reconcile` on a partitioned IMV swaps each child partition by
+// building, ATTACHing, and DROPping per-child tables. Those child / swap tables
+// are NOT the registered target, so the new branch must leave both the parent
+// target table and its registry row untouched. Keying the branch on exact target
+// identity (not a prefix) is what makes this safe; this test proves it.
+#[pg_test]
+fn test_partition_swap_preserves_registry_row() {
+    Spi::run(
+        "CREATE TABLE psp_src (id BIGINT, region TEXT NOT NULL, amount NUMERIC) \
+         PARTITION BY LIST (region)",
+    )
+    .expect("create");
+    for r in ["A", "B"] {
+        Spi::run(&format!(
+            "CREATE TABLE psp_src_{r} PARTITION OF psp_src FOR VALUES IN ('{r}')"
+        ))
+        .expect("p");
+    }
+    Spi::run("INSERT INTO psp_src VALUES (1, 'A', 10), (2, 'B', 20)").expect("seed");
+    Spi::run(
+        "SELECT create_reflex_ivm( \
+            'psp_view', \
+            'SELECT region, SUM(amount) AS total FROM psp_src GROUP BY region', \
+            NULL, NULL, NULL, NULL, \
+            ARRAY['region'] \
+         )",
+    )
+    .expect("imv");
+
+    // Force the per-child swap path by drifting every child.
+    Spi::run("UPDATE psp_view SET total = -1 WHERE region IN ('A', 'B')").expect("drift");
+    let res = Spi::get_one::<&str>("SELECT reflex_reconcile('psp_view')")
+        .expect("rec")
+        .expect("res");
+    assert_eq!(res, "RECONCILED");
+
+    // The child-partition drops during the swap must not delete the parent row.
+    let row_alive = Spi::get_one::<i64>(
+        "SELECT COUNT(*) FROM public.__reflex_ivm_reference WHERE name = 'psp_view'",
+    )
+    .expect("q")
+    .expect("v");
+    assert_eq!(
+        row_alive, 1,
+        "registry row must survive a partition-swap maintenance cycle"
+    );
+
+    let target_alive = Spi::get_one::<i64>(
+        "SELECT COUNT(*) FROM information_schema.tables WHERE table_name = 'psp_view'",
+    )
+    .expect("q")
+    .expect("v");
+    assert_eq!(target_alive, 1, "parent target table must survive the swap");
+}

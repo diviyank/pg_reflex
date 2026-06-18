@@ -774,6 +774,31 @@ extension_sql!(
                     DELETE FROM public.__reflex_ivm_reference WHERE name = _imv.name;
                 END;
             END LOOP;
+
+            -- An IMV whose own *target* table was dropped (e.g. DROP SCHEMA …
+            -- CASCADE, or a stray DROP TABLE) must also be torn down, otherwise
+            -- the registry row orphans, pointing at a relation that no longer
+            -- exists. The source branch above never catches this when the
+            -- source is a view or lives outside the dropped scope. Match on the
+            -- EXACT target identity (target_schema + bare name) — never a prefix
+            -- — so a partition swap dropping child / __reflex_swap_* tables can
+            -- never be mistaken for the registered target.
+            FOR _imv IN
+                SELECT name
+                FROM public.__reflex_ivm_reference
+                WHERE COALESCE(target_schema, 'public') || '.'
+                      || (regexp_match(name, '([^.]+)$'))[1] = _obj.object_identity
+                ORDER BY graph_depth DESC, name DESC
+            LOOP
+                BEGIN
+                    PERFORM public.drop_reflex_ivm(_imv.name, TRUE);
+                    RAISE NOTICE 'pg_reflex: dropped IMV % (target % was dropped)', _imv.name, _obj.object_identity;
+                EXCEPTION WHEN OTHERS THEN
+                    RAISE WARNING 'pg_reflex: failed to drop IMV % after target % drop: %',
+                        _imv.name, _obj.object_identity, SQLERRM;
+                    DELETE FROM public.__reflex_ivm_reference WHERE name = _imv.name;
+                END;
+            END LOOP;
         END LOOP;
     END;
     $$;
