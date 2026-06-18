@@ -2138,9 +2138,14 @@ fn flush_isolates_failing_root_from_healthy_root() {
          'region', 'UNLOGGED', 'IMMEDIATE', NULL, ARRAY['region'])",
     ).unwrap();
 
-    // Broken partitioned source + IMV: we corrupt the IMV after creation by
-    // dropping a required target partition child, so reconcile of this root
-    // throws. (Independent of Fix #3 so this test stays valid afterwards.)
+    // Broken partitioned source + IMV: we corrupt the IMV after creation so the
+    // per-partition reconcile of this root throws, WITHOUT removing the registry
+    // row or its source triggers (the root must still enqueue on ATTACH).
+    // Dropping the whole target table is intercepted by the sql_drop event
+    // trigger, which fully unregisters the IMV — so instead we drop only the
+    // aggregate output column from the target: the registry/triggers survive
+    // (target identity unchanged, never a tracked source), but reconcile's
+    // INSERT of (region, total) into a now-`total`-less target child errors hard.
     Spi::run("CREATE TABLE iso_bad (region text, amount int) PARTITION BY LIST (region)").unwrap();
     Spi::run("CREATE TABLE iso_bad_us PARTITION OF iso_bad FOR VALUES IN ('us')").unwrap();
     Spi::run("INSERT INTO iso_bad VALUES ('us', 1)").unwrap();
@@ -2149,8 +2154,8 @@ fn flush_isolates_failing_root_from_healthy_root() {
          'SELECT region, sum(amount) AS total FROM iso_bad GROUP BY region', \
          'region', 'UNLOGGED', 'IMMEDIATE', NULL, ARRAY['region'])",
     ).unwrap();
-    // Corrupt: drop the IMV's target table so reconcile errors hard.
-    Spi::run("DROP TABLE public.iso_bad_imv CASCADE").unwrap();
+    // Corrupt: strip the aggregate output column so reconcile errors hard.
+    Spi::run("ALTER TABLE public.iso_bad_imv DROP COLUMN total").unwrap();
 
     // Attach NEW data partitions to BOTH sources (event trigger enqueues both,
     // creates empty structure, no data fill yet).

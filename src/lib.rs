@@ -1214,13 +1214,20 @@ mod tests {
     /// delta against a small base and a `base_ratio`x-larger base, decide whether
     /// the shape's maintenance cost SCALES with base size (an O(base) plan grows
     /// ~`base_ratio`x; an O(delta) plan stays flat). Returns `false` when the
-    /// large-base flush is cheap (< 30ms) — at that point the shape is fast
+    /// large-base flush is cheap (< 50ms) — at that point the shape is fast
     /// enough at scale that O(base) vs O(delta) is not an operational concern
     /// (the bugs this guards against are multi-second/​minute flushes). Only when
     /// the large-base flush is operationally heavy do we require it to stay near
     /// the small-base cost rather than tracking base growth.
+    ///
+    /// The floor is 50ms, not 30: on a loaded CI runner the base-INDEPENDENT
+    /// fixed overhead of the heaviest probe shape (UNION ALL — two operands, each
+    /// a decomposed sub-IMV) had a `min`-sampled floor cost of ~35ms, tripping the
+    /// old 30ms guard on pure noise even after min-of-N sampling. 50ms clears that
+    /// observed fixed-overhead ceiling while staying 1-2 orders of magnitude below
+    /// the multi-second regressions this discriminator exists to catch.
     fn flush_scales_with_base(small_ms: i64, big_ms: i64, base_ratio: i64) -> bool {
-        if big_ms < 30 {
+        if big_ms < 50 {
             return false;
         }
         big_ms as f64 > std::cmp::max(small_ms, 1) as f64 * (base_ratio as f64 / 3.0)
