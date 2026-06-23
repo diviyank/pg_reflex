@@ -10,14 +10,14 @@ RETURNS TEXT
 ```
 
 - `partition_keys` — comma-separated list of partition key values to reconcile (e.g. `'US'`, `'2026-01,2026-02'`).
-- `source_partition` — optionally names the source child to read from; defaults to resolving it from the keys.
+- `source_partition` — optionally names the source child to read from; defaults to resolving it from the keys. (1.10.7+) accepts a comma-separated list of source children, reconciled in one call so a dependent cascade fires once over the union rather than once per child.
 
 ## Behaviour
 
 1. Resolves the IMV child partition(s) covering `partition_keys`.
 2. Rebuilds each child *outside* the partition tree from the base/end query restricted by the child's partition constraint.
 3. Flips it in via `DETACH`/`ATTACH` inside one sub-transaction — the `AccessExclusiveLock` on the parent lasts only for the metadata DDL.
-4. Cascades to dependent IMVs partitioned on the same column with the same keys; otherwise falls back to a full `reflex_reconcile` of the dependent.
+4. Cascades to dependent IMVs: a dependent partitioned on the same column reconciles by the same keys; (1.10.7+) a non-partitioned dependent that `GROUP BY`s the parent's partition key is rebuilt *key-scoped* — only the affected key slices, with an `EXCEPTION` fallback to full reconcile so it can never be left incorrect; any other dependent falls back to a full `reflex_reconcile`.
 
 Only valid on partitioned IMVs (see [`create_reflex_ivm`](create_reflex_ivm.md) `partition_by`). On an unpartitioned IMV, use [`reflex_reconcile`](reflex_reconcile.md).
 

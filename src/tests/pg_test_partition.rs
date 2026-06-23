@@ -824,6 +824,246 @@ fn pg_part_cascade_after_swap_sees_new_data() {
     assert_eq!(c_doubled.to_string(), "10", "child should reflect rebuilt parent");
 }
 
+/// Scoped cascade: a partitioned parent IMV with a NON-partitioned child IMV
+/// that groups by the parent's partition key (the `forecast_dp_year_agg`
+/// shape). Reconciling ONE parent partition must rebuild only that key's child
+/// groups — it must NOT full-rebuild every key. Proven by corrupting an
+/// unrelated key's child row and asserting it survives a reconcile of a
+/// different partition (a full reflex_reconcile of the child would overwrite
+/// it back to the correct value).
+#[pg_test]
+fn pg_part_cascade_scoped_to_reconciled_key() {
+    Spi::run(
+        "CREATE TABLE part_scope (id BIGINT, region TEXT NOT NULL, amount NUMERIC) \
+         PARTITION BY LIST (region)",
+    )
+    .expect("create");
+    Spi::run("CREATE TABLE part_scope_a PARTITION OF part_scope FOR VALUES IN ('A')").expect("pa");
+    Spi::run("CREATE TABLE part_scope_b PARTITION OF part_scope FOR VALUES IN ('B')").expect("pb");
+    Spi::run("INSERT INTO part_scope VALUES (1, 'A', 10), (2, 'B', 5)").expect("seed");
+
+    // Parent IMV: partitioned by region.
+    let p = Spi::get_one::<&str>(
+        "SELECT create_reflex_ivm( \
+            'part_scope_p', \
+            'SELECT region, SUM(amount) AS total FROM part_scope GROUP BY region', \
+            NULL, NULL, NULL, NULL, \
+            ARRAY['region'] \
+         )",
+    )
+    .expect("p_imv")
+    .expect("p_imv_res");
+    assert!(!p.starts_with("ERROR"), "parent imv: {p}");
+
+    // Child IMV: aggregate grouped by region but EXPLICITLY non-partitioned
+    // (ARRAY[]::text[] forces unpartitioned on a partitioned source).
+    let c = Spi::get_one::<&str>(
+        "SELECT create_reflex_ivm( \
+            'part_scope_c', \
+            'SELECT region, SUM(total) AS s FROM part_scope_p GROUP BY region', \
+            NULL, NULL, NULL, NULL, \
+            ARRAY[]::text[] \
+         )",
+    )
+    .expect("c_imv")
+    .expect("c_imv_res");
+    assert!(!c.starts_with("ERROR"), "child imv: {c}");
+
+    // Corrupt both child groups directly. A is the partition we reconcile
+    // (must be rebuilt -> fixed). B is unrelated (scoped reconcile must NOT
+    // touch it).
+    Spi::run("UPDATE part_scope_c SET s = 8888 WHERE region = 'A'").expect("corrupt a");
+    Spi::run("UPDATE part_scope_c SET s = 9999 WHERE region = 'B'").expect("corrupt b");
+
+    let msg = Spi::get_one::<String>("SELECT reflex_reconcile_partition('part_scope_p', 'A')")
+        .expect("rec")
+        .expect("msg");
+    assert!(msg.starts_with("RECONCILED"), "{msg}");
+
+    // A was reconciled -> child A rebuilt from the parent (= 10).
+    let a = Spi::get_one::<pgrx::AnyNumeric>("SELECT s FROM part_scope_c WHERE region = 'A'")
+        .expect("qa")
+        .expect("a");
+    assert_eq!(a.to_string(), "10", "child A must be rebuilt by the cascade");
+
+    // B was NOT reconciled -> a scoped cascade leaves it untouched (still 9999).
+    // The buggy full reflex_reconcile would overwrite B back to 5.
+    let b = Spi::get_one::<pgrx::AnyNumeric>("SELECT s FROM part_scope_c WHERE region = 'B'")
+        .expect("qb")
+        .expect("b");
+    assert_eq!(
+        b.to_string(),
+        "9999",
+        "reconciling partition A must NOT rebuild unrelated key B (scoped cascade)"
+    );
+}
+
+/// Scoped cascade through the FLUSH path (the production forecast-push path):
+/// `reflex_flush_partition_source` passes a source partition, not keys, so the
+/// affected key set is DERIVED from the reconciled parent. Attaching a new key
+/// must scope the cascade into a non-partitioned aggregate dependent to that
+/// key only — leaving unrelated keys untouched. Guards the derivation against
+/// silently scoping to the wrong key (which the DO-block EXCEPTION cannot
+/// catch).
+#[pg_test]
+fn pg_part_flush_cascade_scoped_to_attached_key() {
+    Spi::run(
+        "CREATE TABLE fsc_src (id BIGINT, region TEXT NOT NULL, amount NUMERIC) \
+         PARTITION BY LIST (region)",
+    )
+    .expect("create");
+    Spi::run("CREATE TABLE fsc_src_n PARTITION OF fsc_src FOR VALUES IN ('N')").expect("pn");
+    Spi::run("INSERT INTO fsc_src VALUES (1, 'N', 10)").expect("seed");
+
+    let p = Spi::get_one::<&str>(
+        "SELECT create_reflex_ivm( \
+            'fsc_p', \
+            'SELECT region, SUM(amount) AS total FROM fsc_src GROUP BY region', \
+            NULL, NULL, NULL, NULL, \
+            ARRAY['region'] \
+         )",
+    )
+    .expect("p_imv")
+    .expect("p_imv_res");
+    assert!(!p.starts_with("ERROR"), "parent imv: {p}");
+
+    let c = Spi::get_one::<&str>(
+        "SELECT create_reflex_ivm( \
+            'fsc_c', \
+            'SELECT region, SUM(total) AS s FROM fsc_p GROUP BY region', \
+            NULL, NULL, NULL, NULL, \
+            ARRAY[]::text[] \
+         )",
+    )
+    .expect("c_imv")
+    .expect("c_imv_res");
+    assert!(!c.starts_with("ERROR"), "child imv: {c}");
+
+    // Corrupt the EXISTING, unrelated key N's child group.
+    Spi::run("UPDATE fsc_c SET s = 7777 WHERE region = 'N'").expect("corrupt n");
+
+    // Attach a NEW partition S with data — the key the flush will process.
+    Spi::run("CREATE TABLE fsc_src_s (id BIGINT, region TEXT NOT NULL, amount NUMERIC)")
+        .expect("detached child");
+    Spi::run("INSERT INTO fsc_src_s VALUES (2, 'S', 50)").expect("child data");
+    Spi::run("ALTER TABLE fsc_src ATTACH PARTITION fsc_src_s FOR VALUES IN ('S')").expect("attach");
+
+    // Flush: reconciles S in the parent and cascades, scoped to the derived key S.
+    Spi::run("SELECT reflex_flush_partition_source('fsc_src')").expect("flush");
+
+    // S now flows into the child (scoped reconcile of the newly attached key).
+    let s = Spi::get_one::<pgrx::AnyNumeric>("SELECT s FROM fsc_c WHERE region = 'S'")
+        .expect("qs")
+        .expect("s");
+    assert_eq!(s.to_string(), "50", "attached key S must appear in the child");
+
+    // N is unrelated to the flushed key S -> derived-key scoping must leave it
+    // untouched (corruption survives). A full reconcile would reset it to 10.
+    let n = Spi::get_one::<pgrx::AnyNumeric>("SELECT s FROM fsc_c WHERE region = 'N'")
+        .expect("qn")
+        .expect("n");
+    assert_eq!(
+        n.to_string(),
+        "7777",
+        "flushing key S must NOT rebuild unrelated key N (derived-key scoped cascade)"
+    );
+}
+
+/// Cascade dedup: one flush that reconciles MULTIPLE leaves of a single
+/// partitioned parent IMV must cascade into a non-co-partitioned aggregate
+/// dependent ONCE — not once per reconciled leaf (the `forecast_dp_year_agg`
+/// per-month-push redundancy: 12 monthly leaves of one plan would otherwise
+/// rebuild that plan's aggregate slice 12×). Proven by counting `INSERT`
+/// statements on the child's target via a statement-level trigger: a single
+/// flush attaching two non-empty leaves must produce exactly one cascade
+/// `INSERT`, while still landing both keys correctly.
+#[pg_test]
+fn pg_part_flush_cascade_fires_once_for_multileaf() {
+    Spi::run(
+        "CREATE TABLE fdd_src (id BIGINT, region TEXT NOT NULL, amount NUMERIC) \
+         PARTITION BY LIST (region)",
+    )
+    .expect("create");
+    Spi::run("CREATE TABLE fdd_src_n PARTITION OF fdd_src FOR VALUES IN ('N')").expect("pn");
+    Spi::run("INSERT INTO fdd_src VALUES (1, 'N', 10)").expect("seed");
+
+    let p = Spi::get_one::<&str>(
+        "SELECT create_reflex_ivm( \
+            'fdd_p', \
+            'SELECT region, SUM(amount) AS total FROM fdd_src GROUP BY region', \
+            NULL, NULL, NULL, NULL, \
+            ARRAY['region'] \
+         )",
+    )
+    .expect("p_imv")
+    .expect("p_imv_res");
+    assert!(!p.starts_with("ERROR"), "parent imv: {p}");
+
+    let c = Spi::get_one::<&str>(
+        "SELECT create_reflex_ivm( \
+            'fdd_c', \
+            'SELECT region, SUM(total) AS s FROM fdd_p GROUP BY region', \
+            NULL, NULL, NULL, NULL, \
+            ARRAY[]::text[] \
+         )",
+    )
+    .expect("c_imv")
+    .expect("c_imv_res");
+    assert!(!c.starts_with("ERROR"), "child imv: {c}");
+
+    // Count INSERT statements on the child target. Only the cascade writes to
+    // fdd_c (the parent's swap touches its own children, not fdd_c), so this
+    // counts cascade firings for the flush.
+    Spi::run("CREATE TABLE fdd_casc_count (n INT)").expect("counter table");
+    Spi::run("INSERT INTO fdd_casc_count VALUES (0)").expect("counter seed");
+    Spi::run(
+        "CREATE FUNCTION fdd_casc_bump() RETURNS trigger LANGUAGE plpgsql AS \
+         $$ BEGIN UPDATE fdd_casc_count SET n = n + 1; RETURN NULL; END $$",
+    )
+    .expect("counter fn");
+    Spi::run(
+        "CREATE TRIGGER fdd_casc_trg AFTER INSERT ON fdd_c \
+         FOR EACH STATEMENT EXECUTE FUNCTION fdd_casc_bump()",
+    )
+    .expect("counter trigger");
+
+    // Attach TWO new non-empty leaves in one batch -> one flush, two reconciled
+    // parent nodes, two cascade firings without dedup.
+    Spi::run("CREATE TABLE fdd_src_a (id BIGINT, region TEXT NOT NULL, amount NUMERIC)")
+        .expect("a child");
+    Spi::run("INSERT INTO fdd_src_a VALUES (2, 'A', 50)").expect("a data");
+    Spi::run("ALTER TABLE fdd_src ATTACH PARTITION fdd_src_a FOR VALUES IN ('A')").expect("attach a");
+    Spi::run("CREATE TABLE fdd_src_b (id BIGINT, region TEXT NOT NULL, amount NUMERIC)")
+        .expect("b child");
+    Spi::run("INSERT INTO fdd_src_b VALUES (3, 'B', 70)").expect("b data");
+    Spi::run("ALTER TABLE fdd_src ATTACH PARTITION fdd_src_b FOR VALUES IN ('B')").expect("attach b");
+
+    // Reset the counter so only the flush's cascade INSERTs are measured.
+    Spi::run("UPDATE fdd_casc_count SET n = 0").expect("reset");
+
+    Spi::run("SELECT reflex_flush_partition_source('fdd_src')").expect("flush");
+
+    // Both keys must land correctly in the child (dedup must not lose work).
+    let a = Spi::get_one::<pgrx::AnyNumeric>("SELECT s FROM fdd_c WHERE region = 'A'")
+        .expect("qa")
+        .expect("a");
+    assert_eq!(a.to_string(), "50", "attached key A must appear in the child");
+    let b = Spi::get_one::<pgrx::AnyNumeric>("SELECT s FROM fdd_c WHERE region = 'B'")
+        .expect("qb")
+        .expect("b");
+    assert_eq!(b.to_string(), "70", "attached key B must appear in the child");
+
+    // The cascade must have fired exactly once for the whole flush.
+    let fires = Spi::get_one::<i32>("SELECT n FROM fdd_casc_count")
+        .expect("count")
+        .expect("count_res");
+    assert_eq!(
+        fires, 1,
+        "cascade into the non-co-partitioned dependent must fire ONCE per flush, \
+         not once per reconciled leaf"
+    );
+}
+
 /// Idempotent recovery: when a swap is left orphaned (simulated by
 /// manually creating a `__reflex_swap_*` table), the next reconcile
 /// drops it cleanly.

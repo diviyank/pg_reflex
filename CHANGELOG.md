@@ -2,6 +2,54 @@
 
 ## [Unreleased]
 
+## [1.10.7] - 2026-06-23
+
+Partition-flush reconcile of a partitioned IMV no longer full-rebuilds its
+non-co-partitioned aggregate dependents on every swapped leaf — the cascade is
+now key-scoped and fires once per flush. This is the root cause of the forecast
+`push_baseline` COMMIT `TimeoutError` (`forecast_dp_year_agg` was rescanning the
+whole parent, per leaf, past the asyncpg 200 s ceiling). Pure Rust: replace the
+`.so`, then `ALTER EXTENSION pg_reflex UPDATE TO '1.10.7';` (no-op migration).
+
+### Fixed
+
+- **Cascade from a partitioned parent IMV into a NON-partitioned aggregate
+  dependent whose `GROUP BY` includes the parent's partition key was a full
+  `reflex_reconcile`.** It `TRUNCATE`d and rebuilt the dependent by rescanning
+  EVERY source partition, even when a single parent key changed. It is now a
+  key-scoped rebuild: a literal-pruned `DELETE` + `INSERT` of only the affected
+  `partition_col IN (<keys>)` slices of the dependent's intermediate and target
+  (the literal `IN` list lets PostgreSQL prune the source partitions; a
+  subquery / array form does not — verified by `EXPLAIN`). A `DO`-block
+  `EXCEPTION` branch falls back to a full `reflex_reconcile`, so the
+  optimization can never leave a dependent incorrect. Affects the
+  `*_dp_year_agg` / `*_sp_year_agg` family.
+- **The flush fired that cascade once per swapped leaf.** A 12-month
+  single-plan push reconciled the parent's 12 monthly leaves and rebuilt the
+  dependent's same key slice 12×. The batch flush now reconciles all of one
+  IMV's changed leaves in a single `reflex_reconcile_partition` call (its
+  `source_partition` argument accepts a comma-separated list), so the dependent
+  cascade fires ONCE over the union of affected keys. The saving scales with the
+  dependent's per-rebuild cost.
+
+### Tests
+
+- `pg_part_cascade_scoped_to_reconciled_key` and
+  `pg_part_flush_cascade_scoped_to_attached_key` — reconciling (by key) or
+  attaching (derived-key flush path) one partition must not rebuild unrelated
+  keys' dependent groups; a corrupted unrelated key's row must survive.
+- `pg_part_flush_cascade_fires_once_for_multileaf` — a statement-level trigger
+  counts cascade `INSERT`s into the dependent's target; a two-leaf flush must
+  cascade exactly once while both keys still land correctly.
+
+### Migration
+
+- `ALTER EXTENSION pg_reflex UPDATE TO '1.10.7';` after replacing the module.
+  No DDL — the change is entirely in the recompiled Rust; no IMV rebuild
+  required (the EXCEPTION fallback preserves correctness):
+  [`sql/pg_reflex--1.10.6--1.10.7.sql`](https://github.com/diviyank/pg_reflex/blob/main/sql/pg_reflex--1.10.6--1.10.7.sql)
+  is a no-op marker.
+
 ## [1.10.6] - 2026-06-18
 
 Dropping an IMV's target table (or the schema/view it lives on) now cleans the

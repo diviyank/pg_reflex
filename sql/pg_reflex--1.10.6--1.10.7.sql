@@ -1,0 +1,42 @@
+-- Migration: pg_reflex 1.10.6 → 1.10.7
+--
+-- Run via: ALTER EXTENSION pg_reflex UPDATE TO '1.10.7';
+--
+-- 1.10.7 makes the partition-flush reconcile of a partitioned IMV stop
+-- full-rebuilding its non-co-partitioned aggregate dependents. There are NO
+-- catalog schema changes, NO function signature changes, and NO SPI additions
+-- — the change is entirely in the recompiled Rust module.
+--
+-- What changed (all in-process, no migration DDL):
+--
+--   1. Key-scoped cascade. When a partitioned parent IMV is reconciled, a
+--      dependent that is NOT partitioned but GROUPs BY the parent's partition
+--      key (the `*_dp_year_agg` / `*_sp_year_agg` family) was rebuilt with a
+--      full `reflex_reconcile`: TRUNCATE + rescan of EVERY source partition,
+--      even when a single parent key changed. It is now a literal-pruned
+--      `DELETE` + `INSERT` of only the affected `partition_col IN (<keys>)`
+--      slices of the dependent's intermediate and target. The literal `IN`
+--      list lets PostgreSQL prune the source partitions (a subquery / array
+--      form does not). A `DO`-block `EXCEPTION` branch falls back to a full
+--      `reflex_reconcile`, so the optimization can never leave a dependent
+--      incorrect.
+--
+--   2. Cascade dedup. The batch flush fired that cascade once per swapped
+--      leaf — a 12-month single-plan push rebuilt the dependent's same key
+--      slice 12×. The flush now reconciles all of one IMV's changed leaves in
+--      a single `reflex_reconcile_partition` call (its `source_partition`
+--      argument accepts a comma-separated list), so the dependent cascade
+--      fires ONCE over the union of affected keys.
+--
+--   Together these fix the forecast `push_baseline` COMMIT `TimeoutError`:
+--   `forecast_dp_year_agg` was rescanning the whole parent, per swapped leaf,
+--   past the asyncpg 200 s command timeout.
+--
+-- Migration steps:
+--
+--   No DDL is required by this file. Replace the module (.so), then run
+--   `ALTER EXTENSION pg_reflex UPDATE TO '1.10.7';`. No IMV rebuild required;
+--   results are unchanged (the EXCEPTION fallback preserves correctness).
+
+-- No-op marker: ALTER EXTENSION needs a non-empty migration file.
+SELECT 1 WHERE FALSE;

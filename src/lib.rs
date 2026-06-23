@@ -489,6 +489,11 @@ fn reflex_sync_partitions(view_name: &str, drop_orphans: default!(bool, "TRUE"))
 /// end query restricted by the child's partition constraint.  Cascades
 /// to dependent IMVs partitioned on the same column with the same keys,
 /// or to full reconcile otherwise.
+///
+/// Alternatively pass `source_partition` (a single source partition, or a
+/// comma-separated list) to reconcile every IMV node mapping to those source
+/// partitions in ONE call; the dependent cascade then fires once over the
+/// union of affected keys rather than once per node.
 #[pg_extern]
 fn reflex_reconcile_partition(
     view_name: &str,

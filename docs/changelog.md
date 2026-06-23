@@ -4,6 +4,23 @@ The full changelog tracks every release. The latest version's headlines are on t
 
 For each version below, see [`CHANGELOG.md`](https://github.com/diviyank/pg_reflex/blob/main/CHANGELOG.md) on GitHub for the canonical text.
 
+## [1.10.7] — 2026-06-23
+
+Partition-flush reconcile no longer full-rebuilds a partitioned IMV's non-co-partitioned aggregate dependents on every swapped leaf — the cascade is now key-scoped and fires once per flush, fixing the forecast `push_baseline` COMMIT `TimeoutError` (`forecast_dp_year_agg` was rescanning the whole parent per leaf, past the asyncpg 200 s ceiling). Pure Rust: replace the `.so`, then `ALTER EXTENSION pg_reflex UPDATE TO '1.10.7';`.
+
+**Fixed**
+
+- Cascade from a partitioned parent IMV into a non-partitioned aggregate dependent grouping by the parent's partition key was a full `reflex_reconcile` (rescanning every source partition); it is now a literal-pruned key-scoped `DELETE`+`INSERT` of only the affected `col IN (<keys>)` slices, with a `DO`-block `EXCEPTION` fallback to full reconcile so it can never be incorrect. Affects the `*_dp_year_agg` / `*_sp_year_agg` family.
+- The flush fired that cascade once per swapped leaf (a 12-month one-plan push rebuilt the same slice 12×); it now reconciles all of one IMV's changed leaves in a single `reflex_reconcile_partition` call (its `source_partition` accepts a comma-separated list) so the cascade fires once over the union of affected keys.
+
+**Tests**
+
+- New scoped-cascade tests (key + derived-key paths) assert reconciling one key never rebuilds unrelated keys' dependent groups; a statement-trigger test asserts a two-leaf flush cascades exactly once while both keys land.
+
+**Migration**
+
+- `ALTER EXTENSION pg_reflex UPDATE TO '1.10.7';` after swapping the module — no DDL: [`sql/pg_reflex--1.10.6--1.10.7.sql`](https://github.com/diviyank/pg_reflex/blob/main/sql/pg_reflex--1.10.6--1.10.7.sql) is a no-op marker.
+
 ## [1.10.6] — 2026-06-18
 
 Dropping an IMV's target table no longer orphans its registry row. Replace the `.so`, then `ALTER EXTENSION pg_reflex UPDATE TO '1.10.6';`.

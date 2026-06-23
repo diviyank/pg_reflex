@@ -1222,7 +1222,8 @@ pub(crate) fn reflex_sync_partitions_impl(view_name: &str, drop_orphans: bool) -
 ///    itself" (µs).
 /// 5. Cascade to dependents:
 ///    * Same partition column → partition-scoped reconcile.
-///    * Different / non-partitioned → full reconcile.
+///    * Non-partitioned but GROUP BY this column → key-scoped reconcile.
+///    * Anything else → full reconcile.
 ///
 /// Atomicity: the entire operation runs inside one `Spi::connect_mut`
 /// sub-transaction; any failure rolls back all changes (including the
@@ -1320,10 +1321,16 @@ pub(crate) fn reflex_reconcile_partition_impl(
         let mut to_process: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         if !source_partition.trim().is_empty() {
-            // Level-agnostic + depth-aware path: expand the named source
+            // Level-agnostic + depth-aware path: expand each named source
             // partition to source leaves, map each UP to the IMV's mirror-depth
             // node, then to its IMV target child name. When the IMV mirrors the
             // full source depth this is the identity (leaf -> leaf).
+            //
+            // `source_partition` accepts a comma-separated list so the batch
+            // flush can reconcile every changed leaf of one IMV in a SINGLE
+            // call — the affected-key derivation and dependent cascade below
+            // then run ONCE over the union, instead of once per leaf (which
+            // redundantly rebuilds the same dependent slice N times).
             let anchor = resolve_anchor_source(client, part_col, &depends_on).unwrap_or_default();
             let full_tree = if anchor.is_empty() {
                 Vec::new()
@@ -1333,11 +1340,17 @@ pub(crate) fn reflex_reconcile_partition_impl(
             let mirror_depth = partition_depth
                 .map(|d| d as usize)
                 .unwrap_or_else(|| max_tree_depth(&full_tree));
-            for src_leaf in expand_source_partition_to_leaves(client, source_partition) {
-                let chain = leaf_ancestor_chain(&full_tree, &src_leaf);
-                let node = ancestor_bare_at_depth(&chain, &src_leaf, mirror_depth)
-                    .unwrap_or_else(|| src_leaf.clone());
-                to_process.insert(target_child_name(view_name, &node));
+            for sp in source_partition
+                .split(',')
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+            {
+                for src_leaf in expand_source_partition_to_leaves(client, sp) {
+                    let chain = leaf_ancestor_chain(&full_tree, &src_leaf);
+                    let node = ancestor_bare_at_depth(&chain, &src_leaf, mirror_depth)
+                        .unwrap_or_else(|| src_leaf.clone());
+                    to_process.insert(target_child_name(view_name, &node));
+                }
             }
         } else {
             let keys: Vec<String> = partition_keys_csv
@@ -1444,14 +1457,44 @@ pub(crate) fn reflex_reconcile_partition_impl(
             }],
         );
 
-        // Cascade to dependents.  We resolve each dependent's own partition
-        // metadata; if it's partitioned on the SAME column as this IMV we
-        // call partition-scoped reconcile (with the same keys), otherwise
-        // we fall back to full reconcile.
+        // Affected partition-key values driving this reconcile — used to scope
+        // the cascade into non-partitioned aggregate dependents. Taken from the
+        // keys when called by key; otherwise derived from the reconciled
+        // parent's target children (the swap-fill / flush path passes a source
+        // partition, not keys).
+        let affected_keys: Vec<String> = if !partition_keys_csv.trim().is_empty() {
+            partition_keys_csv
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        } else {
+            let mut set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+            for child_bare in &to_process {
+                let q = format!(
+                    "SELECT DISTINCT \"{}\"::text AS k FROM \"{}\".\"{}\"",
+                    part_col, schema, child_bare
+                );
+                if let Ok(it) = client.select(&q, None, &[]) {
+                    for row in it {
+                        if let Some(k) = row.get_by_name::<&str, _>("k").ok().flatten() {
+                            set.insert(k.to_string());
+                        }
+                    }
+                }
+            }
+            set.into_iter().collect()
+        };
+
+        // Cascade to dependents.  Resolve each dependent's own metadata:
+        //   * partitioned on the SAME column        -> partition-scoped reconcile.
+        //   * non-partitioned, GROUP BY this column  -> key-scoped reconcile.
+        //   * anything else                          -> full reconcile.
         for child in &children {
             let dep = client
                 .select(
-                    "SELECT partition_columns FROM public.__reflex_ivm_reference WHERE name = $1",
+                    "SELECT partition_columns, base_query, end_query, aggregations::text AS agg_json \
+                     FROM public.__reflex_ivm_reference WHERE name = $1",
                     Some(1),
                     &[unsafe {
                         DatumWithOid::new(child.to_string(), PgBuiltInOids::TEXTOID.oid().value())
@@ -1459,13 +1502,42 @@ pub(crate) fn reflex_reconcile_partition_impl(
                 )
                 .ok()
                 .and_then(|mut it| it.next());
-            let dep_cols: Vec<String> = dep
-                .and_then(|r| {
-                    r.get_by_name::<Vec<String>, _>("partition_columns")
+            let (dep_cols, dep_base, dep_end, dep_group_by): (
+                Vec<String>,
+                String,
+                String,
+                Vec<String>,
+            ) = match dep {
+                Some(r) => {
+                    let group_by = r
+                        .get_by_name::<&str, _>("agg_json")
                         .ok()
                         .flatten()
-                })
-                .unwrap_or_default();
+                        .and_then(|j| {
+                            serde_json::from_str::<crate::aggregation::AggregationPlan>(j).ok()
+                        })
+                        .map(|p| p.group_by_columns)
+                        .unwrap_or_default();
+                    (
+                        r.get_by_name::<Vec<String>, _>("partition_columns")
+                            .ok()
+                            .flatten()
+                            .unwrap_or_default(),
+                        r.get_by_name::<&str, _>("base_query")
+                            .ok()
+                            .flatten()
+                            .unwrap_or("")
+                            .to_string(),
+                        r.get_by_name::<&str, _>("end_query")
+                            .ok()
+                            .flatten()
+                            .unwrap_or("")
+                            .to_string(),
+                        group_by,
+                    )
+                }
+                None => (Vec::new(), String::new(), String::new(), Vec::new()),
+            };
             let same_part = !dep_cols.is_empty()
                 && dep_cols
                     .first()
@@ -1481,6 +1553,16 @@ pub(crate) fn reflex_reconcile_partition_impl(
                     sql_literal_text(partition_keys_csv)
                 );
                 let _ = client.update(&q, None, &[]);
+            } else if let Some(scoped) = build_scoped_cascade_reconcile(
+                child,
+                part_col,
+                &affected_keys,
+                &dep_cols,
+                &dep_base,
+                &dep_end,
+                &dep_group_by,
+            ) {
+                let _ = client.update(&scoped, None, &[]);
             } else {
                 let q = format!(
                     "SELECT public.reflex_reconcile({})",
@@ -1499,6 +1581,86 @@ pub(crate) fn reflex_reconcile_partition_impl(
         Ok(s) => s,
         Err(e) => format!("ERROR: {}", e),
     }
+}
+
+/// Build a key-scoped cascade reconcile of a NON-partitioned aggregate
+/// dependent whose GROUP BY includes the parent's partition key `part_col`.
+///
+/// A full `reflex_reconcile` of such a dependent TRUNCATEs and rebuilds it by
+/// rescanning EVERY partition of the source — even when a single parent key was
+/// reconciled. Instead, rebuild only the affected `part_col` groups with a
+/// literal-pruned `DELETE`+`INSERT` of the intermediate and target slices for
+/// `part_col IN (<keys>)`. The literal `IN` list is what lets PostgreSQL prune
+/// the source partitions (a subquery/array form does not — verified).
+///
+/// Returns `None` (caller falls back to full reconcile) when the dependent is
+/// partitioned, is a passthrough (no intermediate to scope), does not group by
+/// `part_col`, has no affected keys, or its base query has no spliceable
+/// `GROUP BY`. The emitted DO block self-heals: any runtime error in the scoped
+/// path runs a full `reflex_reconcile` in its EXCEPTION branch, so the
+/// optimization can never leave the dependent incorrect.
+fn build_scoped_cascade_reconcile(
+    child: &str,
+    part_col: &str,
+    affected_keys: &[String],
+    dep_partition_cols: &[String],
+    base_query: &str,
+    end_query: &str,
+    group_by_columns: &[String],
+) -> Option<String> {
+    if !dep_partition_cols.is_empty() {
+        return None; // partitioned dependents use the co-partitioned path
+    }
+    if end_query.trim().is_empty() {
+        return None; // passthrough: no intermediate table to scope
+    }
+    if affected_keys.is_empty() {
+        return None;
+    }
+    if !group_by_columns
+        .iter()
+        .any(|c| c.eq_ignore_ascii_case(part_col))
+    {
+        return None; // dependent does not group by the parent's partition key
+    }
+
+    let lits = affected_keys
+        .iter()
+        .map(|k| sql_literal_text(k))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let key_pred = format!("\"{}\" IN ({})", part_col, lits);
+
+    // Inject the literal filter BEFORE the source GROUP BY so it prunes the
+    // source scan (wrapping post-aggregation would not push through GROUP BY).
+    let spliced_base = crate::trigger::splice_before_group_by(
+        base_query,
+        &format!(" AND \"{}\" IN ({})", part_col, lits),
+    )?;
+
+    let intermediate = intermediate_table_name(child);
+    let target = quote_identifier(child);
+    let child_lit = sql_literal_text(child);
+
+    Some(format!(
+        "DO $reflex_scoped_cascade$ \
+         BEGIN \
+           DELETE FROM {int} WHERE {pred}; \
+           INSERT INTO {int} {spliced_base}; \
+           DELETE FROM {tgt} WHERE {pred}; \
+           INSERT INTO {tgt} SELECT * FROM ({end_query}) __reflex_scoped WHERE {pred}; \
+           UPDATE public.__reflex_ivm_reference SET last_update_date = NOW() WHERE name = {child_lit}; \
+         EXCEPTION WHEN OTHERS THEN \
+           PERFORM public.reflex_reconcile({child_lit}); \
+         END \
+         $reflex_scoped_cascade$",
+        int = intermediate,
+        tgt = target,
+        pred = key_pred,
+        spliced_base = spliced_base,
+        end_query = end_query,
+        child_lit = child_lit,
+    ))
 }
 
 /// Execute the per-child atomic DETACH/ATTACH swap.  Shared between
@@ -2182,11 +2344,20 @@ pub(crate) fn reflex_flush_partitions_impl(only: Option<&str>) -> String {
                         schema, int
                     ));
                 }
-                for (node, _) in fill_node.iter().filter(|(_, fill)| **fill) {
+                // Reconcile ALL changed leaves of this IMV in one call: the
+                // dependent cascade then fires ONCE over the union of affected
+                // keys, instead of once per leaf (a 12-month single-plan push
+                // would otherwise rebuild that plan's aggregate slice 12×).
+                let fill_nodes: Vec<&str> = fill_node
+                    .iter()
+                    .filter(|(_, fill)| **fill)
+                    .map(|(node, _)| node.as_str())
+                    .collect();
+                if !fill_nodes.is_empty() {
                     root_stmts.push(format!(
                         "PERFORM public.reflex_reconcile_partition({}, '', {}, true)",
                         sql_literal_text(imv),
-                        sql_literal_text(node)
+                        sql_literal_text(&fill_nodes.join(","))
                     ));
                 }
                 summary.push(format!("{}: {} change(s)", imv, actions.len()));
