@@ -2608,3 +2608,32 @@ fn f9_reconcile_succeeds_with_debug_off() {
         .expect("reconcile result");
     assert_eq!(status, "RECONCILED", "reconcile must succeed with debug GUC off");
 }
+
+#[pg_test]
+fn f1_rearm_after_failed_flush_reattempts() {
+    Spi::run("INSERT INTO public.__reflex_partition_pending (source_root) VALUES ('t.wedged')").unwrap();
+    Spi::run(
+        "INSERT INTO public.__reflex_partition_pending (source_root) VALUES ('t.wedged') \
+         ON CONFLICT (source_root) DO UPDATE \
+           SET enqueued_at = statement_timestamp(), \
+               attempts = public.__reflex_partition_pending.attempts + 1",
+    ).unwrap();
+    let attempts = Spi::get_one::<i32>(
+        "SELECT attempts FROM public.__reflex_partition_pending WHERE source_root='t.wedged'",
+    ).unwrap().unwrap();
+    assert_eq!(attempts, 1, "second enqueue must bump attempts (re-arm)");
+}
+
+#[pg_test]
+fn f1_failed_drain_records_last_error() {
+    Spi::run("INSERT INTO public.__reflex_partition_pending (source_root) VALUES ('t.boom')").unwrap();
+    Spi::run(
+        "UPDATE public.__reflex_partition_pending \
+            SET last_error = left('simulated shape drift', 2000) \
+          WHERE source_root='t.boom'",
+    ).unwrap();
+    let err = Spi::get_one::<String>(
+        "SELECT last_error FROM public.__reflex_partition_pending WHERE source_root='t.boom'",
+    ).unwrap().unwrap();
+    assert!(err.contains("shape drift"));
+}

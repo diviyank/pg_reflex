@@ -2523,6 +2523,9 @@ pub(crate) fn reflex_flush_partitions_impl(only: Option<&str>) -> String {
                  BEGIN \
                    \n{body}\n \
                  EXCEPTION WHEN OTHERS THEN \
+                   UPDATE public.__reflex_partition_pending \
+                      SET last_error = left(SQLERRM, 2000) \
+                    WHERE source_root = '{root_esc}'; \
                    RAISE WARNING 'pg_reflex: partition flush for root % failed: % (SQLSTATE %) — left pending for retry', \
                      '{root_esc}', SQLERRM, SQLSTATE; \
                  END \

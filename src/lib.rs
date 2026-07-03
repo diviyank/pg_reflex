@@ -206,6 +206,11 @@ extension_sql!(
         PRIMARY KEY (source_root)
     );
 
+    ALTER TABLE public.__reflex_partition_pending
+        ADD COLUMN IF NOT EXISTS attempts INT NOT NULL DEFAULT 0;
+    ALTER TABLE public.__reflex_partition_pending
+        ADD COLUMN IF NOT EXISTS last_error TEXT;
+
     -- 1.6.0: SQL helper used by the per-partition dispatch DO block emitted
     -- by build_partition_aware_dispatch_sql.  Given a partitioned parent +
     -- partition column name + a single text-form key, returns the regclass
@@ -918,7 +923,9 @@ extension_sql!(
                 THEN
                     INSERT INTO public.__reflex_partition_pending (source_root)
                     VALUES (_part_root)
-                    ON CONFLICT (source_root) DO NOTHING;
+                    ON CONFLICT (source_root)
+                    DO UPDATE SET enqueued_at = statement_timestamp(),
+                                  attempts    = public.__reflex_partition_pending.attempts + 1;
                 END IF;
 
                 FOR _imv IN
@@ -1136,7 +1143,7 @@ extension_sql!(
         ON public.__reflex_partition_pending;
 
     CREATE CONSTRAINT TRIGGER __reflex_partition_flush_trigger
-        AFTER INSERT ON public.__reflex_partition_pending
+        AFTER INSERT OR UPDATE ON public.__reflex_partition_pending
         DEFERRABLE INITIALLY DEFERRED
         FOR EACH ROW EXECUTE FUNCTION public.__reflex_partition_flush_fn();
     "#,
