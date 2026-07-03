@@ -32,6 +32,7 @@ unsafe extern "C" {}
 mod aggregation;
 mod audit;
 mod create_ivm;
+mod doctor;
 mod drop_ivm;
 mod introspect;
 mod partition;
@@ -811,6 +812,38 @@ fn reflex_audit_one(view_name: &str) -> String {
     audit::reflex_audit_impl(audit::AuditScope::One(view_name.to_string()))
 }
 
+/// Comprehensive diagnosis and repair orchestrator. Detects and optionally fixes
+/// inconsistencies across the IMV registry, pending queue, and audit findings.
+///
+/// Returns a TABLE with columns:
+///   check_id TEXT     — identifier like F1, F2, F4, etc.
+///   severity TEXT     — ERROR, WARNING, or INFO
+///   object TEXT       — the affected IMV or source root
+///   finding TEXT      — human-readable description
+///   action TEXT       — the exact SQL to remediate (as a string)
+///   outcome TEXT      — result of attempted fix ('fixed', 'reported', 'skipped(...)', 'failed:...')
+#[pg_extern]
+#[allow(clippy::type_complexity)]
+fn reflex_doctor(
+    target: default!(Option<&str>, "NULL"),
+    fix: default!(bool, "FALSE"),
+    drop_orphans: default!(bool, "FALSE"),
+    max_attempts: default!(i32, "3"),
+) -> TableIterator<
+    'static,
+    (
+        name!(check_id, String),
+        name!(severity, String),
+        name!(object, String),
+        name!(finding, String),
+        name!(action, String),
+        name!(outcome, String),
+    ),
+> {
+    let rows = doctor::reflex_doctor_impl(target, fix, drop_orphans, max_attempts);
+    TableIterator::new(rows)
+}
+
 extension_sql!(
     r#"
     CREATE OR REPLACE FUNCTION public.__reflex_on_sql_drop()
@@ -1352,6 +1385,7 @@ mod tests {
     include!("tests/pg_test_field_replay.rs");
     include!("tests/pg_test_union_subquery_delta.rs");
     include!("tests/pg_test_registry.rs");
+    include!("tests/pg_test_doctor.rs");
 }
 
 /// This module is required by `cargo pgrx test` invocations.
