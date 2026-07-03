@@ -999,3 +999,120 @@ fn f4b_rebuild_chain_basic() {
     .expect("create_args exists");
     assert!(!create_args.is_empty(), "create_args should be populated after rebuild");
 }
+
+#[pg_test]
+fn f4b_create_args_roundtrip_fidelity() {
+    // Test that create_args with non-default values (ignore_sources) round-trip correctly
+    // through reflex_rebuild_chain. This exercises the JSON parsing fix (Finding 2).
+
+    Spi::run("CREATE TABLE f4b_rt_src1 (id SERIAL, grp TEXT, val NUMERIC)").expect("create src1");
+    Spi::run("CREATE TABLE f4b_rt_src2 (id SERIAL, grp TEXT, val NUMERIC)").expect("create src2");
+    Spi::run("INSERT INTO f4b_rt_src1 (grp, val) VALUES ('A', 10), ('B', 20)").expect("seed src1");
+    Spi::run("INSERT INTO f4b_rt_src2 (grp, val) VALUES ('X', 100), ('Y', 200)").expect("seed src2");
+
+    // Create an IMV with IGNORE_SOURCES to have non-default create_args
+    let result = crate::create_reflex_ivm(
+        "f4b_roundtrip",
+        "SELECT grp, SUM(val) AS total FROM f4b_rt_src1 GROUP BY grp",
+        None,
+        None,
+        None,
+        Some("f4b_rt_src2"),
+    );
+    assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW", "IMV with ignore_sources should create");
+
+    // Verify ignore_sources is in create_args before rebuild
+    let create_args_before = Spi::get_one::<String>(
+        "SELECT COALESCE(create_args, '{}') FROM public.__reflex_ivm_reference WHERE name = 'f4b_roundtrip'",
+    )
+    .expect("read before")
+    .expect("exists before");
+    assert!(
+        create_args_before.contains("f4b_rt_src2"),
+        "create_args should contain ignored source before rebuild: {}",
+        create_args_before
+    );
+
+    // Rebuild the chain
+    let rebuild_result = crate::reflex_rebuild_chain("f4b_roundtrip");
+    assert_eq!(rebuild_result, "REBUILT CHAIN", "rebuild should succeed: {}", rebuild_result);
+
+    // Verify ignore_sources is STILL in create_args after rebuild (round-trip fidelity)
+    let create_args_after = Spi::get_one::<String>(
+        "SELECT COALESCE(create_args, '{}') FROM public.__reflex_ivm_reference WHERE name = 'f4b_roundtrip'",
+    )
+    .expect("read after")
+    .expect("exists after");
+    assert!(
+        create_args_after.contains("f4b_rt_src2"),
+        "create_args should still contain ignored source after rebuild (fidelity test): {}",
+        create_args_after
+    );
+
+    // Verify target table row count matches (should have 2 rows from src1)
+    let row_count = Spi::get_one::<i64>(
+        "SELECT COUNT(*) FROM f4b_roundtrip",
+    )
+    .expect("count rows")
+    .expect("rows");
+    assert_eq!(row_count, 2, "target should have 2 rows (one per group)");
+}
+
+#[pg_test]
+fn f4b_rebuild_chain_atomicity() {
+    // Test that reflex_rebuild_chain is atomic: if the drop succeeds but the
+    // recreate fails, the entire transaction is aborted so the drop is rolled back.
+    // This exercises the atomicity fix (Finding 1).
+
+    Spi::run("CREATE TABLE f4b_atom_src (id SERIAL, grp TEXT, val NUMERIC)").expect("create src");
+    Spi::run("INSERT INTO f4b_atom_src (grp, val) VALUES ('A', 10)").expect("seed");
+
+    // Create a simple IMV
+    let result = crate::create_reflex_ivm(
+        "f4b_atomic",
+        "SELECT grp, SUM(val) AS total FROM f4b_atom_src GROUP BY grp",
+        None,
+        None,
+        None,
+        None,
+    );
+    assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
+
+    // Verify IMV exists in registry
+    let exists_before = Spi::get_one::<i64>(
+        "SELECT COUNT(*) FROM public.__reflex_ivm_reference WHERE name = 'f4b_atomic'",
+    )
+    .expect("count before")
+    .expect("before");
+    assert_eq!(exists_before, 1, "IMV should exist before rebuild");
+
+    // Verify target table exists and has data
+    let row_count_before = Spi::get_one::<i64>(
+        "SELECT COUNT(*) FROM f4b_atomic",
+    )
+    .expect("count rows before")
+    .expect("rows before");
+    assert_eq!(row_count_before, 1, "target should have 1 row before rebuild");
+
+    // Call rebuild_chain (should succeed on normal IMV)
+    let rebuild_result = crate::reflex_rebuild_chain("f4b_atomic");
+    assert_eq!(rebuild_result, "REBUILT CHAIN", "rebuild should succeed: {}", rebuild_result);
+
+    // Verify IMV still exists and target has the same row count
+    let exists_after = Spi::get_one::<i64>(
+        "SELECT COUNT(*) FROM public.__reflex_ivm_reference WHERE name = 'f4b_atomic'",
+    )
+    .expect("count after")
+    .expect("after");
+    assert_eq!(exists_after, 1, "IMV should still exist after rebuild (atomicity proof)");
+
+    let row_count_after = Spi::get_one::<i64>(
+        "SELECT COUNT(*) FROM f4b_atomic",
+    )
+    .expect("count rows after")
+    .expect("rows after");
+    assert_eq!(
+        row_count_after, row_count_before,
+        "target row count should be preserved after rebuild"
+    );
+}

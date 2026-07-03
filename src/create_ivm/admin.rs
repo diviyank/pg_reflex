@@ -501,20 +501,22 @@ pub(crate) fn reflex_rebuild_chain_impl(view_name: &str) -> String {
             crate::sql_writer::registry::read_imv_for_rebuild(client, view_name)
                 .ok_or_else(|| format!("IMV '{}' not found in registry", view_name))?;
 
-        // 2. Parse create_args JSON to extract parameters
-        // Expected fields: unique_columns_str, storage_mode, refresh_mode,
-        // topk_k, ignore_sources (array), partition_by (array), explicit_unpartitioned
+        // 2. Parse create_args JSON to extract parameters using PostgreSQL's native JSON
+        // parsing to handle escaped quotes and array elements correctly.
         let unique_columns_str =
-            extract_string_field(&create_args_json, "unique_columns_str").unwrap_or_default();
-        let storage_mode = extract_string_field(&create_args_json, "storage_mode")
+            extract_string_field_via_sql(client, &create_args_json, "unique_columns_str")
+                .unwrap_or_default();
+        let storage_mode = extract_string_field_via_sql(client, &create_args_json, "storage_mode")
             .unwrap_or_else(|| "UNLOGGED".to_string());
-        let refresh_mode = extract_string_field(&create_args_json, "refresh_mode")
+        let refresh_mode = extract_string_field_via_sql(client, &create_args_json, "refresh_mode")
             .unwrap_or_else(|| "IMMEDIATE".to_string());
-        let topk_k = extract_number_field(&create_args_json, "topk_k");
-        let ignore_sources = extract_array_field(&create_args_json, "ignore_sources");
-        let partition_by = extract_array_field(&create_args_json, "partition_by");
+        let topk_k = extract_number_field_via_sql(client, &create_args_json, "topk_k");
+        let ignore_sources =
+            extract_array_field_via_sql(client, &create_args_json, "ignore_sources");
+        let partition_by = extract_array_field_via_sql(client, &create_args_json, "partition_by");
         let explicit_unpartitioned =
-            extract_bool_field(&create_args_json, "explicit_unpartitioned").unwrap_or(false);
+            extract_bool_field_via_sql(client, &create_args_json, "explicit_unpartitioned")
+                .unwrap_or(false);
 
         // 3. Drop the IMV with CASCADE (removes all sub-IMVs)
         let drop_result = drop_reflex_ivm_impl(view_name, true);
@@ -538,7 +540,12 @@ pub(crate) fn reflex_rebuild_chain_impl(view_name: &str) -> String {
         );
 
         if create_result.starts_with("ERROR") {
-            return Err(create_result.to_string());
+            // Post-drop failure: use pgrx::error! to abort transaction so drop rolls back
+            pgrx::error!(
+                "reflex_rebuild_chain: failed to recreate IMV '{}': {}",
+                view_name,
+                create_result
+            );
         }
 
         Ok("REBUILT CHAIN".to_string())
@@ -550,73 +557,114 @@ pub(crate) fn reflex_rebuild_chain_impl(view_name: &str) -> String {
     }
 }
 
-/// Helper: extract a string field from JSON object string (naive parsing).
-/// Returns None if field not found; assumes JSON is well-formed.
-fn extract_string_field(json: &str, field_name: &str) -> Option<String> {
-    let pattern = format!(r#""{}": ""#, field_name);
-    if let Some(start) = json.find(&pattern) {
-        let search_start = start + pattern.len();
-        let rest = &json[search_start..];
-        // Find the closing quote (without escaping for simplicity in rebuild context)
-        if let Some(end) = rest.find('"') {
-            return Some(rest[..end].to_string());
-        }
-    }
-    None
+/// Helper: extract a string field from JSON using PostgreSQL's native JSON parsing.
+/// Uses SQL to correctly handle escaped quotes and special characters.
+/// Returns None if field not found or empty.
+fn extract_string_field_via_sql(
+    client: &pgrx::spi::SpiClient<'_>,
+    json: &str,
+    field_name: &str,
+) -> Option<String> {
+    let sql = format!(
+        "SELECT ($1::jsonb)->>'{}' AS val",
+        field_name.replace('\'', "''")
+    );
+    let rows =
+        client
+            .select(
+                &sql,
+                Some(1),
+                &[unsafe {
+                    DatumWithOid::new(json.to_string(), PgBuiltInOids::TEXTOID.oid().value())
+                }],
+            )
+            .unwrap_or_report()
+            .collect::<Vec<_>>();
+
+    rows.first()
+        .and_then(|row| row.get_by_name::<&str, _>("val").ok().flatten())
+        .map(|s| s.to_string())
 }
 
-/// Helper: extract a number field from JSON object string.
-fn extract_number_field(json: &str, field_name: &str) -> Option<usize> {
-    let pattern = format!(r#""{}": "#, field_name);
-    if let Some(start) = json.find(&pattern) {
-        let search_start = start + pattern.len();
-        let rest = &json[search_start..];
-        // Find the next comma or closing brace
-        let end = rest.find([',', '}']).unwrap_or(rest.len());
-        let num_str = rest[..end].trim();
-        return num_str.parse::<usize>().ok();
-    }
-    None
+/// Helper: extract a number field from JSON using PostgreSQL's native JSON parsing.
+/// Returns None if field not found or not a valid number.
+fn extract_number_field_via_sql(
+    client: &pgrx::spi::SpiClient<'_>,
+    json: &str,
+    field_name: &str,
+) -> Option<usize> {
+    let sql = format!(
+        "SELECT (($1::jsonb)->>'{}')::bigint AS val",
+        field_name.replace('\'', "''")
+    );
+    let rows =
+        client
+            .select(
+                &sql,
+                Some(1),
+                &[unsafe {
+                    DatumWithOid::new(json.to_string(), PgBuiltInOids::TEXTOID.oid().value())
+                }],
+            )
+            .unwrap_or_report()
+            .collect::<Vec<_>>();
+
+    rows.first()
+        .and_then(|row| row.get_by_name::<i64, _>("val").ok().flatten())
+        .and_then(|n| usize::try_from(n).ok())
 }
 
-/// Helper: extract a boolean field from JSON object string.
-fn extract_bool_field(json: &str, field_name: &str) -> Option<bool> {
-    let pattern = format!(r#""{}": "#, field_name);
-    if let Some(start) = json.find(&pattern) {
-        let search_start = start + pattern.len();
-        let rest = &json[search_start..];
-        if rest.starts_with("true") {
-            return Some(true);
-        } else if rest.starts_with("false") {
-            return Some(false);
-        }
-    }
-    None
+/// Helper: extract a boolean field from JSON using PostgreSQL's native JSON parsing.
+/// Returns None if field not found or not a valid boolean.
+fn extract_bool_field_via_sql(
+    client: &pgrx::spi::SpiClient<'_>,
+    json: &str,
+    field_name: &str,
+) -> Option<bool> {
+    let sql = format!(
+        "SELECT (($1::jsonb)->>'{}')::boolean AS val",
+        field_name.replace('\'', "''")
+    );
+    let rows =
+        client
+            .select(
+                &sql,
+                Some(1),
+                &[unsafe {
+                    DatumWithOid::new(json.to_string(), PgBuiltInOids::TEXTOID.oid().value())
+                }],
+            )
+            .unwrap_or_report()
+            .collect::<Vec<_>>();
+
+    rows.first()
+        .and_then(|row| row.get_by_name::<bool, _>("val").ok().flatten())
 }
 
-/// Helper: extract an array field from JSON object string.
-/// Returns empty vec if not found or on parse error.
-fn extract_array_field(json: &str, field_name: &str) -> Vec<String> {
-    let pattern = format!(r#""{}": ["#, field_name);
-    if let Some(start) = json.find(&pattern) {
-        let search_start = start + pattern.len();
-        let rest = &json[search_start..];
-        // Find the closing bracket
-        if let Some(end) = rest.find(']') {
-            let array_content = &rest[..end];
-            // Split by comma and extract quoted strings
-            return array_content
-                .split(',')
-                .filter_map(|item| {
-                    let trimmed = item.trim();
-                    if trimmed.starts_with('"') && trimmed.ends_with('"') {
-                        Some(trimmed[1..trimmed.len() - 1].to_string())
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-        }
-    }
-    Vec::new()
+/// Helper: extract an array field from JSON using PostgreSQL's native JSON parsing.
+/// Returns empty vec if not found or empty.
+fn extract_array_field_via_sql(
+    client: &pgrx::spi::SpiClient<'_>,
+    json: &str,
+    field_name: &str,
+) -> Vec<String> {
+    let sql = format!(
+        "SELECT COALESCE(array_agg(x), ARRAY[]::text[]) AS result FROM jsonb_array_elements_text(($1::jsonb)->'{}') x",
+        field_name.replace('\'', "''")
+    );
+    let rows =
+        client
+            .select(
+                &sql,
+                Some(1),
+                &[unsafe {
+                    DatumWithOid::new(json.to_string(), PgBuiltInOids::TEXTOID.oid().value())
+                }],
+            )
+            .unwrap_or_report()
+            .collect::<Vec<_>>();
+
+    rows.first()
+        .and_then(|row| row.get_by_name::<Vec<String>, _>("result").ok().flatten())
+        .unwrap_or_default()
 }
