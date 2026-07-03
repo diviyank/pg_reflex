@@ -58,6 +58,9 @@ pub struct RegistryRow<'a> {
     /// TRUE for an ungrouped aggregate IMV (empty GROUP BY → at most one row).
     /// Written by the main create path; the decomposed paths leave it false.
     pub max_one_row: bool,
+    /// JSON object with creation-time parameters for chain rebuild (1.11.0).
+    /// Populated at create time; `None` → NULL in catalog → `{}` on rebuild.
+    pub create_args: Option<&'a str>,
 }
 
 impl<'a> RegistryRow<'a> {
@@ -97,6 +100,7 @@ impl<'a> RegistryRow<'a> {
             partition_strategy: None,
             partition_depth: None,
             max_one_row: false,
+            create_args: None,
         }
     }
 }
@@ -152,14 +156,15 @@ pub fn insert_registry_row(
     let graph_child_owned = format_pg_text_array(row.graph_child);
     let index_cols_owned = format_pg_text_array(row.index_columns);
     let unique_cols_owned = format_pg_text_array(row.unique_columns);
+    let create_args_owned = row.create_args.unwrap_or("{}").to_string();
 
     if !full_shape {
         let sql = "INSERT INTO public.__reflex_ivm_reference
                      (name, graph_depth, depends_on, depends_on_imv, unlogged_tables,
                       graph_child, sql_query, base_query, end_query,
                       aggregations, index_columns, unique_columns, enabled, last_update_date,
-                      storage_mode, refresh_mode, target_schema)
-                     VALUES ($1, $2, $3::TEXT[], $4::TEXT[], $5::TEXT[], $6::TEXT[], $7, $8, $9, $10::json, $11::TEXT[], $12::TEXT[], TRUE, NOW(), $13, $14, COALESCE(NULLIF($15, ''), current_schema()))";
+                      storage_mode, refresh_mode, target_schema, create_args)
+                     VALUES ($1, $2, $3::TEXT[], $4::TEXT[], $5::TEXT[], $6::TEXT[], $7, $8, $9, $10::json, $11::TEXT[], $12::TEXT[], TRUE, NOW(), $13, $14, COALESCE(NULLIF($15, ''), current_schema()), $16)";
         client
             .update(
                 sql,
@@ -180,6 +185,7 @@ pub fn insert_registry_row(
                     unsafe { DatumWithOid::new(storage_owned, oid_text) },
                     unsafe { DatumWithOid::new(refresh_owned, oid_text) },
                     unsafe { DatumWithOid::new(explicit_schema_owned, oid_text) },
+                    unsafe { DatumWithOid::new(create_args_owned, oid_text) },
                 ],
             )
             .map(|_| ())
@@ -200,8 +206,8 @@ pub fn insert_registry_row(
                       graph_child, sql_query, base_query, end_query,
                       aggregations, index_columns, unique_columns, enabled, last_update_date,
                       storage_mode, refresh_mode, where_predicate, ignored_sources,
-                      partition_columns, partition_strategy, target_schema, max_one_row, partition_depth)
-                     VALUES ($1, $2, $3::TEXT[], $4::TEXT[], $5::TEXT[], $6::TEXT[], $7, $8, $9, $10::jsonb, $11::TEXT[], $12::TEXT[], TRUE, NOW(), $13, $14, NULLIF($15, ''), $16::TEXT[], NULLIF($17, '{}')::TEXT[], NULLIF($18, ''), COALESCE(NULLIF($19, ''), current_schema()), $20, $21)";
+                      partition_columns, partition_strategy, target_schema, max_one_row, partition_depth, create_args)
+                     VALUES ($1, $2, $3::TEXT[], $4::TEXT[], $5::TEXT[], $6::TEXT[], $7, $8, $9, $10::jsonb, $11::TEXT[], $12::TEXT[], TRUE, NOW(), $13, $14, NULLIF($15, ''), $16::TEXT[], NULLIF($17, '{}')::TEXT[], NULLIF($18, ''), COALESCE(NULLIF($19, ''), current_schema()), $20, $21, $22)";
         client
             .update(
                 sql,
@@ -228,6 +234,7 @@ pub fn insert_registry_row(
                     unsafe { DatumWithOid::new(explicit_schema_owned, oid_text) },
                     unsafe { DatumWithOid::new(row.max_one_row, oid_bool) },
                     unsafe { DatumWithOid::new(row.partition_depth, oid_int4) },
+                    unsafe { DatumWithOid::new(create_args_owned, oid_text) },
                 ],
             )
             .map(|_| ())
@@ -371,6 +378,42 @@ pub fn read_imv(client: &pgrx::spi::SpiClient<'_>, name: &str) -> Option<ImvReco
             .map(|s| s.to_string()),
         partition_depth: row.get_by_name::<i32, _>("partition_depth").unwrap_or(None),
     })
+}
+
+/// Read IMV row with create_args for chain rebuild. Returns the fields needed
+/// to faithfully recreate the IMV via reflex_rebuild_chain.
+pub fn read_imv_for_rebuild(
+    client: &pgrx::spi::SpiClient<'_>,
+    name: &str,
+) -> Option<(String, String)> {
+    // Returns (sql_query, create_args)
+    let rows =
+        client
+            .select(
+                "SELECT sql_query, COALESCE(create_args, '{}') AS create_args \
+             FROM public.__reflex_ivm_reference WHERE name = $1",
+                Some(1),
+                &[unsafe {
+                    DatumWithOid::new(name.to_string(), PgBuiltInOids::TEXTOID.oid().value())
+                }],
+            )
+            .unwrap_or_report()
+            .collect::<Vec<_>>();
+
+    let row = rows.first()?;
+
+    let sql_query = row
+        .get_by_name::<&str, _>("sql_query")
+        .unwrap_or(None)
+        .unwrap_or("")
+        .to_string();
+    let create_args = row
+        .get_by_name::<&str, _>("create_args")
+        .unwrap_or(None)
+        .unwrap_or("{}")
+        .to_string();
+
+    Some((sql_query, create_args))
 }
 
 /// Set or clear (`value = None`) the per-IMV `wipe_threshold` override.

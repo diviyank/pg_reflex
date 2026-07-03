@@ -5,6 +5,7 @@ use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 use std::collections::HashMap;
 
+use crate::drop_ivm::drop_reflex_ivm_impl;
 use crate::query_decomposer::{intermediate_table_name, quote_identifier};
 use crate::sql_analyzer::{analyze, SqlAnalysisError};
 use crate::validate_view_name;
@@ -477,4 +478,145 @@ pub(crate) fn augment_column_types_from_query(
         }
         let _ = client.update(&format!("DROP VIEW IF EXISTS {}", tmp), None, &[]);
     });
+}
+
+/// Rebuild a decomposed (CTE/set-op) IMV chain by cascading-dropping the
+/// top IMV and all its sub-IMVs, then re-creating from the stored registry spec.
+///
+/// This is the in-extension recovery for corrupted decomposed chains where
+/// bottom-up per-sub reconciliation does not converge. The drop + recreate
+/// happens in a single SPI transaction so atomicity is guaranteed: if the
+/// recreate fails, the drop is rolled back.
+///
+/// Requires `create_args` in the registry row (1.11.0+). Returns an ERROR string
+/// on any failure (IMV not found, missing create_args, drop/create failure).
+pub(crate) fn reflex_rebuild_chain_impl(view_name: &str) -> String {
+    if let Err(msg) = validate_view_name(view_name) {
+        return format!("ERROR: {}", msg);
+    }
+
+    let result: Result<String, String> = Spi::connect_mut(|client| {
+        // 1. Read registry entry (with create_args)
+        let (sql_query, create_args_json) =
+            crate::sql_writer::registry::read_imv_for_rebuild(client, view_name)
+                .ok_or_else(|| format!("IMV '{}' not found in registry", view_name))?;
+
+        // 2. Parse create_args JSON to extract parameters
+        // Expected fields: unique_columns_str, storage_mode, refresh_mode,
+        // topk_k, ignore_sources (array), partition_by (array), explicit_unpartitioned
+        let unique_columns_str =
+            extract_string_field(&create_args_json, "unique_columns_str").unwrap_or_default();
+        let storage_mode = extract_string_field(&create_args_json, "storage_mode")
+            .unwrap_or_else(|| "UNLOGGED".to_string());
+        let refresh_mode = extract_string_field(&create_args_json, "refresh_mode")
+            .unwrap_or_else(|| "IMMEDIATE".to_string());
+        let topk_k = extract_number_field(&create_args_json, "topk_k");
+        let ignore_sources = extract_array_field(&create_args_json, "ignore_sources");
+        let partition_by = extract_array_field(&create_args_json, "partition_by");
+        let explicit_unpartitioned =
+            extract_bool_field(&create_args_json, "explicit_unpartitioned").unwrap_or(false);
+
+        // 3. Drop the IMV with CASCADE (removes all sub-IMVs)
+        let drop_result = drop_reflex_ivm_impl(view_name, true);
+        if drop_result.starts_with("ERROR") {
+            return Err(drop_result.to_string());
+        }
+
+        // 4. Re-create with stored parameters
+        // Note: if_not_exists=false because we just dropped it
+        let create_result = create_reflex_ivm_impl(
+            view_name,
+            &sql_query,
+            &unique_columns_str,
+            false, // if_not_exists=false (we just dropped it)
+            &storage_mode,
+            &refresh_mode,
+            topk_k,
+            &ignore_sources,
+            &partition_by,
+            explicit_unpartitioned,
+        );
+
+        if create_result.starts_with("ERROR") {
+            return Err(create_result.to_string());
+        }
+
+        Ok("REBUILT CHAIN".to_string())
+    });
+
+    match result {
+        Ok(msg) => msg,
+        Err(e) => format!("ERROR: {}", e),
+    }
+}
+
+/// Helper: extract a string field from JSON object string (naive parsing).
+/// Returns None if field not found; assumes JSON is well-formed.
+fn extract_string_field(json: &str, field_name: &str) -> Option<String> {
+    let pattern = format!(r#""{}": ""#, field_name);
+    if let Some(start) = json.find(&pattern) {
+        let search_start = start + pattern.len();
+        let rest = &json[search_start..];
+        // Find the closing quote (without escaping for simplicity in rebuild context)
+        if let Some(end) = rest.find('"') {
+            return Some(rest[..end].to_string());
+        }
+    }
+    None
+}
+
+/// Helper: extract a number field from JSON object string.
+fn extract_number_field(json: &str, field_name: &str) -> Option<usize> {
+    let pattern = format!(r#""{}": "#, field_name);
+    if let Some(start) = json.find(&pattern) {
+        let search_start = start + pattern.len();
+        let rest = &json[search_start..];
+        // Find the next comma or closing brace
+        let end = rest.find([',', '}']).unwrap_or(rest.len());
+        let num_str = rest[..end].trim();
+        return num_str.parse::<usize>().ok();
+    }
+    None
+}
+
+/// Helper: extract a boolean field from JSON object string.
+fn extract_bool_field(json: &str, field_name: &str) -> Option<bool> {
+    let pattern = format!(r#""{}": "#, field_name);
+    if let Some(start) = json.find(&pattern) {
+        let search_start = start + pattern.len();
+        let rest = &json[search_start..];
+        if rest.starts_with("true") {
+            return Some(true);
+        } else if rest.starts_with("false") {
+            return Some(false);
+        }
+    }
+    None
+}
+
+/// Helper: extract an array field from JSON object string.
+/// Returns empty vec if not found or on parse error.
+fn extract_array_field(json: &str, field_name: &str) -> Vec<String> {
+    let pattern = format!(r#""{}": ["#, field_name);
+    if let Some(start) = json.find(&pattern) {
+        let search_start = start + pattern.len();
+        let rest = &json[search_start..];
+        // Find the closing bracket
+        if let Some(end) = rest.find(']') {
+            let array_content = &rest[..end];
+            // Split by comma and extract quoted strings
+            return array_content
+                .split(',')
+                .filter_map(|item| {
+                    let trimmed = item.trim();
+                    if trimmed.starts_with('"') && trimmed.ends_with('"') {
+                        Some(trimmed[1..trimmed.len() - 1].to_string())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+        }
+    }
+    Vec::new()
 }

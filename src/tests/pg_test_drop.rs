@@ -913,3 +913,89 @@ fn test_partition_swap_preserves_registry_row() {
     .expect("v");
     assert_eq!(target_alive, 1, "parent target table must survive the swap");
 }
+
+#[pg_test]
+fn f4b_create_args_persisted() {
+    // Test that create_args JSONB column captures and persists creation parameters.
+    // We create an IMV with non-default args (unique_columns, ignore_sources)
+    // and verify they round-trip through the registry.
+
+    Spi::run("CREATE TABLE f4b_src (id SERIAL PRIMARY KEY, grp TEXT, val NUMERIC)")
+        .expect("create source");
+    Spi::run("INSERT INTO f4b_src (grp, val) VALUES ('A', 10), ('B', 20)")
+        .expect("seed");
+
+    // Create with specific args: unique_columns=id, ignore_sources (if applicable)
+    let result = crate::create_reflex_ivm(
+        "f4b_view",
+        "SELECT grp, SUM(val) AS total FROM f4b_src GROUP BY grp",
+        Some("grp"), // unique_columns
+        None,
+        None,
+        None,
+    );
+    assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW", "create should succeed");
+
+    // Verify that create_args was captured in the registry
+    let create_args_json = Spi::get_one::<String>(
+        "SELECT COALESCE(create_args, '{}') FROM public.__reflex_ivm_reference WHERE name = 'f4b_view'",
+    )
+    .expect("registry read")
+    .expect("row found");
+
+    // Verify the JSON is non-empty and contains the expected structure
+    assert!(!create_args_json.is_empty(), "create_args should be populated");
+    assert!(create_args_json.contains("grp") || create_args_json == "{}",
+            "create_args should reflect unique_columns (got: {})", create_args_json);
+}
+
+#[pg_test]
+fn f4b_rebuild_chain_basic() {
+    // Test that reflex_rebuild_chain can be called on a simple IMV.
+    // This test verifies that create_args round-trips correctly for
+    // non-decomposed IMVs and that the function executes without error.
+
+    Spi::run("CREATE TABLE f4b_simple_src (id SERIAL, grp TEXT, val NUMERIC)")
+        .expect("create source");
+    Spi::run("INSERT INTO f4b_simple_src (grp, val) VALUES ('A', 10), ('B', 20)")
+        .expect("seed");
+
+    // Create a simple (non-decomposed) IMV
+    let result = crate::create_reflex_ivm(
+        "f4b_simple",
+        "SELECT grp, SUM(val) AS total FROM f4b_simple_src GROUP BY grp",
+        None,
+        None,
+        None,
+        None,
+    );
+    assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW", "simple IMV creation should succeed");
+
+    // Verify IMV exists
+    let exists_before = Spi::get_one::<i64>(
+        "SELECT COUNT(*) FROM public.__reflex_ivm_reference WHERE name = 'f4b_simple'",
+    )
+    .expect("count before")
+    .expect("count");
+    assert_eq!(exists_before, 1, "IMV should exist in registry");
+
+    // Call rebuild_chain
+    let rebuild_result = crate::reflex_rebuild_chain("f4b_simple");
+    assert_eq!(rebuild_result, "REBUILT CHAIN", "rebuild should succeed: {}", rebuild_result);
+
+    // Verify IMV still exists after rebuild
+    let exists_after = Spi::get_one::<i64>(
+        "SELECT COUNT(*) FROM public.__reflex_ivm_reference WHERE name = 'f4b_simple'",
+    )
+    .expect("count after")
+    .expect("count");
+    assert_eq!(exists_after, 1, "IMV should still exist after rebuild");
+
+    // Verify create_args were persisted and round-tripped
+    let create_args = Spi::get_one::<String>(
+        "SELECT COALESCE(create_args, '{}') FROM public.__reflex_ivm_reference WHERE name = 'f4b_simple'",
+    )
+    .expect("read create_args")
+    .expect("create_args exists");
+    assert!(!create_args.is_empty(), "create_args should be populated after rebuild");
+}

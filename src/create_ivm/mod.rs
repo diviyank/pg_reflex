@@ -1544,6 +1544,64 @@ fn persist_metadata(client: &mut SpiClient<'_>, ctx: &BuildContext) {
     let ignored_sources_vec: Vec<String> = ctx.ignore_sources.to_vec();
     let max_one_row = !ctx.plan.is_passthrough && ctx.plan.group_by_columns.is_empty();
 
+    // Build create_args JSON for faithful chain rebuild: capture all parameters
+    // passed to this create call so reflex_rebuild_chain can reproduce them exactly.
+    let mut create_args_parts = Vec::new();
+
+    // unique_columns_str
+    let unique_cols_escaped = ctx
+        .unique_columns_str
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"");
+    create_args_parts.push(format!(
+        r#""unique_columns_str": "{}""#,
+        unique_cols_escaped
+    ));
+
+    // storage_mode
+    let storage_escaped = ctx.storage_upper.replace('\\', "\\\\").replace('"', "\\\"");
+    create_args_parts.push(format!(r#""storage_mode": "{}""#, storage_escaped));
+
+    // refresh_mode
+    let refresh_escaped = ctx.mode_upper.replace('\\', "\\\\").replace('"', "\\\"");
+    create_args_parts.push(format!(r#""refresh_mode": "{}""#, refresh_escaped));
+
+    // topk_k
+    if let Some(k) = ctx.topk_k {
+        create_args_parts.push(format!(r#""topk_k": {}"#, k));
+    }
+
+    // ignore_sources (as array)
+    let ignore_json = ignored_sources_vec
+        .iter()
+        .map(|s| {
+            let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
+            format!(r#""{}""#, escaped)
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    create_args_parts.push(format!(r#""ignore_sources": [{}]"#, ignore_json));
+
+    // partition_by (as array)
+    let partition_json = ctx
+        .partition_by
+        .iter()
+        .map(|s| {
+            let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
+            format!(r#""{}""#, escaped)
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    create_args_parts.push(format!(r#""partition_by": [{}]"#, partition_json));
+
+    // explicit_unpartitioned
+    create_args_parts.push(format!(
+        r#""explicit_unpartitioned": {}"#,
+        ctx.explicit_unpartitioned
+    ));
+
+    let create_args_json = format!("{{ {} }}", create_args_parts.join(", "));
+
     insert_registry_row(
         client,
         &RegistryRow {
@@ -1568,6 +1626,7 @@ fn persist_metadata(client: &mut SpiClient<'_>, ctx: &BuildContext) {
             partition_strategy: Some(&ctx.plan.partition_strategy),
             partition_depth: ctx.resolved_partition_depth,
             max_one_row,
+            create_args: Some(&create_args_json),
         },
     )
     .unwrap_or_report();

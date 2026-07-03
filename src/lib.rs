@@ -189,6 +189,14 @@ extension_sql!(
     ALTER TABLE public.__reflex_ivm_reference
         ADD COLUMN IF NOT EXISTS stale_since TIMESTAMPTZ;
 
+    -- 1.11.0: JSON object capturing creation-time arguments (unique_columns,
+    -- storage_mode, refresh_mode, topk_k, ignore_sources, partition_by,
+    -- explicit_unpartitioned) for faithful IMV chain reconstruction via
+    -- reflex_rebuild_chain. NULL for legacy rows; new rows populated at
+    -- create time to enable transparent rebuild from stored specs.
+    ALTER TABLE public.__reflex_ivm_reference
+        ADD COLUMN IF NOT EXISTS create_args TEXT;
+
     -- Multi-level partition capture (plans/sub_partitioning.md). Snapshot of
     -- each tracked source root's recursive LEAF set, keyed by (root, child).
     -- reflex_flush_partitions oid-diffs the live leaf set against this to
@@ -652,6 +660,18 @@ fn reflex_rebuild_imv_metadata(view_name: &str) -> String {
 #[pg_extern]
 fn reflex_rebuild_triggers(source_table: &str) -> String {
     create_ivm::reflex_rebuild_triggers_impl(source_table)
+}
+
+/// Rebuild a decomposed (CTE/set-op) IMV chain from the stored registry spec.
+/// CASCADE-drops the top IMV and all sub-IMVs, then recreates them faithfully
+/// using the stored creation parameters. Atomicity guaranteed: drop + recreate
+/// occur in a single SPI transaction, so on failure neither persists.
+///
+/// Used for recovery when a decomposed chain accumulates structural damage that
+/// bottom-up reconciliation cannot resolve. Returns a status string or ERROR.
+#[pg_extern]
+fn reflex_rebuild_chain(view_name: &str) -> String {
+    create_ivm::reflex_rebuild_chain_impl(view_name)
 }
 
 /// Refresh a single IMV by rebuilding from source. Alias for reflex_reconcile.
