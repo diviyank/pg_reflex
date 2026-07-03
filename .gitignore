@@ -16,3 +16,5 @@ journal/
 docs/superpowers
 journal*.zip
 journal.old
+__pycache__
+.superpowers

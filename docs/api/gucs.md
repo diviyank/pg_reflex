@@ -8,6 +8,7 @@ pg_reflex reads a handful of runtime settings via `current_setting`. None requir
 | [`reflex.wipe_floor_rows`](#reflexwipe_floor_rows) | integer | `1000` | Floor on the partition-size denominator of the dirty ratio. |
 | [`reflex.assert_inplace_update`](#reflexassert_inplace_update) | boolean | `off` | Correctness assertion on the in-place UPDATE path; for CI/fuzz. |
 | [`pg_reflex.alter_source_policy`](#pg_reflexalter_source_policy) | enum | `warn` | Reaction to `ALTER TABLE` on a tracked source. |
+| [`pg_reflex.debug_resolve_anchor`](#pg_reflexdebug_resolve_anchor) | boolean | `off` | 1.10.8+. When on, emits `REFLEX-DBG resolve_anchor` NOTICEs; off by default to avoid burying real WARNINGs. |
 
 !!! note "Reserved"
     `reflex.partition_dispatch_cost_cap` (and the [`reflex_set_partition_dispatch_cost_cap`](reflex_set_partition_dispatch_cost_cap.md) setter) is reserved for the Tier 2 per-partition dispatch gate. It is **not yet consulted at runtime** — setting it currently has no effect.
@@ -48,6 +49,14 @@ SET reflex.assert_inplace_update = on;   -- CI / fuzz only
 |---|---|
 | `'warn'` (default) | Emits `WARNING 'pg_reflex: source table % was altered; IMV % may be stale — run SELECT reflex_rebuild_imv(…)`'. The ALTER proceeds. |
 | `'error'` | Raises an `EXCEPTION`, rolling back the ALTER. |
+
+## `pg_reflex.debug_resolve_anchor`
+
+(1.10.8+) Gates diagnostic `NOTICE`s emitted during anchor-source resolution. When `on`, emits `REFLEX-DBG resolve_anchor` lines that trace join-key and partition-key resolution logic. Useful for debugging multi-IMV cascades; off by default to avoid burying real WARNINGs in the log.
+
+```sql
+SET pg_reflex.debug_resolve_anchor = on;   -- CI / debugging only
+```
 
 ## Setting
 

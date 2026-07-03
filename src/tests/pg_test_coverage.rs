@@ -34,6 +34,29 @@ fn cov_reflex_ivm_status_basic() {
     assert_eq!(rc, 2, "two groups (a,b) in target");
 }
 
+/// `reflex_ivm_status().row_count` uses the planner estimate (reltuples) once the
+/// target is analyzed — exercising the fast path — and reports the correct count.
+#[pg_test]
+fn cov_reflex_ivm_status_row_count_estimate_when_analyzed() {
+    Spi::run("CREATE TABLE cov_est_s (id INT, g TEXT, v INT)").expect("create");
+    Spi::run("INSERT INTO cov_est_s SELECT i, 'g' || (i % 3), i FROM generate_series(1, 300) i")
+        .expect("seed");
+    crate::create_reflex_ivm(
+        "cov_est_view",
+        "SELECT g, SUM(v) AS s FROM cov_est_s GROUP BY g",
+        None,
+        None,
+        None,
+        None,
+    );
+    // Analyze the target so pg_class.reltuples > 0 → the reltuples branch is taken.
+    Spi::run("ANALYZE cov_est_view").expect("analyze");
+    let rc: i64 = Spi::get_one("SELECT row_count FROM reflex_ivm_status() WHERE name='cov_est_view'")
+        .expect("q")
+        .expect("v");
+    assert_eq!(rc, 3, "3 groups; reltuples estimate equals exact for a small analyzed target");
+}
+
 /// `reflex_ivm_stats` returns metric/value pairs for a known IMV.
 #[pg_test]
 fn cov_reflex_ivm_stats_known_imv() {

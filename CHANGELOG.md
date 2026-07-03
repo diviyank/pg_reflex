@@ -2,6 +2,90 @@
 
 ## [Unreleased]
 
+## [1.10.8] - 2026-07-03
+
+The "untreated findings" remediation release. It closes the silent IMV-staleness
+failure modes surfaced by the 2026-07-02 multi-tenant production incident and adds
+`reflex_doctor()` — a single operator entrypoint that diagnoses every inconsistency
+class and, on request, applies only non-breaking repairs. Replace the `.so`, then
+`ALTER EXTENSION pg_reflex UPDATE TO '1.10.8';`.
+
+### Added
+
+- **`reflex_doctor(target, fix, drop_orphans, max_attempts)`** — one entrypoint that
+  detects wedged pending roots, `known_stale` IMVs, archive residue, snapshot
+  divergence, and orphan-overlap, and (only under `fix => TRUE`) applies **non-breaking**
+  repairs. **Dry-run by default** (`fix => FALSE`): it prints the diagnosis and the exact
+  remediation SQL and mutates nothing. The one destructive-ish repair (dropping a
+  confirmed orphan, F3) is gated behind `drop_orphans => TRUE`; the one non-additive
+  repair (chain rebuild, F4b) is **never auto-performed** — it is reported with the
+  `reflex_rebuild_chain(...)` call to run. Each repair runs in its own subtransaction,
+  so one failure records `failed:<err>` for that row without aborting the report.
+- **`reflex_rebuild_chain(view)`** — in-extension recovery for a corrupted *decomposed*
+  (CTE / set-op) IMV chain: an **atomic** CASCADE drop + recreate from the create-time
+  arguments now captured in the new `__reflex_ivm_reference.create_args` column. A
+  recreate failure aborts the whole operation (the drop rolls back) — never a
+  half-dropped chain.
+- **`reflex_partition_pending_status()`** — read-only reporter of the partition
+  pending-queue backlog (source root, age, `attempts`, `last_error`).
+- **`reflex_refresh_partition_snapshot_if_diverged(source_root)`** — on-demand snapshot
+  self-heal: oid-diffs `__reflex_source_partition_snapshot` against the live leaf set and
+  rebuilds only on divergence.
+- **`known_stale` / `stale_reason`** columns in `reflex_ivm_status()` (backed by new
+  `__reflex_ivm_reference.known_stale` / `stale_reason` / `stale_since`): a durable health
+  flag set on any caught cascade/flush failure and cleared on a successful reconcile, so
+  `SELECT * FROM reflex_ivm_status() WHERE known_stale` answers "is anything wrong now?".
+- Two new `reflex_audit` checks: **`archive_residue`** (a partitioned IMV partition that is
+  empty while its authoritative — `ignore_sources` — source has rows for that key; suggests
+  `reflex_reconcile_partition`) and **`bare_name_ambiguity`** (an unqualified `depends_on`
+  entry that resolves to a relation in more than one schema, a shared-multi-tenant footgun).
+- GUC **`pg_reflex.debug_resolve_anchor`** (default `off`) — gates the `REFLEX-DBG
+  resolve_anchor` NOTICE spam that previously buried real WARNINGs on multi-IMV cascades.
+
+### Fixed
+
+- **A failed partition flush permanently wedged the pending queue (silent data-staleness).**
+  The DDL enqueue used `ON CONFLICT (source_root) DO NOTHING`; once a root's row was stuck
+  (a flush had failed), every later `ATTACH`/`DETACH`/`CREATE … PARTITION OF` was a no-op
+  insert that never re-fired the `AFTER INSERT` drain trigger — so the IMV silently stopped
+  updating (observed: `nvg.sales_simulation` wedged 6 days). The enqueue is now
+  `ON CONFLICT DO UPDATE` (bumping `attempts`/`enqueued_at`) **and** the drain constraint
+  trigger fires `AFTER INSERT OR UPDATE`, so a stuck root is retried on the next partition
+  DDL. Failed drains record `last_error` on the pending row.
+- **`drop_orphans=false` orphan partitions caused later `would overlap partition` swap
+  aborts** that left an IMV (and its dependents) stale. A partition swap now detects a
+  *confirmed* orphan target child (bounds match the incoming swap target and **no** live
+  source partition backs it) and drops it inside the same swap transaction before `ATTACH`;
+  the reconcile immediately repopulates, so no committed data is lost. The drop is
+  fail-safe (skipped if the live-source set cannot be enumerated) and error-propagating,
+  and can never remove a live-backed child.
+
+### Changed
+
+- **`reflex_rebuild_imv` documented as an anchor-scoped alias of `reflex_reconcile`.** A
+  repro confirmed the incident's "rebuild left the partition empty" was not a skip bug: the
+  function re-derives every child of the *anchor* source and does **not** fill partition
+  keys fed only by a source listed in `ignore_sources`. Use `reflex_reconcile_partition`
+  (or `reflex_doctor` / the new `archive_residue` check) for that case.
+
+### Performance
+
+- **`reflex_ivm_status()` no longer full-scans every IMV target.** Its `row_count`
+  column ran an exact `COUNT(*)` per IMV — O(rows) per target, so a mature registry
+  with large IMVs took seconds-to-minutes. It now reports the planner estimate
+  `pg_class.reltuples` when the target is analyzed (`reltuples > 0`) and falls back to
+  an exact `count(*)` only when the estimate is unavailable (empty or never-analyzed
+  target, where the count is cheap). `row_count` is therefore an estimate for large
+  tables; exact for small/empty ones. No signature or migration change.
+
+### Migration
+
+- `ALTER EXTENSION pg_reflex UPDATE TO '1.10.8';` after swapping the module:
+  [`sql/pg_reflex--1.10.7--1.10.8.sql`](https://github.com/diviyank/pg_reflex/blob/main/sql/pg_reflex--1.10.7--1.10.8.sql)
+  adds the six new columns and the new SQL-callable functions. Like 1.10.0 it does **not**
+  drain the pending queue (ALTER EXTENSION UPDATE runs in `creating_extension` mode); drain
+  any backlog afterward with `SELECT public.reflex_flush_partitions();` as its own statement.
+
 ## [1.10.7] - 2026-06-23
 
 Partition-flush reconcile of a partitioned IMV no longer full-rebuilds its

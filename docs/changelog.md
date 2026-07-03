@@ -4,6 +4,37 @@ The full changelog tracks every release. The latest version's headlines are on t
 
 For each version below, see [`CHANGELOG.md`](https://github.com/diviyank/pg_reflex/blob/main/CHANGELOG.md) on GitHub for the canonical text.
 
+## [1.10.8] — 2026-07-03
+
+The "untreated findings" remediation release: it closes the silent IMV-staleness failure modes from the 2026-07-02 multi-tenant incident and adds [`reflex_doctor()`](api/reflex_doctor.md), a single dry-run-by-default entrypoint that diagnoses every inconsistency class and applies only non-breaking repairs. Replace the `.so`, then `ALTER EXTENSION pg_reflex UPDATE TO '1.10.8';`.
+
+**Added**
+
+- [`reflex_doctor(target, fix, drop_orphans, max_attempts)`](api/reflex_doctor.md) — diagnose + safe-repair entrypoint. Dry-run by default (prints diagnosis + remediation SQL, mutates nothing); F3 orphan drop gated behind `drop_orphans`, F4b chain rebuild report-only, each repair isolated so one failure never aborts the report.
+- [`reflex_rebuild_chain(view)`](api/reflex_rebuild_chain.md) — atomic CASCADE drop + recreate of a decomposed IMV chain from the new `create_args` column (a recreate failure rolls the drop back).
+- [`reflex_partition_pending_status()`](api/reflex_partition_pending_status.md) — read-only pending-queue backlog (age, `attempts`, `last_error`).
+- [`reflex_refresh_partition_snapshot_if_diverged(source_root)`](api/reflex_refresh_partition_snapshot_if_diverged.md) — on-demand snapshot self-heal.
+- `known_stale` / `stale_reason` columns in [`reflex_ivm_status()`](api/reflex_ivm_status.md) — durable health flag, set on caught failures and cleared on success.
+- Two [`reflex_audit`](api/reflex_audit.md) checks: `archive_residue` (empty IMV partition while its `ignore_sources` source has rows) and `bare_name_ambiguity` (unqualified `depends_on` name existing in >1 schema).
+- GUC [`pg_reflex.debug_resolve_anchor`](api/gucs.md) (default off) — silences the `REFLEX-DBG resolve_anchor` NOTICE spam.
+
+**Fixed**
+
+- A failed partition flush permanently wedged the pending queue (`ON CONFLICT DO NOTHING` + `AFTER INSERT`-only drain), silently freezing the IMV. Enqueue is now `ON CONFLICT DO UPDATE` and the drain fires `AFTER INSERT OR UPDATE`, so a stuck root is retried on the next partition DDL; `attempts`/`last_error` surface it.
+- `drop_orphans=false` orphan partitions caused later `would overlap partition` swap aborts. A swap now drops a *confirmed* orphan (bounds match, no live source backing) inside the same transaction before `ATTACH` — fail-safe and never removing a live-backed child.
+
+**Changed**
+
+- `reflex_rebuild_imv` documented as an anchor-scoped alias of [`reflex_reconcile`](api/reflex_reconcile.md): it does not fill partition keys fed only by an `ignore_sources` source — use [`reflex_reconcile_partition`](api/reflex_reconcile_partition.md) or `reflex_doctor` for that.
+
+**Performance**
+
+- [`reflex_ivm_status()`](api/reflex_ivm_status.md) no longer full-scans every IMV target: `row_count` now uses the planner estimate (`pg_class.reltuples`) for analyzed targets and only falls back to exact `count(*)` for empty/never-analyzed ones. A status query is now O(1) per IMV instead of O(rows). `row_count` is an estimate for large tables.
+
+**Migration**
+
+- `ALTER EXTENSION pg_reflex UPDATE TO '1.10.8';` after swapping the module — [`sql/pg_reflex--1.10.7--1.10.8.sql`](https://github.com/diviyank/pg_reflex/blob/main/sql/pg_reflex--1.10.7--1.10.8.sql) adds six columns + the new functions. It does not drain the queue (`creating_extension` mode); run `SELECT public.reflex_flush_partitions();` afterward if there is a backlog.
+
 ## [1.10.7] — 2026-06-23
 
 Partition-flush reconcile no longer full-rebuilds a partitioned IMV's non-co-partitioned aggregate dependents on every swapped leaf — the cascade is now key-scoped and fires once per flush, fixing the forecast `push_baseline` COMMIT `TimeoutError` (`forecast_dp_year_agg` was rescanning the whole parent per leaf, past the asyncpg 200 s ceiling). Pure Rust: replace the `.so`, then `ALTER EXTENSION pg_reflex UPDATE TO '1.10.7';`.

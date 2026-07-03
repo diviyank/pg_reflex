@@ -14,6 +14,8 @@ All three return `'RECONCILED'`.
 
 ## Behaviour
 
+**`reflex_rebuild_imv` (alias) is anchor-scoped:** it re-derives every child of the *anchor* source only, and does **not** fill partition keys fed only by a source listed in `ignore_sources`. For that case, use [`reflex_reconcile_partition`](reflex_reconcile_partition.md) or [`reflex_doctor`](reflex_doctor.md) with the `archive_residue` check.
+
 For aggregate IMVs:
 
 1. Drop all reflex-managed indexes on the intermediate table.

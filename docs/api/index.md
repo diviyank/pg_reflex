@@ -17,9 +17,16 @@ Every SQL-callable function pg_reflex installs. Click a name for the full page.
 |---|---|---|
 | [`reflex_reconcile(view_name)`](reflex_reconcile.md) | `TEXT` | Rebuild intermediate + target from source. Safety net against drift. |
 | [`refresh_reflex_imv(view_name)`](reflex_reconcile.md) | `TEXT` | Alias of `reflex_reconcile`. |
-| [`reflex_rebuild_imv(view_name)`](reflex_reconcile.md) | `TEXT` | Alias of `reflex_reconcile` (1.2.0+). |
+| [`reflex_rebuild_imv(view_name)`](reflex_reconcile.md) | `TEXT` | Alias of `reflex_reconcile` (1.2.0+). Anchor-scoped. |
 | [`refresh_imv_depending_on(source)`](refresh_imv_depending_on.md) | `TEXT` | Reconcile every IMV whose `depends_on` lists `source`, in graph-depth order. |
 | [`reflex_scheduled_reconcile(max_age_minutes)`](reflex_scheduled_reconcile.md) | `SETOF (name, status, ms)` | 1.2.1+. Reconcile every IMV staler than the threshold. pg_cron-friendly. |
+
+## Recovery and diagnostics
+
+| Function | Returns | Purpose |
+|---|---|---|
+| [`reflex_doctor(target, fix, drop_orphans, max_attempts)`](reflex_doctor.md) | `SETOF (check_id, severity, object, finding, action, outcome)` | 1.10.8+. One-stop diagnostic and repair entrypoint. Dry-run by default. |
+| [`reflex_rebuild_chain(view_name)`](reflex_rebuild_chain.md) | `TEXT` | 1.10.8+. Atomic CASCADE drop + recreate of a corrupted decomposed IMV chain. |
 
 ## Partitioning
 
@@ -29,6 +36,8 @@ Every SQL-callable function pg_reflex installs. Click a name for the full page.
 | [`reflex_sync_partitions(view_name [, drop_orphans])`](reflex_sync_partitions.md) | `TEXT` | 1.6.0+. Reconcile partition *structure* — create missing IMV children, optionally drop orphans. |
 | [`reflex_flush_partitions()`](reflex_flush_partitions.md) | `TEXT` | 1.6.0+. Drain pending source `ATTACH`/`DETACH` swaps and propagate to IMV partitions. |
 | [`reflex_flush_partition_source(source_root)`](reflex_flush_partition_source.md) | `TEXT` | 1.6.0+. Flush a single source root without scanning the pending queue. |
+| [`reflex_partition_pending_status()`](reflex_partition_pending_status.md) | `SETOF (source_root, enqueued_at, age_seconds, attempts, last_error)` | 1.10.8+. Read-only reporter of pending partition DDL queue. Detect wedged roots. |
+| [`reflex_refresh_partition_snapshot_if_diverged(source_root)`](reflex_refresh_partition_snapshot_if_diverged.md) | `TEXT` | 1.10.8+. Heal partition snapshot divergence (oid-diffs and rebuilds on divergence). |
 
 ## Maintenance
 
@@ -81,6 +90,7 @@ See [Event triggers](event-triggers.md) for details.
 | [`reflex.wipe_floor_rows`](gucs.md#reflexwipe_floor_rows) | `1000` | 1.6.0+. Floor on the partition-size denominator of the dirty ratio. |
 | [`reflex.assert_inplace_update`](gucs.md#reflexassert_inplace_update) | `off` | Correctness assertion on the in-place UPDATE path; for CI/fuzz. |
 | [`pg_reflex.alter_source_policy`](gucs.md#pg_reflexalter_source_policy) | `'warn'` | 1.2.1+. `'warn'` or `'error'` — reaction to `ALTER TABLE` on a tracked source. |
+| [`pg_reflex.debug_resolve_anchor`](gucs.md#pg_reflexdebug_resolve_anchor) | `off` | 1.10.8+. Gates diagnostic NOTICEs during anchor resolution. Off by default to avoid burying real WARNINGs. |
 
 ## Internal / codegen helpers
 

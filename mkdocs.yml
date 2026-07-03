@@ -125,6 +125,8 @@ nav:
       - create_reflex_ivm_if_not_exists: api/create_reflex_ivm_if_not_exists.md
       - drop_reflex_ivm: api/drop_reflex_ivm.md
       - reflex_reconcile: api/reflex_reconcile.md
+      - reflex_rebuild_chain: api/reflex_rebuild_chain.md
+      - reflex_doctor: api/reflex_doctor.md
       - refresh_imv_depending_on: api/refresh_imv_depending_on.md
       - reflex_flush_deferred: api/reflex_flush_deferred.md
       - reflex_scheduled_reconcile: api/reflex_scheduled_reconcile.md
@@ -132,6 +134,7 @@ nav:
       - reflex_sync_partitions: api/reflex_sync_partitions.md
       - reflex_flush_partitions: api/reflex_flush_partitions.md
       - reflex_flush_partition_source: api/reflex_flush_partition_source.md
+      - reflex_refresh_partition_snapshot_if_diverged: api/reflex_refresh_partition_snapshot_if_diverged.md
       - reflex_compact_imv: api/reflex_compact_imv.md
       - reflex_probe_not_null_columns: api/reflex_probe_not_null_columns.md
       - reflex_rebuild_imv_metadata: api/reflex_rebuild_imv_metadata.md
@@ -141,6 +144,7 @@ nav:
       - reflex_set_wipe_floor_rows: api/reflex_set_wipe_floor_rows.md
       - reflex_set_partition_dispatch_cost_cap: api/reflex_set_partition_dispatch_cost_cap.md
       - reflex_ivm_status: api/reflex_ivm_status.md
+      - reflex_partition_pending_status: api/reflex_partition_pending_status.md
       - reflex_ivm_stats: api/reflex_ivm_stats.md
       - reflex_ivm_histogram: api/reflex_ivm_histogram.md
       - reflex_explain_flush: api/reflex_explain_flush.md

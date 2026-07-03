@@ -23,8 +23,12 @@ type IvmStatusRow = (
     Option<String>,                 // stale_reason
 );
 
-/// Summary per IMV. `row_count` is live (SELECT count(*) on the target), cheap
-/// enough for operator use on a typical registry.
+/// Summary per IMV. `row_count` avoids a full-table `count(*)` on large IMVs:
+/// it reports the planner estimate `pg_class.reltuples` when the target has been
+/// analyzed (`reltuples > 0`, the common production case), and only falls back to
+/// an exact `count(*)` when the estimate is unavailable (`reltuples <= 0`: an
+/// empty target — where the count is instant — or one not yet analyzed). This
+/// keeps the status view O(1) per IMV instead of O(rows) on mature registries.
 #[pg_extern]
 #[allow(clippy::type_complexity)]
 fn reflex_ivm_status() -> TableIterator<
@@ -117,11 +121,22 @@ fn reflex_ivm_status() -> TableIterator<
     });
 
     // Populate row_count in a separate pass to keep the registry read short.
+    // Prefer the planner estimate (reltuples) so a status query never full-scans
+    // a large IMV target; fall back to an exact count only when the estimate is
+    // unavailable (reltuples <= 0 → empty or never-analyzed), where count(*) is
+    // cheap or the only source of truth. Missing target → to_regclass NULL →
+    // no row → the -1 sentinel (unchanged from the prior "could not determine").
     let rows: Vec<IvmStatusRow> = rows
         .into_iter()
         .map(|mut row| {
             let name = &row.0;
-            let count_sql = format!("SELECT COUNT(*)::BIGINT AS c FROM {}", quote(name));
+            let count_sql = format!(
+                "SELECT CASE WHEN c.reltuples > 0 THEN c.reltuples::BIGINT \
+                             ELSE (SELECT COUNT(*)::BIGINT FROM {ident}) END AS c \
+                 FROM pg_class c WHERE c.oid = to_regclass('{name_lit}')",
+                ident = quote(name),
+                name_lit = name.replace('\'', "''"),
+            );
             let c = Spi::get_one::<i64>(&count_sql)
                 .unwrap_or(None)
                 .unwrap_or(-1);
