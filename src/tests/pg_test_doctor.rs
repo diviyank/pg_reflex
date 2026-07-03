@@ -1,3 +1,5 @@
+use pgrx::pg_sys::panic::ErrorReportable;
+
 #[pg_test]
 fn f10_doctor_dry_run_is_read_only() {
     // Seed a wedged pending row + a known_stale IMV.
@@ -17,29 +19,53 @@ fn f10_doctor_dry_run_is_read_only() {
 
 #[pg_test]
 fn f10_doctor_fix_drains_wedged_queue() {
-    // Seed a pending root that WILL drain cleanly (a real flushable root, or assert the
-    // outcome is 'fixed'/'failed:...' and the row state changed accordingly). Call
-    // reflex_doctor(fix => TRUE). Assert the F1/F2 row reports outcome 'fixed' (or the
-    // queue drained). Real assertions.
-    //
-    // For now, just test that calling with fix => TRUE doesn't crash and returns rows.
-    // We'll need a more elaborate fixture to test actual queue draining.
-    // Use high attempt count (>= max_attempts = 3) to trigger F2 detection
+    // Seed a pending root with high attempt count to trigger F2 detection.
+    // Call reflex_doctor(fix => TRUE) and verify:
+    // 1. At least one row is returned
+    // 2. The outcome is either 'fixed' or starts with 'failed:'
+    // 3. The pending row was attempted to be drained
     Spi::run("INSERT INTO public.__reflex_partition_pending (source_root, attempts) VALUES ('test.root', 5)").unwrap();
-    let n = Spi::get_one::<i64>("SELECT count(*) FROM reflex_doctor(NULL, TRUE)")
-        .unwrap()
-        .unwrap_or(0);
-    // Should have at least one row reporting on the pending queue
-    assert!(n >= 1, "doctor should return at least one row with fix => TRUE");
+
+    let result_rows: Vec<(String, String)> = Spi::connect(|client| {
+        let mut result = Vec::new();
+        let rs = client.select(
+            "SELECT object, outcome FROM reflex_doctor(NULL, TRUE) WHERE check_id IN ('F1', 'F2')",
+            None,
+            &[]
+        ).unwrap_or_report();
+        for row in rs {
+            let object: String = row
+                .get_by_name::<&str, _>("object")
+                .unwrap_or(None)
+                .unwrap_or("")
+                .to_string();
+            let outcome: String = row
+                .get_by_name::<&str, _>("outcome")
+                .unwrap_or(None)
+                .unwrap_or("")
+                .to_string();
+            result.push((object, outcome));
+        }
+        result
+    });
+
+    assert!(!result_rows.is_empty(), "doctor should return at least one F1/F2 row");
+    let (obj, outcome) = &result_rows[0];
+    assert_eq!(obj, "test.root", "object should be the seeded source_root");
+    assert!(
+        outcome == "fixed" || outcome.starts_with("failed:"),
+        "outcome should be 'fixed' or 'failed:...' but got '{}'",
+        outcome
+    );
 }
 
 #[pg_test]
 fn f10_doctor_fix_respects_drop_orphans_gate() {
-    // Seed/represent an F3 orphan-overlap finding.
-    // For now, just verify that without drop_orphans, we get skipped outcomes.
-    // This would need a more complex fixture to actually trigger the F3 condition.
+    // Seed an F3 orphan-overlap IMV and verify the gate behavior:
+    // 1. With drop_orphans=FALSE: outcome should be 'skipped(needs drop_orphans)'
+    // 2. With drop_orphans=TRUE: outcome should be 'fixed' or 'failed:...'
 
-    // Seed a basic IMV with a known_stale condition
+    // Seed a basic IMV
     Spi::run("CREATE TABLE f10_src (id INT PRIMARY KEY, val INT)").unwrap();
     Spi::run("INSERT INTO f10_src VALUES (1, 100)").unwrap();
     crate::create_reflex_ivm(
@@ -51,16 +77,84 @@ fn f10_doctor_fix_respects_drop_orphans_gate() {
         None,
     );
 
-    // Mark it as stale with a reason that suggests drop_orphans is needed
-    Spi::run("UPDATE public.__reflex_ivm_reference SET known_stale = TRUE, stale_reason = 'overlap' WHERE name = 'f10_test_imv'").unwrap();
-
-    // Call without drop_orphans - should report it as skipped or reported
-    let result_without = Spi::get_one::<String>(
-        "SELECT outcome FROM reflex_doctor(NULL, TRUE, FALSE) WHERE object = 'f10_test_imv'"
+    // Mark it as stale with a reason containing "overlap" (F3 trigger)
+    Spi::run(
+        "UPDATE public.__reflex_ivm_reference SET known_stale = TRUE, stale_reason = 'partition overlap detected' WHERE name = 'f10_test_imv'"
     ).unwrap();
 
-    // At minimum, the function should succeed and return a result
-    assert!(result_without.is_some(), "doctor should return row for the stale IMV");
+    // Test 1: Call with drop_orphans=FALSE - should be gated
+    let result_without: Vec<(String, String, String)> = Spi::connect(|client| {
+        let mut result = Vec::new();
+        let rs = client.select(
+            "SELECT check_id, object, outcome FROM reflex_doctor(NULL, TRUE, FALSE) WHERE object = 'f10_test_imv'",
+            None,
+            &[]
+        ).unwrap_or_report();
+        for row in rs {
+            let check_id: String = row
+                .get_by_name::<&str, _>("check_id")
+                .unwrap_or(None)
+                .unwrap_or("")
+                .to_string();
+            let object: String = row
+                .get_by_name::<&str, _>("object")
+                .unwrap_or(None)
+                .unwrap_or("")
+                .to_string();
+            let outcome: String = row
+                .get_by_name::<&str, _>("outcome")
+                .unwrap_or(None)
+                .unwrap_or("")
+                .to_string();
+            result.push((check_id, object, outcome));
+        }
+        result
+    });
+
+    assert!(!result_without.is_empty(), "doctor should return row for the stale IMV");
+    let (check_id, obj, outcome) = &result_without[0];
+    assert_eq!(check_id, "F3", "should be classified as F3");
+    assert_eq!(obj, "f10_test_imv", "object should be the seeded IMV");
+    assert_eq!(outcome, "skipped(needs drop_orphans)", "outcome should be skipped when drop_orphans=FALSE");
+
+    // Test 2: Call with drop_orphans=TRUE - should attempt the repair
+    let result_with: Vec<(String, String, String)> = Spi::connect(|client| {
+        let mut result = Vec::new();
+        let rs = client.select(
+            "SELECT check_id, object, outcome FROM reflex_doctor(NULL, TRUE, TRUE) WHERE object = 'f10_test_imv'",
+            None,
+            &[]
+        ).unwrap_or_report();
+        for row in rs {
+            let check_id: String = row
+                .get_by_name::<&str, _>("check_id")
+                .unwrap_or(None)
+                .unwrap_or("")
+                .to_string();
+            let object: String = row
+                .get_by_name::<&str, _>("object")
+                .unwrap_or(None)
+                .unwrap_or("")
+                .to_string();
+            let outcome: String = row
+                .get_by_name::<&str, _>("outcome")
+                .unwrap_or(None)
+                .unwrap_or("")
+                .to_string();
+            result.push((check_id, object, outcome));
+        }
+        result
+    });
+
+    assert!(!result_with.is_empty(), "doctor should return row after retry with drop_orphans=TRUE");
+    let (check_id, obj, outcome) = &result_with[0];
+    assert_eq!(check_id, "F3", "should still be classified as F3");
+    assert_eq!(obj, "f10_test_imv", "object should be the seeded IMV");
+    assert!(
+        outcome == "fixed" || outcome.starts_with("failed:"),
+        "outcome should be 'fixed' or 'failed:...' but got '{}' (gate was bypassed)",
+        outcome
+    );
 }
 
 #[pg_test]

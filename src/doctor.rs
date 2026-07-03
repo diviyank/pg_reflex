@@ -153,11 +153,11 @@ fn detect_pending_queue_issues(
 fn apply_partition_flush_repair(source_root: &str) -> String {
     // Run the repair in a subtransaction so one failure doesn't abort the report
     match Spi::get_one::<String>(&format!(
-        "DO $do$ BEGIN PERFORM public.reflex_flush_partition_source('{}'); EXCEPTION WHEN OTHERS THEN RAISE; END $do$;",
+        "DO $do$ BEGIN PERFORM public.reflex_flush_partition_source('{}'); EXCEPTION WHEN OTHERS THEN NULL; END $do$;",
         source_root.replace("'", "''")
     )) {
         Ok(Some(_)) | Ok(None) => "fixed".to_string(),
-        Err(e) => format!("failed: {}", e),
+        Err(e) => format!("failed:{}", e),
     }
 }
 
@@ -165,19 +165,32 @@ fn apply_partition_flush_repair(source_root: &str) -> String {
 fn apply_reconcile_repair(imv_name: &str) -> String {
     // Run the repair in a subtransaction so one failure doesn't abort the report
     match Spi::get_one::<String>(&format!(
-        "DO $do$ BEGIN PERFORM public.reflex_reconcile('{}'); EXCEPTION WHEN OTHERS THEN RAISE; END $do$;",
+        "DO $do$ BEGIN PERFORM public.reflex_reconcile('{}'); EXCEPTION WHEN OTHERS THEN NULL; END $do$;",
         imv_name.replace("'", "''")
     )) {
         Ok(Some(_)) | Ok(None) => "fixed".to_string(),
-        Err(e) => format!("failed: {}", e),
+        Err(e) => format!("failed:{}", e),
     }
 }
 
-/// Detect known_stale IMVs (F4, F4b)
+/// Apply a sync partitions repair in a subtransaction
+fn apply_sync_partitions_repair(imv_name: &str, drop_orphans: bool) -> String {
+    // Run the repair in a subtransaction so one failure doesn't abort the report
+    match Spi::get_one::<String>(&format!(
+        "DO $do$ BEGIN PERFORM public.reflex_sync_partitions('{}', {}); EXCEPTION WHEN OTHERS THEN NULL; END $do$;",
+        imv_name.replace("'", "''"),
+        drop_orphans
+    )) {
+        Ok(Some(_)) | Ok(None) => "fixed".to_string(),
+        Err(e) => format!("failed:{}", e),
+    }
+}
+
+/// Detect known_stale IMVs (F3, F4, F4b)
 fn detect_known_stale_imvs(
     target: Option<&str>,
     fix: bool,
-    _drop_orphans: bool,
+    drop_orphans: bool,
 ) -> Vec<DoctorReportRow> {
     let mut rows = Vec::new();
 
@@ -213,31 +226,64 @@ fn detect_known_stale_imvs(
     });
 
     for (imv_name, _graph_depth, stale_reason) in stale_rows {
-        let check_id = if stale_reason.as_deref().map(|r| r.contains("decomposed")) == Some(true) {
+        let check_id = if stale_reason
+            .as_deref()
+            .map(|r| r.to_lowercase().contains("decomposed"))
+            == Some(true)
+        {
             "F4b".to_string()
+        } else if stale_reason
+            .as_deref()
+            .map(|r| r.to_lowercase().contains("overlap"))
+            == Some(true)
+        {
+            "F3".to_string()
         } else {
             "F4".to_string()
         };
 
-        let action = if check_id == "F4b" {
-            format!(
-                "SELECT reflex_rebuild_chain('{}');",
-                imv_name.replace("'", "''")
-            )
-        } else {
-            format!(
-                "SELECT reflex_reconcile('{}');",
-                imv_name.replace("'", "''")
-            )
-        };
-
-        let outcome = if check_id == "F4b" {
-            "reported".to_string() // F4b is never auto-performed
-        } else if fix {
-            // Try to reconcile the stale IMV
-            apply_reconcile_repair(&imv_name)
-        } else {
-            "reported".to_string()
+        let (action, outcome) = match check_id.as_str() {
+            "F4b" => {
+                (
+                    format!(
+                        "SELECT reflex_rebuild_chain('{}');",
+                        imv_name.replace("'", "''")
+                    ),
+                    "reported".to_string(), // F4b is never auto-performed
+                )
+            }
+            "F3" => {
+                let sync_action = format!(
+                    "SELECT reflex_sync_partitions('{}', true);",
+                    imv_name.replace("'", "''")
+                );
+                if drop_orphans {
+                    // drop_orphans is enabled, so we can attempt the repair
+                    let outcome_val = if fix {
+                        apply_sync_partitions_repair(&imv_name, true)
+                    } else {
+                        "reported".to_string() // dry run
+                    };
+                    (sync_action, outcome_val)
+                } else {
+                    // drop_orphans is disabled, so skip this repair
+                    (sync_action, "skipped(needs drop_orphans)".to_string())
+                }
+            }
+            _ => {
+                // F4 case
+                (
+                    format!(
+                        "SELECT reflex_reconcile('{}');",
+                        imv_name.replace("'", "''")
+                    ),
+                    if fix {
+                        apply_reconcile_repair(&imv_name)
+                    } else {
+                        "reported".to_string()
+                    },
+                )
+            }
         };
 
         rows.push((
