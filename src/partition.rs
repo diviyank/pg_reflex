@@ -1834,6 +1834,77 @@ pub(crate) fn execute_partition_swap_for_child(
     client
         .update(&detach_old_tgt, None, &[])
         .map_err(|e| format!("detach old tgt: {}", e))?;
+
+    // F3 heal: before attaching swap_tgt, check if a confirmed orphan with the same
+    // bounds exists and drop it. A confirmed orphan is an existing target child whose
+    // bounds match the incoming swap target's bounds but which maps to NO live source
+    // partition (i.e. not in the expected target set).
+    {
+        // Query registry to get partition columns and source list
+        let reg_row = client
+            .select(
+                "SELECT partition_columns, depends_on FROM public.__reflex_ivm_reference WHERE name = $1",
+                Some(1),
+                &[unsafe {
+                    DatumWithOid::new(view_name.to_string(), PgBuiltInOids::TEXTOID.oid().value())
+                }],
+            )
+            .ok()
+            .and_then(|mut it| it.next());
+
+        if let Some(row) = reg_row {
+            let part_cols: Vec<String> = row
+                .get_by_name::<Vec<String>, _>("partition_columns")
+                .unwrap_or(None)
+                .unwrap_or_default();
+            let sources: Vec<String> = row
+                .get_by_name::<Vec<String>, _>("depends_on")
+                .unwrap_or(None)
+                .unwrap_or_default();
+
+            // Only attempt orphan drop if this is a partitioned IMV
+            if !part_cols.is_empty() {
+                // Resolve anchor source
+                if let Ok(anchor) = resolve_anchor_source(client, &part_cols[0], &sources) {
+                    // Build expected target set from live source tree
+                    let full_nodes = list_partition_tree(client, &anchor);
+                    let src_expected_tgt: std::collections::HashSet<String> = full_nodes
+                        .iter()
+                        .filter(|n| n.sub_strategy.is_none()) // Only leaf sources
+                        .map(|n| target_child_name(view_name, &n.bare_name))
+                        .collect();
+
+                    // List target parent's children and find any with matching bounds
+                    let tgt_children = list_partition_children(client, &tgt_parent);
+                    for child in &tgt_children {
+                        // Skip the expected target we're about to attach
+                        if child.bare_name == tgt_child_bare {
+                            continue;
+                        }
+                        // Check if this child has the same bounds as swap target
+                        let child_bound = read_partition_bound(client, schema, &child.bare_name);
+                        if child_bound == tgt_bound && !child_bound.is_empty() {
+                            // Found a partition with same bounds — is it a confirmed orphan?
+                            if !src_expected_tgt.contains(&child.bare_name) {
+                                // Confirmed orphan: no live source backing it. Drop it before attach.
+                                let drop_orphan = format!(
+                                    "DROP TABLE IF EXISTS \"{}\".\"{}\"",
+                                    schema, child.bare_name
+                                );
+                                let _ = client.update(&drop_orphan, None, &[]);
+                                pgrx::notice!(
+                                    "pg_reflex: dropped confirmed orphan target partition '{}' \
+                                     (bounds matched incoming swap target)",
+                                    child.bare_name
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     client
         .update(&attach_new_tgt, None, &[])
         .map_err(|e| format!("attach new tgt: {}", e))?;

@@ -2703,3 +2703,154 @@ fn f1_failed_drain_records_last_error() {
     ).unwrap().unwrap();
     assert!(err.contains("shape drift"));
 }
+
+/// Safety test: ensure reconcile never drops a live-backed child partition.
+/// This test MUST always pass before and after the fix.
+#[pg_test]
+fn f3_swap_never_drops_live_backed_child() {
+    // 1. Create partitioned source with two partitions
+    Spi::run(
+        "CREATE TABLE f3_safe_src (id BIGINT, region TEXT NOT NULL, amount NUMERIC) \
+         PARTITION BY LIST (region)"
+    ).expect("create partitioned source");
+    Spi::run(
+        "CREATE TABLE f3_safe_src_n PARTITION OF f3_safe_src FOR VALUES IN ('N')"
+    ).expect("partition N");
+    Spi::run(
+        "CREATE TABLE f3_safe_src_s PARTITION OF f3_safe_src FOR VALUES IN ('S')"
+    ).expect("partition S");
+    Spi::run(
+        "INSERT INTO f3_safe_src (id, region, amount) VALUES (1, 'N', 100), (2, 'S', 200)"
+    ).expect("seed");
+
+    // 2. Create partitioned aggregate IMV
+    let create_result = Spi::get_one::<String>(
+        "SELECT create_reflex_ivm( \
+            'f3_safe_v', \
+            'SELECT region, SUM(amount) AS total FROM f3_safe_src GROUP BY region', \
+            NULL, NULL, NULL, NULL, \
+            ARRAY['region'] \
+         )"
+    ).expect("create IMV call").expect("create IMV result");
+    assert!(!create_result.starts_with("ERROR"), "create failed: {}", create_result);
+
+    // 3. Verify both target children exist and have data
+    let n_count_before = Spi::get_one::<i64>(
+        "SELECT COUNT(*) FROM f3_safe_v WHERE region = 'N'"
+    ).expect("q").expect("c");
+    let s_count_before = Spi::get_one::<i64>(
+        "SELECT COUNT(*) FROM f3_safe_v WHERE region = 'S'"
+    ).expect("q").expect("c");
+    assert_eq!(n_count_before, 1, "N partition should have 1 row");
+    assert_eq!(s_count_before, 1, "S partition should have 1 row");
+
+    // 4. Count target children before reconcile
+    let tgt_child_count_before = Spi::get_one::<i64>(
+        "SELECT COUNT(*) FROM pg_inherits i \
+         JOIN pg_class c ON c.oid = i.inhparent \
+         WHERE c.relname = 'f3_safe_v'"
+    ).expect("q").expect("c");
+    assert_eq!(tgt_child_count_before, 2, "should have 2 target children before reconcile");
+
+    // 5. Run reconcile (should not drop any live-backed children)
+    let recon_result = Spi::get_one::<String>(
+        "SELECT reflex_reconcile('f3_safe_v')"
+    ).expect("reconcile call").expect("result");
+    assert_eq!(recon_result, "RECONCILED", "reconcile must succeed");
+
+    // 6. Verify no children were dropped
+    let tgt_child_count_after = Spi::get_one::<i64>(
+        "SELECT COUNT(*) FROM pg_inherits i \
+         JOIN pg_class c ON c.oid = i.inhparent \
+         WHERE c.relname = 'f3_safe_v'"
+    ).expect("q").expect("c");
+    assert_eq!(tgt_child_count_after, 2, "reconcile must preserve live-backed children");
+
+    // 7. Verify data integrity (row counts preserved or repopulated correctly)
+    let n_count_after = Spi::get_one::<i64>(
+        "SELECT COUNT(*) FROM f3_safe_v WHERE region = 'N'"
+    ).expect("q").expect("c");
+    let s_count_after = Spi::get_one::<i64>(
+        "SELECT COUNT(*) FROM f3_safe_v WHERE region = 'S'"
+    ).expect("q").expect("c");
+    assert_eq!(n_count_after, 1, "N partition should still have 1 row after reconcile");
+    assert_eq!(s_count_after, 1, "S partition should still have 1 row after reconcile");
+}
+
+/// Red test: reproduce the orphan-overlap issue and verify it's healed.
+/// Before fix: reconcile aborts with "would overlap partition".
+/// After fix: reconcile succeeds and the partition is repopulated.
+#[pg_test]
+fn f3_swap_heals_overlapping_orphan() {
+    // 1. Create partitioned source with one partition
+    Spi::run(
+        "CREATE TABLE f3_orphan_src (id BIGINT, region TEXT NOT NULL, amount NUMERIC) \
+         PARTITION BY LIST (region)"
+    ).expect("create partitioned source");
+    Spi::run(
+        "CREATE TABLE f3_orphan_src_x PARTITION OF f3_orphan_src FOR VALUES IN ('X')"
+    ).expect("partition X");
+    Spi::run(
+        "INSERT INTO f3_orphan_src (id, region, amount) VALUES (1, 'X', 111)"
+    ).expect("seed");
+
+    // 2. Create partitioned aggregate IMV
+    let create_result = Spi::get_one::<String>(
+        "SELECT create_reflex_ivm( \
+            'f3_orphan_v', \
+            'SELECT region, SUM(amount) AS total FROM f3_orphan_src GROUP BY region', \
+            NULL, NULL, NULL, NULL, \
+            ARRAY['region'] \
+         )"
+    ).expect("create IMV call").expect("create IMV result");
+    assert!(!create_result.starts_with("ERROR"), "create failed: {}", create_result);
+
+    // 3. Verify X partition populated
+    let x_count_before = Spi::get_one::<i64>(
+        "SELECT COUNT(*) FROM f3_orphan_v WHERE region = 'X'"
+    ).expect("q").expect("c");
+    assert_eq!(x_count_before, 1, "X partition should have 1 row");
+
+    // 4. DETACH source partition X with drop_orphans=false (default)
+    //    This leaves the IMV child as an orphan with live bounds
+    Spi::run(
+        "ALTER TABLE f3_orphan_src DETACH PARTITION f3_orphan_src_x"
+    ).expect("detach X");
+    Spi::run("DROP TABLE f3_orphan_src_x").expect("drop X");
+
+    // 5. Re-create the source partition X with fresh data
+    Spi::run(
+        "CREATE TABLE f3_orphan_src_x PARTITION OF f3_orphan_src FOR VALUES IN ('X')"
+    ).expect("recreate partition X");
+    Spi::run(
+        "INSERT INTO f3_orphan_src (id, region, amount) VALUES (2, 'X', 222)"
+    ).expect("seed fresh X data");
+
+    // 6. Attempt reconcile — should now heal the overlapping orphan
+    //    BEFORE fix: aborts with "would overlap partition"
+    //    AFTER fix: succeeds and fills X with fresh data
+    let recon_result = Spi::get_one::<String>(
+        "SELECT reflex_reconcile_partition('f3_orphan_v', 'X')"
+    ).expect("reconcile call").expect("result");
+
+    // Check for success (should not contain error about overlap)
+    // The result will start with "RECONCILED" on success, possibly with partition details
+    assert!(!recon_result.contains("would overlap"),
+        "reconcile must not fail with overlap error (got: {})", recon_result);
+    assert!(recon_result.starts_with("RECONCILED"),
+        "reconcile must succeed (got: {})", recon_result);
+
+    // 7. Verify the partition was repopulated with fresh data
+    let x_count_after = Spi::get_one::<i64>(
+        "SELECT COUNT(*) FROM f3_orphan_v WHERE region = 'X'"
+    ).expect("q").expect("c");
+    // After reconcile, we should have the fresh data from the re-created source
+    // (the old orphan was dropped during swap, new one populated from base_query)
+    assert!(x_count_after >= 1, "X partition should be repopulated after reconcile (got {})", x_count_after);
+
+    // 8. Verify the total value is correct (should be the fresh value 222)
+    let x_total = Spi::get_one::<pgrx::AnyNumeric>(
+        "SELECT total FROM f3_orphan_v WHERE region = 'X'"
+    ).expect("q").expect("v");
+    assert_eq!(x_total.to_string(), "222", "X partition total should be fresh value (222)");
+}
