@@ -7,6 +7,7 @@ use pgrx::PgBuiltInOids;
 pub mod checks_a_catastrophic;
 pub mod checks_b_drift;
 pub mod checks_c_orphan;
+pub mod checks_d_residue;
 pub mod checks_e_barename;
 
 use checks_a_catastrophic::{
@@ -16,6 +17,7 @@ use checks_b_drift::{
     BaseQueryRuns, IntermediateShape, PartitionMirror, PartitionTreeDrift, TargetShape,
 };
 use checks_c_orphan::{DuplicateTriggerFunction, OrphanIntermediate, OrphanScratch, OrphanStaging};
+use checks_d_residue::ArchiveResidue;
 use checks_e_barename::BareNameAmbiguity;
 
 pub enum AuditScope {
@@ -67,6 +69,8 @@ pub struct ImvRow {
     pub aggregations_json: Option<String>,
     pub partition_columns: Option<Vec<String>>,
     pub enabled: bool,
+    pub where_predicate: Option<String>,
+    pub ignored_sources: Option<Vec<String>>,
 }
 
 impl ImvRow {
@@ -119,6 +123,7 @@ fn registry() -> Vec<Box<dyn Check>> {
         Box::new(OrphanStaging),
         Box::new(OrphanScratch),
         Box::new(DuplicateTriggerFunction),
+        Box::new(ArchiveResidue),
         Box::new(BareNameAmbiguity),
     ]
 }
@@ -242,7 +247,8 @@ fn load_imv_rows(client: &SpiClient<'_>, scope: &AuditScope) -> Vec<ImvRow> {
                 .select(
                     "SELECT name, depends_on, COALESCE(refresh_mode, 'IMMEDIATE') AS refresh_mode, \
                             base_query, end_query, aggregations::text AS aggregations_json, \
-                            partition_columns, COALESCE(enabled, TRUE) AS enabled \
+                            partition_columns, COALESCE(enabled, TRUE) AS enabled, \
+                            where_predicate, ignored_sources \
                      FROM public.__reflex_ivm_reference \
                      WHERE COALESCE(enabled, TRUE) = TRUE \
                      ORDER BY graph_depth, name",
@@ -287,6 +293,13 @@ fn load_imv_rows(client: &SpiClient<'_>, scope: &AuditScope) -> Vec<ImvRow> {
                         .get_by_name::<bool, _>("enabled")
                         .unwrap_or(None)
                         .unwrap_or(true),
+                    where_predicate: row
+                        .get_by_name::<&str, _>("where_predicate")
+                        .unwrap_or(None)
+                        .map(|s| s.to_string()),
+                    ignored_sources: row
+                        .get_by_name::<Vec<String>, _>("ignored_sources")
+                        .unwrap_or(None),
                 });
             }
         }
@@ -298,7 +311,8 @@ fn load_imv_rows(client: &SpiClient<'_>, scope: &AuditScope) -> Vec<ImvRow> {
                 .select(
                     "SELECT name, depends_on, COALESCE(refresh_mode, 'IMMEDIATE') AS refresh_mode, \
                             base_query, end_query, aggregations::text AS aggregations_json, \
-                            partition_columns, COALESCE(enabled, TRUE) AS enabled \
+                            partition_columns, COALESCE(enabled, TRUE) AS enabled, \
+                            where_predicate, ignored_sources \
                      FROM public.__reflex_ivm_reference \
                      WHERE name = $1",
                     None,
@@ -342,6 +356,13 @@ fn load_imv_rows(client: &SpiClient<'_>, scope: &AuditScope) -> Vec<ImvRow> {
                         .get_by_name::<bool, _>("enabled")
                         .unwrap_or(None)
                         .unwrap_or(true),
+                    where_predicate: row
+                        .get_by_name::<&str, _>("where_predicate")
+                        .unwrap_or(None)
+                        .map(|s| s.to_string()),
+                    ignored_sources: row
+                        .get_by_name::<Vec<String>, _>("ignored_sources")
+                        .unwrap_or(None),
                 });
             }
         }

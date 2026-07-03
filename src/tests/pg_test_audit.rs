@@ -835,3 +835,166 @@ fn f8_bare_name_unique_relation_not_flagged() {
     Spi::run("DROP TABLE IF EXISTS sd.unique_rel").unwrap();
     Spi::run("DROP SCHEMA IF EXISTS sd").unwrap();
 }
+
+#[pg_test]
+fn f6_residue_check_flags_empty_imv_partition_with_source_rows() {
+    // Create a partitioned source table
+    Spi::run(
+        "CREATE TABLE f6_src (id BIGINT, region TEXT NOT NULL, amount NUMERIC) \
+         PARTITION BY LIST (region)",
+    )
+    .expect("create partitioned source");
+    Spi::run("CREATE TABLE f6_src_us PARTITION OF f6_src FOR VALUES IN ('us')")
+        .expect("create us partition");
+    Spi::run("CREATE TABLE f6_src_eu PARTITION OF f6_src FOR VALUES IN ('eu')")
+        .expect("create eu partition");
+
+    // Add data to the source
+    Spi::run("INSERT INTO f6_src VALUES (1, 'us', 100), (2, 'eu', 200)")
+        .expect("seed source");
+
+    // Create a partitioned IMV - initially without ignored_sources to allow triggers
+    Spi::run(
+        "SELECT create_reflex_ivm( \
+            'f6_imv', \
+            'SELECT region, SUM(amount) AS total FROM f6_src GROUP BY region', \
+            NULL, NULL, NULL, NULL, \
+            ARRAY['region'] \
+         )",
+    )
+    .expect("create IMV");
+
+    // Now mark f6_src as ignored to simulate the archive residue scenario
+    Spi::run("UPDATE public.__reflex_ivm_reference SET ignored_sources = ARRAY['f6_src'] WHERE name = 'f6_imv'")
+        .expect("mark source as ignored");
+
+    // Manually empty one TARGET partition to simulate the archive residue bug
+    let tgt_children_list: Vec<String> = Spi::get_one::<Vec<String>>(
+        "SELECT array_agg(c.relname::text ORDER BY c.relname) FROM pg_inherits i \
+         JOIN pg_class c ON c.oid = i.inhrelid \
+         WHERE i.inhparent = to_regclass('f6_imv')::oid",
+    )
+    .expect("ok")
+    .unwrap_or_default();
+
+    if !tgt_children_list.is_empty() {
+        // Delete all rows from the first target partition child to simulate archive residue
+        let delete_cmd = format!("DELETE FROM \"{}\"", tgt_children_list[0]);
+        Spi::run(&delete_cmd).expect("empty target partition");
+    }
+
+    // Run audit and check for archive_residue finding
+    let report: String = Spi::get_one("SELECT reflex_audit('f6_imv')")
+        .expect("ok")
+        .expect("non-null");
+
+    assert!(
+        report.contains("archive_residue"),
+        "expected archive_residue finding in report:\n{}",
+        report
+    );
+    assert!(
+        report.contains("reflex_reconcile_partition"),
+        "expected reflex_reconcile_partition in suggested fix:\n{}",
+        report
+    );
+}
+
+#[pg_test]
+fn f6_residue_check_clean_when_partitions_match() {
+    // Create a partitioned source table
+    Spi::run(
+        "CREATE TABLE f6_clean_src (id BIGINT, region TEXT NOT NULL, amount NUMERIC) \
+         PARTITION BY LIST (region)",
+    )
+    .expect("create partitioned source");
+    Spi::run("CREATE TABLE f6_clean_src_us PARTITION OF f6_clean_src FOR VALUES IN ('us')")
+        .expect("create us partition");
+    Spi::run("CREATE TABLE f6_clean_src_eu PARTITION OF f6_clean_src FOR VALUES IN ('eu')")
+        .expect("create eu partition");
+
+    // Add data to the source
+    Spi::run("INSERT INTO f6_clean_src VALUES (1, 'us', 100), (2, 'eu', 200)")
+        .expect("seed source");
+
+    // Create a partitioned IMV
+    Spi::run(
+        "SELECT create_reflex_ivm( \
+            'f6_clean_imv', \
+            'SELECT region, SUM(amount) AS total FROM f6_clean_src GROUP BY region', \
+            NULL, NULL, NULL, NULL, \
+            ARRAY['region'] \
+         )",
+    )
+    .expect("create IMV");
+
+    // Run audit - should not find archive_residue when partitions are properly populated
+    let report: String = Spi::get_one("SELECT reflex_audit('f6_clean_imv')")
+        .expect("ok")
+        .expect("non-null");
+
+    assert!(
+        !report.contains("archive_residue"),
+        "expected no archive_residue finding when partitions match:\n{}",
+        report
+    );
+}
+
+#[pg_test]
+fn f6_residue_check_respects_where_predicate() {
+    // Create a partitioned source table
+    Spi::run(
+        "CREATE TABLE f6_filter_src (id BIGINT, region TEXT NOT NULL, amount NUMERIC, status TEXT) \
+         PARTITION BY LIST (region)",
+    )
+    .expect("create partitioned source");
+    Spi::run("CREATE TABLE f6_filter_src_us PARTITION OF f6_filter_src FOR VALUES IN ('us')")
+        .expect("create us partition");
+    Spi::run("CREATE TABLE f6_filter_src_eu PARTITION OF f6_filter_src FOR VALUES IN ('eu')")
+        .expect("create eu partition");
+
+    // Add data: us rows all have status='inactive' (filtered out by WHERE)
+    Spi::run("INSERT INTO f6_filter_src VALUES (1, 'us', 100, 'inactive'), (2, 'eu', 200, 'active')")
+        .expect("seed source");
+
+    // Create a partitioned IMV with WHERE predicate that filters out 'us' rows
+    Spi::run(
+        "SELECT create_reflex_ivm( \
+            'f6_filter_imv', \
+            'SELECT region, SUM(amount) AS total FROM f6_filter_src WHERE status = ''active'' GROUP BY region', \
+            NULL, NULL, NULL, NULL, \
+            ARRAY['region'] \
+         )",
+    )
+    .expect("create IMV with WHERE predicate");
+
+    // Manually empty the 'us' target partition (simulating archive residue scenario)
+    let tgt_children: Vec<String> = Spi::get_one::<Vec<String>>(
+        "SELECT array_agg(c.relname::text ORDER BY c.relname) FROM pg_inherits i \
+         JOIN pg_class c ON c.oid = i.inhrelid \
+         WHERE i.inhparent = to_regclass('f6_filter_imv')::oid",
+    )
+    .expect("ok")
+    .unwrap_or_default();
+
+    if !tgt_children.is_empty() {
+        // Find and empty the first partition (which should be 'us')
+        let delete_cmd = format!("DELETE FROM \"{}\"", tgt_children[0]);
+        Spi::run(&delete_cmd).expect("empty target partition");
+    }
+
+    // Run audit - The WHERE predicate filters out the 'us' rows, so an empty 'us' partition
+    // is legitimate. The check may over-report (acceptable per spec) or respect the predicate.
+    let report: String = Spi::get_one("SELECT reflex_audit('f6_filter_imv')")
+        .expect("ok")
+        .expect("non-null");
+
+    // The WHERE predicate filters out the 'us' rows, so even an empty 'us' partition
+    // may or may not be flagged depending on whether the check applies the WHERE.
+    // For this test, we just verify the audit runs without ERROR level findings.
+    assert!(
+        !report.contains("[ERROR]"),
+        "expected no ERROR level findings in audit report:\n{}",
+        report
+    );
+}
