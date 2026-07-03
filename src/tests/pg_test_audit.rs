@@ -748,3 +748,90 @@ fn test_audit_flags_duplicate_trigger_function() {
         .expect("drop public fn");
     Spi::run("DROP SCHEMA IF EXISTS s_dup CASCADE").expect("drop schema");
 }
+
+#[pg_test]
+fn f8_bare_name_flagged_when_relation_in_two_schemas() {
+    Spi::run("CREATE SCHEMA IF NOT EXISTS sa").unwrap();
+    Spi::run("CREATE SCHEMA IF NOT EXISTS sb").unwrap();
+    Spi::run("CREATE TABLE IF NOT EXISTS sa.dup(x int)").unwrap();
+    Spi::run("CREATE TABLE IF NOT EXISTS sb.dup(x int)").unwrap();
+    Spi::run(
+        "INSERT INTO public.__reflex_ivm_reference (name, graph_depth, depends_on) \
+         VALUES ('m', 0, ARRAY['dup'])",
+    )
+    .unwrap();
+
+    let report: String = Spi::get_one("SELECT reflex_audit()")
+        .expect("query ok")
+        .expect("non-null result");
+
+    assert!(
+        report.contains("[ERROR]") && report.contains("bare_name_ambiguity"),
+        "expected ERROR/bare_name_ambiguity in report:\n{}",
+        report
+    );
+    assert!(
+        report.contains("dup"),
+        "expected bare name 'dup' mentioned in report:\n{}",
+        report
+    );
+
+    // Cleanup
+    Spi::run("DELETE FROM public.__reflex_ivm_reference WHERE name = 'm'").unwrap();
+    Spi::run("DROP TABLE IF EXISTS sa.dup").unwrap();
+    Spi::run("DROP TABLE IF EXISTS sb.dup").unwrap();
+    Spi::run("DROP SCHEMA IF EXISTS sa").unwrap();
+    Spi::run("DROP SCHEMA IF EXISTS sb").unwrap();
+}
+
+#[pg_test]
+fn f8_qualified_name_not_flagged() {
+    Spi::run("CREATE SCHEMA IF NOT EXISTS sc").unwrap();
+    Spi::run("CREATE TABLE IF NOT EXISTS sc.qual_test(x int)").unwrap();
+    Spi::run(
+        "INSERT INTO public.__reflex_ivm_reference (name, graph_depth, depends_on) \
+         VALUES ('m_qual', 0, ARRAY['sc.qual_test'])",
+    )
+    .unwrap();
+
+    let report: String = Spi::get_one("SELECT reflex_audit()")
+        .expect("query ok")
+        .expect("non-null result");
+
+    assert!(
+        !report.contains("bare_name_ambiguity"),
+        "expected no bare_name_ambiguity finding for qualified name:\n{}",
+        report
+    );
+
+    // Cleanup
+    Spi::run("DELETE FROM public.__reflex_ivm_reference WHERE name = 'm_qual'").unwrap();
+    Spi::run("DROP TABLE IF EXISTS sc.qual_test").unwrap();
+    Spi::run("DROP SCHEMA IF EXISTS sc").unwrap();
+}
+
+#[pg_test]
+fn f8_bare_name_unique_relation_not_flagged() {
+    Spi::run("CREATE SCHEMA IF NOT EXISTS sd").unwrap();
+    Spi::run("CREATE TABLE IF NOT EXISTS sd.unique_rel(x int)").unwrap();
+    Spi::run(
+        "INSERT INTO public.__reflex_ivm_reference (name, graph_depth, depends_on) \
+         VALUES ('m_unique', 0, ARRAY['unique_rel'])",
+    )
+    .unwrap();
+
+    let report: String = Spi::get_one("SELECT reflex_audit()")
+        .expect("query ok")
+        .expect("non-null result");
+
+    assert!(
+        !report.contains("bare_name_ambiguity"),
+        "expected no bare_name_ambiguity finding when bare name exists in only one schema:\n{}",
+        report
+    );
+
+    // Cleanup
+    Spi::run("DELETE FROM public.__reflex_ivm_reference WHERE name = 'm_unique'").unwrap();
+    Spi::run("DROP TABLE IF EXISTS sd.unique_rel").unwrap();
+    Spi::run("DROP SCHEMA IF EXISTS sd").unwrap();
+}
