@@ -273,3 +273,98 @@ fn test_scheduled_reconcile_skips_fresh_imvs() {
     ).expect("q").expect("v");
     assert_eq!(scanned, 0, "fresh IMV should not be reconciled");
 }
+
+/// F5 diagnosis: reflex_rebuild_imv on a partitioned IMV whose authoritative
+/// source is in ignore_sources. This tests whether the partition stays empty
+/// (F6 interaction) or fills (unexpected skip-existing-children bug).
+///
+/// Repro scenario:
+/// 1. Create a partitioned anchor source A
+/// 2. Create an authoritative source B (non-partitioned)
+/// 3. Create a partitioned IMV joining A and B, partitioned by A's key,
+///    with B in ignore_sources (B not incrementally maintained)
+/// 4. Populate B for a specific key while the IMV partition for that key is
+///    left empty (bypass normal maintenance)
+/// 5. Call reflex_rebuild_imv and observe whether the partition fills
+///
+/// Expected (Branch A, F6 interaction): Partition stays empty because B is the
+/// authoritative source but is in ignore_sources, so rebuild anchors on A and
+/// never re-derives keys fed only by B.
+#[pg_test]
+fn f5_rebuild_imv_ignore_sources_anchor_repro() {
+    // 1. Create a partitioned anchor source (A) partitioned by region
+    Spi::run(
+        "CREATE TABLE f5_anchor (id BIGINT NOT NULL, region TEXT NOT NULL, val INT) \
+         PARTITION BY LIST (region)"
+    ).expect("create anchor");
+
+    Spi::run(
+        "CREATE TABLE f5_anchor_n PARTITION OF f5_anchor FOR VALUES IN ('NORTH')"
+    ).expect("create anchor north");
+
+    Spi::run(
+        "CREATE TABLE f5_anchor_s PARTITION OF f5_anchor FOR VALUES IN ('SOUTH')"
+    ).expect("create anchor south");
+
+    // 2. Create an authoritative source B (non-partitioned)
+    Spi::run(
+        "CREATE TABLE f5_auth (auth_id BIGINT NOT NULL, region TEXT NOT NULL, auth_val INT)"
+    ).expect("create auth");
+
+    // 3. Seed anchor with one region, but auth with both
+    Spi::run(
+        "INSERT INTO f5_anchor (id, region, val) VALUES (1, 'NORTH', 100)"
+    ).expect("seed anchor");
+
+    Spi::run(
+        "INSERT INTO f5_auth (auth_id, region, auth_val) VALUES \
+         (10, 'NORTH', 1000), \
+         (20, 'SOUTH', 2000)"
+    ).expect("seed auth");
+
+    // 4. Create a partitioned IMV joining A and B, partitioned by region,
+    //    with B in ignore_sources (so B is NOT incrementally maintained)
+    let create_result = Spi::get_one::<String>(
+        "SELECT create_reflex_ivm( \
+            'f5_view', \
+            'SELECT a.region, COUNT(*) AS cnt FROM f5_anchor a JOIN f5_auth b ON a.region = b.region GROUP BY a.region', \
+            NULL, NULL, NULL, 'f5_auth', \
+            ARRAY['region'] \
+         )"
+    ).expect("create IMV call").expect("create IMV result");
+
+    assert!(
+        !create_result.starts_with("ERROR"),
+        "create IMV failed: {create_result}"
+    );
+
+    // 5. Verify that partition for SOUTH is empty (because anchor has no SOUTH rows)
+    let south_count_before = Spi::get_one::<i64>(
+        "SELECT COUNT(*) FROM f5_view WHERE region = 'SOUTH'"
+    ).expect("query before").expect("count before");
+    assert_eq!(south_count_before, 0, "SOUTH partition should start empty");
+
+    // 6. Call reflex_rebuild_imv and capture result
+    let rebuild_result = Spi::get_one::<String>(
+        "SELECT reflex_rebuild_imv('f5_view')"
+    ).expect("rebuild call").expect("rebuild result");
+
+    pgrx::notice!("pg_test: rebuild returned: {}", rebuild_result);
+
+    // 7. Check if SOUTH partition still empty or got filled
+    //    EXPECTED (Branch A): stays empty because f5_auth is in ignore_sources,
+    //    so rebuild only touches anchor's children (NORTH), never fetches
+    //    new rows from f5_auth for SOUTH.
+    let south_count_after = Spi::get_one::<i64>(
+        "SELECT COUNT(*) FROM f5_view WHERE region = 'SOUTH'"
+    ).expect("query after").expect("count after");
+
+    // Assert the OBSERVED behavior: partition stays empty
+    // This is the durable regression lock documenting F6 interaction.
+    assert_eq!(
+        south_count_after, 0,
+        "F5 diagnosis: SOUTH partition stayed empty after rebuild (F6 interaction: \
+         ignore_sources source is not the reconcile anchor, so rebuild never re-derives \
+         keys fed only by that source)"
+    );
+}

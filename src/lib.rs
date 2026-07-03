@@ -651,6 +651,17 @@ fn refresh_imv_depending_on(source: &str) -> &'static str {
 }
 
 /// Rebuild an IMV from scratch to fix drift. Alias for reflex_reconcile.
+/// This function is anchor-scoped: for unpartitioned IMVs, it rebuilds the entire
+/// target; for partitioned IMVs, it re-derives every child partition of the primary
+/// (anchor) source unconditionally, even if structurally unchanged.
+///
+/// IMPORTANT: Partitions fed only by sources listed in `ignore_sources` (authoritative
+/// sources that are not incrementally maintained) will NOT be filled by this function.
+/// When the anchor source has no rows for a partition key, but an authoritative
+/// ignore_sources table does (archive residue scenario), the partition stays empty.
+/// For such cases, use `reflex_reconcile_partition(view, partition_keys)` to
+/// force-fill the partition from all its authoritative sources, or perform a
+/// full chain drop+recreate. See docs/untreated.md § F6 for details.
 #[pg_extern]
 fn reflex_rebuild_imv(view_name: &str) -> &'static str {
     reconcile::reflex_reconcile(view_name)
