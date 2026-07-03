@@ -281,6 +281,70 @@ fn reflex_ivm_histogram(
     TableIterator::new(row.into_iter().collect::<Vec<_>>())
 }
 
+/// One row of partition pending status. Returned by `reflex_partition_pending_status`.
+type PartitionPendingRow = (
+    String,                             // source_root
+    pgrx::datum::TimestampWithTimeZone, // enqueued_at
+    i64,                                // age_seconds
+    i32,                                // attempts
+    Option<String>,                     // last_error
+);
+
+/// Per-partition pending work: age, attempt count, and last error message.
+#[pg_extern]
+#[allow(clippy::type_complexity)]
+fn reflex_partition_pending_status() -> TableIterator<
+    'static,
+    (
+        name!(source_root, String),
+        name!(enqueued_at, pgrx::datum::TimestampWithTimeZone),
+        name!(age_seconds, i64),
+        name!(attempts, i32),
+        name!(last_error, Option<String>),
+    ),
+> {
+    let rows: Vec<PartitionPendingRow> = Spi::connect(|client| {
+        let mut out = Vec::new();
+        let rs = client
+            .select(
+                "SELECT source_root, enqueued_at, \
+                        extract(epoch FROM now() - enqueued_at)::int8 AS age_seconds, \
+                        attempts, last_error \
+                 FROM public.__reflex_partition_pending ORDER BY enqueued_at",
+                None,
+                &[],
+            )
+            .unwrap_or_report();
+        for row in rs {
+            let source_root: String = row
+                .get_by_name::<&str, _>("source_root")
+                .unwrap_or(None)
+                .unwrap_or("")
+                .to_string();
+            let enqueued_at = row
+                .get_by_name::<pgrx::datum::TimestampWithTimeZone, _>("enqueued_at")
+                .unwrap()
+                .unwrap();
+            let age_seconds = row
+                .get_by_name::<i64, _>("age_seconds")
+                .unwrap_or(None)
+                .unwrap_or(0);
+            let attempts = row
+                .get_by_name::<i32, _>("attempts")
+                .unwrap_or(None)
+                .unwrap_or(0);
+            let last_error = row
+                .get_by_name::<&str, _>("last_error")
+                .unwrap_or(None)
+                .map(|s| s.to_string());
+            out.push((source_root, enqueued_at, age_seconds, attempts, last_error));
+        }
+        out
+    });
+
+    TableIterator::new(rows)
+}
+
 /// Returns the `EXPLAIN` statement for what the next flush would execute for a
 /// given IMV, ready to run. Useful for diagnosing plan regressions without
 /// firing a flush.

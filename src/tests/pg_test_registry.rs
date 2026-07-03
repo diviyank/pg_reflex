@@ -136,3 +136,21 @@ fn f4_status_reports_known_stale() {
     let stale = Spi::get_one::<bool>("SELECT known_stale FROM reflex_ivm_status() WHERE name='s.imv2'").unwrap().unwrap();
     assert!(stale);
 }
+
+#[pg_test]
+fn f2_pending_status_reports_rows() {
+    Spi::run(
+        "INSERT INTO public.__reflex_partition_pending (source_root, attempts) VALUES ('t.stuck', 2)",
+    ).unwrap();
+    let (root, attempts) = Spi::get_two::<String, i32>(
+        "SELECT source_root, attempts FROM reflex_partition_pending_status() WHERE source_root='t.stuck'",
+    ).unwrap();
+    assert_eq!(root.as_deref(), Some("t.stuck"));
+    assert_eq!(attempts, Some(2));
+}
+
+#[pg_test]
+fn f2_pending_status_empty_when_drained() {
+    let n = Spi::get_one::<i64>("SELECT count(*) FROM reflex_partition_pending_status() WHERE source_root='f2.unique.root.abc123'").unwrap().unwrap();
+    assert_eq!(n, 0);
+}
