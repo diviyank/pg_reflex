@@ -491,3 +491,13 @@ fn f7_detect_divergence_flags_missing_and_oid_change() {
     d.sort();
     assert_eq!(d, vec!["b".to_string(), "c".to_string()]); // b oid changed, c new
 }
+
+#[test]
+fn f7_detect_divergence_flags_missing_from_live() {
+    // Test case: snapshot has entries absent from live
+    let snap = vec![("a".to_string(), 1u32), ("z".to_string(), 5u32)];
+    let live = vec![("a".to_string(), 1u32)];
+    let mut d = detect_snapshot_live_divergence(&snap, &live);
+    d.sort();
+    assert_eq!(d, vec!["z".to_string()]); // z missing from live
+}

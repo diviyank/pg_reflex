@@ -1865,42 +1865,52 @@ pub(crate) fn execute_partition_swap_for_child(
             // Only attempt orphan drop if this is a partitioned IMV
             if !part_cols.is_empty() {
                 // Resolve anchor source
-                if let Ok(anchor) = resolve_anchor_source(client, &part_cols[0], &sources) {
-                    // Build expected target set from live source tree
-                    let full_nodes = list_partition_tree(client, &anchor);
-                    let src_expected_tgt: std::collections::HashSet<String> = full_nodes
-                        .iter()
-                        .filter(|n| n.sub_strategy.is_none()) // Only leaf sources
-                        .map(|n| target_child_name(view_name, &n.bare_name))
-                        .collect();
+                match resolve_anchor_source(client, &part_cols[0], &sources) {
+                    Ok(anchor) => {
+                        // Build expected target set from live source tree
+                        let full_nodes = list_partition_tree(client, &anchor);
+                        let src_expected_tgt: std::collections::HashSet<String> = full_nodes
+                            .iter()
+                            .filter(|n| n.sub_strategy.is_none()) // Only leaf sources
+                            .map(|n| target_child_name(view_name, &n.bare_name))
+                            .collect();
 
-                    // List target parent's children and find any with matching bounds
-                    let tgt_children = list_partition_children(client, &tgt_parent);
-                    for child in &tgt_children {
-                        // Skip the expected target we're about to attach
-                        if child.bare_name == tgt_child_bare {
-                            continue;
-                        }
-                        // Check if this child has the same bounds as swap target
-                        let child_bound = read_partition_bound(client, schema, &child.bare_name);
-                        if child_bound == tgt_bound && !child_bound.is_empty() {
-                            // Found a partition with same bounds — is it a confirmed orphan?
-                            if !src_expected_tgt.contains(&child.bare_name) {
-                                // Confirmed orphan: no live source backing it. Drop it before attach.
-                                let drop_orphan = format!(
-                                    "DROP TABLE IF EXISTS \"{}\".\"{}\"",
-                                    schema, child.bare_name
-                                );
-                                client
-                                    .update(&drop_orphan, None, &[])
-                                    .map_err(|e| format!("drop orphan: {}", e))?;
-                                pgrx::notice!(
-                                    "pg_reflex: dropped confirmed orphan target partition '{}' \
-                                     (bounds matched incoming swap target)",
-                                    child.bare_name
-                                );
+                        // List target parent's children and find any with matching bounds
+                        let tgt_children = list_partition_children(client, &tgt_parent);
+                        for child in &tgt_children {
+                            // Skip the expected target we're about to attach
+                            if child.bare_name == tgt_child_bare {
+                                continue;
+                            }
+                            // Check if this child has the same bounds as swap target
+                            let child_bound =
+                                read_partition_bound(client, schema, &child.bare_name);
+                            if child_bound == tgt_bound && !child_bound.is_empty() {
+                                // Found a partition with same bounds — is it a confirmed orphan?
+                                if !src_expected_tgt.contains(&child.bare_name) {
+                                    // Confirmed orphan: no live source backing it. Drop it before attach.
+                                    let drop_orphan = format!(
+                                        "DROP TABLE IF EXISTS \"{}\".\"{}\"",
+                                        schema, child.bare_name
+                                    );
+                                    client
+                                        .update(&drop_orphan, None, &[])
+                                        .map_err(|e| format!("drop orphan: {}", e))?;
+                                    pgrx::notice!(
+                                        "pg_reflex: dropped confirmed orphan target partition '{}' \
+                                         (bounds matched incoming swap target)",
+                                        child.bare_name
+                                    );
+                                }
                             }
                         }
+                    }
+                    Err(e) => {
+                        // Anchor source could not be resolved; orphan check is skipped
+                        pgrx::notice!(
+                            "pg_reflex: orphan-overlap check skipped for IMV '{}' — anchor source resolution failed: {}",
+                            view_name, e
+                        );
                     }
                 }
             }

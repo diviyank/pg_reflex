@@ -77,9 +77,9 @@ fn f10_doctor_fix_respects_drop_orphans_gate() {
         None,
     );
 
-    // Mark it as stale with a reason containing "overlap" (F3 trigger)
+    // Mark it as stale with a realistic overlap error (F3 trigger)
     Spi::run(
-        "UPDATE public.__reflex_ivm_reference SET known_stale = TRUE, stale_reason = 'partition overlap detected' WHERE name = 'f10_test_imv'"
+        "UPDATE public.__reflex_ivm_reference SET known_stale = TRUE, stale_reason = 'ERROR:  partition \"x\" would overlap partition \"y\"' WHERE name = 'f10_test_imv'"
     ).unwrap();
 
     // Test 1: Call with drop_orphans=FALSE - should be gated
@@ -160,7 +160,9 @@ fn f10_doctor_fix_respects_drop_orphans_gate() {
 #[pg_test]
 fn f10_doctor_never_runs_chain_rebuild_without_escalation() {
     // Represent a decomposed known_stale IMV that maps to F4b.
-    // For now, verify that reflex_rebuild_chain is reported but not executed.
+    // Verify that reflex_rebuild_chain is reported but not executed.
+    // A decomposed chain is detected structurally: if there exist registered IMVs
+    // whose names begin with <this_imv's_bare_name>__ (the sub-IMV convention).
 
     // Create a simple IMV
     Spi::run("CREATE TABLE f10_chain_src (id INT PRIMARY KEY, val INT)").unwrap();
@@ -174,22 +176,63 @@ fn f10_doctor_never_runs_chain_rebuild_without_escalation() {
         None,
     );
 
-    // Mark as stale (simulating F4b condition)
-    Spi::run("UPDATE public.__reflex_ivm_reference SET known_stale = TRUE, stale_reason = 'decomposed-non-convergence' WHERE name = 'f10_chain_imv'").unwrap();
+    // Register a sub-IMV to simulate a decomposed chain (e.g., from CTE decomposition)
+    // The naming convention is <root_bare>__<something>, e.g. f10_chain_imv__cte_x
+    Spi::run(
+        "INSERT INTO public.__reflex_ivm_reference (name, graph_depth, known_stale, stale_reason) \
+         VALUES ('f10_chain_imv__cte_x', 1, FALSE, NULL)"
+    ).unwrap();
+
+    // Mark the root IMV as stale with a realistic reason
+    Spi::run(
+        "UPDATE public.__reflex_ivm_reference SET known_stale = TRUE, stale_reason = 'missing intermediate bound for child x' WHERE name = 'f10_chain_imv'"
+    ).unwrap();
 
     // Call reflex_doctor with fix => TRUE
-    let n = Spi::get_one::<i64>(
-        "SELECT count(*) FROM reflex_doctor(NULL, TRUE) WHERE object = 'f10_chain_imv'"
-    ).unwrap().unwrap_or(0);
+    let result_rows: Vec<(String, String, String)> = Spi::connect(|client| {
+        let mut result = Vec::new();
+        let rs = client.select(
+            "SELECT check_id, object, outcome FROM reflex_doctor(NULL, TRUE) WHERE object = 'f10_chain_imv'",
+            None,
+            &[]
+        ).unwrap_or_report();
+        for row in rs {
+            let check_id: String = row
+                .get_by_name::<&str, _>("check_id")
+                .unwrap_or(None)
+                .unwrap_or("")
+                .to_string();
+            let object: String = row
+                .get_by_name::<&str, _>("object")
+                .unwrap_or(None)
+                .unwrap_or("")
+                .to_string();
+            let outcome: String = row
+                .get_by_name::<&str, _>("outcome")
+                .unwrap_or(None)
+                .unwrap_or("")
+                .to_string();
+            result.push((check_id, object, outcome));
+        }
+        result
+    });
 
-    // Should have a row for the chain IMV
-    assert!(n >= 1, "should return row for the chain IMV");
+    assert!(!result_rows.is_empty(), "should return row for the chain IMV");
+    let (check_id, obj, outcome) = &result_rows[0];
+    assert_eq!(check_id, "F4b", "should be classified as F4b (structural decomposed chain detection)");
+    assert_eq!(obj, "f10_chain_imv", "object should be the root IMV");
+    assert_eq!(outcome, "reported", "F4b outcome should be 'reported' (never auto-performed)");
 
-    // Verify the chain hasn't been rebuilt - check that registry still contains the IMV
-    let still_exists = Spi::get_one::<i64>(
+    // Verify the chain hasn't been rebuilt - check that both root and sub-IMV still exist
+    let root_exists = Spi::get_one::<i64>(
         "SELECT count(*) FROM public.__reflex_ivm_reference WHERE name = 'f10_chain_imv'"
     ).unwrap().unwrap();
-    assert_eq!(still_exists, 1, "chain IMV should still exist (not rebuilt)");
+    assert_eq!(root_exists, 1, "root chain IMV should still exist (not rebuilt)");
+
+    let sub_exists = Spi::get_one::<i64>(
+        "SELECT count(*) FROM public.__reflex_ivm_reference WHERE name = 'f10_chain_imv__cte_x'"
+    ).unwrap().unwrap();
+    assert_eq!(sub_exists, 1, "sub-IMV should still exist");
 }
 
 #[pg_test]

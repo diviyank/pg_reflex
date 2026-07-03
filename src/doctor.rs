@@ -247,20 +247,35 @@ fn detect_known_stale_imvs(
     });
 
     for (imv_name, _graph_depth, stale_reason) in stale_rows {
-        let check_id = if stale_reason
-            .as_deref()
-            .map(|r| r.to_lowercase().contains("decomposed"))
-            == Some(true)
-        {
-            "F4b".to_string()
-        } else if stale_reason
-            .as_deref()
-            .map(|r| r.to_lowercase().contains("overlap"))
-            == Some(true)
-        {
-            "F3".to_string()
-        } else {
-            "F4".to_string()
+        // Determine check_id:
+        // (1) If this IMV has registered sub-IMVs (decomposed chain), it's F4b
+        // (2) Else if stale_reason contains "overlap" → F3
+        // (3) Else → F4
+        let check_id = {
+            // Check for decomposed chain: sub-IMVs named with the pattern <bare_name>__*
+            let (_, bare_imv) = crate::query_decomposer::canonical_source(&imv_name);
+            let pattern = format!("{}__", bare_imv);
+            // Escape single quotes for SQL string literal
+            let escaped_pattern = pattern.replace("'", "''");
+
+            let is_decomposed_chain = Spi::get_one::<bool>(&format!(
+                "SELECT EXISTS(SELECT 1 FROM public.__reflex_ivm_reference WHERE name LIKE '{}%')",
+                escaped_pattern
+            ))
+            .unwrap_or(None)
+            .unwrap_or(false);
+
+            if is_decomposed_chain {
+                "F4b".to_string()
+            } else if stale_reason
+                .as_deref()
+                .map(|r| r.to_lowercase().contains("overlap"))
+                == Some(true)
+            {
+                "F3".to_string()
+            } else {
+                "F4".to_string()
+            }
         };
 
         let (action, outcome) = match check_id.as_str() {
