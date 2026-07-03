@@ -278,6 +278,20 @@ extension_sql!(
         RETURN NULL;
     END;
     $REFLEX$;
+
+    -- Helper for reflex_doctor repairs: execute SQL in a subtransaction and return outcome.
+    -- On success: returns 'fixed'. On exception: returns 'failed:' || error message.
+    -- The EXCEPTION block acts as a savepoint: failing repairs rollback only themselves,
+    -- not the outer reflex_doctor transaction, ensuring isolation.
+    CREATE OR REPLACE FUNCTION public.__reflex_doctor_try_repair(_sql TEXT)
+    RETURNS TEXT LANGUAGE plpgsql AS $fn$
+    BEGIN
+        EXECUTE _sql;
+        RETURN 'fixed';
+    EXCEPTION WHEN OTHERS THEN
+        RETURN 'failed:' || left(SQLERRM, 400);
+    END;
+    $fn$;
     "#,
     name = "pg_reflex_init",
 );

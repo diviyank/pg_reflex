@@ -151,37 +151,58 @@ fn detect_pending_queue_issues(
 
 /// Apply a partition flush repair in a subtransaction
 fn apply_partition_flush_repair(source_root: &str) -> String {
-    // Run the repair in a subtransaction so one failure doesn't abort the report
-    match Spi::get_one::<String>(&format!(
-        "DO $do$ BEGIN PERFORM public.reflex_flush_partition_source('{}'); EXCEPTION WHEN OTHERS THEN NULL; END $do$;",
+    // Build the repair SQL with proper escaping
+    let repair_sql = format!(
+        "SELECT public.reflex_flush_partition_source('{}')",
         source_root.replace("'", "''")
-    )) {
-        Ok(Some(_)) | Ok(None) => "fixed".to_string(),
+    );
+    // Call the helper function, which executes the repair and returns 'fixed' or 'failed:...'
+    let helper_call = format!(
+        "SELECT public.__reflex_doctor_try_repair('{}')",
+        repair_sql.replace("'", "''")
+    );
+    match Spi::get_one::<String>(&helper_call) {
+        Ok(Some(outcome)) => outcome,
+        Ok(None) => "failed:no result".to_string(),
         Err(e) => format!("failed:{}", e),
     }
 }
 
 /// Apply a reconcile repair in a subtransaction
 fn apply_reconcile_repair(imv_name: &str) -> String {
-    // Run the repair in a subtransaction so one failure doesn't abort the report
-    match Spi::get_one::<String>(&format!(
-        "DO $do$ BEGIN PERFORM public.reflex_reconcile('{}'); EXCEPTION WHEN OTHERS THEN NULL; END $do$;",
+    // Build the repair SQL with proper escaping
+    let repair_sql = format!(
+        "SELECT public.reflex_reconcile('{}')",
         imv_name.replace("'", "''")
-    )) {
-        Ok(Some(_)) | Ok(None) => "fixed".to_string(),
+    );
+    // Call the helper function, which executes the repair and returns 'fixed' or 'failed:...'
+    let helper_call = format!(
+        "SELECT public.__reflex_doctor_try_repair('{}')",
+        repair_sql.replace("'", "''")
+    );
+    match Spi::get_one::<String>(&helper_call) {
+        Ok(Some(outcome)) => outcome,
+        Ok(None) => "failed:no result".to_string(),
         Err(e) => format!("failed:{}", e),
     }
 }
 
 /// Apply a sync partitions repair in a subtransaction
 fn apply_sync_partitions_repair(imv_name: &str, drop_orphans: bool) -> String {
-    // Run the repair in a subtransaction so one failure doesn't abort the report
-    match Spi::get_one::<String>(&format!(
-        "DO $do$ BEGIN PERFORM public.reflex_sync_partitions('{}', {}); EXCEPTION WHEN OTHERS THEN NULL; END $do$;",
+    // Build the repair SQL with proper escaping
+    let repair_sql = format!(
+        "SELECT public.reflex_sync_partitions('{}', {})",
         imv_name.replace("'", "''"),
         drop_orphans
-    )) {
-        Ok(Some(_)) | Ok(None) => "fixed".to_string(),
+    );
+    // Call the helper function, which executes the repair and returns 'fixed' or 'failed:...'
+    let helper_call = format!(
+        "SELECT public.__reflex_doctor_try_repair('{}')",
+        repair_sql.replace("'", "''")
+    );
+    match Spi::get_one::<String>(&helper_call) {
+        Ok(Some(outcome)) => outcome,
+        Ok(None) => "failed:no result".to_string(),
         Err(e) => format!("failed:{}", e),
     }
 }

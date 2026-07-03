@@ -191,3 +191,108 @@ fn f10_doctor_never_runs_chain_rebuild_without_escalation() {
     ).unwrap().unwrap();
     assert_eq!(still_exists, 1, "chain IMV should still exist (not rebuilt)");
 }
+
+#[pg_test]
+fn f10_doctor_fix_records_failed_and_continues() {
+    // Seed TWO F4 known_stale IMVs: one that can reconcile, one that will fail (orphaned).
+    // Call reflex_doctor(fix => TRUE) and verify:
+    // 1. The failing repair's outcome STARTS WITH 'failed:' (not 'fixed')
+    // 2. The report still contains the non-failing IMV (proving isolation)
+
+    // Create a valid source and IMV
+    Spi::run("CREATE TABLE f10_valid_src (id INT PRIMARY KEY, val INT)").unwrap();
+    Spi::run("INSERT INTO f10_valid_src VALUES (1, 100)").unwrap();
+    crate::create_reflex_ivm(
+        "f10_valid_imv",
+        "SELECT id, val FROM f10_valid_src",
+        Some("id"),
+        None,
+        Some("IMMEDIATE"),
+        None,
+    );
+
+    // Create an orphaned registry entry (with a target name that doesn't exist as a table)
+    Spi::run(
+        "INSERT INTO public.__reflex_ivm_reference (name, graph_depth, known_stale, stale_reason) \
+         VALUES ('public.f10_orphaned_imv', 0, TRUE, 'missing target table')"
+    ).unwrap();
+
+    // Mark the valid IMV as known_stale too (for F4)
+    Spi::run(
+        "UPDATE public.__reflex_ivm_reference SET known_stale = TRUE, stale_reason = 'test stale' WHERE name = 'f10_valid_imv'"
+    ).unwrap();
+
+    // Call reflex_doctor(fix => TRUE)
+    let result_rows: Vec<(String, String, String)> = Spi::connect(|client| {
+        let mut result = Vec::new();
+        let rs = client.select(
+            "SELECT object, outcome, check_id FROM reflex_doctor(NULL, TRUE) WHERE check_id = 'F4'",
+            None,
+            &[]
+        ).unwrap_or_report();
+        for row in rs {
+            let object: String = row
+                .get_by_name::<&str, _>("object")
+                .unwrap_or(None)
+                .unwrap_or("")
+                .to_string();
+            let outcome: String = row
+                .get_by_name::<&str, _>("outcome")
+                .unwrap_or(None)
+                .unwrap_or("")
+                .to_string();
+            let check_id: String = row
+                .get_by_name::<&str, _>("check_id")
+                .unwrap_or(None)
+                .unwrap_or("")
+                .to_string();
+            result.push((object, outcome, check_id));
+        }
+        result
+    });
+
+    // Should have at least 2 rows: valid and orphaned IMVs
+    assert!(
+        result_rows.len() >= 2,
+        "should have at least 2 F4 rows, got {}",
+        result_rows.len()
+    );
+
+    // Find the orphaned IMV outcome
+    let orphaned_outcome = result_rows
+        .iter()
+        .find(|(obj, _, _)| obj == "public.f10_orphaned_imv")
+        .map(|(_, outcome, _)| outcome.clone());
+
+    assert!(
+        orphaned_outcome.is_some(),
+        "orphaned IMV should be in the report"
+    );
+
+    let orphaned_outcome = orphaned_outcome.unwrap();
+    assert!(
+        orphaned_outcome.starts_with("failed:"),
+        "orphaned IMV repair should fail and start with 'failed:', got: {}",
+        orphaned_outcome
+    );
+
+    // Find the valid IMV outcome
+    let valid_outcome = result_rows
+        .iter()
+        .find(|(obj, _, _)| obj == "f10_valid_imv")
+        .map(|(_, outcome, _)| outcome.clone());
+
+    assert!(
+        valid_outcome.is_some(),
+        "valid IMV should be in the report (proving isolation: the failure didn't abort)"
+    );
+
+    // The valid IMV should either be fixed or also failed (we don't enforce success,
+    // just that both are in the report)
+    let valid_outcome = valid_outcome.unwrap();
+    assert!(
+        valid_outcome == "fixed" || valid_outcome.starts_with("failed:"),
+        "valid IMV outcome should be 'fixed' or 'failed:...', got: {}",
+        valid_outcome
+    );
+}
