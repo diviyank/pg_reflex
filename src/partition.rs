@@ -2526,6 +2526,9 @@ pub(crate) fn reflex_flush_partitions_impl(only: Option<&str>) -> String {
                    UPDATE public.__reflex_partition_pending \
                       SET last_error = left(SQLERRM, 2000) \
                     WHERE source_root = '{root_esc}'; \
+                   UPDATE public.__reflex_ivm_reference \
+                      SET known_stale = TRUE, stale_reason = left(SQLERRM, 2000), stale_since = now() \
+                    WHERE depends_on @> ARRAY['{root_esc}'] OR depends_on @> ARRAY[split_part('{root_esc}', '.', 2)]; \
                    RAISE WARNING 'pg_reflex: partition flush for root % failed: % (SQLSTATE %) — left pending for retry', \
                      '{root_esc}', SQLERRM, SQLSTATE; \
                  END \

@@ -19,6 +19,8 @@ type IvmStatusRow = (
     i64,                            // flush_count
     Option<String>,                 // last_error
     Option<pgrx::datum::Timestamp>, // last_update_date
+    bool,                           // known_stale
+    Option<String>,                 // stale_reason
 );
 
 /// Summary per IMV. `row_count` is live (SELECT count(*) on the target), cheap
@@ -38,6 +40,8 @@ fn reflex_ivm_status() -> TableIterator<
         name!(flush_count, i64),
         name!(last_error, Option<String>),
         name!(last_update_date, Option<pgrx::datum::Timestamp>),
+        name!(known_stale, bool),
+        name!(stale_reason, Option<String>),
     ),
 > {
     let rows: Vec<IvmStatusRow> = Spi::connect(|client| {
@@ -47,7 +51,7 @@ fn reflex_ivm_status() -> TableIterator<
                 "SELECT name, graph_depth, COALESCE(enabled, TRUE) AS enabled, \
                         COALESCE(refresh_mode, 'IMMEDIATE') AS refresh_mode, \
                         last_flush_ms, last_flush_rows, COALESCE(flush_count, 0) AS flush_count, \
-                        last_error, last_update_date \
+                        last_error, last_update_date, COALESCE(known_stale, FALSE) AS known_stale, stale_reason \
                  FROM public.__reflex_ivm_reference \
                  ORDER BY graph_depth, name",
                 None,
@@ -86,6 +90,14 @@ fn reflex_ivm_status() -> TableIterator<
             let last_upd = row
                 .get_by_name::<pgrx::datum::Timestamp, _>("last_update_date")
                 .unwrap_or(None);
+            let known_stale = row
+                .get_by_name::<bool, _>("known_stale")
+                .unwrap_or(None)
+                .unwrap_or(false);
+            let stale_reason = row
+                .get_by_name::<&str, _>("stale_reason")
+                .unwrap_or(None)
+                .map(|s| s.to_string());
             out.push((
                 name,
                 depth,
@@ -97,6 +109,8 @@ fn reflex_ivm_status() -> TableIterator<
                 flush_count,
                 last_err,
                 last_upd,
+                known_stale,
+                stale_reason,
             ));
         }
         out

@@ -96,3 +96,43 @@ fn remove_graph_child_unlinks_one_child() {
     .unwrap();
     assert_eq!(remaining, 0, "child was not removed from graph_child");
 }
+
+#[pg_test]
+fn f4_known_stale_set_and_clear() {
+    Spi::run("INSERT INTO public.__reflex_ivm_reference (name, graph_depth) VALUES ('s.imv', 0)").unwrap();
+    Spi::run(
+        "UPDATE public.__reflex_ivm_reference \
+            SET known_stale = TRUE, stale_reason = 'boom', stale_since = now() WHERE name='s.imv'",
+    ).unwrap();
+    let (stale, reason) = Spi::get_two::<bool, String>(
+        "SELECT known_stale, stale_reason FROM public.__reflex_ivm_reference WHERE name='s.imv'",
+    ).unwrap();
+    assert_eq!(stale, Some(true));
+    assert_eq!(reason.as_deref(), Some("boom"));
+    Spi::run(
+        "UPDATE public.__reflex_ivm_reference \
+            SET known_stale = FALSE, stale_reason = NULL, stale_since = NULL WHERE name='s.imv'",
+    ).unwrap();
+    let cleared = Spi::get_one::<bool>(
+        "SELECT known_stale FROM public.__reflex_ivm_reference WHERE name='s.imv'",
+    ).unwrap().unwrap();
+    assert!(!cleared);
+}
+
+#[pg_test]
+fn f4_status_reports_known_stale() {
+    Spi::run(
+        "CREATE SCHEMA IF NOT EXISTS s; \
+         CREATE TABLE s.src (g TEXT, v NUMERIC); \
+         INSERT INTO s.src VALUES ('a', 1);",
+    ).unwrap();
+    Spi::get_one::<&str>(
+        "SELECT create_reflex_ivm('s.imv2', 'SELECT g, SUM(v) AS s FROM s.src GROUP BY g')",
+    )
+    .unwrap();
+    Spi::run(
+        "UPDATE public.__reflex_ivm_reference SET known_stale = TRUE, stale_reason = 'boom' WHERE name = 's.imv2'",
+    ).unwrap();
+    let stale = Spi::get_one::<bool>("SELECT known_stale FROM reflex_ivm_status() WHERE name='s.imv2'").unwrap().unwrap();
+    assert!(stale);
+}

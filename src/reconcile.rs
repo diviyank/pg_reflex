@@ -113,6 +113,13 @@ pub(crate) fn reflex_reconcile(view_name: &str) -> &'static str {
                     }],
                 );
 
+                let _ = client.update(
+                    "UPDATE public.__reflex_ivm_reference \
+                        SET known_stale = FALSE, stale_reason = NULL, stale_since = NULL WHERE name = $1",
+                    None,
+                    &[unsafe { DatumWithOid::new(view_name.to_string(), PgBuiltInOids::TEXTOID.oid().value()) }],
+                );
+
                 info!(
                     "pg_reflex: reconciled IMV '{}' (partitioned, {} children swapped)",
                     view_name,
@@ -359,6 +366,17 @@ pub(crate) fn reflex_reconcile(view_name: &str) -> &'static str {
         client
             .update(
                 "UPDATE public.__reflex_ivm_reference SET last_update_date = NOW() WHERE name = $1",
+                None,
+                &[unsafe {
+                    DatumWithOid::new(view_name.to_string(), PgBuiltInOids::TEXTOID.oid().value())
+                }],
+            )
+            .unwrap_or_report();
+
+        client
+            .update(
+                "UPDATE public.__reflex_ivm_reference \
+                    SET known_stale = FALSE, stale_reason = NULL, stale_since = NULL WHERE name = $1",
                 None,
                 &[unsafe {
                     DatumWithOid::new(view_name.to_string(), PgBuiltInOids::TEXTOID.oid().value())

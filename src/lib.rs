@@ -182,6 +182,13 @@ extension_sql!(
     ALTER TABLE public.__reflex_ivm_reference
         ADD COLUMN IF NOT EXISTS partition_depth INT;
 
+    ALTER TABLE public.__reflex_ivm_reference
+        ADD COLUMN IF NOT EXISTS known_stale BOOLEAN NOT NULL DEFAULT FALSE;
+    ALTER TABLE public.__reflex_ivm_reference
+        ADD COLUMN IF NOT EXISTS stale_reason TEXT;
+    ALTER TABLE public.__reflex_ivm_reference
+        ADD COLUMN IF NOT EXISTS stale_since TIMESTAMPTZ;
+
     -- Multi-level partition capture (plans/sub_partitioning.md). Snapshot of
     -- each tracked source root's recursive LEAF set, keyed by (root, child).
     -- reflex_flush_partitions oid-diffs the live leaf set against this to
@@ -945,6 +952,9 @@ extension_sql!(
                         RAISE NOTICE 'pg_reflex: auto-synced partitions for IMV % (source %)',
                             _imv.name, _parent;
                     EXCEPTION WHEN OTHERS THEN
+                        UPDATE public.__reflex_ivm_reference
+                           SET known_stale = TRUE, stale_reason = left(SQLERRM, 2000), stale_since = now()
+                         WHERE name = _imv.name;
                         RAISE WARNING 'pg_reflex: auto-sync of IMV % failed after source % partition change: % — run SELECT reflex_sync_partitions(''%'') manually',
                             _imv.name, _parent, SQLERRM, _imv.name;
                     END;
