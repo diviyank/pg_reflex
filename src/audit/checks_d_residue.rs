@@ -1,4 +1,4 @@
-use super::{Check, Finding, ImvRow, Severity};
+use super::{quote_qualified_for_regclass, Check, Finding, ImvRow, Severity};
 use pgrx::spi::SpiClient;
 use std::collections::HashMap;
 
@@ -76,33 +76,51 @@ impl Check for ArchiveResidue {
 
         // For each source partition key, count source rows (applying WHERE predicate if possible)
         for src_child in &src_children {
-            let src_count = self.count_source_rows_for_partition(
+            match self.count_source_rows_for_partition(
                 client,
                 &anchor,
                 &src_child.bare_name,
                 &imv.where_predicate,
-            );
+            ) {
+                Some(src_count) => {
+                    // Get the corresponding IMV partition row count
+                    let tgt_partition =
+                        crate::partition::target_child_name(&imv.name, &src_child.bare_name);
+                    let imv_count = imv_row_counts.get(&tgt_partition).copied().unwrap_or(0);
 
-            // Get the corresponding IMV partition row count
-            let tgt_partition =
-                crate::partition::target_child_name(&imv.name, &src_child.bare_name);
-            let imv_count = imv_row_counts.get(&tgt_partition).copied().unwrap_or(0);
-
-            // If source has rows but IMV partition is empty: archive residue
-            if src_count > 0 && imv_count == 0 {
-                findings.push(Finding {
-                    imv: Some(imv.name.clone()),
-                    severity: Severity::Warning,
-                    category: "archive_residue",
-                    finding: format!(
-                        "Partition {} has source rows ({}) but IMV partition is empty (0)",
-                        src_child.bare_name, src_count
-                    ),
-                    suggested_fix: format!(
-                        "SELECT reflex_reconcile_partition('{}', '{}');",
-                        imv.name, src_child.bare_name
-                    ),
-                });
+                    // If source has rows but IMV partition is empty: archive residue
+                    if src_count > 0 && imv_count == 0 {
+                        findings.push(Finding {
+                            imv: Some(imv.name.clone()),
+                            severity: Severity::Warning,
+                            category: "archive_residue",
+                            finding: format!(
+                                "Partition {} has source rows ({}) but IMV partition is empty (0)",
+                                src_child.bare_name, src_count
+                            ),
+                            suggested_fix: format!(
+                                "SELECT reflex_reconcile_partition('{}', '{}');",
+                                imv.name, src_child.bare_name
+                            ),
+                        });
+                    }
+                }
+                None => {
+                    // Failed to count source rows - emit unverifiable finding
+                    findings.push(Finding {
+                        imv: Some(imv.name.clone()),
+                        severity: Severity::Warning,
+                        category: "archive_residue",
+                        finding: format!(
+                            "Partition {}: could not verify source row count (query failed); cannot confirm archive residue status",
+                            src_child.bare_name
+                        ),
+                        suggested_fix: format!(
+                            "Investigate source table access for partition '{}' and re-run audit",
+                            src_child.bare_name
+                        ),
+                    });
+                }
             }
         }
 
@@ -117,7 +135,7 @@ impl ArchiveResidue {
         source: &str,
         partition_name: &str,
         where_predicate: &Option<String>,
-    ) -> i64 {
+    ) -> Option<i64> {
         // Count rows in the partition by querying the source with the partition constraint
         // The partition_name is the bare name (e.g. 'f6_src_us') of a child partition
 
@@ -134,6 +152,9 @@ impl ArchiveResidue {
             .and_then(|row| row.get_by_name::<&str, _>("constraint").ok().flatten())
             .map(|s| s.to_string());
 
+        // Quote the source table name to handle schema-qualified or special-char names
+        let quoted_source = quote_qualified_for_regclass(source);
+
         // Build the count query
         let count_query = if let Some(constraint) = constraint {
             // Use the partition constraint to filter rows from the source
@@ -141,21 +162,24 @@ impl ArchiveResidue {
                 // Try to apply the WHERE predicate along with the partition constraint
                 format!(
                     "SELECT count(*) AS cnt FROM {} WHERE ({}) AND ({})",
-                    source, constraint, pred
+                    quoted_source, constraint, pred
                 )
             } else {
                 // Just use the partition constraint
                 format!(
                     "SELECT count(*) AS cnt FROM {} WHERE ({})",
-                    source, constraint
+                    quoted_source, constraint
                 )
             }
         } else {
             // Fall back: count all rows in source (over-report rather than miss)
             if let Some(pred) = where_predicate {
-                format!("SELECT count(*) AS cnt FROM {} WHERE {}", source, pred)
+                format!(
+                    "SELECT count(*) AS cnt FROM {} WHERE {}",
+                    quoted_source, pred
+                )
             } else {
-                format!("SELECT count(*) AS cnt FROM {}", source)
+                format!("SELECT count(*) AS cnt FROM {}", quoted_source)
             }
         };
 
@@ -164,6 +188,5 @@ impl ArchiveResidue {
             .ok()
             .and_then(|mut iter| iter.next())
             .and_then(|row| row.get_by_name::<i64, _>("cnt").ok().flatten())
-            .unwrap_or(0)
     }
 }

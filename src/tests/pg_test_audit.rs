@@ -978,23 +978,35 @@ fn f6_residue_check_respects_where_predicate() {
     .unwrap_or_default();
 
     if !tgt_children.is_empty() {
-        // Find and empty the first partition (which should be 'us')
-        let delete_cmd = format!("DELETE FROM \"{}\"", tgt_children[0]);
-        Spi::run(&delete_cmd).expect("empty target partition");
+        // Find and empty the 'us' partition specifically
+        // (tgt_children is sorted alphabetically, so 'eu' comes before 'us')
+        if let Some(us_partition) = tgt_children.iter().find(|c| c.contains("us")) {
+            let delete_cmd = format!("DELETE FROM \"{}\"", us_partition);
+            Spi::run(&delete_cmd).expect("empty target partition");
+        }
     }
 
     // Run audit - The WHERE predicate filters out the 'us' rows, so an empty 'us' partition
-    // is legitimate. The check may over-report (acceptable per spec) or respect the predicate.
+    // is legitimate. The check should respect the predicate and NOT report archive_residue.
     let report: String = Spi::get_one("SELECT reflex_audit('f6_filter_imv')")
         .expect("ok")
         .expect("non-null");
 
-    // The WHERE predicate filters out the 'us' rows, so even an empty 'us' partition
-    // may or may not be flagged depending on whether the check applies the WHERE.
-    // For this test, we just verify the audit runs without ERROR level findings.
+    // Assert no ERROR level findings
     assert!(
         !report.contains("[ERROR]"),
         "expected no ERROR level findings in audit report:\n{}",
+        report
+    );
+
+    // Strengthen: verify the predicate was respected. The 'us' partition has source rows
+    // (1 row with status='inactive') but they are ALL filtered by the WHERE predicate.
+    // So there should be NO archive_residue finding for the 'us' partition because the
+    // predicate was applied and those rows legitimately don't belong in the IMV.
+    // The report should be clean (no findings for this case).
+    assert!(
+        report.contains("No findings") || report.is_empty() || !report.contains("archive_residue"),
+        "expected no archive_residue finding when WHERE predicate filters out all source rows; report:\n{}",
         report
     );
 }
