@@ -339,3 +339,132 @@ fn f10_doctor_fix_records_failed_and_continues() {
         valid_outcome
     );
 }
+
+#[pg_test]
+fn f10_decomposed_chain_like_escape_fix() {
+    // F10 regression test: verify that LIKE pattern for decomposed-chain detection
+    // correctly escapes metacharacters (especially underscore) so that unrelated IMVs
+    // with similar names are not misclassified as decomposed chains.
+    //
+    // Before fix: "f10_base_v" matches "f10_base_v__%", and an unrelated IMV
+    //            "f10_base_xy" would also match because underscore is a wildcard.
+    // After fix: only "f10_base_v__<suffix>" pattern matches literally.
+
+    // Create a known_stale aggregate IMV (not a decomposed chain on its own)
+    Spi::run("CREATE TABLE f10_base_src (id INT PRIMARY KEY, val INT)").unwrap();
+    Spi::run("INSERT INTO f10_base_src VALUES (1, 100)").unwrap();
+    crate::create_reflex_ivm(
+        "f10_base_v",
+        "SELECT COUNT(*) AS cnt FROM f10_base_src",
+        None,  // no unique key - aggregate
+        None,
+        Some("IMMEDIATE"),
+        None,
+    );
+
+    // Create an unrelated IMV whose name would collide under buggy wildcard logic:
+    // "f10_base_xy" would match "f10_base_v__%"  if '_' is treated as a wildcard.
+    Spi::run("CREATE TABLE f10_unrelated_src (id INT PRIMARY KEY, val INT)").unwrap();
+    Spi::run("INSERT INTO f10_unrelated_src VALUES (1, 200)").unwrap();
+    crate::create_reflex_ivm(
+        "f10_base_xy",
+        "SELECT COUNT(*) AS cnt FROM f10_unrelated_src",
+        None,  // aggregate
+        None,
+        Some("IMMEDIATE"),
+        None,
+    );
+
+    // Mark both as stale with a generic reason (not overlap, not archive)
+    Spi::run(
+        "UPDATE public.__reflex_ivm_reference SET known_stale = TRUE, stale_reason = 'test stale' WHERE name = 'f10_base_v'"
+    ).unwrap();
+    Spi::run(
+        "UPDATE public.__reflex_ivm_reference SET known_stale = TRUE, stale_reason = 'test stale' WHERE name = 'f10_base_xy'"
+    ).unwrap();
+
+    // Call reflex_doctor and check classifications
+    let result_rows: Vec<(String, String)> = Spi::connect(|client| {
+        let mut result = Vec::new();
+        let rs = client.select(
+            "SELECT object, check_id FROM reflex_doctor(NULL, FALSE) WHERE object IN ('f10_base_v', 'f10_base_xy')",
+            None,
+            &[]
+        ).unwrap_or_report();
+        for row in rs {
+            let object: String = row
+                .get_by_name::<&str, _>("object")
+                .unwrap_or(None)
+                .unwrap_or("")
+                .to_string();
+            let check_id: String = row
+                .get_by_name::<&str, _>("check_id")
+                .unwrap_or(None)
+                .unwrap_or("")
+                .to_string();
+            result.push((object, check_id));
+        }
+        result
+    });
+
+    // Should have 2 results
+    assert_eq!(result_rows.len(), 2, "should have exactly 2 F4 results (no decomposed chains)");
+
+    // Both should be F4, not F4b, because neither has actual sub-IMVs registered
+    for (obj, check_id) in &result_rows {
+        assert_eq!(
+            check_id, "F4",
+            "IMV '{}' should be classified as F4 (not F4b), because neither has registered sub-IMVs",
+            obj
+        );
+    }
+
+    // Now register an actual sub-IMV to make f10_base_v a real decomposed chain
+    Spi::run(
+        "INSERT INTO public.__reflex_ivm_reference (name, graph_depth, known_stale, stale_reason) \
+         VALUES ('f10_base_v__sub', 1, FALSE, NULL)"
+    ).unwrap();
+
+    // Call reflex_doctor again
+    let result_rows_after: Vec<(String, String)> = Spi::connect(|client| {
+        let mut result = Vec::new();
+        let rs = client.select(
+            "SELECT object, check_id FROM reflex_doctor(NULL, FALSE) WHERE object IN ('f10_base_v', 'f10_base_xy')",
+            None,
+            &[]
+        ).unwrap_or_report();
+        for row in rs {
+            let object: String = row
+                .get_by_name::<&str, _>("object")
+                .unwrap_or(None)
+                .unwrap_or("")
+                .to_string();
+            let check_id: String = row
+                .get_by_name::<&str, _>("check_id")
+                .unwrap_or(None)
+                .unwrap_or("")
+                .to_string();
+            result.push((object, check_id));
+        }
+        result
+    });
+
+    // Now f10_base_v should be F4b (has sub-IMV), but f10_base_xy should still be F4
+    let f10_base_v_check = result_rows_after
+        .iter()
+        .find(|(obj, _)| obj == "f10_base_v")
+        .map(|(_, check_id)| check_id.clone());
+    let f10_base_xy_check = result_rows_after
+        .iter()
+        .find(|(obj, _)| obj == "f10_base_xy")
+        .map(|(_, check_id)| check_id.clone());
+
+    assert_eq!(
+        f10_base_v_check, Some("F4b".to_string()),
+        "f10_base_v should be classified as F4b (has registered sub-IMV f10_base_v__sub)"
+    );
+    assert_eq!(
+        f10_base_xy_check, Some("F4".to_string()),
+        "f10_base_xy should still be F4 (no sub-IMVs, escaped LIKE pattern doesn't match)"
+    );
+}

@@ -2,6 +2,8 @@ use pgrx::datum::TimestampWithTimeZone;
 use pgrx::pg_sys::panic::ErrorReportable;
 use pgrx::spi::Spi;
 
+use crate::validate_view_name;
+
 /// One row of doctor report output. Returned by `reflex_doctor`.
 type DoctorReportRow = (
     String, // check_id
@@ -23,6 +25,21 @@ pub(crate) fn reflex_doctor_impl(
     max_attempts: i32,
 ) -> Vec<DoctorReportRow> {
     let mut rows = Vec::new();
+
+    // F3 hardening: validate the target argument if provided
+    if let Some(target_name) = target {
+        if let Err(err_msg) = validate_view_name(target_name) {
+            rows.push((
+                "F3".to_string(),
+                "ERROR".to_string(),
+                target_name.to_string(),
+                "Invalid target argument name".to_string(),
+                "none".to_string(),
+                err_msg.to_string(),
+            ));
+            return rows;
+        }
+    }
 
     // In dry-run mode (fix => FALSE), we only report findings without mutating anything
     if !fix {
@@ -254,12 +271,21 @@ fn detect_known_stale_imvs(
         let check_id = {
             // Check for decomposed chain: sub-IMVs named with the pattern <bare_name>__*
             let (_, bare_imv) = crate::query_decomposer::canonical_source(&imv_name);
-            let pattern = format!("{}__", bare_imv);
+
+            // F10 fix: escape LIKE metacharacters (\ _ %) in bare_imv to match literally.
+            // This ensures underscore positions in real names don't act as wildcards.
+            // For example, "base_v" should NOT match "base_xy" under the pattern "base_v__%".
+            let escaped_bare = bare_imv
+                .replace('\\', "\\\\")
+                .replace('_', "\\_")
+                .replace('%', "\\%");
+
+            let pattern_suffix = format!("{}__", escaped_bare);
             // Escape single quotes for SQL string literal
-            let escaped_pattern = pattern.replace("'", "''");
+            let escaped_pattern = pattern_suffix.replace("'", "''");
 
             let is_decomposed_chain = Spi::get_one::<bool>(&format!(
-                "SELECT EXISTS(SELECT 1 FROM public.__reflex_ivm_reference WHERE name LIKE '{}%')",
+                "SELECT EXISTS(SELECT 1 FROM public.__reflex_ivm_reference WHERE name LIKE '{}%' ESCAPE '\\')",
                 escaped_pattern
             ))
             .unwrap_or(None)

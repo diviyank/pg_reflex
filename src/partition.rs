@@ -1875,32 +1875,46 @@ pub(crate) fn execute_partition_swap_for_child(
                             .map(|n| target_child_name(view_name, &n.bare_name))
                             .collect();
 
-                        // List target parent's children and find any with matching bounds
-                        let tgt_children = list_partition_children(client, &tgt_parent);
-                        for child in &tgt_children {
-                            // Skip the expected target we're about to attach
-                            if child.bare_name == tgt_child_bare {
-                                continue;
-                            }
-                            // Check if this child has the same bounds as swap target
-                            let child_bound =
-                                read_partition_bound(client, schema, &child.bare_name);
-                            if child_bound == tgt_bound && !child_bound.is_empty() {
-                                // Found a partition with same bounds — is it a confirmed orphan?
-                                if !src_expected_tgt.contains(&child.bare_name) {
-                                    // Confirmed orphan: no live source backing it. Drop it before attach.
-                                    let drop_orphan = format!(
-                                        "DROP TABLE IF EXISTS \"{}\".\"{}\"",
-                                        schema, child.bare_name
-                                    );
-                                    client
-                                        .update(&drop_orphan, None, &[])
-                                        .map_err(|e| format!("drop orphan: {}", e))?;
-                                    pgrx::notice!(
-                                        "pg_reflex: dropped confirmed orphan target partition '{}' \
-                                         (bounds matched incoming swap target)",
-                                        child.bare_name
-                                    );
+                        // F3 fail-safe: only attempt orphan drop if live-source set was successfully
+                        // and non-emptily enumerated. If src_expected_tgt is empty, it means either:
+                        // (a) list_partition_tree encountered a query error and returned an empty Vec, or
+                        // (b) there are no leaf sources. Either way, we cannot trust the orphan determination.
+                        // Skip the drop and emit a notice.
+                        if src_expected_tgt.is_empty() {
+                            pgrx::notice!(
+                                "pg_reflex: orphan-overlap heal skipped for IMV '{}' — \
+                                 live source partition set could not be determined (empty enumeration)",
+                                view_name
+                            );
+                        } else {
+                            // Live-source set was successfully enumerated and non-empty; safe to drop confirmed orphans.
+                            // List target parent's children and find any with matching bounds
+                            let tgt_children = list_partition_children(client, &tgt_parent);
+                            for child in &tgt_children {
+                                // Skip the expected target we're about to attach
+                                if child.bare_name == tgt_child_bare {
+                                    continue;
+                                }
+                                // Check if this child has the same bounds as swap target
+                                let child_bound =
+                                    read_partition_bound(client, schema, &child.bare_name);
+                                if child_bound == tgt_bound && !child_bound.is_empty() {
+                                    // Found a partition with same bounds — is it a confirmed orphan?
+                                    if !src_expected_tgt.contains(&child.bare_name) {
+                                        // Confirmed orphan: no live source backing it. Drop it before attach.
+                                        let drop_orphan = format!(
+                                            "DROP TABLE IF EXISTS \"{}\".\"{}\"",
+                                            schema, child.bare_name
+                                        );
+                                        client
+                                            .update(&drop_orphan, None, &[])
+                                            .map_err(|e| format!("drop orphan: {}", e))?;
+                                        pgrx::notice!(
+                                            "pg_reflex: dropped confirmed orphan target partition '{}' \
+                                             (bounds matched incoming swap target)",
+                                            child.bare_name
+                                        );
+                                    }
                                 }
                             }
                         }
