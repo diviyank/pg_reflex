@@ -547,6 +547,24 @@ fn reflex_refresh_partition_snapshot(source_root: &str) -> &'static str {
     "OK"
 }
 
+/// Detect and heal snapshot divergence: refresh the partition snapshot if it
+/// disagrees with the live tree. Returns "OK (no divergence)" or
+/// "HEALED (N divergent leaves)".
+#[pg_extern]
+fn reflex_refresh_partition_snapshot_if_diverged(source_root: &str) -> String {
+    pgrx::Spi::connect_mut(|client| {
+        let snap = partition::read_snapshot_pairs(client, source_root);
+        let live = partition::current_source_leaf_oids(client, source_root);
+        let diverged = partition::detect_snapshot_live_divergence(&snap, &live);
+        if diverged.is_empty() {
+            "OK (no divergence)".to_string()
+        } else {
+            partition::refresh_source_snapshot(client, source_root);
+            format!("HEALED ({} divergent leaves)", diverged.len())
+        }
+    })
+}
+
 /// Drop a reflex IMV and all its artifacts (triggers, tables, reference row).
 /// Refuses to drop if the IMV has children unless cascade is true.
 #[pg_extern]

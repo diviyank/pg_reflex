@@ -744,6 +744,31 @@ pub(crate) fn classify_partition_diff(
     out
 }
 
+/// Detect snapshot divergence from the live tree: missing leaves, new leaves, or oid changes.
+/// Returns the bare-names of divergent leaves (empty if perfectly in sync).
+pub(crate) fn detect_snapshot_live_divergence(
+    snapshot: &[(String, u32)],
+    current: &[(String, u32)],
+) -> Vec<String> {
+    use std::collections::HashMap;
+    let snap: HashMap<&str, u32> = snapshot.iter().map(|(n, o)| (n.as_str(), *o)).collect();
+    let cur: HashMap<&str, u32> = current.iter().map(|(n, o)| (n.as_str(), *o)).collect();
+    let mut out = Vec::new();
+    for (n, o) in current {
+        match snap.get(n.as_str()) {
+            None => out.push(n.clone()),
+            Some(&so) if so != *o => out.push(n.clone()),
+            _ => {}
+        }
+    }
+    for (n, _) in snapshot {
+        if !cur.contains_key(n.as_str()) {
+            out.push(n.clone());
+        }
+    }
+    out
+}
+
 /// Parse a TEXT[] partition-column input.  Returns None for NULL/empty.
 ///
 /// The user passes column names as a Postgres TEXT[]; pgrx forwards it as
@@ -2014,6 +2039,29 @@ pub(crate) fn current_source_leaf_oids(
         .filter(|n| n.sub_strategy.is_none())
         .map(|n| (n.bare_name, n.oid))
         .collect()
+}
+
+/// Read snapshot (child_name, child_oid) pairs for a source root.
+pub(crate) fn read_snapshot_pairs(
+    client: &pgrx::spi::SpiClient<'_>,
+    source_root: &str,
+) -> Vec<(String, u32)> {
+    client
+        .select(
+            "SELECT child_name, child_oid FROM public.__reflex_source_partition_snapshot WHERE source_root = $1",
+            None,
+            &[unsafe { DatumWithOid::new(source_root.to_string(), PgBuiltInOids::TEXTOID.oid().value()) }],
+        )
+        .ok()
+        .map(|rows| {
+            rows.filter_map(|r| {
+                let n = r.get_by_name::<&str, _>("child_name").ok().flatten()?.to_string();
+                let o = r.get_by_name::<i64, _>("child_oid").ok().flatten()? as u32;
+                Some((n, o))
+            })
+            .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Canonical, schema-qualified `"schema.relname"` key for a source root, so the

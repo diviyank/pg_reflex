@@ -2585,6 +2585,72 @@ fn pg_part_detach_then_drop_nonkey_predicate_reconciles() {
 }
 
 #[pg_test]
+fn f7_snapshot_heal_repopulates_after_truncate() {
+    // Build a partitioned source + IMV so a snapshot row set exists.
+    Spi::run(
+        "CREATE TABLE f7_src (id BIGINT, region TEXT NOT NULL, amount NUMERIC) PARTITION BY LIST (region)",
+    )
+    .expect("create partitioned source");
+    Spi::run("CREATE TABLE f7_src_north PARTITION OF f7_src FOR VALUES IN ('NORTH')")
+        .expect("create north partition");
+    Spi::run("CREATE TABLE f7_src_south PARTITION OF f7_src FOR VALUES IN ('SOUTH')")
+        .expect("create south partition");
+    Spi::run("INSERT INTO f7_src (id, region, amount) VALUES (1, 'NORTH', 100), (2, 'SOUTH', 50)")
+        .expect("seed data");
+
+    let create_result = Spi::get_one::<String>(
+        "SELECT create_reflex_ivm( \
+            'f7_v', \
+            'SELECT region, SUM(amount) AS total FROM f7_src GROUP BY region', \
+            NULL, NULL, NULL, NULL, \
+            ARRAY['region'] \
+         )",
+    )
+    .expect("create IMV call")
+    .expect("create IMV result");
+    assert!(
+        !create_result.starts_with("ERROR"),
+        "create should succeed: {create_result}"
+    );
+
+    // Verify snapshot was populated.
+    let snap_count_before = Spi::get_one::<i64>(
+        "SELECT count(*) FROM public.__reflex_source_partition_snapshot WHERE source_root = 'public.f7_src'",
+    )
+    .expect("count before")
+    .expect("count");
+    assert!(snap_count_before > 0, "snapshot should have rows after creation");
+
+    // Truncate the snapshot to simulate divergence.
+    Spi::run("DELETE FROM public.__reflex_source_partition_snapshot WHERE source_root = 'public.f7_src'")
+        .expect("truncate snapshot");
+
+    let snap_count_after_delete = Spi::get_one::<i64>(
+        "SELECT count(*) FROM public.__reflex_source_partition_snapshot WHERE source_root = 'public.f7_src'",
+    )
+    .expect("count after delete")
+    .expect("count");
+    assert_eq!(snap_count_after_delete, 0, "snapshot should be empty after delete");
+
+    // Call the heal function.
+    let msg = Spi::get_one::<String>(
+        "SELECT reflex_refresh_partition_snapshot_if_diverged('public.f7_src')",
+    )
+    .expect("heal call")
+    .expect("heal result");
+    assert!(msg.starts_with("HEALED"), "should report healing: {msg}");
+
+    // Verify snapshot was repopulated.
+    let snap_count_healed = Spi::get_one::<i64>(
+        "SELECT count(*) FROM public.__reflex_source_partition_snapshot WHERE source_root = 'public.f7_src'",
+    )
+    .expect("count after heal")
+    .expect("count");
+    assert!(snap_count_healed > 0, "snapshot should be repopulated from live tree");
+    assert_eq!(snap_count_healed, snap_count_before, "snapshot count should match original");
+}
+
+#[pg_test]
 fn f9_reconcile_succeeds_with_debug_off() {
     Spi::run("CREATE TABLE f9_src (id BIGINT, region TEXT NOT NULL, amount NUMERIC) PARTITION BY LIST (region)")
         .expect("create partitioned source");

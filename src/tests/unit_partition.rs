@@ -478,3 +478,16 @@ fn shape_mismatch_detects_leaf_where_partitioned_expected() {
     assert!(!partition_shape_mismatch(true, None));
     assert!(!partition_shape_mismatch(false, None));
 }
+
+#[test]
+fn f7_detect_divergence_flags_missing_and_oid_change() {
+    let snap = vec![("a".to_string(), 1u32), ("b".to_string(), 2u32)];
+    let live = vec![
+        ("a".to_string(), 1u32),
+        ("b".to_string(), 9u32),
+        ("c".to_string(), 3u32),
+    ];
+    let mut d = detect_snapshot_live_divergence(&snap, &live);
+    d.sort();
+    assert_eq!(d, vec!["b".to_string(), "c".to_string()]); // b oid changed, c new
+}
