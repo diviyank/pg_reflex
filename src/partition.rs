@@ -1891,7 +1891,9 @@ pub(crate) fn execute_partition_swap_for_child(
                                     "DROP TABLE IF EXISTS \"{}\".\"{}\"",
                                     schema, child.bare_name
                                 );
-                                let _ = client.update(&drop_orphan, None, &[]);
+                                client
+                                    .update(&drop_orphan, None, &[])
+                                    .map_err(|e| format!("drop orphan: {}", e))?;
                                 pgrx::notice!(
                                     "pg_reflex: dropped confirmed orphan target partition '{}' \
                                      (bounds matched incoming swap target)",
