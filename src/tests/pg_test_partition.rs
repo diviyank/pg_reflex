@@ -2583,3 +2583,28 @@ fn pg_part_detach_then_drop_nonkey_predicate_reconciles() {
         "non-key-column filter must reconcile (not wrongly skip), removing the dropped row"
     );
 }
+
+#[pg_test]
+fn f9_reconcile_succeeds_with_debug_off() {
+    Spi::run("CREATE TABLE f9_src (id BIGINT, region TEXT NOT NULL, amount NUMERIC) PARTITION BY LIST (region)")
+        .expect("create partitioned source");
+    Spi::run("CREATE TABLE f9_src_n PARTITION OF f9_src FOR VALUES IN ('N')")
+        .expect("partition N");
+    Spi::run("INSERT INTO f9_src (id, region, amount) VALUES (1, 'N', 10)")
+        .expect("seed");
+
+    Spi::run(
+        "SELECT create_reflex_ivm( \
+            'f9_v', \
+            'SELECT region, SUM(amount) AS total FROM f9_src GROUP BY region', \
+            NULL, NULL, NULL, NULL, \
+            ARRAY['region'] \
+         )",
+    )
+    .expect("create partitioned IMV");
+
+    let status = Spi::get_one::<String>("SELECT reflex_reconcile('f9_v')")
+        .expect("reconcile call")
+        .expect("reconcile result");
+    assert_eq!(status, "RECONCILED", "reconcile must succeed with debug GUC off");
+}
