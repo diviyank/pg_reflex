@@ -364,75 +364,195 @@ fn detect_known_stale_imvs(
     rows
 }
 
-/// Detect audit findings (F5/F6 for archive_residue, F8 for bare_name_ambiguity)
-fn detect_audit_findings(target: Option<&str>, _fix: bool) -> Vec<DoctorReportRow> {
-    let mut rows = Vec::new();
+/// Threshold for collapsing multiple residual partitions into a single reconcile(imv) action.
+/// At or below this count, use per-partition reconcile_partition calls (surgical).
+/// Above this count, collapse to a single reconcile(imv) call (one pass through the tree).
+const RESIDUE_COLLAPSE_THRESHOLD: usize = 3;
 
-    // Call reflex_audit to get the formatted report
-    let audit_output = match target {
-        Some(t) => {
-            Spi::get_one::<String>(&format!("SELECT reflex_audit('{}')", t.replace("'", "''")))
-                .unwrap_or(None)
-                .unwrap_or_default()
-        }
-        None => Spi::get_one::<String>("SELECT reflex_audit()")
-            .unwrap_or(None)
-            .unwrap_or_default(),
+/// Detect audit findings (F5/F6 for archive_residue, F8 for bare_name_ambiguity).
+///
+/// Consumes the audit's *structured* findings rather than scraping the formatted
+/// text report, so each row carries the real IMV name and an executable
+/// suggested fix. In fix mode, archive_residue is repaired via its
+/// (per-partition) reconcile command; bare_name_ambiguity stays reported because
+/// its remedy is a manual schema-qualification, not a runnable statement.
+///
+/// For archive_residue findings with many (> RESIDUE_COLLAPSE_THRESHOLD) confirmed
+/// residual partitions, collapses them into a single reflex_reconcile(imv) action
+/// instead of per-partition reflex_reconcile_partition actions.
+fn detect_audit_findings(target: Option<&str>, fix: bool) -> Vec<DoctorReportRow> {
+    let scope = match target {
+        Some(t) => crate::audit::AuditScope::One(t.to_string()),
+        None => crate::audit::AuditScope::All,
     };
 
-    // Parse audit output to extract findings by category
-    // The audit output is a formatted text report; we need to extract findings
-    // For now, we'll do a simple pattern match on the output
-    // In a real implementation, we'd either modify reflex_audit to return structured data
-    // or parse it more carefully
+    let mut rows = Vec::new();
+    let findings = crate::audit::collect_audit_findings(scope);
 
-    // Look for archive_residue findings
-    if audit_output.contains("archive_residue") {
-        let lines: Vec<&str> = audit_output.lines().collect();
-        for (i, line) in lines.iter().enumerate() {
-            if line.contains("archive_residue") {
-                // Extract IMV name if present
-                let imv_name = if i > 0 {
-                    lines[i - 1].to_string()
+    // Group confirmed-residue findings by IMV to enable collapsing logic.
+    // Confirmed-residue = runnable (starts with SELECT).
+    // Advisory-residue = prose, never executed.
+    use std::collections::BTreeMap;
+    let mut residue_by_imv: BTreeMap<String, Vec<_>> = BTreeMap::new();
+    let mut non_residue_findings = Vec::new();
+
+    for finding in findings {
+        match finding.category {
+            "archive_residue" => {
+                let is_runnable = is_runnable_fix(&finding.suggested_fix);
+                if is_runnable {
+                    // Confirmed residue: group by IMV
+                    let imv = finding.imv.clone().unwrap_or_default();
+                    residue_by_imv
+                        .entry(imv)
+                        .or_insert_with(Vec::new)
+                        .push(finding);
                 } else {
-                    "unknown".to_string()
+                    // Advisory residue: treat as non-residue (report as-is)
+                    non_residue_findings.push(finding);
+                }
+            }
+            _ => {
+                // bare_name_ambiguity and any other categories: report as-is
+                non_residue_findings.push(finding);
+            }
+        }
+    }
+
+    // Process confirmed-residue findings with collapse logic
+    for (imv_name, imv_findings) in residue_by_imv {
+        if imv_findings.len() > RESIDUE_COLLAPSE_THRESHOLD {
+            // Collapse: emit one row with reflex_reconcile(imv)
+            let partition_list = imv_findings
+                .iter()
+                .filter_map(|f| {
+                    // Extract partition name from suggested_fix
+                    // Format: "SELECT reflex_reconcile_partition('<imv>', '', '<child>');"
+                    // The last quoted string is the partition name
+                    let parts = f.suggested_fix.split('\'').collect::<Vec<_>>();
+                    if parts.len() >= 7 {
+                        // parts[0] = "SELECT reflex_reconcile_partition("
+                        // parts[1] = imv_name
+                        // parts[2] = ", "
+                        // parts[3] = empty (second '')
+                        // parts[4] = ", "
+                        // parts[5] = partition_name
+                        // parts[6] = rest
+                        Some(parts[5].to_string())
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>();
+
+            let partition_names = partition_list.join(", ");
+            let finding_summary = format!(
+                "{} partitions show archive residue: {}",
+                imv_findings.len(),
+                partition_names
+            );
+
+            let collapsed_action = format!(
+                "SELECT reflex_reconcile('{}');",
+                imv_name.replace("'", "''")
+            );
+            let outcome = if fix {
+                apply_doctor_repair(&collapsed_action)
+            } else {
+                "reported".to_string()
+            };
+
+            rows.push((
+                "F5/F6".to_string(),
+                imv_findings[0].severity.to_string(),
+                imv_name,
+                finding_summary,
+                collapsed_action,
+                outcome,
+            ));
+        } else {
+            // Below threshold: emit per-partition rows as-is
+            for finding in imv_findings {
+                let object = finding.imv.clone().unwrap_or_default();
+                let outcome = if fix {
+                    apply_doctor_repair(&finding.suggested_fix)
+                } else {
+                    "reported".to_string()
                 };
 
                 rows.push((
                     "F5/F6".to_string(),
-                    "WARNING".to_string(),
-                    imv_name,
-                    "Archive residue detected".to_string(),
-                    "SELECT reflex_reconcile_partition(...); -- requires partition key inspection"
-                        .to_string(),
-                    "reported".to_string(),
+                    finding.severity.to_string(),
+                    object,
+                    finding.finding,
+                    finding.suggested_fix,
+                    outcome,
                 ));
             }
         }
     }
 
-    // Look for bare_name_ambiguity findings
-    if audit_output.contains("bare_name_ambiguity") {
-        let lines: Vec<&str> = audit_output.lines().collect();
-        for (i, line) in lines.iter().enumerate() {
-            if line.contains("bare_name_ambiguity") {
-                let imv_name = if i > 0 {
-                    lines[i - 1].to_string()
-                } else {
-                    "unknown".to_string()
-                };
+    // Process non-residue findings (advisory residue, F8, orphan objects, etc.).
+    // All are report-only: their remedies are either manual prose (F8,
+    // duplicate-function) or a destructive DROP (orphan objects) that an operator
+    // must authorize, so none are auto-executed here.
+    for finding in non_residue_findings {
+        let check_id = match finding.category {
+            "archive_residue" => "F5/F6", // advisory "could not verify" variant
+            "bare_name_ambiguity" => "F8",
+            "orphan-intermediate" | "orphan-staging" | "orphan-scratch" => "F9",
+            "duplicate-function" => "F11",
+            _ => continue,
+        };
 
-                rows.push((
-                    "F8".to_string(),
-                    "ERROR".to_string(),
-                    imv_name,
-                    "Bare name ambiguity in depends_on".to_string(),
-                    "Manually qualify the table name in the IMV definition".to_string(),
-                    "reported".to_string(),
-                ));
-            }
-        }
+        // Global checks (orphans, duplicate-function) carry no IMV; name the
+        // object from the leading token of the finding text (the qualified table
+        // or function name) so the row is not blank.
+        let object = finding.imv.clone().unwrap_or_else(|| {
+            finding
+                .finding
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .to_string()
+        });
+        let outcome = "reported".to_string();
+
+        rows.push((
+            check_id.to_string(),
+            finding.severity.to_string(),
+            object,
+            finding.finding,
+            finding.suggested_fix,
+            outcome,
+        ));
     }
 
     rows
+}
+
+/// Check if a suggested fix is runnable (i.e., a SELECT statement).
+/// Returns true if the trimmed text (after removing trailing `;`) starts with `SELECT` (case-insensitive).
+fn is_runnable_fix(suggested_fix: &str) -> bool {
+    let trimmed = suggested_fix.trim().trim_end_matches(';');
+    trimmed.to_uppercase().starts_with("SELECT")
+}
+
+/// Execute an already-formed repair statement in a subtransaction, returning
+/// 'fixed' or 'failed:...'. Unlike the `apply_*_repair` helpers, the caller
+/// supplies the full SQL (e.g. an audit finding's `suggested_fix`).
+///
+/// IMPORTANT: Caller must ensure the suggested_fix is runnable (i.e., a SELECT statement).
+/// Prose suggestions are never passed to this function.
+fn apply_doctor_repair(repair_sql: &str) -> String {
+    let trimmed = repair_sql.trim().trim_end_matches(';');
+    let helper_call = format!(
+        "SELECT public.__reflex_doctor_try_repair('{}')",
+        trimmed.replace("'", "''")
+    );
+    match Spi::get_one::<String>(&helper_call) {
+        Ok(Some(outcome)) => outcome,
+        Ok(None) => "failed:no result".to_string(),
+        Err(e) => format!("failed:{}", e),
+    }
 }

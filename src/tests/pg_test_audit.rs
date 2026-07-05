@@ -1010,3 +1010,374 @@ fn f6_residue_check_respects_where_predicate() {
         report
     );
 }
+
+#[pg_test]
+fn pg_test_audit_partitioned_imv_in_custom_schema_under_narrow_search_path() {
+    // Regression: the archive-residue check queried partition children by BARE
+    // relname (both the IMV target children and the source children). For an IMV
+    // in a non-public schema, running reflex_audit() (and thus reflex_doctor())
+    // under a search_path that excludes that schema raised
+    // `relation "<child>" does not exist` and aborted the whole audit, because
+    // audit checks are not error-isolated.
+    Spi::run("CREATE SCHEMA audit_np").expect("schema");
+    Spi::run(
+        "CREATE TABLE audit_np.src (id BIGINT, region TEXT NOT NULL, amount NUMERIC) \
+         PARTITION BY LIST (region)",
+    )
+    .expect("partitioned src");
+    Spi::run("CREATE TABLE audit_np.src_us PARTITION OF audit_np.src FOR VALUES IN ('us')")
+        .expect("us partition");
+    Spi::run("CREATE TABLE audit_np.src_def PARTITION OF audit_np.src DEFAULT")
+        .expect("default partition");
+    Spi::run("INSERT INTO audit_np.src VALUES (1, 'us', 100), (2, 'eu', 200)").expect("seed");
+
+    Spi::run(
+        "SELECT create_reflex_ivm( \
+            'audit_np.pview', \
+            'SELECT region, SUM(amount) AS total FROM audit_np.src GROUP BY region', \
+            NULL, NULL, NULL, NULL, \
+            ARRAY['region'] \
+         )",
+    )
+    .expect("create IMV");
+
+    // Narrow the search_path so the IMV's (and source's) schema is NOT visible.
+    Spi::run("SET search_path = public").expect("narrow search_path");
+
+    // Before the fix this raised: relation "pview_src_def" does not exist.
+    let report: String = Spi::get_one("SELECT reflex_audit()")
+        .expect("audit must not error under narrow search_path")
+        .expect("non-null report");
+
+    Spi::run("SET search_path = public, audit_np").expect("reset");
+
+    assert!(
+        report.contains("finding(s)"),
+        "expected a well-formed audit report:\n{}",
+        report
+    );
+}
+
+#[pg_test]
+fn pg_doctor_residue_reports_imv_name_and_real_reconcile_command() {
+    // reflex_doctor's F5/F6 (archive-residue) rows must name the actual IMV and
+    // carry an executable reconcile command — not a blank object and a "..."
+    // placeholder (the pre-fix text-parsing dropped both).
+    Spi::run(
+        "CREATE TABLE d6_src (id BIGINT, region TEXT NOT NULL, amount NUMERIC) \
+         PARTITION BY LIST (region)",
+    )
+    .expect("src");
+    Spi::run("CREATE TABLE d6_src_us PARTITION OF d6_src FOR VALUES IN ('us')").expect("us");
+    Spi::run("CREATE TABLE d6_src_eu PARTITION OF d6_src FOR VALUES IN ('eu')").expect("eu");
+    Spi::run("INSERT INTO d6_src VALUES (1,'us',100),(2,'eu',200)").expect("seed");
+    Spi::run(
+        "SELECT create_reflex_ivm('d6_imv', \
+            'SELECT region, SUM(amount) AS total FROM d6_src GROUP BY region', \
+            NULL, NULL, NULL, NULL, ARRAY['region'])",
+    )
+    .expect("imv");
+
+    // Empty one target partition child while the source keeps its rows -> residue.
+    let tgt: Vec<String> = Spi::get_one::<Vec<String>>(
+        "SELECT array_agg(c.relname::text ORDER BY c.relname) FROM pg_inherits i \
+         JOIN pg_class c ON c.oid = i.inhrelid WHERE i.inhparent = to_regclass('d6_imv')::oid",
+    )
+    .expect("q")
+    .unwrap_or_default();
+    assert!(!tgt.is_empty(), "IMV should have target partitions");
+    Spi::run(&format!("DELETE FROM \"{}\"", tgt[0])).expect("empty tgt partition");
+
+    let object: String =
+        Spi::get_one("SELECT object FROM reflex_doctor('d6_imv') WHERE check_id = 'F5/F6' LIMIT 1")
+            .expect("q")
+            .expect("expected an F5/F6 doctor row");
+    assert_eq!(object, "d6_imv", "F5/F6 object should name the IMV");
+
+    let action: String =
+        Spi::get_one("SELECT action FROM reflex_doctor('d6_imv') WHERE check_id = 'F5/F6' LIMIT 1")
+            .expect("q")
+            .expect("expected an F5/F6 doctor row");
+    assert!(
+        action.contains("reflex_reconcile_partition('d6_imv'"),
+        "action should be an executable reconcile command, got: {}",
+        action
+    );
+    assert!(
+        !action.contains("..."),
+        "action must not be a placeholder, got: {}",
+        action
+    );
+}
+
+#[pg_test]
+fn pg_doctor_fix_reconciles_residue_partition() {
+    // reflex_doctor(target, fix => TRUE) must actually repair archive residue by
+    // reconciling the affected partition (previously it always reported, never fixed).
+    Spi::run(
+        "CREATE TABLE d7_src (id BIGINT, region TEXT NOT NULL, amount NUMERIC) \
+         PARTITION BY LIST (region)",
+    )
+    .expect("src");
+    Spi::run("CREATE TABLE d7_src_us PARTITION OF d7_src FOR VALUES IN ('us')").expect("us");
+    Spi::run("CREATE TABLE d7_src_eu PARTITION OF d7_src FOR VALUES IN ('eu')").expect("eu");
+    Spi::run("INSERT INTO d7_src VALUES (1,'us',100),(2,'eu',200)").expect("seed");
+    Spi::run(
+        "SELECT create_reflex_ivm('d7_imv', \
+            'SELECT region, SUM(amount) AS total FROM d7_src GROUP BY region', \
+            NULL, NULL, NULL, NULL, ARRAY['region'])",
+    )
+    .expect("imv");
+
+    let tgt: Vec<String> = Spi::get_one::<Vec<String>>(
+        "SELECT array_agg(c.relname::text ORDER BY c.relname) FROM pg_inherits i \
+         JOIN pg_class c ON c.oid = i.inhrelid WHERE i.inhparent = to_regclass('d7_imv')::oid",
+    )
+    .expect("q")
+    .unwrap_or_default();
+    assert!(!tgt.is_empty());
+    Spi::run(&format!("DELETE FROM \"{}\"", tgt[0])).expect("empty");
+
+    let before: i64 = Spi::get_one(&format!("SELECT count(*) FROM \"{}\"", tgt[0]))
+        .expect("q")
+        .expect("c");
+    assert_eq!(before, 0, "target partition should start empty");
+
+    let outcome: String = Spi::get_one(
+        "SELECT outcome FROM reflex_doctor('d7_imv', TRUE) WHERE check_id = 'F5/F6' LIMIT 1",
+    )
+    .expect("q")
+    .expect("expected an F5/F6 doctor row");
+    assert_eq!(outcome, "fixed", "residue repair should succeed");
+
+    let after: i64 = Spi::get_one(&format!("SELECT count(*) FROM \"{}\"", tgt[0]))
+        .expect("q")
+        .expect("c");
+    assert!(after > 0, "reconcile should refill the empty partition");
+
+    let report: String = Spi::get_one("SELECT reflex_audit('d7_imv')")
+        .expect("q")
+        .expect("r");
+    assert!(
+        !report.contains("archive_residue"),
+        "residue should be cleared after fix:\n{}",
+        report
+    );
+}
+
+#[pg_test]
+fn pg_test_audit_check_isolation_catches_error() {
+    use crate::audit::{Check, Finding, ImvRow, Severity};
+    use pgrx::spi::SpiClient;
+
+    struct CrashingCheck;
+    impl Check for CrashingCheck {
+        fn id(&self) -> &'static str {
+            "test-crashing-check"
+        }
+        fn run(&self, client: &SpiClient<'_>, _imv: Option<&ImvRow>) -> Vec<Finding> {
+            client
+                .select(
+                    "SELECT * FROM __reflex_definitely_missing_relation",
+                    None,
+                    &[],
+                )
+                .unwrap();
+            vec![]
+        }
+    }
+
+    Spi::connect(|client| {
+        let chk = CrashingCheck;
+        let findings = crate::audit::run_check_isolated(&client, &chk, None);
+
+        assert_eq!(findings.len(), 1, "should produce one finding");
+        assert_eq!(findings[0].category, "check-errored", "category should be check-errored");
+        assert_eq!(
+            findings[0].severity, Severity::Error,
+            "severity should be Error"
+        );
+        assert!(
+            findings[0].finding.contains("test-crashing-check"),
+            "finding text should contain check id"
+        );
+    });
+}
+
+#[pg_test]
+fn pg_test_audit_check_isolation_keeps_spi_usable() {
+    use crate::audit::{Check, Finding, ImvRow, Severity};
+    use pgrx::spi::SpiClient;
+
+    struct CrashingCheck;
+    impl Check for CrashingCheck {
+        fn id(&self) -> &'static str {
+            "test-crashing-check-2"
+        }
+        fn run(&self, client: &SpiClient<'_>, _imv: Option<&ImvRow>) -> Vec<Finding> {
+            client
+                .select(
+                    "SELECT * FROM __reflex_definitely_missing_relation",
+                    None,
+                    &[],
+                )
+                .unwrap();
+            vec![]
+        }
+    }
+
+    // Execution-time error (evaluates during scan, not planning) — the class a
+    // bad stored where_predicate would produce.
+    struct ExecCrashCheck;
+    impl Check for ExecCrashCheck {
+        fn id(&self) -> &'static str {
+            "test-exec-crash-check"
+        }
+        fn run(&self, client: &SpiClient<'_>, _imv: Option<&ImvRow>) -> Vec<Finding> {
+            client
+                .select("SELECT 1 / 0 AS boom", None, &[])
+                .unwrap()
+                .first()
+                .get_by_name::<i64, _>("boom")
+                .unwrap();
+            vec![]
+        }
+    }
+
+    struct GoodCheck;
+    impl Check for GoodCheck {
+        fn id(&self) -> &'static str {
+            "test-good-check"
+        }
+        fn run(&self, client: &SpiClient<'_>, _imv: Option<&ImvRow>) -> Vec<Finding> {
+            // Must actually touch SPI: proves the connection is usable for a real
+            // query after a prior check raised a Postgres error (not just that Rust
+            // control-flow resumed).
+            let n: i64 = client
+                .select("SELECT 42 AS x", None, &[])
+                .unwrap()
+                .first()
+                .get_by_name::<i64, _>("x")
+                .unwrap()
+                .unwrap();
+            vec![Finding {
+                imv: None,
+                severity: Severity::Info,
+                category: "test-info",
+                finding: format!("good check ran successfully: {}", n),
+                suggested_fix: "none".to_string(),
+            }]
+        }
+    }
+
+    Spi::connect(|client| {
+        let crashing = CrashingCheck;
+        let good = GoodCheck;
+
+        let exec_crash = ExecCrashCheck;
+
+        let mut findings = vec![];
+        findings.extend(crate::audit::run_check_isolated(&client, &crashing, None));
+        findings.extend(crate::audit::run_check_isolated(&client, &exec_crash, None));
+        findings.extend(crate::audit::run_check_isolated(&client, &good, None));
+
+        assert_eq!(
+            findings.len(),
+            3,
+            "should have two check-errored and one good finding"
+        );
+        assert_eq!(
+            findings[0].category, "check-errored",
+            "parse-error check should be isolated"
+        );
+        assert_eq!(
+            findings[1].category, "check-errored",
+            "execution-error check should be isolated"
+        );
+        assert_eq!(findings[2].category, "test-info", "good check should run");
+        assert!(
+            findings[2].finding.contains("good check ran"),
+            "good check should run real SQL successfully after two crashing checks"
+        );
+    });
+}
+
+#[pg_test]
+fn pg_test_audit_end_to_end_shows_check_errors() {
+    // This test would require injecting a bad check into the registry,
+    // which isn't possible without modifying registry(). Instead, we verify
+    // that normal audit flow still works (no check-errored in clean state).
+    let out: String = Spi::get_one("SELECT reflex_audit()")
+        .expect("query ok")
+        .expect("non-null result");
+    assert!(
+        !out.contains("check-errored"),
+        "clean audit should have no check-errored findings: {}",
+        out
+    );
+}
+
+#[pg_test]
+fn f6_residue_check_resilient_to_where_predicate_error() {
+    // When where_predicate references a missing function or operator,
+    // the residue check should gracefully degrade to "could not verify"
+    // per partition rather than aborting the whole check.
+    // This tests per-partition error isolation.
+
+    // Create a partitioned source table
+    Spi::run(
+        "CREATE TABLE f6_pred_err_src (id BIGINT, region TEXT NOT NULL, amount NUMERIC) \
+         PARTITION BY LIST (region)",
+    )
+    .expect("create partitioned source");
+    Spi::run("CREATE TABLE f6_pred_err_src_us PARTITION OF f6_pred_err_src FOR VALUES IN ('us')")
+        .expect("create us partition");
+    Spi::run("CREATE TABLE f6_pred_err_src_eu PARTITION OF f6_pred_err_src FOR VALUES IN ('eu')")
+        .expect("create eu partition");
+
+    // Add data to the source
+    Spi::run("INSERT INTO f6_pred_err_src VALUES (1, 'us', 100), (2, 'eu', 200)")
+        .expect("seed source");
+
+    // Create a partitioned IMV
+    Spi::run(
+        "SELECT create_reflex_ivm( \
+            'f6_pred_err_imv', \
+            'SELECT region, SUM(amount) AS total FROM f6_pred_err_src GROUP BY region', \
+            NULL, NULL, NULL, NULL, \
+            ARRAY['region'] \
+         )",
+    )
+    .expect("create IMV");
+
+    // Mark source as ignored to enable audit residue check
+    Spi::run("UPDATE public.__reflex_ivm_reference SET ignored_sources = ARRAY['f6_pred_err_src'] WHERE name = 'f6_pred_err_imv'")
+        .expect("mark source as ignored");
+
+    // Corrupt the where_predicate with a division-by-zero expression
+    // to simulate a runtime-erroring SQL expression
+    Spi::run(
+        "UPDATE public.__reflex_ivm_reference \
+         SET where_predicate = '1 / 0 = 1' \
+         WHERE name = 'f6_pred_err_imv'"
+    )
+    .expect("corrupt where_predicate");
+
+    // Run audit - should NOT crash with check-errored, but should emit
+    // archive_residue findings with "could not verify" messages per partition
+    let report: String = Spi::get_one("SELECT reflex_audit('f6_pred_err_imv')")
+        .expect("audit must not error even with bad where_predicate")
+        .expect("non-null report");
+
+    assert!(
+        !report.contains("check-errored"),
+        "residue check should not emit check-errored even with bad where_predicate; report:\n{}",
+        report
+    );
+
+    assert!(
+        report.contains("archive_residue") && report.contains("could not verify"),
+        "residue check should emit archive_residue/could-not-verify findings per partition; report:\n{}",
+        report
+    );
+}

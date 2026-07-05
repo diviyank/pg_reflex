@@ -1,6 +1,7 @@
 use super::{quote_qualified_for_regclass, Check, Finding, ImvRow, Severity};
 use pgrx::spi::SpiClient;
 use std::collections::HashMap;
+use std::panic::AssertUnwindSafe;
 
 pub(super) struct ArchiveResidue;
 
@@ -57,18 +58,23 @@ impl Check for ArchiveResidue {
         let tgt_parent = crate::query_decomposer::quote_identifier(&imv.name);
         let tgt_children = crate::partition::list_partition_children(client, &tgt_parent);
 
-        // Build map of partition key -> IMV row count
+        // Build map of partition key -> IMV row count.
+        // Partition children carry only their bare relname; qualify with the
+        // IMV's schema so the count resolves regardless of the caller's
+        // search_path (the IMV, and thus its children, may live in a
+        // non-public schema not on the current path).
+        let (imv_schema, _) = crate::query_decomposer::split_qualified_name(&imv.name);
         let mut imv_row_counts: HashMap<String, i64> = HashMap::new();
         for tgt_child in &tgt_children {
-            let count: i64 = client
-                .select(
-                    &format!("SELECT count(*) AS cnt FROM \"{}\"", tgt_child.bare_name),
-                    None,
-                    &[],
+            let child_ref = match imv_schema {
+                Some(schema) => format!("\"{}\".\"{}\"", schema, tgt_child.bare_name),
+                None => format!("\"{}\"", tgt_child.bare_name),
+            };
+            let count: i64 = self
+                .safe_count(
+                    client,
+                    &format!("SELECT count(*) AS cnt FROM {}", child_ref),
                 )
-                .ok()
-                .and_then(|mut iter| iter.next())
-                .and_then(|row| row.get_by_name::<i64, _>("cnt").ok().flatten())
                 .unwrap_or(0);
 
             imv_row_counts.insert(tgt_child.bare_name.clone(), count);
@@ -99,7 +105,7 @@ impl Check for ArchiveResidue {
                                 src_child.bare_name, src_count
                             ),
                             suggested_fix: format!(
-                                "SELECT reflex_reconcile_partition('{}', '{}');",
+                                "SELECT reflex_reconcile_partition('{}', '', '{}');",
                                 imv.name, src_child.bare_name
                             ),
                         });
@@ -129,6 +135,22 @@ impl Check for ArchiveResidue {
 }
 
 impl ArchiveResidue {
+    fn safe_count(&self, client: &pgrx::spi::SpiClient<'_>, sql: &str) -> Option<i64> {
+        // Execute SQL safely, catching Postgres errors that would panic the FFI boundary.
+        // Returns None if the query fails (either via error or panic), gracefully degrading
+        // to "could not verify" findings instead of aborting the whole check.
+        // Err(_) => query crashed at the FFI boundary; unwrap_or_default() maps it
+        // to None so we degrade to a "could not verify" finding.
+        std::panic::catch_unwind(AssertUnwindSafe(|| {
+            client
+                .select(sql, None, &[])
+                .ok()
+                .and_then(|mut iter| iter.next())
+                .and_then(|row| row.get_by_name::<i64, _>("cnt").ok().flatten())
+        }))
+        .unwrap_or_default()
+    }
+
     fn count_source_rows_for_partition(
         &self,
         client: &pgrx::spi::SpiClient<'_>,
@@ -139,18 +161,31 @@ impl ArchiveResidue {
         // Count rows in the partition by querying the source with the partition constraint
         // The partition_name is the bare name (e.g. 'f6_src_us') of a child partition
 
-        // First, get the partition bounds to identify which rows belong to this partition
+        // First, get the partition bounds to identify which rows belong to this
+        // partition. `partition_name` is a bare child relname; qualify it with
+        // the source's schema so the ::regclass cast resolves even when the
+        // source lives in a schema not on the current search_path.
+        let (source_schema, _) = crate::query_decomposer::split_qualified_name(source);
+        let qualified_partition = match source_schema {
+            Some(schema) => format!("\"{}\".\"{}\"", schema, partition_name),
+            None => format!("\"{}\"", partition_name),
+        };
         let bound_query = format!(
             "SELECT pg_get_partition_constraintdef('{}'::regclass) AS constraint",
-            partition_name
+            qualified_partition
         );
 
-        let constraint: Option<String> = client
-            .select(&bound_query, None, &[])
-            .ok()
-            .and_then(|mut iter| iter.next())
-            .and_then(|row| row.get_by_name::<&str, _>("constraint").ok().flatten())
-            .map(|s| s.to_string());
+        // A failed constraint lookup degrades to None (fall back to an unfiltered
+        // source count) rather than aborting the whole residue check.
+        let constraint: Option<String> = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            client
+                .select(&bound_query, None, &[])
+                .ok()
+                .and_then(|mut iter| iter.next())
+                .and_then(|row| row.get_by_name::<&str, _>("constraint").ok().flatten())
+                .map(|s| s.to_string())
+        }))
+        .unwrap_or_default();
 
         // Quote the source table name to handle schema-qualified or special-char names
         let quoted_source = quote_qualified_for_regclass(source);
@@ -183,10 +218,6 @@ impl ArchiveResidue {
             }
         };
 
-        client
-            .select(&count_query, None, &[])
-            .ok()
-            .and_then(|mut iter| iter.next())
-            .and_then(|row| row.get_by_name::<i64, _>("cnt").ok().flatten())
+        self.safe_count(client, &count_query)
     }
 }

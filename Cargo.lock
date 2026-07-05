@@ -943,7 +943,7 @@ dependencies = [
 
 [[package]]
 name = "pg_reflex"
-version = "1.10.8"
+version = "1.10.9"
 dependencies = [
  "fuzz_model",
  "insta",

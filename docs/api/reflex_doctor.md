@@ -27,6 +27,8 @@ Each repair runs in its own subtransaction, so one failure records `failed:<err>
 
 `target` narrows the scope to one IMV name or source root; `NULL` audits the whole database.
 
+Since 1.10.9 the underlying audit is crash-isolated per check: a check that raises a Postgres error becomes a `check-errored` finding rather than aborting the whole run. Whole-database scope (`target => NULL`) additionally surfaces orphan aux tables (**F9** — orphan intermediate/staging/scratch, with their `DROP … CASCADE`) and duplicate trigger functions (**F11**), both report-only. Archive-residue (F5/F6) repairs use `reflex_reconcile_partition` per partition, collapsing to a single `reflex_reconcile(<imv>)` when more than three partitions of one IMV are affected.
+
 ## Example: dry-run (report only)
 
 ```sql

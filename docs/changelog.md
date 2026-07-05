@@ -4,6 +4,26 @@ The full changelog tracks every release. The latest version's headlines are on t
 
 For each version below, see [`CHANGELOG.md`](https://github.com/diviyank/pg_reflex/blob/main/CHANGELOG.md) on GitHub for the canonical text.
 
+## [1.10.9] — 2026-07-05
+
+[`reflex_doctor`](api/reflex_doctor.md) / [`reflex_audit`](api/reflex_audit.md) hardening — module-only, no SQL/catalog changes. Replace the `.so`, then `ALTER EXTENSION pg_reflex UPDATE TO '1.10.9';`.
+
+**Fixed**
+
+- Crash on non-`public`-schema partitioned IMVs: the `archive_residue` check queried partition children by bare relname, so `reflex_audit()`/`reflex_doctor()` under a `search_path` excluding the IMV's schema raised `relation "…" does not exist` and aborted. Child queries are now schema-qualified.
+- A single failing check no longer aborts the audit: engine-level per-check isolation turns a check that raises into a `check-errored` finding while the rest run.
+- `archive_residue` no longer forfeits sibling partitions when one partition's stored `where_predicate`/constraint fails — that partition degrades to "could not verify".
+- `reflex_doctor` archive-residue rows now carry the real IMV name + an executable `reflex_reconcile_partition(...)` (not a blank object + `...`), and `fix => TRUE` actually reconciles residue. Corrected the audit's suggested fix (source child belongs in `source_partition`, not `partition_keys`).
+- Fix mode never executes prose: only `SELECT`-prefixed suggested fixes auto-run.
+
+**Added**
+
+- `reflex_doctor` surfaces orphan aux tables (F9) and duplicate trigger functions (F11) that `reflex_audit` finds — report-only, with the `DROP`/consolidation command.
+
+**Changed**
+
+- Many (> 3) residual partitions collapse to a single `reflex_reconcile(<imv>)` repair instead of one `reflex_reconcile_partition` per partition.
+
 ## [1.10.8] — 2026-07-03
 
 The "untreated findings" remediation release: it closes the silent IMV-staleness failure modes from the 2026-07-02 multi-tenant incident and adds [`reflex_doctor()`](api/reflex_doctor.md), a single dry-run-by-default entrypoint that diagnoses every inconsistency class and applies only non-breaking repairs. Replace the `.so`, then `ALTER EXTENSION pg_reflex UPDATE TO '1.10.8';`.

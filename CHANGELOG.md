@@ -2,6 +2,53 @@
 
 ## [Unreleased]
 
+## [1.10.9] - 2026-07-05
+
+`reflex_doctor` / `reflex_audit` hardening. The audit engine can no longer be
+aborted by a single failing check, `reflex_doctor` now repairs archive residue
+correctly, and neither crashes on IMVs registered in a non-`public` schema.
+This is a module-only release — no catalog or SQL surface changed. Replace the
+`.so`, then `ALTER EXTENSION pg_reflex UPDATE TO '1.10.9';`.
+
+### Fixed
+
+- **Crash on non-`public`-schema partitioned IMVs.** The `archive_residue` audit
+  check queried partition children by bare relname; for an IMV registered in a
+  non-`public` schema, running `reflex_audit()` / `reflex_doctor()` under a
+  `search_path` that excluded that schema raised `relation "…" does not exist`
+  and aborted the whole call. The target-child count and the source-child
+  partition-constraint lookup are now schema-qualified.
+- **A single failing check aborted the entire audit.** Audit checks now run with
+  engine-level isolation: a check that raises a Postgres error yields a
+  `check-errored` finding and the remaining checks still run, so one bad IMV can
+  no longer take down `reflex_audit()` / `reflex_doctor()`.
+- **`archive_residue` no longer forfeits sibling partitions.** A malformed or
+  unresolvable stored `where_predicate` (or partition constraint) on one
+  partition now degrades to a "could not verify" finding for that partition
+  instead of aborting the whole check.
+- **`reflex_doctor` archive-residue rows were unusable.** They now carry the real
+  IMV name and an executable `reflex_reconcile_partition(...)` command (from the
+  audit's structured findings) instead of a blank object and a `...` placeholder,
+  and `fix => TRUE` actually reconciles residue (it previously reported but never
+  repaired). The audit's own suggested fix passed the source child as
+  `partition_keys` instead of `source_partition`; corrected.
+- **Fix mode no longer executes prose as SQL.** Only `SELECT`-prefixed suggested
+  fixes are auto-run; advisory ("could not verify" and bare-name) findings are
+  report-only.
+
+### Added
+
+- `reflex_doctor` now surfaces the **orphan aux tables** (F9: orphan intermediate
+  / staging / scratch) and **duplicate trigger functions** (F11) that
+  `reflex_audit` detects — report-only, with the `DROP` / consolidation command
+  in the action column.
+
+### Changed
+
+- When an IMV has many (> 3) residual partitions, `reflex_doctor` collapses the
+  repair to a single `reflex_reconcile(<imv>)` instead of one
+  `reflex_reconcile_partition` per partition (one tree sync instead of N).
+
 ## [1.10.8] - 2026-07-03
 
 The "untreated findings" remediation release. It closes the silent IMV-staleness

@@ -25,7 +25,7 @@ pub enum AuditScope {
     One(String),
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[allow(dead_code)]
 pub enum Severity {
     Error,
@@ -449,6 +449,78 @@ fn format_report(scope: &AuditScope, imvs: &[ImvRow], mut findings: Vec<Finding>
     out
 }
 
+pub(crate) fn run_check_isolated(
+    client: &SpiClient<'_>,
+    chk: &dyn Check,
+    imv: Option<&ImvRow>,
+) -> Vec<Finding> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| chk.run(client, imv))) {
+        Ok(findings) => findings,
+        Err(e) => {
+            let msg = if let Some(s) = e.downcast_ref::<String>() {
+                s.clone()
+            } else if let Some(s) = e.downcast_ref::<&str>() {
+                s.to_string()
+            } else {
+                "unknown error".to_string()
+            };
+            vec![Finding {
+                imv: imv.map(|i| i.name.clone()),
+                severity: Severity::Error,
+                category: "check-errored",
+                finding: format!("check '{}' crashed: {}", chk.id(), msg),
+                suggested_fix: "Inspect logs for details. This check failed during audit."
+                    .to_string(),
+            }]
+        }
+    }
+}
+
+pub(crate) fn run_check_global_isolated(
+    client: &SpiClient<'_>,
+    chk: &dyn Check,
+    imvs: &[ImvRow],
+) -> Vec<Finding> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        chk.run_global(client, imvs)
+    })) {
+        Ok(findings) => findings,
+        Err(e) => {
+            let msg = if let Some(s) = e.downcast_ref::<String>() {
+                s.clone()
+            } else if let Some(s) = e.downcast_ref::<&str>() {
+                s.to_string()
+            } else {
+                "unknown error".to_string()
+            };
+            vec![Finding {
+                imv: None,
+                severity: Severity::Error,
+                category: "check-errored",
+                finding: format!("global check '{}' crashed: {}", chk.id(), msg),
+                suggested_fix: "Inspect logs for details. This check failed during audit."
+                    .to_string(),
+            }]
+        }
+    }
+}
+
+fn run_checks(client: &SpiClient<'_>, scope: &AuditScope, imvs: &[ImvRow]) -> Vec<Finding> {
+    let mut findings: Vec<Finding> = Vec::new();
+    let checks = registry();
+
+    for chk in &checks {
+        if chk.is_per_imv() {
+            for imv in imvs {
+                findings.extend(run_check_isolated(client, chk.as_ref(), Some(imv)));
+            }
+        } else if matches!(scope, AuditScope::All) {
+            findings.extend(run_check_global_isolated(client, chk.as_ref(), imvs));
+        }
+    }
+    findings
+}
+
 pub fn reflex_audit_impl(scope: AuditScope) -> String {
     Spi::connect(|client| {
         let imvs = load_imv_rows(client, &scope);
@@ -459,19 +531,37 @@ pub fn reflex_audit_impl(scope: AuditScope) -> String {
             }
         }
 
-        let mut findings: Vec<Finding> = Vec::new();
-        let checks = registry();
-
-        for chk in &checks {
-            if chk.is_per_imv() {
-                for imv in &imvs {
-                    findings.extend(chk.run(client, Some(imv)));
-                }
-            } else if matches!(scope, AuditScope::All) {
-                findings.extend(chk.run_global(client, &imvs));
-            }
-        }
-
+        let findings = run_checks(client, &scope, &imvs);
         format_report(&scope, &imvs, findings)
+    })
+}
+
+/// One structured audit finding, owned (no `'static`/catalog borrows) so callers
+/// like `reflex_doctor` can consume findings directly instead of scraping the
+/// formatted text report.
+pub struct AuditFinding {
+    pub severity: &'static str,
+    pub imv: Option<String>,
+    pub category: &'static str,
+    pub finding: String,
+    pub suggested_fix: String,
+}
+
+/// Run the audit checks and return the raw findings. Unlike `reflex_audit_impl`,
+/// an unknown scoped target yields an empty vec rather than raising (callers do
+/// their own target validation).
+pub fn collect_audit_findings(scope: AuditScope) -> Vec<AuditFinding> {
+    Spi::connect(|client| {
+        let imvs = load_imv_rows(client, &scope);
+        run_checks(client, &scope, &imvs)
+            .into_iter()
+            .map(|f| AuditFinding {
+                severity: f.severity.label(),
+                imv: f.imv,
+                category: f.category,
+                finding: f.finding,
+                suggested_fix: f.suggested_fix,
+            })
+            .collect()
     })
 }

@@ -468,3 +468,436 @@ fn f10_decomposed_chain_like_escape_fix() {
         "f10_base_xy should still be F4 (no sub-IMVs, escaped LIKE pattern doesn't match)"
     );
 }
+
+#[pg_test]
+fn pg_test_doctor_advisory_residue_not_executed() {
+    // Problem A: advisory residue findings (prose, not runnable SQL) should be
+    // reported without executing them, even in fix mode.
+    // Create a partitioned IMV with empty target partitions and corrupt the
+    // where_predicate to make the source row count check fail on ALL partitions,
+    // triggering "could not verify" advisory findings instead of confirmed residue.
+
+    // Create partitioned source with multiple partitions
+    Spi::run(
+        "CREATE TABLE advisory_src (id BIGINT, region TEXT NOT NULL, amount NUMERIC) \
+         PARTITION BY LIST (region)",
+    )
+    .expect("create partitioned source");
+    Spi::run("CREATE TABLE advisory_src_us PARTITION OF advisory_src FOR VALUES IN ('us')")
+        .expect("create us partition");
+    Spi::run("CREATE TABLE advisory_src_eu PARTITION OF advisory_src FOR VALUES IN ('eu')")
+        .expect("create eu partition");
+    Spi::run("CREATE TABLE advisory_src_asia PARTITION OF advisory_src FOR VALUES IN ('asia')")
+        .expect("create asia partition");
+
+    // Insert data to multiple source partitions
+    Spi::run(
+        "INSERT INTO advisory_src VALUES (1, 'us', 100), (2, 'eu', 200), (3, 'asia', 300)",
+    )
+    .expect("seed source");
+
+    // Create partitioned IMV
+    Spi::run(
+        "SELECT create_reflex_ivm( \
+            'advisory_imv', \
+            'SELECT region, SUM(amount) AS total FROM advisory_src GROUP BY region', \
+            NULL, NULL, NULL, NULL, \
+            ARRAY['region'] \
+         )",
+    )
+    .expect("create IMV");
+
+    // Mark source as ignored (simulate archive scenario)
+    Spi::run(
+        "UPDATE public.__reflex_ivm_reference SET ignored_sources = ARRAY['advisory_src'] \
+         WHERE name = 'advisory_imv'",
+    )
+    .expect("mark ignored");
+
+    // Empty ALL target partitions to simulate complete archive
+    let tgt_children: Vec<String> = Spi::get_one::<Vec<String>>(
+        "SELECT array_agg(c.relname::text ORDER BY c.relname) FROM pg_inherits i \
+         JOIN pg_class c ON c.oid = i.inhrelid \
+         WHERE i.inhparent = to_regclass('advisory_imv')::oid",
+    )
+    .expect("ok")
+    .unwrap_or_default();
+
+    for child in &tgt_children {
+        let delete_cmd = format!("DELETE FROM \"{}\"", child);
+        Spi::run(&delete_cmd).expect("empty target partition");
+    }
+
+    // BEFORE running audit: corrupt the where_predicate to make ALL source
+    // row counts fail (so we get "could not verify" advisory, not confirmed residue)
+    Spi::run(
+        "UPDATE public.__reflex_ivm_reference SET where_predicate = '1 / 0 = 1' \
+         WHERE name = 'advisory_imv'",
+    )
+    .expect("corrupt where_predicate");
+
+    // Run audit to generate advisory findings
+    let _audit_out: String = Spi::get_one("SELECT reflex_audit('advisory_imv')")
+        .expect("ok")
+        .expect("non-null");
+
+    // Now run doctor in fix mode. All residue findings should be advisory
+    // (prose suggested_fix like "Investigate source table..."), NOT runnable SQL.
+    // They must be reported with outcome "reported", NOT executed.
+    let doctor_rows: Vec<(String, String)> = Spi::connect(|client| {
+        let mut result = Vec::new();
+        let rs = client
+            .select(
+                "SELECT outcome, action FROM reflex_doctor('advisory_imv', TRUE) \
+                 WHERE check_id = 'F5/F6'",
+                None,
+                &[],
+            )
+            .unwrap_or_report();
+        for row in rs {
+            let outcome: String = row
+                .get_by_name::<&str, _>("outcome")
+                .unwrap_or(None)
+                .unwrap_or("")
+                .to_string();
+            let action: String = row
+                .get_by_name::<&str, _>("action")
+                .unwrap_or(None)
+                .unwrap_or("")
+                .to_string();
+            result.push((outcome, action));
+        }
+        result
+    });
+
+    // All findings should be advisory (action contains "Investigate")
+    assert!(
+        !doctor_rows.is_empty(),
+        "expected at least one F5/F6 finding in doctor output"
+    );
+
+    for (outcome, action) in doctor_rows {
+        // Advisory findings have prose action containing "Investigate"
+        if action.to_lowercase().contains("investigate") {
+            // Advisory findings must be reported, never fixed or failed
+            assert_eq!(
+                outcome, "reported",
+                "advisory residue finding should have outcome 'reported', got '{}'. \
+                 This means prose was incorrectly executed as SQL. Action was: {}",
+                outcome, action
+            );
+        }
+    }
+}
+
+#[pg_test]
+fn pg_test_doctor_collapse_many_residual_partitions() {
+    // Problem B: when an IMV has >3 confirmed-residue partitions (threshold=3),
+    // collapse them into a single reflex_reconcile(imv) action instead of per-partition ones.
+
+    // Create partitioned source with 5 partitions (ensures >3 threshold)
+    // Using LIST with explicit partitions plus DEFAULT to ensure all data lands somewhere
+    Spi::run(
+        "CREATE TABLE collapse_src (id BIGINT, region TEXT NOT NULL, amount NUMERIC) \
+         PARTITION BY LIST (region)",
+    )
+    .expect("create partitioned source");
+    Spi::run("CREATE TABLE collapse_src_us PARTITION OF collapse_src FOR VALUES IN ('us')")
+        .expect("create us partition");
+    Spi::run("CREATE TABLE collapse_src_eu PARTITION OF collapse_src FOR VALUES IN ('eu')")
+        .expect("create eu partition");
+    Spi::run("CREATE TABLE collapse_src_asia PARTITION OF collapse_src FOR VALUES IN ('asia')")
+        .expect("create asia partition");
+    Spi::run("CREATE TABLE collapse_src_br PARTITION OF collapse_src FOR VALUES IN ('br')")
+        .expect("create br partition");
+    Spi::run("CREATE TABLE collapse_src_default PARTITION OF collapse_src DEFAULT")
+        .expect("create default partition");
+
+    // Insert data to ALL source partitions (one row each is enough to trigger residue)
+    Spi::run(
+        "INSERT INTO collapse_src VALUES \
+         (1, 'us', 100), (2, 'eu', 200), (3, 'asia', 300), (4, 'br', 400), (5, 'ca', 500)",
+    )
+    .expect("seed source");
+
+    // Create partitioned IMV
+    Spi::run(
+        "SELECT create_reflex_ivm( \
+            'collapse_imv', \
+            'SELECT region, SUM(amount) AS total FROM collapse_src GROUP BY region', \
+            NULL, NULL, NULL, NULL, \
+            ARRAY['region'] \
+         )",
+    )
+    .expect("create IMV");
+
+    // Mark source as ignored (simulate archive scenario)
+    Spi::run(
+        "UPDATE public.__reflex_ivm_reference SET ignored_sources = ARRAY['collapse_src'] \
+         WHERE name = 'collapse_imv'",
+    )
+    .expect("mark ignored");
+
+    // Empty ALL target partitions to trigger confirmed residue on all of them
+    let tgt_children: Vec<String> = Spi::get_one::<Vec<String>>(
+        "SELECT array_agg(c.relname::text ORDER BY c.relname) FROM pg_inherits i \
+         JOIN pg_class c ON c.oid = i.inhrelid \
+         WHERE i.inhparent = to_regclass('collapse_imv')::oid",
+    )
+    .expect("ok")
+    .unwrap_or_default();
+
+    assert!(
+        tgt_children.len() > 3,
+        "expected >3 target partitions to test collapse threshold, got {}",
+        tgt_children.len()
+    );
+
+    for child in &tgt_children {
+        let delete_cmd = format!("DELETE FROM \"{}\"", child);
+        Spi::run(&delete_cmd).expect("empty target partition");
+    }
+
+    // Dry-run: should show exactly ONE F5/F6 row with collapsed reflex_reconcile(imv)
+    let dry_rows: Vec<(String, String)> = Spi::connect(|client| {
+        let mut result = Vec::new();
+        let rs = client
+            .select(
+                "SELECT action, finding FROM reflex_doctor('collapse_imv', FALSE) \
+                 WHERE check_id = 'F5/F6'",
+                None,
+                &[],
+            )
+            .unwrap_or_report();
+        for row in rs {
+            let action: String = row
+                .get_by_name::<&str, _>("action")
+                .unwrap_or(None)
+                .unwrap_or("")
+                .to_string();
+            let finding: String = row
+                .get_by_name::<&str, _>("finding")
+                .unwrap_or(None)
+                .unwrap_or("")
+                .to_string();
+            result.push((action, finding));
+        }
+        result
+    });
+
+    // With >3 partitions, should be collapsed into single reflex_reconcile(imv) row
+    let reconcile_rows: Vec<_> = dry_rows
+        .iter()
+        .filter(|(action, _)| action.contains("reflex_reconcile('collapse_imv')"))
+        .collect();
+
+    assert!(
+        !reconcile_rows.is_empty(),
+        "expected collapsed reflex_reconcile(imv) row when >3 partitions have residue, got: {:?}",
+        dry_rows
+    );
+
+    // Verify there is EXACTLY ONE collapsed row
+    assert_eq!(
+        reconcile_rows.len(),
+        1,
+        "expected exactly ONE collapsed reflex_reconcile(imv) row for {} residual partitions, got {}",
+        tgt_children.len(),
+        reconcile_rows.len()
+    );
+
+    // Verify the finding mentions the partition count
+    let (_, finding) = &reconcile_rows[0];
+    assert!(
+        finding.contains(&format!("{} partitions", tgt_children.len())),
+        "collapsed finding should mention partition count {}, got: {}",
+        tgt_children.len(),
+        finding
+    );
+
+    // Fix-run and verify the repair succeeds and residue is gone
+    let fix_rows: Vec<(String, String)> = Spi::connect(|client| {
+        let mut result = Vec::new();
+        let rs = client
+            .select(
+                "SELECT outcome, action FROM reflex_doctor('collapse_imv', TRUE) \
+                 WHERE check_id = 'F5/F6'",
+                None,
+                &[],
+            )
+            .unwrap_or_report();
+        for row in rs {
+            let outcome: String = row
+                .get_by_name::<&str, _>("outcome")
+                .unwrap_or(None)
+                .unwrap_or("")
+                .to_string();
+            let action: String = row
+                .get_by_name::<&str, _>("action")
+                .unwrap_or(None)
+                .unwrap_or("")
+                .to_string();
+            result.push((outcome, action));
+        }
+        result
+    });
+
+    let reconcile_fix_rows: Vec<_> = fix_rows
+        .iter()
+        .filter(|(_, action)| action.contains("reflex_reconcile('collapse_imv')"))
+        .collect();
+
+    assert!(
+        !reconcile_fix_rows.is_empty(),
+        "expected reconcile row in fix mode"
+    );
+
+    let (outcome, _) = &reconcile_fix_rows[0];
+    assert_eq!(
+        outcome, "fixed",
+        "collapsed reflex_reconcile should return 'fixed', got '{}'",
+        outcome
+    );
+
+    // Verify the residue is actually gone: re-run audit should not find archive_residue
+    let reaudit: String = Spi::get_one("SELECT reflex_audit('collapse_imv')")
+        .expect("ok")
+        .expect("non-null");
+
+    assert!(
+        !reaudit.contains("archive_residue"),
+        "after reconciliation, re-audit should not find archive_residue"
+    );
+}
+
+#[pg_test]
+fn pg_test_doctor_below_threshold_keeps_per_partition_action() {
+    // Problem B (threshold boundary): when an IMV has exactly 1 partition with
+    // confirmed residue (below the collapse threshold of 4), the action should
+    // be per-partition reflex_reconcile_partition, not collapsed reflex_reconcile.
+
+    // Create partitioned source with just 1 partition
+    Spi::run(
+        "CREATE TABLE threshold_src (id BIGINT, region TEXT NOT NULL, amount NUMERIC) \
+         PARTITION BY LIST (region)",
+    )
+    .expect("create partitioned source");
+    Spi::run("CREATE TABLE threshold_src_us PARTITION OF threshold_src FOR VALUES IN ('us')")
+        .expect("create us partition");
+
+    // Insert data
+    Spi::run("INSERT INTO threshold_src VALUES (1, 'us', 100)").expect("seed source");
+
+    // Create partitioned IMV
+    Spi::run(
+        "SELECT create_reflex_ivm( \
+            'threshold_imv', \
+            'SELECT region, SUM(amount) AS total FROM threshold_src GROUP BY region', \
+            NULL, NULL, NULL, NULL, \
+            ARRAY['region'] \
+         )",
+    )
+    .expect("create IMV");
+
+    // Mark source as ignored
+    Spi::run(
+        "UPDATE public.__reflex_ivm_reference SET ignored_sources = ARRAY['threshold_src'] \
+         WHERE name = 'threshold_imv'",
+    )
+    .expect("mark ignored");
+
+    // Empty the target partition
+    let tgt_children: Vec<String> = Spi::get_one::<Vec<String>>(
+        "SELECT array_agg(c.relname::text ORDER BY c.relname) FROM pg_inherits i \
+         JOIN pg_class c ON c.oid = i.inhrelid \
+         WHERE i.inhparent = to_regclass('threshold_imv')::oid",
+    )
+    .expect("ok")
+    .unwrap_or_default();
+
+    if !tgt_children.is_empty() {
+        let delete_cmd = format!("DELETE FROM \"{}\"", tgt_children[0]);
+        Spi::run(&delete_cmd).expect("empty target partition");
+    }
+
+    // Dry-run: should show per-partition reflex_reconcile_partition action
+    let dry_rows: Vec<(String,)> = Spi::connect(|client| {
+        let mut result = Vec::new();
+        let rs = client
+            .select(
+                "SELECT action FROM reflex_doctor('threshold_imv', FALSE) \
+                 WHERE check_id = 'F5/F6'",
+                None,
+                &[],
+            )
+            .unwrap_or_report();
+        for row in rs {
+            let action: String = row
+                .get_by_name::<&str, _>("action")
+                .unwrap_or(None)
+                .unwrap_or("")
+                .to_string();
+            result.push((action,));
+        }
+        result
+    });
+
+    assert!(
+        !dry_rows.is_empty(),
+        "expected at least one F5/F6 row in dry-run"
+    );
+
+    let (action,) = &dry_rows[0];
+    assert!(
+        action.contains("reflex_reconcile_partition"),
+        "below-threshold IMV should use per-partition action, got: {}",
+        action
+    );
+    assert!(
+        !action.contains("reflex_reconcile('threshold_imv')"),
+        "below-threshold IMV should NOT use collapsed reflex_reconcile(imv), got: {}",
+        action
+    );
+}
+
+#[pg_test]
+fn f9_f11_doctor_surfaces_orphan_and_duplicate_findings() {
+    // Orphan aux tables carrying reflex prefixes but with no owning enabled IMV.
+    Spi::run("CREATE TABLE __reflex_scratch_orphan_x (g TEXT, n BIGINT)").expect("orphan scratch");
+    Spi::run("CREATE TABLE __reflex_intermediate_orphan_y (g TEXT, n BIGINT)")
+        .expect("orphan intermediate");
+
+    // F9: orphan-scratch is surfaced with its DROP command and the object named.
+    let scratch_action: String = Spi::get_one(
+        "SELECT action FROM reflex_doctor() \
+         WHERE check_id = 'F9' AND object LIKE '%__reflex_scratch_orphan_x%' LIMIT 1",
+    )
+    .expect("q")
+    .expect("expected an F9 orphan-scratch row");
+    assert!(
+        scratch_action.contains("DROP TABLE"),
+        "orphan action should be the DROP command, got: {}",
+        scratch_action
+    );
+
+    // F9: orphan-intermediate surfaced too.
+    let inter_rows: i64 = Spi::get_one(
+        "SELECT count(*) FROM reflex_doctor() \
+         WHERE check_id = 'F9' AND object LIKE '%__reflex_intermediate_orphan_y%'",
+    )
+    .expect("q")
+    .unwrap_or(0);
+    assert!(inter_rows >= 1, "expected an F9 orphan-intermediate row");
+
+    // Orphan findings are report-only (destructive DROP is never auto-run).
+    let outcome: String = Spi::get_one(
+        "SELECT outcome FROM reflex_doctor(NULL, TRUE) \
+         WHERE check_id = 'F9' AND object LIKE '%__reflex_scratch_orphan_x%' LIMIT 1",
+    )
+    .expect("q")
+    .expect("expected an F9 row in fix mode");
+    assert_eq!(
+        outcome, "reported",
+        "orphan drops must not auto-execute in fix mode"
+    );
+}
