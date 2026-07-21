@@ -2854,3 +2854,728 @@ fn f3_swap_heals_overlapping_orphan() {
     ).expect("q").expect("v");
     assert_eq!(x_total.to_string(), "222", "X partition total should be fresh value (222)");
 }
+
+/// Bug 1: the flush error handler writes `last_error`/`failures` to the same
+/// table the deferred flush trigger fires on. Scoping the trigger to
+/// `UPDATE OF enqueued_at` means only a genuine re-enqueue re-arms it.
+#[pg_test]
+fn pg_part_pending_error_write_does_not_rearm() {
+    // Check that the trigger is scoped to enqueued_at column only
+    let event_count_result: Option<i64> = Spi::get_one(
+        "SELECT count(*) FROM pg_trigger t
+          WHERE t.tgname = '__reflex_partition_flush_trigger'
+            AND t.tgattr::int2[] @> ARRAY[
+                  (SELECT attnum FROM pg_attribute
+                    WHERE attrelid = 'public.__reflex_partition_pending'::regclass
+                      AND attname = 'enqueued_at')]::int2[]",
+    )
+    .expect("trigger column scope query");
+    let events = event_count_result.expect("count");
+    assert_eq!(
+        events, 1,
+        "flush trigger must be scoped to the enqueued_at column"
+    );
+
+    // Create a partitioned test source to use as the root
+    Spi::run("CREATE TABLE test_pend_src (id INT) PARTITION BY RANGE (id)").expect("create partitioned test source");
+    Spi::run("CREATE TABLE test_pend_src_part1 PARTITION OF test_pend_src FOR VALUES FROM (1) TO (100)")
+        .expect("create partition");
+
+    // Seed the pending table via direct INSERT (bypassing enqueued_at enforcement)
+    // Use DISABLE TRIGGER to prevent the flush trigger from firing on INSERT
+    Spi::run("ALTER TABLE public.__reflex_partition_pending DISABLE TRIGGER __reflex_partition_flush_trigger")
+        .expect("disable trigger");
+    Spi::run(
+        "INSERT INTO public.__reflex_partition_pending (source_root, enqueued_at, failures)
+         VALUES ('public.test_pend_src', NOW(), 0)",
+    )
+    .expect("seed pending row");
+    Spi::run("ALTER TABLE public.__reflex_partition_pending ENABLE TRIGGER __reflex_partition_flush_trigger")
+        .expect("enable trigger");
+
+    // The error-handler pattern: touches only last_error + failures (not enqueued_at).
+    // This update simulates what an EXCEPTION handler will do in Task 2.
+    // With UPDATE OF enqueued_at scoping, this should NOT re-arm the trigger.
+    Spi::run(
+        "UPDATE public.__reflex_partition_pending
+            SET last_error = 'simulated error', failures = failures + 1
+          WHERE source_root = 'public.test_pend_src'",
+    )
+    .expect("error-handler style update must not re-arm the flush");
+
+    // Force any deferred triggers to fire; none should fire for this update
+    // because it only touches last_error and failures, not enqueued_at
+    Spi::run("SET CONSTRAINTS ALL IMMEDIATE").expect("trigger fire check");
+
+    // Verify the failures column was incremented and persisted (this proves
+    // the row survived the update and the trigger did not re-fire)
+    let failures_result: Option<i32> = Spi::get_one(
+        "SELECT COALESCE(failures, 0) FROM public.__reflex_partition_pending WHERE source_root = 'public.test_pend_src'",
+    )
+    .expect("failures query");
+    let failures = failures_result.expect("get failures");
+    assert_eq!(failures, 1, "failures must increment without re-arming trigger");
+
+    // Positive control: UPDATE OF enqueued_at MUST re-arm the trigger and fire the flush.
+    // The flush deletes the pending row on success, so asserting its absence proves
+    // the trigger fired and the flush executed.
+    Spi::run(
+        "UPDATE public.__reflex_partition_pending
+            SET enqueued_at = NOW()
+          WHERE source_root = 'public.test_pend_src'",
+    )
+    .expect("update enqueued_at for positive control");
+
+    Spi::run("SET CONSTRAINTS ALL IMMEDIATE").expect("trigger fire for positive control");
+
+    // Assert the row is now gone, deleted by the successful flush.
+    let remaining_count: Option<i64> = Spi::get_one(
+        "SELECT count(*) FROM public.__reflex_partition_pending WHERE source_root = 'public.test_pend_src'",
+    )
+    .expect("count after flush");
+    let count = remaining_count.expect("get count");
+    assert_eq!(
+        count, 0,
+        "pending row must be deleted by flush triggered via UPDATE OF enqueued_at"
+    );
+}
+
+/// Bug 1: a root that has already failed the cap number of times is skipped,
+/// so a poison root cannot hang a committing backend indefinitely.
+#[pg_test]
+fn pg_part_flush_skips_root_past_failure_cap() {
+    Spi::run(
+        "INSERT INTO public.__reflex_partition_pending (source_root, failures)
+         VALUES ('public.poison_src', 5)",
+    )
+    .expect("seed capped root");
+
+    let out = Spi::get_one::<String>("SELECT reflex_flush_partitions()")
+        .expect("flush call")
+        .expect("flush result");
+    assert!(
+        !out.starts_with("ERROR"),
+        "capped root must be skipped, not fatal: {out}"
+    );
+
+    let still_pending: i64 = Spi::get_one(
+        "SELECT count(*) FROM public.__reflex_partition_pending WHERE source_root = 'public.poison_src'",
+    )
+    .expect("pending query")
+    .unwrap_or(0);
+    assert_eq!(
+        still_pending, 1,
+        "capped root keeps its pending row for reflex_doctor"
+    );
+}
+
+/// The deferred commit-time trigger reaches the flush via
+/// `reflex_flush_partition_source(root)` (the single-root path), not the
+/// queue-draining `reflex_flush_partitions()`. The cap must engage there too, or
+/// a poison root is retried on every triggering commit — exactly the path the
+/// production deadlock occurred on.
+#[pg_test]
+fn pg_part_flush_source_skips_root_past_failure_cap() {
+    Spi::run(
+        "INSERT INTO public.__reflex_partition_pending (source_root, failures)
+         VALUES ('public.poison_src', 5)",
+    )
+    .expect("seed capped root");
+
+    let out = Spi::get_one::<String>("SELECT reflex_flush_partition_source('public.poison_src')")
+        .expect("flush call")
+        .expect("flush result");
+    assert!(
+        !out.starts_with("ERROR"),
+        "capped root must be skipped on the single-root path, not fatal: {out}"
+    );
+
+    let still_pending: i64 = Spi::get_one(
+        "SELECT count(*) FROM public.__reflex_partition_pending WHERE source_root = 'public.poison_src'",
+    )
+    .expect("pending query")
+    .unwrap_or(0);
+    assert_eq!(
+        still_pending, 1,
+        "capped root keeps its pending row on the single-root path too"
+    );
+}
+
+#[pg_test]
+fn pg_part_flush_failure_increments_counter_across_rollback() {
+    Spi::run(
+        "CREATE TABLE fail_src (id INT, region TEXT NOT NULL, amount NUMERIC) PARTITION BY LIST (region)"
+    )
+    .expect("create partitioned source");
+    Spi::run("CREATE TABLE fail_src_north PARTITION OF fail_src FOR VALUES IN ('NORTH')")
+        .expect("create partition");
+    Spi::run("INSERT INTO fail_src (id, region, amount) VALUES (1, 'NORTH', 100)")
+        .expect("seed data");
+
+    let create_result = Spi::get_one::<String>(
+        "SELECT create_reflex_ivm(
+            'fail_imv',
+            'SELECT region, SUM(amount) AS total FROM fail_src GROUP BY region',
+            NULL, NULL, NULL, NULL,
+            ARRAY['region']
+         )",
+    )
+    .expect("create IMV call")
+    .expect("create IMV result");
+    assert!(!create_result.starts_with("ERROR"), "IMV creation failed: {create_result}");
+
+    Spi::run("ALTER TABLE public.__reflex_partition_pending DISABLE TRIGGER __reflex_partition_flush_trigger")
+        .expect("disable trigger");
+    Spi::run(
+        "INSERT INTO public.__reflex_partition_pending (source_root, enqueued_at, failures)
+         VALUES ('public.fail_src', NOW(), 0)",
+    )
+    .expect("seed pending row");
+    Spi::run("ALTER TABLE public.__reflex_partition_pending ENABLE TRIGGER __reflex_partition_flush_trigger")
+        .expect("enable trigger");
+
+    let pending_count_before_flush: i64 = Spi::get_one(
+        "SELECT count(*) FROM public.__reflex_partition_pending WHERE source_root = 'public.fail_src'",
+    )
+    .expect("pending count before flush")
+    .unwrap_or(0);
+    assert_eq!(pending_count_before_flush, 1, "pending row must be seeded before flush");
+
+    Spi::run(
+        "CREATE FUNCTION fail_trigger_func() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+         BEGIN RAISE EXCEPTION 'simulated flush failure'; END; $$"
+    )
+    .expect("create trigger function");
+
+    Spi::run(
+        "CREATE TRIGGER fail_pending_delete_trigger BEFORE DELETE ON public.__reflex_partition_pending
+         FOR EACH ROW WHEN (OLD.source_root = 'public.fail_src')
+         EXECUTE FUNCTION fail_trigger_func()"
+    )
+    .expect("create trigger to force flush failure");
+
+    let _flush_out = Spi::get_one::<String>("SELECT reflex_flush_partitions()")
+        .expect("first flush call")
+        .expect("first flush result");
+
+    let pending_count_after_flush: i64 = Spi::get_one(
+        "SELECT count(*) FROM public.__reflex_partition_pending WHERE source_root = 'public.fail_src'",
+    )
+    .expect("pending count after flush")
+    .unwrap_or(0);
+
+    if pending_count_after_flush == 0 {
+        panic!("pending row was deleted - flush succeeded when it should have failed");
+    }
+
+    let failures_after_first: Option<i32> = Spi::get_one(
+        "SELECT failures FROM public.__reflex_partition_pending WHERE source_root = 'public.fail_src'",
+    )
+    .expect("first failures query");
+    assert_eq!(failures_after_first, Some(1), "failures must be 1 after first failed flush");
+
+    let error_after_first: Option<String> = Spi::get_one(
+        "SELECT last_error FROM public.__reflex_partition_pending WHERE source_root = 'public.fail_src'",
+    )
+    .ok()
+    .flatten();
+    assert!(
+        error_after_first.is_some() && !error_after_first.as_ref().map(|s| s.is_empty()).unwrap_or(true),
+        "last_error must be populated after failed flush"
+    );
+
+    let _flush_out2 = Spi::get_one::<String>("SELECT reflex_flush_partitions()")
+        .expect("second flush call")
+        .expect("second flush result");
+
+    let failures_after_second: Option<i32> = Spi::get_one(
+        "SELECT failures FROM public.__reflex_partition_pending WHERE source_root = 'public.fail_src'",
+    )
+    .expect("second failures query");
+    assert_eq!(failures_after_second, Some(2), "failures must be 2 after second failed flush");
+
+    let still_pending: i64 = Spi::get_one(
+        "SELECT count(*) FROM public.__reflex_partition_pending WHERE source_root = 'public.fail_src'",
+    )
+    .expect("pending row count query")
+    .unwrap_or(0);
+    assert_eq!(still_pending, 1, "pending row must survive failed flush for retry");
+}
+
+/// F4: the pending table stores source_root canonically (schema.relname). A
+/// single-root flush called with a BARE name must still match the stored row,
+/// so the failure cap engages instead of being silently bypassed.
+#[pg_test]
+fn pg_part_flush_source_canonicalizes_bare_root() {
+    Spi::run("CREATE TABLE fc_src (id INT) PARTITION BY RANGE (id)").expect("src");
+    // Below the cap, so the root is PROCESSED. A successful flush drains the
+    // pending row via `DELETE ... WHERE source_root = <root>`. The row is stored
+    // qualified; a bare call must canonicalize to 'public.fc_src' for that DELETE
+    // to match. This discriminates the fix: without canonicalization the bare
+    // DELETE misses the qualified row and it survives; with it, the row is gone.
+    Spi::run("INSERT INTO public.__reflex_partition_pending (source_root, failures) \
+              VALUES ('public.fc_src', 0)").expect("seed qualified, below cap");
+
+    let out = Spi::get_one::<String>("SELECT reflex_flush_partition_source('fc_src')")
+        .expect("flush").expect("result");
+    assert!(!out.starts_with("ERROR"), "bare flush must not be fatal: {out}");
+
+    let remaining: i64 = Spi::get_one(
+        "SELECT count(*) FROM public.__reflex_partition_pending WHERE source_root = 'public.fc_src'",
+    ).expect("q").unwrap_or(-1);
+    assert_eq!(remaining, 0, "successful bare flush must drain the stored qualified pending row");
+}
+
+/// Bug 2 regression: rows for a key whose source leaf appeared only AFTER the
+/// IMV was built (the field report's stuck-flush gap) sit in the IMV's DEFAULT
+/// partition. reflex_sync_partitions must then create the dedicated IMV leaf,
+/// which PostgreSQL refuses while the default holds a matching row (SQLSTATE
+/// 23514) unless those rows are first drained OUT of the default and INTO the
+/// new leaf. Because sync creates leaves WITHOUT filling them, the drain must
+/// MOVE the rows, never DELETE them — a DELETE would lose the only copy.
+///
+/// Precondition (asserted, not assumed): the IMV must genuinely hold residue in
+/// its default before the sync. The source-side leaf is added under
+/// `session_replication_role = replica` so the IMV's maintenance trigger does
+/// not fire and undo that residue — reproducing the gap a stuck flush leaves.
+#[pg_test]
+fn pg_part_standalone_sync_preserves_default_rows() {
+    Spi::run("CREATE TABLE sp_src (k TEXT NOT NULL, v INT) PARTITION BY LIST (k)").expect("src");
+    Spi::run("CREATE TABLE sp_src_a PARTITION OF sp_src FOR VALUES IN ('a')").expect("src a");
+    Spi::run("CREATE TABLE sp_src_def PARTITION OF sp_src DEFAULT").expect("src default");
+    Spi::run("INSERT INTO sp_src VALUES ('a', 1), ('a', 2)").expect("seed a");
+
+    let sql = "SELECT k, sum(v) AS s FROM sp_src GROUP BY k";
+    let res = Spi::get_one::<String>(&format!(
+        "SELECT create_reflex_ivm('sp_imv', '{}', 'k', NULL, NULL, NULL, ARRAY['k'])",
+        sql.replace('\'', "''")
+    ))
+    .expect("create call")
+    .expect("create result");
+    assert!(!res.starts_with("ERROR"), "create returned: {res}");
+
+    // 'b' has no source leaf yet, so its rows fall to the source default and the
+    // IMV maintains their aggregate into ITS default (no 'b' IMV leaf exists).
+    Spi::run("INSERT INTO sp_src VALUES ('b', 10)").expect("seed b into source default");
+    Spi::run("SET CONSTRAINTS ALL IMMEDIATE").expect("maintain IMV");
+
+    // Confirm the precondition: the IMV default now holds the ('b', 10) aggregate.
+    let default_rows: i64 = Spi::get_one(
+        "SELECT s::bigint FROM sp_imv_sp_src_def WHERE k = 'b'",
+    )
+    .expect("imv default probe")
+    .unwrap_or(-1);
+    assert_eq!(
+        default_rows, 10,
+        "precondition: IMV default must hold the 'b' aggregate before sync"
+    );
+
+    // The app promotes 'b' to a dedicated source leaf. Done under replica role so
+    // the IMV's maintenance trigger does not fire — the IMV keeps its default
+    // residue, exactly as it would while a flush is stuck.
+    Spi::run("SET session_replication_role = replica").expect("suppress triggers");
+    Spi::run("ALTER TABLE sp_src DETACH PARTITION sp_src_def").expect("detach src default");
+    Spi::run("CREATE TABLE sp_src_b PARTITION OF sp_src FOR VALUES IN ('b')").expect("src b");
+    Spi::run("INSERT INTO sp_src_b SELECT * FROM sp_src_def WHERE k = 'b'").expect("move b in src");
+    Spi::run("DELETE FROM sp_src_def WHERE k = 'b'").expect("clear b from src default");
+    Spi::run("ALTER TABLE sp_src ATTACH PARTITION sp_src_def DEFAULT").expect("reattach src default");
+    Spi::run("SET session_replication_role = origin").expect("restore triggers");
+
+    let before: i64 = Spi::get_one("SELECT count(*) FROM sp_imv")
+        .expect("before count").unwrap_or(-1);
+
+    // Without the default drain this fails with SQLSTATE 23514 (sync returns an
+    // ERROR string); with a DELETE-based drain the 'b' aggregate would vanish.
+    let sync = Spi::get_one::<String>("SELECT reflex_sync_partitions('sp_imv')")
+        .expect("sync call")
+        .expect("sync result");
+    assert!(!sync.starts_with("ERROR"), "sync returned: {sync}");
+
+    let after: i64 = Spi::get_one("SELECT count(*) FROM sp_imv")
+        .expect("after count").unwrap_or(-1);
+    assert_eq!(
+        after, before,
+        "sync must not lose IMV rows held in the default partition"
+    );
+
+    let b_total: i64 = Spi::get_one("SELECT s::bigint FROM sp_imv WHERE k = 'b'")
+        .expect("b query").unwrap_or(-1);
+    assert_eq!(b_total, 10, "the 'b' aggregate must move into the new leaf, not be deleted");
+
+    let b_in_default: i64 = Spi::get_one(
+        "SELECT count(*) FROM sp_imv_sp_src_def WHERE k = 'b'",
+    )
+    .expect("default recheck")
+    .unwrap_or(-1);
+    assert_eq!(b_in_default, 0, "the 'b' aggregate must no longer be in the default");
+}
+
+/// Task 4 regression: second sync call on a partitioned IMV whose default
+/// partition already exists must preserve default-resident rows. Retained across
+/// the drain rewrite: a re-sync where the IMV default holds legitimate data for
+/// keys without dedicated leaves must never lose that data. (It originally
+/// guarded a self-referential per-node-drain truncation bug; the tree-wide drain
+/// that replaced it never touches a default self-referentially, and this test
+/// keeps the row-preservation guarantee locked regardless of mechanism.)
+///
+/// This test builds a scenario where the IMV default holds legitimate data for
+/// keys without dedicated leaves, then calls reflex_sync_partitions a second
+/// time (when the default already exists), and asserts the data survives intact.
+#[pg_test]
+fn pg_part_default_self_reference_resync_preserves_data() {
+    Spi::run("CREATE TABLE sr_src (k TEXT NOT NULL, v INT) PARTITION BY LIST (k)").expect("src");
+    Spi::run("CREATE TABLE sr_src_a PARTITION OF sr_src FOR VALUES IN ('a')").expect("src a");
+    Spi::run("CREATE TABLE sr_src_def PARTITION OF sr_src DEFAULT").expect("src default");
+    Spi::run("INSERT INTO sr_src VALUES ('a', 1), ('a', 2)").expect("seed a");
+
+    let sql = "SELECT k, sum(v) AS s FROM sr_src GROUP BY k";
+    let res = Spi::get_one::<String>(&format!(
+        "SELECT create_reflex_ivm('sr_imv', '{}', 'k', NULL, NULL, NULL, ARRAY['k'])",
+        sql.replace('\'', "''")
+    ))
+    .expect("create call")
+    .expect("create result");
+    assert!(!res.starts_with("ERROR"), "create returned: {res}");
+
+    // Key 'b' has no source leaf, so its rows fall into source default and
+    // IMV default holds their aggregate.
+    Spi::run("INSERT INTO sr_src VALUES ('b', 100)").expect("seed b into source default");
+    Spi::run("SET CONSTRAINTS ALL IMMEDIATE").expect("maintain IMV");
+
+    // Precondition: IMV default holds ('b', 100) aggregate.
+    let default_val: i64 = Spi::get_one(
+        "SELECT s::bigint FROM sr_imv_sr_src_def WHERE k = 'b'",
+    )
+    .expect("imv default probe")
+    .unwrap_or(-1);
+    assert_eq!(
+        default_val, 100,
+        "precondition: IMV default must hold the 'b' aggregate before resync"
+    );
+
+    let before: i64 = Spi::get_one("SELECT count(*) FROM sr_imv")
+        .expect("before count").unwrap_or(-1);
+
+    // Second sync call: the IMV default already exists and holds the 'b'
+    // aggregate. The tree-wide drain empties it into a holding table and refills
+    // by routing; 'b' has no dedicated leaf, so it must land back in the default.
+    let sync = Spi::get_one::<String>("SELECT reflex_sync_partitions('sr_imv')")
+        .expect("resync call")
+        .expect("resync result");
+    assert!(!sync.starts_with("ERROR"), "resync returned: {sync}");
+
+    let after: i64 = Spi::get_one("SELECT count(*) FROM sr_imv")
+        .expect("after count").unwrap_or(-1);
+    assert_eq!(
+        after, before,
+        "resync must not lose IMV rows held in the default partition"
+    );
+
+    // Verify the exact value is still correct after resync.
+    let b_total: i64 = Spi::get_one("SELECT s::bigint FROM sr_imv WHERE k = 'b'")
+        .expect("b query").unwrap_or(-1);
+    assert_eq!(b_total, 100, "the 'b' aggregate must survive the resync intact");
+
+    let b_in_default: i64 = Spi::get_one(
+        "SELECT count(*) FROM sr_imv_sr_src_def WHERE k = 'b'",
+    )
+    .expect("default recheck")
+    .unwrap_or(-1);
+    assert_eq!(b_in_default, 1, "the 'b' aggregate must still be in the default");
+}
+
+/// F2: drain empties every default in a tree into holding tables, the caller
+/// builds new leaves against the now-empty defaults, and refill relocates rows
+/// via tuple routing into the correct leaf (unmatched rows stay in the default).
+/// Multi-level tree: LIST(region) -> RANGE(month), residue in the TOP default.
+#[pg_test]
+fn pg_part_drain_refill_multilevel_relocates_rows() {
+    Spi::run("CREATE TABLE dm_p (region TEXT NOT NULL, mon DATE NOT NULL, v INT) \
+              PARTITION BY LIST (region)").expect("parent");
+    Spi::run("CREATE TABLE dm_p_default PARTITION OF dm_p DEFAULT").expect("default");
+    // Residue: region 'r1' has no dedicated subtree yet, so its rows sit in the default.
+    Spi::run("INSERT INTO dm_p VALUES ('r1', '2026-02-10', 1), ('r1', '2026-05-10', 2), \
+              ('rx', '2026-02-10', 9)").expect("seed");
+
+    // Wrapper: drain the tree's defaults, build the r1 subtree (region leaf +
+    // two month leaves) against the emptied default, then refill.
+    let build = "CREATE TABLE dm_p_r1 PARTITION OF dm_p FOR VALUES IN ('r1') PARTITION BY RANGE (mon);\
+                 CREATE TABLE dm_p_r1_q1 PARTITION OF dm_p_r1 FOR VALUES FROM ('2026-01-01') TO ('2026-04-01');\
+                 CREATE TABLE dm_p_r1_q2 PARTITION OF dm_p_r1 FOR VALUES FROM ('2026-04-01') TO ('2026-07-01')";
+    let out = Spi::get_one::<String>(&format!(
+        "SELECT __reflex_test_drain_build_refill('public.dm_p', '{}')",
+        build.replace('\'', "''")
+    )).expect("call").expect("result");
+    assert_eq!(out, "OK", "drain/build/refill returned: {out}");
+
+    // The two r1 rows relocated into the correct month leaves.
+    let q1: i64 = Spi::get_one("SELECT count(*) FROM dm_p_r1_q1").expect("q1").unwrap_or(-1);
+    let q2: i64 = Spi::get_one("SELECT count(*) FROM dm_p_r1_q2").expect("q2").unwrap_or(-1);
+    assert_eq!(q1, 1, "Feb r1 row -> q1 leaf");
+    assert_eq!(q2, 1, "May r1 row -> q2 leaf");
+    // The unrelated 'rx' row stays in the default; total is preserved.
+    let dflt: i64 = Spi::get_one("SELECT count(*) FROM dm_p_default").expect("d").unwrap_or(-1);
+    assert_eq!(dflt, 1, "rx row (no leaf) stays in the default");
+    let total: i64 = Spi::get_one("SELECT count(*) FROM dm_p").expect("t").unwrap_or(-1);
+    assert_eq!(total, 3, "no rows lost");
+}
+
+/// F2: a tree with no default partition — drain is a no-op, build proceeds.
+#[pg_test]
+fn pg_part_drain_refill_noop_without_default() {
+    Spi::run("CREATE TABLE dn2_p (k TEXT NOT NULL, v INT) PARTITION BY LIST (k)").expect("parent");
+    let out = Spi::get_one::<String>(
+        "SELECT __reflex_test_drain_build_refill('public.dn2_p', \
+         'CREATE TABLE dn2_p_a PARTITION OF dn2_p FOR VALUES IN (''a'')')",
+    ).expect("call").expect("result");
+    assert_eq!(out, "OK", "returned: {out}");
+    let exists: i64 = Spi::get_one("SELECT count(*) FROM pg_class WHERE relname = 'dn2_p_a'")
+        .expect("q").unwrap_or(0);
+    assert_eq!(exists, 1, "leaf created when there is no default");
+}
+
+/// F2 end-to-end: a multi-level partitioned PASSTHROUGH IMV
+/// (LIST dem_plan_id -> RANGE order_date) with residue in the IMV's top default
+/// for a plan promoted later. Standalone reflex_sync_partitions must build the
+/// plan subtree and relocate the residue into the correct month leaf — the case
+/// the per-node drain aborted on. Multi-level partition_by is supported for
+/// passthrough IMVs (see pg_test_subpartition.rs), not aggregates.
+#[pg_test]
+fn pg_part_sync_multilevel_default_residue_recovered() {
+    Spi::run("CREATE TABLE mls (dem_plan_id BIGINT NOT NULL, order_date DATE NOT NULL, \
+              product_id BIGINT, qty INT) PARTITION BY LIST (dem_plan_id)").expect("src");
+    Spi::run("CREATE TABLE mls_172 PARTITION OF mls FOR VALUES IN (172) PARTITION BY RANGE (order_date)")
+        .expect("172");
+    Spi::run("CREATE TABLE mls_172_q1 PARTITION OF mls_172 FOR VALUES FROM ('2026-01-01') TO ('2026-04-01')")
+        .expect("172q1");
+    Spi::run("CREATE TABLE mls_def PARTITION OF mls DEFAULT").expect("src default");
+    Spi::run("INSERT INTO mls VALUES (172, '2026-02-01', 1, 10)").expect("seed 172");
+
+    let res = Spi::get_one::<String>(
+        "SELECT create_reflex_ivm('mlv', \
+         'SELECT dem_plan_id, order_date, product_id, qty FROM mls', \
+         'dem_plan_id,product_id,order_date', NULL, NULL, NULL, ARRAY['dem_plan_id','order_date'])",
+    ).expect("create").expect("result");
+    assert!(!res.starts_with("ERROR"), "create returned: {res}");
+
+    // Plan 999 has no source leaf yet: its row falls to the source default and
+    // the IMV maintains its passthrough copy into its own top default.
+    Spi::run("INSERT INTO mls VALUES (999, '2026-05-01', 2, 20)").expect("seed 999");
+    Spi::run("SET CONSTRAINTS ALL IMMEDIATE").expect("maintain");
+
+    // Promote 999 on the source side under replica role so the IMV keeps its
+    // default residue (simulating the stuck-flush gap).
+    Spi::run("SET session_replication_role = replica").expect("suppress");
+    Spi::run("ALTER TABLE mls DETACH PARTITION mls_def").expect("detach");
+    Spi::run("CREATE TABLE mls_999 PARTITION OF mls FOR VALUES IN (999) PARTITION BY RANGE (order_date)").expect("999");
+    Spi::run("CREATE TABLE mls_999_q2 PARTITION OF mls_999 FOR VALUES FROM ('2026-04-01') TO ('2026-07-01')").expect("999q2");
+    Spi::run("INSERT INTO mls_999_q2 SELECT * FROM mls_def WHERE dem_plan_id=999").expect("move");
+    Spi::run("DELETE FROM mls_def WHERE dem_plan_id=999").expect("clear");
+    Spi::run("ALTER TABLE mls ATTACH PARTITION mls_def DEFAULT").expect("reattach");
+    Spi::run("SET session_replication_role = origin").expect("restore");
+
+    let before: i64 = Spi::get_one("SELECT count(*) FROM mlv").expect("before").unwrap_or(-1);
+    let sync = Spi::get_one::<String>("SELECT reflex_sync_partitions('mlv')")
+        .expect("sync").expect("result");
+    assert!(!sync.starts_with("ERROR"), "sync returned: {sync}");
+
+    let after: i64 = Spi::get_one("SELECT count(*) FROM mlv").expect("after").unwrap_or(-1);
+    assert_eq!(after, before, "no IMV rows lost draining the multi-level default");
+    let qty999: i64 = Spi::get_one("SELECT qty::bigint FROM mlv WHERE dem_plan_id=999")
+        .expect("999").unwrap_or(-1);
+    assert_eq!(qty999, 20, "the 999 row relocated into the new subtree");
+}
+
+/// Task 2 hardening, Finding 1: the tree-wide default drain/build/refill in
+/// `reflex_sync_partitions` is a pure PHYSICAL relocation of rows already
+/// present in the IMV -- its logical content does not change. But when the
+/// IMV being synced is itself a SOURCE for a downstream chained IMV, its
+/// target table carries an `AFTER INSERT ... FOR EACH STATEMENT ...
+/// REFERENCING NEW TABLE` maintenance trigger (schema_builder.rs). The
+/// drain's `DELETE FROM <default leaf>` does NOT fire that trigger (it isn't
+/// the partitioned root), but the refill's `INSERT INTO <root>` DOES -- so an
+/// unguarded refill re-counts merely-relocated rows into the downstream IMV.
+#[pg_test]
+fn pg_part_sync_refill_does_not_double_count_downstream_imv() {
+    Spi::run("CREATE TABLE dtr_src (k TEXT NOT NULL, v INT) PARTITION BY LIST (k)").expect("src");
+    Spi::run("CREATE TABLE dtr_src_a PARTITION OF dtr_src FOR VALUES IN ('a')").expect("src a");
+    Spi::run("CREATE TABLE dtr_src_def PARTITION OF dtr_src DEFAULT").expect("src default");
+    Spi::run("INSERT INTO dtr_src VALUES ('a', 1), ('a', 2)").expect("seed a");
+
+    // IMV_A: partitioned aggregate over the source.
+    let ca = Spi::get_one::<String>(
+        "SELECT create_reflex_ivm('dtr_a', 'SELECT k, sum(v) AS s FROM dtr_src GROUP BY k', \
+         'k', NULL, NULL, NULL, ARRAY['k'])",
+    )
+    .expect("create a call")
+    .expect("create a result");
+    assert!(!ca.starts_with("ERROR"), "create IMV_A returned: {ca}");
+
+    // IMV_B chains off IMV_A's target table: a scalar aggregate, unpartitioned.
+    let cb = Spi::get_one::<String>(
+        "SELECT create_reflex_ivm('dtr_b', 'SELECT sum(s) AS total FROM dtr_a')",
+    )
+    .expect("create b call")
+    .expect("create b result");
+    assert!(!cb.starts_with("ERROR"), "create IMV_B returned: {cb}");
+
+    // Key 'b' has no source leaf yet: its row falls to the source default,
+    // IMV_A maintains the aggregate into ITS OWN default, and that genuinely
+    // new row cascades normally into IMV_B (correct: real new data).
+    Spi::run("INSERT INTO dtr_src VALUES ('b', 10)").expect("seed b into source default");
+    Spi::run("SET CONSTRAINTS ALL IMMEDIATE").expect("maintain");
+
+    let default_val: i64 = Spi::get_one("SELECT s::bigint FROM dtr_a_dtr_src_def WHERE k = 'b'")
+        .expect("imv_a default probe")
+        .unwrap_or(-1);
+    assert_eq!(
+        default_val, 10,
+        "precondition: IMV_A default must hold the 'b' aggregate before promotion"
+    );
+
+    let before: i64 = Spi::get_one("SELECT total::bigint FROM dtr_b")
+        .expect("before")
+        .unwrap_or(-1);
+    assert_eq!(before, 13, "precondition: IMV_B must already reflect the 'b' aggregate");
+
+    // Promote 'b' on the SOURCE under replica role so IMV_A's own maintenance
+    // trigger does not fire -- IMV_A keeps its default residue for 'b', exactly
+    // the shape a stuck flush (or a lagging sync) leaves behind.
+    Spi::run("SET session_replication_role = replica").expect("suppress");
+    Spi::run("ALTER TABLE dtr_src DETACH PARTITION dtr_src_def").expect("detach src default");
+    Spi::run("CREATE TABLE dtr_src_b PARTITION OF dtr_src FOR VALUES IN ('b')").expect("src b");
+    Spi::run("INSERT INTO dtr_src_b SELECT * FROM dtr_src_def WHERE k = 'b'").expect("move b in src");
+    Spi::run("DELETE FROM dtr_src_def WHERE k = 'b'").expect("clear b from src default");
+    Spi::run("ALTER TABLE dtr_src ATTACH PARTITION dtr_src_def DEFAULT").expect("reattach src default");
+    Spi::run("SET session_replication_role = origin").expect("restore triggers");
+
+    let sync = Spi::get_one::<String>("SELECT reflex_sync_partitions('dtr_a')")
+        .expect("sync call")
+        .expect("sync result");
+    assert!(!sync.starts_with("ERROR"), "sync returned: {sync}");
+
+    // Sync only RELOCATES the 'b' row within IMV_A (default -> new dedicated
+    // leaf); it must be invisible to IMV_A's own downstream maintenance trigger.
+    let after: i64 = Spi::get_one("SELECT total::bigint FROM dtr_b")
+        .expect("after")
+        .unwrap_or(-1);
+    assert_eq!(
+        after, before,
+        "sync's drain/refill relocation must not re-count rows into a downstream IMV"
+    );
+
+    // IMV_A's own content is correct: 'b' now sits in its dedicated leaf, not lost.
+    let b_total: i64 = Spi::get_one("SELECT s::bigint FROM dtr_a WHERE k = 'b'")
+        .expect("b total")
+        .unwrap_or(-1);
+    assert_eq!(b_total, 10, "the 'b' aggregate must survive the relocation intact");
+
+    let b_in_default: i64 = Spi::get_one("SELECT count(*) FROM dtr_a_dtr_src_def WHERE k = 'b'")
+        .expect("default recheck")
+        .unwrap_or(-1);
+    assert_eq!(b_in_default, 0, "the 'b' aggregate must no longer be in IMV_A's default");
+}
+
+/// Task 2 hardening, Finding 2: residue in a NESTED internal default (a
+/// region's own default under the LIST level, not the tree's top default).
+/// Source: LIST(l1) -> RANGE(l2). Region 'r1' has a dedicated LIST leaf that
+/// is itself RANGE-subpartitioned with ONE dedicated month leaf and its OWN
+/// default (`nst_src_r1_def`); a separate, unrelated top-level default
+/// (`nst_src_def`) also exists so the two are never confused. A row for r1
+/// whose month misses the dedicated leaf lands in r1's OWN default, not the
+/// top one. Multi-level partition_by is only supported for PASSTHROUGH IMVs
+/// (aggregates reject non-empty sub-levels; see pg_test_subpartition.rs), so
+/// this uses a passthrough mirror of the shape, matching
+/// `pg_part_sync_multilevel_default_residue_recovered` above but with the
+/// residue moved one level deeper -- into the region's own default instead of
+/// the tree root's.
+#[pg_test]
+fn pg_part_sync_nested_default_residue_recovered() {
+    Spi::run(
+        "CREATE TABLE nst_src (l1 TEXT NOT NULL, l2 DATE NOT NULL, item BIGINT, qty INT) \
+         PARTITION BY LIST (l1)",
+    )
+    .expect("src");
+    Spi::run("CREATE TABLE nst_src_r1 PARTITION OF nst_src FOR VALUES IN ('r1') PARTITION BY RANGE (l2)")
+        .expect("src r1");
+    Spi::run("CREATE TABLE nst_src_r1_q1 PARTITION OF nst_src_r1 FOR VALUES FROM ('2026-01-01') TO ('2026-04-01')")
+        .expect("src r1 q1");
+    Spi::run("CREATE TABLE nst_src_r1_def PARTITION OF nst_src_r1 DEFAULT").expect("src r1 default (nested)");
+    Spi::run("CREATE TABLE nst_src_def PARTITION OF nst_src DEFAULT").expect("src top default");
+    Spi::run("INSERT INTO nst_src VALUES ('r1', '2026-02-01', 1, 10)").expect("seed r1 q1");
+
+    let res = Spi::get_one::<String>(
+        "SELECT create_reflex_ivm('nst_v', \
+         'SELECT l1, l2, item, qty FROM nst_src', \
+         'l1,item,l2', NULL, NULL, NULL, ARRAY['l1','l2'])",
+    )
+    .expect("create")
+    .expect("result");
+    assert!(!res.starts_with("ERROR"), "create returned: {res}");
+
+    // A second r1 row whose month (May) misses the dedicated q1 leaf (Jan-Mar)
+    // routes to r1's OWN default -- not the tree's top default. The IMV
+    // maintains the passthrough copy into ITS nested default, one level below
+    // the tree root.
+    Spi::run("INSERT INTO nst_src VALUES ('r1', '2026-05-01', 2, 20)").expect("seed r1 residue");
+    Spi::run("SET CONSTRAINTS ALL IMMEDIATE").expect("maintain");
+
+    // Precondition: residue sits in the IMV's NESTED default (under r1), and
+    // the unrelated top-level default is untouched.
+    let nested_qty: i32 = Spi::get_one("SELECT qty FROM nst_v_nst_src_r1_def WHERE item = 2")
+        .expect("nested default probe")
+        .unwrap_or(-1);
+    assert_eq!(nested_qty, 20, "precondition: residue must sit in r1's own default");
+    let top_default_rows: i64 = Spi::get_one("SELECT count(*) FROM nst_v_nst_src_def")
+        .expect("top default probe")
+        .unwrap_or(-1);
+    assert_eq!(top_default_rows, 0, "precondition: the top-level default must stay empty");
+
+    // Promote the deeper (r1, May) leaf on the SOURCE under replica role so
+    // the IMV's own trigger does not fire -- the IMV keeps its nested-default
+    // residue, exactly the shape a stuck flush leaves behind one level down.
+    Spi::run("SET session_replication_role = replica").expect("suppress");
+    Spi::run("ALTER TABLE nst_src_r1 DETACH PARTITION nst_src_r1_def").expect("detach nested default");
+    Spi::run(
+        "CREATE TABLE nst_src_r1_q2 PARTITION OF nst_src_r1 \
+         FOR VALUES FROM ('2026-04-01') TO ('2026-07-01')",
+    )
+    .expect("src r1 q2");
+    Spi::run("INSERT INTO nst_src_r1_q2 SELECT * FROM nst_src_r1_def WHERE item = 2").expect("move deep row");
+    Spi::run("DELETE FROM nst_src_r1_def WHERE item = 2").expect("clear nested default");
+    Spi::run("ALTER TABLE nst_src_r1 ATTACH PARTITION nst_src_r1_def DEFAULT").expect("reattach nested default");
+    Spi::run("SET session_replication_role = origin").expect("restore");
+
+    let before_total: i32 = Spi::get_one("SELECT sum(qty)::int FROM nst_v")
+        .expect("before")
+        .unwrap_or(-1);
+    let sync = Spi::get_one::<String>("SELECT reflex_sync_partitions('nst_v')")
+        .expect("sync call")
+        .expect("sync result");
+    assert!(!sync.starts_with("ERROR"), "sync returned: {sync}");
+
+    // Total preserved -- the sync only relocated the row, it did not lose or
+    // duplicate it.
+    let after_total: i32 = Spi::get_one("SELECT sum(qty)::int FROM nst_v")
+        .expect("after")
+        .unwrap_or(-1);
+    assert_eq!(after_total, before_total, "no rows lost or duplicated draining the nested default");
+
+    // The deep row relocated into the newly built dedicated leaf under r1...
+    let q2_qty: i32 = Spi::get_one("SELECT qty FROM nst_v_nst_src_r1_q2 WHERE item = 2")
+        .expect("q2 probe")
+        .unwrap_or(-1);
+    assert_eq!(q2_qty, 20, "the deep row must relocate into the new r1/May leaf");
+
+    // ...and no longer sits in r1's nested default.
+    let nested_after: i64 = Spi::get_one("SELECT count(*) FROM nst_v_nst_src_r1_def WHERE item = 2")
+        .expect("nested recheck")
+        .unwrap_or(-1);
+    assert_eq!(nested_after, 0, "the deep row must no longer be in r1's nested default");
+
+    // The unrelated top-level default was never touched by this relocation.
+    let top_after: i64 = Spi::get_one("SELECT count(*) FROM nst_v_nst_src_def")
+        .expect("top recheck")
+        .unwrap_or(-1);
+    assert_eq!(top_after, 0, "the top-level default must remain untouched");
+}

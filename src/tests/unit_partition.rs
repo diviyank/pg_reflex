@@ -301,9 +301,9 @@ fn test_node_ddl_internal_node_has_sub_partition_by() {
         sub_columns: vec!["order_date".to_string()],
         depth: 1,
     };
-    let (_int, tgt) = build_partition_node_ddl_pair("fcst", &node, "ss", true);
+    let ddl = build_partition_node_ddl_pair("fcst", &node, "ss", true);
     assert_eq!(
-        tgt,
+        ddl.tgt_ddl,
         r#"CREATE TABLE IF NOT EXISTS "public"."fcst_ss_172" PARTITION OF "public"."fcst" FOR VALUES IN ('172') PARTITION BY RANGE ("order_date")"#
     );
 }
@@ -319,9 +319,9 @@ fn test_node_ddl_leaf_under_internal_parent_is_unlogged() {
         sub_columns: vec![],
         depth: 2,
     };
-    let (_int, tgt) = build_partition_node_ddl_pair("fcst", &node, "ss", true);
+    let ddl = build_partition_node_ddl_pair("fcst", &node, "ss", true);
     assert_eq!(
-        tgt,
+        ddl.tgt_ddl,
         r#"CREATE UNLOGGED TABLE IF NOT EXISTS "public"."fcst_ss_172_2025_01" PARTITION OF "public"."fcst_ss_172" FOR VALUES FROM ('2025-01-01') TO ('2025-02-01')"#
     );
 }

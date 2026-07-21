@@ -5,6 +5,19 @@ use std::panic::AssertUnwindSafe;
 
 pub(super) struct ArchiveResidue;
 
+enum SourceCount {
+    Exact(i64),
+    Unverifiable,
+}
+
+/// The archive_residue check compares a source partition's row count against the
+/// IMV partition's. That is sound only for a ~1:1 single-source IMV; for any
+/// multi-source IMV (a join) the counts are unrelated, filtered or not, so the
+/// residue verdict is unverifiable.
+fn residue_count_unverifiable(imv: &ImvRow) -> bool {
+    imv.real_sources().count() > 1
+}
+
 impl Check for ArchiveResidue {
     fn id(&self) -> &'static str {
         "archive-residue"
@@ -82,13 +95,8 @@ impl Check for ArchiveResidue {
 
         // For each source partition key, count source rows (applying WHERE predicate if possible)
         for src_child in &src_children {
-            match self.count_source_rows_for_partition(
-                client,
-                &anchor,
-                &src_child.bare_name,
-                &imv.where_predicate,
-            ) {
-                Some(src_count) => {
+            match self.count_source_rows_for_partition(client, &anchor, &src_child.bare_name, imv) {
+                Some(SourceCount::Exact(src_count)) => {
                     // Get the corresponding IMV partition row count
                     let tgt_partition =
                         crate::partition::target_child_name(&imv.name, &src_child.bare_name);
@@ -110,6 +118,23 @@ impl Check for ArchiveResidue {
                             ),
                         });
                     }
+                }
+                Some(SourceCount::Unverifiable) => {
+                    findings.push(Finding {
+                        imv: Some(imv.name.clone()),
+                        severity: Severity::Warning,
+                        category: "archive_residue",
+                        finding: format!(
+                            "Partition {}: IMV joins multiple sources, so a source partition's row \
+                             count is not comparable to the IMV partition's; cannot confirm archive \
+                             residue status",
+                            src_child.bare_name
+                        ),
+                        suggested_fix: format!(
+                            "Compare counts manually against the IMV definition for partition '{}'",
+                            src_child.bare_name
+                        ),
+                    });
                 }
                 None => {
                     // Failed to count source rows - emit unverifiable finding
@@ -156,8 +181,14 @@ impl ArchiveResidue {
         client: &pgrx::spi::SpiClient<'_>,
         source: &str,
         partition_name: &str,
-        where_predicate: &Option<String>,
-    ) -> Option<i64> {
+        imv: &ImvRow,
+    ) -> Option<SourceCount> {
+        if residue_count_unverifiable(imv) {
+            return Some(SourceCount::Unverifiable);
+        }
+
+        let where_predicate = &imv.where_predicate;
+
         // Count rows in the partition by querying the source with the partition constraint
         // The partition_name is the bare name (e.g. 'f6_src_us') of a child partition
 
@@ -219,5 +250,6 @@ impl ArchiveResidue {
         };
 
         self.safe_count(client, &count_query)
+            .map(SourceCount::Exact)
     }
 }

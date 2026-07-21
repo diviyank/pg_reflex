@@ -4,6 +4,24 @@ The full changelog tracks every release. The latest version's headlines are on t
 
 For each version below, see [`CHANGELOG.md`](https://github.com/diviyank/pg_reflex/blob/main/CHANGELOG.md) on GitHub for the canonical text.
 
+## [1.10.10] — 2026-07-21
+
+The partition-flush deadlock release: fixes an unbounded retry loop that could hang a committing backend, closes the circular default-partition state that made a new IMV leaf unrecoverable, adds a safety refusal to [`reflex_rebuild_chain`](api/reflex_rebuild_chain.md) before CASCADE-dropping dependents, and removes a false-positive `archive_residue` warning. Replace the `.so`, then `ALTER EXTENSION pg_reflex UPDATE TO '1.10.10';`.
+
+**Fixed**
+
+- Unbounded partition-flush retry loop hung committing backends: the flush trigger's own error handler re-armed itself on any `INSERT OR UPDATE`. It's now scoped to `UPDATE OF enqueued_at`, and a per-root `failures` counter caps retries at 5 on both the queue-drain and single-root flush paths (capped roots stay visible to `reflex_doctor`, dependents stay `known_stale`).
+- A new IMV partition leaf could be unrecoverable (SQLSTATE 23514): rows sat in the parent's DEFAULT partition because the leaf didn't exist, and the leaf couldn't be created because the rows sat in DEFAULT. Syncing an IMV now drains every DEFAULT partition in the tree into a holding table, builds the missing leaves, and re-inserts by routing (moved, never deleted) — recovering stranded rows at any partition depth, multi-level trees included.
+- `archive_residue` no longer false-positives on multi-source IMVs: a source partition's row count isn't comparable to a join's IMV partition (filtered or not), so it reports "cannot verify" instead.
+
+**Changed**
+
+- [`reflex_rebuild_chain`](api/reflex_rebuild_chain.md) gained a `cascade` argument (default `FALSE`): it now refuses when dependent IMVs would be CASCADE-dropped, unless `cascade => TRUE`, which recreates every transitive dependent in dependency order.
+
+**Migration**
+
+- `ALTER EXTENSION pg_reflex UPDATE TO '1.10.10';` — [`sql/pg_reflex--1.10.9--1.10.10.sql`](https://github.com/diviyank/pg_reflex/blob/main/sql/pg_reflex--1.10.9--1.10.10.sql) adds the `failures` column, redefines the flush trigger, and drops the old one-argument `reflex_rebuild_chain(TEXT)`. Re-check any stuck `__reflex_partition_pending` roots with `reflex_doctor()` after upgrading.
+
 ## [1.10.9] — 2026-07-05
 
 [`reflex_doctor`](api/reflex_doctor.md) / [`reflex_audit`](api/reflex_audit.md) hardening — module-only, no SQL/catalog changes. Replace the `.so`, then `ALTER EXTENSION pg_reflex UPDATE TO '1.10.9';`.

@@ -915,13 +915,13 @@ fn materialize_passthrough(client: &mut pgrx::spi::SpiClient<'_>, ctx: &mut Buil
                 nodes = crate::partition::truncate_partition_tree(nodes, depth as usize);
             }
             for node in &nodes {
-                let (_, tgt_ddl) = crate::partition::build_partition_node_ddl_pair(
+                let ddl = crate::partition::build_partition_node_ddl_pair(
                     ctx.view_name,
                     node,
                     anchor_root_bare,
                     !ctx.logged,
                 );
-                client.update(&tgt_ddl, None, &[]).unwrap_or_report();
+                client.update(&ddl.tgt_ddl, None, &[]).unwrap_or_report();
             }
             crate::partition::refresh_source_snapshot(client, &anchor);
         }
@@ -1080,14 +1080,14 @@ fn materialize_aggregate(client: &mut pgrx::spi::SpiClient<'_>, ctx: &mut BuildC
                     anchor
                 );
                 for node in &nodes {
-                    let (int_ddl, tgt_ddl) = crate::partition::build_partition_node_ddl_pair(
+                    let ddl = crate::partition::build_partition_node_ddl_pair(
                         ctx.view_name,
                         node,
                         anchor_root_bare,
                         !ctx.logged,
                     );
-                    client.update(&int_ddl, None, &[]).unwrap_or_report();
-                    client.update(&tgt_ddl, None, &[]).unwrap_or_report();
+                    client.update(&ddl.int_ddl, None, &[]).unwrap_or_report();
+                    client.update(&ddl.tgt_ddl, None, &[]).unwrap_or_report();
                 }
                 crate::partition::refresh_source_snapshot(client, &anchor);
             }

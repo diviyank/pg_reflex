@@ -901,3 +901,75 @@ fn f9_f11_doctor_surfaces_orphan_and_duplicate_findings() {
         "orphan drops must not auto-execute in fix mode"
     );
 }
+
+/// Bug 4: where_predicate is stored only for single-source IMVs
+/// (src/create_ivm/mod.rs:1534). A multi-source filtered IMV therefore gets an
+/// unfiltered source count, and correctly-empty partitions are reported as
+/// archive residue forever. Such an IMV must yield an advisory, not a warning.
+#[pg_test]
+fn pg_doctor_filtered_multi_source_imv_is_not_residue() {
+    Spi::run("CREATE TABLE fr_src (k TEXT NOT NULL, d DATE, v INT) PARTITION BY LIST (k)")
+        .expect("src");
+    Spi::run("CREATE TABLE fr_src_a PARTITION OF fr_src FOR VALUES IN ('a')").expect("a");
+    Spi::run("CREATE TABLE fr_src_b PARTITION OF fr_src FOR VALUES IN ('b')").expect("b");
+    Spi::run("CREATE TABLE fr_cutoff (d DATE)").expect("cutoff");
+    Spi::run("INSERT INTO fr_cutoff VALUES ('2026-06-01')").expect("seed cutoff");
+    Spi::run("INSERT INTO fr_src VALUES ('a', '2026-07-01', 1)").expect("seed a");
+    // Every 'b' row is older than the cutoff, so partition b is correctly empty.
+    Spi::run("INSERT INTO fr_src VALUES ('b', '2026-01-01', 2)").expect("seed b");
+
+    let sql = "SELECT k, sum(v) AS s FROM fr_src \
+               WHERE d >= (SELECT d FROM fr_cutoff) GROUP BY k";
+    let res = Spi::get_one::<String>(&format!(
+        "SELECT create_reflex_ivm('fr_imv', '{}', 'k', NULL, NULL, NULL, ARRAY['k'])",
+        sql.replace('\'', "''")
+    ))
+    .expect("create call")
+    .expect("create result");
+    assert!(!res.starts_with("ERROR"), "create returned: {res}");
+
+    // reflex_audit() returns a formatted text report (see other tests in this
+    // file / pg_test_audit.rs), not a queryable table.
+    let report: String = Spi::get_one("SELECT reflex_audit('fr_imv')")
+        .expect("audit query")
+        .expect("non-null report");
+    assert!(
+        !report.contains("IMV partition is empty"),
+        "a correctly-filtered empty partition must not be flagged as residue:\n{}",
+        report
+    );
+}
+
+/// F3: an UNFILTERED multi-source join with a correctly-empty partition must
+/// also be classified unverifiable — the source-vs-IMV per-partition count
+/// comparison is unsound for any join, filtered or not.
+#[pg_test]
+fn pg_doctor_unfiltered_multi_source_imv_is_unverifiable() {
+    Spi::run("CREATE TABLE fu_a (k TEXT NOT NULL, v INT) PARTITION BY LIST (k)").expect("a");
+    Spi::run("CREATE TABLE fu_a_x PARTITION OF fu_a FOR VALUES IN ('x')").expect("ax");
+    Spi::run("CREATE TABLE fu_a_y PARTITION OF fu_a FOR VALUES IN ('y')").expect("ay");
+    Spi::run("CREATE TABLE fu_b (k TEXT, w INT)").expect("b");
+    Spi::run("INSERT INTO fu_a VALUES ('x', 1)").expect("seed a");
+    // No matching fu_b row for 'y', so the IMV's 'y' partition is legitimately
+    // empty though fu_a_y is non-empty — with NO where clause anywhere.
+    Spi::run("INSERT INTO fu_a VALUES ('y', 2)").expect("seed ay");
+    Spi::run("INSERT INTO fu_b VALUES ('x', 100)").expect("seed b");
+
+    let sql = "SELECT a.k, sum(b.w) AS s FROM fu_a a JOIN fu_b b ON b.k = a.k GROUP BY a.k";
+    let res = Spi::get_one::<String>(&format!(
+        "SELECT create_reflex_ivm('fu_imv', '{}', 'k', NULL, NULL, NULL, ARRAY['k'])",
+        sql.replace('\'', "''")
+    ))
+    .expect("create")
+    .expect("result");
+    assert!(!res.starts_with("ERROR"), "create returned: {res}");
+
+    let report: String = Spi::get_one("SELECT reflex_audit('fu_imv')")
+        .expect("audit")
+        .expect("report");
+    assert!(
+        !report.contains("IMV partition is empty"),
+        "an unfiltered multi-source join must not be flagged as residue:\n{}",
+        report
+    );
+}

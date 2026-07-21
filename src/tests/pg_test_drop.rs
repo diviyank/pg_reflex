@@ -980,8 +980,8 @@ fn f4b_rebuild_chain_basic() {
     assert_eq!(exists_before, 1, "IMV should exist in registry");
 
     // Call rebuild_chain
-    let rebuild_result = crate::reflex_rebuild_chain("f4b_simple");
-    assert_eq!(rebuild_result, "REBUILT CHAIN", "rebuild should succeed: {}", rebuild_result);
+    let rebuild_result = crate::reflex_rebuild_chain("f4b_simple", false);
+    assert!(rebuild_result.starts_with("REBUILT CHAIN"), "rebuild should succeed: {}", rebuild_result);
 
     // Verify IMV still exists after rebuild
     let exists_after = Spi::get_one::<i64>(
@@ -1034,8 +1034,8 @@ fn f4b_create_args_roundtrip_fidelity() {
     );
 
     // Rebuild the chain
-    let rebuild_result = crate::reflex_rebuild_chain("f4b_roundtrip");
-    assert_eq!(rebuild_result, "REBUILT CHAIN", "rebuild should succeed: {}", rebuild_result);
+    let rebuild_result = crate::reflex_rebuild_chain("f4b_roundtrip", false);
+    assert!(rebuild_result.starts_with("REBUILT CHAIN"), "rebuild should succeed: {}", rebuild_result);
 
     // Verify ignore_sources is STILL in create_args after rebuild (round-trip fidelity)
     let create_args_after = Spi::get_one::<String>(
@@ -1095,8 +1095,8 @@ fn f4b_rebuild_chain_atomicity() {
     assert_eq!(row_count_before, 1, "target should have 1 row before rebuild");
 
     // Call rebuild_chain (should succeed on normal IMV)
-    let rebuild_result = crate::reflex_rebuild_chain("f4b_atomic");
-    assert_eq!(rebuild_result, "REBUILT CHAIN", "rebuild should succeed: {}", rebuild_result);
+    let rebuild_result = crate::reflex_rebuild_chain("f4b_atomic", false);
+    assert!(rebuild_result.starts_with("REBUILT CHAIN"), "rebuild should succeed: {}", rebuild_result);
 
     // Verify IMV still exists and target has the same row count
     let exists_after = Spi::get_one::<i64>(

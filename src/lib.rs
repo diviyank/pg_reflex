@@ -226,6 +226,8 @@ extension_sql!(
         ADD COLUMN IF NOT EXISTS attempts INT NOT NULL DEFAULT 0;
     ALTER TABLE public.__reflex_partition_pending
         ADD COLUMN IF NOT EXISTS last_error TEXT;
+    ALTER TABLE public.__reflex_partition_pending
+        ADD COLUMN IF NOT EXISTS failures INT NOT NULL DEFAULT 0;
 
     -- 1.6.0: SQL helper used by the per-partition dispatch DO block emitted
     -- by build_partition_aware_dispatch_sql.  Given a partitioned parent +
@@ -570,6 +572,31 @@ fn reflex_refresh_partition_snapshot(source_root: &str) -> &'static str {
     "OK"
 }
 
+/// Test-only: run the F2 drain → (caller-supplied build DDL) → refill cycle
+/// against one partitioned root. `build_ddl` is one or more `;`-separated
+/// statements that create partitions under the (now-emptied) tree.
+#[cfg(any(test, feature = "pg_test"))]
+#[pg_extern]
+fn __reflex_test_drain_build_refill(root: &str, build_ddl: &str) -> String {
+    let outcome: Result<(), String> = Spi::connect_mut(|client| {
+        let entries = partition::drain_tree_defaults(client, &[root.to_string()])?;
+        for stmt in build_ddl
+            .split(';')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+        {
+            client
+                .update(stmt, None, &[])
+                .map_err(|e| format!("build: {}", e))?;
+        }
+        partition::refill_tree_defaults(client, entries)
+    });
+    match outcome {
+        Ok(()) => "OK".to_string(),
+        Err(e) => format!("ERROR: {}", e),
+    }
+}
+
 /// Detect and heal snapshot divergence: refresh the partition snapshot if it
 /// disagrees with the live tree. Returns "OK (no divergence)" or
 /// "HEALED (N divergent leaves)".
@@ -684,9 +711,14 @@ fn reflex_rebuild_triggers(source_table: &str) -> String {
 ///
 /// Used for recovery when a decomposed chain accumulates structural damage that
 /// bottom-up reconciliation cannot resolve. Returns a status string or ERROR.
+///
+/// Blast radius: if other IMVs depend on `view_name`, CASCADE would drop those
+/// too. Without `cascade => TRUE` this refuses and names the dependents instead
+/// of silently destroying them. With `cascade => TRUE`, dependents are dropped
+/// and recreated alongside the named IMV.
 #[pg_extern]
-fn reflex_rebuild_chain(view_name: &str) -> String {
-    create_ivm::reflex_rebuild_chain_impl(view_name)
+fn reflex_rebuild_chain(view_name: &str, cascade: default!(bool, "FALSE")) -> String {
+    create_ivm::reflex_rebuild_chain_impl(view_name, cascade)
 }
 
 /// Refresh a single IMV by rebuilding from source. Alias for reflex_reconcile.
@@ -1248,8 +1280,12 @@ extension_sql!(
     DROP TRIGGER IF EXISTS __reflex_partition_flush_trigger
         ON public.__reflex_partition_pending;
 
+    -- UPDATE OF enqueued_at, not bare UPDATE: the flush's own EXCEPTION handler
+    -- writes last_error/failures to this table, and a bare UPDATE trigger would
+    -- re-arm itself into an unbounded retry loop at COMMIT. Only the DDL event
+    -- trigger's re-enqueue touches enqueued_at.
     CREATE CONSTRAINT TRIGGER __reflex_partition_flush_trigger
-        AFTER INSERT OR UPDATE ON public.__reflex_partition_pending
+        AFTER INSERT OR UPDATE OF enqueued_at ON public.__reflex_partition_pending
         DEFERRABLE INITIALLY DEFERRED
         FOR EACH ROW EXECUTE FUNCTION public.__reflex_partition_flush_fn();
     "#,
@@ -1400,6 +1436,7 @@ mod tests {
     include!("tests/pg_test_union_subquery_delta.rs");
     include!("tests/pg_test_registry.rs");
     include!("tests/pg_test_doctor.rs");
+    include!("tests/pg_test_rebuild_chain.rs");
 }
 
 /// This module is required by `cargo pgrx test` invocations.

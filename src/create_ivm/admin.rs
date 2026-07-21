@@ -490,7 +490,15 @@ pub(crate) fn augment_column_types_from_query(
 ///
 /// Requires `create_args` in the registry row (1.11.0+). Returns an ERROR string
 /// on any failure (IMV not found, missing create_args, drop/create failure).
-pub(crate) fn reflex_rebuild_chain_impl(view_name: &str) -> String {
+///
+/// Without `cascade`, refuses when other IMVs depend on `view_name` — CASCADE
+/// would drop them too, but only `view_name` gets recreated, silently
+/// destroying the dependents. With `cascade => TRUE`, each dependent's
+/// creation spec is captured before the drop and recreated afterwards, in
+/// shallowest-first order. A dependent with no stored `create_args` (created
+/// before 1.10.8) cannot be faithfully recreated and causes an upfront
+/// refusal, before anything is dropped.
+pub(crate) fn reflex_rebuild_chain_impl(view_name: &str, cascade: bool) -> String {
     if let Err(msg) = validate_view_name(view_name) {
         return format!("ERROR: {}", msg);
     }
@@ -500,6 +508,33 @@ pub(crate) fn reflex_rebuild_chain_impl(view_name: &str) -> String {
         let (sql_query, create_args_json) =
             crate::sql_writer::registry::read_imv_for_rebuild(client, view_name)
                 .ok_or_else(|| format!("IMV '{}' not found in registry", view_name))?;
+
+        let dependents = read_dependents_shallowest_first(client, view_name);
+        if !dependents.is_empty() && !cascade {
+            let names: Vec<&str> = dependents.iter().map(|(n, _)| n.as_str()).collect();
+            return Err(format!(
+                "IMV '{}' has {} dependent IMV(s) that CASCADE would destroy: {}. \
+                 Re-run with cascade => TRUE to drop and recreate them, or rebuild them individually.",
+                view_name,
+                dependents.len(),
+                names.join(", ")
+            ));
+        }
+
+        let unrecreatable: Vec<&str> = dependents
+            .iter()
+            .filter(|(_, args)| args.as_deref().unwrap_or("").trim().is_empty())
+            .map(|(n, _)| n.as_str())
+            .collect();
+        if cascade && !unrecreatable.is_empty() {
+            return Err(format!(
+                "IMV '{}' has dependent IMV(s) with no stored create_args (created before 1.10.8): {}. \
+                 Recreating them would silently reset storage mode, refresh mode and partitioning. \
+                 Rebuild them individually with reflex_rebuild_imv first.",
+                view_name,
+                unrecreatable.join(", ")
+            ));
+        }
 
         // 2. Parse create_args JSON to extract parameters using PostgreSQL's native JSON
         // parsing to handle escaped quotes and array elements correctly.
@@ -517,6 +552,55 @@ pub(crate) fn reflex_rebuild_chain_impl(view_name: &str) -> String {
         let explicit_unpartitioned =
             extract_bool_field_via_sql(client, &create_args_json, "explicit_unpartitioned")
                 .unwrap_or(false);
+
+        // 2b. Capture each dependent's spec before the drop — after the drop
+        // the registry rows are gone, so nothing may be read lazily.
+        let captured_dependents: Vec<CapturedDependent> = dependents
+            .iter()
+            .filter_map(|(dep_name, _)| {
+                let (dep_sql_query, dep_create_args_json) =
+                    crate::sql_writer::registry::read_imv_for_rebuild(client, dep_name)?;
+                Some(CapturedDependent {
+                    name: dep_name.clone(),
+                    sql_query: dep_sql_query,
+                    unique_columns_str: extract_string_field_via_sql(
+                        client,
+                        &dep_create_args_json,
+                        "unique_columns_str",
+                    )
+                    .unwrap_or_default(),
+                    storage_mode: extract_string_field_via_sql(
+                        client,
+                        &dep_create_args_json,
+                        "storage_mode",
+                    )
+                    .unwrap_or_else(|| "UNLOGGED".to_string()),
+                    refresh_mode: extract_string_field_via_sql(
+                        client,
+                        &dep_create_args_json,
+                        "refresh_mode",
+                    )
+                    .unwrap_or_else(|| "IMMEDIATE".to_string()),
+                    topk_k: extract_number_field_via_sql(client, &dep_create_args_json, "topk_k"),
+                    ignore_sources: extract_array_field_via_sql(
+                        client,
+                        &dep_create_args_json,
+                        "ignore_sources",
+                    ),
+                    partition_by: extract_array_field_via_sql(
+                        client,
+                        &dep_create_args_json,
+                        "partition_by",
+                    ),
+                    explicit_unpartitioned: extract_bool_field_via_sql(
+                        client,
+                        &dep_create_args_json,
+                        "explicit_unpartitioned",
+                    )
+                    .unwrap_or(false),
+                })
+            })
+            .collect();
 
         // 3. Drop the IMV with CASCADE (removes all sub-IMVs)
         let drop_result = drop_reflex_ivm_impl(view_name, true);
@@ -548,13 +632,107 @@ pub(crate) fn reflex_rebuild_chain_impl(view_name: &str) -> String {
             );
         }
 
-        Ok("REBUILT CHAIN".to_string())
+        // 5. Re-create dependents, shallowest first, so each recreate sees its
+        // own upstream dependency already restored.
+        for dep in &captured_dependents {
+            let dep_create_result = create_reflex_ivm_impl(
+                &dep.name,
+                &dep.sql_query,
+                &dep.unique_columns_str,
+                false,
+                &dep.storage_mode,
+                &dep.refresh_mode,
+                dep.topk_k,
+                &dep.ignore_sources,
+                &dep.partition_by,
+                dep.explicit_unpartitioned,
+            );
+            if dep_create_result.starts_with("ERROR") {
+                pgrx::error!(
+                    "reflex_rebuild_chain: failed to recreate dependent IMV '{}': {}",
+                    dep.name,
+                    dep_create_result
+                );
+            }
+        }
+
+        Ok(format!(
+            "REBUILT CHAIN ({} dependent(s) restored)",
+            captured_dependents.len()
+        ))
     });
 
     match result {
         Ok(msg) => msg,
         Err(e) => format!("ERROR: {}", e),
     }
+}
+
+/// A dependent IMV's creation spec, captured before the CASCADE-drop so it can
+/// be recreated afterwards — the registry row backing it is gone once the
+/// drop runs, so every field needed for `create_reflex_ivm_impl` must be an
+/// owned value read up front.
+struct CapturedDependent {
+    name: String,
+    sql_query: String,
+    unique_columns_str: String,
+    storage_mode: String,
+    refresh_mode: String,
+    topk_k: Option<usize>,
+    ignore_sources: Vec<String>,
+    partition_by: Vec<String>,
+    explicit_unpartitioned: bool,
+}
+
+/// Dependents of `view_name` registered in `__reflex_ivm_reference`, shallowest
+/// first, so recreation order matches dependency order.
+///
+/// The walk follows `graph_child` transitively — the SAME forward edge the
+/// CASCADE drop recurses over (`src/drop_ivm.rs`) — so the capture set is
+/// exactly the set the drop destroys. A direct-only enumeration (matching
+/// `depends_on`) would miss depth+2-and-deeper dependents, which CASCADE still
+/// drops, silently losing them: the very failure this guard exists to prevent.
+/// Ordering by ascending `graph_depth` yields a valid recreate order (a
+/// dependent is always recreated after everything it reads from), including for
+/// diamond dependencies, which the recursive UNION deduplicates.
+fn read_dependents_shallowest_first(
+    client: &SpiClient<'_>,
+    view_name: &str,
+) -> Vec<(String, Option<String>)> {
+    client
+        .select(
+            "WITH RECURSIVE chain AS (
+                 SELECT unnest(graph_child) AS dep_name
+                   FROM public.__reflex_ivm_reference
+                  WHERE name = $1 OR name = split_part($1, '.', 2)
+               UNION
+                 SELECT unnest(r.graph_child)
+                   FROM public.__reflex_ivm_reference r
+                   JOIN chain c ON r.name = c.dep_name
+             )
+             SELECT ref.name, ref.create_args
+               FROM chain
+               JOIN public.__reflex_ivm_reference ref ON ref.name = chain.dep_name
+              ORDER BY ref.graph_depth",
+            None,
+            &[unsafe {
+                DatumWithOid::new(view_name.to_string(), PgBuiltInOids::TEXTOID.oid().value())
+            }],
+        )
+        .ok()
+        .map(|it| {
+            it.filter_map(|r| {
+                let name = r.get_by_name::<&str, _>("name").ok().flatten()?.to_string();
+                let args = r
+                    .get_by_name::<&str, _>("create_args")
+                    .ok()
+                    .flatten()
+                    .map(|s| s.to_string());
+                Some((name, args))
+            })
+            .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Helper: extract a string field from JSON using PostgreSQL's native JSON parsing.

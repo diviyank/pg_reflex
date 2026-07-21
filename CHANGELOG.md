@@ -2,6 +2,64 @@
 
 ## [Unreleased]
 
+## [1.10.10] - 2026-07-21
+
+The partition-flush deadlock release. It fixes an unbounded retry loop that
+could hang a committing backend indefinitely, closes the circular
+default-partition state that made an IMV partition leaf unrecoverable, adds a
+safety refusal to `reflex_rebuild_chain` before it CASCADE-drops dependents,
+and removes a false-positive `archive_residue` warning. Replace the `.so`,
+then `ALTER EXTENSION pg_reflex UPDATE TO '1.10.10';`.
+
+### Fixed
+
+- **Unbounded partition-flush retry loop hung committing backends.** The
+  `__reflex_partition_flush_trigger` constraint trigger fired on any `INSERT
+  OR UPDATE` of `__reflex_partition_pending`; the flush's own `EXCEPTION`
+  handler wrote `last_error` back onto the same row, which re-armed the
+  trigger at COMMIT and retried forever. The trigger is now scoped to
+  `UPDATE OF enqueued_at` — only the DDL event trigger's re-enqueue touches
+  that column — and a per-root `failures` counter caps retries at 5, honored on
+  both the queue-drain and the commit-time single-root flush paths (the latter
+  canonicalizing the root key so a bare-name call matches the stored pending
+  row). A capped root keeps its pending row and `last_error` for `reflex_doctor`
+  to surface, and its dependent IMVs stay `known_stale` instead of silently
+  succeeding.
+- **A new IMV partition leaf could be unrecoverable (SQLSTATE 23514).**
+  Rows sat in the parent's DEFAULT partition because the leaf did not exist
+  yet, and the leaf could not be created because those same rows violated its
+  bounds while still attached to DEFAULT. Syncing an IMV now drains every
+  DEFAULT partition in the tree into a holding table, builds the missing
+  leaves, then re-inserts the rows so PostgreSQL routing places each in its
+  correct leaf (moving them, never deleting) — recovering stranded rows at any
+  partition depth, including multi-level (sub-partitioned) trees. The
+  relocation preserves IMV content, so downstream chained-IMV maintenance is
+  suppressed during it to avoid re-counting merely-relocated rows.
+- **`archive_residue` false-positived on multi-source IMVs.** The check
+  compares a source partition's row count against the IMV partition's — sound
+  only for a roughly 1:1 single-source IMV. For any multi-source IMV (a join)
+  those counts are unrelated, filtered or not, so it now reports "cannot
+  verify" instead of a false warning.
+
+### Changed
+
+- **`reflex_rebuild_chain(view_name, cascade => FALSE)` gained a `cascade`
+  argument.** Without it, the function now refuses when dependent IMVs would
+  be CASCADE-dropped by the rebuild. Pass `cascade => TRUE` to drop and
+  recreate every transitive dependent in dependency order (shallowest first);
+  this still refuses if any dependent predates the `create_args` column
+  (1.10.8) with no stored creation arguments to replay.
+
+### Migration
+
+- `ALTER EXTENSION pg_reflex UPDATE TO '1.10.10';` after swapping the module:
+  [`sql/pg_reflex--1.10.9--1.10.10.sql`](https://github.com/diviyank/pg_reflex/blob/main/sql/pg_reflex--1.10.9--1.10.10.sql)
+  adds the `failures` column, redefines the flush trigger, and drops the old
+  one-argument `reflex_rebuild_chain(TEXT)` so the new two-argument version
+  installs without an ambiguous overload. Roots stuck in
+  `__reflex_partition_pending` should be re-checked with `reflex_doctor()`
+  after upgrading.
+
 ## [1.10.9] - 2026-07-05
 
 `reflex_doctor` / `reflex_audit` hardening. The audit engine can no longer be

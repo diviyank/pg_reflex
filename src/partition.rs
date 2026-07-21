@@ -30,6 +30,11 @@ use crate::query_decomposer::{
 };
 use crate::sql_writer::identifier::format_pg_text_array;
 
+/// A root that has failed this many flushes stops being retried. Its pending row
+/// and `last_error` survive for `reflex_doctor`, and dependents stay marked
+/// `known_stale`, so the condition is reported rather than silently retried.
+const PARTITION_FLUSH_FAILURE_CAP: i32 = 5;
+
 /// A description of how a source table is partitioned.
 ///
 /// `column_names` are the OUTPUT names (lowercased, unquoted) of the
@@ -422,6 +427,11 @@ fn schema_prefix(view_name: &str, child: &str) -> String {
 /// [PARTITION BY …]` DDL pair for one node of a source partition tree.
 ///
 /// Resolves the parent from `node.parent_bare`: when it equals
+pub(crate) struct PartitionNodeDdl {
+    pub int_ddl: String,
+    pub tgt_ddl: String,
+}
+
 /// `anchor_root_bare` (quote-insensitively) the parent is the IMV root,
 /// otherwise it is the IMV child mirroring that source node. Internal nodes
 /// (own partition strategy) get a `PARTITION BY` suffix and are always LOGGED;
@@ -432,7 +442,7 @@ pub(crate) fn build_partition_node_ddl_pair(
     node: &PartitionNode,
     anchor_root_bare: &str,
     unlogged: bool,
-) -> (String, String) {
+) -> PartitionNodeDdl {
     let (schema_opt, bare_view) = split_qualified_name(view_name);
     let schema = schema_opt.unwrap_or("public");
 
@@ -483,7 +493,7 @@ pub(crate) fn build_partition_node_ddl_pair(
         "{} IF NOT EXISTS {} PARTITION OF {} {}{}",
         create_kw, tgt_child, tgt_parent, node.bound_expr, sub_clause
     );
-    (int_ddl, tgt_ddl)
+    PartitionNodeDdl { int_ddl, tgt_ddl }
 }
 
 /// True when an existing IMV partition child's actual shape disagrees with the
@@ -1188,28 +1198,75 @@ pub(crate) fn reflex_sync_partitions_impl(view_name: &str, drop_orphans: bool) -
             }
         }
 
-        for node in &nodes {
-            let int_name = intermediate_child_name(view_name, &node.bare_name);
-            let tgt_name = target_child_name(view_name, &node.bare_name);
-            let (int_ddl, tgt_ddl) =
-                build_partition_node_ddl_pair(view_name, node, anchor_root_bare, unlogged);
-            if has_intermediate {
-                client
-                    .update(&int_ddl, None, &[])
-                    .map_err(|e| format!("sync: create intermediate node: {}", e))?;
-                if !int_have.contains(&int_name) {
-                    out.added_intermediate += 1;
+        let mut drain_roots: Vec<String> = vec![tgt_parent.clone()];
+        if has_intermediate {
+            drain_roots.push(int_parent.clone());
+        }
+
+        // The drain -> build -> refill sequence below is a pure PHYSICAL
+        // relocation of rows already present in the IMV — it moves
+        // default-resident rows into a holding table and routes them back
+        // through `INSERT INTO <root>` once the correct leaf exists. When
+        // this IMV is itself a maintenance SOURCE for a downstream chained
+        // IMV, its target table carries an `AFTER INSERT ... FOR EACH
+        // STATEMENT ... REFERENCING NEW TABLE` trigger (schema_builder.rs)
+        // that the refill's `INSERT INTO <root>` would otherwise fire,
+        // re-counting merely-relocated rows into the downstream IMV. Suppress
+        // triggers for the relocation only — tuple routing is not a trigger
+        // and still works under `replica` role — then restore the caller's
+        // role unconditionally so its transaction is unaffected.
+        let prior_replication_role: String = client
+            .select(
+                "SELECT current_setting('session_replication_role') AS r",
+                Some(1),
+                &[],
+            )
+            .map_err(|e| format!("sync: read session_replication_role: {}", e))?
+            .next()
+            .and_then(|r| r.get_by_name::<&str, _>("r").ok().flatten())
+            .unwrap_or("origin")
+            .to_string();
+        client
+            .update("SET session_replication_role = replica", None, &[])
+            .map_err(|e| format!("sync: suppress triggers for relocation: {}", e))?;
+
+        let reloc_result: Result<(), String> = (|| {
+            let drain_entries = drain_tree_defaults(client, &drain_roots)?;
+
+            for node in &nodes {
+                let int_name = intermediate_child_name(view_name, &node.bare_name);
+                let tgt_name = target_child_name(view_name, &node.bare_name);
+                let ddl =
+                    build_partition_node_ddl_pair(view_name, node, anchor_root_bare, unlogged);
+                if has_intermediate {
+                    client
+                        .update(&ddl.int_ddl, None, &[])
+                        .map_err(|e| format!("sync: create intermediate node: {}", e))?;
+                    if !int_have.contains(&int_name) {
+                        out.added_intermediate += 1;
+                    }
                 }
-            }
-            {
                 client
-                    .update(&tgt_ddl, None, &[])
+                    .update(&ddl.tgt_ddl, None, &[])
                     .map_err(|e| format!("sync: create target node: {}", e))?;
                 if !tgt_have.contains(&tgt_name) {
                     out.added_target += 1;
                 }
             }
-        }
+            refill_tree_defaults(client, drain_entries)?;
+            Ok(())
+        })();
+
+        // Restore before propagating either result — never leave the session
+        // stuck suppressing triggers for the caller's continuing transaction,
+        // even when the relocation itself failed.
+        let restore_result = client.update(
+            &format!("SET session_replication_role = {}", prior_replication_role),
+            None,
+            &[],
+        );
+        reloc_result?;
+        restore_result.map_err(|e| format!("sync: restore session_replication_role: {}", e))?;
 
         if !drop_orphans {
             for c in &int_children {
@@ -2290,25 +2347,94 @@ fn source_matching_root(deps: &[String], root: &str) -> String {
 /// SwapFill -> partition-scoped reconcile of the matching IMV leaf (creates it
 /// via sync if new, then swap-fills); Drop -> DROP the orphaned IMV leaf.
 /// Refreshes the snapshot and clears the pending row(s) afterward.
+/// A pending root that has exceeded the failure cap: (source_root, failures, last_error).
+type CappedRoot = (String, i32, Option<String>);
+
 pub(crate) fn reflex_flush_partitions_impl(only: Option<&str>) -> String {
     let outcome: Result<String, String> = Spi::connect_mut(|client| {
-        let roots: Vec<String> = match only {
-            Some(r) => vec![r.to_string()],
-            None => client
-                .select(
-                    "SELECT source_root FROM public.__reflex_partition_pending",
-                    None,
-                    &[],
-                )
-                .map_err(|e| format!("flush: pending scan failed: {}", e))?
-                .filter_map(|row| {
-                    row.get_by_name::<&str, _>("source_root")
+        let (roots, capped_roots): (Vec<String>, Vec<CappedRoot>) = match only {
+            // The deferred commit-time trigger reaches the flush through this
+            // single-root path, so the failure cap must be honoured here too — a
+            // poison root would otherwise be retried on every triggering commit,
+            // never permanently skipped and never warned about. A root with no
+            // pending row (e.g. a direct manual call) has no failure history and
+            // is processed normally.
+            Some(r) => {
+                let root = canonical_root_key(client, r);
+                let failures: i32 = client
+                    .select(
+                        "SELECT failures FROM public.__reflex_partition_pending WHERE source_root = $1",
+                        Some(1),
+                        &[unsafe {
+                            DatumWithOid::new(root.clone(), PgBuiltInOids::TEXTOID.oid().value())
+                        }],
+                    )
+                    .ok()
+                    .and_then(|mut it| it.next())
+                    .and_then(|row| row.get_by_name::<i32, _>("failures").ok().flatten())
+                    .unwrap_or(0);
+                if failures >= PARTITION_FLUSH_FAILURE_CAP {
+                    let last_error: Option<String> = client
+                        .select(
+                            "SELECT last_error FROM public.__reflex_partition_pending WHERE source_root = $1",
+                            Some(1),
+                            &[unsafe {
+                                DatumWithOid::new(root.clone(), PgBuiltInOids::TEXTOID.oid().value())
+                            }],
+                        )
                         .ok()
-                        .flatten()
-                        .map(|s| s.to_string())
-                })
-                .collect(),
+                        .and_then(|mut it| it.next())
+                        .and_then(|row| row.get_by_name::<&str, _>("last_error").ok().flatten())
+                        .map(|s| s.to_string());
+                    (Vec::new(), vec![(root, failures, last_error)])
+                } else {
+                    (vec![root], Vec::new())
+                }
+            }
+            None => {
+                let pending: Vec<CappedRoot> = client
+                    .select(
+                        "SELECT source_root, failures, last_error FROM public.__reflex_partition_pending",
+                        None,
+                        &[],
+                    )
+                    .map_err(|e| format!("flush: pending scan failed: {}", e))?
+                    .filter_map(|row| {
+                        let root = row.get_by_name::<&str, _>("source_root")
+                            .ok()
+                            .flatten()?
+                            .to_string();
+                        let failures = row.get_by_name::<i32, _>("failures")
+                            .ok()
+                            .flatten()
+                            .unwrap_or(0);
+                        let last_error = row.get_by_name::<&str, _>("last_error")
+                            .ok()
+                            .flatten()
+                            .map(|s| s.to_string());
+                        Some((root, failures, last_error))
+                    })
+                    .collect();
+
+                let (active, capped): (Vec<_>, Vec<_>) = pending
+                    .into_iter()
+                    .partition(|(_, failures, _)| *failures < PARTITION_FLUSH_FAILURE_CAP);
+
+                let active_roots: Vec<String> = active.into_iter().map(|(r, _, _)| r).collect();
+                (active_roots, capped)
+            }
         };
+
+        // Emit warnings for capped roots so operators know why they're not being retried
+        for (root, failures, last_error) in &capped_roots {
+            pgrx::warning!(
+                "pg_reflex: partition flush for root {} skipped — {} consecutive failures (last error: {}); \
+                 run reflex_doctor and reset failures to retry",
+                root,
+                failures,
+                last_error.as_deref().unwrap_or("unknown")
+            );
+        }
 
         let mut summary: Vec<String> = Vec::new();
         for root in &roots {
@@ -2669,7 +2795,8 @@ pub(crate) fn reflex_flush_partitions_impl(only: Option<&str>) -> String {
                    \n{body}\n \
                  EXCEPTION WHEN OTHERS THEN \
                    UPDATE public.__reflex_partition_pending \
-                      SET last_error = left(SQLERRM, 2000) \
+                      SET last_error = left(SQLERRM, 2000), \
+                          failures   = failures + 1 \
                     WHERE source_root = '{root_esc}'; \
                    UPDATE public.__reflex_ivm_reference \
                       SET known_stale = TRUE, stale_reason = left(SQLERRM, 2000), stale_since = now() \
@@ -2694,6 +2821,126 @@ pub(crate) fn reflex_flush_partitions_impl(only: Option<&str>) -> String {
         Ok(s) => s,
         Err(e) => format!("ERROR: {}", e),
     }
+}
+
+/// One default partition emptied into a holding table during a tree drain.
+pub(crate) struct DrainEntry {
+    pub parent_qual: String,
+    pub holding_qual: String,
+    /// The drained default's own depth in the tree (not its parent's). Refill
+    /// always inserts at `parent_qual` (the tree root) regardless of this
+    /// value — tuple routing carries each row to the right depth — so it is
+    /// diagnostic only.
+    pub default_level: i32,
+}
+
+/// Phase 1 of the multi-level default drain: for every DEFAULT partition in each
+/// root's tree that holds rows, move those rows into a fresh holding table and
+/// leave the default attached but empty. Emptied defaults let the subsequent
+/// `CREATE ... PARTITION OF` calls proceed without SQLSTATE 23514.
+pub(crate) fn drain_tree_defaults(
+    client: &mut pgrx::spi::SpiClient<'_>,
+    roots: &[String],
+) -> Result<Vec<DrainEntry>, String> {
+    let mut entries = Vec::new();
+    for root in roots {
+        let defaults: Vec<(String, i32)> = client
+            .select(
+                "SELECT quote_ident(n.nspname) || '.' || quote_ident(c.relname) AS q, t.level AS lvl \
+                   FROM pg_partition_tree($1) t \
+                   JOIN pg_class c ON c.oid = t.relid \
+                   JOIN pg_namespace n ON n.oid = c.relnamespace \
+                  WHERE pg_get_expr(c.relpartbound, c.oid) = 'DEFAULT'",
+                None,
+                &[unsafe { DatumWithOid::new(root.clone(), PgBuiltInOids::TEXTOID.oid().value()) }],
+            )
+            .map_err(|e| format!("drain: enumerate defaults of {}: {}", root, e))?
+            .filter_map(|r| {
+                let q = r.get_by_name::<&str, _>("q").ok().flatten()?.to_string();
+                let lvl = r.get_by_name::<i32, _>("lvl").ok().flatten().unwrap_or(0);
+                Some((q, lvl))
+            })
+            .collect();
+
+        for (default_qual, default_level) in defaults {
+            let (schema, bare) = split_qualified_name(&default_qual);
+            let holding_bare =
+                safe_identifier(&format!("__reflex_drain_{}", bare.trim_matches('"')));
+            let holding_qual = match schema {
+                Some(s) => format!("{}.{}", s, quote_identifier(&holding_bare)),
+                None => quote_identifier(&holding_bare),
+            };
+            // Skip empty defaults: nothing to move, no holding table.
+            let has_rows: bool = client
+                .select(
+                    &format!("SELECT EXISTS (SELECT 1 FROM {})", default_qual),
+                    Some(1),
+                    &[],
+                )
+                .ok()
+                .and_then(|mut it| it.next())
+                .and_then(|r| r.get_by_name::<bool, _>("exists").ok().flatten())
+                .unwrap_or(false);
+            if !has_rows {
+                continue;
+            }
+            client
+                .update(
+                    &format!(
+                        "CREATE TABLE {} (LIKE {} INCLUDING DEFAULTS)",
+                        holding_qual, default_qual
+                    ),
+                    None,
+                    &[],
+                )
+                .map_err(|e| format!("drain: create holding {}: {}", holding_qual, e))?;
+            client
+                .update(
+                    &format!(
+                        "WITH d AS (DELETE FROM {} RETURNING *) INSERT INTO {} SELECT * FROM d",
+                        default_qual, holding_qual
+                    ),
+                    None,
+                    &[],
+                )
+                .map_err(|e| format!("drain: move rows from {}: {}", default_qual, e))?;
+            entries.push(DrainEntry {
+                parent_qual: root.clone(),
+                holding_qual,
+                default_level,
+            });
+        }
+    }
+    Ok(entries)
+}
+
+/// Phase 3: refill each emptied default's rows back into its tree root by
+/// tuple routing, which carries each row to its now-existing leaf — or back
+/// into a still-unmatched default — regardless of the drained default's
+/// original depth. Sorted by `default_level` for deterministic, readable
+/// ordering only; every entry inserts at the same root, so order does not
+/// affect correctness. Drops each holding table.
+pub(crate) fn refill_tree_defaults(
+    client: &mut pgrx::spi::SpiClient<'_>,
+    mut entries: Vec<DrainEntry>,
+) -> Result<(), String> {
+    entries.sort_by_key(|e| e.default_level);
+    for e in &entries {
+        client
+            .update(
+                &format!(
+                    "INSERT INTO {} SELECT * FROM {}",
+                    e.parent_qual, e.holding_qual
+                ),
+                None,
+                &[],
+            )
+            .map_err(|err| format!("refill: reinsert into {}: {}", e.parent_qual, err))?;
+        client
+            .update(&format!("DROP TABLE {}", e.holding_qual), None, &[])
+            .map_err(|err| format!("refill: drop holding {}: {}", e.holding_qual, err))?;
+    }
+    Ok(())
 }
 
 // Phase 1 (plans/1_6_1_refacto.md) — `substitute_identifier` is a re-export
