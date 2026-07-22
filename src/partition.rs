@@ -1212,23 +1212,24 @@ pub(crate) fn reflex_sync_partitions_impl(view_name: &str, drop_orphans: bool) -
         // STATEMENT ... REFERENCING NEW TABLE` trigger (schema_builder.rs)
         // that the refill's `INSERT INTO <root>` would otherwise fire,
         // re-counting merely-relocated rows into the downstream IMV. Suppress
-        // triggers for the relocation only — tuple routing is not a trigger
-        // and still works under `replica` role — then restore the caller's
-        // role unconditionally so its transaction is unaffected.
-        let prior_replication_role: String = client
-            .select(
-                "SELECT current_setting('session_replication_role') AS r",
-                Some(1),
-                &[],
-            )
-            .map_err(|e| format!("sync: read session_replication_role: {}", e))?
-            .next()
-            .and_then(|r| r.get_by_name::<&str, _>("r").ok().flatten())
-            .unwrap_or("origin")
-            .to_string();
-        client
-            .update("SET session_replication_role = replica", None, &[])
-            .map_err(|e| format!("sync: suppress triggers for relocation: {}", e))?;
+        // those triggers on the relocation roots only — tuple routing is not a
+        // trigger and still works — then re-enable them unconditionally so the
+        // caller's transaction is unaffected. `ALTER TABLE ... DISABLE TRIGGER
+        // USER` is scoped to these tables and requires only their ownership
+        // (which the IMV owner holds), unlike the session-wide
+        // `session_replication_role` GUC which is superuser-only and would abort
+        // reconcile for non-superuser roles.
+        for root in &drain_roots {
+            client
+                .update(
+                    &format!("ALTER TABLE {} DISABLE TRIGGER USER", root),
+                    None,
+                    &[],
+                )
+                .map_err(|e| {
+                    format!("sync: suppress triggers for relocation on {}: {}", root, e)
+                })?;
+        }
 
         let reloc_result: Result<(), String> = (|| {
             let drain_entries = drain_tree_defaults(client, &drain_roots)?;
@@ -1257,16 +1258,25 @@ pub(crate) fn reflex_sync_partitions_impl(view_name: &str, drop_orphans: bool) -
             Ok(())
         })();
 
-        // Restore before propagating either result — never leave the session
-        // stuck suppressing triggers for the caller's continuing transaction,
-        // even when the relocation itself failed.
-        let restore_result = client.update(
-            &format!("SET session_replication_role = {}", prior_replication_role),
-            None,
-            &[],
-        );
+        // Restore before propagating either result — never leave a relocation
+        // root with its maintenance triggers disabled for the caller's
+        // continuing transaction, even when the relocation itself failed.
+        let mut restore_err: Option<String> = None;
+        for root in &drain_roots {
+            if let Err(e) = client.update(
+                &format!("ALTER TABLE {} ENABLE TRIGGER USER", root),
+                None,
+                &[],
+            ) {
+                if restore_err.is_none() {
+                    restore_err = Some(format!("sync: restore triggers on {}: {}", root, e));
+                }
+            }
+        }
         reloc_result?;
-        restore_result.map_err(|e| format!("sync: restore session_replication_role: {}", e))?;
+        if let Some(e) = restore_err {
+            return Err(e);
+        }
 
         if !drop_orphans {
             for c in &int_children {

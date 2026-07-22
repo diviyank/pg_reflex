@@ -3579,3 +3579,81 @@ fn pg_part_sync_nested_default_residue_recovered() {
         .unwrap_or(-1);
     assert_eq!(top_after, 0, "the top-level default must remain untouched");
 }
+
+/// Regression (1.10.10): the drain/refill relocation in `reflex_sync_partitions`
+/// suppressed downstream-feeding triggers with a session-wide
+/// `SET session_replication_role = replica`, a SUPERUSER-only GUC. Reconcile of
+/// a partitioned IMV therefore aborted for any non-superuser role with
+/// `permission denied to set parameter "session_replication_role"`, even when
+/// that role owned every table involved. Trigger suppression must instead be
+/// scoped to the relocation roots via ownership-based `ALTER TABLE ... DISABLE
+/// TRIGGER USER`, which a non-superuser table owner is permitted to run.
+#[pg_test]
+fn pg_part_sync_relocation_works_for_non_superuser_owner() {
+    Spi::run("CREATE TABLE permrec_src (k TEXT NOT NULL, v INT) PARTITION BY LIST (k)").expect("src");
+    Spi::run("CREATE TABLE permrec_src_a PARTITION OF permrec_src FOR VALUES IN ('a')").expect("src a");
+    Spi::run("CREATE TABLE permrec_src_def PARTITION OF permrec_src DEFAULT").expect("src default");
+    Spi::run("INSERT INTO permrec_src VALUES ('a', 1), ('a', 2)").expect("seed a");
+
+    let create = Spi::get_one::<String>(
+        "SELECT create_reflex_ivm('permrec_v', 'SELECT k, sum(v) AS s FROM permrec_src GROUP BY k', \
+         'k', NULL, NULL, NULL, ARRAY['k'])",
+    )
+    .expect("create call")
+    .expect("create result");
+    assert!(!create.starts_with("ERROR"), "create returned: {create}");
+
+    // Force default residue in the IMV so the sync performs a real drain/refill
+    // relocation -- the code path that suppresses triggers. Promote 'b' on the
+    // source under replica role so the IMV keeps its default residue behind.
+    Spi::run("INSERT INTO permrec_src VALUES ('b', 10)").expect("seed b");
+    Spi::run("SET CONSTRAINTS ALL IMMEDIATE").expect("maintain");
+    Spi::run("SET session_replication_role = replica").expect("suppress");
+    Spi::run("ALTER TABLE permrec_src DETACH PARTITION permrec_src_def").expect("detach");
+    Spi::run("CREATE TABLE permrec_src_b PARTITION OF permrec_src FOR VALUES IN ('b')").expect("src b");
+    Spi::run("INSERT INTO permrec_src_b SELECT * FROM permrec_src_def WHERE k = 'b'").expect("move b");
+    Spi::run("DELETE FROM permrec_src_def WHERE k = 'b'").expect("clear b");
+    Spi::run("ALTER TABLE permrec_src ATTACH PARTITION permrec_src_def DEFAULT").expect("reattach");
+    Spi::run("SET session_replication_role = origin").expect("restore");
+
+    // A non-superuser role that OWNS every IMV table (target + intermediate and
+    // their partition children) and may create the holding tables the drain
+    // needs. This is the shape of a locked-down production database.
+    Spi::run("CREATE ROLE permrec_owner NOSUPERUSER").expect("role");
+    Spi::run("GRANT CREATE ON SCHEMA public TO permrec_owner").expect("schema create grant");
+    Spi::run("GRANT SELECT ON public.__reflex_ivm_reference TO permrec_owner").expect("catalog select grant");
+    Spi::run(
+        "DO $$ DECLARE r record; BEGIN \
+           FOR r IN SELECT c.oid::regclass::text AS t FROM pg_class c \
+             JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname = 'public' \
+               AND (c.relname = 'permrec_v' OR c.relname LIKE 'permrec\\_v\\_%' \
+                    OR c.relname LIKE '\\_\\_reflex_intermediate_permrec_v%') \
+           LOOP EXECUTE format('ALTER TABLE %s OWNER TO permrec_owner', r.t); END LOOP; \
+         END $$",
+    )
+    .expect("transfer ownership of IMV tables to the non-superuser role");
+
+    Spi::run("SET ROLE permrec_owner").expect("assume non-superuser role");
+    let sync = Spi::get_one::<String>("SELECT reflex_sync_partitions('permrec_v')")
+        .expect("sync call")
+        .expect("sync result");
+    Spi::run("RESET ROLE").expect("reset role");
+
+    assert!(
+        !sync.starts_with("ERROR"),
+        "sync must succeed for a non-superuser table owner, got: {sync}"
+    );
+
+    // The relocation still did its job: 'b' moved out of the default into its
+    // dedicated leaf, nothing lost or duplicated.
+    let b_total: i64 = Spi::get_one("SELECT s::bigint FROM permrec_v WHERE k = 'b'")
+        .expect("b total")
+        .unwrap_or(-1);
+    assert_eq!(b_total, 10, "the relocated 'b' aggregate must survive intact");
+    let b_in_default: i64 =
+        Spi::get_one("SELECT count(*) FROM permrec_v_permrec_src_def WHERE k = 'b'")
+            .expect("default recheck")
+            .unwrap_or(-1);
+    assert_eq!(b_in_default, 0, "'b' must no longer sit in the IMV default");
+}
