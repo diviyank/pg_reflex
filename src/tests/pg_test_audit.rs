@@ -1319,10 +1319,13 @@ fn pg_test_audit_end_to_end_shows_check_errors() {
 
 #[pg_test]
 fn f6_residue_check_resilient_to_where_predicate_error() {
-    // When where_predicate references a missing function or operator,
-    // the residue check should gracefully degrade to "could not verify"
-    // per partition rather than aborting the whole check.
-    // This tests per-partition error isolation.
+    // The residue check verifies residue by probing the IMV's base_query
+    // (which already embeds the IMV's WHERE); it does NOT consult the stored
+    // where_predicate. A stale or corrupt where_predicate in the catalog must
+    // therefore be harmless: the audit neither crashes (no check-errored) nor
+    // raises a false archive_residue finding when the partitions are populated.
+    // (Per-partition probe error isolation is covered separately by
+    // f6_residue_probe_error_degrades_to_advisory.)
 
     // Create a partitioned source table
     Spi::run(
@@ -1363,8 +1366,9 @@ fn f6_residue_check_resilient_to_where_predicate_error() {
     )
     .expect("corrupt where_predicate");
 
-    // Run audit - should NOT crash with check-errored, but should emit
-    // archive_residue findings with "could not verify" messages per partition
+    // Run audit - the corrupt where_predicate is not consulted by the residue
+    // probe, and the partitions are populated, so the audit must complete
+    // cleanly: no check-errored crash and no false archive_residue finding.
     let report: String = Spi::get_one("SELECT reflex_audit('f6_pred_err_imv')")
         .expect("audit must not error even with bad where_predicate")
         .expect("non-null report");
@@ -1376,8 +1380,8 @@ fn f6_residue_check_resilient_to_where_predicate_error() {
     );
 
     assert!(
-        report.contains("archive_residue") && report.contains("could not verify"),
-        "residue check should emit archive_residue/could-not-verify findings per partition; report:\n{}",
+        !report.contains("archive_residue"),
+        "a corrupt where_predicate must not produce a false archive_residue finding on populated partitions; report:\n{}",
         report
     );
 }
