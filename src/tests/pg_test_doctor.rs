@@ -474,8 +474,8 @@ fn pg_test_doctor_advisory_residue_not_executed() {
     // Problem A: advisory residue findings (prose, not runnable SQL) should be
     // reported without executing them, even in fix mode.
     // Create a partitioned IMV with empty target partitions and corrupt the
-    // where_predicate to make the source row count check fail on ALL partitions,
-    // triggering "could not verify" advisory findings instead of confirmed residue.
+    // base_query so the residue definition probe fails on ALL partitions,
+    // triggering advisory "Investigate ..." findings instead of confirmed residue.
 
     // Create partitioned source with multiple partitions
     Spi::run(
@@ -528,13 +528,15 @@ fn pg_test_doctor_advisory_residue_not_executed() {
         Spi::run(&delete_cmd).expect("empty target partition");
     }
 
-    // BEFORE running audit: corrupt the where_predicate to make ALL source
-    // row counts fail (so we get "could not verify" advisory, not confirmed residue)
+    // BEFORE running audit: corrupt base_query to reference a missing relation so
+    // the residue definition probe errors on ALL partitions (safe_count -> None),
+    // yielding advisory "Investigate ..." findings, not confirmed residue.
     Spi::run(
-        "UPDATE public.__reflex_ivm_reference SET where_predicate = '1 / 0 = 1' \
+        "UPDATE public.__reflex_ivm_reference \
+         SET base_query = 'SELECT region, SUM(amount) AS total FROM __reflex_no_such_advisory GROUP BY region' \
          WHERE name = 'advisory_imv'",
     )
-    .expect("corrupt where_predicate");
+    .expect("corrupt base_query");
 
     // Run audit to generate advisory findings
     let _audit_out: String = Spi::get_one("SELECT reflex_audit('advisory_imv')")
@@ -902,10 +904,10 @@ fn f9_f11_doctor_surfaces_orphan_and_duplicate_findings() {
     );
 }
 
-/// Bug 4: where_predicate is stored only for single-source IMVs
-/// (src/create_ivm/mod.rs:1534). A multi-source filtered IMV therefore gets an
-/// unfiltered source count, and correctly-empty partitions are reported as
-/// archive residue forever. Such an IMV must yield an advisory, not a warning.
+/// A multi-source filtered IMV whose partition is correctly empty because the
+/// filter excludes its rows must not be flagged as residue. The definition
+/// probe evaluates the IMV's own base_query (filter included), so the empty
+/// partition is definitively cleared.
 #[pg_test]
 fn pg_doctor_filtered_multi_source_imv_is_not_residue() {
     Spi::run("CREATE TABLE fr_src (k TEXT NOT NULL, d DATE, v INT) PARTITION BY LIST (k)")
@@ -934,17 +936,18 @@ fn pg_doctor_filtered_multi_source_imv_is_not_residue() {
         .expect("audit query")
         .expect("non-null report");
     assert!(
-        !report.contains("IMV partition is empty"),
+        !report.contains("archive_residue"),
         "a correctly-filtered empty partition must not be flagged as residue:\n{}",
         report
     );
 }
 
-/// F3: an UNFILTERED multi-source join with a correctly-empty partition must
-/// also be classified unverifiable — the source-vs-IMV per-partition count
-/// comparison is unsound for any join, filtered or not.
+/// An UNFILTERED multi-source join with a legitimately-empty partition (a key
+/// present in the partitioned source but with no join match) is definitively
+/// verified by the IMV definition probe — the join yields no rows for that
+/// partition — and must not be flagged as residue.
 #[pg_test]
-fn pg_doctor_unfiltered_multi_source_imv_is_unverifiable() {
+fn pg_doctor_unfiltered_multi_source_join_legit_empty_not_residue() {
     Spi::run("CREATE TABLE fu_a (k TEXT NOT NULL, v INT) PARTITION BY LIST (k)").expect("a");
     Spi::run("CREATE TABLE fu_a_x PARTITION OF fu_a FOR VALUES IN ('x')").expect("ax");
     Spi::run("CREATE TABLE fu_a_y PARTITION OF fu_a FOR VALUES IN ('y')").expect("ay");
@@ -968,7 +971,7 @@ fn pg_doctor_unfiltered_multi_source_imv_is_unverifiable() {
         .expect("audit")
         .expect("report");
     assert!(
-        !report.contains("IMV partition is empty"),
+        !report.contains("archive_residue"),
         "an unfiltered multi-source join must not be flagged as residue:\n{}",
         report
     );

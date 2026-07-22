@@ -51,7 +51,7 @@ fn unverifiable_finding(imv: &ImvRow, src_child: &str) -> Finding {
             src_child
         ),
         suggested_fix: format!(
-            "Re-run reflex_doctor for partition '{}', or reconcile it manually after investigating source access",
+            "Investigate source access for partition '{}', then re-run reflex_doctor or reconcile it manually",
             src_child
         ),
     }
