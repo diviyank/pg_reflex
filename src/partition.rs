@@ -1219,16 +1219,38 @@ pub(crate) fn reflex_sync_partitions_impl(view_name: &str, drop_orphans: bool) -
         // (which the IMV owner holds), unlike the session-wide
         // `session_replication_role` GUC which is superuser-only and would abort
         // reconcile for non-superuser roles.
+        // Track which roots we actually disabled so every one is re-enabled on
+        // every exit path — including a failure partway through this loop, which
+        // must not leave an already-disabled root (e.g. the target table that
+        // carries a downstream chained-IMV trigger) disabled in the committing
+        // transaction.
+        let mut disabled_roots: Vec<&String> = Vec::new();
+        let mut disable_err: Option<String> = None;
         for root in &drain_roots {
-            client
-                .update(
-                    &format!("ALTER TABLE {} DISABLE TRIGGER USER", root),
+            match client.update(
+                &format!("ALTER TABLE {} DISABLE TRIGGER USER", root),
+                None,
+                &[],
+            ) {
+                Ok(_) => disabled_roots.push(root),
+                Err(e) => {
+                    disable_err = Some(format!(
+                        "sync: suppress triggers for relocation on {}: {}",
+                        root, e
+                    ));
+                    break;
+                }
+            }
+        }
+        if let Some(e) = disable_err {
+            for root in &disabled_roots {
+                let _ = client.update(
+                    &format!("ALTER TABLE {} ENABLE TRIGGER USER", root),
                     None,
                     &[],
-                )
-                .map_err(|e| {
-                    format!("sync: suppress triggers for relocation on {}: {}", root, e)
-                })?;
+                );
+            }
+            return Err(e);
         }
 
         let reloc_result: Result<(), String> = (|| {
@@ -1262,7 +1284,7 @@ pub(crate) fn reflex_sync_partitions_impl(view_name: &str, drop_orphans: bool) -
         // root with its maintenance triggers disabled for the caller's
         // continuing transaction, even when the relocation itself failed.
         let mut restore_err: Option<String> = None;
-        for root in &drain_roots {
+        for root in &disabled_roots {
             if let Err(e) = client.update(
                 &format!("ALTER TABLE {} ENABLE TRIGGER USER", root),
                 None,
