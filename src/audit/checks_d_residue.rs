@@ -1,21 +1,60 @@
-use super::{quote_qualified_for_regclass, Check, Finding, ImvRow, Severity};
+use super::{Check, Finding, ImvRow, Severity};
 use pgrx::spi::SpiClient;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::panic::AssertUnwindSafe;
 
 pub(super) struct ArchiveResidue;
 
-enum SourceCount {
-    Exact(i64),
-    Unverifiable,
+/// Upper bound on a single definition probe. `statement_timeout` is USERSET
+/// (no superuser dependency) and set best-effort — if the SET is rejected the
+/// probe runs unbounded, still bounded in COUNT by the empty-partition gate.
+const RESIDUE_PROBE_TIMEOUT: &str = "30s";
+
+/// Qualify a bare child relname with the IMV's schema so it resolves regardless
+/// of the caller's search_path.
+fn qualify(schema: Option<&str>, bare: &str) -> String {
+    match schema {
+        Some(s) => format!("\"{}\".\"{}\"", s, bare),
+        None => format!("\"{}\"", bare),
+    }
 }
 
-/// The archive_residue check compares a source partition's row count against the
-/// IMV partition's. That is sound only for a ~1:1 single-source IMV; for any
-/// multi-source IMV (a join) the counts are unrelated, filtered or not, so the
-/// residue verdict is unverifiable.
-fn residue_count_unverifiable(imv: &ImvRow) -> bool {
-    imv.real_sources().count() > 1
+/// Confirmed residue: the IMV definition would populate this partition but it is
+/// empty. The fix MUST start with `SELECT` so reflex_doctor treats it as runnable
+/// (see doctor.rs is_runnable_fix / collapse parser).
+fn confirmed_finding(imv: &ImvRow, src_child: &str) -> Finding {
+    Finding {
+        imv: Some(imv.name.clone()),
+        severity: Severity::Warning,
+        category: "archive_residue",
+        finding: format!(
+            "Partition {} is empty but the IMV definition would populate it (archive residue)",
+            src_child
+        ),
+        suggested_fix: format!(
+            "SELECT reflex_reconcile_partition('{}', '', '{}');",
+            imv.name, src_child
+        ),
+    }
+}
+
+/// Unverifiable: the probe could not be evaluated (bad definition, missing
+/// constraint, or timeout). The fix MUST be prose (no leading `SELECT`) so
+/// reflex_doctor reports it rather than executing it.
+fn unverifiable_finding(imv: &ImvRow, src_child: &str) -> Finding {
+    Finding {
+        imv: Some(imv.name.clone()),
+        severity: Severity::Warning,
+        category: "archive_residue",
+        finding: format!(
+            "Partition {}: could not evaluate the IMV definition (query failed or timed out); cannot confirm archive residue status",
+            src_child
+        ),
+        suggested_fix: format!(
+            "Re-run reflex_doctor for partition '{}', or reconcile it manually after investigating source access",
+            src_child
+        ),
+    }
 }
 
 impl Check for ArchiveResidue {
@@ -29,19 +68,15 @@ impl Check for ArchiveResidue {
             None => return vec![],
         };
 
-        // Skip non-partitioned IMVs
         let part_cols = match imv.partition_columns.as_ref() {
             Some(p) if !p.is_empty() => p,
             _ => return vec![],
         };
 
-        let mut findings = Vec::new();
-
-        // Resolve the anchor source (the source that owns the first partition column)
-        let sources_vec: Vec<String> = imv.real_sources().map(|s| s.to_string()).collect();
-
-        // Also include ignored sources when finding the anchor
-        let mut all_sources_for_anchor = sources_vec.clone();
+        // Resolve the anchor source (owns the first partition column), including
+        // ignored sources so the anchor still resolves in the residue scenario.
+        let mut all_sources_for_anchor: Vec<String> =
+            imv.real_sources().map(|s| s.to_string()).collect();
         if let Some(ignored) = imv.ignored_sources.as_ref() {
             all_sources_for_anchor.extend(ignored.clone());
         }
@@ -54,118 +89,106 @@ impl Check for ArchiveResidue {
             &all_sources_for_anchor,
         ) {
             Ok(a) => a,
-            Err(_) => {
-                // If we can't resolve the anchor, the IMV may not be partitioned correctly
-                // or the source is not visible. Skip the check in this case.
-                return vec![];
-            }
+            Err(_) => return vec![],
         };
 
-        // Get partition children from the source
         let src_children = crate::partition::list_partition_children(client, &anchor);
         if src_children.is_empty() {
             return vec![];
         }
 
-        // Get IMV target partition children with row counts
+        // Target partition children with row counts, keyed by bare name.
         let tgt_parent = crate::query_decomposer::quote_identifier(&imv.name);
         let tgt_children = crate::partition::list_partition_children(client, &tgt_parent);
-
-        // Build map of partition key -> IMV row count.
-        // Partition children carry only their bare relname; qualify with the
-        // IMV's schema so the count resolves regardless of the caller's
-        // search_path (the IMV, and thus its children, may live in a
-        // non-public schema not on the current path).
         let (imv_schema, _) = crate::query_decomposer::split_qualified_name(&imv.name);
+
+        let existing_tgt: HashSet<String> =
+            tgt_children.iter().map(|c| c.bare_name.clone()).collect();
+
         let mut imv_row_counts: HashMap<String, i64> = HashMap::new();
         for tgt_child in &tgt_children {
-            let child_ref = match imv_schema {
-                Some(schema) => format!("\"{}\".\"{}\"", schema, tgt_child.bare_name),
-                None => format!("\"{}\"", tgt_child.bare_name),
-            };
-            let count: i64 = self
+            let child_ref = qualify(imv_schema, &tgt_child.bare_name);
+            let count = self
                 .safe_count(
                     client,
                     &format!("SELECT count(*) AS cnt FROM {}", child_ref),
                 )
                 .unwrap_or(0);
-
             imv_row_counts.insert(tgt_child.bare_name.clone(), count);
         }
 
-        // For each source partition key, count source rows (applying WHERE predicate if possible)
-        for src_child in &src_children {
-            match self.count_source_rows_for_partition(client, &anchor, &src_child.bare_name, imv) {
-                Some(SourceCount::Exact(src_count)) => {
-                    // Get the corresponding IMV partition row count
-                    let tgt_partition =
-                        crate::partition::target_child_name(&imv.name, &src_child.bare_name);
-                    let imv_count = imv_row_counts.get(&tgt_partition).copied().unwrap_or(0);
+        // Only EMPTY, EXISTING target children can be residue. A missing child is
+        // another check's concern; a non-empty child cannot be residue.
+        let empty_src_children: Vec<String> = src_children
+            .iter()
+            .filter_map(|src_child| {
+                let tgt = crate::partition::target_child_name(&imv.name, &src_child.bare_name);
+                if existing_tgt.contains(&tgt)
+                    && imv_row_counts.get(&tgt).copied().unwrap_or(0) == 0
+                {
+                    Some(src_child.bare_name.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
 
-                    // If source has rows but IMV partition is empty: archive residue
-                    if src_count > 0 && imv_count == 0 {
-                        findings.push(Finding {
-                            imv: Some(imv.name.clone()),
-                            severity: Severity::Warning,
-                            category: "archive_residue",
-                            finding: format!(
-                                "Partition {} has source rows ({}) but IMV partition is empty (0)",
-                                src_child.bare_name, src_count
-                            ),
-                            suggested_fix: format!(
-                                "SELECT reflex_reconcile_partition('{}', '', '{}');",
-                                imv.name, src_child.bare_name
-                            ),
-                        });
+        if empty_src_children.is_empty() {
+            return vec![];
+        }
+
+        // Load the IMV definition once. Without base_query nothing is verifiable.
+        let (base_query, has_intermediate) = match self.load_definition(client, &imv.name) {
+            Some(v) => v,
+            None => {
+                return empty_src_children
+                    .iter()
+                    .map(|c| unverifiable_finding(imv, c))
+                    .collect();
+            }
+        };
+
+        let prior_timeout = self.set_probe_timeout(client);
+
+        let mut findings = Vec::new();
+        for src_child in &empty_src_children {
+            // base_query fills the intermediate for aggregates (filtered by the
+            // intermediate constraint) and the target for passthrough (target
+            // constraint). Mirror build_swap_partition_ddl exactly.
+            let constraint_child = if has_intermediate {
+                crate::partition::intermediate_child_name(&imv.name, src_child)
+            } else {
+                crate::partition::target_child_name(&imv.name, src_child)
+            };
+            let constraint =
+                match self.partition_constraint(client, &qualify(imv_schema, &constraint_child)) {
+                    Some(c) => c,
+                    None => {
+                        findings.push(unverifiable_finding(imv, src_child));
+                        continue;
                     }
-                }
-                Some(SourceCount::Unverifiable) => {
-                    findings.push(Finding {
-                        imv: Some(imv.name.clone()),
-                        severity: Severity::Warning,
-                        category: "archive_residue",
-                        finding: format!(
-                            "Partition {}: IMV joins multiple sources, so a source partition's row \
-                             count is not comparable to the IMV partition's; cannot confirm archive \
-                             residue status",
-                            src_child.bare_name
-                        ),
-                        suggested_fix: format!(
-                            "Compare counts manually against the IMV definition for partition '{}'",
-                            src_child.bare_name
-                        ),
-                    });
-                }
-                None => {
-                    // Failed to count source rows - emit unverifiable finding
-                    findings.push(Finding {
-                        imv: Some(imv.name.clone()),
-                        severity: Severity::Warning,
-                        category: "archive_residue",
-                        finding: format!(
-                            "Partition {}: could not verify source row count (query failed); cannot confirm archive residue status",
-                            src_child.bare_name
-                        ),
-                        suggested_fix: format!(
-                            "Investigate source table access for partition '{}' and re-run audit",
-                            src_child.bare_name
-                        ),
-                    });
-                }
+                };
+
+            let probe = format!(
+                "SELECT (CASE WHEN EXISTS (SELECT 1 FROM ({}) __src WHERE ({})) THEN 1 ELSE 0 END)::bigint AS cnt",
+                base_query, constraint
+            );
+            match self.safe_count(client, &probe) {
+                Some(1) => findings.push(confirmed_finding(imv, src_child)),
+                Some(_) => {} // definition yields no rows -> legitimately empty
+                None => findings.push(unverifiable_finding(imv, src_child)),
             }
         }
 
+        self.restore_probe_timeout(client, prior_timeout);
         findings
     }
 }
 
 impl ArchiveResidue {
-    fn safe_count(&self, client: &pgrx::spi::SpiClient<'_>, sql: &str) -> Option<i64> {
-        // Execute SQL safely, catching Postgres errors that would panic the FFI boundary.
-        // Returns None if the query fails (either via error or panic), gracefully degrading
-        // to "could not verify" findings instead of aborting the whole check.
-        // Err(_) => query crashed at the FFI boundary; unwrap_or_default() maps it
-        // to None so we degrade to a "could not verify" finding.
+    /// Execute a `... AS cnt` query, catching Postgres errors at the FFI
+    /// boundary. Returns None on any failure (error or timeout).
+    fn safe_count(&self, client: &SpiClient<'_>, sql: &str) -> Option<i64> {
         std::panic::catch_unwind(AssertUnwindSafe(|| {
             client
                 .select(sql, None, &[])
@@ -176,80 +199,93 @@ impl ArchiveResidue {
         .unwrap_or_default()
     }
 
-    fn count_source_rows_for_partition(
-        &self,
-        client: &pgrx::spi::SpiClient<'_>,
-        source: &str,
-        partition_name: &str,
-        imv: &ImvRow,
-    ) -> Option<SourceCount> {
-        if residue_count_unverifiable(imv) {
-            return Some(SourceCount::Unverifiable);
-        }
-
-        let where_predicate = &imv.where_predicate;
-
-        // Count rows in the partition by querying the source with the partition constraint
-        // The partition_name is the bare name (e.g. 'f6_src_us') of a child partition
-
-        // First, get the partition bounds to identify which rows belong to this
-        // partition. `partition_name` is a bare child relname; qualify it with
-        // the source's schema so the ::regclass cast resolves even when the
-        // source lives in a schema not on the current search_path.
-        let (source_schema, _) = crate::query_decomposer::split_qualified_name(source);
-        let qualified_partition = match source_schema {
-            Some(schema) => format!("\"{}\".\"{}\"", schema, partition_name),
-            None => format!("\"{}\"", partition_name),
-        };
-        let bound_query = format!(
-            "SELECT pg_get_partition_constraintdef('{}'::regclass) AS constraint",
-            qualified_partition
+    /// Fetch (base_query, has_intermediate) for the IMV. has_intermediate mirrors
+    /// reconcile's `!end_query.is_empty()` guard. None if base_query is
+    /// absent/empty or the lookup fails.
+    fn load_definition(&self, client: &SpiClient<'_>, name: &str) -> Option<(String, bool)> {
+        let sql = format!(
+            "SELECT base_query, COALESCE(end_query, '') AS end_query \
+             FROM public.__reflex_ivm_reference WHERE name = '{}'",
+            name.replace('\'', "''")
         );
+        std::panic::catch_unwind(AssertUnwindSafe(|| {
+            let mut iter = client.select(&sql, Some(1), &[]).ok()?;
+            let row = iter.next()?;
+            let base = row
+                .get_by_name::<&str, _>("base_query")
+                .ok()
+                .flatten()?
+                .to_string();
+            if base.trim().is_empty() {
+                return None;
+            }
+            let end = row
+                .get_by_name::<&str, _>("end_query")
+                .ok()
+                .flatten()
+                .unwrap_or("");
+            Some((base, !end.trim().is_empty()))
+        }))
+        .ok()
+        .flatten()
+    }
 
-        // A failed constraint lookup degrades to None (fall back to an unfiltered
-        // source count) rather than aborting the whole residue check.
-        let constraint: Option<String> = std::panic::catch_unwind(AssertUnwindSafe(|| {
+    /// Read a partition child's constraint definition. None if the child is
+    /// absent or the lookup fails.
+    fn partition_constraint(&self, client: &SpiClient<'_>, child_qual: &str) -> Option<String> {
+        let sql = format!(
+            "SELECT pg_get_partition_constraintdef('{}'::regclass) AS constraint",
+            child_qual.replace('\'', "''")
+        );
+        std::panic::catch_unwind(AssertUnwindSafe(|| {
             client
-                .select(&bound_query, None, &[])
+                .select(&sql, Some(1), &[])
                 .ok()
                 .and_then(|mut iter| iter.next())
                 .and_then(|row| row.get_by_name::<&str, _>("constraint").ok().flatten())
                 .map(|s| s.to_string())
         }))
-        .unwrap_or_default();
+        .ok()
+        .flatten()
+        .filter(|c| !c.trim().is_empty())
+    }
 
-        // Quote the source table name to handle schema-qualified or special-char names
-        let quoted_source = quote_qualified_for_regclass(source);
+    /// Best-effort: set the probe timeout, returning the prior value to restore.
+    /// Any failure (e.g. read-only SPI rejecting SET) is swallowed and the probe
+    /// runs unbounded.
+    fn set_probe_timeout(&self, client: &SpiClient<'_>) -> Option<String> {
+        let prior = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            client
+                .select("SHOW statement_timeout", Some(1), &[])
+                .ok()
+                .and_then(|mut it| it.next())
+                .and_then(|r| r.get_by_name::<&str, _>("statement_timeout").ok().flatten())
+                .map(|s| s.to_string())
+        }))
+        .ok()
+        .flatten();
 
-        // Build the count query
-        let count_query = if let Some(constraint) = constraint {
-            // Use the partition constraint to filter rows from the source
-            if let Some(pred) = where_predicate {
-                // Try to apply the WHERE predicate along with the partition constraint
-                format!(
-                    "SELECT count(*) AS cnt FROM {} WHERE ({}) AND ({})",
-                    quoted_source, constraint, pred
-                )
-            } else {
-                // Just use the partition constraint
-                format!(
-                    "SELECT count(*) AS cnt FROM {} WHERE ({})",
-                    quoted_source, constraint
-                )
-            }
-        } else {
-            // Fall back: count all rows in source (over-report rather than miss)
-            if let Some(pred) = where_predicate {
-                format!(
-                    "SELECT count(*) AS cnt FROM {} WHERE {}",
-                    quoted_source, pred
-                )
-            } else {
-                format!("SELECT count(*) AS cnt FROM {}", quoted_source)
-            }
-        };
+        let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            let _ = client.select(
+                &format!("SET statement_timeout = '{}'", RESIDUE_PROBE_TIMEOUT),
+                None,
+                &[],
+            );
+        }));
 
-        self.safe_count(client, &count_query)
-            .map(SourceCount::Exact)
+        prior
+    }
+
+    /// Restore the timeout captured by `set_probe_timeout` (best-effort).
+    fn restore_probe_timeout(&self, client: &SpiClient<'_>, prior: Option<String>) {
+        if let Some(prior) = prior {
+            let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                let _ = client.select(
+                    &format!("SET statement_timeout = '{}'", prior.replace('\'', "''")),
+                    None,
+                    &[],
+                );
+            }));
+        }
     }
 }
