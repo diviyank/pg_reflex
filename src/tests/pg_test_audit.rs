@@ -1381,3 +1381,146 @@ fn f6_residue_check_resilient_to_where_predicate_error() {
         report
     );
 }
+
+/// Multi-source JOIN residue: the case the old check could not confirm. A
+/// partitioned join IMV whose 'us' target partition is empty while the join
+/// definition would populate it must be flagged with a runnable
+/// reflex_reconcile_partition fix (not "compare manually").
+#[pg_test]
+fn f6_residue_multisource_join_confirms_residue() {
+    Spi::run("CREATE TABLE f6j_sales (id BIGINT, region TEXT NOT NULL, amount NUMERIC) PARTITION BY LIST (region)").expect("sales parent");
+    Spi::run("CREATE TABLE f6j_sales_us PARTITION OF f6j_sales FOR VALUES IN ('us')").expect("sales us");
+    Spi::run("CREATE TABLE f6j_sales_eu PARTITION OF f6j_sales FOR VALUES IN ('eu')").expect("sales eu");
+    Spi::run("CREATE TABLE f6j_region (region TEXT PRIMARY KEY, label TEXT)").expect("region lookup");
+    Spi::run("INSERT INTO f6j_region VALUES ('us','United States'),('eu','Europe')").expect("seed lookup");
+    Spi::run("INSERT INTO f6j_sales VALUES (1,'us',100),(2,'eu',200)").expect("seed sales");
+
+    Spi::run(
+        "SELECT create_reflex_ivm( \
+           'f6j_imv', \
+           'SELECT s.region, SUM(s.amount) AS total FROM f6j_sales s JOIN f6j_region r ON r.region = s.region GROUP BY s.region', \
+           NULL, NULL, NULL, NULL, ARRAY['region'])",
+    ).expect("create join IMV");
+
+    // Simulate archive residue: suppress maintenance, then empty the 'us' target child.
+    Spi::run("UPDATE public.__reflex_ivm_reference SET ignored_sources = ARRAY['f6j_sales'] WHERE name = 'f6j_imv'").expect("mark ignored");
+    let tgt: Vec<String> = Spi::get_one::<Vec<String>>(
+        "SELECT array_agg(c.relname::text ORDER BY c.relname) FROM pg_inherits i \
+         JOIN pg_class c ON c.oid = i.inhrelid WHERE i.inhparent = to_regclass('f6j_imv')::oid",
+    ).expect("ok").unwrap_or_default();
+    let us = tgt.iter().find(|c| c.contains("us")).expect("us target child present");
+    Spi::run(&format!("DELETE FROM \"{}\"", us)).expect("empty us target");
+
+    let report: String = Spi::get_one("SELECT reflex_audit('f6j_imv')").expect("ok").expect("non-null");
+    assert!(report.contains("archive_residue"), "expected archive_residue finding:\n{report}");
+    assert!(report.contains("reflex_reconcile_partition"), "expected runnable reconcile fix:\n{report}");
+}
+
+/// Multi-source JOIN, legitimately empty: 'us' has sales but NO matching lookup
+/// row, so the inner join yields no 'us' rows and the empty 'us' target
+/// partition is correct. The definition probe returns 0 -> no finding.
+#[pg_test]
+fn f6_residue_multisource_join_legit_empty_no_finding() {
+    Spi::run("CREATE TABLE f6jl_sales (id BIGINT, region TEXT NOT NULL, amount NUMERIC) PARTITION BY LIST (region)").expect("sales parent");
+    Spi::run("CREATE TABLE f6jl_sales_us PARTITION OF f6jl_sales FOR VALUES IN ('us')").expect("sales us");
+    Spi::run("CREATE TABLE f6jl_sales_eu PARTITION OF f6jl_sales FOR VALUES IN ('eu')").expect("sales eu");
+    Spi::run("CREATE TABLE f6jl_region (region TEXT PRIMARY KEY, label TEXT)").expect("region lookup");
+    Spi::run("INSERT INTO f6jl_region VALUES ('eu','Europe')").expect("seed lookup eu only");
+    Spi::run("INSERT INTO f6jl_sales VALUES (1,'us',100),(2,'eu',200)").expect("seed sales");
+
+    Spi::run(
+        "SELECT create_reflex_ivm( \
+           'f6jl_imv', \
+           'SELECT s.region, SUM(s.amount) AS total FROM f6jl_sales s JOIN f6jl_region r ON r.region = s.region GROUP BY s.region', \
+           NULL, NULL, NULL, NULL, ARRAY['region'])",
+    ).expect("create join IMV");
+
+    // The 'us' target partition is legitimately empty (no matching lookup row).
+    let report: String = Spi::get_one("SELECT reflex_audit('f6jl_imv')").expect("ok").expect("non-null");
+    assert!(
+        !report.contains("archive_residue"),
+        "us partition is legitimately empty (no join match); expected no archive_residue:\n{report}"
+    );
+}
+
+/// Aggregate residue must be confirmed from base_query (the real sources), NOT
+/// from end_query (which reads the intermediate). Emptying BOTH the intermediate
+/// and target 'us' children reproduces a genuine residue: an end_query probe
+/// over the empty intermediate would wrongly clear it; the base_query probe
+/// still confirms it.
+#[pg_test]
+fn f6_residue_aggregate_probes_base_query_not_intermediate() {
+    Spi::run("CREATE TABLE f6a_sales (id BIGINT, region TEXT NOT NULL, amount NUMERIC) PARTITION BY LIST (region)").expect("sales parent");
+    Spi::run("CREATE TABLE f6a_sales_us PARTITION OF f6a_sales FOR VALUES IN ('us')").expect("sales us");
+    Spi::run("CREATE TABLE f6a_sales_eu PARTITION OF f6a_sales FOR VALUES IN ('eu')").expect("sales eu");
+    Spi::run("CREATE TABLE f6a_region (region TEXT PRIMARY KEY, label TEXT)").expect("region lookup");
+    Spi::run("INSERT INTO f6a_region VALUES ('us','United States'),('eu','Europe')").expect("seed lookup");
+    Spi::run("INSERT INTO f6a_sales VALUES (1,'us',100),(2,'eu',200)").expect("seed sales");
+
+    Spi::run(
+        "SELECT create_reflex_ivm( \
+           'f6a_imv', \
+           'SELECT s.region, SUM(s.amount) AS total FROM f6a_sales s JOIN f6a_region r ON r.region = s.region GROUP BY s.region', \
+           NULL, NULL, NULL, NULL, ARRAY['region'])",
+    ).expect("create aggregate join IMV");
+
+    Spi::run("UPDATE public.__reflex_ivm_reference SET ignored_sources = ARRAY['f6a_sales'] WHERE name = 'f6a_imv'").expect("mark ignored");
+
+    // Empty the 'us' TARGET child.
+    let tgt: Vec<String> = Spi::get_one::<Vec<String>>(
+        "SELECT array_agg(c.relname::text ORDER BY c.relname) FROM pg_inherits i \
+         JOIN pg_class c ON c.oid = i.inhrelid WHERE i.inhparent = to_regclass('f6a_imv')::oid",
+    ).expect("ok").unwrap_or_default();
+    let tgt_us = tgt.iter().find(|c| c.contains("us")).expect("us target child present");
+    Spi::run(&format!("DELETE FROM \"{}\"", tgt_us)).expect("empty us target");
+
+    // Empty the 'us' INTERMEDIATE child too, so an end_query-based probe would clear it.
+    let ints: Vec<String> = Spi::get_one::<Vec<String>>(
+        "SELECT array_agg(c.relname::text ORDER BY c.relname) FROM pg_inherits i \
+         JOIN pg_class c ON c.oid = i.inhrelid \
+         WHERE i.inhparent = to_regclass('__reflex_intermediate_f6a_imv')::oid",
+    ).expect("ok").unwrap_or_default();
+    let int_us = ints.iter().find(|c| c.contains("us")).expect("us intermediate child present");
+    Spi::run(&format!("DELETE FROM \"{}\"", int_us)).expect("empty us intermediate");
+
+    let report: String = Spi::get_one("SELECT reflex_audit('f6a_imv')").expect("ok").expect("non-null");
+    assert!(report.contains("archive_residue"), "expected archive_residue from base_query probe:\n{report}");
+    assert!(report.contains("reflex_reconcile_partition"), "expected runnable reconcile fix:\n{report}");
+}
+
+/// Probe degradation: if evaluating base_query fails (invalid definition, or a
+/// real statement_timeout — both funnel through the same None branch), the check
+/// must emit a PROSE advisory (no runnable reflex_reconcile_partition fix) and
+/// still complete, never crash the audit.
+#[pg_test]
+fn f6_residue_probe_error_degrades_to_advisory() {
+    Spi::run("CREATE TABLE f6e_sales (id BIGINT, region TEXT NOT NULL, amount NUMERIC) PARTITION BY LIST (region)").expect("sales parent");
+    Spi::run("CREATE TABLE f6e_sales_us PARTITION OF f6e_sales FOR VALUES IN ('us')").expect("sales us");
+    Spi::run("CREATE TABLE f6e_sales_eu PARTITION OF f6e_sales FOR VALUES IN ('eu')").expect("sales eu");
+    Spi::run("INSERT INTO f6e_sales VALUES (1,'us',100),(2,'eu',200)").expect("seed sales");
+
+    Spi::run(
+        "SELECT create_reflex_ivm( \
+           'f6e_imv', \
+           'SELECT region, SUM(amount) AS total FROM f6e_sales GROUP BY region', \
+           NULL, NULL, NULL, NULL, ARRAY['region'])",
+    ).expect("create IMV");
+
+    // Empty the 'us' target child so it becomes a probe candidate.
+    let tgt: Vec<String> = Spi::get_one::<Vec<String>>(
+        "SELECT array_agg(c.relname::text ORDER BY c.relname) FROM pg_inherits i \
+         JOIN pg_class c ON c.oid = i.inhrelid WHERE i.inhparent = to_regclass('f6e_imv')::oid",
+    ).expect("ok").unwrap_or_default();
+    let us = tgt.iter().find(|c| c.contains("us")).expect("us target child present");
+    Spi::run(&format!("DELETE FROM \"{}\"", us)).expect("empty us target");
+
+    // Corrupt base_query so the probe errors -> None -> advisory (prose) finding.
+    Spi::run("UPDATE public.__reflex_ivm_reference SET base_query = 'SELECT ''us''::text AS region FROM __reflex_no_such_table' WHERE name = 'f6e_imv'").expect("corrupt base_query");
+
+    let report: String = Spi::get_one("SELECT reflex_audit('f6e_imv')").expect("ok").expect("non-null");
+    assert!(report.contains("archive_residue"), "expected an archive_residue advisory:\n{report}");
+    assert!(
+        !report.contains("reflex_reconcile_partition"),
+        "a failed probe must NOT yield a runnable reconcile fix:\n{report}"
+    );
+}
