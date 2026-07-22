@@ -4,6 +4,19 @@ The full changelog tracks every release. The latest version's headlines are on t
 
 For each version below, see [`CHANGELOG.md`](https://github.com/diviyank/pg_reflex/blob/main/CHANGELOG.md) on GitHub for the canonical text.
 
+## [1.10.11] — 2026-07-22
+
+Non-superuser reconcile, and real archive-residue verification for joins: `reflex_reconcile` on a partitioned IMV no longer requires superuser, and the `archive_residue` check now confirms or clears residue on multi-source and aggregate IMVs instead of the "cannot confirm" placeholder 1.10.10 left. Replace the `.so`, then `ALTER EXTENSION pg_reflex UPDATE TO '1.10.11';`.
+
+**Fixed**
+
+- `reflex_reconcile` no longer fails for non-superuser roles: the partition-sync relocation path replaced the superuser-only `session_replication_role` GUC with ownership-scoped `ALTER TABLE ... DISABLE/ENABLE TRIGGER USER` on the relocation roots, re-enabling every disabled root on all exit paths (including partial-failure bailout).
+- `archive_residue` now verifies residue on multi-source and aggregate IMVs instead of reporting "cannot confirm": for each empty IMV partition it probes the IMV's own definition (`base_query`) scoped to that partition — intermediate constraint for aggregates, target for passthrough — reporting confirmed residue (with a runnable `reflex_reconcile_partition` fix) only when the definition would produce rows, clearing correctly-empty partitions, and degrading a failed/timed-out probe to a prose advisory.
+
+**Migration**
+
+- `ALTER EXTENSION pg_reflex UPDATE TO '1.10.11';` — [`sql/pg_reflex--1.10.10--1.10.11.sql`](https://github.com/diviyank/pg_reflex/blob/main/sql/pg_reflex--1.10.10--1.10.11.sql) is a no-op delta (both fixes ship in the module, no SQL changes). Re-run `reflex_doctor()` to re-check partitions previously reported as "cannot confirm".
+
 ## [1.10.10] — 2026-07-21
 
 The partition-flush deadlock release: fixes an unbounded retry loop that could hang a committing backend, closes the circular default-partition state that made a new IMV leaf unrecoverable, adds a safety refusal to [`reflex_rebuild_chain`](api/reflex_rebuild_chain.md) before CASCADE-dropping dependents, and removes a false-positive `archive_residue` warning. Replace the `.so`, then `ALTER EXTENSION pg_reflex UPDATE TO '1.10.10';`.

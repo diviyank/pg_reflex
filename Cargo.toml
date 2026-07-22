@@ -4,7 +4,7 @@ members = ["fuzz_model"]
 
 [package]
 name = "pg_reflex"
-version = "1.10.10"
+version = "1.10.11"
 edition = "2021"
 description = "Incremental materialized view maintenance for PostgreSQL"
 license = "Apache-2.0"

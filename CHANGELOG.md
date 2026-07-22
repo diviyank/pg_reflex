@@ -2,6 +2,47 @@
 
 ## [Unreleased]
 
+## [1.10.11] - 2026-07-22
+
+Non-superuser reconcile, and real archive-residue verification for joins.
+`reflex_reconcile` on a partitioned IMV no longer requires superuser, and
+the `archive_residue` check now confirms or clears residue on multi-source
+and aggregate IMVs instead of reporting "cannot confirm" (the placeholder
+1.10.10 left in place). Replace the `.so`, then
+`ALTER EXTENSION pg_reflex UPDATE TO '1.10.11';`.
+
+### Fixed
+
+- **`reflex_reconcile` failed for non-superuser roles with "permission
+  denied to set parameter session_replication_role".** The partition-sync
+  relocation path (new in 1.10.10) suppressed downstream chained-IMV
+  triggers with the session-wide, superuser-only `session_replication_role`
+  GUC. It now uses ownership-scoped `ALTER TABLE ... DISABLE/ENABLE TRIGGER
+  USER` on the relocation roots, which a non-superuser table owner may run.
+  The suppression is strictly narrower than the old replica role, and every
+  root that was disabled is re-enabled on all exit paths — including a
+  partial-failure bailout, so the target table's downstream-feeding trigger
+  is never left disabled in the committing transaction.
+- **`archive_residue` could not verify residue on multi-source or aggregate
+  IMVs.** 1.10.10 replaced a false-positive with a "cannot confirm" advisory
+  for any join. The check now verifies directly: for each empty IMV
+  partition it probes the IMV's own definition (`base_query`) scoped to that
+  partition's constraint — the intermediate constraint for aggregates, the
+  target constraint for passthrough, mirroring how reconcile fills a
+  partition. It reports confirmed residue (with a runnable
+  `reflex_reconcile_partition` fix) only when the definition would have
+  produced rows, clears correctly-empty partitions (filtered out, or no join
+  match), and degrades a failed or timed-out probe to a prose advisory. Each
+  probe is bounded by a best-effort, non-superuser `statement_timeout`.
+
+### Migration
+
+- `ALTER EXTENSION pg_reflex UPDATE TO '1.10.11';` after swapping the module:
+  [`sql/pg_reflex--1.10.10--1.10.11.sql`](https://github.com/diviyank/pg_reflex/blob/main/sql/pg_reflex--1.10.10--1.10.11.sql)
+  is a no-op delta — both fixes ship entirely in the module, with no SQL
+  signature, table, or trigger changes. Re-run `reflex_doctor()` to re-check
+  any partitions previously reported as "cannot confirm".
+
 ## [1.10.10] - 2026-07-21
 
 The partition-flush deadlock release. It fixes an unbounded retry loop that
