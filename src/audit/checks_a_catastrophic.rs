@@ -254,10 +254,14 @@ impl Check for InternalTablesExist {
         let mut required: Vec<String> = Vec::new();
 
         // Sources whose per-(IMV, source) passthrough scratch pair is missing.
-        // These heal via the source-scoped `reflex_rebuild_triggers`, NOT via
-        // `reflex_rebuild_imv` (= reconcile), which rebuilds the target but never
-        // recreates the pt scratch — it would report success while the IMV stays
-        // wedged. (PS-6.)
+        // Recovery has TWO halves (PS-6): `reflex_rebuild_triggers(<source>)`
+        // recreates the scratch (reconcile alone never does — it rebuilds the
+        // target and would report success while the IMV stays wedged), and
+        // `reflex_reconcile(<imv>)` backfills the deltas the wedge silently lost
+        // (the deferred flush swallows the per-IMV 42P01 yet still unconditionally
+        // purges the staged delta, so recreating the scratch fixes only future
+        // flushes). Prescribing rebuild alone would leave a diverged IMV that
+        // audit then reports green.
         let mut sources_missing_scratch: Vec<String> = Vec::new();
 
         if imv.is_passthrough() {
@@ -296,11 +300,12 @@ impl Check for InternalTablesExist {
         let suggested_fix = if sources_missing_scratch.is_empty() {
             format!("SELECT reflex_rebuild_imv('{}');", imv.name)
         } else {
-            sources_missing_scratch
+            let mut stmts: Vec<String> = sources_missing_scratch
                 .iter()
                 .map(|src| format!("SELECT reflex_rebuild_triggers('{}');", src))
-                .collect::<Vec<_>>()
-                .join(" ")
+                .collect();
+            stmts.push(format!("SELECT reflex_reconcile('{}');", imv.name));
+            stmts.join(" ")
         };
         vec![Finding {
             imv: Some(imv.name.clone()),
