@@ -98,10 +98,7 @@ pub(crate) fn mark_generated_sub_imv(sub_imv_name: &str) {
 /// `resolve_existing_imv_deps` computes for the main create path and with what
 /// `reflex_repair_dependency_graph` recomputes, which would have left
 /// `graph_depth` meaning two different things depending on a row's age.
-pub(crate) fn depth_above(
-    client: &mut pgrx::spi::SpiClient<'_>,
-    sub_imv_names: &[String],
-) -> i32 {
+pub(crate) fn depth_above(client: &mut pgrx::spi::SpiClient<'_>, sub_imv_names: &[String]) -> i32 {
     if sub_imv_names.is_empty() {
         return 1;
     }
