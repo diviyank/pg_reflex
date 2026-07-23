@@ -800,6 +800,26 @@ fn affected_null_key_gate(
 /// nothing, so the NULL group's stale target row would survive the DELETE and
 /// never be re-inserted. Pinned by
 /// `pg_test_correctness.rs::test_correctness_null_group_key_gate_branch_boundary`.
+///
+/// # ATOMICITY INVARIANT — do not weaken the affected table's TRUNCATE
+///
+/// The two gates are logical complements, but that alone is **not** sufficient:
+/// each statement takes its own snapshot, so complementarity *across the pair* is
+/// not a property the SQL guarantees. If the affected table's NULL-ness could
+/// change between the two statements, the FAST one could see "a NULL key exists"
+/// and skip, while the SAFE one sees "none exists" and also skips — **neither
+/// runs, and the target is left silently stale.**
+///
+/// That interleaving is unreachable only because every flush path `TRUNCATE`s the
+/// affected table before populating it (`ops.rs`'s `TRUNCATE {affected_tbl}` and
+/// the dispatch builders' equivalents), and `TRUNCATE` holds an
+/// `AccessExclusiveLock` until transaction end — on top of the per-IMV advisory
+/// lock the flush already takes. No concurrent writer can touch the affected
+/// table between the pair's two statements.
+///
+/// Refactoring that `TRUNCATE` to `DELETE FROM` (only `RowExclusiveLock`) would
+/// silently void this invariant and reintroduce the stale-target window. If you
+/// change how the affected table is cleared, re-derive this argument first.
 pub(crate) struct AffectedMatch {
     /// Sargable `=` form, self-gated on the affected set containing no NULL key.
     /// When no key column is nullable this is ungated and the only variant.

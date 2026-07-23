@@ -375,9 +375,18 @@ fn audit_ps5_nullable_group_key_target_sync_uses_index_scan() {
 
     // The SARGABLE variant of each (the one gated on NOT EXISTS(null)) is the one
     // that actually runs for a NULL-free affected set. Its plan must use an index.
-    for (label, stmt) in [
-        ("target DELETE", *target_deletes.iter().find(|s| s.contains("AND NOT EXISTS")).expect("sargable DELETE variant")),
-        ("target INSERT", *target_inserts.iter().find(|s| s.contains("AND NOT EXISTS")).expect("sargable INSERT variant")),
+    // (relation the Index Cond must be ON, label, statement)
+    for (rel, label, stmt) in [
+        (
+            "ps5t_v",
+            "target DELETE",
+            *target_deletes.iter().find(|s| s.contains("AND NOT EXISTS")).expect("sargable DELETE variant"),
+        ),
+        (
+            "__reflex_intermediate_ps5t_v",
+            "target INSERT",
+            *target_inserts.iter().find(|s| s.contains("AND NOT EXISTS")).expect("sargable INSERT variant"),
+        ),
     ] {
         let plan = Spi::connect(|client| {
             let rows = client
@@ -387,18 +396,25 @@ fn audit_ps5_nullable_group_key_target_sync_uses_index_scan() {
                 .collect::<Vec<String>>()
                 .join("\n")
         });
+        // Pin BOTH the access method and the relation it applies to: a bare
+        // `contains("Index Scan")` would be satisfied by an index scan on the
+        // tiny affected table while the big relation still got seq-scanned.
+        let scanned_by_index = plan.lines().any(|l| {
+            (l.contains("Index Scan") || l.contains("Index Only Scan") || l.contains("Bitmap Index Scan"))
+                && l.contains(rel)
+        });
         assert!(
-            plan.contains("Index Scan") || plan.contains("Index Only Scan") || plan.contains("Bitmap Index Scan"),
-            "PS-5 PLAN-QUALITY GAP [{}]: sargable variant must reach its relation by \
-             index scan, got:\n{}\nstatement: {}",
+            scanned_by_index,
+            "PS-5 PLAN-QUALITY GAP [{}]: `{}` must be reached by index scan, got:\n{}\nstatement: {}",
             label,
+            rel,
             plan,
             stmt
         );
+        // And the probe must be a real index condition, not a post-scan filter.
         assert!(
-            !plan.contains("IS NOT DISTINCT FROM"),
-            "PS-5 [{}]: the sargable variant must not carry the non-sargable \
-             operator:\n{}",
+            plan.contains("Index Cond:"),
+            "PS-5 [{}]: the group-key probe must be an Index Cond, not a Filter:\n{}",
             label,
             plan
         );

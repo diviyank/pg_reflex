@@ -1295,6 +1295,13 @@ fn test_build_delta_sql_end_query_group_by_uses_scratch_table() {
             "affected-groups filter must appear before GROUP BY in target INSERT: {stmt}"
         );
     }
+    // Both variants must be present. Without this the test would still pass if
+    // the SARGABLE variant vanished entirely and only the NULL-safe one remained.
+    assert_eq!(
+        target_inserts.len(),
+        2,
+        "nullable group key must emit a gated pair of target INSERTs: {sql}"
+    );
     assert_eq!(
         target_inserts
             .iter()
@@ -3591,6 +3598,95 @@ fn gated_match_variants_survive_parameter_placeholders() {
         assert!(
             s.contains("$1::TEXT[]"),
             "cold-path placeholder must survive gating: {s}"
+        );
+    }
+}
+
+/// PS-5 — the two-variant expansion must survive the DISPATCH path, not just the
+/// `AffectedMatch` helper. `build_high_selectivity_dispatch_sql` wraps the target
+/// sync in `DO $reflex_dispatch$ ... EXECUTE ...`; the field data attributes
+/// 79 calls / 25 s mean to that block, so it is the production path. It is also
+/// the path where dropping a variant loses the NULL groups, and where emitting a
+/// variant twice would double-apply the target INSERT.
+#[test]
+fn dispatch_sql_emits_one_execute_per_gated_variant() {
+    let tdel = vec![
+        "DELETE FROM \"v\" WHERE FAST_PRED".to_string(),
+        "DELETE FROM \"v\" WHERE SAFE_PRED".to_string(),
+    ];
+    let tins = vec![
+        "INSERT INTO \"v\" SELECT 1 WHERE FAST_PRED".to_string(),
+        "INSERT INTO \"v\" SELECT 1 WHERE SAFE_PRED".to_string(),
+    ];
+    let dead = vec![
+        "DELETE FROM \"__int\" WHERE __ivm_count <= 0 AND FAST_PRED".to_string(),
+        "DELETE FROM \"__int\" WHERE __ivm_count <= 0 AND SAFE_PRED".to_string(),
+    ];
+    let sql = build_high_selectivity_dispatch_sql(
+        "v",
+        "__int",
+        "__aff",
+        "MERGE_SQL",
+        &dead,
+        &tdel,
+        &tins,
+    );
+
+    for stmt in dead.iter().chain(tdel.iter()).chain(tins.iter()) {
+        assert_eq!(
+            sql.matches(&format!("EXECUTE $reflex_inner${}$reflex_inner$;", stmt))
+                .count(),
+            1,
+            "each gated variant must be EXECUTEd exactly once (twice would \
+             double-apply the target INSERT, zero would lose the NULL groups): {stmt}"
+        );
+    }
+    // Ordering matters: the fast variant is emitted before the safe one so the
+    // cheap plan is the one the planner sees first in the block.
+    assert!(
+        sql.find("DELETE FROM \"v\" WHERE FAST_PRED").unwrap()
+            < sql.find("DELETE FROM \"v\" WHERE SAFE_PRED").unwrap(),
+        "fast variant must precede safe variant: {sql}"
+    );
+}
+
+/// Same, for the partition-aware dispatch builder — and critically, every gated
+/// variant must keep its `USING` binding, since the cold-partition filter spliced
+/// into both carries `$1`/`$2`.
+#[test]
+fn partition_dispatch_sql_emits_one_execute_per_gated_variant_with_using() {
+    let tdel = vec![
+        "DELETE FROM \"v\" WHERE FAST AND \"v\".\"region\"::text <> ALL($1::TEXT[])".to_string(),
+        "DELETE FROM \"v\" WHERE SAFE AND \"v\".\"region\"::text <> ALL($1::TEXT[])".to_string(),
+    ];
+    let tins = vec![
+        "INSERT INTO \"v\" SELECT 1 WHERE FAST AND \"i\".\"region\"::text <> ALL($1::TEXT[])"
+            .to_string(),
+        "INSERT INTO \"v\" SELECT 1 WHERE SAFE AND \"i\".\"region\"::text <> ALL($1::TEXT[])"
+            .to_string(),
+    ];
+    let sql = build_partition_aware_dispatch_sql_strategy(
+        "v",
+        "__int",
+        "__int",
+        "__aff",
+        "region",
+        "LIST",
+        "MERGE_$1",
+        &[],
+        &tdel,
+        &tins,
+    );
+    for stmt in tdel.iter().chain(tins.iter()) {
+        assert_eq!(
+            sql.matches(&format!(
+                "EXECUTE $reflex_inner${}$reflex_inner$ USING _hot_keys;",
+                stmt
+            ))
+            .count(),
+            2,
+            "each gated variant must be EXECUTEd with its USING binding in both \
+             the no-children fallback and the cold-partition section: {stmt}"
         );
     }
 }

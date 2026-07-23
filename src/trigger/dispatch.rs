@@ -60,29 +60,6 @@ pub(crate) struct InplaceSpec<'a> {
     pub pt_old: &'a str,               // OLD-image scratch table (quoted, schema-qualified)
 }
 
-/// 1.4.5 — emit a DO block that dispatches between MERGE-incremental and
-/// TRUNCATE-rebuild based on runtime selectivity.
-///
-/// Replaces these statements in the standard flow:
-///   1. MERGE intermediate USING scratch
-///   2. DELETE intermediate WHERE __ivm_count<=0 AND in_affected (optional)
-///   3. DELETE target WHERE in_affected
-///   4. INSERT target SELECT end_query WHERE in_affected
-///
-/// At high selectivity, instead:
-///   1. TRUNCATE intermediate
-///   2. INSERT INTO intermediate <base_query> -- full re-aggregation
-///   3. TRUNCATE target
-///   4. INSERT INTO target <end_query>
-///
-/// Scratch and affected are populated BEFORE this block (steps 1-3 of the
-/// standard flow remain unchanged). The DO block reads the affected table's
-/// row count and compares to pg_class.reltuples on the intermediate.
-///
-/// Threshold: `current_setting('reflex.wipe_threshold', true)::numeric` if
-/// set, else `WIPE_THRESHOLD_DEFAULT`. Operators can `SET LOCAL` per-session
-/// or per-statement.
-#[allow(clippy::too_many_arguments)]
 /// Render a list of statements as PL/pgSQL `EXECUTE` lines, one per statement,
 /// each dollar-quoted with `$reflex_inner$` (any occurrence of that tag inside
 /// the statement is rewritten so it cannot terminate the quote early).
@@ -115,6 +92,29 @@ fn execute_each(stmts: &[String], using: Option<&str>) -> String {
         .collect()
 }
 
+/// 1.4.5 — emit a DO block that dispatches between MERGE-incremental and
+/// TRUNCATE-rebuild based on runtime selectivity.
+///
+/// Replaces these statements in the standard flow:
+///   1. MERGE intermediate USING scratch
+///   2. DELETE intermediate WHERE __ivm_count<=0 AND in_affected (optional)
+///   3. DELETE target WHERE in_affected
+///   4. INSERT target SELECT end_query WHERE in_affected
+///
+/// At high selectivity, instead:
+///   1. TRUNCATE intermediate
+///   2. INSERT INTO intermediate <base_query> -- full re-aggregation
+///   3. TRUNCATE target
+///   4. INSERT INTO target <end_query>
+///
+/// Scratch and affected are populated BEFORE this block (steps 1-3 of the
+/// standard flow remain unchanged). The DO block reads the affected table's
+/// row count and compares to pg_class.reltuples on the intermediate.
+///
+/// Threshold: `current_setting('reflex.wipe_threshold', true)::numeric` if
+/// set, else `WIPE_THRESHOLD_DEFAULT`. Operators can `SET LOCAL` per-session
+/// or per-statement.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_high_selectivity_dispatch_sql(
     view_name: &str,
     intermediate_tbl: &str,
