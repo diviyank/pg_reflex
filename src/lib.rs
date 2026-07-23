@@ -191,6 +191,16 @@ extension_sql!(
     ALTER TABLE public.__reflex_ivm_reference
         ADD COLUMN IF NOT EXISTS stale_since TIMESTAMPTZ;
 
+    -- 1.11.0 (PS-3): TRUE when every real source of this node is a materialized
+    -- view. Such a node cannot self-maintain (PG fires no trigger on a matview),
+    -- so it is a snapshot frozen at create time and needs an explicit
+    -- refresh_imv_depending_on('<mv>') after each REFRESH MATERIALIZED VIEW.
+    -- PERMANENT and structural — distinct from known_stale (which means "a flush
+    -- failed"), and NEVER cleared by reconcile or the doctor's verify_stale_cleared
+    -- authority. Surfaced by reflex_ivm_status and as reflex_doctor finding F7.
+    ALTER TABLE public.__reflex_ivm_reference
+        ADD COLUMN IF NOT EXISTS requires_explicit_refresh BOOLEAN NOT NULL DEFAULT FALSE;
+
     -- 1.11.0: JSON object capturing creation-time arguments (unique_columns,
     -- storage_mode, refresh_mode, topk_k, ignore_sources, partition_by,
     -- explicit_unpartitioned) for faithful IMV chain reconstruction via

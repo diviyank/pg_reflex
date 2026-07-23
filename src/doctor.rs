@@ -50,6 +50,7 @@ pub(crate) fn reflex_doctor_impl(
             drop_orphans,
         ));
         rows.extend(detect_known_stale_imvs(target, false, drop_orphans));
+        rows.extend(detect_requires_explicit_refresh(target, false));
         rows.extend(detect_audit_findings(target, false));
 
         return rows;
@@ -63,6 +64,7 @@ pub(crate) fn reflex_doctor_impl(
         drop_orphans,
     ));
     rows.extend(detect_known_stale_imvs(target, true, drop_orphans));
+    rows.extend(detect_requires_explicit_refresh(target, true));
     rows.extend(detect_audit_findings(target, true));
 
     rows
@@ -543,6 +545,141 @@ fn detect_known_stale_imvs(
                 "IMV is known_stale: {}",
                 stale_reason.unwrap_or_else(|| "(unknown reason)".to_string())
             ),
+            action,
+            outcome,
+        ));
+    }
+
+    rows
+}
+
+/// Detect nodes that cannot self-maintain because every real source is a
+/// materialized view (F7 — PS-3).
+///
+/// PG fires no trigger on a matview, so such a node is a snapshot frozen at
+/// create time. `requires_explicit_refresh` records that structurally and
+/// PERMANENTLY. This finding makes the node visible to `reflex_doctor` — the
+/// blind spot that let 40/40 generated sub-IMVs sit month-stale unflagged,
+/// because every other health surface keys off `known_stale` (which a
+/// by-design-unmaintainable node never sets).
+///
+/// The flag is kept strictly distinct from `known_stale`: this path never reads,
+/// sets, or clears `known_stale`, and never routes through `verify_stale_cleared`
+/// — so a `fix => TRUE` run can never turn this into a permanent
+/// `failed:known_stale still set` false alarm. In fix mode it runs the verified
+/// remedy `refresh_imv_depending_on('<mv>')` for each matview source (closing the
+/// "nothing schedules the remedy" gap) and reports `refreshed`; the structural
+/// flag is intentionally NOT cleared, because clearing it would re-hide the node
+/// the instant the matview next changes.
+fn detect_requires_explicit_refresh(target: Option<&str>, fix: bool) -> Vec<DoctorReportRow> {
+    let mut rows = Vec::new();
+
+    let query = match target {
+        Some(t) => format!(
+            "SELECT name FROM public.__reflex_ivm_reference \
+             WHERE (name = '{0}' OR depends_on @> ARRAY['{0}']) \
+               AND COALESCE(requires_explicit_refresh, FALSE) = TRUE ORDER BY graph_depth, name",
+            t.replace("'", "''")
+        ),
+        None => "SELECT name FROM public.__reflex_ivm_reference \
+             WHERE COALESCE(requires_explicit_refresh, FALSE) = TRUE ORDER BY graph_depth, name"
+            .to_string(),
+    };
+
+    let names = Spi::connect(|client| {
+        let mut result = Vec::new();
+        let rs = client.select(&query, None, &[]).unwrap_or_report();
+        for row in rs {
+            let name: String = row
+                .get_by_name::<&str, _>("name")
+                .unwrap_or(None)
+                .unwrap_or("")
+                .to_string();
+            if !name.is_empty() {
+                result.push(name);
+            }
+        }
+        result
+    });
+
+    for imv_name in names {
+        // Re-derive the matview source(s) from the graph so the remedy names the
+        // exact spelling stored in depends_on — which is what
+        // refresh_imv_depending_on matches on ($1 = ANY(depends_on)).
+        let matview_sources: Vec<String> = Spi::connect(|client| {
+            let sql = format!(
+                "SELECT s FROM unnest( \
+                     (SELECT depends_on FROM public.__reflex_ivm_reference WHERE name = '{}') \
+                 ) AS s \
+                 WHERE s NOT LIKE '<%' \
+                   AND EXISTS (SELECT 1 FROM pg_class c \
+                                WHERE c.oid = to_regclass(s) AND c.relkind = 'm')",
+                imv_name.replace("'", "''")
+            );
+            let mut out = Vec::new();
+            let rs = client.select(&sql, None, &[]).unwrap_or_report();
+            for row in rs {
+                if let Some(s) = row.get_by_name::<&str, _>("s").unwrap_or(None) {
+                    out.push(s.to_string());
+                }
+            }
+            out
+        });
+
+        let action = if matview_sources.is_empty() {
+            "-- the node's only sources were materialized views, now absent; \
+             recreate the source or drop this IMV"
+                .to_string()
+        } else {
+            matview_sources
+                .iter()
+                .map(|mv| {
+                    format!(
+                        "SELECT refresh_imv_depending_on('{}');",
+                        mv.replace("'", "''")
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+
+        let finding = if matview_sources.is_empty() {
+            "IMV cannot self-maintain: all sources are materialized views. \
+             Frozen at create time; needs explicit refresh after each REFRESH MATERIALIZED VIEW"
+                .to_string()
+        } else {
+            format!(
+                "IMV cannot self-maintain: all sources are materialized views ({}). \
+                 Frozen at create time; needs explicit refresh after each REFRESH MATERIALIZED VIEW",
+                matview_sources.join(", ")
+            )
+        };
+
+        // In fix mode run the verified remedy per matview source. Never touches
+        // known_stale, never clears requires_explicit_refresh, never calls
+        // verify_stale_cleared — so it cannot become a permanent false alarm.
+        let outcome = if !fix || matview_sources.is_empty() {
+            "reported".to_string()
+        } else {
+            let mut failure: Option<String> = None;
+            for mv in &matview_sources {
+                let res = apply_doctor_repair(&format!(
+                    "SELECT refresh_imv_depending_on('{}')",
+                    mv.replace("'", "''")
+                ));
+                if res != "fixed" {
+                    failure = Some(res);
+                    break;
+                }
+            }
+            failure.unwrap_or_else(|| "refreshed".to_string())
+        };
+
+        rows.push((
+            "F7".to_string(),
+            "WARNING".to_string(),
+            imv_name,
+            finding,
             action,
             outcome,
         ));

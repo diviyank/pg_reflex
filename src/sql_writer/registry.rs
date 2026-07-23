@@ -61,6 +61,14 @@ pub struct RegistryRow<'a> {
     /// JSON object with creation-time parameters for chain rebuild (1.11.0).
     /// Populated at create time; `None` → NULL in catalog → `{}` on rebuild.
     pub create_args: Option<&'a str>,
+    /// TRUE when every real source of this node is a materialized view (PS-3,
+    /// 1.11.0). Such a node cannot self-maintain — PG fires no trigger on a
+    /// matview — so it is a snapshot frozen at create time and needs an explicit
+    /// `refresh_imv_depending_on('<mv>')` after each `REFRESH MATERIALIZED VIEW`.
+    /// PERMANENT and structural: distinct from `known_stale`, never cleared by
+    /// reconcile or `verify_stale_cleared`. The decomposed paths leave it false
+    /// (their real sources are triggerable sub-IMV tables).
+    pub requires_explicit_refresh: bool,
 }
 
 impl<'a> RegistryRow<'a> {
@@ -101,6 +109,7 @@ impl<'a> RegistryRow<'a> {
             partition_depth: None,
             max_one_row: false,
             create_args: None,
+            requires_explicit_refresh: false,
         }
     }
 }
@@ -206,8 +215,9 @@ pub fn insert_registry_row(
                       graph_child, sql_query, base_query, end_query,
                       aggregations, index_columns, unique_columns, enabled, last_update_date,
                       storage_mode, refresh_mode, where_predicate, ignored_sources,
-                      partition_columns, partition_strategy, target_schema, max_one_row, partition_depth, create_args)
-                     VALUES ($1, $2, $3::TEXT[], $4::TEXT[], $5::TEXT[], $6::TEXT[], $7, $8, $9, $10::jsonb, $11::TEXT[], $12::TEXT[], TRUE, NOW(), $13, $14, NULLIF($15, ''), $16::TEXT[], NULLIF($17, '{}')::TEXT[], NULLIF($18, ''), COALESCE(NULLIF($19, ''), current_schema()), $20, $21, $22)";
+                      partition_columns, partition_strategy, target_schema, max_one_row, partition_depth, create_args,
+                      requires_explicit_refresh)
+                     VALUES ($1, $2, $3::TEXT[], $4::TEXT[], $5::TEXT[], $6::TEXT[], $7, $8, $9, $10::jsonb, $11::TEXT[], $12::TEXT[], TRUE, NOW(), $13, $14, NULLIF($15, ''), $16::TEXT[], NULLIF($17, '{}')::TEXT[], NULLIF($18, ''), COALESCE(NULLIF($19, ''), current_schema()), $20, $21, $22, $23)";
         client
             .update(
                 sql,
@@ -235,6 +245,7 @@ pub fn insert_registry_row(
                     unsafe { DatumWithOid::new(row.max_one_row, oid_bool) },
                     unsafe { DatumWithOid::new(row.partition_depth, oid_int4) },
                     unsafe { DatumWithOid::new(create_args_owned, oid_text) },
+                    unsafe { DatumWithOid::new(row.requires_explicit_refresh, oid_bool) },
                 ],
             )
             .map(|_| ())

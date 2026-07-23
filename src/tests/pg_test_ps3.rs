@@ -1,13 +1,11 @@
-//! PS-3 — unmaintainable-source visibility.
-//!
-//! An IMV whose only real sources are materialized views cannot self-maintain
-//! (PG fires no trigger on a matview): it is a snapshot frozen at create time.
-//! `requires_explicit_refresh` records that structurally and durably, so
-//! `reflex_ivm_status` and `reflex_doctor` can see it. The flag is PERMANENT and
-//! kept distinct from `known_stale` (PS-4's `verify_stale_cleared` authority),
-//! so a by-design-unmaintainable node never becomes a permanent `failed:` alarm.
-
-use pgrx::pg_sys::panic::ErrorReportable;
+// PS-3 — unmaintainable-source visibility.
+//
+// An IMV whose only real sources are materialized views cannot self-maintain
+// (PG fires no trigger on a matview): it is a snapshot frozen at create time.
+// `requires_explicit_refresh` records that structurally and durably, so
+// `reflex_ivm_status` and `reflex_doctor` can see it. The flag is PERMANENT and
+// kept distinct from `known_stale` (PS-4's `verify_stale_cleared` authority),
+// so a by-design-unmaintainable node never becomes a permanent `failed:` alarm.
 
 fn ps3_requires_explicit_refresh(name: &str) -> bool {
     Spi::get_one::<bool>(&format!(

@@ -1519,6 +1519,47 @@ fn install_secondary_key_indexes(client: &mut SpiClient<'_>, ctx: &BuildContext)
     }
 }
 
+/// PS-3 per-node verdict: TRUE iff the node has at least one real source and
+/// *every* real source is a materialized view. A real source is an entry of
+/// `ctx.froms` that is neither a `<subquery:>` / `<function:>` placeholder nor an
+/// ignored source. Such a node cannot self-maintain — PG fires no trigger on a
+/// matview — so it is a snapshot frozen at create time. A node with even one
+/// triggerable real source (a plain table or a sub-IMV table) is maintainable
+/// via it and returns false. This aggregates the per-source matview probe in
+/// `install_source_triggers` to a single per-node decision.
+fn all_real_sources_are_matviews(client: &SpiClient<'_>, ctx: &BuildContext) -> bool {
+    let mut saw_real_source = false;
+    for source in &ctx.froms {
+        if source.starts_with('<') {
+            continue;
+        }
+        let (_, source_bare) = split_qualified_name(source);
+        if ctx
+            .ignore_sources
+            .iter()
+            .any(|s| s == source || s == source_bare)
+        {
+            continue;
+        }
+        saw_real_source = true;
+        let is_matview = client
+            .select(
+                "SELECT 1 FROM pg_class WHERE oid = to_regclass($1) AND relkind = 'm'",
+                None,
+                &[unsafe {
+                    DatumWithOid::new(source.to_string(), PgBuiltInOids::TEXTOID.oid().value())
+                }],
+            )
+            .unwrap_or_report()
+            .next()
+            .is_some();
+        if !is_matview {
+            return false;
+        }
+    }
+    saw_real_source
+}
+
 /// Compute base_query / end_query / aggregations_json / index_columns /
 /// where_predicate, INSERT a RegistryRow into `__reflex_ivm_reference`, and
 /// add this IMV's name to the `graph_child` array of each parent IMV.
@@ -1629,6 +1670,8 @@ fn persist_metadata(client: &mut SpiClient<'_>, ctx: &BuildContext) {
 
     let create_args_json = format!("{{ {} }}", create_args_parts.join(", "));
 
+    let requires_explicit_refresh = all_real_sources_are_matviews(client, ctx);
+
     insert_registry_row(
         client,
         &RegistryRow {
@@ -1654,6 +1697,7 @@ fn persist_metadata(client: &mut SpiClient<'_>, ctx: &BuildContext) {
             partition_depth: ctx.resolved_partition_depth,
             max_one_row,
             create_args: Some(&create_args_json),
+            requires_explicit_refresh,
         },
     )
     .unwrap_or_report();
