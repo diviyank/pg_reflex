@@ -401,6 +401,68 @@ pub(crate) fn reflex_rebuild_triggers_impl(source_table: &str) -> String {
                 .update(ddl, None, &[])
                 .map_err(|e| format!("CREATE TRIGGER failed: {}", e))?;
         }
+
+        // PS-6 heal — a passthrough IMV references a per-(IMV, source) scratch
+        // pair (`__reflex_pt_new/old_<imv>_<source>`) that `passthrough_op_stmts`
+        // emits TRUNCATE/INSERT against on every flush. If that pair is missing
+        // (an older create loop that didn't cover this source, a partial create,
+        // or a manual drop), every flush fails fast with 42P01, is swallowed as a
+        // WARNING, and the IMV goes silently stale forever. Recreate the pair
+        // idempotently (`build_passthrough_scratch_ddls` is CREATE IF NOT EXISTS)
+        // for every enabled passthrough IMV that depends on this source, using
+        // the IMV's own `depends_on` entry as the source string so the recreated
+        // name matches exactly what the trigger references. This is the
+        // source-scoped, no-drop recovery the 1.4.5+ migrations already invoke.
+        let bare_source = split_qualified_name(&resolved).1.to_string();
+        let passthrough_deps: Vec<(String, Vec<String>)> = client
+            .select(
+                "SELECT name, depends_on \
+                 FROM public.__reflex_ivm_reference \
+                 WHERE enabled = TRUE \
+                   AND COALESCE((aggregations->>'is_passthrough')::bool, FALSE) \
+                   AND ($1 = ANY(depends_on) OR $2 = ANY(depends_on))",
+                None,
+                &[
+                    unsafe {
+                        DatumWithOid::new(resolved.clone(), PgBuiltInOids::TEXTOID.oid().value())
+                    },
+                    unsafe {
+                        DatumWithOid::new(bare_source.clone(), PgBuiltInOids::TEXTOID.oid().value())
+                    },
+                ],
+            )
+            .map_err(|e| format!("passthrough-dependent lookup failed: {}", e))?
+            .filter_map(|row| {
+                let name = row
+                    .get_by_name::<&str, _>("name")
+                    .ok()
+                    .flatten()?
+                    .to_string();
+                let deps = row
+                    .get_by_name::<Vec<String>, _>("depends_on")
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default();
+                Some((name, deps))
+            })
+            .collect();
+
+        for (imv_name, deps) in &passthrough_deps {
+            for dep in deps {
+                if dep == &resolved
+                    || dep == source_table
+                    || split_qualified_name(dep).1 == bare_source
+                {
+                    for ddl in crate::schema_builder::build_passthrough_scratch_ddls(imv_name, dep)
+                    {
+                        client
+                            .update(&ddl, None, &[])
+                            .map_err(|e| format!("passthrough scratch recreate failed: {}", e))?;
+                    }
+                }
+            }
+        }
+
         Ok(ddls.len())
     });
     match result {
