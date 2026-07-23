@@ -46,3 +46,20 @@ the intermediate's `reltuples` (a handful of changed rows will not move the
 histogram). That is a behaviour change and needs its own benchmark answering
 "does the NEXT flush still get a good plan after a skipped ANALYZE?" — i.e. its
 own pre-spec, not a drive-by edit here.
+
+---
+
+## Related minor gap (integration note, 2026-07-24): PS-3 backfill under-flags bare-name ignore_sources
+
+The PS-3 `requires_explicit_refresh` migration backfill (`sql/pg_reflex--1.10.11--1.11.0.sql`,
+PS-3 section) excludes ignored sources with an exact-string match
+`NOT (s = ANY(ignored_sources))`, whereas create-time (`src/create_ivm/mod.rs`
+`all_real_sources_are_matviews`) compares each ignore entry against BOTH the
+qualified source and its bare form. So on upgrade, an IMV that ignores a real
+table by *bare* name while `depends_on` stores it *qualified* is under-flagged
+(stays invisible). Narrow config; new IMVs unaffected (create-time is correct).
+Deliberately NOT patched at integration — the backfill SQL has no test, and
+shipping an untested predicate change to the upgrade path for a narrow case is
+worse than the documented gap. Fix when adding a migration-DO-block test for the
+PS-3 backfill (pattern: PS-6's `ps6_migration_do_block_*` test): widen to
+`NOT (s = ANY(ig) OR split_part(s,'.',2) = ANY(ig))`.

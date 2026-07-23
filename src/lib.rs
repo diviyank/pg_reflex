@@ -197,7 +197,7 @@ extension_sql!(
     -- refresh_imv_depending_on('<mv>') after each REFRESH MATERIALIZED VIEW.
     -- PERMANENT and structural — distinct from known_stale (which means "a flush
     -- failed"), and NEVER cleared by reconcile or the doctor's verify_stale_cleared
-    -- authority. Surfaced by reflex_ivm_status and as reflex_doctor finding F7.
+    -- authority. Surfaced by reflex_ivm_status and as reflex_doctor finding F12.
     ALTER TABLE public.__reflex_ivm_reference
         ADD COLUMN IF NOT EXISTS requires_explicit_refresh BOOLEAN NOT NULL DEFAULT FALSE;
 

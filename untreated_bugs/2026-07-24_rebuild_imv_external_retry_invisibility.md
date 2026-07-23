@@ -27,11 +27,15 @@ passthrough IMV that LEFT JOINs two matviews (`latest_price_view`,
 `ignore_sources: [location, latest_price_view]`.
 
 `reflex_rebuild_imv`'s own docstring (`src/lib.rs:800-811`) states it re-derives
-partitions from the anchor source only and does **not** refill partitions fed by
-`ignore_sources` tables. So when this IMV goes stale on data arriving through the
-matview LEFT JOINs or an `ignore_sources` table, `reflex_rebuild_imv` returns a
-success-ish result and **does not converge**. Whatever automation watches the
-staleness symptom re-issues the call indefinitely. Each call still pays the full
+partitions from the anchor source only and does **not** refill an anchor-empty
+partition whose rows arrive solely via `ignore_sources` tables. (A full
+re-derivation *does* re-run the base_query including the matview LEFT JOINs, so a
+matview value change on a partition that still has anchor rows is picked up — the
+genuine non-convergence case is the anchor-empty / archive-residue partition,
+exactly what the docstring and F6 describe.) So when this IMV goes stale on data
+that reaches only such a partition, `reflex_rebuild_imv` returns a success-ish
+result and **does not converge**. Whatever automation watches the staleness
+symptom re-issues the call indefinitely. Each call still pays the full
 anchor re-derivation cost (12.4 s mean), so the futile loop burned 3.5 h.
 
 Two distinct gaps:

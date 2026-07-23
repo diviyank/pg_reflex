@@ -554,7 +554,7 @@ fn detect_known_stale_imvs(
 }
 
 /// Detect nodes that cannot self-maintain because every real source is a
-/// materialized view (F7 — PS-3).
+/// materialized view (F12 — PS-3).
 ///
 /// PG fires no trigger on a matview, so such a node is a snapshot frozen at
 /// create time. `requires_explicit_refresh` records that structurally and
@@ -676,7 +676,7 @@ fn detect_requires_explicit_refresh(target: Option<&str>, fix: bool) -> Vec<Doct
         };
 
         rows.push((
-            "F7".to_string(),
+            "F12".to_string(),
             "WARNING".to_string(),
             imv_name,
             finding,

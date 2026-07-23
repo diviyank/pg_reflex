@@ -117,7 +117,7 @@ fn ps3_mixed_source_imv_not_flagged() {
     );
 }
 
-/// (4) The flag survives reflex_doctor(fix=>TRUE): the F7 finding is not a
+/// (4) The flag survives reflex_doctor(fix=>TRUE): the F12 finding is not a
 /// failure, the flag stays TRUE, known_stale is never set, and the node stays
 /// visible on a subsequent run. This is the anti-false-alarm property.
 #[pg_test]
@@ -140,7 +140,7 @@ fn ps3_flag_survives_doctor_fix_without_false_alarm() {
         let rs = client
             .select(
                 "SELECT check_id, outcome FROM reflex_doctor(NULL, TRUE) \
-                 WHERE check_id = 'F7' AND object = 'ps3d_imv'",
+                 WHERE check_id = 'F12' AND object = 'ps3d_imv'",
                 None,
                 &[],
             )
@@ -159,10 +159,10 @@ fn ps3_flag_survives_doctor_fix_without_false_alarm() {
         }
         out
     });
-    assert_eq!(check_id, "F7", "matview-only node must surface as an F7 finding");
+    assert_eq!(check_id, "F12", "matview-only node must surface as an F12 finding");
     assert!(
         !outcome.starts_with("failed"),
-        "F7 fix outcome must not be a failure (got '{}')",
+        "F12 fix outcome must not be a failure (got '{}')",
         outcome
     );
 
@@ -177,11 +177,11 @@ fn ps3_flag_survives_doctor_fix_without_false_alarm() {
     .unwrap();
     assert!(
         !known_stale,
-        "the F7 path must never set/leave known_stale (no verify_stale_cleared collision)"
+        "the F12 path must never set/leave known_stale (no verify_stale_cleared collision)"
     );
 
     let still_seen = Spi::get_one::<i64>(
-        "SELECT count(*) FROM reflex_doctor() WHERE check_id = 'F7' AND object = 'ps3d_imv'",
+        "SELECT count(*) FROM reflex_doctor() WHERE check_id = 'F12' AND object = 'ps3d_imv'",
     )
     .unwrap()
     .unwrap();

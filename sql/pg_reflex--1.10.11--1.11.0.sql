@@ -224,13 +224,13 @@ END $ps2$;
 -- and is the authority PS-4's verify_stale_cleared uses to confirm a repair, so
 -- reusing it for a by-design-unmaintainable node would make every
 -- reflex_doctor(fix => TRUE) report a permanent failure. The new column is
--- surfaced by reflex_ivm_status and as reflex_doctor finding F7, whose action is
+-- surfaced by reflex_ivm_status and as reflex_doctor finding F12, whose action is
 -- refresh_imv_depending_on('<mv>') (which cascades the whole chain) rather than
 -- reflex_reconcile (which only fixes one level). No reconcile or verify path
 -- ever clears it.
 --
 -- BLAST RADIUS: the backfill below flags existing matview-only IMVs. Any
--- monitoring that alerts on the new column (or the F7 finding count) will begin
+-- monitoring that alerts on the new column (or the F12 finding count) will begin
 -- firing for them. That is correct — they genuinely cannot self-maintain — but
 -- it is a visible change on upgrade. Mixed-source and normally-maintainable IMVs
 -- are never flagged.
@@ -271,7 +271,7 @@ BEGIN
     SELECT count(*) INTO _n
       FROM public.__reflex_ivm_reference
      WHERE requires_explicit_refresh = TRUE;
-    RAISE NOTICE 'pg_reflex 1.11.0 (PS-3): % IMV(s) flagged requires_explicit_refresh (all sources are materialized views; cannot self-maintain). reflex_ivm_status and reflex_doctor (finding F7) now surface them; the remedy is SELECT refresh_imv_depending_on(''<matview>'') after each REFRESH MATERIALIZED VIEW. The flag is permanent and is never cleared by reconcile or reflex_doctor.', _n;
+    RAISE NOTICE 'pg_reflex 1.11.0 (PS-3): % IMV(s) flagged requires_explicit_refresh (all sources are materialized views; cannot self-maintain). reflex_ivm_status and reflex_doctor (finding F12) now surface them; the remedy is SELECT refresh_imv_depending_on(''<matview>'') after each REFRESH MATERIALIZED VIEW. The flag is permanent and is never cleared by reconcile or reflex_doctor.', _n;
 END $ps3$;
 -- === end PS-3 ==============================================================
 
