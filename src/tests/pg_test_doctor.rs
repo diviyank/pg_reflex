@@ -976,3 +976,22 @@ fn pg_doctor_unfiltered_multi_source_join_legit_empty_not_residue() {
         report
     );
 }
+
+// ---------------------------------------------------------------------------
+// PS-4: reflex_doctor truthfulness
+// ---------------------------------------------------------------------------
+
+#[pg_test]
+fn ps4_pending_queue_has_last_attempt_at_column() {
+    let present: bool = Spi::get_one(
+        "SELECT EXISTS(SELECT 1 FROM pg_attribute \
+         WHERE attrelid = 'public.__reflex_partition_pending'::regclass \
+           AND attname = 'last_attempt_at' AND NOT attisdropped)",
+    )
+    .expect("q")
+    .unwrap_or(false);
+    assert!(
+        present,
+        "__reflex_partition_pending must carry last_attempt_at"
+    );
+}
