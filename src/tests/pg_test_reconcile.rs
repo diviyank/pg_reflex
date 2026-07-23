@@ -274,6 +274,58 @@ fn test_scheduled_reconcile_skips_fresh_imvs() {
     assert_eq!(scanned, 0, "fresh IMV should not be reconciled");
 }
 
+/// PS-7 gap 4 — every IMV reconciled in one scheduled batch must get a DISTINCT
+/// `last_update_date`. Before the fix `reconcile_one` stamped `NOW()`
+/// (transaction start), so an entire batch shared one identical timestamp
+/// (field-observed across four schemas at once) and the column could not date an
+/// individual rebuild. `clock_timestamp()` stamps wall-clock at statement time,
+/// so two IMVs reconciled back-to-back differ.
+#[pg_test]
+fn pg_scheduled_reconcile_stamps_distinct_timestamps_per_imv() {
+    Spi::run("CREATE TABLE ps7_ts_src (id SERIAL, grp TEXT, val NUMERIC)").expect("create table");
+    Spi::run("INSERT INTO ps7_ts_src (grp, val) VALUES ('a', 10), ('b', 20)").expect("seed");
+
+    crate::create_reflex_ivm(
+        "ps7_ts_v1",
+        "SELECT grp, SUM(val) AS total FROM ps7_ts_src GROUP BY grp",
+        None, None, None, None,
+    );
+    crate::create_reflex_ivm(
+        "ps7_ts_v2",
+        "SELECT grp, COUNT(*) AS cnt FROM ps7_ts_src GROUP BY grp",
+        None, None, None, None,
+    );
+
+    // Backdate so both are candidates (CURRENT_TIMESTAMP is transaction start
+    // inside a test, so a row touched this transaction never looks stale).
+    Spi::run(
+        "UPDATE public.__reflex_ivm_reference \
+            SET last_update_date = TIMESTAMP '2001-01-01 00:00:00' \
+          WHERE name LIKE 'ps7_ts_%'",
+    )
+    .expect("backdate");
+
+    let reconciled: i64 = Spi::get_one(
+        "SELECT COUNT(*)::BIGINT FROM reflex_scheduled_reconcile(0) \
+          WHERE name LIKE 'ps7_ts_%' AND status = 'RECONCILED'",
+    )
+    .expect("q")
+    .expect("v");
+    assert_eq!(reconciled, 2, "both IMVs should reconcile");
+
+    let distinct_timestamps: i64 = Spi::get_one(
+        "SELECT COUNT(DISTINCT last_update_date)::BIGINT \
+           FROM public.__reflex_ivm_reference WHERE name LIKE 'ps7_ts_%'",
+    )
+    .expect("q")
+    .expect("v");
+    assert_eq!(
+        distinct_timestamps, 2,
+        "each IMV in the batch must get its own last_update_date (clock_timestamp), \
+         not one shared NOW() for the whole transaction"
+    );
+}
+
 /// F5 diagnosis: reflex_rebuild_imv on a partitioned IMV whose authoritative
 /// source is in ignore_sources. This tests whether the partition stays empty
 /// (F6 interaction) or fills (unexpected skip-existing-children bug).

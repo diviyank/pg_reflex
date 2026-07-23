@@ -113,7 +113,7 @@ fn reconcile_one(view_name: &str, drop_orphans: bool) -> &'static str {
                 );
 
                 let _ = client.update(
-                    "UPDATE public.__reflex_ivm_reference SET last_update_date = NOW() WHERE name = $1",
+                    "UPDATE public.__reflex_ivm_reference SET last_update_date = clock_timestamp() WHERE name = $1",
                     None,
                     &[unsafe {
                         DatumWithOid::new(view_name.to_string(), PgBuiltInOids::TEXTOID.oid().value())
@@ -369,10 +369,14 @@ fn reconcile_one(view_name: &str, drop_orphans: bool) -> &'static str {
                 .unwrap_or_report();
         }
 
-        // Update last_update_date
+        // Update last_update_date. clock_timestamp() (wall-clock at statement
+        // time), NOT NOW() (transaction start): a reflex_scheduled_reconcile
+        // batch runs many reconciles in one transaction, and NOW() stamped every
+        // one of them identically, so the column could not date an individual
+        // rebuild. clock_timestamp() stamps each rebuild's own end.
         client
             .update(
-                "UPDATE public.__reflex_ivm_reference SET last_update_date = NOW() WHERE name = $1",
+                "UPDATE public.__reflex_ivm_reference SET last_update_date = clock_timestamp() WHERE name = $1",
                 None,
                 &[unsafe {
                     DatumWithOid::new(view_name.to_string(), PgBuiltInOids::TEXTOID.oid().value())
