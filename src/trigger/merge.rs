@@ -921,6 +921,13 @@ pub(crate) fn splice_before_group_by(query: &str, and_fragment: &str) -> Option<
 /// `end_query`'s FROM is the intermediate. See `null_safe_in` doc for why
 /// qualifying the outer is mandatory.
 /// Returns `None` if `end_query` contains no ` GROUP BY ` marker (defensive fallback).
+///
+/// PS-5: production codegen now goes through
+/// `inject_affected_filter_before_group_by_gated`, which returns one spliced
+/// query per gated variant. This ungated form is retained because its tests pin
+/// the splice contract (marker choice, `AND` placement, outer qualification)
+/// that the gated version builds on.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn inject_affected_filter_before_group_by(
     end_query: &str,
     output_gb_cols: &[String],

@@ -1273,21 +1273,35 @@ fn test_build_delta_sql_end_query_group_by_uses_scratch_table() {
         "MERGE must never use inline transition-table subquery: {}",
         &sql[..sql.len().min(600)]
     );
-    // The target INSERT (into test_view) must have the null-safe filter before GROUP BY.
-    let insert_pos = sql
-        .find("INSERT INTO \"test_view\"")
-        .expect("target INSERT must be present");
-    let tail = &sql[insert_pos..];
-    let filter_pos = tail
-        .find("IS NOT DISTINCT FROM")
-        .expect("null-safe filter must be in target INSERT");
-    let group_by_pos = tail
-        .find("GROUP BY")
-        .expect("GROUP BY must be in target INSERT");
+    // The affected-groups filter must appear before GROUP BY in the target
+    // INSERT. PS-5: check each gated variant against its own GROUP BY (see
+    // test_build_delta_sql_splice_injects_filter_before_group_by for why a
+    // global `find` is wrong once two statements are emitted).
+    let target_inserts: Vec<&str> = sql
+        .split("\n--<<REFLEX_SEP>>--\n")
+        .filter(|s| s.trim_start().starts_with("INSERT INTO \"test_view\""))
+        .collect();
     assert!(
-        filter_pos < group_by_pos,
-        "null-safe filter must appear before GROUP BY in target INSERT: {}",
-        &tail[..tail.len().min(400)]
+        !target_inserts.is_empty(),
+        "target INSERT must be present: {sql}"
+    );
+    for stmt in &target_inserts {
+        let filter_pos = stmt
+            .find("EXISTS (SELECT 1 FROM \"__reflex_affected_test_view\"")
+            .expect("affected-groups filter must be in target INSERT");
+        let group_by_pos = stmt.find("GROUP BY").expect("GROUP BY in target INSERT");
+        assert!(
+            filter_pos < group_by_pos,
+            "affected-groups filter must appear before GROUP BY in target INSERT: {stmt}"
+        );
+    }
+    assert_eq!(
+        target_inserts
+            .iter()
+            .filter(|s| s.contains("IS NOT DISTINCT FROM"))
+            .count(),
+        1,
+        "exactly one gated variant keeps the NULL-safe operator: {sql}"
     );
 }
 
@@ -1419,21 +1433,45 @@ fn test_build_delta_sql_splice_injects_filter_before_group_by() {
         "MERGE must never use inline transition-table subquery: {}",
         &sql[..sql.len().min(600)]
     );
-    // The target INSERT (into test_view) must have the null-safe filter spliced before GROUP BY.
-    let insert_pos = sql
-        .find("INSERT INTO \"test_view\"")
-        .expect("target INSERT must be present");
-    let tail = &sql[insert_pos..];
-    let filter_pos = tail
-        .find("IS NOT DISTINCT FROM")
-        .expect("null-safe filter must appear in target INSERT");
-    let group_by_pos = tail
-        .find("GROUP BY")
-        .expect("GROUP BY must be in target INSERT");
+    // The affected-groups filter must be spliced BEFORE GROUP BY in the target
+    // INSERT, so it scopes the intermediate scan rather than the aggregation
+    // output (the planner does not reliably push a filter through GROUP BY).
+    //
+    // PS-5: a nullable group key emits one target INSERT per gated variant, so
+    // check EVERY target INSERT against its OWN GROUP BY rather than searching
+    // the whole concatenated script — a global `find` would locate the second
+    // statement's operator past the first statement's GROUP BY.
+    let target_inserts: Vec<&str> = sql
+        .split("\n--<<REFLEX_SEP>>--\n")
+        .filter(|s| s.trim_start().starts_with("INSERT INTO \"test_view\""))
+        .collect();
     assert!(
-        filter_pos < group_by_pos,
-        "filter must precede GROUP BY in target INSERT: {}",
-        &tail[..tail.len().min(500)]
+        !target_inserts.is_empty(),
+        "target INSERT must be present: {sql}"
+    );
+    for stmt in &target_inserts {
+        let filter_pos = stmt
+            .find("EXISTS (SELECT 1 FROM \"__reflex_affected_test_view\"")
+            .expect("affected-groups filter must appear in target INSERT");
+        let group_by_pos = stmt.find("GROUP BY").expect("GROUP BY in target INSERT");
+        assert!(
+            filter_pos < group_by_pos,
+            "filter must precede GROUP BY in target INSERT: {stmt}"
+        );
+    }
+    // The pair must be exactly one sargable variant plus one NULL-safe variant.
+    assert_eq!(
+        target_inserts.len(),
+        2,
+        "nullable group key must emit a gated pair of target INSERTs: {sql}"
+    );
+    assert_eq!(
+        target_inserts
+            .iter()
+            .filter(|s| s.contains("IS NOT DISTINCT FROM"))
+            .count(),
+        1,
+        "exactly one variant keeps the NULL-safe operator: {sql}"
     );
 }
 
@@ -3156,9 +3194,9 @@ fn partition_dispatch_keeps_hot_swap_and_trip_cap_markers() {
         "region",
         "LIST",
         "MERGE_SQL_$1",
-        None,
-        "TDEL_$1",
-        "TINS_$1",
+        &[],
+        &["TDEL_$1".to_string()],
+        &["TINS_$1".to_string()],
     );
     assert!(
         sql.contains("reflex_reconcile_partition"),
@@ -3254,7 +3292,16 @@ fn passthrough_update_nonpartitioned_unchanged() {
 #[test]
 fn partition_dispatch_range_uses_child_name_filter() {
     let sql = build_partition_aware_dispatch_sql_strategy(
-        "v", "__int", "__int", "__aff", "d", "RANGE", "MERGE_$2", None, "TDEL_$2", "TINS_$2",
+        "v",
+        "__int",
+        "__int",
+        "__aff",
+        "d",
+        "RANGE",
+        "MERGE_$2",
+        &[],
+        &["TDEL_$2".to_string()],
+        &["TINS_$2".to_string()],
     );
     assert!(
         sql.contains("_hot_child_names"),
@@ -3269,7 +3316,16 @@ fn partition_dispatch_range_uses_child_name_filter() {
 #[test]
 fn partition_dispatch_list_unchanged_strategy_api() {
     let sql = build_partition_aware_dispatch_sql_strategy(
-        "v", "__int", "__int", "__aff", "region", "LIST", "MERGE_$1", None, "TDEL_$1", "TINS_$1",
+        "v",
+        "__int",
+        "__int",
+        "__aff",
+        "region",
+        "LIST",
+        "MERGE_$1",
+        &[],
+        &["TDEL_$1".to_string()],
+        &["TINS_$1".to_string()],
     );
     assert!(
         sql.contains("$reflex_inner$MERGE_$1$reflex_inner$ USING _hot_keys"),

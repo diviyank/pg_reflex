@@ -83,25 +83,51 @@ pub(crate) struct InplaceSpec<'a> {
 /// set, else `WIPE_THRESHOLD_DEFAULT`. Operators can `SET LOCAL` per-session
 /// or per-statement.
 #[allow(clippy::too_many_arguments)]
+/// Render a list of statements as PL/pgSQL `EXECUTE` lines, one per statement,
+/// each dollar-quoted with `$reflex_inner$` (any occurrence of that tag inside
+/// the statement is rewritten so it cannot terminate the quote early).
+///
+/// PS-5 — the target DELETE / INSERT / dead-cleanup slots each hold a *list*
+/// rather than a single statement, because a nullable group key makes the
+/// affected-groups match expand into a self-gated sargable/NULL-safe pair (see
+/// `merge.rs::AffectedMatch`). Each statement carries its own gate, so emitting
+/// all of them unconditionally is correct: exactly one does work and PostgreSQL
+/// skips the other's plan with a `One-Time Filter`.
+///
+/// `using` is the PL/pgSQL `USING` argument list appended to every `EXECUTE`
+/// (the partitioned cold path binds hot-partition keys as `$1`/`$2`). Both
+/// variants of a gated pair derive from the same filtered string, so they
+/// reference the same placeholders.
+fn execute_each(stmts: &[String], using: Option<&str>) -> String {
+    let suffix = match using {
+        Some(u) => format!(" USING {}", u),
+        None => String::new(),
+    };
+    stmts
+        .iter()
+        .map(|s| {
+            format!(
+                "EXECUTE $reflex_inner${}$reflex_inner${};\n",
+                s.replace("$reflex_inner$", "$reflex_inner_alt$"),
+                suffix
+            )
+        })
+        .collect()
+}
+
 pub(crate) fn build_high_selectivity_dispatch_sql(
     view_name: &str,
     intermediate_tbl: &str,
     affected_tbl: &str,
     merge_sql: &str,
-    dead_cleanup_sql: Option<&str>,
-    target_delete_sql: &str,
-    target_insert_sql: &str,
+    dead_cleanup_sql: &[String],
+    target_delete_sql: &[String],
+    target_insert_sql: &[String],
 ) -> String {
-    let dead_cleanup = match dead_cleanup_sql {
-        Some(s) => format!(
-            "        EXECUTE $reflex_inner${cleanup}$reflex_inner$;\n",
-            cleanup = s.replace("$reflex_inner$", "$reflex_inner_alt$")
-        ),
-        None => String::new(),
-    };
+    let dead_cleanup = execute_each(dead_cleanup_sql, None);
     let safe_merge = merge_sql.replace("$reflex_inner$", "$reflex_inner_alt$");
-    let safe_tdel = target_delete_sql.replace("$reflex_inner$", "$reflex_inner_alt$");
-    let safe_tins = target_insert_sql.replace("$reflex_inner$", "$reflex_inner_alt$");
+    let safe_tdel = execute_each(target_delete_sql, None);
+    let safe_tins = execute_each(target_insert_sql, None);
     let safe_view = view_name.replace('\'', "''");
 
     format!(
@@ -145,8 +171,8 @@ pub(crate) fn build_high_selectivity_dispatch_sql(
                  -- the SOP-forecast shape.\n\
                  EXECUTE 'ANALYZE {intermediate}';\n\
 {dead_cleanup}\
-                 EXECUTE $reflex_inner${tdel}$reflex_inner$;\n\
-                 EXECUTE $reflex_inner${tins}$reflex_inner$;\n\
+{tdel}\
+{tins}\
              END IF;\n\
          END\n\
          $reflex_dispatch$",
@@ -213,9 +239,9 @@ pub(crate) fn build_partition_aware_dispatch_sql_strategy(
     partition_col: &str,
     strategy: &str,
     merge_sql_with_filter: &str,
-    dead_cleanup_sql: Option<&str>,
-    target_delete_sql_with_filter: &str,
-    target_insert_sql_with_filter: &str,
+    dead_cleanup_sql: &[String],
+    target_delete_sql_with_filter: &[String],
+    target_insert_sql_with_filter: &[String],
 ) -> String {
     // RANGE cold filters reference $2 (hot child NAMES); LIST references only $1.
     // Child NAMES (not OIDs) because the hot swap DETACHes/re-ATTACHes the child,
@@ -226,17 +252,10 @@ pub(crate) fn build_partition_aware_dispatch_sql_strategy(
     } else {
         "_hot_keys"
     };
-    let dead_cleanup = match dead_cleanup_sql {
-        Some(s) => format!(
-            "                EXECUTE $reflex_inner${cleanup}$reflex_inner$ USING {using};\n",
-            cleanup = s.replace("$reflex_inner$", "$reflex_inner_alt$"),
-            using = using,
-        ),
-        None => String::new(),
-    };
+    let dead_cleanup = execute_each(dead_cleanup_sql, Some(using));
     let safe_merge = merge_sql_with_filter.replace("$reflex_inner$", "$reflex_inner_alt$");
-    let safe_tdel = target_delete_sql_with_filter.replace("$reflex_inner$", "$reflex_inner_alt$");
-    let safe_tins = target_insert_sql_with_filter.replace("$reflex_inner$", "$reflex_inner_alt$");
+    let safe_tdel = execute_each(target_delete_sql_with_filter, Some(using));
+    let safe_tins = execute_each(target_insert_sql_with_filter, Some(using));
     let safe_view = view_name.replace('\'', "''");
     let safe_part_col = partition_col.replace('"', "");
     let safe_part_col_lit = safe_part_col.replace('\'', "''");
@@ -266,8 +285,8 @@ pub(crate) fn build_partition_aware_dispatch_sql_strategy(
                  EXECUTE $reflex_inner${merge}$reflex_inner$ USING {using};\n\
                  EXECUTE 'ANALYZE {intermediate}';\n\
 {dead_cleanup}\
-                 EXECUTE $reflex_inner${tdel}$reflex_inner$ USING {using};\n\
-                 EXECUTE $reflex_inner${tins}$reflex_inner$ USING {using};\n\
+{tdel}\
+{tins}\
                  RETURN;\n\
              END IF;\n\
              -- Classify by RESOLVED CHILD, not by raw partition value: sum the\n\
@@ -330,8 +349,8 @@ pub(crate) fn build_partition_aware_dispatch_sql_strategy(
              EXECUTE $reflex_inner${merge}$reflex_inner$ USING {using};\n\
              EXECUTE 'ANALYZE {intermediate}';\n\
 {dead_cleanup}\
-             EXECUTE $reflex_inner${tdel}$reflex_inner$ USING {using};\n\
-             EXECUTE $reflex_inner${tins}$reflex_inner$ USING {using};\n\
+{tdel}\
+{tins}\
          END\n\
          $reflex_dispatch$",
         view = safe_view,

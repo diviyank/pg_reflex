@@ -729,50 +729,53 @@ pub(crate) fn outer_join_secondary_stmts(
             affected_tbl, select_expr, delta_q
         ));
 
-        let ns_in_int = null_safe_in(
+        // PS-5 — each affected-groups match expands into a self-gated
+        // sargable/NULL-safe pair when any scope column is nullable, so every
+        // slot below emits one statement per live variant.
+        let ns_in_int = null_safe_in_gated(
             affected_tbl,
             intermediate_tbl,
             &scope_cols,
             &scope_cols,
             &plan.not_null_columns,
         );
-        stmts.push(format!(
-            "DELETE FROM {} WHERE {}",
-            intermediate_tbl, ns_in_int
-        ));
+        stmts.extend(
+            ns_in_int.stmts(|pred| format!("DELETE FROM {} WHERE {}", intermediate_tbl, pred)),
+        );
 
-        let ns_in_full = null_safe_in(
+        let ns_in_full = null_safe_in_gated(
             affected_tbl,
             "__full",
             &scope_cols,
             &scope_cols,
             &plan.not_null_columns,
         );
-        stmts.push(format!(
-            "INSERT INTO {} SELECT * FROM ({}) AS __full WHERE {}",
-            intermediate_tbl, base_query, ns_in_full
-        ));
+        stmts.extend(ns_in_full.stmts(|pred| {
+            format!(
+                "INSERT INTO {} SELECT * FROM ({}) AS __full WHERE {}",
+                intermediate_tbl, base_query, pred
+            )
+        }));
 
-        let ns_in_tgt_delete = null_safe_in(
+        let ns_in_tgt_delete = null_safe_in_gated(
             affected_tbl,
             &qv,
             &scope_target_cols,
             &scope_cols,
             &plan.not_null_columns,
         );
-        stmts.push(format!("DELETE FROM {} WHERE {}", qv, ns_in_tgt_delete));
+        stmts.extend(ns_in_tgt_delete.stmts(|pred| format!("DELETE FROM {} WHERE {}", qv, pred)));
 
-        let ns_in_tgt_insert = null_safe_in(
+        let ns_in_tgt_insert = null_safe_in_gated(
             affected_tbl,
             intermediate_tbl,
             &scope_cols,
             &scope_cols,
             &plan.not_null_columns,
         );
-        stmts.push(format!(
-            "INSERT INTO {} {} AND {}",
-            qv, end_query, ns_in_tgt_insert
-        ));
+        stmts.extend(
+            ns_in_tgt_insert.stmts(|pred| format!("INSERT INTO {} {} AND {}", qv, end_query, pred)),
+        );
     } else {
         stmts.push(format!("TRUNCATE {}", intermediate_tbl));
         stmts.push(format!("INSERT INTO {} {}", intermediate_tbl, base_query));
@@ -1162,9 +1165,9 @@ pub(crate) fn aggregate_epilogue_stmts(
                     intermediate_tbl,
                     affected_tbl,
                     &pd.merge_sql,
-                    None,
-                    &tdel,
-                    &tins,
+                    &[],
+                    std::slice::from_ref(&tdel),
+                    std::slice::from_ref(&tins),
                 ));
             } else {
                 if !skip_target_delete {
@@ -1182,38 +1185,44 @@ pub(crate) fn aggregate_epilogue_stmts(
                 .into_iter()
                 .take(plan.group_by_columns.len())
                 .collect();
-            match inject_affected_filter_before_group_by(
+            match inject_affected_filter_before_group_by_gated(
                 end_query,
                 &output_cols,
                 affected_tbl,
                 intermediate_tbl,
                 &plan.not_null_columns,
             ) {
-                Some(spliced_end_q) => {
-                    let ns_in_target = null_safe_in(
+                Some(spliced_end_qs) => {
+                    // PS-5 — the spliced INSERT and the target DELETE each expand
+                    // into one statement per live variant of the gated match.
+                    let ns_in_target = null_safe_in_gated(
                         affected_tbl,
                         &qv,
                         &target_cols,
                         &output_cols,
                         &plan.not_null_columns,
                     );
-                    let tdel = format!("DELETE FROM {} WHERE {}", qv, ns_in_target);
-                    let tins = format!("INSERT INTO {} {}", qv, spliced_end_q);
+                    let tdel =
+                        ns_in_target.stmts(|pred| format!("DELETE FROM {} WHERE {}", qv, pred));
+                    let tins: Vec<String> = spliced_end_qs
+                        .iter()
+                        .map(|q| format!("INSERT INTO {} {}", qv, q))
+                        .collect();
                     if let Some(pd) = pending_dispatch.take() {
                         stmts.push(build_high_selectivity_dispatch_sql(
                             view_name,
                             intermediate_tbl,
                             affected_tbl,
                             &pd.merge_sql,
-                            None,
+                            &[],
                             &tdel,
                             &tins,
                         ));
                     } else {
                         if !skip_target_delete {
-                            stmts.push(tdel);
+                            stmts.extend(tdel);
                         }
-                        stmts.push(tins);
+                        stmts.extend(tins);
                     }
                 }
                 None => {
@@ -1225,9 +1234,9 @@ pub(crate) fn aggregate_epilogue_stmts(
                             intermediate_tbl,
                             affected_tbl,
                             &pd.merge_sql,
-                            None,
-                            &tdel,
-                            &tins,
+                            &[],
+                            std::slice::from_ref(&tdel),
+                            std::slice::from_ref(&tins),
                         ));
                     } else {
                         if !skip_target_delete {
@@ -1242,33 +1251,38 @@ pub(crate) fn aggregate_epilogue_stmts(
     } else if let Some(ref cols) = grp_cols {
         let qv = quote_identifier(view_name);
         let target_cols = target_group_columns(plan);
-        let ns_in_intermediate = null_safe_in(
+        // PS-5 — a nullable group key expands each affected-groups match into a
+        // self-gated sargable/NULL-safe pair, so every slot below is a LIST of
+        // statements. Exactly one member of each pair does work at run time; the
+        // other's plan is skipped by a `One-Time Filter`.
+        let ns_in_intermediate = null_safe_in_gated(
             affected_tbl,
             intermediate_tbl,
             cols,
             cols,
             &plan.not_null_columns,
         );
-        let ns_in_target_delete = null_safe_in(
+        let ns_in_target_delete = null_safe_in_gated(
             affected_tbl,
             &qv,
             &target_cols,
             cols,
             &plan.not_null_columns,
         );
-        let dead_cleanup_sql = if include_dead_cleanup {
-            Some(format!(
-                "DELETE FROM {} WHERE __ivm_count <= 0 AND {}",
-                intermediate_tbl, ns_in_intermediate
-            ))
+        let dead_cleanup_sql: Vec<String> = if include_dead_cleanup {
+            ns_in_intermediate.stmts(|pred| {
+                format!(
+                    "DELETE FROM {} WHERE __ivm_count <= 0 AND {}",
+                    intermediate_tbl, pred
+                )
+            })
         } else {
-            None
+            Vec::new()
         };
-        let target_delete_sql = format!("DELETE FROM {} WHERE {}", qv, ns_in_target_delete);
-        let target_insert_sql = format!(
-            "INSERT INTO {} {} AND {}",
-            qv, end_query, ns_in_intermediate
-        );
+        let target_delete_sql =
+            ns_in_target_delete.stmts(|pred| format!("DELETE FROM {} WHERE {}", qv, pred));
+        let target_insert_sql = ns_in_intermediate
+            .stmts(|pred| format!("INSERT INTO {} {} AND {}", qv, end_query, pred));
 
         if let Some(pd) = pending_dispatch.take() {
             let strategy_is_range = plan.partition_strategy.eq_ignore_ascii_case("RANGE");
@@ -1310,28 +1324,39 @@ pub(crate) fn aggregate_epilogue_stmts(
                     plan,
                     DeltaOp::Add,
                 );
-                let dead_cleanup_filtered = dead_cleanup_sql.as_ref().map(|s| {
-                    format!(
-                        "{} AND EXISTS (SELECT 1 FROM {} __ap \
-                          WHERE __ap.{} = {}.{} AND {})",
-                        s,
-                        affected_tbl,
-                        part_col_q,
-                        intermediate_tbl,
-                        part_col_q,
-                        cold_pred(&format!("__ap.{}", part_col_q))
-                    )
-                });
-                let tdel_filtered = format!(
-                    "{} AND {}",
-                    target_delete_sql,
-                    cold_pred(&format!("{}.{}", qv, part_col_q))
-                );
-                let tins_filtered = format!(
-                    "{} AND {}",
-                    target_insert_sql,
-                    cold_pred(&format!("{}.{}", intermediate_tbl, part_col_q))
-                );
+                // The cold-partition filter is appended to EVERY gated variant —
+                // both carry the same `$1`/`$2` placeholders, which is exactly why
+                // the gate lives inside the statement rather than in a wrapping
+                // `DO` block (a `DO` block cannot take parameters).
+                let dead_cleanup_filtered: Vec<String> = dead_cleanup_sql
+                    .iter()
+                    .map(|s| {
+                        format!(
+                            "{} AND EXISTS (SELECT 1 FROM {} __ap \
+                              WHERE __ap.{} = {}.{} AND {})",
+                            s,
+                            affected_tbl,
+                            part_col_q,
+                            intermediate_tbl,
+                            part_col_q,
+                            cold_pred(&format!("__ap.{}", part_col_q))
+                        )
+                    })
+                    .collect();
+                let tdel_filtered: Vec<String> = target_delete_sql
+                    .iter()
+                    .map(|s| format!("{} AND {}", s, cold_pred(&format!("{}.{}", qv, part_col_q))))
+                    .collect();
+                let tins_filtered: Vec<String> = target_insert_sql
+                    .iter()
+                    .map(|s| {
+                        format!(
+                            "{} AND {}",
+                            s,
+                            cold_pred(&format!("{}.{}", intermediate_tbl, part_col_q))
+                        )
+                    })
+                    .collect();
                 stmts.push(build_partition_aware_dispatch_sql_strategy(
                     view_name,
                     intermediate_tbl,
@@ -1340,7 +1365,7 @@ pub(crate) fn aggregate_epilogue_stmts(
                     part_col,
                     &plan.partition_strategy,
                     &merge_filtered,
-                    dead_cleanup_filtered.as_deref(),
+                    &dead_cleanup_filtered,
                     &tdel_filtered,
                     &tins_filtered,
                 ));
@@ -1350,19 +1375,17 @@ pub(crate) fn aggregate_epilogue_stmts(
                     intermediate_tbl,
                     affected_tbl,
                     &pd.merge_sql,
-                    dead_cleanup_sql.as_deref(),
+                    &dead_cleanup_sql,
                     &target_delete_sql,
                     &target_insert_sql,
                 ));
             }
         } else {
-            if let Some(s) = dead_cleanup_sql {
-                stmts.push(s);
-            }
+            stmts.extend(dead_cleanup_sql);
             if !skip_target_delete {
-                stmts.push(target_delete_sql);
+                stmts.extend(target_delete_sql);
             }
-            stmts.push(target_insert_sql);
+            stmts.extend(target_insert_sql);
         }
         stmts.push(metadata_sql);
     } else {
