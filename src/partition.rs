@@ -2382,6 +2382,45 @@ fn source_matching_root(deps: &[String], root: &str) -> String {
 /// A pending root that has exceeded the failure cap: (source_root, failures, last_error).
 type CappedRoot = (String, i32, Option<String>);
 
+/// Re-arm pending roots by zeroing their consecutive-failure counter.
+///
+/// `PARTITION_FLUSH_FAILURE_CAP` makes both flush entry points decline a root that
+/// has failed that many times in a row, so a capped root is skipped by
+/// `reflex_flush_partitions()` *and* by `reflex_flush_partition_source(root)`.
+/// Before this primitive existed the only way out was a manual UPDATE against an
+/// extension-owned table — which the skip warning asked for without providing.
+///
+/// `None` re-arms every root carrying failures; `Some(root)` re-arms just that
+/// one. Returns the number of rows re-armed. `last_error` is deliberately left in
+/// place: it is the only record of why the root broke, the next attempt overwrites
+/// it, and a successful drain deletes the row outright.
+pub(crate) fn reflex_reset_partition_failures_impl(source_root: Option<&str>) -> i64 {
+    Spi::connect_mut(|client| {
+        let updated = match source_root {
+            Some(root) => client.update(
+                "UPDATE public.__reflex_partition_pending SET failures = 0 \
+                  WHERE source_root = $1 AND failures > 0",
+                None,
+                &[unsafe {
+                    DatumWithOid::new(root.to_string(), PgBuiltInOids::TEXTOID.oid().value())
+                }],
+            ),
+            None => client.update(
+                "UPDATE public.__reflex_partition_pending SET failures = 0 WHERE failures > 0",
+                None,
+                &[],
+            ),
+        };
+        match updated {
+            Ok(table) => table.len() as i64,
+            Err(e) => {
+                pgrx::warning!("pg_reflex: reset_partition_failures failed: {}", e);
+                0
+            }
+        }
+    })
+}
+
 pub(crate) fn reflex_flush_partitions_impl(only: Option<&str>) -> String {
     let outcome: Result<String, String> = Spi::connect_mut(|client| {
         let (roots, capped_roots): (Vec<String>, Vec<CappedRoot>) = match only {

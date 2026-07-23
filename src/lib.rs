@@ -575,6 +575,21 @@ fn reflex_flush_partition_source(source_root: &str) -> String {
     partition::reflex_flush_partitions_impl(Some(source_root))
 }
 
+/// Re-arm pending partition roots that the failure cap has given up on, so the
+/// next flush attempts them again. Pass NULL for every root.
+///
+/// A root that has failed `PARTITION_FLUSH_FAILURE_CAP` flushes in a row is
+/// skipped by both `reflex_flush_partitions()` and
+/// `reflex_flush_partition_source(root)`, so no flush can move it and no flush
+/// can clear the counter (it is cleared only by the DELETE a *successful* drain
+/// performs). Fix the underlying cause first — re-arming a root whose cause is
+/// still present simply spends another attempt. Returns the number of roots
+/// re-armed.
+#[pg_extern]
+fn reflex_reset_partition_failures(source_root: default!(Option<&str>, "NULL")) -> i64 {
+    partition::reflex_reset_partition_failures_impl(source_root)
+}
+
 /// Internal: replace the source-partition snapshot for `source_root` with the
 /// live leaf set. SQL-callable so the per-root flush subtransaction can refresh
 /// the snapshot atomically with its reconciles. Not part of the public API.
