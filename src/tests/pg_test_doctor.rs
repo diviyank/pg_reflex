@@ -1182,3 +1182,106 @@ fn ps4_finding_dates_the_wedge_from_stale_since() {
     .unwrap_or(-1);
     assert_eq!(n, 1, "the finding must date the wedge from stale_since");
 }
+
+#[pg_test]
+fn ps4_soft_error_string_is_not_reported_as_fixed() {
+    // reflex_reconcile / reflex_sync_partitions signal some failures by RETURNING
+    // an 'ERROR: …' string instead of raising. A helper that discards the result
+    // reports those as 'fixed'.
+    let outcome: String =
+        Spi::get_one("SELECT public.__reflex_doctor_try_repair('SELECT ''ERROR: nope''')")
+            .expect("q")
+            .expect("non-null");
+    assert!(
+        outcome.starts_with("failed:"),
+        "a repair returning an ERROR string must not be reported as fixed, got '{}'",
+        outcome
+    );
+}
+
+#[pg_test]
+fn ps4_successful_repair_is_still_reported_as_fixed() {
+    let outcome: String =
+        Spi::get_one("SELECT public.__reflex_doctor_try_repair('SELECT ''RECONCILED''')")
+            .expect("q")
+            .expect("non-null");
+    assert_eq!(outcome, "fixed");
+}
+
+#[pg_test]
+fn ps4_f3_repair_clears_known_stale_and_stops_reporting() {
+    Spi::run("CREATE TABLE ps4_f3_src (id INT PRIMARY KEY, val INT)").expect("src");
+    Spi::run("INSERT INTO ps4_f3_src VALUES (1, 100)").expect("rows");
+    crate::create_reflex_ivm(
+        "ps4_f3_imv",
+        "SELECT id, val FROM ps4_f3_src",
+        Some("id"),
+        None,
+        Some("IMMEDIATE"),
+        None,
+    );
+    Spi::run(
+        "UPDATE public.__reflex_ivm_reference \
+            SET known_stale = TRUE, \
+                stale_reason = 'ERROR:  partition \"a\" would overlap partition \"b\"' \
+          WHERE name = 'ps4_f3_imv'",
+    )
+    .expect("mark stale");
+
+    let outcome: String = Spi::get_one(
+        "SELECT outcome FROM reflex_doctor(NULL, TRUE, TRUE) \
+         WHERE object = 'ps4_f3_imv' AND check_id = 'F3' LIMIT 1",
+    )
+    .expect("q")
+    .expect("expected an F3 row");
+    assert_eq!(outcome, "fixed", "the authorized F3 repair must succeed");
+
+    let still_stale: bool = Spi::get_one(
+        "SELECT known_stale FROM public.__reflex_ivm_reference WHERE name = 'ps4_f3_imv'",
+    )
+    .expect("q")
+    .unwrap_or(true);
+    assert!(
+        !still_stale,
+        "a repair reported as fixed must have cleared known_stale"
+    );
+
+    let again: i64 = Spi::get_one(
+        "SELECT count(*) FROM reflex_doctor() \
+         WHERE object = 'ps4_f3_imv' AND check_id = 'F3'",
+    )
+    .expect("q")
+    .unwrap_or(-1);
+    assert_eq!(again, 0, "a repaired F3 must stop being re-reported");
+}
+
+#[pg_test]
+fn ps4_unrepairable_f3_is_not_reported_as_fixed() {
+    // A registry row with no relations behind it: every repair fails.
+    Spi::run(
+        "INSERT INTO public.__reflex_ivm_reference \
+             (name, graph_depth, known_stale, stale_reason, enabled) \
+         VALUES ('ps4_ghost_imv', 0, TRUE, \
+                 'ERROR:  partition \"a\" would overlap partition \"b\"', TRUE)",
+    )
+    .expect("seed");
+
+    let outcome: String = Spi::get_one(
+        "SELECT outcome FROM reflex_doctor(NULL, TRUE, TRUE) \
+         WHERE object = 'ps4_ghost_imv' AND check_id = 'F3' LIMIT 1",
+    )
+    .expect("q")
+    .expect("expected an F3 row");
+    assert!(
+        outcome.starts_with("failed:"),
+        "an unrepairable F3 must report failed, got '{}'",
+        outcome
+    );
+
+    let still_stale: bool = Spi::get_one(
+        "SELECT known_stale FROM public.__reflex_ivm_reference WHERE name = 'ps4_ghost_imv'",
+    )
+    .expect("q")
+    .unwrap_or(false);
+    assert!(still_stale, "a failed repair must leave known_stale set");
+}
