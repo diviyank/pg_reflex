@@ -991,12 +991,23 @@ extension_sql!(
         _affected TEXT[] := ARRAY[]::TEXT[];
         _synced_keys TEXT[] := ARRAY[]::TEXT[];
         _sync_key TEXT;
+        _reconcile_root TEXT;
     BEGIN
         _policy := lower(COALESCE(NULLIF(current_setting('pg_reflex.alter_source_policy', true), ''), 'warn'));
         IF _policy NOT IN ('warn', 'error') THEN
             RAISE WARNING 'pg_reflex: invalid pg_reflex.alter_source_policy=%, falling back to ''warn''', _policy;
             _policy := 'warn';
         END IF;
+
+        -- Root whose chain reflex_reconcile is currently rebuilding, set by that
+        -- function around its DISABLE/ENABLE TRIGGER of each generated sub-IMV.
+        -- Those internal ALTERs are on tracked sources (a generated child sits in
+        -- its parent's depends_on), so the warn/error branch below would fire a
+        -- spurious "run reflex_rebuild_imv" for a rebuild already in flight and,
+        -- under 'error' policy, abort the reconcile outright. Suppressed for the
+        -- nodes of the active chain only — a DIFFERENT root that reads the same
+        -- node still warns, because that consumer really did miss the refresh.
+        _reconcile_root := NULLIF(current_setting('pg_reflex.internal_reconcile_root', true), '');
 
         -- 1.6.0: auto-sync IMV partitions when a source's partition tree changes.
         --
@@ -1133,6 +1144,21 @@ extension_sql!(
                 WHERE depends_on @> ARRAY[_src]
                    OR depends_on @> ARRAY[split_part(_src, '.', 2)]
             LOOP
+                -- Skip pg_reflex's own DISABLE/ENABLE TRIGGER on a generated
+                -- sub-IMV of the chain being reconciled: the consumer named here
+                -- is that same chain's root or an intermediate generated node of
+                -- it, and it is about to be rebuilt. A consumer on a DIFFERENT
+                -- root does not match this prefix, so its legitimate stale signal
+                -- still fires.
+                IF _reconcile_root IS NOT NULL
+                   AND ( _imv.name = _reconcile_root
+                         OR split_part(_imv.name, '.', 2)
+                            = split_part(_reconcile_root, '.', 2)
+                         OR split_part(_imv.name, '.', 2)
+                            LIKE split_part(_reconcile_root, '.', 2) || '\_\_%' )
+                THEN
+                    CONTINUE;
+                END IF;
                 _affected := _affected || (_src || ' -> ' || _imv.name);
                 IF _policy = 'warn' THEN
                     RAISE WARNING 'pg_reflex: source table % was altered; IMV % may be stale — run SELECT reflex_rebuild_imv(''%'') to recover',

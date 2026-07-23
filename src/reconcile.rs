@@ -431,19 +431,30 @@ pub(crate) fn reflex_reconcile_with_orphans(view_name: &str, drop_orphans: bool)
         warn_if_recursion_skipped_with_generated_children(view_name);
     } else {
         warn_about_skipped_decomposed_nodes(view_name);
-        for child in generated_dependencies_shallowest_first(view_name) {
-            let result = reconcile_generated_child_without_propagating(&child);
-            if result.starts_with("ERROR") {
-                child_failed = true;
-                warning!(
-                    "pg_reflex: reconcile of generated sub-IMV '{}' of '{}' returned: {} \
-                     — rebuilding '{}' anyway, but reporting failure",
-                    child,
-                    view_name,
-                    result,
-                    view_name
-                );
+        let children = generated_dependencies_shallowest_first(view_name);
+        if !children.is_empty() {
+            // Tell `reflex_on_ddl_command_end` which chain we are rebuilding, so
+            // it suppresses the spurious "source altered — run reflex_rebuild_imv"
+            // alarm (and, under 'error' policy, the abort) that our own
+            // DISABLE/ENABLE TRIGGER on each generated child would otherwise
+            // raise. Transaction-scoped; a different root reading a shared node
+            // still warns.
+            set_internal_reconcile_root(Some(view_name));
+            for child in &children {
+                let result = reconcile_generated_child_without_propagating(child);
+                if result.starts_with("ERROR") {
+                    child_failed = true;
+                    warning!(
+                        "pg_reflex: reconcile of generated sub-IMV '{}' of '{}' returned: {} \
+                         — rebuilding '{}' anyway, but reporting failure",
+                        child,
+                        view_name,
+                        result,
+                        view_name
+                    );
+                }
             }
+            set_internal_reconcile_root(None);
         }
     }
 
@@ -498,6 +509,22 @@ fn warn_if_recursion_skipped_with_generated_children(view_name: &str) {
 /// live. Since rebuilding a generated child is itself a 100%-of-rows change it
 /// trips the wipe branch, so without this gate the recursion would re-enter
 /// itself.
+/// Publish (or clear, with `None`) the name of the chain reflex_reconcile is
+/// rebuilding, in a transaction-scoped GUC the `reflex_on_ddl_command_end` event
+/// trigger reads to suppress the stale alarm for our own trigger-suppression
+/// ALTERs. `SET LOCAL` so it reverts at transaction end even on an error path;
+/// the placeholder GUC name (contains a dot) needs no prior definition.
+fn set_internal_reconcile_root(root: Option<&str>) {
+    let sql = match root {
+        Some(name) => format!(
+            "SET LOCAL pg_reflex.internal_reconcile_root = '{}'",
+            name.replace('\'', "''")
+        ),
+        None => "SET LOCAL pg_reflex.internal_reconcile_root = ''".to_string(),
+    };
+    let _ = Spi::run(&sql);
+}
+
 /// Fails CLOSED: an unreadable probe is treated as "inside a trigger", which
 /// disables the recursion. The gate is mandatory, so a probe failure must not be
 /// the thing that enables re-entrant DDL on a relation under its own trigger.

@@ -977,3 +977,57 @@ fn pg_repair_dependency_graph_reports_non_convergence_on_a_cycle() {
         "the summary must name the cause, got: {summary}"
     );
 }
+
+/// PS-1 REVIEW Item A — recursion issues `ALTER TABLE <child> DISABLE/ENABLE
+/// TRIGGER USER`, which `reflex_on_ddl_command_end` sees. Under the default
+/// 'warn' policy that is spurious noise (a recovery instruction for a recovery in
+/// flight); under `pg_reflex.alter_source_policy = 'error'` it is worse — the
+/// child is a tracked source, so the ALTER would RAISE and abort the entire
+/// reconcile. The alarm must be suppressed for the chain being reconciled.
+#[pg_test]
+fn pg_reconcile_under_error_policy_does_not_abort_on_own_alter() {
+    Spi::run("CREATE TABLE dce_src (id INT, grp TEXT, val NUMERIC)").expect("create src");
+    Spi::run("INSERT INTO dce_src SELECT g, 'g' || (g % 4), 10 FROM generate_series(1,80) g")
+        .expect("seed");
+
+    crate::create_reflex_ivm(
+        "dce_agg",
+        "WITH base AS (SELECT id, grp, val FROM dce_src) \
+         SELECT grp, COUNT(*) AS cnt, SUM(val) AS total FROM base GROUP BY grp",
+        Some("grp"),
+        Some("UNLOGGED"),
+        Some("DEFERRED"),
+        None,
+    );
+
+    Spi::run("SET pg_reflex.alter_source_policy = 'error'").expect("set policy");
+
+    // Pre-fix: the internal ALTER on dce_agg__cte_base raises under 'error' and
+    // this returns an Err. Post-fix: the chain reconciles cleanly.
+    let status = Spi::get_one::<String>("SELECT reflex_rebuild_imv('dce_agg')")
+        .expect("reconcile must not abort under error policy")
+        .expect("value");
+    assert_eq!(status, "RECONCILED");
+
+    // The policy is still live for a genuine user ALTER on a real source. A
+    // plpgsql RAISE EXCEPTION surfaces through pgrx as a hard abort rather than a
+    // returnable Err, so catch it in SQL and report a flag instead.
+    let user_alter_blocked = Spi::get_one::<bool>(
+        "DO $$ BEGIN \
+             ALTER TABLE dce_src ADD COLUMN note TEXT; \
+         EXCEPTION WHEN OTHERS THEN \
+             RAISE NOTICE 'blocked'; \
+         END $$; \
+         SELECT NOT EXISTS ( \
+             SELECT 1 FROM information_schema.columns \
+              WHERE table_name = 'dce_src' AND column_name = 'note')",
+    )
+    .expect("q")
+    .expect("v");
+    assert!(
+        user_alter_blocked,
+        "a real user ALTER on a tracked source must still be blocked under 'error' policy"
+    );
+
+    Spi::run("SET pg_reflex.alter_source_policy = 'warn'").expect("reset policy");
+}
