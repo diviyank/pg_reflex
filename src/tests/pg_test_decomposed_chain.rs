@@ -1104,3 +1104,91 @@ fn pg_reconcile_with_pending_deferred_delta_stays_correct() {
         "SELECT grp, COUNT(*) AS cnt, SUM(val) AS total FROM dcpd_src GROUP BY grp",
     );
 }
+
+/// INTEGRATION (PS-1 + PS-4) — the doctor must classify a genuinely decomposed
+/// IMV as F4b regardless of schema qualification, and prescribe a remedy that
+/// actually works. Pre-integration the doctor probed `name LIKE '<bare>__%'`,
+/// which never matched a schema-qualified child (`s.qv__cte_base` does not begin
+/// with `qv__`), so `s.qv` was misclassified F4; and F4b prescribed
+/// `reflex_rebuild_chain`, which hard-errors on a CTE-decomposed parent (D22).
+/// This test fails on either branch alone and on their naive merge.
+#[pg_test]
+fn doctor_classifies_a_real_decomposed_chain_regardless_of_schema_qualification() {
+    Spi::run("CREATE TABLE dcint_src (id INT, grp TEXT, val NUMERIC)").expect("src");
+    Spi::run("INSERT INTO dcint_src VALUES (1,'a',10),(2,'a',20),(3,'b',30)").expect("seed bare");
+    Spi::run("CREATE SCHEMA dcint_s").expect("schema");
+    Spi::run("CREATE TABLE dcint_s.src (id INT, grp TEXT, val NUMERIC)").expect("qsrc");
+    Spi::run("INSERT INTO dcint_s.src VALUES (1,'a',10),(2,'a',20),(3,'b',30)").expect("seed q");
+
+    let cte_agg = "WITH base AS (SELECT id, grp, val FROM {src}) \
+                   SELECT grp, SUM(val) AS total FROM base GROUP BY grp";
+    assert_eq!(
+        crate::create_reflex_ivm("bv", &cte_agg.replace("{src}", "dcint_src"),
+                                 None, None, None, None),
+        "CREATE REFLEX INCREMENTAL VIEW"
+    );
+    assert_eq!(
+        crate::create_reflex_ivm("dcint_s.qv", &cte_agg.replace("{src}", "dcint_s.src"),
+                                 None, None, None, None),
+        "CREATE REFLEX INCREMENTAL VIEW"
+    );
+
+    // Both parents must carry the generated-child edge; both children flagged.
+    for parent in ["bv", "dcint_s.qv"] {
+        let has_gen_dep = Spi::get_one::<bool>(&format!(
+            "SELECT EXISTS(SELECT 1 FROM public.__reflex_ivm_reference child \
+               WHERE child.name = ANY(SELECT unnest(depends_on_imv) \
+                 FROM public.__reflex_ivm_reference WHERE name = '{parent}') \
+               AND child.is_generated_sub_imv)"
+        ))
+        .expect("q").expect("v");
+        assert!(has_gen_dep, "{parent} must depend on a flagged generated sub-IMV");
+    }
+
+    // Flag the whole graph stale so the doctor's known_stale sweep sees every node.
+    Spi::run(
+        "UPDATE public.__reflex_ivm_reference \
+           SET known_stale = TRUE, stale_reason = 'integration test' \
+         WHERE name IN ('bv','dcint_s.qv') OR name LIKE '%\\_\\_cte\\_%' ESCAPE '\\'",
+    )
+    .expect("flag stale");
+
+    // Load-bearing: BOTH parents classify F4b. Pre-integration s.qv was F4.
+    for parent in ["bv", "dcint_s.qv"] {
+        let check_id = Spi::get_one::<String>(&format!(
+            "SELECT check_id FROM reflex_doctor() WHERE object = '{parent}'"
+        ))
+        .expect("q").expect("row for parent");
+        assert_eq!(check_id, "F4b", "{parent} must be classified F4b");
+
+        // The remedy must be reflex_reconcile, never the D22-broken rebuild_chain.
+        let action = Spi::get_one::<String>(&format!(
+            "SELECT action FROM reflex_doctor() WHERE object = '{parent}'"
+        ))
+        .expect("q").expect("action");
+        assert!(action.contains("reflex_reconcile"),
+                "{parent} F4b action must use reflex_reconcile, got: {action}");
+        assert!(!action.contains("reflex_rebuild_chain"),
+                "{parent} F4b action must not use the D22-broken rebuild_chain, got: {action}");
+    }
+
+    // fix mode must actually clear the state and leave correct data.
+    Spi::run("SELECT * FROM reflex_doctor(NULL, TRUE)").expect("fix run");
+    for (parent, src) in [("bv", "dcint_src"), ("dcint_s.qv", "dcint_s.src")] {
+        let still_stale = Spi::get_one::<bool>(&format!(
+            "SELECT COALESCE(known_stale, FALSE) FROM public.__reflex_ivm_reference WHERE name = '{parent}'"
+        ))
+        .expect("q").expect("v");
+        assert!(!still_stale, "{parent} must be cleared after fix");
+        let mismatch = Spi::get_one::<i64>(&format!(
+            "SELECT count(*) FROM ( \
+                 (SELECT grp, SUM(val) AS total FROM {src} GROUP BY grp \
+                  EXCEPT SELECT grp, total FROM {parent}) \
+                 UNION ALL \
+                 (SELECT grp, total FROM {parent} \
+                  EXCEPT SELECT grp, SUM(val) AS total FROM {src} GROUP BY grp)) d"
+        ))
+        .expect("q").expect("v");
+        assert_eq!(mismatch, 0, "{parent} must match ground truth after repair");
+    }
+}

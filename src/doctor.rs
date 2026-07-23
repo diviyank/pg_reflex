@@ -325,12 +325,18 @@ fn apply_partition_flush_repair(source_root: &str) -> String {
     }
 }
 
-/// Apply a reconcile repair in a subtransaction
-fn apply_reconcile_repair(imv_name: &str) -> String {
+/// Apply a reconcile repair in a subtransaction.
+///
+/// Calls the two-argument `reflex_reconcile(view, drop_orphans)` overload (1.11.0)
+/// so an F4 / F4b repair honours the operator's `drop_orphans` choice instead of
+/// silently dropping orphan partitions the way the one-argument form does. F3
+/// already gates its orphan drop; this keeps F4/F4b consistent with it.
+fn apply_reconcile_repair(imv_name: &str, drop_orphans: bool) -> String {
     // Build the repair SQL with proper escaping
     let repair_sql = format!(
-        "SELECT public.reflex_reconcile('{}')",
-        imv_name.replace("'", "''")
+        "SELECT public.reflex_reconcile('{}', {})",
+        imv_name.replace("'", "''"),
+        drop_orphans
     );
     // Call the helper function, which executes the repair and returns 'fixed' or 'failed:...'
     let helper_call = format!(
@@ -426,28 +432,27 @@ fn detect_known_stale_imvs(
 
     for (imv_name, _graph_depth, stale_reason) in stale_rows {
         // Determine check_id:
-        // (1) If this IMV has registered sub-IMVs (decomposed chain), it's F4b
+        // (1) If this IMV is a decomposed parent (depends on a pg_reflex-generated
+        //     sub-IMV), it's F4b
         // (2) Else if stale_reason contains "overlap" → F3
         // (3) Else → F4
         let check_id = {
-            // Check for decomposed chain: sub-IMVs named with the pattern <bare_name>__*
-            let (_, bare_imv) = crate::query_decomposer::canonical_source(&imv_name);
-
-            // F10 fix: escape LIKE metacharacters (\ _ %) in bare_imv to match literally.
-            // This ensures underscore positions in real names don't act as wildcards.
-            // For example, "base_v" should NOT match "base_xy" under the pattern "base_v__%".
-            let escaped_bare = bare_imv
-                .replace('\\', "\\\\")
-                .replace('_', "\\_")
-                .replace('%', "\\%");
-
-            let pattern_suffix = format!("{}__", escaped_bare);
-            // Escape single quotes for SQL string literal
-            let escaped_pattern = pattern_suffix.replace("'", "''");
-
+            // 1.11.0: classify on the authoritative registry graph, not a name
+            // heuristic. The old `name LIKE '<bare>__%'` probe silently missed
+            // every schema-qualified decomposed IMV — its registry name is
+            // `s.qv__cte_b`, which does not begin with the parent's bare `qv__`,
+            // so `s.qv` was misclassified F4 and given a repair that could not
+            // handle its chain. PS-1 now records `is_generated_sub_imv` on the
+            // child and the edge in the parent's `depends_on_imv`; a decomposed
+            // parent is exactly a row with a generated node in `depends_on_imv`.
             let is_decomposed_chain = Spi::get_one::<bool>(&format!(
-                "SELECT EXISTS(SELECT 1 FROM public.__reflex_ivm_reference WHERE name LIKE '{}%' ESCAPE '\\')",
-                escaped_pattern
+                "SELECT EXISTS( \
+                     SELECT 1 FROM public.__reflex_ivm_reference child \
+                      WHERE child.name = ANY( \
+                          SELECT unnest(COALESCE(parent.depends_on_imv, ARRAY[]::TEXT[])) \
+                            FROM public.__reflex_ivm_reference parent WHERE parent.name = '{}') \
+                        AND COALESCE(child.is_generated_sub_imv, FALSE))",
+                imv_name.replace("'", "''")
             ))
             .unwrap_or(None)
             .unwrap_or(false);
@@ -467,12 +472,29 @@ fn detect_known_stale_imvs(
 
         let (action, outcome) = match check_id.as_str() {
             "F4b" => {
+                // Pre-1.11.0 this prescribed reflex_rebuild_chain and never ran it.
+                // reflex_rebuild_chain drop+recreates from the registry sql_query,
+                // which for a CTE-decomposed parent is the *rewritten* body naming
+                // a child the cascade just dropped — so it hard-errors on exactly
+                // this shape (D22, still open, PS-2's file). PS-1 made
+                // reflex_reconcile rebuild the generated sub-IMVs bottom-up first,
+                // so it is now the correct — and safe, rebuild-in-place — remedy,
+                // repaired under `fix` like F4. drop_orphans is honoured via the
+                // scoped overload.
                 (
                     format!(
-                        "SELECT reflex_rebuild_chain('{}');",
-                        imv_name.replace("'", "''")
+                        "SELECT reflex_reconcile('{}', {});",
+                        imv_name.replace("'", "''"),
+                        drop_orphans
                     ),
-                    "reported".to_string(), // F4b is never auto-performed
+                    if fix {
+                        verify_stale_cleared(
+                            &imv_name,
+                            apply_reconcile_repair(&imv_name, drop_orphans),
+                        )
+                    } else {
+                        "reported".to_string()
+                    },
                 )
             }
             "F3" => {
@@ -497,11 +519,15 @@ fn detect_known_stale_imvs(
                 // F4 case
                 (
                     format!(
-                        "SELECT reflex_reconcile('{}');",
-                        imv_name.replace("'", "''")
+                        "SELECT reflex_reconcile('{}', {});",
+                        imv_name.replace("'", "''"),
+                        drop_orphans
                     ),
                     if fix {
-                        verify_stale_cleared(&imv_name, apply_reconcile_repair(&imv_name))
+                        verify_stale_cleared(
+                            &imv_name,
+                            apply_reconcile_repair(&imv_name, drop_orphans),
+                        )
                     } else {
                         "reported".to_string()
                     },

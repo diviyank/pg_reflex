@@ -150,7 +150,7 @@ $fn$;
 -- TRUE) now re-arms each capped root once per invocation before the flush it
 -- prescribes, and capped rows report as F2b rather than F2 so "wedged and
 -- retrying" is distinguishable from "wedged and given up on".
-CREATE OR REPLACE FUNCTION public."reflex_reset_partition_failures"(
+CREATE OR REPLACE FUNCTION "reflex_reset_partition_failures"(
     "source_root" TEXT DEFAULT NULL
 ) RETURNS bigint
 LANGUAGE c

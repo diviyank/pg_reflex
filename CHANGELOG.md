@@ -2,6 +2,80 @@
 
 ## [Unreleased]
 
+## [1.11.0] - 2026-07-24
+
+Correctness and truthfulness across decomposed IMV chains, the doctor, and
+nullable-key maintenance cost. Replace the `.so`, then
+`ALTER EXTENSION pg_reflex UPDATE TO '1.11.0';`, then run
+`SELECT reflex_repair_dependency_graph();` in a fresh session to backfill the
+dependency graph on existing rows.
+
+**Fixed**
+
+- A CTE-decomposed IMV never recorded the edge to the sub-IMV pg_reflex generated
+  for it: `resolve_existing_imv_deps` matched `depends_on` against the registry
+  `name` by exact string equality, but the decomposer persists the sub-IMV source
+  double-quoted to preserve identifier case, so the match never fired. Every
+  decomposed IMV had an empty `depends_on_imv`, an empty `graph_child` on its
+  generated child, and a collapsed `graph_depth`. Consequences, all fixed:
+  `reflex_reconcile` / `reflex_rebuild_imv` on the parent re-aggregated a stale
+  child and returned `RECONCILED` (silent stale data when the child reads a
+  materialized view); and `reflex_rebuild_chain` / non-cascade `drop_reflex_ivm`
+  on a generated child saw no dependents and silently ended the parent's
+  maintenance. `reflex_reconcile` now rebuilds a decomposed IMV's generated
+  sub-IMVs bottom-up (triggers suppressed, so nothing double-counts) before the
+  IMV itself, and refuses the two destructive operations on a generated child.
+- `reflex_reconcile` on a decomposed chain no longer skips a generated child
+  under a mixed-case name, and no longer descends into set-op / CTE wrapper nodes
+  it cannot rebuild (which silently column-shifted or aborted).
+- `reflex_doctor` classified the pending queue on `attempts` (an enqueue counter),
+  reported an arbitrarily old `last_error` next to a freshly reset age, and left a
+  capped root's prescribed flush a guaranteed no-op. It now classifies on
+  `failures`, dates findings from a new `last_attempt_at`, distinguishes capped
+  roots as `F2b`, and re-arms them (one attempt per `fix` invocation, via the new
+  `reflex_reset_partition_failures`) before flushing. A repair is reported `fixed`
+  only when the pending row actually drained.
+- `reflex_doctor`'s orphan-object check reported every intermediate partition of
+  every partitioned IMV, and every aux table of a bare-name IMV, as an orphan with
+  a `DROP … CASCADE` fix; ownership is now decided on catalog OIDs
+  (`pg_partition_root`) rather than name strings, with a `COALESCE(target_schema,
+  'public')` fallback for pre-1.7.2 rows.
+- The aggregate target-sync and intermediate MERGE emitted a non-sargable
+  `IS NOT DISTINCT FROM` join on nullable group keys, forcing a full scan of the
+  target/intermediate on every delta. Both now emit a runtime-gated pair — a
+  sargable `=` form when the affected set has no NULL key, the null-safe form only
+  when it does — restoring index use and partition pruning (200k-group,
+  1-row-delta target sync 52 ms → 0.09 ms; intermediate MERGE 14 ms → 0.04 ms).
+  NOT-NULL-keyed IMVs are byte-for-byte unchanged.
+- `reflex_doctor(fix => TRUE, drop_orphans => FALSE)` no longer drops orphan
+  partitions through its F4 / F4b reconcile after refusing to at the F3 step: the
+  reconcile repairs now call the new two-argument `reflex_reconcile(view,
+  drop_orphans)` overload and honour the caller's choice.
+
+**Changed**
+
+- `reflex_doctor` classifies a decomposed parent as `F4b` from the registry graph
+  (`is_generated_sub_imv` + `depends_on_imv`) rather than a `name LIKE` heuristic
+  that missed every schema-qualified chain, and prescribes `reflex_reconcile`
+  (which now handles the chain) rather than `reflex_rebuild_chain`.
+- `graph_depth` changes value for every decomposed IMV (up for CTE parents, down
+  for set-op wrappers). Every consumer orders by it ascending and wants the
+  corrected order.
+
+**Added**
+
+- `is_generated_sub_imv` and `__reflex_partition_pending.last_attempt_at` columns;
+  `reflex_repair_dependency_graph()`, `reflex_reset_partition_failures()`, and the
+  two-argument `reflex_reconcile(view, drop_orphans)` overload.
+
+**Migration**
+
+- `ALTER EXTENSION pg_reflex UPDATE TO '1.11.0';` —
+  [`sql/pg_reflex--1.10.11--1.11.0.sql`](https://github.com/diviyank/pg_reflex/blob/main/sql/pg_reflex--1.10.11--1.11.0.sql).
+  After the upgrade, in a fresh session, run `SELECT reflex_repair_dependency_graph();`
+  to backfill `depends_on_imv` / `graph_child` / `graph_depth` /
+  `is_generated_sub_imv` on rows created before 1.11.0, then re-run `reflex_doctor()`.
+
 ## [1.10.11] - 2026-07-22
 
 Non-superuser reconcile, and real archive-residue verification for joins.
