@@ -514,10 +514,14 @@ pub(crate) fn reflex_rebuild_chain_impl(view_name: &str, cascade: bool) -> Strin
             let names: Vec<&str> = dependents.iter().map(|(n, _)| n.as_str()).collect();
             return Err(format!(
                 "IMV '{}' has {} dependent IMV(s) that CASCADE would destroy: {}. \
-                 Re-run with cascade => TRUE to drop and recreate them, or rebuild them individually.",
+                 To rebuild the whole chain, drop and recreate it from its original spec: \
+                 SELECT drop_reflex_ivm('{}', true); then re-run the original create_reflex_ivm. \
+                 (cascade => TRUE is unsafe on a decomposed chain — it recreates from a stored \
+                 query that references a sibling the cascade has already dropped.)",
                 view_name,
                 dependents.len(),
-                names.join(", ")
+                names.join(", "),
+                view_name
             ));
         }
 

@@ -34,6 +34,7 @@ mod audit;
 mod create_ivm;
 mod doctor;
 mod drop_ivm;
+mod graph_repair;
 mod introspect;
 mod partition;
 mod query_decomposer;
@@ -197,6 +198,17 @@ extension_sql!(
     -- create time to enable transparent rebuild from stored specs.
     ALTER TABLE public.__reflex_ivm_reference
         ADD COLUMN IF NOT EXISTS create_args TEXT;
+
+    -- 1.11.0 (PS-1): TRUE when pg_reflex itself created this node while
+    -- decomposing a single user create_reflex_ivm call — a CTE sub-IMV
+    -- (`__cte_<alias>`), a set-op operand (`__union_<i>`), or a DISTINCT-ON /
+    -- window base (`__base`). reflex_reconcile recurses into these and only
+    -- these: a user-declared IMV dependency is someone else's object and
+    -- reconciling it is not this call's business. Recorded explicitly rather
+    -- than inferred from the name prefix, which a user IMV literally named
+    -- `foo__cte_bar` would defeat.
+    ALTER TABLE public.__reflex_ivm_reference
+        ADD COLUMN IF NOT EXISTS is_generated_sub_imv BOOLEAN NOT NULL DEFAULT FALSE;
 
     -- Multi-level partition capture (plans/sub_partitioning.md). Snapshot of
     -- each tracked source root's recursive LEAF set, keyed by (root, child).
@@ -633,6 +645,21 @@ fn drop_reflex_ivm_cascade(view_name: &str, cascade: bool) -> &'static str {
     drop_ivm::drop_reflex_ivm_impl(view_name, cascade)
 }
 
+/// Reconcile an IMV by rebuilding intermediate + target from scratch, with
+/// explicit control over whether the pre-rebuild partition sync may drop orphan
+/// IMV partitions.
+///
+/// The one-argument form hardcodes `drop_orphans => TRUE`, which is 1.10.11
+/// behaviour and remains the default. This overload exists for callers that gate
+/// destruction on their own authorization: `reflex_doctor` refuses an F3 orphan
+/// drop when the operator did not pass `drop_orphans`, then reached the same
+/// destruction anyway through its F4 `reflex_reconcile` repair. Passing FALSE here
+/// keeps that promise.
+#[pg_extern(name = "reflex_reconcile")]
+fn reflex_reconcile_scoped(view_name: &str, drop_orphans: bool) -> &'static str {
+    reconcile::reflex_reconcile_with_orphans(view_name, drop_orphans)
+}
+
 /// Reconcile an IMV by rebuilding intermediate + target from scratch.
 /// Use this as a safety net (manually or via pg_cron) to fix drift.
 #[pg_extern]
@@ -964,12 +991,23 @@ extension_sql!(
         _affected TEXT[] := ARRAY[]::TEXT[];
         _synced_keys TEXT[] := ARRAY[]::TEXT[];
         _sync_key TEXT;
+        _reconcile_root TEXT;
     BEGIN
         _policy := lower(COALESCE(NULLIF(current_setting('pg_reflex.alter_source_policy', true), ''), 'warn'));
         IF _policy NOT IN ('warn', 'error') THEN
             RAISE WARNING 'pg_reflex: invalid pg_reflex.alter_source_policy=%, falling back to ''warn''', _policy;
             _policy := 'warn';
         END IF;
+
+        -- Root whose chain reflex_reconcile is currently rebuilding, set by that
+        -- function around its DISABLE/ENABLE TRIGGER of each generated sub-IMV.
+        -- Those internal ALTERs are on tracked sources (a generated child sits in
+        -- its parent's depends_on), so the warn/error branch below would fire a
+        -- spurious "run reflex_rebuild_imv" for a rebuild already in flight and,
+        -- under 'error' policy, abort the reconcile outright. Suppressed for the
+        -- nodes of the active chain only — a DIFFERENT root that reads the same
+        -- node still warns, because that consumer really did miss the refresh.
+        _reconcile_root := NULLIF(current_setting('pg_reflex.internal_reconcile_root', true), '');
 
         -- 1.6.0: auto-sync IMV partitions when a source's partition tree changes.
         --
@@ -1106,6 +1144,21 @@ extension_sql!(
                 WHERE depends_on @> ARRAY[_src]
                    OR depends_on @> ARRAY[split_part(_src, '.', 2)]
             LOOP
+                -- Skip pg_reflex's own DISABLE/ENABLE TRIGGER on a generated
+                -- sub-IMV of the chain being reconciled: the consumer named here
+                -- is that same chain's root or an intermediate generated node of
+                -- it, and it is about to be rebuilt. A consumer on a DIFFERENT
+                -- root does not match this prefix, so its legitimate stale signal
+                -- still fires.
+                IF _reconcile_root IS NOT NULL
+                   AND ( _imv.name = _reconcile_root
+                         OR split_part(_imv.name, '.', 2)
+                            = split_part(_reconcile_root, '.', 2)
+                         OR split_part(_imv.name, '.', 2)
+                            LIKE split_part(_reconcile_root, '.', 2) || '\_\_%' )
+                THEN
+                    CONTINUE;
+                END IF;
                 _affected := _affected || (_src || ' -> ' || _imv.name);
                 IF _policy = 'warn' THEN
                     RAISE WARNING 'pg_reflex: source table % was altered; IMV % may be stale — run SELECT reflex_rebuild_imv(''%'') to recover',
@@ -1437,6 +1490,7 @@ mod tests {
     include!("tests/pg_test_registry.rs");
     include!("tests/pg_test_doctor.rs");
     include!("tests/pg_test_rebuild_chain.rs");
+    include!("tests/pg_test_decomposed_chain.rs");
 }
 
 /// This module is required by `cargo pgrx test` invocations.
