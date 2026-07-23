@@ -534,12 +534,17 @@ pub(crate) fn reflex_rebuild_chain_impl(view_name: &str, cascade: bool) -> Strin
         // mode, refresh mode and partitioning. Refuse up front, before the drop.
         if create_args_unusable(&create_args_json) {
             return Err(format!(
-                "IMV '{v}' has no stored create_args (created before 1.10.8). \
-                 Recreating it would silently reset its storage mode, refresh mode \
-                 and partitioning. Run the 1.11.0 migration to backfill create_args, \
-                 or drop and recreate from the original spec: \
+                "IMV '{v}' has no usable create_args. Recreating it would silently \
+                 reset its storage mode, refresh mode and partitioning. To refresh it \
+                 without a structural rebuild, run: SELECT reflex_reconcile('{v}'); \
+                 to rebuild its structure, drop and recreate from the original spec: \
                  SELECT drop_reflex_ivm('{v}', true); then re-run the original \
-                 create_reflex_ivm.",
+                 create_reflex_ivm. The 1.11.0 migration backfills create_args for \
+                 legacy aggregate/join IMVs, but not for set-op / DISTINCT-ON / window \
+                 wrappers (aggregations = '{{}}'): for a decomposed parent still in the \
+                 pre-repair window this refusal self-resolves once \
+                 SELECT reflex_repair_dependency_graph(); has run (it is then caught by \
+                 the more specific decomposed-parent guard).",
                 v = view_name
             ));
         }
@@ -831,7 +836,12 @@ fn is_decomposed_parent(client: &SpiClient<'_>, view_name: &str) -> bool {
             it.next()
                 .and_then(|r| r.get_by_name::<bool, _>("decomposed").ok().flatten())
         })
-        .unwrap_or(false)
+        // Fail CLOSED: an SPI error or an unexpected shape means we could not prove
+        // the parent is NOT decomposed, so treat it as decomposed and refuse rather
+        // than proceed to a CASCADE drop that a decomposed parent cannot survive.
+        // The EXISTS query always yields one non-NULL bool, so None here is a real
+        // fault, not an empty result — refusing on it is correctness-first.
+        .unwrap_or(true)
 }
 
 /// Dependents of `view_name` registered in `__reflex_ivm_reference`, shallowest

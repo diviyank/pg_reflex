@@ -331,4 +331,73 @@ fn pg_rebuild_chain_backfilled_row_warns_lossy_fields() {
     );
 }
 
-// FINDING4_PLACEHOLDER
+/// Finding 4: the backfill round-trip must also preserve partitioning, not only
+/// DEFERRED + the unique key. A partitioned aggregate IMV whose create_args is
+/// nulled (pre-1.10.8 shape) then backfilled from `partition_columns` must,
+/// after reflex_rebuild_chain, come back as a partitioned target with the same
+/// partition key.
+#[pg_test]
+fn pg_rebuild_chain_backfill_reconstructs_partitioning_from_columns() {
+    Spi::run(
+        "CREATE TABLE rbp_src (id BIGINT, region TEXT NOT NULL, amount NUMERIC) PARTITION BY LIST (region)",
+    )
+    .expect("partitioned source");
+    Spi::run("CREATE TABLE rbp_src_north PARTITION OF rbp_src FOR VALUES IN ('NORTH')")
+        .expect("child north");
+    Spi::run("CREATE TABLE rbp_src_south PARTITION OF rbp_src FOR VALUES IN ('SOUTH')")
+        .expect("child south");
+    Spi::run("INSERT INTO rbp_src (id, region, amount) VALUES (1,'NORTH',100),(2,'NORTH',200),(3,'SOUTH',50)")
+        .expect("seed");
+    let create_result = Spi::get_one::<String>(
+        "SELECT create_reflex_ivm('rbp_view', \
+             'SELECT region, SUM(amount) AS total FROM rbp_src GROUP BY region', \
+             NULL, NULL, NULL, NULL, ARRAY['region'])",
+    )
+    .expect("create call")
+    .expect("create result");
+    assert!(!create_result.starts_with("ERROR"), "create returned: {create_result}");
+
+    // Simulate a pre-1.10.8 row and apply the migration backfill.
+    Spi::run("UPDATE public.__reflex_ivm_reference SET create_args = NULL WHERE name = 'rbp_view'")
+        .expect("null create_args");
+    Spi::run(
+        "UPDATE public.__reflex_ivm_reference SET create_args = json_build_object( \
+             'unique_columns_str', array_to_string( \
+                 CASE WHEN unique_columns IS NOT NULL AND cardinality(unique_columns) > 0 \
+                      THEN unique_columns ELSE index_columns END, ','), \
+             'storage_mode', COALESCE(storage_mode, 'UNLOGGED'), \
+             'refresh_mode', COALESCE(refresh_mode, 'IMMEDIATE'), \
+             'ignore_sources', to_json(COALESCE(ignored_sources, ARRAY[]::TEXT[])), \
+             'partition_by', to_json(COALESCE(partition_columns, ARRAY[]::TEXT[])), \
+             'backfilled', TRUE)::text \
+           WHERE create_args IS NULL \
+             AND COALESCE(is_generated_sub_imv, FALSE) = FALSE \
+             AND COALESCE(aggregations::text, '{}') <> '{}'",
+    )
+    .expect("backfill");
+
+    let part_by = Spi::get_one::<String>(
+        "SELECT (create_args::jsonb)->'partition_by'->>0 FROM public.__reflex_ivm_reference WHERE name = 'rbp_view'",
+    )
+    .expect("q")
+    .expect("v");
+    assert_eq!(part_by, "region", "backfill must recover the partition key");
+
+    let out = crate::reflex_rebuild_chain("rbp_view", false);
+    assert!(!out.starts_with("ERROR"), "rebuild of a partitioned backfilled row must succeed, got: {out}");
+
+    let strategy = Spi::get_one::<String>(
+        "SELECT pt.partstrat::text FROM pg_partitioned_table pt \
+         JOIN pg_class c ON c.oid = pt.partrelid WHERE c.relname = 'rbp_view'",
+    )
+    .expect("strategy query")
+    .expect("strategy");
+    assert_eq!(strategy, "l", "rebuilt target must stay LIST partitioned");
+
+    let part_cols: Vec<String> = Spi::get_one::<Vec<String>>(
+        "SELECT partition_columns FROM public.__reflex_ivm_reference WHERE name = 'rbp_view'",
+    )
+    .expect("catalog query")
+    .expect("part_cols");
+    assert_eq!(part_cols, vec!["region".to_string()], "rebuild must preserve the partition key");
+}
