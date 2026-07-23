@@ -1040,3 +1040,144 @@ fn ps4_drain_stamps_last_attempt_at_on_failure() {
     .unwrap_or(0);
     assert_eq!(failures, 1, "the failed drain must have counted a failure");
 }
+
+#[pg_test]
+fn ps4_enqueue_counter_is_not_a_failure_counter() {
+    // `attempts` counts partition ATTACHes, not drain attempts. A busy but
+    // healthy root crosses any retry threshold within a day and must not be
+    // reported as wedged.
+    Spi::run(
+        "INSERT INTO public.__reflex_partition_pending \
+             (source_root, attempts, failures, enqueued_at) \
+         VALUES ('ps4_busy.root', 9, 0, now())",
+    )
+    .expect("seed");
+    let n: i64 = Spi::get_one(
+        "SELECT count(*) FROM reflex_doctor() \
+         WHERE object = 'ps4_busy.root' AND check_id IN ('F1','F2')",
+    )
+    .expect("q")
+    .unwrap_or(-1);
+    assert_eq!(n, 0, "9 enqueues with 0 drain failures is not a finding");
+}
+
+#[pg_test]
+fn ps4_drain_failures_classify_as_f2() {
+    Spi::run(
+        "INSERT INTO public.__reflex_partition_pending \
+             (source_root, attempts, failures, enqueued_at) \
+         VALUES ('ps4_wedged.root', 0, 5, now())",
+    )
+    .expect("seed");
+    let n: i64 = Spi::get_one(
+        "SELECT count(*) FROM reflex_doctor() \
+         WHERE object = 'ps4_wedged.root' AND check_id = 'F2'",
+    )
+    .expect("q")
+    .unwrap_or(-1);
+    assert_eq!(n, 1, "5 drain failures with 0 enqueues is F2");
+}
+
+#[pg_test]
+fn ps4_capped_root_says_auto_retry_suppressed() {
+    Spi::run(
+        "INSERT INTO public.__reflex_partition_pending \
+             (source_root, failures, enqueued_at) VALUES ('ps4_capped.root', 5, now())",
+    )
+    .expect("seed");
+    let n: i64 = Spi::get_one(
+        "SELECT count(*) FROM reflex_doctor() \
+         WHERE object = 'ps4_capped.root' AND finding LIKE '%auto-retry suppressed%'",
+    )
+    .expect("q")
+    .unwrap_or(-1);
+    assert_eq!(
+        n, 1,
+        "at the failure cap the finding must say auto-retry has stopped"
+    );
+}
+
+#[pg_test]
+fn ps4_finding_age_comes_from_last_attempt_not_enqueue() {
+    // enqueued_at fresh (a re-enqueue bumped it), last drain attempt 3 days old.
+    // An enqueued_at-derived age would report ~0s over a 3-day-old failure.
+    Spi::run(
+        "INSERT INTO public.__reflex_partition_pending \
+             (source_root, attempts, failures, enqueued_at, last_attempt_at) \
+         VALUES ('ps4_dated.root', 40, 3, now(), now() - interval '3 days')",
+    )
+    .expect("seed");
+    let n: i64 = Spi::get_one(
+        "SELECT count(*) FROM reflex_doctor() \
+         WHERE object = 'ps4_dated.root' AND check_id = 'F2' \
+           AND finding ~ 'last drain attempt 2[0-9]{5}s ago'",
+    )
+    .expect("q")
+    .unwrap_or(-1);
+    assert_eq!(n, 1, "the reported age must be derived from last_attempt_at");
+}
+
+#[pg_test]
+fn ps4_never_attempted_row_is_f1() {
+    Spi::run(
+        "INSERT INTO public.__reflex_partition_pending \
+             (source_root, failures, enqueued_at) \
+         VALUES ('ps4_rearm.root', 0, now() - interval '3 days')",
+    )
+    .expect("seed");
+    let n: i64 = Spi::get_one(
+        "SELECT count(*) FROM reflex_doctor() \
+         WHERE object = 'ps4_rearm.root' AND check_id = 'F1' \
+           AND finding LIKE '%never attempted%'",
+    )
+    .expect("q")
+    .unwrap_or(-1);
+    assert_eq!(
+        n, 1,
+        "an old row that no drain ever touched is F1 / never attempted"
+    );
+}
+
+#[pg_test]
+fn ps4_recently_retried_row_is_not_reported() {
+    Spi::run(
+        "INSERT INTO public.__reflex_partition_pending \
+             (source_root, failures, enqueued_at, last_attempt_at) \
+         VALUES ('ps4_retried.root', 1, now() - interval '3 days', now())",
+    )
+    .expect("seed");
+    let n: i64 = Spi::get_one(
+        "SELECT count(*) FROM reflex_doctor() \
+         WHERE object = 'ps4_retried.root' AND check_id IN ('F1','F2')",
+    )
+    .expect("q")
+    .unwrap_or(-1);
+    assert_eq!(
+        n, 0,
+        "a root retried a moment ago is not a stuck-queue finding"
+    );
+}
+
+#[pg_test]
+fn ps4_finding_dates_the_wedge_from_stale_since() {
+    Spi::run(
+        "INSERT INTO public.__reflex_partition_pending \
+             (source_root, failures, enqueued_at) VALUES ('ps4_join.root', 5, now())",
+    )
+    .expect("seed");
+    Spi::run(
+        "INSERT INTO public.__reflex_ivm_reference \
+             (name, graph_depth, depends_on, enabled, known_stale, stale_reason, stale_since) \
+         VALUES ('ps4_join_imv', 0, ARRAY['ps4_join.root'], TRUE, TRUE, 'boom', \
+                 '2026-07-21 16:20:00+00')",
+    )
+    .expect("seed imv");
+    let n: i64 = Spi::get_one(
+        "SELECT count(*) FROM reflex_doctor() \
+         WHERE object = 'ps4_join.root' \
+           AND finding LIKE '%dependent IMVs stale since 2026-07-21%'",
+    )
+    .expect("q")
+    .unwrap_or(-1);
+    assert_eq!(n, 1, "the finding must date the wedge from stale_since");
+}
