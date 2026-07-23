@@ -995,3 +995,27 @@ fn ps4_pending_queue_has_last_attempt_at_column() {
         "__reflex_partition_pending must carry last_attempt_at"
     );
 }
+
+#[pg_test]
+fn ps4_drain_stamps_last_attempt_at_on_failure() {
+    // A pending root that is not a relation at all: the drain attempts it, the
+    // attempt fails, and the surviving row must carry the timestamp of that
+    // attempt — otherwise nothing in the queue can date a failure.
+    Spi::run(
+        "INSERT INTO public.__reflex_partition_pending (source_root) \
+         VALUES ('ps4_nonexistent.root')",
+    )
+    .expect("seed");
+    let _ = Spi::get_one::<String>("SELECT reflex_flush_partitions()");
+
+    let stamped: bool = Spi::get_one(
+        "SELECT last_attempt_at IS NOT NULL FROM public.__reflex_partition_pending \
+         WHERE source_root = 'ps4_nonexistent.root'",
+    )
+    .expect("q")
+    .unwrap_or(false);
+    assert!(
+        stamped,
+        "the drain must stamp last_attempt_at on a root it attempted"
+    );
+}
