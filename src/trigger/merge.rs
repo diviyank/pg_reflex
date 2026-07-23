@@ -730,6 +730,153 @@ pub(crate) fn null_safe_in(
     )
 }
 
+/// PS-5 — the runtime NULL-freeness probe on the affected-groups table.
+///
+/// Returns `EXISTS (SELECT 1 FROM <affected> AS __ng WHERE <col> IS NULL OR ...)`
+/// over the NULLABLE key columns only, or `None` when every key column is known
+/// NOT NULL (in which case `null_safe_in` already emits a fully sargable `=`
+/// match and no specialisation is needed).
+///
+/// The probe is deliberately **uncorrelated** — it references only `__ng`, never
+/// the outer relation or the `__a` scope. That is what makes PostgreSQL evaluate
+/// it once as an `InitPlan`, mark the qual `pseudoconstant`, and hoist it into a
+/// gating `Result / One-Time Filter` above the whole join, so the untaken
+/// variant's subtree is reported `(never executed)`. A correlated probe would be
+/// re-evaluated per outer row and buy nothing.
+fn affected_null_key_gate(
+    affected_tbl: &str,
+    affected_cols: &[String],
+    not_null_columns: &std::collections::HashSet<String>,
+) -> Option<String> {
+    let nullable: Vec<&String> = affected_cols
+        .iter()
+        .filter(|c| !not_null_columns.contains(c.trim_matches('"')))
+        .collect();
+    if nullable.is_empty() {
+        return None;
+    }
+    let disjunction = nullable
+        .iter()
+        .map(|c| format!("__ng.{} IS NULL", c))
+        .collect::<Vec<_>>()
+        .join(" OR ");
+    Some(format!(
+        "EXISTS (SELECT 1 FROM {} AS __ng WHERE {})",
+        affected_tbl, disjunction
+    ))
+}
+
+/// PS-5 — mutually exclusive alternatives for the same logical affected-groups
+/// match, so the common case gets an index-usable plan.
+///
+/// `IS NOT DISTINCT FROM` is not a member of any operator family, so it can
+/// serve neither an `Index Cond` nor a hash/merge join key: the planner's only
+/// option is a nested loop with a `Join Filter` over the entire target, making
+/// the target sync `O(total_groups × affected_groups)`. Measured on a
+/// 200 000-group nullable-key fixture (PG 17.7): 52 ms for a 1-row delta, and
+/// **681 576 ms** with 50 000 affected groups (`Rows Removed by Join Filter:
+/// 8 749 975 000`) against **57 ms** for the same statement with `=`.
+///
+/// Nullable group keys are the norm, not the exception: expression keys, any
+/// column reached through a LEFT/RIGHT JOIN, and every decomposed sub-IMV target
+/// (the decomposer creates those with no NOT NULL constraints at all, so a
+/// decomposed parent is permanently on this path).
+///
+/// The specialisation is sound because, for any affected row whose key is
+/// non-NULL, `t.k IS NOT DISTINCT FROM a.k` and `t.k = a.k` select exactly the
+/// same rows: with `t.k` non-NULL both reduce to value equality, and with
+/// `t.k IS NULL` the former is false while the latter is NULL — neither is
+/// *true*, so both exclude the row. Hence if the affected table holds no NULL
+/// key the two predicates are interchangeable; the gate decides that at runtime,
+/// from the data itself.
+///
+/// This reads data only to choose between two forms that agree *on that data* —
+/// it never records a conclusion that could later become false, which is how it
+/// differs from the unsound NOT-NULL *inference* that
+/// `project_differential_fuzz_harness_2026_05_22` caught.
+///
+/// An ungated `=` would be wrong: with target `{1, 2, NULL}` and affected
+/// `{NULL}`, `IS NOT DISTINCT FROM` selects the NULL group and `=` selects
+/// nothing, so the NULL group's stale target row would survive the DELETE and
+/// never be re-inserted. Pinned by
+/// `pg_test_correctness.rs::test_correctness_null_group_key_gate_branch_boundary`.
+pub(crate) struct AffectedMatch {
+    /// Sargable `=` form, self-gated on the affected set containing no NULL key.
+    /// When no key column is nullable this is ungated and the only variant.
+    pub fast: String,
+    /// NULL-safe form, self-gated on the affected set *having* a NULL key.
+    /// `None` when no key column is nullable.
+    pub safe: Option<String>,
+}
+
+impl AffectedMatch {
+    /// Expand a statement template into one statement per live variant.
+    ///
+    /// Callers emit every returned statement unconditionally; the gates make
+    /// exactly one of them do work, and PostgreSQL skips the other's plan via a
+    /// `One-Time Filter` (0.013–0.029 ms measured). The gate travels inside the
+    /// SQL string, so this works identically for a statement pushed directly, one
+    /// run via `EXECUTE`, and one run via `EXECUTE ... USING $1` — a `DO`-block
+    /// branch could not serve the last of those, since a `DO` block takes no
+    /// parameters.
+    pub fn stmts(&self, build: impl Fn(&str) -> String) -> Vec<String> {
+        let mut out = vec![build(&self.fast)];
+        if let Some(safe) = &self.safe {
+            out.push(build(safe));
+        }
+        out
+    }
+}
+
+/// PS-5 — `null_safe_in`, specialised into a gated fast/safe pair. See
+/// `AffectedMatch` for why, and `null_safe_in` for the argument contract (the
+/// outer-qualification invariant from `journal/2026-05-13_null_safe_in_bug.md`
+/// applies unchanged — the safe variant *is* `null_safe_in`).
+pub(crate) fn null_safe_in_gated(
+    affected_tbl: &str,
+    outer_qualifier: &str,
+    outer_cols: &[String],
+    affected_cols: &[String],
+    not_null_columns: &std::collections::HashSet<String>,
+) -> AffectedMatch {
+    let safe_match = null_safe_in(
+        affected_tbl,
+        outer_qualifier,
+        outer_cols,
+        affected_cols,
+        not_null_columns,
+    );
+    let Some(gate) = affected_null_key_gate(affected_tbl, affected_cols, not_null_columns) else {
+        // Every key column is NOT NULL: `null_safe_in` already emitted `=`
+        // throughout, so it is the sargable form and no gate is needed. Keeping
+        // this byte-for-byte identical means existing NOT NULL IMVs see no SQL
+        // change at all.
+        return AffectedMatch {
+            fast: safe_match,
+            safe: None,
+        };
+    };
+
+    // The fast variant forces `=` on EVERY key column, which is only valid under
+    // the gate. Build it by treating all affected columns as NOT NULL.
+    let all_not_null: std::collections::HashSet<String> = affected_cols
+        .iter()
+        .map(|c| c.trim_matches('"').to_string())
+        .collect();
+    let fast_match = null_safe_in(
+        affected_tbl,
+        outer_qualifier,
+        outer_cols,
+        affected_cols,
+        &all_not_null,
+    );
+
+    AffectedMatch {
+        fast: format!("{} AND NOT {}", fast_match, gate),
+        safe: Some(format!("{} AND {}", safe_match, gate)),
+    }
+}
+
 /// Splice a SQL fragment (already formatted as ` AND (...)` or similar) into a
 /// query immediately before its `GROUP BY` clause. If the query has no
 /// existing `WHERE` clause between `FROM` and `GROUP BY`, the leading `AND`
@@ -797,6 +944,37 @@ pub(crate) fn inject_affected_filter_before_group_by(
         filter,
         &end_query[pos..]
     ))
+}
+
+/// PS-5 — gated sibling of `inject_affected_filter_before_group_by`: returns one
+/// spliced `end_query` per live variant of the affected-groups match.
+///
+/// The gate lands in the **pre-`GROUP BY`** WHERE alongside the match, which is
+/// where it has to be for the filter to scope the intermediate scan rather than
+/// the aggregation output. Verified that PostgreSQL still hoists it: the
+/// `One-Time Filter` appears inside the `GroupAggregate` and the untaken
+/// variant's `Nested Loop Semi Join` is `(never executed)`.
+///
+/// Returns `None` if `end_query` contains no ` GROUP BY ` marker (same defensive
+/// fallback as the ungated form).
+pub(crate) fn inject_affected_filter_before_group_by_gated(
+    end_query: &str,
+    output_gb_cols: &[String],
+    affected_tbl: &str,
+    outer_qualifier: &str,
+    not_null_columns: &std::collections::HashSet<String>,
+) -> Option<Vec<String>> {
+    let upper = end_query.to_uppercase();
+    let gb_marker = " GROUP BY ";
+    let pos = upper.rfind(gb_marker)?;
+    let m = null_safe_in_gated(
+        affected_tbl,
+        outer_qualifier,
+        output_gb_cols,
+        output_gb_cols,
+        not_null_columns,
+    );
+    Some(m.stmts(|filter| format!("{} AND {}{}", &end_query[..pos], filter, &end_query[pos..])))
 }
 
 /// Build the group column list for targeted refresh.
