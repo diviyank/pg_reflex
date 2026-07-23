@@ -568,3 +568,351 @@ fn pg_scheduled_reconcile_does_not_revisit_covered_generated_children() {
         "SELECT grp, COUNT(*) AS cnt, SUM(val) AS total FROM dcb_src GROUP BY grp",
     );
 }
+
+/// PS-1 REVIEW BLOCKING 1 (S1, silent data corruption) — a UNION-ALL CTE is
+/// materialised by `install_union_all_intermediate_wrapper` as
+/// `(__reflex_src_idx SMALLINT NOT NULL, <payload…>)` but registered with
+/// `base_query = 'SELECT * FROM op0 UNION ALL SELECT * FROM op1'` and an empty
+/// `end_query`. Handing that to `reconcile_one` takes the passthrough branch,
+/// which runs `INSERT INTO <wrapper> SELECT * FROM …` — N payload values into an
+/// N+1-column table. PostgreSQL left-shifts rather than rejecting when the types
+/// line up, and raises a hard `ereport` when they do not; either way the node the
+/// parent is then rebuilt from is wrong, and the call still says RECONCILED.
+///
+/// `RegistryRow::decomposed` nodes are not `reconcile_one`-rebuildable. The
+/// recursion must skip them. Rebuilding them correctly is a separate pre-spec.
+#[pg_test]
+fn pg_reconcile_skips_decomposed_union_all_wrapper_node() {
+    Spi::run(
+        "CREATE TABLE dcu_us(id INT PRIMARY KEY, country TEXT, amount NUMERIC); \
+         CREATE TABLE dcu_eu(id INT PRIMARY KEY, country TEXT, amount NUMERIC); \
+         INSERT INTO dcu_us VALUES (1,'US',100),(2,'US',50); \
+         INSERT INTO dcu_eu VALUES (1,'FR',200),(2,'DE',25);",
+    )
+    .expect("seed");
+
+    let res = crate::create_reflex_ivm(
+        "dcu_imv",
+        "WITH all_ord AS ( \
+             SELECT id, country, amount FROM dcu_us \
+             UNION ALL \
+             SELECT id, country, amount FROM dcu_eu \
+         ) \
+         SELECT country, SUM(amount) AS total FROM all_ord GROUP BY country",
+        None,
+        Some("UNLOGGED"),
+        None,
+        None,
+    );
+    assert_eq!(res, "CREATE REFLEX INCREMENTAL VIEW");
+
+    // The wrapper is a decomposed node: `aggregations` is the literal '{}' that
+    // `RegistryRow::decomposed` writes. Pin that, because the skip predicate
+    // depends on it distinguishing wrappers from passthrough sub-IMVs.
+    let wrapper_aggs = Spi::get_one::<String>(
+        "SELECT aggregations::text FROM public.__reflex_ivm_reference \
+          WHERE name = 'dcu_imv__cte_all_ord'",
+    )
+    .expect("q")
+    .expect("v");
+    assert_eq!(
+        wrapper_aggs, "{}",
+        "wrapper must be recognisable as a decomposed node"
+    );
+
+    let src_idx_before = Spi::get_one::<i64>(
+        "SELECT COUNT(*) FROM dcu_imv__cte_all_ord WHERE __reflex_src_idx IN (0,1)",
+    )
+    .expect("q")
+    .expect("v");
+    assert_eq!(src_idx_before, 4, "wrapper should hold 4 tagged payload rows");
+
+    // Pre-fix this either left-shifts the wrapper's columns or aborts the
+    // transaction on a type mismatch.
+    let status = Spi::get_one::<String>("SELECT reflex_rebuild_imv('dcu_imv')")
+        .expect("q")
+        .expect("v");
+    assert_eq!(status, "RECONCILED");
+
+    let src_idx_after = Spi::get_one::<i64>(
+        "SELECT COUNT(*) FROM dcu_imv__cte_all_ord WHERE __reflex_src_idx IN (0,1)",
+    )
+    .expect("q")
+    .expect("v");
+    assert_eq!(
+        src_idx_after, 4,
+        "reconcile must not disturb the wrapper's __reflex_src_idx tagging"
+    );
+
+    assert_imv_correct(
+        "dcu_imv",
+        "SELECT country, SUM(amount) AS total FROM ( \
+             SELECT id, country, amount FROM dcu_us \
+             UNION ALL SELECT id, country, amount FROM dcu_eu) u GROUP BY country",
+    );
+}
+
+/// PS-1 REVIEW BLOCKING 2 (S2) — the `relkind` probe passed an UNQUOTED name to
+/// `to_regclass`, which down-cases, so for any IMV whose name needs quoting the
+/// probe returned NULL, `triggerable` came out false, and the child was rebuilt
+/// with its triggers LIVE. In DEFERRED mode that reinstates exactly the
+/// COMMIT-time double-count the suppression exists to prevent — silently, still
+/// returning RECONCILED. The codebase persists sub-IMV sources double-quoted
+/// precisely to preserve identifier case (`query_decomposer.rs:18-23`).
+#[pg_test]
+fn pg_reconcile_suppresses_triggers_for_mixed_case_child_deferred() {
+    Spi::run("CREATE TABLE dcm_src (id INT, grp TEXT, val NUMERIC)").expect("create src");
+    Spi::run("INSERT INTO dcm_src SELECT g, 'g' || (g % 5), 10 FROM generate_series(1,200) g")
+        .expect("seed");
+
+    crate::create_reflex_ivm(
+        "MixedCase_Agg",
+        "WITH base AS (SELECT id, grp, val FROM dcm_src) \
+         SELECT grp, COUNT(*) AS cnt, SUM(val) AS total FROM base GROUP BY grp",
+        Some("grp"),
+        Some("UNLOGGED"),
+        Some("DEFERRED"),
+        None,
+    );
+
+    // The bug in one line: the unquoted probe cannot see this relation.
+    let unquoted_probe_blind = Spi::get_one::<bool>(
+        "SELECT to_regclass('MixedCase_Agg__cte_base') IS NULL",
+    )
+    .expect("q")
+    .expect("v");
+    assert!(
+        unquoted_probe_blind,
+        "fixture must exercise a name that an unquoted to_regclass cannot resolve"
+    );
+
+    let status = Spi::get_one::<String>("SELECT reflex_rebuild_imv('MixedCase_Agg')")
+        .expect("q")
+        .expect("v");
+    assert_eq!(status, "RECONCILED");
+
+    // Suppression must have left no staged delta for the child. A pgrx test never
+    // commits, so the COMMIT-time flush must be driven by hand or the
+    // double-count is unobservable.
+    let pending_for_child = Spi::get_one::<i64>(
+        "SELECT COUNT(*) FROM public.__reflex_deferred_pending \
+          WHERE source_table LIKE '%MixedCase_Agg__cte_base%'",
+    )
+    .expect("q")
+    .expect("v");
+    assert_eq!(
+        pending_for_child, 0,
+        "suppressed child must stage no deferred delta"
+    );
+
+    // Cheap regression guard: the DISABLE must not leak past the rebuild.
+    let disabled_triggers = Spi::get_one::<i64>(
+        "SELECT COUNT(*) FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid \
+          WHERE c.relname = 'MixedCase_Agg__cte_base' \
+            AND NOT t.tgisinternal AND t.tgenabled = 'D'",
+    )
+    .expect("q")
+    .expect("v");
+    assert_eq!(disabled_triggers, 0, "trigger suppression leaked past reconcile");
+
+    drain_deferred_pending();
+    assert_imv_correct(
+        "\"MixedCase_Agg\"",
+        "SELECT grp, COUNT(*) AS cnt, SUM(val) AS total FROM dcm_src GROUP BY grp",
+    );
+}
+
+/// PS-1 REVIEW BLOCKING 3 — warn-and-continue plus a `"RECONCILED"` return makes
+/// a failed generated-child rebuild invisible. Merged with PS-4, whose
+/// `verify_stale_cleared` checks only `known_stale` on the NAMED IMV (which the
+/// parent's own rebuild just cleared), `reflex_doctor(fix => TRUE)` would report a
+/// *verified* repair over a parent re-derived from a stale child. The child was
+/// never `known_stale` — that is B2's whole finding — so nothing else catches it.
+/// `reflex_reconcile` must therefore surface the failure in its return value.
+#[pg_test]
+fn pg_reconcile_reports_error_when_generated_child_fails() {
+    Spi::run("CREATE TABLE dcf_src (id INT, grp TEXT, val NUMERIC)").expect("create src");
+    Spi::run("INSERT INTO dcf_src VALUES (1,'a',10)").expect("seed");
+
+    crate::create_reflex_ivm(
+        "dcf_top",
+        "WITH base AS (SELECT id, grp, val FROM dcf_src) \
+         SELECT grp, SUM(val) AS total FROM base GROUP BY grp",
+        Some("grp"),
+        None,
+        None,
+        None,
+    );
+
+    // A generated child whose name `validate_view_name` rejects, so
+    // `reconcile_one` returns its soft "ERROR: …" string rather than raising.
+    // Non-empty `aggregations` so the BLOCKING-1 decomposed-node skip keeps it in
+    // the recursion set.
+    Spi::run(
+        "INSERT INTO public.__reflex_ivm_reference \
+             (name, graph_depth, depends_on, aggregations, enabled, is_generated_sub_imv) \
+         VALUES ('dcf_top__cte_bad-name', 1, ARRAY['dcf_src'], \
+                 '{\"is_passthrough\": true}'::jsonb, TRUE, TRUE)",
+    )
+    .expect("insert synthetic child");
+    Spi::run(
+        "UPDATE public.__reflex_ivm_reference \
+            SET depends_on_imv = ARRAY['dcf_top__cte_bad-name'] WHERE name = 'dcf_top'",
+    )
+    .expect("link child");
+
+    let status = Spi::get_one::<String>("SELECT reflex_reconcile('dcf_top')")
+        .expect("q")
+        .expect("v");
+    assert!(
+        status.starts_with("ERROR"),
+        "a failed generated-child rebuild must not be reported as success, got: {status}"
+    );
+}
+
+/// PS-1 REVIEW — `generated_dependencies_shallowest_first` relies on `UNION` to
+/// dedupe a generated child shared by two consumers, but every other fixture here
+/// is a linear chain. The codebase has a real diamond
+/// (`<root>__cte_date_limits`, `drop_ivm.rs:69-72`).
+#[pg_test]
+fn pg_reconcile_diamond_shares_one_generated_child() {
+    Spi::run("CREATE TABLE dcd_src (id INT, grp TEXT, val NUMERIC)").expect("create src");
+    Spi::run("INSERT INTO dcd_src SELECT g, 'g' || (g % 4), 1 FROM generate_series(1,80) g")
+        .expect("seed");
+
+    let res = crate::create_reflex_ivm(
+        "dcd_top",
+        "WITH shared AS (SELECT id, grp, val FROM dcd_src), \
+              left_leg  AS (SELECT id, grp, val FROM shared), \
+              right_leg AS (SELECT id, grp, val FROM shared) \
+         SELECT l.grp, COUNT(*) AS cnt \
+           FROM left_leg l JOIN right_leg r ON l.id = r.id GROUP BY l.grp",
+        Some("grp"),
+        None,
+        None,
+        None,
+    );
+    if !res.starts_with("CREATE REFLEX") {
+        assert!(
+            res.contains(crate::REFLEX_UNSUPPORTED_TAG),
+            "unexpected create failure: {res}"
+        );
+        return;
+    }
+
+    // `shared` is read by both legs, so it must appear once in the reconcile set.
+    let shared_consumers = Spi::get_one::<i64>(
+        "SELECT COUNT(*) FROM public.__reflex_ivm_reference \
+          WHERE 'dcd_top__cte_shared' = ANY(depends_on_imv)",
+    )
+    .expect("q")
+    .expect("v");
+    assert_eq!(shared_consumers, 2, "fixture must be a real diamond");
+
+    let status = Spi::get_one::<String>("SELECT reflex_rebuild_imv('dcd_top')")
+        .expect("q")
+        .expect("v");
+    assert_eq!(status, "RECONCILED");
+
+    assert_imv_correct(
+        "dcd_top",
+        "SELECT l.grp, COUNT(*) AS cnt FROM dcd_src l JOIN dcd_src r ON l.id = r.id \
+         GROUP BY l.grp",
+    );
+}
+
+/// PS-1 (D9) — the DISTINCT-ON / window half of the hard-coded-depth fix. The
+/// set-op half is covered by `pg_decomposed_set_op_depth_reflects_operand_depth`;
+/// these two paths used a literal `2` (`decompose.rs`), which is wrong as soon as
+/// the `__base` sub-IMV is itself decomposed.
+#[pg_test]
+fn pg_decomposed_window_depth_reflects_base_depth() {
+    Spi::run("CREATE TABLE dcw_src (id INT, grp TEXT, val NUMERIC)").expect("create src");
+    Spi::run("INSERT INTO dcw_src VALUES (1,'a',10),(2,'a',20),(3,'b',30)").expect("seed");
+
+    // The window base is itself CTE-decomposed, so `__base` lands at depth 2 and
+    // the window VIEW above it must be 3 — not the old literal 2.
+    let res = crate::create_reflex_ivm(
+        "dcw_top",
+        "WITH base AS (SELECT id, grp, val FROM dcw_src) \
+         SELECT grp, SUM(val) AS total, ROW_NUMBER() OVER (ORDER BY grp) AS rn \
+           FROM base GROUP BY grp",
+        None,
+        None,
+        None,
+        None,
+    );
+    if !res.starts_with("CREATE REFLEX") {
+        assert!(
+            res.contains(crate::REFLEX_UNSUPPORTED_TAG),
+            "unexpected create failure: {res}"
+        );
+        return;
+    }
+
+    let top_depth = Spi::get_one::<i32>(
+        "SELECT graph_depth FROM public.__reflex_ivm_reference WHERE name = 'dcw_top'",
+    )
+    .expect("q")
+    .expect("v");
+    let base_depth = Spi::get_one::<i32>(
+        "SELECT graph_depth FROM public.__reflex_ivm_reference WHERE name = 'dcw_top__base'",
+    )
+    .expect("q")
+    .expect("v");
+    assert_eq!(
+        top_depth,
+        base_depth + 1,
+        "window wrapper must sit exactly one level above its __base ({base_depth})"
+    );
+    assert!(
+        base_depth >= 2,
+        "the __base is itself decomposed, so it should be deeper than 1, got {base_depth}"
+    );
+}
+
+/// PS-1 (D6-revised) — the "covered by a candidate" filter must NOT drop a
+/// generated child whose consumer is fresh enough to be absent from the batch,
+/// or that child would never be reconciled at all. This is the hole D6 cited as
+/// the reason not to filter; the filter is keyed on coverage precisely to close it.
+#[pg_test]
+fn pg_scheduled_reconcile_keeps_generated_child_when_parent_is_fresh() {
+    Spi::run("CREATE TABLE dcp_src (id INT, grp TEXT, val NUMERIC)").expect("create src");
+    Spi::run("INSERT INTO dcp_src SELECT g, 'g' || (g % 3), 1 FROM generate_series(1,60) g")
+        .expect("seed");
+
+    crate::create_reflex_ivm(
+        "dcp_top",
+        "WITH base AS (SELECT id, grp, val FROM dcp_src) \
+         SELECT grp, COUNT(*) AS cnt FROM base GROUP BY grp",
+        Some("grp"),
+        None,
+        None,
+        None,
+    );
+
+    // Child stale, parent fresh: the parent is not a candidate, so nothing would
+    // cover the child.
+    Spi::run(
+        "UPDATE public.__reflex_ivm_reference \
+            SET last_update_date = TIMESTAMP '2001-01-01 00:00:00' \
+          WHERE name = 'dcp_top__cte_base'",
+    )
+    .expect("backdate child");
+    Spi::run(
+        "UPDATE public.__reflex_ivm_reference \
+            SET last_update_date = CURRENT_TIMESTAMP WHERE name = 'dcp_top'",
+    )
+    .expect("freshen parent");
+
+    let attempted = Spi::get_one::<String>(
+        "SELECT string_agg(name, ',' ORDER BY name) FROM reflex_scheduled_reconcile(1) \
+          WHERE name LIKE 'dcp_top%'",
+    )
+    .expect("q")
+    .expect("v");
+    assert_eq!(
+        attempted, "dcp_top__cte_base",
+        "an uncovered stale generated child must still be reconciled"
+    );
+}

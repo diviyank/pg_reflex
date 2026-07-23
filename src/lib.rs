@@ -645,6 +645,21 @@ fn drop_reflex_ivm_cascade(view_name: &str, cascade: bool) -> &'static str {
     drop_ivm::drop_reflex_ivm_impl(view_name, cascade)
 }
 
+/// Reconcile an IMV by rebuilding intermediate + target from scratch, with
+/// explicit control over whether the pre-rebuild partition sync may drop orphan
+/// IMV partitions.
+///
+/// The one-argument form hardcodes `drop_orphans => TRUE`, which is 1.10.11
+/// behaviour and remains the default. This overload exists for callers that gate
+/// destruction on their own authorization: `reflex_doctor` refuses an F3 orphan
+/// drop when the operator did not pass `drop_orphans`, then reached the same
+/// destruction anyway through its F4 `reflex_reconcile` repair. Passing FALSE here
+/// keeps that promise.
+#[pg_extern(name = "reflex_reconcile")]
+fn reflex_reconcile_scoped(view_name: &str, drop_orphans: bool) -> &'static str {
+    reconcile::reflex_reconcile_with_orphans(view_name, drop_orphans)
+}
+
 /// Reconcile an IMV by rebuilding intermediate + target from scratch.
 /// Use this as a safety net (manually or via pg_cron) to fix drift.
 #[pg_extern]
