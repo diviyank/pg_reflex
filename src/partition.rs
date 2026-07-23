@@ -33,7 +33,7 @@ use crate::sql_writer::identifier::format_pg_text_array;
 /// A root that has failed this many flushes stops being retried. Its pending row
 /// and `last_error` survive for `reflex_doctor`, and dependents stay marked
 /// `known_stale`, so the condition is reported rather than silently retried.
-const PARTITION_FLUSH_FAILURE_CAP: i32 = 5;
+pub(crate) const PARTITION_FLUSH_FAILURE_CAP: i32 = 5;
 
 /// A description of how a source table is partitioned.
 ///
@@ -2838,6 +2838,24 @@ pub(crate) fn reflex_flush_partitions_impl(only: Option<&str>) -> String {
                  END \
                  $_reflex_part_sp$"
             );
+            // Stamped OUTSIDE the DO block: the block's EXCEPTION branch rolls its
+            // own body back, and a failed attempt is exactly the one that must stay
+            // dated. A successful drain deletes the row, so any row still visible to
+            // an operator carries the timestamp of the attempt that failed. Without
+            // this, neither `enqueued_at` (reset on every re-enqueue) nor `attempts`
+            // (an enqueue counter) could date a drain failure.
+            client
+                .update(
+                    "UPDATE public.__reflex_partition_pending \
+                        SET last_attempt_at = statement_timestamp() WHERE source_root = $1",
+                    None,
+                    &[unsafe {
+                        DatumWithOid::new(root.to_string(), PgBuiltInOids::TEXTOID.oid().value())
+                    }],
+                )
+                .map_err(|e| {
+                    format!("flush: stamping last_attempt_at for {} failed: {}", root, e)
+                })?;
             client
                 .update(&do_block, None, &[])
                 .map_err(|e| format!("flush: DO block dispatch for root {} failed: {}", root, e))?;

@@ -998,24 +998,45 @@ fn ps4_pending_queue_has_last_attempt_at_column() {
 
 #[pg_test]
 fn ps4_drain_stamps_last_attempt_at_on_failure() {
-    // A pending root that is not a relation at all: the drain attempts it, the
-    // attempt fails, and the surviving row must carry the timestamp of that
-    // attempt — otherwise nothing in the queue can date a failure.
+    // A drain that fails must leave the surviving pending row dated. Neither
+    // `enqueued_at` (reset by every re-enqueue) nor `attempts` (an enqueue
+    // counter) can date a failure, so without this stamp a wedged root reports
+    // an arbitrarily old error next to a freshly reset age.
+    Spi::run("CREATE TABLE ps4_stamp_src (region TEXT NOT NULL, v INT) PARTITION BY LIST (region)")
+        .expect("src");
+    Spi::run("CREATE TABLE ps4_stamp_src_a PARTITION OF ps4_stamp_src FOR VALUES IN ('a')")
+        .expect("a");
+    // A registry row whose relations do not exist: the drain reaches it and fails.
+    Spi::run(
+        "INSERT INTO public.__reflex_ivm_reference \
+            (name, graph_depth, depends_on, partition_columns, partition_strategy, enabled) \
+         VALUES ('ps4_stamp_ghost', 0, ARRAY['public.ps4_stamp_src'], ARRAY['region'], 'LIST', TRUE)",
+    )
+    .expect("ghost");
     Spi::run(
         "INSERT INTO public.__reflex_partition_pending (source_root) \
-         VALUES ('ps4_nonexistent.root')",
+         VALUES ('public.ps4_stamp_src')",
     )
     .expect("seed");
+
     let _ = Spi::get_one::<String>("SELECT reflex_flush_partitions()");
 
     let stamped: bool = Spi::get_one(
         "SELECT last_attempt_at IS NOT NULL FROM public.__reflex_partition_pending \
-         WHERE source_root = 'ps4_nonexistent.root'",
+         WHERE source_root = 'public.ps4_stamp_src'",
     )
-    .expect("q")
+    .expect("the failed drain must leave the pending row in place")
     .unwrap_or(false);
     assert!(
         stamped,
         "the drain must stamp last_attempt_at on a root it attempted"
     );
+
+    let failures: i32 = Spi::get_one(
+        "SELECT failures FROM public.__reflex_partition_pending \
+         WHERE source_root = 'public.ps4_stamp_src'",
+    )
+    .expect("q")
+    .unwrap_or(0);
+    assert_eq!(failures, 1, "the failed drain must have counted a failure");
 }
