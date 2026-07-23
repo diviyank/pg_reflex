@@ -165,80 +165,84 @@ fn f10_doctor_fix_respects_drop_orphans_gate() {
 
 #[pg_test]
 fn f10_doctor_never_runs_chain_rebuild_without_escalation() {
-    // Represent a decomposed known_stale IMV that maps to F4b.
-    // Verify that reflex_rebuild_chain is reported but not executed.
-    // A decomposed chain is detected structurally: if there exist registered IMVs
-    // whose names begin with <this_imv's_bare_name>__ (the sub-IMV convention).
-
-    // Create a simple IMV
-    Spi::run("CREATE TABLE f10_chain_src (id INT PRIMARY KEY, val INT)").unwrap();
-    Spi::run("INSERT INTO f10_chain_src VALUES (1, 100)").unwrap();
-    crate::create_reflex_ivm(
+    // A decomposed known_stale IMV maps to F4b. The safety property this test
+    // guards: the doctor must NOT auto-run the destructive drop+recreate
+    // reflex_rebuild_chain — which additionally hard-errors on a CTE-decomposed
+    // parent (D22). 1.11.0 satisfies that more strongly than the old
+    // "report only": F4b now prescribes reflex_reconcile (safe, rebuild-in-place)
+    // and never emits rebuild_chain at all. Classification is structural
+    // (is_generated_sub_imv + depends_on_imv), not a name-prefix heuristic, so
+    // this uses a genuine CTE-decomposed chain rather than a hand-inserted row.
+    Spi::run("CREATE TABLE f10_chain_src (id INT, grp TEXT, val NUMERIC)").unwrap();
+    Spi::run("INSERT INTO f10_chain_src VALUES (1,'a',100),(2,'a',20),(3,'b',30)").unwrap();
+    let created = crate::create_reflex_ivm(
         "f10_chain_imv",
-        "SELECT id, val FROM f10_chain_src",
-        Some("id"),
+        "WITH base AS (SELECT id, grp, val FROM f10_chain_src) \
+         SELECT grp, SUM(val) AS total FROM base GROUP BY grp",
+        None,
         None,
         Some("IMMEDIATE"),
         None,
     );
+    assert_eq!(created, "CREATE REFLEX INCREMENTAL VIEW");
 
-    // Register a sub-IMV to simulate a decomposed chain (e.g., from CTE decomposition)
-    // The naming convention is <root_bare>__<something>, e.g. f10_chain_imv__cte_x
+    // Precondition: this is a real decomposed chain in the registry graph.
+    let has_gen_dep = Spi::get_one::<bool>(
+        "SELECT EXISTS(SELECT 1 FROM public.__reflex_ivm_reference child \
+           WHERE child.name = ANY(SELECT unnest(depends_on_imv) \
+             FROM public.__reflex_ivm_reference WHERE name = 'f10_chain_imv') \
+           AND child.is_generated_sub_imv)",
+    )
+    .unwrap()
+    .unwrap();
+    assert!(has_gen_dep, "precondition: f10_chain_imv must be a real decomposed chain");
+
     Spi::run(
-        "INSERT INTO public.__reflex_ivm_reference (name, graph_depth, known_stale, stale_reason) \
-         VALUES ('f10_chain_imv__cte_x', 1, FALSE, NULL)"
+        "UPDATE public.__reflex_ivm_reference SET known_stale = TRUE, \
+         stale_reason = 'missing intermediate bound for child x' WHERE name = 'f10_chain_imv'"
     ).unwrap();
 
-    // Mark the root IMV as stale with a realistic reason
-    Spi::run(
-        "UPDATE public.__reflex_ivm_reference SET known_stale = TRUE, stale_reason = 'missing intermediate bound for child x' WHERE name = 'f10_chain_imv'"
-    ).unwrap();
-
-    // Call reflex_doctor with fix => TRUE
-    let result_rows: Vec<(String, String, String)> = Spi::connect(|client| {
-        let mut result = Vec::new();
+    let (check_id, action, outcome) = Spi::connect(|client| {
         let rs = client.select(
-            "SELECT check_id, object, outcome FROM reflex_doctor(NULL, TRUE) WHERE object = 'f10_chain_imv'",
+            "SELECT check_id, action, outcome FROM reflex_doctor(NULL, TRUE) WHERE object = 'f10_chain_imv'",
             None,
-            &[]
+            &[],
         ).unwrap_or_report();
-        for row in rs {
-            let check_id: String = row
-                .get_by_name::<&str, _>("check_id")
-                .unwrap_or(None)
-                .unwrap_or("")
-                .to_string();
-            let object: String = row
-                .get_by_name::<&str, _>("object")
-                .unwrap_or(None)
-                .unwrap_or("")
-                .to_string();
-            let outcome: String = row
-                .get_by_name::<&str, _>("outcome")
-                .unwrap_or(None)
-                .unwrap_or("")
-                .to_string();
-            result.push((check_id, object, outcome));
-        }
-        result
+        let row = rs.into_iter().next().expect("should return a row for the chain IMV");
+        (
+            row.get_by_name::<&str, _>("check_id").unwrap_or(None).unwrap_or("").to_string(),
+            row.get_by_name::<&str, _>("action").unwrap_or(None).unwrap_or("").to_string(),
+            row.get_by_name::<&str, _>("outcome").unwrap_or(None).unwrap_or("").to_string(),
+        )
     });
 
-    assert!(!result_rows.is_empty(), "should return row for the chain IMV");
-    let (check_id, obj, outcome) = &result_rows[0];
-    assert_eq!(check_id, "F4b", "should be classified as F4b (structural decomposed chain detection)");
-    assert_eq!(obj, "f10_chain_imv", "object should be the root IMV");
-    assert_eq!(outcome, "reported", "F4b outcome should be 'reported' (never auto-performed)");
+    assert_eq!(check_id, "F4b", "a real decomposed chain must be classified F4b");
+    // The safety property: no destructive chain rebuild is ever prescribed.
+    assert!(
+        !action.contains("reflex_rebuild_chain"),
+        "F4b must not prescribe the destructive rebuild_chain, got: {action}"
+    );
+    assert!(
+        action.contains("reflex_reconcile"),
+        "F4b must prescribe reflex_reconcile, got: {action}"
+    );
+    // fix mode repairs in place: the row is reconciled, not dropped/recreated.
+    assert!(
+        outcome == "fixed" || outcome.starts_with("failed:"),
+        "F4b under fix must report a verified reconcile outcome, got: {outcome}"
+    );
 
-    // Verify the chain hasn't been rebuilt - check that both root and sub-IMV still exist
+    // Both root and generated child still exist — reconcile is in place, and
+    // rebuild_chain (which would drop+recreate) was never invoked.
     let root_exists = Spi::get_one::<i64>(
         "SELECT count(*) FROM public.__reflex_ivm_reference WHERE name = 'f10_chain_imv'"
     ).unwrap().unwrap();
-    assert_eq!(root_exists, 1, "root chain IMV should still exist (not rebuilt)");
-
+    assert_eq!(root_exists, 1, "root chain IMV must still exist");
     let sub_exists = Spi::get_one::<i64>(
-        "SELECT count(*) FROM public.__reflex_ivm_reference WHERE name = 'f10_chain_imv__cte_x'"
+        "SELECT count(*) FROM public.__reflex_ivm_reference \
+         WHERE name = 'f10_chain_imv__cte_base'"
     ).unwrap().unwrap();
-    assert_eq!(sub_exists, 1, "sub-IMV should still exist");
+    assert_eq!(sub_exists, 1, "generated sub-IMV must still exist");
 }
 
 #[pg_test]
@@ -348,130 +352,60 @@ fn f10_doctor_fix_records_failed_and_continues() {
 
 #[pg_test]
 fn f10_decomposed_chain_like_escape_fix() {
-    // F10 regression test: verify that LIKE pattern for decomposed-chain detection
-    // correctly escapes metacharacters (especially underscore) so that unrelated IMVs
-    // with similar names are not misclassified as decomposed chains.
-    //
-    // Before fix: "f10_base_v" matches "f10_base_v__%", and an unrelated IMV
-    //            "f10_base_xy" would also match because underscore is a wildcard.
-    // After fix: only "f10_base_v__<suffix>" pattern matches literally.
-
-    // Create a known_stale aggregate IMV (not a decomposed chain on its own)
-    Spi::run("CREATE TABLE f10_base_src (id INT PRIMARY KEY, val INT)").unwrap();
-    Spi::run("INSERT INTO f10_base_src VALUES (1, 100)").unwrap();
+    // Regression: an IMV whose name merely resembles another's generated-child
+    // prefix must NOT be misclassified as a decomposed chain. The old detector
+    // probed `name LIKE '<bare>__%'`, where a bare underscore is a wildcard, so
+    // `f10_base_xy` could match `f10_base_v__%`. 1.11.0 classifies structurally on
+    // the registry graph (is_generated_sub_imv + depends_on_imv), which removes
+    // the name-matching class entirely — `f10_base_xy` is F4 because it has no
+    // generated dependency, no matter what it is called. Uses a genuine
+    // CTE-decomposed chain for the F4b side rather than a hand-inserted row.
+    Spi::run("CREATE TABLE f10_base_src (id INT, grp TEXT, val NUMERIC)").unwrap();
+    Spi::run("INSERT INTO f10_base_src VALUES (1,'a',100),(2,'b',20)").unwrap();
+    // f10_base_v is a real decomposed chain → generated child f10_base_v__cte_base.
     crate::create_reflex_ivm(
         "f10_base_v",
-        "SELECT COUNT(*) AS cnt FROM f10_base_src",
-        None,  // no unique key - aggregate
+        "WITH base AS (SELECT id, grp, val FROM f10_base_src) \
+         SELECT grp, SUM(val) AS total FROM base GROUP BY grp",
+        None,
         None,
         Some("IMMEDIATE"),
         None,
     );
 
-    // Create an unrelated IMV whose name would collide under buggy wildcard logic:
-    // "f10_base_xy" would match "f10_base_v__%"  if '_' is treated as a wildcard.
+    // f10_base_xy: similarly named, NOT decomposed (no CTE), so no generated child.
     Spi::run("CREATE TABLE f10_unrelated_src (id INT PRIMARY KEY, val INT)").unwrap();
     Spi::run("INSERT INTO f10_unrelated_src VALUES (1, 200)").unwrap();
     crate::create_reflex_ivm(
         "f10_base_xy",
         "SELECT COUNT(*) AS cnt FROM f10_unrelated_src",
-        None,  // aggregate
+        None,
         None,
         Some("IMMEDIATE"),
         None,
     );
 
-    // Mark both as stale with a generic reason (not overlap, not archive)
     Spi::run(
-        "UPDATE public.__reflex_ivm_reference SET known_stale = TRUE, stale_reason = 'test stale' WHERE name = 'f10_base_v'"
-    ).unwrap();
-    Spi::run(
-        "UPDATE public.__reflex_ivm_reference SET known_stale = TRUE, stale_reason = 'test stale' WHERE name = 'f10_base_xy'"
+        "UPDATE public.__reflex_ivm_reference SET known_stale = TRUE, stale_reason = 'test stale' \
+         WHERE name IN ('f10_base_v', 'f10_base_xy')"
     ).unwrap();
 
-    // Call reflex_doctor and check classifications
-    let result_rows: Vec<(String, String)> = Spi::connect(|client| {
-        let mut result = Vec::new();
-        let rs = client.select(
-            "SELECT object, check_id FROM reflex_doctor(NULL, FALSE) WHERE object IN ('f10_base_v', 'f10_base_xy')",
-            None,
-            &[]
-        ).unwrap_or_report();
-        for row in rs {
-            let object: String = row
-                .get_by_name::<&str, _>("object")
-                .unwrap_or(None)
-                .unwrap_or("")
-                .to_string();
-            let check_id: String = row
-                .get_by_name::<&str, _>("check_id")
-                .unwrap_or(None)
-                .unwrap_or("")
-                .to_string();
-            result.push((object, check_id));
-        }
-        result
-    });
+    let check_of = |obj: &str| -> Option<String> {
+        Spi::get_one::<String>(&format!(
+            "SELECT check_id FROM reflex_doctor(NULL, FALSE) WHERE object = '{obj}'"
+        ))
+        .unwrap_or(None)
+    };
 
-    // Should have 2 results
-    assert_eq!(result_rows.len(), 2, "should have exactly 2 F4 results (no decomposed chains)");
-
-    // Both should be F4, not F4b, because neither has actual sub-IMVs registered
-    for (obj, check_id) in &result_rows {
-        assert_eq!(
-            check_id, "F4",
-            "IMV '{}' should be classified as F4 (not F4b), because neither has registered sub-IMVs",
-            obj
-        );
-    }
-
-    // Now register an actual sub-IMV to make f10_base_v a real decomposed chain
-    Spi::run(
-        "INSERT INTO public.__reflex_ivm_reference (name, graph_depth, known_stale, stale_reason) \
-         VALUES ('f10_base_v__sub', 1, FALSE, NULL)"
-    ).unwrap();
-
-    // Call reflex_doctor again
-    let result_rows_after: Vec<(String, String)> = Spi::connect(|client| {
-        let mut result = Vec::new();
-        let rs = client.select(
-            "SELECT object, check_id FROM reflex_doctor(NULL, FALSE) WHERE object IN ('f10_base_v', 'f10_base_xy')",
-            None,
-            &[]
-        ).unwrap_or_report();
-        for row in rs {
-            let object: String = row
-                .get_by_name::<&str, _>("object")
-                .unwrap_or(None)
-                .unwrap_or("")
-                .to_string();
-            let check_id: String = row
-                .get_by_name::<&str, _>("check_id")
-                .unwrap_or(None)
-                .unwrap_or("")
-                .to_string();
-            result.push((object, check_id));
-        }
-        result
-    });
-
-    // Now f10_base_v should be F4b (has sub-IMV), but f10_base_xy should still be F4
-    let f10_base_v_check = result_rows_after
-        .iter()
-        .find(|(obj, _)| obj == "f10_base_v")
-        .map(|(_, check_id)| check_id.clone());
-    let f10_base_xy_check = result_rows_after
-        .iter()
-        .find(|(obj, _)| obj == "f10_base_xy")
-        .map(|(_, check_id)| check_id.clone());
-
+    // f10_base_v is a genuine decomposed chain → F4b.
     assert_eq!(
-        f10_base_v_check, Some("F4b".to_string()),
-        "f10_base_v should be classified as F4b (has registered sub-IMV f10_base_v__sub)"
+        check_of("f10_base_v"), Some("F4b".to_string()),
+        "f10_base_v has a generated sub-IMV, so it must be F4b"
     );
+    // f10_base_xy only resembles the prefix; with structural detection it is F4.
     assert_eq!(
-        f10_base_xy_check, Some("F4".to_string()),
-        "f10_base_xy should still be F4 (no sub-IMVs, escaped LIKE pattern doesn't match)"
+        check_of("f10_base_xy"), Some("F4".to_string()),
+        "f10_base_xy has no generated dependency and must be F4 regardless of name"
     );
 }
 
