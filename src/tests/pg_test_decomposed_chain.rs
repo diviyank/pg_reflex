@@ -210,6 +210,23 @@ fn pg_reconcile_generated_child_is_not_double_counted_deferred() {
         .expect("value");
     assert_eq!(status, "RECONCILED");
 
+    // The load-bearing assertion: suppression must have left the child with NO
+    // staged deferred delta. A pgrx test runs in one never-committed transaction,
+    // so the COMMIT-time flush never fires on its own — without this the oracle
+    // below cannot see a double-count and the test passes even on `main`. Assert
+    // the child staged nothing, then drive the flush by hand and oracle-check.
+    let pending_for_child = Spi::get_one::<i64>(
+        "SELECT COUNT(*) FROM public.__reflex_deferred_pending \
+          WHERE source_table LIKE '%dc5_agg__cte_base%'",
+    )
+    .expect("q")
+    .expect("v");
+    assert_eq!(
+        pending_for_child, 0,
+        "reconciling the generated child must leave no staged deferred delta"
+    );
+
+    drain_deferred_pending();
     assert_imv_correct(
         "dc5_agg",
         "SELECT grp, COUNT(*) AS cnt, SUM(val) AS total FROM dc5_src GROUP BY grp",
@@ -217,10 +234,18 @@ fn pg_reconcile_generated_child_is_not_double_counted_deferred() {
 }
 
 /// PS-1 (D18) — `reflex_reconcile` is invoked from inside pg_reflex's own
-/// generated trigger bodies on the high-selectivity "wipe" branch. Bulk DML that
-/// trips that branch on a decomposed chain must not recurse into DDL on the
-/// relation whose statement trigger is running. Observable proxy: it stays
-/// oracle-correct and does not error.
+/// generated trigger bodies on the high-selectivity "wipe" branch
+/// (`trigger/dispatch.rs`). Without the `pg_trigger_depth()` gate, that inner
+/// call on a decomposed parent would try to `DISABLE TRIGGER` / `TRUNCATE` the
+/// generated child while the child's own INSERT statement trigger is live — a
+/// hard error. So on this fixture, correctness is the discriminator: the gate is
+/// exactly what turns an error into a correct single-node maintenance.
+///
+/// The premise (the wipe branch actually fires) is FORCED, not hoped for: reflex
+/// takes it when `|affected| / reltuples >= wipe_threshold`, so the threshold is
+/// pinned to 0.01 and the base is ANALYZEd to give reltuples a real value before a
+/// bulk insert an order of magnitude larger. Without forcing it, an INSERT could
+/// take the incremental branch and the test would pass on `main` too.
 #[pg_test]
 fn pg_bulk_dml_on_decomposed_chain_stays_correct() {
     Spi::run("CREATE TABLE dc6_src (id INT, grp TEXT, val NUMERIC)").expect("create src");
@@ -237,10 +262,19 @@ fn pg_bulk_dml_on_decomposed_chain_stays_correct() {
         None,
     );
 
-    // 400 new rows against a 100-row base: |affected| / reltuples is far above
-    // any wipe_threshold, so the trigger takes the reflex_reconcile branch.
+    // Force the wipe branch: low threshold on both the parent and its generated
+    // child (the child carries the source triggers), plus real reltuples.
+    Spi::run("SELECT reflex_set_wipe_threshold('dc6_agg', 0.01::numeric)").expect("thr parent");
+    Spi::run("SELECT reflex_set_wipe_threshold('dc6_agg__cte_base', 0.01::numeric)")
+        .expect("thr child");
+    Spi::run("ANALYZE dc6_agg__cte_base").expect("analyze child intermediate source");
+
+    // 400 rows onto a ~100-row base -> ratio ~4.0, far above 0.01, so the trigger
+    // takes the reflex_reconcile ("wipe") branch. Under the D18 gate this stays
+    // correct; without it, it errors trying to TRUNCATE the child under its own
+    // trigger.
     Spi::run("INSERT INTO dc6_src SELECT g, 'g' || (g % 4), 2 FROM generate_series(101,500) g")
-        .expect("bulk insert");
+        .expect("bulk insert must not error under the trigger-depth gate");
 
     assert_imv_correct(
         "dc6_agg",
@@ -914,5 +948,32 @@ fn pg_scheduled_reconcile_keeps_generated_child_when_parent_is_fresh() {
     assert_eq!(
         attempted, "dcp_top__cte_base",
         "an uncovered stale generated child must still be reconciled"
+    );
+}
+
+/// PS-1 REVIEW — `recompute_graph_depth` cannot converge on a dependency cycle,
+/// and each run inflated `graph_depth` by `MAX_DEPTH_PASSES` (20 -> 40 -> …) while
+/// still reporting `REPAIRED`. Acyclic idempotence is covered by
+/// `pg_repair_dependency_graph_backfills_broken_rows`; this pins the cyclic case,
+/// where the function must refuse to claim success.
+#[pg_test]
+fn pg_repair_dependency_graph_reports_non_convergence_on_a_cycle() {
+    Spi::run(
+        "INSERT INTO public.__reflex_ivm_reference (name, graph_depth, depends_on_imv) VALUES \
+           ('rpc_a', 1, ARRAY['rpc_b']), \
+           ('rpc_b', 1, ARRAY['rpc_a'])",
+    )
+    .expect("seed cycle");
+
+    let summary = Spi::get_one::<String>("SELECT reflex_repair_dependency_graph()")
+        .expect("q")
+        .expect("v");
+    assert!(
+        summary.starts_with("WARNING"),
+        "a non-converging graph must not be reported as repaired, got: {summary}"
+    );
+    assert!(
+        summary.contains("cycle"),
+        "the summary must name the cause, got: {summary}"
     );
 }

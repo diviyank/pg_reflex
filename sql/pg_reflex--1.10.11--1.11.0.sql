@@ -62,31 +62,34 @@ STRICT
 LANGUAGE c /* Rust */
 AS 'MODULE_PATHNAME', 'reflex_repair_dependency_graph_wrapper';
 
--- Backfill existing rows. Everything is derived from `depends_on`, the one
+-- The backfill is NOT run inline here. `CREATE OR REPLACE FUNCTION … MODULE_PATHNAME`
+-- followed by an immediate call needs `dlsym` of a brand-new symbol, which fails
+-- when the backend running ALTER EXTENSION already has the previous `.so` mapped.
+-- The operator runs it in a fresh session after the upgrade — see the NOTICE.
+--
+-- What it does when run: everything is derived from `depends_on`, the one
 -- registry column no bug has corrupted.
 --
--- `depends_on_imv` and `graph_child` are repaired ADDITIVELY: an edge is only
--- ever added, never removed. Removal is the only operation that could make the
--- graph worse than it already is, and every spurious extra edge fails in the
--- safe direction (reflex_rebuild_chain refuses rather than destroying a
--- dependent; drop_reflex_ivm refuses rather than orphaning a parent).
---
--- `is_generated_sub_imv` is backfilled from the `__cte_` / `__union_<n>` /
--- `__base` name suffix AND the requirement that some other registry row depends
--- on the name. The suffix is a heuristic, acceptable here because this is a
--- one-shot repair of rows created before the flag existed and no better evidence
--- survives; the runtime reconcile decision reads the column instead. A false
--- positive needs a user to have named an IMV `foo__cte_bar` and to have `foo`
--- read from it, and costs only extra work on reconcile, never wrong data.
---
--- `graph_depth` is recomputed to a fixpoint of
--- depth(v) = max(depth(d) for d in depends_on_imv(v)) + 1, the same expression
--- create-time now uses, so a row's depth means the same thing regardless of age.
---
--- Re-runnable and idempotent: SELECT public.reflex_repair_dependency_graph();
-SELECT public.reflex_repair_dependency_graph();
+-- * `depends_on_imv` and `graph_child` are repaired ADDITIVELY: an edge is only
+--   ever added, never removed. Removal is the only operation that could make the
+--   graph worse than it already is, and every spurious extra edge fails in the
+--   safe direction (reflex_rebuild_chain and non-cascade drop_reflex_ivm refuse
+--   rather than destroying or orphaning a dependent).
+-- * `is_generated_sub_imv` is backfilled from the `__cte_` / `__union_<n>` /
+--   `__base` name suffix AND the requirement that some other registry row depends
+--   on the name. The suffix is a heuristic, acceptable here because this is a
+--   one-shot repair of rows created before the flag existed and no better
+--   evidence survives; the runtime reconcile decision reads the column instead. A
+--   false positive needs a user to have named an IMV `foo__cte_bar` and to have
+--   `foo` read from it; the node then gets rebuilt on `foo`'s reconcile, which
+--   never silently changes another IMV's values but does suppress propagation to
+--   any OTHER consumer of it for that rebuild.
+-- * `graph_depth` is recomputed to a fixpoint of
+--   depth(v) = max(depth(d) for d in depends_on_imv(v)) + 1, the same expression
+--   create-time now uses. Idempotent on an acyclic graph; on a registry holding a
+--   dependency cycle it cannot converge and returns a WARNING instead of REPAIRED.
 
 DO $ps1$ BEGIN
-    RAISE NOTICE 'pg_reflex 1.11.0 (PS-1): decomposed-chain dependency graph repaired. reflex_rebuild_imv on a decomposed IMV now reconciles its generated sub-IMVs first; reflex_rebuild_chain and non-cascade drop_reflex_ivm on a generated sub-IMV now refuse. Re-run reflex_doctor().';
+    RAISE NOTICE 'pg_reflex 1.11.0 (PS-1): decomposed-chain correctness. AFTER this upgrade completes, in a NEW session, run: SELECT public.reflex_repair_dependency_graph(); to repair depends_on_imv / graph_child / graph_depth / is_generated_sub_imv on existing rows. Then re-run reflex_doctor(). Note: reflex_rebuild_imv on a decomposed IMV now reconciles its generated sub-IMVs first; reflex_rebuild_chain and non-cascade drop_reflex_ivm on a generated sub-IMV now refuse.';
 END $ps1$;
 -- === end PS-1 ==============================================================

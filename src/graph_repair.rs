@@ -5,9 +5,12 @@
 //! `graph_child`, `graph_depth` and `is_generated_sub_imv` are all derivable
 //! from it, so this module re-derives them rather than trusting them.
 //!
-//! Called once by the 1.10.11 → 1.11.0 migration to repair rows created before
+//! Called once after the 1.10.11 → 1.11.0 upgrade to repair rows created before
 //! `resolve_existing_imv_deps` canonicalised its probe, and exposed as a
-//! re-runnable operator primitive. Idempotent.
+//! re-runnable operator primitive. Idempotent on an ACYCLIC graph — a second run
+//! changes nothing. A registry holding a dependency cycle cannot converge, and
+//! `graph_depth` there grows by `MAX_DEPTH_PASSES` per run; that case is detected
+//! and reported rather than silently claimed as repaired.
 //!
 //! Every step de-quotes a stored source name with `replace(s, '"', '')`. A
 //! CTE-decomposed sub-IMV source is persisted double-quoted
@@ -29,14 +32,35 @@ const MAX_DEPTH_PASSES: i32 = 20;
 /// The `depends_on_imv` and `graph_child` steps are additive — an edge is only
 /// ever added. Removal is the only operation that could make the graph worse
 /// than it already is, and every spurious extra edge fails in the safe
-/// direction: `reflex_rebuild_chain` refuses rather than destroying a dependent,
-/// and `drop_reflex_ivm` cascades wider on an object the user asked to drop.
+/// direction: `reflex_rebuild_chain` and a non-cascade `drop_reflex_ivm` refuse
+/// rather than destroying or orphaning a dependent.
+///
+/// Returns `REPAIRED: …` on convergence, or `WARNING: …` when `graph_depth` did
+/// not reach a fixpoint — which means the registry holds a dependency cycle.
 #[pg_extern]
 pub fn reflex_repair_dependency_graph() -> String {
     let generated = mark_legacy_generated_sub_imvs();
     let imv_edges = backfill_depends_on_imv();
     let child_edges = backfill_graph_child();
-    let (depth_rows, passes) = recompute_graph_depth();
+    let (depth_rows, passes, converged) = recompute_graph_depth();
+
+    if !converged {
+        warning!(
+            "pg_reflex: graph_depth did not converge in {} passes — the registry's \
+             depends_on_imv graph contains a cycle. Edge repair was applied, but \
+             graph_depth is NOT trustworthy and re-running this function will keep \
+             inflating it. Find the cycle with: WITH RECURSIVE w(a,b) AS (SELECT name, \
+             unnest(depends_on_imv) FROM public.__reflex_ivm_reference UNION SELECT \
+             w.a, unnest(r.depends_on_imv) FROM w JOIN public.__reflex_ivm_reference r \
+             ON r.name = w.b) SELECT * FROM w WHERE a = b;",
+            MAX_DEPTH_PASSES
+        );
+        return format!(
+            "WARNING: is_generated_sub_imv={}, depends_on_imv={}, graph_child={} repaired, \
+             but graph_depth did NOT converge in {} passes (dependency cycle)",
+            generated, imv_edges, child_edges, MAX_DEPTH_PASSES
+        );
+    }
 
     format!(
         "REPAIRED: is_generated_sub_imv={}, depends_on_imv={}, graph_child={}, \
@@ -53,8 +77,11 @@ pub fn reflex_repair_dependency_graph() -> String {
 /// created before the flag was recorded, where no better evidence survives,
 /// whereas the reconcile recursion evaluates its predicate forever and so reads
 /// the column. A false positive needs a user to have named an IMV
-/// `foo__cte_bar` *and* have `foo` read from it, and costs only extra work on
-/// reconcile, never wrong data.
+/// `foo__cte_bar` *and* have `foo` read from it. The cost of that is bounded: the
+/// node gets rebuilt on `foo`'s reconcile, which never silently changes another
+/// IMV's values, but does suppress propagation to any OTHER consumer of it for
+/// the duration of that rebuild, leaving those consumers to the
+/// `reflex_on_ddl_command_end` staleness alarm rather than an incremental delta.
 fn mark_legacy_generated_sub_imvs() -> i64 {
     Spi::connect_mut(|client| {
         client
@@ -145,10 +172,14 @@ fn backfill_graph_child() -> i64 {
 /// fixpoint — the same expression `resolve_existing_imv_deps` computes at create
 /// time, so a row's depth means the same thing regardless of its age.
 ///
-/// Returns `(rows changed in total, passes run)`.
-fn recompute_graph_depth() -> (i64, i32) {
+/// Returns `(rows changed in total, passes run, converged)`. `converged = false`
+/// means the loop hit `MAX_DEPTH_PASSES` while still changing rows, i.e. the graph
+/// has a cycle; depths are left at their last value and the caller must not report
+/// success.
+fn recompute_graph_depth() -> (i64, i32, bool) {
     let mut changed_total = 0i64;
     let mut passes = 0i32;
+    let mut last_changed = 0i64;
     while passes < MAX_DEPTH_PASSES {
         let changed = Spi::connect_mut(|client| {
             client
@@ -172,9 +203,10 @@ fn recompute_graph_depth() -> (i64, i32) {
         });
         passes += 1;
         changed_total += changed;
+        last_changed = changed;
         if changed == 0 {
             break;
         }
     }
-    (changed_total, passes)
+    (changed_total, passes, last_changed == 0)
 }
