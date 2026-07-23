@@ -214,6 +214,49 @@ fn pg_test_audit_internal_tables_detects_missing_intermediate() {
     );
 }
 
+/// PS-6 — a passthrough IMV missing one of its per-source scratch tables is the
+/// exact field wedge (`__reflex_pt_new_… does not exist`). reflex_audit must
+/// flag it as an internal-tables ERROR naming the missing table, and its
+/// suggested fix must point at the entry point that actually heals it —
+/// `reflex_rebuild_triggers(<source>)` (reflex_rebuild_imv / reconcile rebuilds
+/// the target but never recreates the pt scratch, so it would report success
+/// while leaving the IMV wedged).
+#[pg_test]
+fn pg_test_audit_flags_missing_passthrough_scratch_with_healing_fix() {
+    Spi::run("CREATE TABLE audit_pt_src (id INT PRIMARY KEY, grp TEXT)").expect("src");
+    // Passthrough query (no aggregate / GROUP BY) → per-source pt scratch tables.
+    crate::create_reflex_ivm(
+        "audit_pt_view",
+        "SELECT id, grp FROM audit_pt_src",
+        Some("id"),
+        None,
+        Some("IMMEDIATE"),
+        None,
+    );
+    // Drop the NEW-side scratch out from under the IMV.
+    Spi::run("DROP TABLE \"__reflex_pt_new_audit_pt_view_audit_pt_src\"")
+        .expect("drop pt scratch");
+
+    let report: String = Spi::get_one("SELECT reflex_audit('audit_pt_view')")
+        .expect("ok")
+        .expect("non-null");
+    assert!(
+        report.contains("[ERROR]") && report.contains("internal-tables-exist"),
+        "expected ERROR/internal-tables-exist:\n{}",
+        report
+    );
+    assert!(
+        report.contains("__reflex_pt_new_audit_pt_view_audit_pt_src"),
+        "expected the missing pt scratch name in the body:\n{}",
+        report
+    );
+    assert!(
+        report.contains("reflex_rebuild_triggers('audit_pt_src')"),
+        "suggested fix must be the source-scoped healing entry point:\n{}",
+        report
+    );
+}
+
 #[pg_test]
 fn pg_test_audit_internal_tables_green_when_present() {
     Spi::run("CREATE TABLE audit_it_ok_src (id BIGINT PRIMARY KEY, a INT)").expect("src");

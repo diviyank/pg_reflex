@@ -5,6 +5,104 @@
 //   R1 current_assortment_activity_view (1.10.2 scalar-subquery filter)
 //   R2 sop_incoming_stock_baseline_view (1.10.1 aggregate + LEFT-JOIN secondary)
 
+// PS-6 helpers (unique names — all field-replay tests share one `mod tests`).
+fn ps6_regclass_exists(name: &str) -> bool {
+    Spi::get_one::<i64>(&format!(
+        "SELECT COUNT(*) FROM pg_class WHERE relname = '{}'",
+        name.replace('\'', "''")
+    ))
+    .unwrap()
+    .unwrap_or(0)
+        > 0
+}
+
+fn ps6_flush_count(imv: &str) -> i64 {
+    Spi::get_one::<i64>(&format!(
+        "SELECT COALESCE(flush_count, 0) FROM public.__reflex_ivm_reference WHERE name = '{}'",
+        imv
+    ))
+    .unwrap()
+    .unwrap_or(0)
+}
+
+/// PS-6 wedge + heal — the reproducible current-code form of the field 42P01
+/// (`__reflex_pt_new_… does not exist`). A passthrough IMV whose per-source
+/// scratch tables have gone missing (older create loop that didn't cover the
+/// source, a partial create, or a manual drop) silently goes stale: every
+/// DEFERRED flush fails fast inside the per-IMV subtransaction, is swallowed as
+/// a WARNING, records the 42P01 in `last_error`, and never maintains the IMV.
+///
+/// The heal is `reflex_rebuild_triggers(<SOURCE>)` — the source-scoped entry
+/// point (NOT the IMV name) which must recreate the missing pt scratch pair
+/// idempotently so the IMV maintains again without a full drop+recreate.
+#[pg_test]
+fn ps6_missing_passthrough_scratch_wedges_then_heals() {
+    Spi::run("CREATE TABLE ps6w_src (id INT PRIMARY KEY, grp TEXT, note TEXT)").unwrap();
+    Spi::run("INSERT INTO ps6w_src VALUES (1,'a','x'),(2,'b','y')").unwrap();
+    let sql = "SELECT id, grp, note FROM ps6w_src";
+    crate::create_reflex_ivm("ps6w_v", sql, Some("id"), None, Some("DEFERRED"), None);
+
+    let pt_new = "__reflex_pt_new_ps6w_v_ps6w_src";
+    let pt_old = "__reflex_pt_old_ps6w_v_ps6w_src";
+    assert!(
+        ps6_regclass_exists(pt_new) && ps6_regclass_exists(pt_old),
+        "a fresh passthrough create must have its pt scratch pair"
+    );
+    let stmts = flush_statements_for("ps6w_v", "ps6w_src", "INSERT");
+    assert!(
+        stmts.iter().any(|s| s.contains(pt_new)),
+        "the passthrough flush must reference the pt scratch table: {stmts:#?}"
+    );
+
+    // --- wedge: the pt scratch tables vanish out from under the live IMV ---
+    Spi::run(&format!("DROP TABLE \"{pt_new}\"")).unwrap();
+    Spi::run(&format!("DROP TABLE \"{pt_old}\"")).unwrap();
+
+    Spi::run("INSERT INTO ps6w_src VALUES (3,'c','z')").unwrap();
+    Spi::run("SELECT reflex_flush_deferred('ps6w_src')")
+        .expect("flush call itself returns (the 42P01 is swallowed as a WARNING)");
+    let err_wedged = Spi::get_one::<String>(
+        "SELECT last_error FROM public.__reflex_ivm_reference WHERE name='ps6w_v'",
+    )
+    .unwrap();
+    assert!(
+        err_wedged.as_deref().unwrap_or("").contains("does not exist"),
+        "wedge must record the 42P01 in last_error, got: {err_wedged:?}"
+    );
+    let stale_missing =
+        Spi::get_one::<i64>("SELECT COUNT(*) FROM ps6w_v WHERE id = 3").unwrap().unwrap();
+    assert_eq!(stale_missing, 0, "IMV must be stale (row 3 never applied) while wedged");
+
+    // --- heal via the SOURCE-scoped entry point ---
+    let status = Spi::get_one::<String>("SELECT reflex_rebuild_triggers('ps6w_src')")
+        .unwrap()
+        .unwrap();
+    assert!(!status.starts_with("ERROR"), "rebuild_triggers errored: {status}");
+    assert!(
+        ps6_regclass_exists(pt_new) && ps6_regclass_exists(pt_old),
+        "reflex_rebuild_triggers must recreate the missing pt scratch pair"
+    );
+
+    // absorb whatever the wedge lost, then prove LIVE maintenance is restored.
+    Spi::run("SELECT reflex_reconcile('ps6w_v')").expect("reconcile after heal");
+    let fc_before = ps6_flush_count("ps6w_v");
+    Spi::run("INSERT INTO ps6w_src VALUES (4,'d','w')").unwrap();
+    Spi::run("SELECT reflex_flush_deferred('ps6w_src')").expect("healed flush");
+    let err_healed = Spi::get_one::<String>(
+        "SELECT last_error FROM public.__reflex_ivm_reference WHERE name='ps6w_v'",
+    )
+    .unwrap();
+    assert!(
+        err_healed.is_none(),
+        "last_error must clear on a successful post-heal flush, got: {err_healed:?}"
+    );
+    assert!(
+        ps6_flush_count("ps6w_v") > fc_before,
+        "flush_count must advance on the healed flush"
+    );
+    assert_imv_correct("ps6w_v", sql);
+}
+
 /// R1a — 1.10.2 silent-wrong-delete: a passthrough IMV filtered by
 /// `assortment_id = (SELECT … FROM sop_current)`, keyed on (product_id,
 /// location_id). An UPDATE to a NON-current row that collides on (product_id,
@@ -126,6 +224,68 @@ fn replay_sop_baseline_secondary_is_sublinear() {
         PLAN_PROBE_SAMPLES);
     eprintln!("FIELD_R2B sop-baseline small={}ms big={}ms", small, big);
     assert_sublinear("sop-baseline-secondary", small, big, 25);
+}
+
+/// PS-6 D1 guard — the `reliability_snapshot_kinds` field shape: an aggregate
+/// IMV depending on another aggregate IMV + a tracked base dim + a
+/// `<subquery:k>`. The field 42P01 named a `__reflex_pt_*` scratch table for
+/// this shape, but on current code an AGGREGATE IMV never routes through the
+/// passthrough op path: its generated flush references no pt table, so the
+/// missing-scratch failure cannot arise on a fresh create. This pins that
+/// invariant — if a future change makes the aggregate path emit a pt reference
+/// without creating the table, this test breaks.
+#[pg_test]
+fn ps6_aggregate_reliability_shape_never_references_pt_scratch() {
+    Spi::run("CREATE TABLE ps6_kind_dim (id INT PRIMARY KEY, label TEXT)").unwrap();
+    Spi::run("CREATE TABLE ps6_dp_fact (id INT PRIMARY KEY, sku TEXT, qty NUMERIC)").unwrap();
+    Spi::run("CREATE TABLE ps6_demand_planning (id INT PRIMARY KEY, kind_id INT, sku TEXT)").unwrap();
+    Spi::run("INSERT INTO ps6_kind_dim VALUES (1,'a'),(2,'b')").unwrap();
+    Spi::run("INSERT INTO ps6_dp_fact VALUES (1,'x',3),(2,'y',4)").unwrap();
+    Spi::run("INSERT INTO ps6_demand_planning VALUES (1,1,'x'),(2,2,'y')").unwrap();
+
+    // inner aggregate IMV
+    crate::create_reflex_ivm(
+        "ps6_agg",
+        "SELECT sku, SUM(qty) AS tot FROM ps6_dp_fact GROUP BY sku",
+        None, None, None, None,
+    );
+
+    // reliability shape: aggregate, joins tracked base dim demand_planning,
+    // references the agg IMV, and cross-joins a FROM-subquery (<subquery:k>).
+    let sql = "SELECT dp.kind_id, SUM(ab.tot) AS s, COUNT(*) AS c \
+               FROM ps6_demand_planning dp \
+               JOIN ps6_agg ab ON ab.sku = dp.sku \
+               , (SELECT id FROM ps6_kind_dim) k \
+               WHERE dp.kind_id = k.id \
+               GROUP BY dp.kind_id";
+    crate::create_reflex_ivm("ps6_snap", sql, None, None, None, None);
+
+    // The shape is aggregate, not passthrough.
+    let is_pt = Spi::get_one::<bool>(
+        "SELECT (aggregations->>'is_passthrough')::bool \
+         FROM public.__reflex_ivm_reference WHERE name='ps6_snap'",
+    ).unwrap().unwrap_or(false);
+    assert!(!is_pt, "reliability shape must be aggregate (is_passthrough=false)");
+
+    // Its generated flush for the tracked base dim references NO pt scratch.
+    for op in ["INSERT", "UPDATE", "DELETE"] {
+        let stmts = flush_statements_for("ps6_snap", "ps6_demand_planning", op);
+        assert!(
+            !stmts.iter().any(|s| s.contains("__reflex_pt_")),
+            "aggregate flush ({op}) must not reference a passthrough scratch table: {stmts:#?}"
+        );
+    }
+
+    // And it maintains correctly across a base-dim mutation (IMMEDIATE).
+    Spi::run("INSERT INTO ps6_demand_planning VALUES (3,1,'x')").unwrap();
+    assert_imv_correct("ps6_snap", sql);
+    // audit is green — no missing-internal-table finding for an aggregate IMV.
+    let report: String = Spi::get_one("SELECT reflex_audit('ps6_snap')")
+        .unwrap().unwrap();
+    assert!(
+        !report.contains("internal-tables-exist"),
+        "aggregate reliability shape should have no internal-tables finding:\n{report}"
+    );
 }
 
 /// R2c — PS-5 Bug-1 closer, deterministic. The `sop_incoming_stock_baseline_view`
