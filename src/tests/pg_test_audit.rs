@@ -1051,8 +1051,14 @@ fn pg_test_audit_partitioned_imv_in_custom_schema_under_narrow_search_path() {
 
     Spi::run("SET search_path = public, audit_np").expect("reset");
 
+    // Well-formedness, not a finding count: a clean database legitimately reports
+    // "no findings". This assertion used to read `contains("finding(s)")`, which
+    // only held because this very fixture — a partitioned IMV in a non-public
+    // schema — produced one false orphan-intermediate finding per partition child
+    // (fixed in 1.11.0, PS-4). The check that matters is the `.expect` above: the
+    // audit returned a report instead of raising.
     assert!(
-        report.contains("finding(s)"),
+        report.contains("finding(s)") || report.contains("no findings"),
         "expected a well-formed audit report:\n{}",
         report
     );
