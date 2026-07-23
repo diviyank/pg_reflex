@@ -208,3 +208,69 @@ DO $ps2$ BEGIN
     RAISE NOTICE 'pg_reflex 1.11.0 (PS-2): reflex_rebuild_chain now refuses up front (before any drop) on a decomposed parent (use reflex_reconcile) and on any IMV lacking create_args. Legacy rows were backfilled from their registry columns and marked create_args->>backfilled = true; topk_k and explicit_unpartitioned are NOT reconstructible, so an IMV explicitly created unpartitioned or with a top-K bound should be re-created from its original create_reflex_ivm call to restore those two settings.';
 END $ps2$;
 -- === end PS-2 ==============================================================
+
+
+-- === PS-3: unmaintainable-source visibility ================================
+--
+-- An IMV whose only real sources are materialized views cannot self-maintain:
+-- PG fires no trigger on a matview, so the node is a snapshot frozen at create
+-- time. Before this column pg_reflex recorded it indistinguishably from a
+-- maintainable IMV, so every health surface read clean and reflex_doctor (which
+-- keys off known_stale) could not see it — in prod 40/40 generated sub-IMVs sat
+-- more than two days stale, unflagged.
+--
+-- requires_explicit_refresh records that structurally and PERMANENTLY. It is
+-- kept strictly distinct from known_stale: known_stale means "a flush failed"
+-- and is the authority PS-4's verify_stale_cleared uses to confirm a repair, so
+-- reusing it for a by-design-unmaintainable node would make every
+-- reflex_doctor(fix => TRUE) report a permanent failure. The new column is
+-- surfaced by reflex_ivm_status and as reflex_doctor finding F7, whose action is
+-- refresh_imv_depending_on('<mv>') (which cascades the whole chain) rather than
+-- reflex_reconcile (which only fixes one level). No reconcile or verify path
+-- ever clears it.
+--
+-- BLAST RADIUS: the backfill below flags existing matview-only IMVs. Any
+-- monitoring that alerts on the new column (or the F7 finding count) will begin
+-- firing for them. That is correct — they genuinely cannot self-maintain — but
+-- it is a visible change on upgrade. Mixed-source and normally-maintainable IMVs
+-- are never flagged.
+
+ALTER TABLE public.__reflex_ivm_reference
+    ADD COLUMN IF NOT EXISTS requires_explicit_refresh BOOLEAN NOT NULL DEFAULT FALSE;
+
+-- Backfill: reproduce the create-time per-node verdict from depends_on +
+-- ignored_sources. Flag a row iff it has at least one real source (not a
+-- <subquery:>/<function:> placeholder, not ignored) AND every real source is a
+-- materialized view. Pure SQL (no MODULE_PATHNAME call), so — unlike PS-1's
+-- backfill — it runs inline here without a dlsym of a brand-new symbol.
+WITH real_source AS (
+    SELECT r.name, s AS src
+      FROM public.__reflex_ivm_reference r,
+           LATERAL unnest(COALESCE(r.depends_on, ARRAY[]::TEXT[])) AS s
+     WHERE s NOT LIKE '<%'
+       AND NOT (s = ANY(COALESCE(r.ignored_sources, ARRAY[]::TEXT[])))
+),
+verdict AS (
+    SELECT name,
+           bool_and(EXISTS (SELECT 1 FROM pg_class c
+                             WHERE c.oid = to_regclass(src) AND c.relkind = 'm')) AS all_matviews
+      FROM real_source
+     GROUP BY name
+)
+UPDATE public.__reflex_ivm_reference r
+   SET requires_explicit_refresh = TRUE
+  FROM verdict v
+ WHERE r.name = v.name
+   AND v.all_matviews
+   AND COALESCE(r.requires_explicit_refresh, FALSE) = FALSE;
+
+DO $ps3$
+DECLARE
+    _n BIGINT;
+BEGIN
+    SELECT count(*) INTO _n
+      FROM public.__reflex_ivm_reference
+     WHERE requires_explicit_refresh = TRUE;
+    RAISE NOTICE 'pg_reflex 1.11.0 (PS-3): % IMV(s) flagged requires_explicit_refresh (all sources are materialized views; cannot self-maintain). reflex_ivm_status and reflex_doctor (finding F7) now surface them; the remedy is SELECT refresh_imv_depending_on(''<matview>'') after each REFRESH MATERIALIZED VIEW. The flag is permanent and is never cleared by reconcile or reflex_doctor.', _n;
+END $ps3$;
+-- === end PS-3 ==============================================================
