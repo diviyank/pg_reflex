@@ -287,6 +287,55 @@ fn pg_part_sync_partitions_adds_new_child() {
     assert!(msg.contains("+0 target"),       "manual sync should be a no-op, got: {msg}");
 }
 
+/// PS-8 S2: the advisory lock `reflex_sync_partitions` takes to serialize DDL on
+/// an IMV must use the SAME two-key `(int4, int4)` form as every IMV-name
+/// maintenance lock (immediate/deferred trigger bodies, deferred flush,
+/// partition flush). A one-key `bigint` lock and a two-key lock occupy different
+/// advisory-lock spaces in PostgreSQL and never mutually exclude, so an arity
+/// split silently defeats the per-IMV serialization invariant. Held to end of
+/// this transaction, the lock is inspectable in `pg_locks`: the two-key form
+/// stores `classid = hashtext(view)`, `objid = hashtext(reverse(view))`,
+/// `objsubid = 2`; a one-key form would show `objsubid = 1` and would not split
+/// on those keys at all.
+#[pg_test]
+fn pg_part_sync_advisory_lock_uses_two_key_imv_form() {
+    Spi::run("CREATE TABLE part_lock_a (id BIGINT, region TEXT NOT NULL, amount NUMERIC) PARTITION BY LIST (region)").expect("create");
+    Spi::run("CREATE TABLE part_lock_a_n PARTITION OF part_lock_a FOR VALUES IN ('N')").expect("p1");
+    Spi::run("INSERT INTO part_lock_a (id, region, amount) VALUES (1, 'N', 10)").expect("seed");
+    Spi::run(
+        "SELECT create_reflex_ivm( \
+            'part_lock_a_v', \
+            'SELECT region, SUM(amount) AS total FROM part_lock_a GROUP BY region', \
+            NULL, NULL, NULL, NULL, \
+            ARRAY['region'] \
+         )",
+    )
+    .expect("create");
+
+    // Acquire the sync lock; a pg_advisory_xact_lock is held to end of this
+    // test transaction, so it is still visible in pg_locks afterward.
+    Spi::run("SELECT reflex_sync_partitions('part_lock_a_v')").expect("sync");
+
+    // -1 means "no advisory lock split on (hashtext(view), hashtext(reverse(view)))"
+    // — i.e. a one-key bigint lock, which lives in a different lock space.
+    let subid = Spi::get_one::<i32>(
+        "SELECT COALESCE( \
+            (SELECT objsubid::int FROM pg_locks \
+              WHERE locktype = 'advisory' AND pid = pg_backend_pid() \
+                AND classid = (hashtext('part_lock_a_v'))::oid \
+                AND objid = (hashtext(reverse('part_lock_a_v')))::oid), \
+            -1)",
+    )
+    .expect("pg_locks query failed")
+    .expect("COALESCE always returns a row");
+    assert_eq!(
+        subid, 2,
+        "reflex_sync_partitions must take the two-key (int4,int4) IMV-name advisory lock \
+         so it shares the maintenance lock space (objsubid=2); got objsubid={subid} \
+         (-1 == a one-key bigint lock, which never excludes the two-key maintenance locks)"
+    );
+}
+
 /// Regression: a partitioned PASSTHROUGH IMV (no aggregation, needs_ivm_count
 /// = false) has NO intermediate table — `intermediate_column_spec` returns
 /// None, so `__reflex_intermediate_<view>` is never created. Both the
