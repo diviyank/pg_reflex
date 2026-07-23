@@ -329,9 +329,18 @@ fn pg_scheduled_reconcile_stamps_distinct_timestamps_per_imv() {
 /// PS-7 gaps 1-2 — `batch_size` makes `reflex_scheduled_reconcile` a resumable
 /// driver: a bounded call attempts at most `batch_size` IMVs, reports how many
 /// candidates it deferred via `remaining`, and a second call CONTINUES with the
-/// next IMV rather than restarting. Resumability falls out of the age gate —
-/// clock_timestamp() advances the reconciled IMV past the threshold, so it drops
-/// out of the candidate set on the next call.
+/// next IMV rather than restarting. Resumability falls out of the age gate — a
+/// reconciled IMV's clock_timestamp() write lands after `CURRENT_TIMESTAMP -
+/// max_age`, so it drops out of the candidate set on the next call.
+///
+/// The gate MUST be positive here. With `max_age = 0` this test would be a
+/// false-green: `#[pg_test]` runs in one transaction, so `CURRENT_TIMESTAMP` is
+/// frozen at transaction start while `clock_timestamp()` advances past it —
+/// making the reconciled row drop out for a reason that does NOT hold in
+/// production (where each call is its own transaction with a later
+/// `CURRENT_TIMESTAMP`). Backdating to 2001 and gating on `max_age = 60` makes
+/// the drop-out genuine: a just-reconciled (~now) row is never older than
+/// `CURRENT_TIMESTAMP - 60min` whether the clock is frozen or not.
 #[pg_test]
 fn pg_scheduled_reconcile_batch_size_is_resumable() {
     Spi::run("CREATE TABLE ps7_rz_src (id SERIAL, grp TEXT, val NUMERIC)").expect("create table");
@@ -358,7 +367,7 @@ fn pg_scheduled_reconcile_batch_size_is_resumable() {
     // First bounded call: attempt exactly one, defer the other.
     Spi::run(
         "CREATE TEMP TABLE ps7_rz_call1 AS \
-           SELECT * FROM reflex_scheduled_reconcile(0, 1)",
+           SELECT * FROM reflex_scheduled_reconcile(60, 1)",
     )
     .expect("call1");
 
@@ -377,12 +386,16 @@ fn pg_scheduled_reconcile_batch_size_is_resumable() {
         Spi::get_one("SELECT name FROM ps7_rz_call1 WHERE name LIKE 'ps7_rz_%'")
             .expect("q")
             .expect("v");
-    assert_eq!(first_name, "ps7_rz_a", "candidates are ordered graph_depth, name");
+    assert_eq!(
+        first_name, "ps7_rz_a",
+        "with equal last_update_date the name tiebreaker orders ps7_rz_a first"
+    );
 
-    // Second call continues — the reconciled first IMV is now fresh and drops out.
+    // Second call continues — the reconciled first IMV is now fresh (~now) and
+    // is no longer older than CURRENT_TIMESTAMP - 60min, so it drops out.
     Spi::run(
         "CREATE TEMP TABLE ps7_rz_call2 AS \
-           SELECT * FROM reflex_scheduled_reconcile(0, 1)",
+           SELECT * FROM reflex_scheduled_reconcile(60, 1)",
     )
     .expect("call2");
 
