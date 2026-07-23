@@ -1023,25 +1023,51 @@ fn test_build_merge_count_distinct_nullable_uses_null_safe_join() {
 
     for op in [DeltaOp::Add, DeltaOp::Subtract] {
         let sql = build_merge_sql("intermediate", delta, &plan, op);
-        // Both group key and distinct key must be joined null-safe.
-        assert!(
-            sql.contains("t.\"grp\" IS NOT DISTINCT FROM d.\"grp\""),
-            "group key must be null-safe in {:?} MERGE: {}",
+        // PS-5 — a nullable compound key makes the MERGE a gated pair. The NULL
+        // rows must still match, which the EXISTS-null-gated SAFE variant
+        // guarantees with `IS NOT DISTINCT FROM` on BOTH the group key and the
+        // DISTINCT key. The sargable `=` variant is allowed, but only under the
+        // NOT-EXISTS-null gate, so it can never run when a NULL key is present.
+        let variants: Vec<&str> = sql.split("\n--<<REFLEX_SEP>>--\n").collect();
+        assert_eq!(
+            variants.len(),
+            2,
+            "nullable compound key must emit a gated MERGE pair in {:?}: {}",
             op as u8,
             sql
         );
+        let safe = variants
+            .iter()
+            .find(|m| m.contains("WHERE EXISTS"))
+            .expect("EXISTS-null-gated NULL-safe variant");
         assert!(
-            sql.contains("t.\"maybe_null\" IS NOT DISTINCT FROM d.\"maybe_null\""),
-            "DISTINCT key must be null-safe in {:?} MERGE — otherwise a row with \
-             maybe_null = NULL never matches: {}",
+            safe.contains("t.\"grp\" IS NOT DISTINCT FROM d.\"grp\""),
+            "group key must be null-safe in the SAFE {:?} MERGE variant: {}",
             op as u8,
-            sql
+            safe
         );
-        // The ON clause must NOT use bare `=` on the distinct key.
         assert!(
-            !sql.contains("t.\"maybe_null\" = d.\"maybe_null\""),
-            "bare `=` on nullable DISTINCT key leaves orphan rows: {}",
-            sql
+            safe.contains("t.\"maybe_null\" IS NOT DISTINCT FROM d.\"maybe_null\""),
+            "DISTINCT key must be null-safe in the SAFE {:?} MERGE variant — otherwise \
+             a row with maybe_null = NULL never matches: {}",
+            op as u8,
+            safe
+        );
+        // Any `=` on the DISTINCT key must appear ONLY in the NOT-EXISTS-null-gated
+        // FAST variant, never in the NULL-safe one.
+        assert!(
+            !safe.contains("t.\"maybe_null\" = d.\"maybe_null\""),
+            "the NULL-safe variant must not use bare `=` on the nullable DISTINCT key: {}",
+            safe
+        );
+        let fast = variants
+            .iter()
+            .find(|m| m.contains("WHERE NOT EXISTS"))
+            .expect("NOT-EXISTS-null-gated sargable variant");
+        assert!(
+            fast.contains("__ng.\"grp\" IS NULL OR __ng.\"maybe_null\" IS NULL"),
+            "the fast variant's gate must cover every nullable key column: {}",
+            fast
         );
     }
 }
@@ -1089,16 +1115,29 @@ fn test_build_delta_sql_uses_scratch_table_for_group_by_imv() {
         "targeted DELETE must TRUNCATE the scratch table: {}",
         &sql[..sql.len().min(400)]
     );
-    assert!(
-        sql.contains("USING \"__reflex_scratch_test_view\""),
-        "MERGE must read from scratch table, not inline subquery: {}",
-        &sql[..sql.len().min(400)]
-    );
-    assert!(
-        !sql.contains("USING (SELECT"),
-        "MERGE must never reference a transition table via inline subquery: {}",
-        &sql[..sql.len().min(400)]
-    );
+    // PS-5 — the MERGE must still READ FROM the materialized scratch table. With
+    // a nullable group key the USING is wrapped in a gate subquery
+    // (`USING (SELECT __m.* FROM <scratch> WHERE …)`), but the underlying relation
+    // is the scratch, never a transition table. Scope the checks to the MERGE
+    // statement(s) — the scratch FILL legitimately reads the transition table.
+    let merge_stmts: Vec<&str> = sql
+        .split("\n--<<REFLEX_SEP>>--\n")
+        .filter(|s| s.trim_start().starts_with("MERGE INTO"))
+        .collect();
+    assert!(!merge_stmts.is_empty(), "a MERGE must be emitted: {sql}");
+    for m in &merge_stmts {
+        assert!(
+            m.contains("FROM \"__reflex_scratch_test_view\""),
+            "MERGE must read from the scratch table: {m}"
+        );
+        // The invariant that matters for the cassert SIGABRT: a MERGE USING
+        // subquery must NEVER reference a transition table (`__reflex_new_*` /
+        // `__reflex_old_*`). The PS-5 gate subquery only references the scratch.
+        assert!(
+            !m.contains("__reflex_new_orders") && !m.contains("__reflex_old_orders"),
+            "MERGE USING must never reference a transition table: {m}"
+        );
+    }
     assert!(
         sql.contains("INSERT INTO \"__reflex_affected_test_view\" SELECT"),
         "affected groups must be populated from scratch: {}",
@@ -1268,11 +1307,18 @@ fn test_build_delta_sql_end_query_group_by_uses_scratch_table() {
         "end_query_has_group_by branch must TRUNCATE scratch: {}",
         &sql[..sql.len().min(600)]
     );
-    assert!(
-        !sql.contains("USING (SELECT"),
-        "MERGE must never use inline transition-table subquery: {}",
-        &sql[..sql.len().min(600)]
-    );
+    // PS-5 — the MERGE USING may be a gate subquery over the scratch, but must
+    // never reference a transition table (`__reflex_new_*` / `__reflex_old_*`),
+    // which is the actual cassert-SIGABRT hazard. Scope to the MERGE statements.
+    for m in sql
+        .split("\n--<<REFLEX_SEP>>--\n")
+        .filter(|s| s.trim_start().starts_with("MERGE INTO"))
+    {
+        assert!(
+            !m.contains("__reflex_new_") && !m.contains("__reflex_old_"),
+            "MERGE USING must never reference a transition table: {m}"
+        );
+    }
     // The affected-groups filter must appear before GROUP BY in the target
     // INSERT. PS-5: check each gated variant against its own GROUP BY (see
     // test_build_delta_sql_splice_injects_filter_before_group_by for why a
@@ -1435,11 +1481,17 @@ fn test_build_delta_sql_splice_injects_filter_before_group_by() {
         "targeted splice must use scratch table: {}",
         &sql[..sql.len().min(600)]
     );
-    assert!(
-        !sql.contains("USING (SELECT"),
-        "MERGE must never use inline transition-table subquery: {}",
-        &sql[..sql.len().min(600)]
-    );
+    // PS-5 — MERGE USING may be a gate subquery over the scratch, but must never
+    // reference a transition table (the cassert-SIGABRT hazard). Scope to MERGEs.
+    for m in sql
+        .split("\n--<<REFLEX_SEP>>--\n")
+        .filter(|s| s.trim_start().starts_with("MERGE INTO"))
+    {
+        assert!(
+            !m.contains("__reflex_new_") && !m.contains("__reflex_old_"),
+            "MERGE USING must never reference a transition table: {m}"
+        );
+    }
     // The affected-groups filter must be spliced BEFORE GROUP BY in the target
     // INSERT, so it scopes the intermediate scan rather than the aggregation
     // output (the planner does not reliably push a filter through GROUP BY).
@@ -3723,18 +3775,41 @@ fn merge_using_nullable_key_gates_source_and_uses_equality() {
     );
     // The probe must sit in the USING source, NOT in the ON clause — that is what
     // makes the untaken variant contribute zero source rows instead of merging.
-    let using_pos = sql.find(" USING ").expect("MERGE has USING");
-    let on_pos = sql.find(" ON ").expect("MERGE has ON");
-    let gate_pos = sql.find("AS __ng WHERE").expect("gate present");
+    let first_using = sql.find(" USING ").expect("MERGE has USING");
+    let first_on = sql.find(" ON ").expect("MERGE has ON");
+    let first_gate = sql.find("AS __ng WHERE").expect("gate present");
     assert!(
-        gate_pos > using_pos && gate_pos < on_pos,
+        first_gate > first_using && first_gate < first_on,
         "gate must live inside the USING source (between USING and ON): {sql}"
     );
-    // Exactly one MERGE statement — never two, which would double-apply.
+
+    // Two DIFFERENT gated MERGEs, one per variant. Two DIFFERENT statements do NOT
+    // double-apply: each variant's USING source is gated to yield rows only when
+    // it is the correct one; the other yields zero rows and merges nothing.
+    // (Verified end-to-end in pg_test_correctness_merge_gate_apply_exactly_once.)
+    // What WOULD double-apply is emitting the SAME merge twice, so assert the two
+    // are a sargable/NULL-safe complementary pair — not that there is only one.
+    let merges: Vec<&str> = sql.split("\n--<<REFLEX_SEP>>--\n").collect();
     assert_eq!(
-        sql.matches("MERGE INTO").count(),
-        1,
-        "MERGE must never be duplicated (that would double-apply the delta): {sql}"
+        merges.len(),
+        2,
+        "nullable group key must emit a gated MERGE pair: {sql}"
+    );
+    let fast = merges
+        .iter()
+        .find(|m| m.contains("WHERE NOT EXISTS"))
+        .expect("fast (NOT EXISTS-gated) variant");
+    let safe = merges
+        .iter()
+        .find(|m| m.contains("WHERE EXISTS"))
+        .expect("safe (EXISTS-gated) variant");
+    assert!(
+        fast.contains("ON t.\"city\" = d.\"city\"") && !fast.contains("IS NOT DISTINCT FROM"),
+        "the NOT-EXISTS-gated variant must use sargable `=` ON: {fast}"
+    );
+    assert!(
+        safe.contains("ON t.\"city\" IS NOT DISTINCT FROM d.\"city\""),
+        "the EXISTS-gated variant must keep the NULL-safe ON: {safe}"
     );
 }
 

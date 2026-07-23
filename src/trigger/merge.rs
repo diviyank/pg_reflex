@@ -81,6 +81,20 @@ pub(crate) fn build_merge_using(
         .collect::<Vec<_>>()
         .join(" AND ");
 
+    // PS-5 — the join columns that are actually NULLABLE (the sentinel
+    // `__reflex_group` is a constant, never NULL, so it is excluded and its
+    // single-row MERGE is left byte-for-byte unchanged). When any exist, the
+    // `ON` above is non-sargable (`IS NOT DISTINCT FROM`), which forces the
+    // MERGE into a nested loop over the whole intermediate — 20.7 ms at 200k
+    // groups / 1 delta row, and the dominant cost of the whole flush at scale.
+    let nullable_join_cols: Vec<&String> = join_cols
+        .iter()
+        .filter(|c| {
+            let unquoted = c.trim_matches('"');
+            unquoted != "__reflex_group" && !plan.not_null_columns.contains(unquoted)
+        })
+        .collect();
+
     // WHEN MATCHED THEN UPDATE SET clauses
     let mut set_clauses: Vec<String> = Vec::new();
     for ic in &plan.intermediate_columns {
@@ -211,13 +225,61 @@ pub(crate) fn build_merge_using(
         DeltaOp::Subtract => String::new(),
     };
 
+    let one_merge = |using: &str, on: &str| -> String {
+        format!(
+            "MERGE INTO {} AS t USING {} AS d ON {} WHEN MATCHED THEN UPDATE SET {}{}",
+            intermediate_tbl,
+            using,
+            on,
+            set_clauses.join(", "),
+            not_matched
+        )
+    };
+
+    if nullable_join_cols.is_empty() {
+        // All-NOT-NULL (or sentinel-only) key: `on_clause` is already sargable.
+        return one_merge(using_clause, &on_clause);
+    }
+
+    // PS-5 — gate the MERGE into a sargable/NULL-safe pair. MERGE is NOT
+    // idempotent, so the target-sync trick of emitting the statement twice would
+    // double-apply the delta. Instead the gate lives in the USING SOURCE: the
+    // untaken variant's source yields zero rows, so neither WHEN MATCHED nor WHEN
+    // NOT MATCHED can fire. Verified for real (not just EXPLAIN): NULL-free
+    // scratch → `MERGE 1`/`MERGE 0`, NULL-keyed scratch → `MERGE 0`/`MERGE 1`,
+    // each applying the delta exactly once. See the ATOMICITY INVARIANT on
+    // `AffectedMatch` — the flush's per-source scratch is rebuilt (TRUNCATE +
+    // INSERT) under lock within the same txn, so no writer can change its
+    // NULL-ness between the two MERGEs.
+    //
+    // The gate probes the SOURCE `d` (the scratch/delta), not `__reflex_affected`:
+    // for a source row with a non-NULL key, `t.k IS NOT DISTINCT FROM d.k` and
+    // `t.k = d.k` select the same target rows, so `=` is valid exactly when the
+    // source has no NULL key.
+    let gate_disjunction = nullable_join_cols
+        .iter()
+        .map(|c| format!("__ng.{} IS NULL", c))
+        .collect::<Vec<_>>()
+        .join(" OR ");
+    let gate = format!(
+        "EXISTS (SELECT 1 FROM {} AS __ng WHERE {})",
+        using_clause, gate_disjunction
+    );
+    let fast_on = join_cols
+        .iter()
+        .map(|c| format!("t.{} = d.{}", c, c))
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    let fast_using = format!(
+        "(SELECT __m.* FROM {} AS __m WHERE NOT {})",
+        using_clause, gate
+    );
+    let safe_using = format!("(SELECT __m.* FROM {} AS __m WHERE {})", using_clause, gate);
+
     format!(
-        "MERGE INTO {} AS t USING {} AS d ON {} WHEN MATCHED THEN UPDATE SET {}{}",
-        intermediate_tbl,
-        using_clause,
-        on_clause,
-        set_clauses.join(", "),
-        not_matched
+        "{}\n--<<REFLEX_SEP>>--\n{}",
+        one_merge(&fast_using, &fast_on),
+        one_merge(&safe_using, &on_clause)
     )
 }
 
@@ -458,11 +520,6 @@ pub fn push_topk_shrunk_groups_capture(
         .map(|c| format!("i.\"{}\"", c))
         .collect::<Vec<_>>()
         .join(", ");
-    let join_cond = group_cols
-        .iter()
-        .map(|gc| format!("i.\"{gc}\" IS NOT DISTINCT FROM a.\"{gc}\"", gc = gc))
-        .collect::<Vec<_>>()
-        .join(" AND ");
 
     let predicates: Vec<String> = topk_cols
         .iter()
@@ -478,18 +535,51 @@ pub fn push_topk_shrunk_groups_capture(
         .collect();
     let where_clause = predicates.join(" OR ");
 
+    // PS-5 — the `i JOIN affected a ON i.gc IS NOT DISTINCT FROM a.gc` join is the
+    // same non-sargable nested-loop-over-the-whole-intermediate pattern as the
+    // target sync. Gate it into a sargable/NULL-safe pair on whether the affected
+    // set contains a NULL key (the group cols here are the affected table's own
+    // column names).
+    let quoted_group_cols: Vec<String> = group_cols.iter().map(|c| format!("\"{}\"", c)).collect();
+    let join_on = |eq: bool| -> String {
+        group_cols
+            .iter()
+            .map(|gc| {
+                if eq {
+                    format!("i.\"{gc}\" = a.\"{gc}\"", gc = gc)
+                } else {
+                    format!("i.\"{gc}\" IS NOT DISTINCT FROM a.\"{gc}\"", gc = gc)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" AND ")
+    };
+    let insert_with = |join_cond: &str, extra_gate: &str| -> String {
+        format!(
+            "INSERT INTO {shrunk_tbl} SELECT DISTINCT {proj} \
+             FROM {intermediate_tbl} i JOIN {affected_tbl} a ON {join_cond} \
+             WHERE ({where_clause}){extra_gate}",
+            shrunk_tbl = shrunk_tbl,
+            proj = proj,
+            intermediate_tbl = intermediate_tbl,
+            affected_tbl = affected_tbl,
+            join_cond = join_cond,
+            where_clause = where_clause,
+            extra_gate = extra_gate,
+        )
+    };
+
     stmts.push(format!("TRUNCATE {}", shrunk_tbl));
-    stmts.push(format!(
-        "INSERT INTO {shrunk_tbl} SELECT DISTINCT {proj} \
-         FROM {intermediate_tbl} i JOIN {affected_tbl} a ON {join_cond} \
-         WHERE {where_clause}",
-        shrunk_tbl = shrunk_tbl,
-        proj = proj,
-        intermediate_tbl = intermediate_tbl,
-        affected_tbl = affected_tbl,
-        join_cond = join_cond,
-        where_clause = where_clause,
-    ));
+    match affected_null_key_gate(affected_tbl, &quoted_group_cols, &plan.not_null_columns) {
+        None => {
+            // All group keys NOT NULL: `=` is sargable and semantically exact.
+            stmts.push(insert_with(&join_on(true), ""));
+        }
+        Some(gate) => {
+            stmts.push(insert_with(&join_on(true), &format!(" AND NOT {}", gate)));
+            stmts.push(insert_with(&join_on(false), &format!(" AND {}", gate)));
+        }
+    }
     true
 }
 
@@ -610,24 +700,50 @@ pub(crate) fn build_min_max_recompute_sql_inner(
         None => orig_base_query.to_string(),
     };
 
-    let join_cond: Vec<String> = group_cols
-        .iter()
-        .map(|gc| {
-            format!(
-                "{}.\"{}\" IS NOT DISTINCT FROM __src.\"{}\"",
-                intermediate_tbl, gc, gc
-            )
-        })
-        .collect();
+    // PS-5 — both the recompute UPDATE's join to `__src` and (below) the EXISTS
+    // firing gate's join to `__aff` matched the group key with `IS NOT DISTINCT
+    // FROM`, non-sargable, forcing a nested loop over the whole intermediate. The
+    // firing gate runs on EVERY UPDATE flush of EVERY MIN/MAX IMV. Gate both into
+    // a sargable/NULL-safe pair, keyed on whether the AFFECTED set holds a NULL
+    // group key. `__aff` is the probe for both joins: a NULL key is in `__aff`
+    // iff it is in `__src` (both are scoped to the affected groups), and `__aff`
+    // is a cheap indexed table whereas `__src` is a re-aggregation subquery that
+    // must not be evaluated twice.
+    let update_join = |eq: bool| -> String {
+        group_cols
+            .iter()
+            .map(|gc| {
+                if eq {
+                    format!("{}.\"{}\" = __src.\"{}\"", intermediate_tbl, gc, gc)
+                } else {
+                    format!(
+                        "{}.\"{}\" IS NOT DISTINCT FROM __src.\"{}\"",
+                        intermediate_tbl, gc, gc
+                    )
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" AND ")
+    };
+    let build_update = |eq: bool| -> String {
+        format!(
+            "UPDATE {} SET {} FROM ({}) AS __src WHERE {} AND ({})",
+            intermediate_tbl,
+            set_parts.join(", "),
+            scoped_source,
+            update_join(eq),
+            null_check.join(" OR ")
+        )
+    };
 
-    let update_sql = format!(
-        "UPDATE {} SET {} FROM ({}) AS __src WHERE {} AND ({})",
-        intermediate_tbl,
-        set_parts.join(", "),
-        scoped_source,
-        join_cond.join(" AND "),
-        null_check.join(" OR ")
-    );
+    let Some(at) = affected_tbl else {
+        // Unscoped full recompute (no affected table to gate on). Use `=` when
+        // the key is entirely NOT NULL, else the NULL-safe form.
+        let all_not_null = group_cols
+            .iter()
+            .all(|gc| plan.not_null_columns.contains(gc.as_str()));
+        return Some(build_update(all_not_null));
+    };
 
     // 1.3.0: gate the recompute on `EXISTS (intermediate row with NULL slot
     // in an affected group)`. The post-MERGE topk-scalar refresh sets the
@@ -635,31 +751,57 @@ pub(crate) fn build_min_max_recompute_sql_inner(
     // only needs to fire for groups that genuinely underflowed. An always-
     // executing UPDATE used to trigger the source aggregation even when no
     // group needed it, which dominated the bench.
-    if let Some(at) = affected_tbl {
-        let aff_join_cond: Vec<String> = group_cols
+    let exists_join = |eq: bool| -> String {
+        group_cols
             .iter()
             .map(|gc| {
-                format!(
-                    "{}.\"{}\" IS NOT DISTINCT FROM __aff.\"{}\"",
-                    intermediate_tbl, gc, gc
-                )
+                if eq {
+                    format!("{}.\"{}\" = __aff.\"{}\"", intermediate_tbl, gc, gc)
+                } else {
+                    format!(
+                        "{}.\"{}\" IS NOT DISTINCT FROM __aff.\"{}\"",
+                        intermediate_tbl, gc, gc
+                    )
+                }
             })
-            .collect();
-        let exists_check = format!(
+            .collect::<Vec<_>>()
+            .join(" AND ")
+    };
+    let exists_check = |eq: bool| -> String {
+        format!(
             "EXISTS (SELECT 1 FROM {tbl} JOIN {at} __aff ON {join} WHERE {nullc})",
             tbl = intermediate_tbl,
             at = at,
-            join = aff_join_cond.join(" AND "),
+            join = exists_join(eq),
             nullc = null_check.join(" OR "),
-        );
-        return Some(format!(
+        )
+    };
+    let do_block = |check: &str, upd: &str| -> String {
+        format!(
             "DO $_reflex_recompute$ BEGIN IF {check} THEN {upd}; END IF; END $_reflex_recompute$",
-            check = exists_check,
-            upd = update_sql,
-        ));
-    }
+            check = check,
+            upd = upd,
+        )
+    };
 
-    Some(update_sql)
+    let quoted_group_cols: Vec<String> = group_cols.iter().map(|c| format!("\"{}\"", c)).collect();
+    match affected_null_key_gate(at, &quoted_group_cols, &plan.not_null_columns) {
+        None => {
+            // All group keys NOT NULL: `=` is sargable and semantically exact.
+            Some(do_block(&exists_check(true), &build_update(true)))
+        }
+        Some(gate) => {
+            let fast = do_block(
+                &format!("{} AND NOT {}", exists_check(true), gate),
+                &build_update(true),
+            );
+            let safe = do_block(
+                &format!("{} AND {}", exists_check(false), gate),
+                &build_update(false),
+            );
+            Some(format!("{}\n--<<REFLEX_SEP>>--\n{}", fast, safe))
+        }
+    }
 }
 
 /// Build a match condition for affected groups, used as the WHERE filter on
