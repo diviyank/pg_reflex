@@ -1088,10 +1088,16 @@ pub(crate) fn reflex_sync_partitions_impl(view_name: &str, drop_orphans: bool) -
 
         let mut out = SyncResult::default();
 
-        // Advisory lock keyed by IMV name (hashed) so concurrent calls
-        // serialize their DDL on this view.
+        // Advisory lock keyed by IMV name so concurrent callers serialize their
+        // DDL on this view. INVARIANT: every IMV-name advisory lock in pg_reflex
+        // uses the two-key `(hashtext(name), hashtext(reverse(name)))` form
+        // (immediate/deferred trigger bodies, deferred flush at
+        // trigger/deferred.rs, and partition flush at lib.rs). A one-key `bigint`
+        // lock and a two-key lock occupy different advisory-lock spaces in
+        // PostgreSQL and never mutually exclude, so sync MUST take the same
+        // two-key form to share that space rather than opening a parallel one.
         let _ = client.update(
-            "SELECT pg_advisory_xact_lock(hashtext($1))",
+            "SELECT pg_advisory_xact_lock(hashtext($1), hashtext(reverse($1)))",
             None,
             &[unsafe {
                 DatumWithOid::new(view_name.to_string(), PgBuiltInOids::TEXTOID.oid().value())
