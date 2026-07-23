@@ -185,22 +185,20 @@ fn detect_pending_queue_issues(
         let finding = p.describe();
         let outcome = if fix {
             if p.is_capped() {
-                // Exactly one re-arm per doctor invocation per capped root. The cap
-                // exists to stop the commit-time drain retrying a broken root
-                // forever; an explicit `fix => TRUE` is an operator asking for one
-                // more attempt, not a licence to retry without limit.
-                let reset = apply_doctor_repair(&format!(
-                    "SELECT public.reflex_reset_partition_failures('{}')",
-                    escaped_root
-                ));
-                if reset != "fixed" {
+                // Grant exactly ONE attempt, by re-arming to CAP - 1 rather than 0:
+                // the flush below then runs, and if it fails the drain's own
+                // `failures + 1` re-caps the root immediately. Zeroing would hand
+                // the commit-time drain a full fresh budget every time a cron ran
+                // the doctor, so a poison root would never be permanently skipped —
+                // and would also hide the root from this report for an hour.
+                if crate::partition::rearm_capped_partition_root(&p.source_root) == 0 {
                     rows.push((
                         check_id.to_string(),
                         "WARNING".to_string(),
                         p.source_root,
                         finding,
                         action,
-                        reset,
+                        "failed:could not re-arm the capped root".to_string(),
                     ));
                     continue;
                 }
