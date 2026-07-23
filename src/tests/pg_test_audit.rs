@@ -1528,3 +1528,159 @@ fn f6_residue_probe_error_degrades_to_advisory() {
         "a failed probe must NOT yield a runnable reconcile fix:\n{report}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// PS-4: an orphan check must not name a live IMV's own internals
+// ---------------------------------------------------------------------------
+
+#[pg_test]
+fn ps4_bare_name_imv_aux_tables_are_not_orphans() {
+    Spi::run("CREATE TABLE ps4_n3_src (id INT PRIMARY KEY, g TEXT, v INT)").expect("src");
+    Spi::run("INSERT INTO ps4_n3_src VALUES (1, 'a', 10)").expect("rows");
+    crate::create_reflex_ivm(
+        "ps4_n3_agg",
+        "SELECT g, sum(v) AS s FROM ps4_n3_src GROUP BY g",
+        Some("g"),
+        None,
+        Some("IMMEDIATE"),
+        None,
+    );
+
+    let report: String = Spi::get_one("SELECT reflex_audit()")
+        .expect("ok")
+        .expect("non-null");
+    assert!(
+        !report.contains("ps4_n3_agg"),
+        "a live bare-name IMV's own aux tables must not be reported as orphans:\n{}",
+        report
+    );
+}
+
+#[pg_test]
+fn ps4_qualified_name_imv_aux_tables_are_not_orphans() {
+    Spi::run("CREATE SCHEMA ps4q").expect("schema");
+    Spi::run("CREATE TABLE ps4q.src (id INT PRIMARY KEY, g TEXT, v INT)").expect("src");
+    Spi::run("INSERT INTO ps4q.src VALUES (1, 'a', 10)").expect("rows");
+    crate::create_reflex_ivm(
+        "ps4q.agg",
+        "SELECT g, sum(v) AS s FROM ps4q.src GROUP BY g",
+        Some("g"),
+        None,
+        Some("IMMEDIATE"),
+        None,
+    );
+
+    let report: String = Spi::get_one("SELECT reflex_audit()")
+        .expect("ok")
+        .expect("non-null");
+    assert!(
+        !report.contains("orphan-"),
+        "a live schema-qualified IMV's own aux tables must not be reported as orphans:\n{}",
+        report
+    );
+}
+
+#[pg_test]
+fn ps4_partition_children_of_a_live_imv_are_not_orphans() {
+    Spi::run("CREATE TABLE ps4_part_src (region TEXT NOT NULL, v INT) PARTITION BY LIST (region)")
+        .expect("src");
+    Spi::run("CREATE TABLE ps4_part_src_a PARTITION OF ps4_part_src FOR VALUES IN ('a')")
+        .expect("a");
+    Spi::run("CREATE TABLE ps4_part_src_b PARTITION OF ps4_part_src FOR VALUES IN ('b')")
+        .expect("b");
+    Spi::run("INSERT INTO ps4_part_src VALUES ('a', 1), ('b', 2)").expect("rows");
+    crate::create_reflex_ivm(
+        "ps4_part_agg",
+        "SELECT region, sum(v) AS s FROM ps4_part_src GROUP BY region",
+        Some("region"),
+        None,
+        Some("IMMEDIATE"),
+        Some("region"),
+    );
+
+    let report: String = Spi::get_one("SELECT reflex_audit()")
+        .expect("ok")
+        .expect("non-null");
+    assert!(
+        !report.contains("orphan-"),
+        "partition children of a live IMV's intermediate table are not orphans:\n{}",
+        report
+    );
+}
+
+#[pg_test]
+fn ps4_genuine_orphans_are_still_detected_alongside_a_live_imv() {
+    Spi::run("CREATE TABLE ps4_live_src (id INT PRIMARY KEY, g TEXT, v INT)").expect("src");
+    Spi::run("INSERT INTO ps4_live_src VALUES (1, 'a', 10)").expect("rows");
+    crate::create_reflex_ivm(
+        "ps4_live_agg",
+        "SELECT g, sum(v) AS s FROM ps4_live_src GROUP BY g",
+        Some("g"),
+        None,
+        Some("IMMEDIATE"),
+        None,
+    );
+
+    Spi::run("CREATE TABLE __reflex_intermediate_ps4_ghost (g TEXT, n BIGINT)").expect("i");
+    Spi::run(
+        "CREATE UNLOGGED TABLE __reflex_delta_ps4_ghost (__reflex_op TEXT NOT NULL, id BIGINT)",
+    )
+    .expect("d");
+    Spi::run("CREATE TABLE __reflex_scratch_ps4_ghost (g TEXT, n BIGINT)").expect("s");
+
+    let report: String = Spi::get_one("SELECT reflex_audit()")
+        .expect("ok")
+        .expect("non-null");
+    for needle in [
+        "__reflex_intermediate_ps4_ghost",
+        "__reflex_delta_ps4_ghost",
+        "__reflex_scratch_ps4_ghost",
+    ] {
+        assert!(
+            report.contains(needle),
+            "genuine orphan {} must still be detected:\n{}",
+            needle,
+            report
+        );
+    }
+    assert!(
+        !report.contains("ps4_live_agg"),
+        "the live IMV's own aux tables must not be reported:\n{}",
+        report
+    );
+    Spi::run("DROP TABLE __reflex_intermediate_ps4_ghost").expect("c1");
+    Spi::run("DROP TABLE __reflex_delta_ps4_ghost").expect("c2");
+    Spi::run("DROP TABLE __reflex_scratch_ps4_ghost").expect("c3");
+}
+
+/// Isolates the partition-child false positive from the bare-name one: this IMV
+/// is schema-qualified, so only the `relkind = 'r'` scan (which skips the
+/// partitioned parent but returns every leaf) can produce a finding.
+#[pg_test]
+fn ps4_partition_children_of_a_qualified_imv_are_not_orphans() {
+    Spi::run("CREATE SCHEMA ps4pq").expect("schema");
+    Spi::run(
+        "CREATE TABLE ps4pq.src (region TEXT NOT NULL, v INT) PARTITION BY LIST (region)",
+    )
+    .expect("src");
+    Spi::run("CREATE TABLE ps4pq.src_a PARTITION OF ps4pq.src FOR VALUES IN ('a')").expect("a");
+    Spi::run("CREATE TABLE ps4pq.src_b PARTITION OF ps4pq.src FOR VALUES IN ('b')").expect("b");
+    Spi::run("INSERT INTO ps4pq.src VALUES ('a', 1), ('b', 2)").expect("rows");
+    crate::create_reflex_ivm(
+        "ps4pq.agg",
+        "SELECT region, sum(v) AS s FROM ps4pq.src GROUP BY region",
+        Some("region"),
+        None,
+        Some("IMMEDIATE"),
+        Some("region"),
+    );
+
+    let report: String = Spi::get_one("SELECT reflex_audit()")
+        .expect("ok")
+        .expect("non-null");
+    assert!(
+        !report.contains("orphan-"),
+        "intermediate partition children of a live qualified IMV are not orphans:\n{}",
+        report
+    );
+}
