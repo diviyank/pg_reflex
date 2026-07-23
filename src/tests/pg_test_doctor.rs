@@ -3,7 +3,10 @@ use pgrx::pg_sys::panic::ErrorReportable;
 #[pg_test]
 fn f10_doctor_dry_run_is_read_only() {
     // Seed a wedged pending row + a known_stale IMV.
-    Spi::run("INSERT INTO public.__reflex_partition_pending (source_root, attempts) VALUES ('d.root', 5)").unwrap();
+    // `failures`, not `attempts`: an enqueue counter yields no finding at all
+    // (attempt_age ~ 0), which would leave this test's property carried entirely
+    // by the seeded known_stale IMV.
+    Spi::run("INSERT INTO public.__reflex_partition_pending (source_root, failures) VALUES ('d.root', 5)").unwrap();
     Spi::run("INSERT INTO public.__reflex_ivm_reference (name, graph_depth, known_stale, stale_reason) VALUES ('d.imv', 0, TRUE, 'boom')").unwrap();
     // Snapshot state.
     let pending_before = Spi::get_one::<i64>("SELECT count(*) FROM public.__reflex_partition_pending WHERE source_root='d.root'").unwrap().unwrap();
@@ -15,6 +18,8 @@ fn f10_doctor_dry_run_is_read_only() {
     assert_eq!(pending_before, pending_after, "dry run must not drain the queue");
     let still_stale = Spi::get_one::<bool>("SELECT known_stale FROM public.__reflex_ivm_reference WHERE name='d.imv'").unwrap().unwrap();
     assert!(still_stale, "dry run must not clear known_stale");
+    let failures = Spi::get_one::<i32>("SELECT failures FROM public.__reflex_partition_pending WHERE source_root='d.root'").unwrap().unwrap();
+    assert_eq!(failures, 5, "dry run must not re-arm the failure counter");
 }
 
 #[pg_test]
@@ -1453,4 +1458,106 @@ fn ps4_reset_partition_failures_rearms_roots() {
     .expect("q")
     .unwrap_or(-1);
     assert_eq!(remaining, 0, "no root is left with a failure count");
+}
+
+// --- Review BLOCKING 1: the re-arm must not defeat the cap ------------------
+
+#[pg_test]
+fn ps4_failed_rearm_leaves_the_root_capped_and_visible() {
+    // The cap's guarantee is that a poison root is EVENTUALLY skipped for good.
+    // Re-arming to 0 grants the commit-time drain five fresh attempts, not one,
+    // and drops the row below both doctor gates (failures >= max_attempts,
+    // attempt_age > 1h) — so a root the doctor just failed to repair is reported
+    // by nothing for an hour and a cron cycles it 5 -> 0 -> 1 -> ... forever.
+    Spi::run("CREATE TABLE ps4_vis_src (region TEXT NOT NULL, v INT) PARTITION BY LIST (region)")
+        .expect("src");
+    Spi::run("CREATE TABLE ps4_vis_src_a PARTITION OF ps4_vis_src FOR VALUES IN ('a')")
+        .expect("a");
+    Spi::run(
+        "INSERT INTO public.__reflex_ivm_reference \
+            (name, graph_depth, depends_on, partition_columns, partition_strategy, enabled) \
+         VALUES ('ps4_vis_ghost', 0, ARRAY['public.ps4_vis_src'], ARRAY['region'], 'LIST', TRUE)",
+    )
+    .expect("ghost");
+    Spi::run(
+        "INSERT INTO public.__reflex_partition_pending (source_root, failures) \
+         VALUES ('public.ps4_vis_src', 5)",
+    )
+    .expect("seed");
+
+    let first: String = Spi::get_one(
+        "SELECT outcome FROM reflex_doctor(NULL, TRUE) \
+         WHERE object = 'public.ps4_vis_src' LIMIT 1",
+    )
+    .expect("q")
+    .expect("row");
+    assert!(
+        first.starts_with("failed:"),
+        "the repair could not drain the root, got '{}'",
+        first
+    );
+
+    let failures: i32 = Spi::get_one(
+        "SELECT failures FROM public.__reflex_partition_pending \
+          WHERE source_root = 'public.ps4_vis_src'",
+    )
+    .expect("q")
+    .unwrap_or(-1);
+    assert_eq!(
+        failures, 5,
+        "a failed repair must leave the root re-capped, not below the cap"
+    );
+
+    let second: i64 = Spi::get_one(
+        "SELECT count(*) FROM reflex_doctor() WHERE object = 'public.ps4_vis_src'",
+    )
+    .expect("q")
+    .unwrap_or(-1);
+    assert_eq!(
+        second, 1,
+        "the next doctor invocation must still see the wedged root"
+    );
+}
+
+#[pg_test]
+fn ps4_public_reset_primitive_still_zeroes() {
+    // The operator-facing contract is unchanged: an explicit call is a full reset.
+    Spi::run(
+        "INSERT INTO public.__reflex_partition_pending (source_root, failures) \
+         VALUES ('ps4_zero.root', 5)",
+    )
+    .expect("seed");
+    let n = Spi::get_one::<i64>("SELECT reflex_reset_partition_failures('ps4_zero.root')")
+        .expect("q")
+        .expect("count");
+    assert_eq!(n, 1);
+    let f: i32 = Spi::get_one(
+        "SELECT failures FROM public.__reflex_partition_pending \
+          WHERE source_root = 'ps4_zero.root'",
+    )
+    .expect("q")
+    .unwrap_or(-1);
+    assert_eq!(f, 0, "the public primitive zeroes, unlike the doctor's re-arm");
+}
+
+#[pg_test]
+fn ps4_dry_run_does_not_touch_the_failure_counter() {
+    // 06bdec9 added a write to the pending-queue path; it is gated inside `if fix`
+    // and nothing asserted that.
+    Spi::run(
+        "INSERT INTO public.__reflex_partition_pending (source_root, failures) \
+         VALUES ('ps4_dry.root', 5)",
+    )
+    .expect("seed");
+    let n: i64 = Spi::get_one("SELECT count(*) FROM reflex_doctor() WHERE object = 'ps4_dry.root'")
+        .expect("q")
+        .unwrap_or(-1);
+    assert_eq!(n, 1, "the capped root is reported");
+    let f: i32 = Spi::get_one(
+        "SELECT failures FROM public.__reflex_partition_pending \
+          WHERE source_root = 'ps4_dry.root'",
+    )
+    .expect("q")
+    .unwrap_or(-1);
+    assert_eq!(f, 5, "a dry run must not re-arm anything");
 }
