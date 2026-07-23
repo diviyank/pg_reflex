@@ -356,3 +356,84 @@ fn replay_sop_baseline_bool_or_nullable_key_is_gated_and_correct() {
     Spi::run("DELETE FROM r2c_pb WHERE region IS NULL").unwrap();                 // shrink NULL group
     assert_imv_correct("r2c_v", sql);
 }
+
+/// PS-6 F1 — exercise the ACTUAL shipped 1.10.11→1.11.0 migration `DO $ps6$`
+/// block (extracted from the migration file at compile time, so this cannot
+/// drift from what ships) against a live wedged passthrough IMV. The pgrx test
+/// harness installs the extension fresh and never runs the migration chain, so
+/// without this the migration SQL is untested — and it carries real logic (a
+/// data-modifying CTE with array_agg, the known_stale marking).
+///
+/// The block must (1) recreate the missing pt scratch pair via
+/// reflex_rebuild_triggers and (2) mark the wedged IMV known_stale with a PS-6
+/// stale_reason — NOT silently declare full recovery — so the existing F3/F4
+/// reflex_doctor path surfaces it and prescribes reflex_reconcile, which then
+/// clears known_stale once the lost deltas are backfilled.
+#[pg_test]
+fn ps6_migration_do_block_recreates_scratch_and_marks_known_stale() {
+    let migration = include_str!("../../sql/pg_reflex--1.10.11--1.11.0.sql");
+    let start = migration.find("DO $ps6$").expect("migration must contain the PS-6 DO block");
+    let end = migration[start..].find("$ps6$;").expect("PS-6 block must terminate") + start
+        + "$ps6$;".len();
+    let do_block = &migration[start..end];
+
+    Spi::run("CREATE TABLE ps6m_src (id INT PRIMARY KEY, grp TEXT)").unwrap();
+    Spi::run("INSERT INTO ps6m_src VALUES (1,'a')").unwrap();
+    let sql = "SELECT id, grp FROM ps6m_src";
+    crate::create_reflex_ivm("ps6m_v", sql, Some("id"), None, Some("DEFERRED"), None);
+
+    let pt_new = "__reflex_pt_new_ps6m_v_ps6m_src";
+    let pt_old = "__reflex_pt_old_ps6m_v_ps6m_src";
+    Spi::run(&format!("DROP TABLE \"{pt_new}\"")).unwrap();
+    Spi::run(&format!("DROP TABLE \"{pt_old}\"")).unwrap();
+
+    // Wedge it: a deferred flush records the 42P01 in last_error and (the bug
+    // this whole fix is about) loses the staged delta.
+    Spi::run("INSERT INTO ps6m_src VALUES (2,'b')").unwrap();
+    Spi::run("SELECT reflex_flush_deferred('ps6m_src')").expect("flush swallows the 42P01");
+    let wedged_err = Spi::get_one::<String>(
+        "SELECT last_error FROM public.__reflex_ivm_reference WHERE name='ps6m_v'",
+    )
+    .unwrap();
+    assert!(
+        wedged_err.as_deref().unwrap_or("").contains("does not exist"),
+        "precondition: IMV must carry the 42P01 last_error, got {wedged_err:?}"
+    );
+
+    // Run the real migration recovery block.
+    Spi::run(do_block).expect("the shipped PS-6 DO block must execute");
+
+    assert!(
+        ps6_regclass_exists(pt_new) && ps6_regclass_exists(pt_old),
+        "migration must recreate the pt scratch pair"
+    );
+    let (stale, reason) = Spi::connect(|c| {
+        let row = c
+            .select(
+                "SELECT known_stale, stale_reason FROM public.__reflex_ivm_reference WHERE name='ps6m_v'",
+                None,
+                &[],
+            )
+            .unwrap()
+            .first();
+        (
+            row.get_by_name::<bool, _>("known_stale").unwrap().unwrap_or(false),
+            row.get_by_name::<String, _>("stale_reason").unwrap().unwrap_or_default(),
+        )
+    });
+    assert!(stale, "migration must mark the wedged IMV known_stale (deltas were lost)");
+    assert!(
+        reason.contains("PS-6"),
+        "known_stale must carry the PS-6 recovery reason, got: {reason:?}"
+    );
+
+    // reflex_reconcile is the prescribed backfill and must clear known_stale.
+    Spi::run("SELECT reflex_reconcile('ps6m_v')").expect("reconcile backfills");
+    let still_stale = Spi::get_one::<bool>(
+        "SELECT known_stale FROM public.__reflex_ivm_reference WHERE name='ps6m_v'",
+    )
+    .unwrap()
+    .unwrap_or(true);
+    assert!(!still_stale, "reflex_reconcile must clear known_stale");
+    assert_imv_correct("ps6m_v", sql);
+}

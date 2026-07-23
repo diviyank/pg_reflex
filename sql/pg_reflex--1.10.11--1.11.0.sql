@@ -169,15 +169,27 @@ END $ps4$;
 -- every flush. If that pair is missing — an older create loop that didn't cover
 -- the source, a partial create, or a manual drop — every flush fails fast with
 -- `relation "__reflex_pt_new_…" does not exist` (SQLSTATE 42P01), is swallowed
--- as a WARNING inside the per-IMV subtransaction, and the IMV goes silently
--- stale forever. reflex_rebuild_triggers now recreates the pair idempotently;
--- invoke it once per source feeding a passthrough IMV so wedged installs heal
--- on upgrade without a full drop+recreate. Healthy IMVs no-op (CREATE IF NOT
--- EXISTS). Bare source names that resolve ambiguously are skipped (the function
--- returns an ERROR string rather than raising), leaving the loop to continue.
+-- as a WARNING inside the per-IMV subtransaction — but the DEFERRED flush's
+-- EXCEPTION handler swallows it and the outer transaction still reaches its
+-- UNCONDITIONAL `DELETE FROM <staging delta>`, so every commit during the wedge
+-- window PURGES that IMV's staged deltas. The wedge does not defer work for
+-- later retry; it silently LOSES data.
+--
+-- Recovery therefore has two halves. reflex_rebuild_triggers now recreates the
+-- scratch pair idempotently, so invoking it once per source feeding a
+-- passthrough IMV restores FUTURE flushes on upgrade without a drop+recreate
+-- (healthy IMVs no-op — CREATE IF NOT EXISTS; ambiguous bare sources are skipped
+-- since the function returns an ERROR string rather than raising). But that does
+-- NOT recover the mutations lost across the wedge window. Rather than run a
+-- heavy blanket reconcile inside ALTER EXTENSION UPDATE, mark every IMV that
+-- carries a 42P01 "does not exist" last_error as known_stale so the existing
+-- F3/F4 reflex_doctor path surfaces it and prescribes reflex_reconcile — which
+-- clears known_stale once the deltas are backfilled. This upgrade does not claim
+-- to have made those IMVs correct, only maintainable-again-and-flagged.
 DO $ps6$
 DECLARE
     _src TEXT;
+    _wedged TEXT[];
 BEGIN
     FOR _src IN
         SELECT DISTINCT dep
@@ -189,6 +201,24 @@ BEGIN
     LOOP
         PERFORM public.reflex_rebuild_triggers(_src);
     END LOOP;
-    RAISE NOTICE 'pg_reflex 1.11.0 (PS-6): recreated any missing __reflex_pt_ passthrough scratch tables (idempotent). A missing pair previously wedged the IMV — every flush failed with 42P01 and was retried forever.';
+
+    WITH marked AS (
+        UPDATE public.__reflex_ivm_reference
+           SET known_stale = TRUE,
+               stale_reason = COALESCE(stale_reason,
+                   'PS-6: passthrough scratch was missing; staged deltas were purged across the wedge window. Run reflex_reconcile to backfill.'),
+               stale_since = COALESCE(stale_since, now())
+         WHERE enabled = TRUE
+           AND COALESCE((aggregations->>'is_passthrough')::bool, FALSE)
+           AND last_error LIKE '%does not exist%'
+        RETURNING name
+    )
+    SELECT array_agg(name) INTO _wedged FROM marked;
+
+    IF _wedged IS NOT NULL AND cardinality(_wedged) > 0 THEN
+        RAISE NOTICE 'pg_reflex 1.11.0 (PS-6): recreated missing __reflex_pt_ scratch and marked % passthrough IMV(s) known_stale (deltas were lost across the wedge window): %. Run reflex_doctor(fix => TRUE), or reflex_reconcile() on each, to backfill.', cardinality(_wedged), array_to_string(_wedged, ', ');
+    ELSE
+        RAISE NOTICE 'pg_reflex 1.11.0 (PS-6): passthrough scratch tables verified/recreated (idempotent); no wedged IMVs found.';
+    END IF;
 END $ps6$;
 -- === end PS-6 ==============================================================
