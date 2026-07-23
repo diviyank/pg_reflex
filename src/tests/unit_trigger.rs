@@ -3690,3 +3690,140 @@ fn partition_dispatch_sql_emits_one_execute_per_gated_variant_with_using() {
         );
     }
 }
+
+// =============================================================================
+// PS-5 Part B — the same non-sargable match survives at three more sites in
+// merge.rs. By the Part A benchmark, after the target sync is fixed the
+// intermediate MERGE is 86,434 ms of an 86,574 ms flush at 200k groups / 5k
+// affected — 99.84% of what is left.
+//
+// The MERGE cannot be gated by duplicating the STATEMENT (MERGE is not
+// idempotent, so two copies would double-apply the delta). It is gated by moving
+// the probe into the `USING` SOURCE: the untaken variant's source yields zero
+// rows, so neither WHEN MATCHED nor WHEN NOT MATCHED can fire. Verified for real,
+// not just by EXPLAIN — NULL-free scratch gives `MERGE 1`/`MERGE 0` and
+// NULL-keyed scratch gives `MERGE 0`/`MERGE 1`, each applying exactly once
+// (scratchpad probe5_merge_gate.sql).
+// =============================================================================
+
+/// The MERGE `ON` clause must become sargable for a nullable group key, with the
+/// gate inside `USING` rather than duplicating the statement.
+#[test]
+fn merge_using_nullable_key_gates_source_and_uses_equality() {
+    let plan = simple_plan(); // group_by = ["city"], not_null_columns = {}
+    let sql = build_merge_from_table_sql("\"__int_v\"", "\"__scratch_v\"", &plan, DeltaOp::Add);
+
+    assert!(
+        sql.contains("t.\"city\" = d.\"city\""),
+        "nullable group key must still reach an equality ON clause via the gate: {sql}"
+    );
+    assert!(
+        sql.contains("AS __ng WHERE __ng.\"city\" IS NULL"),
+        "the NULL-freeness probe must be present: {sql}"
+    );
+    // The probe must sit in the USING source, NOT in the ON clause — that is what
+    // makes the untaken variant contribute zero source rows instead of merging.
+    let using_pos = sql.find(" USING ").expect("MERGE has USING");
+    let on_pos = sql.find(" ON ").expect("MERGE has ON");
+    let gate_pos = sql.find("AS __ng WHERE").expect("gate present");
+    assert!(
+        gate_pos > using_pos && gate_pos < on_pos,
+        "gate must live inside the USING source (between USING and ON): {sql}"
+    );
+    // Exactly one MERGE statement — never two, which would double-apply.
+    assert_eq!(
+        sql.matches("MERGE INTO").count(),
+        1,
+        "MERGE must never be duplicated (that would double-apply the delta): {sql}"
+    );
+}
+
+/// A NOT NULL group key needs no gate: the ON clause is already `=`.
+#[test]
+fn merge_using_not_null_key_is_unchanged_and_ungated() {
+    let mut plan = simple_plan();
+    plan.not_null_columns.insert("city".to_string());
+    let sql = build_merge_from_table_sql("\"__int_v\"", "\"__scratch_v\"", &plan, DeltaOp::Add);
+    assert!(
+        sql.contains("t.\"city\" = d.\"city\""),
+        "NOT NULL key already uses `=`: {sql}"
+    );
+    assert!(
+        !sql.contains("__ng"),
+        "NOT NULL key must not get a gate: {sql}"
+    );
+    assert!(
+        sql.contains("USING \"__scratch_v\" AS t") || sql.contains("USING \"__scratch_v\" AS d"),
+        "NOT NULL key must keep the bare USING relation: {sql}"
+    );
+}
+
+/// The top-K shrunk-groups capture joins intermediate to affected on the group
+/// key — same nested-loop pathology, same fix.
+#[test]
+fn topk_shrunk_groups_capture_is_gated() {
+    let mut plan = simple_plan();
+    plan.intermediate_columns[0].source_aggregate = "MIN".to_string();
+    plan.intermediate_columns[0].topk_k = Some(4);
+    let mut stmts: Vec<String> = Vec::new();
+    let emitted = push_topk_shrunk_groups_capture(
+        &mut stmts,
+        "\"__int_v\"",
+        &plan,
+        "\"__aff_v\"",
+        "\"__shrunk_v\"",
+    );
+    assert!(emitted, "top-K plan must emit the capture");
+    let joined = stmts.join("\n");
+    assert!(
+        joined.contains("i.\"city\" = a.\"city\""),
+        "nullable group key must reach an equality join via the gate: {joined}"
+    );
+    assert!(
+        joined.contains("AS __ng WHERE __ng.\"city\" IS NULL"),
+        "gate must be present: {joined}"
+    );
+    assert_eq!(
+        stmts
+            .iter()
+            .filter(|s| s.starts_with("INSERT INTO"))
+            .count(),
+        2,
+        "nullable key expands the capture INSERT into a gated pair: {joined}"
+    );
+}
+
+/// `build_min_max_recompute_sql` has TWO non-sargable joins: the recompute
+/// UPDATE's join to `__src`, and the `EXISTS` firing gate's join to the affected
+/// table. The gate runs on EVERY UPDATE flush of EVERY MIN/MAX IMV, so it is the
+/// hotter of the two.
+#[test]
+fn min_max_recompute_update_and_firing_gate_are_gated() {
+    let mut plan = simple_plan();
+    plan.intermediate_columns[0].source_aggregate = "MIN".to_string();
+    plan.intermediate_columns[0].name = "__min_amount".to_string();
+    let base = "SELECT city, MIN(amount) AS \"__min_amount\" FROM orders GROUP BY city";
+    let sql = build_min_max_recompute_sql("\"__int_v\"", &plan, base, Some("\"__aff_v\""))
+        .expect("MIN plan must emit a recompute");
+
+    assert!(
+        sql.contains("AS __ng WHERE __ng.\"city\" IS NULL"),
+        "both joins must carry the NULL-freeness probe: {sql}"
+    );
+    // The firing gate (EXISTS ... JOIN affected) must have a sargable variant.
+    assert!(
+        sql.contains("\"__int_v\".\"city\" = __aff.\"city\""),
+        "the EXISTS firing gate must reach an equality join: {sql}"
+    );
+    // The recompute UPDATE's join to __src must too.
+    assert!(
+        sql.contains("\"__int_v\".\"city\" = __src.\"city\""),
+        "the recompute UPDATE must reach an equality join: {sql}"
+    );
+    // The NULL-safe forms must survive for the NULL-keyed case.
+    assert!(
+        sql.contains("\"__int_v\".\"city\" IS NOT DISTINCT FROM __aff.\"city\"")
+            && sql.contains("\"__int_v\".\"city\" IS NOT DISTINCT FROM __src.\"city\""),
+        "NULL-safe variants must remain reachable: {sql}"
+    );
+}

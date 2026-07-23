@@ -4247,3 +4247,94 @@ fn test_cte_left_join_cascade_maintenance() {
     Spi::run("INSERT INTO clc_a VALUES (3,9)").expect("ins a3");
     assert_imv_correct("clc_v", body);
 }
+
+// =============================================================================
+// PS-5 Part B — the intermediate MERGE and the MIN/MAX recompute are gated the
+// same way as the target sync. The MERGE gate lives in the USING source, so the
+// non-negotiable property is APPLY-EXACTLY-ONCE: the delta must be applied
+// exactly once whether or not the scratch/affected set contains a NULL key.
+// These are the idempotency tests my (wrong) "MERGE can't be gated" objection
+// lacked. They must never be weakened.
+// =============================================================================
+
+/// SUM over a nullable group key, driven through INSERT/UPDATE/DELETE deltas
+/// that land the SCRATCH set (the MERGE's probe target) on both sides of the
+/// gate. The MERGE applies the delta exactly once in each case, so the IMV must
+/// equal a full recompute at every step. A double-apply would show as a doubled
+/// SUM; a zero-apply as a stale one.
+#[pg_test]
+fn test_correctness_merge_gate_apply_exactly_once() {
+    Spi::run("CREATE TABLE mgo (id SERIAL PRIMARY KEY, grp TEXT, val INT NOT NULL)").expect("create");
+    Spi::run("INSERT INTO mgo (grp, val) VALUES ('a', 10), (NULL, 30), (NULL, 40)").expect("seed");
+    crate::create_reflex_ivm(
+        "mgo_v",
+        "SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM mgo GROUP BY grp",
+        None, None, None, None,
+    );
+    let fresh = "SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM mgo GROUP BY grp";
+    assert_imv_correct("mgo_v", fresh);
+
+    // Delta touches ONLY non-NULL groups: scratch has no NULL key, FAST MERGE runs.
+    Spi::run("INSERT INTO mgo (grp, val) VALUES ('a', 5), ('b', 1)").expect("non-null delta");
+    assert_imv_correct("mgo_v", fresh);
+    assert_eq!(
+        Spi::get_one::<i64>("SELECT total::BIGINT FROM mgo_v WHERE grp='a'").unwrap().unwrap(),
+        15, "group a must be 10+5=15 — not doubled (double-apply) nor stale (zero-apply)"
+    );
+
+    // Delta touches ONLY the NULL group: scratch has a NULL key, SAFE MERGE runs.
+    Spi::run("INSERT INTO mgo (grp, val) VALUES (NULL, 100)").expect("null delta");
+    assert_imv_correct("mgo_v", fresh);
+    assert_eq!(
+        Spi::get_one::<i64>("SELECT total::BIGINT FROM mgo_v WHERE grp IS NULL").unwrap().unwrap(),
+        170, "NULL group must be 30+40+100=170 applied exactly once"
+    );
+
+    // Delta touches BOTH in one statement: scratch has a NULL key, SAFE runs and
+    // must maintain the non-NULL group too.
+    Spi::run("INSERT INTO mgo (grp, val) VALUES (NULL, 1), ('a', 2)").expect("mixed delta");
+    assert_imv_correct("mgo_v", fresh);
+
+    // UPDATE and DELETE across the boundary.
+    Spi::run("UPDATE mgo SET grp = NULL WHERE grp = 'b'").expect("move to null");
+    assert_imv_correct("mgo_v", fresh);
+    Spi::run("DELETE FROM mgo WHERE grp IS NULL").expect("empty null group");
+    assert_imv_correct("mgo_v", fresh);
+    assert_eq!(
+        Spi::get_one::<i64>("SELECT COUNT(*) FROM mgo_v WHERE grp IS NULL").unwrap().unwrap(),
+        0, "NULL group target row must be gone once its source rows are"
+    );
+}
+
+/// MIN/MAX over a nullable group key: exercises `build_min_max_recompute_sql`'s
+/// gated recompute UPDATE and its gated EXISTS firing gate. A retraction (DELETE
+/// of the current MIN) forces the recompute path, which must re-derive the MIN
+/// for the affected group — including when that group's key is NULL.
+#[pg_test]
+fn test_correctness_min_max_recompute_gate_nullable_key() {
+    Spi::run("CREATE TABLE mmr (id SERIAL PRIMARY KEY, grp TEXT, val INT NOT NULL)").expect("create");
+    Spi::run("INSERT INTO mmr (grp, val) VALUES ('a', 5), ('a', 9), (NULL, 3), (NULL, 8)").expect("seed");
+    crate::create_reflex_ivm(
+        "mmr_v",
+        "SELECT grp, MIN(val) AS lo, MAX(val) AS hi FROM mmr GROUP BY grp",
+        None, None, None, None,
+    );
+    let fresh = "SELECT grp, MIN(val) AS lo, MAX(val) AS hi FROM mmr GROUP BY grp";
+    assert_imv_correct("mmr_v", fresh);
+
+    // Retract the current MIN of the NULL group (forces recompute for a NULL key).
+    Spi::run("DELETE FROM mmr WHERE grp IS NULL AND val = 3").expect("retract null-group min");
+    assert_imv_correct("mmr_v", fresh);
+    assert_eq!(
+        Spi::get_one::<i64>("SELECT lo::BIGINT FROM mmr_v WHERE grp IS NULL").unwrap().unwrap(),
+        8, "NULL group MIN must be recomputed to 8 after 3 is retracted"
+    );
+
+    // Retract the current MIN of a non-NULL group (recompute for a non-NULL key).
+    Spi::run("DELETE FROM mmr WHERE grp = 'a' AND val = 5").expect("retract a min");
+    assert_imv_correct("mmr_v", fresh);
+
+    // New lower value into the NULL group (non-retraction path).
+    Spi::run("INSERT INTO mmr (grp, val) VALUES (NULL, 1)").expect("new null-group min");
+    assert_imv_correct("mmr_v", fresh);
+}
