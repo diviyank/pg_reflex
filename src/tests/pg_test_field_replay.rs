@@ -127,3 +127,72 @@ fn replay_sop_baseline_secondary_is_sublinear() {
     eprintln!("FIELD_R2B sop-baseline small={}ms big={}ms", small, big);
     assert_sublinear("sop-baseline-secondary", small, big, 25);
 }
+
+/// R2c — PS-5 Bug-1 closer, deterministic. The `sop_incoming_stock_baseline_view`
+/// shape (UNION ALL in FROM, `BOOL_OR`, correlated scalar-subquery filter) keyed
+/// on columns reached through the UNION — hence structurally NULLABLE, the
+/// permanent-slow-path case. Before PS-5 the intermediate MERGE and the target
+/// DELETE/INSERT matched this nullable key with `IS NOT DISTINCT FROM`, forcing a
+/// nested loop over the whole intermediate/target and defeating both index use and
+/// (in the field) partition pruning — the 9-minute flush. This pins that:
+///   (1) maintenance stays CORRECT across INSERT/UPDATE/DELETE on both operands
+///       (EXCEPT ALL oracle), and
+///   (2) the generated flush for the shape actually carries the PS-5 gate — i.e.
+///       the sargable path is taken, not the seq-scan one.
+#[pg_test]
+fn replay_sop_baseline_bool_or_nullable_key_is_gated_and_correct() {
+    Spi::run("CREATE TABLE r2c_pb (id INT PRIMARY KEY, region TEXT, sku TEXT, qty NUMERIC, active BOOL)").unwrap();
+    Spi::run("CREATE TABLE r2c_stb (id INT PRIMARY KEY, region TEXT, sku TEXT, qty NUMERIC, active BOOL)").unwrap();
+    Spi::run("CREATE TABLE r2c_mod (order_date DATE)").unwrap();
+    Spi::run("CREATE TABLE r2c_ship (id INT PRIMARY KEY, region TEXT, ship_date DATE)").unwrap();
+    Spi::run("INSERT INTO r2c_mod VALUES (date '2024-01-01')").unwrap();
+    // region deliberately includes a genuine NULL — the nullable-key case.
+    Spi::run("INSERT INTO r2c_pb VALUES \
+        (1,'north','a',3,true),(2,'north','b',4,false),(3,NULL,'a',5,true)").unwrap();
+    Spi::run("INSERT INTO r2c_stb VALUES (1,'north','a',2,true),(2,NULL,'c',6,false)").unwrap();
+    Spi::run("INSERT INTO r2c_ship VALUES (1,'north',date '2024-02-01'),(2,'south',date '2024-03-01')").unwrap();
+
+    // UNION ALL in FROM + BOOL_OR + correlated scalar subquery filter, GROUP BY a
+    // union-derived (structurally nullable) key.
+    let sql = "SELECT s.region, \
+               SUM(s.qty) AS total_qty, \
+               BOOL_OR(s.active) AS any_active \
+               FROM ( \
+                 SELECT pb.region, pb.sku, pb.qty, pb.active FROM r2c_pb pb \
+                 WHERE EXISTS (SELECT 1 FROM r2c_ship sh WHERE sh.ship_date >= (SELECT order_date FROM r2c_mod)) \
+                 UNION ALL \
+                 SELECT stb.region, stb.sku, stb.qty, stb.active FROM r2c_stb stb \
+                 WHERE stb.qty >= (SELECT count(*) FROM r2c_mod) \
+               ) s \
+               GROUP BY s.region";
+    crate::create_reflex_ivm("r2c_v", sql, None, None, None, None);
+    assert_imv_correct("r2c_v", sql);
+
+    // (2) The gate must be present in the generated flush for BOTH operands — i.e.
+    // the codegen took the nullable-key sargable path, not the seq-scan one. Use
+    // the same SPI-through-installed-.so provenance technique as the audit gate
+    // (reaches real codegen, fails if a sibling clobbered the install).
+    for src in ["r2c_pb", "r2c_stb"] {
+        let stmts = flush_statements_for("r2c_v", src, "INSERT");
+        assert!(
+            stmts.iter().any(|s| s.contains("AS __ng WHERE")),
+            "sop-baseline nullable-key flush for source {src} must carry the PS-5 gate \
+             (else it is on the non-sargable seq-scan path that caused the 9-min flush): {stmts:#?}"
+        );
+        // The gated MERGE's fast variant must use `=` (sargable), reachable by index.
+        assert!(
+            stmts.iter().any(|s| s.contains("MERGE INTO") && s.contains("ON t.\"region\" = d.\"region\"")),
+            "the gated MERGE fast variant must match the group key with `=`: {stmts:#?}"
+        );
+    }
+
+    // (1 cont.) Correctness across mutations on both operands, incl. the NULL group.
+    Spi::run("INSERT INTO r2c_pb VALUES (4,'north','d',10,true)").unwrap();      // non-NULL group
+    assert_imv_correct("r2c_v", sql);
+    Spi::run("INSERT INTO r2c_stb VALUES (3,NULL,'e',1,true)").unwrap();          // NULL group
+    assert_imv_correct("r2c_v", sql);
+    Spi::run("UPDATE r2c_pb SET active = false WHERE id = 1").unwrap();           // BOOL_OR recompute
+    assert_imv_correct("r2c_v", sql);
+    Spi::run("DELETE FROM r2c_pb WHERE region IS NULL").unwrap();                 // shrink NULL group
+    assert_imv_correct("r2c_v", sql);
+}

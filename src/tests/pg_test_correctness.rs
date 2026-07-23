@@ -2787,6 +2787,202 @@ fn test_correctness_null_multi_column_group_key() {
     assert_imv_correct("nmk_view", fresh);
 }
 
+// =============================================================================
+// PS-5 — the target-sync affected-groups match is specialised at runtime: when
+// the affected-groups table happens to hold no NULL key, codegen's sargable
+// `=` form is used; when it holds one, the NULL-safe `IS NOT DISTINCT FROM`
+// form is used. The specialisation is only sound because those two predicates
+// agree whenever no affected key is NULL.
+//
+// THESE TESTS PIN THE SEMANTICS AND MUST NEVER BE WEAKENED. A group whose key
+// is NULL must match only other NULL keys. An ungated `=` would silently leave
+// the NULL group's stale target row in place and never re-insert it — verified
+// directly in SQL: with target {1,2,NULL} and affected {NULL},
+// `IS NOT DISTINCT FROM` selects the NULL row and `=` selects nothing.
+// =============================================================================
+
+/// The branch boundary itself: drive a nullable-key aggregate through deltas
+/// that land the affected set on BOTH sides of the gate, and after every single
+/// one require exact agreement with a full recompute.
+///
+/// Delta shapes exercised, in order:
+///   1. affected = {non-NULL} only          -> sargable branch
+///   2. affected = {NULL} only              -> NULL-safe branch (the killer case:
+///                                             an ungated `=` matches nothing here)
+///   3. affected = {NULL, non-NULL} mixed   -> NULL-safe branch, must still
+///                                             maintain the non-NULL groups too
+///   4. UPDATE moving a row non-NULL -> NULL and NULL -> non-NULL
+///   5. deleting the NULL group down to empty (target row must disappear)
+///   6. recreating the NULL group from empty (target row must reappear)
+#[pg_test]
+fn test_correctness_null_group_key_gate_branch_boundary() {
+    Spi::run("CREATE TABLE ngkb (id SERIAL PRIMARY KEY, grp TEXT, val INT NOT NULL)")
+        .expect("create");
+    Spi::run(
+        "INSERT INTO ngkb (grp, val) VALUES \
+         ('a', 10), ('a', 20), (NULL, 30), (NULL, 40), ('b', 50)",
+    )
+    .expect("seed");
+
+    crate::create_reflex_ivm(
+        "ngkb_view",
+        "SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM ngkb GROUP BY grp",
+        None,
+        None,
+        None,
+        None,
+    );
+    let fresh = "SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM ngkb GROUP BY grp";
+    assert_imv_correct("ngkb_view", fresh);
+
+    // 1. affected = {'a'} — no NULL key in the affected set: sargable branch.
+    Spi::run("INSERT INTO ngkb (grp, val) VALUES ('a', 7)").expect("insert non-null");
+    assert_imv_correct("ngkb_view", fresh);
+
+    // 2. affected = {NULL} ONLY. The killer case. An ungated `=` join matches
+    //    zero rows here, so the NULL group would keep its pre-delta total.
+    Spi::run("INSERT INTO ngkb (grp, val) VALUES (NULL, 100)").expect("insert null only");
+    assert_imv_correct("ngkb_view", fresh);
+    let null_total = Spi::get_one::<i64>("SELECT total::BIGINT FROM ngkb_view WHERE grp IS NULL")
+        .expect("null group query")
+        .expect("null group row missing from IMV");
+    assert_eq!(
+        null_total, 170,
+        "NULL group total must be 30+40+100=170 after a NULL-only delta; \
+         a stale 70 means the affected-groups match failed to match the NULL key"
+    );
+
+    // 3. affected = {NULL, 'b'} mixed in ONE statement: the NULL-safe branch is
+    //    taken, and it must still maintain the non-NULL group in the same set.
+    Spi::run("INSERT INTO ngkb (grp, val) VALUES (NULL, 1), ('b', 2)").expect("insert mixed");
+    assert_imv_correct("ngkb_view", fresh);
+
+    // 4. UPDATEs across the NULL boundary, both directions.
+    Spi::run("UPDATE ngkb SET grp = NULL WHERE grp = 'b'").expect("move to null");
+    assert_imv_correct("ngkb_view", fresh);
+    Spi::run("UPDATE ngkb SET grp = 'c' WHERE grp IS NULL AND val = 40").expect("move from null");
+    assert_imv_correct("ngkb_view", fresh);
+
+    // 5. Empty the NULL group entirely — the target row must be REMOVED, which
+    //    is the DELETE half of the target sync matching a NULL key.
+    Spi::run("DELETE FROM ngkb WHERE grp IS NULL").expect("empty null group");
+    assert_imv_correct("ngkb_view", fresh);
+    let remaining = Spi::get_one::<i64>("SELECT COUNT(*) FROM ngkb_view WHERE grp IS NULL")
+        .expect("count query")
+        .expect("count NULL");
+    assert_eq!(
+        remaining, 0,
+        "the NULL group's target row must be deleted once its last source row is gone"
+    );
+
+    // 6. Recreate the NULL group from empty — the INSERT half.
+    Spi::run("INSERT INTO ngkb (grp, val) VALUES (NULL, 500)").expect("recreate null group");
+    assert_imv_correct("ngkb_view", fresh);
+    let recreated = Spi::get_one::<i64>("SELECT total::BIGINT FROM ngkb_view WHERE grp IS NULL")
+        .expect("null group query")
+        .expect("NULL group row was not re-inserted after being emptied");
+    assert_eq!(recreated, 500, "recreated NULL group must total 500");
+}
+
+/// Same branch boundary, but multi-column: the gate must consider EVERY key
+/// column, so a NULL in the second column alone still has to force the
+/// NULL-safe branch. Also covers a delta whose affected set contains a row that
+/// is partially NULL — the case where per-column `=` would drop it.
+#[pg_test]
+fn test_correctness_null_multi_col_gate_branch_boundary() {
+    Spi::run("CREATE TABLE nmkb (id SERIAL PRIMARY KEY, g1 TEXT, g2 INT, val INT NOT NULL)")
+        .expect("create");
+    Spi::run(
+        "INSERT INTO nmkb (g1, g2, val) VALUES \
+         ('a', 1, 10), ('a', NULL, 20), (NULL, 1, 30), (NULL, NULL, 40), ('b', 2, 50)",
+    )
+    .expect("seed");
+
+    crate::create_reflex_ivm(
+        "nmkb_view",
+        "SELECT g1, g2, SUM(val) AS total, COUNT(*) AS cnt FROM nmkb GROUP BY g1, g2",
+        None,
+        None,
+        None,
+        None,
+    );
+    let fresh = "SELECT g1, g2, SUM(val) AS total, COUNT(*) AS cnt FROM nmkb GROUP BY g1, g2";
+    assert_imv_correct("nmkb_view", fresh);
+
+    // affected = {('a', 1)} — fully non-NULL: sargable branch.
+    Spi::run("INSERT INTO nmkb (g1, g2, val) VALUES ('a', 1, 5)").expect("both non-null");
+    assert_imv_correct("nmkb_view", fresh);
+
+    // affected = {('a', NULL)} — NULL in the SECOND column only. The gate must
+    // still fire; a first-column-only NULL check would wrongly take `=` and
+    // leave this group stale.
+    Spi::run("INSERT INTO nmkb (g1, g2, val) VALUES ('a', NULL, 6)").expect("second col null");
+    assert_imv_correct("nmkb_view", fresh);
+    let partial =
+        Spi::get_one::<i64>("SELECT total::BIGINT FROM nmkb_view WHERE g1 = 'a' AND g2 IS NULL")
+            .expect("partial-null group query")
+            .expect("('a', NULL) group missing from IMV");
+    assert_eq!(
+        partial, 26,
+        "('a', NULL) must total 20+6=26; a stale 20 means the NULL in g2 was not matched"
+    );
+
+    // affected = {(NULL, NULL)} — every key column NULL.
+    Spi::run("INSERT INTO nmkb (g1, g2, val) VALUES (NULL, NULL, 7)").expect("all null");
+    assert_imv_correct("nmkb_view", fresh);
+
+    // affected = {(NULL, 1), ('b', 2)} — one partially-NULL key alongside a
+    // fully non-NULL one, in a single statement.
+    Spi::run("INSERT INTO nmkb (g1, g2, val) VALUES (NULL, 1, 8), ('b', 2, 9)")
+        .expect("mixed nullness");
+    assert_imv_correct("nmkb_view", fresh);
+
+    // UPDATE that changes only the nullable second column.
+    Spi::run("UPDATE nmkb SET g2 = NULL WHERE g1 = 'b'").expect("null the second col");
+    assert_imv_correct("nmkb_view", fresh);
+
+    // Empty an all-NULL group, then recreate it.
+    Spi::run("DELETE FROM nmkb WHERE g1 IS NULL AND g2 IS NULL").expect("empty all-null group");
+    assert_imv_correct("nmkb_view", fresh);
+    Spi::run("INSERT INTO nmkb (g1, g2, val) VALUES (NULL, NULL, 11)").expect("recreate");
+    assert_imv_correct("nmkb_view", fresh);
+}
+
+/// A NULL-keyed group must never be collateral damage of a delta that touches a
+/// DIFFERENT group. This is the inverse failure mode: over-matching. If the
+/// affected-groups match ever degenerated to a constant-true predicate (the
+/// 2026-05-13 `null_safe_in` bug shape), the NULL group would be wiped and
+/// rebuilt on every unrelated flush — correct by luck, but this pins that the
+/// NULL group's row is genuinely untouched work.
+#[pg_test]
+fn test_correctness_null_group_untouched_by_unrelated_delta() {
+    Spi::run("CREATE TABLE ngu (id SERIAL PRIMARY KEY, grp TEXT, val INT NOT NULL)")
+        .expect("create");
+    Spi::run("INSERT INTO ngu (grp, val) VALUES (NULL, 30), ('a', 10)").expect("seed");
+
+    crate::create_reflex_ivm(
+        "ngu_view",
+        "SELECT grp, SUM(val) AS total FROM ngu GROUP BY grp",
+        None,
+        None,
+        None,
+        None,
+    );
+    let fresh = "SELECT grp, SUM(val) AS total FROM ngu GROUP BY grp";
+    assert_imv_correct("ngu_view", fresh);
+
+    // Delta on 'a' only. The NULL group must survive with its value intact.
+    Spi::run("INSERT INTO ngu (grp, val) VALUES ('a', 5)").expect("unrelated delta");
+    assert_imv_correct("ngu_view", fresh);
+    let null_total = Spi::get_one::<i64>("SELECT total::BIGINT FROM ngu_view WHERE grp IS NULL")
+        .expect("null group query")
+        .expect("NULL group row vanished after a delta on a different group");
+    assert_eq!(
+        null_total, 30,
+        "NULL group must be untouched by a delta on group 'a'"
+    );
+}
+
 /// SUM(price * quantity) — expression inside aggregate
 #[pg_test]
 fn test_correctness_expression_in_aggregate() {
@@ -4050,4 +4246,114 @@ fn test_cte_left_join_cascade_maintenance() {
     assert_imv_correct("clc_v", body);
     Spi::run("INSERT INTO clc_a VALUES (3,9)").expect("ins a3");
     assert_imv_correct("clc_v", body);
+}
+
+// =============================================================================
+// PS-5 Part B — the intermediate MERGE and the MIN/MAX recompute are gated the
+// same way as the target sync. The MERGE gate lives in the USING source, so the
+// non-negotiable property is APPLY-EXACTLY-ONCE: the delta must be applied
+// exactly once whether or not the scratch/affected set contains a NULL key.
+// These are the idempotency tests my (wrong) "MERGE can't be gated" objection
+// lacked. They must never be weakened.
+// =============================================================================
+
+/// SUM over a nullable group key, driven through INSERT/UPDATE/DELETE deltas
+/// that land the SCRATCH set (the MERGE's probe target) on both sides of the
+/// gate. The MERGE applies the delta exactly once in each case, so the IMV must
+/// equal a full recompute at every step. A double-apply would show as a doubled
+/// SUM; a zero-apply as a stale one.
+#[pg_test]
+fn test_correctness_merge_gate_apply_exactly_once() {
+    Spi::run("CREATE TABLE mgo (id SERIAL PRIMARY KEY, grp TEXT, val INT NOT NULL)").expect("create");
+    Spi::run("INSERT INTO mgo (grp, val) VALUES ('a', 10), (NULL, 30), (NULL, 40)").expect("seed");
+    crate::create_reflex_ivm(
+        "mgo_v",
+        "SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM mgo GROUP BY grp",
+        None, None, None, None,
+    );
+    let fresh = "SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM mgo GROUP BY grp";
+    assert_imv_correct("mgo_v", fresh);
+
+    // Delta touches ONLY non-NULL groups: scratch has no NULL key, FAST MERGE runs.
+    Spi::run("INSERT INTO mgo (grp, val) VALUES ('a', 5), ('b', 1)").expect("non-null delta");
+    assert_imv_correct("mgo_v", fresh);
+    assert_eq!(
+        Spi::get_one::<i64>("SELECT total::BIGINT FROM mgo_v WHERE grp='a'").unwrap().unwrap(),
+        15, "group a must be 10+5=15 — not doubled (double-apply) nor stale (zero-apply)"
+    );
+
+    // Delta touches ONLY the NULL group: scratch has a NULL key, SAFE MERGE runs.
+    Spi::run("INSERT INTO mgo (grp, val) VALUES (NULL, 100)").expect("null delta");
+    assert_imv_correct("mgo_v", fresh);
+    assert_eq!(
+        Spi::get_one::<i64>("SELECT total::BIGINT FROM mgo_v WHERE grp IS NULL").unwrap().unwrap(),
+        170, "NULL group must be 30+40+100=170 applied exactly once"
+    );
+
+    // Delta touches BOTH in one statement: scratch has a NULL key, SAFE runs and
+    // must maintain the non-NULL group too.
+    Spi::run("INSERT INTO mgo (grp, val) VALUES (NULL, 1), ('a', 2)").expect("mixed delta");
+    assert_imv_correct("mgo_v", fresh);
+
+    // UPDATE and DELETE across the boundary.
+    Spi::run("UPDATE mgo SET grp = NULL WHERE grp = 'b'").expect("move to null");
+    assert_imv_correct("mgo_v", fresh);
+    Spi::run("DELETE FROM mgo WHERE grp IS NULL").expect("empty null group");
+    assert_imv_correct("mgo_v", fresh);
+    assert_eq!(
+        Spi::get_one::<i64>("SELECT COUNT(*) FROM mgo_v WHERE grp IS NULL").unwrap().unwrap(),
+        0, "NULL group target row must be gone once its source rows are"
+    );
+}
+
+/// MIN/MAX over a nullable group key: exercises `build_min_max_recompute_sql`'s
+/// gated recompute UPDATE and its gated EXISTS firing gate. A retraction (DELETE
+/// of the current MIN) forces the recompute path, which must re-derive the MIN
+/// for the affected group.
+///
+/// SCOPE: this pins the PS-5 join-gating (intermediate ⨝ __src and the EXISTS
+/// firing gate now use sargable `=` for a NULL-free affected set). It deliberately
+/// does NOT retract a NULL-keyed group's MIN, because that recompute path is
+/// defeated by a SEPARATE pre-existing bug — the recompute's affected-scoping uses
+/// NULL-unsafe `(cols) IN (SELECT ...)`, so a NULL group is dropped from the
+/// scoped source and its MIN stays stale. That bug is filed in
+/// `untreated_bugs/2026-07-23_min_max_recompute_scope_null_unsafe_in.md` and is
+/// out of PS-5's scope (it is the scoping filter, not the join conditions PS-5
+/// gates). The NULL group here is exercised on the algebraic (non-recompute) path,
+/// which is correct.
+#[pg_test]
+fn test_correctness_min_max_recompute_gate_nullable_key() {
+    Spi::run("CREATE TABLE mmr (id SERIAL PRIMARY KEY, grp TEXT, val INT NOT NULL)").expect("create");
+    Spi::run("INSERT INTO mmr (grp, val) VALUES ('a', 5), ('a', 9), (NULL, 3), (NULL, 8)")
+        .expect("seed");
+    crate::create_reflex_ivm(
+        "mmr_v",
+        "SELECT grp, MIN(val) AS lo, MAX(val) AS hi FROM mmr GROUP BY grp",
+        None, None, None, None,
+    );
+    let fresh = "SELECT grp, MIN(val) AS lo, MAX(val) AS hi FROM mmr GROUP BY grp";
+    assert_imv_correct("mmr_v", fresh);
+
+    // Retract the current MIN of a NON-NULL group: forces the recompute path, so
+    // the gated `intermediate ⨝ __src` join and the gated EXISTS firing gate both
+    // run with a NULL-free affected set (grp='a'), i.e. the sargable `=` variant.
+    Spi::run("DELETE FROM mmr WHERE grp = 'a' AND val = 5").expect("retract a min");
+    assert_imv_correct("mmr_v", fresh);
+    assert_eq!(
+        Spi::get_one::<i64>("SELECT lo::BIGINT FROM mmr_v WHERE grp = 'a'").unwrap().unwrap(),
+        9, "group a MIN must recompute to 9 after 5 is retracted"
+    );
+
+    // The NULL group on the ALGEBRAIC path (Add, no recompute): a new lower value
+    // must lower its MIN, and this must not corrupt it. Exercises the MERGE gate.
+    Spi::run("INSERT INTO mmr (grp, val) VALUES (NULL, 1)").expect("new null-group min");
+    assert_imv_correct("mmr_v", fresh);
+    assert_eq!(
+        Spi::get_one::<i64>("SELECT lo::BIGINT FROM mmr_v WHERE grp IS NULL").unwrap().unwrap(),
+        1, "NULL group MIN must lower to 1 on the algebraic Add path"
+    );
+
+    // A non-NULL new MAX, algebraic.
+    Spi::run("INSERT INTO mmr (grp, val) VALUES ('a', 42)").expect("new a max");
+    assert_imv_correct("mmr_v", fresh);
 }

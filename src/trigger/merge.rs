@@ -81,6 +81,20 @@ pub(crate) fn build_merge_using(
         .collect::<Vec<_>>()
         .join(" AND ");
 
+    // PS-5 — the join columns that are actually NULLABLE (the sentinel
+    // `__reflex_group` is a constant, never NULL, so it is excluded and its
+    // single-row MERGE is left byte-for-byte unchanged). When any exist, the
+    // `ON` above is non-sargable (`IS NOT DISTINCT FROM`), which forces the
+    // MERGE into a nested loop over the whole intermediate — 20.7 ms at 200k
+    // groups / 1 delta row, and the dominant cost of the whole flush at scale.
+    let nullable_join_cols: Vec<&String> = join_cols
+        .iter()
+        .filter(|c| {
+            let unquoted = c.trim_matches('"');
+            unquoted != "__reflex_group" && !plan.not_null_columns.contains(unquoted)
+        })
+        .collect();
+
     // WHEN MATCHED THEN UPDATE SET clauses
     let mut set_clauses: Vec<String> = Vec::new();
     for ic in &plan.intermediate_columns {
@@ -211,13 +225,61 @@ pub(crate) fn build_merge_using(
         DeltaOp::Subtract => String::new(),
     };
 
+    let one_merge = |using: &str, on: &str| -> String {
+        format!(
+            "MERGE INTO {} AS t USING {} AS d ON {} WHEN MATCHED THEN UPDATE SET {}{}",
+            intermediate_tbl,
+            using,
+            on,
+            set_clauses.join(", "),
+            not_matched
+        )
+    };
+
+    if nullable_join_cols.is_empty() {
+        // All-NOT-NULL (or sentinel-only) key: `on_clause` is already sargable.
+        return one_merge(using_clause, &on_clause);
+    }
+
+    // PS-5 — gate the MERGE into a sargable/NULL-safe pair. MERGE is NOT
+    // idempotent, so the target-sync trick of emitting the statement twice would
+    // double-apply the delta. Instead the gate lives in the USING SOURCE: the
+    // untaken variant's source yields zero rows, so neither WHEN MATCHED nor WHEN
+    // NOT MATCHED can fire. Verified for real (not just EXPLAIN): NULL-free
+    // scratch → `MERGE 1`/`MERGE 0`, NULL-keyed scratch → `MERGE 0`/`MERGE 1`,
+    // each applying the delta exactly once. See the ATOMICITY INVARIANT on
+    // `AffectedMatch` — the flush's per-source scratch is rebuilt (TRUNCATE +
+    // INSERT) under lock within the same txn, so no writer can change its
+    // NULL-ness between the two MERGEs.
+    //
+    // The gate probes the SOURCE `d` (the scratch/delta), not `__reflex_affected`:
+    // for a source row with a non-NULL key, `t.k IS NOT DISTINCT FROM d.k` and
+    // `t.k = d.k` select the same target rows, so `=` is valid exactly when the
+    // source has no NULL key.
+    let gate_disjunction = nullable_join_cols
+        .iter()
+        .map(|c| format!("__ng.{} IS NULL", c))
+        .collect::<Vec<_>>()
+        .join(" OR ");
+    let gate = format!(
+        "EXISTS (SELECT 1 FROM {} AS __ng WHERE {})",
+        using_clause, gate_disjunction
+    );
+    let fast_on = join_cols
+        .iter()
+        .map(|c| format!("t.{} = d.{}", c, c))
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    let fast_using = format!(
+        "(SELECT __m.* FROM {} AS __m WHERE NOT {})",
+        using_clause, gate
+    );
+    let safe_using = format!("(SELECT __m.* FROM {} AS __m WHERE {})", using_clause, gate);
+
     format!(
-        "MERGE INTO {} AS t USING {} AS d ON {} WHEN MATCHED THEN UPDATE SET {}{}",
-        intermediate_tbl,
-        using_clause,
-        on_clause,
-        set_clauses.join(", "),
-        not_matched
+        "{}\n--<<REFLEX_SEP>>--\n{}",
+        one_merge(&fast_using, &fast_on),
+        one_merge(&safe_using, &on_clause)
     )
 }
 
@@ -458,11 +520,6 @@ pub fn push_topk_shrunk_groups_capture(
         .map(|c| format!("i.\"{}\"", c))
         .collect::<Vec<_>>()
         .join(", ");
-    let join_cond = group_cols
-        .iter()
-        .map(|gc| format!("i.\"{gc}\" IS NOT DISTINCT FROM a.\"{gc}\"", gc = gc))
-        .collect::<Vec<_>>()
-        .join(" AND ");
 
     let predicates: Vec<String> = topk_cols
         .iter()
@@ -478,18 +535,51 @@ pub fn push_topk_shrunk_groups_capture(
         .collect();
     let where_clause = predicates.join(" OR ");
 
+    // PS-5 — the `i JOIN affected a ON i.gc IS NOT DISTINCT FROM a.gc` join is the
+    // same non-sargable nested-loop-over-the-whole-intermediate pattern as the
+    // target sync. Gate it into a sargable/NULL-safe pair on whether the affected
+    // set contains a NULL key (the group cols here are the affected table's own
+    // column names).
+    let quoted_group_cols: Vec<String> = group_cols.iter().map(|c| format!("\"{}\"", c)).collect();
+    let join_on = |eq: bool| -> String {
+        group_cols
+            .iter()
+            .map(|gc| {
+                if eq {
+                    format!("i.\"{gc}\" = a.\"{gc}\"", gc = gc)
+                } else {
+                    format!("i.\"{gc}\" IS NOT DISTINCT FROM a.\"{gc}\"", gc = gc)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" AND ")
+    };
+    let insert_with = |join_cond: &str, extra_gate: &str| -> String {
+        format!(
+            "INSERT INTO {shrunk_tbl} SELECT DISTINCT {proj} \
+             FROM {intermediate_tbl} i JOIN {affected_tbl} a ON {join_cond} \
+             WHERE ({where_clause}){extra_gate}",
+            shrunk_tbl = shrunk_tbl,
+            proj = proj,
+            intermediate_tbl = intermediate_tbl,
+            affected_tbl = affected_tbl,
+            join_cond = join_cond,
+            where_clause = where_clause,
+            extra_gate = extra_gate,
+        )
+    };
+
     stmts.push(format!("TRUNCATE {}", shrunk_tbl));
-    stmts.push(format!(
-        "INSERT INTO {shrunk_tbl} SELECT DISTINCT {proj} \
-         FROM {intermediate_tbl} i JOIN {affected_tbl} a ON {join_cond} \
-         WHERE {where_clause}",
-        shrunk_tbl = shrunk_tbl,
-        proj = proj,
-        intermediate_tbl = intermediate_tbl,
-        affected_tbl = affected_tbl,
-        join_cond = join_cond,
-        where_clause = where_clause,
-    ));
+    match affected_null_key_gate(affected_tbl, &quoted_group_cols, &plan.not_null_columns) {
+        None => {
+            // All group keys NOT NULL: `=` is sargable and semantically exact.
+            stmts.push(insert_with(&join_on(true), ""));
+        }
+        Some(gate) => {
+            stmts.push(insert_with(&join_on(true), &format!(" AND NOT {}", gate)));
+            stmts.push(insert_with(&join_on(false), &format!(" AND {}", gate)));
+        }
+    }
     true
 }
 
@@ -610,24 +700,50 @@ pub(crate) fn build_min_max_recompute_sql_inner(
         None => orig_base_query.to_string(),
     };
 
-    let join_cond: Vec<String> = group_cols
-        .iter()
-        .map(|gc| {
-            format!(
-                "{}.\"{}\" IS NOT DISTINCT FROM __src.\"{}\"",
-                intermediate_tbl, gc, gc
-            )
-        })
-        .collect();
+    // PS-5 — both the recompute UPDATE's join to `__src` and (below) the EXISTS
+    // firing gate's join to `__aff` matched the group key with `IS NOT DISTINCT
+    // FROM`, non-sargable, forcing a nested loop over the whole intermediate. The
+    // firing gate runs on EVERY UPDATE flush of EVERY MIN/MAX IMV. Gate both into
+    // a sargable/NULL-safe pair, keyed on whether the AFFECTED set holds a NULL
+    // group key. `__aff` is the probe for both joins: a NULL key is in `__aff`
+    // iff it is in `__src` (both are scoped to the affected groups), and `__aff`
+    // is a cheap indexed table whereas `__src` is a re-aggregation subquery that
+    // must not be evaluated twice.
+    let update_join = |eq: bool| -> String {
+        group_cols
+            .iter()
+            .map(|gc| {
+                if eq {
+                    format!("{}.\"{}\" = __src.\"{}\"", intermediate_tbl, gc, gc)
+                } else {
+                    format!(
+                        "{}.\"{}\" IS NOT DISTINCT FROM __src.\"{}\"",
+                        intermediate_tbl, gc, gc
+                    )
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" AND ")
+    };
+    let build_update = |eq: bool| -> String {
+        format!(
+            "UPDATE {} SET {} FROM ({}) AS __src WHERE {} AND ({})",
+            intermediate_tbl,
+            set_parts.join(", "),
+            scoped_source,
+            update_join(eq),
+            null_check.join(" OR ")
+        )
+    };
 
-    let update_sql = format!(
-        "UPDATE {} SET {} FROM ({}) AS __src WHERE {} AND ({})",
-        intermediate_tbl,
-        set_parts.join(", "),
-        scoped_source,
-        join_cond.join(" AND "),
-        null_check.join(" OR ")
-    );
+    let Some(at) = affected_tbl else {
+        // Unscoped full recompute (no affected table to gate on). Use `=` when
+        // the key is entirely NOT NULL, else the NULL-safe form.
+        let all_not_null = group_cols
+            .iter()
+            .all(|gc| plan.not_null_columns.contains(gc.as_str()));
+        return Some(build_update(all_not_null));
+    };
 
     // 1.3.0: gate the recompute on `EXISTS (intermediate row with NULL slot
     // in an affected group)`. The post-MERGE topk-scalar refresh sets the
@@ -635,31 +751,57 @@ pub(crate) fn build_min_max_recompute_sql_inner(
     // only needs to fire for groups that genuinely underflowed. An always-
     // executing UPDATE used to trigger the source aggregation even when no
     // group needed it, which dominated the bench.
-    if let Some(at) = affected_tbl {
-        let aff_join_cond: Vec<String> = group_cols
+    let exists_join = |eq: bool| -> String {
+        group_cols
             .iter()
             .map(|gc| {
-                format!(
-                    "{}.\"{}\" IS NOT DISTINCT FROM __aff.\"{}\"",
-                    intermediate_tbl, gc, gc
-                )
+                if eq {
+                    format!("{}.\"{}\" = __aff.\"{}\"", intermediate_tbl, gc, gc)
+                } else {
+                    format!(
+                        "{}.\"{}\" IS NOT DISTINCT FROM __aff.\"{}\"",
+                        intermediate_tbl, gc, gc
+                    )
+                }
             })
-            .collect();
-        let exists_check = format!(
+            .collect::<Vec<_>>()
+            .join(" AND ")
+    };
+    let exists_check = |eq: bool| -> String {
+        format!(
             "EXISTS (SELECT 1 FROM {tbl} JOIN {at} __aff ON {join} WHERE {nullc})",
             tbl = intermediate_tbl,
             at = at,
-            join = aff_join_cond.join(" AND "),
+            join = exists_join(eq),
             nullc = null_check.join(" OR "),
-        );
-        return Some(format!(
+        )
+    };
+    let do_block = |check: &str, upd: &str| -> String {
+        format!(
             "DO $_reflex_recompute$ BEGIN IF {check} THEN {upd}; END IF; END $_reflex_recompute$",
-            check = exists_check,
-            upd = update_sql,
-        ));
-    }
+            check = check,
+            upd = upd,
+        )
+    };
 
-    Some(update_sql)
+    let quoted_group_cols: Vec<String> = group_cols.iter().map(|c| format!("\"{}\"", c)).collect();
+    match affected_null_key_gate(at, &quoted_group_cols, &plan.not_null_columns) {
+        None => {
+            // All group keys NOT NULL: `=` is sargable and semantically exact.
+            Some(do_block(&exists_check(true), &build_update(true)))
+        }
+        Some(gate) => {
+            let fast = do_block(
+                &format!("{} AND NOT {}", exists_check(true), gate),
+                &build_update(true),
+            );
+            let safe = do_block(
+                &format!("{} AND {}", exists_check(false), gate),
+                &build_update(false),
+            );
+            Some(format!("{}\n--<<REFLEX_SEP>>--\n{}", fast, safe))
+        }
+    }
 }
 
 /// Build a match condition for affected groups, used as the WHERE filter on
@@ -730,6 +872,173 @@ pub(crate) fn null_safe_in(
     )
 }
 
+/// PS-5 — the runtime NULL-freeness probe on the affected-groups table.
+///
+/// Returns `EXISTS (SELECT 1 FROM <affected> AS __ng WHERE <col> IS NULL OR ...)`
+/// over the NULLABLE key columns only, or `None` when every key column is known
+/// NOT NULL (in which case `null_safe_in` already emits a fully sargable `=`
+/// match and no specialisation is needed).
+///
+/// The probe is deliberately **uncorrelated** — it references only `__ng`, never
+/// the outer relation or the `__a` scope. That is what makes PostgreSQL evaluate
+/// it once as an `InitPlan`, mark the qual `pseudoconstant`, and hoist it into a
+/// gating `Result / One-Time Filter` above the whole join, so the untaken
+/// variant's subtree is reported `(never executed)`. A correlated probe would be
+/// re-evaluated per outer row and buy nothing.
+fn affected_null_key_gate(
+    affected_tbl: &str,
+    affected_cols: &[String],
+    not_null_columns: &std::collections::HashSet<String>,
+) -> Option<String> {
+    let nullable: Vec<&String> = affected_cols
+        .iter()
+        .filter(|c| !not_null_columns.contains(c.trim_matches('"')))
+        .collect();
+    if nullable.is_empty() {
+        return None;
+    }
+    let disjunction = nullable
+        .iter()
+        .map(|c| format!("__ng.{} IS NULL", c))
+        .collect::<Vec<_>>()
+        .join(" OR ");
+    Some(format!(
+        "EXISTS (SELECT 1 FROM {} AS __ng WHERE {})",
+        affected_tbl, disjunction
+    ))
+}
+
+/// PS-5 — mutually exclusive alternatives for the same logical affected-groups
+/// match, so the common case gets an index-usable plan.
+///
+/// `IS NOT DISTINCT FROM` is not a member of any operator family, so it can
+/// serve neither an `Index Cond` nor a hash/merge join key: the planner's only
+/// option is a nested loop with a `Join Filter` over the entire target, making
+/// the target sync `O(total_groups × affected_groups)`. Measured on a
+/// 200 000-group nullable-key fixture (PG 17.7): 52 ms for a 1-row delta, and
+/// **681 576 ms** with 50 000 affected groups (`Rows Removed by Join Filter:
+/// 8 749 975 000`) against **57 ms** for the same statement with `=`.
+///
+/// Nullable group keys are the norm, not the exception: expression keys, any
+/// column reached through a LEFT/RIGHT JOIN, and every decomposed sub-IMV target
+/// (the decomposer creates those with no NOT NULL constraints at all, so a
+/// decomposed parent is permanently on this path).
+///
+/// The specialisation is sound because, for any affected row whose key is
+/// non-NULL, `t.k IS NOT DISTINCT FROM a.k` and `t.k = a.k` select exactly the
+/// same rows: with `t.k` non-NULL both reduce to value equality, and with
+/// `t.k IS NULL` the former is false while the latter is NULL — neither is
+/// *true*, so both exclude the row. Hence if the affected table holds no NULL
+/// key the two predicates are interchangeable; the gate decides that at runtime,
+/// from the data itself.
+///
+/// This reads data only to choose between two forms that agree *on that data* —
+/// it never records a conclusion that could later become false, which is how it
+/// differs from the unsound NOT-NULL *inference* that
+/// `project_differential_fuzz_harness_2026_05_22` caught.
+///
+/// An ungated `=` would be wrong: with target `{1, 2, NULL}` and affected
+/// `{NULL}`, `IS NOT DISTINCT FROM` selects the NULL group and `=` selects
+/// nothing, so the NULL group's stale target row would survive the DELETE and
+/// never be re-inserted. Pinned by
+/// `pg_test_correctness.rs::test_correctness_null_group_key_gate_branch_boundary`.
+///
+/// # ATOMICITY INVARIANT — do not weaken the affected table's TRUNCATE
+///
+/// The two gates are logical complements, but that alone is **not** sufficient:
+/// each statement takes its own snapshot, so complementarity *across the pair* is
+/// not a property the SQL guarantees. If the affected table's NULL-ness could
+/// change between the two statements, the FAST one could see "a NULL key exists"
+/// and skip, while the SAFE one sees "none exists" and also skips — **neither
+/// runs, and the target is left silently stale.**
+///
+/// That interleaving is unreachable only because every flush path `TRUNCATE`s the
+/// affected table before populating it (`ops.rs`'s `TRUNCATE {affected_tbl}` and
+/// the dispatch builders' equivalents), and `TRUNCATE` holds an
+/// `AccessExclusiveLock` until transaction end — on top of the per-IMV advisory
+/// lock the flush already takes. No concurrent writer can touch the affected
+/// table between the pair's two statements.
+///
+/// Refactoring that `TRUNCATE` to `DELETE FROM` (only `RowExclusiveLock`) would
+/// silently void this invariant and reintroduce the stale-target window. If you
+/// change how the affected table is cleared, re-derive this argument first.
+pub(crate) struct AffectedMatch {
+    /// Sargable `=` form, self-gated on the affected set containing no NULL key.
+    /// When no key column is nullable this is ungated and the only variant.
+    pub fast: String,
+    /// NULL-safe form, self-gated on the affected set *having* a NULL key.
+    /// `None` when no key column is nullable.
+    pub safe: Option<String>,
+}
+
+impl AffectedMatch {
+    /// Expand a statement template into one statement per live variant.
+    ///
+    /// Callers emit every returned statement unconditionally; the gates make
+    /// exactly one of them do work, and PostgreSQL skips the other's plan via a
+    /// `One-Time Filter` (0.013–0.029 ms measured). The gate travels inside the
+    /// SQL string, so this works identically for a statement pushed directly, one
+    /// run via `EXECUTE`, and one run via `EXECUTE ... USING $1` — a `DO`-block
+    /// branch could not serve the last of those, since a `DO` block takes no
+    /// parameters.
+    pub fn stmts(&self, build: impl Fn(&str) -> String) -> Vec<String> {
+        let mut out = vec![build(&self.fast)];
+        if let Some(safe) = &self.safe {
+            out.push(build(safe));
+        }
+        out
+    }
+}
+
+/// PS-5 — `null_safe_in`, specialised into a gated fast/safe pair. See
+/// `AffectedMatch` for why, and `null_safe_in` for the argument contract (the
+/// outer-qualification invariant from `journal/2026-05-13_null_safe_in_bug.md`
+/// applies unchanged — the safe variant *is* `null_safe_in`).
+pub(crate) fn null_safe_in_gated(
+    affected_tbl: &str,
+    outer_qualifier: &str,
+    outer_cols: &[String],
+    affected_cols: &[String],
+    not_null_columns: &std::collections::HashSet<String>,
+) -> AffectedMatch {
+    let safe_match = null_safe_in(
+        affected_tbl,
+        outer_qualifier,
+        outer_cols,
+        affected_cols,
+        not_null_columns,
+    );
+    let Some(gate) = affected_null_key_gate(affected_tbl, affected_cols, not_null_columns) else {
+        // Every key column is NOT NULL: `null_safe_in` already emitted `=`
+        // throughout, so it is the sargable form and no gate is needed. Keeping
+        // this byte-for-byte identical means existing NOT NULL IMVs see no SQL
+        // change at all.
+        return AffectedMatch {
+            fast: safe_match,
+            safe: None,
+        };
+    };
+
+    // The fast variant forces `=` on EVERY key column, which is only valid under
+    // the gate. Build it by treating all affected columns as NOT NULL.
+    let all_not_null: std::collections::HashSet<String> = affected_cols
+        .iter()
+        .map(|c| c.trim_matches('"').to_string())
+        .collect();
+    let fast_match = null_safe_in(
+        affected_tbl,
+        outer_qualifier,
+        outer_cols,
+        affected_cols,
+        &all_not_null,
+    );
+
+    AffectedMatch {
+        fast: format!("{} AND NOT {}", fast_match, gate),
+        safe: Some(format!("{} AND {}", safe_match, gate)),
+    }
+}
+
 /// Splice a SQL fragment (already formatted as ` AND (...)` or similar) into a
 /// query immediately before its `GROUP BY` clause. If the query has no
 /// existing `WHERE` clause between `FROM` and `GROUP BY`, the leading `AND`
@@ -774,6 +1083,13 @@ pub(crate) fn splice_before_group_by(query: &str, and_fragment: &str) -> Option<
 /// `end_query`'s FROM is the intermediate. See `null_safe_in` doc for why
 /// qualifying the outer is mandatory.
 /// Returns `None` if `end_query` contains no ` GROUP BY ` marker (defensive fallback).
+///
+/// PS-5: production codegen now goes through
+/// `inject_affected_filter_before_group_by_gated`, which returns one spliced
+/// query per gated variant. This ungated form is retained because its tests pin
+/// the splice contract (marker choice, `AND` placement, outer qualification)
+/// that the gated version builds on.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn inject_affected_filter_before_group_by(
     end_query: &str,
     output_gb_cols: &[String],
@@ -797,6 +1113,37 @@ pub(crate) fn inject_affected_filter_before_group_by(
         filter,
         &end_query[pos..]
     ))
+}
+
+/// PS-5 — gated sibling of `inject_affected_filter_before_group_by`: returns one
+/// spliced `end_query` per live variant of the affected-groups match.
+///
+/// The gate lands in the **pre-`GROUP BY`** WHERE alongside the match, which is
+/// where it has to be for the filter to scope the intermediate scan rather than
+/// the aggregation output. Verified that PostgreSQL still hoists it: the
+/// `One-Time Filter` appears inside the `GroupAggregate` and the untaken
+/// variant's `Nested Loop Semi Join` is `(never executed)`.
+///
+/// Returns `None` if `end_query` contains no ` GROUP BY ` marker (same defensive
+/// fallback as the ungated form).
+pub(crate) fn inject_affected_filter_before_group_by_gated(
+    end_query: &str,
+    output_gb_cols: &[String],
+    affected_tbl: &str,
+    outer_qualifier: &str,
+    not_null_columns: &std::collections::HashSet<String>,
+) -> Option<Vec<String>> {
+    let upper = end_query.to_uppercase();
+    let gb_marker = " GROUP BY ";
+    let pos = upper.rfind(gb_marker)?;
+    let m = null_safe_in_gated(
+        affected_tbl,
+        outer_qualifier,
+        output_gb_cols,
+        output_gb_cols,
+        not_null_columns,
+    );
+    Some(m.stmts(|filter| format!("{} AND {}{}", &end_query[..pos], filter, &end_query[pos..])))
 }
 
 /// Build the group column list for targeted refresh.

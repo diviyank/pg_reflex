@@ -1023,25 +1023,51 @@ fn test_build_merge_count_distinct_nullable_uses_null_safe_join() {
 
     for op in [DeltaOp::Add, DeltaOp::Subtract] {
         let sql = build_merge_sql("intermediate", delta, &plan, op);
-        // Both group key and distinct key must be joined null-safe.
-        assert!(
-            sql.contains("t.\"grp\" IS NOT DISTINCT FROM d.\"grp\""),
-            "group key must be null-safe in {:?} MERGE: {}",
+        // PS-5 — a nullable compound key makes the MERGE a gated pair. The NULL
+        // rows must still match, which the EXISTS-null-gated SAFE variant
+        // guarantees with `IS NOT DISTINCT FROM` on BOTH the group key and the
+        // DISTINCT key. The sargable `=` variant is allowed, but only under the
+        // NOT-EXISTS-null gate, so it can never run when a NULL key is present.
+        let variants: Vec<&str> = sql.split("\n--<<REFLEX_SEP>>--\n").collect();
+        assert_eq!(
+            variants.len(),
+            2,
+            "nullable compound key must emit a gated MERGE pair in {:?}: {}",
             op as u8,
             sql
         );
+        let safe = variants
+            .iter()
+            .find(|m| m.contains("WHERE EXISTS"))
+            .expect("EXISTS-null-gated NULL-safe variant");
         assert!(
-            sql.contains("t.\"maybe_null\" IS NOT DISTINCT FROM d.\"maybe_null\""),
-            "DISTINCT key must be null-safe in {:?} MERGE — otherwise a row with \
-             maybe_null = NULL never matches: {}",
+            safe.contains("t.\"grp\" IS NOT DISTINCT FROM d.\"grp\""),
+            "group key must be null-safe in the SAFE {:?} MERGE variant: {}",
             op as u8,
-            sql
+            safe
         );
-        // The ON clause must NOT use bare `=` on the distinct key.
         assert!(
-            !sql.contains("t.\"maybe_null\" = d.\"maybe_null\""),
-            "bare `=` on nullable DISTINCT key leaves orphan rows: {}",
-            sql
+            safe.contains("t.\"maybe_null\" IS NOT DISTINCT FROM d.\"maybe_null\""),
+            "DISTINCT key must be null-safe in the SAFE {:?} MERGE variant — otherwise \
+             a row with maybe_null = NULL never matches: {}",
+            op as u8,
+            safe
+        );
+        // Any `=` on the DISTINCT key must appear ONLY in the NOT-EXISTS-null-gated
+        // FAST variant, never in the NULL-safe one.
+        assert!(
+            !safe.contains("t.\"maybe_null\" = d.\"maybe_null\""),
+            "the NULL-safe variant must not use bare `=` on the nullable DISTINCT key: {}",
+            safe
+        );
+        let fast = variants
+            .iter()
+            .find(|m| m.contains("WHERE NOT EXISTS"))
+            .expect("NOT-EXISTS-null-gated sargable variant");
+        assert!(
+            fast.contains("__ng.\"grp\" IS NULL OR __ng.\"maybe_null\" IS NULL"),
+            "the fast variant's gate must cover every nullable key column: {}",
+            fast
         );
     }
 }
@@ -1089,16 +1115,29 @@ fn test_build_delta_sql_uses_scratch_table_for_group_by_imv() {
         "targeted DELETE must TRUNCATE the scratch table: {}",
         &sql[..sql.len().min(400)]
     );
-    assert!(
-        sql.contains("USING \"__reflex_scratch_test_view\""),
-        "MERGE must read from scratch table, not inline subquery: {}",
-        &sql[..sql.len().min(400)]
-    );
-    assert!(
-        !sql.contains("USING (SELECT"),
-        "MERGE must never reference a transition table via inline subquery: {}",
-        &sql[..sql.len().min(400)]
-    );
+    // PS-5 — the MERGE must still READ FROM the materialized scratch table. With
+    // a nullable group key the USING is wrapped in a gate subquery
+    // (`USING (SELECT __m.* FROM <scratch> WHERE …)`), but the underlying relation
+    // is the scratch, never a transition table. Scope the checks to the MERGE
+    // statement(s) — the scratch FILL legitimately reads the transition table.
+    let merge_stmts: Vec<&str> = sql
+        .split("\n--<<REFLEX_SEP>>--\n")
+        .filter(|s| s.trim_start().starts_with("MERGE INTO"))
+        .collect();
+    assert!(!merge_stmts.is_empty(), "a MERGE must be emitted: {sql}");
+    for m in &merge_stmts {
+        assert!(
+            m.contains("FROM \"__reflex_scratch_test_view\""),
+            "MERGE must read from the scratch table: {m}"
+        );
+        // The invariant that matters for the cassert SIGABRT: a MERGE USING
+        // subquery must NEVER reference a transition table (`__reflex_new_*` /
+        // `__reflex_old_*`). The PS-5 gate subquery only references the scratch.
+        assert!(
+            !m.contains("__reflex_new_orders") && !m.contains("__reflex_old_orders"),
+            "MERGE USING must never reference a transition table: {m}"
+        );
+    }
     assert!(
         sql.contains("INSERT INTO \"__reflex_affected_test_view\" SELECT"),
         "affected groups must be populated from scratch: {}",
@@ -1268,26 +1307,54 @@ fn test_build_delta_sql_end_query_group_by_uses_scratch_table() {
         "end_query_has_group_by branch must TRUNCATE scratch: {}",
         &sql[..sql.len().min(600)]
     );
+    // PS-5 — the MERGE USING may be a gate subquery over the scratch, but must
+    // never reference a transition table (`__reflex_new_*` / `__reflex_old_*`),
+    // which is the actual cassert-SIGABRT hazard. Scope to the MERGE statements.
+    for m in sql
+        .split("\n--<<REFLEX_SEP>>--\n")
+        .filter(|s| s.trim_start().starts_with("MERGE INTO"))
+    {
+        assert!(
+            !m.contains("__reflex_new_") && !m.contains("__reflex_old_"),
+            "MERGE USING must never reference a transition table: {m}"
+        );
+    }
+    // The affected-groups filter must appear before GROUP BY in the target
+    // INSERT. PS-5: check each gated variant against its own GROUP BY (see
+    // test_build_delta_sql_splice_injects_filter_before_group_by for why a
+    // global `find` is wrong once two statements are emitted).
+    let target_inserts: Vec<&str> = sql
+        .split("\n--<<REFLEX_SEP>>--\n")
+        .filter(|s| s.trim_start().starts_with("INSERT INTO \"test_view\""))
+        .collect();
     assert!(
-        !sql.contains("USING (SELECT"),
-        "MERGE must never use inline transition-table subquery: {}",
-        &sql[..sql.len().min(600)]
+        !target_inserts.is_empty(),
+        "target INSERT must be present: {sql}"
     );
-    // The target INSERT (into test_view) must have the null-safe filter before GROUP BY.
-    let insert_pos = sql
-        .find("INSERT INTO \"test_view\"")
-        .expect("target INSERT must be present");
-    let tail = &sql[insert_pos..];
-    let filter_pos = tail
-        .find("IS NOT DISTINCT FROM")
-        .expect("null-safe filter must be in target INSERT");
-    let group_by_pos = tail
-        .find("GROUP BY")
-        .expect("GROUP BY must be in target INSERT");
-    assert!(
-        filter_pos < group_by_pos,
-        "null-safe filter must appear before GROUP BY in target INSERT: {}",
-        &tail[..tail.len().min(400)]
+    for stmt in &target_inserts {
+        let filter_pos = stmt
+            .find("EXISTS (SELECT 1 FROM \"__reflex_affected_test_view\"")
+            .expect("affected-groups filter must be in target INSERT");
+        let group_by_pos = stmt.find("GROUP BY").expect("GROUP BY in target INSERT");
+        assert!(
+            filter_pos < group_by_pos,
+            "affected-groups filter must appear before GROUP BY in target INSERT: {stmt}"
+        );
+    }
+    // Both variants must be present. Without this the test would still pass if
+    // the SARGABLE variant vanished entirely and only the NULL-safe one remained.
+    assert_eq!(
+        target_inserts.len(),
+        2,
+        "nullable group key must emit a gated pair of target INSERTs: {sql}"
+    );
+    assert_eq!(
+        target_inserts
+            .iter()
+            .filter(|s| s.contains("IS NOT DISTINCT FROM"))
+            .count(),
+        1,
+        "exactly one gated variant keeps the NULL-safe operator: {sql}"
     );
 }
 
@@ -1414,26 +1481,56 @@ fn test_build_delta_sql_splice_injects_filter_before_group_by() {
         "targeted splice must use scratch table: {}",
         &sql[..sql.len().min(600)]
     );
+    // PS-5 — MERGE USING may be a gate subquery over the scratch, but must never
+    // reference a transition table (the cassert-SIGABRT hazard). Scope to MERGEs.
+    for m in sql
+        .split("\n--<<REFLEX_SEP>>--\n")
+        .filter(|s| s.trim_start().starts_with("MERGE INTO"))
+    {
+        assert!(
+            !m.contains("__reflex_new_") && !m.contains("__reflex_old_"),
+            "MERGE USING must never reference a transition table: {m}"
+        );
+    }
+    // The affected-groups filter must be spliced BEFORE GROUP BY in the target
+    // INSERT, so it scopes the intermediate scan rather than the aggregation
+    // output (the planner does not reliably push a filter through GROUP BY).
+    //
+    // PS-5: a nullable group key emits one target INSERT per gated variant, so
+    // check EVERY target INSERT against its OWN GROUP BY rather than searching
+    // the whole concatenated script — a global `find` would locate the second
+    // statement's operator past the first statement's GROUP BY.
+    let target_inserts: Vec<&str> = sql
+        .split("\n--<<REFLEX_SEP>>--\n")
+        .filter(|s| s.trim_start().starts_with("INSERT INTO \"test_view\""))
+        .collect();
     assert!(
-        !sql.contains("USING (SELECT"),
-        "MERGE must never use inline transition-table subquery: {}",
-        &sql[..sql.len().min(600)]
+        !target_inserts.is_empty(),
+        "target INSERT must be present: {sql}"
     );
-    // The target INSERT (into test_view) must have the null-safe filter spliced before GROUP BY.
-    let insert_pos = sql
-        .find("INSERT INTO \"test_view\"")
-        .expect("target INSERT must be present");
-    let tail = &sql[insert_pos..];
-    let filter_pos = tail
-        .find("IS NOT DISTINCT FROM")
-        .expect("null-safe filter must appear in target INSERT");
-    let group_by_pos = tail
-        .find("GROUP BY")
-        .expect("GROUP BY must be in target INSERT");
-    assert!(
-        filter_pos < group_by_pos,
-        "filter must precede GROUP BY in target INSERT: {}",
-        &tail[..tail.len().min(500)]
+    for stmt in &target_inserts {
+        let filter_pos = stmt
+            .find("EXISTS (SELECT 1 FROM \"__reflex_affected_test_view\"")
+            .expect("affected-groups filter must appear in target INSERT");
+        let group_by_pos = stmt.find("GROUP BY").expect("GROUP BY in target INSERT");
+        assert!(
+            filter_pos < group_by_pos,
+            "filter must precede GROUP BY in target INSERT: {stmt}"
+        );
+    }
+    // The pair must be exactly one sargable variant plus one NULL-safe variant.
+    assert_eq!(
+        target_inserts.len(),
+        2,
+        "nullable group key must emit a gated pair of target INSERTs: {sql}"
+    );
+    assert_eq!(
+        target_inserts
+            .iter()
+            .filter(|s| s.contains("IS NOT DISTINCT FROM"))
+            .count(),
+        1,
+        "exactly one variant keeps the NULL-safe operator: {sql}"
     );
 }
 
@@ -3156,9 +3253,9 @@ fn partition_dispatch_keeps_hot_swap_and_trip_cap_markers() {
         "region",
         "LIST",
         "MERGE_SQL_$1",
-        None,
-        "TDEL_$1",
-        "TINS_$1",
+        &[],
+        &["TDEL_$1".to_string()],
+        &["TINS_$1".to_string()],
     );
     assert!(
         sql.contains("reflex_reconcile_partition"),
@@ -3254,7 +3351,16 @@ fn passthrough_update_nonpartitioned_unchanged() {
 #[test]
 fn partition_dispatch_range_uses_child_name_filter() {
     let sql = build_partition_aware_dispatch_sql_strategy(
-        "v", "__int", "__int", "__aff", "d", "RANGE", "MERGE_$2", None, "TDEL_$2", "TINS_$2",
+        "v",
+        "__int",
+        "__int",
+        "__aff",
+        "d",
+        "RANGE",
+        "MERGE_$2",
+        &[],
+        &["TDEL_$2".to_string()],
+        &["TINS_$2".to_string()],
     );
     assert!(
         sql.contains("_hot_child_names"),
@@ -3269,7 +3375,16 @@ fn partition_dispatch_range_uses_child_name_filter() {
 #[test]
 fn partition_dispatch_list_unchanged_strategy_api() {
     let sql = build_partition_aware_dispatch_sql_strategy(
-        "v", "__int", "__int", "__aff", "region", "LIST", "MERGE_$1", None, "TDEL_$1", "TINS_$1",
+        "v",
+        "__int",
+        "__int",
+        "__aff",
+        "region",
+        "LIST",
+        "MERGE_$1",
+        &[],
+        &["TDEL_$1".to_string()],
+        &["TINS_$1".to_string()],
     );
     assert!(
         sql.contains("$reflex_inner$MERGE_$1$reflex_inner$ USING _hot_keys"),
@@ -3278,5 +3393,512 @@ fn partition_dispatch_list_unchanged_strategy_api() {
     assert!(
         !sql.contains("USING _hot_keys, _hot_child_oids"),
         "LIST must NOT bind child oids: {sql}"
+    );
+}
+
+// =============================================================================
+// PS-5 — sargable affected-groups match.
+//
+// `IS NOT DISTINCT FROM` is not an opfamily member, so it can serve neither an
+// `Index Cond` nor a hash/merge join key: the target sync's only available plan
+// is a nested loop with a `Join Filter` over the whole target, i.e.
+// O(total_groups x affected_groups). Measured on a 200k-group nullable-key
+// fixture (PG 17.7): 52ms for a 1-row delta, and 681,576ms with 50k affected
+// groups (`Rows Removed by Join Filter: 8,749,975,000`) versus 57ms for `=`.
+//
+// Fix: emit the statement TWICE, each copy self-gated on an *uncorrelated*
+// probe of the affected table. PostgreSQL evaluates that gate once as an
+// InitPlan, marks the qual pseudoconstant, and puts a `Result / One-Time
+// Filter` above the join, so the untaken copy's subtree is `(never executed)`
+// (0.013-0.029ms measured).
+//
+// Sound because for any affected row with a non-NULL key,
+// `t.k IS NOT DISTINCT FROM a.k` and `t.k = a.k` select the same rows. The
+// semantics themselves are pinned by
+// `pg_test_correctness.rs::test_correctness_null_group_key_gate_branch_boundary`.
+// =============================================================================
+
+/// A nullable group key must produce BOTH variants: a sargable `=` copy gated
+/// on the affected set having no NULL key, and a NULL-safe copy gated on it
+/// having one. Never just the fast one — that would be silent data loss for
+/// NULL-keyed groups.
+#[test]
+fn gated_match_nullable_key_emits_both_variants() {
+    let plan = simple_plan(); // group_by = ["city"], not_null_columns = {}
+    let m = null_safe_in_gated(
+        "\"__reflex_affected_v\"",
+        "\"v\"",
+        &["\"city\"".to_string()],
+        &["\"city\"".to_string()],
+        &plan.not_null_columns,
+    );
+
+    assert!(
+        m.fast.contains("\"v\".\"city\" = __a.\"city\""),
+        "fast variant must use sargable `=`: {}",
+        m.fast
+    );
+    assert!(
+        !m.fast.contains("IS NOT DISTINCT FROM"),
+        "fast variant must not contain the non-sargable operator: {}",
+        m.fast
+    );
+    assert!(
+        m.fast
+            .contains("NOT EXISTS (SELECT 1 FROM \"__reflex_affected_v\" AS __ng"),
+        "fast variant must be gated on the affected set having NO null key: {}",
+        m.fast
+    );
+    assert!(
+        m.fast.contains("__ng.\"city\" IS NULL"),
+        "gate must test the affected side's key column for NULL: {}",
+        m.fast
+    );
+
+    let safe = m
+        .safe
+        .as_ref()
+        .expect("a nullable key MUST get a NULL-safe variant");
+    assert!(
+        safe.contains("\"v\".\"city\" IS NOT DISTINCT FROM __a.\"city\""),
+        "safe variant must keep the NULL-safe operator: {safe}"
+    );
+    assert!(
+        safe.contains("EXISTS (SELECT 1 FROM \"__reflex_affected_v\" AS __ng")
+            && !safe.contains("NOT EXISTS (SELECT 1 FROM \"__reflex_affected_v\" AS __ng"),
+        "safe variant must be gated on the affected set HAVING a null key: {safe}"
+    );
+}
+
+/// The two gates must be exact complements, so exactly one variant ever does
+/// work. If both could fire, a DELETE would run twice (harmless) but an INSERT
+/// would double-insert every affected group.
+#[test]
+fn gated_match_gates_are_mutually_exclusive() {
+    let plan = simple_plan();
+    let m = null_safe_in_gated(
+        "\"__aff\"",
+        "\"v\"",
+        &["\"city\"".to_string()],
+        &["\"city\"".to_string()],
+        &plan.not_null_columns,
+    );
+    let safe = m.safe.as_ref().expect("nullable key gets a safe variant");
+
+    let gate = "EXISTS (SELECT 1 FROM \"__aff\" AS __ng WHERE __ng.\"city\" IS NULL)";
+    assert!(
+        m.fast.ends_with(&format!("AND NOT {gate}")),
+        "fast gate must be the negation of the safe gate: {}",
+        m.fast
+    );
+    assert!(
+        safe.ends_with(&format!("AND {gate}")),
+        "safe gate must be the positive form: {safe}"
+    );
+}
+
+/// An all-NOT-NULL group key needs no gate at all: `null_safe_in` already emits
+/// plain `=` for it, so the plan is already sargable. Emitting a second
+/// statement there would be pure overhead, and it would change the SQL of every
+/// existing NOT-NULL IMV for no reason.
+#[test]
+fn gated_match_not_null_key_emits_single_ungated_variant() {
+    let mut not_null = std::collections::HashSet::new();
+    not_null.insert("city".to_string());
+    let m = null_safe_in_gated(
+        "\"__aff\"",
+        "\"v\"",
+        &["\"city\"".to_string()],
+        &["\"city\"".to_string()],
+        &not_null,
+    );
+    assert!(
+        m.safe.is_none(),
+        "a NOT NULL key must not get a second variant: {:?}",
+        m.safe
+    );
+    assert!(
+        !m.fast.contains("__ng"),
+        "a NOT NULL key must not get a gate: {}",
+        m.fast
+    );
+    assert_eq!(
+        m.fast,
+        null_safe_in(
+            "\"__aff\"",
+            "\"v\"",
+            &["\"city\"".to_string()],
+            &["\"city\"".to_string()],
+            &not_null
+        ),
+        "NOT NULL codegen must be byte-for-byte unchanged"
+    );
+}
+
+/// Multi-column: the gate must test EVERY nullable key column, OR'd together —
+/// a NULL in any one column forces the NULL-safe branch. And a mixed key must
+/// gate only on the nullable columns, since a NOT NULL column can never be the
+/// reason the fast form is wrong.
+#[test]
+fn gated_match_multi_column_gate_covers_every_nullable_column() {
+    let cols = vec!["\"g1\"".to_string(), "\"g2\"".to_string()];
+    let all_nullable = std::collections::HashSet::new();
+    let m = null_safe_in_gated("\"__aff\"", "\"v\"", &cols, &cols, &all_nullable);
+    assert!(
+        m.fast
+            .contains("__ng.\"g1\" IS NULL OR __ng.\"g2\" IS NULL"),
+        "gate must OR every nullable key column: {}",
+        m.fast
+    );
+    assert!(
+        m.fast
+            .contains("\"v\".\"g1\" = __a.\"g1\" AND \"v\".\"g2\" = __a.\"g2\""),
+        "fast variant must use `=` on every column: {}",
+        m.fast
+    );
+
+    let mut mixed = std::collections::HashSet::new();
+    mixed.insert("g1".to_string());
+    let m2 = null_safe_in_gated("\"__aff\"", "\"v\"", &cols, &cols, &mixed);
+    assert!(
+        m2.fast.contains("__ng.\"g2\" IS NULL") && !m2.fast.contains("__ng.\"g1\" IS NULL"),
+        "gate must list only the NULLABLE columns: {}",
+        m2.fast
+    );
+    assert!(
+        m2.safe.is_some(),
+        "one nullable column among several still needs the safe variant"
+    );
+}
+
+/// `AffectedMatch::stmts` is how call sites turn one statement template into one
+/// statement per live variant. It must preserve template order and apply the
+/// template to each variant.
+#[test]
+fn gated_match_stmts_expands_per_variant() {
+    let nullable = std::collections::HashSet::new();
+    let cols = vec!["\"city\"".to_string()];
+    let m = null_safe_in_gated("\"__aff\"", "\"v\"", &cols, &cols, &nullable);
+    let stmts = m.stmts(|pred| format!("DELETE FROM \"v\" WHERE {pred}"));
+    assert_eq!(stmts.len(), 2, "nullable key expands to two statements");
+    assert!(stmts[0].starts_with("DELETE FROM \"v\" WHERE "));
+    assert!(stmts[0].contains("= __a.\"city\""));
+    assert!(stmts[1].contains("IS NOT DISTINCT FROM __a.\"city\""));
+
+    let mut not_null = std::collections::HashSet::new();
+    not_null.insert("city".to_string());
+    let m2 = null_safe_in_gated("\"__aff\"", "\"v\"", &cols, &cols, &not_null);
+    let stmts2 = m2.stmts(|pred| format!("DELETE FROM \"v\" WHERE {pred}"));
+    assert_eq!(stmts2.len(), 1, "NOT NULL key expands to one statement");
+}
+
+/// End-to-end through the real codegen entry point: a nullable-key aggregate
+/// must emit two target DELETEs and two target INSERTs, and the sargable one of
+/// each pair must carry no `IS NOT DISTINCT FROM`.
+#[test]
+fn delta_sql_nullable_group_key_emits_gated_target_sync_pair() {
+    let plan = simple_plan(); // not_null_columns = {} => "city" is nullable
+    let agg_json = serde_json::to_string(&plan).unwrap();
+    let base_q = "SELECT city, SUM(amount) AS \"__sum_amount\", COUNT(*) AS __ivm_count FROM orders GROUP BY city";
+    let end_q = "SELECT \"city\", \"__sum_amount\" AS total FROM \"__reflex_intermediate_gated_view\" WHERE __ivm_count > 0";
+
+    let sql = reflex_build_delta_sql(
+        "gated_view",
+        "orders",
+        "INSERT",
+        base_q,
+        end_q,
+        Some(agg_json.as_str()),
+        base_q,
+    );
+
+    let tdel_count = sql.matches("DELETE FROM \"gated_view\" WHERE ").count();
+    assert_eq!(
+        tdel_count, 2,
+        "nullable group key must emit a fast+safe target DELETE pair, got {tdel_count}: {sql}"
+    );
+    assert!(
+        sql.contains("AS __ng WHERE __ng.\"city\" IS NULL"),
+        "target sync must carry the NULL-freeness gate: {sql}"
+    );
+    // Every gate must be an uncorrelated probe of the affected table — that is
+    // what makes it an InitPlan the executor can hoist into a One-Time Filter.
+    // A correlated gate would be evaluated per row and buy nothing.
+    for frag in sql.split("AS __ng WHERE ").skip(1) {
+        let gate_body = &frag[..frag.find(')').expect("gate has a closing paren")];
+        assert!(
+            !gate_body.contains("\"gated_view\".") && !gate_body.contains("__a."),
+            "gate must be uncorrelated (no outer or __a reference): {gate_body}"
+        );
+    }
+}
+
+/// The partitioned cold path binds `$1`/`$2` via `EXECUTE ... USING`. Both
+/// variants derive from the same filtered string, so both must keep their
+/// placeholders — a `DO` block could not, which is why the gate lives in the
+/// statement rather than in a wrapper block.
+#[test]
+fn gated_match_variants_survive_parameter_placeholders() {
+    let nullable = std::collections::HashSet::new();
+    let cols = vec!["\"city\"".to_string()];
+    let m = null_safe_in_gated("\"__aff\"", "\"v\"", &cols, &cols, &nullable);
+    let stmts = m.stmts(|pred| {
+        format!("DELETE FROM \"v\" WHERE {pred} AND \"v\".\"region\"::text <> ALL($1::TEXT[])")
+    });
+    assert_eq!(stmts.len(), 2);
+    for s in &stmts {
+        assert!(
+            s.contains("$1::TEXT[]"),
+            "cold-path placeholder must survive gating: {s}"
+        );
+    }
+}
+
+/// PS-5 — the two-variant expansion must survive the DISPATCH path, not just the
+/// `AffectedMatch` helper. `build_high_selectivity_dispatch_sql` wraps the target
+/// sync in `DO $reflex_dispatch$ ... EXECUTE ...`; the field data attributes
+/// 79 calls / 25 s mean to that block, so it is the production path. It is also
+/// the path where dropping a variant loses the NULL groups, and where emitting a
+/// variant twice would double-apply the target INSERT.
+#[test]
+fn dispatch_sql_emits_one_execute_per_gated_variant() {
+    let tdel = vec![
+        "DELETE FROM \"v\" WHERE FAST_PRED".to_string(),
+        "DELETE FROM \"v\" WHERE SAFE_PRED".to_string(),
+    ];
+    let tins = vec![
+        "INSERT INTO \"v\" SELECT 1 WHERE FAST_PRED".to_string(),
+        "INSERT INTO \"v\" SELECT 1 WHERE SAFE_PRED".to_string(),
+    ];
+    let dead = vec![
+        "DELETE FROM \"__int\" WHERE __ivm_count <= 0 AND FAST_PRED".to_string(),
+        "DELETE FROM \"__int\" WHERE __ivm_count <= 0 AND SAFE_PRED".to_string(),
+    ];
+    let sql = build_high_selectivity_dispatch_sql(
+        "v",
+        "__int",
+        "__aff",
+        "MERGE_SQL",
+        &dead,
+        &tdel,
+        &tins,
+    );
+
+    for stmt in dead.iter().chain(tdel.iter()).chain(tins.iter()) {
+        assert_eq!(
+            sql.matches(&format!("EXECUTE $reflex_inner${}$reflex_inner$;", stmt))
+                .count(),
+            1,
+            "each gated variant must be EXECUTEd exactly once (twice would \
+             double-apply the target INSERT, zero would lose the NULL groups): {stmt}"
+        );
+    }
+    // Ordering matters: the fast variant is emitted before the safe one so the
+    // cheap plan is the one the planner sees first in the block.
+    assert!(
+        sql.find("DELETE FROM \"v\" WHERE FAST_PRED").unwrap()
+            < sql.find("DELETE FROM \"v\" WHERE SAFE_PRED").unwrap(),
+        "fast variant must precede safe variant: {sql}"
+    );
+}
+
+/// Same, for the partition-aware dispatch builder — and critically, every gated
+/// variant must keep its `USING` binding, since the cold-partition filter spliced
+/// into both carries `$1`/`$2`.
+#[test]
+fn partition_dispatch_sql_emits_one_execute_per_gated_variant_with_using() {
+    let tdel = vec![
+        "DELETE FROM \"v\" WHERE FAST AND \"v\".\"region\"::text <> ALL($1::TEXT[])".to_string(),
+        "DELETE FROM \"v\" WHERE SAFE AND \"v\".\"region\"::text <> ALL($1::TEXT[])".to_string(),
+    ];
+    let tins = vec![
+        "INSERT INTO \"v\" SELECT 1 WHERE FAST AND \"i\".\"region\"::text <> ALL($1::TEXT[])"
+            .to_string(),
+        "INSERT INTO \"v\" SELECT 1 WHERE SAFE AND \"i\".\"region\"::text <> ALL($1::TEXT[])"
+            .to_string(),
+    ];
+    let sql = build_partition_aware_dispatch_sql_strategy(
+        "v",
+        "__int",
+        "__int",
+        "__aff",
+        "region",
+        "LIST",
+        "MERGE_$1",
+        &[],
+        &tdel,
+        &tins,
+    );
+    for stmt in tdel.iter().chain(tins.iter()) {
+        assert_eq!(
+            sql.matches(&format!(
+                "EXECUTE $reflex_inner${}$reflex_inner$ USING _hot_keys;",
+                stmt
+            ))
+            .count(),
+            2,
+            "each gated variant must be EXECUTEd with its USING binding in both \
+             the no-children fallback and the cold-partition section: {stmt}"
+        );
+    }
+}
+
+// =============================================================================
+// PS-5 Part B — the same non-sargable match survives at three more sites in
+// merge.rs. By the Part A benchmark, after the target sync is fixed the
+// intermediate MERGE is 86,434 ms of an 86,574 ms flush at 200k groups / 5k
+// affected — 99.84% of what is left.
+//
+// The MERGE cannot be gated by duplicating the STATEMENT (MERGE is not
+// idempotent, so two copies would double-apply the delta). It is gated by moving
+// the probe into the `USING` SOURCE: the untaken variant's source yields zero
+// rows, so neither WHEN MATCHED nor WHEN NOT MATCHED can fire. Verified for real,
+// not just by EXPLAIN — NULL-free scratch gives `MERGE 1`/`MERGE 0` and
+// NULL-keyed scratch gives `MERGE 0`/`MERGE 1`, each applying exactly once
+// (scratchpad probe5_merge_gate.sql).
+// =============================================================================
+
+/// The MERGE `ON` clause must become sargable for a nullable group key, with the
+/// gate inside `USING` rather than duplicating the statement.
+#[test]
+fn merge_using_nullable_key_gates_source_and_uses_equality() {
+    let plan = simple_plan(); // group_by = ["city"], not_null_columns = {}
+    let sql = build_merge_from_table_sql("\"__int_v\"", "\"__scratch_v\"", &plan, DeltaOp::Add);
+
+    assert!(
+        sql.contains("t.\"city\" = d.\"city\""),
+        "nullable group key must still reach an equality ON clause via the gate: {sql}"
+    );
+    assert!(
+        sql.contains("AS __ng WHERE __ng.\"city\" IS NULL"),
+        "the NULL-freeness probe must be present: {sql}"
+    );
+    // The probe must sit in the USING source, NOT in the ON clause — that is what
+    // makes the untaken variant contribute zero source rows instead of merging.
+    let first_using = sql.find(" USING ").expect("MERGE has USING");
+    let first_on = sql.find(" ON ").expect("MERGE has ON");
+    let first_gate = sql.find("AS __ng WHERE").expect("gate present");
+    assert!(
+        first_gate > first_using && first_gate < first_on,
+        "gate must live inside the USING source (between USING and ON): {sql}"
+    );
+
+    // Two DIFFERENT gated MERGEs, one per variant. Two DIFFERENT statements do NOT
+    // double-apply: each variant's USING source is gated to yield rows only when
+    // it is the correct one; the other yields zero rows and merges nothing.
+    // (Verified end-to-end in pg_test_correctness_merge_gate_apply_exactly_once.)
+    // What WOULD double-apply is emitting the SAME merge twice, so assert the two
+    // are a sargable/NULL-safe complementary pair — not that there is only one.
+    let merges: Vec<&str> = sql.split("\n--<<REFLEX_SEP>>--\n").collect();
+    assert_eq!(
+        merges.len(),
+        2,
+        "nullable group key must emit a gated MERGE pair: {sql}"
+    );
+    let fast = merges
+        .iter()
+        .find(|m| m.contains("WHERE NOT EXISTS"))
+        .expect("fast (NOT EXISTS-gated) variant");
+    let safe = merges
+        .iter()
+        .find(|m| m.contains("WHERE EXISTS"))
+        .expect("safe (EXISTS-gated) variant");
+    assert!(
+        fast.contains("ON t.\"city\" = d.\"city\"") && !fast.contains("IS NOT DISTINCT FROM"),
+        "the NOT-EXISTS-gated variant must use sargable `=` ON: {fast}"
+    );
+    assert!(
+        safe.contains("ON t.\"city\" IS NOT DISTINCT FROM d.\"city\""),
+        "the EXISTS-gated variant must keep the NULL-safe ON: {safe}"
+    );
+}
+
+/// A NOT NULL group key needs no gate: the ON clause is already `=`.
+#[test]
+fn merge_using_not_null_key_is_unchanged_and_ungated() {
+    let mut plan = simple_plan();
+    plan.not_null_columns.insert("city".to_string());
+    let sql = build_merge_from_table_sql("\"__int_v\"", "\"__scratch_v\"", &plan, DeltaOp::Add);
+    assert!(
+        sql.contains("t.\"city\" = d.\"city\""),
+        "NOT NULL key already uses `=`: {sql}"
+    );
+    assert!(
+        !sql.contains("__ng"),
+        "NOT NULL key must not get a gate: {sql}"
+    );
+    assert!(
+        sql.contains("USING \"__scratch_v\" AS t") || sql.contains("USING \"__scratch_v\" AS d"),
+        "NOT NULL key must keep the bare USING relation: {sql}"
+    );
+}
+
+/// The top-K shrunk-groups capture joins intermediate to affected on the group
+/// key — same nested-loop pathology, same fix.
+#[test]
+fn topk_shrunk_groups_capture_is_gated() {
+    let mut plan = simple_plan();
+    plan.intermediate_columns[0].source_aggregate = "MIN".to_string();
+    plan.intermediate_columns[0].topk_k = Some(4);
+    let mut stmts: Vec<String> = Vec::new();
+    let emitted = push_topk_shrunk_groups_capture(
+        &mut stmts,
+        "\"__int_v\"",
+        &plan,
+        "\"__aff_v\"",
+        "\"__shrunk_v\"",
+    );
+    assert!(emitted, "top-K plan must emit the capture");
+    let joined = stmts.join("\n");
+    assert!(
+        joined.contains("i.\"city\" = a.\"city\""),
+        "nullable group key must reach an equality join via the gate: {joined}"
+    );
+    assert!(
+        joined.contains("AS __ng WHERE __ng.\"city\" IS NULL"),
+        "gate must be present: {joined}"
+    );
+    assert_eq!(
+        stmts
+            .iter()
+            .filter(|s| s.starts_with("INSERT INTO"))
+            .count(),
+        2,
+        "nullable key expands the capture INSERT into a gated pair: {joined}"
+    );
+}
+
+/// `build_min_max_recompute_sql` has TWO non-sargable joins: the recompute
+/// UPDATE's join to `__src`, and the `EXISTS` firing gate's join to the affected
+/// table. The gate runs on EVERY UPDATE flush of EVERY MIN/MAX IMV, so it is the
+/// hotter of the two.
+#[test]
+fn min_max_recompute_update_and_firing_gate_are_gated() {
+    let mut plan = simple_plan();
+    plan.intermediate_columns[0].source_aggregate = "MIN".to_string();
+    plan.intermediate_columns[0].name = "__min_amount".to_string();
+    let base = "SELECT city, MIN(amount) AS \"__min_amount\" FROM orders GROUP BY city";
+    let sql = build_min_max_recompute_sql("\"__int_v\"", &plan, base, Some("\"__aff_v\""))
+        .expect("MIN plan must emit a recompute");
+
+    assert!(
+        sql.contains("AS __ng WHERE __ng.\"city\" IS NULL"),
+        "both joins must carry the NULL-freeness probe: {sql}"
+    );
+    // The firing gate (EXISTS ... JOIN affected) must have a sargable variant.
+    assert!(
+        sql.contains("\"__int_v\".\"city\" = __aff.\"city\""),
+        "the EXISTS firing gate must reach an equality join: {sql}"
+    );
+    // The recompute UPDATE's join to __src must too.
+    assert!(
+        sql.contains("\"__int_v\".\"city\" = __src.\"city\""),
+        "the recompute UPDATE must reach an equality join: {sql}"
+    );
+    // The NULL-safe forms must survive for the NULL-keyed case.
+    assert!(
+        sql.contains("\"__int_v\".\"city\" IS NOT DISTINCT FROM __aff.\"city\"")
+            && sql.contains("\"__int_v\".\"city\" IS NOT DISTINCT FROM __src.\"city\""),
+        "NULL-safe variants must remain reachable: {sql}"
     );
 }
