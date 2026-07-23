@@ -3280,3 +3280,261 @@ fn partition_dispatch_list_unchanged_strategy_api() {
         "LIST must NOT bind child oids: {sql}"
     );
 }
+
+// =============================================================================
+// PS-5 — sargable affected-groups match.
+//
+// `IS NOT DISTINCT FROM` is not an opfamily member, so it can serve neither an
+// `Index Cond` nor a hash/merge join key: the target sync's only available plan
+// is a nested loop with a `Join Filter` over the whole target, i.e.
+// O(total_groups x affected_groups). Measured on a 200k-group nullable-key
+// fixture (PG 17.7): 52ms for a 1-row delta, and 681,576ms with 50k affected
+// groups (`Rows Removed by Join Filter: 8,749,975,000`) versus 57ms for `=`.
+//
+// Fix: emit the statement TWICE, each copy self-gated on an *uncorrelated*
+// probe of the affected table. PostgreSQL evaluates that gate once as an
+// InitPlan, marks the qual pseudoconstant, and puts a `Result / One-Time
+// Filter` above the join, so the untaken copy's subtree is `(never executed)`
+// (0.013-0.029ms measured).
+//
+// Sound because for any affected row with a non-NULL key,
+// `t.k IS NOT DISTINCT FROM a.k` and `t.k = a.k` select the same rows. The
+// semantics themselves are pinned by
+// `pg_test_correctness.rs::test_correctness_null_group_key_gate_branch_boundary`.
+// =============================================================================
+
+/// A nullable group key must produce BOTH variants: a sargable `=` copy gated
+/// on the affected set having no NULL key, and a NULL-safe copy gated on it
+/// having one. Never just the fast one — that would be silent data loss for
+/// NULL-keyed groups.
+#[test]
+fn gated_match_nullable_key_emits_both_variants() {
+    let plan = simple_plan(); // group_by = ["city"], not_null_columns = {}
+    let m = null_safe_in_gated(
+        "\"__reflex_affected_v\"",
+        "\"v\"",
+        &["\"city\"".to_string()],
+        &["\"city\"".to_string()],
+        &plan.not_null_columns,
+    );
+
+    assert!(
+        m.fast.contains("\"v\".\"city\" = __a.\"city\""),
+        "fast variant must use sargable `=`: {}",
+        m.fast
+    );
+    assert!(
+        !m.fast.contains("IS NOT DISTINCT FROM"),
+        "fast variant must not contain the non-sargable operator: {}",
+        m.fast
+    );
+    assert!(
+        m.fast
+            .contains("NOT EXISTS (SELECT 1 FROM \"__reflex_affected_v\" AS __ng"),
+        "fast variant must be gated on the affected set having NO null key: {}",
+        m.fast
+    );
+    assert!(
+        m.fast.contains("__ng.\"city\" IS NULL"),
+        "gate must test the affected side's key column for NULL: {}",
+        m.fast
+    );
+
+    let safe = m
+        .safe
+        .as_ref()
+        .expect("a nullable key MUST get a NULL-safe variant");
+    assert!(
+        safe.contains("\"v\".\"city\" IS NOT DISTINCT FROM __a.\"city\""),
+        "safe variant must keep the NULL-safe operator: {safe}"
+    );
+    assert!(
+        safe.contains("EXISTS (SELECT 1 FROM \"__reflex_affected_v\" AS __ng")
+            && !safe.contains("NOT EXISTS (SELECT 1 FROM \"__reflex_affected_v\" AS __ng"),
+        "safe variant must be gated on the affected set HAVING a null key: {safe}"
+    );
+}
+
+/// The two gates must be exact complements, so exactly one variant ever does
+/// work. If both could fire, a DELETE would run twice (harmless) but an INSERT
+/// would double-insert every affected group.
+#[test]
+fn gated_match_gates_are_mutually_exclusive() {
+    let plan = simple_plan();
+    let m = null_safe_in_gated(
+        "\"__aff\"",
+        "\"v\"",
+        &["\"city\"".to_string()],
+        &["\"city\"".to_string()],
+        &plan.not_null_columns,
+    );
+    let safe = m.safe.as_ref().expect("nullable key gets a safe variant");
+
+    let gate = "EXISTS (SELECT 1 FROM \"__aff\" AS __ng WHERE __ng.\"city\" IS NULL)";
+    assert!(
+        m.fast.ends_with(&format!("AND NOT {gate}")),
+        "fast gate must be the negation of the safe gate: {}",
+        m.fast
+    );
+    assert!(
+        safe.ends_with(&format!("AND {gate}")),
+        "safe gate must be the positive form: {safe}"
+    );
+}
+
+/// An all-NOT-NULL group key needs no gate at all: `null_safe_in` already emits
+/// plain `=` for it, so the plan is already sargable. Emitting a second
+/// statement there would be pure overhead, and it would change the SQL of every
+/// existing NOT-NULL IMV for no reason.
+#[test]
+fn gated_match_not_null_key_emits_single_ungated_variant() {
+    let mut not_null = std::collections::HashSet::new();
+    not_null.insert("city".to_string());
+    let m = null_safe_in_gated(
+        "\"__aff\"",
+        "\"v\"",
+        &["\"city\"".to_string()],
+        &["\"city\"".to_string()],
+        &not_null,
+    );
+    assert!(
+        m.safe.is_none(),
+        "a NOT NULL key must not get a second variant: {:?}",
+        m.safe
+    );
+    assert!(
+        !m.fast.contains("__ng"),
+        "a NOT NULL key must not get a gate: {}",
+        m.fast
+    );
+    assert_eq!(
+        m.fast,
+        null_safe_in(
+            "\"__aff\"",
+            "\"v\"",
+            &["\"city\"".to_string()],
+            &["\"city\"".to_string()],
+            &not_null
+        ),
+        "NOT NULL codegen must be byte-for-byte unchanged"
+    );
+}
+
+/// Multi-column: the gate must test EVERY nullable key column, OR'd together —
+/// a NULL in any one column forces the NULL-safe branch. And a mixed key must
+/// gate only on the nullable columns, since a NOT NULL column can never be the
+/// reason the fast form is wrong.
+#[test]
+fn gated_match_multi_column_gate_covers_every_nullable_column() {
+    let cols = vec!["\"g1\"".to_string(), "\"g2\"".to_string()];
+    let all_nullable = std::collections::HashSet::new();
+    let m = null_safe_in_gated("\"__aff\"", "\"v\"", &cols, &cols, &all_nullable);
+    assert!(
+        m.fast
+            .contains("__ng.\"g1\" IS NULL OR __ng.\"g2\" IS NULL"),
+        "gate must OR every nullable key column: {}",
+        m.fast
+    );
+    assert!(
+        m.fast
+            .contains("\"v\".\"g1\" = __a.\"g1\" AND \"v\".\"g2\" = __a.\"g2\""),
+        "fast variant must use `=` on every column: {}",
+        m.fast
+    );
+
+    let mut mixed = std::collections::HashSet::new();
+    mixed.insert("g1".to_string());
+    let m2 = null_safe_in_gated("\"__aff\"", "\"v\"", &cols, &cols, &mixed);
+    assert!(
+        m2.fast.contains("__ng.\"g2\" IS NULL") && !m2.fast.contains("__ng.\"g1\" IS NULL"),
+        "gate must list only the NULLABLE columns: {}",
+        m2.fast
+    );
+    assert!(
+        m2.safe.is_some(),
+        "one nullable column among several still needs the safe variant"
+    );
+}
+
+/// `AffectedMatch::stmts` is how call sites turn one statement template into one
+/// statement per live variant. It must preserve template order and apply the
+/// template to each variant.
+#[test]
+fn gated_match_stmts_expands_per_variant() {
+    let nullable = std::collections::HashSet::new();
+    let cols = vec!["\"city\"".to_string()];
+    let m = null_safe_in_gated("\"__aff\"", "\"v\"", &cols, &cols, &nullable);
+    let stmts = m.stmts(|pred| format!("DELETE FROM \"v\" WHERE {pred}"));
+    assert_eq!(stmts.len(), 2, "nullable key expands to two statements");
+    assert!(stmts[0].starts_with("DELETE FROM \"v\" WHERE "));
+    assert!(stmts[0].contains("= __a.\"city\""));
+    assert!(stmts[1].contains("IS NOT DISTINCT FROM __a.\"city\""));
+
+    let mut not_null = std::collections::HashSet::new();
+    not_null.insert("city".to_string());
+    let m2 = null_safe_in_gated("\"__aff\"", "\"v\"", &cols, &cols, &not_null);
+    let stmts2 = m2.stmts(|pred| format!("DELETE FROM \"v\" WHERE {pred}"));
+    assert_eq!(stmts2.len(), 1, "NOT NULL key expands to one statement");
+}
+
+/// End-to-end through the real codegen entry point: a nullable-key aggregate
+/// must emit two target DELETEs and two target INSERTs, and the sargable one of
+/// each pair must carry no `IS NOT DISTINCT FROM`.
+#[test]
+fn delta_sql_nullable_group_key_emits_gated_target_sync_pair() {
+    let plan = simple_plan(); // not_null_columns = {} => "city" is nullable
+    let agg_json = serde_json::to_string(&plan).unwrap();
+    let base_q = "SELECT city, SUM(amount) AS \"__sum_amount\", COUNT(*) AS __ivm_count FROM orders GROUP BY city";
+    let end_q = "SELECT \"city\", \"__sum_amount\" AS total FROM \"__reflex_intermediate_gated_view\" WHERE __ivm_count > 0";
+
+    let sql = reflex_build_delta_sql(
+        "gated_view",
+        "orders",
+        "INSERT",
+        base_q,
+        end_q,
+        Some(agg_json.as_str()),
+        base_q,
+    );
+
+    let tdel_count = sql.matches("DELETE FROM \"gated_view\" WHERE ").count();
+    assert_eq!(
+        tdel_count, 2,
+        "nullable group key must emit a fast+safe target DELETE pair, got {tdel_count}: {sql}"
+    );
+    assert!(
+        sql.contains("AS __ng WHERE __ng.\"city\" IS NULL"),
+        "target sync must carry the NULL-freeness gate: {sql}"
+    );
+    // Every gate must be an uncorrelated probe of the affected table — that is
+    // what makes it an InitPlan the executor can hoist into a One-Time Filter.
+    // A correlated gate would be evaluated per row and buy nothing.
+    for frag in sql.split("AS __ng WHERE ").skip(1) {
+        let gate_body = &frag[..frag.find(')').expect("gate has a closing paren")];
+        assert!(
+            !gate_body.contains("\"gated_view\".") && !gate_body.contains("__a."),
+            "gate must be uncorrelated (no outer or __a reference): {gate_body}"
+        );
+    }
+}
+
+/// The partitioned cold path binds `$1`/`$2` via `EXECUTE ... USING`. Both
+/// variants derive from the same filtered string, so both must keep their
+/// placeholders — a `DO` block could not, which is why the gate lives in the
+/// statement rather than in a wrapper block.
+#[test]
+fn gated_match_variants_survive_parameter_placeholders() {
+    let nullable = std::collections::HashSet::new();
+    let cols = vec!["\"city\"".to_string()];
+    let m = null_safe_in_gated("\"__aff\"", "\"v\"", &cols, &cols, &nullable);
+    let stmts = m.stmts(|pred| {
+        format!("DELETE FROM \"v\" WHERE {pred} AND \"v\".\"region\"::text <> ALL($1::TEXT[])")
+    });
+    assert_eq!(stmts.len(), 2);
+    for s in &stmts {
+        assert!(
+            s.contains("$1::TEXT[]"),
+            "cold-path placeholder must survive gating: {s}"
+        );
+    }
+}
