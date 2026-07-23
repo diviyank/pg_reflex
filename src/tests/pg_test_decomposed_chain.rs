@@ -1031,3 +1031,76 @@ fn pg_reconcile_under_error_policy_does_not_abort_on_own_alter() {
 
     Spi::run("SET pg_reflex.alter_source_policy = 'warn'").expect("reset policy");
 }
+
+/// PS-1 REVIEW Item B — the two-argument `reflex_reconcile(view, drop_orphans)`
+/// entry point exists so `reflex_doctor` can reconcile WITHOUT dropping orphan
+/// partitions. Assert both the capability and that its default-true sibling is
+/// unchanged. (Wiring the doctor to call it is an integration-commit task.)
+#[pg_test]
+fn pg_reconcile_scoped_entry_point_recurses_and_is_correct() {
+    Spi::run("CREATE TABLE dcs_src (id INT, grp TEXT, val NUMERIC)").expect("create src");
+    Spi::run("INSERT INTO dcs_src SELECT g, 'g' || (g % 4), 5 FROM generate_series(1,80) g")
+        .expect("seed");
+    Spi::run("CREATE MATERIALIZED VIEW dcs_mv AS SELECT * FROM dcs_src").expect("mv");
+
+    crate::create_reflex_ivm(
+        "dcs_agg",
+        "WITH base AS (SELECT id, grp, val FROM dcs_mv) \
+         SELECT grp, SUM(val) AS total FROM base GROUP BY grp",
+        Some("grp"),
+        None,
+        None,
+        None,
+    );
+
+    Spi::run("INSERT INTO dcs_src VALUES (999, 'gZ', 5)").expect("late");
+    Spi::run("REFRESH MATERIALIZED VIEW dcs_mv").expect("refresh");
+
+    // Two-arg form: reconcile with drop_orphans => FALSE. Must still recurse into
+    // the generated child and end correct.
+    let status = Spi::get_one::<String>("SELECT reflex_reconcile('dcs_agg', false)")
+        .expect("q")
+        .expect("v");
+    assert_eq!(status, "RECONCILED");
+    let seen = Spi::get_one::<i64>("SELECT COUNT(*) FROM dcs_agg WHERE grp = 'gZ'")
+        .expect("q")
+        .expect("v");
+    assert_eq!(seen, 1, "two-arg reconcile must still refresh the generated child");
+}
+
+/// PS-1 REVIEW — reconcile of a DEFERRED IMV that already has a staged,
+/// un-flushed delta must end correct: the reconcile rebuilds from scratch, and
+/// draining the still-pending delta afterwards must not double-apply onto the
+/// freshly rebuilt target.
+#[pg_test]
+fn pg_reconcile_with_pending_deferred_delta_stays_correct() {
+    Spi::run("CREATE TABLE dcpd_src (id INT, grp TEXT, val NUMERIC)").expect("create src");
+    Spi::run("INSERT INTO dcpd_src SELECT g, 'g' || (g % 5), 10 FROM generate_series(1,100) g")
+        .expect("seed");
+
+    crate::create_reflex_ivm(
+        "dcpd_agg",
+        "WITH base AS (SELECT id, grp, val FROM dcpd_src) \
+         SELECT grp, COUNT(*) AS cnt, SUM(val) AS total FROM base GROUP BY grp",
+        Some("grp"),
+        Some("UNLOGGED"),
+        Some("DEFERRED"),
+        None,
+    );
+
+    // Stage a delta but do NOT flush it — it sits pending on the child's source.
+    Spi::run("INSERT INTO dcpd_src VALUES (777, 'gNEW', 99)").expect("stage delta");
+
+    // Reconcile now, on top of the pending delta.
+    let status = Spi::get_one::<String>("SELECT reflex_rebuild_imv('dcpd_agg')")
+        .expect("q")
+        .expect("v");
+    assert_eq!(status, "RECONCILED");
+
+    // Then drain whatever remains pending and oracle-check: no double count.
+    drain_deferred_pending();
+    assert_imv_correct(
+        "dcpd_agg",
+        "SELECT grp, COUNT(*) AS cnt, SUM(val) AS total FROM dcpd_src GROUP BY grp",
+    );
+}

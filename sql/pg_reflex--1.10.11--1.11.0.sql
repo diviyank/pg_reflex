@@ -62,6 +62,18 @@ STRICT
 LANGUAGE c /* Rust */
 AS 'MODULE_PATHNAME', 'reflex_repair_dependency_graph_wrapper';
 
+-- New two-argument overload of reflex_reconcile. The one-argument form (unchanged)
+-- keeps drop_orphans => TRUE, its 1.10.11 behaviour; this overload lets a caller
+-- decline orphan-partition deletion — reflex_doctor uses it so an F4 reconcile no
+-- longer drops a partition the operator refused to authorise at the F3 step.
+CREATE OR REPLACE FUNCTION "reflex_reconcile"(
+    "view_name" TEXT, /* &str */
+    "drop_orphans" bool /* bool */
+) RETURNS TEXT /* String */
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'reflex_reconcile_scoped_wrapper';
+
 -- The backfill is NOT run inline here. `CREATE OR REPLACE FUNCTION … MODULE_PATHNAME`
 -- followed by an immediate call needs `dlsym` of a brand-new symbol, which fails
 -- when the backend running ALTER EXTENSION already has the previous `.so` mapped.
