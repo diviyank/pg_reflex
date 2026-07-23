@@ -228,6 +228,11 @@ extension_sql!(
         ADD COLUMN IF NOT EXISTS last_error TEXT;
     ALTER TABLE public.__reflex_partition_pending
         ADD COLUMN IF NOT EXISTS failures INT NOT NULL DEFAULT 0;
+    -- 1.11.0: stamped by the drain, so a pending row's age reflects the last
+    -- flush attempt rather than the last enqueue (which every ATTACH resets).
+    -- NULL means no drain has ever fired for this row — the F1 re-arm hole.
+    ALTER TABLE public.__reflex_partition_pending
+        ADD COLUMN IF NOT EXISTS last_attempt_at TIMESTAMPTZ;
 
     -- 1.6.0: SQL helper used by the per-partition dispatch DO block emitted
     -- by build_partition_aware_dispatch_sql.  Given a partitioned parent +
