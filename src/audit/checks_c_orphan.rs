@@ -102,6 +102,27 @@ fn is_owned(expected: &HashSet<i64>, oid: i64, root_oid: i64) -> bool {
     expected.contains(&oid) || expected.contains(&root_oid)
 }
 
+/// The unowned relations worth reporting: for an orphaned *partitioned* tree,
+/// only its root.
+///
+/// An unowned leaf always has an unowned root (if the root were expected,
+/// `is_owned` would have covered the leaf), so reporting every leaf as well as the
+/// parent is pure duplication — dropping the root CASCADEs the leaves. A leaf is
+/// suppressed only when its root is itself in this scan and therefore reported in
+/// its place; a leaf attached to some relation the scan never saw is still
+/// reported on its own, so nothing can hide.
+fn unowned_relations(expected: &HashSet<i64>, scanned: Vec<ScannedRelation>) -> Vec<String> {
+    let scanned_oids: HashSet<i64> = scanned.iter().map(|(_, oid, _)| *oid).collect();
+    scanned
+        .into_iter()
+        .filter(|(_, oid, root_oid)| {
+            !is_owned(expected, *oid, *root_oid)
+                && (*oid == *root_oid || !scanned_oids.contains(root_oid))
+        })
+        .map(|(qualified, _, _)| qualified)
+        .collect()
+}
+
 /// The registry name re-qualified with `target_schema` when it is bare, so the
 /// aux-table names built from it resolve without depending on the audit session's
 /// search_path. Mirrors the `resolved_name` in `src/drop_ivm.rs`.
@@ -110,13 +131,24 @@ fn is_owned(expected: &HashSet<i64>, oid: i64, root_oid: i64) -> bool {
 /// `sanitized_source_suffix` folds the schema into the identifier body
 /// (`schema_table`), so re-qualifying a bare source would compute a table name
 /// that has never existed.
+///
+/// Rows created before 1.7.2 keep `target_schema` NULL
+/// (`sql/pg_reflex--1.7.1--1.7.2.sql`), and a bare name left unqualified resolves
+/// through the session `search_path` — under a narrow one it resolves to nothing,
+/// putting every aux table of a live legacy IMV back in the orphan report with a
+/// `DROP … CASCADE`. `COALESCE(target_schema, 'public')` is the codebase's
+/// existing convention for that gap (`src/lib.rs:963`,
+/// `sql/pg_reflex--1.10.5--1.10.6.sql:65`).
 fn resolved_imv_name(imv: &ImvRow) -> String {
-    match (
-        crate::query_decomposer::canonical_source(&imv.name).0,
-        imv.target_schema.as_deref(),
-    ) {
-        (None, Some(schema)) if !schema.is_empty() => format!("{}.{}", schema, imv.name),
-        _ => imv.name.clone(),
+    match crate::query_decomposer::canonical_source(&imv.name).0 {
+        Some(_) => imv.name.clone(),
+        None => {
+            let schema = match imv.target_schema.as_deref() {
+                Some(s) if !s.is_empty() => s,
+                _ => "public",
+            };
+            format!("{}.{}", schema, imv.name)
+        }
     }
 }
 
@@ -142,16 +174,14 @@ impl Check for OrphanIntermediate {
         let actual = scan_relations_with_prefixes(client, &["__reflex_intermediate_"]);
         let mut findings = Vec::new();
 
-        for (qualified, oid, root_oid) in actual {
-            if !is_owned(&expected, oid, root_oid) {
-                findings.push(Finding {
-                    imv: None,
-                    severity: Severity::Warning,
-                    category: "orphan-intermediate",
-                    finding: format!("{} has no owning enabled IMV.", qualified),
-                    suggested_fix: format!("DROP TABLE {} CASCADE;", qualified),
-                });
-            }
+        for qualified in unowned_relations(&expected, actual) {
+            findings.push(Finding {
+                imv: None,
+                severity: Severity::Warning,
+                category: "orphan-intermediate",
+                finding: format!("{} has no owning enabled IMV.", qualified),
+                suggested_fix: format!("DROP TABLE {} CASCADE;", qualified),
+            });
         }
         findings
     }
@@ -184,19 +214,17 @@ impl Check for OrphanStaging {
         let actual = scan_relations_with_prefixes(client, &["__reflex_delta_"]);
         let mut findings = Vec::new();
 
-        for (qualified, oid, root_oid) in actual {
-            if !is_owned(&expected, oid, root_oid) {
-                findings.push(Finding {
-                    imv: None,
-                    severity: Severity::Warning,
-                    category: "orphan-staging",
-                    finding: format!(
-                        "{} has no enabled DEFERRED IMV depending on its source.",
-                        qualified
-                    ),
-                    suggested_fix: format!("DROP TABLE {} CASCADE;", qualified),
-                });
-            }
+        for qualified in unowned_relations(&expected, actual) {
+            findings.push(Finding {
+                imv: None,
+                severity: Severity::Warning,
+                category: "orphan-staging",
+                finding: format!(
+                    "{} has no enabled DEFERRED IMV depending on its source.",
+                    qualified
+                ),
+                suggested_fix: format!("DROP TABLE {} CASCADE;", qualified),
+            });
         }
         findings
     }
@@ -247,16 +275,14 @@ impl Check for OrphanScratch {
         );
         let mut findings = Vec::new();
 
-        for (qualified, oid, root_oid) in actual {
-            if !is_owned(&expected, oid, root_oid) {
-                findings.push(Finding {
-                    imv: None,
-                    severity: Severity::Info,
-                    category: "orphan-scratch",
-                    finding: format!("{} has no owning enabled IMV.", qualified),
-                    suggested_fix: format!("DROP TABLE {} CASCADE;", qualified),
-                });
-            }
+        for qualified in unowned_relations(&expected, actual) {
+            findings.push(Finding {
+                imv: None,
+                severity: Severity::Info,
+                category: "orphan-scratch",
+                finding: format!("{} has no owning enabled IMV.", qualified),
+                suggested_fix: format!("DROP TABLE {} CASCADE;", qualified),
+            });
         }
         findings
     }

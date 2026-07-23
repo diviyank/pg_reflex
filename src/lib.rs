@@ -287,6 +287,12 @@ extension_sql!(
     $REFLEX$;
 
     -- Helper for reflex_doctor repairs: execute SQL in a subtransaction and return outcome.
+    -- CONTRACT: `_sql` MUST be a statement that returns a value (every caller
+    -- passes `SELECT reflex_*(...)`). `EXECUTE ... INTO` cannot run a statement that
+    -- returns no data, so a bare DDL/DML repair yields
+    -- 'failed:INTO used with a command that cannot return data'. That degrades
+    -- safely, but a future executable repair (e.g. F9's DROP ... CASCADE) must be
+    -- wrapped so it returns something, or this helper must be extended first.
     -- Returns 'fixed' only when the statement neither raised nor RETURNED an
     -- 'ERROR: …' string. reflex_reconcile, reflex_sync_partitions and
     -- drop_reflex_ivm all signal some failures by returning that text rather than

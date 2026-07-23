@@ -248,6 +248,12 @@ struct PendingQueueRow {
 /// "OK — nothing pending", and a per-root failure is swallowed into a WARNING by
 /// the drain's own EXCEPTION handler. Without this check the doctor reported
 /// `fixed` for a repair that did nothing.
+///
+/// Scope: this proves the QUEUE drained, not that downstream maintenance
+/// succeeded. The drain issues `PERFORM public.reflex_reconcile(imv)`, and
+/// `PERFORM` discards the `ERROR: …` string that reflex_reconcile returns for a
+/// soft failure. A drained row means the flush committed, not that every dependent
+/// IMV is now correct.
 fn verify_pending_drained(source_root: &str, outcome: String) -> String {
     if outcome != "fixed" {
         return outcome;
@@ -656,6 +662,14 @@ fn detect_audit_findings(target: Option<&str>, fix: bool) -> Vec<DoctorReportRow
             "archive_residue" => "F5/F6", // advisory "could not verify" variant
             "bare_name_ambiguity" => "F8",
             "orphan-intermediate" | "orphan-staging" | "orphan-scratch" => "F9",
+            // The IMV-vs-source partition-structure findings. These name an orphan
+            // mirror partition of a LIVE parent — the case the orphan-* checks
+            // deliberately no longer claim (it is not "unowned by any IMV", it is
+            // "owned but no longer backed by a source partition"). The audit
+            // already detects it with a correct suggested fix; without forwarding
+            // it here, nothing reaches reflex_doctor, because F3 only exists once a
+            // maintenance attempt has already failed.
+            "partition-mirror" | "partition-tree-drift" => "F3",
             "duplicate-function" => "F11",
             _ => continue,
         };

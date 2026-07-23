@@ -20,6 +20,8 @@ ALTER TABLE public.__reflex_partition_pending
     ADD COLUMN IF NOT EXISTS last_attempt_at TIMESTAMPTZ;
 
 -- __reflex_doctor_try_repair now captures its statement's return value.
+-- CONTRACT: _sql must be a statement that RETURNS a value (all callers pass
+-- `SELECT reflex_*(...)`); `EXECUTE ... INTO` rejects one that returns no data.
 -- reflex_reconcile / reflex_sync_partitions / drop_reflex_ivm signal some
 -- failures by RETURNING an 'ERROR: …' string rather than raising; the old helper
 -- discarded the result and reported those repairs as 'fixed'.
