@@ -7,9 +7,16 @@ use crate::query_decomposer::{intermediate_table_name, quote_identifier, split_q
 use crate::schema_builder::build_indexes_ddl;
 use crate::validate_view_name;
 
-/// Reconcile an IMV by rebuilding intermediate + target from scratch.
-/// Use this as a safety net (manually or via pg_cron) to fix drift.
-pub(crate) fn reflex_reconcile(view_name: &str) -> &'static str {
+/// Rebuild ONE IMV's intermediate + target from its own `base_query`.
+///
+/// The single-node primitive. [`reflex_reconcile`] is the entry point, and it
+/// first repairs the sub-IMVs pg_reflex generated for `view_name`.
+///
+/// `drop_orphans` is forwarded to the pre-rebuild partition sync. The operator
+/// entry point passes `true` (unchanged from 1.10.11); the recursive descent
+/// passes `false` so reconciling a chain does not multiply an orphan-dropping
+/// side effect the caller never asked for across every generated node in it.
+fn reconcile_one(view_name: &str, drop_orphans: bool) -> &'static str {
     if let Err(msg) = validate_view_name(view_name) {
         return msg;
     }
@@ -18,7 +25,7 @@ pub(crate) fn reflex_reconcile(view_name: &str) -> &'static str {
     // failures are surfaced as a NOTICE but do not abort reconcile — the
     // operator may have deliberately stale state, and the rebuild itself
     // is the recovery action.
-    let sync_msg = crate::partition::reflex_sync_partitions_impl(view_name, true);
+    let sync_msg = crate::partition::reflex_sync_partitions_impl(view_name, drop_orphans);
     if sync_msg.starts_with("ERROR") {
         pgrx::notice!("pg_reflex: sync before reconcile returned: {}", sync_msg);
     }
@@ -387,6 +394,139 @@ pub(crate) fn reflex_reconcile(view_name: &str) -> &'static str {
         info!("pg_reflex: reconciled IMV '{}'", view_name);
         "RECONCILED"
     })
+}
+
+/// Reconcile an IMV by rebuilding intermediate + target from scratch, first
+/// rebuilding the sub-IMVs pg_reflex generated for it.
+/// Use this as a safety net (manually or via pg_cron) to fix drift.
+///
+/// A decomposed IMV's `base_query` reads a node pg_reflex invented while
+/// splitting one `create_reflex_ivm` call — a CTE sub-IMV, a set-op operand, a
+/// DISTINCT-ON / window base. Rebuilding only the named IMV re-derives it from
+/// that node's possibly-stale contents and reports `RECONCILED`, which is how a
+/// chain whose generated child reads a MATERIALIZED VIEW (untriggerable, so the
+/// child is frozen at create time) served month-old rows through every recovery
+/// primitive an operator reaches for first. So: rebuild the generated
+/// descendants bottom-up, then the named IMV.
+///
+/// A *user-declared* IMV dependency keeps the old non-recursive behaviour.
+/// Reconciling someone else's IMV is not this call's business, and the operator
+/// can name it directly.
+pub(crate) fn reflex_reconcile(view_name: &str) -> &'static str {
+    if !inside_trigger() {
+        for child in generated_dependencies_shallowest_first(view_name) {
+            let result = reconcile_generated_child_without_propagating(&child);
+            if result.starts_with("ERROR") {
+                warning!(
+                    "pg_reflex: reconcile of generated sub-IMV '{}' of '{}' returned: {} \
+                     — continuing with '{}' itself",
+                    child,
+                    view_name,
+                    result,
+                    view_name
+                );
+            }
+        }
+    }
+    reconcile_one(view_name, true)
+}
+
+/// TRUE when we are executing inside a data-change trigger.
+///
+/// pg_reflex calls `reflex_reconcile` from its own generated trigger bodies —
+/// the high-selectivity "wipe" branch and the partition trip-cap branch in
+/// `trigger/dispatch.rs`, and the partition-flush plpgsql in `lib.rs` /
+/// `partition.rs`. Those callers must keep the single-node behaviour for two
+/// independent reasons: their sources are fresh by construction (a delta just
+/// arrived), and recursing would run `TRUNCATE` / `ALTER TABLE` against the very
+/// relation whose statement trigger is mid-execution, with its transition tables
+/// live. Since rebuilding a generated child is itself a 100%-of-rows change it
+/// trips the wipe branch, so without this gate the recursion would re-enter
+/// itself.
+fn inside_trigger() -> bool {
+    Spi::get_one::<i32>("SELECT pg_trigger_depth()")
+        .unwrap_or(None)
+        .unwrap_or(0)
+        > 0
+}
+
+/// The extension-generated IMVs `view_name` transitively reads from, shallowest
+/// first — the order they must be rebuilt in, since `depends_on_imv` points at
+/// *shallower* nodes.
+///
+/// The walk starts from all of `view_name`'s IMV dependencies but descends only
+/// through generated ones and returns only generated ones, so a user-declared
+/// dependency is neither rebuilt nor traversed. `UNION` dedupes, so a CTE
+/// sub-IMV shared by two siblings is rebuilt once.
+fn generated_dependencies_shallowest_first(view_name: &str) -> Vec<String> {
+    Spi::connect(|client| {
+        client
+            .select(
+                "WITH RECURSIVE gen AS ( \
+                       SELECT unnest(COALESCE(r.depends_on_imv, ARRAY[]::TEXT[])) AS nm \
+                         FROM public.__reflex_ivm_reference r WHERE r.name = $1 \
+                     UNION \
+                       SELECT unnest(COALESCE(c.depends_on_imv, ARRAY[]::TEXT[])) \
+                         FROM public.__reflex_ivm_reference c JOIN gen ON c.name = gen.nm \
+                        WHERE COALESCE(c.is_generated_sub_imv, FALSE) \
+                   ) \
+                 SELECT ref.name FROM gen \
+                   JOIN public.__reflex_ivm_reference ref ON ref.name = gen.nm \
+                  WHERE COALESCE(ref.is_generated_sub_imv, FALSE) \
+                    AND COALESCE(ref.enabled, TRUE) \
+                  ORDER BY ref.graph_depth, ref.name",
+                None,
+                &[unsafe {
+                    DatumWithOid::new(view_name.to_string(), PgBuiltInOids::TEXTOID.oid().value())
+                }],
+            )
+            .unwrap_or_report()
+            .filter_map(|row| {
+                row.get_by_name::<&str, _>("name")
+                    .unwrap_or(None)
+                    .map(|s| s.to_string())
+            })
+            .collect()
+    })
+}
+
+/// Rebuild a generated sub-IMV with its user triggers suppressed, so the rebuild
+/// does not propagate into its consumers.
+///
+/// `reconcile_one` does `TRUNCATE` + full `INSERT`. Left to propagate, the
+/// TRUNCATE empties the consumer immediately (the AFTER TRUNCATE trigger fires
+/// even for DEFERRED IMVs) while the INSERT only *stages* a delta in DEFERRED
+/// mode — so a consumer rebuilt in between ends up correct and then has the
+/// staged full-table delta applied again at COMMIT, doubling its aggregates.
+/// Suppression removes the delta rather than trying to net it out, and as a side
+/// effect skips a full-size incremental flush whose result the consumer's own
+/// rebuild discards anyway.
+///
+/// Nothing is lost: every consumer of a generated sub-IMV is either a deeper
+/// member of the same generated set or the named IMV itself, and
+/// [`reflex_reconcile`] rebuilds both explicitly.
+///
+/// `ALTER TABLE` is transactional, so a hard error inside `reconcile_one` rolls
+/// the DISABLE back with everything else; a soft `"ERROR: …"` return still
+/// reaches the ENABLE.
+fn reconcile_generated_child_without_propagating(child: &str) -> &'static str {
+    let triggerable = Spi::get_one::<bool>(&format!(
+        "SELECT COALESCE((SELECT relkind IN ('r','p') FROM pg_class \
+          WHERE oid = to_regclass('{}')), FALSE)",
+        child.replace('\'', "''")
+    ))
+    .unwrap_or(None)
+    .unwrap_or(false);
+
+    if !triggerable {
+        return reconcile_one(child, false);
+    }
+
+    let quoted = quote_identifier(child);
+    Spi::run(&format!("ALTER TABLE {} DISABLE TRIGGER USER", quoted)).unwrap_or_report();
+    let result = reconcile_one(child, false);
+    Spi::run(&format!("ALTER TABLE {} ENABLE TRIGGER USER", quoted)).unwrap_or_report();
+    result
 }
 
 /// One row in the result set of `reflex_scheduled_reconcile`.
