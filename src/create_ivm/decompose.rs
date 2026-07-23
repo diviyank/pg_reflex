@@ -59,6 +59,71 @@ pub(crate) fn rollback_partial_sub_imvs(sub_imv_names: &[String]) {
     }
 }
 
+/// Record that pg_reflex — not the user — created this node, as one step of
+/// decomposing a single `create_reflex_ivm` call.
+///
+/// Written post-hoc rather than threaded through
+/// `create_reflex_ivm_impl_with_materialization` as a twelfth argument: the
+/// decomposer is the only caller that knows a node is generated, so the flag
+/// belongs at the site that has that knowledge instead of smeared through a
+/// signature four other create paths share. Runs in the same transaction as the
+/// row's INSERT.
+///
+/// `reflex_reconcile` recurses into flagged nodes and only flagged nodes.
+pub(crate) fn mark_generated_sub_imv(sub_imv_name: &str) {
+    Spi::connect_mut(|client| {
+        client
+            .update(
+                "UPDATE public.__reflex_ivm_reference \
+                    SET is_generated_sub_imv = TRUE WHERE name = $1",
+                None,
+                &[unsafe {
+                    DatumWithOid::new(
+                        sub_imv_name.to_string(),
+                        PgBuiltInOids::TEXTOID.oid().value(),
+                    )
+                }],
+            )
+            .unwrap_or_report();
+    });
+}
+
+/// `graph_depth` for a node whose IMV dependencies are `sub_imv_names`: one above
+/// the deepest of them, or 1 when none of them is registered.
+///
+/// The decomposed paths used to hard-code this — `sub_imv_names.len() + 1` for
+/// set ops, so a three-operand UNION ALL claimed depth 4 because of its arity
+/// rather than its position, and a literal 2 for DISTINCT ON / window, wrong
+/// whenever the `__base` sub-IMV is itself decomposed. Both disagreed with what
+/// `resolve_existing_imv_deps` computes for the main create path and with what
+/// `reflex_repair_dependency_graph` recomputes, which would have left
+/// `graph_depth` meaning two different things depending on a row's age.
+pub(crate) fn depth_above(
+    client: &mut pgrx::spi::SpiClient<'_>,
+    sub_imv_names: &[String],
+) -> i32 {
+    if sub_imv_names.is_empty() {
+        return 1;
+    }
+    client
+        .select(
+            "SELECT COALESCE(MAX(graph_depth), 0) + 1 AS depth \
+             FROM public.__reflex_ivm_reference WHERE name = ANY($1::TEXT[])",
+            None,
+            &[unsafe {
+                DatumWithOid::new(
+                    crate::query_decomposer::format_pg_text_array_literal(sub_imv_names),
+                    PgBuiltInOids::TEXTOID.oid().value(),
+                )
+            }],
+        )
+        .unwrap_or_report()
+        .first()
+        .get_by_name::<i32, _>("depth")
+        .unwrap_or(None)
+        .unwrap_or(1)
+}
+
 /// Decomposition phase: UNION / INTERSECT / EXCEPT.
 ///
 /// Each operand is materialised as its own sub-IMV (recursively); the user-
@@ -106,6 +171,7 @@ pub(crate) fn try_decompose_set_op(ctx: &DecomposeCtx) -> Option<&'static str> {
             rollback_partial_sub_imvs(&sub_imv_names);
             return Some(result);
         }
+        mark_generated_sub_imv(&sub_name);
         sub_imv_names.push(sub_name);
     }
 
@@ -152,7 +218,7 @@ pub(crate) fn try_decompose_set_op(ctx: &DecomposeCtx) -> Option<&'static str> {
                     .unwrap_or_report();
                 let depends_on: Vec<String> = sub_imv_names.clone();
                 let depends_on_imv: Vec<String> = sub_imv_names.clone();
-                let depth = sub_imv_names.len() as i32 + 1;
+                let depth = depth_above(client, &depends_on_imv);
                 insert_registry_row(
                     client,
                     &RegistryRow::decomposed(
@@ -213,7 +279,7 @@ pub(crate) fn try_decompose_set_op(ctx: &DecomposeCtx) -> Option<&'static str> {
         Spi::connect_mut(|client| {
             let depends_on: Vec<String> = sub_imv_names.clone();
             let depends_on_imv: Vec<String> = sub_imv_names.clone();
-            let depth = sub_imv_names.len() as i32 + 1;
+            let depth = depth_above(client, &depends_on_imv);
             insert_registry_row(
                 client,
                 &RegistryRow::decomposed(
@@ -530,7 +596,7 @@ pub(crate) fn install_union_all_intermediate_wrapper(
         .join(" UNION ALL ");
     let depends_on: Vec<String> = operand_sub_imv_names.to_vec();
     let depends_on_imv: Vec<String> = operand_sub_imv_names.to_vec();
-    let depth = operand_sub_imv_names.len() as i32 + 1;
+    let depth = depth_above(client, &depends_on_imv);
     insert_registry_row(
         client,
         &RegistryRow::decomposed(
@@ -604,6 +670,7 @@ pub(crate) fn try_decompose_distinct_on(ctx: &DecomposeCtx) -> Option<&'static s
     if result.starts_with("ERROR") {
         return Some(result);
     }
+    mark_generated_sub_imv(&base_name);
 
     // Build the VIEW: SELECT <cols> FROM (SELECT *, ROW_NUMBER() OVER (...) AS __reflex_rn FROM base) WHERE __reflex_rn = 1
     // Strip table qualifiers — the VIEW reads from the base sub-IMV which has bare column names
@@ -668,11 +735,12 @@ pub(crate) fn try_decompose_distinct_on(ctx: &DecomposeCtx) -> Option<&'static s
         // Register in reference table for cleanup
         let depends_on = vec![base_name.clone()];
         let depends_on_imv = vec![base_name.clone()];
+        let depth = depth_above(client, &depends_on_imv);
         insert_registry_row(
             client,
             &RegistryRow::decomposed(
                 ctx.view_name,
-                2,
+                depth,
                 &depends_on,
                 &depends_on_imv,
                 ctx.sql,
@@ -745,6 +813,7 @@ maintained — move it to the outermost SELECT, or define this view with kind: m
     if result.starts_with("ERROR") {
         return Some(result);
     }
+    mark_generated_sub_imv(&base_name);
 
     // Create a VIEW that applies window functions to the base sub-IMV
     let view_sql = format!(
@@ -768,11 +837,12 @@ maintained — move it to the outermost SELECT, or define this view with kind: m
         // Register in reference table for cleanup
         let depends_on = vec![base_name.clone()];
         let depends_on_imv = vec![base_name.clone()];
+        let depth = depth_above(client, &depends_on_imv);
         insert_registry_row(
             client,
             &RegistryRow::decomposed(
                 view_name,
-                2,
+                depth,
                 &depends_on,
                 &depends_on_imv,
                 sql,
@@ -969,6 +1039,7 @@ with kind: mv.",
             rollback_partial_sub_imvs(&created_sub_imv_names(&cte_name_map));
             return Some(result);
         }
+        mark_generated_sub_imv(&cte_view_name);
         cte_name_map.push((cte.alias.clone(), cte_view_name));
     }
 

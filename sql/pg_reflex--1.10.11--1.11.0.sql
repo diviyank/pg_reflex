@@ -3,11 +3,48 @@
 -- Run via: ALTER EXTENSION pg_reflex UPDATE TO '1.11.0';
 --
 -- Replace the module (.so) BEFORE running this.
+
+SELECT 1 WHERE FALSE;
+
+-- === PS-4: reflex_doctor truthfulness ======================================
 --
--- Sections below are per-fix and independent. Keep them separate.
+-- __reflex_partition_pending.last_attempt_at — stamped by the drain so a
+-- finding can be dated. `enqueued_at` is reset by every re-enqueue and
+-- `attempts` counts enqueues (not drain attempts), so before this column
+-- nothing in the queue could date a drain failure: reflex_doctor classified
+-- F1/F2 on `attempts` and reported an arbitrarily old `last_error` next to a
+-- freshly reset age. It now classifies on `failures` and dates on
+-- `last_attempt_at`.
+
+ALTER TABLE public.__reflex_partition_pending
+    ADD COLUMN IF NOT EXISTS last_attempt_at TIMESTAMPTZ;
+
+-- __reflex_doctor_try_repair now captures its statement's return value.
+-- reflex_reconcile / reflex_sync_partitions / drop_reflex_ivm signal some
+-- failures by RETURNING an 'ERROR: …' string rather than raising; the old helper
+-- discarded the result and reported those repairs as 'fixed'.
+CREATE OR REPLACE FUNCTION public.__reflex_doctor_try_repair(_sql TEXT)
+RETURNS TEXT LANGUAGE plpgsql AS $fn$
+DECLARE
+    _res TEXT;
+BEGIN
+    EXECUTE _sql INTO _res;
+    IF _res IS NOT NULL AND upper(_res) LIKE 'ERROR%' THEN
+        RETURN 'failed:' || left(_res, 400);
+    END IF;
+    RETURN 'fixed';
+EXCEPTION WHEN OTHERS THEN
+    RETURN 'failed:' || left(SQLERRM, 400);
+END;
+$fn$;
+
+DO $ps4$ BEGIN
+    RAISE NOTICE 'pg_reflex 1.11.0 (PS-4): reflex_doctor classifies the pending queue on drain failures and dates findings from last_attempt_at. Existing pending rows have last_attempt_at NULL until their next drain attempt.';
+END $ps4$;
+-- === end PS-4 ==============================================================
 
 
--- === PS-1: decomposed-chain correctness (N1 + B1) =========================
+-- === PS-1: decomposed-chain correctness (N1 + B1) ==========================
 --
 -- A CTE-decomposed IMV's registry row never recorded the edge to the sub-IMV
 -- pg_reflex generated for it. `resolve_existing_imv_deps` matched `depends_on`
@@ -34,15 +71,18 @@
 -- before rebuilding the IMV itself. A user-declared IMV dependency keeps the
 -- old non-recursive behaviour.
 --
--- Two operator-visible behaviour changes:
+-- Three operator-visible behaviour changes:
 --
---   * reflex_rebuild_chain(<generated sub-IMV>) now REFUSES without
---     cascade => TRUE, because the parent is finally a registered dependent.
---     That replaces silently ending the parent's maintenance.
+--   * reflex_rebuild_chain(<generated sub-IMV>) and a NON-cascade
+--     drop_reflex_ivm(<generated sub-IMV>) now REFUSE, because the parent is
+--     finally a registered dependent. That replaces silently ending the
+--     parent's maintenance.
 --   * graph_depth changes value for every decomposed IMV — up for CTE parents
 --     (collapsed -> real), down for set-op wrappers (which used operand count
 --     plus one). Every consumer orders by it ascending and every one of them
 --     wants the corrected order.
+--   * reflex_reconcile of a decomposed IMV does strictly more work: one extra
+--     full rebuild per generated sub-IMV in the chain.
 
 ALTER TABLE public.__reflex_ivm_reference
     ADD COLUMN IF NOT EXISTS is_generated_sub_imv BOOLEAN NOT NULL DEFAULT FALSE;
@@ -62,8 +102,7 @@ AS 'MODULE_PATHNAME', 'reflex_repair_dependency_graph_wrapper';
 -- ever added, never removed. Removal is the only operation that could make the
 -- graph worse than it already is, and every spurious extra edge fails in the
 -- safe direction (reflex_rebuild_chain refuses rather than destroying a
--- dependent; drop_reflex_ivm cascades wider on an object the user asked to
--- drop).
+-- dependent; drop_reflex_ivm refuses rather than orphaning a parent).
 --
 -- `is_generated_sub_imv` is backfilled from the `__cte_` / `__union_<n>` /
 -- `__base` name suffix AND the requirement that some other registry row depends
@@ -80,6 +119,7 @@ AS 'MODULE_PATHNAME', 'reflex_repair_dependency_graph_wrapper';
 -- Re-runnable and idempotent: SELECT public.reflex_repair_dependency_graph();
 SELECT public.reflex_repair_dependency_graph();
 
-DO $migrate$ BEGIN
-    RAISE NOTICE 'pg_reflex 1.11.0 (PS-1): decomposed-chain dependency graph repaired. reflex_rebuild_imv on a decomposed IMV now reconciles its generated sub-IMVs first; reflex_rebuild_chain on a generated sub-IMV now refuses without cascade => TRUE. Re-run reflex_doctor().';
-END $migrate$;
+DO $ps1$ BEGIN
+    RAISE NOTICE 'pg_reflex 1.11.0 (PS-1): decomposed-chain dependency graph repaired. reflex_rebuild_imv on a decomposed IMV now reconciles its generated sub-IMVs first; reflex_rebuild_chain and non-cascade drop_reflex_ivm on a generated sub-IMV now refuse. Re-run reflex_doctor().';
+END $ps1$;
+-- === end PS-1 ==============================================================
