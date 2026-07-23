@@ -551,11 +551,41 @@ pub fn reflex_scheduled_reconcile(
     max_age_minutes: default!(i32, 60),
 ) -> TableIterator<'static, (name!(name, String), name!(status, String), name!(ms, i64))> {
     let candidates: Vec<String> = Spi::connect(|client| {
-        let sql = "SELECT name FROM public.__reflex_ivm_reference \
-                   WHERE COALESCE(enabled, TRUE) = TRUE \
-                     AND (last_update_date IS NULL \
-                          OR last_update_date < (CURRENT_TIMESTAMP - make_interval(mins => $1))) \
-                   ORDER BY graph_depth, name";
+        // Skip a generated sub-IMV when a candidate that transitively reads it is
+        // also in this batch: `reflex_reconcile` on that candidate already
+        // rebuilds it, and the scan visits children first, so without this filter
+        // a depth-d decomposed chain costs 1+2+…+d rebuilds instead of d.
+        // Measured at 15 rebuilds for a 4-generated-child chain — 3x, and
+        // quadratic in depth.
+        //
+        // The filter is deliberately "covered by a candidate", not "is
+        // generated": a generated node whose consumer is NOT stale enough to be a
+        // candidate stays in the batch, so it is still reconciled rather than
+        // silently skipped.
+        let sql = "WITH candidate AS ( \
+                       SELECT name, graph_depth, depends_on_imv \
+                         FROM public.__reflex_ivm_reference \
+                        WHERE COALESCE(enabled, TRUE) = TRUE \
+                          AND (last_update_date IS NULL \
+                               OR last_update_date < (CURRENT_TIMESTAMP - make_interval(mins => $1))) \
+                   ), \
+                   covered AS ( \
+                       WITH RECURSIVE reachable AS ( \
+                             SELECT unnest(COALESCE(c.depends_on_imv, ARRAY[]::TEXT[])) AS nm \
+                               FROM candidate c \
+                           UNION \
+                             SELECT unnest(COALESCE(r.depends_on_imv, ARRAY[]::TEXT[])) \
+                               FROM public.__reflex_ivm_reference r JOIN reachable ON r.name = reachable.nm \
+                              WHERE COALESCE(r.is_generated_sub_imv, FALSE) \
+                       ) \
+                       SELECT reachable.nm AS name \
+                         FROM reachable \
+                         JOIN public.__reflex_ivm_reference ref ON ref.name = reachable.nm \
+                        WHERE COALESCE(ref.is_generated_sub_imv, FALSE) \
+                   ) \
+                   SELECT name FROM candidate \
+                    WHERE name NOT IN (SELECT name FROM covered) \
+                    ORDER BY graph_depth, name";
         client
             .select(
                 sql,

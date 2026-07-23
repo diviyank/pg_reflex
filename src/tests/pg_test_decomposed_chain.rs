@@ -492,3 +492,79 @@ fn pg_decomposed_set_op_depth_reflects_operand_depth() {
         "a UNION ALL wrapper sits one level above its depth-1 operands"
     );
 }
+
+/// PS-1 (D6, revised after measurement) — `reflex_scheduled_reconcile` walks every
+/// registry row in `graph_depth` order, so on a decomposed chain each parent used
+/// to re-rebuild the generated children the scan had already visited: 1+2+…+d
+/// rebuilds for a depth-d chain instead of d. Measured at 15 rebuilds for a
+/// 4-generated-child chain (3x, and quadratic in depth), not the 2x D6 assumed.
+///
+/// A generated node whose consumer is also a candidate must therefore be dropped
+/// from the candidate list — the consumer's own recursion covers it. Observable
+/// as the number of rows the function returns (one per *attempted* IMV), while
+/// every node still ends up rebuilt and correct.
+#[pg_test]
+fn pg_scheduled_reconcile_does_not_revisit_covered_generated_children() {
+    Spi::run("CREATE TABLE dcb_src (id INT, grp TEXT, val NUMERIC)").expect("create src");
+    Spi::run("INSERT INTO dcb_src SELECT g, 'g' || (g % 5), 1 FROM generate_series(1,100) g")
+        .expect("seed");
+
+    crate::create_reflex_ivm(
+        "dcb_top",
+        "WITH a AS (SELECT id, grp, val FROM dcb_src), \
+              b AS (SELECT id, grp, val FROM a), \
+              c AS (SELECT id, grp, val FROM b) \
+         SELECT grp, COUNT(*) AS cnt, SUM(val) AS total FROM c GROUP BY grp",
+        Some("grp"),
+        None,
+        None,
+        None,
+    );
+
+    let generated = Spi::get_one::<i64>(
+        "SELECT COUNT(*) FROM public.__reflex_ivm_reference \
+         WHERE is_generated_sub_imv AND name LIKE 'dcb_top%'",
+    )
+    .expect("q")
+    .expect("v");
+    assert_eq!(generated, 3, "fixture must produce 3 generated children");
+
+    // Inside one transaction CURRENT_TIMESTAMP is the transaction start, so a row
+    // touched in this transaction never looks stale. Backdate to make all 4 rows
+    // candidates.
+    Spi::run(
+        "UPDATE public.__reflex_ivm_reference \
+            SET last_update_date = TIMESTAMP '2001-01-01 00:00:00' \
+          WHERE name LIKE 'dcb_top%'",
+    )
+    .expect("backdate");
+
+    let attempted = Spi::get_one::<i64>(
+        "SELECT COUNT(*) FROM reflex_scheduled_reconcile(1) WHERE name LIKE 'dcb_top%'",
+    )
+    .expect("q")
+    .expect("v");
+    assert_eq!(
+        attempted, 1,
+        "only the top IMV should be attempted; its recursion covers the 3 generated children"
+    );
+
+    // Every node must nevertheless have been rebuilt — the recursion did the work
+    // the scan no longer duplicates.
+    let still_backdated = Spi::get_one::<i64>(
+        "SELECT COUNT(*) FROM public.__reflex_ivm_reference \
+          WHERE name LIKE 'dcb_top%' \
+            AND last_update_date = TIMESTAMP '2001-01-01 00:00:00'",
+    )
+    .expect("q")
+    .expect("v");
+    assert_eq!(
+        still_backdated, 0,
+        "every node in the chain must have been reconciled, not just the top"
+    );
+
+    assert_imv_correct(
+        "dcb_top",
+        "SELECT grp, COUNT(*) AS cnt, SUM(val) AS total FROM dcb_src GROUP BY grp",
+    );
+}
