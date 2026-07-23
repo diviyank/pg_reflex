@@ -591,6 +591,13 @@ pub(crate) fn reflex_rebuild_chain_impl(view_name: &str, cascade: bool) -> Strin
         let explicit_unpartitioned =
             extract_bool_field_via_sql(client, &create_args_json, "explicit_unpartitioned")
                 .unwrap_or(false);
+        // The 1.11.0 migration backfills legacy create_args from dedicated columns
+        // but cannot reconstruct topk_k or explicit_unpartitioned (no column holds
+        // them), so a rebuild from such a row defaults both — silently dropping a
+        // top-K bound or auto-partitioning a deliberately-unpartitioned IMV. The
+        // marker makes that loss load-bearing: it is surfaced at rebuild time.
+        let named_backfilled =
+            extract_bool_field_via_sql(client, &create_args_json, "backfilled").unwrap_or(false);
 
         // 2b. Capture each dependent's spec before the drop — after the drop
         // the registry rows are gone, so nothing may be read lazily.
@@ -635,6 +642,12 @@ pub(crate) fn reflex_rebuild_chain_impl(view_name: &str, cascade: bool) -> Strin
                         client,
                         &dep_create_args_json,
                         "explicit_unpartitioned",
+                    )
+                    .unwrap_or(false),
+                    backfilled: extract_bool_field_via_sql(
+                        client,
+                        &dep_create_args_json,
+                        "backfilled",
                     )
                     .unwrap_or(false),
                 })
@@ -695,10 +708,41 @@ pub(crate) fn reflex_rebuild_chain_impl(view_name: &str, cascade: bool) -> Strin
             }
         }
 
-        Ok(format!(
+        // Surface the honest-partial backfill loss on the recovery path. Emitted
+        // only after every recreate succeeded, so it never fires on a rolled-back
+        // rebuild. A live WARNING reaches the operator's session at rebuild time
+        // (months after the one-time migration NOTICE), and the same caveat is
+        // appended to the returned status so programmatic callers can see it too.
+        let mut backfilled_names: Vec<&str> = Vec::new();
+        if named_backfilled {
+            backfilled_names.push(view_name);
+        }
+        backfilled_names.extend(
+            captured_dependents
+                .iter()
+                .filter(|d| d.backfilled)
+                .map(|d| d.name.as_str()),
+        );
+
+        let base = format!(
             "REBUILT CHAIN ({} dependent(s) restored)",
             captured_dependents.len()
-        ))
+        );
+        if backfilled_names.is_empty() {
+            return Ok(base);
+        }
+
+        let caveat = format!(
+            "rebuilt from a backfilled create_args ({}) — topk_k and \
+             explicit_unpartitioned are not reconstructible by the 1.11.0 migration \
+             and were reset to create-time defaults (no top-K bound; auto-partitioning). \
+             If any of these IMVs was created with a top-K bound or explicitly \
+             unpartitioned, re-create it from its original create_reflex_ivm call to \
+             restore those settings.",
+            backfilled_names.join(", ")
+        );
+        pgrx::warning!("pg_reflex: {}", caveat);
+        Ok(format!("{} [WARNING: {}]", base, caveat))
     });
 
     match result {
@@ -721,6 +765,7 @@ struct CapturedDependent {
     ignore_sources: Vec<String>,
     partition_by: Vec<String>,
     explicit_unpartitioned: bool,
+    backfilled: bool,
 }
 
 /// A stored `create_args` cannot faithfully recreate an IMV when it is absent —

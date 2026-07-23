@@ -274,3 +274,61 @@ fn pg_rebuild_chain_backfill_reconstructs_deferred_from_columns() {
     .expect("v");
     assert_eq!(mode_after, "DEFERRED", "rebuild must preserve DEFERRED from the backfilled spec");
 }
+
+/// Finding 1 (BLOCKER): the migration backfill cannot reconstruct `topk_k` or
+/// `explicit_unpartitioned` from any registry column, so a rebuild from a
+/// backfilled row silently resets them to their create-time defaults (no top-K
+/// bound; auto-partitioning) — a result-content / layout change on the recovery
+/// path. The `"backfilled": true` marker must therefore be load-bearing:
+/// reflex_rebuild_chain must surface a WARNING when it rebuilds from such a row,
+/// and must NOT warn when create_args was genuinely populated at create time.
+#[pg_test]
+fn pg_rebuild_chain_backfilled_row_warns_lossy_fields() {
+    // A genuinely-populated create_args (normal create) must NOT warn.
+    Spi::run("CREATE TABLE rbw_clean_src (k TEXT, v INT)").expect("src");
+    Spi::run("INSERT INTO rbw_clean_src VALUES ('a', 1)").expect("seed");
+    Spi::run("SELECT create_reflex_ivm('rbw_clean', 'SELECT k, sum(v) AS s FROM rbw_clean_src GROUP BY k', 'k')")
+        .expect("clean");
+    let clean_out = crate::reflex_rebuild_chain("rbw_clean", false);
+    assert!(!clean_out.starts_with("ERROR"), "clean rebuild returned: {clean_out}");
+    assert!(
+        !clean_out.contains("WARNING"),
+        "a genuinely-populated create_args must not warn, got: {clean_out}"
+    );
+
+    // A backfilled row MUST warn that topk_k / explicit_unpartitioned were defaulted.
+    Spi::run("CREATE TABLE rbw_bf_src (k TEXT, v INT)").expect("src");
+    Spi::run("INSERT INTO rbw_bf_src VALUES ('a', 1), ('b', 2)").expect("seed");
+    Spi::run("SELECT create_reflex_ivm('rbw_bf', 'SELECT k, sum(v) AS s FROM rbw_bf_src GROUP BY k', 'k')")
+        .expect("bf");
+    Spi::run("UPDATE public.__reflex_ivm_reference SET create_args = NULL WHERE name = 'rbw_bf'")
+        .expect("null create_args");
+    Spi::run(
+        "UPDATE public.__reflex_ivm_reference SET create_args = json_build_object( \
+             'unique_columns_str', array_to_string( \
+                 CASE WHEN unique_columns IS NOT NULL AND cardinality(unique_columns) > 0 \
+                      THEN unique_columns ELSE index_columns END, ','), \
+             'storage_mode', COALESCE(storage_mode, 'UNLOGGED'), \
+             'refresh_mode', COALESCE(refresh_mode, 'IMMEDIATE'), \
+             'ignore_sources', to_json(COALESCE(ignored_sources, ARRAY[]::TEXT[])), \
+             'partition_by', to_json(COALESCE(partition_columns, ARRAY[]::TEXT[])), \
+             'backfilled', TRUE)::text \
+           WHERE create_args IS NULL \
+             AND COALESCE(is_generated_sub_imv, FALSE) = FALSE \
+             AND COALESCE(aggregations::text, '{}') <> '{}'",
+    )
+    .expect("backfill");
+
+    let bf_out = crate::reflex_rebuild_chain("rbw_bf", false);
+    assert!(!bf_out.starts_with("ERROR"), "backfilled rebuild returned: {bf_out}");
+    assert!(
+        bf_out.contains("WARNING"),
+        "rebuild from a backfilled row must warn, got: {bf_out}"
+    );
+    assert!(
+        bf_out.contains("topk_k") && bf_out.contains("explicit_unpartitioned"),
+        "the warning must name the two unreconstructible fields, got: {bf_out}"
+    );
+}
+
+// FINDING4_PLACEHOLDER
