@@ -336,3 +336,51 @@ BEGIN
     END IF;
 END $ps6$;
 -- === end PS-6 ==============================================================
+
+
+-- === PS-7: resumable reflex_scheduled_reconcile ============================
+--
+-- B6: the old reflex_scheduled_reconcile(int) looped over the WHOLE registry in
+-- the caller's single transaction. At 190 IMVs / 415 schemas it could not finish
+-- under a sane statement_timeout, and a timeout discarded every rebuild already
+-- done. pgrx cannot commit per-IMV in-process (a set-returning function runs in
+-- an atomic context; pgrx 0.18 exposes no SPI transaction control), so the
+-- function is now a RESUMABLE batched driver: bound the work per call with
+-- batch_size, let the scheduler call again, and resumability falls out of the
+-- age gate (a reconciled IMV's last_update_date is advanced past the threshold,
+-- so it drops out of the candidate set). Two new optional arguments:
+--
+--   * batch_size    (default 0 = unlimited) — max IMVs attempted per call.
+--   * target_schema (default '' = all)      — scope to one tenant's target_schema.
+--
+-- Defaults reproduce the pre-1.11.0 "one call sweeps everything" behaviour, so
+-- SELECT * FROM reflex_scheduled_reconcile(60) is unchanged for small registries.
+-- A new fourth output column, `remaining`, reports how many candidates a call
+-- deferred because batch_size capped it — 0 means the sweep is complete. Monitor
+-- for `remaining = 0`, not merely a successful call.
+--
+-- The argument list AND the return type both change, so CREATE OR REPLACE cannot
+-- apply (return-type change is forbidden, and the added defaulted args would make
+-- reflex_scheduled_reconcile(60) ambiguous against the surviving 1-arg form). Drop
+-- the old 1-arg function first, then declare the new one. A fresh install gets the
+-- new signature straight from the generated schema; this delta only fixes the
+-- upgrade path.
+DROP FUNCTION IF EXISTS "reflex_scheduled_reconcile"(integer);
+CREATE OR REPLACE FUNCTION "reflex_scheduled_reconcile"(
+    "max_age_minutes" integer DEFAULT 60, /* i32 */
+    "batch_size" integer DEFAULT 0, /* i32 */
+    "target_schema" TEXT DEFAULT '' /* &str */
+) RETURNS TABLE (
+    "name" TEXT, /* alloc::string::String */
+    "status" TEXT, /* alloc::string::String */
+    "ms" bigint, /* i64 */
+    "remaining" bigint /* i64 */
+)
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'reflex_scheduled_reconcile_wrapper';
+
+DO $ps7$ BEGIN
+    RAISE NOTICE 'pg_reflex 1.11.0 (PS-7): reflex_scheduled_reconcile is now a resumable batched driver. New optional args batch_size (default 0 = unlimited) and target_schema (default '''' = all); new output column remaining (0 = sweep complete). Default-arg usage is unchanged. For large registries, bound each pg_cron tick with a batch_size and call until remaining = 0. last_update_date is now stamped with clock_timestamp() per IMV, not one shared NOW() per batch.';
+END $ps7$;
+-- === end PS-7 ==============================================================

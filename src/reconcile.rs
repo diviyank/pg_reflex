@@ -113,7 +113,7 @@ fn reconcile_one(view_name: &str, drop_orphans: bool) -> &'static str {
                 );
 
                 let _ = client.update(
-                    "UPDATE public.__reflex_ivm_reference SET last_update_date = NOW() WHERE name = $1",
+                    "UPDATE public.__reflex_ivm_reference SET last_update_date = clock_timestamp() WHERE name = $1",
                     None,
                     &[unsafe {
                         DatumWithOid::new(view_name.to_string(), PgBuiltInOids::TEXTOID.oid().value())
@@ -369,10 +369,14 @@ fn reconcile_one(view_name: &str, drop_orphans: bool) -> &'static str {
                 .unwrap_or_report();
         }
 
-        // Update last_update_date
+        // Update last_update_date. clock_timestamp() (wall-clock at statement
+        // time), NOT NOW() (transaction start): a reflex_scheduled_reconcile
+        // batch runs many reconciles in one transaction, and NOW() stamped every
+        // one of them identically, so the column could not date an individual
+        // rebuild. clock_timestamp() stamps each rebuild's own end.
         client
             .update(
-                "UPDATE public.__reflex_ivm_reference SET last_update_date = NOW() WHERE name = $1",
+                "UPDATE public.__reflex_ivm_reference SET last_update_date = clock_timestamp() WHERE name = $1",
                 None,
                 &[unsafe {
                     DatumWithOid::new(view_name.to_string(), PgBuiltInOids::TEXTOID.oid().value())
@@ -701,26 +705,76 @@ fn reconcile_generated_child_without_propagating(child: &str) -> &'static str {
 }
 
 /// One row in the result set of `reflex_scheduled_reconcile`.
-type ScheduledReconcileRow = (String, String, i64);
+type ScheduledReconcileRow = (String, String, i64, i64);
 
-/// Reconcile every IMV whose `last_update_date` is older than `max_age_minutes`,
-/// or which has not been updated yet. Designed to be invoked on a cadence by
-/// pg_cron or another scheduler. Each per-IMV reconcile runs in isolation so
-/// one failure does not block the rest.
+/// Reconcile stale IMVs on a cadence, as a RESUMABLE batched driver.
 ///
-/// Returns one row per attempted IMV: `(name, status, ms)` where `status` is
-/// either `'RECONCILED'` or an error string, and `ms` is the wall time of the
-/// reconcile call.
+/// Reconciles up to `batch_size` IMVs whose `last_update_date` is older than
+/// `max_age_minutes` (or never set), optionally scoped to one `target_schema`.
+/// Each per-IMV reconcile runs in isolation so one soft failure does not block
+/// the rest.
+///
+/// Why a driver, not one call that does everything (B6): a single loop over a
+/// 190-IMV / 415-schema registry cannot finish under a sane `statement_timeout`,
+/// and a timeout discards every rebuild already done — pgrx cannot commit
+/// per-IMV in-process (a set-returning function runs in an atomic context, and
+/// pgrx 0.18 exposes no SPI transaction control), so the durable unit has to be
+/// the CALL. Bound the work with `batch_size` so each call finishes and commits,
+/// and let the scheduler call again. Resumability needs no cursor: a reconciled
+/// IMV's `last_update_date` is advanced (to `clock_timestamp()`) past the age
+/// gate, so it drops out of the candidate set and the next call continues with
+/// the next stale IMV.
+///
+/// Arguments (all optional; defaults reproduce the pre-1.11.0 "one call does
+/// everything" behaviour on a small registry):
+/// * `max_age_minutes` (default 60) — freshness threshold.
+/// * `batch_size` (default 0 = unlimited) — max IMVs attempted per call.
+/// * `target_schema` (default `''` = all schemas) — restrict to one tenant's
+///   `target_schema`; legacy rows with NULL `target_schema` count as `public`.
+///
+/// Returns one row per ATTEMPTED IMV: `(name, status, ms, remaining)` where
+/// `status` is `'RECONCILED'` or an error string (PS-1 surfaces a decomposed
+/// chain's child failure here — it is reported, never swallowed), `ms` is the
+/// reconcile wall time, and `remaining` is the number of candidates this call
+/// DEFERRED because `batch_size` capped it.
+///
+/// `remaining = 0` is NOT a health signal — it only means this call attempted
+/// every remaining candidate, not that they all succeeded. A failed / poison
+/// IMV keeps its stale `last_update_date`, stays a candidate, and is attempted
+/// again next call while `remaining` may already read 0. Monitoring must check
+/// per-row `status` for failures, not just `remaining`.
+///
+/// The age gate is the resume cursor, so `remaining` reaching 0 is meaningful
+/// only under a POSITIVE `max_age_minutes`: a reconciled IMV's `clock_timestamp()`
+/// write then falls inside the fresh window and it drops out. With
+/// `max_age_minutes <= 0` every enabled IMV is perpetually eligible, so a bounded
+/// (`batch_size > 0`) sweep never reports `remaining = 0` — it instead rotates
+/// oldest-first through the registry each call (continuous maintenance). Do not
+/// loop-until-zero on a non-positive gate; drive it from a scheduler tick.
 ///
 /// ```sql
-/// -- Run every 15 minutes via pg_cron
+/// -- Small registry: unchanged from 1.10.11 — one call sweeps everything.
 /// SELECT cron.schedule('reflex-drift-scan', '*/15 * * * *',
 ///     'SELECT * FROM reflex_scheduled_reconcile(60)');
+///
+/// -- Large registry: bound each tick (positive gate); repeat until remaining = 0.
+/// SELECT cron.schedule('reflex-drift-scan', '*/5 * * * *',
+///     'SELECT * FROM reflex_scheduled_reconcile(60, 25)');
 /// ```
 #[pg_extern]
 pub fn reflex_scheduled_reconcile(
     max_age_minutes: default!(i32, 60),
-) -> TableIterator<'static, (name!(name, String), name!(status, String), name!(ms, i64))> {
+    batch_size: default!(i32, 0),
+    target_schema: default!(&str, "''"),
+) -> TableIterator<
+    'static,
+    (
+        name!(name, String),
+        name!(status, String),
+        name!(ms, i64),
+        name!(remaining, i64),
+    ),
+> {
     let candidates: Vec<String> = Spi::connect(|client| {
         // Skip a generated sub-IMV when a candidate that transitively reads it is
         // also in this batch: `reflex_reconcile` on that candidate already
@@ -732,11 +786,31 @@ pub fn reflex_scheduled_reconcile(
         // The filter is deliberately "covered by a candidate", not "is
         // generated": a generated node whose consumer is NOT stale enough to be a
         // candidate stays in the batch, so it is still reconciled rather than
-        // silently skipped.
+        // silently skipped. A covered child whose parent then FAILS is not
+        // orphaned: the failed parent keeps a stale `last_update_date`, so it
+        // stays a candidate and covers (and retries) the child on the next call —
+        // and the candidate set is re-derived live every call, so the resumable
+        // cursor inherits no hole.
+        //
+        // `$2` scopes to one tenant's `target_schema` (empty string = all). The
+        // covered CTE derives from the already-scoped candidate set, so a covered
+        // child is scoped with its parent.
+        //
+        // ORDER BY keeps `graph_depth` primary (children before parents), then
+        // rotates oldest-first within a depth via `last_update_date`. A depth
+        // level holds only mutually independent IMVs — `graph_depth` exceeds
+        // every dependency's depth, so same-depth nodes never depend on each
+        // other — hence reordering within a level cannot perturb dependency
+        // order. The staleness tiebreaker is what lets a bounded (`batch_size`)
+        // call advance through the whole registry instead of re-doing the same
+        // leading rows and starving the tail when the age gate stays open on
+        // just-reconciled IMVs (max_age <= 0). `name` is the final, deterministic
+        // tiebreaker.
         let sql = "WITH candidate AS ( \
-                       SELECT name, graph_depth, depends_on_imv \
+                       SELECT name, graph_depth, depends_on_imv, last_update_date \
                          FROM public.__reflex_ivm_reference \
                         WHERE COALESCE(enabled, TRUE) = TRUE \
+                          AND ($2 = '' OR COALESCE(target_schema, 'public') = $2) \
                           AND (last_update_date IS NULL \
                                OR last_update_date < (CURRENT_TIMESTAMP - make_interval(mins => $1))) \
                    ), \
@@ -756,14 +830,22 @@ pub fn reflex_scheduled_reconcile(
                    ) \
                    SELECT name FROM candidate \
                     WHERE name NOT IN (SELECT name FROM covered) \
-                    ORDER BY graph_depth, name";
+                    ORDER BY graph_depth, last_update_date ASC NULLS FIRST, name";
         client
             .select(
                 sql,
                 None,
-                &[unsafe {
-                    DatumWithOid::new(max_age_minutes, PgBuiltInOids::INT4OID.oid().value())
-                }],
+                &[
+                    unsafe {
+                        DatumWithOid::new(max_age_minutes, PgBuiltInOids::INT4OID.oid().value())
+                    },
+                    unsafe {
+                        DatumWithOid::new(
+                            target_schema.to_string(),
+                            PgBuiltInOids::TEXTOID.oid().value(),
+                        )
+                    },
+                ],
             )
             .unwrap_or_report()
             .filter_map(|row| {
@@ -774,8 +856,19 @@ pub fn reflex_scheduled_reconcile(
             .collect()
     });
 
-    let mut out: Vec<ScheduledReconcileRow> = Vec::with_capacity(candidates.len());
-    for name in candidates {
+    // batch_size <= 0 means unlimited (one call sweeps everything — the
+    // pre-1.11.0 default). Otherwise attempt at most batch_size, and report the
+    // rest as deferred to a future call.
+    let total = candidates.len();
+    let limit = if batch_size <= 0 {
+        total
+    } else {
+        (batch_size as usize).min(total)
+    };
+    let remaining = (total - limit) as i64;
+
+    let mut out: Vec<ScheduledReconcileRow> = Vec::with_capacity(limit);
+    for name in candidates.into_iter().take(limit) {
         let started = std::time::Instant::now();
         let result = reflex_reconcile(&name);
         let ms = started.elapsed().as_millis() as i64;
@@ -789,7 +882,7 @@ pub fn reflex_scheduled_reconcile(
             );
             result.to_string()
         };
-        out.push((name, status, ms));
+        out.push((name, status, ms, remaining));
     }
 
     TableIterator::new(out)
