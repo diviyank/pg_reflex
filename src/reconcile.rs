@@ -736,17 +736,28 @@ type ScheduledReconcileRow = (String, String, i64, i64);
 /// `status` is `'RECONCILED'` or an error string (PS-1 surfaces a decomposed
 /// chain's child failure here — it is reported, never swallowed), `ms` is the
 /// reconcile wall time, and `remaining` is the number of candidates this call
-/// DEFERRED because `batch_size` capped it. `remaining = 0` means the sweep is
-/// complete for this age gate — monitoring must not read a single call as "done"
-/// unless `remaining` is 0. A failed IMV is not counted in `remaining`; its
-/// `last_update_date` is not advanced, so it re-appears as a candidate next call.
+/// DEFERRED because `batch_size` capped it.
+///
+/// `remaining = 0` is NOT a health signal — it only means this call attempted
+/// every remaining candidate, not that they all succeeded. A failed / poison
+/// IMV keeps its stale `last_update_date`, stays a candidate, and is attempted
+/// again next call while `remaining` may already read 0. Monitoring must check
+/// per-row `status` for failures, not just `remaining`.
+///
+/// The age gate is the resume cursor, so `remaining` reaching 0 is meaningful
+/// only under a POSITIVE `max_age_minutes`: a reconciled IMV's `clock_timestamp()`
+/// write then falls inside the fresh window and it drops out. With
+/// `max_age_minutes <= 0` every enabled IMV is perpetually eligible, so a bounded
+/// (`batch_size > 0`) sweep never reports `remaining = 0` — it instead rotates
+/// oldest-first through the registry each call (continuous maintenance). Do not
+/// loop-until-zero on a non-positive gate; drive it from a scheduler tick.
 ///
 /// ```sql
 /// -- Small registry: unchanged from 1.10.11 — one call sweeps everything.
 /// SELECT cron.schedule('reflex-drift-scan', '*/15 * * * *',
 ///     'SELECT * FROM reflex_scheduled_reconcile(60)');
 ///
-/// -- Large registry: bound each tick; call repeatedly until remaining = 0.
+/// -- Large registry: bound each tick (positive gate); repeat until remaining = 0.
 /// SELECT cron.schedule('reflex-drift-scan', '*/5 * * * *',
 ///     'SELECT * FROM reflex_scheduled_reconcile(60, 25)');
 /// ```
@@ -784,8 +795,19 @@ pub fn reflex_scheduled_reconcile(
         // `$2` scopes to one tenant's `target_schema` (empty string = all). The
         // covered CTE derives from the already-scoped candidate set, so a covered
         // child is scoped with its parent.
+        //
+        // ORDER BY keeps `graph_depth` primary (children before parents), then
+        // rotates oldest-first within a depth via `last_update_date`. A depth
+        // level holds only mutually independent IMVs — `graph_depth` exceeds
+        // every dependency's depth, so same-depth nodes never depend on each
+        // other — hence reordering within a level cannot perturb dependency
+        // order. The staleness tiebreaker is what lets a bounded (`batch_size`)
+        // call advance through the whole registry instead of re-doing the same
+        // leading rows and starving the tail when the age gate stays open on
+        // just-reconciled IMVs (max_age <= 0). `name` is the final, deterministic
+        // tiebreaker.
         let sql = "WITH candidate AS ( \
-                       SELECT name, graph_depth, depends_on_imv \
+                       SELECT name, graph_depth, depends_on_imv, last_update_date \
                          FROM public.__reflex_ivm_reference \
                         WHERE COALESCE(enabled, TRUE) = TRUE \
                           AND ($2 = '' OR COALESCE(target_schema, 'public') = $2) \
@@ -808,7 +830,7 @@ pub fn reflex_scheduled_reconcile(
                    ) \
                    SELECT name FROM candidate \
                     WHERE name NOT IN (SELECT name FROM covered) \
-                    ORDER BY graph_depth, name";
+                    ORDER BY graph_depth, last_update_date ASC NULLS FIRST, name";
         client
             .select(
                 sql,

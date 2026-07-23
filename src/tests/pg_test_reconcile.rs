@@ -413,6 +413,61 @@ fn pg_scheduled_reconcile_batch_size_is_resumable() {
     assert_eq!(remaining2, 0, "sweep complete after the second call");
 }
 
+/// PS-7 F1 — under a gate that stays open on freshly reconciled IMVs (max_age
+/// <= 0), a bounded driver must ROTATE oldest-first through the whole set, not
+/// re-do the same leading `batch_size` every call and starve the tail.
+///
+/// In production each call is its own transaction, so a row reconciled in the
+/// previous call (clock_timestamp() write) is STILL older than that later
+/// call's `CURRENT_TIMESTAMP` and stays a candidate. A negative `max_age` (gate
+/// threshold in the future) reproduces that "still eligible after reconcile"
+/// property inside a single test transaction — with `max_age = 0` the frozen
+/// `CURRENT_TIMESTAMP` would artificially drop reconciled rows and hide the
+/// livelock. The three IMVs share a depth (0), so ordering is decided purely by
+/// the `last_update_date` tiebreaker; their staleness order (c<b<a) is the
+/// reverse of their name order, so an `ORDER BY … , name` driver would return
+/// ps7_rot_a three times (the bug) while the fixed driver returns c, b, a.
+#[pg_test]
+fn pg_scheduled_reconcile_rotates_oldest_first_under_open_gate() {
+    Spi::run("CREATE TABLE ps7_rot_src (id SERIAL, grp TEXT, val NUMERIC)").expect("create table");
+    Spi::run("INSERT INTO ps7_rot_src (grp, val) VALUES ('a', 1)").expect("seed");
+
+    for name in ["ps7_rot_a", "ps7_rot_b", "ps7_rot_c"] {
+        crate::create_reflex_ivm(
+            name,
+            "SELECT grp, SUM(val) AS total FROM ps7_rot_src GROUP BY grp",
+            None, None, None, None,
+        );
+    }
+
+    // Staleness order is the REVERSE of name order: c oldest, a newest.
+    Spi::run(
+        "UPDATE public.__reflex_ivm_reference SET last_update_date = CASE name \
+            WHEN 'ps7_rot_c' THEN TIMESTAMP '2001-01-01' \
+            WHEN 'ps7_rot_b' THEN TIMESTAMP '2001-01-02' \
+            WHEN 'ps7_rot_a' THEN TIMESTAMP '2001-01-03' END \
+          WHERE name LIKE 'ps7_rot_%'",
+    )
+    .expect("backdate");
+
+    let mut seen: Vec<String> = Vec::new();
+    for _ in 0..3 {
+        let picked: String = Spi::get_one(
+            "SELECT name FROM reflex_scheduled_reconcile(-1440, 1) WHERE name LIKE 'ps7_rot_%'",
+        )
+        .expect("q")
+        .expect("v");
+        seen.push(picked);
+    }
+
+    assert_eq!(
+        seen,
+        vec!["ps7_rot_c", "ps7_rot_b", "ps7_rot_a"],
+        "bounded driver must advance oldest-first through the whole set; \
+         a fixed name tiebreaker would starve the tail by re-picking ps7_rot_a"
+    );
+}
+
 /// PS-7 gap 3 — `target_schema` scopes the scan to one tenant. An IMV in another
 /// schema must be untouched (its `last_update_date` unchanged), so single-tenant
 /// recovery does not pay for all 415 schemas.
