@@ -1,4 +1,3 @@
-use pgrx::datum::TimestampWithTimeZone;
 use pgrx::pg_sys::panic::ErrorReportable;
 use pgrx::spi::Spi;
 
@@ -69,7 +68,19 @@ pub(crate) fn reflex_doctor_impl(
     rows
 }
 
-/// Detect pending queue issues (F1/F2): rows that are too old or have too many attempts
+/// Detect pending-queue issues (F1/F2).
+///
+/// Classification reads `failures` — the counter the drain's EXCEPTION handler
+/// bumps and the one `PARTITION_FLUSH_FAILURE_CAP` gates on — never `attempts`,
+/// which the *enqueue* path bumps once per partition ATTACH. A busy source
+/// crosses any retry threshold within a day, so classifying on `attempts` made
+/// every such root permanently "too many attempts".
+///
+/// Age is measured from `last_attempt_at`, falling back to `enqueued_at` only
+/// when no drain has ever fired for the row. `enqueued_at` is reset by every
+/// re-enqueue, so on a busy source it reports a fresh age over an old failure —
+/// which is how a fixed bug's `last_error` came to be presented as the current
+/// cause.
 fn detect_pending_queue_issues(
     target: Option<&str>,
     max_attempts: i32,
@@ -78,85 +89,96 @@ fn detect_pending_queue_issues(
 ) -> Vec<DoctorReportRow> {
     let mut rows = Vec::new();
 
-    let query = match target {
-        Some(t) => format!(
-            "SELECT source_root, enqueued_at, attempts, last_error FROM public.__reflex_partition_pending WHERE source_root = '{}' ORDER BY enqueued_at",
-            t.replace("'", "''")
-        ),
-        None => "SELECT source_root, enqueued_at, attempts, last_error FROM public.__reflex_partition_pending ORDER BY enqueued_at".to_string(),
+    let filter = match target {
+        Some(t) => format!("WHERE p.source_root = '{}' ", t.replace("'", "''")),
+        None => String::new(),
     };
+    // `wedged_since` is the earliest stale_since among the IMVs fed by this root.
+    // It is the only timestamp neither the enqueue nor the drain resets, so it is
+    // the one honest answer to "how long has this actually been broken".
+    let query = format!(
+        "SELECT p.source_root, \
+                p.attempts, \
+                p.failures, \
+                p.last_error, \
+                p.last_attempt_at IS NOT NULL AS attempted, \
+                extract(epoch FROM now() - COALESCE(p.last_attempt_at, p.enqueued_at))::int8 AS attempt_age, \
+                extract(epoch FROM now() - p.enqueued_at)::int8 AS pending_age, \
+                (SELECT min(r.stale_since) FROM public.__reflex_ivm_reference r \
+                  WHERE COALESCE(r.enabled, TRUE) \
+                    AND (r.depends_on @> ARRAY[p.source_root] \
+                         OR r.depends_on @> ARRAY[split_part(p.source_root, '.', 2)]))::text AS wedged_since \
+           FROM public.__reflex_partition_pending p {filter}\
+          ORDER BY p.enqueued_at"
+    );
 
-    let pending_rows: Vec<(String, Option<TimestampWithTimeZone>, i32, Option<String>)> =
-        Spi::connect(|client| {
-            let mut result = Vec::new();
-            let rs = client.select(&query, None, &[]).unwrap_or_report();
-            for row in rs {
-                let source_root: String = row
+    let pending_rows: Vec<PendingQueueRow> = Spi::connect(|client| {
+        let mut result = Vec::new();
+        let rs = client.select(&query, None, &[]).unwrap_or_report();
+        for row in rs {
+            result.push(PendingQueueRow {
+                source_root: row
                     .get_by_name::<&str, _>("source_root")
                     .unwrap_or(None)
                     .unwrap_or("")
-                    .to_string();
-                let enqueued_at = row
-                    .get_by_name::<TimestampWithTimeZone, _>("enqueued_at")
-                    .unwrap_or(None);
-                let attempts: i32 = row
+                    .to_string(),
+                attempts: row
                     .get_by_name::<i32, _>("attempts")
                     .unwrap_or(None)
-                    .unwrap_or(0);
-                let last_error: Option<String> = row
+                    .unwrap_or(0),
+                failures: row
+                    .get_by_name::<i32, _>("failures")
+                    .unwrap_or(None)
+                    .unwrap_or(0),
+                last_error: row
                     .get_by_name::<&str, _>("last_error")
                     .unwrap_or(None)
-                    .map(|s| s.to_string());
-                result.push((source_root, enqueued_at, attempts, last_error));
-            }
-            result
-        });
+                    .map(|s| s.to_string()),
+                attempted: row
+                    .get_by_name::<bool, _>("attempted")
+                    .unwrap_or(None)
+                    .unwrap_or(false),
+                attempt_age: row
+                    .get_by_name::<i64, _>("attempt_age")
+                    .unwrap_or(None)
+                    .unwrap_or(0),
+                pending_age: row
+                    .get_by_name::<i64, _>("pending_age")
+                    .unwrap_or(None)
+                    .unwrap_or(0),
+                wedged_since: row
+                    .get_by_name::<&str, _>("wedged_since")
+                    .unwrap_or(None)
+                    .map(|s| s.to_string()),
+            });
+        }
+        result
+    });
 
-    for (source_root, enqueued_at, attempts, last_error) in pending_rows {
-        // Calculate age in seconds from enqueued_at to now
-        let age_seconds = if let Some(ts) = enqueued_at {
-            Spi::get_one::<i64>(&format!(
-                "SELECT extract(epoch FROM now() - '{}'::timestamptz)::int8",
-                ts
-            ))
-            .unwrap_or(None)
-            .unwrap_or(0)
+    for p in pending_rows {
+        let check_id = if p.failures >= max_attempts {
+            "F2"
+        } else if p.attempt_age > PENDING_ROW_STALE_SECONDS {
+            "F1"
         } else {
-            0
-        };
-
-        let check_id = if attempts >= max_attempts {
-            "F2".to_string()
-        } else if age_seconds > 3600 {
-            // Older than 1 hour
-            "F1".to_string()
-        } else {
-            continue; // Not old enough or too many attempts yet
+            continue;
         };
 
         let action = format!(
             "SELECT reflex_flush_partition_source('{}');",
-            source_root.replace("'", "''")
+            p.source_root.replace("'", "''")
         );
-        let finding = format!(
-            "Partition source {} enqueued for {} seconds, {} attempts, last error: {}",
-            source_root,
-            age_seconds,
-            attempts,
-            last_error.as_deref().unwrap_or("(none)")
-        );
-
+        let finding = p.describe();
         let outcome = if fix {
-            // Try to flush the partition source
-            apply_partition_flush_repair(&source_root)
+            apply_partition_flush_repair(&p.source_root)
         } else {
             "reported".to_string()
         };
 
         rows.push((
-            check_id,
+            check_id.to_string(),
             "WARNING".to_string(),
-            source_root,
+            p.source_root,
             finding,
             action,
             outcome,
@@ -164,6 +186,55 @@ fn detect_pending_queue_issues(
     }
 
     rows
+}
+
+/// A pending row is "old" past this many seconds since its last drain attempt.
+const PENDING_ROW_STALE_SECONDS: i64 = 3600;
+
+/// One `__reflex_partition_pending` row, read with everything a finding needs to
+/// be both classified and dated.
+struct PendingQueueRow {
+    source_root: String,
+    /// Enqueues since the last successful drain — NOT retries.
+    attempts: i32,
+    /// Consecutive drain failures. The classification column.
+    failures: i32,
+    last_error: Option<String>,
+    /// False when no drain has ever fired for this row (the F1 re-arm hole).
+    attempted: bool,
+    attempt_age: i64,
+    pending_age: i64,
+    wedged_since: Option<String>,
+}
+
+impl PendingQueueRow {
+    fn describe(&self) -> String {
+        let cap_note = if self.failures >= crate::partition::PARTITION_FLUSH_FAILURE_CAP {
+            " — auto-retry suppressed, failure cap reached"
+        } else {
+            ""
+        };
+        let attempt_phrase = if self.attempted {
+            format!("last drain attempt {}s ago", self.attempt_age)
+        } else {
+            "never attempted".to_string()
+        };
+        let wedge_phrase = match &self.wedged_since {
+            Some(ts) => format!("dependent IMVs stale since {}", ts),
+            None => "no dependent IMV flagged stale".to_string(),
+        };
+        format!(
+            "{}: {} consecutive drain failure(s){}; {}; pending {}s; {} enqueue(s); {}; last error: {}",
+            self.source_root,
+            self.failures,
+            cap_note,
+            attempt_phrase,
+            self.pending_age,
+            self.attempts,
+            wedge_phrase,
+            self.last_error.as_deref().unwrap_or("(none)")
+        )
+    }
 }
 
 /// Apply a partition flush repair in a subtransaction

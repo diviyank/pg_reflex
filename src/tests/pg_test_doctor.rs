@@ -19,12 +19,13 @@ fn f10_doctor_dry_run_is_read_only() {
 
 #[pg_test]
 fn f10_doctor_fix_drains_wedged_queue() {
-    // Seed a pending root with high attempt count to trigger F2 detection.
+    // Seed a pending root with a high drain-failure count to trigger F2 detection.
+    // (1.11.0: `attempts` counts enqueues, `failures` counts drain failures.)
     // Call reflex_doctor(fix => TRUE) and verify:
     // 1. At least one row is returned
     // 2. The outcome is either 'fixed' or starts with 'failed:'
     // 3. The pending row was attempted to be drained
-    Spi::run("INSERT INTO public.__reflex_partition_pending (source_root, attempts) VALUES ('test.root', 5)").unwrap();
+    Spi::run("INSERT INTO public.__reflex_partition_pending (source_root, failures) VALUES ('test.root', 5)").unwrap();
 
     let result_rows: Vec<(String, String)> = Spi::connect(|client| {
         let mut result = Vec::new();
