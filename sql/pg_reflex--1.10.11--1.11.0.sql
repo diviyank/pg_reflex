@@ -160,3 +160,51 @@ DO $ps4$ BEGIN
     RAISE NOTICE 'pg_reflex 1.11.0 (PS-4): reflex_doctor classifies the pending queue on drain failures (F2b when the failure cap has been reached), dates findings from last_attempt_at, and re-arms capped roots via the new reflex_reset_partition_failures() before flushing. Existing pending rows have last_attempt_at NULL until their next drain attempt.';
 END $ps4$;
 -- === end PS-4 ==============================================================
+
+
+-- === PS-2: reflex_rebuild_chain fail-closed + create_args backfill =========
+--
+-- reflex_rebuild_chain drop-and-recreates an IMV from its stored create_args.
+-- Two changes ship in the module (.so):
+--
+--   * The NAMED IMV is now refused up front (before any drop) when it has no
+--     faithful create_args, exactly as its dependents already were — recreating
+--     from an absent spec silently reset storage mode, refresh mode and
+--     partitioning on every pre-1.10.8 row.
+--   * A CTE/set-op/DISTINCT-ON/window-decomposed parent is refused up front: its
+--     stored query names a generated sibling the CASCADE drop removes first, so a
+--     recreate references a vanished relation and aborts (D22). Recovery is
+--     reflex_reconcile (recursive since 1.11.0) or drop_reflex_ivm + recreate.
+--
+-- This SQL delta backfills create_args for legacy rows so the refusal above does
+-- not turn every pre-1.10.8 IMV into a dead end. It is HONEST-partial: only the
+-- fields reconstructible from dedicated registry columns are written, and the
+-- row is marked "backfilled": true. `topk_k` and `explicit_unpartitioned` are
+-- NOT reconstructible from any column and are deliberately OMITTED, so a rebuild
+-- takes the create-time defaults for them (topk_k none; auto-partitioning). An
+-- IMV that was explicitly created unpartitioned, or with a top-K bound, must be
+-- re-created from its original call to restore those two knobs faithfully.
+--
+-- Scope: only real rebuildable main-path IMVs. Generated sub-IMVs
+-- (is_generated_sub_imv) are rebuilt via their parent, and decomposed VIEW /
+-- UNION-ALL wrapper nodes (aggregations = '{}') have no rebuild from their row,
+-- so both are left untouched.
+
+UPDATE public.__reflex_ivm_reference
+   SET create_args = json_build_object(
+           'unique_columns_str', array_to_string(
+               CASE WHEN unique_columns IS NOT NULL AND cardinality(unique_columns) > 0
+                    THEN unique_columns ELSE COALESCE(index_columns, ARRAY[]::TEXT[]) END, ','),
+           'storage_mode', COALESCE(storage_mode, 'UNLOGGED'),
+           'refresh_mode', COALESCE(refresh_mode, 'IMMEDIATE'),
+           'ignore_sources', to_json(COALESCE(ignored_sources, ARRAY[]::TEXT[])),
+           'partition_by', to_json(COALESCE(partition_columns, ARRAY[]::TEXT[])),
+           'backfilled', TRUE)::text
+ WHERE create_args IS NULL
+   AND COALESCE(is_generated_sub_imv, FALSE) = FALSE
+   AND COALESCE(aggregations::text, '{}') <> '{}';
+
+DO $ps2$ BEGIN
+    RAISE NOTICE 'pg_reflex 1.11.0 (PS-2): reflex_rebuild_chain now refuses up front (before any drop) on a decomposed parent (use reflex_reconcile) and on any IMV lacking create_args. Legacy rows were backfilled from their registry columns and marked create_args->>backfilled = true; topk_k and explicit_unpartitioned are NOT reconstructible, so an IMV explicitly created unpartitioned or with a top-K bound should be re-created from its original create_reflex_ivm call to restore those two settings.';
+END $ps2$;
+-- === end PS-2 ==============================================================
