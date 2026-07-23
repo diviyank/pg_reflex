@@ -51,6 +51,40 @@ dependency graph on existing rows.
   partitions through its F4 / F4b reconcile after refusing to at the F3 step: the
   reconcile repairs now call the new two-argument `reflex_reconcile(view,
   drop_orphans)` overload and honour the caller's choice.
+- `reflex_rebuild_chain` silently downgraded an IMV rebuilt from an absent
+  `create_args` (pre-1.10.8 rows) to `IMMEDIATE` / unpartitioned / no-unique-key,
+  and hard-aborted on a CTE/set-op-decomposed parent (its stored query names a
+  generated sibling the CASCADE drop removes first, so the recreate referenced a
+  vanished relation — D22). It now refuses up front, before any drop, on a
+  decomposed parent (recover via `reflex_reconcile`) and on any IMV lacking a
+  faithful `create_args`; the SQL migration backfills reconstructible `create_args`
+  for legacy rows (marked `"backfilled": true`; a rebuild from such a row warns
+  that `topk_k` / `explicit_unpartitioned` took create-time defaults).
+- An IMV whose only real sources are materialized views is a snapshot frozen at
+  create time (PG fires no trigger on a matview) but was recorded
+  indistinguishably from a maintainable IMV, so every health surface read clean.
+  It is now flagged `requires_explicit_refresh` and surfaced by `reflex_ivm_status`
+  and as `reflex_doctor` finding `F12`, whose remedy is
+  `refresh_imv_depending_on('<matview>')`. The flag is structural and permanent —
+  kept strictly distinct from `known_stale` so it never becomes a false repair
+  failure.
+- A passthrough IMV missing its per-source scratch pair
+  (`__reflex_pt_new/old_<imv>_<source>`) failed every flush with 42P01, was caught
+  as a WARNING, and silently lost the staged deltas on each commit. `reflex_audit`
+  now prescribes `reflex_rebuild_triggers` + `reflex_reconcile` (not the no-op
+  `reflex_rebuild_imv`) for that condition, and the upgrade recreates missing
+  scratch pairs idempotently and marks any still-wedged IMV `known_stale` so the
+  doctor prescribes a reconcile rather than the audit reporting a false green.
+- `reflex_scheduled_reconcile` ran the whole registry in one transaction, so a
+  `statement_timeout` discarded every rebuild already done and it could not finish
+  on a large multi-tenant registry. It is now a resumable batched driver (see
+  Changed), and per-IMV `last_update_date` is stamped with `clock_timestamp()`
+  rather than one shared transaction-start `NOW()`, so a batch's timestamps are
+  distinct and can date an individual rebuild.
+- `reflex_sync_partitions` took a one-key advisory lock on the IMV name while all
+  maintenance paths use the two-key form — a different advisory-lock space, so a
+  sync and a concurrent maintenance of the same IMV did not mutually exclude at the
+  advisory level. Aligned to the two-key form (removes a lock-ordering surface).
 
 **Changed**
 
@@ -61,12 +95,40 @@ dependency graph on existing rows.
 - `graph_depth` changes value for every decomposed IMV (up for CTE parents, down
   for set-op wrappers). Every consumer orders by it ascending and wants the
   corrected order.
+- **`reflex_scheduled_reconcile` signature (public API change).** New optional
+  arguments `batch_size` (default `0` = unlimited, the previous one-call-sweeps-all
+  behaviour) and `target_schema` (default `''` = all schemas), and a new output
+  column `remaining`. For a large registry, bound each pg_cron tick with a
+  `batch_size` and call until `remaining = 0`; candidates rotate oldest-first
+  within a `graph_depth` level so a bounded sweep advances through the whole
+  registry. `remaining = 0` means the batch deferred nothing this call, not that
+  the registry is healthy — monitoring must still check per-row `status`. The
+  upgrade drops the old single-argument function and recreates the new form
+  (the return type changed), so default-argument pg_cron jobs keep working.
 
 **Added**
 
-- `is_generated_sub_imv` and `__reflex_partition_pending.last_attempt_at` columns;
-  `reflex_repair_dependency_graph()`, `reflex_reset_partition_failures()`, and the
-  two-argument `reflex_reconcile(view, drop_orphans)` overload.
+- Columns `is_generated_sub_imv`, `requires_explicit_refresh`, and
+  `__reflex_partition_pending.last_attempt_at`.
+- Functions `reflex_repair_dependency_graph()`, `reflex_reset_partition_failures()`,
+  and the two-argument `reflex_reconcile(view, drop_orphans)` overload.
+- `reflex_doctor` finding `F12` (matview-only / `requires_explicit_refresh`) and
+  `F2b` (a partition-flush root at the failure cap, distinct from a still-retrying
+  `F2`).
+
+**Known limitations**
+
+- MIN / MAX over a **nullable** group key can stay `NULL` after the NULL group's
+  extremum is retracted: the recompute scopes its re-aggregation with a
+  null-unsafe `IN (...)`, which excludes the NULL group. Pre-existing (not changed
+  in 1.11.0), narrow, and tracked in
+  `untreated_bugs/2026-07-23_min_max_recompute_scope_null_unsafe_in.md`. The
+  differential fuzz harness does not yet emit MIN/MAX, so it does not cover this.
+- The `requires_explicit_refresh` upgrade backfill matches `ignore_sources` by
+  exact stored spelling, so an IMV that ignores a real source by *bare* name while
+  `depends_on` stores it qualified can be under-flagged on upgrade (new IMVs are
+  unaffected — create-time matches both forms). Tracked in
+  `untreated_bugs/2026-07-24_gap2_analyze_intermediate_residual.md`.
 
 **Migration**
 
