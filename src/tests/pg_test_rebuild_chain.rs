@@ -120,3 +120,157 @@ fn pg_rebuild_chain_cascade_refuses_null_create_args() {
     assert!(out.starts_with("ERROR"), "must refuse, got: {out}");
     assert!(out.contains("rcn_dep"), "error must name the dependent: {out}");
 }
+
+/// PS-2 Part 1 — the NAMED IMV is protected by the same fail-closed check as its
+/// dependents. A row predating create_args (1.10.8) has no faithful spec, so
+/// recreating it would silently reset storage/refresh/partitioning — the very
+/// downgrade the dependents check warns about. It must refuse UP FRONT, before
+/// any drop, leaving the IMV intact.
+#[pg_test]
+fn pg_rebuild_chain_refuses_named_null_create_args() {
+    Spi::run("CREATE TABLE rnn_src (k TEXT, v INT)").expect("src");
+    Spi::run("INSERT INTO rnn_src VALUES ('a', 1), ('b', 2)").expect("seed");
+    Spi::run("SELECT create_reflex_ivm('rnn_agg', 'SELECT k, sum(v) AS s FROM rnn_src GROUP BY k', 'k')")
+        .expect("agg");
+    Spi::run("UPDATE public.__reflex_ivm_reference SET create_args = NULL WHERE name = 'rnn_agg'")
+        .expect("simulate pre-1.10.8 named row");
+
+    let out = crate::reflex_rebuild_chain("rnn_agg", false);
+    assert!(out.starts_with("ERROR"), "named IMV with no create_args must refuse, got: {out}");
+    assert!(out.contains("rnn_agg"), "error must name the IMV: {out}");
+
+    // Nothing may be dropped: the target table and registry row survive intact.
+    let alive: i64 = Spi::get_one(
+        "SELECT count(*) FROM public.__reflex_ivm_reference WHERE name = 'rnn_agg'",
+    )
+    .expect("q")
+    .unwrap_or(0);
+    assert_eq!(alive, 1, "the refused IMV's registry row must survive");
+    let rows: i64 = Spi::get_one("SELECT count(*) FROM rnn_agg").expect("q").unwrap_or(-1);
+    assert_eq!(rows, 2, "the refused IMV's target table must be untouched");
+}
+
+/// PS-2 Part 2 (D22) — reflex_rebuild_chain hard-errored on every CTE-decomposed
+/// parent: the parent's stored sql_query is the REWRITTEN body naming the
+/// generated `<root>__cte_<alias>` child, so drop-CASCADE removes that child and
+/// the recreate then references a relation that no longer exists ("relation
+/// ...cte_base does not exist"), aborting the transaction. The primitive must
+/// instead REFUSE cleanly before any drop, pointing at reflex_reconcile (the
+/// recursive, correct recovery since 1.11.0) and leaving the chain intact.
+#[pg_test]
+fn pg_rebuild_chain_refuses_on_cte_decomposed_parent() {
+    Spi::run("CREATE TABLE rcd_src (id INT, grp TEXT, val NUMERIC)").expect("src");
+    Spi::run("INSERT INTO rcd_src VALUES (1,'a',10),(2,'a',20),(3,'b',30)").expect("seed");
+
+    let created = crate::create_reflex_ivm(
+        "rcd_agg",
+        "WITH base AS (SELECT id, grp, val FROM rcd_src) \
+         SELECT grp, SUM(val) AS total FROM base GROUP BY grp",
+        None,
+        None,
+        None,
+        None,
+    );
+    assert_eq!(created, "CREATE REFLEX INCREMENTAL VIEW");
+
+    // Sanity: the parent really is CTE-decomposed (generated child present).
+    let child_present: i64 = Spi::get_one(
+        "SELECT count(*) FROM public.__reflex_ivm_reference WHERE name = 'rcd_agg__cte_base'",
+    )
+    .expect("q")
+    .unwrap_or(0);
+    assert_eq!(child_present, 1, "fixture must be CTE-decomposed");
+
+    // Pre-fix this drops the parent + child then aborts on the vanished relation.
+    let out = crate::reflex_rebuild_chain("rcd_agg", false);
+    assert!(
+        out.starts_with("ERROR"),
+        "rebuild_chain on a decomposed parent must refuse cleanly, got: {out}"
+    );
+    assert!(
+        out.contains("reflex_reconcile"),
+        "the refusal must point at reflex_reconcile as the recovery, got: {out}"
+    );
+
+    // Nothing dropped: parent, generated child and the parent's data all survive.
+    let parent_alive: i64 = Spi::get_one(
+        "SELECT count(*) FROM public.__reflex_ivm_reference WHERE name = 'rcd_agg'",
+    )
+    .expect("q")
+    .unwrap_or(0);
+    assert_eq!(parent_alive, 1, "the decomposed parent must not be dropped");
+    let child_alive: i64 = Spi::get_one(
+        "SELECT count(*) FROM public.__reflex_ivm_reference WHERE name = 'rcd_agg__cte_base'",
+    )
+    .expect("q")
+    .unwrap_or(0);
+    assert_eq!(child_alive, 1, "the generated child must not be dropped");
+    let data: i64 = Spi::get_one("SELECT count(*) FROM rcd_agg").expect("q").unwrap_or(-1);
+    assert_eq!(data, 2, "the parent's data must be untouched");
+}
+
+/// PS-2 Part 2b (backfill) — a legacy row (create_args NULL) carrying DEFERRED /
+/// partitioning in its dedicated registry columns must, after the 1.11.0
+/// backfill, expose a create_args that reconstructs those fields and is marked
+/// `"backfilled": true`, so reflex_rebuild_chain preserves DEFERRED rather than
+/// silently resetting it to IMMEDIATE. This mirrors the migration's backfill
+/// UPDATE (the .sql delta is not executed by the pgrx test harness).
+#[pg_test]
+fn pg_rebuild_chain_backfill_reconstructs_deferred_from_columns() {
+    Spi::run("CREATE TABLE rbf_src (k TEXT, v INT)").expect("src");
+    Spi::run("INSERT INTO rbf_src VALUES ('a', 1), ('b', 2)").expect("seed");
+    Spi::run("SELECT create_reflex_ivm('rbf_agg', 'SELECT k, sum(v) AS s FROM rbf_src GROUP BY k', 'k', 'UNLOGGED', 'DEFERRED')")
+        .expect("agg");
+    // Simulate a pre-1.10.8 row: create_args absent, but the dedicated columns
+    // (unique_columns/index_columns, storage_mode, refresh_mode) still describe it.
+    Spi::run("UPDATE public.__reflex_ivm_reference SET create_args = NULL WHERE name = 'rbf_agg'")
+        .expect("null create_args");
+
+    // The backfill UPDATE shipped in the PS-2 migration section.
+    Spi::run(
+        "UPDATE public.__reflex_ivm_reference SET create_args = json_build_object( \
+             'unique_columns_str', array_to_string( \
+                 CASE WHEN unique_columns IS NOT NULL AND cardinality(unique_columns) > 0 \
+                      THEN unique_columns ELSE index_columns END, ','), \
+             'storage_mode', COALESCE(storage_mode, 'UNLOGGED'), \
+             'refresh_mode', COALESCE(refresh_mode, 'IMMEDIATE'), \
+             'ignore_sources', to_json(COALESCE(ignored_sources, ARRAY[]::TEXT[])), \
+             'partition_by', to_json(COALESCE(partition_columns, ARRAY[]::TEXT[])), \
+             'backfilled', TRUE)::text \
+           WHERE create_args IS NULL \
+             AND COALESCE(is_generated_sub_imv, FALSE) = FALSE \
+             AND COALESCE(aggregations::text, '{}') <> '{}'",
+    )
+    .expect("backfill");
+
+    let refresh = Spi::get_one::<String>(
+        "SELECT (create_args::jsonb)->>'refresh_mode' FROM public.__reflex_ivm_reference WHERE name = 'rbf_agg'",
+    )
+    .expect("q")
+    .expect("v");
+    assert_eq!(refresh, "DEFERRED", "backfill must recover the DEFERRED refresh mode");
+
+    let marked = Spi::get_one::<bool>(
+        "SELECT (create_args::jsonb)->>'backfilled' = 'true' FROM public.__reflex_ivm_reference WHERE name = 'rbf_agg'",
+    )
+    .expect("q")
+    .expect("v");
+    assert!(marked, "backfilled rows must be honestly marked");
+
+    let uniq = Spi::get_one::<String>(
+        "SELECT (create_args::jsonb)->>'unique_columns_str' FROM public.__reflex_ivm_reference WHERE name = 'rbf_agg'",
+    )
+    .expect("q")
+    .expect("v");
+    assert_eq!(uniq, "k", "backfill must recover the declared unique key");
+
+    // And a rebuild from the backfilled row must preserve DEFERRED, not reset it.
+    let out = crate::reflex_rebuild_chain("rbf_agg", false);
+    assert!(!out.starts_with("ERROR"), "rebuild of a backfilled row must succeed, got: {out}");
+    let mode_after = Spi::get_one::<String>(
+        "SELECT refresh_mode FROM public.__reflex_ivm_reference WHERE name = 'rbf_agg'",
+    )
+    .expect("q")
+    .expect("v");
+    assert_eq!(mode_after, "DEFERRED", "rebuild must preserve DEFERRED from the backfilled spec");
+}

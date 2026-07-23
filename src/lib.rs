@@ -191,7 +191,7 @@ extension_sql!(
     ALTER TABLE public.__reflex_ivm_reference
         ADD COLUMN IF NOT EXISTS stale_since TIMESTAMPTZ;
 
-    -- 1.11.0: JSON object capturing creation-time arguments (unique_columns,
+    -- 1.10.8: JSON object capturing creation-time arguments (unique_columns,
     -- storage_mode, refresh_mode, topk_k, ignore_sources, partition_by,
     -- explicit_unpartitioned) for faithful IMV chain reconstruction via
     -- reflex_rebuild_chain. NULL for legacy rows; new rows populated at
