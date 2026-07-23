@@ -240,6 +240,11 @@ extension_sql!(
         ADD COLUMN IF NOT EXISTS last_error TEXT;
     ALTER TABLE public.__reflex_partition_pending
         ADD COLUMN IF NOT EXISTS failures INT NOT NULL DEFAULT 0;
+    -- 1.11.0: stamped by the drain, so a pending row's age reflects the last
+    -- flush attempt rather than the last enqueue (which every ATTACH resets).
+    -- NULL means no drain has ever fired for this row — the F1 re-arm hole.
+    ALTER TABLE public.__reflex_partition_pending
+        ADD COLUMN IF NOT EXISTS last_attempt_at TIMESTAMPTZ;
 
     -- 1.6.0: SQL helper used by the per-partition dispatch DO block emitted
     -- by build_partition_aware_dispatch_sql.  Given a partitioned parent +
@@ -294,13 +299,28 @@ extension_sql!(
     $REFLEX$;
 
     -- Helper for reflex_doctor repairs: execute SQL in a subtransaction and return outcome.
-    -- On success: returns 'fixed'. On exception: returns 'failed:' || error message.
+    -- CONTRACT: `_sql` MUST be a statement that returns a value (every caller
+    -- passes `SELECT reflex_*(...)`). `EXECUTE ... INTO` cannot run a statement that
+    -- returns no data, so a bare DDL/DML repair yields
+    -- 'failed:INTO used with a command that cannot return data'. That degrades
+    -- safely, but a future executable repair (e.g. F9's DROP ... CASCADE) must be
+    -- wrapped so it returns something, or this helper must be extended first.
+    -- Returns 'fixed' only when the statement neither raised nor RETURNED an
+    -- 'ERROR: …' string. reflex_reconcile, reflex_sync_partitions and
+    -- drop_reflex_ivm all signal some failures by returning that text rather than
+    -- raising, so discarding the result reported those repairs as successful —
+    -- the outcome an operator can least afford to be lied to about.
     -- The EXCEPTION block acts as a savepoint: failing repairs rollback only themselves,
     -- not the outer reflex_doctor transaction, ensuring isolation.
     CREATE OR REPLACE FUNCTION public.__reflex_doctor_try_repair(_sql TEXT)
     RETURNS TEXT LANGUAGE plpgsql AS $fn$
+    DECLARE
+        _res TEXT;
     BEGIN
-        EXECUTE _sql;
+        EXECUTE _sql INTO _res;
+        IF _res IS NOT NULL AND upper(_res) LIKE 'ERROR%' THEN
+            RETURN 'failed:' || left(_res, 400);
+        END IF;
         RETURN 'fixed';
     EXCEPTION WHEN OTHERS THEN
         RETURN 'failed:' || left(SQLERRM, 400);
@@ -571,6 +591,21 @@ fn reflex_flush_partitions() -> String {
 #[pg_extern]
 fn reflex_flush_partition_source(source_root: &str) -> String {
     partition::reflex_flush_partitions_impl(Some(source_root))
+}
+
+/// Re-arm pending partition roots that the failure cap has given up on, so the
+/// next flush attempts them again. Pass NULL for every root.
+///
+/// A root that has failed `PARTITION_FLUSH_FAILURE_CAP` flushes in a row is
+/// skipped by both `reflex_flush_partitions()` and
+/// `reflex_flush_partition_source(root)`, so no flush can move it and no flush
+/// can clear the counter (it is cleared only by the DELETE a *successful* drain
+/// performs). Fix the underlying cause first — re-arming a root whose cause is
+/// still present simply spends another attempt. Returns the number of roots
+/// re-armed.
+#[pg_extern]
+fn reflex_reset_partition_failures(source_root: default!(Option<&str>, "NULL")) -> i64 {
+    partition::reflex_reset_partition_failures_impl(source_root)
 }
 
 /// Internal: replace the source-partition snapshot for `source_root` with the
