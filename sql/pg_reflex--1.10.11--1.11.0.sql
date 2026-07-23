@@ -160,3 +160,35 @@ DO $ps4$ BEGIN
     RAISE NOTICE 'pg_reflex 1.11.0 (PS-4): reflex_doctor classifies the pending queue on drain failures (F2b when the failure cap has been reached), dates findings from last_attempt_at, and re-arms capped roots via the new reflex_reset_partition_failures() before flushing. Existing pending rows have last_attempt_at NULL until their next drain attempt.';
 END $ps4$;
 -- === end PS-4 ==============================================================
+
+
+-- === PS-6: heal missing passthrough scratch tables =========================
+--
+-- A passthrough IMV maintains itself through a per-(IMV, source) scratch pair
+-- `__reflex_pt_new/old_<imv>_<source>` that the trigger TRUNCATE/INSERTs on
+-- every flush. If that pair is missing — an older create loop that didn't cover
+-- the source, a partial create, or a manual drop — every flush fails fast with
+-- `relation "__reflex_pt_new_…" does not exist` (SQLSTATE 42P01), is swallowed
+-- as a WARNING inside the per-IMV subtransaction, and the IMV goes silently
+-- stale forever. reflex_rebuild_triggers now recreates the pair idempotently;
+-- invoke it once per source feeding a passthrough IMV so wedged installs heal
+-- on upgrade without a full drop+recreate. Healthy IMVs no-op (CREATE IF NOT
+-- EXISTS). Bare source names that resolve ambiguously are skipped (the function
+-- returns an ERROR string rather than raising), leaving the loop to continue.
+DO $ps6$
+DECLARE
+    _src TEXT;
+BEGIN
+    FOR _src IN
+        SELECT DISTINCT dep
+        FROM public.__reflex_ivm_reference r,
+             LATERAL unnest(r.depends_on) AS dep
+        WHERE r.enabled = TRUE
+          AND COALESCE((r.aggregations->>'is_passthrough')::bool, FALSE)
+          AND dep NOT LIKE '<%'
+    LOOP
+        PERFORM public.reflex_rebuild_triggers(_src);
+    END LOOP;
+    RAISE NOTICE 'pg_reflex 1.11.0 (PS-6): recreated any missing __reflex_pt_ passthrough scratch tables (idempotent). A missing pair previously wedged the IMV — every flush failed with 42P01 and was retried forever.';
+END $ps6$;
+-- === end PS-6 ==============================================================
