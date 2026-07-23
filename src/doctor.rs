@@ -156,7 +156,12 @@ fn detect_pending_queue_issues(
     });
 
     for p in pending_rows {
-        let check_id = if p.failures >= max_attempts {
+        // F2b before F2: a capped root is not merely failing, it has been given
+        // up on — no flush will touch it again until it is re-armed, which is a
+        // different instruction to the operator.
+        let check_id = if p.is_capped() {
+            "F2b"
+        } else if p.failures >= max_attempts {
             "F2"
         } else if p.attempt_age > PENDING_ROW_STALE_SECONDS {
             "F1"
@@ -164,13 +169,43 @@ fn detect_pending_queue_issues(
             continue;
         };
 
-        let action = format!(
-            "SELECT reflex_flush_partition_source('{}');",
-            p.source_root.replace("'", "''")
-        );
+        let escaped_root = p.source_root.replace("'", "''");
+        // A capped root needs re-arming first: the flush this action prescribes
+        // declines to touch it otherwise, which made the F1/F2 remedy a
+        // guaranteed no-op on exactly the rows most likely to be capped.
+        let action = if p.is_capped() {
+            format!(
+                "SELECT reflex_reset_partition_failures('{0}'); \
+                 SELECT reflex_flush_partition_source('{0}');",
+                escaped_root
+            )
+        } else {
+            format!("SELECT reflex_flush_partition_source('{}');", escaped_root)
+        };
         let finding = p.describe();
         let outcome = if fix {
-            apply_partition_flush_repair(&p.source_root)
+            if p.is_capped() {
+                // Exactly one re-arm per doctor invocation per capped root. The cap
+                // exists to stop the commit-time drain retrying a broken root
+                // forever; an explicit `fix => TRUE` is an operator asking for one
+                // more attempt, not a licence to retry without limit.
+                let reset = apply_doctor_repair(&format!(
+                    "SELECT public.reflex_reset_partition_failures('{}')",
+                    escaped_root
+                ));
+                if reset != "fixed" {
+                    rows.push((
+                        check_id.to_string(),
+                        "WARNING".to_string(),
+                        p.source_root,
+                        finding,
+                        action,
+                        reset,
+                    ));
+                    continue;
+                }
+            }
+            verify_pending_drained(&p.source_root, apply_partition_flush_repair(&p.source_root))
         } else {
             "reported".to_string()
         };
@@ -207,9 +242,39 @@ struct PendingQueueRow {
     wedged_since: Option<String>,
 }
 
+/// A pending-queue repair is `fixed` only when the row actually left the queue.
+///
+/// A successful drain DELETEs the row, so a row that is still present means the
+/// drain either declined (capped) or failed and rolled back. Neither is visible in
+/// the flush's return value: the capped path returns a perfectly normal
+/// "OK — nothing pending", and a per-root failure is swallowed into a WARNING by
+/// the drain's own EXCEPTION handler. Without this check the doctor reported
+/// `fixed` for a repair that did nothing.
+fn verify_pending_drained(source_root: &str, outcome: String) -> String {
+    if outcome != "fixed" {
+        return outcome;
+    }
+    let escaped = source_root.replace("'", "''");
+    let still_queued = Spi::get_one::<i32>(&format!(
+        "SELECT failures FROM public.__reflex_partition_pending WHERE source_root = '{}'",
+        escaped
+    ))
+    .unwrap_or(None);
+    match still_queued {
+        Some(failures) => format!("failed:still queued after flush (failures = {})", failures),
+        None => outcome,
+    }
+}
+
 impl PendingQueueRow {
+    /// At or past the cap both flush entry points decline this root, so nothing
+    /// short of a re-arm can move it.
+    fn is_capped(&self) -> bool {
+        self.failures >= crate::partition::PARTITION_FLUSH_FAILURE_CAP
+    }
+
     fn describe(&self) -> String {
-        let cap_note = if self.failures >= crate::partition::PARTITION_FLUSH_FAILURE_CAP {
+        let cap_note = if self.is_capped() {
             " — auto-retry suppressed, failure cap reached"
         } else {
             ""

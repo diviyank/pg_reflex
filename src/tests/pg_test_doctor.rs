@@ -30,7 +30,7 @@ fn f10_doctor_fix_drains_wedged_queue() {
     let result_rows: Vec<(String, String)> = Spi::connect(|client| {
         let mut result = Vec::new();
         let rs = client.select(
-            "SELECT object, outcome FROM reflex_doctor(NULL, TRUE) WHERE check_id IN ('F1', 'F2')",
+            "SELECT object, outcome FROM reflex_doctor(NULL, TRUE) WHERE check_id IN ('F1', 'F2', 'F2b')",
             None,
             &[]
         ).unwrap_or_report();
@@ -1067,16 +1067,19 @@ fn ps4_drain_failures_classify_as_f2() {
     Spi::run(
         "INSERT INTO public.__reflex_partition_pending \
              (source_root, attempts, failures, enqueued_at) \
-         VALUES ('ps4_wedged.root', 0, 5, now())",
+         VALUES ('ps4_wedged.root', 0, 3, now())",
     )
     .expect("seed");
+    // 3 failures: at the default max_attempts, still below the failure cap, so
+    // this is the plain retrying variant (F2). The capped variant is F2b, covered
+    // by ps4_capped_root_has_its_own_check_id.
     let n: i64 = Spi::get_one(
         "SELECT count(*) FROM reflex_doctor() \
          WHERE object = 'ps4_wedged.root' AND check_id = 'F2'",
     )
     .expect("q")
     .unwrap_or(-1);
-    assert_eq!(n, 1, "5 drain failures with 0 enqueues is F2");
+    assert_eq!(n, 1, "3 drain failures with 0 enqueues is F2");
 }
 
 #[pg_test]
