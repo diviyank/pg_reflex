@@ -1285,3 +1285,169 @@ fn ps4_unrepairable_f3_is_not_reported_as_fixed() {
     .unwrap_or(false);
     assert!(still_stale, "a failed repair must leave known_stale set");
 }
+
+// --- B5: the F1/F2 remedy must not be a no-op on capped roots ---------------
+
+#[pg_test]
+fn ps4_pending_repair_reported_fixed_must_actually_drain() {
+    // A root at PARTITION_FLUSH_FAILURE_CAP: both flush entry points decline to
+    // touch it, so `reflex_flush_partition_source` — the doctor's only F1/F2
+    // action — returns normally having done nothing. Nothing in that return is
+    // error-shaped, so the outcome capture added for soft ERROR strings does not
+    // catch it. `fixed` must mean the row actually left the queue.
+    Spi::run(
+        "INSERT INTO public.__reflex_partition_pending (source_root, failures) \
+         VALUES ('ps4_cap_fix.root', 5)",
+    )
+    .expect("seed");
+
+    let outcome: String = Spi::get_one(
+        "SELECT outcome FROM reflex_doctor(NULL, TRUE) \
+         WHERE object = 'ps4_cap_fix.root' LIMIT 1",
+    )
+    .expect("q")
+    .expect("expected a pending-queue row for the capped root");
+
+    let still_queued: bool = Spi::get_one(
+        "SELECT EXISTS(SELECT 1 FROM public.__reflex_partition_pending \
+          WHERE source_root = 'ps4_cap_fix.root')",
+    )
+    .expect("q")
+    .unwrap_or(true);
+
+    assert!(
+        outcome != "fixed" || !still_queued,
+        "doctor reported '{}' for a capped root that is still queued — the \
+         prescribed flush cannot move a root at the failure cap",
+        outcome
+    );
+}
+
+#[pg_test]
+fn ps4_capped_root_that_cannot_drain_reports_failed() {
+    // Same fixture as the last_attempt_at stamp test (a registry row whose
+    // relations do not exist), but capped. Re-arming it lets the drain run; the
+    // drain then fails and the row stays queued, so the outcome must say so.
+    Spi::run("CREATE TABLE ps4_cap_src (region TEXT NOT NULL, v INT) PARTITION BY LIST (region)")
+        .expect("src");
+    Spi::run("CREATE TABLE ps4_cap_src_a PARTITION OF ps4_cap_src FOR VALUES IN ('a')")
+        .expect("a");
+    Spi::run(
+        "INSERT INTO public.__reflex_ivm_reference \
+            (name, graph_depth, depends_on, partition_columns, partition_strategy, enabled) \
+         VALUES ('ps4_cap_ghost', 0, ARRAY['public.ps4_cap_src'], ARRAY['region'], 'LIST', TRUE)",
+    )
+    .expect("ghost");
+    Spi::run(
+        "INSERT INTO public.__reflex_partition_pending (source_root, failures) \
+         VALUES ('public.ps4_cap_src', 5)",
+    )
+    .expect("seed");
+
+    let outcome: String = Spi::get_one(
+        "SELECT outcome FROM reflex_doctor(NULL, TRUE) \
+         WHERE object = 'public.ps4_cap_src' LIMIT 1",
+    )
+    .expect("q")
+    .expect("expected a pending-queue row");
+    assert!(
+        outcome.starts_with("failed:"),
+        "a root that is still queued after the repair must report failed, got '{}'",
+        outcome
+    );
+}
+
+#[pg_test]
+fn ps4_capped_root_has_its_own_check_id() {
+    // "wedged and retrying" and "wedged and given up on" need different ids:
+    // only the second one requires the operator to re-arm the root.
+    Spi::run(
+        "INSERT INTO public.__reflex_partition_pending (source_root, failures) \
+         VALUES ('ps4_retrying.root', 3)",
+    )
+    .expect("seed retrying");
+    Spi::run(
+        "INSERT INTO public.__reflex_partition_pending (source_root, failures) \
+         VALUES ('ps4_givenup.root', 5)",
+    )
+    .expect("seed capped");
+
+    let retrying: String = Spi::get_one(
+        "SELECT check_id FROM reflex_doctor() WHERE object = 'ps4_retrying.root' LIMIT 1",
+    )
+    .expect("q")
+    .expect("row");
+    let givenup: String = Spi::get_one(
+        "SELECT check_id FROM reflex_doctor() WHERE object = 'ps4_givenup.root' LIMIT 1",
+    )
+    .expect("q")
+    .expect("row");
+    assert_eq!(retrying, "F2", "a root below the cap is still being retried");
+    assert_eq!(
+        givenup, "F2b",
+        "a root at the cap has been given up on and needs re-arming"
+    );
+}
+
+#[pg_test]
+fn ps4_capped_finding_reports_the_failure_count_and_the_reset_action() {
+    Spi::run(
+        "INSERT INTO public.__reflex_partition_pending (source_root, failures) \
+         VALUES ('ps4_count.root', 5)",
+    )
+    .expect("seed");
+    let n: i64 = Spi::get_one(
+        "SELECT count(*) FROM reflex_doctor() \
+         WHERE object = 'ps4_count.root' \
+           AND finding LIKE '%5 consecutive drain failure(s)%' \
+           AND action LIKE '%reflex_reset_partition_failures(''ps4_count.root'')%' \
+           AND action LIKE '%reflex_flush_partition_source(''ps4_count.root'')%'",
+    )
+    .expect("q")
+    .unwrap_or(-1);
+    assert_eq!(
+        n, 1,
+        "a capped finding must report the failure count and prescribe re-arm + flush"
+    );
+}
+
+#[pg_test]
+fn ps4_reset_partition_failures_rearms_roots() {
+    Spi::run(
+        "INSERT INTO public.__reflex_partition_pending (source_root, failures) \
+         VALUES ('ps4_reset_a.root', 5), ('ps4_reset_b.root', 4)",
+    )
+    .expect("seed");
+
+    // Targeted: only the named root is re-armed.
+    let n = Spi::get_one::<i64>("SELECT reflex_reset_partition_failures('ps4_reset_a.root')")
+        .expect("q")
+        .expect("count");
+    assert_eq!(n, 1, "one root re-armed");
+    let a: i32 = Spi::get_one(
+        "SELECT failures FROM public.__reflex_partition_pending \
+          WHERE source_root = 'ps4_reset_a.root'",
+    )
+    .expect("q")
+    .unwrap_or(-1);
+    let b: i32 = Spi::get_one(
+        "SELECT failures FROM public.__reflex_partition_pending \
+          WHERE source_root = 'ps4_reset_b.root'",
+    )
+    .expect("q")
+    .unwrap_or(-1);
+    assert_eq!(a, 0, "the named root is re-armed");
+    assert_eq!(b, 4, "other roots are untouched");
+
+    // NULL = every root.
+    let all = Spi::get_one::<i64>("SELECT reflex_reset_partition_failures(NULL)")
+        .expect("q")
+        .expect("count");
+    assert!(all >= 1, "NULL re-arms every root with failures > 0, got {}", all);
+    let remaining: i64 = Spi::get_one(
+        "SELECT count(*) FROM public.__reflex_partition_pending WHERE failures > 0",
+    )
+    .expect("q")
+    .unwrap_or(-1);
+    assert_eq!(remaining, 0, "no root is left with a failure count");
+}
