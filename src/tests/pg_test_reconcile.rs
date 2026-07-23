@@ -326,6 +326,265 @@ fn pg_scheduled_reconcile_stamps_distinct_timestamps_per_imv() {
     );
 }
 
+/// PS-7 gaps 1-2 — `batch_size` makes `reflex_scheduled_reconcile` a resumable
+/// driver: a bounded call attempts at most `batch_size` IMVs, reports how many
+/// candidates it deferred via `remaining`, and a second call CONTINUES with the
+/// next IMV rather than restarting. Resumability falls out of the age gate —
+/// clock_timestamp() advances the reconciled IMV past the threshold, so it drops
+/// out of the candidate set on the next call.
+#[pg_test]
+fn pg_scheduled_reconcile_batch_size_is_resumable() {
+    Spi::run("CREATE TABLE ps7_rz_src (id SERIAL, grp TEXT, val NUMERIC)").expect("create table");
+    Spi::run("INSERT INTO ps7_rz_src (grp, val) VALUES ('a', 1), ('b', 2)").expect("seed");
+
+    crate::create_reflex_ivm(
+        "ps7_rz_a",
+        "SELECT grp, SUM(val) AS total FROM ps7_rz_src GROUP BY grp",
+        None, None, None, None,
+    );
+    crate::create_reflex_ivm(
+        "ps7_rz_b",
+        "SELECT grp, COUNT(*) AS cnt FROM ps7_rz_src GROUP BY grp",
+        None, None, None, None,
+    );
+
+    Spi::run(
+        "UPDATE public.__reflex_ivm_reference \
+            SET last_update_date = TIMESTAMP '2001-01-01 00:00:00' \
+          WHERE name LIKE 'ps7_rz_%'",
+    )
+    .expect("backdate");
+
+    // First bounded call: attempt exactly one, defer the other.
+    Spi::run(
+        "CREATE TEMP TABLE ps7_rz_call1 AS \
+           SELECT * FROM reflex_scheduled_reconcile(0, 1)",
+    )
+    .expect("call1");
+
+    let attempted1: i64 = Spi::get_one(
+        "SELECT COUNT(*)::BIGINT FROM ps7_rz_call1 WHERE name LIKE 'ps7_rz_%'",
+    )
+    .expect("q")
+    .expect("v");
+    assert_eq!(attempted1, 1, "batch_size=1 attempts exactly one IMV");
+
+    let remaining1: i64 =
+        Spi::get_one("SELECT MAX(remaining) FROM ps7_rz_call1").expect("q").expect("v");
+    assert_eq!(remaining1, 1, "one candidate must be reported as deferred to a future call");
+
+    let first_name: String =
+        Spi::get_one("SELECT name FROM ps7_rz_call1 WHERE name LIKE 'ps7_rz_%'")
+            .expect("q")
+            .expect("v");
+    assert_eq!(first_name, "ps7_rz_a", "candidates are ordered graph_depth, name");
+
+    // Second call continues — the reconciled first IMV is now fresh and drops out.
+    Spi::run(
+        "CREATE TEMP TABLE ps7_rz_call2 AS \
+           SELECT * FROM reflex_scheduled_reconcile(0, 1)",
+    )
+    .expect("call2");
+
+    let second_name: String =
+        Spi::get_one("SELECT name FROM ps7_rz_call2 WHERE name LIKE 'ps7_rz_%'")
+            .expect("q")
+            .expect("v");
+    assert_eq!(
+        second_name, "ps7_rz_b",
+        "second call must continue with the next IMV, not restart on the first"
+    );
+
+    let remaining2: i64 =
+        Spi::get_one("SELECT MAX(remaining) FROM ps7_rz_call2").expect("q").expect("v");
+    assert_eq!(remaining2, 0, "sweep complete after the second call");
+}
+
+/// PS-7 gap 3 — `target_schema` scopes the scan to one tenant. An IMV in another
+/// schema must be untouched (its `last_update_date` unchanged), so single-tenant
+/// recovery does not pay for all 415 schemas.
+#[pg_test]
+fn pg_scheduled_reconcile_target_schema_isolates_tenants() {
+    Spi::run("CREATE SCHEMA ps7_sa").expect("schema a");
+    Spi::run("CREATE SCHEMA ps7_sb").expect("schema b");
+    Spi::run("CREATE TABLE ps7_sa.src (id SERIAL, grp TEXT, val NUMERIC)").expect("src a");
+    Spi::run("CREATE TABLE ps7_sb.src (id SERIAL, grp TEXT, val NUMERIC)").expect("src b");
+    Spi::run("INSERT INTO ps7_sa.src (grp, val) VALUES ('a', 1)").expect("seed a");
+    Spi::run("INSERT INTO ps7_sb.src (grp, val) VALUES ('a', 1)").expect("seed b");
+
+    crate::create_reflex_ivm(
+        "ps7_sa.v",
+        "SELECT grp, SUM(val) AS total FROM ps7_sa.src GROUP BY grp",
+        None, None, None, None,
+    );
+    crate::create_reflex_ivm(
+        "ps7_sb.v",
+        "SELECT grp, SUM(val) AS total FROM ps7_sb.src GROUP BY grp",
+        None, None, None, None,
+    );
+
+    Spi::run(
+        "UPDATE public.__reflex_ivm_reference \
+            SET last_update_date = TIMESTAMP '2001-01-01 00:00:00' \
+          WHERE target_schema IN ('ps7_sa', 'ps7_sb')",
+    )
+    .expect("backdate");
+
+    // Reconcile only schema a.
+    let attempted: i64 = Spi::get_one(
+        "SELECT COUNT(*)::BIGINT FROM reflex_scheduled_reconcile(0, 0, 'ps7_sa') \
+          WHERE status = 'RECONCILED'",
+    )
+    .expect("q")
+    .expect("v");
+    assert_eq!(attempted, 1, "only schema a's IMV should be reconciled");
+
+    let a_fresh: i64 = Spi::get_one(
+        "SELECT COUNT(*)::BIGINT FROM public.__reflex_ivm_reference \
+          WHERE target_schema = 'ps7_sa' \
+            AND last_update_date > TIMESTAMP '2001-01-01 00:00:00'",
+    )
+    .expect("q")
+    .expect("v");
+    assert_eq!(a_fresh, 1, "schema a IMV must be reconciled (timestamp advanced)");
+
+    let b_untouched: i64 = Spi::get_one(
+        "SELECT COUNT(*)::BIGINT FROM public.__reflex_ivm_reference \
+          WHERE target_schema = 'ps7_sb' \
+            AND last_update_date = TIMESTAMP '2001-01-01 00:00:00'",
+    )
+    .expect("q")
+    .expect("v");
+    assert_eq!(
+        b_untouched, 1,
+        "schema b IMV must be untouched by a schema-a-scoped scan"
+    );
+}
+
+/// PS-7 gap 1 — durability boundary the batched-driver model provides IN-PROCESS:
+/// a per-IMV SOFT failure does not halt the batch or discard the siblings'
+/// rebuilds, and the failing candidate is reported HONESTLY (PS-1 error
+/// propagation is not swallowed). Cross-call COMMIT durability (a bounded batch
+/// that finishes under statement_timeout persists across pg_cron ticks) is a
+/// deployment property of "each call is its own transaction" and cannot be
+/// exercised by the transaction-wrapped test harness.
+///
+/// The failure is injected as a registry row whose name `validate_view_name`
+/// rejects — the only in-transaction soft-error injection that does not abort the
+/// whole transaction (a broken real IMV hard-errors via unwrap_or_report). It
+/// exercises the same driver loop that real soft failures (partition-swap Err,
+/// PS-1 generated-child failure) travel through. The bad name sorts FIRST
+/// (ASCII '-' < '_'), so the two real IMVs are reconciled AFTER the failure.
+#[pg_test]
+fn pg_scheduled_reconcile_soft_failure_does_not_stop_the_batch() {
+    Spi::run("CREATE TABLE ps7_du_src (id SERIAL, grp TEXT, val NUMERIC)").expect("create table");
+    Spi::run("INSERT INTO ps7_du_src (grp, val) VALUES ('a', 1), ('b', 2)").expect("seed");
+
+    crate::create_reflex_ivm(
+        "ps7_du_a",
+        "SELECT grp, SUM(val) AS total FROM ps7_du_src GROUP BY grp",
+        None, None, None, None,
+    );
+    crate::create_reflex_ivm(
+        "ps7_du_b",
+        "SELECT grp, COUNT(*) AS cnt FROM ps7_du_src GROUP BY grp",
+        None, None, None, None,
+    );
+
+    // Inject a candidate whose name validate_view_name rejects (contains '-').
+    Spi::run(
+        "INSERT INTO public.__reflex_ivm_reference (name, graph_depth, last_update_date) \
+         VALUES ('ps7-du-bad', 1, TIMESTAMP '2001-01-01 00:00:00')",
+    )
+    .expect("inject bad candidate");
+
+    Spi::run(
+        "UPDATE public.__reflex_ivm_reference \
+            SET last_update_date = TIMESTAMP '2001-01-01 00:00:00' \
+          WHERE name IN ('ps7_du_a', 'ps7_du_b')",
+    )
+    .expect("backdate");
+
+    Spi::run(
+        "CREATE TEMP TABLE ps7_du_call AS SELECT * FROM reflex_scheduled_reconcile(0)",
+    )
+    .expect("call");
+
+    let bad_reported: i64 = Spi::get_one(
+        "SELECT COUNT(*)::BIGINT FROM ps7_du_call \
+          WHERE name = 'ps7-du-bad' AND status LIKE 'ERROR%'",
+    )
+    .expect("q")
+    .expect("v");
+    assert_eq!(bad_reported, 1, "the failing candidate must be reported with its ERROR status");
+
+    let siblings_ok: i64 = Spi::get_one(
+        "SELECT COUNT(*)::BIGINT FROM ps7_du_call \
+          WHERE name IN ('ps7_du_a', 'ps7_du_b') AND status = 'RECONCILED'",
+    )
+    .expect("q")
+    .expect("v");
+    assert_eq!(
+        siblings_ok, 2,
+        "both real IMVs must reconcile despite the earlier soft failure in the batch"
+    );
+
+    let siblings_fresh: i64 = Spi::get_one(
+        "SELECT COUNT(*)::BIGINT FROM public.__reflex_ivm_reference \
+          WHERE name IN ('ps7_du_a', 'ps7_du_b') \
+            AND last_update_date > TIMESTAMP '2001-01-01 00:00:00'",
+    )
+    .expect("q")
+    .expect("v");
+    assert_eq!(siblings_fresh, 2, "siblings' rebuilds must survive the failure (timestamps advanced)");
+}
+
+/// PS-7 regression — default-arg pg_cron usage is behaviour-preserving:
+/// `reflex_scheduled_reconcile(max_age)` alone (batch_size defaults to 0 =
+/// unlimited, target_schema defaults to '' = all schemas) still reconciles every
+/// stale IMV in ONE call and reports `remaining = 0`, so existing monitoring that
+/// reads a single successful call as "sweep complete" stays correct.
+#[pg_test]
+fn pg_scheduled_reconcile_default_args_are_behaviour_preserving() {
+    Spi::run("CREATE TABLE ps7_dflt_src (id SERIAL, grp TEXT, val NUMERIC)").expect("create table");
+    Spi::run("INSERT INTO ps7_dflt_src (grp, val) VALUES ('a', 1), ('b', 2)").expect("seed");
+
+    crate::create_reflex_ivm(
+        "ps7_dflt_a",
+        "SELECT grp, SUM(val) AS total FROM ps7_dflt_src GROUP BY grp",
+        None, None, None, None,
+    );
+    crate::create_reflex_ivm(
+        "ps7_dflt_b",
+        "SELECT grp, COUNT(*) AS cnt FROM ps7_dflt_src GROUP BY grp",
+        None, None, None, None,
+    );
+
+    Spi::run(
+        "UPDATE public.__reflex_ivm_reference \
+            SET last_update_date = TIMESTAMP '2001-01-01 00:00:00' \
+          WHERE name LIKE 'ps7_dflt_%'",
+    )
+    .expect("backdate");
+
+    Spi::run(
+        "CREATE TEMP TABLE ps7_dflt_call AS SELECT * FROM reflex_scheduled_reconcile(0)",
+    )
+    .expect("call");
+
+    let reconciled: i64 = Spi::get_one(
+        "SELECT COUNT(*)::BIGINT FROM ps7_dflt_call \
+          WHERE name LIKE 'ps7_dflt_%' AND status = 'RECONCILED'",
+    )
+    .expect("q")
+    .expect("v");
+    assert_eq!(reconciled, 2, "default args must reconcile all stale IMVs in one call");
+
+    let remaining: i64 =
+        Spi::get_one("SELECT MAX(remaining) FROM ps7_dflt_call").expect("q").expect("v");
+    assert_eq!(remaining, 0, "unlimited default batch reports 0 remaining = sweep complete");
+}
+
 /// F5 diagnosis: reflex_rebuild_imv on a partitioned IMV whose authoritative
 /// source is in ignore_sources. This tests whether the partition stays empty
 /// (F6 interaction) or fills (unexpected skip-existing-children bug).
