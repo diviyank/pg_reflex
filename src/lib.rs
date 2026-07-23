@@ -34,6 +34,7 @@ mod audit;
 mod create_ivm;
 mod doctor;
 mod drop_ivm;
+mod graph_repair;
 mod introspect;
 mod partition;
 mod query_decomposer;
@@ -197,6 +198,17 @@ extension_sql!(
     -- create time to enable transparent rebuild from stored specs.
     ALTER TABLE public.__reflex_ivm_reference
         ADD COLUMN IF NOT EXISTS create_args TEXT;
+
+    -- 1.11.0 (PS-1): TRUE when pg_reflex itself created this node while
+    -- decomposing a single user create_reflex_ivm call — a CTE sub-IMV
+    -- (`__cte_<alias>`), a set-op operand (`__union_<i>`), or a DISTINCT-ON /
+    -- window base (`__base`). reflex_reconcile recurses into these and only
+    -- these: a user-declared IMV dependency is someone else's object and
+    -- reconciling it is not this call's business. Recorded explicitly rather
+    -- than inferred from the name prefix, which a user IMV literally named
+    -- `foo__cte_bar` would defeat.
+    ALTER TABLE public.__reflex_ivm_reference
+        ADD COLUMN IF NOT EXISTS is_generated_sub_imv BOOLEAN NOT NULL DEFAULT FALSE;
 
     -- Multi-level partition capture (plans/sub_partitioning.md). Snapshot of
     -- each tracked source root's recursive LEAF set, keyed by (root, child).

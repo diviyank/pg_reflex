@@ -1,0 +1,85 @@
+-- Migration: pg_reflex 1.10.11 → 1.11.0
+--
+-- Run via: ALTER EXTENSION pg_reflex UPDATE TO '1.11.0';
+--
+-- Replace the module (.so) BEFORE running this.
+--
+-- Sections below are per-fix and independent. Keep them separate.
+
+
+-- === PS-1: decomposed-chain correctness (N1 + B1) =========================
+--
+-- A CTE-decomposed IMV's registry row never recorded the edge to the sub-IMV
+-- pg_reflex generated for it. `resolve_existing_imv_deps` matched `depends_on`
+-- against the registry `name` by exact string equality, but the decomposer
+-- persists a sub-IMV source double-quoted ("schema"."view__cte_x") to preserve
+-- identifier case. The match never fired, so for every decomposed IMV:
+--
+--   * `depends_on_imv` was empty and the generated child's `graph_child` was
+--     empty, so reflex_rebuild_chain(<generated child>) saw no dependents — it
+--     dropped the child's table, taking the parent's triggers with it, and
+--     recreated only the child, silently ending the parent's maintenance.
+--   * `graph_depth` was collapsed (a CTE parent got 1 instead of 2), so
+--     ORDER BY graph_depth no longer ordered children before parents in
+--     reflex_scheduled_reconcile, refresh_imv_depending_on and reflex_doctor.
+--   * reflex_reconcile / reflex_rebuild_imv / refresh_reflex_imv on the parent
+--     re-aggregated a stale child snapshot and returned RECONCILED. On a chain
+--     whose generated child reads a MATERIALIZED VIEW — which cannot carry
+--     triggers, so the child is frozen at create time — that meant every
+--     operator-facing recovery primitive silently served stale data.
+--
+-- 1.11.0 canonicalises the dependency probe, records the generated node
+-- explicitly, and makes reflex_reconcile rebuild a decomposed IMV's generated
+-- sub-IMVs bottom-up (with their triggers suppressed, so nothing double-counts)
+-- before rebuilding the IMV itself. A user-declared IMV dependency keeps the
+-- old non-recursive behaviour.
+--
+-- Two operator-visible behaviour changes:
+--
+--   * reflex_rebuild_chain(<generated sub-IMV>) now REFUSES without
+--     cascade => TRUE, because the parent is finally a registered dependent.
+--     That replaces silently ending the parent's maintenance.
+--   * graph_depth changes value for every decomposed IMV — up for CTE parents
+--     (collapsed -> real), down for set-op wrappers (which used operand count
+--     plus one). Every consumer orders by it ascending and every one of them
+--     wants the corrected order.
+
+ALTER TABLE public.__reflex_ivm_reference
+    ADD COLUMN IF NOT EXISTS is_generated_sub_imv BOOLEAN NOT NULL DEFAULT FALSE;
+
+-- ALTER EXTENSION UPDATE runs only this delta script, not the full generated
+-- schema, so a new function must be declared here or the upgrade leaves it
+-- uninstalled.
+CREATE OR REPLACE FUNCTION "reflex_repair_dependency_graph"() RETURNS TEXT /* String */
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'reflex_repair_dependency_graph_wrapper';
+
+-- Backfill existing rows. Everything is derived from `depends_on`, the one
+-- registry column no bug has corrupted.
+--
+-- `depends_on_imv` and `graph_child` are repaired ADDITIVELY: an edge is only
+-- ever added, never removed. Removal is the only operation that could make the
+-- graph worse than it already is, and every spurious extra edge fails in the
+-- safe direction (reflex_rebuild_chain refuses rather than destroying a
+-- dependent; drop_reflex_ivm cascades wider on an object the user asked to
+-- drop).
+--
+-- `is_generated_sub_imv` is backfilled from the `__cte_` / `__union_<n>` /
+-- `__base` name suffix AND the requirement that some other registry row depends
+-- on the name. The suffix is a heuristic, acceptable here because this is a
+-- one-shot repair of rows created before the flag existed and no better evidence
+-- survives; the runtime reconcile decision reads the column instead. A false
+-- positive needs a user to have named an IMV `foo__cte_bar` and to have `foo`
+-- read from it, and costs only extra work on reconcile, never wrong data.
+--
+-- `graph_depth` is recomputed to a fixpoint of
+-- depth(v) = max(depth(d) for d in depends_on_imv(v)) + 1, the same expression
+-- create-time now uses, so a row's depth means the same thing regardless of age.
+--
+-- Re-runnable and idempotent: SELECT public.reflex_repair_dependency_graph();
+SELECT public.reflex_repair_dependency_graph();
+
+DO $migrate$ BEGIN
+    RAISE NOTICE 'pg_reflex 1.11.0 (PS-1): decomposed-chain dependency graph repaired. reflex_rebuild_imv on a decomposed IMV now reconciles its generated sub-IMVs first; reflex_rebuild_chain on a generated sub-IMV now refuses without cascade => TRUE. Re-run reflex_doctor().';
+END $migrate$;
