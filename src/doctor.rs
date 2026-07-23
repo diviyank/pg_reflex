@@ -275,23 +275,44 @@ fn apply_reconcile_repair(imv_name: &str) -> String {
     }
 }
 
-/// Apply a sync partitions repair in a subtransaction
-fn apply_sync_partitions_repair(imv_name: &str, drop_orphans: bool) -> String {
-    // Build the repair SQL with proper escaping
-    let repair_sql = format!(
-        "SELECT public.reflex_sync_partitions('{}', {})",
-        imv_name.replace("'", "''"),
-        drop_orphans
-    );
-    // Call the helper function, which executes the repair and returns 'fixed' or 'failed:...'
-    let helper_call = format!(
-        "SELECT public.__reflex_doctor_try_repair('{}')",
-        repair_sql.replace("'", "''")
-    );
-    match Spi::get_one::<String>(&helper_call) {
-        Ok(Some(outcome)) => outcome,
-        Ok(None) => "failed:no result".to_string(),
-        Err(e) => format!("failed:{}", e),
+/// F3's authorized repair: drop the colliding orphan partitions, then refill.
+///
+/// `reflex_sync_partitions(imv, true)` removes IMV-side children that map to no
+/// live source partition, NOTICEing each one — which is how the operator learns
+/// what blocked the swap. `reflex_reconcile` then refills and is the only path
+/// that clears `known_stale`. Sync alone reported success over an IMV the health
+/// surface still called broken, so the same finding came back on every run.
+fn apply_f3_repair(imv_name: &str) -> String {
+    let escaped = imv_name.replace("'", "''");
+    let sync_outcome = apply_doctor_repair(&format!(
+        "SELECT public.reflex_sync_partitions('{}', true)",
+        escaped
+    ));
+    if sync_outcome != "fixed" {
+        return sync_outcome;
+    }
+    apply_doctor_repair(&format!("SELECT public.reflex_reconcile('{}')", escaped))
+}
+
+/// A repair is only `fixed` when the registry agrees it is.
+///
+/// `reflex_sync_partitions` never clears `known_stale` and `reflex_reconcile` can
+/// fail softly, so an unverified outcome lets the doctor claim it fixed something
+/// while its own health surface still reports the IMV as stale.
+fn verify_stale_cleared(imv_name: &str, outcome: String) -> String {
+    if outcome != "fixed" {
+        return outcome;
+    }
+    let still_stale = Spi::get_one::<bool>(&format!(
+        "SELECT COALESCE(known_stale, FALSE) FROM public.__reflex_ivm_reference WHERE name = '{}'",
+        imv_name.replace("'", "''")
+    ))
+    .unwrap_or(None)
+    .unwrap_or(false);
+    if still_stale {
+        "failed:known_stale still set after repair".to_string()
+    } else {
+        outcome
     }
 }
 
@@ -387,13 +408,13 @@ fn detect_known_stale_imvs(
             }
             "F3" => {
                 let sync_action = format!(
-                    "SELECT reflex_sync_partitions('{}', true);",
+                    "SELECT reflex_sync_partitions('{0}', true); SELECT reflex_reconcile('{0}');",
                     imv_name.replace("'", "''")
                 );
                 if drop_orphans {
                     // drop_orphans is enabled, so we can attempt the repair
                     let outcome_val = if fix {
-                        apply_sync_partitions_repair(&imv_name, true)
+                        verify_stale_cleared(&imv_name, apply_f3_repair(&imv_name))
                     } else {
                         "reported".to_string() // dry run
                     };
@@ -411,7 +432,7 @@ fn detect_known_stale_imvs(
                         imv_name.replace("'", "''")
                     ),
                     if fix {
-                        apply_reconcile_repair(&imv_name)
+                        verify_stale_cleared(&imv_name, apply_reconcile_repair(&imv_name))
                     } else {
                         "reported".to_string()
                     },

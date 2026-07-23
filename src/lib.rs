@@ -287,13 +287,22 @@ extension_sql!(
     $REFLEX$;
 
     -- Helper for reflex_doctor repairs: execute SQL in a subtransaction and return outcome.
-    -- On success: returns 'fixed'. On exception: returns 'failed:' || error message.
+    -- Returns 'fixed' only when the statement neither raised nor RETURNED an
+    -- 'ERROR: …' string. reflex_reconcile, reflex_sync_partitions and
+    -- drop_reflex_ivm all signal some failures by returning that text rather than
+    -- raising, so discarding the result reported those repairs as successful —
+    -- the outcome an operator can least afford to be lied to about.
     -- The EXCEPTION block acts as a savepoint: failing repairs rollback only themselves,
     -- not the outer reflex_doctor transaction, ensuring isolation.
     CREATE OR REPLACE FUNCTION public.__reflex_doctor_try_repair(_sql TEXT)
     RETURNS TEXT LANGUAGE plpgsql AS $fn$
+    DECLARE
+        _res TEXT;
     BEGIN
-        EXECUTE _sql;
+        EXECUTE _sql INTO _res;
+        IF _res IS NOT NULL AND upper(_res) LIKE 'ERROR%' THEN
+            RETURN 'failed:' || left(_res, 400);
+        END IF;
         RETURN 'fixed';
     EXCEPTION WHEN OTHERS THEN
         RETURN 'failed:' || left(SQLERRM, 400);
