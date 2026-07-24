@@ -1539,6 +1539,7 @@ mod tests {
     include!("tests/pg_test_ps3.rs");
     include!("tests/pg_test_ps9.rs");
     include!("tests/pg_test_ps10.rs");
+    include!("tests/pg_test_psca_skip_signal.rs");
 }
 
 /// This module is required by `cargo pgrx test` invocations.
