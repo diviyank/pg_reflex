@@ -5,9 +5,25 @@
 ## [1.11.1] - 2026-07-24
 
 Audit truthfulness, two silent-wrong-result fixes in nullable-key MIN/MAX
-maintenance, wrapper-reconcile safety, plus a recovery path for a dropped internal
-table. Module-only — replace the `.so`, then
-`ALTER EXTENSION pg_reflex UPDATE TO '1.11.1';`. No DDL, no reconcile needed.
+maintenance, wrapper-reconcile safety, targeted-recovery observability, plus a
+recovery path for a dropped internal table. Replace the `.so`, then
+`ALTER EXTENSION pg_reflex UPDATE TO '1.11.1';`. The update adds two registry
+columns (fast-default `ADD COLUMN`, no table rewrite) and one corrective metadata
+backfill; no reconcile is needed.
+
+**Added**
+
+- `reflex_rebuild_imv` / directly-targeted `reflex_reconcile` retries are now
+  observable: `__reflex_ivm_reference` gains `rebuild_count` and `last_rebuild_at`,
+  surfaced by `reflex_ivm_status` (an **additive** change — two columns appended to
+  its result; `SELECT *`-into-fixed-rowtype callers should name columns). The counter
+  increments only on direct operator recovery — not trigger-fired maintenance, the
+  scheduled sweep, or the recursive cascade — and also on `reflex_doctor(fix => true)`
+  recoveries. When a rebuild targets an IMV it cannot converge (a matview source, or
+  an `ignore_sources`-fed / anchor-empty partition), it now WARNs and names the
+  primitive that can (`refresh_imv_depending_on` / `reflex_reconcile_partition`)
+  instead of returning a bare success — so a non-converging retry loop is visible
+  in-database rather than only in `pg_stat_statements`.
 
 **Fixed**
 
@@ -86,6 +102,13 @@ table. Module-only — replace the `.so`, then
   reported when the intermediate parent is absent — previously an early return
   suppressed it. A genuinely missing intermediate parent stays reported by
   `internal-tables-exist`, which already covers relation absence at Error severity.
+
+- (metadata backfill) The 1.11.0 `requires_explicit_refresh` backfill matched
+  `ignore_sources` by exact string only, so an IMV that ignored a real table by *bare*
+  name while `depends_on` stored it *qualified* was under-flagged and stayed invisible
+  to the matview-source checks. The 1.11.1 migration re-backfills with a bare-or-
+  qualified match mirroring create-time; it only ever flips the flag on, never off, so
+  it cannot suppress a maintainable IMV.
 
 **Known limitations**
 

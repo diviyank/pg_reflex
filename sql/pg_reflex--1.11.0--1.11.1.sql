@@ -4,8 +4,10 @@
 --
 -- Replace the module (.so) BEFORE running this.
 --
--- Seven fixes, all delivered entirely in the module — no SQL signatures, tables, or
--- triggers change, so this delta carries no DDL:
+-- Eight fixes. Seven are delivered entirely in the module; the eighth
+-- (targeted-recovery observability) adds two nullable/defaulted columns to the
+-- registry, so this delta carries DDL at the end (a fast-default ADD COLUMN, no
+-- table rewrite) plus one corrective metadata backfill.
 --
 --   * (SILENT WRONG RESULT) A MIN/MAX aggregate IMV over a nullable group key returned
 --     a stale extremum forever after a retraction: the recompute scoped its rescan
@@ -47,6 +49,16 @@
 --     clearing the finding. If you ran it, drop any
 --     `__reflex_trigger_{ins,del,upd,trunc}_on_<sub-imv>` triggers it left behind.
 --
+--   * (DDL) `reflex_rebuild_imv` / targeted `reflex_reconcile` retries are now
+--     observable: `__reflex_ivm_reference` gains `rebuild_count` and
+--     `last_rebuild_at`, incremented only by direct operator recovery (not by
+--     trigger-fired maintenance or the scheduled sweep), and surfaced by
+--     `reflex_ivm_status`. When a rebuild targets an IMV it cannot converge (a
+--     matview source, or an `ignore_sources`-fed / anchor-empty partition) it now
+--     WARNs, naming the primitive that can (`refresh_imv_depending_on` /
+--     `reflex_reconcile_partition`), instead of returning a bare success. The
+--     counter also increments on `reflex_doctor(fix => true)` recoveries.
+--
 --   * The `partition-mirror` audit check (surfaced by reflex_doctor as F3) no
 --     longer reports phantom intermediate-partition drift on passthrough IMVs.
 --     A passthrough IMV owns no `__reflex_intermediate_<view>` table at all, so
@@ -69,3 +81,43 @@
 -- Existing F3 `partition-mirror` findings on passthrough IMVs disappear from the
 -- next `reflex_doctor()` / `reflex_audit()` run; nothing needs to be reconciled
 -- to clear them, because nothing was ever wrong with those IMVs.
+
+-- --------------------------------------------------------------------------
+-- DDL: targeted-recovery observability columns. Identical to the bootstrap DDL
+-- in src/lib.rs (fresh installs get these from the bootstrap; upgrades from here).
+-- `NOT NULL DEFAULT 0` is a PG11+ fast default — metadata-only, no table rewrite.
+-- --------------------------------------------------------------------------
+ALTER TABLE public.__reflex_ivm_reference
+    ADD COLUMN IF NOT EXISTS rebuild_count BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE public.__reflex_ivm_reference
+    ADD COLUMN IF NOT EXISTS last_rebuild_at TIMESTAMPTZ;
+
+-- --------------------------------------------------------------------------
+-- Corrective backfill (PS-14 Part B): the 1.10.11→1.11.0 PS-3 backfill matched
+-- ignored sources by exact string only, so an IMV that ignores a real table by
+-- BARE name while `depends_on` stores it QUALIFIED was under-flagged and stayed
+-- invisible. Widen to bare-OR-qualified, mirroring create-time
+-- (all_real_sources_are_matviews). Only ever flips FALSE→TRUE — it excludes no
+-- more sources than create-time, so it cannot over-flag a maintainable IMV.
+-- --------------------------------------------------------------------------
+WITH real_source AS (
+    SELECT r.name, s AS src
+      FROM public.__reflex_ivm_reference r,
+           LATERAL unnest(COALESCE(r.depends_on, ARRAY[]::TEXT[])) AS s
+     WHERE s NOT LIKE '<%'
+       AND NOT (s = ANY(COALESCE(r.ignored_sources, ARRAY[]::TEXT[]))
+                OR split_part(s, '.', 2) = ANY(COALESCE(r.ignored_sources, ARRAY[]::TEXT[])))
+),
+verdict AS (
+    SELECT name,
+           bool_and(EXISTS (SELECT 1 FROM pg_class c
+                             WHERE c.oid = to_regclass(src) AND c.relkind = 'm')) AS all_matviews
+      FROM real_source
+     GROUP BY name
+)
+UPDATE public.__reflex_ivm_reference r
+   SET requires_explicit_refresh = TRUE
+  FROM verdict v
+ WHERE r.name = v.name
+   AND v.all_matviews
+   AND COALESCE(r.requires_explicit_refresh, FALSE) = FALSE;

@@ -820,6 +820,85 @@ fn inside_trigger() -> bool {
         > 0
 }
 
+/// Record a targeted-recovery call and, when the target cannot be converged by an
+/// anchor-scoped rebuild, WARN loudly with the primitive that can (PS-14).
+///
+/// Called only from the SQL entry-point wrappers `reflex_rebuild_imv`,
+/// `reflex_reconcile`, and the two-arg `reflex_reconcile` overload — the calls an
+/// operator (or a retry loop) makes directly on one IMV. It is NOT called from the
+/// internal recursive/cascade descent (`reconcile_one` /
+/// `reconcile_generated_child_without_propagating`), so a decomposed chain rebuild
+/// bumps only the named node's counter, not each generated child's.
+///
+/// `inside_trigger()` gates both effects: the runtime fires
+/// `PERFORM public.reflex_reconcile(...)` from its own generated trigger bodies
+/// and partition-flush plpgsql, which reach this same entry point; those are
+/// maintenance, not targeted recovery, and must neither inflate the retry counter
+/// nor emit an operator advisory.
+pub(crate) fn stamp_targeted_recovery(view_name: &str) {
+    if inside_trigger() {
+        return;
+    }
+    Spi::connect_mut(|client| {
+        let _ = crate::sql_writer::registry::bump_rebuild_count(client, view_name);
+    });
+    if let Some(advisory) = rebuild_convergence_advisory(view_name) {
+        warning!("{}", advisory);
+    }
+}
+
+/// Returns an actionable advisory when an anchor-scoped rebuild
+/// (`reflex_rebuild_imv` / `reflex_reconcile`) structurally cannot converge this
+/// IMV, else `None`. Pure classifier over the registry — the testable seam behind
+/// the WARN in [`stamp_targeted_recovery`].
+///
+/// Reuses PS-3's stored `requires_explicit_refresh` verdict and the existing
+/// `ignored_sources` / `partition_strategy` metadata rather than re-deriving
+/// matview-ness. Two non-convergence shapes:
+///   * `requires_explicit_refresh` — every real source is a materialized view, so
+///     the node never self-maintains; a manual rebuild does re-derive it, but the
+///     canonical recovery after `REFRESH MATERIALIZED VIEW` is
+///     `refresh_imv_depending_on('<mv>')`.
+///   * partitioned + `ignore_sources` — the archive-residue shape: an anchor-empty
+///     partition whose rows arrive only via an authoritative ignored source is
+///     never refilled by the anchor-scoped re-derivation, so repeated rebuilds do
+///     not converge. The primitives that do are `reflex_reconcile_partition` (one
+///     partition) or a `reflex_rebuild_chain` full recreate.
+///
+/// Deliberately conservative — a WARN, never a refusal: a matview-source IMV whose
+/// stale data reached an anchor-non-empty partition DOES converge under a plain
+/// rebuild, and turning a working recovery into an error would be worse than the
+/// advisory. A partitioned IMV WITHOUT ignored sources refills every partition from
+/// its anchor and is not flagged.
+pub(crate) fn rebuild_convergence_advisory(view_name: &str) -> Option<String> {
+    let risk =
+        Spi::connect(|client| crate::sql_writer::registry::read_rebuild_risk(client, view_name))?;
+
+    if risk.has_ignored_sources && risk.is_partitioned {
+        return Some(format!(
+            "pg_reflex: reflex_rebuild_imv/reflex_reconcile re-derives '{v}' only from its \
+             anchor source(s); it CANNOT refill a partition whose rows arrive solely via an \
+             ignore_sources / authoritative table (archive-residue, anchor-empty partitions \
+             stay stale — repeated calls will NOT converge). To force-fill such a partition \
+             use reflex_reconcile_partition('{v}', '<partition_keys>'), or fully recreate the \
+             chain with reflex_rebuild_chain('{v}'). See docs/untreated.md § F6.",
+            v = view_name
+        ));
+    }
+
+    if risk.requires_explicit_refresh {
+        return Some(format!(
+            "pg_reflex: '{v}' is fed only by materialized view source(s); it does not \
+             self-maintain (PostgreSQL fires no trigger on a matview). A rebuild re-derives it, \
+             but the canonical recovery after REFRESH MATERIALIZED VIEW is \
+             refresh_imv_depending_on('<matview>'), which cascades the whole chain.",
+            v = view_name
+        ));
+    }
+
+    None
+}
+
 /// SQL predicate identifying a node the recursion must NOT hand to
 /// `reconcile_one`.
 ///

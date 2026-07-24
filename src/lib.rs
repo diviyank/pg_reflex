@@ -201,6 +201,18 @@ extension_sql!(
     ALTER TABLE public.__reflex_ivm_reference
         ADD COLUMN IF NOT EXISTS requires_explicit_refresh BOOLEAN NOT NULL DEFAULT FALSE;
 
+    -- 1.11.1 (PS-14): repeat-call visibility for targeted recovery. Bumped ONLY
+    -- by the targeted-recovery entry points (reflex_rebuild_imv / reflex_reconcile
+    -- invoked directly on one IMV, outside a trigger) — never by the internal
+    -- recursive/cascade reconcile_one descent, or the count would be meaningless.
+    -- A non-converging retry loop (field: 1020 reflex_rebuild_imv calls in 3.5 h
+    -- on a partitioned ignore_sources IMV) becomes observable in-database via
+    -- reflex_ivm_status instead of only in pg_stat_statements.
+    ALTER TABLE public.__reflex_ivm_reference
+        ADD COLUMN IF NOT EXISTS rebuild_count BIGINT NOT NULL DEFAULT 0;
+    ALTER TABLE public.__reflex_ivm_reference
+        ADD COLUMN IF NOT EXISTS last_rebuild_at TIMESTAMPTZ;
+
     -- 1.10.8: JSON object capturing creation-time arguments (unique_columns,
     -- storage_mode, refresh_mode, topk_k, ignore_sources, partition_by,
     -- explicit_unpartitioned) for faithful IMV chain reconstruction via
@@ -702,6 +714,7 @@ fn drop_reflex_ivm_cascade(view_name: &str, cascade: bool) -> &'static str {
 /// keeps that promise.
 #[pg_extern(name = "reflex_reconcile")]
 fn reflex_reconcile_scoped(view_name: &str, drop_orphans: bool) -> &'static str {
+    reconcile::stamp_targeted_recovery(view_name);
     reconcile::reflex_reconcile_with_orphans(view_name, drop_orphans)
 }
 
@@ -709,6 +722,7 @@ fn reflex_reconcile_scoped(view_name: &str, drop_orphans: bool) -> &'static str 
 /// Use this as a safety net (manually or via pg_cron) to fix drift.
 #[pg_extern]
 fn reflex_reconcile(view_name: &str) -> &'static str {
+    reconcile::stamp_targeted_recovery(view_name);
     reconcile::reflex_reconcile(view_name)
 }
 
@@ -821,6 +835,7 @@ fn refresh_imv_depending_on(source: &str) -> &'static str {
 /// full chain drop+recreate. See docs/untreated.md § F6 for details.
 #[pg_extern]
 fn reflex_rebuild_imv(view_name: &str) -> &'static str {
+    reconcile::stamp_targeted_recovery(view_name);
     reconcile::reflex_reconcile(view_name)
 }
 
@@ -1553,6 +1568,7 @@ mod tests {
     include!("tests/pg_test_ps10.rs");
     include!("tests/pg_test_ps12.rs");
     include!("tests/pg_test_psca_skip_signal.rs");
+    include!("tests/pg_test_ps14.rs");
 }
 
 /// This module is required by `cargo pgrx test` invocations.
