@@ -348,3 +348,36 @@ fn ps9_passthrough_partitioned_imv_in_custom_schema_under_narrow_search_path() {
          findings:\n{report}"
     );
 }
+
+/// (6) HARDENING — the fourth corner the three-way classification does not name:
+/// intermediate NOT expected but a relation with that name nevertheless PRESENT
+/// (e.g. residue of an earlier aggregate definition of the same IMV name). Gating
+/// only on presence would re-open the phantom by a second route: the parent has no
+/// children, so every anchor child is "missing" again, and the prescribed sync
+/// would happily materialise partition children on a table no maintenance path
+/// reads or writes. The intermediate half stays silent for a passthrough IMV
+/// regardless of presence; a stray relation is an orphan-family concern, not
+/// mirror drift, and must not be described as missing children.
+#[pg_test]
+fn ps9_stray_intermediate_on_passthrough_imv_is_not_reported_as_missing_children() {
+    ps9_make_passthrough_fixture("ps9_st_src", "ps9_st_view");
+
+    // A real, childless, partitioned relation occupying the intermediate name.
+    Spi::run(
+        "CREATE TABLE __reflex_intermediate_ps9_st_view \
+           (dem_plan_id BIGINT NOT NULL, product_id BIGINT, qty NUMERIC) \
+         PARTITION BY LIST (dem_plan_id)",
+    )
+    .expect("create stray intermediate");
+
+    let report = ps9_audit("ps9_st_view");
+    assert!(
+        !report.contains("Intermediate is missing child partitions"),
+        "a stray intermediate on a passthrough IMV must not be reported as missing \
+         child partitions — nothing reads or writes it:\n{report}"
+    );
+    assert!(
+        !report.contains("partition-mirror"),
+        "the target side is clean, so partition-mirror must stay silent:\n{report}"
+    );
+}

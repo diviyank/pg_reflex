@@ -219,10 +219,17 @@ impl Check for PartitionMirror {
             .map(|c| crate::partition::target_child_name(&imv.name, &c.bare_name))
             .collect();
 
-        // Absent and not expected (passthrough): no intermediate finding at all.
-        // The target-side comparison below still runs, so a clean target yields
-        // zero findings rather than an empty-bodied one.
-        let (missing_int, extra_int): (Vec<String>, Vec<String>) = if intermediate_present {
+        // Not expected (passthrough): no intermediate finding at all, whether or
+        // not a relation of that name happens to exist. Gating on presence alone
+        // would re-open the phantom by a second route — a stray childless
+        // intermediate left over from an earlier definition of the same IMV name
+        // makes every anchor child "missing" again, and the prescribed sync would
+        // materialise partition children on a table no maintenance path reads or
+        // writes. A stray relation is an orphan-family concern, not mirror drift.
+        //
+        // The target-side comparison still runs, so a clean target yields zero
+        // findings rather than an empty-bodied one.
+        let (missing_int, extra_int): (Vec<String>, Vec<String>) = if intermediate_expected {
             let int_children = crate::partition::list_partition_children(client, &int_parent);
             let int_have: HashSet<String> =
                 int_children.iter().map(|c| c.bare_name.clone()).collect();
