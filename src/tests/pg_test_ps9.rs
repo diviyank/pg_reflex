@@ -258,16 +258,19 @@ fn ps9_aggregate_imv_missing_intermediate_child_is_still_reported() {
     );
 }
 
-/// (3) An aggregate IMV whose intermediate PARENT is gone entirely. Mirror drift
-/// is not the right vocabulary for a relation that does not exist, and — verified
-/// by probe — no primitive in the extension recreates one: `reflex_reconcile` on a
-/// partitioned IMV takes the swap path and returns `ERROR: partition reconcile
-/// failed`, and `reflex_rebuild_imv` is a literal alias for it (`src/lib.rs:823`).
-/// So `partition-mirror` must NOT invent a remedy it cannot honour; absence stays
-/// the business of `internal-tables-exist`, which reports it as an Error — the
-/// division of labour `IntermediateShape` documents ("internal-tables-exist covers
-/// absence"). Asserting BOTH halves is what keeps this from being a silencing
-/// test: the misleading text must go AND the true Error must remain.
+/// (3) An aggregate IMV whose intermediate PARENT is gone entirely. Mirror drift is
+/// not the right vocabulary for a relation that does not exist, so `partition-mirror`
+/// stays silent and absence remains the business of `internal-tables-exist`, which
+/// reports it as an Error — the division of labour `IntermediateShape` documents
+/// ("internal-tables-exist covers absence"). Asserting BOTH halves is what keeps
+/// this from being a silencing test: the misleading text must go AND the true Error
+/// must remain.
+///
+/// PS-9 also had a second reason — no primitive recreated a dropped intermediate, so
+/// any remedy this check printed would have been unclearable. That is no longer true
+/// (1.11.1: `reflex_reconcile` heals it, and the Error's `reflex_rebuild_imv` remedy
+/// converges — `src/tests/pg_test_ps10.rs`), but the division of labour stands: two
+/// checks reporting one absence with the same remedy is duplication.
 #[pg_test]
 fn ps9_aggregate_imv_missing_intermediate_parent_is_left_to_internal_tables_exist() {
     ps9_make_aggregate_fixture("ps9_mp_src", "ps9_mp_view");

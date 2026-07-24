@@ -185,6 +185,45 @@ pub fn build_delta_scratch_table_ddl(
     )
 }
 
+/// Build the DDL for the persistent group-capture tables: `__reflex_affected_<view>`
+/// (always, when the plan groups) and `__reflex_shrunk_<view>` (only for top-K
+/// MIN/MAX plans, which scope a forced recompute to groups whose heap shrank).
+///
+/// Both are shaped by selecting the group columns out of the intermediate table, so
+/// the intermediate must already exist when these run. UNLOGGED for speed — they
+/// hold only in-flight group keys and are rebuilt by reconcile.
+///
+/// Shared by create (`materialize_aggregate`'s caller) and by reconcile's heal step,
+/// so the two cannot emit different shapes for the same IMV.
+pub fn build_group_capture_ddl(view_name: &str, plan: &AggregationPlan) -> Vec<String> {
+    if plan.group_by_columns.is_empty() && plan.distinct_columns.is_empty() {
+        return Vec::new();
+    }
+    let group_cols_csv = plan
+        .group_by_columns
+        .iter()
+        .chain(plan.distinct_columns.iter())
+        .map(|c| format!("\"{}\"", normalized_column_name(c)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let intermediate = intermediate_table_name(view_name);
+    let mut ddl = vec![format!(
+        "CREATE UNLOGGED TABLE IF NOT EXISTS {} AS SELECT {} FROM {} WHERE FALSE",
+        crate::query_decomposer::affected_groups_table_name(view_name),
+        group_cols_csv,
+        intermediate
+    )];
+    if plan.intermediate_columns.iter().any(|ic| ic.has_topk()) {
+        ddl.push(format!(
+            "CREATE UNLOGGED TABLE IF NOT EXISTS {} AS SELECT {} FROM {} WHERE FALSE",
+            crate::query_decomposer::shrunk_groups_table_name(view_name),
+            group_cols_csv,
+            intermediate
+        ));
+    }
+    ddl
+}
+
 /// Build the DDL for the target (materialized view result) table.
 ///
 /// When `logged` is true, creates a regular (WAL-logged) table for crash safety.

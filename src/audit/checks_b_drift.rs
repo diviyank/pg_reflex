@@ -196,9 +196,10 @@ impl Check for PartitionMirror {
         //     `unwrap_or(false)` claims an intermediate is expected — for a node
         //     that owns none. (Those rows carry `partition_columns: None`, so this
         //     check returns early above before reaching the predicate; the
-        //     disagreement is nonetheless real, and is what makes
-        //     `internal-tables-exist` false-positive on UNION-ALL wrappers — see
-        //     `untreated_bugs/2026-07-24_internal_tables_exist_union_wrapper_false_positive.md`.)
+        //     disagreement is nonetheless real, and it is what made
+        //     `internal-tables-exist` false-positive on every set-op / DISTINCT ON
+        //     / window wrapper until 1.11.1, which turned that disagreement into
+        //     the classifier: `ImvRow::is_decomposed_wrapper`.)
         // (3) For every row `persist_metadata` writes (`src/create_ivm/mod.rs:1572`)
         //     the two agree: `end_query` is `""` exactly when
         //     `plan.is_passthrough`. Note this is NOT the same predicate as
@@ -246,16 +247,16 @@ impl Check for PartitionMirror {
         //   the very check the field just caught false-positiving.
         // - Expectation alone: an aggregate IMV whose intermediate parent has been
         //   dropped would report all children missing with a sync remedy that
-        //   skips the absent parent. NOTHING in the extension recreates a dropped
-        //   intermediate — `reflex_reconcile` on a partitioned IMV takes the swap
-        //   path, which needs an existing parent to ATTACH to, and
-        //   `reflex_rebuild_imv` is a literal alias for it (`src/lib.rs:823`); both
-        //   return `ERROR: partition reconcile failed`. So there is no truthful
-        //   remedy this check could print. Absence is deliberately left to
-        //   `internal-tables-exist`, which already reports it as an Error — the
-        //   same division of labour `IntermediateShape` documents above
-        //   ("internal-tables-exist covers absence"). See
-        //   `untreated_bugs/2026-07-24_no_primitive_recreates_dropped_intermediate.md`.
+        //   skips the absent parent, so this check would be describing mirror drift
+        //   in a tree that does not exist. Absence stays the business of
+        //   `internal-tables-exist`, which reports it as an Error — the same
+        //   division of labour `IntermediateShape` documents above
+        //   ("internal-tables-exist covers absence") — and whose
+        //   `reflex_rebuild_imv` remedy converges since 1.11.1, when
+        //   `reflex_reconcile` gained the heal step that re-issues the create-time
+        //   DDL (`heal_missing_intermediate`, `src/reconcile.rs`). Two checks
+        //   reporting one absence with the same remedy would be pure duplication,
+        //   so this one still stays silent.
         //
         // The target-side comparison runs in every case, so a clean target yields
         // zero findings rather than an empty-bodied one.

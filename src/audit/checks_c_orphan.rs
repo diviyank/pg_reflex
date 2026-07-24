@@ -164,6 +164,15 @@ impl Check for OrphanIntermediate {
         false
     }
     fn run_global(&self, client: &SpiClient<'_>, imvs: &[ImvRow]) -> Vec<Finding> {
+        // DELIBERATELY unconditional: every enabled IMV contributes an expected
+        // `__reflex_intermediate_<view>`, including passthroughs and decomposed
+        // wrappers that cannot own one. Do NOT narrow this with
+        // `owns_intermediate()` — this check's remedy is `DROP TABLE … CASCADE`,
+        // so its failure mode must stay "don't drop this". Narrowing would key a
+        // destructive proposal on a classification, and one misclassified
+        // aggregate IMV would mean proposing the DROP of a LIVE intermediate.
+        // Over-inclusion costs only a stray inert relation going unreported
+        // (documented in `PartitionMirror::run`); under-inclusion costs data.
         let expected: HashSet<String> = imvs
             .iter()
             .filter(|i| i.enabled)
@@ -244,6 +253,14 @@ impl Check for OrphanScratch {
     fn run_global(&self, client: &SpiClient<'_>, imvs: &[ImvRow]) -> Vec<Finding> {
         let mut expected = HashSet::new();
 
+        // Left on `is_passthrough()` on purpose. A decomposed wrapper row takes the
+        // `else` branch and contributes three names that never resolve, so
+        // `resolve_expected_oids` drops them and the wrapper adds nothing — while
+        // the scratch pairs that DO exist under a wrapper's name
+        // (`__reflex_pt_new_<view>__union_0_<src>`) belong to the sub-IMV rows,
+        // which are registered and enabled and contribute them here themselves.
+        // Routing this through the wrapper classification would therefore be a
+        // behavioural no-op, and this check's remedy is a `DROP TABLE … CASCADE`.
         for imv in imvs.iter().filter(|i| i.enabled) {
             let view = resolved_imv_name(imv);
             if imv.is_passthrough() {
