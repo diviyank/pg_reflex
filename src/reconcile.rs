@@ -7,6 +7,116 @@ use crate::query_decomposer::{intermediate_table_name, quote_identifier, split_q
 use crate::schema_builder::build_indexes_ddl;
 use crate::validate_view_name;
 
+/// Recreate `__reflex_intermediate_<view>` and its companions when the IMV expects
+/// an intermediate and it is absent — dropped by hand, lost to a
+/// `DROP … CASCADE`, or removed with a schema.
+///
+/// Until 1.11.1 nothing in the extension re-issued that DDL (it was emitted only at
+/// create time), so `internal-tables-exist` reported the absence at Error severity
+/// and prescribed `reflex_rebuild_imv`, a literal alias for [`reflex_reconcile`]
+/// (`src/lib.rs:823`) — which could not repair it: the partitioned path needs an
+/// existing parent to ATTACH swap children to (`ERROR: partition reconcile failed`,
+/// `missing intermediate bound for child …`) and the unpartitioned path raises
+/// 42P01 on `TRUNCATE {intermediate}`. An operator following the tool's own
+/// instruction retried forever.
+///
+/// Runs BEFORE the pre-rebuild partition sync: `reflex_sync_partitions` gates every
+/// intermediate-child DDL on a `to_regclass` probe of the parent
+/// (`src/partition.rs:1055`), so with the parent restored its existing loop mirrors
+/// the partition tree and no new partition code is needed here.
+///
+/// Everything needed is in the registry row — `aggregations` (the plan, with the
+/// column types create time resolved), `storage_mode`, and the sources in
+/// `depends_on` — so the missing `create_args` of a generated sub-IMV does not block
+/// recovery. `column_types` is reconstructed the way create time built it: from the
+/// sources' catalog entries, then from a temp view over `base_query`, whose output
+/// column names ARE the intermediate's column names.
+///
+/// Gated on [`crate::sql_writer::registry::owns_intermediate`] — the same predicate
+/// the audit classifies with — so it cannot build an intermediate for a passthrough
+/// IMV or a decomposed wrapper (the mirror image of the phantom drift PS-9 removed).
+fn heal_missing_intermediate(view_name: &str) {
+    let intermediate = intermediate_table_name(view_name);
+
+    let record = Spi::connect(|client| {
+        if relation_present(client, &intermediate) {
+            return None;
+        }
+        crate::sql_writer::registry::read_imv(client, view_name)
+    });
+    let record = match record {
+        Some(r) if r.enabled && r.owns_intermediate() => r,
+        _ => return,
+    };
+    // A row whose `aggregations` will not parse carries no shape to rebuild from;
+    // leave it to the audit rather than guessing one.
+    let plan = match record.plan.clone() {
+        Some(p) => p,
+        None => return,
+    };
+
+    let mut column_types = Spi::connect(|client| {
+        crate::create_ivm::query_column_types_from_catalog_with_per_source(
+            client,
+            &record.depends_on,
+        )
+        .0
+    });
+    crate::create_ivm::augment_column_types_from_query(&record.base_query, &mut column_types);
+
+    let logged = !record.storage_mode.eq_ignore_ascii_case("UNLOGGED");
+    let intermediate_ddl = match crate::schema_builder::build_intermediate_table_ddl(
+        view_name,
+        &plan,
+        &column_types,
+        logged,
+    ) {
+        Some(ddl) => ddl,
+        None => return,
+    };
+
+    Spi::connect_mut(|client| {
+        client
+            .update(&intermediate_ddl, None, &[])
+            .unwrap_or_report();
+        if let Some(scratch_ddl) =
+            crate::schema_builder::build_delta_scratch_table_ddl(view_name, &plan, &column_types)
+        {
+            client.update(&scratch_ddl, None, &[]).unwrap_or_report();
+        }
+        for ddl in build_indexes_ddl(view_name, &plan) {
+            client.update(&ddl, None, &[]).unwrap_or_report();
+        }
+        for ddl in crate::schema_builder::build_group_capture_ddl(view_name, &plan) {
+            client.update(&ddl, None, &[]).unwrap_or_report();
+        }
+    });
+
+    warning!(
+        "pg_reflex: recreated the missing internal table(s) of IMV '{}' ({} and companions). \
+         The IMV was not being maintained while they were absent; this reconcile refills it.",
+        view_name,
+        intermediate
+    );
+}
+
+/// `to_regclass` presence probe for an already-quoted, qualified relation name.
+fn relation_present(client: &pgrx::spi::SpiClient<'_>, qualified: &str) -> bool {
+    client
+        .select(
+            "SELECT to_regclass($1) IS NOT NULL AS present",
+            Some(1),
+            &[unsafe {
+                DatumWithOid::new(qualified.to_string(), PgBuiltInOids::TEXTOID.oid().value())
+            }],
+        )
+        .unwrap_or_report()
+        .first()
+        .get_by_name::<bool, _>("present")
+        .unwrap_or(None)
+        .unwrap_or(false)
+}
+
 /// Rebuild ONE IMV's intermediate + target from its own `base_query`.
 ///
 /// The single-node primitive. [`reflex_reconcile`] is the entry point, and it
@@ -20,6 +130,9 @@ fn reconcile_one(view_name: &str, drop_orphans: bool) -> &'static str {
     if let Err(msg) = validate_view_name(view_name) {
         return msg;
     }
+    // Recreate the aggregate aux relations first when they are gone, so the rest of
+    // this function — and the partition sync below it — have something to work on.
+    heal_missing_intermediate(view_name);
     // Best-effort partition sync: keep the IMV partition set aligned with
     // the source before rebuilding.  No-op for unpartitioned IMVs.  Sync
     // failures are surfaced as a NOTICE but do not abort reconcile — the
