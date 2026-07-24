@@ -871,9 +871,8 @@ pub(crate) fn stamp_targeted_recovery(view_name: &str) {
 /// advisory. A partitioned IMV WITHOUT ignored sources refills every partition from
 /// its anchor and is not flagged.
 pub(crate) fn rebuild_convergence_advisory(view_name: &str) -> Option<String> {
-    let risk = Spi::connect(|client| {
-        crate::sql_writer::registry::read_rebuild_risk(client, view_name)
-    })?;
+    let risk =
+        Spi::connect(|client| crate::sql_writer::registry::read_rebuild_risk(client, view_name))?;
 
     if risk.has_ignored_sources && risk.is_partitioned {
         return Some(format!(

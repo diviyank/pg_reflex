@@ -9,20 +9,20 @@ use crate::sql_writer::identifier::quote;
 
 /// One row of IMV status summary.  Returned by `reflex_ivm_status`.
 type IvmStatusRow = (
-    String,                         // name
-    i32,                            // graph_depth
-    bool,                           // enabled
-    String,                         // refresh_mode
-    i64,                            // row_count (live SELECT count(*) on target)
-    Option<i64>,                    // last_flush_ms
-    Option<i64>,                    // last_flush_rows
-    i64,                            // flush_count
-    Option<String>,                 // last_error
-    Option<pgrx::datum::Timestamp>, // last_update_date
-    bool,                           // known_stale
-    Option<String>,                 // stale_reason
-    bool,                           // requires_explicit_refresh
-    i64,                                    // rebuild_count
+    String,                                     // name
+    i32,                                        // graph_depth
+    bool,                                       // enabled
+    String,                                     // refresh_mode
+    i64,                                        // row_count (live SELECT count(*) on target)
+    Option<i64>,                                // last_flush_ms
+    Option<i64>,                                // last_flush_rows
+    i64,                                        // flush_count
+    Option<String>,                             // last_error
+    Option<pgrx::datum::Timestamp>,             // last_update_date
+    bool,                                       // known_stale
+    Option<String>,                             // stale_reason
+    bool,                                       // requires_explicit_refresh
+    i64,                                        // rebuild_count
     Option<pgrx::datum::TimestampWithTimeZone>, // last_rebuild_at
 );
 

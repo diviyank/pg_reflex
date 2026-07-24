@@ -474,19 +474,20 @@ pub struct RebuildRisk {
 /// Read the [`RebuildRisk`] projection for one IMV. `None` when the IMV is not
 /// registered.
 pub fn read_rebuild_risk(client: &pgrx::spi::SpiClient<'_>, name: &str) -> Option<RebuildRisk> {
-    let rows = client
-        .select(
-            "SELECT COALESCE(requires_explicit_refresh, FALSE) AS req, \
+    let rows =
+        client
+            .select(
+                "SELECT COALESCE(requires_explicit_refresh, FALSE) AS req, \
                     COALESCE(array_length(ignored_sources, 1), 0) > 0 AS has_ignored, \
                     (partition_strategy IS NOT NULL AND partition_strategy <> '') AS is_part \
              FROM public.__reflex_ivm_reference WHERE name = $1",
-            Some(1),
-            &[unsafe {
-                DatumWithOid::new(name.to_string(), PgBuiltInOids::TEXTOID.oid().value())
-            }],
-        )
-        .unwrap_or_report()
-        .collect::<Vec<_>>();
+                Some(1),
+                &[unsafe {
+                    DatumWithOid::new(name.to_string(), PgBuiltInOids::TEXTOID.oid().value())
+                }],
+            )
+            .unwrap_or_report()
+            .collect::<Vec<_>>();
 
     let row = rows.first()?;
     Some(RebuildRisk {
@@ -513,17 +514,18 @@ pub fn bump_rebuild_count(
     client: &mut pgrx::spi::SpiClient<'_>,
     name: &str,
 ) -> Result<u64, spi::Error> {
-    let n = client
-        .update(
-            "UPDATE public.__reflex_ivm_reference \
+    let n =
+        client
+            .update(
+                "UPDATE public.__reflex_ivm_reference \
              SET rebuild_count = COALESCE(rebuild_count, 0) + 1, last_rebuild_at = now() \
              WHERE name = $1",
-            None,
-            &[unsafe {
-                DatumWithOid::new(name.to_string(), PgBuiltInOids::TEXTOID.oid().value())
-            }],
-        )?
-        .len();
+                None,
+                &[unsafe {
+                    DatumWithOid::new(name.to_string(), PgBuiltInOids::TEXTOID.oid().value())
+                }],
+            )?
+            .len();
     Ok(n as u64)
 }
 
