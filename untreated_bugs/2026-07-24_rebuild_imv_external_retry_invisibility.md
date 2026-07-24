@@ -1,9 +1,28 @@
 # 2026-07-24 — `reflex_rebuild_imv` retried 1020× externally because it cannot converge a matview-LEFT-JOIN / ignore_sources IMV, and nothing makes the futile repeats visible
 
-**Status: untreated.** Diagnosed under PS-8 (B7 S3). Field evidence: db_prod
+**Status: two stated gaps FIXED (PS-14, 1.11.1); narrowed to the convergence
+residual.** Diagnosed under PS-8 (B7 S3). Field evidence: db_prod
 `pg_stat_statements` (pg_reflex 1.10.11) shows
 `reflex_rebuild_imv('yse.sop_last_forecast_view')` with **1020 calls**, 12.4 s
 mean, 558.9 s max, 3.5 h total.
+
+**Fixed by PS-14 (1.11.1):** both gaps below are closed. (1) *Invisibility* —
+`__reflex_ivm_reference` now carries `rebuild_count` / `last_rebuild_at`, incremented
+by direct operator recovery (and `reflex_doctor(fix => true)`), surfaced by
+`reflex_ivm_status`, so a non-converging retry loop is observable in-database rather
+than only in `pg_stat_statements`. (2) *Wrong primitive, silently* — a rebuild that
+targets an IMV it cannot converge (matview source, or `ignore_sources`-fed /
+anchor-empty partition) now WARNs and names `refresh_imv_depending_on` /
+`reflex_reconcile_partition` instead of returning a bare success.
+
+**What remains (the convergence residual):** it is still unproven that the primitives
+PS-14's advisory now names actually *converge* an anchor-empty partition whose rows
+arrive only via an `ignore_sources` table — that is the `docs/untreated.md` §F6
+partition-refill question, deferred. PS-14 made the futile loop visible and routed the
+operator toward the intended primitive; it did not establish that any in-extension
+primitive can refresh such a partition. If none can, the honest recovery is still a
+chain drop+recreate. Same deferred family as
+`2026-07-24_union_mirror_triggers_unchecked.md`.
 
 ## What was ruled out
 
