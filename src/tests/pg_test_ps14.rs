@@ -293,3 +293,65 @@ fn ps14_partitioned_without_ignore_sources_no_advisory() {
          anchor and must NOT warn"
     );
 }
+
+/// (9) Part B reference pin: create-time correctly flags requires_explicit_refresh
+/// when an IMV ignores a real table by its BARE name while depends_on stores it
+/// QUALIFIED — because `all_real_sources_are_matviews` compares each ignore entry
+/// against BOTH the qualified source and its bare form. This is the exact shape the
+/// PS-3 migration backfill under-flags with its exact-string `= ANY(ignored_sources)`
+/// match; the corrective 1.11.1 re-backfill must reproduce THIS verdict
+/// (`NOT (s = ANY(ig) OR split_part(s,'.',2) = ANY(ig))`). Migrations never run under
+/// `cargo pgrx test`, so this pins the Rust reference the SQL mirrors, not the SQL.
+#[pg_test]
+fn ps14_bare_ignore_qualified_depends_is_flagged_at_create_time() {
+    Spi::run("CREATE SCHEMA ps14i_s").unwrap();
+    Spi::run("CREATE TABLE ps14i_s.realtbl (id INT PRIMARY KEY, grp TEXT, val INT)").unwrap();
+    Spi::run("INSERT INTO ps14i_s.realtbl VALUES (1,'a',10),(2,'b',20)").unwrap();
+    Spi::run("CREATE MATERIALIZED VIEW ps14i_s.mv AS SELECT id, grp, val FROM ps14i_s.realtbl")
+        .unwrap();
+
+    // The IMV joins the matview and the real table, both schema-qualified (so
+    // depends_on stores 'ps14i_s.realtbl'), and ignores the real table by its BARE
+    // name 'realtbl'. After the ignore, the only maintainable-source candidate is a
+    // matview -> requires_explicit_refresh must be TRUE.
+    let create = Spi::get_one::<String>(
+        "SELECT create_reflex_ivm( \
+            'ps14i_imv', \
+            'SELECT m.grp, SUM(m.val) AS total FROM ps14i_s.mv m \
+                JOIN ps14i_s.realtbl r ON r.id = m.id GROUP BY m.grp', \
+            NULL, NULL, NULL, 'realtbl' \
+         )",
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(create, "CREATE REFLEX INCREMENTAL VIEW", "create returned: {create}");
+
+    // Confirm depends_on stores the real table QUALIFIED (the migration-gap
+    // precondition) and the ignore was recorded BARE.
+    let qualified_dep = Spi::get_one::<bool>(
+        "SELECT 'ps14i_s.realtbl' = ANY(depends_on) \
+         FROM public.__reflex_ivm_reference WHERE name = 'ps14i_imv'",
+    )
+    .unwrap()
+    .unwrap();
+    assert!(qualified_dep, "depends_on must store the real table qualified");
+    let bare_ignore = Spi::get_one::<bool>(
+        "SELECT 'realtbl' = ANY(ignored_sources) \
+         FROM public.__reflex_ivm_reference WHERE name = 'ps14i_imv'",
+    )
+    .unwrap()
+    .unwrap();
+    assert!(bare_ignore, "ignore must be recorded by its bare name");
+
+    let flagged = Spi::get_one::<bool>(
+        "SELECT requires_explicit_refresh FROM public.__reflex_ivm_reference \
+         WHERE name = 'ps14i_imv'",
+    )
+    .unwrap()
+    .unwrap();
+    assert!(
+        flagged,
+        "create-time flags a bare-ignored real table with a qualified depends_on entry; \
+         the corrective 1.11.1 backfill must reproduce this same TRUE verdict"
+    );
+}
