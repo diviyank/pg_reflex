@@ -1504,6 +1504,18 @@ mod tests {
         Spi::connect(|client| crate::partition::list_partition_tree(client, root).len() as i64)
     }
 
+    /// Call `reconcile_one` directly, bypassing `reflex_reconcile`'s bottom-up
+    /// descent into generated children. PS-12 test 2 needs this to exercise the
+    /// backstop on a materialised wrapper in isolation: the operator entry point
+    /// would first reconcile the wrapper's operand sub-IMVs, whose INSERT mirror
+    /// triggers append to the wrapper — the pre-existing doubling hazard — which
+    /// would obscure whether the backstop itself is what leaves the wrapper
+    /// unchanged.
+    #[pg_extern]
+    fn crate_test_reconcile_one(view: &str) -> String {
+        crate::reconcile::reconcile_one(view, true).to_string()
+    }
+
     include!("tests/pg_test_basic.rs");
     include!("tests/pg_test_trigger.rs");
     include!("tests/pg_test_passthrough.rs");
@@ -1539,6 +1551,7 @@ mod tests {
     include!("tests/pg_test_ps3.rs");
     include!("tests/pg_test_ps9.rs");
     include!("tests/pg_test_ps10.rs");
+    include!("tests/pg_test_ps12.rs");
 }
 
 /// This module is required by `cargo pgrx test` invocations.

@@ -218,6 +218,46 @@ fn relation_present(client: &pgrx::spi::SpiClient<'_>, qualified: &str) -> bool 
         .unwrap_or(false)
 }
 
+/// Whether `view_name`'s registry row is a decomposed WRAPPER node — the class
+/// `reconcile_one` must refuse. Shares its definition with the audit's
+/// `ImvRow::is_decomposed_wrapper` (`src/audit/mod.rs`): a row written only by
+/// `RegistryRow::decomposed`, which hardcodes `end_query = ''` AND
+/// `aggregations = '{}'`. No `persist_metadata` row can be both — it always
+/// serialises a full `AggregationPlan`, non-empty even for a passthrough
+/// (`is_passthrough` alone makes the object non-empty) — so the pair is exact.
+///
+/// NOT `is_generated_sub_imv`: a TOP-LEVEL UNION-ALL / set-op / DISTINCT-ON /
+/// window IMV registers its wrapper under the USER's own name (`ctx.view_name`),
+/// which `decompose.rs` never marks generated (only operand and CTE sub-nodes are)
+/// — yet that VIEW is exactly the one whose `TRUNCATE` raises. `aggregations = '{}'`
+/// catches it; `is_generated_sub_imv` would let it through.
+///
+/// `aggregations::text = '{}'` is a PLAIN equality, not `COALESCE(…, '{}')`: a NULL
+/// `aggregations` is a row of UNKNOWN shape (the column is nullable; legacy rows
+/// predate it), and refusing an unknown row would break reconcile for it. Only a
+/// row KNOWN to carry an empty-object plan is refused — the same safe direction
+/// `ImvRow::is_decomposed_wrapper` takes (`Some(0)`, not NULL), and the opposite of
+/// `REBUILDABLE_NODE`, whose question ("may reconcile rewrite this?") wants the
+/// other default.
+fn is_decomposed_wrapper_row(view_name: &str) -> bool {
+    Spi::connect(|client| {
+        client
+            .select(
+                "SELECT (end_query = '' AND aggregations::text = '{}') AS is_wrapper \
+                 FROM public.__reflex_ivm_reference WHERE name = $1",
+                Some(1),
+                &[unsafe {
+                    DatumWithOid::new(view_name.to_string(), PgBuiltInOids::TEXTOID.oid().value())
+                }],
+            )
+            .unwrap_or_report()
+            .first()
+            .get_by_name::<bool, _>("is_wrapper")
+            .unwrap_or(None)
+            .unwrap_or(false)
+    })
+}
+
 /// Rebuild ONE IMV's intermediate + target from its own `base_query`.
 ///
 /// The single-node primitive. [`reflex_reconcile`] is the entry point, and it
@@ -227,9 +267,36 @@ fn relation_present(client: &pgrx::spi::SpiClient<'_>, qualified: &str) -> bool 
 /// entry point passes `true` (unchanged from 1.10.11); the recursive descent
 /// passes `false` so reconciling a chain does not multiply an orphan-dropping
 /// side effect the caller never asked for across every generated node in it.
-fn reconcile_one(view_name: &str, drop_orphans: bool) -> &'static str {
+pub(crate) fn reconcile_one(view_name: &str, drop_orphans: bool) -> &'static str {
     if let Err(msg) = validate_view_name(view_name) {
         return msg;
+    }
+    // Backstop: refuse a decomposed WRAPPER node before touching anything. A
+    // wrapper is a set-op / DISTINCT ON / window VIEW, or a materialised UNION-ALL
+    // mirror TABLE, maintained through its operands — it has no rebuild from its
+    // own registry row. Reaching the passthrough branch below would `TRUNCATE` +
+    // `INSERT <base_query>`, which RAISES on a VIEW (`"<v>" is not a table`,
+    // aborting the caller's transaction) and column-shifts a materialised wrapper
+    // (its base_query yields N payload values for the wrapper's N+1 columns —
+    // `__reflex_src_idx` + payload — silently wrong data that propagates to the
+    // parent). Refusing here with a returned error STRING converts both faces into
+    // one loud, transaction-preserving refusal that every caller — direct
+    // `reflex_reconcile`, `refresh_imv_depending_on`, doctor F4/F4b — already
+    // handles as a non-fatal `ERROR:`.
+    //
+    // Placed before `heal_missing_intermediate` / `reflex_sync_partitions_impl` /
+    // the `TRUNCATE`: those are no-ops on a wrapper (it owns no intermediate and no
+    // partition plan), but the refusal must not depend on that staying true.
+    if is_decomposed_wrapper_row(view_name) {
+        warning!(
+            "pg_reflex: refusing to reconcile '{}' — it is a decomposed wrapper node \
+             (UNION-ALL/set-op/DISTINCT-ON/window) with no standalone rebuild. It is \
+             maintained by its operand sub-IMVs; reconcile those, or the parent IMV that \
+             reads it, instead.",
+            view_name
+        );
+        return "ERROR: cannot reconcile a decomposed wrapper node — it is maintained by \
+                its operand sub-IMVs; reconcile the operands or the parent that reads it";
     }
     // Recreate the aggregate aux relations first when they are gone, so the rest of
     // this function — and the partition sync below it — have something to work on.
