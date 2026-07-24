@@ -420,3 +420,93 @@ fn audit_ps5_nullable_group_key_target_sync_uses_index_scan() {
         );
     }
 }
+
+/// PLAN-QUALITY + SCOPE-TIGHTNESS (PS-11): the top-K MIN/MAX scalar-refresh
+/// (`build_topk_scalar_refresh_sql`) scopes the refresh to the affected groups.
+/// Its scoping used a NULL-unsafe `(cols) IN (SELECT ...)` that silently DROPPED
+/// the NULL group — a reproduced silent-wrong-result after an unshrunk NULL-group
+/// UPDATE. The fix makes it NULL-safe via a gated pair, but the common (NULL-free
+/// affected set) path must STILL reach the intermediate by INDEX SCAN — a plain
+/// always-NULL-safe `IS NOT DISTINCT FROM` seq-scans the whole intermediate on
+/// every top-K Sub. This pins both: a NULL-safe variant exists AND the sargable
+/// variant is index-driven. Without the guard, scoping could silently collapse to
+/// a full-intermediate scan (correct results, so contents-only tests miss it).
+#[pg_test]
+fn audit_ps11_topk_scalar_refresh_null_safe_and_index_scoped() {
+    Spi::run("CREATE TABLE ps11t (id INT PRIMARY KEY, grp TEXT, v INT NOT NULL)").unwrap();
+    Spi::run("INSERT INTO ps11t SELECT i, 'g'||i, i FROM generate_series(1,20000) i").unwrap();
+    // Nullable group key (no NOT NULL on `grp`); top-K is on by default.
+    crate::create_reflex_ivm(
+        "ps11t_v",
+        "SELECT grp, MIN(v) AS lo, MAX(v) AS hi FROM ps11t GROUP BY grp",
+        None,
+        None,
+        None,
+        None,
+    );
+    // Affected set holds a single NON-NULL key — what the sargable branch keys off.
+    Spi::run("TRUNCATE \"__reflex_affected_ps11t_v\"").unwrap();
+    Spi::run("INSERT INTO \"__reflex_affected_ps11t_v\" VALUES ('g7')").unwrap();
+    Spi::run("ANALYZE \"__reflex_affected_ps11t_v\"").unwrap();
+    Spi::run("ANALYZE \"__reflex_intermediate_ps11t_v\"").unwrap();
+
+    let stmts = flush_statements_for("ps11t_v", "ps11t", "UPDATE");
+
+    // The scalar-refresh statements: they refresh the scalar from the top-K array
+    // (`... = "..._topk"[1]`) gated by the heap `cardinality` predicate.
+    let refreshes: Vec<&String> = stmts
+        .iter()
+        .filter(|s| {
+            s.contains("__reflex_intermediate_ps11t_v")
+                && s.contains("[1]")
+                && s.contains("cardinality")
+        })
+        .collect();
+    assert!(
+        !refreshes.is_empty(),
+        "no top-K scalar-refresh statement found in UPDATE flush: {:#?}",
+        stmts
+    );
+    // NULL-safe: there must be a variant using `IS NOT DISTINCT FROM` (else a NULL
+    // group is silently dropped — the reproduced bug).
+    assert!(
+        refreshes.iter().any(|s| s.contains("IS NOT DISTINCT FROM")),
+        "top-K scalar-refresh has no NULL-safe variant (NULL group would be dropped): {:#?}",
+        refreshes
+    );
+
+    // The sargable variant (runs for a NULL-free affected set) is the one gated on
+    // `AND NOT EXISTS(<null-key>)` with a `=` scope. Its plan must hit the
+    // intermediate's unique group-key index, not seq-scan the whole intermediate.
+    let sargable = refreshes
+        .iter()
+        .find(|s| s.contains("AND NOT EXISTS") && !s.contains("IS NOT DISTINCT FROM"))
+        .expect("sargable top-K refresh variant (`=` scope, gated on NOT EXISTS)");
+    let plan = Spi::connect(|client| {
+        let rows = client
+            .select(&format!("EXPLAIN (COSTS OFF) {}", sargable), None, &[])
+            .unwrap();
+        rows.filter_map(|r| {
+            r.get_datum_by_ordinal(1)
+                .ok()
+                .and_then(|d| d.value::<String>().ok().flatten())
+        })
+        .collect::<Vec<String>>()
+        .join("\n")
+    });
+    let scanned_by_index = plan.lines().any(|l| {
+        (l.contains("Index Scan") || l.contains("Index Only Scan") || l.contains("Bitmap Index Scan"))
+            && l.contains("__reflex_intermediate_ps11t_v")
+    });
+    assert!(
+        scanned_by_index,
+        "PS-11 SCOPE-TIGHTNESS: top-K scalar-refresh must reach the intermediate by index scan, \
+         not a full scan, got:\n{}\nstatement: {}",
+        plan, sargable
+    );
+    assert!(
+        plan.contains("Index Cond:"),
+        "PS-11: the top-K refresh group-key probe must be an Index Cond, not a Filter:\n{}",
+        plan
+    );
+}
