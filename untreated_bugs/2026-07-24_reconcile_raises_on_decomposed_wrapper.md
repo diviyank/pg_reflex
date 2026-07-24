@@ -1,20 +1,36 @@
-# 2026-07-24 — `reflex_reconcile` RAISES on a decomposed wrapper IMV (set-op / DISTINCT ON / window), aborting the caller's transaction
+# 2026-07-24 — directly reconciling a machine-generated UNION-ALL operand doubles a materialised wrapper (residual after the wrapper-reconcile fix)
 
-**Status: untreated, narrowed.** Found under PS-10. Probe-confirmed on
-`fix/ps10-intermediate-audit-bugs` @ 1.11.1. **Pre-existing.**
+**Status: untreated, narrowed twice.** Found under PS-10, narrowed by PS-12.
+**Pre-existing.**
 
-**What PS-10 already fixed:** `reflex_scheduled_reconcile` no longer reaches this.
-Its candidate CTE now skips rows with no plan
-(`COALESCE(aggregations::text, '{}') <> '{}'`, `src/reconcile.rs`), so one set-op
-IMV no longer kills the whole sweep — it used to raise out of the function and
-return nothing, leaving every other IMV in the batch unreconciled, permanently,
-because a wrapper's `last_update_date` is stamped at create and never advances
-(the only writer is the tail of `reconcile_one`, which a wrapper never reaches).
-Regression test:
+**What PS-10 fixed:** `reflex_scheduled_reconcile` no longer reaches the wrapper
+reconcile path — its candidate CTE skips planless rows
+(`COALESCE(aggregations::text, '{}') <> '{}'`), so one set-op IMV no longer kills
+the whole sweep. Regression test
 `src/tests/pg_test_ps10.rs::ps10_scheduled_reconcile_survives_a_set_op_imv`.
 
-**What remains:** the direct call still raises, and two other callers still route
-into it.
+**What PS-12 fixed (1.11.1):** `reconcile_one` now REFUSES a decomposed wrapper node
+(`end_query = '' AND aggregations::text = '{}'`) with a clean error STRING before any
+`TRUNCATE`, instead of raising. So `reflex_reconcile('<wrapper>')` /
+`reflex_rebuild_imv('<wrapper>')` no longer abort the caller's transaction (the VIEW
+case) and no longer column-shift a materialised wrapper (the former #8 case). The two
+other callers are safe: `refresh_imv_depending_on` warns on the error string and
+continues (skip-and-continue, verified), and no path can mark a wrapper `known_stale`,
+so `reflex_doctor(fix => true)` F4/F4b never call reconcile on one. Regression tests in
+`src/tests/pg_test_ps12.rs`.
+
+**What remains (this file, S3):** directly reconciling a machine-generated *operand*
+sub-IMV of a **materialised** UNION-ALL wrapper still doubles the wrapper.
+`reflex_reconcile('<wrapper>__cte_u__union_0')` rebuilds that operand
+(`TRUNCATE`+`INSERT`) with its triggers LIVE, firing the `__reflex_union_mirror_ins_*`
+trigger, which appends the operand's rows to the wrapper a second time while nothing
+removes the old ones. Reachable only by an operator naming an internal `…__union_N`
+node directly — not by reconciling the wrapper or its parent (those descend via
+`reconcile_generated_child_without_propagating`, which disables the operand's triggers
+first, verified safe by the PS-12 review). Same mirror-trigger machinery the reports
+carve out of scope (see `2026-07-24_union_mirror_triggers_unchecked.md`); the honest
+fix is to make `reconcile_one` on an operand of a materialised wrapper either refuse or
+route through the trigger-suppressed descent path.
 
 ## Reproduction (pg17)
 

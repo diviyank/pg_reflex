@@ -4,11 +4,38 @@
 
 ## [1.11.1] - 2026-07-24
 
-Audit truthfulness, plus a recovery path for a dropped internal table. Module-only
-— replace the `.so`, then `ALTER EXTENSION pg_reflex UPDATE TO '1.11.1';`. No DDL,
-no reconcile needed.
+Audit truthfulness, two silent-wrong-result fixes in nullable-key MIN/MAX
+maintenance, wrapper-reconcile safety, plus a recovery path for a dropped internal
+table. Module-only — replace the `.so`, then
+`ALTER EXTENSION pg_reflex UPDATE TO '1.11.1';`. No DDL, no reconcile needed.
 
 **Fixed**
+
+- **(silent wrong result)** A MIN/MAX aggregate IMV over a **nullable group key**
+  returned a stale extremum forever after a retraction. The recompute scoped its
+  source re-aggregation with `(group cols) IN (SELECT … FROM affected)`, and
+  `(NULL) IN (…)` is NULL — never true — so a NULL group whose current MIN/MAX was
+  retracted was excluded from the rescan and never re-derived. Fixed with a NULL-safe
+  correlated `EXISTS (… IS NOT DISTINCT FROM …)` scope.
+
+- **(silent wrong result)** The same NULL-unsafe `IN` in the **top-K** scalar-refresh
+  path (`build_topk_scalar_refresh_sql`) left a NULL group's MIN/MAX wrong after an
+  UPDATE that touched a middle-ranked row (one that shrank neither the min- nor the
+  max-heap), because the forced recompute is scoped to shrunk heaps only and the
+  scalar refresh skipped the NULL group. Fixed NULL-safe, gated on whether the
+  affected set actually holds a NULL key: the common path keeps the sargable `=`
+  (index scan) and only a batch touching a NULL group pays the NULL-safe scan.
+
+- **(transaction abort / silent column-shift)** `reflex_reconcile` on a decomposed
+  wrapper IMV (top-level `UNION`/`UNION ALL`/`INTERSECT`/`EXCEPT`, `DISTINCT ON`,
+  window) either raised `"<view>" is not a table` — aborting the caller's whole
+  transaction, since the wrapper is a VIEW and `reconcile_one` tried to `TRUNCATE` it
+  — or, for a materialised UNION-ALL wrapper (extra leading `__reflex_src_idx`
+  column), column-shifted its payload on the `INSERT`. `reconcile_one` now refuses a
+  wrapper node with a clean error string before any DDL, so direct calls,
+  `refresh_imv_depending_on`, and `reflex_doctor(fix => true)` all fail safe and
+  transaction-preserving. Wrappers are maintained through their operands; reconcile
+  the parent or the operands, not the wrapper.
 
 - `reflex_scheduled_reconcile` raised `"<view>" is not a table` and returned nothing
   — the entire scheduled sweep died — in any database containing a decomposed
@@ -62,12 +89,19 @@ no reconcile needed.
 
 **Known limitations**
 
-- `reflex_reconcile('<wrapper>')` called **directly** on a decomposed set-op /
-  `DISTINCT ON` / window IMV still raises `"<view>" is not a table`. The scheduled
-  sweep no longer reaches that state, but `refresh_imv_depending_on` and
-  `reflex_doctor(fix => true)`'s F4/F4b repairs route into the same call and are
-  unaudited. Filed in
+- Directly reconciling a machine-generated *operand* sub-IMV of a **materialised**
+  UNION-ALL wrapper (`reflex_reconcile('<wrapper>__cte_u__union_0')`) still doubles the
+  wrapper: the operand rebuild fires its live `__reflex_union_mirror_ins_*` trigger.
+  Reachable only by naming an internal `…__union_N` node directly — reconciling the
+  wrapper (now refused) or its parent (trigger-suppressed descent) is safe. Filed in
   `untreated_bugs/2026-07-24_reconcile_raises_on_decomposed_wrapper.md`.
+- No sound package-level "skip-unchanged reconcile" exists: a blanket reconcile is a
+  trustless output-correctness certificate, and no signal cheaper than recomputing the
+  output can license skipping it without downgrading the guarantee. For the matview-
+  driven cost case (`current_assortment_activity_view`, ~2.5 h), use push-based
+  invalidation instead — call `refresh_imv_depending_on('<mv>')` after
+  `REFRESH MATERIALIZED VIEW`. Investigated in
+  `untreated_bugs/2026-07-24_current_assortment_reconcile_cost.md`.
 - Nothing checks that a materialised wrapper's `__reflex_union_mirror_*` triggers are
   present, so dropping one causes silent divergence that `reflex_audit` reports as
   healthy. The wrapper Error this release removed never detected that condition

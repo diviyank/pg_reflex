@@ -4,8 +4,23 @@
 --
 -- Replace the module (.so) BEFORE running this.
 --
--- Four fixes, all delivered entirely in the module — no SQL signatures, tables, or
+-- Seven fixes, all delivered entirely in the module — no SQL signatures, tables, or
 -- triggers change, so this delta carries no DDL:
+--
+--   * (SILENT WRONG RESULT) A MIN/MAX aggregate IMV over a nullable group key returned
+--     a stale extremum forever after a retraction: the recompute scoped its rescan
+--     with `(cols) IN (SELECT … FROM affected)`, and `(NULL) IN (…)` is NULL, so the
+--     NULL group was never re-derived. Now NULL-safe (`EXISTS … IS NOT DISTINCT FROM`).
+--
+--   * (SILENT WRONG RESULT) The same NULL-unsafe skip in the top-K scalar-refresh path
+--     left a NULL group's MIN/MAX wrong after a middle-ranked UPDATE (shrinking neither
+--     heap). Now NULL-safe, gated so the common path keeps its sargable index scan.
+--
+--   * (TX ABORT / SILENT COLUMN-SHIFT) reflex_reconcile on a decomposed wrapper IMV
+--     (top-level UNION/UNION ALL/INTERSECT/EXCEPT, DISTINCT ON, window) either raised
+--     `"<view>" is not a table` (aborting the caller's transaction) or column-shifted a
+--     materialised wrapper. reconcile_one now refuses a wrapper with a clean error
+--     string before any DDL; reconcile the parent or the operands, not the wrapper.
 --
 --   * reflex_scheduled_reconcile no longer dies on decomposed set-op / DISTINCT ON /
 --     window wrapper IMVs. Reconcile cannot operate on a wrapper (it is a view,

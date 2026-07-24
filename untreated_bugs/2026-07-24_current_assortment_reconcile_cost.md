@@ -1,9 +1,26 @@
 # 2026-07-24 — `alp.current_assortment_activity_view` reconcile costs 2.5 h: statement-attributed, version-attributed, fixability
 
-**Status: diagnosis only. No fix implemented** (mechanism is conclusive; no safe,
-worthwhile pg_reflex-side fix exists — see Fixability). Follow-up is
-orchestration-level and belongs with B6/B7 of
-`2026-07-23_decomposed_subimv_never_reconciled.md`.
+**Status: investigated, resolved as no-package-fix (PS-CA, 1.11.1). The correct lever
+is push-based invalidation, not a pull-based skip.** A dedicated investigation proved
+that no sound, cheap, testable package-level "skip-unchanged reconcile" signal exists
+for this shape: a blanket reconcile is a trustless output-drift safety net, so any
+input-derived signal can at best certify "no input changed" — never "stored output is
+correct" — and the only input-independent certificate of output correctness is
+recomputing it (the reconcile itself). No skip logic was shipped; demonstration tests
+proving each candidate signal is blind to a real staleness live in
+`src/tests/pg_test_psca_skip_signal.rs` (they go RED as a signpost if a future change
+makes a signal trackable).
+
+**The correct fix, empirically confirmed:** do NOT blanket-reconcile a matview-sourced
+IMV. After `REFRESH MATERIALIZED VIEW <mv>`, call `refresh_imv_depending_on('<mv>')` —
+its `WHERE $1 = ANY(depends_on)` matches this IMV (the matview referenced only inside
+the scalar subquery IS captured in `depends_on`, verified), so it reconciles exactly
+when the matview changed, avoiding both the redundant 2.5 h reconciles AND the
+staleness. This is the sound, push-based version of what a "skip-unchanged" pass was
+trying to approximate by guess. The remaining 2.5 h cost of an actually-needed
+reconcile is a property of the view shape (non-partition-key filter from an
+uncorrelated scalar subquery → no pruning) and is the user's view to fix; no safe
+pg_reflex-side rewrite exists.
 
 Investigates the field data point appended to **B7**: a controlled full reconcile
 of all 190 IMVs (one `reflex_reconcile` per transaction) ran 190/190 clean, but

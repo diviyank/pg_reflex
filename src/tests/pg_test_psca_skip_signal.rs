@@ -183,13 +183,16 @@ fn psca_t3_relfilenode_blind_to_in_place_dml() {
 // T4 — CROWN JEWEL. The current_assortment shape: a passthrough IMV whose WHERE
 // filter comes from an uncorrelated scalar subquery over a MATERIALIZED VIEW.
 // Flipping which value the matview selects (with NO change to the anchor table)
-// makes the IMV stale. This staleness is invisible to EVERY package-controlled
-// signal: flush_count (frozen in immediate mode), last_update_date (no IMV-source
+// makes the IMV stale. This staleness is invisible to all three registry/catalog
+// signals: flush_count (frozen in immediate mode), last_update_date (no IMV-source
 // trigger fires — the matview isn't a DML source), and the matview's relfilenode
-// (unchanged under REFRESH ... CONCURRENTLY). Only a from-scratch reconcile
-// restores correctness. => the motivating 2.5h IMV cannot be safely skipped.
+// (unchanged under REFRESH ... CONCURRENTLY). The one signal that WOULD catch this
+// input is a fingerprint of the scalar-subquery result value — sound for this input,
+// but insufficient for a complete skip: it is blind to in-place UPDATE/DELETE on the
+// anchor partitions, so it cannot license skipping the reconcile. Only a from-scratch
+// reconcile restores correctness. => the motivating 2.5h IMV cannot be safely skipped.
 #[pg_test]
-fn psca_t4_matview_subquery_flip_invisible_to_all_signals() {
+fn psca_t4_matview_subquery_flip_invisible_to_registry_and_catalog_signals() {
     // Anchor table: two assortments, mirrors assortment_activity_relation.
     Spi::run("CREATE TABLE psca_aar (product_id INT, assortment_id INT, is_active BOOLEAN)")
         .expect("aar");
