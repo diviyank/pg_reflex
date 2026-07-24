@@ -181,36 +181,45 @@ impl Check for PartitionMirror {
         // that structurally cannot create any of them — an unrepairable phantom
         // finding, observed on 42 production IMVs.
         //
-        // `end_query.is_empty()` is the authoritative signal. It is the branch the
-        // runtime itself takes when deciding whether to touch an intermediate
-        // (`src/partition.rs:633`/`644`/`1054`, `src/trigger/ops.rs:436`/`653`/`783`),
-        // so it answers the question this check actually asks — "does an
-        // intermediate participate in maintenance?" — rather than "what did create
-        // time intend?". It is equivalent to `aggregations->>'is_passthrough'` for
-        // every row `create_reflex_ivm` writes (`src/create_ivm/mod.rs:1572`).
+        // `end_query.is_empty()` is the authoritative signal, for three reasons.
+        //
+        // (1) It is the branch the runtime itself takes when deciding whether to
+        //     touch an intermediate (`src/partition.rs:633`/`644`/`1054`,
+        //     `src/trigger/ops.rs:436`/`653`/`783`), so it answers the question
+        //     this check actually asks — "does an intermediate participate in
+        //     maintenance?" — not "what did create time intend?".
+        // (2) Where the two candidate signals DISAGREE, this one is right.
+        //     Decomposed wrapper rows (`RegistryRow::decomposed`, five
+        //     `insert_registry_row` sites in `src/create_ivm/decompose.rs`)
+        //     hardcode `end_query: ""` AND `aggregations: "{}"`, so
+        //     `ImvRow::is_passthrough()` finds no `is_passthrough` key and
+        //     `unwrap_or(false)` claims an intermediate is expected — for a node
+        //     that owns none. (Those rows carry `partition_columns: None`, so this
+        //     check returns early above before reaching the predicate; the
+        //     disagreement is nonetheless real, and is what makes
+        //     `internal-tables-exist` false-positive on UNION-ALL wrappers — see
+        //     `untreated_bugs/2026-07-24_internal_tables_exist_union_wrapper_false_positive.md`.)
+        // (3) For every row `persist_metadata` writes (`src/create_ivm/mod.rs:1572`)
+        //     the two agree: `end_query` is `""` exactly when
+        //     `plan.is_passthrough`. Note this is NOT the same predicate as
+        //     `intermediate_column_spec`'s `None` (`src/schema_builder.rs:18`),
+        //     which also requires `distinct_columns.is_empty()`:
+        //     `COUNT(DISTINCT val)` without GROUP BY is `is_passthrough == true`
+        //     with non-empty `distinct_columns`, because
+        //     `AggregateKind::CountDistinct` pushes only into
+        //     `count_distinct_columns` (`src/aggregation.rs:983`). That shape is
+        //     still safe here: the intermediate DDL is only ever emitted via
+        //     `build_intermediate_table_ddl` on the non-passthrough branch
+        //     (`src/create_ivm/mod.rs:1076`), so a passthrough row never has one.
+        //
+        // NULL `end_query` is coerced to `""` by `load_imv_rows`
+        // (`src/audit/mod.rs:288-292`), biasing an unset column toward
+        // "passthrough". No code path UPDATEs `end_query` and no migration
+        // back-fills it, so that state is unreachable through supported
+        // operations. Do NOT "fail safe" with `|| !imv.is_passthrough()`: by (2)
+        // that reintroduces the phantom for every decomposed wrapper row.
         let intermediate_expected = !imv.end_query.is_empty();
         let intermediate_present = relation_exists(client, &int_parent);
-
-        // Expected but gone entirely: no amount of child mirroring helps, and sync
-        // would skip the intermediate half outright. Distinct, more severe, and
-        // prescribing the only primitive that recreates the relation *and*
-        // re-derives its children.
-        if intermediate_expected && !intermediate_present {
-            return vec![Finding {
-                imv: Some(imv.name.clone()),
-                severity: Severity::Error,
-                category: "partition-mirror",
-                finding: format!(
-                    "Intermediate table {} does not exist, so none of anchor source {}'s \
-                     {} child partition(s) can be mirrored onto it. \
-                     reflex_sync_partitions skips the intermediate half of an absent parent.",
-                    int_parent,
-                    anchor,
-                    src_children.len()
-                ),
-                suggested_fix: format!("SELECT reflex_reconcile('{}');", imv.name),
-            }];
-        }
 
         let tgt_children = crate::partition::list_partition_children(client, &tgt_parent);
         let tgt_have: HashSet<String> = tgt_children.iter().map(|c| c.bare_name.clone()).collect();
@@ -219,31 +228,53 @@ impl Check for PartitionMirror {
             .map(|c| crate::partition::target_child_name(&imv.name, &c.bare_name))
             .collect();
 
-        // Not expected (passthrough): no intermediate finding at all, whether or
-        // not a relation of that name happens to exist. Gating on presence alone
-        // would re-open the phantom by a second route — a stray childless
-        // intermediate left over from an earlier definition of the same IMV name
-        // makes every anchor child "missing" again, and the prescribed sync would
-        // materialise partition children on a table no maintenance path reads or
-        // writes. A stray relation is an orphan-family concern, not mirror drift.
+        // The intermediate half runs only when an intermediate is BOTH expected
+        // and present. Either gate alone is insufficient:
         //
-        // The target-side comparison still runs, so a clean target yields zero
-        // findings rather than an empty-bodied one.
-        let (missing_int, extra_int): (Vec<String>, Vec<String>) = if intermediate_expected {
-            let int_children = crate::partition::list_partition_children(client, &int_parent);
-            let int_have: HashSet<String> =
-                int_children.iter().map(|c| c.bare_name.clone()).collect();
-            let src_expected_int: HashSet<String> = src_children
-                .iter()
-                .map(|c| crate::partition::intermediate_child_name(&imv.name, &c.bare_name))
-                .collect();
-            (
-                src_expected_int.difference(&int_have).cloned().collect(),
-                int_have.difference(&src_expected_int).cloned().collect(),
-            )
-        } else {
-            (Vec::new(), Vec::new())
-        };
+        // - Presence alone: a stray childless `__reflex_intermediate_<view>` left
+        //   over from an earlier definition of a passthrough IMV of the same name
+        //   makes every anchor child "missing" again, and the prescribed sync would
+        //   materialise partition children on a table no maintenance path reads or
+        //   writes — the same phantom by a second route. Such a stray is reported
+        //   by no check at all: `OrphanIntermediate` (`checks_c_orphan.rs:167-171`)
+        //   builds `expected` from `intermediate_table_name` for EVERY enabled IMV
+        //   including passthroughs, so the stray is "owned" and never flagged.
+        //   Accepted deliberately: the relation is inert (nothing reads or writes
+        //   it, and it holds no rows), and the alternative — dropping passthrough
+        //   intermediates from that `expected` set — would arm an
+        //   `DROP TABLE … CASCADE` remedy keyed on a passthrough classification in
+        //   the very check the field just caught false-positiving.
+        // - Expectation alone: an aggregate IMV whose intermediate parent has been
+        //   dropped would report all children missing with a sync remedy that
+        //   skips the absent parent. NOTHING in the extension recreates a dropped
+        //   intermediate — `reflex_reconcile` on a partitioned IMV takes the swap
+        //   path, which needs an existing parent to ATTACH to, and
+        //   `reflex_rebuild_imv` is a literal alias for it (`src/lib.rs:823`); both
+        //   return `ERROR: partition reconcile failed`. So there is no truthful
+        //   remedy this check could print. Absence is deliberately left to
+        //   `internal-tables-exist`, which already reports it as an Error — the
+        //   same division of labour `IntermediateShape` documents above
+        //   ("internal-tables-exist covers absence"). See
+        //   `untreated_bugs/2026-07-24_no_primitive_recreates_dropped_intermediate.md`.
+        //
+        // The target-side comparison runs in every case, so a clean target yields
+        // zero findings rather than an empty-bodied one.
+        let (missing_int, extra_int): (Vec<String>, Vec<String>) =
+            if intermediate_expected && intermediate_present {
+                let int_children = crate::partition::list_partition_children(client, &int_parent);
+                let int_have: HashSet<String> =
+                    int_children.iter().map(|c| c.bare_name.clone()).collect();
+                let src_expected_int: HashSet<String> = src_children
+                    .iter()
+                    .map(|c| crate::partition::intermediate_child_name(&imv.name, &c.bare_name))
+                    .collect();
+                (
+                    src_expected_int.difference(&int_have).cloned().collect(),
+                    int_have.difference(&src_expected_int).cloned().collect(),
+                )
+            } else {
+                (Vec::new(), Vec::new())
+            };
         let missing_tgt: Vec<String> = src_expected_tgt.difference(&tgt_have).cloned().collect();
         let extra_tgt: Vec<String> = tgt_have.difference(&src_expected_tgt).cloned().collect();
 

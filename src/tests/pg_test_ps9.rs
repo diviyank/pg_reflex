@@ -11,10 +11,19 @@
 // `Intermediate is missing child partitions: … (17 tables)` with the printed
 // remedy returning `sync: +0 intermediate, +675 target` forever.
 //
-// The check is NARROWED, not disabled: a genuinely missing intermediate child on
-// an aggregate IMV is still reported with the sync remedy, and an aggregate IMV
-// whose intermediate parent is gone entirely now gets a distinct, more severe
-// finding pointing at `reflex_reconcile` (the only primitive that recreates it).
+// The check is NARROWED, not disabled. The intermediate half now runs only when an
+// intermediate is both EXPECTED (`end_query` non-empty) and PRESENT:
+//
+// - expected + present  → unchanged; a genuinely missing intermediate child on an
+//   aggregate IMV is still reported, still with the sync remedy that repairs it.
+// - not expected        → silent, whether or not a stray relation of that name
+//   exists; sync would only materialise dead partition children.
+// - expected + absent   → silent HERE, because no primitive in the extension
+//   recreates a dropped intermediate (verified by probe: both `reflex_reconcile`
+//   and its alias `reflex_rebuild_imv` return `ERROR: partition reconcile
+//   failed`), so any remedy this check printed would be unclearable — the very
+//   anti-pattern being deleted. `internal-tables-exist` already reports the
+//   absence as an Error, and the target half of this check keeps running.
 
 /// The `Suggested fix:` block of the first `reflex_audit` finding whose header
 /// line names `category`. Panics when there is none, so a test can never pass by
@@ -249,13 +258,18 @@ fn ps9_aggregate_imv_missing_intermediate_child_is_still_reported() {
     );
 }
 
-/// (3) CASE 2 of the classification. An aggregate IMV whose intermediate PARENT
-/// is gone is a different, worse condition: the object does not exist, so no
-/// amount of child mirroring helps. It gets a distinct finding pointing at
-/// `reflex_reconcile`, and must NOT print the misleading "missing child
-/// partitions" text.
+/// (3) An aggregate IMV whose intermediate PARENT is gone entirely. Mirror drift
+/// is not the right vocabulary for a relation that does not exist, and — verified
+/// by probe — no primitive in the extension recreates one: `reflex_reconcile` on a
+/// partitioned IMV takes the swap path and returns `ERROR: partition reconcile
+/// failed`, and `reflex_rebuild_imv` is a literal alias for it (`src/lib.rs:823`).
+/// So `partition-mirror` must NOT invent a remedy it cannot honour; absence stays
+/// the business of `internal-tables-exist`, which reports it as an Error — the
+/// division of labour `IntermediateShape` documents ("internal-tables-exist covers
+/// absence"). Asserting BOTH halves is what keeps this from being a silencing
+/// test: the misleading text must go AND the true Error must remain.
 #[pg_test]
-fn ps9_aggregate_imv_missing_intermediate_parent_gets_severe_reconcile_finding() {
+fn ps9_aggregate_imv_missing_intermediate_parent_is_left_to_internal_tables_exist() {
     ps9_make_aggregate_fixture("ps9_mp_src", "ps9_mp_view");
 
     Spi::run("DROP TABLE __reflex_intermediate_ps9_mp_view CASCADE")
@@ -267,23 +281,56 @@ fn ps9_aggregate_imv_missing_intermediate_parent_gets_severe_reconcile_finding()
         "an absent intermediate parent must not be described as missing children:\n{report}"
     );
     assert!(
-        report.contains("partition-mirror"),
-        "an expected-but-absent intermediate must still be reported by \
-         partition-mirror:\n{report}"
+        !report.contains("partition-mirror"),
+        "partition-mirror must stay silent on absence — it has no remedy that \
+         works, and inventing one recreates the unclearable-finding bug this \
+         branch exists to delete:\n{report}"
+    );
+    assert!(
+        report.contains("internal-tables-exist")
+            && report.contains("__reflex_intermediate_ps9_mp_view"),
+        "the absence itself must remain visible via internal-tables-exist, naming \
+         the relation:\n{report}"
+    );
+    let fix = ps9_suggested_fix(&report, "internal-tables-exist");
+    assert!(
+        fix.contains("reflex_rebuild_imv"),
+        "internal-tables-exist owns the remedy for absence; got fix: {fix}"
+    );
+}
+
+/// (3b) The target half must keep working when the intermediate parent is absent.
+/// Deleting the early return that the old Case-2 finding needed is only safe if
+/// real target drift is still reported in that state — otherwise silencing the
+/// intermediate half would have blinded the check to the target too.
+#[pg_test]
+fn ps9_absent_intermediate_does_not_blind_the_target_half() {
+    ps9_make_aggregate_fixture("ps9_bt_src", "ps9_bt_view");
+
+    Spi::run("DROP TABLE __reflex_intermediate_ps9_bt_view CASCADE")
+        .expect("drop the whole intermediate tree");
+    let victim = Spi::get_one::<String>(
+        "SELECT c.relname::text FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid \
+         WHERE i.inhparent = 'ps9_bt_view'::regclass ORDER BY c.relname LIMIT 1",
+    )
+    .expect("target child lookup failed")
+    .expect("no target child");
+    Spi::run(&format!("DROP TABLE {victim}")).expect("drop one target child");
+
+    let report = ps9_audit("ps9_bt_view");
+    assert!(
+        report.contains("Target is missing child partitions") && report.contains(&victim),
+        "target drift must still be reported while the intermediate parent is \
+         absent:\n{report}"
+    );
+    assert!(
+        !report.contains("Intermediate is missing child partitions"),
+        "the intermediate half must stay silent on absence:\n{report}"
     );
     let fix = ps9_suggested_fix(&report, "partition-mirror");
     assert!(
-        fix.contains("reflex_reconcile"),
-        "only reflex_reconcile recreates an absent intermediate; got fix: {fix}"
-    );
-    assert!(
-        !fix.contains("reflex_sync_partitions"),
-        "sync skips the intermediate half when the parent is absent, so it must \
-         not be prescribed; got fix: {fix}"
-    );
-    assert!(
-        report.contains("__reflex_intermediate_ps9_mp_view"),
-        "the finding must name the absent relation:\n{report}"
+        fix.contains("reflex_sync_partitions"),
+        "target-only drift is repairable by sync; got fix: {fix}"
     );
 }
 
@@ -349,15 +396,20 @@ fn ps9_passthrough_partitioned_imv_in_custom_schema_under_narrow_search_path() {
     );
 }
 
-/// (6) HARDENING — the fourth corner the three-way classification does not name:
-/// intermediate NOT expected but a relation with that name nevertheless PRESENT
-/// (e.g. residue of an earlier aggregate definition of the same IMV name). Gating
-/// only on presence would re-open the phantom by a second route: the parent has no
-/// children, so every anchor child is "missing" again, and the prescribed sync
-/// would happily materialise partition children on a table no maintenance path
-/// reads or writes. The intermediate half stays silent for a passthrough IMV
-/// regardless of presence; a stray relation is an orphan-family concern, not
-/// mirror drift, and must not be described as missing children.
+/// (6) HARDENING — intermediate NOT expected but a relation with that name
+/// nevertheless PRESENT (residue of an earlier definition of the same IMV name).
+/// Gating on presence alone re-opens the phantom by a second route: the stray
+/// parent has no children, so every anchor child is "missing" again, and the
+/// prescribed sync would materialise partition children on a table no maintenance
+/// path reads or writes.
+///
+/// The stray relation itself is reported by NO check: `OrphanIntermediate` builds
+/// its `expected` set from `intermediate_table_name` for every enabled IMV
+/// including passthroughs, so the stray counts as owned. That is accepted — the
+/// relation is inert (no maintenance path reads or writes it, and it holds no
+/// rows), and the alternative would arm a `DROP TABLE … CASCADE` remedy keyed on a
+/// passthrough classification inside the check the field just caught
+/// false-positiving. Recorded, not fixed.
 #[pg_test]
 fn ps9_stray_intermediate_on_passthrough_imv_is_not_reported_as_missing_children() {
     ps9_make_passthrough_fixture("ps9_st_src", "ps9_st_view");
