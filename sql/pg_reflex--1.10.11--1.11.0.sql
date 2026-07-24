@@ -4,9 +4,10 @@
 --
 -- Replace the module (.so) BEFORE running this.
 --
--- 1.11.0 collects several independent fixes. Each owns one clearly fenced
--- section below; sections do not depend on each other and may be applied in any
--- order.
+-- 1.11.0 collects several fixes, each owning one clearly fenced section below.
+-- The sections appear in DEPENDENCY order and must NOT be reordered: PS-2's
+-- inline create_args backfill reads the `is_generated_sub_imv` column that PS-1
+-- adds, so PS-1 must run before PS-2. Keep the sections in the order given.
 
 SELECT 1 WHERE FALSE;
 
@@ -313,7 +314,18 @@ BEGIN
           AND COALESCE((r.aggregations->>'is_passthrough')::bool, FALSE)
           AND dep NOT LIKE '<%'
     LOOP
-        PERFORM public.reflex_rebuild_triggers(_src);
+        -- reflex_rebuild_triggers RAISES (it does not merely return an 'ERROR:'
+        -- string) on a source it cannot resolve — e.g. a stale IMV whose
+        -- depends_on names a qualified relation in a since-dropped tenant schema,
+        -- or a bare name resolvable only outside the session search_path. A raise
+        -- here would roll back the ENTIRE atomic ALTER EXTENSION UPDATE. Isolate
+        -- each source in its own savepoint so one unresolvable source cannot abort
+        -- the upgrade; the loop keeps healing the rest.
+        BEGIN
+            PERFORM public.reflex_rebuild_triggers(_src);
+        EXCEPTION WHEN OTHERS THEN
+            RAISE WARNING 'pg_reflex 1.11.0 (PS-6): could not heal passthrough scratch for source % (%); reconcile it manually after fixing search_path/schema', _src, SQLERRM;
+        END;
     END LOOP;
 
     WITH marked AS (

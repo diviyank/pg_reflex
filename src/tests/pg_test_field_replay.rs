@@ -437,3 +437,84 @@ fn ps6_migration_do_block_recreates_scratch_and_marks_known_stale() {
     assert!(!still_stale, "reflex_reconcile must clear known_stale");
     assert_imv_correct("ps6m_v", sql);
 }
+
+/// PS-6 heal-loop resilience — the shipped `DO $ps6$` loop calls
+/// `reflex_rebuild_triggers(_src)` once per enabled passthrough source. Contrary
+/// to the PS-6 comment ("returns an ERROR string rather than raising"), that
+/// function RAISES on a source it cannot resolve: for a DEFERRED passthrough it
+/// resolves the qualified `depends_on` name and then fetches the source's columns
+/// via `'<schema>.<rel>'::regclass`, which ereports ERROR when the schema/relation
+/// no longer exists — the recurring multi-tenant / dropped-schema footgun (a stale
+/// IMV whose source lives in, or once lived in, a non-`public` tenant schema).
+///
+/// Because ALTER EXTENSION UPDATE is ONE atomic transaction, an unguarded raise in
+/// this loop rolls back the ENTIRE 1.11.0 upgrade (PS-1/PS-4/PS-2/PS-3/PS-7
+/// included) — the operator gets none of 1.11.0. The loop must survive one
+/// unresolvable source (downgrade the raise to a WARNING) and keep healing the
+/// others. This exercises the ACTUAL shipped `DO $ps6$` block via `include_str!`.
+#[pg_test]
+fn ps6_migration_do_block_survives_unresolvable_source() {
+    let migration = include_str!("../../sql/pg_reflex--1.10.11--1.11.0.sql");
+    let start = migration.find("DO $ps6$").expect("migration must contain the PS-6 DO block");
+    let end = migration[start..].find("$ps6$;").expect("PS-6 block must terminate") + start
+        + "$ps6$;".len();
+    let do_block = &migration[start..end];
+
+    // (1) A healthy, resolvable passthrough source. Drop its scratch pair so the
+    //     heal loop has something to (re)create — proof that the loop kept going.
+    Spi::run("CREATE TABLE ps6g_ok_src (id INT PRIMARY KEY, grp TEXT)").unwrap();
+    Spi::run("INSERT INTO ps6g_ok_src VALUES (1,'a')").unwrap();
+    crate::create_reflex_ivm(
+        "ps6g_ok_v",
+        "SELECT id, grp FROM ps6g_ok_src",
+        Some("id"),
+        None,
+        Some("DEFERRED"),
+        None,
+    );
+    let ok_new = "__reflex_pt_new_ps6g_ok_v_ps6g_ok_src";
+    let ok_old = "__reflex_pt_old_ps6g_ok_v_ps6g_ok_src";
+    Spi::run(&format!("DROP TABLE \"{ok_new}\"")).unwrap();
+    Spi::run(&format!("DROP TABLE \"{ok_old}\"")).unwrap();
+    assert!(
+        !ps6_regclass_exists(ok_new) && !ps6_regclass_exists(ok_old),
+        "precondition: the resolvable source's scratch pair must be dropped"
+    );
+
+    // (2) A stale passthrough IMV whose depends_on names a qualified relation in a
+    //     schema that does not exist. reflex_rebuild_triggers takes the qualified
+    //     branch, sees a DEFERRED dependent, and RAISES at `::regclass` fetching
+    //     the missing source's columns — exactly the field abort.
+    Spi::run("CREATE TABLE ps6g_bad_src (id INT PRIMARY KEY, grp TEXT)").unwrap();
+    crate::create_reflex_ivm(
+        "ps6g_bad_v",
+        "SELECT id, grp FROM ps6g_bad_src",
+        Some("id"),
+        None,
+        Some("DEFERRED"),
+        None,
+    );
+    Spi::run(
+        "UPDATE public.__reflex_ivm_reference \
+            SET depends_on = ARRAY['ps6g_gone_schema.ps6g_gone_src'] \
+          WHERE name = 'ps6g_bad_v'",
+    )
+    .unwrap();
+
+    // (a) The shipped heal loop must NOT propagate the raise: a WARNING keeps the
+    //     enclosing atomic ALTER EXTENSION UPDATE alive, an ERROR rolls it all back.
+    //     On the current unguarded loop this returns Err (the upgrade aborts).
+    let res = Spi::run(do_block);
+    assert!(
+        res.is_ok(),
+        "PS-6 heal loop must not abort the upgrade when a passthrough source is \
+         unresolvable — it must WARN and continue. Got: {res:?}"
+    );
+
+    // (b) …and it must have kept healing the OTHER, resolvable source.
+    assert!(
+        ps6_regclass_exists(ok_new) && ps6_regclass_exists(ok_old),
+        "PS-6 heal loop must recreate the resolvable source's scratch pair despite \
+         another source raising"
+    );
+}
