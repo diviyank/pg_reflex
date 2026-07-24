@@ -538,6 +538,85 @@ fn ps10_dropped_intermediate_printed_remedy_converges_non_public_schema() {
     );
 }
 
+/// (5d) An EXPRESSION group key. This is what pins the `base_query` half of the
+/// `column_types` reconstruction: `date_trunc('day', ts)` exists in no catalog, so
+/// the sources' `pg_attribute` rows cannot type it and `resolve_column_type` would
+/// fall through to its NUMERIC default. Only the temp view over `base_query` —
+/// whose output column names ARE the intermediate's column names — resolves it.
+/// Every other fixture here groups on a bare source column and stays green without
+/// that line.
+#[pg_test]
+fn ps10_dropped_intermediate_remedy_converges_with_expression_group_key() {
+    Spi::run("CREATE TABLE ps10_c6_src (id BIGINT, ts TIMESTAMPTZ NOT NULL, amount NUMERIC)")
+        .expect("src");
+    Spi::run(
+        "INSERT INTO ps10_c6_src VALUES (1,'2026-01-01 04:00+00',100), \
+         (2,'2026-01-01 20:00+00',200), (3,'2026-02-03 09:00+00',50)",
+    )
+    .expect("seed");
+    Spi::run(
+        "SELECT create_reflex_ivm('ps10_c6_view', \
+           'SELECT date_trunc(''day'', ts) AS d, SUM(amount) AS total \
+            FROM ps10_c6_src GROUP BY date_trunc(''day'', ts)')",
+    )
+    .expect("create expression-group-key IMV");
+
+    let key_type_sql = "SELECT format_type(a.atttypid, a.atttypmod) \
+         FROM pg_attribute a \
+         WHERE a.attrelid = '__reflex_intermediate_ps10_c6_view'::regclass \
+           AND a.attnum > 0 AND NOT a.attisdropped \
+           AND a.attname NOT LIKE '\\_\\_%' \
+         ORDER BY a.attnum LIMIT 1";
+    let created_key_type = Spi::get_one::<String>(key_type_sql)
+        .expect("q")
+        .expect("no intermediate key column");
+    assert_eq!(
+        created_key_type, "timestamp with time zone",
+        "fixture precondition: create time types the expression key from the query, \
+         not from the catalog"
+    );
+
+    Spi::run("DROP TABLE __reflex_intermediate_ps10_c6_view CASCADE").expect("drop intermediate");
+    ps10_run_printed_remedy("ps10_c6_view");
+
+    let healed_key_type = Spi::get_one::<String>(key_type_sql)
+        .expect("q")
+        .expect("intermediate not recreated");
+    assert_eq!(
+        healed_key_type, created_key_type,
+        "the healed intermediate must type the expression key the same way create \
+         time did — a NUMERIC fallback here means the reconstruction lost the \
+         base_query half"
+    );
+
+    let report = ps10_audit("ps10_c6_view");
+    assert!(
+        ps10_findings(&report, "internal-tables-exist").is_empty(),
+        "the printed remedy must clear its own finding:\n{report}"
+    );
+    assert_eq!(
+        ps10_diff_count(
+            "SELECT d, total FROM ps10_c6_view",
+            "SELECT date_trunc('day', ts), SUM(amount) FROM ps10_c6_src \
+             GROUP BY date_trunc('day', ts)"
+        ),
+        0,
+        "the repaired IMV must match its defining query"
+    );
+
+    Spi::run("INSERT INTO ps10_c6_src VALUES (4,'2026-02-03 23:00+00',7)").expect("insert");
+    Spi::run("DELETE FROM ps10_c6_src WHERE id = 1").expect("delete");
+    assert_eq!(
+        ps10_diff_count(
+            "SELECT d, total FROM ps10_c6_view",
+            "SELECT date_trunc('day', ts), SUM(amount) FROM ps10_c6_src \
+             GROUP BY date_trunc('day', ts)"
+        ),
+        0,
+        "the healed expression-key IMV must still maintain incrementally"
+    );
+}
+
 /// (6) A healed IMV must keep maintaining INCREMENTALLY. A recreated but
 /// unregistered / unindexed intermediate that silently stopped being maintained
 /// would be worse than the bug.

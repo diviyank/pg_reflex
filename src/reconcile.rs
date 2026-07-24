@@ -55,6 +55,25 @@ fn heal_missing_intermediate(view_name: &str) {
         None => return,
     };
 
+    // The three inputs create time uses, in create time's order — the map is
+    // `or_insert`-filled, so earlier sources win and adding later ones is purely
+    // additive (`materialize_aggregate`, `src/create_ivm/mod.rs`).
+    //
+    // The `base_query` augment is load-bearing, not belt-and-braces: an EXPRESSION
+    // group key such as `date_trunc('day', ts)` exists in no catalog, so without it
+    // `resolve_column_type` falls through to its NUMERIC default and the healed key
+    // column is `numeric` where create time made it `timestamptz`.
+    //
+    // HAZARD, deliberately guarded below: `augment_column_types_from_query` returns
+    // SILENTLY when its `CREATE TEMP VIEW` fails (`src/create_ivm/admin.rs:513-515`).
+    // At create time a wrongly-typed intermediate dies immediately on the following
+    // `INSERT INTO {intermediate} {base_query}`, which raises and rolls the whole
+    // CREATE back. At heal time that protection is absent on the partitioned path:
+    // `reconcile_one` turns a failed swap fill into a returned `ERROR: …` STRING
+    // rather than a raise, so the transaction is not rolled back and a wrongly-typed
+    // intermediate would be COMMITTED — and the next reconcile would skip the heal
+    // (the relation now exists) and fail forever. So instead of trusting the map, we
+    // refuse to build a shape we cannot type.
     let mut column_types = Spi::connect(|client| {
         crate::create_ivm::query_column_types_from_catalog_with_per_source(
             client,
@@ -63,6 +82,26 @@ fn heal_missing_intermediate(view_name: &str) {
         .0
     });
     crate::create_ivm::augment_column_types_from_query(&record.base_query, &mut column_types);
+    if let Some((sql_query, _)) =
+        Spi::connect(|client| crate::sql_writer::registry::read_imv_for_rebuild(client, view_name))
+    {
+        if !sql_query.is_empty() {
+            crate::create_ivm::augment_column_types_from_query(&sql_query, &mut column_types);
+        }
+    }
+
+    if let Some(unresolved) = first_unresolved_group_key(&plan, &column_types) {
+        warning!(
+            "pg_reflex: cannot recreate the missing internal table(s) of IMV '{}' — \
+             the type of group key '{}' could not be resolved from its sources or its \
+             stored queries, and guessing one would commit an intermediate that no \
+             later reconcile can repair. Recreate the IMV from its original \
+             definition instead.",
+            view_name,
+            unresolved
+        );
+        return;
+    }
 
     let logged = !record.storage_mode.eq_ignore_ascii_case("UNLOGGED");
     let intermediate_ddl = match crate::schema_builder::build_intermediate_table_ddl(
@@ -138,6 +177,28 @@ fn heal_missing_intermediate(view_name: &str) {
             intermediate
         );
     }
+}
+
+/// The first GROUP BY / DISTINCT key whose type the reconstructed `column_types`
+/// cannot supply, if any.
+///
+/// `resolve_column_type` with an empty default reports exactly that: unlike its
+/// `"TEXT"` default — which silently substitutes NUMERIC — an empty default returns
+/// an empty string when nothing in the map matches. Only the key columns are checked
+/// because they are the ones typed from `column_types`; the aggregate columns carry
+/// the `pg_type` create time already resolved into the stored plan.
+fn first_unresolved_group_key(
+    plan: &aggregation::AggregationPlan,
+    column_types: &std::collections::HashMap<String, String>,
+) -> Option<String> {
+    plan.group_by_columns
+        .iter()
+        .chain(plan.distinct_columns.iter())
+        .find(|col| {
+            let norm = crate::query_decomposer::normalized_column_name(col);
+            crate::schema_builder::resolve_column_type(&norm, column_types, "").is_empty()
+        })
+        .cloned()
 }
 
 /// `to_regclass` presence probe for an already-quoted, qualified relation name.
