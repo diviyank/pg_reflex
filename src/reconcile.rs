@@ -7,9 +7,16 @@ use crate::query_decomposer::{intermediate_table_name, quote_identifier, split_q
 use crate::schema_builder::build_indexes_ddl;
 use crate::validate_view_name;
 
-/// Reconcile an IMV by rebuilding intermediate + target from scratch.
-/// Use this as a safety net (manually or via pg_cron) to fix drift.
-pub(crate) fn reflex_reconcile(view_name: &str) -> &'static str {
+/// Rebuild ONE IMV's intermediate + target from its own `base_query`.
+///
+/// The single-node primitive. [`reflex_reconcile`] is the entry point, and it
+/// first repairs the sub-IMVs pg_reflex generated for `view_name`.
+///
+/// `drop_orphans` is forwarded to the pre-rebuild partition sync. The operator
+/// entry point passes `true` (unchanged from 1.10.11); the recursive descent
+/// passes `false` so reconciling a chain does not multiply an orphan-dropping
+/// side effect the caller never asked for across every generated node in it.
+fn reconcile_one(view_name: &str, drop_orphans: bool) -> &'static str {
     if let Err(msg) = validate_view_name(view_name) {
         return msg;
     }
@@ -18,7 +25,7 @@ pub(crate) fn reflex_reconcile(view_name: &str) -> &'static str {
     // failures are surfaced as a NOTICE but do not abort reconcile — the
     // operator may have deliberately stale state, and the rebuild itself
     // is the recovery action.
-    let sync_msg = crate::partition::reflex_sync_partitions_impl(view_name, true);
+    let sync_msg = crate::partition::reflex_sync_partitions_impl(view_name, drop_orphans);
     if sync_msg.starts_with("ERROR") {
         pgrx::notice!("pg_reflex: sync before reconcile returned: {}", sync_msg);
     }
@@ -106,7 +113,7 @@ pub(crate) fn reflex_reconcile(view_name: &str) -> &'static str {
                 );
 
                 let _ = client.update(
-                    "UPDATE public.__reflex_ivm_reference SET last_update_date = NOW() WHERE name = $1",
+                    "UPDATE public.__reflex_ivm_reference SET last_update_date = clock_timestamp() WHERE name = $1",
                     None,
                     &[unsafe {
                         DatumWithOid::new(view_name.to_string(), PgBuiltInOids::TEXTOID.oid().value())
@@ -362,10 +369,14 @@ pub(crate) fn reflex_reconcile(view_name: &str) -> &'static str {
                 .unwrap_or_report();
         }
 
-        // Update last_update_date
+        // Update last_update_date. clock_timestamp() (wall-clock at statement
+        // time), NOT NOW() (transaction start): a reflex_scheduled_reconcile
+        // batch runs many reconciles in one transaction, and NOW() stamped every
+        // one of them identically, so the column could not date an individual
+        // rebuild. clock_timestamp() stamps each rebuild's own end.
         client
             .update(
-                "UPDATE public.__reflex_ivm_reference SET last_update_date = NOW() WHERE name = $1",
+                "UPDATE public.__reflex_ivm_reference SET last_update_date = clock_timestamp() WHERE name = $1",
                 None,
                 &[unsafe {
                     DatumWithOid::new(view_name.to_string(), PgBuiltInOids::TEXTOID.oid().value())
@@ -389,39 +400,235 @@ pub(crate) fn reflex_reconcile(view_name: &str) -> &'static str {
     })
 }
 
-/// One row in the result set of `reflex_scheduled_reconcile`.
-type ScheduledReconcileRow = (String, String, i64);
+/// Reconcile an IMV by rebuilding intermediate + target from scratch, first
+/// rebuilding the sub-IMVs pg_reflex generated for it.
+/// Use this as a safety net (manually or via pg_cron) to fix drift.
+///
+/// A decomposed IMV's `base_query` reads a node pg_reflex invented while
+/// splitting one `create_reflex_ivm` call — a CTE sub-IMV, a set-op operand, a
+/// DISTINCT-ON / window base. Rebuilding only the named IMV re-derives it from
+/// that node's possibly-stale contents and reports `RECONCILED`, which is how a
+/// chain whose generated child reads a MATERIALIZED VIEW (untriggerable, so the
+/// child is frozen at create time) served month-old rows through every recovery
+/// primitive an operator reaches for first. So: rebuild the generated
+/// descendants bottom-up, then the named IMV.
+///
+/// A *user-declared* IMV dependency keeps the old non-recursive behaviour.
+/// Reconciling someone else's IMV is not this call's business, and the operator
+/// can name it directly.
+pub(crate) fn reflex_reconcile(view_name: &str) -> &'static str {
+    reflex_reconcile_with_orphans(view_name, true)
+}
 
-/// Reconcile every IMV whose `last_update_date` is older than `max_age_minutes`,
-/// or which has not been updated yet. Designed to be invoked on a cadence by
-/// pg_cron or another scheduler. Each per-IMV reconcile runs in isolation so
-/// one failure does not block the rest.
+/// [`reflex_reconcile`] with explicit control over whether the pre-rebuild
+/// partition sync may drop orphan IMV partitions.
 ///
-/// Returns one row per attempted IMV: `(name, status, ms)` where `status` is
-/// either `'RECONCILED'` or an error string, and `ms` is the wall time of the
-/// reconcile call.
+/// `reflex_reconcile` hardcodes `true`, which is 1.10.11 behaviour and stays the
+/// default for operators. `reflex_doctor` needs `false`: it refuses an F3 orphan
+/// drop when the operator did not pass `drop_orphans`, and then reached the same
+/// destruction through its F4 `reflex_reconcile` repair — a health tool removing a
+/// partition after authorization was declined. This entry point is what lets that
+/// caller honour its own gate.
+pub(crate) fn reflex_reconcile_with_orphans(view_name: &str, drop_orphans: bool) -> &'static str {
+    let mut child_failed = false;
+    if inside_trigger() {
+        warn_if_recursion_skipped_with_generated_children(view_name);
+    } else {
+        warn_about_skipped_decomposed_nodes(view_name);
+        let children = generated_dependencies_shallowest_first(view_name);
+        if !children.is_empty() {
+            // Tell `reflex_on_ddl_command_end` which chain we are rebuilding, so
+            // it suppresses the spurious "source altered — run reflex_rebuild_imv"
+            // alarm (and, under 'error' policy, the abort) that our own
+            // DISABLE/ENABLE TRIGGER on each generated child would otherwise
+            // raise. Transaction-scoped; a different root reading a shared node
+            // still warns.
+            set_internal_reconcile_root(Some(view_name));
+            for child in &children {
+                let result = reconcile_generated_child_without_propagating(child);
+                if result.starts_with("ERROR") {
+                    child_failed = true;
+                    warning!(
+                        "pg_reflex: reconcile of generated sub-IMV '{}' of '{}' returned: {} \
+                         — rebuilding '{}' anyway, but reporting failure",
+                        child,
+                        view_name,
+                        result,
+                        view_name
+                    );
+                }
+            }
+            set_internal_reconcile_root(None);
+        }
+    }
+
+    let own = reconcile_one(view_name, drop_orphans);
+
+    // The parent is rebuilt even when a child failed — that still repairs any
+    // drift local to the parent, and leaving it untouched would be no fresher.
+    // But the RETURN VALUE must not claim success: the parent has just been
+    // re-derived from a sub-IMV we know is stale. `reflex_doctor`'s
+    // verified-repair check reads only `known_stale` on the named IMV, which this
+    // rebuild clears, and the failed child was never `known_stale` in the first
+    // place, so this string is the only signal that survives.
+    if child_failed {
+        return "ERROR: generated sub-IMV reconcile failed";
+    }
+    own
+}
+
+/// WARN when the trigger-depth gate suppresses recursion for an IMV that
+/// actually has generated children.
 ///
-/// ```sql
-/// -- Run every 15 minutes via pg_cron
-/// SELECT cron.schedule('reflex-drift-scan', '*/15 * * * *',
-///     'SELECT * FROM reflex_scheduled_reconcile(60)');
-/// ```
-#[pg_extern]
-pub fn reflex_scheduled_reconcile(
-    max_age_minutes: default!(i32, 60),
-) -> TableIterator<'static, (name!(name, String), name!(status, String), name!(ms, i64))> {
-    let candidates: Vec<String> = Spi::connect(|client| {
-        let sql = "SELECT name FROM public.__reflex_ivm_reference \
-                   WHERE COALESCE(enabled, TRUE) = TRUE \
-                     AND (last_update_date IS NULL \
-                          OR last_update_date < (CURRENT_TIMESTAMP - make_interval(mins => $1))) \
-                   ORDER BY graph_depth, name";
+/// Returning `RECONCILED` there is the B1 bug in miniature — a rebuild that
+/// re-derives from a child it did not refresh. It is the right behaviour on this
+/// path (the delta that fired the trigger made the child fresh, and DDL on the
+/// relation under its own statement trigger would error), but it must not be
+/// silent, because an operator reading the log needs to know a nested reconcile
+/// did less than the top-level one would.
+fn warn_if_recursion_skipped_with_generated_children(view_name: &str) {
+    let generated_children = generated_dependencies_shallowest_first(view_name);
+    if !generated_children.is_empty() {
+        warning!(
+            "pg_reflex: reconcile of '{}' ran inside a trigger, so its {} generated \
+             sub-IMV(s) ({}) were NOT rebuilt; run SELECT reflex_reconcile('{}') outside \
+             a trigger to refresh the whole chain",
+            view_name,
+            generated_children.len(),
+            generated_children.join(", "),
+            view_name
+        );
+    }
+}
+
+/// TRUE when we are executing inside a data-change trigger.
+///
+/// pg_reflex calls `reflex_reconcile` from its own generated trigger bodies —
+/// the high-selectivity "wipe" branch and the partition trip-cap branch in
+/// `trigger/dispatch.rs`, and the partition-flush plpgsql in `lib.rs` /
+/// `partition.rs`. Those callers must keep the single-node behaviour for two
+/// independent reasons: their sources are fresh by construction (a delta just
+/// arrived), and recursing would run `TRUNCATE` / `ALTER TABLE` against the very
+/// relation whose statement trigger is mid-execution, with its transition tables
+/// live. Since rebuilding a generated child is itself a 100%-of-rows change it
+/// trips the wipe branch, so without this gate the recursion would re-enter
+/// itself.
+/// Publish (or clear, with `None`) the name of the chain reflex_reconcile is
+/// rebuilding, in a transaction-scoped GUC the `reflex_on_ddl_command_end` event
+/// trigger reads to suppress the stale alarm for our own trigger-suppression
+/// ALTERs. `SET LOCAL` so it reverts at transaction end even on an error path;
+/// the placeholder GUC name (contains a dot) needs no prior definition.
+fn set_internal_reconcile_root(root: Option<&str>) {
+    let sql = match root {
+        Some(name) => format!(
+            "SET LOCAL pg_reflex.internal_reconcile_root = '{}'",
+            name.replace('\'', "''")
+        ),
+        None => "SET LOCAL pg_reflex.internal_reconcile_root = ''".to_string(),
+    };
+    let _ = Spi::run(&sql);
+}
+
+/// Fails CLOSED: an unreadable probe is treated as "inside a trigger", which
+/// disables the recursion. The gate is mandatory, so a probe failure must not be
+/// the thing that enables re-entrant DDL on a relation under its own trigger.
+fn inside_trigger() -> bool {
+    Spi::get_one::<i32>("SELECT pg_trigger_depth()")
+        .unwrap_or(None)
+        .unwrap_or(1)
+        > 0
+}
+
+/// SQL predicate identifying a node the recursion must NOT hand to
+/// `reconcile_one`.
+///
+/// `RegistryRow::decomposed` writes `aggregations = '{}'`; every node built by the
+/// main create path stores a serialised `AggregationPlan`, which is never `'{}'`
+/// even for a passthrough (`is_passthrough` alone makes the object non-empty). So
+/// this selects exactly the decomposed rows — the UNION-ALL intermediate wrapper,
+/// the set-op VIEW, the DISTINCT-ON and window VIEWs — and leaves passthrough
+/// sub-IMVs in the recursion set where they belong.
+///
+/// Those nodes are not rebuildable from their registry row: the UNION-ALL wrapper
+/// is `(__reflex_src_idx SMALLINT NOT NULL, <payload…>)` while its `base_query` is
+/// `SELECT * FROM op0 UNION ALL SELECT * FROM op1`, so the passthrough branch's
+/// `INSERT INTO <wrapper> SELECT * FROM …` puts N values into N+1 columns —
+/// PostgreSQL left-shifts when the types line up and raises when they do not. The
+/// set-op / DISTINCT-ON / window nodes are VIEWs, which cannot be TRUNCATEd at
+/// all. Giving them a correct rebuild is a separate piece of work; until then the
+/// recursion skips them and says so.
+const REBUILDABLE_NODE: &str = "COALESCE(ref.aggregations::text, '{}') <> '{}'";
+
+/// The extension-generated IMVs `view_name` transitively reads from, shallowest
+/// first — the order they must be rebuilt in, since `depends_on_imv` points at
+/// *shallower* nodes.
+///
+/// The walk starts from all of `view_name`'s IMV dependencies but descends only
+/// through generated ones and returns only generated ones, so a user-declared
+/// dependency is neither rebuilt nor traversed. `UNION` dedupes, so a CTE
+/// sub-IMV shared by two siblings is rebuilt once.
+///
+/// Decomposed nodes ([`REBUILDABLE_NODE`]) are excluded, and the walk does not
+/// descend *past* one either: rebuilding a wrapper's operands while leaving the
+/// wrapper stale would feed the parent from a half-refreshed subtree, which is
+/// worse than leaving that subtree exactly as a pre-1.11.0 reconcile left it.
+fn generated_dependencies_shallowest_first(view_name: &str) -> Vec<String> {
+    Spi::connect(|client| {
         client
             .select(
-                sql,
+                &format!(
+                    "WITH RECURSIVE gen AS ( \
+                           SELECT unnest(COALESCE(r.depends_on_imv, ARRAY[]::TEXT[])) AS nm \
+                             FROM public.__reflex_ivm_reference r WHERE r.name = $1 \
+                         UNION \
+                           SELECT unnest(COALESCE(c.depends_on_imv, ARRAY[]::TEXT[])) \
+                             FROM public.__reflex_ivm_reference c JOIN gen ON c.name = gen.nm \
+                            WHERE COALESCE(c.is_generated_sub_imv, FALSE) \
+                              AND COALESCE(c.aggregations::text, '{{}}') <> '{{}}' \
+                       ) \
+                     SELECT ref.name FROM gen \
+                       JOIN public.__reflex_ivm_reference ref ON ref.name = gen.nm \
+                      WHERE COALESCE(ref.is_generated_sub_imv, FALSE) \
+                        AND COALESCE(ref.enabled, TRUE) \
+                        AND {REBUILDABLE_NODE} \
+                      ORDER BY ref.graph_depth, ref.name"
+                ),
                 None,
                 &[unsafe {
-                    DatumWithOid::new(max_age_minutes, PgBuiltInOids::INT4OID.oid().value())
+                    DatumWithOid::new(view_name.to_string(), PgBuiltInOids::TEXTOID.oid().value())
+                }],
+            )
+            .unwrap_or_report()
+            .filter_map(|row| {
+                row.get_by_name::<&str, _>("name")
+                    .unwrap_or(None)
+                    .map(|s| s.to_string())
+            })
+            .collect()
+    })
+}
+
+/// WARN for each generated sub-IMV the recursion had to skip because it is a
+/// decomposed node with no safe rebuild.
+///
+/// Silence here would be the B1 failure mode again: a `RECONCILED` over a subtree
+/// nothing refreshed. Naming the node gives the operator something to act on.
+fn warn_about_skipped_decomposed_nodes(view_name: &str) {
+    let skipped: Vec<String> = Spi::connect(|client| {
+        client
+            .select(
+                &format!(
+                    "SELECT ref.name FROM public.__reflex_ivm_reference parent \
+                       JOIN public.__reflex_ivm_reference ref \
+                         ON ref.name = ANY(COALESCE(parent.depends_on_imv, ARRAY[]::TEXT[])) \
+                      WHERE parent.name = $1 \
+                        AND COALESCE(ref.is_generated_sub_imv, FALSE) \
+                        AND NOT ({REBUILDABLE_NODE}) \
+                      ORDER BY ref.name"
+                ),
+                None,
+                &[unsafe {
+                    DatumWithOid::new(view_name.to_string(), PgBuiltInOids::TEXTOID.oid().value())
                 }],
             )
             .unwrap_or_report()
@@ -432,9 +639,250 @@ pub fn reflex_scheduled_reconcile(
             })
             .collect()
     });
+    if !skipped.is_empty() {
+        warning!(
+            "pg_reflex: reconcile of '{}' skipped {} decomposed sub-IMV node(s) ({}) — \
+             a UNION-ALL/set-op/DISTINCT-ON/window node has no rebuild from its registry \
+             row, so that part of the chain was NOT refreshed. To refresh it, drop and \
+             recreate the chain: SELECT drop_reflex_ivm('{}', true); then re-run the \
+             original create_reflex_ivm.",
+            view_name,
+            skipped.len(),
+            skipped.join(", "),
+            view_name
+        );
+    }
+}
 
-    let mut out: Vec<ScheduledReconcileRow> = Vec::with_capacity(candidates.len());
-    for name in candidates {
+/// Rebuild a generated sub-IMV with its user triggers suppressed, so the rebuild
+/// does not propagate into its consumers.
+///
+/// `reconcile_one` does `TRUNCATE` + full `INSERT`. Left to propagate, the
+/// TRUNCATE empties the consumer immediately (the AFTER TRUNCATE trigger fires
+/// even for DEFERRED IMVs) while the INSERT only *stages* a delta in DEFERRED
+/// mode — so a consumer rebuilt in between ends up correct and then has the
+/// staged full-table delta applied again at COMMIT, doubling its aggregates.
+/// Suppression removes the delta rather than trying to net it out, and as a side
+/// effect skips a full-size incremental flush whose result the consumer's own
+/// rebuild discards anyway.
+///
+/// Nothing is lost for the chain being rebuilt: every consumer of a generated
+/// sub-IMV within it is either a deeper member of the same generated set or the
+/// named IMV itself, and [`reflex_reconcile`] rebuilds both explicitly. A
+/// consumer OUTSIDE that set — a hand-written IMV reading a generated node, or a
+/// generated node shared with a different root — does miss this delta, and the
+/// `reflex_on_ddl_command_end` alarm the `ALTER TABLE` trips flags it stale, which
+/// for that consumer is the correct signal.
+///
+/// `ALTER TABLE` is transactional, so a hard error inside `reconcile_one` rolls
+/// the DISABLE back with everything else; a soft `"ERROR: …"` return still
+/// reaches the ENABLE.
+///
+/// The `relkind` probe quotes `child` before `to_regclass`. Unquoted, PostgreSQL
+/// down-cases, so every mixed-case IMV resolved to NULL, `triggerable` came out
+/// false, and the child was rebuilt with triggers LIVE — silently reinstating the
+/// DEFERRED double-count this function exists to prevent. The codebase persists
+/// sub-IMV sources double-quoted for exactly this reason
+/// (`query_decomposer.rs:18-23`).
+fn reconcile_generated_child_without_propagating(child: &str) -> &'static str {
+    let quoted = quote_identifier(child);
+    let triggerable = Spi::get_one::<bool>(&format!(
+        "SELECT COALESCE((SELECT relkind IN ('r','p') FROM pg_class \
+          WHERE oid = to_regclass('{}')), FALSE)",
+        quoted.replace('\'', "''")
+    ))
+    .unwrap_or(None)
+    .unwrap_or(false);
+
+    if !triggerable {
+        return reconcile_one(child, false);
+    }
+
+    Spi::run(&format!("ALTER TABLE {} DISABLE TRIGGER USER", quoted)).unwrap_or_report();
+    let result = reconcile_one(child, false);
+    Spi::run(&format!("ALTER TABLE {} ENABLE TRIGGER USER", quoted)).unwrap_or_report();
+    result
+}
+
+/// One row in the result set of `reflex_scheduled_reconcile`.
+type ScheduledReconcileRow = (String, String, i64, i64);
+
+/// Reconcile stale IMVs on a cadence, as a RESUMABLE batched driver.
+///
+/// Reconciles up to `batch_size` IMVs whose `last_update_date` is older than
+/// `max_age_minutes` (or never set), optionally scoped to one `target_schema`.
+/// Each per-IMV reconcile runs in isolation so one soft failure does not block
+/// the rest.
+///
+/// Why a driver, not one call that does everything (B6): a single loop over a
+/// 190-IMV / 415-schema registry cannot finish under a sane `statement_timeout`,
+/// and a timeout discards every rebuild already done — pgrx cannot commit
+/// per-IMV in-process (a set-returning function runs in an atomic context, and
+/// pgrx 0.18 exposes no SPI transaction control), so the durable unit has to be
+/// the CALL. Bound the work with `batch_size` so each call finishes and commits,
+/// and let the scheduler call again. Resumability needs no cursor: a reconciled
+/// IMV's `last_update_date` is advanced (to `clock_timestamp()`) past the age
+/// gate, so it drops out of the candidate set and the next call continues with
+/// the next stale IMV.
+///
+/// Arguments (all optional; defaults reproduce the pre-1.11.0 "one call does
+/// everything" behaviour on a small registry):
+/// * `max_age_minutes` (default 60) — freshness threshold.
+/// * `batch_size` (default 0 = unlimited) — max IMVs attempted per call.
+/// * `target_schema` (default `''` = all schemas) — restrict to one tenant's
+///   `target_schema`; legacy rows with NULL `target_schema` count as `public`.
+///
+/// Returns one row per ATTEMPTED IMV: `(name, status, ms, remaining)` where
+/// `status` is `'RECONCILED'` or an error string (PS-1 surfaces a decomposed
+/// chain's child failure here — it is reported, never swallowed), `ms` is the
+/// reconcile wall time, and `remaining` is the number of candidates this call
+/// DEFERRED because `batch_size` capped it.
+///
+/// `remaining = 0` is NOT a health signal — it only means this call attempted
+/// every remaining candidate, not that they all succeeded. A failed / poison
+/// IMV keeps its stale `last_update_date`, stays a candidate, and is attempted
+/// again next call while `remaining` may already read 0. Monitoring must check
+/// per-row `status` for failures, not just `remaining`.
+///
+/// The age gate is the resume cursor, so `remaining` reaching 0 is meaningful
+/// only under a POSITIVE `max_age_minutes`: a reconciled IMV's `clock_timestamp()`
+/// write then falls inside the fresh window and it drops out. With
+/// `max_age_minutes <= 0` every enabled IMV is perpetually eligible, so a bounded
+/// (`batch_size > 0`) sweep never reports `remaining = 0` — it instead rotates
+/// oldest-first through the registry each call (continuous maintenance). Do not
+/// loop-until-zero on a non-positive gate; drive it from a scheduler tick.
+///
+/// ```sql
+/// -- Small registry: unchanged from 1.10.11 — one call sweeps everything.
+/// SELECT cron.schedule('reflex-drift-scan', '*/15 * * * *',
+///     'SELECT * FROM reflex_scheduled_reconcile(60)');
+///
+/// -- Large registry: bound each tick (positive gate); repeat until remaining = 0.
+/// SELECT cron.schedule('reflex-drift-scan', '*/5 * * * *',
+///     'SELECT * FROM reflex_scheduled_reconcile(60, 25)');
+/// ```
+#[pg_extern]
+pub fn reflex_scheduled_reconcile(
+    max_age_minutes: default!(i32, 60),
+    batch_size: default!(i32, 0),
+    target_schema: default!(&str, "''"),
+) -> TableIterator<
+    'static,
+    (
+        name!(name, String),
+        name!(status, String),
+        name!(ms, i64),
+        name!(remaining, i64),
+    ),
+> {
+    let candidates: Vec<String> = Spi::connect(|client| {
+        // Skip a generated sub-IMV when a candidate that transitively reads it is
+        // also in this batch: `reflex_reconcile` on that candidate already
+        // rebuilds it, and the scan visits children first, so without this filter
+        // a depth-d decomposed chain costs 1+2+…+d rebuilds instead of d.
+        // Measured at 15 rebuilds for a 4-generated-child chain — 3x, and
+        // quadratic in depth.
+        //
+        // The filter is deliberately "covered by a candidate", not "is
+        // generated": a generated node whose consumer is NOT stale enough to be a
+        // candidate stays in the batch, so it is still reconciled rather than
+        // silently skipped. A covered child whose parent then FAILS is not
+        // orphaned: the failed parent keeps a stale `last_update_date`, so it
+        // stays a candidate and covers (and retries) the child on the next call —
+        // and the candidate set is re-derived live every call, so the resumable
+        // cursor inherits no hole.
+        //
+        // Both the base seed and the recursive descent stop at a decomposed node
+        // (`aggregations = '{}'`), mirroring `generated_dependencies_shallowest_first`,
+        // which `reflex_reconcile` uses to decide what it rebuilds. A decomposed
+        // wrapper (UNION-ALL/set-op/DISTINCT-ON/window) is neither standalone-
+        // reconcilable (reconcile_one would column-shift it) nor descended past by
+        // the rebuild, so a candidate reading one does NOT rebuild the operands
+        // below it. Treating that wrapper as a coverer would mark those operands
+        // covered and skip them forever, even though nothing ever reconciles them.
+        // The wrapper itself still gets covered (its rebuildable parent seeds it in
+        // the base step) and correctly stays skipped, while its operands drop out of
+        // the covered set and are reconciled standalone.
+        //
+        // `$2` scopes to one tenant's `target_schema` (empty string = all). The
+        // covered CTE derives from the already-scoped candidate set, so a covered
+        // child is scoped with its parent.
+        //
+        // ORDER BY keeps `graph_depth` primary (children before parents), then
+        // rotates oldest-first within a depth via `last_update_date`. A depth
+        // level holds only mutually independent IMVs — `graph_depth` exceeds
+        // every dependency's depth, so same-depth nodes never depend on each
+        // other — hence reordering within a level cannot perturb dependency
+        // order. The staleness tiebreaker is what lets a bounded (`batch_size`)
+        // call advance through the whole registry instead of re-doing the same
+        // leading rows and starving the tail when the age gate stays open on
+        // just-reconciled IMVs (max_age <= 0). `name` is the final, deterministic
+        // tiebreaker.
+        let sql = "WITH candidate AS ( \
+                       SELECT name, graph_depth, depends_on_imv, last_update_date, aggregations \
+                         FROM public.__reflex_ivm_reference \
+                        WHERE COALESCE(enabled, TRUE) = TRUE \
+                          AND ($2 = '' OR COALESCE(target_schema, 'public') = $2) \
+                          AND (last_update_date IS NULL \
+                               OR last_update_date < (CURRENT_TIMESTAMP - make_interval(mins => $1))) \
+                   ), \
+                   covered AS ( \
+                       WITH RECURSIVE reachable AS ( \
+                             SELECT unnest(COALESCE(c.depends_on_imv, ARRAY[]::TEXT[])) AS nm \
+                               FROM candidate c \
+                              WHERE COALESCE(c.aggregations::text, '{}') <> '{}' \
+                           UNION \
+                             SELECT unnest(COALESCE(r.depends_on_imv, ARRAY[]::TEXT[])) \
+                               FROM public.__reflex_ivm_reference r JOIN reachable ON r.name = reachable.nm \
+                              WHERE COALESCE(r.is_generated_sub_imv, FALSE) \
+                                AND COALESCE(r.aggregations::text, '{}') <> '{}' \
+                       ) \
+                       SELECT reachable.nm AS name \
+                         FROM reachable \
+                         JOIN public.__reflex_ivm_reference ref ON ref.name = reachable.nm \
+                        WHERE COALESCE(ref.is_generated_sub_imv, FALSE) \
+                   ) \
+                   SELECT name FROM candidate \
+                    WHERE name NOT IN (SELECT name FROM covered) \
+                    ORDER BY graph_depth, last_update_date ASC NULLS FIRST, name";
+        client
+            .select(
+                sql,
+                None,
+                &[
+                    unsafe {
+                        DatumWithOid::new(max_age_minutes, PgBuiltInOids::INT4OID.oid().value())
+                    },
+                    unsafe {
+                        DatumWithOid::new(
+                            target_schema.to_string(),
+                            PgBuiltInOids::TEXTOID.oid().value(),
+                        )
+                    },
+                ],
+            )
+            .unwrap_or_report()
+            .filter_map(|row| {
+                row.get_by_name::<&str, _>("name")
+                    .unwrap_or(None)
+                    .map(|s| s.to_string())
+            })
+            .collect()
+    });
+
+    // batch_size <= 0 means unlimited (one call sweeps everything — the
+    // pre-1.11.0 default). Otherwise attempt at most batch_size, and report the
+    // rest as deferred to a future call.
+    let total = candidates.len();
+    let limit = if batch_size <= 0 {
+        total
+    } else {
+        (batch_size as usize).min(total)
+    };
+    let remaining = (total - limit) as i64;
+
+    let mut out: Vec<ScheduledReconcileRow> = Vec::with_capacity(limit);
+    for name in candidates.into_iter().take(limit) {
         let started = std::time::Instant::now();
         let result = reflex_reconcile(&name);
         let ms = started.elapsed().as_millis() as i64;
@@ -448,7 +896,7 @@ pub fn reflex_scheduled_reconcile(
             );
             result.to_string()
         };
-        out.push((name, status, ms));
+        out.push((name, status, ms, remaining));
     }
 
     TableIterator::new(out)

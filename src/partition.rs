@@ -33,7 +33,7 @@ use crate::sql_writer::identifier::format_pg_text_array;
 /// A root that has failed this many flushes stops being retried. Its pending row
 /// and `last_error` survive for `reflex_doctor`, and dependents stay marked
 /// `known_stale`, so the condition is reported rather than silently retried.
-const PARTITION_FLUSH_FAILURE_CAP: i32 = 5;
+pub(crate) const PARTITION_FLUSH_FAILURE_CAP: i32 = 5;
 
 /// A description of how a source table is partitioned.
 ///
@@ -1088,10 +1088,16 @@ pub(crate) fn reflex_sync_partitions_impl(view_name: &str, drop_orphans: bool) -
 
         let mut out = SyncResult::default();
 
-        // Advisory lock keyed by IMV name (hashed) so concurrent calls
-        // serialize their DDL on this view.
+        // Advisory lock keyed by IMV name so concurrent callers serialize their
+        // DDL on this view. INVARIANT: every IMV-name advisory lock in pg_reflex
+        // uses the two-key `(hashtext(name), hashtext(reverse(name)))` form
+        // (immediate/deferred trigger bodies, deferred flush at
+        // trigger/deferred.rs, and partition flush at lib.rs). A one-key `bigint`
+        // lock and a two-key lock occupy different advisory-lock spaces in
+        // PostgreSQL and never mutually exclude, so sync MUST take the same
+        // two-key form to share that space rather than opening a parallel one.
         let _ = client.update(
-            "SELECT pg_advisory_xact_lock(hashtext($1))",
+            "SELECT pg_advisory_xact_lock(hashtext($1), hashtext(reverse($1)))",
             None,
             &[unsafe {
                 DatumWithOid::new(view_name.to_string(), PgBuiltInOids::TEXTOID.oid().value())
@@ -2382,6 +2388,76 @@ fn source_matching_root(deps: &[String], root: &str) -> String {
 /// A pending root that has exceeded the failure cap: (source_root, failures, last_error).
 type CappedRoot = (String, i32, Option<String>);
 
+/// Set the consecutive-failure counter on pending roots. `None` targets every
+/// root carrying failures; `Some(root)` targets just that one. Returns the number
+/// of rows changed.
+///
+/// `last_error` is deliberately left in place: it is the only record of why the
+/// root broke, the next attempt overwrites it, and a successful drain deletes the
+/// row outright.
+fn set_partition_failures(source_root: Option<&str>, value: i32) -> i64 {
+    Spi::connect_mut(|client| {
+        let updated = match source_root {
+            Some(root) => client.update(
+                &format!(
+                    "UPDATE public.__reflex_partition_pending SET failures = {value} \
+                      WHERE source_root = $1 AND failures <> {value}"
+                ),
+                None,
+                &[unsafe {
+                    DatumWithOid::new(root.to_string(), PgBuiltInOids::TEXTOID.oid().value())
+                }],
+            ),
+            None => client.update(
+                &format!(
+                    "UPDATE public.__reflex_partition_pending SET failures = {value} \
+                      WHERE failures <> {value}"
+                ),
+                None,
+                &[],
+            ),
+        };
+        match updated {
+            Ok(table) => table.len() as i64,
+            Err(e) => {
+                pgrx::warning!("pg_reflex: setting partition failure count failed: {}", e);
+                0
+            }
+        }
+    })
+}
+
+/// Re-arm pending roots by zeroing their consecutive-failure counter — the
+/// operator-facing `reflex_reset_partition_failures` contract.
+///
+/// `PARTITION_FLUSH_FAILURE_CAP` makes both flush entry points decline a root that
+/// has failed that many times in a row, so a capped root is skipped by
+/// `reflex_flush_partitions()` *and* by `reflex_flush_partition_source(root)`.
+/// Before this primitive existed the only way out was a manual UPDATE against an
+/// extension-owned table — which the skip warning asked for without providing.
+///
+/// An explicit call is a FULL reset: the operator is asserting the cause is fixed,
+/// so the root gets its whole retry budget back. `reflex_doctor` deliberately does
+/// not use this — see `rearm_capped_partition_root`.
+pub(crate) fn reflex_reset_partition_failures_impl(source_root: Option<&str>) -> i64 {
+    set_partition_failures(source_root, 0)
+}
+
+/// Grant a capped root exactly ONE more flush attempt, for `reflex_doctor`.
+///
+/// Setting the counter to `CAP - 1` rather than 0 is what makes "one attempt"
+/// true: the flush that follows runs (it is below the cap), and if it fails the
+/// drain's own `failures + 1` puts the root straight back at the cap. Zeroing
+/// instead would hand the *commit-time* drain a full fresh budget, so a cron
+/// running `reflex_doctor(fix => TRUE)` would cycle a poison root
+/// `CAP -> 0 -> 1 -> … -> CAP` forever and it would never be permanently skipped —
+/// the one guarantee the cap exists to provide. It would also drop the row below
+/// the doctor's own reporting gates, hiding a root the doctor just failed to
+/// repair from the operator's next run.
+pub(crate) fn rearm_capped_partition_root(source_root: &str) -> i64 {
+    set_partition_failures(Some(source_root), PARTITION_FLUSH_FAILURE_CAP - 1)
+}
+
 pub(crate) fn reflex_flush_partitions_impl(only: Option<&str>) -> String {
     let outcome: Result<String, String> = Spi::connect_mut(|client| {
         let (roots, capped_roots): (Vec<String>, Vec<CappedRoot>) = match only {
@@ -2838,6 +2914,24 @@ pub(crate) fn reflex_flush_partitions_impl(only: Option<&str>) -> String {
                  END \
                  $_reflex_part_sp$"
             );
+            // Stamped OUTSIDE the DO block: the block's EXCEPTION branch rolls its
+            // own body back, and a failed attempt is exactly the one that must stay
+            // dated. A successful drain deletes the row, so any row still visible to
+            // an operator carries the timestamp of the attempt that failed. Without
+            // this, neither `enqueued_at` (reset on every re-enqueue) nor `attempts`
+            // (an enqueue counter) could date a drain failure.
+            client
+                .update(
+                    "UPDATE public.__reflex_partition_pending \
+                        SET last_attempt_at = statement_timestamp() WHERE source_root = $1",
+                    None,
+                    &[unsafe {
+                        DatumWithOid::new(root.to_string(), PgBuiltInOids::TEXTOID.oid().value())
+                    }],
+                )
+                .map_err(|e| {
+                    format!("flush: stamping last_attempt_at for {} failed: {}", root, e)
+                })?;
             client
                 .update(&do_block, None, &[])
                 .map_err(|e| format!("flush: DO block dispatch for root {} failed: {}", root, e))?;

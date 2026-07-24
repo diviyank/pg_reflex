@@ -738,9 +738,34 @@ fn resolve_partitioning(ctx: &mut BuildContext) -> Result<(), String> {
 /// Resolve existing IMV dependencies among `ctx.froms` and compute graph_depth.
 /// Populates `ctx.ivm_froms` and `ctx.depth`.
 fn resolve_existing_imv_deps(client: &mut pgrx::spi::SpiClient<'_>, ctx: &mut BuildContext) {
+    // The probe must compare canonical names, not raw ones. A CTE-decomposed
+    // sub-IMV source is persisted double-quoted (`"schema"."view__cte_x"`) to
+    // preserve identifier case, while the registry `name` is whatever the caller
+    // passed `create_reflex_ivm` — never quoted. Comparing raw strings therefore
+    // never matched a generated child, which left `depends_on_imv` and the
+    // child's `graph_child` empty and collapsed `graph_depth` (PS-1 / N1).
+    //
+    // Only this side needs canonicalising: `canonical_source` is the identity on
+    // an unquoted bare or schema-qualified name, so routing through it strictly
+    // widens the match and cannot un-match a source that matched before.
+    //
+    // `ctx.froms` itself is deliberately left alone — the quoted spelling stored
+    // in `depends_on` is load-bearing for the drop-time prefix scan, for the
+    // `sanitized_source_suffix`-derived trigger and staging-table names, and for
+    // the `$1 = ANY(depends_on)` lookups in `refresh_imv_depending_on` and
+    // `reflex_flush_deferred`.
+    let canonical_froms: Vec<String> = ctx
+        .froms
+        .iter()
+        .map(|source| match canonical_source(source) {
+            (Some(schema), bare) => format!("{schema}.{bare}"),
+            (None, bare) => bare,
+        })
+        .collect();
+
     let args = [unsafe {
         DatumWithOid::new(
-            format_pg_text_array_literal(&ctx.froms),
+            format_pg_text_array_literal(&canonical_froms),
             PgBuiltInOids::TEXTOID.oid().value(),
         )
     }];
@@ -754,6 +779,8 @@ fn resolve_existing_imv_deps(client: &mut pgrx::spi::SpiClient<'_>, ctx: &mut Bu
         .unwrap_or_report()
         .collect::<Vec<_>>();
 
+    // Registry names, not the raw `froms` spelling: `depends_on_imv`,
+    // `add_graph_child_links` and `remove_graph_child` all join on `name`.
     ctx.ivm_froms = matching_froms
         .iter()
         .filter_map(|row| row.get_by_name::<&str, _>("name").unwrap_or(None))
@@ -1492,6 +1519,47 @@ fn install_secondary_key_indexes(client: &mut SpiClient<'_>, ctx: &BuildContext)
     }
 }
 
+/// PS-3 per-node verdict: TRUE iff the node has at least one real source and
+/// *every* real source is a materialized view. A real source is an entry of
+/// `ctx.froms` that is neither a `<subquery:>` / `<function:>` placeholder nor an
+/// ignored source. Such a node cannot self-maintain — PG fires no trigger on a
+/// matview — so it is a snapshot frozen at create time. A node with even one
+/// triggerable real source (a plain table or a sub-IMV table) is maintainable
+/// via it and returns false. This aggregates the per-source matview probe in
+/// `install_source_triggers` to a single per-node decision.
+fn all_real_sources_are_matviews(client: &SpiClient<'_>, ctx: &BuildContext) -> bool {
+    let mut saw_real_source = false;
+    for source in &ctx.froms {
+        if source.starts_with('<') {
+            continue;
+        }
+        let (_, source_bare) = split_qualified_name(source);
+        if ctx
+            .ignore_sources
+            .iter()
+            .any(|s| s == source || s == source_bare)
+        {
+            continue;
+        }
+        saw_real_source = true;
+        let is_matview = client
+            .select(
+                "SELECT 1 FROM pg_class WHERE oid = to_regclass($1) AND relkind = 'm'",
+                None,
+                &[unsafe {
+                    DatumWithOid::new(source.to_string(), PgBuiltInOids::TEXTOID.oid().value())
+                }],
+            )
+            .unwrap_or_report()
+            .next()
+            .is_some();
+        if !is_matview {
+            return false;
+        }
+    }
+    saw_real_source
+}
+
 /// Compute base_query / end_query / aggregations_json / index_columns /
 /// where_predicate, INSERT a RegistryRow into `__reflex_ivm_reference`, and
 /// add this IMV's name to the `graph_child` array of each parent IMV.
@@ -1602,6 +1670,8 @@ fn persist_metadata(client: &mut SpiClient<'_>, ctx: &BuildContext) {
 
     let create_args_json = format!("{{ {} }}", create_args_parts.join(", "));
 
+    let requires_explicit_refresh = all_real_sources_are_matviews(client, ctx);
+
     insert_registry_row(
         client,
         &RegistryRow {
@@ -1627,6 +1697,7 @@ fn persist_metadata(client: &mut SpiClient<'_>, ctx: &BuildContext) {
             partition_depth: ctx.resolved_partition_depth,
             max_one_row,
             create_args: Some(&create_args_json),
+            requires_explicit_refresh,
         },
     )
     .unwrap_or_report();

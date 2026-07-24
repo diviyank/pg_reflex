@@ -277,3 +277,146 @@ fn audit_distinct_on_declared_output_key_should_not_crash_create() {
     Spi::run("INSERT INTO dok VALUES (100, 5, 'g100')").unwrap();
     assert_imv_correct("dok_v", sql);
 }
+
+// =============================================================================
+// PS-5 — plan-quality gate for the sargable affected-groups match.
+//
+// This is the deterministic lock-in for PS-5 and the right instrument for it.
+// The timing-based `assert_sublinear` probes cannot lock this in yet: after PS-5
+// the intermediate MERGE's `ON t.k IS NOT DISTINCT FROM d.k` is the dominant
+// O(total_groups) cost (measured: 48.7 ms at 200k groups / 1 affected row,
+// 86,434 ms at 200k groups / 5k affected), so a flush-time ratio would be
+// dominated by a defect PS-5 does not touch. Asserting on the PLAN of the
+// statements PS-5 actually changes is immune to that.
+// =============================================================================
+
+/// Pull the flush statements the codegen emits for `imv`, straight from the
+/// registry row, so the assertion is against real production codegen rather than
+/// a hand-built plan.
+fn flush_statements_for(imv: &str, source: &str, op: &str) -> Vec<String> {
+    let sql = Spi::get_one::<String>(&format!(
+        "SELECT reflex_build_delta_sql(name, '{src}', '{op}', base_query, end_query, \
+                aggregations::text, base_query) \
+         FROM public.__reflex_ivm_reference WHERE name = '{imv}'",
+        src = source,
+        op = op,
+        imv = imv
+    ))
+    .expect("delta sql query failed")
+    .expect("no registry row for IMV");
+    sql.split("\n--<<REFLEX_SEP>>--\n")
+        .map(|s| s.to_string())
+        .collect()
+}
+
+/// PLAN-QUALITY (PS-5): with a NULLABLE group key and a NULL-free affected set,
+/// the target DELETE and the target INSERT must both reach their relation by
+/// INDEX SCAN, not by scanning the whole target/intermediate.
+///
+/// Before PS-5 both statements matched with `IS NOT DISTINCT FROM`, which is not
+/// an operator-family member and therefore cannot serve an `Index Cond` nor a
+/// hash/merge join key — the planner's only option was a nested loop with a
+/// `Join Filter` over the entire relation. Measured on this shape at 200k groups:
+/// target sync 52.11 ms -> 0.09 ms (579x); at 5k affected groups,
+/// 95,376 ms -> 82 ms (1158x).
+#[pg_test]
+fn audit_ps5_nullable_group_key_target_sync_uses_index_scan() {
+    // Nullable group key (no NOT NULL on `grp`) — the common case: expression
+    // keys, LEFT/RIGHT-JOIN-reached columns, and every decomposed sub-IMV target.
+    Spi::run("CREATE TABLE ps5t (id INT PRIMARY KEY, grp TEXT, amt NUMERIC)").unwrap();
+    Spi::run("INSERT INTO ps5t SELECT i, 'g'||i, i FROM generate_series(1,20000) i").unwrap();
+    crate::create_reflex_ivm(
+        "ps5t_v",
+        "SELECT grp, SUM(amt) AS s FROM ps5t GROUP BY grp",
+        None,
+        None,
+        None,
+        None,
+    );
+    // Populate the affected-groups table with a single NON-NULL key, which is
+    // what the gate keys off. ANALYZE so the planner costs it as one row.
+    Spi::run("INSERT INTO ps5t VALUES (900001, 'g7', 5)").unwrap();
+    Spi::run("TRUNCATE \"__reflex_affected_ps5t_v\"").unwrap();
+    Spi::run("INSERT INTO \"__reflex_affected_ps5t_v\" VALUES ('g7')").unwrap();
+    Spi::run("ANALYZE \"__reflex_affected_ps5t_v\"").unwrap();
+    Spi::run("ANALYZE \"__reflex_intermediate_ps5t_v\"").unwrap();
+    Spi::run("ANALYZE ps5t_v").unwrap();
+
+    let stmts = flush_statements_for("ps5t_v", "ps5t", "INSERT");
+
+    // The gate must be present at all — otherwise this test is vacuous.
+    assert!(
+        stmts.iter().any(|s| s.contains("AS __ng WHERE")),
+        "PS-5 gate absent from generated flush; codegen under test is not gated: {:#?}",
+        stmts
+    );
+
+    // Exactly one sargable and one NULL-safe variant of each target statement.
+    let target_deletes: Vec<&String> = stmts
+        .iter()
+        .filter(|s| s.trim_start().starts_with("DELETE FROM \"ps5t_v\""))
+        .collect();
+    let target_inserts: Vec<&String> = stmts
+        .iter()
+        .filter(|s| s.trim_start().starts_with("INSERT INTO \"ps5t_v\""))
+        .collect();
+    assert_eq!(
+        target_deletes.len(),
+        2,
+        "expected a gated target-DELETE pair: {:#?}",
+        target_deletes
+    );
+    assert_eq!(
+        target_inserts.len(),
+        2,
+        "expected a gated target-INSERT pair: {:#?}",
+        target_inserts
+    );
+
+    // The SARGABLE variant of each (the one gated on NOT EXISTS(null)) is the one
+    // that actually runs for a NULL-free affected set. Its plan must use an index.
+    // (relation the Index Cond must be ON, label, statement)
+    for (rel, label, stmt) in [
+        (
+            "ps5t_v",
+            "target DELETE",
+            *target_deletes.iter().find(|s| s.contains("AND NOT EXISTS")).expect("sargable DELETE variant"),
+        ),
+        (
+            "__reflex_intermediate_ps5t_v",
+            "target INSERT",
+            *target_inserts.iter().find(|s| s.contains("AND NOT EXISTS")).expect("sargable INSERT variant"),
+        ),
+    ] {
+        let plan = Spi::connect(|client| {
+            let rows = client
+                .select(&format!("EXPLAIN (COSTS OFF) {}", stmt), None, &[])
+                .unwrap();
+            rows.filter_map(|r| r.get_datum_by_ordinal(1).ok().and_then(|d| d.value::<String>().ok().flatten()))
+                .collect::<Vec<String>>()
+                .join("\n")
+        });
+        // Pin BOTH the access method and the relation it applies to: a bare
+        // `contains("Index Scan")` would be satisfied by an index scan on the
+        // tiny affected table while the big relation still got seq-scanned.
+        let scanned_by_index = plan.lines().any(|l| {
+            (l.contains("Index Scan") || l.contains("Index Only Scan") || l.contains("Bitmap Index Scan"))
+                && l.contains(rel)
+        });
+        assert!(
+            scanned_by_index,
+            "PS-5 PLAN-QUALITY GAP [{}]: `{}` must be reached by index scan, got:\n{}\nstatement: {}",
+            label,
+            rel,
+            plan,
+            stmt
+        );
+        // And the probe must be a real index condition, not a post-scan filter.
+        assert!(
+            plan.contains("Index Cond:"),
+            "PS-5 [{}]: the group-key probe must be an Index Cond, not a Filter:\n{}",
+            label,
+            plan
+        );
+    }
+}

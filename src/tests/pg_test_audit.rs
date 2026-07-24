@@ -214,6 +214,59 @@ fn pg_test_audit_internal_tables_detects_missing_intermediate() {
     );
 }
 
+/// PS-6 — a passthrough IMV missing one of its per-source scratch tables is the
+/// exact field wedge (`__reflex_pt_new_… does not exist`). reflex_audit must
+/// flag it as an internal-tables ERROR naming the missing table, and its
+/// suggested fix must prescribe BOTH halves of a real recovery:
+///   1. `reflex_rebuild_triggers(<source>)` recreates the pt scratch pair
+///      (`reflex_rebuild_imv` = reconcile alone never does — it rebuilds the
+///      target and would report success while the IMV stays wedged); and
+///   2. `reflex_reconcile(<imv>)` backfills the deltas the wedge silently LOST.
+/// The deferred flush swallows the per-IMV 42P01 and still unconditionally
+/// purges the staged delta, so recreating the scratch restores future flushes
+/// but not the mutations dropped across the wedge window — reconcile is
+/// mandatory, otherwise audit goes green over a diverged IMV.
+#[pg_test]
+fn pg_test_audit_flags_missing_passthrough_scratch_with_healing_fix() {
+    Spi::run("CREATE TABLE audit_pt_src (id INT PRIMARY KEY, grp TEXT)").expect("src");
+    // Passthrough query (no aggregate / GROUP BY) → per-source pt scratch tables.
+    crate::create_reflex_ivm(
+        "audit_pt_view",
+        "SELECT id, grp FROM audit_pt_src",
+        Some("id"),
+        None,
+        Some("IMMEDIATE"),
+        None,
+    );
+    // Drop the NEW-side scratch out from under the IMV.
+    Spi::run("DROP TABLE \"__reflex_pt_new_audit_pt_view_audit_pt_src\"")
+        .expect("drop pt scratch");
+
+    let report: String = Spi::get_one("SELECT reflex_audit('audit_pt_view')")
+        .expect("ok")
+        .expect("non-null");
+    assert!(
+        report.contains("[ERROR]") && report.contains("internal-tables-exist"),
+        "expected ERROR/internal-tables-exist:\n{}",
+        report
+    );
+    assert!(
+        report.contains("__reflex_pt_new_audit_pt_view_audit_pt_src"),
+        "expected the missing pt scratch name in the body:\n{}",
+        report
+    );
+    assert!(
+        report.contains("reflex_rebuild_triggers('audit_pt_src')"),
+        "suggested fix must recreate the scratch via the source-scoped entry point:\n{}",
+        report
+    );
+    assert!(
+        report.contains("reflex_reconcile('audit_pt_view')"),
+        "suggested fix must ALSO reconcile to backfill deltas the wedge lost:\n{}",
+        report
+    );
+}
+
 #[pg_test]
 fn pg_test_audit_internal_tables_green_when_present() {
     Spi::run("CREATE TABLE audit_it_ok_src (id BIGINT PRIMARY KEY, a INT)").expect("src");
@@ -1051,8 +1104,14 @@ fn pg_test_audit_partitioned_imv_in_custom_schema_under_narrow_search_path() {
 
     Spi::run("SET search_path = public, audit_np").expect("reset");
 
+    // This fixture — a partitioned IMV in a non-public schema — is exactly the
+    // shape that used to produce one false orphan-intermediate finding per
+    // partition child, so the assertion used to read `contains("finding(s)")`.
+    // Post-1.11.0 (PS-4) the correct result is a clean report, which is a stronger
+    // statement than well-formedness: accepting either form would be a tautology,
+    // since audit/mod.rs emits only those two shapes.
     assert!(
-        report.contains("finding(s)"),
+        report.contains("no findings"),
         "expected a well-formed audit report:\n{}",
         report
     );
@@ -1526,5 +1585,305 @@ fn f6_residue_probe_error_degrades_to_advisory() {
     assert!(
         !report.contains("reflex_reconcile_partition"),
         "a failed probe must NOT yield a runnable reconcile fix:\n{report}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// PS-4: an orphan check must not name a live IMV's own internals
+// ---------------------------------------------------------------------------
+
+#[pg_test]
+fn ps4_bare_name_imv_aux_tables_are_not_orphans() {
+    Spi::run("CREATE TABLE ps4_n3_src (id INT PRIMARY KEY, g TEXT, v INT)").expect("src");
+    Spi::run("INSERT INTO ps4_n3_src VALUES (1, 'a', 10)").expect("rows");
+    crate::create_reflex_ivm(
+        "ps4_n3_agg",
+        "SELECT g, sum(v) AS s FROM ps4_n3_src GROUP BY g",
+        Some("g"),
+        None,
+        Some("IMMEDIATE"),
+        None,
+    );
+
+    let report: String = Spi::get_one("SELECT reflex_audit()")
+        .expect("ok")
+        .expect("non-null");
+    assert!(
+        !report.contains("ps4_n3_agg"),
+        "a live bare-name IMV's own aux tables must not be reported as orphans:\n{}",
+        report
+    );
+}
+
+#[pg_test]
+fn ps4_qualified_name_imv_aux_tables_are_not_orphans() {
+    Spi::run("CREATE SCHEMA ps4q").expect("schema");
+    Spi::run("CREATE TABLE ps4q.src (id INT PRIMARY KEY, g TEXT, v INT)").expect("src");
+    Spi::run("INSERT INTO ps4q.src VALUES (1, 'a', 10)").expect("rows");
+    crate::create_reflex_ivm(
+        "ps4q.agg",
+        "SELECT g, sum(v) AS s FROM ps4q.src GROUP BY g",
+        Some("g"),
+        None,
+        Some("IMMEDIATE"),
+        None,
+    );
+
+    let report: String = Spi::get_one("SELECT reflex_audit()")
+        .expect("ok")
+        .expect("non-null");
+    assert!(
+        !report.contains("orphan-"),
+        "a live schema-qualified IMV's own aux tables must not be reported as orphans:\n{}",
+        report
+    );
+}
+
+#[pg_test]
+fn ps4_partition_children_of_a_live_imv_are_not_orphans() {
+    Spi::run("CREATE TABLE ps4_part_src (region TEXT NOT NULL, v INT) PARTITION BY LIST (region)")
+        .expect("src");
+    Spi::run("CREATE TABLE ps4_part_src_a PARTITION OF ps4_part_src FOR VALUES IN ('a')")
+        .expect("a");
+    Spi::run("CREATE TABLE ps4_part_src_b PARTITION OF ps4_part_src FOR VALUES IN ('b')")
+        .expect("b");
+    Spi::run("INSERT INTO ps4_part_src VALUES ('a', 1), ('b', 2)").expect("rows");
+    crate::create_reflex_ivm(
+        "ps4_part_agg",
+        "SELECT region, sum(v) AS s FROM ps4_part_src GROUP BY region",
+        Some("region"),
+        None,
+        Some("IMMEDIATE"),
+        Some("region"),
+    );
+
+    let report: String = Spi::get_one("SELECT reflex_audit()")
+        .expect("ok")
+        .expect("non-null");
+    assert!(
+        !report.contains("orphan-"),
+        "partition children of a live IMV's intermediate table are not orphans:\n{}",
+        report
+    );
+}
+
+#[pg_test]
+fn ps4_genuine_orphans_are_still_detected_alongside_a_live_imv() {
+    Spi::run("CREATE TABLE ps4_live_src (id INT PRIMARY KEY, g TEXT, v INT)").expect("src");
+    Spi::run("INSERT INTO ps4_live_src VALUES (1, 'a', 10)").expect("rows");
+    crate::create_reflex_ivm(
+        "ps4_live_agg",
+        "SELECT g, sum(v) AS s FROM ps4_live_src GROUP BY g",
+        Some("g"),
+        None,
+        Some("IMMEDIATE"),
+        None,
+    );
+
+    Spi::run("CREATE TABLE __reflex_intermediate_ps4_ghost (g TEXT, n BIGINT)").expect("i");
+    Spi::run(
+        "CREATE UNLOGGED TABLE __reflex_delta_ps4_ghost (__reflex_op TEXT NOT NULL, id BIGINT)",
+    )
+    .expect("d");
+    Spi::run("CREATE TABLE __reflex_scratch_ps4_ghost (g TEXT, n BIGINT)").expect("s");
+
+    let report: String = Spi::get_one("SELECT reflex_audit()")
+        .expect("ok")
+        .expect("non-null");
+    for needle in [
+        "__reflex_intermediate_ps4_ghost",
+        "__reflex_delta_ps4_ghost",
+        "__reflex_scratch_ps4_ghost",
+    ] {
+        assert!(
+            report.contains(needle),
+            "genuine orphan {} must still be detected:\n{}",
+            needle,
+            report
+        );
+    }
+    assert!(
+        !report.contains("ps4_live_agg"),
+        "the live IMV's own aux tables must not be reported:\n{}",
+        report
+    );
+    Spi::run("DROP TABLE __reflex_intermediate_ps4_ghost").expect("c1");
+    Spi::run("DROP TABLE __reflex_delta_ps4_ghost").expect("c2");
+    Spi::run("DROP TABLE __reflex_scratch_ps4_ghost").expect("c3");
+}
+
+/// Isolates the partition-child false positive from the bare-name one: this IMV
+/// is schema-qualified, so only the `relkind = 'r'` scan (which skips the
+/// partitioned parent but returns every leaf) can produce a finding.
+#[pg_test]
+fn ps4_partition_children_of_a_qualified_imv_are_not_orphans() {
+    Spi::run("CREATE SCHEMA ps4pq").expect("schema");
+    Spi::run(
+        "CREATE TABLE ps4pq.src (region TEXT NOT NULL, v INT) PARTITION BY LIST (region)",
+    )
+    .expect("src");
+    Spi::run("CREATE TABLE ps4pq.src_a PARTITION OF ps4pq.src FOR VALUES IN ('a')").expect("a");
+    Spi::run("CREATE TABLE ps4pq.src_b PARTITION OF ps4pq.src FOR VALUES IN ('b')").expect("b");
+    Spi::run("INSERT INTO ps4pq.src VALUES ('a', 1), ('b', 2)").expect("rows");
+    crate::create_reflex_ivm(
+        "ps4pq.agg",
+        "SELECT region, sum(v) AS s FROM ps4pq.src GROUP BY region",
+        Some("region"),
+        None,
+        Some("IMMEDIATE"),
+        Some("region"),
+    );
+
+    let report: String = Spi::get_one("SELECT reflex_audit()")
+        .expect("ok")
+        .expect("non-null");
+    assert!(
+        !report.contains("orphan-"),
+        "intermediate partition children of a live qualified IMV are not orphans:\n{}",
+        report
+    );
+}
+
+// --- Review BLOCKING 2: legacy rows carry target_schema = NULL --------------
+
+#[pg_test]
+fn ps4_legacy_null_target_schema_aux_tables_are_not_orphans() {
+    // Every row created before 1.7.2 keeps target_schema NULL
+    // (sql/pg_reflex--1.7.1--1.7.2.sql). With no fallback, a bare registry name
+    // resolves through the session search_path — and under a narrow one it
+    // resolves to nothing, so every aux table of a live IMV is reported as an
+    // orphan with a DROP ... CASCADE.
+    Spi::run("CREATE TABLE ps4_legacy_src (id INT PRIMARY KEY, g TEXT, v INT)").expect("src");
+    Spi::run("INSERT INTO ps4_legacy_src VALUES (1, 'a', 10)").expect("rows");
+    crate::create_reflex_ivm(
+        "ps4_legacy_agg",
+        "SELECT g, sum(v) AS s FROM ps4_legacy_src GROUP BY g",
+        Some("g"),
+        None,
+        Some("IMMEDIATE"),
+        None,
+    );
+    Spi::run(
+        "UPDATE public.__reflex_ivm_reference SET target_schema = NULL \
+          WHERE name = 'ps4_legacy_agg'",
+    )
+    .expect("simulate a pre-1.7.2 row");
+
+    Spi::run("SET search_path = pg_catalog").expect("narrow search_path");
+    let report: String = Spi::get_one("SELECT public.reflex_audit()")
+        .expect("audit must not error")
+        .expect("non-null");
+    Spi::run("SET search_path = public").expect("reset");
+
+    // Scoped to the orphan checks deliberately. Under this search_path the
+    // catastrophic-tier checks (`internal-tables-exist`, `source-exists`) also fail
+    // to see a bare-name IMV's relations, but they never consult `target_schema`
+    // at all (`src/audit/checks_a_catastrophic.rs`) and are untouched by this
+    // branch — a pre-existing gap of the same family, reported separately rather
+    // than silently absorbed here.
+    assert!(
+        !report.contains("orphan-"),
+        "a legacy row with NULL target_schema must still resolve its own aux \
+         tables:\n{}",
+        report
+    );
+}
+
+#[pg_test]
+fn ps4_orphaned_partitioned_intermediate_is_detected_once() {
+    // D12 widened the scan to relkind 'p' so a genuinely orphaned *partitioned*
+    // aux table is caught. A leaf's partition root is the equally-unexpected
+    // parent, so a naive report emits parent + every leaf; dropping the parent
+    // CASCADEs, so only the root is worth reporting.
+    Spi::run(
+        "CREATE TABLE __reflex_intermediate_ps4_pghost (k TEXT NOT NULL, n BIGINT) \
+         PARTITION BY LIST (k)",
+    )
+    .expect("parent");
+    Spi::run(
+        "CREATE TABLE __reflex_intermediate_ps4_pghost_a \
+         PARTITION OF __reflex_intermediate_ps4_pghost FOR VALUES IN ('a')",
+    )
+    .expect("leaf a");
+    Spi::run(
+        "CREATE TABLE __reflex_intermediate_ps4_pghost_b \
+         PARTITION OF __reflex_intermediate_ps4_pghost FOR VALUES IN ('b')",
+    )
+    .expect("leaf b");
+
+    let parent_rows: i64 = Spi::get_one(
+        "SELECT count(*) FROM reflex_doctor() WHERE check_id = 'F9' \
+           AND object = '\"public\".\"__reflex_intermediate_ps4_pghost\"'",
+    )
+    .expect("q")
+    .unwrap_or(-1);
+    assert_eq!(
+        parent_rows, 1,
+        "an orphaned partitioned aux table must be reported exactly once"
+    );
+
+    let leaf_rows: i64 = Spi::get_one(
+        "SELECT count(*) FROM reflex_doctor() WHERE check_id = 'F9' \
+           AND object LIKE '%__reflex_intermediate_ps4_pghost\\_%'",
+    )
+    .expect("q")
+    .unwrap_or(-1);
+    assert_eq!(
+        leaf_rows, 0,
+        "its leaves must not be reported separately — dropping the root CASCADEs"
+    );
+
+    Spi::run("DROP TABLE __reflex_intermediate_ps4_pghost CASCADE").expect("cleanup");
+}
+
+#[pg_test]
+fn ps4_partition_drift_findings_reach_the_doctor() {
+    // reflex_audit() names an orphan mirror partition of a LIVE parent under
+    // partition-mirror / partition-tree-drift with a correct suggested fix, but
+    // detect_audit_findings dropped every category outside its match, so the
+    // doctor never surfaced it. PS-4 removed the (false-positive-ridden) F9 row
+    // that used to compensate.
+    Spi::run("CREATE TABLE ps4_drift_src (region TEXT NOT NULL, v INT) PARTITION BY LIST (region)")
+        .expect("src");
+    Spi::run("CREATE TABLE ps4_drift_src_a PARTITION OF ps4_drift_src FOR VALUES IN ('a')")
+        .expect("a");
+    Spi::run("INSERT INTO ps4_drift_src VALUES ('a', 1)").expect("rows");
+    crate::create_reflex_ivm(
+        "ps4_drift_agg",
+        "SELECT region, sum(v) AS s FROM ps4_drift_src GROUP BY region",
+        Some("region"),
+        None,
+        Some("IMMEDIATE"),
+        Some("region"),
+    );
+    // A source partition the IMV has no mirror for: drift the audit can see.
+    Spi::run("CREATE TABLE ps4_drift_src_b PARTITION OF ps4_drift_src FOR VALUES IN ('b')")
+        .expect("b");
+    Spi::run(
+        "DROP TABLE IF EXISTS public.ps4_drift_agg_ps4_drift_src_b CASCADE",
+    )
+    .expect("remove any auto-created mirror");
+
+    let report: String = Spi::get_one("SELECT reflex_audit()")
+        .expect("ok")
+        .expect("non-null");
+    let audit_names_it =
+        report.contains("partition-mirror") || report.contains("partition-tree-drift");
+    assert!(
+        audit_names_it,
+        "precondition: the audit must see the drift:\n{}",
+        report
+    );
+
+    let doctor_rows: i64 = Spi::get_one(
+        "SELECT count(*) FROM reflex_doctor() WHERE object = 'ps4_drift_agg' \
+           AND check_id = 'F3'",
+    )
+    .expect("q")
+    .unwrap_or(-1);
+    assert!(
+        doctor_rows >= 1,
+        "the doctor must forward partition drift findings, got {} rows",
+        doctor_rows
     );
 }

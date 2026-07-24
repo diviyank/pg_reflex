@@ -62,6 +62,10 @@ pub struct Finding {
 #[allow(dead_code)]
 pub struct ImvRow {
     pub name: String,
+    /// Schema the IMV's relations were created in (1.7.1). Set for every row
+    /// created since; used to resolve a bare `name` without depending on the
+    /// audit session's search_path.
+    pub target_schema: Option<String>,
     pub depends_on: Vec<String>,
     pub refresh_mode: String,
     pub base_query: String,
@@ -245,7 +249,7 @@ fn load_imv_rows(client: &SpiClient<'_>, scope: &AuditScope) -> Vec<ImvRow> {
         AuditScope::All => {
             let rs = client
                 .select(
-                    "SELECT name, depends_on, COALESCE(refresh_mode, 'IMMEDIATE') AS refresh_mode, \
+                    "SELECT name, target_schema, depends_on, COALESCE(refresh_mode, 'IMMEDIATE') AS refresh_mode, \
                             base_query, end_query, aggregations::text AS aggregations_json, \
                             partition_columns, COALESCE(enabled, TRUE) AS enabled, \
                             where_predicate, ignored_sources \
@@ -263,6 +267,10 @@ fn load_imv_rows(client: &SpiClient<'_>, scope: &AuditScope) -> Vec<ImvRow> {
                         .unwrap_or(None)
                         .unwrap_or("")
                         .to_string(),
+                    target_schema: row
+                        .get_by_name::<&str, _>("target_schema")
+                        .unwrap_or(None)
+                        .map(|s| s.to_string()),
                     depends_on: row
                         .get_by_name::<Vec<String>, _>("depends_on")
                         .unwrap_or(None)
@@ -309,7 +317,7 @@ fn load_imv_rows(client: &SpiClient<'_>, scope: &AuditScope) -> Vec<ImvRow> {
             }];
             let rs = client
                 .select(
-                    "SELECT name, depends_on, COALESCE(refresh_mode, 'IMMEDIATE') AS refresh_mode, \
+                    "SELECT name, target_schema, depends_on, COALESCE(refresh_mode, 'IMMEDIATE') AS refresh_mode, \
                             base_query, end_query, aggregations::text AS aggregations_json, \
                             partition_columns, COALESCE(enabled, TRUE) AS enabled, \
                             where_predicate, ignored_sources \
@@ -326,6 +334,10 @@ fn load_imv_rows(client: &SpiClient<'_>, scope: &AuditScope) -> Vec<ImvRow> {
                         .unwrap_or(None)
                         .unwrap_or("")
                         .to_string(),
+                    target_schema: row
+                        .get_by_name::<&str, _>("target_schema")
+                        .unwrap_or(None)
+                        .map(|s| s.to_string()),
                     depends_on: row
                         .get_by_name::<Vec<String>, _>("depends_on")
                         .unwrap_or(None)

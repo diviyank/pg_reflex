@@ -211,8 +211,23 @@ fn test_drop_imv_with_quoted_sub_imv_source() {
     );
     assert_eq!(r, "CREATE REFLEX INCREMENTAL VIEW");
 
-    // `dq_v__cte_j` depends on the quoted sub-IMV "dq_v__cte_lim".
-    let d = crate::drop_reflex_ivm("dq_v__cte_j");
+    // 1.11.0 (PS-1): `dq_v` is now registered as a `graph_child` of
+    // `dq_v__cte_j`, so a NON-cascade drop of that intermediate generated node
+    // refuses instead of leaving `dq_v` reading a vanished relation. Pin the new
+    // guard here too — before PS-1 this drop silently succeeded and broke the
+    // parent, which is the same latent data-destroyer N1 caused in
+    // reflex_rebuild_chain.
+    let refused = crate::drop_reflex_ivm("dq_v__cte_j");
+    assert!(
+        refused.starts_with("ERROR: IMV has children"),
+        "non-cascade drop of a generated node the parent reads must refuse, got: {refused}"
+    );
+
+    // `dq_v__cte_j` depends on the quoted sub-IMV "dq_v__cte_lim". The cascade
+    // teardown rebuilds the source-trigger / function names from that same
+    // quoted source, so it still covers the quoting regression this test exists
+    // for.
+    let d = crate::drop_reflex_ivm_cascade("dq_v__cte_j", true);
     assert_eq!(
         d, "DROP REFLEX INCREMENTAL VIEW",
         "drop must not raise a syntax error on the quoted sub-IMV source"

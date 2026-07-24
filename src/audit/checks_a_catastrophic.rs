@@ -253,15 +253,31 @@ impl Check for InternalTablesExist {
 
         let mut required: Vec<String> = Vec::new();
 
+        // Sources whose per-(IMV, source) passthrough scratch pair is missing.
+        // Recovery has TWO halves (PS-6): `reflex_rebuild_triggers(<source>)`
+        // recreates the scratch (reconcile alone never does — it rebuilds the
+        // target and would report success while the IMV stays wedged), and
+        // `reflex_reconcile(<imv>)` backfills the deltas the wedge silently lost
+        // (the deferred flush swallows the per-IMV 42P01 yet still unconditionally
+        // purges the staged delta, so recreating the scratch fixes only future
+        // flushes). Prescribing rebuild alone would leave a diverged IMV that
+        // audit then reports green.
+        let mut sources_missing_scratch: Vec<String> = Vec::new();
+
         if imv.is_passthrough() {
             // Passthrough IMVs use per-source scratch tables instead of an intermediate
             for src in imv.real_sources() {
-                required.push(crate::query_decomposer::passthrough_scratch_new_table_name(
-                    &imv.name, src,
-                ));
-                required.push(crate::query_decomposer::passthrough_scratch_old_table_name(
-                    &imv.name, src,
-                ));
+                let pt_new =
+                    crate::query_decomposer::passthrough_scratch_new_table_name(&imv.name, src);
+                let pt_old =
+                    crate::query_decomposer::passthrough_scratch_old_table_name(&imv.name, src);
+                let missing_here =
+                    !relation_exists(client, &pt_new) || !relation_exists(client, &pt_old);
+                required.push(pt_new);
+                required.push(pt_old);
+                if missing_here {
+                    sources_missing_scratch.push(src.to_string());
+                }
             }
         } else {
             // Aggregate IMVs use an intermediate table and affected groups table
@@ -281,6 +297,16 @@ impl Check for InternalTablesExist {
         if missing.is_empty() {
             return vec![];
         }
+        let suggested_fix = if sources_missing_scratch.is_empty() {
+            format!("SELECT reflex_rebuild_imv('{}');", imv.name)
+        } else {
+            let mut stmts: Vec<String> = sources_missing_scratch
+                .iter()
+                .map(|src| format!("SELECT reflex_rebuild_triggers('{}');", src))
+                .collect();
+            stmts.push(format!("SELECT reflex_reconcile('{}');", imv.name));
+            stmts.join(" ")
+        };
         vec![Finding {
             imv: Some(imv.name.clone()),
             severity: Severity::Error,
@@ -290,7 +316,7 @@ impl Check for InternalTablesExist {
                 imv.name,
                 missing.join("\n  ")
             ),
-            suggested_fix: format!("SELECT reflex_rebuild_imv('{}');", imv.name),
+            suggested_fix,
         }]
     }
 }

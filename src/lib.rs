@@ -34,6 +34,7 @@ mod audit;
 mod create_ivm;
 mod doctor;
 mod drop_ivm;
+mod graph_repair;
 mod introspect;
 mod partition;
 mod query_decomposer;
@@ -190,13 +191,34 @@ extension_sql!(
     ALTER TABLE public.__reflex_ivm_reference
         ADD COLUMN IF NOT EXISTS stale_since TIMESTAMPTZ;
 
-    -- 1.11.0: JSON object capturing creation-time arguments (unique_columns,
+    -- 1.11.0 (PS-3): TRUE when every real source of this node is a materialized
+    -- view. Such a node cannot self-maintain (PG fires no trigger on a matview),
+    -- so it is a snapshot frozen at create time and needs an explicit
+    -- refresh_imv_depending_on('<mv>') after each REFRESH MATERIALIZED VIEW.
+    -- PERMANENT and structural — distinct from known_stale (which means "a flush
+    -- failed"), and NEVER cleared by reconcile or the doctor's verify_stale_cleared
+    -- authority. Surfaced by reflex_ivm_status and as reflex_doctor finding F12.
+    ALTER TABLE public.__reflex_ivm_reference
+        ADD COLUMN IF NOT EXISTS requires_explicit_refresh BOOLEAN NOT NULL DEFAULT FALSE;
+
+    -- 1.10.8: JSON object capturing creation-time arguments (unique_columns,
     -- storage_mode, refresh_mode, topk_k, ignore_sources, partition_by,
     -- explicit_unpartitioned) for faithful IMV chain reconstruction via
     -- reflex_rebuild_chain. NULL for legacy rows; new rows populated at
     -- create time to enable transparent rebuild from stored specs.
     ALTER TABLE public.__reflex_ivm_reference
         ADD COLUMN IF NOT EXISTS create_args TEXT;
+
+    -- 1.11.0 (PS-1): TRUE when pg_reflex itself created this node while
+    -- decomposing a single user create_reflex_ivm call — a CTE sub-IMV
+    -- (`__cte_<alias>`), a set-op operand (`__union_<i>`), or a DISTINCT-ON /
+    -- window base (`__base`). reflex_reconcile recurses into these and only
+    -- these: a user-declared IMV dependency is someone else's object and
+    -- reconciling it is not this call's business. Recorded explicitly rather
+    -- than inferred from the name prefix, which a user IMV literally named
+    -- `foo__cte_bar` would defeat.
+    ALTER TABLE public.__reflex_ivm_reference
+        ADD COLUMN IF NOT EXISTS is_generated_sub_imv BOOLEAN NOT NULL DEFAULT FALSE;
 
     -- Multi-level partition capture (plans/sub_partitioning.md). Snapshot of
     -- each tracked source root's recursive LEAF set, keyed by (root, child).
@@ -228,6 +250,11 @@ extension_sql!(
         ADD COLUMN IF NOT EXISTS last_error TEXT;
     ALTER TABLE public.__reflex_partition_pending
         ADD COLUMN IF NOT EXISTS failures INT NOT NULL DEFAULT 0;
+    -- 1.11.0: stamped by the drain, so a pending row's age reflects the last
+    -- flush attempt rather than the last enqueue (which every ATTACH resets).
+    -- NULL means no drain has ever fired for this row — the F1 re-arm hole.
+    ALTER TABLE public.__reflex_partition_pending
+        ADD COLUMN IF NOT EXISTS last_attempt_at TIMESTAMPTZ;
 
     -- 1.6.0: SQL helper used by the per-partition dispatch DO block emitted
     -- by build_partition_aware_dispatch_sql.  Given a partitioned parent +
@@ -282,13 +309,28 @@ extension_sql!(
     $REFLEX$;
 
     -- Helper for reflex_doctor repairs: execute SQL in a subtransaction and return outcome.
-    -- On success: returns 'fixed'. On exception: returns 'failed:' || error message.
+    -- CONTRACT: `_sql` MUST be a statement that returns a value (every caller
+    -- passes `SELECT reflex_*(...)`). `EXECUTE ... INTO` cannot run a statement that
+    -- returns no data, so a bare DDL/DML repair yields
+    -- 'failed:INTO used with a command that cannot return data'. That degrades
+    -- safely, but a future executable repair (e.g. F9's DROP ... CASCADE) must be
+    -- wrapped so it returns something, or this helper must be extended first.
+    -- Returns 'fixed' only when the statement neither raised nor RETURNED an
+    -- 'ERROR: …' string. reflex_reconcile, reflex_sync_partitions and
+    -- drop_reflex_ivm all signal some failures by returning that text rather than
+    -- raising, so discarding the result reported those repairs as successful —
+    -- the outcome an operator can least afford to be lied to about.
     -- The EXCEPTION block acts as a savepoint: failing repairs rollback only themselves,
     -- not the outer reflex_doctor transaction, ensuring isolation.
     CREATE OR REPLACE FUNCTION public.__reflex_doctor_try_repair(_sql TEXT)
     RETURNS TEXT LANGUAGE plpgsql AS $fn$
+    DECLARE
+        _res TEXT;
     BEGIN
-        EXECUTE _sql;
+        EXECUTE _sql INTO _res;
+        IF _res IS NOT NULL AND upper(_res) LIKE 'ERROR%' THEN
+            RETURN 'failed:' || left(_res, 400);
+        END IF;
         RETURN 'fixed';
     EXCEPTION WHEN OTHERS THEN
         RETURN 'failed:' || left(SQLERRM, 400);
@@ -561,6 +603,21 @@ fn reflex_flush_partition_source(source_root: &str) -> String {
     partition::reflex_flush_partitions_impl(Some(source_root))
 }
 
+/// Re-arm pending partition roots that the failure cap has given up on, so the
+/// next flush attempts them again. Pass NULL for every root.
+///
+/// A root that has failed `PARTITION_FLUSH_FAILURE_CAP` flushes in a row is
+/// skipped by both `reflex_flush_partitions()` and
+/// `reflex_flush_partition_source(root)`, so no flush can move it and no flush
+/// can clear the counter (it is cleared only by the DELETE a *successful* drain
+/// performs). Fix the underlying cause first — re-arming a root whose cause is
+/// still present simply spends another attempt. Returns the number of roots
+/// re-armed.
+#[pg_extern]
+fn reflex_reset_partition_failures(source_root: default!(Option<&str>, "NULL")) -> i64 {
+    partition::reflex_reset_partition_failures_impl(source_root)
+}
+
 /// Internal: replace the source-partition snapshot for `source_root` with the
 /// live leaf set. SQL-callable so the per-root flush subtransaction can refresh
 /// the snapshot atomically with its reconciles. Not part of the public API.
@@ -631,6 +688,21 @@ fn drop_reflex_ivm_cascade(view_name: &str, cascade: bool) -> &'static str {
         return msg;
     }
     drop_ivm::drop_reflex_ivm_impl(view_name, cascade)
+}
+
+/// Reconcile an IMV by rebuilding intermediate + target from scratch, with
+/// explicit control over whether the pre-rebuild partition sync may drop orphan
+/// IMV partitions.
+///
+/// The one-argument form hardcodes `drop_orphans => TRUE`, which is 1.10.11
+/// behaviour and remains the default. This overload exists for callers that gate
+/// destruction on their own authorization: `reflex_doctor` refuses an F3 orphan
+/// drop when the operator did not pass `drop_orphans`, then reached the same
+/// destruction anyway through its F4 `reflex_reconcile` repair. Passing FALSE here
+/// keeps that promise.
+#[pg_extern(name = "reflex_reconcile")]
+fn reflex_reconcile_scoped(view_name: &str, drop_orphans: bool) -> &'static str {
+    reconcile::reflex_reconcile_with_orphans(view_name, drop_orphans)
 }
 
 /// Reconcile an IMV by rebuilding intermediate + target from scratch.
@@ -964,12 +1036,23 @@ extension_sql!(
         _affected TEXT[] := ARRAY[]::TEXT[];
         _synced_keys TEXT[] := ARRAY[]::TEXT[];
         _sync_key TEXT;
+        _reconcile_root TEXT;
     BEGIN
         _policy := lower(COALESCE(NULLIF(current_setting('pg_reflex.alter_source_policy', true), ''), 'warn'));
         IF _policy NOT IN ('warn', 'error') THEN
             RAISE WARNING 'pg_reflex: invalid pg_reflex.alter_source_policy=%, falling back to ''warn''', _policy;
             _policy := 'warn';
         END IF;
+
+        -- Root whose chain reflex_reconcile is currently rebuilding, set by that
+        -- function around its DISABLE/ENABLE TRIGGER of each generated sub-IMV.
+        -- Those internal ALTERs are on tracked sources (a generated child sits in
+        -- its parent's depends_on), so the warn/error branch below would fire a
+        -- spurious "run reflex_rebuild_imv" for a rebuild already in flight and,
+        -- under 'error' policy, abort the reconcile outright. Suppressed for the
+        -- nodes of the active chain only — a DIFFERENT root that reads the same
+        -- node still warns, because that consumer really did miss the refresh.
+        _reconcile_root := NULLIF(current_setting('pg_reflex.internal_reconcile_root', true), '');
 
         -- 1.6.0: auto-sync IMV partitions when a source's partition tree changes.
         --
@@ -1106,6 +1189,21 @@ extension_sql!(
                 WHERE depends_on @> ARRAY[_src]
                    OR depends_on @> ARRAY[split_part(_src, '.', 2)]
             LOOP
+                -- Skip pg_reflex's own DISABLE/ENABLE TRIGGER on a generated
+                -- sub-IMV of the chain being reconciled: the consumer named here
+                -- is that same chain's root or an intermediate generated node of
+                -- it, and it is about to be rebuilt. A consumer on a DIFFERENT
+                -- root does not match this prefix, so its legitimate stale signal
+                -- still fires.
+                IF _reconcile_root IS NOT NULL
+                   AND ( _imv.name = _reconcile_root
+                         OR split_part(_imv.name, '.', 2)
+                            = split_part(_reconcile_root, '.', 2)
+                         OR split_part(_imv.name, '.', 2)
+                            LIKE split_part(_reconcile_root, '.', 2) || '\_\_%' )
+                THEN
+                    CONTINUE;
+                END IF;
                 _affected := _affected || (_src || ' -> ' || _imv.name);
                 IF _policy = 'warn' THEN
                     RAISE WARNING 'pg_reflex: source table % was altered; IMV % may be stale — run SELECT reflex_rebuild_imv(''%'') to recover',
@@ -1437,6 +1535,8 @@ mod tests {
     include!("tests/pg_test_registry.rs");
     include!("tests/pg_test_doctor.rs");
     include!("tests/pg_test_rebuild_chain.rs");
+    include!("tests/pg_test_decomposed_chain.rs");
+    include!("tests/pg_test_ps3.rs");
 }
 
 /// This module is required by `cargo pgrx test` invocations.

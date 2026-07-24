@@ -401,6 +401,68 @@ pub(crate) fn reflex_rebuild_triggers_impl(source_table: &str) -> String {
                 .update(ddl, None, &[])
                 .map_err(|e| format!("CREATE TRIGGER failed: {}", e))?;
         }
+
+        // PS-6 heal — a passthrough IMV references a per-(IMV, source) scratch
+        // pair (`__reflex_pt_new/old_<imv>_<source>`) that `passthrough_op_stmts`
+        // emits TRUNCATE/INSERT against on every flush. If that pair is missing
+        // (an older create loop that didn't cover this source, a partial create,
+        // or a manual drop), every flush fails fast with 42P01, is swallowed as a
+        // WARNING, and the IMV goes silently stale forever. Recreate the pair
+        // idempotently (`build_passthrough_scratch_ddls` is CREATE IF NOT EXISTS)
+        // for every enabled passthrough IMV that depends on this source, using
+        // the IMV's own `depends_on` entry as the source string so the recreated
+        // name matches exactly what the trigger references. This is the
+        // source-scoped, no-drop recovery the 1.4.5+ migrations already invoke.
+        let bare_source = split_qualified_name(&resolved).1.to_string();
+        let passthrough_deps: Vec<(String, Vec<String>)> = client
+            .select(
+                "SELECT name, depends_on \
+                 FROM public.__reflex_ivm_reference \
+                 WHERE enabled = TRUE \
+                   AND COALESCE((aggregations->>'is_passthrough')::bool, FALSE) \
+                   AND ($1 = ANY(depends_on) OR $2 = ANY(depends_on))",
+                None,
+                &[
+                    unsafe {
+                        DatumWithOid::new(resolved.clone(), PgBuiltInOids::TEXTOID.oid().value())
+                    },
+                    unsafe {
+                        DatumWithOid::new(bare_source.clone(), PgBuiltInOids::TEXTOID.oid().value())
+                    },
+                ],
+            )
+            .map_err(|e| format!("passthrough-dependent lookup failed: {}", e))?
+            .filter_map(|row| {
+                let name = row
+                    .get_by_name::<&str, _>("name")
+                    .ok()
+                    .flatten()?
+                    .to_string();
+                let deps = row
+                    .get_by_name::<Vec<String>, _>("depends_on")
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default();
+                Some((name, deps))
+            })
+            .collect();
+
+        for (imv_name, deps) in &passthrough_deps {
+            for dep in deps {
+                if dep == &resolved
+                    || dep == source_table
+                    || split_qualified_name(dep).1 == bare_source
+                {
+                    for ddl in crate::schema_builder::build_passthrough_scratch_ddls(imv_name, dep)
+                    {
+                        client
+                            .update(&ddl, None, &[])
+                            .map_err(|e| format!("passthrough scratch recreate failed: {}", e))?;
+                    }
+                }
+            }
+        }
+
         Ok(ddls.len())
     });
     match result {
@@ -509,21 +571,65 @@ pub(crate) fn reflex_rebuild_chain_impl(view_name: &str, cascade: bool) -> Strin
             crate::sql_writer::registry::read_imv_for_rebuild(client, view_name)
                 .ok_or_else(|| format!("IMV '{}' not found in registry", view_name))?;
 
+        // D22 — a CTE-decomposed parent stores the REWRITTEN body as sql_query (it
+        // names the generated <root>__cte_<alias> child), so a CASCADE drop removes
+        // that child and the recreate then references a vanished relation, aborting
+        // the transaction. The original user SQL is not recoverable from the row, so
+        // refuse BEFORE any drop and point at the recursive reflex_reconcile (the
+        // correct recovery since 1.11.0) or a full drop-and-recreate.
+        if is_decomposed_parent(client, view_name) {
+            return Err(format!(
+                "IMV '{v}' was decomposed by pg_reflex into generated sub-IMV(s) it \
+                 depends on; its stored query references a generated sibling that a \
+                 rebuild would drop first, so drop-and-recreate cannot restore it. \
+                 To refresh it, run: SELECT reflex_reconcile('{v}'); (recursive over \
+                 the whole chain since 1.11.0). To rebuild its structure, drop and \
+                 recreate from the original spec: SELECT drop_reflex_ivm('{v}', true); \
+                 then re-run the original create_reflex_ivm.",
+                v = view_name
+            ));
+        }
+
+        // Part 1 — the NAMED IMV gets the same fail-closed guard as its dependents
+        // (below): a row with no faithful create_args (legacy pre-1.10.8, surfaced
+        // as "" or "{}") cannot be recreated without silently resetting storage
+        // mode, refresh mode and partitioning. Refuse up front, before the drop.
+        if create_args_unusable(&create_args_json) {
+            return Err(format!(
+                "IMV '{v}' has no usable create_args. Recreating it would silently \
+                 reset its storage mode, refresh mode and partitioning. To refresh it \
+                 without a structural rebuild, run: SELECT reflex_reconcile('{v}'); \
+                 to rebuild its structure, drop and recreate from the original spec: \
+                 SELECT drop_reflex_ivm('{v}', true); then re-run the original \
+                 create_reflex_ivm. The 1.11.0 migration backfills create_args for \
+                 legacy aggregate/join IMVs, but not for set-op / DISTINCT-ON / window \
+                 wrappers (aggregations = '{{}}'): for a decomposed parent still in the \
+                 pre-repair window this refusal self-resolves once \
+                 SELECT reflex_repair_dependency_graph(); has run (it is then caught by \
+                 the more specific decomposed-parent guard).",
+                v = view_name
+            ));
+        }
+
         let dependents = read_dependents_shallowest_first(client, view_name);
         if !dependents.is_empty() && !cascade {
             let names: Vec<&str> = dependents.iter().map(|(n, _)| n.as_str()).collect();
             return Err(format!(
                 "IMV '{}' has {} dependent IMV(s) that CASCADE would destroy: {}. \
-                 Re-run with cascade => TRUE to drop and recreate them, or rebuild them individually.",
+                 To rebuild the whole chain, drop and recreate it from its original spec: \
+                 SELECT drop_reflex_ivm('{}', true); then re-run the original create_reflex_ivm. \
+                 (cascade => TRUE is unsafe on a decomposed chain — it recreates from a stored \
+                 query that references a sibling the cascade has already dropped.)",
                 view_name,
                 dependents.len(),
-                names.join(", ")
+                names.join(", "),
+                view_name
             ));
         }
 
         let unrecreatable: Vec<&str> = dependents
             .iter()
-            .filter(|(_, args)| args.as_deref().unwrap_or("").trim().is_empty())
+            .filter(|(_, args)| create_args_unusable(args.as_deref().unwrap_or("")))
             .map(|(n, _)| n.as_str())
             .collect();
         if cascade && !unrecreatable.is_empty() {
@@ -552,6 +658,13 @@ pub(crate) fn reflex_rebuild_chain_impl(view_name: &str, cascade: bool) -> Strin
         let explicit_unpartitioned =
             extract_bool_field_via_sql(client, &create_args_json, "explicit_unpartitioned")
                 .unwrap_or(false);
+        // The 1.11.0 migration backfills legacy create_args from dedicated columns
+        // but cannot reconstruct topk_k or explicit_unpartitioned (no column holds
+        // them), so a rebuild from such a row defaults both — silently dropping a
+        // top-K bound or auto-partitioning a deliberately-unpartitioned IMV. The
+        // marker makes that loss load-bearing: it is surfaced at rebuild time.
+        let named_backfilled =
+            extract_bool_field_via_sql(client, &create_args_json, "backfilled").unwrap_or(false);
 
         // 2b. Capture each dependent's spec before the drop — after the drop
         // the registry rows are gone, so nothing may be read lazily.
@@ -596,6 +709,12 @@ pub(crate) fn reflex_rebuild_chain_impl(view_name: &str, cascade: bool) -> Strin
                         client,
                         &dep_create_args_json,
                         "explicit_unpartitioned",
+                    )
+                    .unwrap_or(false),
+                    backfilled: extract_bool_field_via_sql(
+                        client,
+                        &dep_create_args_json,
+                        "backfilled",
                     )
                     .unwrap_or(false),
                 })
@@ -656,10 +775,41 @@ pub(crate) fn reflex_rebuild_chain_impl(view_name: &str, cascade: bool) -> Strin
             }
         }
 
-        Ok(format!(
+        // Surface the honest-partial backfill loss on the recovery path. Emitted
+        // only after every recreate succeeded, so it never fires on a rolled-back
+        // rebuild. A live WARNING reaches the operator's session at rebuild time
+        // (months after the one-time migration NOTICE), and the same caveat is
+        // appended to the returned status so programmatic callers can see it too.
+        let mut backfilled_names: Vec<&str> = Vec::new();
+        if named_backfilled {
+            backfilled_names.push(view_name);
+        }
+        backfilled_names.extend(
+            captured_dependents
+                .iter()
+                .filter(|d| d.backfilled)
+                .map(|d| d.name.as_str()),
+        );
+
+        let base = format!(
             "REBUILT CHAIN ({} dependent(s) restored)",
             captured_dependents.len()
-        ))
+        );
+        if backfilled_names.is_empty() {
+            return Ok(base);
+        }
+
+        let caveat = format!(
+            "rebuilt from a backfilled create_args ({}) — topk_k and \
+             explicit_unpartitioned are not reconstructible by the 1.11.0 migration \
+             and were reset to create-time defaults (no top-K bound; auto-partitioning). \
+             If any of these IMVs was created with a top-K bound or explicitly \
+             unpartitioned, re-create it from its original create_reflex_ivm call to \
+             restore those settings.",
+            backfilled_names.join(", ")
+        );
+        pgrx::warning!("pg_reflex: {}", caveat);
+        Ok(format!("{} [WARNING: {}]", base, caveat))
     });
 
     match result {
@@ -682,6 +832,78 @@ struct CapturedDependent {
     ignore_sources: Vec<String>,
     partition_by: Vec<String>,
     explicit_unpartitioned: bool,
+    backfilled: bool,
+}
+
+/// A stored `create_args` cannot faithfully recreate an IMV when it is absent —
+/// legacy pre-1.10.8 rows carry NULL, surfaced by `read_imv_for_rebuild` and the
+/// registry read as an empty string or the placeholder `"{}"`. Recreating from it
+/// would silently reset storage mode, refresh mode and partitioning, so the named
+/// IMV and every dependent are refused on this one shared predicate — the two
+/// paths cannot drift.
+fn create_args_unusable(create_args: &str) -> bool {
+    let trimmed = create_args.trim();
+    trimmed.is_empty() || trimmed == "{}"
+}
+
+/// True when `view_name` is a parent pg_reflex decomposed into generated
+/// sub-IMV(s) it now depends on (a CTE / set-op / DISTINCT-ON / window split).
+/// reflex_rebuild_chain cannot rebuild such a parent: its stored query names a
+/// generated sibling that the CASCADE drop removes first, so the recreate
+/// references a vanished relation (D22).
+///
+/// Detected two ways so the guard holds for new and legacy rows alike:
+///   * structurally — a `is_generated_sub_imv` child sits in the parent's
+///     `depends_on_imv` (precise; correct for new rows and after
+///     reflex_repair_dependency_graph backfills legacy rows);
+///   * via the uncorrupted `depends_on`, which always carries the generated child
+///     double-quoted as `"<bare_root>__…"`. That spelling survives even when the
+///     structural columns do not (legacy rows predating `is_generated_sub_imv`,
+///     including schema-qualified names the old name-prefix heuristic could not
+///     match). Anchoring the match on the opening quote plus the view's OWN bare
+///     name keeps it from firing on an unrelated source.
+fn is_decomposed_parent(client: &SpiClient<'_>, view_name: &str) -> bool {
+    let (_, bare) = crate::query_decomposer::canonical_source(view_name);
+    let escaped_bare = bare
+        .replace('\\', "\\\\")
+        .replace('_', "\\_")
+        .replace('%', "\\%");
+    let dep_pattern = format!("%\"{}\\_\\_%", escaped_bare);
+    client
+        .select(
+            "SELECT (EXISTS( \
+                 SELECT 1 FROM public.__reflex_ivm_reference child \
+                  WHERE COALESCE(child.is_generated_sub_imv, FALSE) \
+                    AND child.name = ANY(SELECT unnest(COALESCE(p.depends_on_imv, ARRAY[]::TEXT[])) \
+                                           FROM public.__reflex_ivm_reference p WHERE p.name = $1)) \
+               OR EXISTS( \
+                 SELECT 1 FROM public.__reflex_ivm_reference p, \
+                        unnest(COALESCE(p.depends_on, ARRAY[]::TEXT[])) AS dep \
+                  WHERE p.name = $1 AND dep LIKE $2 ESCAPE '\\')) AS decomposed",
+            Some(1),
+            &[
+                unsafe {
+                    DatumWithOid::new(
+                        view_name.to_string(),
+                        PgBuiltInOids::TEXTOID.oid().value(),
+                    )
+                },
+                unsafe {
+                    DatumWithOid::new(dep_pattern, PgBuiltInOids::TEXTOID.oid().value())
+                },
+            ],
+        )
+        .ok()
+        .and_then(|mut it| {
+            it.next()
+                .and_then(|r| r.get_by_name::<bool, _>("decomposed").ok().flatten())
+        })
+        // Fail CLOSED: an SPI error or an unexpected shape means we could not prove
+        // the parent is NOT decomposed, so treat it as decomposed and refuse rather
+        // than proceed to a CASCADE drop that a decomposed parent cannot survive.
+        // The EXISTS query always yields one non-NULL bool, so None here is a real
+        // fault, not an empty result — refusing on it is correctness-first.
+        .unwrap_or(true)
 }
 
 /// Dependents of `view_name` registered in `__reflex_ivm_reference`, shallowest

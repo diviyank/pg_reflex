@@ -1,4 +1,3 @@
-use pgrx::datum::TimestampWithTimeZone;
 use pgrx::pg_sys::panic::ErrorReportable;
 use pgrx::spi::Spi;
 
@@ -51,6 +50,7 @@ pub(crate) fn reflex_doctor_impl(
             drop_orphans,
         ));
         rows.extend(detect_known_stale_imvs(target, false, drop_orphans));
+        rows.extend(detect_requires_explicit_refresh(target, false));
         rows.extend(detect_audit_findings(target, false));
 
         return rows;
@@ -64,12 +64,25 @@ pub(crate) fn reflex_doctor_impl(
         drop_orphans,
     ));
     rows.extend(detect_known_stale_imvs(target, true, drop_orphans));
+    rows.extend(detect_requires_explicit_refresh(target, true));
     rows.extend(detect_audit_findings(target, true));
 
     rows
 }
 
-/// Detect pending queue issues (F1/F2): rows that are too old or have too many attempts
+/// Detect pending-queue issues (F1/F2).
+///
+/// Classification reads `failures` — the counter the drain's EXCEPTION handler
+/// bumps and the one `PARTITION_FLUSH_FAILURE_CAP` gates on — never `attempts`,
+/// which the *enqueue* path bumps once per partition ATTACH. A busy source
+/// crosses any retry threshold within a day, so classifying on `attempts` made
+/// every such root permanently "too many attempts".
+///
+/// Age is measured from `last_attempt_at`, falling back to `enqueued_at` only
+/// when no drain has ever fired for the row. `enqueued_at` is reset by every
+/// re-enqueue, so on a busy source it reports a fresh age over an old failure —
+/// which is how a fixed bug's `last_error` came to be presented as the current
+/// cause.
 fn detect_pending_queue_issues(
     target: Option<&str>,
     max_attempts: i32,
@@ -78,85 +91,129 @@ fn detect_pending_queue_issues(
 ) -> Vec<DoctorReportRow> {
     let mut rows = Vec::new();
 
-    let query = match target {
-        Some(t) => format!(
-            "SELECT source_root, enqueued_at, attempts, last_error FROM public.__reflex_partition_pending WHERE source_root = '{}' ORDER BY enqueued_at",
-            t.replace("'", "''")
-        ),
-        None => "SELECT source_root, enqueued_at, attempts, last_error FROM public.__reflex_partition_pending ORDER BY enqueued_at".to_string(),
+    let filter = match target {
+        Some(t) => format!("WHERE p.source_root = '{}' ", t.replace("'", "''")),
+        None => String::new(),
     };
+    // `wedged_since` is the earliest stale_since among the IMVs fed by this root.
+    // It is the only timestamp neither the enqueue nor the drain resets, so it is
+    // the one honest answer to "how long has this actually been broken".
+    let query = format!(
+        "SELECT p.source_root, \
+                p.attempts, \
+                p.failures, \
+                p.last_error, \
+                p.last_attempt_at IS NOT NULL AS attempted, \
+                extract(epoch FROM now() - COALESCE(p.last_attempt_at, p.enqueued_at))::int8 AS attempt_age, \
+                extract(epoch FROM now() - p.enqueued_at)::int8 AS pending_age, \
+                (SELECT min(r.stale_since) FROM public.__reflex_ivm_reference r \
+                  WHERE COALESCE(r.enabled, TRUE) \
+                    AND (r.depends_on @> ARRAY[p.source_root] \
+                         OR r.depends_on @> ARRAY[split_part(p.source_root, '.', 2)]))::text AS wedged_since \
+           FROM public.__reflex_partition_pending p {filter}\
+          ORDER BY p.enqueued_at"
+    );
 
-    let pending_rows: Vec<(String, Option<TimestampWithTimeZone>, i32, Option<String>)> =
-        Spi::connect(|client| {
-            let mut result = Vec::new();
-            let rs = client.select(&query, None, &[]).unwrap_or_report();
-            for row in rs {
-                let source_root: String = row
+    let pending_rows: Vec<PendingQueueRow> = Spi::connect(|client| {
+        let mut result = Vec::new();
+        let rs = client.select(&query, None, &[]).unwrap_or_report();
+        for row in rs {
+            result.push(PendingQueueRow {
+                source_root: row
                     .get_by_name::<&str, _>("source_root")
                     .unwrap_or(None)
                     .unwrap_or("")
-                    .to_string();
-                let enqueued_at = row
-                    .get_by_name::<TimestampWithTimeZone, _>("enqueued_at")
-                    .unwrap_or(None);
-                let attempts: i32 = row
+                    .to_string(),
+                attempts: row
                     .get_by_name::<i32, _>("attempts")
                     .unwrap_or(None)
-                    .unwrap_or(0);
-                let last_error: Option<String> = row
+                    .unwrap_or(0),
+                failures: row
+                    .get_by_name::<i32, _>("failures")
+                    .unwrap_or(None)
+                    .unwrap_or(0),
+                last_error: row
                     .get_by_name::<&str, _>("last_error")
                     .unwrap_or(None)
-                    .map(|s| s.to_string());
-                result.push((source_root, enqueued_at, attempts, last_error));
-            }
-            result
-        });
+                    .map(|s| s.to_string()),
+                attempted: row
+                    .get_by_name::<bool, _>("attempted")
+                    .unwrap_or(None)
+                    .unwrap_or(false),
+                attempt_age: row
+                    .get_by_name::<i64, _>("attempt_age")
+                    .unwrap_or(None)
+                    .unwrap_or(0),
+                pending_age: row
+                    .get_by_name::<i64, _>("pending_age")
+                    .unwrap_or(None)
+                    .unwrap_or(0),
+                wedged_since: row
+                    .get_by_name::<&str, _>("wedged_since")
+                    .unwrap_or(None)
+                    .map(|s| s.to_string()),
+            });
+        }
+        result
+    });
 
-    for (source_root, enqueued_at, attempts, last_error) in pending_rows {
-        // Calculate age in seconds from enqueued_at to now
-        let age_seconds = if let Some(ts) = enqueued_at {
-            Spi::get_one::<i64>(&format!(
-                "SELECT extract(epoch FROM now() - '{}'::timestamptz)::int8",
-                ts
-            ))
-            .unwrap_or(None)
-            .unwrap_or(0)
+    for p in pending_rows {
+        // F2b before F2: a capped root is not merely failing, it has been given
+        // up on — no flush will touch it again until it is re-armed, which is a
+        // different instruction to the operator.
+        let check_id = if p.is_capped() {
+            "F2b"
+        } else if p.failures >= max_attempts {
+            "F2"
+        } else if p.attempt_age > PENDING_ROW_STALE_SECONDS {
+            "F1"
         } else {
-            0
+            continue;
         };
 
-        let check_id = if attempts >= max_attempts {
-            "F2".to_string()
-        } else if age_seconds > 3600 {
-            // Older than 1 hour
-            "F1".to_string()
+        let escaped_root = p.source_root.replace("'", "''");
+        // A capped root needs re-arming first: the flush this action prescribes
+        // declines to touch it otherwise, which made the F1/F2 remedy a
+        // guaranteed no-op on exactly the rows most likely to be capped.
+        let action = if p.is_capped() {
+            format!(
+                "SELECT reflex_reset_partition_failures('{0}'); \
+                 SELECT reflex_flush_partition_source('{0}');",
+                escaped_root
+            )
         } else {
-            continue; // Not old enough or too many attempts yet
+            format!("SELECT reflex_flush_partition_source('{}');", escaped_root)
         };
-
-        let action = format!(
-            "SELECT reflex_flush_partition_source('{}');",
-            source_root.replace("'", "''")
-        );
-        let finding = format!(
-            "Partition source {} enqueued for {} seconds, {} attempts, last error: {}",
-            source_root,
-            age_seconds,
-            attempts,
-            last_error.as_deref().unwrap_or("(none)")
-        );
-
+        let finding = p.describe();
         let outcome = if fix {
-            // Try to flush the partition source
-            apply_partition_flush_repair(&source_root)
+            if p.is_capped() {
+                // Grant exactly ONE attempt, by re-arming to CAP - 1 rather than 0:
+                // the flush below then runs, and if it fails the drain's own
+                // `failures + 1` re-caps the root immediately. Zeroing would hand
+                // the commit-time drain a full fresh budget every time a cron ran
+                // the doctor, so a poison root would never be permanently skipped —
+                // and would also hide the root from this report for an hour.
+                if crate::partition::rearm_capped_partition_root(&p.source_root) == 0 {
+                    rows.push((
+                        check_id.to_string(),
+                        "WARNING".to_string(),
+                        p.source_root,
+                        finding,
+                        action,
+                        "failed:could not re-arm the capped root".to_string(),
+                    ));
+                    continue;
+                }
+            }
+            verify_pending_drained(&p.source_root, apply_partition_flush_repair(&p.source_root))
         } else {
             "reported".to_string()
         };
 
         rows.push((
-            check_id,
+            check_id.to_string(),
             "WARNING".to_string(),
-            source_root,
+            p.source_root,
             finding,
             action,
             outcome,
@@ -164,6 +221,91 @@ fn detect_pending_queue_issues(
     }
 
     rows
+}
+
+/// A pending row is "old" past this many seconds since its last drain attempt.
+const PENDING_ROW_STALE_SECONDS: i64 = 3600;
+
+/// One `__reflex_partition_pending` row, read with everything a finding needs to
+/// be both classified and dated.
+struct PendingQueueRow {
+    source_root: String,
+    /// Enqueues since the last successful drain — NOT retries.
+    attempts: i32,
+    /// Consecutive drain failures. The classification column.
+    failures: i32,
+    last_error: Option<String>,
+    /// False when no drain has ever fired for this row (the F1 re-arm hole).
+    attempted: bool,
+    attempt_age: i64,
+    pending_age: i64,
+    wedged_since: Option<String>,
+}
+
+/// A pending-queue repair is `fixed` only when the row actually left the queue.
+///
+/// A successful drain DELETEs the row, so a row that is still present means the
+/// drain either declined (capped) or failed and rolled back. Neither is visible in
+/// the flush's return value: the capped path returns a perfectly normal
+/// "OK — nothing pending", and a per-root failure is swallowed into a WARNING by
+/// the drain's own EXCEPTION handler. Without this check the doctor reported
+/// `fixed` for a repair that did nothing.
+///
+/// Scope: this proves the QUEUE drained, not that downstream maintenance
+/// succeeded. The drain issues `PERFORM public.reflex_reconcile(imv)`, and
+/// `PERFORM` discards the `ERROR: …` string that reflex_reconcile returns for a
+/// soft failure. A drained row means the flush committed, not that every dependent
+/// IMV is now correct.
+fn verify_pending_drained(source_root: &str, outcome: String) -> String {
+    if outcome != "fixed" {
+        return outcome;
+    }
+    let escaped = source_root.replace("'", "''");
+    let still_queued = Spi::get_one::<i32>(&format!(
+        "SELECT failures FROM public.__reflex_partition_pending WHERE source_root = '{}'",
+        escaped
+    ))
+    .unwrap_or(None);
+    match still_queued {
+        Some(failures) => format!("failed:still queued after flush (failures = {})", failures),
+        None => outcome,
+    }
+}
+
+impl PendingQueueRow {
+    /// At or past the cap both flush entry points decline this root, so nothing
+    /// short of a re-arm can move it.
+    fn is_capped(&self) -> bool {
+        self.failures >= crate::partition::PARTITION_FLUSH_FAILURE_CAP
+    }
+
+    fn describe(&self) -> String {
+        let cap_note = if self.is_capped() {
+            " — auto-retry suppressed, failure cap reached"
+        } else {
+            ""
+        };
+        let attempt_phrase = if self.attempted {
+            format!("last drain attempt {}s ago", self.attempt_age)
+        } else {
+            "never attempted".to_string()
+        };
+        let wedge_phrase = match &self.wedged_since {
+            Some(ts) => format!("dependent IMVs stale since {}", ts),
+            None => "no dependent IMV flagged stale".to_string(),
+        };
+        format!(
+            "{}: {} consecutive drain failure(s){}; {}; pending {}s; {} enqueue(s); {}; last error: {}",
+            self.source_root,
+            self.failures,
+            cap_note,
+            attempt_phrase,
+            self.pending_age,
+            self.attempts,
+            wedge_phrase,
+            self.last_error.as_deref().unwrap_or("(none)")
+        )
+    }
 }
 
 /// Apply a partition flush repair in a subtransaction
@@ -185,12 +327,18 @@ fn apply_partition_flush_repair(source_root: &str) -> String {
     }
 }
 
-/// Apply a reconcile repair in a subtransaction
-fn apply_reconcile_repair(imv_name: &str) -> String {
+/// Apply a reconcile repair in a subtransaction.
+///
+/// Calls the two-argument `reflex_reconcile(view, drop_orphans)` overload (1.11.0)
+/// so an F4 / F4b repair honours the operator's `drop_orphans` choice instead of
+/// silently dropping orphan partitions the way the one-argument form does. F3
+/// already gates its orphan drop; this keeps F4/F4b consistent with it.
+fn apply_reconcile_repair(imv_name: &str, drop_orphans: bool) -> String {
     // Build the repair SQL with proper escaping
     let repair_sql = format!(
-        "SELECT public.reflex_reconcile('{}')",
-        imv_name.replace("'", "''")
+        "SELECT public.reflex_reconcile('{}', {})",
+        imv_name.replace("'", "''"),
+        drop_orphans
     );
     // Call the helper function, which executes the repair and returns 'fixed' or 'failed:...'
     let helper_call = format!(
@@ -204,23 +352,44 @@ fn apply_reconcile_repair(imv_name: &str) -> String {
     }
 }
 
-/// Apply a sync partitions repair in a subtransaction
-fn apply_sync_partitions_repair(imv_name: &str, drop_orphans: bool) -> String {
-    // Build the repair SQL with proper escaping
-    let repair_sql = format!(
-        "SELECT public.reflex_sync_partitions('{}', {})",
-        imv_name.replace("'", "''"),
-        drop_orphans
-    );
-    // Call the helper function, which executes the repair and returns 'fixed' or 'failed:...'
-    let helper_call = format!(
-        "SELECT public.__reflex_doctor_try_repair('{}')",
-        repair_sql.replace("'", "''")
-    );
-    match Spi::get_one::<String>(&helper_call) {
-        Ok(Some(outcome)) => outcome,
-        Ok(None) => "failed:no result".to_string(),
-        Err(e) => format!("failed:{}", e),
+/// F3's authorized repair: drop the colliding orphan partitions, then refill.
+///
+/// `reflex_sync_partitions(imv, true)` removes IMV-side children that map to no
+/// live source partition, NOTICEing each one — which is how the operator learns
+/// what blocked the swap. `reflex_reconcile` then refills and is the only path
+/// that clears `known_stale`. Sync alone reported success over an IMV the health
+/// surface still called broken, so the same finding came back on every run.
+fn apply_f3_repair(imv_name: &str) -> String {
+    let escaped = imv_name.replace("'", "''");
+    let sync_outcome = apply_doctor_repair(&format!(
+        "SELECT public.reflex_sync_partitions('{}', true)",
+        escaped
+    ));
+    if sync_outcome != "fixed" {
+        return sync_outcome;
+    }
+    apply_doctor_repair(&format!("SELECT public.reflex_reconcile('{}')", escaped))
+}
+
+/// A repair is only `fixed` when the registry agrees it is.
+///
+/// `reflex_sync_partitions` never clears `known_stale` and `reflex_reconcile` can
+/// fail softly, so an unverified outcome lets the doctor claim it fixed something
+/// while its own health surface still reports the IMV as stale.
+fn verify_stale_cleared(imv_name: &str, outcome: String) -> String {
+    if outcome != "fixed" {
+        return outcome;
+    }
+    let still_stale = Spi::get_one::<bool>(&format!(
+        "SELECT COALESCE(known_stale, FALSE) FROM public.__reflex_ivm_reference WHERE name = '{}'",
+        imv_name.replace("'", "''")
+    ))
+    .unwrap_or(None)
+    .unwrap_or(false);
+    if still_stale {
+        "failed:known_stale still set after repair".to_string()
+    } else {
+        outcome
     }
 }
 
@@ -265,28 +434,27 @@ fn detect_known_stale_imvs(
 
     for (imv_name, _graph_depth, stale_reason) in stale_rows {
         // Determine check_id:
-        // (1) If this IMV has registered sub-IMVs (decomposed chain), it's F4b
+        // (1) If this IMV is a decomposed parent (depends on a pg_reflex-generated
+        //     sub-IMV), it's F4b
         // (2) Else if stale_reason contains "overlap" → F3
         // (3) Else → F4
         let check_id = {
-            // Check for decomposed chain: sub-IMVs named with the pattern <bare_name>__*
-            let (_, bare_imv) = crate::query_decomposer::canonical_source(&imv_name);
-
-            // F10 fix: escape LIKE metacharacters (\ _ %) in bare_imv to match literally.
-            // This ensures underscore positions in real names don't act as wildcards.
-            // For example, "base_v" should NOT match "base_xy" under the pattern "base_v__%".
-            let escaped_bare = bare_imv
-                .replace('\\', "\\\\")
-                .replace('_', "\\_")
-                .replace('%', "\\%");
-
-            let pattern_suffix = format!("{}__", escaped_bare);
-            // Escape single quotes for SQL string literal
-            let escaped_pattern = pattern_suffix.replace("'", "''");
-
+            // 1.11.0: classify on the authoritative registry graph, not a name
+            // heuristic. The old `name LIKE '<bare>__%'` probe silently missed
+            // every schema-qualified decomposed IMV — its registry name is
+            // `s.qv__cte_b`, which does not begin with the parent's bare `qv__`,
+            // so `s.qv` was misclassified F4 and given a repair that could not
+            // handle its chain. PS-1 now records `is_generated_sub_imv` on the
+            // child and the edge in the parent's `depends_on_imv`; a decomposed
+            // parent is exactly a row with a generated node in `depends_on_imv`.
             let is_decomposed_chain = Spi::get_one::<bool>(&format!(
-                "SELECT EXISTS(SELECT 1 FROM public.__reflex_ivm_reference WHERE name LIKE '{}%' ESCAPE '\\')",
-                escaped_pattern
+                "SELECT EXISTS( \
+                     SELECT 1 FROM public.__reflex_ivm_reference child \
+                      WHERE child.name = ANY( \
+                          SELECT unnest(COALESCE(parent.depends_on_imv, ARRAY[]::TEXT[])) \
+                            FROM public.__reflex_ivm_reference parent WHERE parent.name = '{}') \
+                        AND COALESCE(child.is_generated_sub_imv, FALSE))",
+                imv_name.replace("'", "''")
             ))
             .unwrap_or(None)
             .unwrap_or(false);
@@ -306,23 +474,40 @@ fn detect_known_stale_imvs(
 
         let (action, outcome) = match check_id.as_str() {
             "F4b" => {
+                // Pre-1.11.0 this prescribed reflex_rebuild_chain and never ran it.
+                // reflex_rebuild_chain drop+recreates from the registry sql_query,
+                // which for a CTE-decomposed parent is the *rewritten* body naming
+                // a child the cascade just dropped — so it hard-errors on exactly
+                // this shape (D22, still open, PS-2's file). PS-1 made
+                // reflex_reconcile rebuild the generated sub-IMVs bottom-up first,
+                // so it is now the correct — and safe, rebuild-in-place — remedy,
+                // repaired under `fix` like F4. drop_orphans is honoured via the
+                // scoped overload.
                 (
                     format!(
-                        "SELECT reflex_rebuild_chain('{}');",
-                        imv_name.replace("'", "''")
+                        "SELECT reflex_reconcile('{}', {});",
+                        imv_name.replace("'", "''"),
+                        drop_orphans
                     ),
-                    "reported".to_string(), // F4b is never auto-performed
+                    if fix {
+                        verify_stale_cleared(
+                            &imv_name,
+                            apply_reconcile_repair(&imv_name, drop_orphans),
+                        )
+                    } else {
+                        "reported".to_string()
+                    },
                 )
             }
             "F3" => {
                 let sync_action = format!(
-                    "SELECT reflex_sync_partitions('{}', true);",
+                    "SELECT reflex_sync_partitions('{0}', true); SELECT reflex_reconcile('{0}');",
                     imv_name.replace("'", "''")
                 );
                 if drop_orphans {
                     // drop_orphans is enabled, so we can attempt the repair
                     let outcome_val = if fix {
-                        apply_sync_partitions_repair(&imv_name, true)
+                        verify_stale_cleared(&imv_name, apply_f3_repair(&imv_name))
                     } else {
                         "reported".to_string() // dry run
                     };
@@ -336,11 +521,15 @@ fn detect_known_stale_imvs(
                 // F4 case
                 (
                     format!(
-                        "SELECT reflex_reconcile('{}');",
-                        imv_name.replace("'", "''")
+                        "SELECT reflex_reconcile('{}', {});",
+                        imv_name.replace("'", "''"),
+                        drop_orphans
                     ),
                     if fix {
-                        apply_reconcile_repair(&imv_name)
+                        verify_stale_cleared(
+                            &imv_name,
+                            apply_reconcile_repair(&imv_name, drop_orphans),
+                        )
                     } else {
                         "reported".to_string()
                     },
@@ -356,6 +545,141 @@ fn detect_known_stale_imvs(
                 "IMV is known_stale: {}",
                 stale_reason.unwrap_or_else(|| "(unknown reason)".to_string())
             ),
+            action,
+            outcome,
+        ));
+    }
+
+    rows
+}
+
+/// Detect nodes that cannot self-maintain because every real source is a
+/// materialized view (F12 — PS-3).
+///
+/// PG fires no trigger on a matview, so such a node is a snapshot frozen at
+/// create time. `requires_explicit_refresh` records that structurally and
+/// PERMANENTLY. This finding makes the node visible to `reflex_doctor` — the
+/// blind spot that let 40/40 generated sub-IMVs sit month-stale unflagged,
+/// because every other health surface keys off `known_stale` (which a
+/// by-design-unmaintainable node never sets).
+///
+/// The flag is kept strictly distinct from `known_stale`: this path never reads,
+/// sets, or clears `known_stale`, and never routes through `verify_stale_cleared`
+/// — so a `fix => TRUE` run can never turn this into a permanent
+/// `failed:known_stale still set` false alarm. In fix mode it runs the verified
+/// remedy `refresh_imv_depending_on('<mv>')` for each matview source (closing the
+/// "nothing schedules the remedy" gap) and reports `refreshed`; the structural
+/// flag is intentionally NOT cleared, because clearing it would re-hide the node
+/// the instant the matview next changes.
+fn detect_requires_explicit_refresh(target: Option<&str>, fix: bool) -> Vec<DoctorReportRow> {
+    let mut rows = Vec::new();
+
+    let query = match target {
+        Some(t) => format!(
+            "SELECT name FROM public.__reflex_ivm_reference \
+             WHERE (name = '{0}' OR depends_on @> ARRAY['{0}']) \
+               AND COALESCE(requires_explicit_refresh, FALSE) = TRUE ORDER BY graph_depth, name",
+            t.replace("'", "''")
+        ),
+        None => "SELECT name FROM public.__reflex_ivm_reference \
+             WHERE COALESCE(requires_explicit_refresh, FALSE) = TRUE ORDER BY graph_depth, name"
+            .to_string(),
+    };
+
+    let names = Spi::connect(|client| {
+        let mut result = Vec::new();
+        let rs = client.select(&query, None, &[]).unwrap_or_report();
+        for row in rs {
+            let name: String = row
+                .get_by_name::<&str, _>("name")
+                .unwrap_or(None)
+                .unwrap_or("")
+                .to_string();
+            if !name.is_empty() {
+                result.push(name);
+            }
+        }
+        result
+    });
+
+    for imv_name in names {
+        // Re-derive the matview source(s) from the graph so the remedy names the
+        // exact spelling stored in depends_on — which is what
+        // refresh_imv_depending_on matches on ($1 = ANY(depends_on)).
+        let matview_sources: Vec<String> = Spi::connect(|client| {
+            let sql = format!(
+                "SELECT s FROM unnest( \
+                     (SELECT depends_on FROM public.__reflex_ivm_reference WHERE name = '{}') \
+                 ) AS s \
+                 WHERE s NOT LIKE '<%' \
+                   AND EXISTS (SELECT 1 FROM pg_class c \
+                                WHERE c.oid = to_regclass(s) AND c.relkind = 'm')",
+                imv_name.replace("'", "''")
+            );
+            let mut out = Vec::new();
+            let rs = client.select(&sql, None, &[]).unwrap_or_report();
+            for row in rs {
+                if let Some(s) = row.get_by_name::<&str, _>("s").unwrap_or(None) {
+                    out.push(s.to_string());
+                }
+            }
+            out
+        });
+
+        let action = if matview_sources.is_empty() {
+            "-- the node's only sources were materialized views, now absent; \
+             recreate the source or drop this IMV"
+                .to_string()
+        } else {
+            matview_sources
+                .iter()
+                .map(|mv| {
+                    format!(
+                        "SELECT refresh_imv_depending_on('{}');",
+                        mv.replace("'", "''")
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+
+        let finding = if matview_sources.is_empty() {
+            "IMV cannot self-maintain: all sources are materialized views. \
+             Frozen at create time; needs explicit refresh after each REFRESH MATERIALIZED VIEW"
+                .to_string()
+        } else {
+            format!(
+                "IMV cannot self-maintain: all sources are materialized views ({}). \
+                 Frozen at create time; needs explicit refresh after each REFRESH MATERIALIZED VIEW",
+                matview_sources.join(", ")
+            )
+        };
+
+        // In fix mode run the verified remedy per matview source. Never touches
+        // known_stale, never clears requires_explicit_refresh, never calls
+        // verify_stale_cleared — so it cannot become a permanent false alarm.
+        let outcome = if !fix || matview_sources.is_empty() {
+            "reported".to_string()
+        } else {
+            let mut failure: Option<String> = None;
+            for mv in &matview_sources {
+                let res = apply_doctor_repair(&format!(
+                    "SELECT refresh_imv_depending_on('{}')",
+                    mv.replace("'", "''")
+                ));
+                if res != "fixed" {
+                    failure = Some(res);
+                    break;
+                }
+            }
+            failure.unwrap_or_else(|| "refreshed".to_string())
+        };
+
+        rows.push((
+            "F12".to_string(),
+            "WARNING".to_string(),
+            imv_name,
+            finding,
             action,
             outcome,
         ));
@@ -501,6 +825,14 @@ fn detect_audit_findings(target: Option<&str>, fix: bool) -> Vec<DoctorReportRow
             "archive_residue" => "F5/F6", // advisory "could not verify" variant
             "bare_name_ambiguity" => "F8",
             "orphan-intermediate" | "orphan-staging" | "orphan-scratch" => "F9",
+            // The IMV-vs-source partition-structure findings. These name an orphan
+            // mirror partition of a LIVE parent — the case the orphan-* checks
+            // deliberately no longer claim (it is not "unowned by any IMV", it is
+            // "owned but no longer backed by a source partition"). The audit
+            // already detects it with a correct suggested fix; without forwarding
+            // it here, nothing reaches reflex_doctor, because F3 only exists once a
+            // maintenance attempt has already failed.
+            "partition-mirror" | "partition-tree-drift" => "F3",
             "duplicate-function" => "F11",
             _ => continue,
         };
