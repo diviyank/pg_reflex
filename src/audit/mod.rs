@@ -89,6 +89,32 @@ impl ImvRow {
         }
     }
 
+    /// Whether `__reflex_intermediate_<name>` participates in this IMV's
+    /// maintenance. Shares its definition with the runtime and with reconcile's
+    /// heal gate — see [`crate::sql_writer::registry::owns_intermediate`].
+    pub fn owns_intermediate(&self) -> bool {
+        crate::sql_writer::registry::owns_intermediate(&self.end_query)
+    }
+
+    /// A row written by `RegistryRow::decomposed` (`src/sql_writer/registry.rs`):
+    /// the *wrapper* node of a set-op / DISTINCT ON / window decomposition. It
+    /// hardcodes `end_query: ""` AND `aggregations_json: "{}"`, so it is the one
+    /// shape where the two registry signals DISAGREE — and the disagreement is the
+    /// classifier: every row `persist_metadata` writes has `end_query == ""`
+    /// exactly when `aggregations.is_passthrough` is true.
+    ///
+    /// Such a node owns NO internal relation of either branch. Probed on pg17: a
+    /// top-level `UNION ALL` wrapper is a VIEW over its `__union_N` sub-IMVs and
+    /// the only `__reflex_%` relations in the database are the sub-IMVs' own
+    /// passthrough scratch pairs (`__reflex_pt_new_<view>__union_0_<src>`, owned by
+    /// the sub-IMV row, which audits clean on its own). DISTINCT ON and window
+    /// wrappers are VIEWs too; a `materialize_as_table` UNION-ALL wrapper is an
+    /// UNLOGGED TABLE maintained by `__reflex_union_mirror_*` triggers on its
+    /// operands, and still owns no aux relation.
+    pub fn is_decomposed_wrapper(&self) -> bool {
+        !self.owns_intermediate() && !self.is_passthrough()
+    }
+
     pub fn real_sources(&self) -> impl Iterator<Item = &str> {
         self.depends_on
             .iter()

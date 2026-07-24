@@ -311,6 +311,31 @@ pub struct ImvRecord {
     pub partition_depth: Option<i32>,
 }
 
+impl ImvRecord {
+    /// See [`owns_intermediate`].
+    pub fn owns_intermediate(&self) -> bool {
+        owns_intermediate(&self.end_query)
+    }
+}
+
+/// Whether an intermediate table (`__reflex_intermediate_<view>`) participates in
+/// this IMV's maintenance, decided from its `end_query`.
+///
+/// `end_query` is non-empty exactly for the aggregate shape whose target is filled
+/// FROM the intermediate; it is `''` for a passthrough IMV and for every decomposed
+/// wrapper row. This is the branch the runtime itself takes (`src/partition.rs:633`,
+/// `:644`, `:1054`, `src/trigger/ops.rs:436`, `:653`, `:783`,
+/// `src/reconcile.rs:139`), which is why the audit reads the same signal rather
+/// than `aggregations->>'is_passthrough'`: `RegistryRow::decomposed` writes
+/// `aggregations = '{}'`, so the JSON signal claims "not passthrough" — and
+/// therefore "has an intermediate" — for wrapper rows that own nothing. One
+/// function, so the audit's classification and reconcile's heal gate cannot drift
+/// apart (see `PartitionMirror::run` in `src/audit/checks_b_drift.rs` for the full
+/// rationale, and `ImvRow::owns_intermediate` in `src/audit/mod.rs`).
+pub fn owns_intermediate(end_query: &str) -> bool {
+    !end_query.is_empty()
+}
+
 /// Read one IMV row by name. Returns `None` when no row matches (the IMV is
 /// not registered). Disabled rows are still returned — callers that require
 /// `enabled = TRUE` check [`ImvRecord::enabled`] themselves (matching the
