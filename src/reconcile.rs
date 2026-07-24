@@ -75,7 +75,44 @@ fn heal_missing_intermediate(view_name: &str) {
         None => return,
     };
 
-    Spi::connect_mut(|client| {
+    let healed = Spi::connect_mut(|client| {
+        // Serialize the DDL against a concurrent healer of the same IMV, then
+        // RE-PROBE under the lock. `CREATE TABLE IF NOT EXISTS` is not race-safe:
+        // two sessions that both saw `to_regclass` NULL (each other's CREATE being
+        // uncommitted) would both emit it and the loser would abort on
+        // `pg_type_typname_nsp_index`. Because the lock is transaction-scoped, the
+        // second session cannot acquire it until the first has committed — at which
+        // point the re-probe sees the table and it skips the DDL entirely.
+        //
+        // INVARIANT: every IMV-name advisory lock in pg_reflex uses the two-key
+        // `(hashtext(name), hashtext(reverse(name)))` form (trigger bodies, the
+        // deferred flush in `trigger/deferred.rs`, the partition flush in `lib.rs`,
+        // and `reflex_sync_partitions` at `src/partition.rs:1099`). A one-key
+        // `bigint` lock occupies a different advisory-lock space in PostgreSQL and
+        // would never mutually exclude with those, so it MUST be the two-key form.
+        //
+        // Taken here rather than at the top of the function so the healthy path —
+        // every reconcile of an IMV whose intermediate is present — keeps its
+        // current locking behaviour exactly. Only a session that is about to emit
+        // DDL waits.
+        //
+        // Considered and accepted: `build_indexes_ddl` also emits
+        // `CREATE INDEX IF NOT EXISTS idx__reflex_target_<view>` on the LIVE target,
+        // so a heal briefly holds a ShareLock there — and the heal is reachable from
+        // the COMMIT-time deferred flush. It is bounded (one index on an
+        // already-existing table, only on the absent-intermediate path) and it is
+        // the same DDL create time issues, but a reader should know it was weighed.
+        let _ = client.update(
+            "SELECT pg_advisory_xact_lock(hashtext($1), hashtext(reverse($1)))",
+            None,
+            &[unsafe {
+                DatumWithOid::new(view_name.to_string(), PgBuiltInOids::TEXTOID.oid().value())
+            }],
+        );
+        if relation_present(client, &intermediate) {
+            return false;
+        }
+
         client
             .update(&intermediate_ddl, None, &[])
             .unwrap_or_report();
@@ -90,14 +127,17 @@ fn heal_missing_intermediate(view_name: &str) {
         for ddl in crate::schema_builder::build_group_capture_ddl(view_name, &plan) {
             client.update(&ddl, None, &[]).unwrap_or_report();
         }
+        true
     });
 
-    warning!(
-        "pg_reflex: recreated the missing internal table(s) of IMV '{}' ({} and companions). \
-         The IMV was not being maintained while they were absent; this reconcile refills it.",
-        view_name,
-        intermediate
-    );
+    if healed {
+        warning!(
+            "pg_reflex: recreated the missing internal table(s) of IMV '{}' ({} and companions). \
+             The IMV was not being maintained while they were absent; this reconcile refills it.",
+            view_name,
+            intermediate
+        );
+    }
 }
 
 /// `to_regclass` presence probe for an already-quoted, qualified relation name.
