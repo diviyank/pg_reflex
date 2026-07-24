@@ -951,6 +951,108 @@ fn pg_scheduled_reconcile_keeps_generated_child_when_parent_is_fresh() {
     );
 }
 
+/// 1.11.0 FINAL REVIEW — the covered-skip descent and the rebuild descent must
+/// stop at the same nodes. The covered descent walked through ANY generated node
+/// (`is_generated_sub_imv`), while the rebuild descent
+/// (`generated_dependencies_shallowest_first`) also requires
+/// `aggregations <> '{}'`, so it STOPS at a decomposed wrapper — PS-1 established
+/// reconcile_one cannot rebuild a set-op wrapper without column-shifting.
+///
+/// A CTE whose body is a `UNION ALL` of aggregates decomposes to
+/// `top -> top__cte_u (wrapper, aggregations='{}') -> top__cte_u__union_0/1
+/// (rebuildable aggregate operands)`. When every node is stale in one sweep the
+/// covered descent reached THROUGH the wrapper and marked both operands covered —
+/// so they were skipped — yet `reflex_reconcile(top)` halted at the wrapper and
+/// rebuilt neither. Net: the operands got NO drift-recovery reconcile, ever, for
+/// this topology (a regression from pre-covered-filter behaviour, where they were
+/// swept standalone). The fix mirrors the rebuild descent so the covered descent
+/// also stops at the wrapper: the wrapper itself stays covered (reached via the
+/// base step from its parent, and it can't be safely standalone-reconciled), but
+/// the operands below it become standalone candidates again.
+#[pg_test]
+fn pg_scheduled_reconcile_reconciles_operands_below_decomposed_wrapper() {
+    Spi::run(
+        "CREATE TABLE dcw_t0 (g TEXT, v NUMERIC); \
+         CREATE TABLE dcw_t1 (g TEXT, x NUMERIC); \
+         CREATE TABLE dcw_t2 (g TEXT, x NUMERIC);",
+    )
+    .expect("create sources");
+    Spi::run(
+        "INSERT INTO dcw_t0 SELECT 'g' || (g % 4), 1 FROM generate_series(1,80) g; \
+         INSERT INTO dcw_t1 SELECT 'g' || (g % 4), 2 FROM generate_series(1,80) g; \
+         INSERT INTO dcw_t2 SELECT 'g' || (g % 4), 3 FROM generate_series(1,80) g;",
+    )
+    .expect("seed");
+
+    let result = crate::create_reflex_ivm(
+        "dcw_top",
+        "WITH u AS ( \
+             SELECT g, SUM(x) AS sx FROM dcw_t1 GROUP BY g \
+             UNION ALL \
+             SELECT g, SUM(x) AS sx FROM dcw_t2 GROUP BY g \
+         ) \
+         SELECT u.g, SUM(u.sx) AS total FROM u JOIN dcw_t0 ON dcw_t0.g = u.g GROUP BY u.g",
+        Some("g"),
+        None,
+        None,
+        None,
+    );
+    assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
+
+    // Fixture topology: a decomposed UNION-ALL wrapper (aggregations='{}') sitting
+    // one level above two rebuildable aggregate operands (aggregations<>'{}').
+    let wrapper_aggs = Spi::get_one::<String>(
+        "SELECT aggregations::text FROM public.__reflex_ivm_reference \
+          WHERE name = 'dcw_top__cte_u'",
+    )
+    .expect("q")
+    .expect("v");
+    assert_eq!(
+        wrapper_aggs, "{}",
+        "the UNION-ALL CTE wrapper must be a decomposed node the rebuild descent stops at"
+    );
+
+    let rebuildable_operands = Spi::get_one::<i64>(
+        "SELECT COUNT(*) FROM public.__reflex_ivm_reference \
+          WHERE name LIKE 'dcw_top__cte_u__union_%' \
+            AND is_generated_sub_imv \
+            AND COALESCE(aggregations::text, '{}') <> '{}'",
+    )
+    .expect("q")
+    .expect("v");
+    assert_eq!(
+        rebuildable_operands, 2,
+        "fixture must produce 2 rebuildable aggregate operands below the wrapper"
+    );
+
+    // Age every node into candidacy: inside one transaction CURRENT_TIMESTAMP is
+    // the transaction start, so a row touched here never looks stale otherwise.
+    Spi::run(
+        "UPDATE public.__reflex_ivm_reference \
+            SET last_update_date = TIMESTAMP '2001-01-01 00:00:00' \
+          WHERE name LIKE 'dcw_top%'",
+    )
+    .expect("backdate");
+
+    Spi::run("SELECT * FROM reflex_scheduled_reconcile(1)").expect("run scheduled reconcile");
+
+    // Each rebuildable operand must have been reconciled standalone: its
+    // last_update_date must have advanced past the backdate. Pre-fix the covered
+    // descent reached through the wrapper and skipped them while reflex_reconcile
+    // halted at the wrapper, so both stayed exactly backdated.
+    let operands_still_backdated = Spi::get_one::<i64>(
+        "SELECT COUNT(*) FROM public.__reflex_ivm_reference \
+          WHERE name LIKE 'dcw_top__cte_u__union_%' \
+            AND last_update_date = TIMESTAMP '2001-01-01 00:00:00'",
+    )
+    .expect("q")
+    .expect("v");
+    assert_eq!(
+        operands_still_backdated, 0,
+        "each rebuildable operand below the decomposed wrapper must have been reconciled"
+    );
+}
+
 /// PS-1 REVIEW — `recompute_graph_depth` cannot converge on a dependency cycle,
 /// and each run inflated `graph_depth` by `MAX_DEPTH_PASSES` (20 -> 40 -> …) while
 /// still reporting `REPAIRED`. Acyclic idempotence is covered by
