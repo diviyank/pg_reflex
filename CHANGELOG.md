@@ -4,10 +4,43 @@
 
 ## [1.11.1] - 2026-07-24
 
-Audit truthfulness fix. Module-only — replace the `.so`, then
-`ALTER EXTENSION pg_reflex UPDATE TO '1.11.1';`. No DDL, no reconcile needed.
+Audit truthfulness, plus a recovery path for a dropped internal table. Module-only
+— replace the `.so`, then `ALTER EXTENSION pg_reflex UPDATE TO '1.11.1';`. No DDL,
+no reconcile needed.
 
 **Fixed**
+
+- `reflex_scheduled_reconcile` raised `"<view>" is not a table` and returned nothing
+  — the entire scheduled sweep died — in any database containing a decomposed
+  set-op / `DISTINCT ON` / window IMV. Such a wrapper is a view maintained through
+  its generated sub-IMVs, so `reflex_reconcile` cannot operate on it; nothing ever
+  advances the wrapper's `last_update_date` either (only the tail of `reconcile_one`
+  writes it, which a wrapper never reaches), so it became a sweep candidate
+  `max_age_minutes` after creation and stayed one forever. The candidate query now
+  skips planless rows, using the predicate already applied two CTEs down.
+
+- `reflex_reconcile` (and therefore `reflex_rebuild_imv`) now **recreates a dropped
+  `__reflex_intermediate_<view>`** instead of failing on it. Previously the
+  intermediate's DDL was emitted only at create time, so an intermediate lost to a
+  `DROP … CASCADE` or a dropped schema left the IMV unrepairable by any exposed
+  primitive: the partitioned path returned `ERROR: partition reconcile failed` from
+  the swap's ATTACH, the unpartitioned path raised 42P01 on `TRUNCATE`, and
+  `internal-tables-exist` reported the condition at Error severity while prescribing
+  the very call that could not fix it. The heal rebuilds the table, its indexes and
+  the group-capture tables from the registry row, then lets the existing partition
+  sync mirror the children. It runs under the IMV's advisory lock and re-probes
+  after acquiring it, so concurrent callers cannot race the DDL, and it refuses to
+  build a shape whose group-key types it cannot resolve rather than committing a
+  wrongly-typed table.
+
+- `internal-tables-exist` and `trigger-attached` false-positived at Error severity on
+  every decomposed set-op / `DISTINCT ON` / window **wrapper** IMV, demanding
+  internal tables and consolidated triggers the wrapper correctly does not own (it is
+  a view; its maintenance runs through the generated sub-IMVs). `trigger-attached`'s
+  remedy was actively harmful: `reflex_rebuild_triggers` on a sub-IMV installed four
+  junk consolidated triggers on its target and left the finding standing, so every
+  retry added four more. Wrappers are now classified by their `aggregations` key
+  count and excluded from both checks.
 
 - The `partition-mirror` audit check (surfaced by `reflex_doctor` as F3) reported
   phantom intermediate-partition drift on partitioned **passthrough** IMVs. A
@@ -29,17 +62,26 @@ Audit truthfulness fix. Module-only — replace the `.so`, then
 
 **Known limitations**
 
-- No primitive recreates a dropped `__reflex_intermediate_<view>` table.
-  `internal-tables-exist` reports the absence at Error severity but prescribes
-  `reflex_rebuild_imv`, which is an alias for `reflex_reconcile` and fails with
-  `ERROR: partition reconcile failed` on a partitioned IMV. The working remedy
-  today is `drop_reflex_ivm` followed by recreation. Filed in
-  `untreated_bugs/2026-07-24_no_primitive_recreates_dropped_intermediate.md`.
-- `internal-tables-exist` false-positives at Error severity on UNION-ALL wrapper
-  IMVs, demanding `__reflex_intermediate_<view>` / `__reflex_affected_<view>` for a
-  decomposed wrapper that correctly owns neither. Filed in
-  `untreated_bugs/2026-07-24_internal_tables_exist_union_wrapper_false_positive.md`.
-- A stray childless `__reflex_intermediate_<view>` beside a passthrough IMV is now
+- `reflex_reconcile('<wrapper>')` called **directly** on a decomposed set-op /
+  `DISTINCT ON` / window IMV still raises `"<view>" is not a table`. The scheduled
+  sweep no longer reaches that state, but `refresh_imv_depending_on` and
+  `reflex_doctor(fix => true)`'s F4/F4b repairs route into the same call and are
+  unaudited. Filed in
+  `untreated_bugs/2026-07-24_reconcile_raises_on_decomposed_wrapper.md`.
+- Nothing checks that a materialised wrapper's `__reflex_union_mirror_*` triggers are
+  present, so dropping one causes silent divergence that `reflex_audit` reports as
+  healthy. The wrapper Error this release removed never detected that condition
+  either (it fired unconditionally), so no detection power was lost — but no
+  primitive reinstalls a mirror trigger today, which is why the check is deferred
+  rather than added. Filed in
+  `untreated_bugs/2026-07-24_union_mirror_triggers_unchecked.md`.
+- The heal repairs the aggregate branch only: a missing target table or a missing
+  per-source passthrough scratch table is still `reflex_rebuild_triggers`' job, so
+  `internal-tables-exist` converges for aggregate IMVs, not universally.
+- `reflex_doctor` never mentions a missing intermediate at all —
+  `internal-tables-exist` findings are `reflex_audit`-only and are not forwarded to
+  the doctor summarizer.
+- A stray childless `__reflex_intermediate_<view>` beside a passthrough IMV is
   reported by no check. The relation is inert; the alternative would arm a
   `DROP TABLE … CASCADE` remedy keyed on a passthrough classification.
 

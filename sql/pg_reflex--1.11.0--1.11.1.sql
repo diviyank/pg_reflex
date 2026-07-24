@@ -4,8 +4,33 @@
 --
 -- Replace the module (.so) BEFORE running this.
 --
--- One fix, delivered entirely in the module — no SQL signatures, tables, or
+-- Four fixes, all delivered entirely in the module — no SQL signatures, tables, or
 -- triggers change, so this delta carries no DDL:
+--
+--   * reflex_scheduled_reconcile no longer dies on decomposed set-op / DISTINCT ON /
+--     window wrapper IMVs. Reconcile cannot operate on a wrapper (it is a view,
+--     maintained through its generated sub-IMVs), so the sweep raised
+--     `"<view>" is not a table` and returned NOTHING — no IMV in the database was
+--     swept. Wrapper rows were permanent candidates because nothing advances their
+--     `last_update_date`. The candidate query now skips planless rows. If you have
+--     any UNION / UNION ALL / DISTINCT ON / window IMV, your scheduled reconcile was
+--     a no-op before this release.
+--
+--   * reflex_reconcile (and its alias reflex_rebuild_imv) now recreates a dropped
+--     `__reflex_intermediate_<view>`, its indexes and its group-capture tables from
+--     the registry row, then lets the existing partition sync mirror the children.
+--     Previously that DDL existed only at create time, so an intermediate lost to a
+--     `DROP … CASCADE` left the IMV unrepairable by any exposed primitive while the
+--     audit reported it at Error severity with a remedy that could not work. The
+--     heal runs under the IMV's advisory lock, re-probes after acquiring it, and
+--     refuses to build a shape whose group-key types it cannot resolve.
+--
+--   * internal-tables-exist and trigger-attached no longer false-positive at Error
+--     severity on decomposed wrapper IMVs, demanding internal tables and consolidated
+--     triggers the wrapper does not own. trigger-attached's remedy was harmful:
+--     rebuilding triggers on a sub-IMV installed four junk triggers per retry without
+--     clearing the finding. If you ran it, drop any
+--     `__reflex_trigger_{ins,del,upd,trunc}_on_<sub-imv>` triggers it left behind.
 --
 --   * The `partition-mirror` audit check (surfaced by reflex_doctor as F3) no
 --     longer reports phantom intermediate-partition drift on passthrough IMVs.

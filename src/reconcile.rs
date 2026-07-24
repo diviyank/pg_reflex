@@ -7,6 +7,217 @@ use crate::query_decomposer::{intermediate_table_name, quote_identifier, split_q
 use crate::schema_builder::build_indexes_ddl;
 use crate::validate_view_name;
 
+/// Recreate `__reflex_intermediate_<view>` and its companions when the IMV expects
+/// an intermediate and it is absent — dropped by hand, lost to a
+/// `DROP … CASCADE`, or removed with a schema.
+///
+/// Until 1.11.1 nothing in the extension re-issued that DDL (it was emitted only at
+/// create time), so `internal-tables-exist` reported the absence at Error severity
+/// and prescribed `reflex_rebuild_imv`, a literal alias for [`reflex_reconcile`]
+/// (`src/lib.rs:823`) — which could not repair it: the partitioned path needs an
+/// existing parent to ATTACH swap children to (`ERROR: partition reconcile failed`,
+/// `missing intermediate bound for child …`) and the unpartitioned path raises
+/// 42P01 on `TRUNCATE {intermediate}`. An operator following the tool's own
+/// instruction retried forever.
+///
+/// Runs BEFORE the pre-rebuild partition sync: `reflex_sync_partitions` gates every
+/// intermediate-child DDL on a `to_regclass` probe of the parent
+/// (`src/partition.rs:1055`), so with the parent restored its existing loop mirrors
+/// the partition tree and no new partition code is needed here.
+///
+/// Everything needed is in the registry row — `aggregations` (the plan, with the
+/// column types create time resolved), `storage_mode`, and the sources in
+/// `depends_on` — so the missing `create_args` of a generated sub-IMV does not block
+/// recovery. `column_types` is reconstructed the way create time built it: from the
+/// sources' catalog entries, then from a temp view over `base_query`, whose output
+/// column names ARE the intermediate's column names.
+///
+/// Gated on [`crate::sql_writer::registry::owns_intermediate`] — the same predicate
+/// the audit classifies with — so it cannot build an intermediate for a passthrough
+/// IMV or a decomposed wrapper (the mirror image of the phantom drift PS-9 removed).
+fn heal_missing_intermediate(view_name: &str) {
+    let intermediate = intermediate_table_name(view_name);
+
+    let record = Spi::connect(|client| {
+        if relation_present(client, &intermediate) {
+            return None;
+        }
+        crate::sql_writer::registry::read_imv(client, view_name)
+    });
+    let record = match record {
+        Some(r) if r.enabled && r.owns_intermediate() => r,
+        _ => return,
+    };
+    // A row whose `aggregations` will not parse carries no shape to rebuild from;
+    // leave it to the audit rather than guessing one.
+    let plan = match record.plan.clone() {
+        Some(p) => p,
+        None => return,
+    };
+
+    // The three inputs create time uses, in create time's order — the map is
+    // `or_insert`-filled, so earlier sources win and adding later ones is purely
+    // additive (`materialize_aggregate`, `src/create_ivm/mod.rs`).
+    //
+    // The `base_query` augment is load-bearing, not belt-and-braces: an EXPRESSION
+    // group key such as `date_trunc('day', ts)` exists in no catalog, so without it
+    // `resolve_column_type` falls through to its NUMERIC default and the healed key
+    // column is `numeric` where create time made it `timestamptz`.
+    //
+    // HAZARD, deliberately guarded below: `augment_column_types_from_query` returns
+    // SILENTLY when its `CREATE TEMP VIEW` fails (`src/create_ivm/admin.rs:513-515`).
+    // At create time a wrongly-typed intermediate dies immediately on the following
+    // `INSERT INTO {intermediate} {base_query}`, which raises and rolls the whole
+    // CREATE back. At heal time that protection is absent on the partitioned path:
+    // `reconcile_one` turns a failed swap fill into a returned `ERROR: …` STRING
+    // rather than a raise, so the transaction is not rolled back and a wrongly-typed
+    // intermediate would be COMMITTED — and the next reconcile would skip the heal
+    // (the relation now exists) and fail forever. So instead of trusting the map, we
+    // refuse to build a shape we cannot type.
+    let mut column_types = Spi::connect(|client| {
+        crate::create_ivm::query_column_types_from_catalog_with_per_source(
+            client,
+            &record.depends_on,
+        )
+        .0
+    });
+    crate::create_ivm::augment_column_types_from_query(&record.base_query, &mut column_types);
+    if let Some((sql_query, _)) =
+        Spi::connect(|client| crate::sql_writer::registry::read_imv_for_rebuild(client, view_name))
+    {
+        if !sql_query.is_empty() {
+            crate::create_ivm::augment_column_types_from_query(&sql_query, &mut column_types);
+        }
+    }
+
+    if let Some(unresolved) = first_unresolved_group_key(&plan, &column_types) {
+        warning!(
+            "pg_reflex: cannot recreate the missing internal table(s) of IMV '{}' — \
+             the type of group key '{}' could not be resolved from its sources or its \
+             stored queries, and guessing one would commit an intermediate that no \
+             later reconcile can repair. Recreate the IMV from its original \
+             definition instead.",
+            view_name,
+            unresolved
+        );
+        return;
+    }
+
+    let logged = !record.storage_mode.eq_ignore_ascii_case("UNLOGGED");
+    let intermediate_ddl = match crate::schema_builder::build_intermediate_table_ddl(
+        view_name,
+        &plan,
+        &column_types,
+        logged,
+    ) {
+        Some(ddl) => ddl,
+        None => return,
+    };
+
+    let healed = Spi::connect_mut(|client| {
+        // Serialize the DDL against a concurrent healer of the same IMV, then
+        // RE-PROBE under the lock. `CREATE TABLE IF NOT EXISTS` is not race-safe:
+        // two sessions that both saw `to_regclass` NULL (each other's CREATE being
+        // uncommitted) would both emit it and the loser would abort on
+        // `pg_type_typname_nsp_index`. Because the lock is transaction-scoped, the
+        // second session cannot acquire it until the first has committed — at which
+        // point the re-probe sees the table and it skips the DDL entirely.
+        //
+        // INVARIANT: every IMV-name advisory lock in pg_reflex uses the two-key
+        // `(hashtext(name), hashtext(reverse(name)))` form (trigger bodies, the
+        // deferred flush in `trigger/deferred.rs`, the partition flush in `lib.rs`,
+        // and `reflex_sync_partitions` at `src/partition.rs:1099`). A one-key
+        // `bigint` lock occupies a different advisory-lock space in PostgreSQL and
+        // would never mutually exclude with those, so it MUST be the two-key form.
+        //
+        // Taken here rather than at the top of the function so the healthy path —
+        // every reconcile of an IMV whose intermediate is present — keeps its
+        // current locking behaviour exactly. Only a session that is about to emit
+        // DDL waits.
+        //
+        // Considered and accepted: `build_indexes_ddl` also emits
+        // `CREATE INDEX IF NOT EXISTS idx__reflex_target_<view>` on the LIVE target,
+        // so a heal briefly holds a ShareLock there — and the heal is reachable from
+        // the COMMIT-time deferred flush. It is bounded (one index on an
+        // already-existing table, only on the absent-intermediate path) and it is
+        // the same DDL create time issues, but a reader should know it was weighed.
+        let _ = client.update(
+            "SELECT pg_advisory_xact_lock(hashtext($1), hashtext(reverse($1)))",
+            None,
+            &[unsafe {
+                DatumWithOid::new(view_name.to_string(), PgBuiltInOids::TEXTOID.oid().value())
+            }],
+        );
+        if relation_present(client, &intermediate) {
+            return false;
+        }
+
+        client
+            .update(&intermediate_ddl, None, &[])
+            .unwrap_or_report();
+        if let Some(scratch_ddl) =
+            crate::schema_builder::build_delta_scratch_table_ddl(view_name, &plan, &column_types)
+        {
+            client.update(&scratch_ddl, None, &[]).unwrap_or_report();
+        }
+        for ddl in build_indexes_ddl(view_name, &plan) {
+            client.update(&ddl, None, &[]).unwrap_or_report();
+        }
+        for ddl in crate::schema_builder::build_group_capture_ddl(view_name, &plan) {
+            client.update(&ddl, None, &[]).unwrap_or_report();
+        }
+        true
+    });
+
+    if healed {
+        warning!(
+            "pg_reflex: recreated the missing internal table(s) of IMV '{}' ({} and companions). \
+             The IMV was not being maintained while they were absent; this reconcile refills it.",
+            view_name,
+            intermediate
+        );
+    }
+}
+
+/// The first GROUP BY / DISTINCT key whose type the reconstructed `column_types`
+/// cannot supply, if any.
+///
+/// `resolve_column_type` with an empty default reports exactly that: unlike its
+/// `"TEXT"` default — which silently substitutes NUMERIC — an empty default returns
+/// an empty string when nothing in the map matches. Only the key columns are checked
+/// because they are the ones typed from `column_types`; the aggregate columns carry
+/// the `pg_type` create time already resolved into the stored plan.
+fn first_unresolved_group_key(
+    plan: &aggregation::AggregationPlan,
+    column_types: &std::collections::HashMap<String, String>,
+) -> Option<String> {
+    plan.group_by_columns
+        .iter()
+        .chain(plan.distinct_columns.iter())
+        .find(|col| {
+            let norm = crate::query_decomposer::normalized_column_name(col);
+            crate::schema_builder::resolve_column_type(&norm, column_types, "").is_empty()
+        })
+        .cloned()
+}
+
+/// `to_regclass` presence probe for an already-quoted, qualified relation name.
+fn relation_present(client: &pgrx::spi::SpiClient<'_>, qualified: &str) -> bool {
+    client
+        .select(
+            "SELECT to_regclass($1) IS NOT NULL AS present",
+            Some(1),
+            &[unsafe {
+                DatumWithOid::new(qualified.to_string(), PgBuiltInOids::TEXTOID.oid().value())
+            }],
+        )
+        .unwrap_or_report()
+        .first()
+        .get_by_name::<bool, _>("present")
+        .unwrap_or(None)
+        .unwrap_or(false)
+}
+
 /// Rebuild ONE IMV's intermediate + target from its own `base_query`.
 ///
 /// The single-node primitive. [`reflex_reconcile`] is the entry point, and it
@@ -20,6 +231,9 @@ fn reconcile_one(view_name: &str, drop_orphans: bool) -> &'static str {
     if let Err(msg) = validate_view_name(view_name) {
         return msg;
     }
+    // Recreate the aggregate aux relations first when they are gone, so the rest of
+    // this function — and the partition sync below it — have something to work on.
+    heal_missing_intermediate(view_name);
     // Best-effort partition sync: keep the IMV partition set aligned with
     // the source before rebuilding.  No-op for unpartitioned IMVs.  Sync
     // failures are surfaced as a NOTICE but do not abort reconcile — the
@@ -818,10 +1032,35 @@ pub fn reflex_scheduled_reconcile(
         // leading rows and starving the tail when the age gate stays open on
         // just-reconciled IMVs (max_age <= 0). `name` is the final, deterministic
         // tiebreaker.
+        // A decomposed wrapper is not a candidate at all — the same
+        // `aggregations <> '{}'` test the `covered` CTE below already applies, and
+        // for the same reason `REBUILDABLE_NODE` exists: `reflex_reconcile` cannot
+        // operate on such a node. Worse than "cannot": a VIEW wrapper RAISES from
+        // the passthrough branch's `TRUNCATE` (`"<view>" is not a table`), and the
+        // raise propagates out of `reflex_scheduled_reconcile`, so a single set-op
+        // IMV in the database killed the ENTIRE sweep — every other IMV in the batch
+        // went unreconciled and the function returned nothing. Permanently, too: a
+        // wrapper's `last_update_date` is stamped at create and never advances,
+        // because the only writer is the tail of `reconcile_one`, which a wrapper
+        // never reaches, so it stays a candidate from `max_age_minutes` after
+        // creation onwards.
+        //
+        // Excluding wrappers loses no maintenance: a wrapper is kept current by its
+        // sub-IMVs (VIEW) or by its per-operand `__reflex_union_mirror_*` triggers
+        // (TABLE), and its operands are separate rows that the sweep still visits —
+        // they were never "covered" by the wrapper (see the note above), so they are
+        // reconciled standalone exactly as before.
+        //
+        // `COALESCE(…, '{}')` puts a NULL `aggregations` on the excluded side, which
+        // is the safe direction for a writer: an unknown shape is one not to rewrite.
+        // (`ImvRow::is_decomposed_wrapper` resolves the same NULL the other way, and
+        // for the same reason — for a *reporter*, unknown must not mean "silence the
+        // Error".)
         let sql = "WITH candidate AS ( \
                        SELECT name, graph_depth, depends_on_imv, last_update_date, aggregations \
                          FROM public.__reflex_ivm_reference \
                         WHERE COALESCE(enabled, TRUE) = TRUE \
+                          AND COALESCE(aggregations::text, '{}') <> '{}' \
                           AND ($2 = '' OR COALESCE(target_schema, 'public') = $2) \
                           AND (last_update_date IS NULL \
                                OR last_update_date < (CURRENT_TIMESTAMP - make_interval(mins => $1))) \
