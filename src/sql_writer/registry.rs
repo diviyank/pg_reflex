@@ -452,6 +452,81 @@ pub fn read_imv_for_rebuild(
     Some((sql_query, create_args))
 }
 
+/// The subset of a registry row that decides whether an anchor-scoped rebuild
+/// (`reflex_rebuild_imv` / `reflex_reconcile`) can converge the IMV. Read as one
+/// projection so the caller-side advisory (PS-14) reuses PS-3's stored
+/// `requires_explicit_refresh` verdict and the existing `ignored_sources` /
+/// `partition_strategy` metadata rather than re-deriving matview-ness.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RebuildRisk {
+    /// PS-3: every real source is a materialized view — the node cannot
+    /// self-maintain and the canonical recovery is `refresh_imv_depending_on`.
+    pub requires_explicit_refresh: bool,
+    /// At least one `ignore_sources` entry is declared. Combined with
+    /// `is_partitioned`, this is the archive-residue shape: a partition whose
+    /// rows arrive only via an authoritative ignored source stays empty under an
+    /// anchor-scoped rebuild.
+    pub has_ignored_sources: bool,
+    /// The IMV is declaratively partitioned.
+    pub is_partitioned: bool,
+}
+
+/// Read the [`RebuildRisk`] projection for one IMV. `None` when the IMV is not
+/// registered.
+pub fn read_rebuild_risk(client: &pgrx::spi::SpiClient<'_>, name: &str) -> Option<RebuildRisk> {
+    let rows = client
+        .select(
+            "SELECT COALESCE(requires_explicit_refresh, FALSE) AS req, \
+                    COALESCE(array_length(ignored_sources, 1), 0) > 0 AS has_ignored, \
+                    (partition_strategy IS NOT NULL AND partition_strategy <> '') AS is_part \
+             FROM public.__reflex_ivm_reference WHERE name = $1",
+            Some(1),
+            &[unsafe {
+                DatumWithOid::new(name.to_string(), PgBuiltInOids::TEXTOID.oid().value())
+            }],
+        )
+        .unwrap_or_report()
+        .collect::<Vec<_>>();
+
+    let row = rows.first()?;
+    Some(RebuildRisk {
+        requires_explicit_refresh: row
+            .get_by_name::<bool, _>("req")
+            .unwrap_or(None)
+            .unwrap_or(false),
+        has_ignored_sources: row
+            .get_by_name::<bool, _>("has_ignored")
+            .unwrap_or(None)
+            .unwrap_or(false),
+        is_partitioned: row
+            .get_by_name::<bool, _>("is_part")
+            .unwrap_or(None)
+            .unwrap_or(false),
+    })
+}
+
+/// Record one targeted-recovery call against an IMV: bump `rebuild_count` and
+/// stamp `last_rebuild_at`. Returns the number of catalog rows updated (0 = IMV
+/// not found). Called only from the targeted-recovery entry points, never from
+/// the internal cascade descent (PS-14).
+pub fn bump_rebuild_count(
+    client: &mut pgrx::spi::SpiClient<'_>,
+    name: &str,
+) -> Result<u64, spi::Error> {
+    let n = client
+        .update(
+            "UPDATE public.__reflex_ivm_reference \
+             SET rebuild_count = COALESCE(rebuild_count, 0) + 1, last_rebuild_at = now() \
+             WHERE name = $1",
+            None,
+            &[unsafe {
+                DatumWithOid::new(name.to_string(), PgBuiltInOids::TEXTOID.oid().value())
+            }],
+        )?
+        .len();
+    Ok(n as u64)
+}
+
 /// Set or clear (`value = None`) the per-IMV `wipe_threshold` override.
 /// Returns the number of catalog rows updated (0 = IMV not found).
 pub fn set_wipe_threshold(

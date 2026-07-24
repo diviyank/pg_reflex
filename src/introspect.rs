@@ -22,6 +22,8 @@ type IvmStatusRow = (
     bool,                           // known_stale
     Option<String>,                 // stale_reason
     bool,                           // requires_explicit_refresh
+    i64,                                    // rebuild_count
+    Option<pgrx::datum::TimestampWithTimeZone>, // last_rebuild_at
 );
 
 /// Summary per IMV. `row_count` avoids a full-table `count(*)` on large IMVs:
@@ -48,6 +50,8 @@ fn reflex_ivm_status() -> TableIterator<
         name!(known_stale, bool),
         name!(stale_reason, Option<String>),
         name!(requires_explicit_refresh, bool),
+        name!(rebuild_count, i64),
+        name!(last_rebuild_at, Option<pgrx::datum::TimestampWithTimeZone>),
     ),
 > {
     let rows: Vec<IvmStatusRow> = Spi::connect(|client| {
@@ -58,7 +62,8 @@ fn reflex_ivm_status() -> TableIterator<
                         COALESCE(refresh_mode, 'IMMEDIATE') AS refresh_mode, \
                         last_flush_ms, last_flush_rows, COALESCE(flush_count, 0) AS flush_count, \
                         last_error, last_update_date, COALESCE(known_stale, FALSE) AS known_stale, stale_reason, \
-                        COALESCE(requires_explicit_refresh, FALSE) AS requires_explicit_refresh \
+                        COALESCE(requires_explicit_refresh, FALSE) AS requires_explicit_refresh, \
+                        COALESCE(rebuild_count, 0) AS rebuild_count, last_rebuild_at \
                  FROM public.__reflex_ivm_reference \
                  ORDER BY graph_depth, name",
                 None,
@@ -109,6 +114,13 @@ fn reflex_ivm_status() -> TableIterator<
                 .get_by_name::<bool, _>("requires_explicit_refresh")
                 .unwrap_or(None)
                 .unwrap_or(false);
+            let rebuild_count = row
+                .get_by_name::<i64, _>("rebuild_count")
+                .unwrap_or(None)
+                .unwrap_or(0);
+            let last_rebuild_at = row
+                .get_by_name::<pgrx::datum::TimestampWithTimeZone, _>("last_rebuild_at")
+                .unwrap_or(None);
             out.push((
                 name,
                 depth,
@@ -123,6 +135,8 @@ fn reflex_ivm_status() -> TableIterator<
                 known_stale,
                 stale_reason,
                 requires_explicit_refresh,
+                rebuild_count,
+                last_rebuild_at,
             ));
         }
         out
