@@ -1032,10 +1032,35 @@ pub fn reflex_scheduled_reconcile(
         // leading rows and starving the tail when the age gate stays open on
         // just-reconciled IMVs (max_age <= 0). `name` is the final, deterministic
         // tiebreaker.
+        // A decomposed wrapper is not a candidate at all — the same
+        // `aggregations <> '{}'` test the `covered` CTE below already applies, and
+        // for the same reason `REBUILDABLE_NODE` exists: `reflex_reconcile` cannot
+        // operate on such a node. Worse than "cannot": a VIEW wrapper RAISES from
+        // the passthrough branch's `TRUNCATE` (`"<view>" is not a table`), and the
+        // raise propagates out of `reflex_scheduled_reconcile`, so a single set-op
+        // IMV in the database killed the ENTIRE sweep — every other IMV in the batch
+        // went unreconciled and the function returned nothing. Permanently, too: a
+        // wrapper's `last_update_date` is stamped at create and never advances,
+        // because the only writer is the tail of `reconcile_one`, which a wrapper
+        // never reaches, so it stays a candidate from `max_age_minutes` after
+        // creation onwards.
+        //
+        // Excluding wrappers loses no maintenance: a wrapper is kept current by its
+        // sub-IMVs (VIEW) or by its per-operand `__reflex_union_mirror_*` triggers
+        // (TABLE), and its operands are separate rows that the sweep still visits —
+        // they were never "covered" by the wrapper (see the note above), so they are
+        // reconciled standalone exactly as before.
+        //
+        // `COALESCE(…, '{}')` puts a NULL `aggregations` on the excluded side, which
+        // is the safe direction for a writer: an unknown shape is one not to rewrite.
+        // (`ImvRow::is_decomposed_wrapper` resolves the same NULL the other way, and
+        // for the same reason — for a *reporter*, unknown must not mean "silence the
+        // Error".)
         let sql = "WITH candidate AS ( \
                        SELECT name, graph_depth, depends_on_imv, last_update_date, aggregations \
                          FROM public.__reflex_ivm_reference \
                         WHERE COALESCE(enabled, TRUE) = TRUE \
+                          AND COALESCE(aggregations::text, '{}') <> '{}' \
                           AND ($2 = '' OR COALESCE(target_schema, 'public') = $2) \
                           AND (last_update_date IS NULL \
                                OR last_update_date < (CURRENT_TIMESTAMP - make_interval(mins => $1))) \

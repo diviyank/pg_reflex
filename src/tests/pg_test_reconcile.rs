@@ -560,9 +560,19 @@ fn pg_scheduled_reconcile_soft_failure_does_not_stop_the_batch() {
     );
 
     // Inject a candidate whose name validate_view_name rejects (contains '-').
+    //
+    // `aggregations` must be a non-empty plan for this row to be a sweep candidate
+    // at all: since 1.11.1 the candidate CTE skips rows with no plan
+    // (`COALESCE(aggregations::text, '{}') <> '{}'`), because that is the shape of a
+    // decomposed wrapper, on which reconcile RAISES and kills the whole sweep. The
+    // property under test is unchanged — the row is still rejected by
+    // `validate_view_name` before reconcile touches anything, which is still the
+    // only in-transaction soft-error injection available.
     Spi::run(
-        "INSERT INTO public.__reflex_ivm_reference (name, graph_depth, last_update_date) \
-         VALUES ('ps7-du-bad', 1, TIMESTAMP '2001-01-01 00:00:00')",
+        "INSERT INTO public.__reflex_ivm_reference \
+             (name, graph_depth, last_update_date, aggregations) \
+         VALUES ('ps7-du-bad', 1, TIMESTAMP '2001-01-01 00:00:00', \
+                 '{\"is_passthrough\": false}')",
     )
     .expect("inject bad candidate");
 

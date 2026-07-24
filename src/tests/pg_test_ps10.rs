@@ -666,6 +666,80 @@ fn ps10_dropped_intermediate_remedy_converges_with_expression_group_key() {
     );
 }
 
+/// (9) The scheduled sweep must survive a database that contains a set-op IMV.
+///
+/// `reflex_reconcile` cannot operate on a decomposed wrapper at all — a VIEW
+/// wrapper RAISES `"<view>" is not a table` from the passthrough branch's TRUNCATE,
+/// and the materialised UNION-ALL wrapper would be column-shifted (its
+/// `base_query` yields N values for N+1 columns). The raise propagates out of
+/// `reflex_scheduled_reconcile`, so ONE set-op IMV killed the whole sweep and every
+/// other IMV in the batch went unreconciled. A wrapper row is not born stale — its
+/// `last_update_date` is stamped at create like any other — but nothing ever
+/// advances it, because the only writer is the tail of `reconcile_one`, which a
+/// wrapper never reaches. So it becomes a candidate `max_age_minutes` after creation
+/// and stays one forever. The candidate CTE now applies the same
+/// `aggregations <> '{}'` filter the `covered` CTE two lines below it already used.
+#[pg_test]
+fn ps10_scheduled_reconcile_survives_a_set_op_imv() {
+    Spi::run("CREATE TABLE ps10_sr_src (region TEXT, amount NUMERIC)").expect("agg src");
+    Spi::run("INSERT INTO ps10_sr_src VALUES ('us', 100), ('eu', 200)").expect("seed agg");
+    Spi::run(
+        "SELECT create_reflex_ivm('ps10_sr_agg', \
+           'SELECT region, SUM(amount) AS total FROM ps10_sr_src GROUP BY region')",
+    )
+    .expect("create aggregate IMV");
+    ps10_make_union_all_fixture("ps10_sr_a", "ps10_sr_b", "ps10_sr_union");
+
+    // The candidate CTE's own age predicate, evaluated for the wrapper at the
+    // `max_age_minutes` this test passes. If this is false the test proves nothing,
+    // because the sweep would never have looked at the wrapper.
+    let wrapper_is_candidate = Spi::get_one::<bool>(
+        "SELECT last_update_date IS NULL \
+                OR last_update_date < (CURRENT_TIMESTAMP - make_interval(mins => -1)) \
+         FROM public.__reflex_ivm_reference WHERE name = 'ps10_sr_union'",
+    )
+    .expect("registry query failed")
+    .expect("no registry row");
+    assert!(
+        wrapper_is_candidate,
+        "fixture precondition: the wrapper must be old enough to be a sweep candidate"
+    );
+
+    // -1 opens the age gate for every row. This is the call that used to raise.
+    Spi::run("CREATE TEMP TABLE ps10_sr_out AS SELECT * FROM reflex_scheduled_reconcile(-1)")
+        .expect("the scheduled sweep must not raise on a database holding a set-op IMV");
+
+    assert_eq!(
+        ps10_count(
+            "SELECT count(*) FROM ps10_sr_out \
+             WHERE name = 'ps10_sr_agg' AND status = 'RECONCILED'"
+        ),
+        1,
+        "the aggregate IMV must still be swept and reconciled"
+    );
+    assert_eq!(
+        ps10_count("SELECT count(*) FROM ps10_sr_out WHERE name = 'ps10_sr_union'"),
+        0,
+        "the wrapper must not be attempted — reconcile cannot operate on it"
+    );
+    assert_eq!(
+        ps10_diff_count(
+            "SELECT region, total FROM ps10_sr_agg",
+            "SELECT region, SUM(amount) FROM ps10_sr_src GROUP BY region"
+        ),
+        0,
+        "the swept aggregate IMV must match its defining query"
+    );
+    assert_eq!(
+        ps10_diff_count(
+            "SELECT id, v FROM ps10_sr_union",
+            "SELECT id, v FROM ps10_sr_a UNION ALL SELECT id, v FROM ps10_sr_b"
+        ),
+        0,
+        "and the skipped set-op IMV must still be correct"
+    );
+}
+
 /// (6) A healed IMV must keep maintaining INCREMENTALLY. A recreated but
 /// unregistered / unindexed intermediate that silently stopped being maintained
 /// would be worse than the bug.
