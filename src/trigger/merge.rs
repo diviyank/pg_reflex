@@ -383,9 +383,11 @@ pub(crate) fn build_net_delta_query(
 /// `orig_base_query` is wrapped in a filter that restricts its output to groups
 /// present in the affected-groups table. Without this filter, every MIN/MAX
 /// retraction re-aggregates the full source — the cliff that makes stock_chart
-/// IMVs unusable in practice. The wrapper is `SELECT * FROM (<orig>) AS __all
-/// WHERE (<gb_cols>) IN (SELECT DISTINCT <gb_cols> FROM "<affected_tbl>")`, which
-/// pushes the group-key filter down through the aggregation boundary.
+/// IMVs unusable in practice. The wrapper splices, before the GROUP BY,
+/// `AND EXISTS (SELECT 1 FROM (SELECT <gb_cols> AS __gN FROM "<affected_tbl>") __ng
+/// WHERE <raw gb_col> IS NOT DISTINCT FROM __ng.__gN AND …)` — a NULL-safe
+/// membership test (a NULL-unsafe `IN` dropped NULL group keys), which pushes the
+/// group-key filter down through the aggregation boundary.
 /// Build a UPDATE that refreshes the scalar `__min_x` / `__max_x` from the
 /// companion `__min_x_topk[1]` for groups whose heap is non-empty after a
 /// top-K subtract. Returns `None` when the plan has no top-K MIN/MAX columns.
@@ -438,31 +440,78 @@ pub fn build_topk_scalar_refresh_sql(
         .collect();
     let heap_pred = heap_predicates.join(" OR ");
 
-    // Scope to affected groups when possible.
-    // `at` is a fully-formed identifier ref (qualified+quoted or bare local).
-    let scope_filter = match (affected_tbl, !group_cols.is_empty()) {
-        (Some(at), true) => {
-            let cols_csv = group_cols
-                .iter()
-                .map(|c| format!("\"{}\"", c))
-                .collect::<Vec<_>>()
-                .join(", ");
-            format!(
-                " AND ({cols}) IN (SELECT {cols} FROM {at})",
-                cols = cols_csv,
-                at = at,
-            )
-        }
-        _ => String::new(),
+    let update_with_scope = |scope: &str| -> String {
+        format!(
+            "UPDATE {tbl} SET {sets} WHERE ({heap}){scope}",
+            tbl = intermediate_tbl,
+            sets = set_parts.join(", "),
+            heap = heap_pred,
+            scope = scope,
+        )
     };
 
-    Some(format!(
-        "UPDATE {tbl} SET {sets} WHERE ({heap}){scope}",
-        tbl = intermediate_tbl,
-        sets = set_parts.join(", "),
-        heap = heap_pred,
-        scope = scope_filter,
-    ))
+    // Scope to affected groups. `at` is a fully-formed identifier ref
+    // (qualified+quoted or bare local). The scope must be NULL-safe: a plain
+    // `(cols) IN (SELECT ...)` never matches a NULL group key — `(NULL) IN (...)`
+    // is NULL, not TRUE — so the NULL group was skipped and its scalar left NULL
+    // by the preceding Sub was never refreshed from `topk[1]`. On the top-K UPDATE
+    // path the subsequent Add then computes LEAST/GREATEST(NULL, delta) = delta
+    // (wrong) and the forced recompute only covers groups whose heap shrank, so an
+    // unshrunk NULL group stayed wrong (same NULL-group family as the recompute).
+    //
+    // Correctness needs `IS NOT DISTINCT FROM`, but that is non-sargable: it cannot
+    // use the intermediate's unique group-key index, so it seq-scans the whole
+    // intermediate on every top-K Sub (verified with EXPLAIN). This UPDATE fires on
+    // every top-K Sub, so — unlike the rare recompute — the common path must stay
+    // sargable. Reuse PS-5's `affected_null_key_gate`: when the affected set holds
+    // no NULL group key, `=` (index scan) is exact; only when it actually holds a
+    // NULL key do we pay the NULL-safe scan, and just for that batch.
+    let scope_exists = |at: &str, eq: bool| -> String {
+        let conds = group_cols
+            .iter()
+            .map(|c| {
+                if eq {
+                    format!(
+                        "{tbl}.\"{c}\" = __ng.\"{c}\"",
+                        tbl = intermediate_tbl,
+                        c = c
+                    )
+                } else {
+                    format!(
+                        "{tbl}.\"{c}\" IS NOT DISTINCT FROM __ng.\"{c}\"",
+                        tbl = intermediate_tbl,
+                        c = c
+                    )
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" AND ");
+        format!(" AND EXISTS (SELECT 1 FROM {at} __ng WHERE {conds})")
+    };
+
+    // The gate is an uncorrelated `EXISTS(<affected has a NULL key>)`, spliced
+    // inline as a One-Time Filter (not a DO block): the fast variant runs only
+    // when NO NULL key is affected (sargable `=` → index scan on the intermediate,
+    // verified with EXPLAIN); the safe variant runs only when a NULL key IS
+    // affected (NULL-safe `IS NOT DISTINCT FROM`). The refresh body is a cheap
+    // scalar assignment from the intermediate's own top-K array, so the no-op
+    // branch's One-Time Filter short-circuit costs nothing — no DO block needed.
+    match (affected_tbl, !group_cols.is_empty()) {
+        (Some(at), true) => {
+            let quoted: Vec<String> = group_cols.iter().map(|c| format!("\"{}\"", c)).collect();
+            match affected_null_key_gate(at, &quoted, &plan.not_null_columns) {
+                None => Some(update_with_scope(&scope_exists(at, true))),
+                Some(gate) => {
+                    let fast =
+                        update_with_scope(&format!("{} AND NOT {}", scope_exists(at, true), gate));
+                    let safe =
+                        update_with_scope(&format!("{} AND {}", scope_exists(at, false), gate));
+                    Some(format!("{}\n--<<REFLEX_SEP>>--\n{}", fast, safe))
+                }
+            }
+        }
+        _ => Some(update_with_scope("")),
+    }
 }
 
 pub fn build_min_max_recompute_sql(
@@ -685,12 +734,45 @@ pub(crate) fn build_min_max_recompute_sql_inner(
     // by value, not by alias, so a raw/normalized pair works.
     let scoped_source = match affected_tbl {
         Some(at) => {
-            let raw_csv = plan.group_by_columns.join(", ");
-            let norm_csv: Vec<String> = group_cols.iter().map(|c| format!("\"{}\"", c)).collect();
-            let norm_csv = norm_csv.join(", ");
+            // NULL-safe affected-group scoping. `(cols) IN (SELECT ...)` never
+            // matches a NULL group key — `(NULL) IN (...)` is NULL, not TRUE — so a
+            // NULL group was dropped from the scoped source and a MIN/MAX left NULL
+            // by a retraction was never re-derived (silent wrong result). Use a
+            // correlated EXISTS with per-column `IS NOT DISTINCT FROM`, pairing each
+            // raw GROUP BY expression (LHS, evaluated in the outer source scope) to
+            // its normalized column in the affected table (RHS) — the same
+            // raw/normalized pairing the IN form used.
+            //
+            // The affected columns are aliased through a derived table (`__g0`,
+            // `__g1`, …) so the correlated subquery exposes NO column named like a
+            // raw source column: an unqualified raw key (e.g. bare `grp`) then
+            // resolves outward to the source row, not inward to the affected table.
+            // Without the alias, a bare raw key equal to an affected column name
+            // would bind to the affected column, the predicate would be trivially
+            // TRUE, and the scoping would silently collapse to a full source scan.
+            // (The `__gN` labels prevent bare-column shadowing; they are not
+            // collision-proof against a source column literally named `__gN`, but
+            // reflex reserves the `__` identifier namespace, so that cannot occur.)
+            let pairs: Vec<(&String, &String)> = plan
+                .group_by_columns
+                .iter()
+                .zip(group_cols.iter())
+                .collect();
+            let projection = pairs
+                .iter()
+                .enumerate()
+                .map(|(i, (_, norm))| format!("\"{}\" AS __g{}", norm, i))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let conds = pairs
+                .iter()
+                .enumerate()
+                .map(|(i, (raw, _))| format!("({}) IS NOT DISTINCT FROM __ng.__g{}", raw, i))
+                .collect::<Vec<_>>()
+                .join(" AND ");
             let filter = format!(
-                " AND ({}) IN (SELECT DISTINCT {} FROM {})",
-                raw_csv, norm_csv, at
+                " AND EXISTS (SELECT 1 FROM (SELECT {} FROM {}) __ng WHERE {})",
+                projection, at, conds
             );
             match splice_before_group_by(orig_base_query, &filter) {
                 Some(spliced) => spliced,

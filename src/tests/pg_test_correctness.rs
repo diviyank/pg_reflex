@@ -4357,3 +4357,189 @@ fn test_correctness_min_max_recompute_gate_nullable_key() {
     Spi::run("INSERT INTO mmr (grp, val) VALUES ('a', 42)").expect("new a max");
     assert_imv_correct("mmr_v", fresh);
 }
+
+/// PS-11: MIN/MAX recompute scoping must be NULL-safe. Retracting the current
+/// MIN/MAX of a NULL-keyed group forces the recompute path, whose affected-group
+/// scoping filter used `(cols) IN (SELECT ...)` — `(NULL) IN (...)` is never TRUE,
+/// so the NULL group was dropped from the scoped source, its extremum never
+/// re-derived, and the scalar left NULL by the retraction stayed NULL forever.
+/// This is the report's exact repro (silent wrong result). It also covers both
+/// MIN and MAX on the NULL group, and a non-NULL regression.
+#[pg_test]
+fn test_correctness_min_max_recompute_null_group_scope() {
+    Spi::run("CREATE TABLE mmrn (id SERIAL PRIMARY KEY, grp TEXT, val INT NOT NULL)")
+        .expect("create");
+    Spi::run("INSERT INTO mmrn (grp, val) VALUES ('a', 5), ('a', 9), (NULL, 3), (NULL, 8), (NULL, 6)")
+        .expect("seed");
+    crate::create_reflex_ivm(
+        "mmrn_v",
+        "SELECT grp, MIN(val) AS lo, MAX(val) AS hi FROM mmrn GROUP BY grp",
+        None, None, None, None,
+    );
+    let fresh = "SELECT grp, MIN(val) AS lo, MAX(val) AS hi FROM mmrn GROUP BY grp";
+    assert_imv_correct("mmrn_v", fresh);
+
+    // Retract the NULL group's current MIN (3): Sub sets __min = NULL, forcing the
+    // recompute path scoped to the NULL group. With NULL-unsafe IN the NULL group
+    // is dropped from the scoped source and lo stays NULL (bug). It must recompute
+    // to the next-smallest survivor, 6.
+    Spi::run("DELETE FROM mmrn WHERE grp IS NULL AND val = 3").expect("retract null-group min");
+    assert_imv_correct("mmrn_v", fresh);
+    assert_eq!(
+        Spi::get_one::<i64>("SELECT lo::BIGINT FROM mmrn_v WHERE grp IS NULL").unwrap().unwrap(),
+        6, "NULL group MIN must recompute to 6 after 3 is retracted"
+    );
+
+    // Retract the NULL group's current MAX (8): same recompute path for MAX.
+    Spi::run("DELETE FROM mmrn WHERE grp IS NULL AND val = 8").expect("retract null-group max");
+    assert_imv_correct("mmrn_v", fresh);
+    assert_eq!(
+        Spi::get_one::<i64>("SELECT hi::BIGINT FROM mmrn_v WHERE grp IS NULL").unwrap().unwrap(),
+        6, "NULL group MAX must recompute to 6 after 8 is retracted"
+    );
+
+    // Non-NULL regression: retracting a non-NULL group's MIN still recomputes,
+    // proving the common (sargable) path is untouched.
+    Spi::run("DELETE FROM mmrn WHERE grp = 'a' AND val = 5").expect("retract a min");
+    assert_imv_correct("mmrn_v", fresh);
+    assert_eq!(
+        Spi::get_one::<i64>("SELECT lo::BIGINT FROM mmrn_v WHERE grp = 'a'").unwrap().unwrap(),
+        9, "group 'a' MIN must recompute to 9 after 5 is retracted"
+    );
+}
+
+/// PS-11: multi-column group key with a NULL component. Pins the per-column
+/// `IS NOT DISTINCT FROM` pairing of the NULL-safe scoping EXISTS: raw LHS column
+/// must correspond to its own normalized RHS column. A swapped pairing silently
+/// rescopes to the wrong groups (verified by self-mutation, see PROGRESS).
+#[pg_test]
+fn test_correctness_min_max_recompute_null_group_multicol() {
+    Spi::run("CREATE TABLE mmrn2 (id SERIAL PRIMARY KEY, g1 TEXT, g2 TEXT, val INT NOT NULL)")
+        .expect("create");
+    Spi::run(
+        "INSERT INTO mmrn2 (g1, g2, val) VALUES \
+         ('x', NULL, 5), ('x', NULL, 9), ('y', 'z', 2), ('y', 'z', 7), (NULL, 'q', 4), (NULL, 'q', 1)",
+    )
+    .expect("seed");
+    crate::create_reflex_ivm(
+        "mmrn2_v",
+        "SELECT g1, g2, MIN(val) AS lo, MAX(val) AS hi FROM mmrn2 GROUP BY g1, g2",
+        None, None, None, None,
+    );
+    let fresh = "SELECT g1, g2, MIN(val) AS lo, MAX(val) AS hi FROM mmrn2 GROUP BY g1, g2";
+    assert_imv_correct("mmrn2_v", fresh);
+
+    // Retract the MIN of the ('x', NULL) group: NULL is in the SECOND key column.
+    Spi::run("DELETE FROM mmrn2 WHERE g1 = 'x' AND g2 IS NULL AND val = 5")
+        .expect("retract x/null min");
+    assert_imv_correct("mmrn2_v", fresh);
+    assert_eq!(
+        Spi::get_one::<i64>("SELECT lo::BIGINT FROM mmrn2_v WHERE g1 = 'x' AND g2 IS NULL")
+            .unwrap().unwrap(),
+        9, "('x', NULL) group MIN must recompute to 9",
+    );
+
+    // Retract the MIN of the (NULL, 'q') group: NULL is in the FIRST key column.
+    Spi::run("DELETE FROM mmrn2 WHERE g1 IS NULL AND g2 = 'q' AND val = 1")
+        .expect("retract null/q min");
+    assert_imv_correct("mmrn2_v", fresh);
+    assert_eq!(
+        Spi::get_one::<i64>("SELECT lo::BIGINT FROM mmrn2_v WHERE g1 IS NULL AND g2 = 'q'")
+            .unwrap().unwrap(),
+        4, "(NULL, 'q') group MIN must recompute to 4",
+    );
+}
+
+/// PS-11: a NULL-keyed group emptied entirely (all its rows retracted) must have
+/// its target row removed, not resurrected with a stale scalar by the recompute.
+///
+/// NOTE: this is a non-discriminating GUARD, not a RED->GREEN pin — it passes with
+/// and without the scoping fix (the emptied-group path never enters the affected
+/// scoping filter). It guards against a future regression that would resurrect an
+/// emptied NULL group; the RED->GREEN pins for this fix are
+/// `..._null_group_scope`, `..._null_group_multicol`, and
+/// `..._topk_update_unshrunk_null_group`.
+#[pg_test]
+fn test_correctness_min_max_recompute_null_group_emptied() {
+    Spi::run("CREATE TABLE mmrn3 (id SERIAL PRIMARY KEY, grp TEXT, val INT NOT NULL)")
+        .expect("create");
+    Spi::run("INSERT INTO mmrn3 (grp, val) VALUES ('a', 5), (NULL, 3), (NULL, 8)")
+        .expect("seed");
+    crate::create_reflex_ivm(
+        "mmrn3_v",
+        "SELECT grp, MIN(val) AS lo, MAX(val) AS hi FROM mmrn3 GROUP BY grp",
+        None, None, None, None,
+    );
+    let fresh = "SELECT grp, MIN(val) AS lo, MAX(val) AS hi FROM mmrn3 GROUP BY grp";
+    assert_imv_correct("mmrn3_v", fresh);
+
+    Spi::run("DELETE FROM mmrn3 WHERE grp IS NULL").expect("empty null group");
+    assert_imv_correct("mmrn3_v", fresh);
+    assert_eq!(
+        Spi::get_one::<i64>("SELECT COUNT(*) FROM mmrn3_v WHERE grp IS NULL").unwrap().unwrap(),
+        0, "emptied NULL group must have no target row",
+    );
+}
+
+/// PS-11 fix-round: top-K MIN/MAX over a NULLABLE group key, UPDATE of a
+/// MIDDLE-ranked NULL-group row (rank between the min-heap and the max-heap, so
+/// NEITHER heap shrinks). This is the reviewer's reproduced silent-wrong-result:
+///
+///   Sub sets the NULL group's scalar to NULL -> `build_topk_scalar_refresh_sql`
+///   refreshed `scalar = topk[1]` for surviving heaps, but scoped with a
+///   NULL-unsafe `(cols) IN (SELECT ...)` that DROPPED the NULL group -> scalar
+///   stays NULL -> the Add computes LEAST/GREATEST(NULL, delta) = delta (wrong)
+///   -> the forced recompute is scoped to `__reflex_shrunk_*`, empty here (no
+///   heap shrank), so nothing re-derives it.
+///
+/// The DELETE-path recompute fix does NOT backstop this: the unshrunk NULL group
+/// is not in the shrunk set. The topk scalar-refresh scoping itself must be
+/// NULL-safe.
+#[pg_test]
+fn test_correctness_min_max_topk_update_unshrunk_null_group() {
+    Spi::run("CREATE TABLE tkmm (id SERIAL PRIMARY KEY, grp TEXT, val INT NOT NULL)")
+        .expect("create");
+    // 40 distinct values per group: min-heap = {1..16}, max-heap = {25..40}.
+    // A row valued ~20 is in NEITHER heap, so updating it shrinks no heap.
+    Spi::run(
+        "INSERT INTO tkmm (grp, val) \
+         SELECT NULL, g FROM generate_series(1, 40) g \
+         UNION ALL SELECT 'a', 100 + g FROM generate_series(1, 40) g",
+    )
+    .expect("seed");
+    crate::create_reflex_ivm(
+        "tkmm_v",
+        "SELECT grp, MIN(val) AS lo, MAX(val) AS hi FROM tkmm GROUP BY grp",
+        None, None, None, None,
+    );
+    let fresh = "SELECT grp, MIN(val) AS lo, MAX(val) AS hi FROM tkmm GROUP BY grp";
+    assert_imv_correct("tkmm_v", fresh);
+
+    // UPDATE a middle-ranked NULL-group row (20 -> 21): both remain in (16, 25),
+    // so neither heap shrinks. True MIN stays 1, true MAX stays 40.
+    Spi::run("UPDATE tkmm SET val = 21 WHERE grp IS NULL AND val = 20")
+        .expect("middle update null group");
+    assert_imv_correct("tkmm_v", fresh);
+    assert_eq!(
+        Spi::get_one::<i64>("SELECT lo::BIGINT FROM tkmm_v WHERE grp IS NULL").unwrap().unwrap(),
+        1, "NULL group MIN must stay 1 after an unshrunk middle UPDATE",
+    );
+    assert_eq!(
+        Spi::get_one::<i64>("SELECT hi::BIGINT FROM tkmm_v WHERE grp IS NULL").unwrap().unwrap(),
+        40, "NULL group MAX must stay 40 after an unshrunk middle UPDATE",
+    );
+
+    // Non-NULL regression: the same unshrunk middle UPDATE on a NON-NULL group
+    // must stay correct (proves the sargable common path is intact).
+    Spi::run("UPDATE tkmm SET val = 121 WHERE grp = 'a' AND val = 120")
+        .expect("middle update non-null group");
+    assert_imv_correct("tkmm_v", fresh);
+    assert_eq!(
+        Spi::get_one::<i64>("SELECT lo::BIGINT FROM tkmm_v WHERE grp = 'a'").unwrap().unwrap(),
+        101, "group 'a' MIN must stay 101",
+    );
+    assert_eq!(
+        Spi::get_one::<i64>("SELECT hi::BIGINT FROM tkmm_v WHERE grp = 'a'").unwrap().unwrap(),
+        140, "group 'a' MAX must stay 140",
+    );
+}
