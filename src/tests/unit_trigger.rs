@@ -495,10 +495,15 @@ fn test_min_max_recompute_scoped_to_affected_groups_when_provided() {
         "recompute SQL must reference the affected-groups table: {}",
         sql
     );
-    // The filter should restrict orig_base_query to groups present in the affected table.
+    // The filter must restrict orig_base_query to the groups present in the affected
+    // table, NULL-safely (PS-11): a correlated EXISTS with per-column
+    // `IS NOT DISTINCT FROM`. A NULL-unsafe `(cols) IN (SELECT ...)` dropped NULL
+    // group keys, leaving their MIN/MAX stale forever.
     assert!(
-        sql.contains("\"city\"") && sql.contains("IN (SELECT"),
-        "recompute SQL must include an IN-filter on the group key(s) referencing the affected table: {}",
+        sql.contains("EXISTS (SELECT 1 FROM")
+            && sql.contains("IS NOT DISTINCT FROM")
+            && sql.contains("\"city\""),
+        "recompute SQL must NULL-safely scope the group key(s) to the affected table via EXISTS: {}",
         sql
     );
 }

@@ -383,9 +383,11 @@ pub(crate) fn build_net_delta_query(
 /// `orig_base_query` is wrapped in a filter that restricts its output to groups
 /// present in the affected-groups table. Without this filter, every MIN/MAX
 /// retraction re-aggregates the full source — the cliff that makes stock_chart
-/// IMVs unusable in practice. The wrapper is `SELECT * FROM (<orig>) AS __all
-/// WHERE (<gb_cols>) IN (SELECT DISTINCT <gb_cols> FROM "<affected_tbl>")`, which
-/// pushes the group-key filter down through the aggregation boundary.
+/// IMVs unusable in practice. The wrapper splices, before the GROUP BY,
+/// `AND EXISTS (SELECT 1 FROM (SELECT <gb_cols> AS __gN FROM "<affected_tbl>") __ng
+/// WHERE <raw gb_col> IS NOT DISTINCT FROM __ng.__gN AND …)` — a NULL-safe
+/// membership test (a NULL-unsafe `IN` dropped NULL group keys), which pushes the
+/// group-key filter down through the aggregation boundary.
 /// Build a UPDATE that refreshes the scalar `__min_x` / `__max_x` from the
 /// companion `__min_x_topk[1]` for groups whose heap is non-empty after a
 /// top-K subtract. Returns `None` when the plan has no top-K MIN/MAX columns.
@@ -685,12 +687,42 @@ pub(crate) fn build_min_max_recompute_sql_inner(
     // by value, not by alias, so a raw/normalized pair works.
     let scoped_source = match affected_tbl {
         Some(at) => {
-            let raw_csv = plan.group_by_columns.join(", ");
-            let norm_csv: Vec<String> = group_cols.iter().map(|c| format!("\"{}\"", c)).collect();
-            let norm_csv = norm_csv.join(", ");
+            // NULL-safe affected-group scoping. `(cols) IN (SELECT ...)` never
+            // matches a NULL group key — `(NULL) IN (...)` is NULL, not TRUE — so a
+            // NULL group was dropped from the scoped source and a MIN/MAX left NULL
+            // by a retraction was never re-derived (silent wrong result). Use a
+            // correlated EXISTS with per-column `IS NOT DISTINCT FROM`, pairing each
+            // raw GROUP BY expression (LHS, evaluated in the outer source scope) to
+            // its normalized column in the affected table (RHS) — the same
+            // raw/normalized pairing the IN form used.
+            //
+            // The affected columns are aliased through a derived table (`__g0`,
+            // `__g1`, …) so the correlated subquery exposes NO column named like a
+            // raw source column: an unqualified raw key (e.g. bare `grp`) then
+            // resolves outward to the source row, not inward to the affected table.
+            // Without the alias, a bare raw key equal to an affected column name
+            // would bind to the affected column, the predicate would be trivially
+            // TRUE, and the scoping would silently collapse to a full source scan.
+            let pairs: Vec<(&String, &String)> = plan
+                .group_by_columns
+                .iter()
+                .zip(group_cols.iter())
+                .collect();
+            let projection = pairs
+                .iter()
+                .enumerate()
+                .map(|(i, (_, norm))| format!("\"{}\" AS __g{}", norm, i))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let conds = pairs
+                .iter()
+                .enumerate()
+                .map(|(i, (raw, _))| format!("({}) IS NOT DISTINCT FROM __ng.__g{}", raw, i))
+                .collect::<Vec<_>>()
+                .join(" AND ");
             let filter = format!(
-                " AND ({}) IN (SELECT DISTINCT {} FROM {})",
-                raw_csv, norm_csv, at
+                " AND EXISTS (SELECT 1 FROM (SELECT {} FROM {}) __ng WHERE {})",
+                projection, at, conds
             );
             match splice_before_group_by(orig_base_query, &filter) {
                 Some(spliced) => spliced,
