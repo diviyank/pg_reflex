@@ -471,6 +471,19 @@ fn ps10_dropped_intermediate_printed_remedy_converges_partitioned() {
         int_children, 2,
         "the healed intermediate must mirror the source partition tree again"
     );
+    // The partitioned branch of `reconcile_one` returns after the swap walk and
+    // never calls `build_indexes_ddl`, so the heal is the ONLY thing that can put
+    // the MERGE-lookup index back. Without it every later maintenance MERGE
+    // seq-scans the intermediate.
+    let int_indexes = ps10_count(
+        "SELECT count(*) FROM pg_index ix JOIN pg_class i ON i.oid = ix.indexrelid \
+         WHERE ix.indrelid = '__reflex_intermediate_ps10_c2_view'::regclass \
+           AND i.relname = 'idx__reflex_int_ps10_c2_view'",
+    );
+    assert_eq!(
+        int_indexes, 1,
+        "the healed intermediate must carry its reflex-managed lookup index"
+    );
     assert_eq!(
         ps10_diff_count(
             "SELECT region, total FROM ps10_c2_view",
@@ -614,6 +627,67 @@ fn ps10_reconcile_does_not_heal_passthrough_unpartitioned() {
         ),
         0,
         "the reconciled passthrough IMV must match its defining query"
+    );
+}
+
+/// (7c) The shape that makes the heal's gate load-bearing: `COUNT(DISTINCT v)`
+/// with no GROUP BY is `is_passthrough` (so `end_query = ''` and create time never
+/// emitted intermediate DDL) YET has non-empty `distinct_columns`, so
+/// `intermediate_column_spec` — and hence `build_intermediate_table_ddl` — WOULD
+/// happily produce a table for it. Every other `end_query = ''` shape is protected
+/// twice over, by the gate and by that builder returning None; this one is
+/// protected only by the gate. Without it, reconcile materialises a phantom
+/// intermediate that no maintenance path reads or writes: the exact mirror of the
+/// PS-9 phantom this branch exists to stop reintroducing.
+#[pg_test]
+fn ps10_reconcile_does_not_heal_count_distinct_passthrough() {
+    Spi::run("CREATE TABLE ps10_cd_src (id BIGINT, v NUMERIC)").expect("src");
+    Spi::run("INSERT INTO ps10_cd_src VALUES (1,10),(2,10),(3,20)").expect("seed");
+    Spi::run(
+        "SELECT create_reflex_ivm('ps10_cd_view', \
+           'SELECT COUNT(DISTINCT v) AS n FROM ps10_cd_src')",
+    )
+    .expect("create COUNT(DISTINCT) IMV");
+
+    let shape = Spi::get_one::<bool>(
+        "SELECT end_query = '' \
+                AND (aggregations->>'is_passthrough')::bool \
+                AND jsonb_array_length((aggregations->'distinct_columns')::jsonb) > 0 \
+         FROM public.__reflex_ivm_reference WHERE name = 'ps10_cd_view'",
+    )
+    .expect("registry query failed")
+    .expect("no registry row");
+    assert!(
+        shape,
+        "fixture precondition: passthrough (empty end_query) WITH non-empty \
+         distinct_columns — the shape where only the gate stops the heal"
+    );
+    assert_eq!(
+        ps10_own_aux_relation_count("ps10_cd_view", &[]),
+        0,
+        "fixture precondition: create time built no intermediate for it"
+    );
+
+    let res = Spi::get_one::<String>("SELECT reflex_reconcile('ps10_cd_view')")
+        .expect("reconcile errored")
+        .expect("NULL reconcile result");
+    assert_eq!(res, "RECONCILED", "reconcile must succeed");
+
+    assert_eq!(
+        ps10_own_aux_relation_count("ps10_cd_view", &[]),
+        0,
+        "reconcile must not materialise a phantom intermediate for a passthrough \
+         IMV whose plan happens to carry distinct_columns"
+    );
+    let report = ps10_audit("ps10_cd_view");
+    assert!(
+        ps10_findings(&report, "internal-tables-exist").is_empty(),
+        "the IMV was healthy before and after; the check must stay silent:\n{report}"
+    );
+    assert_eq!(
+        ps10_count("SELECT n FROM ps10_cd_view"),
+        2,
+        "the reconciled IMV must match its defining query"
     );
 }
 
