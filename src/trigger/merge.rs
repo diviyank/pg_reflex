@@ -489,24 +489,23 @@ pub fn build_topk_scalar_refresh_sql(
         format!(" AND EXISTS (SELECT 1 FROM {at} __ng WHERE {conds})")
     };
 
+    // The gate is an uncorrelated `EXISTS(<affected has a NULL key>)`, spliced
+    // inline as a One-Time Filter (not a DO block): the fast variant runs only
+    // when NO NULL key is affected (sargable `=` → index scan on the intermediate,
+    // verified with EXPLAIN); the safe variant runs only when a NULL key IS
+    // affected (NULL-safe `IS NOT DISTINCT FROM`). The refresh body is a cheap
+    // scalar assignment from the intermediate's own top-K array, so the no-op
+    // branch's One-Time Filter short-circuit costs nothing — no DO block needed.
     match (affected_tbl, !group_cols.is_empty()) {
         (Some(at), true) => {
             let quoted: Vec<String> = group_cols.iter().map(|c| format!("\"{}\"", c)).collect();
             match affected_null_key_gate(at, &quoted, &plan.not_null_columns) {
                 None => Some(update_with_scope(&scope_exists(at, true))),
                 Some(gate) => {
-                    let fast = format!(
-                        "DO $_reflex_topk_refresh$ BEGIN IF NOT {gate} THEN {upd}; END IF; \
-                         END $_reflex_topk_refresh$",
-                        gate = gate,
-                        upd = update_with_scope(&scope_exists(at, true)),
-                    );
-                    let safe = format!(
-                        "DO $_reflex_topk_refresh$ BEGIN IF {gate} THEN {upd}; END IF; \
-                         END $_reflex_topk_refresh$",
-                        gate = gate,
-                        upd = update_with_scope(&scope_exists(at, false)),
-                    );
+                    let fast =
+                        update_with_scope(&format!("{} AND NOT {}", scope_exists(at, true), gate));
+                    let safe =
+                        update_with_scope(&format!("{} AND {}", scope_exists(at, false), gate));
                     Some(format!("{}\n--<<REFLEX_SEP>>--\n{}", fast, safe))
                 }
             }
@@ -751,6 +750,9 @@ pub(crate) fn build_min_max_recompute_sql_inner(
             // Without the alias, a bare raw key equal to an affected column name
             // would bind to the affected column, the predicate would be trivially
             // TRUE, and the scoping would silently collapse to a full source scan.
+            // (The `__gN` labels prevent bare-column shadowing; they are not
+            // collision-proof against a source column literally named `__gN`, but
+            // reflex reserves the `__` identifier namespace, so that cannot occur.)
             let pairs: Vec<(&String, &String)> = plan
                 .group_by_columns
                 .iter()

@@ -4452,6 +4452,13 @@ fn test_correctness_min_max_recompute_null_group_multicol() {
 
 /// PS-11: a NULL-keyed group emptied entirely (all its rows retracted) must have
 /// its target row removed, not resurrected with a stale scalar by the recompute.
+///
+/// NOTE: this is a non-discriminating GUARD, not a RED->GREEN pin — it passes with
+/// and without the scoping fix (the emptied-group path never enters the affected
+/// scoping filter). It guards against a future regression that would resurrect an
+/// emptied NULL group; the RED->GREEN pins for this fix are
+/// `..._null_group_scope`, `..._null_group_multicol`, and
+/// `..._topk_update_unshrunk_null_group`.
 #[pg_test]
 fn test_correctness_min_max_recompute_null_group_emptied() {
     Spi::run("CREATE TABLE mmrn3 (id SERIAL PRIMARY KEY, grp TEXT, val INT NOT NULL)")

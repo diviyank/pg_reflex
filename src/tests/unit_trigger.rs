@@ -495,15 +495,37 @@ fn test_min_max_recompute_scoped_to_affected_groups_when_provided() {
         "recompute SQL must reference the affected-groups table: {}",
         sql
     );
-    // The filter must restrict orig_base_query to the groups present in the affected
-    // table, NULL-safely (PS-11): a correlated EXISTS with per-column
-    // `IS NOT DISTINCT FROM`. A NULL-unsafe `(cols) IN (SELECT ...)` dropped NULL
-    // group keys, leaving their MIN/MAX stale forever.
+    // SCOPE-TIGHTNESS / ANTI-COLLAPSE (PS-11). The filter must restrict
+    // orig_base_query to the groups present in the affected table, NULL-safely:
+    // a correlated EXISTS with per-column `IS NOT DISTINCT FROM`. Two regressions
+    // this guards, both of which produce CORRECT contents (so oracle/contents
+    // tests miss them) while silently defeating scoping:
+    //   1. NULL-unsafe `(cols) IN (SELECT ...)` — drops NULL group keys.
+    //   2. Naive un-aliased EXISTS (`... WHERE city IS NOT DISTINCT FROM __ng.city`)
+    //      — the bare raw key `city` binds to the INNER `__ng.city`, the predicate
+    //      is trivially TRUE, and the scan collapses to ALL groups.
+    // The fix aliases the affected columns through a derived table (`... AS __g0`)
+    // and correlates the raw source key to `__ng.__g0`, so a bare raw key resolves
+    // OUTWARD to the source. Pin that structure.
+    //
+    // This is a codegen (not EXPLAIN) assertion on purpose: the recompute UPDATE is
+    // DO-block-wrapped and — unlike the top-K scalar-refresh — its source is a
+    // re-aggregation with no usable index, so it seq-scans the source by design
+    // (accepted: the recompute fires only on rare MIN/MAX underflow). "Index Scan"
+    // is therefore not an available signal; the real failure mode is scope-collapse,
+    // which the correlated derived-table alias precludes. The plan-based scope guard
+    // for this NULL-group family lives in `audit_ps11_topk_scalar_refresh_null_safe_and_index_scoped`.
     assert!(
         sql.contains("EXISTS (SELECT 1 FROM")
-            && sql.contains("IS NOT DISTINCT FROM")
-            && sql.contains("\"city\""),
-        "recompute SQL must NULL-safely scope the group key(s) to the affected table via EXISTS: {}",
+            && sql.contains("IS NOT DISTINCT FROM __ng.__g0")
+            && sql.contains("\"city\" AS __g0"),
+        "recompute must NULL-safely scope via a derived-table-aliased correlated EXISTS \
+         (raw key IS NOT DISTINCT FROM __ng.__g0): {}",
+        sql
+    );
+    assert!(
+        !sql.contains("IN (SELECT"),
+        "recompute must NOT use the NULL-unsafe `IN (SELECT ...)` scoping (PS-11 regression): {}",
         sql
     );
 }
