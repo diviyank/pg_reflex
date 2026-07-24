@@ -8,7 +8,8 @@ use pgrx::PgBuiltInOids;
 use std::collections::HashSet;
 
 use super::{
-    probe_query_columns, quote_qualified_for_regclass, relation_attname_set_quoted, shape_matches,
+    probe_query_columns, quote_qualified_for_regclass, relation_attname_set_quoted,
+    relation_exists, shape_matches,
 };
 use super::{Check, Finding, ImvRow, Severity};
 
@@ -167,22 +168,75 @@ impl Check for PartitionMirror {
         }
         let int_parent = crate::query_decomposer::intermediate_table_name(&imv.name);
         let tgt_parent = crate::query_decomposer::quote_identifier(&imv.name);
-        let int_children = crate::partition::list_partition_children(client, &int_parent);
-        let tgt_children = crate::partition::list_partition_children(client, &tgt_parent);
 
-        let int_have: HashSet<String> = int_children.iter().map(|c| c.bare_name.clone()).collect();
+        // Whether an intermediate table participates in this IMV at all.
+        //
+        // A PASSTHROUGH IMV owns none: `intermediate_column_spec` returns None at
+        // create time, so `__reflex_intermediate_<view>` is never created.
+        // `reflex_sync_partitions` gates every intermediate-child DDL on the same
+        // `to_regclass` probe (`src/partition.rs:1055`) precisely because
+        // `CREATE TABLE … PARTITION OF <absent>` raises 42P01. Diffing the
+        // anchor's child set against an absent parent's (necessarily empty) child
+        // list therefore reported every child as missing and prescribed a sync
+        // that structurally cannot create any of them — an unrepairable phantom
+        // finding, observed on 42 production IMVs.
+        //
+        // `end_query.is_empty()` is the authoritative signal. It is the branch the
+        // runtime itself takes when deciding whether to touch an intermediate
+        // (`src/partition.rs:633`/`644`/`1054`, `src/trigger/ops.rs:436`/`653`/`783`),
+        // so it answers the question this check actually asks — "does an
+        // intermediate participate in maintenance?" — rather than "what did create
+        // time intend?". It is equivalent to `aggregations->>'is_passthrough'` for
+        // every row `create_reflex_ivm` writes (`src/create_ivm/mod.rs:1572`).
+        let intermediate_expected = !imv.end_query.is_empty();
+        let intermediate_present = relation_exists(client, &int_parent);
+
+        // Expected but gone entirely: no amount of child mirroring helps, and sync
+        // would skip the intermediate half outright. Distinct, more severe, and
+        // prescribing the only primitive that recreates the relation *and*
+        // re-derives its children.
+        if intermediate_expected && !intermediate_present {
+            return vec![Finding {
+                imv: Some(imv.name.clone()),
+                severity: Severity::Error,
+                category: "partition-mirror",
+                finding: format!(
+                    "Intermediate table {} does not exist, so none of anchor source {}'s \
+                     {} child partition(s) can be mirrored onto it. \
+                     reflex_sync_partitions skips the intermediate half of an absent parent.",
+                    int_parent,
+                    anchor,
+                    src_children.len()
+                ),
+                suggested_fix: format!("SELECT reflex_reconcile('{}');", imv.name),
+            }];
+        }
+
+        let tgt_children = crate::partition::list_partition_children(client, &tgt_parent);
         let tgt_have: HashSet<String> = tgt_children.iter().map(|c| c.bare_name.clone()).collect();
-        let src_expected_int: HashSet<String> = src_children
-            .iter()
-            .map(|c| crate::partition::intermediate_child_name(&imv.name, &c.bare_name))
-            .collect();
         let src_expected_tgt: HashSet<String> = src_children
             .iter()
             .map(|c| crate::partition::target_child_name(&imv.name, &c.bare_name))
             .collect();
 
-        let missing_int: Vec<String> = src_expected_int.difference(&int_have).cloned().collect();
-        let extra_int: Vec<String> = int_have.difference(&src_expected_int).cloned().collect();
+        // Absent and not expected (passthrough): no intermediate finding at all.
+        // The target-side comparison below still runs, so a clean target yields
+        // zero findings rather than an empty-bodied one.
+        let (missing_int, extra_int): (Vec<String>, Vec<String>) = if intermediate_present {
+            let int_children = crate::partition::list_partition_children(client, &int_parent);
+            let int_have: HashSet<String> =
+                int_children.iter().map(|c| c.bare_name.clone()).collect();
+            let src_expected_int: HashSet<String> = src_children
+                .iter()
+                .map(|c| crate::partition::intermediate_child_name(&imv.name, &c.bare_name))
+                .collect();
+            (
+                src_expected_int.difference(&int_have).cloned().collect(),
+                int_have.difference(&src_expected_int).cloned().collect(),
+            )
+        } else {
+            (Vec::new(), Vec::new())
+        };
         let missing_tgt: Vec<String> = src_expected_tgt.difference(&tgt_have).cloned().collect();
         let extra_tgt: Vec<String> = tgt_have.difference(&src_expected_tgt).cloned().collect();
 
