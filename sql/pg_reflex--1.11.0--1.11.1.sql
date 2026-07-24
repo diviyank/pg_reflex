@@ -1,0 +1,31 @@
+-- Migration: pg_reflex 1.11.0 → 1.11.1
+--
+-- Run via: ALTER EXTENSION pg_reflex UPDATE TO '1.11.1';
+--
+-- Replace the module (.so) BEFORE running this.
+--
+-- One fix, delivered entirely in the module — no SQL signatures, tables, or
+-- triggers change, so this delta carries no DDL:
+--
+--   * The `partition-mirror` audit check (surfaced by reflex_doctor as F3) no
+--     longer reports phantom intermediate-partition drift on passthrough IMVs.
+--     A passthrough IMV owns no `__reflex_intermediate_<view>` table at all, so
+--     the check diffed the anchor source's child set against an absent parent's
+--     necessarily-empty child list and reported every child as missing — then
+--     prescribed `reflex_sync_partitions`, which gates its intermediate-child
+--     DDL on the same relation's existence and therefore could never create
+--     any of them. The finding survived its own remedy indefinitely (field:
+--     42 IMVs across 5 tenants, one of them reporting 17 phantom children while
+--     sync returned `+0 intermediate`).
+--
+--     The intermediate half of the comparison now runs only when an
+--     intermediate is both expected (non-empty `end_query`) and present. The
+--     target half always runs, so target-tree drift is still reported when the
+--     intermediate parent is absent. A genuinely missing intermediate parent
+--     remains reported by the `internal-tables-exist` check, which already
+--     covers relation absence at Error severity.
+--
+-- No action is required beyond replacing the module and running this update.
+-- Existing F3 `partition-mirror` findings on passthrough IMVs disappear from the
+-- next `reflex_doctor()` / `reflex_audit()` run; nothing needs to be reconciled
+-- to clear them, because nothing was ever wrong with those IMVs.

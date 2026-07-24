@@ -2,6 +2,47 @@
 
 ## [Unreleased]
 
+## [1.11.1] - 2026-07-24
+
+Audit truthfulness fix. Module-only — replace the `.so`, then
+`ALTER EXTENSION pg_reflex UPDATE TO '1.11.1';`. No DDL, no reconcile needed.
+
+**Fixed**
+
+- The `partition-mirror` audit check (surfaced by `reflex_doctor` as F3) reported
+  phantom intermediate-partition drift on partitioned **passthrough** IMVs. A
+  passthrough IMV owns no `__reflex_intermediate_<view>` table — the runtime never
+  creates one — so the check diffed the anchor source's child set against an absent
+  parent's necessarily-empty child list and reported every child as missing. The
+  remedy it printed, `reflex_sync_partitions`, gates its intermediate-child DDL on
+  that same relation's existence, so it could never create any of them: the finding
+  survived its own remedy indefinitely. Field impact: 42 IMVs across 5 tenants,
+  including one reporting 17 phantom missing children while sync returned
+  `sync: +0 intermediate, +675 target`.
+
+  The intermediate half of the comparison now runs only when an intermediate is
+  both expected (non-empty `end_query`, the same signal the maintenance runtime
+  uses) and present. The target half always runs, so target-tree drift is still
+  reported when the intermediate parent is absent — previously an early return
+  suppressed it. A genuinely missing intermediate parent stays reported by
+  `internal-tables-exist`, which already covers relation absence at Error severity.
+
+**Known limitations**
+
+- No primitive recreates a dropped `__reflex_intermediate_<view>` table.
+  `internal-tables-exist` reports the absence at Error severity but prescribes
+  `reflex_rebuild_imv`, which is an alias for `reflex_reconcile` and fails with
+  `ERROR: partition reconcile failed` on a partitioned IMV. The working remedy
+  today is `drop_reflex_ivm` followed by recreation. Filed in
+  `untreated_bugs/2026-07-24_no_primitive_recreates_dropped_intermediate.md`.
+- `internal-tables-exist` false-positives at Error severity on UNION-ALL wrapper
+  IMVs, demanding `__reflex_intermediate_<view>` / `__reflex_affected_<view>` for a
+  decomposed wrapper that correctly owns neither. Filed in
+  `untreated_bugs/2026-07-24_internal_tables_exist_union_wrapper_false_positive.md`.
+- A stray childless `__reflex_intermediate_<view>` beside a passthrough IMV is now
+  reported by no check. The relation is inert; the alternative would arm a
+  `DROP TABLE … CASCADE` remedy keyed on a passthrough classification.
+
 ## [1.11.0] - 2026-07-24
 
 Correctness and truthfulness across decomposed IMV chains, the doctor, and
