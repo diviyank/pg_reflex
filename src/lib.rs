@@ -1537,6 +1537,7 @@ mod tests {
     include!("tests/pg_test_rebuild_chain.rs");
     include!("tests/pg_test_decomposed_chain.rs");
     include!("tests/pg_test_ps3.rs");
+    include!("tests/pg_test_ps9.rs");
 }
 
 /// This module is required by `cargo pgrx test` invocations.
