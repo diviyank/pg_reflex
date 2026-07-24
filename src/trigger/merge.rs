@@ -440,31 +440,79 @@ pub fn build_topk_scalar_refresh_sql(
         .collect();
     let heap_pred = heap_predicates.join(" OR ");
 
-    // Scope to affected groups when possible.
-    // `at` is a fully-formed identifier ref (qualified+quoted or bare local).
-    let scope_filter = match (affected_tbl, !group_cols.is_empty()) {
-        (Some(at), true) => {
-            let cols_csv = group_cols
-                .iter()
-                .map(|c| format!("\"{}\"", c))
-                .collect::<Vec<_>>()
-                .join(", ");
-            format!(
-                " AND ({cols}) IN (SELECT {cols} FROM {at})",
-                cols = cols_csv,
-                at = at,
-            )
-        }
-        _ => String::new(),
+    let update_with_scope = |scope: &str| -> String {
+        format!(
+            "UPDATE {tbl} SET {sets} WHERE ({heap}){scope}",
+            tbl = intermediate_tbl,
+            sets = set_parts.join(", "),
+            heap = heap_pred,
+            scope = scope,
+        )
     };
 
-    Some(format!(
-        "UPDATE {tbl} SET {sets} WHERE ({heap}){scope}",
-        tbl = intermediate_tbl,
-        sets = set_parts.join(", "),
-        heap = heap_pred,
-        scope = scope_filter,
-    ))
+    // Scope to affected groups. `at` is a fully-formed identifier ref
+    // (qualified+quoted or bare local). The scope must be NULL-safe: a plain
+    // `(cols) IN (SELECT ...)` never matches a NULL group key — `(NULL) IN (...)`
+    // is NULL, not TRUE — so the NULL group was skipped and its scalar left NULL
+    // by the preceding Sub was never refreshed from `topk[1]`. On the top-K UPDATE
+    // path the subsequent Add then computes LEAST/GREATEST(NULL, delta) = delta
+    // (wrong) and the forced recompute only covers groups whose heap shrank, so an
+    // unshrunk NULL group stayed wrong (same NULL-group family as the recompute).
+    //
+    // Correctness needs `IS NOT DISTINCT FROM`, but that is non-sargable: it cannot
+    // use the intermediate's unique group-key index, so it seq-scans the whole
+    // intermediate on every top-K Sub (verified with EXPLAIN). This UPDATE fires on
+    // every top-K Sub, so — unlike the rare recompute — the common path must stay
+    // sargable. Reuse PS-5's `affected_null_key_gate`: when the affected set holds
+    // no NULL group key, `=` (index scan) is exact; only when it actually holds a
+    // NULL key do we pay the NULL-safe scan, and just for that batch.
+    let scope_exists = |at: &str, eq: bool| -> String {
+        let conds = group_cols
+            .iter()
+            .map(|c| {
+                if eq {
+                    format!(
+                        "{tbl}.\"{c}\" = __ng.\"{c}\"",
+                        tbl = intermediate_tbl,
+                        c = c
+                    )
+                } else {
+                    format!(
+                        "{tbl}.\"{c}\" IS NOT DISTINCT FROM __ng.\"{c}\"",
+                        tbl = intermediate_tbl,
+                        c = c
+                    )
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" AND ");
+        format!(" AND EXISTS (SELECT 1 FROM {at} __ng WHERE {conds})")
+    };
+
+    match (affected_tbl, !group_cols.is_empty()) {
+        (Some(at), true) => {
+            let quoted: Vec<String> = group_cols.iter().map(|c| format!("\"{}\"", c)).collect();
+            match affected_null_key_gate(at, &quoted, &plan.not_null_columns) {
+                None => Some(update_with_scope(&scope_exists(at, true))),
+                Some(gate) => {
+                    let fast = format!(
+                        "DO $_reflex_topk_refresh$ BEGIN IF NOT {gate} THEN {upd}; END IF; \
+                         END $_reflex_topk_refresh$",
+                        gate = gate,
+                        upd = update_with_scope(&scope_exists(at, true)),
+                    );
+                    let safe = format!(
+                        "DO $_reflex_topk_refresh$ BEGIN IF {gate} THEN {upd}; END IF; \
+                         END $_reflex_topk_refresh$",
+                        gate = gate,
+                        upd = update_with_scope(&scope_exists(at, false)),
+                    );
+                    Some(format!("{}\n--<<REFLEX_SEP>>--\n{}", fast, safe))
+                }
+            }
+        }
+        _ => Some(update_with_scope("")),
+    }
 }
 
 pub fn build_min_max_recompute_sql(

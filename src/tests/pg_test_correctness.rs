@@ -4473,3 +4473,66 @@ fn test_correctness_min_max_recompute_null_group_emptied() {
         0, "emptied NULL group must have no target row",
     );
 }
+
+/// PS-11 fix-round: top-K MIN/MAX over a NULLABLE group key, UPDATE of a
+/// MIDDLE-ranked NULL-group row (rank between the min-heap and the max-heap, so
+/// NEITHER heap shrinks). This is the reviewer's reproduced silent-wrong-result:
+///
+///   Sub sets the NULL group's scalar to NULL -> `build_topk_scalar_refresh_sql`
+///   refreshed `scalar = topk[1]` for surviving heaps, but scoped with a
+///   NULL-unsafe `(cols) IN (SELECT ...)` that DROPPED the NULL group -> scalar
+///   stays NULL -> the Add computes LEAST/GREATEST(NULL, delta) = delta (wrong)
+///   -> the forced recompute is scoped to `__reflex_shrunk_*`, empty here (no
+///   heap shrank), so nothing re-derives it.
+///
+/// The DELETE-path recompute fix does NOT backstop this: the unshrunk NULL group
+/// is not in the shrunk set. The topk scalar-refresh scoping itself must be
+/// NULL-safe.
+#[pg_test]
+fn test_correctness_min_max_topk_update_unshrunk_null_group() {
+    Spi::run("CREATE TABLE tkmm (id SERIAL PRIMARY KEY, grp TEXT, val INT NOT NULL)")
+        .expect("create");
+    // 40 distinct values per group: min-heap = {1..16}, max-heap = {25..40}.
+    // A row valued ~20 is in NEITHER heap, so updating it shrinks no heap.
+    Spi::run(
+        "INSERT INTO tkmm (grp, val) \
+         SELECT NULL, g FROM generate_series(1, 40) g \
+         UNION ALL SELECT 'a', 100 + g FROM generate_series(1, 40) g",
+    )
+    .expect("seed");
+    crate::create_reflex_ivm(
+        "tkmm_v",
+        "SELECT grp, MIN(val) AS lo, MAX(val) AS hi FROM tkmm GROUP BY grp",
+        None, None, None, None,
+    );
+    let fresh = "SELECT grp, MIN(val) AS lo, MAX(val) AS hi FROM tkmm GROUP BY grp";
+    assert_imv_correct("tkmm_v", fresh);
+
+    // UPDATE a middle-ranked NULL-group row (20 -> 21): both remain in (16, 25),
+    // so neither heap shrinks. True MIN stays 1, true MAX stays 40.
+    Spi::run("UPDATE tkmm SET val = 21 WHERE grp IS NULL AND val = 20")
+        .expect("middle update null group");
+    assert_imv_correct("tkmm_v", fresh);
+    assert_eq!(
+        Spi::get_one::<i64>("SELECT lo::BIGINT FROM tkmm_v WHERE grp IS NULL").unwrap().unwrap(),
+        1, "NULL group MIN must stay 1 after an unshrunk middle UPDATE",
+    );
+    assert_eq!(
+        Spi::get_one::<i64>("SELECT hi::BIGINT FROM tkmm_v WHERE grp IS NULL").unwrap().unwrap(),
+        40, "NULL group MAX must stay 40 after an unshrunk middle UPDATE",
+    );
+
+    // Non-NULL regression: the same unshrunk middle UPDATE on a NON-NULL group
+    // must stay correct (proves the sargable common path is intact).
+    Spi::run("UPDATE tkmm SET val = 121 WHERE grp = 'a' AND val = 120")
+        .expect("middle update non-null group");
+    assert_imv_correct("tkmm_v", fresh);
+    assert_eq!(
+        Spi::get_one::<i64>("SELECT lo::BIGINT FROM tkmm_v WHERE grp = 'a'").unwrap().unwrap(),
+        101, "group 'a' MIN must stay 101",
+    );
+    assert_eq!(
+        Spi::get_one::<i64>("SELECT hi::BIGINT FROM tkmm_v WHERE grp = 'a'").unwrap().unwrap(),
+        140, "group 'a' MAX must stay 140",
+    );
+}
