@@ -792,6 +792,18 @@ pub fn reflex_scheduled_reconcile(
         // and the candidate set is re-derived live every call, so the resumable
         // cursor inherits no hole.
         //
+        // Both the base seed and the recursive descent stop at a decomposed node
+        // (`aggregations = '{}'`), mirroring `generated_dependencies_shallowest_first`,
+        // which `reflex_reconcile` uses to decide what it rebuilds. A decomposed
+        // wrapper (UNION-ALL/set-op/DISTINCT-ON/window) is neither standalone-
+        // reconcilable (reconcile_one would column-shift it) nor descended past by
+        // the rebuild, so a candidate reading one does NOT rebuild the operands
+        // below it. Treating that wrapper as a coverer would mark those operands
+        // covered and skip them forever, even though nothing ever reconciles them.
+        // The wrapper itself still gets covered (its rebuildable parent seeds it in
+        // the base step) and correctly stays skipped, while its operands drop out of
+        // the covered set and are reconciled standalone.
+        //
         // `$2` scopes to one tenant's `target_schema` (empty string = all). The
         // covered CTE derives from the already-scoped candidate set, so a covered
         // child is scoped with its parent.
@@ -807,7 +819,7 @@ pub fn reflex_scheduled_reconcile(
         // just-reconciled IMVs (max_age <= 0). `name` is the final, deterministic
         // tiebreaker.
         let sql = "WITH candidate AS ( \
-                       SELECT name, graph_depth, depends_on_imv, last_update_date \
+                       SELECT name, graph_depth, depends_on_imv, last_update_date, aggregations \
                          FROM public.__reflex_ivm_reference \
                         WHERE COALESCE(enabled, TRUE) = TRUE \
                           AND ($2 = '' OR COALESCE(target_schema, 'public') = $2) \
@@ -818,10 +830,12 @@ pub fn reflex_scheduled_reconcile(
                        WITH RECURSIVE reachable AS ( \
                              SELECT unnest(COALESCE(c.depends_on_imv, ARRAY[]::TEXT[])) AS nm \
                                FROM candidate c \
+                              WHERE COALESCE(c.aggregations::text, '{}') <> '{}' \
                            UNION \
                              SELECT unnest(COALESCE(r.depends_on_imv, ARRAY[]::TEXT[])) \
                                FROM public.__reflex_ivm_reference r JOIN reachable ON r.name = reachable.nm \
                               WHERE COALESCE(r.is_generated_sub_imv, FALSE) \
+                                AND COALESCE(r.aggregations::text, '{}') <> '{}' \
                        ) \
                        SELECT reachable.nm AS name \
                          FROM reachable \
