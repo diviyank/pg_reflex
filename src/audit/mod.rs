@@ -98,10 +98,10 @@ impl ImvRow {
 
     /// A row written by `RegistryRow::decomposed` (`src/sql_writer/registry.rs`):
     /// the *wrapper* node of a set-op / DISTINCT ON / window decomposition. It
-    /// hardcodes `end_query: ""` AND `aggregations_json: "{}"`, so it is the one
-    /// shape where the two registry signals DISAGREE — and the disagreement is the
-    /// classifier: every row `persist_metadata` writes has `end_query == ""`
-    /// exactly when `aggregations.is_passthrough` is true.
+    /// hardcodes `end_query: ""` AND `aggregations_json: "{}"` — an empty
+    /// `end_query` on a row that carries no plan at all, which no row
+    /// `persist_metadata` writes can be (there `end_query` is `""` exactly when the
+    /// plan says `is_passthrough`, and the plan is always fully serialised).
     ///
     /// Such a node owns NO internal relation of either branch. Probed on pg17: a
     /// top-level `UNION ALL` wrapper is a VIEW over its `__union_N` sub-IMVs and
@@ -111,8 +111,36 @@ impl ImvRow {
     /// wrappers are VIEWs too; a `materialize_as_table` UNION-ALL wrapper is an
     /// UNLOGGED TABLE maintained by `__reflex_union_mirror_*` triggers on its
     /// operands, and still owns no aux relation.
+    ///
+    /// Detected by the KEY COUNT of `aggregations`, not by `!is_passthrough()`. The
+    /// two agree on every row either writer produces, but they diverge on a NULL or
+    /// unparseable `aggregations` — the column is nullable (`src/lib.rs:107`, and
+    /// `sql/pg_reflex--1.3.0--1.4.0.sql:51` guards `WHERE aggregations IS NOT NULL`).
+    /// `is_passthrough()` returns `false` there, which together with an empty
+    /// `end_query` would have classified such a row as a wrapper and silenced BOTH
+    /// `internal-tables-exist` and the much more serious `trigger-attached`. Key
+    /// count answers "unknown, not zero" and keeps reporting. It is also the signal
+    /// `REBUILDABLE_NODE` (`src/reconcile.rs`) already uses, so the tree carries two
+    /// predicates — `end_query` and key count — rather than three.
+    ///
+    /// That NULL case is deliberately resolved the OPPOSITE way from
+    /// `REBUILDABLE_NODE`'s `COALESCE(aggregations::text, '{}') <> '{}'`, and both
+    /// are right: there the question is "may reconcile rewrite this node?", whose
+    /// safe answer on unknown input is "leave it alone"; here it is "is this node
+    /// known to own nothing?", whose safe answer is "no — keep the Error".
     pub fn is_decomposed_wrapper(&self) -> bool {
-        !self.owns_intermediate() && !self.is_passthrough()
+        !self.owns_intermediate() && self.aggregation_key_count() == Some(0)
+    }
+
+    /// Number of keys in the row's `aggregations` object. `None` when the column is
+    /// NULL or holds something that is not a JSON object — the row's shape is then
+    /// unknown, which is not the same as empty.
+    fn aggregation_key_count(&self) -> Option<usize> {
+        let raw = self.aggregations_json.as_deref()?;
+        match serde_json::from_str::<serde_json::Value>(raw) {
+            Ok(serde_json::Value::Object(map)) => Some(map.len()),
+            _ => None,
+        }
     }
 
     pub fn real_sources(&self) -> impl Iterator<Item = &str> {

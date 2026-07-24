@@ -251,6 +251,55 @@ fn ps10_passthrough_missing_scratch_is_still_reported() {
     );
 }
 
+/// (3b) The divergence the wrapper discriminator is chosen for. A row with a NULL
+/// `aggregations` and an empty `end_query` is not a wrapper — it is a row whose
+/// shape is UNKNOWN (the column is nullable, and legacy rows predate it), and
+/// silencing it would hide a genuinely missing scratch table AND a genuinely
+/// missing source trigger. `!is_passthrough()` cannot tell the two apart, because
+/// it answers `false` for absent JSON exactly as it does for an aggregate; the key
+/// count answers "unknown, not zero" and the checks keep reporting.
+///
+/// The fixture is a REAL passthrough IMV over a real source with real damage; only
+/// the one column that no create path can leave NULL is set to NULL, to reach the
+/// legacy state instead of fabricating a row.
+#[pg_test]
+fn ps10_null_aggregations_row_is_not_treated_as_a_wrapper() {
+    Spi::run("CREATE TABLE ps10_na_src (id BIGINT, v NUMERIC)").expect("src");
+    Spi::run("INSERT INTO ps10_na_src VALUES (1, 10)").expect("seed");
+    Spi::run("SELECT create_reflex_ivm('ps10_na_view', 'SELECT id, v FROM ps10_na_src', 'id')")
+        .expect("create passthrough IMV");
+    Spi::run("DROP TABLE __reflex_pt_new_ps10_na_view_ps10_na_src CASCADE")
+        .expect("drop scratch");
+    Spi::run("DROP TRIGGER __reflex_trigger_ins_on_ps10_na_src ON ps10_na_src")
+        .expect("drop trigger");
+    Spi::run(
+        "UPDATE public.__reflex_ivm_reference SET aggregations = NULL \
+         WHERE name = 'ps10_na_view'",
+    )
+    .expect("blank the plan");
+    let unknown_shape = Spi::get_one::<bool>(
+        "SELECT aggregations IS NULL AND end_query = '' \
+         FROM public.__reflex_ivm_reference WHERE name = 'ps10_na_view'",
+    )
+    .expect("registry query failed")
+    .expect("no registry row");
+    assert!(
+        unknown_shape,
+        "fixture precondition: NULL aggregations with an empty end_query"
+    );
+
+    let report = ps10_audit("ps10_na_view");
+    assert!(
+        !ps10_findings(&report, "internal-tables-exist").is_empty(),
+        "a row of unknown shape must not be silenced — the missing scratch table is \
+         still real:\n{report}"
+    );
+    assert!(
+        !ps10_findings(&report, "trigger-attached").is_empty(),
+        "nor may the missing source trigger be silenced:\n{report}"
+    );
+}
+
 /// (4) `trigger-attached` on the same wrapper fixture. Probed: a VIEW wrapper has
 /// no triggers anywhere by design (its sub-IMVs maintain themselves and the view
 /// reads them), and a materialised UNION-ALL wrapper is maintained by
