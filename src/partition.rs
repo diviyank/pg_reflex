@@ -1259,6 +1259,9 @@ pub(crate) fn reflex_sync_partitions_impl(view_name: &str, drop_orphans: bool) -
             return Err(e);
         }
 
+        let (schema_opt, _) = split_qualified_name(view_name);
+        let schema = schema_opt.unwrap_or("public");
+
         let reloc_result: Result<(), String> = (|| {
             let drain_entries = drain_tree_defaults(client, &drain_roots)?;
 
@@ -1268,6 +1271,26 @@ pub(crate) fn reflex_sync_partitions_impl(view_name: &str, drop_orphans: bool) -
                 let ddl =
                     build_partition_node_ddl_pair(view_name, node, anchor_root_bare, unlogged);
                 if has_intermediate {
+                    // Bound-collision heal (untreated_bugs/
+                    // 2026-07-25_nightly_swap_target_overlap_restale.md): a
+                    // source-side repartition that DETACHes a leaf and
+                    // ATTACHes a freshly-named replacement at the SAME bound
+                    // leaves the old leaf's mirror child behind as an orphan
+                    // (drop_orphans=false — the auto-sync default, since
+                    // orphan deletion is never automatic). The CREATE below
+                    // would then raise "would overlap partition" against that
+                    // orphan. Drop only a CONFIRMED orphan — bounds identical
+                    // to the incoming child AND mapped to no live source leaf
+                    // — never a broader drop_orphans-style sweep. Mirrors the
+                    // F3 heal in `execute_partition_swap_for_child`.
+                    drop_bound_collision_orphan(
+                        client,
+                        schema,
+                        &int_children,
+                        &src_expected_int,
+                        &int_name,
+                        &node.bound_expr,
+                    )?;
                     client
                         .update(&ddl.int_ddl, None, &[])
                         .map_err(|e| format!("sync: create intermediate node: {}", e))?;
@@ -1275,6 +1298,14 @@ pub(crate) fn reflex_sync_partitions_impl(view_name: &str, drop_orphans: bool) -
                         out.added_intermediate += 1;
                     }
                 }
+                drop_bound_collision_orphan(
+                    client,
+                    schema,
+                    &tgt_children,
+                    &src_expected_tgt,
+                    &tgt_name,
+                    &node.bound_expr,
+                )?;
                 client
                     .update(&ddl.tgt_ddl, None, &[])
                     .map_err(|e| format!("sync: create target node: {}", e))?;
@@ -1333,6 +1364,52 @@ pub(crate) fn reflex_sync_partitions_impl(view_name: &str, drop_orphans: bool) -
         Ok(s) => s,
         Err(e) => format!("ERROR: {}", e),
     }
+}
+
+/// Drop a CONFIRMED orphan sibling of `about_to_attach` whose `FOR VALUES`
+/// bound is byte-identical to it: a `CREATE TABLE ... PARTITION OF ... FOR
+/// VALUES <bound>` for `about_to_attach` would otherwise raise "would overlap
+/// partition" against it. Narrower than a `drop_orphans` sweep — `expected`
+/// gates it to a child that maps to NO live source leaf, so this never
+/// touches a partition a live source still backs, regardless of the caller's
+/// own `drop_orphans` flag. Mirrors the F3 heal in
+/// `execute_partition_swap_for_child`; `siblings` and `expected` are the
+/// int/tgt child list and expected-name set for the namespace being healed.
+fn drop_bound_collision_orphan(
+    client: &mut pgrx::spi::SpiClient<'_>,
+    schema: &str,
+    siblings: &[PartitionNode],
+    expected: &std::collections::HashSet<String>,
+    about_to_attach: &str,
+    bound_expr: &str,
+) -> Result<(), String> {
+    if bound_expr.is_empty() {
+        return Ok(());
+    }
+    for child in siblings {
+        if child.bare_name == about_to_attach || expected.contains(&child.bare_name) {
+            continue;
+        }
+        let child_bound = read_partition_bound(client, schema, &child.bare_name);
+        if !child_bound.is_empty() && child_bound == bound_expr {
+            let q = format!(
+                "DROP TABLE IF EXISTS \"{}\".\"{}\" CASCADE",
+                schema, child.bare_name
+            );
+            client.update(&q, None, &[]).map_err(|e| {
+                format!(
+                    "sync: drop bound-collision orphan '{}': {}",
+                    child.bare_name, e
+                )
+            })?;
+            pgrx::notice!(
+                "pg_reflex: dropped confirmed orphan partition '{}' (bounds matched incoming child '{}')",
+                child.bare_name,
+                about_to_attach
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Implementation of `reflex_reconcile_partition(view_name, partition_keys)`.
