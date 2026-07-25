@@ -4,10 +4,13 @@
 --
 -- Replace the module (.so) BEFORE running this.
 --
--- Eight fixes. Seven are delivered entirely in the module; the eighth
--- (targeted-recovery observability) adds two nullable/defaulted columns to the
--- registry, so this delta carries DDL at the end (a fast-default ADD COLUMN, no
--- table rewrite) plus one corrective metadata backfill.
+-- Nine fixes plus one new function. Seven of the fixes are delivered entirely
+-- in the module; the eighth (targeted-recovery observability) adds two
+-- nullable/defaulted columns to the registry, so this delta carries DDL at
+-- the end (a fast-default ADD COLUMN, no table rewrite) plus one corrective
+-- metadata backfill. The ninth fix and the new `reflex_rebuild_union_mirror`
+-- function (CREATE FUNCTION below) are the materialised UNION-ALL wrapper
+-- mirror-trigger work.
 --
 --   * (SILENT WRONG RESULT) A MIN/MAX aggregate IMV over a nullable group key returned
 --     a stale extremum forever after a retraction: the recompute scoped its rescan
@@ -49,6 +52,24 @@
 --     clearing the finding. If you ran it, drop any
 --     `__reflex_trigger_{ins,del,upd,trunc}_on_<sub-imv>` triggers it left behind.
 --
+--   * New repair primitive `reflex_rebuild_union_mirror(wrapper TEXT)`: a
+--     materialised UNION-ALL wrapper (built when a CTE feeding a set-op is
+--     consumed by an aggregate) is kept in sync by
+--     `__reflex_union_mirror_{ins,del,upd}_<wrapper>_<i>` triggers on each
+--     operand. Previously nothing could repair a dropped mirror trigger.
+--     Refuses cleanly on a VIEW wrapper (no operand triggers by design) or a
+--     non-wrapper IMV; restores future maintenance only, does not backfill
+--     deltas missed while the trigger was absent.
+--
+--   * trigger-attached's decomposed-wrapper skip above was unconditional, which
+--     also silenced the real check for a materialised wrapper's mirror
+--     triggers. It now checks a materialised (TABLE) wrapper's operands and
+--     reports any missing mirror trigger, naming `reflex_rebuild_union_mirror`;
+--     a VIEW wrapper stays silent, unchanged. The expected trigger name is
+--     compared against PostgreSQL's own NAMEDATALEN-truncated form, so a
+--     wrapper whose generated trigger name exceeds 63 bytes is not
+--     permanently misreported as broken.
+--
 --   * (DDL) `reflex_rebuild_imv` / targeted `reflex_reconcile` retries are now
 --     observable: `__reflex_ivm_reference` gains `rebuild_count` and
 --     `last_rebuild_at`, incremented only by direct operator recovery (not by
@@ -81,6 +102,14 @@
 -- Existing F3 `partition-mirror` findings on passthrough IMVs disappear from the
 -- next `reflex_doctor()` / `reflex_audit()` run; nothing needs to be reconciled
 -- to clear them, because nothing was ever wrong with those IMVs.
+
+-- New SQL-callable function (Rust-backed via pgrx).
+CREATE FUNCTION "reflex_rebuild_union_mirror"(
+    "wrapper" TEXT
+) RETURNS TEXT
+STRICT
+LANGUAGE c
+AS 'MODULE_PATHNAME', 'reflex_rebuild_union_mirror_wrapper';
 
 -- --------------------------------------------------------------------------
 -- DDL: targeted-recovery observability columns. Identical to the bootstrap DDL

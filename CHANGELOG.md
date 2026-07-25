@@ -5,8 +5,10 @@
 ## [1.11.1] - 2026-07-24
 
 Audit truthfulness, two silent-wrong-result fixes in nullable-key MIN/MAX
-maintenance, wrapper-reconcile safety, targeted-recovery observability, plus a
-recovery path for a dropped internal table. Replace the `.so`, then
+maintenance, wrapper-reconcile safety, targeted-recovery observability, a
+recovery path for a dropped internal table, plus a repair primitive and real
+audit coverage for materialised UNION-ALL wrapper mirror triggers. Replace
+the `.so`, then
 `ALTER EXTENSION pg_reflex UPDATE TO '1.11.1';`. The update adds two registry
 columns (fast-default `ADD COLUMN`, no table rewrite) and one corrective metadata
 backfill; no reconcile is needed.
@@ -24,6 +26,15 @@ backfill; no reconcile is needed.
   primitive that can (`refresh_imv_depending_on` / `reflex_reconcile_partition`)
   instead of returning a bare success — so a non-converging retry loop is visible
   in-database rather than only in `pg_stat_statements`.
+
+- `reflex_rebuild_union_mirror(wrapper TEXT)`: reinstalls a materialised
+  UNION-ALL wrapper's `__reflex_union_mirror_{ins,del,upd}_<wrapper>_<i>`
+  triggers on every operand recorded in its `depends_on`. Previously nothing
+  could repair a dropped mirror trigger — `reflex_rebuild_triggers` installs
+  the wrong (consolidated) trigger set on a sub-IMV target and never clears
+  the finding. Refuses cleanly on a VIEW wrapper (no operand triggers by
+  design) or a non-wrapper IMV. Restores future maintenance only; it does not
+  backfill deltas missed while the trigger was absent.
 
 **Fixed**
 
@@ -84,6 +95,17 @@ backfill; no reconcile is needed.
   junk consolidated triggers on its target and left the finding standing, so every
   retry added four more. Wrappers are now classified by their `aggregations` key
   count and excluded from both checks.
+
+- `trigger-attached`'s wrapper exclusion above was unconditional, which also
+  silenced the real check for a **materialised** UNION-ALL wrapper's mirror
+  triggers (a VIEW wrapper genuinely has none; a materialised one is
+  maintained by `__reflex_union_mirror_*` triggers this check didn't know
+  about). It now checks a materialised (TABLE) wrapper's operands and reports
+  any missing mirror trigger, naming `reflex_rebuild_union_mirror`; a VIEW
+  wrapper stays silent, unchanged. The expected trigger name is compared
+  against PostgreSQL's own `NAMEDATALEN`-truncated form (not the untruncated
+  one), so a wrapper whose generated trigger name exceeds 63 bytes is not
+  permanently misreported as broken.
 
 - The `partition-mirror` audit check (surfaced by `reflex_doctor` as F3) reported
   phantom intermediate-partition drift on partitioned **passthrough** IMVs. A
