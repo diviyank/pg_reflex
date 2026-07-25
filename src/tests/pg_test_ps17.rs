@@ -217,3 +217,57 @@ fn ps17_rebuild_union_mirror_rejects_unknown_name() {
         "must refuse cleanly on an unknown name: {result}"
     );
 }
+
+/// (6) Adversarial-review finding: PostgreSQL silently truncates a CREATE
+/// TRIGGER name over 63 bytes at a char boundary
+/// (`decompose.rs::install_union_mirror_triggers` relies on this — it
+/// deliberately skips `safe_identifier`'s hash-suffixed truncation). A
+/// wrapper name long enough to push `__reflex_union_mirror_{ins,del,upd}_
+/// <wrapper>_<i>` past 63 bytes must still audit clean when maintenance is
+/// genuinely healthy — comparing against the UNTRUNCATED expected name would
+/// misreport a healthy wrapper as broken, and the printed remedy
+/// (`reflex_rebuild_union_mirror`) recreates the same truncated trigger every
+/// time, so the finding could never clear (the exact "unclearable remedy"
+/// anti-pattern this whole check exists to avoid).
+///
+/// 36-char wrapper name — below the ~38-char threshold where a SEPARATE,
+/// pre-existing bug in `install_union_mirror_triggers` itself collapses the
+/// three mirror trigger FUNCTIONS into one (filed separately, out of scope
+/// here); this fixture is chosen to isolate the truncation-comparison defect
+/// from that adjacent one.
+#[pg_test]
+fn ps17_long_wrapper_name_truncation_not_flagged() {
+    Spi::run("CREATE TABLE ps17_long_wrapper_name_abcdef_a (id BIGINT, v NUMERIC)").expect("a");
+    Spi::run("CREATE TABLE ps17_long_wrapper_name_abcdef_b (id BIGINT, v NUMERIC)").expect("b");
+    Spi::run("INSERT INTO ps17_long_wrapper_name_abcdef_a VALUES (1, 10)").expect("seed a");
+    Spi::run("INSERT INTO ps17_long_wrapper_name_abcdef_b VALUES (2, 20)").expect("seed b");
+    Spi::run(
+        "SELECT create_reflex_ivm('ps17_long_wrapper_name_abcdef', \
+           'WITH u AS (SELECT id, v FROM ps17_long_wrapper_name_abcdef_a \
+                       UNION ALL SELECT id, v FROM ps17_long_wrapper_name_abcdef_b) \
+            SELECT id, SUM(v) AS total FROM u GROUP BY id', 'id')",
+    )
+    .expect("create CTE-over-UNION-ALL IMV");
+
+    let wrapper = "ps17_long_wrapper_name_abcdef__cte_u";
+    assert_eq!(wrapper.len(), 36, "fixture precondition: wrapper name is 36 bytes");
+    let is_table = ps17_count(&format!(
+        "SELECT count(*) FROM pg_class WHERE relname = '{wrapper}' AND relkind = 'r'"
+    ));
+    assert_eq!(is_table, 1, "fixture precondition: materialised wrapper");
+
+    // Maintenance must actually be healthy: an insert into each base table
+    // must still reach the wrapper (proves the truncated-but-distinct
+    // trigger names are still functioning, not just present).
+    Spi::run("INSERT INTO ps17_long_wrapper_name_abcdef_a VALUES (3, 30)").expect("insert a");
+    Spi::run("INSERT INTO ps17_long_wrapper_name_abcdef_b VALUES (4, 40)").expect("insert b");
+    let rows = ps17_count(&format!("SELECT count(*) FROM {wrapper}"));
+    assert_eq!(rows, 4, "healthy wrapper must receive both new rows");
+
+    let report = ps17_audit(wrapper);
+    assert!(
+        ps17_findings(&report, "trigger-attached").is_empty(),
+        "a healthy long-named wrapper must NOT be misreported as missing \
+         triggers due to PG's own name truncation:\n{report}"
+    );
+}

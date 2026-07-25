@@ -156,10 +156,27 @@ impl Check for TriggerAttached {
             let safe_wrapper = crate::query_decomposer::sanitized_source_suffix(&wrapper_name);
             let mut out = Vec::new();
             for (i, operand) in imv.depends_on.iter().enumerate() {
+                // PostgreSQL silently truncates a CREATE TRIGGER name >63 bytes
+                // to NAMEDATALEN-1 at a char boundary (`decompose.rs`'s own
+                // installer relies on this — it deliberately does NOT
+                // pre-truncate via `safe_identifier`, see the comment there).
+                // Comparing against the UNTRUNCATED name would report a
+                // healthy, longer-named wrapper's triggers as permanently
+                // "missing" — an unclearable finding, since the printed
+                // remedy re-creates the same (truncated) trigger every time.
                 let expected = [
-                    format!("__reflex_union_mirror_ins_{}_{}", safe_wrapper, i),
-                    format!("__reflex_union_mirror_del_{}_{}", safe_wrapper, i),
-                    format!("__reflex_union_mirror_upd_{}_{}", safe_wrapper, i),
+                    crate::query_decomposer::truncate_identifier(format!(
+                        "__reflex_union_mirror_ins_{}_{}",
+                        safe_wrapper, i
+                    )),
+                    crate::query_decomposer::truncate_identifier(format!(
+                        "__reflex_union_mirror_del_{}_{}",
+                        safe_wrapper, i
+                    )),
+                    crate::query_decomposer::truncate_identifier(format!(
+                        "__reflex_union_mirror_upd_{}_{}",
+                        safe_wrapper, i
+                    )),
                 ];
                 let operand_oid = match client
                     .select(
@@ -207,13 +224,18 @@ impl Check for TriggerAttached {
                         category: "trigger-attached",
                         finding: format!(
                             "Materialised UNION-ALL wrapper operand {} (index {}) is \
-                             missing mirror trigger(s): {}",
+                             missing mirror trigger(s): {}. Any writes to this operand \
+                             while the trigger was absent were NOT mirrored into the \
+                             wrapper and will not be backfilled by reinstalling it — \
+                             verify row counts (or reconcile the whole chain) if writes \
+                             happened during the gap.",
                             operand,
                             i,
                             names.join(", ")
                         ),
                         suggested_fix: format!(
-                            "SELECT reflex_rebuild_union_mirror('{}');",
+                            "SELECT reflex_rebuild_union_mirror('{}'); -- restores FUTURE \
+                             maintenance only, does not backfill missed deltas",
                             wrapper_name
                         ),
                     });
