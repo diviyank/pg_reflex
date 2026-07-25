@@ -5,8 +5,8 @@ use pgrx::prelude::*;
 use crate::query_decomposer::{
     affected_groups_table_name, canonical_source, delta_scratch_table_name,
     intermediate_table_name, passthrough_scratch_new_table_name,
-    passthrough_scratch_old_table_name, quote_identifier, shrunk_groups_table_name,
-    staging_delta_table_name,
+    passthrough_scratch_old_table_name, quote_identifier, safe_identifier,
+    shrunk_groups_table_name, staging_delta_table_name,
 };
 
 pub(crate) fn drop_reflex_ivm_impl(view_name: &str, cascade: bool) -> &'static str {
@@ -431,7 +431,13 @@ fn drop_reflex_ivm_impl_inner(view_name: &str, cascade: bool, root: &str) -> &'s
             let safe_wrapper = crate::query_decomposer::sanitized_source_suffix(view_name);
             for i in 0..depends_on_imv.len() {
                 for op in &["ins", "del", "upd"] {
-                    let fn_name = format!("__reflex_union_mirror_{safe_wrapper}_{i}_{op}");
+                    // Must match `install_union_mirror_triggers`'s construction
+                    // exactly (op tag first, then `safe_identifier`-hashed) or
+                    // `DROP FUNCTION IF EXISTS` silently no-ops on the mismatch
+                    // and leaks the function — see
+                    // untreated_bugs/2026-07-25_union_mirror_function_name_collision.md.
+                    let fn_name =
+                        safe_identifier(&format!("__reflex_union_mirror_{op}_{safe_wrapper}_{i}"));
                     detach_function_from_extension(client, &format!("public.{fn_name}"));
                     client
                         .update(

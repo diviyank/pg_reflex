@@ -343,10 +343,25 @@ pub(crate) fn install_union_mirror_triggers(
         .collect::<Vec<_>>()
         .join(" AND ");
 
-    let fn_base = format!("__reflex_union_mirror_{safe_wrapper}_{operand_idx}");
-    let fn_ins = format!("{fn_base}_ins");
-    let fn_del = format!("{fn_base}_del");
-    let fn_upd = format!("{fn_base}_upd");
+    // Function names are global per schema (unlike trigger names, which are
+    // scoped per relation and so cannot collide across operands). Naively
+    // truncating a long wrapper name at 63 bytes can eat BOTH discriminators
+    // that keep these three names apart: the DML-kind tag and the operand
+    // index. Moving the tag before the unbounded wrapper component (as
+    // trigger names below do) only fixes the first: at wrapper lengths where
+    // `prefix + tag + "_" + safe_wrapper` alone already exceeds 63 bytes, the
+    // trailing `_<operand_idx>` is truncated away too, and every operand's
+    // same-kind function collapses onto one `proname` — `CREATE OR REPLACE`
+    // for operand 1 then silently overwrites operand 0's already-bound
+    // trigger body (see
+    // untreated_bugs/2026-07-25_union_mirror_function_name_collision.md).
+    // `safe_identifier` hashes the FULL raw string (including the trailing
+    // operand index) into its truncated form, so two names that differ only
+    // in a byte past the naive cutoff still end up distinct — this holds
+    // regardless of wrapper length, not just below some fixed threshold.
+    let fn_ins = safe_identifier(&format!("__reflex_union_mirror_ins_{safe_wrapper}_{operand_idx}"));
+    let fn_del = safe_identifier(&format!("__reflex_union_mirror_del_{safe_wrapper}_{operand_idx}"));
+    let fn_upd = safe_identifier(&format!("__reflex_union_mirror_upd_{safe_wrapper}_{operand_idx}"));
 
     // INSERT mirror: tag every NEW row with this operand's index.
     let ins_body = format!(
@@ -397,12 +412,9 @@ pub(crate) fn install_union_mirror_triggers(
     }
 
     // Register the newly created functions as pg_reflex extension members.
-    // Pass the RAW name (not `safe_identifier`): these fns are created above
-    // with the raw `fn_*` name, so for names >63 chars PostgreSQL truncates them
-    // naively to the first 63 chars. The ADD inside member_register_ddl truncates
-    // the same naive way, so it resolves to the same function. `safe_identifier`
-    // would instead produce a `<54chars>_<hash>` name that diverges from the
-    // stored one and break registration — do NOT wrap these in it.
+    // `fn_ins`/`fn_del`/`fn_upd` are already `safe_identifier`-truncated above,
+    // so this is the function's exact, final `proname` — PostgreSQL performs
+    // no further truncation since the string is already <=63 bytes.
     for fn_name in [&fn_ins, &fn_del, &fn_upd] {
         client
             .update(
