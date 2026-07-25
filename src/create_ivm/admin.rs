@@ -525,7 +525,12 @@ pub(crate) fn reflex_rebuild_union_mirror_impl(wrapper: &str) -> String {
 
         let depends_on = match depends_on {
             Some(d) if !d.is_empty() => d,
-            Some(_) => return Err(format!("'{}' has no operands recorded in depends_on", wrapper)),
+            Some(_) => {
+                return Err(format!(
+                    "'{}' has no operands recorded in depends_on",
+                    wrapper
+                ))
+            }
             None => return Err(format!("IMV '{}' not found in the registry", wrapper)),
         };
         if !is_wrapper {

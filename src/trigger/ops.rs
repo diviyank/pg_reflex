@@ -1221,6 +1221,7 @@ pub(crate) fn passthrough_op_stmts(
                             key_source_cols: &source_cols,
                             non_key_cols: &non_key_cols,
                             pt_old: &pt_old,
+                            not_null_columns: &plan.not_null_columns,
                         };
                         stmts.push(build_passthrough_partition_dispatch_sql(
                             view_name,
