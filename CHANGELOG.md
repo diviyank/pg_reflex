@@ -4,11 +4,12 @@
 
 ## [1.11.1] - 2026-07-24
 
-Audit truthfulness, two silent-wrong-result fixes in nullable-key MIN/MAX
-maintenance, wrapper-reconcile safety, targeted-recovery observability, a
-recovery path for a dropped internal table, plus a repair primitive and real
-audit coverage for materialised UNION-ALL wrapper mirror triggers. Replace
-the `.so`, then
+Audit truthfulness, three silent-wrong-result fixes (nullable-key MIN/MAX
+maintenance, and a materialised UNION-ALL wrapper's mirror trigger functions
+colliding under long wrapper names), wrapper-reconcile safety,
+targeted-recovery observability, a recovery path for a dropped internal
+table, plus a repair primitive and real audit coverage for materialised
+UNION-ALL wrapper mirror triggers. Replace the `.so`, then
 `ALTER EXTENSION pg_reflex UPDATE TO '1.11.1';`. The update adds two registry
 columns (fast-default `ADD COLUMN`, no table rewrite) and one corrective metadata
 backfill; no reconcile is needed.
@@ -106,6 +107,27 @@ backfill; no reconcile is needed.
   against PostgreSQL's own `NAMEDATALEN`-truncated form (not the untruncated
   one), so a wrapper whose generated trigger name exceeds 63 bytes is not
   permanently misreported as broken.
+
+- **(silent wrong result)** A materialised UNION-ALL wrapper's per-operand mirror
+  trigger *functions* (`__reflex_union_mirror_{ins,del,upd}_<wrapper>_<i>`, installed
+  by `install_union_mirror_triggers`) shared one unbounded, non-length-capped name.
+  PostgreSQL silently truncates any identifier over `NAMEDATALEN-1` (63 bytes) at a
+  char boundary, so a wrapper name ≥ 38 bytes truncated away the one character
+  distinguishing `ins`/`del`/`upd`, collapsing two or three of the `CREATE OR REPLACE
+  FUNCTION`s onto the same `proname` — the last one issued silently overwrote the
+  others' bodies while the already-bound triggers kept their captured `tgfoid`, so an
+  `INSERT` on one operand could execute another DML kind's body outright (erroring
+  immediately) or, at a second threshold, mis-tag the row with the wrong
+  `__reflex_src_idx` instead of erroring at all. Fixed by hashing the full raw name
+  (DML tag, wrapper, and operand index together) through the same `safe_identifier`
+  truncation scheme used elsewhere, so the operand index and DML-kind tag both
+  survive regardless of wrapper length. `drop_reflex_ivm` now also probes the legacy
+  (pre-1.11.1) unhashed name when cleaning up a wrapper's functions, so dropping a
+  wrapper created before this fix does not leak them. This fix only changes what a
+  *new* `create_reflex_ivm` call produces — a wrapper already collided under the old
+  scheme is not automatically repaired or flagged; run `reflex_rebuild_union_mirror`
+  on it by hand (see `untreated_bugs/2026-07-25_union_mirror_function_name_collision.md`
+  for the residual detection gap).
 
 - The `partition-mirror` audit check (surfaced by `reflex_doctor` as F3) reported
   phantom intermediate-partition drift on partitioned **passthrough** IMVs. A

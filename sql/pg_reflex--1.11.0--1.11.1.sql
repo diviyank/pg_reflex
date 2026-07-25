@@ -4,13 +4,15 @@
 --
 -- Replace the module (.so) BEFORE running this.
 --
--- Nine fixes plus one new function. Seven of the fixes are delivered entirely
+-- Ten fixes plus one new function. Seven of the fixes are delivered entirely
 -- in the module; the eighth (targeted-recovery observability) adds two
 -- nullable/defaulted columns to the registry, so this delta carries DDL at
 -- the end (a fast-default ADD COLUMN, no table rewrite) plus one corrective
 -- metadata backfill. The ninth fix and the new `reflex_rebuild_union_mirror`
 -- function (CREATE FUNCTION below) are the materialised UNION-ALL wrapper
--- mirror-trigger work.
+-- mirror-trigger work; the tenth is a further, module-only fix in that same
+-- area (mirror-trigger FUNCTION naming, not the trigger naming the ninth
+-- fix covers).
 --
 --   * (SILENT WRONG RESULT) A MIN/MAX aggregate IMV over a nullable group key returned
 --     a stale extremum forever after a retraction: the recompute scoped its rescan
@@ -70,6 +72,20 @@
 --     wrapper whose generated trigger name exceeds 63 bytes is not
 --     permanently misreported as broken.
 --
+--   * (SILENT WRONG RESULT) A materialised UNION-ALL wrapper's per-operand mirror
+--     trigger FUNCTIONS shared one unbounded name; a wrapper name >=38 bytes
+--     truncated away the discriminator between the ins/del/upd functions (or, at a
+--     longer threshold, between two operands' same-kind function), so PostgreSQL's
+--     NAMEDATALEN truncation collapsed distinct CREATE OR REPLACE FUNCTIONs onto one
+--     proname and the last one issued silently overwrote the others' bodies while
+--     already-bound triggers kept executing them — an INSERT on one operand could
+--     run another DML kind's body (erroring) or mis-tag the row with the wrong
+--     operand index (no error, wrong data). Fixed by hashing the full name through
+--     safe_identifier so both discriminators survive regardless of wrapper length;
+--     reflex_rebuild_union_mirror (above) repairs an already-collided wrapper by
+--     hand, but this fix does not detect or auto-heal one — see
+--     untreated_bugs/2026-07-25_union_mirror_function_name_collision.md.
+--
 --   * (DDL) `reflex_rebuild_imv` / targeted `reflex_reconcile` retries are now
 --     observable: `__reflex_ivm_reference` gains `rebuild_count` and
 --     `last_rebuild_at`, incremented only by direct operator recovery (not by
@@ -102,6 +118,13 @@
 -- Existing F3 `partition-mirror` findings on passthrough IMVs disappear from the
 -- next `reflex_doctor()` / `reflex_audit()` run; nothing needs to be reconciled
 -- to clear them, because nothing was ever wrong with those IMVs.
+--
+-- One EXCEPTION: if you have a materialised UNION-ALL wrapper (a CTE feeding a
+-- set-op consumed by an aggregate) whose name is >=38 bytes, its mirror trigger
+-- functions may already be collided under the pre-1.11.1 naming bug above. This
+-- update does not detect or repair that automatically — run
+-- `SELECT reflex_rebuild_union_mirror('<wrapper_name>')` by hand for any such
+-- wrapper after replacing the module.
 
 -- New SQL-callable function (Rust-backed via pgrx).
 CREATE FUNCTION "reflex_rebuild_union_mirror"(

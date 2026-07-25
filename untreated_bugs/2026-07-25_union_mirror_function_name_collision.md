@@ -1,78 +1,77 @@
-# 2026-07-25 — long wrapper names collapse the three union-mirror trigger functions into one, breaking the IMV at CREATE time
+# 2026-07-25 — no automatic detection that a deployed union-mirror wrapper already collided under the pre-1.11.1 naming scheme
 
-**Status: untreated.** Found adversarially while reviewing PS-17 (`reflex_rebuild_union_mirror` +
-`trigger-attached` extension for `untreated_bugs/2026-07-24_union_mirror_triggers_unchecked.md`).
-Pre-existing, unrelated to PS-17's diff — the function under suspicion,
-`install_union_mirror_triggers`, is unchanged by that fix; only its caller is new. Filed
-separately per the hygiene rule against folding adjacent bugs into unrelated work.
+**Status: narrowed.** The original create-time collision (below, kept for context) is fixed —
+`install_union_mirror_triggers` (`src/create_ivm/decompose.rs`) now runs each mirror trigger
+function's full raw name (DML tag + wrapper + operand index) through `safe_identifier`, which
+hashes it into a truncated form whenever it exceeds 63 bytes, so the operand index and DML-kind
+tag both survive regardless of wrapper length. `drop_reflex_ivm` (`src/drop_ivm.rs`) was updated
+to match and additionally still probes the legacy (pre-1.11.1, unhashed) name form, so dropping a
+wrapper created before this fix does not leak its functions. Regression tests:
+`ps18_long_wrapper_mirror_functions_stay_distinct`, `ps18_long_wrapper_mirror_functions_run_correct_body`,
+`ps18_drop_reflex_ivm_leaves_no_orphan_mirror_functions`, `ps18_drop_reflex_ivm_cleans_up_legacy_named_mirror_functions`
+(`src/tests/pg_test_ps18.rs`).
 
-## Symptom
+## Residual: pre-1.11.1 wrappers already collided in the field have no automated signal
 
-`create_reflex_ivm` on a CTE-over-UNION-ALL view consumed by an aggregate (the shape that
-triggers `install_union_all_intermediate_wrapper`) reports success, but the materialised wrapper
-is broken from the moment the first base-table write happens: an `INSERT` into an operand fails
-with `ERROR: relation "__reflex_old" does not exist` (an UPDATE-only local variable, referenced
-from the INSERT trigger body).
+A wrapper created by pg_reflex 1.11.0 or earlier with a name ≥ 38 bytes was already
+silently broken (see the original symptom below) before this fix ever ran. Upgrading the
+module does **not** repair an already-collided wrapper — the fix only changes what a *new*
+`create_reflex_ivm` call produces. Nothing detects the collision automatically:
+`trigger-attached` (PS-17) only checks that the three trigger *names* exist, not that their
+`tgfoid`s point at three distinct functions with the correct bodies, so a collided wrapper
+audits clean.
 
-## Root cause
+**Available remedy, not yet wired to a finding**: `reflex_rebuild_union_mirror(wrapper)`
+(shipped alongside `trigger-attached` in this same unreleased 1.11.1) re-runs
+`install_union_mirror_triggers` with the corrected naming and re-binds each operand's
+triggers to the new, distinct functions — this does repair a collided wrapper, but only if
+an operator knows to run it. The old, now-unreferenced legacy-named function is left as a
+harmless orphan, cleaned up automatically the next time the wrapper itself is dropped.
 
-`src/create_ivm/decompose.rs:344` builds the three mirror-trigger **function** names from one
-shared base with a raw (non-`safe_identifier`) suffix:
-
-```rust
-let fn_base = format!("__reflex_union_mirror_{safe_wrapper}_{operand_idx}");
-let fn_ins = format!("{fn_base}_ins");
-let fn_del = format!("{fn_base}_del");
-let fn_upd = format!("{fn_base}_upd");
-```
-
-`safe_wrapper` is `sanitized_source_suffix(wrapper)` (`query_decomposer.rs:50`), which does no
-length capping — `install_union_mirror_triggers`'s own comment (`decompose.rs:401-405`)
-deliberately opts out of `safe_identifier`'s hash-suffixed truncation because trigger *names*
-need to match PostgreSQL's own naive truncation for lookups elsewhere to line up. But that
-comment's reasoning only covers `CREATE TRIGGER`; the three `CREATE OR REPLACE FUNCTION` names
-share the same unbounded prefix, and PostgreSQL truncates a `>NAMEDATALEN-1`-byte identifier at a
-char boundary — so once the truncated form eats past the `i`/`d`/`u` character that is the *only*
-difference between `..._ins`, `..._del`, `..._upd`, all three DDLs `CREATE OR REPLACE` the exact
-same `proname`, and the last one issued (`upd`) silently overwrites the other two.
-
-**Verified threshold: wrapper name length ≥ 38 bytes** (for a 1-digit `operand_idx`; the prefix
-`__reflex_union_mirror_` is 22 bytes, `+ wrapper + _0` reaches the 63-byte `NAMEDATALEN-1` limit
-one byte before the `_ins`/`_del`/`_upd` discriminator survives truncation). Reproduced directly:
-a 39-char wrapper name creates successfully, then the first base-table `INSERT` throws the
-`__reflex_old` error because the INSERT trigger is executing the UPDATE function body.
-
-This is realistic, not exotic — the wrapper name is `<view_name>__cte_<alias>` (7-8 extra bytes),
-so any view name at or above ~30 characters is affected. `sop_incoming_stock_baseline_view`
-(33 chars) is already over that bar.
-
-## Relationship to PS-17
-
-PS-17's new `trigger-attached` extension (same file family) *does* correctly detect the resulting
-missing/wrong triggers once this collision has broken a wrapper — but its `suggested_fix`
-(`reflex_rebuild_union_mirror`) re-runs the same buggy `install_union_mirror_triggers` and cannot
-converge either, since the function-name collision reproduces every time. That check now truncates
-its *expected trigger name* comparison to match PostgreSQL's real truncation (fixing a false
-positive at the trigger-name layer, PS-17 finding F1) but does nothing for — and cannot detect —
-the function-body collision underneath it. A future fix here should also make `trigger-attached`
-(or a new check) verify the three function `prosrc` bodies are distinct for a materialised wrapper,
-not just that the trigger names exist.
-
-## Fix direction
-
-`fn_base` (or the three derived function names) needs the same "match Postgres's own truncation,
-but keep the DML-kind discriminator" treatment `install_union_mirror_triggers` already gives the
-*trigger* names — except trigger names can share the plain naive truncation (they're never
-compared to a hash-suffixed form elsewhere), while the **function** names specifically need the
-`ins`/`del`/`upd` discriminator preserved even after truncation, e.g. truncate the wrapper-derived
-core first and place the DML tag as a fixed-position, always-preserved suffix rather than
-appending it after the unbounded part. Needs its own pre-spec: this touches create-time DDL
-generation, so a length-boundary fixture (name ≥ 38 bytes) has to be added to whatever regression
-test locks in the redesigned naming, and existing installations whose functions already collided
-under the old scheme need a migration-time heal (re-run the corrected installer for every
-materialised wrapper — same shape as the PS-6 passthrough-scratch heal).
+Fix direction for closing this residual: extend `trigger-attached` (or add a dedicated
+check) to compare the three operand-relation triggers' `tgfoid`s for distinctness (cheap,
+catalog-only) and report `reflex_rebuild_union_mirror` as the remedy when they've collapsed
+onto one function. Low urgency — the shape requires a base view name ≳30 characters feeding
+`install_union_all_intermediate_wrapper`, which is uncommon; `sop_incoming_stock_baseline_view`
+(33 chars) is the only known example in this codebase's own fixtures/benchmarks, and it does
+not hit this specific decomposition path.
 
 ## Severity
 
-S1 — silent-at-create, hard-broken-at-first-write data corruption risk (INSERT trigger executing
-UPDATE logic is not merely "missing", it runs the *wrong* maintenance code against live data).
+S3 — narrowed from S1. The original silent-wrong-result risk is closed for anything created
+under the fixed module; what remains is an observability gap for wrappers that were already
+broken under the old module, with a working manual remedy once the finding is spotted by hand.
+
+---
+
+## Original report (context, root cause now fixed)
+
+Found adversarially while reviewing PS-17 (`reflex_rebuild_union_mirror` + `trigger-attached`
+extension for `untreated_bugs/2026-07-24_union_mirror_triggers_unchecked.md`). Pre-existing,
+unrelated to PS-17's diff — the function under suspicion, `install_union_mirror_triggers`, was
+unchanged by that fix; only its caller was new.
+
+### Symptom
+
+`create_reflex_ivm` on a CTE-over-UNION-ALL view consumed by an aggregate (the shape that
+triggers `install_union_all_intermediate_wrapper`) reported success, but the materialised wrapper
+was broken from the moment the first base-table write happened: an `INSERT` into an operand
+failed with `ERROR: relation "__reflex_old" does not exist` (an UPDATE-only local variable,
+referenced from the INSERT trigger body) — or, past a second, longer threshold, silently mis-tagged
+the new row with the wrong `__reflex_src_idx` instead of erroring at all (found during this fix's
+own adversarial review: moving the DML tag before the wrapper component alone still let a
+sufficiently long wrapper name truncate away the trailing operand-index digit, collapsing operand
+0 and operand 1's same-kind function onto one `proname`).
+
+### Root cause
+
+`src/create_ivm/decompose.rs` built the three mirror-trigger **function** names from one shared,
+unbounded, non-`safe_identifier` suffix, so PostgreSQL's NAMEDATALEN truncation could eat the
+DML-kind discriminator (`ins`/`del`/`upd`) and, once that was fixed by re-ordering, could still eat
+the operand-index discriminator at a longer threshold — either way collapsing distinct functions
+onto one `proname`, with the last `CREATE OR REPLACE FUNCTION` issued silently overwriting the
+others' bodies while already-bound triggers kept their captured `tgfoid`.
+
+**Verified threshold: wrapper name length ≥ 38 bytes** (for a 1-digit `operand_idx`) for the
+original ins/del/upd collision; the cross-operand collision (post-reorder) reproduces at the same
+39-byte fixture used by the regression tests.
