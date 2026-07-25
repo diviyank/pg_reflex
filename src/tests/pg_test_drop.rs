@@ -679,12 +679,16 @@ fn test_drop_cleans_up_union_mirror_functions() {
     .unwrap();
 
     // Before drop: at least 6 mirror functions exist (2 operands × 3 ops).
+    // The `%` right after `mirror\_` absorbs the `ins_`/`del_`/`upd_` DML-kind
+    // tag, which sits BEFORE the wrapper-derived component (not after it) so
+    // it survives NAMEDATALEN truncation on long wrapper names — see
+    // `install_union_mirror_triggers` in `create_ivm/decompose.rs`.
     let before: Option<i64> = Spi::get_one(
         "SELECT COUNT(*)
          FROM pg_proc p
          JOIN pg_namespace n ON n.oid = p.pronamespace
          WHERE n.nspname = 'public'
-           AND p.proname LIKE '\\_\\_reflex\\_union\\_mirror\\_clean\\_imv\\_\\_cte\\_pooled\\_%' ESCAPE '\\'",
+           AND p.proname LIKE '\\_\\_reflex\\_union\\_mirror\\_%clean\\_imv\\_\\_cte\\_pooled\\_%' ESCAPE '\\'",
     )
     .unwrap();
     assert!(before.unwrap_or(0) >= 6, "expected ≥6 mirror functions before drop, got {before:?}");
@@ -697,7 +701,7 @@ fn test_drop_cleans_up_union_mirror_functions() {
          FROM pg_proc p
          JOIN pg_namespace n ON n.oid = p.pronamespace
          WHERE n.nspname = 'public'
-           AND p.proname LIKE '\\_\\_reflex\\_union\\_mirror\\_clean\\_imv\\_\\_cte\\_pooled\\_%' ESCAPE '\\'",
+           AND p.proname LIKE '\\_\\_reflex\\_union\\_mirror\\_%clean\\_imv\\_\\_cte\\_pooled\\_%' ESCAPE '\\'",
     )
     .unwrap();
     assert_eq!(

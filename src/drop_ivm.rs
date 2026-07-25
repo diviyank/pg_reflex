@@ -431,21 +431,29 @@ fn drop_reflex_ivm_impl_inner(view_name: &str, cascade: bool, root: &str) -> &'s
             let safe_wrapper = crate::query_decomposer::sanitized_source_suffix(view_name);
             for i in 0..depends_on_imv.len() {
                 for op in &["ins", "del", "upd"] {
-                    // Must match `install_union_mirror_triggers`'s construction
-                    // exactly (op tag first, then `safe_identifier`-hashed) or
-                    // `DROP FUNCTION IF EXISTS` silently no-ops on the mismatch
-                    // and leaks the function — see
-                    // untreated_bugs/2026-07-25_union_mirror_function_name_collision.md.
+                    // Current construction: op tag first, then the whole raw
+                    // name `safe_identifier`-hashed, matching
+                    // `install_union_mirror_triggers` exactly (fixes
+                    // untreated_bugs/2026-07-25_union_mirror_function_name_collision.md).
+                    // A wrapper created by pg_reflex 1.11.0 or earlier used
+                    // the legacy `<wrapper>_<i>_<op>` order with no hashing,
+                    // so its functions were never renamed by this fix — drop
+                    // BOTH candidate names (IF EXISTS makes the mismatched
+                    // one a no-op) or upgraded databases leak the legacy
+                    // functions on every union-mirror wrapper drop.
                     let fn_name =
                         safe_identifier(&format!("__reflex_union_mirror_{op}_{safe_wrapper}_{i}"));
-                    detach_function_from_extension(client, &format!("public.{fn_name}"));
-                    client
-                        .update(
-                            &format!("DROP FUNCTION IF EXISTS public.{fn_name}() CASCADE"),
-                            None,
-                            &[],
-                        )
-                        .unwrap_or_report();
+                    let legacy_fn_name = format!("__reflex_union_mirror_{safe_wrapper}_{i}_{op}");
+                    for candidate in [&fn_name, &legacy_fn_name] {
+                        detach_function_from_extension(client, &format!("public.{candidate}"));
+                        client
+                            .update(
+                                &format!("DROP FUNCTION IF EXISTS public.{candidate}() CASCADE"),
+                                None,
+                                &[],
+                            )
+                            .unwrap_or_report();
+                    }
                 }
             }
         }

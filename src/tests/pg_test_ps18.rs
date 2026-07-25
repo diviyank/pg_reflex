@@ -171,3 +171,52 @@ fn ps18_drop_reflex_ivm_leaves_no_orphan_mirror_functions() {
     );
     assert_eq!(after, 0, "drop_reflex_ivm must not leak any union-mirror function");
 }
+
+/// (4) A wrapper created by pg_reflex 1.11.0 or earlier has its mirror
+/// functions named with the LEGACY `<wrapper>_<i>_<op>` order (tag last, no
+/// `safe_identifier` hash) — this fix only changes what NEW creates produce,
+/// so `drop_reflex_ivm` must still recognise and remove the legacy form or
+/// every already-deployed union-mirror wrapper leaks its functions on drop
+/// the moment the module is upgraded. Simulated by manually installing one
+/// legacy-named no-op function alongside a real (short-name, unhashed by
+/// either scheme) wrapper and asserting drop removes both forms.
+#[pg_test]
+fn ps18_drop_reflex_ivm_cleans_up_legacy_named_mirror_functions() {
+    Spi::run(
+        "CREATE TABLE ps18_legacy_a (id BIGINT, v NUMERIC); \
+         CREATE TABLE ps18_legacy_b (id BIGINT, v NUMERIC); \
+         SELECT create_reflex_ivm('ps18_legacy_wrap', \
+           'WITH u AS (SELECT id, v FROM ps18_legacy_a \
+                       UNION ALL SELECT id, v FROM ps18_legacy_b) \
+            SELECT id, SUM(v) AS total FROM u GROUP BY id', 'id')",
+    )
+    .expect("create CTE-over-UNION-ALL IMV");
+
+    // The wrapper is short, so the current (fixed) scheme produces unhashed,
+    // tag-first names. Install one further function per operand under the
+    // OLD tag-last name to stand in for a pre-1.11.1 leftover.
+    for i in 0..2 {
+        Spi::run(&format!(
+            "CREATE FUNCTION public.__reflex_union_mirror_ps18_legacy_wrap__cte_u_{i}_ins() \
+             RETURNS TRIGGER LANGUAGE plpgsql AS $body$ BEGIN RETURN NULL; END; $body$"
+        ))
+        .expect("install legacy-named stand-in function");
+    }
+
+    let legacy_before = ps18_count(
+        "SELECT count(*) FROM pg_proc \
+         WHERE proname LIKE '__reflex_union_mirror_ps18_legacy_wrap__cte_u_%_ins'",
+    );
+    assert_eq!(legacy_before, 2, "fixture precondition: 2 legacy-named stand-ins installed");
+
+    Spi::run("SELECT drop_reflex_ivm('ps18_legacy_wrap', TRUE)").expect("drop must not error");
+
+    let legacy_after = ps18_count(
+        "SELECT count(*) FROM pg_proc \
+         WHERE proname LIKE '__reflex_union_mirror_ps18_legacy_wrap%'",
+    );
+    assert_eq!(
+        legacy_after, 0,
+        "drop_reflex_ivm must clean up legacy-named (pre-1.11.1) mirror functions too"
+    );
+}
