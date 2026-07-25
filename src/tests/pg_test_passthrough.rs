@@ -827,6 +827,80 @@ fn pt_inplace_upsert_filter_and_keychange_oracle() {
     assert_imv_correct("up_v", sql);
 }
 
+/// End-to-end pin for the shape the 2026-07-25 nullable-explicit-key family of
+/// bugs attacks, on a PARTITIONED passthrough target: a unique key that mixes a
+/// NOT NULL column (`region`, which the partitioned target forces into the key)
+/// with a nullable one (`id`). A `(key) IN (SELECT ... FROM pt_old)` membership
+/// predicate is NULL-blind — `(NULL, 'A') IN (...)` is NULL, never TRUE — so any
+/// path that keys its delete-gone that way leaves the NULL-key target row behind
+/// as a phantom on a filter-exit, and as a phantom PLUS a duplicate on a
+/// NULL -> non-NULL key change.
+///
+/// This passes today because the cold partitioned UPDATE runs the standard
+/// keyed DELETE+INSERT body, whose predicate was made NULL-safe in
+/// `passthrough_keyed_delete_predicate`. It is kept as the end-to-end guard for
+/// the in-place variant of that body (`trigger::dispatch::InplaceSpec`), which
+/// is currently unreachable — see `untreated_bugs/` for why — and whose own
+/// membership predicate is NULL-safe as of this change. Revive that path with a
+/// NULL-blind predicate and this test goes red.
+#[pg_test]
+fn pt_inplace_nullable_key_cold_update_no_phantom_row() {
+    Spi::run(
+        "CREATE TABLE nkp_src (id BIGINT, region TEXT NOT NULL, status TEXT NOT NULL, qty BIGINT) PARTITION BY LIST (region)",
+    )
+    .expect("src");
+    for r in ["A", "B"] {
+        Spi::run(&format!(
+            "CREATE TABLE nkp_src_{} PARTITION OF nkp_src FOR VALUES IN ('{}')",
+            r, r
+        ))
+        .expect("p");
+    }
+    Spi::run("INSERT INTO nkp_src VALUES (1,'A','ok',5),(NULL,'A','ok',6),(3,'B','ok',7)")
+        .expect("seed");
+
+    let sql = "SELECT id, region, qty FROM nkp_src WHERE status = 'ok'";
+    let res = Spi::get_one::<String>(&format!(
+        "SELECT create_reflex_ivm('nkp_v', '{}', 'id,region', NULL, NULL, NULL, ARRAY['region'])",
+        sql.replace('\'', "''")
+    ))
+    .expect("create_reflex_ivm call")
+    .expect("create_reflex_ivm result");
+    assert_eq!(res, "CREATE REFLEX INCREMENTAL VIEW");
+
+    // Force the COLD in-place dispatch path (same guard as the sibling
+    // all-NOT-NULL-key test above); the HOT path would atomic-swap the whole
+    // child and never build the keyed membership predicate under test.
+    Spi::run("SELECT reflex_set_wipe_threshold('nkp_v', 2.0::NUMERIC)").expect("force cold");
+    assert_imv_correct("nkp_v", sql);
+
+    // (a) the NULL-key row leaves the WHERE filter: the recompute drops it, so
+    // delete-gone must remove its target counterpart.
+    Spi::run("UPDATE nkp_src SET status = 'archived' WHERE id IS NULL").expect("filter-exit");
+    assert_imv_correct("nkp_v", sql);
+    let phantom = Spi::get_one::<i64>("SELECT COUNT(*) FROM nkp_v WHERE id IS NULL")
+        .expect("q")
+        .expect("v");
+    assert_eq!(
+        phantom, 0,
+        "the NULL-key row left the filter — its target row must not survive as a phantom"
+    );
+
+    // (b) NULL -> non-NULL key change: the old NULL-key target row must go, or the
+    // IMV carries both it and the freshly inserted id=9 row.
+    Spi::run("INSERT INTO nkp_src VALUES (NULL,'B','ok',11)").expect("seed second null key");
+    assert_imv_correct("nkp_v", sql);
+    Spi::run("UPDATE nkp_src SET id = 9 WHERE id IS NULL AND region = 'B'").expect("key change");
+    assert_imv_correct("nkp_v", sql);
+    let total = Spi::get_one::<i64>("SELECT COUNT(*) FROM nkp_v")
+        .expect("q")
+        .expect("v");
+    assert_eq!(
+        total, 3,
+        "NULL -> non-NULL key change must not duplicate the row (id=1, id=3, id=9)"
+    );
+}
+
 /// 2026-07-25 nullable-explicit-key bug (untreated_bugs). An explicit passthrough
 /// unique key on a column that can be NULL in the target defeats the keyed
 /// `(key) IN (SELECT ...)` DELETE/UPDATE maintenance — `(NULL) IN (...)` is never
@@ -911,3 +985,4 @@ fn test_passthrough_explicit_not_null_key_still_accepted() {
         .expect("q").expect("v");
     assert_eq!(count, 1, "DELETE must remove the row, no phantom left behind");
 }
+

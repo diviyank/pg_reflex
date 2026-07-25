@@ -58,6 +58,23 @@ pub(crate) struct InplaceSpec<'a> {
     pub key_source_cols: &'a [String], // quoted unique-key cols in the SOURCE scratch (pt_old)
     pub non_key_cols: &'a [String],    // quoted NON-key target cols (resolved at codegen time)
     pub pt_old: &'a str,               // OLD-image scratch table (quoted, schema-qualified)
+    // Target columns proven NOT NULL, for gating the `pt_old` membership
+    // predicate: a key column that can be NULL makes the plain `(key) IN
+    // (SELECT ...)` form NULL-blind, so delete-gone silently keeps the row.
+    pub not_null_columns: &'a std::collections::HashSet<String>,
+}
+
+/// The `pt_old` membership half of the in-place delete-gone and its
+/// `assert_inplace_update` guard. NULL-safe when any key column is not proven
+/// NOT NULL, byte-identical to the plain `IN` form when they all are.
+fn inplace_pt_old_membership(spec: &InplaceSpec) -> String {
+    crate::trigger::scope::build_null_safe_membership_predicate(
+        "__t",
+        spec.key_target_cols,
+        spec.key_source_cols,
+        spec.pt_old,
+        spec.not_null_columns,
+    )
 }
 
 /// Render a list of statements as PL/pgSQL `EXECUTE` lines, one per statement,
@@ -390,7 +407,6 @@ pub(crate) fn build_partition_aware_dispatch_sql_strategy(
 /// Helper: build the in-place upsert + delete-gone cold section for LIST partitioning.
 fn build_inplace_cold_list_block(spec: &InplaceSpec, qv: &str, pcol: &str) -> String {
     let k_csv = spec.key_target_cols.join(", ");
-    let ksrc_csv = spec.key_source_cols.join(", ");
     let nk_csv = spec.non_key_cols.join(", ");
     let all_cols = if nk_csv.is_empty() {
         k_csv.clone()
@@ -415,7 +431,7 @@ fn build_inplace_cold_list_block(spec: &InplaceSpec, qv: &str, pcol: &str) -> St
         .collect::<Vec<_>>()
         .join(" AND ");
     let dn = spec.delta_new;
-    let pt_old = spec.pt_old;
+    let membership = inplace_pt_old_membership(spec);
     let assert_default = ASSERT_INPLACE_UPDATE_DEFAULT;
     let qvmsg = qv.replace('\'', "''");
 
@@ -424,13 +440,13 @@ fn build_inplace_cold_list_block(spec: &InplaceSpec, qv: &str, pcol: &str) -> St
         "             DROP TABLE IF EXISTS __reflex_pt_proj;\n\
          \x20            EXECUTE format($reflex_dn$CREATE TEMP TABLE __reflex_pt_proj ON COMMIT DROP AS SELECT * FROM ({dn}) __r WHERE __r.{pcol}::text <> ALL($1::text[]) AND __r.{pcol} = ANY($2::text[]::%s[])$reflex_dn$, _part_type) USING _hot_keys, _cold_keys;\n\
          \x20            EXECUTE $reflex_up$INSERT INTO {qv} ({all_cols}) SELECT {all_cols} FROM __reflex_pt_proj ON CONFLICT ({k_csv}) {on_conflict}$reflex_up$;\n\
-         \x20            EXECUTE format($reflex_del$DELETE FROM {qv} __t WHERE ({k_csv}) IN (SELECT {ksrc_csv} FROM {pt_old}) AND __t.{pcol}::text <> ALL($1::text[]) AND __t.{pcol} = ANY($2::text[]::%s[]) AND NOT EXISTS (SELECT 1 FROM __reflex_pt_proj __r WHERE {key_join})$reflex_del$, _part_type) USING _hot_keys, _cold_keys;\n\
+         \x20            EXECUTE format($reflex_del$DELETE FROM {qv} __t WHERE {membership} AND __t.{pcol}::text <> ALL($1::text[]) AND __t.{pcol} = ANY($2::text[]::%s[]) AND NOT EXISTS (SELECT 1 FROM __reflex_pt_proj __r WHERE {key_join})$reflex_del$, _part_type) USING _hot_keys, _cold_keys;\n\
          \x20            IF COALESCE(current_setting('reflex.assert_inplace_update', true)::bool, {assert_default}) THEN\n\
-         \x20                EXECUTE format($reflex_as$SELECT 1 WHERE EXISTS ((SELECT {k_csv} FROM {qv} __t WHERE ({k_csv}) IN (SELECT {ksrc_csv} FROM {pt_old}) AND __t.{pcol} = ANY($1::text[]::%1$s[]) EXCEPT ALL SELECT {k_csv} FROM __reflex_pt_proj) UNION ALL (SELECT {k_csv} FROM __reflex_pt_proj EXCEPT ALL SELECT {k_csv} FROM {qv} __t WHERE ({k_csv}) IN (SELECT {ksrc_csv} FROM {pt_old}) AND __t.{pcol} = ANY($1::text[]::%1$s[])))$reflex_as$, _part_type) INTO _assert_hit USING _cold_keys;\n\
+         \x20                EXECUTE format($reflex_as$SELECT 1 WHERE EXISTS ((SELECT {k_csv} FROM {qv} __t WHERE {membership} AND __t.{pcol} = ANY($1::text[]::%1$s[]) EXCEPT ALL SELECT {k_csv} FROM __reflex_pt_proj) UNION ALL (SELECT {k_csv} FROM __reflex_pt_proj EXCEPT ALL SELECT {k_csv} FROM {qv} __t WHERE {membership} AND __t.{pcol} = ANY($1::text[]::%1$s[])))$reflex_as$, _part_type) INTO _assert_hit USING _cold_keys;\n\
          \x20                IF _assert_hit IS NOT NULL THEN RAISE EXCEPTION 'pg_reflex in-place assertion failed for {qvmsg}: affected key set diverged'; END IF;\n\
          \x20            END IF;\n",
         dn=dn, pcol=pcol, qv=qv, k_csv=k_csv, all_cols=all_cols, on_conflict=on_conflict,
-        ksrc_csv=ksrc_csv, pt_old=pt_old, key_join=key_join,
+        membership=membership, key_join=key_join,
         assert_default=assert_default, qvmsg=qvmsg
     );
     block
@@ -445,7 +461,6 @@ fn build_inplace_cold_range_block(
     part_col_qualified: &str,
 ) -> String {
     let k_csv = spec.key_target_cols.join(", ");
-    let ksrc_csv = spec.key_source_cols.join(", ");
     let nk_csv = spec.non_key_cols.join(", ");
     let all_cols = if nk_csv.is_empty() {
         k_csv.clone()
@@ -470,7 +485,7 @@ fn build_inplace_cold_range_block(
         .collect::<Vec<_>>()
         .join(" AND ");
     let dn = spec.delta_new;
-    let pt_old = spec.pt_old;
+    let membership = inplace_pt_old_membership(spec);
     let assert_default = ASSERT_INPLACE_UPDATE_DEFAULT;
     let qvmsg = qv.replace('\'', "''");
     // For RANGE, the partition column reference is needed in three places (recompute projection, target delete, assert)
@@ -482,14 +497,14 @@ fn build_inplace_cold_range_block(
         "             DROP TABLE IF EXISTS __reflex_pt_proj;\n\
          \x20            CREATE TEMP TABLE __reflex_pt_proj ON COMMIT DROP AS SELECT * FROM ({dn}) __r WHERE public.__reflex_partition_child_for_key('{parent_lit}'::regclass, '{part_col_lit}', {pt_col_ref}::text)::text <> ALL($1::text[]);\n\
          \x20            EXECUTE $reflex_up$INSERT INTO {qv} ({all_cols}) SELECT {all_cols} FROM __reflex_pt_proj ON CONFLICT ({k_csv}) {on_conflict}$reflex_up$;\n\
-         \x20            DELETE FROM {qv} __t WHERE ({k_csv}) IN (SELECT {ksrc_csv} FROM {pt_old}) AND public.__reflex_partition_child_for_key('{parent_lit}'::regclass, '{part_col_lit}', {tgt_col_ref}::text)::text <> ALL($1::text[]) AND NOT EXISTS (SELECT 1 FROM __reflex_pt_proj __r WHERE {key_join}) USING _hot_child_names;\n\
+         \x20            DELETE FROM {qv} __t WHERE {membership} AND public.__reflex_partition_child_for_key('{parent_lit}'::regclass, '{part_col_lit}', {tgt_col_ref}::text)::text <> ALL($1::text[]) AND NOT EXISTS (SELECT 1 FROM __reflex_pt_proj __r WHERE {key_join}) USING _hot_child_names;\n\
          \x20            IF COALESCE(current_setting('reflex.assert_inplace_update', true)::bool, {assert_default}) THEN\n\
-         \x20                SELECT 1 WHERE EXISTS ((SELECT {k_csv} FROM {qv} __t WHERE ({k_csv}) IN (SELECT {ksrc_csv} FROM {pt_old}) AND public.__reflex_partition_child_for_key('{parent_lit}'::regclass, '{part_col_lit}', {tgt_col_ref}::text)::text <> ALL($1::text[]) EXCEPT ALL SELECT {k_csv} FROM __reflex_pt_proj) UNION ALL (SELECT {k_csv} FROM __reflex_pt_proj EXCEPT ALL SELECT {k_csv} FROM {qv} __t WHERE ({k_csv}) IN (SELECT {ksrc_csv} FROM {pt_old}) AND public.__reflex_partition_child_for_key('{parent_lit}'::regclass, '{part_col_lit}', {tgt_col_ref}::text)::text <> ALL($1::text[]))) INTO _assert_hit USING _hot_child_names;\n\
+         \x20                SELECT 1 WHERE EXISTS ((SELECT {k_csv} FROM {qv} __t WHERE {membership} AND public.__reflex_partition_child_for_key('{parent_lit}'::regclass, '{part_col_lit}', {tgt_col_ref}::text)::text <> ALL($1::text[]) EXCEPT ALL SELECT {k_csv} FROM __reflex_pt_proj) UNION ALL (SELECT {k_csv} FROM __reflex_pt_proj EXCEPT ALL SELECT {k_csv} FROM {qv} __t WHERE {membership} AND public.__reflex_partition_child_for_key('{parent_lit}'::regclass, '{part_col_lit}', {tgt_col_ref}::text)::text <> ALL($1::text[]))) INTO _assert_hit USING _hot_child_names;\n\
          \x20                IF _assert_hit IS NOT NULL THEN RAISE EXCEPTION 'pg_reflex in-place assertion failed for {qvmsg}: affected key set diverged'; END IF;\n\
          \x20            END IF;\n",
         dn=dn, parent_lit=parent_lit, part_col_lit=part_col_lit, pt_col_ref=pt_col_ref,
         qv=qv, all_cols=all_cols, on_conflict=on_conflict, k_csv=k_csv,
-        ksrc_csv=ksrc_csv, pt_old=pt_old, tgt_col_ref=tgt_col_ref, key_join=key_join,
+        membership=membership, tgt_col_ref=tgt_col_ref, key_join=key_join,
         assert_default=assert_default, qvmsg=qvmsg
     );
     block

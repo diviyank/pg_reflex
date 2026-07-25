@@ -653,3 +653,83 @@ fn pg_part_list_dispatch_sql_has_pruning_predicate() {
         "RANGE dispatch must not add value-ANY pruning (LIST-only); got:\n{range_sql}"
     );
 }
+
+/// The in-place cold body (`InplaceSpec`) keys its delete-gone and its
+/// `assert_inplace_update` guard by membership in the OLD-image scratch. That
+/// membership was a plain `(key) IN (SELECT ... FROM pt_old)` with no NOT-NULL
+/// gate, while the `NOT EXISTS` anti-join half of the very same statement
+/// already used `IS NOT DISTINCT FROM` — the 2026-07-25 nullable-key defect
+/// (`(NULL) IN (...)` is NULL, never TRUE) in its third location. Pinned at the
+/// codegen seam because the in-place body is not currently reachable end to end
+/// (see `untreated_bugs/`); the shape is what a revival would inherit.
+///
+/// Two properties, both required:
+///   * all key columns proven NOT NULL -> output is byte-identical to the plain
+///     `IN` form, so no plan changes for the case that was always correct;
+///   * any key column not proven NOT NULL -> the NULL-blind `IN` form is ABSENT
+///     and the per-column operators are `=` for the proven column and
+///     `IS NOT DISTINCT FROM` for the nullable one.
+#[pg_test]
+fn pg_part_inplace_membership_is_null_safe_when_key_nullable() {
+    let key_target: Vec<String> = vec!["\"id\"".into(), "\"region\"".into()];
+    let key_source: Vec<String> = vec!["\"id\"".into(), "\"region\"".into()];
+    let non_key: Vec<String> = vec!["\"qty\"".into()];
+    let pt_old = "\"__reflex_pt_old_v_src\"";
+    let delta_new = "SELECT id, region, qty FROM \"__reflex_pt_new_v_src\"";
+
+    let all_not_null: std::collections::HashSet<String> =
+        ["id".to_string(), "region".to_string()].into_iter().collect();
+    let region_only: std::collections::HashSet<String> =
+        ["region".to_string()].into_iter().collect();
+
+    let build = |nn: &std::collections::HashSet<String>, strategy: &str, part: &str| {
+        let spec = crate::trigger::InplaceSpec {
+            delta_new,
+            key_target_cols: &key_target,
+            key_source_cols: &key_source,
+            non_key_cols: &non_key,
+            pt_old,
+            not_null_columns: nn,
+        };
+        crate::trigger::build_passthrough_partition_dispatch_sql(
+            "v",
+            "\"public\".\"v\"",
+            "SELECT 1 AS pkey",
+            part,
+            &format!("\"public\".\"v\".\"{}\"", part),
+            strategy,
+            "DELETE FROM \"public\".\"v\" WHERE false",
+            "INSERT INTO \"public\".\"v\" SELECT 1",
+            Some(&spec),
+        )
+    };
+
+    let unsafe_form = "(\"id\", \"region\") IN (SELECT \"id\", \"region\" FROM \"__reflex_pt_old_v_src\")";
+
+    for (strategy, part) in [("LIST", "region"), ("RANGE", "region")] {
+        let proven = build(&all_not_null, strategy, part);
+        assert!(
+            proven.contains(unsafe_form),
+            "{strategy}: a fully NOT NULL key must keep the sargable IN form byte-identical; got:\n{proven}"
+        );
+
+        let nullable = build(&region_only, strategy, part);
+        assert!(
+            !nullable.contains(unsafe_form),
+            "{strategy}: a nullable key column must not be matched by the NULL-blind IN form; got:\n{nullable}"
+        );
+        assert!(
+            nullable.contains(
+                "EXISTS (SELECT 1 FROM \"__reflex_pt_old_v_src\" WHERE __t.\"id\" IS NOT DISTINCT FROM \"id\" AND __t.\"region\" = \"region\")"
+            ),
+            "{strategy}: the nullable key column needs IS NOT DISTINCT FROM and the proven one plain =; got:\n{nullable}"
+        );
+        // Both the delete-gone and the assert guard are keyed by this
+        // membership; gating only one of them still hides a phantom row.
+        assert_eq!(
+            nullable.matches("__t.\"id\" IS NOT DISTINCT FROM \"id\"").count(),
+            3,
+            "{strategy}: delete-gone + both assert branches must all be NULL-safe; got:\n{nullable}"
+        );
+    }
+}
