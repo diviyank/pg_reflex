@@ -1583,6 +1583,7 @@ mod tests {
     include!("tests/pg_test_psca_skip_signal.rs");
     include!("tests/pg_test_ps14.rs");
     include!("tests/pg_test_ps17.rs");
+    include!("tests/pg_test_ps18.rs");
 }
 
 /// This module is required by `cargo pgrx test` invocations.

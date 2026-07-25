@@ -158,12 +158,17 @@ impl Check for TriggerAttached {
             for (i, operand) in imv.depends_on.iter().enumerate() {
                 // PostgreSQL silently truncates a CREATE TRIGGER name >63 bytes
                 // to NAMEDATALEN-1 at a char boundary (`decompose.rs`'s own
-                // installer relies on this — it deliberately does NOT
-                // pre-truncate via `safe_identifier`, see the comment there).
-                // Comparing against the UNTRUNCATED name would report a
-                // healthy, longer-named wrapper's triggers as permanently
-                // "missing" — an unclearable finding, since the printed
-                // remedy re-creates the same (truncated) trigger every time.
+                // installer relies on this for TRIGGER names specifically —
+                // it deliberately does NOT pre-truncate them via
+                // `safe_identifier`, see the comment there; the mirror
+                // FUNCTION names are a different story and ARE
+                // `safe_identifier`-hashed, since triggers are scoped per
+                // relation and cannot collide across operands the way global
+                // function names can). Comparing against the UNTRUNCATED
+                // trigger name would report a healthy, longer-named
+                // wrapper's triggers as permanently "missing" — an
+                // unclearable finding, since the printed remedy re-creates
+                // the same (truncated) trigger every time.
                 let expected = [
                     crate::query_decomposer::truncate_identifier(format!(
                         "__reflex_union_mirror_ins_{}_{}",

@@ -5,8 +5,8 @@ use pgrx::prelude::*;
 use crate::query_decomposer::{
     affected_groups_table_name, canonical_source, delta_scratch_table_name,
     intermediate_table_name, passthrough_scratch_new_table_name,
-    passthrough_scratch_old_table_name, quote_identifier, shrunk_groups_table_name,
-    staging_delta_table_name,
+    passthrough_scratch_old_table_name, quote_identifier, safe_identifier,
+    shrunk_groups_table_name, staging_delta_table_name,
 };
 
 pub(crate) fn drop_reflex_ivm_impl(view_name: &str, cascade: bool) -> &'static str {
@@ -431,15 +431,29 @@ fn drop_reflex_ivm_impl_inner(view_name: &str, cascade: bool, root: &str) -> &'s
             let safe_wrapper = crate::query_decomposer::sanitized_source_suffix(view_name);
             for i in 0..depends_on_imv.len() {
                 for op in &["ins", "del", "upd"] {
-                    let fn_name = format!("__reflex_union_mirror_{safe_wrapper}_{i}_{op}");
-                    detach_function_from_extension(client, &format!("public.{fn_name}"));
-                    client
-                        .update(
-                            &format!("DROP FUNCTION IF EXISTS public.{fn_name}() CASCADE"),
-                            None,
-                            &[],
-                        )
-                        .unwrap_or_report();
+                    // Current construction: op tag first, then the whole raw
+                    // name `safe_identifier`-hashed, matching
+                    // `install_union_mirror_triggers` exactly (fixes
+                    // untreated_bugs/2026-07-25_union_mirror_function_name_collision.md).
+                    // A wrapper created by pg_reflex 1.11.0 or earlier used
+                    // the legacy `<wrapper>_<i>_<op>` order with no hashing,
+                    // so its functions were never renamed by this fix — drop
+                    // BOTH candidate names (IF EXISTS makes the mismatched
+                    // one a no-op) or upgraded databases leak the legacy
+                    // functions on every union-mirror wrapper drop.
+                    let fn_name =
+                        safe_identifier(&format!("__reflex_union_mirror_{op}_{safe_wrapper}_{i}"));
+                    let legacy_fn_name = format!("__reflex_union_mirror_{safe_wrapper}_{i}_{op}");
+                    for candidate in [&fn_name, &legacy_fn_name] {
+                        detach_function_from_extension(client, &format!("public.{candidate}"));
+                        client
+                            .update(
+                                &format!("DROP FUNCTION IF EXISTS public.{candidate}() CASCADE"),
+                                None,
+                                &[],
+                            )
+                            .unwrap_or_report();
+                    }
                 }
             }
         }
