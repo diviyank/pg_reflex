@@ -430,6 +430,11 @@ fn schema_prefix(view_name: &str, child: &str) -> String {
 pub(crate) struct PartitionNodeDdl {
     pub int_ddl: String,
     pub tgt_ddl: String,
+    /// Resolved immediate-parent qualified names the DDL above attaches
+    /// into — the exact scope a bound-collision check must search (direct
+    /// children of THIS parent only, never the whole multi-level subtree).
+    pub int_parent_qual: String,
+    pub tgt_parent_qual: String,
 }
 
 /// `anchor_root_bare` (quote-insensitively) the parent is the IMV root,
@@ -493,7 +498,12 @@ pub(crate) fn build_partition_node_ddl_pair(
         "{} IF NOT EXISTS {} PARTITION OF {} {}{}",
         create_kw, tgt_child, tgt_parent, node.bound_expr, sub_clause
     );
-    PartitionNodeDdl { int_ddl, tgt_ddl }
+    PartitionNodeDdl {
+        int_ddl,
+        tgt_ddl,
+        int_parent_qual: int_parent,
+        tgt_parent_qual: tgt_parent,
+    }
 }
 
 /// True when an existing IMV partition child's actual shape disagrees with the
@@ -1286,7 +1296,7 @@ pub(crate) fn reflex_sync_partitions_impl(view_name: &str, drop_orphans: bool) -
                     drop_bound_collision_orphan(
                         client,
                         schema,
-                        &int_children,
+                        &ddl.int_parent_qual,
                         &src_expected_int,
                         &int_name,
                         &node.bound_expr,
@@ -1301,7 +1311,7 @@ pub(crate) fn reflex_sync_partitions_impl(view_name: &str, drop_orphans: bool) -
                 drop_bound_collision_orphan(
                     client,
                     schema,
-                    &tgt_children,
+                    &ddl.tgt_parent_qual,
                     &src_expected_tgt,
                     &tgt_name,
                     &node.bound_expr,
@@ -1366,19 +1376,24 @@ pub(crate) fn reflex_sync_partitions_impl(view_name: &str, drop_orphans: bool) -
     }
 }
 
-/// Drop a CONFIRMED orphan sibling of `about_to_attach` whose `FOR VALUES`
-/// bound is byte-identical to it: a `CREATE TABLE ... PARTITION OF ... FOR
-/// VALUES <bound>` for `about_to_attach` would otherwise raise "would overlap
-/// partition" against it. Narrower than a `drop_orphans` sweep — `expected`
-/// gates it to a child that maps to NO live source leaf, so this never
-/// touches a partition a live source still backs, regardless of the caller's
-/// own `drop_orphans` flag. Mirrors the F3 heal in
-/// `execute_partition_swap_for_child`; `siblings` and `expected` are the
-/// int/tgt child list and expected-name set for the namespace being healed.
+/// Drop a CONFIRMED orphan DIRECT CHILD of `parent_qual` whose `FOR VALUES`
+/// bound is byte-identical to `about_to_attach`'s: a `CREATE TABLE ...
+/// PARTITION OF <parent_qual> ... FOR VALUES <bound>` would otherwise raise
+/// "would overlap partition" against it. Scoped to `list_partition_children`
+/// (direct children of this ONE parent) rather than the whole multi-level
+/// subtree — a flat whole-tree scan would treat unrelated leaves under
+/// DIFFERENT branches that happen to share a repeated sub-partition bound
+/// literal (e.g. LIST(region) -> LIST(quarter) with 'Q1'..'Q4' under every
+/// region) as colliding siblings and drop live, unrelated data. Narrower than
+/// a `drop_orphans` sweep too — `expected` gates it to a child that maps to
+/// NO live source leaf, so this never touches a partition a live source still
+/// backs, regardless of the caller's own `drop_orphans` flag. Mirrors the F3
+/// heal in `execute_partition_swap_for_child` (which is itself already
+/// correctly parent-scoped via `list_partition_children`).
 fn drop_bound_collision_orphan(
     client: &mut pgrx::spi::SpiClient<'_>,
     schema: &str,
-    siblings: &[PartitionNode],
+    parent_qual: &str,
     expected: &std::collections::HashSet<String>,
     about_to_attach: &str,
     bound_expr: &str,
@@ -1386,12 +1401,11 @@ fn drop_bound_collision_orphan(
     if bound_expr.is_empty() {
         return Ok(());
     }
-    for child in siblings {
+    for child in list_partition_children(client, parent_qual) {
         if child.bare_name == about_to_attach || expected.contains(&child.bare_name) {
             continue;
         }
-        let child_bound = read_partition_bound(client, schema, &child.bare_name);
-        if !child_bound.is_empty() && child_bound == bound_expr {
+        if !child.bound_expr.is_empty() && child.bound_expr == bound_expr {
             let q = format!(
                 "DROP TABLE IF EXISTS \"{}\".\"{}\" CASCADE",
                 schema, child.bare_name
