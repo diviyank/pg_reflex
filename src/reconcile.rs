@@ -817,7 +817,7 @@ pub(crate) fn reflex_reconcile_with_orphans(view_name: &str, drop_orphans: bool)
             // still warns.
             set_internal_reconcile_root(Some(view_name));
             for child in &children {
-                let result = reconcile_generated_child_without_propagating(child);
+                let result = reconcile_generated_child_without_propagating(child, false);
                 if result.starts_with("ERROR") {
                     child_failed = true;
                     warning!(
@@ -834,7 +834,7 @@ pub(crate) fn reflex_reconcile_with_orphans(view_name: &str, drop_orphans: bool)
         }
     }
 
-    let own = reconcile_one(view_name, drop_orphans);
+    let own = reconcile_named_node(view_name, drop_orphans);
 
     // The parent is rebuilt even when a child failed — that still repairs any
     // drift local to the parent, and leaving it untouched would be no fresher.
@@ -1135,7 +1135,13 @@ fn warn_about_skipped_decomposed_nodes(view_name: &str) {
 /// DEFERRED double-count this function exists to prevent. The codebase persists
 /// sub-IMV sources double-quoted for exactly this reason
 /// (`query_decomposer.rs:18-23`).
-fn reconcile_generated_child_without_propagating(child: &str) -> &'static str {
+///
+/// `drop_orphans` is forwarded to `reconcile_one`. The chain descent and the
+/// DEFERRED cross-source guard pass `false` (neither caller was asked to drop
+/// partitions); the direct-entry operand routing forwards whatever the operator
+/// asked for, so naming an operand keeps the same orphan semantics as naming any
+/// other IMV.
+fn reconcile_generated_child_without_propagating(child: &str, drop_orphans: bool) -> &'static str {
     let quoted = quote_identifier(child);
     let triggerable = Spi::get_one::<bool>(&format!(
         "SELECT COALESCE((SELECT relkind IN ('r','p') FROM pg_class \
@@ -1146,12 +1152,63 @@ fn reconcile_generated_child_without_propagating(child: &str) -> &'static str {
     .unwrap_or(false);
 
     if !triggerable {
-        return reconcile_one(child, false);
+        return reconcile_one(child, drop_orphans);
     }
 
     Spi::run(&format!("ALTER TABLE {} DISABLE TRIGGER USER", quoted)).unwrap_or_report();
-    let result = reconcile_one(child, false);
+    let result = reconcile_one(child, drop_orphans);
     Spi::run(&format!("ALTER TABLE {} ENABLE TRIGGER USER", quoted)).unwrap_or_report();
+    result
+}
+
+/// Rebuild the NAMED node of a [`reflex_reconcile_with_orphans`] call, routing a
+/// UNION-ALL operand of a MATERIALISED wrapper through the trigger-suppressed
+/// rebuild plus an explicit wrapper-slice resync.
+///
+/// `reconcile_one` rebuilds with `TRUNCATE` + `INSERT`. An operand carries an
+/// `__reflex_union_mirror_{ins,del,upd}_*` trigger mirroring its rows into the
+/// wrapper's `__reflex_src_idx` slice, and that mirror has no `TRUNCATE` handler:
+/// the TRUNCATE removes nothing from the wrapper while the INSERT re-appends the
+/// operand's whole row set, silently DOUBLING the slice and every consumer of it.
+/// The chain descent never hit this (it suppresses triggers first), but three
+/// direct callers do — an operator naming a `…__union_N` node, `reflex_doctor`'s
+/// F4 repair, and `reflex_scheduled_reconcile`, which reconciles operands
+/// STANDALONE by design (they are `REBUILDABLE_NODE` and deliberately not
+/// "covered" by the wrapper above them), making every unattended drift sweep over
+/// such a chain double the wrapper. This is the 2026-07-24 report's residual, and
+/// the same mechanism the DEFERRED cross-source guard already routes around via
+/// [`reconcile_generated_child_for_cross_source_guard`].
+///
+/// Any other target — including a plain CTE sub-IMV, and a VIEW-based
+/// set-op/DISTINCT-ON/window wrapper's operand (that wrapper stores nothing, so
+/// there is no slice to double) — is byte-identical to before: one extra registry
+/// probe, then the same `reconcile_one`.
+///
+/// Brackets with the WRAPPER as reconcile root, not the operand: the
+/// DISABLE/ENABLE TRIGGER trips `reflex_on_ddl_command_end`'s alter_source alarm
+/// for every IMV whose `depends_on` names the operand — which for a materialised
+/// union-ALL operand is the wrapper — and under `alter_source_policy = 'error'`
+/// that alarm RAISES, turning a plain `reflex_reconcile` into an aborted
+/// transaction. The root also prefix-matches `<wrapper>__%`, covering the operand
+/// itself, while any UNRELATED consumer of the operand still gets its legitimate
+/// stale warning.
+fn reconcile_named_node(view_name: &str, drop_orphans: bool) -> &'static str {
+    let Some((wrapper, operand_idx)) =
+        Spi::connect(|client| materialized_union_wrapper_of(client, view_name))
+    else {
+        return reconcile_one(view_name, drop_orphans);
+    };
+
+    set_internal_reconcile_root(Some(&wrapper));
+    let result = reconcile_generated_child_without_propagating(view_name, drop_orphans);
+    set_internal_reconcile_root(None);
+    // A failed rebuild leaves the operand's contents undefined; resyncing the
+    // wrapper from it would publish that. Leave the wrapper's existing slice
+    // alone and report the failure — stale beats wrong.
+    if result.starts_with("ERROR") {
+        return result;
+    }
+    resync_wrapper_operand_slice(&wrapper, operand_idx, view_name);
     result
 }
 
@@ -1178,14 +1235,21 @@ fn reconcile_generated_child_without_propagating(child: &str) -> &'static str {
 /// needs no resync), additionally replaces that wrapper's slice for `child`
 /// from the freshly rebuilt operand. That resync is exactly what suppressing
 /// propagation otherwise leaves undone, and it is the one piece
-/// [`reconcile_generated_child_without_propagating`]'s OTHER caller
-/// (`reflex_reconcile`'s top-down chain rebuild) does not need: a wrapper is
-/// never itself `REBUILDABLE_NODE`, so that caller never reconciles one, and
-/// nothing else resyncs it either — see `pg_scheduled_reconcile_reconciles_operands_below_decomposed_wrapper`
+/// [`reconcile_generated_child_without_propagating`]'s CHAIN-DESCENT caller
+/// (`reflex_reconcile`'s top-down rebuild) does not need: that descent
+/// (`generated_dependencies_shallowest_first`) stops at a decomposed node, so it
+/// never reaches an operand to rebuild in the first place — see
+/// `pg_scheduled_reconcile_reconciles_operands_below_decomposed_wrapper`
 /// (`src/tests/pg_test_decomposed_chain.rs`), which pins that `reflex_reconcile`
 /// on the wrapper's own top-level consumer halts AT the wrapper.
+///
+/// [`reconcile_named_node`] does the same suppress-then-resync for the DIRECT
+/// entry points (`reflex_reconcile` / `reflex_rebuild_imv` / the scheduled sweep,
+/// which reach an operand by NAME rather than by descent). The two paths are
+/// deliberately separate: this one is reached from inside a COMMIT trigger and
+/// has its own failure contract with the deferred flush.
 pub(crate) fn reconcile_generated_child_for_cross_source_guard(child: &str) -> &'static str {
-    let result = reconcile_generated_child_without_propagating(child);
+    let result = reconcile_generated_child_without_propagating(child, false);
     if result.starts_with("ERROR") {
         return result;
     }
