@@ -3320,6 +3320,51 @@ fn full_outer_secondary_passthrough_falls_back_to_rebuild() {
     );
 }
 
+/// 2026-07-25 ljgroup bug (untreated_bugs): an aggregate outer-join secondary
+/// with `GROUP BY <primary>.<col>` looks "stable" to both the join-key-scoped
+/// fast path and the STABLE-column fallback, because each only checks that the
+/// group column's qualifier isn't the *mutated* table — but a FULL JOIN's
+/// unmatched-row semantics mean a write to the secondary can still change
+/// which primary rows exist in the result (a right-only insert with no
+/// matching left row surfaces a brand-new group), which neither scoped path
+/// accounts for. The aggregate branch must fall back to the same full
+/// intermediate+target rebuild the passthrough branch already uses for FULL
+/// JOIN, regardless of which group-by qualifier scoping would otherwise pick.
+#[test]
+fn full_outer_secondary_aggregate_falls_back_to_rebuild() {
+    let mut plan = simple_plan();
+    plan.group_by_columns = vec!["s.city".to_string()];
+    plan.source_join_keys = std::collections::HashMap::from([(
+        "caav".to_string(),
+        vec![("city".to_string(), "city".to_string())],
+    )]);
+    let grp_cols = Some(vec!["city".to_string()]);
+    let mut stmts = Vec::new();
+    outer_join_secondary_stmts(
+        "fc_view",
+        "caav",
+        "UPDATE",
+        "SELECT s.city, SUM(s.amount) AS total FROM s FULL OUTER JOIN caav ON caav.city = s.city GROUP BY s.city",
+        "",
+        &plan,
+        &grp_cols,
+        "__int",
+        "__aff",
+        "__reflex_old_caav",
+        "__reflex_new_caav",
+        &mut stmts,
+    );
+    let joined = stmts.join("\n");
+    assert!(
+        joined.contains("TRUNCATE __int") && joined.contains("TRUNCATE \"fc_view\""),
+        "FULL OUTER aggregate secondary must fall back to full rebuild, not scoped recompute: {joined}"
+    );
+    assert!(
+        !joined.contains(" IN (") && !joined.contains("WHERE \"city\""),
+        "FULL OUTER must NOT emit a scoped/keyed recompute: {joined}"
+    );
+}
+
 #[test]
 fn partition_dispatch_keeps_hot_swap_and_trip_cap_markers() {
     let sql = build_partition_aware_dispatch_sql_strategy(
