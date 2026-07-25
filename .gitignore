@@ -3,6 +3,7 @@
 /target
 target-*/
 .target/
+.target-*/
 .worktrees/
 *.iml
 **/*.rs.bk
