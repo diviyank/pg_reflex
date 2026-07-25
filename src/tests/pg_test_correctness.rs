@@ -4616,3 +4616,77 @@ fn test_correctness_min_max_topk_update_unshrunk_null_group() {
         140, "group 'a' MAX must stay 140",
     );
 }
+
+/// PS-5 (2026-07-25) — the correctness half of the keyed outer-join-secondary
+/// membership gate. The gate splits one statement into a fast/safe PAIR whose
+/// two guards must be exact complements, so this drives the secondary through
+/// both branches and across the NULL boundary in both directions, diffing
+/// against a fresh recompute each time.
+///
+/// SELF-MUTATION RESULT — what this does and does not pin. Breaking the
+/// complement so BOTH variants fire takes it RED (`duplicate key value violates
+/// unique constraint "__reflex_uk_ps5b_v"`), which is the real failure mode the
+/// pair introduces. Dropping the NULL-safe variant outright leaves it GREEN, and
+/// that is not a weak fixture: on an equi-join secondary mapping `s.k = p.k`
+/// never matches a NULL, so a NULL changed-key can never require a target row to
+/// be rebuilt. The NULL-safe branch is defensive on this path — which is exactly
+/// what made the pre-fix code so expensive, since it paid the non-sargable form
+/// UNCONDITIONALLY for a branch that changes no output here. NULL-blindness of
+/// the fast form is pinned at the codegen seam instead
+/// (`unit_trigger.rs::membership_gate_*`), where it is observable.
+#[pg_test]
+fn test_correctness_keyed_secondary_membership_gate_null_boundary() {
+    Spi::run("CREATE TABLE ps5b_prim (k INT, payload TEXT)").expect("prim");
+    Spi::run("CREATE UNIQUE INDEX ON ps5b_prim (k)").expect("prim idx");
+    Spi::run("CREATE TABLE ps5b_sec (k INT, extra TEXT)").expect("sec");
+    Spi::run("CREATE UNIQUE INDEX ON ps5b_sec (k)").expect("sec idx");
+    Spi::run("INSERT INTO ps5b_prim VALUES (1,'p1'),(2,'p2'),(3,'p3'),(NULL,'pnull')")
+        .expect("seed prim");
+    Spi::run("INSERT INTO ps5b_sec VALUES (1,'s1'),(2,'s2'),(NULL,'snull')").expect("seed sec");
+
+    let fresh =
+        "SELECT p.k, p.payload, s.extra FROM ps5b_prim p LEFT JOIN ps5b_sec s ON s.k = p.k";
+    let res = Spi::get_one::<String>(&format!(
+        "SELECT create_reflex_ivm('ps5b_v', '{}', 'k')",
+        fresh.replace('\'', "''")
+    ))
+    .expect("create call")
+    .expect("create result");
+    assert_eq!(res, "CREATE REFLEX INCREMENTAL VIEW");
+    assert_imv_correct("ps5b_v", fresh);
+
+    // 1. NULL-free delta on the secondary — the sargable branch.
+    Spi::run("INSERT INTO ps5b_sec VALUES (3,'s3')").expect("insert non-null");
+    assert_imv_correct("ps5b_v", fresh);
+
+    // 2. NULL-ONLY delta. The killer case: the sargable `IN` matches nothing
+    //    here, so an ungated fast form would leave the NULL-key row stale.
+    Spi::run("UPDATE ps5b_sec SET extra = 'snull2' WHERE k IS NULL").expect("null-only update");
+    assert_imv_correct("ps5b_v", fresh);
+
+    // 3. Mixed NULL + non-NULL in ONE statement: the NULL-safe branch is taken
+    //    and must still maintain the non-NULL keys in the same delta.
+    Spi::run("UPDATE ps5b_sec SET extra = extra || 'x' WHERE k IS NULL OR k = 1")
+        .expect("mixed update");
+    assert_imv_correct("ps5b_v", fresh);
+
+    // 4. Cross the NULL boundary in both directions.
+    Spi::run("UPDATE ps5b_sec SET k = NULL WHERE k = 2").expect("to null");
+    assert_imv_correct("ps5b_v", fresh);
+    Spi::run("UPDATE ps5b_sec SET k = 7 WHERE k IS NULL AND extra LIKE 'snull%'")
+        .expect("from null");
+    assert_imv_correct("ps5b_v", fresh);
+
+    // 5. DELETE a NULL key — the DELETE half of the gated pair.
+    Spi::run("DELETE FROM ps5b_sec WHERE k IS NULL").expect("delete null key");
+    assert_imv_correct("ps5b_v", fresh);
+
+    // 6. Recreate a NULL key from empty — the INSERT half.
+    Spi::run("INSERT INTO ps5b_sec VALUES (NULL,'snull3')").expect("recreate null key");
+    assert_imv_correct("ps5b_v", fresh);
+
+    // 7. Back to a plain NULL-free delta: the gate must flip back to sargable
+    //    and still be correct.
+    Spi::run("UPDATE ps5b_sec SET extra = 's1_final' WHERE k = 1").expect("final non-null");
+    assert_imv_correct("ps5b_v", fresh);
+}

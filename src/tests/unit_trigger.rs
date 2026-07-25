@@ -3280,18 +3280,289 @@ fn secondary_passthrough_nullable_key_uses_null_safe_match() {
         "__reflex_new_caav",
         &mut stmts,
     );
+    // PS-5 (2026-07-25) strengthened this from "the IN form must be ABSENT" to
+    // "the IN form may appear ONLY under the no-NULL-key gate". The original
+    // property (a NULL key is never matched by a bare `IN`) is preserved and
+    // tightened: an ungated `IN` anywhere is still a failure, and the NULL-safe
+    // variant must additionally exist and be gated as its exact complement.
     let joined = stmts.join("\n");
+    let gate = "EXISTS (SELECT 1 FROM (SELECT \"product_id\" AS \"product_id\", \
+                \"location_id\" AS \"location_id\" FROM \"__reflex_old_caav\" UNION SELECT \
+                \"product_id\" AS \"product_id\", \"location_id\" AS \"location_id\" FROM \
+                \"__reflex_new_caav\") AS __ng WHERE __ng.\"product_id\" IS NULL OR \
+                __ng.\"location_id\" IS NULL)";
+
+    for stmt in &stmts {
+        if stmt.contains("(\"product_id\", \"location_id\") IN") {
+            assert!(
+                stmt.ends_with(&format!("AND NOT {gate}")),
+                "the NULL-unsafe IN-list form is only permitted under the \
+                 no-NULL-key gate, found ungated: {stmt}"
+            );
+        } else {
+            assert!(
+                stmt.contains("IS NOT DISTINCT FROM") && stmt.ends_with(&format!("AND {gate}")),
+                "the non-IN variant must be the NULL-safe match gated on the \
+                 changed keys HAVING a NULL: {stmt}"
+            );
+        }
+    }
     assert!(
-        !joined.contains("(\"product_id\", \"location_id\") IN"),
-        "an unproven key must not use the NULL-unsafe IN-list form: {joined}"
+        stmts.iter().any(|s| s.contains("IS NOT DISTINCT FROM")),
+        "an unproven key must still get a NULL-safe match: {joined}"
     );
     assert!(
-        joined.contains("IS NOT DISTINCT FROM"),
-        "an unproven key must use the NULL-safe match: {joined}"
+        stmts
+            .iter()
+            .any(|s| s.contains("(\"product_id\", \"location_id\") IN")),
+        "an unproven key must ALSO get a sargable variant — without it the flush \
+         nested-loops the whole base relation (579x measured): {joined}"
+    );
+
+    // Exactly one gated pair per statement kind, and every DELETE must precede
+    // every INSERT: a safe-variant DELETE running after a fast-variant INSERT
+    // would delete rows the INSERT had just written.
+    let dels: Vec<usize> = stmts
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.starts_with("DELETE FROM \"fc_view\" WHERE "))
+        .map(|(i, _)| i)
+        .collect();
+    let inss: Vec<usize> = stmts
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.starts_with("INSERT INTO \"fc_view\" "))
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(
+        dels,
+        vec![0, 1],
+        "expected a gated DELETE pair first: {joined}"
+    );
+    assert_eq!(
+        inss,
+        vec![2, 3],
+        "expected a gated INSERT pair after: {joined}"
+    );
+}
+
+// =============================================================================
+// PS-5 (2026-07-25) — the passthrough membership predicate's runtime gate.
+//
+// `build_null_safe_membership_predicate` made a STATIC-only choice: sargable
+// `IN` when every key column is provably NOT NULL, else an UNCONDITIONAL
+// `EXISTS (... IS NOT DISTINCT FROM ...)`. For the keyed outer-join secondary
+// the target columns come off the NULLABLE side, so `provably_not_null_key_
+// columns` can never prove them and the expensive form was the ROUTINE case,
+// not an edge case — matching the FULL base relation against the transition
+// delta by nested loop. Measured on PG 18.4, 500k base rows x 2k changed keys:
+// 23,698 ms (`Rows Removed by Join Filter: 489,995,000`) vs 40.9 ms for `IN`.
+//
+// Fix: the same gated fast/safe pair `merge::null_safe_in_gated` already uses.
+// =============================================================================
+
+fn ck_body() -> String {
+    "(SELECT \"k\" FROM \"__reflex_old_s\" UNION SELECT \"k\" FROM \"__reflex_new_s\")".to_string()
+}
+
+/// A key column that is not provably NOT NULL must yield BOTH a sargable `IN`
+/// variant gated on the changed keys holding no NULL, and the NULL-safe variant
+/// gated on the complement. Emitting only the safe one is the perf cliff;
+/// emitting only the fast one would silently drop NULL-keyed rows.
+#[test]
+fn membership_gate_nullable_key_emits_both_variants() {
+    let cols = vec!["\"k\"".to_string()];
+    let m = build_null_safe_membership_predicate_gated(
+        "\"v\"",
+        &cols,
+        &cols,
+        &ck_body(),
+        &std::collections::HashSet::new(),
+    );
+
+    assert!(
+        m.fast.contains("\"k\" IN (SELECT \"k\" FROM") && m.fast.contains("__ck"),
+        "fast variant must be the sargable IN form over the __ck alias: {}",
+        m.fast
     );
     assert!(
-        joined.contains("EXISTS ("),
-        "the NULL-safe match must be a correlated EXISTS: {joined}"
+        !m.fast.contains("IS NOT DISTINCT FROM"),
+        "fast variant must carry no non-sargable operator: {}",
+        m.fast
+    );
+    assert!(
+        m.fast.contains(&format!(
+            "AND NOT EXISTS (SELECT 1 FROM {} AS __ng",
+            ck_body()
+        )),
+        "fast variant must be gated on the changed keys having NO NULL: {}",
+        m.fast
+    );
+
+    let safe = m
+        .safe
+        .as_ref()
+        .expect("a nullable key MUST get a safe variant");
+    assert!(
+        safe.contains("\"v\".\"k\" IS NOT DISTINCT FROM \"k\""),
+        "safe variant must keep the NULL-safe operator: {safe}"
+    );
+    assert!(
+        safe.contains(&format!("AND EXISTS (SELECT 1 FROM {} AS __ng", ck_body())),
+        "safe variant must be gated on the changed keys HAVING a NULL: {safe}"
+    );
+}
+
+/// The gate must be UNCORRELATED — it may reference only `__ng`. That is what
+/// makes PostgreSQL evaluate it once as an InitPlan and hoist it into a
+/// `One-Time Filter`, so the untaken variant reports `(never executed)`. A
+/// correlated gate would be re-evaluated per outer row and buy nothing.
+#[test]
+fn membership_gate_probe_is_uncorrelated() {
+    let cols = vec!["\"k\"".to_string()];
+    let m = build_null_safe_membership_predicate_gated(
+        "\"v\"",
+        &cols,
+        &cols,
+        &ck_body(),
+        &std::collections::HashSet::new(),
+    );
+    for variant in [m.fast.as_str(), m.safe.as_deref().unwrap()] {
+        let after = variant
+            .split(" AS __ng WHERE ")
+            .nth(1)
+            .expect("gate present");
+        let body = &after[..after.find(')').expect("gate closes")];
+        assert!(
+            !body.contains("\"v\".") && !body.contains("__ck.") && !body.contains("__bq."),
+            "gate must reference only __ng, got: {body}"
+        );
+    }
+}
+
+/// The two gates must be exact complements so exactly one variant ever does
+/// work. If both could fire, the paired INSERT would double-insert every
+/// changed key.
+#[test]
+fn membership_gate_gates_are_exact_complements() {
+    let cols = vec!["\"k\"".to_string()];
+    let m = build_null_safe_membership_predicate_gated(
+        "\"v\"",
+        &cols,
+        &cols,
+        &ck_body(),
+        &std::collections::HashSet::new(),
+    );
+    let gate = format!(
+        "EXISTS (SELECT 1 FROM {} AS __ng WHERE __ng.\"k\" IS NULL)",
+        ck_body()
+    );
+    assert!(
+        m.fast.ends_with(&format!("AND NOT {gate}")),
+        "fast gate must negate the safe gate: {}",
+        m.fast
+    );
+    assert!(
+        m.safe.as_ref().unwrap().ends_with(&format!("AND {gate}")),
+        "safe gate must be the positive form: {:?}",
+        m.safe
+    );
+}
+
+/// An all-NOT-NULL key already gets the sargable `IN`, so it needs no gate and
+/// no second statement. This case must stay BYTE-IDENTICAL to the pre-PS-5
+/// output — every existing NOT NULL passthrough IMV must see no SQL change.
+#[test]
+fn membership_gate_not_null_key_is_byte_identical_and_ungated() {
+    let cols = vec!["\"k\"".to_string()];
+    let mut not_null = std::collections::HashSet::new();
+    not_null.insert("k".to_string());
+    let m =
+        build_null_safe_membership_predicate_gated("\"v\"", &cols, &cols, &ck_body(), &not_null);
+    assert!(
+        m.safe.is_none(),
+        "a NOT NULL key must not get a second variant"
+    );
+    assert!(
+        !m.fast.contains("__ng"),
+        "a NOT NULL key must not get a gate: {}",
+        m.fast
+    );
+    assert_eq!(
+        m.fast,
+        build_null_safe_membership_predicate(
+            "\"v\"",
+            &cols,
+            &cols,
+            &format!("{} __ck", ck_body()),
+            &not_null
+        ),
+        "NOT NULL codegen must be byte-for-byte unchanged"
+    );
+}
+
+/// The gate names SOURCE columns (it probes the membership relation) but
+/// nullability is only known for TARGET names, and the two lists can differ
+/// when the IMV aliases a join column. The pairing must be POSITIONAL: gate on
+/// the source column whose *target* counterpart is unproven, and on no other.
+/// Getting this backwards would probe a column that may not exist in `__ck`,
+/// or silently skip the one that can actually be NULL.
+#[test]
+fn membership_gate_pairs_target_nullability_onto_source_column_names() {
+    let target_cols = vec!["\"t_proven\"".to_string(), "\"t_unproven\"".to_string()];
+    let source_cols = vec!["\"s_proven\"".to_string(), "\"s_unproven\"".to_string()];
+    let mut not_null = std::collections::HashSet::new();
+    not_null.insert("t_proven".to_string());
+
+    let m = build_null_safe_membership_predicate_gated(
+        "\"v\"",
+        &target_cols,
+        &source_cols,
+        &ck_body(),
+        &not_null,
+    );
+    assert!(
+        m.fast.contains("__ng.\"s_unproven\" IS NULL"),
+        "gate must probe the SOURCE name of the unproven target column: {}",
+        m.fast
+    );
+    assert!(
+        !m.fast.contains("__ng.\"s_proven\" IS NULL")
+            && !m.fast.contains("__ng.\"t_unproven\" IS NULL"),
+        "gate must not probe the proven column, nor use TARGET names: {}",
+        m.fast
+    );
+    // The safe variant keeps the mixed per-column operators it always had.
+    let safe = m.safe.as_ref().unwrap();
+    assert!(
+        safe.contains("\"v\".\"t_proven\" = \"s_proven\"")
+            && safe.contains("\"v\".\"t_unproven\" IS NOT DISTINCT FROM \"s_unproven\""),
+        "safe variant must keep per-column operator selection: {safe}"
+    );
+}
+
+/// Multi-column: a NULL in ANY key column makes the fast form wrong, so the
+/// gate must OR every unproven column together.
+#[test]
+fn membership_gate_multi_column_ors_every_unproven_column() {
+    let cols = vec!["\"a\"".to_string(), "\"b\"".to_string()];
+    let m = build_null_safe_membership_predicate_gated(
+        "\"v\"",
+        &cols,
+        &cols,
+        &ck_body(),
+        &std::collections::HashSet::new(),
+    );
+    assert!(
+        m.fast.contains("__ng.\"a\" IS NULL OR __ng.\"b\" IS NULL"),
+        "gate must OR every unproven column: {}",
+        m.fast
+    );
+    assert!(
+        m.fast
+            .contains("(\"a\", \"b\") IN (SELECT \"a\", \"b\" FROM"),
+        "fast variant must use the row-wise IN form: {}",
+        m.fast
     );
 }
 
