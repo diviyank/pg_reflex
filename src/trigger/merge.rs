@@ -984,7 +984,12 @@ pub(crate) fn null_safe_in(
 /// gating `Result / One-Time Filter` above the whole join, so the untaken
 /// variant's subtree is reported `(never executed)`. A correlated probe would be
 /// re-evaluated per outer row and buy nothing.
-fn affected_null_key_gate(
+///
+/// `affected_tbl` is spliced into `FROM <affected_tbl> AS __ng`, so it may be a
+/// table reference OR a parenthesised derived table — which is what lets
+/// `trigger::scope`'s passthrough membership gate reuse this over the
+/// `(OLD ∪ NEW)` transition subquery rather than a physical affected table.
+pub(crate) fn affected_null_key_gate(
     affected_tbl: &str,
     affected_cols: &[String],
     not_null_columns: &std::collections::HashSet<String>,

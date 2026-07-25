@@ -67,6 +67,17 @@ pub(crate) struct InplaceSpec<'a> {
 /// The `pt_old` membership half of the in-place delete-gone and its
 /// `assert_inplace_update` guard. NULL-safe when any key column is not proven
 /// NOT NULL, byte-identical to the plain `IN` form when they all are.
+///
+/// PS-5 deliberately left this on the ungated static form. It is the one
+/// membership site that is CURRENTLY UNREACHABLE — `resolve_inplace_non_key_cols`
+/// always returns empty (see
+/// `untreated_bugs/2026-07-25_inplace_partitioned_upsert_path_dead_and_broken.md`),
+/// so `InplaceSpec` is never constructed and this never executes, which makes its
+/// plan quality moot and a live before/after measurement impossible. If that path
+/// is ever revived, switch to `scope::build_null_safe_membership_predicate_gated`
+/// (or `merge::null_safe_in_gated`) and emit both variants: the UPDATE body would
+/// otherwise scan the whole target with `IS NOT DISTINCT FROM`, exactly the
+/// nested-loop cliff the gated sites fix.
 fn inplace_pt_old_membership(spec: &InplaceSpec) -> String {
     crate::trigger::scope::build_null_safe_membership_predicate(
         "__t",

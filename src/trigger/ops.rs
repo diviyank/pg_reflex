@@ -623,26 +623,39 @@ pub(crate) fn outer_join_secondary_stmts(
                 // NULL-safe form needs an explicit outer qualifier, and that
                 // qualifier differs between the DELETE (qv itself) and the
                 // INSERT (the `__bq` alias of base_query).
-                let ck_relation = format!("({}) __ck", changed_keys);
-                let del_pred = build_null_safe_membership_predicate(
+                //
+                // PS-5: each predicate is a runtime-gated fast/safe PAIR, not a
+                // single statically-chosen form. These target columns come off
+                // the NULLABLE side of the outer join, so `not_null_columns` can
+                // never contain them and the static choice was ALWAYS the
+                // non-sargable `IS NOT DISTINCT FROM` — a nested loop over the
+                // whole base relation (579x measured). See
+                // `build_null_safe_membership_predicate_gated`, which attaches the
+                // `__ck` / `__ng` aliases itself. Both variants of each pair are
+                // emitted; the gate makes exactly one do work, and all DELETEs
+                // still precede all INSERTs.
+                let ck_body = format!("({})", changed_keys);
+                let del_match = build_null_safe_membership_predicate_gated(
                     &qv,
                     &target_cols,
                     &target_cols,
-                    &ck_relation,
+                    &ck_body,
                     &plan.not_null_columns,
                 );
-                stmts.push(format!("DELETE FROM {} WHERE {}", qv, del_pred));
-                let ins_pred = build_null_safe_membership_predicate(
+                stmts.extend(del_match.stmts(|pred| format!("DELETE FROM {} WHERE {}", qv, pred)));
+                let ins_match = build_null_safe_membership_predicate_gated(
                     "__bq",
                     &target_cols,
                     &target_cols,
-                    &ck_relation,
+                    &ck_body,
                     &plan.not_null_columns,
                 );
-                stmts.push(format!(
-                    "INSERT INTO {} SELECT * FROM ({}) __bq WHERE {}",
-                    qv, base_query, ins_pred
-                ));
+                stmts.extend(ins_match.stmts(|pred| {
+                    format!(
+                        "INSERT INTO {} SELECT * FROM ({}) __bq WHERE {}",
+                        qv, base_query, pred
+                    )
+                }));
                 return;
             }
             _ => {
@@ -1012,6 +1025,46 @@ fn passthrough_keyed_delete_predicate(
     )
 }
 
+/// PS-5 — `passthrough_keyed_delete_predicate` as a runtime-gated fast/safe
+/// pair. Same cliff, same fix as `outer_join_secondary_stmts`: the NULL-safe
+/// branch matches the WHOLE target against `pt_old` with `IS NOT DISTINCT
+/// FROM`, which no operator family covers, so the planner's only option is a
+/// nested loop over the entire IMV.
+///
+/// `pt_old` is a real scratch table that this same flush `TRUNCATE`s and
+/// repopulates a few statements earlier, so `AffectedMatch`'s atomicity
+/// invariant holds here verbatim (`AccessExclusiveLock` until commit) — see
+/// that struct's "ATOMICITY INVARIANT" section before changing how `pt_old` is
+/// cleared.
+///
+/// Returns a single ungated variant whenever every mapped column is proven NOT
+/// NULL, so the plain `IN` output stays byte-identical for that case.
+fn passthrough_keyed_delete_match(
+    pt_old: &str,
+    qv: &str,
+    mappings: &[(String, String)],
+    target_cols: &[String],
+    source_cols: &[String],
+    not_null_columns: &std::collections::HashSet<String>,
+) -> crate::trigger::merge::AffectedMatch {
+    let all_not_null = mappings
+        .iter()
+        .all(|(t, _)| not_null_columns.contains(t.as_str()));
+    if all_not_null {
+        return crate::trigger::merge::AffectedMatch {
+            fast: build_membership_predicate(target_cols, source_cols, pt_old),
+            safe: None,
+        };
+    }
+    crate::trigger::merge::null_safe_in_gated(
+        pt_old,
+        qv,
+        target_cols,
+        source_cols,
+        &source_not_null_cols(mappings, not_null_columns),
+    )
+}
+
 /// Strategy-specific cold-exclusion predicate for the passthrough dispatch.
 /// LIST excludes hot partition VALUES (`$1::TEXT[]`); RANGE excludes rows of hot
 /// CHILDREN by resolving the value to its child of `view_parent` and comparing
@@ -1082,25 +1135,31 @@ pub(crate) fn passthrough_op_stmts(
                     mappings.iter().map(|(t, _)| format!("\"{}\"", t)).collect();
                 let source_cols: Vec<String> =
                     mappings.iter().map(|(_, s)| format!("\"{}\"", s)).collect();
-                let base_del = format!(
-                    "DELETE FROM {} WHERE {}",
-                    qv,
-                    passthrough_keyed_delete_predicate(
-                        &pt_old,
-                        &qv,
-                        mappings,
-                        &target_cols,
-                        &source_cols,
-                        &plan.not_null_columns,
-                    )
-                );
-
                 if let Some((part_col, part_col_q, part_src_q, strategy)) =
                     passthrough_partition_dispatch_cols(plan, mappings)
                 {
                     // Hybrid partition dispatch (audit #2): DELETE-only, so no
                     // cold INSERT body. Hot leaves are swapped (rebuilt from the
                     // post-delete source state); cold leaves get the keyed delete.
+                    //
+                    // PS-5 deliberately does NOT gate this branch: the predicate
+                    // is spliced into a DO block that also swaps the hot leaves,
+                    // so emitting the block once per variant would run that swap
+                    // TWICE (the swap is not gated and cannot be). Keeping the
+                    // single always-NULL-safe form trades this branch's plan
+                    // quality for correctness, which is the right direction.
+                    let base_del = format!(
+                        "DELETE FROM {} WHERE {}",
+                        qv,
+                        passthrough_keyed_delete_predicate(
+                            &pt_old,
+                            &qv,
+                            mappings,
+                            &target_cols,
+                            &source_cols,
+                            &plan.not_null_columns,
+                        )
+                    );
                     let strategy_is_range = strategy.eq_ignore_ascii_case("RANGE");
                     let parent_lit = qv.replace('"', "").replace('\'', "''");
                     let part_col_lit = part_col.replace('\'', "''");
@@ -1127,7 +1186,17 @@ pub(crate) fn passthrough_op_stmts(
                         None,
                     ));
                 } else {
-                    stmts.push(base_del);
+                    let del_match = passthrough_keyed_delete_match(
+                        &pt_old,
+                        &qv,
+                        mappings,
+                        &target_cols,
+                        &source_cols,
+                        &plan.not_null_columns,
+                    );
+                    stmts.extend(
+                        del_match.stmts(|pred| format!("DELETE FROM {} WHERE {}", qv, pred)),
+                    );
                 }
                 if operation == "DELETE_PROMOTED" {
                     stmts.push(format!("ANALYZE {}", qv));
@@ -1143,18 +1212,6 @@ pub(crate) fn passthrough_op_stmts(
                     mappings.iter().map(|(t, _)| format!("\"{}\"", t)).collect();
                 let source_cols: Vec<String> =
                     mappings.iter().map(|(_, s)| format!("\"{}\"", s)).collect();
-                let base_del = format!(
-                    "DELETE FROM {} WHERE {}",
-                    qv,
-                    passthrough_keyed_delete_predicate(
-                        &pt_old,
-                        &qv,
-                        mappings,
-                        &target_cols,
-                        &source_cols,
-                        &plan.not_null_columns,
-                    )
-                );
                 let delta_new = scoped_delta_query(base_query, source_table, &pt_new);
                 let base_ins = format!("INSERT INTO {} {}", qv, delta_new);
 
@@ -1166,6 +1223,18 @@ pub(crate) fn passthrough_op_stmts(
                     // keyed predicate with the hot-exclusion filter; the cold
                     // INSERT re-runs the delta projection (which reads pt_new) for
                     // cold partitions only.
+                    let base_del = format!(
+                        "DELETE FROM {} WHERE {}",
+                        qv,
+                        passthrough_keyed_delete_predicate(
+                            &pt_old,
+                            &qv,
+                            mappings,
+                            &target_cols,
+                            &source_cols,
+                            &plan.not_null_columns,
+                        )
+                    );
                     let strategy_is_range = strategy.eq_ignore_ascii_case("RANGE");
                     let parent_lit = qv.replace('"', "").replace('\'', "''");
                     let part_col_lit = part_col.replace('\'', "''");
@@ -1243,7 +1312,22 @@ pub(crate) fn passthrough_op_stmts(
                         ));
                     }
                 } else {
-                    stmts.push(base_del);
+                    // PS-5 — gated pair on the unpartitioned path only; see the
+                    // DELETE branch for why the partition-dispatch DO block above
+                    // must keep the single always-NULL-safe form. The INSERT is
+                    // unaffected (it is scoped by `pt_new`, not by a membership
+                    // predicate), so it simply follows both DELETE variants.
+                    let del_match = passthrough_keyed_delete_match(
+                        &pt_old,
+                        &qv,
+                        mappings,
+                        &target_cols,
+                        &source_cols,
+                        &plan.not_null_columns,
+                    );
+                    stmts.extend(
+                        del_match.stmts(|pred| format!("DELETE FROM {} WHERE {}", qv, pred)),
+                    );
                     stmts.push(base_ins);
                 }
             } else {

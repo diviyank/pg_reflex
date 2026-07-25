@@ -526,3 +526,157 @@ fn audit_ps11_topk_scalar_refresh_null_safe_and_index_scoped() {
         plan
     );
 }
+
+/// PLAN-QUALITY (PS-5, 2026-07-25): the keyed outer-join-secondary passthrough
+/// must not nested-loop the FULL base relation against the transition delta.
+///
+/// `build_null_safe_membership_predicate` chose between the sargable `IN` form
+/// and `EXISTS (... IS NOT DISTINCT FROM ...)` STATICALLY, from
+/// `plan.not_null_columns`. On this shape the target columns come off the
+/// NULLABLE side of the outer join, so `provably_not_null_key_columns` can never
+/// prove them — it excludes LEFT-join target tables outright and returns an EMPTY
+/// set for any RIGHT/FULL join — which made the expensive form the ROUTINE case
+/// for every IMV of this shape, not a rare-NULL-data edge case. `IS NOT DISTINCT
+/// FROM` is in no operator family, so it can serve neither a hash nor a merge
+/// join key and the planner's only option is a nested loop over the whole base.
+/// Measured on PG 18.4 at 500k base rows x 2k changed keys: 23,698 ms with
+/// `Rows Removed by Join Filter: 489,995,000`, versus 40.9 ms for `IN` (579x).
+///
+/// The fix emits a runtime-gated PAIR. This pins that (a) the pair exists, (b)
+/// the sargable variant that runs for a NULL-free delta is planned as a
+/// hash/merge join rather than a nested loop, and (c) the NULL-safe variant is
+/// still there — so the test cannot pass by simply dropping NULL safety.
+#[pg_test]
+fn audit_ps5_keyed_outer_join_secondary_avoids_nested_loop_over_base() {
+    // `k` is deliberately NULLABLE on both sides: that is the shape
+    // `provably_not_null_key_columns` cannot prove, i.e. the common case.
+    Spi::run("CREATE TABLE ps5lj_prim (k INT, payload TEXT)").unwrap();
+    Spi::run("CREATE UNIQUE INDEX ON ps5lj_prim (k)").unwrap();
+    Spi::run("CREATE TABLE ps5lj_sec (k INT, extra TEXT)").unwrap();
+    Spi::run("CREATE UNIQUE INDEX ON ps5lj_sec (k)").unwrap();
+    Spi::run("INSERT INTO ps5lj_prim SELECT i, 'p'||i FROM generate_series(1,20000) i").unwrap();
+    Spi::run("INSERT INTO ps5lj_sec SELECT i, 's'||i FROM generate_series(1,20000) i").unwrap();
+
+    let base = "SELECT p.k, p.payload, s.extra FROM ps5lj_prim p LEFT JOIN ps5lj_sec s ON s.k = p.k";
+    let res = Spi::get_one::<String>(&format!(
+        "SELECT create_reflex_ivm('ps5lj_v', '{}', 'k')",
+        base.replace('\'', "''")
+    ))
+    .expect("create call")
+    .expect("create result");
+    assert_eq!(res, "CREATE REFLEX INCREMENTAL VIEW");
+
+    // The statements reference the trigger's transition tables, which do not
+    // exist outside trigger execution. Stand-ins with the same names and column
+    // types let the planner produce a real plan for them.
+    for side in ["old", "new"] {
+        Spi::run(&format!(
+            "CREATE TABLE \"__reflex_{}_ps5lj_sec\" (k INT, extra TEXT)",
+            side
+        ))
+        .unwrap();
+    }
+    // A NULL-free delta of 200 changed keys — the case the fast variant serves.
+    Spi::run("INSERT INTO \"__reflex_new_ps5lj_sec\" SELECT i, 's'||i FROM generate_series(1,200) i")
+        .unwrap();
+    Spi::run("ANALYZE ps5lj_prim").unwrap();
+    Spi::run("ANALYZE ps5lj_sec").unwrap();
+    Spi::run("ANALYZE \"__reflex_old_ps5lj_sec\"").unwrap();
+    Spi::run("ANALYZE \"__reflex_new_ps5lj_sec\"").unwrap();
+
+    let stmts = flush_statements_for("ps5lj_v", "ps5lj_sec", "UPDATE");
+
+    // Guard against a vacuous test: this fixture must actually be on the keyed
+    // secondary path, not the full-rebuild fallback.
+    assert!(
+        stmts.iter().any(|s| s.contains("__ck")),
+        "fixture is not on the keyed outer-join-secondary path: {:#?}",
+        stmts
+    );
+    let target_inserts: Vec<&String> = stmts
+        .iter()
+        .filter(|s| s.trim_start().starts_with("INSERT INTO \"ps5lj_v\""))
+        .collect();
+    assert_eq!(
+        target_inserts.len(),
+        2,
+        "expected a gated target-INSERT pair: {:#?}",
+        target_inserts
+    );
+    assert!(
+        target_inserts
+            .iter()
+            .any(|s| s.contains("IS NOT DISTINCT FROM")),
+        "the NULL-safe variant must survive — dropping it would be silent data loss: {:#?}",
+        target_inserts
+    );
+
+    let explain = |stmt: &str| -> String {
+        Spi::connect(|client| {
+            let rows = client
+                .select(&format!("EXPLAIN (COSTS OFF) {}", stmt), None, &[])
+                .unwrap();
+            rows.filter_map(|r| {
+                r.get_datum_by_ordinal(1)
+                    .ok()
+                    .and_then(|d| d.value::<String>().ok().flatten())
+            })
+            .collect::<Vec<String>>()
+            .join("\n")
+        })
+    };
+
+    let sargable = target_inserts
+        .iter()
+        .find(|s| s.contains("AND NOT EXISTS") && !s.contains("IS NOT DISTINCT FROM"))
+        .expect("sargable INSERT variant (`IN` scope, gated on NOT EXISTS)");
+    // Assert on the MEMBERSHIP join specifically. A bare `Nested Loop` check
+    // would be wrong here: the base query has its own LEFT JOIN to the secondary,
+    // which the planner legitimately serves with a nested loop + index scan. The
+    // cliff has a distinct signature — a `Nested Loop Semi Join` whose
+    // `Join Filter` is the `IS DISTINCT FROM` negation.
+    let membership_join_cond = |p: &str| {
+        p.lines().any(|l: &str| {
+            (l.contains("Hash Cond:") || l.contains("Merge Cond:"))
+                && l.contains("__reflex_old_ps5lj_sec")
+        })
+    };
+    let plan = explain(sargable);
+    assert!(
+        membership_join_cond(&plan),
+        "PS-5 PLAN-QUALITY GAP: the sargable variant must match the base against \
+         the changed keys by a hash/merge join CONDITION, got:\n{}\nstatement: {}",
+        plan,
+        sargable
+    );
+    assert!(
+        !plan.contains("Nested Loop Semi Join") && !plan.contains("IS DISTINCT FROM"),
+        "PS-5 PLAN-QUALITY GAP: the sargable variant must carry no non-sargable \
+         semi join over the base relation — that is the O(base x delta) cliff, \
+         got:\n{}\nstatement: {}",
+        plan,
+        sargable
+    );
+
+    // The contrast that makes the assertions above meaningful: the NULL-safe
+    // variant, which the pre-fix codegen emitted UNCONDITIONALLY, genuinely does
+    // get the nested-loop semi join. If this ever stops being true the fast/slow
+    // distinction has evaporated and the assertions above prove nothing.
+    let null_safe = target_inserts
+        .iter()
+        .find(|s| s.contains("IS NOT DISTINCT FROM"))
+        .expect("NULL-safe INSERT variant");
+    let slow_plan = explain(null_safe);
+    assert!(
+        slow_plan.contains("Nested Loop Semi Join") && slow_plan.contains("IS DISTINCT FROM"),
+        "PS-5 test is vacuous: the NULL-safe form was expected to nested-loop the \
+         base relation (that is the cliff being avoided), got:\n{}",
+        slow_plan
+    );
+    assert!(
+        !membership_join_cond(&slow_plan),
+        "PS-5 test is vacuous: the NULL-safe form must NOT get a hash/merge \
+         membership condition, or the two variants plan identically:\n{}",
+        slow_plan
+    );
+}
