@@ -139,6 +139,7 @@ nav:
       - reflex_probe_not_null_columns: api/reflex_probe_not_null_columns.md
       - reflex_rebuild_imv_metadata: api/reflex_rebuild_imv_metadata.md
       - reflex_rebuild_triggers: api/reflex_rebuild_triggers.md
+      - reflex_rebuild_union_mirror: api/reflex_rebuild_union_mirror.md
       - reflex_audit: api/reflex_audit.md
       - reflex_set_wipe_threshold: api/reflex_set_wipe_threshold.md
       - reflex_set_wipe_floor_rows: api/reflex_set_wipe_floor_rows.md

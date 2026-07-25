@@ -4,6 +4,46 @@ The full changelog tracks every release. The latest version's headlines are on t
 
 For each version below, see [`CHANGELOG.md`](https://github.com/diviyank/pg_reflex/blob/main/CHANGELOG.md) on GitHub for the canonical text.
 
+## [1.11.1] — 2026-07-24
+
+Audit truthfulness, eleven silent-wrong-result fixes (nullable-key MIN/MAX maintenance; a materialised UNION-ALL wrapper's mirror trigger functions colliding under long wrapper names; a nullable explicit unique key on a passthrough IMV; a LEFT JOIN aggregate grouped by the secondary's join column; the DEFERRED cross-source guard double-reconciling a UNION-ALL operand; a FULL OUTER JOIN aggregate's scoped recompute dropping a newly-surfaced group; a synchronous partition-sync orphan collision going permanently `known_stale`; an outer-join-blind catalog NOT-NULL set silently staling a LEFT/RIGHT JOIN aggregate's NULL group; a qualified GROUP BY column misclassified as stable by its first `.`-segment; and directly-named UNION-ALL operand reconciles — including every unattended scheduled-sweep pass — silently doubling their wrapper), an unclearable-finding fix (a group-capture table dropped independently of its intermediate), two performance-cliff fixes (MIN/MAX affected-group scoping, and the keyed outer-join-secondary passthrough's membership predicate — 579× on the latter), wrapper-reconcile safety, targeted-recovery observability, and a recovery path for a dropped internal table. Replace the `.so`, then `ALTER EXTENSION pg_reflex UPDATE TO '1.11.1';`.
+
+**Added**
+
+- `reflex_ivm_status()` gains `rebuild_count` / `last_rebuild_at`, incremented only by direct operator recovery (`reflex_rebuild_imv`, targeted `reflex_reconcile`, `reflex_doctor(fix => true)`) — a non-converging retry loop is now visible in-database.
+- [`reflex_rebuild_union_mirror(wrapper)`](api/reflex_rebuild_union_mirror.md) — repair primitive that reinstalls a materialised UNION-ALL wrapper's per-operand mirror triggers. Refuses cleanly on a VIEW wrapper or a non-wrapper IMV.
+
+**Fixed**
+
+Eleven silent-wrong-result bugs (nullable-key MIN/MAX, the top-K scalar-refresh path, mirror trigger function name collisions, a nullable explicit unique key on passthrough, a LEFT JOIN aggregate grouped by the secondary's join column, the DEFERRED cross-source guard's UNION-ALL double-reconcile, a FULL OUTER JOIN aggregate's scoped recompute, a synchronous partition-sync orphan collision, an outer-join-blind NOT-NULL set, a qualified-GROUP-BY qualifier misparse, and directly-named UNION-ALL operand reconciles doubling their wrapper), plus a `reflex_reconcile`-on-wrapper transaction abort, a dead scheduled-sweep candidate query, a heal for a dropped `__reflex_intermediate_<view>`, two audit false-positives (`internal-tables-exist` / `trigger-attached` on wrapper IMVs), an unclearable group-capture-table finding, and a phantom `partition-mirror` (F3) finding on partitioned passthrough IMVs. Two performance-cliff fixes: MIN/MAX affected-group scoping (700–3700×) and the keyed outer-join-secondary passthrough membership predicate (579×), both via a runtime-gated NULL-freeness probe that pays the safe non-sargable form only when a batch actually holds a NULL key. Full itemized list in [`CHANGELOG.md`](https://github.com/diviyank/pg_reflex/blob/main/CHANGELOG.md).
+
+**Migration**
+
+- `ALTER EXTENSION pg_reflex UPDATE TO '1.11.1';` — [`sql/pg_reflex--1.11.0--1.11.1.sql`](https://github.com/diviyank/pg_reflex/blob/main/sql/pg_reflex--1.11.0--1.11.1.sql) adds `rebuild_count` / `last_rebuild_at` (fast-default `ADD COLUMN`, no table rewrite), redeclares `reflex_ivm_status()`, adds `reflex_rebuild_union_mirror`, and re-runs the `requires_explicit_refresh` backfill with bare-or-qualified `ignore_sources` matching. No reconcile needed. If you have a materialised UNION-ALL wrapper ≥38 bytes, its mirror trigger functions may already be collided under the pre-1.11.1 naming bug — run `SELECT reflex_rebuild_union_mirror('<wrapper_name>')` by hand after upgrading.
+
+## [1.11.0] — 2026-07-24
+
+Correctness and truthfulness across decomposed IMV chains, the doctor, and nullable-key maintenance cost. Replace the `.so`, then `ALTER EXTENSION pg_reflex UPDATE TO '1.11.0';`, then run `SELECT reflex_repair_dependency_graph();` in a fresh session to backfill the dependency graph on existing rows.
+
+**Fixed**
+
+- A CTE-decomposed IMV never recorded the edge to its generated sub-IMV (a quoting mismatch in the depends-on match), collapsing `graph_depth` and letting `reflex_reconcile` re-aggregate a stale child. `reflex_reconcile` now rebuilds a decomposed IMV's generated sub-IMVs bottom-up before the IMV itself, and refuses destructive operations (`reflex_rebuild_chain`, non-cascade `drop_reflex_ivm`) on a generated child.
+- `reflex_doctor`'s pending-queue classification, orphan-object check, and `reflex_rebuild_chain`'s legacy-row handling all hardened — see [`CHANGELOG.md`](https://github.com/diviyank/pg_reflex/blob/main/CHANGELOG.md) for the full list.
+- The aggregate target-sync and intermediate MERGE emitted a non-sargable `IS NOT DISTINCT FROM` join on nullable group keys unconditionally; now runtime-gated to the sargable `=` form when the affected set has no NULL key (200k-group, 1-row-delta target sync 52 ms → 0.09 ms).
+- A matview-only IMV (no trigger ever fires on it) is now flagged `requires_explicit_refresh`, surfaced by `reflex_ivm_status` and `reflex_doctor` finding `F12`.
+
+**Changed**
+
+- **`reflex_scheduled_reconcile` signature (public API change).** New `batch_size` / `target_schema` arguments and a `remaining` output column, for bounding a pg_cron tick on a large registry.
+
+**Added**
+
+- Columns `is_generated_sub_imv`, `requires_explicit_refresh`. Functions `reflex_repair_dependency_graph()`, `reflex_reset_partition_failures()`, and the two-argument `reflex_reconcile(view, drop_orphans)` overload.
+
+**Migration**
+
+- `ALTER EXTENSION pg_reflex UPDATE TO '1.11.0';` — [`sql/pg_reflex--1.10.11--1.11.0.sql`](https://github.com/diviyank/pg_reflex/blob/main/sql/pg_reflex--1.10.11--1.11.0.sql). After upgrading, in a fresh session, run `SELECT reflex_repair_dependency_graph();` to backfill `depends_on_imv` / `graph_child` / `graph_depth` / `is_generated_sub_imv` on rows created before 1.11.0, then re-run `reflex_doctor()`.
+
 ## [1.10.11] — 2026-07-22
 
 Non-superuser reconcile, and real archive-residue verification for joins: `reflex_reconcile` on a partitioned IMV no longer requires superuser, and the `archive_residue` check now confirms or clears residue on multi-source and aggregate IMVs instead of the "cannot confirm" placeholder 1.10.10 left. Replace the `.so`, then `ALTER EXTENSION pg_reflex UPDATE TO '1.10.11';`.

@@ -680,6 +680,14 @@ SELECT reflex_rebuild_imv_metadata('sales_by_region');
 SELECT reflex_rebuild_triggers('sales');   -- note: takes the source table, not the IMV
 ```
 
+### `reflex_rebuild_union_mirror(wrapper TEXT) -> TEXT`
+
+(1.11.1+) Repair primitive for a materialised UNION-ALL wrapper (the TABLE built when a CTE feeding a set-op is consumed by an aggregate): re-installs the `__reflex_union_mirror_{ins,del,upd}_<wrapper>_<i>` triggers and their functions on every operand recorded in the wrapper's `depends_on`, healing a dropped trigger, a dropped trigger function, or a name-collision between operands. Refuses cleanly on a VIEW wrapper (no operand triggers by design) or a non-wrapper IMV. Restores future maintenance only — it does not backfill deltas missed while a trigger was absent or broken; run `reflex_reconcile` afterward if the wrapper may already be stale.
+
+```sql
+SELECT reflex_rebuild_union_mirror('sales_by_region__union_wrapper');
+```
+
 ### `reflex_audit() -> TEXT` / `reflex_audit(view_name TEXT) -> TEXT`
 
 Runs the consistency audit over all enabled IMVs (no-arg form) or a single IMV. Checks fall into three tiers: catastrophic (missing source/internal tables, trigger attachment and mode mismatches, staging shape), drift (base-query runnability, intermediate/target/partition shape, partition-tree mirror), and orphans (stray intermediate/scratch/staging tables, duplicate trigger functions). Returns a human-readable report; use it to verify integrity after migrations, crashes, or manual DDL.
