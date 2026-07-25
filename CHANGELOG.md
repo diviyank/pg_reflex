@@ -4,15 +4,18 @@
 
 ## [1.11.1] - 2026-07-24
 
-Audit truthfulness, six silent-wrong-result fixes (nullable-key MIN/MAX
+Audit truthfulness, eight silent-wrong-result fixes (nullable-key MIN/MAX
 maintenance; a materialised UNION-ALL wrapper's mirror trigger functions
 colliding under long wrapper names; a nullable explicit unique key on a
 passthrough IMV; a LEFT JOIN aggregate grouped by the secondary's join
-column; and the DEFERRED cross-source guard double-reconciling a UNION-ALL
-operand), wrapper-reconcile safety, targeted-recovery observability, a
-recovery path for a dropped internal table, plus a repair primitive and real
-audit coverage for materialised UNION-ALL wrapper mirror triggers. Replace
-the `.so`, then
+column; the DEFERRED cross-source guard double-reconciling a UNION-ALL
+operand; a FULL OUTER JOIN aggregate's scoped recompute dropping a
+newly-surfaced group; and a synchronous partition-sync orphan collision
+going permanently `known_stale`), a MIN/MAX recompute performance-cliff fix,
+wrapper-reconcile safety, targeted-recovery observability, a recovery path
+for a dropped internal table, plus a repair primitive and real audit
+coverage for materialised UNION-ALL wrapper mirror triggers. Replace the
+`.so`, then
 `ALTER EXTENSION pg_reflex UPDATE TO '1.11.1';`. The update adds two registry
 columns (fast-default `ADD COLUMN`, no table rewrite) and one corrective metadata
 backfill; no reconcile is needed.
@@ -191,6 +194,38 @@ backfill; no reconcile is needed.
   resyncs the wrapper's operand slice, instead of calling `reflex_reconcile` on it
   directly. Also now flags `known_stale` (with a reason) instead of silently
   discarding a staged delta if that repair itself fails.
+
+- **(performance)** A MIN/MAX aggregate IMV's affected-group recompute scoped its
+  membership `EXISTS` filter with the non-sargable `IS NOT DISTINCT FROM`
+  unconditionally — even on the `eq = true` fast branch, where the sibling
+  `update_join`/`exists_join` predicates in the same statement were already
+  correctly gated to the sargable `=`. `IS NOT DISTINCT FROM` is neither hashable
+  nor mergejoinable, degrading the semi-join to the affected table from a
+  Hash/Merge Semi Join to a Nested Loop Semi Join for every MIN/MAX IMV — measured
+  700-3700x slower at realistic source sizes, not just ones holding a NULL group
+  key. Gated on `eq` like its siblings.
+
+- **(silent wrong result)** An aggregate outer-join-secondary IMV with a `FULL
+  JOIN`/`FULL OUTER JOIN` base query could take a scoped recompute path (either
+  the join-key-scoped fast path or the STABLE-column fallback) that assumed a
+  group-by column qualified by a table other than the one just mutated is stable.
+  A FULL JOIN's unmatched-row semantics make that false for either side: a write
+  to one side can surface or drop a brand-new group driven by the other side's
+  join value, without that other table's own row changing. Both scoped strategies
+  now bail out to the same unconditional full intermediate+target rebuild the
+  passthrough branch already used for this join type.
+
+- **(silent wrong result)** The synchronous DDL-event partition auto-sync
+  (`__reflex_on_ddl_command_end`) left a source-side repartition's old, orphaned
+  mirror child behind when a `DETACH`+`ATTACH` replaced a leaf at the same bound;
+  the next `CREATE` for the replacement's mirror then collided on identical
+  bounds (`would overlap partition`), and the IMV went `known_stale` on every
+  subsequent swap regardless of manual reconcile. The sync now drops a *confirmed*
+  orphan sibling (bounds byte-identical to the incoming child, mapped to no live
+  source leaf) before each `CREATE`, scoped to the exact immediate parent
+  receiving the incoming child — never the whole multi-level subtree, which an
+  adversarial review pass found could otherwise CASCADE-drop a same-bound leaf
+  under a completely unrelated, still-live branch.
 
 **Known limitations**
 
