@@ -1,6 +1,8 @@
 .DS_Store
 .idea/
 /target
+target-*/
+.target/
 .worktrees/
 *.iml
 **/*.rs.bk
