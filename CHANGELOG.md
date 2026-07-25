@@ -4,15 +4,18 @@
 
 ## [1.11.1] - 2026-07-24
 
-Audit truthfulness, nine silent-wrong-result fixes (nullable-key MIN/MAX
+Audit truthfulness, eleven silent-wrong-result fixes (nullable-key MIN/MAX
 maintenance; a materialised UNION-ALL wrapper's mirror trigger functions
 colliding under long wrapper names; a nullable explicit unique key on a
 passthrough IMV; a LEFT JOIN aggregate grouped by the secondary's join
 column; the DEFERRED cross-source guard double-reconciling a UNION-ALL
 operand; a FULL OUTER JOIN aggregate's scoped recompute dropping a
 newly-surfaced group; a synchronous partition-sync orphan collision going
-permanently `known_stale`; and an outer-join-blind catalog NOT-NULL set
-silently staling a LEFT/RIGHT JOIN aggregate's NULL group), an
+permanently `known_stale`; an outer-join-blind catalog NOT-NULL set
+silently staling a LEFT/RIGHT JOIN aggregate's NULL group; a qualified
+GROUP BY column misclassified as stable by its first `.`-segment; and
+directly-named UNION-ALL operand reconciles — including every unattended
+scheduled-sweep pass — silently doubling their wrapper), an
 unclearable-finding fix (a group-capture table dropped independently of its
 intermediate), two performance-cliff fixes (MIN/MAX affected-group scoping,
 and the keyed outer-join-secondary passthrough's membership predicate —
@@ -311,6 +314,25 @@ backfill; no reconcile is needed.
   identifier chain's immediate qualifier segment against the secondary,
   applied consistently to both the join-key-scoped fast path and the
   STABLE-column fallback.
+
+- **(silent wrong result)** Directly naming a machine-generated UNION-ALL
+  operand sub-IMV in `reflex_reconcile`/`reflex_rebuild_imv` — or via
+  `reflex_doctor`'s F4 repair, or (unattended) every `reflex_scheduled_reconcile`
+  drift sweep, since an operand is `REBUILDABLE_NODE` and reconciled standalone
+  by design — rebuilt it with `TRUNCATE` + `INSERT`. The operand's
+  `__reflex_union_mirror_*` trigger mirrors its rows into its materialised
+  wrapper's `__reflex_src_idx` slice but has no `TRUNCATE` handler, so the
+  `TRUNCATE` removed nothing from the wrapper while the `INSERT` re-appended the
+  operand's full row set: every such repair, including every unattended
+  scheduled-sweep pass over a materialised UNION-ALL chain, silently DOUBLED
+  the wrapper's slice and everything reading it. Now routes a directly-named
+  operand through the same trigger-suppressed rebuild + explicit wrapper-slice
+  resync this release's DEFERRED cross-source guard fix already established,
+  bracketed with the wrapper as the internal reconcile root so
+  `alter_source_policy='error'` cannot abort the caller. A failed rebuild
+  leaves the wrapper's existing slice alone rather than publish undefined
+  operand contents. Any other target is unaffected (one added registry probe,
+  then the identical prior rebuild).
 
 **Known limitations**
 
