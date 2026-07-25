@@ -797,11 +797,11 @@ fn ps10_reconcile_does_not_heal_passthrough_partitioned() {
 /// (7b) The unpartitioned passthrough shape — the other `end_query = ''` row —
 /// must likewise gain nothing from a reconcile.
 ///
-/// The third `end_query = ''` shape, a decomposed WRAPPER, cannot be asserted
-/// here: `reflex_reconcile` on one RAISES today (`"<view>" is not a table` —
-/// the passthrough branch TRUNCATEs a VIEW), which aborts the test transaction.
-/// That is pre-existing and out of scope; filed as
-/// `untreated_bugs/2026-07-24_reconcile_raises_on_decomposed_wrapper.md`.
+/// The third `end_query = ''` shape, a decomposed WRAPPER, is asserted
+/// elsewhere: PS-12 gave `reconcile_one` a backstop that refuses one with a
+/// returned error STRING instead of the raise that used to abort the caller's
+/// transaction (`src/tests/pg_test_ps12.rs`), and its operands are covered by
+/// `src/tests/pg_test_union_operand_direct_reconcile.rs`.
 #[pg_test]
 fn ps10_reconcile_does_not_heal_passthrough_unpartitioned() {
     Spi::run("CREATE TABLE ps10_nw_src (id BIGINT, v NUMERIC)").expect("src");
