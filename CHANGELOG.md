@@ -4,16 +4,19 @@
 
 ## [1.11.1] - 2026-07-24
 
-Audit truthfulness, eight silent-wrong-result fixes (nullable-key MIN/MAX
+Audit truthfulness, nine silent-wrong-result fixes (nullable-key MIN/MAX
 maintenance; a materialised UNION-ALL wrapper's mirror trigger functions
 colliding under long wrapper names; a nullable explicit unique key on a
 passthrough IMV; a LEFT JOIN aggregate grouped by the secondary's join
 column; the DEFERRED cross-source guard double-reconciling a UNION-ALL
 operand; a FULL OUTER JOIN aggregate's scoped recompute dropping a
-newly-surfaced group; and a synchronous partition-sync orphan collision
-going permanently `known_stale`), an unclearable-finding fix (a group-capture
-table dropped independently of its intermediate), a MIN/MAX recompute
-performance-cliff fix, wrapper-reconcile safety, targeted-recovery
+newly-surfaced group; a synchronous partition-sync orphan collision going
+permanently `known_stale`; and an outer-join-blind catalog NOT-NULL set
+silently staling a LEFT/RIGHT JOIN aggregate's NULL group), an
+unclearable-finding fix (a group-capture table dropped independently of its
+intermediate), two performance-cliff fixes (MIN/MAX affected-group scoping,
+and the keyed outer-join-secondary passthrough's membership predicate —
+579x on the latter), wrapper-reconcile safety, targeted-recovery
 observability, a recovery path for a dropped internal table, plus a repair
 primitive and real audit coverage for materialised UNION-ALL wrapper mirror
 triggers. Replace the `.so`, then
@@ -254,6 +257,46 @@ backfill; no reconcile is needed.
   receiving the incoming child — never the whole multi-level subtree, which an
   adversarial review pass found could otherwise CASCADE-drop a same-bound leaf
   under a completely unrelated, still-live branch.
+
+- **(silent wrong result)** An aggregate IMV's catalog-derived NOT-NULL set
+  (`plan.not_null_columns`) was a bare-column-name union across every source
+  table, blind to both outer-join nullability and bare-name collisions across
+  sources: a column on the nullable side of a LEFT/RIGHT JOIN is NULL for every
+  unmatched row regardless of its own table's `NOT NULL` declaration, and one
+  source's `NOT NULL` column silently promoted every other source's
+  same-named nullable column even with no outer join involved at all. Once a
+  name was in the set it was never withdrawn — `optimize_not_null_sums` stored
+  it verbatim and `infer_not_null_columns` only ever adds. Downstream, this
+  made group-key matching use a plain `=` (never TRUE for the genuinely NULL
+  group) and suppressed the NULL-safe alternative entirely: the NULL group's
+  target row was neither deleted nor re-inserted on a primary-side mutation
+  (silently stale), and the intermediate's `MERGE ... ON` inserted a duplicate
+  NULL-key row. Fixed by reducing the catalog union to the join's actual
+  output nullability at `materialize_aggregate` time — the one place holding
+  both the catalog facts and the join structure — before it reaches
+  `plan.not_null_columns`; nothing survives a RIGHT/FULL join, matching the
+  bail-out `infer_not_null_columns`/`provably_not_null_key_columns` already
+  take elsewhere. A dropped name only ever costs the sargable `=` form, never
+  correctness; a genuinely non-NULL GROUP BY key is added back afterward by
+  the existing (correctly outer-join-aware) `infer_not_null_columns`.
+
+- **(performance)** The keyed outer-join-secondary passthrough path matched
+  the full base relation against its small `(OLD ∪ NEW)` transition delta with
+  `IS NOT DISTINCT FROM` whenever a key column was not statically proven NOT
+  NULL — and since those target columns come from the nullable side of the
+  outer join, `provably_not_null_key_columns` can never prove them: this was
+  the routine cost for every such IMV, not an edge case. `IS NOT DISTINCT
+  FROM` belongs to no PostgreSQL operator family, so the semi-join degrades to
+  a Nested Loop Semi Join over the entire base relation — measured 579x
+  slower (23.7s vs 41ms at 500k base rows / 2k changed keys) than the sargable
+  form. Now emits the same runtime-gated fast/safe pair this release's
+  MIN/MAX fix established (an uncorrelated NULL-freeness probe decides at
+  execution time, via a `One-Time Filter`-skipped `InitPlan`, whether the
+  batch actually contains a NULL key), so the common case pays ~6ms instead.
+  Applied to the outer-join-secondary DELETE/INSERT and the unpartitioned
+  keyed passthrough DELETE; the partition-dispatch branch keeps its single
+  always-safe form to avoid double-running the hot-leaf swap. Output stays
+  byte-identical when every key column is proven NOT NULL.
 
 **Known limitations**
 
