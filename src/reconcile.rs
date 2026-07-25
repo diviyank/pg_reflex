@@ -1064,6 +1064,134 @@ fn reconcile_generated_child_without_propagating(child: &str) -> &'static str {
     result
 }
 
+/// Safe repair for a GENERATED sub-IMV reached by the DEFERRED cross-source
+/// guard (`trigger/deferred.rs`'s `imv_has_multiple_sources` branch).
+///
+/// That guard runs from inside the deferred COMMIT trigger
+/// (`pg_trigger_depth() > 0`), so calling the public `reflex_reconcile` there
+/// is unsafe: `reflex_reconcile_with_orphans`'s `inside_trigger` gate skips the
+/// trigger-suppressed descent entirely and falls straight to `reconcile_one`
+/// with `child`'s own triggers LIVE. For a UNION-ALL operand that live trigger
+/// is the `__reflex_union_mirror_*` mirror `install_union_mirror_triggers`
+/// installs — it covers INSERT/UPDATE/DELETE but not `TRUNCATE`, so
+/// `reconcile_one`'s TRUNCATE-then-INSERT rebuild re-appends the operand's
+/// entire row set into its wrapper a second time, with nothing having removed
+/// the wrapper's stale slice. The wrapper (and anything reading it) silently
+/// doubles that operand's contribution — the 2026-07-25 bug this fixes.
+///
+/// Always rebuilds with propagation suppressed
+/// ([`reconcile_generated_child_without_propagating`], safe for any
+/// consumer — not just a union wrapper). When `child` also turns out to feed a
+/// MATERIALISED union-ALL wrapper (one with a stored `__reflex_src_idx`
+/// column — a VIEW-based set-op/DISTINCT-ON/window wrapper stores nothing and
+/// needs no resync), additionally replaces that wrapper's slice for `child`
+/// from the freshly rebuilt operand. That resync is exactly what suppressing
+/// propagation otherwise leaves undone, and it is the one piece
+/// [`reconcile_generated_child_without_propagating`]'s OTHER caller
+/// (`reflex_reconcile`'s top-down chain rebuild) does not need: a wrapper is
+/// never itself `REBUILDABLE_NODE`, so that caller never reconciles one, and
+/// nothing else resyncs it either — see `pg_scheduled_reconcile_reconciles_operands_below_decomposed_wrapper`
+/// (`src/tests/pg_test_decomposed_chain.rs`), which pins that `reflex_reconcile`
+/// on the wrapper's own top-level consumer halts AT the wrapper.
+pub(crate) fn reconcile_generated_child_for_cross_source_guard(child: &str) -> &'static str {
+    let result = reconcile_generated_child_without_propagating(child);
+    if result.starts_with("ERROR") {
+        return result;
+    }
+    if let Some((wrapper, idx)) =
+        Spi::connect(|client| materialized_union_wrapper_of(client, child))
+    {
+        resync_wrapper_operand_slice(&wrapper, idx, child);
+    }
+    result
+}
+
+/// `child`'s materialised UNION-ALL wrapper and its `__reflex_src_idx` tag, if
+/// any. `child` is an operand exactly when some decomposed row's
+/// `depends_on_imv` names it — `install_union_all_intermediate_wrapper` writes
+/// that array in the same order it assigns operand indices
+/// (`decompose.rs:594-611`), so the operand's position in the array (0-based)
+/// IS its `__reflex_src_idx` tag. The `__reflex_src_idx` column existence check
+/// excludes VIEW-based set-op/DISTINCT-ON/window wrappers, which store nothing
+/// and so have no slice to resync.
+fn materialized_union_wrapper_of(
+    client: &pgrx::spi::SpiClient<'_>,
+    child: &str,
+) -> Option<(String, i16)> {
+    client
+        .select(
+            "SELECT w.name AS wrapper, \
+                    (array_position(w.depends_on_imv, $1::text) - 1)::SMALLINT AS idx \
+             FROM public.__reflex_ivm_reference w \
+             WHERE $1 = ANY(COALESCE(w.depends_on_imv, ARRAY[]::TEXT[])) \
+               AND w.end_query = '' AND w.aggregations::text = '{}' \
+               AND EXISTS ( \
+                     SELECT 1 FROM pg_attribute a \
+                      WHERE a.attrelid = to_regclass(w.name) \
+                        AND a.attname = '__reflex_src_idx' \
+                        AND NOT a.attisdropped)",
+            Some(1),
+            &[unsafe {
+                DatumWithOid::new(child.to_string(), PgBuiltInOids::TEXTOID.oid().value())
+            }],
+        )
+        .unwrap_or_report()
+        .next()
+        .and_then(|row| {
+            let wrapper = row.get_by_name::<&str, _>("wrapper").ok()??.to_string();
+            let idx = row.get_by_name::<i16, _>("idx").ok()??;
+            Some((wrapper, idx))
+        })
+}
+
+/// Replace `wrapper`'s stored `__reflex_src_idx = operand_idx` slice wholesale
+/// with `child`'s freshly rebuilt rows — the resync
+/// [`reconcile_generated_child_for_cross_source_guard`] needs after rebuilding
+/// `child` with its mirror trigger suppressed (which, by design, propagates
+/// nothing to the wrapper). Named columns, not `SELECT idx, *`: matching by
+/// name (not position) means a column reorder on either relation can't
+/// silently shift the payload the way `reconcile_one`'s wrapper backstop
+/// (`is_decomposed_wrapper_row`) exists to prevent for the whole-wrapper case.
+fn resync_wrapper_operand_slice(wrapper: &str, operand_idx: i16, child: &str) {
+    let wrapper_q = quote_identifier(wrapper);
+    let child_q = quote_identifier(child);
+    let payload_cols: Vec<String> = Spi::connect(|client| {
+        client
+            .select(
+                "SELECT a.attname::text AS name FROM pg_attribute a \
+                 WHERE a.attrelid = to_regclass($1) AND a.attnum > 0 \
+                   AND NOT a.attisdropped AND a.attname <> '__reflex_src_idx' \
+                 ORDER BY a.attnum",
+                None,
+                &[unsafe {
+                    DatumWithOid::new(wrapper.to_string(), PgBuiltInOids::TEXTOID.oid().value())
+                }],
+            )
+            .unwrap_or_report()
+            .filter_map(|row| {
+                row.get_by_name::<&str, _>("name")
+                    .ok()
+                    .flatten()
+                    .map(|s| s.to_string())
+            })
+            .collect()
+    });
+    let col_list = payload_cols
+        .iter()
+        .map(|c| quote_identifier(c))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Spi::run(&format!(
+        "DELETE FROM {wrapper_q} WHERE __reflex_src_idx = {operand_idx}::SMALLINT"
+    ))
+    .unwrap_or_report();
+    Spi::run(&format!(
+        "INSERT INTO {wrapper_q} (__reflex_src_idx, {col_list}) \
+         SELECT {operand_idx}::SMALLINT, {col_list} FROM {child_q}"
+    ))
+    .unwrap_or_report();
+}
+
 /// One row in the result set of `reflex_scheduled_reconcile`.
 type ScheduledReconcileRow = (String, String, i64, i64);
 
