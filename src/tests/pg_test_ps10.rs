@@ -1000,3 +1000,107 @@ fn ps10_healed_intermediate_matches_a_fresh_twin() {
         "healed and twin IMVs must stay identical under maintenance"
     );
 }
+
+// --- Bug 1b: a companion dropped ALONE ------------------------------------
+//
+// `__reflex_affected_<view>` / `__reflex_shrunk_<view>` are CTAS'd
+// `... AS SELECT <group cols> FROM <intermediate> WHERE FALSE`, and a CTAS
+// records NO catalog dependency on the table it selected from. So dropping a
+// companion leaves the intermediate untouched and vice versa — the two failure
+// shapes are independent, and the heal must probe them independently. Before
+// this, the heal returned early whenever the INTERMEDIATE was present, so the
+// `internal-tables-exist` finding for a lone missing companion could never be
+// cleared by its own printed remedy.
+
+/// (9) Bug 1b: only `__reflex_affected_<view>` is dropped. The audit reports it
+/// and its printed remedy must recreate it and clear the finding.
+#[pg_test]
+fn ps10_dropped_affected_alone_printed_remedy_converges() {
+    ps10_make_unpartitioned_aggregate("ps10_c8_src", "ps10_c8_view");
+    Spi::run("DROP TABLE __reflex_affected_ps10_c8_view").expect("drop affected");
+    assert_eq!(
+        ps10_count(
+            "SELECT count(*) FROM pg_class WHERE relname = '__reflex_intermediate_ps10_c8_view'"
+        ),
+        1,
+        "fixture precondition: dropping the affected table must leave the intermediate"
+    );
+
+    ps10_run_printed_remedy("ps10_c8_view");
+
+    assert_eq!(
+        ps10_count("SELECT count(*) FROM pg_class WHERE relname = '__reflex_affected_ps10_c8_view'"),
+        1,
+        "the printed remedy must recreate the lone missing group-capture table"
+    );
+    let report = ps10_audit("ps10_c8_view");
+    assert!(
+        ps10_findings(&report, "internal-tables-exist").is_empty(),
+        "the printed remedy must CLEAR its own finding:\n{report}"
+    );
+
+    Spi::run("INSERT INTO ps10_c8_src VALUES (4,'ap',7)").expect("insert");
+    Spi::run("UPDATE ps10_c8_src SET amount = 999 WHERE id = 1").expect("update");
+    Spi::run("DELETE FROM ps10_c8_src WHERE id = 2").expect("delete");
+    assert_eq!(
+        ps10_diff_count(
+            "SELECT region, total FROM ps10_c8_view",
+            "SELECT region, SUM(amount) FROM ps10_c8_src GROUP BY region"
+        ),
+        0,
+        "the repaired IMV must maintain incrementally after INSERT/UPDATE/DELETE"
+    );
+}
+
+/// (10) Bug 1b, top-K twin: only `__reflex_shrunk_<view>` is dropped. It is the
+/// companion the UPDATE path scopes its forced MIN/MAX recompute to, so a
+/// silently absent one wedges maintenance of exactly the plan that needs it.
+#[pg_test]
+fn ps10_dropped_shrunk_alone_is_healed_by_reconcile() {
+    Spi::run("CREATE TABLE ps10_c7_src (id BIGINT, grp TEXT NOT NULL, v INT)").expect("src");
+    Spi::run(
+        "INSERT INTO ps10_c7_src SELECT i, 'g' || (i % 4), i FROM generate_series(1, 40) i",
+    )
+    .expect("seed");
+    Spi::run(
+        "SELECT create_reflex_ivm('ps10_c7_view', \
+           'SELECT grp, MIN(v) AS mn, MAX(v) AS mx FROM ps10_c7_src GROUP BY grp')",
+    )
+    .expect("create top-K IMV");
+    assert_eq!(
+        ps10_count("SELECT count(*) FROM pg_class WHERE relname = '__reflex_shrunk_ps10_c7_view'"),
+        1,
+        "fixture precondition: a MIN/MAX plan owns a shrunk-groups table"
+    );
+
+    Spi::run("DROP TABLE __reflex_shrunk_ps10_c7_view").expect("drop shrunk");
+    assert_eq!(
+        ps10_count(
+            "SELECT count(*) FROM pg_class WHERE relname = '__reflex_intermediate_ps10_c7_view'"
+        ),
+        1,
+        "fixture precondition: dropping the shrunk table must leave the intermediate"
+    );
+
+    let res = Spi::get_one::<String>("SELECT reflex_reconcile('ps10_c7_view')")
+        .expect("reconcile errored")
+        .expect("NULL reconcile result");
+    assert_eq!(res, "RECONCILED", "reconcile must succeed");
+    assert_eq!(
+        ps10_count("SELECT count(*) FROM pg_class WHERE relname = '__reflex_shrunk_ps10_c7_view'"),
+        1,
+        "reconcile must recreate the lone missing shrunk-groups table"
+    );
+
+    Spi::run("UPDATE ps10_c7_src SET v = v + 1000 WHERE id IN (1,2,3)").expect("update");
+    Spi::run("DELETE FROM ps10_c7_src WHERE id BETWEEN 5 AND 9").expect("delete");
+    Spi::run("INSERT INTO ps10_c7_src VALUES (99,'g1',-5)").expect("insert");
+    assert_eq!(
+        ps10_diff_count(
+            "SELECT grp, mn, mx FROM ps10_c7_view",
+            "SELECT grp, MIN(v), MAX(v) FROM ps10_c7_src GROUP BY grp"
+        ),
+        0,
+        "the repaired top-K IMV must maintain incrementally"
+    );
+}

@@ -35,7 +35,17 @@ use crate::validate_view_name;
 /// Gated on [`crate::sql_writer::registry::owns_intermediate`] — the same predicate
 /// the audit classifies with — so it cannot build an intermediate for a passthrough
 /// IMV or a decomposed wrapper (the mirror image of the phantom drift PS-9 removed).
+///
+/// Two INDEPENDENT probes, in build order: the intermediate first, then the
+/// group-capture companions — which a CTAS leaves with no catalog dependency on
+/// the intermediate, so either side can be dropped without the other and a single
+/// probe of the intermediate would silently skip half the damage.
 fn heal_missing_intermediate(view_name: &str) {
+    heal_missing_intermediate_table(view_name);
+    heal_missing_group_capture_tables(view_name);
+}
+
+fn heal_missing_intermediate_table(view_name: &str) {
     let intermediate = intermediate_table_name(view_name);
 
     let record = Spi::connect(|client| {
@@ -163,7 +173,7 @@ fn heal_missing_intermediate(view_name: &str) {
         for ddl in build_indexes_ddl(view_name, &plan) {
             client.update(&ddl, None, &[]).unwrap_or_report();
         }
-        for ddl in crate::schema_builder::build_group_capture_ddl(view_name, &plan) {
+        for (_, ddl) in crate::schema_builder::build_group_capture_ddl(view_name, &plan) {
             client.update(&ddl, None, &[]).unwrap_or_report();
         }
         true
@@ -175,6 +185,87 @@ fn heal_missing_intermediate(view_name: &str) {
              The IMV was not being maintained while they were absent; this reconcile refills it.",
             view_name,
             intermediate
+        );
+    }
+}
+
+/// Recreate the group-capture companions — `__reflex_affected_<view>` and, for a
+/// top-K MIN/MAX plan, `__reflex_shrunk_<view>` — that are absent while the
+/// intermediate itself is present.
+///
+/// They are built as `CREATE UNLOGGED TABLE … AS SELECT … FROM <intermediate>
+/// WHERE FALSE`, and a CTAS records NO catalog dependency on the relation it read.
+/// So `DROP TABLE __reflex_affected_<view>` leaves the intermediate untouched and
+/// vice versa: the two absences are independent, and a heal gated on the
+/// intermediate alone can never repair the companion-only shape. Nothing else in
+/// the extension re-issues that DDL, yet `internal-tables-exist` reports a missing
+/// `__reflex_affected_<view>` at Error severity and prints `reflex_rebuild_imv` —
+/// an alias for [`reflex_reconcile`] — as its remedy, so before this the finding
+/// could not be cleared by the fix the tool itself prescribed.
+///
+/// Runs AFTER [`heal_missing_intermediate_table`] so the intermediate these DDLs
+/// select from is present whenever it can be. When it is still absent — that heal
+/// refused an untypable shape, or the row carries no rebuildable plan — this is a
+/// no-op rather than a 42P01: the missing intermediate is the finding to act on.
+fn heal_missing_group_capture_tables(view_name: &str) {
+    let record =
+        match Spi::connect(|client| crate::sql_writer::registry::read_imv(client, view_name)) {
+            Some(r) if r.enabled && r.owns_intermediate() => r,
+            _ => return,
+        };
+    let plan = match record.plan {
+        Some(p) => p,
+        None => return,
+    };
+    let capture_ddl = crate::schema_builder::build_group_capture_ddl(view_name, &plan);
+    if capture_ddl.is_empty() {
+        return;
+    }
+    let intermediate = intermediate_table_name(view_name);
+
+    let missing: Vec<(String, String)> = Spi::connect(|client| {
+        if !relation_present(client, &intermediate) {
+            return Vec::new();
+        }
+        capture_ddl
+            .into_iter()
+            .filter(|(name, _)| !relation_present(client, name))
+            .collect()
+    });
+    if missing.is_empty() {
+        return;
+    }
+
+    let recreated = Spi::connect_mut(|client| {
+        // Same two-key advisory lock and re-probe-under-the-lock pattern as the
+        // intermediate heal above, for the same reason: `CREATE TABLE IF NOT
+        // EXISTS … AS SELECT` is not race-safe against a concurrent healer whose
+        // CREATE is still uncommitted.
+        let _ = client.update(
+            "SELECT pg_advisory_xact_lock(hashtext($1), hashtext(reverse($1)))",
+            None,
+            &[unsafe {
+                DatumWithOid::new(view_name.to_string(), PgBuiltInOids::TEXTOID.oid().value())
+            }],
+        );
+        let mut recreated: Vec<String> = Vec::new();
+        for (name, ddl) in &missing {
+            if relation_present(client, name) {
+                continue;
+            }
+            client.update(ddl, None, &[]).unwrap_or_report();
+            recreated.push(name.clone());
+        }
+        recreated
+    });
+
+    if !recreated.is_empty() {
+        warning!(
+            "pg_reflex: recreated the missing group-capture table(s) of IMV '{}' ({}). \
+             Maintenance could not record affected groups while they were absent; \
+             this reconcile refills the IMV.",
+            view_name,
+            recreated.join(", ")
         );
     }
 }
