@@ -71,6 +71,12 @@ fn audit_probe_calibration_passthrough_is_sublinear() {
 
 /// PLAN-QUALITY: an aggregate IMV joining a secondary dimension table must
 /// maintain a 1-row primary delta in O(delta), not re-aggregate the whole base.
+///
+/// `dim = i` (PS-13/gap-2): group count scales 1:1 with the base, so the small
+/// vs big comparison actually exercises O(base) vs O(delta), not two runs of
+/// identical fixed-100-group work. Safe since PS-13 confirmed the target sync
+/// is index/pruning-driven, not O(total groups); the dimension table scales
+/// alongside the fact table so every generated `dim` still finds its label.
 #[pg_test]
 fn audit_multisource_aggregate_secondary_join_is_sublinear() {
     for (suf, n) in [("s", 20000_i32), ("b", 500000_i32)] {
@@ -79,9 +85,9 @@ fn audit_multisource_aggregate_secondary_join_is_sublinear() {
         Spi::run(&format!(
             "CREATE TABLE ma_dim_{s} (dim INT PRIMARY KEY, label TEXT)", s = suf)).unwrap();
         Spi::run(&format!(
-            "INSERT INTO ma_dim_{s} SELECT d, 'L'||d FROM generate_series(1,100) d", s = suf)).unwrap();
+            "INSERT INTO ma_dim_{s} SELECT d, 'L'||d FROM generate_series(1,{n}) d", s = suf, n = n)).unwrap();
         Spi::run(&format!(
-            "INSERT INTO ma_fact_{s} SELECT i, i % 100 + 1, i FROM generate_series(1,{n}) i",
+            "INSERT INTO ma_fact_{s} SELECT i, i, i FROM generate_series(1,{n}) i",
             s = suf, n = n)).unwrap();
         crate::create_reflex_ivm(
             &format!("ma_v_{s}", s = suf),
@@ -145,13 +151,16 @@ fn audit_in_subquery_filter_skips_out_of_filter_update() {
 
 /// PLAN-QUALITY: a single-source GROUP BY aggregate must maintain a 1-row delta
 /// by recomputing only the affected group, not re-aggregating the whole base.
+///
+/// `g = i` (PS-13/gap-2): group count scales 1:1 with the base — see the
+/// multisource probe above for why a fixed group count made this a smoke test.
 #[pg_test]
 fn audit_single_source_aggregate_is_sublinear() {
     for (suf, n) in [("s", 20000_i32), ("b", 500000_i32)] {
         Spi::run(&format!(
             "CREATE TABLE sa_{s} (id INT PRIMARY KEY, g INT, v NUMERIC)", s = suf)).unwrap();
         Spi::run(&format!(
-            "INSERT INTO sa_{s} SELECT i, i % 1000, i FROM generate_series(1,{n}) i",
+            "INSERT INTO sa_{s} SELECT i, i, i FROM generate_series(1,{n}) i",
             s = suf, n = n)).unwrap();
         crate::create_reflex_ivm(
             &format!("sa_v_{s}", s = suf),
@@ -167,6 +176,10 @@ fn audit_single_source_aggregate_is_sublinear() {
 }
 
 /// PLAN-QUALITY: inner-join aggregate, 1-row primary delta stays O(delta).
+///
+/// `dim = i` (PS-13/gap-2): group count scales 1:1 with the base — see the
+/// multisource probe above. The dimension table scales alongside the fact
+/// table so an INNER JOIN still matches every generated row.
 #[pg_test]
 fn audit_inner_join_aggregate_is_sublinear() {
     for (suf, n) in [("s", 20000_i32), ("b", 500000_i32)] {
@@ -175,9 +188,9 @@ fn audit_inner_join_aggregate_is_sublinear() {
         Spi::run(&format!(
             "CREATE TABLE ija_dim_{s} (dim INT PRIMARY KEY, label TEXT)", s = suf)).unwrap();
         Spi::run(&format!(
-            "INSERT INTO ija_dim_{s} SELECT d, 'L'||d FROM generate_series(1,100) d", s = suf)).unwrap();
+            "INSERT INTO ija_dim_{s} SELECT d, 'L'||d FROM generate_series(1,{n}) d", s = suf, n = n)).unwrap();
         Spi::run(&format!(
-            "INSERT INTO ija_fact_{s} SELECT i, i % 100 + 1, i FROM generate_series(1,{n}) i",
+            "INSERT INTO ija_fact_{s} SELECT i, i, i FROM generate_series(1,{n}) i",
             s = suf, n = n)).unwrap();
         crate::create_reflex_ivm(
             &format!("ija_v_{s}", s = suf),
@@ -197,13 +210,16 @@ fn audit_inner_join_aggregate_is_sublinear() {
 /// PLAN-QUALITY: CTE-decomposed aggregate, 1-row delta stays O(delta).
 /// NOTE: CTE-decomposed views create sub-IMVs with generated names (__cte_agg).
 /// We query the sub-IMV timing, not the main IMV, since that's where the work is recorded.
+///
+/// `dim = i` (PS-13/gap-2): group count scales 1:1 with the base — see the
+/// multisource probe above for why a fixed group count made this a smoke test.
 #[pg_test]
 fn audit_cte_decomposed_is_sublinear() {
     for (suf, n) in [("s", 20000_i32), ("b", 500000_i32)] {
         Spi::run(&format!(
             "CREATE TABLE cd_fact_{s} (id INT PRIMARY KEY, dim INT, amt NUMERIC)", s = suf)).unwrap();
         Spi::run(&format!(
-            "INSERT INTO cd_fact_{s} SELECT i, i % 100 + 1, i FROM generate_series(1,{n}) i",
+            "INSERT INTO cd_fact_{s} SELECT i, i, i FROM generate_series(1,{n}) i",
             s = suf, n = n)).unwrap();
         crate::create_reflex_ivm(
             &format!("cd_v_{s}", s = suf),
