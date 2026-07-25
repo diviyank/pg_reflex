@@ -6,7 +6,6 @@ pg_reflex reads a handful of runtime settings via `current_setting`. None requir
 |---|---|---|---|
 | [`reflex.wipe_threshold`](#reflexwipe_threshold) | float `0`–`1` | `0.5` | Dirty-row fraction at or above which a batch wipes-and-rebuilds instead of applying a delta. |
 | [`reflex.wipe_floor_rows`](#reflexwipe_floor_rows) | integer | `1000` | Floor on the partition-size denominator of the dirty ratio. |
-| [`reflex.assert_inplace_update`](#reflexassert_inplace_update) | boolean | `off` | Correctness assertion on the in-place UPDATE path; for CI/fuzz. |
 | [`pg_reflex.alter_source_policy`](#pg_reflexalter_source_policy) | enum | `warn` | Reaction to `ALTER TABLE` on a tracked source. |
 | [`pg_reflex.debug_resolve_anchor`](#pg_reflexdebug_resolve_anchor) | boolean | `off` | 1.10.8+. When on, emits `REFLEX-DBG resolve_anchor` NOTICEs; off by default to avoid burying real WARNINGs. |
 
@@ -31,14 +30,6 @@ Resolution order: per-IMV [`reflex_set_wipe_floor_rows`](reflex_set_wipe_floor_r
 
 ```sql
 SET reflex.wipe_floor_rows = 5000;
-```
-
-## `reflex.assert_inplace_update`
-
-When `on`, the in-place UPDATE path re-derives the affected key set and `RAISE`s on any mismatch — a correctness assertion intended for CI and fuzz runs. Default `off`; leave it off in production, where the extra work is pure overhead.
-
-```sql
-SET reflex.assert_inplace_update = on;   -- CI / fuzz only
 ```
 
 ## `pg_reflex.alter_source_policy`

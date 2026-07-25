@@ -766,12 +766,12 @@ fn test_passthrough_auto_pk_recorded_in_catalog() {
 
 /// Partitioned passthrough IMV with a WHERE filter and a LEFT JOIN. Forces the
 /// COLD dispatch path (high wipe_threshold) so it exercises the keyed cold
-/// maintenance that Phase 2 turns into an in-place upsert. Covers: (a) pure-data
-/// UPDATE, (b) a row LEAVING the filter without the source row vanishing, (c) a
-/// new key entering, (d) a key-column change, (e) a delete. The IMV must match a
-/// fresh recompute after each op (today via DELETE+INSERT; Phase 2 via upsert).
+/// DELETE+INSERT maintenance. Covers: (a) pure-data UPDATE, (b) a row LEAVING
+/// the filter without the source row vanishing, (c) a new key entering, (d) a
+/// key-column change, (e) a delete. The IMV must match a fresh recompute after
+/// each op.
 #[pg_test]
-fn pt_inplace_upsert_filter_and_keychange_oracle() {
+fn pt_cold_partitioned_update_filter_and_keychange_oracle() {
     Spi::run("CREATE TABLE up_src (id BIGINT NOT NULL, region TEXT NOT NULL, status TEXT NOT NULL, qty BIGINT, PRIMARY KEY (id, region)) PARTITION BY LIST (region)").expect("src");
     for r in ["A", "B"] {
         Spi::run(&format!("CREATE TABLE up_src_{} PARTITION OF up_src FOR VALUES IN ('{}')", r, r)).expect("p");
@@ -800,8 +800,7 @@ fn pt_inplace_upsert_filter_and_keychange_oracle() {
     // Force the COLD dispatch path by setting an impossible wipe_threshold (2.0).
     // With default wipe_threshold (0.5), small changes on small partitions would
     // get classified HOT and take the atomic-swap reconcile path, bypassing the
-    // keyed-maintenance code that Phase 2 optimizes. This guard ensures Phase 2's
-    // in-place upsert actually exercises the cold path.
+    // keyed cold maintenance under test.
     Spi::run("SELECT reflex_set_wipe_threshold('up_v', 2.0::NUMERIC)").expect("force cold");
 
     assert_imv_correct("up_v", sql);
@@ -836,15 +835,11 @@ fn pt_inplace_upsert_filter_and_keychange_oracle() {
 /// as a phantom on a filter-exit, and as a phantom PLUS a duplicate on a
 /// NULL -> non-NULL key change.
 ///
-/// This passes today because the cold partitioned UPDATE runs the standard
-/// keyed DELETE+INSERT body, whose predicate was made NULL-safe in
-/// `passthrough_keyed_delete_predicate`. It is kept as the end-to-end guard for
-/// the in-place variant of that body (`trigger::dispatch::InplaceSpec`), which
-/// is currently unreachable — see `untreated_bugs/` for why — and whose own
-/// membership predicate is NULL-safe as of this change. Revive that path with a
-/// NULL-blind predicate and this test goes red.
+/// The cold partitioned UPDATE runs the keyed DELETE+INSERT body, whose
+/// predicate was made NULL-safe in `passthrough_keyed_delete_predicate`. Make
+/// that predicate NULL-blind again and this test goes red.
 #[pg_test]
-fn pt_inplace_nullable_key_cold_update_no_phantom_row() {
+fn pt_cold_partitioned_nullable_key_update_no_phantom_row() {
     Spi::run(
         "CREATE TABLE nkp_src (id BIGINT, region TEXT NOT NULL, status TEXT NOT NULL, qty BIGINT) PARTITION BY LIST (region)",
     )
@@ -868,9 +863,9 @@ fn pt_inplace_nullable_key_cold_update_no_phantom_row() {
     .expect("create_reflex_ivm result");
     assert_eq!(res, "CREATE REFLEX INCREMENTAL VIEW");
 
-    // Force the COLD in-place dispatch path (same guard as the sibling
-    // all-NOT-NULL-key test above); the HOT path would atomic-swap the whole
-    // child and never build the keyed membership predicate under test.
+    // Force the COLD dispatch path (same guard as the sibling all-NOT-NULL-key
+    // test above); the HOT path would atomic-swap the whole child and never
+    // build the keyed membership predicate under test.
     Spi::run("SELECT reflex_set_wipe_threshold('nkp_v', 2.0::NUMERIC)").expect("force cold");
     assert_imv_correct("nkp_v", sql);
 

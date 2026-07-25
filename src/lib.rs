@@ -1605,13 +1605,7 @@ pub mod pg_test {
         // transaction end. Raise the per-transaction lock budget so larger ad-hoc
         // runs (PG_REFLEX_FUZZ_CASES up to a few hundred) don't hit "out of shared
         // memory". Very large runs still need batching.
-        //
-        // Enable in-place update assertion in tests: when on, the in-place cold
-        // section re-derives the affected key set and RAISEs on any mismatch.
-        vec![
-            "max_locks_per_transaction = 4096",
-            "reflex.assert_inplace_update = on",
-        ]
+        vec!["max_locks_per_transaction = 4096"]
     }
 }
 

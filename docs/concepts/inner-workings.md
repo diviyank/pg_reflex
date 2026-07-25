@@ -298,23 +298,15 @@ A passthrough IMV (`SELECT … FROM source [WHERE …]`, no GROUP BY) has **no i
   DELETE FROM <view> WHERE (<target keys>) IN (SELECT <source keys> FROM <old>);
   INSERT INTO <view> SELECT … FROM ( <base_query with source → <new>> );
   ```
-- **Keyed, partitioned (1.9.x)**: the hot partitions swap; the **cold path** does a true in-place upsert instead of delete+reinsert (the 1.9.1 headline):
+- **Keyed, partitioned**: the hot partitions swap; the **cold path** runs the same keyed delete + delta insert, each statement restricted to the cold partitions:
   ```sql
-  -- project the cold delta into a temp table (LIST: prune by partition key; RANGE: by child name)
-  CREATE TEMP TABLE <proj> ON COMMIT DROP AS
-    SELECT * FROM ( <delta_new> ) __r WHERE <cold-partition predicate>;
-  -- pure-data update of the rows that stayed
-  INSERT INTO <view> (<keys>, <non-key cols>) SELECT … FROM <proj>
-    ON CONFLICT (<keys>) DO UPDATE SET <non-key col> = EXCLUDED.<non-key col>, … ;
-  -- remove rows that disappeared or left the WHERE filter (delete-gone)
-  DELETE FROM <view> __t WHERE (<keys>) IN (SELECT <source keys> FROM <old>)
-    AND <cold-partition predicate>
-    AND NOT EXISTS (SELECT 1 FROM <proj> __r WHERE __t.<key> = __r.<key>);
+  DELETE FROM <view> WHERE (<target keys>) IN (SELECT <source keys> FROM <old>)
+    AND <cold-partition predicate>;
+  INSERT INTO <view> SELECT * FROM ( <delta_new> ) __pt WHERE <cold-partition predicate>;
   ```
-  The non-key column list is resolved at codegen time from `pg_attribute` (`resolve_inplace_non_key_cols`); if that can't run (e.g. unit-test context), the path falls back to delete+insert. The optional `reflex.assert_inplace_update` GUC re-derives the affected keys afterward and raises on any divergence from a fresh recompute — a correctness canary, off by default.
 - **Keyless**: full rebuild.
 
-The in-place upsert takes only `RowExclusiveLock` (INSERT/UPDATE, no TRUNCATE), so partitioned passthrough readers stay live.
+The cold body takes only `RowExclusiveLock` (DELETE/INSERT, no TRUNCATE), so partitioned passthrough readers stay live.
 
 ---
 

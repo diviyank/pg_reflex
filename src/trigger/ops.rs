@@ -889,67 +889,6 @@ pub(crate) fn outer_join_secondary_stmts(
 /// `view`/the delta projection, the source name used to read the touched
 /// partition values from the scratch tables (the two differ when the partition
 /// column is aliased in the projection), and the partition strategy ("LIST" |
-/// Resolve the non-key columns of the target view at codegen time via SPI.
-/// Returns a Vec of quoted column names (e.g., "\"qty\"", "\"price\""), excluding
-/// the key columns. If the target cannot be resolved or has no non-key columns,
-/// returns an empty Vec (which signals fallback to standard DELETE+INSERT).
-fn resolve_inplace_non_key_cols(view_name: &str, key_target_cols: &[String]) -> Vec<String> {
-    use pgrx::datum::DatumWithOid;
-    use pgrx::spi::Spi;
-    use pgrx::PgBuiltInOids;
-
-    // Codegen also runs in plain #[test] unit tests with no backend, where Spi
-    // would panic on the weak SPI_connect stub. CurrentMemoryContext is NULL only
-    // in that stub context; in a real backend (create/flush, #[pg_test]) it is set.
-    // No backend → return empty so the caller falls back to DELETE+INSERT.
-    if unsafe { pgrx::pg_sys::CurrentMemoryContext.is_null() } {
-        return Vec::new();
-    }
-
-    // Build a normalized set of key column names for filtering.
-    let key_names: std::collections::HashSet<String> = key_target_cols
-        .iter()
-        .map(|c| {
-            // Remove quotes and normalize for comparison
-            let unquoted = c.trim_matches('"');
-            unquoted.to_lowercase()
-        })
-        .collect();
-
-    let result = Spi::connect(|client| {
-        // Query the target's columns in attnum order, excluding dropped columns.
-        // Return quoted column names.
-        let rows = client
-            .select(
-                "SELECT attname FROM pg_attribute \
-                 WHERE attrelid = $1::regclass AND attnum > 0 AND NOT attisdropped \
-                 ORDER BY attnum",
-                None,
-                &[unsafe {
-                    DatumWithOid::new(view_name.to_string(), PgBuiltInOids::TEXTOID.oid().value())
-                }],
-            )
-            .unwrap_or_report();
-
-        rows.filter_map(|row| {
-            row.get_by_name::<String, _>("attname")
-                .unwrap_or(None)
-                .and_then(|name| {
-                    let norm = name.to_lowercase();
-                    // Exclude key columns (use lowercase comparison).
-                    if !key_names.contains(&norm) {
-                        Some(format!("\"{}\"", name))
-                    } else {
-                        None
-                    }
-                })
-        })
-        .collect::<Vec<String>>()
-    });
-
-    result
-}
-
 /// "RANGE"). Returns `None` when the plan is not LIST/RANGE-partitioned, so the
 /// caller emits the plain keyed delete/insert.
 fn passthrough_partition_dispatch_cols(
@@ -1183,7 +1122,6 @@ pub(crate) fn passthrough_op_stmts(
                         &strategy,
                         &del_cold,
                         "",
-                        None,
                     ));
                 } else {
                     let del_match = passthrough_keyed_delete_match(
@@ -1267,50 +1205,19 @@ pub(crate) fn passthrough_op_stmts(
                     );
                     debug_assert!(
                         operation == "UPDATE" && !mappings.is_empty(),
-                        "in-place cold path only valid for keyed passthrough UPDATE"
+                        "partitioned cold path only valid for keyed passthrough UPDATE"
                     );
 
-                    // Resolve non-key columns at codegen time via SPI.
-                    // This avoids runtime column list construction and ensures the upsert
-                    // can cover all target columns (keys ∪ non-keys) correctly.
-                    let non_key_cols = resolve_inplace_non_key_cols(view_name, &target_cols);
-
-                    if !non_key_cols.is_empty() {
-                        // In-place optimization is viable: we have both key and non-key columns.
-                        let spec = crate::trigger::dispatch::InplaceSpec {
-                            delta_new: &delta_new,
-                            key_target_cols: &target_cols,
-                            key_source_cols: &source_cols,
-                            non_key_cols: &non_key_cols,
-                            pt_old: &pt_old,
-                            not_null_columns: &plan.not_null_columns,
-                        };
-                        stmts.push(build_passthrough_partition_dispatch_sql(
-                            view_name,
-                            &qv,
-                            &aff,
-                            &part_col,
-                            &format!("{}.{}", qv, part_col_q),
-                            &strategy,
-                            &del_cold,
-                            &ins_cold,
-                            Some(&spec),
-                        ));
-                    } else {
-                        // Fallback: non-key resolution failed or target cannot be resolved.
-                        // Use standard DELETE+INSERT path (passes None for inplace).
-                        stmts.push(build_passthrough_partition_dispatch_sql(
-                            view_name,
-                            &qv,
-                            &aff,
-                            &part_col,
-                            &format!("{}.{}", qv, part_col_q),
-                            &strategy,
-                            &del_cold,
-                            &ins_cold,
-                            None,
-                        ));
-                    }
+                    stmts.push(build_passthrough_partition_dispatch_sql(
+                        view_name,
+                        &qv,
+                        &aff,
+                        &part_col,
+                        &format!("{}.{}", qv, part_col_q),
+                        &strategy,
+                        &del_cold,
+                        &ins_cold,
+                    ));
                 } else {
                     // PS-5 — gated pair on the unpartitioned path only; see the
                     // DELETE branch for why the partition-dispatch DO block above
