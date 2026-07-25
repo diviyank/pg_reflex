@@ -192,7 +192,7 @@ pub fn bare_column_name(col: &str) -> &str {
 /// the type-probe `column_types` map keyed by Postgres's stored attname) matches
 /// the stored, truncated name — otherwise the lookup misses and the column is
 /// mis-typed (see the carried-EXISTS / long-group-key-expression regressions).
-fn truncate_identifier(mut s: String) -> String {
+pub(crate) fn truncate_identifier(mut s: String) -> String {
     const MAX_IDENT_BYTES: usize = 63;
     if s.len() > MAX_IDENT_BYTES {
         let mut end = MAX_IDENT_BYTES;

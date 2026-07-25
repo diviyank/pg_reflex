@@ -790,6 +790,19 @@ fn reflex_rebuild_triggers(source_table: &str) -> String {
     create_ivm::reflex_rebuild_triggers_impl(source_table)
 }
 
+/// Repair primitive for a materialised UNION-ALL wrapper's per-operand
+/// `__reflex_union_mirror_{ins,del,upd}_<wrapper>_<i>` triggers
+/// (`install_union_mirror_triggers`, create-time only). Re-running it heals a
+/// dropped trigger, a dropped trigger function, or both, for every operand
+/// recorded in the wrapper's `depends_on`. Refuses (clean `ERROR: ...`
+/// string, not a raise) a VIEW wrapper — which has no operand triggers by
+/// design — or a non-wrapper IMV. See
+/// `untreated_bugs/2026-07-24_union_mirror_triggers_unchecked.md`.
+#[pg_extern]
+fn reflex_rebuild_union_mirror(wrapper: &str) -> String {
+    create_ivm::reflex_rebuild_union_mirror_impl(wrapper)
+}
+
 /// Rebuild a decomposed (CTE/set-op) IMV chain from the stored registry spec.
 /// CASCADE-drops the top IMV and all sub-IMVs, then recreates them faithfully
 /// using the stored creation parameters. Atomicity guaranteed: drop + recreate
@@ -1569,6 +1582,7 @@ mod tests {
     include!("tests/pg_test_ps12.rs");
     include!("tests/pg_test_psca_skip_signal.rs");
     include!("tests/pg_test_ps14.rs");
+    include!("tests/pg_test_ps17.rs");
 }
 
 /// This module is required by `cargo pgrx test` invocations.

@@ -471,6 +471,128 @@ pub(crate) fn reflex_rebuild_triggers_impl(source_table: &str) -> String {
     }
 }
 
+/// Repair primitive for a **materialised** UNION-ALL wrapper's
+/// `__reflex_union_mirror_{ins,del,upd}_<wrapper>_<i>` triggers
+/// (`install_union_mirror_triggers`, `create_ivm/decompose.rs`). That
+/// installer only ever runs at create time; if a mirror trigger (or its
+/// underlying function) is dropped, nothing re-creates it, and the wrapper
+/// silently stops receiving that operand's deltas. `reflex_rebuild_triggers`
+/// is the wrong primitive here — it installs the *consolidated*
+/// `__reflex_trigger_*` set, which does not belong on a wrapper operand and
+/// does not clear a mirror-trigger finding (see
+/// `untreated_bugs/2026-07-24_union_mirror_triggers_unchecked.md`).
+///
+/// `wrapper` must name a decomposed-wrapper registry row
+/// (`end_query = '' AND aggregations::text = '{}'`) whose relation is a
+/// TABLE (`relkind = 'r'`) — a VIEW wrapper has no operand triggers by
+/// design. Both conditions are refused with a plain `ERROR: ...` string
+/// (never a raised error), matching this module's other admin entry points.
+///
+/// The operand index `i` is the operand's position in `depends_on`, which is
+/// exactly how `install_union_all_intermediate_wrapper` derived it at create
+/// time (`operand_sub_imv_names.iter().enumerate()`), so it is fully
+/// recoverable from the registry alone. `install_union_mirror_triggers` is
+/// idempotent (`CREATE OR REPLACE FUNCTION` + `DROP TRIGGER IF EXISTS` /
+/// `CREATE TRIGGER`), so re-running it per operand heals a dropped function,
+/// a dropped attachment, or both in one call.
+pub(crate) fn reflex_rebuild_union_mirror_impl(wrapper: &str) -> String {
+    let result: Result<usize, String> = Spi::connect_mut(|client| {
+        let header = client
+            .select(
+                "SELECT depends_on, \
+                        (end_query = '' AND aggregations::text = '{}') AS is_wrapper, \
+                        (SELECT c.relkind::text FROM pg_class c \
+                          WHERE c.oid = to_regclass(name)) AS relkind \
+                 FROM public.__reflex_ivm_reference WHERE name = $1",
+                None,
+                &[unsafe {
+                    DatumWithOid::new(wrapper.to_string(), PgBuiltInOids::TEXTOID.oid().value())
+                }],
+            )
+            .map_err(|e| format!("registry lookup failed: {}", e))?
+            .first();
+        let depends_on = header
+            .get_by_name::<Vec<String>, _>("depends_on")
+            .unwrap_or(None);
+        let is_wrapper = header
+            .get_by_name::<bool, _>("is_wrapper")
+            .unwrap_or(None)
+            .unwrap_or(false);
+        let relkind = header
+            .get_by_name::<&str, _>("relkind")
+            .unwrap_or(None)
+            .map(|s| s.to_string());
+
+        let depends_on = match depends_on {
+            Some(d) if !d.is_empty() => d,
+            Some(_) => return Err(format!("'{}' has no operands recorded in depends_on", wrapper)),
+            None => return Err(format!("IMV '{}' not found in the registry", wrapper)),
+        };
+        if !is_wrapper {
+            return Err(format!(
+                "'{}' is not a decomposed UNION-ALL/set-op wrapper row \
+                 (end_query and aggregations must both be empty) — \
+                 reflex_rebuild_union_mirror only repairs wrapper operand triggers",
+                wrapper
+            ));
+        }
+        match relkind.as_deref() {
+            Some("r") => {}
+            Some("v") => {
+                return Err(format!(
+                    "'{}' is a VIEW wrapper — it has no operand triggers to \
+                     rebuild by design; each operand sub-IMV maintains its own \
+                     target independently",
+                    wrapper
+                ));
+            }
+            _ => return Err(format!("relation '{}' not found", wrapper)),
+        }
+
+        // Payload columns: the wrapper's own attributes (minus the
+        // discriminator) are exactly the operand columns it was built from
+        // (`install_union_all_intermediate_wrapper` derives the wrapper's DDL
+        // from operand 0's columns 1:1), so reading them back off the wrapper
+        // needs no operand access and cannot disagree with what is actually
+        // there to mirror into.
+        let payload_cols: Vec<String> = client
+            .select(
+                "SELECT a.attname::text AS name \
+                 FROM pg_catalog.pg_attribute a \
+                 JOIN pg_catalog.pg_class c ON c.oid = a.attrelid \
+                 WHERE c.oid = to_regclass($1) \
+                   AND a.attnum > 0 AND NOT a.attisdropped \
+                 ORDER BY a.attnum",
+                None,
+                &[unsafe {
+                    DatumWithOid::new(wrapper.to_string(), PgBuiltInOids::TEXTOID.oid().value())
+                }],
+            )
+            .map_err(|e| format!("column lookup failed: {}", e))?
+            .filter_map(|r| {
+                let n = r.get_by_name::<&str, _>("name").ok()??;
+                Some(n.to_string())
+            })
+            .filter(|n| n != "__reflex_src_idx")
+            .collect();
+        if payload_cols.is_empty() {
+            return Err(format!("wrapper '{}' has no payload columns", wrapper));
+        }
+
+        for (i, operand) in depends_on.iter().enumerate() {
+            install_union_mirror_triggers(client, wrapper, operand, i, &payload_cols);
+        }
+        Ok(depends_on.len())
+    });
+    match result {
+        Ok(n) => format!(
+            "pg_reflex: reinstalled union mirror triggers for {} operand(s) of '{}'",
+            n, wrapper
+        ),
+        Err(e) => format!("ERROR: {}", e),
+    }
+}
+
 /// Map information_schema data_type strings to PostgreSQL type names usable in DDL.
 pub(crate) fn map_information_schema_type(data_type: &str) -> String {
     // `format_type` appends type modifiers (`numeric(10,2)`, `character
