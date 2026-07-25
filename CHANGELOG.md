@@ -4,12 +4,15 @@
 
 ## [1.11.1] - 2026-07-24
 
-Audit truthfulness, three silent-wrong-result fixes (nullable-key MIN/MAX
-maintenance, and a materialised UNION-ALL wrapper's mirror trigger functions
-colliding under long wrapper names), wrapper-reconcile safety,
-targeted-recovery observability, a recovery path for a dropped internal
-table, plus a repair primitive and real audit coverage for materialised
-UNION-ALL wrapper mirror triggers. Replace the `.so`, then
+Audit truthfulness, six silent-wrong-result fixes (nullable-key MIN/MAX
+maintenance; a materialised UNION-ALL wrapper's mirror trigger functions
+colliding under long wrapper names; a nullable explicit unique key on a
+passthrough IMV; a LEFT JOIN aggregate grouped by the secondary's join
+column; and the DEFERRED cross-source guard double-reconciling a UNION-ALL
+operand), wrapper-reconcile safety, targeted-recovery observability, a
+recovery path for a dropped internal table, plus a repair primitive and real
+audit coverage for materialised UNION-ALL wrapper mirror triggers. Replace
+the `.so`, then
 `ALTER EXTENSION pg_reflex UPDATE TO '1.11.1';`. The update adds two registry
 columns (fast-default `ADD COLUMN`, no table rewrite) and one corrective metadata
 backfill; no reconcile is needed.
@@ -153,6 +156,41 @@ backfill; no reconcile is needed.
   to the matview-source checks. The 1.11.1 migration re-backfills with a bare-or-
   qualified match mirroring create-time; it only ever flips the flag on, never off, so
   it cannot suppress a maintainable IMV.
+
+- **(silent wrong result)** A passthrough IMV built with an *explicit* unique key over
+  a column that can be NULL in the target silently diverged from its source: the keyed
+  `DELETE`/`UPDATE` maintenance scoped row removal with a plain
+  `(key) IN (SELECT key FROM …)`, and `(NULL) IN (…)` is never TRUE. A source `DELETE`
+  of a NULL-key row left a permanent phantom target row; a source `UPDATE` of one left
+  the stale row in place *and* inserted the new one, colliding on the target's unique
+  index and aborting the caller's own transaction. Fixed with a NULL-safe gated
+  predicate mirroring the 1.11.0 nullable-key aggregate pattern: a sargable `IN`
+  (byte-identical SQL) when every key column is provably `NOT NULL`, a correlated
+  `EXISTS … IS NOT DISTINCT FROM` otherwise. Covers both the primary keyed passthrough
+  path and the LEFT/RIGHT-JOIN secondary keyed path.
+
+- **(silent wrong result)** An aggregate IMV over a LEFT JOIN, grouped by the
+  *secondary* (nullable) side's join column, silently diverged whenever the join's
+  `ON` clause equated two columns sharing the same bare name (e.g.
+  `fa LEFT JOIN fb ON fa.k = fb.k GROUP BY fb.k`): the join-condition mapping matched
+  by bare column name only, so the 1.4.6 incremental fast path treated the group
+  column as stable when it actually migrates NULL↔value as the secondary changes.
+  `INSERT` into the secondary silently double-counted the migrated rows; `DELETE`
+  silently lost them. Fixed by verifying no mapped `GROUP BY` column is
+  secondary-derived before taking the fast path; falls through to the existing
+  (already correct) stable-column recompute otherwise.
+
+- **(silent wrong result)** The DEFERRED cross-source consistency guard (fires when
+  one transaction mutates ≥2 sources of an IMV) reconciled a machine-generated
+  UNION-ALL operand sub-IMV by calling the public `reflex_reconcile` on it directly.
+  Running inside the deferred-flush trigger, that call skipped the
+  trigger-suppressed rebuild path and ran with the operand's own mirror trigger
+  live, silently doubling its materialised wrapper — and anything reading it — on an
+  ordinary transaction touching both of the operand's sources together. Fixed: the
+  guard now rebuilds a generated operand with propagation suppressed and explicitly
+  resyncs the wrapper's operand slice, instead of calling `reflex_reconcile` on it
+  directly. Also now flags `known_stale` (with a reason) instead of silently
+  discarding a staged delta if that repair itself fails.
 
 **Known limitations**
 
