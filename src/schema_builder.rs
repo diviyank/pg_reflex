@@ -195,7 +195,11 @@ pub fn build_delta_scratch_table_ddl(
 ///
 /// Shared by create (`materialize_aggregate`'s caller) and by reconcile's heal step,
 /// so the two cannot emit different shapes for the same IMV.
-pub fn build_group_capture_ddl(view_name: &str, plan: &AggregationPlan) -> Vec<String> {
+///
+/// Each entry is `(relation name, DDL)`. The heal probes the names to decide which
+/// DDL to re-issue, so pairing them here is what keeps "which companions does this
+/// plan own" a single definition rather than a predicate duplicated at the probe.
+pub fn build_group_capture_ddl(view_name: &str, plan: &AggregationPlan) -> Vec<(String, String)> {
     if plan.group_by_columns.is_empty() && plan.distinct_columns.is_empty() {
         return Vec::new();
     }
@@ -207,18 +211,19 @@ pub fn build_group_capture_ddl(view_name: &str, plan: &AggregationPlan) -> Vec<S
         .collect::<Vec<_>>()
         .join(", ");
     let intermediate = intermediate_table_name(view_name);
-    let mut ddl = vec![format!(
-        "CREATE UNLOGGED TABLE IF NOT EXISTS {} AS SELECT {} FROM {} WHERE FALSE",
+    let capture_table = |name: String| {
+        let ddl = format!(
+            "CREATE UNLOGGED TABLE IF NOT EXISTS {} AS SELECT {} FROM {} WHERE FALSE",
+            name, group_cols_csv, intermediate
+        );
+        (name, ddl)
+    };
+    let mut ddl = vec![capture_table(
         crate::query_decomposer::affected_groups_table_name(view_name),
-        group_cols_csv,
-        intermediate
     )];
     if plan.intermediate_columns.iter().any(|ic| ic.has_topk()) {
-        ddl.push(format!(
-            "CREATE UNLOGGED TABLE IF NOT EXISTS {} AS SELECT {} FROM {} WHERE FALSE",
+        ddl.push(capture_table(
             crate::query_decomposer::shrunk_groups_table_name(view_name),
-            group_cols_csv,
-            intermediate
         ));
     }
     ddl

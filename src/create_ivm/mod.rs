@@ -1765,7 +1765,7 @@ fn initial_aggregate_materialization(client: &mut SpiClient<'_>, ctx: &mut Build
     // co-located in the IMV's schema (1.4.1) so SQL works under any `search_path`.
     // Emitted by the shared builder so reconcile's heal step cannot drift from
     // create time.
-    for ddl in crate::schema_builder::build_group_capture_ddl(ctx.view_name, &ctx.plan) {
+    for (_, ddl) in crate::schema_builder::build_group_capture_ddl(ctx.view_name, &ctx.plan) {
         client.update(&ddl, None, &[]).unwrap_or_report();
     }
 
