@@ -6,7 +6,7 @@ This page sorts query patterns into three buckets:
 2. **Supported with a fallback path** — the IMV is created and stays correct, but one or more operations bypass the algebraic delta and fall back to a scoped re-aggregation, full refresh, or read-time computation. Operationally these are slower than the hot algebraic path; functionally they're correct.
 3. **Operator-side workarounds** — patterns that look unsupported but have a straightforward rewrite that lands on a supported shape.
 
-The journal entry [`2026-04-22_unsupported_views.md`](https://github.com/diviyank/pg_reflex/blob/main/journal/2026-04-22_unsupported_views.md) (1.1.2 era) catalogues a real production deployment's matview inventory. Several of those have since become eligible — auto-on top-K closes the MIN/MAX retraction cliff, FULL OUTER JOIN now flows through the targeted-reconcile fallback, and window functions over passthrough decompose to a sub-IMV plus read-time VIEW. The historical journal is still useful for shape-class analysis, but treat its "supported" verdicts as a snapshot, not the current truth.
+The journal entry [`2026-04-22_unsupported_views.md`](https://github.com/diviyank/pg_reflex/blob/main/journal/2026-04-22_unsupported_views.md) (1.1.2 era) catalogues a real production deployment's matview inventory. Several of those have since become eligible — auto-on top-K closes the MIN/MAX retraction cliff, FULL OUTER JOIN now flows through a full-rebuild fallback, and window functions over passthrough decompose to a sub-IMV plus read-time VIEW. The historical journal is still useful for shape-class analysis, but treat its "supported" verdicts as a snapshot, not the current truth.
 
 ---
 
@@ -177,9 +177,9 @@ FROM employees
 
 `FULL JOIN` produces rows on both sides of the output — matched rows plus NULL-extended rows from each side. The algebraic delta tracks one source at a time, so on every INSERT/DELETE/UPDATE on either side, the engine cannot determine the matched-↔-unmatched transitions for the other side from delta alone.
 
-**Status**: ✅ Supported via fallback. Aggregate `FULL JOIN` IMVs route through the targeted-reconcile path (extract affected groups from the delta, re-aggregate those groups from the full source). Passthrough `FULL JOIN` IMVs fall back to a full `DELETE + INSERT` from `base_query` on retract.
+**Status**: ✅ Supported via fallback. Both aggregate and passthrough `FULL JOIN` IMVs fall back to a full intermediate + target rebuild on every mutation to either side (2026-07-25: an earlier targeted-reconcile fast path for aggregate `FULL JOIN` was found to silently drop rows — an unmatched-side insert can surface a brand-new group that the scoped recompute's membership predicate never scopes into — and was removed in favour of the same unconditional rebuild the passthrough case already used).
 
-**Cost shape**: every retraction (DELETE/UPDATE on the secondary side) re-aggregates the affected groups from the full source — same cost as the 1.2.0 scoped-recompute path. INSERTs on the primary side use the algebraic delta as normal.
+**Cost shape**: every mutation on either side triggers a full rebuild of the intermediate and target from `base_query` — there is currently no scoped or algebraic path for this shape.
 
 **What would unlock the algebraic path**: generalised delta computation that tracks `MATCH ↔ NULL` transitions on both sides simultaneously. Out of scope for the current release.
 

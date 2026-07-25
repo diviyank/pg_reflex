@@ -3155,6 +3155,40 @@ fn test_correctness_full_outer_join_aggregate() {
     assert_imv_correct("cc_foj_v", sql);
 }
 
+/// 2026-07-25 ljgroup bug (untreated_bugs): FULL OUTER JOIN aggregate with a
+/// GROUP BY on the PRIMARY side's bare column (not a COALESCE of both sides)
+/// looked "stable" to the scoped-recompute heuristics — its qualifier isn't
+/// the secondary table being mutated. But a FULL JOIN's unmatched-row
+/// semantics mean an insert into the secondary with no matching primary row
+/// surfaces a brand-new group the scoped recompute's membership predicate
+/// (keyed on the mutated side's join value) never scopes into, silently
+/// dropping the new group's row.
+#[pg_test]
+fn test_correctness_full_outer_join_aggregate_primary_group_by() {
+    Spi::run("CREATE TABLE foja (id INT PRIMARY KEY, k TEXT)").expect("create foja");
+    Spi::run("CREATE TABLE fojb (k TEXT PRIMARY KEY, w INT NOT NULL)").expect("create fojb");
+    Spi::run("INSERT INTO foja VALUES (1, 'a'), (2, 'b')").expect("seed foja");
+    Spi::run("INSERT INTO fojb VALUES ('a', 100)").expect("seed fojb");
+
+    let sql = "SELECT foja.k AS k, COUNT(*) AS cnt \
+               FROM foja FULL JOIN fojb ON foja.k = fojb.k \
+               GROUP BY foja.k";
+    crate::create_reflex_ivm("foj_pg_v", sql, None, None, None, None);
+    assert_imv_correct("foj_pg_v", sql);
+
+    // Right-only insert: no matching foja row → a brand-new group ('c') that
+    // the scoped-recompute heuristics (keyed on fojb's join value) must not
+    // silently drop.
+    Spi::run("INSERT INTO fojb VALUES ('c', 200)").expect("insert right-only");
+    assert_imv_correct("foj_pg_v", sql);
+
+    Spi::run("UPDATE fojb SET w = 999 WHERE k = 'a'").expect("update");
+    assert_imv_correct("foj_pg_v", sql);
+
+    Spi::run("DELETE FROM fojb WHERE k = 'c'").expect("delete");
+    assert_imv_correct("foj_pg_v", sql);
+}
+
 /// CROSS JOIN with mutations
 #[pg_test]
 fn test_correctness_cross_join() {

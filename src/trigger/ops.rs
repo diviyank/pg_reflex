@@ -515,12 +515,27 @@ pub(crate) fn secondary_ref_identifiers(base_query: &str, source_table: &str) ->
 /// migrate. Mirrors the qualifier check the STABLE-column fallback (below)
 /// uses to decide the same thing; an unmatched or unqualified column is
 /// treated as migrating (fail toward the safe fallback).
+///
+/// Also refuses a FULL OUTER JOIN outright, unconditionally — mirroring the
+/// passthrough branch's own FULL-JOIN bail-out a few lines up in this file.
+/// The "qualifier != mutated table => stable" premise this predicate checks
+/// is exactly what a FULL JOIN violates: EITHER side can carry unmatched
+/// rows whose join-key column is NULL on one side of the row and populated
+/// on the other, so a column qualified by the OTHER (non-mutated) side is not
+/// actually stable either — an INSERT into the secondary with no matching
+/// primary row produces a NULL primary-side group key that the changed-key
+/// scoping never rebuilds (silent row loss), and the symmetric DELETE case
+/// leaves a stale NULL group behind.
 fn join_key_scope_is_sound(
     plan: &AggregationPlan,
     join_keys: &[(String, String)],
     base_query: &str,
     source_table: &str,
 ) -> bool {
+    let bq_upper = base_query.to_uppercase();
+    if bq_upper.contains("FULL JOIN") || bq_upper.contains("FULL OUTER") {
+        return false;
+    }
     let sec_ids = secondary_ref_identifiers(base_query, source_table);
     join_keys.iter().all(|(interm_col, _)| {
         plan.group_by_columns
@@ -644,6 +659,29 @@ pub(crate) fn outer_join_secondary_stmts(
                 return;
             }
         }
+    }
+
+    // A FULL OUTER JOIN breaks BOTH of the aggregate scoping strategies below,
+    // not just the join-key-scoped fast path: both rest on "a group-by column
+    // qualified by a table OTHER than the one just mutated is stable" (see
+    // `join_key_scope_is_sound`'s doc comment), and a FULL JOIN's unmatched-row
+    // semantics make that false for either side — a write to one side can hand
+    // the OTHER side's join column a new (or newly-vanished) NULL group value
+    // without that other table's own row having changed at all. Bail out to
+    // the same unconditional full intermediate+target refresh the passthrough
+    // branch above already uses for this join type, mirroring its own
+    // FULL-JOIN check.
+    let bq_upper = base_query.to_uppercase();
+    if bq_upper.contains("FULL JOIN") || bq_upper.contains("FULL OUTER") {
+        stmts.push(format!("TRUNCATE {}", intermediate_tbl));
+        stmts.push(format!("INSERT INTO {} {}", intermediate_tbl, base_query));
+        stmts.push(format!("TRUNCATE {}", qv));
+        if end_query.is_empty() {
+            stmts.push(format!("INSERT INTO {} {}", qv, base_query));
+        } else {
+            stmts.push(format!("INSERT INTO {} {}", qv, end_query));
+        }
+        return;
     }
 
     // Scoped recompute for an aggregate outer-join secondary that carries a
