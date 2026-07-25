@@ -11,11 +11,12 @@ passthrough IMV; a LEFT JOIN aggregate grouped by the secondary's join
 column; the DEFERRED cross-source guard double-reconciling a UNION-ALL
 operand; a FULL OUTER JOIN aggregate's scoped recompute dropping a
 newly-surfaced group; and a synchronous partition-sync orphan collision
-going permanently `known_stale`), a MIN/MAX recompute performance-cliff fix,
-wrapper-reconcile safety, targeted-recovery observability, a recovery path
-for a dropped internal table, plus a repair primitive and real audit
-coverage for materialised UNION-ALL wrapper mirror triggers. Replace the
-`.so`, then
+going permanently `known_stale`), an unclearable-finding fix (a group-capture
+table dropped independently of its intermediate), a MIN/MAX recompute
+performance-cliff fix, wrapper-reconcile safety, targeted-recovery
+observability, a recovery path for a dropped internal table, plus a repair
+primitive and real audit coverage for materialised UNION-ALL wrapper mirror
+triggers. Replace the `.so`, then
 `ALTER EXTENSION pg_reflex UPDATE TO '1.11.1';`. The update adds two registry
 columns (fast-default `ADD COLUMN`, no table rewrite) and one corrective metadata
 backfill; no reconcile is needed.
@@ -194,6 +195,18 @@ backfill; no reconcile is needed.
   resyncs the wrapper's operand slice, instead of calling `reflex_reconcile` on it
   directly. Also now flags `known_stale` (with a reason) instead of silently
   discarding a staged delta if that repair itself fails.
+
+- **(unclearable finding)** `reflex_reconcile`'s heal for a dropped
+  `__reflex_intermediate_<view>` (added earlier in this release) gated on the
+  intermediate's own presence, so a `__reflex_affected_<view>` /
+  `__reflex_shrunk_<view>` group-capture table dropped **without** its
+  intermediate — physically independent, since it's `CREATE TABLE ... AS SELECT
+  ... FROM <intermediate> WHERE FALSE`, a CTAS that records no catalog
+  dependency — was never recreated. `internal-tables-exist` reports this shape
+  at Error and prints `reflex_rebuild_imv` (an alias for the same reconcile) as
+  the remedy, so the finding could not be cleared by the fix it names. The heal
+  now probes the intermediate and its group-capture companions independently,
+  in build order, recreating only what's missing under the same advisory lock.
 
 - **(performance)** A MIN/MAX aggregate IMV's affected-group recompute scoped its
   membership `EXISTS` filter with the non-sargable `IS NOT DISTINCT FROM`
