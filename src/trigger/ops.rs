@@ -503,6 +503,37 @@ pub(crate) fn secondary_ref_identifiers(base_query: &str, source_table: &str) ->
     ids
 }
 
+/// Whether every GROUP BY column that `source_join_keys` maps for this
+/// secondary is STABLE — i.e. not itself derived from the secondary being
+/// mutated. `parse_join_condition_mappings` matches JOIN-equality sides by
+/// bare column name only, so `fa LEFT JOIN fb ON fa.k = fb.k GROUP BY fb.k`
+/// gets mapped as if the group column were `fa.k` (the primary's copy, which
+/// can't migrate) when it's actually `fb.k` (the secondary's copy, which
+/// migrates NULL<->value as fb changes). The join-key-scoped fast path below
+/// only rebuilds the changed-key groups, never the NULL group a migrating
+/// row leaves or joins, so it must not be used when a mapped column can
+/// migrate. Mirrors the qualifier check the STABLE-column fallback (below)
+/// uses to decide the same thing; an unmatched or unqualified column is
+/// treated as migrating (fail toward the safe fallback).
+fn join_key_scope_is_sound(
+    plan: &AggregationPlan,
+    join_keys: &[(String, String)],
+    base_query: &str,
+    source_table: &str,
+) -> bool {
+    let sec_ids = secondary_ref_identifiers(base_query, source_table);
+    join_keys.iter().all(|(interm_col, _)| {
+        plan.group_by_columns
+            .iter()
+            .find(|gb| normalized_column_name(gb).to_lowercase() == *interm_col)
+            .is_some_and(|gb| {
+                gb.split_once('.')
+                    .map(|(q, _)| q.trim().trim_matches('"').to_lowercase())
+                    .is_some_and(|q| !sec_ids.contains(&q))
+            })
+    })
+}
+
 /// Outer-join-secondary handling: when source_table is the secondary side of a
 /// LEFT/RIGHT JOIN (or any side of FULL OUTER), the MERGE subtract can't represent
 /// the NULL semantics. Passthrough → full refresh. Aggregate → targeted group
@@ -632,7 +663,9 @@ pub(crate) fn outer_join_secondary_stmts(
     // column change keeps the same join key, so both the old and new (possibly
     // migrated) group rows share it and are recomputed together.
     if let Some(join_keys) = plan.source_join_keys.get(source_table) {
-        if !join_keys.is_empty() {
+        if !join_keys.is_empty()
+            && join_key_scope_is_sound(plan, join_keys, base_query, source_table)
+        {
             let interm_cols: Vec<String> = join_keys
                 .iter()
                 .map(|(interm, _)| format!("\"{}\"", interm))

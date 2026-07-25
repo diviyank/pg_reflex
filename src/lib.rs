@@ -1585,6 +1585,7 @@ mod tests {
     include!("tests/pg_test_ps14.rs");
     include!("tests/pg_test_ps17.rs");
     include!("tests/pg_test_ps18.rs");
+    include!("tests/pg_test_leftjoin_secondary_groupkey.rs");
 }
 
 /// This module is required by `cargo pgrx test` invocations.
