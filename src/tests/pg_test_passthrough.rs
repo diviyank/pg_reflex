@@ -826,3 +826,88 @@ fn pt_inplace_upsert_filter_and_keychange_oracle() {
     Spi::run("DELETE FROM up_src WHERE id = 1").expect("delete");
     assert_imv_correct("up_v", sql);
 }
+
+/// 2026-07-25 nullable-explicit-key bug (untreated_bugs). An explicit passthrough
+/// unique key on a column that can be NULL in the target defeats the keyed
+/// `(key) IN (SELECT ...)` DELETE/UPDATE maintenance — `(NULL) IN (...)` is never
+/// TRUE — leaving a phantom target row on DELETE and a unique-index violation
+/// aborting the source UPDATE. Exact repro from the report. Fix direction taken:
+/// make the keyed DELETE/UPDATE predicate NULL-safe (gated on whether the key is
+/// provably NOT NULL, mirroring the PS-5 aggregate pattern), rather than refusing
+/// the create — an early attempt at "refuse at create" broke ~80 existing tests
+/// that use an explicit key on a column with no declared NOT NULL/PK (a `trust
+/// me, it's unique` convention this codebase relies on throughout, including
+/// decomposed sub-IMV targets, which carry no NOT NULL constraints at all).
+#[pg_test]
+fn test_passthrough_explicit_nullable_key_delete_no_phantom_row() {
+    Spi::run("CREATE TABLE nk_src (id INT, v TEXT)").expect("create table");
+    Spi::run("CREATE UNIQUE INDEX ON nk_src(id)").expect("nullable unique index");
+    Spi::run("INSERT INTO nk_src VALUES (1,'a'), (2,'b'), (NULL,'x')").expect("seed");
+
+    let sql = "SELECT id, v FROM nk_src";
+    let result = crate::create_reflex_ivm("nk_view", sql, Some("id"), None, None, None);
+    assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
+    assert_imv_correct("nk_view", sql);
+
+    Spi::run("DELETE FROM nk_src WHERE id IS NULL").expect("delete NULL-key row");
+    assert_imv_correct("nk_view", sql);
+    let count = Spi::get_one::<i64>("SELECT COUNT(*) FROM nk_view")
+        .expect("q")
+        .expect("v");
+    assert_eq!(
+        count, 2,
+        "DELETE of the NULL-key row must not leave a phantom target row"
+    );
+}
+
+/// Same bug, the UPDATE face: previously the stale NULL-key row survived AND the
+/// delta re-INSERT collided with it on the unique index, aborting the user's own
+/// transaction.
+#[pg_test]
+fn test_passthrough_explicit_nullable_key_update_does_not_abort() {
+    Spi::run("CREATE TABLE nku_src (id INT, v TEXT)").expect("create table");
+    Spi::run("CREATE UNIQUE INDEX ON nku_src(id)").expect("nullable unique index");
+    Spi::run("INSERT INTO nku_src VALUES (1,'a'), (2,'b'), (NULL,'x')").expect("seed");
+
+    let sql = "SELECT id, v FROM nku_src";
+    let result = crate::create_reflex_ivm("nku_view", sql, Some("id"), None, None, None);
+    assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
+
+    Spi::run("UPDATE nku_src SET v = 'y' WHERE id IS NULL").expect("update NULL-key row");
+    assert_imv_correct("nku_view", sql);
+    let v: String = Spi::get_one("SELECT v FROM nku_view WHERE id IS NULL")
+        .expect("q")
+        .expect("v");
+    assert_eq!(v, "y");
+}
+
+/// Regression guard: an explicit key on a genuinely NOT NULL column must still
+/// be accepted, and the report's own DELETE/UPDATE repro must behave correctly —
+/// now true regardless of key nullability, but pinned again here for the
+/// historically-safe NOT NULL case.
+#[pg_test]
+fn test_passthrough_explicit_not_null_key_still_accepted() {
+    Spi::run("CREATE TABLE nnk_src (id INT NOT NULL, v TEXT)").expect("create table");
+    Spi::run("CREATE UNIQUE INDEX ON nnk_src(id)").expect("not-null unique index");
+    Spi::run("INSERT INTO nnk_src VALUES (1,'a'), (2,'b')").expect("seed");
+
+    let result = crate::create_reflex_ivm(
+        "nnk_view",
+        "SELECT id, v FROM nnk_src",
+        Some("id"),
+        None,
+        None,
+        None,
+    );
+    assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
+
+    Spi::run("UPDATE nnk_src SET v = 'y' WHERE id = 2").expect("update");
+    let v: String = Spi::get_one("SELECT v FROM nnk_view WHERE id = 2")
+        .expect("q").expect("v");
+    assert_eq!(v, "y");
+
+    Spi::run("DELETE FROM nnk_src WHERE id = 1").expect("delete");
+    let count = Spi::get_one::<i64>("SELECT COUNT(*) FROM nnk_view")
+        .expect("q").expect("v");
+    assert_eq!(count, 1, "DELETE must remove the row, no phantom left behind");
+}

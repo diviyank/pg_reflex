@@ -1226,6 +1226,69 @@ pub(crate) fn column_base_not_null(
         == Some(true)
 }
 
+/// For a passthrough IMV's unique key (auto-detected *or* explicit), determine
+/// which key columns are provably NOT NULL by the same structural proof
+/// `infer_not_null_columns` uses for aggregate GROUP BY keys: an equi-join
+/// operand of an INNER join, or a catalog NOT-NULL base column not on the
+/// nullable side of an outer join.
+///
+/// The result feeds `plan.not_null_columns`, which the keyed DELETE/UPDATE
+/// codegen (`trigger::merge::null_safe_in`, `trigger::scope::
+/// build_null_safe_membership_predicate`) reads to choose a sargable `=`/`IN`
+/// match for a column proven safe, or the NULL-safe `IS NOT DISTINCT FROM`
+/// match otherwise. Left unproven, a column defaults to the safe form — never
+/// the reverse — because `(key) IN (SELECT ...)` is never TRUE for a NULL key:
+/// treating an actually-nullable key as safe would leave a phantom target row
+/// on source DELETE and abort the source UPDATE with a unique-index violation
+/// (2026-07-25 untreated_bugs report).
+///
+/// An explicit key can name any column, so it is the branch that actually
+/// needs this; the auto-detect paths (`resolve_unique_columns`'s PK probe,
+/// `infer_join_passthrough_unique_key`) only ever resolve to a PRIMARY KEY,
+/// which is always NOT NULL — calling this on them is a cheap confirmation,
+/// not a new failure mode.
+pub(crate) fn provably_not_null_key_columns(
+    client: &mut pgrx::spi::SpiClient<'_>,
+    analysis: &crate::sql_analyzer::SqlAnalysis,
+    key_columns: &[String],
+) -> std::collections::HashSet<String> {
+    let mut left_target_tables: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    for j in &analysis.joins {
+        let jt = j.join_type.to_uppercase();
+        if jt.contains("RIGHT") || jt.contains("FULL") {
+            // Nullable side is ambiguous for RIGHT/FULL joins — prove nothing
+            // rather than guess which key column could go NULL.
+            return std::collections::HashSet::new();
+        }
+        if jt.contains("LEFT") {
+            left_target_tables.insert(j.target_table.trim_matches('"').to_lowercase());
+        }
+    }
+
+    let equi_refs = inner_join_equi_non_null_refs(analysis);
+    let target_col_to_expr: HashMap<String, String> = analysis
+        .select_columns
+        .iter()
+        .map(|c| {
+            let target_name = normalized_column_name(c.alias.as_deref().unwrap_or(&c.expr_sql));
+            (target_name, c.expr_sql.clone())
+        })
+        .collect();
+
+    key_columns
+        .iter()
+        .filter(|kc| {
+            target_col_to_expr.get(kc.as_str()).is_some_and(|expr| {
+                is_simple_col_ref(expr)
+                    && (equi_refs.contains(&canon_col_ref(expr))
+                        || column_base_not_null(client, analysis, expr, &left_target_tables))
+            })
+        })
+        .cloned()
+        .collect()
+}
+
 /// Infer the group-by / distinct columns that are *provably* NOT NULL from the
 /// query's structure (NOT from transient create-time data). A column is promoted
 /// only when it can never be NULL in the IMV:

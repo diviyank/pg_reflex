@@ -579,16 +579,30 @@ pub(crate) fn outer_join_secondary_stmts(
                 // The membership source is a derived table (a UNION over the
                 // transition tables), so it MUST carry an alias — an unaliased
                 // subquery in FROM is rejected by every Postgres version with
-                // "subquery in FROM must have an alias".
-                let pred = build_membership_predicate(
+                // "subquery in FROM must have an alias". The predicate is built
+                // separately per statement (not reused verbatim) because the
+                // NULL-safe form needs an explicit outer qualifier, and that
+                // qualifier differs between the DELETE (qv itself) and the
+                // INSERT (the `__bq` alias of base_query).
+                let ck_relation = format!("({}) __ck", changed_keys);
+                let del_pred = build_null_safe_membership_predicate(
+                    &qv,
                     &target_cols,
                     &target_cols,
-                    &format!("({}) __ck", changed_keys),
+                    &ck_relation,
+                    &plan.not_null_columns,
                 );
-                stmts.push(format!("DELETE FROM {} WHERE {}", qv, pred));
+                stmts.push(format!("DELETE FROM {} WHERE {}", qv, del_pred));
+                let ins_pred = build_null_safe_membership_predicate(
+                    "__bq",
+                    &target_cols,
+                    &target_cols,
+                    &ck_relation,
+                    &plan.not_null_columns,
+                );
                 stmts.push(format!(
                     "INSERT INTO {} SELECT * FROM ({}) __bq WHERE {}",
-                    qv, base_query, pred
+                    qv, base_query, ins_pred
                 ));
                 return;
             }
@@ -887,6 +901,53 @@ fn passthrough_partition_dispatch_cols(
     ))
 }
 
+/// Re-key `plan.not_null_columns` (keyed on *target* column bare names) onto
+/// the *source* column bare names of a passthrough key-owner mapping, for
+/// `trigger::merge::null_safe_in`, whose `not_null_columns` argument is
+/// looked up against the "affected" (here: source/scratch) side of the match.
+fn source_not_null_cols(
+    mappings: &[(String, String)],
+    not_null_columns: &std::collections::HashSet<String>,
+) -> std::collections::HashSet<String> {
+    mappings
+        .iter()
+        .filter(|(t, _)| not_null_columns.contains(t.as_str()))
+        .map(|(_, s)| s.clone())
+        .collect()
+}
+
+/// The passthrough keyed DELETE/UPDATE predicate: `(target_cols) IN (SELECT
+/// source_cols FROM pt_old)`, made NULL-safe when a key column is not proven
+/// NOT NULL (2026-07-25 untreated_bugs: `(NULL) IN (...)` is never TRUE, so a
+/// NULL-key row's target counterpart is never matched — a phantom row on
+/// DELETE, a unique-index abort on UPDATE). Unlike `null_safe_in` (which
+/// always emits the correlated-EXISTS shape, only varying the per-column
+/// operator), this collapses to the plain `IN`-list — byte-identical to the
+/// pre-fix output — when every mapped column is in `plan.not_null_columns`,
+/// which is the case that must see no plan change.
+fn passthrough_keyed_delete_predicate(
+    pt_old: &str,
+    qv: &str,
+    mappings: &[(String, String)],
+    target_cols: &[String],
+    source_cols: &[String],
+    not_null_columns: &std::collections::HashSet<String>,
+) -> String {
+    let all_not_null = mappings
+        .iter()
+        .all(|(t, _)| not_null_columns.contains(t.as_str()));
+    if all_not_null {
+        return build_membership_predicate(target_cols, source_cols, pt_old);
+    }
+    null_safe_in(
+        pt_old,
+        qv,
+        target_cols,
+        source_cols,
+        &source_not_null_cols(mappings, not_null_columns),
+    )
+}
+
 /// Strategy-specific cold-exclusion predicate for the passthrough dispatch.
 /// LIST excludes hot partition VALUES (`$1::TEXT[]`); RANGE excludes rows of hot
 /// CHILDREN by resolving the value to its child of `view_parent` and comparing
@@ -957,13 +1018,17 @@ pub(crate) fn passthrough_op_stmts(
                     mappings.iter().map(|(t, _)| format!("\"{}\"", t)).collect();
                 let source_cols: Vec<String> =
                     mappings.iter().map(|(_, s)| format!("\"{}\"", s)).collect();
-                let row = row_expr(&target_cols);
                 let base_del = format!(
-                    "DELETE FROM {} WHERE {} IN (SELECT {} FROM {})",
+                    "DELETE FROM {} WHERE {}",
                     qv,
-                    row,
-                    source_cols.join(", "),
-                    pt_old
+                    passthrough_keyed_delete_predicate(
+                        &pt_old,
+                        &qv,
+                        mappings,
+                        &target_cols,
+                        &source_cols,
+                        &plan.not_null_columns,
+                    )
                 );
 
                 if let Some((part_col, part_col_q, part_src_q, strategy)) =
@@ -1014,13 +1079,17 @@ pub(crate) fn passthrough_op_stmts(
                     mappings.iter().map(|(t, _)| format!("\"{}\"", t)).collect();
                 let source_cols: Vec<String> =
                     mappings.iter().map(|(_, s)| format!("\"{}\"", s)).collect();
-                let row = row_expr(&target_cols);
                 let base_del = format!(
-                    "DELETE FROM {} WHERE {} IN (SELECT {} FROM {})",
+                    "DELETE FROM {} WHERE {}",
                     qv,
-                    row,
-                    source_cols.join(", "),
-                    pt_old
+                    passthrough_keyed_delete_predicate(
+                        &pt_old,
+                        &qv,
+                        mappings,
+                        &target_cols,
+                        &source_cols,
+                        &plan.not_null_columns,
+                    )
                 );
                 let delta_new = scoped_delta_query(base_query, source_table, &pt_new);
                 let base_ins = format!("INSERT INTO {} {}", qv, delta_new);

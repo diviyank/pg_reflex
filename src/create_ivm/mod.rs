@@ -199,6 +199,17 @@ fn validate_and_parse_inputs(
 /// full refresh on DELETE/UPDATE (warned). Populates
 /// `ctx.resolved_unique_columns` and `ctx.plan.passthrough_columns` /
 /// `ctx.plan.passthrough_key_mappings`.
+///
+/// Also populates `ctx.plan.not_null_columns` with whichever resolved key
+/// columns are provably NOT NULL (see `provably_not_null_key_columns`) — an
+/// *explicit* key can name any column, including one the target can actually
+/// see NULL, and the keyed DELETE/UPDATE codegen must know which columns it
+/// can safely match with a sargable `=`/`IN` versus which need the NULL-safe
+/// `IS NOT DISTINCT FROM` form (`(NULL) IN (...)` is never TRUE, so a wrongly
+/// "safe" column would leave a phantom target row on DELETE and abort the
+/// source UPDATE with a unique-index violation — 2026-07-25 untreated_bugs
+/// report). This is persisted to the registry the same way aggregate GROUP BY
+/// inference is, so a later trigger regeneration reads the same set.
 fn resolve_unique_columns(ctx: &mut BuildContext) {
     if !ctx.plan.is_passthrough {
         return;
@@ -213,6 +224,7 @@ fn resolve_unique_columns(ctx: &mut BuildContext) {
             .filter(|s| !s.is_empty())
             .collect();
         ctx.plan.passthrough_columns = ctx.resolved_unique_columns.clone();
+
         info!(
             "pg_reflex: using explicit unique key ({}) for '{}'",
             ctx.resolved_unique_columns.join(", "),
@@ -325,6 +337,13 @@ fn resolve_unique_columns(ctx: &mut BuildContext) {
              Example: SELECT create_reflex_ivm('{}', '...', 'col1,col2')",
             ctx.view_name, ctx.view_name
         );
+    }
+
+    if !ctx.resolved_unique_columns.is_empty() {
+        let proven = Spi::connect_mut(|client| {
+            provably_not_null_key_columns(client, &ctx.analysis, &ctx.resolved_unique_columns)
+        });
+        ctx.plan.not_null_columns.extend(proven);
     }
 }
 
