@@ -940,16 +940,23 @@ pub(crate) fn is_from_table(
 }
 
 /// Return type of [`query_column_types_from_catalog_with_per_source`]:
-/// `(types, not_null_cols, per_source_columns)`.
+/// `(types, not_null_cols, per_source_columns, per_source_not_null_columns)`.
+///
+/// `not_null_cols` is a BARE-NAME union across every source and so says nothing
+/// about the IMV's *output* nullability. Anything that feeds it into
+/// `plan.not_null_columns` must reduce it first with
+/// [`reduce_not_null_to_join_output`].
 type CatalogColumnInfo = (
     HashMap<String, String>,
     std::collections::HashSet<String>,
     HashMap<String, std::collections::HashSet<String>>,
+    HashMap<String, std::collections::HashSet<String>>,
 );
 
 /// Per-source-aware column-type catalog lookup. Returns the cross-source
-/// type map and not-null set used elsewhere, plus a per-source map
-/// `source-table-name → set of catalog-known column names`.
+/// type map and not-null set used elsewhere, plus per-source maps
+/// `source-table-name → set of catalog-known column names` and
+/// `source-table-name → set of catalog NOT NULL column names`.
 ///
 /// Used by the 1.4.5 filter-aware spurious-skip metadata to ground the
 /// analyzer's over-inclusive `imv_relevant_columns` (which attributes
@@ -962,6 +969,8 @@ pub(crate) fn query_column_types_from_catalog_with_per_source(
     let mut types = HashMap::new();
     let mut not_null_cols = std::collections::HashSet::new();
     let mut per_source: HashMap<String, std::collections::HashSet<String>> = HashMap::new();
+    let mut per_source_not_null: HashMap<String, std::collections::HashSet<String>> =
+        HashMap::new();
     for table in table_names {
         // Skip non-real tables (subqueries, functions)
         if table.starts_with('<') {
@@ -1013,6 +1022,10 @@ pub(crate) fn query_column_types_from_catalog_with_per_source(
                     .unwrap_or_default();
                 if is_nullable == "NO" {
                     not_null_cols.insert(col_name.to_string());
+                    per_source_not_null
+                        .entry(table.clone())
+                        .or_default()
+                        .insert(col_name.clone());
                 }
                 per_source
                     .entry(table.clone())
@@ -1021,7 +1034,82 @@ pub(crate) fn query_column_types_from_catalog_with_per_source(
             }
         }
     }
-    (types, not_null_cols, per_source)
+    (types, not_null_cols, per_source, per_source_not_null)
+}
+
+/// Reduce the bare-name catalog NOT-NULL union to the names that are still
+/// provably NOT NULL *in the IMV's output*, i.e. after the FROM clause's joins.
+///
+/// `query_column_types_from_catalog_with_per_source` reads
+/// `pg_attribute.attnotnull` from every source and unions the results under the
+/// BARE column name. It is handed no `SqlAnalysis`, so it cannot know either of
+/// the two ways that union over-promotes:
+///
+///   * **outer-join nullability** — a column on the nullable side of an outer
+///     join is NULL for every unmatched row, however it is declared
+///     (`fa LEFT JOIN fb ON fa.k = fb.k GROUP BY fb.k`, with `fb.k` a PRIMARY
+///     KEY, genuinely produces a NULL group), and
+///   * **bare-name collision** — one source's NOT NULL `k` promotes every other
+///     source's same-named nullable `k`.
+///
+/// `AggregationPlan::optimize_not_null_sums` stores whatever it is given
+/// verbatim in `plan.not_null_columns`, and `infer_not_null_columns` can only
+/// ever add to that, so an over-promoted name is never withdrawn. Downstream it
+/// makes `null_safe_in` / `build_null_safe_membership_predicate` match group
+/// keys with a plain `=` (never TRUE for the NULL group) and suppresses
+/// `affected_null_key_gate`'s NULL-safe alternative entirely — a silent wrong
+/// result on the NULL group, plus a duplicate NULL row in the intermediate from
+/// the MERGE's `ON t.k = d.k`.
+///
+/// A name therefore survives only when EVERY source column of that name is
+/// catalog NOT NULL *and* its table is not on an outer join's nullable side.
+/// RIGHT/FULL joins put the nullable side out of reach of this flat `joins`
+/// list, so nothing survives for those — the same bail-out
+/// `infer_not_null_columns` and `provably_not_null_key_columns` already take.
+///
+/// Dropping a name is always the safe direction: it costs the sargable `=` form
+/// and the `__nonnull_count_` companion-column elision, never correctness.
+/// Group-by keys that really are non-NULL are added back structurally by
+/// `infer_not_null_columns` once the IMV is materialized.
+pub(crate) fn reduce_not_null_to_join_output(
+    analysis: &crate::sql_analyzer::SqlAnalysis,
+    per_source_columns: &HashMap<String, std::collections::HashSet<String>>,
+    per_source_not_null: &HashMap<String, std::collections::HashSet<String>>,
+    catalog_not_null: &std::collections::HashSet<String>,
+) -> std::collections::HashSet<String> {
+    let bare_relname = |name: &str| {
+        name.rsplit('.')
+            .next()
+            .unwrap_or(name)
+            .trim_matches('"')
+            .to_lowercase()
+    };
+
+    let mut nullable_side_tables: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    for join in &analysis.joins {
+        let join_type = join.join_type.to_uppercase();
+        if join_type.contains("RIGHT") || join_type.contains("FULL") {
+            return std::collections::HashSet::new();
+        }
+        if join_type.contains("LEFT") {
+            nullable_side_tables.insert(bare_relname(&join.target_table));
+        }
+    }
+
+    catalog_not_null
+        .iter()
+        .filter(|col| {
+            per_source_columns.iter().all(|(source, columns)| {
+                !columns.contains(col.as_str())
+                    || (!nullable_side_tables.contains(&bare_relname(source))
+                        && per_source_not_null
+                            .get(source)
+                            .is_some_and(|nn| nn.contains(col.as_str())))
+            })
+        })
+        .cloned()
+        .collect()
 }
 
 /// Canonicalize a column reference for comparison: lower-case, trim, and strip

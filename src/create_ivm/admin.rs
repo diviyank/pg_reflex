@@ -203,7 +203,7 @@ pub(crate) fn reflex_rebuild_imv_metadata_impl(view_name: &str) -> String {
         // 1.4.5 filter applied at create-time in the create_reflex_ivm
         // aggregate path (search "1.4.5 — filter `imv_relevant_columns`").
         let froms_list: Vec<String> = analysis.sources.to_vec();
-        let (_types, _nn, per_source_cols) =
+        let (_types, _nn, per_source_cols, _psnn) =
             query_column_types_from_catalog_with_per_source(client, &froms_list);
         let mut relevant_cols: std::collections::HashMap<String, Vec<String>> =
             std::collections::HashMap::new();
