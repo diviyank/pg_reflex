@@ -207,13 +207,6 @@ backfill; no reconcile is needed.
   invalidation instead — call `refresh_imv_depending_on('<mv>')` after
   `REFRESH MATERIALIZED VIEW`. Investigated in
   `untreated_bugs/2026-07-24_current_assortment_reconcile_cost.md`.
-- Nothing checks that a materialised wrapper's `__reflex_union_mirror_*` triggers are
-  present, so dropping one causes silent divergence that `reflex_audit` reports as
-  healthy. The wrapper Error this release removed never detected that condition
-  either (it fired unconditionally), so no detection power was lost — but no
-  primitive reinstalls a mirror trigger today, which is why the check is deferred
-  rather than added. Filed in
-  `untreated_bugs/2026-07-24_union_mirror_triggers_unchecked.md`.
 - The heal repairs the aggregate branch only: a missing target table or a missing
   per-source passthrough scratch table is still `reflex_rebuild_triggers`' job, so
   `internal-tables-exist` converges for aggregate IMVs, not universally.

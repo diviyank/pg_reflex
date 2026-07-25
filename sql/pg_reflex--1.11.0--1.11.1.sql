@@ -144,6 +144,36 @@ ALTER TABLE public.__reflex_ivm_reference
 ALTER TABLE public.__reflex_ivm_reference
     ADD COLUMN IF NOT EXISTS last_rebuild_at TIMESTAMPTZ;
 
+-- reflex_ivm_status() gains rebuild_count / last_rebuild_at (and, cumulatively,
+-- the 1.11.0 requires_explicit_refresh column that never got its own redeclare
+-- either — this is a RETURNS TABLE shape change, so DROP + CREATE, not CREATE
+-- OR REPLACE, matching the precedent in sql/pg_reflex--1.10.7--1.10.8.sql.
+-- ALTER EXTENSION UPDATE does not re-derive a function's catalog signature from
+-- the module's pgrx annotations on its own; skipping this step leaves an
+-- upgraded install's reflex_ivm_status() at its pre-1.11.0 (12-column) shape
+-- forever while a fresh 1.11.1 install gets the current 15-column one.
+DROP FUNCTION IF EXISTS public.reflex_ivm_status();
+CREATE FUNCTION "reflex_ivm_status"() RETURNS TABLE (
+	"name" TEXT,
+	"graph_depth" INT,
+	"enabled" bool,
+	"refresh_mode" TEXT,
+	"row_count" bigint,
+	"last_flush_ms" bigint,
+	"last_flush_rows" bigint,
+	"flush_count" bigint,
+	"last_error" TEXT,
+	"last_update_date" timestamp,
+	"known_stale" bool,
+	"stale_reason" TEXT,
+	"requires_explicit_refresh" bool,
+	"rebuild_count" bigint,
+	"last_rebuild_at" timestamp with time zone
+)
+STRICT
+LANGUAGE c
+AS 'MODULE_PATHNAME', 'reflex_ivm_status_wrapper';
+
 -- --------------------------------------------------------------------------
 -- Corrective backfill (PS-14 Part B): the 1.10.11→1.11.0 PS-3 backfill matched
 -- ignored sources by exact string only, so an IMV that ignores a real table by
