@@ -298,6 +298,20 @@ backfill; no reconcile is needed.
   always-safe form to avoid double-running the hot-leaf swap. Output stays
   byte-identical when every key column is proven NOT NULL.
 
+- **(silent wrong result)** An outer-join-secondary aggregate's GROUP BY
+  stability check (deciding whether a scoped/targeted recompute is safe, or
+  whether a group might migrate on a secondary-side mutation) took only the
+  FIRST `.`-delimited segment of a qualified column reference as its
+  qualifier. A genuinely 3+-part reference (e.g. `public.fb.k`, or an
+  expression like `DATE_TRUNC('month', fb.ts)` whose stringified qualifier
+  segment doesn't match any real table) never matched the mutated secondary
+  table's name, so it was always classified stable regardless of which table
+  it actually belonged to — silently skipping the rebuild a migrating group
+  needed on a secondary INSERT/UPDATE/DELETE. Fixed by checking every
+  identifier chain's immediate qualifier segment against the secondary,
+  applied consistently to both the join-key-scoped fast path and the
+  STABLE-column fallback.
+
 **Known limitations**
 
 - Directly reconciling a machine-generated *operand* sub-IMV of a **materialised**
