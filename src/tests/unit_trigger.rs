@@ -3171,6 +3171,15 @@ fn passthrough_secondary_plan() -> AggregationPlan {
             ("location_id".to_string(), "location_id".to_string()),
         ],
     )]);
+    // Realistic anchor shape (mirrors pg_test_passthrough.rs's ai_anchor /
+    // aic_anchor fixtures): the anchor declares these NOT NULL, so
+    // `resolve_unique_columns` would have proven them at create time. Keeping
+    // this set is what pins the byte-identical `IN`-list regression guard in
+    // `secondary_passthrough_with_mapping_is_keyed` below —
+    // `secondary_passthrough_nullable_key_uses_null_safe_match` covers the
+    // unproven case separately.
+    p.not_null_columns =
+        std::collections::HashSet::from(["product_id".to_string(), "location_id".to_string()]);
     p
 }
 
@@ -3205,6 +3214,47 @@ fn secondary_passthrough_with_mapping_is_keyed() {
     assert!(
         joined.contains("UNION"),
         "changed keys must come from old ∪ new transition: {joined}"
+    );
+}
+
+/// 2026-07-25 nullable-explicit-key bug (untreated_bugs). When the secondary's
+/// join-key columns are NOT proven NOT NULL (`plan.not_null_columns` empty —
+/// the same shape a nullable base column or an unproven explicit key produces),
+/// `(cols) IN (SELECT ...)` is NULL-unsafe: `(NULL) IN (...)` is never TRUE, so
+/// a NULL-key row's target counterpart would never be matched. The DELETE and
+/// the INSERT's WHERE must both fall back to the NULL-safe `IS NOT DISTINCT
+/// FROM` form instead of the plain `IN`.
+#[test]
+fn secondary_passthrough_nullable_key_uses_null_safe_match() {
+    let mut plan = passthrough_secondary_plan();
+    plan.not_null_columns.clear();
+    let mut stmts = Vec::new();
+    outer_join_secondary_stmts(
+        "fc_view",
+        "caav",
+        "UPDATE",
+        "SELECT s.product_id, s.location_id FROM s LEFT JOIN caav ON caav.product_id = s.product_id",
+        "",
+        &plan,
+        &None,
+        "__int",
+        "__aff",
+        "__reflex_old_caav",
+        "__reflex_new_caav",
+        &mut stmts,
+    );
+    let joined = stmts.join("\n");
+    assert!(
+        !joined.contains("(\"product_id\", \"location_id\") IN"),
+        "an unproven key must not use the NULL-unsafe IN-list form: {joined}"
+    );
+    assert!(
+        joined.contains("IS NOT DISTINCT FROM"),
+        "an unproven key must use the NULL-safe match: {joined}"
+    );
+    assert!(
+        joined.contains("EXISTS ("),
+        "the NULL-safe match must be a correlated EXISTS: {joined}"
     );
 }
 
@@ -3316,6 +3366,13 @@ fn passthrough_partitioned_plan() -> AggregationPlan {
             ("product_id".to_string(), "product_id".to_string()),
         ],
     )]);
+    // Realistic shape (mirrors pg_test_subpartition.rs's `ss` fixture, which
+    // declares `dem_plan_id BIGINT NOT NULL`): pins the byte-identical
+    // `IN`-list regression guard in `passthrough_update_nonpartitioned_unchanged`
+    // below. `passthrough_delete_nullable_key_uses_null_safe_match` covers the
+    // unproven case separately.
+    p.not_null_columns =
+        std::collections::HashSet::from(["dem_plan_id".to_string(), "product_id".to_string()]);
     p
 }
 
@@ -3372,6 +3429,42 @@ fn passthrough_update_nonpartitioned_unchanged() {
     assert!(
         joined.contains(") IN (SELECT"),
         "still keyed delete: {joined}"
+    );
+}
+
+/// 2026-07-25 nullable-explicit-key bug (untreated_bugs): the primary keyed
+/// DELETE/UPDATE (`passthrough_op_stmts`, not the secondary-join path above).
+/// With no key column proven NOT NULL, the plain `(cols) IN (SELECT ...)` is
+/// NULL-unsafe — `(NULL) IN (...)` is never TRUE, so a source DELETE of a
+/// NULL-key row would leave a phantom target row, and a source UPDATE would
+/// leave the stale row in place while the delta re-INSERT collides with it on
+/// the unique index. The generated DELETE must use the NULL-safe
+/// `IS NOT DISTINCT FROM` match instead.
+#[test]
+fn passthrough_delete_nullable_key_uses_null_safe_match() {
+    let mut plan = passthrough_partitioned_plan();
+    plan.partition_columns = vec![];
+    plan.partition_strategy = String::new();
+    plan.not_null_columns.clear();
+    let mut stmts = Vec::new();
+    passthrough_op_stmts(
+        "fc",
+        "ss",
+        "DELETE",
+        "SELECT dem_plan_id, product_id FROM ss",
+        &plan,
+        "__reflex_new_ss",
+        "__reflex_old_ss",
+        &mut stmts,
+    );
+    let joined = stmts.join("\n");
+    assert!(
+        !joined.contains(") IN (SELECT"),
+        "an unproven key must not use the NULL-unsafe IN-list form: {joined}"
+    );
+    assert!(
+        joined.contains("IS NOT DISTINCT FROM"),
+        "an unproven key must use the NULL-safe match: {joined}"
     );
 }
 

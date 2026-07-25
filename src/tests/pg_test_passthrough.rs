@@ -831,85 +831,60 @@ fn pt_inplace_upsert_filter_and_keychange_oracle() {
 /// unique key on a column that can be NULL in the target defeats the keyed
 /// `(key) IN (SELECT ...)` DELETE/UPDATE maintenance — `(NULL) IN (...)` is never
 /// TRUE — leaving a phantom target row on DELETE and a unique-index violation
-/// aborting the source UPDATE. The exact repro from the report: a nullable unique
-/// base column named as the explicit 3rd-argument key. Fix direction taken:
-/// refuse the create when the key column is not provably NOT NULL, mirroring the
-/// safe auto-detect path (which only ever resolves to a PRIMARY KEY).
+/// aborting the source UPDATE. Exact repro from the report. Fix direction taken:
+/// make the keyed DELETE/UPDATE predicate NULL-safe (gated on whether the key is
+/// provably NOT NULL, mirroring the PS-5 aggregate pattern), rather than refusing
+/// the create — an early attempt at "refuse at create" broke ~80 existing tests
+/// that use an explicit key on a column with no declared NOT NULL/PK (a `trust
+/// me, it's unique` convention this codebase relies on throughout, including
+/// decomposed sub-IMV targets, which carry no NOT NULL constraints at all).
 #[pg_test]
-fn test_passthrough_explicit_nullable_key_refused_at_create() {
+fn test_passthrough_explicit_nullable_key_delete_no_phantom_row() {
     Spi::run("CREATE TABLE nk_src (id INT, v TEXT)").expect("create table");
     Spi::run("CREATE UNIQUE INDEX ON nk_src(id)").expect("nullable unique index");
     Spi::run("INSERT INTO nk_src VALUES (1,'a'), (2,'b'), (NULL,'x')").expect("seed");
 
-    let result = crate::create_reflex_ivm(
-        "nk_view",
-        "SELECT id, v FROM nk_src",
-        Some("id"),
-        None,
-        None,
-        None,
-    );
-    assert!(
-        result.starts_with("ERROR:"),
-        "explicit key on a nullable column must be refused at create time, got: {}",
-        result
-    );
-    assert!(
-        result.contains("id"),
-        "refusal message must name the offending column, got: {}",
-        result
-    );
+    let sql = "SELECT id, v FROM nk_src";
+    let result = crate::create_reflex_ivm("nk_view", sql, Some("id"), None, None, None);
+    assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
+    assert_imv_correct("nk_view", sql);
 
-    let registered = Spi::get_one::<i64>(
-        "SELECT COUNT(*) FROM public.__reflex_ivm_reference WHERE name = 'nk_view'",
-    )
-    .expect("q")
-    .expect("v");
-    assert_eq!(registered, 0, "refused create must leave no registry row");
-
-    let relation_exists =
-        Spi::get_one::<bool>("SELECT to_regclass('nk_view') IS NOT NULL")
-            .expect("q")
-            .expect("v");
-    assert!(!relation_exists, "refused create must leave no target relation");
+    Spi::run("DELETE FROM nk_src WHERE id IS NULL").expect("delete NULL-key row");
+    assert_imv_correct("nk_view", sql);
+    let count = Spi::get_one::<i64>("SELECT COUNT(*) FROM nk_view")
+        .expect("q")
+        .expect("v");
+    assert_eq!(
+        count, 2,
+        "DELETE of the NULL-key row must not leave a phantom target row"
+    );
 }
 
-/// Same bug, adjacent shape: the explicit key names a column projected from the
-/// nullable side of a LEFT JOIN rather than a directly-nullable base column.
-/// `column_base_not_null`'s `left_target_tables` check must catch this too.
+/// Same bug, the UPDATE face: previously the stale NULL-key row survived AND the
+/// delta re-INSERT collided with it on the unique index, aborting the user's own
+/// transaction.
 #[pg_test]
-fn test_passthrough_explicit_key_left_join_nullable_side_refused_at_create() {
-    Spi::run("CREATE TABLE nkj_anchor (id INT PRIMARY KEY, name TEXT)").expect("anchor");
-    Spi::run("CREATE TABLE nkj_detail (id INT UNIQUE, anchor_id INT, note TEXT)").expect("detail");
-    Spi::run("INSERT INTO nkj_anchor VALUES (1,'a'), (2,'b')").expect("seed anchor");
-    Spi::run("INSERT INTO nkj_detail VALUES (10,1,'x')").expect("seed detail");
+fn test_passthrough_explicit_nullable_key_update_does_not_abort() {
+    Spi::run("CREATE TABLE nku_src (id INT, v TEXT)").expect("create table");
+    Spi::run("CREATE UNIQUE INDEX ON nku_src(id)").expect("nullable unique index");
+    Spi::run("INSERT INTO nku_src VALUES (1,'a'), (2,'b'), (NULL,'x')").expect("seed");
 
-    let sql = "SELECT a.id, d.id AS detail_id, d.note \
-               FROM nkj_anchor a LEFT JOIN nkj_detail d ON d.anchor_id = a.id";
-    let result = crate::create_reflex_ivm(
-        "nkj_view",
-        sql,
-        Some("detail_id"),
-        None,
-        None,
-        None,
-    );
-    assert!(
-        result.starts_with("ERROR:"),
-        "explicit key on a LEFT JOIN's nullable side must be refused at create time, got: {}",
-        result
-    );
-    assert!(
-        result.contains("detail_id"),
-        "refusal message must name the offending column, got: {}",
-        result
-    );
+    let sql = "SELECT id, v FROM nku_src";
+    let result = crate::create_reflex_ivm("nku_view", sql, Some("id"), None, None, None);
+    assert_eq!(result, "CREATE REFLEX INCREMENTAL VIEW");
+
+    Spi::run("UPDATE nku_src SET v = 'y' WHERE id IS NULL").expect("update NULL-key row");
+    assert_imv_correct("nku_view", sql);
+    let v: String = Spi::get_one("SELECT v FROM nku_view WHERE id IS NULL")
+        .expect("q")
+        .expect("v");
+    assert_eq!(v, "y");
 }
 
 /// Regression guard: an explicit key on a genuinely NOT NULL column must still
-/// be accepted, and the report's own DELETE/UPDATE repro must behave correctly
-/// once the key is sound. Uses the report's exact shape but with a NOT NULL
-/// unique column instead of a nullable one.
+/// be accepted, and the report's own DELETE/UPDATE repro must behave correctly —
+/// now true regardless of key nullability, but pinned again here for the
+/// historically-safe NOT NULL case.
 #[pg_test]
 fn test_passthrough_explicit_not_null_key_still_accepted() {
     Spi::run("CREATE TABLE nnk_src (id INT NOT NULL, v TEXT)").expect("create table");

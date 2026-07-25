@@ -1226,34 +1226,40 @@ pub(crate) fn column_base_not_null(
         == Some(true)
 }
 
-/// For a passthrough IMV's *explicit* unique key (3rd `create_reflex_ivm`
-/// argument), require every key column to be provably NOT NULL by the same
-/// structural proof `infer_not_null_columns` uses for aggregate GROUP BY keys:
-/// an equi-join operand of an INNER join, or a catalog NOT-NULL base column not
-/// on the nullable side of an outer join. A nullable key column defeats the
-/// `(key) IN (SELECT ...)` scoped DELETE/UPDATE predicate — `(NULL) IN (...)`
-/// is never TRUE — leaving a phantom target row on source DELETE and a
-/// unique-index violation aborting the user's transaction on source UPDATE.
+/// For a passthrough IMV's unique key (auto-detected *or* explicit), determine
+/// which key columns are provably NOT NULL by the same structural proof
+/// `infer_not_null_columns` uses for aggregate GROUP BY keys: an equi-join
+/// operand of an INNER join, or a catalog NOT-NULL base column not on the
+/// nullable side of an outer join.
 ///
-/// The safe auto-detect path (`resolve_unique_columns`'s PK probe,
-/// `infer_join_passthrough_unique_key`) never surfaces this because a
-/// PRIMARY KEY is always NOT NULL; this only guards the explicit-key path,
-/// where the caller can name any column.
+/// The result feeds `plan.not_null_columns`, which the keyed DELETE/UPDATE
+/// codegen (`trigger::merge::null_safe_in`, `trigger::scope::
+/// build_null_safe_membership_predicate`) reads to choose a sargable `=`/`IN`
+/// match for a column proven safe, or the NULL-safe `IS NOT DISTINCT FROM`
+/// match otherwise. Left unproven, a column defaults to the safe form — never
+/// the reverse — because `(key) IN (SELECT ...)` is never TRUE for a NULL key:
+/// treating an actually-nullable key as safe would leave a phantom target row
+/// on source DELETE and abort the source UPDATE with a unique-index violation
+/// (2026-07-25 untreated_bugs report).
 ///
-/// Returns the first key column that cannot be proven NOT NULL, or `None` if
-/// every key column can.
-pub(crate) fn first_nullable_explicit_key_column(
+/// An explicit key can name any column, so it is the branch that actually
+/// needs this; the auto-detect paths (`resolve_unique_columns`'s PK probe,
+/// `infer_join_passthrough_unique_key`) only ever resolve to a PRIMARY KEY,
+/// which is always NOT NULL — calling this on them is a cheap confirmation,
+/// not a new failure mode.
+pub(crate) fn provably_not_null_key_columns(
     client: &mut pgrx::spi::SpiClient<'_>,
     analysis: &crate::sql_analyzer::SqlAnalysis,
     key_columns: &[String],
-) -> Option<String> {
-    let mut left_target_tables: std::collections::HashSet<String> = std::collections::HashSet::new();
+) -> std::collections::HashSet<String> {
+    let mut left_target_tables: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
     for j in &analysis.joins {
         let jt = j.join_type.to_uppercase();
         if jt.contains("RIGHT") || jt.contains("FULL") {
-            // Nullable side is ambiguous for RIGHT/FULL joins — refuse rather
-            // than guess which key column could go NULL.
-            return key_columns.first().cloned();
+            // Nullable side is ambiguous for RIGHT/FULL joins — prove nothing
+            // rather than guess which key column could go NULL.
+            return std::collections::HashSet::new();
         }
         if jt.contains("LEFT") {
             left_target_tables.insert(j.target_table.trim_matches('"').to_lowercase());
@@ -1270,20 +1276,17 @@ pub(crate) fn first_nullable_explicit_key_column(
         })
         .collect();
 
-    for kc in key_columns {
-        let Some(expr) = target_col_to_expr.get(kc) else {
-            // Key column absent from the projection — cannot prove anything
-            // about it; refuse rather than silently accept.
-            return Some(kc.clone());
-        };
-        let proven = is_simple_col_ref(expr)
-            && (equi_refs.contains(&canon_col_ref(expr))
-                || column_base_not_null(client, analysis, expr, &left_target_tables));
-        if !proven {
-            return Some(kc.clone());
-        }
-    }
-    None
+    key_columns
+        .iter()
+        .filter(|kc| {
+            target_col_to_expr.get(kc.as_str()).is_some_and(|expr| {
+                is_simple_col_ref(expr)
+                    && (equi_refs.contains(&canon_col_ref(expr))
+                        || column_base_not_null(client, analysis, expr, &left_target_tables))
+            })
+        })
+        .cloned()
+        .collect()
 }
 
 /// Infer the group-by / distinct columns that are *provably* NOT NULL from the
