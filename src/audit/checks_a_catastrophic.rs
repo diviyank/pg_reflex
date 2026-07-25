@@ -113,22 +113,113 @@ impl Check for TriggerAttached {
         // a VIEW wrapper's operands carry no trigger at all — each sub-IMV
         // maintains its own target and the wrapper is evaluated on read — while a
         // materialised UNION-ALL wrapper is maintained by
-        // `__reflex_union_mirror_{ins,del,upd}_<wrapper>_<i>` triggers whose names
-        // this check does not know.
+        // `__reflex_union_mirror_{ins,del,upd}_<wrapper>_<i>` triggers, checked
+        // separately below since their absence is exactly the same class of
+        // silent-divergence defect this check exists to catch.
         //
-        // The remedy it printed was worse than noise: `reflex_rebuild_triggers`
+        // The consolidated remedy is worse than noise here: `reflex_rebuild_triggers`
         // on a sub-IMV target INSTALLS four consolidated triggers there
         // (`__reflex_trigger_ins_on_public_<sub>`, note the qualified suffix) and
-        // the finding still does not clear, so an operator following the tool
-        // accumulates junk triggers on every retry.
-        //
-        // Mirror-trigger absence on a materialised wrapper is consequently
-        // unchecked; adding that check needs a repair primitive first (nothing
-        // reinstalls them today) or it recreates the unclearable-remedy
-        // anti-pattern. Filed as
-        // `untreated_bugs/2026-07-24_union_mirror_triggers_unchecked.md`.
+        // does not clear a mirror-trigger finding, so an operator following it
+        // accumulates junk triggers on every retry. `reflex_rebuild_union_mirror`
+        // is the correct repair primitive for this shape (added alongside this
+        // check — see `untreated_bugs/2026-07-24_union_mirror_triggers_unchecked.md`).
         if imv.is_decomposed_wrapper() {
-            return vec![];
+            // Bare registry name, NOT `resolved_imv_name` — this is the exact
+            // key `reflex_rebuild_union_mirror` looks up with `WHERE name =
+            // $1`, which stores whatever `create_reflex_ivm` was given
+            // verbatim. A schema-qualified variant would not match that row
+            // and the printed remedy would silently fail to converge.
+            let wrapper_name = imv.name.clone();
+            let relkind = client
+                .select(
+                    "SELECT c.relkind::text AS k FROM pg_class c WHERE c.oid = to_regclass($1)",
+                    None,
+                    &[unsafe {
+                        DatumWithOid::new(
+                            wrapper_name.clone(),
+                            PgBuiltInOids::TEXTOID.oid().value(),
+                        )
+                    }],
+                )
+                .unwrap_or_report()
+                .first()
+                .get_by_name::<&str, _>("k")
+                .unwrap_or(None)
+                .map(|s| s.to_string());
+            // Only a materialised (TABLE) wrapper is maintained by mirror
+            // triggers; a VIEW wrapper has none by design, and an unresolved
+            // relation is covered by `source-exists`, not this check.
+            if relkind.as_deref() != Some("r") {
+                return vec![];
+            }
+            let safe_wrapper = crate::query_decomposer::sanitized_source_suffix(&wrapper_name);
+            let mut out = Vec::new();
+            for (i, operand) in imv.depends_on.iter().enumerate() {
+                let expected = [
+                    format!("__reflex_union_mirror_ins_{}_{}", safe_wrapper, i),
+                    format!("__reflex_union_mirror_del_{}_{}", safe_wrapper, i),
+                    format!("__reflex_union_mirror_upd_{}_{}", safe_wrapper, i),
+                ];
+                let operand_oid = match client
+                    .select(
+                        "SELECT to_regclass($1)::oid::bigint AS oid",
+                        None,
+                        &[unsafe {
+                            DatumWithOid::new(
+                                operand.to_string(),
+                                PgBuiltInOids::TEXTOID.oid().value(),
+                            )
+                        }],
+                    )
+                    .unwrap_or_report()
+                    .first()
+                    .get_by_name::<i64, _>("oid")
+                    .unwrap_or(None)
+                {
+                    Some(0) | None => continue,
+                    Some(o) => o,
+                };
+                let mut present: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
+                let rs = client
+                    .select(
+                        "SELECT tgname::text AS n FROM pg_trigger \
+                         WHERE tgrelid = $1::oid AND NOT tgisinternal",
+                        None,
+                        &[unsafe {
+                            DatumWithOid::new(operand_oid, PgBuiltInOids::INT8OID.oid().value())
+                        }],
+                    )
+                    .unwrap_or_report();
+                for row in rs {
+                    if let Ok(Some(n)) = row.get_by_name::<&str, _>("n") {
+                        present.insert(n.to_string());
+                    }
+                }
+                let missing: Vec<&String> =
+                    expected.iter().filter(|e| !present.contains(*e)).collect();
+                if !missing.is_empty() {
+                    let names: Vec<String> = missing.iter().map(|s| (*s).clone()).collect();
+                    out.push(Finding {
+                        imv: Some(imv.name.clone()),
+                        severity: Severity::Error,
+                        category: "trigger-attached",
+                        finding: format!(
+                            "Materialised UNION-ALL wrapper operand {} (index {}) is \
+                             missing mirror trigger(s): {}",
+                            operand,
+                            i,
+                            names.join(", ")
+                        ),
+                        suggested_fix: format!(
+                            "SELECT reflex_rebuild_union_mirror('{}');",
+                            wrapper_name
+                        ),
+                    });
+                }
+            }
+            return out;
         }
         let mut out = Vec::new();
         for src in imv.real_sources() {
