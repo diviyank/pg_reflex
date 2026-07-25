@@ -208,6 +208,21 @@ backfill; no reconcile is needed.
   now probes the intermediate and its group-capture companions independently,
   in build order, recreating only what's missing under the same advisory lock.
 
+- **(hardening, currently dead code)** The in-place partitioned passthrough UPDATE
+  body's `pt_old` membership predicate (its delete-gone and its
+  `assert_inplace_update` guard) was a plain `(key) IN (SELECT ... FROM pt_old)`
+  with no NOT-NULL gate — the third instance of this release's nullable-explicit-
+  key defect, after the primary keyed passthrough path and the LEFT/RIGHT-JOIN
+  secondary path. Gated on `plan.not_null_columns`, byte-identical when every key
+  column is proven NOT NULL. Investigation found this body is not currently
+  reachable (a `pg_attribute.attname`/`name`-type read silently returns no
+  columns, so every partitioned keyed UPDATE falls back to the standard,
+  already-safe cold body) and that naively enabling it raises on an ordinary
+  partition-key change, unrelated to NULLs — recorded in
+  `untreated_bugs/2026-07-25_inplace_partitioned_upsert_path_dead_and_broken.md`
+  as separate, still-open follow-up work; this fix only ensures a future revival
+  does not also inherit the NULL-unsafe predicate.
+
 - **(performance)** A MIN/MAX aggregate IMV's affected-group recompute scoped its
   membership `EXISTS` filter with the non-sargable `IS NOT DISTINCT FROM`
   unconditionally — even on the `eq = true` fast branch, where the sibling
