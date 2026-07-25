@@ -40,10 +40,8 @@ fn ps18_count(sql: &str) -> i64 {
 /// the verified collision zone (wrapper len >= 38) for a 1-digit operand
 /// index, comfortably past the boundary rather than sitting exactly on it.
 fn ps18_make_long_wrapper_fixture() {
-    Spi::run("CREATE TABLE ps18_len39_wrapper_name_abcdefgh_a (id BIGINT, v NUMERIC)")
-        .expect("a");
-    Spi::run("CREATE TABLE ps18_len39_wrapper_name_abcdefgh_b (id BIGINT, v NUMERIC)")
-        .expect("b");
+    Spi::run("CREATE TABLE ps18_len39_wrapper_name_abcdefgh_a (id BIGINT, v NUMERIC)").expect("a");
+    Spi::run("CREATE TABLE ps18_len39_wrapper_name_abcdefgh_b (id BIGINT, v NUMERIC)").expect("b");
     Spi::run("INSERT INTO ps18_len39_wrapper_name_abcdefgh_a VALUES (1, 10)").expect("seed a");
     Spi::run("INSERT INTO ps18_len39_wrapper_name_abcdefgh_b VALUES (2, 20)").expect("seed b");
     Spi::run(
@@ -116,7 +114,10 @@ fn ps18_assert_wrapper_matches_oracle(step: &str) {
         &format!("SELECT __reflex_src_idx, id, v FROM {PS18_WRAPPER}"),
         PS18_ORACLE,
     );
-    assert_eq!(diff, 0, "wrapper diverged from a fresh derivation after {step}");
+    assert_eq!(
+        diff, 0,
+        "wrapper diverged from a fresh derivation after {step}"
+    );
 }
 
 /// (2) Functional: each DML kind must run its OWN body, not another kind's
@@ -158,18 +159,22 @@ fn ps18_long_wrapper_mirror_functions_run_correct_body() {
 #[pg_test]
 fn ps18_drop_reflex_ivm_leaves_no_orphan_mirror_functions() {
     ps18_make_long_wrapper_fixture();
-    let before = ps18_count(
-        "SELECT count(*) FROM pg_proc WHERE proname LIKE '__reflex_union_mirror_%'",
+    let before =
+        ps18_count("SELECT count(*) FROM pg_proc WHERE proname LIKE '__reflex_union_mirror_%'");
+    assert_eq!(
+        before, 6,
+        "fixture precondition: 3 functions per operand x 2 operands"
     );
-    assert_eq!(before, 6, "fixture precondition: 3 functions per operand x 2 operands");
 
     Spi::run("SELECT drop_reflex_ivm('ps18_len39_wrapper_name_abcdefgh', TRUE)")
         .expect("drop must not error");
 
-    let after = ps18_count(
-        "SELECT count(*) FROM pg_proc WHERE proname LIKE '__reflex_union_mirror_%'",
+    let after =
+        ps18_count("SELECT count(*) FROM pg_proc WHERE proname LIKE '__reflex_union_mirror_%'");
+    assert_eq!(
+        after, 0,
+        "drop_reflex_ivm must not leak any union-mirror function"
     );
-    assert_eq!(after, 0, "drop_reflex_ivm must not leak any union-mirror function");
 }
 
 /// (4) A wrapper created by pg_reflex 1.11.0 or earlier has its mirror
@@ -207,7 +212,10 @@ fn ps18_drop_reflex_ivm_cleans_up_legacy_named_mirror_functions() {
         "SELECT count(*) FROM pg_proc \
          WHERE proname LIKE '__reflex_union_mirror_ps18_legacy_wrap__cte_u_%_ins'",
     );
-    assert_eq!(legacy_before, 2, "fixture precondition: 2 legacy-named stand-ins installed");
+    assert_eq!(
+        legacy_before, 2,
+        "fixture precondition: 2 legacy-named stand-ins installed"
+    );
 
     Spi::run("SELECT drop_reflex_ivm('ps18_legacy_wrap', TRUE)").expect("drop must not error");
 

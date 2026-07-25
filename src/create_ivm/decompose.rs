@@ -359,9 +359,15 @@ pub(crate) fn install_union_mirror_triggers(
     // operand index) into its truncated form, so two names that differ only
     // in a byte past the naive cutoff still end up distinct — this holds
     // regardless of wrapper length, not just below some fixed threshold.
-    let fn_ins = safe_identifier(&format!("__reflex_union_mirror_ins_{safe_wrapper}_{operand_idx}"));
-    let fn_del = safe_identifier(&format!("__reflex_union_mirror_del_{safe_wrapper}_{operand_idx}"));
-    let fn_upd = safe_identifier(&format!("__reflex_union_mirror_upd_{safe_wrapper}_{operand_idx}"));
+    let fn_ins = safe_identifier(&format!(
+        "__reflex_union_mirror_ins_{safe_wrapper}_{operand_idx}"
+    ));
+    let fn_del = safe_identifier(&format!(
+        "__reflex_union_mirror_del_{safe_wrapper}_{operand_idx}"
+    ));
+    let fn_upd = safe_identifier(&format!(
+        "__reflex_union_mirror_upd_{safe_wrapper}_{operand_idx}"
+    ));
 
     // INSERT mirror: tag every NEW row with this operand's index.
     let ins_body = format!(
