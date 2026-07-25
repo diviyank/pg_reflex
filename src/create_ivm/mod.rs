@@ -865,7 +865,7 @@ fn apply_partition_plan(client: &mut pgrx::spi::SpiClient<'_>, ctx: &mut BuildCo
 /// Drop `imv_relevant_columns` entries that don't exist on the source table.
 /// Mutates: `ctx.plan.imv_relevant_columns`.
 fn filter_imv_relevant_columns(client: &mut pgrx::spi::SpiClient<'_>, ctx: &mut BuildContext) {
-    let (_t, _nn, per_source_cols_for_filter) =
+    let (_t, _nn, per_source_cols_for_filter, _psnn) =
         query_column_types_from_catalog_with_per_source(client, &ctx.froms);
     for (source, cols) in ctx.plan.imv_relevant_columns.iter_mut() {
         if let Some(actual) = per_source_cols_for_filter.get(source) {
@@ -1037,8 +1037,17 @@ fn materialize_passthrough(client: &mut pgrx::spi::SpiClient<'_>, ctx: &mut Buil
 /// Aggregate materialization: catalog type discovery, intermediate + target + delta-scratch
 /// DDL, partition children. Pushes intermediate table name onto `ctx.unlogged_tables`.
 fn materialize_aggregate(client: &mut pgrx::spi::SpiClient<'_>, ctx: &mut BuildContext) {
-    let (mut column_types, not_null_cols, per_source_cols) =
+    let (mut column_types, catalog_not_null_cols, per_source_cols, per_source_not_null_cols) =
         query_column_types_from_catalog_with_per_source(client, &ctx.froms);
+    // The catalog union is outer-join-blind and bare-name-keyed; reduce it to
+    // the names still NOT NULL in the join's OUTPUT before it becomes
+    // `plan.not_null_columns` (which only ever grows from here on).
+    let not_null_cols = reduce_not_null_to_join_output(
+        &ctx.analysis,
+        &per_source_cols,
+        &per_source_not_null_cols,
+        &catalog_not_null_cols,
+    );
     ctx.plan.optimize_not_null_sums(&not_null_cols);
     for (source, cols) in ctx.plan.imv_relevant_columns.iter_mut() {
         if let Some(actual) = per_source_cols.get(source) {
