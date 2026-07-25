@@ -585,6 +585,18 @@ pub fn reflex_flush_deferred(source_table: &str) -> String {
                     // Flag it instead — the operator (or the next scheduled
                     // sweep, once the underlying issue is fixed) has a signal
                     // to act on.
+                    //
+                    // Flagging unconditionally is safe only because `imv_name`
+                    // can never be a decomposed WRAPPER, whose `reconcile_one`
+                    // refusal is an `ERROR:` string nothing could ever clear
+                    // (the clear lives past that refusal). A wrapper's
+                    // `depends_on` holds only its generated operands, and those
+                    // operands carry `__reflex_union_mirror_*` triggers only —
+                    // never the consolidated staging triggers that write
+                    // `__reflex_deferred_pending` — so no wrapper is ever
+                    // selected by the `= ANY(depends_on)` query this flush runs.
+                    // Pinned by
+                    // `xsu_wrapper_operands_have_no_staging_triggers`.
                     if reconcile_result.starts_with("ERROR") {
                         client
                             .update(

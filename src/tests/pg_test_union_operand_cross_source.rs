@@ -176,3 +176,78 @@ fn xsu_guard_reconcile_failure_flags_known_stale() {
         "stale_reason must name the underlying failure: {stale_reason}"
     );
 }
+
+/// Pins the invariant that keeps the guard's `known_stale`-on-`ERROR` write
+/// (above) from ever landing on a decomposed WRAPPER row — where nothing could
+/// clear it, since `reconcile_one` refuses a wrapper with an `ERROR:` string
+/// before reaching the tail that resets the flag — so a wrapper flagged this
+/// way could never be un-flagged by any primitive.
+///
+/// The guard can only ever name an IMV that `reflex_flush_deferred` selected
+/// with `<flushed source> = ANY(depends_on)`, and a wrapper's `depends_on`
+/// holds only its generated operand sub-IMVs. Those operands carry
+/// `__reflex_union_mirror_*` triggers and NOTHING else — the trigger-install
+/// loop in `create_ivm/mod.rs` runs over an IMV's own sources, and a wrapper
+/// short-circuits out of `create_reflex_ivm_impl` before it — so no operand
+/// name can enter `__reflex_deferred_pending`, so no wrapper row can enter the
+/// guard. Break that (install consolidated staging triggers on an operand) and
+/// the first assertion below goes RED, ahead of the latent wedge.
+#[pg_test]
+fn xsu_wrapper_operands_have_no_staging_triggers() {
+    Spi::run("CREATE TABLE xsu3_ua (id INT PRIMARY KEY, g INT, v INT)").unwrap();
+    Spi::run("CREATE TABLE xsu3_ub (id INT PRIMARY KEY, ua_id INT, w INT)").unwrap();
+    Spi::run("CREATE TABLE xsu3_uc (id INT PRIMARY KEY, g INT, v INT)").unwrap();
+    Spi::run("CREATE TABLE xsu3_ud (id INT PRIMARY KEY, uc_id INT, w INT)").unwrap();
+    Spi::run("INSERT INTO xsu3_ua VALUES (1,10,0), (2,20,0)").unwrap();
+    Spi::run("INSERT INTO xsu3_ub VALUES (100,1,7), (101,2,8)").unwrap();
+    Spi::run("INSERT INTO xsu3_uc VALUES (200,10,3)").unwrap();
+    Spi::run("INSERT INTO xsu3_ud VALUES (300,200,4)").unwrap();
+
+    // Both operands are two-source joins, so a single transaction can mutate
+    // two sources of EACH operand — the widest cross-source shape this wrapper
+    // can be subjected to.
+    let sql = "WITH u AS ( \
+                 SELECT xsu3_ua.g AS g, xsu3_ub.w AS v \
+                   FROM xsu3_ua JOIN xsu3_ub ON xsu3_ub.ua_id = xsu3_ua.id \
+                 UNION ALL \
+                 SELECT xsu3_uc.g AS g, xsu3_ud.w AS v \
+                   FROM xsu3_uc JOIN xsu3_ud ON xsu3_ud.uc_id = xsu3_uc.id \
+               ) \
+               SELECT g, SUM(v) AS s FROM u GROUP BY g";
+    crate::create_reflex_ivm("xsu3_v", sql, None, None, Some("DEFERRED"), None);
+
+    for operand in ["xsu3_v__cte_u__union_0", "xsu3_v__cte_u__union_1"] {
+        let staging_trigs = Spi::get_one::<i64>(&format!(
+            "SELECT count(*) FROM pg_trigger \
+             WHERE tgrelid = to_regclass('{operand}') AND NOT tgisinternal \
+               AND tgname LIKE '\\_\\_reflex\\_trigger\\_%'"
+        ))
+        .expect("q")
+        .expect("v");
+        assert_eq!(
+            staging_trigs, 0,
+            "operand '{operand}' must carry only __reflex_union_mirror_* triggers; a \
+             consolidated staging trigger there would put its name in \
+             __reflex_deferred_pending and expose the wrapper to the cross-source guard"
+        );
+    }
+
+    Spi::run("INSERT INTO xsu3_ua VALUES (3,30,0)").unwrap();
+    Spi::run("INSERT INTO xsu3_ub VALUES (102,3,9)").unwrap();
+    Spi::run("INSERT INTO xsu3_uc VALUES (201,40,0)").unwrap();
+    Spi::run("INSERT INTO xsu3_ud VALUES (301,201,5)").unwrap();
+    drain_deferred_pending();
+
+    let flagged = Spi::get_one::<String>(
+        "SELECT COALESCE(string_agg(name || ': ' || COALESCE(stale_reason, '?'), ' | '), '') \
+         FROM public.__reflex_ivm_reference WHERE known_stale",
+    )
+    .expect("q")
+    .expect("v");
+    assert_eq!(
+        flagged, "",
+        "a multi-source transaction over a materialised UNION-ALL wrapper's operands \
+         must leave no row known_stale"
+    );
+    assert_imv_correct("xsu3_v", sql);
+}
