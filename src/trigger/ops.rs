@@ -503,6 +503,40 @@ pub(crate) fn secondary_ref_identifiers(base_query: &str, source_table: &str) ->
     ids
 }
 
+/// Table qualifiers (lowercased, unquoted) a GROUP BY expression references:
+/// for every `tbl.col` / `schema.tbl.col` identifier chain in it, the segment
+/// immediately preceding the column — the TABLE, never the schema. Taking the
+/// first `.`-delimited segment instead would read `public` out of
+/// `public.fb.k` and `date_trunc('month', fb` out of an expression, neither of
+/// which can ever match a table, silently making every such key look stable.
+///
+/// Segments that don't look like identifiers (a numeric literal's `1.5`) are
+/// skipped, so they can neither pose as a qualifier nor mask a real one.
+fn group_column_qualifiers(gb: &str) -> Vec<String> {
+    let is_ident_char = |c: char| c.is_alphanumeric() || c == '_' || c == '$' || c == '"';
+    gb.split(|c: char| !(is_ident_char(c) || c == '.'))
+        .filter_map(|chain| {
+            let (prefix, _) = chain.rsplit_once('.')?;
+            let table = prefix.rsplit('.').next().unwrap_or(prefix);
+            let table = table.trim_matches('"');
+            let starts_like_identifier = table
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_alphabetic() || c == '_');
+            starts_like_identifier.then(|| table.to_lowercase())
+        })
+        .collect()
+}
+
+/// Whether a GROUP BY column is STABLE with respect to the table just mutated:
+/// confidently qualified, and by no identifier that refers to that table. An
+/// unqualified column (or an expression with no identifier-looking qualifier)
+/// is treated as migrating, which only ever broadens the recompute.
+fn group_column_is_stable(gb: &str, secondary_ids: &[String]) -> bool {
+    let qualifiers = group_column_qualifiers(gb);
+    !qualifiers.is_empty() && qualifiers.iter().all(|q| !secondary_ids.contains(q))
+}
+
 /// Whether every GROUP BY column that `source_join_keys` maps for this
 /// secondary is STABLE — i.e. not itself derived from the secondary being
 /// mutated. `parse_join_condition_mappings` matches JOIN-equality sides by
@@ -534,11 +568,7 @@ fn join_key_scope_is_sound(
         plan.group_by_columns
             .iter()
             .find(|gb| normalized_column_name(gb).to_lowercase() == *interm_col)
-            .is_some_and(|gb| {
-                gb.split_once('.')
-                    .map(|(q, _)| q.trim().trim_matches('"').to_lowercase())
-                    .is_some_and(|q| !sec_ids.contains(&q))
-            })
+            .is_some_and(|gb| group_column_is_stable(gb, &sec_ids))
     })
 }
 
@@ -769,14 +799,10 @@ pub(crate) fn outer_join_secondary_stmts(
         let mut scope_cols: Vec<String> = Vec::new();
         let mut scope_target_cols: Vec<String> = Vec::new();
         for (i, gb) in plan.group_by_columns.iter().enumerate() {
-            let qualifier = gb
-                .split_once('.')
-                .map(|(q, _)| q.trim().trim_matches('"').to_lowercase());
             // Stable only when confidently qualified by a non-secondary table.
             // Unqualified columns are excluded (treated as possibly migrating),
             // which only ever broadens the recompute — never narrows it.
-            let stable = qualifier.is_some_and(|q| !sec_ids.contains(&q));
-            if stable {
+            if group_column_is_stable(gb, &sec_ids) {
                 if let Some(c) = cols.get(i) {
                     scope_cols.push(c.clone());
                 }
