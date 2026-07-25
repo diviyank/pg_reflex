@@ -521,13 +521,88 @@ pub fn reflex_flush_deferred(source_table: &str) -> String {
                             &[],
                         )
                         .unwrap_or_report();
-                    client
-                        .update(
-                            &format!("SELECT public.reflex_reconcile('{}')", imv_esc),
+
+                    // A GENERATED sub-IMV (a CTE / UNION-ALL / set-op operand
+                    // pg_reflex itself created) must never be repaired through
+                    // the public `reflex_reconcile` from here. We are running
+                    // inside the deferred COMMIT trigger
+                    // (`pg_trigger_depth() > 0`), and
+                    // `reflex_reconcile_with_orphans`'s `inside_trigger` gate
+                    // skips straight to `reconcile_one` with the node's OWN
+                    // triggers live for exactly that reason — but for a
+                    // UNION-ALL operand that live trigger is a mirror that
+                    // re-appends the operand's full row set into its wrapper
+                    // on the rebuild's INSERT, with nothing having removed the
+                    // wrapper's stale slice (`TRUNCATE` doesn't fire it),
+                    // silently doubling the wrapper and everything reading it.
+                    // `reconcile_generated_child_for_cross_source_guard`
+                    // rebuilds with propagation suppressed instead, and
+                    // resyncs the wrapper's slice when there is one.
+                    let is_generated = client
+                        .select(
+                            &format!(
+                                "SELECT COALESCE(is_generated_sub_imv, FALSE) AS g \
+                                 FROM public.__reflex_ivm_reference WHERE name = '{}'",
+                                imv_esc
+                            ),
                             None,
                             &[],
                         )
-                        .unwrap_or_report();
+                        .unwrap_or_report()
+                        .next()
+                        .map(|row| {
+                            row.get_by_name::<bool, _>("g")
+                                .unwrap_or(None)
+                                .unwrap_or(false)
+                        })
+                        .unwrap_or(false);
+
+                    let reconcile_result: String = if is_generated {
+                        crate::reconcile::reconcile_generated_child_for_cross_source_guard(imv_name)
+                            .to_string()
+                    } else {
+                        client
+                            .select(
+                                &format!("SELECT public.reflex_reconcile('{}') AS r", imv_esc),
+                                None,
+                                &[],
+                            )
+                            .unwrap_or_report()
+                            .next()
+                            .and_then(|row| row.get_by_name::<&str, _>("r").unwrap_or(None))
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(|| {
+                                "ERROR: reflex_reconcile returned no result".to_string()
+                            })
+                    };
+
+                    // Never silently discard a staged delta whose only
+                    // consumer failed (facet (b), 2026-07-25 bug report):
+                    // most reconcile failures are returned STRINGS, not
+                    // raises, so without this the end-of-flush cleanup below
+                    // deletes the delta and pending row unconditionally,
+                    // converting the failure into permanent silent staleness.
+                    // Flag it instead — the operator (or the next scheduled
+                    // sweep, once the underlying issue is fixed) has a signal
+                    // to act on.
+                    if reconcile_result.starts_with("ERROR") {
+                        client
+                            .update(
+                                &format!(
+                                    "UPDATE public.__reflex_ivm_reference \
+                                     SET known_stale = TRUE, \
+                                         stale_reason = left('cross-source guard reconcile failed: {}', 2000), \
+                                         stale_since = now() \
+                                     WHERE name = '{}'",
+                                    reconcile_result.replace('\'', "''"),
+                                    imv_esc
+                                ),
+                                None,
+                                &[],
+                            )
+                            .unwrap_or_report();
+                    }
+
                     total_processed += 1;
                     continue;
                 }
