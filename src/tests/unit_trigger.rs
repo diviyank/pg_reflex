@@ -530,6 +530,43 @@ fn test_min_max_recompute_scoped_to_affected_groups_when_provided() {
     );
 }
 
+/// PS-11 REGRESSION GUARD: when every group key is provably NOT NULL,
+/// `affected_null_key_gate` returns `None` and only the `eq = true` fast
+/// branch is emitted. Its affected-group scoping EXISTS filter must use the
+/// sargable `=`, not `IS NOT DISTINCT FROM` — the latter is neither hashable
+/// nor mergejoinable, so the semi-join to the affected table silently
+/// degrades from a Hash/Merge Semi Join to a Nested Loop Semi Join, measured
+/// 700-3700x slower at realistic source sizes. This must hold even though the
+/// two OTHER `IS NOT DISTINCT FROM` join predicates in the same statement
+/// (`update_join`/`exists_join`) are correctly gated already — the affected-
+/// group scoping filter was the one spot still hard-coded to the NULL-safe
+/// form regardless of `eq`.
+#[test]
+fn test_min_max_recompute_scoped_source_uses_eq_when_group_key_provably_not_null() {
+    let mut plan = min_only_plan();
+    plan.not_null_columns.insert("city".to_string());
+    let orig_base = "SELECT city AS \"city\", MIN(price) AS \"__min_price\", COUNT(*) AS __ivm_count FROM orders GROUP BY city";
+    let sql = build_min_max_recompute_sql(
+        "intermediate",
+        &plan,
+        orig_base,
+        Some("__reflex_affected_v"),
+    )
+    .expect("MIN plan must produce recompute SQL");
+    assert!(
+        sql.contains("(city) = __ng.__g0"),
+        "all-group-keys-NOT-NULL recompute must scope the affected-group EXISTS \
+         filter with the sargable `=`, not the NULL-safe form: {}",
+        sql
+    );
+    assert!(
+        !sql.contains("IS NOT DISTINCT FROM __ng.__g0"),
+        "all-group-keys-NOT-NULL recompute must not pay the non-sargable \
+         NULL-safe scoping filter (PS-11 perf-cliff regression): {}",
+        sql
+    );
+}
+
 #[test]
 fn test_min_max_recompute_no_affected_filter_when_none_passed() {
     // Backward-compatible path: when no affected-groups table is available

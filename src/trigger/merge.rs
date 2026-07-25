@@ -732,54 +732,71 @@ pub(crate) fn build_min_max_recompute_sql_inner(
     // the LHS (so it applies to pre-aggregation rows) and the normalized
     // column names in the affected-groups table on the RHS. Postgres matches
     // by value, not by alias, so a raw/normalized pair works.
-    let scoped_source = match affected_tbl {
-        Some(at) => {
-            // NULL-safe affected-group scoping. `(cols) IN (SELECT ...)` never
-            // matches a NULL group key — `(NULL) IN (...)` is NULL, not TRUE — so a
-            // NULL group was dropped from the scoped source and a MIN/MAX left NULL
-            // by a retraction was never re-derived (silent wrong result). Use a
-            // correlated EXISTS with per-column `IS NOT DISTINCT FROM`, pairing each
-            // raw GROUP BY expression (LHS, evaluated in the outer source scope) to
-            // its normalized column in the affected table (RHS) — the same
-            // raw/normalized pairing the IN form used.
-            //
-            // The affected columns are aliased through a derived table (`__g0`,
-            // `__g1`, …) so the correlated subquery exposes NO column named like a
-            // raw source column: an unqualified raw key (e.g. bare `grp`) then
-            // resolves outward to the source row, not inward to the affected table.
-            // Without the alias, a bare raw key equal to an affected column name
-            // would bind to the affected column, the predicate would be trivially
-            // TRUE, and the scoping would silently collapse to a full source scan.
-            // (The `__gN` labels prevent bare-column shadowing; they are not
-            // collision-proof against a source column literally named `__gN`, but
-            // reflex reserves the `__` identifier namespace, so that cannot occur.)
-            let pairs: Vec<(&String, &String)> = plan
-                .group_by_columns
-                .iter()
-                .zip(group_cols.iter())
-                .collect();
-            let projection = pairs
-                .iter()
-                .enumerate()
-                .map(|(i, (_, norm))| format!("\"{}\" AS __g{}", norm, i))
-                .collect::<Vec<_>>()
-                .join(", ");
-            let conds = pairs
-                .iter()
-                .enumerate()
-                .map(|(i, (raw, _))| format!("({}) IS NOT DISTINCT FROM __ng.__g{}", raw, i))
-                .collect::<Vec<_>>()
-                .join(" AND ");
-            let filter = format!(
-                " AND EXISTS (SELECT 1 FROM (SELECT {} FROM {}) __ng WHERE {})",
-                projection, at, conds
-            );
-            match splice_before_group_by(orig_base_query, &filter) {
-                Some(spliced) => spliced,
-                None => orig_base_query.to_string(),
+    // `eq`-parameterized like `update_join`/`exists_join` below (PS-11 fix): the
+    // ORIGINAL NULL-safe rewrite built this filter ONCE, unconditionally using
+    // `IS NOT DISTINCT FROM`, and every caller of `build_update` — including the
+    // `eq = true` (all-group-keys-provably-NOT-NULL) fast branch — shared that
+    // one non-sargable string. `IS NOT DISTINCT FROM` is neither hashable nor
+    // mergejoinable, so the semi-join to the affected table silently degraded
+    // from a Hash/Merge Semi Join to a Nested Loop Semi Join for EVERY MIN/MAX
+    // IMV, not just the ones actually holding a NULL group key — measured
+    // 700-3700x slower at realistic (50k-1M row) source sizes, landing on the
+    // exact recompute path implicated in a known production storm. `=` and
+    // `IS NOT DISTINCT FROM` select identically once the caller has already
+    // proven (via `eq`) that no group key involved can be NULL, so scoping this
+    // by the same `eq` the join predicates already use is sound, not just fast.
+    let scoped_source = |eq: bool| -> String {
+        match affected_tbl {
+            Some(at) => {
+                // NULL-safe affected-group scoping. `(cols) IN (SELECT ...)` never
+                // matches a NULL group key — `(NULL) IN (...)` is NULL, not TRUE — so a
+                // NULL group was dropped from the scoped source and a MIN/MAX left NULL
+                // by a retraction was never re-derived (silent wrong result). Use a
+                // correlated EXISTS with per-column `IS NOT DISTINCT FROM` (or `=` when
+                // `eq` proves no NULL key can be involved), pairing each raw GROUP BY
+                // expression (LHS, evaluated in the outer source scope) to its
+                // normalized column in the affected table (RHS) — the same
+                // raw/normalized pairing the IN form used.
+                //
+                // The affected columns are aliased through a derived table (`__g0`,
+                // `__g1`, …) so the correlated subquery exposes NO column named like a
+                // raw source column: an unqualified raw key (e.g. bare `grp`) then
+                // resolves outward to the source row, not inward to the affected table.
+                // Without the alias, a bare raw key equal to an affected column name
+                // would bind to the affected column, the predicate would be trivially
+                // TRUE, and the scoping would silently collapse to a full source scan.
+                // (The `__gN` labels prevent bare-column shadowing; they are not
+                // collision-proof against a source column literally named `__gN`, but
+                // reflex reserves the `__` identifier namespace, so that cannot occur.)
+                let pairs: Vec<(&String, &String)> = plan
+                    .group_by_columns
+                    .iter()
+                    .zip(group_cols.iter())
+                    .collect();
+                let projection = pairs
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (_, norm))| format!("\"{}\" AS __g{}", norm, i))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let op = if eq { "=" } else { "IS NOT DISTINCT FROM" };
+                let conds = pairs
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (raw, _))| format!("({}) {} __ng.__g{}", raw, op, i))
+                    .collect::<Vec<_>>()
+                    .join(" AND ");
+                let filter = format!(
+                    " AND EXISTS (SELECT 1 FROM (SELECT {} FROM {}) __ng WHERE {})",
+                    projection, at, conds
+                );
+                match splice_before_group_by(orig_base_query, &filter) {
+                    Some(spliced) => spliced,
+                    None => orig_base_query.to_string(),
+                }
             }
+            None => orig_base_query.to_string(),
         }
-        None => orig_base_query.to_string(),
     };
 
     // PS-5 — both the recompute UPDATE's join to `__src` and (below) the EXISTS
@@ -812,7 +829,7 @@ pub(crate) fn build_min_max_recompute_sql_inner(
             "UPDATE {} SET {} FROM ({}) AS __src WHERE {} AND ({})",
             intermediate_tbl,
             set_parts.join(", "),
-            scoped_source,
+            scoped_source(eq),
             update_join(eq),
             null_check.join(" OR ")
         )
