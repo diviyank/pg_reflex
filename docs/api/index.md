@@ -88,7 +88,6 @@ See [Event triggers](event-triggers.md) for details.
 |---|---|---|
 | [`reflex.wipe_threshold`](gucs.md#reflexwipe_threshold) | `0.5` | 1.4.6+. Dirty-row fraction at or above which a batch wipes-and-rebuilds instead of delta-applying. |
 | [`reflex.wipe_floor_rows`](gucs.md#reflexwipe_floor_rows) | `1000` | 1.6.0+. Floor on the partition-size denominator of the dirty ratio. |
-| [`reflex.assert_inplace_update`](gucs.md#reflexassert_inplace_update) | `off` | Correctness assertion on the in-place UPDATE path; for CI/fuzz. |
 | [`pg_reflex.alter_source_policy`](gucs.md#pg_reflexalter_source_policy) | `'warn'` | 1.2.1+. `'warn'` or `'error'` — reaction to `ALTER TABLE` on a tracked source. |
 | [`pg_reflex.debug_resolve_anchor`](gucs.md#pg_reflexdebug_resolve_anchor) | `off` | 1.10.8+. Gates diagnostic NOTICEs during anchor resolution. Off by default to avoid burying real WARNINGs. |
 

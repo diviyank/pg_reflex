@@ -448,7 +448,6 @@ pg_reflex reads a handful of runtime settings via `current_setting`. None requir
 |---|---|---|---|
 | `reflex.wipe_threshold` | float `0`–`1` | `0.5` | Dirty-row fraction at or above which a maintenance batch wipes-and-rebuilds the (partition of the) IMV instead of applying a row-by-row delta. Per-IMV override via [`reflex_set_wipe_threshold`](#reflex_set_wipe_thresholdview_name-text-value-numeric---text). |
 | `reflex.wipe_floor_rows` | integer | `1000` | Floor on the partition-size denominator of the dirty/size ratio, so a tiny or never-`ANALYZE`d partition (`reltuples = 0`) cannot trip a wipe on one dirty row. Per-IMV override via [`reflex_set_wipe_floor_rows`](#reflex_set_wipe_floor_rowsview_name-text-value-bigint---text). |
-| `reflex.assert_inplace_update` | boolean | `off` | When on, the in-place UPDATE path re-derives the affected key set and `RAISE`s on any mismatch — a correctness assertion for CI/fuzz runs. Leave off in production. |
 | `pg_reflex.alter_source_policy` | enum `warn` \| `error` | `warn` | What the `ddl_command_end` event trigger does when a tracked source table is altered: `warn` emits a `WARNING` and lets the ALTER through (run `reflex_rebuild_imv` afterward); `error` rejects the ALTER. |
 
 ```sql
