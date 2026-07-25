@@ -1226,6 +1226,66 @@ pub(crate) fn column_base_not_null(
         == Some(true)
 }
 
+/// For a passthrough IMV's *explicit* unique key (3rd `create_reflex_ivm`
+/// argument), require every key column to be provably NOT NULL by the same
+/// structural proof `infer_not_null_columns` uses for aggregate GROUP BY keys:
+/// an equi-join operand of an INNER join, or a catalog NOT-NULL base column not
+/// on the nullable side of an outer join. A nullable key column defeats the
+/// `(key) IN (SELECT ...)` scoped DELETE/UPDATE predicate — `(NULL) IN (...)`
+/// is never TRUE — leaving a phantom target row on source DELETE and a
+/// unique-index violation aborting the user's transaction on source UPDATE.
+///
+/// The safe auto-detect path (`resolve_unique_columns`'s PK probe,
+/// `infer_join_passthrough_unique_key`) never surfaces this because a
+/// PRIMARY KEY is always NOT NULL; this only guards the explicit-key path,
+/// where the caller can name any column.
+///
+/// Returns the first key column that cannot be proven NOT NULL, or `None` if
+/// every key column can.
+pub(crate) fn first_nullable_explicit_key_column(
+    client: &mut pgrx::spi::SpiClient<'_>,
+    analysis: &crate::sql_analyzer::SqlAnalysis,
+    key_columns: &[String],
+) -> Option<String> {
+    let mut left_target_tables: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for j in &analysis.joins {
+        let jt = j.join_type.to_uppercase();
+        if jt.contains("RIGHT") || jt.contains("FULL") {
+            // Nullable side is ambiguous for RIGHT/FULL joins — refuse rather
+            // than guess which key column could go NULL.
+            return key_columns.first().cloned();
+        }
+        if jt.contains("LEFT") {
+            left_target_tables.insert(j.target_table.trim_matches('"').to_lowercase());
+        }
+    }
+
+    let equi_refs = inner_join_equi_non_null_refs(analysis);
+    let target_col_to_expr: HashMap<String, String> = analysis
+        .select_columns
+        .iter()
+        .map(|c| {
+            let target_name = normalized_column_name(c.alias.as_deref().unwrap_or(&c.expr_sql));
+            (target_name, c.expr_sql.clone())
+        })
+        .collect();
+
+    for kc in key_columns {
+        let Some(expr) = target_col_to_expr.get(kc) else {
+            // Key column absent from the projection — cannot prove anything
+            // about it; refuse rather than silently accept.
+            return Some(kc.clone());
+        };
+        let proven = is_simple_col_ref(expr)
+            && (equi_refs.contains(&canon_col_ref(expr))
+                || column_base_not_null(client, analysis, expr, &left_target_tables));
+        if !proven {
+            return Some(kc.clone());
+        }
+    }
+    None
+}
+
 /// Infer the group-by / distinct columns that are *provably* NOT NULL from the
 /// query's structure (NOT from transient create-time data). A column is promoted
 /// only when it can never be NULL in the IMV:

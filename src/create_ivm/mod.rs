@@ -199,9 +199,16 @@ fn validate_and_parse_inputs(
 /// full refresh on DELETE/UPDATE (warned). Populates
 /// `ctx.resolved_unique_columns` and `ctx.plan.passthrough_columns` /
 /// `ctx.plan.passthrough_key_mappings`.
-fn resolve_unique_columns(ctx: &mut BuildContext) {
+///
+/// Returns `Some(msg)` to abort the create when an *explicit* key names a
+/// column that is not provably NOT NULL — `(NULL) IN (...)` never matches, so
+/// a nullable key defeats the keyed DELETE/UPDATE maintenance predicate
+/// (phantom target row on DELETE, unique-index abort on UPDATE). The
+/// auto-detect branches below never need this check: they only ever resolve
+/// to a PRIMARY KEY, which the catalog already guarantees is NOT NULL.
+fn resolve_unique_columns(ctx: &mut BuildContext) -> Option<&'static str> {
     if !ctx.plan.is_passthrough {
-        return;
+        return None;
     }
 
     if !ctx.unique_columns_str.is_empty() {
@@ -213,6 +220,21 @@ fn resolve_unique_columns(ctx: &mut BuildContext) {
             .filter(|s| !s.is_empty())
             .collect();
         ctx.plan.passthrough_columns = ctx.resolved_unique_columns.clone();
+
+        let nullable_key_col = Spi::connect_mut(|client| {
+            first_nullable_explicit_key_column(client, &ctx.analysis, &ctx.resolved_unique_columns)
+        });
+        if let Some(col) = nullable_key_col {
+            return Some(crate::reflex_reject(&format!(
+                "explicit unique key column '{col}' is not provably NOT NULL. \
+                 A passthrough IMV's keyed DELETE/UPDATE maintenance scopes rows with \
+                 `(key) IN (SELECT ... )`, and `(NULL) IN (...)` is never TRUE — a NULL-key \
+                 row would leave a phantom target row on DELETE and abort the source UPDATE \
+                 with a unique-index violation. Add a NOT NULL constraint on '{col}'s base \
+                 column, or remove it from the explicit key if it does not uniquely identify rows."
+            )));
+        }
+
         info!(
             "pg_reflex: using explicit unique key ({}) for '{}'",
             ctx.resolved_unique_columns.join(", "),
@@ -326,6 +348,7 @@ fn resolve_unique_columns(ctx: &mut BuildContext) {
             ctx.view_name, ctx.view_name
         );
     }
+    None
 }
 
 fn populate_source_join_keys(ctx: &mut BuildContext) {
@@ -2052,7 +2075,9 @@ pub(crate) fn create_reflex_ivm_impl_with_materialization(
         unlogged_tables: Vec::new(),
     };
 
-    resolve_unique_columns(&mut ctx);
+    if let Some(msg) = resolve_unique_columns(&mut ctx) {
+        return msg;
+    }
 
     // 1.5.3 (plans/partitioning_3.md §4) — populate per-source
     // partition_join_paths fragments.  Skipped here for the unpartitioned
