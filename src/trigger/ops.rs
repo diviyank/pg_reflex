@@ -516,26 +516,19 @@ pub(crate) fn secondary_ref_identifiers(base_query: &str, source_table: &str) ->
 /// uses to decide the same thing; an unmatched or unqualified column is
 /// treated as migrating (fail toward the safe fallback).
 ///
-/// Also refuses a FULL OUTER JOIN outright, unconditionally — mirroring the
-/// passthrough branch's own FULL-JOIN bail-out a few lines up in this file.
-/// The "qualifier != mutated table => stable" premise this predicate checks
-/// is exactly what a FULL JOIN violates: EITHER side can carry unmatched
-/// rows whose join-key column is NULL on one side of the row and populated
-/// on the other, so a column qualified by the OTHER (non-mutated) side is not
-/// actually stable either — an INSERT into the secondary with no matching
-/// primary row produces a NULL primary-side group key that the changed-key
-/// scoping never rebuilds (silent row loss), and the symmetric DELETE case
-/// leaves a stale NULL group behind.
+/// A FULL OUTER JOIN base query never reaches this function at all — its
+/// caller (`outer_join_secondary_stmts`) bails out to an unconditional full
+/// rebuild for that join type before `source_join_keys` is even consulted,
+/// for the same reason this predicate would otherwise have to refuse it: the
+/// "qualifier != mutated table => stable" premise is false for either side of
+/// a FULL JOIN, since either can carry unmatched rows whose join-key column
+/// is NULL on one side of the row and populated on the other.
 fn join_key_scope_is_sound(
     plan: &AggregationPlan,
     join_keys: &[(String, String)],
     base_query: &str,
     source_table: &str,
 ) -> bool {
-    let bq_upper = base_query.to_uppercase();
-    if bq_upper.contains("FULL JOIN") || bq_upper.contains("FULL OUTER") {
-        return false;
-    }
     let sec_ids = secondary_ref_identifiers(base_query, source_table);
     join_keys.iter().all(|(interm_col, _)| {
         plan.group_by_columns

@@ -3165,13 +3165,19 @@ fn test_correctness_full_outer_join_aggregate() {
 /// dropping the new group's row.
 #[pg_test]
 fn test_correctness_full_outer_join_aggregate_primary_group_by() {
-    Spi::run("CREATE TABLE foja (id INT PRIMARY KEY, k TEXT)").expect("create foja");
-    Spi::run("CREATE TABLE fojb (k TEXT PRIMARY KEY, w INT NOT NULL)").expect("create fojb");
+    // `foja.k` and `fojb.kk` are deliberately DIFFERENT column names (not both
+    // "k"): `plan.not_null_columns` is a bare-name set with no per-source
+    // qualification, so a shared name across both join sides would make a
+    // NOT NULL secondary key look like a NOT NULL primary key too, letting an
+    // unrelated NULL-safety fallback (not this test's target property) also
+    // turn RED under mutation and mask what's actually being pinned.
+    Spi::run("CREATE TABLE foja (id INT PRIMARY KEY, k TEXT NOT NULL)").expect("create foja");
+    Spi::run("CREATE TABLE fojb (kk TEXT PRIMARY KEY, w INT NOT NULL)").expect("create fojb");
     Spi::run("INSERT INTO foja VALUES (1, 'a'), (2, 'b')").expect("seed foja");
     Spi::run("INSERT INTO fojb VALUES ('a', 100)").expect("seed fojb");
 
     let sql = "SELECT foja.k AS k, COUNT(*) AS cnt \
-               FROM foja FULL JOIN fojb ON foja.k = fojb.k \
+               FROM foja FULL JOIN fojb ON foja.k = fojb.kk \
                GROUP BY foja.k";
     crate::create_reflex_ivm("foj_pg_v", sql, None, None, None, None);
     assert_imv_correct("foj_pg_v", sql);
@@ -3182,11 +3188,44 @@ fn test_correctness_full_outer_join_aggregate_primary_group_by() {
     Spi::run("INSERT INTO fojb VALUES ('c', 200)").expect("insert right-only");
     assert_imv_correct("foj_pg_v", sql);
 
-    Spi::run("UPDATE fojb SET w = 999 WHERE k = 'a'").expect("update");
+    Spi::run("UPDATE fojb SET w = 999 WHERE kk = 'a'").expect("update");
     assert_imv_correct("foj_pg_v", sql);
 
-    Spi::run("DELETE FROM fojb WHERE k = 'c'").expect("delete");
+    Spi::run("DELETE FROM fojb WHERE kk = 'c'").expect("delete");
     assert_imv_correct("foj_pg_v", sql);
+}
+
+/// Symmetric twin of the test above: GROUP BY is on the FULL JOIN's
+/// SECONDARY side (`fojb.kk`) and the mutation lands on the PRIMARY side
+/// (`foja`) instead. `secondary_ref_identifiers` only names the table the
+/// trigger fired on, so a fast/fallback path keyed off "qualifier != mutated
+/// table" would classify `fojb.kk` as stable for a `foja` mutation — but a
+/// primary-side insert with no matching secondary row still surfaces a brand
+/// new NULL group (`fojb.kk IS NULL`) that scoping on `fojb`'s own join value
+/// can never reach.
+#[pg_test]
+fn test_correctness_full_outer_join_aggregate_secondary_group_by() {
+    Spi::run("CREATE TABLE fojc (id INT PRIMARY KEY, k TEXT NOT NULL)").expect("create fojc");
+    Spi::run("CREATE TABLE fojd (kk TEXT PRIMARY KEY, w INT NOT NULL)").expect("create fojd");
+    Spi::run("INSERT INTO fojc VALUES (1, 'a')").expect("seed fojc");
+    Spi::run("INSERT INTO fojd VALUES ('a', 100), ('b', 200)").expect("seed fojd");
+
+    let sql = "SELECT fojd.kk AS kk, COUNT(*) AS cnt \
+               FROM fojc FULL JOIN fojd ON fojc.k = fojd.kk \
+               GROUP BY fojd.kk";
+    crate::create_reflex_ivm("foj_sg_v", sql, None, None, None, None);
+    assert_imv_correct("foj_sg_v", sql);
+
+    // Left-only insert: no matching fojd row → a brand-new NULL group that a
+    // scoped recompute keyed on fojc's own join value must not silently drop.
+    Spi::run("INSERT INTO fojc VALUES (2, 'zz')").expect("insert left-only");
+    assert_imv_correct("foj_sg_v", sql);
+
+    Spi::run("UPDATE fojc SET k = 'b' WHERE id = 1").expect("update");
+    assert_imv_correct("foj_sg_v", sql);
+
+    Spi::run("DELETE FROM fojc WHERE id = 2").expect("delete");
+    assert_imv_correct("foj_sg_v", sql);
 }
 
 /// CROSS JOIN with mutations
