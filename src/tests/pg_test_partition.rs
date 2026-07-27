@@ -478,6 +478,82 @@ fn pg_part_sync_partitions_preserves_orphans_when_opt_out() {
     assert_eq!(after, 2, "orphan target should be preserved");
 }
 
+/// An empty source-tree enumeration must NEVER be read as "every IMV partition
+/// is an orphan". `list_partition_tree` returns an empty Vec both when the
+/// anchor genuinely has no children AND when it could not be resolved at all
+/// (`to_regclass` NULL on an unqualified name, a non-partitioned anchor, a
+/// failed catalog query) — so an empty expected-set carries no information and
+/// must not authorise a drop. `execute_partition_swap_for_child` already
+/// refuses on exactly this condition (the "F3 fail-safe"); the sync path is
+/// far more destructive (it drops every non-expected child, not just
+/// bound-colliding ones) and must refuse too.
+///
+/// Field impact: a `drop_orphans = true` sync — the SQL default, and what
+/// `reflex_reconcile_partition` runs internally — emptied a production IMV.
+#[pg_test]
+fn pg_part_sync_refuses_mass_drop_on_empty_source_tree() {
+    Spi::run("CREATE TABLE part_wipe_a (id BIGINT, region TEXT NOT NULL, amount NUMERIC) PARTITION BY LIST (region)").expect("create");
+    Spi::run("CREATE TABLE part_wipe_a_n PARTITION OF part_wipe_a FOR VALUES IN ('N')")
+        .expect("p1");
+    Spi::run("CREATE TABLE part_wipe_a_s PARTITION OF part_wipe_a FOR VALUES IN ('S')")
+        .expect("p2");
+    Spi::run("INSERT INTO part_wipe_a (id, region, amount) VALUES (1, 'N', 10),(2,'S',20)")
+        .expect("seed");
+
+    Spi::run(
+        "SELECT create_reflex_ivm( \
+            'part_wipe_a_v', \
+            'SELECT region, SUM(amount) AS total FROM part_wipe_a GROUP BY region', \
+            NULL, NULL, NULL, NULL, \
+            ARRAY['region'] \
+         )",
+    )
+    .expect("create");
+
+    let rows_before = Spi::get_one::<i64>("SELECT count(*) FROM part_wipe_a_v")
+        .expect("q")
+        .expect("c");
+    assert_eq!(rows_before, 2, "fixture must start with both region rows");
+
+    // Drive the source tree to enumerate empty WITHOUT destroying the IMV's
+    // right to its partitions: the anchor still exists and still owns `region`,
+    // so anchor resolution succeeds and only the child enumeration comes back
+    // empty. This is the shape a mid-maintenance source (all children detached)
+    // presents, and the same empty Vec an unresolvable anchor produces.
+    Spi::run("ALTER TABLE part_wipe_a DETACH PARTITION part_wipe_a_n").expect("detach n");
+    Spi::run("ALTER TABLE part_wipe_a DETACH PARTITION part_wipe_a_s").expect("detach s");
+
+    let msg = Spi::get_one::<String>("SELECT reflex_sync_partitions('part_wipe_a_v')")
+        .expect("call")
+        .expect("msg");
+
+    let children = Spi::get_one::<i64>(
+        "SELECT count(*) FROM pg_inherits i \
+         JOIN pg_class c ON c.oid = i.inhparent \
+         WHERE c.relname = 'part_wipe_a_v'",
+    )
+    .expect("q")
+    .expect("c");
+    assert_eq!(
+        children, 2,
+        "sync must not drop IMV partitions on an empty source enumeration, got {children} \
+         remaining (msg: {msg})"
+    );
+
+    let rows_after = Spi::get_one::<i64>("SELECT count(*) FROM part_wipe_a_v")
+        .expect("q")
+        .expect("c");
+    assert_eq!(
+        rows_after, 2,
+        "IMV data must survive an empty source enumeration (msg: {msg})"
+    );
+
+    assert!(
+        msg.contains("refused orphan drop"),
+        "sync must refuse LOUDLY, not silently skip — got: {msg}"
+    );
+}
+
 #[pg_test]
 fn pg_part_reconcile_partition_rebuilds_only_one_child() {
     Spi::run("CREATE TABLE part_rec_a (id BIGINT, region TEXT NOT NULL, amount NUMERIC) PARTITION BY LIST (region)").expect("create");
