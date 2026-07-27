@@ -1206,12 +1206,9 @@ pub(crate) fn reflex_sync_partitions_impl(view_name: &str, drop_orphans: bool) -
         let tgt_children = list_partition_tree(client, &tgt_parent);
 
         // Build name-keyed views (using the IMV-side bare name format).
-        // Mutable: the shape-drift heal below drops children, and a dropped
-        // child must be seen as ABSENT by the create loop or it would be
-        // rebuilt in place (AccessExclusive on its parent) instead of detached.
-        let mut int_have: std::collections::HashSet<String> =
+        let int_have: std::collections::HashSet<String> =
             int_children.iter().map(|c| c.bare_name.clone()).collect();
-        let mut tgt_have: std::collections::HashSet<String> =
+        let tgt_have: std::collections::HashSet<String> =
             tgt_children.iter().map(|c| c.bare_name.clone()).collect();
         let src_expected_int: std::collections::HashSet<String> = nodes
             .iter()
@@ -1304,6 +1301,13 @@ pub(crate) fn reflex_sync_partitions_impl(view_name: &str, drop_orphans: bool) -
         // children top-down so the create loop below rebuilds them with the right
         // shape. Nodes are depth-ordered, so a dropped internal node's CASCADE removes
         // stale descendants that the create loop then re-creates.
+        // Names of mirror children that already exist as a RELATION of any kind
+        // — a live partition, or a detached/orphaned leftover carrying the same
+        // name. Only a name that exists nowhere may be built detached: reusing
+        // the name would raise 42P07 where the old
+        // `CREATE TABLE IF NOT EXISTS ... PARTITION OF` silently no-opped.
+        let mut existing_children: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
         {
             let (schema_opt, _) = split_qualified_name(view_name);
             let schema = schema_opt.unwrap_or("public");
@@ -1339,6 +1343,9 @@ pub(crate) fn reflex_sync_partitions_impl(view_name: &str, drop_orphans: bool) -
                         .and_then(|r| r.get_by_name::<&str, _>("rk").ok().flatten())
                         .and_then(|s| s.chars().next());
 
+                    if relkind.is_some() {
+                        existing_children.insert(child_bare.clone());
+                    }
                     if partition_shape_mismatch(expect_partitioned, relkind) {
                         let q = format!(
                             "DROP TABLE IF EXISTS \"{}\".\"{}\" CASCADE",
@@ -1347,8 +1354,7 @@ pub(crate) fn reflex_sync_partitions_impl(view_name: &str, drop_orphans: bool) -
                         client.update(&q, None, &[]).map_err(|e| {
                             format!("sync: heal drop of mismatched child {}: {}", child_bare, e)
                         })?;
-                        int_have.remove(&child_bare);
-                        tgt_have.remove(&child_bare);
+                        existing_children.remove(&child_bare);
                         pgrx::notice!(
                             "pg_reflex: rebuilt partition child '{}' (shape drift: expected {})",
                             child_bare,
@@ -1440,8 +1446,8 @@ pub(crate) fn reflex_sync_partitions_impl(view_name: &str, drop_orphans: bool) -
                 let detached =
                     build_detached_node_ddl_pair(view_name, node, anchor_root_bare, unlogged);
                 let top_level = is_top_level_node(node, anchor_root_bare);
-                let build_int_detached = top_level && !int_have.contains(&int_name);
-                let build_tgt_detached = top_level && !tgt_have.contains(&tgt_name);
+                let build_int_detached = top_level && !existing_children.contains(&int_name);
+                let build_tgt_detached = top_level && !existing_children.contains(&tgt_name);
                 if has_intermediate {
                     // Bound-collision heal (untreated_bugs/
                     // 2026-07-25_nightly_swap_target_overlap_restale.md): a
