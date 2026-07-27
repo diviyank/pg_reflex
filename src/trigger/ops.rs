@@ -958,40 +958,10 @@ fn source_not_null_cols(
         .collect()
 }
 
-/// The passthrough keyed DELETE/UPDATE predicate: `(target_cols) IN (SELECT
-/// source_cols FROM pt_old)`, made NULL-safe when a key column is not proven
-/// NOT NULL (2026-07-25 untreated_bugs: `(NULL) IN (...)` is never TRUE, so a
-/// NULL-key row's target counterpart is never matched — a phantom row on
-/// DELETE, a unique-index abort on UPDATE). Unlike `null_safe_in` (which
-/// always emits the correlated-EXISTS shape, only varying the per-column
-/// operator), this collapses to the plain `IN`-list — byte-identical to the
-/// pre-fix output — when every mapped column is in `plan.not_null_columns`,
-/// which is the case that must see no plan change.
-fn passthrough_keyed_delete_predicate(
-    pt_old: &str,
-    qv: &str,
-    mappings: &[(String, String)],
-    target_cols: &[String],
-    source_cols: &[String],
-    not_null_columns: &std::collections::HashSet<String>,
-) -> String {
-    let all_not_null = mappings
-        .iter()
-        .all(|(t, _)| not_null_columns.contains(t.as_str()));
-    if all_not_null {
-        return build_membership_predicate(target_cols, source_cols, pt_old);
-    }
-    null_safe_in(
-        pt_old,
-        qv,
-        target_cols,
-        source_cols,
-        &source_not_null_cols(mappings, not_null_columns),
-    )
-}
-
-/// PS-5 — `passthrough_keyed_delete_predicate` as a runtime-gated fast/safe
-/// pair. Same cliff, same fix as `outer_join_secondary_stmts`: the NULL-safe
+/// PS-5 — the keyed passthrough DELETE/UPDATE membership match, as a
+/// runtime-gated fast/safe pair. This is the only form: the ungated variant was
+/// removed on 2026-07-27 when the partition-dispatch arm (its last caller)
+/// was gated too. Same cliff, same fix as `outer_join_secondary_stmts`: the NULL-safe
 /// branch matches the WHOLE target against `pt_old` with `IS NOT DISTINCT
 /// FROM`, which no operator family covers, so the planner's only option is a
 /// nested loop over the entire IMV.
@@ -1107,37 +1077,32 @@ pub(crate) fn passthrough_op_stmts(
                     // cold INSERT body. Hot leaves are swapped (rebuilt from the
                     // post-delete source state); cold leaves get the keyed delete.
                     //
-                    // PS-5 deliberately does NOT gate this branch: the predicate
-                    // is spliced into a DO block that also swaps the hot leaves,
-                    // so emitting the block once per variant would run that swap
-                    // TWICE (the swap is not gated and cannot be). Keeping the
-                    // single always-NULL-safe form trades this branch's plan
-                    // quality for correctness, which is the right direction.
-                    let base_del = format!(
-                        "DELETE FROM {} WHERE {}",
-                        qv,
-                        passthrough_keyed_delete_predicate(
-                            &pt_old,
-                            &qv,
-                            mappings,
-                            &target_cols,
-                            &source_cols,
-                            &plan.not_null_columns,
-                        )
+                    // PS-5 (2026-07-27) gates this branch too. The old carve-out
+                    // assumed gating meant emitting the whole DO block per variant
+                    // — it does not: the cold DELETE is its own `EXECUTE` inside
+                    // the block, so the variants expand there while the hot-leaf
+                    // swap stays single. Same shape the aggregate sibling already
+                    // uses (`build_partition_aware_dispatch_sql_strategy`).
+                    let del_match = passthrough_keyed_delete_match(
+                        &pt_old,
+                        &qv,
+                        mappings,
+                        &target_cols,
+                        &source_cols,
+                        &plan.not_null_columns,
                     );
                     let strategy_is_range = strategy.eq_ignore_ascii_case("RANGE");
                     let parent_lit = qv.replace('"', "").replace('\'', "''");
                     let part_col_lit = part_col.replace('\'', "''");
-                    let del_cold = format!(
-                        "{} AND {}",
-                        base_del,
-                        passthrough_cold_pred(
-                            strategy_is_range,
-                            &parent_lit,
-                            &part_col_lit,
-                            &format!("{}.{}", qv, part_col_q)
-                        )
+                    let cold_pred = passthrough_cold_pred(
+                        strategy_is_range,
+                        &parent_lit,
+                        &part_col_lit,
+                        &format!("{}.{}", qv, part_col_q),
                     );
+                    let del_cold = del_match.stmts(|pred| {
+                        format!("DELETE FROM {} WHERE {} AND {}", qv, pred, cold_pred)
+                    });
                     let aff = format!("SELECT {}::text AS pkey FROM {}", part_src_q, pt_old);
                     stmts.push(build_passthrough_partition_dispatch_sql(
                         view_name,
@@ -1187,31 +1152,31 @@ pub(crate) fn passthrough_op_stmts(
                     // keyed predicate with the hot-exclusion filter; the cold
                     // INSERT re-runs the delta projection (which reads pt_new) for
                     // cold partitions only.
-                    let base_del = format!(
-                        "DELETE FROM {} WHERE {}",
-                        qv,
-                        passthrough_keyed_delete_predicate(
-                            &pt_old,
-                            &qv,
-                            mappings,
-                            &target_cols,
-                            &source_cols,
-                            &plan.not_null_columns,
-                        )
+                    //
+                    // PS-5 (2026-07-27): the cold DELETE is a gated pair — see the
+                    // DELETE arm above for why gating cannot double-swap. The cold
+                    // INSERT needs no gate: it is scoped by `pt_new` through
+                    // `scoped_delta_query`, not by a membership predicate.
+                    let del_match = passthrough_keyed_delete_match(
+                        &pt_old,
+                        &qv,
+                        mappings,
+                        &target_cols,
+                        &source_cols,
+                        &plan.not_null_columns,
                     );
                     let strategy_is_range = strategy.eq_ignore_ascii_case("RANGE");
                     let parent_lit = qv.replace('"', "").replace('\'', "''");
                     let part_col_lit = part_col.replace('\'', "''");
-                    let del_cold = format!(
-                        "{} AND {}",
-                        base_del,
-                        passthrough_cold_pred(
-                            strategy_is_range,
-                            &parent_lit,
-                            &part_col_lit,
-                            &format!("{}.{}", qv, part_col_q)
-                        )
+                    let cold_pred = passthrough_cold_pred(
+                        strategy_is_range,
+                        &parent_lit,
+                        &part_col_lit,
+                        &format!("{}.{}", qv, part_col_q),
                     );
+                    let del_cold = del_match.stmts(|pred| {
+                        format!("DELETE FROM {} WHERE {} AND {}", qv, pred, cold_pred)
+                    });
                     let ins_cold = format!(
                         "INSERT INTO {} SELECT * FROM ({}) __pt WHERE {}",
                         qv,

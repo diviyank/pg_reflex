@@ -387,13 +387,22 @@ pub(crate) fn build_passthrough_partition_dispatch_sql(
     partition_col: &str,
     target_part_ref: &str,
     strategy: &str,
-    cold_delete_with_filter: &str,
+    cold_delete_variants: &[String],
     cold_insert_with_filter: &str,
 ) -> String {
     let safe_view = view_name.replace('\'', "''");
     let safe_part_col_lit = partition_col.replace('"', "").replace('\'', "''");
     let parent = target_parent_qual.replace('"', "").replace('\'', "''");
-    let safe_del = cold_delete_with_filter.replace("$reflex_inner$", "$reflex_inner_alt$");
+    // PS-5 (2026-07-27): the cold DELETE arrives as a gated fast/safe pair, like
+    // the aggregate sibling's cold MERGE. Every variant is emitted at each site;
+    // the gates travel inside the SQL so exactly one does work and PostgreSQL
+    // skips the other with a `One-Time Filter`. The hot-leaf swap is emitted by
+    // the template itself, ONCE, and is unaffected by how many variants there
+    // are — which is why gating here cannot double-swap.
+    let safe_dels: Vec<String> = cold_delete_variants
+        .iter()
+        .map(|d| d.replace("$reflex_inner$", "$reflex_inner_alt$"))
+        .collect();
     let safe_ins = cold_insert_with_filter.replace("$reflex_inner$", "$reflex_inner_alt$");
     // RANGE cold filters reference $2 (hot child NAMES — stable across the swap's
     // DETACH/ATTACH+RENAME, unlike the OID); LIST references only $1 (hot values).
@@ -420,11 +429,17 @@ pub(crate) fn build_passthrough_partition_dispatch_sql(
     let cold_dispatch_block = if is_list {
         // LIST: cold DELETE with pruning
         let del_part = format!(
-            "             IF array_length(_cold_keys,1) IS NOT NULL THEN\n\
-                 EXECUTE format($reflex_cold_list${sql} AND {col} = ANY($2::text[]::%s[])$reflex_cold_list$, _part_type)\n\
+            "             IF array_length(_cold_keys,1) IS NOT NULL THEN\n{variants}",
+            variants = safe_dels
+                .iter()
+                .map(|sql| format!(
+                    "                 EXECUTE format($reflex_cold_list${sql} AND {col} = ANY($2::text[]::%s[])$reflex_cold_list$, _part_type)\n\
                      USING _hot_keys, _cold_keys;\n",
-            sql = safe_del,
-            col = target_col_only
+                    sql = sql,
+                    col = target_col_only
+                ))
+                .collect::<Vec<_>>()
+                .join("")
         );
         // LIST: cold INSERT with pruning (if present)
         let ins_part = if cold_insert_with_filter.is_empty() {
@@ -442,10 +457,16 @@ pub(crate) fn build_passthrough_partition_dispatch_sql(
     } else {
         // RANGE: cold DELETE (no pruning needed — hot-exclusion by child name suffices)
         // Note: literal USING clause here (not a placeholder), since this block is embedded into the template.
-        let del_part = format!(
-            "             EXECUTE $reflex_inner${del}$reflex_inner$ USING _hot_keys, _hot_child_names;\n",
-            del = safe_del
-        );
+        let del_part = safe_dels
+            .iter()
+            .map(|del| {
+                format!(
+                    "             EXECUTE $reflex_inner${del}$reflex_inner$ USING _hot_keys, _hot_child_names;\n",
+                    del = del
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("");
         // RANGE: cold INSERT (if present)
         let ins_part = if cold_insert_with_filter.is_empty() {
             String::new()
@@ -458,7 +479,19 @@ pub(crate) fn build_passthrough_partition_dispatch_sql(
         format!("{}{}", del_part, ins_part)
     };
 
-    // For the defensive branch (unpartitioned target), use the original simple behavior.
+    // For the defensive branch (unpartitioned target), use the original simple
+    // behavior — one EXECUTE per gated variant, same as the cold block above.
+    let del_block = safe_dels
+        .iter()
+        .map(|del| {
+            format!(
+                "             EXECUTE $reflex_inner${del}$reflex_inner$ USING {using};\n",
+                del = del,
+                using = using
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("");
     let ins_block = if cold_insert_with_filter.is_empty() {
         String::new()
     } else {
@@ -491,7 +524,7 @@ pub(crate) fn build_passthrough_partition_dispatch_sql(
              IF _partition_total IS NULL OR _partition_total = 0 THEN\n\
                  -- Target not partitioned (defensive) — run the cold body over\n\
                  -- everything (empty _hot_keys / _hot_child_names excludes nothing).\n\
-                 EXECUTE $reflex_inner${del}$reflex_inner$ USING {using};\n\
+{del_block}\
 {ins_block}\
                  RETURN;\n\
              END IF;\n\
@@ -551,9 +584,8 @@ pub(crate) fn build_passthrough_partition_dispatch_sql(
         part_col_lit = safe_part_col_lit,
         default_thr = WIPE_THRESHOLD_DEFAULT,
         default_floor = WIPE_FLOOR_ROWS_DEFAULT,
-        del = safe_del,
+        del_block = del_block,
         ins_block = ins_block,
-        using = using,
         cold_dispatch_block = cold_dispatch_block,
     )
 }
