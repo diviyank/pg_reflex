@@ -3821,6 +3821,70 @@ fn passthrough_delete_nullable_key_uses_null_safe_match() {
     );
 }
 
+/// 2026-07-27 — see
+/// `untreated_bugs/2026-07-27_partitioned_passthrough_membership_ungated.md`.
+///
+/// The partition-dispatch arm was the one branch PS-5 never gated: it spliced the
+/// raw `passthrough_keyed_delete_predicate` into the DO block, so every
+/// partitioned passthrough IMV ran its cold DELETE with an ungated `IS NOT
+/// DISTINCT FROM` match. No operator family covers that, so the planner's only
+/// option is a nested loop over the whole IMV — a 96-minute `COMMIT` on a
+/// 132 MB / 930k-row production IMV (`omc.sop_forecast_view`, db_prod).
+///
+/// The old justification ("emitting the block once per variant would run the swap
+/// TWICE") does not apply: the aggregate sibling splits the gated pair into
+/// separate `EXECUTE`s *inside one* DO block
+/// (`build_partition_aware_dispatch_sql_strategy`), and the cold DELETE is
+/// already its own `EXECUTE`. So the pair must appear while the swap stays single.
+///
+/// The cold DELETE is emitted at TWO sites (the no-children defensive fallback and
+/// the cold-partition block), so a gated pair is 2 variants × 2 sites = 4. Counting
+/// bare occurrences without that factor would pass on the ungated form too.
+#[test]
+fn partitioned_passthrough_cold_delete_is_gated_and_swaps_once() {
+    for op in ["UPDATE", "DELETE"] {
+        let mut plan = passthrough_partitioned_plan();
+        // The production shape: nothing proven NOT NULL. Every passthrough IMV is
+        // permanently here — `initial_aggregate_materialization` and
+        // `reflex_probe_not_null_columns_impl` both return early on `is_passthrough`.
+        plan.not_null_columns.clear();
+        let mut stmts = Vec::new();
+        passthrough_op_stmts(
+            "fc",
+            "ss",
+            op,
+            "SELECT dem_plan_id, product_id FROM ss",
+            &plan,
+            "__reflex_new_ss",
+            "__reflex_old_ss",
+            &mut stmts,
+        );
+        let joined = stmts.join("\n");
+
+        assert_eq!(
+            joined.matches("reflex_reconcile_partition").count(),
+            1,
+            "{op}: the hot-leaf swap must stay single — gating must not duplicate \
+             it (this is the invariant the old carve-out was protecting): {joined}"
+        );
+        assert!(
+            joined.contains("IS NOT DISTINCT FROM"),
+            "{op}: the NULL-safe variant must still be emitted: {joined}"
+        );
+        assert!(
+            joined.contains("__ng.\"product_id\" IS NULL"),
+            "{op}: the runtime NULL-key gate must be present so the fast variant \
+             can be chosen from the data: {joined}"
+        );
+        assert_eq!(
+            joined.matches("DELETE FROM \"fc\" WHERE").count(),
+            4,
+            "{op}: the cold DELETE must be emitted once per gated variant at each \
+             of the two sites (2 variants x 2 sites): {joined}"
+        );
+    }
+}
+
 #[test]
 fn partition_dispatch_range_uses_child_name_filter() {
     let sql = build_partition_aware_dispatch_sql_strategy(
