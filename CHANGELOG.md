@@ -2,6 +2,89 @@
 
 ## [Unreleased]
 
+## [1.11.2] - 2026-07-27
+
+Two module-only fixes: a performance cliff that made every flush of a
+partitioned passthrough IMV scan the whole IMV instead of the changed
+partition (a 96-minute `COMMIT` in the field; 461.5 ms → 0.207 ms on a
+one-day affected set), and a catastrophic data-loss guard — a partition
+sync that read an unreadable anchor as "every child is an orphan" and
+dropped every partition of the IMV. No DDL, no new function, no registry
+column. Replace the `.so`, then
+`ALTER EXTENSION pg_reflex UPDATE TO '1.11.2';`.
+
+---
+
+### Fixed
+
+- **(PERFORMANCE CLIFF) The cold `DELETE` of a partitioned passthrough IMV
+  scanned every leaf of the IMV on every flush.** The partition-dispatch
+  branch spliced an ungated `IS NOT DISTINCT FROM` membership match against
+  the `__reflex_pt_old_<view>_<source>` scratch table. No operator family
+  covers that operator, so PostgreSQL could neither prune partitions nor use
+  the IMV's unique index — the cost was a function of the IMV's total size,
+  not of the change. Measured on a 49-leaf / 930k-row / 132 MB field IMV with
+  a **one-day** affected set: **461.5 ms** executing all 49 leaves, against
+  **0.207 ms** executing one and pruning 48 with the sargable form. With a
+  one-month affected set the ungated form exceeded a 90 s `statement_timeout`
+  while the sargable form ran in ~106 ms. Because DEFERRED maintenance runs
+  inside the caller's `COMMIT`, this surfaced as a 96-minute `COMMIT` on a
+  bulk push and blocked every writer queued behind it.
+
+  This was the one branch the 1.11.1 PS-5 gate deliberately skipped, on the
+  grounds that emitting the dispatch `DO` block per variant would run the
+  hot-leaf swap twice. That does not follow: the aggregate sibling
+  (`build_partition_aware_dispatch_sql_strategy`) already splits a gated pair
+  into separate `EXECUTE`s *inside one* block, and the cold `DELETE` is its
+  own `EXECUTE`. The variants now expand there while the swap stays single.
+  The cold `INSERT` needs no gate — it is scoped by `pt_new`, not by a
+  membership predicate. The 1.11.1 nullable-key correctness fix is fully
+  preserved: the gate picks the NULL-safe form from the data whenever the
+  scratch table holds a NULL key.
+
+  Affects every partitioned passthrough IMV whose key columns are not all
+  catalog `NOT NULL`. Because passthrough IMVs never populate
+  `not_null_columns` at all — `initial_aggregate_materialization` and
+  `reflex_probe_not_null_columns_impl` both return early on `is_passthrough`
+  — that is *every* partitioned passthrough IMV, and no operator-side
+  workaround existed. That metadata half is filed but **not** fixed here, in
+  `untreated_bugs/2026-07-27_partitioned_passthrough_membership_ungated.md`.
+
+- **(CATASTROPHIC, DATA LOSS) `reflex_sync_partitions` could drop every
+  partition of an IMV, emptying it.** `list_partition_tree` returns an empty
+  `Vec` both when the anchor genuinely has no children and when it could not
+  be read at all — an unqualified anchor name `to_regclass` cannot resolve
+  under the caller's `search_path`, a non-partitioned anchor, or a failed
+  catalog query. An empty enumeration therefore carries no information about
+  orphanhood, but the sync read it as "every child is an orphan". Reachable
+  from the SQL default (`drop_orphans` defaults to `TRUE`) and from
+  `reflex_reconcile_partition`, which runs the sync with `drop_orphans=true`
+  before its own work. It now refuses loudly — a `WARNING` naming the anchor
+  plus a marker in the returned message — mirroring the F3 fail-safe already
+  present in `execute_partition_swap_for_child`.
+
+### Tests
+
+- `partitioned_passthrough_cold_delete_is_gated_and_swaps_once` — asserts both
+  gated variants reach the cold `DELETE` at each of its two emission sites
+  (2 variants × 2 sites) **and** that `reflex_reconcile_partition` is emitted
+  exactly once, pinning the swap-single invariant the old carve-out existed to
+  protect. Counting bare occurrences without the site factor passes on the
+  ungated form, so the factor is load-bearing.
+- `pg_part_sync_refuses_mass_drop_on_empty_source_tree` — covers the
+  empty-enumeration refusal, asserting the IMV's partitions survive.
+- `passthrough_keyed_delete_predicate` (the ungated builder) had no callers
+  left and is removed, so the pre-fix form cannot be reintroduced by accident.
+
+### Migration
+
+- `ALTER EXTENSION pg_reflex UPDATE TO '1.11.2';` — no-op marker only
+  (`SELECT 1 WHERE FALSE;`). Both fixes are module-only. The maintenance SQL is
+  regenerated from the registry on every flush (`reflex_flush_deferred` calls
+  `reflex_build_delta_sql` at flush time rather than executing a stored trigger
+  body), so **no trigger rebuild and no reconcile are required** — the next
+  flush of an affected IMV already uses the fixed SQL.
+
 ## [1.11.1] - 2026-07-24
 
 Audit truthfulness, eleven silent-wrong-result fixes (nullable-key MIN/MAX
