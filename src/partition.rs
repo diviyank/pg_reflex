@@ -963,6 +963,9 @@ pub(crate) struct SyncResult {
     /// Names of source children present on the IMV but absent from source.
     /// Populated only when drop_orphans = false.
     pub preserved_orphans: Vec<String>,
+    /// Set when `drop_orphans` was requested but the live source tree
+    /// enumerated empty, so no child could be *confirmed* an orphan.
+    pub refused_orphan_drop: bool,
 }
 
 impl SyncResult {
@@ -982,6 +985,9 @@ impl SyncResult {
                 ", preserved orphans: {}",
                 self.preserved_orphans.join(", ")
             ));
+        }
+        if self.refused_orphan_drop {
+            msg.push_str(", refused orphan drop (source partition set enumerated empty)");
         }
         msg
     }
@@ -1120,7 +1126,28 @@ pub(crate) fn reflex_sync_partitions_impl(view_name: &str, drop_orphans: bool) -
         // child's; adding first would raise "would overlap partition". This is
         // the multi-level reconcile path: a sub-level swap renames the sub-IMV
         // leaf, and reconcile(parent) must heal its mirror without overlap.
-        if drop_orphans {
+        // Fail-safe (mirrors the F3 guard in `execute_partition_swap_for_child`):
+        // an empty source enumeration carries NO information about orphanhood.
+        // `list_partition_tree` returns an empty Vec both when the anchor has no
+        // children AND when it could not be read at all — an unqualified anchor
+        // name `to_regclass` cannot resolve under the caller's search_path, an
+        // anchor that is not partitioned, or a failed catalog query. Treating
+        // that as "every child is an orphan" drops EVERY partition of the IMV
+        // and empties it. Nothing can be confirmed an orphan here, so refuse.
+        let source_enumeration_empty = nodes.is_empty();
+        if drop_orphans && source_enumeration_empty {
+            out.refused_orphan_drop = true;
+            pgrx::warning!(
+                "pg_reflex: refused to drop orphan partitions of IMV '{}' — the partition set of \
+                 anchor source '{}' enumerated empty, so no child can be confirmed an orphan. \
+                 Existing partitions were left intact. Verify the anchor resolves \
+                 (SELECT to_regclass('{}')) and is partitioned, then re-run.",
+                view_name,
+                anchor,
+                anchor
+            );
+        }
+        if drop_orphans && !source_enumeration_empty {
             let (schema_opt, _) = split_qualified_name(view_name);
             let schema = schema_opt.unwrap_or("public");
             // Drop bottom-up (children before parents) to avoid depending on CASCADE.

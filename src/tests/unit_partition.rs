@@ -112,6 +112,7 @@ fn test_sync_result_message_basic() {
         dropped_intermediate: 0,
         dropped_target: 0,
         preserved_orphans: vec![],
+        refused_orphan_drop: false,
     };
     assert_eq!(r.into_message(), "sync: +2 intermediate, +2 target");
 }
@@ -124,6 +125,7 @@ fn test_sync_result_message_with_drops() {
         dropped_intermediate: 1,
         dropped_target: 1,
         preserved_orphans: vec![],
+        refused_orphan_drop: false,
     };
     assert_eq!(
         r.into_message(),
@@ -139,6 +141,7 @@ fn test_sync_result_message_with_orphans() {
         dropped_intermediate: 0,
         dropped_target: 0,
         preserved_orphans: vec!["x".to_string(), "y".to_string()],
+        refused_orphan_drop: false,
     };
     assert!(r.into_message().contains("preserved orphans: x, y"));
 }
