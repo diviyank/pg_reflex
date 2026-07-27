@@ -456,7 +456,7 @@ pub(crate) fn build_partition_node_ddl_pair(
     // surrounding quotes when the anchor is a quoted/decomposed source (e.g. a
     // CTE sub-IMV passed as `"view__cte_x"`). Comparing the raw strings would
     // treat a top-level child as nested and resolve a non-existent parent.
-    let is_top_level = node.parent_bare.trim_matches('"') == anchor_root_bare.trim_matches('"');
+    let is_top_level = is_top_level_node(node, anchor_root_bare);
 
     let int_parent = if is_top_level {
         intermediate_table_name(view_name)
@@ -503,6 +503,83 @@ pub(crate) fn build_partition_node_ddl_pair(
         tgt_ddl,
         int_parent_qual: int_parent,
         tgt_parent_qual: tgt_parent,
+    }
+}
+
+/// True when `node` mirrors a DIRECT child of the anchor source root, i.e. its
+/// IMV counterpart attaches straight to the live IMV root.
+///
+/// Quote-insensitive: `parent_bare` comes from `pg_class.relname` (never
+/// quoted) while `anchor_root_bare` may carry quotes when the anchor is a
+/// quoted/decomposed source.
+pub(crate) fn is_top_level_node(node: &PartitionNode, anchor_root_bare: &str) -> bool {
+    node.parent_bare.trim_matches('"') == anchor_root_bare.trim_matches('"')
+}
+
+/// DDL that builds one mirror node **detached** and then adds it with a single
+/// `ALTER TABLE … ATTACH PARTITION`.
+///
+/// `CREATE TABLE … PARTITION OF <parent>` takes an `AccessExclusiveLock` on the
+/// parent, and PostgreSQL holds every DDL lock to commit. For a top-level node
+/// that parent is the live IMV root, so the whole rest of the transaction —
+/// including the COMMIT-time reconcile that does the heavy fill — runs with
+/// every reader of the IMV blocked, even readers pruning to an unrelated
+/// partition. `ATTACH PARTITION` takes only `ShareUpdateExclusiveLock`, which
+/// does not conflict with `AccessShare`.
+///
+/// A brand-new node has nothing to preserve, so it is created standalone; the
+/// caller builds its whole sub-partition subtree into it while it is still
+/// detached (those `CREATE … PARTITION OF` calls then lock the detached node,
+/// never anything live) and issues the single ATTACH afterwards.
+#[derive(Debug, Clone)]
+pub(crate) struct DetachedNodeDdl {
+    pub int_create: String,
+    pub tgt_create: String,
+    pub int_attach: String,
+    pub tgt_attach: String,
+}
+
+pub(crate) fn build_detached_node_ddl_pair(
+    view_name: &str,
+    node: &PartitionNode,
+    anchor_root_bare: &str,
+    unlogged: bool,
+) -> DetachedNodeDdl {
+    let attached = build_partition_node_ddl_pair(view_name, node, anchor_root_bare, unlogged);
+    let int_child = schema_prefix(
+        view_name,
+        &intermediate_child_name(view_name, &node.bare_name),
+    );
+    let tgt_child = schema_prefix(view_name, &target_child_name(view_name, &node.bare_name));
+    let is_leaf = node.sub_strategy.is_none();
+    let sub_clause = match &node.sub_strategy {
+        Some(strat) if !node.sub_columns.is_empty() => {
+            format!(" {}", build_partition_by_clause(strat, &node.sub_columns))
+        }
+        _ => String::new(),
+    };
+    let create_kw = if unlogged && is_leaf {
+        "CREATE UNLOGGED TABLE"
+    } else {
+        "CREATE TABLE"
+    };
+    DetachedNodeDdl {
+        int_create: format!(
+            "{} {} (LIKE {} INCLUDING ALL){}",
+            create_kw, int_child, attached.int_parent_qual, sub_clause
+        ),
+        tgt_create: format!(
+            "{} {} (LIKE {} INCLUDING ALL){}",
+            create_kw, tgt_child, attached.tgt_parent_qual, sub_clause
+        ),
+        int_attach: format!(
+            "ALTER TABLE {} ATTACH PARTITION {} {}",
+            attached.int_parent_qual, int_child, node.bound_expr
+        ),
+        tgt_attach: format!(
+            "ALTER TABLE {} ATTACH PARTITION {} {}",
+            attached.tgt_parent_qual, tgt_child, node.bound_expr
+        ),
     }
 }
 
@@ -727,6 +804,46 @@ pub(crate) fn build_swap_partition_ddl(
         rename_int,
         rename_tgt,
     }
+}
+
+/// The two fill statements of the in-place path used when a mirror child is
+/// provably empty. Same row-producing queries and same partition-constraint
+/// filters as `build_swap_partition_ddl`'s fills — only the destination differs
+/// (the live child rather than a detached swap table).
+pub(crate) fn build_inplace_partition_fill(
+    int_child_qual: &str,
+    tgt_child_qual: &str,
+    int_constraint_def: &str,
+    tgt_constraint_def: &str,
+    base_query: &str,
+    end_query: &str,
+) -> (Option<String>, String) {
+    let fill_int = if end_query.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "INSERT INTO {child} SELECT * FROM ({bq}) __src WHERE ({con})",
+            child = int_child_qual,
+            bq = base_query,
+            con = int_constraint_def
+        ))
+    };
+    let fill_tgt = if end_query.is_empty() {
+        format!(
+            "INSERT INTO {child} SELECT * FROM ({bq}) __src WHERE ({con})",
+            child = tgt_child_qual,
+            bq = base_query,
+            con = tgt_constraint_def
+        )
+    } else {
+        format!(
+            "INSERT INTO {child} SELECT * FROM ({eq}) __end WHERE ({con})",
+            child = tgt_child_qual,
+            eq = end_query,
+            con = tgt_constraint_def
+        )
+    };
+    (fill_int, fill_tgt)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1089,9 +1206,12 @@ pub(crate) fn reflex_sync_partitions_impl(view_name: &str, drop_orphans: bool) -
         let tgt_children = list_partition_tree(client, &tgt_parent);
 
         // Build name-keyed views (using the IMV-side bare name format).
-        let int_have: std::collections::HashSet<String> =
+        // Mutable: the shape-drift heal below drops children, and a dropped
+        // child must be seen as ABSENT by the create loop or it would be
+        // rebuilt in place (AccessExclusive on its parent) instead of detached.
+        let mut int_have: std::collections::HashSet<String> =
             int_children.iter().map(|c| c.bare_name.clone()).collect();
-        let tgt_have: std::collections::HashSet<String> =
+        let mut tgt_have: std::collections::HashSet<String> =
             tgt_children.iter().map(|c| c.bare_name.clone()).collect();
         let src_expected_int: std::collections::HashSet<String> = nodes
             .iter()
@@ -1227,6 +1347,8 @@ pub(crate) fn reflex_sync_partitions_impl(view_name: &str, drop_orphans: bool) -
                         client.update(&q, None, &[]).map_err(|e| {
                             format!("sync: heal drop of mismatched child {}: {}", child_bare, e)
                         })?;
+                        int_have.remove(&child_bare);
+                        tgt_have.remove(&child_bare);
                         pgrx::notice!(
                             "pg_reflex: rebuilt partition child '{}' (shape drift: expected {})",
                             child_bare,
@@ -1302,11 +1424,24 @@ pub(crate) fn reflex_sync_partitions_impl(view_name: &str, drop_orphans: bool) -
         let reloc_result: Result<(), String> = (|| {
             let drain_entries = drain_tree_defaults(client, &drain_roots)?;
 
+            // Top-level nodes that do not exist yet are built DETACHED and
+            // attached with one `ALTER TABLE … ATTACH PARTITION` after the
+            // whole tree (including their sub-partition subtree) is created —
+            // see `build_detached_node_ddl_pair`. Deferring the attach keeps
+            // the subtree build off any live relation and holds the root at
+            // ShareUpdateExclusive instead of AccessExclusive.
+            let mut pending_attach: Vec<String> = Vec::new();
+
             for node in &nodes {
                 let int_name = intermediate_child_name(view_name, &node.bare_name);
                 let tgt_name = target_child_name(view_name, &node.bare_name);
                 let ddl =
                     build_partition_node_ddl_pair(view_name, node, anchor_root_bare, unlogged);
+                let detached =
+                    build_detached_node_ddl_pair(view_name, node, anchor_root_bare, unlogged);
+                let top_level = is_top_level_node(node, anchor_root_bare);
+                let build_int_detached = top_level && !int_have.contains(&int_name);
+                let build_tgt_detached = top_level && !tgt_have.contains(&tgt_name);
                 if has_intermediate {
                     // Bound-collision heal (untreated_bugs/
                     // 2026-07-25_nightly_swap_target_overlap_restale.md): a
@@ -1328,9 +1463,18 @@ pub(crate) fn reflex_sync_partitions_impl(view_name: &str, drop_orphans: bool) -
                         &int_name,
                         &node.bound_expr,
                     )?;
-                    client
-                        .update(&ddl.int_ddl, None, &[])
-                        .map_err(|e| format!("sync: create intermediate node: {}", e))?;
+                    if build_int_detached {
+                        client
+                            .update(&detached.int_create, None, &[])
+                            .map_err(|e| {
+                                format!("sync: create detached intermediate node: {}", e)
+                            })?;
+                        pending_attach.push(detached.int_attach.clone());
+                    } else {
+                        client
+                            .update(&ddl.int_ddl, None, &[])
+                            .map_err(|e| format!("sync: create intermediate node: {}", e))?;
+                    }
                     if !int_have.contains(&int_name) {
                         out.added_intermediate += 1;
                     }
@@ -1343,12 +1487,30 @@ pub(crate) fn reflex_sync_partitions_impl(view_name: &str, drop_orphans: bool) -
                     &tgt_name,
                     &node.bound_expr,
                 )?;
-                client
-                    .update(&ddl.tgt_ddl, None, &[])
-                    .map_err(|e| format!("sync: create target node: {}", e))?;
+                if build_tgt_detached {
+                    client
+                        .update(&detached.tgt_create, None, &[])
+                        .map_err(|e| format!("sync: create detached target node: {}", e))?;
+                    pending_attach.push(detached.tgt_attach.clone());
+                } else {
+                    client
+                        .update(&ddl.tgt_ddl, None, &[])
+                        .map_err(|e| format!("sync: create target node: {}", e))?;
+                }
                 if !tgt_have.contains(&tgt_name) {
                     out.added_target += 1;
                 }
+            }
+            // Attach the detached nodes AFTER the whole tree is built, so each
+            // one goes in complete with its sub-partition subtree and the
+            // parent is locked exactly once, at ShareUpdateExclusive. Runs
+            // before `refill_tree_defaults` so drained default rows belonging
+            // to a new bound still route into their new leaf, exactly as they
+            // did when the node was created in place.
+            for stmt in &pending_attach {
+                client
+                    .update(stmt, None, &[])
+                    .map_err(|e| format!("sync: attach new node: {}", e))?;
             }
             refill_tree_defaults(client, drain_entries)?;
             Ok(())
@@ -1960,6 +2122,42 @@ pub(crate) fn execute_partition_swap_for_child(
             "missing target bound for child '{}'",
             tgt_child_bare
         ));
+    }
+
+    // A provably EMPTY mirror child has nothing to preserve, so the
+    // DETACH/ATTACH swap buys nothing and costs an `AccessExclusiveLock` on the
+    // child's immediate parent — the IMV ROOT at mirror depth 1 — held to
+    // commit, which freezes every reader of the IMV including readers pruning
+    // to an unrelated partition. Fill such a child in place instead: the
+    // resulting content is identical (empty + INSERT == fresh table + INSERT),
+    // and `INSERT INTO <partition child>` fires no statement-level trigger of
+    // the root, exactly like the swap's detached fill. `relation_has_rows`
+    // fails toward "non-empty", so any probe failure still takes the swap.
+    let int_child_qual_probe = schema_prefix(view_name, &int_child_bare);
+    let tgt_child_qual_probe = schema_prefix(view_name, &tgt_child_bare);
+    let int_is_empty = end_query.is_empty()
+        || (!int_def.is_empty() && !relation_has_rows(client, &int_child_qual_probe));
+    let tgt_is_empty = !tgt_def.is_empty() && !relation_has_rows(client, &tgt_child_qual_probe);
+    if int_is_empty && tgt_is_empty {
+        let (fill_int, fill_tgt) = build_inplace_partition_fill(
+            &int_child_qual_probe,
+            &tgt_child_qual_probe,
+            &int_def,
+            &tgt_def,
+            base_query,
+            end_query,
+        );
+        if let Some(ref fill) = fill_int {
+            client
+                .update(fill, None, &[])
+                .map_err(|e| format!("fill empty int child in place: {}", e))?;
+            let _ = client.update(&format!("ANALYZE {}", int_child_qual_probe), None, &[]);
+        }
+        client
+            .update(&fill_tgt, None, &[])
+            .map_err(|e| format!("fill empty tgt child in place: {}", e))?;
+        let _ = client.update(&format!("ANALYZE {}", tgt_child_qual_probe), None, &[]);
+        return Ok(());
     }
 
     let src_child = PartitionChild {
