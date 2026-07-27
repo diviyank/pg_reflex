@@ -1,15 +1,27 @@
-# 2026-07-27 — partitioned passthrough IMVs are permanently on the non-sargable membership predicate
+# 2026-07-27 — passthrough IMVs never get NOT-NULL inference, and `reflex_probe_not_null_columns` reports success having done nothing
 
-**Status: untreated.** Field-reported from `db_prod`: a `COMMIT` on an `omc.sales_simulation`
+**Status: narrowed — defect A FIXED in 1.11.2 (`4e4c825`, merged `5444c28`); this report now
+covers only defect B.** Field-reported from `db_prod`: a `COMMIT` on an `omc.sales_simulation`
 push ran **96 minutes** (pid 2375195, `application_name = reflex_flush:omc.sop_forecast_view`,
 100% CPU, zero wait events, zero blockers) to maintain a **132 MB / 930k-row** IMV. It did
 eventually commit; the next queued push immediately started another long `COMMIT`.
 
-Two independent defects stack. **A** is the proximate cause and is fixable in codegen. **B**
-makes the documented operator remedy a no-op, so there is currently **no operational
-workaround** — the only lever is code.
+Two independent defects stacked. **A** was the proximate cause and is now fixed; the incident
+itself is closed (461.5 ms → 0.207 ms on the field one-day affected set). **B** remains open:
+it makes the documented operator remedy a no-op, so there is still no operational workaround
+for the underlying metadata gap — the only lever is code.
 
-## A — the partition-dispatch branch is the one branch PS-5 never gated
+Verified open at HEAD (`f74fc56`, 1.11.2): both `is_passthrough` early returns are still
+present at `src/create_ivm/mod.rs:1754` and `src/create_ivm/soundness.rs:1533`.
+
+## A — the partition-dispatch branch is the one branch PS-5 never gated (FIXED in 1.11.2)
+
+**Resolved.** `passthrough_op_stmts` now uses the gated `passthrough_keyed_delete_match` in the
+partition-dispatch arms (`src/trigger/ops.rs:1086`, `:1118`, `:1160`, `:1218`), the variants
+expand as separate `EXECUTE`s inside the single DO block, and the ungated
+`passthrough_keyed_delete_predicate` builder has been deleted outright so it cannot be
+reintroduced. Regression test: `partitioned_passthrough_cold_delete_is_gated_and_swaps_once`.
+The original analysis is kept below for context.
 
 `passthrough_op_stmts` (`src/trigger/ops.rs`) has two arms per operation. The unpartitioned
 arm uses `passthrough_keyed_delete_match` — the PS-5 runtime-gated fast/safe pair. The
@@ -129,15 +141,11 @@ rows and time the `COMMIT`. `omc.sop_forecast_view`: 96 min for 930k rows / 132 
 
 ## Fix direction
 
-**A (do first — solves the incident).** In `passthrough_op_stmts`, use the gated
-`passthrough_keyed_delete_match` in the partition-dispatch arms, and let
-`build_passthrough_partition_dispatch_sql` take the cold DELETE as a list of variants, emitting
-one `EXECUTE` per variant inside the single DO block, exactly as `dispatch.rs:254-257` does.
-Delete the stale "cannot be gated" comment. Regression test must assert the emitted DO block
-contains **one** swap call and **two** cold-DELETE `EXECUTE`s, and must go RED if the arm is
-reverted to the ungated predicate.
+**A — done in 1.11.2.** Left here for the record: the gated `passthrough_keyed_delete_match` in
+the partition-dispatch arms, with the cold DELETE emitted as one `EXECUTE` per variant inside
+the single DO block exactly as `dispatch.rs:254-257` does, so the swap stays single.
 
-**B (separate change).** Run the structural NOT-NULL inference for passthrough IMVs, at create
+**B (the remaining work).** Run the structural NOT-NULL inference for passthrough IMVs, at create
 time and in `reflex_probe_not_null_columns`. It is `infer_not_null_columns` — the *structural*
 inference that "never trusts transient null-freeness" — not the old data probe, so it is sound
 for passthrough. Until then `reflex_probe_not_null_columns` should at minimum report that it

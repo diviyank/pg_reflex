@@ -1414,9 +1414,13 @@ pub(crate) fn reflex_sync_partitions_impl(view_name: &str, drop_orphans: bool) -
 /// region) as colliding siblings and drop live, unrelated data. Narrower than
 /// a `drop_orphans` sweep too — `expected` gates it to a child that maps to
 /// NO live source leaf, so this never touches a partition a live source still
-/// backs, regardless of the caller's own `drop_orphans` flag. Mirrors the F3
-/// heal in `execute_partition_swap_for_child` (which is itself already
-/// correctly parent-scoped via `list_partition_children`).
+/// backs, regardless of the caller's own `drop_orphans` flag. Same intent as
+/// the F3 heal in `execute_partition_swap_for_child`, but NOT the same scoping:
+/// that one passes the IMV ROOT rather than the swapped leaf's immediate
+/// parent, so on a multi-level tree it compares the root's direct children
+/// against a leaf's bound, never matches, and silently heals nothing. Tracked
+/// in `untreated_bugs/2026-07-25_swap_f3_heal_wrong_parent_scope_multilevel.md`
+/// — do not copy that scoping here.
 fn drop_bound_collision_orphan(
     client: &mut pgrx::spi::SpiClient<'_>,
     schema: &str,
