@@ -1,0 +1,56 @@
+-- Migration: pg_reflex 1.11.1 → 1.11.2
+--
+-- Run via: ALTER EXTENSION pg_reflex UPDATE TO '1.11.2';
+--
+-- Replace the module (.so) BEFORE running this.
+--
+-- Two fixes, both delivered ENTIRELY in the module. There is no DDL, no new
+-- function, and no registry column in this delta — the file carries only a
+-- no-op marker so that ALTER EXTENSION … UPDATE has something to run.
+--
+--   * (PERFORMANCE CLIFF) The cold DELETE of a PARTITIONED passthrough IMV ran
+--     with an ungated `IS NOT DISTINCT FROM` membership match against the
+--     `__reflex_pt_old_<view>_<source>` scratch table. No operator family covers
+--     that operator, so PostgreSQL can neither prune partitions nor use the
+--     IMV's unique index: every flush scanned EVERY leaf of the IMV, whatever
+--     the size of the change. Measured on a 49-leaf / 930k-row / 132 MB field
+--     IMV, with a ONE-DAY affected set: 461.5 ms scanning all 49 leaves, versus
+--     0.207 ms scanning one leaf and pruning 48 once the match is sargable. At a
+--     one-month affected set the ungated form exceeded a 90 s statement_timeout
+--     while the sargable form ran in ~106 ms. In the field this showed up as a
+--     96-minute COMMIT on a bulk push, because the maintenance runs inside the
+--     caller's COMMIT via the DEFERRED constraint trigger.
+--
+--     The PS-5 runtime fast/safe gate — already used by every other keyed
+--     maintenance path since 1.11.1 — now covers this branch too. It emits both
+--     variants and lets the data decide per flush: the sargable `=` form when
+--     the scratch table holds no NULL key, the NULL-safe form when it does, so
+--     the 1.11.1 nullable-key correctness fix is fully preserved. The hot-leaf
+--     swap is emitted once and is untouched by the gating.
+--
+--     This affects every partitioned passthrough IMV whose key columns are not
+--     all catalog NOT NULL — which, because passthrough IMVs never populate
+--     `not_null_columns` at all, is every partitioned passthrough IMV. See
+--     untreated_bugs/2026-07-27_partitioned_passthrough_membership_ungated.md;
+--     the metadata half of that report is NOT fixed here.
+--
+--   * (CATASTROPHIC, DATA LOSS) reflex_sync_partitions could drop EVERY
+--     partition of an IMV, emptying it. `list_partition_tree` returns an empty
+--     Vec both when the anchor genuinely has no children and when it could not
+--     be read at all (an unqualified anchor name that `to_regclass` cannot
+--     resolve under the caller's search_path, a non-partitioned anchor, or a
+--     failed catalog query), so an empty enumeration carries no information
+--     about orphanhood — but the sync read it as "every child is an orphan".
+--     Reachable from the SQL default (`drop_orphans` defaults to TRUE) and from
+--     reflex_reconcile_partition, which runs the sync with drop_orphans=true
+--     before its own work. The sync now refuses loudly on an empty enumeration:
+--     a WARNING naming the anchor plus a marker in the returned message,
+--     mirroring the F3 fail-safe already in execute_partition_swap_for_child.
+--
+-- No action is required beyond replacing the module and running this update.
+-- Both fixes are generated per flush from the registry (`reflex_build_delta_sql`
+-- is called by `reflex_flush_deferred` at flush time, not baked into a stored
+-- trigger body), so NO trigger rebuild and NO reconcile is needed: the next
+-- flush of an affected IMV already uses the fixed SQL.
+
+SELECT 1 WHERE FALSE;

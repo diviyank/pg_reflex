@@ -4,6 +4,20 @@ The full changelog tracks every release. The latest version's headlines are on t
 
 For each version below, see [`CHANGELOG.md`](https://github.com/diviyank/pg_reflex/blob/main/CHANGELOG.md) on GitHub for the canonical text.
 
+## [1.11.2] — 2026-07-27
+
+Two module-only fixes: a performance cliff that made every flush of a partitioned passthrough IMV scan the whole IMV rather than the changed partition — an ungated `IS NOT DISTINCT FROM` membership match that no operator family covers, so PostgreSQL could neither prune partitions nor use the unique index (461.5 ms scanning all 49 leaves versus 0.207 ms scanning one and pruning 48, on a one-day affected set against a 930k-row field IMV; a 96-minute `COMMIT` in the field, since DEFERRED maintenance runs inside the caller's `COMMIT`) — and a catastrophic data-loss guard, a partition sync that read an unreadable anchor enumeration as "every child is an orphan" and dropped every partition of the IMV. No DDL, no new function, no registry column. Replace the `.so`, then `ALTER EXTENSION pg_reflex UPDATE TO '1.11.2';`.
+
+**Fixed**
+
+- (PERFORMANCE CLIFF) The cold `DELETE` of a partitioned passthrough IMV scanned every leaf on every flush; the PS-5 runtime fast/safe gate now covers this branch, emitting both variants so the data picks the sargable `=` form per flush while the hot-leaf swap stays single — the 1.11.1 nullable-key correctness fix is fully preserved.
+- Affects every partitioned passthrough IMV whose key columns are not all catalog `NOT NULL`, which is all of them, since passthrough IMVs never populate `not_null_columns`; that metadata half is filed but not fixed here.
+- (CATASTROPHIC, DATA LOSS) `reflex_sync_partitions` could drop every partition of an IMV when `list_partition_tree` returned empty for an unreadable anchor — reachable from the SQL default `drop_orphans => TRUE` and from `reflex_reconcile_partition` — and now refuses loudly with a `WARNING` naming the anchor.
+
+**Migration**
+
+- [`sql/pg_reflex--1.11.1--1.11.2.sql`](https://github.com/diviyank/pg_reflex/blob/main/sql/pg_reflex--1.11.1--1.11.2.sql) — no-op marker only; both fixes are module-only, and because the maintenance SQL is regenerated from the registry on every flush, no trigger rebuild and no reconcile are required.
+
 ## [1.11.1] — 2026-07-24
 
 Audit truthfulness, eleven silent-wrong-result fixes (nullable-key MIN/MAX maintenance; a materialised UNION-ALL wrapper's mirror trigger functions colliding under long wrapper names; a nullable explicit unique key on a passthrough IMV; a LEFT JOIN aggregate grouped by the secondary's join column; the DEFERRED cross-source guard double-reconciling a UNION-ALL operand; a FULL OUTER JOIN aggregate's scoped recompute dropping a newly-surfaced group; a synchronous partition-sync orphan collision going permanently `known_stale`; an outer-join-blind catalog NOT-NULL set silently staling a LEFT/RIGHT JOIN aggregate's NULL group; a qualified GROUP BY column misclassified as stable by its first `.`-segment; and directly-named UNION-ALL operand reconciles — including every unattended scheduled-sweep pass — silently doubling their wrapper), an unclearable-finding fix (a group-capture table dropped independently of its intermediate), two performance-cliff fixes (MIN/MAX affected-group scoping, and the keyed outer-join-secondary passthrough's membership predicate — 579× on the latter), wrapper-reconcile safety, targeted-recovery observability, and a recovery path for a dropped internal table. Replace the `.so`, then `ALTER EXTENSION pg_reflex UPDATE TO '1.11.1';`.
