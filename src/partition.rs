@@ -35,6 +35,66 @@ use crate::sql_writer::identifier::format_pg_text_array;
 /// `known_stale`, so the condition is reported rather than silently retried.
 pub(crate) const PARTITION_FLUSH_FAILURE_CAP: i32 = 5;
 
+/// An explicit PostgreSQL subtransaction, the same primitive a plpgsql
+/// `BEGIN … EXCEPTION` block opens.
+///
+/// `Spi::connect_mut` does NOT open one — it is only `SPI_connect` plus a
+/// scratch memory context — so a primitive that reports failure by RETURNING a
+/// string (rather than raising) commits everything it did before failing.
+/// Wrapping such a primitive in one of these makes "it returned ERROR" mean
+/// "nothing happened".
+///
+/// Bookkeeping mirrors plpgsql's `exec_stmt_block`: `BeginInternalSubTransaction`
+/// switches the current memory context and resource owner, both of which must be
+/// restored around the release/rollback.
+///
+/// A raised PostgreSQL error (as opposed to a returned one) unwinds past
+/// `release`/`rollback` entirely; that aborts the whole transaction, which
+/// discards this subtransaction along with it.
+struct SubTransaction {
+    memory_context: pgrx::pg_sys::MemoryContext,
+    resource_owner: pgrx::pg_sys::ResourceOwner,
+}
+
+impl SubTransaction {
+    fn begin() -> Self {
+        unsafe {
+            let memory_context = pgrx::pg_sys::CurrentMemoryContext;
+            let resource_owner = pgrx::pg_sys::CurrentResourceOwner;
+            pgrx::pg_sys::BeginInternalSubTransaction(std::ptr::null());
+            pgrx::pg_sys::MemoryContextSwitchTo(memory_context);
+            Self {
+                memory_context,
+                resource_owner,
+            }
+        }
+    }
+
+    /// Commit: everything done inside becomes part of the enclosing
+    /// transaction, and locks taken inside are reassigned to it.
+    fn release(self) {
+        unsafe {
+            pgrx::pg_sys::ReleaseCurrentSubTransaction();
+            self.restore();
+        }
+    }
+
+    /// Undo everything done inside, including DDL.
+    fn rollback(self) {
+        unsafe {
+            pgrx::pg_sys::RollbackAndReleaseCurrentSubTransaction();
+            self.restore();
+        }
+    }
+
+    unsafe fn restore(self) {
+        unsafe {
+            pgrx::pg_sys::MemoryContextSwitchTo(self.memory_context);
+            pgrx::pg_sys::CurrentResourceOwner = self.resource_owner;
+        }
+    }
+}
+
 /// A description of how a source table is partitioned.
 ///
 /// `column_names` are the OUTPUT names (lowercased, unquoted) of the
@@ -1477,9 +1537,16 @@ fn drop_bound_collision_orphan(
 ///    * Non-partitioned but GROUP BY this column → key-scoped reconcile.
 ///    * Anything else → full reconcile.
 ///
-/// Atomicity: the entire operation runs inside one `Spi::connect_mut`
-/// sub-transaction; any failure rolls back all changes (including the
-/// catalog-side DETACH/ATTACH), leaving the IMV in its pre-call state.
+/// Atomicity: failures are REPORTED (an `ERROR: …` return value), not raised,
+/// so the calling statement commits. Steps 1-4 therefore run inside an explicit
+/// `SubTransaction` that is rolled back on any reported failure — otherwise the
+/// destructive pre-sync (`DROP TABLE … CASCADE` on orphan children) and any
+/// children already swapped would stay committed while the caller is told the
+/// call failed. `Spi::connect_mut` gives no such isolation on its own.
+///
+/// The `skip_sync` batch path deliberately opens no subtransaction: its caller
+/// (`reflex_flush_partitions_impl`) already wraps every root's statements in a
+/// plpgsql `EXCEPTION` block, which is one, and nests all leaves of a root in it.
 pub(crate) fn reflex_reconcile_partition_impl(
     view_name: &str,
     partition_keys_csv: &str,
@@ -1493,7 +1560,13 @@ pub(crate) fn reflex_reconcile_partition_impl(
     // cleans orphan swaps once up front, then drives many per-leaf reconciles
     // with `skip_sync = true` so this O(tree) prep isn't repeated per leaf.
     // The standalone / cascade entry points pass `false` and stay self-contained.
-    if !skip_sync {
+    // Opened BEFORE the destructive pre-sync so a reported failure anywhere
+    // below undoes it. `None` on the batch path — see the doc comment.
+    let subxact = (!skip_sync).then(SubTransaction::begin);
+
+    let presync: Result<(), String> = if skip_sync {
+        Ok(())
+    } else {
         // Idempotent recovery: drop any orphan __reflex_swap_* tables left over
         // from a prior aborted swap.  Names are deterministic from view +
         // source-child bare name (see `swap_partition_name`); we identify them
@@ -1501,11 +1574,21 @@ pub(crate) fn reflex_reconcile_partition_impl(
         // prefix, scoped to the IMV's schema.
         cleanup_orphan_swap_tables(view_name);
 
-        // First, ensure the partition set is in sync with the source.
-        let _ = reflex_sync_partitions_impl(view_name, true);
-    }
+        // First, ensure the partition set is in sync with the source. A sync
+        // that FAILS leaves the partition set neither known-current nor
+        // necessarily unchanged; swapping children against it would rebuild
+        // slices from a tree we could not verify, so refuse instead of
+        // discarding the failure. (A refused orphan drop is not a failure —
+        // it is the sync declining to destroy, and reports no ERROR.)
+        let sync = reflex_sync_partitions_impl(view_name, true);
+        if sync.starts_with("ERROR") {
+            Err(format!("reconcile_partition: pre-sync failed: {}", sync))
+        } else {
+            Ok(())
+        }
+    };
 
-    let outcome: Result<String, String> = Spi::connect_mut(|client| {
+    let outcome: Result<String, String> = presync.and_then(|()| Spi::connect_mut(|client| {
         let row = client
             .select(
                 "SELECT base_query, end_query, partition_columns, partition_strategy, depends_on, graph_child, storage_mode, partition_depth \
@@ -1828,7 +1911,16 @@ pub(crate) fn reflex_reconcile_partition_impl(
             "RECONCILED partitions: {}",
             to_process.into_iter().collect::<Vec<_>>().join(", ")
         ))
-    });
+    }));
+
+    if let Some(subxact) = subxact {
+        if outcome.is_ok() {
+            subxact.release();
+        } else {
+            subxact.rollback();
+        }
+    }
+
     match outcome {
         Ok(s) => s,
         Err(e) => format!("ERROR: {}", e),
@@ -1924,8 +2016,11 @@ fn build_scoped_cascade_reconcile(
 /// and target child names are derived from it.  Reads each child's
 /// bound + constraint def live from `pg_class` / `pg_get_partition_*`.
 ///
-/// Returns Err(message) on any DDL failure — the caller's
-/// `Spi::connect_mut` sub-transaction rolls back atomically.
+/// Returns Err(message) on any DDL failure. `Spi::connect_mut` is not a
+/// sub-transaction, so it is the CALLER that owns rolling those partial swaps
+/// back: `reflex_reconcile_partition_impl` does it with an explicit
+/// `SubTransaction`, and the batch flush with the plpgsql `EXCEPTION` block it
+/// dispatches every root's statements through.
 pub(crate) fn execute_partition_swap_for_child(
     client: &mut pgrx::spi::SpiClient<'_>,
     view_name: &str,
