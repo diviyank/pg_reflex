@@ -3782,3 +3782,324 @@ fn pg_part_sync_relocation_works_for_non_superuser_owner() {
             .unwrap_or(-1);
     assert_eq!(b_in_default, 0, "'b' must no longer sit in the IMV default");
 }
+
+// ---------------------------------------------------------------------------
+// Failure atomicity of `reflex_reconcile_partition`
+//
+// `reflex_reconcile_partition` reports failure by RETURNING a string starting
+// with "ERROR:" rather than by raising — so the calling statement COMMITS.
+// Everything the call did before the failure must therefore be undone by the
+// call itself, or an operator who reads "ERROR" (and reasonably concludes
+// nothing happened) is left with committed, destructive DDL.
+// ---------------------------------------------------------------------------
+
+/// Comma-joined, ordered child relnames of a partitioned relation — the exact
+/// partition set, not just its cardinality, so a drop compensated by a create
+/// cannot pass.
+fn partition_child_set(parent: &str) -> String {
+    Spi::get_one::<String>(&format!(
+        "SELECT COALESCE(string_agg(c.relname, ',' ORDER BY c.relname), '') \
+         FROM pg_inherits i \
+         JOIN pg_class c ON c.oid = i.inhrelid \
+         JOIN pg_class p ON p.oid = i.inhparent \
+         WHERE p.relname = '{parent}'"
+    ))
+    .expect("child set query")
+    .expect("child set")
+}
+
+/// T1 — a reconcile that fails must not commit the destructive orphan drop its
+/// own pre-sync performed. This is the field shape: a detached source child
+/// makes the pre-sync legitimately DROP the mirrored IMV child, then a bogus
+/// `source_partition` (arg 3 handed a key value instead of a partition name)
+/// fails the reconcile. The operator sees "ERROR" — and the IMV partition,
+/// with its data, must still be there.
+#[pg_test]
+fn pg_part_failed_reconcile_rolls_back_presync_orphan_drop() {
+    Spi::run(
+        "CREATE TABLE atom1 (id BIGINT, region TEXT NOT NULL, amount NUMERIC) \
+         PARTITION BY LIST (region)",
+    )
+    .expect("source");
+    Spi::run("CREATE TABLE atom1_n PARTITION OF atom1 FOR VALUES IN ('N')").expect("n");
+    Spi::run("CREATE TABLE atom1_s PARTITION OF atom1 FOR VALUES IN ('S')").expect("s");
+    Spi::run("INSERT INTO atom1 (id, region, amount) VALUES (1,'N',10),(2,'S',20)").expect("seed");
+    Spi::run(
+        "SELECT create_reflex_ivm('atom1v', \
+           'SELECT region, SUM(amount) AS total FROM atom1 GROUP BY region', \
+           NULL, NULL, NULL, NULL, ARRAY['region'])",
+    )
+    .expect("create imv");
+
+    let tgt_before = partition_child_set("atom1v");
+    let int_before = partition_child_set("__reflex_intermediate_atom1v");
+    assert!(
+        tgt_before.contains("atom1v_atom1_s"),
+        "fixture must start with the S mirror child, got: {tgt_before}"
+    );
+    let rows_before = Spi::get_one::<i64>("SELECT count(*) FROM atom1v")
+        .expect("q")
+        .expect("c");
+    assert_eq!(rows_before, 2, "fixture must start with both region rows");
+
+    // The source child genuinely goes away, so the pre-sync's orphan drop is
+    // correct in isolation — it is the FAILED reconcile that must undo it.
+    Spi::run("ALTER TABLE atom1 DETACH PARTITION atom1_s").expect("detach s");
+
+    let msg = Spi::get_one::<String>(
+        "SELECT reflex_reconcile_partition('atom1v', 'region', 'no_such_source_child')",
+    )
+    .expect("call")
+    .expect("msg");
+    assert!(
+        msg.starts_with("ERROR"),
+        "reconcile of a bogus source partition must report ERROR, got: {msg}"
+    );
+
+    assert_eq!(
+        partition_child_set("atom1v"),
+        tgt_before,
+        "a reconcile that reports ERROR must leave the target partition set untouched (msg: {msg})"
+    );
+    assert_eq!(
+        partition_child_set("__reflex_intermediate_atom1v"),
+        int_before,
+        "a reconcile that reports ERROR must leave the intermediate partition set untouched (msg: {msg})"
+    );
+    let rows_after = Spi::get_one::<i64>("SELECT count(*) FROM atom1v")
+        .expect("q")
+        .expect("c");
+    assert_eq!(
+        rows_after, 2,
+        "the dropped child's DATA must come back too, not just an empty child (msg: {msg})"
+    );
+    let s_total = Spi::get_one::<pgrx::AnyNumeric>("SELECT total FROM atom1v WHERE region = 'S'")
+        .expect("q")
+        .expect("s");
+    assert_eq!(s_total.to_string(), "20", "the S slice must survive intact");
+}
+
+/// T2 — the creative direction. A genuinely new source partition makes the
+/// pre-sync CREATE mirror children; a reconcile that then fails must roll that
+/// creation back too, so "ERROR" means the whole call was a no-op.
+#[pg_test]
+fn pg_part_failed_reconcile_rolls_back_presync_child_creation() {
+    Spi::run(
+        "CREATE TABLE atom2 (id BIGINT, region TEXT NOT NULL, amount NUMERIC) \
+         PARTITION BY LIST (region)",
+    )
+    .expect("source");
+    Spi::run("CREATE TABLE atom2_n PARTITION OF atom2 FOR VALUES IN ('N')").expect("n");
+    Spi::run("CREATE TABLE atom2_s PARTITION OF atom2 FOR VALUES IN ('S')").expect("s");
+    Spi::run("INSERT INTO atom2 (id, region, amount) VALUES (1,'N',10),(2,'S',20)").expect("seed");
+    Spi::run(
+        "SELECT create_reflex_ivm('atom2v', \
+           'SELECT region, SUM(amount) AS total FROM atom2 GROUP BY region', \
+           NULL, NULL, NULL, NULL, ARRAY['region'])",
+    )
+    .expect("create imv");
+
+    let tgt_before = partition_child_set("atom2v");
+    let int_before = partition_child_set("__reflex_intermediate_atom2v");
+
+    // A new source partition the IMV does not mirror yet — the shape left by a
+    // partition created while the DDL hook was not in force (restore, replica
+    // promotion, `ALTER EVENT TRIGGER … DISABLE`). It is the RECONCILE's own
+    // pre-sync that must create `atom2v_atom2_e` (+ its intermediate), not the
+    // ddl_command_end auto-sync, or the creation would sit outside the scope
+    // this test is about.
+    Spi::run("ALTER EVENT TRIGGER reflex_on_ddl_command_end DISABLE").expect("disable ddl hook");
+    Spi::run("CREATE TABLE atom2_e PARTITION OF atom2 FOR VALUES IN ('E')").expect("e");
+    Spi::run("ALTER EVENT TRIGGER reflex_on_ddl_command_end ENABLE").expect("re-enable ddl hook");
+    assert!(
+        !partition_child_set("atom2v").contains("atom2v_atom2_e"),
+        "fixture precondition: the E mirror must not exist before the reconcile"
+    );
+
+    let msg = Spi::get_one::<String>(
+        "SELECT reflex_reconcile_partition('atom2v', '', 'no_such_source_child')",
+    )
+    .expect("call")
+    .expect("msg");
+    assert!(
+        msg.starts_with("ERROR"),
+        "reconcile of a bogus source partition must report ERROR, got: {msg}"
+    );
+
+    assert_eq!(
+        partition_child_set("atom2v"),
+        tgt_before,
+        "a reconcile that reports ERROR must roll back the children its pre-sync created \
+         (msg: {msg})"
+    );
+    assert_eq!(
+        partition_child_set("__reflex_intermediate_atom2v"),
+        int_before,
+        "a reconcile that reports ERROR must roll back the intermediate children its pre-sync \
+         created (msg: {msg})"
+    );
+}
+
+/// T3 — the happy path is unchanged: a successful reconcile still commits its
+/// work (the pre-sync's AND the swap's), the mirrored child stays usable, and
+/// the IMV still matches a fresh recompute under the bidirectional EXCEPT ALL
+/// oracle.
+#[pg_test]
+fn pg_part_successful_reconcile_still_commits_and_stays_correct() {
+    Spi::run(
+        "CREATE TABLE atom3 (id BIGINT, region TEXT NOT NULL, amount NUMERIC) \
+         PARTITION BY LIST (region)",
+    )
+    .expect("source");
+    Spi::run("CREATE TABLE atom3_n PARTITION OF atom3 FOR VALUES IN ('N')").expect("n");
+    Spi::run("CREATE TABLE atom3_s PARTITION OF atom3 FOR VALUES IN ('S')").expect("s");
+    Spi::run("INSERT INTO atom3 (id, region, amount) VALUES (1,'N',10),(2,'S',20)").expect("seed");
+    Spi::run(
+        "SELECT create_reflex_ivm('atom3v', \
+           'SELECT region, SUM(amount) AS total FROM atom3 GROUP BY region', \
+           NULL, NULL, NULL, NULL, ARRAY['region'])",
+    )
+    .expect("create imv");
+
+    // A new source partition the reconcile's own pre-sync must mirror (the DDL
+    // hook is held off so the creation belongs to the reconcile) — work that
+    // has to SURVIVE the call, since the reconcile succeeds.
+    Spi::run("ALTER EVENT TRIGGER reflex_on_ddl_command_end DISABLE").expect("disable ddl hook");
+    Spi::run("CREATE TABLE atom3_e PARTITION OF atom3 FOR VALUES IN ('E')").expect("e");
+    Spi::run("ALTER EVENT TRIGGER reflex_on_ddl_command_end ENABLE").expect("re-enable ddl hook");
+
+    let top_xid = Spi::get_one::<i64>("SELECT pg_current_xact_id()::text::bigint")
+        .expect("xid")
+        .expect("xid");
+
+    let msg = Spi::get_one::<String>("SELECT reflex_reconcile_partition('atom3v', '', 'atom3_e')")
+        .expect("call")
+        .expect("msg");
+    assert!(
+        msg.starts_with("RECONCILED partitions"),
+        "expected RECONCILED, got: {msg}"
+    );
+
+    assert!(
+        partition_child_set("atom3v").contains("atom3v_atom3_e"),
+        "the pre-sync's new child must SURVIVE a successful reconcile"
+    );
+    // The surviving mirror is a working partition, not just a catalog entry:
+    // maintenance into the new key must land and stay correct.
+    Spi::run("INSERT INTO atom3 (id, region, amount) VALUES (3,'E',30)").expect("seed e");
+    assert_imv_correct(
+        "atom3v",
+        "SELECT region, SUM(amount) AS total FROM atom3 GROUP BY region",
+    );
+
+    // The work ran inside a subtransaction of its own: the registry row it
+    // wrote carries that subtransaction's xid, not the top-level one. Without
+    // a subtransaction there is nothing for a failed call to roll back to.
+    let ref_xmin = Spi::get_one::<i64>(
+        "SELECT xmin::text::bigint FROM public.__reflex_ivm_reference WHERE name = 'atom3v'",
+    )
+    .expect("xmin")
+    .expect("xmin");
+    assert_ne!(
+        ref_xmin, top_xid,
+        "reconcile must run in its own subtransaction, but its registry write carries the \
+         top-level xid ({top_xid}) — nothing to roll back to"
+    );
+}
+
+/// T4 — the batch path (`skip_sync => true`, what `reflex_flush_partitions`
+/// drives per root) is untouched: it still reconciles correctly, and it does
+/// NOT open a subtransaction of its own. The flush already wraps every root's
+/// statements in a plpgsql `EXCEPTION` block — itself a subtransaction — so a
+/// per-leaf savepoint here would be pure overhead.
+#[pg_test]
+fn pg_part_skip_sync_reconcile_opens_no_subtransaction() {
+    Spi::run(
+        "CREATE TABLE atom4 (id BIGINT, region TEXT NOT NULL, amount NUMERIC) \
+         PARTITION BY LIST (region)",
+    )
+    .expect("source");
+    Spi::run("CREATE TABLE atom4_n PARTITION OF atom4 FOR VALUES IN ('N')").expect("n");
+    Spi::run("CREATE TABLE atom4_s PARTITION OF atom4 FOR VALUES IN ('S')").expect("s");
+    Spi::run("INSERT INTO atom4 (id, region, amount) VALUES (1,'N',10),(2,'S',20)").expect("seed");
+    Spi::run(
+        "SELECT create_reflex_ivm('atom4v', \
+           'SELECT region, SUM(amount) AS total FROM atom4 GROUP BY region', \
+           NULL, NULL, NULL, NULL, ARRAY['region'])",
+    )
+    .expect("create imv");
+    Spi::run("UPDATE atom4v SET total = 999 WHERE region = 'N'").expect("drift");
+
+    let top_xid = Spi::get_one::<i64>("SELECT pg_current_xact_id()::text::bigint")
+        .expect("xid")
+        .expect("xid");
+
+    let msg =
+        Spi::get_one::<String>("SELECT reflex_reconcile_partition('atom4v', '', 'atom4_n', true)")
+            .expect("call")
+            .expect("msg");
+    assert!(
+        msg.starts_with("RECONCILED partitions"),
+        "skip_sync reconcile must still work, got: {msg}"
+    );
+    assert_imv_correct(
+        "atom4v",
+        "SELECT region, SUM(amount) AS total FROM atom4 GROUP BY region",
+    );
+
+    let ref_xmin = Spi::get_one::<i64>(
+        "SELECT xmin::text::bigint FROM public.__reflex_ivm_reference WHERE name = 'atom4v'",
+    )
+    .expect("xmin")
+    .expect("xmin");
+    assert_eq!(
+        ref_xmin, top_xid,
+        "the skip_sync batch path must not acquire a subtransaction per leaf"
+    );
+}
+
+/// T5 — the sync's advisory lock keeps the two-key
+/// `(hashtext(name), hashtext(reverse(name)))` form and is still held for the
+/// rest of the transaction once the reconcile's subtransaction is released.
+/// `objsubid = 2` is PostgreSQL's marker for the two-int4-key advisory space; a
+/// one-key `bigint` lock lands in space `objsubid = 1` and would never mutually
+/// exclude against the rest of pg_reflex.
+#[pg_test]
+fn pg_part_reconcile_keeps_two_key_advisory_lock_after_subtransaction() {
+    Spi::run(
+        "CREATE TABLE atom5 (id BIGINT, region TEXT NOT NULL, amount NUMERIC) \
+         PARTITION BY LIST (region)",
+    )
+    .expect("source");
+    Spi::run("CREATE TABLE atom5_n PARTITION OF atom5 FOR VALUES IN ('N')").expect("n");
+    Spi::run("CREATE TABLE atom5_s PARTITION OF atom5 FOR VALUES IN ('S')").expect("s");
+    Spi::run("INSERT INTO atom5 (id, region, amount) VALUES (1,'N',10),(2,'S',20)").expect("seed");
+    Spi::run(
+        "SELECT create_reflex_ivm('atom5v', \
+           'SELECT region, SUM(amount) AS total FROM atom5 GROUP BY region', \
+           NULL, NULL, NULL, NULL, ARRAY['region'])",
+    )
+    .expect("create imv");
+
+    let msg = Spi::get_one::<String>("SELECT reflex_reconcile_partition('atom5v', 'N')")
+        .expect("call")
+        .expect("msg");
+    assert!(
+        msg.starts_with("RECONCILED partitions"),
+        "expected RECONCILED, got: {msg}"
+    );
+
+    let held = Spi::get_one::<i64>(
+        "SELECT count(*) FROM pg_locks \
+         WHERE locktype = 'advisory' AND pid = pg_backend_pid() AND objsubid = 2 \
+           AND classid::bigint = (hashtext('atom5v')::bigint & 4294967295) \
+           AND objid::bigint   = (hashtext(reverse('atom5v'))::bigint & 4294967295)",
+    )
+    .expect("lock probe")
+    .expect("lock count");
+    assert_eq!(
+        held, 1,
+        "the two-key advisory lock on the IMV name must still be held after the reconcile's \
+         subtransaction is released"
+    );
+}
