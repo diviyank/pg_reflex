@@ -239,6 +239,63 @@ fn pg_rdd_reconcile_propagates_two_levels_deep() {
     assert_imv_correct("rdd3c", c_fresh);
 }
 
+/// T5 -- the swap primitive on its own, with NO cascade behind it to clean up
+/// after it.
+///
+/// T1-T3 exercise `reflex_reconcile`, whose dependent cascade repairs a mirror
+/// the swap corrupted, so they cannot tell "the swap never corrupts it" from
+/// "the corruption is repaired afterwards". `crate_test_partition_swap_for_child`
+/// drives one DETACH/ATTACH swap directly, so what the dependent looks like
+/// afterwards is exactly what the event-trigger guard did or did not prevent.
+///
+/// This matters beyond tidiness: a cascade that FAILS (lock timeout, a broken
+/// source, a refused repair) leaves an unguarded dependent EMPTY with a mirror
+/// of a relation that no longer exists, instead of merely stale.
+#[pg_test]
+fn pg_rdd_bare_swap_does_not_touch_the_dependent_mirror() {
+    build_rdd_source("rdd6s");
+    create_imv(
+        "rdd6p",
+        "SELECT create_reflex_ivm('rdd6p', \
+         'SELECT k, bucket, SUM(amt) AS total FROM rdd6s GROUP BY k, bucket', \
+         NULL, NULL, NULL, NULL, ARRAY['k'])",
+    );
+    create_imv(
+        "rdd6d",
+        "SELECT create_reflex_ivm('rdd6d', 'SELECT k, SUM(total) AS t FROM rdd6p GROUP BY k')",
+    );
+
+    let dep_children = partition_child_names("rdd6d");
+    let dep_int_children = partition_child_names("__reflex_intermediate_rdd6d");
+    let dep_rows = dep_row_count("rdd6d");
+    assert_eq!(dep_children.len(), 3, "fixture: {dep_children:?}");
+
+    let swap = Spi::get_one::<String>(
+        "SELECT tests.crate_test_partition_swap_for_child('rdd6p', 'rdd6s_c')",
+    )
+    .expect("swap call")
+    .expect("swap result");
+    assert_eq!(swap, "OK", "the swap primitive itself failed");
+
+    assert_no_swap_residue_children("rdd6d");
+    assert_no_swap_residue_children("__reflex_intermediate_rdd6d");
+    assert_eq!(
+        partition_child_names("rdd6d"),
+        dep_children,
+        "a bare swap of the parent rewrote the dependent's partition set"
+    );
+    assert_eq!(
+        partition_child_names("__reflex_intermediate_rdd6d"),
+        dep_int_children,
+        "a bare swap of the parent rewrote the dependent's intermediate partition set"
+    );
+    assert_eq!(
+        dep_row_count("rdd6d"),
+        dep_rows,
+        "a bare swap of the parent emptied the dependent"
+    );
+}
+
 /// T4a -- an UNPARTITIONED dependent of a PARTITIONED parent. It cannot be
 /// destroyed (nothing mirrors the swap tables into it), but the swap moves no
 /// rows, so without an explicit cascade it is left silently STALE. Measured
