@@ -437,3 +437,141 @@ fn attach_new_partition_absorbing_default_rows_stays_correct() {
         .unwrap();
     assert_eq!(n5, 50, "absorbed default rows must appear exactly once");
 }
+
+// ---------------------------------------------------------------------------
+// T7 — the canonical partition-rollover shape at mirror depth 1: create next
+// period's source partition and LOAD it in the same transaction.
+//
+// The load's own IMV maintenance delta lands in the brand-new mirror child
+// before the COMMIT-time partition reconcile reaches it, so an "is the child
+// empty?" gate sees a non-empty child and refuses the in-place fill. The child
+// is nonetheless brand new — nothing in it predates this transaction, and no
+// reader could have been reading a partition that did not exist at transaction
+// start — so the reconcile must still avoid DETACHing it off the live root.
+// ---------------------------------------------------------------------------
+
+#[pg_test]
+fn create_and_load_partition_never_locks_imv_root_depth1() {
+    setup_dblink();
+    worker_connect();
+    worker_exec(
+        "CREATE TABLE lz_src (k INT NOT NULL, v INT) PARTITION BY LIST (k); \
+         CREATE TABLE lz_src_1 PARTITION OF lz_src FOR VALUES IN (1); \
+         INSERT INTO lz_src SELECT 1, g FROM generate_series(1, 500) g; \
+         DO $mk$ BEGIN PERFORM create_reflex_ivm('lz_imv', 'SELECT k, v FROM lz_src', \
+             'k,v', NULL, NULL, NULL, ARRAY['k']); END $mk$",
+    );
+    let pid = worker_pid();
+    let imv_oid = relation_oid("lz_imv");
+
+    let baseline = read_with_lock_timeout("SELECT count(*) FROM lz_imv WHERE k = 1");
+
+    worker_exec("BEGIN");
+    worker_exec("CREATE TABLE lz_src_5 PARTITION OF lz_src FOR VALUES IN (5)");
+    let modes_after_sync = worker_lock_modes(imv_oid, pid);
+
+    worker_exec("INSERT INTO lz_src SELECT 5, g FROM generate_series(1, 900) g");
+    let modes_after_load = worker_lock_modes(imv_oid, pid);
+    let during1 = read_with_lock_timeout("SELECT count(*) FROM lz_imv WHERE k = 1");
+
+    worker_exec("SET CONSTRAINTS ALL IMMEDIATE");
+    let modes_after_reconcile = worker_lock_modes(imv_oid, pid);
+    let during2 = read_with_lock_timeout("SELECT count(*) FROM lz_imv WHERE k = 1");
+    let during3 = read_with_lock_timeout("SELECT count(*) FROM lz_imv");
+
+    worker_exec("COMMIT");
+    let new_rows = read_with_lock_timeout("SELECT count(*) FROM lz_imv WHERE k = 5");
+    let mismatches = read_with_lock_timeout(
+        "SELECT count(*) FROM ((SELECT * FROM lz_imv EXCEPT ALL SELECT k, v FROM lz_src) \
+         UNION ALL (SELECT k, v FROM lz_src EXCEPT ALL SELECT * FROM lz_imv)) o",
+    );
+    worker_exec(
+        "DROP TABLE IF EXISTS lz_src CASCADE; DROP TABLE IF EXISTS lz_imv CASCADE; \
+         DELETE FROM public.__reflex_ivm_reference WHERE name = 'lz_imv'",
+    );
+    worker_disconnect();
+
+    assert_eq!(baseline, 500, "baseline reader could not read the IMV");
+    assert_eq!(
+        during1, 500,
+        "a reader of an UNRELATED partition blocked after the load"
+    );
+    assert_eq!(
+        during2, 500,
+        "a reader of an UNRELATED partition blocked after the COMMIT-time reconcile"
+    );
+    assert_eq!(during3, 500, "an unpruned reader of the whole IMV blocked");
+    assert_root_lock_shape(&modes_after_sync, "rollover depth 1, after sync");
+    assert_root_lock_shape(&modes_after_load, "rollover depth 1, after load");
+    assert_root_lock_shape(&modes_after_reconcile, "rollover depth 1, after reconcile");
+    assert_eq!(new_rows, 900, "the loaded rows are wrong after commit");
+    assert_eq!(mismatches, 0, "EXCEPT ALL oracle: IMV diverges from source");
+}
+
+// ---------------------------------------------------------------------------
+// T8 — the same defect via the other route: ATTACH a pre-populated branch and
+// then INSERT more into it in the same transaction, at mirror depth 2.
+// ---------------------------------------------------------------------------
+
+#[pg_test]
+fn attach_then_load_partition_never_locks_imv_root_depth2() {
+    setup_dblink();
+    worker_connect();
+    worker_exec(
+        "CREATE TABLE ly_src (k INT NOT NULL, d DATE NOT NULL, v INT) PARTITION BY LIST (k); \
+         CREATE TABLE ly_src_1 PARTITION OF ly_src FOR VALUES IN (1) PARTITION BY RANGE (d); \
+         CREATE TABLE ly_src_1_m1 PARTITION OF ly_src_1 \
+             FOR VALUES FROM ('2025-01-01') TO ('2025-02-01'); \
+         INSERT INTO ly_src SELECT 1, '2025-01-15'::date, g FROM generate_series(1, 500) g; \
+         DO $mk$ BEGIN PERFORM create_reflex_ivm('ly_imv', 'SELECT k, d, v FROM ly_src', \
+             'k,d,v', NULL, NULL, NULL, ARRAY['k','d']); END $mk$",
+    );
+    worker_exec(
+        "CREATE TABLE ly_src_5 (k INT NOT NULL, d DATE NOT NULL, v INT) PARTITION BY RANGE (d); \
+         CREATE TABLE ly_src_5_m1 PARTITION OF ly_src_5 \
+             FOR VALUES FROM ('2025-01-01') TO ('2025-02-01'); \
+         CREATE TABLE ly_src_5_m2 PARTITION OF ly_src_5 \
+             FOR VALUES FROM ('2025-02-01') TO ('2025-03-01'); \
+         INSERT INTO ly_src_5 SELECT 5, '2025-01-10'::date, g FROM generate_series(1, 400) g",
+    );
+    let pid = worker_pid();
+    let imv_oid = relation_oid("ly_imv");
+
+    let baseline = read_with_lock_timeout("SELECT count(*) FROM ly_imv WHERE k = 1");
+
+    worker_exec("BEGIN");
+    worker_exec("ALTER TABLE ly_src ATTACH PARTITION ly_src_5 FOR VALUES IN (5)");
+    worker_exec("INSERT INTO ly_src SELECT 5, '2025-02-10'::date, g FROM generate_series(1, 300) g");
+    let modes_after_load = worker_lock_modes(imv_oid, pid);
+    let during1 = read_with_lock_timeout("SELECT count(*) FROM ly_imv WHERE k = 1");
+
+    worker_exec("SET CONSTRAINTS ALL IMMEDIATE");
+    let modes_after_reconcile = worker_lock_modes(imv_oid, pid);
+    let during2 = read_with_lock_timeout("SELECT count(*) FROM ly_imv WHERE k = 1");
+
+    worker_exec("COMMIT");
+    let new_rows = read_with_lock_timeout("SELECT count(*) FROM ly_imv WHERE k = 5");
+    let mismatches = read_with_lock_timeout(
+        "SELECT count(*) FROM ((SELECT * FROM ly_imv EXCEPT ALL SELECT k, d, v FROM ly_src) \
+         UNION ALL (SELECT k, d, v FROM ly_src EXCEPT ALL SELECT * FROM ly_imv)) o",
+    );
+    worker_exec(
+        "DROP TABLE IF EXISTS ly_src CASCADE; DROP TABLE IF EXISTS ly_imv CASCADE; \
+         DELETE FROM public.__reflex_ivm_reference WHERE name = 'ly_imv'",
+    );
+    worker_disconnect();
+
+    assert_eq!(baseline, 500, "baseline reader could not read the IMV");
+    assert_eq!(
+        during1, 500,
+        "a reader of an UNRELATED partition blocked after the load"
+    );
+    assert_eq!(
+        during2, 500,
+        "a reader of an UNRELATED partition blocked after the COMMIT-time reconcile"
+    );
+    assert_root_lock_shape(&modes_after_load, "attach+load depth 2, after load");
+    assert_root_lock_shape(&modes_after_reconcile, "attach+load depth 2, after reconcile");
+    assert_eq!(new_rows, 700, "the loaded rows are wrong after commit");
+    assert_eq!(mismatches, 0, "EXCEPT ALL oracle: IMV diverges from source");
+}

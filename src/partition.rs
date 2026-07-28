@@ -806,6 +806,66 @@ pub(crate) fn build_swap_partition_ddl(
     }
 }
 
+/// Transaction-local set of mirror children that `reflex_sync_partitions`
+/// created in THIS transaction, recorded as `pg_class` OIDs.
+///
+/// The COMMIT-time reconcile runs later in the same transaction and needs to
+/// know which children are brand new. It cannot infer it: a child created
+/// inside sync's SPI scope carries the SPI SUBtransaction's xid in
+/// `pg_class.xmin`, not `pg_current_xact_id()`, so the obvious
+/// "was this relation created by my transaction" probe answers `false` for
+/// exactly the children we must recognise (measured on PG 17.7).
+///
+/// OIDs rather than names because a GUC value is flat text and a quoted
+/// identifier may legally contain the separator; an OID cannot. A child that
+/// was dropped and recreated between sync and reconcile gets a new OID and so
+/// reads as NOT fresh — the safe direction.
+///
+/// `set_config(..., is_local => true)` scopes the value to the transaction and
+/// discards it on rollback, including rollback of the SPI subtransaction that
+/// wrote it.
+const FRESH_PARTITIONS_GUC: &str = "pg_reflex.fresh_partition_oids";
+
+fn record_fresh_partitions(client: &mut pgrx::spi::SpiClient<'_>, child_quals: &[String]) {
+    for qual in child_quals {
+        let _ = client.update(
+            &format!(
+                "SELECT set_config('{guc}', \
+                   concat_ws(',', NULLIF(current_setting('{guc}', true), ''), \
+                             to_regclass($1)::oid::text), true)",
+                guc = FRESH_PARTITIONS_GUC
+            ),
+            None,
+            &[unsafe { DatumWithOid::new(qual.clone(), PgBuiltInOids::TEXTOID.oid().value()) }],
+        );
+    }
+}
+
+/// True only when `child_qual` is one of the children this transaction's sync
+/// created. Any doubt — GUC unset, probe failure, unresolvable name, OID not
+/// listed — answers `false`, which routes the caller to the full DETACH/ATTACH
+/// swap. That asymmetry is deliberate: a false `true` would TRUNCATE a child
+/// holding rows that predate the transaction (silent data loss), while a false
+/// `false` only costs the slower, always-correct path.
+fn is_fresh_partition(client: &pgrx::spi::SpiClient<'_>, child_qual: &str) -> bool {
+    client
+        .select(
+            &format!(
+                "SELECT to_regclass($1)::oid::text = ANY(string_to_array( \
+                   COALESCE(current_setting('{guc}', true), ''), ',')) AS fresh",
+                guc = FRESH_PARTITIONS_GUC
+            ),
+            Some(1),
+            &[unsafe {
+                DatumWithOid::new(child_qual.to_string(), PgBuiltInOids::TEXTOID.oid().value())
+            }],
+        )
+        .ok()
+        .and_then(|mut it| it.next())
+        .and_then(|r| r.get_by_name::<bool, _>("fresh").ok().flatten())
+        .unwrap_or(false)
+}
+
 /// The two fill statements of the in-place path used when a mirror child is
 /// provably empty. Same row-producing queries and same partition-constraint
 /// filters as `build_swap_partition_ddl`'s fills — only the destination differs
@@ -1437,17 +1497,23 @@ pub(crate) fn reflex_sync_partitions_impl(view_name: &str, drop_orphans: bool) -
             // the subtree build off any live relation and holds the root at
             // ShareUpdateExclusive instead of AccessExclusive.
             let mut pending_attach: Vec<String> = Vec::new();
+            // Mirror children this sync run actually creates. They did not exist
+            // before this transaction, so nothing in them is worth preserving —
+            // see `record_fresh_partitions`.
+            let mut created_children: Vec<String> = Vec::new();
 
             for node in &nodes {
                 let int_name = intermediate_child_name(view_name, &node.bare_name);
                 let tgt_name = target_child_name(view_name, &node.bare_name);
+                let int_is_new = !existing_children.contains(&int_name);
+                let tgt_is_new = !existing_children.contains(&tgt_name);
                 let ddl =
                     build_partition_node_ddl_pair(view_name, node, anchor_root_bare, unlogged);
                 let detached =
                     build_detached_node_ddl_pair(view_name, node, anchor_root_bare, unlogged);
                 let top_level = is_top_level_node(node, anchor_root_bare);
-                let build_int_detached = top_level && !existing_children.contains(&int_name);
-                let build_tgt_detached = top_level && !existing_children.contains(&tgt_name);
+                let build_int_detached = top_level && int_is_new;
+                let build_tgt_detached = top_level && tgt_is_new;
                 if has_intermediate {
                     // Bound-collision heal (untreated_bugs/
                     // 2026-07-25_nightly_swap_target_overlap_restale.md): a
@@ -1481,6 +1547,9 @@ pub(crate) fn reflex_sync_partitions_impl(view_name: &str, drop_orphans: bool) -
                             .update(&ddl.int_ddl, None, &[])
                             .map_err(|e| format!("sync: create intermediate node: {}", e))?;
                     }
+                    if int_is_new {
+                        created_children.push(schema_prefix(view_name, &int_name));
+                    }
                     if !int_have.contains(&int_name) {
                         out.added_intermediate += 1;
                     }
@@ -1503,6 +1572,9 @@ pub(crate) fn reflex_sync_partitions_impl(view_name: &str, drop_orphans: bool) -
                         .update(&ddl.tgt_ddl, None, &[])
                         .map_err(|e| format!("sync: create target node: {}", e))?;
                 }
+                if tgt_is_new {
+                    created_children.push(schema_prefix(view_name, &tgt_name));
+                }
                 if !tgt_have.contains(&tgt_name) {
                     out.added_target += 1;
                 }
@@ -1518,6 +1590,7 @@ pub(crate) fn reflex_sync_partitions_impl(view_name: &str, drop_orphans: bool) -
                     .update(stmt, None, &[])
                     .map_err(|e| format!("sync: attach new node: {}", e))?;
             }
+            record_fresh_partitions(client, &created_children);
             refill_tree_defaults(client, drain_entries)?;
             Ok(())
         })();
@@ -2130,21 +2203,35 @@ pub(crate) fn execute_partition_swap_for_child(
         ));
     }
 
-    // A provably EMPTY mirror child has nothing to preserve, so the
-    // DETACH/ATTACH swap buys nothing and costs an `AccessExclusiveLock` on the
+    // A mirror child with nothing worth preserving does not need the
+    // DETACH/ATTACH swap, and the swap costs an `AccessExclusiveLock` on the
     // child's immediate parent — the IMV ROOT at mirror depth 1 — held to
     // commit, which freezes every reader of the IMV including readers pruning
-    // to an unrelated partition. Fill such a child in place instead: the
-    // resulting content is identical (empty + INSERT == fresh table + INSERT),
-    // and `INSERT INTO <partition child>` fires no statement-level trigger of
-    // the root, exactly like the swap's detached fill. `relation_has_rows`
-    // fails toward "non-empty", so any probe failure still takes the swap.
+    // to an unrelated partition. Two disjoint proofs qualify a child:
+    //
+    //   * it is EMPTY, so the in-place fill trivially reproduces what the swap
+    //     would have built; or
+    //   * it is FRESH — created by this transaction's sync (`is_fresh_partition`)
+    //     — in which case whatever it holds arrived after transaction start and
+    //     the swap would discard it anyway, so TRUNCATE + fill is equivalent.
+    //     The load's own IMV maintenance delta lands in a brand-new child before
+    //     the COMMIT-time reconcile reaches it, so the emptiness proof alone
+    //     misses the commonest field shape (create/attach a partition and load it
+    //     in one transaction).
+    //
+    // TRUNCATE takes `AccessExclusive` on the CHILD only — never on the parent —
+    // and fires no statement-level TRUNCATE trigger of the root, so it inherits
+    // the swap's isolation without the swap's lock. Both probes fail toward
+    // "not qualified", so any doubt still takes the swap.
     let int_child_qual_probe = schema_prefix(view_name, &int_child_bare);
     let tgt_child_qual_probe = schema_prefix(view_name, &tgt_child_bare);
     let int_is_empty = end_query.is_empty()
         || (!int_def.is_empty() && !relation_has_rows(client, &int_child_qual_probe));
     let tgt_is_empty = !tgt_def.is_empty() && !relation_has_rows(client, &tgt_child_qual_probe);
-    if int_is_empty && tgt_is_empty {
+    let int_is_fresh = end_query.is_empty()
+        || (!int_def.is_empty() && is_fresh_partition(client, &int_child_qual_probe));
+    let tgt_is_fresh = !tgt_def.is_empty() && is_fresh_partition(client, &tgt_child_qual_probe);
+    if (int_is_empty || int_is_fresh) && (tgt_is_empty || tgt_is_fresh) {
         let (fill_int, fill_tgt) = build_inplace_partition_fill(
             &int_child_qual_probe,
             &tgt_child_qual_probe,
@@ -2154,10 +2241,20 @@ pub(crate) fn execute_partition_swap_for_child(
             end_query,
         );
         if let Some(ref fill) = fill_int {
+            if !int_is_empty {
+                client
+                    .update(&format!("TRUNCATE {}", int_child_qual_probe), None, &[])
+                    .map_err(|e| format!("truncate fresh int child: {}", e))?;
+            }
             client
                 .update(fill, None, &[])
                 .map_err(|e| format!("fill empty int child in place: {}", e))?;
             let _ = client.update(&format!("ANALYZE {}", int_child_qual_probe), None, &[]);
+        }
+        if !tgt_is_empty {
+            client
+                .update(&format!("TRUNCATE {}", tgt_child_qual_probe), None, &[])
+                .map_err(|e| format!("truncate fresh tgt child: {}", e))?;
         }
         client
             .update(&fill_tgt, None, &[])
