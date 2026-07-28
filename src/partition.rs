@@ -64,7 +64,9 @@ pub(crate) const PARTITION_FLUSH_FAILURE_CAP: i32 = 5;
 struct SubTransaction {
     memory_context: pgrx::pg_sys::MemoryContext,
     resource_owner: pgrx::pg_sys::ResourceOwner,
-    open: bool,
+    /// Whether `Drop` still owes a rollback. Cleared BEFORE the FFI call, not
+    /// after — see `close`.
+    close_owed: bool,
 }
 
 impl SubTransaction {
@@ -77,7 +79,7 @@ impl SubTransaction {
             Self {
                 memory_context,
                 resource_owner,
-                open: true,
+                close_owed: true,
             }
         }
     }
@@ -93,11 +95,28 @@ impl SubTransaction {
         self.close(false);
     }
 
+    /// `close_owed` is cleared BEFORE the FFI call, and moving it after would be
+    /// a bug, not a fix. If the call were ever to raise part-way, `Drop` would
+    /// then re-enter a half-run close: `RollbackAndReleaseCurrentSubTransaction`
+    /// on a subtransaction already past `TBLOCK_SUBINPROGRESS` takes its
+    /// `elog(FATAL)` arm (`xact.c`), turning a hypothetical leak into a certain
+    /// backend kill. A close that begins must never be attempted twice.
+    ///
+    /// It is also unreachable as written. `Drop` only ever takes the rollback
+    /// direction, and `RollbackAndReleaseCurrentSubTransaction` cannot raise:
+    /// its only non-returning failure is that `elog(FATAL)`, which terminates
+    /// rather than unwinding, and `AbortSubTransaction` / `CleanupSubTransaction`
+    /// run under `HOLD_INTERRUPTS` and report state problems at WARNING. So the
+    /// "raise inside `Drop` while unwinding → abort()" hazard has no trigger.
+    /// The release direction guards on parallel mode (impossible here — the
+    /// reconcile does DDL, and `BeginInternalSubTransaction` would have refused
+    /// first) and on block state (balanced by construction now that `Drop`
+    /// closes every path), and `CommitSubTransaction` itself raises nothing.
     fn close(&mut self, commit: bool) {
-        if !self.open {
+        if !self.close_owed {
             return;
         }
-        self.open = false;
+        self.close_owed = false;
         unsafe {
             if commit {
                 pgrx::pg_sys::ReleaseCurrentSubTransaction();
