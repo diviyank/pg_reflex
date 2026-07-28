@@ -2380,7 +2380,10 @@ pub(crate) fn execute_partition_swap_for_child(
     // Both operator entry points resolve mirror LEAVES before calling here, so
     // this guard is a backstop rather than a routine path. It refuses instead of
     // raising: the caller keeps its transaction and decides what to report.
-    for (bare, what) in [(&tgt_child_bare, "target"), (&int_child_bare, "intermediate")] {
+    for (bare, what) in [
+        (&tgt_child_bare, "target"),
+        (&int_child_bare, "intermediate"),
+    ] {
         if what == "intermediate" && end_query.is_empty() {
             continue;
         }
