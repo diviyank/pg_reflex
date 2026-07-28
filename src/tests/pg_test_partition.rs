@@ -4200,6 +4200,11 @@ fn pg_part_reconcile_keeps_two_key_advisory_lock_even_when_it_fails() {
 ///
 /// `drop_old_tgt` is a `DROP TABLE` with no CASCADE, so one dependent view is
 /// enough to make the swap raise for real, mid-flight.
+///
+/// NOTE ON FAILURE MODE: when this regresses it does not print a clean assertion
+/// — the backend aborts, so the run dies with `connection closed` and every
+/// later test reports "Could not obtain test mutex". A whole-suite collapse of
+/// that shape means the `SubTransaction` `Drop` contract broke; start here.
 #[pg_test]
 fn pg_part_raised_reconcile_failure_survives_plpgsql_exception_handler() {
     Spi::run(
@@ -4245,5 +4250,124 @@ fn pg_part_raised_reconcile_failure_survives_plpgsql_exception_handler() {
     assert_imv_correct(
         "atom6v",
         "SELECT region, SUM(amount) AS total FROM atom6 GROUP BY region",
+    );
+}
+
+/// T7 — TWO nested `SubTransaction` guards unwinding together on a raise.
+///
+/// The dependent cascade re-enters `reflex_reconcile_partition` for a dependent
+/// partitioned on the same column (`src/partition.rs`, the `same_part` branch)
+/// via `client.update`, from inside the parent's still-open subtransaction AND
+/// inside the parent's live `SpiClient`. Making the NESTED swap raise is the
+/// only way to unwind two guards at once, and it is the one shape the
+/// success-path suite cannot reach.
+///
+/// The unwind has to run, in order: the nested `SpiClient` (`SPI_finish`), the
+/// nested `SubTransaction` (rollback), then the parent's pair — before the error
+/// reaches the plpgsql `EXCEPTION` handler that must roll back only its OWN
+/// subtransaction. Any guard that skips its turn leaves the handler rolling back
+/// someone else's, which aborts the backend.
+///
+/// Same failure mode as T6: a regression here kills the run rather than printing
+/// an assertion.
+#[pg_test]
+fn pg_part_nested_cascade_raise_unwinds_both_subtransactions() {
+    Spi::run("CREATE TABLE nst (id BIGINT, region TEXT NOT NULL, amount NUMERIC) PARTITION BY LIST (region)")
+        .expect("source");
+    Spi::run("CREATE TABLE nst_a PARTITION OF nst FOR VALUES IN ('A')").expect("a");
+    Spi::run("CREATE TABLE nst_b PARTITION OF nst FOR VALUES IN ('B')").expect("b");
+    Spi::run("INSERT INTO nst VALUES (1,'A',10),(2,'B',5)").expect("seed");
+
+    let parent = Spi::get_one::<String>(
+        "SELECT create_reflex_ivm('nstp', \
+           'SELECT region, SUM(amount) AS total FROM nst GROUP BY region', \
+           NULL, NULL, NULL, NULL, ARRAY['region'])",
+    )
+    .expect("parent imv")
+    .expect("parent imv result");
+    assert!(!parent.starts_with("ERROR"), "parent imv: {parent}");
+
+    // Dependent partitioned on the SAME column, so the cascade re-enters
+    // reflex_reconcile_partition rather than taking a scoped or full reconcile.
+    let dependent = Spi::get_one::<String>(
+        "SELECT create_reflex_ivm('nstd', \
+           'SELECT region, SUM(total) AS doubled FROM nstp GROUP BY region', \
+           NULL, NULL, NULL, NULL, ARRAY['region'])",
+    )
+    .expect("dependent imv")
+    .expect("dependent imv result");
+    assert!(!dependent.starts_with("ERROR"), "dependent imv: {dependent}");
+
+    let parent_children_before = partition_child_set("nstp");
+    let dependent_children_before = partition_child_set("nstd");
+
+    // Drift both levels, so "did this level's swap survive?" is answered by
+    // data. The parent goes to a value the reconcile WILL repair (to 10), and
+    // the dependent to one that satisfies the blocker below.
+    Spi::run("UPDATE nstp SET total = 77 WHERE region = 'A'").expect("drift parent");
+    Spi::run("UPDATE nstd SET doubled = 9999 WHERE region = 'A'").expect("drift dependent");
+
+    // Block the NESTED swap, on the dependent's PARENT table. It has to live
+    // there, not on the child and not as a dependent view: the dependent's own
+    // pre-sync drops and recreates that child with `DROP TABLE … CASCADE`, which
+    // silently removes any view pinned to it (and with it the blocker). A CHECK
+    // on the partitioned parent survives, is inherited by the recreated child,
+    // and is copied onto the swap table by `CREATE TABLE … (LIKE … INCLUDING
+    // ALL)` — so the swap's fill raises on the rebuilt value (10, not > 100).
+    Spi::run("ALTER TABLE nstd ADD CONSTRAINT nstd_block CHECK (region <> 'A' OR doubled > 100)")
+        .expect("blocking constraint");
+
+    let repair = Spi::get_one::<String>(
+        "SELECT public.__reflex_doctor_try_repair( \
+           $q$SELECT reflex_reconcile_partition('nstp','A')$q$)",
+    )
+    .expect("repair call")
+    .expect("repair result");
+    assert!(
+        repair.starts_with("failed:"),
+        "the nested raise must surface through the handler, got: {repair}"
+    );
+
+    // Backend alive, transaction usable — the whole point.
+    let rows = Spi::get_one::<i64>("SELECT count(*) FROM nstp")
+        .expect("post-failure query")
+        .expect("rows");
+    assert_eq!(rows, 2, "the parent IMV must still be readable");
+
+    // INNER guard: the dependent's own partial swap is gone.
+    let dependent_a = Spi::get_one::<pgrx::AnyNumeric>(
+        "SELECT doubled FROM nstd WHERE region = 'A'",
+    )
+    .expect("dependent probe")
+    .expect("dependent value");
+    assert_eq!(
+        dependent_a.to_string(),
+        "9999",
+        "the nested reconcile's subtransaction must have rolled back"
+    );
+
+    // OUTER guard: the parent's swap SUCCEEDED before the cascade raised, and
+    // must be rolled back too. This is the assertion that needs both guards to
+    // have unwound in order — the inner one first, then the outer.
+    let parent_a =
+        Spi::get_one::<pgrx::AnyNumeric>("SELECT total FROM nstp WHERE region = 'A'")
+            .expect("parent probe")
+            .expect("parent value");
+    assert_eq!(
+        parent_a.to_string(),
+        "77",
+        "the parent's already-completed swap must be rolled back by its own subtransaction \
+         when a cascaded reconcile raises"
+    );
+
+    assert_eq!(
+        partition_child_set("nstp"),
+        parent_children_before,
+        "the parent's partition set must be intact after a nested cascade raise"
+    );
+    assert_eq!(
+        partition_child_set("nstd"),
+        dependent_children_before,
+        "the dependent's partition set must be intact after a nested cascade raise"
     );
 }
