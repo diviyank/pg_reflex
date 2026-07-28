@@ -51,15 +51,21 @@
 #
 #     max_locks_per_transaction >= 2048
 #
-# A full reflex_reconcile of a partitioned IMV holds several locks per leaf
-# (source child, intermediate child, target child, and the swap tables), all to
-# end of transaction.  At the PostgreSQL default of 64 it runs out of shared
-# memory somewhere between N=100 and N=200 and the sweep loses its top point:
+# A full reflex_reconcile of a partitioned IMV holds 42N + 38 locks to end of
+# transaction (source child, intermediate child, target child, swap tables).
+# The reconcile_full metric runs its repetitions inside ONE transaction, and
+# each repetition recreates the __reflex_swap_* tables with fresh OIDs, so the
+# footprint accumulates across reps: at N=200 x 4 reps that is ~32k lock
+# entries, which exhausts the table at the PostgreSQL default of 64 and costs
+# the sweep its top point.
 #
 #     ALTER SYSTEM SET max_locks_per_transaction = 2048;   -- then restart
 #
-# This is a benchmark prerequisite, not a workaround: any deployment running
-# hundreds of partitions has to raise it for PostgreSQL's own sake.
+# A SINGLE reconcile at N=200 holds only 8038 locks and does NOT need this —
+# on an idle default-configured cluster one reconcile survives to N ~ 490.
+# That product-side ceiling is filed separately as
+# untreated_bugs/2026-07-28_full_reconcile_exhausts_max_locks_per_transaction.md;
+# the setting above is a prerequisite of THIS HARNESS, not of pg_reflex.
 #
 # Connection is taken from PSQL_BIN / PGBIN / standard libpq environment
 # variables:
