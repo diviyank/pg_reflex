@@ -239,15 +239,12 @@ fn pg_rdd_reconcile_propagates_two_levels_deep() {
     assert_imv_correct("rdd3c", c_fresh);
 }
 
-/// T4 -- regression guard for the paths that already worked.
-///
-/// (a) an UNPARTITIONED dependent of a partitioned parent, and
-/// (b) an unpartitioned parent whose dependent propagates through the
-///     `AFTER TRUNCATE ... FOR EACH STATEMENT` trigger.
-///
-/// Both were measured correct before the fix; neither may regress.
+/// T4a -- an UNPARTITIONED dependent of a PARTITIONED parent. It cannot be
+/// destroyed (nothing mirrors the swap tables into it), but the swap moves no
+/// rows, so without an explicit cascade it is left silently STALE. Measured
+/// RED at 10 oracle mismatches before the fix.
 #[pg_test]
-fn pg_rdd_unpartitioned_dependents_still_propagate() {
+fn pg_rdd_unpartitioned_dependent_of_partitioned_parent_follows() {
     build_rdd_source("rdd4s");
     create_imv(
         "rdd4p",
@@ -264,50 +261,60 @@ fn pg_rdd_unpartitioned_dependents_still_propagate() {
     assert_eq!(
         partition_child_names("rdd4d").len(),
         0,
-        "control dependent was unexpectedly partitioned"
-    );
-
-    // (b) unpartitioned parent + dependent.
-    Spi::run("CREATE TABLE rdd4u (k TEXT NOT NULL, bucket INT NOT NULL, amt NUMERIC)")
-        .expect("plain source");
-    Spi::run(
-        "INSERT INTO rdd4u (k, bucket, amt) \
-         SELECT v.k, (g % 5), (g % 97)::numeric \
-         FROM generate_series(1, 300) g CROSS JOIN (VALUES ('A'),('B'),('C')) v(k)",
-    )
-    .expect("seed plain");
-    Spi::run("ANALYZE rdd4u").expect("analyze plain");
-    create_imv(
-        "rdd4up",
-        "SELECT create_reflex_ivm('rdd4up', \
-         'SELECT k, bucket, SUM(amt) AS total FROM rdd4u GROUP BY k, bucket')",
-    );
-    create_imv(
-        "rdd4ud",
-        "SELECT create_reflex_ivm('rdd4ud', 'SELECT k, SUM(total) AS t FROM rdd4up GROUP BY k')",
+        "dependent was unexpectedly partitioned — fixture does not cover this shape"
     );
 
     let d_fresh = "SELECT bucket, SUM(total) AS t FROM \
                    (SELECT k, bucket, SUM(amt) AS total FROM rdd4s GROUP BY k, bucket) o \
                    GROUP BY bucket";
-    let ud_fresh = "SELECT k, SUM(total) AS t FROM \
-                    (SELECT k, bucket, SUM(amt) AS total FROM rdd4u GROUP BY k, bucket) o \
-                    GROUP BY k";
     assert_imv_correct("rdd4d", d_fresh);
-    assert_imv_correct("rdd4ud", ud_fresh);
 
-    Spi::run("UPDATE rdd4p SET total = total + 1").expect("drift partitioned");
-    Spi::run("UPDATE rdd4up SET total = total + 1").expect("drift plain");
-
+    Spi::run("UPDATE rdd4p SET total = total + 1").expect("drift");
     let res = Spi::get_one::<&str>("SELECT reflex_reconcile('rdd4p')")
         .expect("reconcile")
         .expect("res");
     assert_eq!(res, "RECONCILED");
-    let res_u = Spi::get_one::<&str>("SELECT reflex_reconcile('rdd4up')")
-        .expect("reconcile")
-        .expect("res");
-    assert_eq!(res_u, "RECONCILED");
 
     assert_imv_correct("rdd4d", d_fresh);
-    assert_imv_correct("rdd4ud", ud_fresh);
+}
+
+/// T4b -- the genuine regression control: an UNPARTITIONED parent, whose
+/// dependent propagates through the `AFTER TRUNCATE ... FOR EACH STATEMENT`
+/// trigger plus the refill INSERT. Measured working before the fix; must not
+/// regress.
+#[pg_test]
+fn pg_rdd_unpartitioned_parent_still_propagates() {
+    Spi::run("CREATE TABLE rdd5u (k TEXT NOT NULL, bucket INT NOT NULL, amt NUMERIC)")
+        .expect("plain source");
+    Spi::run(
+        "INSERT INTO rdd5u (k, bucket, amt) \
+         SELECT v.k, (g % 5), (g % 97)::numeric \
+         FROM generate_series(1, 300) g CROSS JOIN (VALUES ('A'),('B'),('C')) v(k)",
+    )
+    .expect("seed plain");
+    Spi::run("ANALYZE rdd5u").expect("analyze plain");
+    create_imv(
+        "rdd5p",
+        "SELECT create_reflex_ivm('rdd5p', \
+         'SELECT k, bucket, SUM(amt) AS total FROM rdd5u GROUP BY k, bucket')",
+    );
+    create_imv(
+        "rdd5d",
+        "SELECT create_reflex_ivm('rdd5d', 'SELECT k, SUM(total) AS t FROM rdd5p GROUP BY k')",
+    );
+
+    let d_fresh = "SELECT k, SUM(total) AS t FROM \
+                   (SELECT k, bucket, SUM(amt) AS total FROM rdd5u GROUP BY k, bucket) o \
+                   GROUP BY k";
+    assert_imv_correct("rdd5d", d_fresh);
+    let rows = dep_row_count("rdd5d");
+
+    Spi::run("UPDATE rdd5p SET total = total + 1").expect("drift");
+    let res = Spi::get_one::<&str>("SELECT reflex_reconcile('rdd5p')")
+        .expect("reconcile")
+        .expect("res");
+    assert_eq!(res, "RECONCILED");
+
+    assert_eq!(dep_row_count("rdd5d"), rows, "unpartitioned control lost rows");
+    assert_imv_correct("rdd5d", d_fresh);
 }
