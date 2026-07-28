@@ -520,3 +520,122 @@ fn pg_subpart_reconcile_repairs_an_already_flattened_mirror() {
     );
     assert_imv_correct("dl8v", fresh);
 }
+
+// The two queries operators are given to find affected IMVs on an unfixed
+// build. They are asserted here verbatim so what is published is what was
+// measured, not an inference from the registry schema.
+
+/// Mirrors deeper than one level: on an affected build a `reflex_reconcile`
+/// flattens these, and the next partition sync then empties them.
+const EXPOSED_SHAPED_QUERY: &str = "SELECT DISTINCT r.name \
+     FROM public.__reflex_ivm_reference r \
+     JOIN pg_inherits i ON i.inhparent = to_regclass(r.name) \
+     JOIN pg_class c ON c.oid = i.inhrelid \
+     WHERE r.enabled AND c.relkind = 'p'";
+
+/// Mirrors the registry says should be deeper than one level but which are
+/// flat: already flattened. Data is still correct; the next sync empties them.
+const EXPOSED_FLATTENED_QUERY: &str = "SELECT r.name \
+     FROM public.__reflex_ivm_reference r \
+     WHERE r.enabled \
+       AND COALESCE(r.partition_depth, 0) >= 2 \
+       AND NOT EXISTS (SELECT 1 FROM pg_inherits i \
+                       JOIN pg_class c ON c.oid = i.inhrelid \
+                       WHERE i.inhparent = to_regclass(r.name) AND c.relkind = 'p')";
+
+fn query_matches(sql: &str, name: &str) -> bool {
+    Spi::get_one::<bool>(&format!(
+        "SELECT EXISTS(SELECT 1 FROM ({}) q WHERE q.name = '{}')",
+        sql, name
+    ))
+    .expect("exposure query failed")
+    .expect("exposure query returned NULL")
+}
+
+/// The published exposure criteria, checked in both directions against real
+/// IMVs: a depth-2 mirror must be reported, a depth-1 mirror must NOT be, and
+/// a flattened mirror must move from the first query to the second.
+#[pg_test]
+fn pg_subpart_exposure_detection_queries_are_accurate() {
+    build_depth2_fixture("dl9s", "dl9v");
+
+    // A depth-1 control that must never be reported by either query.
+    Spi::run("CREATE TABLE dl9x (k TEXT NOT NULL, id BIGINT) PARTITION BY LIST (k)").expect("root");
+    Spi::run("CREATE TABLE dl9x_a PARTITION OF dl9x FOR VALUES IN ('A')").expect("a");
+    Spi::run("INSERT INTO dl9x SELECT 'A', g FROM generate_series(1, 20) g").expect("seed");
+    Spi::get_one::<String>(
+        "SELECT create_reflex_ivm('dl9xv', 'SELECT k, id FROM dl9x', 'k,id', \
+         NULL, NULL, NULL, ARRAY['k'])",
+    )
+    .expect("c")
+    .expect("c");
+
+    assert!(
+        query_matches(EXPOSED_SHAPED_QUERY, "dl9v"),
+        "the depth-2 exposure query missed a depth-2 mirror"
+    );
+    assert!(
+        !query_matches(EXPOSED_SHAPED_QUERY, "dl9xv"),
+        "the depth-2 exposure query falsely reported a depth-1 mirror"
+    );
+    assert!(
+        !query_matches(EXPOSED_FLATTENED_QUERY, "dl9v"),
+        "an intact depth-2 mirror must not be reported as already flattened"
+    );
+    assert!(
+        !query_matches(EXPOSED_FLATTENED_QUERY, "dl9xv"),
+        "a depth-1 mirror must never be reported as already flattened"
+    );
+
+    // Flatten it the way the old swap did, then re-check both queries.
+    for br in ["a", "b"] {
+        Spi::run(&format!(
+            "CREATE UNLOGGED TABLE dl9v_swap_{br} (LIKE dl9v_dl9s_{br} INCLUDING ALL)"
+        ))
+        .expect("swap table");
+        Spi::run(&format!(
+            "INSERT INTO dl9v_swap_{br} SELECT * FROM dl9v_dl9s_{br}"
+        ))
+        .expect("fill swap");
+        Spi::run(&format!("ALTER TABLE dl9v DETACH PARTITION dl9v_dl9s_{br}")).expect("detach");
+        Spi::run(&format!(
+            "ALTER TABLE dl9v ATTACH PARTITION dl9v_swap_{br} FOR VALUES IN ('{up}')",
+            up = br.to_uppercase()
+        ))
+        .expect("attach");
+        Spi::run(&format!("DROP TABLE dl9v_dl9s_{br}")).expect("drop old");
+        Spi::run(&format!(
+            "ALTER TABLE dl9v_swap_{br} RENAME TO dl9v_dl9s_{br}"
+        ))
+        .expect("rename");
+    }
+
+    assert!(
+        !query_matches(EXPOSED_SHAPED_QUERY, "dl9v"),
+        "a flattened mirror has no partitioned children and must drop out of the first query"
+    );
+    assert!(
+        query_matches(EXPOSED_FLATTENED_QUERY, "dl9v"),
+        "the already-flattened query missed a mirror that lost a level"
+    );
+    assert!(
+        !query_matches(EXPOSED_FLATTENED_QUERY, "dl9xv"),
+        "the already-flattened query falsely reported a legitimately depth-1 mirror"
+    );
+
+    // And the remedy converges: after the repair it is neither flattened nor
+    // reported as such.
+    let res = Spi::get_one::<&str>("SELECT reflex_reconcile('dl9v')")
+        .expect("rec")
+        .expect("res");
+    assert_eq!(res, "RECONCILED");
+    assert!(
+        !query_matches(EXPOSED_FLATTENED_QUERY, "dl9v"),
+        "reflex_reconcile did not clear the already-flattened finding"
+    );
+    assert!(
+        query_matches(EXPOSED_SHAPED_QUERY, "dl9v"),
+        "reflex_reconcile did not restore the depth-2 shape"
+    );
+    assert_imv_correct("dl9v", "SELECT k, d, id, amt FROM dl9s");
+}
