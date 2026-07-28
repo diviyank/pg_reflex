@@ -1,28 +1,45 @@
-// Attaching a NEW source partition must never take AccessExclusive on the live
-// IMV root: readers of the IMV — including readers pruning to a completely
+// Adding a source partition must never take AccessExclusive on the live IMV
+// root: readers of the IMV — including readers pruning to a completely
 // unrelated partition — must stay unblocked for the whole transaction (the
 // inline `ddl_command_end` sync AND the COMMIT-time reconcile it precedes).
 //
 // A `#[pg_test]` body is one transaction that is rolled back, which cannot host
 // this scenario: the IMV root would be created by the very transaction under
 // test (so it already holds AccessExclusive on it from the CREATE, masking the
-// lock under test), and nothing it does is visible to a second session. Both
-// lock tests therefore drive a REMOTE `dblink` session: it builds the fixture,
-// opens a transaction, attaches the source partition, and commits — while this
-// session observes `pg_locks` and reads the IMV with a `lock_timeout`. The
-// remote session drops its fixture after COMMIT, so nothing is left behind.
+// lock under test), and nothing it does is visible to a second session. These
+// tests therefore drive a REMOTE `dblink` session: it builds the fixture, opens
+// a transaction, changes the source partition set, and commits — while this
+// session observes `pg_locks` and reads the IMV with a `lock_timeout`.
+//
+// The remote fixture lives in its OWN database. It has to: it is committed, and
+// these are the only tests in the suite that commit global state, so a fixture
+// in the shared test database perturbs any test that takes a cluster-wide
+// census of artifact relations (`drop_deferred_imv_wipes_every_nonmaintenance_table`
+// does exactly that) whenever the two run concurrently.
 
 fn sql_lit(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
 }
 
-fn dblink_conninfo() -> String {
+fn current_db_conninfo() -> String {
     Spi::get_one::<String>(
         "SELECT 'host=' || split_part(current_setting('unix_socket_directories'), ',', 1) \
               || ' port=' || current_setting('port') \
               || ' dbname=' || current_database() \
               || ' user=' || current_user",
     )
+    .expect("admin conninfo")
+    .expect("admin conninfo NULL")
+}
+
+fn conninfo_for(dbname: &str) -> String {
+    Spi::get_one::<String>(&format!(
+        "SELECT 'host=' || split_part(current_setting('unix_socket_directories'), ',', 1) \
+              || ' port=' || current_setting('port') \
+              || ' dbname=' || {} \
+              || ' user=' || current_user",
+        sql_lit(dbname)
+    ))
     .expect("conninfo query")
     .expect("conninfo NULL")
 }
@@ -31,19 +48,15 @@ fn setup_dblink() {
     Spi::run("CREATE EXTENSION IF NOT EXISTS dblink").expect("dblink extension");
 }
 
-/// Open the named remote worker session that plays the role of the application
-/// backend doing the partition add.
-fn worker_connect() {
+/// Run a statement in a throwaway session on the CURRENT database — used for
+/// `CREATE DATABASE` / `DROP DATABASE`, which cannot run in a transaction block.
+fn admin_exec(sql: &str) {
     Spi::get_one::<String>(&format!(
-        "SELECT dblink_connect('reflex_lock_worker', {})",
-        sql_lit(&dblink_conninfo())
+        "SELECT dblink_exec({}, {})",
+        sql_lit(&current_db_conninfo()),
+        sql_lit(sql)
     ))
-    .expect("worker connect")
-    .expect("worker connect NULL");
-}
-
-fn worker_disconnect() {
-    let _ = Spi::get_one::<String>("SELECT dblink_disconnect('reflex_lock_worker')");
+    .unwrap_or_else(|e| panic!("admin_exec failed for <{}>: {}", sql, e));
 }
 
 /// Run a statement (or `;`-separated batch returning no rows) on the worker.
@@ -55,10 +68,33 @@ fn worker_exec(sql: &str) {
     .unwrap_or_else(|e| panic!("worker_exec failed for <{}>: {}", sql, e));
 }
 
-fn relation_oid(rel: &str) -> i64 {
-    Spi::get_one::<i64>(&format!("SELECT to_regclass({})::oid::int8", sql_lit(rel)))
-        .expect("oid query")
-        .expect("oid NULL")
+/// Create a private database for one lock test and open the worker session on
+/// it. Idempotent: a leftover from an aborted run is dropped first.
+fn probe_db_open(dbname: &str) {
+    setup_dblink();
+    admin_exec(&format!("DROP DATABASE IF EXISTS {} WITH (FORCE)", dbname));
+    admin_exec(&format!("CREATE DATABASE {}", dbname));
+    Spi::get_one::<String>(&format!(
+        "SELECT dblink_connect('reflex_lock_worker', {})",
+        sql_lit(&conninfo_for(dbname))
+    ))
+    .expect("worker connect")
+    .expect("worker connect NULL");
+    worker_exec("CREATE EXTENSION pg_reflex");
+}
+
+fn probe_db_close(dbname: &str) {
+    let _ = Spi::get_one::<String>("SELECT dblink_disconnect('reflex_lock_worker')");
+    admin_exec(&format!("DROP DATABASE IF EXISTS {} WITH (FORCE)", dbname));
+}
+
+fn worker_scalar_i64(query: &str) -> i64 {
+    Spi::get_one::<i64>(&format!(
+        "SELECT c FROM dblink('reflex_lock_worker', {}) AS t(c bigint)",
+        sql_lit(query)
+    ))
+    .expect("worker scalar")
+    .expect("worker scalar NULL")
 }
 
 fn worker_pid() -> i32 {
@@ -69,7 +105,13 @@ fn worker_pid() -> i32 {
     .expect("worker pid NULL")
 }
 
-/// Lock modes the worker backend currently holds on `rel`.
+/// Resolve a relation OID inside the probe database — OIDs are per-database and
+/// `pg_locks` reports them raw.
+fn worker_relation_oid(rel: &str) -> i64 {
+    worker_scalar_i64(&format!("SELECT to_regclass({})::oid::int8", sql_lit(rel)))
+}
+
+/// Lock modes the worker backend currently holds on the relation.
 fn worker_lock_modes(rel_oid: i64, pid: i32) -> Vec<String> {
     Spi::get_one::<String>(&format!(
         "SELECT COALESCE(string_agg(mode, ',' ORDER BY mode), '') FROM pg_locks \
@@ -85,16 +127,17 @@ fn worker_lock_modes(rel_oid: i64, pid: i32) -> Vec<String> {
     .collect()
 }
 
-/// Read `query` from a THROWAWAY session with `lock_timeout = 2s`, returning
-/// -1 when the read blocked — the freeze under test.
+/// Read `query` from a THROWAWAY session on the probe database with
+/// `lock_timeout = 2s`, returning -1 when the read blocked — the freeze under
+/// test.
 ///
-/// The reader must not be this session: a `SELECT` here would hold
-/// `AccessShareLock` on the IMV for the rest of the test transaction, and the
-/// worker's fixture `DROP TABLE` would then deadlock against it. `dblink` with
-/// an inline conninfo opens and closes its connection per call, so it leaves no
-/// lock behind. The plpgsql EXCEPTION block confines the lock-timeout error to
-/// a subtransaction so the test reports it instead of aborting.
-fn read_with_lock_timeout(query: &str) -> i64 {
+/// The reader must be neither this session nor the worker: a `SELECT` here
+/// would hold `AccessShareLock` for the rest of the test transaction and the
+/// worker's teardown would deadlock against it. `dblink` with an inline
+/// conninfo opens and closes its connection per call, so it leaves no lock
+/// behind. The plpgsql EXCEPTION block confines the lock-timeout error to a
+/// subtransaction so the test reports it instead of aborting.
+fn read_with_lock_timeout(dbname: &str, query: &str) -> i64 {
     Spi::run(
         "CREATE OR REPLACE FUNCTION pg_temp.__reflex_timed_read(conn text, q text) \
          RETURNS bigint LANGUAGE plpgsql AS $fn$ \
@@ -106,7 +149,7 @@ fn read_with_lock_timeout(query: &str) -> i64 {
          END $fn$",
     )
     .expect("timed read function");
-    let conn = format!("{} options=-c\\ lock_timeout=2000", dblink_conninfo());
+    let conn = format!("{} options=-c\\ lock_timeout=2000", conninfo_for(dbname));
     Spi::get_one::<i64>(&format!(
         "SELECT pg_temp.__reflex_timed_read({}, {})",
         sql_lit(&conn),
@@ -139,8 +182,8 @@ fn assert_root_lock_shape(modes: &[String], what: &str) {
 
 #[pg_test]
 fn attach_new_partition_never_locks_imv_root_depth2() {
-    setup_dblink();
-    worker_connect();
+    const DBNAME: &str = "reflex_lockprobe_la2";
+    probe_db_open(DBNAME);
     worker_exec(
         "CREATE TABLE la2_src (k INT NOT NULL, d DATE NOT NULL, v INT) PARTITION BY LIST (k); \
          CREATE TABLE la2_src_1 PARTITION OF la2_src FOR VALUES IN (1) PARTITION BY RANGE (d); \
@@ -167,9 +210,9 @@ fn attach_new_partition_never_locks_imv_root_depth2() {
          INSERT INTO la2_src_5 SELECT 5, '2025-03-10'::date, g FROM generate_series(1, 400) g",
     );
     let pid = worker_pid();
-    let imv_oid = relation_oid("la2_imv");
+    let imv_oid = worker_relation_oid("la2_imv");
 
-    let baseline = read_with_lock_timeout("SELECT count(*) FROM la2_imv WHERE k = 1");
+    let baseline = read_with_lock_timeout(DBNAME, "SELECT count(*) FROM la2_imv WHERE k = 1");
 
     worker_exec("BEGIN");
     worker_exec("ALTER TABLE la2_src ATTACH PARTITION la2_src_5 FOR VALUES IN (5)");
@@ -177,17 +220,17 @@ fn attach_new_partition_never_locks_imv_root_depth2() {
     // Mid-transaction: the inline ddl_command_end sync has run and every lock it
     // took is held until the worker commits.
     let modes = worker_lock_modes(imv_oid, pid);
-    let during1 = read_with_lock_timeout("SELECT count(*) FROM la2_imv WHERE k = 1");
-    let during2 = read_with_lock_timeout("SELECT count(*) FROM la2_imv WHERE k = 1");
-    let during3 = read_with_lock_timeout("SELECT count(*) FROM la2_imv");
+    let during1 = read_with_lock_timeout(DBNAME, "SELECT count(*) FROM la2_imv WHERE k = 1");
+    let during2 = read_with_lock_timeout(DBNAME, "SELECT count(*) FROM la2_imv WHERE k = 1");
+    let during3 = read_with_lock_timeout(DBNAME, "SELECT count(*) FROM la2_imv");
 
     worker_exec("COMMIT");
-    let after = read_with_lock_timeout("SELECT count(*) FROM la2_imv WHERE k = 5");
+    let after = read_with_lock_timeout(DBNAME, "SELECT count(*) FROM la2_imv WHERE k = 5");
     worker_exec(
         "DROP TABLE IF EXISTS la2_src CASCADE; DROP TABLE IF EXISTS la2_imv CASCADE; \
          DELETE FROM public.__reflex_ivm_reference WHERE name = 'la2_imv'",
     );
-    worker_disconnect();
+    probe_db_close(DBNAME);
 
     assert_eq!(baseline, 1000, "baseline reader could not read the IMV");
     assert_eq!(
@@ -211,8 +254,8 @@ fn attach_new_partition_never_locks_imv_root_depth2() {
 
 #[pg_test]
 fn attach_new_partition_never_locks_imv_root_depth1() {
-    setup_dblink();
-    worker_connect();
+    const DBNAME: &str = "reflex_lockprobe_la1";
+    probe_db_open(DBNAME);
     worker_exec(
         "CREATE TABLE la1_src (k INT NOT NULL, v INT) PARTITION BY LIST (k); \
          CREATE TABLE la1_src_1 PARTITION OF la1_src FOR VALUES IN (1); \
@@ -225,29 +268,29 @@ fn attach_new_partition_never_locks_imv_root_depth1() {
          INSERT INTO la1_src_5 SELECT 5, g FROM generate_series(1, 900) g",
     );
     let pid = worker_pid();
-    let imv_oid = relation_oid("la1_imv");
+    let imv_oid = worker_relation_oid("la1_imv");
 
-    let baseline = read_with_lock_timeout("SELECT count(*) FROM la1_imv WHERE k = 1");
+    let baseline = read_with_lock_timeout(DBNAME, "SELECT count(*) FROM la1_imv WHERE k = 1");
 
     worker_exec("BEGIN");
     worker_exec("ALTER TABLE la1_src ATTACH PARTITION la1_src_5 FOR VALUES IN (5)");
     let modes_after_sync = worker_lock_modes(imv_oid, pid);
-    let during1 = read_with_lock_timeout("SELECT count(*) FROM la1_imv WHERE k = 1");
+    let during1 = read_with_lock_timeout(DBNAME, "SELECT count(*) FROM la1_imv WHERE k = 1");
 
     // Drain the deferred COMMIT-time flush WITHOUT ending the transaction, so
     // the locks the reconcile takes are still observable.
     worker_exec("SET CONSTRAINTS ALL IMMEDIATE");
     let modes_after_reconcile = worker_lock_modes(imv_oid, pid);
-    let during2 = read_with_lock_timeout("SELECT count(*) FROM la1_imv WHERE k = 1");
-    let during3 = read_with_lock_timeout("SELECT count(*) FROM la1_imv WHERE k = 1");
+    let during2 = read_with_lock_timeout(DBNAME, "SELECT count(*) FROM la1_imv WHERE k = 1");
+    let during3 = read_with_lock_timeout(DBNAME, "SELECT count(*) FROM la1_imv WHERE k = 1");
 
     worker_exec("COMMIT");
-    let after = read_with_lock_timeout("SELECT count(*) FROM la1_imv WHERE k = 5");
+    let after = read_with_lock_timeout(DBNAME, "SELECT count(*) FROM la1_imv WHERE k = 5");
     worker_exec(
         "DROP TABLE IF EXISTS la1_src CASCADE; DROP TABLE IF EXISTS la1_imv CASCADE; \
          DELETE FROM public.__reflex_ivm_reference WHERE name = 'la1_imv'",
     );
-    worker_disconnect();
+    probe_db_close(DBNAME);
 
     assert_eq!(baseline, 500, "baseline reader could not read the IMV");
     assert_eq!(
@@ -452,8 +495,8 @@ fn attach_new_partition_absorbing_default_rows_stays_correct() {
 
 #[pg_test]
 fn create_and_load_partition_never_locks_imv_root_depth1() {
-    setup_dblink();
-    worker_connect();
+    const DBNAME: &str = "reflex_lockprobe_lz";
+    probe_db_open(DBNAME);
     worker_exec(
         "CREATE TABLE lz_src (k INT NOT NULL, v INT) PARTITION BY LIST (k); \
          CREATE TABLE lz_src_1 PARTITION OF lz_src FOR VALUES IN (1); \
@@ -462,9 +505,9 @@ fn create_and_load_partition_never_locks_imv_root_depth1() {
              'k,v', NULL, NULL, NULL, ARRAY['k']); END $mk$",
     );
     let pid = worker_pid();
-    let imv_oid = relation_oid("lz_imv");
+    let imv_oid = worker_relation_oid("lz_imv");
 
-    let baseline = read_with_lock_timeout("SELECT count(*) FROM lz_imv WHERE k = 1");
+    let baseline = read_with_lock_timeout(DBNAME, "SELECT count(*) FROM lz_imv WHERE k = 1");
 
     worker_exec("BEGIN");
     worker_exec("CREATE TABLE lz_src_5 PARTITION OF lz_src FOR VALUES IN (5)");
@@ -472,16 +515,16 @@ fn create_and_load_partition_never_locks_imv_root_depth1() {
 
     worker_exec("INSERT INTO lz_src SELECT 5, g FROM generate_series(1, 900) g");
     let modes_after_load = worker_lock_modes(imv_oid, pid);
-    let during1 = read_with_lock_timeout("SELECT count(*) FROM lz_imv WHERE k = 1");
+    let during1 = read_with_lock_timeout(DBNAME, "SELECT count(*) FROM lz_imv WHERE k = 1");
 
     worker_exec("SET CONSTRAINTS ALL IMMEDIATE");
     let modes_after_reconcile = worker_lock_modes(imv_oid, pid);
-    let during2 = read_with_lock_timeout("SELECT count(*) FROM lz_imv WHERE k = 1");
-    let during3 = read_with_lock_timeout("SELECT count(*) FROM lz_imv");
+    let during2 = read_with_lock_timeout(DBNAME, "SELECT count(*) FROM lz_imv WHERE k = 1");
+    let during3 = read_with_lock_timeout(DBNAME, "SELECT count(*) FROM lz_imv");
 
     worker_exec("COMMIT");
-    let new_rows = read_with_lock_timeout("SELECT count(*) FROM lz_imv WHERE k = 5");
-    let mismatches = read_with_lock_timeout(
+    let new_rows = read_with_lock_timeout(DBNAME, "SELECT count(*) FROM lz_imv WHERE k = 5");
+    let mismatches = read_with_lock_timeout(DBNAME, 
         "SELECT count(*) FROM ((SELECT * FROM lz_imv EXCEPT ALL SELECT k, v FROM lz_src) \
          UNION ALL (SELECT k, v FROM lz_src EXCEPT ALL SELECT * FROM lz_imv)) o",
     );
@@ -489,7 +532,7 @@ fn create_and_load_partition_never_locks_imv_root_depth1() {
         "DROP TABLE IF EXISTS lz_src CASCADE; DROP TABLE IF EXISTS lz_imv CASCADE; \
          DELETE FROM public.__reflex_ivm_reference WHERE name = 'lz_imv'",
     );
-    worker_disconnect();
+    probe_db_close(DBNAME);
 
     assert_eq!(baseline, 500, "baseline reader could not read the IMV");
     assert_eq!(
@@ -515,8 +558,8 @@ fn create_and_load_partition_never_locks_imv_root_depth1() {
 
 #[pg_test]
 fn attach_then_load_partition_never_locks_imv_root_depth2() {
-    setup_dblink();
-    worker_connect();
+    const DBNAME: &str = "reflex_lockprobe_ly";
+    probe_db_open(DBNAME);
     worker_exec(
         "CREATE TABLE ly_src (k INT NOT NULL, d DATE NOT NULL, v INT) PARTITION BY LIST (k); \
          CREATE TABLE ly_src_1 PARTITION OF ly_src FOR VALUES IN (1) PARTITION BY RANGE (d); \
@@ -535,23 +578,23 @@ fn attach_then_load_partition_never_locks_imv_root_depth2() {
          INSERT INTO ly_src_5 SELECT 5, '2025-01-10'::date, g FROM generate_series(1, 400) g",
     );
     let pid = worker_pid();
-    let imv_oid = relation_oid("ly_imv");
+    let imv_oid = worker_relation_oid("ly_imv");
 
-    let baseline = read_with_lock_timeout("SELECT count(*) FROM ly_imv WHERE k = 1");
+    let baseline = read_with_lock_timeout(DBNAME, "SELECT count(*) FROM ly_imv WHERE k = 1");
 
     worker_exec("BEGIN");
     worker_exec("ALTER TABLE ly_src ATTACH PARTITION ly_src_5 FOR VALUES IN (5)");
     worker_exec("INSERT INTO ly_src SELECT 5, '2025-02-10'::date, g FROM generate_series(1, 300) g");
     let modes_after_load = worker_lock_modes(imv_oid, pid);
-    let during1 = read_with_lock_timeout("SELECT count(*) FROM ly_imv WHERE k = 1");
+    let during1 = read_with_lock_timeout(DBNAME, "SELECT count(*) FROM ly_imv WHERE k = 1");
 
     worker_exec("SET CONSTRAINTS ALL IMMEDIATE");
     let modes_after_reconcile = worker_lock_modes(imv_oid, pid);
-    let during2 = read_with_lock_timeout("SELECT count(*) FROM ly_imv WHERE k = 1");
+    let during2 = read_with_lock_timeout(DBNAME, "SELECT count(*) FROM ly_imv WHERE k = 1");
 
     worker_exec("COMMIT");
-    let new_rows = read_with_lock_timeout("SELECT count(*) FROM ly_imv WHERE k = 5");
-    let mismatches = read_with_lock_timeout(
+    let new_rows = read_with_lock_timeout(DBNAME, "SELECT count(*) FROM ly_imv WHERE k = 5");
+    let mismatches = read_with_lock_timeout(DBNAME, 
         "SELECT count(*) FROM ((SELECT * FROM ly_imv EXCEPT ALL SELECT k, d, v FROM ly_src) \
          UNION ALL (SELECT k, d, v FROM ly_src EXCEPT ALL SELECT * FROM ly_imv)) o",
     );
@@ -559,7 +602,7 @@ fn attach_then_load_partition_never_locks_imv_root_depth2() {
         "DROP TABLE IF EXISTS ly_src CASCADE; DROP TABLE IF EXISTS ly_imv CASCADE; \
          DELETE FROM public.__reflex_ivm_reference WHERE name = 'ly_imv'",
     );
-    worker_disconnect();
+    probe_db_close(DBNAME);
 
     assert_eq!(baseline, 500, "baseline reader could not read the IMV");
     assert_eq!(
