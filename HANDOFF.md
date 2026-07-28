@@ -45,14 +45,24 @@ the default it dies with `out of shared memory` between N=100 and N=200.
 - `benchmarks/bench_partition_subxid.sql`  — subtransaction-XID consumption of
   a multi-root flush (the PGPROC_MAX_CACHED_SUBXIDS = 64 cliff)
 - `benchmarks/bench_partition_scaling.sh`  — sweeps N, fresh DB per point,
-  prints log-log slope + successive-N ratios + ms/N + a CV noise column
+  prints log-log slope + growth + successive-N ratios + ms/N + a noise column
+- `benchmarks/build_at_commit.sh`          — attributable per-commit build
 
 Run:
 
 ```
+./benchmarks/build_at_commit.sh <commit>
 PGBIN=/opt/homebrew/opt/postgresql@17/bin \
-  ./benchmarks/bench_partition_scaling.sh --label $(git rev-parse --short HEAD)
+  ./benchmarks/bench_partition_scaling.sh --label <commit>
+./benchmarks/bench_partition_scaling.sh --compare <baseline> <candidate>
 ```
+
+**`build_at_commit.sh` exists because `cargo pgrx install` silently lied.**
+`git archive` stamps extracted files with the commit time, which is older than
+the artifact already in `CARGO_TARGET_DIR`; cargo judged the crate fresh and
+reinstalled the PREVIOUS commit's `.so` while reporting success. Caught only
+because the integration/s1-batch build produced a `.so` byte-identical to the
+baseline. Any run made that way would have been attributed to the wrong commit.
 
 ## Design decisions worth keeping
 
@@ -73,17 +83,67 @@ PGBIN=/opt/homebrew/opt/postgresql@17/bin \
   of the 1.11.1 regression (unprunable membership predicate → every leaf
   scanned on every flush), and those two metrics must be FLAT in N.
 
-## Status
+## Status — complete
 
-- [x] harness written and smoke-tested on homebrew PG17
-- [ ] sweep on 2f8b786 (main, pre-batch baseline)
-- [ ] sweep on integration/s1-batch
-- [ ] sweep on fix/swap-flattens-subpartitioned-child (689ab95)
-- [ ] 1.11.1 acceptance check — build **`b56142a`**, which is `4e4c825^`, i.e.
-      the tree as 1.11.1 shipped, immediately before `fix: gate the cold DELETE
-      in the passthrough partition dispatch`. If the benchmark is a real guard,
-      `flush_deferred` / `flush_txn` must go from FLAT to linear in N there.
-- [ ] verdicts + any regression report in untreated_bugs/
+- [x] harness written, smoke-tested on homebrew PG17
+- [x] sweep on 2f8b786 (main, pre-batch baseline) — `.so` sha `f03056eb23a8b2e8`
+- [x] sweep on integration/s1-batch 5f02066 — `.so` sha `ea23909e7b34c36d`
+- [x] sweep on fix/swap-flattens-subpartitioned-child 689ab95 — `.so` sha `6169fdf54e7227d2`
+- [x] 1.11.1 acceptance check on `b56142a` (= `4e4c825^`, the tree as 1.11.1
+      shipped) — `.so` sha `b2645144cb022b13`
+- [x] `untreated_bugs/2026-07-25_partition_swap_orphan_probe_quadratic.md`
+      updated with the measurement it was missing
+
+Rendered tables for all four builds: `benchmarks/results_partition_scaling_2026-07-28.txt`.
+Raw per-rep data: `benchmarks/results_partition_scaling_<label>.tsv`.
+
+## Findings
+
+**No timing regression from the batch.** At every N, `integration/s1-batch` and
+the tip are equal to or slightly faster than the 2f8b786 baseline on every
+timed metric. None of the suspected per-child additions (the `relkind` probe,
+`truncate_partition_tree`, the fresh-partition-OID GUC) is measurable at
+N ≤ 200. The GUC membership test is quadratic in principle — an O(N) string
+parsed once per child — but the string is ~6 bytes per OID, so at N=200 it is
+~1.2 kB and invisible.
+
+**One real regression, already filed elsewhere.** Subtransaction-XID
+consumption per multi-root flush doubled:
+
+| build | XIDs per pending root | roots before the 64-subxid overflow |
+|---|---:|---:|
+| 2f8b786 baseline | 1.04 – 1.26 | ~58 |
+| integration/s1-batch | 2.01 – 2.10 | ~31 |
+| tip 689ab95 | 2.01 – 2.17 | ~31 |
+
+This independently confirms, on PostgreSQL 17.7, the report filed on the tip
+branch as `untreated_bugs/2026-07-28_reconcile_subtransaction_doubles_flush_subxid_consumption.md`
+(commit `bb338d1`), which measured the same doubling on pg16 and predicted the
+threshold moving from 65 to 33 roots. **Not duplicated here** — one report per
+issue. The integrator should fold these numbers into that report.
+
+**Pre-existing, not from this batch:** `reflex_sync_partitions` is quadratic in
+N (local slope 1.97 over N=100→200) on all three builds, and every path that
+pre-syncs inherits it. Measurement written into the existing report.
+
+**Operational:** a full `reflex_reconcile` of a partitioned IMV holds
+`42N + 38` locks to end of transaction, so at PostgreSQL's default
+`max_locks_per_transaction = 64` it fails with `out of shared memory` somewhere
+between N=100 and N=200. Baseline was `40N + 38`; the batch adds 2 locks per
+child. Linear, and only relevant to sizing the setting.
+
+## Methodology notes worth keeping
+
+- The headline statistic is the **median**, not the minimum. The 1.11.1
+  regression is a shift in the distribution, not in the floor: an unprunable
+  predicate still gets a pruning custom plan for the first few executions. At
+  N=200 min showed 14.0 vs 4.5 ms while median showed 53.2 vs 4.9 ms.
+- A fitted log-log slope alone is not sufficient. A curve flat at small N that
+  climbs later fits a low slope (0.59 for that regression). The verdict
+  therefore also requires growth at the largest N to stay under 1.6x before
+  calling a row FLAT.
+- Growth is anchored at the largest N, not at max/min: one noisy mid-sweep
+  point otherwise vetoes FLAT on builds that are flat.
 
 Commits under test (build the .so from each, reinstall, re-run):
 
