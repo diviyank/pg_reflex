@@ -4007,35 +4007,105 @@ fn pg_part_successful_reconcile_still_commits_and_stays_correct() {
     );
 }
 
-/// T4 — the batch path (`skip_sync => true`, what `reflex_flush_partitions`
-/// drives per root) is untouched: it still reconciles correctly, and it does
-/// NOT open a subtransaction of its own. The flush already wraps every root's
-/// statements in a plpgsql `EXCEPTION` block — itself a subtransaction — so a
-/// per-leaf savepoint here would be pure overhead.
+/// T4 — the batch path (`skip_sync => true`, the shape `reflex_flush_partitions`
+/// dispatches per root) gets the SAME rollback. `skip_sync` skips the O(tree)
+/// prep, never the isolation.
+///
+/// The flush wraps its statements in a plpgsql `EXCEPTION` block, which is a
+/// subtransaction — but one that only rolls back on a RAISED error. Reconcile
+/// reports failure by RETURNING `ERROR: …`, so that block completes normally and
+/// RELEASEs, committing every child swapped before the failure. Here three real
+/// children are reconciled in one call alongside a fourth that cannot resolve;
+/// the three sort first, so they are swapped before the failure is reached.
 #[pg_test]
-fn pg_part_skip_sync_reconcile_opens_no_subtransaction() {
+fn pg_part_failed_skip_sync_reconcile_rolls_back_children_already_swapped() {
     Spi::run(
         "CREATE TABLE atom4 (id BIGINT, region TEXT NOT NULL, amount NUMERIC) \
          PARTITION BY LIST (region)",
     )
     .expect("source");
-    Spi::run("CREATE TABLE atom4_n PARTITION OF atom4 FOR VALUES IN ('N')").expect("n");
-    Spi::run("CREATE TABLE atom4_s PARTITION OF atom4 FOR VALUES IN ('S')").expect("s");
-    Spi::run("INSERT INTO atom4 (id, region, amount) VALUES (1,'N',10),(2,'S',20)").expect("seed");
+    for (child, key) in [("atom4_a", "A"), ("atom4_b", "B"), ("atom4_c", "C")] {
+        Spi::run(&format!(
+            "CREATE TABLE {child} PARTITION OF atom4 FOR VALUES IN ('{key}')"
+        ))
+        .expect("child");
+    }
+    Spi::run("INSERT INTO atom4 (id, region, amount) VALUES (1,'A',10),(2,'B',20),(3,'C',30)")
+        .expect("seed");
     Spi::run(
         "SELECT create_reflex_ivm('atom4v', \
            'SELECT region, SUM(amount) AS total FROM atom4 GROUP BY region', \
            NULL, NULL, NULL, NULL, ARRAY['region'])",
     )
     .expect("create imv");
-    Spi::run("UPDATE atom4v SET total = 999 WHERE region = 'N'").expect("drift");
 
-    let top_xid = Spi::get_one::<i64>("SELECT pg_current_xact_id()::text::bigint")
-        .expect("xid")
-        .expect("xid");
+    // Real drift the reconcile would repair — so "was this child swapped?" is
+    // answered by data, not just by catalog identity.
+    Spi::run("UPDATE atom4v SET total = 999").expect("drift");
+    // Catalog identity too: a DETACH/ATTACH swap replaces the child relation, so
+    // a committed swap changes its oid.
+    let oids_before = Spi::get_one::<String>(
+        "SELECT string_agg(c.oid::text, ',' ORDER BY c.relname) FROM pg_class c \
+         WHERE c.relname IN ('atom4v_atom4_a','atom4v_atom4_b','atom4v_atom4_c')",
+    )
+    .expect("oids")
+    .expect("oids");
+
+    // `zzz_ghost` sorts after all three real children, so they are processed —
+    // and swapped — before the reconcile discovers it has no target bound.
+    let msg = Spi::get_one::<String>(
+        "SELECT reflex_reconcile_partition('atom4v', '', 'atom4_a,atom4_b,atom4_c,zzz_ghost', true)",
+    )
+    .expect("call")
+    .expect("msg");
+    assert!(
+        msg.starts_with("ERROR"),
+        "a batch reconcile naming an unresolvable child must report ERROR, got: {msg}"
+    );
+
+    let oids_after = Spi::get_one::<String>(
+        "SELECT string_agg(c.oid::text, ',' ORDER BY c.relname) FROM pg_class c \
+         WHERE c.relname IN ('atom4v_atom4_a','atom4v_atom4_b','atom4v_atom4_c')",
+    )
+    .expect("oids")
+    .expect("oids");
+    assert_eq!(
+        oids_before, oids_after,
+        "the batch path must roll back the children it had already swapped when a later \
+         child fails (msg: {msg})"
+    );
+    let repaired = Spi::get_one::<i64>("SELECT count(*) FROM atom4v WHERE total <> 999")
+        .expect("repaired probe")
+        .expect("repaired");
+    assert_eq!(
+        repaired, 0,
+        "no partial repair may survive a batch reconcile that reports ERROR (msg: {msg})"
+    );
+}
+
+/// T4b — the batch path still WORKS. Paired with T4 so "rolls back on failure"
+/// can never be satisfied by refusing to do anything.
+#[pg_test]
+fn pg_part_skip_sync_reconcile_still_repairs_on_success() {
+    Spi::run(
+        "CREATE TABLE atom4b (id BIGINT, region TEXT NOT NULL, amount NUMERIC) \
+         PARTITION BY LIST (region)",
+    )
+    .expect("source");
+    Spi::run("CREATE TABLE atom4b_n PARTITION OF atom4b FOR VALUES IN ('N')").expect("n");
+    Spi::run("CREATE TABLE atom4b_s PARTITION OF atom4b FOR VALUES IN ('S')").expect("s");
+    Spi::run("INSERT INTO atom4b (id, region, amount) VALUES (1,'N',10),(2,'S',20)")
+        .expect("seed");
+    Spi::run(
+        "SELECT create_reflex_ivm('atom4bv', \
+           'SELECT region, SUM(amount) AS total FROM atom4b GROUP BY region', \
+           NULL, NULL, NULL, NULL, ARRAY['region'])",
+    )
+    .expect("create imv");
+    Spi::run("UPDATE atom4bv SET total = 999 WHERE region = 'N'").expect("drift");
 
     let msg =
-        Spi::get_one::<String>("SELECT reflex_reconcile_partition('atom4v', '', 'atom4_n', true)")
+        Spi::get_one::<String>("SELECT reflex_reconcile_partition('atom4bv', '', 'atom4b_n', true)")
             .expect("call")
             .expect("msg");
     assert!(
@@ -4043,29 +4113,25 @@ fn pg_part_skip_sync_reconcile_opens_no_subtransaction() {
         "skip_sync reconcile must still work, got: {msg}"
     );
     assert_imv_correct(
-        "atom4v",
-        "SELECT region, SUM(amount) AS total FROM atom4 GROUP BY region",
-    );
-
-    let ref_xmin = Spi::get_one::<i64>(
-        "SELECT xmin::text::bigint FROM public.__reflex_ivm_reference WHERE name = 'atom4v'",
-    )
-    .expect("xmin")
-    .expect("xmin");
-    assert_eq!(
-        ref_xmin, top_xid,
-        "the skip_sync batch path must not acquire a subtransaction per leaf"
+        "atom4bv",
+        "SELECT region, SUM(amount) AS total FROM atom4b GROUP BY region",
     );
 }
 
-/// T5 — the sync's advisory lock keeps the two-key
-/// `(hashtext(name), hashtext(reverse(name)))` form and is still held for the
-/// rest of the transaction once the reconcile's subtransaction is released.
-/// `objsubid = 2` is PostgreSQL's marker for the two-int4-key advisory space; a
-/// one-key `bigint` lock lands in space `objsubid = 1` and would never mutually
-/// exclude against the rest of pg_reflex.
+/// T5 — the IMV-name advisory lock keeps the two-key
+/// `(hashtext(name), hashtext(reverse(name)))` form AND belongs to the caller's
+/// transaction, not to the reconcile's subtransaction.
+///
+/// PostgreSQL releases a lock first taken inside a subtransaction when that
+/// subtransaction rolls back. So the load-bearing case is the FAILING reconcile:
+/// callers such as `trigger/dispatch.rs` discard the returned `ERROR:` string and
+/// go on to run MERGE/DELETE/INSERT against the same IMV, and they must still be
+/// serialized against concurrent maintenance. `objsubid = 2` is PostgreSQL's
+/// marker for the two-int4-key advisory space; a one-key `bigint` lock lands in
+/// space `objsubid = 1` and would never mutually exclude against the rest of
+/// pg_reflex.
 #[pg_test]
-fn pg_part_reconcile_keeps_two_key_advisory_lock_after_subtransaction() {
+fn pg_part_reconcile_keeps_two_key_advisory_lock_even_when_it_fails() {
     Spi::run(
         "CREATE TABLE atom5 (id BIGINT, region TEXT NOT NULL, amount NUMERIC) \
          PARTITION BY LIST (region)",
@@ -4081,25 +4147,103 @@ fn pg_part_reconcile_keeps_two_key_advisory_lock_after_subtransaction() {
     )
     .expect("create imv");
 
-    let msg = Spi::get_one::<String>("SELECT reflex_reconcile_partition('atom5v', 'N')")
+    let two_key_lock_count = || {
+        Spi::get_one::<i64>(
+            "SELECT count(*) FROM pg_locks \
+             WHERE locktype = 'advisory' AND pid = pg_backend_pid() AND objsubid = 2 \
+               AND classid::bigint = (hashtext('atom5v')::bigint & 4294967295) \
+               AND objid::bigint   = (hashtext(reverse('atom5v'))::bigint & 4294967295)",
+        )
+        .expect("lock probe")
+        .expect("lock count")
+    };
+
+    let failed = Spi::get_one::<String>(
+        "SELECT reflex_reconcile_partition('atom5v', 'region', 'no_such_source_child')",
+    )
+    .expect("call")
+    .expect("msg");
+    assert!(
+        failed.starts_with("ERROR"),
+        "expected the bogus reconcile to report ERROR, got: {failed}"
+    );
+    assert_eq!(
+        two_key_lock_count(),
+        1,
+        "a FAILED reconcile must leave the two-key advisory lock held by the caller's \
+         transaction — its rollback must not take the caller's mutual exclusion with it"
+    );
+
+    let ok = Spi::get_one::<String>("SELECT reflex_reconcile_partition('atom5v', 'N')")
         .expect("call")
         .expect("msg");
     assert!(
-        msg.starts_with("RECONCILED partitions"),
-        "expected RECONCILED, got: {msg}"
+        ok.starts_with("RECONCILED partitions"),
+        "expected RECONCILED, got: {ok}"
+    );
+    assert_eq!(
+        two_key_lock_count(),
+        1,
+        "a SUCCESSFUL reconcile must still leave the two-key advisory lock held"
+    );
+}
+
+/// T6 — a reconcile whose swap RAISES, caught by a real plpgsql `EXCEPTION`
+/// handler, must be reported cleanly and leave the backend usable.
+///
+/// This is the shape every `reflex_doctor(fix => true)` partition repair takes
+/// (`__reflex_doctor_try_repair`), and the shape the deferred flush wraps every
+/// IMV's dispatch statements in. A subtransaction left open by the unwind would
+/// be rolled back by that handler INSTEAD of its own, desynchronising plpgsql's
+/// expression-context stack — an assertion failure and `SIGABRT` on a cassert
+/// build, silently mismatched state on a release build.
+///
+/// `drop_old_tgt` is a `DROP TABLE` with no CASCADE, so one dependent view is
+/// enough to make the swap raise for real, mid-flight.
+#[pg_test]
+fn pg_part_raised_reconcile_failure_survives_plpgsql_exception_handler() {
+    Spi::run(
+        "CREATE TABLE atom6 (id BIGINT, region TEXT NOT NULL, amount NUMERIC) \
+         PARTITION BY LIST (region)",
+    )
+    .expect("source");
+    Spi::run("CREATE TABLE atom6_n PARTITION OF atom6 FOR VALUES IN ('N')").expect("n");
+    Spi::run("CREATE TABLE atom6_s PARTITION OF atom6 FOR VALUES IN ('S')").expect("s");
+    Spi::run("INSERT INTO atom6 (id, region, amount) VALUES (1,'N',10),(2,'S',20)").expect("seed");
+    Spi::run(
+        "SELECT create_reflex_ivm('atom6v', \
+           'SELECT region, SUM(amount) AS total FROM atom6 GROUP BY region', \
+           NULL, NULL, NULL, NULL, ARRAY['region'])",
+    )
+    .expect("create imv");
+
+    let children_before = partition_child_set("atom6v");
+    Spi::run("CREATE VIEW atom6_pin AS SELECT * FROM atom6v_atom6_n").expect("blocking view");
+
+    // The in-tree doctor repair wrapper: plpgsql, EXCEPTION WHEN OTHERS.
+    let repair = Spi::get_one::<String>(
+        "SELECT public.__reflex_doctor_try_repair( \
+           $q$SELECT reflex_reconcile_partition('atom6v','','atom6_n')$q$)",
+    )
+    .expect("repair call")
+    .expect("repair result");
+    assert!(
+        repair.starts_with("failed:"),
+        "the raised swap failure must be reported by the handler, got: {repair}"
     );
 
-    let held = Spi::get_one::<i64>(
-        "SELECT count(*) FROM pg_locks \
-         WHERE locktype = 'advisory' AND pid = pg_backend_pid() AND objsubid = 2 \
-           AND classid::bigint = (hashtext('atom5v')::bigint & 4294967295) \
-           AND objid::bigint   = (hashtext(reverse('atom5v'))::bigint & 4294967295)",
-    )
-    .expect("lock probe")
-    .expect("lock count");
+    // The backend is alive and the transaction still usable — the whole point.
+    let rows = Spi::get_one::<i64>("SELECT count(*) FROM atom6v")
+        .expect("post-failure query")
+        .expect("rows");
+    assert_eq!(rows, 2, "the IMV must still be readable after a caught raise");
     assert_eq!(
-        held, 1,
-        "the two-key advisory lock on the IMV name must still be held after the reconcile's \
-         subtransaction is released"
+        partition_child_set("atom6v"),
+        children_before,
+        "a raised, caught reconcile failure must leave the partition set intact"
+    );
+    assert_imv_correct(
+        "atom6v",
+        "SELECT region, SUM(amount) AS total FROM atom6 GROUP BY region",
     );
 }
