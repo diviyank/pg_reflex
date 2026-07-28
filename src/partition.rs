@@ -2363,6 +2363,18 @@ fn build_scoped_cascade_reconcile(
 /// EMPTY once the closing RENAME puts the parent back. The bracket is cleared on
 /// the error path too; a hard error longjmps past it, but `SET LOCAL` unwinds
 /// with the aborting (sub)transaction, so the GUC cannot outlive the swap.
+///
+/// **The clear is load-bearing, and its failure mode is WRONG DATA, not
+/// staleness.** While the GUC is set, `__reflex_on_ddl_command_end` does
+/// *nothing at all* — no dependent auto-sync, no pending enqueue, no
+/// alter-source alarm. A leaked value therefore disables partition mirroring for
+/// the remainder of the transaction, and deleting `set_internal_swap_root(client,
+/// None)` below turns three tests RED: the branch's own
+/// `pg_rdd_suppression_ends_with_the_swap` plus
+/// `pg_fuzz_subpartition_swap_sequence_matches_recompute` and its shallow
+/// variant — both of which are **oracle** tests. The sub-partition path produces
+/// oracle-detectable divergence, not merely stale rows. Anyone narrowing,
+/// moving, or conditionalising this bracket must re-run those three.
 pub(crate) fn execute_partition_swap_for_child(
     client: &mut pgrx::spi::SpiClient<'_>,
     view_name: &str,

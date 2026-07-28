@@ -428,6 +428,117 @@ fn pg_rdd_cascade_honours_drop_orphans_false() {
     );
 }
 
+/// T8 -- a reconcile that REPORTS failure must not push its contents into the
+/// dependents.
+///
+/// When a generated sub-IMV of the chain fails to rebuild, the parent is still
+/// rebuilt (that repairs drift local to it) but the call returns
+/// `ERROR: generated sub-IMV reconcile failed`, because the parent has just
+/// been re-derived from a node we know is stale. Cascading that content onward
+/// would turn one IMV known to be stale into N IMVs freshly stamped healthy --
+/// each dependent's own rebuild clears its `known_stale` / `stale_reason` /
+/// `stale_since`. So the cascade must sit BELOW that gate.
+///
+/// Reaching `child_failed` with no hand-written registry state takes two
+/// ingredients:
+///
+///   * the CTE must be an AGGREGATE, so the sub-IMV is a rebuildable node
+///     rather than a decomposed wrapper, and must emit the partition column, so
+///     `compute_cte_partition_subset` partitions it; and
+///   * DETACHing one of that sub-IMV's intermediate children makes the
+///     pre-reconcile sync's `CREATE ... IF NOT EXISTS ... PARTITION OF` skip the
+///     still-existing name instead of re-attaching it, so the swap reads an
+///     empty bound and returns the soft `Err("missing intermediate bound")`.
+///
+/// The assertion is an EXACT before/after aggregate, never a threshold -- the
+/// natural values here comfortably exceed any round number, so a threshold
+/// would pass whether or not the cascade ran.
+#[pg_test]
+fn pg_rdd_failed_reconcile_does_not_cascade() {
+    build_rdd_source("r10s");
+    create_imv(
+        "r10r",
+        "SELECT create_reflex_ivm('r10r', \
+         'WITH cb AS (SELECT k, SUM(amt) AS s FROM r10s GROUP BY k) \
+          SELECT k, SUM(s) AS m FROM cb GROUP BY k', \
+         NULL, NULL, NULL, NULL, ARRAY['k'])",
+    );
+    create_imv(
+        "r10d",
+        "SELECT create_reflex_ivm('r10d', 'SELECT k, SUM(m) AS mx FROM r10r GROUP BY k')",
+    );
+
+    // Fixture validation: the CTE must have become a PARTITIONED generated
+    // sub-IMV, or the failure this test needs is unreachable and it would pass
+    // vacuously.
+    let sub = Spi::get_one::<String>(
+        "SELECT name FROM public.__reflex_ivm_reference \
+         WHERE COALESCE(is_generated_sub_imv, FALSE) \
+           AND partition_columns IS NOT NULL \
+           AND array_length(partition_columns, 1) > 0 \
+           AND name LIKE 'r10r%'",
+    )
+    .expect("sub lookup")
+    .expect("fixture: the CTE did not become a PARTITIONED generated sub-IMV");
+    let int_parent = format!("__reflex_intermediate_{sub}");
+    let int_children = partition_child_names(&int_parent);
+    assert!(
+        !int_children.is_empty(),
+        "fixture: '{int_parent}' is not partitioned, so the swap cannot fail this way"
+    );
+
+    // Break exactly one of the sub-IMV's intermediate children.
+    Spi::run(&format!(
+        "ALTER TABLE {int_parent} DETACH PARTITION {}",
+        int_children[0]
+    ))
+    .expect("detach sub-IMV intermediate child");
+
+    // Drift the root with triggers live so the dependent follows it. The
+    // DRIFTED value is what must survive a reconcile that reports failure.
+    Spi::run("UPDATE r10r SET m = m + 1000").expect("drift");
+    let dep_drifted = Spi::get_one::<i64>("SELECT SUM(mx)::int8 FROM r10d")
+        .expect("dep sum")
+        .expect("dep sum NULL");
+    let dep_if_cascaded = Spi::get_one::<i64>(
+        "SELECT SUM(s)::int8 FROM (SELECT k, SUM(amt) AS s FROM r10s GROUP BY k) o",
+    )
+    .expect("oracle sum")
+    .expect("oracle sum NULL");
+    assert_ne!(
+        dep_drifted, dep_if_cascaded,
+        "fixture: drifted and cascaded values coincide, so the assertion below \
+         could not tell them apart"
+    );
+
+    let res = Spi::get_one::<&str>("SELECT reflex_reconcile('r10r')")
+        .expect("reconcile")
+        .expect("reconcile result");
+    assert_eq!(
+        res, "ERROR: generated sub-IMV reconcile failed",
+        "fixture: the reconcile did not reach the child_failed gate"
+    );
+
+    // The root itself WAS rebuilt (own = RECONCILED) -- that is what makes this
+    // the co-reachable case rather than a plain early exit.
+    assert_eq!(
+        Spi::get_one::<i64>("SELECT SUM(m)::int8 FROM r10r")
+            .expect("root sum")
+            .expect("root sum NULL"),
+        dep_if_cascaded,
+        "fixture: the root was not rebuilt, so nothing would have been cascaded"
+    );
+
+    assert_eq!(
+        Spi::get_one::<i64>("SELECT SUM(mx)::int8 FROM r10d")
+            .expect("dep sum")
+            .expect("dep sum NULL"),
+        dep_drifted,
+        "a reconcile that reported 'generated sub-IMV reconcile failed' still \
+         cascaded its known-stale content into the dependent"
+    );
+}
+
 /// T9 -- the suppression must not be over-broad: once the swap's bracket is
 /// closed, ordinary source DDL must still reach the dependent auto-sync.
 ///
