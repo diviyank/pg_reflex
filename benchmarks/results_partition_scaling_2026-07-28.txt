@@ -1,0 +1,424 @@
+############################################################
+# main-2f8b786
+# # label:        main-2f8b786
+# # git HEAD:     381e8141b3f6b0965d6ada15a91e2fc8b2195782 (uncommitted files: 0)
+# # .so:          /opt/homebrew/lib/postgresql@17/pg_reflex.dylib  sha256:f03056eb23a8b2e8  built:2026-07-28T16:28:46
+# # server:       PostgreSQL 17.7 (Homebrew) on aarch64-apple-darwin24.6.0, compiled by Apple clang version 17.0.0 (clang-1700.6.3.2), 64-bit
+# # params:       n_list='10 25 50 100 200' roots='10 25 50 100' rows=20000 reps=6
+# # server cfg:   max_locks_per_transaction=2048 shared_buffers=128MB
+# # disk before:  /dev/disk3s5   228Gi   171Gi    24Gi    88%    2.4M  253M    1%   /System/Volumes/Data
+# # load before:  2.83 4.49 5.35
+# # run at:       2026-07-28T16:29:02
+# # disk after:   /dev/disk3s5   228Gi   172Gi    24Gi    88%    2.4M  247M    1%   /System/Volumes/Data
+# # load after:   4.98 4.56 5.27
+############################################################
+
+MEDIAN TIME (ms) BY PARTITION COUNT N   [total data held CONSTANT across N]
+  The MEDIAN, not the minimum.  A regression can be a shift in the DISTRIBUTION
+  rather than in the floor: when a predicate stops being prunable, the first few
+  executions still get a custom plan that prunes on actual values and
+  stay fast, while later generic-plan executions do not.  The minimum then picks
+  the lucky rep and reports no regression at all.  Measured: on the 1.11.1 flush
+  regression at N=200 every rep was worse than every rep of the fixed build, but
+  min showed 14.0 vs 4.5 ms where median showed 53.2 vs 4.9 ms.
+  The min and the CV are in the NOISE CHECK table below.
+  slope e = d(log y)/d(log N), least squares over all N.
+  e ~ 0 constant in N   e ~ 1 linear in N   e ~ 2 quadratic in N
+
+metric                            N=10        N=25        N=50       N=100       N=200  slope e   growth  verdict
+                              --------    --------    --------    --------    --------  -------   ------  -------
+flush_deferred                    4.20        3.76        3.54        4.00        4.42     0.02     1.2x  FLAT
+flush_txn                         5.51        4.87        4.74        5.11        5.11    -0.02     1.1x  FLAT
+reconcile_partition_one          10.91       20.98       41.86      131.95      487.68     1.27    44.7x  linear
+sync_partitions                   5.11       13.56       35.50      119.43      489.81     1.52    95.9x  SUPERLINEAR
+sync_partitions_pt                3.10        7.94       19.54       62.21      251.95     1.46    81.3x  SUPERLINEAR
+reconcile_full                   65.20      176.47      488.36     1464.12     4883.46     1.45    74.9x  SUPERLINEAR
+attach_txn                       34.06       44.96      101.03      357.43     3481.37     1.51   102.2x  SUPERLINEAR
+attach_txn_pt                    18.00       29.87       69.35      197.46      611.63     1.20    34.0x  linear
+
+SUCCESSIVE-N RATIOS   time(N2)/time(N1)  and the local slope it implies
+  "doubled when N doubled" is 2.00x / 1.00 ; "quadrupled" is 4.00x / 2.00
+metric                              10->25          25->50         50->100        100->200
+flush_deferred                 0.90x -0.12     0.94x -0.09     1.13x  0.18     1.10x  0.14
+flush_txn                      0.88x -0.14     0.97x -0.04     1.08x  0.11     1.00x  0.00
+reconcile_partition_one        1.92x  0.71     2.00x  1.00     3.15x  1.66     3.70x  1.89
+sync_partitions                2.65x  1.06     2.62x  1.39     3.36x  1.75     4.10x  2.04
+sync_partitions_pt             2.56x  1.03     2.46x  1.30     3.18x  1.67     4.05x  2.02
+reconcile_full                 2.71x  1.09     2.77x  1.47     3.00x  1.58     3.34x  1.74
+attach_txn                     1.32x  0.30     2.25x  1.17     3.54x  1.82     9.74x  3.28
+attach_txn_pt                  1.66x  0.55     2.32x  1.22     2.85x  1.51     3.10x  1.63
+
+COST PER PARTITION (ms / N)   falling row = sublinear; flat row = linear; rising row = SUPERLINEAR
+metric                            N=10        N=25        N=50       N=100       N=200
+flush_deferred                  0.4199      0.1505      0.0708      0.0400      0.0221
+flush_txn                       0.5515      0.1949      0.0948      0.0511      0.0256
+reconcile_partition_one         1.0909      0.8390      0.8372      1.3195      2.4384
+sync_partitions                 0.5110      0.5422      0.7101      1.1943      2.4490
+sync_partitions_pt              0.3099      0.3175      0.3909      0.6221      1.2597
+reconcile_full                  6.5205      7.0588      9.7671     14.6412     24.4173
+attach_txn                      3.4064      1.7984      2.0205      3.5743     17.4068
+attach_txn_pt                   1.7998      1.1949      1.3870      1.9746      3.0582
+
+NOISE CHECK   best rep (ms) and coefficient of variation per N
+  A CV above ~30% means that column is not trustworthy on its own; re-run.
+  A best rep FAR below the median is not just noise: it is the signature of a
+  plan that prunes on some executions and not others.  Compare against the table
+  above rather than reading either number alone.
+metric                                N=10            N=25            N=50           N=100           N=200
+flush_deferred                  3.57   38%      3.49   14%      3.29   15%      3.68    6%      4.21    4%
+flush_txn                       4.80   36%      4.77    2%      4.46    3%      4.66   15%      5.07    3%
+reconcile_partition_one        10.47    9%     20.58   60%     41.37    1%    130.99    1%    463.09    5%
+sync_partitions                 4.96    3%     13.38    2%     35.41    1%    118.67    0%    486.83    0%
+sync_partitions_pt              3.05    8%      7.72    2%     19.48    1%     61.79    3%    249.53    1%
+reconcile_full                 63.96    7%    170.77    2%    461.21    5%   1343.39    6%   4634.92    7%
+attach_txn                     32.74    5%     42.08    5%     98.65    4%    351.56    2%   1134.18   85%
+attach_txn_pt                  17.02   64%     28.48    3%     61.87    7%    194.28    1%    607.16    7%
+
+
+LOCK FOOTPRINT (locks held at end of the call) BY PARTITION COUNT N
+  A pure count: no timer, no cache, no competing process can move it.  This is
+  the metric to trust when the machine is busy, and the one operators must size
+  max_locks_per_transaction against.
+  slope e = d(log y)/d(log N), least squares over all N.
+  e ~ 0 constant in N   e ~ 1 linear in N   e ~ 2 quadratic in N
+
+metric                            N=10        N=25        N=50       N=100       N=200  slope e   growth  verdict
+                              --------    --------    --------    --------    --------  -------   ------  -------
+locks_reconcile_full            438.00     1038.00     2038.00     4038.00     8038.00     0.97    18.4x  linear
+locks_sync_partitions            45.00       75.00      125.00      225.00      425.00     0.75     9.4x  linear
+locks_reconcile_one              95.00      125.00      175.00      275.00      475.00     0.54     5.0x  linear
+locks_flush_deferred             68.00       68.00       68.00       68.00       68.00     0.00     1.0x  FLAT
+
+SUCCESSIVE-N RATIOS   time(N2)/time(N1)  and the local slope it implies
+  "doubled when N doubled" is 2.00x / 1.00 ; "quadrupled" is 4.00x / 2.00
+metric                              10->25          25->50         50->100        100->200
+locks_reconcile_full           2.37x  0.94     1.96x  0.97     1.98x  0.99     1.99x  0.99
+locks_sync_partitions          1.67x  0.56     1.67x  0.74     1.80x  0.85     1.89x  0.92
+locks_reconcile_one            1.32x  0.30     1.40x  0.49     1.57x  0.65     1.73x  0.79
+locks_flush_deferred           1.00x  0.00     1.00x  0.00     1.00x  0.00     1.00x  0.00
+
+COST PER PARTITION (locks / N)   falling row = sublinear; flat row = linear; rising row = SUPERLINEAR
+metric                            N=10        N=25        N=50       N=100       N=200
+locks_reconcile_full           43.8000     41.5200     40.7600     40.3800     40.1900
+locks_sync_partitions           4.5000      3.0000      2.5000      2.2500      2.1250
+locks_reconcile_one             9.5000      5.0000      3.5000      2.7500      2.3750
+locks_flush_deferred            6.8000      2.7200      1.3600      0.6800      0.3400
+
+############################################################
+# s1batch-5f02066
+# # label:        s1batch-5f02066
+# # git HEAD:     68c37f63760e4e2dc36e284863a42ec2b211e134 (uncommitted files: 2)
+# # .so:          /opt/homebrew/lib/postgresql@17/pg_reflex.dylib  sha256:ea23909e7b34c36d  built:2026-07-28T16:33:04
+# # server:       PostgreSQL 17.7 (Homebrew) on aarch64-apple-darwin24.6.0, compiled by Apple clang version 17.0.0 (clang-1700.6.3.2), 64-bit
+# # params:       n_list='10 25 50 100 200' roots='10 25 50 100' rows=20000 reps=6
+# # server cfg:   max_locks_per_transaction=2048 shared_buffers=128MB
+# # disk before:  /dev/disk3s5   228Gi   172Gi    23Gi    88%    2.4M  246M    1%   /System/Volumes/Data
+# # load before:  9.48 5.53 5.57
+# # run at:       2026-07-28T16:33:12
+# # disk after:   /dev/disk3s5   228Gi   172Gi    23Gi    88%    2.4M  246M    1%   /System/Volumes/Data
+# # load after:   5.15 4.99 5.36
+############################################################
+
+MEDIAN TIME (ms) BY PARTITION COUNT N   [total data held CONSTANT across N]
+  The MEDIAN, not the minimum.  A regression can be a shift in the DISTRIBUTION
+  rather than in the floor: when a predicate stops being prunable, the first few
+  executions still get a custom plan that prunes on actual values and
+  stay fast, while later generic-plan executions do not.  The minimum then picks
+  the lucky rep and reports no regression at all.  Measured: on the 1.11.1 flush
+  regression at N=200 every rep was worse than every rep of the fixed build, but
+  min showed 14.0 vs 4.5 ms where median showed 53.2 vs 4.9 ms.
+  The min and the CV are in the NOISE CHECK table below.
+  slope e = d(log y)/d(log N), least squares over all N.
+  e ~ 0 constant in N   e ~ 1 linear in N   e ~ 2 quadratic in N
+
+metric                            N=10        N=25        N=50       N=100       N=200  slope e   growth  verdict
+                              --------    --------    --------    --------    --------  -------   ------  -------
+flush_deferred                    3.55        3.53        3.48        4.23        4.19     0.07     1.2x  FLAT
+flush_txn                         4.82        4.31        4.36        4.64        4.89     0.01     1.1x  FLAT
+reconcile_partition_one           9.93       18.64       41.67      116.42      427.10     1.25    43.0x  linear
+sync_partitions                   4.72       13.28       33.63      104.92      412.06     1.48    87.3x  SUPERLINEAR
+sync_partitions_pt                2.97        7.96       18.62       54.72      208.55     1.40    70.2x  SUPERLINEAR
+reconcile_full                   52.92      158.71      407.50     1396.59     4401.20     1.49    83.2x  SUPERLINEAR
+attach_txn                       18.90       39.30      102.83      312.45     1010.30     1.35    53.5x  linear
+attach_txn_pt                    14.09       26.08       59.60      160.53      501.70     1.20    35.6x  linear
+
+SUCCESSIVE-N RATIOS   time(N2)/time(N1)  and the local slope it implies
+  "doubled when N doubled" is 2.00x / 1.00 ; "quadrupled" is 4.00x / 2.00
+metric                              10->25          25->50         50->100        100->200
+flush_deferred                 0.99x -0.01     0.99x -0.02     1.21x  0.28     0.99x -0.01
+flush_txn                      0.90x -0.12     1.01x  0.02     1.06x  0.09     1.06x  0.08
+reconcile_partition_one        1.88x  0.69     2.24x  1.16     2.79x  1.48     3.67x  1.88
+sync_partitions                2.81x  1.13     2.53x  1.34     3.12x  1.64     3.93x  1.97
+sync_partitions_pt             2.68x  1.08     2.34x  1.23     2.94x  1.56     3.81x  1.93
+reconcile_full                 3.00x  1.20     2.57x  1.36     3.43x  1.78     3.15x  1.66
+attach_txn                     2.08x  0.80     2.62x  1.39     3.04x  1.60     3.23x  1.69
+attach_txn_pt                  1.85x  0.67     2.29x  1.19     2.69x  1.43     3.13x  1.64
+
+COST PER PARTITION (ms / N)   falling row = sublinear; flat row = linear; rising row = SUPERLINEAR
+metric                            N=10        N=25        N=50       N=100       N=200
+flush_deferred                  0.3554      0.1410      0.0696      0.0423      0.0209
+flush_txn                       0.4819      0.1726      0.0873      0.0464      0.0245
+reconcile_partition_one         0.9934      0.7456      0.8335      1.1642      2.1355
+sync_partitions                 0.4718      0.5311      0.6726      1.0492      2.0603
+sync_partitions_pt              0.2972      0.3184      0.3724      0.5472      1.0427
+reconcile_full                  5.2923      6.3482      8.1500     13.9659     22.0060
+attach_txn                      1.8896      1.5719      2.0566      3.1245      5.0515
+attach_txn_pt                   1.4091      1.0432      1.1920      1.6053      2.5085
+
+NOISE CHECK   best rep (ms) and coefficient of variation per N
+  A CV above ~30% means that column is not trustworthy on its own; re-run.
+  A best rep FAR below the median is not just noise: it is the signature of a
+  plan that prunes on some executions and not others.  Compare against the table
+  above rather than reading either number alone.
+metric                                N=10            N=25            N=50           N=100           N=200
+flush_deferred                  3.40   14%      3.28   16%      3.25   21%      3.66   10%      3.87  103%
+flush_txn                       4.58    4%      4.12    5%      4.17    4%      4.30    5%      4.52   10%
+reconcile_partition_one         9.80    3%     18.54    1%     40.84    6%    115.83    1%    414.47    3%
+sync_partitions                 4.69    1%     12.36    4%     33.26    0%    104.44    0%    406.18    3%
+sync_partitions_pt              2.95    2%      7.56    2%     18.45    0%     54.21    1%    207.71    1%
+reconcile_full                 52.91    2%    156.25    1%    403.91    2%   1344.72   10%   4223.35   11%
+attach_txn                     18.31    3%     38.16    3%     99.80    2%    309.64    2%    986.71    2%
+attach_txn_pt                  12.92    4%     25.35    3%     57.58    2%    159.66    2%    497.53    1%
+
+
+LOCK FOOTPRINT (locks held at end of the call) BY PARTITION COUNT N
+  A pure count: no timer, no cache, no competing process can move it.  This is
+  the metric to trust when the machine is busy, and the one operators must size
+  max_locks_per_transaction against.
+  slope e = d(log y)/d(log N), least squares over all N.
+  e ~ 0 constant in N   e ~ 1 linear in N   e ~ 2 quadratic in N
+
+metric                            N=10        N=25        N=50       N=100       N=200  slope e   growth  verdict
+                              --------    --------    --------    --------    --------  -------   ------  -------
+locks_reconcile_full            458.00     1088.00     2138.00     4238.00     8438.00     0.97    18.4x  linear
+locks_sync_partitions            45.00       75.00      125.00      225.00      425.00     0.75     9.4x  linear
+locks_reconcile_one              97.00      127.00      177.00      277.00      477.00     0.53     4.9x  linear
+locks_flush_deferred             68.00       68.00       68.00       68.00       68.00     0.00     1.0x  FLAT
+
+SUCCESSIVE-N RATIOS   time(N2)/time(N1)  and the local slope it implies
+  "doubled when N doubled" is 2.00x / 1.00 ; "quadrupled" is 4.00x / 2.00
+metric                              10->25          25->50         50->100        100->200
+locks_reconcile_full           2.38x  0.94     1.97x  0.97     1.98x  0.99     1.99x  0.99
+locks_sync_partitions          1.67x  0.56     1.67x  0.74     1.80x  0.85     1.89x  0.92
+locks_reconcile_one            1.31x  0.29     1.39x  0.48     1.56x  0.65     1.72x  0.78
+locks_flush_deferred           1.00x  0.00     1.00x  0.00     1.00x  0.00     1.00x  0.00
+
+COST PER PARTITION (locks / N)   falling row = sublinear; flat row = linear; rising row = SUPERLINEAR
+metric                            N=10        N=25        N=50       N=100       N=200
+locks_reconcile_full           45.8000     43.5200     42.7600     42.3800     42.1900
+locks_sync_partitions           4.5000      3.0000      2.5000      2.2500      2.1250
+locks_reconcile_one             9.7000      5.0800      3.5400      2.7700      2.3850
+locks_flush_deferred            6.8000      2.7200      1.3600      0.6800      0.3400
+
+############################################################
+# tip-689ab95
+# # label:        tip-689ab95
+# # git HEAD:     68c37f63760e4e2dc36e284863a42ec2b211e134 (uncommitted files: 4)
+# # .so:          /opt/homebrew/lib/postgresql@17/pg_reflex.dylib  sha256:6169fdf54e7227d2  built:2026-07-28T16:34:48
+# # server:       PostgreSQL 17.7 (Homebrew) on aarch64-apple-darwin24.6.0, compiled by Apple clang version 17.0.0 (clang-1700.6.3.2), 64-bit
+# # params:       n_list='10 25 50 100 200' roots='10 25 50 100' rows=20000 reps=6
+# # server cfg:   max_locks_per_transaction=2048 shared_buffers=128MB
+# # disk before:  /dev/disk3s5   228Gi   172Gi    23Gi    88%    2.4M  246M    1%   /System/Volumes/Data
+# # load before:  4.06 4.74 5.25
+# # run at:       2026-07-28T16:34:54
+# # disk after:   /dev/disk3s5   228Gi   173Gi    23Gi    89%    2.4M  237M    1%   /System/Volumes/Data
+# # load after:   5.65 5.04 5.31
+############################################################
+
+MEDIAN TIME (ms) BY PARTITION COUNT N   [total data held CONSTANT across N]
+  The MEDIAN, not the minimum.  A regression can be a shift in the DISTRIBUTION
+  rather than in the floor: when a predicate stops being prunable, the first few
+  executions still get a custom plan that prunes on actual values and
+  stay fast, while later generic-plan executions do not.  The minimum then picks
+  the lucky rep and reports no regression at all.  Measured: on the 1.11.1 flush
+  regression at N=200 every rep was worse than every rep of the fixed build, but
+  min showed 14.0 vs 4.5 ms where median showed 53.2 vs 4.9 ms.
+  The min and the CV are in the NOISE CHECK table below.
+  slope e = d(log y)/d(log N), least squares over all N.
+  e ~ 0 constant in N   e ~ 1 linear in N   e ~ 2 quadratic in N
+
+metric                            N=10        N=25        N=50       N=100       N=200  slope e   growth  verdict
+                              --------    --------    --------    --------    --------  -------   ------  -------
+flush_deferred                    3.54        3.42        5.81        3.48        3.79     0.02     1.1x  FLAT
+flush_txn                         4.71        4.45        9.41        4.17        4.92     0.01     1.2x  FLAT
+reconcile_partition_one           9.98       18.76       45.00      116.35      427.18     1.25    42.8x  linear
+sync_partitions                   4.74       12.89       40.91      114.78      407.59     1.50    86.0x  SUPERLINEAR
+sync_partitions_pt                2.99        7.77       20.58       55.07      208.72     1.41    69.8x  SUPERLINEAR
+reconcile_full                   54.79      161.55      474.49     1232.76     4429.73     1.46    80.9x  SUPERLINEAR
+attach_txn                       19.21       44.15       87.28      294.05     1186.13     1.36    61.7x  SUPERLINEAR
+attach_txn_pt                    14.08       26.33       51.77      161.81      520.03     1.21    36.9x  linear
+
+SUCCESSIVE-N RATIOS   time(N2)/time(N1)  and the local slope it implies
+  "doubled when N doubled" is 2.00x / 1.00 ; "quadrupled" is 4.00x / 2.00
+metric                              10->25          25->50         50->100        100->200
+flush_deferred                 0.97x -0.04     1.70x  0.77     0.60x -0.74     1.09x  0.12
+flush_txn                      0.94x -0.06     2.11x  1.08     0.44x -1.17     1.18x  0.24
+reconcile_partition_one        1.88x  0.69     2.40x  1.26     2.59x  1.37     3.67x  1.88
+sync_partitions                2.72x  1.09     3.17x  1.67     2.81x  1.49     3.55x  1.83
+sync_partitions_pt             2.60x  1.04     2.65x  1.41     2.68x  1.42     3.79x  1.92
+reconcile_full                 2.95x  1.18     2.94x  1.55     2.60x  1.38     3.59x  1.85
+attach_txn                     2.30x  0.91     1.98x  0.98     3.37x  1.75     4.03x  2.01
+attach_txn_pt                  1.87x  0.68     1.97x  0.98     3.13x  1.64     3.21x  1.68
+
+COST PER PARTITION (ms / N)   falling row = sublinear; flat row = linear; rising row = SUPERLINEAR
+metric                            N=10        N=25        N=50       N=100       N=200
+flush_deferred                  0.3538      0.1367      0.1162      0.0348      0.0190
+flush_txn                       0.4715      0.1779      0.1881      0.0417      0.0246
+reconcile_partition_one         0.9982      0.7503      0.9000      1.1635      2.1359
+sync_partitions                 0.4737      0.5155      0.8183      1.1478      2.0379
+sync_partitions_pt              0.2991      0.3109      0.4117      0.5507      1.0436
+reconcile_full                  5.4789      6.4621      9.4898     12.3276     22.1486
+attach_txn                      1.9212      1.7658      1.7456      2.9405      5.9307
+attach_txn_pt                   1.4078      1.0532      1.0354      1.6181      2.6001
+
+NOISE CHECK   best rep (ms) and coefficient of variation per N
+  A CV above ~30% means that column is not trustworthy on its own; re-run.
+  A best rep FAR below the median is not just noise: it is the signature of a
+  plan that prunes on some executions and not others.  Compare against the table
+  above rather than reading either number alone.
+metric                                N=10            N=25            N=50           N=100           N=200
+flush_deferred                  3.44   14%      3.30   14%      4.67  132%      3.24    7%      3.46    7%
+flush_txn                       4.69   14%      4.32    1%      5.95   69%      4.11    4%      4.48   12%
+reconcile_partition_one         9.87    1%     18.70    1%     44.50    2%    114.60    1%    425.68    3%
+sync_partitions                 4.72    0%     12.54    3%     39.16    5%    107.25    5%    406.64    5%
+sync_partitions_pt              2.97    1%      7.45    4%     20.09    1%     54.52    3%    207.65    1%
+reconcile_full                 51.85    3%    155.23    2%    416.17    7%   1213.74    3%   4294.95   77%
+attach_txn                     18.21    4%     40.41    7%     84.91    2%    290.13    1%   1044.68   14%
+attach_txn_pt                  13.60    3%     26.00    1%     50.34    2%    161.00    1%    517.18    1%
+
+
+LOCK FOOTPRINT (locks held at end of the call) BY PARTITION COUNT N
+  A pure count: no timer, no cache, no competing process can move it.  This is
+  the metric to trust when the machine is busy, and the one operators must size
+  max_locks_per_transaction against.
+  slope e = d(log y)/d(log N), least squares over all N.
+  e ~ 0 constant in N   e ~ 1 linear in N   e ~ 2 quadratic in N
+
+metric                            N=10        N=25        N=50       N=100       N=200  slope e   growth  verdict
+                              --------    --------    --------    --------    --------  -------   ------  -------
+locks_reconcile_full            458.00     1088.00     2138.00     4238.00     8438.00     0.97    18.4x  linear
+locks_sync_partitions            45.00       75.00      125.00      225.00      425.00     0.75     9.4x  linear
+locks_reconcile_one              97.00      127.00      177.00      277.00      477.00     0.53     4.9x  linear
+locks_flush_deferred             68.00       68.00       68.00       68.00       68.00     0.00     1.0x  FLAT
+
+SUCCESSIVE-N RATIOS   time(N2)/time(N1)  and the local slope it implies
+  "doubled when N doubled" is 2.00x / 1.00 ; "quadrupled" is 4.00x / 2.00
+metric                              10->25          25->50         50->100        100->200
+locks_reconcile_full           2.38x  0.94     1.97x  0.97     1.98x  0.99     1.99x  0.99
+locks_sync_partitions          1.67x  0.56     1.67x  0.74     1.80x  0.85     1.89x  0.92
+locks_reconcile_one            1.31x  0.29     1.39x  0.48     1.56x  0.65     1.72x  0.78
+locks_flush_deferred           1.00x  0.00     1.00x  0.00     1.00x  0.00     1.00x  0.00
+
+COST PER PARTITION (locks / N)   falling row = sublinear; flat row = linear; rising row = SUPERLINEAR
+metric                            N=10        N=25        N=50       N=100       N=200
+locks_reconcile_full           45.8000     43.5200     42.7600     42.3800     42.1900
+locks_sync_partitions           4.5000      3.0000      2.5000      2.2500      2.1250
+locks_reconcile_one             9.7000      5.0800      3.5400      2.7700      2.3850
+locks_flush_deferred            6.8000      2.7200      1.3600      0.6800      0.3400
+
+############################################################
+# acceptance-1.11.1-b56142a
+# # label:        acceptance-1.11.1-b56142a
+# # git HEAD:     8649526a1a77a079b431ba9322916401e3a91a70 (uncommitted files: 2)
+# # .so:          /opt/homebrew/lib/postgresql@17/pg_reflex.dylib  sha256:b2645144cb022b13  built:2026-07-28T16:36:51
+# # server:       PostgreSQL 17.7 (Homebrew) on aarch64-apple-darwin24.6.0, compiled by Apple clang version 17.0.0 (clang-1700.6.3.2), 64-bit
+# # params:       n_list='10 25 50 100 200' roots='10 25 50 100' rows=20000 reps=6
+# # server cfg:   max_locks_per_transaction=2048 shared_buffers=128MB
+# # disk before:  /dev/disk3s5   228Gi   173Gi    22Gi    89%    2.4M  228M    1%   /System/Volumes/Data
+# # load before:  4.21 4.73 5.18
+# # run at:       2026-07-28T16:37:05
+# # disk after:   /dev/disk3s5   228Gi   173Gi    22Gi    89%    2.4M  228M    1%   /System/Volumes/Data
+# # load after:   5.78 5.29 5.35
+############################################################
+
+MEDIAN TIME (ms) BY PARTITION COUNT N   [total data held CONSTANT across N]
+  The MEDIAN, not the minimum.  A regression can be a shift in the DISTRIBUTION
+  rather than in the floor: when a predicate stops being prunable, the first few
+  executions still get a custom plan that prunes on actual values and
+  stay fast, while later generic-plan executions do not.  The minimum then picks
+  the lucky rep and reports no regression at all.  Measured: on the 1.11.1 flush
+  regression at N=200 every rep was worse than every rep of the fixed build, but
+  min showed 14.0 vs 4.5 ms where median showed 53.2 vs 4.9 ms.
+  The min and the CV are in the NOISE CHECK table below.
+  slope e = d(log y)/d(log N), least squares over all N.
+  e ~ 0 constant in N   e ~ 1 linear in N   e ~ 2 quadratic in N
+
+metric                            N=10        N=25        N=50       N=100       N=200  slope e   growth  verdict
+                              --------    --------    --------    --------    --------  -------   ------  -------
+flush_deferred                    5.25        3.53        7.32       10.29       28.75     0.59     8.2x  linear
+flush_txn                         5.99        4.45       13.01       13.88       53.21     0.73    11.9x  linear
+reconcile_partition_one          11.29       53.83      105.12      250.52      502.59     1.25    44.5x  linear
+sync_partitions                   5.03       29.21       38.52      166.25      468.39     1.47    93.1x  SUPERLINEAR
+sync_partitions_pt                3.29       13.43       21.07       72.99      243.91     1.39    74.1x  SUPERLINEAR
+reconcile_full                   61.74      222.42      508.02     3619.09     5207.83     1.58    84.4x  SUPERLINEAR
+attach_txn                       25.95       66.82      130.95     1359.72     1269.93     1.45    48.9x  SUPERLINEAR
+attach_txn_pt                    17.94       76.37       76.45      557.79      631.75     1.24    35.2x  linear
+
+SUCCESSIVE-N RATIOS   time(N2)/time(N1)  and the local slope it implies
+  "doubled when N doubled" is 2.00x / 1.00 ; "quadrupled" is 4.00x / 2.00
+metric                              10->25          25->50         50->100        100->200
+flush_deferred                 0.67x -0.43     2.08x  1.05     1.41x  0.49     2.80x  1.48
+flush_txn                      0.74x -0.32     2.92x  1.55     1.07x  0.09     3.83x  1.94
+reconcile_partition_one        4.77x  1.70     1.95x  0.97     2.38x  1.25     2.01x  1.00
+sync_partitions                5.81x  1.92     1.32x  0.40     4.32x  2.11     2.82x  1.49
+sync_partitions_pt             4.08x  1.53     1.57x  0.65     3.46x  1.79     3.34x  1.74
+reconcile_full                 3.60x  1.40     2.28x  1.19     7.12x  2.83     1.44x  0.53
+attach_txn                     2.57x  1.03     1.96x  0.97    10.38x  3.38     0.93x -0.10
+attach_txn_pt                  4.26x  1.58     1.00x  0.00     7.30x  2.87     1.13x  0.18
+
+COST PER PARTITION (ms / N)   falling row = sublinear; flat row = linear; rising row = SUPERLINEAR
+metric                            N=10        N=25        N=50       N=100       N=200
+flush_deferred                  0.5252      0.1411      0.1464      0.1029      0.1438
+flush_txn                       0.5990      0.1782      0.2602      0.1388      0.2660
+reconcile_partition_one         1.1290      2.1531      2.1024      2.5052      2.5129
+sync_partitions                 0.5031      1.1683      0.7704      1.6625      2.3420
+sync_partitions_pt              0.3291      0.5373      0.4215      0.7299      1.2195
+reconcile_full                  6.1737      8.8966     10.1603     36.1909     26.0392
+attach_txn                      2.5950      2.6727      2.6190     13.5972      6.3497
+attach_txn_pt                   1.7941      3.0550      1.5291      5.5779      3.1588
+
+NOISE CHECK   best rep (ms) and coefficient of variation per N
+  A CV above ~30% means that column is not trustworthy on its own; re-run.
+  A best rep FAR below the median is not just noise: it is the signature of a
+  plan that prunes on some executions and not others.  Compare against the table
+  above rather than reading either number alone.
+metric                                N=10            N=25            N=50           N=100           N=200
+flush_deferred                  4.47   10%      3.50   13%      6.63   22%      8.70   26%      9.67   73%
+flush_txn                       5.18   27%      4.29    2%      8.92   49%     10.11   37%     13.99   43%
+reconcile_partition_one        10.72    3%     50.36   15%     94.25   20%    159.28   29%    463.51   15%
+sync_partitions                 4.86   37%     16.84   35%     37.74    7%    136.43   20%    459.14    2%
+sync_partitions_pt              3.08   15%      8.95   25%     20.52    3%     68.35    4%    243.29    0%
+reconcile_full                 58.16    4%    217.81   17%    504.74    3%   3066.81   14%   4909.34    5%
+attach_txn                     25.28    4%     62.90    7%    123.05    3%   1098.48   25%   1246.50    1%
+attach_txn_pt                  17.27    3%     70.34    4%     75.73    5%    542.49    4%    628.34    2%
+
+
+LOCK FOOTPRINT (locks held at end of the call) BY PARTITION COUNT N
+  A pure count: no timer, no cache, no competing process can move it.  This is
+  the metric to trust when the machine is busy, and the one operators must size
+  max_locks_per_transaction against.
+  slope e = d(log y)/d(log N), least squares over all N.
+  e ~ 0 constant in N   e ~ 1 linear in N   e ~ 2 quadratic in N
+
+metric                            N=10        N=25        N=50       N=100       N=200  slope e   growth  verdict
+                              --------    --------    --------    --------    --------  -------   ------  -------
+locks_reconcile_full            438.00     1038.00     2038.00     4038.00     8038.00     0.97    18.4x  linear
+locks_sync_partitions            45.00       75.00      125.00      225.00      425.00     0.75     9.4x  linear
+locks_reconcile_one              95.00      125.00      175.00      275.00      475.00     0.54     5.0x  linear
+locks_flush_deferred             68.00       68.00       68.00       68.00       68.00     0.00     1.0x  FLAT
+
+SUCCESSIVE-N RATIOS   time(N2)/time(N1)  and the local slope it implies
+  "doubled when N doubled" is 2.00x / 1.00 ; "quadrupled" is 4.00x / 2.00
+metric                              10->25          25->50         50->100        100->200
+locks_reconcile_full           2.37x  0.94     1.96x  0.97     1.98x  0.99     1.99x  0.99
+locks_sync_partitions          1.67x  0.56     1.67x  0.74     1.80x  0.85     1.89x  0.92
+locks_reconcile_one            1.32x  0.30     1.40x  0.49     1.57x  0.65     1.73x  0.79
+locks_flush_deferred           1.00x  0.00     1.00x  0.00     1.00x  0.00     1.00x  0.00
+
+COST PER PARTITION (locks / N)   falling row = sublinear; flat row = linear; rising row = SUPERLINEAR
+metric                            N=10        N=25        N=50       N=100       N=200
+locks_reconcile_full           43.8000     41.5200     40.7600     40.3800     40.1900
+locks_sync_partitions           4.5000      3.0000      2.5000      2.2500      2.1250
+locks_reconcile_one             9.5000      5.0000      3.5000      2.7500      2.3750
+locks_flush_deferred            6.8000      2.7200      1.3600      0.6800      0.3400
+
