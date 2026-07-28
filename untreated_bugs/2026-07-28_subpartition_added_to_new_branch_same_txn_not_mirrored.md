@@ -1,7 +1,9 @@
 # 2026-07-28 — a sub-partition added to a newly-attached branch later in the SAME transaction is never mirrored, and the next INSERT aborts the user's transaction
 
-**Status: untreated. PRE-EXISTING — verified RED on `main` @ `2f8b786` and on the
-IMV-root AccessExclusive fix branch. Not a regression from that work.**
+**Status: untreated, mechanism CONFIRMED in code. PRE-EXISTING — verified RED on
+`main` @ `2f8b786` and on the IMV-root AccessExclusive fix branch. Not a
+regression from that work. Left unfixed deliberately: it is a separate defect
+and belongs to a later batch, per `untreated_bugs/` hygiene.**
 
 ## Symptom
 
@@ -41,19 +43,26 @@ transaction (which may contain unrelated work) is lost. Reachable from the same
 partition-rollover workflows that motivated the AccessExclusive report: build
 next period's branch, attach it, then add a month to it.
 
-## Mechanism (hypothesis — NOT yet verified in code)
+## Mechanism — CONFIRMED in code
 
-The `ddl_command_end` event trigger resolves the parent of the created partition
-and syncs every partitioned IMV that depends on **that parent**. For
-`zr4_src_5_m2` the parent is `zr4_src_5`, which is not itself a registered
-source — the IMV's `depends_on` names the root `zr4_src` — so no IMV matches and
-no sync runs. The branch-level attach earlier in the transaction matched because
-its parent *was* the root.
+The `ddl_command_end` event trigger resolves the created partition's immediate
+parent into `_parent`, then:
 
-`pg_partition_root()` is already used a few lines above, for the
-`__reflex_partition_pending` enqueue, so the root is available at that point;
-the IMV lookup simply keys off `_parent` rather than the resolved root. That is
-the first thing to check, and the first thing to test.
+* `src/lib.rs:1148` resolves the partition ROOT into `_part_root` via
+  `pg_partition_root(_parent::regclass)` — but uses it **only** for the
+  `__reflex_partition_pending` enqueue;
+* `src/lib.rs:1181` selects the IMVs to sync with
+  `depends_on @> ARRAY[_parent]`, i.e. keyed off the **immediate parent**, not
+  the resolved root.
+
+For `zr4_src_5_m2` the immediate parent is `zr4_src_5`, which is not a
+registered source — the IMV's `depends_on` names the root `zr4_src` — so no IMV
+matches, no sync runs, and the mirror sub-partition is never created. The
+branch-level ATTACH earlier in the same transaction matched only because its
+immediate parent *was* the root.
+
+The root is therefore already computed and in scope at the point the IMV lookup
+runs; the lookup simply uses the wrong variable.
 
 ## Fix direction
 

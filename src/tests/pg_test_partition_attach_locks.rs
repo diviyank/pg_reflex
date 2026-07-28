@@ -552,12 +552,24 @@ fn create_and_load_partition_never_locks_imv_root_depth1() {
 }
 
 // ---------------------------------------------------------------------------
-// T8 — the same defect via the other route: ATTACH a pre-populated branch and
-// then INSERT more into it in the same transaction, at mirror depth 2.
+// T8 — ATTACH a pre-populated branch and then INSERT more into it in the same
+// transaction, at mirror depth 2.
+//
+// WHAT THIS PINS, PRECISELY. Its lock assertions are a regression guard only:
+// at mirror depth 2 the reconcile's swap DETACHes off the intermediate branch,
+// never off the root, so the root stays clean here whether or not the fresh-
+// child mechanism works — this test does NOT go RED when that mechanism is
+// broken (mutation M5). What IS load-bearing here are the row-count and oracle
+// assertions: they go RED under M6 (the target TRUNCATE removed), which the
+// depth-1 test cannot catch because there the duplicate INSERT collides with
+// the IMV's unique key and the reconcile's error is discarded upstream.
+//
+// The test that pins the fresh-child mechanism by lock shape is T7
+// (`create_and_load_partition_never_locks_imv_root_depth1`).
 // ---------------------------------------------------------------------------
 
 #[pg_test]
-fn attach_then_load_partition_never_locks_imv_root_depth2() {
+fn attach_then_load_partition_depth2_row_counts_and_root_lock_guard() {
     const DBNAME: &str = "reflex_lockprobe_ly";
     probe_db_open(DBNAME);
     worker_exec(
@@ -617,4 +629,91 @@ fn attach_then_load_partition_never_locks_imv_root_depth2() {
     assert_root_lock_shape(&modes_after_reconcile, "attach+load depth 2, after reconcile");
     assert_eq!(new_rows, 700, "the loaded rows are wrong after commit");
     assert_eq!(mismatches, 0, "EXCEPT ALL oracle: IMV diverges from source");
+}
+
+// ---------------------------------------------------------------------------
+// T9 / T10 — AGGREGATE partition rollover.
+//
+// T1-T8 are all passthrough IMVs, where `end_query` is empty and the
+// intermediate half of the fresh-child gate short-circuits to "qualified"
+// without ever being exercised. Only an aggregate IMV has an intermediate
+// table, so only an aggregate fixture reaches the intermediate TRUNCATE.
+//
+// The failure mode there is SILENT: without the TRUNCATE the intermediate child
+// keeps the maintenance delta that the same transaction's load wrote into it
+// and the authoritative refill is added on top, so the aggregate double-counts.
+// No error is raised — only the bidirectional EXCEPT ALL oracle catches it,
+// which is why both tests assert through `assert_imv_correct` and on the
+// aggregate value itself rather than on lock shape.
+// ---------------------------------------------------------------------------
+
+#[pg_test]
+fn aggregate_rollover_create_and_load_is_not_double_counted() {
+    Spi::run("CREATE TABLE zg_src (k INT NOT NULL, v INT) PARTITION BY LIST (k)").expect("root");
+    Spi::run("CREATE TABLE zg_src_1 PARTITION OF zg_src FOR VALUES IN (1)").expect("p1");
+    Spi::run("INSERT INTO zg_src VALUES (1, 10), (1, 20)").expect("seed");
+    Spi::get_one::<String>(
+        "SELECT create_reflex_ivm('zg_imv', \
+         'SELECT k, SUM(v) AS total FROM zg_src GROUP BY k', \
+         NULL, NULL, NULL, NULL, ARRAY['k'])",
+    )
+    .expect("create")
+    .expect("create");
+
+    // Rollover: create next period's partition and load it in ONE transaction,
+    // so the load's own maintenance delta lands in the brand-new mirror children.
+    Spi::run("CREATE TABLE zg_src_5 PARTITION OF zg_src FOR VALUES IN (5)").expect("rollover");
+    Spi::run("INSERT INTO zg_src VALUES (5, 100), (5, 200), (5, 300)").expect("load");
+    Spi::run("SET CONSTRAINTS ALL IMMEDIATE").expect("deferred flush");
+
+    assert_imv_correct("zg_imv", "SELECT k, SUM(v) AS total FROM zg_src GROUP BY k");
+
+    let new_total = Spi::get_one::<i64>("SELECT total::int8 FROM zg_imv WHERE k = 5")
+        .expect("q")
+        .expect("no row for the new partition");
+    assert_eq!(
+        new_total, 600,
+        "aggregate over the rolled-over partition is wrong — the intermediate \
+         child kept its maintenance delta and the refill was added on top"
+    );
+    let old_total = Spi::get_one::<i64>("SELECT total::int8 FROM zg_imv WHERE k = 1")
+        .expect("q")
+        .expect("no row for the pre-existing partition");
+    assert_eq!(old_total, 30, "pre-existing partition must be untouched");
+}
+
+#[pg_test]
+fn aggregate_rollover_attach_then_load_is_not_double_counted() {
+    Spi::run("CREATE TABLE zh_src (k INT NOT NULL, v INT) PARTITION BY LIST (k)").expect("root");
+    Spi::run("CREATE TABLE zh_src_1 PARTITION OF zh_src FOR VALUES IN (1)").expect("p1");
+    Spi::run("INSERT INTO zh_src VALUES (1, 10), (1, 20)").expect("seed");
+    Spi::get_one::<String>(
+        "SELECT create_reflex_ivm('zh_imv', \
+         'SELECT k, SUM(v) AS total FROM zh_src GROUP BY k', \
+         NULL, NULL, NULL, NULL, ARRAY['k'])",
+    )
+    .expect("create")
+    .expect("create");
+
+    // The other route: ATTACH a pre-populated partition, then load more into it
+    // in the same transaction.
+    Spi::run("CREATE TABLE zh_src_5 (k INT NOT NULL, v INT)").expect("branch");
+    Spi::run("INSERT INTO zh_src_5 VALUES (5, 100), (5, 200)").expect("pre-populate");
+    Spi::run("ALTER TABLE zh_src ATTACH PARTITION zh_src_5 FOR VALUES IN (5)").expect("attach");
+    Spi::run("INSERT INTO zh_src VALUES (5, 300)").expect("load more");
+    Spi::run("SET CONSTRAINTS ALL IMMEDIATE").expect("deferred flush");
+
+    assert_imv_correct("zh_imv", "SELECT k, SUM(v) AS total FROM zh_src GROUP BY k");
+
+    let new_total = Spi::get_one::<i64>("SELECT total::int8 FROM zh_imv WHERE k = 5")
+        .expect("q")
+        .expect("no row for the new partition");
+    assert_eq!(
+        new_total, 600,
+        "aggregate over the attached-then-loaded partition is wrong"
+    );
+    let old_total = Spi::get_one::<i64>("SELECT total::int8 FROM zh_imv WHERE k = 1")
+        .expect("q")
+        .expect("no row for the pre-existing partition");
+    assert_eq!(old_total, 30, "pre-existing partition must be untouched");
 }

@@ -844,9 +844,17 @@ fn record_fresh_partitions(client: &mut pgrx::spi::SpiClient<'_>, child_quals: &
 /// True only when `child_qual` is one of the children this transaction's sync
 /// created. Any doubt — GUC unset, probe failure, unresolvable name, OID not
 /// listed — answers `false`, which routes the caller to the full DETACH/ATTACH
-/// swap. That asymmetry is deliberate: a false `true` would TRUNCATE a child
-/// holding rows that predate the transaction (silent data loss), while a false
-/// `false` only costs the slower, always-correct path.
+/// swap.
+///
+/// What that asymmetry buys, stated precisely: a wrong `true` costs the LOCK
+/// SHAPE, not data. TRUNCATE-then-fill-in-place is semantically identical to the
+/// swap — `build_swap_partition_ddl` also discards the old child wholesale and
+/// refills from the same authoritative `base_query`/`end_query` — so misjudging
+/// a child as fresh cannot by itself produce wrong rows; it takes
+/// `AccessExclusive` on the child where the swap would have taken it on the
+/// parent, which is the worse trade for readers of that one partition. A wrong
+/// `false` costs only the slower, always-correct path. Failing toward `false`
+/// stays the right default, but this predicate is not a data-loss guard.
 fn is_fresh_partition(client: &pgrx::spi::SpiClient<'_>, child_qual: &str) -> bool {
     client
         .select(
