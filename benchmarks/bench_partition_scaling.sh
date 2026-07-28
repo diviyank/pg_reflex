@@ -147,11 +147,17 @@ report() {
         ss = 0; for (i = 0; i < c; i++) ss += (tmp[i] - mu) ^ 2
         return 100 * sqrt(ss / c) / mu
     }
-    function verdict(e) {
-        if (e == "na")     return "unclear"
-        if (e < 0.35)      return "FLAT"
-        if (e < 1.35)      return "linear"
-        if (e < 1.75)      return "SUPERLINEAR"
+    # Growth (largest N relative to the cheapest point) is checked alongside the
+    # fitted slope because a curve that is flat at small N and then climbs fits a
+    # deceptively low slope.  The 1.11.1 flush regression landed exactly there:
+    # e = 0.55 but a 8x rise from its cheapest point.  A row cannot be called
+    # FLAT while it grows by more than 60%.
+    function verdict(e, growth) {
+        if (e == "na")                     return "unclear"
+        if (e < 0.35 && growth < 1.6)      return "FLAT"
+        if (e < 0.35)                      return "rising"
+        if (e < 1.35)                      return "linear"
+        if (e < 1.75)                      return "SUPERLINEAR"
         return "QUADRATIC+"
     }
     {
@@ -168,9 +174,15 @@ report() {
 
         printf "\n"
         if (unit == "ms") {
-            printf "BEST-OF-REPS TIME (ms) BY PARTITION COUNT N   [total data held CONSTANT across N]\n"
-            printf "  The minimum over repetitions estimates the deterministic cost; a checkpoint or\n"
-            printf "  an autovacuum landing in one rep inflates a mean but cannot deflate a minimum.\n"
+            printf "MEDIAN TIME (ms) BY PARTITION COUNT N   [total data held CONSTANT across N]\n"
+            printf "  The MEDIAN, not the minimum.  A regression can be a shift in the DISTRIBUTION\n"
+            printf "  rather than in the floor: when a predicate stops being prunable, the first few\n"
+            printf "  executions still get a custom plan that prunes on actual values and\n"
+            printf "  stay fast, while later generic-plan executions do not.  The minimum then picks\n"
+            printf "  the lucky rep and reports no regression at all.  Measured: on the 1.11.1 flush\n"
+            printf "  regression at N=200 every rep was worse than every rep of the fixed build, but\n"
+            printf "  min showed 14.0 vs 4.5 ms where median showed 53.2 vs 4.9 ms.\n"
+            printf "  The min and the CV are in the NOISE CHECK table below.\n"
         } else {
             printf "LOCK FOOTPRINT (locks held at end of the call) BY PARTITION COUNT N\n"
             printf "  A pure count: no timer, no cache, no competing process can move it.  This is\n"
@@ -181,27 +193,30 @@ report() {
         printf "  e ~ 0 constant in N   e ~ 1 linear in N   e ~ 2 quadratic in N\n\n"
         printf "%-26s", "metric"
         for (i = 1; i <= nn; i++) printf "%12s", "N=" nlist[i]
-        printf "%10s  %s\n", "slope e", "verdict"
+        printf "%9s%9s  %s\n", "slope e", "growth", "verdict"
         printf "%-26s", ""
         for (i = 1; i <= nn; i++) printf "%12s", "--------"
-        printf "%10s  %s\n", "-------", "-------"
+        printf "%9s%9s  %s\n", "-------", "------", "-------"
 
         for (mi = 1; mi <= nm; mi++) {
             m = morder[mi]
             printf "%-26s", m
-            sx = 0; sy = 0; sxx = 0; sxy = 0; np = 0
+            sx = 0; sy = 0; sxx = 0; sxy = 0; np = 0; lo = 0; hi = 0
             for (i = 1; i <= nn; i++) {
-                v = stat(m SUBSEP nlist[i], "min")
+                v = stat(m SUBSEP nlist[i], (unit == "ms") ? "median" : "min")
                 if (v < 0) { printf "%12s", "-"; continue }
                 printf "%12.2f", v
                 best[m, nlist[i]] = v
+                if (lo == 0 || v < lo) lo = v
+                if (v > hi) hi = v
                 if (v > 0) { x = log(nlist[i]); y = log(v)
                              sx += x; sy += y; sxx += x*x; sxy += x*y; np++ }
             }
+            g = (lo > 0) ? hi / lo : 0
             if (np >= 2 && (np*sxx - sx*sx) != 0) {
                 e = (np*sxy - sx*sy) / (np*sxx - sx*sx)
-                printf "%10.2f  %s\n", e, verdict(e)
-            } else printf "%10s  %s\n", "na", "unclear"
+                printf "%9.2f%8.1fx  %s\n", e, g, verdict(e, g)
+            } else printf "%9s%8.1fx  %s\n", "na", g, "unclear"
         }
 
         printf "\n"
@@ -240,8 +255,11 @@ report() {
 
         if (noise == 0) { printf "\n"; exit }
         printf "\n"
-        printf "NOISE CHECK   median (ms) and coefficient of variation per N\n"
+        printf "NOISE CHECK   best rep (ms) and coefficient of variation per N\n"
         printf "  A CV above ~30%% means that column is not trustworthy on its own; re-run.\n"
+        printf "  A best rep FAR below the median is not just noise: it is the signature of a\n"
+        printf "  plan that prunes on some executions and not others.  Compare against the table\n"
+        printf "  above rather than reading either number alone.\n"
         printf "%-26s", "metric"
         for (i = 1; i <= nn; i++) printf "%16s", "N=" nlist[i]
         printf "\n"
@@ -249,7 +267,7 @@ report() {
             m = morder[mi]
             printf "%-26s", m
             for (i = 1; i <= nn; i++) {
-                v = stat(m SUBSEP nlist[i], "median")
+                v = stat(m SUBSEP nlist[i], "min")
                 if (v < 0) { printf "%16s", "-"; continue }
                 printf "%10.2f %4.0f%%", v, stat(m SUBSEP nlist[i], "cv")
             }
