@@ -1532,6 +1532,36 @@ mod tests {
         Spi::connect(|client| crate::partition::list_partition_tree(client, root).len() as i64)
     }
 
+    /// Drive the per-child DETACH/ATTACH swap primitive directly, on an
+    /// arbitrary source-child name, and surface its `Result` as a string. The
+    /// operator entry points resolve leaves before calling it, so this is the
+    /// only way to hand it the input it must refuse: a source BRANCH whose
+    /// derived mirror child is a partitioned relation.
+    #[pg_extern]
+    fn crate_test_partition_swap_for_child(view: &str, src_child: &str) -> String {
+        let record = Spi::connect(|client| crate::sql_writer::registry::read_imv(client, view))
+            .expect("IMV not found in registry");
+        let schema = crate::query_decomposer::split_qualified_name(view)
+            .0
+            .unwrap_or("public")
+            .to_string();
+        let unlogged = record.storage_mode.eq_ignore_ascii_case("UNLOGGED");
+        Spi::connect_mut(|client| {
+            match crate::partition::execute_partition_swap_for_child(
+                client,
+                view,
+                &schema,
+                src_child,
+                &record.base_query,
+                &record.end_query,
+                unlogged,
+            ) {
+                Ok(()) => "OK".to_string(),
+                Err(e) => format!("ERROR: {}", e),
+            }
+        })
+    }
+
     /// Call `reconcile_one` directly, bypassing `reflex_reconcile`'s bottom-up
     /// descent into generated children. PS-12 test 2 needs this to exercise the
     /// backstop on a materialised wrapper in isolation: the operator entry point
@@ -1565,6 +1595,7 @@ mod tests {
     include!("tests/pg_test_coverage.rs");
     include!("tests/pg_test_partition.rs");
     include!("tests/pg_test_subpartition.rs");
+    include!("tests/pg_test_subpartition_dataloss.rs");
     include!("tests/pg_test_partition_attach_locks.rs");
     include!("tests/pg_test_partition_dispatch.rs");
     include!("tests/pg_test_audit.rs");
