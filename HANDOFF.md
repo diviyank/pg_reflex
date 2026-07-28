@@ -66,15 +66,42 @@ The CHECK added on the partitioned child propagates to every leaf
 `q_5_check_m1..m12`), and `PartConstraintImpliedByRelConstraint` then skips the
 scan for the whole subtree. **The approach is not killed by H3.**
 
-**But the CHECK turned out not to be needed, and I deliberately did not add one.**
-The parent lock during the validation scan is `ShareUpdateExclusiveLock`, which
-does not conflict with `AccessShare` — readers are unblocked *whether or not*
-validation runs. The CHECK therefore buys latency, not availability, at the price
-of disabling PostgreSQL's own proof that the incoming rows match the bound. Per
-the asymmetric-correctness rule I let PG validate. In the shipped design the
-child is attached while still **empty**, so validation is free anyway and the
-question is moot — no predicate has to be derived at all, which also removes the
-whole class of "derived predicate is subtly wrong → silently wrong data" risk.
+**But the CHECK is not needed, and I deliberately did not add one. The reason is
+simply that the shipped design attaches the child while it is still EMPTY.**
+Measured on bare PG 17.7, LIST-partitioned parent:
+
+| ATTACH | time |
+|---|---|
+| 2 000 000-row child, WITH the bound-matching CHECK | 4.9 ms |
+| 2 000 000-row child, WITHOUT the CHECK | 162 ms |
+| **empty child, no CHECK** | **1.7 ms** |
+
+The validation scan has zero rows to scan, so it costs nothing. The 456.6 ms →
+0.26 ms speedup in the table above belongs to the **rejected** fill-then-attach
+design, where the child is full at attach time. Under the accepted
+attach-empty-then-fill shape the CHECK is not a latency/safety trade being
+declined — it is a cost that is never paid. It also means no bound predicate has
+to be derived for a not-yet-attached child at all, which removes the whole class
+of "derived predicate is subtly wrong → silently wrong rows attached" risk.
+
+**Do not re-open this.** Two related facts, measured, that bound how the fix
+should be argued:
+
+1. **The ATTACH lock is held to COMMIT.** The parent shows
+   `ShareUpdateExclusiveLock, granted` continuously from the ATTACH statement
+   until commit (verified over 10 s and 30 s holds); the incoming child shows
+   `AccessExclusiveLock`. Shortening the ATTACH statement therefore does **not**
+   shorten the lock window — the window is `[ATTACH executes → COMMIT]`
+   regardless. No argument of the form "a faster ATTACH reduces the freeze" is
+   valid, and none appears in this document or in the benchmark section.
+2. **What `ShareUpdateExclusive` on the root actually blocks**, probed from a
+   second session at `lock_timeout='1s'` with the ATTACH transaction open:
+   `SELECT` on the parent — OK; `INSERT` on the parent — OK; `VACUUM` on a
+   different child — OK; `ANALYZE <parent>` — **BLOCKED**; a second
+   `ATTACH PARTITION` — **BLOCKED**. So the residual cost of the fix's own lock
+   is a blocked ANALYZE/autovacuum on the root and serialized partition
+   maintenance. Readers and writers are unaffected, which is what makes the
+   end state acceptable.
 
 ### H4 — DEFAULT partitions. **RESOLVED. Real, bounded, and not a regression.**
 `ATTACH PARTITION` takes `AccessExclusiveLock` on the parent's DEFAULT partition
@@ -246,10 +273,15 @@ approved shape carries:
 3. no duplicate risk against `refill_tree_defaults` when the IMV's DEFAULT
    partition already holds rows for the incoming bound (T5b covers this).
 
-**This was my call and it should be reviewed.** If the reviewer wants the
-approved shape, M2's result is the key datum: the sync half alone leaves depth 1
-open, so whatever replaces the in-place fill must still remove the reconcile's
-DETACH at depth 1.
+Hazard 2 is the decisive one, and it is now settled: attaching the child empty
+also makes the CHECK unnecessary rather than merely optional (see H3 — an empty
+child's validation scan costs 1.7 ms because there is nothing to scan), so the
+approved design's only real advantage over this shape evaporates while its
+predicate-derivation risk remains. **The deviation was reviewed and accepted.**
+
+M2's result remains the key datum for anyone reconsidering: the sync half alone
+leaves depth 1 open, so whatever replaces the in-place fill must still remove the
+reconcile's DETACH at depth 1.
 
 Known residual, accepted and deliberate: if `refill_tree_defaults` routes drained
 default rows into the brand-new child, that child is no longer empty and the
@@ -260,35 +292,79 @@ work, which is the required direction. T5b pins the correctness of that path but
 
 ---
 
-## 8. What I was doing when I stopped
+## 7b. Benchmark — freeze window before / after
 
-Mid-verification of `0314d9e`. I had just applied the reader/worker rework to
-`src/tests/pg_test_partition_attach_locks.rs`, run `cargo fmt`, and was about to
-re-run `cargo pgrx test pg17 attach_new_partition`. That run has **not** happened.
+pgrx-managed PG 17.7 on port 28817. `.so` rebuilt and reinstalled between runs;
+**BEFORE = `src/partition.rs` at `2f8b786`, AFTER = `8963faa`** (both verified by
+`cargo pgrx install` immediately preceding the run). Fixture: 300 000 rows in the
+existing branch, an incoming pre-populated branch of 300 000 rows (12 monthly
+leaves at depth 2). A second session polls `SELECT count(*) … WHERE k = 1` — an
+UNRELATED partition — 60 times at `lock_timeout='2s'`; a third samples `pg_locks`
+on the IMV root every 50 ms. Two repetitions each.
 
-## 9. Next session, in order
+| | BEFORE (`2f8b786`) | AFTER (`8963faa`) |
+|---|---|---|
+| **depth 2** — root `AccessExclusive` window | **0.794 s / 0.709 s** | **none observed** |
+| depth 2 — root lock modes seen | AccessExclusive + ShareRowExclusive | ShareUpdateExclusive + ShareRowExclusive |
+| depth 2 — reader max latency (unrelated partition) | **865 ms / 827 ms** | **31.7 ms / 24.9 ms** |
+| depth 2 — ATTACH statement | 121.7 / 106.4 ms | 127.0 / 113.4 ms |
+| depth 2 — COMMIT | 857 / 804 ms | 649 / 603 ms |
+| **depth 1** — root `AccessExclusive` window | **0.479 s / 0.315 s** | **none observed** |
+| depth 1 — reader max latency | **547 ms / 342 ms** | **19.3 ms / 12.7 ms** |
+| depth 1 — ATTACH statement | 62.6 / 44.2 ms | 49.5 / 48.0 ms |
+| depth 1 — COMMIT | 536 / 364 ms | 354 / 350 ms |
+| oracle mismatches (all runs) | 0 | 0 |
 
-1. `df -h /private/tmp` first. Below ~5 GB free, `cargo pgrx test` hangs silently.
-2. `export CARGO_TARGET_DIR=/private/tmp/tb2` and run
-   `cargo pgrx test pg17 attach_new_partition`. Expect 6 tests. If T1/T2 hang,
-   the worker-session rework is still deadlocking — check that **nothing in the
-   test session itself** ever touches `la1_imv`/`la2_imv`/`la1_src`/`la2_src`,
-   since any such lock blocks the worker's cleanup `DROP`.
-3. Re-run the **full** `cargo pgrx test pg17`. Specifically confirm
-   `xsu_guard_reconcile_failure_flags_known_stale` and the two empty-registry
-   tests are green — those are the three that `0314d9e` claims to fix.
-4. Re-run mutation M1 and M3 once more on the final tree (they were run on
-   `4a75c92`, not on `0314d9e`).
-5. **The benchmark was never run.** `benchmarks/` has no lock/freeze script; I
-   wrote one at `/private/tmp/claude-502/.../scratchpad/bench_freeze.sh`
-   (may be gone — it is outside the worktree; rewrite if so). It needs
-   `cargo pgrx install` + `cargo pgrx start pg17`, a fixture, a reader loop with
-   `lock_timeout=2s`, and a `pg_locks` sampler, run once on `2f8b786` and once on
-   HEAD. Owed numbers: freeze window before/after, and the cost of the ATTACH
-   statement itself before/after (the fix moves no work into it in my design,
-   unlike the approved one — worth stating explicitly).
-6. Then `untreated_bugs/` hygiene: the report is still present and must be
-   removed, or narrowed to the `refill_tree_defaults` residual in §7.
+Reading these:
+
+* The freeze is gone at both depths: the root never reaches `AccessExclusive`,
+  and a reader of an unrelated partition goes from ~0.5–0.9 s of blocking to
+  ~13–32 ms of ordinary latency (~28×). At this fixture size the pre-fix block
+  stays under the 2 s `lock_timeout`, so it shows as latency rather than as
+  timeouts; the in-suite T1/T2 RED baseline, where the transaction is held open
+  across the polls, produced hard 2 s lock timeouts instead.
+* **The ATTACH statement's own cost is unchanged** (121.7 → 127.0 ms at depth 2;
+  62.6 → 49.5 ms at depth 1 — both within run-to-run noise). This design moves
+  **no** fill work into the ATTACH, unlike the approved design, which
+  deliberately would have.
+* Total transaction cost went *down* (857 → 649 ms, 536 → 354 ms): the in-place
+  fill of a provably empty child skips the swap's `CREATE … LIKE`, DETACH,
+  ATTACH, DROP and RENAME per node.
+* Note the lock-window rows, not the statement-cost rows, are the ones that
+  matter. `ATTACH`'s `ShareUpdateExclusive` on the parent is held to COMMIT
+  regardless of how long the statement itself takes (see H3), so a faster ATTACH
+  would not shorten any window.
+
+## 8. Status — verification complete
+
+Everything the previous session left owed is done and verified on the final tree:
+
+1. `cargo pgrx test pg17 attach_new_partition` — **6 passed, 0 failed**, no hang.
+   The worker-session rework holds: the test session never touches
+   `la1_imv`/`la2_imv`/`la1_src`/`la2_src` itself, so the worker's cleanup `DROP`
+   is never blocked and the fixtures leave nothing committed behind.
+2. Full `cargo pgrx test pg17` — **1548 passed, 0 failed, 0 ignored**. The three
+   tests `0314d9e` claimed to fix are green:
+   `pg_xsu_guard_reconcile_failure_flags_known_stale`,
+   `pg_cov_reflex_compact_all_imv_empty_registry`,
+   `pg_pg_test_reflex_compact_all_imv_empty_catalog`. That commit's message is
+   therefore true as written; no amendment needed.
+3. Mutations M1 and M3 re-run on the final tree — see §6.
+4. Benchmark — see §7b.
+5. `cargo fmt --check` clean; `cargo clippy --features pg17 --all-targets` reports
+   nothing for the changed files (the four `needless_borrow` warnings in
+   `src/tests/pg_test_audit.rs` predate this branch).
+
+## 9. `untreated_bugs/` hygiene — narrowed, not deleted
+
+`untreated_bugs/2026-07-27_sync_partition_add_holds_accessexclusive_on_imv_root.md`
+now covers exactly the `refill_tree_defaults` residual from §7: when the IMV's
+DEFAULT partition holds rows belonging to the incoming bound, the refill lands
+them in the brand-new child, the child is no longer empty, and the reconcile
+falls back to the full DETACH/ATTACH swap — so the root can still go
+`AccessExclusive` in that narrow case. It records the reachability conditions,
+two candidate fixes plus "leave it", and states explicitly that T5b pins the
+correctness of that path but deliberately does **not** assert its lock shape.
 
 ## 10. Dead ends — do not re-explore
 
