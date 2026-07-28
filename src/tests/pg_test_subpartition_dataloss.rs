@@ -498,6 +498,24 @@ fn pg_subpart_reconcile_repairs_an_already_flattened_mirror() {
     );
     assert_imv_correct("dl8v", fresh);
 
+    // reflex_audit DOES notice — the mirror's real leaves read as missing and
+    // the flattened parents as extra — but the remedy it prints for
+    // partition-tree-drift is `reflex_sync_partitions(..., TRUE)`, which is the
+    // operation that empties a flattened IMV. Pinned so the hazard is a
+    // measured fact operators can be warned about, not an inference from
+    // reading `src/audit/checks_b_drift.rs`.
+    let report: String = Spi::get_one("SELECT reflex_audit('dl8v')")
+        .expect("audit")
+        .expect("audit NULL");
+    assert!(
+        report.contains("partition-tree-drift"),
+        "reflex_audit did not flag a flattened mirror at all: {report}"
+    );
+    assert!(
+        report.contains("reflex_sync_partitions"),
+        "audit remedy changed — recheck the operator warning in HANDOFF.md: {report}"
+    );
+
     // The prescribed remedy.
     let res = Spi::get_one::<&str>("SELECT reflex_reconcile('dl8v')")
         .expect("rec")
