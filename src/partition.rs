@@ -2354,7 +2354,67 @@ fn build_scoped_cascade_reconcile(
 /// back: `reflex_reconcile_partition_impl` does it with an explicit
 /// `SubTransaction`, and the batch flush with the plpgsql `EXCEPTION` block it
 /// dispatches every root's statements through.
+///
+/// The swap's `ALTER TABLE`s are bracketed by [`set_internal_swap_root`], which
+/// tells the `ddl_command_end` event trigger that the partition-tree churn it is
+/// about to observe is pg_reflex's own and TRANSIENT. Without it a dependent IMV
+/// re-mirrors the mid-swap child set — adopting a `<dep>___reflex_swap_tgt_*`
+/// child and dropping its real one as a bound-collision orphan — and is left
+/// EMPTY once the closing RENAME puts the parent back. The bracket is cleared on
+/// the error path too; a hard error longjmps past it, but `SET LOCAL` unwinds
+/// with the aborting (sub)transaction, so the GUC cannot outlive the swap.
+///
+/// **The clear is load-bearing, and its failure mode is WRONG DATA, not
+/// staleness.** While the GUC is set, `__reflex_on_ddl_command_end` does
+/// *nothing at all* — no dependent auto-sync, no pending enqueue, no
+/// alter-source alarm. A leaked value therefore disables partition mirroring for
+/// the remainder of the transaction, and deleting `set_internal_swap_root(client,
+/// None)` below turns three tests RED: the branch's own
+/// `pg_rdd_suppression_ends_with_the_swap` plus
+/// `pg_fuzz_subpartition_swap_sequence_matches_recompute` and its shallow
+/// variant — both of which are **oracle** tests. The sub-partition path produces
+/// oracle-detectable divergence, not merely stale rows. Anyone narrowing,
+/// moving, or conditionalising this bracket must re-run those three.
 pub(crate) fn execute_partition_swap_for_child(
+    client: &mut pgrx::spi::SpiClient<'_>,
+    view_name: &str,
+    schema: &str,
+    src_child_bare: &str,
+    base_query: &str,
+    end_query: &str,
+    unlogged: bool,
+) -> Result<(), String> {
+    set_internal_swap_root(client, Some(view_name));
+    let result = swap_partition_child_ddl(
+        client,
+        view_name,
+        schema,
+        src_child_bare,
+        base_query,
+        end_query,
+        unlogged,
+    );
+    set_internal_swap_root(client, None);
+    result
+}
+
+/// Publish (or clear, with `None`) the IMV whose partition tree is mid-swap, in
+/// a transaction-scoped GUC `__reflex_on_ddl_command_end` reads. `SET LOCAL` so
+/// it reverts at (sub)transaction end even when a hard error skips the clear;
+/// the placeholder GUC name (contains a dot) needs no prior definition.
+fn set_internal_swap_root(client: &mut pgrx::spi::SpiClient<'_>, root: Option<&str>) {
+    let sql = match root {
+        Some(name) => format!(
+            "SET LOCAL pg_reflex.internal_swap_root = '{}'",
+            name.replace('\'', "''")
+        ),
+        None => "SET LOCAL pg_reflex.internal_swap_root = ''".to_string(),
+    };
+    let _ = client.update(&sql, None, &[]);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn swap_partition_child_ddl(
     client: &mut pgrx::spi::SpiClient<'_>,
     view_name: &str,
     schema: &str,

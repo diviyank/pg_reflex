@@ -881,10 +881,97 @@ pub(crate) fn reflex_reconcile_with_orphans(view_name: &str, drop_orphans: bool)
     // verified-repair check reads only `known_stale` on the named IMV, which this
     // rebuild clears, and the failed child was never `known_stale` in the first
     // place, so this string is the only signal that survives.
+    //
+    // The dependent cascade sits BELOW this return for the same reason. Content
+    // we have just declared stale must not be pushed into every dependent —
+    // each dependent's own rebuild clears its `known_stale` / `stale_reason` /
+    // `stale_since`, so cascading here would turn one IMV known to be stale into
+    // N IMVs freshly stamped healthy and derived from it.
     if child_failed {
         return "ERROR: generated sub-IMV reconcile failed";
     }
+
+    if !own.starts_with("ERROR") {
+        cascade_partitioned_rebuild_to_dependents(view_name, drop_orphans);
+    }
     own
+}
+
+/// Refresh the dependents of an IMV that was just rebuilt through the
+/// PARTITIONED path, which propagates nothing on its own.
+///
+/// The unpartitioned rebuild is `TRUNCATE` + `INSERT`, and every source carries
+/// an `AFTER TRUNCATE … FOR EACH STATEMENT` trigger plus the statement-level
+/// INSERT trigger, so consumers follow it. The partitioned rebuild moves rows
+/// with `CREATE TABLE AS` into a detached table and then DETACH/ATTACH/RENAME —
+/// pure DDL, no DML on the live target, so no data trigger can fire and no
+/// consumer ever learns the IMV changed. Left alone the dependent serves stale
+/// rows with `known_stale = f` and no signal at all.
+///
+/// This is the same fan-out `reflex_reconcile_partition` performs after its own
+/// swap (`partition.rs`), reached here for the whole-IMV rebuild. Restricted to
+/// the partitioned case on purpose: cascading after an unpartitioned rebuild
+/// would rebuild a consumer that ALSO has the rebuild's delta staged for COMMIT,
+/// double-counting it — the hazard
+/// `reconcile_generated_child_without_propagating` exists to avoid.
+///
+/// Deliberately at the public entry point rather than inside `reconcile_one`:
+/// the chain descent rebuilds generated sub-IMVs through `reconcile_one` with
+/// their triggers suppressed *because* they must not propagate, and a cascade
+/// there would send a generated child back up to the root currently rebuilding
+/// it.
+///
+/// `drop_orphans` is forwarded, never hardcoded. The two-argument
+/// [`reflex_reconcile_with_orphans`] exists precisely so a caller that gates
+/// destruction on its own authorization — `reflex_doctor`, which refuses an F3
+/// orphan drop when the operator did not pass `drop_orphans` and then repairs
+/// through F4 — does not reach that destruction by the back door. Calling the
+/// one-argument `reflex_reconcile` here would re-open that door one level down:
+/// a dependent's PRESERVED orphan partition still holds the user's rows, and
+/// `reflex_reconcile(parent, FALSE)` must not drop it.
+///
+/// Cost is O(D) dispatches for D direct dependents of THIS node, once per
+/// reconcile — not once per swapped partition. There is no visited set, so on a
+/// DAG with fan-in a shared node is rebuilt once per path rather than once;
+/// that is redundant work, not incorrect (a full rebuild is idempotent), and is
+/// tracked separately.
+fn cascade_partitioned_rebuild_to_dependents(view_name: &str, drop_orphans: bool) {
+    let dependents: Vec<String> = Spi::connect(|client| {
+        client
+            .select(
+                "SELECT unnest(r.graph_child) AS dep \
+                 FROM public.__reflex_ivm_reference r \
+                 WHERE r.name = $1 \
+                   AND r.partition_columns IS NOT NULL \
+                   AND array_length(r.partition_columns, 1) > 0",
+                None,
+                &[unsafe {
+                    DatumWithOid::new(view_name.to_string(), PgBuiltInOids::TEXTOID.oid().value())
+                }],
+            )
+            .unwrap_or_report()
+            .filter_map(|row| {
+                row.get_by_name::<&str, _>("dep")
+                    .unwrap_or(None)
+                    .map(|s| s.to_string())
+            })
+            .collect()
+    });
+
+    for dep in &dependents {
+        let result = reflex_reconcile_with_orphans(dep, drop_orphans);
+        if result.starts_with("ERROR") {
+            warning!(
+                "pg_reflex: '{}' was rebuilt but refreshing its dependent '{}' returned: {} \
+                 — that dependent is STALE; run SELECT reflex_rebuild_imv('{}') once the \
+                 cause is cleared",
+                view_name,
+                dep,
+                result,
+                dep
+            );
+        }
+    }
 }
 
 /// WARN when the trigger-depth gate suppresses recursion for an IMV that
