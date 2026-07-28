@@ -437,6 +437,67 @@ The threshold is relative to the IMV's size, not absolute.
 create-partition-and-bulk-load transaction can still freeze the IMV when the load
 is large relative to the IMV — via that other defect, not this one.
 
+## 7e. Second review round — F3 (false green on the intermediate TRUNCATE)
+
+The reviewer proved the intermediate TRUNCATE at `src/partition.rs` was reachable
+by **no test at all**: deleting it left all 1550 green. Every lock test to that
+point used a **passthrough** IMV, where `end_query.is_empty()` short-circuits
+both `int_is_empty` and `int_is_fresh` to `true`, so the intermediate branch was
+never entered. Only an aggregate IMV has an intermediate table.
+
+The failure mode is silent — a wrong `SUM`, no error — so the covering tests
+assert through `assert_imv_correct` and on the aggregate value, never on lock
+shape:
+
+* `aggregate_rollover_create_and_load_is_not_double_counted`
+* `aggregate_rollover_attach_then_load_is_not_double_counted`
+
+**Mutation M7** (delete the intermediate TRUNCATE block): both go **RED on the
+oracle** — `EXCEPT ALL oracle failed for 'zg_imv': 1 mismatches` and the same for
+`zh_imv` — which is the required signal, not a lock assertion.
+
+### T8's name was overselling its coverage
+
+Renamed to `attach_then_load_partition_depth2_row_counts_and_root_lock_guard`
+and documented in place. Its lock assertions are a regression guard only: at
+mirror depth 2 the swap DETACHes off the intermediate branch, never off the
+root, so they cannot distinguish the fresh-child mechanism working from broken
+(it stays green under M5). What is load-bearing there are its row-count and
+oracle assertions, which catch M6 — the depth-1 test cannot, because there the
+duplicate INSERT collides with the IMV's unique key and the reconcile's error is
+discarded upstream. Nothing was weakened.
+
+### A doc comment that was wrong in the conservative direction
+
+`is_fresh_partition`'s comment claimed a false `true` would cause "silent data
+loss". It would not: TRUNCATE-then-fill-in-place is semantically identical to the
+swap, since `build_swap_partition_ddl` also discards the old child wholesale and
+refills from the same authoritative query. A wrong `true` costs the **lock
+shape**, not data. The comment and the escalation report's correctness note now
+say the same accurate thing. The predicate still fails toward `false` — that
+remains right, just not for the reason previously written.
+
+### The escalation report did not reproduce as filed
+
+`2026-07-28_large_delta_full_reconcile_swaps_every_partition.md` omitted
+`ANALYZE`. Path B is gated at `src/lib.rs:1316` on `reltuples >= 1000`, and a
+fresh fixture has `reltuples = -1`, so the escalation never fires and an operator
+following the reproduction concludes the bug does not exist. The report now
+carries the `ANALYZE`, documents the gate, and documents that the second
+condition is a **ratio** (`delta / reltuples >= wipe_threshold`, default 0.5,
+`src/lib.rs:1317-1320`) — which is what actually explains why 50 k into 300 k
+does not escalate while 50 k into 50 k does.
+
+### Sub-partition report upgraded from hypothesis to confirmed
+
+`src/lib.rs:1148` resolves the partition ROOT into `_part_root` but uses it only
+for the pending enqueue; `src/lib.rs:1181` selects IMVs to sync with
+`depends_on @> ARRAY[_parent]` — the immediate parent, not the root. Recorded
+with that evidence. **Left unfixed on purpose**: separate defect, later batch.
+
+Final: `cargo pgrx test pg17` **1552 passed, 0 failed**; `cargo fmt --check`
+clean; clippy reports nothing for the changed files.
+
 ## 8. Status — verification complete (updated after the review round)
 
 Everything the previous session left owed is done and verified on the final tree:
@@ -457,8 +518,8 @@ Everything the previous session left owed is done and verified on the final tree
    nothing for the changed files (the four `needless_borrow` warnings in
    `src/tests/pg_test_audit.rs` predate this branch).
 
-Superseded by the review round: the suite is now **1550 passed, 0 failed** with
-the two new F1 tests, and the lock tests each run against their own throwaway
+Superseded by the review round: the suite is now **1552 passed, 0 failed** with
+the two F1 tests and the two aggregate-rollover tests, and the lock tests each run against their own throwaway
 database. That last change was forced: they are the only tests in the suite that
 commit global state, and
 `drop_deferred_imv_wipes_every_nonmaintenance_table` takes a cluster-wide census
