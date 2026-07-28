@@ -1565,6 +1565,7 @@ mod tests {
     include!("tests/pg_test_coverage.rs");
     include!("tests/pg_test_partition.rs");
     include!("tests/pg_test_subpartition.rs");
+    include!("tests/pg_test_partition_attach_locks.rs");
     include!("tests/pg_test_partition_dispatch.rs");
     include!("tests/pg_test_audit.rs");
     include!("tests/pg_test_fuzz.rs");
