@@ -92,21 +92,32 @@ Review verdict was DO-NOT-MERGE on **F1**, which I concede in full.
 * **F2 (MEDIUM, fixed).** The cascade ran *above* the `child_failed` early return, so a
   reconcile deliberately reported as ERROR first laundered known-stale content into every
   dependent and cleared their `known_stale`. Moved below the gate.
-* **F4 (LOW, fixed).** **T9** is the missing negative coverage: the GUC must be `''` after
-  a reconcile, and ordinary source DDL in the same transaction must still mirror into
-  parent *and* dependent.
+* **F4 (re-graded MEDIUM, fixed).** **T9** is the missing negative coverage: the GUC must
+  be `''` after a reconcile, and ordinary source DDL in the same transaction must still
+  mirror into parent *and* dependent. Filed as LOW on the assumption that a leaked GUC
+  causes staleness; M4 shows it also breaks two *oracle* tests on the sub-partition path,
+  so the real failure mode is **wrong data**. See the M4 row below.
 
-**F2 has no test, deliberately, and this is a known gap.** `child_failed` requires a
-generated sub-IMV whose reconcile fails. `generated_dependencies_shallowest_first` filters
-on `enabled` and `REBUILDABLE_NODE`, so the disabled and decomposed-wrapper routes are
-excluded; the only remaining route is `ERROR: partition reconcile failed` from a
-partitioned generated sub-IMV. I tried to provoke that by planting a VIEW on a swap
-table's name (it survives `cleanup_orphan_swap_tables`, which only drops `relkind='r'`) —
-the `CREATE TABLE` collision **raises** rather than returning a soft `Err`, aborting the
-transaction instead of producing `child_failed`. That test was removed rather than
-weakened. Every other route I found needs hand-written registry state, which this
-project's history explicitly forbids. **F2 therefore lands code-read-verified only**, on
-the strength of the invariant its own adjacent comment states.
+**F2 is pinned by T8.** My earlier conclusion that it could not be tested was **wrong**,
+and the refutation is worth recording. The parts were right — `REBUILDABLE_NODE` and
+`is_decomposed_wrapper_row` are mutually exclusive, and `COALESCE(ref.enabled, TRUE)`
+closes the disabled route — but I stopped at the first mechanism I tried for the one
+remaining route (planting a VIEW on a swap-table name; the `CREATE TABLE` collision
+**raises** instead of returning a soft `Err`, so it aborts rather than setting
+`child_failed`) and generalised from that single failure to "unreachable".
+
+The reachable fixture needs a CTE that is BOTH an aggregate (→ `REBUILDABLE_NODE`, not a
+wrapper) and emits the partition column (→ `compute_cte_partition_subset` partitions the
+sub-IMV). DETACHing one of that sub-IMV's intermediate children then makes the
+pre-reconcile sync's `CREATE … IF NOT EXISTS … PARTITION OF` skip the still-existing name
+rather than re-attach it, so the swap reads an empty bound and returns the soft
+`Err("missing intermediate bound")`. No hand-written registry state anywhere.
+
+T8 asserts an **exact** before/after aggregate, not a threshold — the reviewer's first
+version of this fixture was a false green precisely because it thresholded on a value the
+natural data already exceeded. T8 additionally asserts the root WAS rebuilt, so the test
+pins the co-reachable `own = RECONCILED` + `child_failed = true` case rather than a plain
+early exit.
 
 ## Self-mutation
 
@@ -115,10 +126,19 @@ the strength of the invariant its own adjacent comment states.
 | **M1** guard defeated (`IF _swap_root IS NOT NULL AND FALSE`) | T5 only, with `rdd6d___reflex_swap_tgt_rdd6p_rdd6s_c` | T1-T4 |
 | **M2** cascade call removed | T1 (6 oracle mismatches), T3, T4a | T2, T5, T4b |
 | **M3** `drop_orphans` hardcoded back to `true` | T7 only — `rdd8d_rdd8p_rdd8s_c` destroyed | all others |
-| **M4** `set_internal_swap_root(client, None)` deleted | T9 only — GUC left as `"rddad"` | all others |
+| **M4** `set_internal_swap_root(client, None)` deleted | **three** tests — T9 (GUC left as `"rddad"`), `pg_fuzz_subpartition_swap_sequence_matches_recompute`, and its shallow variant. Suite 1577/3. | all others |
+| **M5** cascade restored above the `child_failed` gate | T8 only — dependent 45039 (drifted) → 42039 (cascaded), the exact 3×1000 drift | all others |
 
-Each mutation moves exactly one property's tests and nothing else, so no test is standing
-in for another.
+**M4's blast radius corrects the F4 grade upward.** The two extra tests are *oracle*
+tests, so a leaked `internal_swap_root` produces oracle-detectable **wrong data** on the
+sub-partition path — not the silent staleness the original LOW grade assumed. While the
+GUC is set the event trigger does nothing at all: no dependent auto-sync, no pending
+enqueue, no alter-source alarm. The doc comment on
+`execute_partition_swap_for_child` now says this explicitly and names the three tests to
+re-run.
+
+I originally wrote that each mutation moves exactly one property's tests; **that sentence
+was wrong and is withdrawn.** M1, M3 and M5 do isolate to a single test each; M4 does not.
 
 M1 initially left **all** tests green — a false green. The cascade repairs a
 mirror the swap corrupted, so a test that goes through `reflex_reconcile` cannot
@@ -158,11 +178,11 @@ per *path* rather than per node (filed, see below).
 
 ## State
 
-- Tests: `src/tests/pg_test_reconcile_dependent_dataloss.rs` (8 `#[pg_test]`),
+- Tests: `src/tests/pg_test_reconcile_dependent_dataloss.rs` (9 `#[pg_test]`),
   included from `src/lib.rs`.
-- All 8 GREEN; each measured RED under its own mutation (M1-M4), except the
-  `child_failed` half of F2 — see the fix-round section for why.
-- Full `cargo pgrx test pg17`: **1580 passed, 0 failed**. `cargo fmt` clean.
+- All 9 GREEN, and every one measured RED under a mutation of the property it
+  pins (M1-M5).
+- Full `cargo pgrx test pg17`: **1581 passed, 0 failed**. `cargo fmt` clean.
   `cargo clippy` — 4 pre-existing `needless_borrow` warnings in
   `src/tests/pg_test_audit.rs`, none from this branch.
 - No registry column added. No version bump / CHANGELOG / `sql/*--*.sql`
