@@ -422,13 +422,16 @@ pub(crate) fn reconcile_one(view_name: &str, drop_orphans: bool) -> &'static str
             .unwrap_or(false);
 
         // 1.5.3 (plans/partitioning_3.md §1 follow-up): partitioned IMVs
-        // skip the TRUNCATE-on-parent pattern and rebuild each child via
+        // skip the TRUNCATE-on-parent pattern and rebuild each mirror LEAF via
         // the same atomic DETACH/ATTACH swap used by
-        // `reflex_reconcile_partition`.  This keeps the
-        // AccessExclusiveLock window on the parent to per-child DDL only
-        // (microseconds) instead of holding it for the entire rebuild
-        // duration.  Readers pruning to a not-yet-swapped partition stay
-        // live throughout.
+        // `reflex_reconcile_partition`.
+        //
+        // Each swap DETACHes from the leaf's IMMEDIATE parent and PostgreSQL
+        // holds that `AccessExclusiveLock` to commit, so the lock lands on a
+        // branch — not the IMV root — whenever the mirror is deeper than one
+        // level. At mirror depth 1 the leaf's immediate parent IS the root, and
+        // readers of the IMV do block for the rest of the transaction; that
+        // residual case is tracked separately.
         if let Some(ref plan) = parsed_plan {
             if !plan.partition_columns.is_empty()
                 && !plan.partition_strategy.is_empty()
@@ -442,15 +445,47 @@ pub(crate) fn reconcile_one(view_name: &str, drop_orphans: bool) -> &'static str
                 let storage_mode: String = record.storage_mode.clone();
                 let unlogged = storage_mode.eq_ignore_ascii_case("UNLOGGED");
 
-                // Walk every source partition child and swap each.
-                let src_children =
-                    crate::partition::list_partition_children(client, &plan.anchor_source);
-                for src in &src_children {
+                // Resolve the mirror's LEAF nodes, exactly as
+                // `reflex_reconcile_partition_impl` does: expand the source tree
+                // to its leaves and map each one UP to the IMV's mirror depth.
+                //
+                // Iterating the source's IMMEDIATE children instead would hand
+                // the swap a top-level child, which on a depth->=2 mirror is a
+                // PARTITIONED relation the swap cannot rebuild — its
+                // `LIKE ... INCLUDING ALL` replacement carries no partitioning,
+                // so the mirror was silently flattened and the next sync then
+                // recreated those children empty. Resolving leaves also narrows
+                // the swap's `AccessExclusive` from the IMV root to the swapped
+                // leaf's immediate parent.
+                //
+                // At mirror depth 1 this yields exactly the old set — the source
+                // leaves' depth-1 ancestors are the source's immediate children —
+                // so single-level IMVs are unaffected.
+                let source_tree =
+                    crate::partition::list_partition_tree(client, &plan.anchor_source);
+                let mirror_depth = record
+                    .partition_depth
+                    .map(|d| d as usize)
+                    .unwrap_or_else(|| crate::partition::max_tree_depth(&source_tree));
+                let mut mirror_nodes: std::collections::BTreeSet<String> =
+                    std::collections::BTreeSet::new();
+                for leaf in source_tree
+                    .iter()
+                    .filter(|n| n.sub_strategy.is_none())
+                    .map(|n| n.bare_name.clone())
+                {
+                    let chain = crate::partition::leaf_ancestor_chain(&source_tree, &leaf);
+                    let node =
+                        crate::partition::ancestor_bare_at_depth(&chain, &leaf, mirror_depth)
+                            .unwrap_or_else(|| leaf.clone());
+                    mirror_nodes.insert(node);
+                }
+                for src_bare in &mirror_nodes {
                     if let Err(e) = crate::partition::execute_partition_swap_for_child(
                         client,
                         view_name,
                         &schema,
-                        &src.bare_name,
+                        src_bare,
                         &base_query,
                         &end_query,
                         unlogged,
@@ -458,7 +493,7 @@ pub(crate) fn reconcile_one(view_name: &str, drop_orphans: bool) -> &'static str
                         warning!(
                             "pg_reflex: per-partition reconcile of '{}' for child '{}' failed: {}",
                             view_name,
-                            src.bare_name,
+                            src_bare,
                             e
                         );
                         return "ERROR: partition reconcile failed";
@@ -502,7 +537,7 @@ pub(crate) fn reconcile_one(view_name: &str, drop_orphans: bool) -> &'static str
                 info!(
                     "pg_reflex: reconciled IMV '{}' (partitioned, {} children swapped)",
                     view_name,
-                    src_children.len()
+                    mirror_nodes.len()
                 );
                 return "RECONCILED";
             }

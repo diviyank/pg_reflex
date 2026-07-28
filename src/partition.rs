@@ -2368,6 +2368,33 @@ pub(crate) fn execute_partition_swap_for_child(
     let int_child_bare = intermediate_child_name(view_name, src_child_bare);
     let tgt_child_bare = target_child_name(view_name, src_child_bare);
 
+    // The swap replaces the child with `CREATE TABLE swap (LIKE old INCLUDING
+    // ALL)`. `LIKE` NEVER copies partitioning — PostgreSQL has no
+    // `INCLUDING PARTITIONING` — so on a PARTITIONED child the replacement is a
+    // plain table, and the DETACH/ATTACH/DROP that follows silently flattens the
+    // mirror and discards its whole sub-partition subtree. The data is still
+    // correct at that instant, so nothing complains; the next partition sync
+    // sees the shape drift, drops the flattened children and recreates them
+    // EMPTY, taking the IMV to zero rows.
+    //
+    // Both operator entry points resolve mirror LEAVES before calling here, so
+    // this guard is a backstop rather than a routine path. It refuses instead of
+    // raising: the caller keeps its transaction and decides what to report.
+    for (bare, what) in [(&tgt_child_bare, "target"), (&int_child_bare, "intermediate")] {
+        if what == "intermediate" && end_query.is_empty() {
+            continue;
+        }
+        if is_partitioned_relation(client, schema, bare) {
+            return Err(format!(
+                "cannot swap sub-partitioned {} child '{}' — the swap's \
+                 'LIKE ... INCLUDING ALL' replacement cannot carry partitioning and would \
+                 flatten the mirror; reconcile its leaves instead (reflex_reconcile_partition \
+                 with source_partition => '{}')",
+                what, bare, src_child_bare
+            ));
+        }
+    }
+
     let int_bound = read_partition_bound(client, schema, &int_child_bare);
     let tgt_bound = read_partition_bound(client, schema, &tgt_child_bare);
     let int_def = read_partition_constraint_def(client, schema, &int_child_bare);
@@ -2753,6 +2780,32 @@ fn read_partition_bound(client: &pgrx::spi::SpiClient<'_>, schema: &str, bare: &
                 .map(|s| s.to_string())
         })
         .unwrap_or_default()
+}
+
+/// True when `<schema>.<bare>` exists and is a PARTITIONED relation
+/// (`relkind = 'p'`). Absent or plain relations answer false, so callers that
+/// use this as a refusal guard fail toward "proceed" only for shapes the swap
+/// can actually rebuild.
+fn is_partitioned_relation(client: &pgrx::spi::SpiClient<'_>, schema: &str, bare: &str) -> bool {
+    client
+        .select(
+            "SELECT (c.relkind = 'p') AS is_part FROM pg_class c \
+             JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname = $1 AND c.relname = $2",
+            Some(1),
+            &[
+                unsafe {
+                    DatumWithOid::new(schema.to_string(), PgBuiltInOids::TEXTOID.oid().value())
+                },
+                unsafe {
+                    DatumWithOid::new(bare.to_string(), PgBuiltInOids::TEXTOID.oid().value())
+                },
+            ],
+        )
+        .ok()
+        .and_then(|mut it| it.next())
+        .and_then(|r| r.get_by_name::<bool, _>("is_part").ok().flatten())
+        .unwrap_or(false)
 }
 
 /// Return `pg_get_partition_constraintdef(child_oid)` — the boolean expression
