@@ -1,0 +1,6 @@
+# label: main-2f8b786   .so sha256:b4da40a4a19da494 built:2026-07-28T16:11:06   HEAD:ff09adbff5344ec084d8716a29e079b6c96c2cde
+roots	xids_consumed	xids_per_root	roots_until_64_overflow
+10	11	1.10	58
+25	26	1.04	61
+50	63	1.26	50
+100	116	1.16	55

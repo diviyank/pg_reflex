@@ -373,7 +373,7 @@ if [ "$SKIP_SUBXID" -eq 0 ]; then
     done
     echo ""
     echo "SUBTRANSACTION XIDs PER MULTI-ROOT FLUSH   (PGPROC_MAX_CACHED_SUBXIDS = 64)"
-    column -t -s $'\t' < "$SUBOUT" | grep -v '^#'
+    grep -v '^#' "$SUBOUT" | column -t -s $'\t'
     echo ""
     echo "  'roots_until_64_overflow' is the cliff: past it, every OTHER backend"
     echo "  reading this transaction's rows falls back to pg_subtrans lookups."
