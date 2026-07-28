@@ -1,3 +1,100 @@
+# HANDOFF — partitioned reconcile destroys its dependents
+
+Branch `fix/swap-ddl-destroys-dependents`, worktree
+`.claude/worktrees/agent-a0fa941f00af9d131`, based on
+`fix/swap-flattens-subpartitioned-child` @ `689ab95`. **PostgreSQL 17 only**
+(a reviewer is on pg16 and `cargo pgrx test` shares `~/.pgrx/<ver>/pgrx-install`),
+`CARGO_TARGET_DIR=/private/tmp/rfx-dep`.
+
+Treats
+`git show worktree-agent-a006921b9bcaad1dd:untreated_bugs/2026-07-28_partitioned_reconcile_destroys_dependent_imvs.md`.
+
+The predecessor branch's handoff for the sub-partition fix is kept verbatim
+below the horizontal rule; it is not mine and should not be edited.
+
+## Step 0 — falsification results
+
+**It still reproduces on this branch.** `c80113b` changed the swap set from the
+source's immediate children to the mirror's leaf set, but at mirror depth 1 the
+two coincide, so the `ALTER TABLE`s still name the IMV root and the event
+trigger still sees the transient child set.
+
+Measured on `689ab95`, pg17, real IMVs over a real LIST(k) source:
+
+| test | before the fix |
+|---|---|
+| T1 partitioned parent + auto-partitioned dependent | dependent 3 rows → **0** |
+| T2 dependent mirror | gains `rdd2d___reflex_swap_tgt_*`, loses the real child |
+| T3 chain A→B→C | **both** B and C destroyed |
+| T4a unpartitioned dependent of a partitioned parent | **10 oracle mismatches** — stale |
+| T4b unpartitioned parent (control) | green, as the report claims |
+
+**Orphan-drop step confirmed** (report §4 was right): the drop is
+`drop_bound_collision_orphan`, reached from the *dependent's own*
+`reflex_sync_partitions`, not a shape-drift heal —
+`NOTICE: dropped confirmed orphan partition 'rdd3b_rdd3a_rdd3s_c' (bounds matched incoming child 'rdd3b___reflex_swap_tgt_rdd3a_rdd3s_c')`.
+
+**Trigger surface.** `reflex_reconcile` is the only entry point that leaves the
+damage standing. `reflex_reconcile_partition` and the COMMIT-time flush issue
+the same destructive DDL, but their own dependent cascade re-syncs and refills
+the dependent afterwards, so the damage is transient there.
+
+**New finding not in the report.** Destruction is only half of it. A dependent
+that *cannot* be destroyed (unpartitioned — nothing mirrors the swap tables into
+it) is still left silently STALE, because DETACH/ATTACH moves no rows and fires
+no data trigger. The report's §3 "the unpartitioned path propagates" holds only
+for an unpartitioned **parent** (T4b). Consequence for the fix: the
+`__reflex_`-name guard alone is **not sufficient** — on its own it converts data
+destruction into silent staleness, the same class of defect.
+
+## Fix — three coupled parts
+
+1. **`src/lib.rs` `__reflex_on_ddl_command_end`** returns immediately when
+   `pg_reflex.internal_swap_root` is set. Nothing but pg_reflex's own swap DDL
+   can run inside that window and none of it is a source change, so the guard is
+   O(1) with no catalog lookup — no name matching to get subtly wrong.
+2. **`src/partition.rs` `execute_partition_swap_for_child`** becomes a thin
+   wrapper bracketing the (renamed) `swap_partition_child_ddl` with
+   `set_internal_swap_root`. Single choke point: covers `reflex_reconcile`,
+   `reflex_reconcile_partition` and the flush at once.
+3. **`src/reconcile.rs` `cascade_partitioned_rebuild_to_dependents`**, called
+   from `reflex_reconcile_with_orphans` after a successful rebuild and **only**
+   for partitioned IMVs. Fans out `reflex_reconcile(dep)` over `graph_child`.
+
+Placement of (3) at the public entry point rather than inside `reconcile_one` is
+load-bearing: the chain descent rebuilds generated sub-IMVs through
+`reconcile_one` with their triggers suppressed *because* they must not
+propagate, and a cascade there would send a generated child back up into the
+root currently rebuilding it. Restricting it to the partitioned case is equally
+load-bearing: cascading after an unpartitioned rebuild would rebuild a consumer
+that also has the rebuild's delta staged for COMMIT, double-counting it.
+
+**Rejected:** reusing `build_scoped_cascade_reconcile` and the 80-line 3-way
+dispatch from `reflex_reconcile_partition_impl`. For a FULL reconcile every key
+is affected, so key-scoping degenerates into the full rebuild `reflex_reconcile`
+already performs, while deriving `affected_keys` costs an extra
+`SELECT DISTINCT` per partition — more code, more cost, no behaviour change.
+
+**Complexity: O(D) dispatches per reconcile and O(N) `SET LOCAL` statements.**
+Not superlinear in either.
+
+## State
+
+- Tests: `src/tests/pg_test_reconcile_dependent_dataloss.rs` (5 `#[pg_test]`),
+  included from `src/lib.rs`.
+- All 5 GREEN after the fix; each measured RED before it.
+- No registry column added. No version bump / CHANGELOG / `sql/*--*.sql`
+  migration — integrator owns those. **The migration must replay the
+  `__reflex_on_ddl_command_end` body**, or upgraded installs keep the
+  destructive one.
+
+## Recovery for operators already hit
+
+`SELECT reflex_rebuild_imv('<dependent>')` — one call, converges, repairs both
+the contents and the partition mirror.
+
+---
+
 # HANDOFF — sub-partition swap data loss
 
 Branch `fix/swap-flattens-subpartitioned-child` (worktree branch
