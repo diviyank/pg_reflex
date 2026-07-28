@@ -1596,6 +1596,7 @@ mod tests {
     include!("tests/pg_test_partition.rs");
     include!("tests/pg_test_subpartition.rs");
     include!("tests/pg_test_subpartition_dataloss.rs");
+    include!("tests/pg_test_reconcile_dependent_dataloss.rs");
     include!("tests/pg_test_partition_attach_locks.rs");
     include!("tests/pg_test_partition_dispatch.rs");
     include!("tests/pg_test_audit.rs");
