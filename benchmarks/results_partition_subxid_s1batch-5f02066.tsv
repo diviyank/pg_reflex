@@ -1,0 +1,6 @@
+# label: s1batch-5f02066   .so sha256:ea23909e7b34c36d built:2026-07-28T16:33:04   HEAD:68c37f63760e4e2dc36e284863a42ec2b211e134
+roots	xids_consumed	xids_per_root	roots_until_64_overflow
+10	21	2.10	30
+25	51	2.04	31
+50	101	2.02	31
+100	201	2.01	31
