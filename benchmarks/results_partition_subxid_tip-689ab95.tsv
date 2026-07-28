@@ -1,0 +1,6 @@
+# label: tip-689ab95   .so sha256:6169fdf54e7227d2 built:2026-07-28T16:34:48   HEAD:68c37f63760e4e2dc36e284863a42ec2b211e134
+roots	xids_consumed	xids_per_root	roots_until_64_overflow
+10	21	2.10	30
+25	51	2.04	31
+50	101	2.02	31
+100	217	2.17	29
