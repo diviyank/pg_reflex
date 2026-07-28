@@ -3782,3 +3782,592 @@ fn pg_part_sync_relocation_works_for_non_superuser_owner() {
             .unwrap_or(-1);
     assert_eq!(b_in_default, 0, "'b' must no longer sit in the IMV default");
 }
+
+// ---------------------------------------------------------------------------
+// Failure atomicity of `reflex_reconcile_partition`
+//
+// `reflex_reconcile_partition` reports failure by RETURNING a string starting
+// with "ERROR:" rather than by raising — so the calling statement COMMITS.
+// Everything the call did before the failure must therefore be undone by the
+// call itself, or an operator who reads "ERROR" (and reasonably concludes
+// nothing happened) is left with committed, destructive DDL.
+// ---------------------------------------------------------------------------
+
+/// Comma-joined, ordered child relnames of a partitioned relation — the exact
+/// partition set, not just its cardinality, so a drop compensated by a create
+/// cannot pass.
+fn partition_child_set(parent: &str) -> String {
+    Spi::get_one::<String>(&format!(
+        "SELECT COALESCE(string_agg(c.relname, ',' ORDER BY c.relname), '') \
+         FROM pg_inherits i \
+         JOIN pg_class c ON c.oid = i.inhrelid \
+         JOIN pg_class p ON p.oid = i.inhparent \
+         WHERE p.relname = '{parent}'"
+    ))
+    .expect("child set query")
+    .expect("child set")
+}
+
+/// T1 — a reconcile that fails must not commit the destructive orphan drop its
+/// own pre-sync performed. This is the field shape: a detached source child
+/// makes the pre-sync legitimately DROP the mirrored IMV child, then a bogus
+/// `source_partition` (arg 3 handed a key value instead of a partition name)
+/// fails the reconcile. The operator sees "ERROR" — and the IMV partition,
+/// with its data, must still be there.
+#[pg_test]
+fn pg_part_failed_reconcile_rolls_back_presync_orphan_drop() {
+    Spi::run(
+        "CREATE TABLE atom1 (id BIGINT, region TEXT NOT NULL, amount NUMERIC) \
+         PARTITION BY LIST (region)",
+    )
+    .expect("source");
+    Spi::run("CREATE TABLE atom1_n PARTITION OF atom1 FOR VALUES IN ('N')").expect("n");
+    Spi::run("CREATE TABLE atom1_s PARTITION OF atom1 FOR VALUES IN ('S')").expect("s");
+    Spi::run("INSERT INTO atom1 (id, region, amount) VALUES (1,'N',10),(2,'S',20)").expect("seed");
+    Spi::run(
+        "SELECT create_reflex_ivm('atom1v', \
+           'SELECT region, SUM(amount) AS total FROM atom1 GROUP BY region', \
+           NULL, NULL, NULL, NULL, ARRAY['region'])",
+    )
+    .expect("create imv");
+
+    let tgt_before = partition_child_set("atom1v");
+    let int_before = partition_child_set("__reflex_intermediate_atom1v");
+    assert!(
+        tgt_before.contains("atom1v_atom1_s"),
+        "fixture must start with the S mirror child, got: {tgt_before}"
+    );
+    let rows_before = Spi::get_one::<i64>("SELECT count(*) FROM atom1v")
+        .expect("q")
+        .expect("c");
+    assert_eq!(rows_before, 2, "fixture must start with both region rows");
+
+    // The source child genuinely goes away, so the pre-sync's orphan drop is
+    // correct in isolation — it is the FAILED reconcile that must undo it.
+    Spi::run("ALTER TABLE atom1 DETACH PARTITION atom1_s").expect("detach s");
+
+    let msg = Spi::get_one::<String>(
+        "SELECT reflex_reconcile_partition('atom1v', 'region', 'no_such_source_child')",
+    )
+    .expect("call")
+    .expect("msg");
+    assert!(
+        msg.starts_with("ERROR"),
+        "reconcile of a bogus source partition must report ERROR, got: {msg}"
+    );
+
+    assert_eq!(
+        partition_child_set("atom1v"),
+        tgt_before,
+        "a reconcile that reports ERROR must leave the target partition set untouched (msg: {msg})"
+    );
+    assert_eq!(
+        partition_child_set("__reflex_intermediate_atom1v"),
+        int_before,
+        "a reconcile that reports ERROR must leave the intermediate partition set untouched (msg: {msg})"
+    );
+    let rows_after = Spi::get_one::<i64>("SELECT count(*) FROM atom1v")
+        .expect("q")
+        .expect("c");
+    assert_eq!(
+        rows_after, 2,
+        "the dropped child's DATA must come back too, not just an empty child (msg: {msg})"
+    );
+    let s_total = Spi::get_one::<pgrx::AnyNumeric>("SELECT total FROM atom1v WHERE region = 'S'")
+        .expect("q")
+        .expect("s");
+    assert_eq!(s_total.to_string(), "20", "the S slice must survive intact");
+}
+
+/// T2 — the creative direction. A genuinely new source partition makes the
+/// pre-sync CREATE mirror children; a reconcile that then fails must roll that
+/// creation back too, so "ERROR" means the whole call was a no-op.
+#[pg_test]
+fn pg_part_failed_reconcile_rolls_back_presync_child_creation() {
+    Spi::run(
+        "CREATE TABLE atom2 (id BIGINT, region TEXT NOT NULL, amount NUMERIC) \
+         PARTITION BY LIST (region)",
+    )
+    .expect("source");
+    Spi::run("CREATE TABLE atom2_n PARTITION OF atom2 FOR VALUES IN ('N')").expect("n");
+    Spi::run("CREATE TABLE atom2_s PARTITION OF atom2 FOR VALUES IN ('S')").expect("s");
+    Spi::run("INSERT INTO atom2 (id, region, amount) VALUES (1,'N',10),(2,'S',20)").expect("seed");
+    Spi::run(
+        "SELECT create_reflex_ivm('atom2v', \
+           'SELECT region, SUM(amount) AS total FROM atom2 GROUP BY region', \
+           NULL, NULL, NULL, NULL, ARRAY['region'])",
+    )
+    .expect("create imv");
+
+    let tgt_before = partition_child_set("atom2v");
+    let int_before = partition_child_set("__reflex_intermediate_atom2v");
+
+    // A new source partition the IMV does not mirror yet — the shape left by a
+    // partition created while the DDL hook was not in force (restore, replica
+    // promotion, `ALTER EVENT TRIGGER … DISABLE`). It is the RECONCILE's own
+    // pre-sync that must create `atom2v_atom2_e` (+ its intermediate), not the
+    // ddl_command_end auto-sync, or the creation would sit outside the scope
+    // this test is about.
+    Spi::run("ALTER EVENT TRIGGER reflex_on_ddl_command_end DISABLE").expect("disable ddl hook");
+    Spi::run("CREATE TABLE atom2_e PARTITION OF atom2 FOR VALUES IN ('E')").expect("e");
+    Spi::run("ALTER EVENT TRIGGER reflex_on_ddl_command_end ENABLE").expect("re-enable ddl hook");
+    assert!(
+        !partition_child_set("atom2v").contains("atom2v_atom2_e"),
+        "fixture precondition: the E mirror must not exist before the reconcile"
+    );
+
+    let msg = Spi::get_one::<String>(
+        "SELECT reflex_reconcile_partition('atom2v', '', 'no_such_source_child')",
+    )
+    .expect("call")
+    .expect("msg");
+    assert!(
+        msg.starts_with("ERROR"),
+        "reconcile of a bogus source partition must report ERROR, got: {msg}"
+    );
+
+    assert_eq!(
+        partition_child_set("atom2v"),
+        tgt_before,
+        "a reconcile that reports ERROR must roll back the children its pre-sync created \
+         (msg: {msg})"
+    );
+    assert_eq!(
+        partition_child_set("__reflex_intermediate_atom2v"),
+        int_before,
+        "a reconcile that reports ERROR must roll back the intermediate children its pre-sync \
+         created (msg: {msg})"
+    );
+}
+
+/// T3 — the happy path is unchanged: a successful reconcile still commits its
+/// work (the pre-sync's AND the swap's), the mirrored child stays usable, and
+/// the IMV still matches a fresh recompute under the bidirectional EXCEPT ALL
+/// oracle.
+#[pg_test]
+fn pg_part_successful_reconcile_still_commits_and_stays_correct() {
+    Spi::run(
+        "CREATE TABLE atom3 (id BIGINT, region TEXT NOT NULL, amount NUMERIC) \
+         PARTITION BY LIST (region)",
+    )
+    .expect("source");
+    Spi::run("CREATE TABLE atom3_n PARTITION OF atom3 FOR VALUES IN ('N')").expect("n");
+    Spi::run("CREATE TABLE atom3_s PARTITION OF atom3 FOR VALUES IN ('S')").expect("s");
+    Spi::run("INSERT INTO atom3 (id, region, amount) VALUES (1,'N',10),(2,'S',20)").expect("seed");
+    Spi::run(
+        "SELECT create_reflex_ivm('atom3v', \
+           'SELECT region, SUM(amount) AS total FROM atom3 GROUP BY region', \
+           NULL, NULL, NULL, NULL, ARRAY['region'])",
+    )
+    .expect("create imv");
+
+    // A new source partition the reconcile's own pre-sync must mirror (the DDL
+    // hook is held off so the creation belongs to the reconcile) — work that
+    // has to SURVIVE the call, since the reconcile succeeds.
+    Spi::run("ALTER EVENT TRIGGER reflex_on_ddl_command_end DISABLE").expect("disable ddl hook");
+    Spi::run("CREATE TABLE atom3_e PARTITION OF atom3 FOR VALUES IN ('E')").expect("e");
+    Spi::run("ALTER EVENT TRIGGER reflex_on_ddl_command_end ENABLE").expect("re-enable ddl hook");
+
+    let top_xid = Spi::get_one::<i64>("SELECT pg_current_xact_id()::text::bigint")
+        .expect("xid")
+        .expect("xid");
+
+    let msg = Spi::get_one::<String>("SELECT reflex_reconcile_partition('atom3v', '', 'atom3_e')")
+        .expect("call")
+        .expect("msg");
+    assert!(
+        msg.starts_with("RECONCILED partitions"),
+        "expected RECONCILED, got: {msg}"
+    );
+
+    assert!(
+        partition_child_set("atom3v").contains("atom3v_atom3_e"),
+        "the pre-sync's new child must SURVIVE a successful reconcile"
+    );
+    // The surviving mirror is a working partition, not just a catalog entry:
+    // maintenance into the new key must land and stay correct.
+    Spi::run("INSERT INTO atom3 (id, region, amount) VALUES (3,'E',30)").expect("seed e");
+    assert_imv_correct(
+        "atom3v",
+        "SELECT region, SUM(amount) AS total FROM atom3 GROUP BY region",
+    );
+
+    // The work ran inside a subtransaction of its own: the registry row it
+    // wrote carries that subtransaction's xid, not the top-level one. Without
+    // a subtransaction there is nothing for a failed call to roll back to.
+    let ref_xmin = Spi::get_one::<i64>(
+        "SELECT xmin::text::bigint FROM public.__reflex_ivm_reference WHERE name = 'atom3v'",
+    )
+    .expect("xmin")
+    .expect("xmin");
+    assert_ne!(
+        ref_xmin, top_xid,
+        "reconcile must run in its own subtransaction, but its registry write carries the \
+         top-level xid ({top_xid}) — nothing to roll back to"
+    );
+}
+
+/// T4 — the batch path (`skip_sync => true`, the shape `reflex_flush_partitions`
+/// dispatches per root) gets the SAME rollback. `skip_sync` skips the O(tree)
+/// prep, never the isolation.
+///
+/// The flush wraps its statements in a plpgsql `EXCEPTION` block, which is a
+/// subtransaction — but one that only rolls back on a RAISED error. Reconcile
+/// reports failure by RETURNING `ERROR: …`, so that block completes normally and
+/// RELEASEs, committing every child swapped before the failure. Here three real
+/// children are reconciled in one call alongside a fourth that cannot resolve;
+/// the three sort first, so they are swapped before the failure is reached.
+#[pg_test]
+fn pg_part_failed_skip_sync_reconcile_rolls_back_children_already_swapped() {
+    Spi::run(
+        "CREATE TABLE atom4 (id BIGINT, region TEXT NOT NULL, amount NUMERIC) \
+         PARTITION BY LIST (region)",
+    )
+    .expect("source");
+    for (child, key) in [("atom4_a", "A"), ("atom4_b", "B"), ("atom4_c", "C")] {
+        Spi::run(&format!(
+            "CREATE TABLE {child} PARTITION OF atom4 FOR VALUES IN ('{key}')"
+        ))
+        .expect("child");
+    }
+    Spi::run("INSERT INTO atom4 (id, region, amount) VALUES (1,'A',10),(2,'B',20),(3,'C',30)")
+        .expect("seed");
+    Spi::run(
+        "SELECT create_reflex_ivm('atom4v', \
+           'SELECT region, SUM(amount) AS total FROM atom4 GROUP BY region', \
+           NULL, NULL, NULL, NULL, ARRAY['region'])",
+    )
+    .expect("create imv");
+
+    // Real drift the reconcile would repair — so "was this child swapped?" is
+    // answered by data, not just by catalog identity.
+    Spi::run("UPDATE atom4v SET total = 999").expect("drift");
+    // Catalog identity too: a DETACH/ATTACH swap replaces the child relation, so
+    // a committed swap changes its oid.
+    let oids_before = Spi::get_one::<String>(
+        "SELECT string_agg(c.oid::text, ',' ORDER BY c.relname) FROM pg_class c \
+         WHERE c.relname IN ('atom4v_atom4_a','atom4v_atom4_b','atom4v_atom4_c')",
+    )
+    .expect("oids")
+    .expect("oids");
+
+    // `zzz_ghost` sorts after all three real children, so they are processed —
+    // and swapped — before the reconcile discovers it has no target bound.
+    let msg = Spi::get_one::<String>(
+        "SELECT reflex_reconcile_partition('atom4v', '', 'atom4_a,atom4_b,atom4_c,zzz_ghost', true)",
+    )
+    .expect("call")
+    .expect("msg");
+    assert!(
+        msg.starts_with("ERROR"),
+        "a batch reconcile naming an unresolvable child must report ERROR, got: {msg}"
+    );
+
+    let oids_after = Spi::get_one::<String>(
+        "SELECT string_agg(c.oid::text, ',' ORDER BY c.relname) FROM pg_class c \
+         WHERE c.relname IN ('atom4v_atom4_a','atom4v_atom4_b','atom4v_atom4_c')",
+    )
+    .expect("oids")
+    .expect("oids");
+    assert_eq!(
+        oids_before, oids_after,
+        "the batch path must roll back the children it had already swapped when a later \
+         child fails (msg: {msg})"
+    );
+    let repaired = Spi::get_one::<i64>("SELECT count(*) FROM atom4v WHERE total <> 999")
+        .expect("repaired probe")
+        .expect("repaired");
+    assert_eq!(
+        repaired, 0,
+        "no partial repair may survive a batch reconcile that reports ERROR (msg: {msg})"
+    );
+}
+
+/// T4b — the batch path still WORKS. Paired with T4 so "rolls back on failure"
+/// can never be satisfied by refusing to do anything.
+#[pg_test]
+fn pg_part_skip_sync_reconcile_still_repairs_on_success() {
+    Spi::run(
+        "CREATE TABLE atom4b (id BIGINT, region TEXT NOT NULL, amount NUMERIC) \
+         PARTITION BY LIST (region)",
+    )
+    .expect("source");
+    Spi::run("CREATE TABLE atom4b_n PARTITION OF atom4b FOR VALUES IN ('N')").expect("n");
+    Spi::run("CREATE TABLE atom4b_s PARTITION OF atom4b FOR VALUES IN ('S')").expect("s");
+    Spi::run("INSERT INTO atom4b (id, region, amount) VALUES (1,'N',10),(2,'S',20)")
+        .expect("seed");
+    Spi::run(
+        "SELECT create_reflex_ivm('atom4bv', \
+           'SELECT region, SUM(amount) AS total FROM atom4b GROUP BY region', \
+           NULL, NULL, NULL, NULL, ARRAY['region'])",
+    )
+    .expect("create imv");
+    Spi::run("UPDATE atom4bv SET total = 999 WHERE region = 'N'").expect("drift");
+
+    let msg =
+        Spi::get_one::<String>("SELECT reflex_reconcile_partition('atom4bv', '', 'atom4b_n', true)")
+            .expect("call")
+            .expect("msg");
+    assert!(
+        msg.starts_with("RECONCILED partitions"),
+        "skip_sync reconcile must still work, got: {msg}"
+    );
+    assert_imv_correct(
+        "atom4bv",
+        "SELECT region, SUM(amount) AS total FROM atom4b GROUP BY region",
+    );
+}
+
+/// T5 — the IMV-name advisory lock keeps the two-key
+/// `(hashtext(name), hashtext(reverse(name)))` form AND belongs to the caller's
+/// transaction, not to the reconcile's subtransaction.
+///
+/// PostgreSQL releases a lock first taken inside a subtransaction when that
+/// subtransaction rolls back. So the load-bearing case is the FAILING reconcile:
+/// callers such as `trigger/dispatch.rs` discard the returned `ERROR:` string and
+/// go on to run MERGE/DELETE/INSERT against the same IMV, and they must still be
+/// serialized against concurrent maintenance. `objsubid = 2` is PostgreSQL's
+/// marker for the two-int4-key advisory space; a one-key `bigint` lock lands in
+/// space `objsubid = 1` and would never mutually exclude against the rest of
+/// pg_reflex.
+#[pg_test]
+fn pg_part_reconcile_keeps_two_key_advisory_lock_even_when_it_fails() {
+    Spi::run(
+        "CREATE TABLE atom5 (id BIGINT, region TEXT NOT NULL, amount NUMERIC) \
+         PARTITION BY LIST (region)",
+    )
+    .expect("source");
+    Spi::run("CREATE TABLE atom5_n PARTITION OF atom5 FOR VALUES IN ('N')").expect("n");
+    Spi::run("CREATE TABLE atom5_s PARTITION OF atom5 FOR VALUES IN ('S')").expect("s");
+    Spi::run("INSERT INTO atom5 (id, region, amount) VALUES (1,'N',10),(2,'S',20)").expect("seed");
+    Spi::run(
+        "SELECT create_reflex_ivm('atom5v', \
+           'SELECT region, SUM(amount) AS total FROM atom5 GROUP BY region', \
+           NULL, NULL, NULL, NULL, ARRAY['region'])",
+    )
+    .expect("create imv");
+
+    let two_key_lock_count = || {
+        Spi::get_one::<i64>(
+            "SELECT count(*) FROM pg_locks \
+             WHERE locktype = 'advisory' AND pid = pg_backend_pid() AND objsubid = 2 \
+               AND classid::bigint = (hashtext('atom5v')::bigint & 4294967295) \
+               AND objid::bigint   = (hashtext(reverse('atom5v'))::bigint & 4294967295)",
+        )
+        .expect("lock probe")
+        .expect("lock count")
+    };
+
+    let failed = Spi::get_one::<String>(
+        "SELECT reflex_reconcile_partition('atom5v', 'region', 'no_such_source_child')",
+    )
+    .expect("call")
+    .expect("msg");
+    assert!(
+        failed.starts_with("ERROR"),
+        "expected the bogus reconcile to report ERROR, got: {failed}"
+    );
+    assert_eq!(
+        two_key_lock_count(),
+        1,
+        "a FAILED reconcile must leave the two-key advisory lock held by the caller's \
+         transaction — its rollback must not take the caller's mutual exclusion with it"
+    );
+
+    let ok = Spi::get_one::<String>("SELECT reflex_reconcile_partition('atom5v', 'N')")
+        .expect("call")
+        .expect("msg");
+    assert!(
+        ok.starts_with("RECONCILED partitions"),
+        "expected RECONCILED, got: {ok}"
+    );
+    assert_eq!(
+        two_key_lock_count(),
+        1,
+        "a SUCCESSFUL reconcile must still leave the two-key advisory lock held"
+    );
+}
+
+/// T6 — a reconcile whose swap RAISES, caught by a real plpgsql `EXCEPTION`
+/// handler, must be reported cleanly and leave the backend usable.
+///
+/// This is the shape every `reflex_doctor(fix => true)` partition repair takes
+/// (`__reflex_doctor_try_repair`), and the shape the deferred flush wraps every
+/// IMV's dispatch statements in. A subtransaction left open by the unwind would
+/// be rolled back by that handler INSTEAD of its own, desynchronising plpgsql's
+/// expression-context stack — an assertion failure and `SIGABRT` on a cassert
+/// build, silently mismatched state on a release build.
+///
+/// `drop_old_tgt` is a `DROP TABLE` with no CASCADE, so one dependent view is
+/// enough to make the swap raise for real, mid-flight.
+///
+/// NOTE ON FAILURE MODE: when this regresses it does not print a clean assertion
+/// — the backend aborts, so the run dies with `connection closed` and every
+/// later test reports "Could not obtain test mutex". A whole-suite collapse of
+/// that shape means the `SubTransaction` `Drop` contract broke; start here.
+#[pg_test]
+fn pg_part_raised_reconcile_failure_survives_plpgsql_exception_handler() {
+    Spi::run(
+        "CREATE TABLE atom6 (id BIGINT, region TEXT NOT NULL, amount NUMERIC) \
+         PARTITION BY LIST (region)",
+    )
+    .expect("source");
+    Spi::run("CREATE TABLE atom6_n PARTITION OF atom6 FOR VALUES IN ('N')").expect("n");
+    Spi::run("CREATE TABLE atom6_s PARTITION OF atom6 FOR VALUES IN ('S')").expect("s");
+    Spi::run("INSERT INTO atom6 (id, region, amount) VALUES (1,'N',10),(2,'S',20)").expect("seed");
+    Spi::run(
+        "SELECT create_reflex_ivm('atom6v', \
+           'SELECT region, SUM(amount) AS total FROM atom6 GROUP BY region', \
+           NULL, NULL, NULL, NULL, ARRAY['region'])",
+    )
+    .expect("create imv");
+
+    let children_before = partition_child_set("atom6v");
+    Spi::run("CREATE VIEW atom6_pin AS SELECT * FROM atom6v_atom6_n").expect("blocking view");
+
+    // The in-tree doctor repair wrapper: plpgsql, EXCEPTION WHEN OTHERS.
+    let repair = Spi::get_one::<String>(
+        "SELECT public.__reflex_doctor_try_repair( \
+           $q$SELECT reflex_reconcile_partition('atom6v','','atom6_n')$q$)",
+    )
+    .expect("repair call")
+    .expect("repair result");
+    assert!(
+        repair.starts_with("failed:"),
+        "the raised swap failure must be reported by the handler, got: {repair}"
+    );
+
+    // The backend is alive and the transaction still usable — the whole point.
+    let rows = Spi::get_one::<i64>("SELECT count(*) FROM atom6v")
+        .expect("post-failure query")
+        .expect("rows");
+    assert_eq!(rows, 2, "the IMV must still be readable after a caught raise");
+    assert_eq!(
+        partition_child_set("atom6v"),
+        children_before,
+        "a raised, caught reconcile failure must leave the partition set intact"
+    );
+    assert_imv_correct(
+        "atom6v",
+        "SELECT region, SUM(amount) AS total FROM atom6 GROUP BY region",
+    );
+}
+
+/// T7 — TWO nested `SubTransaction` guards unwinding together on a raise.
+///
+/// The dependent cascade re-enters `reflex_reconcile_partition` for a dependent
+/// partitioned on the same column (`src/partition.rs`, the `same_part` branch)
+/// via `client.update`, from inside the parent's still-open subtransaction AND
+/// inside the parent's live `SpiClient`. Making the NESTED swap raise is the
+/// only way to unwind two guards at once, and it is the one shape the
+/// success-path suite cannot reach.
+///
+/// The unwind has to run, in order: the nested `SpiClient` (`SPI_finish`), the
+/// nested `SubTransaction` (rollback), then the parent's pair — before the error
+/// reaches the plpgsql `EXCEPTION` handler that must roll back only its OWN
+/// subtransaction. Any guard that skips its turn leaves the handler rolling back
+/// someone else's, which aborts the backend.
+///
+/// Same failure mode as T6: a regression here kills the run rather than printing
+/// an assertion.
+#[pg_test]
+fn pg_part_nested_cascade_raise_unwinds_both_subtransactions() {
+    Spi::run("CREATE TABLE nst (id BIGINT, region TEXT NOT NULL, amount NUMERIC) PARTITION BY LIST (region)")
+        .expect("source");
+    Spi::run("CREATE TABLE nst_a PARTITION OF nst FOR VALUES IN ('A')").expect("a");
+    Spi::run("CREATE TABLE nst_b PARTITION OF nst FOR VALUES IN ('B')").expect("b");
+    Spi::run("INSERT INTO nst VALUES (1,'A',10),(2,'B',5)").expect("seed");
+
+    let parent = Spi::get_one::<String>(
+        "SELECT create_reflex_ivm('nstp', \
+           'SELECT region, SUM(amount) AS total FROM nst GROUP BY region', \
+           NULL, NULL, NULL, NULL, ARRAY['region'])",
+    )
+    .expect("parent imv")
+    .expect("parent imv result");
+    assert!(!parent.starts_with("ERROR"), "parent imv: {parent}");
+
+    // Dependent partitioned on the SAME column, so the cascade re-enters
+    // reflex_reconcile_partition rather than taking a scoped or full reconcile.
+    let dependent = Spi::get_one::<String>(
+        "SELECT create_reflex_ivm('nstd', \
+           'SELECT region, SUM(total) AS doubled FROM nstp GROUP BY region', \
+           NULL, NULL, NULL, NULL, ARRAY['region'])",
+    )
+    .expect("dependent imv")
+    .expect("dependent imv result");
+    assert!(!dependent.starts_with("ERROR"), "dependent imv: {dependent}");
+
+    let parent_children_before = partition_child_set("nstp");
+    let dependent_children_before = partition_child_set("nstd");
+
+    // Drift both levels, so "did this level's swap survive?" is answered by
+    // data. The parent goes to a value the reconcile WILL repair (to 10), and
+    // the dependent to one that satisfies the blocker below.
+    Spi::run("UPDATE nstp SET total = 77 WHERE region = 'A'").expect("drift parent");
+    Spi::run("UPDATE nstd SET doubled = 9999 WHERE region = 'A'").expect("drift dependent");
+
+    // Block the NESTED swap, on the dependent's PARENT table. It has to live
+    // there, not on the child and not as a dependent view: the dependent's own
+    // pre-sync drops and recreates that child with `DROP TABLE … CASCADE`, which
+    // silently removes any view pinned to it (and with it the blocker). A CHECK
+    // on the partitioned parent survives, is inherited by the recreated child,
+    // and is copied onto the swap table by `CREATE TABLE … (LIKE … INCLUDING
+    // ALL)` — so the swap's fill raises on the rebuilt value (10, not > 100).
+    Spi::run("ALTER TABLE nstd ADD CONSTRAINT nstd_block CHECK (region <> 'A' OR doubled > 100)")
+        .expect("blocking constraint");
+
+    let repair = Spi::get_one::<String>(
+        "SELECT public.__reflex_doctor_try_repair( \
+           $q$SELECT reflex_reconcile_partition('nstp','A')$q$)",
+    )
+    .expect("repair call")
+    .expect("repair result");
+    assert!(
+        repair.starts_with("failed:"),
+        "the nested raise must surface through the handler, got: {repair}"
+    );
+
+    // Backend alive, transaction usable — the whole point.
+    let rows = Spi::get_one::<i64>("SELECT count(*) FROM nstp")
+        .expect("post-failure query")
+        .expect("rows");
+    assert_eq!(rows, 2, "the parent IMV must still be readable");
+
+    // INNER guard: the dependent's own partial swap is gone.
+    let dependent_a = Spi::get_one::<pgrx::AnyNumeric>(
+        "SELECT doubled FROM nstd WHERE region = 'A'",
+    )
+    .expect("dependent probe")
+    .expect("dependent value");
+    assert_eq!(
+        dependent_a.to_string(),
+        "9999",
+        "the nested reconcile's subtransaction must have rolled back"
+    );
+
+    // OUTER guard: the parent's swap SUCCEEDED before the cascade raised, and
+    // must be rolled back too. This is the assertion that needs both guards to
+    // have unwound in order — the inner one first, then the outer.
+    let parent_a =
+        Spi::get_one::<pgrx::AnyNumeric>("SELECT total FROM nstp WHERE region = 'A'")
+            .expect("parent probe")
+            .expect("parent value");
+    assert_eq!(
+        parent_a.to_string(),
+        "77",
+        "the parent's already-completed swap must be rolled back by its own subtransaction \
+         when a cascaded reconcile raises"
+    );
+
+    assert_eq!(
+        partition_child_set("nstp"),
+        parent_children_before,
+        "the parent's partition set must be intact after a nested cascade raise"
+    );
+    assert_eq!(
+        partition_child_set("nstd"),
+        dependent_children_before,
+        "the dependent's partition set must be intact after a nested cascade raise"
+    );
+}
