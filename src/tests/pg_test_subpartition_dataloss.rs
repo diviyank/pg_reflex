@@ -435,3 +435,88 @@ fn pg_subpart_reconcile_then_sync_keeps_depth2_aggregate_imv_data() {
     );
     assert_imv_correct("dl7v", fresh);
 }
+
+/// The recovery path for an IMV already flattened in the field.
+///
+/// Preventing future flattening does not repair a mirror that has already lost
+/// a level: it holds correct data but the wrong shape, and the next partition
+/// sync will empty it. This test builds that exact state by replaying, in SQL,
+/// the statement sequence the old swap executed, then pins two things
+/// operators need to be told:
+///
+///   * the flattened IMV's data IS still correct (so nothing is lost yet), and
+///   * a single `reflex_reconcile` on a fixed build restores the depth-2 shape
+///     AND the data -- so recovery does not require dropping and recreating the
+///     IMV, and must NOT be attempted with a bare `reflex_sync_partitions`,
+///     which heals the shape by recreating the children empty.
+#[pg_test]
+fn pg_subpart_reconcile_repairs_an_already_flattened_mirror() {
+    build_depth2_fixture("dl8s", "dl8v");
+    let fresh = "SELECT k, d, id, amt FROM dl8s";
+    let seeded = imv_row_count("dl8v");
+    let grandchildren_before = imv_grandchild_count("dl8v");
+
+    // Exactly what `execute_partition_swap_for_child` used to do to a
+    // partitioned mirror child: build a LIKE copy (which carries no
+    // partitioning), fill it, swap it in, drop the old subtree, rename.
+    for br in ["a", "b"] {
+        Spi::run(&format!(
+            "CREATE UNLOGGED TABLE dl8v_swap_{br} (LIKE dl8v_dl8s_{br} INCLUDING ALL)"
+        ))
+        .expect("swap table");
+        Spi::run(&format!(
+            "INSERT INTO dl8v_swap_{br} SELECT * FROM dl8v_dl8s_{br}"
+        ))
+        .expect("fill swap");
+        Spi::run(&format!(
+            "ALTER TABLE dl8v DETACH PARTITION dl8v_dl8s_{br}"
+        ))
+        .expect("detach old");
+        Spi::run(&format!(
+            "ALTER TABLE dl8v ATTACH PARTITION dl8v_swap_{br} FOR VALUES IN ('{up}')",
+            up = br.to_uppercase()
+        ))
+        .expect("attach swap");
+        Spi::run(&format!("DROP TABLE dl8v_dl8s_{br}")).expect("drop old");
+        Spi::run(&format!(
+            "ALTER TABLE dl8v_swap_{br} RENAME TO dl8v_dl8s_{br}"
+        ))
+        .expect("rename");
+    }
+
+    // The flattened state: correct data, wrong shape.
+    assert_eq!(
+        imv_partitioned_child_count("dl8v"),
+        0,
+        "the fixture did not reach the flattened state"
+    );
+    assert_eq!(imv_grandchild_count("dl8v"), 0, "subtree should be gone");
+    assert_eq!(
+        imv_row_count("dl8v"),
+        seeded,
+        "flattening must not lose rows — it is the SYNC that empties, not the swap"
+    );
+    assert_imv_correct("dl8v", fresh);
+
+    // The prescribed remedy.
+    let res = Spi::get_one::<&str>("SELECT reflex_reconcile('dl8v')")
+        .expect("rec")
+        .expect("res");
+    assert_eq!(res, "RECONCILED");
+    assert_eq!(
+        imv_partitioned_child_count("dl8v"),
+        2,
+        "reflex_reconcile did not restore the depth-2 mirror shape"
+    );
+    assert_eq!(
+        imv_grandchild_count("dl8v"),
+        grandchildren_before,
+        "reflex_reconcile did not restore the mirror's leaves"
+    );
+    assert_eq!(
+        imv_row_count("dl8v"),
+        seeded,
+        "reflex_reconcile did not refill the repaired mirror"
+    );
+    assert_imv_correct("dl8v", fresh);
+}
