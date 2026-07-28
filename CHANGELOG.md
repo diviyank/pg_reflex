@@ -2,6 +2,92 @@
 
 ## [Unreleased]
 
+## [1.11.3] - 2026-07-28
+
+Four correctness fixes on the partitioned-IMV maintenance paths. Three of
+them were silent — they produced wrong or absent data with no error, so an
+affected cluster shows no symptom until someone reads the result. Two
+destroyed data outright: a partition swap that flattened a sub-partitioned
+mirror child so the next sync emptied the IMV (2.8 M rows → 0 in the
+reproduction), and a `reflex_reconcile` that destroyed every dependent IMV
+of a partitioned one. The remaining two are a failure-atomicity fix that
+also closes a backend-abort class, and the removal of an `AccessExclusive`
+lock that froze all readers of an IMV whenever a source partition was
+added. This migration **must** be applied: the dependent-cascade fix is
+split between the library and the `__reflex_on_ddl_command_end` trigger
+body, and the new library against the old trigger is worse than either
+half alone. `ALTER EXTENSION pg_reflex UPDATE TO '1.11.3';`
+
+---
+
+### Fixed
+
+- **(DATA LOSS) The partition swap flattened a sub-partitioned mirror
+  child, and the next partition sync then emptied the whole IMV.**
+  `build_swap_partition_ddl` built the replacement with
+  `CREATE TABLE ... (LIKE old INCLUDING ALL)`, and `LIKE` never copies
+  partitioning — PostgreSQL has no `INCLUDING PARTITIONING` — so a
+  depth-≥2 mirror child was replaced by a plain table. Data stayed correct
+  at that instant, which is why it went unnoticed; the next sync's
+  shape-drift heal then dropped those children and recreated them EMPTY,
+  with NOTICE-level output only and `known_stale` never set. `reflex_reconcile`
+  now resolves mirror *leaves* rather than immediate source children, and
+  `execute_partition_swap_for_child` refuses outright on a partitioned child.
+  An IMV already flattened in the field still holds correct data but is
+  armed — repair it with `reflex_reconcile`, and do **not** run
+  `reflex_sync_partitions` on it first.
+- **(DATA LOSS) `reflex_reconcile` on a partitioned IMV destroyed its
+  dependent IMVs.** Each swap's `ALTER TABLE` fired the `ddl_command_end`
+  trigger, whose dependent auto-sync re-mirrored the parent's *transient*
+  mid-swap child set, adopted a `..._swap_tgt_*` child and dropped the real
+  one as a bound-collision orphan; the closing RENAME never revisited the
+  dependent, leaving it empty with `known_stale` false. The swap now
+  publishes `pg_reflex.internal_swap_root` for the duration of its
+  DETACH/ATTACH and the trigger returns immediately while it is set, with
+  dependents refreshed explicitly once the swap completes. Removing the
+  unguarded mid-swap re-sync also deleted an O(N²·D) term: reconcile is
+  ~3.9× faster at 50 partitions.
+- **(SILENT PARTIAL COMMIT / BACKEND ABORT) `reflex_reconcile_partition`
+  committed the destructive DDL of its pre-sync even when it reported
+  `ERROR`.** The pre-sync ran outside the reconcile's scope and failures
+  were returned as a string rather than raised, so `DROP TABLE ... CASCADE`
+  survived a reported failure while the operator read "ERROR" as "nothing
+  happened". The pre-sync and the reconcile body now share one
+  subtransaction. A multi-child reconcile that failed on child N also
+  committed children 1..N-1's swaps; that is closed too, including on the
+  batch flush path.
+- **(AVAILABILITY) Adding a source partition froze every reader of the
+  IMV.** `reflex_sync_partitions` created the mirror child in place with
+  `CREATE TABLE ... PARTITION OF <live IMV root>`, taking `AccessExclusive`
+  on the root and holding it — through the COMMIT-time reconcile — for the
+  whole transaction. Readers pruning to entirely unrelated partitions
+  blocked for the full window. New nodes are now built detached, attached
+  empty and filled in place, so the root stays at `ShareUpdateExclusive` at
+  any mirror depth. Measured at depth 1: root `AccessExclusive` window
+  0.48 s → none, concurrent reader latency 184 ms → 13 ms.
+
+### Tests
+
+- New suites `pg_test_subpartition_dataloss.rs` and
+  `pg_test_reconcile_dependent_dataloss.rs`, plus
+  `pg_test_partition_attach_locks.rs` asserting lock shape from a second
+  session. Every assertion is mutation-checked: reverting the guard it
+  pins turns it RED.
+- `benchmarks/bench_partition_scaling.sh` — a reusable partition-count
+  scaling harness (N = 10…200, log-log slope and successive-N ratios) that
+  reproduces the 1.11.1 flush regression it was built to guard against
+  (53.2 ms vs 4.9 ms median at N=200).
+
+### Migration
+
+- `ALTER EXTENSION pg_reflex UPDATE TO '1.11.3';` replays the
+  `__reflex_on_ddl_command_end` function body, which gained an early return
+  while `pg_reflex.internal_swap_root` is set. **This is not optional** —
+  the new library paired with the old trigger body still corrupts dependent
+  IMVs mid-swap. No registry columns were added or changed.
+
+---
+
 ## [1.11.2] - 2026-07-27
 
 Two module-only fixes: a performance cliff that made every flush of a
