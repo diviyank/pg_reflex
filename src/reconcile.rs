@@ -874,10 +874,6 @@ pub(crate) fn reflex_reconcile_with_orphans(view_name: &str, drop_orphans: bool)
 
     let own = reconcile_named_node(view_name, drop_orphans);
 
-    if !own.starts_with("ERROR") {
-        cascade_partitioned_rebuild_to_dependents(view_name);
-    }
-
     // The parent is rebuilt even when a child failed — that still repairs any
     // drift local to the parent, and leaving it untouched would be no fresher.
     // But the RETURN VALUE must not claim success: the parent has just been
@@ -885,8 +881,18 @@ pub(crate) fn reflex_reconcile_with_orphans(view_name: &str, drop_orphans: bool)
     // verified-repair check reads only `known_stale` on the named IMV, which this
     // rebuild clears, and the failed child was never `known_stale` in the first
     // place, so this string is the only signal that survives.
+    //
+    // The dependent cascade sits BELOW this return for the same reason. Content
+    // we have just declared stale must not be pushed into every dependent —
+    // each dependent's own rebuild clears its `known_stale` / `stale_reason` /
+    // `stale_since`, so cascading here would turn one IMV known to be stale into
+    // N IMVs freshly stamped healthy and derived from it.
     if child_failed {
         return "ERROR: generated sub-IMV reconcile failed";
+    }
+
+    if !own.starts_with("ERROR") {
+        cascade_partitioned_rebuild_to_dependents(view_name, drop_orphans);
     }
     own
 }
@@ -915,10 +921,21 @@ pub(crate) fn reflex_reconcile_with_orphans(view_name: &str, drop_orphans: bool)
 /// there would send a generated child back up to the root currently rebuilding
 /// it.
 ///
-/// Cost is O(D) dispatches for D direct dependents, once per reconcile — not
-/// once per swapped partition. Each dependent's own rebuild is the work its
-/// staleness requires, and recursion carries the refresh down the chain.
-fn cascade_partitioned_rebuild_to_dependents(view_name: &str) {
+/// `drop_orphans` is forwarded, never hardcoded. The two-argument
+/// [`reflex_reconcile_with_orphans`] exists precisely so a caller that gates
+/// destruction on its own authorization — `reflex_doctor`, which refuses an F3
+/// orphan drop when the operator did not pass `drop_orphans` and then repairs
+/// through F4 — does not reach that destruction by the back door. Calling the
+/// one-argument `reflex_reconcile` here would re-open that door one level down:
+/// a dependent's PRESERVED orphan partition still holds the user's rows, and
+/// `reflex_reconcile(parent, FALSE)` must not drop it.
+///
+/// Cost is O(D) dispatches for D direct dependents of THIS node, once per
+/// reconcile — not once per swapped partition. There is no visited set, so on a
+/// DAG with fan-in a shared node is rebuilt once per path rather than once;
+/// that is redundant work, not incorrect (a full rebuild is idempotent), and is
+/// tracked separately.
+fn cascade_partitioned_rebuild_to_dependents(view_name: &str, drop_orphans: bool) {
     let dependents: Vec<String> = Spi::connect(|client| {
         client
             .select(
@@ -942,7 +959,7 @@ fn cascade_partitioned_rebuild_to_dependents(view_name: &str) {
     });
 
     for dep in &dependents {
-        let result = reflex_reconcile(dep);
+        let result = reflex_reconcile_with_orphans(dep, drop_orphans);
         if result.starts_with("ERROR") {
             warning!(
                 "pg_reflex: '{}' was rebuilt but refreshing its dependent '{}' returned: {} \
