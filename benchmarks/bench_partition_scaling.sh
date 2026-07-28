@@ -201,18 +201,21 @@ report() {
         for (mi = 1; mi <= nm; mi++) {
             m = morder[mi]
             printf "%-26s", m
-            sx = 0; sy = 0; sxx = 0; sxy = 0; np = 0; lo = 0; hi = 0
+            sx = 0; sy = 0; sxx = 0; sxy = 0; np = 0; lo = 0; top = 0
             for (i = 1; i <= nn; i++) {
                 v = stat(m SUBSEP nlist[i], (unit == "ms") ? "median" : "min")
                 if (v < 0) { printf "%12s", "-"; continue }
                 printf "%12.2f", v
                 best[m, nlist[i]] = v
                 if (lo == 0 || v < lo) lo = v
-                if (v > hi) hi = v
+                top = v
                 if (v > 0) { x = log(nlist[i]); y = log(v)
                              sx += x; sy += y; sxx += x*x; sxy += x*y; np++ }
             }
-            g = (lo > 0) ? hi / lo : 0
+            # Growth is anchored at the LARGEST N, not at whichever point happened
+            # to be highest: a single noisy mid-sweep N would otherwise veto a FLAT
+            # verdict, and a genuine trend in N always peaks at the largest N anyway.
+            g = (lo > 0) ? top / lo : 0
             if (np >= 2 && (np*sxx - sx*sx) != 0) {
                 e = (np*sxy - sx*sy) / (np*sxx - sx*sx)
                 printf "%9.2f%8.1fx  %s\n", e, g, verdict(e, g)
