@@ -543,23 +543,53 @@ fn pg_subpart_reconcile_repairs_an_already_flattened_mirror() {
 // build. They are asserted here verbatim so what is published is what was
 // measured, not an inference from the registry schema.
 
+/// Resolve a registry name to its `regclass`, quoting each component. A bare
+/// `to_regclass(r.name)` down-cases an unquoted mixed-case name and yields
+/// NULL, which would make query 1 MISS an affected IMV and query 2 FALSELY
+/// report one (its `NOT EXISTS` over an empty set is TRUE). The codebase
+/// documents the same hazard at `src/reconcile.rs:1170-1175`.
+const REGISTRY_REGCLASS: &str = "to_regclass(CASE WHEN r.name LIKE '%.%' \
+          THEN quote_ident(split_part(r.name, '.', 1)) || '.' \
+               || quote_ident(split_part(r.name, '.', 2)) \
+          ELSE quote_ident(r.name) END)";
+
 /// Mirrors deeper than one level: on an affected build a `reflex_reconcile`
 /// flattens these, and the next partition sync then empties them.
-const EXPOSED_SHAPED_QUERY: &str = "SELECT DISTINCT r.name \
-     FROM public.__reflex_ivm_reference r \
-     JOIN pg_inherits i ON i.inhparent = to_regclass(r.name) \
-     JOIN pg_class c ON c.oid = i.inhrelid \
-     WHERE r.enabled AND c.relkind = 'p'";
+fn exposed_shaped_query() -> String {
+    format!(
+        "SELECT DISTINCT r.name \
+         FROM public.__reflex_ivm_reference r \
+         JOIN pg_inherits i ON i.inhparent = {rc} \
+         JOIN pg_class c ON c.oid = i.inhrelid \
+         WHERE r.enabled AND c.relkind = 'p'",
+        rc = REGISTRY_REGCLASS
+    )
+}
 
-/// Mirrors the registry says should be deeper than one level but which are
-/// flat: already flattened. Data is still correct; the next sync empties them.
-const EXPOSED_FLATTENED_QUERY: &str = "SELECT r.name \
-     FROM public.__reflex_ivm_reference r \
-     WHERE r.enabled \
-       AND COALESCE(r.partition_depth, 0) >= 2 \
-       AND NOT EXISTS (SELECT 1 FROM pg_inherits i \
-                       JOIN pg_class c ON c.oid = i.inhrelid \
-                       WHERE i.inhparent = to_regclass(r.name) AND c.relkind = 'p')";
+/// Partitioned mirrors that are FLAT but should not be: already flattened, or
+/// of unrecorded depth. Data is still correct; the next sync empties them.
+///
+/// A NULL `partition_depth` means "mirror the full source depth", so such a row
+/// cannot be excluded — an already-flattened legacy IMV has no partitioned
+/// child either, and excluding it would make it invisible to BOTH queries,
+/// which is exactly the dangerous population. It is reported as UNKNOWN.
+fn exposed_flattened_query() -> String {
+    format!(
+        "SELECT r.name, r.partition_depth, \
+                CASE WHEN r.partition_depth IS NULL \
+                     THEN 'UNKNOWN — mirror depth unrecorded, inspect the source tree' \
+                     ELSE 'ALREADY FLATTENED' END AS status \
+         FROM public.__reflex_ivm_reference r \
+         WHERE r.enabled \
+           AND r.partition_columns IS NOT NULL \
+           AND array_length(r.partition_columns, 1) > 0 \
+           AND (r.partition_depth IS NULL OR r.partition_depth >= 2) \
+           AND NOT EXISTS (SELECT 1 FROM pg_inherits i \
+                           JOIN pg_class c ON c.oid = i.inhrelid \
+                           WHERE i.inhparent = {rc} AND c.relkind = 'p')",
+        rc = REGISTRY_REGCLASS
+    )
+}
 
 fn query_matches(sql: &str, name: &str) -> bool {
     Spi::get_one::<bool>(&format!(
@@ -589,19 +619,19 @@ fn pg_subpart_exposure_detection_queries_are_accurate() {
     .expect("c");
 
     assert!(
-        query_matches(EXPOSED_SHAPED_QUERY, "dl9v"),
+        query_matches(&exposed_shaped_query(), "dl9v"),
         "the depth-2 exposure query missed a depth-2 mirror"
     );
     assert!(
-        !query_matches(EXPOSED_SHAPED_QUERY, "dl9xv"),
+        !query_matches(&exposed_shaped_query(), "dl9xv"),
         "the depth-2 exposure query falsely reported a depth-1 mirror"
     );
     assert!(
-        !query_matches(EXPOSED_FLATTENED_QUERY, "dl9v"),
+        !query_matches(&exposed_flattened_query(), "dl9v"),
         "an intact depth-2 mirror must not be reported as already flattened"
     );
     assert!(
-        !query_matches(EXPOSED_FLATTENED_QUERY, "dl9xv"),
+        !query_matches(&exposed_flattened_query(), "dl9xv"),
         "a depth-1 mirror must never be reported as already flattened"
     );
 
@@ -629,15 +659,15 @@ fn pg_subpart_exposure_detection_queries_are_accurate() {
     }
 
     assert!(
-        !query_matches(EXPOSED_SHAPED_QUERY, "dl9v"),
+        !query_matches(&exposed_shaped_query(), "dl9v"),
         "a flattened mirror has no partitioned children and must drop out of the first query"
     );
     assert!(
-        query_matches(EXPOSED_FLATTENED_QUERY, "dl9v"),
+        query_matches(&exposed_flattened_query(), "dl9v"),
         "the already-flattened query missed a mirror that lost a level"
     );
     assert!(
-        !query_matches(EXPOSED_FLATTENED_QUERY, "dl9xv"),
+        !query_matches(&exposed_flattened_query(), "dl9xv"),
         "the already-flattened query falsely reported a legitimately depth-1 mirror"
     );
 
@@ -648,14 +678,66 @@ fn pg_subpart_exposure_detection_queries_are_accurate() {
         .expect("res");
     assert_eq!(res, "RECONCILED");
     assert!(
-        !query_matches(EXPOSED_FLATTENED_QUERY, "dl9v"),
+        !query_matches(&exposed_flattened_query(), "dl9v"),
         "reflex_reconcile did not clear the already-flattened finding"
     );
     assert!(
-        query_matches(EXPOSED_SHAPED_QUERY, "dl9v"),
+        query_matches(&exposed_shaped_query(), "dl9v"),
         "reflex_reconcile did not restore the depth-2 shape"
     );
     assert_imv_correct("dl9v", "SELECT k, d, id, amt FROM dl9s");
+
+    // A legacy row: real IMV, real mirror, but `partition_depth` unrecorded —
+    // what an install upgraded from before the column existed looks like. Only
+    // the recorded depth is legacy here; the relations are the ones
+    // `create_reflex_ivm` built. A NULL depth means "mirror the full source
+    // depth", so once flattened such an IMV has no partitioned child and is
+    // invisible to the first query; the second must still surface it.
+    build_depth2_fixture("dlbs", "dlbv");
+    Spi::run(
+        "UPDATE public.__reflex_ivm_reference SET partition_depth = NULL WHERE name = 'dlbv'",
+    )
+    .expect("legacy row");
+    assert!(
+        query_matches(&exposed_shaped_query(), "dlbv"),
+        "an intact legacy-row mirror is still shaped and must be reported by the first query"
+    );
+    assert!(
+        !query_matches(&exposed_flattened_query(), "dlbv"),
+        "an intact mirror must not be reported as flattened, legacy row or not"
+    );
+
+    for br in ["a", "b"] {
+        Spi::run(&format!(
+            "CREATE UNLOGGED TABLE dlbv_swap_{br} (LIKE dlbv_dlbs_{br} INCLUDING ALL)"
+        ))
+        .expect("swap table");
+        Spi::run(&format!(
+            "INSERT INTO dlbv_swap_{br} SELECT * FROM dlbv_dlbs_{br}"
+        ))
+        .expect("fill swap");
+        Spi::run(&format!("ALTER TABLE dlbv DETACH PARTITION dlbv_dlbs_{br}")).expect("detach");
+        Spi::run(&format!(
+            "ALTER TABLE dlbv ATTACH PARTITION dlbv_swap_{br} FOR VALUES IN ('{up}')",
+            up = br.to_uppercase()
+        ))
+        .expect("attach");
+        Spi::run(&format!("DROP TABLE dlbv_dlbs_{br}")).expect("drop old");
+        Spi::run(&format!(
+            "ALTER TABLE dlbv_swap_{br} RENAME TO dlbv_dlbs_{br}"
+        ))
+        .expect("rename");
+    }
+
+    assert!(
+        !query_matches(&exposed_shaped_query(), "dlbv"),
+        "a flattened mirror has no partitioned child, legacy row or not"
+    );
+    assert!(
+        query_matches(&exposed_flattened_query(), "dlbv"),
+        "a flattened legacy-row IMV was invisible to BOTH queries — the dangerous \
+         population must never fall through the gap between them"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -669,6 +751,77 @@ fn pg_subpart_exposure_detection_queries_are_accurate() {
 // Both shapes below are ordinary: a branch pre-created ahead of next month's
 // leaves, and a branch whose leaves have aged out under a retention policy.
 // ---------------------------------------------------------------------------
+
+/// The destructive half of the audit hazard, measured rather than asserted in
+/// prose: running the remedy `reflex_audit` prints for a flattened mirror
+/// EMPTIES it. Pinned because the operator guidance ("run reflex_reconcile,
+/// never reflex_sync_partitions") rests on this being true, and because
+/// `drop_orphans => FALSE` is widely assumed to be the safe option.
+#[pg_test]
+fn pg_subpart_sync_on_a_flattened_mirror_empties_it_silently() {
+    build_depth2_fixture("dlas", "dlav");
+    let seeded = imv_row_count("dlav");
+    assert!(seeded > 0, "fixture seeded no rows");
+
+    for br in ["a", "b"] {
+        Spi::run(&format!(
+            "CREATE UNLOGGED TABLE dlav_swap_{br} (LIKE dlav_dlas_{br} INCLUDING ALL)"
+        ))
+        .expect("swap table");
+        Spi::run(&format!(
+            "INSERT INTO dlav_swap_{br} SELECT * FROM dlav_dlas_{br}"
+        ))
+        .expect("fill swap");
+        Spi::run(&format!("ALTER TABLE dlav DETACH PARTITION dlav_dlas_{br}")).expect("detach");
+        Spi::run(&format!(
+            "ALTER TABLE dlav ATTACH PARTITION dlav_swap_{br} FOR VALUES IN ('{up}')",
+            up = br.to_uppercase()
+        ))
+        .expect("attach");
+        Spi::run(&format!("DROP TABLE dlav_dlas_{br}")).expect("drop old");
+        Spi::run(&format!(
+            "ALTER TABLE dlav_swap_{br} RENAME TO dlav_dlas_{br}"
+        ))
+        .expect("rename");
+    }
+    assert_eq!(
+        imv_row_count("dlav"),
+        seeded,
+        "the flattened mirror should still hold its rows"
+    );
+
+    // The conservative-looking call: drop_orphans => FALSE.
+    let sync = Spi::get_one::<String>("SELECT reflex_sync_partitions('dlav', false)")
+        .expect("sync")
+        .expect("sync res");
+
+    assert!(
+        !sync.starts_with("ERROR"),
+        "the destructive sync is expected to report SUCCESS — that is the hazard, \
+         got: {sync}"
+    );
+    assert_eq!(
+        imv_row_count("dlav"),
+        0,
+        "if this is no longer 0 the shape-drift heal has gained a refill and the \
+         operator warning in HANDOFF.md must be revisited"
+    );
+    let stale = Spi::get_one::<bool>(
+        "SELECT known_stale FROM public.__reflex_ivm_reference WHERE name = 'dlav'",
+    )
+    .expect("q")
+    .expect("known_stale NULL");
+    assert!(
+        !stale,
+        "known_stale was set — the emptying would then be visible to monitoring, and \
+         the operator warning could be softened"
+    );
+    assert_eq!(
+        imv_partitioned_child_count("dlav"),
+        2,
+        "the heal should have restored the shape while discarding the contents"
+    );
+}
 
 /// A childless partitioned source branch, mirrored at depth 1. Drift injected
 /// into its mirror child must be repaired by a full reconcile.
