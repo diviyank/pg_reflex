@@ -57,8 +57,8 @@ Two independent confirmations that the cost is this probe and not the work itsel
    quadratic time doing it, which is the signature of repeated catalog re-enumeration
    rather than of more work being done.
 
-Extrapolating the quadratic term: ~0.41 s at N=200 becomes **~10 s at N=1000 and ~41 s at
-N=2000**, per sync. Every `reflex_reconcile_partition` pays it in its pre-sync, and so does
+**Inferred, not measured** — extrapolating the quadratic term: ~0.41 s at N=200 becomes
+**~10 s at N=1000 and ~41 s at N=2000**, per sync. Every `reflex_reconcile_partition` pays it in its pre-sync, and so does
 every COMMIT-time flush of an attached partition — `attach_txn` measures 1.0 s at N=200
 with a 100→200 local slope of 1.69.
 

@@ -34,10 +34,19 @@ that window were discarded. The driver now refuses to start below 5 GB free and
 records `df` and load average in the results header. Check the header of any
 results file before believing it.
 
-The server needs `max_locks_per_transaction = 2048` (set via `ALTER SYSTEM` +
-`brew services restart postgresql@17`; the default 64 was in place before). A
-full `reflex_reconcile` of a partitioned IMV holds ~44 locks per leaf, so at
-the default it dies with `out of shared memory` between N=100 and N=200.
+**Persistent change to the maintainer's machine:** `max_locks_per_transaction`
+on the homebrew PostgreSQL 17 is now **2048** (was the default 64), set via
+`ALTER SYSTEM` + `brew services restart postgresql@17`. It is a prerequisite of
+this harness — `reconcile_full` runs its repetitions in one transaction and
+each repetition recreates the swap tables with fresh OIDs, so the footprint
+accumulates to ~32k lock entries at N=200. Recommend leaving it in place: it
+only enlarges the shared lock table and this box has the headroom. Recorded
+here and in the header of `bench_partition_scaling.sh` so it is findable.
+
+A *single* reconcile needs no such setting — it holds `42N + 38` locks and
+survives to N ≈ 490 on an idle default cluster. That product-side ceiling is
+filed as
+`untreated_bugs/2026-07-28_full_reconcile_exhausts_max_locks_per_transaction.md`.
 
 ## Deliverables
 
@@ -126,11 +135,13 @@ issue. The integrator should fold these numbers into that report.
 N (local slope 1.97 over N=100→200) on all three builds, and every path that
 pre-syncs inherits it. Measurement written into the existing report.
 
-**Operational:** a full `reflex_reconcile` of a partitioned IMV holds
-`42N + 38` locks to end of transaction, so at PostgreSQL's default
-`max_locks_per_transaction = 64` it fails with `out of shared memory` somewhere
-between N=100 and N=200. Baseline was `40N + 38`; the batch adds 2 locks per
-child. Linear, and only relevant to sizing the setting.
+**Filed as a product defect:** a full `reflex_reconcile` holds `42N + 38` locks
+to end of transaction (baseline `40N + 38`; the batch adds 2 per child) and
+dies with `out of shared memory` at N ≈ 490 on a default-configured cluster —
+measured by bisection, not extrapolated. `reflex_reconcile_partition` is
+`2N + 75` and the COMMIT-time flush is a constant 68, so the automatic path is
+not exposed and the partition-scoped primitive is the workaround. See
+`untreated_bugs/2026-07-28_full_reconcile_exhausts_max_locks_per_transaction.md`.
 
 ## Methodology notes worth keeping
 
