@@ -232,7 +232,23 @@ in `src/tests/pg_test_audit.rs`, untouched). No `#[pg_extern]` added, so
 
 ---
 
-## 6. Self-mutation — all four run, all confirmed
+## 6. Self-mutation — six run, all confirmed
+
+Post-review additions (run on the final tree):
+
+| mutation | result |
+|---|---|
+| **M5** `is_fresh_partition` forced `false` (revert the F1 half) | T7 `create_and_load_…_depth1` **RED** alone; the other three lock tests stay green |
+| **M6** TRUNCATE of a fresh non-empty child removed | T8 `attach_then_load_…_depth2` **RED** on row counts — the TRUNCATE is load-bearing |
+
+M6 leaves T7 green: at depth 1 the duplicate INSERT collides with the IMV's
+unique key and the reconcile's error is discarded by its caller, so the child
+keeps its delta rows and the count still reads 900. That is the same
+error-swallowing the reviewer noted about M4; it is pre-existing and out of scope
+here, but it is why T8 (a distinct key shape) is the test that catches M6.
+
+### Original four
+
 
 Run against `4a75c92`, each mutation applied alone and reverted after.
 
@@ -335,7 +351,93 @@ Reading these:
   regardless of how long the statement itself takes (see H3), so a faster ATTACH
   would not shorten any window.
 
-## 8. Status — verification complete
+## 7c. Adversarial review round — F1 confirmed and fixed
+
+The reviewer found (SEVERITY 1) that the fix did not close the commonest field
+shape. **Reproduced independently before touching anything:**
+
+```sql
+BEGIN;
+CREATE TABLE lz_src_5 PARTITION OF lz_src FOR VALUES IN (5);
+INSERT INTO lz_src SELECT 5, g FROM generate_series(1, 900) g;
+SET CONSTRAINTS ALL IMMEDIATE;
+```
+
+| point | lock modes held on the IMV root |
+|---|---|
+| after the inline sync | AccessShare, ShareRowExclusive, **ShareUpdateExclusive** |
+| after the COMMIT-time reconcile | … + **AccessExclusiveLock** |
+
+A second session reading an unrelated partition at `lock_timeout='2s'` blocked
+for the full 2 004 ms. **No DEFAULT partition anywhere**, so the previous
+report's reachability claim was simply wrong.
+
+**Why the emptiness gate missed it:** the load's own IMV maintenance delta lands
+in the brand-new mirror child before the COMMIT-time reconcile reaches it, so
+`tgt_empty=false` and the swap runs.
+
+**The predicate that replaced it.** "Is the child empty?" is a proxy; the
+property that licenses skipping the swap is "was this child created by this
+transaction?" — whatever such a child holds arrived after transaction start, and
+the swap would discard it anyway, so TRUNCATE + fill in place is equivalent.
+
+The `pg_class.xmin = pg_current_xact_id()` candidate was **measured and
+rejected**, not assumed: a child created inside sync's SPI scope carries the SPI
+SUBtransaction's xid, so the probe answers `false` for exactly the children that
+must be recognised (`xmin=6474 cur=6472` in the reproduction). Using it would
+have produced a fix that never engages. The implementation therefore uses an
+explicit hand-off — sync records the OIDs of the children it creates in a
+transaction-local GUC (`is_local => true`), the reconcile tests membership.
+
+Both probes fail toward the swap. That asymmetry is the point: a false "fresh"
+would TRUNCATE rows predating the transaction (silent data loss), a false "not
+fresh" only costs the slower always-correct path.
+
+**TRUNCATE was verified, not assumed** (PG 17.7, `TRUNCATE <partition child>`):
+locks are `AccessExclusive` + `Share` on the CHILD and **nothing at all on the
+parent**; the parent's statement-level TRUNCATE trigger does **not** fire — the
+same isolation the swap's detached fill relies on.
+
+## 7d. Benchmark — corrected, and what the first one was actually measuring
+
+The §7b table below is retained but **its fixture cannot exhibit F1** (it
+attaches a pre-populated branch and does no further DML), so its "none observed"
+overstated the fix's scope. The reviewer was right about that.
+
+Re-run on an F1-capable fixture (create the partition and load it in one
+transaction, mirror depth 1). `.so` rebuilt and reinstalled between runs;
+BEFORE = `src/partition.rs` at `2f8b786`, AFTER = the fix branch.
+
+| base / load | | BEFORE | AFTER |
+|---|---|---|---|
+| 300 000 / 50 000 | root `AccessExclusive` window | **0.082 s** | **none observed** |
+| 300 000 / 50 000 | reader max latency (unrelated partition) | **184 ms** | **13 ms** |
+| 300 000 / 50 000 | CREATE PARTITION statement | 34.5 ms | 33.0 ms |
+| 300 000 / 50 000 | INSERT statement | 98.9 ms | 91.4 ms |
+| 300 000 / 50 000 | COMMIT | 104.7 ms | 95.4 ms |
+| all runs | oracle mismatches | 0 | 0 |
+
+The statement costs are unchanged — this design still moves no work into the
+partition-add statements.
+
+**A discrepancy I chased down rather than reported as a pass.** At base 50 000 /
+load 50 000 the AFTER run still showed a 0.162 s `AccessExclusive` window even
+though T7 (900 rows) was green. Stepping the transaction statement by statement
+showed the lock appears on the **INSERT**, not the flush, with
+`INFO: pg_reflex: reconciled IMV 'f_imv' (partitioned, 2 children swapped)` —
+a large delta escalates to a full partitioned reconcile that swaps every child,
+including unchanged ones. Scoping probe: a large INSERT into an **existing**
+partition with **no DDL at all** does the same (300 000 rows → root
+`AccessExclusive`; 50 000 → `RowExclusive`), and identically on `2f8b786`. So it
+is a pre-existing, independent defect, filed as
+`untreated_bugs/2026-07-28_large_delta_full_reconcile_swaps_every_partition.md`.
+The threshold is relative to the IMV's size, not absolute.
+
+**Consequence, stated plainly:** the partition-add path is lock-free, but a
+create-partition-and-bulk-load transaction can still freeze the IMV when the load
+is large relative to the IMV — via that other defect, not this one.
+
+## 8. Status — verification complete (updated after the review round)
 
 Everything the previous session left owed is done and verified on the final tree:
 
@@ -354,6 +456,15 @@ Everything the previous session left owed is done and verified on the final tree
 5. `cargo fmt --check` clean; `cargo clippy --features pg17 --all-targets` reports
    nothing for the changed files (the four `needless_borrow` warnings in
    `src/tests/pg_test_audit.rs` predate this branch).
+
+Superseded by the review round: the suite is now **1550 passed, 0 failed** with
+the two new F1 tests, and the lock tests each run against their own throwaway
+database. That last change was forced: they are the only tests in the suite that
+commit global state, and
+`drop_deferred_imv_wipes_every_nonmaintenance_table` takes a cluster-wide census
+of artifact relations, so it failed once when the two ran concurrently. Isolating
+the fixtures into per-test databases removes the interference at the source
+rather than by retry.
 
 ## 9. `untreated_bugs/` hygiene — narrowed, not deleted
 
