@@ -47,6 +47,20 @@
 #   --skip-subxid  omit the subtransaction-XID sweep
 #   --out    <f>   results TSV (default benchmarks/results_partition_scaling_<label>.tsv)
 #
+# SERVER PREREQUISITE
+#
+#     max_locks_per_transaction >= 2048
+#
+# A full reflex_reconcile of a partitioned IMV holds several locks per leaf
+# (source child, intermediate child, target child, and the swap tables), all to
+# end of transaction.  At the PostgreSQL default of 64 it runs out of shared
+# memory somewhere between N=100 and N=200 and the sweep loses its top point:
+#
+#     ALTER SYSTEM SET max_locks_per_transaction = 2048;   -- then restart
+#
+# This is a benchmark prerequisite, not a workaround: any deployment running
+# hundreds of partitions has to raise it for PostgreSQL's own sake.
+#
 # Connection is taken from PSQL_BIN / PGBIN / standard libpq environment
 # variables:
 #
@@ -114,7 +128,7 @@ fi
 # stdin is the raw TSV: metric <TAB> n <TAB> rep <TAB> ms
 # --------------------------------------------------------------------------
 report() {
-    awk -F'\t' '
+    awk -F'\t' -v unit="${1:-ms}" -v noise="${2:-1}" '
     function stat(key, what,   i, c, tmp, t, j, s, ss, mu) {
         c = 0
         for (i = 1; i <= cnt[key]; i++) tmp[c++] = val[key SUBSEP i]
@@ -153,10 +167,17 @@ report() {
             if (nlist[j] < nlist[i]) { t = nlist[i]; nlist[i] = nlist[j]; nlist[j] = t }
 
         printf "\n"
-        printf "BEST-OF-REPS TIME (ms) BY PARTITION COUNT N   [total data held CONSTANT across N]\n"
-        printf "  The minimum over repetitions estimates the deterministic cost; a checkpoint or\n"
-        printf "  an autovacuum landing in one rep inflates a mean but cannot deflate a minimum.\n"
-        printf "  slope e = d(log time)/d(log N), least squares over all N.\n"
+        if (unit == "ms") {
+            printf "BEST-OF-REPS TIME (ms) BY PARTITION COUNT N   [total data held CONSTANT across N]\n"
+            printf "  The minimum over repetitions estimates the deterministic cost; a checkpoint or\n"
+            printf "  an autovacuum landing in one rep inflates a mean but cannot deflate a minimum.\n"
+        } else {
+            printf "LOCK FOOTPRINT (locks held at end of the call) BY PARTITION COUNT N\n"
+            printf "  A pure count: no timer, no cache, no competing process can move it.  This is\n"
+            printf "  the metric to trust when the machine is busy, and the one operators must size\n"
+            printf "  max_locks_per_transaction against.\n"
+        }
+        printf "  slope e = d(log y)/d(log N), least squares over all N.\n"
         printf "  e ~ 0 constant in N   e ~ 1 linear in N   e ~ 2 quadratic in N\n\n"
         printf "%-26s", "metric"
         for (i = 1; i <= nn; i++) printf "%12s", "N=" nlist[i]
@@ -202,7 +223,7 @@ report() {
         }
 
         printf "\n"
-        printf "COST PER PARTITION (ms / N)   falling row = sublinear; flat row = linear; rising row = SUPERLINEAR\n"
+        printf "COST PER PARTITION (%s / N)   falling row = sublinear; flat row = linear; rising row = SUPERLINEAR\n", unit
         printf "%-26s", "metric"
         for (i = 1; i <= nn; i++) printf "%12s", "N=" nlist[i]
         printf "\n"
@@ -217,6 +238,7 @@ report() {
             printf "\n"
         }
 
+        if (noise == 0) { printf "\n"; exit }
         printf "\n"
         printf "NOISE CHECK   median (ms) and coefficient of variation per N\n"
         printf "  A CV above ~30%% means that column is not trustworthy on its own; re-run.\n"
@@ -245,7 +267,8 @@ if [ -n "$COMPARE_A" ]; then
         echo "# $lbl"
         grep '^#' "$f" | sed 's/^/# /'
         echo "############################################################"
-        grep -v '^#' "$f" | report
+        grep -v '^#' "$f" | grep -v '^locks_' | report ms 1
+        grep -v '^#' "$f" | grep '^locks_' | report locks 0
     done
     exit 0
 fi
@@ -280,6 +303,7 @@ fi
     echo "# .so:          $DYLIB  sha256:$DYLIB_SHA  built:$DYLIB_MTIME"
     echo "# server:       $("$PSQL" -d postgres -tAc 'select version()')"
     echo "# params:       n_list='$N_LIST' roots='$ROOT_LIST' rows=$TOTAL_ROWS reps=$REPS"
+    echo "# server cfg:   max_locks_per_transaction=$("$PSQL" -d postgres -tAc 'show max_locks_per_transaction') shared_buffers=$("$PSQL" -d postgres -tAc 'show shared_buffers')"
     echo "# disk before:  $DISK_LINE"
     echo "# load before:  $LOADAVG"
     echo "# run at:       $(date '+%Y-%m-%dT%H:%M:%S')"
@@ -297,8 +321,11 @@ for n in $N_LIST; do
     "$DROPDB" --if-exists "$db" >/dev/null 2>&1 || true
     "$CREATEDB" "$db"
     "$PSQL" -q -d "$db" -c "CREATE EXTENSION pg_reflex" >/dev/null
+    # A failure at one N must not discard the points already collected, so the
+    # sweep records it and carries on rather than aborting under `set -e`.
     "$PSQL" -q -d "$db" -v n="$n" -v total_rows="$TOTAL_ROWS" -v reps="$REPS" \
             -f "${SCRIPT_DIR}/bench_partition_scaling.sql" 2>&1 \
+        | tee "/private/tmp/rfxbench_${LABEL}_n${n}.log" \
         | grep -E 'RFXBENCH\||RFXCHECK\|' \
         | sed -e 's/^.*RFXBENCH|/RFXBENCH|/' -e 's/^.*RFXCHECK|/RFXCHECK|/' \
         | while IFS='|' read -r tag a b c d; do
@@ -311,6 +338,11 @@ for n in $N_LIST; do
                   printf '%s\t%s\t%s\t%s\n' "$a" "$b" "$c" "$d" >> "$OUT"
               fi
           done
+    if grep -q '^psql:.*ERROR:' "/private/tmp/rfxbench_${LABEL}_n${n}.log"; then
+        echo "  !! N=$n did not complete; first error:" >&2
+        grep -m1 '^psql:.*ERROR:' "/private/tmp/rfxbench_${LABEL}_n${n}.log" >&2
+        echo "# INCOMPLETE n=$n $(grep -m1 -o 'ERROR:.*' "/private/tmp/rfxbench_${LABEL}_n${n}.log")" >> "$OUT"
+    fi
     "$DROPDB" "$db" >/dev/null 2>&1 || true
 done
 
@@ -356,5 +388,6 @@ echo "############################################################"
 echo "# RESULTS — label '$LABEL'"
 grep '^#' "$OUT" | sed 's/^/# /'
 echo "############################################################"
-grep -v '^#' "$OUT" | report
+grep -v '^#' "$OUT" | grep -v '^locks_' | report ms 1
+grep -v '^#' "$OUT" | grep '^locks_' | report locks 0
 echo "raw: $OUT"

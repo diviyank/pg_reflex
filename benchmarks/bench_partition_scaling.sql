@@ -331,6 +331,46 @@ BEGIN
 END $$;
 
 -- ===========================================================================
+-- LOCK FOOTPRINT — deterministic, and therefore the metric to trust on a
+-- machine that is doing other work.
+--
+-- Locks are held to end of transaction, so counting pg_locks after the call
+-- inside a transaction we then roll back gives the exact peak footprint.  It
+-- is a pure count: no timer, no cache, no competing process can move it.  If
+-- a change makes a path touch more children, this shows it even when every
+-- timing in the run is drowned in noise.
+--
+-- It is also the setting operators have to size: PostgreSQL's lock table holds
+-- max_locks_per_transaction * (max_connections + max_prepared_transactions)
+-- entries, and a full reconcile of a partitioned IMV needs several per leaf
+-- (source child, intermediate child, target child, swap tables).
+-- ===========================================================================
+BEGIN;
+SELECT public.reflex_reconcile('rfxsc_agg');
+SELECT rfx_bench_emit('locks_reconcile_full', 1,
+                      (SELECT count(*) FROM pg_locks WHERE pid = pg_backend_pid()));
+ROLLBACK;
+
+BEGIN;
+SELECT public.reflex_sync_partitions('rfxsc_agg');
+SELECT rfx_bench_emit('locks_sync_partitions', 1,
+                      (SELECT count(*) FROM pg_locks WHERE pid = pg_backend_pid()));
+ROLLBACK;
+
+BEGIN;
+SELECT public.reflex_reconcile_partition('rfxsc_agg', '0');
+SELECT rfx_bench_emit('locks_reconcile_one', 1,
+                      (SELECT count(*) FROM pg_locks WHERE pid = pg_backend_pid()));
+ROLLBACK;
+
+BEGIN;
+SELECT rfx_bench_touch_one_leaf();
+SELECT public.reflex_flush_deferred('rfxsc_ptsrc');
+SELECT rfx_bench_emit('locks_flush_deferred', 1,
+                      (SELECT count(*) FROM pg_locks WHERE pid = pg_backend_pid()));
+ROLLBACK;
+
+-- ===========================================================================
 -- M6 attach_txn — attach one new source partition and load it, measured over
 -- the whole transaction because the reconcile lands in the COMMIT.
 -- Rows loaded are constant (200), so only the per-child cost varies with N.
