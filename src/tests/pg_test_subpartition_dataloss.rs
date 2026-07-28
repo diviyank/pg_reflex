@@ -657,3 +657,117 @@ fn pg_subpart_exposure_detection_queries_are_accurate() {
     );
     assert_imv_correct("dl9v", "SELECT k, d, id, amt FROM dl9s");
 }
+
+// ---------------------------------------------------------------------------
+// A full reconcile must rebuild EVERY mirror child, including those whose
+// source node is partitioned but currently childless.
+//
+// Deriving the swap set from the source tree's leaves alone loses them: such a
+// node is not a leaf (it has a sub-strategy) and has no descendants to stand in
+// for it, so it contributes nothing and its mirror child — which exists and can
+// hold rows — is never rebuilt, while the reconcile still returns RECONCILED.
+// Both shapes below are ordinary: a branch pre-created ahead of next month's
+// leaves, and a branch whose leaves have aged out under a retention policy.
+// ---------------------------------------------------------------------------
+
+/// A childless partitioned source branch, mirrored at depth 1. Drift injected
+/// into its mirror child must be repaired by a full reconcile.
+#[pg_test]
+fn pg_subpart_reconcile_rebuilds_childless_branch_mirror_child() {
+    Spi::run(
+        "CREATE TABLE f1s (k TEXT NOT NULL, d DATE NOT NULL, id BIGINT) PARTITION BY LIST (k)",
+    )
+    .expect("root");
+    Spi::run("CREATE TABLE f1s_p PARTITION OF f1s FOR VALUES IN ('P')").expect("plain child");
+    // Pre-created branch, leaves not added yet — the standard rolling-window
+    // pattern. It is partitioned and has no children.
+    Spi::run("CREATE TABLE f1s_c PARTITION OF f1s FOR VALUES IN ('C') PARTITION BY RANGE (d)")
+        .expect("childless branch");
+    Spi::run("INSERT INTO f1s SELECT 'P', DATE '2026-01-05', g FROM generate_series(1, 30) g")
+        .expect("seed");
+    Spi::get_one::<String>(
+        "SELECT create_reflex_ivm('f1v', 'SELECT k, d, id FROM f1s', 'k,d,id', \
+         NULL, NULL, NULL, ARRAY['k'])",
+    )
+    .expect("c")
+    .expect("c");
+    assert_imv_correct("f1v", "SELECT k, d, id FROM f1s");
+
+    // Drift: a row in the mirror that the source cannot produce.
+    Spi::run("INSERT INTO f1v (k, d, id) VALUES ('C', '2026-01-09', 9999)").expect("inject drift");
+    assert_eq!(
+        imv_row_count("f1v"),
+        31,
+        "the drift row was not routed into the childless branch's mirror child"
+    );
+
+    let res = Spi::get_one::<&str>("SELECT reflex_reconcile('f1v')")
+        .expect("rec")
+        .expect("res");
+    assert_eq!(res, "RECONCILED");
+    assert_imv_correct("f1v", "SELECT k, d, id FROM f1s");
+    assert_eq!(
+        imv_row_count("f1v"),
+        30,
+        "the full reconcile skipped the childless branch's mirror child and left drift behind"
+    );
+}
+
+/// Retention: a branch whose only source leaf has been dropped. Its mirror
+/// child still holds that leaf's rows, and a full reconcile must remove them.
+#[pg_test]
+fn pg_subpart_reconcile_rebuilds_branch_whose_leaves_were_dropped() {
+    Spi::run(
+        "CREATE TABLE f2s (k TEXT NOT NULL, d DATE NOT NULL, id BIGINT) PARTITION BY LIST (k)",
+    )
+    .expect("root");
+    for br in ["a", "b"] {
+        Spi::run(&format!(
+            "CREATE TABLE f2s_{br} PARTITION OF f2s FOR VALUES IN ('{up}') PARTITION BY RANGE (d)",
+            up = br.to_uppercase()
+        ))
+        .expect("branch");
+        Spi::run(&format!(
+            "CREATE TABLE f2s_{br}_m1 PARTITION OF f2s_{br} \
+             FOR VALUES FROM ('2026-01-01') TO ('2026-02-01')"
+        ))
+        .expect("leaf");
+    }
+    Spi::run(
+        "INSERT INTO f2s SELECT v.k, DATE '2026-01-10', g \
+         FROM generate_series(1, 25) g CROSS JOIN (VALUES ('A'),('B')) v(k)",
+    )
+    .expect("seed");
+    // Mirror depth 1 over a depth-2 source: each mirror child is a plain table
+    // holding its whole branch.
+    Spi::get_one::<String>(
+        "SELECT create_reflex_ivm('f2v', 'SELECT k, d, id FROM f2s', 'k,d,id', \
+         NULL, NULL, NULL, ARRAY['k'])",
+    )
+    .expect("c")
+    .expect("c");
+    assert_eq!(imv_row_count("f2v"), 50, "fixture seeded wrong");
+    assert_imv_correct("f2v", "SELECT k, d, id FROM f2s");
+
+    // Retention drops branch A's only leaf. Branch A survives, childless.
+    Spi::run("ALTER TABLE f2s_a DETACH PARTITION f2s_a_m1").expect("detach");
+    Spi::run("DROP TABLE f2s_a_m1").expect("drop leaf");
+    assert_eq!(
+        Spi::get_one::<i64>("SELECT count(*)::int8 FROM f2s")
+            .expect("q")
+            .expect("c"),
+        25,
+        "the source should now hold only branch B"
+    );
+
+    let res = Spi::get_one::<&str>("SELECT reflex_reconcile('f2v')")
+        .expect("rec")
+        .expect("res");
+    assert_eq!(res, "RECONCILED");
+    assert_imv_correct("f2v", "SELECT k, d, id FROM f2s");
+    assert_eq!(
+        imv_row_count("f2v"),
+        25,
+        "the full reconcile left the dropped leaf's rows in the branch's mirror child"
+    );
+}
