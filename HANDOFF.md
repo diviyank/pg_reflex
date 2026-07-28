@@ -78,15 +78,65 @@ already performs, while deriving `affected_keys` costs an extra
 **Complexity: O(D) dispatches per reconcile and O(N) `SET LOCAL` statements.**
 Not superlinear in either.
 
+## Self-mutation
+
+| mutation | RED | GREEN |
+|---|---|---|
+| **M1** guard defeated (`IF _swap_root IS NOT NULL AND FALSE`) | T5 only, with `rdd6d___reflex_swap_tgt_rdd6p_rdd6s_c` | T1-T4 |
+| **M2** cascade call removed | T1 (6 oracle mismatches), T3, T4a | T2, T5, T4b |
+
+M1 initially left **all** tests green — a false green. The cascade repairs a
+mirror the swap corrupted, so a test that goes through `reflex_reconcile` cannot
+distinguish "never corrupted" from "corrupted then repaired". **T5 was added for
+this**: it drives one swap through `tests.crate_test_partition_swap_for_child`
+with no cascade behind it. That is the only assertion pinning the guard.
+
+M2's signature is the design argument in miniature: with the guard but no
+cascade, T1 fails as *staleness* (6 mismatches), not emptiness. The name guard
+alone converts data destruction into silent staleness.
+
+## Scaling (measured, pg17, same box, back to back)
+
+Reconcile of a partitioned IMV with one auto-partitioned dependent:
+
+| | N=10 | N=50 | ratio (linear = 5.0) |
+|---|---|---|---|
+| **fixed** | 697 ms | 4 652 ms | **6.68** |
+| guard defeated (= base behaviour) | 1 378 ms | 18 200 ms | **13.21** |
+
+The unguarded mid-swap re-sync is the superlinear term: O(N) swaps each firing a
+full `reflex_sync_partitions` over each dependent's O(N) tree, i.e. **O(N²·D)**.
+The fix deletes it — 3.9× faster at N=50 and roughly half the growth exponent.
+The fix's own additions are **O(D) reconcile dispatches + O(N) `SET LOCAL`**.
+
 ## State
 
-- Tests: `src/tests/pg_test_reconcile_dependent_dataloss.rs` (5 `#[pg_test]`),
+- Tests: `src/tests/pg_test_reconcile_dependent_dataloss.rs` (6 `#[pg_test]`),
   included from `src/lib.rs`.
-- All 5 GREEN after the fix; each measured RED before it.
+- All 6 GREEN after the fix; each measured RED under its own mutation.
+- Full `cargo pgrx test pg17`: **1578 passed, 0 failed**. `cargo fmt` clean.
+  `cargo clippy` — 4 pre-existing `needless_borrow` warnings in
+  `src/tests/pg_test_audit.rs`, none from this branch.
 - No registry column added. No version bump / CHANGELOG / `sql/*--*.sql`
   migration — integrator owns those. **The migration must replay the
   `__reflex_on_ddl_command_end` body**, or upgraded installs keep the
   destructive one.
+
+## Reports
+
+The parent report lives on `worktree-agent-a006921b9bcaad1dd` (not in this
+tree), so it cannot be deleted from here. It is **fully closed** — the
+integrator should remove
+`untreated_bugs/2026-07-28_partitioned_reconcile_destroys_dependent_imvs.md`.
+
+Its three adjacent defects survived and are filed separately here:
+
+- `2026-07-28_sync_trigger_suppression_alter_blocks_reconcile_under_error_policy.md`
+  — the parent report's attribution of the `error`-policy block to the swap is
+  **falsified**; it comes from `reflex_sync_partitions`' own `DISABLE TRIGGER USER`.
+- `2026-07-28_doctor_mislabels_residue_and_reports_fixed_without_rechecking.md`
+- `2026-07-28_alter_source_alarm_suppressed_by_name_shape_not_provenance.md`
+  — the parent report's *inferred* suppression hole, now confirmed by code read.
 
 ## Recovery for operators already hit
 

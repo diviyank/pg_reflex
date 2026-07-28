@@ -929,10 +929,7 @@ fn cascade_partitioned_rebuild_to_dependents(view_name: &str) {
                    AND array_length(r.partition_columns, 1) > 0",
                 None,
                 &[unsafe {
-                    DatumWithOid::new(
-                        view_name.to_string(),
-                        PgBuiltInOids::TEXTOID.oid().value(),
-                    )
+                    DatumWithOid::new(view_name.to_string(), PgBuiltInOids::TEXTOID.oid().value())
                 }],
             )
             .unwrap_or_report()
