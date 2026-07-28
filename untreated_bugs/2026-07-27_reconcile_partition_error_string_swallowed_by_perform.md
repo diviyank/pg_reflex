@@ -43,8 +43,15 @@ in the write path is invisible.
 
 ## What was ruled out
 
-* Not the atomicity bug — that is fixed; the call leaves no partial DDL behind.
-  The residue here is purely "the failure is never reported to anyone".
+* Not the in-function atomicity bug — that is fixed and mutation-tested: the
+  reconcile itself leaves no partial DDL behind on either path. **But do not read
+  that as "nothing was committed".** The flush's DO block runs its OWN destructive
+  statements — `PERFORM reflex_sync_partitions(imv, true)` (`src/partition.rs:2936`)
+  and two `DROP TABLE … CASCADE` (`:2944`, `:2948`) — before the reconcile, in the
+  same block, and swallowing the reconcile's `ERROR:` is exactly what lets that
+  block complete normally and commit them. That destructive half is tracked in
+  `2026-07-27_flush_do_block_commits_destructive_ddl_on_failed_reconcile.md`; the
+  two share this root cause and should be fixed together.
 * Not fixable by making the function RAISE: `reflex_doctor`'s repair path, the
   audit report, and the batch flush all inspect the returned text, and a raise
   would abort the caller's transaction. The return-string contract is deliberate.
