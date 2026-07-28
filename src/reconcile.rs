@@ -445,41 +445,44 @@ pub(crate) fn reconcile_one(view_name: &str, drop_orphans: bool) -> &'static str
                 let storage_mode: String = record.storage_mode.clone();
                 let unlogged = storage_mode.eq_ignore_ascii_case("UNLOGGED");
 
-                // Resolve the mirror's LEAF nodes, exactly as
-                // `reflex_reconcile_partition_impl` does: expand the source tree
-                // to its leaves and map each one UP to the IMV's mirror depth.
+                // The set to swap is the mirror's LEAF set, derived from the
+                // source tree through `truncate_partition_tree` — the same
+                // function `create_ivm` and `reflex_sync_partitions` use to
+                // build the mirror. Deriving it from the builder makes the two
+                // agree by construction rather than by parallel reasoning.
                 //
                 // Iterating the source's IMMEDIATE children instead would hand
                 // the swap a top-level child, which on a depth->=2 mirror is a
                 // PARTITIONED relation the swap cannot rebuild — its
                 // `LIKE ... INCLUDING ALL` replacement carries no partitioning,
                 // so the mirror was silently flattened and the next sync then
-                // recreated those children empty. Resolving leaves also narrows
-                // the swap's `AccessExclusive` from the IMV root to the swapped
-                // leaf's immediate parent.
+                // recreated those children empty.
                 //
-                // At mirror depth 1 this yields exactly the old set — the source
-                // leaves' depth-1 ancestors are the source's immediate children —
-                // so single-level IMVs are unaffected.
+                // Truncation keeps `depth <= mirror_depth` and demotes the nodes
+                // sitting exactly at `mirror_depth` to leaves, which is what
+                // makes a CHILDLESS source branch come out right: at
+                // `mirror_depth` it is demoted and included (its mirror child is
+                // a plain table that can hold rows, so it must be rebuilt);
+                // above `mirror_depth` it stays partitioned and is excluded (its
+                // mirror child is a partitioned relation, which holds no rows
+                // itself and has nothing to rebuild). Filtering the raw source
+                // tree to leaves instead drops such a branch entirely — it is
+                // not a leaf and owns no leaf to stand in for it.
+                //
+                // At mirror depth 1 this yields exactly the source's immediate
+                // children, so single-level IMVs are unaffected.
                 let source_tree =
                     crate::partition::list_partition_tree(client, &plan.anchor_source);
                 let mirror_depth = record
                     .partition_depth
                     .map(|d| d as usize)
                     .unwrap_or_else(|| crate::partition::max_tree_depth(&source_tree));
-                let mut mirror_nodes: std::collections::BTreeSet<String> =
-                    std::collections::BTreeSet::new();
-                for leaf in source_tree
-                    .iter()
-                    .filter(|n| n.sub_strategy.is_none())
-                    .map(|n| n.bare_name.clone())
-                {
-                    let chain = crate::partition::leaf_ancestor_chain(&source_tree, &leaf);
-                    let node =
-                        crate::partition::ancestor_bare_at_depth(&chain, &leaf, mirror_depth)
-                            .unwrap_or_else(|| leaf.clone());
-                    mirror_nodes.insert(node);
-                }
+                let mirror_nodes: std::collections::BTreeSet<String> =
+                    crate::partition::truncate_partition_tree(source_tree, mirror_depth)
+                        .into_iter()
+                        .filter(|n| n.sub_strategy.is_none())
+                        .map(|n| n.bare_name)
+                        .collect();
                 for src_bare in &mirror_nodes {
                     if let Err(e) = crate::partition::execute_partition_swap_for_child(
                         client,
