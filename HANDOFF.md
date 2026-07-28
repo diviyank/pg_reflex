@@ -24,8 +24,20 @@ cargo pgrx install --pg-config $PGBIN/pg_config --no-default-features --features
 disjoint from `~/.pgrx/17.7/pgrx-install/lib/postgresql`. Verified before
 installing.
 
-Disk on `/private/tmp` is tight (was 3.4 GB free at start). Other agents own
-`/private/tmp/rfx-dep` and `/private/tmp/rfx-dl` — do not delete them.
+Disk on `/private/tmp` is tight. Other agents own `/private/tmp/rfx-dep` and
+`/private/tmp/rfx-dl` — do not delete them.
+
+**The filesystem hit 100% early in this session and every timing taken then was
+worthless** — coefficients of variation of 50-70% that dropped to 0-4% once
+space was freed, with no error raised anywhere. All measurements taken during
+that window were discarded. The driver now refuses to start below 5 GB free and
+records `df` and load average in the results header. Check the header of any
+results file before believing it.
+
+The server needs `max_locks_per_transaction = 2048` (set via `ALTER SYSTEM` +
+`brew services restart postgresql@17`; the default 64 was in place before). A
+full `reflex_reconcile` of a partitioned IMV holds ~44 locks per leaf, so at
+the default it dies with `out of shared memory` between N=100 and N=200.
 
 ## Deliverables
 
@@ -67,8 +79,10 @@ PGBIN=/opt/homebrew/opt/postgresql@17/bin \
 - [ ] sweep on 2f8b786 (main, pre-batch baseline)
 - [ ] sweep on integration/s1-batch
 - [ ] sweep on fix/swap-flattens-subpartitioned-child (689ab95)
-- [ ] 1.11.1 acceptance check (revert the 1.11.2 gate, confirm the benchmark
-      turns the flush metrics from FLAT to linear)
+- [ ] 1.11.1 acceptance check — build **`b56142a`**, which is `4e4c825^`, i.e.
+      the tree as 1.11.1 shipped, immediately before `fix: gate the cold DELETE
+      in the passthrough partition dispatch`. If the benchmark is a real guard,
+      `flush_deferred` / `flush_txn` must go from FLAT to linear in N there.
 - [ ] verdicts + any regression report in untreated_bugs/
 
 Commits under test (build the .so from each, reinstall, re-run):
@@ -79,7 +93,16 @@ Commits under test (build the .so from each, reinstall, re-run):
 | integration/s1-batch | 5f02066 | main + the two S1 fixes |
 | fix/swap-flattens-subpartitioned-child | 689ab95 | current tip, worktree `.claude/worktrees/agent-af6c0dd061ece2667` |
 
-To measure another commit, `git checkout <sha>` in this worktree, rebuild,
-reinstall, and re-run the driver with `--label <sha>`. The benchmark files
-live only on this branch, so copy them to `/private/tmp` before checking out a
-different commit, or run them by absolute path from a copy.
+To measure another commit, export it rather than checking it out, so this
+worktree (and the benchmark files, which live only on this branch) stays put:
+
+```
+git archive <sha> | tar -x -C /private/tmp/rfxsrc-<label>
+cd /private/tmp/rfxsrc-<label>
+CARGO_TARGET_DIR=/private/tmp/rfx-bench CARGO_INCREMENTAL=0 \
+  cargo pgrx install --pg-config $PGBIN/pg_config --no-default-features --features pg17
+```
+
+then run the driver from this worktree with `--label <label>`. The helper
+`scratchpad/build_at.sh <sha> <label>` does exactly this and prints the
+resulting `.so` sha256, which the driver also records.
