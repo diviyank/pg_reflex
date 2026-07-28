@@ -29,11 +29,38 @@ the map built once up front stays valid for the whole loop.
 
 ## Reproduction / measurement
 
-Not yet measured. At the scale of the existing test fixture (~48 leaves, per the co-partitioned
-DP test family) the absolute cost is small and this is why it wasn't caught by that suite. The
-concern is daily/weekly-partitioned production roots with hundreds to low-thousands of leaves
-synced in one bulk backfill — the same order of magnitude where the empty-subpartition-skip
-optimization (`journal`/memory: 48-leaf DP attach 898s→51s) mattered.
+**Measured 2026-07-28 and confirmed quadratic.** `benchmarks/bench_partition_scaling.sh`
+sweeps N = partition count with total data held constant, so any growth is per-child
+overhead. PostgreSQL 17.7 (homebrew), `max_locks_per_transaction = 2048`, 20 000 source
+rows spread over N leaves, median of 6 reps, tree already in sync (so this is the probe
+cost alone — no node is actually created):
+
+| metric | N=10 | N=25 | N=50 | N=100 | N=200 | fitted slope |
+|---|---:|---:|---:|---:|---:|---:|
+| `reflex_sync_partitions` (aggregate IMV, 2 probes/node) | 4.7 ms | 13.3 | 33.6 | 104.9 | 412.1 | **1.48** |
+| `reflex_sync_partitions` (passthrough IMV, 1 probe/node) | 3.0 ms | 8.0 | 18.6 | 54.7 | 208.6 | **1.40** |
+
+The local slope climbs to **1.97 over N=100→200** (3.93x the time for 2x the partitions) —
+a linear term dominated by a quadratic one, exactly the predicted shape. Identical on
+`2f8b786` (main), `integration/s1-batch` and `fix/swap-flattens-subpartitioned-child`, so
+this is pre-existing and **not** introduced by the current batch.
+
+Two independent confirmations that the cost is this probe and not the work itself:
+
+1. **The aggregate IMV costs almost exactly 2x the passthrough at every N** (412.1 / 208.6
+   at N=200; 2.0x, 1.9x, 1.8x, 1.9x, 2.0x across the sweep). An aggregate IMV has an
+   intermediate, so the loop calls `drop_bound_collision_orphan` **twice** per node; a
+   passthrough calls it **once**. Halving the number of probe calls halves the time, and
+   both halves are quadratic.
+2. **The lock footprint is exactly linear** — `2N + 25` locks held at the end of the sync,
+   identical on all three builds. The sync touches a linear number of objects and spends
+   quadratic time doing it, which is the signature of repeated catalog re-enumeration
+   rather than of more work being done.
+
+Extrapolating the quadratic term: ~0.41 s at N=200 becomes **~10 s at N=1000 and ~41 s at
+N=2000**, per sync. Every `reflex_reconcile_partition` pays it in its pre-sync, and so does
+every COMMIT-time flush of an attached partition — `attach_txn` measures 1.0 s at N=200
+with a 100→200 local slope of 1.69.
 
 ## Fix direction
 
