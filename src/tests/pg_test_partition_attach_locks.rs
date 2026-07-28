@@ -717,3 +717,90 @@ fn aggregate_rollover_attach_then_load_is_not_double_counted() {
         .expect("no row for the pre-existing partition");
     assert_eq!(old_total, 30, "pre-existing partition must be untouched");
 }
+
+// ---------------------------------------------------------------------------
+// A full `reflex_reconcile` of a depth-2 IMV must swap mirror LEAVES, so every
+// DETACH/ATTACH lands on the leaf's immediate parent — a BRANCH — and never on
+// the IMV root. Swapping top-level children instead (the shape that also
+// silently flattened the mirror) DETACHes straight off the root, and PostgreSQL
+// holds that AccessExclusiveLock to commit.
+//
+// This narrows the lock; it does not make the reconcile reader-free. Plan-time
+// expansion locks the branches a query reaches, so a reader still blocks behind
+// whichever branch is mid-swap. What changes is that the lock is no longer on
+// the root, which every reader of the IMV must take regardless of pruning.
+// ---------------------------------------------------------------------------
+
+#[pg_test]
+fn full_reconcile_never_locks_imv_root_depth2() {
+    const DBNAME: &str = "reflex_lockprobe_rc2";
+    probe_db_open(DBNAME);
+    worker_exec(
+        "CREATE TABLE rc2_src (k INT NOT NULL, d DATE NOT NULL, v INT) PARTITION BY LIST (k); \
+         CREATE TABLE rc2_src_1 PARTITION OF rc2_src FOR VALUES IN (1) PARTITION BY RANGE (d); \
+         CREATE TABLE rc2_src_1_m1 PARTITION OF rc2_src_1 \
+             FOR VALUES FROM ('2025-01-01') TO ('2025-02-01'); \
+         CREATE TABLE rc2_src_1_m2 PARTITION OF rc2_src_1 \
+             FOR VALUES FROM ('2025-02-01') TO ('2025-03-01'); \
+         CREATE TABLE rc2_src_2 PARTITION OF rc2_src FOR VALUES IN (2) PARTITION BY RANGE (d); \
+         CREATE TABLE rc2_src_2_m1 PARTITION OF rc2_src_2 \
+             FOR VALUES FROM ('2025-01-01') TO ('2025-02-01'); \
+         INSERT INTO rc2_src SELECT 1, '2025-01-15'::date, g FROM generate_series(1, 500) g; \
+         INSERT INTO rc2_src SELECT 1, '2025-02-15'::date, g FROM generate_series(1, 500) g; \
+         INSERT INTO rc2_src SELECT 2, '2025-01-15'::date, g FROM generate_series(1, 300) g; \
+         ANALYZE rc2_src; \
+         DO $mk$ BEGIN PERFORM create_reflex_ivm('rc2_imv', 'SELECT k, d, v FROM rc2_src', \
+             'k,d,v', NULL, NULL, NULL, ARRAY['k','d']); END $mk$",
+    );
+    let pid = worker_pid();
+    let imv_oid = worker_relation_oid("rc2_imv");
+    let branch_oid = worker_relation_oid("rc2_imv_rc2_src_2");
+
+    let baseline = read_with_lock_timeout(DBNAME, "SELECT count(*) FROM rc2_imv WHERE k = 2");
+
+    worker_exec("BEGIN");
+    worker_exec("DO $rc$ BEGIN PERFORM reflex_reconcile('rc2_imv'); END $rc$");
+
+    let root_modes = worker_lock_modes(imv_oid, pid);
+    let branch_modes = worker_lock_modes(branch_oid, pid);
+
+    worker_exec("COMMIT");
+    let after = read_with_lock_timeout(DBNAME, "SELECT count(*) FROM rc2_imv");
+    let partitioned_children = worker_scalar_i64(
+        "SELECT count(*)::int8 FROM pg_inherits i \
+         JOIN pg_class c ON c.oid = i.inhrelid \
+         WHERE i.inhparent = 'rc2_imv'::regclass AND c.relkind = 'p'",
+    );
+    let grandchildren = worker_scalar_i64(
+        "SELECT count(*)::int8 FROM pg_class c \
+         JOIN pg_inherits i  ON i.inhrelid  = c.oid \
+         JOIN pg_inherits i2 ON i2.inhrelid = i.inhparent \
+         WHERE i2.inhparent = 'rc2_imv'::regclass",
+    );
+    worker_exec(
+        "DROP TABLE IF EXISTS rc2_src CASCADE; DROP TABLE IF EXISTS rc2_imv CASCADE; \
+         DELETE FROM public.__reflex_ivm_reference WHERE name = 'rc2_imv'",
+    );
+    probe_db_close(DBNAME);
+
+    assert_eq!(baseline, 300, "baseline reader could not read the IMV");
+    assert!(
+        !root_modes.iter().any(|m| m == "AccessExclusiveLock"),
+        "a full reconcile took AccessExclusiveLock on the IMV ROOT and holds it to commit, \
+         freezing every reader of the IMV (locks held on the root: {root_modes:?})"
+    );
+    assert!(
+        branch_modes.iter().any(|m| m == "AccessExclusiveLock"),
+        "the swap's AccessExclusiveLock is not on the swapped leaf's immediate parent \
+         (locks held on the branch: {branch_modes:?}) — the reconcile did not swap leaves"
+    );
+    assert_eq!(after, 1300, "the IMV is wrong after the reconcile committed");
+    assert_eq!(
+        partitioned_children, 2,
+        "the full reconcile flattened the depth-2 mirror"
+    );
+    assert_eq!(
+        grandchildren, 3,
+        "the full reconcile dropped part of the mirror's sub-partition subtree"
+    );
+}
