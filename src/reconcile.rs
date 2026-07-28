@@ -874,6 +874,10 @@ pub(crate) fn reflex_reconcile_with_orphans(view_name: &str, drop_orphans: bool)
 
     let own = reconcile_named_node(view_name, drop_orphans);
 
+    if !own.starts_with("ERROR") {
+        cascade_partitioned_rebuild_to_dependents(view_name);
+    }
+
     // The parent is rebuilt even when a child failed — that still repairs any
     // drift local to the parent, and leaving it untouched would be no fresher.
     // But the RETURN VALUE must not claim success: the parent has just been
@@ -885,6 +889,75 @@ pub(crate) fn reflex_reconcile_with_orphans(view_name: &str, drop_orphans: bool)
         return "ERROR: generated sub-IMV reconcile failed";
     }
     own
+}
+
+/// Refresh the dependents of an IMV that was just rebuilt through the
+/// PARTITIONED path, which propagates nothing on its own.
+///
+/// The unpartitioned rebuild is `TRUNCATE` + `INSERT`, and every source carries
+/// an `AFTER TRUNCATE … FOR EACH STATEMENT` trigger plus the statement-level
+/// INSERT trigger, so consumers follow it. The partitioned rebuild moves rows
+/// with `CREATE TABLE AS` into a detached table and then DETACH/ATTACH/RENAME —
+/// pure DDL, no DML on the live target, so no data trigger can fire and no
+/// consumer ever learns the IMV changed. Left alone the dependent serves stale
+/// rows with `known_stale = f` and no signal at all.
+///
+/// This is the same fan-out `reflex_reconcile_partition` performs after its own
+/// swap (`partition.rs`), reached here for the whole-IMV rebuild. Restricted to
+/// the partitioned case on purpose: cascading after an unpartitioned rebuild
+/// would rebuild a consumer that ALSO has the rebuild's delta staged for COMMIT,
+/// double-counting it — the hazard
+/// `reconcile_generated_child_without_propagating` exists to avoid.
+///
+/// Deliberately at the public entry point rather than inside `reconcile_one`:
+/// the chain descent rebuilds generated sub-IMVs through `reconcile_one` with
+/// their triggers suppressed *because* they must not propagate, and a cascade
+/// there would send a generated child back up to the root currently rebuilding
+/// it.
+///
+/// Cost is O(D) dispatches for D direct dependents, once per reconcile — not
+/// once per swapped partition. Each dependent's own rebuild is the work its
+/// staleness requires, and recursion carries the refresh down the chain.
+fn cascade_partitioned_rebuild_to_dependents(view_name: &str) {
+    let dependents: Vec<String> = Spi::connect(|client| {
+        client
+            .select(
+                "SELECT unnest(r.graph_child) AS dep \
+                 FROM public.__reflex_ivm_reference r \
+                 WHERE r.name = $1 \
+                   AND r.partition_columns IS NOT NULL \
+                   AND array_length(r.partition_columns, 1) > 0",
+                None,
+                &[unsafe {
+                    DatumWithOid::new(
+                        view_name.to_string(),
+                        PgBuiltInOids::TEXTOID.oid().value(),
+                    )
+                }],
+            )
+            .unwrap_or_report()
+            .filter_map(|row| {
+                row.get_by_name::<&str, _>("dep")
+                    .unwrap_or(None)
+                    .map(|s| s.to_string())
+            })
+            .collect()
+    });
+
+    for dep in &dependents {
+        let result = reflex_reconcile(dep);
+        if result.starts_with("ERROR") {
+            warning!(
+                "pg_reflex: '{}' was rebuilt but refreshing its dependent '{}' returned: {} \
+                 — that dependent is STALE; run SELECT reflex_rebuild_imv('{}') once the \
+                 cause is cleared",
+                view_name,
+                dep,
+                result,
+                dep
+            );
+        }
+    }
 }
 
 /// WARN when the trigger-depth gate suppresses recursion for an IMV that

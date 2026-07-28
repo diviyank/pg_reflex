@@ -1065,7 +1065,31 @@ extension_sql!(
         _synced_keys TEXT[] := ARRAY[]::TEXT[];
         _sync_key TEXT;
         _reconcile_root TEXT;
+        _swap_root TEXT;
     BEGIN
+        -- pg_reflex's own atomic partition swap (partition.rs
+        -- `execute_partition_swap_for_child`) publishes the IMV it is rebuilding
+        -- here for the duration of its DETACH/ATTACH sequence. Nothing else runs
+        -- inside that window, so every DDL command reaching this trigger while
+        -- the GUC is set is ours, and NONE of it is a source change:
+        --
+        --   * the parent's child set is TRANSIENT mid-swap. A dependent that
+        --     re-mirrors it adopts a `<dep>___reflex_swap_tgt_*` child and drops
+        --     its real one as a bound-collision orphan; the closing RENAME then
+        --     never revisits the dependent, leaving it EMPTY with a mirror of a
+        --     relation that no longer exists.
+        --   * the swap changes no column shape, so the alter-source alarm has
+        --     nothing to report — and under `alter_source_policy = 'error'` it
+        --     would abort the very reconcile that repairs the IMV.
+        --
+        -- Dependents are refreshed explicitly once the swap is complete
+        -- (reconcile.rs `cascade_partitioned_rebuild_to_dependents`), which is
+        -- what makes skipping here safe rather than merely quiet.
+        _swap_root := NULLIF(current_setting('pg_reflex.internal_swap_root', true), '');
+        IF _swap_root IS NOT NULL THEN
+            RETURN;
+        END IF;
+
         _policy := lower(COALESCE(NULLIF(current_setting('pg_reflex.alter_source_policy', true), ''), 'warn'));
         IF _policy NOT IN ('warn', 'error') THEN
             RAISE WARNING 'pg_reflex: invalid pg_reflex.alter_source_policy=%, falling back to ''warn''', _policy;
