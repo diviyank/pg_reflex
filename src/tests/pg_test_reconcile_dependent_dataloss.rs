@@ -375,3 +375,111 @@ fn pg_rdd_unpartitioned_parent_still_propagates() {
     assert_eq!(dep_row_count("rdd5d"), rows, "unpartitioned control lost rows");
     assert_imv_correct("rdd5d", d_fresh);
 }
+
+/// T7 -- the cascade must honour the caller's `drop_orphans` authorization.
+///
+/// `reflex_reconcile(view, FALSE)` exists so a caller that has NOT been given
+/// permission to destroy partitions can still rebuild: `reflex_doctor` refuses
+/// an orphan drop when the operator did not pass `drop_orphans`, and this
+/// overload is how its F4/F4b repair keeps that promise. A cascade that calls
+/// the ONE-argument form re-opens exactly that door one level down -- the
+/// dependent's preserved orphan is destroyed by a call that asked for no
+/// destruction.
+#[pg_test]
+fn pg_rdd_cascade_honours_drop_orphans_false() {
+    build_rdd_source("rdd8s");
+    create_imv(
+        "rdd8p",
+        "SELECT create_reflex_ivm('rdd8p', \
+         'SELECT k, bucket, SUM(amt) AS total FROM rdd8s GROUP BY k, bucket', \
+         NULL, NULL, NULL, NULL, ARRAY['k'])",
+    );
+    create_imv(
+        "rdd8d",
+        "SELECT create_reflex_ivm('rdd8d', 'SELECT k, SUM(total) AS t FROM rdd8p GROUP BY k')",
+    );
+
+    // Retire one source partition. The parent may drop its mirror child (it was
+    // asked to); the dependent's mirror child becomes a PRESERVED orphan --
+    // holding rows that are still the user's data.
+    Spi::run("ALTER TABLE rdd8s DETACH PARTITION rdd8s_c").expect("detach");
+    Spi::run("DROP TABLE rdd8s_c").expect("drop source child");
+    let sync = Spi::get_one::<String>("SELECT reflex_sync_partitions('rdd8p', TRUE)")
+        .expect("sync")
+        .expect("sync result");
+    assert!(!sync.starts_with("ERROR"), "sync returned: {sync}");
+
+    let dep_children_before = partition_child_names("rdd8d");
+    assert!(
+        dep_children_before.iter().any(|n| n.ends_with("_rdd8s_c")),
+        "fixture: the dependent should still hold the preserved orphan, got {dep_children_before:?}"
+    );
+
+    let res = Spi::get_one::<&str>("SELECT reflex_reconcile('rdd8p', FALSE)")
+        .expect("reconcile")
+        .expect("reconcile result");
+    assert!(!res.starts_with("ERROR"), "reconcile returned: {res}");
+
+    assert_eq!(
+        partition_child_names("rdd8d"),
+        dep_children_before,
+        "reflex_reconcile(parent, FALSE) destroyed a dependent partition the caller \
+         did not authorize dropping"
+    );
+}
+
+/// T9 -- the suppression must not be over-broad: once the swap's bracket is
+/// closed, ordinary source DDL must still reach the dependent auto-sync.
+///
+/// The branch adds a mechanism that makes `ddl_command_end` do nothing at all.
+/// Nothing else pins that it stops doing so. Without this, a fix that failed to
+/// clear the GUC would silently disable partition mirroring for the rest of
+/// every transaction that reconciled anything, and the whole suite would stay
+/// green.
+#[pg_test]
+fn pg_rdd_suppression_ends_with_the_swap() {
+    build_rdd_source("rddas");
+    create_imv(
+        "rddap",
+        "SELECT create_reflex_ivm('rddap', \
+         'SELECT k, bucket, SUM(amt) AS total FROM rddas GROUP BY k, bucket', \
+         NULL, NULL, NULL, NULL, ARRAY['k'])",
+    );
+    create_imv(
+        "rddad",
+        "SELECT create_reflex_ivm('rddad', 'SELECT k, SUM(total) AS t FROM rddap GROUP BY k')",
+    );
+
+    let res = Spi::get_one::<&str>("SELECT reflex_reconcile('rddap')")
+        .expect("reconcile")
+        .expect("reconcile result");
+    assert_eq!(res, "RECONCILED");
+
+    assert_eq!(
+        Spi::get_one::<String>("SELECT current_setting('pg_reflex.internal_swap_root', true)")
+            .expect("guc")
+            .unwrap_or_default(),
+        "",
+        "the swap suppression GUC outlived the swap"
+    );
+
+    // Ordinary source DDL, in the same transaction, AFTER a reconcile. The
+    // event trigger must still mirror the new partition all the way down.
+    Spi::run("CREATE TABLE rddas_d PARTITION OF rddas FOR VALUES IN ('D')")
+        .expect("new source partition");
+
+    assert!(
+        partition_child_names("rddap")
+            .iter()
+            .any(|n| n.ends_with("_rddas_d")),
+        "the parent did not mirror a source partition created after a reconcile: {:?}",
+        partition_child_names("rddap")
+    );
+    assert!(
+        partition_child_names("rddad")
+            .iter()
+            .any(|n| n.ends_with("_rddas_d")),
+        "the dependent did not mirror a source partition created after a reconcile: {:?}",
+        partition_child_names("rddad")
+    );
+}
