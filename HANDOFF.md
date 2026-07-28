@@ -78,12 +78,47 @@ already performs, while deriving `affected_keys` costs an extra
 **Complexity: O(D) dispatches per reconcile and O(N) `SET LOCAL` statements.**
 Not superlinear in either.
 
+## Author fix round (adversarial review F1/F2/F4)
+
+Review verdict was DO-NOT-MERGE on **F1**, which I concede in full.
+
+* **F1 (HIGH, fixed).** The cascade called the one-argument `reflex_reconcile(dep)` =
+  `drop_orphans => TRUE`, while the caller's `drop_orphans` was in scope and
+  ignored. `reflex_reconcile(parent, FALSE)` therefore destroyed a dependent's
+  PRESERVED orphan partition — and the reachable caller is the bad one,
+  `reflex_doctor(fix => true, drop_orphans => false)`. Now
+  `cascade_partitioned_rebuild_to_dependents(view_name, drop_orphans)` forwarding to
+  `reflex_reconcile_with_orphans(dep, drop_orphans)`. **T7** pins it.
+* **F2 (MEDIUM, fixed).** The cascade ran *above* the `child_failed` early return, so a
+  reconcile deliberately reported as ERROR first laundered known-stale content into every
+  dependent and cleared their `known_stale`. Moved below the gate.
+* **F4 (LOW, fixed).** **T9** is the missing negative coverage: the GUC must be `''` after
+  a reconcile, and ordinary source DDL in the same transaction must still mirror into
+  parent *and* dependent.
+
+**F2 has no test, deliberately, and this is a known gap.** `child_failed` requires a
+generated sub-IMV whose reconcile fails. `generated_dependencies_shallowest_first` filters
+on `enabled` and `REBUILDABLE_NODE`, so the disabled and decomposed-wrapper routes are
+excluded; the only remaining route is `ERROR: partition reconcile failed` from a
+partitioned generated sub-IMV. I tried to provoke that by planting a VIEW on a swap
+table's name (it survives `cleanup_orphan_swap_tables`, which only drops `relkind='r'`) —
+the `CREATE TABLE` collision **raises** rather than returning a soft `Err`, aborting the
+transaction instead of producing `child_failed`. That test was removed rather than
+weakened. Every other route I found needs hand-written registry state, which this
+project's history explicitly forbids. **F2 therefore lands code-read-verified only**, on
+the strength of the invariant its own adjacent comment states.
+
 ## Self-mutation
 
 | mutation | RED | GREEN |
 |---|---|---|
 | **M1** guard defeated (`IF _swap_root IS NOT NULL AND FALSE`) | T5 only, with `rdd6d___reflex_swap_tgt_rdd6p_rdd6s_c` | T1-T4 |
 | **M2** cascade call removed | T1 (6 oracle mismatches), T3, T4a | T2, T5, T4b |
+| **M3** `drop_orphans` hardcoded back to `true` | T7 only — `rdd8d_rdd8p_rdd8s_c` destroyed | all others |
+| **M4** `set_internal_swap_root(client, None)` deleted | T9 only — GUC left as `"rddad"` | all others |
+
+Each mutation moves exactly one property's tests and nothing else, so no test is standing
+in for another.
 
 M1 initially left **all** tests green — a false green. The cascade repairs a
 mirror the swap corrupted, so a test that goes through `reflex_reconcile` cannot
@@ -95,7 +130,19 @@ M2's signature is the design argument in miniature: with the guard but no
 cascade, T1 fails as *staleness* (6 mismatches), not emptiness. The name guard
 alone converts data destruction into silent staleness.
 
-## Scaling (measured, pg17, same box, back to back)
+## Scaling — mechanism confirmed, numbers NOT reproducible from this tree
+
+The reviewer is right to discount the raw numbers: no driver was committed, and they were
+taken on pg17 while review ran on pg16. A reusable
+`benchmarks/bench_partition_scaling.sh` on another branch will be used to re-measure at
+integration. **Read the table below as an illustration of the mechanism, not as a
+committed benchmark result.**
+
+The mechanism itself is not in doubt and is confirmed by M1/M2: under the unguarded build
+each swap's `ALTER TABLE` re-enters `__reflex_on_ddl_command_end`, which runs a full
+`reflex_sync_partitions` over every partitioned dependent — O(N) swaps × O(N) dependent
+tree × D dependents. Note also that the comparison below is "fixed" vs "guard defeated",
+which isolates the *guard*; the cascade is a cost on top, not part of the saving.
 
 Reconcile of a partitioned IMV with one auto-partitioned dependent:
 
@@ -104,17 +151,18 @@ Reconcile of a partitioned IMV with one auto-partitioned dependent:
 | **fixed** | 697 ms | 4 652 ms | **6.68** |
 | guard defeated (= base behaviour) | 1 378 ms | 18 200 ms | **13.21** |
 
-The unguarded mid-swap re-sync is the superlinear term: O(N) swaps each firing a
-full `reflex_sync_partitions` over each dependent's O(N) tree, i.e. **O(N²·D)**.
-The fix deletes it — 3.9× faster at N=50 and roughly half the growth exponent.
-The fix's own additions are **O(D) reconcile dispatches + O(N) `SET LOCAL`**.
+N = partition count; dependent count D = 1; rows = 40·N spread one partition-key
+per partition. The fix's own additions are **O(D) reconcile dispatches + O(N)
+`SET LOCAL`** — except on a DAG with fan-in, where the cascade costs one dispatch
+per *path* rather than per node (filed, see below).
 
 ## State
 
-- Tests: `src/tests/pg_test_reconcile_dependent_dataloss.rs` (6 `#[pg_test]`),
+- Tests: `src/tests/pg_test_reconcile_dependent_dataloss.rs` (8 `#[pg_test]`),
   included from `src/lib.rs`.
-- All 6 GREEN after the fix; each measured RED under its own mutation.
-- Full `cargo pgrx test pg17`: **1578 passed, 0 failed**. `cargo fmt` clean.
+- All 8 GREEN; each measured RED under its own mutation (M1-M4), except the
+  `child_failed` half of F2 — see the fix-round section for why.
+- Full `cargo pgrx test pg17`: **1580 passed, 0 failed**. `cargo fmt` clean.
   `cargo clippy` — 4 pre-existing `needless_borrow` warnings in
   `src/tests/pg_test_audit.rs`, none from this branch.
 - No registry column added. No version bump / CHANGELOG / `sql/*--*.sql`
@@ -137,6 +185,20 @@ Its three adjacent defects survived and are filed separately here:
 - `2026-07-28_doctor_mislabels_residue_and_reports_fixed_without_rechecking.md`
 - `2026-07-28_alter_source_alarm_suppressed_by_name_shape_not_provenance.md`
   — the parent report's *inferred* suppression hole, now confirmed by code read.
+
+From the review round, filed not folded in:
+
+- `2026-07-28_dependent_cascade_has_no_visited_set_on_dag_fanin.md` (F3) — no
+  visited set, so a fan-in node is rebuilt once per path. Correctness unaffected.
+- `2026-07-28_scoped_cascade_fallback_escalates_drop_orphans.md` — the same
+  one-arg escalation as F1 at `src/partition.rs:2331`, but **pre-existing** and
+  not reachable from `reflex_reconcile(x, FALSE)`. Its Step 0 is to establish
+  reachability at all; a no-fix-plus-comment is a legitimate outcome.
+
+Not filed, carried as a note: the cascade is not gated by `inside_trigger()`
+while the chain descent deliberately is. The reviewer could not turn this into
+wrong data and neither could I; it is unbounded extra work at COMMIT time, not a
+correctness defect.
 
 ## Recovery for operators already hit
 
