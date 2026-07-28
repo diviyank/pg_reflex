@@ -77,12 +77,26 @@ any source DDL triggers automatically) empties it.
 
 Two complementary halves, both in `ead9845`.
 
-**(a) `src/reconcile.rs` — resolve mirror leaves.** The partitioned branch iterated
+**(a) `src/reconcile.rs` — target the mirror's leaf set.** The partitioned branch iterated
 `list_partition_children(anchor_source)` — *immediate* source children — so on a depth->=2
-mirror the derived target child was a partitioned relation every time. It now expands the
-source tree to leaves and maps each up to the IMV's mirror depth, exactly as
-`reflex_reconcile_partition_impl` already did. At mirror depth 1 this yields the identical
-set, so single-level IMVs are untouched.
+mirror the derived target child was a partitioned relation every time. It now derives the set
+from `truncate_partition_tree(source_tree, mirror_depth)` filtered to leaves — the same
+function `create_ivm` and `reflex_sync_partitions` use to *build* the mirror, so the swap set
+matches the mirror by construction. At mirror depth 1 this yields exactly the source's
+immediate children, so single-level IMVs are untouched.
+
+> The first version of (a) filtered the raw source tree to leaves and mapped each up to
+> `mirror_depth` via `leaf_ancestor_chain` / `ancestor_bare_at_depth`. Adversarial review
+> found that this **silently dropped any source node that is partitioned but currently
+> childless** — it is not a leaf and owns no leaf to stand in for it, so its mirror child was
+> never rebuilt while the reconcile still returned `RECONCILED`. Reached by a branch
+> pre-created ahead of its leaves and by retention dropping a branch's leaves. Deriving from
+> `truncate_partition_tree` closes the class: truncation *demotes* nodes at `mirror_depth` to
+> leaves, so a childless branch there is included (its mirror child is a plain table that can
+> hold rows) and one above `mirror_depth` is still excluded (its mirror child is partitioned
+> and holds nothing itself). It also removes the ancestor-mapping helpers from this path
+> entirely. Pinned by `pg_subpart_reconcile_rebuilds_childless_branch_mirror_child` and
+> `pg_subpart_reconcile_rebuilds_branch_whose_leaves_were_dropped`; isolated by M4.
 
 **(b) `src/partition.rs` — refuse loudly.** `execute_partition_swap_for_child` now probes
 `relkind` on the target and intermediate child and returns a clean `Err` naming the child and
@@ -103,11 +117,12 @@ the sibling report also argued.
 
 | run | tree | result |
 |---|---|---|
-| green | `ff8327a` (HEAD) | **1569 passed, 0 failed** |
-| green | `c6f15d5` | 1568 passed, 0 failed |
+| green | HEAD (post-review round) | **1572 passed, 0 failed** |
+| green | `62fe6c7` (pre-review) | 1569 passed, 0 failed |
 | M1 | leaf resolution reverted, guard kept | **10 failed** |
 | M2 | guard disabled, leaf resolution kept | **1 failed** |
 | M3 | both reverted (true pre-fix) | **6 failed** |
+| M4 | F1 fix reverted only (leaf-filter restored) | **2 failed** |
 
 `cargo fmt --check` clean. `cargo clippy` reports 5 warnings, **all pre-existing** on
 `integration/s1-batch` (`src/trigger/mod.rs` dead code, 4 `needless_borrow` in
@@ -115,7 +130,10 @@ the sibling report also argued.
 
 ### Mutation matrix — which mutation broke which test
 
-**M3 (both halves reverted) — 6 red, every one for the intended reason:**
+The four mutations are not nested, so the counts are not cumulative. Each isolates one
+property.
+
+**M3 (both halves reverted — the true pre-fix tree) — 6 red:**
 
 | test | failure |
 |---|---|
@@ -126,18 +144,34 @@ the sibling report also argued.
 | `pg_subpart_swap_refuses_partitioned_child_and_leaves_state_intact` | swap returned `OK` |
 | `full_reconcile_never_locks_imv_root_depth2` | root held `AccessExclusiveLock` |
 
-**M1 (leaf resolution reverted, guard kept) — 10 red.** The guard converts the silent
-flattening into `ERROR: partition reconcile failed`, so on top of the M3 set, **three
-pre-existing tests** go red: `pg_subpart_global_reconcile_passthrough_multilevel`,
-`pg_subpart_cte_passthrough_global_reconcile`,
-`pg_subpart_cte_passthrough_sublevel_attach_swap`. Those three were green before this work
-*only because the corruption was silent*. This is the decisive evidence that **half (b) alone
-stops the data loss**, and that (a) is what makes the operation succeed rather than refuse.
+Both F1 probes are GREEN at M3 — correctly: the pre-fix `list_partition_children` covered
+childless branches. F1 was a regression this branch introduced and has now removed.
+
+**M1 (leaf resolution reverted, guard kept) — 10 red. Not a superset of M3.** The refusal
+test is correctly GREEN here (the guard is kept), and two of this branch's own tests join:
+
+* 5 shared with M3: the four data-loss/shape tests plus the lock test.
+* 3 **pre-existing** tests, which fail with `ERROR: partition reconcile failed`:
+  `pg_subpart_global_reconcile_passthrough_multilevel`,
+  `pg_subpart_cte_passthrough_global_reconcile`,
+  `pg_subpart_cte_passthrough_sublevel_attach_swap`. They were green before this work
+  *only because the corruption was silent*.
+* 2 more of this branch's: `pg_subpart_exposure_detection_queries_are_accurate`,
+  `pg_subpart_reconcile_repairs_an_already_flattened_mirror`.
+
+5 + 3 + 2 = 10. This is the decisive evidence that **the guard alone stops the data loss**,
+and that leaf resolution is what makes the operation succeed rather than refuse.
 
 **M2 (guard disabled, leaf resolution kept) — exactly 1 red:**
-`pg_subpart_swap_refuses_partitioned_child_and_leaves_state_intact`. The guard is
-independently pinned and nothing else depends on it, which is the correct signature for a
-backstop.
+`pg_subpart_swap_refuses_partitioned_child_and_leaves_state_intact`. Held at 1 across both
+review rounds. Nothing else depends on the guard, which is the correct signature for a
+backstop rather than a load-bearing check.
+
+**M4 (F1 fix reverted — `truncate_partition_tree` swapped back for the source-leaf filter,
+everything else intact) — exactly 2 red:**
+`pg_subpart_reconcile_rebuilds_childless_branch_mirror_child` (`1` vs `0` rows of surviving
+drift) and `pg_subpart_reconcile_rebuilds_branch_whose_leaves_were_dropped`
+(`EXCEPT ALL oracle failed: 25 mismatches`).
 
 No test stayed green under its own mutation.
 
@@ -148,35 +182,64 @@ No test stayed green under its own mutation.
 ### 4.1 Find affected IMVs
 
 Both queries are asserted verbatim against real IMVs by
-`pg_subpart_exposure_detection_queries_are_accurate`, in both directions.
+`pg_subpart_exposure_detection_queries_are_accurate`, in both directions, including a
+legacy NULL-`partition_depth` fixture.
 
-Mirrors deeper than one level — on an unfixed build a `reflex_reconcile` will flatten these:
+Both resolve the registry name through `quote_ident` per component. A bare
+`to_regclass(r.name)` **down-cases** an unquoted mixed-case name and yields NULL — which
+would make query 1 *miss* an affected IMV and make query 2 *falsely report* one (its
+`NOT EXISTS` over an empty set is TRUE). The codebase documents the same hazard at
+`src/reconcile.rs:1170-1175`.
+
+Query 1 — mirrors deeper than one level. On an unfixed build a `reflex_reconcile` flattens
+these, and the next partition sync then empties them:
 
 ```sql
 SELECT DISTINCT r.name
 FROM public.__reflex_ivm_reference r
-JOIN pg_inherits i ON i.inhparent = to_regclass(r.name)
+JOIN pg_inherits i
+  ON i.inhparent = to_regclass(CASE WHEN r.name LIKE '%.%'
+       THEN quote_ident(split_part(r.name, '.', 1)) || '.'
+            || quote_ident(split_part(r.name, '.', 2))
+       ELSE quote_ident(r.name) END)
 JOIN pg_class c ON c.oid = i.inhrelid
 WHERE r.enabled AND c.relkind = 'p';
 ```
 
-Mirrors that have **already flattened** — data still correct, next sync empties them:
+Query 2 — partitioned mirrors that are FLAT but should not be. Data is still correct; the
+next sync empties them:
 
 ```sql
-SELECT r.name, r.partition_depth
+SELECT r.name, r.partition_depth,
+       CASE WHEN r.partition_depth IS NULL
+            THEN 'UNKNOWN — mirror depth unrecorded, inspect the source tree'
+            ELSE 'ALREADY FLATTENED' END AS status
 FROM public.__reflex_ivm_reference r
 WHERE r.enabled
-  AND COALESCE(r.partition_depth, 0) >= 2
-  AND NOT EXISTS (SELECT 1 FROM pg_inherits i
-                  JOIN pg_class c ON c.oid = i.inhrelid
-                  WHERE i.inhparent = to_regclass(r.name) AND c.relkind = 'p');
+  AND r.partition_columns IS NOT NULL
+  AND array_length(r.partition_columns, 1) > 0
+  AND (r.partition_depth IS NULL OR r.partition_depth >= 2)
+  AND NOT EXISTS (
+        SELECT 1 FROM pg_inherits i
+        JOIN pg_class c ON c.oid = i.inhrelid
+        WHERE i.inhparent = to_regclass(CASE WHEN r.name LIKE '%.%'
+                 THEN quote_ident(split_part(r.name, '.', 1)) || '.'
+                      || quote_ident(split_part(r.name, '.', 2))
+                 ELSE quote_ident(r.name) END)
+          AND c.relkind = 'p');
 ```
 
-Caveat on the second query: `partition_depth` NULL means "mirror the full source depth", so a
-legacy row with NULL is excluded by the `COALESCE(...,0)` and must be inspected by hand. The
-circulated `coalesce(partition_depth,1) >= 2` is a reasonable *want-depth* expression but is
-**not** an exposure criterion on its own — it reports IMVs that are supposed to be deep, not
-ones currently at risk, and it says nothing about whether the mirror is intact.
+**NULL `partition_depth` must not be excluded.** It means "mirror the full source depth", so
+an already-flattened legacy row has no partitioned child either — excluding it would make it
+invisible to *both* queries, which is precisely the dangerous population. It is reported as
+UNKNOWN instead. `partition_depth` is always populated by current code
+(`src/create_ivm/mod.rs:649`, `:744`), so this only affects rows upgraded from before the
+column existed.
+
+The circulated `coalesce(partition_depth,1) >= 2` is a reasonable *want-depth* expression but
+is **not** an exposure criterion on its own: it reports IMVs that are supposed to be deep, not
+ones currently at risk, it says nothing about whether the mirror is intact, and its
+`coalesce(...,1)` silently drops the legacy population.
 
 ### 4.2 Repair an already-flattened IMV
 
@@ -197,6 +260,12 @@ Two warnings that matter more than the fix itself:
   exactly the destructive operation. Operators must run `reflex_reconcile` instead. This is
   a live "remedy that cannot clear its own finding" and is **not fixed on this branch**; see
   §5.
+
+Both halves of that warning are measured, not reasoned:
+`pg_subpart_reconcile_repairs_an_already_flattened_mirror` pins that the audit *prescribes*
+`reflex_sync_partitions`, and `pg_subpart_sync_on_a_flattened_mirror_empties_it_silently`
+pins what running it does — `400` rows to `0`, a **success** return string, `known_stale`
+left FALSE, with `drop_orphans => FALSE`.
 * On an **unfixed** build the repair is a stopgap, not a cure: the repaired mirror is
   immediately re-exposed, because the next `reflex_reconcile` sees non-empty children and
   flattens again. Deploy the fix, then repair.
@@ -213,7 +282,8 @@ that both touch them. The integrator must apply the following to the **merged** 
    closed. Its acceptance criteria 1-5 are all covered by
    `src/tests/pg_test_subpartition_dataloss.rs`, and criterion 5's mutation signal is recorded
    as M3 above. Note when closing that its stated scope ("multi-column `partition_by`") was
-   wrong — see §1.2.
+   wrong — see §1.2. **Safe only after the F1 fix (`c80113b`) is in the merged tree**; the
+   reviewer held this deletion pending that, and it has since landed.
 2. **NARROW** `2026-07-28_full_reconcile_swaps_every_partition_and_cascades.md`. Its H1/H2
    lock finding is closed **for mirror depth >= 2 only**. Suggested residual text:
 
@@ -227,13 +297,12 @@ that both touch them. The integrator must apply the following to the **merged** 
    > unchanged: the reconcile is not reader-free even at depth >= 2 — plan-time expansion locks
    > the branches a query reaches, so a reader still blocks behind whichever branch is
    > mid-swap. The cascade/dependent-staleness half of this report is untouched.
-3. **KEEP** the new `2026-07-28_explicit_multilevel_partition_by_impossible_on_aggregates.md`
-   (added on this branch, `e446505`). Not fixed here.
-4. **FILE** the `reflex_audit` hazard from §4.2 as its own report if it is not already
-   tracked: `partition-tree-drift` prescribes `reflex_sync_partitions(..., TRUE)`, which on a
-   flattened mirror empties the IMV. Not fixed on this branch — the flattened shape can no
-   longer be *created* after this fix, so the hazard only affects mirrors already flattened in
-   the field, but that is exactly the population being told to run the audit.
+3. **KEEP** the three reports added on this branch, none of which are fixed here:
+   * `2026-07-28_explicit_multilevel_partition_by_impossible_on_aggregates.md` (`e446505`)
+   * `2026-07-28_audit_partition_drift_remedy_empties_a_flattened_mirror.md` (`62fe6c7`)
+   * `2026-07-28_soft_reconcile_error_string_discarded_by_perform_callers.md` (review F2 —
+     pre-existing, adjacent to
+     `2026-07-27_reconcile_partition_commits_destructive_sync_on_failure.md`)
 
 ---
 
