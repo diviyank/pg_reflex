@@ -460,6 +460,25 @@ pub fn reflex_flush_deferred(source_table: &str) -> String {
                 .unwrap_or_report();
         }
 
+        // A5 — `pg_reflex.flush_failure_policy`. Default `warn`: a per-IMV flush
+        // failure is caught, the IMV is marked known_stale, and the cascade
+        // continues (existing behaviour, unchanged for every caller who never
+        // sets this). Opt-in `error` drops the per-IMV EXCEPTION handler so the
+        // failure propagates and aborts the whole caller transaction instead.
+        // Any unrecognised value (including empty/unset) falls back to `warn` —
+        // mirrors how `pg_reflex.alter_source_policy` is read at
+        // src/lib.rs:1093; a typo must never silently disable the guard.
+        let fail_hard = client
+            .select(
+                "SELECT lower(COALESCE(NULLIF(current_setting('pg_reflex.flush_failure_policy', true), ''), 'warn')) = 'error' AS e",
+                None,
+                &[],
+            )
+            .unwrap_or_report()
+            .next()
+            .map(|row| row.get_by_name::<bool, _>("e").unwrap_or(None).unwrap_or(false))
+            .unwrap_or(false);
+
         for (imv_name, base_query, end_query, agg_json, where_pred) in &imvs {
             if engage_cross_source_guard {
                 let imv_esc = imv_name.replace('\'', "''");
@@ -836,6 +855,71 @@ pub fn reflex_flush_deferred(source_table: &str) -> String {
             //   * `application_name` is set to `reflex_flush:<view>` for the
             //     duration of this IMV's body so `pg_stat_statements` /
             //     `log_line_prefix` can correlate query rows back to the IMV.
+            //
+            // A5 — the success path (timing, row count, the registry UPDATE,
+            // restoring application_name) is identical under `warn` and
+            // `error`; only the EXCEPTION clause differs, so it is built once
+            // as `success_body` and the two modes share it verbatim rather
+            // than carrying two drifting copies of this SQL.
+            let imv_name_esc = imv_name.replace("'", "''");
+            let success_body = format!(
+                "PERFORM set_config('application_name', 'reflex_flush:{imv_name_esc}', true); \
+                 SELECT COUNT(*) INTO _rows FROM {delta_tbl}; \
+                 \n{body}\n \
+                 _ms := (EXTRACT(EPOCH FROM (clock_timestamp() - _t0)) * 1000)::BIGINT; \
+                 UPDATE public.__reflex_ivm_reference \
+                   SET last_flush_ms = _ms, \
+                       last_flush_rows = _rows, \
+                       flush_count = COALESCE(flush_count, 0) + 1, \
+                       last_error = CASE WHEN known_stale THEN last_error ELSE NULL END, \
+                       flush_ms_history = (\
+                           COALESCE(flush_ms_history, ARRAY[]::BIGINT[]) || _ms\
+                       )[GREATEST(1, COALESCE(cardinality(flush_ms_history), 0) + 1 - 63):] \
+                   WHERE name = '{imv_name_esc}'; \
+                 PERFORM set_config('application_name', COALESCE(_prev_app, ''), true);",
+                delta_tbl = delta_tbl,
+                body = body,
+                imv_name_esc = imv_name_esc,
+            );
+            // Under `error` there is deliberately no EXCEPTION clause at all:
+            // the failure propagates and aborts the caller's transaction, so
+            // the registry write and the failing IMV's own subtransaction both
+            // roll back together with it. Nothing diverged, so nothing needs
+            // marking — the client's exception plus the PG server log is the
+            // durable trace. Under `warn` (default), the existing handler
+            // catches the failure in its own subtransaction, marks the IMV
+            // known_stale with a repair-pointing stale_reason, and records a
+            // durable public.__reflex_event_log row — itself guarded by a
+            // nested BEGIN…EXCEPTION WHEN OTHERS THEN NULL so a logging
+            // failure can never mask the real error or abort the cascade.
+            let exception_clause = if fail_hard {
+                String::new()
+            } else {
+                format!(
+                    "EXCEPTION WHEN OTHERS THEN \
+                       PERFORM set_config('application_name', COALESCE(_prev_app, ''), true); \
+                       RAISE WARNING 'pg_reflex: IMV % flush failed at cascade: % (SQLSTATE %)', \
+                         '{imv_name_esc}', SQLERRM, SQLSTATE; \
+                       UPDATE public.__reflex_ivm_reference \
+                         SET last_error = LEFT(SQLERRM || ' (SQLSTATE ' || SQLSTATE || ')', 500), \
+                             known_stale = TRUE, \
+                             stale_reason = LEFT('deferred flush failed: ' || SQLERRM \
+                                                 || ' (SQLSTATE ' || SQLSTATE || '). The staged ' \
+                                                 || 'delta was discarded; run reflex_reconcile(' \
+                                                 || '''{imv_name_esc}'') to repair.', 2000), \
+                             stale_since = now(), \
+                             flush_count = COALESCE(flush_count, 0) + 1 \
+                         WHERE name = '{imv_name_esc}'; \
+                       BEGIN \
+                         INSERT INTO public.__reflex_event_log \
+                           (imv_name, event, trigger_reason, detail, sqlstate) \
+                           VALUES ('{imv_name_esc}', 'error', 'flush', \
+                                   LEFT(SQLERRM, 2000), SQLSTATE); \
+                       EXCEPTION WHEN OTHERS THEN NULL; \
+                       END;",
+                    imv_name_esc = imv_name_esc,
+                )
+            };
             let do_block = format!(
                 "DO $_reflex_imv_sp$ \
                  DECLARE _t0 TIMESTAMP := clock_timestamp(); \
@@ -843,45 +927,11 @@ pub fn reflex_flush_deferred(source_table: &str) -> String {
                          _ms BIGINT; \
                          _prev_app TEXT := current_setting('application_name', true); \
                  BEGIN \
-                   PERFORM set_config('application_name', 'reflex_flush:{imv_name_esc}', true); \
-                   SELECT COUNT(*) INTO _rows FROM {delta_tbl}; \
-                   \n{body}\n \
-                   _ms := (EXTRACT(EPOCH FROM (clock_timestamp() - _t0)) * 1000)::BIGINT; \
-                   UPDATE public.__reflex_ivm_reference \
-                     SET last_flush_ms = _ms, \
-                         last_flush_rows = _rows, \
-                         flush_count = COALESCE(flush_count, 0) + 1, \
-                         last_error = CASE WHEN known_stale THEN last_error ELSE NULL END, \
-                         flush_ms_history = (\
-                             COALESCE(flush_ms_history, ARRAY[]::BIGINT[]) || _ms\
-                         )[GREATEST(1, COALESCE(cardinality(flush_ms_history), 0) + 1 - 63):] \
-                     WHERE name = '{imv_name_esc}'; \
-                   PERFORM set_config('application_name', COALESCE(_prev_app, ''), true); \
-                 EXCEPTION WHEN OTHERS THEN \
-                   PERFORM set_config('application_name', COALESCE(_prev_app, ''), true); \
-                   RAISE WARNING 'pg_reflex: IMV % flush failed at cascade: % (SQLSTATE %)', \
-                     '{imv_name_esc}', SQLERRM, SQLSTATE; \
-                   UPDATE public.__reflex_ivm_reference \
-                     SET last_error = LEFT(SQLERRM || ' (SQLSTATE ' || SQLSTATE || ')', 500), \
-                         known_stale = TRUE, \
-                         stale_reason = LEFT('deferred flush failed: ' || SQLERRM \
-                                             || ' (SQLSTATE ' || SQLSTATE || '). The staged ' \
-                                             || 'delta was discarded; run reflex_reconcile(' \
-                                             || '''{imv_name_esc}'') to repair.', 2000), \
-                         stale_since = now(), \
-                         flush_count = COALESCE(flush_count, 0) + 1 \
-                     WHERE name = '{imv_name_esc}'; \
-                   BEGIN \
-                     INSERT INTO public.__reflex_event_log \
-                       (imv_name, event, trigger_reason, detail, sqlstate) \
-                       VALUES ('{imv_name_esc}', 'error', 'flush', \
-                               LEFT(SQLERRM, 2000), SQLSTATE); \
-                   EXCEPTION WHEN OTHERS THEN NULL; \
-                   END; \
+                   {success_body} \
+                 {exception_clause} \
                  END $_reflex_imv_sp$",
-                delta_tbl = delta_tbl,
-                body = body,
-                imv_name_esc = imv_name.replace("'", "''"),
+                success_body = success_body,
+                exception_clause = exception_clause,
             );
             client.update(&do_block, None, &[]).unwrap_or_report();
 
