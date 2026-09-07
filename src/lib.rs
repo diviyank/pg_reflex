@@ -261,6 +261,13 @@ extension_sql!(
     CREATE INDEX IF NOT EXISTS __reflex_event_log_imv_at
         ON public.__reflex_event_log (imv_name, at DESC);
 
+    -- `CREATE TABLE IF NOT EXISTS` above is a no-op on any pre-release dev
+    -- database that already created this table with the original `DEFAULT
+    -- now()`; an explicit ALTER makes the clock_timestamp() fix apply on
+    -- upgrade too, not only on a fresh install.
+    ALTER TABLE public.__reflex_event_log
+        ALTER COLUMN at SET DEFAULT clock_timestamp();
+
     -- Operator-driven pruning; returns the number of rows removed.
     CREATE OR REPLACE FUNCTION public.reflex_prune_event_log(_older_than INTERVAL)
     RETURNS BIGINT LANGUAGE plpgsql AS $fn$

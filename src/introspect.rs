@@ -153,57 +153,82 @@ fn reflex_ivm_status() -> TableIterator<
     // a large IMV target; fall back to an exact count when the estimate is
     // unavailable (reltuples <= 0 → empty or never-analyzed), where count(*) is
     // cheap or the only source of truth, or when the IMV carries an anomaly:
-    // `known_stale` / a retained `last_error`, or an unresolved
-    // `__reflex_event_log` entry — an 'error' row (nothing but reconcile
-    // clears it, and reconcile also clears known_stale/last_error), or a
-    // 'rebuild' row newer than the target's last ANALYZE. The 'rebuild' term
-    // is deliberately scoped to ANALYZE recency rather than counting forever:
-    // a rebuild is written for any slice-changing swap, which is routine, so
-    // an unscoped predicate would make has_anomaly permanently true after the
-    // first one — pinning is_estimate to a constant false and, worse, making
-    // reconcile (the remedy the incident's stale_reason prescribes) write
-    // MORE 'rebuild' rows, deepening the very condition it is meant to clear.
-    // "The estimate may be stale" is true exactly when a slice was rebuilt
-    // AFTER the planner last saw it, so scoping by
+    // `known_stale`, a retained `last_error`, or an unresolved 'rebuild' row
+    // newer than the target's last ANALYZE.
+    //
+    // An 'error' event-log row is deliberately NOT a term here: it is written
+    // in the exact same handler that sets `known_stale`/`last_error` (the
+    // deferred-flush EXCEPTION branch, src/trigger/deferred.rs), so
+    // `known_stale`/`last_error` already see it — adding `event = 'error'`
+    // here would be redundant AND non-converging, because reconcile clears
+    // `known_stale`/`last_error` but never touches `__reflex_event_log`
+    // (nothing does but the operator-driven `reflex_prune_event_log`). An
+    // always-on 'error' term would therefore pin `has_anomaly` true forever
+    // after one caught flush failure — permanent exact `COUNT(*)`,
+    // `is_estimate` stuck false — exactly the non-convergence defect this
+    // predicate exists to avoid. `known_stale`/`last_error` are the
+    // convergent proxy for 'error' rows; only 'rebuild' needs its own term,
+    // because it is the one anomaly (a successful-but-destructive rebuild)
+    // that `known_stale` cannot see.
+    //
+    // 'rebuild' is scoped to ANALYZE recency rather than counting forever: a
+    // rebuild is written for any slice-changing swap, which is routine, so an
+    // unscoped predicate would make has_anomaly permanently true after the
+    // first one. "The estimate may be stale" is true exactly when a slice was
+    // rebuilt AFTER the planner last saw it, so scoping by
     // `COALESCE(last_analyze, last_autoanalyze)` from `pg_stat_all_tables`
     // (NULL, i.e. never analyzed, counts as always stale) converges by
     // construction: reconcile ANALYZEs the target (reconcile.rs:520 / :627),
-    // so running the prescribed remedy clears the condition it caused.
+    // so running the prescribed remedy retires the condition it caused —
+    // reconcile clears `known_stale`/`last_error` directly and clears the
+    // 'rebuild' term indirectly via its ANALYZE, never by touching the log.
+    // (Left out of scope: a routine partition swap only ANALYZEs the child,
+    // and autovacuum never auto-analyzes a partitioned parent, so
+    // has_anomaly legitimately re-arms after each count-changing swap until
+    // an operator reconciles or explicitly ANALYZEs the root — the root's
+    // reltuples really is stale, so this is semantically honest, not a bug.)
     // A failed/unavailable `pg_stat_all_tables` lookup fails toward the exact
     // count — the safe direction for a correctness alarm is to do the work.
+    // A missing `__reflex_event_log` (e.g. an upgraded install whose
+    // migration missed it) is checked for explicitly and skips the 'rebuild'
+    // term rather than erroring — this is the primary observability entry
+    // point and a missing maintenance table must not take it down for every
+    // IMV.
     //
-    // Missing target: neither branch is actually protected by `to_regclass`
-    // here — PostgreSQL resolves every relation reference in a query at parse
-    // time regardless of which branch or subquery contains it, so a
-    // `to_regclass` check elsewhere in the same query does not stop the
-    // `{ident}` reference below from raising. Both the anomaly branch's
-    // `COUNT(*) FROM {ident}` and the estimate branch's `to_regclass`-scoped
-    // query error identically on an orphaned registry row; this is a
-    // pre-existing gap in `reflex_ivm_status` as a whole, not something this
-    // predicate widens (see untreated_bugs/ for the filed report).
+    // Missing target: neither the anomaly branch's `COUNT(*) FROM {ident}`
+    // nor the estimate branch's `to_regclass`-scoped query is actually
+    // protected against a dropped target — PostgreSQL resolves every
+    // relation reference in a query at parse time regardless of which branch
+    // or subquery contains it, so a `to_regclass` check elsewhere in the same
+    // query does not stop `{ident}` from raising. This is a pre-existing gap
+    // in `reflex_ivm_status` as a whole, not something this predicate widens
+    // (see untreated_bugs/ for the filed report).
+    let event_log_exists =
+        Spi::get_one::<bool>("SELECT to_regclass('public.__reflex_event_log') IS NOT NULL AS ok")
+            .unwrap_or(Some(false))
+            .unwrap_or(false);
     let rows: Vec<IvmStatusRow> = rows
         .into_iter()
         .map(|mut row| {
             let name = &row.0;
             let name_lit = name.replace('\'', "''");
-            let has_unresolved_event = Spi::get_one::<bool>(&format!(
-                "SELECT EXISTS( \
-                     SELECT 1 FROM public.__reflex_event_log e \
-                     WHERE e.imv_name = '{name_lit}' \
-                       AND ( \
-                             e.event = 'error' \
-                          OR (e.event = 'rebuild' AND e.at > COALESCE( \
-                                 (SELECT COALESCE(last_analyze, last_autoanalyze) \
-                                  FROM pg_stat_all_tables \
-                                  WHERE relid = to_regclass('{name_lit}')), \
-                                 '-infinity'::timestamptz)) \
-                       ) \
-                     LIMIT 1 \
-                 ) AS ok"
-            ))
-            .unwrap_or(Some(true))
-            .unwrap_or(true);
-            let has_anomaly = row.10 || row.8.is_some() || has_unresolved_event;
+            let has_unresolved_rebuild = event_log_exists
+                && Spi::get_one::<bool>(&format!(
+                    "SELECT EXISTS( \
+                         SELECT 1 FROM public.__reflex_event_log e \
+                         WHERE e.imv_name = '{name_lit}' \
+                           AND e.event = 'rebuild' \
+                           AND e.at > COALESCE( \
+                                  (SELECT COALESCE(last_analyze, last_autoanalyze) \
+                                   FROM pg_stat_all_tables \
+                                   WHERE relid = to_regclass('{name_lit}')), \
+                                  '-infinity'::timestamptz) \
+                         LIMIT 1 \
+                     ) AS ok"
+                ))
+                .unwrap_or(Some(true))
+                .unwrap_or(true);
+            let has_anomaly = row.10 || row.8.is_some() || has_unresolved_rebuild;
             let (c, is_estimate) = if has_anomaly {
                 let c = Spi::get_one::<i64>(&format!(
                     "SELECT COUNT(*)::BIGINT AS c FROM {ident}",

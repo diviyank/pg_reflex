@@ -366,6 +366,30 @@ fn dfx_d3_status_row_count_exact_under_anomaly() {
     assert_eq!(est2, Some(false), "and must say the number is not an estimate");
 }
 
+/// NB2: `reflex_ivm_status` is the primary observability entry point. A
+/// missing `__reflex_event_log` (a missed migration on an upgraded install)
+/// must not turn it into a casualty of the anomaly signal it added — the
+/// call must fall back to the known_stale/last_error/estimate determination
+/// instead of erroring for every IMV.
+#[pg_test]
+fn dfx_status_survives_missing_event_log_table() {
+    dfx_build();
+    Spi::run("ANALYZE dfx_imv").expect("analyze so reltuples > 0");
+    Spi::run("ALTER TABLE public.__reflex_event_log RENAME TO __reflex_event_log_hidden")
+        .expect("simulate a missed migration");
+
+    let (rc, est) = Spi::get_two::<i64, bool>(
+        "SELECT row_count, is_estimate FROM reflex_ivm_status() WHERE name = 'dfx_imv'",
+    )
+    .expect("status must not error when the event log is missing");
+    assert_eq!(rc, Some(1), "a healthy IMV still reports its row count");
+    assert_eq!(
+        est,
+        Some(true),
+        "no known_stale/last_error means still the O(1) estimate, event log or not"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // A4: the durable maintenance event log. A slice-changing rebuild or a caught
 // flush failure must leave a row; an ordinary successful flush must not.
