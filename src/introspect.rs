@@ -152,23 +152,58 @@ fn reflex_ivm_status() -> TableIterator<
     // Prefer the planner estimate (reltuples) so a status query never full-scans
     // a large IMV target; fall back to an exact count when the estimate is
     // unavailable (reltuples <= 0 → empty or never-analyzed), where count(*) is
-    // cheap or the only source of truth, or when the IMV carries an anomaly —
-    // a stale estimate from before a caught flush failure would tell a
-    // comfortable lie about a target that may have been silently emptied.
-    // Missing target → to_regclass NULL → no row → the -1 sentinel (unchanged
-    // from the prior "could not determine").
+    // cheap or the only source of truth, or when the IMV carries an anomaly:
+    // `known_stale` / a retained `last_error`, or an unresolved
+    // `__reflex_event_log` entry — an 'error' row (nothing but reconcile
+    // clears it, and reconcile also clears known_stale/last_error), or a
+    // 'rebuild' row newer than the target's last ANALYZE. The 'rebuild' term
+    // is deliberately scoped to ANALYZE recency rather than counting forever:
+    // a rebuild is written for any slice-changing swap, which is routine, so
+    // an unscoped predicate would make has_anomaly permanently true after the
+    // first one — pinning is_estimate to a constant false and, worse, making
+    // reconcile (the remedy the incident's stale_reason prescribes) write
+    // MORE 'rebuild' rows, deepening the very condition it is meant to clear.
+    // "The estimate may be stale" is true exactly when a slice was rebuilt
+    // AFTER the planner last saw it, so scoping by
+    // `COALESCE(last_analyze, last_autoanalyze)` from `pg_stat_all_tables`
+    // (NULL, i.e. never analyzed, counts as always stale) converges by
+    // construction: reconcile ANALYZEs the target (reconcile.rs:520 / :627),
+    // so running the prescribed remedy clears the condition it caused.
+    // A failed/unavailable `pg_stat_all_tables` lookup fails toward the exact
+    // count — the safe direction for a correctness alarm is to do the work.
+    //
+    // Missing target: neither branch is actually protected by `to_regclass`
+    // here — PostgreSQL resolves every relation reference in a query at parse
+    // time regardless of which branch or subquery contains it, so a
+    // `to_regclass` check elsewhere in the same query does not stop the
+    // `{ident}` reference below from raising. Both the anomaly branch's
+    // `COUNT(*) FROM {ident}` and the estimate branch's `to_regclass`-scoped
+    // query error identically on an orphaned registry row; this is a
+    // pre-existing gap in `reflex_ivm_status` as a whole, not something this
+    // predicate widens (see untreated_bugs/ for the filed report).
     let rows: Vec<IvmStatusRow> = rows
         .into_iter()
         .map(|mut row| {
             let name = &row.0;
-            let unresolved_events = Spi::get_one::<i64>(&format!(
-                "SELECT count(*)::int8 FROM public.__reflex_event_log \
-                 WHERE imv_name = '{}' AND event IN ('error', 'stale_set', 'rebuild')",
-                name.replace('\'', "''")
+            let name_lit = name.replace('\'', "''");
+            let has_unresolved_event = Spi::get_one::<bool>(&format!(
+                "SELECT EXISTS( \
+                     SELECT 1 FROM public.__reflex_event_log e \
+                     WHERE e.imv_name = '{name_lit}' \
+                       AND ( \
+                             e.event = 'error' \
+                          OR (e.event = 'rebuild' AND e.at > COALESCE( \
+                                 (SELECT COALESCE(last_analyze, last_autoanalyze) \
+                                  FROM pg_stat_all_tables \
+                                  WHERE relid = to_regclass('{name_lit}')), \
+                                 '-infinity'::timestamptz)) \
+                       ) \
+                     LIMIT 1 \
+                 ) AS ok"
             ))
-            .unwrap_or(None)
-            .unwrap_or(0);
-            let has_anomaly = row.10 || row.8.is_some() || unresolved_events > 0;
+            .unwrap_or(Some(true))
+            .unwrap_or(true);
+            let has_anomaly = row.10 || row.8.is_some() || has_unresolved_event;
             let (c, is_estimate) = if has_anomaly {
                 let c = Spi::get_one::<i64>(&format!(
                     "SELECT COUNT(*)::BIGINT AS c FROM {ident}",

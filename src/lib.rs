@@ -239,9 +239,16 @@ extension_sql!(
     -- count, never on an ordinary successful flush). Maintenance table, not a
     -- per-IMV artefact: excluded from the drop census like the other
     -- __reflex_* maintenance tables.
+    -- `at` uses clock_timestamp(), not now(): now() is frozen at the
+    -- enclosing transaction's start, so every event written by a long-lived
+    -- transaction (or, notably, by a single pg_test) would carry the SAME
+    -- timestamp regardless of when it actually happened — silently breaking
+    -- reflex_ivm_status's ANALYZE-recency comparison (introspect.rs), which
+    -- depends on `at` reflecting real occurrence time relative to
+    -- pg_stat_all_tables' (also real-time) last_analyze.
     CREATE TABLE IF NOT EXISTS public.__reflex_event_log (
         id             BIGSERIAL PRIMARY KEY,
-        at             TIMESTAMPTZ NOT NULL DEFAULT now(),
+        at             TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
         imv_name       TEXT NOT NULL,
         event          TEXT NOT NULL,
         trigger_reason TEXT,

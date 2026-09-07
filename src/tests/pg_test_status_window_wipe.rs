@@ -406,6 +406,88 @@ fn swi_silent_wipe_leaves_an_event_log_row() {
     assert_eq!(reason.as_deref(), Some("partition_swap"));
 }
 
+/// I2, partition side: unlike the plpgsql DO block in deferred.rs, the swap's
+/// event-log INSERT runs via a bare `client.update` with no surrounding
+/// EXCEPTION to catch a hard Postgres ERROR (which longjmps straight past a
+/// `Result`). A missing `__reflex_event_log` must not turn a legitimate,
+/// successful partition swap into a failure — the existence check must skip
+/// the write instead.
+#[pg_test]
+fn swi_silent_wipe_still_swaps_without_event_log_table() {
+    swi_build_fixture("validated");
+    // Renamed, not dropped: the table is an extension member, and a real DROP
+    // pulls in extension-membership dependency handling that isn't the point
+    // of this test. A rename is enough to make `public.__reflex_event_log`
+    // unresolvable — exactly the "missing table" shape an upgraded install
+    // whose migration missed it would present.
+    Spi::run("ALTER TABLE public.__reflex_event_log RENAME TO __reflex_event_log_hidden")
+        .expect("simulate a missed migration");
+
+    Spi::run("UPDATE swi_dp SET status = 'creating_sop' WHERE id = 471").expect("SP window");
+    swi_month_swap();
+    Spi::run("SET CONSTRAINTS ALL IMMEDIATE").expect("drain partition queue");
+    let flush = Spi::get_one::<String>("SELECT reflex_flush_partitions()").expect("flush");
+    assert!(
+        !flush.unwrap_or_default().starts_with("ERROR"),
+        "the swap itself must succeed even though it can't log"
+    );
+
+    assert!(
+        swi_imv_rows_for(471) < 3,
+        "the swap must still have rebuilt the slice — logging is an observer, not a gate"
+    );
+}
+
+/// I1 convergence: a 'rebuild' row must force the exact count (not the O(1)
+/// estimate) until the target is re-analyzed — and it MUST clear afterward,
+/// or the remedy the incident's stale_reason prescribes (reconcile, which
+/// ANALYZEs the target) would deepen the condition instead of repairing it.
+/// This is the point of the finding: without this test the ANALYZE-recency
+/// scoping is unverified.
+#[pg_test]
+fn swi_rebuild_anomaly_clears_after_analyze() {
+    swi_build_fixture("validated");
+    Spi::run("UPDATE swi_dp SET status = 'creating_sop' WHERE id = 471").expect("SP window");
+    swi_month_swap();
+    Spi::run("SET CONSTRAINTS ALL IMMEDIATE").expect("drain partition queue");
+    let _ = Spi::get_one::<String>("SELECT reflex_flush_partitions()").expect("flush");
+    assert_eq!(
+        swi_event_rows("swi_imv"),
+        1,
+        "precondition: the wipe logged exactly one rebuild row"
+    );
+
+    let (rc, est) = Spi::get_two::<i64, bool>(
+        "SELECT row_count, is_estimate FROM reflex_ivm_status() WHERE name = 'swi_imv'",
+    )
+    .expect("status before analyze");
+    assert_eq!(
+        est,
+        Some(false),
+        "a rebuild row newer than the last ANALYZE must force the exact count"
+    );
+    assert!(rc.is_some(), "row_count must still be reported while forced exact");
+
+    Spi::run("ANALYZE swi_imv").expect("analyze the target");
+    // pg_stat_all_tables is snapshotted once per transaction; the whole test
+    // runs inside pg_test's single wrapping transaction, so without this the
+    // ANALYZE above is invisible to the next query in THIS test only — a
+    // harness artifact, not something a real caller (a fresh statement in a
+    // fresh transaction) would ever need.
+    Spi::run("SELECT pg_stat_clear_snapshot()").expect("clear stats snapshot");
+    let (_, est_after) = Spi::get_two::<i64, bool>(
+        "SELECT row_count, is_estimate FROM reflex_ivm_status() WHERE name = 'swi_imv'",
+    )
+    .expect("status after analyze");
+    assert_eq!(
+        est_after,
+        Some(true),
+        "ANALYZE-ing the target (what reconcile does) must clear the rebuild \
+         anomaly and restore the O(1) estimate — this is what makes reconcile \
+         an actual repair instead of a remedy that deepens its own finding"
+    );
+}
+
 /// A caught flush failure writes an error row alongside the staleness mark.
 #[pg_test]
 fn dfx_failed_flush_writes_event_log_row() {
@@ -422,6 +504,41 @@ fn dfx_failed_flush_writes_event_log_row() {
     .expect("event log query");
     assert_eq!(event.as_deref(), Some("error"));
     assert_eq!(sqlstate.as_deref(), Some("23505"));
+}
+
+/// I2: a logging side effect must never be able to break the operation it
+/// observes. If `__reflex_event_log` is missing (the realistic trigger: an
+/// upgraded install whose migration missed the table), the EXCEPTION
+/// branch's own INSERT would otherwise raise "relation does not exist" from
+/// INSIDE the handler — uncaught by it — aborting the whole cascade and
+/// rolling back the known_stale/last_error UPDATE two statements above. The
+/// nested BEGIN…EXCEPTION WHEN OTHERS THEN NULL around that INSERT must
+/// prevent that: known_stale/last_error must still be recorded exactly as
+/// they would be with the table present.
+#[pg_test]
+fn dfx_failed_flush_marks_stale_even_without_event_log_table() {
+    dfx_build();
+    // Renamed, not dropped: the table is an extension member, and a real DROP
+    // pulls in extension-membership dependency handling that isn't the point
+    // of this test. A rename is enough to make `public.__reflex_event_log`
+    // unresolvable — exactly the "missing table" shape an upgraded install
+    // whose migration missed it would present.
+    Spi::run("ALTER TABLE public.__reflex_event_log RENAME TO __reflex_event_log_hidden")
+        .expect("simulate a missed migration");
+
+    Spi::run("INSERT INTO dfx_src VALUES (2, 'x'), (2, 'y')").expect("dup insert");
+    Spi::run("SET CONSTRAINTS ALL IMMEDIATE").expect("failing flush must not abort");
+
+    let (rows, stale, err, _, _) = dfx_state();
+    assert!(
+        stale,
+        "known_stale must still be set even though the event-log INSERT can't land"
+    );
+    assert!(
+        err.is_some_and(|e| e.contains("23505")),
+        "last_error must still carry the real failure, not be lost to a missing table"
+    );
+    assert_eq!(rows, 1, "the failed subtransaction must still not have modified the IMV");
 }
 
 /// An unremarkable successful flush must NOT write a row — the log is for

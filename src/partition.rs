@@ -2504,7 +2504,13 @@ fn swap_partition_child_ddl(
     let int_is_fresh = end_query.is_empty()
         || (!int_def.is_empty() && is_fresh_partition(client, &int_child_qual_probe));
     let tgt_is_fresh = !tgt_def.is_empty() && is_fresh_partition(client, &tgt_child_qual_probe);
-    let rows_before_tgt = count_rows(client, &tgt_child_qual_probe);
+    // `tgt_is_empty` already proved the count is 0 two lines up — skip the
+    // redundant `count(*)` round-trip in that (common) case.
+    let rows_before_tgt: Option<i64> = if tgt_is_empty {
+        Some(0)
+    } else {
+        count_rows(client, &tgt_child_qual_probe)
+    };
     if (int_is_empty || int_is_fresh) && (tgt_is_empty || tgt_is_fresh) {
         let (fill_int, fill_tgt) = build_inplace_partition_fill(
             &int_child_qual_probe,
@@ -3102,8 +3108,12 @@ fn relation_has_rows(client: &pgrx::spi::SpiClient<'_>, qualified: &str) -> bool
 
 /// Row count of a relation about to be truncated and refilled — cheap next to
 /// the refill's own source scan. Used to detect a slice-changing rebuild worth
-/// a durable `__reflex_event_log` row.
-fn count_rows(client: &pgrx::spi::SpiClient<'_>, qualified: &str) -> i64 {
+/// a durable `__reflex_event_log` row. `None` on probe failure — unlike
+/// `relation_has_rows`, there is no safe non-`None` default here: collapsing
+/// an unreadable count to 0 would let a real N->0 wipe read as 0==0 and
+/// suppress the very alarm this exists to raise, so the caller must treat
+/// `None` as "count unknown, assume changed" rather than as a count of zero.
+fn count_rows(client: &pgrx::spi::SpiClient<'_>, qualified: &str) -> Option<i64> {
     client
         .select(
             &format!("SELECT count(*)::int8 AS c FROM {}", qualified),
@@ -3113,31 +3123,69 @@ fn count_rows(client: &pgrx::spi::SpiClient<'_>, qualified: &str) -> i64 {
         .ok()
         .and_then(|mut it| it.next())
         .and_then(|r| r.get_by_name::<i64, _>("c").ok().flatten())
-        .unwrap_or(0)
+}
+
+/// `true` iff `public.__reflex_event_log` exists. Guards the partition-side
+/// INSERT below: unlike a plpgsql `DO` block, a bare `client.update` here has
+/// no surrounding `EXCEPTION` to catch a "relation does not exist" — that is
+/// a hard Postgres ERROR that longjmps straight past the `Result`, aborting
+/// the swap this logging is only supposed to observe (realistic trigger: an
+/// upgraded install whose migration missed this table). Checked once per
+/// call rather than cached: this path only runs on an actual slice-changing
+/// rebuild, never on the hot per-commit flush.
+fn event_log_table_exists(client: &pgrx::spi::SpiClient<'_>) -> bool {
+    client
+        .select(
+            "SELECT to_regclass('public.__reflex_event_log') IS NOT NULL AS ok",
+            Some(1),
+            &[],
+        )
+        .ok()
+        .and_then(|mut it| it.next())
+        .and_then(|r| r.get_by_name::<bool, _>("ok").ok().flatten())
+        .unwrap_or(false)
 }
 
 /// Record a slice-changing rebuild — the artefact the 2026-09 silent wipe
-/// incident had none of. A no-op when the count didn't move: the log is for
-/// anomalies and slice-changing rebuilds, never for every commit.
+/// incident had none of. A no-op when the count is known on both sides and
+/// didn't move: the log is for anomalies and slice-changing rebuilds, never
+/// for every commit. When either side couldn't be counted, fails toward
+/// firing — the safe direction for an alarm — and names the unknown side in
+/// `detail` instead of guessing a count.
 fn log_slice_rebuild_if_changed(
     client: &mut pgrx::spi::SpiClient<'_>,
     view_name: &str,
     slice: &str,
-    rows_before: i64,
-    rows_after: i64,
+    rows_before: Option<i64>,
+    rows_after: Option<i64>,
 ) {
-    if rows_before == rows_after {
+    let (changed, detail) = match (rows_before, rows_after) {
+        (Some(b), Some(a)) => (b != a, None),
+        (None, Some(_)) => (true, Some("rows_before unavailable")),
+        (Some(_), None) => (true, Some("rows_after unavailable")),
+        (None, None) => (true, Some("rows_before and rows_after unavailable")),
+    };
+    if !changed || !event_log_table_exists(client) {
         return;
     }
+    let sql_opt_i64 = |v: Option<i64>| {
+        v.map(|n| n.to_string())
+            .unwrap_or_else(|| "NULL".to_string())
+    };
+    let sql_opt_text = |v: Option<&str>| {
+        v.map(sql_literal_text)
+            .unwrap_or_else(|| "NULL".to_string())
+    };
     let _ = client.update(
         &format!(
             "INSERT INTO public.__reflex_event_log \
-               (imv_name, event, trigger_reason, slice, rows_before, rows_after) \
-             VALUES ('{}', 'rebuild', 'partition_swap', '{}', {}, {})",
+               (imv_name, event, trigger_reason, slice, rows_before, rows_after, detail) \
+             VALUES ('{}', 'rebuild', 'partition_swap', '{}', {}, {}, {})",
             view_name.replace('\'', "''"),
             slice.replace('\'', "''"),
-            rows_before,
-            rows_after
+            sql_opt_i64(rows_before),
+            sql_opt_i64(rows_after),
+            sql_opt_text(detail),
         ),
         None,
         &[],
