@@ -164,6 +164,35 @@ fn isx_unattributable_cte_query_is_refused() {
         r.starts_with("ERROR"),
         "unattributable query must be refused, got: {r}"
     );
+    // The refusal must come from the OUTER query being unattributable, not from
+    // a sub-IMV of the CTE decomposition happening to be refused for its own
+    // reason — otherwise this test stays green with the CTE verdict removed.
+    assert!(
+        r.contains("(CTE)") && r.contains("'isx_imv5'"),
+        "the outer CTE query itself must be what is refused, got: {r}"
+    );
+}
+
+/// Second unattributable shape, and the one no sub-IMV re-check can rescue: a
+/// set operation. Each operand is a plain single-source SELECT that the
+/// resolver would pass, so if the set-op verdict is removed the create
+/// succeeds — which is the false-green this test exists to block.
+#[pg_test]
+fn isx_unattributable_set_operation_is_refused() {
+    isx_fixture();
+    let r = Spi::get_one::<String>(
+        "SELECT create_reflex_ivm('isx_imv9', \
+           'SELECT ss.dem_plan_id AS dem_plan_id, ss.qty AS qty FROM isx_ss ss \
+            UNION ALL \
+            SELECT dp.id AS dem_plan_id, 0 AS qty FROM isx_dp dp', \
+           'dem_plan_id', 'UNLOGGED', 'DEFERRED', 'isx_dp')",
+    )
+    .expect("create call")
+    .expect("create result");
+    assert!(
+        r.starts_with("ERROR") && r.contains("set operation"),
+        "an unattributable set operation must be refused, got: {r}"
+    );
 }
 
 /// A genuinely sound ignore is still allowed: the source is not referenced at all.
