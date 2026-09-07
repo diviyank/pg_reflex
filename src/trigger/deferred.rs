@@ -848,7 +848,9 @@ pub fn reflex_flush_deferred(source_table: &str) -> String {
                      SET last_error = LEFT(SQLERRM || ' (SQLSTATE ' || SQLSTATE || ')', 500), \
                          known_stale = TRUE, \
                          stale_reason = LEFT('deferred flush failed: ' || SQLERRM \
-                                             || ' (SQLSTATE ' || SQLSTATE || ')', 2000), \
+                                             || ' (SQLSTATE ' || SQLSTATE || '). The staged ' \
+                                             || 'delta was discarded; run reflex_reconcile(' \
+                                             || '''{imv_name_esc}'') to repair.', 2000), \
                          stale_since = now(), \
                          flush_count = COALESCE(flush_count, 0) + 1 \
                      WHERE name = '{imv_name_esc}'; \
