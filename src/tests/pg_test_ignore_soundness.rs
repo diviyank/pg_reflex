@@ -1,0 +1,202 @@
+// A1: an ignored source whose columns determine the IMV's contents is refused
+// at create time unless explicitly acknowledged with a '!' prefix.
+//
+// The 2026-09 silent-wipe incident: an IMV declared ignore_sources on a table
+// whose `status` column gated its WHERE. The status changed, nothing refreshed
+// the IMV, and a later partition-scoped rebuild from the base query wrote the
+// slice to zero rows — successfully, silently, permanently.
+
+fn isx_fixture() {
+    Spi::run("CREATE TABLE isx_dp (id BIGINT PRIMARY KEY, status TEXT NOT NULL)").expect("dp");
+    Spi::run("INSERT INTO isx_dp VALUES (1, 'validated')").expect("seed dp");
+    Spi::run("CREATE TABLE isx_ss (dem_plan_id BIGINT, qty INT)").expect("ss");
+    Spi::run("INSERT INTO isx_ss VALUES (1, 10)").expect("seed ss");
+}
+
+/// The incident's shape: the ignored source appears in the WHERE.
+#[pg_test]
+fn isx_refuses_ignored_source_referenced_in_where() {
+    isx_fixture();
+    let r = Spi::get_one::<String>(
+        "SELECT create_reflex_ivm('isx_imv', \
+           'SELECT ss.dem_plan_id, ss.qty FROM isx_ss ss \
+              JOIN isx_dp dp ON dp.id = ss.dem_plan_id \
+             WHERE dp.status = ''validated''', \
+           'dem_plan_id', 'UNLOGGED', 'DEFERRED', 'isx_dp')",
+    )
+    .expect("create call")
+    .expect("create result");
+    assert!(r.starts_with("ERROR"), "must refuse, got: {r}");
+    assert!(r.contains("isx_dp"), "the error must name the source: {r}");
+    assert!(r.contains("status"), "the error must name the column: {r}");
+}
+
+/// The '!' ack permits it deliberately.
+#[pg_test]
+fn isx_ack_marker_permits_creation() {
+    isx_fixture();
+    let r = Spi::get_one::<String>(
+        "SELECT create_reflex_ivm('isx_imv2', \
+           'SELECT ss.dem_plan_id, ss.qty FROM isx_ss ss \
+              JOIN isx_dp dp ON dp.id = ss.dem_plan_id \
+             WHERE dp.status = ''validated''', \
+           'dem_plan_id', 'UNLOGGED', 'DEFERRED', '!isx_dp')",
+    )
+    .expect("create call")
+    .expect("create result");
+    assert!(!r.starts_with("ERROR"), "ack must permit creation, got: {r}");
+}
+
+/// TRAP 1: the marker must never reach the runtime array, or the ignore itself
+/// silently stops working — turning the safety feature into the outage.
+#[pg_test]
+fn isx_runtime_ignored_sources_is_free_of_the_marker() {
+    isx_fixture();
+    let _ = Spi::get_one::<String>(
+        "SELECT create_reflex_ivm('isx_imv3', \
+           'SELECT ss.dem_plan_id, ss.qty FROM isx_ss ss \
+              JOIN isx_dp dp ON dp.id = ss.dem_plan_id \
+             WHERE dp.status = ''validated''', \
+           'dem_plan_id', 'UNLOGGED', 'DEFERRED', '!isx_dp')",
+    );
+    let clean = Spi::get_one::<bool>(
+        "SELECT ignored_sources @> ARRAY['isx_dp'] AND NOT (ignored_sources @> ARRAY['!isx_dp']) \
+         FROM public.__reflex_ivm_reference WHERE name = 'isx_imv3'",
+    )
+    .unwrap()
+    .unwrap();
+    assert!(clean, "ignored_sources must hold the clean name only");
+
+    let acked = Spi::get_one::<bool>(
+        "SELECT ignore_ack @> ARRAY['isx_dp'] \
+         FROM public.__reflex_ivm_reference WHERE name = 'isx_imv3'",
+    )
+    .unwrap()
+    .unwrap();
+    assert!(acked, "ignore_ack must record the acknowledgement");
+}
+
+/// TRAP 1, second face: the marker must not reach trigger installation either.
+/// The in-memory list gates `install_source_triggers`; a marker-bearing entry
+/// stops matching there, the trigger gets installed, and the declared ignore
+/// silently stops being an ignore.
+#[pg_test]
+fn isx_ack_marker_still_suppresses_the_trigger() {
+    isx_fixture();
+    let r = Spi::get_one::<String>(
+        "SELECT create_reflex_ivm('isx_imv7', \
+           'SELECT ss.dem_plan_id, ss.qty FROM isx_ss ss \
+              JOIN isx_dp dp ON dp.id = ss.dem_plan_id \
+             WHERE dp.status = ''validated''', \
+           'dem_plan_id', 'UNLOGGED', 'IMMEDIATE', '!isx_dp')",
+    )
+    .expect("create call")
+    .expect("create result");
+    assert!(!r.starts_with("ERROR"), "ack must permit creation, got: {r}");
+
+    let triggers_on_ignored = Spi::get_one::<i64>(
+        "SELECT count(*) FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid \
+         WHERE c.relname = 'isx_dp' AND NOT t.tgisinternal AND t.tgname LIKE '%isx_imv7%'",
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        triggers_on_ignored, 0,
+        "an acknowledged ignore must still suppress the trigger on the ignored source"
+    );
+
+    let triggers_on_kept = Spi::get_one::<i64>(
+        "SELECT count(*) FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid \
+         WHERE c.relname = 'isx_ss' AND NOT t.tgisinternal AND t.tgname LIKE '%isx_imv7%'",
+    )
+    .unwrap()
+    .unwrap();
+    assert!(
+        triggers_on_kept > 0,
+        "the non-ignored source must still get its trigger"
+    );
+}
+
+/// TRAP 2: the marker must survive into create_args, or rebuild_reflex_ivm
+/// replays without it, A1 refuses the replay, and the IMV is unrebuildable.
+#[pg_test]
+fn isx_ack_survives_rebuild() {
+    isx_fixture();
+    let _ = Spi::get_one::<String>(
+        "SELECT create_reflex_ivm('isx_imv4', \
+           'SELECT ss.dem_plan_id, ss.qty FROM isx_ss ss \
+              JOIN isx_dp dp ON dp.id = ss.dem_plan_id \
+             WHERE dp.status = ''validated''', \
+           'dem_plan_id', 'UNLOGGED', 'DEFERRED', '!isx_dp')",
+    );
+    let raw = Spi::get_one::<bool>(
+        "SELECT create_args::jsonb -> 'ignore_sources' ? '!isx_dp' \
+         FROM public.__reflex_ivm_reference WHERE name = 'isx_imv4'",
+    )
+    .unwrap()
+    .unwrap();
+    assert!(
+        raw,
+        "create_args must retain the raw marker for faithful replay"
+    );
+
+    let r = Spi::get_one::<String>("SELECT reflex_rebuild_imv('isx_imv4')")
+        .expect("rebuild call")
+        .expect("rebuild result");
+    assert!(!r.starts_with("ERROR"), "rebuild must not be refused: {r}");
+}
+
+/// Fail toward "unsound": a query the resolver cannot attribute is refused, not
+/// waved through. collect_imv_relevant_columns returns an empty map for CTE
+/// queries — building on that would have silently exempted this shape.
+#[pg_test]
+fn isx_unattributable_cte_query_is_refused() {
+    isx_fixture();
+    let r = Spi::get_one::<String>(
+        "SELECT create_reflex_ivm('isx_imv5', \
+           'WITH v AS (SELECT id FROM isx_dp WHERE status = ''validated'') \
+            SELECT ss.dem_plan_id, ss.qty FROM isx_ss ss JOIN v ON v.id = ss.dem_plan_id', \
+           'dem_plan_id', 'UNLOGGED', 'DEFERRED', 'isx_dp')",
+    )
+    .expect("create call")
+    .expect("create result");
+    assert!(
+        r.starts_with("ERROR"),
+        "unattributable query must be refused, got: {r}"
+    );
+}
+
+/// A genuinely sound ignore is still allowed: the source is not referenced at all.
+#[pg_test]
+fn isx_allows_sound_ignore() {
+    isx_fixture();
+    Spi::run("CREATE TABLE isx_unrelated (id BIGINT)").expect("unrelated");
+    let r = Spi::get_one::<String>(
+        "SELECT create_reflex_ivm('isx_imv6', 'SELECT dem_plan_id, qty FROM isx_ss', \
+         'dem_plan_id', 'UNLOGGED', 'DEFERRED', 'isx_unrelated')",
+    )
+    .expect("create call")
+    .expect("create result");
+    assert!(!r.starts_with("ERROR"), "a sound ignore must be allowed, got: {r}");
+}
+
+/// No ignore_sources at all must not be perturbed by the check — the resolver
+/// must never refuse a query that declares no ignores, however unparseable the
+/// shape is to it.
+#[pg_test]
+fn isx_no_ignore_sources_is_never_refused() {
+    isx_fixture();
+    let r = Spi::get_one::<String>(
+        "SELECT create_reflex_ivm('isx_imv8', \
+           'SELECT ss.dem_plan_id, ss.qty FROM isx_ss ss \
+              JOIN isx_dp dp ON dp.id = ss.dem_plan_id \
+             WHERE dp.status = ''validated''', \
+           'dem_plan_id', 'UNLOGGED', 'DEFERRED', NULL)",
+    )
+    .expect("create call")
+    .expect("create result");
+    assert!(
+        !r.starts_with("ERROR"),
+        "an IMV with no ignore_sources must be unaffected, got: {r}"
+    );
+}
