@@ -814,6 +814,17 @@ pub fn reflex_flush_deferred(source_table: &str) -> String {
             // carrying SQLERRM/SQLSTATE — the handler runs in the outer
             // transaction after its own subtransaction rolled back, so the
             // row survives even though the flush itself did not.
+            //
+            // The INSERT is wrapped in its own nested BEGIN…EXCEPTION WHEN
+            // OTHERS THEN NULL — a logging side effect must never be able to
+            // break the operation it observes. Without that nested handler, a
+            // missing __reflex_event_log (e.g. an upgraded install whose
+            // migration missed the table) would raise from INSIDE this
+            // EXCEPTION branch, which is NOT caught by it: the caller would
+            // see "relation does not exist" instead of the real failure, and
+            // the whole cascade aborts, rolling back the known_stale UPDATE
+            // two statements above — a contained per-IMV failure recording
+            // LESS than before this observability existed.
             let body = imv_stmts
                 .into_iter()
                 .map(|s| format!("{};", s))
@@ -860,10 +871,13 @@ pub fn reflex_flush_deferred(source_table: &str) -> String {
                          stale_since = now(), \
                          flush_count = COALESCE(flush_count, 0) + 1 \
                      WHERE name = '{imv_name_esc}'; \
-                   INSERT INTO public.__reflex_event_log \
-                     (imv_name, event, trigger_reason, detail, sqlstate) \
-                     VALUES ('{imv_name_esc}', 'error', 'flush', \
-                             LEFT(SQLERRM, 2000), SQLSTATE); \
+                   BEGIN \
+                     INSERT INTO public.__reflex_event_log \
+                       (imv_name, event, trigger_reason, detail, sqlstate) \
+                       VALUES ('{imv_name_esc}', 'error', 'flush', \
+                               LEFT(SQLERRM, 2000), SQLSTATE); \
+                   EXCEPTION WHEN OTHERS THEN NULL; \
+                   END; \
                  END $_reflex_imv_sp$",
                 delta_tbl = delta_tbl,
                 body = body,
