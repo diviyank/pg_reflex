@@ -532,9 +532,15 @@ pub(crate) fn reconcile_one(view_name: &str, drop_orphans: bool) -> &'static str
 
                 let _ = client.update(
                     "UPDATE public.__reflex_ivm_reference \
-                        SET known_stale = FALSE, stale_reason = NULL, stale_since = NULL WHERE name = $1",
+                        SET known_stale = FALSE, stale_reason = NULL, stale_since = NULL, \
+                            last_error = NULL WHERE name = $1",
                     None,
-                    &[unsafe { DatumWithOid::new(view_name.to_string(), PgBuiltInOids::TEXTOID.oid().value()) }],
+                    &[unsafe {
+                        DatumWithOid::new(
+                            view_name.to_string(),
+                            PgBuiltInOids::TEXTOID.oid().value(),
+                        )
+                    }],
                 );
 
                 info!(
@@ -797,7 +803,8 @@ pub(crate) fn reconcile_one(view_name: &str, drop_orphans: bool) -> &'static str
         client
             .update(
                 "UPDATE public.__reflex_ivm_reference \
-                    SET known_stale = FALSE, stale_reason = NULL, stale_since = NULL WHERE name = $1",
+                    SET known_stale = FALSE, stale_reason = NULL, stale_since = NULL, \
+                        last_error = NULL WHERE name = $1",
                 None,
                 &[unsafe {
                     DatumWithOid::new(view_name.to_string(), PgBuiltInOids::TEXTOID.oid().value())

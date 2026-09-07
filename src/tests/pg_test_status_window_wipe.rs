@@ -244,47 +244,66 @@ fn dfx_state() -> (i64, bool, Option<String>, i64, i64) {
     (imv_rows, stale, err, delta_rows, pending)
 }
 
-/// D1: a caught per-IMV flush failure must not leave the IMV silently diverged.
-/// Claim under test: `last_error` is set but `known_stale` stays FALSE, and the
-/// staged delta is discarded anyway — so the lost rows can never be replayed.
+/// D1: a caught per-IMV flush failure must mark the IMV stale. The staged delta
+/// stays discarded on purpose — it is per-SOURCE and shared with every other IMV
+/// reading that source, so replaying it would re-apply to IMVs that already
+/// succeeded (a merge-add, i.e. silent double-counting, for aggregates). The
+/// repair path is reflex_reconcile, which clears known_stale.
 #[pg_test]
-fn dfx_d1_failed_flush_discards_delta_without_marking_stale() {
+fn dfx_d1_failed_flush_marks_imv_stale() {
     dfx_build();
-    let (rows0, _, _, _, _) = dfx_state();
 
-    // Two rows sharing the IMV's unique key: the flush INSERT must violate
-    // __reflex_uk_dfx_imv. The source itself has no such constraint.
     Spi::run("INSERT INTO dfx_src VALUES (2, 'x'), (2, 'y')").expect("dup insert");
     Spi::run("SET CONSTRAINTS ALL IMMEDIATE").expect("flush (failure is caught)");
 
-    let (rows1, stale, err, delta_rows, pending) = dfx_state();
-    panic!(
-        "D1 PROBE: rows_before={rows0} rows_after={rows1} (source now has 3) \
-         known_stale={stale} last_error={err:?} staged_delta_rows={delta_rows} \
-         pending_rows={pending}"
+    let (rows, stale, err, delta_rows, _pending) = dfx_state();
+    assert!(stale, "a caught flush failure must set known_stale");
+    assert!(
+        err.is_some_and(|e| e.contains("23505")),
+        "last_error must carry the SQLSTATE of the failure"
+    );
+    assert_eq!(rows, 1, "the failed subtransaction must not have modified the IMV");
+    assert_eq!(delta_rows, 0, "the shared per-source delta is still discarded");
+
+    let reason = Spi::get_one::<String>(
+        "SELECT stale_reason FROM public.__reflex_ivm_reference WHERE name = 'dfx_imv'",
+    )
+    .unwrap();
+    assert!(
+        reason.is_some_and(|r| r.contains("flush")),
+        "stale_reason must say what failed"
     );
 }
 
-/// D2: the evidence of D1 must survive until something repairs the IMV.
-/// Claim under test: the next SUCCESSFUL flush nulls `last_error`, erasing the
-/// only trace, while the IMV stays diverged.
+/// D2: the evidence must survive until something actually repairs the IMV.
 #[pg_test]
-fn dfx_d2_successful_flush_erases_last_error() {
+fn dfx_d2_successful_flush_preserves_last_error_while_stale() {
     dfx_build();
     Spi::run("INSERT INTO dfx_src VALUES (2, 'x'), (2, 'y')").expect("dup insert");
     Spi::run("SET CONSTRAINTS ALL IMMEDIATE").expect("failing flush");
-    let (_, stale_a, err_a, _, _) = dfx_state();
 
-    // A later, perfectly valid change to an unrelated key.
     Spi::run("INSERT INTO dfx_src VALUES (3, 'z')").expect("clean insert");
     Spi::run("SET CONSTRAINTS ALL IMMEDIATE").expect("successful flush");
-    let (rows_b, stale_b, err_b, _, _) = dfx_state();
 
-    panic!(
-        "D2 PROBE: after_failure(known_stale={stale_a}, last_error={err_a:?}) \
-         after_success(rows={rows_b}, known_stale={stale_b}, last_error={err_b:?}) \
-         — source holds 4 rows, 3 distinct keys"
+    let (_, stale, err, _, _) = dfx_state();
+    assert!(stale, "a later success must not clear known_stale");
+    assert!(
+        err.is_some(),
+        "a later success must not erase last_error while the IMV is still stale"
     );
+
+    Spi::run("DELETE FROM dfx_src WHERE id = 2 AND val = 'y'").expect("remove the duplicate");
+    Spi::run("SET CONSTRAINTS ALL IMMEDIATE").expect("flush the fix");
+
+    // reconcile is the repair path, and it is what clears both.
+    let r = Spi::get_one::<String>("SELECT reflex_reconcile('dfx_imv')")
+        .expect("reconcile call")
+        .expect("reconcile result");
+    assert!(!r.starts_with("ERROR"), "reconcile returned: {r}");
+
+    let (_, stale_after, err_after, _, _) = dfx_state();
+    assert!(!stale_after, "reconcile must clear known_stale");
+    assert!(err_after.is_none(), "reconcile must clear last_error");
 }
 
 /// D3: `reflex_ivm_status.row_count` must not report a comfortable number for a
