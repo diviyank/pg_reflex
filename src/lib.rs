@@ -1647,6 +1647,7 @@ mod tests {
     include!("tests/pg_test_ps16.rs");
     include!("tests/pg_test_outerjoin_notnull_groupkey.rs");
     include!("tests/pg_test_qualified_groupby_qualifier.rs");
+    include!("tests/pg_test_status_window_wipe.rs");
 }
 
 /// This module is required by `cargo pgrx test` invocations.
