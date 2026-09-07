@@ -834,7 +834,7 @@ pub fn reflex_flush_deferred(source_table: &str) -> String {
                      SET last_flush_ms = _ms, \
                          last_flush_rows = _rows, \
                          flush_count = COALESCE(flush_count, 0) + 1, \
-                         last_error = NULL, \
+                         last_error = CASE WHEN known_stale THEN last_error ELSE NULL END, \
                          flush_ms_history = (\
                              COALESCE(flush_ms_history, ARRAY[]::BIGINT[]) || _ms\
                          )[GREATEST(1, COALESCE(cardinality(flush_ms_history), 0) + 1 - 63):] \
@@ -846,6 +846,10 @@ pub fn reflex_flush_deferred(source_table: &str) -> String {
                      '{imv_name_esc}', SQLERRM, SQLSTATE; \
                    UPDATE public.__reflex_ivm_reference \
                      SET last_error = LEFT(SQLERRM || ' (SQLSTATE ' || SQLSTATE || ')', 500), \
+                         known_stale = TRUE, \
+                         stale_reason = LEFT('deferred flush failed: ' || SQLERRM \
+                                             || ' (SQLSTATE ' || SQLSTATE || ')', 2000), \
+                         stale_since = now(), \
                          flush_count = COALESCE(flush_count, 0) + 1 \
                      WHERE name = '{imv_name_esc}'; \
                  END $_reflex_imv_sp$",
