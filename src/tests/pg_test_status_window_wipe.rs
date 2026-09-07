@@ -308,6 +308,85 @@ fn dfx_d1_failed_flush_marks_imv_stale() {
     );
 }
 
+/// A5 — `pg_reflex.flush_failure_policy`. Default behaviour is unchanged: the
+/// caller's transaction survives a per-IMV flush failure (it degrades to a
+/// WARNING, exactly as D1 pins). Nothing in the suite sets this GUC, so this
+/// also stands as the "nothing regressed" control for the two tests below.
+#[pg_test]
+fn dfx_policy_defaults_to_warn() {
+    dfx_build();
+    Spi::run("INSERT INTO dfx_src VALUES (2, 'x'), (2, 'y')").expect("dup insert");
+    Spi::run("SET CONSTRAINTS ALL IMMEDIATE").expect("default policy must not abort");
+    let (_, stale, _, _, _) = dfx_state();
+    assert!(stale, "warn still marks the IMV stale");
+}
+
+/// Under 'error' the failure reaches the caller instead of being swallowed.
+///
+/// A `#[pg_test]` body is itself one transaction, and cannot host this
+/// scenario directly. Confirmed empirically: `client.update` (in
+/// `reflex_flush_deferred`) calls `pg_sys::SPI_execute` with no sigsetjmp of
+/// its own, so the uncaught ERROR raised inside the fail_hard DO block
+/// longjmps straight past every Rust frame in between — neither
+/// `std::panic::catch_unwind` around the triggering `Spi::run` nor a PL/pgSQL
+/// `EXCEPTION` block wrapped around it catches it — landing on the
+/// pgrx-tests CLIENT's own top-level query and failing the whole test
+/// instead of letting it observe the outcome. This is exactly the in-harness
+/// limitation the task brief anticipated, and exactly why
+/// `src/tests/pg_test_partition_attach_locks.rs:63-80` drives its own
+/// transaction-aborting scenario through a REMOTE `dblink` worker instead —
+/// only a genuinely separate session can abort without taking this one down.
+///
+/// The worker fires the flush as its own bare autocommit statement (no
+/// explicit `BEGIN`): the duplicate-key insert's own implicit COMMIT is what
+/// drains the deferred trigger, so a failure there aborts exactly that one
+/// statement's transaction — proof the flush failure reaches (and aborts)
+/// the caller. `dblink_exec(..., fail_on_error := false)` reports that
+/// failure back to THIS session as a string instead of raising here, so the
+/// probe itself needs no exception handling of its own.
+#[pg_test]
+fn dfx_policy_error_aborts_the_caller() {
+    const DBNAME: &str = "reflex_flushpolicy_probe";
+    probe_db_open(DBNAME);
+    worker_exec(
+        "CREATE TABLE dpx_src (id BIGINT, val TEXT); \
+         INSERT INTO dpx_src VALUES (1, 'a'); \
+         DO $mk$ BEGIN PERFORM create_reflex_ivm('dpx_imv', 'SELECT id, val FROM dpx_src', \
+             'id', 'UNLOGGED', 'DEFERRED'); END $mk$",
+    );
+    worker_exec("SET pg_reflex.flush_failure_policy = 'error'");
+
+    let outcome = Spi::get_one::<String>(&format!(
+        "SELECT dblink_exec('reflex_lock_worker', {}, false)",
+        sql_lit("INSERT INTO dpx_src VALUES (2, 'x'), (2, 'y')")
+    ))
+    .expect("dblink_exec call")
+    .expect("dblink_exec result");
+
+    worker_exec(
+        "DROP TABLE IF EXISTS dpx_src CASCADE; DROP TABLE IF EXISTS dpx_imv CASCADE; \
+         DELETE FROM public.__reflex_ivm_reference WHERE name = 'dpx_imv'",
+    );
+    probe_db_close(DBNAME);
+
+    assert!(
+        outcome.to_uppercase().contains("ERROR"),
+        "under 'error' the flush failure must propagate to (and abort) the caller \
+         (dblink_exec returned: {outcome})"
+    );
+}
+
+/// An unrecognised value must not silently disable the guard.
+#[pg_test]
+fn dfx_policy_invalid_value_falls_back_to_warn() {
+    dfx_build();
+    Spi::run("SET pg_reflex.flush_failure_policy = 'banana'").expect("set policy");
+    Spi::run("INSERT INTO dfx_src VALUES (2, 'x'), (2, 'y')").expect("dup insert");
+    Spi::run("SET CONSTRAINTS ALL IMMEDIATE").expect("invalid value falls back to warn");
+    let (_, stale, _, _, _) = dfx_state();
+    assert!(stale, "fallback must still mark the IMV stale");
+}
+
 /// D2: the evidence must survive until something actually repairs the IMV.
 #[pg_test]
 fn dfx_d2_successful_flush_preserves_last_error_while_stale() {
