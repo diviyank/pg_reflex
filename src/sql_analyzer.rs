@@ -851,7 +851,10 @@ fn resolve_column_ref(
 /// attributes to `orders` only, ignoring `config` (which lives inside the
 /// WHERE subquery).
 pub(crate) fn top_level_sources(select: &Select) -> Vec<String> {
-    top_level_tables(select).into_iter().map(|(n, _)| n).collect()
+    top_level_tables(select)
+        .into_iter()
+        .map(|(n, _)| n)
+        .collect()
 }
 
 /// Alias → table name for the top-level FROM/JOIN relations of one SELECT.
@@ -871,10 +874,9 @@ pub(crate) fn alias_map(select: &Select) -> HashMap<String, String> {
 /// top-level FROM / JOIN table factor as `(table_name, alias)`.
 fn top_level_tables(select: &Select) -> Vec<(String, Option<String>)> {
     let entry = |factor: &TableFactor| match factor {
-        TableFactor::Table { name, alias, .. } => Some((
-            name.to_string(),
-            alias.as_ref().map(|a| a.name.to_string()),
-        )),
+        TableFactor::Table { name, alias, .. } => {
+            Some((name.to_string(), alias.as_ref().map(|a| a.name.to_string())))
+        }
         _ => None,
     };
     let mut tables = Vec::new();

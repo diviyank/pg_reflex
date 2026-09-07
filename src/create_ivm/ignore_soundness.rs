@@ -33,7 +33,12 @@ fn same_source(candidate: &str, ignored: &str) -> bool {
 /// Record `(ignored_name, reason)` the first time an ignored source is
 /// implicated. First reason wins, so the clause walked first (WHERE) supplies
 /// the most legible explanation.
-fn flag(candidate: &str, reason: String, ignored_clean: &[String], out: &mut Vec<(String, String)>) {
+fn flag(
+    candidate: &str,
+    reason: String,
+    ignored_clean: &[String],
+    out: &mut Vec<(String, String)>,
+) {
     if let Some(ig) = ignored_clean.iter().find(|ig| same_source(candidate, ig)) {
         if !out.iter().any(|(s, _)| s == ig) {
             out.push((ig.clone(), reason));
@@ -48,18 +53,38 @@ pub fn unsound_ignored_sources(sql: &str, ignored_clean: &[String]) -> Vec<(Stri
         return Vec::new();
     }
 
-    let unresolvable = |reason: &str| -> Vec<(String, String)> {
+    let flag_all = |reason: &str| -> Vec<(String, String)> {
         ignored_clean
             .iter()
             .map(|s| (s.clone(), reason.to_string()))
             .collect()
     };
 
-    // 1. Parse failure is unresolvable -> every ignored source is unsound.
+    // 1. Parse failure is unresolvable, and nothing can be enumerated to narrow
+    //    it -> every ignored source is unsound.
     let stmts = match Parser::parse_sql(&PostgreSqlDialect {}, sql) {
         Ok(s) => s,
-        Err(e) => return unresolvable(&format!("query could not be parsed ({e})")),
+        Err(e) => return flag_all(&format!("query could not be parsed ({e})")),
     };
+
+    // Every relation the analyzer can see anywhere in the statement — CTE
+    // bodies and subqueries included. An ignored name that appears nowhere in
+    // it is not a source of this IMV at all, so ignoring it is a no-op and
+    // stays sound even when the query as a whole cannot be attributed. `None`
+    // means the statement could not be analyzed, so nothing may be narrowed.
+    let all_sources: Option<Vec<String>> =
+        crate::sql_analyzer::analyze(&stmts).ok().map(|a| a.sources);
+    let unresolvable = |reason: &str| -> Vec<(String, String)> {
+        match &all_sources {
+            None => flag_all(reason),
+            Some(sources) => ignored_clean
+                .iter()
+                .filter(|ig| sources.iter().any(|s| same_source(s, ig)))
+                .map(|s| (s.clone(), reason.to_string()))
+                .collect(),
+        }
+    };
+
     let select: &Select = match stmts.first() {
         Some(Statement::Query(q)) => {
             // 2a. CTEs make attribution unsafe: a source referenced only inside
@@ -197,8 +222,10 @@ mod tests {
 
     #[test]
     fn plain_join_on_is_flagged() {
-        let out =
-            unsound_ignored_sources("SELECT s.a FROM ss s JOIN dp ON dp.id = s.a", &ignored(&["dp"]));
+        let out = unsound_ignored_sources(
+            "SELECT s.a FROM ss s JOIN dp ON dp.id = s.a",
+            &ignored(&["dp"]),
+        );
         assert_eq!(out.len(), 1, "a bare JOIN ... ON must be flagged: {out:?}");
     }
 
@@ -226,6 +253,18 @@ mod tests {
     }
 
     #[test]
+    fn an_unattributable_query_still_spares_a_name_that_is_not_a_source() {
+        let out = unsound_ignored_sources(
+            "WITH v AS (SELECT id FROM dp) SELECT s.a FROM ss s JOIN v ON v.id = s.a",
+            &ignored(&["not_a_table_here"]),
+        );
+        assert!(
+            out.is_empty(),
+            "ignoring a name absent from the query is a no-op, not an unsound ignore: {out:?}"
+        );
+    }
+
+    #[test]
     fn set_operation_is_unsound() {
         let out = unsound_ignored_sources(
             "SELECT a FROM ss UNION ALL SELECT id FROM dp",
@@ -242,7 +281,10 @@ mod tests {
 
     #[test]
     fn unqualified_column_is_unsound_only_for_sources_of_the_query() {
-        let out = unsound_ignored_sources("SELECT a FROM ss WHERE flag", &ignored(&["ss", "elsewhere"]));
+        let out = unsound_ignored_sources(
+            "SELECT a FROM ss WHERE flag",
+            &ignored(&["ss", "elsewhere"]),
+        );
         assert_eq!(out.len(), 1, "{out:?}");
         assert_eq!(out[0].0, "ss");
     }
