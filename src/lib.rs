@@ -232,6 +232,39 @@ extension_sql!(
     ALTER TABLE public.__reflex_ivm_reference
         ADD COLUMN IF NOT EXISTS is_generated_sub_imv BOOLEAN NOT NULL DEFAULT FALSE;
 
+    -- 1.11.4: durable record of anomalies and slice-changing rebuilds — the
+    -- artefact a silent wipe leaves behind. A regular LOGGED table: rows must
+    -- survive a crash, and the volume is bounded by design (written only on
+    -- caught flush failures and rebuilds that actually change a slice's row
+    -- count, never on an ordinary successful flush). Maintenance table, not a
+    -- per-IMV artefact: excluded from the drop census like the other
+    -- __reflex_* maintenance tables.
+    CREATE TABLE IF NOT EXISTS public.__reflex_event_log (
+        id             BIGSERIAL PRIMARY KEY,
+        at             TIMESTAMPTZ NOT NULL DEFAULT now(),
+        imv_name       TEXT NOT NULL,
+        event          TEXT NOT NULL,
+        trigger_reason TEXT,
+        slice          TEXT,
+        rows_before    BIGINT,
+        rows_after     BIGINT,
+        detail         TEXT,
+        sqlstate       TEXT
+    );
+    CREATE INDEX IF NOT EXISTS __reflex_event_log_imv_at
+        ON public.__reflex_event_log (imv_name, at DESC);
+
+    -- Operator-driven pruning; returns the number of rows removed.
+    CREATE OR REPLACE FUNCTION public.reflex_prune_event_log(_older_than INTERVAL)
+    RETURNS BIGINT LANGUAGE plpgsql AS $fn$
+    DECLARE _n BIGINT;
+    BEGIN
+        DELETE FROM public.__reflex_event_log WHERE at < now() - _older_than;
+        GET DIAGNOSTICS _n = ROW_COUNT;
+        RETURN _n;
+    END;
+    $fn$;
+
     -- Multi-level partition capture (plans/sub_partitioning.md). Snapshot of
     -- each tracked source root's recursive LEAF set, keyed by (root, child).
     -- reflex_flush_partitions oid-diffs the live leaf set against this to

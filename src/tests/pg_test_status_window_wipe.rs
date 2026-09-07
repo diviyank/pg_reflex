@@ -130,6 +130,11 @@ fn swi_registry_health() -> (bool, Option<String>) {
 /// CONTROL: the same month swap with the DP in an INCLUDED status must keep the
 /// IMV complete. If this fails, the swap itself is the culprit and the status
 /// window is irrelevant.
+///
+/// Also the mutation-check discriminator for the event log's write-suppression
+/// guard: the swap changes the slice's CONTENT (qty is rewritten) but not its
+/// ROW COUNT, so this is the "must stay silent" case — a rebuild that changes
+/// nothing worth logging must leave no `__reflex_event_log` row.
 #[pg_test]
 fn swi_control_swap_with_included_status_keeps_rows() {
     swi_build_fixture("validated");
@@ -146,6 +151,11 @@ fn swi_control_swap_with_included_status_keeps_rows() {
         "CONTROL: swap under an included status must preserve the slice \
          (known_stale={stale}, last_error={err:?})"
     );
+    assert_eq!(
+        swi_event_rows("swi_imv"),
+        0,
+        "a swap that doesn't change the slice's row count must write nothing"
+    );
 }
 
 /// THE HYPOTHESIS: DP status moves to a value the view's IN list omits (the
@@ -153,6 +163,13 @@ fn swi_control_swap_with_included_status_keeps_rows() {
 /// status change itself changes nothing. Then the month swap fires the
 /// partition path, which rebuilds from base_query — and the predicate now
 /// excludes the whole DP.
+///
+/// This confirms the defect, it does not fix it: the predicate exclusion is a
+/// base-db-owned bug (spec §3 B1 — invert `sop_forecast_view`'s status
+/// predicate) that this plan does not touch. What this plan (Task 3) adds is
+/// the durable `__reflex_event_log` row asserted in
+/// `swi_silent_wipe_leaves_an_event_log_row` — the slice still shrinks, but it
+/// no longer does so silently.
 #[pg_test]
 fn swi_status_window_swap_wipes_slice_silently() {
     swi_build_fixture("validated");
@@ -172,18 +189,29 @@ fn swi_status_window_swap_wipes_slice_silently() {
 
     let after_471 = swi_imv_rows_for(471);
     let after_all = swi_imv_rows();
-    let (stale, err) = swi_registry_health();
+    let (stale, _err) = swi_registry_health();
 
-    // Not an assertion of desired behaviour — this is the probe. Print the
-    // observed state so the run itself is the evidence.
-    panic!(
-        "PROBE RESULT: dp471_rows={after_471} total_rows={after_all} \
-         known_stale={stale} last_error={err:?}"
+    assert!(
+        after_471 < 3,
+        "the excluded-status window lets the swap rebuild the slice smaller \
+         (dp471_rows={after_471} total_rows={after_all})"
+    );
+    assert!(
+        !stale,
+        "the swap succeeds outright — this is not a caught failure, so \
+         known_stale is never set; that is exactly why the event log (not \
+         known_stale) is the artefact that catches it"
     );
 }
 
 /// Does the status returning to `validated` heal it? With `ignore_sources`
 /// naming the status table, nothing should fire.
+///
+/// This is the same base-db-owned defect (spec §3 B1) as the probe above:
+/// `swi_dp` is in `ignore_sources`, so pg_reflex never re-evaluates the base
+/// query on a plain status UPDATE, and the already-shrunk slice stays shrunk.
+/// Not a bug in this plan to fix — recorded here so the healing gap stays
+/// pinned by a green test rather than a panic.
 #[pg_test]
 fn swi_status_return_does_not_heal() {
     swi_build_fixture("validated");
@@ -197,7 +225,12 @@ fn swi_status_return_does_not_heal() {
     Spi::run("SET CONSTRAINTS ALL IMMEDIATE").expect("drain 2");
     let after = swi_imv_rows_for(471);
 
-    panic!("PROBE RESULT: during_window={during} after_return_to_validated={after}");
+    assert!(during < 3, "precondition: the swap already shrunk the slice");
+    assert_eq!(
+        after, during,
+        "ignore_sources means the status returning to validated does not \
+         re-evaluate the base query, so the slice does not heal on its own"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -331,4 +364,98 @@ fn dfx_d3_status_row_count_exact_under_anomaly() {
     .expect("status query 2");
     assert_eq!(rc2, Some(0), "an IMV carrying an anomaly must report the exact count");
     assert_eq!(est2, Some(false), "and must say the number is not an estimate");
+}
+
+// ---------------------------------------------------------------------------
+// A4: the durable maintenance event log. A slice-changing rebuild or a caught
+// flush failure must leave a row; an ordinary successful flush must not.
+// ---------------------------------------------------------------------------
+
+fn swi_event_rows(imv: &str) -> i64 {
+    Spi::get_one::<i64>(&format!(
+        "SELECT count(*)::int8 FROM public.__reflex_event_log WHERE imv_name = '{imv}'"
+    ))
+    .unwrap()
+    .unwrap()
+}
+
+/// The incident, now observable. A slice rebuild that empties a non-empty slice
+/// commits successfully — that is legitimate given the predicate — but it must
+/// no longer do so without leaving a trace.
+#[pg_test]
+fn swi_silent_wipe_leaves_an_event_log_row() {
+    swi_build_fixture("validated");
+    assert_eq!(swi_imv_rows_for(471), 3, "seeded DP 471 rows");
+
+    Spi::run("UPDATE swi_dp SET status = 'creating_sop' WHERE id = 471").expect("SP window");
+    swi_month_swap();
+    Spi::run("SET CONSTRAINTS ALL IMMEDIATE").expect("drain partition queue");
+    let _ = Spi::get_one::<String>("SELECT reflex_flush_partitions()").expect("flush");
+
+    assert!(
+        swi_imv_rows_for(471) < 3,
+        "precondition: the slice was rebuilt smaller (this is the incident)"
+    );
+
+    let (before, after, reason) = Spi::get_three::<i64, i64, String>(
+        "SELECT rows_before, rows_after, trigger_reason FROM public.__reflex_event_log \
+         WHERE imv_name = 'swi_imv' AND event = 'rebuild' ORDER BY id DESC LIMIT 1",
+    )
+    .expect("event log query");
+    assert!(before.unwrap_or(0) > after.unwrap_or(-1), "the row must record the shrink");
+    assert_eq!(reason.as_deref(), Some("partition_swap"));
+}
+
+/// A caught flush failure writes an error row alongside the staleness mark.
+#[pg_test]
+fn dfx_failed_flush_writes_event_log_row() {
+    dfx_build();
+    assert_eq!(swi_event_rows("dfx_imv"), 0, "no events on a healthy IMV");
+
+    Spi::run("INSERT INTO dfx_src VALUES (2, 'x'), (2, 'y')").expect("dup insert");
+    Spi::run("SET CONSTRAINTS ALL IMMEDIATE").expect("failing flush");
+
+    let (event, sqlstate) = Spi::get_two::<String, String>(
+        "SELECT event, sqlstate FROM public.__reflex_event_log \
+         WHERE imv_name = 'dfx_imv' ORDER BY id DESC LIMIT 1",
+    )
+    .expect("event log query");
+    assert_eq!(event.as_deref(), Some("error"));
+    assert_eq!(sqlstate.as_deref(), Some("23505"));
+}
+
+/// An unremarkable successful flush must NOT write a row — the log is for
+/// anomalies and slice-changing rebuilds, not for every commit.
+#[pg_test]
+fn dfx_clean_flush_writes_no_event_log_row() {
+    dfx_build();
+    Spi::run("INSERT INTO dfx_src VALUES (4, 'q')").expect("clean insert");
+    Spi::run("SET CONSTRAINTS ALL IMMEDIATE").expect("clean flush");
+    assert_eq!(swi_event_rows("dfx_imv"), 0, "a clean flush writes nothing");
+}
+
+/// Pruning is operator-driven and returns what it removed.
+#[pg_test]
+fn dfx_prune_event_log_removes_only_old_rows() {
+    dfx_build();
+    Spi::run("INSERT INTO dfx_src VALUES (2, 'x'), (2, 'y')").expect("dup insert");
+    Spi::run("SET CONSTRAINTS ALL IMMEDIATE").expect("failing flush");
+    assert_eq!(swi_event_rows("dfx_imv"), 1);
+
+    let kept = Spi::get_one::<i64>("SELECT reflex_prune_event_log('30 days')")
+        .expect("prune")
+        .expect("prune result");
+    assert_eq!(kept, 0, "nothing is 30 days old yet");
+    assert_eq!(swi_event_rows("dfx_imv"), 1, "recent rows survive");
+
+    Spi::run(
+        "UPDATE public.__reflex_event_log SET at = now() - INTERVAL '40 days' \
+         WHERE imv_name = 'dfx_imv'",
+    )
+    .expect("age the row");
+    let removed = Spi::get_one::<i64>("SELECT reflex_prune_event_log('30 days')")
+        .expect("prune 2")
+        .expect("prune 2 result");
+    assert_eq!(removed, 1);
+    assert_eq!(swi_event_rows("dfx_imv"), 0);
 }

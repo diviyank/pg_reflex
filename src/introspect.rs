@@ -161,7 +161,14 @@ fn reflex_ivm_status() -> TableIterator<
         .into_iter()
         .map(|mut row| {
             let name = &row.0;
-            let has_anomaly = row.10 || row.8.is_some();
+            let unresolved_events = Spi::get_one::<i64>(&format!(
+                "SELECT count(*)::int8 FROM public.__reflex_event_log \
+                 WHERE imv_name = '{}' AND event IN ('error', 'stale_set', 'rebuild')",
+                name.replace('\'', "''")
+            ))
+            .unwrap_or(None)
+            .unwrap_or(0);
+            let has_anomaly = row.10 || row.8.is_some() || unresolved_events > 0;
             let (c, is_estimate) = if has_anomaly {
                 let c = Spi::get_one::<i64>(&format!(
                     "SELECT COUNT(*)::BIGINT AS c FROM {ident}",
