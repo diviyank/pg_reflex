@@ -306,37 +306,29 @@ fn dfx_d2_successful_flush_preserves_last_error_while_stale() {
     assert!(err_after.is_none(), "reconcile must clear last_error");
 }
 
-/// D3: `reflex_ivm_status.row_count` must not report a comfortable number for a
-/// table that has been emptied. Claim under test: it returns `pg_class.reltuples`
-/// whenever that is > 0, so a slice wipe that ANALYZEs only the child leaves the
-/// status view reporting the pre-incident count.
+/// D3: the status view must not report a planner estimate for an IMV that
+/// carries an anomaly. A healthy IMV keeps the O(1) estimate.
 #[pg_test]
-fn dfx_d3_status_row_count_reports_stale_estimate() {
-    swi_build_fixture("validated");
-    Spi::run("ANALYZE swi_imv").expect("analyze parent — the pre-incident state");
+fn dfx_d3_status_row_count_exact_under_anomaly() {
+    dfx_build();
+    Spi::run("ANALYZE dfx_imv").expect("analyze so reltuples > 0");
 
-    let reported_before = Spi::get_one::<i64>(
-        "SELECT row_count FROM reflex_ivm_status() WHERE name = 'swi_imv'",
+    let (rc, est) = Spi::get_two::<i64, bool>(
+        "SELECT row_count, is_estimate FROM reflex_ivm_status() WHERE name = 'dfx_imv'",
     )
-    .unwrap()
-    .unwrap();
+    .expect("status query");
+    assert_eq!(rc, Some(1), "healthy IMV reports its row count");
+    assert_eq!(est, Some(true), "healthy IMV uses the O(1) estimate");
 
-    Spi::run("UPDATE swi_dp SET status = 'creating_sop' WHERE id = 471").expect("window");
-    swi_month_swap();
-    Spi::run("SET CONSTRAINTS ALL IMMEDIATE").expect("drain");
-    let _ = Spi::get_one::<String>("SELECT reflex_flush_partitions()").expect("flush");
+    // Force a caught flush failure -> known_stale, then diverge the estimate.
+    Spi::run("INSERT INTO dfx_src VALUES (2, 'x'), (2, 'y')").expect("dup insert");
+    Spi::run("SET CONSTRAINTS ALL IMMEDIATE").expect("failing flush");
+    Spi::run("DELETE FROM dfx_imv").expect("empty the target behind the estimate's back");
 
-    let reported_after = Spi::get_one::<i64>(
-        "SELECT row_count FROM reflex_ivm_status() WHERE name = 'swi_imv'",
+    let (rc2, est2) = Spi::get_two::<i64, bool>(
+        "SELECT row_count, is_estimate FROM reflex_ivm_status() WHERE name = 'dfx_imv'",
     )
-    .unwrap()
-    .unwrap();
-    let actual = Spi::get_one::<i64>("SELECT count(*)::int8 FROM swi_imv")
-        .unwrap()
-        .unwrap();
-
-    panic!(
-        "D3 PROBE: status.row_count_before={reported_before} \
-         status.row_count_after={reported_after} actual_count={actual}"
-    );
+    .expect("status query 2");
+    assert_eq!(rc2, Some(0), "an IMV carrying an anomaly must report the exact count");
+    assert_eq!(est2, Some(false), "and must say the number is not an estimate");
 }
