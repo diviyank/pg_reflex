@@ -806,8 +806,14 @@ pub fn reflex_flush_deferred(source_table: &str) -> String {
             // aborting the entire flush cascade.
             //
             // Theme 4 (observability): inside the same savepoint, record flush
-            // timing + staged row count + clear last_error on success; on
-            // failure the EXCEPTION branch captures SQLERRM into last_error.
+            // timing + staged row count on success, clearing last_error only
+            // when the IMV isn't already marked known_stale for some other
+            // reason; on failure the EXCEPTION branch marks the IMV
+            // known_stale with a repair-pointing stale_reason AND inserts a
+            // durable row into public.__reflex_event_log (event = 'error')
+            // carrying SQLERRM/SQLSTATE — the handler runs in the outer
+            // transaction after its own subtransaction rolled back, so the
+            // row survives even though the flush itself did not.
             let body = imv_stmts
                 .into_iter()
                 .map(|s| format!("{};", s))
@@ -854,6 +860,10 @@ pub fn reflex_flush_deferred(source_table: &str) -> String {
                          stale_since = now(), \
                          flush_count = COALESCE(flush_count, 0) + 1 \
                      WHERE name = '{imv_name_esc}'; \
+                   INSERT INTO public.__reflex_event_log \
+                     (imv_name, event, trigger_reason, detail, sqlstate) \
+                     VALUES ('{imv_name_esc}', 'error', 'flush', \
+                             LEFT(SQLERRM, 2000), SQLSTATE); \
                  END $_reflex_imv_sp$",
                 delta_tbl = delta_tbl,
                 body = body,

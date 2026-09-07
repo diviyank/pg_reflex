@@ -2504,6 +2504,7 @@ fn swap_partition_child_ddl(
     let int_is_fresh = end_query.is_empty()
         || (!int_def.is_empty() && is_fresh_partition(client, &int_child_qual_probe));
     let tgt_is_fresh = !tgt_def.is_empty() && is_fresh_partition(client, &tgt_child_qual_probe);
+    let rows_before_tgt = count_rows(client, &tgt_child_qual_probe);
     if (int_is_empty || int_is_fresh) && (tgt_is_empty || tgt_is_fresh) {
         let (fill_int, fill_tgt) = build_inplace_partition_fill(
             &int_child_qual_probe,
@@ -2533,6 +2534,14 @@ fn swap_partition_child_ddl(
             .update(&fill_tgt, None, &[])
             .map_err(|e| format!("fill empty tgt child in place: {}", e))?;
         let _ = client.update(&format!("ANALYZE {}", tgt_child_qual_probe), None, &[]);
+        let rows_after = count_rows(client, &tgt_child_qual_probe);
+        log_slice_rebuild_if_changed(
+            client,
+            view_name,
+            &tgt_child_qual_probe,
+            rows_before_tgt,
+            rows_after,
+        );
         return Ok(());
     }
 
@@ -2734,6 +2743,21 @@ fn swap_partition_child_ddl(
     client
         .update(&ddl.rename_tgt, None, &[])
         .map_err(|e| format!("rename tgt: {}", e))?;
+
+    // The DETACH/CREATE-LIKE/fill/ATTACH/RENAME dance above is exactly the
+    // shape of the 2026-09 incident: a legitimate swap that rebuilds a slice
+    // from `base_query` under whatever predicate holds now, which can differ
+    // from what built the slice it replaces. `tgt_child_qual` names the OLD
+    // child before this block and — after `rename_tgt` — the NEW one, so the
+    // same qualified name captures both sides of the swap.
+    let rows_after_tgt = count_rows(client, &tgt_child_qual);
+    log_slice_rebuild_if_changed(
+        client,
+        view_name,
+        &tgt_child_qual,
+        rows_before_tgt,
+        rows_after_tgt,
+    );
 
     Ok(())
 }
@@ -3074,6 +3098,50 @@ fn relation_has_rows(client: &pgrx::spi::SpiClient<'_>, qualified: &str) -> bool
         .and_then(|mut it| it.next())
         .and_then(|r| r.get_by_name::<bool, _>("has_rows").ok().flatten())
         .unwrap_or(true)
+}
+
+/// Row count of a relation about to be truncated and refilled — cheap next to
+/// the refill's own source scan. Used to detect a slice-changing rebuild worth
+/// a durable `__reflex_event_log` row.
+fn count_rows(client: &pgrx::spi::SpiClient<'_>, qualified: &str) -> i64 {
+    client
+        .select(
+            &format!("SELECT count(*)::int8 AS c FROM {}", qualified),
+            None,
+            &[],
+        )
+        .ok()
+        .and_then(|mut it| it.next())
+        .and_then(|r| r.get_by_name::<i64, _>("c").ok().flatten())
+        .unwrap_or(0)
+}
+
+/// Record a slice-changing rebuild — the artefact the 2026-09 silent wipe
+/// incident had none of. A no-op when the count didn't move: the log is for
+/// anomalies and slice-changing rebuilds, never for every commit.
+fn log_slice_rebuild_if_changed(
+    client: &mut pgrx::spi::SpiClient<'_>,
+    view_name: &str,
+    slice: &str,
+    rows_before: i64,
+    rows_after: i64,
+) {
+    if rows_before == rows_after {
+        return;
+    }
+    let _ = client.update(
+        &format!(
+            "INSERT INTO public.__reflex_event_log \
+               (imv_name, event, trigger_reason, slice, rows_before, rows_after) \
+             VALUES ('{}', 'rebuild', 'partition_swap', '{}', {}, {})",
+            view_name.replace('\'', "''"),
+            slice.replace('\'', "''"),
+            rows_before,
+            rows_after
+        ),
+        None,
+        &[],
+    );
 }
 
 /// Extract the inner value list of a single-key LIST partition bound, i.e. the

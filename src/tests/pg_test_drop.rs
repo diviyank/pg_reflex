@@ -49,16 +49,18 @@ fn test_drop_reflex_ivm_basic() {
     assert_eq!(trig_gone, 0);
 }
 
-// Maintenance tables are persistent extension infrastructure (the registry and
-// the deferred / partition bookkeeping queues). They are NOT per-IMV and must
-// survive every create→drop cycle. Every other relation under the `__reflex_`
-// prefix is a per-IMV / per-source artifact that a complete drop must wipe.
+// Maintenance tables are persistent extension infrastructure (the registry,
+// the deferred / partition bookkeeping queues, and the maintenance event
+// log). They are NOT per-IMV and must survive every create→drop cycle. Every
+// other relation under the `__reflex_` prefix is a per-IMV / per-source
+// artifact that a complete drop must wipe.
 const COUNT_REFLEX_ARTIFACT_TABLES: &str = "SELECT COUNT(*) FROM pg_class c \
      JOIN pg_namespace n ON n.oid = c.relnamespace \
      WHERE c.relkind = 'r' AND c.relname LIKE '\\_\\_reflex\\_%' ESCAPE '\\' \
        AND c.relname NOT IN ( \
            '__reflex_ivm_reference', '__reflex_deferred_pending', \
-           '__reflex_source_partition_snapshot', '__reflex_partition_pending')";
+           '__reflex_source_partition_snapshot', '__reflex_partition_pending', \
+           '__reflex_event_log')";
 
 // A DEFERRED IMV is the most artifact-heavy shape: it materializes a per-source
 // staging delta table (`__reflex_delta_<source>`) on top of the per-IMV
