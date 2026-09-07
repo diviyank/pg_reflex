@@ -96,7 +96,7 @@ fn isx_ack_marker_still_suppresses_the_trigger() {
 
     let triggers_on_ignored = Spi::get_one::<i64>(
         "SELECT count(*) FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid \
-         WHERE c.relname = 'isx_dp' AND NOT t.tgisinternal AND t.tgname LIKE '%isx_imv7%'",
+         WHERE c.relname = 'isx_dp' AND NOT t.tgisinternal AND t.tgname ~ '^__reflex_trigger_'",
     )
     .unwrap()
     .unwrap();
@@ -107,7 +107,7 @@ fn isx_ack_marker_still_suppresses_the_trigger() {
 
     let triggers_on_kept = Spi::get_one::<i64>(
         "SELECT count(*) FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid \
-         WHERE c.relname = 'isx_ss' AND NOT t.tgisinternal AND t.tgname LIKE '%isx_imv7%'",
+         WHERE c.relname = 'isx_ss' AND NOT t.tgisinternal AND t.tgname ~ '^__reflex_trigger_'",
     )
     .unwrap()
     .unwrap();

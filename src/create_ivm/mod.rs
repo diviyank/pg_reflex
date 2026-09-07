@@ -17,6 +17,7 @@ use crate::schema_builder::{
     build_staging_table_ddl, build_target_table_ddl, build_trigger_ddls, resolve_column_type,
 };
 use crate::sql_analyzer::{analyze, SqlAnalysisError};
+use crate::sql_writer::registry::{split_ignore_ack, strip_ignore_ack_marker};
 use crate::sql_writer::{
     add_graph_child_links, insert_registry_row, AggregationsCast, RegistryRow,
 };
@@ -1177,11 +1178,10 @@ fn install_source_triggers(client: &mut pgrx::spi::SpiClient<'_>, ctx: &BuildCon
         }
 
         let (_, source_bare) = split_qualified_name(source);
-        if ctx
-            .ignore_sources
-            .iter()
-            .any(|s| s == source || s == source_bare)
-        {
+        if ctx.ignore_sources.iter().any(|s| {
+            let s = strip_ignore_ack_marker(s);
+            s == source || s == source_bare
+        }) {
             info!(
                 "pg_reflex: skipping trigger install on source '{}' for IMV '{}' (ignored)",
                 source, ctx.view_name
@@ -1561,11 +1561,10 @@ fn all_real_sources_are_matviews(client: &SpiClient<'_>, ctx: &BuildContext) -> 
             continue;
         }
         let (_, source_bare) = split_qualified_name(source);
-        if ctx
-            .ignore_sources
-            .iter()
-            .any(|s| s == source || s == source_bare)
-        {
+        if ctx.ignore_sources.iter().any(|s| {
+            let s = strip_ignore_ack_marker(s);
+            s == source || s == source_bare
+        }) {
             continue;
         }
         saw_real_source = true;
@@ -1924,6 +1923,25 @@ pub(crate) fn create_reflex_ivm_impl_with_materialization(
 
     warn_on_bare_name_under_nonpublic_search_path(view_name);
 
+    // A1: refuse an ignore whose source can determine this IMV's contents. Such
+    // an IMV is silently invalidated by a change it will never see, and a later
+    // rebuild from the base query makes the divergence permanent. Runs before
+    // any DDL and before decomposition, so a CTE query is judged as written
+    // rather than after being split into sub-IMVs.
+    let (ignored_clean, ignored_acked) = split_ignore_ack(ignore_sources);
+    let unacked = ignore_soundness::unsound_ignored_sources(sql, &ignored_clean)
+        .into_iter()
+        .find(|(src, _)| !ignored_acked.contains(src));
+    if let Some((src, reason)) = unacked {
+        return crate::reflex_reject(&format!(
+            "ignoring source '{src}' is unsound for IMV '{view_name}': {reason}. \
+             Changes to '{src}' will not refresh this IMV, so it can silently diverge — \
+             and a later rebuild from the base query makes the divergence permanent. \
+             Either remove '{src}' from ignore_sources, remove the reference from the query, \
+             or acknowledge the risk explicitly by passing '!{src}'."
+        ));
+    }
+
     // The `unique_columns` argument may carry per-CTE keys after the outer key
     // (`'<outer> ; <cte alias> : <cols> ; ...'`). Strip them so only the outer
     // key reaches the non-CTE paths; the map is consumed by CTE decomposition.
@@ -2127,6 +2145,9 @@ pub(crate) fn create_reflex_ivm_impl_with_materialization(
 
 mod admin;
 mod decompose;
+/// A1 create-time `ignore_sources` soundness check. Crate-visible: the audit's
+/// unsound-ignore finding calls `unsound_ignored_sources` from `crate::audit`.
+pub(crate) mod ignore_soundness;
 mod soundness;
 
 pub(crate) use admin::*;
