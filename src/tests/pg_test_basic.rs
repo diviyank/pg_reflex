@@ -804,8 +804,11 @@ fn pg_test_ignore_sources_suppresses_trigger() {
             'isr.kv', \
             'SELECT c.fk_id, SUM(c.qty) AS total FROM isr.child c \
              INNER JOIN isr.parent p ON p.id = c.fk_id GROUP BY c.fk_id', \
-            NULL, 'UNLOGGED', 'IMMEDIATE', 'isr.parent' \
+            NULL, 'UNLOGGED', 'IMMEDIATE', '!isr.parent' \
          )",
+        // A1: genuinely unsound — isr.parent is INNER JOINed, so deleting a
+        // parent row must delete the IMV's rows. The ack marker keeps the
+        // test's deliberate ignore while recording that it is accepted.
     )
     .expect("create")
     .expect("v");

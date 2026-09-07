@@ -712,12 +712,15 @@ fn f5_rebuild_imv_ignore_sources_anchor_repro() {
     ).expect("seed auth");
 
     // 4. Create a partitioned IMV joining A and B, partitioned by region,
-    //    with B in ignore_sources (so B is NOT incrementally maintained)
+    //    with B in ignore_sources (so B is NOT incrementally maintained).
+    //    A1: f5_auth is INNER JOINed and its region gates the ON, so this ignore
+    //    is genuinely unsound — that non-convergence is exactly what this test
+    //    documents. The '!' ack keeps the shape and records it as deliberate.
     let create_result = Spi::get_one::<String>(
         "SELECT create_reflex_ivm( \
             'f5_view', \
             'SELECT a.region, COUNT(*) AS cnt FROM f5_anchor a JOIN f5_auth b ON a.region = b.region GROUP BY a.region', \
-            NULL, NULL, NULL, 'f5_auth', \
+            NULL, NULL, NULL, '!f5_auth', \
             ARRAY['region'] \
          )"
     ).expect("create IMV call").expect("create IMV result");

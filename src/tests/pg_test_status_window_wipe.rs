@@ -75,13 +75,17 @@ fn swi_build_fixture(status: &str) {
     )
     .expect("seed ss");
 
+    // A1: this fixture IS the incident — swi_dp.status gates the WHERE while
+    // swi_dp is ignored. The check refuses that shape at create time now, so the
+    // reproduction declares it with the '!' ack to keep exercising the downstream
+    // wipe/heal behaviour it was written to pin.
     let r = Spi::get_one::<String>(
         "SELECT create_reflex_ivm('swi_imv', \
            'SELECT ss.dem_plan_id, ss.order_date, ss.product_id, ss.location_id, ss.qty \
               FROM swi_ss ss JOIN swi_dp dp ON dp.id = ss.dem_plan_id \
              WHERE dp.status IN (''validated'', ''draft'')', \
            'dem_plan_id,order_date,product_id,location_id', 'UNLOGGED', 'DEFERRED', \
-           'swi_dp', ARRAY['dem_plan_id','order_date'])",
+           '!swi_dp', ARRAY['dem_plan_id','order_date'])",
     )
     .expect("create call")
     .expect("create result");

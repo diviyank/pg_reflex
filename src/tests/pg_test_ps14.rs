@@ -191,6 +191,9 @@ fn ps14_matview_source_imv_advisory_names_convergent_primitive() {
     assert_eq!(ps14_rebuild_count("ps14e_imv"), 1);
 }
 
+/// A1: ps14f_auth is LEFT JOINed and its `note` is projected, so ignoring it is
+/// genuinely unsound — the '!' ack keeps the field shape this test reproduces.
+///
 /// (6) The field shape: a partitioned IMV declaring ignore_sources yields an
 /// advisory naming reflex_reconcile_partition and reflex_rebuild_chain — the
 /// primitives that CAN refill an anchor-empty partition. Rebuild still succeeds.
@@ -212,7 +215,7 @@ fn ps14_partitioned_ignore_sources_imv_advisory() {
             'ps14f_imv', \
             'SELECT a.id, a.region, a.amount, x.note FROM ps14f_anchor a \
                 LEFT JOIN ps14f_auth x ON a.region = x.region', \
-            'id,region', NULL, NULL, 'ps14f_auth', ARRAY['region'] \
+            'id,region', NULL, NULL, '!ps14f_auth', ARRAY['region'] \
          )",
     )
     .unwrap()
@@ -310,6 +313,8 @@ fn ps14_bare_ignore_qualified_depends_is_flagged_at_create_time() {
     Spi::run("CREATE MATERIALIZED VIEW ps14i_s.mv AS SELECT id, grp, val FROM ps14i_s.realtbl")
         .unwrap();
 
+    // A1: ps14i_s.realtbl is INNER JOINed and its id gates the ON, so the ignore
+    // is genuinely unsound; the '!' ack preserves the bare-name shape under test.
     // The IMV joins the matview and the real table, both schema-qualified (so
     // depends_on stores 'ps14i_s.realtbl'), and ignores the real table by its BARE
     // name 'realtbl'. After the ignore, the only maintainable-source candidate is a
@@ -319,7 +324,7 @@ fn ps14_bare_ignore_qualified_depends_is_flagged_at_create_time() {
             'ps14i_imv', \
             'SELECT m.grp, SUM(m.val) AS total FROM ps14i_s.mv m \
                 JOIN ps14i_s.realtbl r ON r.id = m.id GROUP BY m.grp', \
-            NULL, NULL, NULL, 'realtbl' \
+            NULL, NULL, NULL, '!realtbl' \
          )",
     )
     .unwrap()
