@@ -213,6 +213,16 @@ extension_sql!(
     ALTER TABLE public.__reflex_ivm_reference
         ADD COLUMN IF NOT EXISTS last_rebuild_at TIMESTAMPTZ;
 
+    -- 1.11.4 (A1): the subset of `ignored_sources` whose ignore was explicitly
+    -- acknowledged as unsound at create time with a '!' prefix. The marker is
+    -- stripped before `ignored_sources` is written — a marker-bearing entry
+    -- would stop matching the runtime `= ANY(depends_on)` / array-overlap skip
+    -- and the ignore would silently stop working. The raw list (markers intact)
+    -- lives on in `create_args` so `reflex_rebuild_imv` replays the ack and the
+    -- IMV stays rebuildable.
+    ALTER TABLE public.__reflex_ivm_reference
+        ADD COLUMN IF NOT EXISTS ignore_ack TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[];
+
     -- 1.10.8: JSON object capturing creation-time arguments (unique_columns,
     -- storage_mode, refresh_mode, topk_k, ignore_sources, partition_by,
     -- explicit_unpartitioned) for faithful IMV chain reconstruction via
@@ -433,6 +443,13 @@ const DEFAULT_TOPK_K: usize = 16;
 
 /// Parse a comma-separated source list into a Vec<String>. Empty input → empty vec.
 /// Both schema-qualified ("alp.product") and bare ("product") names are accepted.
+///
+/// Entries are kept VERBATIM, including any leading `!` soundness-acknowledgement
+/// marker (A1). Stripping here would drop the ack from `create_args`, so
+/// `reflex_rebuild_imv` would replay the create without it, the create-time
+/// soundness check would refuse the replay, and the IMV would become
+/// unrebuildable. The marker is removed at the points that consume the list —
+/// see [`crate::sql_writer::registry::split_ignore_ack`].
 fn parse_ignore_sources_list(s: &str) -> Vec<String> {
     s.split(',')
         .map(|p| p.trim().to_string())

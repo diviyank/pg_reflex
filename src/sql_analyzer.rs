@@ -593,7 +593,7 @@ fn join_type_str(op: &JoinOperator) -> &'static str {
 /// Extract the JoinConstraint from a JoinOperator. SEMI/ANTI/STRAIGHT
 /// variants — not reachable from `PostgreSqlDialect` — fall to None
 /// alongside other constraint-less / future-added variants.
-fn join_constraint(op: &JoinOperator) -> Option<&JoinConstraint> {
+pub(crate) fn join_constraint(op: &JoinOperator) -> Option<&JoinConstraint> {
     match op {
         JoinOperator::Join(c)
         | JoinOperator::Inner(c)
@@ -850,19 +850,51 @@ fn resolve_column_ref(
 /// `SELECT id FROM orders WHERE created_at >= (SELECT cutoff FROM config)`
 /// attributes to `orders` only, ignoring `config` (which lives inside the
 /// WHERE subquery).
-fn top_level_sources(select: &Select) -> Vec<String> {
-    let mut sources = Vec::new();
+pub(crate) fn top_level_sources(select: &Select) -> Vec<String> {
+    top_level_tables(select).into_iter().map(|(n, _)| n).collect()
+}
+
+/// Alias → table name for the top-level FROM/JOIN relations of one SELECT.
+///
+/// Same walk as [`top_level_sources`], so the create-time `ignore_sources`
+/// soundness check resolves a qualifier to exactly the source the rest of the
+/// analyzer would. Deliberately top-level only: an alias reused inside a
+/// subquery must not shadow the outer relation it would otherwise resolve to.
+pub(crate) fn alias_map(select: &Select) -> HashMap<String, String> {
+    top_level_tables(select)
+        .into_iter()
+        .filter_map(|(name, alias)| alias.map(|a| (a, name)))
+        .collect()
+}
+
+/// The single walk behind [`top_level_sources`] and [`alias_map`]: every
+/// top-level FROM / JOIN table factor as `(table_name, alias)`.
+fn top_level_tables(select: &Select) -> Vec<(String, Option<String>)> {
+    let entry = |factor: &TableFactor| match factor {
+        TableFactor::Table { name, alias, .. } => Some((
+            name.to_string(),
+            alias.as_ref().map(|a| a.name.to_string()),
+        )),
+        _ => None,
+    };
+    let mut tables = Vec::new();
     for twj in &select.from {
-        if let TableFactor::Table { name, .. } = &twj.relation {
-            sources.push(name.to_string());
-        }
+        tables.extend(entry(&twj.relation));
         for join in &twj.joins {
-            if let TableFactor::Table { name, .. } = &join.relation {
-                sources.push(name.to_string());
-            }
+            tables.extend(entry(&join.relation));
         }
     }
-    sources
+    tables
+}
+
+/// Collect the dotted column references of one expression, using the same
+/// [`ColumnRefCollector`] the analyzer's own clause walk uses. A bare
+/// `Identifier("status")` yields `vec!["status"]`; `dp.status` yields
+/// `vec!["dp", "status"]`.
+pub(crate) fn collect_column_refs(expr: &Expr) -> Vec<Vec<String>> {
+    let mut collector = ColumnRefCollector::default();
+    let _ = expr.visit(&mut collector);
+    collector.refs
 }
 
 /// Compute the IMV-relevant column set for each source by walking every
