@@ -24,14 +24,18 @@ type IvmStatusRow = (
     bool,                                       // requires_explicit_refresh
     i64,                                        // rebuild_count
     Option<pgrx::datum::TimestampWithTimeZone>, // last_rebuild_at
+    bool,                                       // is_estimate
 );
 
 /// Summary per IMV. `row_count` avoids a full-table `count(*)` on large IMVs:
 /// it reports the planner estimate `pg_class.reltuples` when the target has been
 /// analyzed (`reltuples > 0`, the common production case), and only falls back to
 /// an exact `count(*)` when the estimate is unavailable (`reltuples <= 0`: an
-/// empty target — where the count is instant — or one not yet analyzed). This
-/// keeps the status view O(1) per IMV instead of O(rows) on mature registries.
+/// empty target — where the count is instant — or one not yet analyzed), or when
+/// the IMV carries an anomaly (`known_stale` or a retained `last_error`) — an
+/// estimate taken before a caught flush failure can no longer be trusted. `is_estimate`
+/// tells the caller which case produced `row_count`. This keeps the status view
+/// O(1) per IMV in the common case instead of O(rows) on mature registries.
 #[pg_extern]
 #[allow(clippy::type_complexity)]
 fn reflex_ivm_status() -> TableIterator<
@@ -52,6 +56,7 @@ fn reflex_ivm_status() -> TableIterator<
         name!(requires_explicit_refresh, bool),
         name!(rebuild_count, i64),
         name!(last_rebuild_at, Option<pgrx::datum::TimestampWithTimeZone>),
+        name!(is_estimate, bool),
     ),
 > {
     let rows: Vec<IvmStatusRow> = Spi::connect(|client| {
@@ -137,6 +142,7 @@ fn reflex_ivm_status() -> TableIterator<
                 requires_explicit_refresh,
                 rebuild_count,
                 last_rebuild_at,
+                false,
             ));
         }
         out
@@ -144,25 +150,41 @@ fn reflex_ivm_status() -> TableIterator<
 
     // Populate row_count in a separate pass to keep the registry read short.
     // Prefer the planner estimate (reltuples) so a status query never full-scans
-    // a large IMV target; fall back to an exact count only when the estimate is
+    // a large IMV target; fall back to an exact count when the estimate is
     // unavailable (reltuples <= 0 → empty or never-analyzed), where count(*) is
-    // cheap or the only source of truth. Missing target → to_regclass NULL →
-    // no row → the -1 sentinel (unchanged from the prior "could not determine").
+    // cheap or the only source of truth, or when the IMV carries an anomaly —
+    // a stale estimate from before a caught flush failure would tell a
+    // comfortable lie about a target that may have been silently emptied.
+    // Missing target → to_regclass NULL → no row → the -1 sentinel (unchanged
+    // from the prior "could not determine").
     let rows: Vec<IvmStatusRow> = rows
         .into_iter()
         .map(|mut row| {
             let name = &row.0;
-            let count_sql = format!(
-                "SELECT CASE WHEN c.reltuples > 0 THEN c.reltuples::BIGINT \
-                             ELSE (SELECT COUNT(*)::BIGINT FROM {ident}) END AS c \
-                 FROM pg_class c WHERE c.oid = to_regclass('{name_lit}')",
-                ident = quote(name),
-                name_lit = name.replace('\'', "''"),
-            );
-            let c = Spi::get_one::<i64>(&count_sql)
+            let has_anomaly = row.10 || row.8.is_some();
+            let (c, is_estimate) = if has_anomaly {
+                let c = Spi::get_one::<i64>(&format!(
+                    "SELECT COUNT(*)::BIGINT AS c FROM {ident}",
+                    ident = quote(name)
+                ))
                 .unwrap_or(None)
                 .unwrap_or(-1);
+                (c, false)
+            } else {
+                let count_sql = format!(
+                    "SELECT CASE WHEN c.reltuples > 0 THEN c.reltuples::BIGINT \
+                                 ELSE (SELECT COUNT(*)::BIGINT FROM {ident}) END AS c, \
+                            (c.reltuples > 0) AS is_estimate \
+                     FROM pg_class c WHERE c.oid = to_regclass('{name_lit}')",
+                    ident = quote(name),
+                    name_lit = name.replace('\'', "''"),
+                );
+                Spi::get_two::<i64, bool>(&count_sql)
+                    .map(|(c, est)| (c.unwrap_or(-1), est.unwrap_or(false)))
+                    .unwrap_or((-1, false))
+            };
             row.4 = c;
+            row.15 = is_estimate;
             row
         })
         .collect();
