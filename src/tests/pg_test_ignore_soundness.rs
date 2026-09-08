@@ -236,6 +236,91 @@ fn isx_ack_function_makes_a_legacy_imv_rebuildable() {
     );
 }
 
+/// Same defect as isx_ack_function_makes_a_legacy_imv_rebuildable, but sized
+/// like the production incident that exposed it: a ~32-char IMV name and a
+/// schema-qualified ~20-char source, refused through a long
+/// qualifier-attribution reason. __reflex_doctor_try_repair caps its output at
+/// `left(SQLERRM, 400)`; before the remedy-first reordering the working
+/// remedy (reflex_ack_ignore_source) sat behind two copies of both names plus
+/// the reason and was truncated away entirely at this size, leaving an
+/// operator with a finding they could not clear.
+#[pg_test]
+fn isx_ack_remedy_survives_truncation_for_production_sized_names() {
+    isx_fixture();
+    Spi::run("CREATE SCHEMA isxq").expect("schema");
+    Spi::run("CREATE TABLE isxq.demand_planning (id BIGINT PRIMARY KEY, status TEXT NOT NULL)")
+        .expect("qualified source");
+    Spi::run("INSERT INTO isxq.demand_planning VALUES (1, 'validated')").expect("seed");
+
+    let view_name = "isx_current_assortment_activity";
+    let source = "isxq.demand_planning";
+
+    // `t` is a derived-table alias: valid SQL Postgres can execute, but
+    // invisible to pg_reflex's top-level alias map (which only tracks real
+    // FROM/JOIN tables). Referencing it in the JOIN ON — rather than WHERE,
+    // which the walk visits first and would otherwise claim the reason first
+    // — is exactly the shape that produces the long "qualifier ... could not
+    // be attributed to a top-level source" reason for the JOIN ON clause.
+    let ivm_query = format!(
+        "SELECT ss.dem_plan_id, ss.qty FROM isx_ss ss \
+           JOIN (SELECT id FROM {source} WHERE status = ''validated'') t \
+             ON t.id = ss.dem_plan_id"
+    );
+
+    // Confirm the shape hits the intended long reason, straight from
+    // create_reflex_ivm's own (untruncated) return — not the 400-capped
+    // doctor-repair path this test is really about.
+    let bare_refusal = Spi::get_one::<String>(&format!(
+        "SELECT create_reflex_ivm('{view_name}', '{ivm_query}', \
+           'dem_plan_id', 'UNLOGGED', 'DEFERRED', '{source}')"
+    ))
+    .expect("bare create call")
+    .expect("bare create result");
+    assert!(
+        bare_refusal.contains("qualifier t in JOIN ON could not be attributed"),
+        "sanity: must hit the long qualifier-attribution reason, got: {bare_refusal}"
+    );
+
+    let create_sql = format!(
+        "SELECT create_reflex_ivm('{view_name}', '{ivm_query}', \
+           'dem_plan_id', 'UNLOGGED', 'DEFERRED', '!{source}')"
+    );
+    let r = Spi::get_one::<String>(&create_sql)
+        .expect("create call")
+        .expect("create result");
+    assert!(!r.starts_with("ERROR"), "create returned: {r}");
+
+    // Reproduce the legacy pre-A1 shape: strip the ack from both places.
+    Spi::run(&format!(
+        "UPDATE public.__reflex_ivm_reference \
+            SET ignore_ack = ARRAY[]::TEXT[], \
+                create_args = jsonb_set(create_args::jsonb, '{{ignore_sources}}', \
+                                        '[\"{source}\"]'::jsonb)::text \
+          WHERE name = '{view_name}'"
+    ))
+    .expect("de-ack");
+
+    let refused = Spi::get_one::<String>(&format!(
+        "SELECT public.__reflex_doctor_try_repair( \
+           'SELECT reflex_rebuild_chain(''{view_name}'')')"
+    ))
+    .expect("rebuild call")
+    .expect("rebuild result");
+    assert!(
+        refused.starts_with("failed:"),
+        "the legacy replay must be refused, got: {refused}"
+    );
+    assert!(
+        refused.len() <= "failed:".len() + 400,
+        "sanity: the repair path is still capped at 400 chars, got len {}: {refused}",
+        refused.len()
+    );
+    assert!(
+        refused.contains("reflex_ack_ignore_source"),
+        "the remedy must survive the 400-char truncation for production-sized names, got: {refused}"
+    );
+}
+
 /// The ack function refuses loudly rather than silently no-opping.
 #[pg_test]
 fn isx_ack_function_refuses_unknown_imv_and_unignored_source() {
