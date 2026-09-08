@@ -140,10 +140,200 @@ fn isx_ack_survives_rebuild() {
         "create_args must retain the raw marker for faithful replay"
     );
 
-    let r = Spi::get_one::<String>("SELECT reflex_rebuild_imv('isx_imv4')")
+    // reflex_rebuild_imv is an alias for reflex_reconcile: it never touches
+    // create_args and never re-enters the create path, so asserting on it would
+    // stay green with A1 refusing every replay. reflex_rebuild_chain is the only
+    // path that drops and re-creates from create_args, so it is the one that
+    // proves the ack survives — and that A1 has not made the IMV unrebuildable.
+    let r = Spi::get_one::<String>("SELECT reflex_rebuild_chain('isx_imv4')")
         .expect("rebuild call")
         .expect("rebuild result");
-    assert!(!r.starts_with("ERROR"), "rebuild must not be refused: {r}");
+    assert!(
+        !r.starts_with("ERROR"),
+        "the replay must not be refused by the check that made it necessary: {r}"
+    );
+    let still_acked = Spi::get_one::<bool>(
+        "SELECT ignore_ack @> ARRAY['isx_dp'] \
+         FROM public.__reflex_ivm_reference WHERE name = 'isx_imv4'",
+    )
+    .unwrap()
+    .unwrap();
+    assert!(still_acked, "the rebuilt IMV must carry the acknowledgement");
+}
+
+/// I1: the escape hatch for the rebuild path. A legacy IMV created before A1
+/// carries no '!' in create_args, so reflex_rebuild_chain replays a create the
+/// check refuses — and reflex_rebuild_chain takes no ignore_sources argument,
+/// so the '!' remedy is unreachable from there. reflex_ack_ignore_source must
+/// make that state clearable, and the fix must converge in one call.
+#[pg_test]
+fn isx_ack_function_makes_a_legacy_imv_rebuildable() {
+    isx_fixture();
+    let r = Spi::get_one::<String>(
+        "SELECT create_reflex_ivm('isx_legacy', \
+           'SELECT ss.dem_plan_id, ss.qty FROM isx_ss ss \
+              JOIN isx_dp dp ON dp.id = ss.dem_plan_id \
+             WHERE dp.status = ''validated''', \
+           'dem_plan_id', 'UNLOGGED', 'DEFERRED', '!isx_dp')",
+    )
+    .expect("create call")
+    .expect("create result");
+    assert!(!r.starts_with("ERROR"), "create returned: {r}");
+
+    // Reproduce the legacy shape: strip the ack from both places, exactly as a
+    // pre-A1 install would have it.
+    Spi::run(
+        "UPDATE public.__reflex_ivm_reference \
+            SET ignore_ack = ARRAY[]::TEXT[], \
+                create_args = jsonb_set(create_args::jsonb, '{ignore_sources}', \
+                                        '[\"isx_dp\"]'::jsonb)::text \
+          WHERE name = 'isx_legacy'",
+    )
+    .expect("de-ack");
+
+    // The refusal reaches the caller as a RAISE (reflex_rebuild_chain uses
+    // pgrx::error! so the drop rolls back), which would abort this test's
+    // transaction. __reflex_doctor_try_repair wraps it in a savepoint and hands
+    // back the message — the same shape an operator sees.
+    let refused = Spi::get_one::<String>(
+        "SELECT public.__reflex_doctor_try_repair( \
+           'SELECT reflex_rebuild_chain(''isx_legacy'')')",
+    )
+    .expect("rebuild call")
+    .expect("rebuild result");
+    assert!(
+        refused.starts_with("failed:"),
+        "the legacy replay must be refused, got: {refused}"
+    );
+    assert!(
+        refused.contains("unsound") && refused.contains("reflex_ack_ignore_source"),
+        "the refusal must name the remedy that clears it, got: {refused}"
+    );
+
+    let ack = Spi::get_one::<String>("SELECT reflex_ack_ignore_source('isx_legacy', 'isx_dp')")
+        .expect("ack call")
+        .expect("ack result");
+    assert_eq!(ack, "ACKNOWLEDGED", "ack returned: {ack}");
+
+    let raw = Spi::get_one::<bool>(
+        "SELECT create_args::jsonb -> 'ignore_sources' ? '!isx_dp' \
+           AND NOT (create_args::jsonb -> 'ignore_sources' ? 'isx_dp') \
+         FROM public.__reflex_ivm_reference WHERE name = 'isx_legacy'",
+    )
+    .unwrap()
+    .unwrap();
+    assert!(
+        raw,
+        "the ack must REPLACE the bare entry in create_args, not sit beside it"
+    );
+
+    let after = Spi::get_one::<String>("SELECT reflex_rebuild_chain('isx_legacy')")
+        .expect("rebuild call")
+        .expect("rebuild result");
+    assert!(
+        !after.starts_with("ERROR"),
+        "the prescribed remedy must converge in one call, got: {after}"
+    );
+}
+
+/// The ack function refuses loudly rather than silently no-opping.
+#[pg_test]
+fn isx_ack_function_refuses_unknown_imv_and_unignored_source() {
+    isx_fixture();
+    let r = Spi::get_one::<String>("SELECT reflex_ack_ignore_source('isx_nope', 'isx_dp')")
+        .unwrap()
+        .unwrap();
+    assert!(r.starts_with("ERROR"), "unknown IMV must be refused: {r}");
+
+    let _ = Spi::get_one::<String>(
+        "SELECT create_reflex_ivm('isx_plain', 'SELECT dem_plan_id, qty FROM isx_ss', \
+         'dem_plan_id', 'UNLOGGED', 'DEFERRED', NULL)",
+    );
+    let r = Spi::get_one::<String>("SELECT reflex_ack_ignore_source('isx_plain', 'isx_dp')")
+        .unwrap()
+        .unwrap();
+    assert!(
+        r.starts_with("ERROR"),
+        "acking a source that is not ignored must be refused: {r}"
+    );
+}
+
+/// M3: an entry that is a bare marker names no source. Refuse it rather than
+/// writing an empty string into ignored_sources and ignore_ack.
+#[pg_test]
+fn isx_bare_marker_entry_is_refused() {
+    isx_fixture();
+    let r = Spi::get_one::<String>(
+        "SELECT create_reflex_ivm('isx_bang', 'SELECT dem_plan_id, qty FROM isx_ss', \
+         'dem_plan_id', 'UNLOGGED', 'DEFERRED', '!')",
+    )
+    .expect("create call")
+    .expect("create result");
+    assert!(
+        r.starts_with("ERROR") && r.contains("names no source"),
+        "a bare '!' must be refused, got: {r}"
+    );
+}
+
+/// C1(a) — the ignored source is reachable only through a WHERE subquery. No
+/// CTE, no set operation, no wildcard, no unqualified column: before the C1 fix
+/// the qualifier `dp` resolved to itself and this was accepted.
+#[pg_test]
+fn isx_subquery_scoped_reference_is_refused() {
+    isx_fixture();
+    let r = Spi::get_one::<String>(
+        "SELECT create_reflex_ivm('isx_sub', \
+           'SELECT ss.dem_plan_id, ss.qty FROM isx_ss ss \
+             WHERE ss.dem_plan_id IN \
+               (SELECT dp.id FROM isx_dp dp WHERE dp.status = ''validated'')', \
+           'dem_plan_id', 'UNLOGGED', 'DEFERRED', 'isx_dp')",
+    )
+    .expect("create call")
+    .expect("create result");
+    assert!(
+        r.contains("is unsound for IMV") && r.contains("isx_dp"),
+        "a subquery-scoped reference to the ignored source must be refused, got: {r}"
+    );
+}
+
+/// C1(b) — the ignored source is wrapped in a derived table, whose alias never
+/// enters the top-level alias map.
+#[pg_test]
+fn isx_derived_table_reference_is_refused() {
+    isx_fixture();
+    let r = Spi::get_one::<String>(
+        "SELECT create_reflex_ivm('isx_der', \
+           'SELECT ss.dem_plan_id, t.status FROM isx_ss ss \
+              JOIN (SELECT id, status FROM isx_dp) t ON t.id = ss.dem_plan_id \
+             WHERE t.status = ''validated''', \
+           'dem_plan_id', 'UNLOGGED', 'DEFERRED', 'isx_dp')",
+    )
+    .expect("create call")
+    .expect("create result");
+    assert!(
+        r.contains("is unsound for IMV") && r.contains("isx_dp"),
+        "a derived-table reference to the ignored source must be refused, got: {r}"
+    );
+}
+
+/// C1(c) — a quoted alias. Ident::to_string() re-adds the quotes for the alias
+/// map key while Ident.value does not for the collected qualifier, so the
+/// lookup misses and the fallback must catch it.
+#[pg_test]
+fn isx_quoted_alias_reference_is_refused() {
+    isx_fixture();
+    let r = Spi::get_one::<String>(
+        "SELECT create_reflex_ivm('isx_quoted', \
+           'SELECT \"DP\".id AS dem_plan_id, ss.qty FROM isx_dp \"DP\", isx_ss ss \
+             WHERE \"DP\".status = ''validated'' AND \"DP\".id = ss.dem_plan_id', \
+           'dem_plan_id', 'UNLOGGED', 'DEFERRED', 'isx_dp')",
+    )
+    .expect("create call")
+    .expect("create result");
+    assert!(
+        r.contains("is unsound for IMV") && r.contains("isx_dp"),
+        "a quoted-alias reference to the ignored source must be refused, got: {r}"
+    );
 }
 
 /// Fail toward "unsound": a query the resolver cannot attribute is refused, not
