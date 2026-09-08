@@ -161,10 +161,38 @@ pub(crate) fn unsound_ignored_sources_parsed(
     }
     for twj in &select.from {
         for join in &twj.joins {
-            if let Some(JoinConstraint::On(e)) =
-                crate::sql_analyzer::join_constraint(&join.join_operator)
-            {
-                clauses.push(("JOIN ON", e));
+            // Exhaustive on purpose: a future sqlparser variant must fail to
+            // compile here, not fall through as silently sound.
+            match crate::sql_analyzer::join_constraint(&join.join_operator) {
+                None => {}
+                Some(JoinConstraint::On(e)) => clauses.push(("JOIN ON", e)),
+                Some(JoinConstraint::Using(cols)) => {
+                    // A USING column names a column in both relations at
+                    // once and cannot be attributed to either one — treated
+                    // like any other unattributable reference.
+                    let col_list = cols
+                        .iter()
+                        .map(|c| c.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    flag_unattributed(
+                        &format!(
+                            "JOIN USING ({col_list}) references a column in both \
+                             relations and cannot be attributed to one"
+                        ),
+                        &mut out,
+                    );
+                }
+                Some(JoinConstraint::Natural) => {
+                    // NATURAL equates every common column implicitly, so no
+                    // single column or relation can be named.
+                    flag_unattributed(
+                        "NATURAL JOIN implicitly equates every common column and \
+                         cannot be attributed to one relation",
+                        &mut out,
+                    );
+                }
+                Some(JoinConstraint::None) => {}
             }
         }
     }
@@ -441,5 +469,34 @@ mod tests {
             &ignored(&["dp"]),
         );
         assert_eq!(out.len(), 1, "{out:?}");
+    }
+
+    #[test]
+    fn join_using_on_ignored_source_is_unsound() {
+        let out = unsound_ignored_sources(
+            "SELECT a.x, dp.status FROM a LEFT JOIN dp USING (id)",
+            &ignored(&["dp"]),
+        );
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert_eq!(out[0].0, "dp");
+    }
+
+    #[test]
+    fn natural_join_on_ignored_source_is_unsound() {
+        let out = unsound_ignored_sources(
+            "SELECT a.x FROM a NATURAL LEFT JOIN dp",
+            &ignored(&["dp"]),
+        );
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert_eq!(out[0].0, "dp");
+    }
+
+    #[test]
+    fn join_using_does_not_flag_a_non_source() {
+        let out = unsound_ignored_sources(
+            "SELECT a.x, dp.status FROM a LEFT JOIN dp USING (id)",
+            &ignored(&["elsewhere"]),
+        );
+        assert!(out.is_empty(), "{out:?}");
     }
 }
