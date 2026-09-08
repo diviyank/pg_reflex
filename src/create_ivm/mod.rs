@@ -1958,17 +1958,21 @@ pub(crate) fn create_reflex_ivm_impl_with_materialization(
         .find(|(src, _)| !ignored_acked.contains(src))
     };
     if let Some((src, reason)) = unacked {
-        // The remedy comes FIRST. Consumers truncate: __reflex_doctor_try_repair
-        // caps at 400 characters, and a message whose actionable half is cut off
-        // is a finding an operator cannot clear.
+        // The working remedy comes FIRST, right after the two names. Consumers
+        // truncate: __reflex_doctor_try_repair caps at 400 characters, and a
+        // message whose actionable half is cut off is a finding an operator
+        // cannot clear. reflex_ack_ignore_source is the only remedy that works
+        // on every path, including rebuild (which takes no ignore_sources
+        // argument), so it must land before the variable-length reason and the
+        // other alternatives.
         return crate::reflex_reject(&format!(
-            "ignoring source '{src}' is unsound for IMV '{view_name}': {reason}. \
-             Fix: pass '!{src}' in ignore_sources to accept the risk, or on the rebuild \
-             path (which takes no ignore_sources argument) run \
-             SELECT reflex_ack_ignore_source('{view_name}', '{src}'); first. \
-             Otherwise drop '{src}' from ignore_sources, or drop the reference from the \
-             query. Rationale: changes to '{src}' will not refresh this IMV, so it can \
-             silently diverge, and a later rebuild from the base query makes that permanent."
+            "ignoring source '{src}' is unsound for IMV '{view_name}'. \
+             Fix: run SELECT reflex_ack_ignore_source('{view_name}', '{src}'); \
+             which works on every path including rebuild. Alternatives: pass '!{src}' in \
+             ignore_sources at create time, drop '{src}' from ignore_sources, or drop the \
+             reference from the query. Reason: {reason}. Changes to '{src}' will not \
+             refresh this IMV, so it can silently diverge, and a later rebuild from the \
+             base query makes that permanent."
         ));
     }
 
