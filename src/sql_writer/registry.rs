@@ -39,6 +39,11 @@ pub fn strip_ignore_ack_marker(entry: &str) -> &str {
 /// deferred dispatcher's array-overlap predicate and by the trigger-install
 /// skip, and a marker-bearing entry stops matching — the ignore would silently
 /// stop working, which is the very outage the A1 check exists to prevent.
+///
+/// An entry that strips to nothing (a bare `!`) names no source and is dropped
+/// rather than written as an empty string into either array. The create path
+/// refuses such an entry outright, so this is defence in depth for the callers
+/// that have no error channel.
 pub fn split_ignore_ack(raw: &[String]) -> (Vec<String>, Vec<String>) {
     let mut clean = Vec::with_capacity(raw.len());
     let mut acked = Vec::new();
@@ -46,9 +51,13 @@ pub fn split_ignore_ack(raw: &[String]) -> (Vec<String>, Vec<String>) {
         match entry.strip_prefix(IGNORE_ACK_MARKER) {
             Some(name) => {
                 let name = name.trim().to_string();
+                if name.is_empty() {
+                    continue;
+                }
                 acked.push(name.clone());
                 clean.push(name);
             }
+            None if entry.is_empty() => continue,
             None => clean.push(entry.clone()),
         }
     }
@@ -654,4 +663,33 @@ pub fn remove_graph_child(
         ],
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod split_ignore_ack_tests {
+    use super::split_ignore_ack;
+
+    fn v(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn marker_is_stripped_and_recorded() {
+        let (clean, acked) = split_ignore_ack(&v(&["a", "!b", "! c "]));
+        assert_eq!(clean, v(&["a", "b", "c"]));
+        assert_eq!(acked, v(&["b", "c"]));
+    }
+
+    #[test]
+    fn a_bare_marker_names_no_source_and_is_dropped() {
+        let (clean, acked) = split_ignore_ack(&v(&["!", "!   ", ""]));
+        assert!(
+            clean.is_empty(),
+            "no empty name may reach ignored_sources: {clean:?}"
+        );
+        assert!(
+            acked.is_empty(),
+            "no empty name may reach ignore_ack: {acked:?}"
+        );
+    }
 }

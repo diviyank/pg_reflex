@@ -392,26 +392,30 @@ fn validate_select_columns(ctx: &BuildContext) {
     }
 }
 
-/// Pre-flight checks: reject duplicate view name (or skip-noop on
-/// `if_not_exists`), detect cycles in the IMV dependency DAG. Returns the
-/// short-circuit string when the create should stop, `None` to continue.
-fn check_existence_and_cycle(ctx: &BuildContext) -> Option<&'static str> {
-    let already_exists = Spi::connect(|client| {
+/// Is an IMV of this name already in the registry? One definition, shared by
+/// the duplicate-name pre-flight and by the A1 soundness gate, which must not
+/// fire on a call that will short-circuit as a no-op.
+fn imv_is_registered(view_name: &str) -> bool {
+    Spi::connect(|client| {
         !client
             .select(
                 "SELECT 1 FROM public.__reflex_ivm_reference WHERE name = $1",
                 None,
                 &[unsafe {
-                    DatumWithOid::new(
-                        ctx.view_name.to_string(),
-                        PgBuiltInOids::TEXTOID.oid().value(),
-                    )
+                    DatumWithOid::new(view_name.to_string(), PgBuiltInOids::TEXTOID.oid().value())
                 }],
             )
             .unwrap_or_report()
             .collect::<Vec<_>>()
             .is_empty()
-    });
+    })
+}
+
+/// Pre-flight checks: reject duplicate view name (or skip-noop on
+/// `if_not_exists`), detect cycles in the IMV dependency DAG. Returns the
+/// short-circuit string when the create should stop, `None` to continue.
+fn check_existence_and_cycle(ctx: &BuildContext) -> Option<&'static str> {
+    let already_exists = imv_is_registered(ctx.view_name);
     if already_exists {
         if ctx.if_not_exists {
             return Some("REFLEX INCREMENTAL VIEW ALREADY EXISTS (skipped)");
@@ -1928,17 +1932,41 @@ pub(crate) fn create_reflex_ivm_impl_with_materialization(
     // rebuild from the base query makes the divergence permanent. Runs before
     // any DDL and before decomposition, so a CTE query is judged as written
     // rather than after being split into sub-IMVs.
+    if let Some(bad) = ignore_sources
+        .iter()
+        .find(|e| strip_ignore_ack_marker(e).is_empty())
+    {
+        return crate::reflex_reject(&format!(
+            "ignore_sources entry '{bad}' names no source. The '!' prefix acknowledges an \
+             unsound ignore and must be followed by the source name, e.g. '!schema.table'."
+        ));
+    }
     let (ignored_clean, ignored_acked) = split_ignore_ack(ignore_sources);
-    let unacked = ignore_soundness::unsound_ignored_sources(sql, &ignored_clean)
+    // `if_not_exists` on an IMV that already exists is a no-op: refusing it
+    // protects nothing (the unsound IMV goes on existing either way) and breaks
+    // idempotent deployment re-runs. Judge only calls that would build.
+    let creates_nothing = if_not_exists && imv_is_registered(view_name);
+    let unacked = if creates_nothing {
+        None
+    } else {
+        ignore_soundness::unsound_ignored_sources_parsed(
+            &parsed.parsed_sql,
+            &parsed.analysis,
+            &ignored_clean,
+        )
         .into_iter()
-        .find(|(src, _)| !ignored_acked.contains(src));
+        .find(|(src, _)| !ignored_acked.contains(src))
+    };
     if let Some((src, reason)) = unacked {
         return crate::reflex_reject(&format!(
             "ignoring source '{src}' is unsound for IMV '{view_name}': {reason}. \
              Changes to '{src}' will not refresh this IMV, so it can silently diverge — \
              and a later rebuild from the base query makes the divergence permanent. \
              Either remove '{src}' from ignore_sources, remove the reference from the query, \
-             or acknowledge the risk explicitly by passing '!{src}'."
+             or acknowledge the risk explicitly by passing '!{src}'. \
+             On the rebuild path, where no ignore_sources argument can be passed, run \
+             SELECT reflex_ack_ignore_source('{view_name}', '{src}'); first — it records \
+             the acknowledgement in the registry AND in create_args, so the replay carries it."
         ));
     }
 
@@ -2145,8 +2173,9 @@ pub(crate) fn create_reflex_ivm_impl_with_materialization(
 
 mod admin;
 mod decompose;
-/// A1 create-time `ignore_sources` soundness check. Crate-visible: the audit's
-/// unsound-ignore finding calls `unsound_ignored_sources` from `crate::audit`.
+/// A1 create-time `ignore_sources` soundness check. Crate-visible so the planned
+/// audit finding for unsound ignores can call `unsound_ignored_sources` from
+/// `crate::audit` without re-implementing the resolver.
 pub(crate) mod ignore_soundness;
 mod soundness;
 
