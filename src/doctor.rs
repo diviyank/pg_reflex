@@ -834,6 +834,11 @@ fn detect_audit_findings(target: Option<&str>, fix: bool) -> Vec<DoctorReportRow
             // maintenance attempt has already failed.
             "partition-mirror" | "partition-tree-drift" => "F3",
             "duplicate-function" => "F11",
+            // An unacknowledged unsound ignore_sources (A1). Report-only: its
+            // remedy, reflex_ack_ignore_source, records an operator's
+            // acceptance of risk rather than repairing anything, and must
+            // never be auto-executed.
+            "ignore-soundness" => "F13",
             _ => continue,
         };
 
