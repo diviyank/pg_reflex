@@ -343,6 +343,58 @@ fn isx_ack_function_refuses_unknown_imv_and_unignored_source() {
     );
 }
 
+/// reflex_ack_ignore_source must not invent an `ignore_sources` key in
+/// create_args on a row that never had one. jsonb_set defaults to
+/// create_missing = true, so a naive fix would MATERIALISE the key on a
+/// legacy row whose create_args is '{}' — a silent config rewrite performed
+/// by the very remedy the refusal message tells an operator to run.
+#[pg_test]
+fn isx_ack_function_does_not_invent_ignore_sources_key_on_legacy_row() {
+    isx_fixture();
+    let r = Spi::get_one::<String>(
+        "SELECT create_reflex_ivm('isx_prekey', \
+           'SELECT ss.dem_plan_id, ss.qty FROM isx_ss ss \
+              JOIN isx_dp dp ON dp.id = ss.dem_plan_id \
+             WHERE dp.status = ''validated''', \
+           'dem_plan_id', 'UNLOGGED', 'DEFERRED', '!isx_dp')",
+    )
+    .expect("create call")
+    .expect("create result");
+    assert!(!r.starts_with("ERROR"), "create returned: {r}");
+
+    // Simulate a row that predates the `ignore_sources` key entirely — the
+    // shape a pre-A1 install has, distinct from a row that already carries
+    // the key unacked.
+    Spi::run(
+        "UPDATE public.__reflex_ivm_reference SET create_args = '{}' \
+          WHERE name = 'isx_prekey'",
+    )
+    .expect("simulate legacy row");
+
+    let ack = Spi::get_one::<String>("SELECT reflex_ack_ignore_source('isx_prekey', 'isx_dp')")
+        .expect("ack call")
+        .expect("ack result");
+    assert_eq!(ack, "ACKNOWLEDGED", "ack returned: {ack}");
+
+    let create_args = Spi::get_one::<String>(
+        "SELECT create_args FROM public.__reflex_ivm_reference WHERE name = 'isx_prekey'",
+    )
+    .expect("read create_args")
+    .expect("create_args present");
+    assert_eq!(
+        create_args, "{}",
+        "a legacy row with no ignore_sources key must be left untouched, got: {create_args}"
+    );
+
+    let acked = Spi::get_one::<bool>(
+        "SELECT ignore_ack @> ARRAY['isx_dp'] \
+         FROM public.__reflex_ivm_reference WHERE name = 'isx_prekey'",
+    )
+    .unwrap()
+    .unwrap();
+    assert!(acked, "the ack must still take effect: ignore_ack unset");
+}
+
 /// M3: an entry that is a bare marker names no source. Refuse it rather than
 /// writing an empty string into ignored_sources and ignore_ack.
 #[pg_test]

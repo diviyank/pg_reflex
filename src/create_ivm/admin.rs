@@ -1229,24 +1229,36 @@ fn reflex_ack_ignore_source(imv: &str, source: &str) -> String {
     // Both writes in one statement so the column and create_args can never
     // disagree. The array is rebuilt with the bare entry REPLACED by its
     // '!'-prefixed form — replaced, not appended, or `split_ignore_ack` would
-    // later yield the same name twice. The CASE leaves an already-acked entry
-    // alone, so the function is idempotent.
+    // later yield the same name twice. The inner CASE leaves an already-acked
+    // entry alone, so the function is idempotent.
+    //
+    // The outer CASE only runs jsonb_set when `ignore_sources` is actually a
+    // key of create_args. jsonb_set's create_missing defaults to true, so
+    // without this guard a legacy row whose create_args is NULL, '{}', or
+    // simply predates the key would have this ack MATERIALISE that key —
+    // rewriting a config the operator never set, from the very remedy the
+    // refusal message tells them to run. A row with no `ignore_sources` key
+    // is left byte-for-byte unchanged.
     let sql = format!(
         "UPDATE public.__reflex_ivm_reference \
             SET ignore_ack = ( \
                   SELECT COALESCE(array_agg(DISTINCT x), ARRAY[]::TEXT[]) \
                   FROM unnest(COALESCE(ignore_ack, ARRAY[]::TEXT[]) || ARRAY['{s}']) x \
                 ), \
-                create_args = jsonb_set( \
-                  COALESCE(create_args, '{{}}')::jsonb, \
-                  '{{ignore_sources}}', \
-                  ( \
-                    SELECT COALESCE(jsonb_agg( \
-                             CASE WHEN e = '{s}' THEN '!{s}' ELSE e END), '[]'::jsonb) \
-                    FROM jsonb_array_elements_text( \
-                           COALESCE(create_args::jsonb -> 'ignore_sources', '[]'::jsonb)) e \
-                  ) \
-                )::text \
+                create_args = CASE \
+                  WHEN COALESCE(create_args, '{{}}')::jsonb ? 'ignore_sources' THEN \
+                    jsonb_set( \
+                      COALESCE(create_args, '{{}}')::jsonb, \
+                      '{{ignore_sources}}', \
+                      ( \
+                        SELECT COALESCE(jsonb_agg( \
+                                 CASE WHEN e = '{s}' THEN '!{s}' ELSE e END), '[]'::jsonb) \
+                        FROM jsonb_array_elements_text( \
+                               COALESCE(create_args::jsonb -> 'ignore_sources', '[]'::jsonb)) e \
+                      ) \
+                    )::text \
+                  ELSE create_args \
+                  END \
           WHERE name = '{v}'",
         s = source.replace('\'', "''"),
         v = imv.replace('\'', "''"),
