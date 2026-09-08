@@ -504,3 +504,76 @@ fn isx_no_ignore_sources_is_never_refused() {
         "an IMV with no ignore_sources must be unaffected, got: {r}"
     );
 }
+
+/// `reflex_audit` returns a formatted REPORT STRING, not a table
+/// (`src/audit/mod.rs:590-603`) — assert on its text, as the existing audit
+/// tests do (`src/tests/pg_test_audit.rs:41-44`).
+fn isx_audit_flags(imv: &str) -> bool {
+    let report: String = Spi::get_one(&format!("SELECT reflex_audit('{imv}')"))
+        .expect("audit query ok")
+        .expect("non-null report");
+    report.contains("ignore-soundness")
+}
+
+/// An IMV installed before A1 existed must be surfaced by the audit.
+#[pg_test]
+fn isx_audit_flags_installed_unsound_imv() {
+    isx_fixture();
+    // Create it soundly, then make it unsound the way the field did: by adding
+    // the ignore afterwards. A registry row hand-built to fake the shape would
+    // be a false-green fixture; this is a real IMV over real sources.
+    let r = Spi::get_one::<String>(
+        "SELECT create_reflex_ivm('isx_aud', \
+           'SELECT ss.dem_plan_id, ss.qty FROM isx_ss ss \
+              JOIN isx_dp dp ON dp.id = ss.dem_plan_id \
+             WHERE dp.status = ''validated''', \
+           'dem_plan_id', 'UNLOGGED', 'DEFERRED', '!isx_dp')",
+    )
+    .expect("create")
+    .expect("create result");
+    assert!(!r.starts_with("ERROR"), "setup create failed: {r}");
+
+    // Strip the acknowledgement to simulate a pre-A1 installation.
+    Spi::run(
+        "UPDATE public.__reflex_ivm_reference SET ignore_ack = ARRAY[]::TEXT[] \
+         WHERE name = 'isx_aud'",
+    )
+    .expect("strip ack");
+
+    assert!(isx_audit_flags("isx_aud"), "audit must flag the unsound ignore");
+}
+
+/// The remedy must converge: running it clears the finding it printed.
+#[pg_test]
+fn isx_ack_function_clears_the_finding() {
+    isx_fixture();
+    let _ = Spi::get_one::<String>(
+        "SELECT create_reflex_ivm('isx_aud2', \
+           'SELECT ss.dem_plan_id, ss.qty FROM isx_ss ss \
+              JOIN isx_dp dp ON dp.id = ss.dem_plan_id \
+             WHERE dp.status = ''validated''', \
+           'dem_plan_id', 'UNLOGGED', 'DEFERRED', '!isx_dp')",
+    );
+    Spi::run(
+        "UPDATE public.__reflex_ivm_reference SET ignore_ack = ARRAY[]::TEXT[] \
+         WHERE name = 'isx_aud2'",
+    )
+    .expect("strip ack");
+    assert!(isx_audit_flags("isx_aud2"), "precondition: finding present");
+
+    let r = Spi::get_one::<String>("SELECT reflex_ack_ignore_source('isx_aud2', 'isx_dp')")
+        .expect("ack call")
+        .expect("ack result");
+    assert!(!r.starts_with("ERROR"), "ack returned: {r}");
+
+    assert!(!isx_audit_flags("isx_aud2"), "the remedy must clear its own finding");
+
+    // And it must survive a rebuild, or the finding comes back.
+    let raw = Spi::get_one::<bool>(
+        "SELECT create_args::jsonb -> 'ignore_sources' ? '!isx_dp' \
+         FROM public.__reflex_ivm_reference WHERE name = 'isx_aud2'",
+    )
+    .unwrap()
+    .unwrap();
+    assert!(raw, "the ack must be patched into create_args, not only the column");
+}
