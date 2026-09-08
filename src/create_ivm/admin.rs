@@ -1195,3 +1195,64 @@ fn extract_array_field_via_sql(
         .and_then(|row| row.get_by_name::<Vec<String>, _>("result").ok().flatten())
         .unwrap_or_default()
 }
+
+/// Record an accepted `ignore_sources` unsoundness for an already-installed IMV.
+///
+/// The A1 create-time check also runs on the re-create step of
+/// `reflex_rebuild_chain`, which takes no `ignore_sources` argument. Without
+/// this function a legacy IMV whose `create_args` carry no `!` is refused on
+/// rebuild and the printed remedy is unreachable — an operator would have to
+/// hand-write an UPDATE against an internal catalog. This is that remedy, and
+/// it converges: after one call the replay carries the acknowledgement.
+///
+/// Writes BOTH the `ignore_ack` column and the `!`-prefixed entry in
+/// `create_args.ignore_sources`, in one statement. Patching only the column
+/// would let the next replay go without the ack, so the refusal would return.
+#[pg_extern]
+fn reflex_ack_ignore_source(imv: &str, source: &str) -> String {
+    let present = Spi::get_one::<bool>(&format!(
+        "SELECT COALESCE(ignored_sources @> ARRAY['{s}'], FALSE) \
+         FROM public.__reflex_ivm_reference WHERE name = '{v}'",
+        s = source.replace('\'', "''"),
+        v = imv.replace('\'', "''"),
+    ))
+    .unwrap_or(None);
+
+    match present {
+        None => return format!("ERROR: no IMV named '{imv}'"),
+        Some(false) => {
+            return format!("ERROR: '{source}' is not in ignore_sources for IMV '{imv}'")
+        }
+        Some(true) => {}
+    }
+
+    // Both writes in one statement so the column and create_args can never
+    // disagree. The array is rebuilt with the bare entry REPLACED by its
+    // '!'-prefixed form — replaced, not appended, or `split_ignore_ack` would
+    // later yield the same name twice. The CASE leaves an already-acked entry
+    // alone, so the function is idempotent.
+    let sql = format!(
+        "UPDATE public.__reflex_ivm_reference \
+            SET ignore_ack = ( \
+                  SELECT COALESCE(array_agg(DISTINCT x), ARRAY[]::TEXT[]) \
+                  FROM unnest(COALESCE(ignore_ack, ARRAY[]::TEXT[]) || ARRAY['{s}']) x \
+                ), \
+                create_args = jsonb_set( \
+                  COALESCE(create_args, '{{}}')::jsonb, \
+                  '{{ignore_sources}}', \
+                  ( \
+                    SELECT COALESCE(jsonb_agg( \
+                             CASE WHEN e = '{s}' THEN '!{s}' ELSE e END), '[]'::jsonb) \
+                    FROM jsonb_array_elements_text( \
+                           COALESCE(create_args::jsonb -> 'ignore_sources', '[]'::jsonb)) e \
+                  ) \
+                )::text \
+          WHERE name = '{v}'",
+        s = source.replace('\'', "''"),
+        v = imv.replace('\'', "''"),
+    );
+    match Spi::run(&sql) {
+        Ok(()) => "ACKNOWLEDGED".to_string(),
+        Err(e) => format!("ERROR: {e}"),
+    }
+}
