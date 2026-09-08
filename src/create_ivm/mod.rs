@@ -1958,15 +1958,17 @@ pub(crate) fn create_reflex_ivm_impl_with_materialization(
         .find(|(src, _)| !ignored_acked.contains(src))
     };
     if let Some((src, reason)) = unacked {
+        // The remedy comes FIRST. Consumers truncate: __reflex_doctor_try_repair
+        // caps at 400 characters, and a message whose actionable half is cut off
+        // is a finding an operator cannot clear.
         return crate::reflex_reject(&format!(
             "ignoring source '{src}' is unsound for IMV '{view_name}': {reason}. \
-             Changes to '{src}' will not refresh this IMV, so it can silently diverge — \
-             and a later rebuild from the base query makes the divergence permanent. \
-             Either remove '{src}' from ignore_sources, remove the reference from the query, \
-             or acknowledge the risk explicitly by passing '!{src}'. \
-             On the rebuild path, where no ignore_sources argument can be passed, run \
-             SELECT reflex_ack_ignore_source('{view_name}', '{src}'); first — it records \
-             the acknowledgement in the registry AND in create_args, so the replay carries it."
+             Fix: pass '!{src}' in ignore_sources to accept the risk, or on the rebuild \
+             path (which takes no ignore_sources argument) run \
+             SELECT reflex_ack_ignore_source('{view_name}', '{src}'); first. \
+             Otherwise drop '{src}' from ignore_sources, or drop the reference from the \
+             query. Rationale: changes to '{src}' will not refresh this IMV, so it can \
+             silently diverge, and a later rebuild from the base query makes that permanent."
         ));
     }
 
