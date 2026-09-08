@@ -554,9 +554,19 @@ fn isx_ack_function_clears_the_finding() {
              WHERE dp.status = ''validated''', \
            'dem_plan_id', 'UNLOGGED', 'DEFERRED', '!isx_dp')",
     );
+    // Strip BOTH the ignore_ack column and the '!' marker from create_args, so
+    // the fixture matches a real pre-A1 installation rather than one that
+    // merely lost the column while create_args (set from the '!' passed to
+    // create_reflex_ivm above) still carries the marker. Leaving create_args
+    // acked here would let the final assertion below pass even if
+    // reflex_ack_ignore_source never touched create_args at all — exactly the
+    // false-green a mutation check must catch.
     Spi::run(
-        "UPDATE public.__reflex_ivm_reference SET ignore_ack = ARRAY[]::TEXT[] \
-         WHERE name = 'isx_aud2'",
+        "UPDATE public.__reflex_ivm_reference \
+            SET ignore_ack = ARRAY[]::TEXT[], \
+                create_args = jsonb_set(create_args::jsonb, '{ignore_sources}', \
+                                        '[\"isx_dp\"]'::jsonb)::text \
+          WHERE name = 'isx_aud2'",
     )
     .expect("strip ack");
     assert!(isx_audit_flags("isx_aud2"), "precondition: finding present");
