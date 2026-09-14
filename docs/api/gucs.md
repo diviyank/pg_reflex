@@ -7,6 +7,7 @@ pg_reflex reads a handful of runtime settings via `current_setting`. None requir
 | [`reflex.wipe_threshold`](#reflexwipe_threshold) | float `0`–`1` | `0.5` | Dirty-row fraction at or above which a batch wipes-and-rebuilds instead of applying a delta. |
 | [`reflex.wipe_floor_rows`](#reflexwipe_floor_rows) | integer | `1000` | Floor on the partition-size denominator of the dirty ratio. |
 | [`pg_reflex.alter_source_policy`](#pg_reflexalter_source_policy) | enum | `warn` | Reaction to `ALTER TABLE` on a tracked source. |
+| [`pg_reflex.flush_failure_policy`](#pg_reflexflush_failure_policy) | enum | `warn` | 1.11.4+. Reaction to a failed deferred flush of one IMV. |
 | [`pg_reflex.debug_resolve_anchor`](#pg_reflexdebug_resolve_anchor) | boolean | `off` | 1.10.8+. When on, emits `REFLEX-DBG resolve_anchor` NOTICEs; off by default to avoid burying real WARNINGs. |
 
 !!! note "Reserved"
@@ -40,6 +41,24 @@ SET reflex.wipe_floor_rows = 5000;
 |---|---|
 | `'warn'` (default) | Emits `WARNING 'pg_reflex: source table % was altered; IMV % may be stale — run SELECT reflex_rebuild_imv(…)`'. The ALTER proceeds. |
 | `'error'` | Raises an `EXCEPTION`, rolling back the ALTER. |
+
+## `pg_reflex.flush_failure_policy`
+
+(1.11.4+) Controls what happens when the deferred (commit-time) maintenance of one IMV fails — a unique violation from duplicate source rows, a missing relation, and so on.
+
+| Value | Behaviour |
+|---|---|
+| `'warn'` (default) | The failure is caught per IMV. That IMV's staged delta is discarded, it is marked `known_stale` with `last_error` and a `stale_reason` naming the remedy, a `WARNING` is raised, an `error` row is written to `__reflex_event_log`, and the rest of the cascade — and the caller's `COMMIT` — continues. Repair with `SELECT reflex_reconcile('<imv>')`. |
+| `'error'` | The failure propagates and aborts the caller's transaction, so the source write that caused it is rolled back too. |
+
+Any other non-empty value falls back to `warn` and raises `WARNING 'pg_reflex: invalid pg_reflex.flush_failure_policy=…, falling back to ''warn'''` — a typo never silently selects either mode.
+
+!!! warning "Drivers drop WARNINGs by default"
+    asyncpg discards server notices unless a log listener is registered (`Connection.add_log_listener`). Under `warn`, register one or poll `reflex_ivm_status()`, or the failure is invisible to the application.
+
+```sql
+ALTER DATABASE mydb SET pg_reflex.flush_failure_policy = 'error';
+```
 
 ## `pg_reflex.debug_resolve_anchor`
 
