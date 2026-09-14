@@ -79,7 +79,24 @@ pub(crate) fn reflex_doctor_impl(
 /// reporting stale. The heal is the remedy that drains its own finding, and
 /// `fixed` is claimed only once the queue for the IMV is empty.
 fn detect_queued_heals(target: Option<&str>, fix: bool) -> Vec<DoctorReportRow> {
-    crate::heal::queued_heals_by_imv()
+    let unhealable = crate::heal::unhealable_reasons_by_imv()
+        .into_iter()
+        .filter(|(imv, _)| target.is_none_or(|t| t == imv))
+        .map(|(imv, reason)| {
+            (
+                "F14".to_string(),
+                "WARNING".to_string(),
+                imv,
+                reason,
+                "Recreate the IMV against the ignored source's current columns.".to_string(),
+                if fix {
+                    "skipped(needs recreate)".to_string()
+                } else {
+                    "reported".to_string()
+                },
+            )
+        });
+    let queued = crate::heal::queued_heals_by_imv()
         .into_iter()
         .filter(|(imv, _)| target.is_none_or(|t| t == imv))
         .map(|(imv, heal)| {
@@ -99,8 +116,8 @@ fn detect_queued_heals(target: Option<&str>, fix: bool) -> Vec<DoctorReportRow> 
                 ),
                 outcome,
             )
-        })
-        .collect()
+        });
+    queued.chain(unhealable).collect()
 }
 
 fn heal_and_verify(imv: &str) -> String {
