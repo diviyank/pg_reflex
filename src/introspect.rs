@@ -186,7 +186,11 @@ fn reflex_ivm_status() -> TableIterator<
     // and autovacuum never auto-analyzes a partitioned parent, so
     // has_anomaly legitimately re-arms after each count-changing swap until
     // an operator reconciles or explicitly ANALYZEs the root — the root's
-    // reltuples really is stale, so this is semantically honest, not a bug.)
+    // reltuples really is stale, so this is semantically honest, not a bug.
+    // On an IMV swapped at every push the condition never retires and every
+    // status call counts it exactly; `ANALYZE <root>` or `reflex_reconcile`
+    // retires it. Tracked in untreated_bugs/
+    // 2026-09-08_status_rebuild_anomaly_never_retires_on_swapped_partitioned_imv.md)
     // A failed/unavailable `pg_stat_all_tables` lookup fails toward the exact
     // count — the safe direction for a correctness alarm is to do the work.
     // A missing `__reflex_event_log` (e.g. an upgraded install whose

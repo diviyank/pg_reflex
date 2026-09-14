@@ -63,11 +63,9 @@ fn flag_all(ignored_clean: &[String], reason: &str) -> Vec<(String, String)> {
 /// Parses and analyzes `sql` itself, for callers that hold only the query text
 /// (the audit). The create path already has both and calls
 /// [`unsound_ignored_sources_parsed`] instead — one parse, one analysis, and no
-/// second place where the dialect could diverge.
-/// The text-only entry point has no in-crate caller yet: the create path holds
-/// a parsed query and uses `unsound_ignored_sources_parsed`. It is the surface
-/// the planned audit finding consumes, and the unit tests exercise it.
-#[allow(dead_code)]
+/// second place where the dialect could diverge. Its caller is the
+/// `ignore-soundness` audit check (`src/audit/checks_f_ignore_soundness.rs`),
+/// which holds only the registry's stored `base_query` text.
 pub fn unsound_ignored_sources(sql: &str, ignored_clean: &[String]) -> Vec<(String, String)> {
     if ignored_clean.is_empty() {
         return Vec::new();
