@@ -465,19 +465,30 @@ pub fn reflex_flush_deferred(source_table: &str) -> String {
         // continues (existing behaviour, unchanged for every caller who never
         // sets this). Opt-in `error` drops the per-IMV EXCEPTION handler so the
         // failure propagates and aborts the whole caller transaction instead.
-        // Any unrecognised value (including empty/unset) falls back to `warn` —
-        // mirrors how `pg_reflex.alter_source_policy` is read at
-        // src/lib.rs:1093; a typo must never silently disable the guard.
-        let fail_hard = client
+        // Unset or empty means `warn`. Any other unrecognised value also falls
+        // back to `warn` and raises a WARNING naming it — the same contract as
+        // `pg_reflex.alter_source_policy` (src/lib.rs, `__reflex_on_ddl_command_end`):
+        // a typo must never silently select either mode.
+        let flush_failure_policy = client
             .select(
-                "SELECT lower(COALESCE(NULLIF(current_setting('pg_reflex.flush_failure_policy', true), ''), 'warn')) = 'error' AS e",
+                "SELECT lower(NULLIF(current_setting('pg_reflex.flush_failure_policy', true), '')) AS v",
                 None,
                 &[],
             )
             .unwrap_or_report()
             .next()
-            .map(|row| row.get_by_name::<bool, _>("e").unwrap_or(None).unwrap_or(false))
-            .unwrap_or(false);
+            .and_then(|row| row.get_by_name::<String, _>("v").unwrap_or(None));
+        let fail_hard = match flush_failure_policy.as_deref() {
+            None | Some("warn") => false,
+            Some("error") => true,
+            Some(invalid) => {
+                pgrx::warning!(
+                    "pg_reflex: invalid pg_reflex.flush_failure_policy={}, falling back to 'warn'",
+                    invalid
+                );
+                false
+            }
+        };
 
         for (imv_name, base_query, end_query, agg_json, where_pred) in &imvs {
             if engage_cross_source_guard {
