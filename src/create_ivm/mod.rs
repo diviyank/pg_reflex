@@ -2059,9 +2059,10 @@ pub(crate) fn create_reflex_ivm_impl_with_materialization(
         deferred,
         storage_upper,
         mode_upper,
-        parsed_sql: _,
+        parsed_sql,
         mut analysis,
     } = parsed;
+    let column_refs = crate::sql_analyzer::statement_column_refs(&parsed_sql);
 
     // Resolve every bare source against the current `search_path` so the
     // identifiers stored in `__reflex_ivm_reference.depends_on`, baked into the
@@ -2163,6 +2164,19 @@ pub(crate) fn create_reflex_ivm_impl_with_materialization(
         }
 
         install_source_triggers(client, &ctx);
+        let ignored_clean: Vec<String> = ctx
+            .ignore_sources
+            .iter()
+            .map(|s| strip_ignore_ack_marker(s).to_string())
+            .collect();
+        ctx.plan.ignore_heal_keys = crate::heal::install_heal_triggers(
+            client,
+            ctx.view_name,
+            &ctx.analysis,
+            column_refs.as_deref(),
+            &ignored_clean,
+            &ctx.plan.partition_columns,
+        );
         install_deferred_flush_if_needed(client, &ctx);
 
         install_min_max_indexes(client, &ctx);

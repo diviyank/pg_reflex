@@ -175,22 +175,12 @@ fn reflex_ivm_status() -> TableIterator<
     // rebuild is written for any slice-changing swap, which is routine, so an
     // unscoped predicate would make has_anomaly permanently true after the
     // first one. "The estimate may be stale" is true exactly when a slice was
-    // rebuilt AFTER the planner last saw it, so scoping by
-    // `COALESCE(last_analyze, last_autoanalyze)` from `pg_stat_all_tables`
-    // (NULL, i.e. never analyzed, counts as always stale) converges by
-    // construction: reconcile ANALYZEs the target (reconcile.rs:520 / :627),
-    // so running the prescribed remedy retires the condition it caused —
-    // reconcile clears `known_stale`/`last_error` directly and clears the
-    // 'rebuild' term indirectly via its ANALYZE, never by touching the log.
-    // (Left out of scope: a routine partition swap only ANALYZEs the child,
-    // and autovacuum never auto-analyzes a partitioned parent, so
-    // has_anomaly legitimately re-arms after each count-changing swap until
-    // an operator reconciles or explicitly ANALYZEs the root — the root's
-    // reltuples really is stale, so this is semantically honest, not a bug.
-    // On an IMV swapped at every push the condition never retires and every
-    // status call counts it exactly; `ANALYZE <root>` or `reflex_reconcile`
-    // retires it. Tracked in untreated_bugs/
-    // 2026-09-08_status_rebuild_anomaly_never_retires_on_swapped_partitioned_imv.md)
+    // rebuilt AFTER the planner last saw it — either the IMV itself or the
+    // rebuilt slice (`slice`). A partitioned IMV's estimate is the sum of its
+    // leaves' reltuples, and the swap ANALYZEs the leaf it rebuilds after
+    // stamping the event, so the swap retires its own event. A reconcile
+    // ANALYZEs the whole target and retires every older event. Never analyzed
+    // (NULL) counts as always stale.
     // A failed/unavailable `pg_stat_all_tables` lookup fails toward the exact
     // count — the safe direction for a correctness alarm is to do the work.
     // A missing `__reflex_event_log` (e.g. an upgraded install whose
@@ -212,11 +202,18 @@ fn reflex_ivm_status() -> TableIterator<
             .unwrap_or(Some(false))
             .unwrap_or(false);
     let capped = capped_source_by_imv();
+    let heal_reasons = crate::heal::heal_stale_reasons_by_imv();
+    // The stats snapshot is cached per transaction; an ANALYZE earlier in the
+    // caller's transaction must be visible to the recency check below.
+    let _ = Spi::run("SELECT pg_stat_clear_snapshot()");
     let rows: Vec<IvmStatusRow> = rows
         .into_iter()
         .map(|mut row| {
-            if let Some(source) = capped.get(&row.0) {
-                let reason = source.stale_reason();
+            let derived_reasons = [
+                capped.get(&row.0).map(CappedSource::stale_reason),
+                heal_reasons.get(&row.0).cloned(),
+            ];
+            for reason in derived_reasons.into_iter().flatten() {
                 row.11 = Some(match (row.10, row.11.take()) {
                     (true, Some(stored)) => format!("{stored} | {reason}"),
                     _ => reason,
@@ -231,10 +228,13 @@ fn reflex_ivm_status() -> TableIterator<
                          SELECT 1 FROM public.__reflex_event_log e \
                          WHERE e.imv_name = '{name_lit}' \
                            AND e.event = 'rebuild' \
-                           AND e.at > COALESCE( \
+                           AND e.at > COALESCE(GREATEST( \
                                   (SELECT COALESCE(last_analyze, last_autoanalyze) \
                                    FROM pg_stat_all_tables \
                                    WHERE relid = to_regclass('{name_lit}')), \
+                                  (SELECT COALESCE(last_analyze, last_autoanalyze) \
+                                   FROM pg_stat_all_tables \
+                                   WHERE relid = to_regclass(e.slice))), \
                                   '-infinity'::timestamptz) \
                          LIMIT 1 \
                      ) AS ok"
@@ -251,13 +251,25 @@ fn reflex_ivm_status() -> TableIterator<
                 .unwrap_or(-1);
                 (c, false)
             } else {
+                // A partitioned parent's own reltuples is never maintained by a
+                // leaf swap, so its estimate is the sum over leaves, and only
+                // when every leaf has been analyzed (reltuples >= 0).
                 let count_sql = format!(
-                    "SELECT CASE WHEN c.reltuples > 0 THEN c.reltuples::BIGINT \
+                    "WITH rel AS (SELECT oid, relkind, reltuples FROM pg_class \
+                                   WHERE oid = to_regclass('{name_lit}')), \
+                          est AS (SELECT CASE WHEN rel.relkind = 'p' THEN \
+                                      (SELECT CASE WHEN bool_and(l.reltuples >= 0) \
+                                                   THEN sum(l.reltuples::float8) END \
+                                         FROM pg_partition_tree(rel.oid) t \
+                                         JOIN pg_class l ON l.oid = t.relid \
+                                        WHERE t.isleaf) \
+                                  ELSE rel.reltuples::float8 END AS n \
+                                    FROM rel) \
+                     SELECT CASE WHEN est.n > 0 THEN est.n::BIGINT \
                                  ELSE (SELECT COUNT(*)::BIGINT FROM {ident}) END AS c, \
-                            (c.reltuples > 0) AS is_estimate \
-                     FROM pg_class c WHERE c.oid = to_regclass('{name_lit}')",
+                            COALESCE(est.n > 0, FALSE) AS is_estimate \
+                     FROM est",
                     ident = quote(name),
-                    name_lit = name.replace('\'', "''"),
                 );
                 Spi::get_two::<i64, bool>(&count_sql)
                     .map(|(c, est)| (c.unwrap_or(-1), est.unwrap_or(false)))

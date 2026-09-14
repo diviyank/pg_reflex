@@ -93,6 +93,7 @@ fn simple_plan() -> AggregationPlan {
         partition_strategy: String::new(),
         anchor_source: String::new(),
         partition_join_paths: std::collections::HashMap::new(),
+        ignore_heal_keys: std::collections::HashMap::new(),
     }
 }
 
@@ -171,6 +172,7 @@ fn test_build_merge_min_add() {
         partition_strategy: String::new(),
         anchor_source: String::new(),
         partition_join_paths: std::collections::HashMap::new(),
+        ignore_heal_keys: std::collections::HashMap::new(),
     };
     let delta = "SELECT city, MIN(price) AS \"__min_price\", COUNT(*) AS __ivm_count FROM src GROUP BY city";
     let sql = build_merge_sql("intermediate", delta, &plan, DeltaOp::Add);
@@ -206,6 +208,7 @@ fn test_build_upsert_min_subtract_sets_null() {
         partition_strategy: String::new(),
         anchor_source: String::new(),
         partition_join_paths: std::collections::HashMap::new(),
+        ignore_heal_keys: std::collections::HashMap::new(),
     };
     let delta = "SELECT city, MIN(price) FROM src GROUP BY city";
     let sql = build_merge_sql("intermediate", delta, &plan, DeltaOp::Subtract);
@@ -250,6 +253,7 @@ fn test_min_max_recompute_sql() {
         partition_strategy: String::new(),
         anchor_source: String::new(),
         partition_join_paths: std::collections::HashMap::new(),
+        ignore_heal_keys: std::collections::HashMap::new(),
     };
     let orig_base = "SELECT city AS \"city\", MIN(price) AS \"__min_price\", SUM(amount) AS \"__sum_amount\", COUNT(*) AS __ivm_count FROM orders GROUP BY city";
     let sql = build_min_max_recompute_sql("intermediate", &plan, orig_base, None);
@@ -332,6 +336,7 @@ fn test_min_max_recompute_sql_handles_join_aliases() {
         partition_strategy: String::new(),
         anchor_source: String::new(),
         partition_join_paths: std::collections::HashMap::new(),
+        ignore_heal_keys: std::collections::HashMap::new(),
     };
     let orig_base = "SELECT s.product_id AS \"product_id\", SUM(CASE WHEN (caav.product_id IS NOT NULL) THEN 1 ELSE 0 END) AS \"__bool_or_caav_product_id_is_not_null_true_count\", COUNT(*) AS __ivm_count FROM sales_simulation s LEFT JOIN current_assortment_activity caav ON caav.product_id = s.product_id GROUP BY s.product_id";
     let sql = build_min_max_recompute_sql("intermediate", &plan, orig_base, None);
@@ -393,6 +398,7 @@ fn test_outer_join_secondary_aggregate_scopes_recompute_by_join_keys() {
         partition_strategy: String::new(),
         anchor_source: String::new(),
         partition_join_paths: std::collections::HashMap::new(),
+        ignore_heal_keys: std::collections::HashMap::new(),
     };
     let agg_json = serde_json::to_string(&plan).unwrap();
     let base_q = "SELECT s.product_id AS \"product_id\", s.location_id AS \"location_id\", \
@@ -472,6 +478,7 @@ fn min_only_plan() -> AggregationPlan {
         partition_strategy: String::new(),
         anchor_source: String::new(),
         partition_join_paths: std::collections::HashMap::new(),
+        ignore_heal_keys: std::collections::HashMap::new(),
     }
 }
 
@@ -613,6 +620,7 @@ fn test_min_max_recompute_affected_filter_uses_multiple_group_columns() {
         partition_strategy: String::new(),
         anchor_source: String::new(),
         partition_join_paths: std::collections::HashMap::new(),
+        ignore_heal_keys: std::collections::HashMap::new(),
     };
     let orig_base = "SELECT region AS \"region\", product AS \"product\", MIN(price) AS \"__min_price\", COUNT(*) AS __ivm_count FROM orders GROUP BY region, product";
     let sql = build_min_max_recompute_sql(
@@ -666,6 +674,7 @@ fn test_min_max_recompute_skips_affected_filter_for_sentinel_plan() {
         partition_strategy: String::new(),
         anchor_source: String::new(),
         partition_join_paths: std::collections::HashMap::new(),
+        ignore_heal_keys: std::collections::HashMap::new(),
     };
     let orig_base = "SELECT MIN(price) AS \"__min_price\", COUNT(*) AS __ivm_count FROM orders";
     let sql = build_min_max_recompute_sql(
@@ -1082,6 +1091,7 @@ fn test_build_merge_count_distinct_nullable_uses_null_safe_join() {
         partition_strategy: String::new(),
         anchor_source: String::new(),
         partition_join_paths: std::collections::HashMap::new(),
+        ignore_heal_keys: std::collections::HashMap::new(),
     };
     let delta = "SELECT grp, maybe_null, COUNT(*) AS __ivm_count FROM src GROUP BY grp, maybe_null";
 
@@ -1525,6 +1535,7 @@ fn test_build_delta_sql_splice_injects_filter_before_group_by() {
         partition_strategy: String::new(),
         anchor_source: String::new(),
         partition_join_paths: std::collections::HashMap::new(),
+        ignore_heal_keys: std::collections::HashMap::new(),
     };
     let agg_json = serde_json::to_string(&plan).unwrap();
     let base_q =
@@ -1716,6 +1727,7 @@ fn test_build_delta_sql_splice_uses_distinct_projection_for_compound_key() {
         partition_strategy: String::new(),
         anchor_source: String::new(),
         partition_join_paths: std::collections::HashMap::new(),
+        ignore_heal_keys: std::collections::HashMap::new(),
     };
     let agg_json = serde_json::to_string(&plan).unwrap();
     let base_q =
@@ -1791,6 +1803,7 @@ fn test_build_merge_sql_bool_or_algebraic_subtract() {
         partition_strategy: String::new(),
         anchor_source: String::new(),
         partition_join_paths: std::collections::HashMap::new(),
+        ignore_heal_keys: std::collections::HashMap::new(),
     };
     let delta = "SELECT grp, SUM(CASE WHEN (flag) THEN 1 ELSE 0 END) AS \"__bool_or_flag_true_count\", SUM(CASE WHEN (flag) IS NOT NULL THEN 1 ELSE 0 END) AS \"__bool_or_flag_nonnull_count\", COUNT(*) AS __ivm_count FROM src GROUP BY grp";
     let sql = build_merge_sql("intermediate", delta, &plan, DeltaOp::Subtract);
@@ -1867,6 +1880,7 @@ fn test_build_delta_sql_bool_or_has_no_recompute() {
         partition_strategy: String::new(),
         anchor_source: String::new(),
         partition_join_paths: std::collections::HashMap::new(),
+        ignore_heal_keys: std::collections::HashMap::new(),
     };
     let agg_json = serde_json::to_string(&plan).unwrap();
     let base_q = "SELECT grp, SUM(CASE WHEN (flag) THEN 1 ELSE 0 END) AS \"__bool_or_flag_true_count\", SUM(CASE WHEN (flag) IS NOT NULL THEN 1 ELSE 0 END) AS \"__bool_or_flag_nonnull_count\", COUNT(*) AS __ivm_count FROM t GROUP BY grp";
@@ -1916,6 +1930,7 @@ fn passthrough_plan(source: &str) -> AggregationPlan {
         partition_strategy: String::new(),
         anchor_source: String::new(),
         partition_join_paths: std::collections::HashMap::new(),
+        ignore_heal_keys: std::collections::HashMap::new(),
     }
 }
 
@@ -2332,6 +2347,7 @@ fn test_null_safe_in_handles_aliased_group_by_column() {
         partition_strategy: String::new(),
         anchor_source: String::new(),
         partition_join_paths: std::collections::HashMap::new(),
+        ignore_heal_keys: std::collections::HashMap::new(),
     };
     plan.group_by_aliases
         .insert("dp.id".to_string(), "dem_plan_id".to_string());

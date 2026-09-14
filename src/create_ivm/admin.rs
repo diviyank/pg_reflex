@@ -172,7 +172,8 @@ pub(crate) fn reflex_rebuild_imv_metadata_impl(view_name: &str) -> String {
     let result: Result<(usize, usize, usize), String> = Spi::connect_mut(|client| {
         let rows = client
             .select(
-                "SELECT base_query FROM public.__reflex_ivm_reference \
+                "SELECT base_query, partition_columns, ignored_sources \
+                 FROM public.__reflex_ivm_reference \
                  WHERE name = $1 AND enabled = TRUE",
                 None,
                 &[unsafe {
@@ -189,6 +190,17 @@ pub(crate) fn reflex_rebuild_imv_metadata_impl(view_name: &str) -> String {
             .map_err(|e| format!("read base_query: {}", e))?
             .unwrap_or("")
             .to_string();
+        let partition_columns: Vec<String> = rows[0]
+            .get_by_name::<Vec<String>, _>("partition_columns")
+            .unwrap_or(None)
+            .unwrap_or_default();
+        let ignored_clean: Vec<String> = rows[0]
+            .get_by_name::<Vec<String>, _>("ignored_sources")
+            .unwrap_or(None)
+            .unwrap_or_default()
+            .iter()
+            .map(|s| crate::sql_writer::registry::strip_ignore_ack_marker(s).to_string())
+            .collect();
 
         let parsed = Parser::parse_sql(&PostgreSqlDialect {}, &base_query)
             .map_err(|e| format!("parse base_query: {}", e))?;
@@ -250,6 +262,16 @@ pub(crate) fn reflex_rebuild_imv_metadata_impl(view_name: &str) -> String {
         let sjk_json = serde_json::to_string(&tmp_plan.source_join_keys)
             .map_err(|e| format!("serialize source_join_keys: {}", e))?;
         let n_sjk_sources = tmp_plan.source_join_keys.len();
+        let heal_keys = crate::heal::install_heal_triggers(
+            client,
+            view_name,
+            &analysis,
+            crate::sql_analyzer::statement_column_refs(&parsed).as_deref(),
+            &ignored_clean,
+            &partition_columns,
+        );
+        let heal_json = serde_json::to_string(&heal_keys)
+            .map_err(|e| format!("serialize ignore_heal_keys: {}", e))?;
 
         client
             .update(
@@ -257,19 +279,24 @@ pub(crate) fn reflex_rebuild_imv_metadata_impl(view_name: &str) -> String {
                  SET aggregations = jsonb_set( \
                        jsonb_set( \
                          jsonb_set( \
-                           aggregations::jsonb, \
-                           '{imv_relevant_columns}', \
-                           $1::jsonb, \
+                           jsonb_set( \
+                             aggregations::jsonb, \
+                             '{imv_relevant_columns}', \
+                             $1::jsonb, \
+                             TRUE \
+                           ), \
+                           '{imv_relevant_where}', \
+                           $2::jsonb, \
                            TRUE \
                          ), \
-                         '{imv_relevant_where}', \
-                         $2::jsonb, \
+                         '{source_join_keys}', \
+                         $4::jsonb, \
                          TRUE \
                        ), \
-                       '{source_join_keys}', \
-                       $4::jsonb, \
+                       '{ignore_heal_keys}', \
+                       $5::jsonb, \
                        TRUE \
-                     )::json \
+                     ) \
                  WHERE name = $3",
                 None,
                 &[
@@ -282,6 +309,7 @@ pub(crate) fn reflex_rebuild_imv_metadata_impl(view_name: &str) -> String {
                         )
                     },
                     unsafe { DatumWithOid::new(sjk_json, PgBuiltInOids::TEXTOID.oid().value()) },
+                    unsafe { DatumWithOid::new(heal_json, PgBuiltInOids::TEXTOID.oid().value()) },
                 ],
             )
             .map_err(|e| format!("update aggregations: {}", e))?;

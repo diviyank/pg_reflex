@@ -545,53 +545,54 @@ fn swi_silent_wipe_still_swaps_without_event_log_table() {
     );
 }
 
-/// I1 convergence: a 'rebuild' row must force the exact count (not the O(1)
-/// estimate) until the target is re-analyzed — and it MUST clear afterward,
-/// or the remedy the incident's stale_reason prescribes (reconcile, which
-/// ANALYZEs the target) would deepen the condition instead of repairing it.
-/// This is the point of the finding: without this test the ANALYZE-recency
-/// scoping is unverified.
+/// A slice-changing swap must not latch the exact-count branch. The swap ANALYZEs
+/// the leaf it rebuilt, so the partitioned IMV's leaf-summed estimate is already
+/// current when the rebuild is logged; before 1.11.4 the anomaly compared against
+/// the ROOT's last ANALYZE, which a partition swap never advances, so every
+/// status call on a routinely swapped IMV fell into `COUNT(*)` forever.
 #[pg_test]
-fn swi_rebuild_anomaly_clears_after_analyze() {
+fn swi_rebuild_anomaly_retires_on_the_swap_itself() {
     swi_build_fixture("validated");
-    Spi::run("UPDATE swi_dp SET status = 'creating_sop' WHERE id = 471").expect("SP window");
-    swi_month_swap();
+    Spi::run("CREATE TABLE swi_ss_471_feb_new (LIKE swi_ss_471_feb INCLUDING DEFAULTS)")
+        .expect("build detached");
+    Spi::run(
+        "INSERT INTO swi_ss_471_feb_new VALUES \
+           (471, '2026-02-10', 1, 1, 10), \
+           (471, '2026-02-20', 2, 1, 11), \
+           (471, '2026-02-25', 3, 1, 12)",
+    )
+    .expect("fill detached with one more row");
+    Spi::run("ALTER TABLE swi_ss_471 DETACH PARTITION swi_ss_471_feb").expect("detach old");
+    Spi::run(
+        "ALTER TABLE swi_ss_471 ATTACH PARTITION swi_ss_471_feb_new \
+         FOR VALUES FROM ('2026-02-01') TO ('2026-03-01')",
+    )
+    .expect("attach new");
+    Spi::run("DROP TABLE swi_ss_471_feb").expect("drop old");
+    Spi::run("ALTER TABLE swi_ss_471_feb_new RENAME TO swi_ss_471_feb").expect("rename");
     Spi::run("SET CONSTRAINTS ALL IMMEDIATE").expect("drain partition queue");
     let _ = Spi::get_one::<String>("SELECT reflex_flush_partitions()").expect("flush");
     assert_eq!(
         swi_event_rows("swi_imv"),
         1,
-        "precondition: the wipe logged exactly one rebuild row"
+        "precondition: the count-changing swap logged exactly one rebuild row"
     );
 
     let (rc, est) = Spi::get_two::<i64, bool>(
         "SELECT row_count, is_estimate FROM reflex_ivm_status() WHERE name = 'swi_imv'",
     )
-    .expect("status before analyze");
+    .expect("status after swap");
     assert_eq!(
         est,
-        Some(false),
-        "a rebuild row newer than the last ANALYZE must force the exact count"
-    );
-    assert!(rc.is_some(), "row_count must still be reported while forced exact");
-
-    Spi::run("ANALYZE swi_imv").expect("analyze the target");
-    // pg_stat_all_tables is snapshotted once per transaction; the whole test
-    // runs inside pg_test's single wrapping transaction, so without this the
-    // ANALYZE above is invisible to the next query in THIS test only — a
-    // harness artifact, not something a real caller (a fresh statement in a
-    // fresh transaction) would ever need.
-    Spi::run("SELECT pg_stat_clear_snapshot()").expect("clear stats snapshot");
-    let (_, est_after) = Spi::get_two::<i64, bool>(
-        "SELECT row_count, is_estimate FROM reflex_ivm_status() WHERE name = 'swi_imv'",
-    )
-    .expect("status after analyze");
-    assert_eq!(
-        est_after,
         Some(true),
-        "ANALYZE-ing the target (what reconcile does) must clear the rebuild \
-         anomaly and restore the O(1) estimate — this is what makes reconcile \
-         an actual repair instead of a remedy that deepens its own finding"
+        "the swap ANALYZEd the rebuilt leaf, so the rebuild is resolved without \
+         any further ANALYZE and the O(1) estimate applies"
+    );
+    assert_eq!(
+        rc,
+        Some(swi_imv_rows()),
+        "the partitioned IMV's estimate, summed from its leaves, must match the \
+         true count after the swap"
     );
 }
 
