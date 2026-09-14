@@ -207,9 +207,18 @@ fn reflex_ivm_status() -> TableIterator<
         Spi::get_one::<bool>("SELECT to_regclass('public.__reflex_event_log') IS NOT NULL AS ok")
             .unwrap_or(Some(false))
             .unwrap_or(false);
+    let capped = capped_source_by_imv();
     let rows: Vec<IvmStatusRow> = rows
         .into_iter()
         .map(|mut row| {
+            if let Some(source) = capped.get(&row.0) {
+                let reason = source.stale_reason();
+                row.11 = Some(match (row.10, row.11.take()) {
+                    (true, Some(stored)) => format!("{stored} | {reason}"),
+                    _ => reason,
+                });
+                row.10 = true;
+            }
             let name = &row.0;
             let name_lit = name.replace('\'', "''");
             let has_unresolved_rebuild = event_log_exists
@@ -257,6 +266,88 @@ fn reflex_ivm_status() -> TableIterator<
         .collect();
 
     TableIterator::new(rows)
+}
+
+/// A partition source root the flush has given up on, as seen by one IMV.
+struct CappedSource {
+    root: String,
+    failures: i32,
+    last_error: String,
+}
+
+impl CappedSource {
+    fn stale_reason(&self) -> String {
+        format!(
+            "partition flush for source '{root}' is suspended after {failures} consecutive \
+             failures (last error: {err}); changes to it are not reaching this IMV. Fix the \
+             cause, then run SELECT reflex_reset_partition_failures('{root}'); \
+             SELECT reflex_flush_partition_source('{root}');",
+            root = self.root,
+            failures = self.failures,
+            err = self.last_error,
+        )
+    }
+}
+
+/// Every IMV that depends, directly or through other IMVs, on a partition source
+/// root at `PARTITION_FLUSH_FAILURE_CAP`.
+///
+/// Both flush entry points skip a capped root, so none of its changes reach those
+/// IMVs. The registry cannot carry this: a full reconcile clears `known_stale`
+/// while the root stays capped, which is how dev tenants reported healthy IMVs
+/// that had not been maintained for weeks. Derived live from the queue instead,
+/// so the report clears exactly when the root drains.
+fn capped_source_by_imv() -> std::collections::HashMap<String, CappedSource> {
+    let sql = format!(
+        "WITH RECURSIVE capped AS ( \
+             SELECT source_root, failures, COALESCE(last_error, 'unknown') AS last_error \
+             FROM public.__reflex_partition_pending \
+             WHERE failures >= {cap} \
+         ), reach(name, source_root, failures, last_error, depth) AS ( \
+             SELECT r.name, c.source_root, c.failures, c.last_error, 1 \
+             FROM capped c \
+             JOIN public.__reflex_ivm_reference r \
+               ON r.depends_on && ARRAY[c.source_root, split_part(c.source_root, '.', 2)] \
+             UNION \
+             SELECT r.name, x.source_root, x.failures, x.last_error, x.depth + 1 \
+             FROM reach x \
+             JOIN public.__reflex_ivm_reference r \
+               ON r.depends_on && ARRAY[x.name, split_part(x.name, '.', 2), 'public.' || x.name] \
+             WHERE x.depth < 32 \
+         ) \
+         SELECT DISTINCT ON (name) name, source_root, failures, last_error \
+         FROM reach ORDER BY name, depth, source_root",
+        cap = crate::partition::PARTITION_FLUSH_FAILURE_CAP,
+    );
+    Spi::connect(|client| {
+        let mut by_imv = std::collections::HashMap::new();
+        let Ok(rows) = client.select(&sql, None, &[]) else {
+            return by_imv;
+        };
+        for row in rows {
+            let name = row.get_by_name::<String, _>("name").ok().flatten();
+            let root = row.get_by_name::<String, _>("source_root").ok().flatten();
+            if let (Some(name), Some(root)) = (name, root) {
+                by_imv.insert(
+                    name,
+                    CappedSource {
+                        root,
+                        failures: row
+                            .get_by_name::<i32, _>("failures")
+                            .ok()
+                            .flatten()
+                            .unwrap_or(0),
+                        last_error: row
+                            .get_by_name::<String, _>("last_error")
+                            .ok()
+                            .flatten()
+                            .unwrap_or_else(|| "unknown".to_string()),
+                    },
+                );
+            }
+        }
+        by_imv
+    })
 }
 
 /// Detailed stats for a single IMV: intermediate size, target size, index count,
