@@ -2179,9 +2179,9 @@ pub(crate) fn create_reflex_ivm_impl_with_materialization(
 
 mod admin;
 mod decompose;
-/// A1 create-time `ignore_sources` soundness check. Crate-visible so the planned
-/// audit finding for unsound ignores can call `unsound_ignored_sources` from
-/// `crate::audit` without re-implementing the resolver.
+/// A1 create-time `ignore_sources` soundness check. Crate-visible because the
+/// `ignore-soundness` audit check calls `unsound_ignored_sources` from
+/// `crate::audit` rather than re-implementing the resolver.
 pub(crate) mod ignore_soundness;
 mod soundness;
 
