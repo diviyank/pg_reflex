@@ -58,6 +58,8 @@ SELECT reflex_heal_ignored_sources('<imv>');
 
 Schedule [`reflex_scheduled_reconcile`](../api/reflex_scheduled_reconcile.md) or `reflex_heal_ignored_sources()` with pg_cron so the window stays short. A row with `last_error` set failed to heal. Fix the cause and re-run.
 
+If `stale_reason` says the ignored source was truncated, run the `reflex_reconcile` it prints. If it says the source no longer has a column, the IMV's query refers to a column that was renamed or dropped: recreate the IMV against the current columns.
+
 If the IMV is wrong but nothing is queued, the ignored source cannot be mapped to partitions (see [which ignored sources heal](../api/reflex_heal_ignored_sources.md#which-ignored-sources-heal)), or it predates 1.11.4 and was not backfilled. Run `SELECT reflex_rebuild_imv_metadata('<imv>');` to install the heal triggers, and `SELECT reflex_reconcile('<imv>');` to repair it now.
 
 ## IMV drifted after a crash
