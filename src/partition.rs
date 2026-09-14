@@ -61,7 +61,7 @@ pub(crate) const PARTITION_FLUSH_FAILURE_CAP: i32 = 5;
 /// this subtransaction is an inner scope whose own `Drop` has already run
 /// `SPI_finish`. That is the same state plpgsql's `PG_CATCH` is in when it calls
 /// `RollbackAndReleaseCurrentSubTransaction`.
-struct SubTransaction {
+pub(crate) struct SubTransaction {
     memory_context: pgrx::pg_sys::MemoryContext,
     resource_owner: pgrx::pg_sys::ResourceOwner,
     /// Whether `Drop` still owes a rollback. Cleared BEFORE the FFI call, not
@@ -70,7 +70,7 @@ struct SubTransaction {
 }
 
 impl SubTransaction {
-    fn begin() -> Self {
+    pub(crate) fn begin() -> Self {
         unsafe {
             let memory_context = pgrx::pg_sys::CurrentMemoryContext;
             let resource_owner = pgrx::pg_sys::CurrentResourceOwner;
@@ -86,7 +86,7 @@ impl SubTransaction {
 
     /// Commit: everything done inside becomes part of the enclosing
     /// transaction, and locks taken inside are reassigned to it.
-    fn release(mut self) {
+    pub(crate) fn release(mut self) {
         self.close(true);
     }
 
@@ -1872,7 +1872,7 @@ fn drop_bound_collision_orphan(
 /// subtransaction is opened on both paths.
 pub(crate) fn reflex_reconcile_partition_impl(
     view_name: &str,
-    partition_keys_csv: &str,
+    partition_keys: &[String],
     source_partition: &str,
     skip_sync: bool,
 ) -> String {
@@ -2015,11 +2015,7 @@ pub(crate) fn reflex_reconcile_partition_impl(
                 }
             }
         } else {
-            let keys: Vec<String> = partition_keys_csv
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect();
+            let keys = partition_keys;
             if keys.is_empty() {
                 return Err(
                     "reconcile_partition: empty partition_keys (or pass source_partition)"
@@ -2027,7 +2023,7 @@ pub(crate) fn reflex_reconcile_partition_impl(
                 );
             }
             let tgt_children = list_partition_children(client, &tgt_parent);
-            for key in &keys {
+            for key in keys {
                 let child_match = tgt_children.iter().find(|c| {
                     let oid_q =
                         "SELECT pg_get_partition_constraintdef(to_regclass($1)::oid) AS def";
@@ -2082,7 +2078,7 @@ pub(crate) fn reflex_reconcile_partition_impl(
         if to_process.is_empty() {
             return Ok(format!(
                 "reconcile_partition: no children matched (keys={:?}, source_partition={:?})",
-                partition_keys_csv, source_partition
+                partition_keys, source_partition
             ));
         }
 
@@ -2132,12 +2128,8 @@ pub(crate) fn reflex_reconcile_partition_impl(
         // keys when called by key; otherwise derived from the reconciled
         // parent's target children (the swap-fill / flush path passes a source
         // partition, not keys).
-        let affected_keys: Vec<String> = if !partition_keys_csv.trim().is_empty() {
-            partition_keys_csv
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect()
+        let affected_keys: Vec<String> = if !partition_keys.is_empty() {
+            partition_keys.to_vec()
         } else {
             let mut set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
             for child_bare in &to_process {
@@ -2216,11 +2208,14 @@ pub(crate) fn reflex_reconcile_partition_impl(
             // We can't reflex_reconcile_partition / reflex_reconcile from
             // inside this SPI scope directly — call the inner impls in a
             // fresh SPI session by deferring via PERFORM at SQL level.
-            if same_part {
+            // The SQL entry point takes comma-separated keys, so a key containing a
+            // comma cannot cross it; such a dependent takes the full reconcile below.
+            let keys_fit_csv = !partition_keys.iter().any(|k| k.contains(','));
+            if same_part && keys_fit_csv {
                 let q = format!(
                     "SELECT public.reflex_reconcile_partition({}, {})",
                     sql_literal_text(child),
-                    sql_literal_text(partition_keys_csv)
+                    sql_literal_text(&partition_keys.join(","))
                 );
                 let _ = client.update(&q, None, &[]);
             } else if let Some(scoped) = build_scoped_cascade_reconcile(

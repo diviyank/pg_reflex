@@ -340,55 +340,82 @@ extension_sql!(
     );
 
     -- Statement trigger on an ignored source. Queues the partition keys of the
-    -- changed rows for every IMV whose `ignore_heal_keys` names this relation.
-    -- An UPDATE queues only keys whose watched columns (every column of the
-    -- source the query references) changed; with no watched list, or when
-    -- that diff cannot be computed (a column type without equality), every
-    -- touched key is queued. Re-queuing a key re-stamps it, so a heal that
-    -- read the older stamp leaves it queued.
+    -- changed rows for every enabled IMV whose `ignore_heal_keys` names this
+    -- relation, rendered by `to_jsonb` so a key never depends on the writer's
+    -- DateStyle. An UPDATE queues only keys whose watched columns (every column
+    -- of the source the query references, compared as text) changed; with no
+    -- watched list every touched key is queued. Re-queuing a key re-stamps it,
+    -- so a heal that read the older stamp leaves it queued.
+    --
+    -- It must never fail or tax the caller's write: SECURITY DEFINER with a
+    -- pinned search_path, so writers need no pg_reflex grant; no EXCEPTION
+    -- block, which would cost a subtransaction per statement; and a TRUNCATE,
+    -- or a mapped or watched column that no longer exists, marks the IMV
+    -- known_stale instead of raising.
     CREATE OR REPLACE FUNCTION public.__reflex_heal_on_ignored_change()
-    RETURNS trigger LANGUAGE plpgsql AS $fn$
+    RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $fn$
     DECLARE
         _h RECORD;
-        _all_keys TEXT;
-        _changed_keys TEXT;
+        _missing TEXT;
+        _key TEXT;
+        _keys TEXT;
         _cols TEXT;
-        _enqueue CONSTANT TEXT :=
-            'INSERT INTO public.__reflex_heal_pending (imv_name, partition_key, source) '
-            || 'SELECT DISTINCT $1, k, $2 FROM (%s) s(k) WHERE k IS NOT NULL '
-            || 'ON CONFLICT (imv_name, partition_key) DO UPDATE '
-            || 'SET enqueued_at = clock_timestamp(), source = EXCLUDED.source, last_error = NULL';
     BEGIN
         FOR _h IN
             SELECT r.name, k.key AS source, k.value->>'source_column' AS source_col,
                    ARRAY(SELECT jsonb_array_elements_text(
-                             COALESCE(k.value->'watched_columns', '[]'::jsonb))) AS relevant
+                             COALESCE(k.value->'watched_columns', '[]'::jsonb))) AS watched
               FROM public.__reflex_ivm_reference r
              CROSS JOIN LATERAL jsonb_each(COALESCE(r.aggregations->'ignore_heal_keys', '{}'::jsonb)) k
              WHERE COALESCE(r.enabled, TRUE)
                AND to_regclass(k.value->>'relation') = TG_RELID
         LOOP
-            _all_keys := CASE TG_OP
-                WHEN 'INSERT' THEN format('SELECT %I::text FROM __reflex_heal_new', _h.source_col)
-                WHEN 'DELETE' THEN format('SELECT %I::text FROM __reflex_heal_old', _h.source_col)
-                ELSE format('SELECT %1$I::text FROM __reflex_heal_old UNION SELECT %1$I::text FROM __reflex_heal_new',
-                            _h.source_col)
-            END;
-            IF TG_OP = 'UPDATE' AND cardinality(_h.relevant) > 0 THEN
-                SELECT string_agg(format('%I', c), ', ') INTO _cols
-                  FROM (SELECT DISTINCT unnest(_h.relevant || _h.source_col) AS c) s;
-                _changed_keys := format(
-                    'SELECT %1$I::text FROM ((SELECT %2$s FROM __reflex_heal_old EXCEPT SELECT %2$s FROM __reflex_heal_new) '
-                    || 'UNION ALL (SELECT %2$s FROM __reflex_heal_new EXCEPT SELECT %2$s FROM __reflex_heal_old)) d',
-                    _h.source_col, _cols);
-                BEGIN
-                    EXECUTE format(_enqueue, _changed_keys) USING _h.name, _h.source;
-                    CONTINUE;
-                EXCEPTION WHEN undefined_function THEN
-                    NULL;
-                END;
+            IF TG_OP = 'TRUNCATE' THEN
+                UPDATE public.__reflex_ivm_reference
+                   SET known_stale = TRUE,
+                       stale_reason = format('ignored source %s was truncated, which no heal can scope. '
+                                             || 'Run SELECT reflex_reconcile(%L);', TG_RELID::regclass, _h.name)
+                 WHERE name = _h.name;
+                CONTINUE;
             END IF;
-            EXECUTE format(_enqueue, _all_keys) USING _h.name, _h.source;
+            SELECT string_agg(c, ', ') INTO _missing
+              FROM unnest(_h.watched || _h.source_col) AS c
+             WHERE NOT EXISTS (SELECT 1 FROM pg_attribute a
+                                WHERE a.attrelid = TG_RELID AND a.attname = c
+                                  AND a.attnum > 0 AND NOT a.attisdropped);
+            IF _missing IS NOT NULL THEN
+                UPDATE public.__reflex_ivm_reference
+                   SET known_stale = TRUE,
+                       stale_reason = format('ignored source %s no longer has column(s) %s, so its changes '
+                                             || 'can no longer be healed. Recreate the IMV against its '
+                                             || 'current columns.', TG_RELID::regclass, _missing)
+                 WHERE name = _h.name;
+                CONTINUE;
+            END IF;
+            _key := format('to_jsonb(%I) #>> ''{}''', _h.source_col);
+            IF TG_OP = 'INSERT' THEN
+                _keys := format('SELECT %s FROM __reflex_heal_new', _key);
+            ELSIF TG_OP = 'DELETE' THEN
+                _keys := format('SELECT %s FROM __reflex_heal_old', _key);
+            ELSIF cardinality(_h.watched) = 0 THEN
+                _keys := format('SELECT %1$s FROM __reflex_heal_old UNION SELECT %1$s FROM __reflex_heal_new', _key);
+            ELSE
+                SELECT string_agg(format('%I::text', c), ', ') INTO _cols FROM unnest(_h.watched) AS c;
+                _keys := format(
+                    'SELECT d.__reflex_heal_key FROM ('
+                    || '(SELECT %1$s AS __reflex_heal_key, %2$s FROM __reflex_heal_old '
+                    || 'EXCEPT SELECT %1$s, %2$s FROM __reflex_heal_new) UNION ALL '
+                    || '(SELECT %1$s, %2$s FROM __reflex_heal_new '
+                    || 'EXCEPT SELECT %1$s, %2$s FROM __reflex_heal_old)) d',
+                    _key, _cols);
+            END IF;
+            EXECUTE format(
+                'INSERT INTO public.__reflex_heal_pending (imv_name, partition_key, source) '
+                || 'SELECT DISTINCT $1, k, $2 FROM (%s) s(k) WHERE k IS NOT NULL '
+                || 'ON CONFLICT (imv_name, partition_key) DO UPDATE '
+                || 'SET enqueued_at = clock_timestamp(), source = EXCLUDED.source, last_error = NULL',
+                _keys)
+            USING _h.name, _h.source;
         END LOOP;
         RETURN NULL;
     END;
@@ -725,9 +752,14 @@ fn reflex_reconcile_partition(
     source_partition: default!(&str, "''"),
     skip_sync: default!(bool, "FALSE"),
 ) -> String {
+    let partition_keys: Vec<String> = partition_keys
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
     partition::reflex_reconcile_partition_impl(
         view_name,
-        partition_keys,
+        &partition_keys,
         source_partition,
         skip_sync,
     )

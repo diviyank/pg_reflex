@@ -2062,7 +2062,6 @@ pub(crate) fn create_reflex_ivm_impl_with_materialization(
         parsed_sql,
         mut analysis,
     } = parsed;
-    let column_refs = crate::sql_analyzer::statement_column_refs(&parsed_sql);
 
     // Resolve every bare source against the current `search_path` so the
     // identifiers stored in `__reflex_ivm_reference.depends_on`, baked into the
@@ -2173,7 +2172,7 @@ pub(crate) fn create_reflex_ivm_impl_with_materialization(
             client,
             ctx.view_name,
             &ctx.analysis,
-            column_refs.as_deref(),
+            &parsed_sql,
             &ignored_clean,
             &ctx.plan.partition_columns,
         );

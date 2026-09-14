@@ -684,3 +684,62 @@ fn dfx_prune_event_log_removes_only_old_rows() {
     assert_eq!(removed, 1);
     assert_eq!(swi_event_rows("dfx_imv"), 0);
 }
+
+/// Adversarial review F7: a new, still empty source partition creates an IMV leaf
+/// that is never analyzed. Its zero rows are known without ANALYZE, so the IMV
+/// keeps the O(1) estimate.
+#[pg_test]
+fn swi_new_empty_partition_keeps_the_estimate() {
+    swi_build_fixture("validated");
+    Spi::run("ANALYZE swi_imv").expect("analyze");
+    Spi::run(
+        "CREATE TABLE swi_ss_471_apr PARTITION OF swi_ss_471 \
+         FOR VALUES FROM ('2026-04-01') TO ('2026-05-01')",
+    )
+    .expect("add an empty month");
+    Spi::run("SET CONSTRAINTS ALL IMMEDIATE").expect("drain partition queue");
+    let _ = Spi::get_one::<String>("SELECT reflex_flush_partitions()").expect("flush");
+    let unanalyzed: i64 = Spi::get_one(
+        "SELECT count(*)::int8 FROM pg_partition_tree('swi_imv') t \
+           JOIN pg_class c ON c.oid = t.relid WHERE t.isleaf AND c.reltuples < 0",
+    )
+    .expect("leaf query")
+    .unwrap_or(0);
+    assert!(unanalyzed >= 1, "precondition: the mirrored empty leaf is unanalyzed");
+
+    let (rc, est) = Spi::get_two::<i64, bool>(
+        "SELECT row_count, is_estimate FROM reflex_ivm_status() WHERE name = 'swi_imv'",
+    )
+    .expect("status");
+    assert_eq!(est, Some(true), "an empty unanalyzed leaf must not force an exact count");
+    assert_eq!(rc, Some(swi_imv_rows()), "and the estimate is right");
+}
+
+/// Adversarial review F8: attaching a month with data fills the fresh IMV leaf in
+/// place; that path's rebuild event must retire on its own ANALYZE too.
+#[pg_test]
+fn swi_in_place_fill_retires_its_rebuild_event() {
+    swi_build_fixture("validated");
+    Spi::run("CREATE TABLE swi_ss_471_apr (LIKE swi_ss_471_feb INCLUDING DEFAULTS)")
+        .expect("build detached month");
+    Spi::run(
+        "INSERT INTO swi_ss_471_apr VALUES (471, '2026-04-10', 1, 1, 7), (471, '2026-04-20', 2, 1, 8)",
+    )
+    .expect("fill detached month");
+    Spi::run(
+        "ALTER TABLE swi_ss_471 ATTACH PARTITION swi_ss_471_apr \
+         FOR VALUES FROM ('2026-04-01') TO ('2026-05-01')",
+    )
+    .expect("attach with data");
+    Spi::run("SET CONSTRAINTS ALL IMMEDIATE").expect("drain partition queue");
+    let _ = Spi::get_one::<String>("SELECT reflex_flush_partitions()").expect("flush");
+    assert_eq!(swi_imv_rows_for(471), 5, "precondition: the attached month is mirrored");
+    assert_eq!(swi_event_rows("swi_imv"), 1, "precondition: the fill logged one rebuild");
+
+    let (rc, est) = Spi::get_two::<i64, bool>(
+        "SELECT row_count, is_estimate FROM reflex_ivm_status() WHERE name = 'swi_imv'",
+    )
+    .expect("status");
+    assert_eq!(est, Some(true), "the in-place fill ANALYZEd its leaf after stamping the event");
+    assert_eq!(rc, Some(swi_imv_rows()), "and the estimate is right");
+}

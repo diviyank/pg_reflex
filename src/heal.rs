@@ -75,11 +75,12 @@ fn bare_name(name: &str) -> String {
 ///
 /// Refuses (omits the source) whenever a changed source row could affect a
 /// partition other than its own key: an OR in the join condition, a join type
-/// that preserves the ignored side's unmatched rows, or the source appearing
-/// under more than one alias.
+/// that preserves the ignored side's unmatched rows, or the source read more than
+/// once anywhere in the statement (`relation_names` has one entry per read).
 fn heal_candidates(
     analysis: &crate::sql_analyzer::SqlAnalysis,
     column_refs: Option<&[Vec<String>]>,
+    relation_names: &[String],
     ignored_clean: &[String],
     partition_columns: &[String],
 ) -> HashMap<String, HealCandidate> {
@@ -113,7 +114,11 @@ fn heal_candidates(
             })
             .map(|(alias, _)| alias.to_lowercase())
             .collect();
-        if aliases.len() > 1 {
+        let reads = relation_names
+            .iter()
+            .filter(|name| bare_name(name) == source_bare)
+            .count();
+        if aliases.len() > 1 || reads != 1 {
             continue;
         }
 
@@ -167,18 +172,31 @@ fn heal_candidates(
 /// trigger matches it by OID whatever search_path the writer runs under. A
 /// source the caller may not put a trigger on gets no heal, with a WARNING,
 /// rather than failing the create.
+///
+/// The source column's type must render keys the partition column parses back
+/// to the same value: the same type, two integer types, or two string types.
+/// Otherwise (e.g. `numeric` 5.0 against a `bigint` partition) no heal.
 pub(crate) fn install_heal_triggers(
     client: &mut pgrx::spi::SpiClient<'_>,
     view_name: &str,
     analysis: &crate::sql_analyzer::SqlAnalysis,
-    column_refs: Option<&[Vec<String>]>,
+    stmts: &[sqlparser::ast::Statement],
     ignored_clean: &[String],
     partition_columns: &[String],
 ) -> HashMap<String, IgnoreHealKey> {
     let mut installed = HashMap::new();
-    for (source, candidate) in
-        heal_candidates(analysis, column_refs, ignored_clean, partition_columns)
-    {
+    let Some(partition_column) = partition_columns.first() else {
+        return installed;
+    };
+    let column_refs = crate::sql_analyzer::statement_column_refs(stmts);
+    let relation_names = crate::sql_analyzer::statement_relation_names(stmts);
+    for (source, candidate) in heal_candidates(
+        analysis,
+        column_refs.as_deref(),
+        &relation_names,
+        ignored_clean,
+        partition_columns,
+    ) {
         let resolved = client
             .select(
                 "SELECT format('%I.%I', n.nspname, c.relname) AS rel, \
@@ -189,8 +207,18 @@ pub(crate) fn install_heal_triggers(
                                ORDER BY a.attnum) AS watched \
                    FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
                   WHERE c.oid = to_regclass($1) AND c.relkind IN ('r', 'p') \
-                    AND EXISTS (SELECT 1 FROM pg_attribute a WHERE a.attrelid = c.oid \
-                                 AND a.attname = $2 AND a.attnum > 0 AND NOT a.attisdropped)",
+                    AND EXISTS ( \
+                        SELECT 1 FROM pg_attribute s \
+                          JOIN pg_type st ON st.oid = s.atttypid \
+                          JOIN pg_attribute p ON p.attrelid = to_regclass($4) AND p.attname = $5 \
+                                             AND p.attnum > 0 AND NOT p.attisdropped \
+                          JOIN pg_type pt ON pt.oid = p.atttypid \
+                         WHERE s.attrelid = c.oid AND s.attname = $2 \
+                           AND s.attnum > 0 AND NOT s.attisdropped \
+                           AND (s.atttypid = p.atttypid \
+                                OR (s.atttypid IN ('int2'::regtype, 'int4'::regtype, 'int8'::regtype) \
+                                    AND p.atttypid IN ('int2'::regtype, 'int4'::regtype, 'int8'::regtype)) \
+                                OR (st.typcategory = 'S' AND pt.typcategory = 'S')))",
                 Some(1),
                 &[
                     unsafe {
@@ -206,6 +234,15 @@ pub(crate) fn install_heal_triggers(
                         DatumWithOid::new(
                             candidate.watched_candidates.clone().unwrap_or_default(),
                             PgBuiltInOids::TEXTARRAYOID.oid().value(),
+                        )
+                    },
+                    unsafe {
+                        DatumWithOid::new(view_name.to_string(), PgBuiltInOids::TEXTOID.oid().value())
+                    },
+                    unsafe {
+                        DatumWithOid::new(
+                            partition_column.to_lowercase(),
+                            PgBuiltInOids::TEXTOID.oid().value(),
                         )
                     },
                 ],
@@ -241,24 +278,25 @@ pub(crate) fn install_heal_triggers(
             (
                 "__reflex_heal_ins",
                 "INSERT",
-                "NEW TABLE AS __reflex_heal_new",
+                "REFERENCING NEW TABLE AS __reflex_heal_new",
             ),
             (
                 "__reflex_heal_upd",
                 "UPDATE",
-                "OLD TABLE AS __reflex_heal_old NEW TABLE AS __reflex_heal_new",
+                "REFERENCING OLD TABLE AS __reflex_heal_old NEW TABLE AS __reflex_heal_new",
             ),
             (
                 "__reflex_heal_del",
                 "DELETE",
-                "OLD TABLE AS __reflex_heal_old",
+                "REFERENCING OLD TABLE AS __reflex_heal_old",
             ),
+            ("__reflex_heal_trunc", "TRUNCATE", ""),
         ] {
             client
                 .update(
                     &format!(
                         "CREATE OR REPLACE TRIGGER {name} AFTER {event} ON {relation} \
-                         REFERENCING {transition} FOR EACH STATEMENT \
+                         {transition} FOR EACH STATEMENT \
                          EXECUTE FUNCTION public.__reflex_heal_on_ignored_change()"
                     ),
                     None,
@@ -314,7 +352,8 @@ pub(crate) fn heal_ignored_sources_impl(imv: Option<&str>, target_schema: &str) 
                         array_agg(p.partition_key ORDER BY p.partition_key) AS keys, \
                         array_agg(p.enqueued_at::text ORDER BY p.partition_key) AS stamps \
                    FROM public.__reflex_heal_pending p \
-                   LEFT JOIN public.__reflex_ivm_reference r ON r.name = p.imv_name \
+                   JOIN public.__reflex_ivm_reference r \
+                     ON r.name = p.imv_name AND COALESCE(r.enabled, TRUE) \
                   WHERE ($1::text IS NULL OR p.imv_name = $1) \
                     AND ($2 = '' OR COALESCE(r.target_schema, 'public') = $2) \
                   GROUP BY p.imv_name, r.graph_depth \
@@ -352,12 +391,7 @@ pub(crate) fn heal_ignored_sources_impl(imv: Option<&str>, target_schema: &str) 
         .into_iter()
         .map(|(name, keys, stamps)| {
             let started = std::time::Instant::now();
-            let result = crate::partition::reflex_reconcile_partition_impl(
-                &name,
-                &keys.join(","),
-                "",
-                false,
-            );
+            let result = reconcile_keys_isolated(&name, &keys);
             let heal = HealResult {
                 imv: name,
                 result,
@@ -367,6 +401,31 @@ pub(crate) fn heal_ignored_sources_impl(imv: Option<&str>, target_schema: &str) 
             heal
         })
         .collect()
+}
+
+/// Rebuild `keys` of `imv` in a subtransaction. A PostgreSQL error raised inside
+/// (a key the partition column cannot parse, say) rolls back only this heal and
+/// comes back as an `ERROR:` string, so one bad IMV cannot abort the sweep and its
+/// failure is recorded like any other.
+fn reconcile_keys_isolated(imv: &str, keys: &[String]) -> String {
+    pgrx::PgTryBuilder::new(|| {
+        let subxact = crate::partition::SubTransaction::begin();
+        let result = crate::partition::reflex_reconcile_partition_impl(imv, keys, "", false);
+        subxact.release();
+        result
+    })
+    .catch_others(|error| {
+        use pgrx::pg_sys::panic::CaughtError;
+        let message = match &error {
+            CaughtError::PostgresError(report)
+            | CaughtError::ErrorReport(report)
+            | CaughtError::RustPanic {
+                ereport: report, ..
+            } => report.message().to_string(),
+        };
+        format!("ERROR: {message}")
+    })
+    .execute()
 }
 
 fn record_heal_outcome(heal: &HealResult, keys: Vec<String>, stamps: Vec<String>) {
@@ -427,8 +486,9 @@ fn reflex_heal_ignored_sources(imv: default!(Option<&str>, "NULL")) -> String {
     }
 }
 
-/// The IMVs with queued heals, by name, with the ignored sources that queued
-/// them, the queued keys and the oldest enqueue time.
+/// The enabled IMVs with queued heals, by name, with the ignored sources that
+/// queued them, the queued keys and the oldest enqueue time. A disabled IMV's
+/// keys wait for it to be enabled; nothing heals or reports them meanwhile.
 pub(crate) struct QueuedHeal {
     pub sources: String,
     pub keys: String,
@@ -445,10 +505,13 @@ pub(crate) fn queued_heals_by_imv() -> BTreeMap<String, QueuedHeal> {
     }
     Spi::connect(|client| {
         let Ok(rows) = client.select(
-            "SELECT imv_name, string_agg(DISTINCT source, ', ') AS sources, \
-                    string_agg(partition_key, ', ' ORDER BY partition_key) AS keys, \
-                    min(enqueued_at)::text AS since \
-               FROM public.__reflex_heal_pending GROUP BY imv_name",
+            "SELECT p.imv_name, string_agg(DISTINCT p.source, ', ') AS sources, \
+                    string_agg(p.partition_key, ', ' ORDER BY p.partition_key) AS keys, \
+                    min(p.enqueued_at)::text AS since \
+               FROM public.__reflex_heal_pending p \
+               JOIN public.__reflex_ivm_reference r \
+                 ON r.name = p.imv_name AND COALESCE(r.enabled, TRUE) \
+              GROUP BY p.imv_name",
             None,
             &[],
         ) else {
