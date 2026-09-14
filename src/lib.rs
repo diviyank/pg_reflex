@@ -1713,6 +1713,7 @@ mod tests {
     include!("tests/pg_test_qualified_groupby_qualifier.rs");
     include!("tests/pg_test_status_window_wipe.rs");
     include!("tests/pg_test_ignore_soundness.rs");
+    include!("tests/pg_test_capped_source_status.rs");
 }
 
 /// This module is required by `cargo pgrx test` invocations.
