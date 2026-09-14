@@ -37,12 +37,19 @@ with no error, no `known_stale`, and the pre-wipe `reltuples` in `reflex_ivm_sta
 2. **Unmappable ignored sources get no heal.** An ignored source that does not join by a
    top-level equality onto the expression the first partition column projects (an
    `OR` in the condition, a `RIGHT` / `FULL` join, a source read more than once,
-   `USING`, a comma join filtered in `WHERE`, a key type that differs from the partition
-   column's, a non-partitioned IMV) keeps the pre-1.11.4 contract. Its create is
-   refused unless acknowledged, so that is an accepted risk, but nothing reports a
-   change to it.
+   `USING`, a comma join filtered in `WHERE`, a key of a user-defined type or of a type
+   other than the partition column's (bar integer pairs and `text`/`varchar`), a
+   non-partitioned IMV) keeps the pre-1.11.4 contract. Its create is refused unless
+   acknowledged, so that is an accepted risk, but nothing reports a change to it.
 3. **Writes addressed directly to a partition of a partitioned ignored source** queue
    nothing, as for the regular maintenance triggers, which are also on the root only.
+4. **A second read of the ignored source hidden in a SQL function body** is invisible
+   to the single-read check, so such a source is still mapped and a change seen only
+   through the function's read can be missed.
+5. **The heal helpers are callable by any role.** `__reflex_heal_enqueue` lets a role
+   with no rights on the source queue keys for IMVs mapped to it. That costs partition
+   rebuilds that restore what the query returns, never wrong data;
+   `__reflex_heal_mark_truncated` acts only on an empty source.
 
 (`TRUNCATE` of a mapped ignored source is reported: it marks the IMV `known_stale`.)
 
