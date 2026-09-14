@@ -129,6 +129,7 @@ nav:
       - reflex_doctor: api/reflex_doctor.md
       - reflex_ack_ignore_source: api/reflex_ack_ignore_source.md
       - reflex_prune_event_log: api/reflex_prune_event_log.md
+      - reflex_heal_ignored_sources: api/reflex_heal_ignored_sources.md
       - refresh_imv_depending_on: api/refresh_imv_depending_on.md
       - reflex_flush_deferred: api/reflex_flush_deferred.md
       - reflex_scheduled_reconcile: api/reflex_scheduled_reconcile.md
