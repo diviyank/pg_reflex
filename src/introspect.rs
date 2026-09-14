@@ -252,14 +252,16 @@ fn reflex_ivm_status() -> TableIterator<
                 (c, false)
             } else {
                 // A partitioned parent's own reltuples is never maintained by a
-                // leaf swap, so its estimate is the sum over leaves, and only
-                // when every leaf has been analyzed (reltuples >= 0).
+                // leaf swap, so its estimate is the sum over leaves. A leaf never
+                // analyzed (reltuples < 0) counts as 0 only when it is provably
+                // empty (no storage); otherwise the count is exact.
                 let count_sql = format!(
                     "WITH rel AS (SELECT oid, relkind, reltuples FROM pg_class \
                                    WHERE oid = to_regclass('{name_lit}')), \
                           est AS (SELECT CASE WHEN rel.relkind = 'p' THEN \
-                                      (SELECT CASE WHEN bool_and(l.reltuples >= 0) \
-                                                   THEN sum(l.reltuples::float8) END \
+                                      (SELECT CASE WHEN bool_and(l.reltuples >= 0 \
+                                                                 OR pg_relation_size(l.oid) = 0) \
+                                                   THEN sum(GREATEST(l.reltuples, 0)::float8) END \
                                          FROM pg_partition_tree(rel.oid) t \
                                          JOIN pg_class l ON l.oid = t.relid \
                                         WHERE t.isleaf) \

@@ -266,7 +266,7 @@ pub(crate) fn reflex_rebuild_imv_metadata_impl(view_name: &str) -> String {
             client,
             view_name,
             &analysis,
-            crate::sql_analyzer::statement_column_refs(&parsed).as_deref(),
+            &parsed,
             &ignored_clean,
             &partition_columns,
         );

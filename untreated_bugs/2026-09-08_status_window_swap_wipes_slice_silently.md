@@ -36,12 +36,15 @@ with no error, no `known_stale`, and the pre-wipe `reltuples` in `reflex_ivm_sta
    (`docs/superpowers/plans/2026-09-08-base-db-silent-wipe-companion.md`).
 2. **Unmappable ignored sources get no heal.** An ignored source that does not join by a
    top-level equality onto the expression the first partition column projects (an
-   `OR` in the condition, a `RIGHT` / `FULL` join, a self-join, `USING`, a comma join
-   filtered in `WHERE`, a non-partitioned IMV) keeps the pre-1.11.4 contract. Its create
-   is refused unless acknowledged, so that is an accepted risk, but nothing reports a
+   `OR` in the condition, a `RIGHT` / `FULL` join, a source read more than once,
+   `USING`, a comma join filtered in `WHERE`, a key type that differs from the partition
+   column's, a non-partitioned IMV) keeps the pre-1.11.4 contract. Its create is
+   refused unless acknowledged, so that is an accepted risk, but nothing reports a
    change to it.
-3. **`TRUNCATE` of an ignored source** queues nothing: there is no statement trigger
-   with transition tables for it.
+3. **Writes addressed directly to a partition of a partitioned ignored source** queue
+   nothing, as for the regular maintenance triggers, which are also on the root only.
+
+(`TRUNCATE` of a mapped ignored source is reported: it marks the IMV `known_stale`.)
 
 A pg_reflex-side runtime wipe guard (refusing a rebuild that takes a non-empty slice to
 zero) was considered and declined in the 1.11.4 design.

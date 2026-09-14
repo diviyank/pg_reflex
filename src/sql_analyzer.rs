@@ -899,6 +899,35 @@ pub(crate) fn collect_column_refs(expr: &Expr) -> Vec<Vec<String>> {
     collector.refs
 }
 
+fn folded(id: &Ident) -> String {
+    match id.quote_style {
+        Some(_) => id.value.clone(),
+        None => id.value.to_lowercase(),
+    }
+}
+
+/// The table name (last part, folded like PostgreSQL folds identifiers) of every
+/// relation reference in `stmts`, once per reference, subqueries and CTE bodies
+/// included.
+pub(crate) fn statement_relation_names(stmts: &[Statement]) -> Vec<String> {
+    struct Relations(Vec<String>);
+    impl Visitor for Relations {
+        type Break = ();
+
+        fn pre_visit_relation(&mut self, relation: &sqlparser::ast::ObjectName) -> ControlFlow<()> {
+            if let Some(sqlparser::ast::ObjectNamePart::Identifier(id)) = relation.0.last() {
+                self.0.push(folded(id));
+            }
+            ControlFlow::Continue(())
+        }
+    }
+    let mut relations = Relations(Vec::new());
+    for stmt in stmts {
+        let _ = stmt.visit(&mut relations);
+    }
+    relations.0
+}
+
 /// Every column reference in `stmts`, subqueries included, as dotted parts
 /// folded the way PostgreSQL folds identifiers (unquoted parts lowercased).
 /// `None` when the statements can read columns no reference names: a wildcard
@@ -908,12 +937,6 @@ pub(crate) fn statement_column_refs(stmts: &[Statement]) -> Option<Vec<Vec<Strin
     struct Refs {
         refs: Vec<Vec<String>>,
         implicit_columns: bool,
-    }
-    fn folded(id: &Ident) -> String {
-        match id.quote_style {
-            Some(_) => id.value.clone(),
-            None => id.value.to_lowercase(),
-        }
     }
     fn has_wildcard(body: &SetExpr) -> bool {
         match body {
