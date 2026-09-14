@@ -18,4 +18,4 @@ Returns the number of rows removed.
 SELECT reflex_prune_event_log(INTERVAL '90 days');
 ```
 
-A `rebuild` row newer than the IMV target's last `ANALYZE` makes `reflex_ivm_status` count that IMV exactly. Pruning such a row retires that signal, so prefer `ANALYZE <imv>` or `reflex_reconcile('<imv>')` over pruning to clear it.
+A `rebuild` row newer than the last `ANALYZE` of both the IMV target and the rebuilt slice makes `reflex_ivm_status` count that IMV exactly. A partition swap ANALYZEs its slice, so this only persists when that ANALYZE did not happen. Pruning such a row retires the signal, so prefer `ANALYZE <imv>` or `reflex_reconcile('<imv>')` over pruning to clear it.

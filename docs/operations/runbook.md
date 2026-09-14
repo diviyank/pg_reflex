@@ -43,6 +43,23 @@ SELECT reflex_flush_partition_source('<schema.source_root>');
 
 The report clears as soon as the root drains. A `deadlock detected` last error is usually transient — re-arming alone fixes it. A duplicate-key error re-caps the root on the first retry unless step 2 removed the duplicates. `reflex_doctor(fix => TRUE)` performs step 3 with a single retry (F2b), never step 2.
 
+## IMV slice empty after an ignored source changed
+
+**Symptom:** a partition of an IMV is empty or outdated after a row of an ignored source (e.g. `demand_planning.status`) left and re-entered the query's filter, and `reflex_ivm_status()` reports `known_stale` with a `stale_reason` naming that source.
+
+Since 1.11.4 the change only queues the affected partition keys; the rebuild waits for a sweep. Heal now:
+
+```sql
+SELECT partition_key, source, enqueued_at, last_error
+FROM public.__reflex_heal_pending WHERE imv_name = '<imv>';
+
+SELECT reflex_heal_ignored_sources('<imv>');
+```
+
+Schedule [`reflex_scheduled_reconcile`](../api/reflex_scheduled_reconcile.md) or `reflex_heal_ignored_sources()` with pg_cron so the window stays short. A row with `last_error` set failed to heal. Fix the cause and re-run.
+
+If the IMV is wrong but nothing is queued, the ignored source cannot be mapped to partitions (see [which ignored sources heal](../api/reflex_heal_ignored_sources.md#which-ignored-sources-heal)), or it predates 1.11.4 and was not backfilled. Run `SELECT reflex_rebuild_imv_metadata('<imv>');` to install the heal triggers, and `SELECT reflex_reconcile('<imv>');` to repair it now.
+
 ## IMV drifted after a crash
 
 UNLOGGED intermediates are TRUNCATEd on crash recovery. Run:
