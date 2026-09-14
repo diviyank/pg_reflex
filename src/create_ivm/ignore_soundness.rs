@@ -483,10 +483,8 @@ mod tests {
 
     #[test]
     fn natural_join_on_ignored_source_is_unsound() {
-        let out = unsound_ignored_sources(
-            "SELECT a.x FROM a NATURAL LEFT JOIN dp",
-            &ignored(&["dp"]),
-        );
+        let out =
+            unsound_ignored_sources("SELECT a.x FROM a NATURAL LEFT JOIN dp", &ignored(&["dp"]));
         assert_eq!(out.len(), 1, "{out:?}");
         assert_eq!(out[0].0, "dp");
     }
