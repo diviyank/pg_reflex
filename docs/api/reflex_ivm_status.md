@@ -53,7 +53,7 @@ WHERE known_stale;
 
     The report clears as soon as the root drains. Fix the root cause first (for a duplicate-key error, the duplicate source rows) — a failed retry re-caps it.
 
-- **(1.11.4+) an ignored source changed for some of this IMV's partitions** — or for an IMV this one reads. Derived live from `__reflex_heal_pending`. `stale_reason` names the ignored source and the queued keys and prescribes `SELECT reflex_heal_ignored_sources('<imv>');`. See [`reflex_heal_ignored_sources`](reflex_heal_ignored_sources.md).
+- **(1.11.4+) an ignored source changed for some of this IMV's partitions** — or for an IMV this one reads. Derived live from `__reflex_heal_pending`. `stale_reason` names the ignored source and the queued keys and prescribes `SELECT reflex_heal_ignored_sources('<imv>');`. Also derived live: a mapped or watched column of an ignored source was renamed or dropped, so its changes can no longer be healed; `stale_reason` names the missing columns and prescribes recreating the IMV. See [`reflex_heal_ignored_sources`](reflex_heal_ignored_sources.md).
 
 ## Row count
 
