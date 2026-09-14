@@ -2208,10 +2208,13 @@ pub(crate) fn reflex_reconcile_partition_impl(
             // We can't reflex_reconcile_partition / reflex_reconcile from
             // inside this SPI scope directly — call the inner impls in a
             // fresh SPI session by deferring via PERFORM at SQL level.
-            // The SQL entry point takes comma-separated keys, so a key containing a
-            // comma cannot cross it; such a dependent takes the full reconcile below.
-            let keys_fit_csv = !partition_keys.iter().any(|k| k.contains(','));
-            if same_part && keys_fit_csv {
+            // The SQL entry point splits keys on commas and trims each one, so a key
+            // that is empty, contains a comma or has edge whitespace cannot cross it
+            // unchanged; such a dependent takes the full reconcile below.
+            let keys_survive_csv = partition_keys
+                .iter()
+                .all(|k| !k.is_empty() && !k.contains(',') && k.trim() == k);
+            if same_part && keys_survive_csv {
                 let q = format!(
                     "SELECT public.reflex_reconcile_partition({}, {})",
                     sql_literal_text(child),

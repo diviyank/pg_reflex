@@ -331,27 +331,10 @@ fn ish_key_type_mismatch_is_not_mapped() {
 #[pg_test]
 fn ish_a_failing_heal_is_recorded_and_does_not_abort_the_sweep() {
     swi_build_fixture("validated");
-    Spi::run("CREATE TABLE ish_od (id BIGINT PRIMARY KEY, status TEXT NOT NULL)").expect("od");
-    Spi::run("INSERT INTO ish_od VALUES (1, 'validated')").expect("seed od");
-    Spi::run(
-        "CREATE TABLE ish_of (pid INT NOT NULL, d INT NOT NULL, v INT NOT NULL) \
-         PARTITION BY LIST (pid)",
-    )
-    .expect("of");
-    Spi::run("CREATE TABLE ish_of_1 PARTITION OF ish_of FOR VALUES IN (1)").expect("leaf");
-    Spi::run("INSERT INTO ish_of VALUES (1, 1, 10)").expect("seed of");
-    ish_create(
-        "ish_o_imv",
-        "SELECT f.pid, f.d, f.v FROM ish_of f JOIN ish_od x ON x.id = f.pid \
-          WHERE x.status = 'validated'",
-        "pid,d",
-        "!ish_od",
-        "'pid'",
-    );
-    // Out of range for the int4 partition column: the partition match raises.
-    Spi::run("INSERT INTO ish_od VALUES (3000000000, 'validated')").expect("queue a bad key");
+    ish_gated_fixture();
+    Spi::run("UPDATE ish_gd SET status = 'boom' WHERE id = 1").expect("queue a key whose heal raises");
     Spi::run("UPDATE swi_dp SET status = 'draft' WHERE id = 471").expect("queue a good key");
-    assert_eq!(ish_queued("ish_o_imv"), 1, "precondition: bad key queued");
+    assert_eq!(ish_queued("ish_g_imv"), 1, "precondition: raising key queued");
     assert_eq!(ish_queued("swi_imv"), 1, "precondition: good key queued");
 
     let result = Spi::get_one::<String>("SELECT reflex_heal_ignored_sources()")
@@ -361,7 +344,7 @@ fn ish_a_failing_heal_is_recorded_and_does_not_abort_the_sweep() {
     assert_eq!(ish_queued("swi_imv"), 0, "the other IMV is still healed");
     let recorded = Spi::get_one::<bool>(
         "SELECT bool_and(last_error IS NOT NULL) FROM public.__reflex_heal_pending \
-          WHERE imv_name = 'ish_o_imv'",
+          WHERE imv_name = 'ish_g_imv'",
     )
     .expect("last_error query")
     .unwrap_or(false);
@@ -478,4 +461,336 @@ fn ish_truncate_of_the_ignored_source_marks_the_imv_stale() {
     assert!(!result.starts_with("ERROR"), "reconcile returned: {result}");
     assert_eq!(ish_swi_diverging_rows(), 0, "the remedy restores the IMV");
     assert!(!ish_status_stale("swi_imv").0, "and retires the report");
+}
+
+// Re-review of the fix round (2026-09-14): one test per confirmed finding.
+
+/// An IMV over `ish_gd` whose query calls `ish_gate`, which raises for status
+/// `boom` (a plain error) and `cancel` (a query cancel). Only a heal evaluates
+/// it on those statuses: `ish_gd` is ignored.
+fn ish_gated_fixture() {
+    Spi::run(
+        "CREATE FUNCTION ish_gate(status TEXT) RETURNS BOOLEAN LANGUAGE plpgsql IMMUTABLE AS $$ \
+         BEGIN \
+           IF status = 'boom' THEN RAISE EXCEPTION 'ish gate boom'; END IF; \
+           IF status = 'cancel' THEN \
+             RAISE EXCEPTION 'ish cancel probe' USING ERRCODE = 'query_canceled'; \
+           END IF; \
+           RETURN status = 'validated'; \
+         END $$",
+    )
+    .expect("gate function");
+    Spi::run("CREATE TABLE ish_gd (id BIGINT PRIMARY KEY, status TEXT NOT NULL)").expect("gd");
+    Spi::run("INSERT INTO ish_gd VALUES (1, 'validated'), (2, 'validated')").expect("seed gd");
+    Spi::run(
+        "CREATE TABLE ish_gf (pid BIGINT NOT NULL, d INT NOT NULL, v INT NOT NULL) \
+         PARTITION BY LIST (pid)",
+    )
+    .expect("gf");
+    Spi::run("CREATE TABLE ish_gf_1 PARTITION OF ish_gf FOR VALUES IN (1)").expect("leaf 1");
+    Spi::run("CREATE TABLE ish_gf_2 PARTITION OF ish_gf FOR VALUES IN (2)").expect("leaf 2");
+    Spi::run("INSERT INTO ish_gf VALUES (1, 1, 10), (2, 1, 20)").expect("seed gf");
+    ish_create(
+        "ish_g_imv",
+        "SELECT f.pid, f.d, f.v FROM ish_gf f JOIN ish_gd x ON x.id = f.pid \
+          WHERE ish_gate(x.status)",
+        "pid,d",
+        "!ish_gd",
+        "'pid'",
+    );
+}
+
+/// N1: the heal must never run user-defined code as anyone but the writer. A
+/// type owner's cast of a watched column records who runs it.
+#[pg_test]
+fn ish_heal_trigger_runs_no_user_code_as_another_role() {
+    swi_build_fixture("validated");
+    Spi::run("CREATE TABLE ish_probe (who TEXT)").expect("probe");
+    Spi::run("GRANT INSERT ON ish_probe TO PUBLIC").expect("probe grant");
+    Spi::run("CREATE TYPE ish_mood AS ENUM ('ok', 'sad')").expect("type");
+    Spi::run(
+        "CREATE FUNCTION ish_mood_text(ish_mood) RETURNS TEXT LANGUAGE plpgsql AS $$ \
+         BEGIN INSERT INTO public.ish_probe VALUES (current_user); RETURN format('%s', $1); END $$",
+    )
+    .expect("cast function");
+    Spi::run("CREATE CAST (ish_mood AS TEXT) WITH FUNCTION ish_mood_text(ish_mood)").expect("cast");
+    Spi::run("ALTER TABLE swi_dp ADD COLUMN mood ish_mood NOT NULL DEFAULT 'ok'").expect("column");
+    ish_create(
+        "ish_mood_imv",
+        "SELECT ss.dem_plan_id, ss.order_date, ss.product_id, ss.location_id, ss.qty \
+           FROM swi_ss ss JOIN swi_dp dp ON dp.id = ss.dem_plan_id \
+          WHERE dp.status IN ('validated', 'draft') AND dp.mood = 'ok'",
+        "dem_plan_id,order_date,product_id,location_id",
+        "!swi_dp",
+        "'dem_plan_id','order_date'",
+    );
+    Spi::run("CREATE ROLE ish_writer").expect("role");
+    Spi::run("GRANT USAGE ON SCHEMA public TO ish_writer").expect("schema usage");
+    Spi::run("GRANT SELECT, UPDATE ON swi_dp TO ish_writer").expect("table grants");
+
+    Spi::run("SET ROLE ish_writer").expect("become the writer");
+    let update = Spi::run("UPDATE swi_dp SET mood = 'sad' WHERE id = 471");
+    Spi::run("RESET ROLE").expect("reset role");
+    update.expect("the writer can update the ignored source");
+
+    assert_eq!(ish_queued("ish_mood_imv"), 1, "the watched-column change is queued");
+    let foreign = Spi::get_one::<i64>(
+        "SELECT count(*)::int8 FROM ish_probe WHERE who <> 'ish_writer'",
+    )
+    .expect("probe query")
+    .unwrap_or(-1);
+    assert_eq!(foreign, 0, "user-defined code must not run with another role's rights");
+}
+
+/// N2: a `char(n)` key keeps its padding in text form and matches no `text`
+/// partition; only compatible key types are mapped.
+#[pg_test]
+fn ish_char_key_against_text_partition_is_not_mapped() {
+    Spi::run("CREATE TABLE ish_bd (code CHAR(5) PRIMARY KEY, status TEXT NOT NULL)").expect("bd");
+    Spi::run("INSERT INTO ish_bd VALUES ('ab', 'validated'), ('cd', 'validated')").expect("seed bd");
+    Spi::run(
+        "CREATE TABLE ish_bf (code TEXT NOT NULL, d INT NOT NULL, v INT NOT NULL) \
+         PARTITION BY LIST (code)",
+    )
+    .expect("bf");
+    Spi::run("CREATE TABLE ish_bf_ab PARTITION OF ish_bf FOR VALUES IN ('ab')").expect("ab");
+    Spi::run("CREATE TABLE ish_bf_cd PARTITION OF ish_bf FOR VALUES IN ('cd')").expect("cd");
+    Spi::run("INSERT INTO ish_bf VALUES ('ab', 1, 10), ('cd', 1, 20)").expect("seed bf");
+    ish_create(
+        "ish_b_imv",
+        "SELECT f.code, f.d, f.v FROM ish_bf f JOIN ish_bd x ON x.code = f.code \
+          WHERE x.status = 'validated'",
+        "code,d",
+        "!ish_bd",
+        "'code'",
+    );
+    assert_eq!(ish_heal_triggers_on("ish_bd"), 0, "char(n) against text gets no heal");
+}
+
+/// N3: a key no row of the partition column's type can hold (an int8 id beyond
+/// an int4 partition column) has nothing to rebuild; it drains.
+#[pg_test]
+fn ish_key_outside_the_partition_type_drains() {
+    Spi::run("CREATE TABLE ish_od (id BIGINT PRIMARY KEY, status TEXT NOT NULL)").expect("od");
+    Spi::run("INSERT INTO ish_od VALUES (1, 'validated')").expect("seed od");
+    Spi::run(
+        "CREATE TABLE ish_of (pid INT NOT NULL, d INT NOT NULL, v INT NOT NULL) \
+         PARTITION BY LIST (pid)",
+    )
+    .expect("of");
+    Spi::run("CREATE TABLE ish_of_1 PARTITION OF ish_of FOR VALUES IN (1)").expect("leaf");
+    Spi::run("INSERT INTO ish_of VALUES (1, 1, 10)").expect("seed of");
+    let query = "SELECT f.pid, f.d, f.v FROM ish_of f JOIN ish_od x ON x.id = f.pid \
+                  WHERE x.status = 'validated'";
+    ish_create("ish_o_imv", query, "pid,d", "!ish_od", "'pid'");
+
+    Spi::run("INSERT INTO ish_od VALUES (3000000000, 'validated')").expect("id beyond int4");
+    assert_eq!(ish_queued("ish_o_imv"), 1, "precondition: key queued");
+    let result = Spi::get_one::<String>("SELECT reflex_heal_ignored_sources()")
+        .expect("heal")
+        .unwrap_or_default();
+    assert!(!result.starts_with("ERROR"), "an impossible key is not a failure: {result}");
+    assert_eq!(ish_queued("ish_o_imv"), 0, "it drains");
+    assert!(!ish_status_stale("ish_o_imv").0, "and the IMV reports fresh");
+    assert_eq!(ish_diverging("ish_o_imv", "pid, d, v", query), 0, "which it is");
+}
+
+/// N4: the cascade to a dependent IMV must not lose a key's exact text.
+#[pg_test]
+fn ish_key_with_edge_whitespace_heals_dependents() {
+    Spi::run("CREATE TABLE ish_wd (code TEXT PRIMARY KEY, status TEXT NOT NULL)").expect("wd");
+    Spi::run("INSERT INTO ish_wd VALUES (' a', 'validated'), ('c', 'validated')").expect("seed wd");
+    Spi::run(
+        "CREATE TABLE ish_wf (code TEXT NOT NULL, d INT NOT NULL, v INT NOT NULL) \
+         PARTITION BY LIST (code)",
+    )
+    .expect("wf");
+    Spi::run("CREATE TABLE ish_wf_a PARTITION OF ish_wf FOR VALUES IN (' a')").expect("a");
+    Spi::run("CREATE TABLE ish_wf_c PARTITION OF ish_wf FOR VALUES IN ('c')").expect("c");
+    Spi::run("INSERT INTO ish_wf VALUES (' a', 1, 10), (' a', 2, 11), ('c', 1, 20)").expect("seed");
+    ish_create(
+        "ish_w_imv",
+        "SELECT f.code, f.d, f.v FROM ish_wf f JOIN ish_wd x ON x.code = f.code \
+          WHERE x.status = 'validated'",
+        "code,d",
+        "!ish_wd",
+        "'code'",
+    );
+    let r = Spi::get_one::<String>(
+        "SELECT create_reflex_ivm('ish_w_dep', \
+           'SELECT code, sum(v) AS s, count(*) AS n FROM ish_w_imv GROUP BY code', \
+           NULL, 'UNLOGGED', 'DEFERRED', NULL, ARRAY['code'])",
+    )
+    .expect("dependent create call")
+    .expect("dependent create result");
+    assert!(!r.starts_with("ERROR"), "dependent create returned: {r}");
+
+    Spi::run("UPDATE ish_wd SET status = 'draft' WHERE code = ' a'").expect("exclude ' a'");
+    let result = Spi::get_one::<String>("SELECT reflex_heal_ignored_sources()")
+        .expect("heal")
+        .unwrap_or_default();
+    assert!(!result.starts_with("ERROR"), "heal returned: {result}");
+    assert_eq!(
+        ish_diverging(
+            "ish_w_dep",
+            "code, s, n",
+            "SELECT code, sum(v) AS s, count(*) AS n FROM ish_w_imv GROUP BY code"
+        ),
+        0,
+        "the dependent must follow its healed parent"
+    );
+}
+
+fn ish_registry_ctid(imv: &str) -> String {
+    Spi::get_one::<String>(&format!(
+        "SELECT ctid::text FROM public.__reflex_ivm_reference WHERE name = '{imv}'"
+    ))
+    .expect("ctid query")
+    .expect("registry row")
+}
+
+/// N5: writes to an ignored source whose watched column went missing must not
+/// write the registry row; every writer would serialize (and deadlock) on it.
+#[pg_test]
+fn ish_missing_column_leaves_the_registry_row_alone() {
+    swi_build_fixture("validated");
+    Spi::run("ALTER TABLE swi_dp RENAME COLUMN status TO state").expect("rename watched column");
+    let before = ish_registry_ctid("swi_imv");
+    Spi::run("UPDATE swi_dp SET state = 'draft' WHERE id = 471").expect("update");
+    Spi::run("UPDATE swi_dp SET state = 'draft' WHERE id = 9").expect("update another row");
+    Spi::run("INSERT INTO swi_dp VALUES (12, 'validated')").expect("insert");
+    assert_eq!(
+        ish_registry_ctid("swi_imv"),
+        before,
+        "the writes must not update the IMV's registry row"
+    );
+    assert!(ish_status_stale("swi_imv").0, "the lost heal is still reported");
+    let doctor_rows = Spi::get_one::<i64>(
+        "SELECT count(*)::int8 FROM reflex_doctor() WHERE check_id = 'F14' AND object = 'swi_imv'",
+    )
+    .expect("doctor")
+    .unwrap_or(0);
+    assert_eq!(doctor_rows, 1, "and reflex_doctor reports it");
+}
+
+/// N6: a query cancel (or statement_timeout) during a heal must stop the call,
+/// not be recorded as one IMV's failure while the sweep carries on.
+#[pg_test(error = "ish cancel probe")]
+fn ish_a_cancel_during_a_heal_is_not_swallowed() {
+    ish_gated_fixture();
+    Spi::run("UPDATE ish_gd SET status = 'cancel' WHERE id = 1").expect("queue");
+    let _ = Spi::get_one::<String>("SELECT reflex_heal_ignored_sources()");
+}
+
+fn ish_registry_stale_reason(imv: &str) -> Option<String> {
+    Spi::get_one::<String>(&format!(
+        "SELECT stale_reason FROM public.__reflex_ivm_reference WHERE name = '{imv}'"
+    ))
+    .expect("stale_reason query")
+}
+
+/// N7: a TRUNCATE adds its reason to an IMV already stale for another cause.
+#[pg_test]
+fn ish_truncate_keeps_an_existing_stale_reason() {
+    swi_build_fixture("validated");
+    Spi::run("INSERT INTO swi_ss VALUES (471, '2026-02-10', 1, 1, 10)").expect("duplicate row");
+    Spi::run("SET CONSTRAINTS ALL IMMEDIATE").expect("failing deferred flush");
+    let earlier = ish_registry_stale_reason("swi_imv")
+        .expect("precondition: the failed flush left a stale_reason");
+
+    Spi::run("TRUNCATE swi_dp").expect("truncate ignored source");
+    let reason = ish_registry_stale_reason("swi_imv").unwrap_or_default();
+    assert!(reason.contains(&earlier), "the earlier reason must survive: {reason}");
+    assert!(reason.contains("truncated"), "and the truncate is added: {reason}");
+}
+
+/// N7: a TRUNCATE stamps `stale_since` like every other staleness writer.
+#[pg_test]
+fn ish_truncate_stamps_stale_since() {
+    swi_build_fixture("validated");
+    Spi::run("TRUNCATE swi_dp").expect("truncate ignored source");
+    let stamped = Spi::get_one::<bool>(
+        "SELECT stale_since IS NOT NULL FROM public.__reflex_ivm_reference WHERE name = 'swi_imv'",
+    )
+    .expect("stale_since query")
+    .unwrap_or(false);
+    assert!(stamped, "stale_since must be set");
+}
+
+/// N1: a type owner's cast to text must neither run inside the heal trigger nor
+/// decide whether a watched column changed (a constant cast would hide it).
+#[pg_test]
+fn ish_type_owner_cast_neither_runs_nor_hides_a_change() {
+    swi_build_fixture("validated");
+    Spi::run("CREATE TABLE ish_cast_probe (who TEXT)").expect("probe");
+    Spi::run("GRANT INSERT ON ish_cast_probe TO PUBLIC").expect("probe grant");
+    Spi::run("CREATE TYPE ish_tone AS ENUM ('ok', 'sad')").expect("type");
+    Spi::run(
+        "CREATE FUNCTION ish_tone_text(ish_tone) RETURNS TEXT LANGUAGE plpgsql AS $$ \
+         BEGIN INSERT INTO public.ish_cast_probe VALUES (current_user); RETURN 'tone'; END $$",
+    )
+    .expect("cast function");
+    Spi::run("CREATE CAST (ish_tone AS TEXT) WITH FUNCTION ish_tone_text(ish_tone)").expect("cast");
+    Spi::run("ALTER TABLE swi_dp ADD COLUMN tone ish_tone NOT NULL DEFAULT 'ok'").expect("column");
+    ish_create(
+        "ish_tone_imv",
+        "SELECT ss.dem_plan_id, ss.order_date, ss.product_id, ss.location_id, ss.qty \
+           FROM swi_ss ss JOIN swi_dp dp ON dp.id = ss.dem_plan_id \
+          WHERE dp.status IN ('validated', 'draft') AND dp.tone = 'ok'",
+        "dem_plan_id,order_date,product_id,location_id",
+        "!swi_dp",
+        "'dem_plan_id','order_date'",
+    );
+
+    Spi::run("UPDATE swi_dp SET tone = 'sad' WHERE id = 471").expect("update");
+    assert_eq!(ish_queued("ish_tone_imv"), 1, "the change is seen through the type's output");
+    let ran = Spi::get_one::<i64>("SELECT count(*)::int8 FROM ish_cast_probe")
+        .expect("probe query")
+        .unwrap_or(-1);
+    assert_eq!(ran, 0, "the heal trigger must not evaluate the type owner's cast");
+}
+
+/// N1: a key of a user-defined type is not mapped: rendering it would consult
+/// that type's owner-defined casts.
+#[pg_test]
+fn ish_user_typed_key_is_not_mapped() {
+    Spi::run("CREATE TYPE ish_ek AS ENUM ('a', 'b')").expect("type");
+    Spi::run("CREATE TABLE ish_ed (code ish_ek PRIMARY KEY, status TEXT NOT NULL)").expect("ed");
+    Spi::run("INSERT INTO ish_ed VALUES ('a', 'validated'), ('b', 'validated')").expect("seed ed");
+    Spi::run(
+        "CREATE TABLE ish_ef (code ish_ek NOT NULL, d INT NOT NULL, v INT NOT NULL) \
+         PARTITION BY LIST (code)",
+    )
+    .expect("ef");
+    Spi::run("CREATE TABLE ish_ef_a PARTITION OF ish_ef FOR VALUES IN ('a')").expect("a");
+    Spi::run("CREATE TABLE ish_ef_b PARTITION OF ish_ef FOR VALUES IN ('b')").expect("b");
+    Spi::run("INSERT INTO ish_ef VALUES ('a', 1, 10), ('b', 1, 20)").expect("seed ef");
+    ish_create(
+        "ish_e_imv",
+        "SELECT f.code, f.d, f.v FROM ish_ef f JOIN ish_ed x ON x.code = f.code \
+          WHERE x.status = 'validated'",
+        "code,d",
+        "!ish_ed",
+        "'code'",
+    );
+    assert_eq!(ish_heal_triggers_on("ish_ed"), 0, "a user-typed key gets no heal");
+}
+
+/// N1: the truncate helper runs with pg_reflex's rights and anyone may call it,
+/// so a direct call on a source that was not emptied marks nothing stale.
+#[pg_test]
+fn ish_direct_truncate_helper_call_marks_nothing() {
+    swi_build_fixture("validated");
+    Spi::run("CREATE ROLE ish_outsider").expect("role");
+    Spi::run("GRANT USAGE ON SCHEMA public TO ish_outsider").expect("schema usage");
+    Spi::run("SET ROLE ish_outsider").expect("become the outsider");
+    let call = Spi::run("SELECT public.__reflex_heal_mark_truncated('public.swi_dp'::regclass)");
+    Spi::run("RESET ROLE").expect("reset role");
+    call.expect("the helper is callable");
+    let stale = Spi::get_one::<bool>(
+        "SELECT COALESCE(known_stale, FALSE) FROM public.__reflex_ivm_reference WHERE name = 'swi_imv'",
+    )
+    .expect("registry query")
+    .unwrap_or(true);
+    assert!(!stale, "a source that still has rows was not truncated");
 }

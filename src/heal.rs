@@ -173,9 +173,12 @@ fn heal_candidates(
 /// source the caller may not put a trigger on gets no heal, with a WARNING,
 /// rather than failing the create.
 ///
-/// The source column's type must render keys the partition column parses back
-/// to the same value: the same type, two integer types, or two string types.
-/// Otherwise (e.g. `numeric` 5.0 against a `bigint` partition) no heal.
+/// The source column's type must be built in (the trigger renders keys with
+/// `to_jsonb`, which a type owner's cast to json would otherwise hook) and render
+/// keys the partition column reads back as the same value: the same type, two
+/// integer types, or `text` and `varchar`. Otherwise (`numeric` 5.0 against a
+/// `bigint` partition, `char(n)` padding against `text`) no heal. An integer key
+/// the partition column is too narrow to hold is drained by the heal.
 pub(crate) fn install_heal_triggers(
     client: &mut pgrx::spi::SpiClient<'_>,
     view_name: &str,
@@ -212,13 +215,14 @@ pub(crate) fn install_heal_triggers(
                           JOIN pg_type st ON st.oid = s.atttypid \
                           JOIN pg_attribute p ON p.attrelid = to_regclass($4) AND p.attname = $5 \
                                              AND p.attnum > 0 AND NOT p.attisdropped \
-                          JOIN pg_type pt ON pt.oid = p.atttypid \
                          WHERE s.attrelid = c.oid AND s.attname = $2 \
                            AND s.attnum > 0 AND NOT s.attisdropped \
+                           AND st.typnamespace = 'pg_catalog'::regnamespace \
                            AND (s.atttypid = p.atttypid \
                                 OR (s.atttypid IN ('int2'::regtype, 'int4'::regtype, 'int8'::regtype) \
                                     AND p.atttypid IN ('int2'::regtype, 'int4'::regtype, 'int8'::regtype)) \
-                                OR (st.typcategory = 'S' AND pt.typcategory = 'S')))",
+                                OR (s.atttypid IN ('text'::regtype, 'varchar'::regtype) \
+                                    AND p.atttypid IN ('text'::regtype, 'varchar'::regtype))))",
                 Some(1),
                 &[
                     unsafe {
@@ -345,18 +349,22 @@ pub(crate) fn heal_ignored_sources_impl(imv: Option<&str>, target_schema: &str) 
     if !heal_table_exists {
         return Vec::new();
     }
-    let batches: Vec<(String, Vec<String>, Vec<String>)> = Spi::connect(|client| {
+    let batches: Vec<HealBatch> = Spi::connect(|client| {
         client
             .select(
                 "SELECT p.imv_name, \
                         array_agg(p.partition_key ORDER BY p.partition_key) AS keys, \
-                        array_agg(p.enqueued_at::text ORDER BY p.partition_key) AS stamps \
+                        array_agg(p.enqueued_at::text ORDER BY p.partition_key) AS stamps, \
+                        (SELECT a.atttypid::regtype::text FROM pg_attribute a \
+                          WHERE a.attrelid = to_regclass(p.imv_name) \
+                            AND a.attname = r.partition_columns[1] \
+                            AND NOT a.attisdropped) AS key_type \
                    FROM public.__reflex_heal_pending p \
                    JOIN public.__reflex_ivm_reference r \
                      ON r.name = p.imv_name AND COALESCE(r.enabled, TRUE) \
                   WHERE ($1::text IS NULL OR p.imv_name = $1) \
                     AND ($2 = '' OR COALESCE(r.target_schema, 'public') = $2) \
-                  GROUP BY p.imv_name, r.graph_depth \
+                  GROUP BY p.imv_name, r.graph_depth, r.partition_columns \
                   ORDER BY r.graph_depth NULLS FIRST, p.imv_name",
                 None,
                 &[
@@ -376,37 +384,85 @@ pub(crate) fn heal_ignored_sources_impl(imv: Option<&str>, target_schema: &str) 
             )
             .map(|rows| {
                 rows.filter_map(|row| {
-                    Some((
-                        row.get_by_name::<String, _>("imv_name").ok().flatten()?,
-                        row.get_by_name::<Vec<String>, _>("keys").ok().flatten()?,
-                        row.get_by_name::<Vec<String>, _>("stamps").ok().flatten()?,
-                    ))
+                    Some(HealBatch {
+                        imv: row.get_by_name::<String, _>("imv_name").ok().flatten()?,
+                        keys: row.get_by_name::<Vec<String>, _>("keys").ok().flatten()?,
+                        stamps: row.get_by_name::<Vec<String>, _>("stamps").ok().flatten()?,
+                        key_type: row.get_by_name::<String, _>("key_type").ok().flatten(),
+                    })
                 })
                 .collect()
             })
             .unwrap_or_default()
     });
 
-    batches
+    batches.into_iter().map(heal_batch).collect()
+}
+
+/// One IMV's queue rows as read before its heal.
+struct HealBatch {
+    imv: String,
+    keys: Vec<String>,
+    stamps: Vec<String>,
+    /// The IMV's partition column type, as `regtype` text.
+    key_type: Option<String>,
+}
+
+fn heal_batch(batch: HealBatch) -> HealResult {
+    let started = std::time::Instant::now();
+    let (holdable, unholdable): (Vec<_>, Vec<_>) = batch
+        .keys
         .into_iter()
-        .map(|(name, keys, stamps)| {
-            let started = std::time::Instant::now();
-            let result = reconcile_keys_isolated(&name, &keys);
-            let heal = HealResult {
-                imv: name,
-                result,
-                ms: started.elapsed().as_millis() as i64,
-            };
-            record_heal_outcome(&heal, keys, stamps);
-            heal
-        })
-        .collect()
+        .zip(batch.stamps)
+        .partition(|(key, _)| partition_type_can_hold(batch.key_type.as_deref(), key));
+    let (unholdable_keys, unholdable_stamps): (Vec<String>, Vec<String>) =
+        unholdable.into_iter().unzip();
+    if !unholdable_keys.is_empty() {
+        update_queue_rows(
+            DRAIN_QUEUE_ROWS,
+            &batch.imv,
+            unholdable_keys,
+            unholdable_stamps,
+            "",
+        );
+    }
+    let (keys, stamps): (Vec<String>, Vec<String>) = holdable.into_iter().unzip();
+    if keys.is_empty() {
+        return HealResult {
+            imv: batch.imv,
+            result: "HEALED: no partition can hold the queued keys".to_string(),
+            ms: started.elapsed().as_millis() as i64,
+        };
+    }
+    let result = reconcile_keys_isolated(&batch.imv, &keys);
+    let heal = HealResult {
+        imv: batch.imv,
+        result,
+        ms: started.elapsed().as_millis() as i64,
+    };
+    record_heal_outcome(&heal, keys, stamps);
+    heal
+}
+
+/// Whether a value of the IMV's partition column type can equal `key`. Keys come
+/// from a compatible source column (see `install_heal_triggers`), so only a
+/// narrower integer partition column can reject one, and a key it cannot hold
+/// has no partition to rebuild.
+fn partition_type_can_hold(key_type: Option<&str>, key: &str) -> bool {
+    let bounds = match key_type {
+        Some("smallint") => i16::MIN as i128..=i16::MAX as i128,
+        Some("integer") => i32::MIN as i128..=i32::MAX as i128,
+        _ => return true,
+    };
+    key.parse::<i128>()
+        .is_ok_and(|value| bounds.contains(&value))
 }
 
 /// Rebuild `keys` of `imv` in a subtransaction. A PostgreSQL error raised inside
 /// (a key the partition column cannot parse, say) rolls back only this heal and
 /// comes back as an `ERROR:` string, so one bad IMV cannot abort the sweep and its
-/// failure is recorded like any other.
+/// failure is recorded like any other. A query cancel or shutdown is re-raised: it
+/// is the caller stopping the sweep, not a failed heal.
 fn reconcile_keys_isolated(imv: &str, keys: &[String]) -> String {
     pgrx::PgTryBuilder::new(|| {
         let subxact = crate::partition::SubTransaction::begin();
@@ -416,36 +472,47 @@ fn reconcile_keys_isolated(imv: &str, keys: &[String]) -> String {
     })
     .catch_others(|error| {
         use pgrx::pg_sys::panic::CaughtError;
-        let message = match &error {
+        let (code, message) = match &error {
             CaughtError::PostgresError(report)
             | CaughtError::ErrorReport(report)
             | CaughtError::RustPanic {
                 ereport: report, ..
-            } => report.message().to_string(),
+            } => (report.sql_error_code(), report.message().to_string()),
         };
+        if matches!(
+            code,
+            PgSqlErrorCode::ERRCODE_QUERY_CANCELED
+                | PgSqlErrorCode::ERRCODE_ADMIN_SHUTDOWN
+                | PgSqlErrorCode::ERRCODE_CRASH_SHUTDOWN
+        ) {
+            error.rethrow();
+        }
         format!("ERROR: {message}")
     })
     .execute()
 }
 
+const DRAIN_QUEUE_ROWS: &str = "DELETE FROM public.__reflex_heal_pending p \
+       USING unnest($2::text[], $3::text[]) AS q(k, at) \
+      WHERE p.imv_name = $1 AND p.partition_key = q.k AND p.enqueued_at = q.at::timestamptz \
+        AND $4 IS NOT NULL";
+
+const FAIL_QUEUE_ROWS: &str =
+    "UPDATE public.__reflex_heal_pending p SET last_error = left($4, 2000) \
+       FROM unnest($2::text[], $3::text[]) AS q(k, at) \
+      WHERE p.imv_name = $1 AND p.partition_key = q.k AND p.enqueued_at = q.at::timestamptz";
+
 fn record_heal_outcome(heal: &HealResult, keys: Vec<String>, stamps: Vec<String>) {
-    let (sql, detail) = if heal.failed() {
+    if heal.failed() {
         pgrx::warning!("pg_reflex: heal of '{}' failed: {}", heal.imv, heal.result);
-        (
-            "UPDATE public.__reflex_heal_pending p SET last_error = left($4, 2000) \
-               FROM unnest($2::text[], $3::text[]) AS q(k, at) \
-              WHERE p.imv_name = $1 AND p.partition_key = q.k AND p.enqueued_at = q.at::timestamptz",
-            heal.result.clone(),
-        )
+        update_queue_rows(FAIL_QUEUE_ROWS, &heal.imv, keys, stamps, &heal.result);
     } else {
-        (
-            "DELETE FROM public.__reflex_heal_pending p \
-               USING unnest($2::text[], $3::text[]) AS q(k, at) \
-              WHERE p.imv_name = $1 AND p.partition_key = q.k AND p.enqueued_at = q.at::timestamptz \
-                AND $4 IS NOT NULL",
-            String::new(),
-        )
-    };
+        update_queue_rows(DRAIN_QUEUE_ROWS, &heal.imv, keys, stamps, "");
+    }
+}
+
+/// Apply `sql` to exactly the queue rows `(keys[i], stamps[i])` of `imv`.
+fn update_queue_rows(sql: &str, imv: &str, keys: Vec<String>, stamps: Vec<String>, detail: &str) {
     Spi::connect_mut(|client| {
         client
             .update(
@@ -453,11 +520,13 @@ fn record_heal_outcome(heal: &HealResult, keys: Vec<String>, stamps: Vec<String>
                 None,
                 &[
                     unsafe {
-                        DatumWithOid::new(heal.imv.clone(), PgBuiltInOids::TEXTOID.oid().value())
+                        DatumWithOid::new(imv.to_string(), PgBuiltInOids::TEXTOID.oid().value())
                     },
                     unsafe { DatumWithOid::new(keys, PgBuiltInOids::TEXTARRAYOID.oid().value()) },
                     unsafe { DatumWithOid::new(stamps, PgBuiltInOids::TEXTARRAYOID.oid().value()) },
-                    unsafe { DatumWithOid::new(detail, PgBuiltInOids::TEXTOID.oid().value()) },
+                    unsafe {
+                        DatumWithOid::new(detail.to_string(), PgBuiltInOids::TEXTOID.oid().value())
+                    },
                 ],
             )
             .unwrap_or_else(|e| pgrx::error!("pg_reflex: heal queue bookkeeping: {e}"));
@@ -550,18 +619,77 @@ impl QueuedHeal {
     }
 }
 
-/// Stale reasons for every IMV with queued heals and every IMV reading one,
-/// transitively: a downstream IMV is exactly as wrong as the slice it reads.
+/// IMVs a heal can no longer reach, with the reason: a mapped or watched column
+/// of one of their ignored sources was renamed or dropped, so the trigger skips
+/// every change to that source. Derived from the catalog on read, not recorded
+/// by the trigger, which must not write a registry row every writer of the
+/// source would then contend on.
+pub(crate) fn unhealable_reasons_by_imv() -> BTreeMap<String, String> {
+    Spi::connect(|client| {
+        let Ok(rows) = client.select(
+            "SELECT r.name, k.value->>'relation' AS relation, \
+                    string_agg(c.col, ', ' ORDER BY c.col) AS missing \
+               FROM public.__reflex_ivm_reference r \
+              CROSS JOIN LATERAL jsonb_each(COALESCE(r.aggregations->'ignore_heal_keys', '{}'::jsonb)) k \
+              CROSS JOIN LATERAL ( \
+                    SELECT DISTINCT col FROM jsonb_array_elements_text( \
+                        COALESCE(k.value->'watched_columns', '[]'::jsonb) \
+                        || jsonb_build_array(k.value->>'source_column')) AS col) c \
+              WHERE COALESCE(r.enabled, TRUE) \
+                AND NOT EXISTS (SELECT 1 FROM pg_attribute a \
+                                 WHERE a.attrelid = to_regclass(k.value->>'relation') \
+                                   AND a.attname = c.col AND a.attnum > 0 AND NOT a.attisdropped) \
+              GROUP BY r.name, k.value->>'relation'",
+            None,
+            &[],
+        ) else {
+            return BTreeMap::new();
+        };
+        let mut reasons: BTreeMap<String, String> = BTreeMap::new();
+        for row in rows {
+            let text = |col: &str| row.get_by_name::<String, _>(col).ok().flatten();
+            let (Some(name), Some(relation), Some(missing)) =
+                (text("name"), text("relation"), text("missing"))
+            else {
+                continue;
+            };
+            let reason = format!(
+                "ignored source {relation} no longer has column(s) {missing}, so its changes can \
+                 no longer be healed. Recreate the IMV against its current columns."
+            );
+            reasons
+                .entry(name)
+                .and_modify(|existing| {
+                    existing.push_str(" | ");
+                    existing.push_str(&reason);
+                })
+                .or_insert(reason);
+        }
+        reasons
+    })
+}
+
+/// Stale reasons for every IMV with queued heals or an ignored source it can no
+/// longer heal from, and every IMV reading one, transitively: a downstream IMV
+/// is exactly as wrong as the slice it reads.
 pub(crate) fn heal_stale_reasons_by_imv() -> HashMap<String, String> {
-    let queued = queued_heals_by_imv();
-    if queued.is_empty() {
-        return HashMap::new();
-    }
-    let mut reasons: HashMap<String, String> = queued
+    let mut reasons: HashMap<String, String> = queued_heals_by_imv()
         .iter()
         .map(|(imv, heal)| (imv.clone(), heal.stale_reason(imv)))
         .collect();
-    let origins: Vec<String> = queued.into_keys().collect();
+    for (imv, reason) in unhealable_reasons_by_imv() {
+        reasons
+            .entry(imv)
+            .and_modify(|existing| {
+                existing.push_str(" | ");
+                existing.push_str(&reason);
+            })
+            .or_insert(reason);
+    }
+    if reasons.is_empty() {
+        return reasons;
+    }
+    let origins: Vec<String> = reasons.keys().cloned().collect();
     Spi::connect(|client| {
         let Ok(rows) = client.select(
             "WITH RECURSIVE reach(name, origin, depth) AS ( \
@@ -588,9 +716,8 @@ pub(crate) fn heal_stale_reasons_by_imv() -> HashMap<String, String> {
             if let (Some(name), Some(origin)) = (name, origin) {
                 reasons.entry(name).or_insert_with(|| {
                     format!(
-                        "reads IMV '{origin}', whose partitions are queued for heal after an ignored \
-                         source changed. Run SELECT reflex_heal_ignored_sources('{}');",
-                        origin.replace('\'', "''")
+                        "reads IMV '{origin}', which is known stale after one of its ignored \
+                         sources changed; repair '{origin}' first (see its stale_reason)."
                     )
                 });
             }
