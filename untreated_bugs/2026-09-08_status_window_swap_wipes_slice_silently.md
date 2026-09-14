@@ -1,9 +1,9 @@
-# 2026-09-08 — a partition swap under a status filter that excludes the slice empties it, and it never heals
+# 2026-09-08 — a partition swap under a status filter that excludes the slice empties it
 
-**Status: untreated in pg_reflex — detection closed in 1.11.4, prevention owned by base-db.**
+**Status: narrowed in 1.11.4 — healing closed for the incident shape; the transient window and unmappable shapes remain.**
 Residual of the `omc.sop_forecast_view` incident (DP 471, 1.86 M rows showing 0).
 
-Severity: **high**, mitigated by 1.11.4's detection.
+Severity: **medium** (was high).
 
 ---
 
@@ -12,33 +12,36 @@ Severity: **high**, mitigated by 1.11.4's detection.
 `sop_forecast_view` filters `demand_planning.status` and lists `demand_planning` in
 `ignore_sources`. When db-bus swaps a month of `sales_simulation` while the DP is in a
 status the filter excludes (e.g. `creating_sop`), the partition rebuild evaluates the
-query and correctly writes zero rows for that slice. When the DP's status returns to an
-included value, nothing refreshes the IMV — `demand_planning` is ignored — so the slice
-stays empty. The unswapped months keep their (stale) rows, which is why the client saw
-Feb–Aug at 0 and Sept–Oct at 35.
+query and correctly writes zero rows for that slice. On ≤ 1.11.3, when the status
+returned to an included value, nothing refreshed the IMV, so the slice stayed empty
+with no error, no `known_stale`, and the pre-wipe `reltuples` in `reflex_ivm_status`.
 
-The flush succeeded, so on ≤ 1.11.3 there was no error, no `known_stale`, and
-`reflex_ivm_status` reported the pre-wipe `reltuples`.
+## What 1.11.4 closes
 
-Reproduced by `swi_status_window_swap_wipes_slice_silently`
-(`src/tests/pg_test_status_window_wipe.rs`).
+- Detection: the swap writes a `rebuild` event to `__reflex_event_log`, and
+  `reflex_audit` / `create_reflex_ivm` flag the unsound ignore.
+- Healing: the ignored source joins onto the IMV's first partition column
+  (`dp.id = ss.dem_plan_id`), so statement triggers on it queue the changed DP into
+  `__reflex_heal_pending`. The IMV reports `known_stale` until
+  `reflex_heal_ignored_sources`, `reflex_scheduled_reconcile` or
+  `reflex_doctor(fix => TRUE)` rebuilds exactly those partitions.
+  Pinned by `src/tests/pg_test_ignored_source_heal.rs`.
 
-## What 1.11.4 closes (detection)
+## What remains
 
-- The swap writes a `rebuild` / `partition_swap` event with `rows_before` → `rows_after`
-  to `__reflex_event_log`.
-- `reflex_ivm_status` reports the exact count (`is_estimate = false`) while that rebuild
-  is newer than the target's last ANALYZE.
-- `reflex_audit` raises `ignore-soundness` on the IMV, and `create_reflex_ivm` refuses the
-  unsound ignore unless acknowledged.
-
-## What it does not close (prevention)
-
-A swap under an excluding predicate still empties the slice, and it still does not heal.
-Owned by the base-db companion work, not pg_reflex: invert the `sop_forecast_view` status
-filter to an exclusion list generated from `DemandPlanningStatus` (so a transient status
-no longer excludes a live DP), plus a per-leaf unique index on `sales_simulation`.
-See `docs/superpowers/plans/2026-09-08-base-db-silent-wipe-companion.md`.
+1. **The window itself.** Between the status returning and the next sweep the slice is
+   still empty. It is reported (`known_stale`, F14), not prevented. Prevention stays with
+   base-db: an exclusion-list status filter generated from `DemandPlanningStatus`, plus
+   a per-leaf unique index on `sales_simulation`
+   (`docs/superpowers/plans/2026-09-08-base-db-silent-wipe-companion.md`).
+2. **Unmappable ignored sources get no heal.** An ignored source that does not join by a
+   top-level equality onto the expression the first partition column projects (an
+   `OR` in the condition, a `RIGHT` / `FULL` join, a self-join, `USING`, a comma join
+   filtered in `WHERE`, a non-partitioned IMV) keeps the pre-1.11.4 contract. Its create
+   is refused unless acknowledged, so that is an accepted risk, but nothing reports a
+   change to it.
+3. **`TRUNCATE` of an ignored source** queues nothing: there is no statement trigger
+   with transition tables for it.
 
 A pg_reflex-side runtime wipe guard (refusing a rebuild that takes a non-empty slice to
 zero) was considered and declined in the 1.11.4 design.

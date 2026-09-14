@@ -35,6 +35,7 @@ mod create_ivm;
 mod doctor;
 mod drop_ivm;
 mod graph_repair;
+mod heal;
 mod introspect;
 mod partition;
 mod query_decomposer;
@@ -324,6 +325,74 @@ extension_sql!(
     -- NULL means no drain has ever fired for this row — the F1 re-arm hole.
     ALTER TABLE public.__reflex_partition_pending
         ADD COLUMN IF NOT EXISTS last_attempt_at TIMESTAMPTZ;
+
+    -- 1.11.4: IMV partitions made wrong by a change to an ignored source,
+    -- queued by __reflex_heal_on_ignored_change and drained by
+    -- reflex_heal_ignored_sources, reflex_scheduled_reconcile and
+    -- reflex_doctor(fix => TRUE). See src/heal.rs.
+    CREATE TABLE IF NOT EXISTS public.__reflex_heal_pending (
+        imv_name      TEXT NOT NULL,
+        partition_key TEXT NOT NULL,
+        source        TEXT NOT NULL,
+        enqueued_at   TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+        last_error    TEXT,
+        PRIMARY KEY (imv_name, partition_key)
+    );
+
+    -- Statement trigger on an ignored source. Queues the partition keys of the
+    -- changed rows for every IMV whose `ignore_heal_keys` names this relation.
+    -- An UPDATE queues only keys whose watched columns (every column of the
+    -- source the query references) changed; with no watched list, or when
+    -- that diff cannot be computed (a column type without equality), every
+    -- touched key is queued. Re-queuing a key re-stamps it, so a heal that
+    -- read the older stamp leaves it queued.
+    CREATE OR REPLACE FUNCTION public.__reflex_heal_on_ignored_change()
+    RETURNS trigger LANGUAGE plpgsql AS $fn$
+    DECLARE
+        _h RECORD;
+        _all_keys TEXT;
+        _changed_keys TEXT;
+        _cols TEXT;
+        _enqueue CONSTANT TEXT :=
+            'INSERT INTO public.__reflex_heal_pending (imv_name, partition_key, source) '
+            || 'SELECT DISTINCT $1, k, $2 FROM (%s) s(k) WHERE k IS NOT NULL '
+            || 'ON CONFLICT (imv_name, partition_key) DO UPDATE '
+            || 'SET enqueued_at = clock_timestamp(), source = EXCLUDED.source, last_error = NULL';
+    BEGIN
+        FOR _h IN
+            SELECT r.name, k.key AS source, k.value->>'source_column' AS source_col,
+                   ARRAY(SELECT jsonb_array_elements_text(
+                             COALESCE(k.value->'watched_columns', '[]'::jsonb))) AS relevant
+              FROM public.__reflex_ivm_reference r
+             CROSS JOIN LATERAL jsonb_each(COALESCE(r.aggregations->'ignore_heal_keys', '{}'::jsonb)) k
+             WHERE COALESCE(r.enabled, TRUE)
+               AND to_regclass(k.value->>'relation') = TG_RELID
+        LOOP
+            _all_keys := CASE TG_OP
+                WHEN 'INSERT' THEN format('SELECT %I::text FROM __reflex_heal_new', _h.source_col)
+                WHEN 'DELETE' THEN format('SELECT %I::text FROM __reflex_heal_old', _h.source_col)
+                ELSE format('SELECT %1$I::text FROM __reflex_heal_old UNION SELECT %1$I::text FROM __reflex_heal_new',
+                            _h.source_col)
+            END;
+            IF TG_OP = 'UPDATE' AND cardinality(_h.relevant) > 0 THEN
+                SELECT string_agg(format('%I', c), ', ') INTO _cols
+                  FROM (SELECT DISTINCT unnest(_h.relevant || _h.source_col) AS c) s;
+                _changed_keys := format(
+                    'SELECT %1$I::text FROM ((SELECT %2$s FROM __reflex_heal_old EXCEPT SELECT %2$s FROM __reflex_heal_new) '
+                    || 'UNION ALL (SELECT %2$s FROM __reflex_heal_new EXCEPT SELECT %2$s FROM __reflex_heal_old)) d',
+                    _h.source_col, _cols);
+                BEGIN
+                    EXECUTE format(_enqueue, _changed_keys) USING _h.name, _h.source;
+                    CONTINUE;
+                EXCEPTION WHEN undefined_function THEN
+                    NULL;
+                END;
+            END IF;
+            EXECUTE format(_enqueue, _all_keys) USING _h.name, _h.source;
+        END LOOP;
+        RETURN NULL;
+    END;
+    $fn$;
 
     -- 1.6.0: SQL helper used by the per-partition dispatch DO block emitted
     -- by build_partition_aware_dispatch_sql.  Given a partitioned parent +
@@ -1714,6 +1783,7 @@ mod tests {
     include!("tests/pg_test_status_window_wipe.rs");
     include!("tests/pg_test_ignore_soundness.rs");
     include!("tests/pg_test_capped_source_status.rs");
+    include!("tests/pg_test_ignored_source_heal.rs");
 }
 
 /// This module is required by `cargo pgrx test` invocations.

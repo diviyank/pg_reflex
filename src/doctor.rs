@@ -49,6 +49,7 @@ pub(crate) fn reflex_doctor_impl(
             false,
             drop_orphans,
         ));
+        rows.extend(detect_queued_heals(target, false));
         rows.extend(detect_known_stale_imvs(target, false, drop_orphans));
         rows.extend(detect_requires_explicit_refresh(target, false));
         rows.extend(detect_audit_findings(target, false));
@@ -63,11 +64,57 @@ pub(crate) fn reflex_doctor_impl(
         true,
         drop_orphans,
     ));
+    rows.extend(detect_queued_heals(target, true));
     rows.extend(detect_known_stale_imvs(target, true, drop_orphans));
     rows.extend(detect_requires_explicit_refresh(target, true));
     rows.extend(detect_audit_findings(target, true));
 
     rows
+}
+
+/// IMVs with partitions queued for heal after an ignored source changed (F14).
+///
+/// Runs before the known_stale repairs: a full reconcile rebuilds the queued
+/// partitions too but leaves their queue rows behind, so the IMV would keep
+/// reporting stale. The heal is the remedy that drains its own finding, and
+/// `fixed` is claimed only once the queue for the IMV is empty.
+fn detect_queued_heals(target: Option<&str>, fix: bool) -> Vec<DoctorReportRow> {
+    crate::heal::queued_heals_by_imv()
+        .into_iter()
+        .filter(|(imv, _)| target.is_none_or(|t| t == imv))
+        .map(|(imv, heal)| {
+            let outcome = if fix {
+                heal_and_verify(&imv)
+            } else {
+                "reported".to_string()
+            };
+            (
+                "F14".to_string(),
+                "WARNING".to_string(),
+                imv.clone(),
+                heal.stale_reason(&imv),
+                format!(
+                    "SELECT reflex_heal_ignored_sources('{}');",
+                    imv.replace('\'', "''")
+                ),
+                outcome,
+            )
+        })
+        .collect()
+}
+
+fn heal_and_verify(imv: &str) -> String {
+    if let Some(failure) = crate::heal::heal_ignored_sources_impl(Some(imv), "")
+        .into_iter()
+        .find(|h| h.failed())
+    {
+        return format!("failed:{}", failure.result);
+    }
+    if crate::heal::queued_heals_by_imv().contains_key(imv) {
+        "failed:heal queue not drained".to_string()
+    } else {
+        "fixed".to_string()
+    }
 }
 
 /// Detect pending-queue issues (F1/F2).

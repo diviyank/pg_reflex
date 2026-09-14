@@ -2539,6 +2539,7 @@ fn swap_partition_child_ddl(
         client
             .update(&fill_tgt, None, &[])
             .map_err(|e| format!("fill empty tgt child in place: {}", e))?;
+        let rebuilt_at = clock_timestamp(client);
         let _ = client.update(&format!("ANALYZE {}", tgt_child_qual_probe), None, &[]);
         let rows_after = count_rows(client, &tgt_child_qual_probe);
         log_slice_rebuild_if_changed(
@@ -2547,6 +2548,7 @@ fn swap_partition_child_ddl(
             &tgt_child_qual_probe,
             rows_before_tgt,
             rows_after,
+            rebuilt_at.as_deref(),
         );
         return Ok(());
     }
@@ -2631,6 +2633,7 @@ fn swap_partition_child_ddl(
     client
         .update(&ddl.fill_swap_tgt, None, &[])
         .map_err(|e| format!("fill swap tgt: {}", e))?;
+    let rebuilt_at = clock_timestamp(client);
     let _ = client.update(&format!("ANALYZE {}", ddl.swap_tgt_qual), None, &[]);
     if let Some(ref c) = ddl.check_tgt {
         client
@@ -2763,6 +2766,7 @@ fn swap_partition_child_ddl(
         &tgt_child_qual,
         rows_before_tgt,
         rows_after_tgt,
+        rebuilt_at.as_deref(),
     );
 
     Ok(())
@@ -3146,18 +3150,31 @@ fn event_log_table_exists(client: &pgrx::spi::SpiClient<'_>) -> bool {
         .unwrap_or(false)
 }
 
+fn clock_timestamp(client: &pgrx::spi::SpiClient<'_>) -> Option<String> {
+    client
+        .select("SELECT clock_timestamp()::text AS t", Some(1), &[])
+        .ok()
+        .and_then(|mut it| it.next())
+        .and_then(|r| r.get_by_name::<String, _>("t").ok().flatten())
+}
+
 /// Record a slice-changing rebuild — the artefact the 2026-09 silent wipe
 /// incident had none of. A no-op when the count is known on both sides and
 /// didn't move: the log is for anomalies and slice-changing rebuilds, never
 /// for every commit. When either side couldn't be counted, fails toward
 /// firing — the safe direction for an alarm — and names the unknown side in
 /// `detail` instead of guessing a count.
+///
+/// `rebuilt_at` is taken before the slice's ANALYZE, so that ANALYZE is
+/// recorded as newer than the rebuild and `reflex_ivm_status` treats the
+/// slice's estimate as current.
 fn log_slice_rebuild_if_changed(
     client: &mut pgrx::spi::SpiClient<'_>,
     view_name: &str,
     slice: &str,
     rows_before: Option<i64>,
     rows_after: Option<i64>,
+    rebuilt_at: Option<&str>,
 ) {
     let (changed, detail) = match (rows_before, rows_after) {
         (Some(b), Some(a)) => (b != a, None),
@@ -3179,8 +3196,10 @@ fn log_slice_rebuild_if_changed(
     let _ = client.update(
         &format!(
             "INSERT INTO public.__reflex_event_log \
-               (imv_name, event, trigger_reason, slice, rows_before, rows_after, detail) \
-             VALUES ('{}', 'rebuild', 'partition_swap', '{}', {}, {}, {})",
+               (at, imv_name, event, trigger_reason, slice, rows_before, rows_after, detail) \
+             VALUES (COALESCE({}::timestamptz, clock_timestamp()), \
+                     '{}', 'rebuild', 'partition_swap', '{}', {}, {}, {})",
+            sql_opt_text(rebuilt_at),
             view_name.replace('\'', "''"),
             slice.replace('\'', "''"),
             sql_opt_i64(rows_before),

@@ -899,6 +899,63 @@ pub(crate) fn collect_column_refs(expr: &Expr) -> Vec<Vec<String>> {
     collector.refs
 }
 
+/// Every column reference in `stmts`, subqueries included, as dotted parts
+/// folded the way PostgreSQL folds identifiers (unquoted parts lowercased).
+/// `None` when the statements can read columns no reference names: a wildcard
+/// or whole-row (`alias.*`) projection, or a `USING` / `NATURAL` join.
+pub(crate) fn statement_column_refs(stmts: &[Statement]) -> Option<Vec<Vec<String>>> {
+    #[derive(Default)]
+    struct Refs {
+        refs: Vec<Vec<String>>,
+        implicit_columns: bool,
+    }
+    fn folded(id: &Ident) -> String {
+        match id.quote_style {
+            Some(_) => id.value.clone(),
+            None => id.value.to_lowercase(),
+        }
+    }
+    fn has_wildcard(body: &SetExpr) -> bool {
+        match body {
+            SetExpr::Select(select) => select.projection.iter().any(|item| {
+                matches!(
+                    item,
+                    SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _)
+                )
+            }),
+            SetExpr::SetOperation { left, right, .. } => has_wildcard(left) || has_wildcard(right),
+            SetExpr::Query(query) => has_wildcard(&query.body),
+            _ => false,
+        }
+    }
+    impl Visitor for Refs {
+        type Break = ();
+
+        fn pre_visit_query(&mut self, query: &Query) -> ControlFlow<()> {
+            self.implicit_columns |= has_wildcard(&query.body);
+            ControlFlow::Continue(())
+        }
+
+        fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<()> {
+            match expr {
+                Expr::Identifier(id) => self.refs.push(vec![folded(id)]),
+                Expr::CompoundIdentifier(ids) => self.refs.push(ids.iter().map(folded).collect()),
+                _ => {}
+            }
+            ControlFlow::Continue(())
+        }
+    }
+
+    let mut refs = Refs::default();
+    for stmt in stmts {
+        let _ = stmt.visit(&mut refs);
+        let text = stmt.to_string().to_uppercase();
+        refs.implicit_columns |=
+            text.contains(".*") || text.contains("USING") || text.contains("NATURAL");
+    }
+    (!refs.implicit_columns).then_some(refs.refs)
+}
+
 /// Compute the IMV-relevant column set for each source by walking every
 /// clause of the SELECT EXCEPT the WHERE clause: projection, GROUP BY,
 /// HAVING, JOIN ON, and JOIN USING column lists.
