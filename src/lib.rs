@@ -339,101 +339,77 @@ extension_sql!(
         PRIMARY KEY (imv_name, partition_key)
     );
 
-    -- Heal triggers on an ignored source (src/heal.rs). The trigger runs as the
-    -- writer (SECURITY INVOKER) and evaluates no user-defined function: watched
-    -- columns are compared through their types' output functions
-    -- (`format('%s', col)`, never a cast) and keys are of built-in types only
-    -- (`to_jsonb`), so neither a type owner's cast nor anything else runs with
-    -- another role's rights. The three SECURITY DEFINER helpers below touch only
-    -- pg_reflex's own tables with plain text, so a writer needs no pg_reflex
-    -- grant. The trigger opens no subtransaction and writes nothing when a
-    -- mapped or watched column no longer exists (reflex_ivm_status reports
-    -- that): every writer would otherwise contend on one registry row.
-
-    -- The IMVs whose ignore_heal_keys name `_relid`.
-    CREATE OR REPLACE FUNCTION public.__reflex_heal_targets(_relid regclass)
-    RETURNS TABLE (imv_name TEXT, source TEXT, source_column TEXT, watched_columns TEXT[])
-    LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $fn$
-        SELECT r.name, k.key, k.value->>'source_column',
-               ARRAY(SELECT jsonb_array_elements_text(
-                         COALESCE(k.value->'watched_columns', '[]'::jsonb)))
-          FROM public.__reflex_ivm_reference r
-         CROSS JOIN LATERAL jsonb_each(COALESCE(r.aggregations->'ignore_heal_keys', '{}'::jsonb)) k
-         WHERE COALESCE(r.enabled, TRUE)
-           AND to_regclass(k.value->>'relation') = _relid
-    $fn$;
-
-    -- Queue text keys for one IMV mapped to `_relid`. Re-queuing a key
-    -- re-stamps it, so a heal that read the older stamp leaves it queued.
-    CREATE OR REPLACE FUNCTION public.__reflex_heal_enqueue(_relid regclass, _imv TEXT, _source TEXT, _keys TEXT[])
-    RETURNS void LANGUAGE sql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $fn$
-        INSERT INTO public.__reflex_heal_pending (imv_name, partition_key, source)
-        SELECT DISTINCT t.imv_name, q.key, t.source
-          FROM public.__reflex_heal_targets(_relid) t
-         CROSS JOIN unnest(_keys) AS q(key)
-         WHERE t.imv_name = _imv AND t.source = _source AND q.key IS NOT NULL
-        ON CONFLICT (imv_name, partition_key) DO UPDATE
-           SET enqueued_at = clock_timestamp(), source = EXCLUDED.source, last_error = NULL
-    $fn$;
-
-    -- A TRUNCATE cannot be scoped to keys: mark every IMV mapped to `_relid`
-    -- known_stale, keeping an earlier reason and stale_since. Anyone may call
-    -- this helper, so it acts only on a source that really is empty.
-    CREATE OR REPLACE FUNCTION public.__reflex_heal_mark_truncated(_relid regclass)
-    RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $fn$
-    DECLARE
-        _emptied BOOLEAN;
-    BEGIN
-        EXECUTE format('SELECT NOT EXISTS (SELECT 1 FROM %s)', _relid) INTO _emptied;
-        IF NOT _emptied THEN
-            RETURN;
-        END IF;
-        UPDATE public.__reflex_ivm_reference r
-           SET known_stale = TRUE,
-               stale_since = COALESCE(r.stale_since, now()),
-               stale_reason = CASE WHEN COALESCE(r.known_stale, FALSE) AND COALESCE(r.stale_reason, '') <> ''
-                                   THEN r.stale_reason || ' | ' || m.reason
-                                   ELSE m.reason END
-          FROM (SELECT DISTINCT t.imv_name,
-                       format('ignored source %s was truncated, which no heal can scope. '
-                              || 'Run SELECT reflex_reconcile(%L);', _relid, t.imv_name) AS reason
-                  FROM public.__reflex_heal_targets(_relid) t) m
-         WHERE r.name = m.imv_name
-           AND NOT (COALESCE(r.known_stale, FALSE)
-                    AND position(m.reason IN COALESCE(r.stale_reason, '')) > 0);
-    END;
-    $fn$;
-
+    -- Statement trigger on an ignored source (src/heal.rs). Queues the partition
+    -- keys of the changed rows for every enabled IMV whose `ignore_heal_keys`
+    -- names this relation; an UPDATE queues only keys whose watched columns
+    -- changed. A TRUNCATE cannot be scoped to keys, so it marks those IMVs
+    -- known_stale, keeping an earlier reason and stale_since.
+    --
+    -- SECURITY DEFINER so a writer needs no pg_reflex grant nor USAGE on
+    -- public; a trigger function cannot be called directly, so no role can
+    -- point it at a relation of its choosing. It evaluates no user-defined
+    -- code: watched columns are compared through their types' output functions
+    -- (a NULL flag plus `format('%s', col)`, never a cast), and a key is
+    -- rendered by `to_jsonb` only while its type is built in. It opens no
+    -- subtransaction and writes nothing when a mapped or watched column is
+    -- gone or the key was retyped; reflex_ivm_status derives that instead,
+    -- since every writer of the source would contend on the registry row.
     CREATE OR REPLACE FUNCTION public.__reflex_heal_on_ignored_change()
-    RETURNS trigger LANGUAGE plpgsql
+    RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER
     SET search_path = pg_catalog, pg_temp SET extra_float_digits = 3 AS $fn$
     DECLARE
         _h RECORD;
         _key TEXT;
         _keys TEXT;
         _cols TEXT;
-        _batch TEXT[];
     BEGIN
         IF TG_OP = 'TRUNCATE' THEN
-            PERFORM public.__reflex_heal_mark_truncated(TG_RELID::regclass);
+            UPDATE public.__reflex_ivm_reference r
+               SET known_stale = TRUE,
+                   stale_since = COALESCE(r.stale_since, now()),
+                   stale_reason = CASE WHEN COALESCE(r.known_stale, FALSE) AND COALESCE(r.stale_reason, '') <> ''
+                                       THEN r.stale_reason || ' | ' || m.reason
+                                       ELSE m.reason END
+              FROM (SELECT DISTINCT i.name,
+                           format('ignored source %s was truncated, which no heal can scope. '
+                                  || 'Run SELECT reflex_reconcile(%L);', TG_RELID::regclass, i.name) AS reason
+                      FROM public.__reflex_ivm_reference i
+                     CROSS JOIN LATERAL jsonb_each(COALESCE(i.aggregations->'ignore_heal_keys', '{}'::jsonb)) k
+                     WHERE COALESCE(i.enabled, TRUE)
+                       AND to_regclass(k.value->>'relation') = TG_RELID) m
+             WHERE r.name = m.name
+               AND NOT (COALESCE(r.known_stale, FALSE)
+                        AND position(m.reason IN COALESCE(r.stale_reason, '')) > 0);
             RETURN NULL;
         END IF;
-        FOR _h IN SELECT * FROM public.__reflex_heal_targets(TG_RELID::regclass) LOOP
+        FOR _h IN
+            SELECT r.name, k.key AS source, k.value->>'source_column' AS source_column,
+                   ARRAY(SELECT jsonb_array_elements_text(
+                             COALESCE(k.value->'watched_columns', '[]'::jsonb))) AS watched
+              FROM public.__reflex_ivm_reference r
+             CROSS JOIN LATERAL jsonb_each(COALESCE(r.aggregations->'ignore_heal_keys', '{}'::jsonb)) k
+             WHERE COALESCE(r.enabled, TRUE)
+               AND to_regclass(k.value->>'relation') = TG_RELID
+        LOOP
             CONTINUE WHEN EXISTS (
-                SELECT 1 FROM unnest(_h.watched_columns || _h.source_column) AS c
+                SELECT 1 FROM unnest(_h.watched || _h.source_column) AS c
                  WHERE NOT EXISTS (SELECT 1 FROM pg_attribute a
                                     WHERE a.attrelid = TG_RELID AND a.attname = c
                                       AND a.attnum > 0 AND NOT a.attisdropped));
+            CONTINUE WHEN NOT EXISTS (
+                SELECT 1 FROM pg_attribute a JOIN pg_type t ON t.oid = a.atttypid
+                 WHERE a.attrelid = TG_RELID AND a.attname = _h.source_column
+                   AND t.typnamespace = 'pg_catalog'::regnamespace);
             _key := format('to_jsonb(%I) #>> ''{}''', _h.source_column);
             IF TG_OP = 'INSERT' THEN
                 _keys := format('SELECT %s FROM __reflex_heal_new', _key);
             ELSIF TG_OP = 'DELETE' THEN
                 _keys := format('SELECT %s FROM __reflex_heal_old', _key);
-            ELSIF cardinality(_h.watched_columns) = 0 THEN
+            ELSIF cardinality(_h.watched) = 0 THEN
                 _keys := format('SELECT %1$s FROM __reflex_heal_old UNION SELECT %1$s FROM __reflex_heal_new', _key);
             ELSE
-                SELECT string_agg(format('format(''%%s'', %I)', c), ', ') INTO _cols
-                  FROM unnest(_h.watched_columns) AS c;
+                SELECT string_agg(format('(%1$I IS NULL), format(''%%s'', %1$I)', c), ', ') INTO _cols
+                  FROM unnest(_h.watched) AS c;
                 _keys := format(
                     'SELECT d.__reflex_heal_key FROM ('
                     || '(SELECT %1$s AS __reflex_heal_key, %2$s FROM __reflex_heal_old '
@@ -442,11 +418,13 @@ extension_sql!(
                     || 'EXCEPT SELECT %1$s, %2$s FROM __reflex_heal_old)) d',
                     _key, _cols);
             END IF;
-            EXECUTE format('SELECT array_agg(DISTINCT k) FROM (%s) s(k) WHERE k IS NOT NULL', _keys)
-               INTO _batch;
-            IF _batch IS NOT NULL THEN
-                PERFORM public.__reflex_heal_enqueue(TG_RELID::regclass, _h.imv_name, _h.source, _batch);
-            END IF;
+            EXECUTE format(
+                'INSERT INTO public.__reflex_heal_pending (imv_name, partition_key, source) '
+                || 'SELECT DISTINCT $1, k, $2 FROM (%s) s(k) WHERE k IS NOT NULL '
+                || 'ON CONFLICT (imv_name, partition_key) DO UPDATE '
+                || 'SET enqueued_at = clock_timestamp(), source = EXCLUDED.source, last_error = NULL',
+                _keys)
+            USING _h.name, _h.source;
         END LOOP;
         RETURN NULL;
     END;
