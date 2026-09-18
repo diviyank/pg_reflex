@@ -28,6 +28,7 @@ fn swi_imv_rows_for(dp: i64) -> i64 {
 }
 
 fn swi_build_fixture(status: &str) {
+    lock_shared_fixtures();
     Spi::run("CREATE TABLE swi_dp (id BIGINT PRIMARY KEY, status TEXT NOT NULL)").expect("dp");
     Spi::run(&format!(
         "INSERT INTO swi_dp VALUES (471, '{status}'), (9, 'validated')"
@@ -243,6 +244,7 @@ fn swi_status_return_does_not_heal() {
 // ---------------------------------------------------------------------------
 
 fn dfx_build() {
+    lock_shared_fixtures();
     Spi::run("CREATE TABLE dfx_src (id BIGINT, val TEXT)").expect("src");
     Spi::run("INSERT INTO dfx_src VALUES (1, 'a')").expect("seed");
     let r = Spi::get_one::<String>(

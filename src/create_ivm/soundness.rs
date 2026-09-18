@@ -569,7 +569,7 @@ pub(crate) fn source_registered_group_key(source: &str) -> Option<Vec<String>> {
                     .unwrap_or(None)
             })
             .next()
-            .and_then(|cols| if cols.is_empty() { None } else { Some(cols) })
+            .filter(|cols| !cols.is_empty())
     })
 }
 
