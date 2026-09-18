@@ -1636,6 +1636,15 @@ mod tests {
         "Hello, pg_reflex"
     }
 
+    /// Serializes the tests whose fixtures create fixed-name objects. Run in
+    /// parallel, one such test blocks on another's uncommitted names while
+    /// holding the `__reflex_deferred_pending` lock a DEFERRED create takes,
+    /// and the pair deadlocks. Call before creating anything.
+    fn lock_shared_fixtures() {
+        Spi::run("SELECT pg_advisory_xact_lock(hashtext('pg_reflex shared test fixtures'))")
+            .expect("shared fixture lock");
+    }
+
     /// Verify IMV matches a fresh computation using EXCEPT ALL oracle.
     fn assert_imv_correct(imv: &str, fresh_sql: &str) {
         let check = format!(

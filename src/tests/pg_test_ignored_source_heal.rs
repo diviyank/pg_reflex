@@ -234,6 +234,8 @@ fn ish_diverging(imv: &str, cols: &str, query: &str) -> i64 {
     .unwrap_or(-1)
 }
 
+// `pg_stat_get_backend_subxact` exists from PostgreSQL 16.
+#[cfg(not(feature = "pg15"))]
 fn ish_subxact_state() -> String {
     Spi::run("SELECT pg_stat_clear_snapshot()").expect("clear stats snapshot");
     Spi::get_one::<String>(
@@ -396,6 +398,7 @@ fn ish_writer_without_reflex_grants_can_write_the_ignored_source() {
 
 /// F6: queuing must not consume a subtransaction per statement; 64 of them
 /// overflow the backend's subxid cache.
+#[cfg(not(feature = "pg15"))]
 #[pg_test]
 fn ish_status_updates_consume_no_subtransactions() {
     swi_build_fixture("validated");
@@ -469,6 +472,7 @@ fn ish_truncate_of_the_ignored_source_marks_the_imv_stale() {
 /// `boom` (a plain error) and `cancel` (a query cancel). Only a heal evaluates
 /// it on those statuses: `ish_gd` is ignored.
 fn ish_gated_fixture() {
+    lock_shared_fixtures();
     Spi::run(
         "CREATE FUNCTION ish_gate(status TEXT) RETURNS BOOLEAN LANGUAGE plpgsql IMMUTABLE AS $$ \
          BEGIN \
@@ -799,6 +803,7 @@ fn ish_no_heal_function_is_directly_callable() {
 
 /// An IMV over `ish_nf` keeping the partitions whose `ish_nd.note` is NULL.
 fn ish_null_note_fixture() -> &'static str {
+    lock_shared_fixtures();
     Spi::run("CREATE TABLE ish_nd (id BIGINT PRIMARY KEY, note TEXT)").expect("nd");
     Spi::run("INSERT INTO ish_nd VALUES (1, NULL), (2, NULL)").expect("seed nd");
     Spi::run(
