@@ -219,7 +219,7 @@ extension_sql!(
     -- stripped before `ignored_sources` is written — a marker-bearing entry
     -- would stop matching the runtime `= ANY(depends_on)` / array-overlap skip
     -- and the ignore would silently stop working. The raw list (markers intact)
-    -- lives on in `create_args` so `reflex_rebuild_imv` replays the ack and the
+    -- lives on in `create_args` so `reflex_rebuild_chain` replays the ack and the
     -- IMV stays rebuildable.
     ALTER TABLE public.__reflex_ivm_reference
         ADD COLUMN IF NOT EXISTS ignore_ack TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[];
@@ -551,7 +551,7 @@ const DEFAULT_TOPK_K: usize = 16;
 ///
 /// Entries are kept VERBATIM, including any leading `!` soundness-acknowledgement
 /// marker (A1). Stripping here would drop the ack from `create_args`, so
-/// `reflex_rebuild_imv` would replay the create without it, the create-time
+/// `reflex_rebuild_chain` would replay the create without it, the create-time
 /// soundness check would refuse the replay, and the IMV would become
 /// unrebuildable. The marker is removed at the points that consume the list —
 /// see [`crate::sql_writer::registry::split_ignore_ack`].
