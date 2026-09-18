@@ -620,26 +620,41 @@ impl QueuedHeal {
 }
 
 /// IMVs a heal can no longer reach, with the reason: a mapped or watched column
-/// of one of their ignored sources was renamed or dropped, so the trigger skips
-/// every change to that source. Derived from the catalog on read, not recorded
-/// by the trigger, which must not write a registry row every writer of the
-/// source would then contend on.
+/// of one of their ignored sources was renamed or dropped, or the mapped column
+/// was retyped to a type outside `pg_catalog`, so the trigger skips every change
+/// to that source. Derived from the catalog on read, not recorded by the
+/// trigger, which must not write a registry row every writer of the source
+/// would then contend on.
 pub(crate) fn unhealable_reasons_by_imv() -> BTreeMap<String, String> {
     Spi::connect(|client| {
         let Ok(rows) = client.select(
-            "SELECT r.name, k.value->>'relation' AS relation, \
-                    string_agg(c.col, ', ' ORDER BY c.col) AS missing \
-               FROM public.__reflex_ivm_reference r \
-              CROSS JOIN LATERAL jsonb_each(COALESCE(r.aggregations->'ignore_heal_keys', '{}'::jsonb)) k \
+            "WITH heal AS ( \
+                 SELECT r.name, k.value->>'relation' AS relation, \
+                        k.value->>'source_column' AS source_column, \
+                        COALESCE(k.value->'watched_columns', '[]'::jsonb) AS watched \
+                   FROM public.__reflex_ivm_reference r \
+                  CROSS JOIN LATERAL jsonb_each(COALESCE(r.aggregations->'ignore_heal_keys', '{}'::jsonb)) k \
+                  WHERE COALESCE(r.enabled, TRUE)) \
+             SELECT h.name, format('ignored source %s no longer has column(s) %s', h.relation, \
+                                   string_agg(c.col, ', ' ORDER BY c.col)) AS cause \
+               FROM heal h \
               CROSS JOIN LATERAL ( \
                     SELECT DISTINCT col FROM jsonb_array_elements_text( \
-                        COALESCE(k.value->'watched_columns', '[]'::jsonb) \
-                        || jsonb_build_array(k.value->>'source_column')) AS col) c \
-              WHERE COALESCE(r.enabled, TRUE) \
-                AND NOT EXISTS (SELECT 1 FROM pg_attribute a \
-                                 WHERE a.attrelid = to_regclass(k.value->>'relation') \
+                        h.watched || jsonb_build_array(h.source_column)) AS col) c \
+              WHERE NOT EXISTS (SELECT 1 FROM pg_attribute a \
+                                 WHERE a.attrelid = to_regclass(h.relation) \
                                    AND a.attname = c.col AND a.attnum > 0 AND NOT a.attisdropped) \
-              GROUP BY r.name, k.value->>'relation'",
+              GROUP BY h.name, h.relation \
+             UNION ALL \
+             SELECT h.name, format('ignored source %s column %s is no longer of a built-in type', \
+                                   h.relation, h.source_column) \
+               FROM heal h \
+               JOIN pg_attribute a ON a.attrelid = to_regclass(h.relation) \
+                                  AND a.attname = h.source_column \
+                                  AND a.attnum > 0 AND NOT a.attisdropped \
+               JOIN pg_type t ON t.oid = a.atttypid \
+              WHERE t.typnamespace <> 'pg_catalog'::regnamespace \
+              ORDER BY 1, 2",
             None,
             &[],
         ) else {
@@ -648,14 +663,12 @@ pub(crate) fn unhealable_reasons_by_imv() -> BTreeMap<String, String> {
         let mut reasons: BTreeMap<String, String> = BTreeMap::new();
         for row in rows {
             let text = |col: &str| row.get_by_name::<String, _>(col).ok().flatten();
-            let (Some(name), Some(relation), Some(missing)) =
-                (text("name"), text("relation"), text("missing"))
-            else {
+            let (Some(name), Some(cause)) = (text("name"), text("cause")) else {
                 continue;
             };
             let reason = format!(
-                "ignored source {relation} no longer has column(s) {missing}, so its changes can \
-                 no longer be healed. Recreate the IMV against its current columns."
+                "{cause}, so its changes can no longer be healed. Recreate the IMV against its \
+                 current columns."
             );
             reasons
                 .entry(name)
