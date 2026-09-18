@@ -6,6 +6,7 @@
 // command, and is what prints `relation … already exists, skipping`.
 
 fn rln_record_skipped_creates() {
+    lock_shared_fixtures();
     Spi::run("CREATE TABLE rln_ddl_log (tag TEXT)").expect("ddl log");
     Spi::run(
         "CREATE FUNCTION rln_log_ddl() RETURNS event_trigger LANGUAGE plpgsql AS $$ \
@@ -34,6 +35,7 @@ const RLN_DEPENDENT_SQL: &str = "SELECT k, SUM(total) AS t FROM rln_p GROUP BY k
 
 /// A partitioned aggregate IMV `rln_p` over three leaves, read by `rln_d`.
 fn rln_partitioned_with_dependent() {
+    lock_shared_fixtures();
     Spi::run(
         "CREATE TABLE rln_s (k TEXT NOT NULL, bucket INT NOT NULL, amt NUMERIC) \
          PARTITION BY LIST (k)",
@@ -121,6 +123,7 @@ fn rln_new_source_leaf_is_still_mirrored() {
 /// transaction, not re-issued by every later flush of the batch.
 #[pg_test]
 fn rln_cross_source_marker_is_created_once_per_batch() {
+    lock_shared_fixtures();
     Spi::run("CREATE TABLE rln_xa (id INT PRIMARY KEY, g INT, m NUMERIC)").unwrap();
     Spi::run("CREATE TABLE rln_xb (id INT PRIMARY KEY, g INT, w NUMERIC)").unwrap();
     Spi::run("INSERT INTO rln_xa VALUES (1,1,10),(2,1,20),(3,2,30)").unwrap();
