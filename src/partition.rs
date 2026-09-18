@@ -1594,11 +1594,7 @@ pub(crate) fn reflex_sync_partitions_impl(view_name: &str, drop_orphans: bool) -
         let mut disabled_roots: Vec<&String> = Vec::new();
         let mut disable_err: Option<String> = None;
         for root in &drain_roots {
-            match client.update(
-                &format!("ALTER TABLE {} DISABLE TRIGGER USER", root),
-                None,
-                &[],
-            ) {
+            match toggle_relocation_triggers(client, root, false) {
                 Ok(_) => disabled_roots.push(root),
                 Err(e) => {
                     disable_err = Some(format!(
@@ -1611,11 +1607,7 @@ pub(crate) fn reflex_sync_partitions_impl(view_name: &str, drop_orphans: bool) -
         }
         if let Some(e) = disable_err {
             for root in &disabled_roots {
-                let _ = client.update(
-                    &format!("ALTER TABLE {} ENABLE TRIGGER USER", root),
-                    None,
-                    &[],
-                );
+                let _ = toggle_relocation_triggers(client, root, true);
             }
             return Err(e);
         }
@@ -1637,6 +1629,11 @@ pub(crate) fn reflex_sync_partitions_impl(view_name: &str, drop_orphans: bool) -
             // before this transaction, so nothing in them is worth preserving —
             // see `record_fresh_partitions`.
             let mut created_children: Vec<String> = Vec::new();
+            // An existing child needs no `CREATE TABLE IF NOT EXISTS`, which
+            // would only print `already exists, skipping`. A dropped orphan's
+            // CASCADE may remove a relation `existing_children` still lists,
+            // so after the first drop every create is issued again.
+            let mut existing_children_current = true;
 
             for node in &nodes {
                 let int_name = intermediate_child_name(view_name, &node.bare_name);
@@ -1663,14 +1660,16 @@ pub(crate) fn reflex_sync_partitions_impl(view_name: &str, drop_orphans: bool) -
                     // to the incoming child AND mapped to no live source leaf
                     // — never a broader drop_orphans-style sweep. Mirrors the
                     // F3 heal in `execute_partition_swap_for_child`.
-                    drop_bound_collision_orphan(
+                    if drop_bound_collision_orphan(
                         client,
                         schema,
                         &ddl.int_parent_qual,
                         &src_expected_int,
                         &int_name,
                         &node.bound_expr,
-                    )?;
+                    )? {
+                        existing_children_current = false;
+                    }
                     if build_int_detached {
                         client
                             .update(&detached.int_create, None, &[])
@@ -1678,7 +1677,7 @@ pub(crate) fn reflex_sync_partitions_impl(view_name: &str, drop_orphans: bool) -
                                 format!("sync: create detached intermediate node: {}", e)
                             })?;
                         pending_attach.push(detached.int_attach.clone());
-                    } else {
+                    } else if int_is_new || !existing_children_current {
                         client
                             .update(&ddl.int_ddl, None, &[])
                             .map_err(|e| format!("sync: create intermediate node: {}", e))?;
@@ -1690,20 +1689,22 @@ pub(crate) fn reflex_sync_partitions_impl(view_name: &str, drop_orphans: bool) -
                         out.added_intermediate += 1;
                     }
                 }
-                drop_bound_collision_orphan(
+                if drop_bound_collision_orphan(
                     client,
                     schema,
                     &ddl.tgt_parent_qual,
                     &src_expected_tgt,
                     &tgt_name,
                     &node.bound_expr,
-                )?;
+                )? {
+                    existing_children_current = false;
+                }
                 if build_tgt_detached {
                     client
                         .update(&detached.tgt_create, None, &[])
                         .map_err(|e| format!("sync: create detached target node: {}", e))?;
                     pending_attach.push(detached.tgt_attach.clone());
-                } else {
+                } else if tgt_is_new || !existing_children_current {
                     client
                         .update(&ddl.tgt_ddl, None, &[])
                         .map_err(|e| format!("sync: create target node: {}", e))?;
@@ -1736,11 +1737,7 @@ pub(crate) fn reflex_sync_partitions_impl(view_name: &str, drop_orphans: bool) -
         // continuing transaction, even when the relocation itself failed.
         let mut restore_err: Option<String> = None;
         for root in &disabled_roots {
-            if let Err(e) = client.update(
-                &format!("ALTER TABLE {} ENABLE TRIGGER USER", root),
-                None,
-                &[],
-            ) {
+            if let Err(e) = toggle_relocation_triggers(client, root, true) {
                 if restore_err.is_none() {
                     restore_err = Some(format!("sync: restore triggers on {}: {}", root, e));
                 }
@@ -1780,6 +1777,43 @@ pub(crate) fn reflex_sync_partitions_impl(view_name: &str, drop_orphans: bool) -
     }
 }
 
+/// `ALTER TABLE <root> {DISABLE|ENABLE} TRIGGER USER` around the default
+/// relocation, with `pg_reflex.internal_trigger_toggle_root` naming `root` for
+/// exactly that statement. The toggle changes no column and is always undone,
+/// so `__reflex_on_ddl_command_end` must not report it to `root`'s dependents as
+/// a source change; under `alter_source_policy = 'error'` that report aborted
+/// the reconcile. A user's ALTER, even of `root` in the same transaction, runs
+/// with the GUC cleared and is still reported.
+fn toggle_relocation_triggers(
+    client: &mut pgrx::spi::SpiClient<'_>,
+    root: &str,
+    enable: bool,
+) -> Result<(), pgrx::spi::Error> {
+    let _ = client.update(
+        &format!(
+            "SET LOCAL pg_reflex.internal_trigger_toggle_root = '{}'",
+            root.replace('\'', "''")
+        ),
+        None,
+        &[],
+    );
+    let toggled = client.update(
+        &format!(
+            "ALTER TABLE {} {} TRIGGER USER",
+            root,
+            if enable { "ENABLE" } else { "DISABLE" }
+        ),
+        None,
+        &[],
+    );
+    let _ = client.update(
+        "SET LOCAL pg_reflex.internal_trigger_toggle_root = ''",
+        None,
+        &[],
+    );
+    toggled.map(|_| ())
+}
+
 /// Drop a CONFIRMED orphan DIRECT CHILD of `parent_qual` whose `FOR VALUES`
 /// bound is byte-identical to `about_to_attach`'s: a `CREATE TABLE ...
 /// PARTITION OF <parent_qual> ... FOR VALUES <bound>` would otherwise raise
@@ -1797,7 +1831,7 @@ pub(crate) fn reflex_sync_partitions_impl(view_name: &str, drop_orphans: bool) -
 /// parent, so on a multi-level tree it compares the root's direct children
 /// against a leaf's bound, never matches, and silently heals nothing. Tracked
 /// in `untreated_bugs/2026-07-25_swap_f3_heal_wrong_parent_scope_multilevel.md`
-/// — do not copy that scoping here.
+/// — do not copy that scoping here. Returns whether a child was dropped.
 fn drop_bound_collision_orphan(
     client: &mut pgrx::spi::SpiClient<'_>,
     schema: &str,
@@ -1805,10 +1839,11 @@ fn drop_bound_collision_orphan(
     expected: &std::collections::HashSet<String>,
     about_to_attach: &str,
     bound_expr: &str,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     if bound_expr.is_empty() {
-        return Ok(());
+        return Ok(false);
     }
+    let mut dropped = false;
     for child in list_partition_children(client, parent_qual) {
         if child.bare_name == about_to_attach || expected.contains(&child.bare_name) {
             continue;
@@ -1829,9 +1864,10 @@ fn drop_bound_collision_orphan(
                 child.bare_name,
                 about_to_attach
             );
+            dropped = true;
         }
     }
-    Ok(())
+    Ok(dropped)
 }
 
 /// Implementation of `reflex_reconcile_partition(view_name, partition_keys)`.

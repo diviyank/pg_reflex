@@ -1240,6 +1240,7 @@ extension_sql!(
         _sync_key TEXT;
         _reconcile_root TEXT;
         _swap_root TEXT;
+        _toggle_root TEXT;
     BEGIN
         -- pg_reflex's own atomic partition swap (partition.rs
         -- `execute_partition_swap_for_child`) publishes the IMV it is rebuilding
@@ -1279,6 +1280,12 @@ extension_sql!(
         -- nodes of the active chain only — a DIFFERENT root that reads the same
         -- node still warns, because that consumer really did miss the refresh.
         _reconcile_root := NULLIF(current_setting('pg_reflex.internal_reconcile_root', true), '');
+
+        -- Relation whose triggers reflex_sync_partitions is toggling around a
+        -- partition relocation, set for that one ALTER only
+        -- (partition.rs `toggle_relocation_triggers`). The toggle changes no
+        -- column and is always undone, so it is not reported as a source change.
+        _toggle_root := NULLIF(current_setting('pg_reflex.internal_trigger_toggle_root', true), '');
 
         -- 1.6.0: auto-sync IMV partitions when a source's partition tree changes.
         --
@@ -1410,6 +1417,8 @@ extension_sql!(
             WHERE command_tag = 'ALTER TABLE'
         LOOP
             _src := _cmd.object_identity;
+            CONTINUE WHEN _toggle_root IS NOT NULL
+                      AND to_regclass(_src) = to_regclass(_toggle_root);
             FOR _imv IN
                 SELECT name FROM public.__reflex_ivm_reference
                 WHERE depends_on @> ARRAY[_src]
@@ -1825,6 +1834,7 @@ mod tests {
     include!("tests/pg_test_ignore_soundness.rs");
     include!("tests/pg_test_capped_source_status.rs");
     include!("tests/pg_test_ignored_source_heal.rs");
+    include!("tests/pg_test_reconcile_log_noise.rs");
 }
 
 /// This module is required by `cargo pgrx test` invocations.
