@@ -443,7 +443,7 @@ pub fn reflex_flush_deferred(source_table: &str) -> String {
             })
             .unwrap_or(false);
         let engage_cross_source_guard = batch_has_multiple_sources || marker_exists;
-        if engage_cross_source_guard {
+        if engage_cross_source_guard && !marker_exists {
             // ON COMMIT DROP: one marker per transaction, shared across the
             // per-source flush calls (the constraint trigger flushes each
             // mutated source separately), auto-removed at commit. Records the
