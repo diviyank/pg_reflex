@@ -17,6 +17,7 @@ use crate::schema_builder::{
     build_staging_table_ddl, build_target_table_ddl, build_trigger_ddls, resolve_column_type,
 };
 use crate::sql_analyzer::{analyze, SqlAnalysisError};
+use crate::sql_writer::registry::{split_ignore_ack, strip_ignore_ack_marker};
 use crate::sql_writer::{
     add_graph_child_links, insert_registry_row, AggregationsCast, RegistryRow,
 };
@@ -391,26 +392,30 @@ fn validate_select_columns(ctx: &BuildContext) {
     }
 }
 
-/// Pre-flight checks: reject duplicate view name (or skip-noop on
-/// `if_not_exists`), detect cycles in the IMV dependency DAG. Returns the
-/// short-circuit string when the create should stop, `None` to continue.
-fn check_existence_and_cycle(ctx: &BuildContext) -> Option<&'static str> {
-    let already_exists = Spi::connect(|client| {
+/// Is an IMV of this name already in the registry? One definition, shared by
+/// the duplicate-name pre-flight and by the A1 soundness gate, which must not
+/// fire on a call that will short-circuit as a no-op.
+fn imv_is_registered(view_name: &str) -> bool {
+    Spi::connect(|client| {
         !client
             .select(
                 "SELECT 1 FROM public.__reflex_ivm_reference WHERE name = $1",
                 None,
                 &[unsafe {
-                    DatumWithOid::new(
-                        ctx.view_name.to_string(),
-                        PgBuiltInOids::TEXTOID.oid().value(),
-                    )
+                    DatumWithOid::new(view_name.to_string(), PgBuiltInOids::TEXTOID.oid().value())
                 }],
             )
             .unwrap_or_report()
             .collect::<Vec<_>>()
             .is_empty()
-    });
+    })
+}
+
+/// Pre-flight checks: reject duplicate view name (or skip-noop on
+/// `if_not_exists`), detect cycles in the IMV dependency DAG. Returns the
+/// short-circuit string when the create should stop, `None` to continue.
+fn check_existence_and_cycle(ctx: &BuildContext) -> Option<&'static str> {
+    let already_exists = imv_is_registered(ctx.view_name);
     if already_exists {
         if ctx.if_not_exists {
             return Some("REFLEX INCREMENTAL VIEW ALREADY EXISTS (skipped)");
@@ -1177,11 +1182,10 @@ fn install_source_triggers(client: &mut pgrx::spi::SpiClient<'_>, ctx: &BuildCon
         }
 
         let (_, source_bare) = split_qualified_name(source);
-        if ctx
-            .ignore_sources
-            .iter()
-            .any(|s| s == source || s == source_bare)
-        {
+        if ctx.ignore_sources.iter().any(|s| {
+            let s = strip_ignore_ack_marker(s);
+            s == source || s == source_bare
+        }) {
             info!(
                 "pg_reflex: skipping trigger install on source '{}' for IMV '{}' (ignored)",
                 source, ctx.view_name
@@ -1561,11 +1565,10 @@ fn all_real_sources_are_matviews(client: &SpiClient<'_>, ctx: &BuildContext) -> 
             continue;
         }
         let (_, source_bare) = split_qualified_name(source);
-        if ctx
-            .ignore_sources
-            .iter()
-            .any(|s| s == source || s == source_bare)
-        {
+        if ctx.ignore_sources.iter().any(|s| {
+            let s = strip_ignore_ack_marker(s);
+            s == source || s == source_bare
+        }) {
             continue;
         }
         saw_real_source = true;
@@ -1924,6 +1927,55 @@ pub(crate) fn create_reflex_ivm_impl_with_materialization(
 
     warn_on_bare_name_under_nonpublic_search_path(view_name);
 
+    // A1: refuse an ignore whose source can determine this IMV's contents. Such
+    // an IMV is silently invalidated by a change it will never see, and a later
+    // rebuild from the base query makes the divergence permanent. Runs before
+    // any DDL and before decomposition, so a CTE query is judged as written
+    // rather than after being split into sub-IMVs.
+    if let Some(bad) = ignore_sources
+        .iter()
+        .find(|e| strip_ignore_ack_marker(e).is_empty())
+    {
+        return crate::reflex_reject(&format!(
+            "ignore_sources entry '{bad}' names no source. The '!' prefix acknowledges an \
+             unsound ignore and must be followed by the source name, e.g. '!schema.table'."
+        ));
+    }
+    let (ignored_clean, ignored_acked) = split_ignore_ack(ignore_sources);
+    // `if_not_exists` on an IMV that already exists is a no-op: refusing it
+    // protects nothing (the unsound IMV goes on existing either way) and breaks
+    // idempotent deployment re-runs. Judge only calls that would build.
+    let creates_nothing = if_not_exists && imv_is_registered(view_name);
+    let unacked = if creates_nothing {
+        None
+    } else {
+        ignore_soundness::unsound_ignored_sources_parsed(
+            &parsed.parsed_sql,
+            &parsed.analysis,
+            &ignored_clean,
+        )
+        .into_iter()
+        .find(|(src, _)| !ignored_acked.contains(src))
+    };
+    if let Some((src, reason)) = unacked {
+        // The working remedy comes FIRST, right after the two names. Consumers
+        // truncate: __reflex_doctor_try_repair caps at 400 characters, and a
+        // message whose actionable half is cut off is a finding an operator
+        // cannot clear. reflex_ack_ignore_source is the only remedy that works
+        // on every path, including rebuild (which takes no ignore_sources
+        // argument), so it must land before the variable-length reason and the
+        // other alternatives.
+        return crate::reflex_reject(&format!(
+            "ignoring source '{src}' is unsound for IMV '{view_name}'. \
+             Fix: run SELECT reflex_ack_ignore_source('{view_name}', '{src}'); \
+             which works on every path including rebuild. Alternatives: pass '!{src}' in \
+             ignore_sources at create time, drop '{src}' from ignore_sources, or drop the \
+             reference from the query. Reason: {reason}. Changes to '{src}' will not \
+             refresh this IMV, so it can silently diverge, and a later rebuild from the \
+             base query makes that permanent."
+        ));
+    }
+
     // The `unique_columns` argument may carry per-CTE keys after the outer key
     // (`'<outer> ; <cte alias> : <cols> ; ...'`). Strip them so only the outer
     // key reaches the non-CTE paths; the map is consumed by CTE decomposition.
@@ -2007,7 +2059,7 @@ pub(crate) fn create_reflex_ivm_impl_with_materialization(
         deferred,
         storage_upper,
         mode_upper,
-        parsed_sql: _,
+        parsed_sql,
         mut analysis,
     } = parsed;
 
@@ -2111,6 +2163,19 @@ pub(crate) fn create_reflex_ivm_impl_with_materialization(
         }
 
         install_source_triggers(client, &ctx);
+        let ignored_clean: Vec<String> = ctx
+            .ignore_sources
+            .iter()
+            .map(|s| strip_ignore_ack_marker(s).to_string())
+            .collect();
+        ctx.plan.ignore_heal_keys = crate::heal::install_heal_triggers(
+            client,
+            ctx.view_name,
+            &ctx.analysis,
+            &parsed_sql,
+            &ignored_clean,
+            &ctx.plan.partition_columns,
+        );
         install_deferred_flush_if_needed(client, &ctx);
 
         install_min_max_indexes(client, &ctx);
@@ -2127,6 +2192,10 @@ pub(crate) fn create_reflex_ivm_impl_with_materialization(
 
 mod admin;
 mod decompose;
+/// A1 create-time `ignore_sources` soundness check. Crate-visible because the
+/// `ignore-soundness` audit check calls `unsound_ignored_sources` from
+/// `crate::audit` rather than re-implementing the resolver.
+pub(crate) mod ignore_soundness;
 mod soundness;
 
 pub(crate) use admin::*;

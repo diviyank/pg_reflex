@@ -2,6 +2,203 @@
 
 ## [Unreleased]
 
+## [1.11.4] - 2026-09-18
+
+Silent-wipe observability and prevention. In the field a 1.86 M-row
+forecast IMV was emptied to 2 161 rows by a partition swap evaluated while
+its own status filter excluded the slice, and `reflex_ivm_status()` kept
+reporting `known_stale = false`, `last_error = NULL` and the pre-wipe row
+count. On a dev cluster, four partition source roots had been capped at the
+flush failure cap for up to six weeks — every later flush skipped them —
+while every dependent IMV reported healthy, because a full reconcile clears
+`known_stale` but never re-arms the root. This release makes those states
+visible, records them durably, lets an operator make a flush failure abort
+the caller, refuses at create time the `ignore_sources` shape that caused
+the wipe, and heals the incident shape: a change to an ignored source that
+joins onto the partition key queues exactly the affected partitions for
+rebuild. `ALTER EXTENSION pg_reflex UPDATE TO '1.11.4';`
+
+---
+
+### Fixed
+
+- **(SILENT) A caught deferred-flush failure left the IMV looking healthy.**
+  The per-IMV handler discarded the staged delta and recorded `last_error`,
+  but never set `known_stale`, and the next successful flush cleared
+  `last_error` — erasing the only evidence of a missed change. The handler
+  now sets `known_stale` with a `stale_reason` that names the failure and
+  prescribes `reflex_reconcile('<imv>')`, and a successful flush keeps
+  `last_error` while the IMV is still stale.
+- **(SILENT) `reflex_ivm_status()` reported the pre-wipe row count.**
+  `row_count` is the planner estimate `reltuples`, which a partition-scoped
+  rebuild never refreshes on the parent. An IMV carrying an anomaly —
+  `known_stale`, a retained `last_error`, or a slice-changing rebuild newer
+  than the target's last `ANALYZE` — is now counted exactly, and the new
+  `is_estimate` column says which one the caller got.
+- **(SILENT) An IMV whose partition source is capped reported healthy.**
+  A source root that fails five consecutive partition flushes is skipped by
+  every later flush with only a `WARNING`. `reflex_ivm_status()` now reports
+  every IMV depending on a capped root — directly or through other IMVs — as
+  `known_stale`, with the root, its failure count, its last error and the
+  `reflex_reset_partition_failures` + `reflex_flush_partition_source` remedy
+  in `stale_reason`. Derived live from the queue, so a reconcile cannot hide
+  it and the report clears exactly when the root drains.
+- **(SILENT, CREATE-TIME) `create_reflex_ivm` accepted an unsound
+  `ignore_sources` entry.** Ignoring a source the query filters or
+  inner-joins on means a change to it never refreshes the IMV, and a later
+  partition rebuild from the base query makes the divergence permanent for
+  the slices it rewrites — the mechanism of the field wipe. Such an entry is
+  now refused unless acknowledged; see *Changed*.
+- **(SILENT) A slice emptied while an ignored source excluded it never
+  healed.** A partition swap evaluated while `demand_planning.status` was
+  outside the IMV's filter correctly wrote zero rows, and when the status
+  returned nothing refreshed the IMV, because `demand_planning` is ignored.
+  When an ignored source joins by equality onto the expression the IMV's
+  first partition column projects, `create_reflex_ivm` now installs
+  statement triggers on it that queue the changed rows' partition keys into
+  `__reflex_heal_pending` (an `UPDATE` only when a column the query reads
+  changed). The write itself never rebuilds. Until a sweep heals it, the
+  IMV and every IMV reading it report `known_stale` with the
+  `reflex_heal_ignored_sources('<imv>')` remedy. Ignored sources that
+  cannot be mapped to partitions keep the previous contract: a source read
+  more than once, a join other than `INNER` or a `LEFT JOIN` of the source,
+  an `OR`, or a key column that is not of a built-in type matching the
+  partition column's (same type, two integer types, or `text` and
+  `varchar`). The trigger function is `SECURITY DEFINER`, so a writer
+  needs no pg_reflex grant nor `USAGE` on `public`, and it cannot be called
+  directly. It evaluates no user-defined function: watched columns are
+  compared through a NULL flag and their types' output functions, never a
+  cast, and a key is rendered only while its column is of a built-in type.
+  It opens no subtransaction and never fails the write: a `TRUNCATE`
+  (also `TRUNCATE ONLY` of an inheritance parent) marks the IMV
+  `known_stale`, keeping any earlier `stale_reason` and `stale_since`, and
+  a renamed or dropped mapped column, or a key retyped to a user type,
+  queues nothing and is reported stale from the catalog by
+  `reflex_ivm_status` and `reflex_doctor` (F14).
+- **`reflex_reconcile` of a partitioned IMV with a dependent raised a false
+  alter alarm, and under `alter_source_policy = 'error'` aborted.** The
+  partition sync's own `DISABLE` / `ENABLE TRIGGER USER` around its default
+  relocation is an `ALTER TABLE` on the IMV root, which the alter-source
+  alarm reported to every dependent ("was altered; … may be stale — run
+  `reflex_rebuild_imv`") on every call. The toggle is now bracketed by
+  `pg_reflex.internal_trigger_toggle_root` for that statement only; a
+  user's `ALTER` of the same relation, even in the same transaction, is
+  still reported.
+- **`reflex_reconcile` printed one `already exists, skipping` NOTICE per
+  partition child and sync pass.** The sync re-issued `CREATE TABLE IF NOT
+  EXISTS` for every existing child (24 NOTICEs for a 3-leaf IMV); it now
+  creates only missing children, re-issuing every create after it drops a
+  bound-collision orphan whose `CASCADE` may have removed one. The
+  deferred cross-source guard no longer re-creates its batch marker on
+  every later flush of the batch.
+- **`reflex_ivm_status()` counted an actively swapped partitioned IMV
+  exactly on every call.** A slice-changing swap logged a `rebuild` event
+  that only an `ANALYZE` of the IMV root retired, and autovacuum never
+  analyzes a partitioned parent, so an IMV swapped at every push never
+  returned to the O(1) estimate. The event is now stamped before the swap
+  ANALYZEs the rebuilt leaf, which retires it, and a partitioned IMV's
+  estimate is the sum of its leaves' `reltuples`.
+- An invalid `pg_reflex.flush_failure_policy` value falls back to `warn`
+  and now raises a `WARNING` naming it, matching
+  `pg_reflex.alter_source_policy`.
+
+### Added
+
+- `public.__reflex_event_log`: a durable row for every caught flush failure
+  (`event = 'error'`, with `sqlstate`) and every rebuild that changed a
+  slice's row count (`event = 'rebuild'`, with `slice`, `rows_before`,
+  `rows_after`). Never written on an ordinary flush. Pruned with the new
+  `reflex_prune_event_log(INTERVAL)`.
+- `pg_reflex.flush_failure_policy` GUC: `warn` (default) keeps the
+  per-IMV catch; `error` lets a failed deferred flush abort the caller's
+  transaction so the offending write is rolled back.
+- `reflex_ack_ignore_source(imv, source)` and the create-time `'!source'`
+  marker, backed by a new `ignore_ack` registry column. The function
+  records the acknowledgement in the registry and in the stored
+  `create_args` in one statement, so `reflex_rebuild_chain` replays it.
+- `ignore-soundness` audit check, forwarded by `reflex_doctor` as **F13**
+  (report-only).
+- `is_estimate` column on `reflex_ivm_status()`.
+- `reflex_heal_ignored_sources(imv DEFAULT NULL)`: rebuilds the queued
+  partitions, shallowest IMV first. A heal removes only the queue rows it
+  read, so a key re-queued mid-heal survives; a failed heal keeps its rows
+  with `last_error`, while a query cancel or shutdown is re-raised. An
+  integer key the partition column is too narrow to hold is drained without
+  a rebuild. `reflex_scheduled_reconcile` runs it first (one
+  `HEALED` row per IMV), and `reflex_doctor` reports queued heals as
+  **F14**, running the heal under `fix => TRUE` and claiming `fixed` only
+  once the queue is empty. `drop_reflex_ivm` deletes the IMV's queue rows.
+
+### Changed
+
+- **`create_reflex_ivm` refuses an `ignore_sources` entry the query depends
+  on** — referenced in `WHERE`, `HAVING`, `JOIN … ON` or `JOIN … USING`,
+  inner- or cross-joined, or unattributable (CTEs, set operations, wildcard
+  projections, qualifiers from nested scopes). The refusal message leads
+  with the `reflex_ack_ignore_source` call that clears it. Because
+  `reflex_rebuild_chain` replays the create, **audit before rebuilding a
+  chain or recreating an IMV**:
+  `SELECT * FROM reflex_audit() WHERE category = 'ignore-soundness';`.
+  `reflex_rebuild_imv` is a reconcile and is not affected. A client that
+  drops and recreates IMVs from stored definitions must add the `'!'`
+  marker to the entries it accepts, or its creates are refused; a
+  `create_reflex_ivm_if_not_exists` of an existing IMV is a no-op and is
+  not refused.
+  Columns referenced only in the projection or `GROUP BY` are not yet
+  checked (filed in `untreated_bugs/`).
+- `reflex_ivm_status()` returns one extra trailing column, `is_estimate`.
+- `reflex_ivm_status()` estimates a partitioned IMV's `row_count` as the sum
+  of its leaves' `reltuples`. A never-analyzed leaf counts as 0 when it has
+  no storage (a mirrored empty partition); a never-analyzed leaf holding
+  data forces an exact count.
+- `reflex_scheduled_reconcile` returns one `HEALED` (or error) row per
+  healed IMV before its reconcile rows.
+
+### Tests
+
+- New `pg_test_status_window_wipe.rs` (the field incident reproduced, plus
+  the flush-observability and policy defects), `pg_test_ignore_soundness.rs`
+  (create-time refusal, ack replay, nested-scope and `USING` attribution),
+  `pg_test_capped_source_status.rs` (direct and transitive capped-root
+  reporting, and convergence of the printed remedy) and
+  `pg_test_ignored_source_heal.rs` (queue on status return, no queue for an
+  unreferenced column, sweep, doctor and explicit heal each restore the
+  slice exactly, no trigger on an unmappable source, drop clears the
+  queue, no user-defined code in the trigger, no directly callable heal
+  function, `NULL`/`''` watched changes, `TRUNCATE ONLY` of an inheritance
+  parent, a writer without `USAGE` on `public`, a key retyped to a user
+  type, key type mapping, dependents of edge-whitespace keys, cancels,
+  truncate bookkeeping) and `pg_test_reconcile_log_noise.rs` (no
+  re-issued child creates, marker created once, children dropped with an
+  orphan recreated, no alter alarm on the relocation toggle under the
+  `error` policy while a user `ALTER` still raises).
+  `swi_rebuild_anomaly_clears_after_analyze` is replaced by
+  `swi_rebuild_anomaly_retires_on_the_swap_itself`. Every must-refuse /
+  must-report assertion was mutation-checked: reverting its guard turns it
+  RED.
+
+### Migration
+
+- `ALTER EXTENSION pg_reflex UPDATE TO '1.11.4';` adds the `ignore_ack`
+  column, the `__reflex_event_log` table and index,
+  `reflex_prune_event_log`, the `__reflex_heal_pending` table, the
+  `__reflex_heal_on_ignored_change` trigger function, recreates
+  `reflex_ivm_status()` with the `is_estimate` column (return-shape change,
+  `DROP` + `CREATE`), creates `reflex_ack_ignore_source` and
+  `reflex_heal_ignored_sources`, replaces `__reflex_on_ddl_command_end`,
+  and finally runs
+  `reflex_rebuild_imv_metadata` on every enabled partitioned IMV with
+  ignored sources to install its heal triggers. Installing a trigger takes
+  a `SHARE ROW EXCLUSIVE` lock on each ignored source, which blocks writes
+  to it and waits behind any open transaction on it: upgrade in a quiet
+  window, with `lock_timeout` set. Run the `ignore-soundness` audit before
+  any IMV recreate or `reflex_rebuild_chain`.
+- Clients of `reflex_scheduled_reconcile` must treat a `HEALED` status as
+  success, alongside `RECONCILED`.
+
+---
+
+
 ## [1.11.3] - 2026-07-28
 
 Four correctness fixes on the partitioned-IMV maintenance paths. Three of

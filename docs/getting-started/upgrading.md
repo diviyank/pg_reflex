@@ -48,8 +48,56 @@ psql -d mydb -c "ALTER EXTENSION pg_reflex UPDATE;"
 | 1.7.5 → 1.7.6 | `ignore_sources` is now honored on the DEFERRED trigger path (the three deferred trigger bodies + `reflex_flush_deferred`), closing a gap where only IMMEDIATE honored it. No catalog change; the migration rebuilds source triggers via `reflex_rebuild_triggers`. | none for existing IMVs — the migration re-emits trigger bodies so the fix applies without recreating IMVs. A source whose rebuild fails (dropped table, ambiguous bare name) is logged as a `NOTICE` and skipped. |
 | … 1.7.6 → 1.10.5 | See the [changelog](../changelog.md) for each intermediate release. `ALTER EXTENSION pg_reflex UPDATE` applies every step automatically. | see changelog per version. |
 | 1.10.5 → 1.10.6 | The `sql_drop` event trigger now also cleans up an IMV whose own **target** table is dropped (directly, via `DROP SCHEMA … CASCADE`, or by dropping a view the IMV is built on), not only IMVs whose *source* was dropped. The migration re-creates the `reflex_on_sql_drop` plpgsql function; no catalog or signature change. | none for existing IMVs. Pre-1.10.6 orphaned registry rows are **not** retroactively cleaned — drop them with `drop_reflex_ivm(name, true)`, or `DELETE FROM public.__reflex_ivm_reference` for rows whose target is already gone. |
+| … 1.10.6 → 1.11.3 | See the [changelog](../changelog.md) for each intermediate release. | see changelog per version. |
+| 1.11.3 → 1.11.4 | Silent-wipe observability and prevention. A failed deferred flush now marks the IMV `known_stale` (it previously discarded the staged delta silently); `reflex_ivm_status()` gains `is_estimate`, counts anomalous IMVs exactly, and reports IMVs whose partition source is capped; new `__reflex_event_log` table and `reflex_prune_event_log`; new `pg_reflex.flush_failure_policy` GUC (`warn` default, opt-in `error`); **`create_reflex_ivm` refuses an unsound `ignore_sources` entry** unless acknowledged with a `'!'` prefix or `reflex_ack_ignore_source`; `reflex_audit` / `reflex_doctor` (F13) report existing ones; a change to an ignored source that joins onto the partition key queues the affected partitions for heal (`reflex_heal_ignored_sources`, run by `reflex_scheduled_reconcile` and doctor F14). The migration adds `ignore_ack`, the event log, the heal queue, recreates `reflex_ivm_status()` (return-shape change), and installs heal triggers on existing partitioned IMVs. | See [Upgrading to 1.11.4](#upgrading-to-1114) below: upgrade in a quiet window with `lock_timeout` set, treat `HEALED` from `reflex_scheduled_reconcile` as success, and add the `'!'` marker to accepted unsound ignores before recreating any IMV or running `reflex_rebuild_chain`. |
 
 `ALTER EXTENSION pg_reflex UPDATE` walks the chain automatically.
+
+## Upgrading to 1.11.4
+
+1.11.4 changes three things a client can see. Check each before upgrading a
+production database.
+
+1. **The upgrade blocks writes to ignored sources.** For every enabled
+   partitioned IMV with `ignore_sources`, the migration installs heal
+   triggers on each ignored source it can map to a partition. `CREATE
+   TRIGGER` takes a `SHARE ROW EXCLUSIVE` lock on that source, which blocks
+   writes to it and waits behind any open transaction on it. Upgrade in a
+   quiet window:
+
+    ```sql
+    SET lock_timeout = '10s';
+    ALTER EXTENSION pg_reflex UPDATE TO '1.11.4';
+    ```
+
+    On a lock timeout the whole upgrade rolls back; run it again.
+
+2. **Unsound ignores are refused at create time.** `create_reflex_ivm`
+   refuses an `ignore_sources` entry the query filters or joins on, unless
+   the entry carries the `'!'` marker (`'!demand_planning'`) or was
+   acknowledged with `reflex_ack_ignore_source`. Existing IMVs keep working,
+   `reflex_rebuild_imv` (a reconcile) is not affected, and
+   `create_reflex_ivm_if_not_exists` of an existing IMV is a no-op. What is
+   refused is a *new* create of such a definition, including a drop and
+   recreate, and `reflex_rebuild_chain`, which replays the create. After
+   upgrading:
+
+    ```sql
+    SELECT * FROM reflex_audit() WHERE category = 'ignore-soundness';
+    SELECT reflex_ack_ignore_source('<imv>', '<source>');  -- per accepted risk
+    ```
+
+    A client that recreates IMVs from stored definitions must add the `'!'`
+    marker to each accepted entry, and only once the database runs 1.11.4:
+    earlier versions read `'!demand_planning'` as a relation name that
+    matches nothing, so that source would no longer be ignored. The refusal
+    is returned as an `ERROR: …` string, not raised; check for it.
+
+3. **New status values.** `reflex_scheduled_reconcile` returns a `HEALED`
+   row for each IMV it healed before its reconcile rows; treat it as
+   success. `reflex_ivm_status()` has a trailing `is_estimate` column, and
+   reports more IMVs as `known_stale` (capped partition sources, queued
+   heals, unhealable ignored sources), which monitoring may alert on.
 
 ## After upgrade
 

@@ -27,6 +27,9 @@ Every SQL-callable function pg_reflex installs. Click a name for the full page.
 |---|---|---|
 | [`reflex_doctor(target, fix, drop_orphans, max_attempts)`](reflex_doctor.md) | `SETOF (check_id, severity, object, finding, action, outcome)` | 1.10.8+. One-stop diagnostic and repair entrypoint. Dry-run by default. |
 | [`reflex_rebuild_chain(view_name)`](reflex_rebuild_chain.md) | `TEXT` | 1.10.8+. Atomic CASCADE drop + recreate of a corrupted decomposed IMV chain. |
+| [`reflex_ack_ignore_source(imv, source)`](reflex_ack_ignore_source.md) | `TEXT` | 1.11.4+. Acknowledge an unsound `ignore_sources` entry so create/rebuild and the audit accept it. |
+| [`reflex_prune_event_log(older_than)`](reflex_prune_event_log.md) | `BIGINT` | 1.11.4+. Delete `__reflex_event_log` rows older than an interval; returns rows removed. |
+| [`reflex_heal_ignored_sources(imv)`](reflex_heal_ignored_sources.md) | `TEXT` | 1.11.4+. Rebuild the partitions queued by a change to an ignored source. |
 
 ## Partitioning
 

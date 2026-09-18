@@ -35,6 +35,7 @@ mod create_ivm;
 mod doctor;
 mod drop_ivm;
 mod graph_repair;
+mod heal;
 mod introspect;
 mod partition;
 mod query_decomposer;
@@ -213,6 +214,16 @@ extension_sql!(
     ALTER TABLE public.__reflex_ivm_reference
         ADD COLUMN IF NOT EXISTS last_rebuild_at TIMESTAMPTZ;
 
+    -- 1.11.4 (A1): the subset of `ignored_sources` whose ignore was explicitly
+    -- acknowledged as unsound at create time with a '!' prefix. The marker is
+    -- stripped before `ignored_sources` is written — a marker-bearing entry
+    -- would stop matching the runtime `= ANY(depends_on)` / array-overlap skip
+    -- and the ignore would silently stop working. The raw list (markers intact)
+    -- lives on in `create_args` so `reflex_rebuild_chain` replays the ack and the
+    -- IMV stays rebuildable.
+    ALTER TABLE public.__reflex_ivm_reference
+        ADD COLUMN IF NOT EXISTS ignore_ack TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[];
+
     -- 1.10.8: JSON object capturing creation-time arguments (unique_columns,
     -- storage_mode, refresh_mode, topk_k, ignore_sources, partition_by,
     -- explicit_unpartitioned) for faithful IMV chain reconstruction via
@@ -231,6 +242,53 @@ extension_sql!(
     -- `foo__cte_bar` would defeat.
     ALTER TABLE public.__reflex_ivm_reference
         ADD COLUMN IF NOT EXISTS is_generated_sub_imv BOOLEAN NOT NULL DEFAULT FALSE;
+
+    -- 1.11.4: durable record of anomalies and slice-changing rebuilds — the
+    -- artefact a silent wipe leaves behind. A regular LOGGED table: rows must
+    -- survive a crash, and the volume is bounded by design (written only on
+    -- caught flush failures and rebuilds that actually change a slice's row
+    -- count, never on an ordinary successful flush). Maintenance table, not a
+    -- per-IMV artefact: excluded from the drop census like the other
+    -- __reflex_* maintenance tables.
+    -- `at` uses clock_timestamp(), not now(): now() is frozen at the
+    -- enclosing transaction's start, so every event written by a long-lived
+    -- transaction (or, notably, by a single pg_test) would carry the SAME
+    -- timestamp regardless of when it actually happened — silently breaking
+    -- reflex_ivm_status's ANALYZE-recency comparison (introspect.rs), which
+    -- depends on `at` reflecting real occurrence time relative to
+    -- pg_stat_all_tables' (also real-time) last_analyze.
+    CREATE TABLE IF NOT EXISTS public.__reflex_event_log (
+        id             BIGSERIAL PRIMARY KEY,
+        at             TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+        imv_name       TEXT NOT NULL,
+        event          TEXT NOT NULL,
+        trigger_reason TEXT,
+        slice          TEXT,
+        rows_before    BIGINT,
+        rows_after     BIGINT,
+        detail         TEXT,
+        sqlstate       TEXT
+    );
+    CREATE INDEX IF NOT EXISTS __reflex_event_log_imv_at
+        ON public.__reflex_event_log (imv_name, at DESC);
+
+    -- `CREATE TABLE IF NOT EXISTS` above is a no-op on any pre-release dev
+    -- database that already created this table with the original `DEFAULT
+    -- now()`; an explicit ALTER makes the clock_timestamp() fix apply on
+    -- upgrade too, not only on a fresh install.
+    ALTER TABLE public.__reflex_event_log
+        ALTER COLUMN at SET DEFAULT clock_timestamp();
+
+    -- Operator-driven pruning; returns the number of rows removed.
+    CREATE OR REPLACE FUNCTION public.reflex_prune_event_log(_older_than INTERVAL)
+    RETURNS BIGINT LANGUAGE plpgsql AS $fn$
+    DECLARE _n BIGINT;
+    BEGIN
+        DELETE FROM public.__reflex_event_log WHERE at < now() - _older_than;
+        GET DIAGNOSTICS _n = ROW_COUNT;
+        RETURN _n;
+    END;
+    $fn$;
 
     -- Multi-level partition capture (plans/sub_partitioning.md). Snapshot of
     -- each tracked source root's recursive LEAF set, keyed by (root, child).
@@ -267,6 +325,110 @@ extension_sql!(
     -- NULL means no drain has ever fired for this row — the F1 re-arm hole.
     ALTER TABLE public.__reflex_partition_pending
         ADD COLUMN IF NOT EXISTS last_attempt_at TIMESTAMPTZ;
+
+    -- 1.11.4: IMV partitions made wrong by a change to an ignored source,
+    -- queued by __reflex_heal_on_ignored_change and drained by
+    -- reflex_heal_ignored_sources, reflex_scheduled_reconcile and
+    -- reflex_doctor(fix => TRUE). See src/heal.rs.
+    CREATE TABLE IF NOT EXISTS public.__reflex_heal_pending (
+        imv_name      TEXT NOT NULL,
+        partition_key TEXT NOT NULL,
+        source        TEXT NOT NULL,
+        enqueued_at   TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+        last_error    TEXT,
+        PRIMARY KEY (imv_name, partition_key)
+    );
+
+    -- Statement trigger on an ignored source (src/heal.rs). Queues the partition
+    -- keys of the changed rows for every enabled IMV whose `ignore_heal_keys`
+    -- names this relation; an UPDATE queues only keys whose watched columns
+    -- changed. A TRUNCATE cannot be scoped to keys, so it marks those IMVs
+    -- known_stale, keeping an earlier reason and stale_since.
+    --
+    -- SECURITY DEFINER so a writer needs no pg_reflex grant nor USAGE on
+    -- public; a trigger function cannot be called directly, so no role can
+    -- point it at a relation of its choosing. It evaluates no user-defined
+    -- code: watched columns are compared through their types' output functions
+    -- (a NULL flag plus `format('%s', col)`, never a cast), and a key is
+    -- rendered by `to_jsonb` only while its type is built in. It opens no
+    -- subtransaction and writes nothing when a mapped or watched column is
+    -- gone or the key was retyped; reflex_ivm_status derives that instead,
+    -- since every writer of the source would contend on the registry row.
+    CREATE OR REPLACE FUNCTION public.__reflex_heal_on_ignored_change()
+    RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER
+    SET search_path = pg_catalog, pg_temp SET extra_float_digits = 3 AS $fn$
+    DECLARE
+        _h RECORD;
+        _key TEXT;
+        _keys TEXT;
+        _cols TEXT;
+    BEGIN
+        IF TG_OP = 'TRUNCATE' THEN
+            UPDATE public.__reflex_ivm_reference r
+               SET known_stale = TRUE,
+                   stale_since = COALESCE(r.stale_since, now()),
+                   stale_reason = CASE WHEN COALESCE(r.known_stale, FALSE) AND COALESCE(r.stale_reason, '') <> ''
+                                       THEN r.stale_reason || ' | ' || m.reason
+                                       ELSE m.reason END
+              FROM (SELECT DISTINCT i.name,
+                           format('ignored source %s was truncated, which no heal can scope. '
+                                  || 'Run SELECT reflex_reconcile(%L);', TG_RELID::regclass, i.name) AS reason
+                      FROM public.__reflex_ivm_reference i
+                     CROSS JOIN LATERAL jsonb_each(COALESCE(i.aggregations->'ignore_heal_keys', '{}'::jsonb)) k
+                     WHERE COALESCE(i.enabled, TRUE)
+                       AND to_regclass(k.value->>'relation') = TG_RELID) m
+             WHERE r.name = m.name
+               AND NOT (COALESCE(r.known_stale, FALSE)
+                        AND position(m.reason IN COALESCE(r.stale_reason, '')) > 0);
+            RETURN NULL;
+        END IF;
+        FOR _h IN
+            SELECT r.name, k.key AS source, k.value->>'source_column' AS source_column,
+                   ARRAY(SELECT jsonb_array_elements_text(
+                             COALESCE(k.value->'watched_columns', '[]'::jsonb))) AS watched
+              FROM public.__reflex_ivm_reference r
+             CROSS JOIN LATERAL jsonb_each(COALESCE(r.aggregations->'ignore_heal_keys', '{}'::jsonb)) k
+             WHERE COALESCE(r.enabled, TRUE)
+               AND to_regclass(k.value->>'relation') = TG_RELID
+        LOOP
+            CONTINUE WHEN EXISTS (
+                SELECT 1 FROM unnest(_h.watched || _h.source_column) AS c
+                 WHERE NOT EXISTS (SELECT 1 FROM pg_attribute a
+                                    WHERE a.attrelid = TG_RELID AND a.attname = c
+                                      AND a.attnum > 0 AND NOT a.attisdropped));
+            CONTINUE WHEN NOT EXISTS (
+                SELECT 1 FROM pg_attribute a JOIN pg_type t ON t.oid = a.atttypid
+                 WHERE a.attrelid = TG_RELID AND a.attname = _h.source_column
+                   AND t.typnamespace = 'pg_catalog'::regnamespace);
+            _key := format('to_jsonb(%I) #>> ''{}''', _h.source_column);
+            IF TG_OP = 'INSERT' THEN
+                _keys := format('SELECT %s FROM __reflex_heal_new', _key);
+            ELSIF TG_OP = 'DELETE' THEN
+                _keys := format('SELECT %s FROM __reflex_heal_old', _key);
+            ELSIF cardinality(_h.watched) = 0 THEN
+                _keys := format('SELECT %1$s FROM __reflex_heal_old UNION SELECT %1$s FROM __reflex_heal_new', _key);
+            ELSE
+                SELECT string_agg(format('(%1$I IS NULL), format(''%%s'', %1$I)', c), ', ') INTO _cols
+                  FROM unnest(_h.watched) AS c;
+                _keys := format(
+                    'SELECT d.__reflex_heal_key FROM ('
+                    || '(SELECT %1$s AS __reflex_heal_key, %2$s FROM __reflex_heal_old '
+                    || 'EXCEPT SELECT %1$s, %2$s FROM __reflex_heal_new) UNION ALL '
+                    || '(SELECT %1$s, %2$s FROM __reflex_heal_new '
+                    || 'EXCEPT SELECT %1$s, %2$s FROM __reflex_heal_old)) d',
+                    _key, _cols);
+            END IF;
+            EXECUTE format(
+                'INSERT INTO public.__reflex_heal_pending (imv_name, partition_key, source) '
+                || 'SELECT DISTINCT $1, k, $2 FROM (%s) s(k) WHERE k IS NOT NULL '
+                || 'ON CONFLICT (imv_name, partition_key) DO UPDATE '
+                || 'SET enqueued_at = clock_timestamp(), source = EXCLUDED.source, last_error = NULL',
+                _keys)
+            USING _h.name, _h.source;
+        END LOOP;
+        RETURN NULL;
+    END;
+    $fn$;
 
     -- 1.6.0: SQL helper used by the per-partition dispatch DO block emitted
     -- by build_partition_aware_dispatch_sql.  Given a partitioned parent +
@@ -386,6 +548,13 @@ const DEFAULT_TOPK_K: usize = 16;
 
 /// Parse a comma-separated source list into a Vec<String>. Empty input → empty vec.
 /// Both schema-qualified ("alp.product") and bare ("product") names are accepted.
+///
+/// Entries are kept VERBATIM, including any leading `!` soundness-acknowledgement
+/// marker (A1). Stripping here would drop the ack from `create_args`, so
+/// `reflex_rebuild_chain` would replay the create without it, the create-time
+/// soundness check would refuse the replay, and the IMV would become
+/// unrebuildable. The marker is removed at the points that consume the list —
+/// see [`crate::sql_writer::registry::split_ignore_ack`].
 fn parse_ignore_sources_list(s: &str) -> Vec<String> {
     s.split(',')
         .map(|p| p.trim().to_string())
@@ -592,9 +761,14 @@ fn reflex_reconcile_partition(
     source_partition: default!(&str, "''"),
     skip_sync: default!(bool, "FALSE"),
 ) -> String {
+    let partition_keys: Vec<String> = partition_keys
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
     partition::reflex_reconcile_partition_impl(
         view_name,
-        partition_keys,
+        &partition_keys,
         source_partition,
         skip_sync,
     )
@@ -1066,6 +1240,7 @@ extension_sql!(
         _sync_key TEXT;
         _reconcile_root TEXT;
         _swap_root TEXT;
+        _toggle_root TEXT;
     BEGIN
         -- pg_reflex's own atomic partition swap (partition.rs
         -- `execute_partition_swap_for_child`) publishes the IMV it is rebuilding
@@ -1105,6 +1280,12 @@ extension_sql!(
         -- nodes of the active chain only — a DIFFERENT root that reads the same
         -- node still warns, because that consumer really did miss the refresh.
         _reconcile_root := NULLIF(current_setting('pg_reflex.internal_reconcile_root', true), '');
+
+        -- Relation whose triggers reflex_sync_partitions is toggling around a
+        -- partition relocation, set for that one ALTER only
+        -- (partition.rs `toggle_relocation_triggers`). The toggle changes no
+        -- column and is always undone, so it is not reported as a source change.
+        _toggle_root := NULLIF(current_setting('pg_reflex.internal_trigger_toggle_root', true), '');
 
         -- 1.6.0: auto-sync IMV partitions when a source's partition tree changes.
         --
@@ -1236,6 +1417,8 @@ extension_sql!(
             WHERE command_tag = 'ALTER TABLE'
         LOOP
             _src := _cmd.object_identity;
+            CONTINUE WHEN _toggle_root IS NOT NULL
+                      AND to_regclass(_src) = to_regclass(_toggle_root);
             FOR _imv IN
                 SELECT name FROM public.__reflex_ivm_reference
                 WHERE depends_on @> ARRAY[_src]
@@ -1647,6 +1830,11 @@ mod tests {
     include!("tests/pg_test_ps16.rs");
     include!("tests/pg_test_outerjoin_notnull_groupkey.rs");
     include!("tests/pg_test_qualified_groupby_qualifier.rs");
+    include!("tests/pg_test_status_window_wipe.rs");
+    include!("tests/pg_test_ignore_soundness.rs");
+    include!("tests/pg_test_capped_source_status.rs");
+    include!("tests/pg_test_ignored_source_heal.rs");
+    include!("tests/pg_test_reconcile_log_noise.rs");
 }
 
 /// This module is required by `cargo pgrx test` invocations.

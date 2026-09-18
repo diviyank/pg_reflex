@@ -844,6 +844,43 @@ fn f9_f11_doctor_surfaces_orphan_and_duplicate_findings() {
     );
 }
 
+/// F13: reflex_audit's ignore-soundness finding must reach reflex_doctor too,
+/// or an operator who only ever runs the doctor never learns the IMV can
+/// silently diverge. Report-only: the remedy (reflex_ack_ignore_source)
+/// records an operator's risk acceptance, not a repair.
+#[pg_test]
+fn f13_doctor_surfaces_unacknowledged_unsound_ignore() {
+    isx_fixture();
+    let r = Spi::get_one::<String>(
+        "SELECT create_reflex_ivm('isx_f13', \
+           'SELECT ss.dem_plan_id, ss.qty FROM isx_ss ss \
+              JOIN isx_dp dp ON dp.id = ss.dem_plan_id \
+             WHERE dp.status = ''validated''', \
+           'dem_plan_id', 'UNLOGGED', 'DEFERRED', '!isx_dp')",
+    )
+    .expect("create call")
+    .expect("create result");
+    assert!(!r.starts_with("ERROR"), "setup create failed: {r}");
+
+    // Strip the acknowledgement to simulate a pre-A1 installation.
+    Spi::run(
+        "UPDATE public.__reflex_ivm_reference SET ignore_ack = ARRAY[]::TEXT[] \
+         WHERE name = 'isx_f13'",
+    )
+    .expect("strip ack");
+
+    let outcome: String = Spi::get_one(
+        "SELECT outcome FROM reflex_doctor() \
+         WHERE check_id = 'F13' AND object = 'isx_f13' LIMIT 1",
+    )
+    .expect("q")
+    .expect("expected an F13 row for the unacknowledged unsound ignore");
+    assert_eq!(
+        outcome, "reported",
+        "the ignore-soundness finding must be report-only, never auto-executed"
+    );
+}
+
 /// A multi-source filtered IMV whose partition is correctly empty because the
 /// filter excludes its rows must not be flagged as residue. The definition
 /// probe evaluates the IMV's own base_query (filter included), so the empty

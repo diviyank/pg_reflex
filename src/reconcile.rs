@@ -532,9 +532,15 @@ pub(crate) fn reconcile_one(view_name: &str, drop_orphans: bool) -> &'static str
 
                 let _ = client.update(
                     "UPDATE public.__reflex_ivm_reference \
-                        SET known_stale = FALSE, stale_reason = NULL, stale_since = NULL WHERE name = $1",
+                        SET known_stale = FALSE, stale_reason = NULL, stale_since = NULL, \
+                            last_error = NULL WHERE name = $1",
                     None,
-                    &[unsafe { DatumWithOid::new(view_name.to_string(), PgBuiltInOids::TEXTOID.oid().value()) }],
+                    &[unsafe {
+                        DatumWithOid::new(
+                            view_name.to_string(),
+                            PgBuiltInOids::TEXTOID.oid().value(),
+                        )
+                    }],
                 );
 
                 info!(
@@ -797,7 +803,8 @@ pub(crate) fn reconcile_one(view_name: &str, drop_orphans: bool) -> &'static str
         client
             .update(
                 "UPDATE public.__reflex_ivm_reference \
-                    SET known_stale = FALSE, stale_reason = NULL, stale_since = NULL WHERE name = $1",
+                    SET known_stale = FALSE, stale_reason = NULL, stale_since = NULL, \
+                        last_error = NULL WHERE name = $1",
                 None,
                 &[unsafe {
                     DatumWithOid::new(view_name.to_string(), PgBuiltInOids::TEXTOID.oid().value())
@@ -1543,6 +1550,9 @@ pub fn reflex_scheduled_reconcile(
         name!(remaining, i64),
     ),
 > {
+    // Heals first: they rebuild only the queued partitions and stamp
+    // `last_update_date`, so a healed IMV is not also rebuilt in full below.
+    let heals = crate::heal::heal_ignored_sources_impl(None, target_schema);
     let candidates: Vec<String> = Spi::connect(|client| {
         // Skip a generated sub-IMV when a candidate that transitively reads it is
         // also in this batch: `reflex_reconcile` on that candidate already
@@ -1674,7 +1684,17 @@ pub fn reflex_scheduled_reconcile(
     };
     let remaining = (total - limit) as i64;
 
-    let mut out: Vec<ScheduledReconcileRow> = Vec::with_capacity(limit);
+    let mut out: Vec<ScheduledReconcileRow> = heals
+        .into_iter()
+        .map(|heal| {
+            let status = if heal.failed() {
+                heal.result
+            } else {
+                "HEALED".to_string()
+            };
+            (heal.imv, status, heal.ms, remaining)
+        })
+        .collect();
     for name in candidates.into_iter().take(limit) {
         let started = std::time::Instant::now();
         let result = reflex_reconcile(&name);

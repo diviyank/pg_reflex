@@ -172,7 +172,8 @@ pub(crate) fn reflex_rebuild_imv_metadata_impl(view_name: &str) -> String {
     let result: Result<(usize, usize, usize), String> = Spi::connect_mut(|client| {
         let rows = client
             .select(
-                "SELECT base_query FROM public.__reflex_ivm_reference \
+                "SELECT base_query, partition_columns, ignored_sources \
+                 FROM public.__reflex_ivm_reference \
                  WHERE name = $1 AND enabled = TRUE",
                 None,
                 &[unsafe {
@@ -189,6 +190,17 @@ pub(crate) fn reflex_rebuild_imv_metadata_impl(view_name: &str) -> String {
             .map_err(|e| format!("read base_query: {}", e))?
             .unwrap_or("")
             .to_string();
+        let partition_columns: Vec<String> = rows[0]
+            .get_by_name::<Vec<String>, _>("partition_columns")
+            .unwrap_or(None)
+            .unwrap_or_default();
+        let ignored_clean: Vec<String> = rows[0]
+            .get_by_name::<Vec<String>, _>("ignored_sources")
+            .unwrap_or(None)
+            .unwrap_or_default()
+            .iter()
+            .map(|s| crate::sql_writer::registry::strip_ignore_ack_marker(s).to_string())
+            .collect();
 
         let parsed = Parser::parse_sql(&PostgreSqlDialect {}, &base_query)
             .map_err(|e| format!("parse base_query: {}", e))?;
@@ -250,6 +262,16 @@ pub(crate) fn reflex_rebuild_imv_metadata_impl(view_name: &str) -> String {
         let sjk_json = serde_json::to_string(&tmp_plan.source_join_keys)
             .map_err(|e| format!("serialize source_join_keys: {}", e))?;
         let n_sjk_sources = tmp_plan.source_join_keys.len();
+        let heal_keys = crate::heal::install_heal_triggers(
+            client,
+            view_name,
+            &analysis,
+            &parsed,
+            &ignored_clean,
+            &partition_columns,
+        );
+        let heal_json = serde_json::to_string(&heal_keys)
+            .map_err(|e| format!("serialize ignore_heal_keys: {}", e))?;
 
         client
             .update(
@@ -257,19 +279,24 @@ pub(crate) fn reflex_rebuild_imv_metadata_impl(view_name: &str) -> String {
                  SET aggregations = jsonb_set( \
                        jsonb_set( \
                          jsonb_set( \
-                           aggregations::jsonb, \
-                           '{imv_relevant_columns}', \
-                           $1::jsonb, \
+                           jsonb_set( \
+                             aggregations::jsonb, \
+                             '{imv_relevant_columns}', \
+                             $1::jsonb, \
+                             TRUE \
+                           ), \
+                           '{imv_relevant_where}', \
+                           $2::jsonb, \
                            TRUE \
                          ), \
-                         '{imv_relevant_where}', \
-                         $2::jsonb, \
+                         '{source_join_keys}', \
+                         $4::jsonb, \
                          TRUE \
                        ), \
-                       '{source_join_keys}', \
-                       $4::jsonb, \
+                       '{ignore_heal_keys}', \
+                       $5::jsonb, \
                        TRUE \
-                     )::json \
+                     ) \
                  WHERE name = $3",
                 None,
                 &[
@@ -282,6 +309,7 @@ pub(crate) fn reflex_rebuild_imv_metadata_impl(view_name: &str) -> String {
                         )
                     },
                     unsafe { DatumWithOid::new(sjk_json, PgBuiltInOids::TEXTOID.oid().value()) },
+                    unsafe { DatumWithOid::new(heal_json, PgBuiltInOids::TEXTOID.oid().value()) },
                 ],
             )
             .map_err(|e| format!("update aggregations: {}", e))?;
@@ -1194,4 +1222,77 @@ fn extract_array_field_via_sql(
     rows.first()
         .and_then(|row| row.get_by_name::<Vec<String>, _>("result").ok().flatten())
         .unwrap_or_default()
+}
+
+/// Record an accepted `ignore_sources` unsoundness for an already-installed IMV.
+///
+/// The A1 create-time check also runs on the re-create step of
+/// `reflex_rebuild_chain`, which takes no `ignore_sources` argument. Without
+/// this function a legacy IMV whose `create_args` carry no `!` is refused on
+/// rebuild and the printed remedy is unreachable — an operator would have to
+/// hand-write an UPDATE against an internal catalog. This is that remedy, and
+/// it converges: after one call the replay carries the acknowledgement.
+///
+/// Writes BOTH the `ignore_ack` column and the `!`-prefixed entry in
+/// `create_args.ignore_sources`, in one statement. Patching only the column
+/// would let the next replay go without the ack, so the refusal would return.
+#[pg_extern]
+fn reflex_ack_ignore_source(imv: &str, source: &str) -> String {
+    let present = Spi::get_one::<bool>(&format!(
+        "SELECT COALESCE(ignored_sources @> ARRAY['{s}'], FALSE) \
+         FROM public.__reflex_ivm_reference WHERE name = '{v}'",
+        s = source.replace('\'', "''"),
+        v = imv.replace('\'', "''"),
+    ))
+    .unwrap_or(None);
+
+    match present {
+        None => return format!("ERROR: no IMV named '{imv}'"),
+        Some(false) => {
+            return format!("ERROR: '{source}' is not in ignore_sources for IMV '{imv}'")
+        }
+        Some(true) => {}
+    }
+
+    // Both writes in one statement so the column and create_args can never
+    // disagree. The array is rebuilt with the bare entry REPLACED by its
+    // '!'-prefixed form — replaced, not appended, or `split_ignore_ack` would
+    // later yield the same name twice. The inner CASE leaves an already-acked
+    // entry alone, so the function is idempotent.
+    //
+    // The outer CASE only runs jsonb_set when `ignore_sources` is actually a
+    // key of create_args. jsonb_set's create_missing defaults to true, so
+    // without this guard a legacy row whose create_args is NULL, '{}', or
+    // simply predates the key would have this ack MATERIALISE that key —
+    // rewriting a config the operator never set, from the very remedy the
+    // refusal message tells them to run. A row with no `ignore_sources` key
+    // is left byte-for-byte unchanged.
+    let sql = format!(
+        "UPDATE public.__reflex_ivm_reference \
+            SET ignore_ack = ( \
+                  SELECT COALESCE(array_agg(DISTINCT x), ARRAY[]::TEXT[]) \
+                  FROM unnest(COALESCE(ignore_ack, ARRAY[]::TEXT[]) || ARRAY['{s}']) x \
+                ), \
+                create_args = CASE \
+                  WHEN COALESCE(create_args, '{{}}')::jsonb ? 'ignore_sources' THEN \
+                    jsonb_set( \
+                      COALESCE(create_args, '{{}}')::jsonb, \
+                      '{{ignore_sources}}', \
+                      ( \
+                        SELECT COALESCE(jsonb_agg( \
+                                 CASE WHEN e = '{s}' THEN '!{s}' ELSE e END), '[]'::jsonb) \
+                        FROM jsonb_array_elements_text( \
+                               COALESCE(create_args::jsonb -> 'ignore_sources', '[]'::jsonb)) e \
+                      ) \
+                    )::text \
+                  ELSE create_args \
+                  END \
+          WHERE name = '{v}'",
+        s = source.replace('\'', "''"),
+        v = imv.replace('\'', "''"),
+    );
+    match Spi::run(&sql) {
+        Ok(()) => "ACKNOWLEDGED".to_string(),
+        Err(e) => format!("ERROR: {e}"),
+    }
 }

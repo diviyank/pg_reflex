@@ -17,6 +17,53 @@ use pgrx::pg_sys::panic::ErrorReportable;
 use pgrx::prelude::*;
 use pgrx::spi;
 
+/// The A1 soundness-acknowledgement marker: a leading `!` on an
+/// `ignore_sources` entry means "I know ignoring this source is unsound and I
+/// accept it". Defined once, here, so the create-time check, the registry write
+/// and the trigger-install skip cannot drift on what the marker is.
+pub const IGNORE_ACK_MARKER: char = '!';
+
+/// Strip the A1 acknowledgement marker from one raw `ignore_sources` entry.
+/// Returns the entry unchanged when it carries no marker.
+pub fn strip_ignore_ack_marker(entry: &str) -> &str {
+    match entry.strip_prefix(IGNORE_ACK_MARKER) {
+        Some(name) => name.trim(),
+        None => entry,
+    }
+}
+
+/// Split raw `ignore_sources` entries into the clean names used at runtime and
+/// the subset carrying the `!` acknowledgement marker. Both come back stripped.
+///
+/// The marker must NOT reach `ignored_sources`: that array is matched by the
+/// deferred dispatcher's array-overlap predicate and by the trigger-install
+/// skip, and a marker-bearing entry stops matching — the ignore would silently
+/// stop working, which is the very outage the A1 check exists to prevent.
+///
+/// An entry that strips to nothing (a bare `!`) names no source and is dropped
+/// rather than written as an empty string into either array. The create path
+/// refuses such an entry outright, so this is defence in depth for the callers
+/// that have no error channel.
+pub fn split_ignore_ack(raw: &[String]) -> (Vec<String>, Vec<String>) {
+    let mut clean = Vec::with_capacity(raw.len());
+    let mut acked = Vec::new();
+    for entry in raw {
+        match entry.strip_prefix(IGNORE_ACK_MARKER) {
+            Some(name) => {
+                let name = name.trim().to_string();
+                if name.is_empty() {
+                    continue;
+                }
+                acked.push(name.clone());
+                clean.push(name);
+            }
+            None if entry.is_empty() => continue,
+            None => clean.push(entry.clone()),
+        }
+    }
+    (clean, acked)
+}
+
 /// JSON-blob hint: the `aggregations` column was historically inserted as
 /// `::json` for the decomposed paths and `::jsonb` for the main path. Both
 /// shapes survive a round-trip, but byte-identical contract is preserved by
@@ -200,10 +247,12 @@ pub fn insert_registry_row(
             .map(|_| ())
     } else {
         let where_predicate_owned = row.where_predicate.unwrap_or("").to_string();
-        let ignored_sources_owned = match row.ignored_sources {
-            Some(s) => format_pg_text_array(s),
-            None => format_pg_text_array(&[] as &[String]),
-        };
+        // A1: the '!' acknowledgement marker never reaches `ignored_sources` —
+        // it would stop the runtime skip from matching. It is recorded
+        // separately in `ignore_ack`, and survives raw only in `create_args`.
+        let (ignored_clean, ignore_acked) = split_ignore_ack(row.ignored_sources.unwrap_or(&[]));
+        let ignored_sources_owned = format_pg_text_array(&ignored_clean);
+        let ignore_ack_owned = format_pg_text_array(&ignore_acked);
         let part_cols_owned = match row.partition_columns {
             Some(s) => format_pg_text_array(s),
             None => format_pg_text_array(&[] as &[String]),
@@ -216,8 +265,8 @@ pub fn insert_registry_row(
                       aggregations, index_columns, unique_columns, enabled, last_update_date,
                       storage_mode, refresh_mode, where_predicate, ignored_sources,
                       partition_columns, partition_strategy, target_schema, max_one_row, partition_depth, create_args,
-                      requires_explicit_refresh)
-                     VALUES ($1, $2, $3::TEXT[], $4::TEXT[], $5::TEXT[], $6::TEXT[], $7, $8, $9, $10::jsonb, $11::TEXT[], $12::TEXT[], TRUE, NOW(), $13, $14, NULLIF($15, ''), $16::TEXT[], NULLIF($17, '{}')::TEXT[], NULLIF($18, ''), COALESCE(NULLIF($19, ''), current_schema()), $20, $21, $22, $23)";
+                      requires_explicit_refresh, ignore_ack)
+                     VALUES ($1, $2, $3::TEXT[], $4::TEXT[], $5::TEXT[], $6::TEXT[], $7, $8, $9, $10::jsonb, $11::TEXT[], $12::TEXT[], TRUE, NOW(), $13, $14, NULLIF($15, ''), $16::TEXT[], NULLIF($17, '{}')::TEXT[], NULLIF($18, ''), COALESCE(NULLIF($19, ''), current_schema()), $20, $21, $22, $23, $24::TEXT[])";
         client
             .update(
                 sql,
@@ -246,6 +295,7 @@ pub fn insert_registry_row(
                     unsafe { DatumWithOid::new(row.partition_depth, oid_int4) },
                     unsafe { DatumWithOid::new(create_args_owned, oid_text) },
                     unsafe { DatumWithOid::new(row.requires_explicit_refresh, oid_bool) },
+                    unsafe { DatumWithOid::new(ignore_ack_owned, oid_text) },
                 ],
             )
             .map(|_| ())
@@ -613,4 +663,33 @@ pub fn remove_graph_child(
         ],
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod split_ignore_ack_tests {
+    use super::split_ignore_ack;
+
+    fn v(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn marker_is_stripped_and_recorded() {
+        let (clean, acked) = split_ignore_ack(&v(&["a", "!b", "! c "]));
+        assert_eq!(clean, v(&["a", "b", "c"]));
+        assert_eq!(acked, v(&["b", "c"]));
+    }
+
+    #[test]
+    fn a_bare_marker_names_no_source_and_is_dropped() {
+        let (clean, acked) = split_ignore_ack(&v(&["!", "!   ", ""]));
+        assert!(
+            clean.is_empty(),
+            "no empty name may reach ignored_sources: {clean:?}"
+        );
+        assert!(
+            acked.is_empty(),
+            "no empty name may reach ignore_ack: {acked:?}"
+        );
+    }
 }

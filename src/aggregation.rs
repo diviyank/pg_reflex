@@ -179,6 +179,11 @@ pub struct AggregationPlan {
     /// through to global Path B for that source.
     #[serde(default)]
     pub partition_join_paths: std::collections::HashMap<String, String>,
+    /// 1.11.4 — ignored sources whose changes can be scoped to IMV partitions,
+    /// by source as written in the query. Read by
+    /// `__reflex_heal_on_ignored_change`. See `src/heal.rs`.
+    #[serde(default)]
+    pub ignore_heal_keys: std::collections::HashMap<String, crate::heal::IgnoreHealKey>,
 }
 
 impl AggregationPlan {
@@ -1258,6 +1263,7 @@ fn plan_aggregation_inner(analysis: &SqlAnalysis) -> AggregationPlan {
         partition_strategy: String::new(),
         anchor_source: String::new(),
         partition_join_paths: std::collections::HashMap::new(),
+        ignore_heal_keys: std::collections::HashMap::new(),
     }
 }
 

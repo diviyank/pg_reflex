@@ -43,7 +43,7 @@ create_reflex_ivm(view_name, sql, unique_columns, storage, mode,
 | `unique_columns` | Comma-separated unique key columns for passthrough IMVs. Auto-inferred from source PK in 1.2.1+ for single-source passthroughs. |
 | `storage` | `'UNLOGGED'` (default, max perf) or `'LOGGED'` (WAL-logged, crash-safe) |
 | `mode` | `'IMMEDIATE'` (default, per-statement flush) or `'DEFERRED'` (flush at COMMIT) |
-| `ignore_sources` | 1.4.5+. Comma-separated source list to exclude from maintenance. DML on listed sources will NOT refresh this IMV — use `reflex_reconcile` or periodic refresh instead. Schema-qualified (`alp.product`) or bare (`product`) names both accepted. Honored on the IMMEDIATE and (since 1.7.6) DEFERRED trigger paths. |
+| `ignore_sources` | 1.4.5+. Comma-separated source list to exclude from maintenance. DML on listed sources will NOT refresh this IMV — use `reflex_reconcile` or periodic refresh instead. (1.11.4+) Exception: on a partitioned IMV, an ignored source that joins onto the first partition column queues the affected partitions for [`reflex_heal_ignored_sources`](reflex_heal_ignored_sources.md). Schema-qualified (`alp.product`) or bare (`product`) names both accepted. Honored on the IMMEDIATE and (since 1.7.6) DEFERRED trigger paths. |
 | `topk` | 1.3.0+ (overload). Integer K. When > 0, MIN/MAX columns maintain a sibling top-K array. Disabled by default. |
 | `partition_by` | 1.5.0+ (overload). `TEXT[]` of output column names to partition the target on; see the partitioning guide. |
 
