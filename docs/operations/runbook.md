@@ -19,6 +19,49 @@ SELECT reflex_rebuild_imv('<name>');
 
 A failing IMV no longer aborts the cascade — its `last_error` is recorded and the next IMV runs normally (per-IMV SAVEPOINT, since 1.2.0).
 
+## IMV stopped updating: capped partition source
+
+Symptom: an IMV over a partitioned source (e.g. a forecast view fed by monthly partition swaps) stops reflecting new pushes, with no error in the application. Since 1.11.4 `reflex_ivm_status()` reports it `known_stale` with a `stale_reason` naming the source root; before 1.11.4 it looked healthy.
+
+Cause: the root failed `5` consecutive partition flushes (`PARTITION_FLUSH_FAILURE_CAP`), so every later flush **skips** it with only a `WARNING`. A full `reflex_reconcile` repairs the data once but does not re-arm the root, so the next push is skipped again.
+
+```sql
+-- 1. Which roots are capped, and why?
+SELECT source_root, failures, last_attempt_at, last_error
+FROM public.__reflex_partition_pending
+WHERE failures >= 5;
+
+-- 2. Fix the cause first. For "duplicate key value violates unique constraint
+--    __reflex_swap_tgt_…": find duplicate source rows on the IMV's unique key.
+SELECT unique_columns FROM public.__reflex_ivm_reference WHERE name = '<imv>';
+-- SELECT <unique cols>, COUNT(*) FROM <source> GROUP BY <unique cols> HAVING COUNT(*) > 1;
+
+-- 3. Re-arm and drain.
+SELECT reflex_reset_partition_failures('<schema.source_root>');
+SELECT reflex_flush_partition_source('<schema.source_root>');
+```
+
+The report clears as soon as the root drains. A `deadlock detected` last error is usually transient — re-arming alone fixes it. A duplicate-key error re-caps the root on the first retry unless step 2 removed the duplicates. `reflex_doctor(fix => TRUE)` performs step 3 with a single retry (F2b), never step 2.
+
+## IMV slice empty after an ignored source changed
+
+**Symptom:** a partition of an IMV is empty or outdated after a row of an ignored source (e.g. `demand_planning.status`) left and re-entered the query's filter, and `reflex_ivm_status()` reports `known_stale` with a `stale_reason` naming that source.
+
+Since 1.11.4 the change only queues the affected partition keys; the rebuild waits for a sweep. Heal now:
+
+```sql
+SELECT partition_key, source, enqueued_at, last_error
+FROM public.__reflex_heal_pending WHERE imv_name = '<imv>';
+
+SELECT reflex_heal_ignored_sources('<imv>');
+```
+
+Schedule [`reflex_scheduled_reconcile`](../api/reflex_scheduled_reconcile.md) or `reflex_heal_ignored_sources()` with pg_cron so the window stays short. A row with `last_error` set failed to heal. Fix the cause and re-run.
+
+If `stale_reason` says the ignored source was truncated, run the `reflex_reconcile` it prints. If it says the source no longer has a column, the IMV's query refers to a column that was renamed or dropped: recreate the IMV against the current columns.
+
+If the IMV is wrong but nothing is queued, the ignored source cannot be mapped to partitions (see [which ignored sources heal](../api/reflex_heal_ignored_sources.md#which-ignored-sources-heal)), or it predates 1.11.4 and was not backfilled. Run `SELECT reflex_rebuild_imv_metadata('<imv>');` to install the heal triggers, and `SELECT reflex_reconcile('<imv>');` to repair it now.
+
 ## IMV drifted after a crash
 
 UNLOGGED intermediates are TRUNCATEd on crash recovery. Run:

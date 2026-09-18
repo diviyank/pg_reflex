@@ -593,7 +593,7 @@ fn join_type_str(op: &JoinOperator) -> &'static str {
 /// Extract the JoinConstraint from a JoinOperator. SEMI/ANTI/STRAIGHT
 /// variants — not reachable from `PostgreSqlDialect` — fall to None
 /// alongside other constraint-less / future-added variants.
-fn join_constraint(op: &JoinOperator) -> Option<&JoinConstraint> {
+pub(crate) fn join_constraint(op: &JoinOperator) -> Option<&JoinConstraint> {
     match op {
         JoinOperator::Join(c)
         | JoinOperator::Inner(c)
@@ -850,19 +850,133 @@ fn resolve_column_ref(
 /// `SELECT id FROM orders WHERE created_at >= (SELECT cutoff FROM config)`
 /// attributes to `orders` only, ignoring `config` (which lives inside the
 /// WHERE subquery).
-fn top_level_sources(select: &Select) -> Vec<String> {
-    let mut sources = Vec::new();
-    for twj in &select.from {
-        if let TableFactor::Table { name, .. } = &twj.relation {
-            sources.push(name.to_string());
+pub(crate) fn top_level_sources(select: &Select) -> Vec<String> {
+    top_level_tables(select)
+        .into_iter()
+        .map(|(n, _)| n)
+        .collect()
+}
+
+/// Alias → table name for the top-level FROM/JOIN relations of one SELECT.
+///
+/// Same walk as [`top_level_sources`], so the create-time `ignore_sources`
+/// soundness check resolves a qualifier to exactly the source the rest of the
+/// analyzer would. Deliberately top-level only: an alias reused inside a
+/// subquery must not shadow the outer relation it would otherwise resolve to.
+pub(crate) fn alias_map(select: &Select) -> HashMap<String, String> {
+    top_level_tables(select)
+        .into_iter()
+        .filter_map(|(name, alias)| alias.map(|a| (a, name)))
+        .collect()
+}
+
+/// The single walk behind [`top_level_sources`] and [`alias_map`]: every
+/// top-level FROM / JOIN table factor as `(table_name, alias)`.
+fn top_level_tables(select: &Select) -> Vec<(String, Option<String>)> {
+    let entry = |factor: &TableFactor| match factor {
+        TableFactor::Table { name, alias, .. } => {
+            Some((name.to_string(), alias.as_ref().map(|a| a.name.to_string())))
         }
+        _ => None,
+    };
+    let mut tables = Vec::new();
+    for twj in &select.from {
+        tables.extend(entry(&twj.relation));
         for join in &twj.joins {
-            if let TableFactor::Table { name, .. } = &join.relation {
-                sources.push(name.to_string());
-            }
+            tables.extend(entry(&join.relation));
         }
     }
-    sources
+    tables
+}
+
+/// Collect the dotted column references of one expression, using the same
+/// [`ColumnRefCollector`] the analyzer's own clause walk uses. A bare
+/// `Identifier("status")` yields `vec!["status"]`; `dp.status` yields
+/// `vec!["dp", "status"]`.
+pub(crate) fn collect_column_refs(expr: &Expr) -> Vec<Vec<String>> {
+    let mut collector = ColumnRefCollector::default();
+    let _ = expr.visit(&mut collector);
+    collector.refs
+}
+
+fn folded(id: &Ident) -> String {
+    match id.quote_style {
+        Some(_) => id.value.clone(),
+        None => id.value.to_lowercase(),
+    }
+}
+
+/// The table name (last part, folded like PostgreSQL folds identifiers) of every
+/// relation reference in `stmts`, once per reference, subqueries and CTE bodies
+/// included.
+pub(crate) fn statement_relation_names(stmts: &[Statement]) -> Vec<String> {
+    struct Relations(Vec<String>);
+    impl Visitor for Relations {
+        type Break = ();
+
+        fn pre_visit_relation(&mut self, relation: &sqlparser::ast::ObjectName) -> ControlFlow<()> {
+            if let Some(sqlparser::ast::ObjectNamePart::Identifier(id)) = relation.0.last() {
+                self.0.push(folded(id));
+            }
+            ControlFlow::Continue(())
+        }
+    }
+    let mut relations = Relations(Vec::new());
+    for stmt in stmts {
+        let _ = stmt.visit(&mut relations);
+    }
+    relations.0
+}
+
+/// Every column reference in `stmts`, subqueries included, as dotted parts
+/// folded the way PostgreSQL folds identifiers (unquoted parts lowercased).
+/// `None` when the statements can read columns no reference names: a wildcard
+/// or whole-row (`alias.*`) projection, or a `USING` / `NATURAL` join.
+pub(crate) fn statement_column_refs(stmts: &[Statement]) -> Option<Vec<Vec<String>>> {
+    #[derive(Default)]
+    struct Refs {
+        refs: Vec<Vec<String>>,
+        implicit_columns: bool,
+    }
+    fn has_wildcard(body: &SetExpr) -> bool {
+        match body {
+            SetExpr::Select(select) => select.projection.iter().any(|item| {
+                matches!(
+                    item,
+                    SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _)
+                )
+            }),
+            SetExpr::SetOperation { left, right, .. } => has_wildcard(left) || has_wildcard(right),
+            SetExpr::Query(query) => has_wildcard(&query.body),
+            _ => false,
+        }
+    }
+    impl Visitor for Refs {
+        type Break = ();
+
+        fn pre_visit_query(&mut self, query: &Query) -> ControlFlow<()> {
+            self.implicit_columns |= has_wildcard(&query.body);
+            ControlFlow::Continue(())
+        }
+
+        fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<()> {
+            match expr {
+                Expr::Identifier(id) => self.refs.push(vec![folded(id)]),
+                Expr::CompoundIdentifier(ids) => self.refs.push(ids.iter().map(folded).collect()),
+                _ => {}
+            }
+            ControlFlow::Continue(())
+        }
+    }
+
+    let mut refs = Refs::default();
+    for stmt in stmts {
+        let _ = stmt.visit(&mut refs);
+        let text = stmt.to_string().to_uppercase();
+        refs.implicit_columns |=
+            text.contains(".*") || text.contains("USING") || text.contains("NATURAL");
+    }
+    (!refs.implicit_columns).then_some(refs.refs)
 }
 
 /// Compute the IMV-relevant column set for each source by walking every

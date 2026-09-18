@@ -13,6 +13,7 @@ RETURNS TABLE(name TEXT, status TEXT, ms BIGINT)
 
 ## Behaviour
 
+0. (1.11.4+) Heals first: every IMV with partitions queued in `__reflex_heal_pending` by a change to an ignored source is rebuilt for exactly those partitions (see [`reflex_heal_ignored_sources`](reflex_heal_ignored_sources.md)), scoped by `target_schema`. Each heal is one result row with status `HEALED` or its error. A healed IMV's `last_update_date` is refreshed, so step 1 does not also rebuild it in full.
 1. Selects IMVs where `last_update_date IS NULL OR last_update_date < (CURRENT_TIMESTAMP - max_age_minutes)`.
 2. For each, calls `reflex_reconcile(name)` in isolation. A failing reconcile emits a `WARNING` and is recorded with its error string in the result row, but does not abort the rest of the loop.
 3. Returns one row per attempt with the wall time of the reconcile call.

@@ -24,14 +24,18 @@ type IvmStatusRow = (
     bool,                                       // requires_explicit_refresh
     i64,                                        // rebuild_count
     Option<pgrx::datum::TimestampWithTimeZone>, // last_rebuild_at
+    bool,                                       // is_estimate
 );
 
 /// Summary per IMV. `row_count` avoids a full-table `count(*)` on large IMVs:
 /// it reports the planner estimate `pg_class.reltuples` when the target has been
 /// analyzed (`reltuples > 0`, the common production case), and only falls back to
 /// an exact `count(*)` when the estimate is unavailable (`reltuples <= 0`: an
-/// empty target — where the count is instant — or one not yet analyzed). This
-/// keeps the status view O(1) per IMV instead of O(rows) on mature registries.
+/// empty target — where the count is instant — or one not yet analyzed), or when
+/// the IMV carries an anomaly (`known_stale` or a retained `last_error`) — an
+/// estimate taken before a caught flush failure can no longer be trusted. `is_estimate`
+/// tells the caller which case produced `row_count`. This keeps the status view
+/// O(1) per IMV in the common case instead of O(rows) on mature registries.
 #[pg_extern]
 #[allow(clippy::type_complexity)]
 fn reflex_ivm_status() -> TableIterator<
@@ -52,6 +56,7 @@ fn reflex_ivm_status() -> TableIterator<
         name!(requires_explicit_refresh, bool),
         name!(rebuild_count, i64),
         name!(last_rebuild_at, Option<pgrx::datum::TimestampWithTimeZone>),
+        name!(is_estimate, bool),
     ),
 > {
     let rows: Vec<IvmStatusRow> = Spi::connect(|client| {
@@ -137,6 +142,7 @@ fn reflex_ivm_status() -> TableIterator<
                 requires_explicit_refresh,
                 rebuild_count,
                 last_rebuild_at,
+                false,
             ));
         }
         out
@@ -144,30 +150,222 @@ fn reflex_ivm_status() -> TableIterator<
 
     // Populate row_count in a separate pass to keep the registry read short.
     // Prefer the planner estimate (reltuples) so a status query never full-scans
-    // a large IMV target; fall back to an exact count only when the estimate is
+    // a large IMV target; fall back to an exact count when the estimate is
     // unavailable (reltuples <= 0 → empty or never-analyzed), where count(*) is
-    // cheap or the only source of truth. Missing target → to_regclass NULL →
-    // no row → the -1 sentinel (unchanged from the prior "could not determine").
+    // cheap or the only source of truth, or when the IMV carries an anomaly:
+    // `known_stale`, a retained `last_error`, or an unresolved 'rebuild' row
+    // newer than the target's last ANALYZE.
+    //
+    // An 'error' event-log row is deliberately NOT a term here: it is written
+    // in the exact same handler that sets `known_stale`/`last_error` (the
+    // deferred-flush EXCEPTION branch, src/trigger/deferred.rs), so
+    // `known_stale`/`last_error` already see it — adding `event = 'error'`
+    // here would be redundant AND non-converging, because reconcile clears
+    // `known_stale`/`last_error` but never touches `__reflex_event_log`
+    // (nothing does but the operator-driven `reflex_prune_event_log`). An
+    // always-on 'error' term would therefore pin `has_anomaly` true forever
+    // after one caught flush failure — permanent exact `COUNT(*)`,
+    // `is_estimate` stuck false — exactly the non-convergence defect this
+    // predicate exists to avoid. `known_stale`/`last_error` are the
+    // convergent proxy for 'error' rows; only 'rebuild' needs its own term,
+    // because it is the one anomaly (a successful-but-destructive rebuild)
+    // that `known_stale` cannot see.
+    //
+    // 'rebuild' is scoped to ANALYZE recency rather than counting forever: a
+    // rebuild is written for any slice-changing swap, which is routine, so an
+    // unscoped predicate would make has_anomaly permanently true after the
+    // first one. "The estimate may be stale" is true exactly when a slice was
+    // rebuilt AFTER the planner last saw it — either the IMV itself or the
+    // rebuilt slice (`slice`). A partitioned IMV's estimate is the sum of its
+    // leaves' reltuples, and the swap ANALYZEs the leaf it rebuilds after
+    // stamping the event, so the swap retires its own event. A reconcile
+    // ANALYZEs the whole target and retires every older event. Never analyzed
+    // (NULL) counts as always stale.
+    // A failed/unavailable `pg_stat_all_tables` lookup fails toward the exact
+    // count — the safe direction for a correctness alarm is to do the work.
+    // A missing `__reflex_event_log` (e.g. an upgraded install whose
+    // migration missed it) is checked for explicitly and skips the 'rebuild'
+    // term rather than erroring — this is the primary observability entry
+    // point and a missing maintenance table must not take it down for every
+    // IMV.
+    //
+    // Missing target: neither the anomaly branch's `COUNT(*) FROM {ident}`
+    // nor the estimate branch's `to_regclass`-scoped query is actually
+    // protected against a dropped target — PostgreSQL resolves every
+    // relation reference in a query at parse time regardless of which branch
+    // or subquery contains it, so a `to_regclass` check elsewhere in the same
+    // query does not stop `{ident}` from raising. This is a pre-existing gap
+    // in `reflex_ivm_status` as a whole, not something this predicate widens
+    // (see untreated_bugs/ for the filed report).
+    let event_log_exists =
+        Spi::get_one::<bool>("SELECT to_regclass('public.__reflex_event_log') IS NOT NULL AS ok")
+            .unwrap_or(Some(false))
+            .unwrap_or(false);
+    let capped = capped_source_by_imv();
+    let heal_reasons = crate::heal::heal_stale_reasons_by_imv();
+    // The stats snapshot is cached per transaction; an ANALYZE earlier in the
+    // caller's transaction must be visible to the recency check below.
+    let _ = Spi::run("SELECT pg_stat_clear_snapshot()");
     let rows: Vec<IvmStatusRow> = rows
         .into_iter()
         .map(|mut row| {
+            let derived_reasons = [
+                capped.get(&row.0).map(CappedSource::stale_reason),
+                heal_reasons.get(&row.0).cloned(),
+            ];
+            for reason in derived_reasons.into_iter().flatten() {
+                row.11 = Some(match (row.10, row.11.take()) {
+                    (true, Some(stored)) => format!("{stored} | {reason}"),
+                    _ => reason,
+                });
+                row.10 = true;
+            }
             let name = &row.0;
-            let count_sql = format!(
-                "SELECT CASE WHEN c.reltuples > 0 THEN c.reltuples::BIGINT \
-                             ELSE (SELECT COUNT(*)::BIGINT FROM {ident}) END AS c \
-                 FROM pg_class c WHERE c.oid = to_regclass('{name_lit}')",
-                ident = quote(name),
-                name_lit = name.replace('\'', "''"),
-            );
-            let c = Spi::get_one::<i64>(&count_sql)
+            let name_lit = name.replace('\'', "''");
+            let has_unresolved_rebuild = event_log_exists
+                && Spi::get_one::<bool>(&format!(
+                    "SELECT EXISTS( \
+                         SELECT 1 FROM public.__reflex_event_log e \
+                         WHERE e.imv_name = '{name_lit}' \
+                           AND e.event = 'rebuild' \
+                           AND e.at > COALESCE(GREATEST( \
+                                  (SELECT COALESCE(last_analyze, last_autoanalyze) \
+                                   FROM pg_stat_all_tables \
+                                   WHERE relid = to_regclass('{name_lit}')), \
+                                  (SELECT COALESCE(last_analyze, last_autoanalyze) \
+                                   FROM pg_stat_all_tables \
+                                   WHERE relid = to_regclass(e.slice))), \
+                                  '-infinity'::timestamptz) \
+                         LIMIT 1 \
+                     ) AS ok"
+                ))
+                .unwrap_or(Some(true))
+                .unwrap_or(true);
+            let has_anomaly = row.10 || row.8.is_some() || has_unresolved_rebuild;
+            let (c, is_estimate) = if has_anomaly {
+                let c = Spi::get_one::<i64>(&format!(
+                    "SELECT COUNT(*)::BIGINT AS c FROM {ident}",
+                    ident = quote(name)
+                ))
                 .unwrap_or(None)
                 .unwrap_or(-1);
+                (c, false)
+            } else {
+                // A partitioned parent's own reltuples is never maintained by a
+                // leaf swap, so its estimate is the sum over leaves. A leaf never
+                // analyzed (reltuples < 0) counts as 0 only when it is provably
+                // empty (no storage); otherwise the count is exact.
+                let count_sql = format!(
+                    "WITH rel AS (SELECT oid, relkind, reltuples FROM pg_class \
+                                   WHERE oid = to_regclass('{name_lit}')), \
+                          est AS (SELECT CASE WHEN rel.relkind = 'p' THEN \
+                                      (SELECT CASE WHEN bool_and(l.reltuples >= 0 \
+                                                                 OR pg_relation_size(l.oid) = 0) \
+                                                   THEN sum(GREATEST(l.reltuples, 0)::float8) END \
+                                         FROM pg_partition_tree(rel.oid) t \
+                                         JOIN pg_class l ON l.oid = t.relid \
+                                        WHERE t.isleaf) \
+                                  ELSE rel.reltuples::float8 END AS n \
+                                    FROM rel) \
+                     SELECT CASE WHEN est.n > 0 THEN est.n::BIGINT \
+                                 ELSE (SELECT COUNT(*)::BIGINT FROM {ident}) END AS c, \
+                            COALESCE(est.n > 0, FALSE) AS is_estimate \
+                     FROM est",
+                    ident = quote(name),
+                );
+                Spi::get_two::<i64, bool>(&count_sql)
+                    .map(|(c, est)| (c.unwrap_or(-1), est.unwrap_or(false)))
+                    .unwrap_or((-1, false))
+            };
             row.4 = c;
+            row.15 = is_estimate;
             row
         })
         .collect();
 
     TableIterator::new(rows)
+}
+
+/// A partition source root the flush has given up on, as seen by one IMV.
+struct CappedSource {
+    root: String,
+    failures: i32,
+    last_error: String,
+}
+
+impl CappedSource {
+    fn stale_reason(&self) -> String {
+        format!(
+            "partition flush for source '{root}' is suspended after {failures} consecutive \
+             failures (last error: {err}); changes to it are not reaching this IMV. Fix the \
+             cause, then run SELECT reflex_reset_partition_failures('{root}'); \
+             SELECT reflex_flush_partition_source('{root}');",
+            root = self.root,
+            failures = self.failures,
+            err = self.last_error,
+        )
+    }
+}
+
+/// Every IMV that depends, directly or through other IMVs, on a partition source
+/// root at `PARTITION_FLUSH_FAILURE_CAP`.
+///
+/// Both flush entry points skip a capped root, so none of its changes reach those
+/// IMVs. The registry cannot carry this: a full reconcile clears `known_stale`
+/// while the root stays capped, which is how dev tenants reported healthy IMVs
+/// that had not been maintained for weeks. Derived live from the queue instead,
+/// so the report clears exactly when the root drains.
+fn capped_source_by_imv() -> std::collections::HashMap<String, CappedSource> {
+    let sql = format!(
+        "WITH RECURSIVE capped AS ( \
+             SELECT source_root, failures, COALESCE(last_error, 'unknown') AS last_error \
+             FROM public.__reflex_partition_pending \
+             WHERE failures >= {cap} \
+         ), reach(name, source_root, failures, last_error, depth) AS ( \
+             SELECT r.name, c.source_root, c.failures, c.last_error, 1 \
+             FROM capped c \
+             JOIN public.__reflex_ivm_reference r \
+               ON r.depends_on && ARRAY[c.source_root, split_part(c.source_root, '.', 2)] \
+             UNION \
+             SELECT r.name, x.source_root, x.failures, x.last_error, x.depth + 1 \
+             FROM reach x \
+             JOIN public.__reflex_ivm_reference r \
+               ON r.depends_on && ARRAY[x.name, split_part(x.name, '.', 2), 'public.' || x.name] \
+             WHERE x.depth < 32 \
+         ) \
+         SELECT DISTINCT ON (name) name, source_root, failures, last_error \
+         FROM reach ORDER BY name, depth, source_root",
+        cap = crate::partition::PARTITION_FLUSH_FAILURE_CAP,
+    );
+    Spi::connect(|client| {
+        let mut by_imv = std::collections::HashMap::new();
+        let Ok(rows) = client.select(&sql, None, &[]) else {
+            return by_imv;
+        };
+        for row in rows {
+            let name = row.get_by_name::<String, _>("name").ok().flatten();
+            let root = row.get_by_name::<String, _>("source_root").ok().flatten();
+            if let (Some(name), Some(root)) = (name, root) {
+                by_imv.insert(
+                    name,
+                    CappedSource {
+                        root,
+                        failures: row
+                            .get_by_name::<i32, _>("failures")
+                            .ok()
+                            .flatten()
+                            .unwrap_or(0),
+                        last_error: row
+                            .get_by_name::<String, _>("last_error")
+                            .ok()
+                            .flatten()
+                            .unwrap_or_else(|| "unknown".to_string()),
+                    },
+                );
+            }
+        }
+        by_imv
+    })
 }
 
 /// Detailed stats for a single IMV: intermediate size, target size, index count,

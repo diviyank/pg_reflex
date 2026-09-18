@@ -61,7 +61,7 @@ pub(crate) const PARTITION_FLUSH_FAILURE_CAP: i32 = 5;
 /// this subtransaction is an inner scope whose own `Drop` has already run
 /// `SPI_finish`. That is the same state plpgsql's `PG_CATCH` is in when it calls
 /// `RollbackAndReleaseCurrentSubTransaction`.
-struct SubTransaction {
+pub(crate) struct SubTransaction {
     memory_context: pgrx::pg_sys::MemoryContext,
     resource_owner: pgrx::pg_sys::ResourceOwner,
     /// Whether `Drop` still owes a rollback. Cleared BEFORE the FFI call, not
@@ -70,7 +70,7 @@ struct SubTransaction {
 }
 
 impl SubTransaction {
-    fn begin() -> Self {
+    pub(crate) fn begin() -> Self {
         unsafe {
             let memory_context = pgrx::pg_sys::CurrentMemoryContext;
             let resource_owner = pgrx::pg_sys::CurrentResourceOwner;
@@ -86,7 +86,7 @@ impl SubTransaction {
 
     /// Commit: everything done inside becomes part of the enclosing
     /// transaction, and locks taken inside are reassigned to it.
-    fn release(mut self) {
+    pub(crate) fn release(mut self) {
         self.close(true);
     }
 
@@ -1594,11 +1594,7 @@ pub(crate) fn reflex_sync_partitions_impl(view_name: &str, drop_orphans: bool) -
         let mut disabled_roots: Vec<&String> = Vec::new();
         let mut disable_err: Option<String> = None;
         for root in &drain_roots {
-            match client.update(
-                &format!("ALTER TABLE {} DISABLE TRIGGER USER", root),
-                None,
-                &[],
-            ) {
+            match toggle_relocation_triggers(client, root, false) {
                 Ok(_) => disabled_roots.push(root),
                 Err(e) => {
                     disable_err = Some(format!(
@@ -1611,11 +1607,7 @@ pub(crate) fn reflex_sync_partitions_impl(view_name: &str, drop_orphans: bool) -
         }
         if let Some(e) = disable_err {
             for root in &disabled_roots {
-                let _ = client.update(
-                    &format!("ALTER TABLE {} ENABLE TRIGGER USER", root),
-                    None,
-                    &[],
-                );
+                let _ = toggle_relocation_triggers(client, root, true);
             }
             return Err(e);
         }
@@ -1637,6 +1629,11 @@ pub(crate) fn reflex_sync_partitions_impl(view_name: &str, drop_orphans: bool) -
             // before this transaction, so nothing in them is worth preserving —
             // see `record_fresh_partitions`.
             let mut created_children: Vec<String> = Vec::new();
+            // An existing child needs no `CREATE TABLE IF NOT EXISTS`, which
+            // would only print `already exists, skipping`. A dropped orphan's
+            // CASCADE may remove a relation `existing_children` still lists,
+            // so after the first drop every create is issued again.
+            let mut existing_children_current = true;
 
             for node in &nodes {
                 let int_name = intermediate_child_name(view_name, &node.bare_name);
@@ -1663,14 +1660,16 @@ pub(crate) fn reflex_sync_partitions_impl(view_name: &str, drop_orphans: bool) -
                     // to the incoming child AND mapped to no live source leaf
                     // — never a broader drop_orphans-style sweep. Mirrors the
                     // F3 heal in `execute_partition_swap_for_child`.
-                    drop_bound_collision_orphan(
+                    if drop_bound_collision_orphan(
                         client,
                         schema,
                         &ddl.int_parent_qual,
                         &src_expected_int,
                         &int_name,
                         &node.bound_expr,
-                    )?;
+                    )? {
+                        existing_children_current = false;
+                    }
                     if build_int_detached {
                         client
                             .update(&detached.int_create, None, &[])
@@ -1678,7 +1677,7 @@ pub(crate) fn reflex_sync_partitions_impl(view_name: &str, drop_orphans: bool) -
                                 format!("sync: create detached intermediate node: {}", e)
                             })?;
                         pending_attach.push(detached.int_attach.clone());
-                    } else {
+                    } else if int_is_new || !existing_children_current {
                         client
                             .update(&ddl.int_ddl, None, &[])
                             .map_err(|e| format!("sync: create intermediate node: {}", e))?;
@@ -1690,20 +1689,22 @@ pub(crate) fn reflex_sync_partitions_impl(view_name: &str, drop_orphans: bool) -
                         out.added_intermediate += 1;
                     }
                 }
-                drop_bound_collision_orphan(
+                if drop_bound_collision_orphan(
                     client,
                     schema,
                     &ddl.tgt_parent_qual,
                     &src_expected_tgt,
                     &tgt_name,
                     &node.bound_expr,
-                )?;
+                )? {
+                    existing_children_current = false;
+                }
                 if build_tgt_detached {
                     client
                         .update(&detached.tgt_create, None, &[])
                         .map_err(|e| format!("sync: create detached target node: {}", e))?;
                     pending_attach.push(detached.tgt_attach.clone());
-                } else {
+                } else if tgt_is_new || !existing_children_current {
                     client
                         .update(&ddl.tgt_ddl, None, &[])
                         .map_err(|e| format!("sync: create target node: {}", e))?;
@@ -1736,11 +1737,7 @@ pub(crate) fn reflex_sync_partitions_impl(view_name: &str, drop_orphans: bool) -
         // continuing transaction, even when the relocation itself failed.
         let mut restore_err: Option<String> = None;
         for root in &disabled_roots {
-            if let Err(e) = client.update(
-                &format!("ALTER TABLE {} ENABLE TRIGGER USER", root),
-                None,
-                &[],
-            ) {
+            if let Err(e) = toggle_relocation_triggers(client, root, true) {
                 if restore_err.is_none() {
                     restore_err = Some(format!("sync: restore triggers on {}: {}", root, e));
                 }
@@ -1780,6 +1777,43 @@ pub(crate) fn reflex_sync_partitions_impl(view_name: &str, drop_orphans: bool) -
     }
 }
 
+/// `ALTER TABLE <root> {DISABLE|ENABLE} TRIGGER USER` around the default
+/// relocation, with `pg_reflex.internal_trigger_toggle_root` naming `root` for
+/// exactly that statement. The toggle changes no column and is always undone,
+/// so `__reflex_on_ddl_command_end` must not report it to `root`'s dependents as
+/// a source change; under `alter_source_policy = 'error'` that report aborted
+/// the reconcile. A user's ALTER, even of `root` in the same transaction, runs
+/// with the GUC cleared and is still reported.
+fn toggle_relocation_triggers(
+    client: &mut pgrx::spi::SpiClient<'_>,
+    root: &str,
+    enable: bool,
+) -> Result<(), pgrx::spi::Error> {
+    let _ = client.update(
+        &format!(
+            "SET LOCAL pg_reflex.internal_trigger_toggle_root = '{}'",
+            root.replace('\'', "''")
+        ),
+        None,
+        &[],
+    );
+    let toggled = client.update(
+        &format!(
+            "ALTER TABLE {} {} TRIGGER USER",
+            root,
+            if enable { "ENABLE" } else { "DISABLE" }
+        ),
+        None,
+        &[],
+    );
+    let _ = client.update(
+        "SET LOCAL pg_reflex.internal_trigger_toggle_root = ''",
+        None,
+        &[],
+    );
+    toggled.map(|_| ())
+}
+
 /// Drop a CONFIRMED orphan DIRECT CHILD of `parent_qual` whose `FOR VALUES`
 /// bound is byte-identical to `about_to_attach`'s: a `CREATE TABLE ...
 /// PARTITION OF <parent_qual> ... FOR VALUES <bound>` would otherwise raise
@@ -1797,7 +1831,7 @@ pub(crate) fn reflex_sync_partitions_impl(view_name: &str, drop_orphans: bool) -
 /// parent, so on a multi-level tree it compares the root's direct children
 /// against a leaf's bound, never matches, and silently heals nothing. Tracked
 /// in `untreated_bugs/2026-07-25_swap_f3_heal_wrong_parent_scope_multilevel.md`
-/// — do not copy that scoping here.
+/// — do not copy that scoping here. Returns whether a child was dropped.
 fn drop_bound_collision_orphan(
     client: &mut pgrx::spi::SpiClient<'_>,
     schema: &str,
@@ -1805,10 +1839,11 @@ fn drop_bound_collision_orphan(
     expected: &std::collections::HashSet<String>,
     about_to_attach: &str,
     bound_expr: &str,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     if bound_expr.is_empty() {
-        return Ok(());
+        return Ok(false);
     }
+    let mut dropped = false;
     for child in list_partition_children(client, parent_qual) {
         if child.bare_name == about_to_attach || expected.contains(&child.bare_name) {
             continue;
@@ -1829,9 +1864,10 @@ fn drop_bound_collision_orphan(
                 child.bare_name,
                 about_to_attach
             );
+            dropped = true;
         }
     }
-    Ok(())
+    Ok(dropped)
 }
 
 /// Implementation of `reflex_reconcile_partition(view_name, partition_keys)`.
@@ -1872,7 +1908,7 @@ fn drop_bound_collision_orphan(
 /// subtransaction is opened on both paths.
 pub(crate) fn reflex_reconcile_partition_impl(
     view_name: &str,
-    partition_keys_csv: &str,
+    partition_keys: &[String],
     source_partition: &str,
     skip_sync: bool,
 ) -> String {
@@ -2015,11 +2051,7 @@ pub(crate) fn reflex_reconcile_partition_impl(
                 }
             }
         } else {
-            let keys: Vec<String> = partition_keys_csv
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect();
+            let keys = partition_keys;
             if keys.is_empty() {
                 return Err(
                     "reconcile_partition: empty partition_keys (or pass source_partition)"
@@ -2027,7 +2059,7 @@ pub(crate) fn reflex_reconcile_partition_impl(
                 );
             }
             let tgt_children = list_partition_children(client, &tgt_parent);
-            for key in &keys {
+            for key in keys {
                 let child_match = tgt_children.iter().find(|c| {
                     let oid_q =
                         "SELECT pg_get_partition_constraintdef(to_regclass($1)::oid) AS def";
@@ -2082,7 +2114,7 @@ pub(crate) fn reflex_reconcile_partition_impl(
         if to_process.is_empty() {
             return Ok(format!(
                 "reconcile_partition: no children matched (keys={:?}, source_partition={:?})",
-                partition_keys_csv, source_partition
+                partition_keys, source_partition
             ));
         }
 
@@ -2132,12 +2164,8 @@ pub(crate) fn reflex_reconcile_partition_impl(
         // keys when called by key; otherwise derived from the reconciled
         // parent's target children (the swap-fill / flush path passes a source
         // partition, not keys).
-        let affected_keys: Vec<String> = if !partition_keys_csv.trim().is_empty() {
-            partition_keys_csv
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect()
+        let affected_keys: Vec<String> = if !partition_keys.is_empty() {
+            partition_keys.to_vec()
         } else {
             let mut set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
             for child_bare in &to_process {
@@ -2216,11 +2244,17 @@ pub(crate) fn reflex_reconcile_partition_impl(
             // We can't reflex_reconcile_partition / reflex_reconcile from
             // inside this SPI scope directly — call the inner impls in a
             // fresh SPI session by deferring via PERFORM at SQL level.
-            if same_part {
+            // The SQL entry point splits keys on commas and trims each one, so a key
+            // that is empty, contains a comma or has edge whitespace cannot cross it
+            // unchanged; such a dependent takes the full reconcile below.
+            let keys_survive_csv = partition_keys
+                .iter()
+                .all(|k| !k.is_empty() && !k.contains(',') && k.trim() == k);
+            if same_part && keys_survive_csv {
                 let q = format!(
                     "SELECT public.reflex_reconcile_partition({}, {})",
                     sql_literal_text(child),
-                    sql_literal_text(partition_keys_csv)
+                    sql_literal_text(&partition_keys.join(","))
                 );
                 let _ = client.update(&q, None, &[]);
             } else if let Some(scoped) = build_scoped_cascade_reconcile(
@@ -2504,6 +2538,13 @@ fn swap_partition_child_ddl(
     let int_is_fresh = end_query.is_empty()
         || (!int_def.is_empty() && is_fresh_partition(client, &int_child_qual_probe));
     let tgt_is_fresh = !tgt_def.is_empty() && is_fresh_partition(client, &tgt_child_qual_probe);
+    // `tgt_is_empty` already proved the count is 0 two lines up — skip the
+    // redundant `count(*)` round-trip in that (common) case.
+    let rows_before_tgt: Option<i64> = if tgt_is_empty {
+        Some(0)
+    } else {
+        count_rows(client, &tgt_child_qual_probe)
+    };
     if (int_is_empty || int_is_fresh) && (tgt_is_empty || tgt_is_fresh) {
         let (fill_int, fill_tgt) = build_inplace_partition_fill(
             &int_child_qual_probe,
@@ -2532,7 +2573,17 @@ fn swap_partition_child_ddl(
         client
             .update(&fill_tgt, None, &[])
             .map_err(|e| format!("fill empty tgt child in place: {}", e))?;
+        let rebuilt_at = clock_timestamp(client);
         let _ = client.update(&format!("ANALYZE {}", tgt_child_qual_probe), None, &[]);
+        let rows_after = count_rows(client, &tgt_child_qual_probe);
+        log_slice_rebuild_if_changed(
+            client,
+            view_name,
+            &tgt_child_qual_probe,
+            rows_before_tgt,
+            rows_after,
+            rebuilt_at.as_deref(),
+        );
         return Ok(());
     }
 
@@ -2616,6 +2667,7 @@ fn swap_partition_child_ddl(
     client
         .update(&ddl.fill_swap_tgt, None, &[])
         .map_err(|e| format!("fill swap tgt: {}", e))?;
+    let rebuilt_at = clock_timestamp(client);
     let _ = client.update(&format!("ANALYZE {}", ddl.swap_tgt_qual), None, &[]);
     if let Some(ref c) = ddl.check_tgt {
         client
@@ -2734,6 +2786,22 @@ fn swap_partition_child_ddl(
     client
         .update(&ddl.rename_tgt, None, &[])
         .map_err(|e| format!("rename tgt: {}", e))?;
+
+    // The DETACH/CREATE-LIKE/fill/ATTACH/RENAME dance above is exactly the
+    // shape of the 2026-09 incident: a legitimate swap that rebuilds a slice
+    // from `base_query` under whatever predicate holds now, which can differ
+    // from what built the slice it replaces. `tgt_child_qual` names the OLD
+    // child before this block and — after `rename_tgt` — the NEW one, so the
+    // same qualified name captures both sides of the swap.
+    let rows_after_tgt = count_rows(client, &tgt_child_qual);
+    log_slice_rebuild_if_changed(
+        client,
+        view_name,
+        &tgt_child_qual,
+        rows_before_tgt,
+        rows_after_tgt,
+        rebuilt_at.as_deref(),
+    );
 
     Ok(())
 }
@@ -3074,6 +3142,107 @@ fn relation_has_rows(client: &pgrx::spi::SpiClient<'_>, qualified: &str) -> bool
         .and_then(|mut it| it.next())
         .and_then(|r| r.get_by_name::<bool, _>("has_rows").ok().flatten())
         .unwrap_or(true)
+}
+
+/// Row count of a relation about to be truncated and refilled — cheap next to
+/// the refill's own source scan. Used to detect a slice-changing rebuild worth
+/// a durable `__reflex_event_log` row. `None` on probe failure — unlike
+/// `relation_has_rows`, there is no safe non-`None` default here: collapsing
+/// an unreadable count to 0 would let a real N->0 wipe read as 0==0 and
+/// suppress the very alarm this exists to raise, so the caller must treat
+/// `None` as "count unknown, assume changed" rather than as a count of zero.
+fn count_rows(client: &pgrx::spi::SpiClient<'_>, qualified: &str) -> Option<i64> {
+    client
+        .select(
+            &format!("SELECT count(*)::int8 AS c FROM {}", qualified),
+            None,
+            &[],
+        )
+        .ok()
+        .and_then(|mut it| it.next())
+        .and_then(|r| r.get_by_name::<i64, _>("c").ok().flatten())
+}
+
+/// `true` iff `public.__reflex_event_log` exists. Guards the partition-side
+/// INSERT below: unlike a plpgsql `DO` block, a bare `client.update` here has
+/// no surrounding `EXCEPTION` to catch a "relation does not exist" — that is
+/// a hard Postgres ERROR that longjmps straight past the `Result`, aborting
+/// the swap this logging is only supposed to observe (realistic trigger: an
+/// upgraded install whose migration missed this table). Checked once per
+/// call rather than cached: this path only runs on an actual slice-changing
+/// rebuild, never on the hot per-commit flush.
+fn event_log_table_exists(client: &pgrx::spi::SpiClient<'_>) -> bool {
+    client
+        .select(
+            "SELECT to_regclass('public.__reflex_event_log') IS NOT NULL AS ok",
+            Some(1),
+            &[],
+        )
+        .ok()
+        .and_then(|mut it| it.next())
+        .and_then(|r| r.get_by_name::<bool, _>("ok").ok().flatten())
+        .unwrap_or(false)
+}
+
+fn clock_timestamp(client: &pgrx::spi::SpiClient<'_>) -> Option<String> {
+    client
+        .select("SELECT clock_timestamp()::text AS t", Some(1), &[])
+        .ok()
+        .and_then(|mut it| it.next())
+        .and_then(|r| r.get_by_name::<String, _>("t").ok().flatten())
+}
+
+/// Record a slice-changing rebuild — the artefact the 2026-09 silent wipe
+/// incident had none of. A no-op when the count is known on both sides and
+/// didn't move: the log is for anomalies and slice-changing rebuilds, never
+/// for every commit. When either side couldn't be counted, fails toward
+/// firing — the safe direction for an alarm — and names the unknown side in
+/// `detail` instead of guessing a count.
+///
+/// `rebuilt_at` is taken before the slice's ANALYZE, so that ANALYZE is
+/// recorded as newer than the rebuild and `reflex_ivm_status` treats the
+/// slice's estimate as current.
+fn log_slice_rebuild_if_changed(
+    client: &mut pgrx::spi::SpiClient<'_>,
+    view_name: &str,
+    slice: &str,
+    rows_before: Option<i64>,
+    rows_after: Option<i64>,
+    rebuilt_at: Option<&str>,
+) {
+    let (changed, detail) = match (rows_before, rows_after) {
+        (Some(b), Some(a)) => (b != a, None),
+        (None, Some(_)) => (true, Some("rows_before unavailable")),
+        (Some(_), None) => (true, Some("rows_after unavailable")),
+        (None, None) => (true, Some("rows_before and rows_after unavailable")),
+    };
+    if !changed || !event_log_table_exists(client) {
+        return;
+    }
+    let sql_opt_i64 = |v: Option<i64>| {
+        v.map(|n| n.to_string())
+            .unwrap_or_else(|| "NULL".to_string())
+    };
+    let sql_opt_text = |v: Option<&str>| {
+        v.map(sql_literal_text)
+            .unwrap_or_else(|| "NULL".to_string())
+    };
+    let _ = client.update(
+        &format!(
+            "INSERT INTO public.__reflex_event_log \
+               (at, imv_name, event, trigger_reason, slice, rows_before, rows_after, detail) \
+             VALUES (COALESCE({}::timestamptz, clock_timestamp()), \
+                     '{}', 'rebuild', 'partition_swap', '{}', {}, {}, {})",
+            sql_opt_text(rebuilt_at),
+            view_name.replace('\'', "''"),
+            slice.replace('\'', "''"),
+            sql_opt_i64(rows_before),
+            sql_opt_i64(rows_after),
+            sql_opt_text(detail),
+        ),
+        None,
+        &[],
+    );
 }
 
 /// Extract the inner value list of a single-key LIST partition bound, i.e. the

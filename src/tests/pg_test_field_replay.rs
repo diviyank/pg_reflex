@@ -422,9 +422,20 @@ fn ps6_migration_do_block_recreates_scratch_and_marks_known_stale() {
         )
     });
     assert!(stale, "migration must mark the wedged IMV known_stale (deltas were lost)");
+    // The literal "PS-6" marker is no longer what lands here: the wedging
+    // flush itself now fills stale_reason with a more specific reason (the
+    // SQLSTATE 42P01 that actually happened) before the migration's DO block
+    // ever runs, and PS-6's own `COALESCE(stale_reason, 'PS-6: ...')` is
+    // written to preserve — not overwrite — whatever reason already exists.
+    // What matters operator-side is unchanged: the reason must still name the
+    // failure and still direct the operator to the same repair (reflex_reconcile).
     assert!(
-        reason.contains("PS-6"),
-        "known_stale must carry the PS-6 recovery reason, got: {reason:?}"
+        reason.contains("does not exist") || reason.contains("42P01"),
+        "stale_reason must still name the failure, got: {reason:?}"
+    );
+    assert!(
+        reason.contains("reflex_reconcile"),
+        "stale_reason must still direct the operator to reflex_reconcile, got: {reason:?}"
     );
 
     // reflex_reconcile is the prescribed backfill and must clear known_stale.

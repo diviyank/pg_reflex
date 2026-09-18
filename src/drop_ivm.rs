@@ -306,6 +306,31 @@ fn drop_reflex_ivm_impl_inner(view_name: &str, cascade: bool, root: &str) -> &'s
                 }],
             )
             .unwrap_or_report();
+        let heal_table_exists = client
+            .select(
+                "SELECT to_regclass('public.__reflex_heal_pending') IS NOT NULL AS ok",
+                Some(1),
+                &[],
+            )
+            .unwrap_or_report()
+            .first()
+            .get_by_name::<bool, _>("ok")
+            .unwrap_or(None)
+            .unwrap_or(false);
+        if heal_table_exists {
+            client
+                .update(
+                    "DELETE FROM public.__reflex_heal_pending WHERE imv_name = $1",
+                    None,
+                    &[unsafe {
+                        DatumWithOid::new(
+                            view_name.to_string(),
+                            PgBuiltInOids::TEXTOID.oid().value(),
+                        )
+                    }],
+                )
+                .unwrap_or_report();
+        }
 
         // 9. Drop consolidated triggers on sources where no other IMV depends.
         //    When called from the sql_drop event trigger the source table itself is

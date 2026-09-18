@@ -366,6 +366,7 @@ fn sample_aggregate_plan() -> AggregationPlan {
         partition_strategy: String::new(),
         anchor_source: String::new(),
         partition_join_paths: std::collections::HashMap::new(),
+        ignore_heal_keys: std::collections::HashMap::new(),
     }
 }
 

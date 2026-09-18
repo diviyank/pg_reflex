@@ -9,6 +9,7 @@ pub mod checks_b_drift;
 pub mod checks_c_orphan;
 pub mod checks_d_residue;
 pub mod checks_e_barename;
+pub mod checks_f_ignore_soundness;
 
 use checks_a_catastrophic::{
     InternalTablesExist, SourceExists, StagingShape, TriggerAttached, TriggerModeMatches,
@@ -19,6 +20,7 @@ use checks_b_drift::{
 use checks_c_orphan::{DuplicateTriggerFunction, OrphanIntermediate, OrphanScratch, OrphanStaging};
 use checks_d_residue::ArchiveResidue;
 use checks_e_barename::BareNameAmbiguity;
+use checks_f_ignore_soundness::IgnoreSoundness;
 
 pub enum AuditScope {
     All,
@@ -183,6 +185,7 @@ fn registry() -> Vec<Box<dyn Check>> {
         Box::new(DuplicateTriggerFunction),
         Box::new(ArchiveResidue),
         Box::new(BareNameAmbiguity),
+        Box::new(IgnoreSoundness),
     ]
 }
 
