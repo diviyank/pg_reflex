@@ -7,6 +7,7 @@
 // slice to zero rows — successfully, silently, permanently.
 
 fn isx_fixture() {
+    lock_shared_fixtures();
     Spi::run("CREATE TABLE isx_dp (id BIGINT PRIMARY KEY, status TEXT NOT NULL)").expect("dp");
     Spi::run("INSERT INTO isx_dp VALUES (1, 'validated')").expect("seed dp");
     Spi::run("CREATE TABLE isx_ss (dem_plan_id BIGINT, qty INT)").expect("ss");

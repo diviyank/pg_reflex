@@ -7,6 +7,7 @@
 // five genuine drain failures is not what these tests are about.
 
 fn cps_build() {
+    lock_shared_fixtures();
     Spi::run(
         "CREATE TABLE cps_src (id BIGINT, region TEXT NOT NULL, amount NUMERIC) \
          PARTITION BY LIST (region)",
