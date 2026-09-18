@@ -16,6 +16,24 @@ We can test and validate the package with:
 
 `cargo pgrx check` does not exist in pgrx 0.18 — it was never a subcommand.
 
+**Before every push, run clippy exactly as CI does** (`.github/workflows/ci.yml`):
+`cargo clippy --features pg17 -- -D warnings`. CI installs the *latest* stable
+toolchain, whose new lints a stale local toolchain does not have (1.11.4's CI failed on
+a `manual_filter` lint that 1.95 did not report). Run it with CI's version, e.g.
+`rustup toolchain install <ci-version> --profile minimal -c clippy` then
+`cargo +<ci-version> clippy --features pg17 -- -D warnings`.
+
+CI runs `cargo pgrx test` on **pg15, pg16, pg17 and pg18**; a release needs all four
+green. A test using a catalog function newer than PG15 (e.g.
+`pg_stat_get_backend_subxact`, `pg_input_is_valid`) must be gated with
+`#[cfg(not(feature = "pg15"))]`.
+
+`#[pg_test]`s run in parallel in one database. A fixture that creates fixed-name
+objects shared by several tests must call `lock_shared_fixtures()` before creating
+anything (and a test must call it before its own first object if it uses such a
+fixture later): otherwise two tests block on each other's uncommitted names while one
+holds the `__reflex_deferred_pending` lock a DEFERRED create takes, and deadlock.
+
 **`cargo pgrx test` installs the extension into the shared pgrx install
 (`~/.pgrx/<version>/pgrx-install`) as part of running.** So two agents or shells testing
 the same PG version concurrently overwrite each other's `.so`, and tests can execute
