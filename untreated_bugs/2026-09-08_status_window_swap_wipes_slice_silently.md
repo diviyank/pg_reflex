@@ -46,11 +46,6 @@ with no error, no `known_stale`, and the pre-wipe `reltuples` in `reflex_ivm_sta
 4. **A second read of the ignored source hidden in a SQL function body** is invisible
    to the single-read check, so such a source is still mapped and a change seen only
    through the function's read can be missed.
-5. **The heal helpers are callable by any role.** `__reflex_heal_enqueue` lets a role
-   with no rights on the source queue keys for IMVs mapped to it. That costs partition
-   rebuilds that restore what the query returns, never wrong data;
-   `__reflex_heal_mark_truncated` acts only on an empty source.
-
 (`TRUNCATE` of a mapped ignored source is reported: it marks the IMV `known_stale`.)
 
 A pg_reflex-side runtime wipe guard (refusing a rebuild that takes a non-empty slice to

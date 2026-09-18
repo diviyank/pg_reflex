@@ -44,12 +44,12 @@ SELECT reflex_heal_ignored_sources('sop_forecast_view');
 
 The triggers never make a write to the ignored source fail, and never make it expensive:
 
-- The trigger runs as the writer, with a pinned `search_path`, and evaluates no user-defined function: watched columns are compared through their types' output functions, never a cast, and keys are of built-in types. Only three small `SECURITY DEFINER` helpers (`__reflex_heal_targets`, `__reflex_heal_enqueue`, `__reflex_heal_mark_truncated`) touch the pg_reflex tables, so a role that writes the source needs no grant on them.
+- The trigger function is `SECURITY DEFINER` with a pinned `search_path`, so a role that writes the source needs no grant on the pg_reflex tables and no `USAGE` on schema `public`. A trigger function cannot be called directly, so no role can point it at a relation of its choosing.
+- It evaluates no user-defined function: watched columns are compared through a NULL flag and their types' output functions, never a cast (so `NULL` and `''` differ), and a key is rendered only while its column is of a built-in type.
 - It opens no subtransaction.
 - Keys are stored as `to_jsonb(<col>) #>> '{}'`, so a date key never depends on the writer's `DateStyle`.
-- `TRUNCATE` cannot be scoped to keys: it marks the IMV `known_stale`, keeping any earlier `stale_reason` and `stale_since`, with `SELECT reflex_reconcile('<imv>');`.
-- If a mapped or watched column of the source was renamed or dropped, the write goes through and queues nothing. `reflex_ivm_status` and `reflex_doctor` (F14) derive that from the catalog and report the IMV `known_stale` until it is recreated against the current columns.
-- The helpers are callable by any role. A direct call can queue keys, which only costs a partition rebuild that restores what the query returns; the truncate helper acts only on a source that is empty.
+- `TRUNCATE` (including `TRUNCATE ONLY` of an inheritance parent) cannot be scoped to keys: it marks the IMV `known_stale`, keeping any earlier `stale_reason` and `stale_since`, with `SELECT reflex_reconcile('<imv>');`.
+- If a mapped or watched column of the source was renamed or dropped, or the mapped column was retyped to a type outside `pg_catalog`, the write goes through and queues nothing. `reflex_ivm_status` and `reflex_doctor` (F14) derive that from the catalog and report the IMV `known_stale` until it is recreated against the current columns.
 
 ## Which ignored sources heal
 
