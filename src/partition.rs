@@ -29,6 +29,7 @@ use crate::query_decomposer::{
     split_qualified_name,
 };
 use crate::sql_writer::identifier::format_pg_text_array;
+use crate::trigger::deferred::ScopedRebuildGuard;
 
 /// A root that has failed this many flushes stops being retried. Its pending row
 /// and `last_error` survive for `reflex_doctor`, and dependents stay marked
@@ -2146,11 +2147,19 @@ pub(crate) fn reflex_reconcile_partition_impl(
                     .to_string()
             })
             .collect();
-        reconcile_at_commit = crate::trigger::deferred::guard_scoped_rebuild(
+        match crate::trigger::deferred::guard_scoped_rebuild(
             client,
             view_name,
             crate::trigger::deferred::RebuiltSlice::SourcePartitions(&src_children),
-        );
+        ) {
+            ScopedRebuildGuard::Unguarded => {}
+            ScopedRebuildGuard::ReconcileAtCommit => reconcile_at_commit = true,
+            ScopedRebuildGuard::RecordWithRebuild(record) => {
+                client
+                    .update(&record, None, &[])
+                    .map_err(|e| format!("reconcile_partition: record rebuilt slice: {}", e))?;
+            }
+        }
         let all_diffed = rebuild_mirror_leaves(
             client,
             view_name,
@@ -2311,7 +2320,7 @@ pub(crate) fn reflex_reconcile_partition_impl(
             if same_part_reconciled {
                 continue;
             }
-            if let Some(scoped) = build_scoped_cascade_reconcile(
+            if let Some(scoped_with) = build_scoped_cascade_reconcile(
                 child,
                 part_col,
                 &affected_keys,
@@ -2329,7 +2338,7 @@ pub(crate) fn reflex_reconcile_partition_impl(
                     .map(|k| sql_literal_text(k))
                     .collect::<Vec<_>>()
                     .join(", ");
-                let child_at_commit = crate::trigger::deferred::guard_scoped_rebuild(
+                let guard = crate::trigger::deferred::guard_scoped_rebuild(
                     client,
                     child,
                     crate::trigger::deferred::RebuiltSlice::Keys {
@@ -2337,8 +2346,12 @@ pub(crate) fn reflex_reconcile_partition_impl(
                         literals: &literals,
                     },
                 );
-                let _ = client.update(&scoped, None, &[]);
-                if child_at_commit {
+                let record_rebuild = match &guard {
+                    ScopedRebuildGuard::RecordWithRebuild(record) => format!("{record};"),
+                    _ => String::new(),
+                };
+                let _ = client.update(&scoped_with(&record_rebuild), None, &[]);
+                if matches!(guard, ScopedRebuildGuard::ReconcileAtCommit) {
                     crate::trigger::deferred::list_for_commit_reconcile(child);
                 }
             } else {
@@ -2386,7 +2399,9 @@ pub(crate) fn reflex_reconcile_partition_impl(
 /// `part_col`, has no affected keys, or its base query has no spliceable
 /// `GROUP BY`. The emitted DO block self-heals: any runtime error in the scoped
 /// path runs a full `reflex_reconcile` in its EXCEPTION branch, so the
-/// optimization can never leave the dependent incorrect.
+/// optimization can never leave the dependent incorrect. The returned builder
+/// takes a statement run first inside the scoped path (the DEFERRED slice
+/// record), so it is undone with the scoped path when that fails.
 fn build_scoped_cascade_reconcile(
     child: &str,
     part_col: &str,
@@ -2395,7 +2410,7 @@ fn build_scoped_cascade_reconcile(
     base_query: &str,
     end_query: &str,
     group_by_columns: &[String],
-) -> Option<String> {
+) -> Option<impl Fn(&str) -> String> {
     if !dep_partition_cols.is_empty() {
         return None; // partitioned dependents use the co-partitioned path
     }
@@ -2426,29 +2441,27 @@ fn build_scoped_cascade_reconcile(
         &format!(" AND \"{}\" IN ({})", part_col, lits),
     )?;
 
-    let intermediate = intermediate_table_name(child);
-    let target = quote_identifier(child);
+    let int = intermediate_table_name(child);
+    let tgt = quote_identifier(child);
     let child_lit = sql_literal_text(child);
+    let end_query = end_query.to_string();
 
-    Some(format!(
-        "DO $reflex_scoped_cascade$ \
-         BEGIN \
-           DELETE FROM {int} WHERE {pred}; \
-           INSERT INTO {int} {spliced_base}; \
-           DELETE FROM {tgt} WHERE {pred}; \
-           INSERT INTO {tgt} SELECT * FROM ({end_query}) __reflex_scoped WHERE {pred}; \
-           UPDATE public.__reflex_ivm_reference SET last_update_date = NOW() WHERE name = {child_lit}; \
-         EXCEPTION WHEN OTHERS THEN \
-           PERFORM public.reflex_reconcile({child_lit}); \
-         END \
-         $reflex_scoped_cascade$",
-        int = intermediate,
-        tgt = target,
-        pred = key_pred,
-        spliced_base = spliced_base,
-        end_query = end_query,
-        child_lit = child_lit,
-    ))
+    Some(move |record_rebuild: &str| {
+        format!(
+            "DO $reflex_scoped_cascade$ \
+             BEGIN \
+               {record_rebuild} \
+               DELETE FROM {int} WHERE {key_pred}; \
+               INSERT INTO {int} {spliced_base}; \
+               DELETE FROM {tgt} WHERE {key_pred}; \
+               INSERT INTO {tgt} SELECT * FROM ({end_query}) __reflex_scoped WHERE {key_pred}; \
+               UPDATE public.__reflex_ivm_reference SET last_update_date = NOW() WHERE name = {child_lit}; \
+             EXCEPTION WHEN OTHERS THEN \
+               PERFORM public.reflex_reconcile({child_lit}); \
+             END \
+             $reflex_scoped_cascade$"
+        )
+    })
 }
 
 /// Whether IMV maintenance triggers (enabled `ORIGIN`, the default) fire under
