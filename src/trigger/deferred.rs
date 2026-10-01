@@ -63,11 +63,95 @@ pub(crate) fn build_netted_view_sql(
     )
 }
 
-/// Transaction-local marker of the IMVs already rebuilt in this COMMIT batch;
-/// every later staged delta for them is skipped by the cross-source guard.
+/// Transaction-local marker of the IMVs already rebuilt in this transaction, with
+/// the command id current when each rebuild started (`watermark`): a delta staged
+/// for one at or before it is reflected by the rebuild and skipped, a later one is
+/// applied (see [`delta_staged_after`]).
 const RECONCILED_BATCH_TABLE_DDL: &str =
     "CREATE TEMP TABLE IF NOT EXISTS __reflex_deferred_reconciled_batch \
-     (name TEXT PRIMARY KEY) ON COMMIT DROP";
+     (name TEXT PRIMARY KEY, watermark BIGINT NOT NULL) ON COMMIT DROP";
+
+/// Re-arms the COMMIT-time rebuild of `view_name` (a source of it was truncated
+/// again): drops it from the marker, if this transaction has one.
+pub(crate) fn rearm_rebuild_sql(view_name: &str) -> String {
+    format!(
+        "DO $_reflex_rearm$ BEGIN \
+           IF to_regclass('pg_temp.__reflex_deferred_reconciled_batch') IS NOT NULL THEN \
+             DELETE FROM pg_temp.__reflex_deferred_reconciled_batch WHERE name = '{}'; \
+           END IF; \
+         END $_reflex_rearm$",
+        view_name.replace('\'', "''")
+    )
+}
+
+/// Rows of `delta_tbl` this transaction staged after command `watermark`: staging
+/// tables are insert-only until a flush or a source TRUNCATE empties them, so a
+/// row's `cmin` is the command that staged it, and command ids grow across the
+/// whole transaction, subtransactions included.
+fn delta_staged_after(delta_tbl: &str, watermark: i64) -> String {
+    format!(
+        "(SELECT * FROM {delta_tbl} \
+          WHERE {WRITTEN_BY_THIS_XACT} AND cmin::text::bigint > {watermark}) __reflex_post"
+    )
+}
+
+fn staged_after(client: &pgrx::spi::SpiClient<'_>, delta_tbl: &str, watermark: i64) -> bool {
+    let select_bool = |sql: &str| {
+        client
+            .select(sql, None, &[])
+            .unwrap_or_report()
+            .first()
+            .get_one::<bool>()
+            .unwrap_or(None)
+            .unwrap_or(false)
+    };
+    select_bool(&format!(
+        "SELECT to_regclass('{}') IS NOT NULL",
+        delta_tbl.replace('\'', "''")
+    )) && select_bool(&format!(
+        "SELECT EXISTS (SELECT 1 FROM {})",
+        delta_staged_after(delta_tbl, watermark)
+    ))
+}
+
+/// The command id a rebuild starting now reads at: every row staged so far has a
+/// `cmin` at or below it, every row staged later one above it (marking it used
+/// makes the next command id increment).
+fn rebuild_watermark() -> i64 {
+    i64::from(unsafe { pg_sys::GetCurrentCommandId(true) })
+}
+
+/// Sources `imv_name` observes (its `depends_on` minus `ignored_sources`).
+fn observed_sources(client: &pgrx::spi::SpiClient<'_>, imv_name: &str) -> Vec<String> {
+    client
+        .select(
+            "SELECT d FROM public.__reflex_ivm_reference r, unnest(r.depends_on) d \
+             WHERE r.name = $1 \
+               AND NOT (COALESCE(r.ignored_sources, ARRAY[]::TEXT[]) \
+                        && ARRAY[d, regexp_replace(d, '^.*\\.', '')])",
+            None,
+            &[unsafe {
+                DatumWithOid::new(imv_name.to_string(), PgBuiltInOids::TEXTOID.oid().value())
+            }],
+        )
+        .unwrap_or_report()
+        .filter_map(|row| row.get_by_name::<String, _>("d").unwrap_or(None))
+        .collect()
+}
+
+fn rebuild_watermark_of(client: &pgrx::spi::SpiClient<'_>, imv_name: &str) -> Option<i64> {
+    client
+        .select(
+            "SELECT watermark FROM pg_temp.__reflex_deferred_reconciled_batch WHERE name = $1",
+            None,
+            &[unsafe {
+                DatumWithOid::new(imv_name.to_string(), PgBuiltInOids::TEXTOID.oid().value())
+            }],
+        )
+        .unwrap_or_report()
+        .next()
+        .and_then(|row| row.get_by_name::<i64, _>("watermark").unwrap_or(None))
+}
 
 /// `pg_reflex.flush_failure_policy`: `error` aborts the caller on a per-IMV
 /// failure; unset, `warn`, or anything unrecognised (with a WARNING) contains it.
@@ -245,23 +329,24 @@ fn flush_request_outstanding(client: &pgrx::spi::SpiClient<'_>, imv_name: &str) 
 /// stale_reason of an IMV whose COMMIT-time rebuild is postponed; its rebuild clears it.
 const POSTPONED_REASON: &str = "COMMIT-time rebuild postponed until upstream DEFERRED IMVs settle";
 
-/// Rebuilds, once per transaction, each IMV listed in `__reflex_deferred_rebuild`
-/// by a source TRUNCATE (`reflex_build_truncate_sql`) or by the cross-source
-/// guard (`flush_staged_deltas`; rebuilt by `rebuild_for_cross_source_guard`),
-/// and records it in
-/// `__reflex_deferred_reconciled_batch` so every delta staged for it in this
-/// transaction is skipped. Runs around every flush, whatever its source: the
-/// rebuild must read every upstream IMV in its final state, so while one may
-/// still change ([`upstream_pending`]) it is postponed, and the flush that
-/// settles the upstream runs this again. As a fallback a pending row is
-/// re-enqueued (bounded; on exhaustion it is rebuilt anyway and marked stale).
-/// Nested calls (a flush fired synchronously by a write of this pass, e.g. after
+/// Rebuilds each IMV listed in `__reflex_deferred_rebuild` by a source TRUNCATE
+/// (`reflex_build_truncate_sql`) or by the cross-source guard
+/// (`flush_staged_deltas`; rebuilt by `rebuild_for_cross_source_guard`), and
+/// records it in `__reflex_deferred_reconciled_batch` with its watermark, so the
+/// deltas staged for it before the rebuild are skipped and the later ones applied
+/// (a rebuild can run before the transaction's last write, e.g. under
+/// `SET CONSTRAINTS ALL IMMEDIATE`). A rebuilt IMV is rebuilt again only when
+/// re-armed: a second TRUNCATE, or two of its sources changed after the rebuild.
+/// Runs around every flush, whatever its source: the rebuild must read every
+/// upstream IMV in its final state, so while one may still change
+/// ([`upstream_pending`]) it is postponed, and the flush that settles the
+/// upstream runs this again. As a fallback a pending row is re-enqueued
+/// (bounded; on exhaustion it is rebuilt anyway and marked stale). Nested calls
+/// (a flush fired synchronously by a write of this pass, e.g. after
 /// `SET CONSTRAINTS ALL IMMEDIATE`) return at once. The rebuild is the one an
 /// IMMEDIATE dependent gets at TRUNCATE time, so its dependents receive a row
 /// diff. A failure marks the IMV stale (or aborts under
-/// `flush_failure_policy = error`). Limit: after a mid-transaction
-/// `SET CONSTRAINTS ALL IMMEDIATE` rebuilt it, later DML of the same transaction
-/// staged for it is skipped by the marker.
+/// `flush_failure_policy = error`).
 fn rebuild_truncated_imvs(client: &mut pgrx::spi::SpiClient<'_>) -> usize {
     let nested = client
         .select(
@@ -395,8 +480,10 @@ fn rebuild_listed(client: &mut pgrx::spi::SpiClient<'_>, listed: &[String]) -> u
         client
             .update(
                 &format!(
-                    "INSERT INTO __reflex_deferred_reconciled_batch (name) VALUES ('{imv_esc}') \
-                     ON CONFLICT DO NOTHING"
+                    "INSERT INTO __reflex_deferred_reconciled_batch (name, watermark) \
+                     VALUES ('{imv_esc}', {}) \
+                     ON CONFLICT (name) DO UPDATE SET watermark = EXCLUDED.watermark",
+                    rebuild_watermark()
                 ),
                 None,
                 &[],
@@ -807,36 +894,32 @@ fn flush_staged_deltas(source_table: &str) -> String {
         // record-key anti-join) and why the choice hinges on `any_text_cast`.
         let cmp_csv = cmp_cols.join(", ");
         let any_text_cast = src_cols_with_types.iter().any(|(_, t)| needs_text_cast(t));
-        client
-            .update(
-                &build_netted_view_sql(
-                    &new_view,
-                    &projection,
-                    &cmp_csv,
-                    &delta_tbl,
-                    "'I', 'U_NEW'",
-                    "'D', 'U_OLD'",
-                    any_text_cast,
-                ),
-                None,
-                &[],
-            )
-            .unwrap_or_report();
-        client
-            .update(
-                &build_netted_view_sql(
-                    &old_view,
-                    &projection,
-                    &cmp_csv,
-                    &delta_tbl,
-                    "'D', 'U_OLD'",
-                    "'I', 'U_NEW'",
-                    any_text_cast,
-                ),
-                None,
-                &[],
-            )
-            .unwrap_or_report();
+        // The views read `rel`: the staging table, or for an IMV rebuilt in this
+        // transaction only the rows staged after its rebuild.
+        let create_netted_views = |client: &mut pgrx::spi::SpiClient<'_>, rel: &str| {
+            for (view, keep, drop) in [
+                (&new_view, "'I', 'U_NEW'", "'D', 'U_OLD'"),
+                (&old_view, "'D', 'U_OLD'", "'I', 'U_NEW'"),
+            ] {
+                client
+                    .update(
+                        &build_netted_view_sql(
+                            view,
+                            &projection,
+                            &cmp_csv,
+                            rel,
+                            keep,
+                            drop,
+                            any_text_cast,
+                        ),
+                        None,
+                        &[],
+                    )
+                    .unwrap_or_report();
+            }
+        };
+        create_netted_views(client, &delta_tbl);
+        let mut views_over = delta_tbl.clone();
 
         // 1.4.3 — Spurious-UPDATE short-circuit.
         //
@@ -884,7 +967,36 @@ fn flush_staged_deltas(source_table: &str) -> String {
                 .unwrap_or(false)
         };
 
-        if is_spurious {
+        // The marker (created below) survives across the batch's per-source
+        // flush calls. A later flush sees a shrunken pending set (each flush
+        // deletes its own pending rows), so `batch_has_multiple_sources` may
+        // already read false by then — but if the marker exists, a
+        // multi-source reconcile happened earlier in this batch and this flush
+        // MUST still treat the rebuilt IMVs as rebuilt. `pg_my_temp_schema()` scopes the
+        // lookup to this session's temp schema (0 ⇒ no temp schema yet).
+        let marker_exists = client
+            .select(
+                "SELECT EXISTS(SELECT 1 FROM pg_class \
+                   WHERE relname = '__reflex_deferred_reconciled_batch' \
+                     AND relnamespace = pg_my_temp_schema()) AS e",
+                None,
+                &[],
+            )
+            .unwrap_or_report()
+            .next()
+            .map(|row| {
+                row.get_by_name::<bool, _>("e")
+                    .unwrap_or(None)
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false);
+        // A delta that nets to nothing as a whole need not for an IMV rebuilt in
+        // this transaction: it takes only the rows staged after its rebuild.
+        let any_rebuilt_here = marker_exists
+            && imvs
+                .iter()
+                .any(|imv| rebuild_watermark_of(client, &imv.0).is_some());
+        if is_spurious && !any_rebuilt_here {
             // No IMV processing. Clean up the staging delta and pending rows.
             // DELETE (not TRUNCATE) — see end-of-function comment.
             client
@@ -915,7 +1027,7 @@ fn flush_staged_deltas(source_table: &str) -> String {
         // hazard is unique to the commit-time batch flush. Detect the batch
         // shape once here — the per-IMV loop lists any affected IMV for one
         // COMMIT-time full rebuild (`rebuild_listed`), and every delta staged for
-        // it in this transaction is skipped. 'TRUNCATE' rows are
+        // it before that rebuild is skipped. 'TRUNCATE' rows are
         // flush requests, not staged deltas, so they never count as a source.
         let batch_has_multiple_sources = client
             .select(
@@ -927,29 +1039,6 @@ fn flush_staged_deltas(source_table: &str) -> String {
             .unwrap_or_report()
             .next()
             .map(|row| row.get_by_name::<bool, _>("m").unwrap_or(None).unwrap_or(false))
-            .unwrap_or(false);
-        // The marker (created below) survives across the batch's per-source
-        // flush calls. A later flush sees a shrunken pending set (each flush
-        // deletes its own pending rows), so `batch_has_multiple_sources` may
-        // already read false by then — but if the marker exists, a
-        // multi-source reconcile happened earlier in this batch and this flush
-        // MUST still skip the reconciled IMVs. `pg_my_temp_schema()` scopes the
-        // lookup to this session's temp schema (0 ⇒ no temp schema yet).
-        let marker_exists = client
-            .select(
-                "SELECT EXISTS(SELECT 1 FROM pg_class \
-                   WHERE relname = '__reflex_deferred_reconciled_batch' \
-                     AND relnamespace = pg_my_temp_schema()) AS e",
-                None,
-                &[],
-            )
-            .unwrap_or_report()
-            .next()
-            .map(|row| {
-                row.get_by_name::<bool, _>("e")
-                    .unwrap_or(None)
-                    .unwrap_or(false)
-            })
             .unwrap_or(false);
         let engage_cross_source_guard = batch_has_multiple_sources || marker_exists;
         if engage_cross_source_guard && !marker_exists {
@@ -976,84 +1065,112 @@ fn flush_staged_deltas(source_table: &str) -> String {
         let fail_hard = flush_fail_hard(client);
 
         for (imv_name, base_query, end_query, agg_json, where_pred) in &imvs {
+            let mut delta_rel = delta_tbl.clone();
             if engage_cross_source_guard {
                 let imv_esc = imv_name.replace('\'', "''");
-                // Rebuilt in this batch, or listed for a COMMIT-time rebuild
-                // (`rebuild_listed`): every delta staged for it is skipped.
-                let rebuilt_or_listed = client
-                    .select(
-                        &format!(
-                            "SELECT EXISTS(SELECT 1 FROM __reflex_deferred_reconciled_batch \
-                             WHERE name = '{imv_esc}') AS e"
-                        ),
-                        None,
-                        &[],
-                    )
-                    .unwrap_or_report()
-                    .next()
-                    .map(|row| {
-                        row.get_by_name::<bool, _>("e")
-                            .unwrap_or(None)
-                            .unwrap_or(false)
-                    })
-                    .unwrap_or(false)
-                    || temp_table_names(client, "__reflex_deferred_rebuild").contains(imv_name);
-                if rebuilt_or_listed {
-                    continue;
-                }
-                // Count this IMV's own sources that are pending in the batch.
-                // The first of the IMV's sources to be flushed still sees all
-                // of them pending (per-source cleanup only runs for sources
-                // already processed, none of which are this IMV's), so it
-                // reliably detects the multi-source shape and reconciles.
-                let imv_has_multiple_sources = client
-                    .select(
-                        &format!(
-                            "SELECT count(DISTINCT p.source_table) >= 2 AS m \
-                             FROM public.__reflex_deferred_pending p \
-                             JOIN public.__reflex_ivm_reference r ON r.name = '{}' \
-                             WHERE p.source_table = ANY(r.depends_on) \
-                               AND p.operation <> 'TRUNCATE'",
-                            imv_esc
-                        ),
-                        None,
-                        &[],
-                    )
-                    .unwrap_or_report()
-                    .next()
-                    .map(|row| {
-                        row.get_by_name::<bool, _>("m")
-                            .unwrap_or(None)
-                            .unwrap_or(false)
-                    })
-                    .unwrap_or(false);
-                if imv_has_multiple_sources {
-                    // Listed for the COMMIT-time rebuild pass that follows this
-                    // flush (`reflex_flush_deferred`) instead of reconciled here:
-                    // the rebuild must read every upstream DEFERRED IMV in its
-                    // final state, so it waits until none has a delta this
-                    // transaction staged and still unflushed (`upstream_pending`),
-                    // and runs in its own subtransaction, so a failure flags the
-                    // IMV stale instead of aborting the COMMIT
-                    // (`rebuild_for_cross_source_guard`).
-                    ensure_temp_table(
-                        client,
-                        "__reflex_deferred_rebuild",
-                        crate::trigger::DEFERRED_REBUILD_TABLE_DDL,
-                    );
-                    client
-                        .update(
+                if let Some(watermark) = rebuild_watermark_of(client, imv_name) {
+                    // Rebuilt in this transaction: the deltas staged up to its
+                    // rebuild are in it; the ones staged after are applied.
+                    if !staged_after(client, &delta_tbl, watermark) {
+                        continue;
+                    }
+                    let other_source_staged_after =
+                        observed_sources(client, imv_name).iter().any(|source| {
+                            source != source_table
+                                && staged_after(
+                                    client,
+                                    &staging_delta_table_name(source),
+                                    watermark,
+                                )
+                        });
+                    if other_source_staged_after {
+                        // Two of its sources changed since the rebuild: applied
+                        // one by one they would count their cross product twice.
+                        // Rebuild it again after this flush.
+                        ensure_temp_table(
+                            client,
+                            "__reflex_deferred_rebuild",
+                            crate::trigger::DEFERRED_REBUILD_TABLE_DDL,
+                        );
+                        client
+                            .update(
+                                &format!(
+                                    "DELETE FROM pg_temp.__reflex_deferred_reconciled_batch \
+                                     WHERE name = '{imv_esc}'; \
+                                     INSERT INTO pg_temp.__reflex_deferred_rebuild (name) \
+                                     VALUES ('{imv_esc}') ON CONFLICT (name) DO NOTHING"
+                                ),
+                                None,
+                                &[],
+                            )
+                            .unwrap_or_report();
+                        total_processed += 1;
+                        continue;
+                    }
+                    delta_rel = delta_staged_after(&delta_tbl, watermark);
+                } else {
+                    if is_spurious {
+                        continue;
+                    }
+                    if temp_table_names(client, "__reflex_deferred_rebuild").contains(imv_name) {
+                        // Listed for a COMMIT-time rebuild (`rebuild_listed`)
+                        // that has not run yet: it reads this delta's final state.
+                        continue;
+                    }
+                    // Count this IMV's own sources that are pending in the batch.
+                    // The first of the IMV's sources to be flushed still sees all
+                    // of them pending (per-source cleanup only runs for sources
+                    // already processed, none of which are this IMV's), so it
+                    // reliably detects the multi-source shape and reconciles.
+                    let imv_has_multiple_sources = client
+                        .select(
                             &format!(
-                                "INSERT INTO pg_temp.__reflex_deferred_rebuild (name, reconcile) \
-                                 VALUES ('{imv_esc}', TRUE) \
-                                 ON CONFLICT (name) DO UPDATE SET reconcile = TRUE"
+                                "SELECT count(DISTINCT p.source_table) >= 2 AS m \
+                                 FROM public.__reflex_deferred_pending p \
+                                 JOIN public.__reflex_ivm_reference r ON r.name = '{}' \
+                                 WHERE p.source_table = ANY(r.depends_on) \
+                                   AND p.operation <> 'TRUNCATE'",
+                                imv_esc
                             ),
                             None,
                             &[],
                         )
-                        .unwrap_or_report();
-                    total_processed += 1;
-                    continue;
+                        .unwrap_or_report()
+                        .next()
+                        .map(|row| {
+                            row.get_by_name::<bool, _>("m")
+                                .unwrap_or(None)
+                                .unwrap_or(false)
+                        })
+                        .unwrap_or(false);
+                    if imv_has_multiple_sources {
+                        // Listed for the COMMIT-time rebuild pass that follows this
+                        // flush (`reflex_flush_deferred`) instead of reconciled here:
+                        // the rebuild must read every upstream DEFERRED IMV in its
+                        // final state, so it waits until none has a delta this
+                        // transaction staged and still unflushed (`upstream_pending`),
+                        // and runs in its own subtransaction, so a failure flags the
+                        // IMV stale instead of aborting the COMMIT
+                        // (`rebuild_for_cross_source_guard`).
+                        ensure_temp_table(
+                            client,
+                            "__reflex_deferred_rebuild",
+                            crate::trigger::DEFERRED_REBUILD_TABLE_DDL,
+                        );
+                        client
+                            .update(
+                                &format!(
+                                    "INSERT INTO pg_temp.__reflex_deferred_rebuild (name, reconcile) \
+                                     VALUES ('{imv_esc}', TRUE) \
+                                     ON CONFLICT (name) DO UPDATE SET reconcile = TRUE"
+                                ),
+                                None,
+                                &[],
+                            )
+                            .unwrap_or_report();
+                        total_processed += 1;
+                        continue;
+                    }
                 }
             }
             // 1.4.5 — Skip this IMV iff NO staged row matches the
@@ -1071,7 +1188,7 @@ fn flush_staged_deltas(source_table: &str) -> String {
                      ) OR EXISTS( \
                         SELECT 1 FROM {delta} WHERE __reflex_op IN ('D', 'U_OLD') AND ({pred}) \
                      ) AS m",
-                    delta = delta_tbl,
+                    delta = delta_rel,
                     pred = pred,
                 );
                 let matched = client
@@ -1177,7 +1294,7 @@ fn flush_staged_deltas(source_table: &str) -> String {
                              SELECT NOT EXISTS(SELECT 1 FROM diff_o) \
                                 AND NOT EXISTS(SELECT 1 FROM diff_n) AS sp",
                             cols = cols_csv,
-                            delta = delta_tbl,
+                            delta = delta_rel,
                             of = old_filter,
                             nf = new_filter,
                         );
@@ -1196,6 +1313,11 @@ fn flush_staged_deltas(source_table: &str) -> String {
                         }
                     }
                 }
+            }
+
+            if views_over != delta_rel {
+                create_netted_views(client, &delta_rel);
+                views_over = delta_rel.clone();
             }
 
             // Collect every per-IMV statement into an ordered list; we emit them
@@ -1282,7 +1404,7 @@ fn flush_staged_deltas(source_table: &str) -> String {
             let imv_name_esc = imv_name.replace("'", "''");
             let success_body = format!(
                 "PERFORM set_config('application_name', 'reflex_flush:{imv_name_esc}', true); \
-                 SELECT COUNT(*) INTO _rows FROM {delta_tbl}; \
+                 SELECT COUNT(*) INTO _rows FROM {delta_rel}; \
                  \n{body}\n \
                  _ms := (EXTRACT(EPOCH FROM (clock_timestamp() - _t0)) * 1000)::BIGINT; \
                  UPDATE public.__reflex_ivm_reference \
@@ -1295,7 +1417,7 @@ fn flush_staged_deltas(source_table: &str) -> String {
                        )[GREATEST(1, COALESCE(cardinality(flush_ms_history), 0) + 1 - 63):] \
                    WHERE name = '{imv_name_esc}'; \
                  PERFORM set_config('application_name', COALESCE(_prev_app, ''), true);",
-                delta_tbl = delta_tbl,
+                delta_rel = delta_rel,
                 body = body,
                 imv_name_esc = imv_name_esc,
             );

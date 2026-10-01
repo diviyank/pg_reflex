@@ -26,8 +26,8 @@ instead of aborting COMMIT. `ALTER EXTENSION pg_reflex UPDATE TO '1.11.5';`
   keeps rows, and they were deleted — in DEFERRED mode outside the flush's
   savepoint, so a failed flush made the loss permanent. The IMV is now
   rebuilt from its base query. An IMMEDIATE IMV is rebuilt at TRUNCATE time;
-  a DEFERRED one once at COMMIT, skipping every delta staged for it in the
-  transaction, after every upstream DEFERRED IMV with work staged in the
+  a DEFERRED one at COMMIT, skipping the deltas staged for it before that
+  rebuild and applying the later ones, after every upstream DEFERRED IMV with work staged in the
   transaction has settled (decided exactly by the new
   `__reflex_xid_is_current`; bounded — on exhaustion it rebuilds anyway and
   marks the IMV `known_stale`). A rebuild that cannot run marks the IMV
@@ -55,6 +55,7 @@ instead of aborting COMMIT. `ALTER EXTENSION pg_reflex UPDATE TO '1.11.5';`
   isolated in a subtransaction, and a failure marks the IMV `known_stale`
   instead of aborting the COMMIT (`flush_failure_policy = error` still
   aborts).
+- **(SILENT) After a mid-transaction `SET CONSTRAINTS ALL IMMEDIATE` rebuilt a DEFERRED IMV (source TRUNCATE or guard), the transaction's later DML was skipped for it**; each rebuild now records a command-id watermark, deltas staged after it are applied, and a second TRUNCATE or two sources changed again rebuild it again.
 - **Volume dispatch misjudged two-level partitioned IMVs.** A dirty
   partition was sized by the partitioned child's own `reltuples` (0 / -1,
   so always the 1000-row floor), and any ≥ 500-row change to a plan rebuilt
@@ -84,9 +85,7 @@ instead of aborting COMMIT. `ALTER EXTENSION pg_reflex UPDATE TO '1.11.5';`
 ### Known limits
 
 Filed in `untreated_bugs/`: a passthrough dependent with no key mapping for
-a source still fully refreshes (now as a diff) on every statement on it;
-after a mid-transaction `SET CONSTRAINTS ALL IMMEDIATE`, later DML of the
-same transaction is skipped for an IMV already rebuilt in it; the guard's
+a source still fully refreshes (now as a diff) on every statement on it; the guard's
 COMMIT-time reconcile may drop orphan partitions (pre-existing); hot/cold
 dispatch still classifies a two-level mirror per plan, not per leaf;
 `create_reflex_ivm` rejects three mixed-case name shapes; the partitioned
@@ -95,8 +94,8 @@ passthrough 23505 flush failure of the incident is not reproduced yet.
 ### Tests
 
 - New `pg_test_truncate_outer_join.rs`, `pg_test_rebuild_diff.rs`,
-  `pg_test_reconcile_diff_apply.rs`, `pg_test_rebuild_cost.rs` and
-  `pg_test_rebuild_commit.rs`; every must-be-absent / must-stay-unchanged
+  `pg_test_reconcile_diff_apply.rs`, `pg_test_rebuild_cost.rs`,
+  `pg_test_rebuild_commit.rs` and `pg_test_deferred_marker.rs`; every must-be-absent / must-stay-unchanged
   assertion mutation-checked. Cost assertions count rows inserted, updated
   and deleted over the partition tree in the current transaction.
 

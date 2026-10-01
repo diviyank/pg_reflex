@@ -466,8 +466,8 @@ pub fn reflex_quote_identifier(name: &str) -> String {
 /// IMMEDIATE: rebuilt now, reaching its dependents as a row diff.
 /// DEFERRED: untouched now. The IMV is listed in `__reflex_deferred_rebuild` and
 /// a pending row is enqueued on a source it observes, so the COMMIT-time flush
-/// rebuilds it once and skips every delta staged for it in this transaction
-/// (see `deferred::rebuild_truncated_dependents`).
+/// rebuilds it and skips every delta staged for it before that rebuild (see
+/// `deferred::rebuild_truncated_imvs`). A TRUNCATE after that rebuild re-arms it.
 #[pg_extern(parallel_safe)]
 pub fn reflex_build_truncate_sql(view_name: &str) -> String {
     let escaped_name = view_name.replace('\'', "''");
@@ -489,6 +489,7 @@ pub fn reflex_build_truncate_sql(view_name: &str) -> String {
             format!(
                 "INSERT INTO __reflex_deferred_rebuild VALUES ('{escaped_name}') ON CONFLICT DO NOTHING"
             ),
+            deferred::rearm_rebuild_sql(view_name),
             enqueue,
         ];
     }

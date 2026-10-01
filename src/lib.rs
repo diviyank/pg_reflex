@@ -1853,6 +1853,7 @@ mod tests {
     include!("tests/pg_test_ignored_source_heal.rs");
     include!("tests/pg_test_reconcile_log_noise.rs");
     include!("tests/pg_test_rebuild_commit.rs");
+    include!("tests/pg_test_deferred_marker.rs");
 }
 
 /// This module is required by `cargo pgrx test` invocations.
