@@ -254,3 +254,20 @@ fn pg_rco_dispatch_sql_raises_on_error_result() {
         );
     }
 }
+
+/// Intended behaviour: a large UPDATE confined to one plan of an IMV without
+/// dependents rebuilds that plan. Today the passthrough UPDATE dispatch
+/// collapses `affected` to distinct partition values, so it never goes hot.
+#[pg_test]
+#[ignore = "untreated_bugs/2026-10-01_passthrough_update_dispatch_union_collapses_dirty.md"]
+fn pg_rco_large_update_goes_hot_without_dependent_passthrough() {
+    rco_build_passthrough("rco8", false);
+    let before = rco_target_leaf_oids("rco8_v");
+    Spi::run("UPDATE rco8_src SET v = v + 1 WHERE id <= 4000").expect("update");
+    assert_ne!(
+        rco_target_leaf_oids("rco8_v"),
+        before,
+        "plan was not rebuilt"
+    );
+    assert_imv_correct("rco8_v", "SELECT plan, m, id, v FROM rco8_src");
+}
