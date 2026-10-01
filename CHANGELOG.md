@@ -105,6 +105,26 @@ instead of aborting COMMIT. `ALTER EXTENSION pg_reflex UPDATE TO '1.11.5';`
 - **A postponed COMMIT-time rebuild could deadlock with a session flushing the
   same IMV.** Its stale flag, and the other registry writes of the COMMIT-time
   pass, now take the IMV's advisory lock before the registry row.
+- **(SILENT) A partition- or key-scoped reconcile of a DEFERRED IMV
+  double-applied the deltas staged for the rebuilt partitions** (pre-existing).
+  `reflex_reconcile_partition`, a partition swap's COMMIT-time flush, the
+  hot-partition cascade and the key-scoped cascade rebuilt slices from base
+  tables that already held the transaction's writes, and the COMMIT flush
+  applied them again. The rebuild now records its watermark with the slice it
+  rebuilt (the source partitions' constraints, or the keys); the flush skips
+  only the earlier staged rows that fall in that slice and applies the rest,
+  each image of a row moved across partitions on its own side. When a staged
+  row's slice cannot be told from the row — the IMV joins another table or
+  reads its source twice — the IMV is listed for a full rebuild at COMMIT
+  instead, as is a scoped reconcile reached from inside a trigger. That full
+  rebuild is the cost of the fallback on a large IMV (see Known limits).
+- **An in-trigger reconcile of a disabled DEFERRED IMV was queued for COMMIT**,
+  where `reflex_reconcile` refused it and the IMV was flagged `known_stale`. It
+  is refused at once, and an IMV disabled after being queued is dropped from
+  the COMMIT-time pass without a flag.
+- **The flush and COMMIT-time rebuild failure handlers wrote the registry
+  without the IMV's advisory lock**: the failed block's rollback released the
+  lock taken inside it. Each handler takes it again first.
 
 ### Added
 
@@ -121,6 +141,9 @@ instead of aborting COMMIT. `ALTER EXTENSION pg_reflex UPDATE TO '1.11.5';`
   deletes exactly that row, and bulk pending deletes keep such rows.
 - Default wipe threshold for an IMV with dependents: 0.9
   (`reflex.wipe_threshold` and the per-IMV `wipe_threshold` still win).
+- `reflex_reconcile` (and `reflex_reconcile_partition`) of a DEFERRED IMV
+  called from inside a trigger returns `RECONCILE QUEUED FOR COMMIT`: the IMV
+  is rebuilt by the COMMIT-time pass, after the statement stages its delta.
 
 ### Known limits
 
@@ -136,8 +159,12 @@ silent no-op; the IMMEDIATE trigger body's pre-scratch Path B and several
 `reflex_flush_partitions` / partition-delta callers still discard a soft
 `ERROR` from `reflex_reconcile`; under `SET CONSTRAINTS ALL IMMEDIATE` one
 statement writing two sources of a DEFERRED join IMV counts their cross
-product twice; `reflex_reconcile` of a DEFERRED IMV in a transaction that
-already staged deltas for it applies them twice at COMMIT; two sessions
+product twice; under `SET CONSTRAINTS ALL IMMEDIATE` a DEFERRED IMV queued
+for the COMMIT-time reconcile from inside a statement's trigger (the dispatch
+refreshing an ignoring dependent that also reads the written table) is
+rebuilt before that statement stages its delta, which is then applied twice;
+a data-modifying CTE and a `reflex_reconcile` of a DEFERRED IMV over the same
+source in one statement apply the CTE's write twice; two sessions
 flushing different sources of one DEFERRED join IMV can deadlock at COMMIT
 (40P01, retryable). All pre-existing.
 
@@ -154,8 +181,12 @@ tablespace) is the failure mode: the rebuild fails, the IMV is marked
 largest IMV with dependents, or reconcile it outside peak hours.
 
 Full rebuilds now run inside `COMMIT`: a DEFERRED IMV whose source was
-truncated, and a DEFERRED multi-source IMV whose cross-source guard fires
-(two of its sources written in one transaction), are rebuilt from their
+truncated, a DEFERRED multi-source IMV whose cross-source guard fires
+(two of its sources written in one transaction), a DEFERRED IMV reconciled
+from inside a trigger (the high-selectivity dispatch refreshing a DEFERRED
+ignoring dependent, a hot-partition cascade into a DEFERRED dependent), and a
+DEFERRED IMV joining another table that a partition- or key-scoped reconcile
+reached after the transaction staged deltas for it, are rebuilt from their
 base query — and diffed into their dependents — when the transaction
 commits. `statement_timeout` (and a pooler's query timeout) covers that
 `COMMIT`; a cancel (`57014`) is not caught by the flush's failure handling,
