@@ -632,6 +632,44 @@ fn pg_drc_partition_reconcile_inside_trigger_before_staging() {
     dmw_assert_fresh("drp4_v", sql);
 }
 
+/// `reflex_reconcile_partition` of an UNPARTITIONED DEFERRED IMV from inside a
+/// trigger is refused as everywhere else, never queued for a COMMIT-time full
+/// rebuild.
+#[pg_test]
+fn pg_drc_in_trigger_partition_reconcile_of_unpartitioned_imv_is_refused() {
+    Spi::run("CREATE TABLE dru_s (k INT PRIMARY KEY, g INT, v INT)").expect("s");
+    Spi::run("INSERT INTO dru_s SELECT i, i % 3, i FROM generate_series(1, 30) i").expect("seed");
+    let sql = "SELECT g, COUNT(*) AS n, SUM(v) AS s FROM dru_s GROUP BY g";
+    dmw_create_deferred("dru_v", sql, None);
+    Spi::run("CREATE TABLE dru_log (result TEXT)").expect("log");
+    Spi::run(
+        "CREATE FUNCTION dru_rec() RETURNS trigger LANGUAGE plpgsql AS $f$ BEGIN \
+           INSERT INTO dru_log SELECT reflex_reconcile_partition('dru_v', '1'); \
+           RETURN NULL; END $f$",
+    )
+    .expect("fn");
+    Spi::run(
+        "CREATE TRIGGER \"A_dru_rec\" AFTER INSERT ON dru_s \
+         FOR EACH STATEMENT EXECUTE FUNCTION dru_rec()",
+    )
+    .expect("trigger");
+
+    Spi::run("INSERT INTO dru_s VALUES (100, 1, 1000)").expect("write + in-trigger reconcile");
+    let result = Spi::get_one::<String>("SELECT result FROM dru_log")
+        .expect("log")
+        .unwrap_or_default();
+    assert!(
+        result.starts_with("ERROR") && result.contains("not partitioned"),
+        "in-trigger reconcile_partition of an unpartitioned IMV returned: {result}"
+    );
+    assert!(
+        !drc_listed_for_commit("dru_v"),
+        "dru_v listed for a COMMIT-time full rebuild"
+    );
+    Spi::run("SET CONSTRAINTS ALL IMMEDIATE").expect("commit-time flush");
+    dmw_assert_fresh("dru_v", sql);
+}
+
 /// A DEFERRED IMV reconciled from inside a trigger: an enabled one is queued for
 /// the COMMIT-time pass (`RECONCILE QUEUED FOR COMMIT`); a disabled one is
 /// refused like everywhere else, and never flagged stale at COMMIT.
