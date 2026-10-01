@@ -360,8 +360,10 @@ fn pg_rbd_qualified_mixed_case_name() {
         crate::create_reflex_ivm("rbq.Up_V", up_sql, None, None, None, None),
         "CREATE REFLEX INCREMENTAL VIEW"
     );
-    Spi::run("CREATE UNIQUE INDEX up_v_key ON rbq.\"Up_V\" (product_id, location_id)")
-        .expect("key");
+    Spi::run(
+        "CREATE UNIQUE INDEX up_v_key ON rbq.\"Up_V\" (product_id, location_id) NULLS NOT DISTINCT",
+    )
+    .expect("key");
     let keyed = Spi::get_one::<bool>(
         "SELECT EXISTS (SELECT 1 FROM pg_index WHERE indrelid = 'rbq.\"Up_V\"'::regclass \
          AND indisunique AND indpred IS NULL AND indexprs IS NULL)",
@@ -429,7 +431,10 @@ fn pg_rbd_invalid_unique_index_is_not_a_key() {
         crate::create_reflex_ivm("rbi_up", up_sql, None, None, None, None),
         "CREATE REFLEX INCREMENTAL VIEW"
     );
-    Spi::run("CREATE UNIQUE INDEX rbi_up_key ON rbi_up (product_id, location_id)").expect("key");
+    Spi::run(
+        "CREATE UNIQUE INDEX rbi_up_key ON rbi_up (product_id, location_id) NULLS NOT DISTINCT",
+    )
+    .expect("key");
     Spi::run("UPDATE pg_index SET indisvalid = FALSE WHERE indexrelid = 'rbi_up_key'::regclass")
         .expect("invalidate");
     Spi::run("CREATE TABLE rbi_seen (op TEXT, product_id INT)").expect("seen");
@@ -456,6 +461,43 @@ fn pg_rbd_invalid_unique_index_is_not_a_key() {
         Some("DELETE:2,INSERT:2"),
         "an invalid unique index was used as the diff key"
     );
+}
+
+/// A user unique index that treats NULLs as distinct admits several NULL-key
+/// rows, so it guarantees no key: a rebuild must keep both NULL rows instead of
+/// refusing them as duplicate keys.
+#[pg_test]
+fn pg_rbd_nulls_distinct_unique_index_is_not_a_key() {
+    let up_sql = "SELECT code, v FROM rbnd_src";
+    Spi::run("CREATE TABLE rbnd_src (id INT PRIMARY KEY, code INT, v INT)").expect("src");
+    Spi::run("INSERT INTO rbnd_src VALUES (1, NULL, 10), (2, NULL, 20), (3, 3, 30), (4, 4, 40)")
+        .expect("seed");
+    assert_eq!(
+        crate::create_reflex_ivm("rbnd_up", up_sql, None, None, None, None),
+        "CREATE REFLEX INCREMENTAL VIEW"
+    );
+    Spi::run("CREATE UNIQUE INDEX rbnd_up_code ON rbnd_up (code)").expect("user index");
+    assert_eq!(
+        crate::create_reflex_ivm(
+            "rbnd_dep",
+            "SELECT code, v FROM rbnd_up",
+            None,
+            None,
+            None,
+            None
+        ),
+        "CREATE REFLEX INCREMENTAL VIEW"
+    );
+    Spi::run("UPDATE rbnd_up SET v = v + 1 WHERE code = 3").expect("drift");
+
+    assert_eq!(
+        Spi::get_one::<String>("SELECT reflex_reconcile('rbnd_up')")
+            .expect("reconcile")
+            .expect("reconcile result"),
+        "RECONCILED"
+    );
+    assert_imv_correct("rbnd_up", up_sql);
+    assert_imv_correct("rbnd_dep", up_sql);
 }
 
 /// A FULL JOIN IMV with a dependent: a source change takes the full-refresh

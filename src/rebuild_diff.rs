@@ -56,7 +56,9 @@ pub(crate) fn target_propagates(client: &pgrx::spi::SpiClient<'_>, view_name: &s
 }
 
 /// Columns of the narrowest valid, unique, non-partial, plain-column index on the
-/// target root, in index order. Empty when there is none.
+/// target root that admits one row per key, in index order. Empty when there is
+/// none. A NULLS DISTINCT index over a nullable column admits several NULL-key
+/// rows, so it qualifies only as NULLS NOT DISTINCT or over NOT NULL columns.
 pub(crate) fn key_columns(client: &pgrx::spi::SpiClient<'_>, view_name: &str) -> Vec<String> {
     select_texts(
         client,
@@ -66,6 +68,10 @@ pub(crate) fn key_columns(client: &pgrx::spi::SpiClient<'_>, view_name: &str) ->
            WHERE i.indrelid = to_regclass($1) AND i.indisunique \
              AND i.indisvalid AND i.indisready \
              AND i.indpred IS NULL AND i.indexprs IS NULL \
+             AND (i.indnullsnotdistinct OR NOT EXISTS ( \
+                   SELECT 1 FROM unnest(i.indkey[0:i.indnkeyatts - 1]) k(attnum) \
+                   JOIN pg_attribute na ON na.attrelid = i.indrelid AND na.attnum = k.attnum \
+                   WHERE NOT na.attnotnull)) \
            ORDER BY i.indnkeyatts, i.indexrelid LIMIT 1) \
          SELECT a.attname::text FROM idx \
          CROSS JOIN LATERAL unnest(idx.indkey[0:idx.indnkeyatts - 1]) WITH ORDINALITY k(attnum, ord) \
