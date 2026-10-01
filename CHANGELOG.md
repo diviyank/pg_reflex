@@ -168,7 +168,9 @@ rebuilt before that statement stages its delta, which is then applied twice;
 a data-modifying CTE and a `reflex_reconcile` of a DEFERRED IMV over the same
 source in one statement apply the CTE's write twice; two sessions
 flushing different sources of one DEFERRED join IMV can deadlock at COMMIT
-(40P01, retryable). All pre-existing.
+(40P01, retryable). All pre-existing. New in 1.11.5: a partition- or
+key-scoped reconcile of a DEFERRED IMV reached from inside a trigger becomes a
+full rebuild of the IMV at COMMIT.
 
 Cost of a DEFERRED TRUNCATE rebuild of a large partitioned IMV with
 dependents: each populated leaf is diffed by staging
