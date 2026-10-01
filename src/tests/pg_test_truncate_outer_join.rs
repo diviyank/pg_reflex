@@ -194,3 +194,90 @@ fn pg_toj_incremental_then_rebuild_of_left_joined_imv_keeps_dependent() {
     .unwrap_or(false);
     assert!(!stale, "the dependent's flush failed and was discarded");
 }
+
+/// T6 — the production shape: the dependent is partitioned by plan, mirroring
+/// a LIST-partitioned anchor, and LEFT JOINs a DEFERRED passthrough IMV that is
+/// rebuilt.
+#[pg_test]
+fn pg_toj_reconcile_of_left_joined_imv_keeps_partitioned_dependent() {
+    Spi::run(
+        "CREATE TABLE toj6_anchor (plan INT NOT NULL, id INT NOT NULL, product_id INT NOT NULL, \
+         location_id INT NOT NULL, qty INT) PARTITION BY LIST (plan)",
+    )
+    .expect("anchor");
+    for plan in [1, 2] {
+        Spi::run(&format!(
+            "CREATE TABLE toj6_anchor_p{plan} PARTITION OF toj6_anchor FOR VALUES IN ({plan})"
+        ))
+        .expect("anchor partition");
+    }
+    Spi::run(
+        "INSERT INTO toj6_anchor SELECT p, g, g % 7, g % 5, g \
+         FROM generate_series(1, 100) g CROSS JOIN (VALUES (1), (2)) v(p)",
+    )
+    .expect("seed anchor");
+    Spi::run(
+        "CREATE TABLE toj6_rel (product_id INT NOT NULL, location_id INT NOT NULL, is_active BOOL, \
+         PRIMARY KEY (product_id, location_id))",
+    )
+    .expect("rel");
+    Spi::run(
+        "INSERT INTO toj6_rel SELECT p, l, (p + l) % 2 = 0 \
+         FROM generate_series(0, 3) p CROSS JOIN generate_series(0, 4) l",
+    )
+    .expect("seed rel");
+    create_imv(
+        "toj6_caav",
+        "SELECT create_reflex_ivm('toj6_caav', \
+         'SELECT product_id, location_id, is_active FROM toj6_rel', \
+         'product_id, location_id', NULL, 'DEFERRED')",
+    );
+    create_imv(
+        "toj6_sfv",
+        "SELECT create_reflex_ivm('toj6_sfv', \
+         'SELECT a.plan, a.id, a.product_id, a.location_id, a.qty, \
+                 COALESCE(c.is_active, FALSE) AS active \
+          FROM toj6_anchor a LEFT JOIN toj6_caav c \
+          ON c.product_id = a.product_id AND c.location_id = a.location_id', \
+         'plan, id', NULL, 'DEFERRED', NULL, ARRAY['plan'])",
+    );
+    let fresh = "SELECT a.plan, a.id, a.product_id, a.location_id, a.qty, \
+                 COALESCE(c.is_active, FALSE) AS active \
+                 FROM toj6_anchor a LEFT JOIN toj6_rel c \
+                 ON c.product_id = a.product_id AND c.location_id = a.location_id";
+    assert_imv_correct("toj6_sfv", fresh);
+
+    let res = Spi::get_one::<&str>("SELECT reflex_reconcile('toj6_caav')")
+        .expect("reconcile")
+        .expect("reconcile result");
+    assert_eq!(res, "RECONCILED");
+    assert_eq!(
+        toj_row_count("toj6_sfv"),
+        200,
+        "the rebuild's TRUNCATE deleted partitioned dependent rows before the flush"
+    );
+    Spi::run("SELECT reflex_flush_deferred('toj6_caav')").expect("flush");
+
+    assert_eq!(toj_row_count("toj6_sfv"), 200);
+    assert_imv_correct("toj6_sfv", fresh);
+}
+
+/// T7 — aggregate dependent: a LEFT JOIN secondary truncated keeps every group
+/// (counts unchanged, the secondary-derived sum drops to zero).
+#[pg_test]
+fn pg_toj_truncate_left_joined_source_keeps_aggregate_groups() {
+    build_toj_tables("toj7_anchor", "toj7_act");
+    let sql = "SELECT a.product_id, COUNT(*) AS n, \
+               SUM(CASE WHEN c.is_active THEN a.qty ELSE 0 END) AS active_qty \
+               FROM toj7_anchor a LEFT JOIN toj7_act c \
+               ON c.product_id = a.product_id AND c.location_id = a.location_id \
+               GROUP BY a.product_id";
+    let res = crate::create_reflex_ivm("toj_v7", sql, None, None, None, None);
+    assert_eq!(res, "CREATE REFLEX INCREMENTAL VIEW");
+    assert_imv_correct("toj_v7", sql);
+
+    Spi::run("TRUNCATE toj7_act").expect("truncate secondary");
+
+    assert_eq!(toj_row_count("toj_v7"), 7, "aggregate groups were deleted");
+    assert_imv_correct("toj_v7", sql);
+}
