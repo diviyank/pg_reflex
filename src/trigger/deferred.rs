@@ -426,15 +426,53 @@ fn rebuild_truncated_imvs(client: &mut pgrx::spi::SpiClient<'_>) -> usize {
         )
         .unwrap_or_report();
     let mut rebuilt = 0usize;
-    // A flush nested in this pass (it returns at once here) may list more IMVs.
-    // Defensive: no test shows a listing that a later pass would not pick up.
+    // A flush nested in this pass (its own pass returns at once) may list a new
+    // IMV, or re-list one this pass already rebuilt (dropping it from the marker:
+    // rows staged after its rebuild on two sources, an ambiguous row, a second
+    // TRUNCATE). This may be the transaction's last pass, so loop until every
+    // listed IMV is rebuilt or postponed (postponed ones are flagged stale and
+    // have a flush request queued). Bounded: what is still waiting after
+    // TRUNCATE_REBUILD_MAX_DEFERRALS rounds is flagged stale.
+    let mut rounds = 0;
     loop {
-        rebuilt += rebuild_listed(client, &listed);
-        let relisted = listed_for_rebuild(client);
-        if relisted.iter().all(|name| listed.contains(name)) {
+        let (count, postponed) = rebuild_listed(client, &listed);
+        rebuilt += count;
+        rounds += 1;
+        let rebuilt_now = temp_table_names(client, "__reflex_deferred_reconciled_batch");
+        listed = listed_for_rebuild(client);
+        let waiting: Vec<String> = listed
+            .iter()
+            .filter(|name| !rebuilt_now.contains(name) && !postponed.contains(name))
+            .cloned()
+            .collect();
+        if waiting.is_empty() {
             break;
         }
-        listed = relisted;
+        if rounds >= TRUNCATE_REBUILD_MAX_DEFERRALS {
+            for name in &waiting {
+                pgrx::warning!(
+                    "pg_reflex: IMV {} still awaits its COMMIT-time rebuild after {} rounds; \
+                     marking it stale",
+                    name,
+                    TRUNCATE_REBUILD_MAX_DEFERRALS
+                );
+                client
+                    .update(
+                        "UPDATE public.__reflex_ivm_reference SET known_stale = TRUE, \
+                           stale_reason = 'COMMIT-time rebuild re-listed too many times in one ' \
+                             || 'rebuild pass; run reflex_reconcile(' || quote_literal($1) \
+                             || ') to repair.', \
+                           stale_since = now() \
+                         WHERE name = $1",
+                        None,
+                        &[unsafe {
+                            DatumWithOid::new(name.clone(), PgBuiltInOids::TEXTOID.oid().value())
+                        }],
+                    )
+                    .unwrap_or_report();
+            }
+            break;
+        }
     }
     client
         .update(
@@ -464,7 +502,13 @@ fn listed_for_rebuild(client: &pgrx::spi::SpiClient<'_>) -> Vec<String> {
         .collect()
 }
 
-fn rebuild_listed(client: &mut pgrx::spi::SpiClient<'_>, listed: &[String]) -> usize {
+/// Rebuilds the listed IMVs not yet in the marker; returns how many it rebuilt
+/// and the ones it postponed.
+fn rebuild_listed(
+    client: &mut pgrx::spi::SpiClient<'_>,
+    listed: &[String],
+) -> (usize, Vec<String>) {
+    let mut postponed = Vec::new();
     let mut already_rebuilt = temp_table_names(client, "__reflex_deferred_reconciled_batch");
     let fail_hard = flush_fail_hard(client);
     let mut rebuilt = 0usize;
@@ -521,6 +565,7 @@ fn rebuild_listed(client: &mut pgrx::spi::SpiClient<'_>, listed: &[String]) -> u
                         client.update(&enqueue, None, &[]).unwrap_or_report();
                     }
                 }
+                postponed.push(imv_name.clone());
                 continue;
             }
         }
@@ -631,7 +676,7 @@ fn rebuild_listed(client: &mut pgrx::spi::SpiClient<'_>, listed: &[String]) -> u
             .unwrap_or_report();
         rebuilt += 1;
     }
-    rebuilt
+    (rebuilt, postponed)
 }
 
 /// Rebuilds an IMV the cross-source guard listed, through `reflex_reconcile`

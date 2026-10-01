@@ -18,7 +18,7 @@ Rebuilds no longer wipe the IMVs built on the rebuilt one. In the field a TRUNCA
 
 **Added**
 
-- `reflex_rebuild_target_rows(view, rebuild_sql)`; internal `__reflex_target_propagates`, `__reflex_rebuild_cost_rows`, `__reflex_xid_is_current`.
+- `reflex_rebuild_target_rows(view, rebuild_sql)`; internal `__reflex_target_propagates`, `__reflex_rebuild_cost_rows`, `__reflex_xid_is_current`, `__reflex_xid_precedes`.
 
 **Migration**
 

@@ -415,3 +415,54 @@ fn pg_dmw_repeated_aborted_flushes_after_rebuild() {
     Spi::run("SET CONSTRAINTS ALL IMMEDIATE").expect("final flush");
     dmw_assert_fresh("dmn_v", "SELECT k, v FROM dmn_s");
 }
+
+/// A flush nested in a COMMIT-time rebuild pass re-lists an IMV the pass had
+/// already rebuilt: Y's rebuild fires a user trigger that stages writes on both
+/// of X's sources before flushing them, so the nested flush finds rows staged
+/// after X's rebuild on two sources and re-lists X. The pass must rebuild X again before
+/// it returns: no later flush is coming.
+#[pg_test]
+fn pg_dmw_relist_nested_in_rebuild_pass_is_rebuilt() {
+    Spi::run("CREATE TABLE dmh_s1 (k INT PRIMARY KEY, v INT)").expect("s1");
+    Spi::run("CREATE TABLE dmh_s2 (k INT PRIMARY KEY, w INT)").expect("s2");
+    Spi::run("CREATE TABLE dmh_t (k INT PRIMARY KEY)").expect("t");
+    Spi::run("INSERT INTO dmh_s1 SELECT g, g FROM generate_series(1, 20) g").expect("seed s1");
+    Spi::run("INSERT INTO dmh_s2 SELECT g, 10 * g FROM generate_series(1, 20) g").expect("seed s2");
+    Spi::run("INSERT INTO dmh_t SELECT g FROM generate_series(1, 5) g").expect("seed t");
+    let x_sql = "SELECT s1.k, s1.v, s2.w FROM dmh_s1 s1 JOIN dmh_s2 s2 ON s2.k = s1.k";
+    dmw_create_deferred("dmh_a_x", x_sql, Some("k"));
+    dmw_create_deferred("dmh_b_y", "SELECT k FROM dmh_t", Some("k"));
+    Spi::run(
+        "CREATE FUNCTION dmh_feed() RETURNS trigger LANGUAGE plpgsql AS $$ \
+         BEGIN \
+           IF NOT EXISTS (SELECT 1 FROM dmh_s1 WHERE k = 1000) THEN \
+             SET CONSTRAINTS ALL DEFERRED; \
+             INSERT INTO dmh_s1 VALUES (1000, 1); \
+             INSERT INTO dmh_s2 VALUES (1000, 2); \
+             SET CONSTRAINTS ALL IMMEDIATE; \
+           END IF; \
+           RETURN NULL; \
+         END $$",
+    )
+    .expect("feed fn");
+    Spi::run(
+        "CREATE TRIGGER dmh_feed AFTER INSERT OR UPDATE OR DELETE ON dmh_b_y \
+         FOR EACH STATEMENT EXECUTE FUNCTION dmh_feed()",
+    )
+    .expect("feed trigger");
+
+    Spi::run("SET CONSTRAINTS ALL IMMEDIATE").expect("immediate");
+    Spi::run("TRUNCATE dmh_s1").expect("truncate s1");
+    Spi::run("INSERT INTO dmh_s1 SELECT g, g FROM generate_series(1, 20) g").expect("refill s1");
+    assert!(dmw_marked("dmh_a_x"), "precondition: dmh_a_x rebuilt");
+    Spi::run("TRUNCATE dmh_t").expect("truncate t: rebuilds dmh_b_y");
+    assert_eq!(
+        Spi::get_one::<i64>("SELECT count(*) FROM dmh_s1 WHERE k = 1000")
+            .expect("s1")
+            .unwrap_or(0),
+        1,
+        "precondition: the rebuild of dmh_b_y fired the feed"
+    );
+    dmw_assert_fresh("dmh_a_x", x_sql);
+    dmw_assert_fresh("dmh_b_y", "SELECT k FROM dmh_t");
+}
