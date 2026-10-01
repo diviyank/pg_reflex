@@ -88,6 +88,20 @@ instead of aborting COMMIT. `ALTER EXTENSION pg_reflex UPDATE TO '1.11.5';`
   unique index is now a diff key only when it is `NULLS NOT DISTINCT` or
   all its key columns are `NOT NULL` (pg_reflex's own `__reflex_uk_*`
   indexes are); otherwise the next candidate or the whole-row diff is used.
+- **A reconcile of a DEFERRED IMV mid-transaction double-applied the deltas
+  already staged for it.** `reflex_reconcile` / `reflex_rebuild_imv`, and the
+  refresh an upstream rebuild gives its IGNORING dependents (high-selectivity
+  dispatch, partitioned cascade), rebuilt from base tables that already held
+  the staged writes, and the COMMIT flush applied them again (aggregates
+  silently wrong, keyed passthroughs flagged stale). The rebuild now records a
+  watermark so the flush skips the deltas staged before it and applies the
+  later ones; reached from inside a trigger, the IMV is rebuilt by the
+  COMMIT-time pass instead, after the statement has staged its own delta.
+- **The multi-source guard's COMMIT-time rebuild could drop orphan IMV
+  partitions.** It now reconciles with `drop_orphans => FALSE`.
+- **A postponed COMMIT-time rebuild could deadlock with a session flushing the
+  same IMV.** Its stale flag, and the other registry writes of the COMMIT-time
+  pass, now take the IMV's advisory lock before the registry row.
 
 ### Added
 

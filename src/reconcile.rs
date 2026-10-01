@@ -389,6 +389,10 @@ pub(crate) fn reconcile_one(view_name: &str, drop_orphans: bool) -> &'static str
         return "ERROR: cannot reconcile a decomposed wrapper node — it is maintained by \
                 its operand sub-IMVs; reconcile the operands or the parent that reads it";
     }
+    if crate::trigger::deferred::reconcile_waits_for_commit(view_name) {
+        crate::trigger::deferred::list_for_commit_reconcile(view_name);
+        return RECONCILE_QUEUED_FOR_COMMIT;
+    }
     // Recreate the aggregate aux relations first when they are gone, so the rest of
     // this function — and the partition sync below it — have something to work on.
     heal_missing_intermediate(view_name);
@@ -401,7 +405,8 @@ pub(crate) fn reconcile_one(view_name: &str, drop_orphans: bool) -> &'static str
     if sync_msg.starts_with("ERROR") {
         pgrx::notice!("pg_reflex: sync before reconcile returned: {}", sync_msg);
     }
-    Spi::connect_mut(|client| {
+    let mut rebuilt_deferred_imv = false;
+    let result = Spi::connect_mut(|client| {
         let record = match crate::sql_writer::registry::read_imv(client, view_name) {
             Some(r) if r.enabled => r,
             _ => {
@@ -412,6 +417,10 @@ pub(crate) fn reconcile_one(view_name: &str, drop_orphans: bool) -> &'static str
                 return "ERROR: IMV not found or disabled";
             }
         };
+        if record.refresh_mode.eq_ignore_ascii_case("DEFERRED") {
+            crate::trigger::deferred::record_rebuild_watermark(client, view_name);
+            rebuilt_deferred_imv = true;
+        }
 
         let base_query: String = record.base_query.clone();
         let end_query: String = record.end_query.clone();
@@ -841,8 +850,19 @@ pub(crate) fn reconcile_one(view_name: &str, drop_orphans: bool) -> &'static str
 
         info!("pg_reflex: reconciled IMV '{}'", view_name);
         "RECONCILED"
-    })
+    });
+    // A rebuild that stopped part-way after its watermark reflects only part of
+    // the deltas the flush would now skip: leave the IMV to the COMMIT-time pass.
+    if rebuilt_deferred_imv && result.starts_with("ERROR") {
+        crate::trigger::deferred::rebuild_failed_after_watermark(view_name);
+    }
+    result
 }
+
+/// What [`reconcile_one`] returns, inside a trigger, for a DEFERRED IMV it left
+/// to the COMMIT-time rebuild pass (see
+/// [`crate::trigger::deferred::reconcile_waits_for_commit`]).
+pub(crate) const RECONCILE_QUEUED_FOR_COMMIT: &str = "RECONCILE QUEUED FOR COMMIT";
 
 thread_local! {
     /// Set by `reconcile_one`'s partitioned branch, just before it returns
@@ -988,6 +1008,10 @@ pub(crate) fn reflex_reconcile_with_orphans(view_name: &str, drop_orphans: bool)
     // withheld for the same reason.
     if child_failed {
         return "ERROR: generated sub-IMV reconcile failed";
+    }
+    // The COMMIT-time reconcile it was left to runs this cascade itself.
+    if own == RECONCILE_QUEUED_FOR_COMMIT {
+        return own;
     }
 
     if !own.starts_with("ERROR") {
@@ -1537,7 +1561,7 @@ pub(crate) fn reconcile_for_cross_source_guard(view_name: &str) -> &'static str 
     if is_generated {
         reconcile_generated_child_for_cross_source_guard(view_name)
     } else {
-        reflex_reconcile(view_name)
+        reflex_reconcile_with_orphans(view_name, false)
     }
 }
 
