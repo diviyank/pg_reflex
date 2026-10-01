@@ -43,7 +43,10 @@ instead of aborting COMMIT. `ALTER EXTENSION pg_reflex UPDATE TO '1.11.5';`
   dependents keeps the cheaper DELETE + INSERT. Key columns holding NULLs
   match NULL-safely (a no-op rebuild rewrites no NULL-key row); a target
   with a second unique or exclusion index, where a keyed UPDATE swapping two
-  rows' values would raise 23505, uses the whole-row diff.
+  rows' values would raise 23505, uses the whole-row diff. The diff is
+  computed into a temporary table first and applied by row identity, so the
+  dependents' triggers plan their own delta work under the caller's planner
+  settings.
 - **(DATA LOSS) Partition rebuilds of an IMV with dependents.** A reconcile
   of a partitioned IMV and a partition swap diff each populated leaf through
   the root instead of swapping it, and cascade a full refresh only to
