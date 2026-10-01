@@ -19,6 +19,8 @@ RETURNS TEXT
 3. Flips it in via `DETACH`/`ATTACH` inside one sub-transaction — the `AccessExclusiveLock` on the parent lasts only for the metadata DDL.
 4. Cascades to dependent IMVs: a dependent partitioned on the same column reconciles by the same keys; (1.10.7+) a non-partitioned dependent that `GROUP BY`s the parent's partition key is rebuilt *key-scoped* — only the affected key slices, with an `EXCEPTION` fallback to full reconcile so it can never be left incorrect; any other dependent falls back to a full `reflex_reconcile`.
 
+On a DEFERRED IMV with deltas staged earlier in the transaction (1.11.5+), the rebuilt partitions already hold them: the `COMMIT` flush skips the staged rows that fall in a rebuilt partition and applies the others. This holds when the IMV reads one source table; an IMV that joins another table is instead listed for a full rebuild at `COMMIT`, since a staged row's partition cannot be told from the row. Called from inside a trigger on a DEFERRED IMV it returns `'RECONCILE QUEUED FOR COMMIT'` without rebuilding (see [`reflex_reconcile`](reflex_reconcile.md#signatures)).
+
 Only valid on partitioned IMVs (see [`create_reflex_ivm`](create_reflex_ivm.md) `partition_by`). On an unpartitioned IMV, use [`reflex_reconcile`](reflex_reconcile.md).
 
 ## Examples
