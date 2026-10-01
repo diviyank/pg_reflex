@@ -223,6 +223,18 @@ pub(crate) enum RebuiltSlice<'a> {
     Keys { column: &'a str, literals: &'a str },
 }
 
+/// What a partition- or key-scoped rebuild of a DEFERRED IMV must do about the
+/// deltas this transaction staged for it ([`guard_scoped_rebuild`]).
+pub(crate) enum ScopedRebuildGuard {
+    /// Nothing: no delta staged, or not a DEFERRED IMV.
+    Unguarded,
+    /// List the IMV for the COMMIT-time full reconcile once the rebuild succeeded.
+    ReconcileAtCommit,
+    /// Run this statement in the same subtransaction as the rebuild, so the
+    /// slice is recorded exactly when the rebuild commits.
+    RecordWithRebuild(String),
+}
+
 /// Transaction-local record of the partition- and key-scoped rebuilds of
 /// DEFERRED IMVs: a delta staged on `source` before the rebuild at `watermark`
 /// whose row satisfies `rebuilt` is reflected by it and skipped by the flush.
@@ -238,17 +250,18 @@ const SCOPED_REBUILDS_TABLE_DDL: &str =
 /// * when the IMV reads one table once (`depends_on` holds one entry per read,
 ///   so a join, self-join or subquery has several) and observes it, a staged
 ///   row lands in the slice exactly when it satisfies the slice's predicate on
-///   its own columns: the rebuild is recorded with its watermark and the flush
-///   skips the earlier staged rows in the slice ([`scoped_rebuild_exclusion`]);
+///   its own columns: the caller records the rebuild with its watermark,
+///   atomically with it, and the flush skips the earlier staged rows in the
+///   slice ([`scoped_rebuild_exclusion`]);
 /// * otherwise a staged row's slice cannot be told from the row (the partition
 ///   column comes from a joined table, another source's row reaches every
-///   slice): returns `true`, and the caller lists the IMV for the COMMIT-time
-///   full reconcile once the scoped rebuild succeeded.
+///   slice): the caller lists the IMV for the COMMIT-time full reconcile once
+///   the scoped rebuild succeeded.
 pub(crate) fn guard_scoped_rebuild(
     client: &mut pgrx::spi::SpiClient<'_>,
     view_name: &str,
     slice: RebuiltSlice<'_>,
-) -> bool {
+) -> ScopedRebuildGuard {
     let registry = client
         .select(
             "SELECT COALESCE(refresh_mode, 'IMMEDIATE') = 'DEFERRED' \
@@ -278,14 +291,14 @@ pub(crate) fn guard_scoped_rebuild(
             )
         });
     let Some((true, depends_on)) = registry else {
-        return false;
+        return ScopedRebuildGuard::Unguarded;
     };
     let observed = observed_sources(client, view_name);
     if !observed
         .iter()
         .any(|source| staged_by_this_xact(client, &staging_delta_table_name(source)))
     {
-        return false;
+        return ScopedRebuildGuard::Unguarded;
     }
     let rebuilt = match (depends_on.as_slice(), observed.as_slice()) {
         ([source], [observed_source]) if source == observed_source => {
@@ -294,7 +307,7 @@ pub(crate) fn guard_scoped_rebuild(
         _ => None,
     };
     let Some((source, predicate)) = rebuilt else {
-        return true;
+        return ScopedRebuildGuard::ReconcileAtCommit;
     };
     ensure_temp_table(
         client,
@@ -302,31 +315,17 @@ pub(crate) fn guard_scoped_rebuild(
         SCOPED_REBUILDS_TABLE_DDL,
     );
     let watermark = Watermark::now();
-    client
-        .update(
-            "INSERT INTO pg_temp.__reflex_deferred_scoped_rebuilds \
-               (name, source, rebuilt, watermark, watermark_xid) \
-             VALUES ($1, $2, $3, $4, $5::text::xid)",
-            None,
-            &[
-                unsafe {
-                    DatumWithOid::new(view_name.to_string(), PgBuiltInOids::TEXTOID.oid().value())
-                },
-                unsafe { DatumWithOid::new(source, PgBuiltInOids::TEXTOID.oid().value()) },
-                unsafe { DatumWithOid::new(predicate, PgBuiltInOids::TEXTOID.oid().value()) },
-                unsafe {
-                    DatumWithOid::new(watermark.command, PgBuiltInOids::INT8OID.oid().value())
-                },
-                unsafe {
-                    DatumWithOid::new(
-                        watermark.next_xid.to_string(),
-                        PgBuiltInOids::TEXTOID.oid().value(),
-                    )
-                },
-            ],
-        )
-        .unwrap_or_report();
-    false
+    let literal = |text: &str| format!("'{}'", text.replace('\'', "''"));
+    ScopedRebuildGuard::RecordWithRebuild(format!(
+        "INSERT INTO pg_temp.__reflex_deferred_scoped_rebuilds \
+           (name, source, rebuilt, watermark, watermark_xid) \
+         VALUES ({}, {}, {}, {}, '{}'::xid)",
+        literal(view_name),
+        literal(&source),
+        literal(&predicate),
+        watermark.command,
+        watermark.next_xid
+    ))
 }
 
 /// The slice as a predicate over a row of `source`'s staging table, or `None`
