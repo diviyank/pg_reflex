@@ -120,29 +120,17 @@ fn temp_table_names(client: &pgrx::spi::SpiClient<'_>, table: &str) -> Vec<Strin
 /// per IMV, before rebuilding anyway and marking the IMV stale.
 const TRUNCATE_REBUILD_MAX_DEFERRALS: i32 = 64;
 
-/// Predicate on a row's `xmin`: written by this transaction (or one of its
-/// subtransactions). Rows of other running transactions are invisible, so a
-/// visible row whose writer is still in progress is ours; committed rows left by
-/// other sessions are not.
-fn written_by_this_xact() -> String {
-    format!(
-        "pg_xact_status(({})::text::xid8) = 'in progress'",
-        widened_xmin_sql("xmin::text::int8", "pg_current_xact_id()::text::int8")
-    )
+/// Whether `xid` is this transaction's or one of its (live or released)
+/// subtransactions'. Exact and never raises: no epoch arithmetic, no clog lookup;
+/// special, frozen and other transactions' xids are false.
+#[pg_extern(name = "__reflex_xid_is_current", stable, parallel_unsafe)]
+fn reflex_xid_is_current(xid: pg_sys::TransactionId) -> bool {
+    unsafe { pg_sys::TransactionIdIsCurrentTransactionId(xid) }
 }
 
-/// `raw` (a 32-bit xid) widened to the full xid nearest `cur` (the current full
-/// xid). A visible row's writer is within 2^31 of it — this transaction's own
-/// subxids sit above it, committed ones below — so this is exact. Special xids
-/// (< 3: invalid, bootstrap, frozen) yield NULL: never this transaction, and
-/// never widened into the future.
-pub(crate) fn widened_xmin_sql(raw: &str, cur: &str) -> String {
-    format!(
-        "(CASE WHEN {raw} < 3 THEN NULL ELSE \
-           {cur} + (((({raw} - ({cur} & 4294967295)) + 2147483648) & 4294967295) - 2147483648) \
-         END)"
-    )
-}
+/// Predicate on a row: written by this transaction (or one of its
+/// subtransactions); committed rows left by other sessions are not.
+const WRITTEN_BY_THIS_XACT: &str = "public.__reflex_xid_is_current(xmin)";
 
 /// Whether an IMV upstream of `imv_name` (transitively, any mode) may still
 /// change in this transaction: a DEFERRED one with a delta this transaction
@@ -209,8 +197,7 @@ fn staged_by_this_xact(client: &pgrx::spi::SpiClient<'_>, delta_tbl: &str) -> bo
         "SELECT to_regclass('{}') IS NOT NULL",
         delta_tbl.replace('\'', "''")
     )) && select_bool(&format!(
-        "SELECT EXISTS (SELECT 1 FROM {delta_tbl} WHERE {})",
-        written_by_this_xact()
+        "SELECT EXISTS (SELECT 1 FROM {delta_tbl} WHERE {WRITTEN_BY_THIS_XACT})"
     ))
 }
 
@@ -224,8 +211,7 @@ fn flush_request_outstanding(client: &pgrx::spi::SpiClient<'_>, imv_name: &str) 
         .select(
             &format!(
                 "SELECT EXISTS (SELECT 1 FROM public.__reflex_deferred_pending \
-                 WHERE source_table = $1 AND operation = 'TRUNCATE' AND {})",
-                written_by_this_xact()
+                 WHERE source_table = $1 AND operation = 'TRUNCATE' AND {WRITTEN_BY_THIS_XACT})"
             ),
             None,
             &[unsafe { DatumWithOid::new(source, PgBuiltInOids::TEXTOID.oid().value()) }],
@@ -811,7 +797,8 @@ fn flush_staged_deltas(source_table: &str) -> String {
         // sequentially, each seeing the correct intermediate state); the
         // hazard is unique to the commit-time batch flush. Detect the batch
         // shape once here — the per-IMV loop full-reconciles any affected IMV
-        // exactly once via the transaction-local marker below.
+        // exactly once via the transaction-local marker below. 'TRUNCATE' rows are
+        // flush requests, not staged deltas, so they never count as a source.
         let batch_has_multiple_sources = client
             .select(
                 "SELECT count(DISTINCT source_table) >= 2 AS m FROM public.__reflex_deferred_pending \

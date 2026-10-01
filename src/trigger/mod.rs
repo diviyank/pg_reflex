@@ -615,8 +615,6 @@ mod union_delta;
 
 #[cfg(test)]
 pub(crate) use deferred::build_netted_view_sql;
-#[cfg(any(test, feature = "pg_test"))]
-pub(crate) use deferred::widened_xmin_sql;
 pub(crate) use dispatch::*;
 pub(crate) use merge::*;
 pub(crate) use ops::*;

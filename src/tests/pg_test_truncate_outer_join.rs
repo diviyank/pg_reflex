@@ -1028,56 +1028,55 @@ fn pg_toj_deferred_truncate_postponed_rebuild_is_flagged_until_done() {
     assert_truncate_rebuilt("rvf_p");
 }
 
-/// `xmin` widened to the full xid nearest the current one: own top xid, own
-/// subxids (above it), older committed xids, across the 2^32 wrap, and special
-/// xids (frozen / bootstrap: not this transaction), at epoch 0 and epoch >= 1.
+/// `__reflex_xid_is_current`: own top-level and subtransaction (EXCEPTION
+/// block) rows are true; special and "future" xids are false and never raise.
 #[pg_test]
-fn pg_toj_widened_xmin_nearest_epoch() {
-    let widen = |raw: i64, cur: i64| -> Option<i64> {
-        Spi::get_one::<i64>(&format!(
-            "SELECT {}",
-            crate::trigger::widened_xmin_sql(&format!("{raw}::int8"), &format!("{cur}::int8"))
+fn pg_toj_xid_is_current_local() {
+    let check = |sql: &str| Spi::get_one::<bool>(sql).expect(sql).expect("NULL");
+    Spi::run("CREATE TABLE tjx (i INT)").expect("table");
+    Spi::run("INSERT INTO tjx VALUES (1)").expect("top-level row");
+    Spi::run(
+        "DO $b$ BEGIN BEGIN INSERT INTO tjx VALUES (2); \
+         EXCEPTION WHEN OTHERS THEN NULL; END; END $b$",
+    )
+    .expect("row in an EXCEPTION block");
+    assert!(check(
+        "SELECT public.__reflex_xid_is_current(xmin) FROM tjx WHERE i = 1"
+    ));
+    assert!(check(
+        "SELECT public.__reflex_xid_is_current(xmin) FROM tjx WHERE i = 2"
+    ));
+    assert!(!check("SELECT public.__reflex_xid_is_current('2'::xid)"));
+    assert!(!check(
+        "SELECT public.__reflex_xid_is_current((pg_current_xact_id()::text::int8 + 1000)::text::xid)"
+    ));
+}
+
+/// Same through a real session: released and live savepoints are true, a row
+/// committed by an earlier transaction is false.
+#[pg_test]
+fn pg_toj_xid_is_current_savepoints_and_committed() {
+    const DBNAME: &str = "reflex_toj_xid_probe";
+    probe_db_open(DBNAME);
+    worker_exec("CREATE TABLE tjx (i INT); INSERT INTO tjx VALUES (0)");
+    worker_exec("BEGIN");
+    worker_exec("INSERT INTO tjx VALUES (1)");
+    worker_exec("SAVEPOINT a");
+    worker_exec("INSERT INTO tjx VALUES (2)");
+    worker_exec("RELEASE SAVEPOINT a");
+    worker_exec("SAVEPOINT b");
+    worker_exec("INSERT INTO tjx VALUES (3)");
+    let current = |i: i32| {
+        worker_scalar_i64(&format!(
+            "SELECT public.__reflex_xid_is_current(xmin)::int::int8 FROM tjx WHERE i = {i}"
         ))
-        .expect("widen")
     };
-    let epoch1 = 1_i64 << 32;
-    let mut wrong = Vec::new();
-    for (label, raw, cur, expected) in [
-        ("epoch 0 own top", 1000, 1000, Some(1000)),
-        ("epoch 0 own subxid", 1005, 1000, Some(1005)),
-        ("epoch 0 older committed", 900, 1000, Some(900)),
-        ("epoch 0 frozen", 2, 1000, None),
-        ("epoch 1 own top", 1000, epoch1 + 1000, Some(epoch1 + 1000)),
-        (
-            "epoch 1 own subxid",
-            1005,
-            epoch1 + 1000,
-            Some(epoch1 + 1005),
-        ),
-        (
-            "epoch 1 older committed",
-            900,
-            epoch1 + 1000,
-            Some(epoch1 + 900),
-        ),
-        ("epoch 1 frozen", 2, epoch1 + 1000, None),
-        (
-            "across wrap, older",
-            4_294_967_290,
-            epoch1 + 10,
-            Some(4_294_967_290),
-        ),
-        (
-            "across wrap, own subxid",
-            3,
-            2 * epoch1 - 5,
-            Some(2 * epoch1 + 3),
-        ),
-    ] {
-        let got = widen(raw, cur);
-        if got != expected {
-            wrong.push(format!("{label}: got {got:?}, expected {expected:?}"));
-        }
-    }
-    assert!(wrong.is_empty(), "{}", wrong.join("; "));
+    let flags = [current(0), current(1), current(2), current(3)];
+    worker_exec("COMMIT");
+    probe_db_close(DBNAME);
+    assert_eq!(
+        flags,
+        [0, 1, 1, 1],
+        "[committed earlier, top-level, released savepoint, live savepoint]"
+    );
 }
