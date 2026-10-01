@@ -993,20 +993,24 @@ pub(crate) fn reflex_reconcile_with_orphans(view_name: &str, drop_orphans: bool)
 /// Refresh the dependents of an IMV that was just rebuilt through the
 /// PARTITIONED path, which propagates nothing on its own.
 ///
-/// An unpartitioned rebuild of an IMV with dependents is a row diff the
-/// consumers receive as ordinary DML; consumers that IGNORE the rebuilt IMV see
-/// none of it and are refreshed explicitly (`ignoring_dependents`). The partitioned rebuild moves rows
-/// with `CREATE TABLE AS` into a detached table and then DETACH/ATTACH/RENAME —
-/// pure DDL, no DML on the live target, so no data trigger can fire and no
-/// consumer ever learns the IMV changed. Left alone the dependent serves stale
-/// rows with `known_stale = f` and no signal at all.
+/// An unpartitioned rebuild of an IMV with dependents is a row diff written
+/// through the target, so OBSERVING consumers (those that read it and do not
+/// ignore it) receive it as ordinary DML. IGNORING consumers, which list it in
+/// `ignored_sources`, see none of that DML and are refreshed explicitly by
+/// `ignoring_dependents`. The partitioned rebuild moves rows with
+/// `CREATE TABLE AS` into a detached table and then DETACH/ATTACH/RENAME — pure
+/// DDL, no DML on the live target, so no data trigger can fire and no consumer
+/// ever learns the IMV changed. Left alone the dependent serves stale rows with
+/// `known_stale = f` and no signal at all.
 ///
 /// This is the same fan-out `reflex_reconcile_partition` performs after its own
-/// swap (`partition.rs`), reached here for the whole-IMV rebuild. Restricted to
-/// the partitioned case on purpose: cascading after an unpartitioned rebuild
-/// would rebuild a consumer that ALSO has the rebuild's delta staged for COMMIT,
-/// double-counting it — the hazard
-/// `reconcile_generated_child_without_propagating` exists to avoid.
+/// swap (`partition.rs`), reached here for the whole-IMV rebuild. It is
+/// restricted to the partitioned case on purpose: after an unpartitioned
+/// rebuild an OBSERVING consumer already has the rebuild's delta staged for
+/// COMMIT, so cascading to it would double-count that delta — the hazard
+/// `reconcile_generated_child_without_propagating` exists to avoid. An IGNORING
+/// consumer has no delta staged, so it is always cascaded to, in or out of a
+/// trigger.
 ///
 /// Deliberately at the public entry point rather than inside `reconcile_one`:
 /// the chain descent rebuilds generated sub-IMVs through `reconcile_one` with
