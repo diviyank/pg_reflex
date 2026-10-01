@@ -860,3 +860,43 @@ fn pg_rbd_null_key_match_survives_stale_statistics() {
         "NULL-key diff took {elapsed:?}: quadratic join plan"
     );
 }
+
+/// The diff's DML fires the dependents' IMMEDIATE statement triggers inside
+/// the same call: no planner setting of the diff may leak into how they plan
+/// their own delta joins.
+#[pg_test]
+fn pg_rbd_diff_dml_runs_under_caller_planner_settings() {
+    rbn_up_and_dep("rbg");
+    Spi::run("UPDATE rbg_up SET v = v + 1000 WHERE p IS NULL AND l = 2").expect("changed");
+    Spi::run("DELETE FROM rbg_up WHERE p IS NULL AND l IS NULL").expect("missing");
+    Spi::run("INSERT INTO rbg_up VALUES (1001, NULL, 7)").expect("phantom");
+    Spi::run("CREATE TABLE rbg_probe (op TEXT, nestloop TEXT)").expect("probe");
+    Spi::run(
+        "CREATE FUNCTION rbg_record_planner() RETURNS trigger LANGUAGE plpgsql AS $f$ BEGIN \
+           INSERT INTO rbg_probe VALUES (TG_OP, current_setting('enable_nestloop')); RETURN NULL; END $f$",
+    )
+    .expect("fn");
+    Spi::run(
+        "CREATE TRIGGER rbg_record_planner AFTER INSERT OR UPDATE OR DELETE ON rbg_up \
+         FOR EACH STATEMENT EXECUTE FUNCTION rbg_record_planner()",
+    )
+    .expect("trigger");
+    assert_eq!(rbd_rebuild("rbg_up", &rbn_sql(RBN_UP_SQL, "rbg")), "DIFFED");
+    assert_imv_correct("rbg_up", &rbn_sql(RBN_UP_SQL, "rbg"));
+    assert_eq!(
+        Spi::get_one::<String>("SELECT string_agg(DISTINCT op, ',' ORDER BY op) FROM rbg_probe")
+            .unwrap()
+            .as_deref(),
+        Some("DELETE,INSERT,UPDATE"),
+        "every diff statement must reach the probe"
+    );
+    assert_eq!(
+        Spi::get_one::<String>(
+            "SELECT string_agg(op || ':' || nestloop, ',' ORDER BY op) FROM rbg_probe \
+             WHERE nestloop <> 'on'"
+        )
+        .unwrap(),
+        None,
+        "diff DML ran with the caller's enable_nestloop overridden"
+    );
+}
