@@ -1291,8 +1291,7 @@ pub(crate) fn aggregate_epilogue_stmts(
     if end_query_has_group_by {
         let qv = quote_identifier(view_name);
         if plan.group_by_columns.is_empty() {
-            let tdel = format!("DELETE FROM {}", qv);
-            let tins = format!("INSERT INTO {} {}", qv, end_query);
+            let rebuild = rebuild_target_stmt(view_name, end_query);
             if let Some(pd) = pending_dispatch.take() {
                 stmts.push(build_high_selectivity_dispatch_sql(
                     view_name,
@@ -1300,14 +1299,15 @@ pub(crate) fn aggregate_epilogue_stmts(
                     affected_tbl,
                     &pd.merge_sql,
                     &[],
-                    std::slice::from_ref(&tdel),
-                    std::slice::from_ref(&tins),
+                    std::slice::from_ref(&rebuild),
+                    &[],
                 ));
             } else {
-                if !skip_target_delete {
-                    stmts.push(tdel);
+                if skip_target_delete {
+                    stmts.push(format!("INSERT INTO {} {}", qv, end_query));
+                } else {
+                    stmts.push(rebuild);
                 }
-                stmts.push(tins);
             }
         } else {
             let output_cols: Vec<String> = plan
@@ -1360,8 +1360,7 @@ pub(crate) fn aggregate_epilogue_stmts(
                     }
                 }
                 None => {
-                    let tdel = format!("DELETE FROM {}", qv);
-                    let tins = format!("INSERT INTO {} {}", qv, end_query);
+                    let rebuild = rebuild_target_stmt(view_name, end_query);
                     if let Some(pd) = pending_dispatch.take() {
                         stmts.push(build_high_selectivity_dispatch_sql(
                             view_name,
@@ -1369,14 +1368,15 @@ pub(crate) fn aggregate_epilogue_stmts(
                             affected_tbl,
                             &pd.merge_sql,
                             &[],
-                            std::slice::from_ref(&tdel),
-                            std::slice::from_ref(&tins),
+                            std::slice::from_ref(&rebuild),
+                            &[],
                         ));
                     } else {
-                        if !skip_target_delete {
-                            stmts.push(tdel);
+                        if skip_target_delete {
+                            stmts.push(format!("INSERT INTO {} {}", qv, end_query));
+                        } else {
+                            stmts.push(rebuild);
                         }
-                        stmts.push(tins);
                     }
                 }
             }
