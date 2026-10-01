@@ -1634,8 +1634,8 @@ fn test_build_delta_sql_splice_falls_back_when_no_group_by_cols() {
         &sql[..sql.len().min(400)]
     );
     assert!(
-        sql.contains("DELETE FROM"),
-        "full-rebuild fallback must contain DELETE FROM: {}",
+        sql.contains("reflex_rebuild_target_rows('test_view'"),
+        "full-rebuild fallback must use the rebuild call: {}",
         &sql[..sql.len().min(400)]
     );
     assert!(
@@ -2952,6 +2952,56 @@ fn test_delete_promoted_falls_back_when_end_query_has_group_by() {
     );
 }
 
+#[test]
+fn as_plpgsql_stmt_rewrites_only_the_rebuild_call() {
+    let rebuild = rebuild_target_stmt("v", "SELECT 1");
+    let rewritten = as_plpgsql_stmt(&rebuild);
+    assert!(
+        rewritten.starts_with("PERFORM public.reflex_rebuild_target_rows('v', "),
+        "{rewritten}"
+    );
+    assert!(
+        rewritten.ends_with(&rebuild["SELECT ".len()..]),
+        "only the leading SELECT is rewritten: {rewritten}"
+    );
+    for untouched in [
+        "SELECT count(*) FROM t",
+        "DELETE FROM \"v\"",
+        "SELECT public.reflex_reconcile('v')",
+    ] {
+        assert_eq!(as_plpgsql_stmt(untouched), untouched);
+    }
+}
+
+#[test]
+fn unkeyed_whole_target_refresh_arms_use_rebuild_call() {
+    // end_query carries a GROUP BY the plan does not know about (no group
+    // columns): the epilogue refreshes the whole target, which must go
+    // through the rebuild call, not DELETE + INSERT.
+    let mut plan = simple_plan();
+    plan.group_by_columns = vec![];
+    let agg_json = serde_json::to_string(&plan).unwrap();
+    let base_q = "SELECT SUM(amount) AS \"__sum_amount\", COUNT(*) AS __ivm_count FROM orders";
+    let end_q = "SELECT SUM(\"__sum_amount\") AS total FROM \"__reflex_intermediate_pv\" WHERE __ivm_count > 0 GROUP BY 1";
+    let sql = reflex_build_delta_sql(
+        "pv",
+        "orders",
+        "INSERT",
+        base_q,
+        end_q,
+        Some(agg_json.as_str()),
+        base_q,
+    );
+    assert!(
+        sql.contains("reflex_rebuild_target_rows('pv'"),
+        "whole-target refresh must use the rebuild call: {sql}"
+    );
+    assert!(
+        !sql.contains("DELETE FROM \"pv\"\n") && !sql.contains("INSERT INTO \"pv\" SELECT"),
+        "no unkeyed DELETE/INSERT of the target: {sql}"
+    );
+}
+
 #[cfg(test)]
 mod delta_sql_snapshots {
     use crate::trigger::reflex_build_delta_sql;
@@ -3603,11 +3653,7 @@ fn secondary_passthrough_without_mapping_falls_back_to_rebuild() {
     );
     let joined = stmts.join("\n");
     assert!(
-        joined.contains("DELETE FROM \"fc_view\""),
-        "no mapping → full rebuild retained: {joined}"
-    );
-    assert!(
-        joined.contains("INSERT INTO \"fc_view\""),
+        joined.contains("reflex_rebuild_target_rows('fc_view'"),
         "no mapping → full rebuild retained: {joined}"
     );
 }
@@ -3635,7 +3681,7 @@ fn full_outer_secondary_passthrough_falls_back_to_rebuild() {
     );
     let joined = stmts.join("\n");
     assert!(
-        joined.contains("DELETE FROM \"fc_view\""),
+        joined.contains("reflex_rebuild_target_rows('fc_view'"),
         "FULL OUTER → full rebuild: {joined}"
     );
     assert!(
@@ -3680,7 +3726,7 @@ fn full_outer_secondary_aggregate_falls_back_to_rebuild() {
     );
     let joined = stmts.join("\n");
     assert!(
-        joined.contains("TRUNCATE __int") && joined.contains("TRUNCATE \"fc_view\""),
+        joined.contains("TRUNCATE __int") && joined.contains("reflex_rebuild_target_rows('fc_view'"),
         "FULL OUTER aggregate secondary must fall back to full rebuild, not scoped recompute: {joined}"
     );
     assert!(
