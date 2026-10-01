@@ -290,6 +290,7 @@ fn rebuild_truncated_imvs(client: &mut pgrx::spi::SpiClient<'_>) -> usize {
         .unwrap_or_report();
     let mut rebuilt = 0usize;
     // A flush nested in this pass (it returns at once here) may list more IMVs.
+    // Defensive: no test shows a listing that a later pass would not pick up.
     loop {
         rebuilt += rebuild_listed(client, &listed);
         let relisted = listed_for_rebuild(client);

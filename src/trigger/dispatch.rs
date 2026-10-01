@@ -80,7 +80,7 @@ fn execute_each(stmts: &[String], using: Option<&str>) -> String {
 }
 
 /// 1.4.5 — emit a DO block that dispatches between MERGE-incremental and
-/// TRUNCATE-rebuild based on runtime selectivity.
+/// full rebuild based on runtime selectivity.
 ///
 /// Replaces these statements in the standard flow:
 ///   1. MERGE intermediate USING scratch
@@ -88,19 +88,18 @@ fn execute_each(stmts: &[String], using: Option<&str>) -> String {
 ///   3. DELETE target WHERE in_affected
 ///   4. INSERT target SELECT end_query WHERE in_affected
 ///
-/// At high selectivity, instead:
-///   1. TRUNCATE intermediate
-///   2. INSERT INTO intermediate <base_query> -- full re-aggregation
-///   3. TRUNCATE target
-///   4. INSERT INTO target <end_query>
+/// At high selectivity, instead `reflex_reconcile(view)`: a full rebuild of
+/// the intermediate, and of the target as a row diff when it has dependents
+/// (`crate::rebuild_diff`).
 ///
 /// Scratch and affected are populated BEFORE this block (steps 1-3 of the
 /// standard flow remain unchanged). The DO block reads the affected table's
 /// row count and compares to pg_class.reltuples on the intermediate.
 ///
 /// Threshold: `current_setting('reflex.wipe_threshold', true)::numeric` if
-/// set, else `WIPE_THRESHOLD_DEFAULT`. Operators can `SET LOCAL` per-session
-/// or per-statement.
+/// set, else `WIPE_THRESHOLD_WITH_DEPENDENTS_DEFAULT` for an IMV with
+/// dependents and `WIPE_THRESHOLD_DEFAULT` otherwise. Operators can
+/// `SET LOCAL` per-session or per-statement.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_high_selectivity_dispatch_sql(
     view_name: &str,
