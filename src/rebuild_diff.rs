@@ -59,7 +59,7 @@ pub(crate) fn target_propagates(client: &pgrx::spi::SpiClient<'_>, view_name: &s
     )
 }
 
-/// Columns of the narrowest unique, non-partial, plain-column index on the
+/// Columns of the narrowest valid, unique, non-partial, plain-column index on the
 /// target root, in index order. Empty when there is none.
 pub(crate) fn key_columns(client: &pgrx::spi::SpiClient<'_>, view_name: &str) -> Vec<String> {
     select_texts(
@@ -68,6 +68,7 @@ pub(crate) fn key_columns(client: &pgrx::spi::SpiClient<'_>, view_name: &str) ->
            SELECT i.indexrelid, i.indkey, i.indnkeyatts \
            FROM pg_index i \
            WHERE i.indrelid = to_regclass($1) AND i.indisunique \
+             AND i.indisvalid AND i.indisready \
              AND i.indpred IS NULL AND i.indexprs IS NULL \
            ORDER BY i.indnkeyatts, i.indexrelid LIMIT 1) \
          SELECT a.attname::text FROM idx \
@@ -159,6 +160,7 @@ pub(crate) fn rebuild_target_rows(
     let staged_cols = column_names(client, &format!("pg_temp.{staged}"));
     let keys = key_columns(client, view_name);
     if !keys.is_empty() && target_cols == staged_cols {
+        reject_duplicate_keys(client, view_name, &staged, &keys);
         apply_keyed_diff(
             client,
             &root,
@@ -180,6 +182,36 @@ pub(crate) fn rebuild_target_rows(
             &[text_arg(&caller_float_digits)],
         )
         .unwrap_or_report();
+}
+
+/// A rebuild yielding a key twice means the IMV is already inconsistent: the
+/// keyed UPDATE would apply an arbitrary copy, so fail loudly instead.
+fn reject_duplicate_keys(
+    client: &pgrx::spi::SpiClient<'_>,
+    view_name: &str,
+    staged: &str,
+    keys: &[String],
+) {
+    let key_list = keys
+        .iter()
+        .map(|k| quoted(k))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let has_duplicate = !client
+        .select(
+            &format!(
+                "SELECT 1 FROM pg_temp.{staged} GROUP BY {key_list} HAVING count(*) > 1 LIMIT 1"
+            ),
+            None,
+            &[],
+        )
+        .unwrap_or_report()
+        .is_empty();
+    if has_duplicate {
+        pgrx::error!(
+            "pg_reflex: rebuild of '{view_name}' yields duplicate keys ({key_list}); refusing to diff"
+        );
+    }
 }
 
 fn apply_keyed_diff(
