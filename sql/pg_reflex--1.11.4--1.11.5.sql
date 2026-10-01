@@ -38,13 +38,27 @@
 -- from indentation, so fresh installs and upgrades converge. If you edit one,
 -- edit both.
 --
--- Step 3 takes no lock on the sources. A body that cannot be rewritten is
--- reported by a WARNING and skipped without aborting the upgrade; run
--- `SELECT reflex_rebuild_triggers('<source>');` for it afterwards.
+-- Step 3 takes no lock on the sources. It reports how many deferred TRUNCATE
+-- bodies it found and rewrote (INFO); a body it cannot rewrite is listed in a
+-- WARNING with its remedy and skipped without aborting the upgrade.
 --
--- Install the 1.11.5 library and run this update together: until the update,
--- a 1.11.5 library over the 1.11.4 catalog cannot rebuild after a TRUNCATE
--- (`reflex_rebuild_target_rows` is missing) and marks the IMV stale instead.
+-- UPGRADE WINDOW — writes fail until this update runs. The 1.11.5 library
+-- generates SQL that calls the five functions above, so between installing
+-- the library and running this update in a database:
+--   * an UPDATE of a source of an aggregate IMV, and an UPDATE / DELETE of the
+--     partitioned source of a partitioned passthrough IMV, fail (volume
+--     dispatch: `__reflex_target_propagates`, `__reflex_rebuild_cost_rows`);
+--   * a TRUNCATE of a source of an IMMEDIATE IMV and the trigger-side full
+--     refreshes fail (`reflex_rebuild_target_rows`);
+--   * a COMMIT that leaves a DEFERRED IMV to rebuild (e.g. two of its sources
+--     written) aborts (`__reflex_xid_is_current`, `__reflex_xid_precedes`);
+--   * a TRUNCATE of a source of a DEFERRED IMV commits and marks the IMV
+--     known_stale.
+-- The failures are loud — the write is rolled back, no IMV silently diverges.
+-- Operator sequence, in a quiet window: install the library; immediately run
+-- `ALTER EXTENSION pg_reflex UPDATE TO '1.11.5';` in every database that has
+-- the extension; recycle connection pools; `reflex_reconcile` any IMV left
+-- known_stale.
 
 -- === New functions ===
 

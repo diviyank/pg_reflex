@@ -14,7 +14,9 @@ Rebuilds no longer wipe the IMVs built on the rebuilt one. In the field a TRUNCA
 - (DATA LOSS) A rebuild of an IMV with dependents (`reflex_reconcile`, wipe dispatch, trigger full-refresh fallbacks) reached them as delete-all + insert-all; the target is now rewritten as a keyed or whole-row diff (`reflex_rebuild_target_rows`).
 - (DATA LOSS) Partitioned reconciles and partition swaps diff each populated leaf of an IMV with dependents, always — also when a generated child failed — and fully refresh only dependents that ignore it.
 - (SILENT) The multi-source cross-source guard rebuilt inside the flush, possibly before an upstream DEFERRED IMV's own flush, and aborted the COMMIT on failure; it now uses the COMMIT-time path (waits for upstream, isolated, stale on failure).
-- Volume dispatch sizes a two-level partition by its leaves (`__reflex_rebuild_cost_rows`), uses a 0.9 threshold for an IMV with dependents, and raises on a hot partition reconcile's `ERROR` result.
+- Volume dispatch sizes a two-level partition by its leaves (`__reflex_rebuild_cost_rows`) and uses a 0.9 threshold for an IMV with dependents.
+- (SILENT) A volume-dispatch rebuild that returned an `ERROR` string was discarded — on the unpartitioned high-selectivity path together with the statement's delta. Every dispatch call now raises: an IMMEDIATE statement fails, a DEFERRED IMV is marked `known_stale`.
+- A user unique index with NULLs distinct is no longer used as the rebuild diff key (two NULL-key rows aborted the rebuild); only `NULLS NOT DISTINCT` or all-`NOT NULL` unique indexes qualify.
 
 **Added**
 
@@ -22,7 +24,7 @@ Rebuilds no longer wipe the IMVs built on the rebuilt one. In the field a TRUNCA
 
 **Migration**
 
-- [`sql/pg_reflex--1.11.4--1.11.5.sql`](https://github.com/diviyank/pg_reflex/blob/main/sql/pg_reflex--1.11.4--1.11.5.sql) — creates the five functions, replaces `__reflex_deferred_flush_fn`, rewrites the pending-row DELETE in installed deferred TRUNCATE trigger bodies (no lock on sources), and deletes leftover `'TRUNCATE'` request rows. Install the library and run the update together.
+- [`sql/pg_reflex--1.11.4--1.11.5.sql`](https://github.com/diviyank/pg_reflex/blob/main/sql/pg_reflex--1.11.4--1.11.5.sql) — creates the five functions, replaces `__reflex_deferred_flush_fn`, rewrites the pending-row DELETE in installed deferred TRUNCATE trigger bodies (no lock on sources), and deletes leftover `'TRUNCATE'` request rows. **Writes and COMMITs on IMV sources fail loudly until the update runs**: in a quiet window, install the library, immediately run the update in every database, then recycle connection pools — see [Upgrading to 1.11.5](getting-started/upgrading.md#upgrading-to-1115).
 
 ## [1.11.4] — 2026-09-18
 

@@ -68,8 +68,26 @@ instead of aborting COMMIT. `ALTER EXTENSION pg_reflex UPDATE TO '1.11.5';`
   (`__reflex_rebuild_cost_rows`). An IMV with dependents uses a wipe
   threshold of 0.9 instead of 0.5 (`__reflex_target_propagates`): its
   rebuild also pays for the diff and for its dependents' maintenance, so
-  the incremental path stays cheaper for longer. A hot partition
-  reconcile that returns `ERROR` now raises instead of passing silently.
+  the incremental path stays cheaper for longer.
+- **(SILENT) A volume-dispatch rebuild that failed softly lost the
+  statement's change.** The dispatch hands a bulk change to
+  `reflex_reconcile` / `reflex_reconcile_partition`, which report some
+  failures (e.g. a mirror child that cannot be swapped) as a returned
+  `ERROR: …` string, and the dispatch discarded it with `PERFORM`: the
+  unpartitioned high-selectivity path then skipped the statement's delta
+  too, so the source change committed and the IMV stayed behind it with
+  `known_stale = FALSE`. Every dispatch call (hot partition, trip-cap,
+  high-selectivity) now raises on an `ERROR` result: an IMMEDIATE IMV's
+  writing statement fails, and a DEFERRED IMV is marked `known_stale` by its
+  flush savepoint (`pg_reflex.flush_failure_policy` applies). The IMMEDIATE
+  trigger body's pre-scratch Path B still discards it (filed, see Known
+  limits).
+- **A user unique index with NULLs distinct was used as the rebuild diff
+  key.** Such an index admits several rows whose key is NULL, so a rebuild
+  of an IMV holding two of them aborted with "yields duplicate keys". A
+  unique index is now a diff key only when it is `NULLS NOT DISTINCT` or
+  all its key columns are `NOT NULL` (pg_reflex's own `__reflex_uk_*`
+  indexes are); otherwise the next candidate or the whole-row diff is used.
 
 ### Added
 
@@ -97,24 +115,62 @@ hot/cold dispatch still classifies a two-level mirror per plan, not per leaf;
 passthrough 23505 flush failure of the incident is not reproduced yet;
 trigger regeneration through `reflex_rebuild_triggers` inside past
 `ALTER EXTENSION` updates (and for bare-name public sources, always) was a
-silent no-op.
+silent no-op; the IMMEDIATE trigger body's pre-scratch Path B and several
+`reflex_flush_partitions` / partition-delta callers still discard a soft
+`ERROR` from `reflex_reconcile`; under `SET CONSTRAINTS ALL IMMEDIATE` one
+statement writing two sources of a DEFERRED join IMV counts their cross
+product twice; `reflex_reconcile` of a DEFERRED IMV in a transaction that
+already staged deltas for it applies them twice at COMMIT; two sessions
+flushing different sources of one DEFERRED join IMV can deadlock at COMMIT
+(40P01, retryable). All pre-existing.
+
+Cost of a DEFERRED TRUNCATE rebuild of a large partitioned IMV with
+dependents: each populated leaf is diffed by staging
+`SELECT * FROM (<base query>) WHERE <leaf constraint>` into a temporary
+table and comparing it with the leaf (src/partition.rs leaf diff →
+`rebuild_target_rows`), so the rebuild after a TRUNCATE pushes the whole
+base query through temporary storage at COMMIT, leaf by leaf — about 123 M
+rows for `alp.sop_forecast_view` on db_clone. Temporary space
+(`temp_file_limit` for the diff's sorts and hashes, and the temp
+tablespace) is the failure mode: the rebuild fails, the IMV is marked
+`known_stale` and keeps its rows (it is not wiped). Size them for the
+largest IMV with dependents, or reconcile it outside peak hours.
 
 ### Tests
 
 - New `pg_test_truncate_outer_join.rs`, `pg_test_rebuild_diff.rs`,
   `pg_test_reconcile_diff_apply.rs`, `pg_test_rebuild_cost.rs`,
   `pg_test_rebuild_commit.rs` and `pg_test_deferred_marker.rs`; every must-be-absent / must-stay-unchanged
-  assertion mutation-checked. Cost assertions count rows inserted, updated
-  and deleted over the partition tree in the current transaction.
+  assertion mutation-checked. Cost assertions count the rows written after a
+  boundary command id (`rows_rewritten_since`: target rows whose `cmin` is
+  past the boundary), which also sees leaves refilled or swapped in; a few
+  keyed-diff tests count rows inserted + updated + deleted in the current
+  transaction over the partition tree (`tree_xact_changes`), and COMMIT-time
+  tests read `pg_stat_user_tables`.
 
 ### Migration
 
-- `sql/pg_reflex--1.11.4--1.11.5.sql` creates the five functions, replaces
-  `__reflex_deferred_flush_fn`, rewrites the pending-row DELETE in every
-  installed deferred TRUNCATE trigger body (no lock on the sources), and
-  deletes leftover `'TRUNCATE'` request rows. Install the library and run
-  the update together: until the update, a 1.11.5 library cannot rebuild
-  after a TRUNCATE and marks the IMV stale instead.
+- `sql/pg_reflex--1.11.4--1.11.5.sql` creates the five functions
+  (`reflex_rebuild_target_rows`, `__reflex_target_propagates`,
+  `__reflex_rebuild_cost_rows`, `__reflex_xid_is_current`,
+  `__reflex_xid_precedes`), replaces `__reflex_deferred_flush_fn`, rewrites
+  the pending-row DELETE in every installed deferred TRUNCATE trigger body
+  (no lock on the sources; an INFO line reports how many it found and
+  rewrote, a WARNING lists any it skipped with the remedy), and deletes
+  leftover `'TRUNCATE'` request rows.
+- **Writes and COMMITs on IMV sources fail until the update runs.** The
+  1.11.5 library's generated SQL calls the five functions, so between the
+  library install and the update: an `UPDATE` of an aggregate IMV's source,
+  an `UPDATE` / `DELETE` of a partitioned passthrough IMV's source, a
+  `TRUNCATE` of an IMMEDIATE IMV's source and the trigger-side full
+  refreshes fail with `function … does not exist`; a `COMMIT` that leaves a
+  DEFERRED IMV to rebuild aborts; a `TRUNCATE` of a DEFERRED IMV's source
+  commits and marks the IMV `known_stale`. The failures are loud — the
+  write is rolled back, no IMV silently diverges. In a quiet window: install
+  the library, immediately run `ALTER EXTENSION pg_reflex UPDATE TO
+  '1.11.5'` in every database that has the extension, recycle connection
+  pools, then `reflex_reconcile` any IMV left `known_stale`
+  (docs/getting-started/upgrading.md, "Upgrading to 1.11.5").
 
 ## [1.11.4] - 2026-09-18
 
