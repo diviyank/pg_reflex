@@ -185,6 +185,7 @@ pub(crate) fn rebuild_target_rows(
              SELECT * FROM ({rebuild_sql}) __reflex_q{scope_filter}"
         ),
     );
+    run(client, &format!("ANALYZE pg_temp.{staged}"));
 
     let target_cols = column_names(client, &root);
     let staged_cols = column_names(client, &format!("pg_temp.{staged}"));
@@ -259,10 +260,15 @@ fn reject_duplicate_keys(
 }
 
 /// Rows whose key holds no NULL are matched with plain `=` (hash / merge
-/// joinable, index usable). `=` never matches a NULL, so keys with a NULL get
-/// a second match restricted to the NULL-key rows of both sides, comparing
+/// joinable, index usable). `=` never matches a NULL, so when both sides hold
+/// NULL-key rows they get a second match restricted to those rows, comparing
 /// nullable columns as one-element arrays: array equality treats NULL elements
 /// as equal and stays hash / merge joinable, unlike IS NOT DISTINCT FROM.
+///
+/// The diff is computed by plain SELECTs into a temp table first, then applied
+/// by row identity: the DML fires the dependents' statement triggers in this
+/// call, so no planner setting of the diff may be in effect while it runs.
+/// The target is locked EXCLUSIVE, so the identities cannot move in between.
 fn apply_keyed_diff(
     client: &mut pgrx::spi::SpiClient<'_>,
     root: &str,
@@ -272,7 +278,31 @@ fn apply_keyed_diff(
     keys: &[KeyColumn],
     scope_on_t: &str,
 ) {
-    let has_nullable_key = keys.iter().any(|k| k.nullable);
+    let staged_rel = format!("pg_temp.{staged}");
+    let any_null_key = |alias: &str| {
+        keys.iter()
+            .filter(|k| k.nullable)
+            .map(|k| format!("{alias}.{} IS NULL", quoted(&k.name)))
+            .collect::<Vec<_>>()
+            .join(" OR ")
+    };
+    let match_null_keys = keys.iter().any(|k| k.nullable)
+        && client
+            .select(
+                &format!(
+                    "SELECT EXISTS (SELECT 1 FROM {staged_rel} n WHERE {}) \
+                        AND EXISTS (SELECT 1 FROM {root} t WHERE {scope_on_t} AND ({}))",
+                    any_null_key("n"),
+                    any_null_key("t")
+                ),
+                None,
+                &[],
+            )
+            .unwrap_or_report()
+            .first()
+            .get_one::<bool>()
+            .unwrap_or(None)
+            .unwrap_or(true);
     let strict_match = |a: &str, b: &str| {
         keys.iter()
             .map(|k| format!("{a}.{q} = {b}.{q}", q = quoted(&k.name)))
@@ -280,13 +310,6 @@ fn apply_keyed_diff(
             .join(" AND ")
     };
     let null_key_match = |a: &str, b: &str| {
-        let any_null = |alias: &str| {
-            keys.iter()
-                .filter(|k| k.nullable)
-                .map(|k| format!("{alias}.{} IS NULL", quoted(&k.name)))
-                .collect::<Vec<_>>()
-                .join(" OR ")
-        };
         let equal = keys
             .iter()
             .map(|k| {
@@ -299,14 +322,18 @@ fn apply_keyed_diff(
             })
             .collect::<Vec<_>>()
             .join(" AND ");
-        format!("({}) AND ({}) AND {equal}", any_null(a), any_null(b))
+        format!(
+            "({}) AND ({}) AND {equal}",
+            any_null_key(a),
+            any_null_key(b)
+        )
     };
     let unmatched_in = |rel: &str, alias: &str, other: &str| {
         let strict = format!(
             "NOT EXISTS (SELECT 1 FROM {rel} {alias} WHERE {})",
             strict_match(alias, other)
         );
-        if has_nullable_key {
+        if match_null_keys {
             format!(
                 "{strict} AND NOT EXISTS (SELECT 1 FROM {rel} {alias} WHERE {})",
                 null_key_match(alias, other)
@@ -329,51 +356,78 @@ fn apply_keyed_diff(
                 .join(", ")
         )
     };
-    let update_where = |key_match: String| {
+    let changed_rows = |key_match: String| {
         format!(
-            "UPDATE {root} t SET {} FROM pg_temp.{staged} n \
-             WHERE {key_match} AND {scope_on_t} AND {} IS DISTINCT FROM {}",
-            others
-                .iter()
-                .map(|c| format!("{q} = n.{q}", q = quoted(c)))
-                .collect::<Vec<_>>()
-                .join(", "),
+            "SELECT 'u'::\"char\", t.tableoid, t.ctid, ROW(n.*)::{staged_rel} FROM {root} t JOIN {staged_rel} n \
+             ON {key_match} WHERE {scope_on_t} AND {} IS DISTINCT FROM {}",
             row_of("t"),
             row_of("n")
         )
     };
-    let mut stmts = vec![format!(
-        "DELETE FROM {root} t WHERE {scope_on_t} AND {}",
-        unmatched_in(&format!("pg_temp.{staged}"), "n", "t")
+    let mut diff_sets = vec![format!(
+        "SELECT 'd'::\"char\" AS op, t.tableoid AS toid, t.ctid AS tid, NULL::{staged_rel} AS r \
+         FROM {root} t WHERE {scope_on_t} AND {}",
+        unmatched_in(&staged_rel, "n", "t")
     )];
     if !others.is_empty() {
-        stmts.push(update_where(strict_match("n", "t")));
-        if has_nullable_key {
-            stmts.push(update_where(null_key_match("n", "t")));
+        diff_sets.push(changed_rows(strict_match("n", "t")));
+        if match_null_keys {
+            diff_sets.push(changed_rows(null_key_match("n", "t")));
         }
     }
+    diff_sets.push(format!(
+        "SELECT 'i'::\"char\", NULL::oid, NULL::tid, ROW(n.*)::{staged_rel} FROM {staged_rel} n WHERE {}",
+        unmatched_in(old_rows, "t", "n")
+    ));
+    let diff_table = format!("{staged}_diff");
+    let diff = format!("pg_temp.{diff_table}");
+    // The NULL-key match uses no index, and estimates of how many NULL-key
+    // rows there are are often stale: a nested loop would be quadratic.
+    let caller_nestloop = match_null_keys.then(|| set_local(client, "enable_nestloop", "off"));
+    client
+        .update(
+            &format!(
+                "CREATE TEMP TABLE {diff_table} ON COMMIT DROP AS {}",
+                diff_sets.join(" UNION ALL ")
+            ),
+            None,
+            &[],
+        )
+        .unwrap_or_report();
+    if let Some(caller_nestloop) = caller_nestloop {
+        set_local(client, "enable_nestloop", &caller_nestloop);
+    }
+    let by_identity = "t.tableoid = d.toid AND t.ctid = d.tid";
+    let mut stmts = vec![
+        format!("ANALYZE {diff}"),
+        format!("DELETE FROM {root} t USING {diff} d WHERE d.op = 'd' AND {by_identity}"),
+    ];
+    if !others.is_empty() {
+        stmts.push(format!(
+            "UPDATE {root} t SET {} FROM {diff} d WHERE d.op = 'u' AND {by_identity}",
+            others
+                .iter()
+                .map(|c| format!("{q} = (d.r).{q}", q = quoted(c)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
     stmts.push(format!(
-        "INSERT INTO {root} ({cols}) SELECT {ncols} FROM pg_temp.{staged} n WHERE {}",
-        unmatched_in(old_rows, "t", "n"),
+        "INSERT INTO {root} ({cols}) SELECT {rcols} FROM {diff} d WHERE d.op = 'i'",
         cols = columns
             .iter()
             .map(|c| quoted(c))
             .collect::<Vec<_>>()
             .join(", "),
-        ncols = columns
+        rcols = columns
             .iter()
-            .map(|c| format!("n.{}", quoted(c)))
+            .map(|c| format!("(d.r).{}", quoted(c)))
             .collect::<Vec<_>>()
             .join(", ")
     ));
-    // The NULL-key match uses no index, and estimates of how many NULL-key
-    // rows there are are often stale: a nested loop would be quadratic.
-    let caller_nestloop = has_nullable_key.then(|| set_local(client, "enable_nestloop", "off"));
+    stmts.push(format!("DROP TABLE {diff}"));
     for stmt in &stmts {
         client.update(stmt, None, &[]).unwrap_or_report();
-    }
-    if let Some(caller_nestloop) = caller_nestloop {
-        set_local(client, "enable_nestloop", &caller_nestloop);
     }
 }
 
