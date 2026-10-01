@@ -14,6 +14,24 @@ fn tree_xact_changes(rel: &str) -> i64 {
     .unwrap_or(0)
 }
 
+/// Highest command id among rows currently in `rel` (take it AFTER the drift).
+fn cmin_boundary(rel: &str) -> i64 {
+    Spi::get_one::<i64>(&format!(
+        "SELECT COALESCE(max(cmin::text::int8), -1) FROM {rel}"
+    ))
+    .expect("cmin")
+    .unwrap_or(-1)
+}
+
+/// Rows of `rel` written (inserted / updated / refilled / swapped in) after `boundary`.
+fn rows_rewritten_since(rel: &str, boundary: i64) -> i64 {
+    Spi::get_one::<i64>(&format!(
+        "SELECT count(*)::int8 FROM {rel} WHERE cmin::text::int8 > {boundary}"
+    ))
+    .expect("rewritten")
+    .unwrap_or(0)
+}
+
 fn rbd_build_rel(prefix: &str) {
     Spi::run(&format!(
         "CREATE TABLE {prefix}_anchor (id INT PRIMARY KEY, product_id INT NOT NULL, \

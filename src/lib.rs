@@ -1259,8 +1259,10 @@ extension_sql!(
         --     would abort the very reconcile that repairs the IMV.
         --
         -- Dependents are refreshed explicitly once the swap is complete
-        -- (reconcile.rs `cascade_partitioned_rebuild_to_dependents`), which is
-        -- what makes skipping here safe rather than merely quiet.
+        -- (reconcile.rs `cascade_partitioned_rebuild_to_dependents` for a
+        -- partitioned root; `ignoring_dependents` for ignoring consumers of
+        -- an unpartitioned one, which see none of the rebuild's DML), which
+        -- is what makes skipping here safe rather than merely quiet.
         _swap_root := NULLIF(current_setting('pg_reflex.internal_swap_root', true), '');
         IF _swap_root IS NOT NULL THEN
             RETURN;

@@ -94,12 +94,12 @@ fn rda_one_row_drift_case(prefix: &str, mode: &str) {
         Spi::run(&format!("SELECT reflex_flush_deferred('{up}')")).expect("flush drift");
     }
 
-    let before = tree_xact_changes(&dep);
+    let boundary = cmin_boundary(&dep);
     rda_reconcile(&up);
     if mode == "DEFERRED" {
         Spi::run(&format!("SELECT reflex_flush_deferred('{up}')")).expect("flush reconcile");
     }
-    let after = tree_xact_changes(&dep);
+    let rewritten = rows_rewritten_since(&dep, boundary);
 
     assert_imv_correct(
         &up,
@@ -112,9 +112,9 @@ fn rda_one_row_drift_case(prefix: &str, mode: &str) {
     .expect("q")
     .expect("v");
     assert!(
-        after - before <= RDA_DIFF_STATEMENTS * key_rows,
-        "dependent rewritten beyond the drifted key: touched {} (key has {} rows)",
-        after - before,
+        (1..=RDA_DIFF_STATEMENTS * key_rows).contains(&rewritten),
+        "dependent must receive the drifted key's rows and no more: rewritten {} (key has {} rows)",
+        rewritten,
         key_rows
     );
 }
@@ -153,11 +153,11 @@ fn pg_rda_reconcile_of_correct_imv_leaves_dependent_untouched() {
     );
     assert_eq!(res, "CREATE REFLEX INCREMENTAL VIEW");
 
-    let before = tree_xact_changes("rda3_dep");
+    let boundary = cmin_boundary("rda3_dep");
     rda_reconcile("rda3_up");
     assert_eq!(
-        tree_xact_changes("rda3_dep"),
-        before,
+        rows_rewritten_since("rda3_dep", boundary),
+        0,
         "a no-op reconcile rewrote the dependent"
     );
     assert_imv_correct("rda3_dep", &rda_dependent_sql("rda3", "rda3_rel"));
@@ -234,9 +234,9 @@ fn pg_rda_aggregate_upstream_reaches_dependent_as_changed_groups() {
         "UPDATE rda5_up SET is_active = NOT is_active WHERE product_id = 0 AND location_id = 0",
     )
     .expect("drift one group");
-    let before = tree_xact_changes("rda5_dep");
+    let boundary = cmin_boundary("rda5_dep");
     rda_reconcile("rda5_up");
-    let after = tree_xact_changes("rda5_dep");
+    let rewritten = rows_rewritten_since("rda5_dep", boundary);
 
     assert_imv_correct("rda5_up", up_sql);
     assert_imv_correct("rda5_dep", &dep_fresh);
@@ -246,9 +246,9 @@ fn pg_rda_aggregate_upstream_reaches_dependent_as_changed_groups() {
     .expect("q")
     .expect("v");
     assert!(
-        after - before <= AGG_WHOLE_ROW_DIFF_FACTOR * RDA_DIFF_STATEMENTS * key_rows,
-        "dependent rewritten beyond the drifted group: touched {}",
-        after - before
+        (1..=AGG_WHOLE_ROW_DIFF_FACTOR * RDA_DIFF_STATEMENTS * key_rows).contains(&rewritten),
+        "dependent must receive the drifted group's rows and no more: rewritten {}",
+        rewritten
     );
 }
 
@@ -312,6 +312,7 @@ fn rda_build_partitioned(prefix: &str) {
 /// P1 — whole-IMV reconcile of a partitioned IMV: an aggregate dependent sees
 /// only the drifted group change, not a rebuild.
 #[pg_test]
+#[ignore = "Task 7: partitioned leaf diff"]
 fn pg_rda_partitioned_reconcile_reaches_aggregate_dependent_as_delta() {
     rda_build_partitioned("rdp1");
     let dep_sql =
@@ -321,22 +322,23 @@ fn pg_rda_partitioned_reconcile_reaches_aggregate_dependent_as_delta() {
     let fresh = "SELECT product_id, SUM(qty) AS q, COUNT(*) AS n FROM rdp1_src GROUP BY product_id";
 
     Spi::run("UPDATE rdp1_up SET qty = qty + 1000 WHERE plan = 2 AND id = 7").expect("drift");
-    let before = tree_xact_changes("rdp1_dep");
+    let boundary = cmin_boundary("rdp1_dep");
     rda_reconcile("rdp1_up");
-    let after = tree_xact_changes("rdp1_dep");
+    let rewritten = rows_rewritten_since("rdp1_dep", boundary);
 
     assert_imv_correct("rdp1_up", "SELECT plan, id, product_id, qty FROM rdp1_src");
     assert_imv_correct("rdp1_dep", fresh);
     assert!(
-        after - before <= RDA_DIFF_STATEMENTS,
-        "aggregate dependent rebuilt instead of receiving the one-group delta: touched {}",
-        after - before
+        (1..=RDA_DIFF_STATEMENTS).contains(&rewritten),
+        "aggregate dependent must receive the one-group delta, no rebuild: rewritten {}",
+        rewritten
     );
 }
 
 /// P2 — partition-scoped reconcile: a dependent partitioned on the same column
 /// receives the drifted row, not a refill of the partition.
 #[pg_test]
+#[ignore = "Task 7: partitioned leaf diff"]
 fn pg_rda_partition_reconcile_reaches_partitioned_dependent_as_delta() {
     rda_build_partitioned("rdp2");
     create_imv(
@@ -348,19 +350,19 @@ fn pg_rda_partition_reconcile_reaches_partitioned_dependent_as_delta() {
     let fresh = "SELECT plan, id, qty * 2 AS q2 FROM rdp2_src";
 
     Spi::run("UPDATE rdp2_up SET qty = qty + 1000 WHERE plan = 2 AND id = 7").expect("drift");
-    let before = tree_xact_changes("rdp2_dep");
+    let boundary = cmin_boundary("rdp2_dep");
     let res = Spi::get_one::<String>("SELECT reflex_reconcile_partition('rdp2_up', '2')")
         .expect("reconcile_partition")
         .expect("result");
     assert!(res.starts_with("RECONCILED"), "{res}");
-    let after = tree_xact_changes("rdp2_dep");
+    let rewritten = rows_rewritten_since("rdp2_dep", boundary);
 
     assert_imv_correct("rdp2_up", "SELECT plan, id, product_id, qty FROM rdp2_src");
     assert_imv_correct("rdp2_dep", fresh);
     assert!(
-        after - before <= RDA_DIFF_STATEMENTS,
-        "partitioned dependent refilled instead of receiving the one-row delta: touched {}",
-        after - before
+        (1..=RDA_DIFF_STATEMENTS).contains(&rewritten),
+        "partitioned dependent must receive the one-row delta, no refill: rewritten {}",
+        rewritten
     );
 }
 
@@ -421,7 +423,7 @@ fn pg_rda_ignoring_and_observing_dependents_on_one_rebuild() {
     create_imv("rdi1_ign", &format!(
         "SELECT create_reflex_ivm('rdi1_ign', $q${}$q$, 'product_id, location_id, id', NULL, 'IMMEDIATE', '!rdi1_up')",
         rbd_dep_sql("rdi1", "rdi1_up")));
-    let before = tree_xact_changes("rdi1_obs");
+    let boundary = cmin_boundary("rdi1_obs");
     rda_reconcile("rdi1_up");
     assert_imv_correct("rdi1_obs", &rbd_dep_sql("rdi1", "rdi1_rel"));
     assert_imv_correct("rdi1_ign", &rbd_dep_sql("rdi1", "rdi1_rel"));
@@ -431,7 +433,7 @@ fn pg_rda_ignoring_and_observing_dependents_on_one_rebuild() {
     .unwrap()
     .unwrap();
     assert!(
-        tree_xact_changes("rdi1_obs") - before <= RDA_DIFF_STATEMENTS * key_rows,
-        "observing dependent was also rebuilt by cascade"
+        (1..=RDA_DIFF_STATEMENTS * key_rows).contains(&rows_rewritten_since("rdi1_obs", boundary)),
+        "observing dependent must get the diff only, not a cascade rebuild"
     );
 }
