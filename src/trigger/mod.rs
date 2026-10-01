@@ -481,8 +481,9 @@ pub fn reflex_build_truncate_sql(view_name: &str) -> String {
         let Some(enqueue) = enqueue_truncate_flush_sql(view_name) else {
             return mark_stale_after_truncate_sql(view_name);
         };
-        // The trigger body then deletes this source's pending rows; the queued
-        // deferred event still fires (AfterTriggerExecute fetches with SnapshotAny).
+        // The request row lives until its own event deletes it (flush_fn). Trigger
+        // bodies installed before that rule delete it early; the queued event still
+        // fires (AfterTriggerExecute fetches with SnapshotAny).
         stmts = vec![
             DEFERRED_REBUILD_TABLE_DDL.to_string(),
             format!(
@@ -614,6 +615,8 @@ mod union_delta;
 
 #[cfg(test)]
 pub(crate) use deferred::build_netted_view_sql;
+#[cfg(any(test, feature = "pg_test"))]
+pub(crate) use deferred::widened_xmin_sql;
 pub(crate) use dispatch::*;
 pub(crate) use merge::*;
 pub(crate) use ops::*;

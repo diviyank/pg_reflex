@@ -460,6 +460,16 @@ fn pg_toj_deferred_truncate_only_source_rebuilds_at_commit() {
         "CREATE REFLEX INCREMENTAL VIEW"
     );
     Spi::run("TRUNCATE tjo_anchor").expect("truncate only source");
+    let requests = Spi::get_one::<i64>(
+        "SELECT count(*)::int8 FROM public.__reflex_deferred_pending \
+         WHERE source_table = 'tjo_anchor' AND operation = 'TRUNCATE'",
+    )
+    .expect("requests")
+    .unwrap_or(0);
+    assert_eq!(
+        requests, 1,
+        "the TRUNCATE body deleted its own flush request"
+    );
     assert_eq!(
         toj_row_count("tjo_v"),
         7,
@@ -840,35 +850,53 @@ fn pg_toj_deferred_truncate_orphan_rows_do_not_hold_back_rebuild() {
     assert!(!sc_stale, "SET CONSTRAINTS: orphan rows flagged rvs_p");
 }
 
-/// Many staging statements queued before the upstream-settling event must not
-/// exhaust the deferrals: a postpone is free.
+/// Many staging statements on the observed source queued before the
+/// upstream-settling event must not exhaust the deferrals, and no flush
+/// request row outlives the transaction.
 #[pg_test]
 fn pg_toj_deferred_truncate_many_statements_before_upstream_commit() {
     const DBNAME: &str = "reflex_toj_many_probe";
     probe_db_open(DBNAME);
-    let fresh = worker_rvw_fixture("rvn");
-    let inserts: String = (0..40)
-        .map(|i| {
-            format!(
-                "INSERT INTO rvn_anchor VALUES ({}, {}, {}, 1); ",
-                1000 + i,
-                i % 7,
-                i % 5
-            )
-        })
-        .collect();
-    worker_exec(&format!(
-        "BEGIN; TRUNCATE rvn_act; {inserts}UPDATE rvn_rel SET is_active = NOT is_active; COMMIT"
-    ));
-    let mismatches = worker_mismatches("rvn_p", &fresh);
-    let stale = worker_stale("rvn_p");
+    let mut outcomes = Vec::new();
+    for (prefix, statements) in [("rvn", 40), ("rvs70", 70), ("rvs200", 200)] {
+        let fresh = worker_rvw_fixture(prefix);
+        let inserts: String = (0..statements)
+            .map(|i| {
+                format!(
+                    "INSERT INTO {prefix}_anchor VALUES ({}, {}, {}, 1); ",
+                    1000 + i,
+                    i % 7,
+                    i % 5
+                )
+            })
+            .collect();
+        worker_exec(&format!(
+            "BEGIN; TRUNCATE {prefix}_act; {inserts}\
+             UPDATE {prefix}_rel SET is_active = NOT is_active; COMMIT"
+        ));
+        let leaked = worker_scalar_i64(
+            "SELECT count(*)::int8 FROM public.__reflex_deferred_pending WHERE operation = 'TRUNCATE'",
+        );
+        outcomes.push((
+            statements,
+            worker_mismatches(&format!("{prefix}_p"), &fresh),
+            worker_stale(&format!("{prefix}_p")),
+            leaked,
+        ));
+    }
     probe_db_close(DBNAME);
 
-    assert_eq!(mismatches, 0, "rvn_p wrong after commit");
-    assert!(
-        !stale,
-        "rvn_p spuriously flagged: deferrals charged for free postpones"
-    );
+    for (statements, mismatches, stale, leaked) in outcomes {
+        assert_eq!(
+            mismatches, 0,
+            "{statements} statements: X wrong after commit"
+        );
+        assert!(!stale, "{statements} statements: X spuriously flagged");
+        assert_eq!(
+            leaked, 0,
+            "{statements} statements: flush request rows outlived COMMIT"
+        );
+    }
 }
 
 const DIAMOND_D_SQL: &str = "SELECT product_id, COUNT(*) AS n, \
@@ -998,4 +1026,58 @@ fn pg_toj_deferred_truncate_postponed_rebuild_is_flagged_until_done() {
     Spi::run("SELECT reflex_flush_deferred('rvf_rel')").expect("upstream settles");
     assert_imv_correct("rvf_p", &fresh);
     assert_truncate_rebuilt("rvf_p");
+}
+
+/// `xmin` widened to the full xid nearest the current one: own top xid, own
+/// subxids (above it), older committed xids, across the 2^32 wrap, and special
+/// xids (frozen / bootstrap: not this transaction), at epoch 0 and epoch >= 1.
+#[pg_test]
+fn pg_toj_widened_xmin_nearest_epoch() {
+    let widen = |raw: i64, cur: i64| -> Option<i64> {
+        Spi::get_one::<i64>(&format!(
+            "SELECT {}",
+            crate::trigger::widened_xmin_sql(&format!("{raw}::int8"), &format!("{cur}::int8"))
+        ))
+        .expect("widen")
+    };
+    let epoch1 = 1_i64 << 32;
+    let mut wrong = Vec::new();
+    for (label, raw, cur, expected) in [
+        ("epoch 0 own top", 1000, 1000, Some(1000)),
+        ("epoch 0 own subxid", 1005, 1000, Some(1005)),
+        ("epoch 0 older committed", 900, 1000, Some(900)),
+        ("epoch 0 frozen", 2, 1000, None),
+        ("epoch 1 own top", 1000, epoch1 + 1000, Some(epoch1 + 1000)),
+        (
+            "epoch 1 own subxid",
+            1005,
+            epoch1 + 1000,
+            Some(epoch1 + 1005),
+        ),
+        (
+            "epoch 1 older committed",
+            900,
+            epoch1 + 1000,
+            Some(epoch1 + 900),
+        ),
+        ("epoch 1 frozen", 2, epoch1 + 1000, None),
+        (
+            "across wrap, older",
+            4_294_967_290,
+            epoch1 + 10,
+            Some(4_294_967_290),
+        ),
+        (
+            "across wrap, own subxid",
+            3,
+            2 * epoch1 - 5,
+            Some(2 * epoch1 + 3),
+        ),
+    ] {
+        let got = widen(raw, cur);
+        if got != expected {
+            wrong.push(format!("{label}: got {got:?}, expected {expected:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("; "));
 }

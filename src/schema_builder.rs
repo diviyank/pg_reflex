@@ -910,8 +910,14 @@ pub fn build_deferred_flush_ddl() -> Vec<String> {
         // effective flush, and the cross-source guard still sees every source
         // this transaction staged (all pending rows are present at COMMIT
         // before any flush deletes its own).
+        // A 'TRUNCATE' row is a flush request (reflex_build_truncate_sql): bulk
+        // pending deletes keep it, and exactly its own event removes it, so its
+        // presence means that event is still queued.
         "CREATE OR REPLACE FUNCTION public.__reflex_deferred_flush_fn() RETURNS TRIGGER AS $fn$ \
          BEGIN \
+           IF NEW.operation = 'TRUNCATE' THEN \
+             DELETE FROM public.__reflex_deferred_pending WHERE id = NEW.id; \
+           END IF; \
            PERFORM public.reflex_flush_deferred(NEW.source_table); \
            RETURN NULL; \
          END; \

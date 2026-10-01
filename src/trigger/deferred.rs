@@ -123,13 +123,26 @@ const TRUNCATE_REBUILD_MAX_DEFERRALS: i32 = 64;
 /// Predicate on a row's `xmin`: written by this transaction (or one of its
 /// subtransactions). Rows of other running transactions are invisible, so a
 /// visible row whose writer is still in progress is ours; committed rows left by
-/// other sessions are not. The 32-bit `xmin` is widened against the snapshot's
-/// xmax, which no visible xid reaches.
-const WRITTEN_BY_THIS_XACT: &str = "pg_xact_status(( \
-       (GREATEST((pg_snapshot_xmax(pg_current_snapshot())::text::int8 >> 32) \
-                 - (xmin::text::int8 > (pg_snapshot_xmax(pg_current_snapshot())::text::int8 \
-                                        & 4294967295))::int, 0) << 32) \
-       | xmin::text::int8)::text::xid8) = 'in progress'";
+/// other sessions are not.
+fn written_by_this_xact() -> String {
+    format!(
+        "pg_xact_status(({})::text::xid8) = 'in progress'",
+        widened_xmin_sql("xmin::text::int8", "pg_current_xact_id()::text::int8")
+    )
+}
+
+/// `raw` (a 32-bit xid) widened to the full xid nearest `cur` (the current full
+/// xid). A visible row's writer is within 2^31 of it — this transaction's own
+/// subxids sit above it, committed ones below — so this is exact. Special xids
+/// (< 3: invalid, bootstrap, frozen) yield NULL: never this transaction, and
+/// never widened into the future.
+pub(crate) fn widened_xmin_sql(raw: &str, cur: &str) -> String {
+    format!(
+        "(CASE WHEN {raw} < 3 THEN NULL ELSE \
+           {cur} + (((({raw} - ({cur} & 4294967295)) + 2147483648) & 4294967295) - 2147483648) \
+         END)"
+    )
+}
 
 /// Whether an IMV upstream of `imv_name` (transitively, any mode) may still
 /// change in this transaction: a DEFERRED one with a delta this transaction
@@ -196,7 +209,8 @@ fn staged_by_this_xact(client: &pgrx::spi::SpiClient<'_>, delta_tbl: &str) -> bo
         "SELECT to_regclass('{}') IS NOT NULL",
         delta_tbl.replace('\'', "''")
     )) && select_bool(&format!(
-        "SELECT EXISTS (SELECT 1 FROM {delta_tbl} WHERE {WRITTEN_BY_THIS_XACT})"
+        "SELECT EXISTS (SELECT 1 FROM {delta_tbl} WHERE {})",
+        written_by_this_xact()
     ))
 }
 
@@ -210,7 +224,8 @@ fn flush_request_outstanding(client: &pgrx::spi::SpiClient<'_>, imv_name: &str) 
         .select(
             &format!(
                 "SELECT EXISTS (SELECT 1 FROM public.__reflex_deferred_pending \
-                 WHERE source_table = $1 AND operation = 'TRUNCATE' AND {WRITTEN_BY_THIS_XACT})"
+                 WHERE source_table = $1 AND operation = 'TRUNCATE' AND {})",
+                written_by_this_xact()
             ),
             None,
             &[unsafe { DatumWithOid::new(source, PgBuiltInOids::TEXTOID.oid().value()) }],
@@ -568,7 +583,8 @@ fn flush_staged_deltas(source_table: &str) -> String {
             client
                 .update(
                     &format!(
-                        "DELETE FROM public.__reflex_deferred_pending WHERE source_table = '{}'",
+                        "DELETE FROM public.__reflex_deferred_pending \
+                         WHERE source_table = '{}' AND operation <> 'TRUNCATE'",
                         source_table.replace("'", "''")
                     ),
                     None,
@@ -774,7 +790,8 @@ fn flush_staged_deltas(source_table: &str) -> String {
             client
                 .update(
                     &format!(
-                        "DELETE FROM public.__reflex_deferred_pending WHERE source_table = '{}'",
+                        "DELETE FROM public.__reflex_deferred_pending \
+                         WHERE source_table = '{}' AND operation <> 'TRUNCATE'",
                         source_table.replace("'", "''")
                     ),
                     None,
@@ -797,7 +814,8 @@ fn flush_staged_deltas(source_table: &str) -> String {
         // exactly once via the transaction-local marker below.
         let batch_has_multiple_sources = client
             .select(
-                "SELECT count(DISTINCT source_table) >= 2 AS m FROM public.__reflex_deferred_pending",
+                "SELECT count(DISTINCT source_table) >= 2 AS m FROM public.__reflex_deferred_pending \
+                 WHERE operation <> 'TRUNCATE'",
                 None,
                 &[],
             )
@@ -887,7 +905,8 @@ fn flush_staged_deltas(source_table: &str) -> String {
                             "SELECT count(DISTINCT p.source_table) >= 2 AS m \
                              FROM public.__reflex_deferred_pending p \
                              JOIN public.__reflex_ivm_reference r ON r.name = '{}' \
-                             WHERE p.source_table = ANY(r.depends_on)",
+                             WHERE p.source_table = ANY(r.depends_on) \
+                               AND p.operation <> 'TRUNCATE'",
                             imv_esc
                         ),
                         None,
@@ -1333,7 +1352,8 @@ fn flush_staged_deltas(source_table: &str) -> String {
         client
             .update(
                 &format!(
-                    "DELETE FROM public.__reflex_deferred_pending WHERE source_table = '{}'",
+                    "DELETE FROM public.__reflex_deferred_pending \
+                         WHERE source_table = '{}' AND operation <> 'TRUNCATE'",
                     source_table.replace("'", "''")
                 ),
                 None,
