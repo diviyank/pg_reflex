@@ -50,7 +50,7 @@ psql -d mydb -c "ALTER EXTENSION pg_reflex UPDATE;"
 | 1.10.5 → 1.10.6 | The `sql_drop` event trigger now also cleans up an IMV whose own **target** table is dropped (directly, via `DROP SCHEMA … CASCADE`, or by dropping a view the IMV is built on), not only IMVs whose *source* was dropped. The migration re-creates the `reflex_on_sql_drop` plpgsql function; no catalog or signature change. | none for existing IMVs. Pre-1.10.6 orphaned registry rows are **not** retroactively cleaned — drop them with `drop_reflex_ivm(name, true)`, or `DELETE FROM public.__reflex_ivm_reference` for rows whose target is already gone. |
 | … 1.10.6 → 1.11.3 | See the [changelog](../changelog.md) for each intermediate release. | see changelog per version. |
 | 1.11.3 → 1.11.4 | Silent-wipe observability and prevention. A failed deferred flush now marks the IMV `known_stale` (it previously discarded the staged delta silently); `reflex_ivm_status()` gains `is_estimate`, counts anomalous IMVs exactly, and reports IMVs whose partition source is capped; new `__reflex_event_log` table and `reflex_prune_event_log`; new `pg_reflex.flush_failure_policy` GUC (`warn` default, opt-in `error`); **`create_reflex_ivm` refuses an unsound `ignore_sources` entry** unless acknowledged with a `'!'` prefix or `reflex_ack_ignore_source`; `reflex_audit` / `reflex_doctor` (F13) report existing ones; a change to an ignored source that joins onto the partition key queues the affected partitions for heal (`reflex_heal_ignored_sources`, run by `reflex_scheduled_reconcile` and doctor F14). The migration adds `ignore_ack`, the event log, the heal queue, recreates `reflex_ivm_status()` (return-shape change), and installs heal triggers on existing partitioned IMVs. | See [Upgrading to 1.11.4](#upgrading-to-1114) below: upgrade in a quiet window with `lock_timeout` set, treat `HEALED` from `reflex_scheduled_reconcile` as success, and add the `'!'` marker to accepted unsound ignores before recreating any IMV or running `reflex_rebuild_chain`. |
-| 1.11.4 → 1.11.5 | Rebuilds of an IMV with dependents (source TRUNCATE, `reflex_reconcile`, wipe dispatch, partition rebuilds) hand dependents a row diff instead of clearing or fully rebuilding them; a DEFERRED IMV whose source is truncated is rebuilt once at COMMIT; volume dispatch sizes two-level partitions by their leaves and uses a 0.9 threshold for IMVs with dependents; a multi-source guard rebuild failure marks the IMV stale instead of aborting COMMIT. The migration adds four functions, replaces `__reflex_deferred_flush_fn` and rewrites the installed deferred TRUNCATE trigger bodies in place. | Install the library and run `ALTER EXTENSION pg_reflex UPDATE TO '1.11.5'` together: in between, a source TRUNCATE marks the IMV stale instead of rebuilding it (repair with `reflex_reconcile`). The update takes no lock on sources. |
+| 1.11.4 → 1.11.5 | Rebuilds of an IMV with dependents (source TRUNCATE, `reflex_reconcile`, wipe dispatch, partition rebuilds) hand dependents a row diff instead of clearing or fully rebuilding them; a DEFERRED IMV whose source is truncated is rebuilt once at COMMIT; volume dispatch sizes two-level partitions by their leaves and uses a 0.9 threshold for IMVs with dependents; a multi-source guard rebuild failure marks the IMV stale instead of aborting COMMIT. The migration adds five functions, replaces `__reflex_deferred_flush_fn` and rewrites the installed deferred TRUNCATE trigger bodies in place. | **Writes to IMV sources fail until the update runs.** See [Upgrading to 1.11.5](#upgrading-to-1115): in a quiet window, install the library, immediately run `ALTER EXTENSION pg_reflex UPDATE TO '1.11.5'` in every database, then recycle connection pools. The update takes no lock on sources. |
 
 `ALTER EXTENSION pg_reflex UPDATE` walks the chain automatically.
 
@@ -99,6 +99,44 @@ production database.
    success. `reflex_ivm_status()` has a trailing `is_estimate` column, and
    reports more IMVs as `known_stale` (capped partition sources, queued
    heals, unhealable ignored sources), which monitoring may alert on.
+
+## Upgrading to 1.11.5
+
+The 1.11.5 library generates SQL that calls five functions the update
+creates: `reflex_rebuild_target_rows`, `__reflex_target_propagates`,
+`__reflex_rebuild_cost_rows`, `__reflex_xid_is_current` and
+`__reflex_xid_precedes`. Between installing the library and running the
+update in a database, maintenance that needs one of them fails with
+`function … does not exist`:
+
+| Operation on an IMV source | Missing function | Effect |
+|---|---|---|
+| `UPDATE` of a source of an aggregate IMV; `UPDATE` / `DELETE` of the partitioned source of a partitioned passthrough IMV (volume dispatch) | `__reflex_target_propagates`, `__reflex_rebuild_cost_rows` | the statement fails |
+| `TRUNCATE` of a source of an IMMEDIATE IMV; a trigger-side full refresh (self-join, set-op, FULL JOIN fallbacks) | `reflex_rebuild_target_rows` | the statement fails |
+| `COMMIT` of a transaction that leaves a DEFERRED IMV to rebuild (e.g. two of its sources written) | `__reflex_xid_is_current`, `__reflex_xid_precedes` | the `COMMIT` aborts and its writes roll back |
+| `TRUNCATE` of a source of a DEFERRED IMV | `reflex_rebuild_target_rows` | the `COMMIT` succeeds; the IMV is marked `known_stale` |
+
+These failures are loud: the write does not happen, so no IMV silently
+diverges from its sources. Other writes (aggregate `INSERT` / `DELETE`,
+unpartitioned passthrough `INSERT` / `UPDATE` / `DELETE`, partitioned
+passthrough `INSERT`) keep working. Keep the window short:
+
+1. Pick a quiet window.
+2. Install the 1.11.5 library (`.deb` or `install.sh`).
+3. Immediately, in **every** database that has the extension:
+
+    ```sql
+    ALTER EXTENSION pg_reflex UPDATE TO '1.11.5';
+    ```
+
+    It reports `INFO: pg_reflex 1.11.5: rewrote N of M deferred TRUNCATE
+    trigger bodies found (…)`. A `WARNING` lists any body it could not
+    rewrite, with the remedy.
+4. Recycle connection pools, so that no session keeps the 1.11.4 library it
+    loaded before the install.
+5. Run `SELECT reflex_reconcile('<imv>')` for every IMV that
+    `reflex_ivm_status()` reports `known_stale` (a DEFERRED IMV whose source
+    was truncated during the window).
 
 ## After upgrade
 
