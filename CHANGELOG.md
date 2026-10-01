@@ -40,7 +40,10 @@ instead of aborting COMMIT. `ALTER EXTENSION pg_reflex UPDATE TO '1.11.5';`
   now rewritten with `reflex_rebuild_target_rows`: a keyed (or whole-row)
   DELETE / UPDATE / INSERT diff, so a dependent receives exactly the rows
   that changed and its work is proportional to them. An IMV without
-  dependents keeps the cheaper DELETE + INSERT.
+  dependents keeps the cheaper DELETE + INSERT. Key columns holding NULLs
+  match NULL-safely (a no-op rebuild rewrites no NULL-key row); a target
+  with a second unique or exclusion index, where a keyed UPDATE swapping two
+  rows' values would raise 23505, uses the whole-row diff.
 - **(DATA LOSS) Partition rebuilds of an IMV with dependents.** A reconcile
   of a partitioned IMV and a partition swap diff each populated leaf through
   the root instead of swapping it, and cascade a full refresh only to
@@ -149,6 +152,19 @@ rows for `alp.sop_forecast_view` on db_clone. Temporary space
 tablespace) is the failure mode: the rebuild fails, the IMV is marked
 `known_stale` and keeps its rows (it is not wiped). Size them for the
 largest IMV with dependents, or reconcile it outside peak hours.
+
+Full rebuilds now run inside `COMMIT`: a DEFERRED IMV whose source was
+truncated, and a DEFERRED multi-source IMV whose cross-source guard fires
+(two of its sources written in one transaction), are rebuilt from their
+base query — and diffed into their dependents — when the transaction
+commits. `statement_timeout` (and a pooler's query timeout) covers that
+`COMMIT`; a cancel (`57014`) is not caught by the flush's failure handling,
+so it aborts the `COMMIT` and rolls back the job's writes instead of marking
+the IMV `known_stale`. A job that TRUNCATEs and reloads a source of a large
+IMV should run `SET LOCAL statement_timeout = 0` in that transaction. The
+rebuild diff of an IMV with dependents stages rows in a temporary table, so
+a transaction that runs one cannot `PREPARE TRANSACTION` (two-phase commit);
+filed with the keyless whole-row diff's two full sorts of the target.
 
 ### Tests
 

@@ -138,6 +138,33 @@ passthrough `INSERT`) keep working. Keep the window short:
     `reflex_ivm_status()` reports `known_stale` (a DEFERRED IMV whose source
     was truncated during the window).
 
+### Rebuilds at COMMIT in 1.11.5
+
+Two operations now do a full rebuild of a DEFERRED IMV inside `COMMIT`:
+a `TRUNCATE` of one of its sources, and a transaction writing two sources
+of a multi-source IMV (the cross-source guard). The rebuild reruns the base
+query and, when the IMV has dependents, diffs it into them, so on a large
+IMV the `COMMIT` can take minutes.
+
+- `statement_timeout`, and a connection pooler's query timeout,
+  apply to that `COMMIT`. A cancel is not caught by the flush's failure
+  handling (`pg_reflex.flush_failure_policy` does not apply): the `COMMIT`
+  aborts and the transaction's writes roll back. Jobs that TRUNCATE and
+  reload sources of large IMVs should disable the timeout for their
+  transaction:
+
+    ```sql
+    BEGIN;
+    SET LOCAL statement_timeout = 0;
+    TRUNCATE source_table;
+    INSERT INTO source_table ...;
+    COMMIT;
+    ```
+
+- The diff stages rows in a temporary table, so a transaction that
+  rebuilds an IMV with dependents (also via `reflex_reconcile`) cannot be
+  prepared with `PREPARE TRANSACTION`.
+
 ## After upgrade
 
 Run the smoke check:
