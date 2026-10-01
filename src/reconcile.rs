@@ -330,7 +330,7 @@ fn relation_present(client: &pgrx::spi::SpiClient<'_>, qualified: &str) -> bool 
 /// `ImvRow::is_decomposed_wrapper` takes (`Some(0)`, not NULL), and the opposite of
 /// `REBUILDABLE_NODE`, whose question ("may reconcile rewrite this?") wants the
 /// other default.
-fn is_decomposed_wrapper_row(view_name: &str) -> bool {
+pub(crate) fn is_decomposed_wrapper_row(view_name: &str) -> bool {
     Spi::connect(|client| {
         client
             .select(
