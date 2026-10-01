@@ -791,6 +791,58 @@ fn pg_drc_scoped_cascade_into_deferred_dependent_with_staged_deltas() {
     dmw_assert_fresh("drp5_d", &fresh);
 }
 
+/// A key-scoped cascade whose scoped rebuild fails falls back to a full
+/// reconcile: the rebuilt slice must not stay recorded, or a fallback that
+/// rebuilds nothing would leave the flush skipping deltas no rebuild reflects.
+/// (A row trigger on the dependent's intermediate, firing under the replica
+/// role the upstream's reconcile runs in, makes the scoped DELETE fail; the
+/// full reconcile empties it by TRUNCATE.)
+#[pg_test]
+fn pg_drc_failed_scoped_cascade_leaves_no_slice_record() {
+    drc_build_partitioned_source("drp8");
+    create_imv(
+        "drp8_u",
+        "SELECT create_reflex_ivm('drp8_u', 'SELECT plan, id, qty FROM drp8_s', 'plan, id', \
+         NULL, 'IMMEDIATE', NULL, ARRAY['plan'])",
+    );
+    let sql = "SELECT plan, SUM(qty) AS q, COUNT(*) AS n FROM drp8_u GROUP BY plan";
+    create_imv(
+        "drp8_d",
+        &format!(
+            "SELECT create_reflex_ivm('drp8_d', {}, NULL, NULL, 'DEFERRED', NULL, \
+             ARRAY[]::text[])",
+            sql_lit(sql)
+        ),
+    );
+    dmw_force_incremental("drp8_d");
+    let fresh = sql.replace("drp8_u", "drp8_s");
+    Spi::run(
+        "CREATE FUNCTION drp8_refuse_delete() RETURNS trigger LANGUAGE plpgsql AS \
+         $$ BEGIN RAISE EXCEPTION 'drp8: scoped delete refused'; END $$",
+    )
+    .expect("refusing trigger fn");
+    Spi::run(
+        "CREATE TRIGGER drp8_refuse BEFORE DELETE ON __reflex_intermediate_drp8_d \
+         FOR EACH ROW EXECUTE FUNCTION drp8_refuse_delete()",
+    )
+    .expect("refusing trigger");
+    Spi::run("ALTER TABLE __reflex_intermediate_drp8_d ENABLE ALWAYS TRIGGER drp8_refuse")
+        .expect("fires under replica");
+
+    Spi::run("INSERT INTO drp8_s VALUES (2, 100, 1000)").expect("staged on drp8_u, plan 2");
+    Spi::run("INSERT INTO drp8_s VALUES (1, 100, 500)").expect("staged on drp8_u, plan 1");
+    Spi::run("SET LOCAL session_replication_role = replica").expect("replica");
+    drc_reconcile_partition("drp8_u", "2");
+    Spi::run("SET LOCAL session_replication_role = origin").expect("origin");
+    assert!(
+        !drc_scoped_recorded("drp8_d"),
+        "drp8_d's failed key-scoped rebuild left its slice recorded"
+    );
+    Spi::run("INSERT INTO drp8_s VALUES (2, 101, 7)").expect("staged after");
+    Spi::run("SET CONSTRAINTS ALL IMMEDIATE").expect("commit-time flush");
+    dmw_assert_fresh("drp8_d", &fresh);
+}
+
 /// The flush of a DEFERRED partitioned IMV's own delta rebuilds a hot partition
 /// (partition-aware dispatch) while that delta is still staged: the flush
 /// consumes it, so the rebuild neither needs a watermark nor a COMMIT-time full
