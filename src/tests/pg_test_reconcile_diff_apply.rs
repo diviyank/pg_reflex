@@ -312,7 +312,6 @@ fn rda_build_partitioned(prefix: &str) {
 /// P1 — whole-IMV reconcile of a partitioned IMV: an aggregate dependent sees
 /// only the drifted group change, not a rebuild.
 #[pg_test]
-#[ignore = "Task 7: partitioned leaf diff"]
 fn pg_rda_partitioned_reconcile_reaches_aggregate_dependent_as_delta() {
     rda_build_partitioned("rdp1");
     let dep_sql =
@@ -338,7 +337,6 @@ fn pg_rda_partitioned_reconcile_reaches_aggregate_dependent_as_delta() {
 /// P2 — partition-scoped reconcile: a dependent partitioned on the same column
 /// receives the drifted row, not a refill of the partition.
 #[pg_test]
-#[ignore = "Task 7: partitioned leaf diff"]
 fn pg_rda_partition_reconcile_reaches_partitioned_dependent_as_delta() {
     rda_build_partitioned("rdp2");
     create_imv(
@@ -372,6 +370,9 @@ fn pg_rda_partition_reconcile_reaches_partitioned_dependent_as_delta() {
 #[pg_test]
 fn pg_rda_partitioned_reconcile_still_refreshes_ignoring_dependent() {
     rda_build_partitioned("rdp3");
+    // Drift BEFORE the dependents exist so they materialise the drifted rows;
+    // only the reconcile's cascade can then correct the ignoring one.
+    Spi::run("UPDATE rdp3_up SET qty = qty + 1000 WHERE plan = 2 AND id = 7").expect("drift");
     let dep_sql = "SELECT plan, SUM(qty) AS q FROM rdp3_up GROUP BY plan";
     create_imv(
         "rdp3_dep",
@@ -381,7 +382,6 @@ fn pg_rda_partitioned_reconcile_still_refreshes_ignoring_dependent() {
     );
     let fresh = "SELECT plan, SUM(qty) AS q FROM rdp3_src GROUP BY plan";
 
-    Spi::run("UPDATE rdp3_up SET qty = qty + 1000 WHERE plan = 2 AND id = 7").expect("drift");
     rda_reconcile("rdp3_up");
 
     assert_imv_correct("rdp3_up", "SELECT plan, id, product_id, qty FROM rdp3_src");
@@ -435,5 +435,320 @@ fn pg_rda_ignoring_and_observing_dependents_on_one_rebuild() {
     assert!(
         (1..=RDA_DIFF_STATEMENTS * key_rows).contains(&rows_rewritten_since("rdi1_obs", boundary)),
         "observing dependent must get the diff only, not a cascade rebuild"
+    );
+}
+
+/// Review focus #2: rebuild rows outside the leaf are never written into it.
+#[pg_test]
+fn pg_rda_partition_leaf_rebuild_stays_in_leaf() {
+    rda_build_partitioned("rdp4");
+    create_imv("rdp4_dep", "SELECT create_reflex_ivm('rdp4_dep', 'SELECT plan, id, qty FROM rdp4_up', 'plan, id', NULL, 'IMMEDIATE', NULL, ARRAY['plan'])");
+    Spi::run("UPDATE rdp4_up SET qty = qty + 1 WHERE plan = 2 AND id = 3").expect("drift");
+    let res = Spi::get_one::<String>("SELECT reflex_reconcile_partition('rdp4_up', '2')")
+        .unwrap()
+        .unwrap();
+    assert!(res.starts_with("RECONCILED"), "{res}");
+    for p in [1, 3] {
+        let n = Spi::get_one::<i64>(&format!(
+            "SELECT count(*)::int8 FROM rdp4_up WHERE plan = {p}"
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(n, 100, "plan {p} touched by a plan-2 rebuild");
+    }
+    assert_imv_correct("rdp4_up", "SELECT plan, id, product_id, qty FROM rdp4_src");
+    assert_imv_correct("rdp4_dep", "SELECT plan, id, qty FROM rdp4_src");
+}
+
+/// ATTACH of a brand-new source partition keeps today's behaviour: dependents correct.
+#[pg_test]
+fn pg_rda_partition_attach_new_plan_unchanged() {
+    rda_build_partitioned("rdp5");
+    create_imv("rdp5_dep", "SELECT create_reflex_ivm('rdp5_dep', 'SELECT plan, SUM(qty) AS q FROM rdp5_up GROUP BY plan', NULL, NULL, 'IMMEDIATE', NULL, ARRAY['plan'])");
+    Spi::run("CREATE TABLE rdp5_src_p4 (LIKE rdp5_src)").expect("new");
+    Spi::run("INSERT INTO rdp5_src_p4 SELECT 4, g, g % 10, g FROM generate_series(1, 100) g")
+        .expect("fill");
+    Spi::run("ALTER TABLE rdp5_src ATTACH PARTITION rdp5_src_p4 FOR VALUES IN (4)")
+        .expect("attach");
+    Spi::run("SELECT reflex_flush_partitions()").expect("flush partitions");
+    assert_imv_correct("rdp5_up", "SELECT plan, id, product_id, qty FROM rdp5_src");
+    assert_imv_correct(
+        "rdp5_dep",
+        "SELECT plan, SUM(qty) AS q FROM rdp5_src GROUP BY plan",
+    );
+}
+
+/// Review focus #3 (partitioned): on one partitioned rebuild the observing
+/// dependent gets the diff only, the ignoring one is refreshed by the cascade.
+#[pg_test]
+fn pg_rda_partitioned_reconcile_observing_and_ignoring_dependents() {
+    rda_build_partitioned("rdp6");
+    // Drift BEFORE the dependents exist so they materialise the drifted rows;
+    // only the reconcile's cascade can then correct the ignoring one.
+    Spi::run("UPDATE rdp6_up SET qty = qty + 1000 WHERE plan = 2 AND id = 7").expect("drift");
+    let dep_sql = "SELECT plan, SUM(qty) AS q FROM rdp6_up GROUP BY plan";
+    create_imv(
+        "rdp6_dep",
+        &format!(
+            "SELECT create_reflex_ivm('rdp6_dep', '{dep_sql}', NULL, NULL, 'IMMEDIATE', '!rdp6_up', ARRAY['plan'])"
+        ),
+    );
+    create_imv(
+        "rdp6_obs",
+        &format!(
+            "SELECT create_reflex_ivm('rdp6_obs', '{dep_sql}', NULL, NULL, 'IMMEDIATE', NULL, ARRAY['plan'])"
+        ),
+    );
+    let fresh = "SELECT plan, SUM(qty) AS q FROM rdp6_src GROUP BY plan";
+
+    let boundary = cmin_boundary("rdp6_obs");
+    rda_reconcile("rdp6_up");
+    let rewritten = rows_rewritten_since("rdp6_obs", boundary);
+
+    assert_imv_correct("rdp6_up", "SELECT plan, id, product_id, qty FROM rdp6_src");
+    assert_imv_correct("rdp6_dep", fresh);
+    assert_imv_correct("rdp6_obs", fresh);
+    assert!(
+        (1..=RDA_DIFF_STATEMENTS).contains(&rewritten),
+        "observing dependent must get the diff only, not a cascade rebuild: rewritten {}",
+        rewritten
+    );
+}
+
+/// A whole-IMV reconcile over a tree with an EMPTY leaf that stays empty
+/// changed nothing in that leaf, so it must not demote the reconcile to a full
+/// cascade: the observing dependent still sees only the drifted group.
+#[pg_test]
+fn pg_rda_partitioned_reconcile_with_empty_leaf_reaches_dependent_as_delta() {
+    Spi::run(
+        "CREATE TABLE rdp7_src (plan INT NOT NULL, id INT NOT NULL, product_id INT NOT NULL, \
+         qty INT) PARTITION BY LIST (plan)",
+    )
+    .expect("src");
+    for plan in [1, 2, 3, 4] {
+        Spi::run(&format!(
+            "CREATE TABLE rdp7_src_p{plan} PARTITION OF rdp7_src FOR VALUES IN ({plan})"
+        ))
+        .expect("src partition");
+    }
+    Spi::run(
+        "INSERT INTO rdp7_src SELECT p, g, g % 10, g \
+         FROM generate_series(1, 100) g CROSS JOIN (VALUES (1), (2), (3)) v(p)",
+    )
+    .expect("seed src, plan 4 left empty");
+    create_imv(
+        "rdp7_up",
+        "SELECT create_reflex_ivm('rdp7_up', 'SELECT plan, id, product_id, qty FROM rdp7_src', \
+         'plan, id', NULL, 'IMMEDIATE', NULL, ARRAY['plan'])",
+    );
+    let dep_sql =
+        "SELECT product_id, SUM(qty) AS q, COUNT(*) AS n FROM rdp7_up GROUP BY product_id";
+    let res = crate::create_reflex_ivm("rdp7_dep", dep_sql, None, None, None, None);
+    assert_eq!(res, "CREATE REFLEX INCREMENTAL VIEW");
+    let fresh = "SELECT product_id, SUM(qty) AS q, COUNT(*) AS n FROM rdp7_src GROUP BY product_id";
+
+    Spi::run("UPDATE rdp7_up SET qty = qty + 1000 WHERE plan = 2 AND id = 7").expect("drift");
+    let boundary = cmin_boundary("rdp7_dep");
+    rda_reconcile("rdp7_up");
+    let rewritten = rows_rewritten_since("rdp7_dep", boundary);
+
+    assert_imv_correct("rdp7_up", "SELECT plan, id, product_id, qty FROM rdp7_src");
+    assert_imv_correct("rdp7_dep", fresh);
+    assert!(
+        (1..=RDA_DIFF_STATEMENTS).contains(&rewritten),
+        "an empty leaf must not force a full cascade: rewritten {}",
+        rewritten
+    );
+}
+
+/// A partitioned AGGREGATE IMV (intermediate + end_query) rebuilds its
+/// populated leaf through the diff too: the dependent sees the drifted group.
+#[pg_test]
+fn pg_rda_partitioned_aggregate_reconcile_reaches_dependent_as_delta() {
+    rda_build_partitioned("rdp8");
+    create_imv(
+        "rdp8_agg",
+        "SELECT create_reflex_ivm('rdp8_agg', \
+         'SELECT plan, product_id, SUM(qty) AS q FROM rdp8_src GROUP BY plan, product_id', \
+         NULL, NULL, 'IMMEDIATE', NULL, ARRAY['plan'])",
+    );
+    let res = crate::create_reflex_ivm(
+        "rdp8_dep",
+        "SELECT product_id, SUM(q) AS q FROM rdp8_agg GROUP BY product_id",
+        None,
+        None,
+        None,
+        None,
+    );
+    assert_eq!(res, "CREATE REFLEX INCREMENTAL VIEW");
+
+    Spi::run("UPDATE rdp8_agg SET q = q + 1000 WHERE plan = 2 AND product_id = 7").expect("drift");
+    let boundary = cmin_boundary("rdp8_dep");
+    rda_reconcile("rdp8_agg");
+    let rewritten = rows_rewritten_since("rdp8_dep", boundary);
+
+    assert_imv_correct(
+        "rdp8_agg",
+        "SELECT plan, product_id, SUM(qty) AS q FROM rdp8_src GROUP BY plan, product_id",
+    );
+    assert_imv_correct(
+        "rdp8_dep",
+        "SELECT product_id, SUM(qty) AS q FROM rdp8_src GROUP BY product_id",
+    );
+    assert!(
+        (1..=RDA_DIFF_STATEMENTS).contains(&rewritten),
+        "aggregate dependent must receive the one-group delta: rewritten {}",
+        rewritten
+    );
+}
+
+/// Two-level mirror: the leaf diff is scoped by the leaf's FULL constraint
+/// (both levels), so sibling leaves stay untouched and the dependent sees the
+/// drifted row only.
+#[pg_test]
+fn pg_rda_two_level_leaf_rebuild_reaches_dependent_as_delta() {
+    Spi::run(
+        "CREATE TABLE rdp9_src (plan INT NOT NULL, region INT NOT NULL, id INT NOT NULL, \
+         qty INT) PARTITION BY LIST (plan)",
+    )
+    .expect("src");
+    for plan in [1, 2] {
+        Spi::run(&format!(
+            "CREATE TABLE rdp9_src_p{plan} PARTITION OF rdp9_src FOR VALUES IN ({plan}) \
+             PARTITION BY LIST (region)"
+        ))
+        .expect("branch");
+        for region in [1, 2] {
+            Spi::run(&format!(
+                "CREATE TABLE rdp9_src_p{plan}_r{region} PARTITION OF rdp9_src_p{plan} \
+                 FOR VALUES IN ({region})"
+            ))
+            .expect("leaf");
+        }
+    }
+    Spi::run(
+        "INSERT INTO rdp9_src SELECT p, r, g, g FROM generate_series(1, 50) g \
+         CROSS JOIN (VALUES (1), (2)) v(p) CROSS JOIN (VALUES (1), (2)) w(r)",
+    )
+    .expect("seed");
+    create_imv(
+        "rdp9_up",
+        "SELECT create_reflex_ivm('rdp9_up', 'SELECT plan, region, id, qty FROM rdp9_src', \
+         'plan, region, id', NULL, 'IMMEDIATE', NULL, ARRAY['plan', 'region'])",
+    );
+    let res = crate::create_reflex_ivm(
+        "rdp9_dep",
+        "SELECT region, SUM(qty) AS q, COUNT(*) AS n FROM rdp9_up GROUP BY region",
+        None,
+        None,
+        None,
+        None,
+    );
+    assert_eq!(res, "CREATE REFLEX INCREMENTAL VIEW");
+
+    Spi::run("UPDATE rdp9_up SET qty = qty + 1000 WHERE plan = 2 AND region = 1 AND id = 7")
+        .expect("drift");
+    let up_boundary = cmin_boundary("rdp9_up");
+    let boundary = cmin_boundary("rdp9_dep");
+    rda_reconcile("rdp9_up");
+
+    assert_imv_correct("rdp9_up", "SELECT plan, region, id, qty FROM rdp9_src");
+    assert_imv_correct(
+        "rdp9_dep",
+        "SELECT region, SUM(qty) AS q, COUNT(*) AS n FROM rdp9_src GROUP BY region",
+    );
+    assert_eq!(
+        rows_rewritten_since("rdp9_up", up_boundary),
+        1,
+        "only the drifted row of leaf (2, 1) is rewritten"
+    );
+    let rewritten = rows_rewritten_since("rdp9_dep", boundary);
+    assert!(
+        (1..=RDA_DIFF_STATEMENTS).contains(&rewritten),
+        "dependent must receive the one-row delta: rewritten {}",
+        rewritten
+    );
+}
+
+/// A DEFERRED observer of a partitioned rebuild must end exact. With
+/// `empty_plan_3` one leaf is emptied behind the IMV's back, so the rebuild
+/// refills it in place (invisible to the dependent) while plan 2 drifted: a
+/// mix of diffed and refilled leaves would cascade a full rebuild into the
+/// observer while the diff is still staged for it, applying it twice.
+fn rda_partitioned_deferred_observer_case(prefix: &str, empty_plan_3: bool) {
+    rda_build_partitioned(prefix);
+    let dep_sql = format!(
+        "SELECT product_id, SUM(qty) AS q, COUNT(*) AS n FROM {prefix}_up GROUP BY product_id"
+    );
+    let res = crate::create_reflex_ivm(
+        &format!("{prefix}_dep"),
+        &dep_sql,
+        None,
+        None,
+        Some("DEFERRED"),
+        None,
+    );
+    assert_eq!(res, "CREATE REFLEX INCREMENTAL VIEW");
+
+    Spi::run(&format!(
+        "UPDATE {prefix}_up SET qty = qty + 1000 WHERE plan = 2 AND id = 7"
+    ))
+    .expect("drift");
+    if empty_plan_3 {
+        Spi::run(&format!("ALTER TABLE {prefix}_up DISABLE TRIGGER USER")).expect("disable");
+        Spi::run(&format!("DELETE FROM {prefix}_up WHERE plan = 3")).expect("empty plan 3");
+        Spi::run(&format!("ALTER TABLE {prefix}_up ENABLE TRIGGER USER")).expect("enable");
+    }
+    Spi::run(&format!("SELECT reflex_flush_deferred('{prefix}_up')")).expect("flush drift");
+    rda_reconcile(&format!("{prefix}_up"));
+    Spi::run(&format!("SELECT reflex_flush_deferred('{prefix}_up')")).expect("flush reconcile");
+
+    assert_imv_correct(
+        &format!("{prefix}_up"),
+        &format!("SELECT plan, id, product_id, qty FROM {prefix}_src"),
+    );
+    assert_imv_correct(
+        &format!("{prefix}_dep"),
+        &format!(
+            "SELECT product_id, SUM(qty) AS q, COUNT(*) AS n FROM {prefix}_src GROUP BY product_id"
+        ),
+    );
+}
+
+#[pg_test]
+fn pg_rda_partitioned_reconcile_deferred_observer_exact() {
+    rda_partitioned_deferred_observer_case("rdpa", false);
+}
+
+#[pg_test]
+fn pg_rda_partitioned_mixed_rebuild_deferred_observer_exact() {
+    rda_partitioned_deferred_observer_case("rdpb", true);
+}
+
+/// P3 through `reflex_reconcile_partition`: the partition-scoped cascade
+/// still refreshes a dependent that IGNORES the reconciled IMV.
+#[pg_test]
+fn pg_rda_partition_reconcile_still_refreshes_ignoring_dependent() {
+    rda_build_partitioned("rdpc");
+    // Drift BEFORE the dependents exist so they materialise the drifted rows;
+    // only the reconcile's cascade can then correct the ignoring one.
+    Spi::run("UPDATE rdpc_up SET qty = qty + 1000 WHERE plan = 2 AND id = 7").expect("drift");
+    let dep_sql = "SELECT plan, SUM(qty) AS q FROM rdpc_up GROUP BY plan";
+    create_imv(
+        "rdpc_dep",
+        &format!(
+            "SELECT create_reflex_ivm('rdpc_dep', '{dep_sql}', NULL, NULL, 'IMMEDIATE', '!rdpc_up', ARRAY['plan'])"
+        ),
+    );
+
+    let res = Spi::get_one::<String>("SELECT reflex_reconcile_partition('rdpc_up', '2')")
+        .expect("reconcile_partition")
+        .expect("result");
+    assert!(res.starts_with("RECONCILED"), "{res}");
+
+    assert_imv_correct("rdpc_up", "SELECT plan, id, product_id, qty FROM rdpc_src");
+    assert_imv_correct(
+        "rdpc_dep",
+        "SELECT plan, SUM(qty) AS q FROM rdpc_src GROUP BY plan",
     );
 }

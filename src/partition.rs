@@ -2129,26 +2129,29 @@ pub(crate) fn reflex_reconcile_partition_impl(
         // Process each child via the shared atomic DETACH/ATTACH swap
         // helper.  The intermediate is swapped before the target so the
         // target's `end_query` fill reads the fresh intermediate.
-        for child_bare in &to_process {
-            // Recover the source bare-child name from the target bare-
-            // child name (target = "<bare_view>_<src_child>" per
-            // `target_child_name`).
-            let (_, view_bare) = split_qualified_name(view_name);
-            let src_child_bare = child_bare
-                .strip_prefix(&format!("{}_", view_bare))
-                .unwrap_or(child_bare)
-                .to_string();
-            execute_partition_swap_for_child(
-                client,
-                view_name,
-                &schema,
-                &src_child_bare,
-                &base_query,
-                &end_query,
-                unlogged,
-            )
-            .map_err(|e| format!("reconcile_partition: {}", e))?;
-        }
+        // Recover each source bare-child name from the target bare-child name
+        // (target = "<bare_view>_<src_child>" per `target_child_name`).
+        let (_, view_bare) = split_qualified_name(view_name);
+        let src_children: Vec<String> = to_process
+            .iter()
+            .map(|child_bare| {
+                child_bare
+                    .strip_prefix(&format!("{}_", view_bare))
+                    .unwrap_or(child_bare)
+                    .to_string()
+            })
+            .collect();
+        let all_diffed = rebuild_mirror_leaves(
+            client,
+            view_name,
+            &schema,
+            &src_children,
+            &base_query,
+            &end_query,
+            unlogged,
+            true,
+        )
+        .map_err(|(_, e)| format!("reconcile_partition: {}", e))?;
 
         // Update last_update_date.
         let _ = client.update(
@@ -2182,6 +2185,14 @@ pub(crate) fn reflex_reconcile_partition_impl(
                 }
             }
             set.into_iter().collect()
+        };
+
+        // Observing dependents already received every leaf's change as DML when
+        // all leaves were diffed; only the ignoring ones still need a refresh.
+        let children: Vec<String> = if all_diffed && origin_triggers_fire(client) {
+            crate::reconcile::ignoring_dependents(view_name)
+        } else {
+            children
         };
 
         // Cascade to dependents.  Resolve each dependent's own metadata:
@@ -2247,17 +2258,47 @@ pub(crate) fn reflex_reconcile_partition_impl(
             // The SQL entry point splits keys on commas and trims each one, so a key
             // that is empty, contains a comma or has edge whitespace cannot cross it
             // unchanged; such a dependent takes the full reconcile below.
-            let keys_survive_csv = partition_keys
-                .iter()
-                .all(|k| !k.is_empty() && !k.contains(',') && k.trim() == k);
-            if same_part && keys_survive_csv {
-                let q = format!(
-                    "SELECT public.reflex_reconcile_partition({}, {})",
-                    sql_literal_text(child),
-                    sql_literal_text(&partition_keys.join(","))
-                );
-                let _ = client.update(&q, None, &[]);
-            } else if let Some(scoped) = build_scoped_cascade_reconcile(
+            //
+            // Called by source partition (ATTACH / flush), `partition_keys` is
+            // empty, and the same-column dependent is reconciled by the rebuilt
+            // children instead: they are its source partitions, so this reaches
+            // exactly the slices that mirror them, emptied ones included.
+            let same_part_call = if !partition_keys.is_empty() {
+                partition_keys
+                    .iter()
+                    .all(|k| !k.is_empty() && !k.contains(',') && k.trim() == k)
+                    .then(|| {
+                        format!(
+                            "SELECT public.reflex_reconcile_partition({}, {})",
+                            sql_literal_text(child),
+                            sql_literal_text(&partition_keys.join(","))
+                        )
+                    })
+            } else {
+                let rebuilt: Vec<String> = to_process
+                    .iter()
+                    .map(|c| format!("{}.{}", schema, c))
+                    .collect();
+                rebuilt.iter().all(|c| !c.contains(',')).then(|| {
+                    format!(
+                        "SELECT public.reflex_reconcile_partition({}, '', {})",
+                        sql_literal_text(child),
+                        sql_literal_text(&rebuilt.join(","))
+                    )
+                })
+            };
+            let same_part_reconciled = match (same_part, same_part_call) {
+                (true, Some(q)) => client
+                    .update(&q, None, &[])
+                    .ok()
+                    .and_then(|rows| rows.first().get_one::<&str>().ok().flatten())
+                    .is_some_and(|r| r.starts_with("RECONCILED")),
+                _ => false,
+            };
+            if same_part_reconciled {
+                continue;
+            }
+            if let Some(scoped) = build_scoped_cascade_reconcile(
                 child,
                 part_col,
                 &affected_keys,
@@ -2374,6 +2415,94 @@ fn build_scoped_cascade_reconcile(
     ))
 }
 
+/// Whether IMV maintenance triggers (enabled `ORIGIN`, the default) fire under
+/// the current `session_replication_role` — i.e. whether a diff written
+/// through a target reached its observing dependents.
+pub(crate) fn origin_triggers_fire(client: &pgrx::spi::SpiClient<'_>) -> bool {
+    client
+        .select(
+            "SELECT current_setting('session_replication_role') IN ('origin', 'local') AS fire",
+            Some(1),
+            &[],
+        )
+        .ok()
+        .and_then(|mut it| it.next())
+        .and_then(|r| r.get_by_name::<bool, _>("fire").ok().flatten())
+        .unwrap_or(false)
+}
+
+/// A populated, non-fresh mirror leaf of a target whose writes reach a
+/// dependent: the leaves `swap_partition_child_ddl` rebuilds as a row diff.
+fn leaf_is_diffable(
+    client: &pgrx::spi::SpiClient<'_>,
+    view_name: &str,
+    tgt_child_qual: &str,
+    tgt_def: &str,
+) -> bool {
+    !tgt_def.is_empty()
+        && relation_has_rows(client, tgt_child_qual)
+        && !is_fresh_partition(client, tgt_child_qual)
+        && crate::rebuild_diff::target_propagates(client, view_name)
+}
+
+/// Rebuild the mirror leaves of `view_name` that mirror `src_children`, and
+/// report whether EVERY one reached the dependents as DML
+/// ([`SwapOutcome::Diffed`]) — the caller then cascades only to the ignoring
+/// dependents.
+///
+/// The leaves that must be swapped or filled behind the root (empty, fresh, or
+/// a target nothing observes) go first. Only when none of them changed
+/// anything are the populated leaves diffed; otherwise they are swapped too.
+/// A mix would be wrong: the caller's full cascade rebuilds a DEFERRED
+/// observer from scratch while the diffed leaves' rows are still staged for
+/// it, and the COMMIT flush applies them a second time.
+///
+/// `allow_diff = false` swaps every leaf (and so reports `false`).
+///
+/// Errors carry the source child they occurred on.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn rebuild_mirror_leaves(
+    client: &mut pgrx::spi::SpiClient<'_>,
+    view_name: &str,
+    schema: &str,
+    src_children: &[String],
+    base_query: &str,
+    end_query: &str,
+    unlogged: bool,
+    allow_diff: bool,
+) -> Result<bool, (String, String)> {
+    let (diffable, behind_root): (Vec<&String>, Vec<&String>) =
+        src_children.iter().partition(|src| {
+            let tgt_bare = target_child_name(view_name, src);
+            leaf_is_diffable(
+                client,
+                view_name,
+                &schema_prefix(view_name, &tgt_bare),
+                &read_partition_constraint_def(client, schema, &tgt_bare),
+            )
+        });
+    let mut all_diffed = allow_diff;
+    for src in behind_root.into_iter().chain(diffable) {
+        let outcome = execute_partition_swap_for_child(
+            client, view_name, schema, src, base_query, end_query, unlogged, all_diffed,
+        )
+        .map_err(|e| (src.clone(), e))?;
+        all_diffed &= outcome == SwapOutcome::Diffed;
+    }
+    Ok(all_diffed)
+}
+
+/// How one mirror leaf was rebuilt, which decides what its dependents still need.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SwapOutcome {
+    /// Every change to the leaf went through the root as DML its observing
+    /// dependents received (a row diff, or an empty leaf that stayed empty).
+    Diffed,
+    /// The leaf was swapped or filled behind the root's statement triggers:
+    /// no dependent learned what changed.
+    Swapped,
+}
+
 /// Execute the per-child atomic DETACH/ATTACH swap.  Shared between
 /// `reflex_reconcile_partition_impl` (partition-scoped) and the global
 /// partition-aware path in `reconcile::reflex_reconcile` (rebuilds every
@@ -2382,6 +2511,11 @@ fn build_scoped_cascade_reconcile(
 /// `src_child_bare` is the source-child's bare relname; the intermediate
 /// and target child names are derived from it.  Reads each child's
 /// bound + constraint def live from `pg_class` / `pg_get_partition_*`.
+///
+/// `allow_diff` lets a populated leaf of a target with dependents be rebuilt as
+/// a row diff through the root instead of swapped; callers decide it across
+/// all the leaves of one rebuild ([`rebuild_mirror_leaves`]). The outcome says
+/// which happened.
 ///
 /// Returns Err(message) on any DDL failure. `Spi::connect_mut` is not a
 /// sub-transaction, so it is the CALLER that owns rolling those partial swaps
@@ -2409,6 +2543,7 @@ fn build_scoped_cascade_reconcile(
 /// variant — both of which are **oracle** tests. The sub-partition path produces
 /// oracle-detectable divergence, not merely stale rows. Anyone narrowing,
 /// moving, or conditionalising this bracket must re-run those three.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn execute_partition_swap_for_child(
     client: &mut pgrx::spi::SpiClient<'_>,
     view_name: &str,
@@ -2417,7 +2552,8 @@ pub(crate) fn execute_partition_swap_for_child(
     base_query: &str,
     end_query: &str,
     unlogged: bool,
-) -> Result<(), String> {
+    allow_diff: bool,
+) -> Result<SwapOutcome, String> {
     set_internal_swap_root(client, Some(view_name));
     let result = swap_partition_child_ddl(
         client,
@@ -2427,6 +2563,7 @@ pub(crate) fn execute_partition_swap_for_child(
         base_query,
         end_query,
         unlogged,
+        allow_diff,
     );
     set_internal_swap_root(client, None);
     result
@@ -2456,7 +2593,8 @@ fn swap_partition_child_ddl(
     base_query: &str,
     end_query: &str,
     unlogged: bool,
-) -> Result<(), String> {
+    allow_diff: bool,
+) -> Result<SwapOutcome, String> {
     let int_parent = intermediate_table_name(view_name);
     let tgt_parent = quote_identifier(view_name);
     let int_child_bare = intermediate_child_name(view_name, src_child_bare);
@@ -2545,6 +2683,60 @@ fn swap_partition_child_ddl(
     } else {
         count_rows(client, &tgt_child_qual_probe)
     };
+    let tgt_propagates = crate::rebuild_diff::target_propagates(client, view_name);
+    // A populated leaf of an IMV that other IMVs read is rebuilt as a row diff
+    // written through the root, so its dependents receive exactly the rows that
+    // changed. The swap and the in-place fill below are DDL / direct child
+    // writes that no root statement trigger sees, which forces a full cascade
+    // into every dependent. An EMPTY or FRESH leaf (ATTACH, new plan) keeps that
+    // path: there is nothing in it a dependent could have derived from.
+    if allow_diff && leaf_is_diffable(client, view_name, &tgt_child_qual_probe, &tgt_def) {
+        if !end_query.is_empty() {
+            let (fill_int, _) = build_inplace_partition_fill(
+                &int_child_qual_probe,
+                &tgt_child_qual_probe,
+                &int_def,
+                &tgt_def,
+                base_query,
+                end_query,
+            );
+            client
+                .update(&format!("TRUNCATE {}", int_child_qual_probe), None, &[])
+                .map_err(|e| format!("truncate int child for diff: {}", e))?;
+            if let Some(fill) = fill_int {
+                client
+                    .update(&fill, None, &[])
+                    .map_err(|e| format!("refill int child for diff: {}", e))?;
+            }
+            let _ = client.update(&format!("ANALYZE {}", int_child_qual_probe), None, &[]);
+        }
+        let rebuild_sql = if end_query.is_empty() {
+            base_query
+        } else {
+            end_query
+        };
+        crate::rebuild_diff::rebuild_target_rows(
+            client,
+            view_name,
+            rebuild_sql,
+            &crate::rebuild_diff::RebuildScope::Leaf {
+                leaf_qual: tgt_child_qual_probe.clone(),
+                constraint: tgt_def.clone(),
+                partition_columns: constraint_columns(client, &tgt_child_qual_probe),
+            },
+        );
+        let rebuilt_at = clock_timestamp(client);
+        let rows_after = count_rows(client, &tgt_child_qual_probe);
+        log_slice_rebuild_if_changed(
+            client,
+            view_name,
+            &tgt_child_qual_probe,
+            rows_before_tgt,
+            rows_after,
+            rebuilt_at.as_deref(),
+        );
+        return Ok(SwapOutcome::Diffed);
+    }
     if (int_is_empty || int_is_fresh) && (tgt_is_empty || tgt_is_fresh) {
         let (fill_int, fill_tgt) = build_inplace_partition_fill(
             &int_child_qual_probe,
@@ -2584,7 +2776,13 @@ fn swap_partition_child_ddl(
             rows_after,
             rebuilt_at.as_deref(),
         );
-        return Ok(());
+        // An empty leaf that stayed empty changed nothing a dependent reads.
+        let stayed_empty = rows_before_tgt == Some(0) && rows_after == Some(0);
+        return Ok(if tgt_propagates && stayed_empty {
+            SwapOutcome::Diffed
+        } else {
+            SwapOutcome::Swapped
+        });
     }
 
     let src_child = PartitionChild {
@@ -2803,7 +3001,37 @@ fn swap_partition_child_ddl(
         rebuilt_at.as_deref(),
     );
 
-    Ok(())
+    Ok(SwapOutcome::Swapped)
+}
+
+/// Columns the leaf's partition constraint can reference: the partition keys
+/// of every ancestor level. `pg_get_partition_constraintdef` of a leaf states
+/// the FULL implied constraint (all levels), and the registry's
+/// `partition_columns` may name only the first level, so it is not used here.
+fn constraint_columns(client: &pgrx::spi::SpiClient<'_>, leaf_qual: &str) -> Vec<String> {
+    client
+        .select(
+            "SELECT DISTINCT a.attname::text AS col \
+             FROM pg_partition_ancestors(to_regclass($1)) anc \
+             JOIN pg_partitioned_table pt ON pt.partrelid = anc.relid \
+             CROSS JOIN LATERAL unnest(pt.partattrs::int2[]) k(attnum) \
+             JOIN pg_attribute a ON a.attrelid = pt.partrelid AND a.attnum = k.attnum \
+             WHERE k.attnum > 0",
+            None,
+            &[unsafe {
+                DatumWithOid::new(leaf_qual.to_string(), PgBuiltInOids::TEXTOID.oid().value())
+            }],
+        )
+        .map(|rows| {
+            rows.filter_map(|r| {
+                r.get_by_name::<&str, _>("col")
+                    .ok()
+                    .flatten()
+                    .map(str::to_string)
+            })
+            .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// SQL-quote a text literal — doubles embedded single quotes.
