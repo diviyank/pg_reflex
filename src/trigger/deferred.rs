@@ -116,29 +116,172 @@ fn temp_table_names(client: &pgrx::spi::SpiClient<'_>, table: &str) -> Vec<Strin
         .collect()
 }
 
-/// Rebuilds, once per transaction, each of `imvs` that a source TRUNCATE listed
-/// in `__reflex_deferred_rebuild` (`reflex_build_truncate_sql`), and records it in
+/// Commit-time rebuilds postponed while upstream DEFERRED IMVs are still pending,
+/// per IMV, before rebuilding anyway and marking the IMV stale.
+const TRUNCATE_REBUILD_MAX_DEFERRALS: i32 = 64;
+
+/// Whether an IMV upstream of `imv_name` (transitively, any mode) may still
+/// change in this transaction: a DEFERRED one with a staged delta on a source it
+/// does not ignore, or one still waiting for its own TRUNCATE rebuild. Pending
+/// rows with operation 'TRUNCATE' are flush requests, not staged deltas.
+fn upstream_pending(
+    client: &pgrx::spi::SpiClient<'_>,
+    imv_name: &str,
+    awaiting_rebuild: &[String],
+) -> bool {
+    client
+        .select(
+            "WITH RECURSIVE up(name) AS ( \
+               SELECT d FROM public.__reflex_ivm_reference r, unnest(r.depends_on) d \
+               WHERE r.name = $1 \
+               UNION \
+               SELECT d FROM up JOIN public.__reflex_ivm_reference r ON r.name = up.name \
+               CROSS JOIN LATERAL unnest(r.depends_on) d \
+             ) \
+             SELECT r.name::text AS name, EXISTS ( \
+                 SELECT 1 FROM unnest(r.depends_on) d \
+                 JOIN public.__reflex_deferred_pending p ON p.source_table = d \
+                 WHERE p.operation <> 'TRUNCATE' \
+                   AND NOT (COALESCE(r.ignored_sources, ARRAY[]::TEXT[]) \
+                            && ARRAY[d, regexp_replace(d, '^.*\\.', '')]) \
+               ) AS staged \
+             FROM up JOIN public.__reflex_ivm_reference r ON r.name = up.name \
+             WHERE r.enabled AND r.name <> $1 \
+               AND COALESCE(r.refresh_mode, 'IMMEDIATE') = 'DEFERRED'",
+            None,
+            &[unsafe {
+                DatumWithOid::new(imv_name.to_string(), PgBuiltInOids::TEXTOID.oid().value())
+            }],
+        )
+        .unwrap_or_report()
+        .any(|row| {
+            let staged = row
+                .get_by_name::<bool, _>("staged")
+                .unwrap_or(None)
+                .unwrap_or(false);
+            let name = row
+                .get_by_name::<String, _>("name")
+                .unwrap_or(None)
+                .unwrap_or_default();
+            staged || awaiting_rebuild.contains(&name)
+        })
+}
+
+/// Rebuilds, once per transaction, each IMV a source TRUNCATE listed in
+/// `__reflex_deferred_rebuild` (`reflex_build_truncate_sql`), and records it in
 /// `__reflex_deferred_reconciled_batch` so every delta staged for it in this
-/// transaction is skipped. Deltas applied to it before the rebuild are harmless:
-/// the rebuild starts from the base query. The rebuild is the one an IMMEDIATE
-/// dependent gets at TRUNCATE time, so its dependents receive a row diff. A
-/// failure marks the IMV stale (or aborts under `flush_failure_policy = error`).
-fn rebuild_truncated_dependents(
-    client: &mut pgrx::spi::SpiClient<'_>,
-    imvs: &[(String, String, String, String, Option<String>)],
-) -> usize {
-    let listed = temp_table_names(client, "__reflex_deferred_rebuild");
+/// transaction is skipped. Runs around every flush, whatever its source: the
+/// rebuild must read every upstream IMV in its final state, so while one may
+/// still change ([`upstream_pending`]) it is postponed, and the flush that
+/// settles the upstream runs this again. As a fallback a pending row is
+/// re-enqueued (bounded; on exhaustion it is rebuilt anyway and marked stale).
+/// Nested calls (a flush fired synchronously by a write of this pass, e.g. after
+/// `SET CONSTRAINTS ALL IMMEDIATE`) return at once. The rebuild is the one an
+/// IMMEDIATE dependent gets at TRUNCATE time, so its dependents receive a row
+/// diff. A failure marks the IMV stale (or aborts under
+/// `flush_failure_policy = error`). Limit: after a mid-transaction
+/// `SET CONSTRAINTS ALL IMMEDIATE` rebuilt it, later DML of the same transaction
+/// staged for it is skipped by the marker.
+fn rebuild_truncated_imvs(client: &mut pgrx::spi::SpiClient<'_>) -> usize {
+    let nested = client
+        .select(
+            "SELECT current_setting('pg_reflex.truncate_rebuild_running', true) = 'on'",
+            None,
+            &[],
+        )
+        .unwrap_or_report()
+        .first()
+        .get_one::<bool>()
+        .unwrap_or(None)
+        .unwrap_or(false);
+    if nested {
+        return 0;
+    }
+    let listed = listed_for_rebuild(client);
     if listed.is_empty() {
         return 0;
     }
-    let already_rebuilt = temp_table_names(client, "__reflex_deferred_reconciled_batch");
+    client
+        .update(
+            "SELECT set_config('pg_reflex.truncate_rebuild_running', 'on', true)",
+            None,
+            &[],
+        )
+        .unwrap_or_report();
+    let rebuilt = rebuild_listed(client, &listed);
+    client
+        .update(
+            "SELECT set_config('pg_reflex.truncate_rebuild_running', '', true)",
+            None,
+            &[],
+        )
+        .unwrap_or_report();
+    rebuilt
+}
+
+/// `__reflex_deferred_rebuild` in graph-depth order (upstream IMVs first).
+fn listed_for_rebuild(client: &pgrx::spi::SpiClient<'_>) -> Vec<String> {
+    if temp_table_names(client, "__reflex_deferred_rebuild").is_empty() {
+        return Vec::new();
+    }
+    client
+        .select(
+            "SELECT b.name FROM pg_temp.__reflex_deferred_rebuild b \
+             LEFT JOIN public.__reflex_ivm_reference r ON r.name = b.name \
+             ORDER BY r.graph_depth NULLS LAST, b.name",
+            None,
+            &[],
+        )
+        .unwrap_or_report()
+        .filter_map(|row| row.get_by_name::<String, _>("name").unwrap_or(None))
+        .collect()
+}
+
+fn rebuild_listed(client: &mut pgrx::spi::SpiClient<'_>, listed: &[String]) -> usize {
+    let mut already_rebuilt = temp_table_names(client, "__reflex_deferred_reconciled_batch");
     let fail_hard = flush_fail_hard(client);
     let mut rebuilt = 0usize;
-    for (imv_name, ..) in imvs {
-        if !listed.contains(imv_name) || already_rebuilt.contains(imv_name) {
+    for imv_name in listed {
+        if already_rebuilt.contains(imv_name) {
             continue;
         }
         let imv_esc = imv_name.replace('\'', "''");
+        let awaiting_rebuild: Vec<String> = listed
+            .iter()
+            .filter(|n| !already_rebuilt.contains(n))
+            .cloned()
+            .collect();
+        let upstream_moving = upstream_pending(client, imv_name, &awaiting_rebuild);
+        let enqueue = enqueue_truncate_flush_sql(imv_name);
+        if upstream_moving {
+            let attempts = client
+                .select(
+                    &format!(
+                        "SELECT attempts FROM pg_temp.__reflex_deferred_rebuild WHERE name = '{imv_esc}'"
+                    ),
+                    None,
+                    &[],
+                )
+                .unwrap_or_report()
+                .first()
+                .get_one::<i32>()
+                .unwrap_or(None)
+                .unwrap_or(0);
+            if let (true, Some(enqueue)) = (attempts < TRUNCATE_REBUILD_MAX_DEFERRALS, &enqueue) {
+                client
+                    .update(
+                        &format!(
+                            "UPDATE pg_temp.__reflex_deferred_rebuild SET attempts = attempts + 1 \
+                             WHERE name = '{imv_esc}'"
+                        ),
+                        None,
+                        &[],
+                    )
+                    .unwrap_or_report();
+                client.update(enqueue, None, &[]).unwrap_or_report();
+                continue;
+            }
+        }
         client
             .update(RECONCILED_BATCH_TABLE_DDL, None, &[])
             .unwrap_or_report();
@@ -152,12 +295,33 @@ fn rebuild_truncated_dependents(
                 &[],
             )
             .unwrap_or_report();
-        let Some(stmts) = truncate_rebuild_stmts(imv_name) else {
-            client
-                .update(&mark_stale_after_truncate_sql(imv_name), None, &[])
-                .unwrap_or_report();
-            continue;
+        already_rebuilt.push(imv_name.clone());
+        let mut stmts = match truncate_rebuild(imv_name) {
+            TruncateRebuild::Stmts(stmts) => stmts,
+            TruncateRebuild::Wrapper => continue,
+            TruncateRebuild::Unreadable => {
+                client
+                    .update(&mark_stale_after_truncate_sql(imv_name), None, &[])
+                    .unwrap_or_report();
+                continue;
+            }
         };
+        if upstream_moving {
+            pgrx::warning!(
+                "pg_reflex: IMV {} rebuilt after a source TRUNCATE while upstream DEFERRED IMVs \
+                 were still pending after {} deferrals; marking it stale",
+                imv_name,
+                TRUNCATE_REBUILD_MAX_DEFERRALS
+            );
+            stmts.push(format!(
+                "UPDATE public.__reflex_ivm_reference SET known_stale = TRUE, \
+                   stale_reason = 'rebuilt after a source TRUNCATE while upstream DEFERRED IMVs \
+                     still had pending changes ({TRUNCATE_REBUILD_MAX_DEFERRALS} deferrals \
+                     exhausted); run reflex_reconcile(''{imv_esc}'') to repair.', \
+                   stale_since = now() \
+                 WHERE name = '{imv_esc}'"
+            ));
+        }
         let body = stmts
             .iter()
             .map(|s| format!("{};", as_plpgsql_stmt(s)))
@@ -204,6 +368,15 @@ fn rebuild_truncated_dependents(
 /// to each DEFERRED IMV, then cleans up staging and pending rows.
 #[pg_extern]
 pub fn reflex_flush_deferred(source_table: &str) -> String {
+    // Before: a rebuilt IMV skips this flush's delta. After: this flush may have
+    // settled an upstream IMV a postponed rebuild was waiting for.
+    Spi::connect_mut(rebuild_truncated_imvs);
+    let flushed = flush_staged_deltas(source_table);
+    Spi::connect_mut(rebuild_truncated_imvs);
+    flushed
+}
+
+fn flush_staged_deltas(source_table: &str) -> String {
     let delta_tbl = staging_delta_table_name(source_table);
 
     // Read all DEFERRED IMVs that depend on this source. IMVs that listed this
@@ -294,11 +467,6 @@ pub fn reflex_flush_deferred(source_table: &str) -> String {
                 &[],
             )
             .unwrap_or_report();
-
-        // Before the staged delta is even looked at: a source TRUNCATE leaves its
-        // own staging delta empty, so the rebuild must not sit behind the
-        // empty-delta / spurious-update early returns below.
-        total_processed += rebuild_truncated_dependents(client, &imvs);
 
         // Check if staging table has any rows
         let has_rows = client

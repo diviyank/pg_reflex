@@ -506,3 +506,361 @@ fn pg_toj_deferred_truncate_rebuilds_when_first_source_ignored() {
     Spi::run("SET CONSTRAINTS ALL IMMEDIATE").expect("commit-time flush");
     assert_imv_correct("tjg_v", &sql);
 }
+
+fn build_upstream_rel(rel: &str) {
+    Spi::run(&format!(
+        "CREATE TABLE {rel} (product_id INT NOT NULL, location_id INT NOT NULL, \
+         is_active BOOL, PRIMARY KEY (product_id, location_id))"
+    ))
+    .expect("rel");
+    Spi::run(&format!(
+        "INSERT INTO {rel} SELECT p, l, (p + l) % 3 = 0 \
+         FROM generate_series(0, 3) p CROSS JOIN generate_series(0, 4) l"
+    ))
+    .expect("seed rel");
+}
+
+fn create_deferred_passthrough(name: &str, from: &str) {
+    assert_eq!(
+        crate::create_reflex_ivm(
+            name,
+            &format!("SELECT product_id, location_id, is_active FROM {from}"),
+            Some("product_id, location_id"),
+            None,
+            Some("DEFERRED"),
+            None
+        ),
+        "CREATE REFLEX INCREMENTAL VIEW"
+    );
+}
+
+/// `<prefix>_anchor LEFT JOIN <prefix>_act LEFT JOIN <upstream>`, and the same
+/// query reading the base table `<prefix>_rel` in place of the upstream IMV.
+fn upstream_join_sql(prefix: &str, upstream: &str) -> (String, String) {
+    let sql = format!(
+        "SELECT a.id, a.product_id, a.location_id, a.qty, \
+         COALESCE(c.is_active, FALSE) AS active, COALESCE(d.is_active, FALSE) AS d_active \
+         FROM {prefix}_anchor a LEFT JOIN {prefix}_act c \
+         ON c.product_id = a.product_id AND c.location_id = a.location_id \
+         LEFT JOIN {upstream} d ON d.product_id = a.product_id AND d.location_id = a.location_id"
+    );
+    let fresh = sql.replace(&format!("{upstream} d"), &format!("{prefix}_rel d"));
+    (sql, fresh)
+}
+
+/// The commit-time TRUNCATE rebuild of `imv` ran (it is in the batch marker) and
+/// did not fall back to rebuild-and-flag.
+fn assert_truncate_rebuilt(imv: &str) {
+    let rebuilt = Spi::get_one::<bool>(&format!(
+        "SELECT EXISTS (SELECT 1 FROM pg_temp.__reflex_deferred_reconciled_batch WHERE name = '{imv}')"
+    ))
+    .expect("batch marker")
+    .unwrap_or(false);
+    assert!(rebuilt, "the commit-time rebuild of {imv} never ran");
+    let stale = Spi::get_one::<bool>(&format!(
+        "SELECT known_stale FROM public.__reflex_ivm_reference WHERE name = '{imv}'"
+    ))
+    .expect("stale")
+    .unwrap_or(false);
+    assert!(!stale, "{imv} was flagged stale");
+}
+
+/// DEFERRED: the commit-time rebuild of a truncated source's dependent must see
+/// the final state of an upstream DEFERRED IMV that changes in the same
+/// transaction (production: sop_forecast_view LEFT JOINs the DEFERRED caav).
+#[pg_test]
+fn pg_toj_deferred_truncate_then_upstream_imv_change() {
+    build_toj_tables("rvw_anchor", "rvw_act");
+    build_upstream_rel("rvw_rel");
+    create_deferred_passthrough("rvw_d", "rvw_rel");
+    let (sql, fresh) = upstream_join_sql("rvw", "rvw_d");
+    assert_eq!(
+        crate::create_reflex_ivm("rvw_p", &sql, Some("id"), None, Some("DEFERRED"), None),
+        "CREATE REFLEX INCREMENTAL VIEW"
+    );
+    assert_imv_correct("rvw_p", &fresh);
+    Spi::run("TRUNCATE rvw_act").expect("truncate");
+    Spi::run("UPDATE rvw_rel SET is_active = NOT is_active").expect("upstream change");
+    Spi::run("SET CONSTRAINTS ALL IMMEDIATE").expect("commit-time flush");
+    assert_imv_correct(
+        "rvw_d",
+        "SELECT product_id, location_id, is_active FROM rvw_rel",
+    );
+    assert_imv_correct("rvw_p", &fresh);
+    assert_truncate_rebuilt("rvw_p");
+}
+
+/// Control: the same sequence with DELETE instead of TRUNCATE.
+#[pg_test]
+fn pg_toj_control_delete_then_upstream_imv_change() {
+    build_toj_tables("rvc_anchor", "rvc_act");
+    build_upstream_rel("rvc_rel");
+    create_deferred_passthrough("rvc_d", "rvc_rel");
+    let (sql, fresh) = upstream_join_sql("rvc", "rvc_d");
+    assert_eq!(
+        crate::create_reflex_ivm("rvc_p", &sql, Some("id"), None, Some("DEFERRED"), None),
+        "CREATE REFLEX INCREMENTAL VIEW"
+    );
+    assert_imv_correct("rvc_p", &fresh);
+    Spi::run("DELETE FROM rvc_act").expect("delete");
+    Spi::run("UPDATE rvc_rel SET is_active = NOT is_active").expect("upstream change");
+    Spi::run("SET CONSTRAINTS ALL IMMEDIATE").expect("commit-time flush");
+    assert_imv_correct(
+        "rvc_d",
+        "SELECT product_id, location_id, is_active FROM rvc_rel",
+    );
+    assert_imv_correct("rvc_p", &fresh);
+}
+
+/// Two upstream levels (rel → D1 → D2 → X): only D1's source is pending when X
+/// would first be rebuilt, so X's direct sources alone do not show the wait.
+#[pg_test]
+fn pg_toj_deferred_truncate_waits_for_two_level_upstream() {
+    build_toj_tables("rv2_anchor", "rv2_act");
+    build_upstream_rel("rv2_rel");
+    create_deferred_passthrough("rv2_d1", "rv2_rel");
+    create_deferred_passthrough("rv2_d2", "rv2_d1");
+    let (sql, fresh) = upstream_join_sql("rv2", "rv2_d2");
+    assert_eq!(
+        crate::create_reflex_ivm("rv2_p", &sql, Some("id"), None, Some("DEFERRED"), None),
+        "CREATE REFLEX INCREMENTAL VIEW"
+    );
+    assert_imv_correct("rv2_p", &fresh);
+    Spi::run("TRUNCATE rv2_act").expect("truncate");
+    Spi::run("UPDATE rv2_rel SET is_active = NOT is_active").expect("upstream change");
+    Spi::run("SET CONSTRAINTS ALL IMMEDIATE").expect("commit-time flush");
+    assert_imv_correct(
+        "rv2_d2",
+        "SELECT product_id, location_id, is_active FROM rv2_rel",
+    );
+    assert_imv_correct("rv2_p", &fresh);
+    assert_truncate_rebuilt("rv2_p");
+}
+
+/// The upstream IMV is itself waiting for a TRUNCATE rebuild: the dependent
+/// must be rebuilt after it, not before.
+#[pg_test]
+fn pg_toj_deferred_truncate_upstream_and_dependent_both_truncated() {
+    build_toj_tables("rvb_anchor", "rvb_act");
+    build_upstream_rel("rvb_rel");
+    create_deferred_passthrough("rvb_d", "rvb_rel");
+    let (sql, fresh) = upstream_join_sql("rvb", "rvb_d");
+    assert_eq!(
+        crate::create_reflex_ivm("rvb_p", &sql, Some("id"), None, Some("DEFERRED"), None),
+        "CREATE REFLEX INCREMENTAL VIEW"
+    );
+    Spi::run("TRUNCATE rvb_act").expect("truncate dependent's source");
+    Spi::run("TRUNCATE rvb_rel").expect("truncate upstream's source");
+    Spi::run("SET CONSTRAINTS ALL IMMEDIATE").expect("commit-time flush");
+    assert_eq!(toj_row_count("rvb_d"), 0);
+    assert_imv_correct("rvb_p", &fresh);
+    assert_truncate_rebuilt("rvb_p");
+}
+
+/// Deferrals are bounded: once exhausted the IMV is rebuilt anyway and marked
+/// stale, never left silently wrong.
+#[pg_test]
+fn pg_toj_deferred_truncate_rebuild_deferrals_exhausted_marks_stale() {
+    build_toj_tables("rvx_anchor", "rvx_act");
+    build_upstream_rel("rvx_rel");
+    create_deferred_passthrough("rvx_d", "rvx_rel");
+    let (sql, _) = upstream_join_sql("rvx", "rvx_d");
+    assert_eq!(
+        crate::create_reflex_ivm("rvx_p", &sql, Some("id"), None, Some("DEFERRED"), None),
+        "CREATE REFLEX INCREMENTAL VIEW"
+    );
+    Spi::run("TRUNCATE rvx_act").expect("truncate");
+    Spi::run("UPDATE rvx_rel SET is_active = NOT is_active").expect("upstream change");
+    Spi::run("UPDATE pg_temp.__reflex_deferred_rebuild SET attempts = 64 WHERE name = 'rvx_p'")
+        .expect("exhaust the deferrals");
+    Spi::run("SELECT reflex_flush_deferred('rvx_anchor')").expect("flush while upstream pending");
+    let (stale, reason) = Spi::get_two::<bool, String>(
+        "SELECT known_stale, stale_reason FROM public.__reflex_ivm_reference WHERE name = 'rvx_p'",
+    )
+    .expect("registry");
+    assert_eq!(
+        stale,
+        Some(true),
+        "exhausted deferrals left the IMV unflagged"
+    );
+    assert!(
+        reason.unwrap_or_default().contains("upstream"),
+        "stale_reason must name the cause"
+    );
+    assert_eq!(
+        toj_row_count("rvx_p"),
+        200,
+        "the IMV was not rebuilt on exhaustion"
+    );
+}
+
+const DEFERRED_EVENT_PROBE_DDL: &str = "\
+    CREATE TABLE tje_q (i INT); \
+    CREATE TABLE tje_log (i INT); \
+    CREATE FUNCTION tje_fire() RETURNS TRIGGER AS $f$ BEGIN \
+      INSERT INTO tje_log VALUES (NEW.i); \
+      IF NEW.i < 3 THEN INSERT INTO tje_q VALUES (NEW.i + 1); END IF; \
+      RETURN NULL; END $f$ LANGUAGE plpgsql; \
+    CREATE CONSTRAINT TRIGGER tje_t AFTER INSERT ON tje_q DEFERRABLE INITIALLY DEFERRED \
+      FOR EACH ROW EXECUTE FUNCTION tje_fire()";
+
+/// PG fires deferred events queued while deferred events fire (the rebuild's
+/// re-enqueue relies on it), and fires a queued event whose row was deleted
+/// (the TRUNCATE body deletes the pending row it enqueued): SET CONSTRAINTS.
+#[pg_test]
+fn pg_toj_pg_fires_deferred_events_queued_during_set_constraints() {
+    Spi::run(DEFERRED_EVENT_PROBE_DDL).expect("probe");
+    Spi::run("INSERT INTO tje_q VALUES (1), (10)").expect("queue");
+    Spi::run("DELETE FROM tje_q WHERE i = 10").expect("delete a queued row");
+    Spi::run("SET CONSTRAINTS ALL IMMEDIATE").expect("fire");
+    let fired = Spi::get_one::<String>("SELECT string_agg(i::text, ',' ORDER BY i) FROM tje_log")
+        .expect("log")
+        .expect("log NULL");
+    assert_eq!(fired, "1,2,3,10");
+}
+
+/// Same at a real COMMIT, and the DEFERRED truncate + upstream change scenario
+/// committed for real (a remote session: a pg_test body never commits).
+#[pg_test]
+fn pg_toj_pg_fires_deferred_events_queued_during_commit() {
+    const DBNAME: &str = "reflex_toj_commit_probe";
+    probe_db_open(DBNAME);
+    worker_exec(DEFERRED_EVENT_PROBE_DDL);
+    worker_exec(
+        "BEGIN; INSERT INTO tje_q VALUES (1), (10); DELETE FROM tje_q WHERE i = 10; COMMIT",
+    );
+    let fired = worker_scalar_i64(
+        "SELECT (string_agg(i::text, ',' ORDER BY i) = '1,2,3,10')::int::int8 FROM tje_log",
+    );
+
+    let (sql, fresh) = upstream_join_sql("rvm", "rvm_d");
+    worker_exec(
+        "CREATE TABLE rvm_anchor (id INT PRIMARY KEY, product_id INT NOT NULL, \
+           location_id INT NOT NULL, qty INT); \
+         CREATE TABLE rvm_act (product_id INT NOT NULL, location_id INT NOT NULL, \
+           is_active BOOL, PRIMARY KEY (product_id, location_id)); \
+         CREATE TABLE rvm_rel (product_id INT NOT NULL, location_id INT NOT NULL, \
+           is_active BOOL, PRIMARY KEY (product_id, location_id)); \
+         INSERT INTO rvm_anchor SELECT g, g % 7, g % 5, g FROM generate_series(1, 200) g; \
+         INSERT INTO rvm_act SELECT p, l, (p + l) % 2 = 0 \
+           FROM generate_series(0, 3) p CROSS JOIN generate_series(0, 4) l; \
+         INSERT INTO rvm_rel SELECT p, l, (p + l) % 3 = 0 \
+           FROM generate_series(0, 3) p CROSS JOIN generate_series(0, 4) l",
+    );
+    worker_exec(
+        "DO $mk$ BEGIN PERFORM create_reflex_ivm('rvm_d', \
+           'SELECT product_id, location_id, is_active FROM rvm_rel', \
+           'product_id, location_id', 'UNLOGGED', 'DEFERRED'); END $mk$",
+    );
+    worker_exec(&format!(
+        "DO $mk$ BEGIN PERFORM create_reflex_ivm('rvm_p', {}, 'id', 'UNLOGGED', 'DEFERRED'); END $mk$",
+        sql_lit(&sql)
+    ));
+    worker_exec("BEGIN; TRUNCATE rvm_act; UPDATE rvm_rel SET is_active = NOT is_active; COMMIT");
+    let mismatches = worker_scalar_i64(&format!(
+        "SELECT count(*)::int8 FROM ((SELECT * FROM rvm_p EXCEPT ALL SELECT * FROM ({fresh}) f1) \
+         UNION ALL (SELECT * FROM ({fresh}) f2 EXCEPT ALL SELECT * FROM rvm_p)) o"
+    ));
+    probe_db_close(DBNAME);
+
+    assert_eq!(
+        fired, 1,
+        "deferred events queued during COMMIT were not all fired"
+    );
+    assert_eq!(
+        mismatches, 0,
+        "committed DEFERRED truncate + upstream change left rvm_p wrong"
+    );
+}
+
+/// A committed pending row nobody will flush (no queued event: inserted with
+/// triggers disabled) keeps the upstream looking busy: the re-enqueued flushes
+/// run out of deferrals and the IMV is rebuilt and flagged, not left wrong.
+#[pg_test]
+fn pg_toj_deferred_truncate_orphan_pending_row_rebuilds_and_flags() {
+    const DBNAME: &str = "reflex_toj_orphan_probe";
+    probe_db_open(DBNAME);
+    let (sql, fresh) = upstream_join_sql("rvo", "rvo_d");
+    worker_exec(
+        "CREATE TABLE rvo_anchor (id INT PRIMARY KEY, product_id INT NOT NULL, \
+           location_id INT NOT NULL, qty INT); \
+         CREATE TABLE rvo_act (product_id INT NOT NULL, location_id INT NOT NULL, \
+           is_active BOOL, PRIMARY KEY (product_id, location_id)); \
+         CREATE TABLE rvo_rel (product_id INT NOT NULL, location_id INT NOT NULL, \
+           is_active BOOL, PRIMARY KEY (product_id, location_id)); \
+         INSERT INTO rvo_anchor SELECT g, g % 7, g % 5, g FROM generate_series(1, 200) g; \
+         INSERT INTO rvo_act SELECT p, l, (p + l) % 2 = 0 \
+           FROM generate_series(0, 3) p CROSS JOIN generate_series(0, 4) l; \
+         INSERT INTO rvo_rel SELECT p, l, (p + l) % 3 = 0 \
+           FROM generate_series(0, 3) p CROSS JOIN generate_series(0, 4) l",
+    );
+    worker_exec(
+        "DO $mk$ BEGIN PERFORM create_reflex_ivm('rvo_d', \
+           'SELECT product_id, location_id, is_active FROM rvo_rel', \
+           'product_id, location_id', 'UNLOGGED', 'DEFERRED'); END $mk$",
+    );
+    worker_exec(&format!(
+        "DO $mk$ BEGIN PERFORM create_reflex_ivm('rvo_p', {}, 'id', 'UNLOGGED', 'DEFERRED'); END $mk$",
+        sql_lit(&sql)
+    ));
+    worker_exec(
+        "BEGIN; SET LOCAL session_replication_role = replica; \
+         INSERT INTO public.__reflex_deferred_pending (source_table, operation) \
+           VALUES ('rvo_rel', 'UPDATE'); COMMIT",
+    );
+    worker_exec("BEGIN; TRUNCATE rvo_act; COMMIT");
+    let mismatches = worker_scalar_i64(&format!(
+        "SELECT count(*)::int8 FROM ((SELECT * FROM rvo_p EXCEPT ALL SELECT * FROM ({fresh}) f1) \
+         UNION ALL (SELECT * FROM ({fresh}) f2 EXCEPT ALL SELECT * FROM rvo_p)) o"
+    ));
+    let flagged = worker_scalar_i64(
+        "SELECT (known_stale AND stale_reason LIKE '%upstream%')::int::int8 \
+         FROM public.__reflex_ivm_reference WHERE name = 'rvo_p'",
+    );
+    probe_db_close(DBNAME);
+
+    assert_eq!(mismatches, 0, "exhausted deferrals did not rebuild rvo_p");
+    assert_eq!(flagged, 1, "exhausted deferrals left rvo_p unflagged");
+}
+
+/// A decomposed wrapper is refused like `reconcile_one` refuses it: nothing to
+/// run, and not flagged with advice (`reflex_reconcile(<wrapper>)`) that cannot work.
+#[pg_test]
+fn pg_toj_truncate_skips_decomposed_wrapper() {
+    build_toj_tables("tjw_anchor", "tjw_act");
+    assert_eq!(
+        crate::create_reflex_ivm(
+            "tjw_u",
+            "SELECT product_id, location_id FROM tjw_anchor \
+             UNION ALL SELECT product_id, location_id FROM tjw_act",
+            None,
+            None,
+            None,
+            None
+        ),
+        "CREATE REFLEX INCREMENTAL VIEW"
+    );
+    let is_wrapper = Spi::get_one::<bool>(
+        "SELECT end_query = '' AND aggregations::text = '{}' \
+         FROM public.__reflex_ivm_reference WHERE name = 'tjw_u'",
+    )
+    .expect("registry")
+    .unwrap_or(false);
+    assert!(is_wrapper, "fixture must register a decomposed wrapper");
+    let stmts = Spi::get_one::<String>("SELECT reflex_build_truncate_sql('tjw_u')")
+        .expect("build")
+        .unwrap_or_default();
+    assert_eq!(stmts, "");
+    let stale = Spi::get_one::<bool>(
+        "SELECT known_stale FROM public.__reflex_ivm_reference WHERE name = 'tjw_u'",
+    )
+    .expect("stale")
+    .unwrap_or(false);
+    assert!(!stale, "wrapper flagged stale");
+    Spi::run("TRUNCATE tjw_act").expect("truncate an operand's source");
+    assert_imv_correct(
+        "tjw_u",
+        "SELECT product_id, location_id FROM tjw_anchor \
+         UNION ALL SELECT product_id, location_id FROM tjw_act",
+    );
+}
