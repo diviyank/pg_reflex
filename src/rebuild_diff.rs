@@ -354,6 +354,21 @@ fn anchor_source_child_oid(
     view_name: &str,
     child: pg_sys::Oid,
 ) -> Option<pg_sys::Oid> {
+    lookup_anchor_source_child(client, view_name, child).unwrap_or_else(|error| {
+        debug1!(
+            "pg_reflex: sizing {view_name} child by itself, anchor-source lookup failed: {error}"
+        );
+        None
+    })
+}
+
+/// `Ok(None)` is the legitimate "size the child itself" (not an aggregate, or
+/// no matching source child); `Err` is a failed lookup.
+fn lookup_anchor_source_child(
+    client: &pgrx::spi::SpiClient<'_>,
+    view_name: &str,
+    child: pg_sys::Oid,
+) -> Result<Option<pg_sys::Oid>, String> {
     use crate::partition::{list_partition_tree, resolve_anchor_source};
     use crate::query_decomposer::split_qualified_name;
 
@@ -364,34 +379,51 @@ fn anchor_source_child_oid(
             Some(1),
             &[text_arg(view_name)],
         )
-        .ok()?
-        .next()?;
-    if !registry.get_by_name::<bool, _>("is_aggregate").ok()?? {
-        return None;
+        .map_err(|e| e.to_string())?
+        .next();
+    let Some(registry) = registry else {
+        return Ok(None);
+    };
+    let is_aggregate = registry
+        .get_by_name::<bool, _>("is_aggregate")
+        .map_err(|e| e.to_string())?
+        .unwrap_or(false);
+    if !is_aggregate {
+        return Ok(None);
     }
-    let part_col = registry.get_by_name::<String, _>("part_col").ok()??;
+    let part_col = registry
+        .get_by_name::<String, _>("part_col")
+        .map_err(|e| e.to_string())?;
     let depends_on = registry
         .get_by_name::<Vec<String>, _>("depends_on")
-        .ok()??;
-    let anchor = resolve_anchor_source(client, &part_col, &depends_on).ok()?;
+        .map_err(|e| e.to_string())?;
+    let (Some(part_col), Some(depends_on)) = (part_col, depends_on) else {
+        return Ok(None);
+    };
+    let anchor = resolve_anchor_source(client, &part_col, &depends_on)?;
     let child_name = client
         .select(
             "SELECT relname::text FROM pg_class WHERE oid = $1",
             Some(1),
             &[unsafe { DatumWithOid::new(child, PgBuiltInOids::OIDOID.oid().value()) }],
         )
-        .ok()?
-        .next()?
-        .get::<String>(1)
-        .ok()??;
+        .map_err(|e| e.to_string())?
+        .next()
+        .and_then(|row| row.get::<String>(1).ok().flatten());
+    let Some(child_name) = child_name else {
+        return Ok(None);
+    };
     let (_, view_bare) = split_qualified_name(view_name);
-    let source_child = child_name
+    let Some(source_child) = child_name
         .strip_prefix(&format!("__reflex_intermediate_{view_bare}_"))
-        .or_else(|| child_name.strip_prefix(&format!("{view_bare}_")))?;
-    list_partition_tree(client, &anchor)
+        .or_else(|| child_name.strip_prefix(&format!("{view_bare}_")))
+    else {
+        return Ok(None);
+    };
+    Ok(list_partition_tree(client, &anchor)
         .into_iter()
         .find(|node| node.bare_name == source_child)
-        .map(|node| pg_sys::Oid::from(node.oid))
+        .map(|node| pg_sys::Oid::from(node.oid)))
 }
 
 /// Estimated rows a rebuild of `child` (a target or intermediate partition
