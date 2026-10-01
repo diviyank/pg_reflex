@@ -36,6 +36,14 @@ fn dmw_force_incremental(imv: &str) {
     .expect("wipe_threshold");
 }
 
+fn dmw_watermark(imv: &str) -> i64 {
+    Spi::get_one::<i64>(&format!(
+        "SELECT watermark FROM pg_temp.__reflex_deferred_reconciled_batch WHERE name = '{imv}'"
+    ))
+    .expect("marker")
+    .unwrap_or(-1)
+}
+
 fn dmw_create_deferred(name: &str, sql: &str, key: Option<&str>) {
     assert_eq!(
         crate::create_reflex_ivm(name, sql, key, None, Some("DEFERRED"), None),
@@ -275,4 +283,135 @@ fn pg_dmw_truncate_then_dml_after_set_constraints_commit() {
     assert_eq!(a_mismatch, 0, "dmc_a wrong after COMMIT");
     assert!(!v_stale, "dmc_v flagged stale");
     assert!(!a_stale, "dmc_a flagged stale");
+}
+
+/// Runs the queued flushes in a subtransaction that then aborts: the flush's
+/// `DELETE FROM` the staging table is rolled back, so the staged rows stay
+/// visible with an aborted `xmax` and a combo command id in `cmin`.
+fn dmw_flush_in_aborted_subtransaction() {
+    Spi::run(
+        "DO $$ BEGIN \
+           BEGIN \
+             SET CONSTRAINTS ALL IMMEDIATE; \
+             RAISE EXCEPTION 'abort the flushing subtransaction'; \
+           EXCEPTION WHEN OTHERS THEN NULL; \
+           END; \
+         END $$",
+    )
+    .expect("flush in an aborted subtransaction");
+}
+
+/// Review repro: a write after the rebuild whose first flush aborts must still
+/// be applied by the next one (its `cmin` is then a combo id, not its command).
+#[pg_test]
+fn pg_dmw_aborted_flush_after_rebuild_keeps_later_write() {
+    Spi::run("CREATE TABLE dmr_s (k INT PRIMARY KEY, v INT)").expect("s");
+    Spi::run("INSERT INTO dmr_s SELECT g, g FROM generate_series(1, 100) g").expect("seed");
+    dmw_create_deferred("dmr_v", "SELECT k, v FROM dmr_s", Some("k"));
+    Spi::run("TRUNCATE dmr_s").expect("truncate");
+    Spi::run("INSERT INTO dmr_s SELECT g, g FROM generate_series(1, 50) g").expect("refill");
+    Spi::run("SET CONSTRAINTS ALL IMMEDIATE").expect("fire the queued flush");
+    assert!(
+        dmw_marked("dmr_v"),
+        "precondition: dmr_v rebuilt mid-transaction"
+    );
+    Spi::run("SET CONSTRAINTS ALL DEFERRED").expect("deferred");
+    Spi::run("INSERT INTO dmr_s VALUES (1000, 1000)").expect("write after the rebuild");
+    dmw_flush_in_aborted_subtransaction();
+    assert_eq!(
+        Spi::get_one::<i64>("SELECT count(*) FROM __reflex_delta_dmr_s WHERE xmax <> '0'::xid")
+            .expect("delta")
+            .unwrap_or(0),
+        1,
+        "precondition: the staged row carries the aborted flush's xmax"
+    );
+    Spi::run("SET CONSTRAINTS ALL IMMEDIATE").expect("final flush");
+    dmw_assert_fresh("dmr_v", "SELECT k, v FROM dmr_s");
+}
+
+/// Aggregate variant: the write after the rebuild is counted exactly once.
+#[pg_test]
+fn pg_dmw_aborted_flush_after_rebuild_aggregate() {
+    Spi::run("CREATE TABLE dmq_a (k INT PRIMARY KEY, g INT, v INT)").expect("a");
+    Spi::run("CREATE TABLE dmq_t (k INT PRIMARY KEY)").expect("t");
+    Spi::run("INSERT INTO dmq_a SELECT i, i, i FROM generate_series(1, 100) i").expect("seed a");
+    Spi::run("INSERT INTO dmq_t SELECT i FROM generate_series(1, 100, 2) i").expect("seed t");
+    let sql = "SELECT a.g, SUM(a.v) AS sv, COUNT(t.k) AS nt, COUNT(*) AS n \
+               FROM dmq_a a LEFT JOIN dmq_t t ON t.k = a.k GROUP BY a.g";
+    dmw_create_deferred("dmq_v", sql, None);
+    dmw_force_incremental("dmq_v");
+    Spi::run("INSERT INTO dmq_a VALUES (1000, 1, 1000)").expect("anchor delta before");
+    Spi::run("TRUNCATE dmq_t").expect("truncate the nullable side");
+    Spi::run("SET CONSTRAINTS ALL IMMEDIATE").expect("fire the queued flushes");
+    assert!(
+        dmw_marked("dmq_v"),
+        "precondition: dmq_v rebuilt mid-transaction"
+    );
+    Spi::run("SET CONSTRAINTS ALL DEFERRED").expect("deferred");
+    Spi::run("INSERT INTO dmq_a VALUES (1001, 2, 7)").expect("insert after");
+    Spi::run("UPDATE dmq_a SET v = v + 1 WHERE k <= 3").expect("update after");
+    dmw_flush_in_aborted_subtransaction();
+    Spi::run("SET CONSTRAINTS ALL IMMEDIATE").expect("final flush");
+    dmw_assert_fresh("dmq_v", sql);
+}
+
+/// A delta staged before the guard rebuild whose flush aborts after it: the
+/// row is ambiguous (aborted deleter newer than the rebuild), so the IMV is
+/// rebuilt again rather than given the row a second time.
+#[pg_test]
+fn pg_dmw_pre_rebuild_row_with_flush_aborted_after_rebuild() {
+    dmg_tables();
+    dmw_create_deferred("dmg.x5", DMG_AGG_SQL, None);
+    dmw_force_incremental("dmg.x5");
+    Spi::run("UPDATE dmg_b SET grp = grp + 100 WHERE k BETWEEN 2 AND 6").expect("change b");
+    Spi::run("UPDATE dmg_a SET v = v + 1 WHERE k <= 3").expect("change a");
+    Spi::run("SELECT reflex_flush_deferred('dmg_b')").expect("flush b: guard rebuild");
+    assert!(
+        dmw_marked("dmg.x5"),
+        "precondition: the guard rebuilt dmg.x5 before a's flush"
+    );
+    let first_rebuild = dmw_watermark("dmg.x5");
+    dmw_flush_in_aborted_subtransaction();
+    Spi::run("SET CONSTRAINTS ALL IMMEDIATE").expect("final flush");
+    dmw_assert_fresh("dmg.x5", DMG_AGG_SQL);
+    assert!(
+        dmw_watermark("dmg.x5") > first_rebuild,
+        "the ambiguous row did not rebuild dmg.x5 again"
+    );
+}
+
+/// A delta whose flush aborted before the rebuild is reflected by it and is
+/// skipped afterwards.
+#[pg_test]
+fn pg_dmw_flush_aborted_before_rebuild() {
+    dmg_tables();
+    dmw_create_deferred("dmg.x6", DMG_AGG_SQL, None);
+    dmw_force_incremental("dmg.x6");
+    Spi::run("UPDATE dmg_b SET grp = grp + 100 WHERE k BETWEEN 2 AND 6").expect("change b");
+    Spi::run("UPDATE dmg_a SET v = v + 1 WHERE k <= 3").expect("change a");
+    dmw_flush_in_aborted_subtransaction();
+    Spi::run("SET CONSTRAINTS ALL IMMEDIATE").expect("flush: guard rebuild");
+    assert!(dmw_marked("dmg.x6"), "precondition: dmg.x6 rebuilt");
+    dmw_assert_fresh("dmg.x6", DMG_AGG_SQL);
+}
+
+/// Several aborted flushes in a row, each after more writes: no loop, and the
+/// IMV ends correct.
+#[pg_test]
+fn pg_dmw_repeated_aborted_flushes_after_rebuild() {
+    Spi::run("CREATE TABLE dmn_s (k INT PRIMARY KEY, v INT)").expect("s");
+    Spi::run("INSERT INTO dmn_s SELECT g, g FROM generate_series(1, 100) g").expect("seed");
+    dmw_create_deferred("dmn_v", "SELECT k, v FROM dmn_s", Some("k"));
+    Spi::run("TRUNCATE dmn_s").expect("truncate");
+    Spi::run("INSERT INTO dmn_s SELECT g, g FROM generate_series(1, 50) g").expect("refill");
+    Spi::run("SET CONSTRAINTS ALL IMMEDIATE").expect("fire the queued flush");
+    assert!(dmw_marked("dmn_v"), "precondition: dmn_v rebuilt");
+    Spi::run("SET CONSTRAINTS ALL DEFERRED").expect("deferred");
+    for i in 0..4 {
+        Spi::run(&format!("INSERT INTO dmn_s VALUES ({}, {})", 1000 + i, i)).expect("write");
+        Spi::run(&format!("UPDATE dmn_s SET v = v + 1 WHERE k = {}", i + 1)).expect("update");
+        dmw_flush_in_aborted_subtransaction();
+    }
+    Spi::run("SET CONSTRAINTS ALL IMMEDIATE").expect("final flush");
+    dmw_assert_fresh("dmn_v", "SELECT k, v FROM dmn_s");
 }

@@ -13,7 +13,9 @@
 --      `__reflex_rebuild_cost_rows` (volume dispatch: higher threshold with
 --      dependents, two-level partitions sized by their leaves), and
 --      `__reflex_xid_is_current` (exact "row written by this transaction"
---      test used by the COMMIT-time rebuild of DEFERRED IMVs).
+--      test used by the COMMIT-time rebuild of DEFERRED IMVs) and
+--      `__reflex_xid_precedes` (wraparound-safe xid order, used to place a
+--      staged row relative to that rebuild).
 --
 --   2. `__reflex_deferred_flush_fn` deletes its own 'TRUNCATE' request row
 --      (`reflex_build_truncate_sql` enqueues one per DEFERRED IMV whose source
@@ -75,6 +77,14 @@ CREATE FUNCTION "__reflex_xid_is_current"(
 STRICT STABLE PARALLEL UNSAFE
 LANGUAGE c
 AS 'MODULE_PATHNAME', 'reflex_xid_is_current_wrapper';
+
+CREATE FUNCTION "__reflex_xid_precedes"(
+	"a" xid,
+	"b" xid
+) RETURNS bool
+IMMUTABLE STRICT PARALLEL SAFE
+LANGUAGE c
+AS 'MODULE_PATHNAME', 'reflex_xid_precedes_wrapper';
 
 -- === Deferred flush: a 'TRUNCATE' request row is removed by its own event ===
 -- Created by the first DEFERRED `create_reflex_ivm`, so it may be absent or,

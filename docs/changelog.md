@@ -22,7 +22,7 @@ Rebuilds no longer wipe the IMVs built on the rebuilt one. In the field a TRUNCA
 
 **Migration**
 
-- [`sql/pg_reflex--1.11.4--1.11.5.sql`](https://github.com/diviyank/pg_reflex/blob/main/sql/pg_reflex--1.11.4--1.11.5.sql) — creates the four functions, replaces `__reflex_deferred_flush_fn`, rewrites the pending-row DELETE in installed deferred TRUNCATE trigger bodies (no lock on sources), and deletes leftover `'TRUNCATE'` request rows. Install the library and run the update together.
+- [`sql/pg_reflex--1.11.4--1.11.5.sql`](https://github.com/diviyank/pg_reflex/blob/main/sql/pg_reflex--1.11.4--1.11.5.sql) — creates the five functions, replaces `__reflex_deferred_flush_fn`, rewrites the pending-row DELETE in installed deferred TRUNCATE trigger bodies (no lock on sources), and deletes leftover `'TRUNCATE'` request rows. Install the library and run the update together.
 
 ## [1.11.4] — 2026-09-18
 
