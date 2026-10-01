@@ -271,3 +271,91 @@ fn pg_rco_large_update_goes_hot_without_dependent_passthrough() {
     );
     assert_imv_correct("rco8_v", "SELECT plan, m, id, v FROM rco8_src");
 }
+
+const RCE_VIEW_SQL: &str = "SELECT region, COUNT(DISTINCT cust) AS n FROM {p}_src GROUP BY region";
+
+/// A partitioned COUNT(DISTINCT) IMV, whose UPDATE dispatch is the unpartitioned
+/// high-selectivity block, with an unrelated table holding the name of the mirror
+/// child for source partition `0`: the delegated `reflex_reconcile` then returns
+/// `ERROR: partition reconcile failed` before it reaches leaf `B`.
+fn rce_failing_reconcile_fixture(prefix: &str, mode: &str, exec: impl Fn(&str)) {
+    let view_sql = RCE_VIEW_SQL.replace("{p}", prefix);
+    for sql in [
+        format!(
+            "CREATE TABLE {prefix}_src (region TEXT NOT NULL, id INT, cust INT) PARTITION BY LIST (region)"
+        ),
+        format!("CREATE TABLE {prefix}_src_a PARTITION OF {prefix}_src FOR VALUES IN ('A')"),
+        format!("CREATE TABLE {prefix}_src_b PARTITION OF {prefix}_src FOR VALUES IN ('B')"),
+        format!(
+            "INSERT INTO {prefix}_src SELECT CASE WHEN g % 2 = 0 THEN 'A' ELSE 'B' END, g, g % 50 \
+             FROM generate_series(1, 2000) g"
+        ),
+        format!(
+            "DO $c$ BEGIN IF create_reflex_ivm('{prefix}_v', '{view_sql}', 'region', NULL, '{mode}', \
+             NULL, ARRAY['region']) <> 'CREATE REFLEX INCREMENTAL VIEW' THEN \
+             RAISE EXCEPTION 'create {prefix}_v failed'; END IF; END $c$"
+        ),
+        format!("CREATE TABLE {prefix}_v_{prefix}_src_0 (x INT)"),
+        format!("CREATE TABLE {prefix}_src_0 PARTITION OF {prefix}_src FOR VALUES IN ('0')"),
+        format!("ANALYZE {prefix}_src"),
+        format!("ANALYZE __reflex_intermediate_{prefix}_v"),
+        format!(
+            "DO $p$ BEGIN IF NOT EXISTS (SELECT 1 FROM public.__reflex_ivm_reference r \
+             WHERE r.name = '{prefix}_v' AND strpos(reflex_build_delta_sql(r.name, '{prefix}_src', \
+             'UPDATE', r.base_query, r.end_query, r.aggregations::text, r.base_query), \
+             'pg_reflex wipe: ratio') > 0) \
+             THEN RAISE EXCEPTION 'fixture: UPDATE does not take the unpartitioned dispatch'; END IF; END $p$"
+        ),
+    ] {
+        exec(&sql);
+    }
+}
+
+/// The UPDATE below touches 5% of the source (under the trigger's pre-scratch
+/// ratio) but every group of `B`, so it reaches the dispatch's rebuild branch.
+const RCE_UPDATE: &str = "UPDATE {p}_src SET cust = id + 1000 WHERE region = 'B' AND id <= 200";
+
+/// The unpartitioned high-selectivity dispatch delegates to `reflex_reconcile`;
+/// when that returns an `ERROR` string, the statement must fail rather than
+/// commit a source change the IMV never received.
+#[pg_test]
+fn pg_rco_high_selectivity_reconcile_error_fails_the_statement() {
+    rce_failing_reconcile_fixture("rce1", "IMMEDIATE", |sql| {
+        Spi::run(sql).unwrap_or_else(|e| panic!("<{sql}>: {e}"))
+    });
+    let outcome = Spi::get_one::<String>(&format!(
+        "DO $d$ BEGIN {}; \
+           PERFORM set_config('rce1.outcome', 'NO ERROR', true); \
+         EXCEPTION WHEN OTHERS THEN PERFORM set_config('rce1.outcome', SQLERRM, true); END $d$; \
+         SELECT current_setting('rce1.outcome')",
+        RCE_UPDATE.replace("{p}", "rce1")
+    ))
+    .expect("outcome")
+    .expect("outcome value");
+    assert_imv_correct("rce1_v", &RCE_VIEW_SQL.replace("{p}", "rce1"));
+    assert!(
+        outcome.contains("partition reconcile failed"),
+        "the failed rebuild must fail the statement, got: {outcome}"
+    );
+}
+
+/// DEFERRED: the same failure at COMMIT must leave the IMV flagged stale, not
+/// silently behind its committed source.
+#[pg_test]
+fn pg_rco_high_selectivity_reconcile_error_marks_deferred_stale() {
+    const DBNAME: &str = "reflex_rce_deferred";
+    probe_db_open(DBNAME);
+    rce_failing_reconcile_fixture("rce2", "DEFERRED", worker_exec);
+    worker_exec(&RCE_UPDATE.replace("{p}", "rce2"));
+    assert_eq!(
+        worker_scalar_i64("SELECT count(DISTINCT cust)::int8 FROM rce2_src WHERE region = 'B'"),
+        125,
+        "the source change committed"
+    );
+    let mismatch = rbc_mismatch("rce2_v", &RCE_VIEW_SQL.replace("{p}", "rce2"));
+    assert!(
+        rbc_known_stale("rce2_v"),
+        "IMV silently diverged from its committed source ({mismatch} mismatched rows) without known_stale"
+    );
+    probe_db_close(DBNAME);
+}
