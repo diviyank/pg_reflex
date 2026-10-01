@@ -3603,11 +3603,7 @@ fn secondary_passthrough_without_mapping_falls_back_to_rebuild() {
     );
     let joined = stmts.join("\n");
     assert!(
-        joined.contains("DELETE FROM \"fc_view\""),
-        "no mapping → full rebuild retained: {joined}"
-    );
-    assert!(
-        joined.contains("INSERT INTO \"fc_view\""),
+        joined.contains("reflex_rebuild_target_rows('fc_view'"),
         "no mapping → full rebuild retained: {joined}"
     );
 }
@@ -3635,7 +3631,7 @@ fn full_outer_secondary_passthrough_falls_back_to_rebuild() {
     );
     let joined = stmts.join("\n");
     assert!(
-        joined.contains("DELETE FROM \"fc_view\""),
+        joined.contains("reflex_rebuild_target_rows('fc_view'"),
         "FULL OUTER → full rebuild: {joined}"
     );
     assert!(
@@ -3680,7 +3676,7 @@ fn full_outer_secondary_aggregate_falls_back_to_rebuild() {
     );
     let joined = stmts.join("\n");
     assert!(
-        joined.contains("TRUNCATE __int") && joined.contains("TRUNCATE \"fc_view\""),
+        joined.contains("TRUNCATE __int") && joined.contains("reflex_rebuild_target_rows('fc_view'"),
         "FULL OUTER aggregate secondary must fall back to full rebuild, not scoped recompute: {joined}"
     );
     assert!(

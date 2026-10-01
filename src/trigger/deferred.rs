@@ -857,7 +857,7 @@ pub fn reflex_flush_deferred(source_table: &str) -> String {
             // LESS than before this observability existed.
             let body = imv_stmts
                 .into_iter()
-                .map(|s| format!("{};", s))
+                .map(|s| format!("{};", as_plpgsql_stmt(&s)))
                 .collect::<Vec<_>>()
                 .join("\n");
             // 1.3.0 observability:
