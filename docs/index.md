@@ -60,6 +60,7 @@ On the workloads it targets — append-mostly sources, narrow updates, cascade d
 
 ## Recent highlights
 
+- **Rebuilds no longer wipe dependent IMVs (1.11.5).** A source TRUNCATE, `reflex_reconcile`, the wipe dispatch and partition rebuilds of an IMV with dependents now hand those dependents a row diff instead of clearing or fully rebuilding them, after a field incident where one rebuild emptied a 123 M-row IMV that LEFT JOINs the rebuilt one.
 - **Silent-wipe observability, and healing after an ignored source changes (1.11.4).** A failed deferred flush, a capped partition source or a queued heal now marks the IMV `known_stale` in `reflex_ivm_status()`, which also counts an anomalous IMV exactly. `create_reflex_ivm` refuses an `ignore_sources` entry the query filters or joins on unless it is acknowledged, and a change to an ignored source that joins onto the partition key queues exactly the affected partitions for [`reflex_heal_ignored_sources`](api/reflex_heal_ignored_sources.md). Read [Upgrading to 1.11.4](getting-started/upgrading.md#upgrading-to-1114) before upgrading.
 - **Partitioned-IMV maintenance fixes (1.11.3).** A partition swap no longer flattens a sub-partitioned mirror child (whose next sync emptied the IMV), `reflex_reconcile` no longer destroys the dependents of a partitioned IMV, and adding a source partition no longer takes an `AccessExclusive` lock that froze every reader of the IMV.
 - **1.10.7 – 1.11.2:** see the [changelog](changelog.md).

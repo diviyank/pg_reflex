@@ -4,6 +4,26 @@ The full changelog tracks every release. The latest version's headlines are on t
 
 For each version below, see [`CHANGELOG.md`](https://github.com/diviyank/pg_reflex/blob/main/CHANGELOG.md) on GitHub for the canonical text.
 
+## [1.11.5] — 2026-10-01
+
+Rebuilds no longer wipe the IMVs built on the rebuilt one. In the field a TRUNCATE + INSERT rebuild of `current_assortment_activity_view` reached `sop_forecast_view`, a 123 M-row passthrough IMV that LEFT JOINs it, as "every row deleted", and a discarded DEFERRED flush made the loss permanent. TRUNCATE / reconcile / partition rebuilds of an IMV with dependents now hand dependents a row diff instead of clearing or fully rebuilding them; DEFERRED truncates rebuild once at COMMIT; volume dispatch sizes two-level partitions by their leaves and uses a higher threshold for IMVs with dependents; multi-source guard rebuild failures mark the IMV stale instead of aborting COMMIT. `ALTER EXTENSION pg_reflex UPDATE TO '1.11.5';`
+
+**Fixed**
+
+- (DATA LOSS) A source TRUNCATE cleared the IMV, deleting rows the query still produces (outer-join nullable side, `NOT EXISTS`, ungrouped aggregate); the IMV is now rebuilt from its base query — IMMEDIATE at TRUNCATE time, DEFERRED once at COMMIT after upstream DEFERRED IMVs settle — and marked `known_stale` when it cannot be.
+- (DATA LOSS) A rebuild of an IMV with dependents (`reflex_reconcile`, wipe dispatch, trigger full-refresh fallbacks) reached them as delete-all + insert-all; the target is now rewritten as a keyed or whole-row diff (`reflex_rebuild_target_rows`).
+- (DATA LOSS) Partitioned reconciles and partition swaps diff each populated leaf of an IMV with dependents, always — also when a generated child failed — and fully refresh only dependents that ignore it.
+- (SILENT) The multi-source cross-source guard rebuilt inside the flush, possibly before an upstream DEFERRED IMV's own flush, and aborted the COMMIT on failure; it now uses the COMMIT-time path (waits for upstream, isolated, stale on failure).
+- Volume dispatch sizes a two-level partition by its leaves (`__reflex_rebuild_cost_rows`), uses a 0.9 threshold for an IMV with dependents, and raises on a hot partition reconcile's `ERROR` result.
+
+**Added**
+
+- `reflex_rebuild_target_rows(view, rebuild_sql)`; internal `__reflex_target_propagates`, `__reflex_rebuild_cost_rows`, `__reflex_xid_is_current`.
+
+**Migration**
+
+- [`sql/pg_reflex--1.11.4--1.11.5.sql`](https://github.com/diviyank/pg_reflex/blob/main/sql/pg_reflex--1.11.4--1.11.5.sql) — creates the four functions, replaces `__reflex_deferred_flush_fn`, rewrites the pending-row DELETE in installed deferred TRUNCATE trigger bodies (no lock on sources), and deletes leftover `'TRUNCATE'` request rows. Install the library and run the update together.
+
 ## [1.11.4] — 2026-09-18
 
 Silent-wipe observability and prevention. In the field a 1.86 M-row forecast IMV was emptied to 2 161 rows by a partition swap evaluated while its own status filter excluded the slice, and `reflex_ivm_status()` kept reporting `known_stale = false`, `last_error = NULL` and the pre-wipe row count; on a dev cluster four partition source roots had been capped for up to six weeks — skipped by every flush — while every dependent IMV reported healthy, because a full reconcile clears `known_stale` but never re-arms the root. This release makes those states visible, records them durably, lets an operator make a flush failure abort the caller, refuses at create time the `ignore_sources` shape that caused the wipe, and heals the incident shape: a change to an ignored source that joins onto the partition key queues exactly the affected partitions for rebuild. `ALTER EXTENSION pg_reflex UPDATE TO '1.11.4';`
