@@ -483,16 +483,19 @@ pub(crate) fn reconcile_one(view_name: &str, drop_orphans: bool) -> &'static str
                         .filter(|n| n.sub_strategy.is_none())
                         .map(|n| n.bare_name)
                         .collect();
-                for src_bare in &mirror_nodes {
-                    if let Err(e) = crate::partition::execute_partition_swap_for_child(
-                        client,
-                        view_name,
-                        &schema,
-                        src_bare,
-                        &base_query,
-                        &end_query,
-                        unlogged,
-                    ) {
+                let mirror_leaves: Vec<String> = mirror_nodes.iter().cloned().collect();
+                let all_diffed = match crate::partition::rebuild_mirror_leaves(
+                    client,
+                    view_name,
+                    &schema,
+                    &mirror_leaves,
+                    &base_query,
+                    &end_query,
+                    unlogged,
+                    PARTITIONED_LEAF_DIFF_ALLOWED.get(),
+                ) {
+                    Ok(all_diffed) => all_diffed,
+                    Err((src_bare, e)) => {
                         warning!(
                             "pg_reflex: per-partition reconcile of '{}' for child '{}' failed: {}",
                             view_name,
@@ -501,7 +504,7 @@ pub(crate) fn reconcile_one(view_name: &str, drop_orphans: bool) -> &'static str
                         );
                         return "ERROR: partition reconcile failed";
                     }
-                }
+                };
 
                 // ANALYZE the parents so the planner sees the freshly
                 // attached children's stats. Passthrough IMVs have no
@@ -548,6 +551,7 @@ pub(crate) fn reconcile_one(view_name: &str, drop_orphans: bool) -> &'static str
                     view_name,
                     mirror_nodes.len()
                 );
+                PARTITIONED_REBUILD_ALL_DIFFED.set(all_diffed);
                 return "RECONCILED";
             }
         }
@@ -840,6 +844,25 @@ pub(crate) fn reconcile_one(view_name: &str, drop_orphans: bool) -> &'static str
     })
 }
 
+thread_local! {
+    /// Set by `reconcile_one`'s partitioned branch, just before it returns
+    /// success, when every mirror leaf reached the dependents as a row diff.
+    /// Read (and reset) by [`reflex_reconcile_with_orphans`] right after its own
+    /// `reconcile_named_node` returns. A backend is single-threaded and this is
+    /// synchronous, so a nested reconcile that touches it during the swaps is
+    /// overwritten by the outer branch's final `set`.
+    static PARTITIONED_REBUILD_ALL_DIFFED: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+
+    /// Cleared by [`reflex_reconcile_with_orphans`] around the rebuild of an
+    /// IMV whose generated sub-IMV failed to rebuild: its partitioned leaves
+    /// are then swapped, never diffed, so content derived from a node known to
+    /// be stale is not written into its dependents (the cascade is withheld
+    /// for the same reason).
+    static PARTITIONED_LEAF_DIFF_ALLOWED: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(true) };
+}
+
 /// Enabled IMVs that read `view_name` but list it in `ignored_sources`: no
 /// write to `view_name` reaches them, so a rebuild must refresh them itself.
 pub(crate) fn ignoring_dependents(view_name: &str) -> Vec<String> {
@@ -952,7 +975,11 @@ pub(crate) fn reflex_reconcile_with_orphans(view_name: &str, drop_orphans: bool)
         }
     }
 
+    PARTITIONED_REBUILD_ALL_DIFFED.set(false);
+    let diff_was_allowed = PARTITIONED_LEAF_DIFF_ALLOWED.replace(!child_failed);
     let own = reconcile_named_node(view_name, drop_orphans);
+    PARTITIONED_LEAF_DIFF_ALLOWED.set(diff_was_allowed);
+    let all_leaves_diffed = PARTITIONED_REBUILD_ALL_DIFFED.replace(false);
 
     // The parent is rebuilt even when a child failed — that still repairs any
     // drift local to the parent, and leaving it untouched would be no fresher.
@@ -972,7 +999,7 @@ pub(crate) fn reflex_reconcile_with_orphans(view_name: &str, drop_orphans: bool)
     }
 
     if !own.starts_with("ERROR") {
-        cascade_partitioned_rebuild_to_dependents(view_name, drop_orphans);
+        cascade_partitioned_rebuild_to_dependents(view_name, drop_orphans, all_leaves_diffed);
     }
     if !own.starts_with("ERROR") && !is_partitioned_imv(view_name) {
         for dep in ignoring_dependents(view_name) {
@@ -991,7 +1018,14 @@ pub(crate) fn reflex_reconcile_with_orphans(view_name: &str, drop_orphans: bool)
 }
 
 /// Refresh the dependents of an IMV that was just rebuilt through the
-/// PARTITIONED path, which propagates nothing on its own.
+/// PARTITIONED path.
+///
+/// When every mirror leaf was rebuilt as a row diff through the root
+/// (`all_leaves_diffed`, see [`crate::partition::rebuild_mirror_leaves`]) and
+/// `session_replication_role` lets the IMV triggers fire (`origin` / `local`),
+/// the observing dependents already received that diff, exactly as on the
+/// unpartitioned path, and only the ignoring ones are refreshed. Otherwise
+/// every dependent is, for the reason below.
 ///
 /// An unpartitioned rebuild of an IMV with dependents is a row diff written
 /// through the target, so OBSERVING consumers (those that read it and do not
@@ -1032,7 +1066,11 @@ pub(crate) fn reflex_reconcile_with_orphans(view_name: &str, drop_orphans: bool)
 /// DAG with fan-in a shared node is rebuilt once per path rather than once;
 /// that is redundant work, not incorrect (a full rebuild is idempotent), and is
 /// tracked separately.
-fn cascade_partitioned_rebuild_to_dependents(view_name: &str, drop_orphans: bool) {
+fn cascade_partitioned_rebuild_to_dependents(
+    view_name: &str,
+    drop_orphans: bool,
+    all_leaves_diffed: bool,
+) {
     let dependents: Vec<String> = Spi::connect(|client| {
         client
             .select(
@@ -1054,6 +1092,14 @@ fn cascade_partitioned_rebuild_to_dependents(view_name: &str, drop_orphans: bool
             })
             .collect()
     });
+    let dependents = if !dependents.is_empty()
+        && all_leaves_diffed
+        && Spi::connect(crate::partition::origin_triggers_fire)
+    {
+        ignoring_dependents(view_name)
+    } else {
+        dependents
+    };
 
     for dep in &dependents {
         let result = reflex_reconcile_with_orphans(dep, drop_orphans);

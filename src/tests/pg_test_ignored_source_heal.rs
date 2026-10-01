@@ -634,6 +634,9 @@ fn ish_key_with_edge_whitespace_heals_dependents() {
         .expect("heal")
         .unwrap_or_default();
     assert!(!result.starts_with("ERROR"), "heal returned: {result}");
+    // The healed parent's rows reach the DEFERRED dependent as a staged diff,
+    // applied at COMMIT; flush it as COMMIT would.
+    Spi::run("SELECT reflex_flush_deferred('ish_w_imv')").expect("flush the staged diff");
     assert_eq!(
         ish_diverging(
             "ish_w_dep",

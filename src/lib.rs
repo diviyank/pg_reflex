@@ -1774,8 +1774,9 @@ mod tests {
                 &record.base_query,
                 &record.end_query,
                 unlogged,
+                true,
             ) {
-                Ok(()) => "OK".to_string(),
+                Ok(_) => "OK".to_string(),
                 Err(e) => format!("ERROR: {}", e),
             }
         })
