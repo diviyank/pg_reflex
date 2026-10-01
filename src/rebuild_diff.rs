@@ -12,10 +12,6 @@ use crate::sql_writer::identifier::substitute_identifier_ci;
 
 pub(crate) enum RebuildScope {
     Whole,
-    #[expect(
-        dead_code,
-        reason = "constructed by the partition-leaf rebuild sites (plan Task 7)"
-    )]
     Leaf {
         leaf_qual: String,
         constraint: String,

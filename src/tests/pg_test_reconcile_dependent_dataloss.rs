@@ -428,16 +428,21 @@ fn pg_rdd_cascade_honours_drop_orphans_false() {
     );
 }
 
-/// T8 -- a reconcile that REPORTS failure must not push its contents into the
-/// dependents.
+/// T8 -- a reconcile that REPORTS failure must not stamp its dependents healthy.
 ///
 /// When a generated sub-IMV of the chain fails to rebuild, the parent is still
 /// rebuilt (that repairs drift local to it) but the call returns
 /// `ERROR: generated sub-IMV reconcile failed`, because the parent has just
-/// been re-derived from a node we know is stale. Cascading that content onward
-/// would turn one IMV known to be stale into N IMVs freshly stamped healthy --
-/// each dependent's own rebuild clears its `known_stale` / `stale_reason` /
-/// `stale_since`. So the cascade must sit BELOW that gate.
+/// been re-derived from a node we know is stale. The parent's rebuild reaches
+/// its OBSERVING dependents as a row diff, like any write to it, so they stay
+/// consistent with it. What must not run is the cascade: each dependent's own
+/// rebuild clears its `known_stale` / `stale_reason` / `stale_since`, turning
+/// one IMV known to be stale into N IMVs freshly stamped healthy -- and the
+/// refresh of an IGNORING dependent is withheld for the same reason.
+///
+/// (Assertion restated per controller ruling, Task 7 fix round 1: it used to
+/// pin the observing dependent at its drifted value, which only held while the
+/// partitioned rebuild was a swap invisible to dependents.)
 ///
 /// Reaching `child_failed` with no hand-written registry state takes two
 /// ingredients:
@@ -450,9 +455,9 @@ fn pg_rdd_cascade_honours_drop_orphans_false() {
 ///     still-existing name instead of re-attaching it, so the swap reads an
 ///     empty bound and returns the soft `Err("missing intermediate bound")`.
 ///
-/// The assertion is an EXACT before/after aggregate, never a threshold -- the
-/// natural values here comfortably exceed any round number, so a threshold
-/// would pass whether or not the cascade ran.
+/// The ignoring dependent's assertion is an EXACT before/after aggregate, never
+/// a threshold -- the natural values here comfortably exceed any round number,
+/// so a threshold would pass whether or not the cascade ran.
 #[pg_test]
 fn pg_rdd_failed_reconcile_does_not_cascade() {
     build_rdd_source("r10s");
@@ -494,22 +499,34 @@ fn pg_rdd_failed_reconcile_does_not_cascade() {
     ))
     .expect("detach sub-IMV intermediate child");
 
-    // Drift the root with triggers live so the dependent follows it. The
-    // DRIFTED value is what must survive a reconcile that reports failure.
+    // Drift the root with triggers live so the observing dependent follows it.
     Spi::run("UPDATE r10r SET m = m + 1000").expect("drift");
-    let dep_drifted = Spi::get_one::<i64>("SELECT SUM(mx)::int8 FROM r10d")
-        .expect("dep sum")
-        .expect("dep sum NULL");
-    let dep_if_cascaded = Spi::get_one::<i64>(
+    // The ignoring dependent is built AFTER the drift so it materialises the
+    // drifted rows: only a (withheld) refresh could move it.
+    create_imv(
+        "r10i",
+        "SELECT create_reflex_ivm('r10i', 'SELECT k, SUM(m) AS mx FROM r10r GROUP BY k', \
+         NULL, NULL, 'IMMEDIATE', '!r10r')",
+    );
+    let drifted = Spi::get_one::<i64>("SELECT SUM(mx)::int8 FROM r10i")
+        .expect("ignoring dep sum")
+        .expect("ignoring dep sum NULL");
+    let oracle = Spi::get_one::<i64>(
         "SELECT SUM(s)::int8 FROM (SELECT k, SUM(amt) AS s FROM r10s GROUP BY k) o",
     )
     .expect("oracle sum")
     .expect("oracle sum NULL");
     assert_ne!(
-        dep_drifted, dep_if_cascaded,
-        "fixture: drifted and cascaded values coincide, so the assertion below \
+        drifted, oracle,
+        "fixture: drifted and refreshed values coincide, so the assertion below \
          could not tell them apart"
     );
+    Spi::run(
+        "UPDATE public.__reflex_ivm_reference \
+            SET known_stale = TRUE, stale_reason = 't8 marker', stale_since = now() \
+          WHERE name IN ('r10d', 'r10i')",
+    )
+    .expect("stamp dependents stale");
 
     let res = Spi::get_one::<&str>("SELECT reflex_reconcile('r10r')")
         .expect("reconcile")
@@ -525,17 +542,29 @@ fn pg_rdd_failed_reconcile_does_not_cascade() {
         Spi::get_one::<i64>("SELECT SUM(m)::int8 FROM r10r")
             .expect("root sum")
             .expect("root sum NULL"),
-        dep_if_cascaded,
-        "fixture: the root was not rebuilt, so nothing would have been cascaded"
+        oracle,
+        "fixture: the root was not rebuilt"
     );
 
+    assert_imv_correct("r10d", "SELECT k, SUM(m) AS mx FROM r10r GROUP BY k");
     assert_eq!(
-        Spi::get_one::<i64>("SELECT SUM(mx)::int8 FROM r10d")
-            .expect("dep sum")
-            .expect("dep sum NULL"),
-        dep_drifted,
+        Spi::get_one::<i64>("SELECT SUM(mx)::int8 FROM r10i")
+            .expect("ignoring dep sum")
+            .expect("ignoring dep sum NULL"),
+        drifted,
         "a reconcile that reported 'generated sub-IMV reconcile failed' still \
-         cascaded its known-stale content into the dependent"
+         refreshed its ignoring dependent"
+    );
+    assert_eq!(
+        Spi::get_one::<i64>(
+            "SELECT count(*)::int8 FROM public.__reflex_ivm_reference \
+             WHERE name IN ('r10d', 'r10i') AND known_stale \
+               AND stale_reason = 't8 marker' AND stale_since IS NOT NULL",
+        )
+        .expect("stale flags")
+        .expect("stale flags NULL"),
+        2,
+        "a reconcile that reported failure cleared its dependents' stale flags"
     );
 }
 

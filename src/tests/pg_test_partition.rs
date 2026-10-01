@@ -999,6 +999,13 @@ fn pg_part_cascade_scoped_to_reconciled_key() {
     // touch it).
     Spi::run("UPDATE part_scope_c SET s = 8888 WHERE region = 'A'").expect("corrupt a");
     Spi::run("UPDATE part_scope_c SET s = 9999 WHERE region = 'B'").expect("corrupt b");
+    // The parent's populated leaves are rebuilt as a row diff the child already
+    // receives, which needs no cascade. Empty parent leaf A behind its
+    // triggers so its rebuild is a refill the child cannot see: the cascade
+    // this test is about must then run.
+    Spi::run("ALTER TABLE part_scope_p DISABLE TRIGGER USER").expect("disable");
+    Spi::run("DELETE FROM part_scope_p WHERE region = 'A'").expect("empty parent leaf A");
+    Spi::run("ALTER TABLE part_scope_p ENABLE TRIGGER USER").expect("enable");
 
     let msg = Spi::get_one::<String>("SELECT reflex_reconcile_partition('part_scope_p', 'A')")
         .expect("rec")
