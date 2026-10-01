@@ -152,7 +152,6 @@ instead of aborting COMMIT. `ALTER EXTENSION pg_reflex UPDATE TO '1.11.5';`
 
 Filed in `untreated_bugs/`: a passthrough dependent with no key mapping for
 a source still fully refreshes (now as a diff) on every statement on it;
-the guard's COMMIT-time reconcile may drop orphan partitions (pre-existing);
 hot/cold dispatch still classifies a two-level mirror per plan, not per leaf;
 `create_reflex_ivm` rejects three mixed-case name shapes; the partitioned
 passthrough 23505 flush failure of the incident is not reproduced yet;
