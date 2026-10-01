@@ -64,12 +64,12 @@ pub(crate) fn build_netted_view_sql(
 }
 
 /// Transaction-local marker of the IMVs already rebuilt in this transaction, with
-/// the command id current when each rebuild started (`watermark`): a delta staged
-/// for one at or before it is reflected by the rebuild and skipped, a later one is
-/// applied (see [`delta_staged_after`]).
+/// the position of each rebuild ([`Watermark`]): a delta staged for one before it
+/// is reflected by the rebuild and skipped, a later one is applied.
 const RECONCILED_BATCH_TABLE_DDL: &str =
     "CREATE TEMP TABLE IF NOT EXISTS __reflex_deferred_reconciled_batch \
-     (name TEXT PRIMARY KEY, watermark BIGINT NOT NULL) ON COMMIT DROP";
+     (name TEXT PRIMARY KEY, watermark BIGINT NOT NULL, watermark_xid xid NOT NULL) \
+     ON COMMIT DROP";
 
 /// Re-arms the COMMIT-time rebuild of `view_name` (a source of it was truncated
 /// again): drops it from the marker, if this transaction has one.
@@ -84,18 +84,64 @@ pub(crate) fn rearm_rebuild_sql(view_name: &str) -> String {
     )
 }
 
-/// Rows of `delta_tbl` this transaction staged after command `watermark`: staging
-/// tables are insert-only until a flush or a source TRUNCATE empties them, so a
-/// row's `cmin` is the command that staged it, and command ids grow across the
-/// whole transaction, subtransactions included.
-fn delta_staged_after(delta_tbl: &str, watermark: i64) -> String {
+/// Where a rebuild sits in its transaction: `command` is the command id current
+/// when it started (marked used, so every later command has a higher one) and
+/// `next_xid` the next transaction id to be assigned then.
+///
+/// A staged row is written by this transaction's staging triggers (INSERT only)
+/// and removed by a flush's DELETE or a source TRUNCATE; nothing else writes
+/// staging tables. So a visible row of this transaction with `xmax = 0` was never
+/// deleted and its `cmin` is the command that staged it. With `xmax <> 0` a
+/// flush of this transaction deleted it in a subtransaction that aborted, and its
+/// `cmin` is a combo command id that says nothing about when it was staged; but
+/// a deleter whose xid precedes `next_xid` was assigned it before the rebuild, so
+/// the row was staged even earlier (a subtransaction cannot be entered and left
+/// by its ancestors' writes), and is reflected by the rebuild.
+#[derive(Clone, Copy)]
+struct Watermark {
+    command: i64,
+    next_xid: u32,
+}
+
+impl Watermark {
+    fn now() -> Self {
+        let command = i64::from(unsafe { pg_sys::GetCurrentCommandId(true) });
+        let next_xid = unsafe { pg_sys::ReadNextFullTransactionId() }.value as u32;
+        Self { command, next_xid }
+    }
+
+    /// Staged by this transaction after the rebuild (`xmax = 0`), or possibly so
+    /// (an aborted deleter that is not older than the rebuild).
+    fn after_rebuild_predicate(self) -> String {
+        format!(
+            "{WRITTEN_BY_THIS_XACT} AND CASE WHEN xmax = '0'::xid \
+               THEN cmin::text::bigint > {command} \
+               ELSE NOT public.__reflex_xid_precedes(xmax, '{next_xid}'::xid) END",
+            command = self.command,
+            next_xid = self.next_xid
+        )
+    }
+
+    /// Rows whose staging time relative to the rebuild cannot be told.
+    fn ambiguous_predicate(self) -> String {
+        format!(
+            "{WRITTEN_BY_THIS_XACT} AND xmax <> '0'::xid \
+             AND NOT public.__reflex_xid_precedes(xmax, '{}'::xid)",
+            self.next_xid
+        )
+    }
+}
+
+/// The rows of `delta_tbl` staged after the rebuild at `watermark`. Applied only
+/// when none of them is ambiguous, so all of them have `xmax = 0`.
+fn delta_staged_after(delta_tbl: &str, watermark: Watermark) -> String {
     format!(
-        "(SELECT * FROM {delta_tbl} \
-          WHERE {WRITTEN_BY_THIS_XACT} AND cmin::text::bigint > {watermark}) __reflex_post"
+        "(SELECT * FROM {delta_tbl} WHERE {}) __reflex_post",
+        watermark.after_rebuild_predicate()
     )
 }
 
-fn staged_after(client: &pgrx::spi::SpiClient<'_>, delta_tbl: &str, watermark: i64) -> bool {
+fn delta_has_rows(client: &pgrx::spi::SpiClient<'_>, delta_tbl: &str, predicate: &str) -> bool {
     let select_bool = |sql: &str| {
         client
             .select(sql, None, &[])
@@ -109,16 +155,14 @@ fn staged_after(client: &pgrx::spi::SpiClient<'_>, delta_tbl: &str, watermark: i
         "SELECT to_regclass('{}') IS NOT NULL",
         delta_tbl.replace('\'', "''")
     )) && select_bool(&format!(
-        "SELECT EXISTS (SELECT 1 FROM {})",
-        delta_staged_after(delta_tbl, watermark)
+        "SELECT EXISTS (SELECT 1 FROM {delta_tbl} WHERE {predicate})"
     ))
 }
 
-/// The command id a rebuild starting now reads at: every row staged so far has a
-/// `cmin` at or below it, every row staged later one above it (marking it used
-/// makes the next command id increment).
-fn rebuild_watermark() -> i64 {
-    i64::from(unsafe { pg_sys::GetCurrentCommandId(true) })
+/// Wraparound-safe `a < b` on transaction ids.
+#[pg_extern(name = "__reflex_xid_precedes", immutable, parallel_safe)]
+fn reflex_xid_precedes(a: pg_sys::TransactionId, b: pg_sys::TransactionId) -> bool {
+    unsafe { pg_sys::TransactionIdPrecedes(a, b) }
 }
 
 /// Sources `imv_name` observes (its `depends_on` minus `ignored_sources`).
@@ -139,10 +183,11 @@ fn observed_sources(client: &pgrx::spi::SpiClient<'_>, imv_name: &str) -> Vec<St
         .collect()
 }
 
-fn rebuild_watermark_of(client: &pgrx::spi::SpiClient<'_>, imv_name: &str) -> Option<i64> {
+fn rebuild_watermark_of(client: &pgrx::spi::SpiClient<'_>, imv_name: &str) -> Option<Watermark> {
     client
         .select(
-            "SELECT watermark FROM pg_temp.__reflex_deferred_reconciled_batch WHERE name = $1",
+            "SELECT watermark, watermark_xid::text::bigint AS watermark_xid \
+             FROM pg_temp.__reflex_deferred_reconciled_batch WHERE name = $1",
             None,
             &[unsafe {
                 DatumWithOid::new(imv_name.to_string(), PgBuiltInOids::TEXTOID.oid().value())
@@ -150,7 +195,14 @@ fn rebuild_watermark_of(client: &pgrx::spi::SpiClient<'_>, imv_name: &str) -> Op
         )
         .unwrap_or_report()
         .next()
-        .and_then(|row| row.get_by_name::<i64, _>("watermark").unwrap_or(None))
+        .and_then(|row| {
+            let command = row.get_by_name::<i64, _>("watermark").unwrap_or(None)?;
+            let next_xid = row.get_by_name::<i64, _>("watermark_xid").unwrap_or(None)?;
+            Some(Watermark {
+                command,
+                next_xid: next_xid as u32,
+            })
+        })
 }
 
 /// `pg_reflex.flush_failure_policy`: `error` aborts the caller on a per-IMV
@@ -477,13 +529,17 @@ fn rebuild_listed(client: &mut pgrx::spi::SpiClient<'_>, listed: &[String]) -> u
             "__reflex_deferred_reconciled_batch",
             RECONCILED_BATCH_TABLE_DDL,
         );
+        // Taken just before the rebuild reads its sources.
+        let watermark = Watermark::now();
         client
             .update(
                 &format!(
-                    "INSERT INTO __reflex_deferred_reconciled_batch (name, watermark) \
-                     VALUES ('{imv_esc}', {}) \
-                     ON CONFLICT (name) DO UPDATE SET watermark = EXCLUDED.watermark",
-                    rebuild_watermark()
+                    "INSERT INTO __reflex_deferred_reconciled_batch \
+                       (name, watermark, watermark_xid) \
+                     VALUES ('{imv_esc}', {}, '{}'::xid) \
+                     ON CONFLICT (name) DO UPDATE SET watermark = EXCLUDED.watermark, \
+                       watermark_xid = EXCLUDED.watermark_xid",
+                    watermark.command, watermark.next_xid
                 ),
                 None,
                 &[],
@@ -992,7 +1048,8 @@ fn flush_staged_deltas(source_table: &str) -> String {
             .unwrap_or(false);
         // A delta that nets to nothing as a whole need not for an IMV rebuilt in
         // this transaction: it takes only the rows staged after its rebuild.
-        let any_rebuilt_here = marker_exists
+        let any_rebuilt_here = is_spurious
+            && marker_exists
             && imvs
                 .iter()
                 .any(|imv| rebuild_watermark_of(client, &imv.0).is_some());
@@ -1071,22 +1128,26 @@ fn flush_staged_deltas(source_table: &str) -> String {
                 if let Some(watermark) = rebuild_watermark_of(client, imv_name) {
                     // Rebuilt in this transaction: the deltas staged up to its
                     // rebuild are in it; the ones staged after are applied.
-                    if !staged_after(client, &delta_tbl, watermark) {
+                    let after = watermark.after_rebuild_predicate();
+                    if !delta_has_rows(client, &delta_tbl, &after) {
                         continue;
                     }
-                    let other_source_staged_after =
-                        observed_sources(client, imv_name).iter().any(|source| {
-                            source != source_table
-                                && staged_after(
-                                    client,
-                                    &staging_delta_table_name(source),
-                                    watermark,
-                                )
-                        });
-                    if other_source_staged_after {
-                        // Two of its sources changed since the rebuild: applied
-                        // one by one they would count their cross product twice.
-                        // Rebuild it again after this flush.
+                    // A row whose staging cannot be placed relative to the
+                    // rebuild is never applied incrementally; nor are deltas of
+                    // two sources changed since it (applied one by one they
+                    // would count their cross product twice). Rebuild it again,
+                    // from the final state, after this flush.
+                    let rebuild_again =
+                        delta_has_rows(client, &delta_tbl, &watermark.ambiguous_predicate())
+                            || observed_sources(client, imv_name).iter().any(|source| {
+                                source != source_table
+                                    && delta_has_rows(
+                                        client,
+                                        &staging_delta_table_name(source),
+                                        &after,
+                                    )
+                            });
+                    if rebuild_again {
                         ensure_temp_table(
                             client,
                             "__reflex_deferred_rebuild",
@@ -1098,7 +1159,8 @@ fn flush_staged_deltas(source_table: &str) -> String {
                                     "DELETE FROM pg_temp.__reflex_deferred_reconciled_batch \
                                      WHERE name = '{imv_esc}'; \
                                      INSERT INTO pg_temp.__reflex_deferred_rebuild (name) \
-                                     VALUES ('{imv_esc}') ON CONFLICT (name) DO NOTHING"
+                                     VALUES ('{imv_esc}') \
+                                     ON CONFLICT (name) DO UPDATE SET attempts = 0"
                                 ),
                                 None,
                                 &[],

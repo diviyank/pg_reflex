@@ -55,7 +55,12 @@ instead of aborting COMMIT. `ALTER EXTENSION pg_reflex UPDATE TO '1.11.5';`
   isolated in a subtransaction, and a failure marks the IMV `known_stale`
   instead of aborting the COMMIT (`flush_failure_policy = error` still
   aborts).
-- **(SILENT) After a mid-transaction `SET CONSTRAINTS ALL IMMEDIATE` rebuilt a DEFERRED IMV (source TRUNCATE or guard), the transaction's later DML was skipped for it**; each rebuild now records a command-id watermark, deltas staged after it are applied, and a second TRUNCATE or two sources changed again rebuild it again.
+- **(SILENT) DML after a mid-transaction `SET CONSTRAINTS ALL IMMEDIATE`
+  was skipped for a DEFERRED IMV already rebuilt in the transaction**
+  (source TRUNCATE or guard). Each rebuild now records its command id and
+  the next xid; deltas staged after it are applied, and a second TRUNCATE,
+  two sources changed again, or a staged row whose aborted flush leaves its
+  position unknown rebuild it again.
 - **Volume dispatch misjudged two-level partitioned IMVs.** A dirty
   partition was sized by the partitioned child's own `reltuples` (0 / -1,
   so always the 1000-row floor), and any ≥ 500-row change to a plan rebuilt
@@ -71,8 +76,8 @@ instead of aborting COMMIT. `ALTER EXTENSION pg_reflex UPDATE TO '1.11.5';`
 - `reflex_rebuild_target_rows(view, rebuild_sql)` — the dependent-safe
   target rebuild used by every rebuild path.
 - Internal: `__reflex_target_propagates(view)`,
-  `__reflex_rebuild_cost_rows(view, child oid)` and
-  `__reflex_xid_is_current(xid)`.
+  `__reflex_rebuild_cost_rows(view, child oid)`,
+  `__reflex_xid_is_current(xid)` and `__reflex_xid_precedes(xid, xid)`.
 
 ### Changed
 
@@ -85,11 +90,14 @@ instead of aborting COMMIT. `ALTER EXTENSION pg_reflex UPDATE TO '1.11.5';`
 ### Known limits
 
 Filed in `untreated_bugs/`: a passthrough dependent with no key mapping for
-a source still fully refreshes (now as a diff) on every statement on it; the guard's
-COMMIT-time reconcile may drop orphan partitions (pre-existing); hot/cold
-dispatch still classifies a two-level mirror per plan, not per leaf;
+a source still fully refreshes (now as a diff) on every statement on it;
+the guard's COMMIT-time reconcile may drop orphan partitions (pre-existing);
+hot/cold dispatch still classifies a two-level mirror per plan, not per leaf;
 `create_reflex_ivm` rejects three mixed-case name shapes; the partitioned
-passthrough 23505 flush failure of the incident is not reproduced yet.
+passthrough 23505 flush failure of the incident is not reproduced yet;
+trigger regeneration through `reflex_rebuild_triggers` inside past
+`ALTER EXTENSION` updates (and for bare-name public sources, always) was a
+silent no-op.
 
 ### Tests
 
@@ -101,7 +109,7 @@ passthrough 23505 flush failure of the incident is not reproduced yet.
 
 ### Migration
 
-- `sql/pg_reflex--1.11.4--1.11.5.sql` creates the four functions, replaces
+- `sql/pg_reflex--1.11.4--1.11.5.sql` creates the five functions, replaces
   `__reflex_deferred_flush_fn`, rewrites the pending-row DELETE in every
   installed deferred TRUNCATE trigger body (no lock on the sources), and
   deletes leftover `'TRUNCATE'` request rows. Install the library and run
