@@ -457,3 +457,113 @@ fn pg_rbd_invalid_unique_index_is_not_a_key() {
         "an invalid unique index was used as the diff key"
     );
 }
+
+/// A FULL JOIN IMV with a dependent: a source change takes the full-refresh
+/// fallback, which must reach the dependent as a diff, not a rebuild.
+#[pg_test]
+fn pg_rbd_full_join_fallback_hands_dependent_a_diff() {
+    Spi::run("CREATE TABLE rfj_a (k INT PRIMARY KEY, v INT)").expect("a");
+    Spi::run("CREATE TABLE rfj_b (k INT PRIMARY KEY, w INT)").expect("b");
+    Spi::run("INSERT INTO rfj_a SELECT g, g FROM generate_series(1, 100) g").expect("seed a");
+    Spi::run("INSERT INTO rfj_b SELECT g, g FROM generate_series(50, 150) g").expect("seed b");
+    let up_sql =
+        "SELECT COALESCE(a.k, b.k) AS k, a.v, b.w FROM rfj_a a FULL JOIN rfj_b b ON a.k = b.k";
+    assert_eq!(
+        crate::create_reflex_ivm("rfj_up", up_sql, Some("k"), None, None, None),
+        "CREATE REFLEX INCREMENTAL VIEW"
+    );
+    assert_eq!(
+        crate::create_reflex_ivm(
+            "rfj_dep",
+            "SELECT k, v, w FROM rfj_up",
+            Some("k"),
+            None,
+            None,
+            None
+        ),
+        "CREATE REFLEX INCREMENTAL VIEW"
+    );
+    let before = tree_xact_changes("rfj_dep");
+    Spi::run("UPDATE rfj_a SET v = v + 1 WHERE k = 10").expect("one change");
+    assert_imv_correct("rfj_up", up_sql);
+    assert_imv_correct("rfj_dep", up_sql);
+    assert!(
+        tree_xact_changes("rfj_dep") - before <= 2,
+        "dependent of a FULL JOIN IMV rebuilt in full"
+    );
+}
+
+/// Ungrouped aggregate with a dependent: every statement rebuilds the
+/// one-row target; the dependent must see one row change, not a rebuild.
+#[pg_test]
+fn pg_rbd_ungrouped_aggregate_epilogue_hands_dependent_a_diff() {
+    Spi::run("CREATE TABLE rug_src (v INT)").expect("src");
+    Spi::run("INSERT INTO rug_src SELECT g FROM generate_series(1, 10) g").expect("seed");
+    assert_eq!(
+        crate::create_reflex_ivm(
+            "rug_up",
+            "SELECT SUM(v) AS s, COUNT(*) AS n FROM rug_src",
+            None,
+            None,
+            None,
+            None
+        ),
+        "CREATE REFLEX INCREMENTAL VIEW"
+    );
+    assert_eq!(
+        crate::create_reflex_ivm(
+            "rug_dep",
+            "SELECT s * 2 AS s2 FROM rug_up",
+            None,
+            None,
+            None,
+            None
+        ),
+        "CREATE REFLEX INCREMENTAL VIEW"
+    );
+    let before = tree_xact_changes("rug_dep");
+    Spi::run("INSERT INTO rug_src VALUES (5)").expect("change");
+    assert_imv_correct("rug_up", "SELECT SUM(v) AS s, COUNT(*) AS n FROM rug_src");
+    assert_imv_correct("rug_dep", "SELECT SUM(v) * 2 AS s2 FROM rug_src");
+    assert!(
+        tree_xact_changes("rug_dep") - before <= 2,
+        "dependent of an ungrouped aggregate IMV rebuilt in full"
+    );
+}
+
+/// Deferred mode runs the delta inside a raw PL/pgSQL body (`PERFORM` form of
+/// the rebuild call); the FULL JOIN fallback there must still hand the
+/// dependent a diff.
+#[pg_test]
+fn pg_rbd_deferred_full_join_fallback_hands_dependent_a_diff() {
+    Spi::run("CREATE TABLE rfd_a (k INT PRIMARY KEY, v INT)").expect("a");
+    Spi::run("CREATE TABLE rfd_b (k INT PRIMARY KEY, w INT)").expect("b");
+    Spi::run("INSERT INTO rfd_a SELECT g, g FROM generate_series(1, 100) g").expect("seed a");
+    Spi::run("INSERT INTO rfd_b SELECT g, g FROM generate_series(50, 150) g").expect("seed b");
+    let up_sql =
+        "SELECT COALESCE(a.k, b.k) AS k, a.v, b.w FROM rfd_a a FULL JOIN rfd_b b ON a.k = b.k";
+    assert_eq!(
+        crate::create_reflex_ivm("rfd_up", up_sql, Some("k"), None, Some("DEFERRED"), None),
+        "CREATE REFLEX INCREMENTAL VIEW"
+    );
+    assert_eq!(
+        crate::create_reflex_ivm(
+            "rfd_dep",
+            "SELECT k, v, w FROM rfd_up",
+            Some("k"),
+            None,
+            None,
+            None
+        ),
+        "CREATE REFLEX INCREMENTAL VIEW"
+    );
+    let before = tree_xact_changes("rfd_dep");
+    Spi::run("UPDATE rfd_a SET v = v + 1 WHERE k = 10").expect("one change");
+    Spi::run("SELECT reflex_flush_deferred('rfd_a')").expect("flush");
+    assert_imv_correct("rfd_up", up_sql);
+    assert_imv_correct("rfd_dep", up_sql);
+    assert!(
+        tree_xact_changes("rfd_dep") - before <= 2,
+        "dependent of a deferred FULL JOIN IMV rebuilt in full"
+    );
+}
