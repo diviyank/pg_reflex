@@ -502,11 +502,14 @@ pub fn reflex_build_truncate_sql(view_name: &str) -> String {
     stmts.join("\n--<<REFLEX_SEP>>--\n")
 }
 
-/// Transaction-local list of DEFERRED IMVs whose source was truncated, with the
-/// number of times their commit-time rebuild was postponed.
+/// Transaction-local list of DEFERRED IMVs to rebuild at COMMIT — their source
+/// was truncated, or the cross-source guard engaged on them (`reconcile`: rebuilt
+/// through `reflex_reconcile`) — with the number of times their rebuild was
+/// postponed.
 pub(crate) const DEFERRED_REBUILD_TABLE_DDL: &str =
     "CREATE TEMP TABLE IF NOT EXISTS __reflex_deferred_rebuild \
-     (name TEXT PRIMARY KEY, attempts INT NOT NULL DEFAULT 0) ON COMMIT DROP";
+     (name TEXT PRIMARY KEY, attempts INT NOT NULL DEFAULT 0, \
+      reconcile BOOLEAN NOT NULL DEFAULT FALSE) ON COMMIT DROP";
 
 /// The first source `view_name` does not ignore: a pending row on it makes a flush
 /// that selects `view_name` run at COMMIT. `None` when it ignores every source.

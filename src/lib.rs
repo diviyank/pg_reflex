@@ -1852,6 +1852,7 @@ mod tests {
     include!("tests/pg_test_capped_source_status.rs");
     include!("tests/pg_test_ignored_source_heal.rs");
     include!("tests/pg_test_reconcile_log_noise.rs");
+    include!("tests/pg_test_rebuild_commit.rs");
 }
 
 /// This module is required by `cargo pgrx test` invocations.

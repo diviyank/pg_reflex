@@ -116,6 +116,25 @@ fn temp_table_names(client: &pgrx::spi::SpiClient<'_>, table: &str) -> Vec<Strin
         .collect()
 }
 
+/// Runs `ddl` (a `CREATE TEMP TABLE IF NOT EXISTS`) only when `table` is absent,
+/// so a batch does not re-issue it on every flush.
+fn ensure_temp_table(client: &mut pgrx::spi::SpiClient<'_>, table: &str, ddl: &str) {
+    let present = client
+        .select(
+            &format!("SELECT to_regclass('pg_temp.{table}') IS NOT NULL"),
+            None,
+            &[],
+        )
+        .unwrap_or_report()
+        .first()
+        .get_one::<bool>()
+        .unwrap_or(None)
+        .unwrap_or(false);
+    if !present {
+        client.update(ddl, None, &[]).unwrap_or_report();
+    }
+}
+
 /// Commit-time rebuilds postponed while upstream DEFERRED IMVs are still pending,
 /// per IMV, before rebuilding anyway and marking the IMV stale.
 const TRUNCATE_REBUILD_MAX_DEFERRALS: i32 = 64;
@@ -223,12 +242,13 @@ fn flush_request_outstanding(client: &pgrx::spi::SpiClient<'_>, imv_name: &str) 
         .unwrap_or(false)
 }
 
-/// stale_reason of an IMV whose TRUNCATE rebuild is postponed; its rebuild clears it.
-const POSTPONED_REASON: &str =
-    "source truncated; rebuild postponed until upstream DEFERRED IMVs settle";
+/// stale_reason of an IMV whose COMMIT-time rebuild is postponed; its rebuild clears it.
+const POSTPONED_REASON: &str = "COMMIT-time rebuild postponed until upstream DEFERRED IMVs settle";
 
-/// Rebuilds, once per transaction, each IMV a source TRUNCATE listed in
-/// `__reflex_deferred_rebuild` (`reflex_build_truncate_sql`), and records it in
+/// Rebuilds, once per transaction, each IMV listed in `__reflex_deferred_rebuild`
+/// by a source TRUNCATE (`reflex_build_truncate_sql`) or by the cross-source
+/// guard (`flush_staged_deltas`; rebuilt by `rebuild_for_cross_source_guard`),
+/// and records it in
 /// `__reflex_deferred_reconciled_batch` so every delta staged for it in this
 /// transaction is skipped. Runs around every flush, whatever its source: the
 /// rebuild must read every upstream IMV in its final state, so while one may
@@ -257,7 +277,7 @@ fn rebuild_truncated_imvs(client: &mut pgrx::spi::SpiClient<'_>) -> usize {
     if nested {
         return 0;
     }
-    let listed = listed_for_rebuild(client);
+    let mut listed = listed_for_rebuild(client);
     if listed.is_empty() {
         return 0;
     }
@@ -268,7 +288,16 @@ fn rebuild_truncated_imvs(client: &mut pgrx::spi::SpiClient<'_>) -> usize {
             &[],
         )
         .unwrap_or_report();
-    let rebuilt = rebuild_listed(client, &listed);
+    let mut rebuilt = 0usize;
+    // A flush nested in this pass (it returns at once here) may list more IMVs.
+    loop {
+        rebuilt += rebuild_listed(client, &listed);
+        let relisted = listed_for_rebuild(client);
+        if relisted.iter().all(|name| listed.contains(name)) {
+            break;
+        }
+        listed = relisted;
+    }
     client
         .update(
             "SELECT set_config('pg_reflex.truncate_rebuild_running', '', true)",
@@ -357,9 +386,11 @@ fn rebuild_listed(client: &mut pgrx::spi::SpiClient<'_>, listed: &[String]) -> u
                 continue;
             }
         }
-        client
-            .update(RECONCILED_BATCH_TABLE_DDL, None, &[])
-            .unwrap_or_report();
+        ensure_temp_table(
+            client,
+            "__reflex_deferred_reconciled_batch",
+            RECONCILED_BATCH_TABLE_DDL,
+        );
         client
             .update(
                 &format!(
@@ -371,6 +402,24 @@ fn rebuild_listed(client: &mut pgrx::spi::SpiClient<'_>, listed: &[String]) -> u
             )
             .unwrap_or_report();
         already_rebuilt.push(imv_name.clone());
+        let listed_by_guard = client
+            .select(
+                &format!(
+                    "SELECT reconcile FROM pg_temp.__reflex_deferred_rebuild WHERE name = '{imv_esc}'"
+                ),
+                None,
+                &[],
+            )
+            .unwrap_or_report()
+            .first()
+            .get_one::<bool>()
+            .unwrap_or(None)
+            .unwrap_or(false);
+        if listed_by_guard {
+            rebuild_for_cross_source_guard(client, imv_name, upstream_moving, fail_hard);
+            rebuilt += 1;
+            continue;
+        }
         let mut stmts = match truncate_rebuild(imv_name) {
             TruncateRebuild::Stmts(stmts) => stmts,
             TruncateRebuild::Wrapper => continue,
@@ -439,6 +488,73 @@ fn rebuild_listed(client: &mut pgrx::spi::SpiClient<'_>, listed: &[String]) -> u
         rebuilt += 1;
     }
     rebuilt
+}
+
+/// Rebuilds an IMV the cross-source guard listed, through `reflex_reconcile`
+/// (a generated sub-IMV through its propagation-safe variant), in its own
+/// subtransaction: a raised error rolls back only this rebuild (or, under
+/// `flush_failure_policy = error`, aborts the caller). A failure, raised or
+/// returned as an `ERROR:` string, flags the IMV stale: the deltas staged for it
+/// in this transaction are skipped, so nothing else would ever repair it.
+///
+/// Flagging is safe only because the IMV can never be a decomposed WRAPPER,
+/// whose `reconcile_one` refusal is an `ERROR:` string nothing could ever clear.
+/// The guard lists an IMV the flush selected by `= ANY(depends_on)`; a wrapper's
+/// `depends_on` holds only its generated operands, which carry
+/// `__reflex_union_mirror_*` triggers only — never the staging triggers that
+/// write `__reflex_deferred_pending` (pinned by
+/// `xsu_wrapper_operands_have_no_staging_triggers`).
+fn rebuild_for_cross_source_guard(
+    client: &mut pgrx::spi::SpiClient<'_>,
+    imv_name: &str,
+    upstream_moving: bool,
+    fail_hard: bool,
+) {
+    let result = if fail_hard {
+        crate::reconcile::reconcile_for_cross_source_guard(imv_name).to_string()
+    } else {
+        crate::reconcile::reconcile_isolated(imv_name)
+    };
+    let failed = result.starts_with("ERROR");
+    let stale_reason = if failed {
+        pgrx::warning!(
+            "pg_reflex: IMV {} cross-source guard reconcile failed: {}",
+            imv_name,
+            result
+        );
+        format!("cross-source guard reconcile failed: {result}")
+    } else if upstream_moving {
+        pgrx::warning!(
+            "pg_reflex: IMV {} rebuilt by the cross-source guard while upstream DEFERRED IMVs \
+             were still pending after {} deferrals; marking it stale",
+            imv_name,
+            TRUNCATE_REBUILD_MAX_DEFERRALS
+        );
+        format!(
+            "rebuilt by the cross-source guard while upstream DEFERRED IMVs still had pending \
+             changes ({TRUNCATE_REBUILD_MAX_DEFERRALS} deferrals exhausted); run \
+             reflex_reconcile('{imv_name}') to repair."
+        )
+    } else {
+        return;
+    };
+    client
+        .update(
+            "UPDATE public.__reflex_ivm_reference \
+             SET known_stale = TRUE, stale_reason = left($2, 2000), stale_since = now(), \
+                 last_error = CASE WHEN $3 THEN left($4, 500) ELSE last_error END \
+             WHERE name = $1",
+            None,
+            &[
+                unsafe {
+                    DatumWithOid::new(imv_name.to_string(), PgBuiltInOids::TEXTOID.oid().value())
+                },
+                unsafe { DatumWithOid::new(stale_reason, PgBuiltInOids::TEXTOID.oid().value()) },
+                unsafe { DatumWithOid::new(failed, PgBuiltInOids::BOOLOID.oid().value()) },
+                unsafe { DatumWithOid::new(result, PgBuiltInOids::TEXTOID.oid().value()) },
+            ],
+        )
+        .unwrap_or_report();
 }
 
 /// Flushes all accumulated deferred deltas for a given source table.
@@ -796,8 +912,9 @@ fn flush_staged_deltas(source_table: &str) -> String {
         // IMMEDIATE mode is immune (per-statement triggers apply deltas
         // sequentially, each seeing the correct intermediate state); the
         // hazard is unique to the commit-time batch flush. Detect the batch
-        // shape once here — the per-IMV loop full-reconciles any affected IMV
-        // exactly once via the transaction-local marker below. 'TRUNCATE' rows are
+        // shape once here — the per-IMV loop lists any affected IMV for one
+        // COMMIT-time full rebuild (`rebuild_listed`), and every delta staged for
+        // it in this transaction is skipped. 'TRUNCATE' rows are
         // flush requests, not staged deltas, so they never count as a source.
         let batch_has_multiple_sources = client
             .select(
@@ -860,12 +977,13 @@ fn flush_staged_deltas(source_table: &str) -> String {
         for (imv_name, base_query, end_query, agg_json, where_pred) in &imvs {
             if engage_cross_source_guard {
                 let imv_esc = imv_name.replace('\'', "''");
-                let already_reconciled = client
+                // Rebuilt in this batch, or listed for a COMMIT-time rebuild
+                // (`rebuild_listed`): every delta staged for it is skipped.
+                let rebuilt_or_listed = client
                     .select(
                         &format!(
                             "SELECT EXISTS(SELECT 1 FROM __reflex_deferred_reconciled_batch \
-                             WHERE name = '{}') AS e",
-                            imv_esc
+                             WHERE name = '{imv_esc}') AS e"
                         ),
                         None,
                         &[],
@@ -877,8 +995,9 @@ fn flush_staged_deltas(source_table: &str) -> String {
                             .unwrap_or(None)
                             .unwrap_or(false)
                     })
-                    .unwrap_or(false);
-                if already_reconciled {
+                    .unwrap_or(false)
+                    || temp_table_names(client, "__reflex_deferred_rebuild").contains(imv_name);
+                if rebuilt_or_listed {
                     continue;
                 }
                 // Count this IMV's own sources that are pending in the batch.
@@ -908,111 +1027,30 @@ fn flush_staged_deltas(source_table: &str) -> String {
                     })
                     .unwrap_or(false);
                 if imv_has_multiple_sources {
+                    // Listed for the COMMIT-time rebuild pass that follows this
+                    // flush (`reflex_flush_deferred`) instead of reconciled here:
+                    // the rebuild must read every upstream DEFERRED IMV in its
+                    // final state, so it waits until none has a delta this
+                    // transaction staged and still unflushed (`upstream_pending`),
+                    // and runs in its own subtransaction, so a failure flags the
+                    // IMV stale instead of aborting the COMMIT
+                    // (`rebuild_for_cross_source_guard`).
+                    ensure_temp_table(
+                        client,
+                        "__reflex_deferred_rebuild",
+                        crate::trigger::DEFERRED_REBUILD_TABLE_DDL,
+                    );
                     client
                         .update(
                             &format!(
-                                "INSERT INTO __reflex_deferred_reconciled_batch (name) \
-                                 VALUES ('{}') ON CONFLICT DO NOTHING",
-                                imv_esc
+                                "INSERT INTO pg_temp.__reflex_deferred_rebuild (name, reconcile) \
+                                 VALUES ('{imv_esc}', TRUE) \
+                                 ON CONFLICT (name) DO UPDATE SET reconcile = TRUE"
                             ),
                             None,
                             &[],
                         )
                         .unwrap_or_report();
-
-                    // A GENERATED sub-IMV (a CTE / UNION-ALL / set-op operand
-                    // pg_reflex itself created) must never be repaired through
-                    // the public `reflex_reconcile` from here. We are running
-                    // inside the deferred COMMIT trigger
-                    // (`pg_trigger_depth() > 0`), and
-                    // `reflex_reconcile_with_orphans`'s `inside_trigger` gate
-                    // skips straight to `reconcile_one` with the node's OWN
-                    // triggers live for exactly that reason — but for a
-                    // UNION-ALL operand that live trigger is a mirror that
-                    // re-appends the operand's full row set into its wrapper
-                    // on the rebuild's INSERT, with nothing having removed the
-                    // wrapper's stale slice (`TRUNCATE` doesn't fire it),
-                    // silently doubling the wrapper and everything reading it.
-                    // `reconcile_generated_child_for_cross_source_guard`
-                    // rebuilds with propagation suppressed instead, and
-                    // resyncs the wrapper's slice when there is one.
-                    let is_generated = client
-                        .select(
-                            &format!(
-                                "SELECT COALESCE(is_generated_sub_imv, FALSE) AS g \
-                                 FROM public.__reflex_ivm_reference WHERE name = '{}'",
-                                imv_esc
-                            ),
-                            None,
-                            &[],
-                        )
-                        .unwrap_or_report()
-                        .next()
-                        .map(|row| {
-                            row.get_by_name::<bool, _>("g")
-                                .unwrap_or(None)
-                                .unwrap_or(false)
-                        })
-                        .unwrap_or(false);
-
-                    let reconcile_result: String = if is_generated {
-                        crate::reconcile::reconcile_generated_child_for_cross_source_guard(imv_name)
-                            .to_string()
-                    } else {
-                        client
-                            .select(
-                                &format!("SELECT public.reflex_reconcile('{}') AS r", imv_esc),
-                                None,
-                                &[],
-                            )
-                            .unwrap_or_report()
-                            .next()
-                            .and_then(|row| row.get_by_name::<&str, _>("r").unwrap_or(None))
-                            .map(|s| s.to_string())
-                            .unwrap_or_else(|| {
-                                "ERROR: reflex_reconcile returned no result".to_string()
-                            })
-                    };
-
-                    // Never silently discard a staged delta whose only
-                    // consumer failed (facet (b), 2026-07-25 bug report):
-                    // most reconcile failures are returned STRINGS, not
-                    // raises, so without this the end-of-flush cleanup below
-                    // deletes the delta and pending row unconditionally,
-                    // converting the failure into permanent silent staleness.
-                    // Flag it instead — the operator (or the next scheduled
-                    // sweep, once the underlying issue is fixed) has a signal
-                    // to act on.
-                    //
-                    // Flagging unconditionally is safe only because `imv_name`
-                    // can never be a decomposed WRAPPER, whose `reconcile_one`
-                    // refusal is an `ERROR:` string nothing could ever clear
-                    // (the clear lives past that refusal). A wrapper's
-                    // `depends_on` holds only its generated operands, and those
-                    // operands carry `__reflex_union_mirror_*` triggers only —
-                    // never the consolidated staging triggers that write
-                    // `__reflex_deferred_pending` — so no wrapper is ever
-                    // selected by the `= ANY(depends_on)` query this flush runs.
-                    // Pinned by
-                    // `xsu_wrapper_operands_have_no_staging_triggers`.
-                    if reconcile_result.starts_with("ERROR") {
-                        client
-                            .update(
-                                &format!(
-                                    "UPDATE public.__reflex_ivm_reference \
-                                     SET known_stale = TRUE, \
-                                         stale_reason = left('cross-source guard reconcile failed: {}', 2000), \
-                                         stale_since = now() \
-                                     WHERE name = '{}'",
-                                    reconcile_result.replace('\'', "''"),
-                                    imv_esc
-                                ),
-                                None,
-                                &[],
-                            )
-                            .unwrap_or_report();
-                    }
-
                     total_processed += 1;
                     continue;
                 }
