@@ -552,10 +552,15 @@ pub(crate) fn reconcile_one(view_name: &str, drop_orphans: bool) -> &'static str
             }
         }
 
-        let propagates = target_propagates(client, view_name);
+        let propagates = crate::rebuild_diff::target_propagates(client, view_name);
 
         if (is_passthrough || end_query.is_empty()) && propagates {
-            apply_rebuild_as_diff(client, &quote_identifier(view_name), None, &base_query);
+            crate::rebuild_diff::rebuild_target_rows(
+                client,
+                view_name,
+                &base_query,
+                &crate::rebuild_diff::RebuildScope::Whole,
+            );
         } else if is_passthrough || end_query.is_empty() {
             // Passthrough: optimized refresh — drop indexes, TRUNCATE, INSERT, recreate, ANALYZE.
             // `indexname` is `name` (fixed 64B), not `text` — cast to text or
@@ -749,7 +754,12 @@ pub(crate) fn reconcile_one(view_name: &str, drop_orphans: bool) -> &'static str
                 )
                 .unwrap_or_report();
             if propagates {
-                apply_rebuild_as_diff(client, &quote_identifier(view_name), None, &end_query);
+                crate::rebuild_diff::rebuild_target_rows(
+                    client,
+                    view_name,
+                    &end_query,
+                    &crate::rebuild_diff::RebuildScope::Whole,
+                );
             } else {
                 client
                     .update(
@@ -830,75 +840,54 @@ pub(crate) fn reconcile_one(view_name: &str, drop_orphans: bool) -> &'static str
     })
 }
 
-/// Whether a write to the IMV's target reaches anything — an enabled,
-/// non-internal trigger, which is how every dependent IMV (and any user
-/// trigger) observes it. Disabled triggers (a suppressed generated child) do
-/// not count.
-pub(crate) fn target_propagates(client: &pgrx::spi::SpiClient<'_>, view_name: &str) -> bool {
-    client
-        .select(
-            "SELECT EXISTS (SELECT 1 FROM pg_trigger \
-              WHERE tgrelid = to_regclass($1) AND NOT tgisinternal AND tgenabled <> 'D') AS p",
-            None,
-            &[unsafe { DatumWithOid::new(view_name.to_string(), PgBuiltInOids::TEXTOID.oid().value()) }],
-        )
-        .unwrap_or_report()
-        .first()
-        .get_by_name::<bool, _>("p")
-        .unwrap_or(None)
-        .unwrap_or(true)
+/// Enabled IMVs that read `view_name` but list it in `ignored_sources`: no
+/// write to `view_name` reaches them, so a rebuild must refresh them itself.
+pub(crate) fn ignoring_dependents(view_name: &str) -> Vec<String> {
+    let bare = split_qualified_name(view_name)
+        .1
+        .trim_matches('"')
+        .to_string();
+    Spi::connect(|client| {
+        client
+            .select(
+                "SELECT name FROM public.__reflex_ivm_reference \
+                 WHERE enabled AND depends_on && ARRAY[$1, $2]::text[] \
+                   AND COALESCE(ignored_sources, ARRAY[]::text[]) && ARRAY[$1, $2]::text[] \
+                 ORDER BY graph_depth, name",
+                None,
+                &[
+                    unsafe {
+                        DatumWithOid::new(
+                            view_name.to_string(),
+                            PgBuiltInOids::TEXTOID.oid().value(),
+                        )
+                    },
+                    unsafe {
+                        DatumWithOid::new(bare.clone(), PgBuiltInOids::TEXTOID.oid().value())
+                    },
+                ],
+            )
+            .unwrap_or_report()
+            .filter_map(|row| {
+                row.get_by_name::<&str, _>("name")
+                    .ok()
+                    .flatten()
+                    .map(str::to_string)
+            })
+            .collect()
+    })
 }
 
-/// Bring `target` (restricted to the partition `leaf` when given) to the rows
-/// of `rebuild_sql` by deleting only the rows that left and inserting only the
-/// rows that arrived, so its dependents receive a real delta instead of a
-/// TRUNCATE (which tells them everything changed).
-///
-/// A multiset diff: rows compare by `to_jsonb(ROW(...))` — positional, NULL
-/// equal to NULL, hashable for every column type — and duplicates are matched
-/// copy for copy through `row_number()`. The writes go through `target`, never
-/// the leaf directly, because statement triggers fire on the relation written.
-pub(crate) fn apply_rebuild_as_diff(
-    client: &mut pgrx::spi::SpiClient<'_>,
-    target: &str,
-    leaf: Option<&str>,
-    rebuild_sql: &str,
-) {
-    let scope = match leaf {
-        Some(l) => format!("WHERE x.tableoid = '{}'::regclass", l.replace('\'', "''")),
-        None => String::new(),
-    };
-    let stmts = [
-        "DROP TABLE IF EXISTS pg_temp.__reflex_rebuild_next".to_string(),
-        format!(
-            "CREATE TEMP TABLE __reflex_rebuild_next AS SELECT * FROM ({rebuild_sql}) __reflex_q"
-        ),
-        format!(
-            "DELETE FROM {target} t USING ( \
-               SELECT o.toid, o.tid FROM ( \
-                 SELECT x.tableoid AS toid, x.ctid AS tid, to_jsonb(ROW(x.*)) AS j, \
-                        row_number() OVER (PARTITION BY to_jsonb(ROW(x.*))) AS rn \
-                 FROM {target} x {scope}) o \
-               LEFT JOIN (SELECT to_jsonb(ROW(n.*)) AS j, count(*) AS c \
-                          FROM pg_temp.__reflex_rebuild_next n GROUP BY 1) k ON k.j = o.j \
-               WHERE o.rn > COALESCE(k.c, 0)) d \
-             WHERE t.tableoid = d.toid AND t.ctid = d.tid"
-        ),
-        format!(
-            "INSERT INTO {target} SELECT n.* FROM pg_temp.__reflex_rebuild_next n WHERE n.ctid IN ( \
-               SELECT o.tid FROM ( \
-                 SELECT y.ctid AS tid, to_jsonb(ROW(y.*)) AS j, \
-                        row_number() OVER (PARTITION BY to_jsonb(ROW(y.*))) AS rn \
-                 FROM pg_temp.__reflex_rebuild_next y) o \
-               LEFT JOIN (SELECT to_jsonb(ROW(x.*)) AS j, count(*) AS c \
-                          FROM {target} x {scope} GROUP BY 1) k ON k.j = o.j \
-               WHERE o.rn > COALESCE(k.c, 0))"
-        ),
-        "DROP TABLE pg_temp.__reflex_rebuild_next".to_string(),
-    ];
-    for stmt in stmts {
-        client.update(&stmt, None, &[]).unwrap_or_report();
-    }
+fn is_partitioned_imv(view_name: &str) -> bool {
+    Spi::get_one_with_args::<bool>(
+        "SELECT COALESCE(array_length(partition_columns, 1), 0) > 0 \
+         FROM public.__reflex_ivm_reference WHERE name = $1",
+        &[unsafe {
+            DatumWithOid::new(view_name.to_string(), PgBuiltInOids::TEXTOID.oid().value())
+        }],
+    )
+    .unwrap_or(None)
+    .unwrap_or(false)
 }
 
 /// Reconcile an IMV by rebuilding intermediate + target from scratch, first
@@ -985,15 +974,28 @@ pub(crate) fn reflex_reconcile_with_orphans(view_name: &str, drop_orphans: bool)
     if !own.starts_with("ERROR") {
         cascade_partitioned_rebuild_to_dependents(view_name, drop_orphans);
     }
+    if !own.starts_with("ERROR") && !is_partitioned_imv(view_name) {
+        for dep in ignoring_dependents(view_name) {
+            let result = reflex_reconcile_with_orphans(&dep, drop_orphans);
+            if result.starts_with("ERROR") {
+                warning!(
+                    "pg_reflex: '{}' was rebuilt but its ignoring dependent '{}' returned: {} — it is STALE",
+                    view_name,
+                    dep,
+                    result
+                );
+            }
+        }
+    }
     own
 }
 
 /// Refresh the dependents of an IMV that was just rebuilt through the
 /// PARTITIONED path, which propagates nothing on its own.
 ///
-/// The unpartitioned rebuild is `TRUNCATE` + `INSERT`, and every source carries
-/// an `AFTER TRUNCATE … FOR EACH STATEMENT` trigger plus the statement-level
-/// INSERT trigger, so consumers follow it. The partitioned rebuild moves rows
+/// An unpartitioned rebuild of an IMV with dependents is a row diff the
+/// consumers receive as ordinary DML; consumers that IGNORE the rebuilt IMV see
+/// none of it and are refreshed explicitly (`ignoring_dependents`). The partitioned rebuild moves rows
 /// with `CREATE TABLE AS` into a detached table and then DETACH/ATTACH/RENAME —
 /// pure DDL, no DML on the live target, so no data trigger can fire and no
 /// consumer ever learns the IMV changed. Left alone the dependent serves stale

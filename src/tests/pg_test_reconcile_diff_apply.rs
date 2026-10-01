@@ -18,14 +18,11 @@ const RDA_DEPENDENT_KEY: &str = "product_id, location_id, id";
 /// rows that arrived), each rewriting at most the drifted key's rows.
 const RDA_DIFF_STATEMENTS: i64 = 2;
 
-fn rda_xact_changes(rel: &str) -> (i64, i64) {
-    let row = Spi::get_two::<i64, i64>(&format!(
-        "SELECT pg_stat_get_xact_tuples_inserted('{rel}'::regclass), \
-                pg_stat_get_xact_tuples_deleted('{rel}'::regclass)"
-    ))
-    .expect("xact stats");
-    (row.0.unwrap_or(0), row.1.unwrap_or(0))
-}
+/// An aggregate IMV has no unique index, so its rebuild diff is whole-row: a
+/// changed group reaches the dependent as DELETE + INSERT, and the dependent's
+/// own maintenance rewrites the key's rows once per statement (delete + insert
+/// each), i.e. twice the keyed-UPDATE cost. Still O(key rows), not O(IMV).
+const AGG_WHOLE_ROW_DIFF_FACTOR: i64 = 2;
 
 fn rda_build(prefix: &str) {
     Spi::run(&format!(
@@ -97,14 +94,17 @@ fn rda_one_row_drift_case(prefix: &str, mode: &str) {
         Spi::run(&format!("SELECT reflex_flush_deferred('{up}')")).expect("flush drift");
     }
 
-    let (ins_before, del_before) = rda_xact_changes(&dep);
+    let before = tree_xact_changes(&dep);
     rda_reconcile(&up);
     if mode == "DEFERRED" {
         Spi::run(&format!("SELECT reflex_flush_deferred('{up}')")).expect("flush reconcile");
     }
-    let (ins_after, del_after) = rda_xact_changes(&dep);
+    let after = tree_xact_changes(&dep);
 
-    assert_imv_correct(&up, &format!("SELECT product_id, location_id, is_active FROM {prefix}_rel"));
+    assert_imv_correct(
+        &up,
+        &format!("SELECT product_id, location_id, is_active FROM {prefix}_rel"),
+    );
     assert_imv_correct(&dep, &dep_fresh);
     let key_rows = Spi::get_one::<i64>(&format!(
         "SELECT count(*)::int8 FROM {prefix}_anchor WHERE product_id = 0 AND location_id = 0"
@@ -112,11 +112,9 @@ fn rda_one_row_drift_case(prefix: &str, mode: &str) {
     .expect("q")
     .expect("v");
     assert!(
-        del_after - del_before <= RDA_DIFF_STATEMENTS * key_rows
-            && ins_after - ins_before <= RDA_DIFF_STATEMENTS * key_rows,
-        "dependent rewritten beyond the drifted key: deleted {} / inserted {} (key has {} rows)",
-        del_after - del_before,
-        ins_after - ins_before,
+        after - before <= RDA_DIFF_STATEMENTS * key_rows,
+        "dependent rewritten beyond the drifted key: touched {} (key has {} rows)",
+        after - before,
         key_rows
     );
 }
@@ -155,9 +153,13 @@ fn pg_rda_reconcile_of_correct_imv_leaves_dependent_untouched() {
     );
     assert_eq!(res, "CREATE REFLEX INCREMENTAL VIEW");
 
-    let before = rda_xact_changes("rda3_dep");
+    let before = tree_xact_changes("rda3_dep");
     rda_reconcile("rda3_up");
-    assert_eq!(rda_xact_changes("rda3_dep"), before, "a no-op reconcile rewrote the dependent");
+    assert_eq!(
+        tree_xact_changes("rda3_dep"),
+        before,
+        "a no-op reconcile rewrote the dependent"
+    );
     assert_imv_correct("rda3_dep", &rda_dependent_sql("rda3", "rda3_rel"));
 }
 
@@ -228,11 +230,13 @@ fn pg_rda_aggregate_upstream_reaches_dependent_as_changed_groups() {
     assert_eq!(res, "CREATE REFLEX INCREMENTAL VIEW");
     let dep_fresh = rda_dependent_sql("rda5", &format!("({up_sql})"));
 
-    Spi::run("UPDATE rda5_up SET is_active = NOT is_active WHERE product_id = 0 AND location_id = 0")
-        .expect("drift one group");
-    let (ins_before, del_before) = rda_xact_changes("rda5_dep");
+    Spi::run(
+        "UPDATE rda5_up SET is_active = NOT is_active WHERE product_id = 0 AND location_id = 0",
+    )
+    .expect("drift one group");
+    let before = tree_xact_changes("rda5_dep");
     rda_reconcile("rda5_up");
-    let (ins_after, del_after) = rda_xact_changes("rda5_dep");
+    let after = tree_xact_changes("rda5_dep");
 
     assert_imv_correct("rda5_up", up_sql);
     assert_imv_correct("rda5_dep", &dep_fresh);
@@ -242,11 +246,9 @@ fn pg_rda_aggregate_upstream_reaches_dependent_as_changed_groups() {
     .expect("q")
     .expect("v");
     assert!(
-        del_after - del_before <= RDA_DIFF_STATEMENTS * key_rows
-            && ins_after - ins_before <= RDA_DIFF_STATEMENTS * key_rows,
-        "dependent rewritten beyond the drifted group: deleted {} / inserted {}",
-        del_after - del_before,
-        ins_after - ins_before
+        after - before <= AGG_WHOLE_ROW_DIFF_FACTOR * RDA_DIFF_STATEMENTS * key_rows,
+        "dependent rewritten beyond the drifted group: touched {}",
+        after - before
     );
 }
 
@@ -255,24 +257,28 @@ fn pg_rda_aggregate_upstream_reaches_dependent_as_changed_groups() {
 fn pg_rda_reconcile_without_dependents_still_correct() {
     rda_build("rda6");
     let sql = "SELECT product_id, location_id, is_active FROM rda6_rel";
-    let res = crate::create_reflex_ivm("rda6_up", sql, Some("product_id, location_id"), None, None, None);
+    let res = crate::create_reflex_ivm(
+        "rda6_up",
+        sql,
+        Some("product_id, location_id"),
+        None,
+        None,
+        None,
+    );
     assert_eq!(res, "CREATE REFLEX INCREMENTAL VIEW");
     Spi::run("DELETE FROM rda6_up WHERE product_id = 1").expect("drift");
     rda_reconcile("rda6_up");
+    // TRUNCATE resets the transaction's tuple counters, so after the fast path
+    // the counter holds exactly the refill; a diff would add to the seed's.
+    let refilled = tree_xact_changes("rda6_up");
+    let total = Spi::get_one::<i64>("SELECT count(*)::int8 FROM rda6_rel")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        refilled, total,
+        "an IMV with no dependents must keep the TRUNCATE + refill fast path (a diff would touch only the drifted rows)"
+    );
     assert_imv_correct("rda6_up", sql);
-}
-
-/// Rows inserted / deleted by this transaction across every leaf of `rel`
-/// (a partitioned root carries no tuple stats of its own; swapped-in leaves
-/// count from zero, which is exactly what a full refill looks like).
-fn rda_tree_xact_changes(rel: &str) -> (i64, i64) {
-    let row = Spi::get_two::<i64, i64>(&format!(
-        "SELECT COALESCE(sum(pg_stat_get_xact_tuples_inserted(relid)), 0)::int8, \
-                COALESCE(sum(pg_stat_get_xact_tuples_deleted(relid)), 0)::int8 \
-         FROM pg_partition_tree('{rel}'::regclass) WHERE isleaf"
-    ))
-    .expect("tree xact stats");
-    (row.0.unwrap_or(0), row.1.unwrap_or(0))
 }
 
 /// A LIST(plan)-partitioned source and a partitioned passthrough IMV over it.
@@ -308,23 +314,23 @@ fn rda_build_partitioned(prefix: &str) {
 #[pg_test]
 fn pg_rda_partitioned_reconcile_reaches_aggregate_dependent_as_delta() {
     rda_build_partitioned("rdp1");
-    let dep_sql = "SELECT product_id, SUM(qty) AS q, COUNT(*) AS n FROM rdp1_up GROUP BY product_id";
+    let dep_sql =
+        "SELECT product_id, SUM(qty) AS q, COUNT(*) AS n FROM rdp1_up GROUP BY product_id";
     let res = crate::create_reflex_ivm("rdp1_dep", dep_sql, None, None, None, None);
     assert_eq!(res, "CREATE REFLEX INCREMENTAL VIEW");
     let fresh = "SELECT product_id, SUM(qty) AS q, COUNT(*) AS n FROM rdp1_src GROUP BY product_id";
 
     Spi::run("UPDATE rdp1_up SET qty = qty + 1000 WHERE plan = 2 AND id = 7").expect("drift");
-    let before = rda_tree_xact_changes("rdp1_dep");
+    let before = tree_xact_changes("rdp1_dep");
     rda_reconcile("rdp1_up");
-    let after = rda_tree_xact_changes("rdp1_dep");
+    let after = tree_xact_changes("rdp1_dep");
 
     assert_imv_correct("rdp1_up", "SELECT plan, id, product_id, qty FROM rdp1_src");
     assert_imv_correct("rdp1_dep", fresh);
     assert!(
-        after.0 - before.0 <= RDA_DIFF_STATEMENTS && after.1 - before.1 <= RDA_DIFF_STATEMENTS,
-        "aggregate dependent rebuilt instead of receiving the one-group delta: +{} / -{}",
-        after.0 - before.0,
-        after.1 - before.1
+        after - before <= RDA_DIFF_STATEMENTS,
+        "aggregate dependent rebuilt instead of receiving the one-group delta: touched {}",
+        after - before
     );
 }
 
@@ -342,20 +348,19 @@ fn pg_rda_partition_reconcile_reaches_partitioned_dependent_as_delta() {
     let fresh = "SELECT plan, id, qty * 2 AS q2 FROM rdp2_src";
 
     Spi::run("UPDATE rdp2_up SET qty = qty + 1000 WHERE plan = 2 AND id = 7").expect("drift");
-    let before = rda_tree_xact_changes("rdp2_dep");
+    let before = tree_xact_changes("rdp2_dep");
     let res = Spi::get_one::<String>("SELECT reflex_reconcile_partition('rdp2_up', '2')")
         .expect("reconcile_partition")
         .expect("result");
     assert!(res.starts_with("RECONCILED"), "{res}");
-    let after = rda_tree_xact_changes("rdp2_dep");
+    let after = tree_xact_changes("rdp2_dep");
 
     assert_imv_correct("rdp2_up", "SELECT plan, id, product_id, qty FROM rdp2_src");
     assert_imv_correct("rdp2_dep", fresh);
     assert!(
-        after.0 - before.0 <= RDA_DIFF_STATEMENTS && after.1 - before.1 <= RDA_DIFF_STATEMENTS,
-        "partitioned dependent refilled instead of receiving the one-row delta: +{} / -{}",
-        after.0 - before.0,
-        after.1 - before.1
+        after - before <= RDA_DIFF_STATEMENTS,
+        "partitioned dependent refilled instead of receiving the one-row delta: touched {}",
+        after - before
     );
 }
 
@@ -379,4 +384,54 @@ fn pg_rda_partitioned_reconcile_still_refreshes_ignoring_dependent() {
 
     assert_imv_correct("rdp3_up", "SELECT plan, id, product_id, qty FROM rdp3_src");
     assert_imv_correct("rdp3_dep", fresh);
+}
+
+/// An observing dependent gets the diff only; an ignoring dependent is refreshed by cascade.
+#[pg_test]
+fn pg_rda_ignoring_and_observing_dependents_on_one_rebuild() {
+    rbd_build_rel("rdi1");
+    assert_eq!(
+        crate::create_reflex_ivm(
+            "rdi1_up",
+            "SELECT product_id, location_id, is_active FROM rdi1_rel",
+            Some("product_id, location_id"),
+            None,
+            None,
+            None
+        ),
+        "CREATE REFLEX INCREMENTAL VIEW"
+    );
+    // Drift BEFORE the dependents exist so both materialise the drifted rows;
+    // only the reconcile can then correct the ignoring one.
+    Spi::run(
+        "UPDATE rdi1_up SET is_active = NOT is_active WHERE product_id = 0 AND location_id = 0",
+    )
+    .expect("drift");
+    assert_eq!(
+        crate::create_reflex_ivm(
+            "rdi1_obs",
+            &rbd_dep_sql("rdi1", "rdi1_up"),
+            Some("product_id, location_id, id"),
+            None,
+            None,
+            None
+        ),
+        "CREATE REFLEX INCREMENTAL VIEW"
+    );
+    create_imv("rdi1_ign", &format!(
+        "SELECT create_reflex_ivm('rdi1_ign', $q${}$q$, 'product_id, location_id, id', NULL, 'IMMEDIATE', '!rdi1_up')",
+        rbd_dep_sql("rdi1", "rdi1_up")));
+    let before = tree_xact_changes("rdi1_obs");
+    rda_reconcile("rdi1_up");
+    assert_imv_correct("rdi1_obs", &rbd_dep_sql("rdi1", "rdi1_rel"));
+    assert_imv_correct("rdi1_ign", &rbd_dep_sql("rdi1", "rdi1_rel"));
+    let key_rows = Spi::get_one::<i64>(
+        "SELECT count(*)::int8 FROM rdi1_anchor WHERE product_id = 0 AND location_id = 0",
+    )
+    .unwrap()
+    .unwrap();
+    assert!(
+        tree_xact_changes("rdi1_obs") - before <= RDA_DIFF_STATEMENTS * key_rows,
+        "observing dependent was also rebuilt by cascade"
+    );
 }
