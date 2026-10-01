@@ -84,6 +84,150 @@ pub(crate) fn rearm_rebuild_sql(view_name: &str) -> String {
     )
 }
 
+/// The IMV-name advisory lock every flush and rebuild of `view_name` takes first.
+/// A registry write on the COMMIT path takes it before the row lock too, so the
+/// order is advisory lock → registry row everywhere: a session flushing the IMV
+/// holds its advisory lock and then writes its registry row, and would otherwise
+/// wait on a row lock held to COMMIT by a transaction about to wait on that
+/// advisory lock (40P01).
+fn lock_imv_sql(view_name: &str) -> String {
+    let name = view_name.replace('\'', "''");
+    format!("SELECT pg_advisory_xact_lock(hashtext('{name}'), hashtext(reverse('{name}')))")
+}
+
+/// Records that `view_name` is rebuilt now, from sources that reflect every
+/// delta staged for it so far: the flush skips those and applies the later ones.
+/// Called just before the rebuild reads its sources.
+pub(crate) fn record_rebuild_watermark(client: &mut pgrx::spi::SpiClient<'_>, view_name: &str) {
+    ensure_temp_table(
+        client,
+        "__reflex_deferred_reconciled_batch",
+        RECONCILED_BATCH_TABLE_DDL,
+    );
+    let watermark = Watermark::now();
+    client
+        .update(
+            "INSERT INTO pg_temp.__reflex_deferred_reconciled_batch \
+               (name, watermark, watermark_xid) \
+             VALUES ($1, $2, $3::text::xid) \
+             ON CONFLICT (name) DO UPDATE SET watermark = EXCLUDED.watermark, \
+               watermark_xid = EXCLUDED.watermark_xid",
+            None,
+            &[
+                unsafe {
+                    DatumWithOid::new(view_name.to_string(), PgBuiltInOids::TEXTOID.oid().value())
+                },
+                unsafe {
+                    DatumWithOid::new(watermark.command, PgBuiltInOids::INT8OID.oid().value())
+                },
+                unsafe {
+                    DatumWithOid::new(
+                        watermark.next_xid.to_string(),
+                        PgBuiltInOids::TEXTOID.oid().value(),
+                    )
+                },
+            ],
+        )
+        .unwrap_or_report();
+}
+
+/// Transaction-local setting naming the IMV the COMMIT-time pass is rebuilding
+/// through `reflex_reconcile` ([`rebuild_for_cross_source_guard`]).
+const COMMIT_REBUILD_OF_GUC: &str = "pg_reflex.commit_rebuild_of";
+
+/// Whether a reconcile of `view_name` must be left to the COMMIT-time rebuild
+/// pass instead of rebuilding it now.
+///
+/// A reconcile rebuilds from the sources, which already reflect every delta this
+/// transaction staged for a DEFERRED IMV, so it records a watermark and the
+/// flush skips the deltas staged before it ([`record_rebuild_watermark`]). That
+/// holds only when no write the rebuild reads is still waiting to be staged.
+/// Inside a trigger it may be: a statement's staging trigger maintains the
+/// IMMEDIATE IMVs before it stages the DEFERRED ones' delta, so a reconcile
+/// reached from that maintenance (a high-selectivity dispatch refreshing its
+/// IGNORING dependents) reads the statement's write, and the delta staged after
+/// it would be applied on top. So, inside a trigger, a DEFERRED IMV is listed for
+/// the COMMIT-time rebuild, which runs once every statement is done — except the
+/// rebuild that pass itself runs. An IMV that observes no source has nothing
+/// staged and no flush to wait for; it is rebuilt now. So is a generated
+/// sub-IMV: that pass rebuilds one without propagating to the IMV that reads it
+/// (the cross-source guard's contract), which a dispatch-driven rebuild must.
+pub(crate) fn reconcile_waits_for_commit(view_name: &str) -> bool {
+    Spi::get_one_with_args::<bool>(
+        "SELECT COALESCE(r.refresh_mode, 'IMMEDIATE') = 'DEFERRED' \
+           AND NOT COALESCE(r.is_generated_sub_imv, FALSE) \
+           AND pg_trigger_depth() > 0 \
+           AND current_setting($2, true) IS DISTINCT FROM r.name \
+         FROM public.__reflex_ivm_reference r WHERE r.name = $1",
+        &[
+            unsafe {
+                DatumWithOid::new(view_name.to_string(), PgBuiltInOids::TEXTOID.oid().value())
+            },
+            unsafe {
+                DatumWithOid::new(COMMIT_REBUILD_OF_GUC, PgBuiltInOids::TEXTOID.oid().value())
+            },
+        ],
+    )
+    .unwrap_or(None)
+    .unwrap_or(false)
+        && observed_source(view_name).is_some()
+}
+
+/// Lists `view_name` for a rebuild through `reflex_reconcile` by the COMMIT-time
+/// pass, as if it had not been rebuilt in this transaction, and makes sure a
+/// flush that runs that pass is queued.
+pub(crate) fn list_for_commit_reconcile(view_name: &str) {
+    Spi::connect_mut(|client| {
+        let name = view_name.replace('\'', "''");
+        ensure_temp_table(
+            client,
+            "__reflex_deferred_rebuild",
+            crate::trigger::DEFERRED_REBUILD_TABLE_DDL,
+        );
+        client
+            .update(
+                &format!(
+                    "INSERT INTO pg_temp.__reflex_deferred_rebuild (name, reconcile) \
+                     VALUES ('{name}', TRUE) ON CONFLICT (name) DO UPDATE SET reconcile = TRUE"
+                ),
+                None,
+                &[],
+            )
+            .unwrap_or_report();
+        client
+            .update(&rearm_rebuild_sql(view_name), None, &[])
+            .unwrap_or_report();
+        if !flush_request_outstanding(client, view_name) {
+            if let Some(enqueue) = enqueue_truncate_flush_sql(view_name) {
+                client.update(&enqueue, None, &[]).unwrap_or_report();
+            }
+        }
+    });
+}
+
+/// A reconcile of `view_name` recorded its watermark and then failed part-way
+/// without raising. Outside the COMMIT-time pass (which flags its own failures
+/// stale) it is listed for that pass, so the deltas the watermark now skips are
+/// never lost to a half-done rebuild.
+pub(crate) fn rebuild_failed_after_watermark(view_name: &str) {
+    let commit_pass_rebuild = Spi::get_one_with_args::<bool>(
+        "SELECT current_setting($1, true) IS NOT DISTINCT FROM $2",
+        &[
+            unsafe {
+                DatumWithOid::new(COMMIT_REBUILD_OF_GUC, PgBuiltInOids::TEXTOID.oid().value())
+            },
+            unsafe {
+                DatumWithOid::new(view_name.to_string(), PgBuiltInOids::TEXTOID.oid().value())
+            },
+        ],
+    )
+    .unwrap_or(None)
+    .unwrap_or(false);
+    if !commit_pass_rebuild {
+        list_for_commit_reconcile(view_name);
+    }
+}
+
 /// Where a rebuild sits in its transaction: `command` is the command id current
 /// when it started (marked used, so every later command has a higher one) and
 /// `next_xid` the next transaction id to be assigned then.
@@ -457,6 +601,9 @@ fn rebuild_truncated_imvs(client: &mut pgrx::spi::SpiClient<'_>) -> usize {
                     TRUNCATE_REBUILD_MAX_DEFERRALS
                 );
                 client
+                    .update(&lock_imv_sql(name), None, &[])
+                    .unwrap_or_report();
+                client
                     .update(
                         "UPDATE public.__reflex_ivm_reference SET known_stale = TRUE, \
                            stale_reason = 'COMMIT-time rebuild re-listed too many times in one ' \
@@ -540,6 +687,9 @@ fn rebuild_listed(
             if attempts < TRUNCATE_REBUILD_MAX_DEFERRALS {
                 // Never end the transaction unrebuilt and unflagged: flagged until rebuilt.
                 client
+                    .update(&lock_imv_sql(imv_name), None, &[])
+                    .unwrap_or_report();
+                client
                     .update(
                         &format!(
                             "UPDATE public.__reflex_ivm_reference SET known_stale = TRUE, \
@@ -569,27 +719,7 @@ fn rebuild_listed(
                 continue;
             }
         }
-        ensure_temp_table(
-            client,
-            "__reflex_deferred_reconciled_batch",
-            RECONCILED_BATCH_TABLE_DDL,
-        );
-        // Taken just before the rebuild reads its sources.
-        let watermark = Watermark::now();
-        client
-            .update(
-                &format!(
-                    "INSERT INTO __reflex_deferred_reconciled_batch \
-                       (name, watermark, watermark_xid) \
-                     VALUES ('{imv_esc}', {}, '{}'::xid) \
-                     ON CONFLICT (name) DO UPDATE SET watermark = EXCLUDED.watermark, \
-                       watermark_xid = EXCLUDED.watermark_xid",
-                    watermark.command, watermark.next_xid
-                ),
-                None,
-                &[],
-            )
-            .unwrap_or_report();
+        record_rebuild_watermark(client, imv_name);
         already_rebuilt.push(imv_name.clone());
         let listed_by_guard = client
             .select(
@@ -613,6 +743,9 @@ fn rebuild_listed(
             TruncateRebuild::Stmts(stmts) => stmts,
             TruncateRebuild::Wrapper => continue,
             TruncateRebuild::Unreadable => {
+                client
+                    .update(&lock_imv_sql(imv_name), None, &[])
+                    .unwrap_or_report();
                 client
                     .update(&mark_stale_after_truncate_sql(imv_name), None, &[])
                     .unwrap_or_report();
@@ -699,11 +832,32 @@ fn rebuild_for_cross_source_guard(
     upstream_moving: bool,
     fail_hard: bool,
 ) {
+    let set_commit_rebuild_of = |client: &mut pgrx::spi::SpiClient<'_>, name: &str| {
+        client
+            .update(
+                "SELECT set_config($1, $2, true)",
+                None,
+                &[
+                    unsafe {
+                        DatumWithOid::new(
+                            COMMIT_REBUILD_OF_GUC,
+                            PgBuiltInOids::TEXTOID.oid().value(),
+                        )
+                    },
+                    unsafe {
+                        DatumWithOid::new(name.to_string(), PgBuiltInOids::TEXTOID.oid().value())
+                    },
+                ],
+            )
+            .unwrap_or_report();
+    };
+    set_commit_rebuild_of(client, imv_name);
     let result = if fail_hard {
         crate::reconcile::reconcile_for_cross_source_guard(imv_name).to_string()
     } else {
         crate::reconcile::reconcile_isolated(imv_name)
     };
+    set_commit_rebuild_of(client, "");
     let failed = result.starts_with("ERROR");
     let stale_reason = if failed {
         pgrx::warning!(
@@ -727,6 +881,9 @@ fn rebuild_for_cross_source_guard(
     } else {
         return;
     };
+    client
+        .update(&lock_imv_sql(imv_name), None, &[])
+        .unwrap_or_report();
     client
         .update(
             "UPDATE public.__reflex_ivm_reference \

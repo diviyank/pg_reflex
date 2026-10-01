@@ -610,7 +610,7 @@ pub fn reflex_execute_separated(sql: &str) {
     }
 }
 
-mod deferred;
+pub(crate) mod deferred;
 mod dispatch;
 mod merge;
 mod ops;
