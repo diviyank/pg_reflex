@@ -293,7 +293,7 @@ fn pg_rbc_guard_listing_from_a_nested_flush_is_rebuilt() {
 }
 
 /// A source write committed while a rebuild of its IMV is in progress is never
-/// lost: the rebuild's table lock serialises the writer behind it.
+/// lost: the rebuild's locks serialise the writer behind it.
 #[pg_test]
 fn pg_rbc_concurrent_write_during_rebuild_not_lost() {
     const DBNAME: &str = "reflex_rbc_concurrent";
@@ -320,7 +320,7 @@ fn pg_rbc_concurrent_write_during_rebuild_not_lost() {
     Spi::run(
         "CREATE FUNCTION pg_temp.rbc_await_lock_wait(q text) RETURNS bool LANGUAGE plpgsql AS $fn$ \
          BEGIN \
-           FOR i IN 1..100 LOOP \
+           FOR i IN 1..200 LOOP \
              PERFORM pg_stat_clear_snapshot(); \
              IF EXISTS (SELECT 1 FROM pg_stat_activity \
                         WHERE query = q AND wait_event_type = 'Lock') THEN RETURN TRUE; END IF; \
