@@ -397,7 +397,7 @@ fn apply_keyed_diff(
     if let Some(caller_nestloop) = caller_nestloop {
         set_local(client, "enable_nestloop", &caller_nestloop);
     }
-    let by_identity = "t.tableoid = d.toid AND t.ctid = d.tid";
+    let by_identity = format!("t.tableoid = d.toid AND t.ctid = d.tid AND {scope_on_t}");
     let mut stmts = vec![
         format!("ANALYZE {diff}"),
         format!("DELETE FROM {root} t USING {diff} d WHERE d.op = 'd' AND {by_identity}"),
