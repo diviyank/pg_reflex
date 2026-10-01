@@ -253,25 +253,45 @@ fn pg_rbd_wholerow_detects_subtle_value_changes() {
         "INSERT INTO rbw2_rel SELECT id, 0.1::float8 + 0.2::float8, '{\"a\": 1}', '[0:1]={1,2}' FROM generate_series(1, 3) id",
     )
     .expect("seed");
-    assert_eq!(crate::create_reflex_ivm("rbw2_up", rel_sql, None, None, None, None),
-               "CREATE REFLEX INCREMENTAL VIEW");
-    assert_eq!(crate::create_reflex_ivm("rbw2_dep",
-               "SELECT id, f, j::text AS jt, array_lower(a, 1) AS lo FROM rbw2_up", None, None, None, None),
-               "CREATE REFLEX INCREMENTAL VIEW");
+    assert_eq!(
+        crate::create_reflex_ivm("rbw2_up", rel_sql, None, None, None, None),
+        "CREATE REFLEX INCREMENTAL VIEW"
+    );
+    assert_eq!(
+        crate::create_reflex_ivm(
+            "rbw2_dep",
+            "SELECT id, f, j::text AS jt, array_lower(a, 1) AS lo FROM rbw2_up",
+            None,
+            None,
+            None,
+            None
+        ),
+        "CREATE REFLEX INCREMENTAL VIEW"
+    );
     // Each look-alike drift in its own row, so each must be detected on its own.
     Spi::run("UPDATE rbw2_up SET f = 0.3 WHERE id = 1").expect("float look-alike");
     Spi::run("UPDATE rbw2_up SET j = '{\"a\":1}' WHERE id = 2").expect("json look-alike");
     Spi::run("UPDATE rbw2_up SET a = '{1,2}' WHERE id = 3").expect("array look-alike");
     Spi::run("SET LOCAL extra_float_digits = 0").expect("caller precision");
     assert_eq!(rbd_rebuild("rbw2_up", rel_sql), "DIFFED");
-    assert_eq!(Spi::get_one::<String>("SHOW extra_float_digits").unwrap().unwrap(), "0",
-               "caller's extra_float_digits not restored");
+    assert_eq!(
+        Spi::get_one::<String>("SHOW extra_float_digits")
+            .unwrap()
+            .unwrap(),
+        "0",
+        "caller's extra_float_digits not restored"
+    );
     Spi::run("SET LOCAL extra_float_digits = 3").expect("oracle precision");
     let exact = Spi::get_one::<bool>(&format!(
         "SELECT (SELECT {rows_text} FROM rbw2_up) = (SELECT {rows_text} FROM rbw2_rel)"
-    )).unwrap().unwrap();
+    ))
+    .unwrap()
+    .unwrap();
     assert!(exact, "a look-alike value survived the rebuild");
-    assert_imv_correct("rbw2_dep", "SELECT id, f, j::text AS jt, array_lower(a, 1) AS lo FROM rbw2_rel");
+    assert_imv_correct(
+        "rbw2_dep",
+        "SELECT id, f, j::text AS jt, array_lower(a, 1) AS lo FROM rbw2_rel",
+    );
 }
 
 /// Fast path: no dependents → 'REPLACED' (DELETE + INSERT), still correct.
@@ -312,24 +332,35 @@ fn pg_rbd_no_dependents_takes_replace_path() {
 fn pg_rbd_qualified_mixed_case_name() {
     let up_sql = "SELECT product_id, location_id, COUNT(*) AS n FROM rbq.rel GROUP BY product_id, location_id";
     Spi::run("CREATE SCHEMA rbq").expect("schema");
-    Spi::run("CREATE TABLE rbq.rel (product_id INT NOT NULL, location_id INT NOT NULL, is_active BOOL)").expect("rel");
-    Spi::run("INSERT INTO rbq.rel VALUES (1,1,TRUE),(1,1,NULL),(2,2,FALSE),(3,3,TRUE)").expect("seed");
-    assert_eq!(crate::create_reflex_ivm("rbq.Up_V", up_sql, None, None, None, None),
-               "CREATE REFLEX INCREMENTAL VIEW");
+    Spi::run(
+        "CREATE TABLE rbq.rel (product_id INT NOT NULL, location_id INT NOT NULL, is_active BOOL)",
+    )
+    .expect("rel");
+    Spi::run("INSERT INTO rbq.rel VALUES (1,1,TRUE),(1,1,NULL),(2,2,FALSE),(3,3,TRUE)")
+        .expect("seed");
+    assert_eq!(
+        crate::create_reflex_ivm("rbq.Up_V", up_sql, None, None, None, None),
+        "CREATE REFLEX INCREMENTAL VIEW"
+    );
     Spi::run("CREATE UNIQUE INDEX up_v_key ON rbq.\"Up_V\" (product_id, location_id)")
         .expect("key");
     let keyed = Spi::get_one::<bool>(
         "SELECT EXISTS (SELECT 1 FROM pg_index WHERE indrelid = 'rbq.\"Up_V\"'::regclass \
          AND indisunique AND indpred IS NULL AND indexprs IS NULL)",
-    ).unwrap().unwrap();
+    )
+    .unwrap()
+    .unwrap();
     assert!(keyed, "fixture must exercise the keyed diff");
     Spi::run("CREATE TABLE rbq.seen (op TEXT, product_id INT)").expect("seen");
     Spi::run(
         "CREATE FUNCTION rbq.record_seen() RETURNS trigger LANGUAGE plpgsql AS $f$ BEGIN \
            INSERT INTO rbq.seen VALUES (TG_OP, COALESCE(NEW.product_id, OLD.product_id)); RETURN NULL; END $f$",
     ).expect("fn");
-    Spi::run("CREATE TRIGGER record_seen AFTER INSERT OR UPDATE OR DELETE ON rbq.\"Up_V\" \
-              FOR EACH ROW EXECUTE FUNCTION rbq.record_seen()").expect("trigger");
+    Spi::run(
+        "CREATE TRIGGER record_seen AFTER INSERT OR UPDATE OR DELETE ON rbq.\"Up_V\" \
+              FOR EACH ROW EXECUTE FUNCTION rbq.record_seen()",
+    )
+    .expect("trigger");
     Spi::run("DELETE FROM rbq.\"Up_V\" WHERE product_id = 1").expect("drift");
     Spi::run("UPDATE rbq.\"Up_V\" SET n = n + 5 WHERE product_id = 2").expect("drift");
     Spi::run("TRUNCATE rbq.seen").expect("reset");
@@ -337,7 +368,74 @@ fn pg_rbd_qualified_mixed_case_name() {
     assert_imv_correct("rbq.\"Up_V\"", up_sql);
     let seen = Spi::get_one::<String>(
         "SELECT string_agg(op || ':' || product_id, ',' ORDER BY op, product_id) FROM rbq.seen",
-    ).unwrap();
-    assert_eq!(seen.as_deref(), Some("INSERT:1,UPDATE:2"), "dependent must see exactly the changed rows");
+    )
+    .unwrap();
+    assert_eq!(
+        seen.as_deref(),
+        Some("INSERT:1,UPDATE:2"),
+        "dependent must see exactly the changed rows"
+    );
 }
 
+/// A rebuild query yielding a key twice (IMV already inconsistent) must fail
+/// loudly, naming the IMV, instead of applying an arbitrary copy.
+#[pg_test]
+fn pg_rbd_keyed_duplicate_key_rebuild_raises() {
+    rbd_up_and_dep("rbk4", Some("product_id, location_id"), "IMMEDIATE");
+    let duplicated = "SELECT product_id, location_id, is_active FROM rbk4_rel \
+                      UNION ALL SELECT product_id, location_id, NOT COALESCE(is_active, FALSE) \
+                      FROM rbk4_rel WHERE product_id = 0 AND location_id = 0";
+    let outcome = Spi::get_one::<String>(&format!(
+        "DO $d$ BEGIN PERFORM reflex_rebuild_target_rows('rbk4_up', $q${duplicated}$q$); \
+           PERFORM set_config('rbk4.outcome', 'NO ERROR', true); \
+         EXCEPTION WHEN OTHERS THEN PERFORM set_config('rbk4.outcome', SQLERRM, true); END $d$; \
+         SELECT current_setting('rbk4.outcome')"
+    ))
+    .expect("outcome")
+    .expect("outcome value");
+    assert!(
+        outcome.contains("'rbk4_up' yields duplicate keys"),
+        "duplicate-key rebuild must raise naming the IMV, got: {outcome}"
+    );
+}
+
+/// An invalid unique index (e.g. a failed CREATE UNIQUE INDEX CONCURRENTLY)
+/// guarantees nothing, so it must not be used as the diff key.
+#[pg_test]
+fn pg_rbd_invalid_unique_index_is_not_a_key() {
+    let up_sql = "SELECT product_id, location_id, COUNT(*) AS n FROM rbi_rel GROUP BY product_id, location_id";
+    Spi::run("CREATE TABLE rbi_rel (product_id INT NOT NULL, location_id INT NOT NULL)")
+        .expect("rel");
+    Spi::run("INSERT INTO rbi_rel VALUES (1,1),(1,1),(2,2)").expect("seed");
+    assert_eq!(
+        crate::create_reflex_ivm("rbi_up", up_sql, None, None, None, None),
+        "CREATE REFLEX INCREMENTAL VIEW"
+    );
+    Spi::run("CREATE UNIQUE INDEX rbi_up_key ON rbi_up (product_id, location_id)").expect("key");
+    Spi::run("UPDATE pg_index SET indisvalid = FALSE WHERE indexrelid = 'rbi_up_key'::regclass")
+        .expect("invalidate");
+    Spi::run("CREATE TABLE rbi_seen (op TEXT, product_id INT)").expect("seen");
+    Spi::run(
+        "CREATE FUNCTION rbi_record_seen() RETURNS trigger LANGUAGE plpgsql AS $f$ BEGIN \
+           INSERT INTO rbi_seen VALUES (TG_OP, COALESCE(NEW.product_id, OLD.product_id)); RETURN NULL; END $f$",
+    )
+    .expect("fn");
+    Spi::run(
+        "CREATE TRIGGER rbi_record_seen AFTER INSERT OR UPDATE OR DELETE ON rbi_up \
+         FOR EACH ROW EXECUTE FUNCTION rbi_record_seen()",
+    )
+    .expect("trigger");
+    Spi::run("UPDATE rbi_up SET n = n + 5 WHERE product_id = 2").expect("drift");
+    Spi::run("TRUNCATE rbi_seen").expect("reset");
+    assert_eq!(rbd_rebuild("rbi_up", up_sql), "DIFFED");
+    assert_imv_correct("rbi_up", up_sql);
+    let seen = Spi::get_one::<String>(
+        "SELECT string_agg(op || ':' || product_id, ',' ORDER BY op, product_id) FROM rbi_seen",
+    )
+    .unwrap();
+    assert_eq!(
+        seen.as_deref(),
+        Some("DELETE:2,INSERT:2"),
+        "an invalid unique index was used as the diff key"
+    );
+}
