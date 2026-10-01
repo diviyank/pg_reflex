@@ -471,31 +471,24 @@ pub fn reflex_quote_identifier(name: &str) -> String {
 #[pg_extern(parallel_safe)]
 pub fn reflex_build_truncate_sql(view_name: &str) -> String {
     let escaped_name = view_name.replace('\'', "''");
-    let Some(mut stmts) = truncate_rebuild_stmts(view_name) else {
-        return mark_stale_after_truncate_sql(view_name);
+    let mut stmts = match truncate_rebuild(view_name) {
+        TruncateRebuild::Stmts(stmts) => stmts,
+        TruncateRebuild::Wrapper => return String::new(),
+        TruncateRebuild::Unreadable => return mark_stale_after_truncate_sql(view_name),
     };
 
     if registry_value(view_name, "COALESCE(refresh_mode, 'IMMEDIATE')") == "DEFERRED" {
-        let observed_source = registry_value(
-            view_name,
-            "(SELECT d FROM unnest(depends_on) WITH ORDINALITY AS u(d, i) \
-              WHERE NOT (COALESCE(ignored_sources, ARRAY[]::TEXT[]) \
-                         && ARRAY[d, regexp_replace(d, '^.*\\.', '')]) \
-              ORDER BY i LIMIT 1)",
-        );
-        if observed_source.is_empty() {
+        let Some(enqueue) = enqueue_truncate_flush_sql(view_name) else {
             return mark_stale_after_truncate_sql(view_name);
-        }
+        };
+        // The trigger body then deletes this source's pending rows; the queued
+        // deferred event still fires (AfterTriggerExecute fetches with SnapshotAny).
         stmts = vec![
             DEFERRED_REBUILD_TABLE_DDL.to_string(),
             format!(
                 "INSERT INTO __reflex_deferred_rebuild VALUES ('{escaped_name}') ON CONFLICT DO NOTHING"
             ),
-            format!(
-                "INSERT INTO public.__reflex_deferred_pending (source_table, operation) \
-                 VALUES ('{}', 'TRUNCATE')",
-                observed_source.replace('\'', "''")
-            ),
+            enqueue,
         ];
     }
 
@@ -508,9 +501,30 @@ pub fn reflex_build_truncate_sql(view_name: &str) -> String {
     stmts.join("\n--<<REFLEX_SEP>>--\n")
 }
 
-/// Transaction-local list of DEFERRED IMVs whose source was truncated.
+/// Transaction-local list of DEFERRED IMVs whose source was truncated, with the
+/// number of times their commit-time rebuild was postponed.
 pub(crate) const DEFERRED_REBUILD_TABLE_DDL: &str =
-    "CREATE TEMP TABLE IF NOT EXISTS __reflex_deferred_rebuild (name TEXT PRIMARY KEY) ON COMMIT DROP";
+    "CREATE TEMP TABLE IF NOT EXISTS __reflex_deferred_rebuild \
+     (name TEXT PRIMARY KEY, attempts INT NOT NULL DEFAULT 0) ON COMMIT DROP";
+
+/// A pending row on the first source `view_name` does not ignore, so a flush that
+/// selects `view_name` runs at COMMIT. `None` when it ignores every source.
+pub(crate) fn enqueue_truncate_flush_sql(view_name: &str) -> Option<String> {
+    let observed_source = registry_value(
+        view_name,
+        "(SELECT d FROM unnest(depends_on) WITH ORDINALITY AS u(d, i) \
+          WHERE NOT (COALESCE(ignored_sources, ARRAY[]::TEXT[]) \
+                     && ARRAY[d, regexp_replace(d, '^.*\\.', '')]) \
+          ORDER BY i LIMIT 1)",
+    );
+    (!observed_source.is_empty()).then(|| {
+        format!(
+            "INSERT INTO public.__reflex_deferred_pending (source_table, operation) \
+             VALUES ('{}', 'TRUNCATE')",
+            observed_source.replace('\'', "''")
+        )
+    })
+}
 
 fn registry_value(view_name: &str, expr: &str) -> String {
     Spi::get_one::<&str>(&format!(
@@ -522,20 +536,26 @@ fn registry_value(view_name: &str, expr: &str) -> String {
     .to_string()
 }
 
-/// The statements that rebuild `view_name` from its base query after a source
-/// TRUNCATE: intermediate refilled, target through the dependent-safe diff.
-/// `None` when the registry row cannot be rebuilt from — unreadable, or a
-/// decomposed wrapper (refused like `reconcile_one` refuses it).
-pub(crate) fn truncate_rebuild_stmts(view_name: &str) -> Option<Vec<String>> {
+pub(crate) enum TruncateRebuild {
+    /// Intermediate refilled, target through the dependent-safe diff.
+    Stmts(Vec<String>),
+    /// A decomposed wrapper, refused like `reconcile_one` refuses it: nothing to
+    /// do, its operands are the truncated source's dependents and maintain it.
+    Wrapper,
+    Unreadable,
+}
+
+/// How `view_name` is rebuilt from its base query after a source TRUNCATE.
+pub(crate) fn truncate_rebuild(view_name: &str) -> TruncateRebuild {
     if crate::reconcile::is_decomposed_wrapper_row(view_name) {
-        return None;
+        return TruncateRebuild::Wrapper;
     }
     let base_query = registry_value(view_name, "base_query");
     let end_query = registry_value(view_name, "end_query");
     let plan =
         match serde_json::from_str::<AggregationPlan>(&registry_value(view_name, "aggregations")) {
             Ok(plan) if !base_query.is_empty() => plan,
-            _ => return None,
+            _ => return TruncateRebuild::Unreadable,
         };
     let mut stmts: Vec<String> = Vec::new();
     full_refresh_stmts(
@@ -546,14 +566,14 @@ pub(crate) fn truncate_rebuild_stmts(view_name: &str) -> Option<Vec<String>> {
         &plan,
         &mut stmts,
     );
-    Some(stmts)
+    TruncateRebuild::Stmts(stmts)
 }
 
 /// Marks `view_name` stale when a source TRUNCATE cannot rebuild it; never clears it.
 pub(crate) fn mark_stale_after_truncate_sql(view_name: &str) -> String {
     warning!(
         "pg_reflex: cannot rebuild '{}' after a source TRUNCATE — registry row unreadable \
-         or not rebuildable; marking it stale instead of clearing it",
+         or observes no source; marking it stale instead of clearing it",
         view_name
     );
     let escaped_name = view_name.replace('\'', "''");
