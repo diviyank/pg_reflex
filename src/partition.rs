@@ -1916,7 +1916,9 @@ pub(crate) fn reflex_reconcile_partition_impl(
     if let Err(msg) = crate::validate_view_name(view_name) {
         return msg.to_string();
     }
-    if crate::trigger::deferred::scoped_rebuild_waits_for_commit(view_name) {
+    if requests_a_partition_slice(view_name, partition_keys, source_partition)
+        && crate::trigger::deferred::scoped_rebuild_waits_for_commit(view_name)
+    {
         crate::trigger::deferred::list_for_commit_reconcile(view_name);
         return crate::reconcile::RECONCILE_QUEUED_FOR_COMMIT.to_string();
     }
@@ -2382,6 +2384,27 @@ pub(crate) fn reflex_reconcile_partition_impl(
         Ok(s) => s,
         Err(e) => format!("ERROR: {}", e),
     }
+}
+
+/// Whether the call names a slice of a partitioned IMV. Any other call is
+/// refused below with its usual error; it must not be queued for a COMMIT-time
+/// full rebuild first.
+fn requests_a_partition_slice(
+    view_name: &str,
+    partition_keys: &[String],
+    source_partition: &str,
+) -> bool {
+    (!partition_keys.is_empty() || !source_partition.trim().is_empty())
+        && Spi::get_one_with_args::<bool>(
+            "SELECT COALESCE(array_length(partition_columns, 1), 0) > 0 \
+                    AND COALESCE(partition_strategy, '') <> '' \
+             FROM public.__reflex_ivm_reference WHERE name = $1",
+            &[unsafe {
+                DatumWithOid::new(view_name.to_string(), PgBuiltInOids::TEXTOID.oid().value())
+            }],
+        )
+        .unwrap_or(None)
+        .unwrap_or(false)
 }
 
 /// Build a key-scoped cascade reconcile of a NON-partitioned aggregate
