@@ -291,3 +291,70 @@ fn pg_rbc_guard_listing_from_a_nested_flush_is_rebuilt() {
     assert_imv_correct("rbn_x", x_sql);
     assert_imv_correct("rbn_d", d_fresh);
 }
+
+/// A source write committed while a rebuild of its IMV is in progress is never
+/// lost: the rebuild's table lock serialises the writer behind it.
+#[pg_test]
+fn pg_rbc_concurrent_write_during_rebuild_not_lost() {
+    const DBNAME: &str = "reflex_rbc_concurrent";
+    const WRITE: &str = "INSERT INTO rcw_rel VALUES (999999, 1)";
+    probe_db_open(DBNAME);
+    Spi::get_one::<String>(&format!(
+        "SELECT dblink_connect('rbc_writer', {})",
+        sql_lit(&conninfo_for(DBNAME))
+    ))
+    .expect("writer connect")
+    .expect("writer connect NULL");
+    worker_exec("CREATE TABLE rcw_rel (k INT PRIMARY KEY, v INT)");
+    worker_exec("INSERT INTO rcw_rel SELECT g, g FROM generate_series(1, 20000) g");
+    rbc_select("create_reflex_ivm('rcw_up', 'SELECT k, v FROM rcw_rel', 'k')");
+    rbc_select("create_reflex_ivm('rcw_dep', 'SELECT k, v FROM rcw_up', 'k')");
+
+    worker_exec("BEGIN");
+    rbc_select("reflex_reconcile('rcw_up')");
+    Spi::run(&format!(
+        "SELECT dblink_send_query('rbc_writer', {})",
+        sql_lit(WRITE)
+    ))
+    .expect("async write");
+    Spi::run(
+        "CREATE FUNCTION pg_temp.rbc_await_lock_wait(q text) RETURNS bool LANGUAGE plpgsql AS $fn$ \
+         BEGIN \
+           FOR i IN 1..100 LOOP \
+             PERFORM pg_stat_clear_snapshot(); \
+             IF EXISTS (SELECT 1 FROM pg_stat_activity \
+                        WHERE query = q AND wait_event_type = 'Lock') THEN RETURN TRUE; END IF; \
+             PERFORM pg_sleep(0.05); \
+           END LOOP; \
+           RETURN FALSE; \
+         END $fn$",
+    )
+    .expect("poll fn");
+    let waiting = Spi::get_one::<bool>(&format!(
+        "SELECT pg_temp.rbc_await_lock_wait({})",
+        sql_lit(WRITE)
+    ))
+    .expect("poll")
+    .unwrap_or(false);
+    worker_exec("COMMIT");
+    Spi::run("SELECT * FROM dblink_get_result('rbc_writer') AS t(r text)").expect("write result");
+
+    assert_eq!(
+        worker_scalar_i64("SELECT count(*)::int8 FROM rcw_up WHERE k = 999999"),
+        1,
+        "write committed during the rebuild was lost from the upstream IMV"
+    );
+    assert_eq!(
+        worker_scalar_i64("SELECT count(*)::int8 FROM rcw_dep WHERE k = 999999"),
+        1,
+        "write committed during the rebuild was lost from the dependent IMV"
+    );
+    assert_eq!(rbc_mismatch("rcw_up", "SELECT k, v FROM rcw_rel"), 0);
+    assert_eq!(rbc_mismatch("rcw_dep", "SELECT k, v FROM rcw_rel"), 0);
+    assert!(
+        waiting,
+        "the writer was never observed blocked behind the rebuild"
+    );
+    let _ = Spi::get_one::<String>("SELECT dblink_disconnect('rbc_writer')");
+    probe_db_close(DBNAME);
+}
