@@ -752,3 +752,47 @@ fn pg_rda_partition_reconcile_still_refreshes_ignoring_dependent() {
         "SELECT plan, SUM(qty) AS q FROM rdpc_src GROUP BY plan",
     );
 }
+
+/// Table scans (sequential + index) of the leaves of `rel` other than the one
+/// holding `plan`, in this transaction.
+fn scans_of_other_leaves(rel: &str, plan: i32) -> i64 {
+    Spi::get_one::<i64>(&format!(
+        "SELECT COALESCE(sum(s.seq_scan + COALESCE(s.idx_scan, 0)), 0)::int8 \
+         FROM pg_partition_tree('{rel}'::regclass) p \
+         JOIN pg_stat_xact_user_tables s ON s.relid = p.relid \
+         WHERE p.isleaf AND p.relid <> (SELECT tableoid FROM {rel} WHERE plan = {plan} LIMIT 1)"
+    ))
+    .expect("scan count")
+    .expect("scan count value")
+}
+
+/// A one-leaf rebuild applies its diff to that leaf only: no statement of it
+/// may scan the IMV's other leaves (it must keep the leaf's partition bound so
+/// the planner prunes them).
+#[pg_test]
+fn pg_rda_partition_leaf_rebuild_scans_no_other_leaf() {
+    rda_build_partitioned("rdps");
+    create_imv(
+        "rdps_dep",
+        "SELECT create_reflex_ivm('rdps_dep', 'SELECT plan, id, qty * 2 AS q2 FROM rdps_up', \
+         'plan, id', NULL, 'IMMEDIATE', NULL, ARRAY['plan'])",
+    );
+    Spi::run("UPDATE rdps_up SET qty = qty + 1000 WHERE plan = 2 AND id = 7").expect("drift");
+    Spi::run("DELETE FROM rdps_up WHERE plan = 2 AND id = 8").expect("missing row");
+    Spi::run("INSERT INTO rdps_up VALUES (2, 1000, 0, 0)").expect("phantom row");
+
+    let before = scans_of_other_leaves("rdps_up", 2);
+
+    let res = Spi::get_one::<String>("SELECT reflex_reconcile_partition('rdps_up', '2')")
+        .expect("reconcile_partition")
+        .expect("result");
+    assert!(res.starts_with("RECONCILED"), "{res}");
+
+    let scanned = scans_of_other_leaves("rdps_up", 2) - before;
+    assert_eq!(
+        scanned, 0,
+        "a plan-2 leaf rebuild scanned the other leaves {scanned} times"
+    );
+    assert_imv_correct("rdps_up", "SELECT plan, id, product_id, qty FROM rdps_src");
+    assert_imv_correct("rdps_dep", "SELECT plan, id, qty * 2 AS q2 FROM rdps_src");
+}
