@@ -39,6 +39,7 @@ mod heal;
 mod introspect;
 mod partition;
 mod query_decomposer;
+mod rebuild_diff;
 mod reconcile;
 mod schema_builder;
 mod sql_analyzer;

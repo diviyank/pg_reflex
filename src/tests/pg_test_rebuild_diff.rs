@@ -1,11 +1,14 @@
 // Shared helpers + step-0 probes for the rebuild-propagation safeguard.
 
+/// `pg_partition_tree` yields no row for a plain table, so the relation itself
+/// is added (a partitioned root holds no tuples and contributes 0).
 fn tree_xact_changes(rel: &str) -> i64 {
     Spi::get_one::<i64>(&format!(
         "SELECT COALESCE(sum(pg_stat_get_xact_tuples_inserted(relid) \
                            + pg_stat_get_xact_tuples_updated(relid) \
                            + pg_stat_get_xact_tuples_deleted(relid)), 0)::int8 \
-         FROM pg_partition_tree('{rel}'::regclass) WHERE isleaf"
+         FROM (SELECT relid FROM pg_partition_tree('{rel}'::regclass) WHERE isleaf \
+               UNION SELECT '{rel}'::regclass) leaves"
     ))
     .expect("tree xact stats")
     .unwrap_or(0)
@@ -55,8 +58,10 @@ fn pg_rbd_step0_dml_through_partitioned_root_maintains_dependent() {
         ))
         .expect("part");
     }
-    Spi::run("INSERT INTO rbd0_src SELECT p, g, g FROM generate_series(1, 50) g, (VALUES (1),(2)) v(p)")
-        .expect("seed");
+    Spi::run(
+        "INSERT INTO rbd0_src SELECT p, g, g FROM generate_series(1, 50) g, (VALUES (1),(2)) v(p)",
+    )
+    .expect("seed");
     create_imv(
         "rbd0_up",
         "SELECT create_reflex_ivm('rbd0_up', 'SELECT plan, id, qty FROM rbd0_src', \
@@ -65,12 +70,16 @@ fn pg_rbd_step0_dml_through_partitioned_root_maintains_dependent() {
     let dep = crate::create_reflex_ivm(
         "rbd0_dep",
         "SELECT plan, SUM(qty) AS q, COUNT(*) AS n FROM rbd0_up GROUP BY plan",
-        None, None, None, None,
+        None,
+        None,
+        None,
+        None,
     );
     assert_eq!(dep, "CREATE REFLEX INCREMENTAL VIEW");
 
     Spi::run("DELETE FROM rbd0_up WHERE plan = 2 AND id = 1").expect("delete via root");
-    Spi::run("UPDATE rbd0_up SET qty = qty + 1 WHERE plan = 2 AND id = 2").expect("update via root");
+    Spi::run("UPDATE rbd0_up SET qty = qty + 1 WHERE plan = 2 AND id = 2")
+        .expect("update via root");
     Spi::run("INSERT INTO rbd0_up VALUES (2, 1000, 7)").expect("insert via root");
 
     assert_imv_correct(
@@ -78,3 +87,257 @@ fn pg_rbd_step0_dml_through_partitioned_root_maintains_dependent() {
         "SELECT plan, SUM(qty) AS q, COUNT(*) AS n FROM rbd0_up GROUP BY plan",
     );
 }
+
+fn rbd_up_and_dep(prefix: &str, key: Option<&str>, mode: &str) {
+    rbd_build_rel(prefix);
+    let up = crate::create_reflex_ivm(
+        &format!("{prefix}_up"),
+        &format!("SELECT product_id, location_id, is_active FROM {prefix}_rel"),
+        key,
+        None,
+        Some(mode),
+        None,
+    );
+    assert_eq!(up, "CREATE REFLEX INCREMENTAL VIEW");
+    let dep = crate::create_reflex_ivm(
+        &format!("{prefix}_dep"),
+        &rbd_dep_sql(prefix, &format!("{prefix}_up")),
+        Some("product_id, location_id, id"),
+        None,
+        Some(mode),
+        None,
+    );
+    assert_eq!(dep, "CREATE REFLEX INCREMENTAL VIEW");
+}
+
+fn rbd_rebuild(view: &str, sql: &str) -> String {
+    Spi::get_one::<String>(&format!(
+        "SELECT reflex_rebuild_target_rows('{view}', $q${sql}$q$)"
+    ))
+    .expect("rebuild")
+    .expect("rebuild result")
+}
+
+/// Keyed diff: one drifted upstream row reaches the dependent as that key's rows only.
+#[pg_test]
+fn pg_rbd_keyed_one_row_drift_is_one_key_downstream() {
+    rbd_up_and_dep("rbk1", Some("product_id, location_id"), "IMMEDIATE");
+    Spi::run(
+        "UPDATE rbk1_up SET is_active = NOT is_active WHERE product_id = 0 AND location_id = 0",
+    )
+    .expect("drift");
+    let before = tree_xact_changes("rbk1_dep");
+    assert_eq!(
+        rbd_rebuild(
+            "rbk1_up",
+            "SELECT product_id, location_id, is_active FROM rbk1_rel"
+        ),
+        "DIFFED"
+    );
+    let touched = tree_xact_changes("rbk1_dep") - before;
+    assert_imv_correct(
+        "rbk1_up",
+        "SELECT product_id, location_id, is_active FROM rbk1_rel",
+    );
+    assert_imv_correct("rbk1_dep", &rbd_dep_sql("rbk1", "rbk1_rel"));
+    let key_rows = Spi::get_one::<i64>(
+        "SELECT count(*)::int8 FROM rbk1_anchor WHERE product_id = 0 AND location_id = 0",
+    )
+    .unwrap()
+    .unwrap();
+    assert!(
+        touched > 0 && touched <= 2 * key_rows,
+        "dependent touched {touched} rows, key has {key_rows}"
+    );
+}
+
+/// No-op rebuild touches nothing downstream (NULL values included).
+#[pg_test]
+fn pg_rbd_keyed_noop_rebuild_touches_nothing() {
+    rbd_up_and_dep("rbk2", Some("product_id, location_id"), "IMMEDIATE");
+    let before = (tree_xact_changes("rbk2_up"), tree_xact_changes("rbk2_dep"));
+    assert_eq!(
+        rbd_rebuild(
+            "rbk2_up",
+            "SELECT product_id, location_id, is_active FROM rbk2_rel"
+        ),
+        "DIFFED"
+    );
+    assert_eq!(
+        (tree_xact_changes("rbk2_up"), tree_xact_changes("rbk2_dep")),
+        before
+    );
+}
+
+/// Vanished key deleted, new key inserted, changed row updated in place.
+#[pg_test]
+fn pg_rbd_keyed_delete_insert_update() {
+    rbd_up_and_dep("rbk3", Some("product_id, location_id"), "IMMEDIATE");
+    Spi::run("DELETE FROM rbk3_rel WHERE product_id = 1 AND location_id = 1").expect("vanish");
+    Spi::run("INSERT INTO rbk3_rel VALUES (6, 4, TRUE)").expect("new key");
+    Spi::run("UPDATE rbk3_rel SET is_active = NOT COALESCE(is_active, FALSE) WHERE product_id = 2 AND location_id = 2")
+        .expect("change");
+    // rel triggers already maintained rbk3_up; drift it back to the old state to give the rebuild work.
+    Spi::run("INSERT INTO rbk3_up VALUES (1, 1, TRUE)").expect("stale row");
+    Spi::run("DELETE FROM rbk3_up WHERE product_id = 6").expect("missing row");
+    assert_eq!(
+        rbd_rebuild(
+            "rbk3_up",
+            "SELECT product_id, location_id, is_active FROM rbk3_rel"
+        ),
+        "DIFFED"
+    );
+    assert_imv_correct(
+        "rbk3_up",
+        "SELECT product_id, location_id, is_active FROM rbk3_rel",
+    );
+    assert_imv_correct("rbk3_dep", &rbd_dep_sql("rbk3", "rbk3_rel"));
+}
+
+/// Whole-row diff (no key): duplicates incl. NULL matched copy for copy.
+#[pg_test]
+fn pg_rbd_wholerow_duplicates_exact() {
+    Spi::run("CREATE TABLE rbw1_rel (product_id INT, tag TEXT)").expect("rel");
+    Spi::run("INSERT INTO rbw1_rel VALUES (1,'a'),(1,'a'),(1,'a'),(2,NULL),(2,NULL),(3,'c')")
+        .expect("seed");
+    assert_eq!(
+        crate::create_reflex_ivm(
+            "rbw1_up",
+            "SELECT product_id, tag FROM rbw1_rel",
+            None,
+            None,
+            None,
+            None
+        ),
+        "CREATE REFLEX INCREMENTAL VIEW"
+    );
+    assert_eq!(
+        crate::create_reflex_ivm(
+            "rbw1_dep",
+            "SELECT product_id, COUNT(*) AS n FROM rbw1_up GROUP BY product_id",
+            None,
+            None,
+            None,
+            None
+        ),
+        "CREATE REFLEX INCREMENTAL VIEW"
+    );
+    Spi::run(
+        "DELETE FROM rbw1_up WHERE ctid IN (SELECT ctid FROM rbw1_up WHERE product_id = 1 LIMIT 1)",
+    )
+    .expect("d1");
+    Spi::run(
+        "DELETE FROM rbw1_up WHERE ctid IN (SELECT ctid FROM rbw1_up WHERE product_id = 2 LIMIT 1)",
+    )
+    .expect("d2");
+    Spi::run("INSERT INTO rbw1_up VALUES (3,'c')").expect("phantom");
+    assert_eq!(
+        rbd_rebuild("rbw1_up", "SELECT product_id, tag FROM rbw1_rel"),
+        "DIFFED"
+    );
+    assert_imv_correct("rbw1_up", "SELECT product_id, tag FROM rbw1_rel");
+    assert_imv_correct(
+        "rbw1_dep",
+        "SELECT product_id, COUNT(*) AS n FROM rbw1_rel GROUP BY product_id",
+    );
+}
+
+/// Whole-row diff detects values to_jsonb would equate: float last digit,
+/// json whitespace, array lower bound — even with extra_float_digits = 0.
+#[pg_test]
+fn pg_rbd_wholerow_detects_subtle_value_changes() {
+    let rel_sql = "SELECT id, f, j, a FROM rbw2_rel";
+    let rows_text = "string_agg(id || ':' || f::text || j::text || a::text, '|' ORDER BY id)";
+    Spi::run("CREATE TABLE rbw2_rel (id INT, f FLOAT8, j JSON, a INT[])").expect("rel");
+    Spi::run(
+        "INSERT INTO rbw2_rel SELECT id, 0.1::float8 + 0.2::float8, '{\"a\": 1}', '[0:1]={1,2}' FROM generate_series(1, 3) id",
+    )
+    .expect("seed");
+    assert_eq!(crate::create_reflex_ivm("rbw2_up", rel_sql, None, None, None, None),
+               "CREATE REFLEX INCREMENTAL VIEW");
+    assert_eq!(crate::create_reflex_ivm("rbw2_dep",
+               "SELECT id, f, j::text AS jt, array_lower(a, 1) AS lo FROM rbw2_up", None, None, None, None),
+               "CREATE REFLEX INCREMENTAL VIEW");
+    // Each look-alike drift in its own row, so each must be detected on its own.
+    Spi::run("UPDATE rbw2_up SET f = 0.3 WHERE id = 1").expect("float look-alike");
+    Spi::run("UPDATE rbw2_up SET j = '{\"a\":1}' WHERE id = 2").expect("json look-alike");
+    Spi::run("UPDATE rbw2_up SET a = '{1,2}' WHERE id = 3").expect("array look-alike");
+    Spi::run("SET LOCAL extra_float_digits = 0").expect("caller precision");
+    assert_eq!(rbd_rebuild("rbw2_up", rel_sql), "DIFFED");
+    assert_eq!(Spi::get_one::<String>("SHOW extra_float_digits").unwrap().unwrap(), "0",
+               "caller's extra_float_digits not restored");
+    Spi::run("SET LOCAL extra_float_digits = 3").expect("oracle precision");
+    let exact = Spi::get_one::<bool>(&format!(
+        "SELECT (SELECT {rows_text} FROM rbw2_up) = (SELECT {rows_text} FROM rbw2_rel)"
+    )).unwrap().unwrap();
+    assert!(exact, "a look-alike value survived the rebuild");
+    assert_imv_correct("rbw2_dep", "SELECT id, f, j::text AS jt, array_lower(a, 1) AS lo FROM rbw2_rel");
+}
+
+/// Fast path: no dependents → 'REPLACED' (DELETE + INSERT), still correct.
+#[pg_test]
+fn pg_rbd_no_dependents_takes_replace_path() {
+    rbd_build_rel("rbf1");
+    let up = crate::create_reflex_ivm(
+        "rbf1_up",
+        "SELECT product_id, location_id, is_active FROM rbf1_rel",
+        Some("product_id, location_id"),
+        None,
+        None,
+        None,
+    );
+    assert_eq!(up, "CREATE REFLEX INCREMENTAL VIEW");
+    Spi::run("DELETE FROM rbf1_up WHERE product_id = 1").expect("drift");
+    assert_eq!(
+        rbd_rebuild(
+            "rbf1_up",
+            "SELECT product_id, location_id, is_active FROM rbf1_rel"
+        ),
+        "REPLACED"
+    );
+    assert_imv_correct(
+        "rbf1_up",
+        "SELECT product_id, location_id, is_active FROM rbf1_rel",
+    );
+}
+
+/// Review focus #1: schema-qualified mixed-case IMV name. IMV names are
+/// registry names (`schema.Name`, case kept, quoted per part when used in SQL).
+/// Pre-existing and out of scope: `create_reflex_ivm` fails for a mixed-case
+/// name with a unique key (explicit or PK-inferred) or an IMV source, so the
+/// upstream is a grouped aggregate given a unique index on its group columns
+/// (to reach the keyed diff) and the dependent is a plain row trigger
+/// recording what reaches it.
+#[pg_test]
+fn pg_rbd_qualified_mixed_case_name() {
+    let up_sql = "SELECT product_id, location_id, COUNT(*) AS n FROM rbq.rel GROUP BY product_id, location_id";
+    Spi::run("CREATE SCHEMA rbq").expect("schema");
+    Spi::run("CREATE TABLE rbq.rel (product_id INT NOT NULL, location_id INT NOT NULL, is_active BOOL)").expect("rel");
+    Spi::run("INSERT INTO rbq.rel VALUES (1,1,TRUE),(1,1,NULL),(2,2,FALSE),(3,3,TRUE)").expect("seed");
+    assert_eq!(crate::create_reflex_ivm("rbq.Up_V", up_sql, None, None, None, None),
+               "CREATE REFLEX INCREMENTAL VIEW");
+    Spi::run("CREATE UNIQUE INDEX up_v_key ON rbq.\"Up_V\" (product_id, location_id)")
+        .expect("key");
+    let keyed = Spi::get_one::<bool>(
+        "SELECT EXISTS (SELECT 1 FROM pg_index WHERE indrelid = 'rbq.\"Up_V\"'::regclass \
+         AND indisunique AND indpred IS NULL AND indexprs IS NULL)",
+    ).unwrap().unwrap();
+    assert!(keyed, "fixture must exercise the keyed diff");
+    Spi::run("CREATE TABLE rbq.seen (op TEXT, product_id INT)").expect("seen");
+    Spi::run(
+        "CREATE FUNCTION rbq.record_seen() RETURNS trigger LANGUAGE plpgsql AS $f$ BEGIN \
+           INSERT INTO rbq.seen VALUES (TG_OP, COALESCE(NEW.product_id, OLD.product_id)); RETURN NULL; END $f$",
+    ).expect("fn");
+    Spi::run("CREATE TRIGGER record_seen AFTER INSERT OR UPDATE OR DELETE ON rbq.\"Up_V\" \
+              FOR EACH ROW EXECUTE FUNCTION rbq.record_seen()").expect("trigger");
+    Spi::run("DELETE FROM rbq.\"Up_V\" WHERE product_id = 1").expect("drift");
+    Spi::run("UPDATE rbq.\"Up_V\" SET n = n + 5 WHERE product_id = 2").expect("drift");
+    Spi::run("TRUNCATE rbq.seen").expect("reset");
+    assert_eq!(rbd_rebuild("rbq.Up_V", up_sql), "DIFFED");
+    assert_imv_correct("rbq.\"Up_V\"", up_sql);
+    let seen = Spi::get_one::<String>(
+        "SELECT string_agg(op || ':' || product_id, ',' ORDER BY op, product_id) FROM rbq.seen",
+    ).unwrap();
+    assert_eq!(seen.as_deref(), Some("INSERT:1,UPDATE:2"), "dependent must see exactly the changed rows");
+}
+
