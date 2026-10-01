@@ -140,11 +140,26 @@ passthrough `INSERT`) keep working. Keep the window short:
 
 ### Rebuilds at COMMIT in 1.11.5
 
-Two operations now do a full rebuild of a DEFERRED IMV inside `COMMIT`:
-a `TRUNCATE` of one of its sources, and a transaction writing two sources
-of a multi-source IMV (the cross-source guard). The rebuild reruns the base
-query and, when the IMV has dependents, diffs it into them, so on a large
-IMV the `COMMIT` can take minutes.
+These operations now do a full rebuild of a DEFERRED IMV inside `COMMIT`:
+
+- a `TRUNCATE` of one of its sources;
+- a transaction writing two sources of a multi-source IMV (the cross-source
+  guard);
+- a reconcile of the IMV reached from inside a trigger, e.g. the
+  high-selectivity dispatch of an upstream IMV refreshing a DEFERRED
+  dependent that ignores it, or a hot-partition rebuild of an IMMEDIATE IMV
+  cascading to a DEFERRED dependent (the trigger's statement may not have
+  staged its own delta yet);
+- a partition- or key-scoped reconcile (`reflex_reconcile_partition`, a
+  partition swap, the scoped cascade) of an IMV that has deltas staged in the
+  transaction, when a staged row's partition cannot be told from the row
+  itself: the IMV joins another table (or reads its source twice), so its
+  partition column, or another source's change, reaches partitions other
+  than the row's own. An IMV reading one source table skips only the staged
+  deltas of the partitions it rebuilt and needs no full rebuild.
+
+The rebuild reruns the base query and, when the IMV has dependents, diffs it
+into them, so on a large IMV the `COMMIT` can take minutes.
 
 - `statement_timeout`, and a connection pooler's query timeout,
   apply to that `COMMIT`. A cancel is not caught by the flush's failure
