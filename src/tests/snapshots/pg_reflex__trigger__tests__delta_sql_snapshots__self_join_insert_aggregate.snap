@@ -6,6 +6,4 @@ TRUNCATE "__reflex_intermediate_v"
 --<<REFLEX_SEP>>--
 INSERT INTO "__reflex_intermediate_v" SELECT a.region, SUM(a.qty) AS qty FROM sales a JOIN sales b ON a.id = b.parent_id GROUP BY a.region
 --<<REFLEX_SEP>>--
-TRUNCATE "v"
---<<REFLEX_SEP>>--
-INSERT INTO "v" SELECT region, qty FROM __reflex_int_v GROUP BY region
+SELECT public.reflex_rebuild_target_rows('v', $reflex_rebuild$SELECT region, qty FROM __reflex_int_v GROUP BY region$reflex_rebuild$)

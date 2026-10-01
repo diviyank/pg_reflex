@@ -413,6 +413,26 @@ pub(crate) struct PendingDispatch {
     pub(crate) merge_sql: String,
 }
 
+/// Adapts a delta statement for embedding in a raw PL/pgSQL body, where a
+/// bare `SELECT` has no destination for its result and must be a `PERFORM`.
+pub(crate) fn as_plpgsql_stmt(stmt: &str) -> String {
+    match stmt.strip_prefix("SELECT public.reflex_rebuild_target_rows(") {
+        Some(rest) => format!("PERFORM public.reflex_rebuild_target_rows({rest}"),
+        None => stmt.to_string(),
+    }
+}
+
+/// A full refresh of `view_name` that reaches its dependents as a row diff
+/// when it has any (see `crate::rebuild_diff`), and as DELETE + INSERT otherwise.
+pub(crate) fn rebuild_target_stmt(view_name: &str, rebuild_sql: &str) -> String {
+    let tag = "$reflex_rebuild$";
+    let body = rebuild_sql.replace(tag, "$reflex_rebuild_x$");
+    format!(
+        "SELECT public.reflex_rebuild_target_rows('{}', {tag}{body}{tag})",
+        view_name.replace('\'', "''")
+    )
+}
+
 /// Full refresh: rebuild the IMV from `base_query`/`end_query` when no valid
 /// incremental delta exists. Used for self-joins (the source appears multiple
 /// times, so a single transition swap is wrong) and for a source inside a
@@ -426,20 +446,19 @@ pub(crate) fn full_refresh_stmts(
     plan: &AggregationPlan,
     stmts: &mut Vec<String>,
 ) {
-    let qv = quote_identifier(view_name);
     if plan.is_passthrough {
-        stmts.push(format!("DELETE FROM {}", qv));
-        stmts.push(format!("INSERT INTO {} {}", qv, base_query));
+        stmts.push(rebuild_target_stmt(view_name, base_query));
     } else {
         stmts.push(format!("TRUNCATE {}", intermediate_tbl));
         stmts.push(format!("INSERT INTO {} {}", intermediate_tbl, base_query));
-        if end_query.is_empty() {
-            stmts.push(format!("TRUNCATE {}", qv));
-            stmts.push(format!("INSERT INTO {} {}", qv, base_query));
-        } else {
-            stmts.push(format!("TRUNCATE {}", qv));
-            stmts.push(format!("INSERT INTO {} {}", qv, end_query));
-        }
+        stmts.push(rebuild_target_stmt(
+            view_name,
+            if end_query.is_empty() {
+                base_query
+            } else {
+                end_query
+            },
+        ));
     }
 }
 
@@ -604,8 +623,7 @@ pub(crate) fn outer_join_secondary_stmts(
                     // A FULL JOIN delta surfaces unmatched rows from the OTHER
                     // side that keyed scoping (on this secondary's join keys)
                     // cannot capture — keep the safe full rebuild.
-                    stmts.push(format!("DELETE FROM {}", qv));
-                    stmts.push(format!("INSERT INTO {} {}", qv, base_query));
+                    stmts.push(rebuild_target_stmt(view_name, base_query));
                     return;
                 }
                 let target_cols: Vec<String> =
@@ -690,8 +708,7 @@ pub(crate) fn outer_join_secondary_stmts(
             }
             _ => {
                 // No derivable mapping → safe full-rebuild fallback.
-                stmts.push(format!("DELETE FROM {}", qv));
-                stmts.push(format!("INSERT INTO {} {}", qv, base_query));
+                stmts.push(rebuild_target_stmt(view_name, base_query));
                 return;
             }
         }
@@ -711,12 +728,14 @@ pub(crate) fn outer_join_secondary_stmts(
     if bq_upper.contains("FULL JOIN") || bq_upper.contains("FULL OUTER") {
         stmts.push(format!("TRUNCATE {}", intermediate_tbl));
         stmts.push(format!("INSERT INTO {} {}", intermediate_tbl, base_query));
-        stmts.push(format!("TRUNCATE {}", qv));
-        if end_query.is_empty() {
-            stmts.push(format!("INSERT INTO {} {}", qv, base_query));
-        } else {
-            stmts.push(format!("INSERT INTO {} {}", qv, end_query));
-        }
+        stmts.push(rebuild_target_stmt(
+            view_name,
+            if end_query.is_empty() {
+                base_query
+            } else {
+                end_query
+            },
+        ));
         return;
     }
 
@@ -827,8 +846,7 @@ pub(crate) fn outer_join_secondary_stmts(
             // to scope by. Fall back to a full intermediate + target refresh.
             stmts.push(format!("TRUNCATE {}", intermediate_tbl));
             stmts.push(format!("INSERT INTO {} {}", intermediate_tbl, base_query));
-            stmts.push(format!("DELETE FROM {}", qv));
-            stmts.push(format!("INSERT INTO {} {}", qv, end_query));
+            stmts.push(rebuild_target_stmt(view_name, end_query));
             return;
         }
 
@@ -896,12 +914,14 @@ pub(crate) fn outer_join_secondary_stmts(
     } else {
         stmts.push(format!("TRUNCATE {}", intermediate_tbl));
         stmts.push(format!("INSERT INTO {} {}", intermediate_tbl, base_query));
-        stmts.push(format!("TRUNCATE {}", qv));
-        if end_query.is_empty() {
-            stmts.push(format!("INSERT INTO {} {}", qv, base_query));
-        } else {
-            stmts.push(format!("INSERT INTO {} {}", qv, end_query));
-        }
+        stmts.push(rebuild_target_stmt(
+            view_name,
+            if end_query.is_empty() {
+                base_query
+            } else {
+                end_query
+            },
+        ));
     }
 }
 
@@ -1131,8 +1151,7 @@ pub(crate) fn passthrough_op_stmts(
                     stmts.push(format!("ANALYZE {}", qv));
                 }
             } else {
-                stmts.push(format!("DELETE FROM {}", qv));
-                stmts.push(format!("INSERT INTO {} {}", qv, base_query));
+                stmts.push(rebuild_target_stmt(view_name, base_query));
             }
         }
         "UPDATE" => {
@@ -1229,8 +1248,7 @@ pub(crate) fn passthrough_op_stmts(
                     stmts.push(base_ins);
                 }
             } else {
-                stmts.push(format!("DELETE FROM {}", qv));
-                stmts.push(format!("INSERT INTO {} {}", qv, base_query));
+                stmts.push(rebuild_target_stmt(view_name, base_query));
             }
         }
         _ => {}
@@ -1505,9 +1523,7 @@ pub(crate) fn aggregate_epilogue_stmts(
         }
         stmts.push(metadata_sql);
     } else {
-        let qv = quote_identifier(view_name);
-        stmts.push(format!("TRUNCATE {}", qv));
-        stmts.push(format!("INSERT INTO {} {}", qv, end_query));
+        stmts.push(rebuild_target_stmt(view_name, end_query));
         stmts.push(metadata_sql);
     }
 }
