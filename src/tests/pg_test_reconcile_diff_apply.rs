@@ -261,3 +261,122 @@ fn pg_rda_reconcile_without_dependents_still_correct() {
     rda_reconcile("rda6_up");
     assert_imv_correct("rda6_up", sql);
 }
+
+/// Rows inserted / deleted by this transaction across every leaf of `rel`
+/// (a partitioned root carries no tuple stats of its own; swapped-in leaves
+/// count from zero, which is exactly what a full refill looks like).
+fn rda_tree_xact_changes(rel: &str) -> (i64, i64) {
+    let row = Spi::get_two::<i64, i64>(&format!(
+        "SELECT COALESCE(sum(pg_stat_get_xact_tuples_inserted(relid)), 0)::int8, \
+                COALESCE(sum(pg_stat_get_xact_tuples_deleted(relid)), 0)::int8 \
+         FROM pg_partition_tree('{rel}'::regclass) WHERE isleaf"
+    ))
+    .expect("tree xact stats");
+    (row.0.unwrap_or(0), row.1.unwrap_or(0))
+}
+
+/// A LIST(plan)-partitioned source and a partitioned passthrough IMV over it.
+fn rda_build_partitioned(prefix: &str) {
+    Spi::run(&format!(
+        "CREATE TABLE {prefix}_src (plan INT NOT NULL, id INT NOT NULL, product_id INT NOT NULL, \
+         qty INT) PARTITION BY LIST (plan)"
+    ))
+    .expect("src");
+    for plan in [1, 2, 3] {
+        Spi::run(&format!(
+            "CREATE TABLE {prefix}_src_p{plan} PARTITION OF {prefix}_src FOR VALUES IN ({plan})"
+        ))
+        .expect("src partition");
+    }
+    Spi::run(&format!(
+        "INSERT INTO {prefix}_src SELECT p, g, g % 10, g \
+         FROM generate_series(1, 100) g CROSS JOIN (VALUES (1), (2), (3)) v(p)"
+    ))
+    .expect("seed src");
+    create_imv(
+        &format!("{prefix}_up"),
+        &format!(
+            "SELECT create_reflex_ivm('{prefix}_up', \
+             'SELECT plan, id, product_id, qty FROM {prefix}_src', \
+             'plan, id', NULL, 'IMMEDIATE', NULL, ARRAY['plan'])"
+        ),
+    );
+}
+
+/// P1 — whole-IMV reconcile of a partitioned IMV: an aggregate dependent sees
+/// only the drifted group change, not a rebuild.
+#[pg_test]
+fn pg_rda_partitioned_reconcile_reaches_aggregate_dependent_as_delta() {
+    rda_build_partitioned("rdp1");
+    let dep_sql = "SELECT product_id, SUM(qty) AS q, COUNT(*) AS n FROM rdp1_up GROUP BY product_id";
+    let res = crate::create_reflex_ivm("rdp1_dep", dep_sql, None, None, None, None);
+    assert_eq!(res, "CREATE REFLEX INCREMENTAL VIEW");
+    let fresh = "SELECT product_id, SUM(qty) AS q, COUNT(*) AS n FROM rdp1_src GROUP BY product_id";
+
+    Spi::run("UPDATE rdp1_up SET qty = qty + 1000 WHERE plan = 2 AND id = 7").expect("drift");
+    let before = rda_tree_xact_changes("rdp1_dep");
+    rda_reconcile("rdp1_up");
+    let after = rda_tree_xact_changes("rdp1_dep");
+
+    assert_imv_correct("rdp1_up", "SELECT plan, id, product_id, qty FROM rdp1_src");
+    assert_imv_correct("rdp1_dep", fresh);
+    assert!(
+        after.0 - before.0 <= RDA_DIFF_STATEMENTS && after.1 - before.1 <= RDA_DIFF_STATEMENTS,
+        "aggregate dependent rebuilt instead of receiving the one-group delta: +{} / -{}",
+        after.0 - before.0,
+        after.1 - before.1
+    );
+}
+
+/// P2 — partition-scoped reconcile: a dependent partitioned on the same column
+/// receives the drifted row, not a refill of the partition.
+#[pg_test]
+fn pg_rda_partition_reconcile_reaches_partitioned_dependent_as_delta() {
+    rda_build_partitioned("rdp2");
+    create_imv(
+        "rdp2_dep",
+        "SELECT create_reflex_ivm('rdp2_dep', \
+         'SELECT plan, id, qty * 2 AS q2 FROM rdp2_up', \
+         'plan, id', NULL, 'IMMEDIATE', NULL, ARRAY['plan'])",
+    );
+    let fresh = "SELECT plan, id, qty * 2 AS q2 FROM rdp2_src";
+
+    Spi::run("UPDATE rdp2_up SET qty = qty + 1000 WHERE plan = 2 AND id = 7").expect("drift");
+    let before = rda_tree_xact_changes("rdp2_dep");
+    let res = Spi::get_one::<String>("SELECT reflex_reconcile_partition('rdp2_up', '2')")
+        .expect("reconcile_partition")
+        .expect("result");
+    assert!(res.starts_with("RECONCILED"), "{res}");
+    let after = rda_tree_xact_changes("rdp2_dep");
+
+    assert_imv_correct("rdp2_up", "SELECT plan, id, product_id, qty FROM rdp2_src");
+    assert_imv_correct("rdp2_dep", fresh);
+    assert!(
+        after.0 - before.0 <= RDA_DIFF_STATEMENTS && after.1 - before.1 <= RDA_DIFF_STATEMENTS,
+        "partitioned dependent refilled instead of receiving the one-row delta: +{} / -{}",
+        after.0 - before.0,
+        after.1 - before.1
+    );
+}
+
+/// P3 — a dependent that IGNORES the reconciled IMV sees none of its writes,
+/// so it must still be refreshed by the cascade (forecast_analysis_view
+/// ignores sop_forecast_view in production).
+#[pg_test]
+fn pg_rda_partitioned_reconcile_still_refreshes_ignoring_dependent() {
+    rda_build_partitioned("rdp3");
+    let dep_sql = "SELECT plan, SUM(qty) AS q FROM rdp3_up GROUP BY plan";
+    create_imv(
+        "rdp3_dep",
+        &format!(
+            "SELECT create_reflex_ivm('rdp3_dep', '{dep_sql}', NULL, NULL, 'IMMEDIATE', '!rdp3_up', ARRAY['plan'])"
+        ),
+    );
+    let fresh = "SELECT plan, SUM(qty) AS q FROM rdp3_src GROUP BY plan";
+
+    Spi::run("UPDATE rdp3_up SET qty = qty + 1000 WHERE plan = 2 AND id = 7").expect("drift");
+    rda_reconcile("rdp3_up");
+
+    assert_imv_correct("rdp3_up", "SELECT plan, id, product_id, qty FROM rdp3_src");
+    assert_imv_correct("rdp3_dep", fresh);
+}
