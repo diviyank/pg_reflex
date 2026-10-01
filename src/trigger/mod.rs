@@ -454,36 +454,56 @@ pub fn reflex_quote_identifier(name: &str) -> String {
 }
 
 /// Generates SQL statements to handle a TRUNCATE on a source table.
-/// TRUNCATE has no transition tables, so we clear intermediate + target entirely.
+///
+/// TRUNCATE has no transition tables, so the IMV is rebuilt from its base
+/// query. Clearing it instead is only right when the truncated source empties
+/// the result (the anchor, an inner join); on the nullable side of an outer
+/// join, under NOT EXISTS, or for an ungrouped aggregate the result keeps rows,
+/// and clearing deleted them outright — in DEFERRED mode outside the flush's
+/// savepoint, so a failed flush made the loss permanent. Where clearing was
+/// right, the rebuild reads an empty join and costs about the same.
 #[pg_extern(parallel_safe)]
 pub fn reflex_build_truncate_sql(view_name: &str) -> String {
     let intermediate_tbl = intermediate_table_name(view_name);
+    let escaped_name = view_name.replace('\'', "''");
+    let registry_text = |column: &str| -> String {
+        Spi::get_one::<&str>(&format!(
+            "SELECT {column}::text FROM public.__reflex_ivm_reference WHERE name = '{escaped_name}'"
+        ))
+        .unwrap_or(None)
+        .unwrap_or("")
+        .to_string()
+    };
 
-    // Check if this is a passthrough IMV by reading aggregations from the reference table
-    let agg_json: String = Spi::get_one::<&str>(&format!(
-        "SELECT aggregations::text FROM public.__reflex_ivm_reference WHERE name = '{}'",
-        view_name.replace("'", "''")
-    ))
-    .unwrap_or(None)
-    .unwrap_or("{}")
-    .to_string();
-
-    let is_passthrough = if let Ok(plan) = serde_json::from_str::<AggregationPlan>(&agg_json) {
-        plan.is_passthrough
-    } else {
-        false
+    let base_query = registry_text("base_query");
+    let end_query = registry_text("end_query");
+    let plan = match serde_json::from_str::<AggregationPlan>(&registry_text("aggregations")) {
+        Ok(plan) if !base_query.is_empty() => plan,
+        _ => {
+            warning!(
+                "pg_reflex: cannot rebuild '{}' after a source TRUNCATE — registry row unreadable; \
+                 marking it stale instead of clearing it",
+                view_name
+            );
+            return format!(
+                "UPDATE public.__reflex_ivm_reference SET known_stale = TRUE, \
+                 stale_since = COALESCE(stale_since, now()), \
+                 stale_reason = 'source truncated and the IMV could not be rebuilt; \
+                 run reflex_reconcile(''{escaped_name}'')' \
+                 WHERE name = '{escaped_name}'"
+            );
+        }
     };
 
     let mut stmts: Vec<String> = Vec::new();
-
-    if is_passthrough {
-        // Passthrough: just clear the target, then re-insert from source (which is now empty)
-        stmts.push(format!("DELETE FROM {}", quote_identifier(view_name)));
-    } else {
-        // Aggregate: clear intermediate and target
-        stmts.push(format!("TRUNCATE {}", intermediate_tbl));
-        stmts.push(format!("DELETE FROM {}", quote_identifier(view_name)));
-    }
+    full_refresh_stmts(
+        view_name,
+        &base_query,
+        &end_query,
+        &intermediate_tbl,
+        &plan,
+        &mut stmts,
+    );
 
     // Update last_update_date (lazy: skip if updated within the last second)
     stmts.push(format!(
