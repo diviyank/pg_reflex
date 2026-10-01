@@ -634,6 +634,9 @@ fn ish_key_with_edge_whitespace_heals_dependents() {
         .expect("heal")
         .unwrap_or_default();
     assert!(!result.starts_with("ERROR"), "heal returned: {result}");
+    // The healed parent's rows reach the DEFERRED dependent as a staged diff,
+    // applied at COMMIT; flush it as COMMIT would.
+    Spi::run("SELECT reflex_flush_deferred('ish_w_imv')").expect("flush the staged diff");
     assert_eq!(
         ish_diverging(
             "ish_w_dep",
@@ -642,6 +645,55 @@ fn ish_key_with_edge_whitespace_heals_dependents() {
         ),
         0,
         "the dependent must follow its healed parent"
+    );
+}
+
+/// N4 through the cascade: a dependent that IGNORES the healed IMV receives no
+/// diff, so the partition cascade must reach it with the exact key text. Two
+/// keys are healed at once so a trimmed ' a' -> 'a' would still let the call
+/// report RECONCILED (via 'c') while leaving the ' a' slice stale.
+#[pg_test]
+fn ish_key_with_edge_whitespace_heals_ignoring_dependent() {
+    Spi::run("CREATE TABLE ish_xd (code TEXT PRIMARY KEY, status TEXT NOT NULL)").expect("xd");
+    Spi::run("INSERT INTO ish_xd VALUES (' a', 'validated'), ('c', 'validated')").expect("seed xd");
+    Spi::run(
+        "CREATE TABLE ish_xf (code TEXT NOT NULL, d INT NOT NULL, v INT NOT NULL) \
+         PARTITION BY LIST (code)",
+    )
+    .expect("xf");
+    Spi::run("CREATE TABLE ish_xf_a PARTITION OF ish_xf FOR VALUES IN (' a')").expect("a");
+    Spi::run("CREATE TABLE ish_xf_c PARTITION OF ish_xf FOR VALUES IN ('c')").expect("c");
+    Spi::run("INSERT INTO ish_xf VALUES (' a', 1, 10), (' a', 2, 11), ('c', 1, 20)").expect("seed");
+    ish_create(
+        "ish_x_imv",
+        "SELECT f.code, f.d, f.v FROM ish_xf f JOIN ish_xd x ON x.code = f.code \
+          WHERE x.status = 'validated'",
+        "code,d",
+        "!ish_xd",
+        "'code'",
+    );
+    let r = Spi::get_one::<String>(
+        "SELECT create_reflex_ivm('ish_x_dep', \
+           'SELECT code, sum(v) AS s, count(*) AS n FROM ish_x_imv GROUP BY code', \
+           NULL, 'UNLOGGED', 'DEFERRED', '!ish_x_imv', ARRAY['code'])",
+    )
+    .expect("dependent create call")
+    .expect("dependent create result");
+    assert!(!r.starts_with("ERROR"), "dependent create returned: {r}");
+
+    Spi::run("UPDATE ish_xd SET status = 'draft'").expect("exclude ' a' and 'c'");
+    let result = Spi::get_one::<String>("SELECT reflex_heal_ignored_sources()")
+        .expect("heal")
+        .unwrap_or_default();
+    assert!(!result.starts_with("ERROR"), "heal returned: {result}");
+    assert_eq!(
+        ish_diverging(
+            "ish_x_dep",
+            "code, s, n",
+            "SELECT code, sum(v) AS s, count(*) AS n FROM ish_x_imv GROUP BY code"
+        ),
+        0,
+        "the ignoring dependent must follow its healed parent"
     );
 }
 
