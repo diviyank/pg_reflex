@@ -63,6 +63,384 @@ pub(crate) fn build_netted_view_sql(
     )
 }
 
+/// Transaction-local marker of the IMVs already rebuilt in this COMMIT batch;
+/// every later staged delta for them is skipped by the cross-source guard.
+const RECONCILED_BATCH_TABLE_DDL: &str =
+    "CREATE TEMP TABLE IF NOT EXISTS __reflex_deferred_reconciled_batch \
+     (name TEXT PRIMARY KEY) ON COMMIT DROP";
+
+/// `pg_reflex.flush_failure_policy`: `error` aborts the caller on a per-IMV
+/// failure; unset, `warn`, or anything unrecognised (with a WARNING) contains it.
+fn flush_fail_hard(client: &pgrx::spi::SpiClient<'_>) -> bool {
+    let flush_failure_policy = client
+        .select(
+            "SELECT lower(NULLIF(current_setting('pg_reflex.flush_failure_policy', true), '')) AS v",
+            None,
+            &[],
+        )
+        .unwrap_or_report()
+        .next()
+        .and_then(|row| row.get_by_name::<String, _>("v").unwrap_or(None));
+    match flush_failure_policy.as_deref() {
+        None | Some("warn") => false,
+        Some("error") => true,
+        Some(invalid) => {
+            pgrx::warning!(
+                "pg_reflex: invalid pg_reflex.flush_failure_policy={}, falling back to 'warn'",
+                invalid
+            );
+            false
+        }
+    }
+}
+
+fn temp_table_names(client: &pgrx::spi::SpiClient<'_>, table: &str) -> Vec<String> {
+    let present = client
+        .select(
+            &format!("SELECT to_regclass('pg_temp.{table}') IS NOT NULL AS e"),
+            None,
+            &[],
+        )
+        .unwrap_or_report()
+        .first()
+        .get_one::<bool>()
+        .unwrap_or(None)
+        .unwrap_or(false);
+    if !present {
+        return Vec::new();
+    }
+    client
+        .select(&format!("SELECT name FROM pg_temp.{table}"), None, &[])
+        .unwrap_or_report()
+        .filter_map(|row| row.get_by_name::<String, _>("name").unwrap_or(None))
+        .collect()
+}
+
+/// Commit-time rebuilds postponed while upstream DEFERRED IMVs are still pending,
+/// per IMV, before rebuilding anyway and marking the IMV stale.
+const TRUNCATE_REBUILD_MAX_DEFERRALS: i32 = 64;
+
+/// Whether `xid` is this transaction's or one of its (live or released)
+/// subtransactions'. Exact and never raises: no epoch arithmetic, no clog lookup;
+/// special, frozen and other transactions' xids are false.
+#[pg_extern(name = "__reflex_xid_is_current", stable, parallel_unsafe)]
+fn reflex_xid_is_current(xid: pg_sys::TransactionId) -> bool {
+    unsafe { pg_sys::TransactionIdIsCurrentTransactionId(xid) }
+}
+
+/// Predicate on a row: written by this transaction (or one of its
+/// subtransactions); committed rows left by other sessions are not.
+const WRITTEN_BY_THIS_XACT: &str = "public.__reflex_xid_is_current(xmin)";
+
+/// Whether an IMV upstream of `imv_name` (transitively, any mode) may still
+/// change in this transaction: a DEFERRED one with a delta this transaction
+/// staged on a source it does not ignore (its flush, which empties that staging
+/// table, is still to come), or one still waiting for its own TRUNCATE rebuild.
+fn upstream_pending(
+    client: &pgrx::spi::SpiClient<'_>,
+    imv_name: &str,
+    awaiting_rebuild: &[String],
+) -> bool {
+    let upstream: Vec<(String, Vec<String>)> = client
+        .select(
+            "WITH RECURSIVE up(name) AS ( \
+               SELECT d FROM public.__reflex_ivm_reference r, unnest(r.depends_on) d \
+               WHERE r.name = $1 \
+               UNION \
+               SELECT d FROM up JOIN public.__reflex_ivm_reference r ON r.name = up.name \
+               CROSS JOIN LATERAL unnest(r.depends_on) d \
+             ) \
+             SELECT r.name::text AS name, \
+                    CASE WHEN COALESCE(r.refresh_mode, 'IMMEDIATE') = 'DEFERRED' THEN \
+                      ARRAY(SELECT d FROM unnest(r.depends_on) d \
+                            WHERE NOT (COALESCE(r.ignored_sources, ARRAY[]::TEXT[]) \
+                                       && ARRAY[d, regexp_replace(d, '^.*\\.', '')])) \
+                    ELSE ARRAY[]::TEXT[] END AS sources \
+             FROM up JOIN public.__reflex_ivm_reference r ON r.name = up.name \
+             WHERE r.enabled AND r.name <> $1",
+            None,
+            &[unsafe {
+                DatumWithOid::new(imv_name.to_string(), PgBuiltInOids::TEXTOID.oid().value())
+            }],
+        )
+        .unwrap_or_report()
+        .map(|row| {
+            (
+                row.get_by_name::<String, _>("name")
+                    .unwrap_or(None)
+                    .unwrap_or_default(),
+                row.get_by_name::<Vec<String>, _>("sources")
+                    .unwrap_or(None)
+                    .unwrap_or_default(),
+            )
+        })
+        .collect();
+    upstream.iter().any(|(name, sources)| {
+        awaiting_rebuild.contains(name)
+            || sources
+                .iter()
+                .any(|source| staged_by_this_xact(client, &staging_delta_table_name(source)))
+    })
+}
+
+fn staged_by_this_xact(client: &pgrx::spi::SpiClient<'_>, delta_tbl: &str) -> bool {
+    let select_bool = |sql: &str| {
+        client
+            .select(sql, None, &[])
+            .unwrap_or_report()
+            .first()
+            .get_one::<bool>()
+            .unwrap_or(None)
+            .unwrap_or(false)
+    };
+    select_bool(&format!(
+        "SELECT to_regclass('{}') IS NOT NULL",
+        delta_tbl.replace('\'', "''")
+    )) && select_bool(&format!(
+        "SELECT EXISTS (SELECT 1 FROM {delta_tbl} WHERE {WRITTEN_BY_THIS_XACT})"
+    ))
+}
+
+/// Whether this transaction already requested a flush for `imv_name` that has
+/// not run yet (a 'TRUNCATE' pending row on its observed source).
+fn flush_request_outstanding(client: &pgrx::spi::SpiClient<'_>, imv_name: &str) -> bool {
+    let Some(source) = observed_source(imv_name) else {
+        return false;
+    };
+    client
+        .select(
+            &format!(
+                "SELECT EXISTS (SELECT 1 FROM public.__reflex_deferred_pending \
+                 WHERE source_table = $1 AND operation = 'TRUNCATE' AND {WRITTEN_BY_THIS_XACT})"
+            ),
+            None,
+            &[unsafe { DatumWithOid::new(source, PgBuiltInOids::TEXTOID.oid().value()) }],
+        )
+        .unwrap_or_report()
+        .first()
+        .get_one::<bool>()
+        .unwrap_or(None)
+        .unwrap_or(false)
+}
+
+/// stale_reason of an IMV whose TRUNCATE rebuild is postponed; its rebuild clears it.
+const POSTPONED_REASON: &str =
+    "source truncated; rebuild postponed until upstream DEFERRED IMVs settle";
+
+/// Rebuilds, once per transaction, each IMV a source TRUNCATE listed in
+/// `__reflex_deferred_rebuild` (`reflex_build_truncate_sql`), and records it in
+/// `__reflex_deferred_reconciled_batch` so every delta staged for it in this
+/// transaction is skipped. Runs around every flush, whatever its source: the
+/// rebuild must read every upstream IMV in its final state, so while one may
+/// still change ([`upstream_pending`]) it is postponed, and the flush that
+/// settles the upstream runs this again. As a fallback a pending row is
+/// re-enqueued (bounded; on exhaustion it is rebuilt anyway and marked stale).
+/// Nested calls (a flush fired synchronously by a write of this pass, e.g. after
+/// `SET CONSTRAINTS ALL IMMEDIATE`) return at once. The rebuild is the one an
+/// IMMEDIATE dependent gets at TRUNCATE time, so its dependents receive a row
+/// diff. A failure marks the IMV stale (or aborts under
+/// `flush_failure_policy = error`). Limit: after a mid-transaction
+/// `SET CONSTRAINTS ALL IMMEDIATE` rebuilt it, later DML of the same transaction
+/// staged for it is skipped by the marker.
+fn rebuild_truncated_imvs(client: &mut pgrx::spi::SpiClient<'_>) -> usize {
+    let nested = client
+        .select(
+            "SELECT current_setting('pg_reflex.truncate_rebuild_running', true) = 'on'",
+            None,
+            &[],
+        )
+        .unwrap_or_report()
+        .first()
+        .get_one::<bool>()
+        .unwrap_or(None)
+        .unwrap_or(false);
+    if nested {
+        return 0;
+    }
+    let listed = listed_for_rebuild(client);
+    if listed.is_empty() {
+        return 0;
+    }
+    client
+        .update(
+            "SELECT set_config('pg_reflex.truncate_rebuild_running', 'on', true)",
+            None,
+            &[],
+        )
+        .unwrap_or_report();
+    let rebuilt = rebuild_listed(client, &listed);
+    client
+        .update(
+            "SELECT set_config('pg_reflex.truncate_rebuild_running', '', true)",
+            None,
+            &[],
+        )
+        .unwrap_or_report();
+    rebuilt
+}
+
+/// `__reflex_deferred_rebuild` in graph-depth order (upstream IMVs first).
+fn listed_for_rebuild(client: &pgrx::spi::SpiClient<'_>) -> Vec<String> {
+    if temp_table_names(client, "__reflex_deferred_rebuild").is_empty() {
+        return Vec::new();
+    }
+    client
+        .select(
+            "SELECT b.name FROM pg_temp.__reflex_deferred_rebuild b \
+             LEFT JOIN public.__reflex_ivm_reference r ON r.name = b.name \
+             ORDER BY r.graph_depth NULLS LAST, b.name",
+            None,
+            &[],
+        )
+        .unwrap_or_report()
+        .filter_map(|row| row.get_by_name::<String, _>("name").unwrap_or(None))
+        .collect()
+}
+
+fn rebuild_listed(client: &mut pgrx::spi::SpiClient<'_>, listed: &[String]) -> usize {
+    let mut already_rebuilt = temp_table_names(client, "__reflex_deferred_reconciled_batch");
+    let fail_hard = flush_fail_hard(client);
+    let mut rebuilt = 0usize;
+    for imv_name in listed {
+        if already_rebuilt.contains(imv_name) {
+            continue;
+        }
+        let imv_esc = imv_name.replace('\'', "''");
+        let awaiting_rebuild: Vec<String> = listed
+            .iter()
+            .filter(|n| !already_rebuilt.contains(n))
+            .cloned()
+            .collect();
+        let upstream_moving = upstream_pending(client, imv_name, &awaiting_rebuild);
+        if upstream_moving {
+            let attempts = client
+                .select(
+                    &format!(
+                        "SELECT attempts FROM pg_temp.__reflex_deferred_rebuild WHERE name = '{imv_esc}'"
+                    ),
+                    None,
+                    &[],
+                )
+                .unwrap_or_report()
+                .first()
+                .get_one::<i32>()
+                .unwrap_or(None)
+                .unwrap_or(0);
+            if attempts < TRUNCATE_REBUILD_MAX_DEFERRALS {
+                // Never end the transaction unrebuilt and unflagged: flagged until rebuilt.
+                client
+                    .update(
+                        &format!(
+                            "UPDATE public.__reflex_ivm_reference SET known_stale = TRUE, \
+                               stale_reason = '{POSTPONED_REASON}', stale_since = now() \
+                             WHERE name = '{imv_esc}' AND NOT known_stale"
+                        ),
+                        None,
+                        &[],
+                    )
+                    .unwrap_or_report();
+                if !flush_request_outstanding(client, imv_name) {
+                    if let Some(enqueue) = enqueue_truncate_flush_sql(imv_name) {
+                        client
+                            .update(
+                                &format!(
+                                    "UPDATE pg_temp.__reflex_deferred_rebuild \
+                                     SET attempts = attempts + 1 WHERE name = '{imv_esc}'"
+                                ),
+                                None,
+                                &[],
+                            )
+                            .unwrap_or_report();
+                        client.update(&enqueue, None, &[]).unwrap_or_report();
+                    }
+                }
+                continue;
+            }
+        }
+        client
+            .update(RECONCILED_BATCH_TABLE_DDL, None, &[])
+            .unwrap_or_report();
+        client
+            .update(
+                &format!(
+                    "INSERT INTO __reflex_deferred_reconciled_batch (name) VALUES ('{imv_esc}') \
+                     ON CONFLICT DO NOTHING"
+                ),
+                None,
+                &[],
+            )
+            .unwrap_or_report();
+        already_rebuilt.push(imv_name.clone());
+        let mut stmts = match truncate_rebuild(imv_name) {
+            TruncateRebuild::Stmts(stmts) => stmts,
+            TruncateRebuild::Wrapper => continue,
+            TruncateRebuild::Unreadable => {
+                client
+                    .update(&mark_stale_after_truncate_sql(imv_name), None, &[])
+                    .unwrap_or_report();
+                continue;
+            }
+        };
+        stmts.push(format!(
+            "UPDATE public.__reflex_ivm_reference \
+               SET known_stale = FALSE, stale_reason = NULL, stale_since = NULL \
+             WHERE name = '{imv_esc}' AND stale_reason = '{POSTPONED_REASON}'"
+        ));
+        if upstream_moving {
+            pgrx::warning!(
+                "pg_reflex: IMV {} rebuilt after a source TRUNCATE while upstream DEFERRED IMVs \
+                 were still pending after {} deferrals; marking it stale",
+                imv_name,
+                TRUNCATE_REBUILD_MAX_DEFERRALS
+            );
+            stmts.push(format!(
+                "UPDATE public.__reflex_ivm_reference SET known_stale = TRUE, \
+                   stale_reason = 'rebuilt after a source TRUNCATE while upstream DEFERRED IMVs \
+                     still had pending changes ({TRUNCATE_REBUILD_MAX_DEFERRALS} deferrals \
+                     exhausted); run reflex_reconcile(''{imv_esc}'') to repair.', \
+                   stale_since = now() \
+                 WHERE name = '{imv_esc}'"
+            ));
+        }
+        let body = stmts
+            .iter()
+            .map(|s| format!("{};", as_plpgsql_stmt(s)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let exception_clause = if fail_hard {
+            String::new()
+        } else {
+            format!(
+                "EXCEPTION WHEN OTHERS THEN \
+                   RAISE WARNING 'pg_reflex: IMV % rebuild after source TRUNCATE failed: % (SQLSTATE %)', \
+                     '{imv_esc}', SQLERRM, SQLSTATE; \
+                   UPDATE public.__reflex_ivm_reference \
+                     SET known_stale = TRUE, \
+                         last_error = LEFT(SQLERRM || ' (SQLSTATE ' || SQLSTATE || ')', 500), \
+                         stale_reason = LEFT('rebuild after source TRUNCATE failed: ' || SQLERRM \
+                                             || '; run reflex_reconcile(''{imv_esc}'') to repair.', 2000), \
+                         stale_since = now() \
+                     WHERE name = '{imv_esc}';"
+            )
+        };
+        client
+            .update(
+                &format!(
+                    "DO $_reflex_trunc_rb$ BEGIN \
+                       PERFORM pg_advisory_xact_lock(hashtext('{imv_esc}'), hashtext(reverse('{imv_esc}'))); \
+                       \n{body}\n \
+                     {exception_clause} \
+                     END $_reflex_trunc_rb$"
+                ),
+                None,
+                &[],
+            )
+            .unwrap_or_report();
+        rebuilt += 1;
+    }
+    rebuilt
+}
+
 /// Flushes all accumulated deferred deltas for a given source table.
 ///
 /// Called by the deferred constraint trigger at COMMIT time.
@@ -70,6 +448,15 @@ pub(crate) fn build_netted_view_sql(
 /// to each DEFERRED IMV, then cleans up staging and pending rows.
 #[pg_extern]
 pub fn reflex_flush_deferred(source_table: &str) -> String {
+    // Before: a rebuilt IMV skips this flush's delta. After: this flush may have
+    // settled an upstream IMV a postponed rebuild was waiting for.
+    Spi::connect_mut(rebuild_truncated_imvs);
+    let flushed = flush_staged_deltas(source_table);
+    Spi::connect_mut(rebuild_truncated_imvs);
+    flushed
+}
+
+fn flush_staged_deltas(source_table: &str) -> String {
     let delta_tbl = staging_delta_table_name(source_table);
 
     // Read all DEFERRED IMVs that depend on this source. IMVs that listed this
@@ -182,7 +569,8 @@ pub fn reflex_flush_deferred(source_table: &str) -> String {
             client
                 .update(
                     &format!(
-                        "DELETE FROM public.__reflex_deferred_pending WHERE source_table = '{}'",
+                        "DELETE FROM public.__reflex_deferred_pending \
+                         WHERE source_table = '{}' AND operation <> 'TRUNCATE'",
                         source_table.replace("'", "''")
                     ),
                     None,
@@ -388,7 +776,8 @@ pub fn reflex_flush_deferred(source_table: &str) -> String {
             client
                 .update(
                     &format!(
-                        "DELETE FROM public.__reflex_deferred_pending WHERE source_table = '{}'",
+                        "DELETE FROM public.__reflex_deferred_pending \
+                         WHERE source_table = '{}' AND operation <> 'TRUNCATE'",
                         source_table.replace("'", "''")
                     ),
                     None,
@@ -408,10 +797,12 @@ pub fn reflex_flush_deferred(source_table: &str) -> String {
         // sequentially, each seeing the correct intermediate state); the
         // hazard is unique to the commit-time batch flush. Detect the batch
         // shape once here — the per-IMV loop full-reconciles any affected IMV
-        // exactly once via the transaction-local marker below.
+        // exactly once via the transaction-local marker below. 'TRUNCATE' rows are
+        // flush requests, not staged deltas, so they never count as a source.
         let batch_has_multiple_sources = client
             .select(
-                "SELECT count(DISTINCT source_table) >= 2 AS m FROM public.__reflex_deferred_pending",
+                "SELECT count(DISTINCT source_table) >= 2 AS m FROM public.__reflex_deferred_pending \
+                 WHERE operation <> 'TRUNCATE'",
                 None,
                 &[],
             )
@@ -451,12 +842,7 @@ pub fn reflex_flush_deferred(source_table: &str) -> String {
             // flush skips them — its net delta would otherwise corrupt the
             // just-reconciled state.
             client
-                .update(
-                    "CREATE TEMP TABLE IF NOT EXISTS __reflex_deferred_reconciled_batch \
-                     (name TEXT PRIMARY KEY) ON COMMIT DROP",
-                    None,
-                    &[],
-                )
+                .update(RECONCILED_BATCH_TABLE_DDL, None, &[])
                 .unwrap_or_report();
         }
 
@@ -469,26 +855,7 @@ pub fn reflex_flush_deferred(source_table: &str) -> String {
         // back to `warn` and raises a WARNING naming it — the same contract as
         // `pg_reflex.alter_source_policy` (src/lib.rs, `__reflex_on_ddl_command_end`):
         // a typo must never silently select either mode.
-        let flush_failure_policy = client
-            .select(
-                "SELECT lower(NULLIF(current_setting('pg_reflex.flush_failure_policy', true), '')) AS v",
-                None,
-                &[],
-            )
-            .unwrap_or_report()
-            .next()
-            .and_then(|row| row.get_by_name::<String, _>("v").unwrap_or(None));
-        let fail_hard = match flush_failure_policy.as_deref() {
-            None | Some("warn") => false,
-            Some("error") => true,
-            Some(invalid) => {
-                pgrx::warning!(
-                    "pg_reflex: invalid pg_reflex.flush_failure_policy={}, falling back to 'warn'",
-                    invalid
-                );
-                false
-            }
-        };
+        let fail_hard = flush_fail_hard(client);
 
         for (imv_name, base_query, end_query, agg_json, where_pred) in &imvs {
             if engage_cross_source_guard {
@@ -525,7 +892,8 @@ pub fn reflex_flush_deferred(source_table: &str) -> String {
                             "SELECT count(DISTINCT p.source_table) >= 2 AS m \
                              FROM public.__reflex_deferred_pending p \
                              JOIN public.__reflex_ivm_reference r ON r.name = '{}' \
-                             WHERE p.source_table = ANY(r.depends_on)",
+                             WHERE p.source_table = ANY(r.depends_on) \
+                               AND p.operation <> 'TRUNCATE'",
                             imv_esc
                         ),
                         None,
@@ -971,7 +1339,8 @@ pub fn reflex_flush_deferred(source_table: &str) -> String {
         client
             .update(
                 &format!(
-                    "DELETE FROM public.__reflex_deferred_pending WHERE source_table = '{}'",
+                    "DELETE FROM public.__reflex_deferred_pending \
+                         WHERE source_table = '{}' AND operation <> 'TRUNCATE'",
                     source_table.replace("'", "''")
                 ),
                 None,

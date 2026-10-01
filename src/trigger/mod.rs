@@ -462,57 +462,134 @@ pub fn reflex_quote_identifier(name: &str) -> String {
 /// and clearing deleted them outright — in DEFERRED mode outside the flush's
 /// savepoint, so a failed flush made the loss permanent. Where clearing was
 /// right, the rebuild reads an empty join and costs about the same.
+///
+/// IMMEDIATE: rebuilt now, reaching its dependents as a row diff.
+/// DEFERRED: untouched now. The IMV is listed in `__reflex_deferred_rebuild` and
+/// a pending row is enqueued on a source it observes, so the COMMIT-time flush
+/// rebuilds it once and skips every delta staged for it in this transaction
+/// (see `deferred::rebuild_truncated_dependents`).
 #[pg_extern(parallel_safe)]
 pub fn reflex_build_truncate_sql(view_name: &str) -> String {
-    let intermediate_tbl = intermediate_table_name(view_name);
     let escaped_name = view_name.replace('\'', "''");
-    let registry_text = |column: &str| -> String {
-        Spi::get_one::<&str>(&format!(
-            "SELECT {column}::text FROM public.__reflex_ivm_reference WHERE name = '{escaped_name}'"
-        ))
-        .unwrap_or(None)
-        .unwrap_or("")
-        .to_string()
+    let mut stmts = match truncate_rebuild(view_name) {
+        TruncateRebuild::Stmts(stmts) => stmts,
+        TruncateRebuild::Wrapper => return String::new(),
+        TruncateRebuild::Unreadable => return mark_stale_after_truncate_sql(view_name),
     };
 
-    let base_query = registry_text("base_query");
-    let end_query = registry_text("end_query");
-    let plan = match serde_json::from_str::<AggregationPlan>(&registry_text("aggregations")) {
-        Ok(plan) if !base_query.is_empty() => plan,
-        _ => {
-            warning!(
-                "pg_reflex: cannot rebuild '{}' after a source TRUNCATE — registry row unreadable; \
-                 marking it stale instead of clearing it",
-                view_name
-            );
-            return format!(
-                "UPDATE public.__reflex_ivm_reference SET known_stale = TRUE, \
-                 stale_since = COALESCE(stale_since, now()), \
-                 stale_reason = 'source truncated and the IMV could not be rebuilt; \
-                 run reflex_reconcile(''{escaped_name}'')' \
-                 WHERE name = '{escaped_name}'"
-            );
-        }
-    };
+    if registry_value(view_name, "COALESCE(refresh_mode, 'IMMEDIATE')") == "DEFERRED" {
+        let Some(enqueue) = enqueue_truncate_flush_sql(view_name) else {
+            return mark_stale_after_truncate_sql(view_name);
+        };
+        // The request row lives until its own event deletes it (flush_fn). Trigger
+        // bodies installed before that rule delete it early; the queued event still
+        // fires (AfterTriggerExecute fetches with SnapshotAny).
+        stmts = vec![
+            DEFERRED_REBUILD_TABLE_DDL.to_string(),
+            format!(
+                "INSERT INTO __reflex_deferred_rebuild VALUES ('{escaped_name}') ON CONFLICT DO NOTHING"
+            ),
+            enqueue,
+        ];
+    }
 
+    // Update last_update_date (lazy: skip if updated within the last second)
+    stmts.push(format!(
+        "UPDATE public.__reflex_ivm_reference SET last_update_date = NOW() \
+         WHERE name = '{escaped_name}' AND (last_update_date IS NULL OR last_update_date < NOW() - INTERVAL '1 second')"
+    ));
+
+    stmts.join("\n--<<REFLEX_SEP>>--\n")
+}
+
+/// Transaction-local list of DEFERRED IMVs whose source was truncated, with the
+/// number of times their commit-time rebuild was postponed.
+pub(crate) const DEFERRED_REBUILD_TABLE_DDL: &str =
+    "CREATE TEMP TABLE IF NOT EXISTS __reflex_deferred_rebuild \
+     (name TEXT PRIMARY KEY, attempts INT NOT NULL DEFAULT 0) ON COMMIT DROP";
+
+/// The first source `view_name` does not ignore: a pending row on it makes a flush
+/// that selects `view_name` run at COMMIT. `None` when it ignores every source.
+pub(crate) fn observed_source(view_name: &str) -> Option<String> {
+    let source = registry_value(
+        view_name,
+        "(SELECT d FROM unnest(depends_on) WITH ORDINALITY AS u(d, i) \
+          WHERE NOT (COALESCE(ignored_sources, ARRAY[]::TEXT[]) \
+                     && ARRAY[d, regexp_replace(d, '^.*\\.', '')]) \
+          ORDER BY i LIMIT 1)",
+    );
+    (!source.is_empty()).then_some(source)
+}
+
+/// Requests a COMMIT-time flush that selects `view_name` (see [`observed_source`]).
+pub(crate) fn enqueue_truncate_flush_sql(view_name: &str) -> Option<String> {
+    observed_source(view_name).map(|source| {
+        format!(
+            "INSERT INTO public.__reflex_deferred_pending (source_table, operation) \
+             VALUES ('{}', 'TRUNCATE')",
+            source.replace('\'', "''")
+        )
+    })
+}
+
+fn registry_value(view_name: &str, expr: &str) -> String {
+    Spi::get_one::<&str>(&format!(
+        "SELECT ({expr})::text FROM public.__reflex_ivm_reference WHERE name = '{}'",
+        view_name.replace('\'', "''")
+    ))
+    .unwrap_or(None)
+    .unwrap_or("")
+    .to_string()
+}
+
+pub(crate) enum TruncateRebuild {
+    /// Intermediate refilled, target through the dependent-safe diff.
+    Stmts(Vec<String>),
+    /// A decomposed wrapper, refused like `reconcile_one` refuses it: nothing to
+    /// do, its operands are the truncated source's dependents and maintain it.
+    Wrapper,
+    Unreadable,
+}
+
+/// How `view_name` is rebuilt from its base query after a source TRUNCATE.
+pub(crate) fn truncate_rebuild(view_name: &str) -> TruncateRebuild {
+    if crate::reconcile::is_decomposed_wrapper_row(view_name) {
+        return TruncateRebuild::Wrapper;
+    }
+    let base_query = registry_value(view_name, "base_query");
+    let end_query = registry_value(view_name, "end_query");
+    let plan =
+        match serde_json::from_str::<AggregationPlan>(&registry_value(view_name, "aggregations")) {
+            Ok(plan) if !base_query.is_empty() => plan,
+            _ => return TruncateRebuild::Unreadable,
+        };
     let mut stmts: Vec<String> = Vec::new();
     full_refresh_stmts(
         view_name,
         &base_query,
         &end_query,
-        &intermediate_tbl,
+        &intermediate_table_name(view_name),
         &plan,
         &mut stmts,
     );
+    TruncateRebuild::Stmts(stmts)
+}
 
-    // Update last_update_date (lazy: skip if updated within the last second)
-    stmts.push(format!(
-        "UPDATE public.__reflex_ivm_reference SET last_update_date = NOW() \
-         WHERE name = '{}' AND (last_update_date IS NULL OR last_update_date < NOW() - INTERVAL '1 second')",
-        view_name.replace("'", "''")
-    ));
-
-    stmts.join("\n--<<REFLEX_SEP>>--\n")
+/// Marks `view_name` stale when a source TRUNCATE cannot rebuild it; never clears it.
+pub(crate) fn mark_stale_after_truncate_sql(view_name: &str) -> String {
+    warning!(
+        "pg_reflex: cannot rebuild '{}' after a source TRUNCATE — registry row unreadable \
+         or observes no source; marking it stale instead of clearing it",
+        view_name
+    );
+    let escaped_name = view_name.replace('\'', "''");
+    format!(
+        "UPDATE public.__reflex_ivm_reference SET known_stale = TRUE, \
+         stale_since = COALESCE(stale_since, now()), \
+         stale_reason = 'source truncated and the IMV could not be rebuilt; \
+         run reflex_reconcile(''{escaped_name}'')' \
+         WHERE name = '{escaped_name}'"
+    )
 }
 
 /// Theme 5.3: execute a `\n--<<REFLEX_SEP>>--\n`-separated SQL string, running
