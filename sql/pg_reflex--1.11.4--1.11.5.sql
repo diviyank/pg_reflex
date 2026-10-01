@@ -130,27 +130,53 @@ $fn$ LANGUAGE plpgsql;
 DO $regen$
 DECLARE
     _fn RECORD;
+    _found INT := 0;
+    _rewritten INT := 0;
+    _current INT := 0;
+    _skipped TEXT[] := ARRAY[]::TEXT[];
 BEGIN
     FOR _fn IN
         SELECT p.oid::regprocedure AS fn,
-               substring(p.prosrc FROM 'DELETE FROM public\.__reflex_deferred_pending WHERE source_table = ''([^'']*)''') AS src
+               substring(p.prosrc FROM 'source_table = ''([^'']*)''') AS src,
+               p.prosrc ~ 'DELETE FROM public\.__reflex_deferred_pending WHERE source_table = ''[^'']*'' AND operation <> ''TRUNCATE'';' AS is_current,
+               p.prosrc ~ 'DELETE FROM public\.__reflex_deferred_pending WHERE source_table = ''[^'']*'';' AS is_rewritable
         FROM pg_proc p
         JOIN pg_namespace n ON n.oid = p.pronamespace
         WHERE n.nspname = 'public'
           AND p.prorettype = 'trigger'::regtype
-          AND p.prosrc ~ 'DELETE FROM public\.__reflex_deferred_pending WHERE source_table = ''[^'']*'';'
+          AND p.proname LIKE '\_\_reflex\_trunc\_trigger\_on\_%'
+          AND strpos(p.prosrc, '__reflex_deferred_pending') > 0
         ORDER BY p.proname
     LOOP
+        _found := _found + 1;
+        IF _fn.is_current THEN
+            _current := _current + 1;
+            CONTINUE;
+        END IF;
+        IF NOT _fn.is_rewritable THEN
+            _skipped := _skipped || format('%s (source %s): unrecognised body', _fn.fn, COALESCE(_fn.src, '?'));
+            CONTINUE;
+        END IF;
         BEGIN
             EXECUTE regexp_replace(
                 pg_get_functiondef(_fn.fn),
                 '(DELETE FROM public\.__reflex_deferred_pending WHERE source_table = ''[^'']*'');',
                 '\1 AND operation <> ''TRUNCATE'';');
+            _rewritten := _rewritten + 1;
         EXCEPTION WHEN OTHERS THEN
-            RAISE WARNING '%', format('pg_reflex 1.11.5: could not update %s: %s — run SELECT reflex_rebuild_triggers(%L) after the upgrade',
-                _fn.fn, SQLERRM, _fn.src);
+            _skipped := _skipped || format('%s (source %s): %s', _fn.fn, COALESCE(_fn.src, '?'), SQLERRM);
         END;
     END LOOP;
+    -- INFO, not NOTICE: an extension script runs with client_min_messages raised to WARNING.
+    RAISE INFO 'pg_reflex 1.11.5: rewrote % of % deferred TRUNCATE trigger bodies found (% already current, % skipped)',
+        _rewritten, _found, _current, COALESCE(array_length(_skipped, 1), 0);
+    IF COALESCE(array_length(_skipped, 1), 0) > 0 THEN
+        RAISE WARNING '%', format('pg_reflex 1.11.5: %s deferred TRUNCATE trigger bodies were NOT rewritten: %s. '
+            'Until repaired, a TRUNCATE of such a source can mark its DEFERRED IMVs stale needlessly (reflex_reconcile clears it). '
+            'Remedy, after the upgrade: create, then drop, a throwaway DEFERRED IMV over each source listed, spelled as listed '
+            '(create_reflex_ivm re-renders the source''s trigger bodies; reflex_rebuild_triggers does not reach the live triggers of a bare-named source).',
+            array_length(_skipped, 1), array_to_string(_skipped, '; '));
+    END IF;
 END
 $regen$;
 
