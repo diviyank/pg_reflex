@@ -1521,6 +1521,59 @@ pub(crate) fn reconcile_generated_child_for_cross_source_guard(child: &str) -> &
     result
 }
 
+/// The rebuild the DEFERRED cross-source guard asks for: a generated sub-IMV
+/// through [`reconcile_generated_child_for_cross_source_guard`], any other IMV
+/// through [`reflex_reconcile`].
+pub(crate) fn reconcile_for_cross_source_guard(view_name: &str) -> &'static str {
+    let is_generated = Spi::get_one_with_args::<bool>(
+        "SELECT COALESCE(is_generated_sub_imv, FALSE) \
+         FROM public.__reflex_ivm_reference WHERE name = $1",
+        &[unsafe {
+            DatumWithOid::new(view_name.to_string(), PgBuiltInOids::TEXTOID.oid().value())
+        }],
+    )
+    .unwrap_or(None)
+    .unwrap_or(false);
+    if is_generated {
+        reconcile_generated_child_for_cross_source_guard(view_name)
+    } else {
+        reflex_reconcile(view_name)
+    }
+}
+
+/// [`reconcile_for_cross_source_guard`] in its own subtransaction: a PostgreSQL
+/// error raised inside rolls back only this rebuild and comes back as an
+/// `ERROR:` string, so the COMMIT-time caller can mark the IMV stale instead of
+/// aborting the COMMIT. Query cancel / shutdown are re-raised.
+pub(crate) fn reconcile_isolated(view_name: &str) -> String {
+    pgrx::PgTryBuilder::new(|| {
+        let subxact = crate::partition::SubTransaction::begin();
+        let result = reconcile_for_cross_source_guard(view_name).to_string();
+        subxact.release();
+        result
+    })
+    .catch_others(|error| {
+        use pgrx::pg_sys::panic::CaughtError;
+        let (code, message) = match &error {
+            CaughtError::PostgresError(report)
+            | CaughtError::ErrorReport(report)
+            | CaughtError::RustPanic {
+                ereport: report, ..
+            } => (report.sql_error_code(), report.message().to_string()),
+        };
+        if matches!(
+            code,
+            PgSqlErrorCode::ERRCODE_QUERY_CANCELED
+                | PgSqlErrorCode::ERRCODE_ADMIN_SHUTDOWN
+                | PgSqlErrorCode::ERRCODE_CRASH_SHUTDOWN
+        ) {
+            error.rethrow();
+        }
+        format!("ERROR: {message}")
+    })
+    .execute()
+}
+
 /// `child`'s materialised UNION-ALL wrapper and its `__reflex_src_idx` tag, if
 /// any. `child` is an operand exactly when some decomposed row's
 /// `depends_on_imv` names it — `install_union_all_intermediate_wrapper` writes
