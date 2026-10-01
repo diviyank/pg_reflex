@@ -507,21 +507,26 @@ pub(crate) const DEFERRED_REBUILD_TABLE_DDL: &str =
     "CREATE TEMP TABLE IF NOT EXISTS __reflex_deferred_rebuild \
      (name TEXT PRIMARY KEY, attempts INT NOT NULL DEFAULT 0) ON COMMIT DROP";
 
-/// A pending row on the first source `view_name` does not ignore, so a flush that
-/// selects `view_name` runs at COMMIT. `None` when it ignores every source.
-pub(crate) fn enqueue_truncate_flush_sql(view_name: &str) -> Option<String> {
-    let observed_source = registry_value(
+/// The first source `view_name` does not ignore: a pending row on it makes a flush
+/// that selects `view_name` run at COMMIT. `None` when it ignores every source.
+pub(crate) fn observed_source(view_name: &str) -> Option<String> {
+    let source = registry_value(
         view_name,
         "(SELECT d FROM unnest(depends_on) WITH ORDINALITY AS u(d, i) \
           WHERE NOT (COALESCE(ignored_sources, ARRAY[]::TEXT[]) \
                      && ARRAY[d, regexp_replace(d, '^.*\\.', '')]) \
           ORDER BY i LIMIT 1)",
     );
-    (!observed_source.is_empty()).then(|| {
+    (!source.is_empty()).then_some(source)
+}
+
+/// Requests a COMMIT-time flush that selects `view_name` (see [`observed_source`]).
+pub(crate) fn enqueue_truncate_flush_sql(view_name: &str) -> Option<String> {
+    observed_source(view_name).map(|source| {
         format!(
             "INSERT INTO public.__reflex_deferred_pending (source_table, operation) \
              VALUES ('{}', 'TRUNCATE')",
-            observed_source.replace('\'', "''")
+            source.replace('\'', "''")
         )
     })
 }

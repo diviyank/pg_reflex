@@ -719,6 +719,73 @@ fn pg_toj_pg_fires_deferred_events_queued_during_set_constraints() {
     assert_eq!(fired, "1,2,3,10");
 }
 
+/// Builds `<prefix>_anchor`, `_act`, `_rel` and the DEFERRED IMV `<prefix>_d`
+/// (`d_sql`) on the worker, committed.
+fn worker_upstream_tables(prefix: &str, d_sql: &str, d_unique: Option<&str>) {
+    worker_exec(&format!(
+        "CREATE TABLE {prefix}_anchor (id INT PRIMARY KEY, product_id INT NOT NULL, \
+           location_id INT NOT NULL, qty INT); \
+         CREATE TABLE {prefix}_act (product_id INT NOT NULL, location_id INT NOT NULL, \
+           is_active BOOL, PRIMARY KEY (product_id, location_id)); \
+         CREATE TABLE {prefix}_rel (product_id INT NOT NULL, location_id INT NOT NULL, \
+           is_active BOOL, PRIMARY KEY (product_id, location_id)); \
+         INSERT INTO {prefix}_anchor SELECT g, g % 7, g % 5, g FROM generate_series(1, 200) g; \
+         INSERT INTO {prefix}_act SELECT p, l, (p + l) % 2 = 0 \
+           FROM generate_series(0, 3) p CROSS JOIN generate_series(0, 4) l; \
+         INSERT INTO {prefix}_rel SELECT p, l, (p + l) % 3 = 0 \
+           FROM generate_series(0, 3) p CROSS JOIN generate_series(0, 4) l"
+    ));
+    worker_create_deferred(&format!("{prefix}_d"), d_sql, d_unique);
+}
+
+fn worker_create_deferred(name: &str, sql: &str, unique: Option<&str>) {
+    worker_exec(&format!(
+        "DO $mk$ BEGIN PERFORM create_reflex_ivm({}, {}, {}, 'UNLOGGED', 'DEFERRED'); END $mk$",
+        sql_lit(name),
+        sql_lit(sql),
+        unique.map(sql_lit).unwrap_or_else(|| "NULL".to_string())
+    ));
+}
+
+/// The rvw fixture on the worker: X = `<prefix>_p` LEFT JOINs the DEFERRED
+/// passthrough `<prefix>_d` over `<prefix>_rel`. Returns X's oracle query.
+fn worker_rvw_fixture(prefix: &str) -> String {
+    worker_upstream_tables(
+        prefix,
+        &format!("SELECT product_id, location_id, is_active FROM {prefix}_rel"),
+        Some("product_id, location_id"),
+    );
+    let (sql, fresh) = upstream_join_sql(prefix, &format!("{prefix}_d"));
+    worker_create_deferred(&format!("{prefix}_p"), &sql, Some("id"));
+    fresh
+}
+
+fn worker_mismatches(imv: &str, fresh: &str) -> i64 {
+    worker_scalar_i64(&format!(
+        "SELECT count(*)::int8 FROM ((SELECT * FROM {imv} EXCEPT ALL SELECT * FROM ({fresh}) f1) \
+         UNION ALL (SELECT * FROM ({fresh}) f2 EXCEPT ALL SELECT * FROM {imv})) o"
+    ))
+}
+
+fn worker_stale(imv: &str) -> bool {
+    worker_scalar_i64(&format!(
+        "SELECT known_stale::int::int8 FROM public.__reflex_ivm_reference WHERE name = '{imv}'"
+    )) == 1
+}
+
+/// Commits, with triggers disabled (no deferred event queued), a pending row
+/// and a staged delta row on `<prefix>_rel` that no flush of the next
+/// transaction will consume: left behind by some other session.
+fn worker_orphan_rows(prefix: &str) {
+    worker_exec(&format!(
+        "BEGIN; SET LOCAL session_replication_role = replica; \
+         INSERT INTO public.__reflex_deferred_pending (source_table, operation) \
+           VALUES ('{prefix}_rel', 'UPDATE'); \
+         INSERT INTO __reflex_delta_{prefix}_rel (product_id, location_id, is_active, __reflex_op) \
+           VALUES (0, 0, TRUE, 'U_NEW'); COMMIT"
+    ));
+}
+
 /// Same at a real COMMIT, and the DEFERRED truncate + upstream change scenario
 /// committed for real (a remote session: a pg_test body never commits).
 #[pg_test]
@@ -732,35 +799,9 @@ fn pg_toj_pg_fires_deferred_events_queued_during_commit() {
     let fired = worker_scalar_i64(
         "SELECT (string_agg(i::text, ',' ORDER BY i) = '1,2,3,10')::int::int8 FROM tje_log",
     );
-
-    let (sql, fresh) = upstream_join_sql("rvm", "rvm_d");
-    worker_exec(
-        "CREATE TABLE rvm_anchor (id INT PRIMARY KEY, product_id INT NOT NULL, \
-           location_id INT NOT NULL, qty INT); \
-         CREATE TABLE rvm_act (product_id INT NOT NULL, location_id INT NOT NULL, \
-           is_active BOOL, PRIMARY KEY (product_id, location_id)); \
-         CREATE TABLE rvm_rel (product_id INT NOT NULL, location_id INT NOT NULL, \
-           is_active BOOL, PRIMARY KEY (product_id, location_id)); \
-         INSERT INTO rvm_anchor SELECT g, g % 7, g % 5, g FROM generate_series(1, 200) g; \
-         INSERT INTO rvm_act SELECT p, l, (p + l) % 2 = 0 \
-           FROM generate_series(0, 3) p CROSS JOIN generate_series(0, 4) l; \
-         INSERT INTO rvm_rel SELECT p, l, (p + l) % 3 = 0 \
-           FROM generate_series(0, 3) p CROSS JOIN generate_series(0, 4) l",
-    );
-    worker_exec(
-        "DO $mk$ BEGIN PERFORM create_reflex_ivm('rvm_d', \
-           'SELECT product_id, location_id, is_active FROM rvm_rel', \
-           'product_id, location_id', 'UNLOGGED', 'DEFERRED'); END $mk$",
-    );
-    worker_exec(&format!(
-        "DO $mk$ BEGIN PERFORM create_reflex_ivm('rvm_p', {}, 'id', 'UNLOGGED', 'DEFERRED'); END $mk$",
-        sql_lit(&sql)
-    ));
+    let fresh = worker_rvw_fixture("rvm");
     worker_exec("BEGIN; TRUNCATE rvm_act; UPDATE rvm_rel SET is_active = NOT is_active; COMMIT");
-    let mismatches = worker_scalar_i64(&format!(
-        "SELECT count(*)::int8 FROM ((SELECT * FROM rvm_p EXCEPT ALL SELECT * FROM ({fresh}) f1) \
-         UNION ALL (SELECT * FROM ({fresh}) f2 EXCEPT ALL SELECT * FROM rvm_p)) o"
-    ));
+    let mismatches = worker_mismatches("rvm_p", &fresh);
     probe_db_close(DBNAME);
 
     assert_eq!(
@@ -773,54 +814,119 @@ fn pg_toj_pg_fires_deferred_events_queued_during_commit() {
     );
 }
 
-/// A committed pending row nobody will flush (no queued event: inserted with
-/// triggers disabled) keeps the upstream looking busy: the re-enqueued flushes
-/// run out of deferrals and the IMV is rebuilt and flagged, not left wrong.
+/// Orphans (a committed pending row and a committed staged row on the upstream's
+/// source, with no queued event) must not hold the rebuild back: at a real COMMIT
+/// and under SET CONSTRAINTS ALL IMMEDIATE, X ends correct and unflagged.
 #[pg_test]
-fn pg_toj_deferred_truncate_orphan_pending_row_rebuilds_and_flags() {
+fn pg_toj_deferred_truncate_orphan_rows_do_not_hold_back_rebuild() {
     const DBNAME: &str = "reflex_toj_orphan_probe";
     probe_db_open(DBNAME);
-    let (sql, fresh) = upstream_join_sql("rvo", "rvo_d");
-    worker_exec(
-        "CREATE TABLE rvo_anchor (id INT PRIMARY KEY, product_id INT NOT NULL, \
-           location_id INT NOT NULL, qty INT); \
-         CREATE TABLE rvo_act (product_id INT NOT NULL, location_id INT NOT NULL, \
-           is_active BOOL, PRIMARY KEY (product_id, location_id)); \
-         CREATE TABLE rvo_rel (product_id INT NOT NULL, location_id INT NOT NULL, \
-           is_active BOOL, PRIMARY KEY (product_id, location_id)); \
-         INSERT INTO rvo_anchor SELECT g, g % 7, g % 5, g FROM generate_series(1, 200) g; \
-         INSERT INTO rvo_act SELECT p, l, (p + l) % 2 = 0 \
-           FROM generate_series(0, 3) p CROSS JOIN generate_series(0, 4) l; \
-         INSERT INTO rvo_rel SELECT p, l, (p + l) % 3 = 0 \
-           FROM generate_series(0, 3) p CROSS JOIN generate_series(0, 4) l",
-    );
-    worker_exec(
-        "DO $mk$ BEGIN PERFORM create_reflex_ivm('rvo_d', \
-           'SELECT product_id, location_id, is_active FROM rvo_rel', \
-           'product_id, location_id', 'UNLOGGED', 'DEFERRED'); END $mk$",
-    );
-    worker_exec(&format!(
-        "DO $mk$ BEGIN PERFORM create_reflex_ivm('rvo_p', {}, 'id', 'UNLOGGED', 'DEFERRED'); END $mk$",
-        sql_lit(&sql)
-    ));
-    worker_exec(
-        "BEGIN; SET LOCAL session_replication_role = replica; \
-         INSERT INTO public.__reflex_deferred_pending (source_table, operation) \
-           VALUES ('rvo_rel', 'UPDATE'); COMMIT",
-    );
+    let fresh_c = worker_rvw_fixture("rvo");
+    worker_orphan_rows("rvo");
     worker_exec("BEGIN; TRUNCATE rvo_act; COMMIT");
-    let mismatches = worker_scalar_i64(&format!(
-        "SELECT count(*)::int8 FROM ((SELECT * FROM rvo_p EXCEPT ALL SELECT * FROM ({fresh}) f1) \
-         UNION ALL (SELECT * FROM ({fresh}) f2 EXCEPT ALL SELECT * FROM rvo_p)) o"
-    ));
-    let flagged = worker_scalar_i64(
-        "SELECT (known_stale AND stale_reason LIKE '%upstream%')::int::int8 \
-         FROM public.__reflex_ivm_reference WHERE name = 'rvo_p'",
-    );
+    let commit_mismatches = worker_mismatches("rvo_p", &fresh_c);
+    let commit_stale = worker_stale("rvo_p");
+
+    let fresh_s = worker_rvw_fixture("rvs");
+    worker_orphan_rows("rvs");
+    worker_exec("BEGIN; TRUNCATE rvs_act; SET CONSTRAINTS ALL IMMEDIATE; COMMIT");
+    let sc_mismatches = worker_mismatches("rvs_p", &fresh_s);
+    let sc_stale = worker_stale("rvs_p");
     probe_db_close(DBNAME);
 
-    assert_eq!(mismatches, 0, "exhausted deferrals did not rebuild rvo_p");
-    assert_eq!(flagged, 1, "exhausted deferrals left rvo_p unflagged");
+    assert_eq!(commit_mismatches, 0, "real COMMIT: rvo_p not rebuilt");
+    assert!(!commit_stale, "real COMMIT: orphan rows flagged rvo_p");
+    assert_eq!(sc_mismatches, 0, "SET CONSTRAINTS: rvs_p not rebuilt");
+    assert!(!sc_stale, "SET CONSTRAINTS: orphan rows flagged rvs_p");
+}
+
+/// Many staging statements queued before the upstream-settling event must not
+/// exhaust the deferrals: a postpone is free.
+#[pg_test]
+fn pg_toj_deferred_truncate_many_statements_before_upstream_commit() {
+    const DBNAME: &str = "reflex_toj_many_probe";
+    probe_db_open(DBNAME);
+    let fresh = worker_rvw_fixture("rvn");
+    let inserts: String = (0..40)
+        .map(|i| {
+            format!(
+                "INSERT INTO rvn_anchor VALUES ({}, {}, {}, 1); ",
+                1000 + i,
+                i % 7,
+                i % 5
+            )
+        })
+        .collect();
+    worker_exec(&format!(
+        "BEGIN; TRUNCATE rvn_act; {inserts}UPDATE rvn_rel SET is_active = NOT is_active; COMMIT"
+    ));
+    let mismatches = worker_mismatches("rvn_p", &fresh);
+    let stale = worker_stale("rvn_p");
+    probe_db_close(DBNAME);
+
+    assert_eq!(mismatches, 0, "rvn_p wrong after commit");
+    assert!(
+        !stale,
+        "rvn_p spuriously flagged: deferrals charged for free postpones"
+    );
+}
+
+const DIAMOND_D_SQL: &str = "SELECT product_id, COUNT(*) AS n, \
+     SUM(CASE WHEN is_active THEN 1 ELSE 0 END) AS a FROM {p}_rel GROUP BY product_id";
+const DIAMOND_X_SQL: &str = "SELECT a.id, a.qty, COALESCE(c.is_active, FALSE) AS active, \
+     COALESCE(r.is_active, FALSE) AS r_active, d.n, d.a \
+     FROM {p}_anchor a LEFT JOIN {p}_act c \
+     ON c.product_id = a.product_id AND c.location_id = a.location_id \
+     LEFT JOIN {p}_rel r ON r.product_id = a.product_id AND r.location_id = a.location_id \
+     LEFT JOIN {p}_d d ON d.product_id = a.product_id";
+
+fn diamond_sql(prefix: &str) -> (String, String, String) {
+    let d = DIAMOND_D_SQL.replace("{p}", prefix);
+    let x = DIAMOND_X_SQL.replace("{p}", prefix);
+    let fresh = x.replace(&format!("{prefix}_d d"), &format!("({d}) d"));
+    (d, x, fresh)
+}
+
+/// Diamond: X reads `rel` directly and through the aggregate DEFERRED IMV D.
+#[pg_test]
+fn pg_toj_deferred_truncate_diamond_set_constraints() {
+    build_toj_tables("rdm_anchor", "rdm_act");
+    build_upstream_rel("rdm_rel");
+    let (d, x, fresh) = diamond_sql("rdm");
+    assert_eq!(
+        crate::create_reflex_ivm("rdm_d", &d, None, None, Some("DEFERRED"), None),
+        "CREATE REFLEX INCREMENTAL VIEW"
+    );
+    assert_eq!(
+        crate::create_reflex_ivm("rdm_p", &x, Some("id"), None, Some("DEFERRED"), None),
+        "CREATE REFLEX INCREMENTAL VIEW"
+    );
+    assert_imv_correct("rdm_p", &fresh);
+    Spi::run("TRUNCATE rdm_act").expect("truncate");
+    Spi::run("UPDATE rdm_rel SET is_active = NOT is_active").expect("upstream change");
+    Spi::run("SET CONSTRAINTS ALL IMMEDIATE").expect("commit-time flush");
+    assert_imv_correct("rdm_d", &d);
+    assert_imv_correct("rdm_p", &fresh);
+    assert_truncate_rebuilt("rdm_p");
+}
+
+/// Same diamond at a real COMMIT.
+#[pg_test]
+fn pg_toj_deferred_truncate_diamond_commit() {
+    const DBNAME: &str = "reflex_toj_diamond_probe";
+    probe_db_open(DBNAME);
+    let (d, x, fresh) = diamond_sql("rdc");
+    worker_upstream_tables("rdc", &d, None);
+    worker_create_deferred("rdc_p", &x, Some("id"));
+    worker_exec("BEGIN; TRUNCATE rdc_act; UPDATE rdc_rel SET is_active = NOT is_active; COMMIT");
+    let d_mismatches = worker_mismatches("rdc_d", &d);
+    let x_mismatches = worker_mismatches("rdc_p", &fresh);
+    let stale = worker_stale("rdc_p");
+    probe_db_close(DBNAME);
+
+    assert_eq!(d_mismatches, 0, "rdc_d wrong after commit");
+    assert_eq!(x_mismatches, 0, "rdc_p wrong after commit");
+    assert!(!stale, "rdc_p flagged stale");
 }
 
 /// A decomposed wrapper is refused like `reconcile_one` refuses it: nothing to
@@ -863,4 +969,33 @@ fn pg_toj_truncate_skips_decomposed_wrapper() {
         "SELECT product_id, location_id FROM tjw_anchor \
          UNION ALL SELECT product_id, location_id FROM tjw_act",
     );
+}
+
+/// While its rebuild is postponed the IMV is flagged, so no path can end the
+/// transaction with it unrebuilt and unflagged; the rebuild clears that flag.
+#[pg_test]
+fn pg_toj_deferred_truncate_postponed_rebuild_is_flagged_until_done() {
+    build_toj_tables("rvf_anchor", "rvf_act");
+    build_upstream_rel("rvf_rel");
+    create_deferred_passthrough("rvf_d", "rvf_rel");
+    let (sql, fresh) = upstream_join_sql("rvf", "rvf_d");
+    assert_eq!(
+        crate::create_reflex_ivm("rvf_p", &sql, Some("id"), None, Some("DEFERRED"), None),
+        "CREATE REFLEX INCREMENTAL VIEW"
+    );
+    Spi::run("TRUNCATE rvf_act").expect("truncate");
+    Spi::run("UPDATE rvf_rel SET is_active = NOT is_active").expect("upstream change");
+    Spi::run("SELECT reflex_flush_deferred('rvf_anchor')").expect("flush while upstream pending");
+    let (stale, reason) = Spi::get_two::<bool, String>(
+        "SELECT known_stale, stale_reason FROM public.__reflex_ivm_reference WHERE name = 'rvf_p'",
+    )
+    .expect("registry");
+    assert_eq!(stale, Some(true), "postponed rebuild left rvf_p unflagged");
+    assert!(
+        reason.unwrap_or_default().contains("postponed"),
+        "stale_reason must name the cause"
+    );
+    Spi::run("SELECT reflex_flush_deferred('rvf_rel')").expect("upstream settles");
+    assert_imv_correct("rvf_p", &fresh);
+    assert_truncate_rebuilt("rvf_p");
 }
