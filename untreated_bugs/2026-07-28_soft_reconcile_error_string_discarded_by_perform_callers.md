@@ -35,9 +35,27 @@ So the contract is "the caller must read the returned string". Consumers split c
 
 **Discard it (`PERFORM`):**
 
-* `src/trigger/dispatch.rs:146`, `:340`, `:568`
-* `src/lib.rs:1322`, `:1333`, `:1371`, `:1381`, `:1393`
-* `src/partition.rs:2331`, `:3523`
+* `sql/trigger_body.plpgsql.in:27` — the IMMEDIATE trigger body's Path B pre-scratch
+  dispatch (`|transition| / reltuples(source) >= wipe_threshold`) runs
+  `PERFORM public.reflex_reconcile(_rec.name); CONTINUE;`. On an `ERROR:` string the
+  `CONTINUE` skips the statement's delta, so the source change commits and the IMV stays
+  behind it with `known_stale = FALSE`. Reproduced on pg17 (1.11.5 + the dispatch fix below):
+  a partitioned `SELECT region, COUNT(DISTINCT cust) … GROUP BY region` IMV over a 2-leaf
+  source, an unrelated table holding the name of the mirror child of a new source partition
+  `0` (`CREATE TABLE <v>_<src>_0 (x INT)` before `CREATE TABLE <src>_0 PARTITION OF …`), then
+  `UPDATE <src> SET cust = 7 WHERE region = 'B'` (half the source): the reconcile WARNs
+  `missing target bound for child '<v>_<src>_0'` and returns the string, the UPDATE succeeds,
+  and the IMV keeps B's old count (25 instead of 1). Fixing it changes the installed per-source
+  body, so it needs a body regeneration in the migration
+  (see `2026-10-01_migration_trigger_regeneration_silently_noop.md`).
+* `src/lib.rs:1532`, `:1543`, `:1581`, `:1591`, `:1603`
+* `src/partition.rs:2406`, `:3993` (and `:3883`, `reflex_reconcile_partition`)
+
+The volume dispatch builders in `src/trigger/dispatch.rs` no longer discard it: the partition
+builders' hot / trip-cap calls raise since 1.11.5, and the unpartitioned high-selectivity
+dispatch raises since the 1.11.5 final review (`pg_rco_high_selectivity_reconcile_error_*` in
+`src/tests/pg_test_rebuild_cost.rs`), so the statement fails (IMMEDIATE) or the IMV is marked
+stale by the flush's per-IMV savepoint (DEFERRED).
 
 On any of those paths a failed reconcile leaves the transaction to **commit** with the IMV
 partially swapped and `known_stale`, `stale_reason`, `stale_since` all untouched. Nothing in the

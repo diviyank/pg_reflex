@@ -19,6 +19,7 @@ _imm NUMERIC;
 _thr NUMERIC;
 _per_imv NUMERIC;
 _ratio NUMERIC;
+_r TEXT;
 BEGIN
 SELECT count(*) INTO _aff FROM "__reflex_affected_v";
 SELECT GREATEST(reltuples::NUMERIC, 1.0) INTO _imm
@@ -38,7 +39,8 @@ IF _ratio >= _thr THEN
 -- the standard MERGE + target double-rewrite exceeds the
 -- cost of a full IMV rebuild.
 RAISE DEBUG 'pg_reflex wipe: ratio=% thr=% — reconcile', _ratio, _thr;
-PERFORM public.reflex_reconcile('v');
+_r := public.reflex_reconcile('v');
+IF _r LIKE 'ERROR%' THEN RAISE EXCEPTION 'pg_reflex: high-selectivity rebuild of % failed: %', 'v', _r; END IF;
 ELSE
 RAISE DEBUG 'pg_reflex wipe: ratio=% thr=% — incremental', _ratio, _thr;
 EXECUTE $reflex_inner$MERGE INTO "__reflex_intermediate_v" AS t USING "__reflex_scratch_v" AS d ON t."region" = d."region" WHEN MATCHED THEN UPDATE SET "__sum_qty" = COALESCE(t."__sum_qty", 0) + COALESCE(d."__sum_qty", 0), __ivm_count = COALESCE(t.__ivm_count, 0) + COALESCE(d.__ivm_count, 0) WHEN NOT MATCHED THEN INSERT ("region", "__sum_qty", __ivm_count) VALUES (d."region", COALESCE(d."__sum_qty", 0), COALESCE(d.__ivm_count, 0))$reflex_inner$;

@@ -128,6 +128,7 @@ pub(crate) fn build_high_selectivity_dispatch_sql(
              _thr NUMERIC;\n\
              _per_imv NUMERIC;\n\
              _ratio NUMERIC;\n\
+             _r TEXT;\n\
          BEGIN\n\
              SELECT count(*) INTO _aff FROM {affected};\n\
              SELECT GREATEST(reltuples::NUMERIC, 1.0) INTO _imm\n\
@@ -147,7 +148,8 @@ pub(crate) fn build_high_selectivity_dispatch_sql(
                  -- the standard MERGE + target double-rewrite exceeds the\n\
                  -- cost of a full IMV rebuild.\n\
                  RAISE DEBUG 'pg_reflex wipe: ratio=% thr=% — reconcile', _ratio, _thr;\n\
-                 PERFORM public.reflex_reconcile('{view}');\n\
+                 _r := public.reflex_reconcile('{view}');\n\
+                 IF _r LIKE 'ERROR%' THEN RAISE EXCEPTION 'pg_reflex: high-selectivity rebuild of % failed: %', '{view}', _r; END IF;\n\
              ELSE\n\
                  RAISE DEBUG 'pg_reflex wipe: ratio=% thr=% — incremental', _ratio, _thr;\n\
 {merge_execs}\
