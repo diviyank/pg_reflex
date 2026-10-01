@@ -336,3 +336,120 @@ fn reflex_rebuild_target_rows(view_name: &str, rebuild_sql: &str) -> String {
         }
     })
 }
+
+const LEAF_ROWS_SQL: &str = "\
+    SELECT COALESCE(sum(CASE WHEN c.reltuples >= 0 THEN c.reltuples \
+                             ELSE pg_relation_size(c.oid)::float8 \
+                                  / GREATEST(COALESCE((SELECT sum(s.avg_width) FROM pg_stats s \
+                                       WHERE s.schemaname = n.nspname AND s.tablename = c.relname), 0) + 24, 32) \
+                        END), 0)::float8 \
+    FROM pg_partition_tree($1::oid::regclass) t JOIN pg_class c ON c.oid = t.relid \
+    JOIN pg_namespace n ON n.oid = c.relnamespace WHERE t.isleaf";
+
+/// For an aggregate IMV the rebuild reads the anchor SOURCE, not the (much
+/// smaller) target: map the target or intermediate child to the source child
+/// of the same name (`<view>_<src child>` / `__reflex_intermediate_<view>_<src child>`).
+fn anchor_source_child_oid(
+    client: &pgrx::spi::SpiClient<'_>,
+    view_name: &str,
+    child: pg_sys::Oid,
+) -> Option<pg_sys::Oid> {
+    lookup_anchor_source_child(client, view_name, child).unwrap_or_else(|error| {
+        debug1!(
+            "pg_reflex: sizing {view_name} child by itself, anchor-source lookup failed: {error}"
+        );
+        None
+    })
+}
+
+/// `Ok(None)` is the legitimate "size the child itself" (not an aggregate, or
+/// no matching source child); `Err` is a failed lookup.
+fn lookup_anchor_source_child(
+    client: &pgrx::spi::SpiClient<'_>,
+    view_name: &str,
+    child: pg_sys::Oid,
+) -> Result<Option<pg_sys::Oid>, String> {
+    use crate::partition::{list_partition_tree, resolve_anchor_source};
+    use crate::query_decomposer::split_qualified_name;
+
+    let registry = client
+        .select(
+            "SELECT depends_on, partition_columns[1] AS part_col, COALESCE(end_query, '') <> '' AS is_aggregate \
+             FROM public.__reflex_ivm_reference WHERE name = $1",
+            Some(1),
+            &[text_arg(view_name)],
+        )
+        .map_err(|e| e.to_string())?
+        .next();
+    let Some(registry) = registry else {
+        return Ok(None);
+    };
+    let is_aggregate = registry
+        .get_by_name::<bool, _>("is_aggregate")
+        .map_err(|e| e.to_string())?
+        .unwrap_or(false);
+    if !is_aggregate {
+        return Ok(None);
+    }
+    let part_col = registry
+        .get_by_name::<String, _>("part_col")
+        .map_err(|e| e.to_string())?;
+    let depends_on = registry
+        .get_by_name::<Vec<String>, _>("depends_on")
+        .map_err(|e| e.to_string())?;
+    let (Some(part_col), Some(depends_on)) = (part_col, depends_on) else {
+        return Ok(None);
+    };
+    let anchor = resolve_anchor_source(client, &part_col, &depends_on)?;
+    let child_name = client
+        .select(
+            "SELECT relname::text FROM pg_class WHERE oid = $1",
+            Some(1),
+            &[unsafe { DatumWithOid::new(child, PgBuiltInOids::OIDOID.oid().value()) }],
+        )
+        .map_err(|e| e.to_string())?
+        .next()
+        .and_then(|row| row.get::<String>(1).ok().flatten());
+    let Some(child_name) = child_name else {
+        return Ok(None);
+    };
+    let (_, view_bare) = split_qualified_name(view_name);
+    let Some(source_child) = child_name
+        .strip_prefix(&format!("__reflex_intermediate_{view_bare}_"))
+        .or_else(|| child_name.strip_prefix(&format!("{view_bare}_")))
+    else {
+        return Ok(None);
+    };
+    Ok(list_partition_tree(client, &anchor)
+        .into_iter()
+        .find(|node| node.bare_name == source_child)
+        .map(|node| pg_sys::Oid::from(node.oid)))
+}
+
+/// Estimated rows a rebuild of `child` (a target or intermediate partition
+/// subtree) reads: summed over its leaves, `reltuples` when analyzed, else
+/// file size / row width. Aggregate IMVs are sized by the matching anchor
+/// source child.
+#[pg_extern]
+fn __reflex_rebuild_cost_rows(view_name: &str, child: pg_sys::Oid) -> f64 {
+    Spi::connect(|client| {
+        let sized = anchor_source_child_oid(client, view_name, child).unwrap_or(child);
+        client
+            .select(
+                LEAF_ROWS_SQL,
+                Some(1),
+                &[unsafe { DatumWithOid::new(sized, PgBuiltInOids::OIDOID.oid().value()) }],
+            )
+            .unwrap_or_report()
+            .first()
+            .get_one::<f64>()
+            .unwrap_or(None)
+            .unwrap_or(0.0)
+    })
+}
+
+/// SQL face of `target_propagates`, read by the volume-triggered dispatch.
+#[pg_extern]
+fn __reflex_target_propagates(view_name: &str) -> bool {
+    Spi::connect(|client| target_propagates(client, view_name))
+}

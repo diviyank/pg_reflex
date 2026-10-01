@@ -29,7 +29,7 @@ FROM pg_class WHERE oid = '"__reflex_intermediate_v"'::regclass;
 -- instance serves IMVs with shape-divergent crossovers.
 SELECT wipe_threshold INTO _per_imv
 FROM public.__reflex_ivm_reference WHERE name = 'v';
-_thr := COALESCE(_per_imv, current_setting('reflex.wipe_threshold', true)::NUMERIC, 0.5);
+_thr := COALESCE(_per_imv, current_setting('reflex.wipe_threshold', true)::NUMERIC, CASE WHEN public.__reflex_target_propagates('v') THEN 0.9 ELSE 0.5 END);
 _ratio := _aff::NUMERIC / _imm;
 IF _ratio >= _thr THEN
 -- High-selectivity path — delegate to reflex_reconcile,
