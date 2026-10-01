@@ -457,3 +457,387 @@ fn pg_drc_guard_rebuild_keeps_orphan_partition() {
     .unwrap_or(false);
     assert!(!stale, "drco_v flagged stale");
 }
+
+/// `{p}_s` partitioned by LIST (plan) in plans 1..3, ids 1..20 each.
+fn drc_build_partitioned_source(p: &str) {
+    Spi::run(&format!(
+        "CREATE TABLE {p}_s (plan INT NOT NULL, id INT NOT NULL, qty INT) PARTITION BY LIST (plan)"
+    ))
+    .expect("s");
+    for plan in [1, 2, 3] {
+        Spi::run(&format!(
+            "CREATE TABLE {p}_s{plan} PARTITION OF {p}_s FOR VALUES IN ({plan})"
+        ))
+        .expect("s partition");
+    }
+    Spi::run(&format!(
+        "INSERT INTO {p}_s SELECT v.plan, g, g FROM generate_series(1, 20) g, \
+         (VALUES (1), (2), (3)) v(plan)"
+    ))
+    .expect("seed s");
+}
+
+fn drc_create_partitioned_deferred(view: &str, sql: &str, key: Option<&str>, ignore: &str) {
+    let key = key.map_or("NULL".to_string(), |k| format!("'{k}'"));
+    let ignore = if ignore.is_empty() {
+        "NULL".to_string()
+    } else {
+        format!("'{ignore}'")
+    };
+    create_imv(
+        view,
+        &format!(
+            "SELECT create_reflex_ivm('{view}', {}, {key}, NULL, 'DEFERRED', {ignore}, \
+             ARRAY['plan'])",
+            sql_lit(sql)
+        ),
+    );
+    dmw_force_incremental(view);
+}
+
+fn drc_reconcile_partition(view: &str, keys: &str) {
+    let res = Spi::get_one::<String>(&format!(
+        "SELECT reflex_reconcile_partition('{view}', '{keys}')"
+    ))
+    .expect("reconcile_partition")
+    .expect("reconcile_partition result");
+    assert!(res.starts_with("RECONCILED"), "reconcile_partition: {res}");
+}
+
+/// Whether `pg_temp.<table>` exists and has a row named `imv`.
+fn drc_temp_lists(table: &str, imv: &str) -> bool {
+    let exists = Spi::get_one::<bool>(&format!(
+        "SELECT to_regclass('pg_temp.{table}') IS NOT NULL"
+    ))
+    .expect("to_regclass")
+    .unwrap_or(false);
+    exists
+        && Spi::get_one::<bool>(&format!(
+            "SELECT EXISTS (SELECT 1 FROM pg_temp.{table} WHERE name = '{imv}')"
+        ))
+        .expect("temp table")
+        .unwrap_or(false)
+}
+
+/// Whether a partition- or key-scoped rebuild of `imv` was recorded with its
+/// watermark (the flush then skips only the rebuilt slice's earlier deltas).
+fn drc_scoped_recorded(imv: &str) -> bool {
+    drc_temp_lists("__reflex_deferred_scoped_rebuilds", imv)
+}
+
+/// Whether `imv` is listed for the COMMIT-time full reconcile.
+fn drc_listed_for_commit(imv: &str) -> bool {
+    drc_temp_lists("__reflex_deferred_rebuild", imv)
+}
+
+/// The filed report's reproduction: a partition-scoped rebuild of a DEFERRED
+/// IMV after a write staged for the rebuilt partition, plus writes staged for
+/// another partition before it and for the rebuilt one after it.
+#[pg_test]
+fn pg_drc_partition_reconcile_of_deferred_imv_with_staged_deltas() {
+    drc_build_partitioned_source("drp1");
+    let sql = "SELECT plan, SUM(qty) AS q, COUNT(*) AS n FROM drp1_s GROUP BY plan";
+    drc_create_partitioned_deferred("drp1_v", sql, None, "");
+
+    Spi::run("INSERT INTO drp1_s VALUES (2, 100, 1000)").expect("staged, rebuilt plan");
+    Spi::run("INSERT INTO drp1_s VALUES (1, 100, 500)").expect("staged, other plan");
+    Spi::run("UPDATE drp1_s SET qty = qty + 1 WHERE plan = 3 AND id <= 3")
+        .expect("staged, other plan");
+    drc_reconcile_partition("drp1_v", "2");
+    assert!(
+        drc_scoped_recorded("drp1_v"),
+        "drp1_v's scoped rebuild not recorded"
+    );
+    assert!(
+        !drc_listed_for_commit("drp1_v"),
+        "drp1_v needlessly listed for a COMMIT-time full rebuild"
+    );
+    Spi::run("INSERT INTO drp1_s VALUES (2, 101, 7)").expect("staged after, rebuilt plan");
+    Spi::run("DELETE FROM drp1_s WHERE plan = 2 AND id = 1").expect("staged after");
+    Spi::run("SET CONSTRAINTS ALL IMMEDIATE").expect("commit-time flush");
+    dmw_assert_fresh("drp1_v", sql);
+}
+
+/// A row moved across partitions before the rebuild of its new partition: its
+/// old image (outside the rebuilt partition) must still be applied, its new
+/// image (inside it) must not. Aggregate and keyed passthrough.
+#[pg_test]
+fn pg_drc_partition_reconcile_after_cross_partition_update() {
+    drc_build_partitioned_source("drp2");
+    let agg = "SELECT plan, SUM(qty) AS q, COUNT(*) AS n FROM drp2_s GROUP BY plan";
+    let pass = "SELECT plan, id, qty FROM drp2_s";
+    drc_create_partitioned_deferred("drp2_a", agg, None, "");
+    drc_create_partitioned_deferred("drp2_p", pass, Some("plan, id"), "");
+
+    Spi::run("UPDATE drp2_s SET plan = 2, id = id + 100 WHERE plan = 1 AND id <= 3")
+        .expect("moved 1 -> 2");
+    Spi::run("UPDATE drp2_s SET plan = 3, id = id + 200 WHERE plan = 2 AND id = 5")
+        .expect("moved 2 -> 3");
+    drc_reconcile_partition("drp2_a", "2");
+    drc_reconcile_partition("drp2_p", "2");
+    Spi::run("UPDATE drp2_s SET plan = 1, id = id - 100 WHERE plan = 2 AND id = 101")
+        .expect("moved back after the rebuild");
+    Spi::run("SET CONSTRAINTS ALL IMMEDIATE").expect("commit-time flush");
+    dmw_assert_fresh("drp2_a", agg);
+    dmw_assert_fresh("drp2_p", pass);
+}
+
+/// The IMV's partition column comes from a joined table, not from the staged
+/// source: a staged row's own `plan` does not say which partition it lands in.
+/// Falls back to a COMMIT-time full rebuild.
+#[pg_test]
+fn pg_drc_partition_reconcile_partition_column_from_joined_table() {
+    drc_build_partitioned_source("drp3");
+    Spi::run("CREATE TABLE drp3_dim (id INT PRIMARY KEY, plan INT NOT NULL)").expect("dim");
+    Spi::run("INSERT INTO drp3_dim SELECT g, 1 + g % 3 FROM generate_series(1, 300) g")
+        .expect("seed dim");
+    let sql = "SELECT d.plan, SUM(s.qty) AS q, COUNT(*) AS n \
+               FROM drp3_s s JOIN drp3_dim d ON d.id = s.id GROUP BY d.plan";
+    drc_create_partitioned_deferred("drp3_v", sql, None, "!drp3_dim");
+
+    // id 1 joins dim plan 2, while the row itself is in source plan 1.
+    Spi::run("INSERT INTO drp3_s VALUES (1, 1, 1000)").expect("staged, lands in plan 2");
+    drc_reconcile_partition("drp3_v", "2");
+    assert!(
+        drc_listed_for_commit("drp3_v"),
+        "drp3_v not listed for the COMMIT-time full rebuild"
+    );
+    Spi::run("INSERT INTO drp3_s VALUES (3, 4, 9)").expect("staged after");
+    Spi::run("SET CONSTRAINTS ALL IMMEDIATE").expect("commit-time flush");
+    dmw_assert_fresh("drp3_v", sql);
+}
+
+/// A partition-scoped rebuild of a DEFERRED IMV reached from a trigger that
+/// fires before the statement's own staging trigger reads a write whose delta
+/// is staged after it.
+#[pg_test]
+fn pg_drc_partition_reconcile_inside_trigger_before_staging() {
+    drc_build_partitioned_source("drp4");
+    let sql = "SELECT plan, SUM(qty) AS q, COUNT(*) AS n FROM drp4_s GROUP BY plan";
+    drc_create_partitioned_deferred("drp4_v", sql, None, "");
+    Spi::run(
+        "CREATE FUNCTION drp4_rec() RETURNS trigger LANGUAGE plpgsql AS $f$ \
+         BEGIN PERFORM reflex_reconcile_partition('drp4_v', '2'); RETURN NULL; END $f$",
+    )
+    .expect("fn");
+    // Named to sort before pg_reflex's `__reflex_*` triggers, so it fires first.
+    Spi::run(
+        "CREATE TRIGGER \"A_drp4_rec\" AFTER INSERT ON drp4_s \
+         FOR EACH STATEMENT EXECUTE FUNCTION drp4_rec()",
+    )
+    .expect("trigger");
+
+    Spi::run("INSERT INTO drp4_s VALUES (2, 100, 1000)").expect("write + in-trigger rebuild");
+    Spi::run("SET CONSTRAINTS ALL IMMEDIATE").expect("commit-time flush");
+    dmw_assert_fresh("drp4_v", sql);
+}
+
+/// A DEFERRED IMV reconciled from inside a trigger: an enabled one is queued for
+/// the COMMIT-time pass (`RECONCILE QUEUED FOR COMMIT`); a disabled one is
+/// refused like everywhere else, and never flagged stale at COMMIT.
+#[pg_test]
+fn pg_drc_in_trigger_reconcile_queues_enabled_and_skips_disabled_imv() {
+    Spi::run("CREATE TABLE drn_s (k INT PRIMARY KEY, g INT, v INT)").expect("s");
+    Spi::run("INSERT INTO drn_s SELECT i, i % 3, i FROM generate_series(1, 30) i").expect("seed");
+    let sql = "SELECT g, COUNT(*) AS n, SUM(v) AS s FROM drn_s GROUP BY g";
+    dmw_create_deferred("drn_on", sql, None);
+    dmw_create_deferred("drn_off", sql, None);
+    Spi::run("UPDATE public.__reflex_ivm_reference SET enabled = FALSE WHERE name = 'drn_off'")
+        .expect("disable");
+    Spi::run("CREATE TABLE drn_log (imv TEXT, result TEXT)").expect("log");
+    Spi::run("CREATE TABLE drn_t (x INT)").expect("t");
+    Spi::run(
+        "CREATE FUNCTION drn_rec() RETURNS trigger LANGUAGE plpgsql AS $f$ BEGIN \
+           INSERT INTO drn_log SELECT i, reflex_reconcile(i) FROM unnest(ARRAY['drn_on', 'drn_off']) i; \
+           RETURN NULL; END $f$",
+    )
+    .expect("fn");
+    Spi::run(
+        "CREATE TRIGGER drn_rec AFTER INSERT ON drn_t FOR EACH STATEMENT EXECUTE FUNCTION drn_rec()",
+    )
+    .expect("trigger");
+
+    Spi::run("INSERT INTO drn_t VALUES (1)").expect("in-trigger reconciles");
+    let result = |imv: &str| {
+        Spi::get_one::<String>(&format!("SELECT result FROM drn_log WHERE imv = '{imv}'"))
+            .expect("log")
+            .unwrap_or_default()
+    };
+    assert_eq!(result("drn_on"), "RECONCILE QUEUED FOR COMMIT");
+    assert!(
+        result("drn_off").starts_with("ERROR"),
+        "disabled IMV: {}",
+        result("drn_off")
+    );
+    Spi::run("SET CONSTRAINTS ALL IMMEDIATE").expect("commit-time flush");
+    dmw_assert_fresh("drn_on", sql);
+    let off_stale = Spi::get_one::<bool>(
+        "SELECT known_stale FROM public.__reflex_ivm_reference WHERE name = 'drn_off'",
+    )
+    .expect("registry")
+    .unwrap_or(false);
+    assert!(
+        !off_stale,
+        "disabled drn_off flagged stale by the COMMIT-time pass"
+    );
+}
+
+/// A DEFERRED IMV queued for the COMMIT-time reconcile and disabled before
+/// COMMIT is skipped by the pass, not flagged stale.
+#[pg_test]
+fn pg_drc_queued_reconcile_of_imv_disabled_before_commit_not_flagged() {
+    Spi::run("CREATE TABLE drn2_s (k INT PRIMARY KEY, g INT, v INT)").expect("s");
+    Spi::run("INSERT INTO drn2_s SELECT i, i % 3, i FROM generate_series(1, 30) i").expect("seed");
+    let sql = "SELECT g, COUNT(*) AS n, SUM(v) AS s FROM drn2_s GROUP BY g";
+    dmw_create_deferred("drn2_v", sql, None);
+    Spi::run("CREATE TABLE drn2_t (x INT)").expect("t");
+    Spi::run(
+        "CREATE FUNCTION drn2_rec() RETURNS trigger LANGUAGE plpgsql AS $f$ BEGIN \
+           PERFORM reflex_reconcile('drn2_v'); RETURN NULL; END $f$",
+    )
+    .expect("fn");
+    Spi::run(
+        "CREATE TRIGGER drn2_rec AFTER INSERT ON drn2_t FOR EACH STATEMENT EXECUTE FUNCTION drn2_rec()",
+    )
+    .expect("trigger");
+
+    Spi::run("INSERT INTO drn2_t VALUES (1)").expect("queued");
+    Spi::run("UPDATE public.__reflex_ivm_reference SET enabled = FALSE WHERE name = 'drn2_v'")
+        .expect("disable");
+    Spi::run("SET CONSTRAINTS ALL IMMEDIATE").expect("commit-time flush");
+    let stale = Spi::get_one::<bool>(
+        "SELECT known_stale FROM public.__reflex_ivm_reference WHERE name = 'drn2_v'",
+    )
+    .expect("registry")
+    .unwrap_or(false);
+    assert!(
+        !stale,
+        "disabled drn2_v flagged stale by the COMMIT-time pass"
+    );
+}
+
+/// A per-IMV flush failure is handled after its subtransaction rolled back,
+/// which released the IMV's advisory lock taken inside it; the handler's
+/// registry write must hold it again (lock order: advisory lock, then row).
+#[pg_test]
+fn pg_drc_flush_failure_handler_holds_imv_lock() {
+    Spi::run("CREATE TABLE drl_s (k INT PRIMARY KEY, v INT)").expect("s");
+    Spi::run("INSERT INTO drl_s SELECT i, i FROM generate_series(1, 10) i").expect("seed");
+    dmw_create_deferred("drl_v", "SELECT k, v FROM drl_s", Some("k"));
+    dmw_force_incremental("drl_v");
+    Spi::run("ALTER TABLE drl_v ADD CONSTRAINT drl_small CHECK (v < 1000)").expect("check");
+
+    Spi::run("INSERT INTO drl_s VALUES (100, 5000)").expect("staged, violates the check");
+    Spi::run("SET CONSTRAINTS ALL IMMEDIATE").expect("commit-time flush");
+    let stale = Spi::get_one::<bool>(
+        "SELECT known_stale FROM public.__reflex_ivm_reference WHERE name = 'drl_v'",
+    )
+    .expect("registry")
+    .unwrap_or(false);
+    assert!(
+        stale,
+        "precondition: the flush of drl_v failed and was handled"
+    );
+    let locked = Spi::get_one::<bool>(
+        "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE locktype = 'advisory' \
+           AND pid = pg_backend_pid() AND granted AND objsubid = 2 \
+           AND classid::bigint = (hashtext('drl_v')::bigint & 4294967295) \
+           AND objid::bigint = (hashtext(reverse('drl_v'))::bigint & 4294967295))",
+    )
+    .expect("pg_locks")
+    .unwrap_or(false);
+    assert!(
+        locked,
+        "the failure handler wrote the registry without the IMV lock"
+    );
+}
+
+/// The key-scoped cascade into a non-partitioned DEFERRED aggregate grouped by
+/// the upstream's partition column, which observes the upstream: rows staged on
+/// the upstream for the rebuilt keys before the cascade are in it. (Triggers are
+/// silenced during the upstream's reconcile so its rebuild reaches the
+/// dependent through the cascade rather than as a row diff.)
+#[pg_test]
+fn pg_drc_scoped_cascade_into_deferred_dependent_with_staged_deltas() {
+    drc_build_partitioned_source("drp5");
+    create_imv(
+        "drp5_u",
+        "SELECT create_reflex_ivm('drp5_u', 'SELECT plan, id, qty FROM drp5_s', 'plan, id', \
+         NULL, 'IMMEDIATE', NULL, ARRAY['plan'])",
+    );
+    let sql = "SELECT plan, SUM(qty) AS q, COUNT(*) AS n FROM drp5_u GROUP BY plan";
+    create_imv(
+        "drp5_d",
+        &format!(
+            "SELECT create_reflex_ivm('drp5_d', {}, NULL, NULL, 'DEFERRED', NULL, \
+             ARRAY[]::text[])",
+            sql_lit(sql)
+        ),
+    );
+    dmw_force_incremental("drp5_d");
+    let fresh = sql.replace("drp5_u", "drp5_s");
+
+    Spi::run("INSERT INTO drp5_s VALUES (2, 100, 1000)").expect("staged on drp5_u, plan 2");
+    Spi::run("INSERT INTO drp5_s VALUES (1, 100, 500)").expect("staged on drp5_u, plan 1");
+    Spi::run("SET LOCAL session_replication_role = replica").expect("replica");
+    drc_reconcile_partition("drp5_u", "2");
+    Spi::run("SET LOCAL session_replication_role = origin").expect("origin");
+    assert!(
+        drc_scoped_recorded("drp5_d"),
+        "drp5_d's key-scoped rebuild not recorded"
+    );
+    Spi::run("INSERT INTO drp5_s VALUES (2, 101, 7)").expect("staged after");
+    Spi::run("SET CONSTRAINTS ALL IMMEDIATE").expect("commit-time flush");
+    dmw_assert_fresh("drp5_d", &fresh);
+}
+
+/// The flush of a DEFERRED partitioned IMV's own delta rebuilds a hot partition
+/// (partition-aware dispatch) while that delta is still staged: the flush
+/// consumes it, so the rebuild neither needs a watermark nor a COMMIT-time full
+/// rebuild, even for an IMV that joins a second table.
+#[pg_test]
+fn pg_drc_hot_partition_dispatch_in_own_flush_stays_scoped() {
+    drc_build_partitioned_source("drp6");
+    Spi::run("CREATE TABLE drp6_dim (id INT PRIMARY KEY, f INT NOT NULL)").expect("dim");
+    Spi::run("INSERT INTO drp6_dim SELECT g, 1 + g % 4 FROM generate_series(1, 300) g")
+        .expect("seed dim");
+    let sql = "SELECT s.plan, SUM(s.qty * d.f) AS q, COUNT(*) AS n \
+               FROM drp6_s s JOIN drp6_dim d ON d.id = s.id GROUP BY s.plan";
+    drc_create_partitioned_deferred("drp6_v", sql, None, "");
+    Spi::run("UPDATE public.__reflex_ivm_reference SET wipe_threshold = 0 WHERE name = 'drp6_v'")
+        .expect("every touched partition is hot");
+
+    Spi::run("INSERT INTO drp6_s VALUES (2, 100, 1000)").expect("staged, plan 2");
+    Spi::run("UPDATE drp6_s SET qty = qty + 1 WHERE plan = 2 AND id <= 4").expect("staged");
+    Spi::run("SET CONSTRAINTS ALL IMMEDIATE").expect("commit-time flush");
+    dmw_assert_fresh("drp6_v", sql);
+    assert!(
+        !drc_temp_lists("__reflex_deferred_reconciled_batch", "drp6_v"),
+        "drp6_v's own flush escalated to a COMMIT-time full rebuild"
+    );
+}
+
+/// A source partition swapped in a transaction that then stages a write into
+/// it: the COMMIT-time partition flush rebuilds that partition of the DEFERRED
+/// IMV (reading the write) before the deferred flush; the write's staged delta
+/// is skipped, the other partitions' deltas applied, and no full rebuild runs.
+#[pg_test]
+fn pg_drc_partition_flush_rebuild_skips_its_staged_deltas() {
+    drc_build_partitioned_source("drp7");
+    let sql = "SELECT plan, SUM(qty) AS q, COUNT(*) AS n FROM drp7_s GROUP BY plan";
+    drc_create_partitioned_deferred("drp7_v", sql, None, "");
+
+    Spi::run("CREATE TABLE drp7_s3_new (LIKE drp7_s)").expect("new partition");
+    Spi::run("INSERT INTO drp7_s3_new SELECT 3, g, 2 * g FROM generate_series(1, 25) g")
+        .expect("fill new partition");
+    Spi::run("ALTER TABLE drp7_s DETACH PARTITION drp7_s3").expect("detach");
+    Spi::run("ALTER TABLE drp7_s ATTACH PARTITION drp7_s3_new FOR VALUES IN (3)").expect("attach");
+    Spi::run("INSERT INTO drp7_s VALUES (3, 100, 1000)").expect("staged into the swapped plan");
+    Spi::run("INSERT INTO drp7_s VALUES (2, 100, 500)").expect("staged, other plan");
+    Spi::run("SET CONSTRAINTS ALL IMMEDIATE").expect("commit-time flushes");
+    dmw_assert_fresh("drp7_v", sql);
+    assert!(
+        !drc_temp_lists("__reflex_deferred_reconciled_batch", "drp7_v"),
+        "the partition flush escalated drp7_v to a COMMIT-time full rebuild"
+    );
+}

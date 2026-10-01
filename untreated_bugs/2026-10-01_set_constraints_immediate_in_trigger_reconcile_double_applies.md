@@ -40,3 +40,20 @@ COMMIT;
 Stage the DEFERRED delta before maintaining the IMMEDIATE IMVs in the trigger bodies (needs
 trigger regeneration in the migration), or have the COMMIT-time pass postpone a listed IMV while
 a statement that may still stage for it is in flight.
+
+## Ruled out (2026-10-02): postponing the pass while `pg_trigger_depth() > 1`
+
+The premise that the outer statement's own flush event runs the pass at depth 1 is
+false. Measured on pg17 with the reproduction above plus a logging AFTER ROW trigger on
+`__reflex_deferred_pending`: under `SET CONSTRAINTS ALL IMMEDIATE` both events fire at
+depth 2 — the `'TRUNCATE'` request queued by `list_for_commit_reconcile` (before the
+statement stages `d`'s delta) and the statement's own `'UPDATE'` pending row (after
+staging), because both INSERTs into `__reflex_deferred_pending` run inside the source's
+statement trigger (depth 1) and an immediate constraint trigger fires at the end of that
+nested INSERT. Without SET CONSTRAINTS the same events fire at COMMIT at depth 1. So a
+depth gate postpones the good event too; the re-enqueued request is consumed at once by a
+nested flush (depth 3) and nothing is left to rebuild `d` before COMMIT: `d` would end
+flagged stale (not wrong), and every in-trigger reconcile under IMMEDIATE would regress
+the same way. Remaining options: stage the DEFERRED delta before the IMMEDIATE
+maintenance in the trigger bodies (template change + regeneration in the migration), or
+tell the two depth-2 events apart (request row vs staging row, or "staged since listing").
