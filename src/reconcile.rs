@@ -492,7 +492,7 @@ pub(crate) fn reconcile_one(view_name: &str, drop_orphans: bool) -> &'static str
                     &base_query,
                     &end_query,
                     unlogged,
-                    PARTITIONED_LEAF_DIFF_ALLOWED.get(),
+                    true,
                 ) {
                     Ok(all_diffed) => all_diffed,
                     Err((src_bare, e)) => {
@@ -853,14 +853,6 @@ thread_local! {
     /// overwritten by the outer branch's final `set`.
     static PARTITIONED_REBUILD_ALL_DIFFED: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
-
-    /// Cleared by [`reflex_reconcile_with_orphans`] around the rebuild of an
-    /// IMV whose generated sub-IMV failed to rebuild: its partitioned leaves
-    /// are then swapped, never diffed, so content derived from a node known to
-    /// be stale is not written into its dependents (the cascade is withheld
-    /// for the same reason).
-    static PARTITIONED_LEAF_DIFF_ALLOWED: std::cell::Cell<bool> =
-        const { std::cell::Cell::new(true) };
 }
 
 /// Enabled IMVs that read `view_name` but list it in `ignored_sources`: no
@@ -976,9 +968,7 @@ pub(crate) fn reflex_reconcile_with_orphans(view_name: &str, drop_orphans: bool)
     }
 
     PARTITIONED_REBUILD_ALL_DIFFED.set(false);
-    let diff_was_allowed = PARTITIONED_LEAF_DIFF_ALLOWED.replace(!child_failed);
     let own = reconcile_named_node(view_name, drop_orphans);
-    PARTITIONED_LEAF_DIFF_ALLOWED.set(diff_was_allowed);
     let all_leaves_diffed = PARTITIONED_REBUILD_ALL_DIFFED.replace(false);
 
     // The parent is rebuilt even when a child failed — that still repairs any
@@ -989,11 +979,13 @@ pub(crate) fn reflex_reconcile_with_orphans(view_name: &str, drop_orphans: bool)
     // rebuild clears, and the failed child was never `known_stale` in the first
     // place, so this string is the only signal that survives.
     //
-    // The dependent cascade sits BELOW this return for the same reason. Content
-    // we have just declared stale must not be pushed into every dependent —
-    // each dependent's own rebuild clears its `known_stale` / `stale_reason` /
-    // `stale_since`, so cascading here would turn one IMV known to be stale into
-    // N IMVs freshly stamped healthy and derived from it.
+    // The dependent cascade sits BELOW this return for the same reason. The
+    // rebuild itself reached the OBSERVING dependents as a row diff, like any
+    // write to this IMV, so they stay consistent with it; what must not happen
+    // is their own rebuild, which clears `known_stale` / `stale_reason` /
+    // `stale_since` and would turn one IMV known to be stale into N IMVs freshly
+    // stamped healthy and derived from it. The ignoring-dependent refresh is
+    // withheld for the same reason.
     if child_failed {
         return "ERROR: generated sub-IMV reconcile failed";
     }

@@ -2691,6 +2691,19 @@ fn swap_partition_child_ddl(
     // into every dependent. An EMPTY or FRESH leaf (ATTACH, new plan) keeps that
     // path: there is nothing in it a dependent could have derived from.
     if allow_diff && leaf_is_diffable(client, view_name, &tgt_child_qual_probe, &tgt_def) {
+        // The IMV's advisory key (the one `rebuild_target_rows` and IMMEDIATE
+        // maintenance take; re-entrant within the transaction) BEFORE the
+        // intermediate child is emptied: `reconcile_one` can reach here without
+        // the pre-sync that otherwise takes it.
+        client
+            .update(
+                "SELECT pg_advisory_xact_lock(hashtext($1), hashtext(reverse($1)))",
+                None,
+                &[unsafe {
+                    DatumWithOid::new(view_name.to_string(), PgBuiltInOids::TEXTOID.oid().value())
+                }],
+            )
+            .map_err(|e| format!("lock IMV for leaf diff: {}", e))?;
         if !end_query.is_empty() {
             let (fill_int, _) = build_inplace_partition_fill(
                 &int_child_qual_probe,
