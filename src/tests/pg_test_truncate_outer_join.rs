@@ -57,7 +57,11 @@ fn pg_toj_truncate_left_joined_source_keeps_anchor_rows_immediate() {
 
     Spi::run("TRUNCATE toj_act").expect("truncate secondary");
 
-    assert_eq!(toj_row_count("toj_v1"), 200, "LEFT JOIN dependent lost anchor rows");
+    assert_eq!(
+        toj_row_count("toj_v1"),
+        200,
+        "LEFT JOIN dependent lost anchor rows"
+    );
     assert_imv_correct("toj_v1", TOJ_SQL_IMMEDIATE);
 }
 
@@ -84,15 +88,21 @@ fn pg_toj_truncate_refill_left_joined_source_deferred() {
     Spi::run("INSERT INTO tojd_act SELECT * FROM tojd_keep").expect("refill subset");
     Spi::run("SELECT reflex_flush_deferred('tojd_act')").expect("flush");
 
-    assert_eq!(toj_row_count("toj_v2"), 200, "LEFT JOIN dependent lost anchor rows");
+    assert_eq!(
+        toj_row_count("toj_v2"),
+        200,
+        "LEFT JOIN dependent lost anchor rows"
+    );
     assert_imv_correct("toj_v2", &sql);
 }
 
 /// T3 — the production chain: the nullable side is itself a DEFERRED
-/// passthrough IMV whose rebuild (`reflex_reconcile`, which the wipe-threshold
-/// dispatch calls) is TRUNCATE + INSERT.
+/// passthrough IMV that drifted and is repaired with `reflex_reconcile` (what
+/// the wipe-threshold dispatch calls). Since the reconcile of an IMV with
+/// dependents diffs instead of TRUNCATE + INSERT, the dependent only sees the
+/// drifted key.
 #[pg_test]
-fn pg_toj_reconcile_of_left_joined_imv_keeps_dependent() {
+fn pg_toj_reconcile_chain_keeps_dependent() {
     build_toj_tables("tojc_anchor", "tojc_rel");
     let caav = crate::create_reflex_ivm(
         "tojc_caav",
@@ -114,6 +124,29 @@ fn pg_toj_reconcile_of_left_joined_imv_keeps_dependent() {
     let dep = crate::create_reflex_ivm("tojc_sfv", sql, Some("id"), None, Some("DEFERRED"), None);
     assert_eq!(dep, "CREATE REFLEX INCREMENTAL VIEW");
     assert_imv_correct("tojc_sfv", fresh);
+    // A consumer of the dependent, as in production: without one the dependent's
+    // own refresh is a plain DELETE + INSERT, which is not what is measured here.
+    let top_sql = "SELECT product_id, COUNT(*) AS n, \
+                   SUM(CASE WHEN active THEN 1 ELSE 0 END) AS active_n \
+                   FROM tojc_sfv GROUP BY product_id";
+    assert_eq!(
+        crate::create_reflex_ivm("tojc_top", top_sql, None, None, Some("DEFERRED"), None),
+        "CREATE REFLEX INCREMENTAL VIEW"
+    );
+
+    Spi::run("SET LOCAL session_replication_role = replica").expect("bypass triggers");
+    Spi::run(
+        "UPDATE tojc_rel SET is_active = NOT is_active WHERE product_id = 1 AND location_id = 1",
+    )
+    .expect("drift the caav");
+    Spi::run("SET LOCAL session_replication_role = origin").expect("restore triggers");
+    let drifted_rows = Spi::get_one::<i64>(
+        "SELECT count(*)::int8 FROM tojc_anchor WHERE product_id = 1 AND location_id = 1",
+    )
+    .expect("drifted rows")
+    .expect("count");
+    let changes_before = tree_xact_changes("tojc_sfv");
+    let boundary = cmin_boundary("tojc_sfv");
 
     let res = Spi::get_one::<&str>("SELECT reflex_reconcile('tojc_caav')")
         .expect("reconcile")
@@ -122,12 +155,28 @@ fn pg_toj_reconcile_of_left_joined_imv_keeps_dependent() {
     assert_eq!(
         toj_row_count("tojc_sfv"),
         200,
-        "the rebuild's TRUNCATE deleted rows before the flush — a failed flush makes the loss permanent"
+        "the rebuild deleted rows before the flush — a failed flush makes the loss permanent"
     );
     Spi::run("SELECT reflex_flush_deferred('tojc_caav')").expect("flush");
+    Spi::run("SELECT reflex_flush_deferred('tojc_sfv')").expect("flush sfv into top");
+    assert_imv_correct("tojc_top", top_sql);
 
-    assert_eq!(toj_row_count("tojc_sfv"), 200, "LEFT JOIN dependent lost anchor rows");
+    assert_eq!(
+        toj_row_count("tojc_sfv"),
+        200,
+        "LEFT JOIN dependent lost anchor rows"
+    );
     assert_imv_correct("tojc_sfv", fresh);
+    let growth = tree_xact_changes("tojc_sfv") - changes_before;
+    assert!(
+        growth <= 2 * drifted_rows,
+        "dependent rewritten beyond the drifted key: {growth} changes for {drifted_rows} rows"
+    );
+    let rewritten = rows_rewritten_since("tojc_sfv", boundary);
+    assert!(
+        rewritten <= drifted_rows,
+        "dependent rows rewritten beyond the drifted key: {rewritten} for {drifted_rows} rows"
+    );
 }
 
 /// T4 — control: an INNER JOIN source truncated really does empty the result,
@@ -140,7 +189,10 @@ fn pg_toj_truncate_inner_joined_source_still_empties_dependent() {
                ON c.product_id = a.product_id AND c.location_id = a.location_id";
     let res = crate::create_reflex_ivm("toj_v4", sql, Some("id"), None, None, None);
     assert_eq!(res, "CREATE REFLEX INCREMENTAL VIEW");
-    assert!(toj_row_count("toj_v4") > 0, "fixture produced an empty inner join");
+    assert!(
+        toj_row_count("toj_v4") > 0,
+        "fixture produced an empty inner join"
+    );
 
     Spi::run("TRUNCATE toji_act").expect("truncate secondary");
 
@@ -150,11 +202,10 @@ fn pg_toj_truncate_inner_joined_source_still_empties_dependent() {
 
 /// T5 — the full field sequence in one transaction: an incremental change to
 /// the nullable-side IMV stages a delta for the dependent, then a rebuild of
-/// that IMV (TRUNCATE + INSERT) stages the same key again. The TRUNCATE leaves
-/// the earlier staged row in place, the flush sees the key twice, and the
-/// dependent must still end up complete.
+/// that IMV stages the same key again. The flush sees the key twice, and the
+/// dependent must still end up complete, touching only that key's rows.
 #[pg_test]
-fn pg_toj_incremental_then_rebuild_of_left_joined_imv_keeps_dependent() {
+fn pg_toj_incremental_then_reconcile_chain_keeps_dependent() {
     build_toj_tables("toj5_anchor", "toj5_rel");
     let caav = crate::create_reflex_ivm(
         "toj5_caav",
@@ -176,6 +227,22 @@ fn pg_toj_incremental_then_rebuild_of_left_joined_imv_keeps_dependent() {
     let dep = crate::create_reflex_ivm("toj5_sfv", sql, Some("id"), None, Some("DEFERRED"), None);
     assert_eq!(dep, "CREATE REFLEX INCREMENTAL VIEW");
     assert_imv_correct("toj5_sfv", fresh);
+    // A consumer of the dependent, as in production: without one the dependent's
+    // own refresh is a plain DELETE + INSERT, which is not what is measured here.
+    let top_sql = "SELECT product_id, COUNT(*) AS n, \
+                   SUM(CASE WHEN active THEN 1 ELSE 0 END) AS active_n \
+                   FROM toj5_sfv GROUP BY product_id";
+    assert_eq!(
+        crate::create_reflex_ivm("toj5_top", top_sql, None, None, Some("DEFERRED"), None),
+        "CREATE REFLEX INCREMENTAL VIEW"
+    );
+    let key_rows = Spi::get_one::<i64>(
+        "SELECT count(*)::int8 FROM toj5_anchor WHERE product_id = 5 AND location_id = 1",
+    )
+    .expect("key rows")
+    .expect("count");
+    let changes_before = tree_xact_changes("toj5_sfv");
+    let boundary = cmin_boundary("toj5_sfv");
 
     Spi::run("INSERT INTO toj5_rel VALUES (5, 1, TRUE)").expect("activate a new key");
     Spi::run("SELECT reflex_flush_deferred('toj5_rel')").expect("flush rel into caav");
@@ -184,8 +251,14 @@ fn pg_toj_incremental_then_rebuild_of_left_joined_imv_keeps_dependent() {
         .expect("reconcile result");
     assert_eq!(res, "RECONCILED");
     Spi::run("SELECT reflex_flush_deferred('toj5_caav')").expect("flush caav into sfv");
+    Spi::run("SELECT reflex_flush_deferred('toj5_sfv')").expect("flush sfv into top");
+    assert_imv_correct("toj5_top", top_sql);
 
-    assert_eq!(toj_row_count("toj5_sfv"), 200, "LEFT JOIN dependent lost anchor rows");
+    assert_eq!(
+        toj_row_count("toj5_sfv"),
+        200,
+        "LEFT JOIN dependent lost anchor rows"
+    );
     assert_imv_correct("toj5_sfv", fresh);
     let stale = Spi::get_one::<bool>(
         "SELECT known_stale FROM public.__reflex_ivm_reference WHERE name = 'toj5_sfv'",
@@ -193,13 +266,23 @@ fn pg_toj_incremental_then_rebuild_of_left_joined_imv_keeps_dependent() {
     .expect("stale q")
     .unwrap_or(false);
     assert!(!stale, "the dependent's flush failed and was discarded");
+    let growth = tree_xact_changes("toj5_sfv") - changes_before;
+    assert!(
+        growth <= 2 * key_rows,
+        "dependent rewritten beyond key (5,1): {growth} changes for {key_rows} rows"
+    );
+    let rewritten = rows_rewritten_since("toj5_sfv", boundary);
+    assert!(
+        rewritten <= key_rows,
+        "dependent rows rewritten beyond key (5,1): {rewritten} for {key_rows} rows"
+    );
 }
 
 /// T6 — the production shape: the dependent is partitioned by plan, mirroring
-/// a LIST-partitioned anchor, and LEFT JOINs a DEFERRED passthrough IMV that is
-/// rebuilt.
+/// a LIST-partitioned anchor, and LEFT JOINs a plain table that is truncated.
+/// DEFERRED: untouched at TRUNCATE time, rebuilt by the COMMIT-time flush.
 #[pg_test]
-fn pg_toj_reconcile_of_left_joined_imv_keeps_partitioned_dependent() {
+fn pg_toj_truncate_left_joined_source_keeps_partitioned_dependent() {
     Spi::run(
         "CREATE TABLE toj6_anchor (plan INT NOT NULL, id INT NOT NULL, product_id INT NOT NULL, \
          location_id INT NOT NULL, qty INT) PARTITION BY LIST (plan)",
@@ -217,46 +300,42 @@ fn pg_toj_reconcile_of_left_joined_imv_keeps_partitioned_dependent() {
     )
     .expect("seed anchor");
     Spi::run(
-        "CREATE TABLE toj6_rel (product_id INT NOT NULL, location_id INT NOT NULL, is_active BOOL, \
-         PRIMARY KEY (product_id, location_id))",
+        "CREATE TABLE toj6_rel_plain (product_id INT NOT NULL, location_id INT NOT NULL, \
+         is_active BOOL, PRIMARY KEY (product_id, location_id))",
     )
     .expect("rel");
     Spi::run(
-        "INSERT INTO toj6_rel SELECT p, l, (p + l) % 2 = 0 \
+        "INSERT INTO toj6_rel_plain SELECT p, l, (p + l) % 2 = 0 \
          FROM generate_series(0, 3) p CROSS JOIN generate_series(0, 4) l",
     )
     .expect("seed rel");
-    create_imv(
-        "toj6_caav",
-        "SELECT create_reflex_ivm('toj6_caav', \
-         'SELECT product_id, location_id, is_active FROM toj6_rel', \
-         'product_id, location_id', NULL, 'DEFERRED')",
-    );
-    create_imv(
-        "toj6_sfv",
-        "SELECT create_reflex_ivm('toj6_sfv', \
-         'SELECT a.plan, a.id, a.product_id, a.location_id, a.qty, \
-                 COALESCE(c.is_active, FALSE) AS active \
-          FROM toj6_anchor a LEFT JOIN toj6_caav c \
-          ON c.product_id = a.product_id AND c.location_id = a.location_id', \
-         'plan, id', NULL, 'DEFERRED', NULL, ARRAY['plan'])",
-    );
     let fresh = "SELECT a.plan, a.id, a.product_id, a.location_id, a.qty, \
                  COALESCE(c.is_active, FALSE) AS active \
-                 FROM toj6_anchor a LEFT JOIN toj6_rel c \
+                 FROM toj6_anchor a LEFT JOIN toj6_rel_plain c \
                  ON c.product_id = a.product_id AND c.location_id = a.location_id";
+    create_imv(
+        "toj6_sfv",
+        &format!(
+            "SELECT create_reflex_ivm('toj6_sfv', '{}', 'plan, id', NULL, 'DEFERRED', NULL, \
+             ARRAY['plan'])",
+            fresh.replace('\'', "''")
+        ),
+    );
     assert_imv_correct("toj6_sfv", fresh);
+    let boundary = cmin_boundary("toj6_sfv");
 
-    let res = Spi::get_one::<&str>("SELECT reflex_reconcile('toj6_caav')")
-        .expect("reconcile")
-        .expect("reconcile result");
-    assert_eq!(res, "RECONCILED");
+    Spi::run("TRUNCATE toj6_rel_plain").expect("truncate secondary");
     assert_eq!(
         toj_row_count("toj6_sfv"),
         200,
-        "the rebuild's TRUNCATE deleted partitioned dependent rows before the flush"
+        "the TRUNCATE deleted partitioned dependent rows before the flush"
     );
-    Spi::run("SELECT reflex_flush_deferred('toj6_caav')").expect("flush");
+    assert_eq!(
+        rows_rewritten_since("toj6_sfv", boundary),
+        0,
+        "DEFERRED partitioned dependent rewritten at TRUNCATE time"
+    );
+    Spi::run("SET CONSTRAINTS ALL IMMEDIATE").expect("commit-time flush");
 
     assert_eq!(toj_row_count("toj6_sfv"), 200);
     assert_imv_correct("toj6_sfv", fresh);
@@ -280,4 +359,150 @@ fn pg_toj_truncate_left_joined_source_keeps_aggregate_groups() {
 
     assert_eq!(toj_row_count("toj_v7"), 7, "aggregate groups were deleted");
     assert_imv_correct("toj_v7", sql);
+}
+
+/// DEFERRED: the dependent is untouched by the TRUNCATE itself and rebuilt
+/// once at flush; a delta another source staged earlier is not applied twice.
+#[pg_test]
+fn pg_toj_deferred_truncate_rebuilds_once_without_double_counting() {
+    build_toj_tables("tjd_anchor", "tjd_act");
+    let sql = "SELECT a.product_id, COUNT(*) AS n, SUM(a.qty) AS q, \
+               SUM(CASE WHEN c.is_active THEN 1 ELSE 0 END) AS active_n \
+               FROM tjd_anchor a LEFT JOIN tjd_act c \
+               ON c.product_id = a.product_id AND c.location_id = a.location_id \
+               GROUP BY a.product_id";
+    assert_eq!(
+        crate::create_reflex_ivm("tjd_v", sql, None, None, Some("DEFERRED"), None),
+        "CREATE REFLEX INCREMENTAL VIEW"
+    );
+    Spi::run("INSERT INTO tjd_anchor VALUES (1000, 1, 1, 50)").expect("anchor delta staged");
+    let before = tree_xact_changes("tjd_v");
+    let boundary = cmin_boundary("tjd_v");
+    Spi::run("TRUNCATE tjd_act").expect("truncate secondary");
+    assert_eq!(
+        tree_xact_changes("tjd_v"),
+        before,
+        "DEFERRED dependent rewritten at TRUNCATE time"
+    );
+    assert_eq!(
+        rows_rewritten_since("tjd_v", boundary),
+        0,
+        "DEFERRED dependent rewritten at TRUNCATE time"
+    );
+    Spi::run("SELECT reflex_flush_deferred('tjd_anchor')").expect("flush anchor");
+    let after_rebuild = tree_xact_changes("tjd_v");
+    let rebuilt_boundary = cmin_boundary("tjd_v");
+    Spi::run("SELECT reflex_flush_deferred('tjd_act')").expect("flush act");
+    assert_imv_correct("tjd_v", sql);
+    assert_eq!(
+        tree_xact_changes("tjd_v"),
+        after_rebuild,
+        "a later flush in the same transaction touched the rebuilt IMV"
+    );
+    assert_eq!(
+        rows_rewritten_since("tjd_v", rebuilt_boundary),
+        0,
+        "a later flush in the same transaction rewrote the rebuilt IMV"
+    );
+    // One rebuild of a target without dependents deletes and re-inserts each row
+    // once; a second rebuild, or the staged delta applied on top, exceeds that.
+    let rebuild_writes = tree_xact_changes("tjd_v") - before;
+    assert!(
+        rebuild_writes <= 2 * toj_row_count("tjd_v"),
+        "rebuilt more than once: {rebuild_writes} row changes"
+    );
+}
+
+/// Same for a keyless passthrough dependent (duplicate rows would appear).
+#[pg_test]
+fn pg_toj_deferred_truncate_keyless_passthrough_no_duplicates() {
+    build_toj_tables("tjk_anchor", "tjk_act");
+    let sql = TOJ_SQL_IMMEDIATE
+        .replace("toj_anchor", "tjk_anchor")
+        .replace("toj_act", "tjk_act");
+    assert_eq!(
+        crate::create_reflex_ivm("tjk_v", &sql, None, None, Some("DEFERRED"), None),
+        "CREATE REFLEX INCREMENTAL VIEW"
+    );
+    Spi::run("INSERT INTO tjk_anchor VALUES (1000, 1, 1, 50)").expect("anchor delta staged");
+    let before = tree_xact_changes("tjk_v");
+    let boundary = cmin_boundary("tjk_v");
+    Spi::run("TRUNCATE tjk_act").expect("truncate");
+    assert_eq!(
+        tree_xact_changes("tjk_v"),
+        before,
+        "DEFERRED dependent rewritten at TRUNCATE time"
+    );
+    assert_eq!(
+        rows_rewritten_since("tjk_v", boundary),
+        0,
+        "DEFERRED dependent rewritten at TRUNCATE time"
+    );
+    Spi::run("SELECT reflex_flush_deferred('tjk_anchor')").expect("flush anchor");
+    Spi::run("SELECT reflex_flush_deferred('tjk_act')").expect("flush act");
+    assert_imv_correct("tjk_v", &sql);
+    let rebuild_writes = tree_xact_changes("tjk_v") - before;
+    assert!(
+        rebuild_writes <= 2 * toj_row_count("tjk_v"),
+        "rebuilt more than once: {rebuild_writes} row changes"
+    );
+}
+
+/// DEFERRED, a TRUNCATE alone in the transaction, on the IMV's only source: the
+/// truncate trigger empties that source's staging delta and pending rows, yet the
+/// COMMIT-time flush must still rebuild the dependent.
+#[pg_test]
+fn pg_toj_deferred_truncate_only_source_rebuilds_at_commit() {
+    build_toj_tables("tjo_anchor", "tjo_act");
+    let sql = "SELECT product_id, COUNT(*) AS n, SUM(qty) AS q FROM tjo_anchor GROUP BY product_id";
+    assert_eq!(
+        crate::create_reflex_ivm("tjo_v", sql, None, None, Some("DEFERRED"), None),
+        "CREATE REFLEX INCREMENTAL VIEW"
+    );
+    Spi::run("TRUNCATE tjo_anchor").expect("truncate only source");
+    assert_eq!(
+        toj_row_count("tjo_v"),
+        7,
+        "DEFERRED dependent rewritten at TRUNCATE time"
+    );
+    Spi::run("SET CONSTRAINTS ALL IMMEDIATE").expect("commit-time flush");
+    assert_eq!(
+        toj_row_count("tjo_v"),
+        0,
+        "the truncate was never applied at COMMIT"
+    );
+    assert_imv_correct("tjo_v", sql);
+}
+
+/// DEFERRED, the IMV ignores its first source: the COMMIT-time rebuild must be
+/// reached through a source the IMV does not ignore.
+#[pg_test]
+fn pg_toj_deferred_truncate_rebuilds_when_first_source_ignored() {
+    build_toj_tables("tjg_anchor", "tjg_act");
+    let sql = TOJ_SQL_IMMEDIATE
+        .replace("toj_anchor", "tjg_anchor")
+        .replace("toj_act", "tjg_act");
+    assert_eq!(
+        crate::create_reflex_ivm(
+            "tjg_v",
+            &sql,
+            Some("id"),
+            None,
+            Some("DEFERRED"),
+            Some("!tjg_anchor")
+        ),
+        "CREATE REFLEX INCREMENTAL VIEW"
+    );
+    let first_source = Spi::get_one::<&str>(
+        "SELECT depends_on[1] FROM public.__reflex_ivm_reference WHERE name = 'tjg_v'",
+    )
+    .expect("depends_on")
+    .expect("first source");
+    assert!(
+        first_source.ends_with("tjg_anchor"),
+        "fixture must ignore the first source, got {first_source}"
+    );
+    Spi::run("TRUNCATE tjg_act").expect("truncate");
+    Spi::run("SET CONSTRAINTS ALL IMMEDIATE").expect("commit-time flush");
+    assert_imv_correct("tjg_v", &sql);
 }
