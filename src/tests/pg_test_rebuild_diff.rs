@@ -609,3 +609,254 @@ fn pg_rbd_deferred_full_join_fallback_hands_dependent_a_diff() {
         "dependent of a deferred FULL JOIN IMV rebuilt in full"
     );
 }
+
+const RBN_UP_SQL: &str = "SELECT p, l, v FROM {prefix}_src";
+const RBN_DEP_SQL: &str = "SELECT p, SUM(v) AS s, COUNT(*) AS n FROM {prefix}_up GROUP BY p";
+
+fn rbn_sql(template: &str, prefix: &str) -> String {
+    template.replace("{prefix}", prefix)
+}
+
+/// A keyed IMV whose key columns hold NULLs (NULLS NOT DISTINCT `__reflex_uk_*`),
+/// an aggregate dependent, and a row trigger recording what reaches the target.
+fn rbn_up_and_dep(prefix: &str) {
+    Spi::run(&format!(
+        "CREATE TABLE {prefix}_src (p INT, l INT, v INT, UNIQUE NULLS NOT DISTINCT (p, l))"
+    ))
+    .expect("src");
+    Spi::run(&format!(
+        "INSERT INTO {prefix}_src SELECT CASE WHEN g % 2 = 0 THEN NULL ELSE g END, \
+         CASE WHEN g % 3 = 0 THEN NULL ELSE g % 4 END, g FROM generate_series(1, 100) g \
+         ON CONFLICT DO NOTHING"
+    ))
+    .expect("seed");
+    assert_eq!(
+        crate::create_reflex_ivm(
+            &format!("{prefix}_up"),
+            &rbn_sql(RBN_UP_SQL, prefix),
+            Some("p, l"),
+            None,
+            None,
+            None
+        ),
+        "CREATE REFLEX INCREMENTAL VIEW"
+    );
+    assert_eq!(
+        crate::create_reflex_ivm(
+            &format!("{prefix}_dep"),
+            &rbn_sql(RBN_DEP_SQL, prefix),
+            None,
+            None,
+            None,
+            None
+        ),
+        "CREATE REFLEX INCREMENTAL VIEW"
+    );
+    let null_keys = Spi::get_one::<i64>(&format!(
+        "SELECT count(*)::int8 FROM {prefix}_up WHERE p IS NULL OR l IS NULL"
+    ))
+    .unwrap()
+    .unwrap();
+    assert!(
+        null_keys >= 3,
+        "fixture must hold NULL-key rows, has {null_keys}"
+    );
+    Spi::run(&format!("CREATE TABLE {prefix}_seen (change TEXT)")).expect("seen");
+    Spi::run(&format!(
+        "CREATE FUNCTION {prefix}_record_seen() RETURNS trigger LANGUAGE plpgsql AS $f$ BEGIN \
+           INSERT INTO {prefix}_seen SELECT TG_OP || ':' || COALESCE(r.p::text, '-') || '/' || COALESCE(r.l::text, '-') \
+           FROM (SELECT (CASE WHEN TG_OP = 'DELETE' THEN OLD ELSE NEW END).*) r; RETURN NULL; END $f$"
+    ))
+    .expect("fn");
+    Spi::run(&format!(
+        "CREATE TRIGGER {prefix}_record_seen AFTER INSERT OR UPDATE OR DELETE ON {prefix}_up \
+         FOR EACH ROW EXECUTE FUNCTION {prefix}_record_seen()"
+    ))
+    .expect("trigger");
+}
+
+fn rbn_seen(prefix: &str) -> Option<String> {
+    Spi::get_one::<String>(&format!(
+        "SELECT string_agg(change, ',' ORDER BY change) FROM {prefix}_seen"
+    ))
+    .unwrap()
+}
+
+/// NULL keys match NULL keys: a no-op rebuild of an IMV holding NULL-key rows
+/// rewrites none of them and hands the dependent nothing.
+#[pg_test]
+fn pg_rbd_keyed_null_key_noop_rebuild_rewrites_nothing() {
+    rbn_up_and_dep("rbn1");
+    let boundary = cmin_boundary("rbn1_up");
+    let before = tree_xact_changes("rbn1_dep");
+    assert_eq!(
+        rbd_rebuild("rbn1_up", &rbn_sql(RBN_UP_SQL, "rbn1")),
+        "DIFFED"
+    );
+    assert_imv_correct("rbn1_up", &rbn_sql(RBN_UP_SQL, "rbn1"));
+    assert_eq!(
+        rows_rewritten_since("rbn1_up", boundary),
+        0,
+        "no-op rebuild rewrote NULL-key rows"
+    );
+    assert_eq!(
+        rbn_seen("rbn1"),
+        None,
+        "no-op rebuild reached the target's triggers"
+    );
+    assert_eq!(
+        tree_xact_changes("rbn1_dep") - before,
+        0,
+        "no-op rebuild reached the dependent"
+    );
+}
+
+/// NULL-key rows changed, missing and phantom: each is applied as exactly one
+/// UPDATE / INSERT / DELETE of that key, and the dependent follows.
+#[pg_test]
+fn pg_rbd_keyed_null_key_changes_are_exact() {
+    rbn_up_and_dep("rbn2");
+    Spi::run("UPDATE rbn2_up SET v = v + 1000 WHERE p IS NULL AND l = 2").expect("changed");
+    Spi::run("DELETE FROM rbn2_up WHERE p IS NULL AND l IS NULL").expect("missing");
+    Spi::run("INSERT INTO rbn2_up VALUES (1001, NULL, 7)").expect("phantom");
+    Spi::run("TRUNCATE rbn2_seen").expect("reset");
+    let before = tree_xact_changes("rbn2_dep");
+    assert_eq!(
+        rbd_rebuild("rbn2_up", &rbn_sql(RBN_UP_SQL, "rbn2")),
+        "DIFFED"
+    );
+    assert_imv_correct("rbn2_up", &rbn_sql(RBN_UP_SQL, "rbn2"));
+    assert_imv_correct(
+        "rbn2_dep",
+        &rbn_sql(RBN_DEP_SQL, "rbn2").replace("rbn2_up", "rbn2_src"),
+    );
+    assert_eq!(
+        rbn_seen("rbn2").as_deref(),
+        Some("DELETE:1001/-,INSERT:-/-,UPDATE:-/2"),
+        "target must see exactly the drifted NULL-key rows"
+    );
+    assert!(
+        tree_xact_changes("rbn2_dep") - before <= 6,
+        "dependent rewritten beyond the NULL group and group 1001"
+    );
+}
+
+/// A second unique index on the target: a rebuild swapping two rows' values on
+/// it must not trip its per-row uniqueness check mid-statement.
+#[pg_test]
+fn pg_rbd_second_unique_index_value_swap() {
+    let rebuilt =
+        "SELECT id, CASE id WHEN 1 THEN 2 WHEN 2 THEN 1 ELSE code END AS code FROM rbs_src";
+    Spi::run("CREATE TABLE rbs_src (id INT PRIMARY KEY, code INT NOT NULL)").expect("src");
+    Spi::run("INSERT INTO rbs_src SELECT g, g FROM generate_series(1, 10) g").expect("seed");
+    assert_eq!(
+        crate::create_reflex_ivm(
+            "rbs_up",
+            "SELECT id, code FROM rbs_src",
+            Some("id"),
+            None,
+            None,
+            None
+        ),
+        "CREATE REFLEX INCREMENTAL VIEW"
+    );
+    Spi::run("CREATE UNIQUE INDEX rbs_up_code ON rbs_up (code)").expect("second unique");
+    assert_eq!(
+        crate::create_reflex_ivm(
+            "rbs_dep",
+            "SELECT id, code FROM rbs_up",
+            None,
+            None,
+            None,
+            None
+        ),
+        "CREATE REFLEX INCREMENTAL VIEW"
+    );
+    assert_eq!(rbd_rebuild("rbs_up", rebuilt), "DIFFED");
+    assert_imv_correct("rbs_up", rebuilt);
+    assert_imv_correct("rbs_dep", rebuilt);
+}
+
+/// Matching NULL keys as one-element arrays cannot tell a NULL array from an
+/// empty one, so a key over a nullable array column must not be used: the
+/// rebuild would cross-update (NULL, NULL) and (NULL, '{}').
+#[pg_test]
+fn pg_rbd_nullable_array_key_is_not_matched_as_array() {
+    let up_sql = "SELECT a, tags, v FROM rba_src";
+    Spi::run(
+        "CREATE TABLE rba_src (a INT, tags INT[], v INT, UNIQUE NULLS NOT DISTINCT (a, tags))",
+    )
+    .expect("src");
+    Spi::run("INSERT INTO rba_src VALUES (NULL, NULL, 1), (NULL, '{}', 2), (1, '{1}', 3)")
+        .expect("seed");
+    assert_eq!(
+        crate::create_reflex_ivm("rba_up", up_sql, Some("a, tags"), None, None, None),
+        "CREATE REFLEX INCREMENTAL VIEW"
+    );
+    assert_eq!(
+        crate::create_reflex_ivm(
+            "rba_dep",
+            "SELECT v, COUNT(*) AS n FROM rba_up GROUP BY v",
+            None,
+            None,
+            None,
+            None
+        ),
+        "CREATE REFLEX INCREMENTAL VIEW"
+    );
+    assert_eq!(rbd_rebuild("rba_up", up_sql), "DIFFED");
+    assert_imv_correct("rba_up", up_sql);
+    assert_imv_correct("rba_dep", "SELECT v, COUNT(*) AS n FROM rba_src GROUP BY v");
+}
+
+/// Statistics taken before the NULL-key rows arrived make the planner expect
+/// none, and a nested loop over the (unindexable) NULL-key match is then
+/// quadratic: the diff must stay hash / merge joined whatever the estimates.
+#[pg_test]
+fn pg_rbd_null_key_match_survives_stale_statistics() {
+    Spi::run("CREATE TABLE rbe_src (a INT, b INT, v INT, UNIQUE NULLS NOT DISTINCT (a, b))")
+        .expect("src");
+    Spi::run("INSERT INTO rbe_src SELECT g, g % 3, g FROM generate_series(1, 10000) g")
+        .expect("seed");
+    assert_eq!(
+        crate::create_reflex_ivm(
+            "rbe_up",
+            "SELECT a, b, v FROM rbe_src",
+            Some("a, b"),
+            None,
+            None,
+            None
+        ),
+        "CREATE REFLEX INCREMENTAL VIEW"
+    );
+    assert_eq!(
+        crate::create_reflex_ivm(
+            "rbe_dep",
+            "SELECT b, SUM(v) AS s FROM rbe_up GROUP BY b",
+            None,
+            None,
+            None,
+            None
+        ),
+        "CREATE REFLEX INCREMENTAL VIEW"
+    );
+    Spi::run("ANALYZE rbe_up").expect("stats without NULL keys");
+    Spi::run("INSERT INTO rbe_src SELECT g, NULL, g FROM generate_series(1, 10000) g")
+        .expect("NULL-key rows");
+    let rebuilt = "SELECT a, b, v + (b IS NULL)::int AS v FROM rbe_src";
+    let started = std::time::Instant::now();
+    assert_eq!(rbd_rebuild("rbe_up", rebuilt), "DIFFED");
+    let elapsed = started.elapsed();
+    assert_imv_correct("rbe_up", rebuilt);
+    assert_eq!(
+        Spi::get_one::<String>("SHOW enable_nestloop")
+            .unwrap()
+            .unwrap(),
+        "on",
+        "caller's enable_nestloop not restored"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "NULL-key diff took {elapsed:?}: quadratic join plan"
+    );
+}
