@@ -135,6 +135,323 @@ pub(crate) fn record_rebuild_watermark(client: &mut pgrx::spi::SpiClient<'_>, vi
 /// through `reflex_reconcile` ([`rebuild_for_cross_source_guard`]).
 const COMMIT_REBUILD_OF_GUC: &str = "pg_reflex.commit_rebuild_of";
 
+/// Transaction-local setting holding `pg_trigger_depth()` of the pg_reflex flush
+/// running now (a COMMIT-time constraint trigger, or a direct call).
+const FLUSH_DEPTH_GUC: &str = "pg_reflex.flush_trigger_depth";
+
+/// Transaction-local setting naming the DEFERRED IMV whose staged delta the
+/// flush is applying now.
+const FLUSHING_IMV_GUC: &str = "pg_reflex.flushing_imv";
+
+fn set_local_setting(name: &str, value: &str) {
+    Spi::get_one_with_args::<String>(
+        "SELECT set_config($1, $2, true)",
+        &[
+            unsafe { DatumWithOid::new(name.to_string(), PgBuiltInOids::TEXTOID.oid().value()) },
+            unsafe { DatumWithOid::new(value.to_string(), PgBuiltInOids::TEXTOID.oid().value()) },
+        ],
+    )
+    .unwrap_or_report();
+}
+
+/// Runs a pg_reflex flush, recording its trigger depth: a trigger fired deeper
+/// than it belongs to a statement still in flight ([`statement_may_still_stage`]).
+pub(crate) fn run_as_flush<T>(flush: impl FnOnce() -> T) -> T {
+    let previous = Spi::get_one_with_args::<String>(
+        "SELECT COALESCE(current_setting($1, true), '')",
+        &[unsafe { DatumWithOid::new(FLUSH_DEPTH_GUC, PgBuiltInOids::TEXTOID.oid().value()) }],
+    )
+    .unwrap_or(None)
+    .unwrap_or_default();
+    let depth = Spi::get_one::<i32>("SELECT pg_trigger_depth()")
+        .unwrap_or(None)
+        .unwrap_or(0);
+    set_local_setting(FLUSH_DEPTH_GUC, &depth.to_string());
+    let result = flush();
+    set_local_setting(FLUSH_DEPTH_GUC, &previous);
+    result
+}
+
+/// Whether this runs inside a trigger of a statement that may still stage a
+/// delta: a source's staging trigger maintains the IMMEDIATE IMVs before it
+/// stages the DEFERRED ones' delta, so anything reached from that maintenance
+/// reads the statement's write before it is staged. A pg_reflex flush (at
+/// COMMIT, or called directly) runs after its statements; only a trigger fired
+/// deeper than it is in flight.
+fn statement_may_still_stage() -> bool {
+    Spi::get_one_with_args::<bool>(
+        "SELECT pg_trigger_depth() > COALESCE(NULLIF(current_setting($1, true), '')::int, 0)",
+        &[unsafe { DatumWithOid::new(FLUSH_DEPTH_GUC, PgBuiltInOids::TEXTOID.oid().value()) }],
+    )
+    .unwrap_or(None)
+    .unwrap_or(true)
+}
+
+/// Whether a partition- or key-scoped rebuild of `view_name` must be left to
+/// the COMMIT-time reconcile: a DEFERRED IMV rebuilt while a statement may still
+/// stage a delta for it ([`statement_may_still_stage`]), which a watermark taken
+/// now would apply on top of the rebuild. Not inside the flush of the IMV's own
+/// delta (its hot-partition dispatch), which consumes that delta.
+pub(crate) fn scoped_rebuild_waits_for_commit(view_name: &str) -> bool {
+    Spi::get_one_with_args::<bool>(
+        "SELECT COALESCE(r.refresh_mode, 'IMMEDIATE') = 'DEFERRED' AND r.enabled \
+           AND NOT COALESCE(r.is_generated_sub_imv, FALSE) \
+           AND current_setting($2, true) IS DISTINCT FROM r.name \
+           AND current_setting($3, true) IS DISTINCT FROM r.name \
+         FROM public.__reflex_ivm_reference r WHERE r.name = $1",
+        &[
+            unsafe {
+                DatumWithOid::new(view_name.to_string(), PgBuiltInOids::TEXTOID.oid().value())
+            },
+            unsafe { DatumWithOid::new(FLUSHING_IMV_GUC, PgBuiltInOids::TEXTOID.oid().value()) },
+            unsafe {
+                DatumWithOid::new(COMMIT_REBUILD_OF_GUC, PgBuiltInOids::TEXTOID.oid().value())
+            },
+        ],
+    )
+    .unwrap_or(None)
+    .unwrap_or(false)
+        && statement_may_still_stage()
+        && observed_source(view_name).is_some()
+}
+
+/// The slice of an IMV a scoped rebuild recomputes from its sources.
+pub(crate) enum RebuiltSlice<'a> {
+    /// The anchor's partitions (bare names) the rebuilt mirror leaves mirror.
+    SourcePartitions(&'a [String]),
+    /// The groups whose `column` is one of `literals` (SQL literals, comma-separated).
+    Keys { column: &'a str, literals: &'a str },
+}
+
+/// Transaction-local record of the partition- and key-scoped rebuilds of
+/// DEFERRED IMVs: a delta staged on `source` before the rebuild at `watermark`
+/// whose row satisfies `rebuilt` is reflected by it and skipped by the flush.
+const SCOPED_REBUILDS_TABLE_DDL: &str =
+    "CREATE TEMP TABLE IF NOT EXISTS __reflex_deferred_scoped_rebuilds \
+     (name TEXT NOT NULL, source TEXT NOT NULL, rebuilt TEXT NOT NULL, \
+      watermark BIGINT NOT NULL, watermark_xid xid NOT NULL) ON COMMIT DROP";
+
+/// Called by a partition- or key-scoped rebuild of `view_name` just before it
+/// reads its sources. The rebuilt slice already reflects every delta this
+/// transaction staged for it, so for a DEFERRED IMV with staged deltas:
+///
+/// * when the IMV reads one table once (`depends_on` holds one entry per read,
+///   so a join, self-join or subquery has several) and observes it, a staged
+///   row lands in the slice exactly when it satisfies the slice's predicate on
+///   its own columns: the rebuild is recorded with its watermark and the flush
+///   skips the earlier staged rows in the slice ([`scoped_rebuild_exclusion`]);
+/// * otherwise a staged row's slice cannot be told from the row (the partition
+///   column comes from a joined table, another source's row reaches every
+///   slice): returns `true`, and the caller lists the IMV for the COMMIT-time
+///   full reconcile once the scoped rebuild succeeded.
+pub(crate) fn guard_scoped_rebuild(
+    client: &mut pgrx::spi::SpiClient<'_>,
+    view_name: &str,
+    slice: RebuiltSlice<'_>,
+) -> bool {
+    let registry = client
+        .select(
+            "SELECT COALESCE(refresh_mode, 'IMMEDIATE') = 'DEFERRED' \
+                      AND current_setting($2, true) IS DISTINCT FROM name AS guarded, \
+                    depends_on \
+             FROM public.__reflex_ivm_reference WHERE name = $1",
+            None,
+            &[
+                unsafe {
+                    DatumWithOid::new(view_name.to_string(), PgBuiltInOids::TEXTOID.oid().value())
+                },
+                unsafe {
+                    DatumWithOid::new(FLUSHING_IMV_GUC, PgBuiltInOids::TEXTOID.oid().value())
+                },
+            ],
+        )
+        .unwrap_or_report()
+        .next()
+        .map(|row| {
+            (
+                row.get_by_name::<bool, _>("guarded")
+                    .unwrap_or(None)
+                    .unwrap_or(false),
+                row.get_by_name::<Vec<String>, _>("depends_on")
+                    .unwrap_or(None)
+                    .unwrap_or_default(),
+            )
+        });
+    let Some((true, depends_on)) = registry else {
+        return false;
+    };
+    let observed = observed_sources(client, view_name);
+    if !observed
+        .iter()
+        .any(|source| staged_by_this_xact(client, &staging_delta_table_name(source)))
+    {
+        return false;
+    }
+    let rebuilt = match (depends_on.as_slice(), observed.as_slice()) {
+        ([source], [observed_source]) if source == observed_source => {
+            slice_predicate(client, source, &slice).map(|predicate| (source.clone(), predicate))
+        }
+        _ => None,
+    };
+    let Some((source, predicate)) = rebuilt else {
+        return true;
+    };
+    ensure_temp_table(
+        client,
+        "__reflex_deferred_scoped_rebuilds",
+        SCOPED_REBUILDS_TABLE_DDL,
+    );
+    let watermark = Watermark::now();
+    client
+        .update(
+            "INSERT INTO pg_temp.__reflex_deferred_scoped_rebuilds \
+               (name, source, rebuilt, watermark, watermark_xid) \
+             VALUES ($1, $2, $3, $4, $5::text::xid)",
+            None,
+            &[
+                unsafe {
+                    DatumWithOid::new(view_name.to_string(), PgBuiltInOids::TEXTOID.oid().value())
+                },
+                unsafe { DatumWithOid::new(source, PgBuiltInOids::TEXTOID.oid().value()) },
+                unsafe { DatumWithOid::new(predicate, PgBuiltInOids::TEXTOID.oid().value()) },
+                unsafe {
+                    DatumWithOid::new(watermark.command, PgBuiltInOids::INT8OID.oid().value())
+                },
+                unsafe {
+                    DatumWithOid::new(
+                        watermark.next_xid.to_string(),
+                        PgBuiltInOids::TEXTOID.oid().value(),
+                    )
+                },
+            ],
+        )
+        .unwrap_or_report();
+    false
+}
+
+/// The slice as a predicate over a row of `source`'s staging table, or `None`
+/// when it cannot be written.
+fn slice_predicate(
+    client: &pgrx::spi::SpiClient<'_>,
+    source: &str,
+    slice: &RebuiltSlice<'_>,
+) -> Option<String> {
+    match slice {
+        RebuiltSlice::SourcePartitions(partitions) => {
+            let mut constraints = Vec::new();
+            for partition in partitions.iter() {
+                let found: Vec<Option<String>> = client
+                    .select(
+                        "SELECT pg_get_partition_constraintdef(t.relid) AS def \
+                         FROM pg_partition_tree(to_regclass($1)) t \
+                         JOIN pg_class c ON c.oid = t.relid \
+                         WHERE c.relname = $2 AND t.level > 0",
+                        None,
+                        &[
+                            unsafe {
+                                DatumWithOid::new(
+                                    source.to_string(),
+                                    PgBuiltInOids::TEXTOID.oid().value(),
+                                )
+                            },
+                            unsafe {
+                                DatumWithOid::new(
+                                    partition.clone(),
+                                    PgBuiltInOids::TEXTOID.oid().value(),
+                                )
+                            },
+                        ],
+                    )
+                    .ok()?
+                    .map(|row| row.get_by_name::<String, _>("def").unwrap_or(None))
+                    .collect();
+                match found.as_slice() {
+                    [Some(def)] if !def.is_empty() => constraints.push(format!("({def})")),
+                    _ => return None,
+                }
+            }
+            (!constraints.is_empty()).then(|| constraints.join(" OR "))
+        }
+        RebuiltSlice::Keys { column, literals } => {
+            let is_column = client
+                .select(
+                    "SELECT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = to_regclass($1) \
+                       AND attname = $2 AND attnum > 0 AND NOT attisdropped)",
+                    None,
+                    &[
+                        unsafe {
+                            DatumWithOid::new(
+                                source.to_string(),
+                                PgBuiltInOids::TEXTOID.oid().value(),
+                            )
+                        },
+                        unsafe {
+                            DatumWithOid::new(
+                                column.to_string(),
+                                PgBuiltInOids::TEXTOID.oid().value(),
+                            )
+                        },
+                    ],
+                )
+                .ok()?
+                .first()
+                .get_one::<bool>()
+                .ok()
+                .flatten()
+                .unwrap_or(false);
+            is_column.then(|| format!("\"{}\" IN ({literals})", column.replace('"', "\"\"")))
+        }
+    }
+}
+
+/// The scoped rebuilds of `imv_name` recorded on `source` in this transaction.
+fn scoped_rebuilds_of(
+    client: &pgrx::spi::SpiClient<'_>,
+    imv_name: &str,
+    source: &str,
+) -> Vec<(Watermark, String)> {
+    if temp_table_names(client, "__reflex_deferred_scoped_rebuilds").is_empty() {
+        return Vec::new();
+    }
+    client
+        .select(
+            "SELECT watermark, watermark_xid::text::bigint AS watermark_xid, rebuilt \
+             FROM pg_temp.__reflex_deferred_scoped_rebuilds WHERE name = $1 AND source = $2",
+            None,
+            &[
+                unsafe {
+                    DatumWithOid::new(imv_name.to_string(), PgBuiltInOids::TEXTOID.oid().value())
+                },
+                unsafe {
+                    DatumWithOid::new(source.to_string(), PgBuiltInOids::TEXTOID.oid().value())
+                },
+            ],
+        )
+        .unwrap_or_report()
+        .filter_map(|row| {
+            let command = row.get_by_name::<i64, _>("watermark").unwrap_or(None)?;
+            let next_xid = row.get_by_name::<i64, _>("watermark_xid").unwrap_or(None)?;
+            let rebuilt = row.get_by_name::<String, _>("rebuilt").unwrap_or(None)?;
+            Some((
+                Watermark {
+                    command,
+                    next_xid: next_xid as u32,
+                },
+                rebuilt,
+            ))
+        })
+        .collect()
+}
+
+/// Keeps a staged row unless it was staged before the scoped rebuild at
+/// `watermark` and lies in the slice it rebuilt (`rebuilt`).
+fn scoped_rebuild_exclusion(watermark: Watermark, rebuilt: &str) -> String {
+    format!(
+        "NOT (NOT ({after}) AND COALESCE(({rebuilt}), FALSE))",
+        after = watermark.after_rebuild_predicate()
+    )
+}
+
 /// Whether a reconcile of `view_name` must be left to the COMMIT-time rebuild
 /// pass instead of rebuilding it now.
 ///
@@ -154,7 +471,7 @@ const COMMIT_REBUILD_OF_GUC: &str = "pg_reflex.commit_rebuild_of";
 /// (the cross-source guard's contract), which a dispatch-driven rebuild must.
 pub(crate) fn reconcile_waits_for_commit(view_name: &str) -> bool {
     Spi::get_one_with_args::<bool>(
-        "SELECT COALESCE(r.refresh_mode, 'IMMEDIATE') = 'DEFERRED' \
+        "SELECT COALESCE(r.refresh_mode, 'IMMEDIATE') = 'DEFERRED' AND r.enabled \
            AND NOT COALESCE(r.is_generated_sub_imv, FALSE) \
            AND pg_trigger_depth() > 0 \
            AND current_setting($2, true) IS DISTINCT FROM r.name \
@@ -274,15 +591,6 @@ impl Watermark {
             self.next_xid
         )
     }
-}
-
-/// The rows of `delta_tbl` staged after the rebuild at `watermark`. Applied only
-/// when none of them is ambiguous, so all of them have `xmax = 0`.
-fn delta_staged_after(delta_tbl: &str, watermark: Watermark) -> String {
-    format!(
-        "(SELECT * FROM {delta_tbl} WHERE {}) __reflex_post",
-        watermark.after_rebuild_predicate()
-    )
 }
 
 fn delta_has_rows(client: &pgrx::spi::SpiClient<'_>, delta_tbl: &str, predicate: &str) -> bool {
@@ -664,6 +972,18 @@ fn rebuild_listed(
             continue;
         }
         let imv_esc = imv_name.replace('\'', "''");
+        if listed_for_reconcile_but_disabled(client, imv_name) {
+            client
+                .update(
+                    &format!(
+                        "DELETE FROM pg_temp.__reflex_deferred_rebuild WHERE name = '{imv_esc}'"
+                    ),
+                    None,
+                    &[],
+                )
+                .unwrap_or_report();
+            continue;
+        }
         let awaiting_rebuild: Vec<String> = listed
             .iter()
             .filter(|n| !already_rebuilt.contains(n))
@@ -783,6 +1103,7 @@ fn rebuild_listed(
         } else {
             format!(
                 "EXCEPTION WHEN OTHERS THEN \
+                   PERFORM pg_advisory_xact_lock(hashtext('{imv_esc}'), hashtext(reverse('{imv_esc}'))); \
                    RAISE WARNING 'pg_reflex: IMV % rebuild after source TRUNCATE failed: % (SQLSTATE %)', \
                      '{imv_esc}', SQLERRM, SQLSTATE; \
                    UPDATE public.__reflex_ivm_reference \
@@ -810,6 +1131,28 @@ fn rebuild_listed(
         rebuilt += 1;
     }
     (rebuilt, postponed)
+}
+
+/// A disabled IMV gets no maintenance and `reflex_reconcile` refuses it: one
+/// listed for the COMMIT-time reconcile and disabled since is dropped from the
+/// list, not flagged stale by a refusal.
+fn listed_for_reconcile_but_disabled(client: &pgrx::spi::SpiClient<'_>, imv_name: &str) -> bool {
+    client
+        .select(
+            "SELECT b.reconcile AND NOT COALESCE(r.enabled, FALSE) \
+             FROM pg_temp.__reflex_deferred_rebuild b \
+             LEFT JOIN public.__reflex_ivm_reference r ON r.name = b.name \
+             WHERE b.name = $1",
+            None,
+            &[unsafe {
+                DatumWithOid::new(imv_name.to_string(), PgBuiltInOids::TEXTOID.oid().value())
+            }],
+        )
+        .unwrap_or_report()
+        .first()
+        .get_one::<bool>()
+        .unwrap_or(None)
+        .unwrap_or(false)
 }
 
 /// Rebuilds an IMV the cross-source guard listed, through `reflex_reconcile`
@@ -912,10 +1255,12 @@ fn rebuild_for_cross_source_guard(
 pub fn reflex_flush_deferred(source_table: &str) -> String {
     // Before: a rebuilt IMV skips this flush's delta. After: this flush may have
     // settled an upstream IMV a postponed rebuild was waiting for.
-    Spi::connect_mut(rebuild_truncated_imvs);
-    let flushed = flush_staged_deltas(source_table);
-    Spi::connect_mut(rebuild_truncated_imvs);
-    flushed
+    run_as_flush(|| {
+        Spi::connect_mut(rebuild_truncated_imvs);
+        let flushed = flush_staged_deltas(source_table);
+        Spi::connect_mut(rebuild_truncated_imvs);
+        flushed
+    })
 }
 
 fn flush_staged_deltas(source_table: &str) -> String {
@@ -1251,10 +1596,13 @@ fn flush_staged_deltas(source_table: &str) -> String {
         // A delta that nets to nothing as a whole need not for an IMV rebuilt in
         // this transaction: it takes only the rows staged after its rebuild.
         let any_rebuilt_here = is_spurious
-            && marker_exists
-            && imvs
-                .iter()
-                .any(|imv| rebuild_watermark_of(client, &imv.0).is_some());
+            && ((marker_exists
+                && imvs
+                    .iter()
+                    .any(|imv| rebuild_watermark_of(client, &imv.0).is_some()))
+                || imvs
+                    .iter()
+                    .any(|imv| !scoped_rebuilds_of(client, &imv.0, source_table).is_empty()));
         if is_spurious && !any_rebuilt_here {
             // No IMV processing. Clean up the staging delta and pending rows.
             // DELETE (not TRUNCATE) — see end-of-function comment.
@@ -1325,6 +1673,8 @@ fn flush_staged_deltas(source_table: &str) -> String {
 
         for (imv_name, base_query, end_query, agg_json, where_pred) in &imvs {
             let mut delta_rel = delta_tbl.clone();
+            let scoped = scoped_rebuilds_of(client, imv_name, source_table);
+            let mut row_filters: Vec<String> = Vec::new();
             if engage_cross_source_guard {
                 let imv_esc = imv_name.replace('\'', "''");
                 if let Some(watermark) = rebuild_watermark_of(client, imv_name) {
@@ -1371,9 +1721,9 @@ fn flush_staged_deltas(source_table: &str) -> String {
                         total_processed += 1;
                         continue;
                     }
-                    delta_rel = delta_staged_after(&delta_tbl, watermark);
+                    row_filters.push(watermark.after_rebuild_predicate());
                 } else {
-                    if is_spurious {
+                    if is_spurious && scoped.is_empty() {
                         continue;
                     }
                     if temp_table_names(client, "__reflex_deferred_rebuild").contains(imv_name) {
@@ -1436,6 +1786,60 @@ fn flush_staged_deltas(source_table: &str) -> String {
                         continue;
                     }
                 }
+            }
+            if !scoped.is_empty() {
+                // Partition- or key-scoped rebuilds of this IMV in this
+                // transaction: the rows staged before one of them in its slice
+                // are in it. A row that cannot be placed relative to the
+                // rebuild is never applied incrementally: rebuild it again.
+                let ambiguous = scoped.iter().any(|(watermark, rebuilt)| {
+                    delta_has_rows(
+                        client,
+                        &delta_tbl,
+                        &format!(
+                            "{} AND COALESCE(({rebuilt}), FALSE)",
+                            watermark.ambiguous_predicate()
+                        ),
+                    )
+                });
+                if ambiguous {
+                    ensure_temp_table(
+                        client,
+                        "__reflex_deferred_rebuild",
+                        crate::trigger::DEFERRED_REBUILD_TABLE_DDL,
+                    );
+                    let imv_esc = imv_name.replace('\'', "''");
+                    client
+                        .update(&rearm_rebuild_sql(imv_name), None, &[])
+                        .unwrap_or_report();
+                    client
+                        .update(
+                            &format!(
+                                "INSERT INTO pg_temp.__reflex_deferred_rebuild (name, reconcile) \
+                                 VALUES ('{imv_esc}', TRUE) \
+                                 ON CONFLICT (name) DO UPDATE SET reconcile = TRUE, attempts = 0"
+                            ),
+                            None,
+                            &[],
+                        )
+                        .unwrap_or_report();
+                    total_processed += 1;
+                    continue;
+                }
+                row_filters.extend(
+                    scoped
+                        .iter()
+                        .map(|(watermark, rebuilt)| scoped_rebuild_exclusion(*watermark, rebuilt)),
+                );
+            }
+            if !row_filters.is_empty() {
+                let filter = row_filters.join(" AND ");
+                if !delta_has_rows(client, &delta_tbl, &filter) {
+                    continue;
+                }
+                delta_rel = format!("(SELECT * FROM {delta_tbl} WHERE {filter}) __reflex_post");
+            } else if is_spurious {
+                continue;
             }
             // 1.4.5 — Skip this IMV iff NO staged row matches the
             // predicate, on either side of the delta. The 1.4.4 check
@@ -1696,11 +2100,15 @@ fn flush_staged_deltas(source_table: &str) -> String {
             // durable public.__reflex_event_log row — itself guarded by a
             // nested BEGIN…EXCEPTION WHEN OTHERS THEN NULL so a logging
             // failure can never mask the real error or abort the cascade.
+            // The rolled-back block released the IMV lock taken inside it, so
+            // the handler takes it again before its registry write.
             let exception_clause = if fail_hard {
                 String::new()
             } else {
                 format!(
                     "EXCEPTION WHEN OTHERS THEN \
+                       PERFORM pg_advisory_xact_lock(hashtext('{imv_name_esc}'), \
+                                                     hashtext(reverse('{imv_name_esc}'))); \
                        PERFORM set_config('application_name', COALESCE(_prev_app, ''), true); \
                        RAISE WARNING 'pg_reflex: IMV % flush failed at cascade: % (SQLSTATE %)', \
                          '{imv_name_esc}', SQLERRM, SQLSTATE; \
@@ -1737,7 +2145,9 @@ fn flush_staged_deltas(source_table: &str) -> String {
                 success_body = success_body,
                 exception_clause = exception_clause,
             );
+            set_local_setting(FLUSHING_IMV_GUC, imv_name);
             client.update(&do_block, None, &[]).unwrap_or_report();
+            set_local_setting(FLUSHING_IMV_GUC, "");
 
             if had_stmts {
                 total_processed += 1;
