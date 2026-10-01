@@ -42,6 +42,11 @@ use crate::query_decomposer::normalized_column_name;
 /// crossover is closer to 0.15.
 pub(crate) const WIPE_THRESHOLD_DEFAULT: f64 = 0.5;
 
+/// Default when the IMV has dependents: a rebuild is handed to them as a row
+/// diff, so a partial rebuild is cheaper than a wholesale one and the
+/// incremental path is preferred for longer.
+pub(crate) const WIPE_THRESHOLD_WITH_DEPENDENTS_DEFAULT: f64 = 0.9;
+
 /// Render a list of statements as PL/pgSQL `EXECUTE` lines, one per statement,
 /// each dollar-quoted with `$reflex_inner$` (any occurrence of that tag inside
 /// the statement is rewritten so it cannot terminate the quote early).
@@ -134,7 +139,7 @@ pub(crate) fn build_high_selectivity_dispatch_sql(
              -- instance serves IMVs with shape-divergent crossovers.\n\
              SELECT wipe_threshold INTO _per_imv\n\
                  FROM public.__reflex_ivm_reference WHERE name = '{view}';\n\
-             _thr := COALESCE(_per_imv, current_setting('reflex.wipe_threshold', true)::NUMERIC, {default_thr});\n\
+             _thr := COALESCE(_per_imv, current_setting('reflex.wipe_threshold', true)::NUMERIC, CASE WHEN public.__reflex_target_propagates('{view}') THEN {dep_thr} ELSE {default_thr} END);\n\
              _ratio := _aff::NUMERIC / _imm;\n\
              IF _ratio >= _thr THEN\n\
                  -- High-selectivity path — delegate to reflex_reconcile,\n\
@@ -166,6 +171,7 @@ pub(crate) fn build_high_selectivity_dispatch_sql(
         intermediate = intermediate_tbl,
         view = safe_view,
         default_thr = WIPE_THRESHOLD_DEFAULT,
+        dep_thr = WIPE_THRESHOLD_WITH_DEPENDENTS_DEFAULT,
         merge_execs = merge_execs,
         dead_cleanup = dead_cleanup,
         tdel = safe_tdel,
@@ -271,11 +277,12 @@ pub(crate) fn build_partition_aware_dispatch_sql_strategy(
              _hot_keys TEXT[] := ARRAY[]::TEXT[];\n\
              _hot_child_names TEXT[] := ARRAY[]::TEXT[];\n\
              _hot_count INT;\n\
+             _r TEXT;\n\
              _partition_total INT;\n\
          BEGIN\n\
              SELECT wipe_threshold, wipe_floor_rows INTO _per_imv, _per_imv_floor\n\
                  FROM public.__reflex_ivm_reference WHERE name = '{view}';\n\
-             _thr   := COALESCE(_per_imv, current_setting('reflex.wipe_threshold', true)::NUMERIC, {default_thr});\n\
+             _thr   := COALESCE(_per_imv, current_setting('reflex.wipe_threshold', true)::NUMERIC, CASE WHEN public.__reflex_target_propagates('{view}') THEN {dep_thr} ELSE {default_thr} END);\n\
              _floor := COALESCE(_per_imv_floor, NULLIF(current_setting('reflex.wipe_floor_rows', true), '')::BIGINT, {default_floor});\n\
              -- Per-partition dirty counts from the already-populated\n\
              -- affected table (GROUP BY partition_col).\n\
@@ -324,7 +331,7 @@ pub(crate) fn build_partition_aware_dispatch_sql_strategy(
              ),\n\
              classified AS (\n\
                  SELECT pc.rep_key, pc.child_oid::text AS child_name,\n\
-                        (pc.dirty::NUMERIC / GREATEST(c.reltuples::NUMERIC, _floor::NUMERIC) >= _thr) AS hot\n\
+                        (pc.dirty::NUMERIC / GREATEST(public.__reflex_rebuild_cost_rows('{view}', pc.child_oid)::NUMERIC, _floor::NUMERIC) >= _thr) AS hot\n\
                  FROM per_child pc JOIN pg_class c ON c.oid = pc.child_oid\n\
              )\n\
              SELECT COALESCE(array_agg(rep_key::text) FILTER (WHERE hot), ARRAY[]::TEXT[]),\n\
@@ -337,13 +344,15 @@ pub(crate) fn build_partition_aware_dispatch_sql_strategy(
              -- is worse than one full reconcile.\n\
              IF _hot_count > _partition_total / 2 THEN\n\
                  RAISE DEBUG 'pg_reflex partition dispatch: % hot of % partitions for %, fallback global', _hot_count, _partition_total, '{view}';\n\
-                 PERFORM public.reflex_reconcile('{view}');\n\
+                 _r := public.reflex_reconcile('{view}');\n\
+                 IF _r LIKE 'ERROR%' THEN RAISE EXCEPTION 'pg_reflex: trip-cap rebuild of % failed: %', '{view}', _r; END IF;\n\
                  RETURN;\n\
              END IF;\n\
              -- Hot partitions: atomic-swap reconcile.\n\
              IF _hot_count > 0 THEN\n\
                  RAISE DEBUG 'pg_reflex partition dispatch: % hot partitions for % → reflex_reconcile_partition', _hot_count, '{view}';\n\
-                 PERFORM public.reflex_reconcile_partition('{view}', array_to_string(_hot_keys, ','));\n\
+                 _r := public.reflex_reconcile_partition('{view}', array_to_string(_hot_keys, ','));\n\
+                 IF _r LIKE 'ERROR%' THEN RAISE EXCEPTION 'pg_reflex: hot-partition rebuild of % failed: %', '{view}', _r; END IF;\n\
              END IF;\n\
              -- Cold partitions: standard MERGE + target sync, restricted\n\
              -- by the strategy-specific partition filter the caller spliced in.\n\
@@ -361,6 +370,7 @@ pub(crate) fn build_partition_aware_dispatch_sql_strategy(
         part_col = safe_part_col,
         part_col_lit = safe_part_col_lit,
         default_thr = WIPE_THRESHOLD_DEFAULT,
+        dep_thr = WIPE_THRESHOLD_WITH_DEPENDENTS_DEFAULT,
         default_floor = WIPE_FLOOR_ROWS_DEFAULT,
         merge_execs = merge_execs,
         dead_cleanup = dead_cleanup,
@@ -513,11 +523,12 @@ pub(crate) fn build_passthrough_partition_dispatch_sql(
              _cold_keys TEXT[] := ARRAY[]::TEXT[];\n\
              _part_type TEXT;\n\
              _hot_count INT;\n\
+             _r TEXT;\n\
              _partition_total INT;\n\
          BEGIN\n\
              SELECT wipe_threshold, wipe_floor_rows INTO _per_imv, _per_imv_floor\n\
                  FROM public.__reflex_ivm_reference WHERE name = '{view}';\n\
-             _thr   := COALESCE(_per_imv, current_setting('reflex.wipe_threshold', true)::NUMERIC, {default_thr});\n\
+             _thr   := COALESCE(_per_imv, current_setting('reflex.wipe_threshold', true)::NUMERIC, CASE WHEN public.__reflex_target_propagates('{view}') THEN {dep_thr} ELSE {default_thr} END);\n\
              _floor := COALESCE(_per_imv_floor, NULLIF(current_setting('reflex.wipe_floor_rows', true), '')::BIGINT, {default_floor});\n\
              SELECT count(*) INTO _partition_total\n\
                  FROM pg_inherits WHERE inhparent = '{parent}'::regclass;\n\
@@ -551,7 +562,7 @@ pub(crate) fn build_passthrough_partition_dispatch_sql(
              ),\n\
              classified AS (\n\
                  SELECT pc.rep_key, pc.child_oid::text AS child_name,\n\
-                        (pc.dirty::NUMERIC / GREATEST(c.reltuples::NUMERIC, _floor::NUMERIC) >= _thr) AS hot\n\
+                        (pc.dirty::NUMERIC / GREATEST(public.__reflex_rebuild_cost_rows('{view}', pc.child_oid)::NUMERIC, _floor::NUMERIC) >= _thr) AS hot\n\
                  FROM per_child pc JOIN pg_class c ON c.oid = pc.child_oid\n\
              )\n\
              SELECT COALESCE(array_agg(rep_key::text) FILTER (WHERE hot), ARRAY[]::TEXT[]),\n\
@@ -565,12 +576,14 @@ pub(crate) fn build_passthrough_partition_dispatch_sql(
                  WHERE attrelid = '{parent}'::regclass AND attname = '{part_col_lit}' AND attnum > 0;\n\
              -- Trip-cap: swapping > half the partitions costs more than one full reconcile.\n\
              IF _hot_count > _partition_total / 2 THEN\n\
-                 PERFORM public.reflex_reconcile('{view}');\n\
+                 _r := public.reflex_reconcile('{view}');\n\
+                 IF _r LIKE 'ERROR%' THEN RAISE EXCEPTION 'pg_reflex: trip-cap rebuild of % failed: %', '{view}', _r; END IF;\n\
                  RETURN;\n\
              END IF;\n\
              -- Hot children: atomic-swap rebuild.\n\
              IF _hot_count > 0 THEN\n\
-                 PERFORM public.reflex_reconcile_partition('{view}', array_to_string(_hot_keys, ','));\n\
+                 _r := public.reflex_reconcile_partition('{view}', array_to_string(_hot_keys, ','));\n\
+                 IF _r LIKE 'ERROR%' THEN RAISE EXCEPTION 'pg_reflex: hot-partition rebuild of % failed: %', '{view}', _r; END IF;\n\
              END IF;\n\
              -- Cold children: keyed delete + delta insert, hot children excluded\n\
              -- via the strategy-specific filter the caller spliced into the SQL.\n\
@@ -583,6 +596,7 @@ pub(crate) fn build_passthrough_partition_dispatch_sql(
         aff = affected_select,
         part_col_lit = safe_part_col_lit,
         default_thr = WIPE_THRESHOLD_DEFAULT,
+        dep_thr = WIPE_THRESHOLD_WITH_DEPENDENTS_DEFAULT,
         default_floor = WIPE_FLOOR_ROWS_DEFAULT,
         del_block = del_block,
         ins_block = ins_block,
