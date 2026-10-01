@@ -10,7 +10,28 @@ reflex_rebuild_imv(view_name TEXT) RETURNS TEXT  -- alias since 1.2.0
 refresh_reflex_imv(view_name TEXT) RETURNS TEXT  -- alias since 1.0.x
 ```
 
-All three return `'RECONCILED'`.
+All three return `'RECONCILED'`, an `'ERROR: …'` string when the IMV cannot
+be rebuilt (not found, disabled, a decomposed wrapper node, a failed partition
+rebuild), or (1.11.5+) `'RECONCILE QUEUED FOR COMMIT'`.
+
+`RECONCILE QUEUED FOR COMMIT`: called from inside a trigger on a DEFERRED IMV
+that observes a source, the reconcile does not rebuild now. The trigger's own
+statement may still stage a delta for the IMV, which the flush would apply on
+top of a rebuild that already read the write. The IMV is listed for a full
+rebuild at `COMMIT`, after the statement has staged it, and that rebuild
+cascades to its dependents. [`reflex_reconcile_partition`](reflex_reconcile_partition.md)
+returns the same value in the same case. A disabled IMV is refused
+(`'ERROR: IMV not found or disabled'`), never queued.
+
+Outside a trigger, a reconcile of a DEFERRED IMV records the point of its
+rebuild: the deltas staged for it earlier in the transaction are in the
+rebuild and skipped by the `COMMIT` flush, later ones are applied.
+
+Known limit: a single statement that both writes a source of a DEFERRED IMV
+in a data-modifying CTE and calls `reflex_reconcile` on that IMV (e.g.
+`WITH w AS (INSERT INTO src …) SELECT reflex_reconcile('imv')`) applies the
+CTE's write twice: the reconcile reads it, and its delta is staged after the
+reconcile, at the end of the statement.
 
 ## Behaviour
 

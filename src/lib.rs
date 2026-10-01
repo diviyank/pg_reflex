@@ -781,13 +781,13 @@ fn reflex_reconcile_partition(
 /// swaps. Drains __reflex_partition_pending.
 #[pg_extern]
 fn reflex_flush_partitions() -> String {
-    partition::reflex_flush_partitions_impl(None)
+    trigger::deferred::run_as_flush(|| partition::reflex_flush_partitions_impl(None))
 }
 
 /// Flush a single source root (skips the pending-queue scan).
 #[pg_extern]
 fn reflex_flush_partition_source(source_root: &str) -> String {
-    partition::reflex_flush_partitions_impl(Some(source_root))
+    trigger::deferred::run_as_flush(|| partition::reflex_flush_partitions_impl(Some(source_root)))
 }
 
 /// Re-arm pending partition roots that the failure cap has given up on, so the

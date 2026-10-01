@@ -1915,9 +1915,14 @@ pub(crate) fn reflex_reconcile_partition_impl(
     if let Err(msg) = crate::validate_view_name(view_name) {
         return msg.to_string();
     }
+    if crate::trigger::deferred::scoped_rebuild_waits_for_commit(view_name) {
+        crate::trigger::deferred::list_for_commit_reconcile(view_name);
+        return crate::reconcile::RECONCILE_QUEUED_FOR_COMMIT.to_string();
+    }
     // Held by the CALLER's transaction, so a rolled-back reconcile still leaves
     // it in place for whatever the caller does next with the returned string.
     acquire_imv_advisory_lock(view_name);
+    let mut reconcile_at_commit = false;
 
     // Opened BEFORE the destructive pre-sync so a reported failure anywhere
     // below undoes it, on both the standalone and the batch path.
@@ -2141,6 +2146,11 @@ pub(crate) fn reflex_reconcile_partition_impl(
                     .to_string()
             })
             .collect();
+        reconcile_at_commit = crate::trigger::deferred::guard_scoped_rebuild(
+            client,
+            view_name,
+            crate::trigger::deferred::RebuiltSlice::SourcePartitions(&src_children),
+        );
         let all_diffed = rebuild_mirror_leaves(
             client,
             view_name,
@@ -2292,7 +2302,10 @@ pub(crate) fn reflex_reconcile_partition_impl(
                     .update(&q, None, &[])
                     .ok()
                     .and_then(|rows| rows.first().get_one::<&str>().ok().flatten())
-                    .is_some_and(|r| r.starts_with("RECONCILED")),
+                    .is_some_and(|r| {
+                        r.starts_with("RECONCILED")
+                            || r == crate::reconcile::RECONCILE_QUEUED_FOR_COMMIT
+                    }),
                 _ => false,
             };
             if same_part_reconciled {
@@ -2307,7 +2320,27 @@ pub(crate) fn reflex_reconcile_partition_impl(
                 &dep_end,
                 &dep_group_by,
             ) {
+                if crate::trigger::deferred::scoped_rebuild_waits_for_commit(child) {
+                    crate::trigger::deferred::list_for_commit_reconcile(child);
+                    continue;
+                }
+                let literals = affected_keys
+                    .iter()
+                    .map(|k| sql_literal_text(k))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let child_at_commit = crate::trigger::deferred::guard_scoped_rebuild(
+                    client,
+                    child,
+                    crate::trigger::deferred::RebuiltSlice::Keys {
+                        column: part_col,
+                        literals: &literals,
+                    },
+                );
                 let _ = client.update(&scoped, None, &[]);
+                if child_at_commit {
+                    crate::trigger::deferred::list_for_commit_reconcile(child);
+                }
             } else {
                 let q = format!(
                     "SELECT public.reflex_reconcile({})",
@@ -2325,6 +2358,9 @@ pub(crate) fn reflex_reconcile_partition_impl(
 
     if outcome.is_ok() {
         subxact.release();
+        if reconcile_at_commit {
+            crate::trigger::deferred::list_for_commit_reconcile(view_name);
+        }
     } else {
         subxact.rollback();
     }
