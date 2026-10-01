@@ -8,6 +8,16 @@
 // fixed) rebuilt in full inside the job's transaction. A rebuild that only
 // corrected a handful of rows must cost the dependents a handful of rows.
 
+/// The dependent's key carries the join columns, as `sop_forecast_view`'s
+/// does: that is what lets pg_reflex scope a change of the joined IMV to the
+/// changed keys. A key without them falls back to a full refresh per
+/// statement, a separate cost tracked in untreated_bugs.
+const RDA_DEPENDENT_KEY: &str = "product_id, location_id, id";
+
+/// The diff reaches the dependent as two statements (the rows that left, the
+/// rows that arrived), each rewriting at most the drifted key's rows.
+const RDA_DIFF_STATEMENTS: i64 = 2;
+
 fn rda_xact_changes(rel: &str) -> (i64, i64) {
     let row = Spi::get_two::<i64, i64>(&format!(
         "SELECT pg_stat_get_xact_tuples_inserted('{rel}'::regclass), \
@@ -71,7 +81,7 @@ fn rda_one_row_drift_case(prefix: &str, mode: &str) {
     let res = crate::create_reflex_ivm(
         &dep,
         &rda_dependent_sql(prefix, &up),
-        Some("id"),
+        Some(RDA_DEPENDENT_KEY),
         None,
         Some(mode),
         None,
@@ -102,7 +112,8 @@ fn rda_one_row_drift_case(prefix: &str, mode: &str) {
     .expect("q")
     .expect("v");
     assert!(
-        del_after - del_before <= key_rows && ins_after - ins_before <= key_rows,
+        del_after - del_before <= RDA_DIFF_STATEMENTS * key_rows
+            && ins_after - ins_before <= RDA_DIFF_STATEMENTS * key_rows,
         "dependent rewritten beyond the drifted key: deleted {} / inserted {} (key has {} rows)",
         del_after - del_before,
         ins_after - ins_before,
@@ -209,7 +220,7 @@ fn pg_rda_aggregate_upstream_reaches_dependent_as_changed_groups() {
     let res = crate::create_reflex_ivm(
         "rda5_dep",
         &rda_dependent_sql("rda5", "rda5_up"),
-        Some("id"),
+        Some(RDA_DEPENDENT_KEY),
         None,
         None,
         None,
@@ -231,7 +242,8 @@ fn pg_rda_aggregate_upstream_reaches_dependent_as_changed_groups() {
     .expect("q")
     .expect("v");
     assert!(
-        del_after - del_before <= key_rows && ins_after - ins_before <= key_rows,
+        del_after - del_before <= RDA_DIFF_STATEMENTS * key_rows
+            && ins_after - ins_before <= RDA_DIFF_STATEMENTS * key_rows,
         "dependent rewritten beyond the drifted group: deleted {} / inserted {}",
         del_after - del_before,
         ins_after - ins_before

@@ -552,7 +552,11 @@ pub(crate) fn reconcile_one(view_name: &str, drop_orphans: bool) -> &'static str
             }
         }
 
-        if is_passthrough || end_query.is_empty() {
+        let propagates = target_propagates(client, view_name);
+
+        if (is_passthrough || end_query.is_empty()) && propagates {
+            apply_rebuild_as_diff(client, &quote_identifier(view_name), None, &base_query);
+        } else if is_passthrough || end_query.is_empty() {
             // Passthrough: optimized refresh — drop indexes, TRUNCATE, INSERT, recreate, ANALYZE.
             // `indexname` is `name` (fixed 64B), not `text` — cast to text or
             // pgrx's `get_by_name::<&str, _>` silently returns None and we'd
@@ -725,10 +729,12 @@ pub(crate) fn reconcile_one(view_name: &str, drop_orphans: bool) -> &'static str
                 })
                 .collect();
 
-            for (qname, _, _) in &tgt_saved_indexes {
-                client
-                    .update(&format!("DROP INDEX IF EXISTS {qname}"), None, &[])
-                    .unwrap_or_report();
+            if !propagates {
+                for (qname, _, _) in &tgt_saved_indexes {
+                    client
+                        .update(&format!("DROP INDEX IF EXISTS {qname}"), None, &[])
+                        .unwrap_or_report();
+                }
             }
 
             // Bulk insert without indexes
@@ -742,32 +748,39 @@ pub(crate) fn reconcile_one(view_name: &str, drop_orphans: bool) -> &'static str
                     &[],
                 )
                 .unwrap_or_report();
-            client
-                .update(
-                    &format!("TRUNCATE {}", quote_identifier(view_name)),
-                    None,
-                    &[],
-                )
-                .unwrap_or_report();
-            client
-                .update(
-                    &format!("INSERT INTO {} {}", quote_identifier(view_name), end_query),
-                    None,
-                    &[],
-                )
-                .unwrap_or_report();
+            if propagates {
+                apply_rebuild_as_diff(client, &quote_identifier(view_name), None, &end_query);
+            } else {
+                client
+                    .update(
+                        &format!("TRUNCATE {}", quote_identifier(view_name)),
+                        None,
+                        &[],
+                    )
+                    .unwrap_or_report();
+                client
+                    .update(
+                        &format!("INSERT INTO {} {}", quote_identifier(view_name), end_query),
+                        None,
+                        &[],
+                    )
+                    .unwrap_or_report();
+            }
 
-            // Recreate reflex-managed indexes (hash index on intermediate + target indexes)
+            // Recreate reflex-managed indexes (hash index on intermediate + target indexes).
+            // `IF NOT EXISTS` makes this a no-op for the target indexes kept above.
             for index_ddl in build_indexes_ddl(view_name, &plan) {
                 client.update(&index_ddl, None, &[]).unwrap_or_report();
             }
 
             // Recreate user-created indexes on target (skip reflex-managed ones already recreated above)
-            for (_, idx_name, idx_def) in &tgt_saved_indexes {
-                if idx_name.starts_with("idx__reflex_") || idx_name.starts_with("__reflex_") {
-                    continue; // Already handled by build_indexes_ddl
+            if !propagates {
+                for (_, idx_name, idx_def) in &tgt_saved_indexes {
+                    if idx_name.starts_with("idx__reflex_") || idx_name.starts_with("__reflex_") {
+                        continue; // Already handled by build_indexes_ddl
+                    }
+                    client.update(idx_def, None, &[]).unwrap_or_report();
                 }
-                client.update(idx_def, None, &[]).unwrap_or_report();
             }
 
             // ANALYZE intermediate so the planner has stats for any
@@ -815,6 +828,77 @@ pub(crate) fn reconcile_one(view_name: &str, drop_orphans: bool) -> &'static str
         info!("pg_reflex: reconciled IMV '{}'", view_name);
         "RECONCILED"
     })
+}
+
+/// Whether a write to the IMV's target reaches anything — an enabled,
+/// non-internal trigger, which is how every dependent IMV (and any user
+/// trigger) observes it. Disabled triggers (a suppressed generated child) do
+/// not count.
+pub(crate) fn target_propagates(client: &pgrx::spi::SpiClient<'_>, view_name: &str) -> bool {
+    client
+        .select(
+            "SELECT EXISTS (SELECT 1 FROM pg_trigger \
+              WHERE tgrelid = to_regclass($1) AND NOT tgisinternal AND tgenabled <> 'D') AS p",
+            None,
+            &[unsafe { DatumWithOid::new(view_name.to_string(), PgBuiltInOids::TEXTOID.oid().value()) }],
+        )
+        .unwrap_or_report()
+        .first()
+        .get_by_name::<bool, _>("p")
+        .unwrap_or(None)
+        .unwrap_or(true)
+}
+
+/// Bring `target` (restricted to the partition `leaf` when given) to the rows
+/// of `rebuild_sql` by deleting only the rows that left and inserting only the
+/// rows that arrived, so its dependents receive a real delta instead of a
+/// TRUNCATE (which tells them everything changed).
+///
+/// A multiset diff: rows compare by `to_jsonb(ROW(...))` — positional, NULL
+/// equal to NULL, hashable for every column type — and duplicates are matched
+/// copy for copy through `row_number()`. The writes go through `target`, never
+/// the leaf directly, because statement triggers fire on the relation written.
+pub(crate) fn apply_rebuild_as_diff(
+    client: &mut pgrx::spi::SpiClient<'_>,
+    target: &str,
+    leaf: Option<&str>,
+    rebuild_sql: &str,
+) {
+    let scope = match leaf {
+        Some(l) => format!("WHERE x.tableoid = '{}'::regclass", l.replace('\'', "''")),
+        None => String::new(),
+    };
+    let stmts = [
+        "DROP TABLE IF EXISTS pg_temp.__reflex_rebuild_next".to_string(),
+        format!(
+            "CREATE TEMP TABLE __reflex_rebuild_next AS SELECT * FROM ({rebuild_sql}) __reflex_q"
+        ),
+        format!(
+            "DELETE FROM {target} t USING ( \
+               SELECT o.toid, o.tid FROM ( \
+                 SELECT x.tableoid AS toid, x.ctid AS tid, to_jsonb(ROW(x.*)) AS j, \
+                        row_number() OVER (PARTITION BY to_jsonb(ROW(x.*))) AS rn \
+                 FROM {target} x {scope}) o \
+               LEFT JOIN (SELECT to_jsonb(ROW(n.*)) AS j, count(*) AS c \
+                          FROM pg_temp.__reflex_rebuild_next n GROUP BY 1) k ON k.j = o.j \
+               WHERE o.rn > COALESCE(k.c, 0)) d \
+             WHERE t.tableoid = d.toid AND t.ctid = d.tid"
+        ),
+        format!(
+            "INSERT INTO {target} SELECT n.* FROM pg_temp.__reflex_rebuild_next n WHERE n.ctid IN ( \
+               SELECT o.tid FROM ( \
+                 SELECT y.ctid AS tid, to_jsonb(ROW(y.*)) AS j, \
+                        row_number() OVER (PARTITION BY to_jsonb(ROW(y.*))) AS rn \
+                 FROM pg_temp.__reflex_rebuild_next y) o \
+               LEFT JOIN (SELECT to_jsonb(ROW(x.*)) AS j, count(*) AS c \
+                          FROM {target} x {scope} GROUP BY 1) k ON k.j = o.j \
+               WHERE o.rn > COALESCE(k.c, 0))"
+        ),
+        "DROP TABLE pg_temp.__reflex_rebuild_next".to_string(),
+    ];
+    for stmt in stmts {
+        client.update(&stmt, None, &[]).unwrap_or_report();
+    }
 }
 
 /// Reconcile an IMV by rebuilding intermediate + target from scratch, first
