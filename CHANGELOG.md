@@ -75,6 +75,14 @@ instead of aborting COMMIT. `ALTER EXTENSION pg_reflex UPDATE TO '1.11.5';`
   threshold of 0.9 instead of 0.5 (`__reflex_target_propagates`): its
   rebuild also pays for the diff and for its dependents' maintenance, so
   the incremental path stays cheaper for longer.
+- **A partitioned passthrough UPDATE never went hot.** The dispatch counted
+  the distinct partition values touched instead of the changed rows, so an
+  UPDATE of 80% of a plan was maintained by keyed DELETE + INSERT instead of
+  one partition rebuild. A partition now counts its changed rows — the larger
+  of its old-image and new-image counts, so N rows updated in place count N
+  and a row moved across partitions counts once on each side — which also
+  covers upserts (`INSERT … ON CONFLICT DO UPDATE`) and passthrough IMVs
+  that join other tables.
 - **(SILENT) A volume-dispatch rebuild that failed softly lost the
   statement's change.** The dispatch hands a bulk change to
   `reflex_reconcile` / `reflex_reconcile_partition`, which report some
@@ -170,7 +178,9 @@ source in one statement apply the CTE's write twice; two sessions
 flushing different sources of one DEFERRED join IMV can deadlock at COMMIT
 (40P01, retryable). All pre-existing. New in 1.11.5: a partition- or
 key-scoped reconcile of a DEFERRED IMV reached from inside a trigger becomes a
-full rebuild of the IMV at COMMIT.
+full rebuild of the IMV at COMMIT; the aggregate partition dispatch now sizes
+a partition by its source rows but still counts dirty groups, so an aggregate
+partition with many source rows per group rarely goes hot.
 
 Cost of a DEFERRED TRUNCATE rebuild of a large partitioned IMV with
 dependents: each populated leaf is diffed by staging

@@ -306,6 +306,8 @@ A passthrough IMV (`SELECT … FROM source [WHERE …]`, no GROUP BY) has **no i
   ```
 - **Keyless**: full rebuild.
 
+A partition is hot when its changed rows reach the wipe threshold of its size, as in §5.5. Each changed row counts once: a partition's count is the larger of its OLD-image and NEW-image row counts, so an UPDATE of N rows within a partition counts N (like N deleted rows) and a row moving between partitions counts once on each side.
+
 The cold body takes only `RowExclusiveLock` (DELETE/INSERT, no TRUNCATE), so partitioned passthrough readers stay live.
 
 ---
