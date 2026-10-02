@@ -3925,9 +3925,10 @@ fn partitioned_passthrough_cold_delete_is_gated_and_swaps_once() {
         );
         assert_eq!(
             joined.matches("DELETE FROM \"fc\" WHERE").count(),
-            4,
+            6,
             "{op}: the cold DELETE must be emitted once per gated variant at each \
-             of the two sites (2 variants x 2 sites): {joined}"
+             of the three sites — the no-children fallback, and the LIST cold body \
+             unrestricted (a touched NULL value) and pruned (2 variants x 3 sites): {joined}"
         );
     }
 }
@@ -3971,8 +3972,8 @@ fn partition_dispatch_list_unchanged_strategy_api() {
         &["TINS_$1".to_string()],
     );
     assert!(
-        sql.contains("$reflex_inner$MERGE_$1$reflex_inner$ USING _hot_keys"),
-        "LIST still binds only _hot_keys: {sql}"
+        sql.contains("$reflex_inner$MERGE_$1$reflex_inner$ USING _hot_vals"),
+        "LIST binds only _hot_vals (every touched value of a hot child): {sql}"
     );
     assert!(
         !sql.contains("USING _hot_keys, _hot_child_oids"),
@@ -4316,7 +4317,7 @@ fn partition_dispatch_sql_emits_one_execute_per_gated_variant_with_using() {
     for stmt in tdel.iter().chain(tins.iter()) {
         assert_eq!(
             sql.matches(&format!(
-                "EXECUTE $reflex_inner${}$reflex_inner$ USING _hot_keys;",
+                "EXECUTE $reflex_inner${}$reflex_inner$ USING _hot_vals;",
                 stmt
             ))
             .count(),

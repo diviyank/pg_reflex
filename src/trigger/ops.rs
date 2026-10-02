@@ -1021,7 +1021,8 @@ fn passthrough_keyed_delete_match(
 }
 
 /// Strategy-specific cold-exclusion predicate for the passthrough dispatch.
-/// LIST excludes hot partition VALUES (`$1::TEXT[]`); RANGE excludes rows of hot
+/// LIST excludes every touched value of a hot child (`$1::TEXT[]`, NULL-safe via
+/// `array_position`); RANGE excludes rows of hot
 /// CHILDREN by resolving the value to its child of `view_parent` and comparing
 /// the child NAME (`$2::text[]`) — a value filter is wrong (many values per range
 /// child) and an OID filter is wrong (the swap changes the child OID).
@@ -1033,13 +1034,16 @@ fn passthrough_cold_pred(
 ) -> String {
     if strategy_is_range {
         format!(
-            "public.__reflex_partition_child_for_key('{parent}'::regclass, '{col}', {qc}::text)::text <> ALL($2::text[])",
+            "array_position($2::text[], public.__reflex_partition_child_for_key('{parent}'::regclass, '{col}', {qc}::text)::text) IS NULL",
             parent = view_parent_lit,
             col = part_col_lit,
             qc = qualified_col
         )
     } else {
-        format!("{qc}::text <> ALL($1::TEXT[])", qc = qualified_col)
+        format!(
+            "array_position($1::TEXT[], {qc}::text) IS NULL",
+            qc = qualified_col
+        )
     }
 }
 
@@ -1510,7 +1514,7 @@ pub(crate) fn aggregate_epilogue_stmts(
                 let parent_lit = intermediate_tbl.replace('"', "").replace('\'', "''");
                 let part_col_lit = part_col.replace('\'', "''");
                 // Cold-exclusion predicate, strategy-specific:
-                //   LIST  → exclude hot partition VALUES   ($1::TEXT[])
+                //   LIST  → exclude every touched value of a hot child ($1::TEXT[])
                 //   RANGE → exclude rows of hot CHILDs      ($2::text[]), resolving
                 //           each value to its child of the (partitioned) intermediate
                 //           and comparing the child NAME — a value-array filter is
@@ -1520,13 +1524,16 @@ pub(crate) fn aggregate_epilogue_stmts(
                 let cold_pred = |qualified_col: &str| -> String {
                     if strategy_is_range {
                         format!(
-                            "public.__reflex_partition_child_for_key('{parent}'::regclass, '{col}', {qc}::text)::text <> ALL($2::text[])",
+                            "array_position($2::text[], public.__reflex_partition_child_for_key('{parent}'::regclass, '{col}', {qc}::text)::text) IS NULL",
                             parent = parent_lit,
                             col = part_col_lit,
                             qc = qualified_col
                         )
                     } else {
-                        format!("{qc}::text <> ALL($1::TEXT[])", qc = qualified_col)
+                        format!(
+                            "array_position($1::TEXT[], {qc}::text) IS NULL",
+                            qc = qualified_col
+                        )
                     }
                 };
                 let filtered_scratch = format!(

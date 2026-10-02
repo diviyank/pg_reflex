@@ -217,7 +217,7 @@ pub(crate) const WIPE_FLOOR_ROWS_DEFAULT: i64 = 1000;
 ///   5. Hot → `PERFORM reflex_reconcile_partition(view, csv_of_hot_keys)`
 ///      (uses the atomic swap from Phase A).
 ///   6. Cold → runs the standard MERGE / dead-cleanup / target DELETE /
-///      target INSERT with a `<partition_col> <> ALL($1::TEXT[])` filter
+///      target INSERT with an `array_position($1::TEXT[], <partition_col>::text) IS NULL` filter
 ///      added.  `$1` is `_hot_keys` passed via EXECUTE USING.
 ///
 /// The cold-path SQL strings MUST already contain the filter splice — the
@@ -230,7 +230,9 @@ pub(crate) const WIPE_FLOOR_ROWS_DEFAULT: i64 = 1000;
 /// `reflex_reconcile_partition`) and `_hot_child_names` (the hot child names).
 /// The cold body's hot-exclusion filter is strategy-specific and lives in the
 /// caller's SQL strings:
-///   * **LIST**  → `<part_col> <> ALL($1::TEXT[])` (hot VALUES) — bind `_hot_keys`.
+///   * **LIST**  → `array_position($1::TEXT[], <part_col>::text) IS NULL` — bind
+///     `_hot_vals`, EVERY touched value of a hot child (a LIST child may hold
+///     several values; `array_position` keeps NULL values cold).
 ///   * **RANGE** → `__reflex_partition_child_for_key(...)::text <> ALL($2::text[])`
 ///     (hot CHILD names; a value-array filter is wrong because many values map to
 ///     one range child, and an OID filter is wrong because the swap changes the
@@ -255,7 +257,7 @@ pub(crate) fn build_partition_aware_dispatch_sql_strategy(
     let using = if strategy.eq_ignore_ascii_case("RANGE") {
         "_hot_keys, _hot_child_names"
     } else {
-        "_hot_keys"
+        "_hot_vals"
     };
     let dead_cleanup = execute_each(dead_cleanup_sql, Some(using));
     // PS-5 — the cold-partition MERGE may be a gated pair; split and bind USING
@@ -277,6 +279,7 @@ pub(crate) fn build_partition_aware_dispatch_sql_strategy(
              _per_imv_floor BIGINT;\n\
              _hot_keys TEXT[] := ARRAY[]::TEXT[];\n\
              _hot_child_names TEXT[] := ARRAY[]::TEXT[];\n\
+             _hot_vals TEXT[] := ARRAY[]::TEXT[];\n\
              _hot_count INT;\n\
              _r TEXT;\n\
              _partition_total INT;\n\
@@ -318,26 +321,32 @@ pub(crate) fn build_partition_aware_dispatch_sql_strategy(
                  FROM {affected}\n\
                  GROUP BY \"{part_col}\"\n\
              ),\n\
-             per_child AS (\n\
-                 SELECT cfk.child AS child_oid,\n\
-                        sum(pv.dirty) AS dirty,\n\
-                        min(pv.pkey)  AS rep_key\n\
+             resolved AS MATERIALIZED (\n\
+                 SELECT pv.pkey, pv.dirty, cfk.child\n\
                  FROM per_val pv\n\
                  CROSS JOIN LATERAL (\n\
-                     SELECT public.__reflex_partition_child_for_key(\n\
-                                '{int_parent}'::regclass, '{part_col_lit}', pv.pkey) AS child\n\
+                     SELECT CASE WHEN pv.pkey IS NOT NULL THEN public.__reflex_partition_child_for_key(\n\
+                                '{int_parent}'::regclass, '{part_col_lit}', pv.pkey) END AS child\n\
                  ) cfk\n\
-                 WHERE cfk.child IS NOT NULL\n\
-                 GROUP BY cfk.child\n\
+             ),\n\
+             per_child AS (\n\
+                 SELECT child AS child_oid,\n\
+                        sum(dirty) AS dirty,\n\
+                        min(pkey)  AS rep_key\n\
+                 FROM resolved\n\
+                 WHERE child IS NOT NULL\n\
+                 GROUP BY child\n\
              ),\n\
              classified AS (\n\
-                 SELECT pc.rep_key, pc.child_oid::text AS child_name,\n\
+                 SELECT pc.child_oid, pc.rep_key, pc.child_oid::text AS child_name,\n\
                         (pc.dirty::NUMERIC / GREATEST(public.__reflex_rebuild_cost_rows('{view}', pc.child_oid)::NUMERIC, _floor::NUMERIC) >= _thr) AS hot\n\
                  FROM per_child pc JOIN pg_class c ON c.oid = pc.child_oid\n\
              )\n\
              SELECT COALESCE(array_agg(rep_key::text) FILTER (WHERE hot), ARRAY[]::TEXT[]),\n\
-                    COALESCE(array_agg(child_name)    FILTER (WHERE hot), ARRAY[]::TEXT[])\n\
-                 INTO _hot_keys, _hot_child_names\n\
+                    COALESCE(array_agg(child_name)    FILTER (WHERE hot), ARRAY[]::TEXT[]),\n\
+                    COALESCE((SELECT array_agg(r.pkey) FROM resolved r JOIN classified k\n\
+                              ON k.child_oid = r.child AND k.hot), ARRAY[]::TEXT[])\n\
+                 INTO _hot_keys, _hot_child_names, _hot_vals\n\
                  FROM classified;\n\
              _hot_count := COALESCE(array_length(_hot_keys, 1), 0);\n\
              RAISE DEBUG 'pg_reflex partition dispatch: hot=% total=% thr=% floor=%', _hot_count, _partition_total, _thr, _floor;\n\
@@ -430,7 +439,7 @@ pub(crate) fn build_passthrough_partition_dispatch_sql(
     let using = if strategy.eq_ignore_ascii_case("RANGE") {
         "_hot_keys, _hot_child_names"
     } else {
-        "_hot_keys"
+        "_hot_vals"
     };
 
     // For use in SQL format() strings, extract just the column name from target_part_ref
@@ -446,33 +455,28 @@ pub(crate) fn build_passthrough_partition_dispatch_sql(
 
     // Build the cold-body execution block for the main partition dispatch (post-trip-cap).
     let cold_dispatch_block = if is_list {
-        // LIST: cold DELETE with pruning
-        let del_part = format!(
-            "             IF array_length(_cold_keys,1) IS NOT NULL THEN\n{variants}",
-            variants = safe_dels
-                .iter()
-                .map(|sql| format!(
-                    "                 EXECUTE format($reflex_cold_list${sql} AND {col} = ANY($2::text[]::%s[])$reflex_cold_list$, _part_type)\n\
-                     USING _hot_keys, _cold_keys;\n",
-                    sql = sql,
-                    col = target_col_only
-                ))
-                .collect::<Vec<_>>()
-                .join("")
-        );
-        // LIST: cold INSERT with pruning (if present)
-        let ins_part = if cold_insert_with_filter.is_empty() {
-            "             END IF;\n".to_string()
-        } else {
+        // LIST: cold body restricted to the touched cold values (partition
+        // pruning); a touched NULL value cannot be matched by `= ANY`, so then
+        // the cold body runs unrestricted (the hot-exclusion filter still applies).
+        let pruned = |sql: &str| {
             format!(
-                "             EXECUTE format($reflex_cold_list${sql} AND {col} = ANY($2::text[]::%s[])$reflex_cold_list$, _part_type)\n\
-                     USING _hot_keys, _cold_keys;\n\
-                 END IF;\n",
-                sql = safe_ins,
+                "                 EXECUTE format($reflex_cold_list${sql} AND {col} = ANY($2::text[]::%s[])$reflex_cold_list$, _part_type)\n\
+                 USING _hot_vals, _cold_keys;\n",
                 col = target_col_only
             )
         };
-        format!("{}{}", del_part, ins_part)
+        let unpruned = |sql: &str| {
+            format!("                 EXECUTE $reflex_inner${sql}$reflex_inner$ USING _hot_vals;\n")
+        };
+        let mut bodies: Vec<&str> = safe_dels.iter().map(String::as_str).collect();
+        if !cold_insert_with_filter.is_empty() {
+            bodies.push(&safe_ins);
+        }
+        format!(
+            "             IF _cold_has_null THEN\n{}             ELSIF array_length(_cold_keys,1) IS NOT NULL THEN\n{}             END IF;\n",
+            bodies.iter().map(|b| unpruned(b)).collect::<String>(),
+            bodies.iter().map(|b| pruned(b)).collect::<String>(),
+        )
     } else {
         // RANGE: cold DELETE (no pruning needed — hot-exclusion by child name suffices)
         // Note: literal USING clause here (not a placeholder), since this block is embedded into the template.
@@ -529,7 +533,9 @@ pub(crate) fn build_passthrough_partition_dispatch_sql(
              _per_imv_floor BIGINT;\n\
              _hot_keys TEXT[] := ARRAY[]::TEXT[];\n\
              _hot_child_names TEXT[] := ARRAY[]::TEXT[];\n\
+             _hot_vals TEXT[] := ARRAY[]::TEXT[];\n\
              _cold_keys TEXT[] := ARRAY[]::TEXT[];\n\
+             _cold_has_null BOOLEAN := FALSE;\n\
              _part_type TEXT;\n\
              _hot_count INT;\n\
              _r TEXT;\n\
@@ -563,26 +569,38 @@ pub(crate) fn build_passthrough_partition_dispatch_sql(
                         count(*) FILTER (WHERE NOT is_old) AS new_rows\n\
                  FROM ({aff}) __pv GROUP BY pkey\n\
              ),\n\
-             per_child AS (\n\
-                 SELECT cfk.child AS child_oid,\n\
-                        GREATEST(sum(pv.old_rows), sum(pv.new_rows)) AS dirty,\n\
-                        min(pv.pkey) AS rep_key\n\
+             resolved AS MATERIALIZED (\n\
+                 SELECT pv.pkey, pv.old_rows, pv.new_rows, cfk.child\n\
                  FROM per_val pv\n\
                  CROSS JOIN LATERAL (\n\
-                     SELECT public.__reflex_partition_child_for_key('{parent}'::regclass, '{part_col_lit}', pv.pkey) AS child\n\
+                     SELECT CASE WHEN pv.pkey IS NOT NULL THEN public.__reflex_partition_child_for_key('{parent}'::regclass, '{part_col_lit}', pv.pkey) END AS child\n\
                  ) cfk\n\
-                 WHERE cfk.child IS NOT NULL\n\
-                 GROUP BY cfk.child\n\
+             ),\n\
+             per_child AS (\n\
+                 SELECT child AS child_oid,\n\
+                        GREATEST(sum(old_rows), sum(new_rows)) AS dirty,\n\
+                        min(pkey) AS rep_key\n\
+                 FROM resolved\n\
+                 WHERE child IS NOT NULL\n\
+                 GROUP BY child\n\
              ),\n\
              classified AS (\n\
-                 SELECT pc.rep_key, pc.child_oid::text AS child_name,\n\
+                 SELECT pc.child_oid, pc.rep_key, pc.child_oid::text AS child_name,\n\
                         (pc.dirty::NUMERIC / GREATEST(public.__reflex_rebuild_cost_rows('{view}', pc.child_oid)::NUMERIC, _floor::NUMERIC) >= _thr) AS hot\n\
                  FROM per_child pc JOIN pg_class c ON c.oid = pc.child_oid\n\
              )\n\
+             -- _hot_vals: EVERY touched value of a hot child (the LIST cold-exclusion\n\
+             -- filter; a multi-value child has several). _cold_keys / _cold_has_null:\n\
+             -- the other touched values (LIST pruning), NULL ones flagged apart.\n\
              SELECT COALESCE(array_agg(rep_key::text) FILTER (WHERE hot), ARRAY[]::TEXT[]),\n\
                     COALESCE(array_agg(child_name)    FILTER (WHERE hot), ARRAY[]::TEXT[]),\n\
-                    COALESCE(array_agg(rep_key::text) FILTER (WHERE NOT hot), ARRAY[]::TEXT[])\n\
-                 INTO _hot_keys, _hot_child_names, _cold_keys\n\
+                    COALESCE((SELECT array_agg(r.pkey) FROM resolved r JOIN classified k\n\
+                              ON k.child_oid = r.child AND k.hot), ARRAY[]::TEXT[]),\n\
+                    COALESCE((SELECT array_agg(r.pkey) FROM resolved r WHERE r.pkey IS NOT NULL\n\
+                              AND NOT EXISTS (SELECT 1 FROM classified k WHERE k.child_oid = r.child AND k.hot)),\n\
+                             ARRAY[]::TEXT[]),\n\
+                    COALESCE((SELECT bool_or(r.pkey IS NULL) FROM resolved r), FALSE)\n\
+                 INTO _hot_keys, _hot_child_names, _hot_vals, _cold_keys, _cold_has_null\n\
                  FROM classified;\n\
              _hot_count := COALESCE(array_length(_hot_keys, 1), 0);\n\
              SELECT atttypid::regtype::text INTO _part_type\n\
