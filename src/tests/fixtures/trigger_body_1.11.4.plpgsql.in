@@ -1,0 +1,42 @@
+DECLARE _rec RECORD; _sql TEXT; _stmt TEXT; _has_rows BOOLEAN; _pred_match BOOLEAN;
+        _skip_cols TEXT; _skip_pred TEXT; _skip_pred_clause TEXT; _skip_sql TEXT; _filter_skip BOOLEAN;
+        _old_has BOOLEAN; _new_has BOOLEAN; _directional_op TEXT;
+        _pre_trans_count BIGINT; _pre_src_total BIGINT; _pre_thr NUMERIC; _pre_per_imv NUMERIC; _pre_ratio NUMERIC;
+BEGIN
+    SELECT EXISTS(SELECT 1 FROM "__REFLEX_SLOT_TRANSITION_TBL__" LIMIT 1) INTO _has_rows;
+    IF NOT _has_rows THEN RETURN NULL; END IF;
+    FOR _rec IN
+      SELECT name, base_query, end_query, aggregations::text AS aggregations, where_predicate, ignored_sources
+      FROM public.__reflex_ivm_reference
+      WHERE '__REFLEX_SLOT_SOURCE_TABLE__' = ANY(depends_on) AND enabled = TRUE
+      ORDER BY graph_depth, name
+    LOOP
+      IF _rec.ignored_sources IS NOT NULL AND ('__REFLEX_SLOT_SOURCE_TABLE__' = ANY(_rec.ignored_sources) OR '__REFLEX_SLOT_BARE_SOURCE__' = ANY(_rec.ignored_sources)) THEN CONTINUE; END IF;
+      __REFLEX_SLOT_PRED_CHECK_BLOCK__
+      __REFLEX_SLOT_FILTER_SKIP_BLOCK__
+      __REFLEX_SLOT_DIRECTIONAL_PROBE_BLOCK__
+      BEGIN
+        SELECT reltuples::BIGINT INTO _pre_src_total FROM pg_class WHERE oid = '__REFLEX_SLOT_SOURCE_TABLE__'::regclass;
+        IF _pre_src_total IS NOT NULL AND _pre_src_total >= 1000 THEN
+          EXECUTE format('SELECT count(*) FROM %I', '__REFLEX_SLOT_TRANSITION_TBL__') INTO _pre_trans_count;
+          SELECT wipe_threshold INTO _pre_per_imv FROM public.__reflex_ivm_reference WHERE name = _rec.name;
+          _pre_thr := COALESCE(_pre_per_imv, current_setting('reflex.wipe_threshold', true)::NUMERIC, 0.5);
+          _pre_ratio := _pre_trans_count::NUMERIC / _pre_src_total;
+          IF _pre_ratio >= _pre_thr THEN
+            RAISE DEBUG 'pg_reflex Path B: dispatching % to reconcile (ratio=% thr=%)', _rec.name, _pre_ratio, _pre_thr;
+            PERFORM public.reflex_reconcile(_rec.name);
+            CONTINUE;
+          END IF;
+        END IF;
+      EXCEPTION WHEN OTHERS THEN NULL; END;
+      __REFLEX_SLOT_PATH_C_BLOCK__
+      PERFORM pg_advisory_xact_lock(hashtext(_rec.name), hashtext(reverse(_rec.name)));
+      _sql := public.reflex_build_delta_sql(_rec.name, '__REFLEX_SLOT_SOURCE_TABLE__', __REFLEX_SLOT_OP_VALUE__, _rec.base_query, _rec.end_query, _rec.aggregations, _rec.base_query);
+      IF _sql <> '' THEN
+        FOREACH _stmt IN ARRAY string_to_array(_sql, E'\n--<<REFLEX_SEP>>--\n') LOOP
+          IF _stmt <> '' THEN EXECUTE _stmt; END IF;
+        END LOOP;
+      END IF;
+    END LOOP;
+    RETURN NULL;
+END;

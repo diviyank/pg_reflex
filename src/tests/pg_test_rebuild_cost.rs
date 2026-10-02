@@ -33,12 +33,22 @@ fn rco_target_leaf_oids(imv: &str) -> String {
     .unwrap_or_default()
 }
 
+/// Volume dispatch (hot partition rebuild, trip-cap) runs only in the DEFERRED
+/// flush, on the transaction's netted delta: a statement trigger never rebuilds.
+const RC_DEFERRED: &str = "DEFERRED";
+const RC_IMMEDIATE: &str = "IMMEDIATE";
+
+/// Fires the DEFERRED flush queued by the writes so far (a no-op for IMMEDIATE).
+fn rc_flush() {
+    Spi::run("SET CONSTRAINTS ALL IMMEDIATE").expect("flush");
+}
+
 /// Passthrough partitioned IMV over a two-level source, optionally with a dependent.
-fn rco_build_passthrough(prefix: &str, with_dependent: bool) {
+fn rco_build_passthrough(prefix: &str, with_dependent: bool, mode: &str) {
     rco_two_level_source(&format!("{prefix}_src"), 5000);
     let created = Spi::get_one::<String>(&format!(
         "SELECT create_reflex_ivm('{prefix}_v', 'SELECT plan, m, id, v FROM {prefix}_src', \
-         'plan, m, id', NULL, NULL, NULL, ARRAY['plan', 'm'])"
+         'plan, m, id', NULL, '{mode}', NULL, ARRAY['plan', 'm'])"
     ))
     .expect("create call")
     .expect("create result");
@@ -50,7 +60,7 @@ fn rco_build_passthrough(prefix: &str, with_dependent: bool) {
                 &format!("SELECT plan, id FROM {prefix}_v"),
                 Some("plan, id"),
                 None,
-                None,
+                Some(mode),
                 None
             ),
             "CREATE REFLEX INCREMENTAL VIEW"
@@ -164,12 +174,13 @@ fn pg_rco_aggregate_child_maps_to_source_child() {
 /// the threshold, so the plan stays on the incremental path.
 #[pg_test]
 fn pg_rco_small_delete_of_two_level_plan_stays_cold() {
-    rco_build_passthrough("rco4", true);
+    rco_build_passthrough("rco4", true, RC_DEFERRED);
     // Autovacuum never analyzes partitioned parents: their reltuples stays -1.
     Spi::run("UPDATE pg_class SET reltuples = -1 WHERE relkind = 'p' AND relname LIKE 'rco4_v%'")
         .expect("unanalyzed plan-level child");
     let before = rco_target_leaf_oids("rco4_v");
     Spi::run("DELETE FROM rco4_src WHERE id <= 1000").expect("delete");
+    rc_flush();
     assert_eq!(
         rco_target_leaf_oids("rco4_v"),
         before,
@@ -183,9 +194,10 @@ fn pg_rco_small_delete_of_two_level_plan_stays_cold() {
 /// (threshold 0.9) ...
 #[pg_test]
 fn pg_rco_large_delete_stays_cold_with_dependent() {
-    rco_build_passthrough("rco6", true);
+    rco_build_passthrough("rco6", true, RC_DEFERRED);
     let before = rco_target_leaf_oids("rco6_v");
     Spi::run("DELETE FROM rco6_src WHERE id <= 4000").expect("delete");
+    rc_flush();
     assert_eq!(
         rco_target_leaf_oids("rco6_v"),
         before,
@@ -197,9 +209,10 @@ fn pg_rco_large_delete_stays_cold_with_dependent() {
 /// ... and goes hot (rebuild) without one (threshold 0.5).
 #[pg_test]
 fn pg_rco_large_delete_goes_hot_without_dependent() {
-    rco_build_passthrough("rco7", false);
+    rco_build_passthrough("rco7", false, RC_DEFERRED);
     let before = rco_target_leaf_oids("rco7_v");
     Spi::run("DELETE FROM rco7_src WHERE id <= 4000").expect("delete");
+    rc_flush();
     assert_ne!(
         rco_target_leaf_oids("rco7_v"),
         before,
@@ -221,6 +234,7 @@ fn pg_rco_dispatch_sql_raises_on_error_result() {
         "LIST",
         &cold_del,
         "",
+        true,
     );
     let aggregate = crate::trigger::build_partition_aware_dispatch_sql_strategy(
         "v",
@@ -255,19 +269,28 @@ fn pg_rco_dispatch_sql_raises_on_error_result() {
     }
 }
 
-/// A large UPDATE confined to one plan of an IMV without dependents rebuilds
-/// that plan (the dispatch counts changed rows, not distinct partition values).
+/// A large UPDATE confined to one of five plans of an IMV without dependents
+/// rebuilds that plan alone, through `reflex_reconcile_partition` (the dispatch
+/// counts changed rows, not distinct partition values; one hot plan of five is
+/// under the trip-cap).
 #[pg_test]
 fn pg_rco_large_update_goes_hot_without_dependent_passthrough() {
-    rco_build_passthrough("rco8", false);
-    let before = rco_target_leaf_oids("rco8_v");
-    Spi::run("UPDATE rco8_src SET v = v + 1 WHERE id <= 4000").expect("update");
-    assert_ne!(
-        rco_target_leaf_oids("rco8_v"),
-        before,
-        "plan was not rebuilt"
-    );
-    assert_imv_correct("rco8_v", "SELECT plan, m, id, v FROM rco8_src");
+    rcu_build("rco8", false, RC_DEFERRED);
+    let before = rcu_all_plan_leaf_oids("rco8_v");
+    rcu_update_plan1("rco8", 1600);
+    rc_flush();
+    rcu_assert_only_plans_rebuilt("rco8", &before, &[1]);
+    assert_imv_correct("rco8_v", &rcu_view_sql("rco8"));
+}
+
+/// The same UPDATE from a statement trigger (IMMEDIATE) stays incremental and correct.
+#[pg_test]
+fn pg_rco_large_immediate_update_stays_cold_passthrough() {
+    rcu_build("rco9", false, RC_IMMEDIATE);
+    let before = rcu_all_plan_leaf_oids("rco9_v");
+    rcu_update_plan1("rco9", 1600);
+    rcu_assert_only_plans_rebuilt("rco9", &before, &[]);
+    assert_imv_correct("rco9_v", &rcu_view_sql("rco9"));
 }
 
 const RCU_ROWS_PER_PLAN: i32 = 2000;
@@ -310,10 +333,10 @@ fn rcu_view_sql(prefix: &str) -> String {
 /// Passthrough IMV `{prefix}_v` partitioned plan -> month over `rcu_source`,
 /// optionally observed by the dependent `{prefix}_d`. Analyzed, so each plan is
 /// sized at exactly 2000 rows and the ratios below are exact.
-fn rcu_build(prefix: &str, with_dependent: bool) {
+fn rcu_build(prefix: &str, with_dependent: bool, mode: &str) {
     rcu_source(&format!("{prefix}_src"));
     let created = Spi::get_one::<String>(&format!(
-        "SELECT create_reflex_ivm('{prefix}_v', '{}', 'plan, m, id', NULL, NULL, NULL, \
+        "SELECT create_reflex_ivm('{prefix}_v', '{}', 'plan, m, id', NULL, '{mode}', NULL, \
          ARRAY['plan', 'm'])",
         rcu_view_sql(prefix)
     ))
@@ -327,7 +350,7 @@ fn rcu_build(prefix: &str, with_dependent: bool) {
                 &format!("SELECT plan, id, v FROM {prefix}_v"),
                 Some("plan, id"),
                 None,
-                None,
+                Some(mode),
                 None
             ),
             "CREATE REFLEX INCREMENTAL VIEW"
@@ -409,10 +432,11 @@ fn rcu_assert_only_plans_rebuilt(prefix: &str, before: &[String], rebuilt: &[i32
 /// keyed DELETE + INSERT of the 1600 rows, nothing updated in place.
 #[pg_test]
 fn pg_rcu_large_update_with_dependent_below_090_stays_cold() {
-    rcu_build("rcu1", true);
+    rcu_build("rcu1", true, RC_DEFERRED);
     let before = rcu_all_plan_leaf_oids("rcu1_v");
     let (ins, upd, del) = rcu_target_xact_counts("rcu1_v");
     rcu_update_plan1("rcu1", 1600);
+    rc_flush();
     let (ins2, upd2, del2) = rcu_target_xact_counts("rcu1_v");
     assert_eq!(
         (ins2 - ins, upd2 - upd, del2 - del),
@@ -430,10 +454,11 @@ fn pg_rcu_large_update_with_dependent_below_090_stays_cold() {
 /// diff, not a rebuild.
 #[pg_test]
 fn pg_rcu_large_update_with_dependent_above_090_goes_hot_by_diff() {
-    rcu_build("rcu2", true);
+    rcu_build("rcu2", true, RC_DEFERRED);
     let before = rcu_all_plan_leaf_oids("rcu2_v");
     let (ins, upd, del) = rcu_target_xact_counts("rcu2_v");
     rcu_update_plan1("rcu2", 1900);
+    rc_flush();
     let (ins2, upd2, del2) = rcu_target_xact_counts("rcu2_v");
     assert_eq!(
         (ins2 - ins, upd2 - upd, del2 - del),
@@ -448,9 +473,10 @@ fn pg_rcu_large_update_with_dependent_above_090_goes_hot_by_diff() {
 /// A small UPDATE stays on the incremental path: no plan is rebuilt.
 #[pg_test]
 fn pg_rcu_small_update_stays_cold() {
-    rcu_build("rcu3", false);
+    rcu_build("rcu3", false, RC_DEFERRED);
     let before = rcu_all_plan_leaf_oids("rcu3_v");
     rcu_update_plan1("rcu3", 100);
+    rc_flush();
     rcu_assert_only_plans_rebuilt("rcu3", &before, &[]);
     assert_imv_correct("rcu3_v", &rcu_view_sql("rcu3"));
 }
@@ -459,9 +485,10 @@ fn pg_rcu_small_update_stays_cold() {
 /// of a plan at the 0.5 threshold stays cold.
 #[pg_test]
 fn pg_rcu_update_counts_each_row_once() {
-    rcu_build("rcu4", false);
+    rcu_build("rcu4", false, RC_DEFERRED);
     let before = rcu_all_plan_leaf_oids("rcu4_v");
     rcu_update_plan1("rcu4", 800);
+    rc_flush();
     rcu_assert_only_plans_rebuilt("rcu4", &before, &[]);
     assert_imv_correct("rcu4_v", &rcu_view_sql("rcu4"));
 }
@@ -470,9 +497,10 @@ fn pg_rcu_update_counts_each_row_once() {
 /// so both go hot; the other plans are untouched.
 #[pg_test]
 fn pg_rcu_partition_key_update_dirties_both_plans_by_moved_rows() {
-    rcu_build("rcu5", false);
+    rcu_build("rcu5", false, RC_DEFERRED);
     let before = rcu_all_plan_leaf_oids("rcu5_v");
     Spi::run("UPDATE rcu5_src SET plan = 2 WHERE plan = 1 AND id <= 1200").expect("move");
+    rc_flush();
     rcu_assert_only_plans_rebuilt("rcu5", &before, &[1, 2]);
     assert_imv_correct("rcu5_v", &rcu_view_sql("rcu5"));
 }
@@ -480,9 +508,10 @@ fn pg_rcu_partition_key_update_dirties_both_plans_by_moved_rows() {
 /// 30% of plan 1 moves to plan 3: 0.3 on each side, both stay cold.
 #[pg_test]
 fn pg_rcu_small_partition_key_update_stays_cold() {
-    rcu_build("rcu6", false);
+    rcu_build("rcu6", false, RC_DEFERRED);
     let before = rcu_all_plan_leaf_oids("rcu6_v");
     Spi::run("UPDATE rcu6_src SET plan = 3 WHERE plan = 1 AND id <= 600").expect("move");
+    rc_flush();
     rcu_assert_only_plans_rebuilt("rcu6", &before, &[]);
     assert_imv_correct("rcu6_v", &rcu_view_sql("rcu6"));
 }
@@ -490,13 +519,14 @@ fn pg_rcu_small_partition_key_update_stays_cold() {
 /// A large upsert whose rows all conflict reaches the IMV as an UPDATE and goes hot.
 #[pg_test]
 fn pg_rcu_large_upsert_goes_hot() {
-    rcu_build("rcu7", false);
+    rcu_build("rcu7", false, RC_DEFERRED);
     let before = rcu_all_plan_leaf_oids("rcu7_v");
     Spi::run(
         "INSERT INTO rcu7_src SELECT plan, m, id, v + 1 FROM rcu7_src WHERE plan = 1 AND id <= 1600 \
          ON CONFLICT (plan, m, id) DO UPDATE SET v = EXCLUDED.v",
     )
     .expect("upsert");
+    rc_flush();
     rcu_assert_only_plans_rebuilt("rcu7", &before, &[1]);
     assert_imv_correct("rcu7_v", &rcu_view_sql("rcu7"));
 }
@@ -505,9 +535,10 @@ fn pg_rcu_large_upsert_goes_hot() {
 /// half the plans hot -> full rebuild) must not fire.
 #[pg_test]
 fn pg_rcu_small_updates_across_all_plans_do_not_trip_cap() {
-    rcu_build("rcu8", false);
+    rcu_build("rcu8", false, RC_DEFERRED);
     let before = rcu_all_plan_leaf_oids("rcu8_v");
     Spi::run("UPDATE rcu8_src SET v = v + 1 WHERE id % 10 = 0").expect("update");
+    rc_flush();
     rcu_assert_only_plans_rebuilt("rcu8", &before, &[]);
     assert_imv_correct("rcu8_v", &rcu_view_sql("rcu8"));
 }
@@ -516,14 +547,15 @@ fn pg_rcu_small_updates_across_all_plans_do_not_trip_cap() {
 /// replaces every plan's leaves.
 #[pg_test]
 fn pg_rcu_large_updates_of_most_plans_trip_cap() {
-    rcu_build("rcu9", false);
+    rcu_build("rcu9", false, RC_DEFERRED);
     let before = rcu_all_plan_leaf_oids("rcu9_v");
     Spi::run("UPDATE rcu9_src SET v = v + 1 WHERE plan IN (1, 2, 3)").expect("update");
+    rc_flush();
     rcu_assert_only_plans_rebuilt("rcu9", &before, &[1, 2, 3, 4, 5]);
     assert_imv_correct("rcu9_v", &rcu_view_sql("rcu9"));
 }
 
-/// Probe: a passthrough IMV LEFT JOINing a secondary table (the
+/// Probe: a DEFERRED passthrough IMV LEFT JOINing a secondary table (the
 /// `sop_forecast_view` shape) maintains an UPDATE and an upsert of its anchor
 /// through the same partition dispatch, so a large one goes hot.
 #[pg_test]
@@ -535,7 +567,7 @@ fn pg_rcu_join_passthrough_anchor_update_and_upsert_go_hot() {
     let view_sql = "SELECT s.plan, s.m, s.id, s.v, c.active \
                     FROM rcu10_src s LEFT JOIN rcu10_caav c ON c.id = s.id";
     let created = Spi::get_one::<String>(&format!(
-        "SELECT create_reflex_ivm('rcu10_v', '{view_sql}', 'plan, m, id', NULL, NULL, NULL, \
+        "SELECT create_reflex_ivm('rcu10_v', '{view_sql}', 'plan, m, id', NULL, 'DEFERRED', NULL, \
          ARRAY['plan', 'm'])"
     ))
     .expect("create call")
@@ -545,6 +577,7 @@ fn pg_rcu_join_passthrough_anchor_update_and_upsert_go_hot() {
 
     let before = rcu_all_plan_leaf_oids("rcu10_v");
     Spi::run("UPDATE rcu10_src SET v = v + 1 WHERE plan = 1 AND id <= 1600").expect("update");
+    rc_flush();
     rcu_assert_only_plans_rebuilt("rcu10", &before, &[1]);
     assert_imv_correct("rcu10_v", view_sql);
 
@@ -555,6 +588,7 @@ fn pg_rcu_join_passthrough_anchor_update_and_upsert_go_hot() {
          ON CONFLICT (plan, m, id) DO UPDATE SET v = EXCLUDED.v",
     )
     .expect("upsert");
+    rc_flush();
     rcu_assert_only_plans_rebuilt("rcu10", &before, &[2]);
     assert_imv_correct("rcu10_v", view_sql);
 }
@@ -589,9 +623,9 @@ fn rce_failing_reconcile_fixture(prefix: &str, mode: &str, exec: impl Fn(&str)) 
         format!(
             "DO $p$ BEGIN IF NOT EXISTS (SELECT 1 FROM public.__reflex_ivm_reference r \
              WHERE r.name = '{prefix}_v' AND strpos(reflex_build_delta_sql(r.name, '{prefix}_src', \
-             'UPDATE', r.base_query, r.end_query, r.aggregations::text, r.base_query), \
+             'UPDATE_NETTED', r.base_query, r.end_query, r.aggregations::text, r.base_query), \
              'pg_reflex wipe: ratio') > 0) \
-             THEN RAISE EXCEPTION 'fixture: UPDATE does not take the unpartitioned dispatch'; END IF; END $p$"
+             THEN RAISE EXCEPTION 'fixture: the flushed UPDATE does not take the unpartitioned dispatch'; END IF; END $p$"
         ),
     ] {
         exec(&sql);
@@ -602,11 +636,12 @@ fn rce_failing_reconcile_fixture(prefix: &str, mode: &str, exec: impl Fn(&str)) 
 /// ratio) but every group of `B`, so it reaches the dispatch's rebuild branch.
 const RCE_UPDATE: &str = "UPDATE {p}_src SET cust = id + 1000 WHERE region = 'B' AND id <= 200";
 
-/// The unpartitioned high-selectivity dispatch delegates to `reflex_reconcile`;
-/// when that returns an `ERROR` string, the statement must fail rather than
-/// commit a source change the IMV never received.
+/// The unpartitioned high-selectivity dispatch delegates to `reflex_reconcile`,
+/// which fails here. It runs only in the DEFERRED flush (below); from a statement
+/// trigger the UPDATE stays incremental, so it never reaches the failing rebuild
+/// and the statement succeeds with a correct IMV.
 #[pg_test]
-fn pg_rco_high_selectivity_reconcile_error_fails_the_statement() {
+fn pg_rco_high_selectivity_immediate_update_stays_incremental() {
     rce_failing_reconcile_fixture("rce1", "IMMEDIATE", |sql| {
         Spi::run(sql).unwrap_or_else(|e| panic!("<{sql}>: {e}"))
     });
@@ -619,11 +654,8 @@ fn pg_rco_high_selectivity_reconcile_error_fails_the_statement() {
     ))
     .expect("outcome")
     .expect("outcome value");
+    assert_eq!(outcome, "NO ERROR", "the statement trigger rebuilt the IMV");
     assert_imv_correct("rce1_v", &RCE_VIEW_SQL.replace("{p}", "rce1"));
-    assert!(
-        outcome.contains("partition reconcile failed"),
-        "the failed rebuild must fail the statement, got: {outcome}"
-    );
 }
 
 /// DEFERRED: the same failure at COMMIT must leave the IMV flagged stale, not

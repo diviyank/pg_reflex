@@ -457,6 +457,12 @@ pub fn build_indexes_ddl(view_name: &str, plan: &AggregationPlan) -> Vec<String>
 ///
 /// Transition tables are referenced directly in EXECUTE context (no temp table copy).
 pub fn build_trigger_ddls(source_table: &str) -> Vec<String> {
+    build_trigger_ddls_from_body(source_table, include_str!("../sql/trigger_body.plpgsql.in"))
+}
+
+/// `build_trigger_ddls` with the statement-trigger body template given, so a
+/// migration test can render the bodies an older template produced.
+pub(crate) fn build_trigger_ddls_from_body(source_table: &str, body_template: &str) -> Vec<String> {
     let safe_source = source_table.replace('.', "_").replace('"', "");
     let ref_new = transition_new_table_name(source_table);
     let ref_old = transition_old_table_name(source_table);
@@ -566,10 +572,10 @@ pub fn build_trigger_ddls(source_table: &str) -> Vec<String> {
     //     that row's contribution). The __REFLEX_SLOT_PRED_CHECK_BLOCK__
     //     in the main body picks the correct op-specific SQL.
     //
-    // 1.4.6 — Path B pre-scratch dispatch.  Static SQL in
-    // sql/trigger_body.plpgsql.in handles the |transition| / |source| ratio
-    // check; the per-IMV `wipe_threshold` override is read at runtime from
-    // `public.__reflex_ivm_reference`.
+    // 1.11.5 — no Path B: these statement-trigger bodies never rebuild the IMV
+    // (`reflex_reconcile`). Another trigger of the same statement (upsert,
+    // MERGE, writable CTE) would apply its delta on top of a rebuild that
+    // already read it. Bulk rebuild dispatch runs only in the DEFERRED flush.
 
     // Op-specific where-predicate early-skip blocks.
     let pred_check_one_tpl = include_str!("../sql/trigger_pred_check_one.plpgsql.in");
@@ -627,7 +633,6 @@ pub fn build_trigger_ddls(source_table: &str) -> Vec<String> {
     );
 
     // Static slot substitutions shared by INSERT/DELETE/UPDATE bodies.
-    let body_template = include_str!("../sql/trigger_body.plpgsql.in");
     let render_body = |transition_tbl: &str,
                        pred_check_block: &str,
                        filter_skip_block: &str,

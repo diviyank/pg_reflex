@@ -13,10 +13,12 @@
 const DRC_UPSTREAM_SQL: &str = "SELECT g, SUM(w) AS sw, COUNT(*) AS n FROM {p}_us GROUP BY g";
 
 /// `{p}_s` (the dependent's own source), `{p}_us` (the upstream's source), an
-/// IMMEDIATE aggregate `{p}_u` over `{p}_us` whose every write is delegated to a
-/// full reconcile (wipe_threshold 0), and a DEFERRED aggregate `{p}_d` reading
-/// `{p}_s` and `{p}_u` that IGNORES `{p}_u`, kept on the incremental flush path.
-fn drc_build(p: &str) -> String {
+/// aggregate `{p}_u` over `{p}_us` in `upstream_mode` whose every flushed write is
+/// delegated to a full reconcile (wipe_threshold 0; only a DEFERRED flush
+/// dispatches, a statement trigger never rebuilds), and a DEFERRED aggregate
+/// `{p}_d` reading `{p}_s` and `{p}_u` that IGNORES `{p}_u`, kept on the
+/// incremental flush path.
+fn drc_build(p: &str, upstream_mode: &str) -> String {
     Spi::run(&format!(
         "CREATE TABLE {p}_s (k INT PRIMARY KEY, g INT, v INT)"
     ))
@@ -39,7 +41,7 @@ fn drc_build(p: &str) -> String {
             &DRC_UPSTREAM_SQL.replace("{p}", p),
             None,
             None,
-            None,
+            Some(upstream_mode),
             None
         ),
         "CREATE REFLEX INCREMENTAL VIEW"
@@ -82,11 +84,11 @@ fn drc_reconcile(view: &str) {
 /// reconcile, which refreshes the ignoring dependent from the base tables.
 #[pg_test]
 fn pg_drc_dispatch_reconcile_refreshes_ignoring_dependent_once() {
-    let fresh = drc_build("drc1");
+    let fresh = drc_build("drc1", "DEFERRED");
     Spi::run("INSERT INTO drc1_s VALUES (100, 0, 1000)").expect("staged for the dependent");
-    Spi::run("UPDATE drc1_us SET w = w + 1").expect("upstream dispatched to a reconcile");
-    assert_imv_correct("drc1_u", &DRC_UPSTREAM_SQL.replace("{p}", "drc1"));
+    Spi::run("UPDATE drc1_us SET w = w + 1").expect("upstream's flush dispatches a reconcile");
     Spi::run("SET CONSTRAINTS ALL IMMEDIATE").expect("commit-time flush");
+    assert_imv_correct("drc1_u", &DRC_UPSTREAM_SQL.replace("{p}", "drc1"));
     dmw_assert_fresh("drc1_d", &fresh);
 
     Spi::run("INSERT INTO drc1_s VALUES (101, 1, 7)").expect("write after the flush");
@@ -97,7 +99,7 @@ fn pg_drc_dispatch_reconcile_refreshes_ignoring_dependent_once() {
 /// Same, through an explicit `reflex_reconcile` of the upstream.
 #[pg_test]
 fn pg_drc_explicit_upstream_reconcile_refreshes_ignoring_dependent_once() {
-    let fresh = drc_build("drc2");
+    let fresh = drc_build("drc2", "IMMEDIATE");
     Spi::run("INSERT INTO drc2_s VALUES (100, 0, 1000)").expect("staged for the dependent");
     Spi::run("ALTER TABLE drc2_us DISABLE TRIGGER USER").expect("disable");
     Spi::run("UPDATE drc2_us SET w = w + 1").expect("upstream drifts");
@@ -123,7 +125,10 @@ fn pg_drc_dispatch_reconcile_dependent_reading_the_written_table() {
     probe_db_open(DBNAME);
     worker_exec("CREATE TABLE drc6_us (id INT PRIMARY KEY, g INT, w INT)");
     worker_exec("INSERT INTO drc6_us SELECT i, i % 3, i FROM generate_series(1, 12) i");
-    let created = rbc_select(&format!("create_reflex_ivm('drc6_u', {})", sql_lit(up_sql)));
+    let created = rbc_select(&format!(
+        "create_reflex_ivm('drc6_u', {}, NULL, NULL, 'DEFERRED')",
+        sql_lit(up_sql)
+    ));
     assert!(!created.starts_with("ERROR"), "create drc6_u: {created}");
     worker_exec(
         "UPDATE public.__reflex_ivm_reference SET wipe_threshold = 0 WHERE name = 'drc6_u'",
@@ -169,7 +174,7 @@ fn pg_drc_dispatch_reconcile_refreshes_ignoring_dependent_once_commit() {
     worker_exec("CREATE TABLE drc7_us (id INT PRIMARY KEY, g INT, w INT)");
     worker_exec("INSERT INTO drc7_us SELECT i, i % 3, i FROM generate_series(1, 12) i");
     let created = rbc_select(&format!(
-        "create_reflex_ivm('drc7_u', {})",
+        "create_reflex_ivm('drc7_u', {}, NULL, NULL, 'DEFERRED')",
         sql_lit(&up_sql)
     ));
     assert!(!created.starts_with("ERROR"), "create drc7_u: {created}");
