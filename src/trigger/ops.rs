@@ -1123,7 +1123,10 @@ pub(crate) fn passthrough_op_stmts(
                     let del_cold = del_match.stmts(|pred| {
                         format!("DELETE FROM {} WHERE {} AND {}", qv, pred, cold_pred)
                     });
-                    let aff = format!("SELECT {}::text AS pkey FROM {}", part_src_q, pt_old);
+                    let aff = format!(
+                        "SELECT {}::text AS pkey, TRUE AS is_old FROM {}",
+                        part_src_q, pt_old
+                    );
                     stmts.push(build_passthrough_partition_dispatch_sql(
                         view_name,
                         &qv,
@@ -1208,7 +1211,8 @@ pub(crate) fn passthrough_op_stmts(
                         )
                     );
                     let aff = format!(
-                        "SELECT {sc}::text AS pkey FROM {old} UNION SELECT {sc}::text AS pkey FROM {new}",
+                        "SELECT {sc}::text AS pkey, TRUE AS is_old FROM {old} \
+                         UNION ALL SELECT {sc}::text AS pkey, FALSE AS is_old FROM {new}",
                         sc = part_src_q,
                         old = pt_old,
                         new = pt_new
