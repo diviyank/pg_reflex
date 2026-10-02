@@ -215,7 +215,10 @@ partition with many source rows per group rarely goes hot. Pre-existing and
 (SILENT): an IMMEDIATE MIN / MAX aggregate whose source gets one statement
 that both updates and inserts (upsert, MERGE) recomputes the updated groups
 from a source that already holds the inserted rows, which the INSERT trigger
-then merges again; a later DELETE of those rows can leave a wrong MIN / MAX.
+then merges again; a later DELETE of those rows can leave a wrong MIN / MAX. PostgreSQL 15 only: a MERGE with
+UPDATE and INSERT actions into a multi-level partitioned source hands the
+AFTER UPDATE trigger a NEW transition table holding inserted rows, so
+IMMEDIATE IMVs over it get wrong deltas (a PostgreSQL defect; pg16+ correct).
 
 Cost of a DEFERRED TRUNCATE rebuild of a large partitioned IMV with
 dependents: each populated leaf is diffed by staging
