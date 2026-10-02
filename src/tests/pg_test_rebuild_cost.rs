@@ -234,7 +234,6 @@ fn pg_rco_dispatch_sql_raises_on_error_result() {
         "LIST",
         &cold_del,
         "",
-        true,
     );
     let aggregate = crate::trigger::build_partition_aware_dispatch_sql_strategy(
         "v",

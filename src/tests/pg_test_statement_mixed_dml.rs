@@ -522,3 +522,68 @@ fn pg_smd_partition_flush_reconcile_then_delta_not_double_applied() {
     Spi::run("SELECT reflex_flush_partitions()").expect("flush");
     assert_imv_correct("smd25_v", sql);
 }
+
+/// A statement trigger's partitioned passthrough maintenance is the plain keyed
+/// cold body (pruned to the touched LIST values): no volume-dispatch helpers are
+/// called, so it neither pays for them nor needs them during an upgrade. The
+/// DEFERRED flush's netted UPDATE still dispatches.
+#[pg_test]
+fn pg_smd_immediate_partitioned_passthrough_sql_has_no_dispatch() {
+    rcu_build("smd26", false, RC_IMMEDIATE);
+    let sql_for = |op: &str| {
+        Spi::get_one::<String>(&format!(
+            "SELECT reflex_build_delta_sql(r.name, 'smd26_src', '{op}', r.base_query, r.end_query, \
+             r.aggregations::text, r.base_query) FROM public.__reflex_ivm_reference r WHERE r.name = 'smd26_v'"
+        ))
+        .expect("delta sql")
+        .expect("delta sql value")
+    };
+    for op in ["UPDATE", "DELETE"] {
+        let sql = sql_for(op);
+        assert!(
+            !sql.contains("__reflex_rebuild_cost_rows")
+                && !sql.contains("__reflex_target_propagates")
+                && !sql.contains("reflex_reconcile"),
+            "{op}: statement trigger SQL still dispatches:\n{sql}"
+        );
+        assert!(
+            sql.contains("= ANY($1::text[]::"),
+            "{op}: LIST pruning lost:\n{sql}"
+        );
+    }
+    let netted = sql_for("UPDATE_NETTED");
+    assert!(
+        netted.contains("__reflex_rebuild_cost_rows"),
+        "the flush no longer dispatches:\n{netted}"
+    );
+}
+
+/// Touched rows with a NULL partition value (DEFAULT partition) are maintained
+/// without the value restriction, which could not match them.
+#[pg_test]
+fn pg_smd_immediate_partitioned_passthrough_null_partition_value() {
+    Spi::run(
+        "CREATE TABLE smd27_src (plan INT, id INT NOT NULL, v INT, UNIQUE (plan, id)) PARTITION BY LIST (plan)",
+    )
+    .expect("root");
+    Spi::run("CREATE TABLE smd27_src_1 PARTITION OF smd27_src FOR VALUES IN (1)").expect("p1");
+    Spi::run("CREATE TABLE smd27_src_d PARTITION OF smd27_src DEFAULT").expect("default");
+    Spi::run(
+        "INSERT INTO smd27_src SELECT CASE WHEN i % 3 = 0 THEN NULL ELSE 1 END, i, i FROM generate_series(1, 300) i",
+    )
+    .expect("seed");
+    let sql = "SELECT plan, id, v FROM smd27_src";
+    let created = Spi::get_one::<String>(&format!(
+        "SELECT create_reflex_ivm('smd27_v', '{sql}', 'plan, id', NULL, 'IMMEDIATE', NULL, ARRAY['plan'])"
+    ))
+    .expect("create call")
+    .expect("create result");
+    assert_eq!(created, "CREATE REFLEX INCREMENTAL VIEW");
+    for stmt in [
+        "UPDATE smd27_src SET v = v + 1 WHERE id % 2 = 0",
+        "DELETE FROM smd27_src WHERE id % 5 = 0",
+    ] {
+        Spi::run(stmt).unwrap_or_else(|e| panic!("<{stmt}>: {e}"));
+        assert_imv_correct("smd27_v", sql);
+    }
+}

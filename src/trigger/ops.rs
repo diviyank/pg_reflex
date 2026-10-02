@@ -1043,6 +1043,56 @@ fn passthrough_cold_pred(
     }
 }
 
+/// The keyed passthrough DELETEs of a statement trigger, which never rebuilds a
+/// partition (see `passthrough_op_stmts`). On a LIST-partitioned target they are
+/// restricted to the partition values the transition tables touch, so only those
+/// partitions are scanned: run in a DO block that collects the values and appends
+/// `<part_col> = ANY(<values>)`. A touched NULL value leaves them unrestricted.
+fn list_pruned_deletes(
+    plan: &AggregationPlan,
+    mappings: &[(String, String)],
+    qv: &str,
+    transition_scratch: &[&str],
+    deletes: Vec<String>,
+) -> Vec<String> {
+    let Some((part_col, part_col_q, part_src_q, strategy)) =
+        passthrough_partition_dispatch_cols(plan, mappings)
+    else {
+        return deletes;
+    };
+    if !strategy.eq_ignore_ascii_case("LIST") {
+        return deletes;
+    }
+    let values = transition_scratch
+        .iter()
+        .map(|t| format!("SELECT {part_src_q}::text AS pkey FROM {t}"))
+        .collect::<Vec<_>>()
+        .join(" UNION ALL ");
+    let parent_lit = qv.replace('"', "").replace('\'', "''");
+    let part_col_lit = part_col.replace('"', "").replace('\'', "''");
+    let (pruned, plain): (String, String) = deletes
+        .iter()
+        .map(|d| {
+            let d = d.replace("$reflex_pruned$", "$reflex_pruned_x$");
+            (
+                format!(
+                    "EXECUTE $reflex_pruned${d}$reflex_pruned$ || ' AND {qv}.{part_col_q} = ANY($1::text[]::' || _part_type || '[])' USING _vals; "
+                ),
+                format!("EXECUTE $reflex_pruned${d}$reflex_pruned$; "),
+            )
+        })
+        .unzip();
+    vec![format!(
+        "DO $reflex_pt_cold$ DECLARE _vals TEXT[]; _has_null BOOLEAN; _part_type TEXT; BEGIN \
+         SELECT array_agg(DISTINCT pkey) FILTER (WHERE pkey IS NOT NULL), COALESCE(bool_or(pkey IS NULL), FALSE) \
+           INTO _vals, _has_null FROM ({values}) __pv; \
+         SELECT atttypid::regtype::text INTO _part_type FROM pg_attribute \
+           WHERE attrelid = '{parent_lit}'::regclass AND attname = '{part_col_lit}' AND attnum > 0; \
+         IF _has_null THEN {plain}ELSIF _vals IS NOT NULL THEN {pruned}END IF; \
+         END $reflex_pt_cold$"
+    )]
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn passthrough_op_stmts(
     view_name: &str,
@@ -1083,6 +1133,18 @@ pub(crate) fn passthrough_op_stmts(
     }
 
     match operation {
+        "INSERT" | "INSERT_PROMOTED" if mappings.is_none() => {
+            // A source with no key reaching the IMV is fully refreshed on every
+            // operation, INSERT included. Its UPDATE / DELETE cannot be keyed and
+            // are refreshed from the source, which already holds the rows another
+            // trigger of the same statement (upsert, MERGE, writable CTE) applies
+            // afterwards; appending an INSERT's delta on top would count them
+            // twice. A refresh by every trigger is idempotent. (Removing exactly
+            // the OLD images instead is only valid for a query distributive over
+            // this source, which keyless shapes — RIGHT JOIN nullable side,
+            // DISTINCT — are not.)
+            stmts.push(rebuild_target_stmt(view_name, base_query));
+        }
         "INSERT" | "INSERT_PROMOTED" => {
             let delta_q = scoped_delta_query(base_query, source_table, &pt_new);
             stmts.push(format!("INSERT INTO {} {}", qv, delta_q));
@@ -1097,7 +1159,7 @@ pub(crate) fn passthrough_op_stmts(
                 let source_cols: Vec<String> =
                     mappings.iter().map(|(_, s)| format!("\"{}\"", s)).collect();
                 if let Some((part_col, part_col_q, part_src_q, strategy)) =
-                    passthrough_partition_dispatch_cols(plan, mappings)
+                    passthrough_partition_dispatch_cols(plan, mappings).filter(|_| netted_delta)
                 {
                     // Hybrid partition dispatch (audit #2): DELETE-only, so no
                     // cold INSERT body. Hot leaves are swapped (rebuilt from the
@@ -1142,7 +1204,6 @@ pub(crate) fn passthrough_op_stmts(
                         &strategy,
                         &del_cold,
                         "",
-                        netted_delta,
                     ));
                 } else {
                     let del_match = passthrough_keyed_delete_match(
@@ -1153,9 +1214,14 @@ pub(crate) fn passthrough_op_stmts(
                         &source_cols,
                         &plan.not_null_columns,
                     );
-                    stmts.extend(
-                        del_match.stmts(|pred| format!("DELETE FROM {} WHERE {}", qv, pred)),
-                    );
+                    let dels = del_match.stmts(|pred| format!("DELETE FROM {} WHERE {}", qv, pred));
+                    stmts.extend(list_pruned_deletes(
+                        plan,
+                        mappings,
+                        &qv,
+                        &[pt_old.as_str()],
+                        dels,
+                    ));
                 }
                 if operation == "DELETE_PROMOTED" {
                     stmts.push(format!("ANALYZE {}", qv));
@@ -1174,7 +1240,7 @@ pub(crate) fn passthrough_op_stmts(
                 let base_ins = format!("INSERT INTO {} {}", qv, delta_new);
 
                 if let Some((part_col, part_col_q, part_src_q, strategy)) =
-                    passthrough_partition_dispatch_cols(plan, mappings)
+                    passthrough_partition_dispatch_cols(plan, mappings).filter(|_| netted_delta)
                 {
                     // Hybrid partition dispatch (audit #2): hot leaves swapped,
                     // cold leaves keyed-maintained. The cold DELETE extends the
@@ -1238,7 +1304,6 @@ pub(crate) fn passthrough_op_stmts(
                         &strategy,
                         &del_cold,
                         &ins_cold,
-                        netted_delta,
                     ));
                 } else {
                     // PS-5 — gated pair on the unpartitioned path only; see the
@@ -1254,9 +1319,14 @@ pub(crate) fn passthrough_op_stmts(
                         &source_cols,
                         &plan.not_null_columns,
                     );
-                    stmts.extend(
-                        del_match.stmts(|pred| format!("DELETE FROM {} WHERE {}", qv, pred)),
-                    );
+                    let dels = del_match.stmts(|pred| format!("DELETE FROM {} WHERE {}", qv, pred));
+                    stmts.extend(list_pruned_deletes(
+                        plan,
+                        mappings,
+                        &qv,
+                        &[pt_old.as_str(), pt_new.as_str()],
+                        dels,
+                    ));
                     stmts.push(base_ins);
                 }
             } else {

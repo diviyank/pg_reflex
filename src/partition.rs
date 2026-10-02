@@ -3662,6 +3662,20 @@ pub(crate) fn rearm_capped_partition_root(source_root: &str) -> i64 {
     set_partition_failures(Some(source_root), PARTITION_FLUSH_FAILURE_CAP - 1)
 }
 
+/// Run one IMV's per-child delta calls in order, stopping at the first that
+/// reconciled the IMV: a reconcile rebuilds it from the source, which already
+/// holds every child of this flush, so any later child's delta would be applied
+/// a second time. Calls that came before are overwritten by the rebuild.
+fn stop_after_reconcile_block(calls: &[String]) -> String {
+    let steps: String = calls
+        .iter()
+        .map(|call| {
+            format!("_r := {call}; IF _r LIKE 'RECONCILED%' THEN EXIT reflex_imv_delta; END IF; ")
+        })
+        .collect();
+    format!("<<reflex_imv_delta>> DECLARE _r TEXT; BEGIN {steps}END reflex_imv_delta")
+}
+
 pub(crate) fn reflex_flush_partitions_impl(only: Option<&str>) -> String {
     let outcome: Result<String, String> = Spi::connect_mut(|client| {
         let (roots, capped_roots): (Vec<String>, Vec<CappedRoot>) = match only {
@@ -4024,7 +4038,7 @@ pub(crate) fn reflex_flush_partitions_impl(only: Option<&str>) -> String {
                         };
                         match oid.and_then(|o| oid_to_qualified_name(client, o)) {
                             Some(child) => delta_stmts.push(format!(
-                                "PERFORM public.reflex_apply_partition_delta({}, {}, '{}', {}, {})",
+                                "public.reflex_apply_partition_delta({}, {}, '{}', {}, {})",
                                 sql_literal_text(imv),
                                 sql_literal_text(&source),
                                 op,
@@ -4045,7 +4059,7 @@ pub(crate) fn reflex_flush_partitions_impl(only: Option<&str>) -> String {
                                     .and_then(list_bound_inner);
                                 match (&part_key_col, bound_inner) {
                                     (Some(keycol), Some(inner)) => delta_stmts.push(format!(
-                                        "PERFORM public.reflex_partition_drop_maybe_skip({}, {}, {})",
+                                        "public.reflex_partition_drop_maybe_skip({}, {}, {})",
                                         sql_literal_text(imv),
                                         sql_literal_text(keycol),
                                         sql_literal_text(&inner),
@@ -4067,7 +4081,7 @@ pub(crate) fn reflex_flush_partitions_impl(only: Option<&str>) -> String {
                     ));
                     summary.push(format!("{}: full reconcile (unpartitioned)", imv));
                 } else if !delta_stmts.is_empty() {
-                    root_stmts.extend(delta_stmts);
+                    root_stmts.push(stop_after_reconcile_block(&delta_stmts));
                     summary.push(format!(
                         "{}: incremental partition delta ({} change(s))",
                         imv,

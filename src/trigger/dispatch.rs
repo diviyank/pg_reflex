@@ -395,9 +395,9 @@ pub(crate) fn build_partition_aware_dispatch_sql_strategy(
 /// counts once on each side, with no join of old to new on the row key. Only rows
 /// crossing in BOTH directions between the same two children are undercounted
 /// (toward the incremental cold path). `cold_insert_with_filter` may be empty
-/// (DELETE-only operations); the INSERT EXECUTE is then omitted. With
-/// `allow_hot = false` every partition is classified cold (the trip-cap cannot
-/// fire either) and the whole change takes the keyed cold body.
+/// (DELETE-only operations); the INSERT EXECUTE is then omitted.
+/// Emitted only for the DEFERRED flush's netted delta (a statement trigger never
+/// rebuilds, see `passthrough_op_stmts`).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_passthrough_partition_dispatch_sql(
     view_name: &str,
@@ -408,7 +408,6 @@ pub(crate) fn build_passthrough_partition_dispatch_sql(
     strategy: &str,
     cold_delete_variants: &[String],
     cold_insert_with_filter: &str,
-    allow_hot: bool,
 ) -> String {
     let safe_view = view_name.replace('\'', "''");
     let safe_part_col_lit = partition_col.replace('"', "").replace('\'', "''");
@@ -577,7 +576,7 @@ pub(crate) fn build_passthrough_partition_dispatch_sql(
              ),\n\
              classified AS (\n\
                  SELECT pc.rep_key, pc.child_oid::text AS child_name,\n\
-                        (pc.dirty::NUMERIC / GREATEST(public.__reflex_rebuild_cost_rows('{view}', pc.child_oid)::NUMERIC, _floor::NUMERIC) >= _thr AND {allow_hot}) AS hot\n\
+                        (pc.dirty::NUMERIC / GREATEST(public.__reflex_rebuild_cost_rows('{view}', pc.child_oid)::NUMERIC, _floor::NUMERIC) >= _thr) AS hot\n\
                  FROM per_child pc JOIN pg_class c ON c.oid = pc.child_oid\n\
              )\n\
              SELECT COALESCE(array_agg(rep_key::text) FILTER (WHERE hot), ARRAY[]::TEXT[]),\n\
@@ -616,7 +615,6 @@ pub(crate) fn build_passthrough_partition_dispatch_sql(
         del_block = del_block,
         ins_block = ins_block,
         cold_dispatch_block = cold_dispatch_block,
-        allow_hot = allow_hot,
     )
 }
 
