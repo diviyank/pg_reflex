@@ -38,6 +38,11 @@
 --      23505 for a passthrough. The block is cut out of each installed body
 --      in place. No other per-source trigger body changed in 1.11.5.
 --
+--   6. `__reflex_partition_child_for_key` resolves a NULL key to the child
+--      holding NULL (DEFAULT, or a LIST child listing NULL) instead of to no
+--      child, so the DEFERRED flush dispatch rebuilds a hot DEFAULT child's
+--      NULL rows once instead of also merging them cold.
+--
 --   4. 'TRUNCATE' request rows committed by a 1.11.5 library running with the
 --      1.11.4 flush function (between the library install and this update)
 --      are deleted: their events have fired, and nothing else removes them.
@@ -256,13 +261,53 @@ BEGIN
     IF COALESCE(array_length(_skipped, 1), 0) > 0 THEN
         RAISE WARNING '%', format('pg_reflex 1.11.5: %s statement-trigger bodies still rebuild the IMV on a large statement: %s. '
             'Until repaired, a statement that both updates and inserts (upsert, MERGE, writable CTE) a large share of such a source '
-            'can double count its aggregate IMVs. Remedy, after the upgrade: create, then drop, a throwaway IMV over each source listed, '
+            'can double count its aggregate IMVs. Remedy, after the upgrade: create, then drop, a throwaway DEFERRED IMV over each source listed, '
             'spelled as listed (create_reflex_ivm re-renders the source''s trigger bodies; reflex_rebuild_triggers does not reach '
             'the live triggers of a bare-named source), then reflex_reconcile its IMVs.',
             array_length(_skipped, 1), array_to_string(_skipped, '; '));
     END IF;
 END
 $stmt_triggers$;
+
+-- === A NULL partition key resolves to its DEFAULT child (step 6) ===
+-- Same body as the extension_sql! in src/lib.rs.
+
+CREATE OR REPLACE FUNCTION public.__reflex_partition_child_for_key(
+    parent regclass, part_col TEXT, k TEXT
+) RETURNS regclass
+LANGUAGE plpgsql STABLE AS $REFLEX$
+DECLARE
+    _r RECORD;
+    _expr TEXT;
+    _match BOOLEAN;
+    _ident_re TEXT;
+BEGIN
+    IF parent IS NULL OR part_col IS NULL THEN
+        RETURN NULL;
+    END IF;
+    _ident_re := '\m(?:' || regexp_replace(part_col, '([\\.+*?^$()\[\]{}|])', '\\\1', 'g')
+                 || ')\M';
+    FOR _r IN
+        SELECT c.oid::regclass AS rc,
+               pg_get_partition_constraintdef(c.oid) AS def
+        FROM pg_inherits i
+        JOIN pg_class c ON c.oid = i.inhrelid
+        WHERE i.inhparent = parent
+    LOOP
+        IF _r.def IS NULL OR _r.def = '' THEN CONTINUE; END IF;
+        _expr := regexp_replace(_r.def, _ident_re, COALESCE(quote_literal(k), 'NULL'), 'gi');
+        BEGIN
+            EXECUTE 'SELECT (' || _expr || ')::boolean' INTO _match;
+        EXCEPTION WHEN OTHERS THEN
+            _match := FALSE;
+        END;
+        IF _match THEN
+            RETURN _r.rc;
+        END IF;
+    END LOOP;
+    RETURN NULL;
+END;
+$REFLEX$;
 
 -- === Leftover truncate flush requests ===
 
