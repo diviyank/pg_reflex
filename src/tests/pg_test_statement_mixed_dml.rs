@@ -704,3 +704,133 @@ fn pg_smd_deferred_aggregate_hot_multivalue_list_child() {
     rc_flush();
     assert_imv_correct("smd32_v", sql);
 }
+
+/// A NULL partition value lives in the DEFAULT child. The flush dispatch resolved
+/// it to no child, so it stayed cold even when its DEFAULT child went hot: the
+/// child's rebuild already held the NULL groups' new values, and the cold MERGE
+/// added their delta again.
+fn smd_null_in_hot_default(p: &str, strategy: &str) {
+    Spi::run(&format!(
+        "CREATE TABLE {p}_src (plan INT, id INT NOT NULL, v INT) PARTITION BY {strategy} (plan)"
+    ))
+    .expect("root");
+    let (b1, b2) = if strategy == "LIST" {
+        ("IN (1)", "IN (2)")
+    } else {
+        ("FROM (1) TO (2)", "FROM (2) TO (3)")
+    };
+    Spi::run(&format!(
+        "CREATE TABLE {p}_src_1 PARTITION OF {p}_src FOR VALUES {b1}"
+    ))
+    .expect("p1");
+    Spi::run(&format!(
+        "CREATE TABLE {p}_src_2 PARTITION OF {p}_src FOR VALUES {b2}"
+    ))
+    .expect("p2");
+    Spi::run(&format!(
+        "CREATE TABLE {p}_src_d PARTITION OF {p}_src DEFAULT"
+    ))
+    .expect("default");
+    Spi::run(&format!(
+        "INSERT INTO {p}_src SELECT CASE i % 4 WHEN 0 THEN NULL WHEN 1 THEN 9 ELSE i % 4 - 1 END, i, i \
+         FROM generate_series(1, 8000) i"
+    ))
+    .expect("seed");
+    let sql = format!("SELECT plan, id, SUM(v) AS s, COUNT(*) AS n FROM {p}_src GROUP BY plan, id");
+    let created = Spi::get_one::<String>(&format!(
+        "SELECT create_reflex_ivm('{p}_v', '{sql}', NULL, NULL, 'DEFERRED')"
+    ))
+    .expect("create call")
+    .expect("create result");
+    assert_eq!(created, "CREATE REFLEX INCREMENTAL VIEW");
+    Spi::run(&format!("ANALYZE {p}_src")).expect("analyze");
+    Spi::run("SET LOCAL reflex.wipe_threshold = 0.2").expect("threshold");
+    Spi::run(&format!(
+        "UPDATE {p}_src SET v = v + 1 WHERE plan IS NULL OR plan = 9"
+    ))
+    .expect("update");
+    rc_flush();
+    assert_imv_correct(&format!("{p}_v"), &sql);
+}
+
+#[pg_test]
+fn pg_smd_deferred_aggregate_null_in_hot_list_default() {
+    smd_null_in_hot_default("smd33", "LIST");
+}
+
+#[pg_test]
+fn pg_smd_deferred_aggregate_null_in_hot_range_default() {
+    smd_null_in_hot_default("smd34", "RANGE");
+}
+
+/// Two-level source (LIST plan -> RANGE m) with a sub-partitioned DEFAULT plan
+/// child: NULL and unlisted plans resolve to the DEFAULT child, which goes hot
+/// as a whole, while plan 1 stays cold.
+#[pg_test]
+fn pg_smd_deferred_two_level_null_in_hot_default() {
+    Spi::run("CREATE TABLE smd35_src (plan INT, m INT NOT NULL, id INT NOT NULL, v INT) PARTITION BY LIST (plan)")
+        .expect("root");
+    for (child, bound) in [
+        ("1", "FOR VALUES IN (1)"),
+        ("2", "FOR VALUES IN (2)"),
+        ("d", "DEFAULT"),
+    ] {
+        Spi::run(&format!(
+            "CREATE TABLE smd35_src_{child} PARTITION OF smd35_src {bound} PARTITION BY RANGE (m)"
+        ))
+        .expect("plan child");
+        Spi::run(&format!(
+            "CREATE TABLE smd35_src_{child}_a PARTITION OF smd35_src_{child} FOR VALUES FROM (0) TO (6)"
+        ))
+        .expect("leaf a");
+        Spi::run(&format!(
+            "CREATE TABLE smd35_src_{child}_b PARTITION OF smd35_src_{child} FOR VALUES FROM (6) TO (12)"
+        ))
+        .expect("leaf b");
+    }
+    Spi::run(
+        "INSERT INTO smd35_src SELECT CASE i % 4 WHEN 0 THEN NULL WHEN 1 THEN 9 ELSE i % 4 - 1 END, i % 12, i, i \
+         FROM generate_series(1, 8000) i",
+    )
+    .expect("seed");
+    let sql = "SELECT plan, m, id, SUM(v) AS s, COUNT(*) AS n FROM smd35_src GROUP BY plan, m, id";
+    let created = Spi::get_one::<String>(&format!(
+        "SELECT create_reflex_ivm('smd35_v', '{sql}', NULL, NULL, 'DEFERRED')"
+    ))
+    .expect("create call")
+    .expect("create result");
+    assert_eq!(created, "CREATE REFLEX INCREMENTAL VIEW");
+    Spi::run("ANALYZE smd35_src").expect("analyze");
+    Spi::run("SET LOCAL reflex.wipe_threshold = 0.2").expect("threshold");
+    Spi::run("UPDATE smd35_src SET v = v + 1 WHERE plan IS NULL OR plan = 9 OR (plan = 1 AND id % 50 = 0)")
+        .expect("update");
+    rc_flush();
+    assert_imv_correct("smd35_v", sql);
+}
+
+/// A passthrough over the same two-level shape: NULL and unlisted plans in the
+/// hot DEFAULT child are rebuilt once, not also re-inserted cold.
+#[pg_test]
+fn pg_smd_deferred_passthrough_null_in_hot_default() {
+    Spi::run("CREATE TABLE smd36_src (plan INT, id INT NOT NULL, v INT, UNIQUE (plan, id)) PARTITION BY LIST (plan)")
+        .expect("root");
+    Spi::run("CREATE TABLE smd36_src_1 PARTITION OF smd36_src FOR VALUES IN (1)").expect("p1");
+    Spi::run("CREATE TABLE smd36_src_d PARTITION OF smd36_src DEFAULT").expect("default");
+    Spi::run(
+        "INSERT INTO smd36_src SELECT CASE i % 3 WHEN 0 THEN NULL WHEN 1 THEN 9 ELSE 1 END, i, i \
+         FROM generate_series(1, 6000) i",
+    )
+    .expect("seed");
+    let sql = "SELECT plan, id, v FROM smd36_src";
+    let created = Spi::get_one::<String>(&format!(
+        "SELECT create_reflex_ivm('smd36_v', '{sql}', 'plan, id', NULL, 'DEFERRED', NULL, ARRAY['plan'])"
+    ))
+    .expect("create call")
+    .expect("create result");
+    assert_eq!(created, "CREATE REFLEX INCREMENTAL VIEW");
+    Spi::run("ANALYZE smd36_src").expect("analyze");
+    Spi::run("SET LOCAL reflex.wipe_threshold = 0.2").expect("threshold");
+    Spi::run("UPDATE smd36_src SET v = v + 1 WHERE plan IS NULL OR plan = 9").expect("update");
+    rc_flush();
+    assert_imv_correct("smd36_v", sql);
+}
