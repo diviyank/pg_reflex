@@ -665,3 +665,42 @@ fn pg_smd_deferred_partitioned_passthrough_multivalue_list_child() {
 fn pg_smd_immediate_partitioned_passthrough_multivalue_list_child() {
     smd_multivalue_list("smd30", RC_IMMEDIATE);
 }
+
+/// A multi-value LIST child going hot: the cold body must exclude every touched
+/// value of the rebuilt child, not only its representative one. Here 80% of
+/// plan 1 moves to plan 2 (same child): the child is rebuilt, and the cold
+/// insert of the moved rows must not run on it again.
+#[pg_test]
+fn pg_smd_deferred_passthrough_hot_multivalue_list_child() {
+    smd_multivalue_list("smd31", RC_DEFERRED);
+    Spi::run("CREATE TABLE smd31_src_4 PARTITION OF smd31_src FOR VALUES IN (4)").expect("p4");
+    Spi::run("UPDATE smd31_src SET plan = 2 WHERE plan = 1 AND id % 5 <> 0").expect("move");
+    rc_flush();
+    assert_imv_correct("smd31_v", "SELECT plan, id, v FROM smd31_src");
+}
+
+/// Same for a partitioned aggregate (one group per row): a hot multi-value LIST
+/// child is rebuilt, and its other value's groups must not also be merged cold.
+#[pg_test]
+fn pg_smd_deferred_aggregate_hot_multivalue_list_child() {
+    Spi::run(
+        "CREATE TABLE smd32_src (plan INT NOT NULL, id INT NOT NULL, v INT) PARTITION BY LIST (plan)",
+    )
+    .expect("root");
+    Spi::run("CREATE TABLE smd32_src_12 PARTITION OF smd32_src FOR VALUES IN (1, 2)").expect("p12");
+    Spi::run("CREATE TABLE smd32_src_3 PARTITION OF smd32_src FOR VALUES IN (3)").expect("p3");
+    Spi::run("CREATE TABLE smd32_src_4 PARTITION OF smd32_src FOR VALUES IN (4)").expect("p4");
+    Spi::run("INSERT INTO smd32_src SELECT 1 + i % 4, i, i FROM generate_series(1, 4000) i")
+        .expect("seed");
+    let sql = "SELECT plan, id, SUM(v) AS s, COUNT(*) AS n FROM smd32_src GROUP BY plan, id";
+    let created = Spi::get_one::<String>(&format!(
+        "SELECT create_reflex_ivm('smd32_v', '{sql}', NULL, NULL, 'DEFERRED')"
+    ))
+    .expect("create call")
+    .expect("create result");
+    assert_eq!(created, "CREATE REFLEX INCREMENTAL VIEW");
+    Spi::run("ANALYZE smd32_src").expect("analyze");
+    Spi::run("UPDATE smd32_src SET v = v + 1 WHERE plan IN (1, 2)").expect("update");
+    rc_flush();
+    assert_imv_correct("smd32_v", sql);
+}
