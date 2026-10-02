@@ -232,8 +232,9 @@ pub(crate) const WIPE_FLOOR_ROWS_DEFAULT: i64 = 1000;
 /// caller's SQL strings:
 ///   * **LIST**  → `array_position($1::TEXT[], <part_col>::text) IS NULL` — bind
 ///     `_hot_vals`, EVERY touched value of a hot child (a LIST child may hold
-///     several values; `array_position` keeps NULL values cold).
-///   * **RANGE** → `__reflex_partition_child_for_key(...)::text <> ALL($2::text[])`
+///     several values; `array_position` matches NULL, so a NULL value is
+///     excluded with its hot DEFAULT child).
+///   * **RANGE** → `array_position($2::text[], __reflex_partition_child_for_key(...)::text) IS NULL`
 ///     (hot CHILD names; a value-array filter is wrong because many values map to
 ///     one range child, and an OID filter is wrong because the swap changes the
 ///     child OID) — bind `_hot_keys, _hot_child_names`.
@@ -316,6 +317,10 @@ pub(crate) fn build_partition_aware_dispatch_sql_strategy(
              -- VOLATILE __reflex_partition_child_for_key down into the row scan,\n\
              -- calling it once PER CHANGED ROW (O(delta), ~seconds at 10-100k rows)\n\
              -- instead of once per DISTINCT touched partition (O(partitions), ms).\n\
+             -- A NULL value resolves to the child holding it (DEFAULT, or a LIST\n\
+             -- child listing NULL) and is hot or cold with it; a child touched only\n\
+             -- by NULL has no text representative for reflex_reconcile_partition,\n\
+             -- so it stays cold.\n\
              WITH per_val AS MATERIALIZED (\n\
                  SELECT \"{part_col}\"::text AS pkey, count(*) AS dirty\n\
                  FROM {affected}\n\
@@ -325,8 +330,8 @@ pub(crate) fn build_partition_aware_dispatch_sql_strategy(
                  SELECT pv.pkey, pv.dirty, cfk.child\n\
                  FROM per_val pv\n\
                  CROSS JOIN LATERAL (\n\
-                     SELECT CASE WHEN pv.pkey IS NOT NULL THEN public.__reflex_partition_child_for_key(\n\
-                                '{int_parent}'::regclass, '{part_col_lit}', pv.pkey) END AS child\n\
+                     SELECT public.__reflex_partition_child_for_key(\n\
+                                '{int_parent}'::regclass, '{part_col_lit}', pv.pkey) AS child\n\
                  ) cfk\n\
              ),\n\
              per_child AS (\n\
@@ -339,7 +344,7 @@ pub(crate) fn build_partition_aware_dispatch_sql_strategy(
              ),\n\
              classified AS (\n\
                  SELECT pc.child_oid, pc.rep_key, pc.child_oid::text AS child_name,\n\
-                        (pc.dirty::NUMERIC / GREATEST(public.__reflex_rebuild_cost_rows('{view}', pc.child_oid)::NUMERIC, _floor::NUMERIC) >= _thr) AS hot\n\
+                        (pc.rep_key IS NOT NULL AND pc.dirty::NUMERIC / GREATEST(public.__reflex_rebuild_cost_rows('{view}', pc.child_oid)::NUMERIC, _floor::NUMERIC) >= _thr) AS hot\n\
                  FROM per_child pc JOIN pg_class c ON c.oid = pc.child_oid\n\
              )\n\
              SELECT COALESCE(array_agg(rep_key::text) FILTER (WHERE hot), ARRAY[]::TEXT[]),\n\
@@ -563,6 +568,10 @@ pub(crate) fn build_passthrough_partition_dispatch_sql(
              -- VOLATILE __reflex_partition_child_for_key down into the row scan,\n\
              -- calling it once PER CHANGED ROW (O(delta), ~seconds at 10-100k rows)\n\
              -- instead of once per DISTINCT touched partition (O(partitions), ms).\n\
+             -- A NULL value resolves to the child holding it (DEFAULT, or a LIST\n\
+             -- child listing NULL) and is hot or cold with it; a child touched only\n\
+             -- by NULL has no text representative for reflex_reconcile_partition,\n\
+             -- so it stays cold.\n\
              WITH per_val AS MATERIALIZED (\n\
                  SELECT pkey::text AS pkey,\n\
                         count(*) FILTER (WHERE is_old) AS old_rows,\n\
@@ -573,7 +582,7 @@ pub(crate) fn build_passthrough_partition_dispatch_sql(
                  SELECT pv.pkey, pv.old_rows, pv.new_rows, cfk.child\n\
                  FROM per_val pv\n\
                  CROSS JOIN LATERAL (\n\
-                     SELECT CASE WHEN pv.pkey IS NOT NULL THEN public.__reflex_partition_child_for_key('{parent}'::regclass, '{part_col_lit}', pv.pkey) END AS child\n\
+                     SELECT public.__reflex_partition_child_for_key('{parent}'::regclass, '{part_col_lit}', pv.pkey) AS child\n\
                  ) cfk\n\
              ),\n\
              per_child AS (\n\
@@ -586,7 +595,7 @@ pub(crate) fn build_passthrough_partition_dispatch_sql(
              ),\n\
              classified AS (\n\
                  SELECT pc.child_oid, pc.rep_key, pc.child_oid::text AS child_name,\n\
-                        (pc.dirty::NUMERIC / GREATEST(public.__reflex_rebuild_cost_rows('{view}', pc.child_oid)::NUMERIC, _floor::NUMERIC) >= _thr) AS hot\n\
+                        (pc.rep_key IS NOT NULL AND pc.dirty::NUMERIC / GREATEST(public.__reflex_rebuild_cost_rows('{view}', pc.child_oid)::NUMERIC, _floor::NUMERIC) >= _thr) AS hot\n\
                  FROM per_child pc JOIN pg_class c ON c.oid = pc.child_oid\n\
              )\n\
              -- _hot_vals: EVERY touched value of a hot child (the LIST cold-exclusion\n\
@@ -599,7 +608,8 @@ pub(crate) fn build_passthrough_partition_dispatch_sql(
                     COALESCE((SELECT array_agg(r.pkey) FROM resolved r WHERE r.pkey IS NOT NULL\n\
                               AND NOT EXISTS (SELECT 1 FROM classified k WHERE k.child_oid = r.child AND k.hot)),\n\
                              ARRAY[]::TEXT[]),\n\
-                    COALESCE((SELECT bool_or(r.pkey IS NULL) FROM resolved r), FALSE)\n\
+                    COALESCE((SELECT bool_or(r.pkey IS NULL) FROM resolved r\n\
+                              WHERE NOT EXISTS (SELECT 1 FROM classified k WHERE k.child_oid = r.child AND k.hot)), FALSE)\n\
                  INTO _hot_keys, _hot_child_names, _hot_vals, _cold_keys, _cold_has_null\n\
                  FROM classified;\n\
              _hot_count := COALESCE(array_length(_hot_keys, 1), 0);\n\

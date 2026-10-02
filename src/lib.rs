@@ -445,6 +445,8 @@ extension_sql!(
     --
     -- LIST: works directly (constraint is `col = ANY(ARRAY['A','B'])`).
     -- RANGE: works for single-column RANGE (constraint is a < /<= test).
+    -- A NULL key is substituted as NULL, so it resolves to the DEFAULT child
+    -- (or a LIST child listing NULL), where the row actually lives.
     -- Multi-column partition keys: NOT supported (single-key v1 limit).
     CREATE OR REPLACE FUNCTION public.__reflex_partition_child_for_key(
         parent regclass, part_col TEXT, k TEXT
@@ -456,7 +458,7 @@ extension_sql!(
         _match BOOLEAN;
         _ident_re TEXT;
     BEGIN
-        IF parent IS NULL OR part_col IS NULL OR k IS NULL THEN
+        IF parent IS NULL OR part_col IS NULL THEN
             RETURN NULL;
         END IF;
         _ident_re := '\m(?:' || regexp_replace(part_col, '([\\.+*?^$()\[\]{}|])', '\\\1', 'g')
@@ -469,7 +471,7 @@ extension_sql!(
             WHERE i.inhparent = parent
         LOOP
             IF _r.def IS NULL OR _r.def = '' THEN CONTINUE; END IF;
-            _expr := regexp_replace(_r.def, _ident_re, quote_literal(k), 'gi');
+            _expr := regexp_replace(_r.def, _ident_re, COALESCE(quote_literal(k), 'NULL'), 'gi');
             BEGIN
                 EXECUTE 'SELECT (' || _expr || ')::boolean' INTO _match;
             EXCEPTION WHEN OTHERS THEN
