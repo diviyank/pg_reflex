@@ -215,7 +215,7 @@ fn pg_rco_dispatch_sql_raises_on_error_result() {
     let passthrough = crate::trigger::build_passthrough_partition_dispatch_sql(
         "v",
         "\"public\".\"v\"",
-        "SELECT 1 AS pkey",
+        "SELECT 1 AS pkey, TRUE AS is_old",
         "region",
         "\"public\".\"v\".\"region\"",
         "LIST",
@@ -359,16 +359,30 @@ fn rcu_all_plan_leaf_oids(imv: &str) -> Vec<String> {
         .collect()
 }
 
-/// Rows UPDATEd in place in the target's leaves this transaction. The cold path
-/// maintains a passthrough UPDATE as keyed DELETE + INSERT; only the hot leaf
-/// diff (the rebuild taken when the target has dependents) UPDATEs rows.
-fn rcu_target_rows_updated(imv: &str) -> i64 {
-    Spi::get_one::<i64>(&format!(
-        "SELECT COALESCE(sum(pg_stat_get_xact_tuples_updated(relid)), 0)::int8 \
-         FROM pg_partition_tree('{imv}'::regclass) WHERE isleaf"
-    ))
-    .expect("updated stats")
-    .unwrap_or(0)
+/// Rows (inserted, updated, deleted) in the target's leaves this transaction. The
+/// cold path maintains a passthrough UPDATE as keyed DELETE + INSERT; only the hot
+/// leaf diff (the rebuild taken when the target has dependents) UPDATEs rows.
+fn rcu_target_xact_counts(imv: &str) -> (i64, i64, i64) {
+    Spi::connect(|client| {
+        let row = client
+            .select(
+                &format!(
+                    "SELECT COALESCE(sum(pg_stat_get_xact_tuples_inserted(relid)), 0)::int8, \
+                            COALESCE(sum(pg_stat_get_xact_tuples_updated(relid)), 0)::int8, \
+                            COALESCE(sum(pg_stat_get_xact_tuples_deleted(relid)), 0)::int8 \
+                     FROM pg_partition_tree('{imv}'::regclass) WHERE isleaf"
+                ),
+                Some(1),
+                &[],
+            )
+            .expect("xact stats")
+            .first();
+        (
+            row.get::<i64>(1).expect("ins").unwrap_or(0),
+            row.get::<i64>(2).expect("upd").unwrap_or(0),
+            row.get::<i64>(3).expect("del").unwrap_or(0),
+        )
+    })
 }
 
 /// `rows` rows of plan 1 get `v = v + 1`.
@@ -391,16 +405,18 @@ fn rcu_assert_only_plans_rebuilt(prefix: &str, before: &[String], rebuilt: &[i32
     }
 }
 
-/// 80% of a plan updated, with an observing dependent (threshold 0.9): cold.
+/// 80% of a plan updated, with an observing dependent (threshold 0.9): cold, i.e.
+/// keyed DELETE + INSERT of the 1600 rows, nothing updated in place.
 #[pg_test]
 fn pg_rcu_large_update_with_dependent_below_090_stays_cold() {
     rcu_build("rcu1", true);
     let before = rcu_all_plan_leaf_oids("rcu1_v");
-    let updated = rcu_target_rows_updated("rcu1_v");
+    let (ins, upd, del) = rcu_target_xact_counts("rcu1_v");
     rcu_update_plan1("rcu1", 1600);
+    let (ins2, upd2, del2) = rcu_target_xact_counts("rcu1_v");
     assert_eq!(
-        rcu_target_rows_updated("rcu1_v"),
-        updated,
+        (ins2 - ins, upd2 - upd, del2 - del),
+        (1600, 0, 1600),
         "80% update was rebuilt despite the dependent's 0.9 threshold"
     );
     rcu_assert_only_plans_rebuilt("rcu1", &before, &[]);
@@ -409,27 +425,24 @@ fn pg_rcu_large_update_with_dependent_below_090_stays_cold() {
 }
 
 /// 95% of a plan updated, with an observing dependent: hot. The plan is rebuilt
-/// through the leaf diff (rows updated in place, leaves kept) and the dependent
-/// receives that diff, not a rebuild.
+/// through the leaf diff — the 1900 changed rows updated in place, nothing
+/// deleted or reinserted, leaves kept — so the dependent receives exactly that
+/// diff, not a rebuild.
 #[pg_test]
 fn pg_rcu_large_update_with_dependent_above_090_goes_hot_by_diff() {
     rcu_build("rcu2", true);
     let before = rcu_all_plan_leaf_oids("rcu2_v");
-    let updated = rcu_target_rows_updated("rcu2_v");
-    let dep_changes = tree_xact_changes("rcu2_d");
+    let (ins, upd, del) = rcu_target_xact_counts("rcu2_v");
     rcu_update_plan1("rcu2", 1900);
-    assert!(
-        rcu_target_rows_updated("rcu2_v") - updated >= 1900,
-        "95% update did not go through the hot leaf diff"
+    let (ins2, upd2, del2) = rcu_target_xact_counts("rcu2_v");
+    assert_eq!(
+        (ins2 - ins, upd2 - upd, del2 - del),
+        (0, 1900, 0),
+        "95% update did not reach the target as the hot leaf diff"
     );
     rcu_assert_only_plans_rebuilt("rcu2", &before, &[]);
     assert_imv_correct("rcu2_v", &rcu_view_sql("rcu2"));
     assert_imv_correct("rcu2_d", "SELECT plan, id, v FROM rcu2_src");
-    let dep_delta = tree_xact_changes("rcu2_d") - dep_changes;
-    assert!(
-        (1900..=2 * 1900).contains(&dep_delta),
-        "dependent did not receive a diff of the 1900 changed rows: {dep_delta} changes"
-    );
 }
 
 /// A small UPDATE stays on the incremental path: no plan is rebuilt.

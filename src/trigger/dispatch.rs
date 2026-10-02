@@ -387,9 +387,15 @@ pub(crate) fn build_partition_aware_dispatch_sql_strategy(
 /// the cold body maintains the rest, each statement restricted to COLD partitions
 /// via the `$1::TEXT[]` (_hot_keys) filter the caller already spliced in.
 ///
-/// `affected_select` must be shaped as `SELECT <expr> AS pkey FROM <delta>` — the
-/// touched partition values (read from the scratch tables). `cold_insert_with_filter`
-/// may be empty (DELETE-only operations); the INSERT EXECUTE is then omitted.
+/// `affected_select` yields one `pkey, is_old` row per changed row image read from
+/// the scratch tables: its partition value and whether it is an old (deleted /
+/// pre-update) or new (inserted / post-update) image. A child is dirtied by the
+/// larger of its old-image and new-image counts, so an UPDATE of N rows within a
+/// child counts N (as N deleted rows would), and a row moving between children
+/// counts once on each side, with no join of old to new on the row key. Only rows
+/// crossing in BOTH directions between the same two children are undercounted
+/// (toward the incremental cold path). `cold_insert_with_filter` may be empty
+/// (DELETE-only operations); the INSERT EXECUTE is then omitted.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_passthrough_partition_dispatch_sql(
     view_name: &str,
@@ -550,10 +556,15 @@ pub(crate) fn build_passthrough_partition_dispatch_sql(
              -- calling it once PER CHANGED ROW (O(delta), ~seconds at 10-100k rows)\n\
              -- instead of once per DISTINCT touched partition (O(partitions), ms).\n\
              WITH per_val AS MATERIALIZED (\n\
-                 SELECT pkey::text AS pkey, count(*) AS dirty FROM ({aff}) __pv GROUP BY pkey\n\
+                 SELECT pkey::text AS pkey,\n\
+                        count(*) FILTER (WHERE is_old) AS old_rows,\n\
+                        count(*) FILTER (WHERE NOT is_old) AS new_rows\n\
+                 FROM ({aff}) __pv GROUP BY pkey\n\
              ),\n\
              per_child AS (\n\
-                 SELECT cfk.child AS child_oid, sum(pv.dirty) AS dirty, min(pv.pkey) AS rep_key\n\
+                 SELECT cfk.child AS child_oid,\n\
+                        GREATEST(sum(pv.old_rows), sum(pv.new_rows)) AS dirty,\n\
+                        min(pv.pkey) AS rep_key\n\
                  FROM per_val pv\n\
                  CROSS JOIN LATERAL (\n\
                      SELECT public.__reflex_partition_child_for_key('{parent}'::regclass, '{part_col_lit}', pv.pkey) AS child\n\
