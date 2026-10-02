@@ -304,7 +304,7 @@ fn resolve_unique_columns(ctx: &mut BuildContext) {
                 } else {
                     info!(
                         "pg_reflex: source '{}' has PK ({}) but the SELECT list does not include all PK columns — \
-                         passthrough '{}' will fall back to row-matching for DELETE/UPDATE. \
+                         passthrough '{}' has no key for it and is fully refreshed by every write to it. \
                          Add the PK columns to the SELECT list, or pass them as the 3rd argument to create_reflex_ivm.",
                         source,
                         pk_lower.join(", "),
@@ -2186,8 +2186,58 @@ pub(crate) fn create_reflex_ivm_impl_with_materialization(
         initial_aggregate_materialization(client, &mut ctx);
     });
 
+    if let Some(msg) = keyless_immediate_warning(
+        view_name,
+        &ctx.mode_upper,
+        &ctx.plan,
+        &ctx.real_source_names,
+        ctx.ignore_sources,
+    ) {
+        warning!("{}", msg);
+    }
     info!("pg_reflex: created IMV '{}'", view_name);
     "CREATE REFLEX INCREMENTAL VIEW"
+}
+
+/// The WARNING for an IMMEDIATE passthrough IMV with sources it has no key
+/// mapping for: every INSERT / UPDATE / DELETE on such a source fully
+/// refreshes the IMV inside the writing statement (src/trigger/ops.rs keyless
+/// arms), which on a large IMV costs orders of magnitude more than a keyed
+/// delta. `None` when every maintained source is keyed, for aggregates, and
+/// for DEFERRED IMVs (one refresh per flush, not per statement).
+pub(crate) fn keyless_immediate_warning(
+    view_name: &str,
+    mode_upper: &str,
+    plan: &crate::aggregation::AggregationPlan,
+    real_sources: &[String],
+    ignore_sources: &[String],
+) -> Option<String> {
+    if !plan.is_passthrough || mode_upper != "IMMEDIATE" {
+        return None;
+    }
+    let keyless: Vec<&str> = real_sources
+        .iter()
+        .filter(|source| {
+            let (_, bare) = split_qualified_name(source);
+            !ignore_sources.iter().any(|s| {
+                let s = strip_ignore_ack_marker(s);
+                s == source.as_str() || s == bare
+            })
+        })
+        .filter(|source| !plan.passthrough_key_mappings.contains_key(source.as_str()))
+        .map(String::as_str)
+        .collect();
+    if keyless.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "pg_reflex: IMMEDIATE passthrough '{}' has no unique key for source(s) {}: every INSERT, UPDATE \
+         and DELETE on them fully refreshes the IMV inside the writing statement. Pass a unique key \
+         (3rd argument of create_reflex_ivm, columns of the SELECT list that identify a row) or use \
+         'DEFERRED'.",
+        view_name,
+        keyless.join(", ")
+    ))
 }
 
 mod admin;
