@@ -1119,8 +1119,11 @@ pub(crate) fn passthrough_op_stmts(
     let pt_old = passthrough_scratch_old_table_name(view_name, source_table);
     let mappings = plan.passthrough_key_mappings.get(source_table);
 
-    let needs_new = matches!(operation, "INSERT" | "INSERT_PROMOTED" | "UPDATE");
-    let needs_old = matches!(operation, "DELETE" | "DELETE_PROMOTED" | "UPDATE");
+    // A source with no key mapping is refreshed from the source by every
+    // operation (below), so its transition rows are never read: skip the scratch.
+    let keyed = mappings.is_some();
+    let needs_new = keyed && matches!(operation, "INSERT" | "INSERT_PROMOTED" | "UPDATE");
+    let needs_old = keyed && matches!(operation, "DELETE" | "DELETE_PROMOTED" | "UPDATE");
     if needs_new {
         stmts.push(format!("TRUNCATE {}", pt_new));
         stmts.push(format!(
