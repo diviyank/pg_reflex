@@ -54,12 +54,12 @@
 -- UPGRADE WINDOW — writes fail until this update runs. The 1.11.5 library
 -- generates SQL that calls the five functions above, so between installing
 -- the library and running this update in a database:
---   * an UPDATE / DELETE of the partitioned source of a partitioned
---     passthrough IMV, and the flush of a DEFERRED grouped aggregate or
---     partitioned passthrough IMV, fail (volume dispatch:
---     `__reflex_target_propagates`, `__reflex_rebuild_cost_rows`);
+--   * the flush of a DEFERRED grouped aggregate or partitioned passthrough
+--     IMV fails (volume dispatch: `__reflex_target_propagates`,
+--     `__reflex_rebuild_cost_rows`);
 --   * a TRUNCATE of a source of an IMMEDIATE IMV and the trigger-side full
---     refreshes fail (`reflex_rebuild_target_rows`);
+--     refreshes (including every write to a source a passthrough IMMEDIATE
+--     IMV has no key mapping for) fail (`reflex_rebuild_target_rows`);
 --   * a COMMIT that leaves a DEFERRED IMV to rebuild (e.g. two of its sources
 --     written) aborts (`__reflex_xid_is_current`, `__reflex_xid_precedes`);
 --   * a TRUNCATE of a source of a DEFERRED IMV commits and marks the IMV
@@ -224,7 +224,8 @@ DECLARE
     _tail CONSTANT TEXT := E'      EXCEPTION WHEN OTHERS THEN NULL; END;\n';
 BEGIN
     FOR _fn IN
-        SELECT p.oid::regprocedure AS fn
+        SELECT p.oid::regprocedure AS fn,
+               substring(p.prosrc FROM 'WHERE ''([^'']*)'' = ANY\(depends_on\)') AS src
         FROM pg_proc p
         JOIN pg_namespace n ON n.oid = p.pronamespace
         WHERE n.nspname = 'public'
@@ -238,7 +239,7 @@ BEGIN
         _len := CASE WHEN _start > 0 THEN strpos(substr(_def, _start), _tail) ELSE 0 END;
         IF _start = 0 OR _len = 0 OR strpos(_def, _decl) = 0
            OR strpos(substr(_def, _start, _len), 'PERFORM public.reflex_reconcile(_rec.name);') = 0 THEN
-            _skipped := _skipped || format('%s: unrecognised body', _fn.fn);
+            _skipped := _skipped || format('%s (source %s): unrecognised body', _fn.fn, COALESCE(_fn.src, '?'));
             CONTINUE;
         END IF;
         _def := substr(_def, 1, _start - 1) || substr(_def, _start + _len - 1 + length(_tail));
@@ -247,7 +248,7 @@ BEGIN
             EXECUTE _def;
             _rewritten := _rewritten + 1;
         EXCEPTION WHEN OTHERS THEN
-            _skipped := _skipped || format('%s: %s', _fn.fn, SQLERRM);
+            _skipped := _skipped || format('%s (source %s): %s', _fn.fn, COALESCE(_fn.src, '?'), SQLERRM);
         END;
     END LOOP;
     RAISE INFO 'pg_reflex 1.11.5: removed the rebuild (Path B) from % of % statement-trigger bodies found (% skipped)',
@@ -255,8 +256,9 @@ BEGIN
     IF COALESCE(array_length(_skipped, 1), 0) > 0 THEN
         RAISE WARNING '%', format('pg_reflex 1.11.5: %s statement-trigger bodies still rebuild the IMV on a large statement: %s. '
             'Until repaired, a statement that both updates and inserts (upsert, MERGE, writable CTE) a large share of such a source '
-            'can double count its aggregate IMVs. Remedy, after the upgrade: create, then drop, a throwaway IMV over each source '
-            '(create_reflex_ivm re-renders the source''s trigger bodies), then reflex_reconcile its IMVs.',
+            'can double count its aggregate IMVs. Remedy, after the upgrade: create, then drop, a throwaway IMV over each source listed, '
+            'spelled as listed (create_reflex_ivm re-renders the source''s trigger bodies; reflex_rebuild_triggers does not reach '
+            'the live triggers of a bare-named source), then reflex_reconcile its IMVs.',
             array_length(_skipped, 1), array_to_string(_skipped, '; '));
     END IF;
 END
