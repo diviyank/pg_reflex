@@ -45,7 +45,7 @@ The `ANALYZE intermediate` between MERGE and target sync is non-optional. The ME
 
 The dispatch DO block above fires *after* scratch fill, which means the JOIN against the source has already run. On bulk filter flips that fanout to millions of fact rows, scratch fill itself is the dominant cost — dispatching to reconcile *after* scratch has already paid that cost is a net loss. Two pre-scratch probes route the work *before* scratch fills.
 
-**Path B — `|transition| / |source|` ratio**. Cheap. Catches the case where a sweeping DML on a source produced a transition table that is itself a meaningful fraction of the source. For `UPDATE sales_simulation SET …` touching 40 M of 76 M rows, the ratio is 0.52 and dispatch routes to reconcile. Fails when the transition is tiny but the JOIN fanout is huge — see Path C.
+**Path B — `|transition| / |source|` ratio** (removed in 1.11.5: a statement trigger never rebuilds the IMV, because another trigger of the same statement — upsert, MERGE, writable CTE — would apply its delta on top of the rebuild; rebuild dispatch runs only in the DEFERRED flush). Cheap. Catches the case where a sweeping DML on a source produced a transition table that is itself a meaningful fraction of the source. For `UPDATE sales_simulation SET …` touching 40 M of 76 M rows, the ratio is 0.52 and dispatch routes to reconcile. Fails when the transition is tiny but the JOIN fanout is huge — see Path C.
 
 **Path C — planner row estimate**. Only emitted in the UPDATE trigger body, gated on `_directional_op = 'INSERT_PROMOTED'` (the only place Item α promotes a bulk OUT→IN dim flip). Runs `EXPLAIN (FORMAT JSON)` on `reflex_build_path_c_explain_sql(view, source)` — the rewritten scratch-fill query (`base_query` with `source_table → transition_new`) — and reads the planner's row estimate without executing the JOIN. Compared against the IMV's `wipe_threshold`. Catches the *dim-flip fanout* case where Path B's ratio is misleading (1 dim row of 28 = 3.6 %, but JOINs to 8.9 M fact rows).
 
@@ -160,7 +160,7 @@ The intermediate must be swapped before the target — the target swap's fill re
 
 **Idempotent recovery**: every entry point drops leftover `__reflex_swap_*` tables for the view (signaled purely by name prefix). If DETACH+ATTACH fails mid-way, the outer Spi::connect_mut sub-transaction rolls back the entire reconcile call — the IMV stays in its pre-call state.
 
-**Lock window**: AccessExclusiveLock on the parent is taken for the DETACH/ATTACH DDL itself (~µs) and held until the transaction commits. Readers on other partitions are blocked only during the DDL window, not during the data fill.
+**Lock window**: the data fill runs before the DDL, but the AccessExclusiveLock the DETACH/ATTACH take on the parent and the swapped child is held until the transaction ends. Readers not pruned away from that child wait until COMMIT (a hot DEFERRED flush swaps at COMMIT, so the window is the rest of the COMMIT).
 
 **Global reconcile**: `reflex_reconcile` on a partitioned IMV (1.6.0 follow-up) iterates over every source partition child and calls the swap helper per child — bypassing the legacy TRUNCATE-on-parent + INSERT-via-tuple-routing pattern that held the parent's AccessExclusiveLock for the entire rebuild.  Per-partition swap is also ~30% faster on the synthetic bench (1474 ms vs 2148 ms on a 10M-row 4-partition IMV) because direct per-child INSERT skips PG's tuple-routing overhead.
 
@@ -318,7 +318,7 @@ release; grep the symbol or hint to land on the current location.
 | Dispatch DO block | `src/trigger/dispatch.rs` · `build_high_selectivity_dispatch_sql` |
 | Self-join full-refresh branch | `src/trigger/ops.rs` · `self_join_full_refresh_stmts` |
 | Bulk-INSERT / Bulk-DELETE paths | `src/trigger/dispatch.rs` · `push_bulk_insert_and_affected`, `push_bulk_delete_via_transition` |
-| Path B pre-scratch dispatch | `src/schema_builder.rs` trigger body (search `Path B: dispatching`) |
+| Path B pre-scratch dispatch | removed in 1.11.5 (`sql/pg_reflex--1.11.4--1.11.5.sql` step 5 cuts it out of installed bodies) |
 | Path C smart bulk-INSERT | `src/schema_builder.rs` · `path_c_for_update` in `build_trigger_ddls` |
 | Path C EXPLAIN dispatch | `src/trigger/mod.rs` · `reflex_build_path_c_explain_sql` |
 | TRUNCATE codegen | `src/trigger/mod.rs` · `reflex_build_truncate_sql` |
