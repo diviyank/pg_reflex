@@ -14,17 +14,37 @@ Rebuilds no longer wipe the IMVs built on the rebuilt one. In the field a TRUNCA
 - (DATA LOSS) A rebuild of an IMV with dependents (`reflex_reconcile`, wipe dispatch, trigger full-refresh fallbacks) reached them as delete-all + insert-all; the target is now rewritten as a keyed or whole-row diff (`reflex_rebuild_target_rows`).
 - (DATA LOSS) Partitioned reconciles and partition swaps diff each populated leaf of an IMV with dependents, always — also when a generated child failed — and fully refresh only dependents that ignore it.
 - (SILENT) The multi-source cross-source guard rebuilt inside the flush, possibly before an upstream DEFERRED IMV's own flush, and aborted the COMMIT on failure; it now uses the COMMIT-time path (waits for upstream, isolated, stale on failure).
-- Volume dispatch sizes a two-level partition by its leaves (`__reflex_rebuild_cost_rows`) and uses a 0.9 threshold for an IMV with dependents.
+- (SILENT) IMMEDIATE upsert / MERGE / writable CTE double count: one statement fires several statement triggers, and when one rebuilt the IMV (Path B, high-selectivity or hot-partition dispatch) the later ones applied their rows again. Statement triggers never rebuild now: Path B is removed and the volume dispatch runs only in the DEFERRED flush, on the netted delta.
+- (SILENT) A keyless passthrough IMMEDIATE IMV inserted an upsert's / MERGE's new rows twice; every statement on a source without a key mapping, INSERT included, now fully refreshes it (see Changed).
+- (SILENT) A reconcile of a DEFERRED IMV mid-transaction — full or partition / key scoped, direct or from the dispatch cascade — double-applied the deltas already staged; the rebuild records a watermark (with its slice when scoped) and the flush applies only later rows. Reached from inside a trigger, the IMV is rebuilt by the COMMIT-time pass. DML after a mid-transaction `SET CONSTRAINTS ALL IMMEDIATE` is no longer skipped for an IMV already rebuilt.
+- (SILENT) A partition flush applied a staged delta on top of the reconcile that already held it; an IMV's calls now stop at the first `RECONCILED`.
+- (SILENT) The DEFERRED flush dispatch of a partitioned IMV never maintained rows whose partition value is NULL, and maintained a multi-value LIST child's other values twice when the child went hot; NULL now resolves to its DEFAULT child and every touched value of a hot child is excluded from the cold body.
 - (SILENT) A volume-dispatch rebuild that returned an `ERROR` string was discarded — on the unpartitioned high-selectivity path together with the statement's delta. Every dispatch call now raises: an IMMEDIATE statement fails, a DEFERRED IMV is marked `known_stale`.
+- A DEFERRED partitioned passthrough flush counted distinct partition values instead of changed rows and never went hot; it now counts rows per partition. Volume dispatch sizes a two-level partition by its leaves (`__reflex_rebuild_cost_rows`) and uses a 0.9 threshold for an IMV with dependents.
+- An in-trigger reconcile of a disabled DEFERRED IMV was queued for COMMIT and flagged stale; it is refused at once. The flush and COMMIT-time failure handlers now retake the IMV's advisory lock before writing the registry, and a postponed rebuild no longer deadlocks with a session flushing the same IMV.
 - A user unique index with NULLs distinct is no longer used as the rebuild diff key (two NULL-key rows aborted the rebuild); only `NULLS NOT DISTINCT` or all-`NOT NULL` unique indexes qualify.
+
+**Changed**
+
+- IMMEDIATE IMVs no longer rebuild on a large statement: the set-based incremental delta runs however large the statement. A statement sweeping most of a source writes more WAL and leaves more bloat than a rebuild would; bulk jobs should write through DEFERRED IMVs, whose flush still switches to a rebuild.
+- A passthrough IMMEDIATE IMV without a key mapping for a source is fully refreshed by every write to it, INSERT included — about 1000× slower than a keyed delta on a 300 k-row IMV. `create_reflex_ivm` warns; pass a unique key or use DEFERRED.
+- `reflex_reconcile` / `reflex_reconcile_partition` of a DEFERRED IMV called from inside a trigger returns `RECONCILE QUEUED FOR COMMIT`.
 
 **Added**
 
 - `reflex_rebuild_target_rows(view, rebuild_sql)`; internal `__reflex_target_propagates`, `__reflex_rebuild_cost_rows`, `__reflex_xid_is_current`, `__reflex_xid_precedes`.
 
+**Known limits** (filed in `untreated_bugs/`)
+
+- An IMMEDIATE MIN / MAX aggregate hit by an upsert or MERGE recomputes updated groups from a source that already holds the inserted rows, which are then merged again (silent; a later DELETE can leave a wrong MIN / MAX).
+- One statement writing two sources of an IMMEDIATE join IMV (writable CTE, or a user trigger on one writing the other) applies ΔA ⋈ ΔB twice.
+- PostgreSQL 15 only: a MERGE with UPDATE and INSERT actions into a multi-level partitioned source gives the UPDATE trigger inserted rows (a PostgreSQL defect), so every IMV over it, IMMEDIATE or DEFERRED, gets wrong deltas. Split the MERGE or upgrade.
+- A partition- or key-scoped reconcile of a DEFERRED IMV reached from inside a trigger becomes a full rebuild of the IMV at COMMIT.
+- The aggregate partition dispatch sizes a partition by its source rows but counts dirty groups, so a partition with many rows per group rarely goes hot.
+
 **Migration**
 
-- [`sql/pg_reflex--1.11.4--1.11.5.sql`](https://github.com/diviyank/pg_reflex/blob/main/sql/pg_reflex--1.11.4--1.11.5.sql) — creates the five functions, replaces `__reflex_deferred_flush_fn`, rewrites the pending-row DELETE in installed deferred TRUNCATE trigger bodies (no lock on sources), and deletes leftover `'TRUNCATE'` request rows. **Writes and COMMITs on IMV sources fail loudly until the update runs**: in a quiet window, install the library, immediately run the update in every database, then recycle connection pools — see [Upgrading to 1.11.5](getting-started/upgrading.md#upgrading-to-1115).
+- [`sql/pg_reflex--1.11.4--1.11.5.sql`](https://github.com/diviyank/pg_reflex/blob/main/sql/pg_reflex--1.11.4--1.11.5.sql) — creates the five functions, replaces `__reflex_deferred_flush_fn` and `__reflex_partition_child_for_key`, rewrites the pending-row DELETE in installed deferred TRUNCATE trigger bodies, cuts the Path B rebuild out of installed IMMEDIATE trigger bodies (both in place, no lock on sources; a WARNING lists any body it skipped, with its source and the remedy), and deletes leftover `'TRUNCATE'` request rows. **Writes and COMMITs on IMV sources fail loudly until the update runs**: in a quiet window, install the library, immediately run the update in every database, then recycle connection pools — see [Upgrading to 1.11.5](getting-started/upgrading.md#upgrading-to-1115).
 
 ## [1.11.4] — 2026-09-18
 

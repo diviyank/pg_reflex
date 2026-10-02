@@ -117,8 +117,9 @@ instead of aborting COMMIT. `ALTER EXTENSION pg_reflex UPDATE TO '1.11.5';`
   high-selectivity) now raises on an `ERROR` result: an IMMEDIATE IMV's
   writing statement fails, and a DEFERRED IMV is marked `known_stale` by its
   flush savepoint (`pg_reflex.flush_failure_policy` applies). The IMMEDIATE
-  trigger body's pre-scratch Path B still discards it (filed, see Known
-  limits).
+  trigger body's pre-scratch Path B, which also discarded it, is removed
+  (next entries); several partition-flush callers still discard it (filed,
+  see Known limits).
 - **(SILENT) A keyless passthrough IMMEDIATE IMV double inserted on a
   mixed statement** (pre-existing). With no key mapping for the source, the
   DELETE / UPDATE triggers fully refresh the IMV, and the INSERT trigger
@@ -140,8 +141,13 @@ instead of aborting COMMIT. `ALTER EXTENSION pg_reflex UPDATE TO '1.11.5';`
   never maintained; and a hot child holding several LIST values was excluded
   from the cold body by one representative value only, so its other values'
   rows were maintained twice (cold delta + partition rebuild). The cold body
-  now excludes every value the batch touched in a hot child, keeps NULL
-  values unpruned, and prunes by every non-NULL cold value.
+  now excludes every value the batch touched in a hot child, and prunes by
+  every non-NULL cold value. A NULL partition value resolves to the child
+  holding it (`__reflex_partition_child_for_key` now maps a NULL key to the
+  DEFAULT child, or a LIST child listing NULL), so it is rebuilt with that
+  child when the child goes hot and kept in the cold body otherwise (LIST
+  and RANGE, one- and two-level). A child touched only by NULL values has no
+  representative key for `reflex_reconcile_partition` and stays cold.
 - IMMEDIATE partitioned passthrough statements emit the plain cold body (no
   volume-dispatch block), so they no longer call
   `__reflex_target_propagates` / `__reflex_rebuild_cost_rows`; the IMMEDIATE
@@ -209,6 +215,13 @@ instead of aborting COMMIT. `ALTER EXTENSION pg_reflex UPDATE TO '1.11.5';`
 - IMMEDIATE IMVs no longer switch to a rebuild on a large statement: the
   statement triggers' Path B is removed, and the high-selectivity and
   hot-partition dispatch run only in the DEFERRED flush.
+- A passthrough IMMEDIATE IMV with no key mapping for a source is fully
+  refreshed by every INSERT on it too (it already was by UPDATE / DELETE).
+  On a large IMV this is orders of magnitude slower than a keyed delta
+  (~225 ms per single-row INSERT on a 300 k-row IMV), so `create_reflex_ivm`
+  now raises a WARNING naming the unkeyed sources: pass a unique key (3rd
+  argument) or use DEFERRED. The INFO for a source whose PK is not projected
+  no longer claims a row-matching fallback.
 
 ### Known limits
 
@@ -219,7 +232,8 @@ touched partitions. On a statement sweeping most of a source this writes
 more WAL and leaves more dead tuples than a rebuild would; bulk jobs should
 write through DEFERRED IMVs, whose flush still switches to a rebuild. A
 passthrough IMMEDIATE IMV with no key mapping for the source is the
-exception: every statement, INSERT included, fully refreshes it.
+exception: every statement, INSERT included, fully refreshes it
+(`create_reflex_ivm` warns).
 
 Filed in `untreated_bugs/`: a passthrough dependent with no key mapping for
 a source still fully refreshes (now as a diff) on every statement on it;
@@ -228,7 +242,7 @@ hot/cold dispatch still classifies a two-level mirror per plan, not per leaf;
 passthrough 23505 flush failure of the incident is not reproduced yet;
 trigger regeneration through `reflex_rebuild_triggers` inside past
 `ALTER EXTENSION` updates (and for bare-name public sources, always) was a
-silent no-op; the IMMEDIATE trigger body's pre-scratch Path B and several
+silent no-op; several
 `reflex_flush_partitions` / partition-delta callers still discard a soft
 `ERROR` from `reflex_reconcile`; under `SET CONSTRAINTS ALL IMMEDIATE` one
 statement writing two sources of a DEFERRED join IMV counts their cross
@@ -310,8 +324,9 @@ filed with the keyless whole-row diff's two full sorts of the target.
   (no lock on the sources; an INFO line reports how many it found and
   rewrote, a WARNING lists any it skipped with the remedy), cuts the Path B
   rebuild out of every installed IMMEDIATE INSERT / DELETE / UPDATE trigger
-  body (in place, no lock; INFO / WARNING likewise), and deletes leftover
-  `'TRUNCATE'` request rows.
+  body (in place, no lock; INFO / WARNING likewise), replaces
+  `__reflex_partition_child_for_key` (a NULL key resolves to its DEFAULT
+  child), and deletes leftover `'TRUNCATE'` request rows.
 - **Writes and COMMITs on IMV sources fail until the update runs.** The
   1.11.5 library's generated SQL calls the five functions, so between the
   library install and the update: the flush of a DEFERRED grouped
