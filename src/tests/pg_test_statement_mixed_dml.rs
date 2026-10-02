@@ -377,3 +377,148 @@ fn pg_smd_migration_removes_rebuild_from_statement_trigger_bodies() {
     smd_plain_mixed_upsert("smd19");
     assert_imv_correct("smd19_v", sql);
 }
+
+/// Keyless passthrough (no source key reaches the IMV): `{p}` holds 2000 rows
+/// with many identical (g, v, t) projections, NULLs and empty strings.
+fn smd_keyless_source(p: &str) {
+    Spi::run(&format!(
+        "CREATE TABLE {p} (id INT PRIMARY KEY, g INT, v INT, t TEXT)"
+    ))
+    .expect("source");
+    Spi::run(&format!(
+        "INSERT INTO {p} SELECT i, i % 3, CASE WHEN i % 4 = 0 THEN NULL ELSE i % 2 END, \
+         CASE i % 5 WHEN 0 THEN NULL WHEN 1 THEN '' ELSE 'x' END \
+         FROM generate_series(1, 2000) i"
+    ))
+    .expect("seed");
+}
+
+fn smd_keyless_build(p: &str, mode: &str) -> String {
+    smd_keyless_source(&format!("{p}_src"));
+    let sql = format!("SELECT g, v, t FROM {p}_src");
+    assert_eq!(
+        crate::create_reflex_ivm(&format!("{p}_v"), &sql, None, None, Some(mode), None),
+        "CREATE REFLEX INCREMENTAL VIEW"
+    );
+    sql
+}
+
+/// Keyless passthrough, IMMEDIATE, upsert of 100 conflicting + 100 new rows:
+/// the UPDATE trigger used to refresh the whole target from the source (which
+/// already held the 100 new rows), then the INSERT trigger appended them again.
+#[pg_test]
+fn pg_smd_immediate_keyless_passthrough_mixed_upsert() {
+    let sql = smd_keyless_build("smd20", RC_IMMEDIATE);
+    Spi::run(
+        "INSERT INTO smd20_src SELECT i, i % 7, i, 'y' FROM generate_series(1901, 2100) i \
+         ON CONFLICT (id) DO UPDATE SET v = EXCLUDED.v, t = EXCLUDED.t",
+    )
+    .expect("upsert");
+    assert_imv_correct("smd20_v", &sql);
+}
+
+/// Writable CTE: DELETE 100 rows, INSERT 100 new ones (DELETE trigger first).
+#[pg_test]
+fn pg_smd_immediate_keyless_passthrough_writable_cte() {
+    let sql = smd_keyless_build("smd21", RC_IMMEDIATE);
+    Spi::run(
+        "WITH d AS (DELETE FROM smd21_src WHERE id <= 100 RETURNING *) \
+         INSERT INTO smd21_src SELECT id + 10000, g, v, t FROM d",
+    )
+    .expect("writable cte");
+    assert_imv_correct("smd21_v", &sql);
+}
+
+/// Duplicates, NULLs and empty strings: each UPDATE / DELETE must remove exactly
+/// one target row per changed source row, whichever identical copy it is.
+#[pg_test]
+fn pg_smd_immediate_keyless_passthrough_duplicates_and_nulls() {
+    let sql = smd_keyless_build("smd22", RC_IMMEDIATE);
+    for stmt in [
+        "UPDATE smd22_src SET v = NULL WHERE id % 9 = 0",
+        "UPDATE smd22_src SET t = '' WHERE t IS NULL AND id % 2 = 0",
+        "UPDATE smd22_src SET t = NULL WHERE t = '' AND id % 3 = 0",
+        "DELETE FROM smd22_src WHERE id % 11 = 0",
+        "DELETE FROM smd22_src WHERE v IS NULL AND id % 13 = 0",
+        "UPDATE smd22_src SET g = g + 1 WHERE id % 17 = 0",
+        "INSERT INTO smd22_src SELECT i, 1, NULL, NULL FROM generate_series(1990, 2050) i \
+         ON CONFLICT (id) DO UPDATE SET v = NULL, t = NULL",
+    ] {
+        Spi::run(stmt).unwrap_or_else(|e| panic!("<{stmt}>: {e}"));
+        assert_imv_correct("smd22_v", &sql);
+    }
+}
+
+/// Keyless passthrough over a join: both sources reach the IMV without a key.
+#[pg_test]
+fn pg_smd_immediate_keyless_join_passthrough() {
+    smd_keyless_source("smd23_src");
+    Spi::run("CREATE TABLE smd23_dim (g INT, name TEXT)").expect("dim");
+    Spi::run("INSERT INTO smd23_dim VALUES (0, 'a'), (1, 'b'), (1, 'b'), (2, NULL)")
+        .expect("seed dim");
+    let sql = "SELECT s.g, s.v, d.name FROM smd23_src s JOIN smd23_dim d ON d.g = s.g";
+    assert_eq!(
+        crate::create_reflex_ivm("smd23_v", sql, None, None, None, None),
+        "CREATE REFLEX INCREMENTAL VIEW"
+    );
+    for stmt in [
+        "INSERT INTO smd23_src SELECT i, i % 7, i, 'y' FROM generate_series(1901, 2100) i \
+         ON CONFLICT (id) DO UPDATE SET v = EXCLUDED.v",
+        "DELETE FROM smd23_src WHERE id % 10 = 0",
+        "UPDATE smd23_dim SET name = 'c' WHERE g = 1 AND ctid = (SELECT min(ctid) FROM smd23_dim WHERE g = 1)",
+        "DELETE FROM smd23_dim WHERE g = 2",
+    ] {
+        Spi::run(stmt).unwrap_or_else(|e| panic!("<{stmt}>: {e}"));
+        assert_imv_correct("smd23_v", sql);
+    }
+}
+
+/// DEFERRED keyless passthrough: the flush nets the upsert and stays correct.
+#[pg_test]
+fn pg_smd_deferred_keyless_passthrough_mixed_upsert() {
+    let sql = smd_keyless_build("smd24", RC_DEFERRED);
+    Spi::run(
+        "INSERT INTO smd24_src SELECT i, i % 7, i, 'y' FROM generate_series(1901, 2100) i \
+         ON CONFLICT (id) DO UPDATE SET v = EXCLUDED.v, t = EXCLUDED.t",
+    )
+    .expect("upsert");
+    rc_flush();
+    assert_imv_correct("smd24_v", &sql);
+}
+
+/// Partition flush of an unpartitioned IMV: three children attached in one
+/// flush (100, 3000 and 100 rows over an analyzed 2000-row root). The 3000-row
+/// child is large enough to reconcile the IMV, which reads every attached child;
+/// the next child's delta must not then be applied on top.
+#[pg_test]
+fn pg_smd_partition_flush_reconcile_then_delta_not_double_applied() {
+    Spi::run("CREATE TABLE smd25_src (k INT NOT NULL, g INT, v INT) PARTITION BY LIST (k)")
+        .expect("root");
+    Spi::run("CREATE TABLE smd25_src_0 PARTITION OF smd25_src FOR VALUES IN (0)").expect("p0");
+    Spi::run("INSERT INTO smd25_src SELECT 0, i % 4, i FROM generate_series(1, 2000) i")
+        .expect("seed");
+    let sql = "SELECT g, SUM(v) AS s, COUNT(*) AS n FROM smd25_src GROUP BY g";
+    let created = Spi::get_one::<String>(&format!(
+        "SELECT create_reflex_ivm('smd25_v', '{sql}', NULL, NULL, NULL, NULL, ARRAY[]::text[])"
+    ))
+    .expect("create call")
+    .expect("create result");
+    assert_eq!(created, "CREATE REFLEX INCREMENTAL VIEW");
+    Spi::run("ANALYZE smd25_src").expect("analyze");
+    for (k, rows) in [(1, 100), (2, 3000), (3, 100)] {
+        Spi::run(&format!(
+            "CREATE TABLE smd25_src_{k} (k INT NOT NULL, g INT, v INT)"
+        ))
+        .expect("child");
+        Spi::run(&format!(
+            "INSERT INTO smd25_src_{k} SELECT {k}, i % 4, i FROM generate_series(1, {rows}) i"
+        ))
+        .expect("child rows");
+        Spi::run(&format!(
+            "ALTER TABLE smd25_src ATTACH PARTITION smd25_src_{k} FOR VALUES IN ({k})"
+        ))
+        .expect("attach");
+    }
+    Spi::run("SELECT reflex_flush_partitions()").expect("flush");
+    assert_imv_correct("smd25_v", sql);
+}
