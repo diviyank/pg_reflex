@@ -267,7 +267,7 @@ END IF;
 EXECUTE <merge_sql_with_filter> USING _hot_keys [, _hot_child_names]; …
 ```
 
-The hot-exclusion filter is `<part_col> <> ALL($1::TEXT[])` for **LIST** (binds hot *values*) and `__reflex_partition_child_for_key(...) <> ALL($2::text[])` for **RANGE** (binds hot *child names* — child OIDs change on the atomic swap, names don't). `_floor` (`wipe_floor_rows`) guards against never-ANALYZEd partitions reporting `reltuples = 0` and tripping an infinite ratio.
+The hot-exclusion filter is `array_position($1::TEXT[], <part_col>::text) IS NULL` for **LIST** (binds every touched value of a hot child — a LIST child may hold several — and keeps NULL values cold) and `array_position($2::text[], __reflex_partition_child_for_key(...)::text) IS NULL` for **RANGE** (binds hot *child names* — child OIDs change on the atomic swap, names don't). `_floor` (`wipe_floor_rows`) guards against never-ANALYZEd partitions reporting `reltuples = 0` and tripping an infinite ratio.
 
 ---
 
