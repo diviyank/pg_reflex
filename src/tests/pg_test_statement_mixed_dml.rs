@@ -115,6 +115,10 @@ fn pg_smd_deferred_passthrough_mixed_upsert_with_dependent() {
 }
 
 /// Passthrough, IMMEDIATE, MERGE with matched UPDATE / DELETE and NOT MATCHED INSERT.
+/// Not on PG15: its MERGE into a multi-level partitioned table hands the AFTER
+/// UPDATE statement trigger a NEW transition table holding INSERTed rows (see
+/// untreated_bugs/2026-10-02_pg15_merge_partitioned_transition_tables.md).
+#[cfg(not(feature = "pg15"))]
 #[pg_test]
 fn pg_smd_immediate_passthrough_merge() {
     rcu_build("smd6", false, RC_IMMEDIATE);
