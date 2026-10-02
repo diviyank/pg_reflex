@@ -3784,7 +3784,7 @@ fn passthrough_update_partitioned_emits_dispatch() {
         &plan,
         "__reflex_new_ss",
         "__reflex_old_ss",
-        false,
+        true, // the DEFERRED flush's netted delta: only it dispatches
         &mut stmts,
     );
     let joined = stmts.join("\n");
@@ -3903,7 +3903,7 @@ fn partitioned_passthrough_cold_delete_is_gated_and_swaps_once() {
             &plan,
             "__reflex_new_ss",
             "__reflex_old_ss",
-            false,
+            true, // the DEFERRED flush's netted delta: only it dispatches
             &mut stmts,
         );
         let joined = stmts.join("\n");
