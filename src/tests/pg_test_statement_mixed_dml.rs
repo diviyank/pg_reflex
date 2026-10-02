@@ -587,3 +587,81 @@ fn pg_smd_immediate_partitioned_passthrough_null_partition_value() {
         assert_imv_correct("smd27_v", sql);
     }
 }
+
+/// The DEFERRED flush's dispatch restricted its cold body to one representative
+/// value per cold child and skipped NULL values, so rows of a DEFAULT partition
+/// (NULL partition value) were never maintained.
+#[pg_test]
+fn pg_smd_deferred_partitioned_passthrough_null_partition_value() {
+    Spi::run(
+        "CREATE TABLE smd28_src (plan INT, id INT NOT NULL, v INT, UNIQUE (plan, id)) PARTITION BY LIST (plan)",
+    )
+    .expect("root");
+    Spi::run("CREATE TABLE smd28_src_1 PARTITION OF smd28_src FOR VALUES IN (1)").expect("p1");
+    Spi::run("CREATE TABLE smd28_src_d PARTITION OF smd28_src DEFAULT").expect("default");
+    Spi::run(
+        "INSERT INTO smd28_src SELECT CASE WHEN i % 3 = 0 THEN NULL ELSE 1 END, i, i FROM generate_series(1, 300) i",
+    )
+    .expect("seed");
+    let sql = "SELECT plan, id, v FROM smd28_src";
+    let created = Spi::get_one::<String>(&format!(
+        "SELECT create_reflex_ivm('smd28_v', '{sql}', 'plan, id', NULL, 'DEFERRED', NULL, ARRAY['plan'])"
+    ))
+    .expect("create call")
+    .expect("create result");
+    assert_eq!(created, "CREATE REFLEX INCREMENTAL VIEW");
+    for stmt in [
+        "UPDATE smd28_src SET v = v + 1 WHERE id % 2 = 0",
+        "DELETE FROM smd28_src WHERE id % 5 = 0",
+    ] {
+        Spi::run(stmt).unwrap_or_else(|e| panic!("<{stmt}>: {e}"));
+        rc_flush();
+        assert_imv_correct("smd28_v", sql);
+    }
+}
+
+/// A LIST child holding several values (`IN (1, 2)`): the cold body must cover
+/// every touched value of the child, not one representative.
+fn smd_multivalue_list(p: &str, mode: &str) {
+    Spi::run(&format!(
+        "CREATE TABLE {p}_src (plan INT NOT NULL, id INT NOT NULL, v INT, UNIQUE (plan, id)) PARTITION BY LIST (plan)"
+    ))
+    .expect("root");
+    Spi::run(&format!(
+        "CREATE TABLE {p}_src_12 PARTITION OF {p}_src FOR VALUES IN (1, 2)"
+    ))
+    .expect("p12");
+    Spi::run(&format!(
+        "CREATE TABLE {p}_src_3 PARTITION OF {p}_src FOR VALUES IN (3)"
+    ))
+    .expect("p3");
+    Spi::run(&format!(
+        "INSERT INTO {p}_src SELECT 1 + i % 3, i, i FROM generate_series(1, 3000) i"
+    ))
+    .expect("seed");
+    let sql = format!("SELECT plan, id, v FROM {p}_src");
+    let created = Spi::get_one::<String>(&format!(
+        "SELECT create_reflex_ivm('{p}_v', '{sql}', 'plan, id', NULL, '{mode}', NULL, ARRAY['plan'])"
+    ))
+    .expect("create call")
+    .expect("create result");
+    assert_eq!(created, "CREATE REFLEX INCREMENTAL VIEW");
+    for stmt in [
+        format!("UPDATE {p}_src SET v = v + 1 WHERE id % 50 = 0"),
+        format!("DELETE FROM {p}_src WHERE id % 70 = 0"),
+    ] {
+        Spi::run(&stmt).unwrap_or_else(|e| panic!("<{stmt}>: {e}"));
+        rc_flush();
+        assert_imv_correct(&format!("{p}_v"), &sql);
+    }
+}
+
+#[pg_test]
+fn pg_smd_deferred_partitioned_passthrough_multivalue_list_child() {
+    smd_multivalue_list("smd29", RC_DEFERRED);
+}
+
+#[pg_test]
+fn pg_smd_immediate_partitioned_passthrough_multivalue_list_child() {
+    smd_multivalue_list("smd30", RC_IMMEDIATE);
+}
