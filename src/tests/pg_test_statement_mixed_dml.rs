@@ -864,3 +864,37 @@ fn pg_smd_deferred_aggregate_null_only_hot_child_stays_cold() {
     rc_flush();
     assert_imv_correct("smd37_v", sql);
 }
+
+/// The keyless-IMMEDIATE WARNING is decided from the plan create_reflex_ivm
+/// stores: a passthrough without the source PK warns, one with it does not.
+#[pg_test]
+fn pg_smd_keyless_immediate_passthrough_warning_follows_stored_plan() {
+    Spi::run("CREATE TABLE smd38_src (id INT PRIMARY KEY, g INT, v INT)").expect("source");
+    for (view, sql) in [
+        ("smd38_keyless", "SELECT g, v FROM smd38_src"),
+        ("smd38_keyed", "SELECT id, g, v FROM smd38_src"),
+    ] {
+        assert_eq!(
+            crate::create_reflex_ivm(view, sql, None, None, None, None),
+            "CREATE REFLEX INCREMENTAL VIEW"
+        );
+    }
+    let warning_for = |view: &str| {
+        let (plan, depends_on) = Spi::get_two::<String, Vec<String>>(&format!(
+            "SELECT aggregations::text, depends_on FROM public.__reflex_ivm_reference WHERE name = '{view}'"
+        ))
+        .expect("registry row");
+        let plan: crate::aggregation::AggregationPlan =
+            serde_json::from_str(&plan.expect("plan")).expect("plan json");
+        crate::create_ivm::keyless_immediate_warning(
+            view,
+            "IMMEDIATE",
+            &plan,
+            &depends_on.expect("depends_on"),
+            &[],
+        )
+    };
+    let msg = warning_for("smd38_keyless").expect("keyless warns");
+    assert!(msg.contains("smd38_src"), "{msg}");
+    assert_eq!(warning_for("smd38_keyed"), None);
+}

@@ -235,3 +235,81 @@ fn reflex_reject_carries_tag_and_error_prefix() {
         "must carry the unsupported tag: {msg}"
     );
 }
+
+fn plan_from_sql(sql: &str) -> crate::aggregation::AggregationPlan {
+    use sqlparser::dialect::PostgreSqlDialect;
+    use sqlparser::parser::Parser;
+    let parsed = Parser::parse_sql(&PostgreSqlDialect {}, sql).unwrap();
+    let analysis = crate::sql_analyzer::analyze(&parsed).unwrap();
+    crate::aggregation::plan_aggregation(&analysis)
+}
+
+fn sources(names: &[&str]) -> Vec<String> {
+    names.iter().map(|s| s.to_string()).collect()
+}
+
+#[test]
+fn test_keyless_immediate_passthrough_warns_with_source_and_remedy() {
+    let plan = plan_from_sql("SELECT g, v FROM public.kl");
+    let msg = keyless_immediate_warning("kl_v", "IMMEDIATE", &plan, &sources(&["public.kl"]), &[])
+        .expect("keyless IMMEDIATE passthrough warns");
+    assert!(msg.contains("'kl_v'"), "{msg}");
+    assert!(msg.contains("public.kl"), "{msg}");
+    assert!(msg.contains("fully refreshes the IMV"), "{msg}");
+    assert!(
+        msg.contains("unique key") && msg.contains("DEFERRED"),
+        "{msg}"
+    );
+}
+
+#[test]
+fn test_keyless_warning_silent_when_keyed_deferred_aggregate_or_ignored() {
+    let mut keyed = plan_from_sql("SELECT id, v FROM public.kl");
+    keyed.passthrough_key_mappings.insert(
+        "public.kl".to_string(),
+        vec![("id".to_string(), "id".to_string())],
+    );
+    let src = sources(&["public.kl"]);
+    assert_eq!(
+        keyless_immediate_warning("v", "IMMEDIATE", &keyed, &src, &[]),
+        None
+    );
+
+    let keyless = plan_from_sql("SELECT g, v FROM public.kl");
+    assert_eq!(
+        keyless_immediate_warning("v", "DEFERRED", &keyless, &src, &[]),
+        None
+    );
+    assert_eq!(
+        keyless_immediate_warning("v", "IMMEDIATE", &keyless, &src, &sources(&["kl"])),
+        None
+    );
+
+    let aggregate = plan_from_sql("SELECT g, SUM(v) FROM public.kl GROUP BY g");
+    assert_eq!(
+        keyless_immediate_warning("v", "IMMEDIATE", &aggregate, &src, &[]),
+        None
+    );
+}
+
+#[test]
+fn test_keyless_warning_lists_only_unmapped_join_sources() {
+    let mut plan =
+        plan_from_sql("SELECT a.id, b.v FROM public.a a LEFT JOIN public.b b ON b.k = a.id");
+    plan.passthrough_key_mappings.insert(
+        "public.a".to_string(),
+        vec![("id".to_string(), "id".to_string())],
+    );
+    let msg = keyless_immediate_warning(
+        "j",
+        "IMMEDIATE",
+        &plan,
+        &sources(&["public.a", "public.b"]),
+        &[],
+    )
+    .expect("unmapped secondary warns");
+    assert!(
+        msg.contains("public.b") && !msg.contains("public.a"),
+        "{msg}"
+    );
+}
