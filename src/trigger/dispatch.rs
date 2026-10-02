@@ -319,7 +319,7 @@ pub(crate) fn build_partition_aware_dispatch_sql_strategy(
              -- instead of once per DISTINCT touched partition (O(partitions), ms).\n\
              -- A NULL value resolves to the child holding it (DEFAULT, or a LIST\n\
              -- child listing NULL) and is hot or cold with it; a child touched only\n\
-             -- by NULL has no text representative for reflex_reconcile_partition,\n\
+             -- by NULL has no text representative key for the partition rebuild,\n\
              -- so it stays cold.\n\
              WITH per_val AS MATERIALIZED (\n\
                  SELECT \"{part_col}\"::text AS pkey, count(*) AS dirty\n\
@@ -570,7 +570,7 @@ pub(crate) fn build_passthrough_partition_dispatch_sql(
              -- instead of once per DISTINCT touched partition (O(partitions), ms).\n\
              -- A NULL value resolves to the child holding it (DEFAULT, or a LIST\n\
              -- child listing NULL) and is hot or cold with it; a child touched only\n\
-             -- by NULL has no text representative for reflex_reconcile_partition,\n\
+             -- by NULL has no text representative key for the partition rebuild,\n\
              -- so it stays cold.\n\
              WITH per_val AS MATERIALIZED (\n\
                  SELECT pkey::text AS pkey,\n\
