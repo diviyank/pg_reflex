@@ -59,6 +59,13 @@ pub enum DeltaOp {
     Subtract,
 }
 
+/// Operation the DEFERRED flush passes to `reflex_build_delta_sql`: an UPDATE
+/// whose transition views hold the transaction's NETTED delta (inserts, deletes
+/// and updates of every statement folded into one old / new pair). Generated as
+/// an `"UPDATE"` except where a statement-level UPDATE must be treated
+/// differently (see `passthrough_op_stmts`); distinct so it is cached apart.
+pub(crate) const NETTED_UPDATE_OP: &str = "UPDATE_NETTED";
+
 /// Generates the SQL statements to apply a delta to an IMV.
 ///
 /// Called from plpgsql trigger wrappers. Returns a delimiter-separated string
@@ -87,6 +94,8 @@ pub fn reflex_build_delta_sql(
             return cached.clone();
         }
     }
+    let netted_delta = operation == NETTED_UPDATE_OP;
+    let operation = if netted_delta { "UPDATE" } else { operation };
 
     // aggregations_json is written by pg_reflex itself via generate_aggregations_json
     // (which is now infallible — see query_decomposer.rs:751-754). A malformed
@@ -241,6 +250,7 @@ pub fn reflex_build_delta_sql(
             &plan,
             &new_tbl,
             &old_tbl,
+            netted_delta,
             &mut stmts,
         );
     } else {
@@ -309,7 +319,14 @@ pub fn reflex_build_delta_sql(
                     &new_tbl,
                     &mut stmts,
                 ) {
-                    pending_dispatch = Some(PendingDispatch { merge_sql });
+                    if netted_delta {
+                        pending_dispatch = Some(PendingDispatch { merge_sql });
+                    } else {
+                        // A statement trigger never rebuilds (see `passthrough_op_stmts`):
+                        // run the MERGE inline and let the epilogue sync the target.
+                        stmts.push(merge_sql);
+                        stmts.push(format!("ANALYZE {}", intermediate_tbl));
+                    }
                 }
             }
             _ => {}

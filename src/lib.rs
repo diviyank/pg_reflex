@@ -1821,6 +1821,7 @@ mod tests {
     include!("tests/pg_test_reconcile_diff_apply.rs");
     include!("tests/pg_test_rebuild_diff.rs");
     include!("tests/pg_test_rebuild_cost.rs");
+    include!("tests/pg_test_statement_mixed_dml.rs");
     include!("tests/pg_test_partition_attach_locks.rs");
     include!("tests/pg_test_partition_dispatch.rs");
     include!("tests/pg_test_audit.rs");

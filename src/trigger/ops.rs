@@ -1052,8 +1052,14 @@ pub(crate) fn passthrough_op_stmts(
     plan: &AggregationPlan,
     new_tbl: &str,
     old_tbl: &str,
+    netted_delta: bool,
     stmts: &mut Vec<String>,
 ) {
+    // Only the DEFERRED flush's netted delta may rebuild a partition hot. A
+    // statement trigger can be followed by another trigger of the same statement
+    // (upsert, MERGE, writable CTE) that applies its own delta: a hot rebuild
+    // here already reads that statement's other writes from the source, which the
+    // later trigger then applies a second time.
     let qv = quote_identifier(view_name);
     let pt_new = passthrough_scratch_new_table_name(view_name, source_table);
     let pt_old = passthrough_scratch_old_table_name(view_name, source_table);
@@ -1136,6 +1142,7 @@ pub(crate) fn passthrough_op_stmts(
                         &strategy,
                         &del_cold,
                         "",
+                        netted_delta,
                     ));
                 } else {
                     let del_match = passthrough_keyed_delete_match(
@@ -1231,6 +1238,7 @@ pub(crate) fn passthrough_op_stmts(
                         &strategy,
                         &del_cold,
                         &ins_cold,
+                        netted_delta,
                     ));
                 } else {
                     // PS-5 — gated pair on the unpartitioned path only; see the

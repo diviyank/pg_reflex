@@ -2010,7 +2010,7 @@ fn flush_staged_deltas(source_table: &str) -> String {
             let upd_sql = reflex_build_delta_sql(
                 imv_name,
                 source_table,
-                "UPDATE",
+                super::NETTED_UPDATE_OP,
                 base_query,
                 end_query,
                 Some(agg_json.as_str()),

@@ -2065,7 +2065,7 @@ fn test_dispatch_block_emitted_only_for_update() {
     let sql_upd = reflex_build_delta_sql(
         "test_view",
         "orders",
-        "UPDATE",
+        crate::trigger::NETTED_UPDATE_OP,
         base_q,
         end_q,
         Some(agg_json.as_str()),
@@ -2073,13 +2073,31 @@ fn test_dispatch_block_emitted_only_for_update() {
     );
     assert!(
         sql_upd.contains("DO $reflex_dispatch$"),
-        "UPDATE must emit the dispatch DO block: {}",
+        "the DEFERRED flush's netted UPDATE must emit the dispatch DO block: {}",
         &sql_upd[..sql_upd.len().min(2000)]
     );
     assert!(
         sql_upd.contains("reflex_reconcile"),
         "UPDATE dispatch block must reference reflex_reconcile: {}",
         &sql_upd[..sql_upd.len().min(2000)]
+    );
+
+    // A statement trigger never rebuilds: another trigger of the same statement
+    // (upsert, MERGE, writable CTE) would apply its delta on top of the rebuild.
+    let sql_stmt_upd = reflex_build_delta_sql(
+        "test_view",
+        "orders",
+        "UPDATE",
+        base_q,
+        end_q,
+        Some(agg_json.as_str()),
+        base_q,
+    );
+    assert!(
+        !sql_stmt_upd.contains("DO $reflex_dispatch$")
+            && !sql_stmt_upd.contains("reflex_reconcile"),
+        "a statement-trigger UPDATE must not emit the dispatch: {}",
+        &sql_stmt_upd[..sql_stmt_upd.len().min(2000)]
     );
 
     for op in ["INSERT", "DELETE"].iter() {
@@ -2115,7 +2133,7 @@ fn test_update_dispatch_block_reads_per_imv_threshold_override() {
     let sql = reflex_build_delta_sql(
         "test_view",
         "orders",
-        "UPDATE",
+        crate::trigger::NETTED_UPDATE_OP,
         base_q,
         end_q,
         Some(agg_json.as_str()),
@@ -2872,59 +2890,21 @@ fn test_delete_promoted_falls_back_to_merge_when_no_source_join_keys() {
     );
 }
 
-// =============================================================================
-// 1.4.6 — Path B pre-scratch dispatch in the trigger function body.
-//
-// Before invoking reflex_build_delta_sql, the trigger function estimates
-// |transition rows| / |source reltuples|. If this exceeds the per-IMV /
-// session / compiled threshold, it dispatches to reflex_reconcile and
-// CONTINUEs to the next IMV — saving the entire scratch-fill cost on
-// genuinely sweeping mutations.
-// =============================================================================
-
+// 1.11.5 — the IMMEDIATE INSERT / DELETE / UPDATE statement-trigger bodies never
+// rebuild an IMV. The removed Path B (|transition| / |source| >= wipe_threshold ⇒
+// reflex_reconcile) ran inside one trigger of a statement that may fire another
+// (upsert: UPDATE then INSERT; MERGE; writable CTE): the rebuild already read
+// that statement's other writes, which the later trigger then applied again.
 #[test]
-fn test_trigger_function_body_emits_path_b_dispatch() {
+fn test_statement_trigger_bodies_never_rebuild() {
     let ddls = build_trigger_ddls("orders");
-    let combined = ddls.join("\n");
-    // Three triggers (ins, del, upd) — each must carry the Path B block.
-    assert!(
-        combined.contains("Path B: dispatching"),
-        "trigger function body must emit Path B dispatch (look for the RAISE DEBUG marker). Got: {}",
-        &combined[..combined.len().min(4000)]
-    );
-    assert!(
-        combined.contains("PERFORM public.reflex_reconcile"),
-        "Path B block must call reflex_reconcile on dispatch. Got: {}",
-        &combined[..combined.len().min(4000)]
-    );
-    // EXCEPTION WHEN OTHERS THEN NULL is the safe-fallback guard for the
-    // pre-scratch dispatch — if any catalog query fails (source dropped,
-    // brand-new table without reltuples), we silently fall through to the
-    // standard codegen rather than aborting the trigger.
-    assert!(
-        combined.contains("EXCEPTION WHEN OTHERS THEN NULL"),
-        "Path B block must have a safe-fallback EXCEPTION handler. Got: {}",
-        &combined[..combined.len().min(4000)]
-    );
-}
-
-#[test]
-fn test_path_b_reads_per_imv_threshold_chain() {
-    let ddls = build_trigger_ddls("orders");
-    let combined = ddls.join("\n");
-    // The threshold chain mirrors the existing UPDATE post-scratch
-    // dispatch: per-IMV wipe_threshold column → reflex.wipe_threshold GUC
-    // → compiled default 0.5.
-    assert!(
-        combined.contains("SELECT wipe_threshold INTO _pre_per_imv"),
-        "Path B must read the per-IMV wipe_threshold column. Got: {}",
-        &combined[..combined.len().min(4000)]
-    );
-    assert!(
-        combined.contains("current_setting('reflex.wipe_threshold', true)::NUMERIC, 0.5"),
-        "Path B must fall through GUC then compiled default. Got: {}",
-        &combined[..combined.len().min(4000)]
-    );
+    for ddl in &ddls[..3] {
+        assert!(
+            !ddl.contains("reflex_reconcile") && !ddl.contains("_pre_src_total"),
+            "a statement trigger body must not rebuild the IMV. Got: {}",
+            &ddl[..ddl.len().min(4000)]
+        );
+    }
 }
 
 #[test]
@@ -3218,13 +3198,14 @@ mod delta_sql_snapshots {
 
     #[test]
     fn snapshot_aggregate_update_with_dispatch() {
-        // UPDATE on a grouped aggregate without MIN/MAX → pending_dispatch path
+        // DEFERRED flush's netted UPDATE on a grouped aggregate without MIN/MAX
+        // → pending_dispatch path
         let base_q = "SELECT region, SUM(qty) AS qty FROM sales GROUP BY region";
         let end_q = "SELECT region, qty FROM __reflex_int_v GROUP BY region";
         let sql = reflex_build_delta_sql(
             "v",
             "sales",
-            "UPDATE",
+            crate::trigger::NETTED_UPDATE_OP,
             base_q,
             end_q,
             Some(AGG_JSON_SINGLE_SOURCE),
@@ -3803,6 +3784,7 @@ fn passthrough_update_partitioned_emits_dispatch() {
         &plan,
         "__reflex_new_ss",
         "__reflex_old_ss",
+        false,
         &mut stmts,
     );
     let joined = stmts.join("\n");
@@ -3834,6 +3816,7 @@ fn passthrough_update_nonpartitioned_unchanged() {
         &plan,
         "__reflex_new_ss",
         "__reflex_old_ss",
+        false,
         &mut stmts,
     );
     let joined = stmts.join("\n");
@@ -3870,6 +3853,7 @@ fn passthrough_delete_nullable_key_uses_null_safe_match() {
         &plan,
         "__reflex_new_ss",
         "__reflex_old_ss",
+        false,
         &mut stmts,
     );
     let joined = stmts.join("\n");
@@ -3919,6 +3903,7 @@ fn partitioned_passthrough_cold_delete_is_gated_and_swaps_once() {
             &plan,
             "__reflex_new_ss",
             "__reflex_old_ss",
+            false,
             &mut stmts,
         );
         let joined = stmts.join("\n");

@@ -640,7 +640,7 @@ fn pg_part_list_dispatch_sql_has_pruning_predicate() {
         ["DELETE FROM \"public\".\"v\" WHERE id IN (SELECT id FROM pt_old)".to_string()];
     let list_sql = crate::trigger::build_passthrough_partition_dispatch_sql(
         "v", "\"public\".\"v\"", "SELECT 1 AS pkey, TRUE AS is_old", "region", "\"public\".\"v\".\"region\"",
-        "LIST", &cold_del, "",
+        "LIST", &cold_del, "", true,
     );
     assert!(
         list_sql.contains("= ANY($2::text[]::"),
@@ -648,7 +648,7 @@ fn pg_part_list_dispatch_sql_has_pruning_predicate() {
     );
     let range_sql = crate::trigger::build_passthrough_partition_dispatch_sql(
         "v", "\"public\".\"v\"", "SELECT 1 AS pkey, TRUE AS is_old", "ts", "\"public\".\"v\".\"ts\"",
-        "RANGE", &cold_del, "",
+        "RANGE", &cold_del, "", true,
     );
     assert!(
         !range_sql.contains("= ANY($2::text[]::"),

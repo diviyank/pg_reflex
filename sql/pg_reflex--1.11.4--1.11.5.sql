@@ -27,7 +27,16 @@
 --      its one changed statement is rewritten in place. A 1.11.4 body deletes
 --      them early, so a COMMIT that postpones a rebuild can take a request
 --      whose event is still queued for one already fired, and mark the IMV
---      stale needlessly. No other per-source trigger body changed in 1.11.5.
+--      stale needlessly.
+--
+--   5. The IMMEDIATE INSERT / DELETE / UPDATE trigger bodies of every existing
+--      source lose their pre-scratch "Path B" block, which rebuilt the IMV
+--      (`reflex_reconcile`) when the statement changed a large share of the
+--      source. Another trigger of the same statement (an upsert's INSERT after
+--      its UPDATE, MERGE, a writable CTE) then applied its delta on top of a
+--      rebuild that already read it: a silent double count for an aggregate, a
+--      23505 for a passthrough. The block is cut out of each installed body
+--      in place. No other per-source trigger body changed in 1.11.5.
 --
 --   4. 'TRUNCATE' request rows committed by a 1.11.5 library running with the
 --      1.11.4 flush function (between the library install and this update)
@@ -38,16 +47,17 @@
 -- from indentation, so fresh installs and upgrades converge. If you edit one,
 -- edit both.
 --
--- Step 3 takes no lock on the sources. It reports how many deferred TRUNCATE
+-- Steps 3 and 5 take no lock on the sources. It reports how many deferred TRUNCATE
 -- bodies it found and rewrote (INFO); a body it cannot rewrite is listed in a
 -- WARNING with its remedy and skipped without aborting the upgrade.
 --
 -- UPGRADE WINDOW — writes fail until this update runs. The 1.11.5 library
 -- generates SQL that calls the five functions above, so between installing
 -- the library and running this update in a database:
---   * an UPDATE of a source of an aggregate IMV, and an UPDATE / DELETE of the
---     partitioned source of a partitioned passthrough IMV, fail (volume
---     dispatch: `__reflex_target_propagates`, `__reflex_rebuild_cost_rows`);
+--   * an UPDATE / DELETE of the partitioned source of a partitioned
+--     passthrough IMV, and the flush of a DEFERRED grouped aggregate or
+--     partitioned passthrough IMV, fail (volume dispatch:
+--     `__reflex_target_propagates`, `__reflex_rebuild_cost_rows`);
 --   * a TRUNCATE of a source of an IMMEDIATE IMV and the trigger-side full
 --     refreshes fail (`reflex_rebuild_target_rows`);
 --   * a COMMIT that leaves a DEFERRED IMV to rebuild (e.g. two of its sources
@@ -193,6 +203,64 @@ BEGIN
     END IF;
 END
 $regen$;
+
+-- === Statement-trigger bodies no longer rebuild (step 5) ===
+-- The Path B block and its DECLARE line are rendered verbatim from
+-- sql/trigger_body.plpgsql.in (unchanged from 1.4.6 to 1.11.4) and contain only
+-- the source-name slot, so they are cut by position: a 1.11.4 body becomes what
+-- 1.11.5 renders for its source.
+
+DO $stmt_triggers$
+DECLARE
+    _fn RECORD;
+    _def TEXT;
+    _start INT;
+    _len INT;
+    _found INT := 0;
+    _rewritten INT := 0;
+    _skipped TEXT[] := ARRAY[]::TEXT[];
+    _decl CONSTANT TEXT := E'        _pre_trans_count BIGINT; _pre_src_total BIGINT; _pre_thr NUMERIC; _pre_per_imv NUMERIC; _pre_ratio NUMERIC;\n';
+    _head CONSTANT TEXT := E'      BEGIN\n        SELECT reltuples::BIGINT INTO _pre_src_total FROM pg_class WHERE oid = ';
+    _tail CONSTANT TEXT := E'      EXCEPTION WHEN OTHERS THEN NULL; END;\n';
+BEGIN
+    FOR _fn IN
+        SELECT p.oid::regprocedure AS fn
+        FROM pg_proc p
+        JOIN pg_namespace n ON n.oid = p.pronamespace
+        WHERE n.nspname = 'public'
+          AND p.prorettype = 'trigger'::regtype
+          AND strpos(p.prosrc, 'pg_reflex Path B: dispatching') > 0
+        ORDER BY p.proname
+    LOOP
+        _found := _found + 1;
+        _def := pg_get_functiondef(_fn.fn);
+        _start := strpos(_def, _head);
+        _len := CASE WHEN _start > 0 THEN strpos(substr(_def, _start), _tail) ELSE 0 END;
+        IF _start = 0 OR _len = 0 OR strpos(_def, _decl) = 0
+           OR strpos(substr(_def, _start, _len), 'PERFORM public.reflex_reconcile(_rec.name);') = 0 THEN
+            _skipped := _skipped || format('%s: unrecognised body', _fn.fn);
+            CONTINUE;
+        END IF;
+        _def := substr(_def, 1, _start - 1) || substr(_def, _start + _len - 1 + length(_tail));
+        _def := replace(_def, _decl, '');
+        BEGIN
+            EXECUTE _def;
+            _rewritten := _rewritten + 1;
+        EXCEPTION WHEN OTHERS THEN
+            _skipped := _skipped || format('%s: %s', _fn.fn, SQLERRM);
+        END;
+    END LOOP;
+    RAISE INFO 'pg_reflex 1.11.5: removed the rebuild (Path B) from % of % statement-trigger bodies found (% skipped)',
+        _rewritten, _found, COALESCE(array_length(_skipped, 1), 0);
+    IF COALESCE(array_length(_skipped, 1), 0) > 0 THEN
+        RAISE WARNING '%', format('pg_reflex 1.11.5: %s statement-trigger bodies still rebuild the IMV on a large statement: %s. '
+            'Until repaired, a statement that both updates and inserts (upsert, MERGE, writable CTE) a large share of such a source '
+            'can double count its aggregate IMVs. Remedy, after the upgrade: create, then drop, a throwaway IMV over each source '
+            '(create_reflex_ivm re-renders the source''s trigger bodies), then reflex_reconcile its IMVs.',
+            array_length(_skipped, 1), array_to_string(_skipped, '; '));
+    END IF;
+END
+$stmt_triggers$;
 
 -- === Leftover truncate flush requests ===
 
