@@ -75,14 +75,37 @@ instead of aborting COMMIT. `ALTER EXTENSION pg_reflex UPDATE TO '1.11.5';`
   threshold of 0.9 instead of 0.5 (`__reflex_target_propagates`): its
   rebuild also pays for the diff and for its dependents' maintenance, so
   the incremental path stays cheaper for longer.
-- **A partitioned passthrough UPDATE never went hot.** The dispatch counted
-  the distinct partition values touched instead of the changed rows, so an
-  UPDATE of 80% of a plan was maintained by keyed DELETE + INSERT instead of
+- **A DEFERRED partitioned passthrough IMV's flush never went hot.** The
+  flush routes every operation through the UPDATE dispatch, which counted the
+  distinct partition values touched instead of the changed rows, so a flush
+  changing 80% of a plan was maintained by keyed DELETE + INSERT instead of
   one partition rebuild. A partition now counts its changed rows — the larger
   of its old-image and new-image counts, so N rows updated in place count N
-  and a row moved across partitions counts once on each side — which also
-  covers upserts (`INSERT … ON CONFLICT DO UPDATE`) and passthrough IMVs
-  that join other tables.
+  and a row moved across partitions counts once on each side. This covers
+  every operation the flush nets (bulk UPDATE, upsert, MERGE, and also bulk
+  INSERT and DELETE, which can now go hot) and passthrough IMVs that join
+  other tables (`sop_forecast_view`). The numerator counts source rows, not
+  IMV rows: a WHERE filter leans it hot, a one-to-many join cold. A hot flush
+  runs at COMMIT and holds its locks until the COMMIT ends: the leaf diff of a
+  target with observing dependents takes `EXCLUSIVE` on the IMV root (other
+  writers wait, readers do not), the swap's `DETACH` takes
+  `ACCESS EXCLUSIVE` on the plan-level child and the leaf (readers not pruned
+  away from that plan wait). IMMEDIATE IMVs never go hot (next entry).
+- **(SILENT) IMMEDIATE mixed upsert / MERGE / writable CTE double count;
+  IMMEDIATE dispatch now stays incremental** (pre-existing: since 1.4.6 for
+  unpartitioned IMVs, 1.6.0 for partitioned ones). One statement that both
+  changes and inserts or deletes source rows fires several statement
+  triggers (an upsert: AFTER UPDATE, then AFTER INSERT), each seeing the
+  source as the whole statement left it. When one of them rebuilt the IMV —
+  the trigger's pre-scratch "Path B" (`|statement rows| / |source| >=
+  wipe_threshold`), the unpartitioned high-selectivity dispatch, the
+  partitioned aggregate or passthrough hot-partition dispatch — the rebuild
+  already held the later triggers' rows, which they applied again: an
+  aggregate silently double counted them (a partitioned `GROUP BY plan, m,
+  id` IMV upserted with 1600 conflicting + 400 new rows: 800 wrong rows), a
+  passthrough failed with 23505. A statement trigger now never rebuilds:
+  Path B is removed from the trigger bodies and the dispatch runs only in the
+  DEFERRED flush, which nets the transaction into one delta first.
 - **(SILENT) A volume-dispatch rebuild that failed softly lost the
   statement's change.** The dispatch hands a bulk change to
   `reflex_reconcile` / `reflex_reconcile_partition`, which report some
@@ -155,8 +178,16 @@ instead of aborting COMMIT. `ALTER EXTENSION pg_reflex UPDATE TO '1.11.5';`
 - `reflex_reconcile` (and `reflex_reconcile_partition`) of a DEFERRED IMV
   called from inside a trigger returns `RECONCILE QUEUED FOR COMMIT`: the IMV
   is rebuilt by the COMMIT-time pass, after the statement stages its delta.
+- IMMEDIATE IMVs no longer switch to a rebuild on a large statement: the
+  statement triggers' Path B is removed, and the high-selectivity and
+  hot-partition dispatch run only in the DEFERRED flush.
 
 ### Known limits
+
+**Large IMMEDIATE statements stay incremental.** A bulk UPDATE / INSERT /
+DELETE on the source of an IMMEDIATE IMV is maintained row by row however
+large, where 1.11.4 could rebuild the IMV or the touched partitions. Bulk
+jobs that want the rebuild path should write through DEFERRED IMVs.
 
 Filed in `untreated_bugs/`: a passthrough dependent with no key mapping for
 a source still fully refreshes (now as a diff) on every statement on it;
@@ -180,7 +211,11 @@ flushing different sources of one DEFERRED join IMV can deadlock at COMMIT
 key-scoped reconcile of a DEFERRED IMV reached from inside a trigger becomes a
 full rebuild of the IMV at COMMIT; the aggregate partition dispatch now sizes
 a partition by its source rows but still counts dirty groups, so an aggregate
-partition with many source rows per group rarely goes hot.
+partition with many source rows per group rarely goes hot. Pre-existing and
+(SILENT): an IMMEDIATE MIN / MAX aggregate whose source gets one statement
+that both updates and inserts (upsert, MERGE) recomputes the updated groups
+from a source that already holds the inserted rows, which the INSERT trigger
+then merges again; a later DELETE of those rows can leave a wrong MIN / MAX.
 
 Cost of a DEFERRED TRUNCATE rebuild of a large partitioned IMV with
 dependents: each populated leaf is diffed by staging
@@ -215,7 +250,9 @@ filed with the keyless whole-row diff's two full sorts of the target.
 
 - New `pg_test_truncate_outer_join.rs`, `pg_test_rebuild_diff.rs`,
   `pg_test_reconcile_diff_apply.rs`, `pg_test_rebuild_cost.rs`,
-  `pg_test_rebuild_commit.rs` and `pg_test_deferred_marker.rs`; every must-be-absent / must-stay-unchanged
+  `pg_test_rebuild_commit.rs`, `pg_test_deferred_marker.rs` and
+  `pg_test_statement_mixed_dml.rs` (upsert / MERGE / writable CTE in both
+  modes, and the trigger-body migration replayed on 1.11.4 bodies); every must-be-absent / must-stay-unchanged
   assertion mutation-checked. Cost assertions count the rows written after a
   boundary command id (`rows_rewritten_since`: target rows whose `cmin` is
   past the boundary), which also sees leaves refilled or swapped in; a few
@@ -231,12 +268,16 @@ filed with the keyless whole-row diff's two full sorts of the target.
   `__reflex_xid_precedes`), replaces `__reflex_deferred_flush_fn`, rewrites
   the pending-row DELETE in every installed deferred TRUNCATE trigger body
   (no lock on the sources; an INFO line reports how many it found and
-  rewrote, a WARNING lists any it skipped with the remedy), and deletes
-  leftover `'TRUNCATE'` request rows.
+  rewrote, a WARNING lists any it skipped with the remedy), cuts the Path B
+  rebuild out of every installed IMMEDIATE INSERT / DELETE / UPDATE trigger
+  body (in place, no lock; INFO / WARNING likewise), and deletes leftover
+  `'TRUNCATE'` request rows.
 - **Writes and COMMITs on IMV sources fail until the update runs.** The
   1.11.5 library's generated SQL calls the five functions, so between the
-  library install and the update: an `UPDATE` of an aggregate IMV's source,
-  an `UPDATE` / `DELETE` of a partitioned passthrough IMV's source, a
+  library install and the update: an `UPDATE` / `DELETE` of a partitioned
+  passthrough IMV's source, the flush of a DEFERRED grouped aggregate or
+  partitioned passthrough IMV (the IMV is marked `known_stale` under the
+  default `flush_failure_policy`), a
   `TRUNCATE` of an IMMEDIATE IMV's source and the trigger-side full
   refreshes fail with `function … does not exist`; a `COMMIT` that leaves a
   DEFERRED IMV to rebuild aborts; a `TRUNCATE` of a DEFERRED IMV's source

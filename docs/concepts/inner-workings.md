@@ -20,7 +20,7 @@ When a tracked source is mutated, the statement trigger fires once with the full
 2. **`ignore_sources` skip** — if this source is in the IMV's `ignored_sources`, `CONTINUE`.
 3. **`where_predicate` skip** — evaluate the IMV's stored `WHERE` against the transition rows; skip if none match.
 4. **Directional probe** (UPDATE only) — classify the batch (e.g. a filter OUT→IN flip becomes `INSERT_PROMOTED`); see §4.3.
-5. **Path B pre-scratch dispatch** — `|transition| / |source| ≥ wipe_threshold` ⇒ `reflex_reconcile` and `CONTINUE` (§5.1).
+5. *(removed in 1.11.5)* **Path B** — a statement trigger no longer rebuilds the IMV (§5).
 6. **Path C pre-scratch dispatch** (promoted UPDATE only) — planner row-estimate ⇒ smart bulk-INSERT (§5.2).
 7. **Per-IMV advisory lock** — `pg_advisory_xact_lock(hashtext(name), hashtext(reverse(name)))`.
 8. **Build + execute the delta SQL** — `reflex_build_delta_sql(...)`, then `EXECUTE` each separated statement.
@@ -188,7 +188,9 @@ An UPDATE is decomposed into a **subtract of the OLD image** and an **add of the
 
 ## 5. Dispatch: choosing incremental vs rebuild
 
-Incremental maintenance is cheaper *only when the delta is small relative to the result*. When a single statement churns a large fraction of the IMV, an in-place MERGE + targeted refresh is slower than rebuilding from scratch. pg_reflex makes that decision at three points.
+Incremental maintenance is cheaper *only when the delta is small relative to the result*. When a single statement churns a large fraction of the IMV, an in-place MERGE + targeted refresh is slower than rebuilding from scratch.
+
+**Since 1.11.5 only the DEFERRED flush makes that decision** (§5.1, §5.5, the passthrough dispatch of §6.3). It calls `reflex_build_delta_sql` once per IMV and source with the transaction's netted delta (`UPDATE_NETTED`). A statement trigger (IMMEDIATE) always stays incremental: one statement can fire several triggers (an upsert's AFTER UPDATE then AFTER INSERT, MERGE, a writable CTE), each seeing the source as the whole statement left it, so a rebuild by an earlier trigger already holds the rows a later trigger then applies again — a silent double count for an aggregate, a 23505 for a passthrough. Bulk jobs that want the rebuild path should use DEFERRED IMVs. When the flush does rebuild, a hot rebuild holds its locks until the transaction ends: the leaf diff (a target with observing dependents) takes `LOCK TABLE <root> IN EXCLUSIVE MODE`, blocking other writers of the IMV but not readers; the swap's `DETACH` takes `AccessExclusiveLock` on the plan-level child and the leaf, blocking every reader not pruned away from that plan.
 
 ### 5.1 Post-scratch selectivity dispatch (`build_high_selectivity_dispatch_sql`)
 
@@ -213,7 +215,7 @@ The threshold resolves **per-IMV column → `reflex.wipe_threshold` GUC → comp
 
 Both probes fire *before* the scratch fill, because on a bulk filter-flip the scratch JOIN is itself the dominant cost.
 
-- **Path B** (`|transition| / |source| ≥ wipe_threshold`): a sweeping DML produced a transition table that is a meaningful fraction of the source ⇒ `reflex_reconcile` and skip the IMV. Cheap; gated on `source.reltuples ≥ 1000`. Misses the case where the transition is tiny but the JOIN fanout is huge.
+- **Path B** (removed from the statement triggers in 1.11.5, see §5) (`|transition| / |source| ≥ wipe_threshold`): a sweeping DML produced a transition table that is a meaningful fraction of the source ⇒ `reflex_reconcile` and skip the IMV. Cheap; gated on `source.reltuples ≥ 1000`. Misses the case where the transition is tiny but the JOIN fanout is huge.
 - **Path C** (UPDATE → `INSERT_PROMOTED` only): runs `EXPLAIN (FORMAT JSON)` on the rewritten scratch-fill query (`reflex_build_path_c_explain_sql`) and reads the planner's row estimate *without executing the JOIN*. If it exceeds the IMV's threshold, dispatch to the **smart bulk-INSERT** (§5.3) which beats both reconcile and `REFRESH MV` on dim-flip fanouts. Any failure is caught and falls through to the standard incremental path.
 
 ### 5.3 Smart bulk-INSERT (`push_bulk_insert_and_affected`)
@@ -306,7 +308,7 @@ A passthrough IMV (`SELECT … FROM source [WHERE …]`, no GROUP BY) has **no i
   ```
 - **Keyless**: full rebuild.
 
-A partition is hot when its changed rows reach the wipe threshold of its size, as in §5.5. Each changed row counts once: a partition's count is the larger of its OLD-image and NEW-image row counts, so an UPDATE of N rows within a partition counts N (like N deleted rows) and a row moving between partitions counts once on each side.
+Only the DEFERRED flush classifies partitions hot (§5); a statement trigger runs the cold body for every partition. Since the flush routes every operation through this UPDATE path, a bulk INSERT or DELETE can go hot too. A partition is hot when its changed rows reach the wipe threshold of its size, as in §5.5. The numerator counts source transition rows, not IMV rows: a WHERE filter leans it hot (rows outside the filter count), a one-to-many join leans it cold (one source row stands for several IMV rows), bounded either way by the source change. Each changed row counts once: a partition's count is the larger of its OLD-image and NEW-image row counts, so an UPDATE of N rows within a partition counts N (like N deleted rows) and a row moving between partitions counts once on each side.
 
 The cold body takes only `RowExclusiveLock` (DELETE/INSERT, no TRUNCATE), so partitioned passthrough readers stay live.
 
@@ -334,7 +336,7 @@ When the source appears 2+ times in `base_query`, a single transition table can'
 
 - **Non-partitioned aggregate**: save index DDL, drop the intermediate's indexes, `TRUNCATE <intermediate>; INSERT INTO <intermediate> <base_query>`, `TRUNCATE <view>; INSERT INTO <view> <end_query>`, recreate the reflex-managed indexes and any user indexes, `ANALYZE`.
 - **Non-partitioned passthrough**: drop target indexes, `DELETE FROM <view>; INSERT INTO <view> <base_query>`, recreate indexes, `ANALYZE`.
-- **Partitioned**: iterate the source partition tree and run a per-child **atomic DETACH/ATTACH swap** — build a new child outside the tree, fill it from `(base_query) WHERE <partition constraint>`, add a matching `CHECK` (so PG skips the ATTACH validation scan), then in one sub-transaction `DETACH` old + `ATTACH` new + `DROP` old + `RENAME` swap→canonical. The intermediate is swapped before the target (the target fill reads the intermediate). `AccessExclusiveLock` on the parent is held only for the µs-scale DDL window, not the data fill. See [internals → Atomic swap](internals.md#atomic-swap-160-planspartitioning_3md-1).
+- **Partitioned**: iterate the source partition tree and run a per-child **atomic DETACH/ATTACH swap** — build a new child outside the tree, fill it from `(base_query) WHERE <partition constraint>`, add a matching `CHECK` (so PG skips the ATTACH validation scan), then in one sub-transaction `DETACH` old + `ATTACH` new + `DROP` old + `RENAME` swap→canonical. The intermediate is swapped before the target (the target fill reads the intermediate). The fill runs before the `DETACH`, but the `AccessExclusiveLock` the `DETACH`/`ATTACH` take on the parent and the child is held until the transaction ends, so readers not pruned away from that child wait for the COMMIT. See [internals → Atomic swap](internals.md#atomic-swap-160-planspartitioning_3md-1).
 
 `reflex_reconcile` also runs `reflex_sync_partitions` at entry (defense-in-depth) and cascades to dependent IMVs.
 
@@ -368,9 +370,9 @@ The full routing, as a single table. "Target lock" is the lock the path takes on
 | Aggregate | INSERT (promoted, join-key) | bulk-INSERT | scratch→drop idx→INSERT→reindex→INSERT target | RowExclusive |
 | Aggregate | DELETE | MERGE-Subtract | scratch→MERGE(−)→dead-cleanup→epilogue | RowExclusive |
 | Aggregate | DELETE (join-key, no rollup) | bulk-DELETE | keyed DELETE intermediate + target | RowExclusive |
-| Aggregate | UPDATE | netted MERGE + dispatch | scratch(net)→affected→dispatcher DO | RowExclusive *or* AccessExclusive (if reconcile) |
+| Aggregate | UPDATE | netted MERGE (+ dispatch in the DEFERRED flush) | scratch(net)→affected→MERGE / dispatcher DO | RowExclusive *or* AccessExclusive until COMMIT (if the flush reconciles) |
 | Aggregate (MIN/MAX) | UPDATE | subtract→recompute→add→shrunk recompute | two-pass MERGE + scoped source scan | RowExclusive |
-| Aggregate (partitioned) | UPDATE | partition-aware dispatch | classify hot/cold → swap hot, MERGE cold | per-child AccessExclusive (DDL window) + RowExclusive |
+| Aggregate (partitioned) | UPDATE | partition-aware dispatch (DEFERRED flush only) | classify hot/cold → swap hot, MERGE cold | per-child AccessExclusive held until COMMIT + RowExclusive |
 | Passthrough | INSERT | keyed append | `INSERT INTO <view> SELECT … <new>` | RowExclusive |
 | Passthrough | DELETE | keyed delete | `DELETE … WHERE key IN <old>` | RowExclusive |
 | Passthrough | UPDATE | keyed delete + delta insert | delete OLD keys, insert NEW projection | RowExclusive |
@@ -379,7 +381,7 @@ The full routing, as a single table. "Target lock" is the lock the path takes on
 | Outer-join secondary (FULL) | any | full rebuild | `DELETE FROM <view>; INSERT <base_query>` | RowExclusive |
 | Self-join | any | full refresh | TRUNCATE+rebuild | AccessExclusive |
 | any | TRUNCATE source | truncate handler | `DELETE FROM <view>` (+TRUNCATE intermediate) | RowExclusive |
-| any | dispatch ≥ threshold | reconcile | drop idx→TRUNCATE→rebuild→reindex (or per-child swap) | AccessExclusive (non-partitioned) |
+| any (DEFERRED flush) | dispatch ≥ threshold | reconcile | drop idx→TRUNCATE→rebuild→reindex (or per-child swap) | AccessExclusive until COMMIT |
 
 ---
 

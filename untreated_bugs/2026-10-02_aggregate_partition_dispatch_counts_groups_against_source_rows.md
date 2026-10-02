@@ -20,7 +20,19 @@ plan's target leaf OIDs are unchanged (cold), ratio 12 / 2000 = 0.006. The resul
 (This small fixture is cold in 1.11.4 too, through the 1000-row floor: 12 / 1000; the
 regression shows only on partitions with more than `wipe_floor_rows` groups.)
 
+## Review assessment (r5 fix round 1)
+- Cost: a plan that should have gone hot is maintained incrementally instead; estimated 1-3x the
+  hot path's time for such a flush. Perf only, results stay correct.
+- Two-level partitions are a net improvement over 1.11.4 (whose plan-level child was sized by its
+  own `reltuples` of 0 / -1, i.e. always the 1000-row floor), so the 1.11.5 sizing is kept.
+- Do NOT switch the numerator to dirty SOURCE rows (as the passthrough arm now does) while a
+  rebuild can be double-applied; with IMMEDIATE dispatch now always cold (1.11.5) that risk is
+  confined to the DEFERRED flush, which nets first, but re-check before changing.
+- Alternative: size aggregate children by their own intermediate leaf sum (groups), matching the
+  numerator's unit.
+
 ## To evaluate before fixing
+Only the DEFERRED flush dispatches since 1.11.5 (statement triggers stay incremental).
 After the scratch fill the cold MERGE touches only the changed groups, so for an aggregate
 the hot rebuild may rarely pay off once the scratch is built — the right fix may be to count
 source rows (transition-table rows per partition, as the passthrough arm now does) or to size

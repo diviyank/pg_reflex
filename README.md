@@ -294,12 +294,13 @@ Highlights:
   `reflex_sync_partitions(view, true)` manually to drop orphans.
 - **Atomic swap**: `reflex_reconcile_partition` (and `reflex_reconcile` on
   partitioned IMVs) rebuilds each child outside the partition tree, then
-  flips it in via DETACH/ATTACH inside one sub-transaction. The
-  `AccessExclusiveLock` window on the parent collapses to the metadata
-  DDL (~µs) instead of the rebuild duration.
-- **Per-partition trigger dispatch**: a bulk write concentrated in one
-  partition routes through `reflex_reconcile_partition` instead of
-  rebuilding the whole IMV.
+  flips it in via DETACH/ATTACH inside one sub-transaction. Readers are
+  not blocked during the fill; the `AccessExclusiveLock` the DDL takes on
+  the parent and child is held until the transaction ends.
+- **Per-partition dispatch** (DEFERRED IMVs): a bulk change concentrated in
+  one partition is rebuilt by `reflex_reconcile_partition` at the flush
+  instead of maintained row by row. IMMEDIATE statement triggers always
+  maintain incrementally (1.11.5).
 - **Bare-column-ref constraint**: `partition_by` columns must be bare
   column references in `GROUP BY`. Computed expressions
   (`DATE_TRUNC(...)`, `UPPER(...)`, casts) are rejected at create time
