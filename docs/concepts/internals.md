@@ -173,7 +173,7 @@ A bulk write concentrated in one or two partitions used to trip the per-IMV `wip
 3. Classify partitions as hot (`dirty / GREATEST(reltuples, wipe_floor_rows) >= wipe_threshold`) or cold.
 4. Trip-cap: if `hot_count > total / 2`, fall back to global `reflex_reconcile` (sequentially DETACHing > half the partitions is worse than one rebuild).
 5. Hot partitions → `reflex_reconcile_partition(view, hot_keys_csv)` (uses the atomic swap from §1).
-6. Cold partitions → standard MERGE / dead-cleanup / target DELETE / target INSERT with an `array_position($1::TEXT[], <partition_col>::text) IS NULL` filter spliced into the USING / WHERE clauses (`$1` is every touched value of a hot child — a LIST child may hold several — bound via EXECUTE USING; `array_position` keeps NULL values cold).
+6. Cold partitions → standard MERGE / dead-cleanup / target DELETE / target INSERT with an `array_position($1::TEXT[], <partition_col>::text) IS NULL` filter spliced into the USING / WHERE clauses (`$1` is every touched value of a hot child — a LIST child may hold several — bound via EXECUTE USING; `array_position` matches NULL, so a NULL value is excluded with its hot DEFAULT child).
 
 The `wipe_floor_rows` floor on the denominator avoids tripping the dispatch on never-ANALYZE'd partitions where `reltuples = 0` would yield infinite ratios.
 
