@@ -50,7 +50,7 @@ psql -d mydb -c "ALTER EXTENSION pg_reflex UPDATE;"
 | 1.10.5 → 1.10.6 | The `sql_drop` event trigger now also cleans up an IMV whose own **target** table is dropped (directly, via `DROP SCHEMA … CASCADE`, or by dropping a view the IMV is built on), not only IMVs whose *source* was dropped. The migration re-creates the `reflex_on_sql_drop` plpgsql function; no catalog or signature change. | none for existing IMVs. Pre-1.10.6 orphaned registry rows are **not** retroactively cleaned — drop them with `drop_reflex_ivm(name, true)`, or `DELETE FROM public.__reflex_ivm_reference` for rows whose target is already gone. |
 | … 1.10.6 → 1.11.3 | See the [changelog](../changelog.md) for each intermediate release. | see changelog per version. |
 | 1.11.3 → 1.11.4 | Silent-wipe observability and prevention. A failed deferred flush now marks the IMV `known_stale` (it previously discarded the staged delta silently); `reflex_ivm_status()` gains `is_estimate`, counts anomalous IMVs exactly, and reports IMVs whose partition source is capped; new `__reflex_event_log` table and `reflex_prune_event_log`; new `pg_reflex.flush_failure_policy` GUC (`warn` default, opt-in `error`); **`create_reflex_ivm` refuses an unsound `ignore_sources` entry** unless acknowledged with a `'!'` prefix or `reflex_ack_ignore_source`; `reflex_audit` / `reflex_doctor` (F13) report existing ones; a change to an ignored source that joins onto the partition key queues the affected partitions for heal (`reflex_heal_ignored_sources`, run by `reflex_scheduled_reconcile` and doctor F14). The migration adds `ignore_ack`, the event log, the heal queue, recreates `reflex_ivm_status()` (return-shape change), and installs heal triggers on existing partitioned IMVs. | See [Upgrading to 1.11.4](#upgrading-to-1114) below: upgrade in a quiet window with `lock_timeout` set, treat `HEALED` from `reflex_scheduled_reconcile` as success, and add the `'!'` marker to accepted unsound ignores before recreating any IMV or running `reflex_rebuild_chain`. |
-| 1.11.4 → 1.11.5 | Rebuilds of an IMV with dependents (source TRUNCATE, `reflex_reconcile`, wipe dispatch, partition rebuilds) hand dependents a row diff instead of clearing or fully rebuilding them; a DEFERRED IMV whose source is truncated is rebuilt once at COMMIT; volume dispatch sizes two-level partitions by their leaves and uses a 0.9 threshold for IMVs with dependents; a multi-source guard rebuild failure marks the IMV stale instead of aborting COMMIT. IMMEDIATE IMVs no longer rebuild on a large statement (the DEFERRED flush still may). The migration adds five functions, replaces `__reflex_deferred_flush_fn`, rewrites the installed deferred TRUNCATE trigger bodies and cuts the rebuild out of the IMMEDIATE trigger bodies, in place. | **Writes to IMV sources fail until the update runs.** See [Upgrading to 1.11.5](#upgrading-to-1115): in a quiet window, install the library, immediately run `ALTER EXTENSION pg_reflex UPDATE TO '1.11.5'` in every database, then recycle connection pools. The update takes no lock on sources. |
+| 1.11.4 → 1.11.5 | Rebuilds of an IMV with dependents (source TRUNCATE, `reflex_reconcile`, wipe dispatch, partition rebuilds) hand dependents a row diff instead of clearing or fully rebuilding them; a DEFERRED IMV whose source is truncated is rebuilt once at COMMIT; volume dispatch sizes two-level partitions by their leaves and uses a 0.9 threshold for IMVs with dependents; a multi-source guard rebuild failure marks the IMV stale instead of aborting COMMIT. IMMEDIATE IMVs no longer rebuild on a large statement (the DEFERRED flush still may), and a passthrough IMMEDIATE IMV without a key for a source is fully refreshed by every write to it (`create_reflex_ivm` warns). The migration adds five functions, replaces `__reflex_deferred_flush_fn` and `__reflex_partition_child_for_key`, rewrites the installed deferred TRUNCATE trigger bodies and cuts the rebuild out of the IMMEDIATE trigger bodies, in place. | **Writes to IMV sources fail until the update runs.** See [Upgrading to 1.11.5](#upgrading-to-1115): in a quiet window, install the library, immediately run `ALTER EXTENSION pg_reflex UPDATE TO '1.11.5'` in every database, then recycle connection pools. The update takes no lock on sources. |
 
 `ALTER EXTENSION pg_reflex UPDATE` walks the chain automatically.
 
@@ -140,6 +140,20 @@ window short:
     `reflex_ivm_status()` reports `known_stale` (a DEFERRED IMV whose source
     was truncated, or whose flush failed, during the window).
 
+### Behaviour changes in 1.11.5
+
+- **IMMEDIATE IMVs stay incremental on large statements.** The statement
+  triggers no longer switch to a rebuild (Path B and the IMMEDIATE volume
+  dispatch are removed): a statement sweeping most of a source writes more
+  WAL and leaves more bloat than a rebuild would. Bulk jobs should write
+  through DEFERRED IMVs, whose flush still rebuilds hot partitions.
+- **Keyless IMMEDIATE passthroughs refresh on every write.** A passthrough
+  IMMEDIATE IMV with no key mapping for a source (no unique key passed, PK
+  not projected) is fully refreshed by every INSERT, UPDATE and DELETE on
+  it — INSERT too, since 1.11.5. `create_reflex_ivm` raises a WARNING for
+  such an IMV. On an existing one, recreate it with a unique key (3rd
+  argument) or as DEFERRED.
+
 ### Rebuilds at COMMIT in 1.11.5
 
 These operations now do a full rebuild of a DEFERRED IMV inside `COMMIT`:
@@ -148,9 +162,8 @@ These operations now do a full rebuild of a DEFERRED IMV inside `COMMIT`:
 - a transaction writing two sources of a multi-source IMV (the cross-source
   guard);
 - a reconcile of the IMV reached from inside a trigger, e.g. the
-  high-selectivity dispatch of an upstream IMV refreshing a DEFERRED
-  dependent that ignores it, or a hot-partition rebuild of an IMMEDIATE IMV
-  cascading to a DEFERRED dependent (the trigger's statement may not have
+  high-selectivity or hot-partition dispatch of an upstream DEFERRED IMV's
+  flush refreshing a DEFERRED dependent (the trigger's statement may not have
   staged its own delta yet);
 - a partition- or key-scoped reconcile (`reflex_reconcile_partition`, a
   partition swap, the scoped cascade) of an IMV that has deltas staged in the
