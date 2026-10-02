@@ -111,16 +111,15 @@ update in a database, maintenance that needs one of them fails with
 
 | Operation on an IMV source | Missing function | Effect |
 |---|---|---|
-| `UPDATE` / `DELETE` of the partitioned source of a partitioned passthrough IMV (volume dispatch) | `__reflex_target_propagates`, `__reflex_rebuild_cost_rows` | the statement fails |
 | the flush of a DEFERRED grouped aggregate or partitioned passthrough IMV (volume dispatch) | `__reflex_target_propagates`, `__reflex_rebuild_cost_rows` | the flush fails; under the default `flush_failure_policy` the IMV is marked `known_stale` |
-| `TRUNCATE` of a source of an IMMEDIATE IMV; a trigger-side full refresh (self-join, set-op, FULL JOIN fallbacks) | `reflex_rebuild_target_rows` | the statement fails |
+| `TRUNCATE` of a source of an IMMEDIATE IMV; a trigger-side full refresh (self-join, set-op, FULL JOIN fallbacks; any `INSERT` / `UPDATE` / `DELETE` of a source a passthrough IMMEDIATE IMV has no key mapping for) | `reflex_rebuild_target_rows` | the statement fails |
 | `COMMIT` of a transaction that leaves a DEFERRED IMV to rebuild (e.g. two of its sources written) | `__reflex_xid_is_current`, `__reflex_xid_precedes` | the `COMMIT` aborts and its writes roll back |
 | `TRUNCATE` of a source of a DEFERRED IMV | `reflex_rebuild_target_rows` | the `COMMIT` succeeds; the IMV is marked `known_stale` |
 
 These failures are loud: the write does not happen, so no IMV silently
-diverges from its sources. Other writes to IMMEDIATE IMVs (aggregate
-`INSERT` / `UPDATE` / `DELETE`, unpartitioned passthrough `INSERT` /
-`UPDATE` / `DELETE`, partitioned passthrough `INSERT`) keep working. Keep the
+diverges from its sources. Other writes to IMMEDIATE IMVs (aggregate and
+keyed passthrough `INSERT` / `UPDATE` / `DELETE`, partitioned or not) keep
+working: a statement trigger no longer calls the volume-dispatch functions. Keep the
 window short:
 
 1. Pick a quiet window.

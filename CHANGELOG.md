@@ -119,6 +119,34 @@ instead of aborting COMMIT. `ALTER EXTENSION pg_reflex UPDATE TO '1.11.5';`
   flush savepoint (`pg_reflex.flush_failure_policy` applies). The IMMEDIATE
   trigger body's pre-scratch Path B still discards it (filed, see Known
   limits).
+- **(SILENT) A keyless passthrough IMMEDIATE IMV double inserted on a
+  mixed statement** (pre-existing). With no key mapping for the source, the
+  DELETE / UPDATE triggers fully refresh the IMV, and the INSERT trigger
+  then appended its transition rows again: an upsert, MERGE or writable CTE
+  that both updated and inserted left the inserted rows twice. Every
+  statement on such a source, INSERT included, now fully refreshes the IMV
+  (idempotent, as a diff when it has dependents): a keyless passthrough
+  query (outer-join nullable side, `DISTINCT`) has no per-row delta that is
+  right in every shape, so INSERTs on such a source now cost a refresh.
+- **(SILENT) A partition flush applied a delta on top of the reconcile that
+  already held it** (pre-existing). `reflex_flush_partitions` runs, per IMV,
+  the reconcile of the swapped partition and then the staged partition
+  deltas; when the reconcile rebuilt from base tables that already held the
+  delta's rows, the delta was applied again. The IMV's calls now stop at the
+  first `RECONCILED` result.
+- **(SILENT) The DEFERRED flush dispatch of a LIST-partitioned IMV skipped
+  or double-applied rows** (pre-existing). Rows whose partition value is
+  NULL were left out of the cold body's partition pruning, so they were
+  never maintained; and a hot child holding several LIST values was excluded
+  from the cold body by one representative value only, so its other values'
+  rows were maintained twice (cold delta + partition rebuild). The cold body
+  now excludes every value the batch touched in a hot child, keeps NULL
+  values unpruned, and prunes by every non-NULL cold value.
+- IMMEDIATE partitioned passthrough statements emit the plain cold body (no
+  volume-dispatch block), so they no longer call
+  `__reflex_target_propagates` / `__reflex_rebuild_cost_rows`; the IMMEDIATE
+  keyed DELETE / UPDATE prune LIST partitions by the touched values (NULL
+  values unpruned).
 - **A user unique index with NULLs distinct was used as the rebuild diff
   key.** Such an index admits several rows whose key is NULL, so a rebuild
   of an IMV holding two of them aborted with "yields duplicate keys". A
@@ -185,9 +213,13 @@ instead of aborting COMMIT. `ALTER EXTENSION pg_reflex UPDATE TO '1.11.5';`
 ### Known limits
 
 **Large IMMEDIATE statements stay incremental.** A bulk UPDATE / INSERT /
-DELETE on the source of an IMMEDIATE IMV is maintained row by row however
-large, where 1.11.4 could rebuild the IMV or the touched partitions. Bulk
-jobs that want the rebuild path should write through DEFERRED IMVs.
+DELETE on the source of an IMMEDIATE IMV is maintained by the set-based
+incremental delta however large, where 1.11.4 could rebuild the IMV or the
+touched partitions. On a statement sweeping most of a source this writes
+more WAL and leaves more dead tuples than a rebuild would; bulk jobs should
+write through DEFERRED IMVs, whose flush still switches to a rebuild. A
+passthrough IMMEDIATE IMV with no key mapping for the source is the
+exception: every statement, INSERT included, fully refreshes it.
 
 Filed in `untreated_bugs/`: a passthrough dependent with no key mapping for
 a source still fully refreshes (now as a diff) on every statement on it;
@@ -215,10 +247,15 @@ partition with many source rows per group rarely goes hot. Pre-existing and
 (SILENT): an IMMEDIATE MIN / MAX aggregate whose source gets one statement
 that both updates and inserts (upsert, MERGE) recomputes the updated groups
 from a source that already holds the inserted rows, which the INSERT trigger
-then merges again; a later DELETE of those rows can leave a wrong MIN / MAX. PostgreSQL 15 only: a MERGE with
-UPDATE and INSERT actions into a multi-level partitioned source hands the
-AFTER UPDATE trigger a NEW transition table holding inserted rows, so
-IMMEDIATE IMVs over it get wrong deltas (a PostgreSQL defect; pg16+ correct).
+then merges again; a later DELETE of those rows can leave a wrong MIN / MAX;
+one statement writing two sources of an IMMEDIATE join IMV (a data-modifying
+CTE, or a user trigger on one source writing the other) applies ΔA ⋈ ΔB
+twice. PostgreSQL 15 only: a MERGE with UPDATE and INSERT actions into a
+multi-level partitioned source hands the AFTER UPDATE trigger a NEW
+transition table holding inserted rows, so every IMV over it, IMMEDIATE or
+DEFERRED, gets wrong deltas (a PostgreSQL 15 defect, reproduced without
+pg_reflex; pg16+ correct). On PostgreSQL 15 avoid such a MERGE into a
+multi-level partitioned source (split it into UPDATE and INSERT), or upgrade.
 
 Cost of a DEFERRED TRUNCATE rebuild of a large partitioned IMV with
 dependents: each populated leaf is diffed by staging
@@ -277,12 +314,12 @@ filed with the keyless whole-row diff's two full sorts of the target.
   `'TRUNCATE'` request rows.
 - **Writes and COMMITs on IMV sources fail until the update runs.** The
   1.11.5 library's generated SQL calls the five functions, so between the
-  library install and the update: an `UPDATE` / `DELETE` of a partitioned
-  passthrough IMV's source, the flush of a DEFERRED grouped aggregate or
-  partitioned passthrough IMV (the IMV is marked `known_stale` under the
-  default `flush_failure_policy`), a
-  `TRUNCATE` of an IMMEDIATE IMV's source and the trigger-side full
-  refreshes fail with `function … does not exist`; a `COMMIT` that leaves a
+  library install and the update: the flush of a DEFERRED grouped
+  aggregate or partitioned passthrough IMV (the IMV is marked `known_stale`
+  under the default `flush_failure_policy`), a `TRUNCATE` of an IMMEDIATE
+  IMV's source and the trigger-side full refreshes (including every write
+  to a source a passthrough IMMEDIATE IMV has no key mapping for) fail with
+  `function … does not exist`; a `COMMIT` that leaves a
   DEFERRED IMV to rebuild aborts; a `TRUNCATE` of a DEFERRED IMV's source
   commits and marks the IMV `known_stale`. The failures are loud — the
   write is rolled back, no IMV silently diverges. In a quiet window: install
