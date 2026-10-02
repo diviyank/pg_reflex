@@ -299,8 +299,10 @@ Highlights:
   the parent and child is held until the transaction ends.
 - **Per-partition dispatch** (DEFERRED IMVs): a bulk change concentrated in
   one partition is rebuilt by `reflex_reconcile_partition` at the flush
-  instead of maintained row by row. IMMEDIATE statement triggers always
-  maintain incrementally (1.11.5).
+  instead of maintained by the incremental delta. IMMEDIATE statement
+  triggers always apply the set-based incremental delta (1.11.5): on a
+  statement sweeping most of a source it writes more WAL and bloat than a
+  rebuild would, so bulk jobs should write through DEFERRED IMVs.
 - **Bare-column-ref constraint**: `partition_by` columns must be bare
   column references in `GROUP BY`. Computed expressions
   (`DATE_TRUNC(...)`, `UPPER(...)`, casts) are rejected at create time
