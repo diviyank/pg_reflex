@@ -1117,3 +1117,87 @@ fn safe_matches_legacy_on_ascii_and_short_names() {
         assert_eq!(safe(&short_multibyte), legacy_safe(&short_multibyte));
     }
 }
+
+// ---------- one definition of "this token names the source" ----------
+
+use super::identifier::{rewritten_source_spellings, token_names_source};
+
+const SOURCE_SPELLINGS: [&str; 4] = ["alp.dim", "\"alp\".\"dim\"", "\"alp\".dim", "alp.\"dim\""];
+
+#[test]
+fn token_names_source_in_every_qualified_spelling() {
+    for registered in SOURCE_SPELLINGS {
+        for token in SOURCE_SPELLINGS {
+            assert!(
+                token_names_source(token, registered),
+                "registered {registered}, token {token}"
+            );
+        }
+        for bare_token in ["dim", "\"dim\""] {
+            assert!(
+                token_names_source(bare_token, registered),
+                "registered {registered}, token {bare_token}"
+            );
+        }
+    }
+}
+
+#[test]
+fn token_names_source_in_every_unqualified_spelling() {
+    for registered in ["dim", "\"dim\""] {
+        for token in ["dim", "\"dim\""] {
+            assert!(
+                token_names_source(token, registered),
+                "registered {registered}, token {token}"
+            );
+        }
+    }
+}
+
+#[test]
+fn token_naming_another_relation_is_not_the_source() {
+    for registered in SOURCE_SPELLINGS {
+        for token in [
+            "alp.dim_backup",
+            "\"alp\".\"dimension\"",
+            "other.dim",
+            "\"other\".dim",
+            "other.\"dim\"",
+            "\"other\".\"dim\"",
+            "alp.dim.k",
+            "alp",
+            "\"alp\"",
+            "",
+        ] {
+            assert!(
+                !token_names_source(token, registered),
+                "registered {registered}, token {token}"
+            );
+        }
+    }
+    assert!(!token_names_source("alp.dim", "dim"));
+    assert!(!token_names_source("DIM", "dim"));
+}
+
+#[test]
+fn every_spelling_the_rewrite_replaces_names_the_source() {
+    for registered in ["alp.dim", "\"alp\".\"dim\"", "dim", "\"dim\""] {
+        let spellings = rewritten_source_spellings(registered);
+        assert!(spellings.len() >= 2, "registered {registered}");
+        for spelling in spellings {
+            assert!(
+                token_names_source(&spelling, registered),
+                "registered {registered}, spelling {spelling}"
+            );
+            assert_ne!(
+                replace_source_with_transition(
+                    &format!("SELECT 1 FROM {spelling} x"),
+                    registered,
+                    "__reflex_new_dim"
+                ),
+                format!("SELECT 1 FROM {spelling} x"),
+                "registered {registered}, spelling {spelling}"
+            );
+        }
+    }
+}

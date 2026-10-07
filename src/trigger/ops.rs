@@ -5,7 +5,7 @@ use crate::query_decomposer::{
     normalized_column_name, passthrough_scratch_new_table_name, passthrough_scratch_old_table_name,
     quote_identifier, split_qualified_name,
 };
-use crate::sql_writer::identifier::replace_source_with_transition;
+use crate::sql_writer::identifier::{replace_source_with_transition, token_names_source};
 
 /// Aggregate-IMV `INSERT` / `INSERT_PROMOTED` arm of [`reflex_build_delta_sql`].
 ///
@@ -474,11 +474,10 @@ pub(crate) fn secondary_ref_identifiers(base_query: &str, source_table: &str) ->
         .1
         .trim_matches('"')
         .to_lowercase();
-    let src_l = src_unquoted.to_lowercase();
-    let toks: Vec<String> = base_query
+    let source_lower = source_table.to_lowercase();
+    let toks: Vec<&str> = base_query
         .split(|c: char| c.is_whitespace())
         .filter(|t| !t.is_empty())
-        .map(|t| t.trim_matches('"').to_string())
         .collect();
     const KW: [&str; 17] = [
         "on",
@@ -501,13 +500,12 @@ pub(crate) fn secondary_ref_identifiers(base_query: &str, source_table: &str) ->
     ];
     let mut ids = vec![bare.clone()];
     for (i, tok) in toks.iter().enumerate() {
-        let t = tok.to_lowercase();
-        if t == src_l || t == bare {
+        if token_names_source(&tok.to_lowercase(), &source_lower) {
             if let Some(next) = toks.get(i + 1) {
-                let mut nx = next.trim_matches(',').to_lowercase();
+                let mut nx = next.trim_matches('"').trim_matches(',').to_lowercase();
                 if nx == "as" {
                     if let Some(n2) = toks.get(i + 2) {
-                        nx = n2.trim_matches(',').to_lowercase();
+                        nx = n2.trim_matches('"').trim_matches(',').to_lowercase();
                     }
                 }
                 if !nx.is_empty()
