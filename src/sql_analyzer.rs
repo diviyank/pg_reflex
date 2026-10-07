@@ -97,6 +97,29 @@ pub(crate) fn bare_function_name(name: &sqlparser::ast::ObjectName) -> String {
         .unwrap_or_default()
 }
 
+/// The schema a call is qualified with, as PostgreSQL resolves it: an unquoted name
+/// folds to lower case, a quoted one is exact.
+fn function_schema(name: &sqlparser::ast::ObjectName) -> Option<String> {
+    let schema = name
+        .0
+        .len()
+        .checked_sub(2)
+        .and_then(|position| name.0[position].as_ident())?;
+    Some(if schema.quote_style.is_some() {
+        schema.value.clone()
+    } else {
+        schema.value.to_ascii_lowercase()
+    })
+}
+
+/// A called function as the catalog lookup needs it: `schema` is `None` for an
+/// unqualified call, which PostgreSQL resolves through the caller's `search_path`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FunctionReference {
+    pub schema: Option<String>,
+    pub name: String,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct CalledFunction {
     pub name: String,
@@ -186,6 +209,8 @@ pub struct SqlAnalysis {
     /// Every non-window function call and keyword pseudo-function in the query, by bare
     /// lower-case name, once per distinct (name, argument count).
     pub called_functions: Vec<CalledFunction>,
+    /// The same calls once per distinct (schema, bare name).
+    pub function_references: Vec<FunctionReference>,
     pub has_extract: bool,
     /// Set when a clock or session-identity function is called anywhere in the
     /// query, not only in the SELECT list.
@@ -303,9 +328,16 @@ impl SqlAnalysis {
         names
     }
 
-    fn record_called_function(&mut self, call: CalledFunction) {
+    fn record_called_function(&mut self, call: CalledFunction, schema: Option<String>) {
         if is_clock_or_session_function(&call) {
             self.has_nondeterministic_select = true;
+        }
+        let reference = FunctionReference {
+            schema,
+            name: call.name.clone(),
+        };
+        if !self.function_references.contains(&reference) {
+            self.function_references.push(reference);
         }
         if !self.called_functions.contains(&call) {
             self.called_functions.push(call);
@@ -378,13 +410,14 @@ impl<'a> Visitor for AnalysisVisitor<'a> {
                         self.analysis.unsupported_aggregates.push(func_name.clone());
                     }
                     if let Some(call) = called_function(f) {
-                        self.analysis.record_called_function(call);
+                        self.analysis
+                            .record_called_function(call, function_schema(&f.name));
                     }
                 }
             }
             Expr::Identifier(ident) => {
                 if let Some(call) = keyword_pseudo_function(ident) {
-                    self.analysis.record_called_function(call);
+                    self.analysis.record_called_function(call, None);
                 }
             }
             Expr::Extract { .. } => {

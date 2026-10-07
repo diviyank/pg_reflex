@@ -1413,3 +1413,37 @@ fn nested_queries_are_detected_wherever_they_appear() {
         assert!(!parse_and_analyze(sql).has_nested_query, "{sql}");
     }
 }
+
+#[test]
+fn function_references_carry_the_schema_as_postgres_resolves_it() {
+    let a = parse_and_analyze(
+        "SELECT upper(g), pg_catalog.upper(g), S1.f(v), \"S1\".f(v), db.\"Sch\".\"F\"(v), s1.f(v, v) FROM t",
+    );
+    let references: Vec<(Option<&str>, &str)> = a
+        .function_references
+        .iter()
+        .map(|r| (r.schema.as_deref(), r.name.as_str()))
+        .collect();
+    assert_eq!(
+        references,
+        vec![
+            (None, "upper"),
+            (Some("pg_catalog"), "upper"),
+            (Some("s1"), "f"),
+            (Some("S1"), "f"),
+            (Some("Sch"), "f"),
+        ]
+    );
+}
+
+#[test]
+fn keyword_pseudo_functions_are_unqualified_references() {
+    let a = parse_and_analyze("SELECT id, CURRENT_DATE AS d FROM t");
+    assert_eq!(
+        a.function_references,
+        vec![FunctionReference {
+            schema: None,
+            name: "current_date".to_string()
+        }]
+    );
+}
