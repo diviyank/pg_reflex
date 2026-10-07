@@ -91,12 +91,11 @@ pub struct SetOperationInfo {
 }
 
 pub(crate) fn bare_function_name(name: &sqlparser::ast::ObjectName) -> String {
-    let full = name.to_string();
-    full.rsplit('.')
-        .next()
-        .unwrap_or(&full)
-        .trim_matches('"')
-        .to_lowercase()
+    name.0
+        .last()
+        .and_then(|part| part.as_ident())
+        .map(|ident| ident.value.to_lowercase())
+        .unwrap_or_default()
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -185,6 +184,7 @@ pub struct SqlAnalysis {
     /// Every non-window function call and keyword pseudo-function in the query, by bare
     /// lower-case name, once per distinct (name, argument count).
     pub called_functions: Vec<CalledFunction>,
+    pub has_extract: bool,
     /// Set when a clock or session-identity function is called anywhere in the
     /// query, not only in the SELECT list.
     pub has_nondeterministic_select: bool,
@@ -293,6 +293,9 @@ impl SqlAnalysis {
             .filter(|call| is_timezone_sensitive_function(call))
             .map(|call| call.name.clone())
             .collect();
+        if self.has_extract {
+            names.push("extract".to_string());
+        }
         names.sort();
         names.dedup();
         names
@@ -378,6 +381,9 @@ impl<'a> Visitor for AnalysisVisitor<'a> {
                 if let Some(call) = keyword_pseudo_function(ident) {
                     self.analysis.record_called_function(call);
                 }
+            }
+            Expr::Extract { .. } => {
+                self.analysis.has_extract = true;
             }
             Expr::Subquery(_) => {
                 self.analysis.has_scalar_subquery = true;
