@@ -35,6 +35,9 @@ pub(crate) struct ParsedInputs {
     mode_upper: String,
     parsed_sql: Vec<sqlparser::ast::Statement>,
     analysis: crate::sql_analyzer::SqlAnalysis,
+    /// Aggregates pg_reflex does not decompose, accepted because the query is a
+    /// single-level passthrough. Only a keyless one recomputes them on every write.
+    keyless_only_aggregates: Vec<String>,
 }
 
 /// Pipeline state shared across phases of `create_reflex_ivm_impl`. Owns the
@@ -146,7 +149,7 @@ fn validate_and_parse_inputs(
             return Err(crate::reflex_reject(&format!("Failed to parse SQL: {}", e)));
         }
     };
-    let analysis = match analyze(&parsed_sql) {
+    let (analysis, keyless_only_aggregates) = match analyze(&parsed_sql) {
         Err(SqlAnalysisError::MultipleQueries(_)) => {
             return Err(crate::reflex_reject("Expected 1 query, got multiple"));
         }
@@ -157,13 +160,14 @@ fn validate_and_parse_inputs(
             if let Some(reason) = a.unsupported_reason() {
                 return Err(crate::reflex_reject(&reason));
             }
-            if let Some(reason) = function_contract_violation(view_name, &a) {
-                return Err(crate::reflex_reject(&reason));
-            }
+            let keyless_only_aggregates = match check_function_contract(view_name, &a) {
+                Ok(aggregates) => aggregates,
+                Err(reason) => return Err(crate::reflex_reject(&reason)),
+            };
             if let Some(message) = timezone_sensitivity_warning(view_name, &a) {
                 warning!("{message}");
             }
-            a
+            (a, keyless_only_aggregates)
         }
     };
     Ok(ParsedInputs {
@@ -173,6 +177,7 @@ fn validate_and_parse_inputs(
         mode_upper,
         parsed_sql,
         analysis,
+        keyless_only_aggregates,
     })
 }
 
@@ -359,36 +364,50 @@ const SUPPORTED_AGGREGATES: [&str; 6] = ["sum", "count", "avg", "min", "max", "b
 
 const LISTED_VOLATILE_SIGNATURES: usize = 3;
 
-fn function_contract_violation(
+fn unsupported_aggregates_message(aggregates: &[String]) -> String {
+    format!(
+        "Unsupported aggregate(s): {}. Supported: SUM, COUNT, AVG, MIN, MAX, BOOL_OR",
+        aggregates.join(", ")
+    )
+}
+
+fn listed_signatures(signatures: &[String]) -> String {
+    let mut listed = signatures
+        .iter()
+        .take(LISTED_VOLATILE_SIGNATURES)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    if signatures.len() > LISTED_VOLATILE_SIGNATURES {
+        listed.push_str(&format!(
+            " and {} more",
+            signatures.len() - LISTED_VOLATILE_SIGNATURES
+        ));
+    }
+    listed
+}
+
+/// `Ok` carries the aggregates pg_reflex does not decompose that the query may still
+/// use, provided the IMV ends up keyless (see `keyed_keyless_only_aggregate`).
+fn check_function_contract(
     view_name: &str,
     analysis: &crate::sql_analyzer::SqlAnalysis,
-) -> Option<String> {
+) -> Result<Vec<String>, String> {
     let CatalogFunctionKinds {
         volatile,
         volatile_signatures,
         aggregates,
     } = catalog_function_kinds(&analysis.function_references);
     if let Some(first) = volatile_signatures.first() {
-        let mut listed = volatile_signatures
-            .iter()
-            .take(LISTED_VOLATILE_SIGNATURES)
-            .cloned()
-            .collect::<Vec<_>>()
-            .join(", ");
-        if volatile_signatures.len() > LISTED_VOLATILE_SIGNATURES {
-            listed.push_str(&format!(
-                " and {} more",
-                volatile_signatures.len() - LISTED_VOLATILE_SIGNATURES
-            ));
-        }
-        return Some(format!(
-            "Volatile function(s) {} in IMV '{view_name}': {listed}. Fix: if \
+        return Err(format!(
+            "Volatile function(s) {} in IMV '{view_name}': {}. Fix: if \
              deterministic, run ALTER FUNCTION {first} IMMUTABLE (or STABLE); otherwise remove \
              it from the IMV query, or compute the value into a source column. An unqualified \
              call is matched by name in every schema and for every overload, a \
              schema-qualified call in that schema only. A volatile function returns a \
              different result on each call, so the IMV would diverge from its own query.",
-            volatile.join(", ")
+            volatile.join(", "),
+            listed_signatures(&volatile_signatures)
         ));
     }
     let unsupported: Vec<String> = aggregates
@@ -397,12 +416,28 @@ fn function_contract_violation(
         .map(|name| name.to_uppercase())
         .collect();
     if !unsupported.is_empty() && !is_single_level_passthrough(analysis) {
-        return Some(format!(
-            "Unsupported aggregate(s): {}. Supported: SUM, COUNT, AVG, MIN, MAX, BOOL_OR",
-            unsupported.join(", ")
-        ));
+        return Err(unsupported_aggregates_message(&unsupported));
     }
-    None
+    Ok(unsupported)
+}
+
+/// A keyed passthrough is maintained row by row from the transition tables, which
+/// cannot maintain an aggregate. The key is the one `resolve_unique_columns` settled on.
+fn keyed_keyless_only_aggregate(
+    ctx: &BuildContext,
+    keyless_only_aggregates: &[String],
+) -> Option<String> {
+    if keyless_only_aggregates.is_empty() || ctx.resolved_unique_columns.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "{}. Another aggregate is accepted only without GROUP BY in an IMV with no unique \
+         key, which recomputes it on every write; this one would be keyed on ({}). Fix: do \
+         not pass unique_columns, and do not name an output column like a primary key \
+         column of the source.",
+        unsupported_aggregates_message(keyless_only_aggregates),
+        ctx.resolved_unique_columns.join(", ")
+    ))
 }
 
 /// One SELECT with no nested query that the planner maintains as a passthrough: no
@@ -2220,6 +2255,7 @@ pub(crate) fn create_reflex_ivm_impl_with_materialization(
         mode_upper,
         parsed_sql,
         mut analysis,
+        keyless_only_aggregates,
     } = parsed;
 
     // Resolve every bare source against the current `search_path` so the
@@ -2291,6 +2327,9 @@ pub(crate) fn create_reflex_ivm_impl_with_materialization(
     };
 
     resolve_unique_columns(&mut ctx);
+    if let Some(reason) = keyed_keyless_only_aggregate(&ctx, &keyless_only_aggregates) {
+        return crate::reflex_reject(&reason);
+    }
 
     // Populate per-source partition_join_paths fragments. A no-op
     // until the partition path resolves the partition column; it cannot run

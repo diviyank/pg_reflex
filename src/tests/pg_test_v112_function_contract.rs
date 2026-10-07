@@ -837,3 +837,78 @@ fn v112_fn_ungrouped_column_rejection_prints_the_cte_remedy_first() {
     let group_by_remedy = res.find("GROUP BY clause").expect("GROUP BY remedy");
     assert!(cte_remedy < group_by_remedy, "{res}");
 }
+
+fn v112_fn_assert_keyed_unknown_aggregate_rejected(name: &str, q: &str, key: Option<&str>, mode: &str) {
+    let res = crate::create_reflex_ivm(name, q, key, None, Some(mode), None);
+    assert!(res.starts_with("ERROR: [reflex-unsupported]"), "{q} -> {res}");
+    assert!(res.contains("Unsupported aggregate(s): V112_FN_UK_AGG"), "{q} -> {res}");
+    assert!(res.find("Fix:").is_some_and(|p| p < 300), "{res}");
+    assert_eq!(v112_fn_leftovers(name), 0, "objects left behind for {name}");
+    assert_eq!(
+        Spi::get_one::<i64>(&format!(
+            "SELECT COUNT(*) FROM public.__reflex_ivm_reference WHERE name LIKE '{name}%'"
+        ))
+        .expect("registry")
+        .unwrap_or(0),
+        0,
+        "registry rows left behind for {name}"
+    );
+    assert_eq!(
+        Spi::get_one::<i64>(
+            "SELECT COUNT(*) FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid \
+             WHERE NOT t.tgisinternal AND c.relname LIKE 'v112\\_fn\\_uk%\\_src'"
+        )
+        .expect("triggers")
+        .unwrap_or(0),
+        0,
+        "triggers left behind for {name}"
+    );
+}
+
+#[pg_test]
+fn v112_fn_ungrouped_unknown_aggregate_aliased_like_the_primary_key_rejected() {
+    v112_fn_table("v112_fn_uk_src");
+    v112_fn_unknown_aggregate("v112_fn_uk_agg");
+    for (i, mode) in ["IMMEDIATE", "DEFERRED"].iter().enumerate() {
+        v112_fn_assert_keyed_unknown_aggregate_rejected(
+            &format!("v112_fn_uk_a{i}"),
+            "SELECT v112_fn_uk_agg(v) AS id FROM v112_fn_uk_src",
+            None,
+            mode,
+        );
+        v112_fn_assert_keyed_unknown_aggregate_rejected(
+            &format!("v112_fn_uk_b{i}"),
+            "SELECT v112_fn_uk_agg(id) AS id, v112_fn_uk_agg(v) AS m FROM v112_fn_uk_src",
+            None,
+            mode,
+        );
+    }
+    let renamed = "SELECT v112_fn_uk_agg(v) AS m FROM v112_fn_uk_src";
+    v112_fn_created("v112_fn_uk_a0", renamed, "IMMEDIATE");
+    v112_fn_assert_correct_through_dml("v112_fn_uk_a0", renamed, "v112_fn_uk_src", false);
+}
+
+#[pg_test]
+fn v112_fn_ungrouped_unknown_aggregate_with_a_declared_key_rejected() {
+    v112_fn_table("v112_fn_ukd_src");
+    v112_fn_table("v112_fn_ukj_src");
+    v112_fn_unknown_aggregate("v112_fn_uk_agg");
+    for (i, mode) in ["IMMEDIATE", "DEFERRED"].iter().enumerate() {
+        v112_fn_assert_keyed_unknown_aggregate_rejected(
+            &format!("v112_fn_uk_d{i}"),
+            "SELECT v112_fn_uk_agg(v) AS m FROM v112_fn_ukd_src",
+            Some("m"),
+            mode,
+        );
+        v112_fn_assert_keyed_unknown_aggregate_rejected(
+            &format!("v112_fn_uk_j{i}"),
+            "SELECT v112_fn_uk_agg(b.id) AS id, v112_fn_uk_agg(a.v) AS m \
+             FROM v112_fn_ukd_src a JOIN v112_fn_ukj_src b ON a.id = b.id",
+            Some("id"),
+            mode,
+        );
+    }
+    let keyless = "SELECT v112_fn_uk_agg(v) AS m FROM v112_fn_ukd_src";
+    v112_fn_created("v112_fn_uk_d1", keyless, "DEFERRED");
+    v112_fn_assert_correct_through_dml("v112_fn_uk_d1", keyless, "v112_fn_ukd_src", true);
+}
