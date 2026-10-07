@@ -1447,3 +1447,39 @@ fn keyword_pseudo_functions_are_unqualified_references() {
         }]
     );
 }
+
+#[test]
+fn clock_names_match_only_unqualified_or_pg_catalog_calls() {
+    for sql in [
+        "SELECT id, now() AS x FROM t",
+        "SELECT id, pg_catalog.now() AS x FROM t",
+        "SELECT id, PG_CATALOG.NOW() AS x FROM t",
+        "SELECT id, \"pg_catalog\".\"now\"() AS x FROM t",
+        "SELECT id, db.pg_catalog.now() AS x FROM t",
+        "SELECT id, CURRENT_TIMESTAMP AS x FROM t",
+        "SELECT id, LOCALTIME AS x FROM t",
+    ] {
+        assert!(parse_and_analyze(sql).has_nondeterministic_select, "{sql}");
+    }
+    for sql in [
+        "SELECT id, s1.now() AS x FROM t",
+        "SELECT id, s1.age(v) AS x FROM t",
+        "SELECT id, \"PG_CATALOG\".random() AS x FROM t",
+    ] {
+        let a = parse_and_analyze(sql);
+        assert!(!a.has_nondeterministic_select, "{sql}");
+        assert!(a.nondeterministic_functions.is_empty(), "{sql}");
+        assert_eq!(a.function_references.len(), 1, "{sql}");
+    }
+}
+
+#[test]
+fn nondeterministic_rejection_names_each_matched_function_once() {
+    let a = parse_and_analyze(
+        "SELECT id, age(ts) AS a, now() AS n, pg_catalog.now() AS n2, s1.random() AS r FROM t",
+    );
+    assert_eq!(a.nondeterministic_functions, vec!["age", "now"]);
+    assert!(a
+        .unsupported_reason()
+        .is_some_and(|r| r.contains("Fix: remove age, now from the IMV query")));
+}

@@ -215,6 +215,10 @@ pub struct SqlAnalysis {
     /// Set when a clock or session-identity function is called anywhere in the
     /// query, not only in the SELECT list.
     pub has_nondeterministic_select: bool,
+    /// The clock and session-identity functions that set `has_nondeterministic_select`.
+    /// They are matched by name when unqualified or qualified with `pg_catalog`; a call
+    /// qualified with another schema is left to the catalog volatility check.
+    pub nondeterministic_functions: Vec<String>,
     /// DISTINCT ON columns (e.g., ["city"] from DISTINCT ON (city))
     pub distinct_on_columns: Vec<String>,
     /// ORDER BY expressions as strings (e.g., ["city", "val DESC"])
@@ -289,13 +293,13 @@ impl SqlAnalysis {
         // table state, producing correct results as effectively static values within
         // one statement execution. E.g., WHERE year >= (SELECT year FROM max_date_view).
         if self.has_nondeterministic_select {
-            return Some(
+            return Some(format!(
                 "Non-deterministic functions (NOW, CURRENT_TIMESTAMP, RANDOM, etc.) \
                  are not supported anywhere in the query — they would cause the IMV \
                  to drift over time without a corresponding source mutation. Fix: remove \
-                 them from the IMV query, or compute the value into a source column"
-                    .into(),
-            );
+                 {} from the IMV query, or compute the value into a source column",
+                self.nondeterministic_functions.join(", ")
+            ));
         }
         if !self.unsupported_aggregates.is_empty() {
             let names = self.unsupported_aggregates.join(", ");
@@ -329,8 +333,12 @@ impl SqlAnalysis {
     }
 
     fn record_called_function(&mut self, call: CalledFunction, schema: Option<String>) {
-        if is_clock_or_session_function(&call) {
+        let is_builtin_spelling = !matches!(schema.as_deref(), Some(s) if s != "pg_catalog");
+        if is_builtin_spelling && is_clock_or_session_function(&call) {
             self.has_nondeterministic_select = true;
+            if !self.nondeterministic_functions.contains(&call.name) {
+                self.nondeterministic_functions.push(call.name.clone());
+            }
         }
         let reference = FunctionReference {
             schema,
