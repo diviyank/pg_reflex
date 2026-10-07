@@ -81,6 +81,15 @@ pub(crate) fn source_reference_count(base_query: &str, source_table: &str) -> us
         .count()
 }
 
+/// `sql` upper-cased with every run of whitespace collapsed to one space, the
+/// form the join-keyword guards search.
+pub(crate) fn upper_with_single_spaces(sql: &str) -> String {
+    sql.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_uppercase()
+}
+
 /// Whether `source_table` is the table named directly after a LEFT / RIGHT /
 /// FULL (OUTER) JOIN keyword of the upper-cased query. A source that only
 /// appears in an ON condition does not count.
@@ -106,6 +115,22 @@ pub(crate) fn follows_outer_join_keyword(bq_upper: &str, source_table: &str) -> 
         }
         false
     })
+}
+
+/// Whether a write to `source_table` has no per-source delta, so the IMV is
+/// recomputed from `base_query`: the source is read more than once, or the
+/// query holds a RIGHT JOIN.
+///
+/// A RIGHT JOIN is never scoped. The table before the keyword is the
+/// null-extended one, which `follows_outer_join_keyword` never inspects, and the
+/// per-source key mappings of the plan assume the null-extended table is the
+/// joined one: a group or passthrough key read from the table before the
+/// keyword is NULL on the unmatched rows of the table after it.
+pub(crate) fn has_no_scoped_delta(base_query: &str, source_table: &str) -> bool {
+    let bq_upper = upper_with_single_spaces(base_query);
+    source_reference_count(base_query, source_table) > 1
+        || bq_upper.contains("RIGHT JOIN")
+        || bq_upper.contains("RIGHT OUTER")
 }
 
 /// Generates the SQL statements to apply a delta to an IMV.
@@ -174,19 +199,16 @@ pub fn reflex_build_delta_sql(
     // 2. LEFT/RIGHT JOIN secondary table DELETE/UPDATE: NULL semantics can't be captured by MERGE subtract
     // Detect self-join and outer-join-secondary for BOTH aggregate and passthrough queries.
     let is_self_join = source_reference_count(base_query, source_table) > 1;
+    let recompute_in_full = has_no_scoped_delta(base_query, source_table);
 
-    let bq_upper = base_query.to_uppercase();
+    let bq_upper = upper_with_single_spaces(base_query);
     let is_full_outer = bq_upper.contains("FULL JOIN") || bq_upper.contains("FULL OUTER");
-    // Check if source_table is the secondary table in a LEFT/RIGHT/FULL JOIN.
+    // Check if source_table is the secondary table in a LEFT/FULL JOIN.
     // The source is secondary if it appears as the table being outer-joined,
-    // i.e. directly after "LEFT JOIN", "RIGHT JOIN", or "FULL JOIN".
+    // i.e. directly after "LEFT JOIN" or "FULL JOIN".
     // Do NOT match if source_table only appears in ON conditions (that's the primary table).
     let is_outer_join_secondary_table = !is_self_join
-        && (bq_upper.contains("LEFT JOIN")
-            || bq_upper.contains("RIGHT JOIN")
-            || bq_upper.contains("LEFT OUTER")
-            || bq_upper.contains("RIGHT OUTER")
-            || is_full_outer)
+        && (bq_upper.contains("LEFT JOIN") || bq_upper.contains("LEFT OUTER") || is_full_outer)
         && follows_outer_join_keyword(&bq_upper, source_table);
     // For LEFT/RIGHT JOIN: EVERY operation on the secondary table needs special
     // handling. The plain `L LEFT JOIN Δsecondary` delta re-emits all left rows
@@ -202,7 +224,7 @@ pub fn reflex_build_delta_sql(
         ))
         || (is_full_outer && !is_self_join);
 
-    if is_self_join {
+    if recompute_in_full {
         full_refresh_stmts(
             view_name,
             base_query,
@@ -422,6 +444,9 @@ pub fn reflex_build_path_c_explain_sql(view_name: &str, source_table: &str) -> S
     match serde_json::from_str::<AggregationPlan>(&agg_json) {
         Ok(plan) if plan.source_join_keys.contains_key(source_table) => {}
         _ => return String::new(),
+    }
+    if has_no_scoped_delta(&base_query, source_table) {
+        return String::new();
     }
     let transition = transition_new_table_name(source_table);
     replace_source_with_transition(&base_query, source_table, &transition)

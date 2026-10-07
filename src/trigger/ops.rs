@@ -610,7 +610,7 @@ pub(crate) fn outer_join_secondary_stmts(
     if plan.is_passthrough {
         match plan.passthrough_key_mappings.get(source_table) {
             Some(mappings) if !mappings.is_empty() => {
-                let bq_upper = base_query.to_uppercase();
+                let bq_upper = upper_with_single_spaces(base_query);
                 if bq_upper.contains("FULL JOIN") || bq_upper.contains("FULL OUTER") {
                     // A FULL JOIN delta surfaces unmatched rows from the OTHER
                     // side that keyed scoping (on this secondary's join keys)
@@ -716,7 +716,7 @@ pub(crate) fn outer_join_secondary_stmts(
     // the same unconditional full intermediate+target refresh the passthrough
     // branch above already uses for this join type, mirroring its own
     // FULL-JOIN check.
-    let bq_upper = base_query.to_uppercase();
+    let bq_upper = upper_with_single_spaces(base_query);
     if bq_upper.contains("FULL JOIN") || bq_upper.contains("FULL OUTER") {
         stmts.push(format!("TRUNCATE {}", intermediate_tbl));
         stmts.push(format!("INSERT INTO {} {}", intermediate_tbl, base_query));
