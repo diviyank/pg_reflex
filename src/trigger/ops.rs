@@ -122,7 +122,7 @@ pub(crate) fn aggregate_delete_stmts(
     //     1:1 with intermediate. Without this, bulk-DELETE on
     //     intermediate could leave target rows that should be
     //     recomputed from surviving intermediate rows.
-    let end_q_has_gb = end_query.to_uppercase().contains("GROUP BY");
+    let end_q_has_gb = crate::sql_writer::keyword_scan::has_keyword(end_query, "GROUP BY");
     let bulk_delete_eligible =
         grp_cols.is_some() && plan.source_join_keys.contains_key(source_table) && !end_q_has_gb;
 
@@ -1362,7 +1362,8 @@ pub(crate) fn aggregate_epilogue_stmts(
     pending_dispatch: Option<PendingDispatch>,
     stmts: &mut Vec<String>,
 ) {
-    let end_query_has_group_by = end_query.to_uppercase().contains("GROUP BY");
+    let end_query_has_group_by =
+        crate::sql_writer::keyword_scan::has_top_level_keyword(end_query, "GROUP BY");
     let include_dead_cleanup = plan.needs_ivm_count
         && grp_cols.is_some()
         && matches!(operation, "DELETE" | "DELETE_PROMOTED" | "UPDATE");
@@ -1461,11 +1462,7 @@ pub(crate) fn aggregate_epilogue_stmts(
                             &[],
                         ));
                     } else {
-                        if skip_target_delete {
-                            stmts.push(format!("INSERT INTO {} {}", qv, end_query));
-                        } else {
-                            stmts.push(rebuild);
-                        }
+                        stmts.push(rebuild);
                     }
                 }
             }
