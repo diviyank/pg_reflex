@@ -7,7 +7,7 @@ use crate::sql_writer::keyword_scan;
 /// Used directly by unit tests; production code goes through `push_materialized_merge`.
 /// MERGE is 3-4x faster than INSERT...ON CONFLICT because it uses a hash join
 /// strategy instead of per-row index probes for conflict resolution.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub fn build_merge_sql(
     intermediate_tbl: &str,
     delta_query: &str,
@@ -1203,7 +1203,7 @@ pub(crate) fn splice_before_group_by(query: &str, and_fragment: &str) -> Option<
 /// query per gated variant. This ungated form is retained because its tests pin
 /// the splice contract (marker choice, `AND` placement, outer qualification)
 /// that the gated version builds on.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub(crate) fn inject_affected_filter_before_group_by(
     end_query: &str,
     output_gb_cols: &[String],

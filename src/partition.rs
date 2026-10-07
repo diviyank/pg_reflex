@@ -187,7 +187,6 @@ pub(crate) struct PartitionChild {
     // consumers (reconcile's CSV-key probe, the swap executor) key off
     // `bare_name` only and read bounds live via `read_partition_bound`, but the
     // DTO carries the bound so callers needn't re-query it.
-    #[allow(dead_code)]
     pub bound_expr: String,
 }
 

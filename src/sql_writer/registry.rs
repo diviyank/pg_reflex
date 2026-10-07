@@ -340,9 +340,9 @@ pub fn add_graph_child_links(
 // read seam's round-trip test, and a field like `refresh_mode` is carried for
 // completeness ahead of a reader. The allow keeps a complete read DTO clean
 // without trimming fields the cdylib build would otherwise flag.
-#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub struct ImvRecord {
+    #[cfg(any(test, feature = "pg_test"))]
     pub view_name: String,
     pub base_query: String,
     pub end_query: String,
@@ -415,6 +415,7 @@ pub fn read_imv(client: &pgrx::spi::SpiClient<'_>, name: &str) -> Option<ImvReco
         .to_string();
 
     Some(ImvRecord {
+        #[cfg(any(test, feature = "pg_test"))]
         view_name: row
             .get_by_name::<&str, _>("name")
             .unwrap_or(None)
