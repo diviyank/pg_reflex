@@ -9,7 +9,7 @@ use pgrx::prelude::*;
 // directive below is scoped to `cfg(test)` so the archive is ONLY pulled in
 // by the test binary — the cdylib postgres actually dlopens stays free of
 // stub variables that would otherwise shadow PG's real globals and segfault
-// every SPI call (observed on PG 17.7 as SIGSEGV / SIGABRT under cassert).
+// every SPI call (SIGSEGV / SIGABRT under cassert).
 #[cfg(all(test, target_os = "linux"))]
 #[link(name = "pg_reflex_pg_stubs", kind = "static")]
 unsafe extern "C" {}
@@ -543,9 +543,8 @@ fn validate_view_name(name: &str) -> Result<(), &'static str> {
 /// Default top-K heap size auto-applied to every MIN/MAX intermediate column
 /// when the operator does not pass an explicit `topk` argument. Reflex
 /// detects MIN/MAX presence in the IMV's plan; the parameter is a no-op for
-/// SUM / COUNT / AVG / BOOL_OR aggregations. K=16 matches the value used in
-/// the 1.3.0 landing benchmark and trades ~2.5× INSERT overhead for ~5-6×
-/// faster retractions on MIN/MAX IMVs. Operators on append-only MIN/MAX
+/// SUM / COUNT / AVG / BOOL_OR aggregations. K=16 trades ~2.5× INSERT
+/// overhead for ~5-6× faster retractions on MIN/MAX IMVs. Operators on append-only MIN/MAX
 /// workloads can opt out by passing `topk = 0` to the 6-arg overload.
 const DEFAULT_TOPK_K: usize = 16;
 
@@ -553,7 +552,7 @@ const DEFAULT_TOPK_K: usize = 16;
 /// Both schema-qualified ("alp.product") and bare ("product") names are accepted.
 ///
 /// Entries are kept VERBATIM, including any leading `!` soundness-acknowledgement
-/// marker (A1). Stripping here would drop the ack from `create_args`, so
+/// marker. Stripping here would drop the ack from `create_args`, so
 /// `reflex_rebuild_chain` would replay the create without it, the create-time
 /// soundness check would refuse the replay, and the IMV would become
 /// unrebuildable. The marker is removed at the points that consume the list —
@@ -818,7 +817,7 @@ fn reflex_refresh_partition_snapshot(source_root: &str) -> &'static str {
     "OK"
 }
 
-/// Test-only: run the F2 drain → (caller-supplied build DDL) → refill cycle
+/// Test-only: run the drain → (caller-supplied build DDL) → refill cycle
 /// against one partitioned root. `build_ddl` is one or more `;`-separated
 /// statements that create partitions under the (now-emptied) tree.
 #[cfg(any(test, feature = "pg_test"))]
@@ -883,12 +882,11 @@ fn drop_reflex_ivm_cascade(view_name: &str, cascade: bool) -> &'static str {
 /// explicit control over whether the pre-rebuild partition sync may drop orphan
 /// IMV partitions.
 ///
-/// The one-argument form hardcodes `drop_orphans => TRUE`, which is 1.10.11
-/// behaviour and remains the default. This overload exists for callers that gate
-/// destruction on their own authorization: `reflex_doctor` refuses an F3 orphan
-/// drop when the operator did not pass `drop_orphans`, then reached the same
-/// destruction anyway through its F4 `reflex_reconcile` repair. Passing FALSE here
-/// keeps that promise.
+/// The one-argument form hardcodes `drop_orphans => TRUE`, which is the default.
+/// This overload exists for callers that gate destruction on their own
+/// authorization: `reflex_doctor` refuses an F3 orphan drop when the operator did
+/// not pass `drop_orphans`, and its F4 `reflex_reconcile` repair must not reach
+/// the same destruction anyway. Passing FALSE here keeps that promise.
 #[pg_extern(name = "reflex_reconcile")]
 fn reflex_reconcile_scoped(view_name: &str, drop_orphans: bool) -> &'static str {
     reconcile::stamp_targeted_recovery(view_name);
@@ -903,9 +901,9 @@ fn reflex_reconcile(view_name: &str) -> &'static str {
     reconcile::reflex_reconcile(view_name)
 }
 
-/// 1.4.5: VACUUM FULL both the intermediate and target tables of an IMV.
-/// Materializes the fillfactor=70 set by the 1.4.3→1.4.4 migration so HOT
-/// updates can fire on legacy-populated pages.
+/// VACUUM FULL both the intermediate and target tables of an IMV.
+/// Materializes the fillfactor=70 setting so HOT updates can fire on
+/// pages populated before it was set.
 ///
 /// Takes ACCESS EXCLUSIVE on each table; schedule during a maintenance
 /// window for multi-gigabyte IMVs.
@@ -914,7 +912,7 @@ fn reflex_compact_imv(view_name: &str) -> String {
     create_ivm::reflex_compact_imv_impl(view_name)
 }
 
-/// 1.4.5: VACUUM FULL every enabled IMV's intermediate and target tables.
+/// VACUUM FULL every enabled IMV's intermediate and target tables.
 /// Convenience wrapper around `reflex_compact_imv` that iterates over all
 /// rows of `__reflex_ivm_reference` in graph_depth order. Each call takes
 /// ACCESS EXCLUSIVE on the IMV's tables; schedule during a maintenance
@@ -925,43 +923,40 @@ fn reflex_compact_all_imv() -> String {
     create_ivm::reflex_compact_all_imv_impl()
 }
 
-/// 1.4.5: Re-probe NOT NULL columns from the intermediate's actual data and
+/// Re-probe NOT NULL columns from the intermediate's actual data and
 /// update `__reflex_ivm_reference.aggregations.not_null_columns`.
 ///
 /// Run this after a data shape change (e.g., a batch load that introduces
-/// NULLs into a previously NULL-free column, or the inverse). The 1.4.4→1.4.5
-/// migration invokes this once per existing IMV to backfill effectively-NOT
-/// NULL columns the catalog heuristic missed.
+/// NULLs into a previously NULL-free column, or the inverse). It also backfills
+/// effectively-NOT NULL columns the catalog heuristic missed.
 ///
 /// Trigger codegen reads `not_null_columns` to choose between `=` (sargable,
 /// index-usable) and `IS NOT DISTINCT FROM` (NULL-safe) on group-key probes.
 /// Mismatched membership causes either correctness bugs (false `=` when
 /// NULLs exist → group-key splitting drift) or perf bugs (false `IS NOT
-/// DISTINCT FROM` when NULLs don't exist → composite-index defeat, the
-/// 405 s yse regression).
+/// DISTINCT FROM` when NULLs don't exist → composite-index defeat).
 #[pg_extern]
 fn reflex_probe_not_null_columns(view_name: &str) -> String {
     create_ivm::reflex_probe_not_null_columns_impl(view_name)
 }
 
-/// 1.4.5: Re-analyze an existing IMV's stored `base_query` and merge the
+/// Re-analyze an existing IMV's stored `base_query` and merge the
 /// newly computed `imv_relevant_columns` / `imv_relevant_where` maps into
 /// its `aggregations` JSON. Idempotent.
 ///
-/// Used by the 1.4.4→1.4.5 migration to backfill the static analysis the
-/// filter-aware spurious-skip relies on; also useful after a future
-/// analyzer extension shifts what falls into either map.
+/// Backfills the static analysis the filter-aware spurious-skip relies on;
+/// also useful after an analyzer extension shifts what falls into either map.
 #[pg_extern]
 fn reflex_rebuild_imv_metadata(view_name: &str) -> String {
     create_ivm::reflex_rebuild_imv_metadata_impl(view_name)
 }
 
-/// 1.4.5: Re-emit the consolidated trigger function bodies for a source
+/// Re-emit the consolidated trigger function bodies for a source
 /// table, picking up the latest codegen. CREATE OR REPLACE overwrites
 /// existing function bodies without changing trigger identity.
 ///
-/// Used by the 1.4.4→1.4.5 migration to install the filter-aware
-/// spurious-skip block on triggers attached to pre-1.4.5 IMVs.
+/// Installs the filter-aware spurious-skip block on triggers attached to IMVs
+/// created by older codegen.
 #[pg_extern]
 fn reflex_rebuild_triggers(source_table: &str) -> String {
     create_ivm::reflex_rebuild_triggers_impl(source_table)
@@ -973,8 +968,7 @@ fn reflex_rebuild_triggers(source_table: &str) -> String {
 /// dropped trigger, a dropped trigger function, or both, for every operand
 /// recorded in the wrapper's `depends_on`. Refuses (clean `ERROR: ...`
 /// string, not a raise) a VIEW wrapper — which has no operand triggers by
-/// design — or a non-wrapper IMV. See
-/// `untreated_bugs/2026-07-24_union_mirror_triggers_unchecked.md`.
+/// design — or a non-wrapper IMV.
 #[pg_extern]
 fn reflex_rebuild_union_mirror(wrapper: &str) -> String {
     create_ivm::reflex_rebuild_union_mirror_impl(wrapper)
@@ -1022,14 +1016,14 @@ fn refresh_imv_depending_on(source: &str) -> &'static str {
 /// ignore_sources table does (archive residue scenario), the partition stays empty.
 /// For such cases, use `reflex_reconcile_partition(view, partition_keys)` to
 /// force-fill the partition from all its authoritative sources, or perform a
-/// full chain drop+recreate. See docs/untreated.md § F6 for details.
+/// full chain drop+recreate.
 #[pg_extern]
 fn reflex_rebuild_imv(view_name: &str) -> &'static str {
     reconcile::stamp_targeted_recovery(view_name);
     reconcile::reflex_reconcile(view_name)
 }
 
-/// 1.4.6 — set or clear the per-IMV wipe_threshold override. The dispatch
+/// Set or clear the per-IMV wipe_threshold override. The dispatch
 /// DO block emitted by the trigger reads this value before the GUC
 /// reflex.wipe_threshold and the compiled default. Pass `value = NULL` to
 /// clear the override (fall back to GUC / compiled default).
@@ -1060,7 +1054,7 @@ fn reflex_set_wipe_threshold(view_name: &str, value: Option<pgrx::AnyNumeric>) -
     }
 }
 
-/// 1.6.0 — set or clear the per-IMV `wipe_floor_rows` override.  The
+/// Set or clear the per-IMV `wipe_floor_rows` override.  The
 /// per-partition dispatch DO block reads this floor on the denominator of
 /// the dirty/partition-size ratio so a tiny / never-ANALYZE'd partition
 /// (`reltuples = 0`) cannot trip the dispatch with a single dirty row.
@@ -1090,7 +1084,7 @@ fn reflex_set_wipe_floor_rows(view_name: &str, value: Option<i64>) -> String {
     }
 }
 
-/// 1.6.0 (plans/partitioning_3.md §4) — set or clear the per-IMV
+/// Set or clear the per-IMV
 /// `partition_dispatch_cost_cap`.  When a Tier 2 (JOIN-secondary)
 /// source-trigger fires on a partitioned IMV, the dispatch JOINs to the
 /// anchor source to derive partition keys; if the planner's estimated row
@@ -1688,10 +1682,9 @@ mod tests {
     ///
     /// At this scale the flush wall-time is dominated by base-INDEPENDENT fixed
     /// overhead (registry reads, scratch/affected build, advisory lock, DO-block
-    /// dispatch, target-sync setup) whose run-to-run jitter is large — observed
-    /// ~2x on a quiet box and ~10x on a loaded CI runner (a fixed-group aggregate
-    /// flush that costs 25ms locally stretched to 242ms on CI, tripping a
-    /// single-sample ratio test on pure noise). MIN collapses those outliers to
+    /// dispatch, target-sync setup) whose run-to-run jitter is large, up to ~10x
+    /// on a loaded CI runner, which would trip a single-sample ratio test on
+    /// pure noise. MIN collapses those outliers to
     /// the genuine floor cost, which is what the O(base)-vs-O(delta) comparison
     /// in `assert_sublinear` is actually meant to measure.
     const PLAN_PROBE_SAMPLES: i32 = 5;
@@ -1721,11 +1714,10 @@ mod tests {
     /// the large-base flush is operationally heavy do we require it to stay near
     /// the small-base cost rather than tracking base growth.
     ///
-    /// The floor is 50ms, not 30: on a loaded CI runner the base-INDEPENDENT
-    /// fixed overhead of the heaviest probe shape (UNION ALL — two operands, each
-    /// a decomposed sub-IMV) had a `min`-sampled floor cost of ~35ms, tripping the
-    /// old 30ms guard on pure noise even after min-of-N sampling. 50ms clears that
-    /// observed fixed-overhead ceiling while staying 1-2 orders of magnitude below
+    /// The floor is 50ms: on a loaded CI runner the base-INDEPENDENT fixed
+    /// overhead of the heaviest probe shape (UNION ALL — two operands, each a
+    /// decomposed sub-IMV) has a `min`-sampled floor cost of ~35ms. 50ms clears
+    /// that fixed-overhead ceiling while staying 1-2 orders of magnitude below
     /// the multi-second regressions this discriminator exists to catch.
     fn flush_scales_with_base(small_ms: i64, big_ms: i64, base_ratio: i64) -> bool {
         if big_ms < 50 {
@@ -1785,12 +1777,11 @@ mod tests {
     }
 
     /// Call `reconcile_one` directly, bypassing `reflex_reconcile`'s bottom-up
-    /// descent into generated children. PS-12 test 2 needs this to exercise the
-    /// backstop on a materialised wrapper in isolation: the operator entry point
-    /// would first reconcile the wrapper's operand sub-IMVs, whose INSERT mirror
-    /// triggers append to the wrapper — the pre-existing doubling hazard — which
-    /// would obscure whether the backstop itself is what leaves the wrapper
-    /// unchanged.
+    /// descent into generated children. This exercises the backstop on a
+    /// materialised wrapper in isolation: the operator entry point would first
+    /// reconcile the wrapper's operand sub-IMVs, whose INSERT mirror triggers
+    /// append to the wrapper, which would obscure whether the backstop itself
+    /// is what leaves the wrapper unchanged.
     #[pg_extern]
     fn crate_test_reconcile_one(view: &str) -> String {
         crate::reconcile::reconcile_one(view, true).to_string()

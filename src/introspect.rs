@@ -165,7 +165,7 @@ fn reflex_ivm_status() -> TableIterator<
     // (nothing does but the operator-driven `reflex_prune_event_log`). An
     // always-on 'error' term would therefore pin `has_anomaly` true forever
     // after one caught flush failure — permanent exact `COUNT(*)`,
-    // `is_estimate` stuck false — exactly the non-convergence defect this
+    // `is_estimate` stuck false — exactly the non-convergence this
     // predicate exists to avoid. `known_stale`/`last_error` are the
     // convergent proxy for 'error' rows; only 'rebuild' needs its own term,
     // because it is the one anomaly (a successful-but-destructive rebuild)
@@ -183,7 +183,7 @@ fn reflex_ivm_status() -> TableIterator<
     // (NULL) counts as always stale.
     // A failed/unavailable `pg_stat_all_tables` lookup fails toward the exact
     // count — the safe direction for a correctness alarm is to do the work.
-    // A missing `__reflex_event_log` (e.g. an upgraded install whose
+    // A missing `__reflex_event_log` (e.g. an install whose
     // migration missed it) is checked for explicitly and skips the 'rebuild'
     // term rather than erroring — this is the primary observability entry
     // point and a missing maintenance table must not take it down for every
@@ -194,9 +194,8 @@ fn reflex_ivm_status() -> TableIterator<
     // protected against a dropped target — PostgreSQL resolves every
     // relation reference in a query at parse time regardless of which branch
     // or subquery contains it, so a `to_regclass` check elsewhere in the same
-    // query does not stop `{ident}` from raising. This is a pre-existing gap
-    // in `reflex_ivm_status` as a whole, not something this predicate widens
-    // (see untreated_bugs/ for the filed report).
+    // query does not stop `{ident}` from raising. This is a gap in
+    // `reflex_ivm_status` as a whole, not something this predicate widens.
     let event_log_exists =
         Spi::get_one::<bool>("SELECT to_regclass('public.__reflex_event_log') IS NOT NULL AS ok")
             .unwrap_or(Some(false))
@@ -312,8 +311,8 @@ impl CappedSource {
 ///
 /// Both flush entry points skip a capped root, so none of its changes reach those
 /// IMVs. The registry cannot carry this: a full reconcile clears `known_stale`
-/// while the root stays capped, which is how dev tenants reported healthy IMVs
-/// that had not been maintained for weeks. Derived live from the queue instead,
+/// while the root stays capped, so IMVs would report healthy while unmaintained.
+/// Derived live from the queue instead,
 /// so the report clears exactly when the root drains.
 fn capped_source_by_imv() -> std::collections::HashMap<String, CappedSource> {
     let sql = format!(
@@ -376,7 +375,7 @@ fn reflex_ivm_stats(
 ) -> TableIterator<'static, (name!(metric, String), name!(value, String))> {
     let mut out: Vec<(String, String)> = Vec::new();
     let qv = quote(view_name);
-    // Co-located intermediate table (1.4.1): same schema as the IMV. The helper
+    // Co-located intermediate table: same schema as the IMV. The helper
     // returns either `"schema"."local"` or a bare local name.
     let interm = intermediate_table_name(view_name);
     let target = qv.clone();
@@ -455,7 +454,7 @@ fn reflex_ivm_stats(
 type HistogramRow = (Option<f64>, Option<f64>, Option<f64>, Option<i64>, i64);
 
 /// Returns flush latency percentiles for an IMV computed from the
-/// `flush_ms_history` ring buffer (1.3.0). The buffer holds up to 64 most
+/// `flush_ms_history` ring buffer. The buffer holds up to 64 most
 /// recent samples; the SPI returns p50, p95, p99, max, and the sample count.
 /// Returns an empty result if the IMV is not registered or has no recorded
 /// flushes.

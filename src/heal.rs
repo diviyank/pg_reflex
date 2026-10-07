@@ -9,9 +9,8 @@
 //! `__reflex_heal_pending`, and a sweep rebuilds only those partitions. The write
 //! itself pays for a queue insert, never for a rebuild.
 //!
-//! An ignored source that cannot be mapped that way keeps the pre-1.11.4
-//! contract (no heal): its create was already refused or acknowledged by the
-//! ignore-soundness check.
+//! An ignored source that cannot be mapped that way gets no heal: its create
+//! was already refused or acknowledged by the ignore-soundness check.
 
 use pgrx::datum::DatumWithOid;
 use pgrx::prelude::*;
