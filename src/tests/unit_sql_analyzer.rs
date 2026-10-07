@@ -1172,3 +1172,122 @@ fn nested_count_distinct_rejected_and_top_level_accepted() {
         assert_eq!(rejection_of(sql), None, "wrongly rejected: {sql}");
     }
 }
+
+#[test]
+fn clock_and_session_functions_rejected_under_any_spelling() {
+    for call in [
+        "now()",
+        "pg_catalog.now()",
+        "\"now\"()",
+        "transaction_timestamp()",
+        "statement_timestamp()",
+        "clock_timestamp()",
+        "timeofday()",
+        "LOCALTIMESTAMP",
+        "LOCALTIME",
+        "CURRENT_TIMESTAMP",
+        "CURRENT_DATE",
+        "CURRENT_TIME",
+        "age(ts)",
+        "current_user",
+        "session_user",
+        "current_role",
+        "current_setting('x')",
+        "current_schema()",
+        "current_database()",
+        "txid_current()",
+        "pg_current_xact_id()",
+        "random()",
+        "gen_random_uuid()",
+    ] {
+        for sql in [
+            format!("SELECT id, {call} AS x FROM t"),
+            format!("SELECT g, COUNT(*) AS c FROM t WHERE ts::text <> ({call})::text GROUP BY g"),
+            format!("WITH c AS (SELECT id, {call} AS x FROM t) SELECT id, x FROM c"),
+            format!("SELECT a.id FROM t a JOIN u b ON b.id = a.id AND b.x::text <> ({call})::text"),
+        ] {
+            assert!(
+                parse_and_analyze(&sql)
+                    .unsupported_reason()
+                    .is_some_and(|r| r.contains("Non-deterministic")),
+                "not rejected: {sql}"
+            );
+        }
+    }
+}
+
+#[test]
+fn deterministic_lookalikes_are_not_rejected() {
+    for sql in [
+        "SELECT id, age(ts, '2020-01-01'::timestamp) AS a FROM t",
+        "SELECT id, \"user\" FROM t",
+        "SELECT t.user FROM t",
+        "SELECT id, 'now()' AS s FROM t",
+        "SELECT id, upper(g) AS u, length(g) AS l, concat(g, 'x') AS c FROM t",
+        "SELECT id, date_trunc('day', ts) AS d FROM t",
+    ] {
+        assert!(
+            !parse_and_analyze(sql)
+                .unsupported_reason()
+                .is_some_and(|r| r.contains("Non-deterministic")),
+            "wrongly rejected: {sql}"
+        );
+    }
+}
+
+#[test]
+fn timezone_sensitive_functions_are_listed() {
+    let a = parse_and_analyze(
+        "SELECT date_trunc('day', ts) AS d, to_char(ts, 'YYYY') AS y, upper(g) AS u FROM t",
+    );
+    assert_eq!(
+        a.timezone_sensitive_functions(),
+        vec!["date_trunc", "to_char"]
+    );
+    let fixed =
+        parse_and_analyze("SELECT date_trunc('day', ts, 'UTC') AS d, length(g) AS l FROM t");
+    assert!(fixed.timezone_sensitive_functions().is_empty());
+}
+
+#[test]
+fn called_functions_exclude_window_calls() {
+    let a =
+        parse_and_analyze("SELECT id, row_number() OVER (ORDER BY id) AS rn, upper(g) AS u FROM t");
+    let names: Vec<&str> = a.called_functions.iter().map(|f| f.name.as_str()).collect();
+    assert_eq!(names, vec!["upper"]);
+}
+
+#[test]
+fn keyword_pseudo_functions_are_recorded_once_without_arguments() {
+    let a = parse_and_analyze(
+        "SELECT id, CURRENT_ROLE AS r, current_role AS r2, CURRENT_SCHEMA AS s FROM t",
+    );
+    let names: Vec<(&str, usize)> = a
+        .called_functions
+        .iter()
+        .map(|f| (f.name.as_str(), f.arg_count))
+        .collect();
+    assert_eq!(names, vec![("current_role", 0), ("current_schema", 0)]);
+}
+
+#[test]
+fn qualified_column_named_like_a_keyword_is_not_a_call() {
+    let a = parse_and_analyze("SELECT t.user, t.id FROM t");
+    assert!(a.called_functions.is_empty(), "{:?}", a.called_functions);
+}
+
+#[test]
+fn called_functions_carry_bare_names_and_argument_counts() {
+    let a = parse_and_analyze(
+        "SELECT pg_catalog.upper(g) AS u, \"Lower\"(g) AS l, age(ts) AS a1, age(ts, ts) AS a2, upper(g) AS u2 FROM t",
+    );
+    let names: Vec<(&str, usize)> = a
+        .called_functions
+        .iter()
+        .map(|f| (f.name.as_str(), f.arg_count))
+        .collect();
+    assert_eq!(
+        names,
+        vec![("upper", 1), ("lower", 1), ("age", 1), ("age", 2)]
+    );
+}
