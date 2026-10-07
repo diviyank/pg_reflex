@@ -1862,6 +1862,7 @@ mod tests {
     include!("tests/pg_test_v112_distinct.rs");
     include!("tests/pg_test_v112_keyword_literals.rs");
     include!("tests/pg_test_v112_source_rewrite.rs");
+    include!("tests/pg_test_v112_function_contract.rs");
 }
 
 /// This module is required by `cargo pgrx test` invocations.

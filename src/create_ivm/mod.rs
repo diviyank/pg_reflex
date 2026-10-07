@@ -159,6 +159,12 @@ fn validate_and_parse_inputs(
             if let Some(reason) = a.unsupported_reason() {
                 return Err(crate::reflex_reject(&reason));
             }
+            if let Some(reason) = function_contract_violation(view_name, &a) {
+                return Err(crate::reflex_reject(&reason));
+            }
+            if let Some(message) = timezone_sensitivity_warning(view_name, &a) {
+                warning!("{message}");
+            }
             a
         }
     };
@@ -334,40 +340,102 @@ fn populate_source_join_keys(ctx: &mut BuildContext) {
     build_source_join_keys(&mut ctx.plan, &real_sources, &ctx.analysis);
 }
 
-/// Warn on SELECT entries that are neither GROUP BY nor recognized aggregates.
-/// These columns will be missing from the IMV (silent data loss is worse than a warning).
-fn validate_select_columns(ctx: &BuildContext) {
-    if ctx.plan.is_passthrough {
-        return;
+pub(crate) fn timezone_sensitivity_warning(
+    view_name: &str,
+    analysis: &crate::sql_analyzer::SqlAnalysis,
+) -> Option<String> {
+    let functions = analysis.timezone_sensitive_functions();
+    if functions.is_empty() {
+        return None;
     }
-    let group_by_set: std::collections::HashSet<&str> = ctx
-        .plan
-        .group_by_columns
+    Some(format!(
+        "pg_reflex: '{view_name}' uses {} whose result depends on the session TimeZone when \
+         applied to timestamptz. Writers with different TimeZone settings will make the IMV \
+         diverge. Pin the zone, e.g. date_trunc('day', ts, 'UTC') or ts AT TIME ZONE 'UTC'.",
+        functions.join(", ")
+    ))
+}
+
+const SUPPORTED_AGGREGATES: [&str; 6] = ["sum", "count", "avg", "min", "max", "bool_or"];
+
+/// The catalog matches by name across every overload and schema: argument types are
+/// unknown here, and accepting a volatile call is the direction that corrupts an IMV.
+fn function_contract_violation(
+    view_name: &str,
+    analysis: &crate::sql_analyzer::SqlAnalysis,
+) -> Option<String> {
+    let called: Vec<String> = analysis
+        .called_functions
         .iter()
-        .map(|s| s.as_str())
+        .map(|f| f.name.clone())
         .collect();
-    for col in &ctx.analysis.select_columns {
-        if !col.is_passthrough && col.aggregate.is_none() && !col.is_aggregate_derived {
-            warning!(
-                "pg_reflex: unsupported expression '{}' in SELECT — column will be missing from IMV '{}'",
-                col.alias.as_deref().unwrap_or(&col.expr_sql),
-                ctx.view_name
-            );
-        } else if col.is_passthrough
-            && !group_by_set.contains(col.expr_sql.as_str())
-            && !ctx.analysis.has_distinct
-        {
-            let bare = bare_column_name(&col.expr_sql);
-            let in_gb = group_by_set.iter().any(|gb| bare_column_name(gb) == bare);
-            if !in_gb {
-                warning!(
-                    "pg_reflex: expression '{}' not in GROUP BY and not a recognized aggregate — column will be missing from IMV '{}'",
-                    col.expr_sql,
-                    ctx.view_name
-                );
-            }
-        }
+    let (volatile, aggregates) = catalog_function_kinds(&called);
+    if !volatile.is_empty() {
+        return Some(format!(
+            "Volatile function(s) {} are not supported in IMV '{view_name}'. Fix: remove them \
+             from the IMV query, or compute the value into a source column. A volatile \
+             function returns a different result on each call, so the IMV would diverge from \
+             its own query.",
+            volatile.join(", ")
+        ));
     }
+    let unsupported: Vec<String> = aggregates
+        .into_iter()
+        .filter(|name| !SUPPORTED_AGGREGATES.contains(&name.as_str()))
+        .map(|name| name.to_uppercase())
+        .collect();
+    if !unsupported.is_empty() {
+        return Some(format!(
+            "Unsupported aggregate(s): {}. Supported: SUM, COUNT, AVG, MIN, MAX, BOOL_OR",
+            unsupported.join(", ")
+        ));
+    }
+    None
+}
+
+/// A non-aggregate SELECT item beside aggregates, with no GROUP BY to key it on.
+fn ungrouped_non_aggregate_column(ctx: &BuildContext) -> Option<String> {
+    if ctx.plan.is_passthrough
+        || ctx.analysis.has_distinct
+        || !ctx.analysis.group_by_columns.is_empty()
+    {
+        return None;
+    }
+    ctx.analysis
+        .select_columns
+        .iter()
+        .find(|col| col.is_passthrough)
+        .map(|col| col.alias.clone().unwrap_or_else(|| col.expr_sql.clone()))
+}
+
+/// Lower-cased names among `called` that the catalog knows as (volatile functions, aggregates).
+fn catalog_function_kinds(called: &[String]) -> (Vec<String>, Vec<String>) {
+    if called.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+    let names = crate::sql_writer::identifier::format_pg_text_array(called);
+    let lookup = |condition: &str| -> Vec<String> {
+        Spi::connect(|client| {
+            client
+                .select(
+                    &format!(
+                        "SELECT DISTINCT lower(proname::text) AS name FROM pg_catalog.pg_proc \
+                         WHERE lower(proname::text) = ANY($1::text[]) AND {condition} ORDER BY 1"
+                    ),
+                    None,
+                    &[unsafe {
+                        DatumWithOid::new(names.clone(), PgBuiltInOids::TEXTOID.oid().value())
+                    }],
+                )
+                .unwrap_or_report()
+                .filter_map(|row| row.get_by_name::<String, _>("name").unwrap_or(None))
+                .collect()
+        })
+    };
+    (
+        lookup("prokind = 'f' AND provolatile = 'v'"),
+        lookup("prokind = 'a'"),
+    )
 }
 
 /// Is an IMV of this name already in the registry? One definition, shared by
@@ -2120,7 +2188,13 @@ pub(crate) fn create_reflex_ivm_impl_with_materialization(
     // insert that persists `plan.aggregations`.)  This call is a no-op
     // until the partition path resolves the partition column.
     populate_source_join_keys(&mut ctx);
-    validate_select_columns(&ctx);
+    if let Some(column) = ungrouped_non_aggregate_column(&ctx) {
+        return crate::reflex_reject(&format!(
+            "'{column}' is not an aggregate and the query has no GROUP BY. Fix: add it to a \
+             GROUP BY clause, or select it in an outer passthrough layer over a CTE that holds \
+             the aggregates."
+        ));
+    }
 
     if let Some(msg) = check_existence_and_cycle(&ctx) {
         return msg;
