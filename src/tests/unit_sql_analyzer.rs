@@ -1137,3 +1137,38 @@ fn count_distinct_and_literals_are_not_rejected() {
         );
     }
 }
+
+#[test]
+fn distinct_aggregate_in_window_call_rejected() {
+    for sql in [
+        "SELECT g, v, SUM(DISTINCT v) OVER () AS s FROM t",
+        "SELECT g, v, SUM( DISTINCT v) OVER (PARTITION BY g) AS s FROM t",
+    ] {
+        assert!(
+            rejection_of(sql).is_some_and(|r| r.contains("DISTINCT modifier")),
+            "not rejected: {sql}"
+        );
+    }
+}
+
+#[test]
+fn nested_count_distinct_rejected_and_top_level_accepted() {
+    for sql in [
+        "SELECT g, COUNT(DISTINCT v) + 1 AS c FROM t GROUP BY g",
+        "SELECT g, COALESCE(COUNT(DISTINCT v), 0) AS c FROM t GROUP BY g",
+        "SELECT g, CASE WHEN COUNT(DISTINCT v) > 1 THEN 1 ELSE 0 END AS c FROM t GROUP BY g",
+    ] {
+        assert!(
+            rejection_of(sql)
+                .is_some_and(|r| r.contains("COUNT(DISTINCT) nested inside an expression")),
+            "not rejected: {sql}"
+        );
+    }
+    for sql in [
+        "SELECT g, COUNT(DISTINCT v) AS c FROM t GROUP BY g",
+        "SELECT g, COUNT(DISTINCT v)::int AS c FROM t GROUP BY g",
+        "SELECT g, SUM(v) + (SELECT COUNT(DISTINCT x) FROM u) AS c FROM t GROUP BY g",
+    ] {
+        assert_eq!(rejection_of(sql), None, "wrongly rejected: {sql}");
+    }
+}

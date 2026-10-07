@@ -115,9 +115,7 @@ pub(crate) struct DecomposeCtx<'a> {
 /// Phase 1 of the create-IMV pipeline.
 ///
 /// Normalizes `storage`/`refresh`, validates the view name, parses the SQL
-/// and runs [`crate::sql_analyzer::analyze`] on it. Also rejects DISTINCT on
-/// aggregates other than COUNT (only COUNT(DISTINCT) is incrementally
-/// maintainable).
+/// and runs [`crate::sql_analyzer::analyze`] on it.
 ///
 /// Returns the error string verbatim on the `Err` arm so the caller can
 /// `return` it unchanged — preserves byte-identical error reporting.
