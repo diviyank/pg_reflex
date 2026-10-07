@@ -820,3 +820,114 @@ fn literal_aware_rewrite_matches_legacy_when_query_has_no_literal() {
     assert!(rewritten > 3000, "rewrote only {rewritten}");
     assert!(stripped > 20, "stripped only {stripped}");
 }
+
+#[test]
+fn replace_identifier_skips_match_followed_by_multibyte_char() {
+    assert_eq!(
+        replace_identifier("SELECT prodé FROM prod", "prod", "X"),
+        "SELECT prodé FROM X"
+    );
+    assert_eq!(
+        replace_identifier("SELECT prod夏, prod🍉 FROM prod", "prod", "X"),
+        "SELECT prod夏, prod🍉 FROM X"
+    );
+}
+
+#[test]
+fn replace_identifier_skips_match_preceded_by_multibyte_char() {
+    assert_eq!(
+        replace_identifier("SELECT éprod FROM prod", "prod", "X"),
+        "SELECT éprod FROM X"
+    );
+    assert_eq!(
+        replace_identifier("SELECT 夏prod, 🍉prod FROM prod", "prod", "X"),
+        "SELECT 夏prod, 🍉prod FROM X"
+    );
+}
+
+#[test]
+fn redundant_alias_after_multibyte_prefixed_name_is_kept() {
+    let sql = "SELECT 1 FROM éalp.product product";
+    assert_eq!(strip_redundant_bare_alias(sql, "alp.product"), sql);
+}
+
+#[test]
+fn source_rewrite_skips_identifier_extending_source_name_with_multibyte_char() {
+    assert_eq!(
+        replace_source_with_transition(
+            "SELECT prodé, éprod FROM prod GROUP BY prodé, éprod",
+            "prod",
+            "__reflex_new_prod"
+        ),
+        "SELECT prodé, éprod FROM \"__reflex_new_prod\" GROUP BY prodé, éprod"
+    );
+}
+
+#[test]
+fn replace_identifier_matches_legacy_on_ascii_input() {
+    const FRAGMENTS: &[&str] = &[
+        "prod",
+        "alp.product",
+        "\"alp\".\"product\"",
+        "\"product\"",
+        "product",
+        ".",
+        "_",
+        "\"",
+        "'",
+        "''",
+        "$",
+        "$$",
+        "$t$",
+        "E'",
+        "\\",
+        " AS ",
+        " as ",
+        "xAS ",
+        " ",
+        "(",
+        ")",
+        ",",
+        "SELECT ",
+        " FROM ",
+        " WHERE ",
+        "=",
+        "a",
+        "Z",
+        "0",
+        "\n",
+        "\t",
+        "-",
+        "/*",
+        "*/",
+    ];
+    const PATTERNS: &[&str] = &[
+        "prod",
+        "product",
+        "alp.product",
+        "\"alp\".\"product\"",
+        "\"product\"",
+        "a",
+        "",
+    ];
+    let mut rng = Lcg(0xb17e);
+    let mut rewritten = 0;
+    for case in 0..6000 {
+        let mut sql = rng.concatenation_of(FRAGMENTS, 14);
+        if case % 3 == 0 {
+            let position = rng.below(sql.len() + 1);
+            sql.insert(position, (rng.below(0x80) as u8) as char);
+        }
+        assert!(sql.is_ascii());
+        for pattern in PATTERNS {
+            let expected = legacy::replace_identifier(&sql, pattern, "\"__t\"");
+            assert_eq!(
+                replace_identifier(&sql, pattern, "\"__t\""),
+                expected,
+                "sql: {sql:?}, pattern: {pattern}"
+            );
+            rewritten += usize::from(expected != sql);
+        }
+    }
+    assert!(rewritten > 1000, "rewrote only {rewritten}");
+}

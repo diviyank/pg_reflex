@@ -125,10 +125,16 @@ pub fn format_pg_text_array(values: &[String]) -> String {
     out
 }
 
+/// PostgreSQL reads every byte of a multi-byte character as part of an
+/// unquoted identifier, so such a byte next to a name extends that name.
+fn continues_identifier(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_' || byte >= 0x80
+}
+
 /// Replace a SQL identifier with another, respecting word boundaries.
 ///
 /// Only replaces when the match is NOT part of a longer identifier
-/// (i.e., the character before/after is not alphanumeric or `_`).
+/// (i.e., the character before/after is not alphanumeric, `_` or multi-byte).
 ///
 /// **Contract:** `new_name` must itself be a simple identifier (possibly
 /// schema-qualified and quoted). A match followed by `.col` produces invalid
@@ -164,10 +170,7 @@ fn replace_identifier_outside(
             continue;
         }
         if i + old_bytes.len() <= bytes.len() && &bytes[i..i + old_bytes.len()] == old_bytes {
-            let before_ok = i == 0
-                || !(bytes[i - 1].is_ascii_alphanumeric()
-                    || bytes[i - 1] == b'_'
-                    || bytes[i - 1] == b'.');
+            let before_ok = i == 0 || !(continues_identifier(bytes[i - 1]) || bytes[i - 1] == b'.');
             // Don't replace identifiers that follow "AS " (output aliases, not table refs)
             let after_as = i >= 3
                 && (bytes[i - 1] == b' ')
@@ -175,8 +178,7 @@ fn replace_identifier_outside(
                 && (bytes[i - 3] == b'A' || bytes[i - 3] == b'a')
                 && (i < 4 || !bytes[i - 4].is_ascii_alphanumeric());
             let after_pos = i + old_bytes.len();
-            let after_ok = after_pos >= bytes.len()
-                || !(bytes[after_pos].is_ascii_alphanumeric() || bytes[after_pos] == b'_');
+            let after_ok = after_pos >= bytes.len() || !continues_identifier(bytes[after_pos]);
             if before_ok && after_ok && !after_as {
                 result.push_str(&sql[unmatched_start..i]);
                 result.push_str(new_name);
@@ -221,13 +223,9 @@ pub fn strip_redundant_bare_alias(sql: &str, source_table: &str) -> String {
             continue;
         }
         if i + pat.len() <= bytes.len() && &bytes[i..i + pat.len()] == pat {
-            let before_ok = i == 0
-                || !(bytes[i - 1].is_ascii_alphanumeric()
-                    || bytes[i - 1] == b'_'
-                    || bytes[i - 1] == b'.');
+            let before_ok = i == 0 || !(continues_identifier(bytes[i - 1]) || bytes[i - 1] == b'.');
             let after_pos = i + pat.len();
-            let after_ok = after_pos >= bytes.len()
-                || !(bytes[after_pos].is_ascii_alphanumeric() || bytes[after_pos] == b'_');
+            let after_ok = after_pos >= bytes.len() || !continues_identifier(bytes[after_pos]);
             if before_ok && after_ok {
                 let (user_alias, consumed_to) = consume_table_alias(bytes, after_pos);
                 if matches!(&user_alias, Some(a) if a == bare) {

@@ -117,3 +117,33 @@ fn v112_sr_dollar_quoted_literal_embedding_source_name_stays_correct() {
         &[("v112_sr_dq_agg", &agg), ("v112_sr_dq_pt", passthrough)],
     );
 }
+
+fn v112_sr_assert_grouping_column_correct_through_dml(table: &str, column: &str) {
+    Spi::run(&format!(
+        "CREATE TABLE {table}(id SERIAL PRIMARY KEY, {column} TEXT, v INT)"
+    ))
+    .expect("create");
+    Spi::run(&format!(
+        "INSERT INTO {table}({column}, v) VALUES ('x',1),('y',2),('x',3)"
+    ))
+    .expect("seed");
+    let q = format!("SELECT {column}, SUM(v) AS s FROM {table} GROUP BY {column}");
+    let imv = format!("{table}_agg");
+    v112_sr_imv(&imv, &q);
+    Spi::run(&format!("INSERT INTO {table}({column}, v) VALUES ('x',10),('z',20)")).expect("insert");
+    assert_imv_correct(&imv, &q);
+    Spi::run(&format!("UPDATE {table} SET v = v + 100 WHERE id = 1")).expect("update");
+    assert_imv_correct(&imv, &q);
+    Spi::run(&format!("DELETE FROM {table} WHERE id = 3")).expect("delete");
+    assert_imv_correct(&imv, &q);
+}
+
+#[pg_test]
+fn v112_sr_column_extending_source_name_with_multibyte_suffix_stays_correct() {
+    v112_sr_assert_grouping_column_correct_through_dml("v112_sr_ct", "v112_sr_cté");
+}
+
+#[pg_test]
+fn v112_sr_column_extending_source_name_with_multibyte_prefix_stays_correct() {
+    v112_sr_assert_grouping_column_correct_through_dml("v112_sr_bp", "év112_sr_bp");
+}
