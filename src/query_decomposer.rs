@@ -4,12 +4,11 @@ use sqlparser::ast::{Expr, Function, FunctionArg, FunctionArgExpr, FunctionArgum
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 
-// Phase 1 (plans/1_6_1_refacto.md) — the canonical implementations of these
-// identifier utilities now live in `crate::sql_writer::identifier`. The
-// `pub use` re-exports below preserve the historical names so existing call
-// sites (and the public-facing test surface in `unit_query_decomposer.rs`)
-// compile without churn. They are true aliases, not wrappers, so there is
-// no extra function-call indirection.
+// The canonical implementations of these identifier utilities live in
+// `crate::sql_writer::identifier`. The `pub use` re-exports below keep the
+// names available here so existing call sites (and the public-facing test
+// surface in `unit_query_decomposer.rs`) compile without churn. They are true
+// aliases, not wrappers, so there is no extra function-call indirection.
 pub use crate::sql_writer::identifier::{
     format_pg_text_array as format_pg_text_array_literal, quote as quote_identifier,
     replace_identifier, safe as safe_identifier, split_qualified as split_qualified_name,
@@ -20,7 +19,7 @@ pub use crate::sql_writer::identifier::{
 /// preserve identifier case, while real-table sources are stored bare
 /// (`schema.table`). This returns both components **unquoted** so every
 /// name-builder works from one canonical form. Routing all consumers through
-/// here makes the quoting-bug family (1, 4, 5) structurally impossible.
+/// here makes the quoting-bug family structurally impossible.
 pub fn canonical_source(name: &str) -> (Option<String>, String) {
     let (schema, bare) = split_qualified_name(name);
     (
@@ -31,7 +30,7 @@ pub fn canonical_source(name: &str) -> (Option<String>, String) {
 
 /// Name of the intermediate (unlogged) table for a given view.
 /// For schema-qualified names, the intermediate table is in the same schema.
-/// Always returns a quoted identifier reference (1.4.1) so usage sites can
+/// Always returns a quoted identifier reference so usage sites can
 /// interpolate it directly without adding outer quotes.
 pub fn intermediate_table_name(view_name: &str) -> String {
     let (schema, name) = split_qualified_name(view_name);
@@ -100,7 +99,7 @@ fn unquote_ident_component(part: &str) -> &str {
 
 /// Name of the deferred-mode staging (delta) table for a source table.
 /// Co-located in the source table's schema so the trigger body can reference
-/// it without depending on the session's `search_path` (1.4.1 fix).
+/// it without depending on the session's `search_path`.
 pub fn staging_delta_table_name(source_table: &str) -> String {
     qualify_in_same_schema(
         source_table,
@@ -112,7 +111,7 @@ pub fn staging_delta_table_name(source_table: &str) -> String {
 /// grouped delta before issuing MERGE (avoids referencing transition tables
 /// inside EXECUTE'd MERGE statements, which trips a PG assert).
 /// Co-located in the IMV's schema so generated MERGE SQL works under any
-/// `search_path` (1.4.1 fix).
+/// `search_path`.
 pub fn delta_scratch_table_name(view_name: &str) -> String {
     qualify_in_same_schema(
         view_name,
@@ -191,7 +190,7 @@ pub fn bare_column_name(col: &str) -> &str {
 /// the column. We must truncate identically so a name we later look up (e.g. in
 /// the type-probe `column_types` map keyed by Postgres's stored attname) matches
 /// the stored, truncated name — otherwise the lookup misses and the column is
-/// mis-typed (see the carried-EXISTS / long-group-key-expression regressions).
+/// mis-typed.
 pub(crate) fn truncate_identifier(mut s: String) -> String {
     const MAX_IDENT_BYTES: usize = 63;
     if s.len() > MAX_IDENT_BYTES {
@@ -233,7 +232,7 @@ pub fn normalized_column_name(col: &str) -> String {
 }
 
 // `replace_identifier` is re-exported at the top of this file (see the
-// `pub use` block). `strip_redundant_bare_alias` is no longer re-exported
+// `pub use` block). `strip_redundant_bare_alias` is not re-exported
 // here — call [`crate::sql_writer::identifier::strip_redundant_bare_alias`]
 // directly (the only caller, `replace_source_with_transition`, lives in
 // `sql_writer::identifier` itself).
@@ -559,8 +558,7 @@ pub fn generate_end_query(view_name: &str, plan: &AggregationPlan) -> String {
 
 /// Serialize the aggregation plan as JSON for the reference table.
 /// `AggregationPlan` derives Serialize from compile-time-known field
-/// types — serialization cannot fail. The previous fallback was dead
-/// defensive code.
+/// types — serialization cannot fail.
 pub fn generate_aggregations_json(plan: &AggregationPlan) -> String {
     serde_json::to_string(plan).expect("AggregationPlan must serialize (derive Serialize)")
 }

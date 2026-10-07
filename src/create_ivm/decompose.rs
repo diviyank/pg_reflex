@@ -91,13 +91,13 @@ pub(crate) fn mark_generated_sub_imv(sub_imv_name: &str) {
 /// `graph_depth` for a node whose IMV dependencies are `sub_imv_names`: one above
 /// the deepest of them, or 1 when none of them is registered.
 ///
-/// The decomposed paths used to hard-code this — `sub_imv_names.len() + 1` for
-/// set ops, so a three-operand UNION ALL claimed depth 4 because of its arity
-/// rather than its position, and a literal 2 for DISTINCT ON / window, wrong
-/// whenever the `__base` sub-IMV is itself decomposed. Both disagreed with what
-/// `resolve_existing_imv_deps` computes for the main create path and with what
-/// `reflex_repair_dependency_graph` recomputes, which would have left
-/// `graph_depth` meaning two different things depending on a row's age.
+/// The decomposed paths must not hard-code this: an arity-based depth
+/// (`sub_imv_names.len() + 1`) makes a three-operand UNION ALL claim depth 4
+/// because of its arity rather than its position, and a literal 2 is wrong
+/// whenever the `__base` sub-IMV is itself decomposed. The value must agree with
+/// what `resolve_existing_imv_deps` computes for the main create path and with what
+/// `reflex_repair_dependency_graph` recomputes, so `graph_depth` means one thing
+/// regardless of a row's age.
 pub(crate) fn depth_above(client: &mut pgrx::spi::SpiClient<'_>, sub_imv_names: &[String]) -> i32 {
     if sub_imv_names.is_empty() {
         return 1;
@@ -347,14 +347,13 @@ pub(crate) fn install_union_mirror_triggers(
     // scoped per relation and so cannot collide across operands). Naively
     // truncating a long wrapper name at 63 bytes can eat BOTH discriminators
     // that keep these three names apart: the DML-kind tag and the operand
-    // index. Moving the tag before the unbounded wrapper component (as
-    // trigger names below do) only fixes the first: at wrapper lengths where
+    // index. Putting the tag before the unbounded wrapper component (as
+    // trigger names below do) only protects the first: at wrapper lengths where
     // `prefix + tag + "_" + safe_wrapper` alone already exceeds 63 bytes, the
     // trailing `_<operand_idx>` is truncated away too, and every operand's
     // same-kind function collapses onto one `proname` — `CREATE OR REPLACE`
-    // for operand 1 then silently overwrites operand 0's already-bound
-    // trigger body (see
-    // untreated_bugs/2026-07-25_union_mirror_function_name_collision.md).
+    // for operand 1 would then silently overwrite operand 0's already-bound
+    // trigger body.
     // `safe_identifier` hashes the FULL raw string (including the trailing
     // operand index) into its truncated form, so two names that differ only
     // in a byte past the naive cutoff still end up distinct — this holds
@@ -510,8 +509,8 @@ pub(crate) fn install_union_all_intermediate_wrapper(
     // 1. Discover operand columns from operand 0 (UNION-ALL operands are
     //    union-compatible, so operand 0 defines the column shape).
     //    Resolve via `to_regclass($1)` so the session's `search_path` is
-    //    honoured — operand sub-IMV names are created unqualified, so the
-    //    earlier `nspname = $1` form silently looked in `public` and missed
+    //    honoured — operand sub-IMV names are created unqualified, so a
+    //    `nspname = $1` lookup would search `public` and miss
     //    tenant-schema operands.
     let operand0 = &operand_sub_imv_names[0];
     let col_rows: Vec<(String, String)> = client
@@ -603,7 +602,7 @@ pub(crate) fn install_union_all_intermediate_wrapper(
 
     // 5. Register in catalog. Use the user's original SQL as sql_query; the
     //    base_query field stores the UNION-ALL over operand sub-IMVs for
-    //    introspection consistency with the previous code.
+    //    introspection consistency.
     let view_sql_for_catalog: String = operand_sub_imv_names
         .iter()
         .map(|n| format!("SELECT * FROM {}", quote_identifier(n)))

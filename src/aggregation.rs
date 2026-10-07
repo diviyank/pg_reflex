@@ -24,8 +24,8 @@ pub struct IntermediateColumn {
     /// subtraction; the retraction recompute path is invoked only when the
     /// array underflows.
     ///
-    /// `None` keeps legacy 1.2.x behaviour (single scalar MIN/MAX column with
-    /// scoped recompute on retraction).
+    /// `None` keeps a single scalar MIN/MAX column with
+    /// scoped recompute on retraction.
     #[serde(default)]
     pub topk_k: Option<usize>,
 }
@@ -119,7 +119,7 @@ pub struct AggregationPlan {
     /// build the EXCEPT ALL check.
     #[serde(default)]
     pub imv_relevant_where: std::collections::HashMap<String, String>,
-    /// 1.4.6 — per-source JOIN-key mapping for "safe bulk-INSERT/DELETE"
+    /// Per-source JOIN-key mapping for "safe bulk-INSERT/DELETE"
     /// detection and pg_stats-based pre-scratch dispatch.
     ///
     /// Key: source table name (matches keys in `imv_relevant_columns`).
@@ -134,7 +134,7 @@ pub struct AggregationPlan {
     ///     GROUP BY values).
     ///   * The source columns listed *uniquely identify* a slice of the
     ///     intermediate — no other rows in S can produce the same
-    ///     intermediate group keys — making Item α OUT→IN / IN→OUT
+    ///     intermediate group keys — making OUT→IN / IN→OUT
     ///     promotion safe to short-circuit:
     ///       - OUT→IN: scratch keys do not collide with existing
     ///         intermediate rows → plain INSERT replaces MERGE.
@@ -149,7 +149,7 @@ pub struct AggregationPlan {
     /// path. Safe fallback.
     #[serde(default)]
     pub source_join_keys: std::collections::HashMap<String, Vec<(String, String)>>,
-    /// Partitioning (plans/partitioning_2.md). Empty means the IMV is
+    /// Partitioning. Empty means the IMV is
     /// unpartitioned (legacy byte-for-byte behaviour). When set, the
     /// intermediate and target tables are declared `PARTITION BY
     /// <partition_strategy> (<partition_columns>)` and mirror the anchor
@@ -159,14 +159,14 @@ pub struct AggregationPlan {
     /// "LIST" or "RANGE"; empty when not partitioned.
     #[serde(default)]
     pub partition_strategy: String,
-    /// 1.5.3 (plans/partitioning_3.md §3) — name of the anchor source for
+    /// Name of the anchor source for
     /// the partition column.  Empty when not partitioned, or when the
     /// anchor cannot be resolved unambiguously.  Used by the trigger
     /// codegen to decide whether the firing source is the anchor (Tier 1)
     /// or a non-anchor (Tier 2 / fallback).
     #[serde(default)]
     pub anchor_source: String,
-    /// 1.5.3 (plans/partitioning_3.md §4) — per-source SQL fragment that
+    /// Per-source SQL fragment that
     /// derives the IMV's partition column from this source's transition
     /// table by JOINing to the anchor.  Empty for the anchor source itself
     /// (it projects the partition column directly).  For non-anchor
@@ -180,7 +180,7 @@ pub struct AggregationPlan {
     /// through to global Path B for that source.
     #[serde(default)]
     pub partition_join_paths: std::collections::HashMap<String, String>,
-    /// 1.11.4 — ignored sources whose changes can be scoped to IMV partitions,
+    /// Ignored sources whose changes can be scoped to IMV partitions,
     /// by source as written in the query. Read by
     /// `__reflex_heal_on_ignored_change`. See `src/heal.rs`.
     #[serde(default)]
@@ -193,19 +193,19 @@ impl AggregationPlan {
     ///
     /// Three classes of redundancy are detected:
     ///
-    /// 1. **Bare-column SUM with NOT NULL source** (since 1.4.4). `SUM(col)` where
+    /// 1. **Bare-column SUM with NOT NULL source**. `SUM(col)` where
     ///    `col` is NOT NULL in the source: the companion `__nonnull_count_col`
     ///    always equals `__ivm_count` and is dropped. The end-query
     ///    `CASE WHEN ... > 0 THEN __sum END` is flattened to just `__sum`.
     ///
-    /// 2. **BOOL_OR over a structurally non-null inner expression** (1.4.6).
+    /// 2. **BOOL_OR over a structurally non-null inner expression**.
     ///    `BOOL_OR(X IS NOT NULL)`, `BOOL_OR(X IS NULL)`, `BOOL_OR(<bare_not_null_col>)`:
     ///    the inner argument can never be NULL, so the `__bool_or_*_nonnull_count`
     ///    companion equals `__ivm_count`. The end-query's
     ///    `CASE WHEN nonnull > 0 THEN true_count > 0 ELSE NULL END` is flattened
     ///    to `true_count > 0`.
     ///
-    /// 3. **Multiplier dedup** (1.4.6). `SUM(<X> * COALESCE(<Y>, <non-null-lit>))`
+    /// 3. **Multiplier dedup**. `SUM(<X> * COALESCE(<Y>, <non-null-lit>))`
     ///    has the same nullability profile as `SUM(<X>)`. When a sibling `SUM(<X>)`
     ///    is tracked (so `__nonnull_count_<X>` exists), the multiplier's own
     ///    `__nonnull_count_<X_times_Y_coalesce_lit>` is redundant — end-query
@@ -213,7 +213,7 @@ impl AggregationPlan {
     ///    dropped. When `<X>` is itself in NOT NULL columns, the dedup degenerates
     ///    to "drop unconditionally and flatten the CASE", same as class 1.
     pub fn optimize_not_null_sums(&mut self, not_null_columns: &std::collections::HashSet<String>) {
-        // 1.4.4: always record the catalog-derived NOT NULL set on the plan,
+        // Always record the catalog-derived NOT NULL set on the plan,
         // not just when the SUM-companion-column optimisation fires. The
         // MERGE codegen in `build_merge_using` reads `plan.not_null_columns`
         // to decide between `=` (index-usable) and `IS NOT DISTINCT FROM`

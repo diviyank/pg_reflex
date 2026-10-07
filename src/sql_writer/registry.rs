@@ -1,14 +1,11 @@
 //! Single source of truth for the `public.__reflex_ivm_reference` INSERT row
-//! shape. Pre-1.6.1 the four create paths (set-op, DISTINCT ON, window, main)
-//! each repeated a 14-column INSERT block with hand-laddered
-//! `DatumWithOid::new(...)` calls. Adding a column meant editing four sites.
+//! shape: one typed row and one INSERT site, so adding a column means editing
+//! one place rather than every create path.
 //!
 //! [`RegistryRow`] is the typed row; [`insert_registry_row`] is the one
-//! INSERT site. Optional columns default to safe empties so the four
-//! historical INSERT shapes are preserved exactly: paths that pre-1.6.1 did
-//! not set `where_predicate`, `ignored_sources`, `partition_columns`,
-//! `partition_strategy` simply leave them at their defaults here and the
-//! catalog row ends up identical.
+//! INSERT site. Optional columns default to safe empties so paths that do not
+//! set `where_predicate`, `ignored_sources`, `partition_columns`,
+//! `partition_strategy` simply leave them at their defaults here.
 
 use crate::aggregation::AggregationPlan;
 use crate::sql_writer::identifier::format_pg_text_array;
@@ -17,13 +14,13 @@ use pgrx::pg_sys::panic::ErrorReportable;
 use pgrx::prelude::*;
 use pgrx::spi;
 
-/// The A1 soundness-acknowledgement marker: a leading `!` on an
+/// The soundness-acknowledgement marker: a leading `!` on an
 /// `ignore_sources` entry means "I know ignoring this source is unsound and I
 /// accept it". Defined once, here, so the create-time check, the registry write
 /// and the trigger-install skip cannot drift on what the marker is.
 pub const IGNORE_ACK_MARKER: char = '!';
 
-/// Strip the A1 acknowledgement marker from one raw `ignore_sources` entry.
+/// Strip the acknowledgement marker from one raw `ignore_sources` entry.
 /// Returns the entry unchanged when it carries no marker.
 pub fn strip_ignore_ack_marker(entry: &str) -> &str {
     match entry.strip_prefix(IGNORE_ACK_MARKER) {
@@ -38,7 +35,7 @@ pub fn strip_ignore_ack_marker(entry: &str) -> &str {
 /// The marker must NOT reach `ignored_sources`: that array is matched by the
 /// deferred dispatcher's array-overlap predicate and by the trigger-install
 /// skip, and a marker-bearing entry stops matching — the ignore would silently
-/// stop working, which is the very outage the A1 check exists to prevent.
+/// stop working, which is the very outage the soundness check exists to prevent.
 ///
 /// An entry that strips to nothing (a bare `!`) names no source and is dropped
 /// rather than written as an empty string into either array. The create path
@@ -64,10 +61,10 @@ pub fn split_ignore_ack(raw: &[String]) -> (Vec<String>, Vec<String>) {
     (clean, acked)
 }
 
-/// JSON-blob hint: the `aggregations` column was historically inserted as
-/// `::json` for the decomposed paths and `::jsonb` for the main path. Both
-/// shapes survive a round-trip, but byte-identical contract is preserved by
-/// having callers select the cast they used.
+/// JSON-blob hint: the `aggregations` column is inserted as
+/// `::json` by the decomposed paths and `::jsonb` by the main path. Both
+/// shapes survive a round-trip, but the catalog stays byte-identical by
+/// having callers select the cast they use.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AggregationsCast {
     Json,
@@ -75,10 +72,9 @@ pub enum AggregationsCast {
 }
 
 /// Typed row written to `public.__reflex_ivm_reference` by every IMV
-/// creation path. Fields that historically defaulted to empty arrays /
+/// creation path. Fields that default to empty arrays /
 /// empty strings carry sensible defaults so set-op / DISTINCT ON / window
-/// paths can leave them at default and continue to produce the pre-1.6.1
-/// catalog row byte-for-byte.
+/// paths can leave them at default.
 #[derive(Clone, Debug)]
 pub struct RegistryRow<'a> {
     pub view_name: &'a str,
@@ -105,11 +101,11 @@ pub struct RegistryRow<'a> {
     /// TRUE for an ungrouped aggregate IMV (empty GROUP BY → at most one row).
     /// Written by the main create path; the decomposed paths leave it false.
     pub max_one_row: bool,
-    /// JSON object with creation-time parameters for chain rebuild (1.11.0).
+    /// JSON object with creation-time parameters for chain rebuild.
     /// Populated at create time; `None` → NULL in catalog → `{}` on rebuild.
     pub create_args: Option<&'a str>,
-    /// TRUE when every real source of this node is a materialized view (PS-3,
-    /// 1.11.0). Such a node cannot self-maintain — PG fires no trigger on a
+    /// TRUE when every real source of this node is a materialized view.
+    /// Such a node cannot self-maintain — PG fires no trigger on a
     /// matview — so it is a snapshot frozen at create time and needs an explicit
     /// `refresh_imv_depending_on('<mv>')` after each `REFRESH MATERIALIZED VIEW`.
     /// PERMANENT and structural: distinct from `known_stale`, never cleared by
@@ -164,7 +160,7 @@ impl<'a> RegistryRow<'a> {
 /// Insert one row into `public.__reflex_ivm_reference`.
 ///
 /// Uses two distinct INSERT statements: a short one for the decomposed
-/// paths (matches the pre-1.6.1 16-column shape with `::json` aggregations)
+/// paths (16 columns with `::json` aggregations)
 /// and the full one for the main path (20 columns, `::jsonb` aggregations,
 /// where_predicate / partitioning).
 ///
@@ -175,8 +171,7 @@ pub fn insert_registry_row(
     row: &RegistryRow<'_>,
 ) -> Result<(), spi::Error> {
     // Choose SQL based on whether any optional columns are set or whether
-    // the caller asked for ::jsonb. The two shapes preserve historical
-    // byte-for-byte catalog rows:
+    // the caller asked for ::jsonb. The two shapes:
     //   * decomposed (json, 16 cols, no where/partition/ignored) → set-op,
     //     DISTINCT ON, window paths.
     //   * full (jsonb, 20 cols, where + ignored + partition) → main path.
@@ -247,7 +242,7 @@ pub fn insert_registry_row(
             .map(|_| ())
     } else {
         let where_predicate_owned = row.where_predicate.unwrap_or("").to_string();
-        // A1: the '!' acknowledgement marker never reaches `ignored_sources` —
+        // The '!' acknowledgement marker never reaches `ignored_sources` —
         // it would stop the runtime skip from matching. It is recorded
         // separately in `ignore_ack`, and survives raw only in `create_args`.
         let (ignored_clean, ignore_acked) = split_ignore_ack(row.ignored_sources.unwrap_or(&[]));
@@ -304,10 +299,9 @@ pub fn insert_registry_row(
 
 /// Helper: append this IMV as a `graph_child` of each `parent_imv`.
 ///
-/// Consolidates the 4 duplicate `for imv_name in &depends_on_imv` loops in
-/// the pre-1.6.1 create paths. Each loop did `UPDATE … SET graph_child =
-/// array_append(...) WHERE name = $2` for the parent IMV; this helper does
-/// the same thing in one call site.
+/// Each parent IMV gets `UPDATE … SET graph_child =
+/// array_append(...) WHERE name = $2`, done here in one call site for every
+/// create path.
 pub fn add_graph_child_links(
     client: &mut pgrx::spi::SpiClient<'_>,
     child_view: &str,
@@ -338,8 +332,7 @@ pub fn add_graph_child_links(
 // `ImvRecord` is a faithful typed mirror of the catalog row: most fields have
 // a production reader (reconcile/drop/audit), `view_name` is asserted by the
 // read seam's round-trip test, and a field like `refresh_mode` is carried for
-// completeness ahead of a reader. The allow keeps a complete read DTO clean
-// without trimming fields the cdylib build would otherwise flag.
+// completeness ahead of a reader.
 #[derive(Clone, Debug)]
 pub struct ImvRecord {
     #[cfg(any(test, feature = "pg_test"))]
@@ -355,9 +348,9 @@ pub struct ImvRecord {
     pub depends_on: Vec<String>,
     pub depends_on_imv: Vec<String>,
     pub graph_child: Vec<String>,
-    /// Schema the IMV's objects were created in (1.7.1). `None` for legacy rows.
+    /// Schema the IMV's objects were created in. `None` for legacy rows.
     pub target_schema: Option<String>,
-    /// IMV partition mirror depth (1.8.2). `None` => mirror full source depth.
+    /// IMV partition mirror depth. `None` => mirror full source depth.
     pub partition_depth: Option<i32>,
 }
 
@@ -373,9 +366,8 @@ impl ImvRecord {
 ///
 /// `end_query` is non-empty exactly for the aggregate shape whose target is filled
 /// FROM the intermediate; it is `''` for a passthrough IMV and for every decomposed
-/// wrapper row. This is the branch the runtime itself takes (`src/partition.rs:633`,
-/// `:644`, `:1054`, `src/trigger/ops.rs:436`, `:653`, `:783`,
-/// `src/reconcile.rs:139`), which is why the audit reads the same signal rather
+/// wrapper row. This is the branch the runtime itself takes (`src/partition.rs`,
+/// `src/trigger/ops.rs`, `src/reconcile.rs`), which is why the audit reads the same signal rather
 /// than `aggregations->>'is_passthrough'`: `RegistryRow::decomposed` writes
 /// `aggregations = '{}'`, so the JSON signal claims "not passthrough" — and
 /// therefore "has an intermediate" — for wrapper rows that own nothing. One
@@ -388,8 +380,7 @@ pub fn owns_intermediate(end_query: &str) -> bool {
 
 /// Read one IMV row by name. Returns `None` when no row matches (the IMV is
 /// not registered). Disabled rows are still returned — callers that require
-/// `enabled = TRUE` check [`ImvRecord::enabled`] themselves (matching the
-/// historical per-caller `WHERE enabled = TRUE` filters).
+/// `enabled = TRUE` check [`ImvRecord::enabled`] themselves.
 pub fn read_imv(client: &pgrx::spi::SpiClient<'_>, name: &str) -> Option<ImvRecord> {
     let rows =
         client
@@ -505,12 +496,12 @@ pub fn read_imv_for_rebuild(
 
 /// The subset of a registry row that decides whether an anchor-scoped rebuild
 /// (`reflex_rebuild_imv` / `reflex_reconcile`) can converge the IMV. Read as one
-/// projection so the caller-side advisory (PS-14) reuses PS-3's stored
+/// projection so the caller-side advisory reuses the stored
 /// `requires_explicit_refresh` verdict and the existing `ignored_sources` /
 /// `partition_strategy` metadata rather than re-deriving matview-ness.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct RebuildRisk {
-    /// PS-3: every real source is a materialized view — the node cannot
+    /// Every real source is a materialized view — the node cannot
     /// self-maintain and the canonical recovery is `refresh_imv_depending_on`.
     pub requires_explicit_refresh: bool,
     /// At least one `ignore_sources` entry is declared. Combined with
@@ -560,7 +551,7 @@ pub fn read_rebuild_risk(client: &pgrx::spi::SpiClient<'_>, name: &str) -> Optio
 /// Record one targeted-recovery call against an IMV: bump `rebuild_count` and
 /// stamp `last_rebuild_at`. Returns the number of catalog rows updated (0 = IMV
 /// not found). Called only from the targeted-recovery entry points, never from
-/// the internal cascade descent (PS-14).
+/// the internal cascade descent.
 pub fn bump_rebuild_count(
     client: &mut pgrx::spi::SpiClient<'_>,
     name: &str,

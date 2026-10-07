@@ -1,12 +1,12 @@
-//! A1: is it sound to ignore this source?
+//! Is it sound to ignore this source?
 //!
 //! An ignored source whose columns determine the IMV's contents can silently
 //! invalidate it — a change the IMV never sees alters what the IMV should hold.
-//! That is the shape behind the 2026-09 silent-wipe incident: an IMV declared
+//! Example: an IMV declared
 //! `ignore_sources: [demand_planning]` while filtering on
-//! `demand_planning.status`. The status changed during a supply-plan run,
-//! nothing refreshed the IMV, and a later partition-scoped rebuild from the
-//! base query wrote the slice to zero rows — successfully and permanently.
+//! `demand_planning.status`. A status change would never reach the IMV,
+//! and a later partition-scoped rebuild from the
+//! base query would write the slice to zero rows — successfully and permanently.
 //!
 //! This deliberately does NOT reuse `collect_imv_relevant_columns`: that helper
 //! excludes the WHERE clause by design and returns an empty map for CTE and
@@ -343,7 +343,7 @@ mod tests {
         );
     }
 
-    /// C1(a) — the ignored source lives only in a WHERE subquery. The
+    /// The ignored source lives only in a WHERE subquery. The
     /// qualifier `d` belongs to a scope the top-level alias map cannot see;
     /// resolving it to itself would drop the reference as sound.
     #[test]
@@ -357,7 +357,7 @@ mod tests {
         assert_eq!(out[0].0, "demand_planning");
     }
 
-    /// C1(b) — the ignored source is wrapped in a derived table. `t` is a
+    /// The ignored source is wrapped in a derived table. `t` is a
     /// TableFactor::Derived, so it never enters the alias map.
     #[test]
     fn derived_table_qualifier_is_unsound() {
@@ -371,7 +371,7 @@ mod tests {
         assert_eq!(out[0].0, "demand_planning");
     }
 
-    /// C1(c) — a quoted alias. `Ident::to_string()` re-adds the quotes for the
+    /// A quoted alias. `Ident::to_string()` re-adds the quotes for the
     /// alias map key while `Ident.value` does not for the collected qualifier,
     /// so the lookup misses and the fallback must catch it.
     #[test]
@@ -385,7 +385,7 @@ mod tests {
         assert_eq!(out[0].0, "demand_planning");
     }
 
-    /// The C1 fallback must not fire for a resolvable qualifier: a plain alias
+    /// The unresolvable-qualifier fallback must not fire for a resolvable qualifier: a plain alias
     /// over a top-level table still resolves, and an unrelated ignored name
     /// stays sound.
     #[test]
@@ -397,7 +397,7 @@ mod tests {
         assert!(out.is_empty(), "{out:?}");
     }
 
-    /// M7 — the accepted false negative, pinned as a test rather than prose: a
+    /// The accepted false negative, pinned as a test rather than prose: a
     /// source contributing only projected / grouped columns via an outer join,
     /// with no WHERE, HAVING or ON reference, is ALLOWED. Widening this to a
     /// refusal would force '!' on effectively every real use of ignore_sources.
