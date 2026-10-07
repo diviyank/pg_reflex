@@ -2,44 +2,29 @@ use super::*;
 use crate::aggregation::AggregationPlan;
 use crate::query_decomposer::normalized_column_name;
 
-/// 2026-05-15 — high-selectivity dispatch threshold. When the number of
-/// affected groups exceeds this fraction of the intermediate's row count, the
-/// trigger switches from MERGE-based incremental to TRUNCATE+rebuild (full
-/// IMV-body refresh via `reflex_reconcile`).
+/// High-selectivity dispatch threshold. When the number of affected groups
+/// exceeds this fraction of the intermediate's row count, the trigger switches
+/// from MERGE-based incremental to TRUNCATE+rebuild (full IMV-body refresh via
+/// `reflex_reconcile`).
 ///
-/// History: 1.4.5 introduced this at 0.3 because reconcile (~14 s on
-/// SOP-forecast shape at the time) was faster than the broken incremental
-/// path (~17 s at 100K-affected dead-cleanup pathology, exposed in 2026-05-15).
+/// The incremental path stays fast at every reachable selectivity when the
+/// source's identity determines its slice of keys (1 M source x 50 plans, ~200 K
+/// intermediate: ~0.6 s at 11 % affected, ~2.9 s at 78 %, against a ~17 s
+/// reconcile). But on large shapes (76 M source, 7.7 M intermediate, 12-115 %
+/// of the intermediate flipped at once) the per-row MERGE + target double-rewrite
+/// costs O(|affected| · log |intermediate|) and loses 2-8x to reconcile at high
+/// selectivity.
 ///
-/// 1.4.6 (Item α + ANALYZE fix) makes incremental fast at ALL reachable
-/// selectivities on the SOP-forecast shape (1 M source × 50 dem_plan, ~200 K
-/// intermediate, 20 K rows per plan = 10 % per flip):
-///
-/// | Selectivity | Incremental | reconcile (1.4.5) |
-/// |---:|---:|---:|
-/// | 11 % (20K) | ~620 ms  | ~17 s |
-/// | 33 % (60K) | ~1.3 s   | ~17 s |
-/// | 50 % (100K)| ~1.9 s   | ~17 s |
-/// | 78 % (140K)| ~2.9 s   | ~17 s |
-///
-/// On that synthetic shape reconcile never wins. **But real db_clone shapes
-/// invert the proportions** (76 M source × 28 dem_plan, 7.7 M intermediate,
-/// 0.9–8.9 M rows per plan = 12–115 % per flip). On those shapes the
-/// per-row MERGE + target double-rewrite hits O(|affected| · log
-/// |intermediate|) and loses 2–8× to reconcile at high selectivity.
-///
-/// 1.4.6 lowers the default to 0.50, a compromise that:
-///   * Keeps small-mutation workloads (< 50 % of intermediate) on the
-///     incremental path — preserves the 60×-faster pure-data UPDATE case.
-///   * Dispatches catastrophic bulk flips (>= 50 % of intermediate) to
-///     reconcile, which on db_clone alp is ~2× faster than the bulk
-///     incremental path.
+/// 0.50 is the compromise:
+///   * Small mutations (< 50 % of intermediate) stay on the incremental path.
+///   * Catastrophic bulk flips (>= 50 % of intermediate) go to reconcile, which
+///     is ~2x faster than the bulk incremental path there.
 ///
 /// Per-IMV override via the `wipe_threshold` column in
 /// `__reflex_ivm_reference` (write via `reflex_set_wipe_threshold(name,
 /// value)`) is the right tool when this global default doesn't fit a
-/// specific IMV's shape — e.g. yse-style 419 K intermediate where the
-/// crossover is closer to 0.15.
+/// specific IMV's shape (e.g. a 419 K intermediate where the crossover is
+/// closer to 0.15).
 pub(crate) const WIPE_THRESHOLD_DEFAULT: f64 = 0.5;
 
 /// Default when the IMV has dependents: a rebuild is handed to them as a row
@@ -51,7 +36,7 @@ pub(crate) const WIPE_THRESHOLD_WITH_DEPENDENTS_DEFAULT: f64 = 0.9;
 /// each dollar-quoted with `$reflex_inner$` (any occurrence of that tag inside
 /// the statement is rewritten so it cannot terminate the quote early).
 ///
-/// PS-5 — the target DELETE / INSERT / dead-cleanup slots each hold a *list*
+/// The target DELETE / INSERT / dead-cleanup slots each hold a *list*
 /// rather than a single statement, because a nullable group key makes the
 /// affected-groups match expand into a self-gated sargable/NULL-safe pair (see
 /// `merge.rs::AffectedMatch`). Each statement carries its own gate, so emitting
@@ -79,7 +64,7 @@ fn execute_each(stmts: &[String], using: Option<&str>) -> String {
         .collect()
 }
 
-/// 1.4.5 — emit a DO block that dispatches between MERGE-incremental and
+/// Emit a DO block that dispatches between MERGE-incremental and
 /// full rebuild based on runtime selectivity.
 ///
 /// Replaces these statements in the standard flow:
@@ -111,7 +96,7 @@ pub(crate) fn build_high_selectivity_dispatch_sql(
     target_insert_sql: &[String],
 ) -> String {
     let dead_cleanup = execute_each(dead_cleanup_sql, None);
-    // PS-5 — the MERGE may itself be a gated sargable/NULL-safe pair (two
+    // The MERGE may itself be a gated sargable/NULL-safe pair (two
     // REFLEX_SEP-joined statements). Split and emit one EXECUTE per part so the
     // DO block runs each as its own command.
     let merge_stmts: Vec<String> = split_reflex_statements(merge_sql);
@@ -181,7 +166,7 @@ pub(crate) fn build_high_selectivity_dispatch_sql(
 }
 
 /// Split a `\n--<<REFLEX_SEP>>--\n`-separated SQL string into its non-empty
-/// statements. PS-5 — `build_merge_using` returns two statements (a gated
+/// statements. `build_merge_using` returns two statements (a gated
 /// sargable/NULL-safe pair) when the group key is nullable; the dispatch builders
 /// split here so each becomes its own `EXECUTE`.
 fn split_reflex_statements(sql: &str) -> Vec<String> {
@@ -198,7 +183,7 @@ fn split_reflex_statements(sql: &str) -> Vec<String> {
 /// meaningful "small partition" size.
 pub(crate) const WIPE_FLOOR_ROWS_DEFAULT: i64 = 1000;
 
-/// 1.5.3 (plans/partitioning_3.md §3) — partition-aware sibling of
+/// Partition-aware sibling of
 /// `build_high_selectivity_dispatch_sql`.
 ///
 /// Emitted only when the plan is partitioned AND the firing source is the
@@ -215,7 +200,7 @@ pub(crate) const WIPE_FLOOR_ROWS_DEFAULT: i64 = 1000;
 ///      `reflex_reconcile(view)` (global) since DETACHing many partitions
 ///      sequentially is worse than one rebuild.
 ///   5. Hot → `PERFORM reflex_reconcile_partition(view, csv_of_hot_keys)`
-///      (uses the atomic swap from Phase A).
+///      (uses the atomic swap of `reflex_reconcile_partition`).
 ///   6. Cold → runs the standard MERGE / dead-cleanup / target DELETE /
 ///      target INSERT with an `array_position($1::TEXT[], <partition_col>::text) IS NULL` filter
 ///      added.  `$1` is `_hot_keys` passed via EXECUTE USING.
@@ -223,7 +208,7 @@ pub(crate) const WIPE_FLOOR_ROWS_DEFAULT: i64 = 1000;
 /// The cold-path SQL strings MUST already contain the filter splice — the
 /// caller is responsible for wrapping the scratch / WHERE clauses with
 /// the `$1::TEXT[]` parameter binding before passing in.
-/// Aggregate-path hot/cold partition dispatch (audit #2 / Component 4).
+/// Aggregate-path hot/cold partition dispatch.
 ///
 /// Classification groups dirty counts by RESOLVED CHILD (see the in-SQL note),
 /// emitting both `_hot_keys` (one representative value per hot child, for
@@ -261,7 +246,7 @@ pub(crate) fn build_partition_aware_dispatch_sql_strategy(
         "_hot_vals"
     };
     let dead_cleanup = execute_each(dead_cleanup_sql, Some(using));
-    // PS-5 — the cold-partition MERGE may be a gated pair; split and bind USING
+    // The cold-partition MERGE may be a gated pair; split and bind USING
     // on each part (the gated variants share the cold-filter `$1`/`$2`).
     let merge_stmts: Vec<String> = split_reflex_statements(merge_sql_with_filter);
     let merge_execs = execute_each(&merge_stmts, Some(using));
@@ -394,7 +379,7 @@ pub(crate) fn build_partition_aware_dispatch_sql_strategy(
     )
 }
 
-/// Passthrough sibling of [`build_partition_aware_dispatch_sql`] (audit #2). Same
+/// Passthrough sibling of [`build_partition_aware_dispatch_sql`]. Same
 /// group-dirty-by-child classification, trip-cap, and atomic-swap hot path, but
 /// the cold body is the passthrough keyed delete + delta insert (no intermediate,
 /// no MERGE, no dead-cleanup). Hot children are rebuilt by `reflex_reconcile_partition`;
@@ -426,7 +411,7 @@ pub(crate) fn build_passthrough_partition_dispatch_sql(
     let safe_view = view_name.replace('\'', "''");
     let safe_part_col_lit = partition_col.replace('"', "").replace('\'', "''");
     let parent = target_parent_qual.replace('"', "").replace('\'', "''");
-    // PS-5 (2026-07-27): the cold DELETE arrives as a gated fast/safe pair, like
+    // The cold DELETE arrives as a gated fast/safe pair, like
     // the aggregate sibling's cold MERGE. Every variant is emitted at each site;
     // the gates travel inside the SQL so exactly one does work and PostgreSQL
     // skips the other with a `One-Time Filter`. The hot-leaf swap is emitted by
@@ -669,13 +654,12 @@ pub(crate) fn push_materialized_merge_and_affected(
         plan,
         op,
     ));
-    // 2026-05-15 (Item α surfaced this): the MERGE just modified
-    // ~|scratch| rows in the intermediate. `pg_class.reltuples` is stale
-    // (last set at IMV creation = 0). Downstream statements that JOIN on
-    // the intermediate via the composite UNIQUE index (target sync's INSERT
-    // and dead-cleanup DELETE) need accurate stats so the planner picks
-    // Index Scan via the composite key instead of a pathological SeqScan
-    // or NestedLoop. A full ANALYZE on a 180K-row intermediate is ~150 ms.
+    // The MERGE just modified ~|scratch| rows in the intermediate, and
+    // `pg_class.reltuples` is stale. Downstream statements that JOIN on the
+    // intermediate via the composite UNIQUE index (target sync's INSERT and
+    // dead-cleanup DELETE) need accurate stats so the planner picks an Index
+    // Scan via the composite key instead of a pathological SeqScan or
+    // NestedLoop. A full ANALYZE on a 180K-row intermediate is ~150 ms.
     stmts.push(format!("ANALYZE {}", intermediate_tbl));
     // Scratch is the result of GROUP BY in build_merge_from_table_sql's delta,
     // so it already contains one row per group key. DISTINCT here would add a
@@ -687,20 +671,17 @@ pub(crate) fn push_materialized_merge_and_affected(
     // ANALYZE affected after INSERT — TRUNCATE clobbers reltuples; without
     // fresh stats the planner estimates 1 row and picks NL+SeqScan for the
     // downstream dead-cleanup DELETE and target sync EXISTS lookups
-    // (pathological at high affected counts — 12+ minutes on 100K groups).
-    // ~50 ms cost.
+    // (pathological at high affected counts). ~50 ms cost.
     stmts.push(format!("ANALYZE {}", affected_tbl));
 }
 
-// 1.4.6 — placeholder for a future revisit of dispatch on the INSERT and
-// DELETE codegen paths (currently UPDATE-only). The blocker is that any
-// dispatch decision needs |affected|, which requires scratch + affected
-// fill, which on the bulk-flip shapes that motivate dispatch is the
-// dominant cost being paid (50–100 s on alp 8.9 M rows). A future
-// implementation must estimate |affected| from cheaper signals (pg_stats
-// most_common_freqs on the JOIN key, or per-IMV calibrated cost) so the
-// decision can fire before scratch is built. See
-// journal/2026-05-15_dispatch_wiring_revert.md for the decision log.
+// Placeholder for dispatch on the INSERT and DELETE codegen paths
+// (currently UPDATE-only). Any dispatch decision needs |affected|, which
+// requires the scratch + affected fill, and on the bulk-flip shapes that
+// motivate dispatch that fill is the dominant cost. A future implementation
+// must estimate |affected| from cheaper signals (pg_stats most_common_freqs on
+// the JOIN key, or per-IMV calibrated cost) so the decision can fire before
+// scratch is built.
 //
 // Signature sketch:
 //     fn push_scratch_and_affected_for_dispatch(
@@ -709,7 +690,7 @@ pub(crate) fn push_materialized_merge_and_affected(
 //         affected_tbl: &str, select_expr: &str,
 //     ) -> String { /* returns merge SQL; pushes scratch+affected fill */ }
 
-/// 1.4.6 — bulk-DELETE path for Item α IN→OUT (and regular DELETE) on
+/// Bulk-DELETE path for IN→OUT (and regular DELETE) on
 /// sources that have passed the `plan.source_join_keys` safety gate.
 ///
 /// Pre-conditions (enforced by the caller):
@@ -727,7 +708,7 @@ pub(crate) fn push_materialized_merge_and_affected(
 /// Emits two indexed DELETEs (intermediate + target) that scan only the
 /// transition rows against the leading column of the intermediate's
 /// composite unique index. Bypasses the scratch fill — which is the
-/// dominant cost (50-100 s) on bulk dim-flips like db_clone alp A4b.
+/// dominant cost (50-100 s) on bulk dimension flips.
 pub(crate) fn push_bulk_delete_via_transition(
     stmts: &mut Vec<String>,
     intermediate_tbl: &str,
@@ -792,18 +773,18 @@ pub(crate) fn push_bulk_delete_via_transition(
     stmts.push(format!("ANALYZE {}", intermediate_tbl));
 }
 
-/// 1.4.6 — bulk-INSERT path for Item α OUT→IN flips on sources that have
+/// Bulk-INSERT path for OUT→IN flips on sources that have
 /// passed the `plan.source_join_keys` safety gate.
 ///
 /// Pre-condition (enforced by the caller via `plan.source_join_keys.contains`):
 /// the source is JOIN-secondary with all JOIN equalities mapping to GROUP
 /// BY columns AND those source columns cover a UNIQUE key on the source.
-/// Together with Item α's OUT→IN guarantee (OLD post-filter empty), this
+/// Together with the OUT→IN guarantee (OLD post-filter empty), this
 /// means the intermediate has zero rows for the group keys the scratch
 /// will produce — MERGE's per-row probe is wasted, a plain INSERT is
 /// correct.
 ///
-/// Companion change in the target-sync block: the target DELETE on the
+/// The target-sync block drops the target DELETE on the
 /// affected keys is dropped (target had zero rows for those keys by the
 /// same reasoning).
 pub(crate) fn push_bulk_insert_and_affected(
