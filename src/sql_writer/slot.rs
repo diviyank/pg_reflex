@@ -1,6 +1,6 @@
 //! Tiny slot-substitution helper for relocated SQL templates.
 //!
-//! Used by Phase 4 of the 1.6.1 refactor to replace
+//! Replaces
 //! `__REFLEX_SLOT_<NAME>__` sentinels in trigger-body templates without
 //! reaching for nested `format!()` calls.
 //!
