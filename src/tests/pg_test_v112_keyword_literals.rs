@@ -156,3 +156,69 @@ fn v112_kw_count_distinct_alias_shorter_once_upper_cased() {
         "SELECT g, COUNT(DISTINCT v) AS \"nıı\" FROM {t} GROUP BY g",
     );
 }
+
+/// Group G never has a non-NULL `a`, so its MIN slot stays NULL and every
+/// recompute rewrites its MAX from whatever rows the scoped source returns.
+fn v112_or_roundtrip(tag: &str, predicate: &str) {
+    let table = format!("v112_or_{tag}_src");
+    let imv = format!("v112_or_{tag}");
+    Spi::run(&format!(
+        "CREATE TABLE {table}(id SERIAL PRIMARY KEY, g TEXT, city TEXT, \
+         flag BOOL, other BOOL, third BOOL, a INT, b INT)"
+    ))
+    .expect("create");
+    Spi::run(&format!(
+        "INSERT INTO {table}(g, city, flag, other, third, a, b) VALUES \
+         ('G','Lyon',true,false,false,NULL,1), \
+         ('G','Lyon',false,true,false,NULL,100), \
+         ('G','Lyon',false,false,true,NULL,1000), \
+         ('G','Paris',true,true,false,NULL,50), \
+         ('H','Lyon',true,false,false,1,1), \
+         ('H','Lyon',true,false,false,2,2), \
+         ('H','Paris',false,true,false,3,3), \
+         ('H','Lyon',false,false,true,4,4), \
+         ('H','Paris',true,true,true,5,5)"
+    ))
+    .expect("seed");
+    let q = format!("SELECT g, MIN(a) AS mn, MAX(b) AS mx FROM {table} WHERE {predicate} GROUP BY g");
+    assert_eq!(
+        crate::create_reflex_ivm_with_topk(&imv, &q, None, None, None, 0, None),
+        "CREATE REFLEX INCREMENTAL VIEW",
+        "{q}"
+    );
+    Spi::run(&format!("DELETE FROM {table} WHERE g = 'H' AND a = 1")).expect("delete");
+    assert_imv_correct(&imv, &q);
+    Spi::run(&format!(
+        "INSERT INTO {table}(g, city, flag, other, third, a, b) VALUES \
+         ('G','Lyon',true,false,false,NULL,2), ('K','Lyon',true,true,true,7,7)"
+    ))
+    .expect("insert");
+    assert_imv_correct(&imv, &q);
+    Spi::run(&format!("UPDATE {table} SET b = b - 1 WHERE g = 'H' AND a = 5")).expect("update");
+    assert_imv_correct(&imv, &q);
+}
+
+#[pg_test]
+fn v112_or_two_way_or_predicate() {
+    v112_or_roundtrip("two", "flag OR other");
+}
+
+#[pg_test]
+fn v112_or_three_way_or_predicate() {
+    v112_or_roundtrip("three", "flag OR other OR third");
+}
+
+#[pg_test]
+fn v112_or_parenthesised_or_then_and() {
+    v112_or_roundtrip("paren", "(flag OR other) AND city <> 'x'");
+}
+
+#[pg_test]
+fn v112_or_and_only_predicate() {
+    v112_or_roundtrip("and", "flag AND city <> 'x'");
+}
+
+#[pg_test]
+fn v112_or_only_inside_a_literal() {
+    v112_or_roundtrip("lit", "city <> 'x or y'");
+}
