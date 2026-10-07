@@ -14,6 +14,7 @@
 
 pub mod ddl;
 pub mod identifier;
+pub(crate) mod keyword_scan;
 pub mod registry;
 pub mod slot;
 
