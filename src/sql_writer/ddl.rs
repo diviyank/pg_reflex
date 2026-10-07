@@ -1,12 +1,11 @@
-//! Typed DDL builders that consolidate the `CREATE TABLE` / `CREATE INDEX`
-//! string construction previously scattered across `schema_builder.rs`.
+//! Typed DDL builders for `CREATE TABLE` / `CREATE INDEX` string construction.
 //!
 //! The builders own identifier quoting via [`super::identifier::quote`] so
-//! callers can no longer forget it — that omission was the source of the
-//! 1.5.2 `mixed_case_identifier` bug class.
+//! callers cannot forget it: an unquoted mixed-case identifier folds to lower
+//! case and misses the relation.
 //!
-//! Output is intentionally byte-identical to the pre-1.6.1 `format!()`-based
-//! emitters so the EXCEPT ALL correctness oracle in `pg_test_correctness.rs`
+//! Output is intentionally byte-identical to a plain `format!()`-based emission
+//! so the EXCEPT ALL correctness oracle in `pg_test_correctness.rs`
 //! sees no diff.
 
 use crate::sql_writer::identifier;
@@ -103,10 +102,9 @@ impl CreateTable {
         out.push_str(&self.name);
 
         if let Some(src) = &self.like_source {
-            // `LIKE` form: short, columns-or-LIKE is mutually exclusive in
-            // pre-1.6.1 callers, but two callers (staging, passthrough)
-            // append a leading column before LIKE. Re-create that shape by
-            // joining columns with comma when present.
+            // `LIKE` form: columns-or-LIKE is normally exclusive, but two
+            // callers (staging, passthrough) append a leading column before LIKE.
+            // Re-create that shape by joining columns with comma when present.
             out.push_str(" (");
             if !self.columns.is_empty() {
                 out.push_str(&self.columns.join(", "));
