@@ -25,7 +25,7 @@ pub(crate) fn reflex_doctor_impl(
 ) -> Vec<DoctorReportRow> {
     let mut rows = Vec::new();
 
-    // F3 hardening: validate the target argument if provided
+    // Validate the target argument if provided
     if let Some(target_name) = target {
         if let Err(err_msg) = validate_view_name(target_name) {
             rows.push((
@@ -139,14 +139,13 @@ fn heal_and_verify(imv: &str) -> String {
 /// Classification reads `failures` — the counter the drain's EXCEPTION handler
 /// bumps and the one `PARTITION_FLUSH_FAILURE_CAP` gates on — never `attempts`,
 /// which the *enqueue* path bumps once per partition ATTACH. A busy source
-/// crosses any retry threshold within a day, so classifying on `attempts` made
-/// every such root permanently "too many attempts".
+/// crosses any retry threshold within a day, so classifying on `attempts` would
+/// leave every such root permanently "too many attempts".
 ///
 /// Age is measured from `last_attempt_at`, falling back to `enqueued_at` only
 /// when no drain has ever fired for the row. `enqueued_at` is reset by every
-/// re-enqueue, so on a busy source it reports a fresh age over an old failure —
-/// which is how a fixed bug's `last_error` came to be presented as the current
-/// cause.
+/// re-enqueue, so on a busy source it reports a fresh age over an old failure,
+/// presenting a stale `last_error` as the current cause.
 fn detect_pending_queue_issues(
     target: Option<&str>,
     max_attempts: i32,
@@ -237,8 +236,8 @@ fn detect_pending_queue_issues(
 
         let escaped_root = p.source_root.replace("'", "''");
         // A capped root needs re-arming first: the flush this action prescribes
-        // declines to touch it otherwise, which made the F1/F2 remedy a
-        // guaranteed no-op on exactly the rows most likely to be capped.
+        // declines to touch it otherwise, so the remedy would be a guaranteed
+        // no-op on exactly the rows most likely to be capped.
         let action = if p.is_capped() {
             format!(
                 "SELECT reflex_reset_partition_failures('{0}'); \
@@ -312,7 +311,7 @@ struct PendingQueueRow {
 /// drain either declined (capped) or failed and rolled back. Neither is visible in
 /// the flush's return value: the capped path returns a perfectly normal
 /// "OK — nothing pending", and a per-root failure is swallowed into a WARNING by
-/// the drain's own EXCEPTION handler. Without this check the doctor reported
+/// the drain's own EXCEPTION handler. Without this check the doctor would report
 /// `fixed` for a repair that did nothing.
 ///
 /// Scope: this proves the QUEUE drained, not that downstream maintenance
@@ -393,7 +392,7 @@ fn apply_partition_flush_repair(source_root: &str) -> String {
 
 /// Apply a reconcile repair in a subtransaction.
 ///
-/// Calls the two-argument `reflex_reconcile(view, drop_orphans)` overload (1.11.0)
+/// Calls the two-argument `reflex_reconcile(view, drop_orphans)` overload
 /// so an F4 / F4b repair honours the operator's `drop_orphans` choice instead of
 /// silently dropping orphan partitions the way the one-argument form does. F3
 /// already gates its orphan drop; this keeps F4/F4b consistent with it.
@@ -421,8 +420,8 @@ fn apply_reconcile_repair(imv_name: &str, drop_orphans: bool) -> String {
 /// `reflex_sync_partitions(imv, true)` removes IMV-side children that map to no
 /// live source partition, NOTICEing each one — which is how the operator learns
 /// what blocked the swap. `reflex_reconcile` then refills and is the only path
-/// that clears `known_stale`. Sync alone reported success over an IMV the health
-/// surface still called broken, so the same finding came back on every run.
+/// that clears `known_stale`. Sync alone would report success over an IMV the
+/// health surface still calls broken, so the same finding would return on every run.
 fn apply_f3_repair(imv_name: &str) -> String {
     let escaped = imv_name.replace("'", "''");
     let sync_outcome = apply_doctor_repair(&format!(
@@ -503,14 +502,13 @@ fn detect_known_stale_imvs(
         // (2) Else if stale_reason contains "overlap" → F3
         // (3) Else → F4
         let check_id = {
-            // 1.11.0: classify on the authoritative registry graph, not a name
-            // heuristic. The old `name LIKE '<bare>__%'` probe silently missed
-            // every schema-qualified decomposed IMV — its registry name is
-            // `s.qv__cte_b`, which does not begin with the parent's bare `qv__`,
-            // so `s.qv` was misclassified F4 and given a repair that could not
-            // handle its chain. PS-1 now records `is_generated_sub_imv` on the
-            // child and the edge in the parent's `depends_on_imv`; a decomposed
-            // parent is exactly a row with a generated node in `depends_on_imv`.
+            // Classify on the authoritative registry graph, not a name heuristic:
+            // a `name LIKE '<bare>__%'` probe would miss every schema-qualified
+            // decomposed IMV — its registry name is `s.qv__cte_b`, which does not
+            // begin with the parent's bare `qv__`. `is_generated_sub_imv` is
+            // recorded on the child and the edge in the parent's `depends_on_imv`;
+            // a decomposed parent is exactly a row with a generated node in
+            // `depends_on_imv`.
             let is_decomposed_chain = Spi::get_one::<bool>(&format!(
                 "SELECT EXISTS( \
                      SELECT 1 FROM public.__reflex_ivm_reference child \
@@ -538,15 +536,13 @@ fn detect_known_stale_imvs(
 
         let (action, outcome) = match check_id.as_str() {
             "F4b" => {
-                // Pre-1.11.0 this prescribed reflex_rebuild_chain and never ran it.
-                // reflex_rebuild_chain drop+recreates from the registry sql_query,
-                // which for a CTE-decomposed parent is the *rewritten* body naming
-                // a child the cascade just dropped — so it hard-errors on exactly
-                // this shape (D22, still open, PS-2's file). PS-1 made
-                // reflex_reconcile rebuild the generated sub-IMVs bottom-up first,
-                // so it is now the correct — and safe, rebuild-in-place — remedy,
-                // repaired under `fix` like F4. drop_orphans is honoured via the
-                // scoped overload.
+                // reflex_rebuild_chain is not the remedy: it drop+recreates from
+                // the registry sql_query, which for a CTE-decomposed parent is the
+                // *rewritten* body naming a child the cascade just dropped, so it
+                // hard-errors on exactly this shape. reflex_reconcile rebuilds the
+                // generated sub-IMVs bottom-up first, so it is the correct — and
+                // safe, rebuild-in-place — remedy, repaired under `fix` like F4.
+                // drop_orphans is honoured via the scoped overload.
                 (
                     format!(
                         "SELECT reflex_reconcile('{}', {});",
@@ -618,21 +614,20 @@ fn detect_known_stale_imvs(
 }
 
 /// Detect nodes that cannot self-maintain because every real source is a
-/// materialized view (F12 — PS-3).
+/// materialized view (F12).
 ///
 /// PG fires no trigger on a matview, so such a node is a snapshot frozen at
 /// create time. `requires_explicit_refresh` records that structurally and
-/// PERMANENTLY. This finding makes the node visible to `reflex_doctor` — the
-/// blind spot that let 40/40 generated sub-IMVs sit month-stale unflagged,
-/// because every other health surface keys off `known_stale` (which a
+/// PERMANENTLY. This finding makes the node visible to `reflex_doctor`, since
+/// every other health surface keys off `known_stale` (which a
 /// by-design-unmaintainable node never sets).
 ///
 /// The flag is kept strictly distinct from `known_stale`: this path never reads,
 /// sets, or clears `known_stale`, and never routes through `verify_stale_cleared`
 /// — so a `fix => TRUE` run can never turn this into a permanent
 /// `failed:known_stale still set` false alarm. In fix mode it runs the verified
-/// remedy `refresh_imv_depending_on('<mv>')` for each matview source (closing the
-/// "nothing schedules the remedy" gap) and reports `refreshed`; the structural
+/// remedy `refresh_imv_depending_on('<mv>')` for each matview source and reports
+/// `refreshed`; the structural
 /// flag is intentionally NOT cleared, because clearing it would re-hide the node
 /// the instant the matview next changes.
 fn detect_requires_explicit_refresh(target: Option<&str>, fix: bool) -> Vec<DoctorReportRow> {
@@ -898,7 +893,7 @@ fn detect_audit_findings(target: Option<&str>, fix: bool) -> Vec<DoctorReportRow
             // maintenance attempt has already failed.
             "partition-mirror" | "partition-tree-drift" => "F3",
             "duplicate-function" => "F11",
-            // An unacknowledged unsound ignore_sources (A1). Report-only: its
+            // An unacknowledged unsound ignore_sources. Report-only: its
             // remedy, reflex_ack_ignore_source, records an operator's
             // acceptance of risk rather than repairing anything, and must
             // never be auto-executed.
