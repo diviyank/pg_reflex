@@ -746,3 +746,82 @@ fn v112_fn_many_volatile_overloads_are_listed_up_to_a_cap() {
     assert!(res.contains(" and 2 more. Fix:"), "{res}");
     assert!(res.find("IMMUTABLE").is_some_and(|p| p < 300), "{res}");
 }
+
+#[pg_test]
+fn v112_fn_user_functions_named_like_clock_functions_accepted_when_schema_qualified() {
+    Spi::run("CREATE SCHEMA v112_fn_cq_s1").expect("schema");
+    Spi::run("CREATE FUNCTION v112_fn_cq_s1.age(int) RETURNS int LANGUAGE sql IMMUTABLE AS 'SELECT $1 + 1'")
+        .expect("age");
+    Spi::run("CREATE FUNCTION v112_fn_cq_s1.now() RETURNS int LANGUAGE sql IMMUTABLE AS 'SELECT 7'")
+        .expect("now");
+    v112_fn_table("v112_fn_cqa_src");
+    let age = "SELECT id, v112_fn_cq_s1.age(v) AS x FROM v112_fn_cqa_src";
+    v112_fn_created("v112_fn_cqa", age, "IMMEDIATE");
+    v112_fn_assert_correct_through_dml("v112_fn_cqa", age, "v112_fn_cqa_src", false);
+    v112_fn_table("v112_fn_cqn_src");
+    let now = "SELECT id, v + v112_fn_cq_s1.now() AS x FROM v112_fn_cqn_src";
+    v112_fn_created("v112_fn_cqn", now, "IMMEDIATE");
+    v112_fn_assert_correct_through_dml("v112_fn_cqn", now, "v112_fn_cqn_src", false);
+}
+
+#[pg_test]
+fn v112_fn_volatile_user_function_in_a_user_schema_rejected_by_the_catalog() {
+    v112_fn_table("v112_fn_cv_src");
+    Spi::run("CREATE SCHEMA v112_fn_cv_s1").expect("schema");
+    Spi::run(
+        "CREATE FUNCTION v112_fn_cv_s1.random_like() RETURNS int LANGUAGE sql VOLATILE AS 'SELECT 1'",
+    )
+    .expect("random_like");
+    Spi::run("CREATE FUNCTION v112_fn_cv_s1.now() RETURNS int LANGUAGE sql VOLATILE AS 'SELECT 1'")
+        .expect("now");
+    v112_fn_assert_rejected(
+        "v112_fn_cv_0",
+        "SELECT id, v + v112_fn_cv_s1.random_like() AS x FROM v112_fn_cv_src",
+        "Volatile function(s) random_like",
+    );
+    v112_fn_assert_rejected(
+        "v112_fn_cv_1",
+        "SELECT id, v + v112_fn_cv_s1.now() AS x FROM v112_fn_cv_src",
+        "ALTER FUNCTION v112_fn_cv_s1.now() IMMUTABLE",
+    );
+}
+
+#[pg_test]
+fn v112_fn_builtin_clock_calls_rejected_however_qualified() {
+    v112_fn_table("v112_fn_cb_src");
+    Spi::run("CREATE SCHEMA v112_fn_cb_s1").expect("schema");
+    Spi::run(
+        "CREATE FUNCTION v112_fn_cb_s1.now() RETURNS timestamptz LANGUAGE sql IMMUTABLE AS 'SELECT ''2026-01-01+00''::timestamptz'",
+    )
+    .expect("now");
+    let queries = [
+        "SELECT id, g FROM v112_fn_cb_src WHERE ts < pg_catalog.now()",
+        "SELECT id, g FROM v112_fn_cb_src WHERE ts < PG_CATALOG.NOW()",
+        "SELECT id, g FROM v112_fn_cb_src WHERE ts < \"pg_catalog\".\"now\"()",
+        "SELECT id, g FROM v112_fn_cb_src WHERE ts < now()",
+        "SELECT id, g, CURRENT_TIMESTAMP AS at FROM v112_fn_cb_src",
+        "SELECT id, g, LOCALTIME AS at FROM v112_fn_cb_src",
+    ];
+    for (i, q) in queries.iter().enumerate() {
+        v112_fn_assert_rejected(&format!("v112_fn_cb_{i}"), q, "Non-deterministic");
+    }
+    Spi::run("SET LOCAL search_path = v112_fn_cb_s1, public, pg_catalog").expect("search_path");
+    for (i, q) in queries.iter().enumerate() {
+        v112_fn_assert_rejected(&format!("v112_fn_cbp_{i}"), q, "Non-deterministic");
+    }
+}
+
+#[pg_test]
+fn v112_fn_clock_rejection_names_the_matched_function() {
+    v112_fn_table("v112_fn_cn_src");
+    v112_fn_assert_rejected(
+        "v112_fn_cn_0",
+        "SELECT id, g, age(ts) AS a FROM v112_fn_cn_src",
+        "Fix: remove age from the IMV query",
+    );
+    v112_fn_assert_rejected(
+        "v112_fn_cn_1",
+        "SELECT id, g, age(ts) AS a, pg_catalog.now() AS n, CURRENT_DATE AS d FROM v112_fn_cn_src",
+        "Fix: remove age, now, current_date from the IMV query",
+    );
+}
