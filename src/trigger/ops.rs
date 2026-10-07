@@ -1363,7 +1363,7 @@ pub(crate) fn aggregate_epilogue_stmts(
     stmts: &mut Vec<String>,
 ) {
     let end_query_has_group_by =
-        crate::sql_writer::keyword_scan::has_keyword(end_query, "GROUP BY");
+        crate::sql_writer::keyword_scan::has_top_level_keyword(end_query, "GROUP BY");
     let include_dead_cleanup = plan.needs_ivm_count
         && grp_cols.is_some()
         && matches!(operation, "DELETE" | "DELETE_PROMOTED" | "UPDATE");
