@@ -72,10 +72,11 @@ pub fn quote(name: &str) -> String {
     }
 }
 
-/// Ensure an identifier fits within PostgreSQL's NAMEDATALEN limit (63 chars).
+/// Ensure an identifier fits within PostgreSQL's NAMEDATALEN limit (63 bytes).
 ///
-/// If the raw name exceeds 63 characters, truncate and append a hash suffix
-/// so that distinct input names remain distinct after truncation.
+/// If the raw name exceeds 63 bytes, truncate on a character boundary and
+/// append a hash suffix so that distinct input names remain distinct after
+/// truncation.
 pub fn safe(raw: &str) -> String {
     const MAX_IDENT: usize = 63;
     if raw.len() <= MAX_IDENT {
@@ -87,7 +88,11 @@ pub fn safe(raw: &str) -> String {
     raw.hash(&mut hasher);
     let hash = hasher.finish();
     // 9 chars for suffix: _ + 8 hex digits
-    format!("{}_{:08x}", &raw[..MAX_IDENT - 9], hash as u32)
+    let mut kept_len = MAX_IDENT - 9;
+    while !raw.is_char_boundary(kept_len) {
+        kept_len -= 1;
+    }
+    format!("{}_{:08x}", &raw[..kept_len], hash as u32)
 }
 
 /// Format a slice of strings as a PostgreSQL array literal in TEXT form

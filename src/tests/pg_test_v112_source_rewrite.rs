@@ -244,3 +244,12 @@ fn v112_sr_length_changing_literal_in_join_condition_keeps_null_group_correct() 
     Spi::run("DELETE FROM v112_sr_db_s WHERE id = 3").expect("delete");
     assert_imv_correct("v112_sr_db_v", q);
 }
+
+#[pg_test]
+fn v112_sr_long_multibyte_source_name_stays_correct() {
+    let table = format!("\"v112_sr_{}\"", "é".repeat(26));
+    v112_sr_seeded_table(&table, "Été");
+    let q = v112_sr_aggregate_over_literal(&table, "'Été'");
+    v112_sr_imv("v112_sr_long_agg", &q);
+    v112_sr_assert_correct_through_dml(&table, "Été", &[("v112_sr_long_agg", &q)]);
+}

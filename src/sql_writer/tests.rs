@@ -1033,3 +1033,87 @@ fn source_rewrite_matches_legacy_for_unquoted_fully_quoted_and_bare_references()
     assert_eq!(compared, 13440);
     assert_eq!(rewritten, compared);
 }
+
+fn legacy_safe(raw: &str) -> String {
+    const MAX_IDENT: usize = 63;
+    if raw.len() <= MAX_IDENT {
+        return raw.to_string();
+    }
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    raw.hash(&mut hasher);
+    let hash = hasher.finish();
+    format!("{}_{:08x}", &raw[..MAX_IDENT - 9], hash as u32)
+}
+
+fn name_with_char_straddling_the_cut(ascii_lead: usize, straddling: char) -> String {
+    format!("{}{}{}", "a".repeat(ascii_lead), straddling, "b".repeat(20))
+}
+
+fn assert_truncated_before_straddling_char(ascii_lead: usize, straddling: char) {
+    let truncated = safe(&name_with_char_straddling_the_cut(ascii_lead, straddling));
+    let (kept, suffix) = truncated.split_at(ascii_lead);
+    assert_eq!(kept, "a".repeat(ascii_lead));
+    assert_eq!(suffix.len(), 9, "suffix: {suffix}");
+    assert!(suffix.starts_with('_'), "suffix: {suffix}");
+    assert!(
+        suffix[1..].chars().all(|c| c.is_ascii_hexdigit()),
+        "suffix: {suffix}"
+    );
+    assert!(truncated.len() <= 63);
+}
+
+#[test]
+fn safe_truncates_before_two_byte_char_straddling_the_cut() {
+    assert_truncated_before_straddling_char(53, 'é');
+}
+
+#[test]
+fn safe_truncates_before_three_byte_char_straddling_the_cut() {
+    assert_truncated_before_straddling_char(53, '夏');
+    assert_truncated_before_straddling_char(52, '夏');
+}
+
+#[test]
+fn safe_truncates_before_four_byte_char_straddling_the_cut() {
+    assert_truncated_before_straddling_char(53, '🍉');
+    assert_truncated_before_straddling_char(52, '🍉');
+    assert_truncated_before_straddling_char(51, '🍉');
+}
+
+#[test]
+fn safe_keeps_distinct_long_multibyte_names_distinct() {
+    let summer = format!("__reflex_new_{}_été", "é".repeat(30));
+    let winter = format!("__reflex_new_{}_hiver", "é".repeat(30));
+    assert_ne!(safe(&summer), safe(&winter));
+    assert!(safe(&summer).len() <= 63);
+}
+
+#[test]
+fn safe_keeps_whole_char_ending_exactly_at_the_cut() {
+    let name = format!("{}é{}", "a".repeat(52), "b".repeat(20));
+    assert!(safe(&name).starts_with(&format!("{}é_", "a".repeat(52))));
+    assert_eq!(safe(&name).len(), 63);
+}
+
+#[test]
+fn safe_matches_legacy_on_ascii_and_short_names() {
+    const ALPHABET: &[u8] = b"abcXYZ019_$. \"";
+    let mut rng = Lcg(0x5afe);
+    let mut truncated = 0;
+    for _ in 0..4000 {
+        let length = rng.below(130);
+        let name: String = (0..length)
+            .map(|_| ALPHABET[rng.below(ALPHABET.len())] as char)
+            .collect();
+        assert_eq!(safe(&name), legacy_safe(&name), "name: {name:?}");
+        truncated += usize::from(name.len() > 63);
+    }
+    assert!(truncated > 1500, "truncated only {truncated}");
+    for chars in 0..=31 {
+        let short_multibyte = "é".repeat(chars);
+        assert_eq!(safe(&short_multibyte), short_multibyte);
+        assert_eq!(safe(&short_multibyte), legacy_safe(&short_multibyte));
+    }
+}
