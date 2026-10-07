@@ -1,6 +1,7 @@
 use super::*;
 use crate::aggregation::AggregationPlan;
 use crate::query_decomposer::normalized_column_name;
+use crate::sql_writer::keyword_scan;
 
 /// Build a MERGE statement that merges a delta query into the intermediate table.
 /// Used directly by unit tests; production code goes through `push_materialized_merge`.
@@ -1143,40 +1144,49 @@ pub(crate) fn null_safe_in_gated(
     }
 }
 
-/// Splice a SQL fragment (already formatted as ` AND (...)` or similar) into a
-/// query immediately before its `GROUP BY` clause. If the query has no
-/// existing `WHERE` clause between `FROM` and `GROUP BY`, the leading `AND`
-/// is rewritten to `WHERE`. Returns `None` if no `GROUP BY` is found.
+/// Splice `and_fragment` (formatted as ` AND <predicate>`) into `query`
+/// immediately before its last `GROUP BY` outside literals, quoted identifiers
+/// and comments. Returns `None` when there is none.
 ///
-/// Used by `build_min_max_recompute_sql` to push an affected-groups filter
-/// through the base-query aggregation boundary so the source scan is scoped.
+/// With a top-level `WHERE` the fragment is appended to its predicate, which is
+/// parenthesised first when it holds a top-level `OR`: `AND` binds tighter, so
+/// the fragment would otherwise constrain only the last alternative. Without a
+/// top-level `WHERE` the fragment's leading `AND` becomes `WHERE`.
 pub(crate) fn splice_before_group_by(query: &str, and_fragment: &str) -> Option<String> {
-    let upper = query.to_uppercase();
-    let gb_marker = " GROUP BY ";
-    let gb_pos = upper.rfind(gb_marker)?;
+    const WHERE: &str = " WHERE ";
+    let group_by = keyword_scan::keyword_hits(query, " GROUP BY ").pop()?;
+    let before_group_by = &query[..group_by.pos];
+    let top_level_where = keyword_scan::keyword_hits(before_group_by, WHERE)
+        .into_iter()
+        .rev()
+        .find(|hit| hit.depth == 0)
+        .map(|hit| hit.pos);
 
-    // Determine whether a WHERE exists between the last FROM/JOIN and GROUP BY.
-    let pre_gb_upper = &upper[..gb_pos];
-    let has_where = pre_gb_upper.contains(" WHERE ");
-
-    let fragment = if has_where {
-        and_fragment.to_string()
-    } else {
-        // Rewrite leading " AND" to " WHERE"
-        let trimmed = and_fragment.trim_start();
-        if let Some(rest) = trimmed.strip_prefix("AND ") {
-            format!(" WHERE {}", rest)
-        } else {
-            // Fallback: just prepend WHERE
-            format!(" WHERE {}", trimmed)
-        }
+    let Some(where_pos) = top_level_where else {
+        let predicate = and_fragment.trim_start();
+        let predicate = predicate.strip_prefix("AND ").unwrap_or(predicate);
+        return Some(format!(
+            "{before_group_by} WHERE {predicate}{}",
+            &query[group_by.pos..]
+        ));
     };
 
-    let mut out = String::with_capacity(query.len() + fragment.len());
-    out.push_str(&query[..gb_pos]);
-    out.push_str(&fragment);
-    out.push_str(&query[gb_pos..]);
-    Some(out)
+    let predicate_start = where_pos + WHERE.len();
+    let predicate = &before_group_by[predicate_start..];
+    let or_would_capture_the_fragment = group_by.depth == 0
+        && keyword_scan::keyword_hits(predicate, " OR ")
+            .iter()
+            .any(|hit| hit.depth == 0);
+    let scoped_predicate = if or_would_capture_the_fragment {
+        format!("({predicate})")
+    } else {
+        predicate.to_string()
+    };
+    Some(format!(
+        "{}{scoped_predicate}{and_fragment}{}",
+        &query[..predicate_start],
+        &query[group_by.pos..]
+    ))
 }
 
 /// Splice an affected-groups filter into `end_query` immediately before its `GROUP BY` clause.
@@ -1201,9 +1211,7 @@ pub(crate) fn inject_affected_filter_before_group_by(
     outer_qualifier: &str,
     not_null_columns: &std::collections::HashSet<String>,
 ) -> Option<String> {
-    let upper = end_query.to_uppercase();
-    let gb_marker = " GROUP BY ";
-    let pos = upper.rfind(gb_marker)?;
+    let pos = keyword_scan::last_keyword(end_query, " GROUP BY ")?;
     let filter = null_safe_in(
         affected_tbl,
         outer_qualifier,
@@ -1237,9 +1245,7 @@ pub(crate) fn inject_affected_filter_before_group_by_gated(
     outer_qualifier: &str,
     not_null_columns: &std::collections::HashSet<String>,
 ) -> Option<Vec<String>> {
-    let upper = end_query.to_uppercase();
-    let gb_marker = " GROUP BY ";
-    let pos = upper.rfind(gb_marker)?;
+    let pos = keyword_scan::last_keyword(end_query, " GROUP BY ")?;
     let m = null_safe_in_gated(
         affected_tbl,
         outer_qualifier,
@@ -1345,3 +1351,7 @@ pub(crate) fn push_materialized_merge(
         op,
     ));
 }
+
+#[cfg(test)]
+#[path = "../tests/unit_splice_before_group_by.rs"]
+mod splice_before_group_by_tests;
