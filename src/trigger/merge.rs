@@ -1014,7 +1014,7 @@ pub(crate) fn affected_null_key_gate(
 /// serve neither an `Index Cond` nor a hash/merge join key: the planner's only
 /// option is a nested loop with a `Join Filter` over the entire target, making
 /// the target sync `O(total_groups × affected_groups)`. Measured on a
-/// 200 000-group nullable-key fixture : 52 ms for a 1-row delta, and
+/// 200 000-group nullable-key fixture: 52 ms for a 1-row delta, and
 /// **681 576 ms** with 50 000 affected groups (`Rows Removed by Join Filter:
 /// 8 749 975 000`) against **57 ms** for the same statement with `=`.
 ///
