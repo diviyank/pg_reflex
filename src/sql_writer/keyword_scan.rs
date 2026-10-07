@@ -116,6 +116,30 @@ pub(crate) fn string_literal_spans(sql: &str) -> Vec<std::ops::Range<usize>> {
     spans
 }
 
+/// Byte ranges of the double-quoted identifiers of `sql`, quotes included, in
+/// ascending order. A quote character inside a string literal or a comment
+/// does not open an identifier.
+pub(crate) fn quoted_identifier_spans(sql: &str) -> Vec<std::ops::Range<usize>> {
+    let bytes = sql.as_bytes();
+    let mut spans = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        i = match bytes[i] {
+            b'"' => {
+                let end = end_of_double_quoted(bytes, i);
+                spans.push(i..end);
+                end
+            }
+            b'\'' => end_of_single_quoted(bytes, i),
+            b'$' => end_of_dollar_quoted(bytes, i).unwrap_or(i + 1),
+            b'-' if bytes.get(i + 1) == Some(&b'-') => end_of_line_comment(bytes, i),
+            b'/' if bytes.get(i + 1) == Some(&b'*') => end_of_block_comment(bytes, i),
+            _ => i + 1,
+        };
+    }
+    spans
+}
+
 pub(crate) fn keyword_hits(sql: &str, keyword: &str) -> Vec<KeywordHit> {
     let bytes = sql.as_bytes();
     let wanted = keyword.as_bytes();
@@ -332,5 +356,28 @@ mod tests {
                 prop_assert_eq!(has_keyword(&sql, kw), legacy_last(&sql, kw).is_some());
             }
         }
+    }
+
+    #[test]
+    fn quoted_identifiers_are_whole_tokens_outside_literals_and_comments() {
+        let spans = |sql: &str| -> Vec<String> {
+            quoted_identifier_spans(sql)
+                .into_iter()
+                .map(|span| sql[span].to_string())
+                .collect()
+        };
+        assert_eq!(spans("\"a\" + \"b\""), vec!["\"a\"", "\"b\""]);
+        assert_eq!(spans("\"a\"\"b\" / 2"), vec!["\"a\"\"b\""]);
+        assert_eq!(spans("'\"a\"' || \"b\""), vec!["\"b\""]);
+        assert_eq!(
+            spans("'it''s \"a\"' || $$\"c\"$$ || $t$\"d\"$t$"),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            spans("\"a\" -- \"b\"\n/* \"c\" */ \"d\""),
+            vec!["\"a\"", "\"d\""]
+        );
+        assert_eq!(spans("$1 + \"a\""), vec!["\"a\""]);
+        assert_eq!(spans("\"it's\" || 'x'"), vec!["\"it's\""]);
     }
 }

@@ -1950,3 +1950,112 @@ fn nested_integer_sum_is_read_as_the_type_sum_returns() {
         "ROUND((__sum_v / NULLIF(__count_v, 0)), 2)"
     );
 }
+
+// ---- Typed reads and counter substitution leave string literals as written ----
+
+#[test]
+fn nested_sum_cast_leaves_a_literal_spelling_the_read_as_written() {
+    let mut plan = plan_from_sql(
+        "SELECT g, CASE WHEN SUM(v) > 0 THEN 'THEN \"__sum_v\" END' ELSE 'x' END AS lit, \
+         COALESCE(SUM(v) / 2, 0) || $tag$THEN \"__sum_v\" END$tag$ AS dollar \
+         FROM t GROUP BY g",
+    );
+    plan.read_nested_sum_as("__sum_v", "BIGINT");
+    assert_eq!(
+        mapping_expr(&plan, "lit"),
+        "CASE WHEN (CASE WHEN \"__nonnull_count_v\" > 0 THEN \"__sum_v\"::BIGINT END) > 0 \
+         THEN 'THEN \"__sum_v\" END' ELSE 'x' END"
+    );
+    assert_eq!(
+        mapping_expr(&plan, "dollar"),
+        "COALESCE((CASE WHEN \"__nonnull_count_v\" > 0 THEN \"__sum_v\"::BIGINT END) / 2, 0) \
+         || $tag$THEN \"__sum_v\" END$tag$"
+    );
+}
+
+#[test]
+fn elided_counter_substitution_leaves_a_literal_naming_the_counter_as_written() {
+    let not_null: std::collections::HashSet<String> =
+        ["v".to_string(), "b".to_string()].into_iter().collect();
+    let mut plan = plan_from_sql(
+        "SELECT g, CASE WHEN SUM(v) > 0 THEN '\"__nonnull_count_v\"' ELSE 'x' END AS s, \
+         CASE WHEN BOOL_OR(b) THEN '\"__bool_or_b_nonnull_count\"' ELSE 'n' END AS o \
+         FROM t GROUP BY g",
+    );
+    plan.optimize_not_null_sums(&not_null);
+    assert_eq!(
+        mapping_expr(&plan, "s"),
+        "CASE WHEN (CASE WHEN \"__ivm_count\" > 0 THEN \"__sum_v\" END) > 0 \
+         THEN '\"__nonnull_count_v\"' ELSE 'x' END"
+    );
+    assert_eq!(
+        mapping_expr(&plan, "o"),
+        "CASE WHEN (CASE WHEN \"__ivm_count\" > 0 THEN \"__bool_or_b_true_count\" > 0 ELSE NULL END) \
+         THEN '\"__bool_or_b_nonnull_count\"' ELSE 'n' END"
+    );
+}
+
+#[test]
+fn nested_integer_extremum_is_read_as_the_type_the_aggregate_returns() {
+    let mut plan = plan_from_sql(
+        "SELECT g, MAX(v * 3) AS top, MAX(v * 3) / 2 AS half, \
+         (MAX(v * 3) / 2)::text || '\"__max_v_3\"' AS lit, MAX(w) / 2 AS other \
+         FROM t GROUP BY g",
+    );
+    plan.read_nested_extremum_as("__max_v_3", "INTEGER");
+    assert_eq!(mapping_expr(&plan, "top"), "__max_v_3");
+    assert_eq!(mapping_expr(&plan, "half"), "\"__max_v_3\"::INTEGER / 2");
+    assert_eq!(
+        mapping_expr(&plan, "lit"),
+        "(\"__max_v_3\"::INTEGER / 2)::TEXT || '\"__max_v_3\"'"
+    );
+    assert_eq!(mapping_expr(&plan, "other"), "\"__max_w\" / 2");
+}
+
+#[test]
+fn column_reads_are_whole_identifiers_outside_literals() {
+    let cast = |expr: &str| {
+        rewrite_column_reads(expr, "__max_v", |_, _| {
+            Some("\"__max_v\"::INTEGER".to_string())
+        })
+    };
+    assert_eq!(cast("\"__max_v\" / 2"), "\"__max_v\"::INTEGER / 2");
+    assert_eq!(
+        cast("\"__max_v\" + \"__max_v\""),
+        "\"__max_v\"::INTEGER + \"__max_v\"::INTEGER"
+    );
+    for untouched in [
+        "'\"__max_v\"'",
+        "'it''s \"__max_v\"'",
+        "E'\\' \"__max_v\"'",
+        "$$\"__max_v\"$$",
+        "$tag$\"__max_v\"$tag$",
+        "\"k\"\"__max_v\"",
+        "\"__max_v\"\"k\"",
+        "\"__max_v2\" / 2",
+        "__max_v / 2",
+    ] {
+        assert_eq!(cast(untouched), untouched);
+    }
+    assert_eq!(
+        cast("'\"__max_v\"' || \"__max_v\" || $$\"__max_v\"$$"),
+        "'\"__max_v\"' || \"__max_v\"::INTEGER || $$\"__max_v\"$$"
+    );
+    let keep_all = rewrite_column_reads("\"__max_v\" / 2", "__max_v", |_, _| None);
+    assert_eq!(keep_all, "\"__max_v\" / 2");
+}
+
+#[test]
+fn redirected_counter_leaves_a_literal_naming_it_as_written() {
+    let mut plan = plan_from_sql(
+        "SELECT g, SUM(v) AS s, \
+         CASE WHEN SUM(v * COALESCE(w, 1)) > 0 THEN '\"__nonnull_count_v_coalesce_w_1\"' ELSE 'x' END AS r \
+         FROM t GROUP BY g",
+    );
+    plan.optimize_not_null_sums(&std::collections::HashSet::new());
+    assert_eq!(
+        mapping_expr(&plan, "r"),
+        "CASE WHEN (CASE WHEN \"__nonnull_count_v\" > 0 THEN \"__sum_v_coalesce_w_1\" END) > 0 \
+         THEN '\"__nonnull_count_v_coalesce_w_1\"' ELSE 'x' END"
+    );
+}
