@@ -1151,13 +1151,11 @@ pub(crate) fn null_safe_in_gated(
 /// Used by `build_min_max_recompute_sql` to push an affected-groups filter
 /// through the base-query aggregation boundary so the source scan is scoped.
 pub(crate) fn splice_before_group_by(query: &str, and_fragment: &str) -> Option<String> {
-    let upper = query.to_uppercase();
-    let gb_marker = " GROUP BY ";
-    let gb_pos = upper.rfind(gb_marker)?;
-
-    // Determine whether a WHERE exists between the last FROM/JOIN and GROUP BY.
-    let pre_gb_upper = &upper[..gb_pos];
-    let has_where = pre_gb_upper.contains(" WHERE ");
+    use crate::sql_writer::keyword_scan::{keyword_hits, last_keyword};
+    let gb_pos = last_keyword(query, " GROUP BY ")?;
+    let has_where = keyword_hits(&query[..gb_pos], " WHERE ")
+        .iter()
+        .any(|hit| hit.depth == 0);
 
     let fragment = if has_where {
         and_fragment.to_string()
@@ -1201,9 +1199,7 @@ pub(crate) fn inject_affected_filter_before_group_by(
     outer_qualifier: &str,
     not_null_columns: &std::collections::HashSet<String>,
 ) -> Option<String> {
-    let upper = end_query.to_uppercase();
-    let gb_marker = " GROUP BY ";
-    let pos = upper.rfind(gb_marker)?;
+    let pos = crate::sql_writer::keyword_scan::last_keyword(end_query, " GROUP BY ")?;
     let filter = null_safe_in(
         affected_tbl,
         outer_qualifier,
@@ -1237,9 +1233,7 @@ pub(crate) fn inject_affected_filter_before_group_by_gated(
     outer_qualifier: &str,
     not_null_columns: &std::collections::HashSet<String>,
 ) -> Option<Vec<String>> {
-    let upper = end_query.to_uppercase();
-    let gb_marker = " GROUP BY ";
-    let pos = upper.rfind(gb_marker)?;
+    let pos = crate::sql_writer::keyword_scan::last_keyword(end_query, " GROUP BY ")?;
     let m = null_safe_in_gated(
         affected_tbl,
         outer_qualifier,
