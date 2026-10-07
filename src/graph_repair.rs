@@ -21,7 +21,7 @@
 use pgrx::prelude::*;
 
 /// Fixpoint iteration cap for `graph_depth`. The cap exists so a cycle — which create-time rejects, but a
-/// hand-edited registry could hold — terminates instead of spinning.
+/// hand-edited registry could hold — terminates instead of spinning. Real chains are a handful of levels deep, so 20 is ample.
 const MAX_DEPTH_PASSES: i32 = 20;
 
 /// Rebuild `is_generated_sub_imv`, `depends_on_imv`, `graph_child` and

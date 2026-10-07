@@ -34,7 +34,7 @@ use crate::validate_view_name;
 ///
 /// Gated on [`crate::sql_writer::registry::owns_intermediate`] — the same predicate
 /// the audit classifies with — so it cannot build an intermediate for a passthrough
-/// IMV or a decomposed wrapper (the audit must not report an intermediate such an IMV never owns).
+/// IMV or a decomposed wrapper (building one would create an intermediate the audit does not expect such an IMV to own).
 ///
 /// Two INDEPENDENT probes, in build order: the intermediate first, then the
 /// group-capture companions — which a CTAS leaves with no catalog dependency on

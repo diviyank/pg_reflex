@@ -161,6 +161,7 @@ pub(crate) fn reflex_compact_all_imv_impl() -> String {
 /// Backfills IMVs created before the filter-aware spurious-skip metadata
 /// existed. Also useful after an analyzer extension shifts what falls into
 /// either map.
+///
 /// Returns a status string for telemetry.
 pub(crate) fn reflex_rebuild_imv_metadata_impl(view_name: &str) -> String {
     if let Err(msg) = validate_view_name(view_name) {
