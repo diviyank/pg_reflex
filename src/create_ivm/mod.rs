@@ -88,7 +88,7 @@ pub(crate) struct BuildContext<'a> {
 /// (`try_decompose_set_op`, `try_decompose_ctes`, `try_decompose_distinct_on`).
 ///
 /// One struct so threading a new field reaches every path uniformly — a path
-/// cannot silently lack one (this is exactly how Bug 2 happened).
+/// cannot silently lack one.
 pub(crate) struct DecomposeCtx<'a> {
     view_name: &'a str,
     sql: &'a str,
@@ -190,8 +190,7 @@ fn validate_and_parse_inputs(
 /// can safely match with a sargable `=`/`IN` versus which need the NULL-safe
 /// `IS NOT DISTINCT FROM` form (`(NULL) IN (...)` is never TRUE, so a wrongly
 /// "safe" column would leave a phantom target row on DELETE and abort the
-/// source UPDATE with a unique-index violation — 2026-07-25 untreated_bugs
-/// report). This is persisted to the registry the same way aggregate GROUP BY
+/// source UPDATE with a unique-index violation). This is persisted to the registry the same way aggregate GROUP BY
 /// inference is, so a later trigger regeneration reads the same set.
 fn resolve_unique_columns(ctx: &mut BuildContext) {
     if !ctx.plan.is_passthrough {
@@ -591,7 +590,7 @@ fn resolve_partitioning(ctx: &mut BuildContext) -> Result<(), String> {
                     ))
                     .to_string());
                 }
-                // Phase B (plans/partitioning_3.md §2): reject when the
+                // Reject when the
                 // matching GROUP BY entry is a computed expression rather
                 // than a bare column reference.  We look up the AST string
                 // that produced this `partition_by` column — either the
@@ -717,7 +716,7 @@ fn resolve_partitioning(ctx: &mut BuildContext) -> Result<(), String> {
             }
         }
     } else {
-        // Phase 5 + depth-prune: auto-mirror when exactly one real source is
+        // Auto-mirror with depth pruning: when exactly one real source is
         // partitioned. Walk levels top-down; keep a level while its partition
         // column is a bare projected output column; stop at the first that is
         // not. The kept prefix length is the mirror depth.
@@ -819,13 +818,13 @@ fn resolve_existing_imv_deps(client: &mut pgrx::spi::SpiClient<'_>, ctx: &mut Bu
     // The probe must compare canonical names, not raw ones. A CTE-decomposed
     // sub-IMV source is persisted double-quoted (`"schema"."view__cte_x"`) to
     // preserve identifier case, while the registry `name` is whatever the caller
-    // passed `create_reflex_ivm` — never quoted. Comparing raw strings therefore
-    // never matched a generated child, which left `depends_on_imv` and the
-    // child's `graph_child` empty and collapsed `graph_depth` (PS-1 / N1).
+    // passed `create_reflex_ivm` — never quoted. Comparing raw strings would
+    // never match a generated child, leaving `depends_on_imv` and the
+    // child's `graph_child` empty and collapsing `graph_depth`.
     //
     // Only this side needs canonicalising: `canonical_source` is the identity on
     // an unquoted bare or schema-qualified name, so routing through it strictly
-    // widens the match and cannot un-match a source that matched before.
+    // widens the match and cannot un-match a source that matches by raw name.
     //
     // `ctx.froms` itself is deliberately left alone — the quoted spelling stored
     // in `depends_on` is load-bearing for the drop-time prefix scan, for the
@@ -986,7 +985,7 @@ fn materialize_passthrough(client: &mut pgrx::spi::SpiClient<'_>, ctx: &mut Buil
             .update(&format!("DROP TABLE {}", scratch_name), None, &[])
             .unwrap_or_report();
         // Root table partitions only on the first column; deeper levels are
-        // handled by building child nodes below (lines 884-896).
+        // handled by building child nodes below.
         let root_partition_cols = if ctx.plan.partition_columns.len() > 1 {
             vec![ctx.plan.partition_columns[0].clone()]
         } else {
@@ -1364,9 +1363,8 @@ fn install_source_triggers(client: &mut pgrx::spi::SpiClient<'_>, ctx: &BuildCon
 /// Read the ordered list of live column names for `source_table` from
 /// `pg_attribute`.  Used at deferred-trigger DDL time so the trigger body
 /// can name the columns it stages instead of relying on `SELECT *`'s
-/// positional binding (which broke when a per-source staging delta
-/// outlived a source DROP+CREATE that reordered columns — see the 1.6.2
-/// regression in `pg_test_deferred.rs`).
+/// positional binding (which breaks when a per-source staging delta
+/// outlives a source DROP+CREATE that reordered columns).
 fn fetch_source_columns(client: &pgrx::spi::SpiClient<'_>, source_table: &str) -> Vec<String> {
     client
         .select(
@@ -1601,7 +1599,7 @@ fn index_covers_prefix(client: &mut SpiClient<'_>, view: &str, cols: &[String]) 
 }
 
 /// Auto-create an index on the IMV for each passthrough secondary's join-key
-/// columns, so the keyed secondary DELETE (audit #3) is index-served (per-leaf
+/// columns, so the keyed secondary DELETE is index-served (per-leaf
 /// on a partitioned IMV). Skipped when an existing index already covers the
 /// columns as a leading prefix — including the `__reflex_uk_*` unique key, which
 /// covers the primary source's full key, so the key-owner mapping is naturally
@@ -1638,7 +1636,7 @@ fn install_secondary_key_indexes(client: &mut SpiClient<'_>, ctx: &BuildContext)
     }
 }
 
-/// PS-3 per-node verdict: TRUE iff the node has at least one real source and
+/// Per-node verdict: TRUE iff the node has at least one real source and
 /// *every* real source is a materialized view. A real source is an entry of
 /// `ctx.froms` that is neither a `<subquery:>` / `<function:>` placeholder nor an
 /// ignored source. Such a node cannot self-maintain — PG fires no trigger on a
@@ -1859,10 +1857,10 @@ fn initial_aggregate_materialization(client: &mut SpiClient<'_>, ctx: &mut Build
     }
 
     // Create the persistent affected-groups table (avoids DROP+CREATE per trigger
-    // fire) and, for top-K MIN/MAX plans, the shrunk-groups capture table (N1:
-    // scopes the forced recompute to groups whose heap actually shrank below K).
-    // Both UNLOGGED for speed — lost on crash, rebuilt by reflex_reconcile — and
-    // co-located in the IMV's schema (1.4.1) so SQL works under any `search_path`.
+    // fire) and, for top-K MIN/MAX plans, the shrunk-groups capture table (scopes
+    // the forced recompute to groups whose heap actually shrank below K).
+    // Both UNLOGGED for speed — lost on crash, rebuilt by reflex_reconcile —
+    // and co-located in the IMV's schema so SQL works under any `search_path`.
     // Emitted by the shared builder so reconcile's heal step cannot drift from
     // create time.
     for (_, ddl) in crate::schema_builder::build_group_capture_ddl(ctx.view_name, &ctx.plan) {
@@ -1884,11 +1882,10 @@ fn initial_aggregate_materialization(client: &mut SpiClient<'_>, ctx: &mut Build
     // Structural NOT-NULL inference. Promote group-by / distinct columns that
     // are *provably* non-NULL from the query (INNER-join equi-keys or catalog
     // NOT-NULL base columns on a non-nullable side), so MERGE maintenance can
-    // match keys with `=` instead of `IS NOT DISTINCT FROM` — the index-defeating
-    // 405 s yse.ivm_sop_forecast_view regression in 1.4.4. Unlike the former
-    // data-probe this never trusts transient null-freeness, so a later NULL on a
-    // genuinely nullable / outer-join column cannot silently drop rows
-    // (docs/fuzz-findings.md findings #1 and #3).
+    // match keys with `=` instead of `IS NOT DISTINCT FROM`, which defeats
+    // indexes. Unlike a data probe this never trusts transient null-freeness, so a
+    // later NULL on a genuinely nullable / outer-join column cannot silently drop
+    // rows.
     let probed_nn = infer_not_null_columns(client, &ctx.plan, Some(&ctx.analysis));
     let new_cols: Vec<String> = probed_nn
         .into_iter()
@@ -2021,7 +2018,7 @@ pub(crate) fn create_reflex_ivm_impl_with_materialization(
 
     warn_on_bare_name_under_nonpublic_search_path(view_name);
 
-    // A1: refuse an ignore whose source can determine this IMV's contents. Such
+    // Refuse an ignore whose source can determine this IMV's contents. Such
     // an IMV is silently invalidated by a change it will never see, and a later
     // rebuild from the base query makes the divergence permanent. Runs before
     // any DDL and before decomposition, so a CTE query is judged as written
@@ -2155,7 +2152,7 @@ pub(crate) fn create_reflex_ivm_impl_with_materialization(
     // all carry the qualified `schema.table` form of the relation the trigger
     // is actually attached to. Without this, a bare `FROM foo` whose
     // search_path-resolved schema is e.g. `alp.foo` flows through unqualified;
-    // `reflex_flush_deferred` (trigger.rs ~2885) later splits the schemaless
+    // `reflex_flush_deferred` later splits the schemaless
     // name, falls back to `nspname='public'`, and projects columns from a
     // public-side homonym, crashing the COMMIT-time flush.
     canonicalize_analysis_sources(&mut analysis);
@@ -2219,13 +2216,10 @@ pub(crate) fn create_reflex_ivm_impl_with_materialization(
 
     resolve_unique_columns(&mut ctx);
 
-    // 1.5.3 (plans/partitioning_3.md §4) — populate per-source
-    // partition_join_paths fragments.  Skipped here for the unpartitioned
-    // / passthrough cases; the real computation runs below once
-    // `resolved_partition_cols` is known.  (We can't run it earlier than
-    // build_source_join_keys, and we can't run it later than the catalog
-    // insert that persists `plan.aggregations`.)  This call is a no-op
-    // until the partition path resolves the partition column.
+    // Populate per-source partition_join_paths fragments. A no-op
+    // until the partition path resolves the partition column; it cannot run
+    // earlier than build_source_join_keys nor later than the catalog
+    // insert that persists `plan.aggregations`.
     populate_source_join_keys(&mut ctx);
     if let Some(column) = ungrouped_non_aggregate_column(&ctx) {
         return crate::reflex_reject(&format!(
@@ -2333,7 +2327,7 @@ pub(crate) fn keyless_immediate_warning(
 
 mod admin;
 mod decompose;
-/// A1 create-time `ignore_sources` soundness check. Crate-visible because the
+/// `ignore_sources` create-time soundness check. Crate-visible because the
 /// `ignore-soundness` audit check calls `unsound_ignored_sources` from
 /// `crate::audit` rather than re-implementing the resolver.
 pub(crate) mod ignore_soundness;

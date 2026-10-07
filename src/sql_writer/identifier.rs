@@ -1,12 +1,11 @@
 //! Canonical identifier handling for pg_reflex.
 //!
 //! Centralises the quoting, NAMEDATALEN truncation, schema split, and
-//! word-boundary identifier rewriting that used to live (in subtly different
-//! shapes) across `query_decomposer.rs`, `partition.rs`, and `trigger.rs`.
+//! word-boundary identifier rewriting so that callers share one implementation
+//! instead of subtly different copies.
 //!
 //! Every helper here is deliberately small and pure so callers can compose
-//! them. The four pre-1.6.1 rewriters now collapse to this file:
-//!
+//! them. The rewriters:
 //! - [`replace_identifier`] — case-sensitive word-boundary substitution.
 //!   Skips matches that follow `AS ` (output aliases, not table refs).
 //! - [`strip_redundant_bare_alias`] — strips a redundant `AS <bare>` clause
