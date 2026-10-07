@@ -35,6 +35,9 @@ pub(crate) struct ParsedInputs {
     mode_upper: String,
     parsed_sql: Vec<sqlparser::ast::Statement>,
     analysis: crate::sql_analyzer::SqlAnalysis,
+    /// Aggregates pg_reflex does not decompose, accepted because the query is a
+    /// single-level passthrough. Only a keyless one recomputes them on every write.
+    keyless_only_aggregates: Vec<String>,
 }
 
 /// Pipeline state shared across phases of `create_reflex_ivm_impl`. Owns the
@@ -146,7 +149,7 @@ fn validate_and_parse_inputs(
             return Err(crate::reflex_reject(&format!("Failed to parse SQL: {}", e)));
         }
     };
-    let analysis = match analyze(&parsed_sql) {
+    let (analysis, keyless_only_aggregates) = match analyze(&parsed_sql) {
         Err(SqlAnalysisError::MultipleQueries(_)) => {
             return Err(crate::reflex_reject("Expected 1 query, got multiple"));
         }
@@ -157,13 +160,14 @@ fn validate_and_parse_inputs(
             if let Some(reason) = a.unsupported_reason() {
                 return Err(crate::reflex_reject(&reason));
             }
-            if let Some(reason) = function_contract_violation(view_name, &a) {
-                return Err(crate::reflex_reject(&reason));
-            }
+            let keyless_only_aggregates = match check_function_contract(view_name, &a) {
+                Ok(aggregates) => aggregates,
+                Err(reason) => return Err(crate::reflex_reject(&reason)),
+            };
             if let Some(message) = timezone_sensitivity_warning(view_name, &a) {
                 warning!("{message}");
             }
-            a
+            (a, keyless_only_aggregates)
         }
     };
     Ok(ParsedInputs {
@@ -173,6 +177,7 @@ fn validate_and_parse_inputs(
         mode_upper,
         parsed_sql,
         analysis,
+        keyless_only_aggregates,
     })
 }
 
@@ -357,26 +362,71 @@ pub(crate) fn timezone_sensitivity_warning(
 
 const SUPPORTED_AGGREGATES: [&str; 6] = ["sum", "count", "avg", "min", "max", "bool_or"];
 
-/// The catalog matches by name across every overload and schema: argument types are
-/// unknown here, and accepting a volatile call is the direction that corrupts an IMV.
-fn function_contract_violation(
+const LISTED_VOLATILE_SIGNATURES: usize = 3;
+
+fn unsupported_aggregates_message(aggregates: &[String]) -> String {
+    format!(
+        "Unsupported aggregate(s): {}. Supported: SUM, COUNT, AVG, MIN, MAX, BOOL_OR",
+        aggregates.join(", ")
+    )
+}
+
+fn listed_signatures(signatures: &[String]) -> String {
+    let mut listed = signatures
+        .iter()
+        .take(LISTED_VOLATILE_SIGNATURES)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    if signatures.len() > LISTED_VOLATILE_SIGNATURES {
+        listed.push_str(&format!(
+            " and {} more",
+            signatures.len() - LISTED_VOLATILE_SIGNATURES
+        ));
+    }
+    listed
+}
+
+/// `Ok` carries the aggregates pg_reflex does not decompose that the query may still
+/// use, provided the IMV ends up keyless (see `keyed_keyless_only_aggregate`).
+fn check_function_contract(
     view_name: &str,
     analysis: &crate::sql_analyzer::SqlAnalysis,
-) -> Option<String> {
-    let called: Vec<String> = analysis
-        .called_functions
-        .iter()
-        .map(|f| f.name.clone())
-        .collect();
-    let (volatile, aggregates) = catalog_function_kinds(&called);
-    if let Some(first) = volatile.first() {
-        return Some(format!(
-            "Volatile function(s) {} are not supported in IMV '{view_name}'. Fix: if a function \
-             is in fact deterministic, declare it with ALTER FUNCTION {first}(...) IMMUTABLE \
-             (or STABLE); otherwise remove it from the IMV query, or compute the value into a \
-             source column. A volatile function returns a different result on each call, so \
-             the IMV would diverge from its own query.",
-            volatile.join(", ")
+) -> Result<Vec<String>, String> {
+    let CatalogFunctionKinds {
+        volatile,
+        volatile_signatures,
+        alterable_volatile_signatures,
+        aggregates,
+    } = catalog_function_kinds(&analysis.function_references);
+    if !volatile_signatures.is_empty() {
+        let builtin_signatures: Vec<String> = volatile_signatures
+            .iter()
+            .filter(|signature| !alterable_volatile_signatures.contains(signature))
+            .cloned()
+            .collect();
+        let alter_remedy = alterable_volatile_signatures
+            .first()
+            .map(|first| {
+                format!("if deterministic, run ALTER FUNCTION {first} IMMUTABLE (or STABLE); otherwise ")
+            })
+            .unwrap_or_default();
+        let builtin_note = if builtin_signatures.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " {} is a volatile built-in and cannot be used in an IMV.",
+                listed_signatures(&builtin_signatures)
+            )
+        };
+        return Err(format!(
+            "Volatile function(s) {} in IMV '{view_name}': {}. Fix: {alter_remedy}remove \
+             it from the IMV query, or compute the value into a source column.{builtin_note} \
+             An unqualified call is matched by name in every schema and for every overload, a \
+             schema-qualified call in that schema only. A volatile function returns a \
+             different result on each call, so the IMV would diverge from its own query.",
+            volatile.join(", "),
+            listed_signatures(&volatile_signatures)
         ));
     }
     let unsupported: Vec<String> = aggregates
@@ -384,13 +434,41 @@ fn function_contract_violation(
         .filter(|name| !SUPPORTED_AGGREGATES.contains(&name.as_str()))
         .map(|name| name.to_uppercase())
         .collect();
-    if !unsupported.is_empty() {
-        return Some(format!(
-            "Unsupported aggregate(s): {}. Supported: SUM, COUNT, AVG, MIN, MAX, BOOL_OR",
-            unsupported.join(", ")
-        ));
+    if !unsupported.is_empty() && !is_single_level_passthrough(analysis) {
+        return Err(unsupported_aggregates_message(&unsupported));
     }
-    None
+    Ok(unsupported)
+}
+
+/// A keyed passthrough is maintained row by row from the transition tables, which
+/// cannot maintain an aggregate. The key is the one `resolve_unique_columns` settled on.
+fn keyed_keyless_only_aggregate(
+    ctx: &BuildContext,
+    keyless_only_aggregates: &[String],
+) -> Option<String> {
+    if keyless_only_aggregates.is_empty() || ctx.resolved_unique_columns.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "{}. Another aggregate is accepted only without GROUP BY in an IMV with no unique \
+         key, which recomputes it on every write; this one would be keyed on ({}). Fix: do \
+         not pass unique_columns, and do not name an output column like a primary key \
+         column of the source.",
+        unsupported_aggregates_message(keyless_only_aggregates),
+        ctx.resolved_unique_columns.join(", ")
+    ))
+}
+
+/// One SELECT with no nested query that the planner maintains as a passthrough: no
+/// GROUP BY and no aggregate it decomposes. Every write recomputes such an IMV from its
+/// own query, so an aggregate pg_reflex cannot decompose is still evaluated by PostgreSQL.
+fn is_single_level_passthrough(analysis: &crate::sql_analyzer::SqlAnalysis) -> bool {
+    analysis.set_operation.is_none()
+        && !analysis.has_nested_query
+        && !analysis.has_distinct_on
+        && !analysis.has_window_function
+        && analysis.having_clause.is_none()
+        && plan_aggregation(analysis).is_passthrough
 }
 
 /// A non-aggregate SELECT item beside aggregates, with no GROUP BY to key it on.
@@ -408,48 +486,112 @@ fn ungrouped_non_aggregate_column(ctx: &BuildContext) -> Option<String> {
         .map(|col| col.alias.clone().unwrap_or_else(|| col.expr_sql.clone()))
 }
 
-/// Names among `called` that the catalog knows as (volatile functions, aggregates with
-/// no plain function of the same name). Both sides fold ASCII only, as PostgreSQL does
-/// for identifiers, so a name with a non-ASCII upper-case letter still matches.
-fn catalog_function_kinds(called: &[String]) -> (Vec<String>, Vec<String>) {
+struct CatalogFunctionKinds {
+    /// Bare names with at least one volatile plain function among the matched ones.
+    volatile: Vec<String>,
+    /// Those volatile functions as `regprocedure` text: quoted and schema-qualified
+    /// for the caller's `search_path`, so it can be pasted into `ALTER FUNCTION`.
+    volatile_signatures: Vec<String>,
+    /// Those of `volatile_signatures` outside `pg_catalog`, which the user can relabel.
+    alterable_volatile_signatures: Vec<String>,
+    /// Bare names matched by aggregates only, with no plain function of the same name.
+    aggregates: Vec<String>,
+}
+
+/// An unqualified call matches by name across every schema and overload: argument
+/// types are unknown here, and accepting a volatile call is the direction that
+/// corrupts an IMV. A schema-qualified call matches in that schema only, unless no
+/// such schema exists, where it matches everywhere again. Names fold ASCII only on
+/// both sides, as PostgreSQL does for identifiers, so a name with a non-ASCII
+/// upper-case letter still matches.
+fn catalog_function_kinds(
+    called: &[crate::sql_analyzer::FunctionReference],
+) -> CatalogFunctionKinds {
+    let mut kinds = CatalogFunctionKinds {
+        volatile: Vec::new(),
+        volatile_signatures: Vec::new(),
+        alterable_volatile_signatures: Vec::new(),
+        aggregates: Vec::new(),
+    };
     if called.is_empty() {
-        return (Vec::new(), Vec::new());
+        return kinds;
     }
-    let names = crate::sql_writer::identifier::format_pg_text_array(called);
-    let kinds: Vec<(String, bool, bool)> = Spi::connect(|client| {
-        client
+    let mut unqualified_names = Vec::new();
+    let mut qualified_names = Vec::new();
+    let mut qualified_schemas = Vec::new();
+    for reference in called {
+        match &reference.schema {
+            None => unqualified_names.push(reference.name.clone()),
+            Some(schema) => {
+                qualified_names.push(reference.name.clone());
+                qualified_schemas.push(schema.clone());
+            }
+        }
+    }
+    let text_array = |values: &[String]| unsafe {
+        DatumWithOid::new(
+            crate::sql_writer::identifier::format_pg_text_array(values),
+            PgBuiltInOids::TEXTOID.oid().value(),
+        )
+    };
+    Spi::connect(|client| {
+        let rows = client
             .select(
-                "SELECT lower(proname::text COLLATE \"C\") AS name, \
-                        bool_or(prokind = 'f' AND provolatile = 'v') AS is_volatile, \
-                        bool_or(prokind = 'a') AND NOT bool_or(prokind = 'f') AS is_aggregate_only \
-                 FROM pg_catalog.pg_proc \
-                 WHERE lower(proname::text COLLATE \"C\") = ANY($1::text[]) \
+                "SELECT lower(p.proname::text COLLATE \"C\") AS name, \
+                        bool_or(p.prokind = 'f' AND p.provolatile = 'v') AS is_volatile, \
+                        bool_or(p.prokind = 'a') AND NOT bool_or(p.prokind = 'f') AS is_aggregate_only, \
+                        COALESCE(array_agg(p.oid::regprocedure::text ORDER BY p.oid::regprocedure::text) \
+                                   FILTER (WHERE p.prokind = 'f' AND p.provolatile = 'v'), \
+                                 '{}'::text[]) AS volatile_signatures, \
+                        COALESCE(array_agg(p.oid::regprocedure::text ORDER BY p.oid::regprocedure::text) \
+                                   FILTER (WHERE p.prokind = 'f' AND p.provolatile = 'v' \
+                                             AND n.nspname <> 'pg_catalog'), \
+                                 '{}'::text[]) AS alterable_volatile_signatures \
+                 FROM pg_catalog.pg_proc p \
+                 JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace \
+                 WHERE lower(p.proname::text COLLATE \"C\") = ANY($1::text[]) \
+                    OR EXISTS ( \
+                         SELECT 1 FROM unnest($2::text[], $3::text[]) AS called(name, schema_name) \
+                         WHERE called.name = lower(p.proname::text COLLATE \"C\") \
+                           AND (called.schema_name = n.nspname::text \
+                                OR NOT EXISTS (SELECT 1 FROM pg_catalog.pg_namespace known \
+                                               WHERE known.nspname::text = called.schema_name))) \
                  GROUP BY 1 ORDER BY 1",
                 None,
-                &[unsafe { DatumWithOid::new(names, PgBuiltInOids::TEXTOID.oid().value()) }],
+                &[
+                    text_array(&unqualified_names),
+                    text_array(&qualified_names),
+                    text_array(&qualified_schemas),
+                ],
             )
-            .unwrap_or_report()
-            .filter_map(|row| {
-                Some((
-                    row.get_by_name::<String, _>("name").unwrap_or(None)?,
-                    row.get_by_name::<bool, _>("is_volatile").unwrap_or(None)?,
-                    row.get_by_name::<bool, _>("is_aggregate_only")
-                        .unwrap_or(None)?,
-                ))
-            })
-            .collect()
+            .unwrap_or_report();
+        for row in rows {
+            let Some(name) = row.get_by_name::<String, _>("name").unwrap_or(None) else {
+                continue;
+            };
+            if row.get_by_name::<bool, _>("is_volatile").unwrap_or(None) == Some(true) {
+                kinds.volatile.push(name.clone());
+            }
+            if row
+                .get_by_name::<bool, _>("is_aggregate_only")
+                .unwrap_or(None)
+                == Some(true)
+            {
+                kinds.aggregates.push(name);
+            }
+            kinds.volatile_signatures.extend(
+                row.get_by_name::<Vec<String>, _>("volatile_signatures")
+                    .unwrap_or(None)
+                    .unwrap_or_default(),
+            );
+            kinds.alterable_volatile_signatures.extend(
+                row.get_by_name::<Vec<String>, _>("alterable_volatile_signatures")
+                    .unwrap_or(None)
+                    .unwrap_or_default(),
+            );
+        }
     });
-    let names_where = |keep: fn(&(String, bool, bool)) -> bool| -> Vec<String> {
-        kinds
-            .iter()
-            .filter(|kind| keep(kind))
-            .map(|(name, _, _)| name.clone())
-            .collect()
-    };
-    (
-        names_where(|(_, is_volatile, _)| *is_volatile),
-        names_where(|(_, _, is_aggregate_only)| *is_aggregate_only),
-    )
+    kinds
 }
 
 /// Is an IMV of this name already in the registry? One definition, shared by
@@ -2144,6 +2286,7 @@ pub(crate) fn create_reflex_ivm_impl_with_materialization(
         mode_upper,
         parsed_sql,
         mut analysis,
+        keyless_only_aggregates,
     } = parsed;
 
     // Resolve every bare source against the current `search_path` so the
@@ -2215,6 +2358,9 @@ pub(crate) fn create_reflex_ivm_impl_with_materialization(
     };
 
     resolve_unique_columns(&mut ctx);
+    if let Some(reason) = keyed_keyless_only_aggregate(&ctx, &keyless_only_aggregates) {
+        return crate::reflex_reject(&reason);
+    }
 
     // Populate per-source partition_join_paths fragments. A no-op
     // until the partition path resolves the partition column; it cannot run
@@ -2224,8 +2370,8 @@ pub(crate) fn create_reflex_ivm_impl_with_materialization(
     if let Some(column) = ungrouped_non_aggregate_column(&ctx) {
         return crate::reflex_reject(&format!(
             "'{column}' is not an aggregate expression that pg_reflex supports and is not a \
-             group key: the query has no GROUP BY. Fix: add it to a GROUP BY clause, or select \
-             it in an outer passthrough layer over a CTE that holds the aggregates."
+             group key: the query has no GROUP BY. Fix: select it in an outer passthrough layer \
+             over a CTE that holds the aggregates, or add it to a GROUP BY clause."
         ));
     }
 

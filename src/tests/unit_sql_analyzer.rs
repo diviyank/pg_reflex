@@ -1392,3 +1392,94 @@ fn bare_function_name_folds_ascii_only() {
     assert_eq!(bare_name_of_call("\"zz_ÉVOL\""), "zz_Évol");
     assert_eq!(bare_name_of_call("zz_ÈVol2"), "zz_Èvol2");
 }
+
+#[test]
+fn nested_queries_are_detected_wherever_they_appear() {
+    for sql in [
+        "WITH c AS (SELECT id FROM t) SELECT id FROM c",
+        "SELECT id FROM (SELECT id FROM t) d",
+        "SELECT id FROM t WHERE v > (SELECT max(v) FROM u)",
+        "SELECT id FROM t WHERE g IN (SELECT g FROM u)",
+        "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.id = t.id)",
+        "SELECT id, (SELECT max(v) FROM u) AS m FROM t",
+    ] {
+        assert!(parse_and_analyze(sql).has_nested_query, "{sql}");
+    }
+    for sql in [
+        "SELECT id FROM t",
+        "SELECT g, SUM(v) FROM t JOIN u ON u.id = t.id WHERE v > 1 GROUP BY g HAVING SUM(v) > 0",
+        "SELECT id FROM t UNION ALL SELECT id FROM u",
+    ] {
+        assert!(!parse_and_analyze(sql).has_nested_query, "{sql}");
+    }
+}
+
+#[test]
+fn function_references_carry_the_schema_as_postgres_resolves_it() {
+    let a = parse_and_analyze(
+        "SELECT upper(g), pg_catalog.upper(g), S1.f(v), \"S1\".f(v), db.\"Sch\".\"F\"(v), s1.f(v, v) FROM t",
+    );
+    let references: Vec<(Option<&str>, &str)> = a
+        .function_references
+        .iter()
+        .map(|r| (r.schema.as_deref(), r.name.as_str()))
+        .collect();
+    assert_eq!(
+        references,
+        vec![
+            (None, "upper"),
+            (Some("pg_catalog"), "upper"),
+            (Some("s1"), "f"),
+            (Some("S1"), "f"),
+            (Some("Sch"), "f"),
+        ]
+    );
+}
+
+#[test]
+fn keyword_pseudo_functions_are_unqualified_references() {
+    let a = parse_and_analyze("SELECT id, CURRENT_DATE AS d FROM t");
+    assert_eq!(
+        a.function_references,
+        vec![FunctionReference {
+            schema: None,
+            name: "current_date".to_string()
+        }]
+    );
+}
+
+#[test]
+fn clock_names_match_only_unqualified_or_pg_catalog_calls() {
+    for sql in [
+        "SELECT id, now() AS x FROM t",
+        "SELECT id, pg_catalog.now() AS x FROM t",
+        "SELECT id, PG_CATALOG.NOW() AS x FROM t",
+        "SELECT id, \"pg_catalog\".\"now\"() AS x FROM t",
+        "SELECT id, db.pg_catalog.now() AS x FROM t",
+        "SELECT id, CURRENT_TIMESTAMP AS x FROM t",
+        "SELECT id, LOCALTIME AS x FROM t",
+    ] {
+        assert!(parse_and_analyze(sql).has_nondeterministic_select, "{sql}");
+    }
+    for sql in [
+        "SELECT id, s1.now() AS x FROM t",
+        "SELECT id, s1.age(v) AS x FROM t",
+        "SELECT id, \"PG_CATALOG\".random() AS x FROM t",
+    ] {
+        let a = parse_and_analyze(sql);
+        assert!(!a.has_nondeterministic_select, "{sql}");
+        assert!(a.nondeterministic_functions.is_empty(), "{sql}");
+        assert_eq!(a.function_references.len(), 1, "{sql}");
+    }
+}
+
+#[test]
+fn nondeterministic_rejection_names_each_matched_function_once() {
+    let a = parse_and_analyze(
+        "SELECT id, age(ts) AS a, now() AS n, pg_catalog.now() AS n2, s1.random() AS r FROM t",
+    );
+    assert_eq!(a.nondeterministic_functions, vec!["age", "now"]);
+    assert!(a
+        .unsupported_reason()
+        .is_some_and(|r| r.contains("Fix: remove age, now from the IMV query")));
+}

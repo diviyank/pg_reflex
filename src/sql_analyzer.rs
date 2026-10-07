@@ -97,6 +97,29 @@ pub(crate) fn bare_function_name(name: &sqlparser::ast::ObjectName) -> String {
         .unwrap_or_default()
 }
 
+/// The schema a call is qualified with, as PostgreSQL resolves it: an unquoted name
+/// folds to lower case, a quoted one is exact.
+fn function_schema(name: &sqlparser::ast::ObjectName) -> Option<String> {
+    let schema = name
+        .0
+        .len()
+        .checked_sub(2)
+        .and_then(|position| name.0[position].as_ident())?;
+    Some(if schema.quote_style.is_some() {
+        schema.value.clone()
+    } else {
+        schema.value.to_ascii_lowercase()
+    })
+}
+
+/// A called function as the catalog lookup needs it: `schema` is `None` for an
+/// unqualified call, which PostgreSQL resolves through the caller's `search_path`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FunctionReference {
+    pub schema: Option<String>,
+    pub name: String,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct CalledFunction {
     pub name: String,
@@ -178,16 +201,24 @@ pub struct SqlAnalysis {
     pub has_filter_clause: bool,
     pub has_within_group: bool,
     pub has_scalar_subquery: bool,
+    /// A CTE, derived table or subquery of any kind below the top-level query.
+    pub has_nested_query: bool,
     pub unsupported_aggregates: Vec<String>,
     pub distinct_aggregates: Vec<String>,
     pub nested_count_distinct: bool,
     /// Every non-window function call and keyword pseudo-function in the query, by bare
     /// lower-case name, once per distinct (name, argument count).
     pub called_functions: Vec<CalledFunction>,
+    /// The same calls once per distinct (schema, bare name).
+    pub function_references: Vec<FunctionReference>,
     pub has_extract: bool,
     /// Set when a clock or session-identity function is called anywhere in the
     /// query, not only in the SELECT list.
     pub has_nondeterministic_select: bool,
+    /// The clock and session-identity functions that set `has_nondeterministic_select`.
+    /// They are matched by name when unqualified or qualified with `pg_catalog`; a call
+    /// qualified with another schema is left to the catalog volatility check.
+    pub nondeterministic_functions: Vec<String>,
     /// DISTINCT ON columns (e.g., ["city"] from DISTINCT ON (city))
     pub distinct_on_columns: Vec<String>,
     /// ORDER BY expressions as strings (e.g., ["city", "val DESC"])
@@ -262,13 +293,13 @@ impl SqlAnalysis {
         // table state, producing correct results as effectively static values within
         // one statement execution. E.g., WHERE year >= (SELECT year FROM max_date_view).
         if self.has_nondeterministic_select {
-            return Some(
+            return Some(format!(
                 "Non-deterministic functions (NOW, CURRENT_TIMESTAMP, RANDOM, etc.) \
                  are not supported anywhere in the query — they would cause the IMV \
                  to drift over time without a corresponding source mutation. Fix: remove \
-                 them from the IMV query, or compute the value into a source column"
-                    .into(),
-            );
+                 {} from the IMV query, or compute the value into a source column",
+                self.nondeterministic_functions.join(", ")
+            ));
         }
         if !self.unsupported_aggregates.is_empty() {
             let names = self.unsupported_aggregates.join(", ");
@@ -301,9 +332,20 @@ impl SqlAnalysis {
         names
     }
 
-    fn record_called_function(&mut self, call: CalledFunction) {
-        if is_clock_or_session_function(&call) {
+    fn record_called_function(&mut self, call: CalledFunction, schema: Option<String>) {
+        let is_builtin_spelling = !matches!(schema.as_deref(), Some(s) if s != "pg_catalog");
+        if is_builtin_spelling && is_clock_or_session_function(&call) {
             self.has_nondeterministic_select = true;
+            if !self.nondeterministic_functions.contains(&call.name) {
+                self.nondeterministic_functions.push(call.name.clone());
+            }
+        }
+        let reference = FunctionReference {
+            schema,
+            name: call.name.clone(),
+        };
+        if !self.function_references.contains(&reference) {
+            self.function_references.push(reference);
         }
         if !self.called_functions.contains(&call) {
             self.called_functions.push(call);
@@ -313,12 +355,15 @@ impl SqlAnalysis {
 
 struct AnalysisVisitor<'a> {
     analysis: &'a mut SqlAnalysis,
+    top_level_query_seen: bool,
 }
 
 impl<'a> Visitor for AnalysisVisitor<'a> {
     type Break = ();
 
     fn pre_visit_query(&mut self, query: &Query) -> ControlFlow<()> {
+        self.analysis.has_nested_query = self.top_level_query_seen;
+        self.top_level_query_seen = true;
         if let Some(ref with) = query.with {
             if with.recursive {
                 self.analysis.has_recursive_cte = true;
@@ -373,13 +418,14 @@ impl<'a> Visitor for AnalysisVisitor<'a> {
                         self.analysis.unsupported_aggregates.push(func_name.clone());
                     }
                     if let Some(call) = called_function(f) {
-                        self.analysis.record_called_function(call);
+                        self.analysis
+                            .record_called_function(call, function_schema(&f.name));
                     }
                 }
             }
             Expr::Identifier(ident) => {
                 if let Some(call) = keyword_pseudo_function(ident) {
-                    self.analysis.record_called_function(call);
+                    self.analysis.record_called_function(call, None);
                 }
             }
             Expr::Extract { .. } => {
@@ -1476,6 +1522,7 @@ pub fn analyze(statements: &[Statement]) -> Result<SqlAnalysis, SqlAnalysisError
     // Phase 1: Visitor pass for unsupported features and source table extraction
     let mut visitor = AnalysisVisitor {
         analysis: &mut analysis,
+        top_level_query_seen: false,
     };
     let _ = query.visit(&mut visitor);
 
