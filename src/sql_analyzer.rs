@@ -1651,8 +1651,44 @@ pub fn analyze(statements: &[Statement]) -> Result<SqlAnalysis, SqlAnalysisError
         collect_imv_relevant_columns(select, &analysis.table_aliases, &analysis.sources, has_ctes);
     analysis.imv_relevant_where =
         collect_imv_relevant_where(select, &analysis.table_aliases, &analysis.sources, has_ctes);
+    disable_update_skip_for_repeated_sources(&mut analysis);
 
     Ok(analysis)
+}
+
+/// Drops the UPDATE-skip inputs of every source the query reads more than once.
+/// They are collected per spelling and per alias, so for a relation read twice
+/// they describe one of its roles: an UPDATE of a column only the other role
+/// reads would be skipped as irrelevant. Two sources sharing an unquoted bare
+/// name count as one relation, whatever their schema or quoting.
+fn disable_update_skip_for_repeated_sources(analysis: &mut SqlAnalysis) {
+    let bare_name = |source: &str| {
+        source
+            .rsplit('.')
+            .next()
+            .unwrap_or(source)
+            .trim_matches('"')
+            .to_lowercase()
+    };
+    let read_more_than_once = |source: &String| {
+        let bare = bare_name(source);
+        analysis
+            .sources
+            .iter()
+            .filter(|other| bare_name(other) == bare)
+            .count()
+            > 1
+    };
+    let repeated: Vec<String> = analysis
+        .sources
+        .iter()
+        .filter(|source| read_more_than_once(source))
+        .cloned()
+        .collect();
+    for source in repeated {
+        analysis.imv_relevant_columns.remove(&source);
+        analysis.imv_relevant_where.remove(&source);
+    }
 }
 
 #[cfg(test)]
