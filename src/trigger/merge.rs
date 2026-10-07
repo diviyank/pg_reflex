@@ -82,12 +82,12 @@ pub(crate) fn build_merge_using(
         .collect::<Vec<_>>()
         .join(" AND ");
 
-    // PS-5 — the join columns that are actually NULLABLE (the sentinel
+    // The join columns that are actually NULLABLE (the sentinel
     // `__reflex_group` is a constant, never NULL, so it is excluded and its
     // single-row MERGE is left byte-for-byte unchanged). When any exist, the
     // `ON` above is non-sargable (`IS NOT DISTINCT FROM`), which forces the
-    // MERGE into a nested loop over the whole intermediate — 20.7 ms at 200k
-    // groups / 1 delta row, and the dominant cost of the whole flush at scale.
+    // MERGE into a nested loop over the whole intermediate, the dominant cost of
+    // the whole flush at scale.
     let nullable_join_cols: Vec<&String> = join_cols
         .iter()
         .filter(|c| {
@@ -143,7 +143,7 @@ pub(crate) fn build_merge_using(
                     // UPDATE emitted by `build_topk_scalar_refresh_sql` reads
                     // `__min_x = __min_x_topk[1]` for groups whose heap
                     // survived. Calling the helper twice in a single SET
-                    // clause doubled the per-row cost.
+                    // clause would double the per-row cost.
                     let topk = ic.topk_column_name();
                     set_clauses.push(format!(
                         "\"{topk}\" = public.__reflex_array_subtract_multiset(t.\"{topk}\", d.\"{topk}\")",
@@ -242,13 +242,12 @@ pub(crate) fn build_merge_using(
         return one_merge(using_clause, &on_clause);
     }
 
-    // PS-5 — gate the MERGE into a sargable/NULL-safe pair. MERGE is NOT
+    // Gate the MERGE into a sargable/NULL-safe pair. MERGE is NOT
     // idempotent, so the target-sync trick of emitting the statement twice would
     // double-apply the delta. Instead the gate lives in the USING SOURCE: the
     // untaken variant's source yields zero rows, so neither WHEN MATCHED nor WHEN
-    // NOT MATCHED can fire. Verified for real (not just EXPLAIN): NULL-free
-    // scratch → `MERGE 1`/`MERGE 0`, NULL-keyed scratch → `MERGE 0`/`MERGE 1`,
-    // each applying the delta exactly once. See the ATOMICITY INVARIANT on
+    // NOT MATCHED can fire, so exactly one of the pair applies the delta. See
+    // the ATOMICITY INVARIANT on
     // `AffectedMatch` — the flush's per-source scratch is rebuilt (TRUNCATE +
     // INSERT) under lock within the same txn, so no writer can change its
     // NULL-ness between the two MERGEs.
@@ -454,17 +453,18 @@ pub fn build_topk_scalar_refresh_sql(
     // Scope to affected groups. `at` is a fully-formed identifier ref
     // (qualified+quoted or bare local). The scope must be NULL-safe: a plain
     // `(cols) IN (SELECT ...)` never matches a NULL group key — `(NULL) IN (...)`
-    // is NULL, not TRUE — so the NULL group was skipped and its scalar left NULL
-    // by the preceding Sub was never refreshed from `topk[1]`. On the top-K UPDATE
-    // path the subsequent Add then computes LEAST/GREATEST(NULL, delta) = delta
-    // (wrong) and the forced recompute only covers groups whose heap shrank, so an
-    // unshrunk NULL group stayed wrong (same NULL-group family as the recompute).
+    // is NULL, not TRUE — so the NULL group would be skipped and its scalar left
+    // NULL by the preceding Sub would never be refreshed from `topk[1]`. On the
+    // top-K UPDATE path the subsequent Add would then compute
+    // LEAST/GREATEST(NULL, delta) = delta (wrong) and the forced recompute only
+    // covers groups whose heap shrank, so an unshrunk NULL group would stay wrong
+    // (same NULL-group family as the recompute).
     //
     // Correctness needs `IS NOT DISTINCT FROM`, but that is non-sargable: it cannot
     // use the intermediate's unique group-key index, so it seq-scans the whole
     // intermediate on every top-K Sub (verified with EXPLAIN). This UPDATE fires on
     // every top-K Sub, so — unlike the rare recompute — the common path must stay
-    // sargable. Reuse PS-5's `affected_null_key_gate`: when the affected set holds
+    // sargable. Reuse `affected_null_key_gate`: when the affected set holds
     // no NULL group key, `=` (index scan) is exact; only when it actually holds a
     // NULL key do we pay the NULL-safe scan, and just for that batch.
     let scope_exists = |at: &str, eq: bool| -> String {
@@ -524,7 +524,7 @@ pub fn build_min_max_recompute_sql(
     build_min_max_recompute_sql_inner(intermediate_tbl, plan, orig_base_query, affected_tbl, false)
 }
 
-/// N1 — Capture the subset of affected groups whose top-K heap shrank below
+/// Capture the subset of affected groups whose top-K heap shrank below
 /// K during the preceding Sub merge. Only those groups need a source-scan
 /// recompute: groups whose heap stayed at K had no heap-eligible row removed,
 /// so the algebraic Sub+Add merge alone is correct.
@@ -585,7 +585,7 @@ pub fn push_topk_shrunk_groups_capture(
         .collect();
     let where_clause = predicates.join(" OR ");
 
-    // PS-5 — the `i JOIN affected a ON i.gc IS NOT DISTINCT FROM a.gc` join is the
+    // The `i JOIN affected a ON i.gc IS NOT DISTINCT FROM a.gc` join is the
     // same non-sargable nested-loop-over-the-whole-intermediate pattern as the
     // target sync. Gate it into a sargable/NULL-safe pair on whether the affected
     // set contains a NULL key (the group cols here are the affected table's own
@@ -733,31 +733,26 @@ pub(crate) fn build_min_max_recompute_sql_inner(
     // the LHS (so it applies to pre-aggregation rows) and the normalized
     // column names in the affected-groups table on the RHS. Postgres matches
     // by value, not by alias, so a raw/normalized pair works.
-    // `eq`-parameterized like `update_join`/`exists_join` below (PS-11 fix): the
-    // ORIGINAL NULL-safe rewrite built this filter ONCE, unconditionally using
-    // `IS NOT DISTINCT FROM`, and every caller of `build_update` — including the
-    // `eq = true` (all-group-keys-provably-NOT-NULL) fast branch — shared that
-    // one non-sargable string. `IS NOT DISTINCT FROM` is neither hashable nor
-    // mergejoinable, so the semi-join to the affected table silently degraded
-    // from a Hash/Merge Semi Join to a Nested Loop Semi Join for EVERY MIN/MAX
-    // IMV, not just the ones actually holding a NULL group key — measured
-    // 700-3700x slower at realistic (50k-1M row) source sizes, landing on the
-    // exact recompute path implicated in a known production storm. `=` and
-    // `IS NOT DISTINCT FROM` select identically once the caller has already
-    // proven (via `eq`) that no group key involved can be NULL, so scoping this
-    // by the same `eq` the join predicates already use is sound, not just fast.
+    // `eq`-parameterized like `update_join`/`exists_join` below: the filter must
+    // not use `IS NOT DISTINCT FROM` unconditionally, because it is neither
+    // hashable nor mergejoinable, so the semi-join to the affected table would
+    // degrade from a Hash/Merge Semi Join to a Nested Loop Semi Join for EVERY
+    // MIN/MAX IMV, not just the ones actually holding a NULL group key (700-3700x
+    // slower at 50k-1M row source sizes). `=` and `IS NOT DISTINCT FROM` select
+    // identically once the caller has already proven (via `eq`) that no group key
+    // involved can be NULL, so scoping this by the same `eq` the join predicates
+    // already use is sound, not just fast.
     let scoped_source = |eq: bool| -> String {
         match affected_tbl {
             Some(at) => {
                 // NULL-safe affected-group scoping. `(cols) IN (SELECT ...)` never
                 // matches a NULL group key — `(NULL) IN (...)` is NULL, not TRUE — so a
-                // NULL group was dropped from the scoped source and a MIN/MAX left NULL
-                // by a retraction was never re-derived (silent wrong result). Use a
-                // correlated EXISTS with per-column `IS NOT DISTINCT FROM` (or `=` when
-                // `eq` proves no NULL key can be involved), pairing each raw GROUP BY
-                // expression (LHS, evaluated in the outer source scope) to its
-                // normalized column in the affected table (RHS) — the same
-                // raw/normalized pairing the IN form used.
+                // NULL group would be dropped from the scoped source and a MIN/MAX left
+                // NULL by a retraction would never be re-derived (silent wrong result).
+                // Use a correlated EXISTS with per-column `IS NOT DISTINCT FROM` (or `=`
+                // when `eq` proves no NULL key can be involved), pairing each raw GROUP
+                // BY expression (LHS, evaluated in the outer source scope) to its
+                // normalized column in the affected table (RHS).
                 //
                 // The affected columns are aliased through a derived table (`__g0`,
                 // `__g1`, …) so the correlated subquery exposes NO column named like a
@@ -800,8 +795,8 @@ pub(crate) fn build_min_max_recompute_sql_inner(
         }
     };
 
-    // PS-5 — both the recompute UPDATE's join to `__src` and (below) the EXISTS
-    // firing gate's join to `__aff` matched the group key with `IS NOT DISTINCT
+    // Both the recompute UPDATE's join to `__src` and (below) the EXISTS
+    // firing gate's join to `__aff` would match the group key with `IS NOT DISTINCT
     // FROM`, non-sargable, forcing a nested loop over the whole intermediate. The
     // firing gate runs on EVERY UPDATE flush of EVERY MIN/MAX IMV. Gate both into
     // a sargable/NULL-safe pair, keyed on whether the AFFECTED set holds a NULL
@@ -845,12 +840,12 @@ pub(crate) fn build_min_max_recompute_sql_inner(
         return Some(build_update(all_not_null));
     };
 
-    // 1.3.0: gate the recompute on `EXISTS (intermediate row with NULL slot
+    // Gate the recompute on `EXISTS (intermediate row with NULL slot
     // in an affected group)`. The post-MERGE topk-scalar refresh sets the
     // scalar from `topk[1]` for groups whose heap survived; the recompute
     // only needs to fire for groups that genuinely underflowed. An always-
-    // executing UPDATE used to trigger the source aggregation even when no
-    // group needed it, which dominated the bench.
+    // executing UPDATE would trigger the source aggregation even when no
+    // group needed it.
     let exists_join = |eq: bool| -> String {
         group_cols
             .iter()
@@ -907,7 +902,7 @@ pub(crate) fn build_min_max_recompute_sql_inner(
 /// Build a match condition for affected groups, used as the WHERE filter on
 /// the target/intermediate during the end_query refresh phase.
 ///
-/// 1.4.4: per-column `=` for NOT NULL group cols, `IS NOT DISTINCT FROM` for
+/// Per-column `=` for NOT NULL group cols, `IS NOT DISTINCT FROM` for
 /// NULLable ones. Same motivation as `build_merge_using`'s rewrite — `=` is
 /// btree-index-usable, `IS NOT DISTINCT FROM` is not. The composite index on
 /// the target/intermediate group cols becomes a usable EXISTS-probe target
@@ -927,7 +922,6 @@ pub(crate) fn build_min_max_recompute_sql_inner(
 /// populated from intermediate-named cols), and the predicate degenerates to
 /// `__a.<col> = __a.<col>` (a one-time TRUE filter that wipes the whole
 /// outer relation on DELETE / re-inserts the whole intermediate on INSERT).
-/// See `journal/2026-05-13_null_safe_in_bug.md`.
 ///
 /// `outer_cols` and `affected_cols` are parallel quoted column lists. Their
 /// names may differ when the IMV's SELECT aliases a GROUP BY column (e.g.,
@@ -972,7 +966,7 @@ pub(crate) fn null_safe_in(
     )
 }
 
-/// PS-5 — the runtime NULL-freeness probe on the affected-groups table.
+/// The runtime NULL-freeness probe on the affected-groups table.
 ///
 /// Returns `EXISTS (SELECT 1 FROM <affected> AS __ng WHERE <col> IS NULL OR ...)`
 /// over the NULLABLE key columns only, or `None` when every key column is known
@@ -1013,14 +1007,14 @@ pub(crate) fn affected_null_key_gate(
     ))
 }
 
-/// PS-5 — mutually exclusive alternatives for the same logical affected-groups
+/// Mutually exclusive alternatives for the same logical affected-groups
 /// match, so the common case gets an index-usable plan.
 ///
 /// `IS NOT DISTINCT FROM` is not a member of any operator family, so it can
 /// serve neither an `Index Cond` nor a hash/merge join key: the planner's only
 /// option is a nested loop with a `Join Filter` over the entire target, making
 /// the target sync `O(total_groups × affected_groups)`. Measured on a
-/// 200 000-group nullable-key fixture (PG 17.7): 52 ms for a 1-row delta, and
+/// 200 000-group nullable-key fixture : 52 ms for a 1-row delta, and
 /// **681 576 ms** with 50 000 affected groups (`Rows Removed by Join Filter:
 /// 8 749 975 000`) against **57 ms** for the same statement with `=`.
 ///
@@ -1039,8 +1033,7 @@ pub(crate) fn affected_null_key_gate(
 ///
 /// This reads data only to choose between two forms that agree *on that data* —
 /// it never records a conclusion that could later become false, which is how it
-/// differs from the unsound NOT-NULL *inference* that
-/// `project_differential_fuzz_harness_2026_05_22` caught.
+/// differs from a NOT-NULL *inference*, which can become unsound.
 ///
 /// An ungated `=` would be wrong: with target `{1, 2, NULL}` and affected
 /// `{NULL}`, `IS NOT DISTINCT FROM` selects the NULL group and `=` selects
@@ -1095,9 +1088,9 @@ impl AffectedMatch {
     }
 }
 
-/// PS-5 — `null_safe_in`, specialised into a gated fast/safe pair. See
+/// `null_safe_in`, specialised into a gated fast/safe pair. See
 /// `AffectedMatch` for why, and `null_safe_in` for the argument contract (the
-/// outer-qualification invariant from `journal/2026-05-13_null_safe_in_bug.md`
+/// outer-qualification invariant
 /// applies unchanged — the safe variant *is* `null_safe_in`).
 pub(crate) fn null_safe_in_gated(
     affected_tbl: &str,
@@ -1198,9 +1191,9 @@ pub(crate) fn splice_before_group_by(query: &str, and_fragment: &str) -> Option<
 /// qualifying the outer is mandatory.
 /// Returns `None` if `end_query` contains no ` GROUP BY ` marker (defensive fallback).
 ///
-/// PS-5: production codegen now goes through
+/// Production codegen goes through
 /// `inject_affected_filter_before_group_by_gated`, which returns one spliced
-/// query per gated variant. This ungated form is retained because its tests pin
+/// query per gated variant. This ungated form exists because its tests pin
 /// the splice contract (marker choice, `AND` placement, outer qualification)
 /// that the gated version builds on.
 #[cfg(test)]
@@ -1227,7 +1220,7 @@ pub(crate) fn inject_affected_filter_before_group_by(
     ))
 }
 
-/// PS-5 — gated sibling of `inject_affected_filter_before_group_by`: returns one
+/// Gated sibling of `inject_affected_filter_before_group_by`: returns one
 /// spliced `end_query` per live variant of the affected-groups match.
 ///
 /// The gate lands in the **pre-`GROUP BY`** WHERE alongside the match, which is
@@ -1324,11 +1317,6 @@ pub(crate) fn row_expr(cols: &[String]) -> String {
         format!("({})", cols.join(", "))
     }
 }
-
-// Phase 1 (plans/1_6_1_refacto.md) — `replace_source_with_transition` is now
-// a re-export of the canonical implementation in
-// [`crate::sql_writer::identifier::replace_source_with_transition`]. Existing
-// call sites in this file (and `unit_trigger.rs` tests) compile unchanged.
 
 /// Push MERGE + affected-groups population.
 /// PG17+: single CTE with MERGE RETURNING (captures affected groups in one statement).

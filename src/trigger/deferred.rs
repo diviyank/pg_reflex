@@ -11,7 +11,7 @@ use pgrx::PgBuiltInOids;
 /// no-op for every IMV shape (an old/new pair already nets to zero in both the
 /// passthrough delete+insert and the aggregate decrement+increment). Without it
 /// a key touched twice before the flush stages two new-side rows and trips the
-/// unique constraint (docs/fuzz-findings.md finding #2).
+/// unique constraint.
 ///
 /// Two equivalent strategies, chosen by `any_text_cast`:
 ///
@@ -25,10 +25,10 @@ use pgrx::PgBuiltInOids;
 ///   materialised record with `=` uses NULL-safe `record_eq` (so identical
 ///   NULL-bearing rows still cancel), and `row_number()` over the identical-row
 ///   partition preserves multiplicity. The record key is sortable/hashable, so
-///   the planner uses a merge/hash anti-join — O(n log n). The earlier form put
+///   the planner uses a merge/hash anti-join — O(n log n). Putting
 ///   the per-column `IS NOT DISTINCT FROM` in the join *filter* with only
-///   `row_number` as the equi-key; when every row is unique that key collapses
-///   to the constant 1, collapsing the anti-join to an O(n²) cross-comparison.
+///   `row_number` as the equi-key would, when every row is unique, collapse
+///   that key to the constant 1 and the anti-join to an O(n²) cross-comparison.
 pub(crate) fn build_netted_view_sql(
     view: &str,
     projection: &str,
@@ -1330,7 +1330,7 @@ fn flush_staged_deltas(source_table: &str) -> String {
     let mut total_processed = 0usize;
 
     Spi::connect_mut(|client| {
-        // 1.4.3 — Serialize flushes on the same source.
+        // Serialize flushes on the same source.
         //
         // ANALYZE (ShareUpdateExclusiveLock) + TRUNCATE (AccessExclusiveLock)
         // on the same staging-delta table inside the same transaction is a
@@ -1395,7 +1395,7 @@ fn flush_staged_deltas(source_table: &str) -> String {
 
         // Passthrough INSERT/DELETE/UPDATE branches in reflex_build_delta_sql
         // reference the NEW/OLD transition tables literally — either directly
-        // (pre-Phase-E paths) or via the Phase E per-(IMV, source) scratch
+        // or via the per-(IMV, source) scratch
         // populate `INSERT INTO __reflex_pt_*_<v>_<s> SELECT * FROM __reflex_(new|old)_<s>`.
         // Those transition tables only exist inside an IMMEDIATE trigger's
         // REFERENCING scope; here we're at COMMIT, so stand both sides up as
@@ -1410,9 +1410,8 @@ fn flush_staged_deltas(source_table: &str) -> String {
         // otherwise. The raw column projection (for the TEMP VIEW that
         // downstream incremental codegen reads) stays unchanged.
         //
-        // Resolve via `to_regclass($1)`: this is the original schema-mismatch
-        // bug site (pre-fix, an unwrap_or("public") fallback projected the
-        // wrong homonym's columns when `source_table` arrived bare). Upstream
+        // Resolve via `to_regclass($1)`: a bare `source_table` must not fall back
+        // to `public`, which would project the wrong homonym's columns. Upstream
         // canonicalization at IMV-create time keeps `source_table` qualified
         // for non-public sources, but feeding the lookup through `to_regclass`
         // makes correctness independent of caller hygiene.
@@ -1481,7 +1480,6 @@ fn flush_staged_deltas(source_table: &str) -> String {
         // U_NEW(v1): the new side then holds BOTH v0 and v1 for k. Feeding that
         // straight into maintenance makes the passthrough INSERT add two rows for
         // k → "duplicate key value violates unique constraint __reflex_uk_*"
-        // (docs/fuzz-findings.md finding #2).
         //
         // Net the two sides against each other (multiset difference): a row that
         // appears identically on both sides contributes zero net change, so it is
@@ -1523,7 +1521,7 @@ fn flush_staged_deltas(source_table: &str) -> String {
         create_netted_views(client, &delta_tbl);
         let mut views_over = delta_tbl.clone();
 
-        // 1.4.3 — Spurious-UPDATE short-circuit.
+        // Spurious-UPDATE short-circuit.
         //
         // If the staging delta contains only paired U_OLD/U_NEW rows whose
         // projections to the source columns are identical multisets (i.e.
@@ -1659,9 +1657,9 @@ fn flush_staged_deltas(source_table: &str) -> String {
                 .unwrap_or_report();
         }
 
-        // A5 — `pg_reflex.flush_failure_policy`. Default `warn`: a per-IMV flush
+        // `pg_reflex.flush_failure_policy`. Default `warn`: a per-IMV flush
         // failure is caught, the IMV is marked known_stale, and the cascade
-        // continues (existing behaviour, unchanged for every caller who never
+        // continues (the behaviour for every caller who never
         // sets this). Opt-in `error` drops the per-IMV EXCEPTION handler so the
         // failure propagates and aborts the whole caller transaction instead.
         // Unset or empty means `warn`. Any other unrecognised value also falls
@@ -1840,14 +1838,13 @@ fn flush_staged_deltas(source_table: &str) -> String {
             } else if is_spurious {
                 continue;
             }
-            // 1.4.5 — Skip this IMV iff NO staged row matches the
-            // predicate, on either side of the delta. The 1.4.4 check
-            // looked only at NEW-state rows (`I` + `U_NEW`); that silently
-            // dropped row-leaves-filter UPDATEs — when a row transitions
-            // out of the IMV's WHERE the IMV must DELETE its
-            // contribution, which requires the trigger body to run. The OR
-            // below extends the gate to OLD-state passing rows so we no
-            // longer mistake "no new row to add" for "no work at all".
+            // Skip this IMV iff NO staged row matches the
+            // predicate, on either side of the delta. Checking only NEW-state
+            // rows (`I` + `U_NEW`) would silently drop row-leaves-filter
+            // UPDATEs — when a row transitions out of the IMV's WHERE the IMV
+            // must DELETE its contribution, which requires the trigger body to
+            // run. The OR below extends the gate to OLD-state passing rows so
+            // "no new row to add" is not mistaken for "no work at all".
             if let Some(pred) = where_pred {
                 let pred_sql = format!(
                     "SELECT EXISTS( \
@@ -1873,9 +1870,9 @@ fn flush_staged_deltas(source_table: &str) -> String {
                 }
             }
 
-            // 1.4.5 — Per-IMV filter-aware spurious-skip in DEFERRED mode.
+            // Per-IMV filter-aware spurious-skip in DEFERRED mode.
             //
-            // The 1.4.3 byte-identical multiset check above is a *source-wide*
+            // The byte-identical multiset check above is a *source-wide*
             // gate — it fires only when EVERY column is byte-equal on every
             // U_OLD/U_NEW pair AND there are no INSERT/DELETE rows. That's
             // strong but rare. The check below is per-IMV and runs even when
@@ -1894,8 +1891,8 @@ fn flush_staged_deltas(source_table: &str) -> String {
             // If multisets match in both directions, the IMV's output cannot
             // change for any group touched by this delta — skip it.
             //
-            // Absent metadata (CTE IMVs, SELECT *, or IMVs created before
-            // 1.4.5 metadata backfill) falls through to the existing path.
+            // Absent metadata (CTE IMVs, SELECT *, or IMVs without
+            // the metadata) falls through to the existing path.
             let agg_jsonb: Result<serde_json::Value, _> = serde_json::from_str(agg_json);
             if let Ok(jv) = agg_jsonb {
                 let cols_arr = jv
@@ -1903,16 +1900,14 @@ fn flush_staged_deltas(source_table: &str) -> String {
                     .and_then(|m| m.get(source_table))
                     .and_then(|a| a.as_array());
                 if let Some(cols) = cols_arr {
-                    // No runtime catalog filter — the analyzer (1.4.5) only
+                    // No runtime catalog filter — the analyzer only
                     // attributes a column to a source when the reference is
                     // unambiguously resolvable, so every column listed here
                     // is guaranteed to exist on the source's transition /
                     // delta table.
                     // Cast json/xml to text (no equality operator). Drop
                     // columns the analyzer wrongly attributed to this
-                    // source: pre-1.5.1 `create_ivm` only filtered the
-                    // attribution catalog for aggregate IMVs, so
-                    // passthrough IMVs created before that fix may have
+                    // source: passthrough IMVs created by older releases may have
                     // `imv_relevant_columns[source]` entries that don't
                     // exist on the source table. Selecting one would
                     // crash the EXCEPT ALL with `column "X" does not
@@ -1998,7 +1993,7 @@ fn flush_staged_deltas(source_table: &str) -> String {
                 imv_name.replace("'", "''")
             ));
 
-            // 1.4.3 — Single op="UPDATE" call replaces the previous 4-way
+            // Single op="UPDATE" call instead of a 4-way
             // dispatch (INSERT / DELETE / U_OLD-as-DELETE / U_NEW-as-INSERT).
             // The TEMP VIEWs created above (`__reflex_new_<src>` =
             // I + U_NEW, `__reflex_old_<src>` = D + U_OLD) act exactly like
@@ -2026,12 +2021,12 @@ fn flush_staged_deltas(source_table: &str) -> String {
                 }
             }
 
-            // Phase 3.4 — wrap per-IMV statements in a PL/pgSQL DO block. The
+            // Wrap per-IMV statements in a PL/pgSQL DO block. The
             // BEGIN…EXCEPTION…END creates an internal subtransaction: a single
             // bad IMV only rolls back its own work and logs a WARNING instead of
             // aborting the entire flush cascade.
             //
-            // Theme 4 (observability): inside the same savepoint, record flush
+            // Observability: inside the same savepoint, record flush
             // timing + staged row count on success, clearing last_error only
             // when the IMV isn't already marked known_stale for some other
             // reason; on failure the EXCEPTION branch marks the IMV
@@ -2056,14 +2051,14 @@ fn flush_staged_deltas(source_table: &str) -> String {
                 .map(|s| format!("{};", as_plpgsql_stmt(&s)))
                 .collect::<Vec<_>>()
                 .join("\n");
-            // 1.3.0 observability:
+            // Observability:
             //   * `flush_ms_history` ring buffer (size 64) collects recent flush
             //     wall times. `reflex_ivm_histogram(name)` reads it.
             //   * `application_name` is set to `reflex_flush:<view>` for the
             //     duration of this IMV's body so `pg_stat_statements` /
             //     `log_line_prefix` can correlate query rows back to the IMV.
             //
-            // A5 — the success path (timing, row count, the registry UPDATE,
+            // The success path (timing, row count, the registry UPDATE,
             // restoring application_name) is identical under `warn` and
             // `error`; only the EXCEPTION clause differs, so it is built once
             // as `success_body` and the two modes share it verbatim rather
@@ -2153,7 +2148,7 @@ fn flush_staged_deltas(source_table: &str) -> String {
             }
         }
 
-        // 1.4.3 — DELETE (not TRUNCATE) for staging cleanup.
+        // DELETE (not TRUNCATE) for staging cleanup.
         //
         // TRUNCATE requires AccessExclusiveLock on the staging delta and
         // deadlocks against any concurrent session that holds a RowExclusive

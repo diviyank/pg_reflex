@@ -1,6 +1,5 @@
 //! Shared string builders for scoping passthrough DML to the rows a delta
-//! actually touched. Pure functions (no DB), reused by the keyed secondary path
-//! (defect #3). See docs/superpowers/specs/2026-06-04-passthrough-partition-keyed-maintenance-design.md.
+//! actually touched. Pure functions (no DB), reused by the keyed secondary path.
 
 use super::row_expr;
 
@@ -22,12 +21,11 @@ pub(crate) fn build_membership_predicate(
 }
 
 /// NULL-safe sibling of `build_membership_predicate` for the passthrough
-/// keyed-secondary path (2026-07-25 untreated_bugs: `(NULL) IN (...)` is never
-/// TRUE, so a nullable key column silently drops out of the plain `IN` form,
-/// leaving a phantom target row on DELETE and a unique-index abort on
-/// UPDATE). Emits byte-identical output to `build_membership_predicate` when
-/// every `target_cols` entry is in `not_null_columns` — the regression-free
-/// common case — and a correlated `EXISTS` with per-column `=`/`IS NOT
+/// keyed-secondary path (`(NULL) IN (...)` is never TRUE, so a nullable key
+/// column would silently drop out of the plain `IN` form, leaving a phantom
+/// target row on DELETE and a unique-index abort on UPDATE). Emits
+/// byte-identical output to `build_membership_predicate` when every
+/// `target_cols` entry is in `not_null_columns` — the common case — and a correlated `EXISTS` with per-column `=`/`IS NOT
 /// DISTINCT FROM` otherwise, mirroring `trigger::merge::null_safe_in`'s op
 /// choice.
 ///
@@ -72,25 +70,24 @@ pub(crate) fn build_null_safe_membership_predicate(
     )
 }
 
-/// PS-5 (2026-07-25) — `build_null_safe_membership_predicate` specialised into a
+/// `build_null_safe_membership_predicate` specialised into a
 /// runtime-gated fast/safe pair, for the same reason
 /// `trigger::merge::null_safe_in_gated` exists. Read `merge::AffectedMatch`'s doc
 /// first: the soundness argument, the "exactly one variant does work" contract
 /// and the `stmts()` expansion protocol are all identical here.
 ///
-/// The static-only choice this replaces was the *worse* half of that bug. The
+/// A static-only choice would be the *worse* option here. The
 /// keyed passthrough secondary (`ops::outer_join_secondary_stmts`) matches the
 /// FULL base relation against the tiny `(OLD ∪ NEW)` transition delta, and its
 /// target columns come from the NULLABLE side of an outer join — so
 /// `provably_not_null_key_columns` can never prove them (it excludes LEFT-join
 /// target tables outright and returns an EMPTY set for any RIGHT/FULL join).
-/// Every such IMV therefore took the `IS NOT DISTINCT FROM` form *always*, not
-/// occasionally: `IS NOT DISTINCT FROM` is in no operator family, so the semi
-/// join degrades to a nested loop over the whole base. Measured on PG 18.4,
-/// 500 000 base rows x 2 000 changed keys: **23 698 ms** with
-/// `Rows Removed by Join Filter: 489 995 000`, versus **40.9 ms** for the
-/// sargable `IN` (579x). Gated, the untaken variant costs 6 ms
-/// (`Nested Loop Semi Join (never executed)` under a `One-Time Filter`).
+/// Every such IMV would therefore take the `IS NOT DISTINCT FROM` form *always*,
+/// not occasionally: `IS NOT DISTINCT FROM` is in no operator family, so the semi
+/// join degrades to a nested loop over the whole base: with 500 000 base rows
+/// and 2 000 changed keys, ~24 s versus ~41 ms for the sargable `IN`. Gated,
+/// the untaken variant costs ~6 ms (`Nested Loop Semi Join (never executed)`
+/// under a `One-Time Filter`).
 ///
 /// # Why the pair is atomic here
 ///
@@ -135,7 +132,7 @@ pub(crate) fn build_null_safe_membership_predicate_gated(
 
     // Every column proven NOT NULL: `build_null_safe_membership_predicate`
     // already returned the plain sargable `IN`, so there is nothing to gate and
-    // the emitted SQL stays byte-identical to the pre-fix output.
+    // the emitted SQL stays byte-identical to the plain `IN` form.
     let Some(gate) = super::merge::affected_null_key_gate(
         src_relation_body,
         &unproven_source_cols,
