@@ -1392,3 +1392,24 @@ fn bare_function_name_folds_ascii_only() {
     assert_eq!(bare_name_of_call("\"zz_ÉVOL\""), "zz_Évol");
     assert_eq!(bare_name_of_call("zz_ÈVol2"), "zz_Èvol2");
 }
+
+#[test]
+fn nested_queries_are_detected_wherever_they_appear() {
+    for sql in [
+        "WITH c AS (SELECT id FROM t) SELECT id FROM c",
+        "SELECT id FROM (SELECT id FROM t) d",
+        "SELECT id FROM t WHERE v > (SELECT max(v) FROM u)",
+        "SELECT id FROM t WHERE g IN (SELECT g FROM u)",
+        "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.id = t.id)",
+        "SELECT id, (SELECT max(v) FROM u) AS m FROM t",
+    ] {
+        assert!(parse_and_analyze(sql).has_nested_query, "{sql}");
+    }
+    for sql in [
+        "SELECT id FROM t",
+        "SELECT g, SUM(v) FROM t JOIN u ON u.id = t.id WHERE v > 1 GROUP BY g HAVING SUM(v) > 0",
+        "SELECT id FROM t UNION ALL SELECT id FROM u",
+    ] {
+        assert!(!parse_and_analyze(sql).has_nested_query, "{sql}");
+    }
+}

@@ -477,3 +477,120 @@ fn v112_fn_ungrouped_aggregate_derived_item_is_not_called_a_non_aggregate() {
         "'e' is not an aggregate expression that pg_reflex supports and is not a group key",
     );
 }
+
+fn v112_fn_created(name: &str, q: &str, mode: &str) {
+    assert_eq!(
+        crate::create_reflex_ivm(name, q, None, None, Some(mode), None),
+        "CREATE REFLEX INCREMENTAL VIEW",
+        "{q}"
+    );
+}
+
+fn v112_fn_assert_correct_through_dml(imv: &str, q: &str, table: &str, deferred: bool) {
+    let assert_correct = || {
+        if deferred {
+            Spi::run(&format!("SELECT reflex_flush_deferred('{table}')")).expect("flush");
+        }
+        assert_imv_correct(imv, q);
+    };
+    assert_correct();
+    for dml in [
+        format!("INSERT INTO {table}(g, v) VALUES ('a', 9), ('c', 4)"),
+        format!("UPDATE {table} SET v = v + 10 WHERE g = 'b'"),
+        format!("DELETE FROM {table} WHERE v = (SELECT MAX(v) FROM {table})"),
+        format!("DELETE FROM {table}"),
+    ] {
+        Spi::run(&dml).expect("dml");
+        assert_correct();
+    }
+}
+
+fn v112_fn_unknown_aggregate(name: &str) {
+    Spi::run(&format!("CREATE AGGREGATE {name}(int) (sfunc = int4larger, stype = int)"))
+        .expect("agg");
+}
+
+#[pg_test]
+fn v112_fn_ungrouped_unknown_aggregate_created_and_correct() {
+    v112_fn_table("v112_fn_ua_src");
+    v112_fn_unknown_aggregate("v112_fn_ua_agg");
+    let q = "SELECT v112_fn_ua_agg(v) AS m FROM v112_fn_ua_src";
+    v112_fn_created("v112_fn_ua", q, "IMMEDIATE");
+    v112_fn_assert_correct_through_dml("v112_fn_ua", q, "v112_fn_ua_src", false);
+}
+
+#[pg_test]
+fn v112_fn_ungrouped_unknown_aggregate_created_and_correct_deferred() {
+    v112_fn_table("v112_fn_uad_src");
+    v112_fn_unknown_aggregate("v112_fn_uad_agg");
+    let q = "SELECT v112_fn_uad_agg(v) AS m FROM v112_fn_uad_src";
+    v112_fn_created("v112_fn_uad", q, "DEFERRED");
+    v112_fn_assert_correct_through_dml("v112_fn_uad", q, "v112_fn_uad_src", true);
+}
+
+#[pg_test]
+fn v112_fn_ungrouped_unknown_aggregate_over_join_created_and_correct() {
+    v112_fn_table("v112_fn_uja_src");
+    v112_fn_table("v112_fn_ujb_src");
+    v112_fn_unknown_aggregate("v112_fn_uj_agg");
+    let q = "SELECT v112_fn_uj_agg(a.v + b.v) AS m \
+             FROM v112_fn_uja_src a JOIN v112_fn_ujb_src b ON b.g = a.g";
+    v112_fn_created("v112_fn_uj", q, "IMMEDIATE");
+    assert_imv_correct("v112_fn_uj", q);
+    for dml in [
+        "INSERT INTO v112_fn_uja_src(g, v) VALUES ('b', 40), ('c', 4)",
+        "INSERT INTO v112_fn_ujb_src(g, v) VALUES ('c', 90)",
+        "UPDATE v112_fn_ujb_src SET v = v - 100 WHERE g = 'c'",
+        "DELETE FROM v112_fn_uja_src WHERE g = 'b'",
+        "DELETE FROM v112_fn_ujb_src",
+    ] {
+        Spi::run(dml).expect("dml");
+        assert_imv_correct("v112_fn_uj", q);
+    }
+}
+
+#[pg_test]
+fn v112_fn_unknown_aggregate_with_group_by_or_beside_supported_aggregate_still_rejected() {
+    v112_fn_table("v112_fn_ug_src");
+    v112_fn_unknown_aggregate("v112_fn_ug_agg");
+    for (i, q) in [
+        "SELECT g, v112_fn_ug_agg(v) AS m FROM v112_fn_ug_src GROUP BY g",
+        "SELECT v112_fn_ug_agg(v) AS m, SUM(v) AS s FROM v112_fn_ug_src",
+        "SELECT v112_fn_ug_agg(v) + SUM(v) AS m FROM v112_fn_ug_src",
+    ]
+    .iter()
+    .enumerate()
+    {
+        v112_fn_assert_rejected(
+            &format!("v112_fn_ug_{i}"),
+            q,
+            "Unsupported aggregate(s): V112_FN_UG_AGG",
+        );
+    }
+}
+
+#[pg_test]
+fn v112_fn_unknown_aggregate_outside_a_single_level_passthrough_still_rejected() {
+    v112_fn_table("v112_fn_un_src");
+    v112_fn_unknown_aggregate("v112_fn_un_agg");
+    for (i, q) in [
+        "WITH c AS (SELECT v112_fn_un_agg(v) AS m FROM v112_fn_un_src) SELECT m FROM c",
+        "SELECT id, v FROM v112_fn_un_src WHERE v >= (SELECT v112_fn_un_agg(v) FROM v112_fn_un_src)",
+        "SELECT m FROM (SELECT v112_fn_un_agg(v) AS m FROM v112_fn_un_src) d",
+        "SELECT v112_fn_un_agg(v) AS m FROM v112_fn_un_src \
+         UNION ALL SELECT v112_fn_un_agg(v) AS m FROM v112_fn_un_src",
+        "SELECT v112_fn_un_agg(v) AS m FROM v112_fn_un_src HAVING v112_fn_un_agg(v) > 0",
+        "SELECT DISTINCT v112_fn_un_agg(v) AS m FROM v112_fn_un_src",
+        "SELECT v112_fn_un_agg(v) AS m, row_number() OVER () AS rn FROM v112_fn_un_src",
+        "SELECT DISTINCT ON (m) v112_fn_un_agg(v) AS m FROM v112_fn_un_src ORDER BY m",
+    ]
+    .iter()
+    .enumerate()
+    {
+        v112_fn_assert_rejected(
+            &format!("v112_fn_un_{i}"),
+            q,
+            "Unsupported aggregate(s): V112_FN_UN_AGG",
+        );
+    }
+}

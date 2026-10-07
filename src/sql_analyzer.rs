@@ -178,6 +178,8 @@ pub struct SqlAnalysis {
     pub has_filter_clause: bool,
     pub has_within_group: bool,
     pub has_scalar_subquery: bool,
+    /// A CTE, derived table or subquery of any kind below the top-level query.
+    pub has_nested_query: bool,
     pub unsupported_aggregates: Vec<String>,
     pub distinct_aggregates: Vec<String>,
     pub nested_count_distinct: bool,
@@ -313,12 +315,15 @@ impl SqlAnalysis {
 
 struct AnalysisVisitor<'a> {
     analysis: &'a mut SqlAnalysis,
+    top_level_query_seen: bool,
 }
 
 impl<'a> Visitor for AnalysisVisitor<'a> {
     type Break = ();
 
     fn pre_visit_query(&mut self, query: &Query) -> ControlFlow<()> {
+        self.analysis.has_nested_query = self.top_level_query_seen;
+        self.top_level_query_seen = true;
         if let Some(ref with) = query.with {
             if with.recursive {
                 self.analysis.has_recursive_cte = true;
@@ -1476,6 +1481,7 @@ pub fn analyze(statements: &[Statement]) -> Result<SqlAnalysis, SqlAnalysisError
     // Phase 1: Visitor pass for unsupported features and source table extraction
     let mut visitor = AnalysisVisitor {
         analysis: &mut analysis,
+        top_level_query_seen: false,
     };
     let _ = query.visit(&mut visitor);
 
