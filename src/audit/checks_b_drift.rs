@@ -168,49 +168,43 @@ impl Check for PartitionMirror {
         // A PASSTHROUGH IMV owns none: `intermediate_column_spec` returns None at
         // create time, so `__reflex_intermediate_<view>` is never created.
         // `reflex_sync_partitions` gates every intermediate-child DDL on the same
-        // `to_regclass` probe (`src/partition.rs:1055`) precisely because
+        // `to_regclass` probe precisely because
         // `CREATE TABLE … PARTITION OF <absent>` raises 42P01. Diffing the
         // anchor's child set against an absent parent's (necessarily empty) child
-        // list therefore reported every child as missing and prescribed a sync
+        // list would report every child as missing and prescribe a sync
         // that structurally cannot create any of them — an unrepairable phantom
-        // finding, observed on 42 production IMVs.
+        // finding.
         //
         // `end_query.is_empty()` is the authoritative signal, for three reasons.
         //
         // (1) It is the branch the runtime itself takes when deciding whether to
-        //     touch an intermediate (`src/partition.rs:633`/`644`/`1054`,
-        //     `src/trigger/ops.rs:436`/`653`/`783`), so it answers the question
-        //     this check actually asks — "does an intermediate participate in
+        //     touch an intermediate, so it answers the question this check
+        //     actually asks — "does an intermediate participate in
         //     maintenance?" — not "what did create time intend?".
         // (2) Where the two candidate signals DISAGREE, this one is right.
-        //     Decomposed wrapper rows (`RegistryRow::decomposed`, five
-        //     `insert_registry_row` sites in `src/create_ivm/decompose.rs`)
+        //     Decomposed wrapper rows (`RegistryRow::decomposed`)
         //     hardcode `end_query: ""` AND `aggregations: "{}"`, so
         //     `ImvRow::is_passthrough()` finds no `is_passthrough` key and
         //     `unwrap_or(false)` claims an intermediate is expected — for a node
         //     that owns none. (Those rows carry `partition_columns: None`, so this
         //     check returns early above before reaching the predicate; the
-        //     disagreement is nonetheless real, and it is what made
-        //     `internal-tables-exist` false-positive on every set-op / DISTINCT ON
-        //     / window wrapper until 1.11.1, which turned that disagreement into
-        //     the classifier: `ImvRow::is_decomposed_wrapper`.)
-        // (3) For every row `persist_metadata` writes (`src/create_ivm/mod.rs:1572`)
-        //     the two agree: `end_query` is `""` exactly when
-        //     `plan.is_passthrough`. Note this is NOT the same predicate as
-        //     `intermediate_column_spec`'s `None` (`src/schema_builder.rs:18`),
-        //     which also requires `distinct_columns.is_empty()`:
+        //     disagreement is nonetheless real, and `ImvRow::is_decomposed_wrapper`
+        //     is the classifier built on it.)
+        // (3) For every row `persist_metadata` writes the two agree: `end_query`
+        //     is `""` exactly when `plan.is_passthrough`. Note this is NOT the
+        //     same predicate as `intermediate_column_spec`'s `None`, which also
+        //     requires `distinct_columns.is_empty()`:
         //     `COUNT(DISTINCT val)` without GROUP BY is `is_passthrough == true`
         //     with non-empty `distinct_columns`, because
         //     `AggregateKind::CountDistinct` pushes only into
-        //     `count_distinct_columns` (`src/aggregation.rs:983`). That shape is
-        //     still safe here: the intermediate DDL is only ever emitted via
-        //     `build_intermediate_table_ddl` on the non-passthrough branch
-        //     (`src/create_ivm/mod.rs:1076`), so a passthrough row never has one.
+        //     `count_distinct_columns`. That shape is still safe here: the
+        //     intermediate DDL is only ever emitted via
+        //     `build_intermediate_table_ddl` on the non-passthrough branch, so a
+        //     passthrough row never has one.
         //
-        // NULL `end_query` is coerced to `""` by `load_imv_rows`
-        // (`src/audit/mod.rs:288-292`), biasing an unset column toward
-        // "passthrough". No code path UPDATEs `end_query` and no migration
-        // back-fills it, so that state is unreachable through supported
+        // NULL `end_query` is coerced to `""` by `load_imv_rows`, biasing an unset
+        // column toward "passthrough". No code path UPDATEs `end_query` and no
+        // migration back-fills it, so that state is unreachable through supported
         // operations. Do NOT "fail safe" with `|| !imv.is_passthrough()`: by (2)
         // that reintroduces the phantom for every decomposed wrapper row.
         let intermediate_expected = !imv.end_query.is_empty();
@@ -228,17 +222,16 @@ impl Check for PartitionMirror {
         //
         // - Presence alone: a stray childless `__reflex_intermediate_<view>` left
         //   over from an earlier definition of a passthrough IMV of the same name
-        //   makes every anchor child "missing" again, and the prescribed sync would
+        //   makes every anchor child "missing", and the prescribed sync would
         //   materialise partition children on a table no maintenance path reads or
         //   writes — the same phantom by a second route. Such a stray is reported
-        //   by no check at all: `OrphanIntermediate` (`checks_c_orphan.rs:167-171`)
+        //   by no check at all: `OrphanIntermediate` (`checks_c_orphan.rs`)
         //   builds `expected` from `intermediate_table_name` for EVERY enabled IMV
         //   including passthroughs, so the stray is "owned" and never flagged.
         //   Accepted deliberately: the relation is inert (nothing reads or writes
         //   it, and it holds no rows), and the alternative — dropping passthrough
-        //   intermediates from that `expected` set — would arm an
-        //   `DROP TABLE … CASCADE` remedy keyed on a passthrough classification in
-        //   the very check the field just caught false-positiving.
+        //   intermediates from that `expected` set — would arm a
+        //   `DROP TABLE … CASCADE` remedy keyed on a passthrough classification.
         // - Expectation alone: an aggregate IMV whose intermediate parent has been
         //   dropped would report all children missing with a sync remedy that
         //   skips the absent parent, so this check would be describing mirror drift
@@ -246,11 +239,10 @@ impl Check for PartitionMirror {
         //   `internal-tables-exist`, which reports it as an Error — the same
         //   division of labour `IntermediateShape` documents above
         //   ("internal-tables-exist covers absence") — and whose
-        //   `reflex_rebuild_imv` remedy converges since 1.11.1, when
-        //   `reflex_reconcile` gained the heal step that re-issues the create-time
-        //   DDL (`heal_missing_intermediate`, `src/reconcile.rs`). Two checks
-        //   reporting one absence with the same remedy would be pure duplication,
-        //   so this one still stays silent.
+        //   `reflex_rebuild_imv` remedy converges because `reflex_reconcile`
+        //   re-issues the create-time DDL (`heal_missing_intermediate`,
+        //   `src/reconcile.rs`). Two checks reporting one absence with the same
+        //   remedy would be pure duplication, so this one stays silent.
         //
         // The target-side comparison runs in every case, so a clean target yields
         // zero findings rather than an empty-bodied one.
