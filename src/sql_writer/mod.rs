@@ -23,20 +23,8 @@ pub mod slot;
 // uses inside the crate still go through the sub-modules; the
 // `#[allow(unused_imports)]` keeps the re-exports compiling when nothing
 // outside this module references them.
-#[allow(unused_imports)]
 pub use ddl::{CreateIndex, CreateTable};
-#[allow(unused_imports)]
-pub use identifier::{
-    format_pg_text_array, quote, replace_identifier, replace_source_with_transition, safe,
-    split_qualified, strip_redundant_bare_alias, substitute_identifier_ci,
-};
-#[allow(unused_imports)]
-pub use registry::{
-    add_graph_child_links, insert_registry_row, read_imv, remove_graph_child,
-    set_partition_dispatch_cost_cap, set_wipe_floor_rows, set_wipe_threshold, AggregationsCast,
-    ImvRecord, RegistryRow,
-};
-#[allow(unused_imports)]
+pub use registry::{add_graph_child_links, insert_registry_row, AggregationsCast, RegistryRow};
 pub use slot::slot_replace;
 
 #[cfg(test)]

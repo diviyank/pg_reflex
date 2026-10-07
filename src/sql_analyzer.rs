@@ -40,7 +40,6 @@ pub enum AggregateKind {
 }
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct SelectColumn {
     /// The original expression as a SQL string (e.g., "SUM(amount)")
     pub expr_sql: String,
@@ -57,6 +56,7 @@ pub struct SelectColumn {
     /// True if this is a window function expression (has OVER clause)
     pub is_window: bool,
     /// The FILTER (WHERE ...) predicate, if any (original SQL string)
+    #[cfg(test)]
     pub filter_expr: Option<String>,
     /// True if the expression contains aggregate functions but is not a simple aggregate
     /// (e.g., CASE WHEN SUM(x) > 0 THEN SUM(x)/SUM(y) END). The constituent aggregates
@@ -65,7 +65,6 @@ pub struct SelectColumn {
 }
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // Fields used in tests and will be used by trigger implementation
 pub struct JoinInfo {
     pub join_type: String,
     pub target_table: String,
@@ -686,6 +685,7 @@ fn extract_select_column(expr: &Expr, alias: Option<String>) -> SelectColumn {
                 is_passthrough: false,
                 cast_type,
                 is_window: true,
+                #[cfg(test)]
                 filter_expr: None,
                 is_aggregate_derived: false,
             };
@@ -708,6 +708,7 @@ fn extract_select_column(expr: &Expr, alias: Option<String>) -> SelectColumn {
                 is_passthrough: false,
                 cast_type,
                 is_window: false,
+                #[cfg(test)]
                 filter_expr: call.filter_expr,
                 is_aggregate_derived: false,
             };
@@ -725,6 +726,7 @@ fn extract_select_column(expr: &Expr, alias: Option<String>) -> SelectColumn {
         is_passthrough: !has_nested_agg,
         cast_type: None,
         is_window: false,
+        #[cfg(test)]
         filter_expr: None,
         is_aggregate_derived: has_nested_agg,
     }
@@ -1538,6 +1540,7 @@ pub fn analyze(statements: &[Statement]) -> Result<SqlAnalysis, SqlAnalysisError
                     is_passthrough: true,
                     cast_type: None,
                     is_window: false,
+                    #[cfg(test)]
                     filter_expr: None,
                     is_aggregate_derived: false,
                 });
@@ -1551,6 +1554,7 @@ pub fn analyze(statements: &[Statement]) -> Result<SqlAnalysis, SqlAnalysisError
                     is_passthrough: true,
                     cast_type: None,
                     is_window: false,
+                    #[cfg(test)]
                     filter_expr: None,
                     is_aggregate_derived: false,
                 });

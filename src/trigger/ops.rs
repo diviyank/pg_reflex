@@ -1390,12 +1390,10 @@ pub(crate) fn aggregate_epilogue_stmts(
                     std::slice::from_ref(&rebuild),
                     &[],
                 ));
+            } else if skip_target_delete {
+                stmts.push(format!("INSERT INTO {} {}", qv, end_query));
             } else {
-                if skip_target_delete {
-                    stmts.push(format!("INSERT INTO {} {}", qv, end_query));
-                } else {
-                    stmts.push(rebuild);
-                }
+                stmts.push(rebuild);
             }
         } else {
             let output_cols: Vec<String> = plan

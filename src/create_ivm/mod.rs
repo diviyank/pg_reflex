@@ -45,7 +45,6 @@ pub(crate) struct BuildContext<'a> {
     view_name: &'a str,
     sql: &'a str,
     unique_columns_str: &'a str,
-    #[allow(dead_code)]
     topk_k: Option<usize>,
     ignore_sources: &'a [String],
     partition_by: &'a [String],
