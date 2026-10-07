@@ -866,7 +866,7 @@ impl Visitor for ColumnRefCollector {
 /// `outer_col <op> (SELECT … FROM other)` attributes to the outer source and is
 /// kept (the scalar subquery is treated as an opaque value), instead of looking
 /// "cross-source" because of the subquery's internal refs and being dropped —
-/// which left filters like `assortment_id = (SELECT … FROM sop_current_view)`
+/// which would leave filters like `assortment_id = (SELECT … FROM sop_current_view)`
 /// with no `where_predicate` and thus no relevance-skip for the IMV.
 #[derive(Default)]
 struct OuterColumnRefCollector {
