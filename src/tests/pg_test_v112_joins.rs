@@ -742,3 +742,187 @@ fn v112_j_schema_self_join_bare_then_fully_quoted_deferred() {
         "ok"
     );
 }
+
+fn v112_j_bare_alias_cell(tag: &str, from_template: &str, alias: &str, deferred: bool) -> String {
+    let schema = format!("v112_j_{tag}_s");
+    Spi::run(&format!("CREATE SCHEMA {schema}")).expect("schema");
+    v112_j_season_table(&format!("{schema}.t"));
+    let from = from_template.replace("{s}", &schema);
+    let aggregate = format!(
+        "SELECT {alias}.season, SUM({alias}.v) AS s FROM {from} WHERE {alias}.v > 0 GROUP BY {alias}.season"
+    );
+    let passthrough =
+        format!("SELECT {alias}.id, {alias}.season, {alias}.v FROM {from} WHERE {alias}.v > 0");
+    let aggregate_outcome = v112_j_spelling_cell(
+        &format!("v112_j_{tag}_agg"),
+        &aggregate,
+        deferred,
+        &[&format!("{schema}.t")],
+    );
+    let passthrough_outcome = v112_j_oracle_after_create(
+        &format!("v112_j_{tag}_pt"),
+        &passthrough,
+        deferred,
+        &format!("{schema}.t"),
+    );
+    format!("agg[{aggregate_outcome}] pt[{passthrough_outcome}]")
+}
+
+/// Creates a second IMV over an already-written table and checks it through one
+/// more INSERT, UPDATE and DELETE.
+fn v112_j_oracle_after_create(imv: &str, query: &str, deferred: bool, table: &str) -> String {
+    let mode = if deferred { "DEFERRED" } else { "IMMEDIATE" };
+    let created = v112_j_try(&format!(
+        "SELECT create_reflex_ivm('{imv}', $v112sel${query}$v112sel$, NULL, 'UNLOGGED', '{mode}')"
+    ));
+    if created != "CREATE REFLEX INCREMENTAL VIEW" {
+        return format!("NOT-CREATED {created}");
+    }
+    let mut outcomes = vec![("create".to_string(), v112_j_oracle(imv, query))];
+    let steps = [
+        ("ins", format!("INSERT INTO {table}(season, v) VALUES ('e',11),('k',-5)")),
+        ("upd", format!("UPDATE {table} SET v = v + 1 WHERE season = 'e'")),
+        ("del", format!("DELETE FROM {table} WHERE season = 'y'")),
+    ];
+    for (label, dml) in steps {
+        let ran = v112_j_try_dml(&dml);
+        if ran != "OK" {
+            outcomes.push((label.to_string(), ran));
+            break;
+        }
+        if deferred {
+            let flushed = v112_j_flush_every_source(imv);
+            if flushed.contains("RAISED") || flushed.contains("ERROR") {
+                outcomes.push((label.to_string(), flushed));
+                break;
+            }
+        }
+        outcomes.push((label.to_string(), v112_j_oracle(imv, query)));
+    }
+    if outcomes.iter().all(|(_, outcome)| outcome == "0") {
+        return "ok".to_string();
+    }
+    outcomes
+        .iter()
+        .map(|(label, outcome)| format!("{label}={outcome}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+macro_rules! v112_j_bare_alias_cells {
+    ($($name:ident => ($from:expr, $alias:expr, $deferred:expr),)+) => {
+        $(
+            #[pg_test]
+            fn $name() {
+                let tag = stringify!($name).trim_start_matches("v112_j_");
+                assert_eq!(
+                    v112_j_bare_alias_cell(tag, $from, $alias, $deferred),
+                    "agg[ok] pt[ok]",
+                    "{}",
+                    $from
+                );
+            }
+        )+
+    };
+}
+
+v112_j_bare_alias_cells! {
+    v112_j_ba_quoted_schema_as => ("\"{s}\".t AS t", "t", false),
+    v112_j_ba_fully_quoted_as => ("\"{s}\".\"t\" AS t", "t", false),
+    v112_j_ba_quoted_table_as => ("{s}.\"t\" AS t", "t", false),
+    v112_j_ba_bare_as => ("{s}.t AS t", "t", false),
+    v112_j_ba_quoted_schema_implicit => ("\"{s}\".t t", "t", false),
+    v112_j_ba_fully_quoted_implicit => ("\"{s}\".\"t\" t", "t", false),
+    v112_j_ba_quoted_schema_lowercase_as => ("\"{s}\".t as t", "t", false),
+    v112_j_ba_quoted_schema_other_alias => ("\"{s}\".t AS x", "x", false),
+    v112_j_ba_fully_quoted_other_alias => ("\"{s}\".\"t\" AS x", "x", false),
+    v112_j_ba_quoted_schema_as_deferred => ("\"{s}\".t AS t", "t", true),
+    v112_j_ba_fully_quoted_as_deferred => ("\"{s}\".\"t\" AS t", "t", true),
+}
+
+#[pg_test]
+fn v112_j_bare_alias_in_a_join_stays_correct() {
+    Spi::run("CREATE SCHEMA v112_j_baj_s").expect("schema");
+    v112_j_season_table("v112_j_baj_s.t");
+    v112_j_season_table("v112_j_baj_o");
+    let query = "SELECT t.season, COUNT(*) AS c, SUM(o.v) AS s FROM \"v112_j_baj_s\".t AS t \
+                 JOIN v112_j_baj_o o ON o.season = t.season GROUP BY t.season";
+    assert_eq!(
+        v112_j_spelling_cell(
+            "v112_j_baj",
+            query,
+            false,
+            &["v112_j_baj_s.t", "v112_j_baj_o"]
+        ),
+        "ok"
+    );
+}
+
+/// An UPDATE that brings a row into the WHERE filter of a join whose aliased
+/// source is the joined table, keyed by the join column.
+fn v112_j_filter_entering_update_cell(tag: &str, from_template: &str) -> String {
+    let schema = format!("v112_j_{tag}_s");
+    Spi::run(&format!("CREATE SCHEMA {schema}")).expect("schema");
+    v112_j_season_table(&format!("{schema}.t"));
+    Spi::run(&format!("INSERT INTO {schema}.t(season, v) VALUES ('n',-1),('n',-2)")).expect("seed");
+    let other = format!("v112_j_{tag}_o");
+    v112_j_season_table(&other);
+    Spi::run(&format!("INSERT INTO {other}(season, v) VALUES ('k',4),('k',4),('k',5)")).expect("seed");
+    let imv = format!("v112_j_{tag}");
+    let query = format!(
+        "SELECT t.id, COUNT(*) AS c, SUM(o.id) AS s FROM {other} o JOIN {} ON o.v = t.id \
+         WHERE t.v > 0 GROUP BY t.id",
+        from_template.replace("{s}", &schema)
+    );
+    let created = v112_j_try(&format!(
+        "SELECT create_reflex_ivm('{imv}', $v112sel${query}$v112sel$)"
+    ));
+    if created != "CREATE REFLEX INCREMENTAL VIEW" {
+        return format!("NOT-CREATED {created}");
+    }
+    let mut outcomes = vec![("create".to_string(), v112_j_oracle(&imv, &query))];
+    let steps = [
+        ("enter", format!("UPDATE {schema}.t SET v = 50 WHERE id = 4")),
+        ("leave", format!("UPDATE {schema}.t SET v = -5 WHERE id = 1")),
+        ("enter_many", format!("UPDATE {schema}.t SET v = 7 WHERE v < 0")),
+        ("ins", format!("INSERT INTO {schema}.t(season, v) VALUES ('z',9)")),
+        ("del", format!("DELETE FROM {schema}.t WHERE id = 4")),
+        ("other_ins", format!("INSERT INTO {other}(season, v) VALUES ('k',5),('k',6)")),
+    ];
+    for (label, dml) in steps {
+        let ran = v112_j_try_dml(&dml);
+        if ran != "OK" {
+            outcomes.push((label.to_string(), ran));
+            break;
+        }
+        outcomes.push((label.to_string(), v112_j_oracle(&imv, &query)));
+    }
+    if outcomes.iter().all(|(_, outcome)| outcome == "0") {
+        return "ok".to_string();
+    }
+    outcomes
+        .iter()
+        .map(|(label, outcome)| format!("{label}={outcome}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+#[pg_test]
+fn v112_j_filter_entering_update_quoted_schema_bare_alias() {
+    assert_eq!(v112_j_filter_entering_update_cell("fe_qs", "\"{s}\".t AS t"), "ok");
+}
+
+#[pg_test]
+fn v112_j_filter_entering_update_fully_quoted_bare_alias() {
+    assert_eq!(v112_j_filter_entering_update_cell("fe_fq", "\"{s}\".\"t\" AS t"), "ok");
+}
+
+#[pg_test]
+fn v112_j_filter_entering_update_unquoted_bare_alias() {
+    assert_eq!(v112_j_filter_entering_update_cell("fe_un", "{s}.t AS t"), "ok");
+}
+
+#[pg_test]
+fn v112_j_filter_entering_update_quoted_schema_implicit_bare_alias() {
+    assert_eq!(v112_j_filter_entering_update_cell("fe_oa", "\"{s}\".t t"), "ok");
+}
