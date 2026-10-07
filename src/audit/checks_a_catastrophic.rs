@@ -119,8 +119,7 @@ impl Check for TriggerAttached {
         // (`__reflex_trigger_ins_on_public_<sub>`, note the qualified suffix) and
         // does not clear a mirror-trigger finding, so an operator following it
         // accumulates junk triggers on every retry. `reflex_rebuild_union_mirror`
-        // is the correct repair primitive for this shape (added alongside this
-        // check — see `untreated_bugs/2026-07-24_union_mirror_triggers_unchecked.md`).
+        // is the correct repair primitive for this shape.
         if imv.is_decomposed_wrapper() {
             // Bare registry name, NOT `resolved_imv_name` — this is the exact
             // key `reflex_rebuild_union_mirror` looks up with `WHERE name =
@@ -392,7 +391,7 @@ impl Check for InternalTablesExist {
         let mut required: Vec<String> = Vec::new();
 
         // Sources whose per-(IMV, source) passthrough scratch pair is missing.
-        // Recovery has TWO halves (PS-6): `reflex_rebuild_triggers(<source>)`
+        // Recovery has TWO halves: `reflex_rebuild_triggers(<source>)`
         // recreates the scratch (reconcile alone never does — it rebuilds the
         // target and would report success while the IMV stays wedged), and
         // `reflex_reconcile(<imv>)` backfills the deltas the wedge silently lost
@@ -403,20 +402,18 @@ impl Check for InternalTablesExist {
         let mut sources_missing_scratch: Vec<String> = Vec::new();
 
         // A decomposed WRAPPER row owns no internal relation of EITHER branch, so
-        // `required` stays empty and the check is silent. Before 1.11.1 it fell
-        // into the aggregate branch — `RegistryRow::decomposed` writes
-        // `aggregations = '{}'`, so `is_passthrough()` `unwrap_or(false)`d — and
-        // every set-op / DISTINCT ON / window IMV in the database carried a
-        // permanent Error-severity finding demanding
+        // `required` stays empty and the check is silent. In the aggregate branch
+        // — `RegistryRow::decomposed` writes `aggregations = '{}'`, so
+        // `is_passthrough()` `unwrap_or(false)`s — every set-op / DISTINCT ON /
+        // window IMV would carry a permanent Error-severity finding demanding
         // `__reflex_intermediate_<view>` + `__reflex_affected_<view>` for a node
         // that must not have them. Its printed remedy could not clear it and, on a
-        // VIEW wrapper, raised `"<view>" is not a table`.
+        // VIEW wrapper, would raise `"<view>" is not a table`.
         //
-        // Sending wrappers to the passthrough branch instead (the fix direction the
-        // field report proposed) would only move the false positive: that branch
-        // demands a scratch PAIR per real source, and a wrapper's real sources are
-        // its sub-IMVs, for which no pair exists either. Probed — see
-        // `ImvRow::is_decomposed_wrapper`.
+        // Sending wrappers to the passthrough branch instead would only move the
+        // false positive: that branch demands a scratch PAIR per real source, and
+        // a wrapper's real sources are its sub-IMVs, for which no pair exists
+        // either. See `ImvRow::is_decomposed_wrapper`.
         if imv.is_decomposed_wrapper() {
             return vec![];
         }
@@ -438,7 +435,7 @@ impl Check for InternalTablesExist {
             }
         } else {
             // Aggregate IMVs use an intermediate table and affected groups table.
-            // Both are recreated by `reflex_reconcile`'s heal step (1.11.1), which
+            // Both are recreated by `reflex_reconcile`'s heal step, which
             // is what makes the `reflex_rebuild_imv` remedy below converge.
             required.push(crate::query_decomposer::intermediate_table_name(&imv.name));
             required.push(crate::query_decomposer::affected_groups_table_name(
