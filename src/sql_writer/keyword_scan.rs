@@ -206,6 +206,37 @@ mod tests {
         assert!(!has_keyword("SELECT 'abc GROUP BY g", " GROUP BY "));
     }
 
+    #[test]
+    fn letter_e_ending_an_identifier_does_not_open_an_escape_string() {
+        assert!(has_keyword(
+            "SELECT date'a\\' FROM t GROUP BY g",
+            " GROUP BY "
+        ));
+    }
+
+    #[test]
+    fn dollar_inside_an_identifier_is_not_a_dollar_quote() {
+        let sql = "SELECT a$b$ FROM t GROUP BY c$b$";
+        assert_eq!(
+            positions(sql, " GROUP BY "),
+            vec![sql.find(" GROUP BY ").unwrap()]
+        );
+    }
+
+    #[test]
+    fn digit_led_tag_is_not_a_dollar_quote() {
+        assert!(has_keyword("SELECT $1$ FROM t GROUP BY x$1$", " GROUP BY "));
+    }
+
+    #[test]
+    fn nested_block_comment_ends_at_its_outer_close() {
+        let sql = "SELECT g /* a /* b */ GROUP BY c */ FROM t GROUP BY g";
+        assert_eq!(
+            positions(sql, " GROUP BY "),
+            vec![sql.rfind(" GROUP BY ").unwrap()]
+        );
+    }
+
     proptest! {
         #[test]
         fn agrees_with_legacy_search_when_nothing_is_quoted(
