@@ -384,13 +384,25 @@ fn function_contract_violation(
         .filter(|name| !SUPPORTED_AGGREGATES.contains(&name.as_str()))
         .map(|name| name.to_uppercase())
         .collect();
-    if !unsupported.is_empty() {
+    if !unsupported.is_empty() && !is_single_level_passthrough(analysis) {
         return Some(format!(
             "Unsupported aggregate(s): {}. Supported: SUM, COUNT, AVG, MIN, MAX, BOOL_OR",
             unsupported.join(", ")
         ));
     }
     None
+}
+
+/// One SELECT with no nested query that the planner maintains as a passthrough: no
+/// GROUP BY and no aggregate it decomposes. Every write recomputes such an IMV from its
+/// own query, so an aggregate pg_reflex cannot decompose is still evaluated by PostgreSQL.
+fn is_single_level_passthrough(analysis: &crate::sql_analyzer::SqlAnalysis) -> bool {
+    analysis.set_operation.is_none()
+        && !analysis.has_nested_query
+        && !analysis.has_distinct_on
+        && !analysis.has_window_function
+        && analysis.having_clause.is_none()
+        && plan_aggregation(analysis).is_passthrough
 }
 
 /// A non-aggregate SELECT item beside aggregates, with no GROUP BY to key it on.
