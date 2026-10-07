@@ -1462,11 +1462,7 @@ pub(crate) fn aggregate_epilogue_stmts(
                             &[],
                         ));
                     } else {
-                        if skip_target_delete {
-                            stmts.push(format!("INSERT INTO {} {}", qv, end_query));
-                        } else {
-                            stmts.push(rebuild);
-                        }
+                        stmts.push(rebuild);
                     }
                 }
             }
