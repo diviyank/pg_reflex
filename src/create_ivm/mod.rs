@@ -115,9 +115,7 @@ pub(crate) struct DecomposeCtx<'a> {
 /// Phase 1 of the create-IMV pipeline.
 ///
 /// Normalizes `storage`/`refresh`, validates the view name, parses the SQL
-/// and runs [`crate::sql_analyzer::analyze`] on it. Also rejects DISTINCT on
-/// aggregates other than COUNT (only COUNT(DISTINCT) is incrementally
-/// maintainable).
+/// and runs [`crate::sql_analyzer::analyze`] on it.
 ///
 /// Returns the error string verbatim on the `Err` arm so the caller can
 /// `return` it unchanged — preserves byte-identical error reporting.
@@ -160,26 +158,6 @@ fn validate_and_parse_inputs(
         Ok(a) => {
             if let Some(reason) = a.unsupported_reason() {
                 return Err(crate::reflex_reject(&reason));
-            }
-            // Reject SUM(DISTINCT), AVG(DISTINCT), etc. — DISTINCT modifier is only
-            // supported on COUNT. Check the original SQL for the pattern.
-            let sql_upper = sql.to_uppercase();
-            let has_distinct_agg = sql_upper.contains("SUM(DISTINCT")
-                || sql_upper.contains("SUM (DISTINCT")
-                || sql_upper.contains("AVG(DISTINCT")
-                || sql_upper.contains("AVG (DISTINCT")
-                || sql_upper.contains("MIN(DISTINCT")
-                || sql_upper.contains("MIN (DISTINCT")
-                || sql_upper.contains("MAX(DISTINCT")
-                || sql_upper.contains("MAX (DISTINCT")
-                || sql_upper.contains("BOOL_OR(DISTINCT")
-                || sql_upper.contains("BOOL_OR (DISTINCT");
-            if has_distinct_agg {
-                return Err(crate::reflex_reject(
-                    "DISTINCT modifier on SUM/AVG/MIN/MAX/BOOL_OR is not supported. \
-                     Only COUNT(DISTINCT col) is supported. Use a CTE with SELECT DISTINCT \
-                     to pre-deduplicate: WITH d AS (SELECT DISTINCT grp, val FROM t) SELECT grp, SUM(val) FROM d GROUP BY grp"
-                ));
             }
             a
         }
