@@ -17,8 +17,8 @@ type ScannedRelation = (String, i64, i64);
 ///
 /// Includes partitioned parents (`relkind = 'p'`), not just ordinary tables: a
 /// partitioned IMV's intermediate table IS the parent, so scanning only `'r'`
-/// meant the parent was never seen while every one of its leaves — which are
-/// `'r'` and are never in the expected set — was reported as unowned.
+/// would never see the parent while every one of its leaves — which are
+/// `'r'` and are never in the expected set — would be reported as unowned.
 fn scan_relations_with_prefixes(client: &SpiClient<'_>, prefixes: &[&str]) -> Vec<ScannedRelation> {
     let mut out = Vec::new();
     for prefix in prefixes {
@@ -70,8 +70,8 @@ fn scan_relations_with_prefixes(client: &SpiClient<'_>, prefixes: &[&str]) -> Ve
 /// Ownership is a catalog fact, so it is decided on oids and never on name
 /// strings: the name-builders return `"schema"."x"` for a schema-qualified IMV
 /// but a bare `"x"` for a bare one, while the catalog scan always yields the
-/// qualified form — so for a bare-name IMV the two sets could never intersect and
-/// every one of its aux tables was reported as an orphan. A name that does not
+/// qualified form — so for a bare-name IMV the two sets would never intersect and
+/// every one of its aux tables would be reported as an orphan. A name that does not
 /// resolve owns nothing, which is the correct answer.
 fn resolve_expected_oids(client: &SpiClient<'_>, names: &HashSet<String>) -> HashSet<i64> {
     let mut oids = HashSet::new();
@@ -132,13 +132,11 @@ fn unowned_relations(expected: &HashSet<i64>, scanned: Vec<ScannedRelation>) -> 
 /// (`schema_table`), so re-qualifying a bare source would compute a table name
 /// that has never existed.
 ///
-/// Rows created before 1.7.2 keep `target_schema` NULL
-/// (`sql/pg_reflex--1.7.1--1.7.2.sql`), and a bare name left unqualified resolves
-/// through the session `search_path` — under a narrow one it resolves to nothing,
-/// putting every aux table of a live legacy IMV back in the orphan report with a
-/// `DROP … CASCADE`. `COALESCE(target_schema, 'public')` is the codebase's
-/// existing convention for that gap (`src/lib.rs:963`,
-/// `sql/pg_reflex--1.10.5--1.10.6.sql:65`).
+/// Rows registered before `target_schema` existed keep it NULL, and a bare name
+/// left unqualified resolves through the session `search_path` — under a narrow
+/// one it resolves to nothing, putting every aux table of a live legacy IMV in
+/// the orphan report with a `DROP … CASCADE`. `COALESCE(target_schema, 'public')`
+/// is the codebase's convention for that gap.
 fn resolved_imv_name(imv: &ImvRow) -> String {
     match crate::query_decomposer::canonical_source(&imv.name).0 {
         Some(_) => imv.name.clone(),
