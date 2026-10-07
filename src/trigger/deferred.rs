@@ -11,7 +11,7 @@ use pgrx::PgBuiltInOids;
 /// no-op for every IMV shape (an old/new pair already nets to zero in both the
 /// passthrough delete+insert and the aggregate decrement+increment). Without it
 /// a key touched twice before the flush stages two new-side rows and trips the
-/// unique constraint (docs/fuzz-findings.md finding #2).
+/// unique constraint.
 ///
 /// Two equivalent strategies, chosen by `any_text_cast`:
 ///
@@ -1480,7 +1480,6 @@ fn flush_staged_deltas(source_table: &str) -> String {
         // U_NEW(v1): the new side then holds BOTH v0 and v1 for k. Feeding that
         // straight into maintenance makes the passthrough INSERT add two rows for
         // k → "duplicate key value violates unique constraint __reflex_uk_*"
-        // (docs/fuzz-findings.md finding #2).
         //
         // Net the two sides against each other (multiset difference): a row that
         // appears identically on both sides contributes zero net change, so it is
