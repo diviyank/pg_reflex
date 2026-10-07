@@ -310,3 +310,128 @@ fn v112_sr_partition_reconcile_with_multibyte_key_stays_correct() {
     assert!(reconciled.starts_with("RECONCILED"), "{reconciled}");
     assert_imv_correct("v112_sr_pp_v", q);
 }
+
+fn v112_sr_assert_self_join_correct(tag: &str, table_ref: &str) {
+    let table = format!("v112_sr_sj{tag}.t");
+    Spi::run(&format!("CREATE SCHEMA v112_sr_sj{tag}")).expect("schema");
+    v112_sr_seeded_table(&table, "e");
+    let q = format!(
+        "SELECT a.season, COUNT(*) AS c, SUM(b.v) AS s FROM {table_ref} a \
+         JOIN {table_ref} b ON a.season = b.season GROUP BY a.season"
+    );
+    let imv = format!("v112_sr_sj{tag}_v");
+    v112_sr_imv(&imv, &q);
+    v112_sr_assert_correct_through_dml(&table, "e", &[(&imv, &q)]);
+}
+
+#[pg_test]
+fn v112_sr_self_join_unquoted_stays_correct() {
+    v112_sr_assert_self_join_correct("u", "v112_sr_sju.t");
+}
+
+#[pg_test]
+fn v112_sr_self_join_fully_quoted_stays_correct() {
+    v112_sr_assert_self_join_correct("q", "\"v112_sr_sjq\".\"t\"");
+}
+
+#[pg_test]
+fn v112_sr_self_join_quoted_schema_stays_correct() {
+    v112_sr_assert_self_join_correct("m", "\"v112_sr_sjm\".t");
+}
+
+#[pg_test]
+fn v112_sr_self_join_quoted_table_stays_correct() {
+    v112_sr_assert_self_join_correct("n", "v112_sr_sjn.\"t\"");
+}
+
+fn v112_sr_outer_join_fixture(tag: &str) -> (String, String) {
+    let dim = format!("v112_sr_oj{tag}.dim");
+    let fact = format!("v112_sr_oj{tag}_fact");
+    Spi::run(&format!("CREATE SCHEMA v112_sr_oj{tag}")).expect("schema");
+    Spi::run(&format!("CREATE TABLE {dim}(kind TEXT PRIMARY KEY, label TEXT)")).expect("dim");
+    Spi::run(&format!("CREATE TABLE {fact}(id SERIAL PRIMARY KEY, kind TEXT, v INT)"))
+        .expect("fact");
+    Spi::run(&format!("INSERT INTO {dim} VALUES ('a','A'),('b','B'),('u','U')")).expect("dim seed");
+    Spi::run(&format!(
+        "INSERT INTO {fact}(kind, v) VALUES ('a',1),('b',2),('c',3),('a',4)"
+    ))
+    .expect("fact seed");
+    (dim, fact)
+}
+
+fn v112_sr_assert_correct_through_dim_dml(dim: &str, imv: &str, q: &str) {
+    assert_imv_correct(imv, q);
+    Spi::run(&format!("INSERT INTO {dim} VALUES ('c','C'),('w','W')")).expect("dim insert");
+    assert_imv_correct(imv, q);
+    Spi::run(&format!("UPDATE {dim} SET label = 'A2' WHERE kind = 'a'")).expect("dim update");
+    assert_imv_correct(imv, q);
+    Spi::run(&format!("DELETE FROM {dim} WHERE kind = 'b'")).expect("dim delete");
+    assert_imv_correct(imv, q);
+}
+
+fn v112_sr_assert_correct_through_fact_dml(fact: &str, imv: &str, q: &str) {
+    Spi::run(&format!("INSERT INTO {fact}(kind, v) VALUES ('a',10),('z',20)")).expect("fact insert");
+    assert_imv_correct(imv, q);
+    Spi::run(&format!("UPDATE {fact} SET v = v + 100 WHERE id = 1")).expect("fact update");
+    assert_imv_correct(imv, q);
+    Spi::run(&format!("DELETE FROM {fact} WHERE id = 3")).expect("fact delete");
+    assert_imv_correct(imv, q);
+}
+
+fn v112_sr_assert_correct_through_outer_join_dml(dim: &str, fact: &str, imv: &str, q: &str) {
+    v112_sr_assert_correct_through_dim_dml(dim, imv, q);
+    v112_sr_assert_correct_through_fact_dml(fact, imv, q);
+}
+
+fn v112_sr_assert_left_join_secondary_correct(tag: &str, dim_ref: &str) {
+    let (dim, fact) = v112_sr_outer_join_fixture(tag);
+    let q = format!(
+        "SELECT d.label, COUNT(*) AS c, SUM(f.v) AS s FROM {fact} f \
+         LEFT JOIN {dim_ref} d ON d.kind = f.kind GROUP BY d.label"
+    );
+    let imv = format!("v112_sr_oj{tag}_v");
+    v112_sr_imv(&imv, &q);
+    v112_sr_assert_correct_through_outer_join_dml(&dim, &fact, &imv, &q);
+}
+
+#[pg_test]
+fn v112_sr_left_join_secondary_unquoted_stays_correct() {
+    v112_sr_assert_left_join_secondary_correct("u", "v112_sr_oju.dim");
+}
+
+#[pg_test]
+fn v112_sr_left_join_secondary_fully_quoted_stays_correct() {
+    v112_sr_assert_left_join_secondary_correct("q", "\"v112_sr_ojq\".\"dim\"");
+}
+
+#[pg_test]
+fn v112_sr_left_join_secondary_quoted_schema_stays_correct() {
+    v112_sr_assert_left_join_secondary_correct("m", "\"v112_sr_ojm\".dim");
+}
+
+#[pg_test]
+fn v112_sr_left_join_secondary_quoted_table_stays_correct() {
+    v112_sr_assert_left_join_secondary_correct("n", "v112_sr_ojn.\"dim\"");
+}
+
+#[pg_test]
+fn v112_sr_right_join_with_mixed_spelling_stays_correct() {
+    let (dim, fact) = v112_sr_outer_join_fixture("r");
+    let q = format!(
+        "SELECT d.label, COUNT(*) AS c, SUM(f.v) AS s FROM {fact} f \
+         RIGHT JOIN \"v112_sr_ojr\".dim d ON d.kind = f.kind GROUP BY d.label"
+    );
+    v112_sr_imv("v112_sr_ojr_v", &q);
+    v112_sr_assert_correct_through_dim_dml(&dim, "v112_sr_ojr_v", &q);
+}
+
+#[pg_test]
+fn v112_sr_full_join_with_mixed_spelling_stays_correct() {
+    let (dim, fact) = v112_sr_outer_join_fixture("f");
+    let q = format!(
+        "SELECT d.label, COUNT(*) AS c, SUM(f.v) AS s FROM {fact} f \
+         FULL JOIN v112_sr_ojf.\"dim\" d ON d.kind = f.kind GROUP BY d.label"
+    );
+    v112_sr_imv("v112_sr_ojf_v", &q);
+    v112_sr_assert_correct_through_outer_join_dml(&dim, &fact, "v112_sr_ojf_v", &q);
+}

@@ -289,6 +289,53 @@ pub fn substitute_identifier_ci(expr: &str, ident: &str, replacement: &str) -> S
     out
 }
 
+/// Every spelling under which a query may reference `source_table`, in the
+/// order the rewrite must replace them.
+pub(super) fn rewritten_source_spellings(source_table: &str) -> Vec<String> {
+    // A stored source can be *referenced* in `base_query` in any quoting
+    // spelling, independent of how it was registered: a CTE sub-IMV source is
+    // registered bare (`schema.bare`) but emitted **quoted**
+    // (`"schema"."bare"`) in the decomposed parent's `base_query`, and a user
+    // may quote only one of the two parts. The quoted
+    // spellings MUST be rewritten before the bare-token pass, otherwise that
+    // pass matches `bare` *inside* the existing quotes (`"bare"`) and injects
+    // the already-quoted transition name, producing `"schema".""__reflex_…""`
+    // — a zero-length delimited identifier the scanner rejects (42601).
+    let (schema, bare_source) = split_qualified(source_table);
+    let bare_unq = bare_source.trim_matches('"');
+    let mut spellings = Vec::new();
+    if let Some(s) = schema {
+        let schema_unq = s.trim_matches('"');
+        spellings.push(format!("\"{}\".\"{}\"", schema_unq, bare_unq));
+        spellings.push(format!("\"{}\".{}", schema_unq, bare_unq));
+        spellings.push(format!("{}.\"{}\"", schema_unq, bare_unq));
+    }
+    spellings.push(format!("\"{}\"", bare_unq));
+    spellings.push(source_table.to_string());
+    if bare_source != source_table {
+        // Bare column qualifiers (`bare.col`). Quoted spellings are already
+        // consumed above, so every remaining match here is genuinely unquoted.
+        spellings.push(bare_unq.to_string());
+    }
+    spellings
+}
+
+/// Whether `token`, one whitespace-delimited word of a query, names
+/// `source_table`. Recognises every spelling the rewrite replaces, and any
+/// other placement of double quotes around the same name, so a guard built on
+/// it can never miss a reference the rewrite would swap for a transition table.
+/// Case-sensitive: callers fold `token` and `source_table` the same way first.
+pub fn token_names_source(token: &str, source_table: &str) -> bool {
+    let unquoted_token = token.replace('"', "");
+    let unquoted_source = source_table.replace('"', "");
+    let unquoted_bare = split_qualified(source_table).1.replace('"', "");
+    unquoted_token == unquoted_source
+        || unquoted_token == unquoted_bare
+        || rewritten_source_spellings(source_table)
+            .iter()
+            .any(|spelling| spelling == token)
+}
+
 /// Trigger-time delta-table rewriter: takes a stored `base_query` and rewrites
 /// every reference to the source table to use the transition table instead.
 ///
@@ -319,34 +366,9 @@ pub fn replace_source_with_transition(
     };
     let stripped = strip_redundant_bare_alias(base_query, source_table);
 
-    // A stored source can be *referenced* in `base_query` in any quoting
-    // spelling, independent of how it was registered: a CTE sub-IMV source is
-    // registered bare (`schema.bare`) but emitted **quoted**
-    // (`"schema"."bare"`) in the decomposed parent's `base_query`, and a user
-    // may quote only one of the two parts. The quoted
-    // spellings MUST be rewritten before the bare-token pass, otherwise that
-    // pass matches `bare` *inside* the existing quotes (`"bare"`) and injects
-    // the already-quoted transition name, producing `"schema".""__reflex_…""`
-    // — a zero-length delimited identifier the scanner rejects (42601).
-    let (schema, bare_source) = split_qualified(source_table);
-    let bare_unq = bare_source.trim_matches('"');
     let mut out = stripped;
-    if let Some(s) = schema {
-        let schema_unq = s.trim_matches('"');
-        for quoted_spelling in [
-            format!("\"{}\".\"{}\"", schema_unq, bare_unq),
-            format!("\"{}\".{}", schema_unq, bare_unq),
-            format!("{}.\"{}\"", schema_unq, bare_unq),
-        ] {
-            out = replace_identifier_outside_literals(&out, &quoted_spelling, &quoted_tbl);
-        }
-    }
-    out = replace_identifier_outside_literals(&out, &format!("\"{}\"", bare_unq), &quoted_tbl);
-    out = replace_identifier_outside_literals(&out, source_table, &quoted_tbl);
-    if bare_source != source_table {
-        // Bare column qualifiers (`bare.col`). Quoted spellings are already
-        // consumed above, so every remaining match here is genuinely unquoted.
-        out = replace_identifier_outside_literals(&out, bare_unq, &quoted_tbl);
+    for spelling in rewritten_source_spellings(source_table) {
+        out = replace_identifier_outside_literals(&out, &spelling, &quoted_tbl);
     }
     out
 }
