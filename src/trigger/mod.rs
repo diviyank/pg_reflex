@@ -12,7 +12,9 @@ use crate::query_decomposer::{
     quote_identifier, shrunk_groups_table_name, transition_new_table_name,
     transition_old_table_name,
 };
-use crate::sql_writer::identifier::{replace_source_with_transition, token_names_source};
+use crate::sql_writer::identifier::{
+    replace_source_with_transition, source_rewrite_breaks_quoted_identifier, token_names_source,
+};
 
 /// Per-backend cache of built delta SQL keyed by a hash of all inputs.
 /// Entries are content-addressable: identical inputs always produce identical
@@ -119,8 +121,9 @@ pub(crate) fn follows_outer_join_keyword(bq_upper: &str, source_table: &str) -> 
 
 /// Whether a write to `source_table` has no per-source delta, so the IMV is
 /// recomputed from `base_query`: the source is read more than once, the query
-/// holds a RIGHT JOIN, or the source is read inside a derived table or a
-/// parenthesised join that a LEFT JOIN null-extends.
+/// holds a RIGHT JOIN, the source is read inside a derived table or a
+/// parenthesised join that a LEFT JOIN null-extends, or the transition-table
+/// rewrite would break a quoted identifier of another relation.
 ///
 /// A RIGHT JOIN is never scoped. The table before the keyword is the
 /// null-extended one, which `follows_outer_join_keyword` never inspects, and the
@@ -133,6 +136,7 @@ pub(crate) fn has_no_scoped_delta(base_query: &str, source_table: &str) -> bool 
         || bq_upper.contains("RIGHT JOIN")
         || bq_upper.contains("RIGHT OUTER")
         || outer_join::source_inside_left_joined_subtree(&bq_upper, base_query, source_table)
+        || source_rewrite_breaks_quoted_identifier(base_query, source_table)
 }
 
 /// Generates the SQL statements to apply a delta to an IMV.

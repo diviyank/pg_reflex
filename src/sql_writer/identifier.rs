@@ -379,6 +379,16 @@ pub fn replace_source_with_transition(
     out
 }
 
+/// Whether [`replace_source_with_transition`] would replace text inside a
+/// double-quoted identifier that is not the source: `other."dim"` for the bare
+/// name `dim`. The result holds a zero-length delimited identifier, so such a
+/// query has no usable transition-table rewrite for this source.
+pub fn source_rewrite_breaks_quoted_identifier(base_query: &str, source_table: &str) -> bool {
+    const PROBE: &str = "\"__reflex_rewrite_probe\"";
+    let rewritten = replace_source_with_transition(base_query, source_table, PROBE);
+    rewritten.contains(&format!("\"{PROBE}")) || rewritten.contains(&format!("{PROBE}\""))
+}
+
 /// Scan forward from `start` looking for an optional table alias. Returns
 /// `(Some(alias), new_index)` if an alias (with or without `AS`) was consumed,
 /// else `(None, start)` so the caller can fall back to its default.
