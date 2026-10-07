@@ -161,26 +161,6 @@ fn validate_and_parse_inputs(
             if let Some(reason) = a.unsupported_reason() {
                 return Err(crate::reflex_reject(&reason));
             }
-            // Reject SUM(DISTINCT), AVG(DISTINCT), etc. — DISTINCT modifier is only
-            // supported on COUNT. Check the original SQL for the pattern.
-            let sql_upper = sql.to_uppercase();
-            let has_distinct_agg = sql_upper.contains("SUM(DISTINCT")
-                || sql_upper.contains("SUM (DISTINCT")
-                || sql_upper.contains("AVG(DISTINCT")
-                || sql_upper.contains("AVG (DISTINCT")
-                || sql_upper.contains("MIN(DISTINCT")
-                || sql_upper.contains("MIN (DISTINCT")
-                || sql_upper.contains("MAX(DISTINCT")
-                || sql_upper.contains("MAX (DISTINCT")
-                || sql_upper.contains("BOOL_OR(DISTINCT")
-                || sql_upper.contains("BOOL_OR (DISTINCT");
-            if has_distinct_agg {
-                return Err(crate::reflex_reject(
-                    "DISTINCT modifier on SUM/AVG/MIN/MAX/BOOL_OR is not supported. \
-                     Only COUNT(DISTINCT col) is supported. Use a CTE with SELECT DISTINCT \
-                     to pre-deduplicate: WITH d AS (SELECT DISTINCT grp, val FROM t) SELECT grp, SUM(val) FROM d GROUP BY grp"
-                ));
-            }
             a
         }
     };

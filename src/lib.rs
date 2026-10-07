@@ -1858,6 +1858,7 @@ mod tests {
     include!("tests/pg_test_rebuild_commit.rs");
     include!("tests/pg_test_deferred_marker.rs");
     include!("tests/pg_test_deferred_reconcile.rs");
+    include!("tests/pg_test_v112_distinct.rs");
 }
 
 /// This module is required by `cargo pgrx test` invocations.

@@ -1063,3 +1063,77 @@ mod proptest_tests {
         }
     }
 }
+
+fn rejection_of(sql: &str) -> Option<String> {
+    parse_and_analyze(sql).unsupported_reason()
+}
+
+#[test]
+fn distinct_aggregate_rejected_in_every_spelling() {
+    for agg in [
+        "SUM",
+        "AVG",
+        "MIN",
+        "MAX",
+        "BOOL_OR",
+        "sum",
+        "pg_catalog.sum",
+        "\"sum\"",
+    ] {
+        for open in [
+            "(DISTINCT ",
+            " (DISTINCT ",
+            "( DISTINCT ",
+            "(\n  DISTINCT ",
+            "(/**/DISTINCT ",
+            "(distinct ",
+        ] {
+            let sql = format!("SELECT g, {agg}{open}v) AS s FROM t GROUP BY g");
+            let reason = rejection_of(&sql);
+            assert!(
+                reason
+                    .as_deref()
+                    .is_some_and(|r| r.contains("DISTINCT modifier")),
+                "not rejected: {sql} -> {reason:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn distinct_aggregate_rejected_in_every_position() {
+    for sql in [
+        "SELECT g, SUM( DISTINCT v) + 1 AS s FROM t GROUP BY g",
+        "SELECT g, COUNT(*) AS c FROM t GROUP BY g HAVING SUM( DISTINCT v) > 3",
+        "WITH c AS (SELECT g, SUM( DISTINCT v) AS s FROM t GROUP BY g) SELECT g, s FROM c",
+        "SELECT g, SUM(v) AS s FROM t GROUP BY g UNION ALL SELECT g, SUM( DISTINCT v) FROM u GROUP BY g",
+        "SELECT g, CASE WHEN AVG( DISTINCT v) > 0 THEN 1 ELSE 0 END AS f FROM t GROUP BY g",
+        "SELECT g, SUM(v) AS s FROM t WHERE v > (SELECT MAX( DISTINCT v) FROM u) GROUP BY g",
+    ] {
+        assert!(
+            rejection_of(sql).is_some_and(|r| r.contains("DISTINCT modifier")),
+            "not rejected: {sql}"
+        );
+    }
+}
+
+#[test]
+fn count_distinct_and_literals_are_not_rejected() {
+    for sql in [
+        "SELECT g, COUNT(DISTINCT v) AS c FROM t GROUP BY g",
+        "SELECT g, COUNT( DISTINCT v) AS c FROM t GROUP BY g",
+        "SELECT g, pg_catalog.count(DISTINCT v) AS c FROM t GROUP BY g",
+        "SELECT g, COUNT(DISTINCT v) FILTER (WHERE v > 0) AS c FROM t GROUP BY g",
+        "SELECT g, 'SUM(DISTINCT x)' AS d, SUM(v) AS s FROM t GROUP BY g",
+        "SELECT g, SUM(v) AS s FROM t WHERE g <> 'max (distinct' GROUP BY g",
+        "SELECT DISTINCT g FROM t",
+    ] {
+        let reason = rejection_of(sql);
+        assert!(
+            !reason
+                .as_deref()
+                .is_some_and(|r| r.contains("DISTINCT modifier")),
+            "wrongly rejected: {sql} -> {reason:?}"
+        );
+    }
+}
