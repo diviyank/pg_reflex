@@ -10,7 +10,7 @@ use crate::sql_writer::identifier::{replace_source_with_transition, token_names_
 /// Aggregate-IMV `INSERT` / `INSERT_PROMOTED` arm of [`reflex_build_delta_sql`].
 ///
 /// Pushes the materialized scratch fill + MERGE statements onto `stmts`.
-/// Bulk-INSERT (skipping MERGE) only fires when the operation is an Item α
+/// Bulk-INSERT (skipping MERGE) only fires when the operation is an
 /// `INSERT_PROMOTED` *and* the source has a `source_join_keys` entry — see
 /// the in-body comment for why regular `INSERT` always takes the MERGE path.
 #[allow(clippy::too_many_arguments)]
@@ -29,7 +29,7 @@ pub(crate) fn aggregate_insert_stmts(
     let delta_q = scoped_delta_query(base_query, source_table, new_tbl);
 
     // Bulk-INSERT eligibility:
-    //   * Item α promoted OUT→IN (op = INSERT_PROMOTED), AND
+    //   * promoted OUT→IN (op = INSERT_PROMOTED), AND
     //   * plan.source_join_keys has an entry for the trigger
     //     source → the source's identity uniquely determines
     //     its slice of intermediate group keys; the OLD-side
@@ -54,12 +54,6 @@ pub(crate) fn aggregate_insert_stmts(
                 &select_expr,
             );
         } else {
-            // 1.4.6 attempt + revert (earlier in this same
-            // session): an earlier draft wired the dispatch
-            // DO block into the grouped INSERT path so Item α's
-            // promoted bulk flips could re-route to reconcile.
-            // Reverted because scratch-fill cost dominates;
-            // see journal/2026-05-15_dispatch_wiring_revert.md.
             push_materialized_merge_and_affected(
                 stmts,
                 scratch_tbl,
@@ -113,7 +107,7 @@ pub(crate) fn aggregate_delete_stmts(
     let delta_q = scoped_delta_query(base_query, source_table, old_tbl);
 
     // Bulk-DELETE eligibility:
-    //   * Item α IN→OUT promotion (op = DELETE_PROMOTED) OR a
+    //   * IN→OUT promotion (op = DELETE_PROMOTED) OR a
     //     regular DELETE on a source that has the safety mapping.
     //   * plan.source_join_keys has an entry for the trigger
     //     source (JOIN-secondary, mapping covers a unique key
@@ -152,12 +146,9 @@ pub(crate) fn aggregate_delete_stmts(
 
     let recompute_scope: Option<&str> = if let Some(ref cols) = grp_cols {
         let select_expr = affected_groups_select(cols);
-        // 1.4.6 attempt + revert: same wasted-scratch problem as
-        // the INSERT branch above. Bulk DELETE-shape (Item α
-        // IN→OUT promotion) pays ~50–100 s for scratch fill on
-        // alp; the dispatch win when reconcile is cheaper is
-        // smaller than the scratch overhead. Stay on the inline
-        // MERGE + dead-cleanup path.
+        // Same wasted-scratch problem as the INSERT branch above: a bulk DELETE
+        // pays a large scratch fill, which outweighs the dispatch win when
+        // reconcile is cheaper. Stay on the inline MERGE + dead-cleanup path.
         push_materialized_merge_and_affected(
             stmts,
             scratch_tbl,
@@ -182,7 +173,7 @@ pub(crate) fn aggregate_delete_stmts(
         None
     };
     if has_min_max {
-        // Top-K (1.3.0): refresh scalar __min_x / __max_x from
+        // Top-K: refresh scalar __min_x / __max_x from
         // topk[1] for groups whose heap survived the subtract,
         // BEFORE the source-scan recompute. The recompute then
         // only fires for actually-underflowed groups.
@@ -256,7 +247,7 @@ pub(crate) fn aggregate_update_stmts(
                 &select_expr,
                 true,
             );
-            // N1: capture groups whose heap shrank below K post-Sub.
+            // Capture groups whose heap shrank below K post-Sub.
             // Must run BEFORE Add (which would re-fill the heap and
             // hide the shrinkage signal) and BEFORE topk_refresh
             // (which doesn't move the cardinality but ordering kept
@@ -360,7 +351,7 @@ pub(crate) fn aggregate_update_stmts(
         let cols = grp_cols.as_ref().expect("grp_cols is Some — checked above");
         let net_delta = build_net_delta_query(&delta_old, &delta_new, plan);
         let select_expr = affected_groups_select(cols);
-        // 1.4.5: emit scratch + affected EARLY so the dispatch
+        // Emit scratch + affected EARLY so the dispatch
         // block below can read |affected| for the selectivity
         // check before deciding MERGE-vs-rebuild. The MERGE
         // statement itself moves into the dispatch DO block at
@@ -406,7 +397,7 @@ pub(crate) fn aggregate_update_stmts(
     }
 }
 
-/// 1.4.5: when set, the cleanup/target-sync block at the end emits the
+/// When set, the cleanup/target-sync block at the end emits the
 /// high-selectivity dispatch DO block (TRUNCATE+rebuild OR MERGE+cleanup)
 /// instead of the standard MERGE-then-cleanup+target-sync sequence.
 pub(crate) struct PendingDispatch {
@@ -670,12 +661,12 @@ pub(crate) fn outer_join_secondary_stmts(
                 // qualifier differs between the DELETE (qv itself) and the
                 // INSERT (the `__bq` alias of base_query).
                 //
-                // PS-5: each predicate is a runtime-gated fast/safe PAIR, not a
+                // Each predicate is a runtime-gated fast/safe PAIR, not a
                 // single statically-chosen form. These target columns come off
                 // the NULLABLE side of the outer join, so `not_null_columns` can
-                // never contain them and the static choice was ALWAYS the
+                // never contain them and a static choice would ALWAYS be the
                 // non-sargable `IS NOT DISTINCT FROM` — a nested loop over the
-                // whole base relation (579x measured). See
+                // whole base relation. See
                 // `build_null_safe_membership_predicate_gated`, which attaches the
                 // `__ck` / `__ng` aliases itself. Both variants of each pair are
                 // emitted; the gate makes exactly one do work, and all DELETEs
@@ -742,7 +733,7 @@ pub(crate) fn outer_join_secondary_stmts(
     // builds its "affected groups" by re-aggregating the ENTIRE base with the
     // secondary swapped for its transition table — but the LEFT JOIN preserves
     // every primary row, so the affected set is ALL groups and a tiny secondary
-    // delta costs a full rebuild (18 min on db_dev sop_incoming_stock_baseline).
+    // delta costs a full rebuild.
     //
     // `source_join_keys` is populated only when every join equality maps to a
     // GROUP BY column AND the source columns cover a unique key of the secondary
@@ -862,7 +853,7 @@ pub(crate) fn outer_join_secondary_stmts(
             affected_tbl, select_expr, delta_q
         ));
 
-        // PS-5 — each affected-groups match expands into a self-gated
+        // Each affected-groups match expands into a self-gated
         // sargable/NULL-safe pair when any scope column is nullable, so every
         // slot below emits one statement per live variant.
         let ns_in_int = null_safe_in_gated(
@@ -976,10 +967,10 @@ fn source_not_null_cols(
         .collect()
 }
 
-/// PS-5 — the keyed passthrough DELETE/UPDATE membership match, as a
-/// runtime-gated fast/safe pair. This is the only form: the ungated variant was
-/// removed on 2026-07-27 when the partition-dispatch arm (its last caller)
-/// was gated too. Same cliff, same fix as `outer_join_secondary_stmts`: the NULL-safe
+/// The keyed passthrough DELETE/UPDATE membership match, as a
+/// runtime-gated fast/safe pair. This is the only form: every caller, the
+/// partition-dispatch arm included, is gated. Same cliff, same fix as
+/// `outer_join_secondary_stmts`: the NULL-safe
 /// branch matches the WHOLE target against `pt_old` with `IS NOT DISTINCT
 /// FROM`, which no operator family covers, so the planner's only option is a
 /// nested loop over the entire IMV.
@@ -1166,16 +1157,14 @@ pub(crate) fn passthrough_op_stmts(
                 if let Some((part_col, part_col_q, part_src_q, strategy)) =
                     passthrough_partition_dispatch_cols(plan, mappings).filter(|_| netted_delta)
                 {
-                    // Hybrid partition dispatch (audit #2): DELETE-only, so no
+                    // Hybrid partition dispatch: DELETE-only, so no
                     // cold INSERT body. Hot leaves are swapped (rebuilt from the
                     // post-delete source state); cold leaves get the keyed delete.
                     //
-                    // PS-5 (2026-07-27) gates this branch too. The old carve-out
-                    // assumed gating meant emitting the whole DO block per variant
-                    // — it does not: the cold DELETE is its own `EXECUTE` inside
-                    // the block, so the variants expand there while the hot-leaf
-                    // swap stays single. Same shape the aggregate sibling already
-                    // uses (`build_partition_aware_dispatch_sql_strategy`).
+                    // This branch is gated too: the cold DELETE is its own `EXECUTE`
+                    // inside the DO block, so the gated variants expand there while
+                    // the hot-leaf swap stays single. Same shape the aggregate
+                    // sibling uses (`build_partition_aware_dispatch_sql_strategy`).
                     let del_match = passthrough_keyed_delete_match(
                         &pt_old,
                         &qv,
@@ -1247,13 +1236,13 @@ pub(crate) fn passthrough_op_stmts(
                 if let Some((part_col, part_col_q, part_src_q, strategy)) =
                     passthrough_partition_dispatch_cols(plan, mappings).filter(|_| netted_delta)
                 {
-                    // Hybrid partition dispatch (audit #2): hot leaves swapped,
+                    // Hybrid partition dispatch: hot leaves swapped,
                     // cold leaves keyed-maintained. The cold DELETE extends the
                     // keyed predicate with the hot-exclusion filter; the cold
                     // INSERT re-runs the delta projection (which reads pt_new) for
                     // cold partitions only.
                     //
-                    // PS-5 (2026-07-27): the cold DELETE is a gated pair — see the
+                    // The cold DELETE is a gated pair — see the
                     // DELETE arm above for why gating cannot double-swap. The cold
                     // INSERT needs no gate: it is scoped by `pt_new` through
                     // `scoped_delta_query`, not by a membership predicate.
@@ -1311,7 +1300,7 @@ pub(crate) fn passthrough_op_stmts(
                         &ins_cold,
                     ));
                 } else {
-                    // PS-5 — gated pair on the unpartitioned path only; see the
+                    // Gated pair on the unpartitioned path only; see the
                     // DELETE branch for why the partition-dispatch DO block above
                     // must keep the single always-NULL-safe form. The INSERT is
                     // unaffected (it is scoped by `pt_new`, not by a membership
@@ -1413,7 +1402,7 @@ pub(crate) fn aggregate_epilogue_stmts(
                 &plan.not_null_columns,
             ) {
                 Some(spliced_end_qs) => {
-                    // PS-5 — the spliced INSERT and the target DELETE each expand
+                    // The spliced INSERT and the target DELETE each expand
                     // into one statement per live variant of the gated match.
                     let ns_in_target = null_safe_in_gated(
                         affected_tbl,
@@ -1467,7 +1456,7 @@ pub(crate) fn aggregate_epilogue_stmts(
     } else if let Some(ref cols) = grp_cols {
         let qv = quote_identifier(view_name);
         let target_cols = target_group_columns(plan);
-        // PS-5 — a nullable group key expands each affected-groups match into a
+        // A nullable group key expands each affected-groups match into a
         // self-gated sargable/NULL-safe pair, so every slot below is a LIST of
         // statements. Exactly one member of each pair does work at run time; the
         // other's plan is skipped by a `One-Time Filter`.

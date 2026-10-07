@@ -11,18 +11,18 @@ use crate::validate_view_name;
 /// an intermediate and it is absent — dropped by hand, lost to a
 /// `DROP … CASCADE`, or removed with a schema.
 ///
-/// Until 1.11.1 nothing in the extension re-issued that DDL (it was emitted only at
-/// create time), so `internal-tables-exist` reported the absence at Error severity
-/// and prescribed `reflex_rebuild_imv`, a literal alias for [`reflex_reconcile`]
-/// (`src/lib.rs:823`) — which could not repair it: the partitioned path needs an
-/// existing parent to ATTACH swap children to (`ERROR: partition reconcile failed`,
+/// Nothing else in the extension re-issues that DDL (it is emitted only at create
+/// time), yet `internal-tables-exist` reports the absence at Error severity and
+/// prescribes `reflex_rebuild_imv`, a literal alias for [`reflex_reconcile`] —
+/// which cannot repair it on its own: the partitioned path needs an existing
+/// parent to ATTACH swap children to (`ERROR: partition reconcile failed`,
 /// `missing intermediate bound for child …`) and the unpartitioned path raises
-/// 42P01 on `TRUNCATE {intermediate}`. An operator following the tool's own
-/// instruction retried forever.
+/// 42P01 on `TRUNCATE {intermediate}`. Without this heal, an operator following
+/// the tool's own instruction would retry forever.
 ///
 /// Runs BEFORE the pre-rebuild partition sync: `reflex_sync_partitions` gates every
 /// intermediate-child DDL on a `to_regclass` probe of the parent
-/// (`src/partition.rs:1055`), so with the parent restored its existing loop mirrors
+/// (in `src/partition.rs`), so with the parent restored its existing loop mirrors
 /// the partition tree and no new partition code is needed here.
 ///
 /// Everything needed is in the registry row — `aggregations` (the plan, with the
@@ -34,7 +34,7 @@ use crate::validate_view_name;
 ///
 /// Gated on [`crate::sql_writer::registry::owns_intermediate`] — the same predicate
 /// the audit classifies with — so it cannot build an intermediate for a passthrough
-/// IMV or a decomposed wrapper (the mirror image of the phantom drift PS-9 removed).
+/// IMV or a decomposed wrapper (the audit must not report an intermediate such an IMV never owns).
 ///
 /// Two INDEPENDENT probes, in build order: the intermediate first, then the
 /// group-capture companions — which a CTAS leaves with no catalog dependency on
@@ -200,8 +200,8 @@ fn heal_missing_intermediate_table(view_name: &str) {
 /// intermediate alone can never repair the companion-only shape. Nothing else in
 /// the extension re-issues that DDL, yet `internal-tables-exist` reports a missing
 /// `__reflex_affected_<view>` at Error severity and prints `reflex_rebuild_imv` —
-/// an alias for [`reflex_reconcile`] — as its remedy, so before this the finding
-/// could not be cleared by the fix the tool itself prescribed.
+/// an alias for [`reflex_reconcile`] — as its remedy, so this heal is what lets
+/// the finding be cleared by the fix the tool itself prescribes.
 ///
 /// Runs AFTER [`heal_missing_intermediate_table`] so the intermediate these DDLs
 /// select from is present whenever it can be. When it is still absent — that heal
@@ -355,7 +355,7 @@ pub(crate) fn is_decomposed_wrapper_row(view_name: &str) -> bool {
 /// first repairs the sub-IMVs pg_reflex generated for `view_name`.
 ///
 /// `drop_orphans` is forwarded to the pre-rebuild partition sync. The operator
-/// entry point passes `true` (unchanged from 1.10.11); the recursive descent
+/// entry point passes `true`; the recursive descent
 /// passes `false` so reconciling a chain does not multiply an orphan-dropping
 /// side effect the caller never asked for across every generated node in it.
 pub(crate) fn reconcile_one(view_name: &str, drop_orphans: bool) -> &'static str {
@@ -430,7 +430,7 @@ pub(crate) fn reconcile_one(view_name: &str, drop_orphans: bool) -> &'static str
             .map(|p| p.is_passthrough)
             .unwrap_or(false);
 
-        // 1.5.3 (plans/partitioning_3.md §1 follow-up): partitioned IMVs
+        // Partitioned IMVs
         // skip the TRUNCATE-on-parent pattern and rebuild each mirror LEAF via
         // the same atomic DETACH/ATTACH swap used by
         // `reflex_reconcile_partition`.
@@ -464,8 +464,8 @@ pub(crate) fn reconcile_one(view_name: &str, drop_orphans: bool) -> &'static str
                 // the swap a top-level child, which on a depth->=2 mirror is a
                 // PARTITIONED relation the swap cannot rebuild — its
                 // `LIKE ... INCLUDING ALL` replacement carries no partitioning,
-                // so the mirror was silently flattened and the next sync then
-                // recreated those children empty.
+                // so the mirror would be silently flattened and the next sync then
+                // recreate those children empty.
                 //
                 // Truncation keeps `depth <= mirror_depth` and demotes the nodes
                 // sitting exactly at `mirror_depth` to leaves, which is what
@@ -809,8 +809,8 @@ pub(crate) fn reconcile_one(view_name: &str, drop_orphans: bool) -> &'static str
             // ANALYZE intermediate so the planner has stats for any
             // subsequent incremental MERGE / dead-cleanup / target sync.
             //
-            // 1.4.6 (P1) — target ANALYZE was 3-7 s on alp's 7.7 M-row IMV
-            // and contributed nothing: pg_reflex's own SQL never plans
+            // The target is not ANALYZEd: a 7.7 M-row target takes 3-7 s and
+            // contributes nothing, since pg_reflex's own SQL never plans
             // against the target (only end_query reads from it, and
             // operator queries are out of scope). User analytic queries
             // benefit from a separate ANALYZE if needed, but blocking the
@@ -948,10 +948,9 @@ pub(crate) fn reflex_reconcile(view_name: &str) -> &'static str {
 /// [`reflex_reconcile`] with explicit control over whether the pre-rebuild
 /// partition sync may drop orphan IMV partitions.
 ///
-/// `reflex_reconcile` hardcodes `true`, which is 1.10.11 behaviour and stays the
-/// default for operators. `reflex_doctor` needs `false`: it refuses an F3 orphan
-/// drop when the operator did not pass `drop_orphans`, and then reached the same
-/// destruction through its F4 `reflex_reconcile` repair — a health tool removing a
+/// `reflex_reconcile` hardcodes `true`, the default for operators. `reflex_doctor` needs `false`: it refuses an F3 orphan
+/// drop when the operator did not pass `drop_orphans`, and would otherwise reach
+/// the same destruction through its F4 `reflex_reconcile` repair — a health tool removing a
 /// partition after authorization was declined. This entry point is what lets that
 /// caller honour its own gate.
 pub(crate) fn reflex_reconcile_with_orphans(view_name: &str, drop_orphans: bool) -> &'static str {
@@ -1136,7 +1135,7 @@ fn cascade_partitioned_rebuild_to_dependents(
 /// WARN when the trigger-depth gate suppresses recursion for an IMV that
 /// actually has generated children.
 ///
-/// Returning `RECONCILED` there is the B1 bug in miniature — a rebuild that
+/// Returning `RECONCILED` there would be a silent-wrong-result in miniature — a rebuild that
 /// re-derives from a child it did not refresh. It is the right behaviour on this
 /// path (the delta that fired the trigger made the child fresh, and DDL on the
 /// relation under its own statement trigger would error), but it must not be
@@ -1196,7 +1195,7 @@ fn inside_trigger() -> bool {
 }
 
 /// Record a targeted-recovery call and, when the target cannot be converged by an
-/// anchor-scoped rebuild, WARN loudly with the primitive that can (PS-14).
+/// anchor-scoped rebuild, WARN loudly with the primitive that can.
 ///
 /// Called only from the SQL entry-point wrappers `reflex_rebuild_imv`,
 /// `reflex_reconcile`, and the two-arg `reflex_reconcile` overload — the calls an
@@ -1227,7 +1226,7 @@ pub(crate) fn stamp_targeted_recovery(view_name: &str) {
 /// IMV, else `None`. Pure classifier over the registry — the testable seam behind
 /// the WARN in [`stamp_targeted_recovery`].
 ///
-/// Reuses PS-3's stored `requires_explicit_refresh` verdict and the existing
+/// Reuses the stored `requires_explicit_refresh` verdict and the existing
 /// `ignored_sources` / `partition_strategy` metadata rather than re-deriving
 /// matview-ness. Two non-convergence shapes:
 ///   * `requires_explicit_refresh` — every real source is a materialized view, so
@@ -1306,7 +1305,7 @@ const REBUILDABLE_NODE: &str = "COALESCE(ref.aggregations::text, '{}') <> '{}'";
 /// Decomposed nodes ([`REBUILDABLE_NODE`]) are excluded, and the walk does not
 /// descend *past* one either: rebuilding a wrapper's operands while leaving the
 /// wrapper stale would feed the parent from a half-refreshed subtree, which is
-/// worse than leaving that subtree exactly as a pre-1.11.0 reconcile left it.
+/// worse than leaving that subtree exactly as it is.
 fn generated_dependencies_shallowest_first(view_name: &str) -> Vec<String> {
     Spi::connect(|client| {
         client
@@ -1346,7 +1345,7 @@ fn generated_dependencies_shallowest_first(view_name: &str) -> Vec<String> {
 /// WARN for each generated sub-IMV the recursion had to skip because it is a
 /// decomposed node with no safe rebuild.
 ///
-/// Silence here would be the B1 failure mode again: a `RECONCILED` over a subtree
+/// Silence here would be a silent wrong result: a `RECONCILED` over a subtree
 /// nothing refreshed. Naming the node gives the operator something to act on.
 fn warn_about_skipped_decomposed_nodes(view_name: &str) {
     let skipped: Vec<String> = Spi::connect(|client| {
@@ -1459,8 +1458,7 @@ fn reconcile_generated_child_without_propagating(child: &str, drop_orphans: bool
 /// F4 repair, and `reflex_scheduled_reconcile`, which reconciles operands
 /// STANDALONE by design (they are `REBUILDABLE_NODE` and deliberately not
 /// "covered" by the wrapper above them), making every unattended drift sweep over
-/// such a chain double the wrapper. This is the 2026-07-24 report's residual, and
-/// the same mechanism the DEFERRED cross-source guard already routes around via
+/// such a chain double the wrapper. This is the same mechanism the DEFERRED cross-source guard already routes around via
 /// [`reconcile_generated_child_for_cross_source_guard`].
 ///
 /// Any other target — including a plain CTE sub-IMV, and a VIEW-based
@@ -1509,7 +1507,7 @@ fn reconcile_named_node(view_name: &str, drop_orphans: bool) -> &'static str {
 /// `reconcile_one`'s TRUNCATE-then-INSERT rebuild re-appends the operand's
 /// entire row set into its wrapper a second time, with nothing having removed
 /// the wrapper's stale slice. The wrapper (and anything reading it) silently
-/// doubles that operand's contribution — the 2026-07-25 bug this fixes.
+/// doubles that operand's contribution.
 ///
 /// Always rebuilds with propagation suppressed
 /// ([`reconcile_generated_child_without_propagating`], safe for any
@@ -1694,7 +1692,7 @@ type ScheduledReconcileRow = (String, String, i64, i64);
 /// Each per-IMV reconcile runs in isolation so one soft failure does not block
 /// the rest.
 ///
-/// Why a driver, not one call that does everything (B6): a single loop over a
+/// Why a driver, not one call that does everything: a single loop over a
 /// 190-IMV / 415-schema registry cannot finish under a sane `statement_timeout`,
 /// and a timeout discards every rebuild already done — pgrx cannot commit
 /// per-IMV in-process (a set-returning function runs in an atomic context, and
@@ -1705,7 +1703,7 @@ type ScheduledReconcileRow = (String, String, i64, i64);
 /// gate, so it drops out of the candidate set and the next call continues with
 /// the next stale IMV.
 ///
-/// Arguments (all optional; defaults reproduce the pre-1.11.0 "one call does
+/// Arguments (all optional; defaults reproduce the "one call does
 /// everything" behaviour on a small registry):
 /// * `max_age_minutes` (default 60) — freshness threshold.
 /// * `batch_size` (default 0 = unlimited) — max IMVs attempted per call.
@@ -1713,8 +1711,8 @@ type ScheduledReconcileRow = (String, String, i64, i64);
 ///   `target_schema`; legacy rows with NULL `target_schema` count as `public`.
 ///
 /// Returns one row per ATTEMPTED IMV: `(name, status, ms, remaining)` where
-/// `status` is `'RECONCILED'` or an error string (PS-1 surfaces a decomposed
-/// chain's child failure here — it is reported, never swallowed), `ms` is the
+/// `status` is `'RECONCILED'` or an error string (a decomposed
+/// chain's child failure is reported here, never swallowed), `ms` is the
 /// reconcile wall time, and `remaining` is the number of candidates this call
 /// DEFERRED because `batch_size` capped it.
 ///
@@ -1733,7 +1731,7 @@ type ScheduledReconcileRow = (String, String, i64, i64);
 /// loop-until-zero on a non-positive gate; drive it from a scheduler tick.
 ///
 /// ```sql
-/// -- Small registry: unchanged from 1.10.11 — one call sweeps everything.
+/// -- Small registry: one call sweeps everything.
 /// SELECT cron.schedule('reflex-drift-scan', '*/15 * * * *',
 ///     'SELECT * FROM reflex_scheduled_reconcile(60)');
 ///
@@ -1879,7 +1877,7 @@ pub fn reflex_scheduled_reconcile(
     });
 
     // batch_size <= 0 means unlimited (one call sweeps everything — the
-    // pre-1.11.0 default). Otherwise attempt at most batch_size, and report the
+    // default). Otherwise attempt at most batch_size, and report the
     // rest as deferred to a future call.
     let total = candidates.len();
     let limit = if batch_size <= 0 {
