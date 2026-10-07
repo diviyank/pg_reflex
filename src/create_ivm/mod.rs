@@ -1132,6 +1132,20 @@ fn materialize_aggregate(client: &mut pgrx::spi::SpiClient<'_>, ctx: &mut BuildC
         }
     }
 
+    let integer_sums: Vec<String> = ctx
+        .plan
+        .intermediate_columns
+        .iter()
+        .filter(|ic| {
+            ic.source_aggregate == "SUM"
+                && resolve_column_type(&ic.name, &column_types, "").eq_ignore_ascii_case("BIGINT")
+        })
+        .map(|ic| ic.name.clone())
+        .collect();
+    for sum_column in &integer_sums {
+        ctx.plan.read_nested_sum_as(sum_column, "BIGINT");
+    }
+
     for ic in &mut ctx.plan.intermediate_columns {
         if (ic.source_aggregate == "MIN" || ic.source_aggregate == "MAX")
             && ic.pg_type.eq_ignore_ascii_case("NUMERIC")
@@ -1141,6 +1155,25 @@ fn materialize_aggregate(client: &mut pgrx::spi::SpiClient<'_>, ctx: &mut BuildC
                 ic.pg_type = resolved;
             }
         }
+    }
+
+    let integer_extrema_stored_as_numeric: Vec<(String, String)> = ctx
+        .plan
+        .intermediate_columns
+        .iter()
+        .filter(|ic| {
+            (ic.source_aggregate == "MIN" || ic.source_aggregate == "MAX")
+                && ic.pg_type.eq_ignore_ascii_case("NUMERIC")
+        })
+        .filter_map(|ic| {
+            let native_type = resolve_column_type(&ic.name, &column_types, "").to_uppercase();
+            matches!(native_type.as_str(), "SMALLINT" | "INTEGER" | "BIGINT")
+                .then(|| (ic.name.clone(), native_type))
+        })
+        .collect();
+    for (extremum_column, native_type) in &integer_extrema_stored_as_numeric {
+        ctx.plan
+            .read_nested_extremum_as(extremum_column, native_type);
     }
 
     for mapping in &mut ctx.plan.end_query_mappings {
