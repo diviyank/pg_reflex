@@ -594,3 +594,155 @@ fn v112_fn_unknown_aggregate_outside_a_single_level_passthrough_still_rejected()
         );
     }
 }
+
+fn v112_fn_same_name_in_two_schemas(tag: &str) {
+    for (schema, label) in [("s1", "IMMUTABLE"), ("s2", "")] {
+        Spi::run(&format!("CREATE SCHEMA {tag}_{schema}")).expect("schema");
+        Spi::run(&format!(
+            "CREATE FUNCTION {tag}_{schema}.{tag}_f(int) RETURNS int LANGUAGE sql {label} AS 'SELECT $1 + 1'"
+        ))
+        .expect("fn");
+    }
+}
+
+fn v112_fn_printed_alter_function(message: &str) -> String {
+    let start = message.find("ALTER FUNCTION").expect("no ALTER FUNCTION in the message");
+    let length = message[start..].find(" IMMUTABLE").expect("no IMMUTABLE after ALTER FUNCTION")
+        + " IMMUTABLE".len();
+    message[start..start + length].to_string()
+}
+
+fn v112_fn_rejection(name: &str, q: &str) -> &'static str {
+    let res = crate::create_reflex_ivm(name, q, None, None, None, None);
+    assert!(res.starts_with("ERROR: [reflex-unsupported]"), "{q} -> {res}");
+    assert_eq!(v112_fn_leftovers(name), 0, "objects left behind for {name}");
+    res
+}
+
+#[pg_test]
+fn v112_fn_qualified_call_ignores_a_same_name_function_in_another_schema() {
+    v112_fn_table("v112_fn_qa_src");
+    v112_fn_same_name_in_two_schemas("v112_fn_qa");
+    let q = "SELECT id, v112_fn_qa_s1.v112_fn_qa_f(v) AS x FROM v112_fn_qa_src";
+    v112_fn_created("v112_fn_qa", q, "IMMEDIATE");
+    v112_fn_assert_correct_through_dml("v112_fn_qa", q, "v112_fn_qa_src", false);
+}
+
+#[pg_test]
+fn v112_fn_volatile_rejection_prints_the_offending_signature_and_its_remedy_first() {
+    v112_fn_table("v112_fn_qr_src");
+    v112_fn_same_name_in_two_schemas("v112q");
+    for (i, q) in [
+        "SELECT id, v112q_s2.v112q_f(v) AS x FROM v112_fn_qr_src",
+        "SELECT id, v112q_f(v) AS x FROM v112_fn_qr_src",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let res = v112_fn_rejection(&format!("v112_fn_qr_{i}"), q);
+        assert!(res.contains("Volatile function(s) v112q_f"), "{res}");
+        assert!(res.contains(": v112q_s2.v112q_f(integer). Fix:"), "{res}");
+        let remedy = "ALTER FUNCTION v112q_s2.v112q_f(integer) IMMUTABLE";
+        assert!(
+            res.find(remedy).is_some_and(|p| p + remedy.len() <= 200),
+            "remedy must end within the first 200 characters: {res}"
+        );
+    }
+}
+
+#[pg_test]
+fn v112_fn_mixed_case_function_remedy_converges_as_printed() {
+    v112_fn_table("v112_fn_mx_src");
+    Spi::run("CREATE FUNCTION \"V112_fn_Mixed\"(int) RETURNS int LANGUAGE sql AS 'SELECT $1 + 1'")
+        .expect("fn");
+    let q = "SELECT id, \"V112_fn_Mixed\"(v) AS x FROM v112_fn_mx_src";
+    let res = v112_fn_rejection("v112_fn_mx_v", q);
+    assert!(res.contains("Volatile function(s) v112_fn_mixed"), "{res}");
+    Spi::run(&v112_fn_printed_alter_function(res)).expect("the printed remedy must run as printed");
+    v112_fn_created("v112_fn_mx_v", q, "IMMEDIATE");
+    v112_fn_assert_correct_through_dml("v112_fn_mx_v", q, "v112_fn_mx_src", false);
+}
+
+#[pg_test]
+fn v112_fn_function_outside_the_search_path_remedy_converges_as_printed() {
+    v112_fn_table("v112_fn_sp_src");
+    v112_fn_same_name_in_two_schemas("v112_fn_sp");
+    let q = "SELECT id, v112_fn_sp_s2.v112_fn_sp_f(v) AS x FROM v112_fn_sp_src";
+    let res = v112_fn_rejection("v112_fn_sp_v", q);
+    Spi::run(&v112_fn_printed_alter_function(res)).expect("the printed remedy must run as printed");
+    v112_fn_created("v112_fn_sp_v", q, "IMMEDIATE");
+    v112_fn_assert_correct_through_dml("v112_fn_sp_v", q, "v112_fn_sp_src", false);
+}
+
+#[pg_test]
+fn v112_fn_volatile_overload_rejection_names_it_and_converges() {
+    v112_fn_table("v112_fn_ov_src");
+    Spi::run("CREATE FUNCTION v112_fn_ov(int) RETURNS int LANGUAGE sql IMMUTABLE AS 'SELECT $1 + 1'")
+        .expect("int overload");
+    Spi::run("CREATE FUNCTION v112_fn_ov(text) RETURNS int LANGUAGE sql VOLATILE AS 'SELECT length($1)'")
+        .expect("text overload");
+    let q = "SELECT id, v112_fn_ov(v) AS x FROM v112_fn_ov_src";
+    let res = v112_fn_rejection("v112_fn_ov_v", q);
+    assert!(res.contains("v112_fn_ov(text)"), "{res}");
+    assert!(!res.contains("v112_fn_ov(integer)"), "{res}");
+    Spi::run(&v112_fn_printed_alter_function(res)).expect("the printed remedy must run as printed");
+    v112_fn_created("v112_fn_ov_v", q, "IMMEDIATE");
+    v112_fn_assert_correct_through_dml("v112_fn_ov_v", q, "v112_fn_ov_src", false);
+}
+
+#[pg_test]
+fn v112_fn_quoted_upper_case_schema_is_matched_exactly() {
+    v112_fn_table("v112_fn_up_src");
+    Spi::run("CREATE SCHEMA \"V112_fn_Up\"").expect("quoted schema");
+    Spi::run("CREATE SCHEMA v112_fn_up").expect("folded schema");
+    Spi::run(
+        "CREATE FUNCTION \"V112_fn_Up\".v112_fn_up_f(int) RETURNS int LANGUAGE sql IMMUTABLE AS 'SELECT $1 + 1'",
+    )
+    .expect("immutable fn");
+    Spi::run("CREATE FUNCTION v112_fn_up.v112_fn_up_f(int) RETURNS int LANGUAGE sql AS 'SELECT $1 + 1'")
+        .expect("unlabelled fn");
+    for (i, q) in [
+        "SELECT id, v112_fn_up.v112_fn_up_f(v) AS x FROM v112_fn_up_src",
+        "SELECT id, V112_FN_UP.v112_fn_up_f(v) AS x FROM v112_fn_up_src",
+        "SELECT id, \"v112_fn_up\".v112_fn_up_f(v) AS x FROM v112_fn_up_src",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let res = v112_fn_rejection(&format!("v112_fn_up_{i}"), q);
+        assert!(res.contains("v112_fn_up.v112_fn_up_f(integer)"), "{res}");
+    }
+    let q = "SELECT id, \"V112_fn_Up\".v112_fn_up_f(v) AS x FROM v112_fn_up_src";
+    v112_fn_created("v112_fn_up_ok", q, "IMMEDIATE");
+    v112_fn_assert_correct_through_dml("v112_fn_up_ok", q, "v112_fn_up_src", false);
+}
+
+#[pg_test]
+fn v112_fn_call_qualified_with_an_unknown_schema_is_matched_in_every_schema() {
+    v112_fn_table("v112_fn_ns_src");
+    Spi::run("CREATE FUNCTION v112_fn_ns_f(int) RETURNS int LANGUAGE sql VOLATILE AS 'SELECT $1 + 1'")
+        .expect("fn");
+    let res = v112_fn_rejection(
+        "v112_fn_ns_v",
+        "SELECT id, v112_fn_ns_absent.v112_fn_ns_f(v) AS x FROM v112_fn_ns_src",
+    );
+    assert!(res.contains("Volatile function(s) v112_fn_ns_f"), "{res}");
+}
+
+#[pg_test]
+fn v112_fn_many_volatile_overloads_are_listed_up_to_a_cap() {
+    v112_fn_table("v112_fn_cap_src");
+    for argument in ["int", "bigint", "text", "numeric", "boolean"] {
+        Spi::run(&format!(
+            "CREATE FUNCTION v112_fn_cap_f({argument}) RETURNS int LANGUAGE sql VOLATILE AS 'SELECT 1'"
+        ))
+        .expect("fn");
+    }
+    let res = v112_fn_rejection(
+        "v112_fn_cap_v",
+        "SELECT id, v112_fn_cap_f(v) AS x FROM v112_fn_cap_src",
+    );
+    assert_eq!(res.matches("v112_fn_cap_f(").count(), 4, "{res}");
+    assert!(res.contains(" and 2 more. Fix:"), "{res}");
+    assert!(res.find("IMMUTABLE").is_some_and(|p| p < 300), "{res}");
+}

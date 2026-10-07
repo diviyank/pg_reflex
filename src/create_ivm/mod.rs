@@ -357,25 +357,37 @@ pub(crate) fn timezone_sensitivity_warning(
 
 const SUPPORTED_AGGREGATES: [&str; 6] = ["sum", "count", "avg", "min", "max", "bool_or"];
 
-/// The catalog matches by name across every overload and schema: argument types are
-/// unknown here, and accepting a volatile call is the direction that corrupts an IMV.
+const LISTED_VOLATILE_SIGNATURES: usize = 3;
+
 fn function_contract_violation(
     view_name: &str,
     analysis: &crate::sql_analyzer::SqlAnalysis,
 ) -> Option<String> {
-    let called: Vec<String> = analysis
-        .called_functions
-        .iter()
-        .map(|f| f.name.clone())
-        .collect();
-    let (volatile, aggregates) = catalog_function_kinds(&called);
-    if let Some(first) = volatile.first() {
+    let CatalogFunctionKinds {
+        volatile,
+        volatile_signatures,
+        aggregates,
+    } = catalog_function_kinds(&analysis.function_references);
+    if let Some(first) = volatile_signatures.first() {
+        let mut listed = volatile_signatures
+            .iter()
+            .take(LISTED_VOLATILE_SIGNATURES)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
+        if volatile_signatures.len() > LISTED_VOLATILE_SIGNATURES {
+            listed.push_str(&format!(
+                " and {} more",
+                volatile_signatures.len() - LISTED_VOLATILE_SIGNATURES
+            ));
+        }
         return Some(format!(
-            "Volatile function(s) {} are not supported in IMV '{view_name}'. Fix: if a function \
-             is in fact deterministic, declare it with ALTER FUNCTION {first}(...) IMMUTABLE \
-             (or STABLE); otherwise remove it from the IMV query, or compute the value into a \
-             source column. A volatile function returns a different result on each call, so \
-             the IMV would diverge from its own query.",
+            "Volatile function(s) {} in IMV '{view_name}': {listed}. Fix: if \
+             deterministic, run ALTER FUNCTION {first} IMMUTABLE (or STABLE); otherwise remove \
+             it from the IMV query, or compute the value into a source column. An unqualified \
+             call is matched by name in every schema and for every overload, a \
+             schema-qualified call in that schema only. A volatile function returns a \
+             different result on each call, so the IMV would diverge from its own query.",
             volatile.join(", ")
         ));
     }
@@ -420,48 +432,100 @@ fn ungrouped_non_aggregate_column(ctx: &BuildContext) -> Option<String> {
         .map(|col| col.alias.clone().unwrap_or_else(|| col.expr_sql.clone()))
 }
 
-/// Names among `called` that the catalog knows as (volatile functions, aggregates with
-/// no plain function of the same name). Both sides fold ASCII only, as PostgreSQL does
-/// for identifiers, so a name with a non-ASCII upper-case letter still matches.
-fn catalog_function_kinds(called: &[String]) -> (Vec<String>, Vec<String>) {
+struct CatalogFunctionKinds {
+    /// Bare names with at least one volatile plain function among the matched ones.
+    volatile: Vec<String>,
+    /// Those volatile functions as `regprocedure` text: quoted and schema-qualified
+    /// for the caller's `search_path`, so it can be pasted into `ALTER FUNCTION`.
+    volatile_signatures: Vec<String>,
+    /// Bare names matched by aggregates only, with no plain function of the same name.
+    aggregates: Vec<String>,
+}
+
+/// An unqualified call matches by name across every schema and overload: argument
+/// types are unknown here, and accepting a volatile call is the direction that
+/// corrupts an IMV. A schema-qualified call matches in that schema only, unless no
+/// such schema exists, where it matches everywhere again. Names fold ASCII only on
+/// both sides, as PostgreSQL does for identifiers, so a name with a non-ASCII
+/// upper-case letter still matches.
+fn catalog_function_kinds(
+    called: &[crate::sql_analyzer::FunctionReference],
+) -> CatalogFunctionKinds {
+    let mut kinds = CatalogFunctionKinds {
+        volatile: Vec::new(),
+        volatile_signatures: Vec::new(),
+        aggregates: Vec::new(),
+    };
     if called.is_empty() {
-        return (Vec::new(), Vec::new());
+        return kinds;
     }
-    let names = crate::sql_writer::identifier::format_pg_text_array(called);
-    let kinds: Vec<(String, bool, bool)> = Spi::connect(|client| {
-        client
+    let mut unqualified_names = Vec::new();
+    let mut qualified_names = Vec::new();
+    let mut qualified_schemas = Vec::new();
+    for reference in called {
+        match &reference.schema {
+            None => unqualified_names.push(reference.name.clone()),
+            Some(schema) => {
+                qualified_names.push(reference.name.clone());
+                qualified_schemas.push(schema.clone());
+            }
+        }
+    }
+    let text_array = |values: &[String]| unsafe {
+        DatumWithOid::new(
+            crate::sql_writer::identifier::format_pg_text_array(values),
+            PgBuiltInOids::TEXTOID.oid().value(),
+        )
+    };
+    Spi::connect(|client| {
+        let rows = client
             .select(
-                "SELECT lower(proname::text COLLATE \"C\") AS name, \
-                        bool_or(prokind = 'f' AND provolatile = 'v') AS is_volatile, \
-                        bool_or(prokind = 'a') AND NOT bool_or(prokind = 'f') AS is_aggregate_only \
-                 FROM pg_catalog.pg_proc \
-                 WHERE lower(proname::text COLLATE \"C\") = ANY($1::text[]) \
+                "SELECT lower(p.proname::text COLLATE \"C\") AS name, \
+                        bool_or(p.prokind = 'f' AND p.provolatile = 'v') AS is_volatile, \
+                        bool_or(p.prokind = 'a') AND NOT bool_or(p.prokind = 'f') AS is_aggregate_only, \
+                        COALESCE(array_agg(p.oid::regprocedure::text ORDER BY p.oid::regprocedure::text) \
+                                   FILTER (WHERE p.prokind = 'f' AND p.provolatile = 'v'), \
+                                 '{}'::text[]) AS volatile_signatures \
+                 FROM pg_catalog.pg_proc p \
+                 JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace \
+                 WHERE lower(p.proname::text COLLATE \"C\") = ANY($1::text[]) \
+                    OR EXISTS ( \
+                         SELECT 1 FROM unnest($2::text[], $3::text[]) AS called(name, schema_name) \
+                         WHERE called.name = lower(p.proname::text COLLATE \"C\") \
+                           AND (called.schema_name = n.nspname::text \
+                                OR NOT EXISTS (SELECT 1 FROM pg_catalog.pg_namespace known \
+                                               WHERE known.nspname::text = called.schema_name))) \
                  GROUP BY 1 ORDER BY 1",
                 None,
-                &[unsafe { DatumWithOid::new(names, PgBuiltInOids::TEXTOID.oid().value()) }],
+                &[
+                    text_array(&unqualified_names),
+                    text_array(&qualified_names),
+                    text_array(&qualified_schemas),
+                ],
             )
-            .unwrap_or_report()
-            .filter_map(|row| {
-                Some((
-                    row.get_by_name::<String, _>("name").unwrap_or(None)?,
-                    row.get_by_name::<bool, _>("is_volatile").unwrap_or(None)?,
-                    row.get_by_name::<bool, _>("is_aggregate_only")
-                        .unwrap_or(None)?,
-                ))
-            })
-            .collect()
+            .unwrap_or_report();
+        for row in rows {
+            let Some(name) = row.get_by_name::<String, _>("name").unwrap_or(None) else {
+                continue;
+            };
+            if row.get_by_name::<bool, _>("is_volatile").unwrap_or(None) == Some(true) {
+                kinds.volatile.push(name.clone());
+            }
+            if row
+                .get_by_name::<bool, _>("is_aggregate_only")
+                .unwrap_or(None)
+                == Some(true)
+            {
+                kinds.aggregates.push(name);
+            }
+            kinds.volatile_signatures.extend(
+                row.get_by_name::<Vec<String>, _>("volatile_signatures")
+                    .unwrap_or(None)
+                    .unwrap_or_default(),
+            );
+        }
     });
-    let names_where = |keep: fn(&(String, bool, bool)) -> bool| -> Vec<String> {
-        kinds
-            .iter()
-            .filter(|kind| keep(kind))
-            .map(|(name, _, _)| name.clone())
-            .collect()
-    };
-    (
-        names_where(|(_, is_volatile, _)| *is_volatile),
-        names_where(|(_, _, is_aggregate_only)| *is_aggregate_only),
-    )
+    kinds
 }
 
 /// Is an IMV of this name already in the registry? One definition, shared by
