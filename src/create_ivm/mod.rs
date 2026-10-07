@@ -1132,6 +1132,20 @@ fn materialize_aggregate(client: &mut pgrx::spi::SpiClient<'_>, ctx: &mut BuildC
         }
     }
 
+    let integer_sums: Vec<String> = ctx
+        .plan
+        .intermediate_columns
+        .iter()
+        .filter(|ic| {
+            ic.source_aggregate == "SUM"
+                && resolve_column_type(&ic.name, &column_types, "").eq_ignore_ascii_case("BIGINT")
+        })
+        .map(|ic| ic.name.clone())
+        .collect();
+    for sum_column in &integer_sums {
+        ctx.plan.read_nested_sum_as(sum_column, "BIGINT");
+    }
+
     for ic in &mut ctx.plan.intermediate_columns {
         if (ic.source_aggregate == "MIN" || ic.source_aggregate == "MAX")
             && ic.pg_type.eq_ignore_ascii_case("NUMERIC")

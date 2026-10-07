@@ -1,9 +1,9 @@
 use serde::Serialize;
 use sqlparser::ast::{
-    BinaryOperator, Distinct, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr,
-    GroupByWithModifier, Ident, Join, JoinConstraint, JoinOperator, Query, Select, SelectItem,
-    SetExpr, SetOperator, SetQuantifier, Statement, TableFactor, Visit, VisitMut, Visitor,
-    VisitorMut,
+    BinaryOperator, Distinct, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments,
+    GroupByExpr, GroupByWithModifier, Ident, Join, JoinConstraint, JoinOperator, Query, Select,
+    SelectItem, SetExpr, SetOperator, SetQuantifier, Statement, TableFactor, Visit, VisitMut,
+    Visitor, VisitorMut,
 };
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
@@ -619,6 +619,50 @@ fn push_select_column(analysis: &mut SqlAnalysis, expr: &Expr, alias: Option<Str
     analysis.select_columns.push(column);
 }
 
+/// A supported aggregate call reduced to what planning needs: `COUNT(*)` and
+/// `COUNT(DISTINCT x)` told apart from `COUNT(x)`, and `FILTER (WHERE cond)`
+/// folded into the argument as `CASE WHEN cond THEN arg END`.
+pub(crate) struct AggregateCall {
+    pub kind: AggregateKind,
+    pub arg: Option<String>,
+    pub filter_expr: Option<String>,
+}
+
+pub(crate) fn resolve_aggregate_call(f: &Function) -> Option<AggregateCall> {
+    let mut kind = detect_aggregate(&f.name.to_string())?;
+    if matches!(kind, AggregateKind::Count) && is_wildcard_arg(&f.args) {
+        kind = AggregateKind::CountStar;
+    }
+    if let FunctionArguments::List(list) = &f.args {
+        if list.duplicate_treatment == Some(sqlparser::ast::DuplicateTreatment::Distinct)
+            && kind == AggregateKind::Count
+        {
+            kind = AggregateKind::CountDistinct;
+        }
+    }
+    let mut arg = if matches!(kind, AggregateKind::CountStar) {
+        Some("*".to_string())
+    } else {
+        first_arg_sql(&f.args)
+    };
+
+    let filter_expr = f.filter.as_ref().map(|filt| filt.to_string());
+    if let Some(ref filter) = filter_expr {
+        if matches!(kind, AggregateKind::CountStar) {
+            kind = AggregateKind::Count;
+            arg = Some(format!("CASE WHEN {} THEN 1 END", filter));
+        } else if let Some(ref unfiltered) = arg {
+            arg = Some(format!("CASE WHEN {} THEN {} END", filter, unfiltered));
+        }
+    }
+
+    Some(AggregateCall {
+        kind,
+        arg,
+        filter_expr,
+    })
+}
+
 /// Extract a SelectColumn from a SelectItem expression.
 fn extract_select_column(expr: &Expr, alias: Option<String>) -> SelectColumn {
     // Unwrap casts to detect aggregates inside (e.g., SUM(x)::BIGINT)
@@ -647,42 +691,11 @@ fn extract_select_column(expr: &Expr, alias: Option<String>) -> SelectColumn {
             };
         }
 
-        let func_name = f.name.to_string();
-        if let Some(mut kind) = detect_aggregate(&func_name) {
-            // Check for COUNT(*)
-            if matches!(kind, AggregateKind::Count) && is_wildcard_arg(&f.args) {
-                kind = AggregateKind::CountStar;
-            }
-            // Check for DISTINCT modifier on aggregates
-            if let FunctionArguments::List(list) = &f.args {
-                if list.duplicate_treatment == Some(sqlparser::ast::DuplicateTreatment::Distinct)
-                    && kind == AggregateKind::Count
-                {
-                    kind = AggregateKind::CountDistinct;
-                }
-            }
-            let mut aggregate_arg = if matches!(kind, AggregateKind::CountStar) {
-                Some("*".to_string())
-            } else {
-                first_arg_sql(&f.args)
-            };
-
-            // FILTER (WHERE cond) → rewrite aggregate_arg to CASE WHEN cond THEN arg END
-            let filter_expr = f.filter.as_ref().map(|filt| filt.to_string());
-            if let Some(ref filter) = filter_expr {
-                if matches!(kind, AggregateKind::CountStar) {
-                    // COUNT(*) FILTER (WHERE c) → COUNT(CASE WHEN c THEN 1 END)
-                    kind = AggregateKind::Count;
-                    aggregate_arg = Some(format!("CASE WHEN {} THEN 1 END", filter));
-                } else if let Some(ref arg) = aggregate_arg {
-                    aggregate_arg = Some(format!("CASE WHEN {} THEN {} END", filter, arg));
-                }
-            }
-
+        if let Some(call) = resolve_aggregate_call(f) {
             // Rewrite expr_sql to reflect the CASE WHEN form for base_query generation
-            let expr_sql = if filter_expr.is_some() {
-                let arg_str = aggregate_arg.as_deref().unwrap_or("*");
-                format!("{}({})", func_name, arg_str)
+            let expr_sql = if call.filter_expr.is_some() {
+                let arg_str = call.arg.as_deref().unwrap_or("*");
+                format!("{}({})", f.name, arg_str)
             } else {
                 inner.to_string()
             };
@@ -690,12 +703,12 @@ fn extract_select_column(expr: &Expr, alias: Option<String>) -> SelectColumn {
             return SelectColumn {
                 expr_sql,
                 alias,
-                aggregate: Some(kind),
-                aggregate_arg,
+                aggregate: Some(call.kind),
+                aggregate_arg: call.arg,
                 is_passthrough: false,
                 cast_type,
                 is_window: false,
-                filter_expr,
+                filter_expr: call.filter_expr,
                 is_aggregate_derived: false,
             };
         }

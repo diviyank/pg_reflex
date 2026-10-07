@@ -1578,3 +1578,375 @@ fn coalesce_multiplier_matches_legacy_on_ascii_expressions() {
     assert_eq!(compared, 21600);
     assert!(recognised > 1000, "recognised only {recognised}");
 }
+
+// ---- An aggregate nested in an expression reads like the same aggregate at top level ----
+
+fn intermediate_column_shapes(plan: &AggregationPlan) -> Vec<(String, String, String, String)> {
+    plan.intermediate_columns
+        .iter()
+        .map(|ic| {
+            (
+                ic.name.clone(),
+                ic.pg_type.clone(),
+                ic.source_aggregate.clone(),
+                ic.source_arg.clone(),
+            )
+        })
+        .collect()
+}
+
+fn mapping_expr<'a>(plan: &'a AggregationPlan, alias: &str) -> &'a str {
+    &plan
+        .end_query_mappings
+        .iter()
+        .find(|m| m.output_alias == alias)
+        .unwrap_or_else(|| panic!("no mapping {alias}: {:?}", plan.end_query_mappings))
+        .intermediate_expr
+}
+
+fn nested_form_of(top_level_plan: &AggregationPlan, top_level_expr: &str) -> String {
+    let is_single_column = top_level_plan
+        .intermediate_columns
+        .iter()
+        .any(|ic| ic.name == top_level_expr);
+    if is_single_column {
+        format!("\"{top_level_expr}\"")
+    } else {
+        format!("({top_level_expr})")
+    }
+}
+
+const NESTABLE_AGGREGATES: [&str; 14] = [
+    "SUM(v)",
+    "COUNT(*)",
+    "COUNT(v)",
+    "AVG(v)",
+    "MIN(v)",
+    "MAX(v)",
+    "BOOL_OR(b)",
+    "SUM(v) FILTER (WHERE v > 1)",
+    "COUNT(*) FILTER (WHERE v > 1)",
+    "COUNT(v) FILTER (WHERE v > 1)",
+    "AVG(v) FILTER (WHERE b)",
+    "MIN(v) FILTER (WHERE v > 1)",
+    "MAX(v) FILTER (WHERE v > 1)",
+    "BOOL_OR(b) FILTER (WHERE v > 1)",
+];
+
+#[test]
+fn nested_aggregate_plans_the_same_columns_and_reading_as_top_level() {
+    for aggregate in NESTABLE_AGGREGATES {
+        let top = plan_from_sql(&format!("SELECT g, {aggregate} AS a FROM t GROUP BY g"));
+        let nested = plan_from_sql(&format!(
+            "SELECT g, COALESCE({aggregate}, NULL) AS a FROM t GROUP BY g"
+        ));
+        assert_eq!(
+            intermediate_column_shapes(&nested),
+            intermediate_column_shapes(&top),
+            "{aggregate}"
+        );
+        let expected = format!(
+            "COALESCE({}, NULL)",
+            nested_form_of(&top, mapping_expr(&top, "a"))
+        );
+        assert_eq!(mapping_expr(&nested, "a"), expected, "{aggregate}");
+    }
+}
+
+#[test]
+fn nested_average_divides_the_sum_by_the_count() {
+    let plan = plan_from_sql("SELECT ROUND(AVG(v), 2) AS a FROM t");
+    assert_eq!(
+        mapping_expr(&plan, "a"),
+        "ROUND((__sum_v / NULLIF(__count_v, 0)), 2)"
+    );
+    let names: Vec<&str> = plan
+        .intermediate_columns
+        .iter()
+        .map(|ic| ic.name.as_str())
+        .collect();
+    assert_eq!(names, vec!["__sum_v", "__count_v"]);
+}
+
+#[test]
+fn nested_sum_is_null_when_no_value_is_non_null() {
+    let plan = plan_from_sql("SELECT g, SUM(v) + 1 AS s FROM t GROUP BY g");
+    assert_eq!(
+        mapping_expr(&plan, "s"),
+        "(CASE WHEN \"__nonnull_count_v\" > 0 THEN \"__sum_v\" END) + 1"
+    );
+    assert!(plan
+        .intermediate_columns
+        .iter()
+        .any(|ic| ic.name == "__nonnull_count_v"
+            && ic.source_aggregate == "COUNT"
+            && ic.source_arg == "v"));
+}
+
+#[test]
+fn nested_filter_is_folded_into_the_argument() {
+    let plan = plan_from_sql(
+        "SELECT g, COUNT(*) FILTER (WHERE v > 1) + 1 AS c, \
+         COALESCE(MAX(v) FILTER (WHERE b), 0) AS m FROM t GROUP BY g",
+    );
+    let shapes = intermediate_column_shapes(&plan);
+    assert!(
+        shapes.iter().any(|(_, ty, agg, arg)| ty == "BIGINT"
+            && agg == "COUNT"
+            && arg == "CASE WHEN v > 1 THEN 1 END"),
+        "{shapes:?}"
+    );
+    assert!(
+        shapes
+            .iter()
+            .any(|(_, _, agg, arg)| agg == "MAX" && arg == "CASE WHEN b THEN v END"),
+        "{shapes:?}"
+    );
+    assert!(
+        !shapes.iter().any(|(_, _, _, arg)| arg == "*" || arg == "v"),
+        "an unfiltered column was planned: {shapes:?}"
+    );
+}
+
+#[test]
+fn nested_and_top_level_occurrences_share_their_columns() {
+    for sql in [
+        "SELECT g, AVG(v) AS a, ROUND(AVG(v), 2) AS r FROM t GROUP BY g",
+        "SELECT g, ROUND(AVG(v), 2) AS r, AVG(v) AS a FROM t GROUP BY g",
+    ] {
+        let plan = plan_from_sql(sql);
+        let mut names: Vec<String> = plan
+            .intermediate_columns
+            .iter()
+            .map(|ic| ic.name.clone())
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["__count_v", "__sum_v"], "{sql}");
+        assert_eq!(mapping_expr(&plan, "a"), "__sum_v / NULLIF(__count_v, 0)");
+        assert_eq!(
+            mapping_expr(&plan, "r"),
+            "ROUND((__sum_v / NULLIF(__count_v, 0)), 2)"
+        );
+    }
+    let plan = plan_from_sql("SELECT g, COUNT(*) AS c, COUNT(*) * 2 AS d FROM t GROUP BY g");
+    assert_eq!(plan.intermediate_columns.len(), 1);
+    assert_eq!(mapping_expr(&plan, "d"), "\"__count_star\" * 2");
+}
+
+#[test]
+fn nested_average_keeps_its_own_precedence_as_a_divisor() {
+    let plan = plan_from_sql("SELECT g, 100 / AVG(v) AS r FROM t GROUP BY g");
+    assert_eq!(
+        mapping_expr(&plan, "r"),
+        "100 / (__sum_v / NULLIF(__count_v, 0))"
+    );
+}
+
+#[test]
+fn nested_sum_over_a_not_null_argument_reads_the_row_count() {
+    let not_null: std::collections::HashSet<String> = ["v".to_string()].into_iter().collect();
+    let mut plan = plan_from_sql("SELECT g, SUM(v) AS s, SUM(v) + 1 AS d FROM t GROUP BY g");
+    plan.optimize_not_null_sums(&not_null);
+    assert!(!plan
+        .intermediate_columns
+        .iter()
+        .any(|ic| ic.name == "__nonnull_count_v"));
+    assert_eq!(mapping_expr(&plan, "s"), "\"__sum_v\"");
+    assert_eq!(
+        mapping_expr(&plan, "d"),
+        "(CASE WHEN \"__ivm_count\" > 0 THEN \"__sum_v\" END) + 1"
+    );
+}
+
+#[test]
+fn nested_bool_or_over_a_not_null_argument_reads_the_row_count() {
+    let not_null: std::collections::HashSet<String> = ["b".to_string()].into_iter().collect();
+    let mut plan = plan_from_sql("SELECT g, COALESCE(BOOL_OR(b), false) AS r FROM t GROUP BY g");
+    plan.optimize_not_null_sums(&not_null);
+    let names: Vec<&str> = plan
+        .intermediate_columns
+        .iter()
+        .map(|ic| ic.name.as_str())
+        .collect();
+    assert_eq!(names, vec!["__bool_or_b_true_count"]);
+    assert_eq!(
+        mapping_expr(&plan, "r"),
+        "COALESCE((CASE WHEN \"__ivm_count\" > 0 THEN \"__bool_or_b_true_count\" > 0 ELSE NULL END), false)"
+    );
+}
+
+#[test]
+fn nested_multiplier_sum_follows_the_redirected_counter() {
+    let mut plan =
+        plan_from_sql("SELECT g, SUM(v) AS s, SUM(v * COALESCE(w, 1)) + 1 AS r FROM t GROUP BY g");
+    plan.optimize_not_null_sums(&std::collections::HashSet::new());
+    let names: Vec<&str> = plan
+        .intermediate_columns
+        .iter()
+        .map(|ic| ic.name.as_str())
+        .collect();
+    assert_eq!(
+        names,
+        vec!["__sum_v", "__nonnull_count_v", "__sum_v_coalesce_w_1"]
+    );
+    assert_eq!(
+        mapping_expr(&plan, "r"),
+        "(CASE WHEN \"__nonnull_count_v\" > 0 THEN \"__sum_v_coalesce_w_1\" END) + 1"
+    );
+}
+
+#[test]
+fn aggregate_reading_names_the_columns_and_the_expression_that_reads_them() {
+    let reading_of = |kind: AggregateKind, arg: &str| {
+        let reading = aggregate_reading(&kind, arg).expect("a reading");
+        let columns: Vec<(String, String, String, String)> = reading
+            .columns
+            .iter()
+            .map(|ic| {
+                assert_eq!(ic.topk_k, None);
+                (
+                    ic.name.clone(),
+                    ic.pg_type.clone(),
+                    ic.source_aggregate.clone(),
+                    ic.source_arg.clone(),
+                )
+            })
+            .collect();
+        (columns, reading.end_expr, reading.aggregate_type)
+    };
+    let column = |name: &str, pg_type: &str, aggregate: &str, arg: &str| {
+        (
+            name.to_string(),
+            pg_type.to_string(),
+            aggregate.to_string(),
+            arg.to_string(),
+        )
+    };
+
+    assert_eq!(
+        reading_of(AggregateKind::Sum, "v"),
+        (
+            vec![
+                column("__sum_v", "NUMERIC", "SUM", "v"),
+                column("__nonnull_count_v", "BIGINT", "COUNT", "v"),
+            ],
+            "CASE WHEN \"__nonnull_count_v\" > 0 THEN \"__sum_v\" END".to_string(),
+            "SUM",
+        )
+    );
+    assert_eq!(
+        reading_of(AggregateKind::Avg, "v"),
+        (
+            vec![
+                column("__sum_v", "NUMERIC", "SUM", "v"),
+                column("__count_v", "BIGINT", "COUNT", "v"),
+            ],
+            "__sum_v / NULLIF(__count_v, 0)".to_string(),
+            "AVG",
+        )
+    );
+    assert_eq!(
+        reading_of(AggregateKind::Count, "v"),
+        (
+            vec![column("__count_v", "BIGINT", "COUNT", "v")],
+            "__count_v".to_string(),
+            "COUNT",
+        )
+    );
+    assert_eq!(
+        reading_of(AggregateKind::CountStar, "*"),
+        (
+            vec![column("__count_star", "BIGINT", "COUNT", "*")],
+            "__count_star".to_string(),
+            "COUNT",
+        )
+    );
+    assert_eq!(
+        reading_of(AggregateKind::Min, "t.v"),
+        (
+            vec![column("__min_t_v", "NUMERIC", "MIN", "t.v")],
+            "__min_t_v".to_string(),
+            "MIN",
+        )
+    );
+    assert_eq!(
+        reading_of(AggregateKind::Max, "v"),
+        (
+            vec![column("__max_v", "NUMERIC", "MAX", "v")],
+            "__max_v".to_string(),
+            "MAX",
+        )
+    );
+    assert_eq!(
+        reading_of(AggregateKind::BoolOr, "b"),
+        (
+            vec![
+                column(
+                    "__bool_or_b_true_count",
+                    "BIGINT",
+                    "SUM",
+                    "CASE WHEN (b) THEN 1 ELSE 0 END"
+                ),
+                column(
+                    "__bool_or_b_nonnull_count",
+                    "BIGINT",
+                    "SUM",
+                    "CASE WHEN (b) IS NOT NULL THEN 1 ELSE 0 END"
+                ),
+            ],
+            "CASE WHEN \"__bool_or_b_nonnull_count\" > 0 THEN \"__bool_or_b_true_count\" > 0 ELSE NULL END"
+                .to_string(),
+            "BOOL_OR",
+        )
+    );
+    assert!(aggregate_reading(&AggregateKind::CountDistinct, "v").is_none());
+}
+
+#[test]
+fn nested_reading_is_a_quoted_column_or_a_parenthesised_expression() {
+    let nested = |kind: AggregateKind| aggregate_reading(&kind, "v").unwrap().nested_expr();
+    assert_eq!(nested(AggregateKind::Count), "\"__count_v\"");
+    assert_eq!(nested(AggregateKind::Min), "\"__min_v\"");
+    assert_eq!(nested(AggregateKind::Max), "\"__max_v\"");
+    assert_eq!(
+        nested(AggregateKind::Avg),
+        "(__sum_v / NULLIF(__count_v, 0))"
+    );
+    assert_eq!(
+        nested(AggregateKind::Sum),
+        "(CASE WHEN \"__nonnull_count_v\" > 0 THEN \"__sum_v\" END)"
+    );
+}
+
+#[test]
+fn nested_integer_sum_is_read_as_the_type_sum_returns() {
+    let not_null: std::collections::HashSet<String> = ["w".to_string()].into_iter().collect();
+    let mut plan = plan_from_sql(
+        "SELECT g, SUM(v) AS s, AVG(v) AS a, SUM(v) / 2 AS h, ROUND(AVG(v), 2) AS r, \
+         SUM(w) / COUNT(*) AS m, SUM(x) / 2 AS untouched FROM t GROUP BY g",
+    );
+    plan.optimize_not_null_sums(&not_null);
+    plan.read_nested_sum_as("__sum_v", "BIGINT");
+    plan.read_nested_sum_as("__sum_w", "BIGINT");
+    assert_eq!(
+        mapping_expr(&plan, "h"),
+        "(CASE WHEN \"__nonnull_count_v\" > 0 THEN \"__sum_v\"::BIGINT END) / 2"
+    );
+    assert_eq!(
+        mapping_expr(&plan, "m"),
+        "(CASE WHEN \"__ivm_count\" > 0 THEN \"__sum_w\"::BIGINT END) / \"__count_star\""
+    );
+    assert_eq!(
+        mapping_expr(&plan, "untouched"),
+        "(CASE WHEN \"__nonnull_count_x\" > 0 THEN \"__sum_x\" END) / 2"
+    );
+    assert_eq!(
+        mapping_expr(&plan, "s"),
+        "CASE WHEN \"__nonnull_count_v\" > 0 THEN \"__sum_v\" END"
+    );
+    assert_eq!(mapping_expr(&plan, "a"), "__sum_v / NULLIF(__count_v, 0)");
+    assert_eq!(
+        mapping_expr(&plan, "r"),
+        "ROUND((__sum_v / NULLIF(__count_v, 0)), 2)"
+    );
+}
