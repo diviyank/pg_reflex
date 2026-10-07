@@ -9,10 +9,10 @@ use std::sync::{Mutex, OnceLock};
 use crate::aggregation::AggregationPlan;
 use crate::query_decomposer::{
     affected_groups_table_name, delta_scratch_table_name, intermediate_table_name,
-    quote_identifier, shrunk_groups_table_name, split_qualified_name, transition_new_table_name,
+    quote_identifier, shrunk_groups_table_name, transition_new_table_name,
     transition_old_table_name,
 };
-use crate::sql_writer::identifier::replace_source_with_transition;
+use crate::sql_writer::identifier::{replace_source_with_transition, token_names_source};
 
 /// Per-backend cache of built delta SQL keyed by a hash of all inputs.
 /// Entries are content-addressable: identical inputs always produce identical
@@ -65,6 +65,48 @@ pub enum DeltaOp {
 /// an `"UPDATE"` except where a statement-level UPDATE must be treated
 /// differently (see `passthrough_op_stmts`); distinct so it is cached apart.
 pub(crate) const NETTED_UPDATE_OP: &str = "UPDATE_NETTED";
+
+/// Number of whitespace-delimited tokens of `base_query` that name
+/// `source_table`. More than one means the source is joined to itself.
+pub(crate) fn source_reference_count(base_query: &str, source_table: &str) -> usize {
+    let is_word_char = |c: char| c.is_alphanumeric() || c == '_';
+    base_query
+        .split_whitespace()
+        .filter(|w| {
+            let bare_word = w.trim_matches(|c: char| !is_word_char(c));
+            let quoted_word = w.trim_matches(|c: char| !is_word_char(c) && c != '"');
+            token_names_source(bare_word, source_table)
+                || token_names_source(quoted_word, source_table)
+        })
+        .count()
+}
+
+/// Whether `source_table` is the table named directly after a LEFT / RIGHT /
+/// FULL (OUTER) JOIN keyword of the upper-cased query. A source that only
+/// appears in an ON condition does not count.
+pub(crate) fn follows_outer_join_keyword(bq_upper: &str, source_table: &str) -> bool {
+    let source_upper = source_table.to_uppercase();
+    let patterns = [
+        "LEFT JOIN ",
+        "LEFT OUTER JOIN ",
+        "RIGHT JOIN ",
+        "RIGHT OUTER JOIN ",
+        "FULL JOIN ",
+        "FULL OUTER JOIN ",
+    ];
+    patterns.iter().any(|pat| {
+        let mut search_from = 0;
+        while let Some(pos) = bq_upper[search_from..].find(pat) {
+            let after = &bq_upper[search_from + pos + pat.len()..];
+            let next_token = after.split_whitespace().next().unwrap_or("");
+            if token_names_source(next_token, &source_upper) {
+                return true;
+            }
+            search_from += pos + pat.len();
+        }
+        false
+    })
+}
 
 /// Generates the SQL statements to apply a delta to an IMV.
 ///
@@ -130,16 +172,8 @@ pub fn reflex_build_delta_sql(
     // Detect cases where standard incremental delta is incorrect:
     // 1. Self-join: source_table appears multiple times in base_query
     // 2. LEFT/RIGHT JOIN secondary table DELETE/UPDATE: NULL semantics can't be captured by MERGE subtract
-    let bare_source = split_qualified_name(source_table).1;
     // Detect self-join and outer-join-secondary for BOTH aggregate and passthrough queries.
-    let occurrences = base_query
-        .split_whitespace()
-        .filter(|w| {
-            let trimmed = w.trim_matches(|c: char| !c.is_alphanumeric() && c != '_');
-            trimmed == source_table || trimmed == bare_source
-        })
-        .count();
-    let is_self_join = occurrences > 1;
+    let is_self_join = source_reference_count(base_query, source_table) > 1;
 
     let bq_upper = base_query.to_uppercase();
     let is_full_outer = bq_upper.contains("FULL JOIN") || bq_upper.contains("FULL OUTER");
@@ -147,49 +181,13 @@ pub fn reflex_build_delta_sql(
     // The source is secondary if it appears as the table being outer-joined,
     // i.e. directly after "LEFT JOIN", "RIGHT JOIN", or "FULL JOIN".
     // Do NOT match if source_table only appears in ON conditions (that's the primary table).
-    // Strip surrounding quotes: a CTE sub-IMV / schema-qualified secondary is
-    // registered (and passed here) quoted, e.g. `"v__cte_agg"`, but the
-    // JOIN-keyword scan compares against the unquoted token in base_query.
-    let src_upper = source_table.trim_matches('"').to_uppercase();
-    let bare_upper = bare_source.trim_matches('"').to_uppercase();
     let is_outer_join_secondary_table = !is_self_join
         && (bq_upper.contains("LEFT JOIN")
             || bq_upper.contains("RIGHT JOIN")
             || bq_upper.contains("LEFT OUTER")
             || bq_upper.contains("RIGHT OUTER")
             || is_full_outer)
-        && {
-            // Check if source_table appears directly after an outer JOIN keyword
-            let patterns = [
-                "LEFT JOIN ",
-                "LEFT OUTER JOIN ",
-                "RIGHT JOIN ",
-                "RIGHT OUTER JOIN ",
-                "FULL JOIN ",
-                "FULL OUTER JOIN ",
-            ];
-            patterns.iter().any(|pat| {
-                let mut search_from = 0;
-                while let Some(pos) = bq_upper[search_from..].find(pat) {
-                    let after = &bq_upper[search_from + pos + pat.len()..];
-                    // Strip surrounding double-quotes: a CTE sub-IMV or schema-
-                    // qualified secondary is emitted quoted (`LEFT JOIN "v__cte_x" a`),
-                    // and the source_table registry name is unquoted — without
-                    // this the match (and thus the whole outer-join-secondary
-                    // handling) silently misses every quoted secondary.
-                    let next_token = after
-                        .split_whitespace()
-                        .next()
-                        .unwrap_or("")
-                        .trim_matches('"');
-                    if next_token == src_upper || next_token == bare_upper {
-                        return true;
-                    }
-                    search_from += pos + pat.len();
-                }
-                false
-            })
-        };
+        && follows_outer_join_keyword(&bq_upper, source_table);
     // For LEFT/RIGHT JOIN: EVERY operation on the secondary table needs special
     // handling. The plain `L LEFT JOIN Δsecondary` delta re-emits all left rows
     // NULL-extended, which double-counts non-matching left rows on INSERT (breaks
@@ -644,3 +642,7 @@ pub(crate) use scope::*;
 #[cfg(test)]
 #[path = "../tests/unit_trigger.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "../tests/unit_trigger_source_guards.rs"]
+mod source_guard_tests;

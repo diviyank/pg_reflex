@@ -492,3 +492,712 @@ fn substitute_identifier_ci_preserves_multibyte_text() {
         "('Hiver' = 'Été'::text)"
     );
 }
+
+// ---------- source rewrite: literals, multi-byte neighbours, mixed quoting ----------
+
+/// Verbatim copies of the rewriters as they were before they became
+/// literal-, quoting- and UTF-8-aware, kept as the reference for the
+/// differential tests below.
+mod legacy {
+    use super::super::identifier::{consume_table_alias, split_qualified};
+
+    pub fn replace_identifier(sql: &str, old_name: &str, new_name: &str) -> String {
+        if old_name.is_empty() {
+            return sql.to_string();
+        }
+        let mut result = String::with_capacity(sql.len());
+        let bytes = sql.as_bytes();
+        let old_bytes = old_name.as_bytes();
+        let mut unmatched_start = 0;
+        let mut i = 0;
+        while i < bytes.len() {
+            if i + old_bytes.len() <= bytes.len() && &bytes[i..i + old_bytes.len()] == old_bytes {
+                let before_ok = i == 0
+                    || !(bytes[i - 1].is_ascii_alphanumeric()
+                        || bytes[i - 1] == b'_'
+                        || bytes[i - 1] == b'.');
+                let after_as = i >= 3
+                    && (bytes[i - 1] == b' ')
+                    && (bytes[i - 2] == b'S' || bytes[i - 2] == b's')
+                    && (bytes[i - 3] == b'A' || bytes[i - 3] == b'a')
+                    && (i < 4 || !bytes[i - 4].is_ascii_alphanumeric());
+                let after_pos = i + old_bytes.len();
+                let after_ok = after_pos >= bytes.len()
+                    || !(bytes[after_pos].is_ascii_alphanumeric() || bytes[after_pos] == b'_');
+                if before_ok && after_ok && !after_as {
+                    result.push_str(&sql[unmatched_start..i]);
+                    result.push_str(new_name);
+                    i += old_bytes.len();
+                    unmatched_start = i;
+                    continue;
+                }
+            }
+            i += 1;
+        }
+        result.push_str(&sql[unmatched_start..]);
+        result
+    }
+
+    pub fn strip_redundant_bare_alias(sql: &str, source_table: &str) -> String {
+        let (schema, bare) = split_qualified(source_table);
+        if schema.is_none() || bare == source_table {
+            return sql.to_string();
+        }
+        let bytes = sql.as_bytes();
+        let pat = source_table.as_bytes();
+        let mut out = String::with_capacity(sql.len());
+        let mut unmatched_start = 0;
+        let mut i = 0;
+        while i < bytes.len() {
+            if i + pat.len() <= bytes.len() && &bytes[i..i + pat.len()] == pat {
+                let before_ok = i == 0
+                    || !(bytes[i - 1].is_ascii_alphanumeric()
+                        || bytes[i - 1] == b'_'
+                        || bytes[i - 1] == b'.');
+                let after_pos = i + pat.len();
+                let after_ok = after_pos >= bytes.len()
+                    || !(bytes[after_pos].is_ascii_alphanumeric() || bytes[after_pos] == b'_');
+                if before_ok && after_ok {
+                    let (user_alias, consumed_to) = consume_table_alias(bytes, after_pos);
+                    if matches!(&user_alias, Some(a) if a == bare) {
+                        out.push_str(&sql[unmatched_start..i]);
+                        out.push_str(source_table);
+                        i = consumed_to;
+                        unmatched_start = i;
+                        continue;
+                    }
+                }
+            }
+            i += 1;
+        }
+        out.push_str(&sql[unmatched_start..]);
+        out
+    }
+
+    pub fn replace_source_with_transition(
+        base_query: &str,
+        source_table: &str,
+        transition_tbl: &str,
+    ) -> String {
+        let quoted_tbl = if transition_tbl.contains('"') {
+            transition_tbl.to_string()
+        } else {
+            format!("\"{}\"", transition_tbl)
+        };
+        let stripped = strip_redundant_bare_alias(base_query, source_table);
+        let (schema, bare_source) = split_qualified(source_table);
+        let bare_unq = bare_source.trim_matches('"');
+        let mut out = stripped;
+        if let Some(s) = schema {
+            let schema_unq = s.trim_matches('"');
+            out = replace_identifier(
+                &out,
+                &format!("\"{}\".\"{}\"", schema_unq, bare_unq),
+                &quoted_tbl,
+            );
+        }
+        out = replace_identifier(&out, &format!("\"{}\"", bare_unq), &quoted_tbl);
+        out = replace_identifier(&out, source_table, &quoted_tbl);
+        if bare_source != source_table {
+            out = replace_identifier(&out, bare_unq, &quoted_tbl);
+        }
+        out
+    }
+}
+
+struct Lcg(u64);
+
+impl Lcg {
+    fn below(&mut self, bound: usize) -> usize {
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        ((self.0 >> 33) as usize) % bound
+    }
+
+    fn concatenation_of(&mut self, fragments: &[&str], max_fragments: usize) -> String {
+        let count = 1 + self.below(max_fragments);
+        (0..count)
+            .map(|_| fragments[self.below(fragments.len())])
+            .collect()
+    }
+}
+
+const TRANSITIONS: [&str; 2] = ["__reflex_new_alp_product", "\"sch\".\"__reflex_pt_new_v\""];
+
+#[test]
+fn source_rewrite_leaves_single_quoted_literal_alone() {
+    assert_eq!(
+        replace_source_with_transition(
+            "SELECT season FROM prod WHERE season = 'a-prod-b' AND prod.v > 0",
+            "prod",
+            "__reflex_new_prod"
+        ),
+        "SELECT season FROM \"__reflex_new_prod\" WHERE season = 'a-prod-b' AND \"__reflex_new_prod\".v > 0"
+    );
+}
+
+#[test]
+fn source_rewrite_leaves_literal_next_to_multibyte_chars_alone() {
+    assert_eq!(
+        replace_source_with_transition(
+            "SELECT season FROM prod WHERE season = 'éprodé'",
+            "prod",
+            "__reflex_new_prod"
+        ),
+        "SELECT season FROM \"__reflex_new_prod\" WHERE season = 'éprodé'"
+    );
+}
+
+#[test]
+fn source_rewrite_leaves_literal_with_doubled_quote_alone() {
+    assert_eq!(
+        replace_source_with_transition(
+            "SELECT v FROM prod WHERE c = 'it''s prod' AND prod.v > 0",
+            "prod",
+            "__reflex_new_prod"
+        ),
+        "SELECT v FROM \"__reflex_new_prod\" WHERE c = 'it''s prod' AND \"__reflex_new_prod\".v > 0"
+    );
+}
+
+#[test]
+fn source_rewrite_leaves_escape_string_alone() {
+    assert_eq!(
+        replace_source_with_transition(
+            "SELECT v FROM prod WHERE c = E'a\\' prod' AND prod.v > 0",
+            "prod",
+            "__reflex_new_prod"
+        ),
+        "SELECT v FROM \"__reflex_new_prod\" WHERE c = E'a\\' prod' AND \"__reflex_new_prod\".v > 0"
+    );
+}
+
+#[test]
+fn source_rewrite_leaves_dollar_quoted_strings_alone() {
+    assert_eq!(
+        replace_source_with_transition(
+            "SELECT v FROM prod WHERE c = $$a prod b$$ AND d = $tag$ prod $tag$ AND prod.v > 0",
+            "prod",
+            "__reflex_new_prod"
+        ),
+        "SELECT v FROM \"__reflex_new_prod\" WHERE c = $$a prod b$$ AND d = $tag$ prod $tag$ AND \"__reflex_new_prod\".v > 0"
+    );
+}
+
+#[test]
+fn source_rewrite_treats_positional_parameter_as_code() {
+    assert_eq!(
+        replace_source_with_transition(
+            "SELECT v FROM prod WHERE c = $1 AND prod.v > $2",
+            "prod",
+            "__reflex_new_prod"
+        ),
+        "SELECT v FROM \"__reflex_new_prod\" WHERE c = $1 AND \"__reflex_new_prod\".v > $2"
+    );
+}
+
+#[test]
+fn source_rewrite_is_not_derailed_by_apostrophe_in_quoted_identifier() {
+    assert_eq!(
+        replace_source_with_transition(
+            "SELECT v AS \"it's\" FROM prod WHERE c = 'prod'",
+            "prod",
+            "__reflex_new_prod"
+        ),
+        "SELECT v AS \"it's\" FROM \"__reflex_new_prod\" WHERE c = 'prod'"
+    );
+}
+
+#[test]
+fn source_rewrite_is_not_derailed_by_apostrophe_in_comments() {
+    assert_eq!(
+        replace_source_with_transition(
+            "SELECT v /* it's */ FROM prod -- don't\nWHERE c = 'prod'",
+            "prod",
+            "__reflex_new_prod"
+        ),
+        "SELECT v /* it's */ FROM \"__reflex_new_prod\" -- don't\nWHERE c = 'prod'"
+    );
+}
+
+#[test]
+fn source_rewrite_leaves_schema_qualified_name_in_literal_alone() {
+    assert_eq!(
+        replace_source_with_transition(
+            "SELECT v FROM alp.product WHERE c = 'a-alp.product-b' AND d = 'product' AND product.v > 0",
+            "alp.product",
+            "__reflex_new_alp_product"
+        ),
+        "SELECT v FROM \"__reflex_new_alp_product\" WHERE c = 'a-alp.product-b' AND d = 'product' AND \"__reflex_new_alp_product\".v > 0"
+    );
+}
+
+#[test]
+fn redundant_alias_inside_literal_is_kept() {
+    assert_eq!(
+        strip_redundant_bare_alias(
+            "SELECT 'alp.product AS product' FROM alp.product AS product",
+            "alp.product"
+        ),
+        "SELECT 'alp.product AS product' FROM alp.product"
+    );
+}
+
+#[test]
+fn replace_identifier_still_rewrites_inside_literals() {
+    assert_eq!(
+        replace_identifier("SELECT 'a-prod-b' FROM prod", "prod", "X"),
+        "SELECT 'a-X-b' FROM X"
+    );
+}
+
+#[test]
+fn literal_aware_rewrite_matches_legacy_when_query_has_no_literal() {
+    const FRAGMENTS: &[&str] = &[
+        "alp.product",
+        "product",
+        "\"alp\".\"product\"",
+        "\"product\"",
+        "alp",
+        ".",
+        "_",
+        "\"",
+        " AS ",
+        " as ",
+        " AS product",
+        " product",
+        "x",
+        " ",
+        "(",
+        ")",
+        ",",
+        "SELECT ",
+        " FROM ",
+        " JOIN ",
+        " WHERE ",
+        " ON ",
+        " = ",
+        "p",
+        "1",
+        "\n",
+        "-",
+        "--",
+        "/*",
+        "*/",
+    ];
+    let mut rng = Lcg(0x5eed);
+    let mut compared = 0;
+    let mut rewritten = 0;
+    let mut stripped = 0;
+    for _ in 0..8000 {
+        let sql = rng.concatenation_of(FRAGMENTS, 14);
+        if sql.contains("\"alp\".product") || sql.contains("alp.\"product\"") {
+            continue;
+        }
+        for source in ["alp.product", "product"] {
+            for transition in TRANSITIONS {
+                let expected = legacy::replace_source_with_transition(&sql, source, transition);
+                assert_eq!(
+                    replace_source_with_transition(&sql, source, transition),
+                    expected,
+                    "sql: {sql:?}, source: {source}"
+                );
+                rewritten += usize::from(expected != sql);
+            }
+            let expected = legacy::strip_redundant_bare_alias(&sql, source);
+            assert_eq!(
+                strip_redundant_bare_alias(&sql, source),
+                expected,
+                "sql: {sql:?}, source: {source}"
+            );
+            stripped += usize::from(expected != sql);
+            compared += 1;
+        }
+    }
+    assert!(compared > 6000, "compared only {compared}");
+    assert!(rewritten > 3000, "rewrote only {rewritten}");
+    assert!(stripped > 20, "stripped only {stripped}");
+}
+
+#[test]
+fn replace_identifier_skips_match_followed_by_multibyte_char() {
+    assert_eq!(
+        replace_identifier("SELECT prodé FROM prod", "prod", "X"),
+        "SELECT prodé FROM X"
+    );
+    assert_eq!(
+        replace_identifier("SELECT prod夏, prod🍉 FROM prod", "prod", "X"),
+        "SELECT prod夏, prod🍉 FROM X"
+    );
+}
+
+#[test]
+fn replace_identifier_skips_match_preceded_by_multibyte_char() {
+    assert_eq!(
+        replace_identifier("SELECT éprod FROM prod", "prod", "X"),
+        "SELECT éprod FROM X"
+    );
+    assert_eq!(
+        replace_identifier("SELECT 夏prod, 🍉prod FROM prod", "prod", "X"),
+        "SELECT 夏prod, 🍉prod FROM X"
+    );
+}
+
+#[test]
+fn redundant_alias_after_multibyte_prefixed_name_is_kept() {
+    let sql = "SELECT 1 FROM éalp.product product";
+    assert_eq!(strip_redundant_bare_alias(sql, "alp.product"), sql);
+}
+
+#[test]
+fn source_rewrite_skips_identifier_extending_source_name_with_multibyte_char() {
+    assert_eq!(
+        replace_source_with_transition(
+            "SELECT prodé, éprod FROM prod GROUP BY prodé, éprod",
+            "prod",
+            "__reflex_new_prod"
+        ),
+        "SELECT prodé, éprod FROM \"__reflex_new_prod\" GROUP BY prodé, éprod"
+    );
+}
+
+#[test]
+fn replace_identifier_matches_legacy_on_ascii_input() {
+    const FRAGMENTS: &[&str] = &[
+        "prod",
+        "alp.product",
+        "\"alp\".\"product\"",
+        "\"product\"",
+        "product",
+        ".",
+        "_",
+        "\"",
+        "'",
+        "''",
+        "$",
+        "$$",
+        "$t$",
+        "E'",
+        "\\",
+        " AS ",
+        " as ",
+        "xAS ",
+        " ",
+        "(",
+        ")",
+        ",",
+        "SELECT ",
+        " FROM ",
+        " WHERE ",
+        "=",
+        "a",
+        "Z",
+        "0",
+        "\n",
+        "\t",
+        "-",
+        "/*",
+        "*/",
+    ];
+    const PATTERNS: &[&str] = &[
+        "prod",
+        "product",
+        "alp.product",
+        "\"alp\".\"product\"",
+        "\"product\"",
+        "a",
+        "",
+    ];
+    let mut rng = Lcg(0xb17e);
+    let mut rewritten = 0;
+    for case in 0..6000 {
+        let mut sql = rng.concatenation_of(FRAGMENTS, 14);
+        if case % 3 == 0 {
+            let position = rng.below(sql.len() + 1);
+            sql.insert(position, (rng.below(0x80) as u8) as char);
+        }
+        assert!(sql.is_ascii());
+        for pattern in PATTERNS {
+            let expected = legacy::replace_identifier(&sql, pattern, "\"__t\"");
+            assert_eq!(
+                replace_identifier(&sql, pattern, "\"__t\""),
+                expected,
+                "sql: {sql:?}, pattern: {pattern}"
+            );
+            rewritten += usize::from(expected != sql);
+        }
+    }
+    assert!(rewritten > 1000, "rewrote only {rewritten}");
+}
+
+#[test]
+fn source_rewrite_recognises_quoted_schema_with_unquoted_table() {
+    assert_eq!(
+        replace_source_with_transition(
+            "SELECT product.v FROM \"alp\".product WHERE \"alp\".product.v > 0",
+            "alp.product",
+            "__reflex_new_alp_product"
+        ),
+        "SELECT \"__reflex_new_alp_product\".v FROM \"__reflex_new_alp_product\" WHERE \"__reflex_new_alp_product\".v > 0"
+    );
+}
+
+#[test]
+fn source_rewrite_recognises_unquoted_schema_with_quoted_table() {
+    assert_eq!(
+        replace_source_with_transition(
+            "SELECT p.v FROM alp.\"product\" p WHERE alp.\"product\".v > 0",
+            "alp.product",
+            "__reflex_new_alp_product"
+        ),
+        "SELECT p.v FROM \"__reflex_new_alp_product\" p WHERE \"__reflex_new_alp_product\".v > 0"
+    );
+}
+
+#[test]
+fn source_rewrite_leaves_mixed_spelling_of_other_names_alone() {
+    for sql in [
+        "SELECT 1 FROM \"alp\".product_backup",
+        "SELECT 1 FROM alp.\"product_backup\"",
+        "SELECT 1 FROM \"zalp\".product",
+    ] {
+        assert_eq!(
+            replace_source_with_transition(sql, "alp.product", "__reflex_new_alp_product"),
+            sql
+        );
+    }
+}
+
+#[test]
+fn source_rewrite_matches_legacy_for_unquoted_fully_quoted_and_bare_references() {
+    const ALIASES: [&str; 5] = ["", " p", " AS p", " AS product", " product"];
+    const SELECTS: [&str; 7] = [
+        "*",
+        "product.id, product.v",
+        "p.id",
+        "\"product\".id",
+        "alp.product.id",
+        "\"alp\".\"product\".v",
+        "SUM(v) AS product",
+    ];
+    const JOINS: [&str; 4] = [
+        "",
+        " JOIN alp.dim d ON d.id = product.dim_id",
+        " LEFT JOIN \"alp\".\"dim\" ON dim.id = p.dim_id",
+        " JOIN alp.product_backup b ON b.id = p.id",
+    ];
+    const WHERES: [&str; 4] = [
+        "",
+        " WHERE product.v > 0",
+        " WHERE p.v > 0 AND alp.product.id < 5",
+        " WHERE \"product\".v IS NULL",
+    ];
+    const GROUPS: [&str; 3] = ["", " GROUP BY product.id", " GROUP BY p.id"];
+    const REFERENCES: [(&str, &str); 4] = [
+        ("alp.product", "alp.product"),
+        ("alp.product", "\"alp\".\"product\""),
+        ("product", "product"),
+        ("product", "\"product\""),
+    ];
+    let mut compared = 0;
+    let mut rewritten = 0;
+    for (source, reference) in REFERENCES {
+        for alias in ALIASES {
+            for select in SELECTS {
+                for join in JOINS {
+                    for filter in WHERES {
+                        for group in GROUPS {
+                            let sql = format!(
+                                "SELECT {select} FROM {reference}{alias}{join}{filter}{group}"
+                            );
+                            for transition in TRANSITIONS {
+                                let expected = legacy::replace_source_with_transition(
+                                    &sql, source, transition,
+                                );
+                                assert_eq!(
+                                    replace_source_with_transition(&sql, source, transition),
+                                    expected,
+                                    "sql: {sql:?}, source: {source}"
+                                );
+                                compared += 1;
+                                rewritten += usize::from(expected != sql);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(compared, 13440);
+    assert_eq!(rewritten, compared);
+}
+
+fn legacy_safe(raw: &str) -> String {
+    const MAX_IDENT: usize = 63;
+    if raw.len() <= MAX_IDENT {
+        return raw.to_string();
+    }
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    raw.hash(&mut hasher);
+    let hash = hasher.finish();
+    format!("{}_{:08x}", &raw[..MAX_IDENT - 9], hash as u32)
+}
+
+fn name_with_char_straddling_the_cut(ascii_lead: usize, straddling: char) -> String {
+    format!("{}{}{}", "a".repeat(ascii_lead), straddling, "b".repeat(20))
+}
+
+fn assert_truncated_before_straddling_char(ascii_lead: usize, straddling: char) {
+    let truncated = safe(&name_with_char_straddling_the_cut(ascii_lead, straddling));
+    let (kept, suffix) = truncated.split_at(ascii_lead);
+    assert_eq!(kept, "a".repeat(ascii_lead));
+    assert_eq!(suffix.len(), 9, "suffix: {suffix}");
+    assert!(suffix.starts_with('_'), "suffix: {suffix}");
+    assert!(
+        suffix[1..].chars().all(|c| c.is_ascii_hexdigit()),
+        "suffix: {suffix}"
+    );
+    assert!(truncated.len() <= 63);
+}
+
+#[test]
+fn safe_truncates_before_two_byte_char_straddling_the_cut() {
+    assert_truncated_before_straddling_char(53, 'é');
+}
+
+#[test]
+fn safe_truncates_before_three_byte_char_straddling_the_cut() {
+    assert_truncated_before_straddling_char(53, '夏');
+    assert_truncated_before_straddling_char(52, '夏');
+}
+
+#[test]
+fn safe_truncates_before_four_byte_char_straddling_the_cut() {
+    assert_truncated_before_straddling_char(53, '🍉');
+    assert_truncated_before_straddling_char(52, '🍉');
+    assert_truncated_before_straddling_char(51, '🍉');
+}
+
+#[test]
+fn safe_keeps_distinct_long_multibyte_names_distinct() {
+    let summer = format!("__reflex_new_{}_été", "é".repeat(30));
+    let winter = format!("__reflex_new_{}_hiver", "é".repeat(30));
+    assert_ne!(safe(&summer), safe(&winter));
+    assert!(safe(&summer).len() <= 63);
+}
+
+#[test]
+fn safe_keeps_whole_char_ending_exactly_at_the_cut() {
+    let name = format!("{}é{}", "a".repeat(52), "b".repeat(20));
+    assert!(safe(&name).starts_with(&format!("{}é_", "a".repeat(52))));
+    assert_eq!(safe(&name).len(), 63);
+}
+
+#[test]
+fn safe_matches_legacy_on_ascii_and_short_names() {
+    const ALPHABET: &[u8] = b"abcXYZ019_$. \"";
+    let mut rng = Lcg(0x5afe);
+    let mut truncated = 0;
+    for _ in 0..4000 {
+        let length = rng.below(130);
+        let name: String = (0..length)
+            .map(|_| ALPHABET[rng.below(ALPHABET.len())] as char)
+            .collect();
+        assert_eq!(safe(&name), legacy_safe(&name), "name: {name:?}");
+        truncated += usize::from(name.len() > 63);
+    }
+    assert!(truncated > 1500, "truncated only {truncated}");
+    for chars in 0..=31 {
+        let short_multibyte = "é".repeat(chars);
+        assert_eq!(safe(&short_multibyte), short_multibyte);
+        assert_eq!(safe(&short_multibyte), legacy_safe(&short_multibyte));
+    }
+}
+
+// ---------- one definition of "this token names the source" ----------
+
+use super::identifier::{rewritten_source_spellings, token_names_source};
+
+const SOURCE_SPELLINGS: [&str; 4] = ["alp.dim", "\"alp\".\"dim\"", "\"alp\".dim", "alp.\"dim\""];
+
+#[test]
+fn token_names_source_in_every_qualified_spelling() {
+    for registered in SOURCE_SPELLINGS {
+        for token in SOURCE_SPELLINGS {
+            assert!(
+                token_names_source(token, registered),
+                "registered {registered}, token {token}"
+            );
+        }
+        for bare_token in ["dim", "\"dim\""] {
+            assert!(
+                token_names_source(bare_token, registered),
+                "registered {registered}, token {bare_token}"
+            );
+        }
+    }
+}
+
+#[test]
+fn token_names_source_in_every_unqualified_spelling() {
+    for registered in ["dim", "\"dim\""] {
+        for token in ["dim", "\"dim\""] {
+            assert!(
+                token_names_source(token, registered),
+                "registered {registered}, token {token}"
+            );
+        }
+    }
+}
+
+#[test]
+fn token_naming_another_relation_is_not_the_source() {
+    for registered in SOURCE_SPELLINGS {
+        for token in [
+            "alp.dim_backup",
+            "\"alp\".\"dimension\"",
+            "other.dim",
+            "\"other\".dim",
+            "other.\"dim\"",
+            "\"other\".\"dim\"",
+            "alp.dim.k",
+            "alp",
+            "\"alp\"",
+            "",
+        ] {
+            assert!(
+                !token_names_source(token, registered),
+                "registered {registered}, token {token}"
+            );
+        }
+    }
+    assert!(!token_names_source("alp.dim", "dim"));
+    assert!(!token_names_source("DIM", "dim"));
+}
+
+#[test]
+fn every_spelling_the_rewrite_replaces_names_the_source() {
+    for registered in ["alp.dim", "\"alp\".\"dim\"", "dim", "\"dim\""] {
+        let spellings = rewritten_source_spellings(registered);
+        assert!(spellings.len() >= 2, "registered {registered}");
+        for spelling in spellings {
+            assert!(
+                token_names_source(&spelling, registered),
+                "registered {registered}, spelling {spelling}"
+            );
+            assert_ne!(
+                replace_source_with_transition(
+                    &format!("SELECT 1 FROM {spelling} x"),
+                    registered,
+                    "__reflex_new_dim"
+                ),
+                format!("SELECT 1 FROM {spelling} x"),
+                "registered {registered}, spelling {spelling}"
+            );
+        }
+    }
+}

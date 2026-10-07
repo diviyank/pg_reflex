@@ -415,7 +415,7 @@ fn is_non_null_literal(s: &str) -> bool {
 /// `<X>` is whatever appears before the top-level ` * COALESCE(`. Case-insensitive
 /// on the keyword `COALESCE`.
 fn strip_coalesce_multiplier_to_x(expr: &str) -> Option<String> {
-    let lc = expr.to_lowercase();
+    let lc = expr.to_ascii_lowercase();
     let needle = " * coalesce(";
     let idx = lc.find(needle)?;
     let x = expr[..idx].trim().to_string();
