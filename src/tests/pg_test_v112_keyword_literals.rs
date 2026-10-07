@@ -250,3 +250,63 @@ fn v112_or_and_only_predicate() {
 fn v112_or_only_inside_a_literal() {
     v112_or_roundtrip("lit", "city <> 'x or y'");
 }
+
+/// The only GROUP BY of the end query is inside the HAVING subquery, so target
+/// rows stay 1:1 with the intermediate. `{o}` is a source of the IMV too.
+fn v112_hs_roundtrip(tag: &str, select_tail: &str, write_subquery_table: bool) {
+    let table = format!("v112_hs_{tag}_src");
+    let lookup = format!("v112_hs_{tag}_o");
+    let imv = format!("v112_hs_{tag}");
+    v112_kw_table(&table);
+    Spi::run(&format!("CREATE TABLE {lookup}(k INT, x INT)")).expect("lookup");
+    Spi::run(&format!(
+        "INSERT INTO {lookup} SELECT i % 4, i FROM generate_series(1, 20) i"
+    ))
+    .expect("lookup seed");
+    let q = select_tail.replace("{t}", &table).replace("{o}", &lookup);
+    assert_eq!(
+        crate::create_reflex_ivm_with_topk(&imv, &q, None, None, None, 0, None),
+        "CREATE REFLEX INCREMENTAL VIEW",
+        "{q}"
+    );
+    Spi::run(&format!("INSERT INTO {table}(g, city, v) VALUES ('g0','Lyon',5)")).expect("insert");
+    assert_imv_correct(&imv, &q);
+    v112_kw_dml(&table);
+    assert_imv_correct(&imv, &q);
+    if !write_subquery_table {
+        return;
+    }
+    Spi::run(&format!("INSERT INTO {lookup} VALUES (7, 100), (8, 101)")).expect("lookup insert");
+    assert_imv_correct(&imv, &q);
+    Spi::run(&format!("UPDATE {lookup} SET x = -x WHERE k = 1")).expect("lookup update");
+    assert_imv_correct(&imv, &q);
+    Spi::run(&format!("DELETE FROM {lookup}")).expect("lookup delete");
+    assert_imv_correct(&imv, &q);
+}
+
+const V112_HS_WHERE_AND_GROUP_BY: &str = "SELECT g, SUM(v) AS s FROM {t} GROUP BY g \
+     HAVING SUM(v) > (SELECT COUNT(*) FROM (SELECT k FROM {o} WHERE x > 0 GROUP BY k) z)";
+const V112_HS_GROUP_BY_ONLY: &str = "SELECT g, MAX(v) AS mx FROM {t} GROUP BY g \
+     HAVING MAX(v) > (SELECT MAX(c) FROM (SELECT COUNT(*) AS c FROM {o} GROUP BY k) z)";
+const V112_HS_FALSE_WHEN_SUBQUERY_IS_EMPTY: &str = "SELECT g, SUM(v) AS s FROM {t} GROUP BY g \
+     HAVING SUM(v) < 1000000 * (SELECT COUNT(*) FROM (SELECT k FROM {o} WHERE x > 0 GROUP BY k) z)";
+
+#[pg_test]
+fn v112_hs_having_subquery_with_where_and_group_by() {
+    v112_hs_roundtrip("wg", V112_HS_WHERE_AND_GROUP_BY, false);
+}
+
+#[pg_test]
+fn v112_hs_having_subquery_with_group_by_only() {
+    v112_hs_roundtrip("g", V112_HS_GROUP_BY_ONLY, false);
+}
+
+#[pg_test]
+fn v112_hs_having_false_when_subquery_is_empty() {
+    v112_hs_roundtrip("fe", V112_HS_FALSE_WHEN_SUBQUERY_IS_EMPTY, false);
+}
+
+#[pg_test]
+fn v112_hs_group_by_only_then_subquery_table_writes() {
+    v112_hs_roundtrip("go", V112_HS_GROUP_BY_ONLY, true);
+}

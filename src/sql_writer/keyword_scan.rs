@@ -131,6 +131,10 @@ pub(crate) fn has_keyword(sql: &str, keyword: &str) -> bool {
     !keyword_hits(sql, keyword).is_empty()
 }
 
+pub(crate) fn has_top_level_keyword(sql: &str, keyword: &str) -> bool {
+    keyword_hits(sql, keyword).iter().any(|hit| hit.depth == 0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -235,6 +239,26 @@ mod tests {
             positions(sql, " GROUP BY "),
             vec![sql.rfind(" GROUP BY ").unwrap()]
         );
+    }
+
+    #[test]
+    fn top_level_keyword_ignores_nested_and_quoted_occurrences() {
+        assert!(has_top_level_keyword(
+            "SELECT g FROM i WHERE c > 0 GROUP BY g",
+            "GROUP BY"
+        ));
+        assert!(!has_top_level_keyword(
+            "SELECT g FROM i WHERE c > (SELECT 1 FROM (SELECT k FROM o GROUP BY k) z)",
+            "GROUP BY"
+        ));
+        assert!(!has_top_level_keyword(
+            "SELECT g AS \"x GROUP BY y\" FROM i WHERE c <> ' GROUP BY '",
+            "GROUP BY"
+        ));
+        assert!(has_top_level_keyword(
+            "SELECT g FROM i WHERE c > (SELECT 1 FROM o GROUP BY k) GROUP BY g",
+            "GROUP BY"
+        ));
     }
 
     proptest! {
