@@ -262,7 +262,7 @@ pub fn build_target_table_ddl(
                     {
                         resolve_column_type(&ic.source_arg, column_types, "NUMERIC")
                     } else {
-                        // Fallback: if no matching IntermediateColumn found, use the old
+                        // Fallback: if no matching IntermediateColumn found, use
                         // prefix-stripping logic (defensive, should rarely happen).
                         let source_arg = mapping
                             .intermediate_expr
@@ -413,14 +413,12 @@ pub fn build_indexes_ddl(view_name: &str, plan: &AggregationPlan) -> Vec<String>
         }
     }
 
-    // 1.4.4 (perftest A→B bench, 47K rows): the per-column intermediate
-    // indexes that pre-1.4.4 emitted (one per group-by column) added
-    // ~480ms of index maintenance per UPDATE cycle and were never used
-    // by any pg_reflex query path — every code path (MERGE ON,
+    // No per-column intermediate indexes: one per group-by column adds
+    // ~480ms of index maintenance per UPDATE cycle (47K-row bench) and no
+    // pg_reflex query path probes them — every code path (MERGE ON,
     // EXISTS-by-affected, JOIN to scratch) uses the full composite key,
     // so the composite UNIQUE NULLS NOT DISTINCT btree above is the
-    // only index actually probed. Dropped here; migration in
-    // sql/pg_reflex--1.4.3--1.4.4.sql drops them on existing IMVs.
+    // only index actually probed.
 
     // Composite index on target table for targeted refresh DELETE performance
     if !plan.group_by_columns.is_empty() {
@@ -474,7 +472,7 @@ pub(crate) fn build_trigger_ddls_from_body(source_table: &str, body_template: &s
     //
     // Early-exit: if the transition table is empty, skip the entire loop (no IMVs to process).
     // This avoids Rust FFI calls and advisory locks when a statement affects 0 relevant rows.
-    // 1.4.5: filter out IMVs that explicitly ignored this source via the
+    // Filter out IMVs that explicitly ignored this source via the
     // `ignore_sources` parameter of `create_reflex_ivm`. The check covers
     // both schema-qualified ('alp.product') and bare ('product') forms so
     // users can write whichever matches their IMV's depends_on entry.
@@ -483,7 +481,7 @@ pub(crate) fn build_trigger_ddls_from_body(source_table: &str, body_template: &s
         .next_back()
         .unwrap_or(source_table)
         .to_string();
-    // 1.4.5 — Filter-aware spurious-skip (UPDATE only). See
+    // Filter-aware spurious-skip (UPDATE only). See
     // sql/trigger_body.plpgsql.in for the relocated main body; this sub-
     // template is spliced in at the `__REFLEX_SLOT_FILTER_SKIP_BLOCK__`
     // sentinel.  References to the source / OLD / NEW transition tables
@@ -505,7 +503,7 @@ pub(crate) fn build_trigger_ddls_from_body(source_table: &str, body_template: &s
     // cannot change for this UPDATE — skip its body entirely.
     //
     // An absent / empty imv_relevant_columns entry disables the check
-    // (CTE-using or SELECT * IMVs land here — they keep the previous path).
+    // (CTE-using or SELECT * IMVs land here — they keep the unfiltered path).
     // The CASE on t.typname casts `json` / `xml` columns to `text` in the
     // EXCEPT ALL projection — neither type has an equality operator, so a
     // bare projection crashes the comparison at runtime. The TEMP VIEW /
@@ -528,7 +526,7 @@ pub(crate) fn build_trigger_ddls_from_body(source_table: &str, body_template: &s
         ],
     );
 
-    // Item α (2026-05-15) — Directional UPDATE dispatch.
+    // Directional UPDATE dispatch.
     //
     // After filter-aware spurious-skip has decided the multisets differ, probe
     // each transition table for post-filter rows. The three outcomes route
@@ -541,7 +539,7 @@ pub(crate) fn build_trigger_ddls_from_body(source_table: &str, body_template: &s
     //     safety mapping exists, trigger.rs uses bulk-DELETE — two
     //     indexed DELETEs against transition_old, skipping the scratch
     //     fill JOIN entirely; otherwise → falls back to MERGE Subtract).
-    //   * both have rows          → 'UPDATE' (today's UNION ALL path).
+    //   * both have rows          → 'UPDATE' (the UNION ALL path).
     //
     // The INSERT/DELETE codegen paths read only one transition table by name;
     // they remain visible from the UPDATE trigger's REFERENCING clauses.
@@ -552,7 +550,7 @@ pub(crate) fn build_trigger_ddls_from_body(source_table: &str, body_template: &s
     //
     // The 'INSERT_PROMOTED' tag is what makes the bulk-INSERT branch
     // selectable: trigger.rs ONLY considers the bulk path on this op
-    // string. Regular INSERT triggers (true source INSERTs, not Item α
+    // string. Regular INSERT triggers (true source INSERTs, not
     // promotions) stay on op='INSERT' and always take MERGE because new
     // fact rows can legitimately aggregate into existing groups.
     let directional_probe_for_update = slot_replace(
@@ -572,7 +570,7 @@ pub(crate) fn build_trigger_ddls_from_body(source_table: &str, body_template: &s
     //     that row's contribution). The __REFLEX_SLOT_PRED_CHECK_BLOCK__
     //     in the main body picks the correct op-specific SQL.
     //
-    // 1.11.5 — no Path B: these statement-trigger bodies never rebuild the IMV
+    // No Path B: these statement-trigger bodies never rebuild the IMV
     // (`reflex_reconcile`). Another trigger of the same statement (upsert,
     // MERGE, writable CTE) would apply its delta on top of a rebuild that
     // already read it. Bulk rebuild dispatch runs only in the DEFERRED flush.
@@ -598,8 +596,8 @@ pub(crate) fn build_trigger_ddls_from_body(source_table: &str, body_template: &s
 
     // Path C — EXPLAIN-based fanout dispatch for INSERT_PROMOTED.
     //
-    // Only emitted in the UPDATE trigger body (the only place Item α can
-    // promote to INSERT_PROMOTED). For dim-source flips where Path B's
+    // Only emitted in the UPDATE trigger body (the only place an UPDATE can
+    // be promoted to INSERT_PROMOTED). For dim-source flips where Path B's
     // |transition| / |source| signal is misleading (1-row UPDATE on a
     // 28-row dim that fans out to 8.9M fact rows), Path C asks the planner
     // for the actual scratch-fill cardinality via `EXPLAIN (FORMAT JSON)`,
@@ -610,7 +608,7 @@ pub(crate) fn build_trigger_ddls_from_body(source_table: &str, body_template: &s
     // path — safe.
     //
     // Path C high-fanout response is a *smart bulk-INSERT*, not a full
-    // reconcile.  The Item α INSERT_PROMOTED guarantee says the existing
+    // reconcile.  The INSERT_PROMOTED guarantee says the existing
     // intermediate has zero rows for the affected group keys, so we can:
     //   1. scratch-fill (base_query with source→transition) — same JOIN
     //      cost as reconcile's INSERT INTO intermediate, but restricted
@@ -741,8 +739,7 @@ pub(crate) fn build_trigger_ddls_from_body(source_table: &str, body_template: &s
 /// It is baked into the trigger body as a named-column INSERT list so that a
 /// staging delta from an older incarnation of the source — whose physical
 /// column ORDER may differ from the current shape — still receives the rows
-/// at the correct named columns instead of mismatching positionally. See the
-/// 1.6.2 regression added in `pg_test_deferred.rs`.
+/// at the correct named columns instead of mismatching positionally.
 pub fn build_deferred_trigger_ddls(source_table: &str, source_columns: &[String]) -> Vec<String> {
     let safe_source = source_table.replace('.', "_").replace('"', "");
     let bare_source = source_table
@@ -760,8 +757,7 @@ pub fn build_deferred_trigger_ddls(source_table: &str, source_columns: &[String]
         .join(", ");
 
     // Mixed-mode body for INSERT/DELETE: process IMMEDIATE IMVs inline, stage
-    // deltas for DEFERRED IMVs.  Relocated to sql/deferred_trigger_body.plpgsql.in
-    // (see plans/1_6_1_refacto.md Phase 4).
+    // deltas for DEFERRED IMVs.  Lives in sql/deferred_trigger_body.plpgsql.in.
     let body_template = include_str!("../sql/deferred_trigger_body.plpgsql.in");
     let render_ins_del = |transition_tbl: &str, op: &str, op_code: &str, ref_tbl: &str| -> String {
         slot_replace(
@@ -907,8 +903,8 @@ pub fn build_deferred_flush_ddl() -> Vec<String> {
         // transaction staged. The trigger is FOR EACH ROW, so NEW.source_table
         // is precisely the pending row this transaction inserted — flushing it
         // (rather than scanning the shared, cross-schema pending queue) keeps
-        // deferred maintenance transaction-local: a commit in one schema no
-        // longer flushes, advisory-locks, or TRUNCATE-locks the staging tables
+        // deferred maintenance transaction-local: a commit in one schema does not
+        // flush, advisory-lock, or TRUNCATE-lock the staging tables
         // of sources owned by other, independent schemas. The per-source
         // advisory lock inside reflex_flush_deferred makes the redundant fires
         // for a source touched by several statements collapse into one
