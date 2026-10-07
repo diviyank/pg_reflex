@@ -926,3 +926,70 @@ fn v112_j_filter_entering_update_unquoted_bare_alias() {
 fn v112_j_filter_entering_update_quoted_schema_implicit_bare_alias() {
     assert_eq!(v112_j_filter_entering_update_cell("fe_oa", "\"{s}\".t t"), "ok");
 }
+
+/// `{a}` and `{b}` are two schemas each holding a table `dim`; `{f}` joins both.
+fn v112_j_same_name_cell(tag: &str, select_template: &str, deferred: bool) -> String {
+    let schema_a = format!("v112_j_{tag}_a");
+    let schema_b = format!("v112_j_{tag}_b");
+    let fact = format!("v112_j_{tag}_f");
+    Spi::run(&format!("CREATE SCHEMA {schema_a}")).expect("schema a");
+    Spi::run(&format!("CREATE SCHEMA {schema_b}")).expect("schema b");
+    v112_j_season_table(&format!("{schema_a}.dim"));
+    v112_j_season_table(&format!("{schema_b}.dim"));
+    v112_j_season_table(&fact);
+    let query = select_template
+        .replace("{a}", &schema_a)
+        .replace("{b}", &schema_b)
+        .replace("{f}", &fact);
+    v112_j_spelling_cell(
+        &format!("v112_j_{tag}"),
+        &query,
+        deferred,
+        &[
+            &format!("{schema_a}.dim"),
+            &format!("{schema_b}.dim"),
+            &fact,
+        ],
+    )
+}
+
+macro_rules! v112_j_same_name_cells {
+    ($($name:ident => ($select:expr, $deferred:expr),)+) => {
+        $(
+            #[pg_test]
+            fn $name() {
+                let tag = stringify!($name).trim_start_matches("v112_j_");
+                assert_eq!(v112_j_same_name_cell(tag, $select, $deferred), "ok", "{}", $select);
+            }
+        )+
+    };
+}
+
+v112_j_same_name_cells! {
+    v112_j_sn_inner_quoted => ("SELECT a.season, COUNT(*) AS c, SUM(b.v) AS s FROM {f} f JOIN \"{a}\".dim a ON a.season = f.season JOIN {b}.\"dim\" b ON b.season = f.season GROUP BY a.season", false),
+    v112_j_sn_inner_fully_quoted => ("SELECT a.season, COUNT(*) AS c, SUM(b.v) AS s FROM {f} f JOIN \"{a}\".\"dim\" a ON a.season = f.season JOIN \"{b}\".\"dim\" b ON b.season = f.season GROUP BY a.season", false),
+    v112_j_sn_inner_one_quoted => ("SELECT a.season, COUNT(*) AS c, SUM(b.v) AS s FROM {f} f JOIN {a}.dim a ON a.season = f.season JOIN {b}.\"dim\" b ON b.season = f.season GROUP BY a.season", false),
+    v112_j_sn_inner_unquoted => ("SELECT a.season, COUNT(*) AS c, SUM(b.v) AS s FROM {f} f JOIN {a}.dim a ON a.season = f.season JOIN {b}.dim b ON b.season = f.season GROUP BY a.season", false),
+    v112_j_sn_left_quoted => ("SELECT f.season, COUNT(*) AS c, SUM(b.v) AS s, SUM(a.v) AS t FROM {f} f LEFT JOIN \"{a}\".dim a ON a.season = f.season LEFT JOIN {b}.\"dim\" b ON b.season = f.season GROUP BY f.season", false),
+    v112_j_sn_left_unquoted => ("SELECT f.season, COUNT(*) AS c, SUM(b.v) AS s, SUM(a.v) AS t FROM {f} f LEFT JOIN {a}.dim a ON a.season = f.season LEFT JOIN {b}.dim b ON b.season = f.season GROUP BY f.season", false),
+    v112_j_sn_pt_quoted => ("SELECT f.id AS fid, a.season AS aseason, b.season AS bseason, b.v FROM {f} f JOIN \"{a}\".dim a ON a.id = f.id JOIN {b}.\"dim\" b ON b.id = f.id", false),
+    v112_j_sn_inner_quoted_deferred => ("SELECT a.season, COUNT(*) AS c, SUM(b.v) AS s FROM {f} f JOIN \"{a}\".dim a ON a.season = f.season JOIN {b}.\"dim\" b ON b.season = f.season GROUP BY a.season", true),
+}
+
+#[pg_test]
+fn v112_j_public_table_beside_quoted_same_name_in_other_schema() {
+    Spi::run("CREATE SCHEMA v112_j_snp_b").expect("schema");
+    v112_j_season_table("v112_j_snp_dim");
+    v112_j_season_table("v112_j_snp_b.v112_j_snp_dim");
+    let query = "SELECT a.season, COUNT(*) AS c, SUM(b.v) AS s FROM v112_j_snp_dim a \
+                 JOIN v112_j_snp_b.\"v112_j_snp_dim\" b ON b.season = a.season GROUP BY a.season";
+    assert_eq!(
+        v112_j_spelling_cell(
+            "v112_j_snp",
+            query,
+            false,
+            &["v112_j_snp_dim", "v112_j_snp_b.v112_j_snp_dim"]
+        ),
+        "ok"
+    );
+}

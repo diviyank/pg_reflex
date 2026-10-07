@@ -1201,3 +1201,57 @@ fn every_spelling_the_rewrite_replaces_names_the_source() {
         }
     }
 }
+
+// ---------- a rewrite that would land inside another quoted identifier ----------
+
+use super::identifier::source_rewrite_breaks_quoted_identifier;
+
+#[test]
+fn rewrite_inside_a_quoted_identifier_of_another_relation_is_detected() {
+    for (sql, source) in [
+        (
+            "SELECT 1 FROM f JOIN \"sa\".dim a ON TRUE JOIN sb.\"dim\" b ON TRUE",
+            "sa.dim",
+        ),
+        (
+            "SELECT 1 FROM f JOIN sa.dim a ON TRUE JOIN \"sb\".\"dim\" b ON TRUE",
+            "sa.dim",
+        ),
+        ("SELECT 1 FROM dim a JOIN sb.\"dim\" b ON TRUE", "dim"),
+        ("SELECT \"alp\".\"product\".v FROM product", "product"),
+        ("SELECT x.\"dim\" FROM sa.dim x", "sa.dim"),
+    ] {
+        assert!(
+            source_rewrite_breaks_quoted_identifier(sql, source),
+            "{sql} / {source}"
+        );
+        assert!(
+            replace_source_with_transition(sql, source, "__reflex_new_x").contains("\"\""),
+            "{sql} / {source}"
+        );
+    }
+}
+
+#[test]
+fn rewrite_of_every_source_spelling_breaks_no_quoted_identifier() {
+    for registered in ["alp.dim", "\"alp\".\"dim\"", "dim", "\"dim\""] {
+        for spelling in rewritten_source_spellings(registered) {
+            for sql in [
+                format!("SELECT x.k FROM {spelling} x JOIN other.dim_backup b ON b.k = x.k"),
+                format!("SELECT {spelling}.k FROM {spelling} WHERE {spelling}.k > 0"),
+                format!("SELECT x.k FROM {spelling} AS x JOIN sb.dim y ON y.k = x.k"),
+                format!("SELECT \"dimension\".k FROM {spelling} x JOIN \"dimension\" ON TRUE"),
+            ] {
+                assert!(
+                    !source_rewrite_breaks_quoted_identifier(&sql, registered),
+                    "{sql} / {registered}"
+                );
+                assert!(
+                    !replace_source_with_transition(&sql, registered, "__reflex_new_x")
+                        .contains("\"\""),
+                    "{sql} / {registered}"
+                );
+            }
+        }
+    }
+}
