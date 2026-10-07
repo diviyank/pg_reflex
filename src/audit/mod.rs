@@ -28,7 +28,6 @@ pub enum AuditScope {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-#[allow(dead_code)]
 pub enum Severity {
     Error,
     Warning,
@@ -61,7 +60,6 @@ pub struct Finding {
     pub suggested_fix: String,
 }
 
-#[allow(dead_code)]
 pub struct ImvRow {
     pub name: String,
     /// Schema the IMV's relations were created in (1.7.1). Set for every row
@@ -75,12 +73,10 @@ pub struct ImvRow {
     pub aggregations_json: Option<String>,
     pub partition_columns: Option<Vec<String>>,
     pub enabled: bool,
-    pub where_predicate: Option<String>,
     pub ignored_sources: Option<Vec<String>>,
 }
 
 impl ImvRow {
-    #[allow(dead_code)]
     pub fn is_passthrough(&self) -> bool {
         match self.aggregations_json.as_deref() {
             Some(s) => serde_json::from_str::<serde_json::Value>(s)
@@ -154,7 +150,6 @@ impl ImvRow {
 }
 
 pub trait Check {
-    #[allow(dead_code)]
     fn id(&self) -> &'static str;
     fn run(&self, _client: &SpiClient<'_>, _imv: Option<&ImvRow>) -> Vec<Finding> {
         vec![]
@@ -358,10 +353,6 @@ fn load_imv_rows(client: &SpiClient<'_>, scope: &AuditScope) -> Vec<ImvRow> {
                         .get_by_name::<bool, _>("enabled")
                         .unwrap_or(None)
                         .unwrap_or(true),
-                    where_predicate: row
-                        .get_by_name::<&str, _>("where_predicate")
-                        .unwrap_or(None)
-                        .map(|s| s.to_string()),
                     ignored_sources: row
                         .get_by_name::<Vec<String>, _>("ignored_sources")
                         .unwrap_or(None),
@@ -425,10 +416,6 @@ fn load_imv_rows(client: &SpiClient<'_>, scope: &AuditScope) -> Vec<ImvRow> {
                         .get_by_name::<bool, _>("enabled")
                         .unwrap_or(None)
                         .unwrap_or(true),
-                    where_predicate: row
-                        .get_by_name::<&str, _>("where_predicate")
-                        .unwrap_or(None)
-                        .map(|s| s.to_string()),
                     ignored_sources: row
                         .get_by_name::<Vec<String>, _>("ignored_sources")
                         .unwrap_or(None),

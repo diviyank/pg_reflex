@@ -1,10 +1,4 @@
-#![allow(unused_imports)]
-
-use pgrx::datum::DatumWithOid;
-use pgrx::pg_sys::panic::ErrorReportable;
-use pgrx::prelude::*;
 use pgrx::spi::SpiClient;
-use pgrx::PgBuiltInOids;
 use std::collections::HashSet;
 
 use super::{
