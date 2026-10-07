@@ -253,3 +253,60 @@ fn v112_sr_long_multibyte_source_name_stays_correct() {
     v112_sr_imv("v112_sr_long_agg", &q);
     v112_sr_assert_correct_through_dml(&table, "Été", &[("v112_sr_long_agg", &q)]);
 }
+
+#[pg_test]
+fn v112_sr_deferred_multibyte_literal_stays_correct() {
+    v112_sr_seeded_table("v112_sr_df", "Été");
+    let q = v112_sr_aggregate_over_literal("v112_sr_df", "'Été'");
+    assert_eq!(
+        crate::create_reflex_ivm("v112_sr_df_agg", &q, None, None, Some("DEFERRED"), None),
+        "CREATE REFLEX INCREMENTAL VIEW"
+    );
+    Spi::run("INSERT INTO v112_sr_df(season, v) VALUES ('Été',10),('y',20)").expect("insert");
+    Spi::run("SELECT reflex_flush_deferred('v112_sr_df')").expect("flush");
+    assert_imv_correct("v112_sr_df_agg", &q);
+}
+
+#[pg_test]
+fn v112_sr_non_public_schema_multibyte_literal_stays_correct() {
+    Spi::run("CREATE SCHEMA v112_sr_np").expect("schema");
+    v112_sr_seeded_table("v112_sr_np.prod", "Été");
+    let q = v112_sr_aggregate_over_literal("v112_sr_np.prod", "'Été'");
+    v112_sr_imv("v112_sr_np_agg", &q);
+    v112_sr_assert_correct_through_dml("v112_sr_np.prod", "Été", &[("v112_sr_np_agg", &q)]);
+}
+
+#[pg_test]
+fn v112_sr_partition_reconcile_with_multibyte_key_stays_correct() {
+    Spi::run(
+        "CREATE TABLE v112_sr_pp(season TEXT NOT NULL, id INT NOT NULL, v INT) \
+         PARTITION BY LIST (season)",
+    )
+    .expect("source");
+    Spi::run("CREATE TABLE v112_sr_pp_e PARTITION OF v112_sr_pp FOR VALUES IN ('Été')").expect("e");
+    Spi::run("CREATE TABLE v112_sr_pp_h PARTITION OF v112_sr_pp FOR VALUES IN ('Hiver')")
+        .expect("h");
+    Spi::run(
+        "INSERT INTO v112_sr_pp SELECT s, g, g FROM generate_series(1,20) g \
+         CROSS JOIN (VALUES ('Été'),('Hiver')) x(s)",
+    )
+    .expect("seed");
+    let q = "SELECT season, id, v FROM v112_sr_pp";
+    let created = Spi::get_one::<String>(
+        "SELECT create_reflex_ivm('v112_sr_pp_v', 'SELECT season, id, v FROM v112_sr_pp', \
+         'season, id', NULL, 'IMMEDIATE', NULL, ARRAY['season'])",
+    )
+    .expect("create")
+    .expect("result");
+    assert_eq!(created, "CREATE REFLEX INCREMENTAL VIEW");
+    Spi::run("UPDATE v112_sr_pp_v SET v = v + 1000 WHERE season = 'Été' AND id = 7")
+        .expect("drift update");
+    Spi::run("DELETE FROM v112_sr_pp_v WHERE season = 'Été' AND id = 8").expect("drift delete");
+    Spi::run("INSERT INTO v112_sr_pp_v VALUES ('Été', 999, 1)").expect("drift insert");
+    let reconciled =
+        Spi::get_one::<String>("SELECT reflex_reconcile_partition('v112_sr_pp_v', 'Été')")
+            .expect("reconcile")
+            .expect("result");
+    assert!(reconciled.starts_with("RECONCILED"), "{reconciled}");
+    assert_imv_correct("v112_sr_pp_v", q);
+}
