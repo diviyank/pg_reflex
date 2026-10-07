@@ -21,7 +21,7 @@ pub(crate) fn drop_reflex_ivm_impl(view_name: &str, cascade: bool) -> &'static s
 /// created at runtime from `create_reflex_ivm`, so they normally belong to the
 /// database, not the extension. But a `CREATE`/`CREATE OR REPLACE` that runs
 /// while PG's `creating_extension` flag is set — any `ALTER EXTENSION pg_reflex
-/// UPDATE` window — adopts them as members (see `sql/pg_reflex--1.7.0--1.7.1.sql`).
+/// UPDATE` window — adopts them as members.
 /// Once a migration leaves a tenant in that state a plain drop hits a hard wall.
 /// `fn_ref` is the function reference exactly as the following `DROP FUNCTION`
 /// names it (bare or schema-qualified, no argument list); the membership probe
@@ -93,11 +93,11 @@ fn drop_reflex_ivm_impl_inner(view_name: &str, cascade: bool, root: &str) -> &'s
 
         // Name used for all relation-level teardown DDL (target + aux tables).
         // When the stored name is bare we re-qualify it with the schema the
-        // objects were created in (1.7.1 `target_schema`), so DROPs no longer
-        // depend on the session search_path at drop time — the bug that
-        // orphaned bare-name IMVs created under a non-public search_path.
+        // objects were created in (`target_schema`), so DROPs do not depend on
+        // the session search_path at drop time, which would orphan bare-name
+        // IMVs created under a non-public search_path.
         // Already-qualified names and legacy rows (no target_schema) are used
-        // verbatim, preserving prior behavior.
+        // verbatim.
         let resolved_name: String = match (&target_schema, canonical_source(view_name).0) {
             (Some(schema), None) => format!("{schema}.{view_name}"),
             _ => view_name.to_string(),
@@ -174,7 +174,7 @@ fn drop_reflex_ivm_impl_inner(view_name: &str, cascade: bool, root: &str) -> &'s
         }
 
         // 5. Drop target (could be a TABLE or a VIEW for window/DISTINCT ON decompositions).
-        //    `resolved_name` carries the schema the target was created in (1.7.1),
+        //    `resolved_name` carries the schema the target was created in,
         //    so `to_regclass` and the DROP resolve the real relation regardless of
         //    the session search_path at drop time. Legacy rows fall back to the
         //    bare name + search_path resolution.
@@ -230,7 +230,7 @@ fn drop_reflex_ivm_impl_inner(view_name: &str, cascade: bool, root: &str) -> &'s
             )
             .unwrap_or_report();
 
-        // 6b. Drop persistent affected-groups table (qualified in IMV's schema, 1.4.1).
+        // 6b. Drop persistent affected-groups table (qualified in IMV's schema).
         client
             .update(
                 &format!(
@@ -458,14 +458,13 @@ fn drop_reflex_ivm_impl_inner(view_name: &str, cascade: bool, root: &str) -> &'s
                 for op in &["ins", "del", "upd"] {
                     // Current construction: op tag first, then the whole raw
                     // name `safe_identifier`-hashed, matching
-                    // `install_union_mirror_triggers` exactly (fixes
-                    // untreated_bugs/2026-07-25_union_mirror_function_name_collision.md).
-                    // A wrapper created by pg_reflex 1.11.0 or earlier used
-                    // the legacy `<wrapper>_<i>_<op>` order with no hashing,
-                    // so its functions were never renamed by this fix — drop
-                    // BOTH candidate names (IF EXISTS makes the mismatched
-                    // one a no-op) or upgraded databases leak the legacy
-                    // functions on every union-mirror wrapper drop.
+                    // `install_union_mirror_triggers` exactly.
+                    // A wrapper created by an older version used the legacy
+                    // `<wrapper>_<i>_<op>` order with no hashing, so its
+                    // functions keep that name — drop BOTH candidate names
+                    // (IF EXISTS makes the mismatched one a no-op) or upgraded
+                    // databases leak the legacy functions on every
+                    // union-mirror wrapper drop.
                     let fn_name =
                         safe_identifier(&format!("__reflex_union_mirror_{op}_{safe_wrapper}_{i}"));
                     let legacy_fn_name = format!("__reflex_union_mirror_{safe_wrapper}_{i}_{op}");
