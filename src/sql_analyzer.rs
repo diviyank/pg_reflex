@@ -90,6 +90,23 @@ pub struct SetOperationInfo {
     pub operand_sqls: Vec<String>,
 }
 
+pub(crate) fn bare_function_name(name: &sqlparser::ast::ObjectName) -> String {
+    let full = name.to_string();
+    full.rsplit('.')
+        .next()
+        .unwrap_or(&full)
+        .trim_matches('"')
+        .to_lowercase()
+}
+
+const DISTINCT_AGGREGATE_REJECTION: &str = "DISTINCT modifier on SUM/AVG/MIN/MAX/BOOL_OR is not supported. \
+     Only COUNT(DISTINCT col) is supported. Use a CTE with SELECT DISTINCT \
+     to pre-deduplicate: WITH d AS (SELECT DISTINCT grp, val FROM t) SELECT grp, SUM(val) FROM d GROUP BY grp";
+
+const NESTED_COUNT_DISTINCT_REJECTION: &str = "COUNT(DISTINCT) nested inside an expression is not supported (the DISTINCT would be lost). \
+     Compute it in a CTE and apply the expression in the outer SELECT: \
+     WITH d AS (SELECT grp, COUNT(DISTINCT val) AS n FROM t GROUP BY grp) SELECT grp, n + 1 AS c FROM d";
+
 #[derive(Debug, Default)]
 pub struct SqlAnalysis {
     pub ctes: Vec<CteInfo>,
@@ -118,6 +135,8 @@ pub struct SqlAnalysis {
     pub has_within_group: bool,
     pub has_scalar_subquery: bool,
     pub unsupported_aggregates: Vec<String>,
+    pub distinct_aggregates: Vec<String>,
+    pub nested_count_distinct: bool,
     /// Set when any non-deterministic function (NOW, RANDOM, etc.) is found
     /// anywhere in the query — SELECT, WHERE, HAVING, JOIN ON, ORDER BY all
     /// flow through `pre_visit_expr`. The flag name is kept for backwards
@@ -211,6 +230,12 @@ impl SqlAnalysis {
                 names
             ));
         }
+        if !self.distinct_aggregates.is_empty() {
+            return Some(DISTINCT_AGGREGATE_REJECTION.into());
+        }
+        if self.nested_count_distinct {
+            return Some(NESTED_COUNT_DISTINCT_REJECTION.into());
+        }
         None
     }
 }
@@ -246,6 +271,18 @@ impl<'a> Visitor for AnalysisVisitor<'a> {
     fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<()> {
         match expr {
             Expr::Function(f) => {
+                if let FunctionArguments::List(list) = &f.args {
+                    if list.duplicate_treatment
+                        == Some(sqlparser::ast::DuplicateTreatment::Distinct)
+                    {
+                        let bare = bare_function_name(&f.name);
+                        if matches!(bare.as_str(), "sum" | "avg" | "min" | "max" | "bool_or")
+                            && !self.analysis.distinct_aggregates.contains(&bare)
+                        {
+                            self.analysis.distinct_aggregates.push(bare);
+                        }
+                    }
+                }
                 if f.over.is_some() {
                     self.analysis.has_window_function = true;
                 } else {
@@ -329,17 +366,32 @@ impl<'a> Visitor for AnalysisVisitor<'a> {
 /// Detect aggregate kind from a function name.
 /// Recursively check if an expression tree contains any aggregate function calls.
 pub fn expr_contains_aggregate(expr: &Expr) -> bool {
+    expr_contains_call(expr, &|f| detect_aggregate(&f.name.to_string()).is_some())
+}
+
+fn is_count_distinct_call(f: &sqlparser::ast::Function) -> bool {
+    bare_function_name(&f.name) == "count"
+        && matches!(
+            &f.args,
+            FunctionArguments::List(list)
+                if list.duplicate_treatment == Some(sqlparser::ast::DuplicateTreatment::Distinct)
+        )
+}
+
+fn expr_contains_call(
+    expr: &Expr,
+    matches_call: &dyn Fn(&sqlparser::ast::Function) -> bool,
+) -> bool {
+    let recurse = |e: &Expr| expr_contains_call(e, matches_call);
     match expr {
         Expr::Function(f) if f.over.is_none() => {
-            let name = f.name.to_string();
-            if detect_aggregate(&name).is_some() {
+            if matches_call(f) {
                 return true;
             }
-            // Check arguments recursively
             if let FunctionArguments::List(list) = &f.args {
                 for arg in &list.args {
                     if let FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) = arg {
-                        if expr_contains_aggregate(e) {
+                        if recurse(e) {
                             return true;
                         }
                     }
@@ -347,37 +399,22 @@ pub fn expr_contains_aggregate(expr: &Expr) -> bool {
             }
             false
         }
-        Expr::BinaryOp { left, right, .. } => {
-            expr_contains_aggregate(left) || expr_contains_aggregate(right)
-        }
-        Expr::UnaryOp { expr: inner, .. } => expr_contains_aggregate(inner),
-        Expr::Nested(inner) => expr_contains_aggregate(inner),
+        Expr::BinaryOp { left, right, .. } => recurse(left) || recurse(right),
+        Expr::UnaryOp { expr: inner, .. } => recurse(inner),
+        Expr::Nested(inner) => recurse(inner),
         Expr::Case {
             operand,
             conditions,
             else_result,
             ..
         } => {
-            if let Some(op) = operand {
-                if expr_contains_aggregate(op) {
-                    return true;
-                }
-            }
-            for case_when in conditions {
-                if expr_contains_aggregate(&case_when.condition)
-                    || expr_contains_aggregate(&case_when.result)
-                {
-                    return true;
-                }
-            }
-            if let Some(el) = else_result {
-                if expr_contains_aggregate(el) {
-                    return true;
-                }
-            }
-            false
+            operand.as_deref().is_some_and(&recurse)
+                || conditions
+                    .iter()
+                    .any(|cw| recurse(&cw.condition) || recurse(&cw.result))
+                || else_result.as_deref().is_some_and(&recurse)
         }
-        Expr::Cast { expr: inner, .. } => expr_contains_aggregate(inner),
+        Expr::Cast { expr: inner, .. } => recurse(inner),
         _ => false,
     }
 }
@@ -476,6 +513,14 @@ fn first_arg_sql(args: &FunctionArguments) -> Option<String> {
     }
 }
 
+fn push_select_column(analysis: &mut SqlAnalysis, expr: &Expr, alias: Option<String>) {
+    let column = extract_select_column(expr, alias);
+    if column.is_aggregate_derived && expr_contains_call(expr, &is_count_distinct_call) {
+        analysis.nested_count_distinct = true;
+    }
+    analysis.select_columns.push(column);
+}
+
 /// Extract a SelectColumn from a SelectItem expression.
 fn extract_select_column(expr: &Expr, alias: Option<String>) -> SelectColumn {
     // Unwrap casts to detect aggregates inside (e.g., SUM(x)::BIGINT)
@@ -517,7 +562,6 @@ fn extract_select_column(expr: &Expr, alias: Option<String>) -> SelectColumn {
                 {
                     kind = AggregateKind::CountDistinct;
                 }
-                // SUM(DISTINCT), AVG(DISTINCT), etc. are rejected in lib.rs via SQL string check
             }
             let mut aggregate_arg = if matches!(kind, AggregateKind::CountStar) {
                 Some("*".to_string())
@@ -1369,14 +1413,10 @@ pub fn analyze(statements: &[Statement]) -> Result<SqlAnalysis, SqlAnalysisError
     for item in &select.projection {
         match item {
             SelectItem::UnnamedExpr(expr) => {
-                analysis
-                    .select_columns
-                    .push(extract_select_column(expr, None));
+                push_select_column(&mut analysis, expr, None);
             }
             SelectItem::ExprWithAlias { expr, alias } => {
-                analysis
-                    .select_columns
-                    .push(extract_select_column(expr, Some(alias.to_string())));
+                push_select_column(&mut analysis, expr, Some(alias.to_string()));
             }
             SelectItem::Wildcard(_) => {
                 analysis.select_columns.push(SelectColumn {
