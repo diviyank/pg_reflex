@@ -140,7 +140,7 @@ pub fn reflex_build_delta_sql(
     let operation = if netted_delta { "UPDATE" } else { operation };
 
     // aggregations_json is written by pg_reflex itself via generate_aggregations_json
-    // (which is now infallible — see query_decomposer.rs:751-754). A malformed
+    // (which is infallible). A malformed
     // value would mean catalog corruption, not user error; failing loudly
     // beats silently emitting empty SQL.
     let json = aggregations_json.unwrap_or("{}");
@@ -162,7 +162,7 @@ pub fn reflex_build_delta_sql(
     let mut pending_dispatch: Option<PendingDispatch> = None;
 
     // Pre-compute group columns and affected-groups table name (used by multiple paths).
-    // Affected / shrunk / scratch live in the IMV's schema (1.4.1) so the generated
+    // Affected / shrunk / scratch live in the IMV's schema so the generated
     // SQL works under any session `search_path`.
     let grp_cols = group_columns(&plan);
     let affected_tbl = affected_groups_table_name(view_name);
@@ -345,19 +345,10 @@ pub fn reflex_build_delta_sql(
         );
     }
 
-    // Historical note (2026-04-24): an earlier version of this function
-    // guarded against *any* transition-table reference outside a sanctioned
-    // scratch-populate INSERT. That guard existed under the hypothesis that
-    // `EXECUTE '…__reflex_new_*…'` inside a trigger body was the root cause
-    // of the backend SIGSEGV/SIGABRT we were seeing. The real root cause
-    // turned out to be in build.rs — weak stub definitions of
-    // `CurrentMemoryContext` etc. were leaking into the installed cdylib,
-    // shadowing postgres's real globals and causing NULL derefs in pgrx's
-    // SPI path. With that fixed, transition-table references in EXECUTE
-    // are safe again and the guard was over-rejecting legitimate full-
-    // refresh SQL (e.g. the LEFT JOIN secondary-table fallback that does
-    // `DELETE FROM target; INSERT INTO target <end_query>` where end_query
-    // can legitimately read from a transition table in some code paths).
+    // Transition-table references inside EXECUTE are safe in trigger bodies, so
+    // full-refresh SQL (e.g. the LEFT JOIN secondary-table fallback `DELETE FROM
+    // target; INSERT INTO target <end_query>`, whose end_query may read a
+    // transition table) is not guarded against them.
 
     let result = stmts.join("\n--<<REFLEX_SEP>>--\n");
 
@@ -371,7 +362,7 @@ pub fn reflex_build_delta_sql(
     result
 }
 
-/// Returns the rewritten scratch-fill SQL for a Item α `INSERT_PROMOTED`
+/// Returns the rewritten scratch-fill SQL for an `INSERT_PROMOTED`
 /// bulk-INSERT: `base_query` with `source_table` rewritten to its
 /// `__reflex_new_*` transition table, identical to what the bulk-INSERT
 /// codegen runs. The trigger function body wraps this in
@@ -393,8 +384,8 @@ pub fn reflex_build_path_c_explain_sql(view_name: &str, source_table: &str) -> S
     // captured a `source_join_keys` entry for this source. For single-source
     // aggregates one source row can feed many group keys, and other rows
     // (filter-passed before this UPDATE) may already be contributing to
-    // those groups; bulk-INSERT then duplicates rows in the intermediate /
-    // target and silently wrong-answers. Match the Rust-side
+    // those groups; bulk-INSERT would then duplicate rows in the intermediate /
+    // target and silently give wrong answers. Match the Rust-side
     // `aggregate_insert_stmts` gate (`plan.source_join_keys.contains_key`)
     // by returning the empty string here, which the trigger body's
     // `IF _pc_sql <> ''` check turns into a Path C skip → falls into the
@@ -474,9 +465,9 @@ pub fn reflex_quote_identifier(name: &str) -> String {
 /// query. Clearing it instead is only right when the truncated source empties
 /// the result (the anchor, an inner join); on the nullable side of an outer
 /// join, under NOT EXISTS, or for an ungrouped aggregate the result keeps rows,
-/// and clearing deleted them outright — in DEFERRED mode outside the flush's
-/// savepoint, so a failed flush made the loss permanent. Where clearing was
-/// right, the rebuild reads an empty join and costs about the same.
+/// and clearing would delete them outright — in DEFERRED mode outside the
+/// flush's savepoint, so a failed flush would make the loss permanent. Where
+/// clearing is right, the rebuild reads an empty join and costs about the same.
 ///
 /// IMMEDIATE: rebuilt now, reaching its dependents as a row diff.
 /// DEFERRED: untouched now. The IMV is listed in `__reflex_deferred_rebuild` and
@@ -496,9 +487,9 @@ pub fn reflex_build_truncate_sql(view_name: &str) -> String {
         let Some(enqueue) = enqueue_truncate_flush_sql(view_name) else {
             return mark_stale_after_truncate_sql(view_name);
         };
-        // The request row lives until its own event deletes it (flush_fn). Trigger
-        // bodies installed before that rule delete it early; the queued event still
-        // fires (AfterTriggerExecute fetches with SnapshotAny).
+        // The request row lives until its own event deletes it (flush_fn). A
+        // trigger body that deleted it early would still be harmless: the queued
+        // event still fires (AfterTriggerExecute fetches with SnapshotAny).
         stmts = vec![
             DEFERRED_REBUILD_TABLE_DDL.to_string(),
             format!(
@@ -611,7 +602,7 @@ pub(crate) fn mark_stale_after_truncate_sql(view_name: &str) -> String {
     )
 }
 
-/// Theme 5.3: execute a `\n--<<REFLEX_SEP>>--\n`-separated SQL string, running
+/// Execute a `\n--<<REFLEX_SEP>>--\n`-separated SQL string, running
 /// each non-empty statement in order. Replaces the `string_to_array + FOREACH`
 /// pattern in generated trigger bodies with a single Rust-side call — smaller
 /// trigger DDL, no intermediate array allocation.
