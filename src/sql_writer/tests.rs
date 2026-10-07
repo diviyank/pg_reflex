@@ -459,3 +459,36 @@ fn snapshot_indexes_ddl_multi_group_by() {
     assert_eq!(indexes[0], expected_int);
     assert_eq!(indexes[1], expected_target);
 }
+
+#[test]
+fn replace_identifier_preserves_multibyte_text() {
+    let sql = "SELECT season FROM product WHERE season = 'Été' AND city = 'Gießen'";
+    assert_eq!(replace_identifier(sql, "absent_table", "x"), sql);
+    assert_eq!(
+        replace_identifier(sql, "product", "\"__reflex_new_product\""),
+        "SELECT season FROM \"__reflex_new_product\" WHERE season = 'Été' AND city = 'Gießen'"
+    );
+}
+
+#[test]
+fn replace_identifier_matches_multibyte_pattern() {
+    assert_eq!(
+        replace_identifier("SELECT a FROM données WHERE a = 'é'", "données", "\"t\""),
+        "SELECT a FROM \"t\" WHERE a = 'é'"
+    );
+}
+
+#[test]
+fn strip_redundant_bare_alias_preserves_multibyte_text() {
+    let sql = "SELECT p.season FROM alp.product AS product WHERE p.season = 'Été'";
+    let out = strip_redundant_bare_alias(sql, "alp.product");
+    assert!(out.contains("'Été'"), "Got: {}", out);
+}
+
+#[test]
+fn substitute_identifier_ci_preserves_multibyte_text() {
+    assert_eq!(
+        substitute_identifier_ci("(season = 'Été'::text)", "season", "'Hiver'"),
+        "('Hiver' = 'Été'::text)"
+    );
+}
