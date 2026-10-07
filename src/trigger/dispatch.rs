@@ -7,8 +7,8 @@ use crate::query_decomposer::normalized_column_name;
 /// from MERGE-based incremental to TRUNCATE+rebuild (full IMV-body refresh via
 /// `reflex_reconcile`).
 ///
-/// The incremental path stays fast at every reachable selectivity when the
-/// source's identity determines its slice of keys (1 M source x 50 plans, ~200 K
+/// The incremental path stays fast at every reachable selectivity on a small
+/// synthetic shape (1 M source x 50 plans, ~200 K
 /// intermediate: ~0.6 s at 11 % affected, ~2.9 s at 78 %, against a ~17 s
 /// reconcile). But on large shapes (76 M source, 7.7 M intermediate, 12-115 %
 /// of the intermediate flipped at once) the per-row MERGE + target double-rewrite
@@ -16,7 +16,8 @@ use crate::query_decomposer::normalized_column_name;
 /// selectivity.
 ///
 /// 0.50 is the compromise:
-///   * Small mutations (< 50 % of intermediate) stay on the incremental path.
+///   * Small mutations (< 50 % of intermediate) stay on the incremental path
+///     (~60x faster than reconcile for pure-data UPDATEs).
 ///   * Catastrophic bulk flips (>= 50 % of intermediate) go to reconcile, which
 ///     is ~2x faster than the bulk incremental path there.
 ///
