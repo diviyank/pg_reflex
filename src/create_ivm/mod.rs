@@ -2300,8 +2300,8 @@ pub(crate) fn create_reflex_ivm_impl_with_materialization(
     if let Some(column) = ungrouped_non_aggregate_column(&ctx) {
         return crate::reflex_reject(&format!(
             "'{column}' is not an aggregate expression that pg_reflex supports and is not a \
-             group key: the query has no GROUP BY. Fix: add it to a GROUP BY clause, or select \
-             it in an outer passthrough layer over a CTE that holds the aggregates."
+             group key: the query has no GROUP BY. Fix: select it in an outer passthrough layer \
+             over a CTE that holds the aggregates, or add it to a GROUP BY clause."
         ));
     }
 
