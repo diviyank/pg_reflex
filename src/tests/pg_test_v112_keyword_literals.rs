@@ -93,7 +93,7 @@ fn v112_kw_literal_in_join_condition() {
     );
 }
 
-/// Hypothesis B3 from the spec: outer query has no WHERE, a FROM subquery does.
+/// The outer query has no WHERE; the only WHERE is inside a FROM subquery.
 #[pg_test]
 fn v112_kw_where_only_inside_from_subquery() {
     v112_kw_roundtrip(
@@ -155,6 +155,34 @@ fn v112_kw_count_distinct_alias_shorter_once_upper_cased() {
         "cda",
         "SELECT g, COUNT(DISTINCT v) AS \"nıı\" FROM {t} GROUP BY g",
     );
+}
+
+/// Group g2 has no dimension row, so it is the NULL-label group. A scope filter
+/// left in the ON clause would null-extend every other row into that group.
+#[pg_test]
+fn v112_kw_literal_in_left_join_condition() {
+    let table = "v112_kw_lj_src";
+    v112_kw_table(table);
+    Spi::run("CREATE TABLE v112_kw_lj_dim(g TEXT PRIMARY KEY, label TEXT)").expect("dim");
+    Spi::run("INSERT INTO v112_kw_lj_dim VALUES ('g0','zero'),('g1','one')").expect("dim seed");
+    let q = format!(
+        "SELECT d.label, MIN(s.v) AS mn FROM {table} s LEFT JOIN v112_kw_lj_dim d \
+         ON d.g = s.g AND d.label <> ' where ' GROUP BY d.label"
+    );
+    assert_eq!(
+        crate::create_reflex_ivm_with_topk("v112_kw_lj", &q, None, None, None, 0, None),
+        "CREATE REFLEX INCREMENTAL VIEW",
+        "{q}"
+    );
+    Spi::run(&format!("DELETE FROM {table} WHERE v = 2")).expect("delete NULL-group minimum");
+    assert_imv_correct("v112_kw_lj", &q);
+    Spi::run(&format!(
+        "INSERT INTO {table}(g, city, v) VALUES ('g2','Lyon',0),('g1','Paris',-5)"
+    ))
+    .expect("insert");
+    assert_imv_correct("v112_kw_lj", &q);
+    Spi::run(&format!("UPDATE {table} SET v = v + 200 WHERE v IN (0, -5)")).expect("update");
+    assert_imv_correct("v112_kw_lj", &q);
 }
 
 /// Group G never has a non-NULL `a`, so its MIN slot stays NULL and every
