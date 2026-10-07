@@ -115,6 +115,7 @@ pub fn replace_identifier(sql: &str, old_name: &str, new_name: &str) -> String {
     let mut result = String::with_capacity(sql.len());
     let bytes = sql.as_bytes();
     let old_bytes = old_name.as_bytes();
+    let mut unmatched_start = 0;
     let mut i = 0;
     while i < bytes.len() {
         if i + old_bytes.len() <= bytes.len() && &bytes[i..i + old_bytes.len()] == old_bytes {
@@ -132,14 +133,16 @@ pub fn replace_identifier(sql: &str, old_name: &str, new_name: &str) -> String {
             let after_ok = after_pos >= bytes.len()
                 || !(bytes[after_pos].is_ascii_alphanumeric() || bytes[after_pos] == b'_');
             if before_ok && after_ok && !after_as {
+                result.push_str(&sql[unmatched_start..i]);
                 result.push_str(new_name);
                 i += old_bytes.len();
+                unmatched_start = i;
                 continue;
             }
         }
-        result.push(bytes[i] as char);
         i += 1;
     }
+    result.push_str(&sql[unmatched_start..]);
     result
 }
 
@@ -161,6 +164,7 @@ pub fn strip_redundant_bare_alias(sql: &str, source_table: &str) -> String {
     let bytes = sql.as_bytes();
     let pat = source_table.as_bytes();
     let mut out = String::with_capacity(sql.len());
+    let mut unmatched_start = 0;
     let mut i = 0;
     while i < bytes.len() {
         if i + pat.len() <= bytes.len() && &bytes[i..i + pat.len()] == pat {
@@ -174,15 +178,17 @@ pub fn strip_redundant_bare_alias(sql: &str, source_table: &str) -> String {
             if before_ok && after_ok {
                 let (user_alias, consumed_to) = consume_table_alias(bytes, after_pos);
                 if matches!(&user_alias, Some(a) if a == bare) {
+                    out.push_str(&sql[unmatched_start..i]);
                     out.push_str(source_table);
                     i = consumed_to;
+                    unmatched_start = i;
                     continue;
                 }
             }
         }
-        out.push(bytes[i] as char);
         i += 1;
     }
+    out.push_str(&sql[unmatched_start..]);
     out
 }
 
@@ -197,10 +203,12 @@ pub fn substitute_identifier_ci(expr: &str, ident: &str, replacement: &str) -> S
     let bytes = expr.as_bytes();
     let lower_ident = ident.to_lowercase();
     let mut out = String::with_capacity(expr.len());
+    let mut unmatched_start = 0;
     let mut i = 0;
     while i < bytes.len() {
         let c = bytes[i] as char;
         if c.is_ascii_alphabetic() || c == '_' {
+            out.push_str(&expr[unmatched_start..i]);
             let start = i;
             while i < bytes.len() {
                 let cc = bytes[i] as char;
@@ -216,11 +224,12 @@ pub fn substitute_identifier_ci(expr: &str, ident: &str, replacement: &str) -> S
             } else {
                 out.push_str(word);
             }
+            unmatched_start = i;
         } else {
-            out.push(c);
             i += 1;
         }
     }
+    out.push_str(&expr[unmatched_start..]);
     out
 }
 
