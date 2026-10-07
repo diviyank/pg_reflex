@@ -1,13 +1,12 @@
-//! Registry dependency-graph repair (1.11.0, PS-1).
+//! Registry dependency-graph repair.
 //!
-//! `depends_on` is the one registry column no bug has corrupted: every create
+//! `depends_on` is the one authoritative registry column: every create
 //! path writes it from the analyzer's source list. `depends_on_imv`,
 //! `graph_child`, `graph_depth` and `is_generated_sub_imv` are all derivable
 //! from it, so this module re-derives them rather than trusting them.
 //!
-//! Called once after the 1.10.11 → 1.11.0 upgrade to repair rows created before
-//! `resolve_existing_imv_deps` canonicalised its probe, and exposed as a
-//! re-runnable operator primitive. Idempotent on an ACYCLIC graph — a second run
+//! Repairs rows created before `resolve_existing_imv_deps` canonicalised its
+//! probe, and is exposed as a re-runnable operator primitive. Idempotent on an ACYCLIC graph — a second run
 //! changes nothing. A registry holding a dependency cycle cannot converge, and
 //! `graph_depth` there grows by `MAX_DEPTH_PASSES` per run; that case is detected
 //! and reported rather than silently claimed as repaired.
@@ -21,8 +20,7 @@
 
 use pgrx::prelude::*;
 
-/// Fixpoint iteration cap for `graph_depth`. The deepest chain observed in
-/// production is 4; the cap exists so a cycle — which create-time rejects, but a
+/// Fixpoint iteration cap for `graph_depth`. The cap exists so a cycle — which create-time rejects, but a
 /// hand-edited registry could hold — terminates instead of spinning.
 const MAX_DEPTH_PASSES: i32 = 20;
 
