@@ -202,3 +202,45 @@ fn v112_sr_join_with_one_mixed_spelling_side_stays_correct() {
     Spi::run("UPDATE v112_sr_jdim SET label = 'A2' WHERE kind = 'a'").expect("dim update");
     v112_sr_assert_all_correct(&imvs);
 }
+
+#[pg_test]
+fn v112_sr_multibyte_identifier_in_join_condition_stays_correct() {
+    Spi::run("CREATE TABLE v112_sr_da_s(id SERIAL PRIMARY KEY, kind TEXT, v INT)").expect("s");
+    Spi::run("CREATE TABLE v112_sr_da_d(\"clé\" TEXT PRIMARY KEY, label TEXT)").expect("d");
+    Spi::run("INSERT INTO v112_sr_da_d VALUES ('a','A'),('b','B')").expect("d seed");
+    Spi::run("INSERT INTO v112_sr_da_s(kind, v) VALUES ('a',1),('b',2),('a',3)").expect("s seed");
+    let q = "SELECT d.label, SUM(s.v) AS s FROM v112_sr_da_s s \
+             JOIN v112_sr_da_d d ON d.\"clé\" = s.kind GROUP BY d.label";
+    v112_sr_imv("v112_sr_da_v", q);
+    Spi::run("INSERT INTO v112_sr_da_s(kind, v) VALUES ('a',10),('b',20)").expect("insert");
+    assert_imv_correct("v112_sr_da_v", q);
+    Spi::run("UPDATE v112_sr_da_s SET v = v + 100 WHERE id = 1").expect("update");
+    assert_imv_correct("v112_sr_da_v", q);
+    Spi::run("DELETE FROM v112_sr_da_s WHERE id = 3").expect("delete");
+    assert_imv_correct("v112_sr_da_v", q);
+}
+
+#[pg_test]
+fn v112_sr_length_changing_literal_in_join_condition_keeps_null_group_correct() {
+    Spi::run(
+        "CREATE TABLE v112_sr_db_s(id SERIAL PRIMARY KEY, b_id INT, xk INT, tag TEXT, v INT)",
+    )
+    .expect("s");
+    Spi::run("CREATE TABLE v112_sr_db_b(id INT PRIMARY KEY, k INT)").expect("b");
+    Spi::run("CREATE TABLE v112_sr_db_xb(k INT PRIMARY KEY)").expect("xb");
+    Spi::run("INSERT INTO v112_sr_db_b VALUES (1,NULL),(2,5),(3,NULL)").expect("b seed");
+    Spi::run("INSERT INTO v112_sr_db_xb VALUES (1),(2)").expect("xb seed");
+    Spi::run("INSERT INTO v112_sr_db_s(b_id, xk, tag, v) VALUES (1,1,'t',1),(2,1,'t',2),(3,2,'t',4)")
+        .expect("s seed");
+    let q = "SELECT b.k, SUM(s.v) AS s FROM v112_sr_db_s s \
+             JOIN v112_sr_db_b b ON b.id = s.b_id \
+             JOIN v112_sr_db_xb xb ON s.tag <> 'ŉ' AND xb.k = s.xk GROUP BY b.k";
+    v112_sr_imv("v112_sr_db_v", q);
+    Spi::run("INSERT INTO v112_sr_db_s(b_id, xk, tag, v) VALUES (1,1,'t',10),(2,2,'t',20)")
+        .expect("insert");
+    assert_imv_correct("v112_sr_db_v", q);
+    Spi::run("UPDATE v112_sr_db_s SET v = v + 100 WHERE id = 1").expect("update");
+    assert_imv_correct("v112_sr_db_v", q);
+    Spi::run("DELETE FROM v112_sr_db_s WHERE id = 3").expect("delete");
+    assert_imv_correct("v112_sr_db_v", q);
+}
