@@ -45,7 +45,6 @@ pub(crate) struct BuildContext<'a> {
     view_name: &'a str,
     sql: &'a str,
     unique_columns_str: &'a str,
-    if_not_exists: bool,
     #[allow(dead_code)]
     topk_k: Option<usize>,
     ignore_sources: &'a [String],
@@ -439,8 +438,7 @@ fn catalog_function_kinds(called: &[String]) -> (Vec<String>, Vec<String>) {
 }
 
 /// Is an IMV of this name already in the registry? One definition, shared by
-/// the duplicate-name pre-flight and by the A1 soundness gate, which must not
-/// fire on a call that will short-circuit as a no-op.
+/// the duplicate-name pre-flight and by the `if_not_exists` no-op.
 fn imv_is_registered(view_name: &str) -> bool {
     Spi::connect(|client| {
         !client
@@ -457,15 +455,10 @@ fn imv_is_registered(view_name: &str) -> bool {
     })
 }
 
-/// Pre-flight checks: reject duplicate view name (or skip-noop on
-/// `if_not_exists`), detect cycles in the IMV dependency DAG. Returns the
-/// short-circuit string when the create should stop, `None` to continue.
+/// Pre-flight checks: reject a duplicate view name and a cycle in the IMV
+/// dependency DAG. Returns the rejection when the create should stop.
 fn check_existence_and_cycle(ctx: &BuildContext) -> Option<&'static str> {
-    let already_exists = imv_is_registered(ctx.view_name);
-    if already_exists {
-        if ctx.if_not_exists {
-            return Some("REFLEX INCREMENTAL VIEW ALREADY EXISTS (skipped)");
-        }
+    if imv_is_registered(ctx.view_name) {
         return Some(crate::reflex_reject("IMV with this name already exists"));
     }
 
@@ -1966,6 +1959,12 @@ pub(crate) fn create_reflex_ivm_impl_with_materialization(
     materialize_as_table: bool,
     explicit_unpartitioned: bool,
 ) -> &'static str {
+    // Before any validation: refusing a call that builds nothing protects nothing
+    // (the IMV goes on existing either way) and breaks idempotent deployment re-runs.
+    if if_not_exists && imv_is_registered(view_name) {
+        return "REFLEX INCREMENTAL VIEW ALREADY EXISTS (skipped)";
+    }
+
     let parsed = match validate_and_parse_inputs(view_name, sql, storage_mode, refresh_mode) {
         Ok(p) => p,
         Err(msg) => return msg,
@@ -1988,21 +1987,13 @@ pub(crate) fn create_reflex_ivm_impl_with_materialization(
         ));
     }
     let (ignored_clean, ignored_acked) = split_ignore_ack(ignore_sources);
-    // `if_not_exists` on an IMV that already exists is a no-op: refusing it
-    // protects nothing (the unsound IMV goes on existing either way) and breaks
-    // idempotent deployment re-runs. Judge only calls that would build.
-    let creates_nothing = if_not_exists && imv_is_registered(view_name);
-    let unacked = if creates_nothing {
-        None
-    } else {
-        ignore_soundness::unsound_ignored_sources_parsed(
-            &parsed.parsed_sql,
-            &parsed.analysis,
-            &ignored_clean,
-        )
-        .into_iter()
-        .find(|(src, _)| !ignored_acked.contains(src))
-    };
+    let unacked = ignore_soundness::unsound_ignored_sources_parsed(
+        &parsed.parsed_sql,
+        &parsed.analysis,
+        &ignored_clean,
+    )
+    .into_iter()
+    .find(|(src, _)| !ignored_acked.contains(src));
     if let Some((src, reason)) = unacked {
         // The working remedy comes FIRST, right after the two names. Consumers
         // truncate: __reflex_doctor_try_repair caps at 400 characters, and a
@@ -2155,7 +2146,6 @@ pub(crate) fn create_reflex_ivm_impl_with_materialization(
         view_name,
         sql,
         unique_columns_str,
-        if_not_exists,
         topk_k,
         ignore_sources,
         partition_by,

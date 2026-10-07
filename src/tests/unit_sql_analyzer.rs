@@ -1291,3 +1291,51 @@ fn called_functions_carry_bare_names_and_argument_counts() {
         vec![("upper", 1), ("lower", 1), ("age", 1), ("age", 2)]
     );
 }
+
+fn bare_name_of_call(call: &str) -> String {
+    let parsed =
+        Parser::parse_sql(&PostgreSqlDialect {}, &format!("SELECT {call}() FROM t")).unwrap();
+    let Statement::Query(query) = &parsed[0] else {
+        panic!("not a query")
+    };
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        panic!("not a select")
+    };
+    let SelectItem::UnnamedExpr(Expr::Function(f)) = &select.projection[0] else {
+        panic!("not a call")
+    };
+    bare_function_name(&f.name)
+}
+
+#[test]
+fn bare_function_name_is_the_last_name_part_lower_cased() {
+    for (call, expected) in [
+        ("\"a.b\"", "a.b"),
+        ("s.\"a.b\"", "a.b"),
+        ("pg_catalog.now", "now"),
+        ("\"Now\"", "now"),
+        ("\"s.x\".\"Sum\"", "sum"),
+        ("upper", "upper"),
+    ] {
+        assert_eq!(bare_name_of_call(call), expected, "{call}");
+    }
+}
+
+#[test]
+fn extract_is_timezone_sensitive_without_being_a_called_function() {
+    let a = parse_and_analyze("SELECT EXTRACT(dow FROM ts) AS d FROM t");
+    assert_eq!(a.timezone_sensitive_functions(), vec!["extract"]);
+    assert!(a.called_functions.is_empty(), "{:?}", a.called_functions);
+    assert_eq!(a.unsupported_reason(), None);
+
+    let both = parse_and_analyze(
+        "SELECT g, SUM(v) AS s FROM t WHERE EXTRACT(hour FROM ts) > 3 AND to_char(ts, 'D') = '1' GROUP BY g",
+    );
+    assert_eq!(
+        both.timezone_sensitive_functions(),
+        vec!["extract", "to_char"]
+    );
+
+    let none = parse_and_analyze("SELECT id, upper(g) AS u FROM t");
+    assert!(none.timezone_sensitive_functions().is_empty());
+}

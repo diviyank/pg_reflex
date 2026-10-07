@@ -245,3 +245,134 @@ fn v112_fn_ungrouped_column_over_cte_leaves_no_sub_imv() {
         0
     );
 }
+
+const V112_FN_NOOP_QUERIES: [&str; 5] = [
+    "SELECT g, SUM(v * v112_fn_ine_vol()) AS s FROM v112_fn_ine_src GROUP BY g",
+    "SELECT id, g, transaction_timestamp() AS at FROM v112_fn_ine_src",
+    "SELECT g, v112_fn_ine_agg(v) AS ms FROM v112_fn_ine_src GROUP BY g",
+    "SELECT 'x'::text AS tag, SUM(v) AS s FROM v112_fn_ine_src",
+    "SELECT date_trunc('day', ts) AS d, SUM(v) AS s FROM v112_fn_ine_src GROUP BY date_trunc('day', ts)",
+];
+
+fn v112_fn_noop_fixture() {
+    v112_fn_table("v112_fn_ine_src");
+    Spi::run("CREATE FUNCTION v112_fn_ine_vol() RETURNS int LANGUAGE sql VOLATILE AS 'SELECT 1'")
+        .expect("fn");
+    Spi::run("CREATE AGGREGATE v112_fn_ine_agg(int) (sfunc = int4pl, stype = int, initcond = '0')")
+        .expect("agg");
+}
+
+#[pg_test]
+fn v112_fn_if_not_exists_on_existing_imv_is_a_noop_for_rejected_definitions() {
+    v112_fn_noop_fixture();
+    let original = "SELECT g, SUM(v) AS s FROM v112_fn_ine_src GROUP BY g";
+    assert_eq!(
+        crate::create_reflex_ivm("v112_fn_ine", original, None, None, None, None),
+        "CREATE REFLEX INCREMENTAL VIEW"
+    );
+    let ordinary_noop =
+        crate::create_reflex_ivm_if_not_exists("v112_fn_ine", original, None, None, None, None);
+    assert_eq!(ordinary_noop, "REFLEX INCREMENTAL VIEW ALREADY EXISTS (skipped)");
+    let stored_definition = || {
+        Spi::get_one::<String>(
+            "SELECT sql_query FROM public.__reflex_ivm_reference WHERE name = 'v112_fn_ine'",
+        )
+        .expect("registry")
+        .expect("row")
+    };
+    let definition_before = stored_definition();
+    for q in V112_FN_NOOP_QUERIES {
+        assert_eq!(
+            crate::create_reflex_ivm_if_not_exists("v112_fn_ine", q, None, None, None, None),
+            ordinary_noop,
+            "{q}"
+        );
+    }
+    assert_eq!(stored_definition(), definition_before);
+    assert_eq!(
+        Spi::get_one::<i64>(
+            "SELECT COUNT(*) FROM public.__reflex_ivm_reference WHERE name LIKE 'v112_fn_ine%'"
+        )
+        .expect("registry")
+        .unwrap_or(0),
+        1
+    );
+    Spi::run("INSERT INTO v112_fn_ine_src(g, v) VALUES ('a', 9), ('c', 4)").expect("insert");
+    Spi::run("DELETE FROM v112_fn_ine_src WHERE id = 2").expect("delete");
+    assert_imv_correct("v112_fn_ine", original);
+}
+
+#[pg_test]
+fn v112_fn_if_not_exists_on_a_new_name_behaves_like_create() {
+    v112_fn_noop_fixture();
+    for (i, needle) in [
+        "Volatile function(s) v112_fn_ine_vol",
+        "Non-deterministic",
+        "Unsupported aggregate(s): V112_FN_INE_AGG",
+        "'tag' is not an aggregate",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let name = format!("v112_fn_inew_{i}");
+        let q = V112_FN_NOOP_QUERIES[i];
+        let res = crate::create_reflex_ivm_if_not_exists(&name, q, None, None, None, None);
+        assert!(res.starts_with("ERROR: [reflex-unsupported]"), "{q} -> {res}");
+        assert!(res.contains(needle), "{q} -> {res}");
+        assert_eq!(v112_fn_leftovers(&name), 0, "objects left behind for {name}");
+    }
+    let q = V112_FN_NOOP_QUERIES[4];
+    assert_eq!(
+        crate::create_reflex_ivm_if_not_exists("v112_fn_inew_4", q, None, None, None, None),
+        "CREATE REFLEX INCREMENTAL VIEW"
+    );
+    Spi::run("INSERT INTO v112_fn_ine_src(g, v, ts) VALUES ('a', 7, '2026-01-02+00')").expect("insert");
+    assert_imv_correct("v112_fn_inew_4", q);
+}
+
+#[pg_test]
+fn v112_fn_if_not_exists_on_existing_cte_imv_is_a_noop() {
+    v112_fn_table("v112_fn_inec_src");
+    let q = "WITH c AS (SELECT g, SUM(v) AS s FROM v112_fn_inec_src GROUP BY g) SELECT g, s FROM c";
+    assert_eq!(
+        crate::create_reflex_ivm("v112_fn_inec", q, None, None, None, None),
+        "CREATE REFLEX INCREMENTAL VIEW"
+    );
+    assert_eq!(
+        crate::create_reflex_ivm_if_not_exists("v112_fn_inec", q, None, None, None, None),
+        "REFLEX INCREMENTAL VIEW ALREADY EXISTS (skipped)"
+    );
+    Spi::run("INSERT INTO v112_fn_inec_src(g, v) VALUES ('a', 9), ('c', 4)").expect("insert");
+    assert_imv_correct("v112_fn_inec", q);
+}
+
+#[pg_test]
+fn v112_fn_volatile_function_with_a_dot_in_its_quoted_name_rejected() {
+    v112_fn_table("v112_fn_dot_src");
+    Spi::run("CREATE FUNCTION \"v112.fn\"() RETURNS int LANGUAGE sql VOLATILE AS 'SELECT 1'")
+        .expect("fn");
+    v112_fn_assert_rejected(
+        "v112_fn_dot_0",
+        "SELECT id, v + \"v112.fn\"() AS x FROM v112_fn_dot_src",
+        "Volatile function(s) v112.fn",
+    );
+    v112_fn_assert_rejected(
+        "v112_fn_dot_1",
+        "SELECT id, v + public.\"v112.fn\"() AS x FROM v112_fn_dot_src",
+        "Volatile function(s) v112.fn",
+    );
+}
+
+#[pg_test]
+fn v112_fn_extract_is_kept_and_correct() {
+    v112_fn_table("v112_fn_ex_src");
+    let q = "SELECT EXTRACT(dow FROM ts) AS d, SUM(v) AS s FROM v112_fn_ex_src GROUP BY EXTRACT(dow FROM ts)";
+    assert_eq!(
+        crate::create_reflex_ivm("v112_fn_ex", q, None, None, None, None),
+        "CREATE REFLEX INCREMENTAL VIEW"
+    );
+    Spi::run("INSERT INTO v112_fn_ex_src(g, v, ts) VALUES ('a', 7, '2026-01-02+00'), ('a', 8, '2026-01-01+00')")
+        .expect("insert");
+    Spi::run("DELETE FROM v112_fn_ex_src WHERE id = 1").expect("delete");
+    assert_imv_correct("v112_fn_ex", q);
+}
