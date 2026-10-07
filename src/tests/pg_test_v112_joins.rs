@@ -443,3 +443,126 @@ fn v112_j_bulk_filter_entering_update_right_join_preserved_table() {
     assert_eq!(entered, "OK");
     assert_imv_correct("v112_j_bfp", query);
 }
+
+/// The fixture of the derived-table report: `{f}` groups joined to a filtered
+/// `{d}`, several `{d}` rows per group.
+const V112_J_DERIVED: V112JFixture = V112JFixture {
+    tables: &[
+        (
+            "{f}",
+            "fact",
+            "id SERIAL PRIMARY KEY, g TEXT, city TEXT, v INT",
+            "INSERT INTO {f}(g, city, v) SELECT 'g' || (i % 3), \
+             CASE WHEN i % 2 = 0 THEN 'Lyon' ELSE 'Paris' END, i FROM generate_series(1, 30) i",
+        ),
+        (
+            "{d}",
+            "dim",
+            "id SERIAL PRIMARY KEY, g TEXT, w INT",
+            "INSERT INTO {d}(g, w) VALUES ('g0',5),('g1',7),('g1',3),('g1',-4),('g9',1)",
+        ),
+        (
+            "{g}",
+            "grp",
+            "g TEXT PRIMARY KEY, z INT",
+            "INSERT INTO {g} VALUES ('g0',1),('g1',2),('g7',3)",
+        ),
+    ],
+    steps: &[
+        ("d_del", "{d}", "DELETE FROM {d} WHERE w = 3"),
+        ("d_ins", "{d}", "INSERT INTO {d}(g, w) VALUES ('g2',9),('g1',1),('g8',2),('g0',-1)"),
+        ("d_upd", "{d}", "UPDATE {d} SET w = w + 10 WHERE g = 'g1'"),
+        ("d_move", "{d}", "UPDATE {d} SET g = 'g2' WHERE g = 'g0'"),
+        ("d_filter", "{d}", "UPDATE {d} SET w = -w WHERE g = 'g2'"),
+        ("f_ins", "{f}", "INSERT INTO {f}(g, city, v) VALUES ('g9','Nice',100),('g1','Nice',200)"),
+        ("f_upd", "{f}", "UPDATE {f} SET v = v + 1000 WHERE id = 3"),
+        ("f_move", "{f}", "UPDATE {f} SET g = 'g8' WHERE id IN (1, 2)"),
+        ("f_del", "{f}", "DELETE FROM {f} WHERE g = 'g2'"),
+        ("g_ins", "{g}", "INSERT INTO {g} VALUES ('g2',4),('g8',5)"),
+        ("g_upd", "{g}", "UPDATE {g} SET z = z + 1 WHERE g = 'g1'"),
+        ("g_del", "{g}", "DELETE FROM {g} WHERE g = 'g1'"),
+        ("d_empty", "{d}", "DELETE FROM {d}"),
+        ("d_refill", "{d}", "INSERT INTO {d}(g, w) VALUES ('g1',2),('g8',6)"),
+        ("f_empty", "{f}", "DELETE FROM {f}"),
+    ],
+};
+
+// ---------------------------------------------------------------------------
+// Outer join onto a derived table or a parenthesised join: a write to a table
+// inside it
+// ---------------------------------------------------------------------------
+
+v112_j_cells! { V112_J_DERIVED, V112JNaming::Public, false;
+    v112_j_dt_lj_minmax_by_f => "SELECT s.g, MIN(d.w) AS mn, MAX(s.v) AS mx FROM {f} s LEFT JOIN (SELECT g, w FROM {d} WHERE w > 0) d ON d.g = s.g GROUP BY s.g",
+    v112_j_dt_lj_sum_by_f => "SELECT s.g, COUNT(*) AS c, SUM(d.w) AS w, SUM(s.v) AS v FROM {f} s LEFT JOIN (SELECT g, w FROM {d} WHERE w > 0) d ON d.g = s.g GROUP BY s.g",
+    v112_j_dt_lj_sum_by_d => "SELECT d.g, COUNT(*) AS c, SUM(d.w) AS w, SUM(s.v) AS v FROM {f} s LEFT JOIN (SELECT g, w FROM {d} WHERE w > 0) d ON d.g = s.g GROUP BY d.g",
+    v112_j_dt_lj_outer_sum => "SELECT s.g, COUNT(*) AS c, SUM(d.w) AS w FROM {f} s LEFT OUTER JOIN (SELECT g, w FROM {d} WHERE w > 0) d ON d.g = s.g GROUP BY s.g",
+    v112_j_dt_lj_ungrouped => "SELECT COUNT(*) AS c, SUM(d.w) AS w, SUM(s.v) AS v FROM {f} s LEFT JOIN (SELECT g, w FROM {d} WHERE w > 0) d ON d.g = s.g",
+    v112_j_dt_lj_pt => "SELECT s.id, s.g, s.v, d.w FROM {f} s LEFT JOIN (SELECT g, w FROM {d} WHERE w > 0) d ON d.g = s.g",
+    v112_j_dt_rj_sum_by_f => "SELECT s.g, COUNT(*) AS c, SUM(d.w) AS w, SUM(s.v) AS v FROM (SELECT g, w FROM {d} WHERE w > 0) d RIGHT JOIN {f} s ON d.g = s.g GROUP BY s.g",
+    v112_j_dt_rj_derived_preserved => "SELECT d.g, COUNT(*) AS c, SUM(d.w) AS w, SUM(s.v) AS v FROM {f} s RIGHT JOIN (SELECT g, w FROM {d} WHERE w > 0) d ON d.g = s.g GROUP BY d.g",
+    v112_j_dt_fj_sum => "SELECT s.g, COUNT(*) AS c, SUM(d.w) AS w FROM {f} s FULL JOIN (SELECT g, w FROM {d} WHERE w > 0) d ON d.g = s.g GROUP BY s.g",
+    v112_j_dt_inner_sum => "SELECT s.g, COUNT(*) AS c, SUM(d.w) AS w, SUM(s.v) AS v FROM {f} s JOIN (SELECT g, w FROM {d} WHERE w > 0) d ON d.g = s.g GROUP BY s.g",
+    v112_j_dt_lj_paren_join => "SELECT s.g, COUNT(*) AS c, SUM(d.w) AS w, SUM(k.z) AS z FROM {f} s LEFT JOIN ({d} d JOIN {g} k ON k.g = d.g) ON d.g = s.g GROUP BY s.g",
+    v112_j_dt_lj_derived_join => "SELECT s.g, COUNT(*) AS c, SUM(d.w) AS w, SUM(d.z) AS z FROM {f} s LEFT JOIN (SELECT x.g, x.w, k.z FROM {d} x JOIN {g} k ON k.g = x.g) d ON d.g = s.g GROUP BY s.g",
+    v112_j_dt_lj_then_inner => "SELECT s.g, COUNT(*) AS c, SUM(d.w) AS w, SUM(k.z) AS z FROM {f} s LEFT JOIN (SELECT g, w FROM {d} WHERE w > 0) d ON d.g = s.g JOIN {g} k ON k.g = s.g GROUP BY s.g",
+}
+
+v112_j_cells! { V112_J_DERIVED, V112JNaming::Public, true;
+    v112_j_dt_lj_minmax_by_f_deferred => "SELECT s.g, MIN(d.w) AS mn, MAX(s.v) AS mx FROM {f} s LEFT JOIN (SELECT g, w FROM {d} WHERE w > 0) d ON d.g = s.g GROUP BY s.g",
+    v112_j_dt_lj_sum_by_f_deferred => "SELECT s.g, COUNT(*) AS c, SUM(d.w) AS w, SUM(s.v) AS v FROM {f} s LEFT JOIN (SELECT g, w FROM {d} WHERE w > 0) d ON d.g = s.g GROUP BY s.g",
+    v112_j_dt_lj_pt_deferred => "SELECT s.id, s.g, s.v, d.w FROM {f} s LEFT JOIN (SELECT g, w FROM {d} WHERE w > 0) d ON d.g = s.g",
+}
+
+v112_j_cells! { V112_J_DERIVED, V112JNaming::OwnSchema, false;
+    v112_j_dt_schema_lj_sum_by_f => "SELECT s.g, COUNT(*) AS c, SUM(d.w) AS w, SUM(s.v) AS v FROM {f} s LEFT JOIN (SELECT g, w FROM {d} WHERE w > 0) d ON d.g = s.g GROUP BY s.g",
+}
+
+/// The stored query of every LEFT JOIN shape below parses and keeps its scoped
+/// delta for each source: the derived-table guard recomputes only what it names.
+#[pg_test]
+fn v112_j_left_join_onto_a_plain_table_keeps_its_scoped_delta() {
+    let shapes = [
+        "SELECT d.label, COUNT(*) AS c, SUM(f.v) AS s, AVG(f.v) AS a, MIN(f.v) AS mn, MAX(f.v) AS mx FROM {d} d LEFT JOIN {f} f ON d.kind = f.kind GROUP BY d.label",
+        "SELECT d.label, COUNT(*) FILTER (WHERE f.v > 1) AS c, BOOL_OR(f.v > 2) AS b FROM {d} d LEFT OUTER JOIN {f} f ON d.kind = f.kind GROUP BY d.label",
+        "SELECT d.label, COUNT(DISTINCT f.v) AS c FROM {d} d LEFT JOIN {f} f ON d.kind = f.kind GROUP BY d.label",
+        "SELECT upper(d.label) AS l, SUM(f.v::numeric) AS s, SUM(CASE WHEN f.v > 1 THEN f.v ELSE 0 END) AS t FROM {d} d LEFT JOIN {f} f ON d.kind = f.kind WHERE d.label LIKE '%' AND d.kind IN ('a', 'b', 'u') AND COALESCE(f.v, 0) BETWEEN 0 AND 100 GROUP BY upper(d.label)",
+        "SELECT d.label, SUM(f.v) AS s FROM {d} d LEFT JOIN {f} f ON d.kind = f.kind GROUP BY d.label HAVING SUM(f.v) > 0",
+        "SELECT d.label, SUM(f.v) AS s, SUM(g.w) AS w FROM {d} d JOIN {g} g ON g.kind = d.kind LEFT JOIN {f} f ON d.kind = f.kind GROUP BY d.label",
+        "SELECT COUNT(*) AS c, SUM(f.v) AS s FROM {d} d LEFT JOIN {f} f ON d.kind = f.kind",
+        "SELECT DISTINCT d.label, f.kind FROM {d} d LEFT JOIN {f} f ON d.kind = f.kind",
+        "SELECT f.id, f.v, d.kind, d.label FROM {d} d LEFT JOIN {f} f ON d.kind = f.kind",
+        "SELECT f.id, f.v, d.label\n  FROM {f} f\n  LEFT JOIN {d} d\n    ON d.kind = f.kind\n  WHERE f.v > 0",
+    ];
+    for (placeholder, _, columns, seed) in V112_J_STAR.tables {
+        let table = v112_j_resolve(placeholder, &V112_J_STAR, "keep", V112JNaming::Public);
+        Spi::run(&format!("CREATE TABLE {table}({columns})")).expect("create table");
+        Spi::run(&v112_j_resolve(seed, &V112_J_STAR, "keep", V112JNaming::Public)).expect("seed");
+    }
+    for (position, shape) in shapes.iter().enumerate() {
+        let imv = format!("v112_j_keep_{position}");
+        let query = v112_j_resolve(shape, &V112_J_STAR, "keep", V112JNaming::Public);
+        assert_eq!(
+            crate::create_reflex_ivm(&imv, &query, None, None, None, None),
+            "CREATE REFLEX INCREMENTAL VIEW",
+            "{query}"
+        );
+        let base_query = Spi::get_one::<String>(&format!(
+            "SELECT base_query FROM public.__reflex_ivm_reference WHERE name = '{imv}'"
+        ))
+        .expect("registry")
+        .expect("base_query");
+        let sources = Spi::get_one::<Vec<String>>(&format!(
+            "SELECT depends_on FROM public.__reflex_ivm_reference WHERE name = '{imv}'"
+        ))
+        .expect("registry")
+        .expect("depends_on");
+        assert!(sources.len() >= 2, "{query}");
+        for source in sources {
+            assert!(
+                !crate::trigger::has_no_scoped_delta(&base_query, &source),
+                "{source} of {base_query}"
+            );
+        }
+    }
+}
