@@ -20,6 +20,31 @@
 //! Naming utilities ([`quote`], [`safe`], [`split_qualified`], [`format_pg_text_array`])
 //! are bundled here so callers do not have to remember which module they live in.
 
+use std::ops::Range;
+
+use super::keyword_scan::string_literal_spans;
+
+/// Forward-only cursor over ascending, non-overlapping byte ranges that a
+/// rewrite must copy through untouched.
+struct UntouchedSpans<'a> {
+    remaining: &'a [Range<usize>],
+}
+
+impl UntouchedSpans<'_> {
+    fn end_of_span_containing(&mut self, position: usize) -> Option<usize> {
+        while let Some((first, rest)) = self.remaining.split_first() {
+            if first.end > position {
+                break;
+            }
+            self.remaining = rest;
+        }
+        self.remaining
+            .first()
+            .filter(|span| span.start <= position)
+            .map(|span| span.end)
+    }
+}
+
 /// Split a potentially schema-qualified name into (Option<schema>, name).
 ///
 /// `"my_view"` -> `(None, "my_view")`
@@ -109,15 +134,35 @@ pub fn format_pg_text_array(values: &[String]) -> String {
 /// schema-qualified and quoted). A match followed by `.col` produces invalid
 /// SQL if `new_name` is a sub-query expression.
 pub fn replace_identifier(sql: &str, old_name: &str, new_name: &str) -> String {
+    replace_identifier_outside(sql, old_name, new_name, &[])
+}
+
+fn replace_identifier_outside_literals(sql: &str, old_name: &str, new_name: &str) -> String {
+    replace_identifier_outside(sql, old_name, new_name, &string_literal_spans(sql))
+}
+
+fn replace_identifier_outside(
+    sql: &str,
+    old_name: &str,
+    new_name: &str,
+    untouched: &[Range<usize>],
+) -> String {
     if old_name.is_empty() {
         return sql.to_string();
     }
+    let mut untouched = UntouchedSpans {
+        remaining: untouched,
+    };
     let mut result = String::with_capacity(sql.len());
     let bytes = sql.as_bytes();
     let old_bytes = old_name.as_bytes();
     let mut unmatched_start = 0;
     let mut i = 0;
     while i < bytes.len() {
+        if let Some(span_end) = untouched.end_of_span_containing(i) {
+            i = span_end;
+            continue;
+        }
         if i + old_bytes.len() <= bytes.len() && &bytes[i..i + old_bytes.len()] == old_bytes {
             let before_ok = i == 0
                 || !(bytes[i - 1].is_ascii_alphanumeric()
@@ -161,12 +206,20 @@ pub fn strip_redundant_bare_alias(sql: &str, source_table: &str) -> String {
     if schema.is_none() || bare == source_table {
         return sql.to_string();
     }
+    let literals = string_literal_spans(sql);
+    let mut untouched = UntouchedSpans {
+        remaining: &literals,
+    };
     let bytes = sql.as_bytes();
     let pat = source_table.as_bytes();
     let mut out = String::with_capacity(sql.len());
     let mut unmatched_start = 0;
     let mut i = 0;
     while i < bytes.len() {
+        if let Some(span_end) = untouched.end_of_span_containing(i) {
+            i = span_end;
+            continue;
+        }
         if i + pat.len() <= bytes.len() && &bytes[i..i + pat.len()] == pat {
             let before_ok = i == 0
                 || !(bytes[i - 1].is_ascii_alphanumeric()
@@ -248,6 +301,9 @@ pub fn substitute_identifier_ci(expr: &str, ident: &str, replacement: &str) -> S
 ///   2. Replace `<source_table>` with the transition table reference. When
 ///      the source was schema-qualified, also replace the bare form so column
 ///      qualifiers like `<bare>.col` are picked up.
+///
+/// String literals are data, never a reference to the source: both passes
+/// copy single-quoted and dollar-quoted strings through unchanged.
 pub fn replace_source_with_transition(
     base_query: &str,
     source_table: &str,
@@ -273,18 +329,18 @@ pub fn replace_source_with_transition(
     let mut out = stripped;
     if let Some(s) = schema {
         let schema_unq = s.trim_matches('"');
-        out = replace_identifier(
+        out = replace_identifier_outside_literals(
             &out,
             &format!("\"{}\".\"{}\"", schema_unq, bare_unq),
             &quoted_tbl,
         );
     }
-    out = replace_identifier(&out, &format!("\"{}\"", bare_unq), &quoted_tbl);
-    out = replace_identifier(&out, source_table, &quoted_tbl);
+    out = replace_identifier_outside_literals(&out, &format!("\"{}\"", bare_unq), &quoted_tbl);
+    out = replace_identifier_outside_literals(&out, source_table, &quoted_tbl);
     if bare_source != source_table {
         // Bare column qualifiers (`bare.col`). Quoted spellings are already
         // consumed above, so every remaining match here is genuinely unquoted.
-        out = replace_identifier(&out, bare_unq, &quoted_tbl);
+        out = replace_identifier_outside_literals(&out, bare_unq, &quoted_tbl);
     }
     out
 }
@@ -295,7 +351,7 @@ pub fn replace_source_with_transition(
 ///
 /// Reject bare identifiers that match SQL keywords which can follow a table
 /// reference (JOIN, WHERE, ON, …) — those are NOT aliases.
-fn consume_table_alias(bytes: &[u8], start: usize) -> (Option<String>, usize) {
+pub(super) fn consume_table_alias(bytes: &[u8], start: usize) -> (Option<String>, usize) {
     let mut i = start;
     while i < bytes.len() && bytes[i].is_ascii_whitespace() {
         i += 1;

@@ -81,6 +81,41 @@ fn end_of_block_comment(bytes: &[u8], open: usize) -> usize {
     bytes.len()
 }
 
+fn end_of_line_comment(bytes: &[u8], open: usize) -> usize {
+    bytes[open..]
+        .iter()
+        .position(|&byte| byte == b'\n')
+        .map_or(bytes.len(), |offset| open + offset)
+}
+
+/// Byte ranges of the single-quoted and dollar-quoted string literals of
+/// `sql`, in ascending order. A quote character inside a double-quoted
+/// identifier or a comment does not open a literal.
+pub(crate) fn string_literal_spans(sql: &str) -> Vec<std::ops::Range<usize>> {
+    let bytes = sql.as_bytes();
+    let mut spans = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        let literal_end = match bytes[i] {
+            b'\'' => Some(end_of_single_quoted(bytes, i)),
+            b'$' => end_of_dollar_quoted(bytes, i),
+            _ => None,
+        };
+        if let Some(end) = literal_end {
+            spans.push(i..end);
+            i = end;
+            continue;
+        }
+        i = match bytes[i] {
+            b'"' => end_of_double_quoted(bytes, i),
+            b'-' if bytes.get(i + 1) == Some(&b'-') => end_of_line_comment(bytes, i),
+            b'/' if bytes.get(i + 1) == Some(&b'*') => end_of_block_comment(bytes, i),
+            _ => i + 1,
+        };
+    }
+    spans
+}
+
 pub(crate) fn keyword_hits(sql: &str, keyword: &str) -> Vec<KeywordHit> {
     let bytes = sql.as_bytes();
     let wanted = keyword.as_bytes();
@@ -259,6 +294,32 @@ mod tests {
             "SELECT g FROM i WHERE c > (SELECT 1 FROM o GROUP BY k) GROUP BY g",
             "GROUP BY"
         ));
+    }
+
+    #[test]
+    fn literal_spans_cover_single_and_dollar_quoted_strings() {
+        let sql = "SELECT 'a''b', E'c\\'d', $$e$$, $t$f$t$ FROM t WHERE x = $1";
+        let literals: Vec<&str> = string_literal_spans(sql)
+            .into_iter()
+            .map(|span| &sql[span])
+            .collect();
+        assert_eq!(literals, vec!["'a''b'", "'c\\'d'", "$$e$$", "$t$f$t$"]);
+    }
+
+    #[test]
+    fn literal_spans_ignore_quotes_in_identifiers_and_comments() {
+        let sql = "SELECT \"it's\" /* don't */ FROM t -- can't\nWHERE x = 'y'";
+        let literals: Vec<&str> = string_literal_spans(sql)
+            .into_iter()
+            .map(|span| &sql[span])
+            .collect();
+        assert_eq!(literals, vec!["'y'"]);
+    }
+
+    #[test]
+    fn unterminated_literal_span_runs_to_the_end() {
+        let sql = "SELECT 'abc FROM t";
+        assert_eq!(string_literal_spans(sql), vec![7..sql.len()]);
     }
 
     proptest! {
