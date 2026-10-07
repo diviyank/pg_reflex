@@ -7,7 +7,7 @@
 //!   * Implementation of `reflex_sync_partitions` (with `drop_orphans` flag).
 //!   * Implementation of `reflex_reconcile_partition`.
 //!
-//! Design notes (see `plans/partitioning_2.md` and `plans/partition_plan.md`):
+//! Design notes:
 //!   * Only LIST and RANGE are supported in v1 (no HASH).
 //!   * For aggregate IMVs the partition columns MUST be a subset of GROUP BY
 //!     (Postgres requires unique indexes on partitioned tables to include the
@@ -1138,7 +1138,7 @@ pub(crate) fn resolve_anchor_source(
         .and_then(|mut it| it.next())
         .and_then(|r| r.get_by_name::<bool, _>("v").ok().flatten())
         .unwrap_or(false);
-    // TEMP reflex-debug — remove after diagnosis. Shows the exact source names
+    // Debug output: shows the exact source names
     // anchor resolution probes (bare vs schema-qualified) + current search_path.
     if debug_resolve {
         let dbg_path = client
@@ -1179,7 +1179,7 @@ pub(crate) fn resolve_anchor_source(
             )
             .map(|mut it| it.next().is_some())
             .unwrap_or(false);
-        // TEMP reflex-debug — per-source ownership + regclass resolution.
+        // Debug output: per-source ownership + regclass resolution.
         if debug_resolve {
             let dbg_regclass = client
                 .select(
@@ -1439,7 +1439,7 @@ pub(crate) fn reflex_sync_partitions_impl(view_name: &str, drop_orphans: bool) -
         // child's; adding first would raise "would overlap partition". This is
         // the multi-level reconcile path: a sub-level swap renames the sub-IMV
         // leaf, and reconcile(parent) must heal its mirror without overlap.
-        // Fail-safe (mirrors the F3 guard in `execute_partition_swap_for_child`):
+        // Fail-safe (mirrors the orphan-drop guard in `execute_partition_swap_for_child`):
         // an empty source enumeration carries NO information about orphanhood.
         // `list_partition_tree` returns an empty Vec both when the anchor has no
         // children AND when it could not be read at all — an unqualified anchor
@@ -1490,8 +1490,8 @@ pub(crate) fn reflex_sync_partitions_impl(view_name: &str, drop_orphans: bool) -
             }
         }
 
-        // Fix #3: heal shape drift. An IMV child created as a leaf whose source
-        // counterpart later became partitioned (or vice versa) was previously skipped
+        // Heal shape drift. An IMV child created as a leaf whose source
+        // counterpart later became partitioned (or vice versa) would be skipped
         // by `CREATE TABLE IF NOT EXISTS`, leaving a plain table where reconcile
         // expects a partitioned one ("… is not partitioned"). Drop such mismatched
         // children top-down so the create loop below rebuilds them with the right
@@ -1648,9 +1648,7 @@ pub(crate) fn reflex_sync_partitions_impl(view_name: &str, drop_orphans: bool) -
                 let build_int_detached = top_level && int_is_new;
                 let build_tgt_detached = top_level && tgt_is_new;
                 if has_intermediate {
-                    // Bound-collision heal (untreated_bugs/
-                    // 2026-07-25_nightly_swap_target_overlap_restale.md): a
-                    // source-side repartition that DETACHes a leaf and
+                    // Bound-collision heal: a source-side repartition that DETACHes a leaf and
                     // ATTACHes a freshly-named replacement at the SAME bound
                     // leaves the old leaf's mirror child behind as an orphan
                     // (drop_orphans=false — the auto-sync default, since
@@ -1659,7 +1657,7 @@ pub(crate) fn reflex_sync_partitions_impl(view_name: &str, drop_orphans: bool) -
                     // orphan. Drop only a CONFIRMED orphan — bounds identical
                     // to the incoming child AND mapped to no live source leaf
                     // — never a broader drop_orphans-style sweep. Mirrors the
-                    // F3 heal in `execute_partition_swap_for_child`.
+                    // orphan heal in `execute_partition_swap_for_child`.
                     if drop_bound_collision_orphan(
                         client,
                         schema,
@@ -1826,12 +1824,11 @@ fn toggle_relocation_triggers(
 /// a `drop_orphans` sweep too — `expected` gates it to a child that maps to
 /// NO live source leaf, so this never touches a partition a live source still
 /// backs, regardless of the caller's own `drop_orphans` flag. Same intent as
-/// the F3 heal in `execute_partition_swap_for_child`, but NOT the same scoping:
+/// the orphan heal in `execute_partition_swap_for_child`, but NOT the same scoping:
 /// that one passes the IMV ROOT rather than the swapped leaf's immediate
 /// parent, so on a multi-level tree it compares the root's direct children
-/// against a leaf's bound, never matches, and silently heals nothing. Tracked
-/// in `untreated_bugs/2026-07-25_swap_f3_heal_wrong_parent_scope_multilevel.md`
-/// — do not copy that scoping here. Returns whether a child was dropped.
+/// against a leaf's bound, never matches, and silently heals nothing (a known
+/// limitation of that heal) — do not copy that scoping here. Returns whether a child was dropped.
 fn drop_bound_collision_orphan(
     client: &mut pgrx::spi::SpiClient<'_>,
     schema: &str,
@@ -1872,7 +1869,7 @@ fn drop_bound_collision_orphan(
 
 /// Implementation of `reflex_reconcile_partition(view_name, partition_keys)`.
 ///
-/// Atomic DETACH/ATTACH swap (Phase A of `plans/partitioning_3.md`).
+/// Atomic DETACH/ATTACH swap.
 ///
 /// 1. Idempotent cleanup pass: drop any leftover `__reflex_swap_*` tables
 ///    for this view from a prior failed swap.  Detected purely by name
@@ -2126,9 +2123,9 @@ pub(crate) fn reflex_reconcile_partition_impl(
         }
 
         // Deterministic order. `to_process` is a set, and iterating it in hash
-        // order made both the NOTICE stream and — when one child fails midway —
+        // order would make both the NOTICE stream and — when one child fails midway —
         // WHICH children had already been swapped vary run to run, so a partial
-        // failure was not reproducible. It also makes the returned
+        // failure would not be reproducible. It also makes the returned
         // "RECONCILED partitions: …" list stable.
         let mut to_process: Vec<String> = to_process.into_iter().collect();
         to_process.sort();
@@ -2960,7 +2957,7 @@ fn swap_partition_child_ddl(
         .update(&detach_old_tgt, None, &[])
         .map_err(|e| format!("detach old tgt: {}", e))?;
 
-    // F3 heal: before attaching swap_tgt, check if a confirmed orphan with the same
+    // Orphan heal: before attaching swap_tgt, check if a confirmed orphan with the same
     // bounds exists and drop it. A confirmed orphan is an existing target child whose
     // bounds match the incoming swap target's bounds but which maps to NO live source
     // partition (i.e. not in the expected target set).
@@ -3000,7 +2997,7 @@ fn swap_partition_child_ddl(
                             .map(|n| target_child_name(view_name, &n.bare_name))
                             .collect();
 
-                        // F3 fail-safe: only attempt orphan drop if live-source set was successfully
+                        // Fail-safe: only attempt orphan drop if live-source set was successfully
                         // and non-emptily enumerated. If src_expected_tgt is empty, it means either:
                         // (a) list_partition_tree encountered a query error and returned an empty Vec, or
                         // (b) there are no leaf sources. Either way, we cannot trust the orphan determination.
@@ -3070,7 +3067,7 @@ fn swap_partition_child_ddl(
         .map_err(|e| format!("rename tgt: {}", e))?;
 
     // The DETACH/CREATE-LIKE/fill/ATTACH/RENAME dance above is exactly the
-    // shape of the 2026-09 incident: a legitimate swap that rebuilds a slice
+    // shape of a silent wipe: a legitimate swap that rebuilds a slice
     // from `base_query` under whatever predicate holds now, which can differ
     // from what built the slice it replaces. `tgt_child_qual` names the OLD
     // child before this block and — after `rename_tgt` — the NEW one, so the
@@ -3504,9 +3501,8 @@ fn clock_timestamp(client: &pgrx::spi::SpiClient<'_>) -> Option<String> {
         .and_then(|r| r.get_by_name::<String, _>("t").ok().flatten())
 }
 
-/// Record a slice-changing rebuild — the artefact the 2026-09 silent wipe
-/// incident had none of. A no-op when the count is known on both sides and
-/// didn't move: the log is for anomalies and slice-changing rebuilds, never
+/// Record a slice-changing rebuild, so a silent wipe leaves an artefact. A
+/// no-op when the count is known on both sides and didn't move: the log is for anomalies and slice-changing rebuilds, never
 /// for every commit. When either side couldn't be counted, fails toward
 /// firing — the safe direction for an alarm — and names the unknown side in
 /// `detail` instead of guessing a count.
@@ -3977,7 +3973,7 @@ pub(crate) fn reflex_flush_partitions_impl(only: Option<&str>) -> String {
             // per-partition reconcile. Instead of a blunt full reconcile on every
             // partition change (which TRUNCATE+rebuilds the IMV and full-cascades
             // to every dependent), apply each attached/detached child as the bulk
-            // INSERT/DELETE it semantically is (plans/2026-06-11) — the same
+            // INSERT/DELETE it semantically is — the same
             // pipeline the INSERT/DELETE triggers use, so propagation is
             // write-driven and dies wherever the delta nets to zero. Falls back to
             // full reconcile when a baseline is missing or a child can't be
@@ -4286,11 +4282,6 @@ pub(crate) fn refill_tree_defaults(
     Ok(())
 }
 
-// Phase 1 (plans/1_6_1_refacto.md) — `substitute_identifier` is a re-export
-// of the canonical implementation in
-// [`crate::sql_writer::identifier::substitute_identifier_ci`]. Existing call
-// sites and `unit_partition.rs` tests continue to compile against the
-// original name.
 use crate::sql_writer::identifier::substitute_identifier_ci as substitute_identifier;
 
 #[cfg(test)]
