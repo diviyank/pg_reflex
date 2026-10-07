@@ -433,3 +433,21 @@ fn timezone_warning_is_silent_for_zone_independent_functions() {
         );
     }
 }
+
+#[test]
+fn timezone_warning_promises_silence_only_for_three_argument_date_trunc() {
+    let parsed = Parser::parse_sql(
+        &PostgreSqlDialect {},
+        "SELECT date_trunc('day', ts) AS d, SUM(v) AS s FROM t GROUP BY 1",
+    )
+    .unwrap();
+    let analysis = analyze(&parsed).unwrap();
+    let msg = timezone_sensitivity_warning("my_view", &analysis).expect("warns");
+    assert!(
+        msg.contains("date_trunc('day', ts, 'UTC') clears this warning"),
+        "{msg}"
+    );
+    assert!(msg.contains("by name and remains"), "{msg}");
+    assert!(!msg.contains("or ts AT TIME ZONE"), "{msg}");
+    assert!(!msg.contains('\n'), "{msg}");
+}
