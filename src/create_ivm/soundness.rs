@@ -468,7 +468,6 @@ pub(crate) fn source_equi_join_columns(
 /// Fetch all sound unique keys (PRIMARY KEY + NOT-NULL UNIQUE indexes) of
 /// a table. Each key is a Vec of column names in definition order.
 /// Includes __reflex_uk_* indexes created for keyed CTE sub-IMVs.
-#[allow(dead_code)]
 pub(crate) fn source_sound_unique_keys(source: &str) -> Vec<Vec<String>> {
     let mut result = Vec::new();
 
@@ -508,7 +507,6 @@ pub(crate) fn source_sound_unique_keys(source: &str) -> Vec<Vec<String>> {
 /// TRUE when `source` is a registered IMV flagged `max_one_row` (ungrouped
 /// aggregate → at most one row). Base tables / unknown names → FALSE.
 /// Normalizes the source name to unquoted canonical form to match registry storage.
-#[allow(dead_code)]
 pub(crate) fn source_is_max_one_row(source: &str) -> bool {
     let (schema_part, bare_name) = canonical_source(source);
     let canonical = match schema_part {
@@ -542,7 +540,6 @@ pub(crate) fn source_is_max_one_row(source: &str) -> bool {
 /// the full `<parent>__cte_<alias>` sub-IMV name after the CTE body rewrite, or a
 /// plain table name) is matched exactly on its canonical or bare form — never by
 /// wildcard, which could match a same-named CTE sub-IMV of a different parent.
-#[allow(dead_code)]
 pub(crate) fn source_registered_group_key(source: &str) -> Option<Vec<String>> {
     let (schema_part, bare_name) = canonical_source(source);
     let canonical = match schema_part {
@@ -575,7 +572,6 @@ pub(crate) fn source_registered_group_key(source: &str) -> Option<Vec<String>> {
 
 /// Find the join type (INNER, LEFT, CROSS, etc.) that reaches a particular
 /// target source. Returns the first match or None.
-#[allow(dead_code)]
 pub(crate) fn join_type_for_target(
     target: &str,
     joins: &[crate::sql_analyzer::JoinInfo],
