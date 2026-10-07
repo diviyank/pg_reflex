@@ -45,7 +45,6 @@ pub(crate) struct BuildContext<'a> {
     view_name: &'a str,
     sql: &'a str,
     unique_columns_str: &'a str,
-    if_not_exists: bool,
     #[allow(dead_code)]
     topk_k: Option<usize>,
     ignore_sources: &'a [String],
@@ -158,6 +157,12 @@ fn validate_and_parse_inputs(
         Ok(a) => {
             if let Some(reason) = a.unsupported_reason() {
                 return Err(crate::reflex_reject(&reason));
+            }
+            if let Some(reason) = function_contract_violation(view_name, &a) {
+                return Err(crate::reflex_reject(&reason));
+            }
+            if let Some(message) = timezone_sensitivity_warning(view_name, &a) {
+                warning!("{message}");
             }
             a
         }
@@ -334,45 +339,123 @@ fn populate_source_join_keys(ctx: &mut BuildContext) {
     build_source_join_keys(&mut ctx.plan, &real_sources, &ctx.analysis);
 }
 
-/// Warn on SELECT entries that are neither GROUP BY nor recognized aggregates.
-/// These columns will be missing from the IMV (silent data loss is worse than a warning).
-fn validate_select_columns(ctx: &BuildContext) {
-    if ctx.plan.is_passthrough {
-        return;
+pub(crate) fn timezone_sensitivity_warning(
+    view_name: &str,
+    analysis: &crate::sql_analyzer::SqlAnalysis,
+) -> Option<String> {
+    let functions = analysis.timezone_sensitive_functions();
+    if functions.is_empty() {
+        return None;
     }
-    let group_by_set: std::collections::HashSet<&str> = ctx
-        .plan
-        .group_by_columns
+    Some(format!(
+        "pg_reflex: '{view_name}' uses {} whose result depends on the session TimeZone when \
+         applied to timestamptz. Writers with different TimeZone settings will make the IMV \
+         diverge. The three-argument form date_trunc('day', ts, 'UTC') clears this warning; \
+         for the other functions pin the zone with AT TIME ZONE, where the warning is by name \
+         and remains.",
+        functions.join(", ")
+    ))
+}
+
+const SUPPORTED_AGGREGATES: [&str; 6] = ["sum", "count", "avg", "min", "max", "bool_or"];
+
+/// The catalog matches by name across every overload and schema: argument types are
+/// unknown here, and accepting a volatile call is the direction that corrupts an IMV.
+fn function_contract_violation(
+    view_name: &str,
+    analysis: &crate::sql_analyzer::SqlAnalysis,
+) -> Option<String> {
+    let called: Vec<String> = analysis
+        .called_functions
         .iter()
-        .map(|s| s.as_str())
+        .map(|f| f.name.clone())
         .collect();
-    for col in &ctx.analysis.select_columns {
-        if !col.is_passthrough && col.aggregate.is_none() && !col.is_aggregate_derived {
-            warning!(
-                "pg_reflex: unsupported expression '{}' in SELECT — column will be missing from IMV '{}'",
-                col.alias.as_deref().unwrap_or(&col.expr_sql),
-                ctx.view_name
-            );
-        } else if col.is_passthrough
-            && !group_by_set.contains(col.expr_sql.as_str())
-            && !ctx.analysis.has_distinct
-        {
-            let bare = bare_column_name(&col.expr_sql);
-            let in_gb = group_by_set.iter().any(|gb| bare_column_name(gb) == bare);
-            if !in_gb {
-                warning!(
-                    "pg_reflex: expression '{}' not in GROUP BY and not a recognized aggregate — column will be missing from IMV '{}'",
-                    col.expr_sql,
-                    ctx.view_name
-                );
-            }
-        }
+    let (volatile, aggregates) = catalog_function_kinds(&called);
+    if let Some(first) = volatile.first() {
+        return Some(format!(
+            "Volatile function(s) {} are not supported in IMV '{view_name}'. Fix: if a function \
+             is in fact deterministic, declare it with ALTER FUNCTION {first}(...) IMMUTABLE \
+             (or STABLE); otherwise remove it from the IMV query, or compute the value into a \
+             source column. A volatile function returns a different result on each call, so \
+             the IMV would diverge from its own query.",
+            volatile.join(", ")
+        ));
     }
+    let unsupported: Vec<String> = aggregates
+        .into_iter()
+        .filter(|name| !SUPPORTED_AGGREGATES.contains(&name.as_str()))
+        .map(|name| name.to_uppercase())
+        .collect();
+    if !unsupported.is_empty() {
+        return Some(format!(
+            "Unsupported aggregate(s): {}. Supported: SUM, COUNT, AVG, MIN, MAX, BOOL_OR",
+            unsupported.join(", ")
+        ));
+    }
+    None
+}
+
+/// A non-aggregate SELECT item beside aggregates, with no GROUP BY to key it on.
+fn ungrouped_non_aggregate_column(ctx: &BuildContext) -> Option<String> {
+    if ctx.plan.is_passthrough
+        || ctx.analysis.has_distinct
+        || !ctx.analysis.group_by_columns.is_empty()
+    {
+        return None;
+    }
+    ctx.analysis
+        .select_columns
+        .iter()
+        .find(|col| col.is_passthrough)
+        .map(|col| col.alias.clone().unwrap_or_else(|| col.expr_sql.clone()))
+}
+
+/// Names among `called` that the catalog knows as (volatile functions, aggregates with
+/// no plain function of the same name). Both sides fold ASCII only, as PostgreSQL does
+/// for identifiers, so a name with a non-ASCII upper-case letter still matches.
+fn catalog_function_kinds(called: &[String]) -> (Vec<String>, Vec<String>) {
+    if called.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+    let names = crate::sql_writer::identifier::format_pg_text_array(called);
+    let kinds: Vec<(String, bool, bool)> = Spi::connect(|client| {
+        client
+            .select(
+                "SELECT lower(proname::text COLLATE \"C\") AS name, \
+                        bool_or(prokind = 'f' AND provolatile = 'v') AS is_volatile, \
+                        bool_or(prokind = 'a') AND NOT bool_or(prokind = 'f') AS is_aggregate_only \
+                 FROM pg_catalog.pg_proc \
+                 WHERE lower(proname::text COLLATE \"C\") = ANY($1::text[]) \
+                 GROUP BY 1 ORDER BY 1",
+                None,
+                &[unsafe { DatumWithOid::new(names, PgBuiltInOids::TEXTOID.oid().value()) }],
+            )
+            .unwrap_or_report()
+            .filter_map(|row| {
+                Some((
+                    row.get_by_name::<String, _>("name").unwrap_or(None)?,
+                    row.get_by_name::<bool, _>("is_volatile").unwrap_or(None)?,
+                    row.get_by_name::<bool, _>("is_aggregate_only")
+                        .unwrap_or(None)?,
+                ))
+            })
+            .collect()
+    });
+    let names_where = |keep: fn(&(String, bool, bool)) -> bool| -> Vec<String> {
+        kinds
+            .iter()
+            .filter(|kind| keep(kind))
+            .map(|(name, _, _)| name.clone())
+            .collect()
+    };
+    (
+        names_where(|(_, is_volatile, _)| *is_volatile),
+        names_where(|(_, _, is_aggregate_only)| *is_aggregate_only),
+    )
 }
 
 /// Is an IMV of this name already in the registry? One definition, shared by
-/// the duplicate-name pre-flight and by the A1 soundness gate, which must not
-/// fire on a call that will short-circuit as a no-op.
+/// the duplicate-name pre-flight and by the `if_not_exists` no-op.
 fn imv_is_registered(view_name: &str) -> bool {
     Spi::connect(|client| {
         !client
@@ -389,15 +472,10 @@ fn imv_is_registered(view_name: &str) -> bool {
     })
 }
 
-/// Pre-flight checks: reject duplicate view name (or skip-noop on
-/// `if_not_exists`), detect cycles in the IMV dependency DAG. Returns the
-/// short-circuit string when the create should stop, `None` to continue.
+/// Pre-flight checks: reject a duplicate view name and a cycle in the IMV
+/// dependency DAG. Returns the rejection when the create should stop.
 fn check_existence_and_cycle(ctx: &BuildContext) -> Option<&'static str> {
-    let already_exists = imv_is_registered(ctx.view_name);
-    if already_exists {
-        if ctx.if_not_exists {
-            return Some("REFLEX INCREMENTAL VIEW ALREADY EXISTS (skipped)");
-        }
+    if imv_is_registered(ctx.view_name) {
         return Some(crate::reflex_reject("IMV with this name already exists"));
     }
 
@@ -1898,6 +1976,12 @@ pub(crate) fn create_reflex_ivm_impl_with_materialization(
     materialize_as_table: bool,
     explicit_unpartitioned: bool,
 ) -> &'static str {
+    // Before any validation: refusing a call that builds nothing protects nothing
+    // (the IMV goes on existing either way) and breaks idempotent deployment re-runs.
+    if if_not_exists && imv_is_registered(view_name) {
+        return "REFLEX INCREMENTAL VIEW ALREADY EXISTS (skipped)";
+    }
+
     let parsed = match validate_and_parse_inputs(view_name, sql, storage_mode, refresh_mode) {
         Ok(p) => p,
         Err(msg) => return msg,
@@ -1920,21 +2004,13 @@ pub(crate) fn create_reflex_ivm_impl_with_materialization(
         ));
     }
     let (ignored_clean, ignored_acked) = split_ignore_ack(ignore_sources);
-    // `if_not_exists` on an IMV that already exists is a no-op: refusing it
-    // protects nothing (the unsound IMV goes on existing either way) and breaks
-    // idempotent deployment re-runs. Judge only calls that would build.
-    let creates_nothing = if_not_exists && imv_is_registered(view_name);
-    let unacked = if creates_nothing {
-        None
-    } else {
-        ignore_soundness::unsound_ignored_sources_parsed(
-            &parsed.parsed_sql,
-            &parsed.analysis,
-            &ignored_clean,
-        )
-        .into_iter()
-        .find(|(src, _)| !ignored_acked.contains(src))
-    };
+    let unacked = ignore_soundness::unsound_ignored_sources_parsed(
+        &parsed.parsed_sql,
+        &parsed.analysis,
+        &ignored_clean,
+    )
+    .into_iter()
+    .find(|(src, _)| !ignored_acked.contains(src));
     if let Some((src, reason)) = unacked {
         // The working remedy comes FIRST, right after the two names. Consumers
         // truncate: __reflex_doctor_try_repair caps at 400 characters, and a
@@ -2087,7 +2163,6 @@ pub(crate) fn create_reflex_ivm_impl_with_materialization(
         view_name,
         sql,
         unique_columns_str,
-        if_not_exists,
         topk_k,
         ignore_sources,
         partition_by,
@@ -2120,7 +2195,13 @@ pub(crate) fn create_reflex_ivm_impl_with_materialization(
     // insert that persists `plan.aggregations`.)  This call is a no-op
     // until the partition path resolves the partition column.
     populate_source_join_keys(&mut ctx);
-    validate_select_columns(&ctx);
+    if let Some(column) = ungrouped_non_aggregate_column(&ctx) {
+        return crate::reflex_reject(&format!(
+            "'{column}' is not an aggregate expression that pg_reflex supports and is not a \
+             group key: the query has no GROUP BY. Fix: add it to a GROUP BY clause, or select \
+             it in an outer passthrough layer over a CTE that holds the aggregates."
+        ));
+    }
 
     if let Some(msg) = check_existence_and_cycle(&ctx) {
         return msg;

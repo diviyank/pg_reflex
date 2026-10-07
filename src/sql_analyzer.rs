@@ -91,12 +91,57 @@ pub struct SetOperationInfo {
 }
 
 pub(crate) fn bare_function_name(name: &sqlparser::ast::ObjectName) -> String {
-    let full = name.to_string();
-    full.rsplit('.')
-        .next()
-        .unwrap_or(&full)
-        .trim_matches('"')
-        .to_lowercase()
+    name.0
+        .last()
+        .and_then(|part| part.as_ident())
+        .map(|ident| ident.value.to_ascii_lowercase())
+        .unwrap_or_default()
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CalledFunction {
+    pub name: String,
+    pub arg_count: usize,
+}
+
+const KEYWORD_PSEUDO_FUNCTIONS: [&str; 12] = [
+    "current_user",
+    "session_user",
+    "system_user",
+    "user",
+    "current_role",
+    "current_catalog",
+    "current_schema",
+    "localtime",
+    "localtimestamp",
+    "current_date",
+    "current_time",
+    "current_timestamp",
+];
+
+/// `None` for a qualified column whose last part is a keyword (`t.user`), which the
+/// parser hands over as an argument-less function with a multi-part name.
+fn called_function(f: &sqlparser::ast::Function) -> Option<CalledFunction> {
+    let arg_count = match &f.args {
+        FunctionArguments::List(list) => list.args.len(),
+        FunctionArguments::None if f.name.0.len() > 1 => return None,
+        _ => 0,
+    };
+    Some(CalledFunction {
+        name: bare_function_name(&f.name),
+        arg_count,
+    })
+}
+
+/// An unquoted bare occurrence of a reserved word that PostgreSQL evaluates as a function.
+fn keyword_pseudo_function(ident: &Ident) -> Option<CalledFunction> {
+    if ident.quote_style.is_some() {
+        return None;
+    }
+    let name = ident.value.to_ascii_lowercase();
+    KEYWORD_PSEUDO_FUNCTIONS
+        .contains(&name.as_str())
+        .then_some(CalledFunction { name, arg_count: 0 })
 }
 
 const DISTINCT_AGGREGATE_REJECTION: &str = "DISTINCT modifier on SUM/AVG/MIN/MAX/BOOL_OR is not supported. \
@@ -137,10 +182,12 @@ pub struct SqlAnalysis {
     pub unsupported_aggregates: Vec<String>,
     pub distinct_aggregates: Vec<String>,
     pub nested_count_distinct: bool,
-    /// Set when any non-deterministic function (NOW, RANDOM, etc.) is found
-    /// anywhere in the query — SELECT, WHERE, HAVING, JOIN ON, ORDER BY all
-    /// flow through `pre_visit_expr`. The flag name is kept for backwards
-    /// compatibility; the rejection is query-wide.
+    /// Every non-window function call and keyword pseudo-function in the query, by bare
+    /// lower-case name, once per distinct (name, argument count).
+    pub called_functions: Vec<CalledFunction>,
+    pub has_extract: bool,
+    /// Set when a clock or session-identity function is called anywhere in the
+    /// query, not only in the SELECT list.
     pub has_nondeterministic_select: bool,
     /// DISTINCT ON columns (e.g., ["city"] from DISTINCT ON (city))
     pub distinct_on_columns: Vec<String>,
@@ -219,7 +266,8 @@ impl SqlAnalysis {
             return Some(
                 "Non-deterministic functions (NOW, CURRENT_TIMESTAMP, RANDOM, etc.) \
                  are not supported anywhere in the query — they would cause the IMV \
-                 to drift over time without a corresponding source mutation"
+                 to drift over time without a corresponding source mutation. Fix: remove \
+                 them from the IMV query, or compute the value into a source column"
                     .into(),
             );
         }
@@ -237,6 +285,30 @@ impl SqlAnalysis {
             return Some(NESTED_COUNT_DISTINCT_REJECTION.into());
         }
         None
+    }
+
+    pub fn timezone_sensitive_functions(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .called_functions
+            .iter()
+            .filter(|call| is_timezone_sensitive_function(call))
+            .map(|call| call.name.clone())
+            .collect();
+        if self.has_extract {
+            names.push("extract".to_string());
+        }
+        names.sort();
+        names.dedup();
+        names
+    }
+
+    fn record_called_function(&mut self, call: CalledFunction) {
+        if is_clock_or_session_function(&call) {
+            self.has_nondeterministic_select = true;
+        }
+        if !self.called_functions.contains(&call) {
+            self.called_functions.push(call);
+        }
     }
 }
 
@@ -301,14 +373,18 @@ impl<'a> Visitor for AnalysisVisitor<'a> {
                     {
                         self.analysis.unsupported_aggregates.push(func_name.clone());
                     }
-                    // Detect non-deterministic functions anywhere in the query
-                    // (SELECT, WHERE, HAVING, JOIN ON, ORDER BY all flow through
-                    // pre_visit_expr). The flag name retains "select" for
-                    // backwards compatibility; the rejection is query-wide.
-                    if is_nondeterministic_function(&func_name) {
-                        self.analysis.has_nondeterministic_select = true;
+                    if let Some(call) = called_function(f) {
+                        self.analysis.record_called_function(call);
                     }
                 }
+            }
+            Expr::Identifier(ident) => {
+                if let Some(call) = keyword_pseudo_function(ident) {
+                    self.analysis.record_called_function(call);
+                }
+            }
+            Expr::Extract { .. } => {
+                self.analysis.has_extract = true;
             }
             Expr::Subquery(_) => {
                 self.analysis.has_scalar_subquery = true;
@@ -471,20 +547,42 @@ fn is_known_unsupported_aggregate(func_name: &str) -> bool {
     )
 }
 
-/// Check if a function name is non-deterministic (result changes across calls).
-fn is_nondeterministic_function(func_name: &str) -> bool {
-    matches!(
-        func_name,
-        "NOW"
-            | "CURRENT_TIMESTAMP"
-            | "CURRENT_DATE"
-            | "CURRENT_TIME"
-            | "RANDOM"
-            | "CLOCK_TIMESTAMP"
-            | "STATEMENT_TIMESTAMP"
-            | "TIMEOFDAY"
-            | "GEN_RANDOM_UUID"
-    )
+fn is_clock_or_session_function(call: &CalledFunction) -> bool {
+    let name = call.name.as_str();
+    KEYWORD_PSEUDO_FUNCTIONS.contains(&name)
+        || match name {
+            "now"
+            | "transaction_timestamp"
+            | "statement_timestamp"
+            | "clock_timestamp"
+            | "timeofday"
+            | "pg_postmaster_start_time"
+            | "pg_conf_load_time"
+            | "random"
+            | "gen_random_uuid"
+            | "current_setting"
+            | "current_schemas"
+            | "current_database"
+            | "pg_backend_pid"
+            | "inet_client_addr"
+            | "inet_client_port"
+            | "inet_server_addr"
+            | "inet_server_port"
+            | "txid_current"
+            | "txid_current_if_assigned"
+            | "pg_current_xact_id"
+            | "pg_current_xact_id_if_assigned" => true,
+            "age" => call.arg_count == 1,
+            _ => false,
+        }
+}
+
+fn is_timezone_sensitive_function(call: &CalledFunction) -> bool {
+    match call.name.as_str() {
+        "date_trunc" | "to_timestamp" => call.arg_count == 2,
+        "date_part" | "to_char" | "to_date" => true,
+        _ => false,
+    }
 }
 
 /// Check if function args contain a wildcard (for COUNT(*)).
