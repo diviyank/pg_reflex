@@ -54,6 +54,9 @@ pub(crate) fn aggregate_insert_stmts(
                 &select_expr,
             );
         } else {
+            // No selectivity dispatch on this path: the decision needs |affected|,
+            // which requires the scratch + affected fill, and on the bulk shapes that
+            // motivate dispatch that fill is the dominant cost.
             push_materialized_merge_and_affected(
                 stmts,
                 scratch_tbl,
@@ -1300,11 +1303,10 @@ pub(crate) fn passthrough_op_stmts(
                         &ins_cold,
                     ));
                 } else {
-                    // Gated pair on the unpartitioned path only; see the
-                    // DELETE branch for why the partition-dispatch DO block above
-                    // must keep the single always-NULL-safe form. The INSERT is
-                    // unaffected (it is scoped by `pt_new`, not by a membership
-                    // predicate), so it simply follows both DELETE variants.
+                    // Gated pair, like the cold DELETE inside the partition-dispatch
+                    // DO block above. The INSERT is unaffected (it is scoped by
+                    // `pt_new`, not by a membership predicate), so it simply follows
+                    // both DELETE variants.
                     let del_match = passthrough_keyed_delete_match(
                         &pt_old,
                         &qv,
