@@ -147,3 +147,58 @@ fn v112_sr_column_extending_source_name_with_multibyte_suffix_stays_correct() {
 fn v112_sr_column_extending_source_name_with_multibyte_prefix_stays_correct() {
     v112_sr_assert_grouping_column_correct_through_dml("v112_sr_bp", "év112_sr_bp");
 }
+
+fn v112_sr_assert_mixed_spelling_correct(tag: &str, schema_ddl: &str, table_ref: &str) {
+    Spi::run(&format!("CREATE SCHEMA {schema_ddl}")).expect("schema");
+    v112_sr_seeded_table(table_ref, "a");
+    let agg = format!("SELECT season, SUM(v) AS s FROM {table_ref} GROUP BY season");
+    let passthrough = format!("SELECT id, season, v FROM {table_ref} WHERE v <> 2");
+    let agg_imv = format!("v112_sr_{tag}_agg");
+    let passthrough_imv = format!("v112_sr_{tag}_pt");
+    v112_sr_imv(&agg_imv, &agg);
+    v112_sr_imv(&passthrough_imv, &passthrough);
+    v112_sr_assert_correct_through_dml(
+        table_ref,
+        "a",
+        &[(&agg_imv, &agg), (&passthrough_imv, &passthrough)],
+    );
+}
+
+#[pg_test]
+fn v112_sr_quoted_schema_with_unquoted_table_stays_correct() {
+    v112_sr_assert_mixed_spelling_correct("qs", "v112_sr_qs", "\"v112_sr_qs\".prod");
+}
+
+#[pg_test]
+fn v112_sr_unquoted_schema_with_quoted_table_stays_correct() {
+    v112_sr_assert_mixed_spelling_correct("qt", "v112_sr_qt", "v112_sr_qt.\"prod\"");
+}
+
+#[pg_test]
+fn v112_sr_quoted_multibyte_schema_with_unquoted_table_stays_correct() {
+    v112_sr_assert_mixed_spelling_correct("qm", "\"v112_sr_schéma\"", "\"v112_sr_schéma\".prod");
+}
+
+#[pg_test]
+fn v112_sr_join_with_one_mixed_spelling_side_stays_correct() {
+    Spi::run("CREATE SCHEMA v112_sr_js").expect("schema");
+    Spi::run("CREATE TABLE v112_sr_js.fact(id SERIAL PRIMARY KEY, kind TEXT, v INT)").expect("fact");
+    Spi::run("CREATE TABLE v112_sr_jdim(kind TEXT PRIMARY KEY, label TEXT)").expect("dim");
+    Spi::run("INSERT INTO v112_sr_jdim VALUES ('a','A'),('b','B')").expect("dim seed");
+    Spi::run("INSERT INTO v112_sr_js.fact(kind, v) VALUES ('a',1),('b',2),('a',3)").expect("seed");
+    let aliased = "SELECT d.label, SUM(f.v) AS s FROM \"v112_sr_js\".fact f \
+                   JOIN v112_sr_jdim d ON d.kind = f.kind GROUP BY d.label";
+    let unaliased = "SELECT d.label, SUM(fact.v) AS s FROM \"v112_sr_js\".fact \
+                     JOIN v112_sr_jdim d ON d.kind = fact.kind GROUP BY d.label";
+    v112_sr_imv("v112_sr_js_aliased", aliased);
+    v112_sr_imv("v112_sr_js_unaliased", unaliased);
+    let imvs = [("v112_sr_js_aliased", aliased), ("v112_sr_js_unaliased", unaliased)];
+    Spi::run("INSERT INTO v112_sr_js.fact(kind, v) VALUES ('a',10),('b',20)").expect("insert");
+    v112_sr_assert_all_correct(&imvs);
+    Spi::run("UPDATE v112_sr_js.fact SET v = v + 100 WHERE id = 1").expect("update");
+    v112_sr_assert_all_correct(&imvs);
+    Spi::run("DELETE FROM v112_sr_js.fact WHERE id = 3").expect("delete");
+    v112_sr_assert_all_correct(&imvs);
+    Spi::run("UPDATE v112_sr_jdim SET label = 'A2' WHERE kind = 'a'").expect("dim update");
+    v112_sr_assert_all_correct(&imvs);
+}

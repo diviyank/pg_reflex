@@ -931,3 +931,105 @@ fn replace_identifier_matches_legacy_on_ascii_input() {
     }
     assert!(rewritten > 1000, "rewrote only {rewritten}");
 }
+
+#[test]
+fn source_rewrite_recognises_quoted_schema_with_unquoted_table() {
+    assert_eq!(
+        replace_source_with_transition(
+            "SELECT product.v FROM \"alp\".product WHERE \"alp\".product.v > 0",
+            "alp.product",
+            "__reflex_new_alp_product"
+        ),
+        "SELECT \"__reflex_new_alp_product\".v FROM \"__reflex_new_alp_product\" WHERE \"__reflex_new_alp_product\".v > 0"
+    );
+}
+
+#[test]
+fn source_rewrite_recognises_unquoted_schema_with_quoted_table() {
+    assert_eq!(
+        replace_source_with_transition(
+            "SELECT p.v FROM alp.\"product\" p WHERE alp.\"product\".v > 0",
+            "alp.product",
+            "__reflex_new_alp_product"
+        ),
+        "SELECT p.v FROM \"__reflex_new_alp_product\" p WHERE \"__reflex_new_alp_product\".v > 0"
+    );
+}
+
+#[test]
+fn source_rewrite_leaves_mixed_spelling_of_other_names_alone() {
+    for sql in [
+        "SELECT 1 FROM \"alp\".product_backup",
+        "SELECT 1 FROM alp.\"product_backup\"",
+        "SELECT 1 FROM \"zalp\".product",
+    ] {
+        assert_eq!(
+            replace_source_with_transition(sql, "alp.product", "__reflex_new_alp_product"),
+            sql
+        );
+    }
+}
+
+#[test]
+fn source_rewrite_matches_legacy_for_unquoted_fully_quoted_and_bare_references() {
+    const ALIASES: [&str; 5] = ["", " p", " AS p", " AS product", " product"];
+    const SELECTS: [&str; 7] = [
+        "*",
+        "product.id, product.v",
+        "p.id",
+        "\"product\".id",
+        "alp.product.id",
+        "\"alp\".\"product\".v",
+        "SUM(v) AS product",
+    ];
+    const JOINS: [&str; 4] = [
+        "",
+        " JOIN alp.dim d ON d.id = product.dim_id",
+        " LEFT JOIN \"alp\".\"dim\" ON dim.id = p.dim_id",
+        " JOIN alp.product_backup b ON b.id = p.id",
+    ];
+    const WHERES: [&str; 4] = [
+        "",
+        " WHERE product.v > 0",
+        " WHERE p.v > 0 AND alp.product.id < 5",
+        " WHERE \"product\".v IS NULL",
+    ];
+    const GROUPS: [&str; 3] = ["", " GROUP BY product.id", " GROUP BY p.id"];
+    const REFERENCES: [(&str, &str); 4] = [
+        ("alp.product", "alp.product"),
+        ("alp.product", "\"alp\".\"product\""),
+        ("product", "product"),
+        ("product", "\"product\""),
+    ];
+    let mut compared = 0;
+    let mut rewritten = 0;
+    for (source, reference) in REFERENCES {
+        for alias in ALIASES {
+            for select in SELECTS {
+                for join in JOINS {
+                    for filter in WHERES {
+                        for group in GROUPS {
+                            let sql = format!(
+                                "SELECT {select} FROM {reference}{alias}{join}{filter}{group}"
+                            );
+                            for transition in TRANSITIONS {
+                                let expected = legacy::replace_source_with_transition(
+                                    &sql, source, transition,
+                                );
+                                assert_eq!(
+                                    replace_source_with_transition(&sql, source, transition),
+                                    expected,
+                                    "sql: {sql:?}, source: {source}"
+                                );
+                                compared += 1;
+                                rewritten += usize::from(expected != sql);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(compared, 13440);
+    assert_eq!(rewritten, compared);
+}
