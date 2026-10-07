@@ -176,7 +176,7 @@ pub(crate) fn build_passthrough_key_mappings(
     }
 }
 
-/// 1.4.6 — Build the per-source JOIN-key mapping for aggregate plans.
+/// Build the per-source JOIN-key mapping for aggregate plans.
 ///
 /// For each source in the IMV, find JOIN equalities where the source's
 /// column equals another table's column AND the other column projects to
@@ -320,9 +320,8 @@ pub(crate) fn count_equalities_involving_source(
         .collect();
 
     let mut count = 0;
-    // Case-insensitive AND split: lowercase first, split once. Avoids the
-    // double-iteration footgun that existed in the legacy
-    // `parse_join_condition_mappings` (now fixed).
+    // Case-insensitive AND split: lowercase first, split once. Chaining two
+    // splits (on "AND" and "and") would yield spurious whole-condition iterations.
     let condition_lower = condition.to_lowercase();
     for part in condition_lower.split(" and ") {
         let part = part.trim();
@@ -597,11 +596,11 @@ pub(crate) fn join_type_for_target(
 /// CROSS to-many, and any source without a projectable key are refused.
 ///
 /// Enhancements:
-/// - Equi-join equivalence (FIX 1): Two qualified column refs are equivalent if
+/// - Equi-join equivalence: Two qualified column refs are equivalent if
 ///   connected by = equalities in top-level join ON clauses. projected_output
 ///   succeeds if an output column is equi-equivalent (not just identical) to a
 ///   key column of the anchor.
-/// - Registered group-by key (FIX 2): If a source is an aggregate IMV, its
+/// - Registered group-by key: If a source is an aggregate IMV, its
 ///   GROUP BY columns are a sound unique key and will be checked by
 ///   source_cols_cover_unique_key / projected_sound_key.
 pub(crate) fn infer_join_passthrough_unique_key(ctx: &BuildContext) -> Option<Vec<String>> {
@@ -610,7 +609,7 @@ pub(crate) fn infer_join_passthrough_unique_key(ctx: &BuildContext) -> Option<Ve
         return None;
     }
 
-    // Per-join admissibility. CROSS is now allowed (to-one iff the joined
+    // Per-join admissibility. CROSS is allowed (to-one iff the joined
     // relation is single-row). RIGHT/FULL multiply or NULL-pad the anchor's
     // rows → refuse. OR / USING conditions defeat the equi analysis → refuse.
     let mut has_left = false;
@@ -871,10 +870,8 @@ pub(crate) fn parse_join_condition_mappings(
     // e.g., "product_id" → "s.product_id"
 
     // Case-insensitive split on AND: lowercase the condition first, then split
-    // only on the lowercase form. The previous chain-of-two-splits formulation
-    // produced spurious whole-condition iterations when only one of "AND" /
-    // "and" was present in the source string (caught by
-    // pg_test_source_join_keys_skipped_when_composite_join_partial_map).
+    // only on the lowercase form. Chaining splits on "AND" and "and" would produce
+    // spurious whole-condition iterations when only one spelling is present.
     let condition_lower = condition.to_lowercase();
     for part in condition_lower.split(" and ") {
         let part = part.trim();
@@ -954,7 +951,7 @@ type CatalogColumnInfo = (
 /// `source-table-name → set of catalog-known column names` and
 /// `source-table-name → set of catalog NOT NULL column names`.
 ///
-/// Used by the 1.4.5 filter-aware spurious-skip metadata to ground the
+/// Used by the filter-aware spurious-skip metadata to ground the
 /// analyzer's over-inclusive `imv_relevant_columns` (which attributes
 /// bare idents to every real source) in the actual catalog shape, so the
 /// persisted JSON only ever names columns that exist on the named source.
@@ -1327,8 +1324,7 @@ pub(crate) fn column_base_not_null(
 /// match otherwise. Left unproven, a column defaults to the safe form — never
 /// the reverse — because `(key) IN (SELECT ...)` is never TRUE for a NULL key:
 /// treating an actually-nullable key as safe would leave a phantom target row
-/// on source DELETE and abort the source UPDATE with a unique-index violation
-/// (2026-07-25 untreated_bugs report).
+/// on source DELETE and abort the source UPDATE with a unique-index violation.
 ///
 /// An explicit key can name any column, so it is the branch that actually
 /// needs this; the auto-detect paths (`resolve_unique_columns`'s PK probe,
@@ -1382,14 +1378,13 @@ pub(crate) fn provably_not_null_key_columns(
 /// only when it can never be NULL in the IMV:
 ///
 ///   * it is an equi-join operand of an INNER join (`dp.id = ss.dem_plan_id`
-///     keeps `ss.dem_plan_id` non-NULL — the yse.ivm_sop_forecast_view 405 s
-///     case), or
+///     keeps `ss.dem_plan_id` non-NULL), or
 ///   * its base column is declared NOT NULL in the catalog and its table is not
 ///     on the nullable side of an outer join.
 ///
 /// Promoting a column lets MERGE maintenance match keys with `=` (index-friendly)
 /// instead of `IS NOT DISTINCT FROM`. Doing so on a column that can later become
-/// NULL silently drops rows (docs/fuzz-findings.md findings #1 and #3), so the
+/// NULL silently drops rows, so the
 /// inference is deliberately conservative: anything not provably non-NULL (outer-
 /// join columns, unconstrained nullable columns, computed expressions, output
 /// aliases) is left alone and matched with the always-correct `IS NOT DISTINCT
@@ -1500,7 +1495,7 @@ pub(crate) fn persist_probed_not_null_columns(
 }
 
 /// SQL-callable wrapper: re-probe an existing IMV from data and update its
-/// stored aggregations. Used by the 1.4.4→1.4.5 migration to backfill
+/// stored aggregations. Backfills
 /// effectively-NOT-NULL columns the catalog missed on existing IMVs, and by
 /// operators after a data shape change. Returns a human-readable status.
 pub(crate) fn reflex_probe_not_null_columns_impl(view_name: &str) -> String {
