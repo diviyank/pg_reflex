@@ -566,3 +566,179 @@ fn v112_j_left_join_onto_a_plain_table_keeps_its_scoped_delta() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Source spellings: one relation named twice, an alias equal to the bare name,
+// and a same-named table of another schema
+// ---------------------------------------------------------------------------
+
+/// Runs INSERT, UPDATE and DELETE on every table of `writes` (each a
+/// `season TEXT, v INT` table with a serial `id`), comparing the IMV with its
+/// query after each. Returns "ok" or the per-step outcomes.
+fn v112_j_spelling_cell(imv: &str, query: &str, deferred: bool, writes: &[&str]) -> String {
+    let mode = if deferred { "DEFERRED" } else { "IMMEDIATE" };
+    let created = v112_j_try(&format!(
+        "SELECT create_reflex_ivm('{imv}', $v112sel${query}$v112sel$, NULL, 'UNLOGGED', '{mode}')"
+    ));
+    if created != "CREATE REFLEX INCREMENTAL VIEW" {
+        return format!("NOT-CREATED {created}");
+    }
+    let mut outcomes = vec![("create".to_string(), v112_j_oracle(imv, query))];
+    'tables: for table in writes {
+        let steps = [
+            ("ins", format!("INSERT INTO {table}(season, v) VALUES ('e',10),('y',20),('n',30)")),
+            ("upd", format!("UPDATE {table} SET v = v + 100 WHERE id = 1")),
+            ("move", format!("UPDATE {table} SET season = 'y' WHERE id = 3")),
+            ("del", format!("DELETE FROM {table} WHERE id = 2")),
+        ];
+        for (label, dml) in steps {
+            let label = format!("{table}:{label}");
+            let ran = v112_j_try_dml(&dml);
+            if ran != "OK" {
+                outcomes.push((label, ran));
+                break 'tables;
+            }
+            if deferred {
+                let flushed = v112_j_flush_every_source(imv);
+                if flushed.contains("RAISED") || flushed.contains("ERROR") {
+                    outcomes.push((label, flushed));
+                    break 'tables;
+                }
+            }
+            outcomes.push((label, v112_j_oracle(imv, query)));
+        }
+    }
+    if outcomes.iter().all(|(_, outcome)| outcome == "0") {
+        return "ok".to_string();
+    }
+    outcomes
+        .iter()
+        .map(|(label, outcome)| format!("{label}={outcome}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Flushes under the spelling each source is registered with.
+fn v112_j_flush_every_source(imv: &str) -> String {
+    v112_j_try(&format!(
+        "SELECT string_agg(reflex_flush_deferred(d), '; ') FROM (SELECT DISTINCT unnest(depends_on) AS d \
+         FROM public.__reflex_ivm_reference WHERE name = '{imv}') sources"
+    ))
+}
+
+fn v112_j_season_table(table: &str) {
+    Spi::run(&format!(
+        "CREATE TABLE {table}(id SERIAL PRIMARY KEY, season TEXT, v INT)"
+    ))
+    .expect("create");
+    Spi::run(&format!(
+        "INSERT INTO {table}(season, v) VALUES ('e',1),('y',2),('e',3)"
+    ))
+    .expect("seed");
+}
+
+fn v112_j_self_join_cell(tag: &str, left: &str, right: &str, deferred: bool) -> String {
+    let table = format!("v112_j_{tag}_t");
+    v112_j_season_table(&table);
+    let query = format!(
+        "SELECT a.season, COUNT(*) AS c, SUM(b.v) AS s FROM {} a JOIN {} b ON a.season = b.season GROUP BY a.season",
+        left.replace("{t}", &table),
+        right.replace("{t}", &table)
+    );
+    v112_j_spelling_cell(&format!("v112_j_{tag}"), &query, deferred, &[&table])
+}
+
+#[pg_test]
+fn v112_j_self_join_quoted_then_bare() {
+    assert_eq!(v112_j_self_join_cell("sj_qb", "\"{t}\"", "{t}", false), "ok");
+}
+
+#[pg_test]
+fn v112_j_self_join_bare_then_quoted() {
+    assert_eq!(v112_j_self_join_cell("sj_bq", "{t}", "\"{t}\"", false), "ok");
+}
+
+#[pg_test]
+fn v112_j_self_join_both_quoted() {
+    assert_eq!(v112_j_self_join_cell("sj_qq", "\"{t}\"", "\"{t}\"", false), "ok");
+}
+
+#[pg_test]
+fn v112_j_self_join_both_bare() {
+    assert_eq!(v112_j_self_join_cell("sj_bb", "{t}", "{t}", false), "ok");
+}
+
+#[pg_test]
+fn v112_j_self_join_bare_then_public_qualified() {
+    assert_eq!(v112_j_self_join_cell("sj_bp", "{t}", "public.{t}", false), "ok");
+}
+
+#[pg_test]
+fn v112_j_self_join_filter_on_one_alias() {
+    v112_j_season_table("v112_j_sj_w_t");
+    let query = "SELECT a.season, COUNT(*) AS c, SUM(b.v) AS s FROM v112_j_sj_w_t a \
+                 JOIN v112_j_sj_w_t b ON a.season = b.season WHERE a.v > 1 GROUP BY a.season";
+    assert_eq!(
+        crate::create_reflex_ivm("v112_j_sj_w", query, None, None, None, None),
+        "CREATE REFLEX INCREMENTAL VIEW"
+    );
+    assert_imv_correct("v112_j_sj_w", query);
+    // Row 1 fails the filter as `a` before and after, and feeds SUM(b.v) as `b`.
+    Spi::run("UPDATE v112_j_sj_w_t SET season = 'y' WHERE id = 1").expect("move");
+    assert_imv_correct("v112_j_sj_w", query);
+    Spi::run("UPDATE v112_j_sj_w_t SET v = 0 WHERE id = 1").expect("update");
+    assert_imv_correct("v112_j_sj_w", query);
+    Spi::run("DELETE FROM v112_j_sj_w_t WHERE id = 1").expect("delete");
+    assert_imv_correct("v112_j_sj_w", query);
+}
+
+#[pg_test]
+fn v112_j_self_join_quoted_then_bare_deferred() {
+    assert_eq!(v112_j_self_join_cell("sj_qb_d", "\"{t}\"", "{t}", true), "ok");
+}
+
+#[pg_test]
+fn v112_j_self_join_bare_then_quoted_deferred() {
+    assert_eq!(v112_j_self_join_cell("sj_bq_d", "{t}", "\"{t}\"", true), "ok");
+}
+
+fn v112_j_schema_self_join_cell(tag: &str, left: &str, right: &str, deferred: bool) -> String {
+    let schema = format!("v112_j_{tag}_s");
+    Spi::run(&format!("CREATE SCHEMA {schema}")).expect("schema");
+    v112_j_season_table(&format!("{schema}.t"));
+    let query = format!(
+        "SELECT a.season, COUNT(*) AS c, SUM(b.v) AS s FROM {} a JOIN {} b ON a.season = b.season GROUP BY a.season",
+        left.replace("{s}", &schema),
+        right.replace("{s}", &schema)
+    );
+    v112_j_spelling_cell(
+        &format!("v112_j_{tag}"),
+        &query,
+        deferred,
+        &[&format!("{schema}.t")],
+    )
+}
+
+#[pg_test]
+fn v112_j_schema_self_join_bare_then_fully_quoted() {
+    assert_eq!(
+        v112_j_schema_self_join_cell("ssj_bq", "{s}.t", "\"{s}\".\"t\"", false),
+        "ok"
+    );
+}
+
+#[pg_test]
+fn v112_j_schema_self_join_quoted_schema_then_quoted_table() {
+    assert_eq!(
+        v112_j_schema_self_join_cell("ssj_qq", "\"{s}\".t", "{s}.\"t\"", false),
+        "ok"
+    );
+}
+
+#[pg_test]
+fn v112_j_schema_self_join_bare_then_fully_quoted_deferred() {
+    assert_eq!(
+        v112_j_schema_self_join_cell("ssj_bq_d", "{s}.t", "\"{s}\".\"t\"", true),
+        "ok"
+    );
+}

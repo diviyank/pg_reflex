@@ -323,13 +323,20 @@ pub(super) fn rewritten_source_spellings(source_table: &str) -> Vec<String> {
 /// `source_table`. Recognises every spelling the rewrite replaces, and any
 /// other placement of double quotes around the same name, so a guard built on
 /// it can never miss a reference the rewrite would swap for a transition table.
+/// An unqualified source is registered that way only when it lives in `public`
+/// (or does not resolve), so `public.<source>` names it too.
 /// Case-sensitive: callers fold `token` and `source_table` the same way first.
 pub fn token_names_source(token: &str, source_table: &str) -> bool {
     let unquoted_token = token.replace('"', "");
     let unquoted_source = source_table.replace('"', "");
     let unquoted_bare = split_qualified(source_table).1.replace('"', "");
+    let names_unqualified_source_in_public = !unquoted_source.contains('.')
+        && unquoted_token
+            .strip_prefix("public.")
+            .is_some_and(|bare| bare == unquoted_source);
     unquoted_token == unquoted_source
         || unquoted_token == unquoted_bare
+        || names_unqualified_source_in_public
         || rewritten_source_spellings(source_table)
             .iter()
             .any(|spelling| spelling == token)
