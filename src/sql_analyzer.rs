@@ -529,11 +529,11 @@ fn expr_contains_call(
             else_result,
             ..
         } => {
-            operand.as_deref().is_some_and(&recurse)
+            operand.as_deref().is_some_and(recurse)
                 || conditions
                     .iter()
                     .any(|cw| recurse(&cw.condition) || recurse(&cw.result))
-                || else_result.as_deref().is_some_and(&recurse)
+                || else_result.as_deref().is_some_and(recurse)
         }
         Expr::Cast { expr: inner, .. } => recurse(inner),
         _ => false,
