@@ -1149,7 +1149,11 @@ pub(crate) fn is_simple_col_ref(s: &str) -> bool {
 /// single-quoted string literals.
 pub(crate) fn split_top_level_and(cond: &str) -> Vec<String> {
     let bytes = cond.as_bytes();
-    let upper = cond.to_uppercase();
+    let starts_and_keyword = |at: usize| {
+        bytes
+            .get(at..at + 5)
+            .is_some_and(|window| window.eq_ignore_ascii_case(b" AND "))
+    };
     let mut parts = Vec::new();
     let mut depth = 0i32;
     let mut in_str = false;
@@ -1169,7 +1173,7 @@ pub(crate) fn split_top_level_and(cond: &str) -> Vec<String> {
             '(' => depth += 1,
             ')' => depth -= 1,
             _ => {
-                if depth == 0 && upper[i..].starts_with(" AND ") {
+                if depth == 0 && starts_and_keyword(i) {
                     parts.push(cond[start..i].to_string());
                     i += 5;
                     start = i;

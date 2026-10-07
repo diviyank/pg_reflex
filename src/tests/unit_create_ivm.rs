@@ -313,3 +313,91 @@ fn test_keyless_warning_lists_only_unmapped_join_sources() {
         "{msg}"
     );
 }
+
+// ---- split_top_level_and: offsets stay valid next to non-ASCII text ----
+
+fn legacy_split_top_level_and(cond: &str) -> Vec<String> {
+    let bytes = cond.as_bytes();
+    let upper = cond.to_uppercase();
+    let mut parts = Vec::new();
+    let mut depth = 0i32;
+    let mut in_str = false;
+    let mut start = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let c = bytes[i] as char;
+        if in_str {
+            if c == '\'' {
+                in_str = false;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            '\'' => in_str = true,
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            _ => {
+                if depth == 0 && upper[i..].starts_with(" AND ") {
+                    parts.push(cond[start..i].to_string());
+                    i += 5;
+                    start = i;
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+    parts.push(cond[start..].to_string());
+    parts
+}
+
+#[test]
+fn split_and_after_literal_that_grows_when_uppercased() {
+    assert_eq!(
+        split_top_level_and("s.tag <> 'ŉ' AND xb.k = s.xk"),
+        vec!["s.tag <> 'ŉ'", "xb.k = s.xk"]
+    );
+}
+
+#[test]
+fn split_and_after_literal_that_shrinks_when_uppercased() {
+    assert_eq!(
+        split_top_level_and("s.tag <> 'Kış' AND xb.k = s.xk"),
+        vec!["s.tag <> 'Kış'", "xb.k = s.xk"]
+    );
+}
+
+#[test]
+fn split_and_with_multibyte_identifier_outside_literal() {
+    assert_eq!(
+        split_top_level_and("d.\"clé\" = s.kind and d.été = s.ŉ AND d.x = s.y"),
+        vec!["d.\"clé\" = s.kind", "d.été = s.ŉ", "d.x = s.y"]
+    );
+}
+
+#[test]
+fn split_and_matches_legacy_on_ascii_conditions() {
+    const FRAGMENTS: &[&str] = &[
+        " AND ", " and ", " And ", " OR ", "a.x", "b.y", " = ", " <> ", "'", "''", "' AND '", "(",
+        ")", " ", "AND", "1", "\"q\"", "sand ", " andy",
+    ];
+    let mut state = 0x5eed_u64;
+    let mut below = |bound: usize| {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        ((state >> 33) as usize) % bound
+    };
+    let mut split_cases = 0;
+    for _ in 0..5000 {
+        let count = 1 + below(12);
+        let cond: String = (0..count)
+            .map(|_| FRAGMENTS[below(FRAGMENTS.len())])
+            .collect();
+        let expected = legacy_split_top_level_and(&cond);
+        assert_eq!(split_top_level_and(&cond), expected, "cond: {cond:?}");
+        split_cases += usize::from(expected.len() > 1);
+    }
+    assert!(split_cases > 500, "split only {split_cases}");
+}

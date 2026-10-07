@@ -1492,3 +1492,89 @@ fn cov_legacy_fallback_build_target_with_distinct_no_count() {
     let ddl = build_target_table_ddl("legacy_v2", &plan, &types, false);
     assert!(ddl.contains("legacy_v2"));
 }
+
+fn legacy_strip_coalesce_multiplier_to_x(expr: &str) -> Option<String> {
+    let lc = expr.to_lowercase();
+    let needle = " * coalesce(";
+    let idx = lc.find(needle)?;
+    let x = expr[..idx].trim().to_string();
+    let coalesce_start = idx + needle.len();
+    let bytes = expr.as_bytes();
+    let mut depth = 1usize;
+    let mut end = None;
+    for (i, b) in bytes.iter().enumerate().skip(coalesce_start) {
+        match b {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    end = Some(i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let coalesce_end = end?;
+    let args_str = &expr[coalesce_start..coalesce_end];
+    let last_comma = find_top_level_last_comma(args_str)?;
+    let last_arg = args_str[last_comma + 1..].trim();
+    if !is_non_null_literal(last_arg) {
+        return None;
+    }
+    Some(x)
+}
+
+#[test]
+fn coalesce_multiplier_after_chars_that_grow_when_lowercased() {
+    assert_eq!(
+        strip_coalesce_multiplier_to_x("\"İİd\" * COALESCE(m, 1)"),
+        Some("\"İİd\"".to_string())
+    );
+}
+
+#[test]
+fn coalesce_multiplier_matches_legacy_on_ascii_expressions() {
+    const LEFT_OPERANDS: [&str; 5] = ["x", "(a + b)", "f(x)", "", "x * y"];
+    const OPERATORS: [&str; 5] = [
+        " * COALESCE(",
+        " * coalesce(",
+        " * Coalesce(",
+        " + COALESCE(",
+        "*COALESCE(",
+    ];
+    const FIRST_ARGUMENTS: [&str; 4] = ["m", "f(m, 2)", "(m)", ""];
+    const SEPARATORS: [&str; 3] = [", ", ",", ""];
+    const LAST_ARGUMENTS: [&str; 8] = ["1", "0", "'a'", "TRUE", "false", "NULL", "n", "f(1)"];
+    const CLOSINGS: [&str; 3] = [")", "", "))"];
+    const TAILS: [&str; 3] = ["", " + 1", " * COALESCE(z, 0)"];
+    let mut compared = 0;
+    let mut recognised = 0;
+    for left in LEFT_OPERANDS {
+        for operator in OPERATORS {
+            for first in FIRST_ARGUMENTS {
+                for separator in SEPARATORS {
+                    for last in LAST_ARGUMENTS {
+                        for closing in CLOSINGS {
+                            for tail in TAILS {
+                                let expr = format!(
+                                    "{left}{operator}{first}{separator}{last}{closing}{tail}"
+                                );
+                                let expected = legacy_strip_coalesce_multiplier_to_x(&expr);
+                                assert_eq!(
+                                    strip_coalesce_multiplier_to_x(&expr),
+                                    expected,
+                                    "expr: {expr:?}"
+                                );
+                                compared += 1;
+                                recognised += usize::from(expected.is_some());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(compared, 21600);
+    assert!(recognised > 1000, "recognised only {recognised}");
+}
