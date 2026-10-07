@@ -1,9 +1,9 @@
 use serde::{Deserialize, Serialize};
-use sqlparser::ast::{Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments};
+use sqlparser::ast::{Expr, FunctionArg, FunctionArgExpr, FunctionArguments};
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 
-use crate::sql_analyzer::{detect_aggregate, AggregateKind, SqlAnalysis};
+use crate::sql_analyzer::{detect_aggregate, resolve_aggregate_call, AggregateKind, SqlAnalysis};
 
 /// A column in the intermediate (unlogged) table storing partial aggregate state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -338,6 +338,31 @@ impl AggregationPlan {
                     mapping.intermediate_expr = stripped.to_string();
                 }
             }
+            // A reading nested in a larger expression keeps its CASE. A counter is
+            // elided only when it always equals the group's row count, so the
+            // reading tests that instead.
+            for count_name in &to_remove {
+                if redirect.contains_key(count_name) {
+                    continue;
+                }
+                let elided = format!("\"{}\"", count_name);
+                mapping.intermediate_expr = mapping
+                    .intermediate_expr
+                    .replace(&elided, "\"__ivm_count\"");
+            }
+        }
+    }
+
+    /// Gives every nested reading of `sum_column` the type `SUM` itself returns.
+    /// The column stores NUMERIC, under which `SUM(int_col) / 2` would divide
+    /// exactly where PostgreSQL divides integers.
+    pub fn read_nested_sum_as(&mut self, sum_column: &str, pg_type: &str) {
+        let untyped = format!("THEN {} END", sum_branch(sum_column));
+        let typed = format!("THEN {}::{} END", sum_branch(sum_column), pg_type);
+        for mapping in &mut self.end_query_mappings {
+            if mapping.aggregate_type == "DERIVED" {
+                mapping.intermediate_expr = mapping.intermediate_expr.replace(&untyped, &typed);
+            }
         }
     }
 }
@@ -589,88 +614,22 @@ fn rewrite_expr_aggregates(
 ) -> String {
     match expr {
         Expr::Function(f) if f.over.is_none() => {
-            let func_name = f.name.to_string();
-            if let Some(kind) = detect_aggregate(&func_name) {
-                let arg = first_arg_string(f);
-                let arg_sanitized = sanitize_for_col_name(&arg);
-                let col_name = match kind {
-                    AggregateKind::Sum => format!("__sum_{}", arg_sanitized),
-                    AggregateKind::Count | AggregateKind::CountStar => {
-                        format!("__count_{}", arg_sanitized)
-                    }
-                    AggregateKind::CountDistinct => {
-                        format!("__count_distinct_{}", arg_sanitized)
-                    }
-                    AggregateKind::Min => format!("__min_{}", arg_sanitized),
-                    AggregateKind::Max => format!("__max_{}", arg_sanitized),
-                    AggregateKind::BoolOr => {
-                        let true_col = format!("__bool_or_{}_true_count", arg_sanitized);
-                        let nonnull_col = format!("__bool_or_{}_nonnull_count", arg_sanitized);
-                        let (has_true, has_nonnull) = {
-                            let all: Vec<&str> = existing
-                                .iter()
-                                .chain(new_cols.iter())
-                                .map(|ic| ic.name.as_str())
-                                .collect();
-                            (
-                                all.contains(&true_col.as_str()),
-                                all.contains(&nonnull_col.as_str()),
-                            )
-                        };
-                        if !has_true {
-                            new_cols.push(IntermediateColumn {
-                                name: true_col.clone(),
-                                pg_type: "BIGINT".to_string(),
-                                source_aggregate: "SUM".to_string(),
-                                source_arg: format!("CASE WHEN ({}) THEN 1 ELSE 0 END", arg),
-                                topk_k: None,
-                            });
-                        }
-                        if !has_nonnull {
-                            new_cols.push(IntermediateColumn {
-                                name: nonnull_col.clone(),
-                                pg_type: "BIGINT".to_string(),
-                                source_aggregate: "SUM".to_string(),
-                                source_arg: format!(
-                                    "CASE WHEN ({}) IS NOT NULL THEN 1 ELSE 0 END",
-                                    arg
-                                ),
-                                topk_k: None,
-                            });
-                        }
-                        return format!(
-                            "CASE WHEN \"{}\" > 0 THEN \"{}\" > 0 ELSE NULL END",
-                            nonnull_col, true_col
-                        );
-                    }
-                    AggregateKind::Avg => format!("__sum_{}", arg_sanitized),
+            if let Some(call) = resolve_aggregate_call(f) {
+                let arg = call.arg.as_deref().unwrap_or("*");
+                let Some(reading) = aggregate_reading(&call.kind, arg) else {
+                    return f.to_string();
                 };
-                // Add intermediate column if not already present
-                let all_names: Vec<&str> = existing
-                    .iter()
-                    .chain(new_cols.iter())
-                    .map(|ic| ic.name.as_str())
-                    .collect();
-                if !all_names.contains(&col_name.as_str()) {
-                    let (source_agg, source_arg) = match kind {
-                        AggregateKind::Avg => ("SUM".to_string(), arg.clone()),
-                        AggregateKind::CountStar => ("COUNT".to_string(), "*".to_string()),
-                        _ => (func_name.to_uppercase(), arg.clone()),
-                    };
-                    new_cols.push(IntermediateColumn {
-                        name: col_name.clone(),
-                        pg_type: match kind {
-                            AggregateKind::Count
-                            | AggregateKind::CountStar
-                            | AggregateKind::CountDistinct => "BIGINT".to_string(),
-                            _ => "NUMERIC".to_string(),
-                        },
-                        source_aggregate: source_agg,
-                        source_arg,
-                        topk_k: None,
-                    });
+                let nested_expr = reading.nested_expr();
+                for column in reading.columns {
+                    let already_planned = existing
+                        .iter()
+                        .chain(new_cols.iter())
+                        .any(|ic| ic.name == column.name);
+                    if !already_planned {
+                        new_cols.push(column);
+                    }
                 }
-                return format!("\"{}\"", col_name);
+                return nested_expr;
             }
             // Not an aggregate function — recursively rewrite arguments
             // (handles COALESCE(SUM(x), 0), GREATEST(SUM(a), SUM(b)), etc.)
@@ -749,21 +708,141 @@ fn rewrite_expr_aggregates(
     }
 }
 
-/// Extract the first argument of a function as a string.
-fn first_arg_string(f: &Function) -> String {
-    if let FunctionArguments::List(list) = &f.args {
-        if let Some(arg) = list.args.first() {
-            match arg {
-                FunctionArg::Unnamed(FunctionArgExpr::Wildcard) => return "*".to_string(),
-                FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => return e.to_string(),
-                FunctionArg::Unnamed(expr) => return expr.to_string(),
-                FunctionArg::Named { arg, .. } | FunctionArg::ExprNamed { arg, .. } => {
-                    return arg.to_string()
-                }
-            }
+/// The intermediate columns one aggregate needs and the end-query expression
+/// that reads them back. An aggregate at top level and the same aggregate nested
+/// in an expression both plan through this, so they cannot disagree.
+struct AggregateReading {
+    columns: Vec<IntermediateColumn>,
+    end_expr: String,
+    aggregate_type: &'static str,
+}
+
+impl AggregateReading {
+    /// `end_expr` as an operand of a larger expression.
+    fn nested_expr(&self) -> String {
+        let reads_one_column = self.columns.iter().any(|ic| ic.name == self.end_expr);
+        if reads_one_column {
+            format!("\"{}\"", self.end_expr)
+        } else {
+            format!("({})", self.end_expr)
         }
     }
-    "*".to_string()
+}
+
+fn intermediate_column(
+    name: &str,
+    pg_type: &str,
+    source_aggregate: &str,
+    source_arg: &str,
+) -> IntermediateColumn {
+    IntermediateColumn {
+        name: name.to_string(),
+        pg_type: pg_type.to_string(),
+        source_aggregate: source_aggregate.to_string(),
+        source_arg: source_arg.to_string(),
+        topk_k: None,
+    }
+}
+
+/// `None` for `COUNT(DISTINCT ...)`, which extends the intermediate key instead
+/// of adding a column.
+fn aggregate_reading(kind: &AggregateKind, arg: &str) -> Option<AggregateReading> {
+    let arg_sanitized = sanitize_for_col_name(arg);
+    let reading = match kind {
+        AggregateKind::Sum => {
+            let sum_col = format!("__sum_{}", arg_sanitized);
+            // Counts the non-NULL contributors: with none left the SUM is NULL, not 0.
+            let count_col = format!("__nonnull_count_{}", arg_sanitized);
+            AggregateReading {
+                end_expr: sum_reading(&count_col, &sum_col),
+                columns: vec![
+                    intermediate_column(&sum_col, "NUMERIC", "SUM", arg),
+                    intermediate_column(&count_col, "BIGINT", "COUNT", arg),
+                ],
+                aggregate_type: "SUM",
+            }
+        }
+        AggregateKind::Count => {
+            let col_name = format!("__count_{}", arg_sanitized);
+            AggregateReading {
+                columns: vec![intermediate_column(&col_name, "BIGINT", "COUNT", arg)],
+                end_expr: col_name,
+                aggregate_type: "COUNT",
+            }
+        }
+        AggregateKind::CountStar => AggregateReading {
+            columns: vec![intermediate_column("__count_star", "BIGINT", "COUNT", "*")],
+            end_expr: "__count_star".to_string(),
+            aggregate_type: "COUNT",
+        },
+        AggregateKind::Avg => {
+            let sum_col = format!("__sum_{}", arg_sanitized);
+            let count_col = format!("__count_{}", arg_sanitized);
+            AggregateReading {
+                end_expr: format!("{} / NULLIF({}, 0)", sum_col, count_col),
+                columns: vec![
+                    intermediate_column(&sum_col, "NUMERIC", "SUM", arg),
+                    intermediate_column(&count_col, "BIGINT", "COUNT", arg),
+                ],
+                aggregate_type: "AVG",
+            }
+        }
+        AggregateKind::Min => {
+            let col_name = format!("__min_{}", arg_sanitized);
+            AggregateReading {
+                columns: vec![intermediate_column(&col_name, "NUMERIC", "MIN", arg)],
+                end_expr: col_name,
+                aggregate_type: "MIN",
+            }
+        }
+        AggregateKind::Max => {
+            let col_name = format!("__max_{}", arg_sanitized);
+            AggregateReading {
+                columns: vec![intermediate_column(&col_name, "NUMERIC", "MAX", arg)],
+                end_expr: col_name,
+                aggregate_type: "MAX",
+            }
+        }
+        AggregateKind::BoolOr => {
+            let true_col = format!("__bool_or_{}_true_count", arg_sanitized);
+            let nonnull_col = format!("__bool_or_{}_nonnull_count", arg_sanitized);
+            AggregateReading {
+                end_expr: format!(
+                    "CASE WHEN \"{}\" > 0 THEN \"{}\" > 0 ELSE NULL END",
+                    nonnull_col, true_col
+                ),
+                columns: vec![
+                    intermediate_column(
+                        &true_col,
+                        "BIGINT",
+                        "SUM",
+                        &format!("CASE WHEN ({}) THEN 1 ELSE 0 END", arg),
+                    ),
+                    intermediate_column(
+                        &nonnull_col,
+                        "BIGINT",
+                        "SUM",
+                        &format!("CASE WHEN ({}) IS NOT NULL THEN 1 ELSE 0 END", arg),
+                    ),
+                ],
+                aggregate_type: "BOOL_OR",
+            }
+        }
+        AggregateKind::CountDistinct => return None,
+    };
+    Some(reading)
+}
+
+fn sum_reading(count_col: &str, sum_col: &str) -> String {
+    format!(
+        "CASE WHEN \"{}\" > 0 THEN {} END",
+        count_col,
+        sum_branch(sum_col)
+    )
+}
+
+fn sum_branch(sum_col: &str) -> String {
+    format!("\"{}\"", sum_col)
 }
 
 /// Build an AggregationPlan from a SqlAnalysis.
@@ -827,7 +906,6 @@ fn plan_aggregation_inner(analysis: &SqlAnalysis) -> AggregationPlan {
         };
 
         let arg = col.aggregate_arg.as_deref().unwrap_or("*");
-        let arg_sanitized = sanitize_for_col_name(arg);
 
         // Determine the user-facing alias for the output
         let output_alias = crate::query_decomposer::normalized_column_name(
@@ -836,171 +914,28 @@ fn plan_aggregation_inner(analysis: &SqlAnalysis) -> AggregationPlan {
 
         let cast_type = col.cast_type.clone();
 
-        match agg {
-            AggregateKind::Sum => {
-                let sum_col = format!("__sum_{}", arg_sanitized);
-                let count_col = format!("__nonnull_count_{}", arg_sanitized);
-                intermediate_columns.push(IntermediateColumn {
-                    name: sum_col.clone(),
-                    pg_type: "NUMERIC".to_string(),
-                    source_aggregate: "SUM".to_string(),
-                    source_arg: arg.to_string(),
-                    topk_k: None,
-                });
-                // Companion COUNT(col) tracks non-NULL contributors.
-                // When this drops to 0, SUM should be NULL (not 0).
-                // Only add if not already present from another aggregate.
-                if !intermediate_columns.iter().any(|ic| ic.name == count_col) {
-                    intermediate_columns.push(IntermediateColumn {
-                        name: count_col.clone(),
-                        pg_type: "BIGINT".to_string(),
-                        source_aggregate: "COUNT".to_string(),
-                        source_arg: arg.to_string(),
-                        topk_k: None,
-                    });
-                }
-                // End query: CASE WHEN non-null count > 0 THEN sum END (returns NULL when all values are NULL)
-                end_query_mappings.push(EndQueryMapping {
-                    intermediate_expr: format!(
-                        "CASE WHEN \"{}\" > 0 THEN \"{}\" END",
-                        count_col, sum_col
-                    ),
-                    output_alias,
-                    aggregate_type: "SUM".to_string(),
-                    cast_type,
-                });
-            }
-            AggregateKind::Count => {
-                let col_name = format!("__count_{}", arg_sanitized);
-                intermediate_columns.push(IntermediateColumn {
-                    name: col_name.clone(),
-                    pg_type: "BIGINT".to_string(),
-                    source_aggregate: "COUNT".to_string(),
-                    source_arg: arg.to_string(),
-                    topk_k: None,
-                });
-                end_query_mappings.push(EndQueryMapping {
-                    intermediate_expr: col_name,
-                    output_alias,
-                    aggregate_type: "COUNT".to_string(),
-                    cast_type,
-                });
-            }
-            AggregateKind::CountStar => {
-                let col_name = "__count_star".to_string();
-                intermediate_columns.push(IntermediateColumn {
-                    name: col_name.clone(),
-                    pg_type: "BIGINT".to_string(),
-                    source_aggregate: "COUNT".to_string(),
-                    source_arg: "*".to_string(),
-                    topk_k: None,
-                });
-                end_query_mappings.push(EndQueryMapping {
-                    intermediate_expr: col_name,
-                    output_alias,
-                    aggregate_type: "COUNT".to_string(),
-                    cast_type,
-                });
-            }
-            AggregateKind::Avg => {
-                // AVG decomposes to SUM + COUNT
-                let sum_col = format!("__sum_{}", arg_sanitized);
-                let count_col = format!("__count_{}", arg_sanitized);
-                intermediate_columns.push(IntermediateColumn {
-                    name: sum_col.clone(),
-                    pg_type: "NUMERIC".to_string(),
-                    source_aggregate: "SUM".to_string(),
-                    source_arg: arg.to_string(),
-                    topk_k: None,
-                });
-                intermediate_columns.push(IntermediateColumn {
-                    name: count_col.clone(),
-                    pg_type: "BIGINT".to_string(),
-                    source_aggregate: "COUNT".to_string(),
-                    source_arg: arg.to_string(),
-                    topk_k: None,
-                });
-                end_query_mappings.push(EndQueryMapping {
-                    intermediate_expr: format!("{} / NULLIF({}, 0)", sum_col, count_col),
-                    output_alias,
-                    aggregate_type: "AVG".to_string(),
-                    cast_type,
-                });
-            }
-            AggregateKind::Min => {
-                let col_name = format!("__min_{}", arg_sanitized);
-                intermediate_columns.push(IntermediateColumn {
-                    name: col_name.clone(),
-                    pg_type: "NUMERIC".to_string(),
-                    source_aggregate: "MIN".to_string(),
-                    source_arg: arg.to_string(),
-                    topk_k: None,
-                });
-                end_query_mappings.push(EndQueryMapping {
-                    intermediate_expr: col_name,
-                    output_alias,
-                    aggregate_type: "MIN".to_string(),
-                    cast_type,
-                });
-            }
-            AggregateKind::Max => {
-                let col_name = format!("__max_{}", arg_sanitized);
-                intermediate_columns.push(IntermediateColumn {
-                    name: col_name.clone(),
-                    pg_type: "NUMERIC".to_string(),
-                    source_aggregate: "MAX".to_string(),
-                    source_arg: arg.to_string(),
-                    topk_k: None,
-                });
-                end_query_mappings.push(EndQueryMapping {
-                    intermediate_expr: col_name,
-                    output_alias,
-                    aggregate_type: "MAX".to_string(),
-                    cast_type,
-                });
-            }
-            AggregateKind::BoolOr => {
-                let true_col = format!("__bool_or_{}_true_count", arg_sanitized);
-                let nonnull_col = format!("__bool_or_{}_nonnull_count", arg_sanitized);
-                intermediate_columns.push(IntermediateColumn {
-                    name: true_col.clone(),
-                    pg_type: "BIGINT".to_string(),
-                    source_aggregate: "SUM".to_string(),
-                    source_arg: format!("CASE WHEN ({}) THEN 1 ELSE 0 END", arg),
-                    topk_k: None,
-                });
-                intermediate_columns.push(IntermediateColumn {
-                    name: nonnull_col.clone(),
-                    pg_type: "BIGINT".to_string(),
-                    source_aggregate: "SUM".to_string(),
-                    source_arg: format!("CASE WHEN ({}) IS NOT NULL THEN 1 ELSE 0 END", arg),
-                    topk_k: None,
-                });
-                end_query_mappings.push(EndQueryMapping {
-                    intermediate_expr: format!(
-                        "CASE WHEN \"{}\" > 0 THEN \"{}\" > 0 ELSE NULL END",
-                        nonnull_col, true_col
-                    ),
-                    output_alias,
-                    aggregate_type: "BOOL_OR".to_string(),
-                    cast_type,
-                });
-            }
-            AggregateKind::CountDistinct => {
-                // COUNT(DISTINCT val): the intermediate uses (grp, val) as compound key.
-                // The end_query counts non-NULL distinct values per original GROUP BY
-                // using COUNT(val). COUNT(val) (not COUNT(*)) matches Postgres
-                // semantics — COUNT(DISTINCT val) ignores NULLs.
-                count_distinct_columns.push(arg.to_string());
-                let arg_norm = crate::query_decomposer::normalized_column_name(arg);
-                end_query_mappings.push(EndQueryMapping {
-                    intermediate_expr: format!("COUNT(\"{}\")", arg_norm),
-                    output_alias,
-                    aggregate_type: "COUNT".to_string(),
-                    cast_type,
-                });
-            }
-        }
+        let Some(reading) = aggregate_reading(agg, arg) else {
+            // COUNT(DISTINCT val): the intermediate uses (grp, val) as compound key.
+            // The end_query counts non-NULL distinct values per original GROUP BY
+            // using COUNT(val). COUNT(val) (not COUNT(*)) matches Postgres
+            // semantics — COUNT(DISTINCT val) ignores NULLs.
+            count_distinct_columns.push(arg.to_string());
+            let arg_norm = crate::query_decomposer::normalized_column_name(arg);
+            end_query_mappings.push(EndQueryMapping {
+                intermediate_expr: format!("COUNT(\"{}\")", arg_norm),
+                output_alias,
+                aggregate_type: "COUNT".to_string(),
+                cast_type,
+            });
+            continue;
+        };
+        intermediate_columns.extend(reading.columns);
+        end_query_mappings.push(EndQueryMapping {
+            intermediate_expr: reading.end_expr,
+            output_alias,
+            aggregate_type: reading.aggregate_type.to_string(),
+            cast_type,
+        });
     }
 
     // Auto-add intermediate columns for aggregates referenced in HAVING but not in SELECT
