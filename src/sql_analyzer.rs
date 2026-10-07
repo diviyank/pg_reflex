@@ -90,6 +90,19 @@ pub struct SetOperationInfo {
     pub operand_sqls: Vec<String>,
 }
 
+pub(crate) fn bare_function_name(name: &sqlparser::ast::ObjectName) -> String {
+    let full = name.to_string();
+    full.rsplit('.')
+        .next()
+        .unwrap_or(&full)
+        .trim_matches('"')
+        .to_lowercase()
+}
+
+const DISTINCT_AGGREGATE_REJECTION: &str = "DISTINCT modifier on SUM/AVG/MIN/MAX/BOOL_OR is not supported. \
+     Only COUNT(DISTINCT col) is supported. Use a CTE with SELECT DISTINCT \
+     to pre-deduplicate: WITH d AS (SELECT DISTINCT grp, val FROM t) SELECT grp, SUM(val) FROM d GROUP BY grp";
+
 #[derive(Debug, Default)]
 pub struct SqlAnalysis {
     pub ctes: Vec<CteInfo>,
@@ -118,6 +131,7 @@ pub struct SqlAnalysis {
     pub has_within_group: bool,
     pub has_scalar_subquery: bool,
     pub unsupported_aggregates: Vec<String>,
+    pub distinct_aggregates: Vec<String>,
     /// Set when any non-deterministic function (NOW, RANDOM, etc.) is found
     /// anywhere in the query — SELECT, WHERE, HAVING, JOIN ON, ORDER BY all
     /// flow through `pre_visit_expr`. The flag name is kept for backwards
@@ -211,6 +225,9 @@ impl SqlAnalysis {
                 names
             ));
         }
+        if !self.distinct_aggregates.is_empty() {
+            return Some(DISTINCT_AGGREGATE_REJECTION.into());
+        }
         None
     }
 }
@@ -256,6 +273,18 @@ impl<'a> Visitor for AnalysisVisitor<'a> {
                     // Detect WITHIN GROUP (ordered-set aggregates)
                     if !f.within_group.is_empty() {
                         self.analysis.has_within_group = true;
+                    }
+                    if let FunctionArguments::List(list) = &f.args {
+                        if list.duplicate_treatment
+                            == Some(sqlparser::ast::DuplicateTreatment::Distinct)
+                        {
+                            let bare = bare_function_name(&f.name);
+                            if matches!(bare.as_str(), "sum" | "avg" | "min" | "max" | "bool_or")
+                                && !self.analysis.distinct_aggregates.contains(&bare)
+                            {
+                                self.analysis.distinct_aggregates.push(bare);
+                            }
+                        }
                     }
                     let func_name = f.name.to_string().to_uppercase();
                     // Detect unsupported aggregate functions
@@ -517,7 +546,6 @@ fn extract_select_column(expr: &Expr, alias: Option<String>) -> SelectColumn {
                 {
                     kind = AggregateKind::CountDistinct;
                 }
-                // SUM(DISTINCT), AVG(DISTINCT), etc. are rejected in lib.rs via SQL string check
             }
             let mut aggregate_arg = if matches!(kind, AggregateKind::CountStar) {
                 Some("*".to_string())
