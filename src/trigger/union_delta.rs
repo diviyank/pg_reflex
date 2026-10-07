@@ -29,7 +29,7 @@ use std::ops::ControlFlow;
 
 /// Bare, unquoted, lower-cased final component of a possibly schema-qualified,
 /// possibly quoted identifier. `"schema"."Tbl"` -> `tbl`, `schema.tbl` -> `tbl`.
-fn bare_lower(name: &str) -> String {
+pub(super) fn bare_lower(name: &str) -> String {
     name.rsplit('.')
         .next()
         .unwrap_or(name)
@@ -59,7 +59,7 @@ impl Visitor for RelationRefFinder {
     }
 }
 
-fn references_source(node: &SetExpr, target_bare: &str) -> bool {
+pub(super) fn references_source(node: &impl Visit, target_bare: &str) -> bool {
     let mut finder = RelationRefFinder {
         target_bare: target_bare.to_string(),
         found: false,

@@ -118,8 +118,9 @@ pub(crate) fn follows_outer_join_keyword(bq_upper: &str, source_table: &str) -> 
 }
 
 /// Whether a write to `source_table` has no per-source delta, so the IMV is
-/// recomputed from `base_query`: the source is read more than once, or the
-/// query holds a RIGHT JOIN.
+/// recomputed from `base_query`: the source is read more than once, the query
+/// holds a RIGHT JOIN, or the source is read inside a derived table or a
+/// parenthesised join that a LEFT JOIN null-extends.
 ///
 /// A RIGHT JOIN is never scoped. The table before the keyword is the
 /// null-extended one, which `follows_outer_join_keyword` never inspects, and the
@@ -131,6 +132,7 @@ pub(crate) fn has_no_scoped_delta(base_query: &str, source_table: &str) -> bool 
     source_reference_count(base_query, source_table) > 1
         || bq_upper.contains("RIGHT JOIN")
         || bq_upper.contains("RIGHT OUTER")
+        || outer_join::source_inside_left_joined_subtree(&bq_upper, base_query, source_table)
 }
 
 /// Generates the SQL statements to apply a delta to an IMV.
@@ -645,6 +647,7 @@ pub(crate) mod deferred;
 mod dispatch;
 mod merge;
 mod ops;
+mod outer_join;
 mod scope;
 mod union_delta;
 
