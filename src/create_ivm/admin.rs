@@ -10,14 +10,12 @@ use crate::query_decomposer::{intermediate_table_name, quote_identifier};
 use crate::sql_analyzer::{analyze, SqlAnalysisError};
 use crate::validate_view_name;
 
-/// 1.4.5 — `reflex_compact_imv(view_name TEXT) RETURNS TEXT`.
+/// `reflex_compact_imv(view_name TEXT) RETURNS TEXT`.
 ///
-/// VACUUM FULL both the intermediate and target tables of an IMV. The
-/// 1.4.3→1.4.4 migration set fillfactor=70 on these tables but did not
-/// rewrite existing pages — HOT updates can only fire after pages have
-/// been written with the new fillfactor. Running VACUUM FULL once per
-/// table materializes the fillfactor immediately, restoring HOT-eligibility
-/// on legacy-populated IMVs.
+/// VACUUM FULL both the intermediate and target tables of an IMV. HOT updates
+/// can only fire on pages written with the table's fillfactor, so rewriting each
+/// table once materializes the fillfactor on IMVs populated before it was set,
+/// restoring HOT-eligibility.
 ///
 /// VACUUM FULL takes ACCESS EXCLUSIVE on the rewritten table; for
 /// multi-gigabyte IMVs this is a maintenance-window operation. Caller is
@@ -82,7 +80,7 @@ pub(crate) fn reflex_compact_imv_impl(view_name: &str) -> String {
     }
 }
 
-/// 1.4.5 — `reflex_compact_all_imv() RETURNS TEXT`.
+/// `reflex_compact_all_imv() RETURNS TEXT`.
 ///
 /// VACUUM FULL every enabled IMV's intermediate and target tables. Iterates
 /// the catalog in `(graph_depth, name)` order and dispatches to
@@ -152,18 +150,17 @@ pub(crate) fn reflex_compact_all_imv_impl() -> String {
     build_compact_all_summary(&names, &results, t0.elapsed().as_millis())
 }
 
-/// 1.4.5 — `reflex_rebuild_imv_metadata(view_name TEXT) RETURNS TEXT`.
+/// `reflex_rebuild_imv_metadata(view_name TEXT) RETURNS TEXT`.
 ///
 /// Re-analyzes an existing IMV's stored `base_query` and merges the newly
 /// computed `imv_relevant_columns` / `imv_relevant_where` maps into its
 /// `aggregations` JSON. Idempotent: existing fields (group_by_columns,
 /// intermediate_columns, end_query_mappings, not_null_columns, …) are NOT
-/// overwritten beyond the two new metadata maps.
+/// overwritten beyond the two metadata maps.
 ///
-/// Used by the 1.4.4→1.4.5 migration to backfill IMVs created before the
-/// filter-aware spurious-skip metadata was introduced. Also useful after a
-/// future analyzer extension shifts what falls into either map.
-///
+/// Backfills IMVs created before the filter-aware spurious-skip metadata
+/// existed. Also useful after an analyzer extension shifts what falls into
+/// either map.
 /// Returns a status string for telemetry.
 pub(crate) fn reflex_rebuild_imv_metadata_impl(view_name: &str) -> String {
     if let Err(msg) = validate_view_name(view_name) {
@@ -211,9 +208,8 @@ pub(crate) fn reflex_rebuild_imv_metadata_impl(view_name: &str) -> String {
         // analyzer attributes bare identifiers to every real source as a
         // safe-correctness move; if we serialize that raw, the trigger's
         // filter-aware-skip block SELECTs columns that don't exist on the
-        // source's transition table and errors at fire time. Mirror the
-        // 1.4.5 filter applied at create-time in the create_reflex_ivm
-        // aggregate path (search "1.4.5 — filter `imv_relevant_columns`").
+        // source's transition table and errors at fire time. This mirrors the
+        // filter applied at create-time in the create_reflex_ivm aggregate path.
         let froms_list: Vec<String> = analysis.sources.to_vec();
         let (_types, _nn, per_source_cols, _psnn) =
             query_column_types_from_catalog_with_per_source(client, &froms_list);
@@ -245,7 +241,7 @@ pub(crate) fn reflex_rebuild_imv_metadata_impl(view_name: &str) -> String {
         let n_cols_sources = relevant_cols.len();
         let n_where_sources = analysis.imv_relevant_where.len();
 
-        // 1.4.6 — also backfill source_join_keys for the bulk-INSERT /
+        // Also backfill source_join_keys for the bulk-INSERT /
         // bulk-DELETE / Path B paths. Rebuild a plan from base_query so we
         // can run the same build_source_join_keys logic the create path
         // uses. Single-source IMVs skip the call (no JOINs to mine).
@@ -324,23 +320,23 @@ pub(crate) fn reflex_rebuild_imv_metadata_impl(view_name: &str) -> String {
     }
 }
 
-/// 1.4.5 — `reflex_rebuild_triggers(source_table TEXT) RETURNS TEXT`.
+/// `reflex_rebuild_triggers(source_table TEXT) RETURNS TEXT`.
 ///
 /// Re-emits the four CREATE OR REPLACE FUNCTION + CREATE OR REPLACE TRIGGER
 /// statements for INSERT/DELETE/UPDATE/TRUNCATE on `source_table`, picking
-/// up the latest codegen (e.g. the 1.4.5 filter-aware spurious-skip block).
+/// up the latest codegen (e.g. the filter-aware spurious-skip block).
 ///
 /// Idempotent — `CREATE OR REPLACE` overwrites the existing function body
 /// without changing trigger identity.
 ///
-/// 1.4.6 — when `source_table` arrives unqualified (`'demand_planning'` from
+/// When `source_table` arrives unqualified (`'demand_planning'` from
 /// a legacy `depends_on` array), resolve the actual schema via `pg_class`
 /// instead of letting the DDL fall through to the caller's `search_path`.
-/// Without this, the 1.4.6 migration silently rebuilt triggers on
-/// `public.demand_planning` (which doesn't exist) when the real source was
-/// `alp.demand_planning`, then deferred-flush failures aborted every
-/// UPDATE in the session. If the bare name resolves to multiple schemas,
-/// return an error rather than guess.
+/// A guessed `public.demand_planning` would rebuild triggers on a table that
+/// doesn't exist while the real source is `alp.demand_planning`, and the
+/// deferred-flush failures would then abort every UPDATE in the session.
+/// If the bare name resolves to multiple schemas, return an error rather
+/// than guess.
 ///
 /// Returns a status string.
 pub(crate) fn reflex_rebuild_triggers_impl(source_table: &str) -> String {
@@ -396,13 +392,12 @@ pub(crate) fn reflex_rebuild_triggers_impl(source_table: &str) -> String {
     };
 
     let result: Result<usize, String> = Spi::connect_mut(|client| {
-        // 1.6.2: pick the correct trigger flavour by inspecting the live
+        // Pick the correct trigger flavour by inspecting the live
         // dependency graph.  If any enabled IMV depending on this source is
         // DEFERRED, the source's trigger function must use the deferred
         // body (which stages into `__reflex_delta_<src>`); otherwise the
-        // immediate body suffices.  Pre-1.6.2 this always emitted the
-        // immediate body, which silently broke deferred IMVs whose trigger
-        // had been rebuilt via this entry point.
+        // immediate body suffices. Emitting the immediate body for a deferred
+        // IMV would silently break it.
         let has_deferred = client
             .select(
                 "SELECT 1 FROM public.__reflex_ivm_reference \
@@ -430,17 +425,17 @@ pub(crate) fn reflex_rebuild_triggers_impl(source_table: &str) -> String {
                 .map_err(|e| format!("CREATE TRIGGER failed: {}", e))?;
         }
 
-        // PS-6 heal — a passthrough IMV references a per-(IMV, source) scratch
+        // Heal passthrough scratch tables: a passthrough IMV references a per-(IMV, source) scratch
         // pair (`__reflex_pt_new/old_<imv>_<source>`) that `passthrough_op_stmts`
         // emits TRUNCATE/INSERT against on every flush. If that pair is missing
-        // (an older create loop that didn't cover this source, a partial create,
+        // (a create loop that didn't cover this source, a partial create,
         // or a manual drop), every flush fails fast with 42P01, is swallowed as a
         // WARNING, and the IMV goes silently stale forever. Recreate the pair
         // idempotently (`build_passthrough_scratch_ddls` is CREATE IF NOT EXISTS)
         // for every enabled passthrough IMV that depends on this source, using
         // the IMV's own `depends_on` entry as the source string so the recreated
-        // name matches exactly what the trigger references. This is the
-        // source-scoped, no-drop recovery the 1.4.5+ migrations already invoke.
+        // name matches exactly what the trigger references. This is source-scoped
+        // and drops nothing.
         let bare_source = split_qualified_name(&resolved).1.to_string();
         let passthrough_deps: Vec<(String, Vec<String>)> = client
             .select(
@@ -507,8 +502,7 @@ pub(crate) fn reflex_rebuild_triggers_impl(source_table: &str) -> String {
 /// silently stops receiving that operand's deltas. `reflex_rebuild_triggers`
 /// is the wrong primitive here — it installs the *consolidated*
 /// `__reflex_trigger_*` set, which does not belong on a wrapper operand and
-/// does not clear a mirror-trigger finding (see
-/// `untreated_bugs/2026-07-24_union_mirror_triggers_unchecked.md`).
+/// does not clear a mirror-trigger finding.
 ///
 /// `wrapper` must name a decomposed-wrapper registry row
 /// (`end_query = '' AND aggregations::text = '{}'`) whose relation is a
@@ -705,15 +699,15 @@ pub(crate) fn augment_column_types_from_query(
 /// happens in a single SPI transaction so atomicity is guaranteed: if the
 /// recreate fails, the drop is rolled back.
 ///
-/// Requires `create_args` in the registry row (1.11.0+). Returns an ERROR string
+/// Requires `create_args` in the registry row. Returns an ERROR string
 /// on any failure (IMV not found, missing create_args, drop/create failure).
 ///
 /// Without `cascade`, refuses when other IMVs depend on `view_name` — CASCADE
 /// would drop them too, but only `view_name` gets recreated, silently
 /// destroying the dependents. With `cascade => TRUE`, each dependent's
 /// creation spec is captured before the drop and recreated afterwards, in
-/// shallowest-first order. A dependent with no stored `create_args` (created
-/// before 1.10.8) cannot be faithfully recreated and causes an upfront
+/// shallowest-first order. A dependent with no stored `create_args` (legacy
+/// row) cannot be faithfully recreated and causes an upfront
 /// refusal, before anything is dropped.
 pub(crate) fn reflex_rebuild_chain_impl(view_name: &str, cascade: bool) -> String {
     if let Err(msg) = validate_view_name(view_name) {
@@ -726,12 +720,12 @@ pub(crate) fn reflex_rebuild_chain_impl(view_name: &str, cascade: bool) -> Strin
             crate::sql_writer::registry::read_imv_for_rebuild(client, view_name)
                 .ok_or_else(|| format!("IMV '{}' not found in registry", view_name))?;
 
-        // D22 — a CTE-decomposed parent stores the REWRITTEN body as sql_query (it
+        // A CTE-decomposed parent stores the REWRITTEN body as sql_query (it
         // names the generated <root>__cte_<alias> child), so a CASCADE drop removes
         // that child and the recreate then references a vanished relation, aborting
         // the transaction. The original user SQL is not recoverable from the row, so
         // refuse BEFORE any drop and point at the recursive reflex_reconcile (the
-        // correct recovery since 1.11.0) or a full drop-and-recreate.
+        // correct recovery) or a full drop-and-recreate.
         if is_decomposed_parent(client, view_name) {
             return Err(format!(
                 "IMV '{v}' was decomposed by pg_reflex into generated sub-IMV(s) it \
@@ -745,8 +739,8 @@ pub(crate) fn reflex_rebuild_chain_impl(view_name: &str, cascade: bool) -> Strin
             ));
         }
 
-        // Part 1 — the NAMED IMV gets the same fail-closed guard as its dependents
-        // (below): a row with no faithful create_args (legacy pre-1.10.8, surfaced
+        // The NAMED IMV gets the same fail-closed guard as its dependents
+        // (below): a legacy row with no faithful create_args (surfaced
         // as "" or "{}") cannot be recreated without silently resetting storage
         // mode, refresh mode and partitioning. Refuse up front, before the drop.
         if create_args_unusable(&create_args_json) {
@@ -813,8 +807,8 @@ pub(crate) fn reflex_rebuild_chain_impl(view_name: &str, cascade: bool) -> Strin
         let explicit_unpartitioned =
             extract_bool_field_via_sql(client, &create_args_json, "explicit_unpartitioned")
                 .unwrap_or(false);
-        // The 1.11.0 migration backfills legacy create_args from dedicated columns
-        // but cannot reconstruct topk_k or explicit_unpartitioned (no column holds
+        // Legacy create_args backfilled from dedicated columns
+        // cannot reconstruct topk_k or explicit_unpartitioned (no column holds
         // them), so a rebuild from such a row defaults both — silently dropping a
         // top-K bound or auto-partitioning a deliberately-unpartitioned IMV. The
         // marker makes that loss load-bearing: it is surfaced at rebuild time.
@@ -932,8 +926,8 @@ pub(crate) fn reflex_rebuild_chain_impl(view_name: &str, cascade: bool) -> Strin
 
         // Surface the honest-partial backfill loss on the recovery path. Emitted
         // only after every recreate succeeded, so it never fires on a rolled-back
-        // rebuild. A live WARNING reaches the operator's session at rebuild time
-        // (months after the one-time migration NOTICE), and the same caveat is
+        // rebuild. A live WARNING reaches the operator's session at rebuild time,
+        // and the same caveat is
         // appended to the returned status so programmatic callers can see it too.
         let mut backfilled_names: Vec<&str> = Vec::new();
         if named_backfilled {
@@ -991,7 +985,7 @@ struct CapturedDependent {
 }
 
 /// A stored `create_args` cannot faithfully recreate an IMV when it is absent —
-/// legacy pre-1.10.8 rows carry NULL, surfaced by `read_imv_for_rebuild` and the
+/// legacy rows carry NULL, surfaced by `read_imv_for_rebuild` and the
 /// registry read as an empty string or the placeholder `"{}"`. Recreating from it
 /// would silently reset storage mode, refresh mode and partitioning, so the named
 /// IMV and every dependent are refused on this one shared predicate — the two
@@ -1005,7 +999,7 @@ fn create_args_unusable(create_args: &str) -> bool {
 /// sub-IMV(s) it now depends on (a CTE / set-op / DISTINCT-ON / window split).
 /// reflex_rebuild_chain cannot rebuild such a parent: its stored query names a
 /// generated sibling that the CASCADE drop removes first, so the recreate
-/// references a vanished relation (D22).
+/// references a vanished relation.
 ///
 /// Detected two ways so the guard holds for new and legacy rows alike:
 ///   * structurally — a `is_generated_sub_imv` child sits in the parent's
@@ -1226,7 +1220,7 @@ fn extract_array_field_via_sql(
 
 /// Record an accepted `ignore_sources` unsoundness for an already-installed IMV.
 ///
-/// The A1 create-time check also runs on the re-create step of
+/// The create-time ignore_sources soundness check also runs on the re-create step of
 /// `reflex_rebuild_chain`, which takes no `ignore_sources` argument. Without
 /// this function a legacy IMV whose `create_args` carry no `!` is refused on
 /// rebuild and the printed remedy is unreachable — an operator would have to
