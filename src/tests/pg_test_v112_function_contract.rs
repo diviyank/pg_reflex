@@ -912,3 +912,37 @@ fn v112_fn_ungrouped_unknown_aggregate_with_a_declared_key_rejected() {
     v112_fn_created("v112_fn_uk_d1", keyless, "DEFERRED");
     v112_fn_assert_correct_through_dml("v112_fn_uk_d1", keyless, "v112_fn_ukd_src", true);
 }
+
+#[pg_test]
+fn v112_fn_builtin_volatile_function_rejection_does_not_advise_altering_it() {
+    v112_fn_table("v112_fn_bv_src");
+    for (i, q) in [
+        "SELECT id, nextval('v112_fn_bv_src_id_seq') AS n FROM v112_fn_bv_src",
+        "SELECT id, pg_catalog.nextval('v112_fn_bv_src_id_seq') AS n FROM v112_fn_bv_src",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let res = v112_fn_rejection(&format!("v112_fn_bv_{i}"), q);
+        assert!(res.contains("nextval(regclass)"), "{res}");
+        assert!(!res.contains("ALTER FUNCTION"), "{res}");
+        assert!(res.contains("volatile built-in"), "{res}");
+        assert!(res.find("Fix: remove").is_some_and(|p| p < 300), "{res}");
+    }
+}
+
+#[pg_test]
+fn v112_fn_remedy_names_only_the_user_function_beside_a_builtin_volatile_one() {
+    v112_fn_table("v112_fn_bm_src");
+    Spi::run("CREATE FUNCTION v112_fn_bm_f(int) RETURNS int LANGUAGE sql AS 'SELECT $1 + 1'")
+        .expect("fn");
+    let q = "SELECT id, v112_fn_bm_f(v) AS x, nextval('v112_fn_bm_src_id_seq') AS n FROM v112_fn_bm_src";
+    let res = v112_fn_rejection("v112_fn_bm_v", q);
+    assert!(res.contains("nextval(regclass)"), "{res}");
+    assert!(res.contains("volatile built-in"), "{res}");
+    assert_eq!(
+        v112_fn_printed_alter_function(res),
+        "ALTER FUNCTION v112_fn_bm_f(integer) IMMUTABLE"
+    );
+    assert_eq!(res.matches("ALTER FUNCTION").count(), 1, "{res}");
+}

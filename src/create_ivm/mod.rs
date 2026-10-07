@@ -396,14 +396,33 @@ fn check_function_contract(
     let CatalogFunctionKinds {
         volatile,
         volatile_signatures,
+        alterable_volatile_signatures,
         aggregates,
     } = catalog_function_kinds(&analysis.function_references);
-    if let Some(first) = volatile_signatures.first() {
+    if !volatile_signatures.is_empty() {
+        let builtin_signatures: Vec<String> = volatile_signatures
+            .iter()
+            .filter(|signature| !alterable_volatile_signatures.contains(signature))
+            .cloned()
+            .collect();
+        let alter_remedy = alterable_volatile_signatures
+            .first()
+            .map(|first| {
+                format!("if deterministic, run ALTER FUNCTION {first} IMMUTABLE (or STABLE); otherwise ")
+            })
+            .unwrap_or_default();
+        let builtin_note = if builtin_signatures.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " {} is a volatile built-in and cannot be used in an IMV.",
+                listed_signatures(&builtin_signatures)
+            )
+        };
         return Err(format!(
-            "Volatile function(s) {} in IMV '{view_name}': {}. Fix: if \
-             deterministic, run ALTER FUNCTION {first} IMMUTABLE (or STABLE); otherwise remove \
-             it from the IMV query, or compute the value into a source column. An unqualified \
-             call is matched by name in every schema and for every overload, a \
+            "Volatile function(s) {} in IMV '{view_name}': {}. Fix: {alter_remedy}remove \
+             it from the IMV query, or compute the value into a source column.{builtin_note} \
+             An unqualified call is matched by name in every schema and for every overload, a \
              schema-qualified call in that schema only. A volatile function returns a \
              different result on each call, so the IMV would diverge from its own query.",
             volatile.join(", "),
@@ -473,6 +492,8 @@ struct CatalogFunctionKinds {
     /// Those volatile functions as `regprocedure` text: quoted and schema-qualified
     /// for the caller's `search_path`, so it can be pasted into `ALTER FUNCTION`.
     volatile_signatures: Vec<String>,
+    /// Those of `volatile_signatures` outside `pg_catalog`, which the user can relabel.
+    alterable_volatile_signatures: Vec<String>,
     /// Bare names matched by aggregates only, with no plain function of the same name.
     aggregates: Vec<String>,
 }
@@ -489,6 +510,7 @@ fn catalog_function_kinds(
     let mut kinds = CatalogFunctionKinds {
         volatile: Vec::new(),
         volatile_signatures: Vec::new(),
+        alterable_volatile_signatures: Vec::new(),
         aggregates: Vec::new(),
     };
     if called.is_empty() {
@@ -520,7 +542,11 @@ fn catalog_function_kinds(
                         bool_or(p.prokind = 'a') AND NOT bool_or(p.prokind = 'f') AS is_aggregate_only, \
                         COALESCE(array_agg(p.oid::regprocedure::text ORDER BY p.oid::regprocedure::text) \
                                    FILTER (WHERE p.prokind = 'f' AND p.provolatile = 'v'), \
-                                 '{}'::text[]) AS volatile_signatures \
+                                 '{}'::text[]) AS volatile_signatures, \
+                        COALESCE(array_agg(p.oid::regprocedure::text ORDER BY p.oid::regprocedure::text) \
+                                   FILTER (WHERE p.prokind = 'f' AND p.provolatile = 'v' \
+                                             AND n.nspname <> 'pg_catalog'), \
+                                 '{}'::text[]) AS alterable_volatile_signatures \
                  FROM pg_catalog.pg_proc p \
                  JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace \
                  WHERE lower(p.proname::text COLLATE \"C\") = ANY($1::text[]) \
@@ -555,6 +581,11 @@ fn catalog_function_kinds(
             }
             kinds.volatile_signatures.extend(
                 row.get_by_name::<Vec<String>, _>("volatile_signatures")
+                    .unwrap_or(None)
+                    .unwrap_or_default(),
+            );
+            kinds.alterable_volatile_signatures.extend(
+                row.get_by_name::<Vec<String>, _>("alterable_volatile_signatures")
                     .unwrap_or(None)
                     .unwrap_or_default(),
             );
