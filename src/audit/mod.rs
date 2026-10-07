@@ -62,9 +62,9 @@ pub struct Finding {
 
 pub struct ImvRow {
     pub name: String,
-    /// Schema the IMV's relations were created in (1.7.1). Set for every row
-    /// created since; used to resolve a bare `name` without depending on the
-    /// audit session's search_path.
+    /// Schema the IMV's relations were created in. `None` on rows registered
+    /// before the column existed; used to resolve a bare `name` without
+    /// depending on the audit session's search_path.
     pub target_schema: Option<String>,
     pub depends_on: Vec<String>,
     pub refresh_mode: String,
@@ -112,13 +112,12 @@ impl ImvRow {
     ///
     /// Detected by the KEY COUNT of `aggregations`, not by `!is_passthrough()`. The
     /// two agree on every row either writer produces, but they diverge on a NULL or
-    /// unparseable `aggregations` — the column is nullable (`src/lib.rs:107`, and
-    /// `sql/pg_reflex--1.3.0--1.4.0.sql:51` guards `WHERE aggregations IS NOT NULL`).
+    /// unparseable `aggregations` — the column is nullable.
     /// `is_passthrough()` returns `false` there, which together with an empty
-    /// `end_query` would have classified such a row as a wrapper and silenced BOTH
+    /// `end_query` would classify such a row as a wrapper and silence BOTH
     /// `internal-tables-exist` and the much more serious `trigger-attached`. Key
     /// count answers "unknown, not zero" and keeps reporting. It is also the signal
-    /// `REBUILDABLE_NODE` (`src/reconcile.rs`) already uses, so the tree carries two
+    /// `REBUILDABLE_NODE` (`src/reconcile.rs`) uses, so the tree carries two
     /// predicates — `end_query` and key count — rather than three.
     ///
     /// That NULL case is deliberately resolved the OPPOSITE way from
