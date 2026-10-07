@@ -4,6 +4,7 @@ use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 
 use crate::sql_analyzer::{detect_aggregate, resolve_aggregate_call, AggregateKind, SqlAnalysis};
+use crate::sql_writer::keyword_scan::quoted_identifier_spans;
 
 /// A column in the intermediate (unlogged) table storing partial aggregate state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -313,9 +314,10 @@ impl AggregationPlan {
         for mapping in &mut self.end_query_mappings {
             // First, apply Pattern-B redirects: replace dropped name with canonical.
             for (orig, canon) in &redirect {
-                let from = format!("\"{}\"", orig);
-                let to = format!("\"{}\"", canon);
-                mapping.intermediate_expr = mapping.intermediate_expr.replace(&from, &to);
+                mapping.intermediate_expr =
+                    rewrite_column_reads(&mapping.intermediate_expr, orig, |_, _| {
+                        Some(format!("\"{}\"", canon))
+                    });
             }
             // Then flatten the CASE for any nonnull_count that was dropped without a redirect.
             for count_name in &to_remove {
@@ -345,10 +347,10 @@ impl AggregationPlan {
                 if redirect.contains_key(count_name) {
                     continue;
                 }
-                let elided = format!("\"{}\"", count_name);
-                mapping.intermediate_expr = mapping
-                    .intermediate_expr
-                    .replace(&elided, "\"__ivm_count\"");
+                mapping.intermediate_expr =
+                    rewrite_column_reads(&mapping.intermediate_expr, count_name, |_, _| {
+                        Some("\"__ivm_count\"".to_string())
+                    });
             }
         }
     }
@@ -357,14 +359,59 @@ impl AggregationPlan {
     /// The column stores NUMERIC, under which `SUM(int_col) / 2` would divide
     /// exactly where PostgreSQL divides integers.
     pub fn read_nested_sum_as(&mut self, sum_column: &str, pg_type: &str) {
-        let untyped = format!("THEN {} END", sum_branch(sum_column));
-        let typed = format!("THEN {}::{} END", sum_branch(sum_column), pg_type);
+        self.rewrite_nested_reads(sum_column, |before, after| {
+            let is_sum_branch = before.ends_with("THEN ") && after.starts_with(" END");
+            is_sum_branch.then(|| format!("\"{}\"::{}", sum_column, pg_type))
+        });
+    }
+
+    /// Gives every nested reading of a MIN / MAX column the type the aggregate
+    /// itself returns, for a column that could only be stored as NUMERIC.
+    pub fn read_nested_extremum_as(&mut self, extremum_column: &str, pg_type: &str) {
+        self.rewrite_nested_reads(extremum_column, |_, _| {
+            Some(format!("\"{}\"::{}", extremum_column, pg_type))
+        });
+    }
+
+    fn rewrite_nested_reads(
+        &mut self,
+        column: &str,
+        replacement: impl Fn(&str, &str) -> Option<String>,
+    ) {
         for mapping in &mut self.end_query_mappings {
             if mapping.aggregate_type == "DERIVED" {
-                mapping.intermediate_expr = mapping.intermediate_expr.replace(&untyped, &typed);
+                mapping.intermediate_expr =
+                    rewrite_column_reads(&mapping.intermediate_expr, column, &replacement);
             }
         }
     }
+}
+
+/// Rewrites the reads of intermediate column `column` in `expr`. A read is a
+/// double-quoted identifier equal to the column name; text inside a string
+/// literal is never one. `replacement` receives the text before and after a
+/// read and returns what replaces it, or `None` to keep it.
+fn rewrite_column_reads(
+    expr: &str,
+    column: &str,
+    replacement: impl Fn(&str, &str) -> Option<String>,
+) -> String {
+    let read = format!("\"{}\"", column);
+    let mut rewritten = String::with_capacity(expr.len());
+    let mut copied_up_to = 0;
+    for span in quoted_identifier_spans(expr) {
+        if expr[span.clone()] != read {
+            continue;
+        }
+        let Some(text) = replacement(&expr[..span.start], &expr[span.end..]) else {
+            continue;
+        };
+        rewritten.push_str(&expr[copied_up_to..span.start]);
+        rewritten.push_str(&text);
+        copied_up_to = span.end;
+    }
+    rewritten.push_str(&expr[copied_up_to..]);
+    rewritten
 }
 
 /// Extract `<inner>` from a `CASE WHEN (<inner>) THEN 1 ELSE 0 END` form.
@@ -709,8 +756,9 @@ fn rewrite_expr_aggregates(
 }
 
 /// The intermediate columns one aggregate needs and the end-query expression
-/// that reads them back. An aggregate at top level and the same aggregate nested
-/// in an expression both plan through this, so they cannot disagree.
+/// that reads them back. In the SELECT list, an aggregate at top level and the
+/// same aggregate nested in an expression both plan through this. HAVING plans
+/// its aggregates separately.
 struct AggregateReading {
     columns: Vec<IntermediateColumn>,
     end_expr: String,
@@ -834,15 +882,7 @@ fn aggregate_reading(kind: &AggregateKind, arg: &str) -> Option<AggregateReading
 }
 
 fn sum_reading(count_col: &str, sum_col: &str) -> String {
-    format!(
-        "CASE WHEN \"{}\" > 0 THEN {} END",
-        count_col,
-        sum_branch(sum_col)
-    )
-}
-
-fn sum_branch(sum_col: &str) -> String {
-    format!("\"{}\"", sum_col)
+    format!("CASE WHEN \"{}\" > 0 THEN \"{}\" END", count_col, sum_col)
 }
 
 /// Build an AggregationPlan from a SqlAnalysis.

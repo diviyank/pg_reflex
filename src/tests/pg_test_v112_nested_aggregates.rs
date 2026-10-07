@@ -463,3 +463,258 @@ v112_na_cells! {
     v112_na_ctx_having_count => "SELECT g, ROUND(AVG(v), 2) AS r FROM {src} GROUP BY g HAVING COUNT(*) > 1",
     v112_na_ctx_where_sum => "SELECT g, SUM(v) / 2 AS r, ROUND(AVG(n), 1) AS a FROM {src} WHERE v <> 2 OR v IS NULL GROUP BY g",
 }
+
+const V112_NA_EXTREMA: V112NaFixture = V112NaFixture {
+    columns: "g TEXT, v INT, b BOOLEAN, t TEXT, w INT, f DOUBLE PRECISION, n NUMERIC, \
+              q BIGINT GENERATED ALWAYS AS (v::bigint * 3) STORED",
+    seed: V112_NA_NULLABLE.seed,
+    steps: V112_NA_NULLABLE.steps,
+};
+
+/// `same <type>` when the IMV's `r` column has the type the query gives it,
+/// otherwise both types.
+fn v112_na_result_type(tag: &str, select_template: &str) -> String {
+    let fresh = select_template.replace("{src}", &format!("v112_na_{tag}_src"));
+    let imv_type = v112_na_try(&format!(
+        "SELECT pg_typeof((SELECT r FROM v112_na_{tag} LIMIT 1))::text"
+    ));
+    let query_type = v112_na_try(&format!(
+        "SELECT pg_typeof((SELECT r FROM ({fresh}) AS __typed LIMIT 1))::text"
+    ));
+    if imv_type == query_type {
+        format!("same {imv_type}")
+    } else {
+        format!("imv {imv_type} query {query_type}")
+    }
+}
+
+macro_rules! v112_na_typed_cells {
+    ($fixture:expr; $($name:ident => $select:expr,)+) => {
+        $(
+            #[pg_test]
+            fn $name() {
+                let tag = stringify!($name).trim_start_matches("v112_na_");
+                let outcome = v112_na_cell_on(&$fixture, tag, $select, false);
+                let result_type = v112_na_result_type(tag, $select);
+                assert!(
+                    outcome == "ok" && result_type.starts_with("same "),
+                    "{}: {} | {}",
+                    $select,
+                    outcome,
+                    result_type
+                );
+            }
+        )+
+    };
+}
+
+// Nested MIN: plain, expression and filtered arguments of each numeric type, result type included
+v112_na_typed_cells! {
+    V112_NA_EXTREMA;
+    v112_na_x_min_int_half_g => "SELECT g, MIN(v) / 2 AS r FROM {src} GROUP BY g",
+    v112_na_x_min_int_half_u => "SELECT MIN(v) / 2 AS r FROM {src}",
+    v112_na_x_min_int_plus_g => "SELECT g, MIN(v) + 1 AS r FROM {src} GROUP BY g",
+    v112_na_x_min_int_plus_u => "SELECT MIN(v) + 1 AS r FROM {src}",
+    v112_na_x_min_int_round_g => "SELECT g, ROUND(MIN(v), 2) AS r FROM {src} GROUP BY g",
+    v112_na_x_min_int_round_u => "SELECT ROUND(MIN(v), 2) AS r FROM {src}",
+    v112_na_x_min_int_coalesce_g => "SELECT g, COALESCE(MIN(v), 0) AS r FROM {src} GROUP BY g",
+    v112_na_x_min_int_coalesce_u => "SELECT COALESCE(MIN(v), 0) AS r FROM {src}",
+    v112_na_x_min_big_half_g => "SELECT g, MIN(q) / 2 AS r FROM {src} GROUP BY g",
+    v112_na_x_min_big_half_u => "SELECT MIN(q) / 2 AS r FROM {src}",
+    v112_na_x_min_big_plus_g => "SELECT g, MIN(q) + 1 AS r FROM {src} GROUP BY g",
+    v112_na_x_min_big_plus_u => "SELECT MIN(q) + 1 AS r FROM {src}",
+    v112_na_x_min_big_round_g => "SELECT g, ROUND(MIN(q), 2) AS r FROM {src} GROUP BY g",
+    v112_na_x_min_big_round_u => "SELECT ROUND(MIN(q), 2) AS r FROM {src}",
+    v112_na_x_min_big_coalesce_g => "SELECT g, COALESCE(MIN(q), 0) AS r FROM {src} GROUP BY g",
+    v112_na_x_min_big_coalesce_u => "SELECT COALESCE(MIN(q), 0) AS r FROM {src}",
+    v112_na_x_min_num_half_g => "SELECT g, MIN(n) / 2 AS r FROM {src} GROUP BY g",
+    v112_na_x_min_num_half_u => "SELECT MIN(n) / 2 AS r FROM {src}",
+    v112_na_x_min_num_plus_g => "SELECT g, MIN(n) + 1 AS r FROM {src} GROUP BY g",
+    v112_na_x_min_num_plus_u => "SELECT MIN(n) + 1 AS r FROM {src}",
+    v112_na_x_min_num_round_g => "SELECT g, ROUND(MIN(n), 2) AS r FROM {src} GROUP BY g",
+    v112_na_x_min_num_round_u => "SELECT ROUND(MIN(n), 2) AS r FROM {src}",
+    v112_na_x_min_num_coalesce_g => "SELECT g, COALESCE(MIN(n), 0) AS r FROM {src} GROUP BY g",
+    v112_na_x_min_num_coalesce_u => "SELECT COALESCE(MIN(n), 0) AS r FROM {src}",
+    v112_na_x_min_intx_half_g => "SELECT g, MIN(v * 3) / 2 AS r FROM {src} GROUP BY g",
+    v112_na_x_min_intx_half_u => "SELECT MIN(v * 3) / 2 AS r FROM {src}",
+    v112_na_x_min_intx_plus_g => "SELECT g, MIN(v * 3) + 1 AS r FROM {src} GROUP BY g",
+    v112_na_x_min_intx_plus_u => "SELECT MIN(v * 3) + 1 AS r FROM {src}",
+    v112_na_x_min_intx_round_g => "SELECT g, ROUND(MIN(v * 3), 2) AS r FROM {src} GROUP BY g",
+    v112_na_x_min_intx_round_u => "SELECT ROUND(MIN(v * 3), 2) AS r FROM {src}",
+    v112_na_x_min_intx_coalesce_g => "SELECT g, COALESCE(MIN(v * 3), 0) AS r FROM {src} GROUP BY g",
+    v112_na_x_min_intx_coalesce_u => "SELECT COALESCE(MIN(v * 3), 0) AS r FROM {src}",
+    v112_na_x_min_bigx_half_g => "SELECT g, MIN(q + 1) / 2 AS r FROM {src} GROUP BY g",
+    v112_na_x_min_bigx_half_u => "SELECT MIN(q + 1) / 2 AS r FROM {src}",
+    v112_na_x_min_bigx_plus_g => "SELECT g, MIN(q + 1) + 1 AS r FROM {src} GROUP BY g",
+    v112_na_x_min_bigx_plus_u => "SELECT MIN(q + 1) + 1 AS r FROM {src}",
+    v112_na_x_min_bigx_round_g => "SELECT g, ROUND(MIN(q + 1), 2) AS r FROM {src} GROUP BY g",
+    v112_na_x_min_bigx_round_u => "SELECT ROUND(MIN(q + 1), 2) AS r FROM {src}",
+    v112_na_x_min_bigx_coalesce_g => "SELECT g, COALESCE(MIN(q + 1), 0) AS r FROM {src} GROUP BY g",
+    v112_na_x_min_bigx_coalesce_u => "SELECT COALESCE(MIN(q + 1), 0) AS r FROM {src}",
+    v112_na_x_min_numx_half_g => "SELECT g, MIN(n * 2) / 2 AS r FROM {src} GROUP BY g",
+    v112_na_x_min_numx_half_u => "SELECT MIN(n * 2) / 2 AS r FROM {src}",
+    v112_na_x_min_numx_plus_g => "SELECT g, MIN(n * 2) + 1 AS r FROM {src} GROUP BY g",
+    v112_na_x_min_numx_plus_u => "SELECT MIN(n * 2) + 1 AS r FROM {src}",
+    v112_na_x_min_numx_round_g => "SELECT g, ROUND(MIN(n * 2), 2) AS r FROM {src} GROUP BY g",
+    v112_na_x_min_numx_round_u => "SELECT ROUND(MIN(n * 2), 2) AS r FROM {src}",
+    v112_na_x_min_numx_coalesce_g => "SELECT g, COALESCE(MIN(n * 2), 0) AS r FROM {src} GROUP BY g",
+    v112_na_x_min_numx_coalesce_u => "SELECT COALESCE(MIN(n * 2), 0) AS r FROM {src}",
+    v112_na_x_min_intf_half_g => "SELECT g, MIN(v) FILTER (WHERE v > 1) / 2 AS r FROM {src} GROUP BY g",
+    v112_na_x_min_intf_half_u => "SELECT MIN(v) FILTER (WHERE v > 1) / 2 AS r FROM {src}",
+    v112_na_x_min_intf_plus_g => "SELECT g, MIN(v) FILTER (WHERE v > 1) + 1 AS r FROM {src} GROUP BY g",
+    v112_na_x_min_intf_plus_u => "SELECT MIN(v) FILTER (WHERE v > 1) + 1 AS r FROM {src}",
+    v112_na_x_min_intf_round_g => "SELECT g, ROUND(MIN(v) FILTER (WHERE v > 1), 2) AS r FROM {src} GROUP BY g",
+    v112_na_x_min_intf_round_u => "SELECT ROUND(MIN(v) FILTER (WHERE v > 1), 2) AS r FROM {src}",
+    v112_na_x_min_intf_coalesce_g => "SELECT g, COALESCE(MIN(v) FILTER (WHERE v > 1), 0) AS r FROM {src} GROUP BY g",
+    v112_na_x_min_intf_coalesce_u => "SELECT COALESCE(MIN(v) FILTER (WHERE v > 1), 0) AS r FROM {src}",
+    v112_na_x_min_bigf_half_g => "SELECT g, MIN(q) FILTER (WHERE v > 1) / 2 AS r FROM {src} GROUP BY g",
+    v112_na_x_min_bigf_half_u => "SELECT MIN(q) FILTER (WHERE v > 1) / 2 AS r FROM {src}",
+    v112_na_x_min_bigf_plus_g => "SELECT g, MIN(q) FILTER (WHERE v > 1) + 1 AS r FROM {src} GROUP BY g",
+    v112_na_x_min_bigf_plus_u => "SELECT MIN(q) FILTER (WHERE v > 1) + 1 AS r FROM {src}",
+    v112_na_x_min_bigf_round_g => "SELECT g, ROUND(MIN(q) FILTER (WHERE v > 1), 2) AS r FROM {src} GROUP BY g",
+    v112_na_x_min_bigf_round_u => "SELECT ROUND(MIN(q) FILTER (WHERE v > 1), 2) AS r FROM {src}",
+    v112_na_x_min_bigf_coalesce_g => "SELECT g, COALESCE(MIN(q) FILTER (WHERE v > 1), 0) AS r FROM {src} GROUP BY g",
+    v112_na_x_min_bigf_coalesce_u => "SELECT COALESCE(MIN(q) FILTER (WHERE v > 1), 0) AS r FROM {src}",
+    v112_na_x_min_numf_half_g => "SELECT g, MIN(n) FILTER (WHERE v > 1) / 2 AS r FROM {src} GROUP BY g",
+    v112_na_x_min_numf_half_u => "SELECT MIN(n) FILTER (WHERE v > 1) / 2 AS r FROM {src}",
+    v112_na_x_min_numf_plus_g => "SELECT g, MIN(n) FILTER (WHERE v > 1) + 1 AS r FROM {src} GROUP BY g",
+    v112_na_x_min_numf_plus_u => "SELECT MIN(n) FILTER (WHERE v > 1) + 1 AS r FROM {src}",
+    v112_na_x_min_numf_round_g => "SELECT g, ROUND(MIN(n) FILTER (WHERE v > 1), 2) AS r FROM {src} GROUP BY g",
+    v112_na_x_min_numf_round_u => "SELECT ROUND(MIN(n) FILTER (WHERE v > 1), 2) AS r FROM {src}",
+    v112_na_x_min_numf_coalesce_g => "SELECT g, COALESCE(MIN(n) FILTER (WHERE v > 1), 0) AS r FROM {src} GROUP BY g",
+    v112_na_x_min_numf_coalesce_u => "SELECT COALESCE(MIN(n) FILTER (WHERE v > 1), 0) AS r FROM {src}",
+}
+
+// Nested MAX: plain, expression and filtered arguments of each numeric type, result type included
+v112_na_typed_cells! {
+    V112_NA_EXTREMA;
+    v112_na_x_max_int_half_g => "SELECT g, MAX(v) / 2 AS r FROM {src} GROUP BY g",
+    v112_na_x_max_int_half_u => "SELECT MAX(v) / 2 AS r FROM {src}",
+    v112_na_x_max_int_plus_g => "SELECT g, MAX(v) + 1 AS r FROM {src} GROUP BY g",
+    v112_na_x_max_int_plus_u => "SELECT MAX(v) + 1 AS r FROM {src}",
+    v112_na_x_max_int_round_g => "SELECT g, ROUND(MAX(v), 2) AS r FROM {src} GROUP BY g",
+    v112_na_x_max_int_round_u => "SELECT ROUND(MAX(v), 2) AS r FROM {src}",
+    v112_na_x_max_int_coalesce_g => "SELECT g, COALESCE(MAX(v), 0) AS r FROM {src} GROUP BY g",
+    v112_na_x_max_int_coalesce_u => "SELECT COALESCE(MAX(v), 0) AS r FROM {src}",
+    v112_na_x_max_big_half_g => "SELECT g, MAX(q) / 2 AS r FROM {src} GROUP BY g",
+    v112_na_x_max_big_half_u => "SELECT MAX(q) / 2 AS r FROM {src}",
+    v112_na_x_max_big_plus_g => "SELECT g, MAX(q) + 1 AS r FROM {src} GROUP BY g",
+    v112_na_x_max_big_plus_u => "SELECT MAX(q) + 1 AS r FROM {src}",
+    v112_na_x_max_big_round_g => "SELECT g, ROUND(MAX(q), 2) AS r FROM {src} GROUP BY g",
+    v112_na_x_max_big_round_u => "SELECT ROUND(MAX(q), 2) AS r FROM {src}",
+    v112_na_x_max_big_coalesce_g => "SELECT g, COALESCE(MAX(q), 0) AS r FROM {src} GROUP BY g",
+    v112_na_x_max_big_coalesce_u => "SELECT COALESCE(MAX(q), 0) AS r FROM {src}",
+    v112_na_x_max_num_half_g => "SELECT g, MAX(n) / 2 AS r FROM {src} GROUP BY g",
+    v112_na_x_max_num_half_u => "SELECT MAX(n) / 2 AS r FROM {src}",
+    v112_na_x_max_num_plus_g => "SELECT g, MAX(n) + 1 AS r FROM {src} GROUP BY g",
+    v112_na_x_max_num_plus_u => "SELECT MAX(n) + 1 AS r FROM {src}",
+    v112_na_x_max_num_round_g => "SELECT g, ROUND(MAX(n), 2) AS r FROM {src} GROUP BY g",
+    v112_na_x_max_num_round_u => "SELECT ROUND(MAX(n), 2) AS r FROM {src}",
+    v112_na_x_max_num_coalesce_g => "SELECT g, COALESCE(MAX(n), 0) AS r FROM {src} GROUP BY g",
+    v112_na_x_max_num_coalesce_u => "SELECT COALESCE(MAX(n), 0) AS r FROM {src}",
+    v112_na_x_max_intx_half_g => "SELECT g, MAX(v * 3) / 2 AS r FROM {src} GROUP BY g",
+    v112_na_x_max_intx_half_u => "SELECT MAX(v * 3) / 2 AS r FROM {src}",
+    v112_na_x_max_intx_plus_g => "SELECT g, MAX(v * 3) + 1 AS r FROM {src} GROUP BY g",
+    v112_na_x_max_intx_plus_u => "SELECT MAX(v * 3) + 1 AS r FROM {src}",
+    v112_na_x_max_intx_round_g => "SELECT g, ROUND(MAX(v * 3), 2) AS r FROM {src} GROUP BY g",
+    v112_na_x_max_intx_round_u => "SELECT ROUND(MAX(v * 3), 2) AS r FROM {src}",
+    v112_na_x_max_intx_coalesce_g => "SELECT g, COALESCE(MAX(v * 3), 0) AS r FROM {src} GROUP BY g",
+    v112_na_x_max_intx_coalesce_u => "SELECT COALESCE(MAX(v * 3), 0) AS r FROM {src}",
+    v112_na_x_max_bigx_half_g => "SELECT g, MAX(q + 1) / 2 AS r FROM {src} GROUP BY g",
+    v112_na_x_max_bigx_half_u => "SELECT MAX(q + 1) / 2 AS r FROM {src}",
+    v112_na_x_max_bigx_plus_g => "SELECT g, MAX(q + 1) + 1 AS r FROM {src} GROUP BY g",
+    v112_na_x_max_bigx_plus_u => "SELECT MAX(q + 1) + 1 AS r FROM {src}",
+    v112_na_x_max_bigx_round_g => "SELECT g, ROUND(MAX(q + 1), 2) AS r FROM {src} GROUP BY g",
+    v112_na_x_max_bigx_round_u => "SELECT ROUND(MAX(q + 1), 2) AS r FROM {src}",
+    v112_na_x_max_bigx_coalesce_g => "SELECT g, COALESCE(MAX(q + 1), 0) AS r FROM {src} GROUP BY g",
+    v112_na_x_max_bigx_coalesce_u => "SELECT COALESCE(MAX(q + 1), 0) AS r FROM {src}",
+    v112_na_x_max_numx_half_g => "SELECT g, MAX(n * 2) / 2 AS r FROM {src} GROUP BY g",
+    v112_na_x_max_numx_half_u => "SELECT MAX(n * 2) / 2 AS r FROM {src}",
+    v112_na_x_max_numx_plus_g => "SELECT g, MAX(n * 2) + 1 AS r FROM {src} GROUP BY g",
+    v112_na_x_max_numx_plus_u => "SELECT MAX(n * 2) + 1 AS r FROM {src}",
+    v112_na_x_max_numx_round_g => "SELECT g, ROUND(MAX(n * 2), 2) AS r FROM {src} GROUP BY g",
+    v112_na_x_max_numx_round_u => "SELECT ROUND(MAX(n * 2), 2) AS r FROM {src}",
+    v112_na_x_max_numx_coalesce_g => "SELECT g, COALESCE(MAX(n * 2), 0) AS r FROM {src} GROUP BY g",
+    v112_na_x_max_numx_coalesce_u => "SELECT COALESCE(MAX(n * 2), 0) AS r FROM {src}",
+    v112_na_x_max_intf_half_g => "SELECT g, MAX(v) FILTER (WHERE v > 1) / 2 AS r FROM {src} GROUP BY g",
+    v112_na_x_max_intf_half_u => "SELECT MAX(v) FILTER (WHERE v > 1) / 2 AS r FROM {src}",
+    v112_na_x_max_intf_plus_g => "SELECT g, MAX(v) FILTER (WHERE v > 1) + 1 AS r FROM {src} GROUP BY g",
+    v112_na_x_max_intf_plus_u => "SELECT MAX(v) FILTER (WHERE v > 1) + 1 AS r FROM {src}",
+    v112_na_x_max_intf_round_g => "SELECT g, ROUND(MAX(v) FILTER (WHERE v > 1), 2) AS r FROM {src} GROUP BY g",
+    v112_na_x_max_intf_round_u => "SELECT ROUND(MAX(v) FILTER (WHERE v > 1), 2) AS r FROM {src}",
+    v112_na_x_max_intf_coalesce_g => "SELECT g, COALESCE(MAX(v) FILTER (WHERE v > 1), 0) AS r FROM {src} GROUP BY g",
+    v112_na_x_max_intf_coalesce_u => "SELECT COALESCE(MAX(v) FILTER (WHERE v > 1), 0) AS r FROM {src}",
+    v112_na_x_max_bigf_half_g => "SELECT g, MAX(q) FILTER (WHERE v > 1) / 2 AS r FROM {src} GROUP BY g",
+    v112_na_x_max_bigf_half_u => "SELECT MAX(q) FILTER (WHERE v > 1) / 2 AS r FROM {src}",
+    v112_na_x_max_bigf_plus_g => "SELECT g, MAX(q) FILTER (WHERE v > 1) + 1 AS r FROM {src} GROUP BY g",
+    v112_na_x_max_bigf_plus_u => "SELECT MAX(q) FILTER (WHERE v > 1) + 1 AS r FROM {src}",
+    v112_na_x_max_bigf_round_g => "SELECT g, ROUND(MAX(q) FILTER (WHERE v > 1), 2) AS r FROM {src} GROUP BY g",
+    v112_na_x_max_bigf_round_u => "SELECT ROUND(MAX(q) FILTER (WHERE v > 1), 2) AS r FROM {src}",
+    v112_na_x_max_bigf_coalesce_g => "SELECT g, COALESCE(MAX(q) FILTER (WHERE v > 1), 0) AS r FROM {src} GROUP BY g",
+    v112_na_x_max_bigf_coalesce_u => "SELECT COALESCE(MAX(q) FILTER (WHERE v > 1), 0) AS r FROM {src}",
+    v112_na_x_max_numf_half_g => "SELECT g, MAX(n) FILTER (WHERE v > 1) / 2 AS r FROM {src} GROUP BY g",
+    v112_na_x_max_numf_half_u => "SELECT MAX(n) FILTER (WHERE v > 1) / 2 AS r FROM {src}",
+    v112_na_x_max_numf_plus_g => "SELECT g, MAX(n) FILTER (WHERE v > 1) + 1 AS r FROM {src} GROUP BY g",
+    v112_na_x_max_numf_plus_u => "SELECT MAX(n) FILTER (WHERE v > 1) + 1 AS r FROM {src}",
+    v112_na_x_max_numf_round_g => "SELECT g, ROUND(MAX(n) FILTER (WHERE v > 1), 2) AS r FROM {src} GROUP BY g",
+    v112_na_x_max_numf_round_u => "SELECT ROUND(MAX(n) FILTER (WHERE v > 1), 2) AS r FROM {src}",
+    v112_na_x_max_numf_coalesce_g => "SELECT g, COALESCE(MAX(n) FILTER (WHERE v > 1), 0) AS r FROM {src} GROUP BY g",
+    v112_na_x_max_numf_coalesce_u => "SELECT COALESCE(MAX(n) FILTER (WHERE v > 1), 0) AS r FROM {src}",
+}
+
+// Nested MIN / MAX over an integer expression, combined
+v112_na_typed_cells! {
+    V112_NA_EXTREMA;
+    v112_na_x_spread_halved_g => "SELECT g, (MAX(v * 3) - MIN(v * 3)) / 2 AS r FROM {src} GROUP BY g",
+    v112_na_x_smallint_halved_g => "SELECT g, MAX(v::smallint) / 2 AS r FROM {src} GROUP BY g",
+    v112_na_x_modulo_g => "SELECT g, MAX(v * 3) % 2 AS r FROM {src} GROUP BY g",
+    v112_na_x_float_halved_g => "SELECT g, MAX(f * 2) / 2 AS r FROM {src} GROUP BY g",
+    v112_na_x_top_and_nested_g => "SELECT g, MAX(v * 3) AS top, MAX(v * 3) / 2 AS r FROM {src} GROUP BY g",
+    v112_na_x_filtered_top_and_nested_g => "SELECT g, MIN(v) FILTER (WHERE v > 1) AS top, MIN(v) FILTER (WHERE v > 1) / 2 AS r FROM {src} GROUP BY g",
+    v112_na_x_sum_and_max_g => "SELECT g, (SUM(v) + MAX(v * 3)) / 2 AS r FROM {src} GROUP BY g",
+}
+
+// A string literal that spells an internal column read is left as written
+v112_na_typed_cells! {
+    V112_NA_EXTREMA;
+    v112_na_lit_sum_case_g => "SELECT g, CASE WHEN SUM(v) > 0 THEN 'THEN \"__sum_v\" END' ELSE 'x' END AS r FROM {src} GROUP BY g",
+    v112_na_lit_sum_case_u => "SELECT CASE WHEN SUM(v) > 0 THEN 'THEN \"__sum_v\" END' ELSE 'x' END AS r FROM {src}",
+    v112_na_lit_sum_concat_g => "SELECT g, (SUM(v) / 2)::text || 'THEN \"__sum_v\" END' AS r FROM {src} GROUP BY g",
+    v112_na_lit_sum_function_g => "SELECT g, COALESCE((SUM(v) / 2)::text, 'THEN \"__sum_v\" END') AS r FROM {src} GROUP BY g",
+    v112_na_lit_sum_dollar_g => "SELECT g, COALESCE((SUM(v) / 2)::text, $lit$THEN \"__sum_v\" END$lit$) AS r FROM {src} GROUP BY g",
+    v112_na_lit_sum_cast_text_g => "SELECT g, ('THEN \"__sum_v\" END' || (SUM(v) / 2)::text)::text AS r FROM {src} GROUP BY g",
+    v112_na_lit_sum_escaped_quote_g => "SELECT g, COALESCE((SUM(v) / 2)::text, 'it''s THEN \"__sum_v\" END') AS r FROM {src} GROUP BY g",
+    v112_na_lit_max_concat_g => "SELECT g, (MAX(v * 3) / 2)::text || '\"__max_v_3\"' AS r FROM {src} GROUP BY g",
+    v112_na_lit_max_case_u => "SELECT CASE WHEN MAX(v * 3) / 2 > 0 THEN '\"__max_v_3\"' ELSE 'low' END AS r FROM {src}",
+    v112_na_lit_min_function_g => "SELECT g, COALESCE((MIN(v) FILTER (WHERE v > 1) / 2)::text, '\"__min_case_when_v_1_then_v_end\"') AS r FROM {src} GROUP BY g",
+}
+
+v112_na_typed_cells! {
+    V112_NA_NOT_NULL;
+    v112_na_lit_counter_concat_g => "SELECT g, (SUM(v) + 1)::text || '\"__nonnull_count_v\"' AS r FROM {src} GROUP BY g",
+    v112_na_lit_counter_case_u => "SELECT CASE WHEN SUM(v) > 0 THEN '\"__nonnull_count_v\"' ELSE 'x' END AS r FROM {src}",
+    v112_na_lit_counter_function_g => "SELECT g, COALESCE(NULLIF((SUM(v) / 2)::text, '0'), '\"__nonnull_count_v\"') AS r FROM {src} GROUP BY g",
+    v112_na_lit_bool_counter_case_g => "SELECT g, CASE WHEN BOOL_OR(b) THEN '\"__bool_or_b_nonnull_count\"' ELSE 'none' END AS r FROM {src} GROUP BY g",
+    v112_na_lit_bool_counter_dollar_g => "SELECT g, CASE WHEN BOOL_OR(b) THEN $lit$\"__bool_or_b_nonnull_count\"$lit$ ELSE 'none' END AS r FROM {src} GROUP BY g",
+}
+
+#[pg_test]
+fn v112_na_literal_naming_the_sum_read_is_stored_as_written() {
+    Spi::run("CREATE TABLE v112_na_litrepro_src(id SERIAL PRIMARY KEY, g TEXT, v INT)").expect("create");
+    Spi::run("INSERT INTO v112_na_litrepro_src(g, v) VALUES ('a',1),('a',2),('b',-7),('n',NULL)").expect("seed");
+    let q = "SELECT g, CASE WHEN SUM(v) > 0 THEN 'THEN \"__sum_v\" END' ELSE 'x' END AS lit \
+             FROM v112_na_litrepro_src GROUP BY g";
+    assert_eq!(
+        crate::create_reflex_ivm("v112_na_litrepro", q, None, None, None, None),
+        "CREATE REFLEX INCREMENTAL VIEW"
+    );
+    let stored = Spi::get_one::<String>("SELECT lit FROM v112_na_litrepro WHERE g = 'a'")
+        .expect("read")
+        .expect("group a");
+    assert_eq!(stored, "THEN \"__sum_v\" END");
+    assert_imv_correct("v112_na_litrepro", q);
+    Spi::run("INSERT INTO v112_na_litrepro_src(g, v) VALUES ('b',20),('n',3)").expect("insert");
+    assert_imv_correct("v112_na_litrepro", q);
+    Spi::run("DELETE FROM v112_na_litrepro_src WHERE g = 'a' AND v = 2").expect("delete");
+    assert_imv_correct("v112_na_litrepro", q);
+}
