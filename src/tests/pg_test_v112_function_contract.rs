@@ -376,3 +376,104 @@ fn v112_fn_extract_is_kept_and_correct() {
     Spi::run("DELETE FROM v112_fn_ex_src WHERE id = 1").expect("delete");
     assert_imv_correct("v112_fn_ex", q);
 }
+
+#[pg_test]
+fn v112_fn_volatile_function_with_non_ascii_upper_case_name_rejected() {
+    v112_fn_table("v112_fn_na_src");
+    Spi::run("CREATE FUNCTION \"v112_fn_ÉVOL\"() RETURNS int LANGUAGE sql VOLATILE AS 'SELECT 1'")
+        .expect("quoted fn");
+    Spi::run("CREATE FUNCTION v112_fn_Èvol2() RETURNS int LANGUAGE sql VOLATILE AS 'SELECT 1'")
+        .expect("unquoted fn");
+    v112_fn_assert_rejected(
+        "v112_fn_na_0",
+        "SELECT id, v + \"v112_fn_ÉVOL\"() AS x FROM v112_fn_na_src",
+        "Volatile function(s) v112_fn_Évol",
+    );
+    v112_fn_assert_rejected(
+        "v112_fn_na_1",
+        "SELECT id, v + v112_fn_Èvol2() AS x FROM v112_fn_na_src",
+        "Volatile function(s) v112_fn_Èvol2",
+    );
+}
+
+#[pg_test]
+fn v112_fn_immutable_function_with_non_ascii_name_accepted() {
+    v112_fn_table("v112_fn_nai_src");
+    Spi::run("CREATE FUNCTION \"v112_fn_ÉIMM\"(int) RETURNS int LANGUAGE sql IMMUTABLE AS 'SELECT $1 * 3'")
+        .expect("fn");
+    let q = "SELECT id, \"v112_fn_ÉIMM\"(v) AS x FROM v112_fn_nai_src";
+    assert_eq!(
+        crate::create_reflex_ivm("v112_fn_nai", q, None, None, None, None),
+        "CREATE REFLEX INCREMENTAL VIEW"
+    );
+    Spi::run("INSERT INTO v112_fn_nai_src(g, v) VALUES ('a', 9), ('c', 4)").expect("insert");
+    Spi::run("DELETE FROM v112_fn_nai_src WHERE id = 2").expect("delete");
+    assert_imv_correct("v112_fn_nai", q);
+}
+
+#[pg_test]
+fn v112_fn_plain_function_sharing_a_name_with_an_aggregate_accepted() {
+    v112_fn_table("v112_fn_amb_src");
+    Spi::run("CREATE AGGREGATE v112_fn_amb(int) (sfunc = int4pl, stype = int, initcond = '0')")
+        .expect("agg");
+    Spi::run("CREATE FUNCTION v112_fn_amb(a int, b int) RETURNS int LANGUAGE sql IMMUTABLE AS 'SELECT a + b'")
+        .expect("fn");
+    let q = "SELECT id, v112_fn_amb(v, id) AS m FROM v112_fn_amb_src";
+    assert_eq!(
+        crate::create_reflex_ivm("v112_fn_amb_v", q, None, None, None, None),
+        "CREATE REFLEX INCREMENTAL VIEW"
+    );
+    Spi::run("INSERT INTO v112_fn_amb_src(g, v) VALUES ('a', 9), ('c', 4)").expect("insert");
+    Spi::run("DELETE FROM v112_fn_amb_src WHERE id = 2").expect("delete");
+    assert_imv_correct("v112_fn_amb_v", q);
+}
+
+#[pg_test]
+fn v112_fn_unlabelled_function_rejection_converges_once_declared_immutable() {
+    v112_fn_table("v112_fn_lbl_src");
+    Spi::run("CREATE FUNCTION v112_fn_lbl(a int) RETURNS int LANGUAGE sql AS 'SELECT a * 2'")
+        .expect("fn");
+    let q = "SELECT id, v112_fn_lbl(v) AS d FROM v112_fn_lbl_src";
+    let rejected = crate::create_reflex_ivm("v112_fn_lbl_v", q, None, None, None, None);
+    assert!(rejected.starts_with("ERROR: [reflex-unsupported]"), "{rejected}");
+    assert!(rejected.contains("Volatile function(s) v112_fn_lbl"), "{rejected}");
+    assert!(
+        rejected.find("ALTER FUNCTION").is_some_and(|p| p < 300),
+        "{rejected}"
+    );
+    assert!(rejected.find("IMMUTABLE").is_some_and(|p| p < 300), "{rejected}");
+    assert_eq!(v112_fn_leftovers("v112_fn_lbl_v"), 0);
+
+    Spi::run("ALTER FUNCTION v112_fn_lbl(int) IMMUTABLE").expect("alter");
+    assert_eq!(
+        crate::create_reflex_ivm("v112_fn_lbl_v", q, None, None, None, None),
+        "CREATE REFLEX INCREMENTAL VIEW"
+    );
+    Spi::run("INSERT INTO v112_fn_lbl_src(g, v) VALUES ('a', 9), ('c', 4)").expect("insert");
+    Spi::run("DELETE FROM v112_fn_lbl_src WHERE id = 2").expect("delete");
+    assert_imv_correct("v112_fn_lbl_v", q);
+}
+
+#[pg_test]
+fn v112_fn_backend_and_connection_functions_rejected() {
+    v112_fn_table("v112_fn_sess_src");
+    for (i, q) in [
+        "SELECT id, pg_backend_pid() AS p FROM v112_fn_sess_src",
+        "SELECT id, g FROM v112_fn_sess_src WHERE inet_client_addr() IS NULL",
+    ]
+    .iter()
+    .enumerate()
+    {
+        v112_fn_assert_rejected(&format!("v112_fn_sess_{i}"), q, "Non-deterministic");
+    }
+}
+
+#[pg_test]
+fn v112_fn_ungrouped_aggregate_derived_item_is_not_called_a_non_aggregate() {
+    v112_fn_table("v112_fn_ungd_src");
+    v112_fn_assert_rejected(
+        "v112_fn_ungd_0",
+        "SELECT SUM(v) IS NULL AS e, COUNT(*) AS c FROM v112_fn_ungd_src",
+        "'e' is not an aggregate expression that pg_reflex supports and is not a group key",
+    );
+}

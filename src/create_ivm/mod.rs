@@ -350,7 +350,9 @@ pub(crate) fn timezone_sensitivity_warning(
     Some(format!(
         "pg_reflex: '{view_name}' uses {} whose result depends on the session TimeZone when \
          applied to timestamptz. Writers with different TimeZone settings will make the IMV \
-         diverge. Pin the zone, e.g. date_trunc('day', ts, 'UTC') or ts AT TIME ZONE 'UTC'.",
+         diverge. The three-argument form date_trunc('day', ts, 'UTC') clears this warning; \
+         for the other functions pin the zone with AT TIME ZONE, where the warning is by name \
+         and remains.",
         functions.join(", ")
     ))
 }
@@ -369,12 +371,13 @@ fn function_contract_violation(
         .map(|f| f.name.clone())
         .collect();
     let (volatile, aggregates) = catalog_function_kinds(&called);
-    if !volatile.is_empty() {
+    if let Some(first) = volatile.first() {
         return Some(format!(
-            "Volatile function(s) {} are not supported in IMV '{view_name}'. Fix: remove them \
-             from the IMV query, or compute the value into a source column. A volatile \
-             function returns a different result on each call, so the IMV would diverge from \
-             its own query.",
+            "Volatile function(s) {} are not supported in IMV '{view_name}'. Fix: if a function \
+             is in fact deterministic, declare it with ALTER FUNCTION {first}(...) IMMUTABLE \
+             (or STABLE); otherwise remove it from the IMV query, or compute the value into a \
+             source column. A volatile function returns a different result on each call, so \
+             the IMV would diverge from its own query.",
             volatile.join(", ")
         ));
     }
@@ -407,33 +410,47 @@ fn ungrouped_non_aggregate_column(ctx: &BuildContext) -> Option<String> {
         .map(|col| col.alias.clone().unwrap_or_else(|| col.expr_sql.clone()))
 }
 
-/// Lower-cased names among `called` that the catalog knows as (volatile functions, aggregates).
+/// Names among `called` that the catalog knows as (volatile functions, aggregates with
+/// no plain function of the same name). Both sides fold ASCII only, as PostgreSQL does
+/// for identifiers, so a name with a non-ASCII upper-case letter still matches.
 fn catalog_function_kinds(called: &[String]) -> (Vec<String>, Vec<String>) {
     if called.is_empty() {
         return (Vec::new(), Vec::new());
     }
     let names = crate::sql_writer::identifier::format_pg_text_array(called);
-    let lookup = |condition: &str| -> Vec<String> {
-        Spi::connect(|client| {
-            client
-                .select(
-                    &format!(
-                        "SELECT DISTINCT lower(proname::text) AS name FROM pg_catalog.pg_proc \
-                         WHERE lower(proname::text) = ANY($1::text[]) AND {condition} ORDER BY 1"
-                    ),
-                    None,
-                    &[unsafe {
-                        DatumWithOid::new(names.clone(), PgBuiltInOids::TEXTOID.oid().value())
-                    }],
-                )
-                .unwrap_or_report()
-                .filter_map(|row| row.get_by_name::<String, _>("name").unwrap_or(None))
-                .collect()
-        })
+    let kinds: Vec<(String, bool, bool)> = Spi::connect(|client| {
+        client
+            .select(
+                "SELECT lower(proname::text COLLATE \"C\") AS name, \
+                        bool_or(prokind = 'f' AND provolatile = 'v') AS is_volatile, \
+                        bool_or(prokind = 'a') AND NOT bool_or(prokind = 'f') AS is_aggregate_only \
+                 FROM pg_catalog.pg_proc \
+                 WHERE lower(proname::text COLLATE \"C\") = ANY($1::text[]) \
+                 GROUP BY 1 ORDER BY 1",
+                None,
+                &[unsafe { DatumWithOid::new(names, PgBuiltInOids::TEXTOID.oid().value()) }],
+            )
+            .unwrap_or_report()
+            .filter_map(|row| {
+                Some((
+                    row.get_by_name::<String, _>("name").unwrap_or(None)?,
+                    row.get_by_name::<bool, _>("is_volatile").unwrap_or(None)?,
+                    row.get_by_name::<bool, _>("is_aggregate_only")
+                        .unwrap_or(None)?,
+                ))
+            })
+            .collect()
+    });
+    let names_where = |keep: fn(&(String, bool, bool)) -> bool| -> Vec<String> {
+        kinds
+            .iter()
+            .filter(|kind| keep(kind))
+            .map(|(name, _, _)| name.clone())
+            .collect()
     };
     (
-        lookup("prokind = 'f' AND provolatile = 'v'"),
-        lookup("prokind = 'a'"),
+        names_where(|(_, is_volatile, _)| *is_volatile),
+        names_where(|(_, _, is_aggregate_only)| *is_aggregate_only),
     )
 }
 
@@ -2180,9 +2197,9 @@ pub(crate) fn create_reflex_ivm_impl_with_materialization(
     populate_source_join_keys(&mut ctx);
     if let Some(column) = ungrouped_non_aggregate_column(&ctx) {
         return crate::reflex_reject(&format!(
-            "'{column}' is not an aggregate and the query has no GROUP BY. Fix: add it to a \
-             GROUP BY clause, or select it in an outer passthrough layer over a CTE that holds \
-             the aggregates."
+            "'{column}' is not an aggregate expression that pg_reflex supports and is not a \
+             group key: the query has no GROUP BY. Fix: add it to a GROUP BY clause, or select \
+             it in an outer passthrough layer over a CTE that holds the aggregates."
         ));
     }
 

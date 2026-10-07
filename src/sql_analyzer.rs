@@ -94,7 +94,7 @@ pub(crate) fn bare_function_name(name: &sqlparser::ast::ObjectName) -> String {
     name.0
         .last()
         .and_then(|part| part.as_ident())
-        .map(|ident| ident.value.to_lowercase())
+        .map(|ident| ident.value.to_ascii_lowercase())
         .unwrap_or_default()
 }
 
@@ -104,9 +104,10 @@ pub struct CalledFunction {
     pub arg_count: usize,
 }
 
-const KEYWORD_PSEUDO_FUNCTIONS: [&str; 11] = [
+const KEYWORD_PSEUDO_FUNCTIONS: [&str; 12] = [
     "current_user",
     "session_user",
+    "system_user",
     "user",
     "current_role",
     "current_catalog",
@@ -137,7 +138,7 @@ fn keyword_pseudo_function(ident: &Ident) -> Option<CalledFunction> {
     if ident.quote_style.is_some() {
         return None;
     }
-    let name = ident.value.to_lowercase();
+    let name = ident.value.to_ascii_lowercase();
     KEYWORD_PSEUDO_FUNCTIONS
         .contains(&name.as_str())
         .then_some(CalledFunction { name, arg_count: 0 })
@@ -547,33 +548,33 @@ fn is_known_unsupported_aggregate(func_name: &str) -> bool {
 }
 
 fn is_clock_or_session_function(call: &CalledFunction) -> bool {
-    match call.name.as_str() {
-        "now"
-        | "current_timestamp"
-        | "current_date"
-        | "current_time"
-        | "localtime"
-        | "localtimestamp"
-        | "transaction_timestamp"
-        | "statement_timestamp"
-        | "clock_timestamp"
-        | "timeofday"
-        | "random"
-        | "gen_random_uuid"
-        | "current_user"
-        | "session_user"
-        | "user"
-        | "current_role"
-        | "current_catalog"
-        | "current_setting"
-        | "current_schema"
-        | "current_schemas"
-        | "current_database"
-        | "txid_current"
-        | "pg_current_xact_id" => true,
-        "age" => call.arg_count == 1,
-        _ => false,
-    }
+    let name = call.name.as_str();
+    KEYWORD_PSEUDO_FUNCTIONS.contains(&name)
+        || match name {
+            "now"
+            | "transaction_timestamp"
+            | "statement_timestamp"
+            | "clock_timestamp"
+            | "timeofday"
+            | "pg_postmaster_start_time"
+            | "pg_conf_load_time"
+            | "random"
+            | "gen_random_uuid"
+            | "current_setting"
+            | "current_schemas"
+            | "current_database"
+            | "pg_backend_pid"
+            | "inet_client_addr"
+            | "inet_client_port"
+            | "inet_server_addr"
+            | "inet_server_port"
+            | "txid_current"
+            | "txid_current_if_assigned"
+            | "pg_current_xact_id"
+            | "pg_current_xact_id_if_assigned" => true,
+            "age" => call.arg_count == 1,
+            _ => false,
+        }
 }
 
 fn is_timezone_sensitive_function(call: &CalledFunction) -> bool {

@@ -1339,3 +1339,56 @@ fn extract_is_timezone_sensitive_without_being_a_called_function() {
     let none = parse_and_analyze("SELECT id, upper(g) AS u FROM t");
     assert!(none.timezone_sensitive_functions().is_empty());
 }
+
+#[test]
+fn backend_connection_and_transaction_identity_functions_rejected() {
+    for call in [
+        "SYSTEM_USER",
+        "system_user",
+        "pg_backend_pid()",
+        "inet_client_addr()",
+        "inet_client_port()",
+        "inet_server_addr()",
+        "inet_server_port()",
+        "pg_current_xact_id_if_assigned()",
+        "txid_current_if_assigned()",
+        "pg_postmaster_start_time()",
+        "pg_conf_load_time()",
+        "pg_catalog.pg_backend_pid()",
+    ] {
+        for sql in [
+            format!("SELECT id, {call} AS x FROM t"),
+            format!("SELECT g, COUNT(*) AS c FROM t WHERE ts::text <> ({call})::text GROUP BY g"),
+        ] {
+            assert!(
+                parse_and_analyze(&sql)
+                    .unsupported_reason()
+                    .is_some_and(|r| r.contains("Non-deterministic")),
+                "not rejected: {sql}"
+            );
+        }
+    }
+    assert_eq!(
+        parse_and_analyze("SELECT id, \"system_user\" FROM t").unsupported_reason(),
+        None
+    );
+}
+
+#[test]
+fn every_keyword_pseudo_function_is_a_clock_or_session_function() {
+    for keyword in KEYWORD_PSEUDO_FUNCTIONS {
+        assert!(
+            is_clock_or_session_function(&CalledFunction {
+                name: keyword.to_string(),
+                arg_count: 0,
+            }),
+            "{keyword}"
+        );
+    }
+}
+
+#[test]
+fn bare_function_name_folds_ascii_only() {
+    assert_eq!(bare_name_of_call("\"zz_ÉVOL\""), "zz_Évol");
+    assert_eq!(bare_name_of_call("zz_ÈVol2"), "zz_Èvol2");
+}
