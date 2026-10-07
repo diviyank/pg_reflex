@@ -317,7 +317,8 @@ pub fn replace_source_with_transition(
     // A stored source can be *referenced* in `base_query` in any quoting
     // spelling, independent of how it was registered: a CTE sub-IMV source is
     // registered bare (`schema.bare`) but emitted **quoted**
-    // (`"schema"."bare"`) in the decomposed parent's `base_query`. The quoted
+    // (`"schema"."bare"`) in the decomposed parent's `base_query`, and a user
+    // may quote only one of the two parts. The quoted
     // spellings MUST be rewritten before the bare-token pass, otherwise that
     // pass matches `bare` *inside* the existing quotes (`"bare"`) and injects
     // the already-quoted transition name, producing `"schema".""__reflex_…""`
@@ -327,11 +328,13 @@ pub fn replace_source_with_transition(
     let mut out = stripped;
     if let Some(s) = schema {
         let schema_unq = s.trim_matches('"');
-        out = replace_identifier_outside_literals(
-            &out,
-            &format!("\"{}\".\"{}\"", schema_unq, bare_unq),
-            &quoted_tbl,
-        );
+        for quoted_spelling in [
+            format!("\"{}\".\"{}\"", schema_unq, bare_unq),
+            format!("\"{}\".{}", schema_unq, bare_unq),
+            format!("{}.\"{}\"", schema_unq, bare_unq),
+        ] {
+            out = replace_identifier_outside_literals(&out, &quoted_spelling, &quoted_tbl);
+        }
     }
     out = replace_identifier_outside_literals(&out, &format!("\"{}\"", bare_unq), &quoted_tbl);
     out = replace_identifier_outside_literals(&out, source_table, &quoted_tbl);
