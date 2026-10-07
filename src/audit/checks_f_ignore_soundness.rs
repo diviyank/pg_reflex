@@ -1,10 +1,10 @@
-//! A2: does the registry still hold an unsound `ignore_sources` entry that was
+//! Does the registry still hold an unsound `ignore_sources` entry that was
 //! never acknowledged?
 //!
-//! A1 (`src/create_ivm/ignore_soundness.rs`) refuses this shape at create time,
-//! but only protects IMVs created from 1.11.4 onward. Everything installed
-//! before then — including any IMV whose ignore predates the '!' ack — carries
-//! the same silent-wipe hazard and is invisible to A1. This check is the audit
+//! The create-time check (`src/create_ivm/ignore_soundness.rs`) refuses this
+//! shape, but only protects IMVs created after it existed. Any older IMV —
+//! including one whose ignore predates the '!' ack — carries the same
+//! silent-wipe hazard and is invisible to it. This check is the audit
 //! surface for those: it re-runs the same resolver against the registry's
 //! stored `base_query` and flags anything not already acknowledged.
 
