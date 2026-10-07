@@ -825,3 +825,15 @@ fn v112_fn_clock_rejection_names_the_matched_function() {
         "Fix: remove age, now, current_date from the IMV query",
     );
 }
+
+#[pg_test]
+fn v112_fn_ungrouped_column_rejection_prints_the_cte_remedy_first() {
+    v112_fn_table("v112_fn_ro_src");
+    let res = v112_fn_rejection(
+        "v112_fn_ro_v",
+        "SELECT COUNT(DISTINCT v) IN (1, 2) AS e, COUNT(*) AS n FROM v112_fn_ro_src",
+    );
+    let cte_remedy = res.find("outer passthrough layer over a CTE").expect("CTE remedy");
+    let group_by_remedy = res.find("GROUP BY clause").expect("GROUP BY remedy");
+    assert!(cte_remedy < group_by_remedy, "{res}");
+}
