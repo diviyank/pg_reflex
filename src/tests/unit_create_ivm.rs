@@ -401,3 +401,53 @@ fn split_and_matches_legacy_on_ascii_conditions() {
     }
     assert!(split_cases > 500, "split only {split_cases}");
 }
+
+#[test]
+fn timezone_warning_names_view_and_functions_and_pins_remedy() {
+    let parsed = Parser::parse_sql(
+        &PostgreSqlDialect {},
+        "SELECT date_trunc('day', ts) AS d, to_char(ts, 'YYYY') AS y, SUM(v) AS s FROM t GROUP BY 1, 2",
+    )
+    .unwrap();
+    let analysis = analyze(&parsed).unwrap();
+    let msg = timezone_sensitivity_warning("my_view", &analysis).expect("warns");
+    assert!(msg.contains("'my_view'"), "{msg}");
+    assert!(msg.contains("date_trunc, to_char"), "{msg}");
+    assert!(msg.contains("TimeZone"), "{msg}");
+    assert!(msg.contains("date_trunc('day', ts, 'UTC')"), "{msg}");
+}
+
+#[test]
+fn timezone_warning_is_silent_for_zone_independent_functions() {
+    for sql in [
+        "SELECT id, length(g) AS l, concat(g, 'x') AS c, upper(g) AS u FROM t",
+        "SELECT date_trunc('day', ts, 'UTC') AS d, SUM(v) AS s FROM t GROUP BY 1",
+        "SELECT g, SUM(v) AS s FROM t GROUP BY g",
+    ] {
+        let parsed = Parser::parse_sql(&PostgreSqlDialect {}, sql).unwrap();
+        let analysis = analyze(&parsed).unwrap();
+        assert_eq!(
+            timezone_sensitivity_warning("my_view", &analysis),
+            None,
+            "{sql}"
+        );
+    }
+}
+
+#[test]
+fn timezone_warning_promises_silence_only_for_three_argument_date_trunc() {
+    let parsed = Parser::parse_sql(
+        &PostgreSqlDialect {},
+        "SELECT date_trunc('day', ts) AS d, SUM(v) AS s FROM t GROUP BY 1",
+    )
+    .unwrap();
+    let analysis = analyze(&parsed).unwrap();
+    let msg = timezone_sensitivity_warning("my_view", &analysis).expect("warns");
+    assert!(
+        msg.contains("date_trunc('day', ts, 'UTC') clears this warning"),
+        "{msg}"
+    );
+    assert!(msg.contains("by name and remains"), "{msg}");
+    assert!(!msg.contains("or ts AT TIME ZONE"), "{msg}");
+    assert!(!msg.contains('\n'), "{msg}");
+}
