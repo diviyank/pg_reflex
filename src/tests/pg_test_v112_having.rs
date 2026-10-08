@@ -6,12 +6,16 @@ struct V112HvFixture {
 
 /// Thresholds used by the cells sit between the per-group values these steps
 /// produce, so groups enter and leave the result under INSERT, UPDATE and
-/// DELETE. Group `n` holds only NULLs until `fill` and again after `unfill`.
+/// DELETE. Group `n` holds only NULLs until `fill` and again after `unfill`;
+/// group `d` repeats one value, which a count of rows and a count of distinct
+/// values tell apart. `regrow` brings back the row of an ungrouped aggregate
+/// that `nullonly` (or `only_a`) and `refill` left filtered out.
 const V112_HV_NULLABLE: V112HvFixture = V112HvFixture {
     columns: "g TEXT, v INT, b BOOLEAN, n NUMERIC",
     seed: "('a',1,true,1.25),('a',2,false,2.5),('a',3,false,3.75),('a',NULL,NULL,NULL),\
            ('b',5,false,6.25),('n',NULL,NULL,NULL),('n',NULL,NULL,NULL),('z',0,NULL,0),\
-           ('m',-4,false,-5),('p',7,true,7),('p',8,NULL,8.5)",
+           ('m',-4,false,-5),('p',7,true,7),('p',8,NULL,8.5),('d',4,false,4),('d',4,true,4),\
+           ('d',4,false,4)",
     steps: &[
         (
             "ins",
@@ -41,6 +45,11 @@ const V112_HV_NULLABLE: V112HvFixture = V112HvFixture {
             "refill",
             "INSERT INTO {src}(g, v, b, n) VALUES ('a',4,true,4),('a',5,false,5),('k',1,false,1)",
         ),
+        (
+            "regrow",
+            "INSERT INTO {src}(g, v, b, n) VALUES ('a',30,true,30),('k',-2,false,-2),('r',6,true,6),\
+             ('r',6,false,6)",
+        ),
         ("empty", "DELETE FROM {src}"),
     ],
 };
@@ -48,7 +57,8 @@ const V112_HV_NULLABLE: V112HvFixture = V112HvFixture {
 const V112_HV_NOT_NULL: V112HvFixture = V112HvFixture {
     columns: "g TEXT NOT NULL, v INT NOT NULL, b BOOLEAN NOT NULL, n NUMERIC NOT NULL",
     seed: "('a',1,true,1.25),('a',2,false,2.5),('a',3,false,3.75),('b',5,false,6.25),\
-           ('z',0,false,0),('m',-4,false,-5),('p',7,true,7),('p',8,false,8.5)",
+           ('z',0,false,0),('m',-4,false,-5),('p',7,true,7),('p',8,false,8.5),('d',4,false,4),\
+           ('d',4,true,4),('d',4,false,4)",
     steps: &[
         (
             "ins",
@@ -72,6 +82,11 @@ const V112_HV_NOT_NULL: V112HvFixture = V112HvFixture {
         (
             "refill",
             "INSERT INTO {src}(g, v, b, n) VALUES ('a',4,true,4),('a',5,false,5),('k',1,false,1)",
+        ),
+        (
+            "regrow",
+            "INSERT INTO {src}(g, v, b, n) VALUES ('a',30,true,30),('k',-2,false,-2),('r',6,true,6),\
+             ('r',6,false,6)",
         ),
         ("empty", "DELETE FROM {src}"),
     ],
