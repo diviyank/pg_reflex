@@ -364,3 +364,49 @@ fn v112_cl_aggregate_that_is_not_the_builtin_is_rejected_or_keyless() {
     assert_eq!(v112_cl_unique_key("other_max_u"), "");
 }
 
+// ---- a constant select item beside GROUP BY or DISTINCT ----
+
+#[pg_test]
+fn v112_cl_bare_constant_beside_group_by_is_rejected() {
+    for (position, constant) in ["'plain'", "NULL", "TRUE", "3.5", "-1", "('plain')"].iter().enumerate() {
+        for (shape, select) in [
+            ("g", format!("SELECT g, {constant} AS d, SUM(v) AS s FROM {{src}} GROUP BY g")),
+            ("d", format!("SELECT DISTINCT g, {constant} AS d FROM {{src}}")),
+        ] {
+            let tag = format!("const{position}{shape}");
+            let outcome = v112_cl_gv(&tag, &select, "", "IMMEDIATE");
+            v112_cl_assert_rejected(&tag, &outcome, "cast it");
+        }
+    }
+}
+
+#[pg_test]
+fn v112_cl_cast_constant_beside_group_by_is_maintained() {
+    for (position, constant) in [
+        "'plain'::text",
+        "NULL::text",
+        "TRUE::boolean",
+        "3.5::numeric",
+        "(-1)::int",
+        "2",
+        "1 + 1",
+        "upper('x')",
+    ]
+    .iter()
+    .enumerate()
+    {
+        for (shape, select) in [
+            ("g", format!("SELECT g, {constant} AS d, SUM(v) AS s FROM {{src}} GROUP BY g")),
+            ("d", format!("SELECT DISTINCT g, {constant} AS d FROM {{src}}")),
+        ] {
+            let tag = format!("cast_const{position}{shape}");
+            assert_eq!(v112_cl_gv(&tag, &select, "", "IMMEDIATE"), "ok", "{select}");
+        }
+    }
+    assert_eq!(
+        v112_cl_gv("const_passthrough", "SELECT id, 'plain' AS d, NULL AS n, g FROM {src}", "", "IMMEDIATE"),
+        "ok"
+    );
+    assert_eq!(v112_cl_unique_key("const_passthrough"), "id");
+}
+
