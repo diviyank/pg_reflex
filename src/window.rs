@@ -8,7 +8,166 @@
 //! aggregate (GROUP BY) or passthrough query — both are handled by existing code.
 //! The VIEW computes window functions at read time over the sub-IMV's small result set.
 
-use crate::sql_analyzer::SqlAnalysis;
+use crate::sql_analyzer::{folded, is_window_call, resolve_aggregate_call, SqlAnalysis};
+use sqlparser::ast::{Expr, Query, Select, SelectItem, Visit, Visitor};
+use std::collections::HashSet;
+use std::ops::ControlFlow;
+
+fn window_call(expr: &Expr) -> Option<&Expr> {
+    let call = match expr {
+        Expr::Cast { expr: inner, .. } => inner.as_ref(),
+        other => other,
+    };
+    is_window_call(call).then_some(call)
+}
+
+fn selected_aggregate(expr: &Expr) -> Option<&sqlparser::ast::Function> {
+    let call = match expr {
+        Expr::Cast { expr: inner, .. } => inner.as_ref(),
+        other => other,
+    };
+    match call {
+        Expr::Function(f) if f.over.is_none() && f.filter.is_none() => {
+            resolve_aggregate_call(f).map(|_| f)
+        }
+        _ => None,
+    }
+}
+
+/// What a window expression reads that the window view cannot find in the base
+/// sub-IMV, as a rejection reason.
+enum UnreadableReference {
+    Column(String),
+    QualifiedColumn(String),
+    Aggregate(String),
+}
+
+struct WindowReferences<'a> {
+    base_columns: &'a HashSet<String>,
+    aliased_aggregates: &'a HashSet<String>,
+    enclosing_queries: usize,
+    enclosing_aggregates: usize,
+    unreadable: Option<UnreadableReference>,
+}
+
+impl WindowReferences<'_> {
+    fn is_aggregate_of_the_base(expr: &Expr) -> bool {
+        matches!(expr, Expr::Function(f) if f.over.is_none() && resolve_aggregate_call(f).is_some())
+    }
+}
+
+impl Visitor for WindowReferences<'_> {
+    type Break = ();
+
+    fn pre_visit_query(&mut self, _query: &Query) -> ControlFlow<()> {
+        self.enclosing_queries += 1;
+        ControlFlow::Continue(())
+    }
+
+    fn post_visit_query(&mut self, _query: &Query) -> ControlFlow<()> {
+        self.enclosing_queries -= 1;
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<()> {
+        let read_by_the_view = self.enclosing_queries == 0 && self.enclosing_aggregates == 0;
+        let unreadable = match expr {
+            _ if !read_by_the_view => None,
+            Expr::Identifier(column) if !self.base_columns.contains(&folded(column)) => {
+                Some(UnreadableReference::Column(column.to_string()))
+            }
+            Expr::CompoundIdentifier(_) => {
+                Some(UnreadableReference::QualifiedColumn(expr.to_string()))
+            }
+            aggregate
+                if Self::is_aggregate_of_the_base(aggregate)
+                    && !self.aliased_aggregates.contains(&aggregate.to_string()) =>
+            {
+                Some(UnreadableReference::Aggregate(aggregate.to_string()))
+            }
+            _ => None,
+        };
+        if Self::is_aggregate_of_the_base(expr) {
+            self.enclosing_aggregates += 1;
+        }
+        if unreadable.is_some() {
+            self.unreadable = unreadable;
+            return ControlFlow::Break(());
+        }
+        ControlFlow::Continue(())
+    }
+
+    fn post_visit_expr(&mut self, expr: &Expr) -> ControlFlow<()> {
+        if Self::is_aggregate_of_the_base(expr) {
+            self.enclosing_aggregates -= 1;
+        }
+        ControlFlow::Continue(())
+    }
+}
+
+/// The window view computes each window expression over the base sub-IMV, so a window
+/// expression can read only what the base projects: a column selected bare under its
+/// own name, or an aggregate selected with an alias. Returns the rejection reason for
+/// the first reference that is neither. A wildcard projects every column, so such a
+/// query is not checked.
+pub fn unreadable_window_reference(select: &Select) -> Option<String> {
+    let mut items: Vec<(&Expr, Option<String>)> = Vec::new();
+    for item in &select.projection {
+        match item {
+            SelectItem::UnnamedExpr(expr) => items.push((expr, None)),
+            SelectItem::ExprWithAlias { expr, alias } => items.push((expr, Some(folded(alias)))),
+            SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => return None,
+        }
+    }
+    let base_items = || items.iter().filter(|(expr, _)| window_call(expr).is_none());
+    let base_columns: HashSet<String> = base_items()
+        .filter_map(|(expr, alias)| {
+            let column = match expr {
+                Expr::Identifier(column) => folded(column),
+                Expr::CompoundIdentifier(parts) => folded(parts.last()?),
+                _ => return None,
+            };
+            alias
+                .as_ref()
+                .is_none_or(|alias| *alias == column)
+                .then_some(column)
+        })
+        .collect();
+    let aliased_aggregates: HashSet<String> = base_items()
+        .filter(|(_, alias)| alias.is_some())
+        .filter_map(|(expr, _)| selected_aggregate(expr).map(|f| f.to_string()))
+        .collect();
+
+    let mut references = WindowReferences {
+        base_columns: &base_columns,
+        aliased_aggregates: &aliased_aggregates,
+        enclosing_queries: 0,
+        enclosing_aggregates: 0,
+        unreadable: None,
+    };
+    for (expr, _) in items.iter().filter(|(expr, _)| window_call(expr).is_some()) {
+        let _ = expr.visit(&mut references);
+    }
+    let cte_remedy = "if it must be renamed or qualified, compute it in a CTE and apply the \
+                      window function in the outer SELECT over that CTE";
+    references.unreadable.map(|unreadable| match unreadable {
+        UnreadableReference::Column(column) => format!(
+            "A window function reads the column '{column}', which the SELECT list does not \
+             project bare under its own name: the window is computed over the IMV's other \
+             output columns. Fix: add {column} to the SELECT list; {cte_remedy}."
+        ),
+        UnreadableReference::QualifiedColumn(column) => format!(
+            "A window function reads '{column}' with a qualifier, which the IMV's output \
+             columns do not carry: the window is computed over them. Fix: write the bare name \
+             of a column of the SELECT list; {cte_remedy}."
+        ),
+        UnreadableReference::Aggregate(aggregate) => format!(
+            "A window function reads the aggregate {aggregate}, which the SELECT list does not \
+             hold under an alias: the window is computed over the IMV's other output columns. \
+             Fix: select it with an alias beside the window function ({aggregate} AS total)."
+        ),
+    })
+}
 
 /// Result of decomposing a windowed query.
 pub struct WindowDecomposition {

@@ -630,3 +630,56 @@ fn v112_cl_set_returning_function_elsewhere_keeps_the_key() {
     );
 }
 
+// ---- window functions read the base sub-IMV ----
+
+#[pg_test]
+fn v112_cl_window_over_an_unprojected_column_is_rejected() {
+    for (tag, select, fragment) in [
+        ("win_part", "SELECT id, v, SUM(v) OVER (PARTITION BY g) AS w FROM {src}", "'g'"),
+        ("win_arg", "SELECT id, g, SUM(v) OVER (PARTITION BY g) AS w FROM {src}", "'v'"),
+        ("win_order", "SELECT g, v, ROW_NUMBER() OVER (ORDER BY id) AS w FROM {src}", "'id'"),
+        ("win_renamed", "SELECT id, g AS grp, v, SUM(v) OVER (PARTITION BY g) AS w FROM {src}", "'g'"),
+        ("win_shadow", "SELECT id, v, v AS g, COUNT(*) OVER (PARTITION BY g) AS w FROM {src}", "'g'"),
+        (
+            "win_shadow_expr",
+            "SELECT id, v, upper(g) AS g, COUNT(*) OVER (PARTITION BY g) AS w FROM {src}",
+            "'g'",
+        ),
+        (
+            "win_qualified",
+            "SELECT id, g, v, SUM(v) OVER (PARTITION BY {src}.g) AS w FROM {src}",
+            ".g'",
+        ),
+    ] {
+        let outcome = v112_cl_gv(tag, select, "", "IMMEDIATE");
+        v112_cl_assert_rejected(tag, &outcome, fragment);
+        assert!(outcome.contains("window function"), "{outcome}");
+    }
+    let unselected = v112_cl_gv(
+        "win_agg",
+        "SELECT g, RANK() OVER (ORDER BY SUM(v) DESC) AS rnk FROM {src} GROUP BY g",
+        "",
+        "IMMEDIATE",
+    );
+    v112_cl_assert_rejected("win_agg", &unselected, "SUM(v)");
+}
+
+#[pg_test]
+fn v112_cl_window_over_projected_columns_is_maintained() {
+    for (tag, select) in [
+        ("win_ok0", "SELECT id, g, v, SUM(v) OVER (PARTITION BY g) AS w FROM {src}"),
+        ("win_ok1", "SELECT id, g, v, ROW_NUMBER() OVER (ORDER BY id) AS w FROM {src}"),
+        (
+            "win_ok2",
+            "SELECT g, SUM(v) AS total, RANK() OVER (ORDER BY SUM(v) DESC) AS rnk FROM {src} GROUP BY g",
+        ),
+        (
+            "win_ok_cte",
+            "WITH b AS (SELECT id, g AS grp, v AS val FROM {src}) \
+             SELECT id, grp, val, SUM(val) OVER (PARTITION BY grp) AS w FROM b",
+        ),
+    ] {
+        assert_eq!(v112_cl_gv(tag, select, "", "IMMEDIATE"), "ok", "{select}");
+    }
+}
+

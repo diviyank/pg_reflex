@@ -1342,7 +1342,7 @@ pub(crate) fn collect_column_refs(expr: &Expr) -> Vec<Vec<String>> {
     collector.refs
 }
 
-fn folded(id: &Ident) -> String {
+pub(crate) fn folded(id: &Ident) -> String {
     match id.quote_style {
         Some(_) => id.value.clone(),
         None => id.value.to_lowercase(),
@@ -1745,6 +1745,17 @@ pub fn is_bare_column_reference(expr_sql: &str) -> bool {
         _ => return false,
     };
     matches!(e, Expr::Identifier(_) | Expr::CompoundIdentifier(_))
+}
+
+/// The SELECT of a single-statement query that is not a set operation.
+pub(crate) fn top_level_select(statements: &[Statement]) -> Option<&Select> {
+    match statements {
+        [Statement::Query(query)] => match query.body.as_ref() {
+            SetExpr::Select(select) => Some(select),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 pub fn analyze(statements: &[Statement]) -> Result<SqlAnalysis, SqlAnalysisError> {

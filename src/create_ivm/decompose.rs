@@ -903,6 +903,11 @@ maintained — move it to the outermost SELECT, or define this view with kind: m
         }
         return None;
     }
+    if let Some(reason) = crate::sql_analyzer::top_level_select(&parsed.parsed_sql)
+        .and_then(window::unreadable_window_reference)
+    {
+        return Some(crate::reflex_reject(&reason));
+    }
     let decomp = window::decompose_window_query(&parsed.analysis);
 
     // Create a sub-IMV for the base query (aggregate or passthrough, no windows)
