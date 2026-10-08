@@ -650,14 +650,21 @@ pub(crate) fn map_information_schema_type(data_type: &str) -> String {
 
 /// `format_type` leaves out the schema of a type that is on the `search_path`.
 /// The stored name is read later under any path, so a type outside `pg_catalog`
-/// always gets its schema.
+/// always gets its schema. A column whose collation is not the one of its type
+/// carries it in a `COLLATE` clause: a table column declared without it would
+/// compare and order its values under the database default.
 const DESCRIBED_COLUMNS_SQL: &str = "SELECT a.attname::text AS col_name, \
             (CASE WHEN n.nspname <> 'pg_catalog' AND pg_catalog.pg_type_is_visible(t.oid) \
                   THEN quote_ident(n.nspname) || '.' ELSE '' END \
-             || format_type(a.atttypid, a.atttypmod))::text AS col_type \
+             || format_type(a.atttypid, a.atttypmod) \
+             || CASE WHEN a.attcollation <> 0 AND a.attcollation <> t.typcollation \
+                     THEN ' COLLATE ' || quote_ident(cn.nspname) || '.' || quote_ident(c.collname) \
+                     ELSE '' END)::text AS col_type \
      FROM pg_catalog.pg_attribute a \
      JOIN pg_catalog.pg_type t ON t.oid = a.atttypid \
      JOIN pg_catalog.pg_namespace n ON n.oid = t.typnamespace \
+     LEFT JOIN pg_catalog.pg_collation c ON c.oid = a.attcollation \
+     LEFT JOIN pg_catalog.pg_namespace cn ON cn.oid = c.collnamespace \
      WHERE a.attrelid = to_regclass('pg_temp.' || $1) \
        AND a.attnum > 0 AND NOT a.attisdropped \
      ORDER BY a.attnum";

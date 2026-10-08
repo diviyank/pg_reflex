@@ -772,6 +772,171 @@ v112_ty_bool_or_cells! {
 }
 
 // ---------------------------------------------------------------------------
+// Collation of a MIN / MAX argument and of a group key
+// ---------------------------------------------------------------------------
+
+fn v112_ty_column_collations(relation: &str) -> String {
+    v112_ty_try(&format!(
+        "SELECT string_agg(COALESCE(c.collname, '-'), ', ' ORDER BY a.attnum) \
+         FROM pg_attribute a LEFT JOIN pg_collation c ON c.oid = a.attcollation \
+         WHERE a.attrelid = '{relation}'::regclass AND a.attnum > 0 AND NOT a.attisdropped"
+    ))
+}
+
+/// The letters order differently under the database default, under "C" and
+/// under ICU English: upper case before lower case in the first two, mixed in
+/// the third, where the punctuation also comes first.
+const V112_TY_COLLATION_FIXTURE: V112TyFixture = V112TyFixture {
+    columns: "g TEXT, v INT, tu TEXT COLLATE \"en-x-icu\", td TEXT, tc TEXT COLLATE \"C\", \
+              tp TEXT COLLATE \"POSIX\"",
+    insert_columns: "g, v, tu, td, tc, tp",
+    seed: "('a',1,'b','b','b','b'),('a',2,'C','C','C','C'),('a',3,'c','c','c','c'),\
+           ('z',4,'m','m','m','m'),('z',5,'N','N','N','N'),('n',6,NULL,NULL,NULL,NULL),\
+           ('p',7,'_x','_x','_x','_x'),('p',8,'Zed','Zed','Zed','Zed'),('p',9,'été','été','été','été')",
+    steps: &[
+        (
+            "ins_low",
+            "INSERT INTO {src}(g, v, tu, td, tc, tp) VALUES ('a',10,'a','a','a','a'),('z',11,'B','B','B','B'),\
+             ('n',12,'q','q','q','q')",
+        ),
+        (
+            "ins_high",
+            "INSERT INTO {src}(g, v, tu, td, tc, tp) VALUES ('a',13,'D','D','D','D'),('z',14,'o','o','o','o'),\
+             ('p',15,'Été','Été','Été','Été'),('n',16,'Q','Q','Q','Q')",
+        ),
+        (
+            "upd",
+            "UPDATE {src} SET tu = upper(tu), td = upper(td), tc = upper(tc), tp = upper(tp) WHERE v IN (1, 4, 12)",
+        ),
+        (
+            "upd_back",
+            "UPDATE {src} SET tu = lower(tu), td = lower(td), tc = lower(tc), tp = lower(tp) WHERE v IN (2, 5, 8)",
+        ),
+        ("move", "UPDATE {src} SET g = 'a' WHERE g = 'p'"),
+        ("del_low", "DELETE FROM {src} WHERE v IN (10, 7, 11)"),
+        ("del_high", "DELETE FROM {src} WHERE v IN (13, 14, 9, 15)"),
+        ("empty", "DELETE FROM {src}"),
+        (
+            "refill",
+            "INSERT INTO {src}(g, v, tu, td, tc, tp) VALUES ('a',1,'b','b','b','b'),('a',2,'A','A','A','A'),\
+             ('a',3,'C','C','C','C')",
+        ),
+        (
+            "refill_more",
+            "INSERT INTO {src}(g, v, tu, td, tc, tp) VALUES ('a',4,'a','a','a','a'),('a',5,'d','d','d','d'),\
+             ('a',6,'B','B','B','B')",
+        ),
+    ],
+};
+
+/// `ok` when the cell is correct through every step and each IMV column also
+/// has the collation the query gives it; `no-icu` when the server has no ICU
+/// collation to test with.
+fn v112_ty_collation_cell(tag: &str, select_template: &str, deferred: bool) -> String {
+    let has_icu = v112_ty_try(
+        "SELECT COUNT(*)::text FROM pg_collation WHERE collname = 'en-x-icu'",
+    );
+    if has_icu == "0" {
+        return "no-icu".to_string();
+    }
+    let outcome = v112_ty_cell_on(&V112_TY_COLLATION_FIXTURE, tag, select_template, deferred);
+    if outcome != "ok" {
+        return outcome;
+    }
+    let imv = format!("v112_ty_{tag}");
+    let imv_collations = v112_ty_column_collations(&imv);
+    let query_collations = v112_ty_column_collations(&format!("{imv}_typed_q"));
+    if imv_collations == query_collations {
+        "ok".to_string()
+    } else {
+        format!("WRONG-COLLATION imv ({imv_collations}) query ({query_collations})")
+    }
+}
+
+macro_rules! v112_ty_collation_cells {
+    ($deferred:expr; $($name:ident => $select:expr,)+) => {
+        $(
+            #[pg_test]
+            fn $name() {
+                let tag = stringify!($name).trim_start_matches("v112_types_");
+                let outcome = v112_ty_collation_cell(tag, $select, $deferred);
+                assert!(outcome == "ok" || outcome == "no-icu", "{}: {outcome}", $select);
+            }
+        )+
+    };
+}
+
+v112_ty_collation_cells! {
+    false;
+    v112_types_coll_icu_column_min_g => "SELECT g, MIN(tu) AS lo FROM {src} GROUP BY g",
+    v112_types_coll_icu_column_max_g => "SELECT g, MAX(tu) AS hi FROM {src} GROUP BY g",
+    v112_types_coll_icu_column_both_u => "SELECT MIN(tu) AS lo, MAX(tu) AS hi FROM {src}",
+    v112_types_coll_icu_column_expr_g => "SELECT g, MIN(tu || '') AS lo, MAX(tu || '') AS hi FROM {src} GROUP BY g",
+    v112_types_coll_icu_column_expr_u => "SELECT MIN(tu || '') AS lo, MAX(tu || '') AS hi FROM {src}",
+    v112_types_coll_icu_column_filter_g => "SELECT g, MIN(tu) FILTER (WHERE v > 1) AS lo, MAX(tu) FILTER (WHERE v < 15) AS hi FROM {src} GROUP BY g",
+    v112_types_coll_icu_column_nested_g => "SELECT g, COALESCE(MIN(tu) FILTER (WHERE v > 0), '-') AS lo, COALESCE(MAX(tu), '-') || '!' AS hi FROM {src} GROUP BY g",
+    v112_types_coll_icu_column_nested_u => "SELECT COALESCE(MIN(tu), '-') AS lo, COALESCE(MAX(tu || ''), '-') AS hi FROM {src}",
+    v112_types_coll_icu_column_having_max_g => "SELECT g, COUNT(*) AS c FROM {src} GROUP BY g HAVING MAX(tu || '') > 'b'",
+    v112_types_coll_icu_column_having_min_g => "SELECT g, COUNT(*) AS c FROM {src} GROUP BY g HAVING MIN(tu) < 'B'",
+    v112_types_coll_icu_column_having_both_g => "SELECT g, MIN(tu) AS lo FROM {src} GROUP BY g HAVING MAX(tu) >= 'D'",
+    v112_types_coll_icu_column_having_u => "SELECT COUNT(*) AS c FROM {src} HAVING MIN(tu) < 'B'",
+    v112_types_coll_icu_expr_min_g => "SELECT g, MIN(td COLLATE \"en-x-icu\") AS lo FROM {src} GROUP BY g",
+    v112_types_coll_icu_expr_max_g => "SELECT g, MAX(td COLLATE \"en-x-icu\") AS hi FROM {src} GROUP BY g",
+    v112_types_coll_icu_expr_both_u => "SELECT MIN(td COLLATE \"en-x-icu\") AS lo, MAX(td COLLATE \"en-x-icu\") AS hi FROM {src}",
+    v112_types_coll_icu_expr_filter_g => "SELECT g, MAX(td COLLATE \"en-x-icu\") FILTER (WHERE v > 1) AS hi FROM {src} GROUP BY g",
+    v112_types_coll_icu_expr_nested_g => "SELECT g, COALESCE(MIN(td COLLATE \"en-x-icu\"), '-') AS lo FROM {src} GROUP BY g",
+    v112_types_coll_icu_expr_having_g => "SELECT g, COUNT(*) AS c FROM {src} GROUP BY g HAVING MAX(td COLLATE \"en-x-icu\") > 'b'",
+    v112_types_coll_icu_and_default_g => "SELECT g, MIN(tu) AS a, MIN(td) AS b, MAX(td COLLATE \"en-x-icu\") AS c, MAX(td) AS d FROM {src} GROUP BY g",
+    v112_types_coll_c_column_g => "SELECT g, MIN(tc) AS lo, MAX(tc) AS hi FROM {src} GROUP BY g",
+    v112_types_coll_c_expr_g => "SELECT g, MIN(tu COLLATE \"C\") AS lo, MAX(tu COLLATE \"C\") AS hi FROM {src} GROUP BY g",
+    v112_types_coll_c_expr_having_u => "SELECT COUNT(*) AS c FROM {src} HAVING MIN(tu COLLATE \"C\") < 'B'",
+    v112_types_coll_posix_column_g => "SELECT g, MIN(tp) AS lo, MAX(tp || '') AS hi FROM {src} GROUP BY g",
+    v112_types_coll_posix_expr_u => "SELECT MIN(tu COLLATE \"POSIX\") AS lo, MAX(td COLLATE \"POSIX\") AS hi FROM {src}",
+    v112_types_coll_default_g => "SELECT g, MIN(td) AS lo, MAX(td || '') AS hi FROM {src} GROUP BY g HAVING MAX(td) > 'B'",
+}
+
+v112_ty_collation_cells! {
+    true;
+    v112_types_coll_icu_column_expr_g_deferred => "SELECT g, MIN(tu || '') AS lo, MAX(tu || '') AS hi FROM {src} GROUP BY g",
+    v112_types_coll_icu_expr_both_u_deferred => "SELECT MIN(td COLLATE \"en-x-icu\") AS lo, MAX(td COLLATE \"en-x-icu\") AS hi FROM {src}",
+    v112_types_coll_icu_column_having_max_g_deferred => "SELECT g, COUNT(*) AS c FROM {src} GROUP BY g HAVING MAX(tu || '') > 'b'",
+}
+
+/// The same with a top-K heap of two values: the heap order and its underflow
+/// both depend on the collation.
+#[pg_test]
+fn v112_types_coll_icu_small_heap() {
+    if v112_ty_try("SELECT COUNT(*)::text FROM pg_collation WHERE collname = 'en-x-icu'") == "0" {
+        return;
+    }
+    for (tag, select) in [
+        ("coll_heap_col", "SELECT g, MIN(tu) AS lo, MAX(tu) AS hi FROM {src} GROUP BY g"),
+        ("coll_heap_expr", "SELECT g, MIN(td COLLATE \"en-x-icu\") AS lo, MAX(tu || '') AS hi FROM {src} GROUP BY g"),
+        ("coll_heap_u", "SELECT MIN(tu || '') AS lo, MAX(td COLLATE \"en-x-icu\") AS hi FROM {src}"),
+    ] {
+        let fixture = &V112_TY_COLLATION_FIXTURE;
+        let src = format!("v112_ty_{tag}_src");
+        let imv = format!("v112_ty_{tag}");
+        Spi::run(&format!("CREATE TABLE {src}(id SERIAL PRIMARY KEY, {})", fixture.columns)).expect("source");
+        Spi::run(&format!("INSERT INTO {src}({}) VALUES {}", fixture.insert_columns, fixture.seed)).expect("seed");
+        let fresh = select.replace("{src}", &src);
+        assert_eq!(
+            v112_ty_try(&format!(
+                "SELECT create_reflex_ivm('{imv}', $v112sel${fresh}$v112sel$, NULL, 'UNLOGGED', 'IMMEDIATE', 2)"
+            )),
+            "CREATE REFLEX INCREMENTAL VIEW",
+            "{select}"
+        );
+        let mut outcomes = vec![format!("create={}", v112_ty_oracle(&imv, &fresh))];
+        for (label, dml) in fixture.steps {
+            assert_eq!(v112_ty_try_dml(&dml.replace("{src}", &src)), "OK", "{select} {label}");
+            outcomes.push(format!("{label}={}", v112_ty_oracle(&imv, &fresh)));
+        }
+        assert!(outcomes.iter().all(|o| o.ends_with("=0")), "{select}: {}", outcomes.join(" "));
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Types outside pg_catalog are stored under their schema
 // ---------------------------------------------------------------------------
 

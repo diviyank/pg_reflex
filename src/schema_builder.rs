@@ -59,8 +59,9 @@ fn intermediate_column_spec(
         } else {
             ic.pg_type.clone()
         };
+        let (value_type, collate_clause) = crate::aggregation::split_collation(&effective_type);
         let default = if is_extremum(ic) {
-            extremum_default(&effective_type)
+            extremum_default(value_type)
         } else {
             Some(match effective_type.as_str() {
                 "BOOLEAN" => "FALSE",
@@ -78,10 +79,11 @@ fn intermediate_column_spec(
         // happens at IMV creation via the base_query.
         if ic.has_topk() {
             columns.push(format!(
-                "    \"{}\" {}[] DEFAULT '{{}}'::{}[]",
+                "    \"{}\" {}[]{} DEFAULT '{{}}'::{}[]",
                 ic.topk_column_name(),
-                effective_type,
-                effective_type
+                value_type,
+                collate_clause,
+                value_type
             ));
         }
     }
