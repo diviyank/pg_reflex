@@ -504,3 +504,86 @@ fn v112_cl_output_columns_sharing_a_name_are_rejected() {
     );
 }
 
+// ---- set-returning functions ----
+
+const V112_CL_ARR_STEPS: [&str; 5] = [
+    "INSERT INTO {src}(g, arr) VALUES ('d','{7,8,9}'),('e',NULL)",
+    "UPDATE {src} SET arr = arr || 5 WHERE g = 'a'",
+    "DELETE FROM {src} WHERE g = 'b'",
+    "DELETE FROM {src}",
+    "INSERT INTO {src}(g, arr) VALUES ('z','{1,1}')",
+];
+
+fn v112_cl_arr(tag: &str, select: &str, key: &str, mode: &str) -> String {
+    let src = format!("v112_cl_{tag}_src");
+    Spi::run(&format!(
+        "CREATE TABLE {src}(id SERIAL PRIMARY KEY, g TEXT, arr INT[]); \
+         INSERT INTO {src}(g, arr) VALUES ('a','{{1,2}}'),('b','{{3}}'),('c','{{}}')"
+    ))
+    .expect("source");
+    v112_cl_cell(
+        &format!("v112_cl_{tag}"),
+        &select.replace("{src}", &src),
+        key,
+        mode,
+        &[&src],
+        &v112_cl_steps(&V112_CL_ARR_STEPS, &src),
+    )
+}
+
+#[pg_test]
+fn v112_cl_function_in_from_is_rejected() {
+    for (tag, select) in [
+        ("srf_from0", "SELECT id, g, s.i FROM {src}, generate_series(1, 2) AS s(i)"),
+        ("srf_from1", "SELECT g, COUNT(*) AS c FROM {src}, generate_series(1, 2) AS s(i) GROUP BY g"),
+        ("srf_from2", "SELECT g, e FROM {src}, unnest(arr) AS e"),
+        ("srf_from3", "SELECT g, e FROM {src} CROSS JOIN LATERAL unnest(arr) AS e"),
+        ("srf_from4", "SELECT g, e FROM {src} JOIN LATERAL pg_catalog.unnest(arr) AS e ON true"),
+        ("srf_from6", "SELECT id, g FROM {src} WHERE id IN (SELECT i FROM generate_series(1, 3) AS i)"),
+    ] {
+        let outcome = v112_cl_arr(tag, select, "", "IMMEDIATE");
+        v112_cl_assert_rejected(tag, &outcome, "function in FROM");
+    }
+}
+
+#[pg_test]
+fn v112_cl_function_in_from_remedies_are_maintained() {
+    assert_eq!(
+        v112_cl_arr("srf_remedy_select", "SELECT g, unnest(arr) AS e FROM {src}", "", "IMMEDIATE"),
+        "ok"
+    );
+    Spi::run(
+        "CREATE TABLE v112_cl_series(i INT PRIMARY KEY); INSERT INTO v112_cl_series VALUES (1),(2)",
+    )
+    .expect("series");
+    assert_eq!(
+        v112_cl_arr(
+            "srf_remedy_table",
+            "SELECT t.id, t.g, s.i FROM {src} t CROSS JOIN v112_cl_series s",
+            "",
+            "IMMEDIATE"
+        ),
+        "ok"
+    );
+    assert_eq!(v112_cl_try_dml("INSERT INTO v112_cl_series VALUES (3)"), "OK");
+    assert_eq!(v112_cl_try_dml("INSERT INTO v112_cl_srf_remedy_table_src(g, arr) VALUES ('k','{1}')"), "OK");
+    assert_eq!(v112_cl_try_dml("DELETE FROM v112_cl_series WHERE i = 1"), "OK");
+    assert_eq!(
+        v112_cl_oracle(
+            "v112_cl_srf_remedy_table",
+            "SELECT t.id, t.g, s.i FROM v112_cl_srf_remedy_table_src t CROSS JOIN v112_cl_series s"
+        ),
+        "0"
+    );
+}
+
+#[pg_test]
+fn v112_cl_function_below_the_top_level_from_is_still_accepted() {
+    for (tag, select) in [
+        ("srf_subquery", "SELECT id, g FROM {src} WHERE id IN (SELECT e FROM unnest(ARRAY[1, 3, 4]) AS e)"),
+        ("srf_derived", "SELECT d.g, d.e FROM (SELECT g, e FROM {src}, unnest(arr) AS e) d"),
+    ] {
+        assert_eq!(v112_cl_arr(tag, select, "", "IMMEDIATE"), "ok", "{select}");
+    }
+}
+

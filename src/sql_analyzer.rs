@@ -218,6 +218,45 @@ fn is_constant_refused_as_group_key(expr: &Expr) -> bool {
     }
 }
 
+/// The function a FROM item calls, by the name the query gives it.
+fn from_function_name(factor: &TableFactor) -> Option<String> {
+    match factor {
+        TableFactor::Table {
+            name,
+            args: Some(_),
+            ..
+        } => Some(name.to_string()),
+        TableFactor::Function { name, .. } => Some(name.to_string()),
+        TableFactor::UNNEST { .. } => Some("unnest".to_string()),
+        TableFactor::TableFunction { expr, .. } => Some(expr.to_string()),
+        TableFactor::JsonTable { .. } => Some("json_table".to_string()),
+        TableFactor::OpenJsonTable { .. } => Some("openjson".to_string()),
+        TableFactor::XmlTable { .. } => Some("xmltable".to_string()),
+        _ => None,
+    }
+}
+
+fn factor_is_function_call(factor: &TableFactor) -> bool {
+    matches!(factor, TableFactor::Table { args: Some(_), .. })
+}
+
+fn collect_from_functions(factor: &TableFactor, functions: &mut Vec<String>) {
+    if let TableFactor::NestedJoin {
+        table_with_joins, ..
+    } = factor
+    {
+        collect_from_functions(&table_with_joins.relation, functions);
+        for join in &table_with_joins.joins {
+            collect_from_functions(&join.relation, functions);
+        }
+    }
+    if let Some(name) = from_function_name(factor) {
+        if !functions.contains(&name) {
+            functions.push(name);
+        }
+    }
+}
+
 const DISTINCT_AGGREGATE_REJECTION: &str = "DISTINCT modifier on SUM/AVG/MIN/MAX/BOOL_OR is not supported. \
      Only COUNT(DISTINCT col) is supported. Use a CTE with SELECT DISTINCT \
      to pre-deduplicate: WITH d AS (SELECT DISTINCT grp, val FROM t) SELECT grp, SUM(val) FROM d GROUP BY grp";
@@ -269,6 +308,9 @@ pub struct SqlAnalysis {
     /// SELECT items PostgreSQL refuses as grouping keys (see
     /// `is_constant_refused_as_group_key`).
     pub constants_refused_as_group_key: Vec<String>,
+    /// Functions used as FROM items: in the top-level FROM clause, or anywhere when
+    /// written `name(args)`, which the source collection takes for a table.
+    pub from_functions: Vec<String>,
     /// Set when a clock or session-identity function is called anywhere in the
     /// query, not only in the SELECT list.
     pub has_nondeterministic_select: bool,
@@ -370,6 +412,16 @@ impl SqlAnalysis {
         }
         if self.nested_count_distinct {
             return Some(NESTED_COUNT_DISTINCT_REJECTION.into());
+        }
+        if !self.from_functions.is_empty() {
+            return Some(format!(
+                "A function in FROM ({}) is not supported: an IMV is maintained from the rows \
+                 written to its source tables, and a function is not one. Fix: store the \
+                 function's rows in a table and join that table; a function of the row's own \
+                 columns can be called in the SELECT list instead \
+                 (SELECT g, unnest(arr) AS e FROM t)",
+                self.from_functions.join(", ")
+            ));
         }
         let groups_rows = !self.group_by_columns.is_empty() || self.has_distinct;
         let undecomposed_aggregate = self
@@ -539,6 +591,9 @@ impl<'a> Visitor for AnalysisVisitor<'a> {
                 sample,
                 ..
             } => {
+                if factor_is_function_call(factor) {
+                    collect_from_functions(factor, &mut self.analysis.from_functions);
+                }
                 let table_name = name.to_string();
                 self.analysis.sources.push(table_name.clone());
                 if let Some(a) = alias {
@@ -1806,7 +1861,9 @@ pub fn analyze(statements: &[Statement]) -> Result<SqlAnalysis, SqlAnalysisError
     analysis.from_clause_sql = from_parts.join(", ");
 
     for twj in &select.from {
+        collect_from_functions(&twj.relation, &mut analysis.from_functions);
         for join in &twj.joins {
+            collect_from_functions(&join.relation, &mut analysis.from_functions);
             analysis.joins.push(extract_join_info(join));
         }
     }
