@@ -71,6 +71,9 @@ pub(crate) struct BuildContext<'a> {
     froms: Vec<String>,
     real_source_names: Vec<String>,
     is_join_query: bool,
+    /// Primary-key columns of the source that name output columns holding another
+    /// expression, when that kept the primary key from being the IMV's key.
+    primary_key_names_reused_by_outputs: Vec<String>,
 
     // Pre-SPI resolution outputs
     resolved_unique_columns: Vec<String>,
@@ -228,14 +231,12 @@ fn resolve_unique_columns(ctx: &mut BuildContext) {
         );
     } else if !ctx.is_join_query {
         // Auto-detect: only for single-source queries (JOINs need explicit key)
-        let select_bare_names: std::collections::HashSet<String> = ctx
+        let select_bare_names = columns_projected_under_their_own_name(&ctx.analysis);
+        let output_names: std::collections::HashSet<String> = ctx
             .analysis
             .select_columns
             .iter()
-            .map(|c| {
-                let name = c.alias.as_deref().unwrap_or(&c.expr_sql);
-                bare_column_name(name).to_lowercase()
-            })
+            .map(|c| bare_column_name(c.alias.as_deref().unwrap_or(&c.expr_sql)).to_lowercase())
             .collect();
 
         let real_sources: Vec<&String> = ctx.real_source_names.iter().collect();
@@ -288,6 +289,9 @@ fn resolve_unique_columns(ctx: &mut BuildContext) {
                     );
                     break;
                 } else {
+                    if pk_lower.iter().all(|c| output_names.contains(c)) {
+                        ctx.primary_key_names_reused_by_outputs = pk_lower.clone();
+                    }
                     info!(
                         "pg_reflex: source '{}' has PK ({}) but the SELECT list does not include all PK columns — \
                          passthrough '{}' has no key for it and is fully refreshed by every write to it. \
@@ -332,6 +336,24 @@ fn resolve_unique_columns(ctx: &mut BuildContext) {
         });
         ctx.plan.not_null_columns.extend(proven);
     }
+}
+
+/// Lower-case names of the SELECT items that are a bare, optionally qualified, column
+/// reference output under the column's own name. Only such an item holds the value of
+/// the source column it is named after.
+fn columns_projected_under_their_own_name(
+    analysis: &crate::sql_analyzer::SqlAnalysis,
+) -> std::collections::HashSet<String> {
+    analysis
+        .select_columns
+        .iter()
+        .filter(|c| crate::sql_analyzer::is_bare_column_reference(&c.expr_sql))
+        .filter_map(|c| {
+            let column = bare_column_name(&c.expr_sql).to_lowercase();
+            let output = bare_column_name(c.alias.as_deref().unwrap_or(&c.expr_sql)).to_lowercase();
+            (column == output).then_some(column)
+        })
+        .collect()
 }
 
 fn populate_source_join_keys(ctx: &mut BuildContext) {
@@ -452,11 +474,18 @@ fn check_function_contract(
 
 /// A keyed passthrough is maintained row by row from the transition tables, which
 /// cannot maintain an aggregate. The key is the one `resolve_unique_columns` settled on.
+/// An output column that reuses the name of a primary-key column for another expression
+/// is refused beside such an aggregate too, as the remedy below states.
 fn keyed_keyless_only_aggregate(
     ctx: &BuildContext,
     keyless_only_aggregates: &[String],
 ) -> Option<String> {
-    if keyless_only_aggregates.is_empty() || ctx.resolved_unique_columns.is_empty() {
+    let key_columns = if ctx.resolved_unique_columns.is_empty() {
+        &ctx.primary_key_names_reused_by_outputs
+    } else {
+        &ctx.resolved_unique_columns
+    };
+    if keyless_only_aggregates.is_empty() || key_columns.is_empty() {
         return None;
     }
     Some(format!(
@@ -465,7 +494,7 @@ fn keyed_keyless_only_aggregate(
          not pass unique_columns, and do not name an output column like a primary key \
          column of the source.",
         unsupported_aggregates_message(keyless_only_aggregates),
-        ctx.resolved_unique_columns.join(", ")
+        key_columns.join(", ")
     ))
 }
 
@@ -2377,6 +2406,7 @@ pub(crate) fn create_reflex_ivm_impl_with_materialization(
         froms,
         real_source_names,
         is_join_query,
+        primary_key_names_reused_by_outputs: Vec::new(),
         resolved_unique_columns: Vec::new(),
         resolved_partition_cols: Vec::new(),
         resolved_strategy: String::new(),
