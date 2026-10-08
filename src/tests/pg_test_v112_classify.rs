@@ -807,3 +807,59 @@ fn v112_cl_fixed_date_time_literal_is_accepted() {
     );
 }
 
+// ---- a function called in attribute notation ----
+
+#[pg_test]
+fn v112_cl_row_function_in_attribute_notation_is_rejected() {
+    Spi::run(
+        "CREATE TABLE v112_cl_rowfn_src(id SERIAL PRIMARY KEY, v INT); \
+         INSERT INTO v112_cl_rowfn_src(v) VALUES (1),(2); \
+         CREATE FUNCTION v112_cl_rowvol(v112_cl_rowfn_src) RETURNS float8 LANGUAGE sql VOLATILE \
+             AS 'SELECT random()'; \
+         CREATE FUNCTION v112_cl_rowimm(v112_cl_rowfn_src) RETURNS int LANGUAGE sql IMMUTABLE \
+             AS 'SELECT $1.v + 1'",
+    )
+    .expect("fixture");
+    for (position, select) in [
+        "SELECT id, t.v112_cl_rowvol AS x FROM v112_cl_rowfn_src t",
+        "SELECT id, (t).v112_cl_rowvol AS x FROM v112_cl_rowfn_src t",
+        "SELECT id, v112_cl_rowfn_src.v112_cl_rowvol AS x FROM v112_cl_rowfn_src",
+        "SELECT id, t.v112_cl_rowimm AS x FROM v112_cl_rowfn_src t",
+        "SELECT id, v FROM v112_cl_rowfn_src t WHERE t.v112_cl_rowimm > 1",
+        "SELECT t.V112_CL_ROWIMM AS x, COUNT(*) AS c FROM v112_cl_rowfn_src t GROUP BY t.V112_CL_ROWIMM",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let tag = format!("rowfn{position}");
+        let outcome = v112_cl_create(&format!("v112_cl_{tag}"), select, "", "IMMEDIATE");
+        v112_cl_assert_rejected(&tag, &outcome, "attribute notation");
+    }
+}
+
+#[pg_test]
+fn v112_cl_column_named_like_a_row_function_is_accepted() {
+    Spi::run(
+        "CREATE TABLE v112_cl_rowcol_src(id SERIAL PRIMARY KEY, v INT, v112_cl_rowcolfn INT, \
+             stored INT GENERATED ALWAYS AS (v + 1) STORED); \
+         INSERT INTO v112_cl_rowcol_src(v, v112_cl_rowcolfn) VALUES (1, 10),(2, 20); \
+         CREATE FUNCTION v112_cl_rowcolfn(v112_cl_rowcol_src) RETURNS float8 LANGUAGE sql VOLATILE \
+             AS 'SELECT random()'",
+    )
+    .expect("fixture");
+    assert_eq!(
+        v112_cl_cell(
+            "v112_cl_rowcol",
+            "SELECT t.id, t.v112_cl_rowcolfn, t.stored FROM v112_cl_rowcol_src t",
+            "",
+            "IMMEDIATE",
+            &[],
+            &[
+                "INSERT INTO v112_cl_rowcol_src(v, v112_cl_rowcolfn) VALUES (5, 50)".to_string(),
+                "UPDATE v112_cl_rowcol_src SET v = v + 1, v112_cl_rowcolfn = 0 WHERE id = 1".to_string(),
+                "DELETE FROM v112_cl_rowcol_src WHERE id = 2".to_string(),
+            ],
+        ),
+        "ok"
+    );
+}

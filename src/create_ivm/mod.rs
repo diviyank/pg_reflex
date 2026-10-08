@@ -171,6 +171,14 @@ fn validate_and_parse_inputs(
                 Ok(contract) => contract,
                 Err(reason) => return Err(crate::reflex_reject(&reason)),
             };
+            if let Some(call) = attribute_notation_calls(&parsed_sql, &a).first() {
+                return Err(crate::reflex_reject(&format!(
+                    "'{call}' calls a function in attribute notation (the function takes the \
+                     row of the table), which pg_reflex cannot maintain. Fix: store the value \
+                     in a column of the source table (for an immutable function, a generated \
+                     column) and select that column."
+                )));
+            }
             if let Some(message) = timezone_sensitivity_warning(view_name, &a) {
                 warning!("{message}");
             }
@@ -495,6 +503,114 @@ fn check_function_contract(
             .cloned()
             .collect(),
     })
+}
+
+/// Column references that PostgreSQL resolves as a call `function(row)`: the qualifier
+/// names a source table that has no such column and a one-argument function over its
+/// row type does. Returned as the query writes them.
+fn attribute_notation_calls(
+    statements: &[sqlparser::ast::Statement],
+    analysis: &crate::sql_analyzer::SqlAnalysis,
+) -> Vec<String> {
+    use sqlparser::ast::{AccessExpr, Expr, Visit, Visitor};
+    use std::ops::ControlFlow;
+
+    #[derive(Default)]
+    struct QualifiedReferences(Vec<(String, String, String)>);
+    impl Visitor for QualifiedReferences {
+        type Break = ();
+
+        fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<()> {
+            let parts = match expr {
+                Expr::CompoundIdentifier(parts) if parts.len() == 2 => Some((&parts[0], &parts[1])),
+                Expr::CompoundFieldAccess { root, access_chain } => {
+                    let mut qualifier = root.as_ref();
+                    while let Expr::Nested(inner) = qualifier {
+                        qualifier = inner;
+                    }
+                    match (qualifier, access_chain.as_slice()) {
+                        (Expr::Identifier(table), [AccessExpr::Dot(Expr::Identifier(name))]) => {
+                            Some((table, name))
+                        }
+                        _ => None,
+                    }
+                }
+                _ => None,
+            };
+            if let Some((qualifier, name)) = parts {
+                self.0.push((
+                    crate::sql_analyzer::folded(qualifier),
+                    crate::sql_analyzer::folded(name),
+                    expr.to_string(),
+                ));
+            }
+            ControlFlow::Continue(())
+        }
+    }
+    let mut references = QualifiedReferences::default();
+    for statement in statements {
+        let _ = statement.visit(&mut references);
+    }
+
+    let source_named = |qualifier: &str| {
+        let aliased = analysis
+            .table_aliases
+            .iter()
+            .find(|(alias, _)| normalized_column_name(alias) == qualifier)
+            .map(|(_, table)| table.clone());
+        aliased.or_else(|| {
+            analysis
+                .sources
+                .iter()
+                .find(|source| {
+                    !source.starts_with('<') && normalized_column_name(source) == qualifier
+                })
+                .cloned()
+        })
+    };
+    let mut relations = Vec::new();
+    let mut names = Vec::new();
+    let mut written = Vec::new();
+    for (qualifier, name, text) in references.0 {
+        if let Some(relation) = source_named(&qualifier) {
+            relations.push(relation);
+            names.push(name);
+            written.push(text);
+        }
+    }
+    if relations.is_empty() {
+        return Vec::new();
+    }
+    let text_array = |values: &[String]| unsafe {
+        DatumWithOid::new(
+            crate::sql_writer::identifier::format_pg_text_array(values),
+            PgBuiltInOids::TEXTOID.oid().value(),
+        )
+    };
+    let called_positions: Vec<i64> = Spi::connect(|client| {
+        client
+            .select(
+                "SELECT DISTINCT referenced.position \
+                 FROM unnest($1::text[], $2::text[]) WITH ORDINALITY \
+                      AS referenced(relation, name, position) \
+                 JOIN pg_catalog.pg_class r ON r.oid = to_regclass(referenced.relation) \
+                 JOIN pg_catalog.pg_proc p ON p.proname::text = referenced.name \
+                      AND p.pronargs = 1 AND p.proargtypes[0] = r.reltype \
+                 WHERE NOT EXISTS (SELECT 1 FROM pg_catalog.pg_attribute a \
+                                   WHERE a.attrelid = r.oid AND a.attname::text = referenced.name \
+                                     AND a.attnum > 0 AND NOT a.attisdropped) \
+                 ORDER BY 1",
+                None,
+                &[text_array(&relations), text_array(&names)],
+            )
+            .unwrap_or_report()
+            .filter_map(|row| row.get_by_name::<i64, _>("position").unwrap_or(None))
+            .collect()
+    });
+    called_positions
+        .into_iter()
+        .filter_map(|position| written.get(position as usize - 1).cloned())
+        .collect()
 }
 
 /// A keyed passthrough is maintained row by row from the transition tables, which
