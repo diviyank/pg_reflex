@@ -127,3 +127,39 @@ fn unparseable_text_is_read_by_keyword() {
     assert!(!joins.holds_right_join && !joins.holds_full_join);
     assert!(!joins.source_is_null_extended_table && !joins.source_inside_left_joined_subtree);
 }
+
+fn update_skip_columns(sql: &str) -> std::collections::HashMap<String, Vec<String>> {
+    use sqlparser::dialect::PostgreSqlDialect;
+    use sqlparser::parser::Parser;
+    let parsed = Parser::parse_sql(&PostgreSqlDialect {}, sql).expect("parse");
+    crate::sql_analyzer::analyze(&parsed)
+        .expect("analyze")
+        .imv_relevant_columns
+        .into_iter()
+        .map(|(source, columns)| (source, columns.into_iter().collect()))
+        .collect()
+}
+
+#[test]
+fn natural_join_leaves_no_update_skip_columns() {
+    for sql in [
+        "SELECT d.label, SUM(f.v) AS s FROM fact f NATURAL JOIN dim d GROUP BY d.label",
+        "SELECT d.label, SUM(f.v) AS s FROM fact f NATURAL LEFT JOIN dim d GROUP BY d.label",
+        "SELECT d.label, SUM(f.v) AS s FROM fact f NATURAL RIGHT JOIN dim d GROUP BY d.label",
+        "SELECT d.label, SUM(f.v) AS s FROM fact f NATURAL FULL JOIN dim d GROUP BY d.label",
+        "SELECT d.label, f.v FROM fact f NATURAL INNER JOIN dim d",
+        "SELECT d.label, f.v FROM grp g JOIN (fact f NATURAL JOIN dim d) ON g.kind = d.kind",
+        "SELECT d.label, f.v FROM grp g JOIN fact f ON g.kind = f.kind NATURAL JOIN dim d",
+    ] {
+        assert!(update_skip_columns(sql).is_empty(), "{sql}");
+    }
+}
+
+#[test]
+fn using_join_lists_its_columns_for_every_source() {
+    let columns = update_skip_columns(
+        "SELECT d.label, SUM(f.v) AS s FROM fact f JOIN dim d USING (kind) GROUP BY d.label",
+    );
+    assert!(columns["fact"].contains(&"kind".to_string()));
+    assert!(columns["dim"].contains(&"kind".to_string()));
+}

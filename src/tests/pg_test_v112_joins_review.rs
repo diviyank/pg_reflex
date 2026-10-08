@@ -1,5 +1,5 @@
 // ---------------------------------------------------------------------------
-// A comment inside the join keyword: aggregates
+// NATURAL and USING joins, and a comment inside the join keyword: aggregates
 // ---------------------------------------------------------------------------
 
 macro_rules! v112_jr_join_spelling_cells {
@@ -9,6 +9,20 @@ macro_rules! v112_jr_join_spelling_cells {
 }
 
 v112_jr_join_spelling_cells! { false;
+    v112_jr_nat_inner => "SELECT d.label, COUNT(*) AS c, SUM(f.v) AS s FROM {f} f NATURAL JOIN {d} d GROUP BY d.label",
+    v112_jr_nat_inner_keyword => "SELECT d.label, COUNT(*) AS c, SUM(f.v) AS s FROM {f} f NATURAL INNER JOIN {d} d GROUP BY d.label",
+    v112_jr_nat_inner_by_join_column => "SELECT kind, COUNT(*) AS c, SUM(f.v) AS s FROM {f} f NATURAL JOIN {d} d GROUP BY kind",
+    v112_jr_nat_left => "SELECT d.label, COUNT(*) AS c, SUM(f.v) AS s FROM {d} d NATURAL LEFT JOIN {f} f GROUP BY d.label",
+    v112_jr_nat_right => "SELECT d.label, COUNT(*) AS c, SUM(f.v) AS s FROM {f} f NATURAL RIGHT JOIN {d} d GROUP BY d.label",
+    v112_jr_nat_full => "SELECT d.label, COUNT(*) AS c, SUM(f.v) AS s FROM {f} f NATURAL FULL JOIN {d} d GROUP BY d.label",
+    v112_jr_nat_inner_pt => "SELECT f.id, f.v, d.label FROM {f} f NATURAL JOIN {d} d",
+    v112_jr_nat_right_pt => "SELECT f.id, f.v, d.label FROM {f} f NATURAL RIGHT JOIN {d} d",
+    v112_jr_using_inner => "SELECT d.label, COUNT(*) AS c, SUM(f.v) AS s FROM {f} f JOIN {d} d USING (kind) GROUP BY d.label",
+    v112_jr_using_inner_by_join_column => "SELECT kind, COUNT(*) AS c, SUM(f.v) AS s FROM {f} f JOIN {d} d USING (kind) GROUP BY kind",
+    v112_jr_using_left => "SELECT d.label, COUNT(*) AS c, SUM(f.v) AS s FROM {d} d LEFT JOIN {f} f USING (kind) GROUP BY d.label",
+    v112_jr_using_right => "SELECT d.label, COUNT(*) AS c, SUM(f.v) AS s FROM {f} f RIGHT JOIN {d} d USING (kind) GROUP BY d.label",
+    v112_jr_using_full => "SELECT d.label, COUNT(*) AS c, SUM(f.v) AS s FROM {f} f FULL JOIN {d} d USING (kind) GROUP BY d.label",
+    v112_jr_using_inner_pt => "SELECT f.id, f.v, d.label FROM {f} f JOIN {d} d USING (kind)",
     v112_jr_comment_right => "SELECT d.label, COUNT(*) AS c, SUM(f.v) AS s FROM {f} f RIGHT /* c */ JOIN {d} d ON d.kind = f.kind GROUP BY d.label",
     v112_jr_comment_right_outer => "SELECT d.label, COUNT(*) AS c, SUM(f.v) AS s FROM {f} f RIGHT /* c */ OUTER /* c */ JOIN {d} d ON d.kind = f.kind GROUP BY d.label",
     v112_jr_comment_left => "SELECT d.label, COUNT(*) AS c, SUM(f.v) AS s FROM {d} d LEFT /* c */ JOIN {f} f ON d.kind = f.kind GROUP BY d.label",
@@ -20,6 +34,15 @@ v112_jr_join_spelling_cells! { false;
 }
 
 v112_jr_join_spelling_cells! { true;
+    v112_jr_nat_inner_deferred => "SELECT d.label, COUNT(*) AS c, SUM(f.v) AS s FROM {f} f NATURAL JOIN {d} d GROUP BY d.label",
+    v112_jr_nat_left_deferred => "SELECT d.label, COUNT(*) AS c, SUM(f.v) AS s FROM {d} d NATURAL LEFT JOIN {f} f GROUP BY d.label",
+    v112_jr_nat_right_deferred => "SELECT d.label, COUNT(*) AS c, SUM(f.v) AS s FROM {f} f NATURAL RIGHT JOIN {d} d GROUP BY d.label",
+    v112_jr_nat_full_deferred => "SELECT d.label, COUNT(*) AS c, SUM(f.v) AS s FROM {f} f NATURAL FULL JOIN {d} d GROUP BY d.label",
+    v112_jr_nat_inner_pt_deferred => "SELECT f.id, f.v, d.label FROM {f} f NATURAL JOIN {d} d",
+    v112_jr_using_inner_deferred => "SELECT d.label, COUNT(*) AS c, SUM(f.v) AS s FROM {f} f JOIN {d} d USING (kind) GROUP BY d.label",
+    v112_jr_using_left_deferred => "SELECT d.label, COUNT(*) AS c, SUM(f.v) AS s FROM {d} d LEFT JOIN {f} f USING (kind) GROUP BY d.label",
+    v112_jr_using_right_deferred => "SELECT d.label, COUNT(*) AS c, SUM(f.v) AS s FROM {f} f RIGHT JOIN {d} d USING (kind) GROUP BY d.label",
+    v112_jr_using_full_deferred => "SELECT d.label, COUNT(*) AS c, SUM(f.v) AS s FROM {f} f FULL JOIN {d} d USING (kind) GROUP BY d.label",
     v112_jr_comment_right_deferred => "SELECT d.label, COUNT(*) AS c, SUM(f.v) AS s FROM {f} f RIGHT /* c */ JOIN {d} d ON d.kind = f.kind GROUP BY d.label",
     v112_jr_comment_left_deferred => "SELECT d.label, COUNT(*) AS c, SUM(f.v) AS s FROM {d} d LEFT /* c */ JOIN {f} f ON d.kind = f.kind GROUP BY d.label",
 }
@@ -117,6 +140,14 @@ v112_jr_keyed_cells! { false;
     v112_jr_kp_left_plain => "SELECT d.kind, d.label, f.v FROM {d} d LEFT JOIN {f} f ON d.kind = f.kind",
     v112_jr_kp_right_plain => "SELECT d.kind, d.label, f.v FROM {f} f RIGHT JOIN {d} d ON d.kind = f.kind",
     v112_jr_kp_inner_plain => "SELECT d.kind, d.label, f.v FROM {f} f JOIN {d} d ON d.kind = f.kind",
+    v112_jr_kp_nat_inner => "SELECT kind, d.label, f.v FROM {f} f NATURAL JOIN {d} d",
+    v112_jr_kp_nat_left => "SELECT kind, d.label, f.v FROM {d} d NATURAL LEFT JOIN {f} f",
+    v112_jr_kp_nat_right => "SELECT kind, d.label, f.v FROM {f} f NATURAL RIGHT JOIN {d} d",
+    v112_jr_kp_nat_full => "SELECT kind, d.label, f.v FROM {f} f NATURAL FULL JOIN {d} d",
+    v112_jr_kp_using_inner => "SELECT kind, d.label, f.v FROM {f} f JOIN {d} d USING (kind)",
+    v112_jr_kp_using_left => "SELECT kind, d.label, f.v FROM {d} d LEFT JOIN {f} f USING (kind)",
+    v112_jr_kp_using_right => "SELECT kind, d.label, f.v FROM {f} f RIGHT JOIN {d} d USING (kind)",
+    v112_jr_kp_using_full => "SELECT kind, d.label, f.v FROM {f} f FULL JOIN {d} d USING (kind)",
 }
 
 v112_jr_keyed_cells! { true;
@@ -125,4 +156,12 @@ v112_jr_keyed_cells! { true;
     v112_jr_kp_left_block_comment_deferred => "SELECT d.kind, d.label, f.v FROM {d} d LEFT /* c */ JOIN {f} f ON d.kind = f.kind",
     v112_jr_kp_left_comment_outer_deferred => "SELECT d.kind, d.label, f.v FROM {d} d LEFT /* c */ OUTER JOIN {f} f ON d.kind = f.kind",
     v112_jr_kp_left_plain_deferred => "SELECT d.kind, d.label, f.v FROM {d} d LEFT JOIN {f} f ON d.kind = f.kind",
+    v112_jr_kp_nat_inner_deferred => "SELECT kind, d.label, f.v FROM {f} f NATURAL JOIN {d} d",
+    v112_jr_kp_nat_left_deferred => "SELECT kind, d.label, f.v FROM {d} d NATURAL LEFT JOIN {f} f",
+    v112_jr_kp_nat_right_deferred => "SELECT kind, d.label, f.v FROM {f} f NATURAL RIGHT JOIN {d} d",
+    v112_jr_kp_nat_full_deferred => "SELECT kind, d.label, f.v FROM {f} f NATURAL FULL JOIN {d} d",
+    v112_jr_kp_using_inner_deferred => "SELECT kind, d.label, f.v FROM {f} f JOIN {d} d USING (kind)",
+    v112_jr_kp_using_left_deferred => "SELECT kind, d.label, f.v FROM {d} d LEFT JOIN {f} f USING (kind)",
+    v112_jr_kp_using_right_deferred => "SELECT kind, d.label, f.v FROM {f} f RIGHT JOIN {d} d USING (kind)",
+    v112_jr_kp_using_full_deferred => "SELECT kind, d.label, f.v FROM {f} f FULL JOIN {d} d USING (kind)",
 }
