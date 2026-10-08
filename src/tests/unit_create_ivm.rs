@@ -451,3 +451,79 @@ fn timezone_warning_promises_silence_only_for_three_argument_date_trunc() {
     assert!(!msg.contains("or ts AT TIME ZONE"), "{msg}");
     assert!(!msg.contains('\n'), "{msg}");
 }
+
+// ---------- CTE references pointed at their sub-IMVs ----------
+
+fn sub_imvs(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+    pairs
+        .iter()
+        .map(|(cte, sub_imv)| (cte.to_string(), sub_imv.to_string()))
+        .collect()
+}
+
+/// A query whose every CTE reference carries its own alias, and that spells
+/// the CTE nowhere else, is rewritten exactly as the textual replacement of
+/// the CTE name by the quoted sub-IMV name does.
+#[test]
+fn aliased_cte_references_are_rewritten_as_the_textual_replacement_does() {
+    let map = sub_imvs(&[("base", "v__cte_base"), ("agg", "sch.v__cte_agg")]);
+    for query in [
+        "SELECT b.id, b.v FROM base AS b WHERE b.v > 1",
+        "SELECT b.g, SUM(b.v) AS total FROM base AS b GROUP BY b.g",
+        "SELECT b.g, a.total FROM base AS b JOIN agg AS a ON a.g = b.g",
+        "SELECT b.g FROM base AS b LEFT JOIN agg AS a ON a.g = b.g WHERE a.total IS NULL",
+        "SELECT x.g FROM (SELECT b.g FROM base AS b) AS x",
+        "SELECT o.id FROM other AS o WHERE EXISTS (SELECT 1 FROM agg AS a WHERE a.g = o.g)",
+        "SELECT o.id, o.v FROM other AS o WHERE o.v > 0",
+        "SELECT b.g FROM base AS b UNION ALL SELECT a.g FROM agg AS a",
+    ] {
+        let textual = map.iter().fold(query.to_string(), |sql, (cte, sub_imv)| {
+            crate::sql_writer::identifier::replace_identifier(
+                &sql,
+                cte,
+                &crate::query_decomposer::quote_identifier(sub_imv),
+            )
+        });
+        assert_eq!(cte_query_reading_sub_imvs(query, &map), textual, "{query}");
+    }
+}
+
+#[test]
+fn unaliased_cte_reference_keeps_the_cte_name_as_alias() {
+    let map = sub_imvs(&[("e", "v__cte_e")]);
+    assert_eq!(
+        cte_query_reading_sub_imvs("SELECT e.season, s FROM e WHERE e.s > 1", &map),
+        "SELECT e.season, s FROM \"v__cte_e\" AS e WHERE e.s > 1"
+    );
+    assert_eq!(
+        cte_query_reading_sub_imvs("SELECT season FROM E", &map),
+        "SELECT season FROM \"v__cte_e\" AS E"
+    );
+}
+
+#[test]
+fn only_relation_references_to_a_cte_are_rewritten() {
+    let map = sub_imvs(&[("e", "v__cte_e")]);
+    for (query, rewritten) in [
+        (
+            "SELECT season, 'e' AS tag FROM e WHERE season <> 'e' AND note <> 'a-e-b'",
+            "SELECT season, 'e' AS tag FROM \"v__cte_e\" AS e WHERE season <> 'e' AND note <> 'a-e-b'",
+        ),
+        (
+            "SELECT season, e FROM e WHERE e > 2 GROUP BY season, e",
+            "SELECT season, e FROM \"v__cte_e\" AS e WHERE e > 2 GROUP BY season, e",
+        ),
+        (
+            "SELECT o.e, e(o.v) FROM public.e AS o JOIN other AS x ON x.e = o.e",
+            "SELECT o.e, e(o.v) FROM public.e AS o JOIN other AS x ON x.e = o.e",
+        ),
+    ] {
+        assert_eq!(cte_query_reading_sub_imvs(query, &map), rewritten);
+    }
+}
+
+#[test]
+fn query_of_the_first_cte_is_kept_as_written() {
+    let query = "SELECT  season,sum(v) as s FROM t GROUP BY season";
+    assert_eq!(cte_query_reading_sub_imvs(query, &[]), query);
+}
