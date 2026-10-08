@@ -311,12 +311,6 @@ pub(super) fn rewritten_source_spellings(source_table: &str) -> Vec<String> {
     }
     spellings.push(format!("\"{}\"", bare_unq));
     spellings.push(source_table.to_string());
-    // A source registered with quotes is also referenced without them: another
-    // IMV over the same relation adopts the spelling registered first.
-    let unquoted_source = source_table.replace('"', "");
-    if unquoted_source != source_table {
-        spellings.push(unquoted_source);
-    }
     if bare_source != source_table {
         // Bare column qualifiers (`bare.col`). Quoted spellings are already
         // consumed above, so every remaining match here is genuinely unquoted.
