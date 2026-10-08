@@ -616,3 +616,66 @@ v112_hv_cells! {
     V112_HV_NULLABLE, true, None;
     v112_hv_sub_own_source_def => "SELECT g, COUNT(*) AS c FROM {src} GROUP BY g HAVING COUNT(*) > (SELECT COUNT(*) FROM {src}) / 4",
 }
+
+/// The bulk-insert shortcut is offered for a dimension joined on its key when
+/// a row of it starts passing the WHERE clause, and withheld once the HAVING
+/// subquery reads that dimension.
+fn v112_hv_shortcut_fixture(tag: &str, having: &str) -> (String, String, String) {
+    let fact = format!("v112_hv_{tag}_f");
+    let dimension = format!("v112_hv_{tag}_d");
+    let imv = format!("v112_hv_{tag}");
+    Spi::run(&format!(
+        "CREATE TABLE {fact}(id SERIAL PRIMARY KEY, did INT, v INT)"
+    ))
+    .expect("fact");
+    Spi::run(&format!(
+        "CREATE TABLE {dimension}(id INT PRIMARY KEY, active BOOLEAN)"
+    ))
+    .expect("dimension");
+    Spi::run(&format!(
+        "INSERT INTO {dimension} VALUES (1, true), (2, false), (3, false), (4, false), (5, false)"
+    ))
+    .expect("seed dimension");
+    Spi::run(&format!(
+        "INSERT INTO {fact}(did, v) VALUES (1,10),(1,20),(2,5),(2,5),(2,5),(3,1),(4,50),(5,100)"
+    ))
+    .expect("seed fact");
+    let fresh = format!(
+        "SELECT f.did, SUM(f.v) AS s FROM {fact} f JOIN {dimension} d ON d.id = f.did \
+         WHERE d.active GROUP BY f.did HAVING {}",
+        having.replace("{d}", &dimension)
+    );
+    assert_eq!(v112_hv_create(&imv, &fresh), "CREATE REFLEX INCREMENTAL VIEW");
+    (imv, dimension, fresh)
+}
+
+fn v112_hv_shortcut_sql(imv: &str, dimension: &str) -> String {
+    v112_na_try(&format!(
+        "SELECT COALESCE(string_agg(public.reflex_build_path_c_explain_sql(name, src), ' | '), 'RAISED: not a source') \
+         FROM (SELECT DISTINCT name, src FROM public.__reflex_ivm_reference, unnest(depends_on) src \
+               WHERE name = '{imv}' AND (src = '{dimension}' OR src LIKE '%.{dimension}')) registered"
+    ))
+}
+
+#[pg_test]
+fn v112_hv_sub_joined_dimension_gets_no_bulk_insert_shortcut() {
+    let (plain, plain_dimension, _) = v112_hv_shortcut_fixture("pc_plain", "SUM(f.v) > 10");
+    let offered = v112_hv_shortcut_sql(&plain, &plain_dimension);
+    assert!(offered.starts_with("SELECT"), "{offered}");
+
+    let (imv, dimension, fresh) = v112_hv_shortcut_fixture(
+        "pc_sub",
+        "SUM(f.v) > 10 * (SELECT COUNT(*) FROM {d} WHERE active)",
+    );
+    assert_eq!(v112_hv_shortcut_sql(&imv, &dimension), "");
+    assert_imv_correct(&imv, &fresh);
+    for promotion in [
+        "SET active = true WHERE id IN (2, 4)",
+        "SET active = true WHERE id = 5",
+        "SET active = false WHERE id IN (1, 2)",
+        "SET active = true WHERE id IN (1, 2, 3)",
+    ] {
+        Spi::run(&format!("UPDATE {dimension} {promotion}")).expect("promotion");
+        assert_imv_correct(&imv, &fresh);
+    }
+}
