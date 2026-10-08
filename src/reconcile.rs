@@ -74,8 +74,8 @@ fn heal_missing_intermediate_table(view_name: &str) {
     // `resolve_column_type` falls through to its NUMERIC default and the healed key
     // column is `numeric` where create time made it `timestamptz`.
     //
-    // HAZARD, deliberately guarded below: `augment_column_types_from_query` returns
-    // SILENTLY when its `CREATE TEMP VIEW` fails (`src/create_ivm/admin.rs:513-515`).
+    // HAZARD, deliberately guarded below: a key that neither the sources nor the
+    // described queries hold would be typed by a default.
     // At create time a wrongly-typed intermediate dies immediately on the following
     // `INSERT INTO {intermediate} {base_query}`, which raises and rolls the whole
     // CREATE back. At heal time that protection is absent on the partitioned path:

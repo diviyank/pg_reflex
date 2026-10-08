@@ -1162,3 +1162,35 @@ v112_ty_cells! {
     v112_types_avg_interval_seconds_u => "SELECT AVG(EXTRACT(EPOCH FROM iv)) AS r FROM {src}",
     v112_types_min_max_money_g => "SELECT g, MIN(m) AS lo, MAX(m) AS hi, COUNT(m) AS c FROM {src} GROUP BY g",
 }
+
+// ---------------------------------------------------------------------------
+// Two output columns of one name
+// ---------------------------------------------------------------------------
+
+#[pg_test]
+fn v112_types_duplicate_output_names_are_rejected() {
+    for (tag, select) in [
+        ("dup_max", "SELECT g, MAX(t), MAX(v) FROM {src} GROUP BY g"),
+        ("dup_sum", "SELECT SUM(v), SUM(q) FROM {src}"),
+        ("dup_alias", "SELECT g, SUM(v) AS r, COUNT(*) AS r FROM {src} GROUP BY g"),
+        ("dup_key", "SELECT g, g, COUNT(*) AS c FROM {src} GROUP BY g"),
+        ("dup_expr", "SELECT g, SUM(v) + 1, SUM(q) + 1 FROM {src} GROUP BY g"),
+        ("dup_having", "SELECT g, MIN(v), MIN(q) FROM {src} GROUP BY g HAVING COUNT(*) > 0"),
+        ("dup_passthrough", "SELECT id, v, v FROM {src}"),
+    ] {
+        let (created, leftovers) = v112_ty_create_outcome(tag, select);
+        assert!(
+            created.starts_with("ERROR: [reflex-unsupported]") && created.contains(" AS "),
+            "{select}: {created}"
+        );
+        assert_eq!(leftovers, "none", "{select}");
+    }
+}
+
+// The remedy: the same queries with their columns aliased
+v112_ty_cells! {
+    V112_TY_FIXTURE, false;
+    v112_types_duplicate_names_aliased_max => "SELECT g, MAX(t) AS a, MAX(v) AS b FROM {src} GROUP BY g",
+    v112_types_duplicate_names_aliased_expr => "SELECT g, SUM(v) + 1 AS a, SUM(q) + 1 AS b FROM {src} GROUP BY g",
+    v112_types_same_function_one_unaliased => "SELECT g, MAX(t), MAX(v) AS b FROM {src} GROUP BY g",
+}
