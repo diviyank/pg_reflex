@@ -648,6 +648,20 @@ pub(crate) fn map_information_schema_type(data_type: &str) -> String {
     }
 }
 
+/// `format_type` leaves out the schema of a type that is on the `search_path`.
+/// The stored name is read later under any path, so a type outside `pg_catalog`
+/// always gets its schema.
+const DESCRIBED_COLUMNS_SQL: &str = "SELECT a.attname::text AS col_name, \
+            (CASE WHEN n.nspname <> 'pg_catalog' AND pg_catalog.pg_type_is_visible(t.oid) \
+                  THEN quote_ident(n.nspname) || '.' ELSE '' END \
+             || format_type(a.atttypid, a.atttypmod))::text AS col_type \
+     FROM pg_catalog.pg_attribute a \
+     JOIN pg_catalog.pg_type t ON t.oid = a.atttypid \
+     JOIN pg_catalog.pg_namespace n ON n.oid = t.typnamespace \
+     WHERE a.attrelid = to_regclass('pg_temp.' || $1) \
+       AND a.attnum > 0 AND NOT a.attisdropped \
+     ORDER BY a.attnum";
+
 /// The output columns of `query` in SELECT order, each with the type
 /// PostgreSQL gives it, spelled by `format_type` (type modifier included).
 ///
@@ -662,12 +676,7 @@ pub(crate) fn describe_query_columns(query: &str) -> Vec<(String, String)> {
         }
         let columns: Vec<(String, String)> = client
             .select(
-                "SELECT a.attname::text AS col_name, \
-                        format_type(a.atttypid, a.atttypmod)::text AS col_type \
-                 FROM pg_attribute a \
-                 WHERE a.attrelid = to_regclass('pg_temp.' || $1) \
-                   AND a.attnum > 0 AND NOT a.attisdropped \
-                 ORDER BY a.attnum",
+                DESCRIBED_COLUMNS_SQL,
                 None,
                 &[unsafe {
                     DatumWithOid::new(tmp.to_string(), PgBuiltInOids::TEXTOID.oid().value())
