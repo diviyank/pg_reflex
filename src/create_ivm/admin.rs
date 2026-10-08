@@ -678,9 +678,7 @@ pub(crate) fn describe_query_columns(query: &str) -> Vec<(String, String)> {
     Spi::connect_mut(|client| {
         let tmp = "__reflex_typecheck_view";
         let create = format!("CREATE TEMP VIEW {} AS {}", tmp, query);
-        if client.update(&create, None, &[]).is_err() {
-            return Vec::new();
-        }
+        client.update(&create, None, &[]).unwrap_or_report();
         let columns: Vec<(String, String)> = client
             .select(
                 DESCRIBED_COLUMNS_SQL,
@@ -700,6 +698,33 @@ pub(crate) fn describe_query_columns(query: &str) -> Vec<(String, String)> {
         let _ = client.update(&format!("DROP VIEW IF EXISTS {}", tmp), None, &[]);
         columns
     })
+}
+
+/// PostgreSQL's message when two output columns of `query` have one name, which
+/// no table can hold. The describe runs in a subtransaction, so the refused
+/// view leaves the transaction usable; any other error is raised as it is.
+pub(crate) fn duplicate_output_column(query: &str) -> Option<String> {
+    pgrx::PgTryBuilder::new(|| {
+        let subxact = crate::partition::SubTransaction::begin();
+        describe_query_columns(query);
+        subxact.release();
+        None
+    })
+    .catch_others(|error| {
+        use pgrx::pg_sys::panic::CaughtError;
+        let (code, message) = match &error {
+            CaughtError::PostgresError(report)
+            | CaughtError::ErrorReport(report)
+            | CaughtError::RustPanic {
+                ereport: report, ..
+            } => (report.sql_error_code(), report.message().to_string()),
+        };
+        if code != pgrx::PgSqlErrorCode::ERRCODE_DUPLICATE_COLUMN {
+            error.rethrow();
+        }
+        Some(message)
+    })
+    .execute()
 }
 
 /// Augment the column_types map with actual types from the base_query output.

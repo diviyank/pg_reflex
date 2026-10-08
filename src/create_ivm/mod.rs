@@ -2478,6 +2478,13 @@ pub(crate) fn create_reflex_ivm_impl_with_materialization(
         return Box::leak(msg.into_boxed_str());
     }
 
+    if let Some(duplicate) = duplicate_output_column(ctx.sql) {
+        return crate::reflex_reject(&format!(
+            "{duplicate}: two output columns of the query have the same name. \
+             Fix: give each its own alias, e.g. MAX(a) AS max_a, MAX(b) AS max_b."
+        ));
+    }
+
     match unsupported_sum(&ctx) {
         Some((arg, sum_type)) if sum_type == "real" => {
             return crate::reflex_reject(&format!(
