@@ -3,7 +3,7 @@ use sqlparser::ast::{Expr, FunctionArg, FunctionArgExpr, FunctionArguments};
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 
-use crate::sql_analyzer::{detect_aggregate, resolve_aggregate_call, AggregateKind, SqlAnalysis};
+use crate::sql_analyzer::{resolve_aggregate_call, AggregateCall, AggregateKind, SqlAnalysis};
 use crate::sql_writer::keyword_scan::quoted_identifier_spans;
 
 /// A column in the intermediate (unlogged) table storing partial aggregate state.
@@ -79,7 +79,8 @@ pub struct AggregationPlan {
     /// For secondary (joined) tables, derived from JOIN conditions.
     #[serde(default)]
     pub passthrough_key_mappings: std::collections::HashMap<String, Vec<(String, String)>>,
-    /// Rewritten HAVING clause (aggregate refs replaced with intermediate column names).
+    /// The HAVING predicate as the end query evaluates it: every aggregate is
+    /// replaced by the expression that reads it from the intermediate table.
     #[serde(default)]
     pub having_clause: Option<String>,
     /// Source columns known to be NOT NULL at IMV creation time.
@@ -343,15 +344,22 @@ impl AggregationPlan {
             // A reading nested in a larger expression keeps its CASE. A counter is
             // elided only when it always equals the group's row count, so the
             // reading tests that instead.
-            for count_name in &to_remove {
-                if redirect.contains_key(count_name) {
-                    continue;
-                }
-                mapping.intermediate_expr =
-                    rewrite_column_reads(&mapping.intermediate_expr, count_name, |_, _| {
-                        Some("\"__ivm_count\"".to_string())
-                    });
+            mapping.intermediate_expr = read_row_count_for_elided_counters(
+                &mapping.intermediate_expr,
+                &to_remove,
+                &redirect,
+            );
+        }
+
+        if let Some(having) = self.having_clause.take() {
+            let mut predicate = having;
+            for (orig, canon) in &redirect {
+                predicate =
+                    rewrite_column_reads(&predicate, orig, |_, _| Some(format!("\"{}\"", canon)));
             }
+            self.having_clause = Some(read_row_count_for_elided_counters(
+                &predicate, &to_remove, &redirect,
+            ));
         }
     }
 
@@ -373,6 +381,8 @@ impl AggregationPlan {
         });
     }
 
+    /// The nested readings are those of the aggregate-derived SELECT items and
+    /// of the HAVING predicate.
     fn rewrite_nested_reads(
         &mut self,
         column: &str,
@@ -384,7 +394,29 @@ impl AggregationPlan {
                     rewrite_column_reads(&mapping.intermediate_expr, column, &replacement);
             }
         }
+        if let Some(having) = &mut self.having_clause {
+            *having = rewrite_column_reads(having, column, &replacement);
+        }
     }
+}
+
+/// `expr` reading `__ivm_count` in place of each counter of `elided` that has
+/// no entry in `redirected`.
+fn read_row_count_for_elided_counters(
+    expr: &str,
+    elided: &std::collections::HashSet<String>,
+    redirected: &std::collections::HashMap<String, String>,
+) -> String {
+    let mut reading = expr.to_string();
+    for count_name in elided {
+        if redirected.contains_key(count_name) {
+            continue;
+        }
+        reading = rewrite_column_reads(&reading, count_name, |_, _| {
+            Some("\"__ivm_count\"".to_string())
+        });
+    }
+    reading
 }
 
 /// Rewrites the reads of intermediate column `column` in `expr`. A read is a
@@ -583,51 +615,11 @@ pub fn sanitize_for_col_name(s: &str) -> String {
     }
 }
 
-// detect_aggregate is imported from sql_analyzer
-
-/// Recursively collect (aggregate_kind, arg_string) pairs from a HAVING expression.
-fn collect_having_aggregates(expr: &Expr, out: &mut Vec<(AggregateKind, String)>) {
-    match expr {
-        Expr::Function(f) => {
-            let func_name = f.name.to_string();
-            if let Some(kind) = detect_aggregate(&func_name) {
-                // Check for COUNT(*)
-                if let FunctionArguments::List(list) = &f.args {
-                    if list.args.len() == 1
-                        && matches!(
-                            &list.args[0],
-                            FunctionArg::Unnamed(FunctionArgExpr::Wildcard)
-                        )
-                    {
-                        out.push((AggregateKind::CountStar, "*".to_string()));
-                    } else if let Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(arg_expr))) =
-                        list.args.first()
-                    {
-                        out.push((kind, arg_expr.to_string()));
-                    }
-                }
-            }
-            // Also recurse into function args (for nested expressions)
-            if let FunctionArguments::List(list) = &f.args {
-                for arg in &list.args {
-                    if let FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) = arg {
-                        collect_having_aggregates(e, out);
-                    }
-                }
-            }
-        }
-        Expr::BinaryOp { left, right, .. } => {
-            collect_having_aggregates(left, out);
-            collect_having_aggregates(right, out);
-        }
-        Expr::UnaryOp { expr: inner, .. } => {
-            collect_having_aggregates(inner, out);
-        }
-        Expr::Nested(inner) => {
-            collect_having_aggregates(inner, out);
-        }
-        _ => {}
-    }
+fn parse_expression(sql: &str) -> Option<Expr> {
+    Parser::new(&PostgreSqlDialect {})
+        .try_with_sql(sql)
+        .and_then(|mut p| p.parse_expr())
+        .ok()
 }
 
 /// Rewrite an aggregate-derived expression: extract constituent aggregates as
@@ -639,44 +631,91 @@ fn rewrite_aggregate_derived_expr(
     existing_intermediates: &[IntermediateColumn],
 ) -> (String, Vec<IntermediateColumn>) {
     let mut new_intermediates = Vec::new();
-
-    // Parse the expression
-    let parsed = Parser::new(&PostgreSqlDialect {})
-        .try_with_sql(expr_sql)
-        .and_then(|mut p| p.parse_expr());
-    let Ok(expr) = parsed else {
+    let Some(expr) = parse_expression(expr_sql) else {
         return (expr_sql.to_string(), new_intermediates);
     };
-
-    let rewritten = rewrite_expr_aggregates(&expr, existing_intermediates, &mut new_intermediates);
+    let rewritten = read_aggregates_from_intermediate(
+        &expr,
+        existing_intermediates,
+        &[],
+        &mut new_intermediates,
+    );
     (rewritten, new_intermediates)
 }
 
-/// Recursively rewrite an expression, replacing aggregate function calls with
-/// intermediate column references (e.g., SUM(x) -> "__sum_x").
-fn rewrite_expr_aggregates(
+/// The HAVING predicate as the end query evaluates it, and the intermediate
+/// columns its aggregates need beyond `planned`. Each aggregate is read exactly
+/// as the same aggregate nested in a SELECT-list expression.
+///
+/// `regrouped_distinct_args` are the `COUNT(DISTINCT ...)` arguments the end
+/// query regroups on; HAVING then follows that GROUP BY and counts them there.
+pub(crate) fn having_predicate(
+    having: &str,
+    planned: &[IntermediateColumn],
+    regrouped_distinct_args: &[String],
+) -> Option<(String, Vec<IntermediateColumn>)> {
+    let expr = parse_expression(having)?;
+    let mut new_columns = Vec::new();
+    let predicate = read_aggregates_from_intermediate(
+        &expr,
+        planned,
+        regrouped_distinct_args,
+        &mut new_columns,
+    );
+    Some((predicate, new_columns))
+}
+
+/// `expr` with every aggregate call replaced by the expression that reads it
+/// back from the intermediate table (e.g., SUM(x) -> "__sum_x"). The columns a
+/// reading needs that are in neither `existing` nor `new_cols` are appended to
+/// `new_cols`.
+fn read_aggregates_from_intermediate(
     expr: &Expr,
     existing: &[IntermediateColumn],
+    regrouped_distinct_args: &[String],
     new_cols: &mut Vec<IntermediateColumn>,
+) -> String {
+    replace_aggregate_calls(expr, &mut |f, call| {
+        let arg = call.arg.as_deref().unwrap_or("*");
+        let Some(reading) = aggregate_reading(&call.kind, arg) else {
+            if regrouped_distinct_args.iter().any(|d| d == arg) {
+                return regrouped_distinct_count(arg);
+            }
+            return f.to_string();
+        };
+        let nested_expr = reading.nested_expr();
+        for column in reading.columns {
+            let already_planned = existing
+                .iter()
+                .chain(new_cols.iter())
+                .any(|ic| ic.name == column.name);
+            if !already_planned {
+                new_cols.push(column);
+            }
+        }
+        nested_expr
+    })
+}
+
+/// `COUNT(DISTINCT arg)` over an intermediate keyed by `arg`: one row per
+/// distinct value, and `COUNT` skips the NULL one as `COUNT(DISTINCT)` does.
+fn regrouped_distinct_count(arg: &str) -> String {
+    format!(
+        "COUNT(\"{}\")",
+        crate::query_decomposer::normalized_column_name(arg)
+    )
+}
+
+/// `expr` as SQL text, each aggregate call outside a subquery replaced by what
+/// `read` returns for it.
+fn replace_aggregate_calls(
+    expr: &Expr,
+    read: &mut dyn FnMut(&sqlparser::ast::Function, AggregateCall) -> String,
 ) -> String {
     match expr {
         Expr::Function(f) if f.over.is_none() => {
             if let Some(call) = resolve_aggregate_call(f) {
-                let arg = call.arg.as_deref().unwrap_or("*");
-                let Some(reading) = aggregate_reading(&call.kind, arg) else {
-                    return f.to_string();
-                };
-                let nested_expr = reading.nested_expr();
-                for column in reading.columns {
-                    let already_planned = existing
-                        .iter()
-                        .chain(new_cols.iter())
-                        .any(|ic| ic.name == column.name);
-                    if !already_planned {
-                        new_cols.push(column);
-                    }
-                }
-                return nested_expr;
+                return read(f, call);
             }
             // Not an aggregate function — recursively rewrite arguments
             // (handles COALESCE(SUM(x), 0), GREATEST(SUM(a), SUM(b)), etc.)
@@ -685,7 +724,7 @@ fn rewrite_expr_aggregates(
                 for arg in &list.args {
                     match arg {
                         FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => {
-                            rewritten_args.push(rewrite_expr_aggregates(e, existing, new_cols));
+                            rewritten_args.push(replace_aggregate_calls(e, read));
                         }
                         other => rewritten_args.push(other.to_string()),
                     }
@@ -696,20 +735,16 @@ fn rewrite_expr_aggregates(
         Expr::BinaryOp { left, op, right } => {
             format!(
                 "{} {} {}",
-                rewrite_expr_aggregates(left, existing, new_cols),
+                replace_aggregate_calls(left, read),
                 op,
-                rewrite_expr_aggregates(right, existing, new_cols)
+                replace_aggregate_calls(right, read)
             )
         }
         Expr::UnaryOp { op, expr: inner } => {
-            format!(
-                "{} {}",
-                op,
-                rewrite_expr_aggregates(inner, existing, new_cols)
-            )
+            format!("{} {}", op, replace_aggregate_calls(inner, read))
         }
         Expr::Nested(inner) => {
-            format!("({})", rewrite_expr_aggregates(inner, existing, new_cols))
+            format!("({})", replace_aggregate_calls(inner, read))
         }
         Expr::Case {
             operand,
@@ -719,23 +754,17 @@ fn rewrite_expr_aggregates(
         } => {
             let mut s = "CASE".to_string();
             if let Some(op) = operand {
-                s.push_str(&format!(
-                    " {}",
-                    rewrite_expr_aggregates(op, existing, new_cols)
-                ));
+                s.push_str(&format!(" {}", replace_aggregate_calls(op, read)));
             }
             for case_when in conditions {
                 s.push_str(&format!(
                     " WHEN {} THEN {}",
-                    rewrite_expr_aggregates(&case_when.condition, existing, new_cols),
-                    rewrite_expr_aggregates(&case_when.result, existing, new_cols)
+                    replace_aggregate_calls(&case_when.condition, read),
+                    replace_aggregate_calls(&case_when.result, read)
                 ));
             }
             if let Some(el) = else_result {
-                s.push_str(&format!(
-                    " ELSE {}",
-                    rewrite_expr_aggregates(el, existing, new_cols)
-                ));
+                s.push_str(&format!(" ELSE {}", replace_aggregate_calls(el, read)));
             }
             s.push_str(" END");
             s
@@ -745,20 +774,16 @@ fn rewrite_expr_aggregates(
             data_type,
             ..
         } => {
-            format!(
-                "{}::{}",
-                rewrite_expr_aggregates(inner, existing, new_cols),
-                data_type
-            )
+            format!("{}::{}", replace_aggregate_calls(inner, read), data_type)
         }
         other => other.to_string(),
     }
 }
 
 /// The intermediate columns one aggregate needs and the end-query expression
-/// that reads them back. In the SELECT list, an aggregate at top level and the
-/// same aggregate nested in an expression both plan through this. HAVING plans
-/// its aggregates separately.
+/// that reads them back. An aggregate at top level of the SELECT list, the same
+/// aggregate nested in a SELECT-list expression and the same aggregate in HAVING
+/// all plan through this.
 struct AggregateReading {
     columns: Vec<IntermediateColumn>,
     end_expr: String,
@@ -960,9 +985,8 @@ fn plan_aggregation_inner(analysis: &SqlAnalysis) -> AggregationPlan {
             // using COUNT(val). COUNT(val) (not COUNT(*)) matches Postgres
             // semantics — COUNT(DISTINCT val) ignores NULLs.
             count_distinct_columns.push(arg.to_string());
-            let arg_norm = crate::query_decomposer::normalized_column_name(arg);
             end_query_mappings.push(EndQueryMapping {
-                intermediate_expr: format!("COUNT(\"{}\")", arg_norm),
+                intermediate_expr: regrouped_distinct_count(arg),
                 output_alias,
                 aggregate_type: "COUNT".to_string(),
                 cast_type,
@@ -978,109 +1002,19 @@ fn plan_aggregation_inner(analysis: &SqlAnalysis) -> AggregationPlan {
         });
     }
 
-    // Auto-add intermediate columns for aggregates referenced in HAVING but not in SELECT
-    if let Some(ref having_str) = analysis.having_clause {
-        let parse_result = Parser::new(&PostgreSqlDialect {})
-            .try_with_sql(having_str)
-            .and_then(|mut p| p.parse_expr());
-        if let Ok(having_expr) = parse_result {
-            let mut having_aggs = Vec::new();
-            collect_having_aggregates(&having_expr, &mut having_aggs);
-            for (kind, arg) in having_aggs {
-                let arg_sanitized = sanitize_for_col_name(&arg);
-                match kind {
-                    AggregateKind::Sum => {
-                        intermediate_columns.push(IntermediateColumn {
-                            name: format!("__sum_{}", arg_sanitized),
-                            pg_type: "NUMERIC".to_string(),
-                            source_aggregate: "SUM".to_string(),
-                            source_arg: arg,
-                            topk_k: None,
-                        });
-                    }
-                    AggregateKind::Count => {
-                        intermediate_columns.push(IntermediateColumn {
-                            name: format!("__count_{}", arg_sanitized),
-                            pg_type: "BIGINT".to_string(),
-                            source_aggregate: "COUNT".to_string(),
-                            source_arg: arg,
-                            topk_k: None,
-                        });
-                    }
-                    AggregateKind::CountStar => {
-                        intermediate_columns.push(IntermediateColumn {
-                            name: "__count_star".to_string(),
-                            pg_type: "BIGINT".to_string(),
-                            source_aggregate: "COUNT".to_string(),
-                            source_arg: "*".to_string(),
-                            topk_k: None,
-                        });
-                    }
-                    AggregateKind::Avg => {
-                        // AVG needs both SUM and COUNT
-                        intermediate_columns.push(IntermediateColumn {
-                            name: format!("__sum_{}", arg_sanitized),
-                            pg_type: "NUMERIC".to_string(),
-                            source_aggregate: "SUM".to_string(),
-                            source_arg: arg.clone(),
-                            topk_k: None,
-                        });
-                        intermediate_columns.push(IntermediateColumn {
-                            name: format!("__count_{}", arg_sanitized),
-                            pg_type: "BIGINT".to_string(),
-                            source_aggregate: "COUNT".to_string(),
-                            source_arg: arg,
-                            topk_k: None,
-                        });
-                    }
-                    AggregateKind::Min => {
-                        intermediate_columns.push(IntermediateColumn {
-                            name: format!("__min_{}", arg_sanitized),
-                            pg_type: "NUMERIC".to_string(),
-                            source_aggregate: "MIN".to_string(),
-                            source_arg: arg,
-                            topk_k: None,
-                        });
-                    }
-                    AggregateKind::Max => {
-                        intermediate_columns.push(IntermediateColumn {
-                            name: format!("__max_{}", arg_sanitized),
-                            pg_type: "NUMERIC".to_string(),
-                            source_aggregate: "MAX".to_string(),
-                            source_arg: arg,
-                            topk_k: None,
-                        });
-                    }
-                    AggregateKind::BoolOr => {
-                        intermediate_columns.push(IntermediateColumn {
-                            name: format!("__bool_or_{}_true_count", arg_sanitized),
-                            pg_type: "BIGINT".to_string(),
-                            source_aggregate: "SUM".to_string(),
-                            source_arg: format!("CASE WHEN ({}) THEN 1 ELSE 0 END", arg),
-                            topk_k: None,
-                        });
-                        intermediate_columns.push(IntermediateColumn {
-                            name: format!("__bool_or_{}_nonnull_count", arg_sanitized),
-                            pg_type: "BIGINT".to_string(),
-                            source_aggregate: "SUM".to_string(),
-                            source_arg: format!(
-                                "CASE WHEN ({}) IS NOT NULL THEN 1 ELSE 0 END",
-                                arg
-                            ),
-                            topk_k: None,
-                        });
-                    }
-                    AggregateKind::CountDistinct => {
-                        // COUNT(DISTINCT) in HAVING is not supported yet
-                    }
-                }
-            }
-        }
-    }
-
     // Deduplicate intermediate columns by name (e.g., SUM(x) and AVG(x) both need __sum_x)
     let mut seen_names = std::collections::HashSet::new();
     intermediate_columns.retain(|col| seen_names.insert(col.name.clone()));
+
+    let having_clause = analysis.having_clause.as_deref().map(|having| {
+        match having_predicate(having, &intermediate_columns, &count_distinct_columns) {
+            Some((predicate, columns)) => {
+                intermediate_columns.extend(columns);
+                predicate
+            }
+            None => having.to_string(),
+        }
+    });
 
     let is_passthrough = analysis.group_by_columns.is_empty()
         && intermediate_columns.is_empty()
@@ -1223,7 +1157,7 @@ fn plan_aggregation_inner(analysis: &SqlAnalysis) -> AggregationPlan {
         is_passthrough,
         passthrough_columns,
         passthrough_key_mappings: std::collections::HashMap::new(),
-        having_clause: analysis.having_clause.clone(),
+        having_clause,
         not_null_columns: std::collections::HashSet::new(),
         group_by_aliases,
         output_column_order,
