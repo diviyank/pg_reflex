@@ -429,11 +429,21 @@ fn check_function_contract(
             listed_signatures(&volatile_signatures)
         ));
     }
-    let unsupported: Vec<String> = aggregates
-        .into_iter()
+    let mut unsupported: Vec<String> = aggregates
+        .iter()
         .filter(|name| !SUPPORTED_AGGREGATES.contains(&name.as_str()))
         .map(|name| name.to_uppercase())
         .collect();
+    // A supported name spelled so that it is not the built-in (`other.max`, `"SUM"`)
+    // is another aggregate, which the planner reads as a plain function.
+    for call in &analysis.non_builtin_calls {
+        let written = call.written.to_uppercase();
+        let shadows_supported_name =
+            aggregates.contains(&call.name) && SUPPORTED_AGGREGATES.contains(&call.name.as_str());
+        if shadows_supported_name && !unsupported.contains(&written) {
+            unsupported.push(written);
+        }
+    }
     if !unsupported.is_empty() && !is_single_level_passthrough(analysis) {
         return Err(unsupported_aggregates_message(&unsupported));
     }
@@ -455,6 +465,24 @@ fn keyed_keyless_only_aggregate(
          not pass unique_columns, and do not name an output column like a primary key \
          column of the source.",
         unsupported_aggregates_message(keyless_only_aggregates),
+        ctx.resolved_unique_columns.join(", ")
+    ))
+}
+
+/// A passthrough is maintained row by row once it has a key, and an aggregate the
+/// planner leaves to PostgreSQL (`COUNT(DISTINCT ...)` or an aggregate under IS NULL,
+/// without GROUP BY) is not a row of the source.
+fn keyed_passthrough_aggregate(ctx: &BuildContext) -> Option<String> {
+    if !ctx.plan.is_passthrough || ctx.resolved_unique_columns.is_empty() {
+        return None;
+    }
+    let aggregate = ctx.analysis.select_columns.iter().find(|col| {
+        col.aggregate.is_some() || col.is_aggregate_derived || col.holds_undecomposed_aggregate
+    })?;
+    Some(format!(
+        "{} without GROUP BY is recomputed on every write and cannot be maintained by a \
+         unique key; this IMV would be keyed on ({}). Fix: do not pass unique_columns.",
+        aggregate.expr_sql,
         ctx.resolved_unique_columns.join(", ")
     ))
 }
@@ -2360,6 +2388,9 @@ pub(crate) fn create_reflex_ivm_impl_with_materialization(
 
     resolve_unique_columns(&mut ctx);
     if let Some(reason) = keyed_keyless_only_aggregate(&ctx, &keyless_only_aggregates) {
+        return crate::reflex_reject(&reason);
+    }
+    if let Some(reason) = keyed_passthrough_aggregate(&ctx) {
         return crate::reflex_reject(&reason);
     }
 

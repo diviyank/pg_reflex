@@ -62,6 +62,11 @@ pub struct SelectColumn {
     /// (e.g., CASE WHEN SUM(x) > 0 THEN SUM(x)/SUM(y) END). The constituent aggregates
     /// are extracted separately and this expression is rewritten in the end_query.
     pub is_aggregate_derived: bool,
+    /// True if the expression holds an aggregate in a place the aggregate mapping does
+    /// not rewrite (under IS NULL, BETWEEN, IN, LIKE, an array constructor, ...). Such an
+    /// item is evaluated by PostgreSQL as written: it is neither a group key nor an
+    /// aggregate pg_reflex maintains.
+    pub holds_undecomposed_aggregate: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -112,6 +117,24 @@ fn function_schema(name: &sqlparser::ast::ObjectName) -> Option<String> {
     })
 }
 
+/// The lower-case name of a call that can only mean a `pg_catalog` function: the call is
+/// unqualified or qualified with `pg_catalog`, and its name is unquoted or quoted in
+/// lower case. `"SUM"(x)` and `other.sum(x)` name other functions.
+fn builtin_function_name(name: &sqlparser::ast::ObjectName) -> Option<String> {
+    let ident = name.0.last()?.as_ident()?;
+    let schema_is_builtin = match function_schema(name) {
+        None => name.0.len() == 1,
+        Some(schema) => schema == "pg_catalog" && name.0.len() == 2,
+    };
+    let is_exact_lower_case = ident.value == ident.value.to_ascii_lowercase();
+    (schema_is_builtin && (ident.quote_style.is_none() || is_exact_lower_case))
+        .then(|| ident.value.to_ascii_lowercase())
+}
+
+fn builtin_aggregate_kind(f: &Function) -> Option<AggregateKind> {
+    builtin_function_name(&f.name).and_then(|name| detect_aggregate(&name))
+}
+
 /// A called function as the catalog lookup needs it: `schema` is `None` for an
 /// unqualified call, which PostgreSQL resolves through the caller's `search_path`.
 #[derive(Debug, Clone, PartialEq)]
@@ -124,6 +147,14 @@ pub struct FunctionReference {
 pub struct CalledFunction {
     pub name: String,
     pub arg_count: usize,
+}
+
+/// A call whose spelling cannot be taken for a `pg_catalog` function: `name` is its
+/// bare lower-case name, `written` the name as the query spells it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NonBuiltinCall {
+    pub name: String,
+    pub written: String,
 }
 
 const KEYWORD_PSEUDO_FUNCTIONS: [&str; 12] = [
@@ -212,6 +243,8 @@ pub struct SqlAnalysis {
     /// The same calls once per distinct (schema, bare name).
     pub function_references: Vec<FunctionReference>,
     pub has_extract: bool,
+    /// Calls spelled so that they cannot be taken for a `pg_catalog` function.
+    pub non_builtin_calls: Vec<NonBuiltinCall>,
     /// Set when a clock or session-identity function is called anywhere in the
     /// query, not only in the SELECT list.
     pub has_nondeterministic_select: bool,
@@ -313,6 +346,21 @@ impl SqlAnalysis {
         }
         if self.nested_count_distinct {
             return Some(NESTED_COUNT_DISTINCT_REJECTION.into());
+        }
+        let groups_rows = !self.group_by_columns.is_empty() || self.has_distinct;
+        let undecomposed_aggregate = self
+            .select_columns
+            .iter()
+            .find(|column| column.holds_undecomposed_aggregate);
+        if let (true, Some(column)) = (groups_rows, undecomposed_aggregate) {
+            return Some(format!(
+                "'{}' holds an aggregate inside an expression pg_reflex does not decompose \
+                 (IS NULL, BETWEEN, IN, LIKE, an array and similar), so it is neither a group \
+                 key nor an aggregate it maintains. Fix: compute the aggregate in a CTE and \
+                 apply the expression in the outer SELECT: WITH a AS (SELECT grp, SUM(val) AS s \
+                 FROM t GROUP BY grp) SELECT grp, s IS NULL AS c FROM a",
+                column.alias.as_deref().unwrap_or(&column.expr_sql)
+            ));
         }
         None
     }
@@ -418,6 +466,15 @@ impl<'a> Visitor for AnalysisVisitor<'a> {
                         self.analysis.unsupported_aggregates.push(func_name.clone());
                     }
                     if let Some(call) = called_function(f) {
+                        if builtin_function_name(&f.name).is_none() {
+                            let spelling = NonBuiltinCall {
+                                name: call.name.clone(),
+                                written: f.name.to_string(),
+                            };
+                            if !self.analysis.non_builtin_calls.contains(&spelling) {
+                                self.analysis.non_builtin_calls.push(spelling);
+                            }
+                        }
                         self.analysis
                             .record_called_function(call, function_schema(&f.name));
                     }
@@ -484,10 +541,10 @@ impl<'a> Visitor for AnalysisVisitor<'a> {
     }
 }
 
-/// Detect aggregate kind from a function name.
-/// Recursively check if an expression tree contains any aggregate function calls.
+/// Whether `expr` holds a call to a built-in aggregate pg_reflex maintains, anywhere
+/// but in a subquery or inside a window function.
 pub fn expr_contains_aggregate(expr: &Expr) -> bool {
-    expr_contains_call(expr, &|f| detect_aggregate(&f.name.to_string()).is_some())
+    expr_contains_call(expr, &|f| builtin_aggregate_kind(f).is_some())
 }
 
 fn is_count_distinct_call(f: &sqlparser::ast::Function) -> bool {
@@ -499,45 +556,114 @@ fn is_count_distinct_call(f: &sqlparser::ast::Function) -> bool {
         )
 }
 
+pub(crate) fn is_window_call(expr: &Expr) -> bool {
+    matches!(expr, Expr::Function(f) if f.over.is_some())
+}
+
+/// Whether `matches_call` accepts a call of `expr` that belongs to the query level of
+/// `expr`: not one in a subquery, and not one in the arguments or the window of a window
+/// function.
 fn expr_contains_call(
     expr: &Expr,
     matches_call: &dyn Fn(&sqlparser::ast::Function) -> bool,
 ) -> bool {
-    let recurse = |e: &Expr| expr_contains_call(e, matches_call);
-    match expr {
-        Expr::Function(f) if f.over.is_none() => {
-            if matches_call(f) {
-                return true;
-            }
-            if let FunctionArguments::List(list) = &f.args {
-                for arg in &list.args {
-                    if let FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) = arg {
-                        if recurse(e) {
-                            return true;
-                        }
-                    }
+    struct CallSearch<'a> {
+        matches_call: &'a dyn Fn(&sqlparser::ast::Function) -> bool,
+        enclosing_queries: usize,
+        enclosing_window_calls: usize,
+    }
+    impl Visitor for CallSearch<'_> {
+        type Break = ();
+
+        fn pre_visit_query(&mut self, _query: &Query) -> ControlFlow<()> {
+            self.enclosing_queries += 1;
+            ControlFlow::Continue(())
+        }
+
+        fn post_visit_query(&mut self, _query: &Query) -> ControlFlow<()> {
+            self.enclosing_queries -= 1;
+            ControlFlow::Continue(())
+        }
+
+        fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<()> {
+            if is_window_call(expr) {
+                self.enclosing_window_calls += 1;
+            } else if let Expr::Function(f) = expr {
+                let at_this_level = self.enclosing_queries == 0 && self.enclosing_window_calls == 0;
+                if at_this_level && (self.matches_call)(f) {
+                    return ControlFlow::Break(());
                 }
             }
-            false
+            ControlFlow::Continue(())
         }
-        Expr::BinaryOp { left, right, .. } => recurse(left) || recurse(right),
-        Expr::UnaryOp { expr: inner, .. } => recurse(inner),
-        Expr::Nested(inner) => recurse(inner),
+
+        fn post_visit_expr(&mut self, expr: &Expr) -> ControlFlow<()> {
+            if is_window_call(expr) {
+                self.enclosing_window_calls -= 1;
+            }
+            ControlFlow::Continue(())
+        }
+    }
+    let mut search = CallSearch {
+        matches_call,
+        enclosing_queries: 0,
+        enclosing_window_calls: 0,
+    };
+    expr.visit(&mut search).is_break()
+}
+
+/// The aggregate calls of `expr` that the aggregate mapping
+/// (`aggregation::replace_aggregate_calls`) reaches and rewrites: those under arithmetic
+/// and boolean operators, parentheses, CASE, casts and positional function arguments.
+fn count_decomposable_aggregates(expr: &Expr) -> usize {
+    let count = count_decomposable_aggregates;
+    match expr {
+        Expr::Function(f) if f.over.is_none() => {
+            if builtin_aggregate_kind(f).is_some() {
+                return 1;
+            }
+            match &f.args {
+                FunctionArguments::List(list) => list
+                    .args
+                    .iter()
+                    .map(|arg| match arg {
+                        FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => count(e),
+                        _ => 0,
+                    })
+                    .sum(),
+                _ => 0,
+            }
+        }
+        Expr::BinaryOp { left, right, .. } => count(left) + count(right),
+        Expr::UnaryOp { expr: inner, .. } => count(inner),
+        Expr::Nested(inner) => count(inner),
         Expr::Case {
             operand,
             conditions,
             else_result,
             ..
         } => {
-            operand.as_deref().is_some_and(recurse)
-                || conditions
+            operand.as_deref().map_or(0, count)
+                + conditions
                     .iter()
-                    .any(|cw| recurse(&cw.condition) || recurse(&cw.result))
-                || else_result.as_deref().is_some_and(recurse)
+                    .map(|when| count(&when.condition) + count(&when.result))
+                    .sum::<usize>()
+                + else_result.as_deref().map_or(0, count)
         }
-        Expr::Cast { expr: inner, .. } => recurse(inner),
-        _ => false,
+        Expr::Cast { expr: inner, .. } => count(inner),
+        _ => 0,
     }
+}
+
+fn every_aggregate_is_decomposable(expr: &Expr) -> bool {
+    let aggregates = std::cell::Cell::new(0usize);
+    expr_contains_call(expr, &|f| {
+        if builtin_aggregate_kind(f).is_some() {
+            aggregates.set(aggregates.get() + 1);
+        }
+        false
+    });
+    count_decomposable_aggregates(expr) == aggregates.get()
 }
 
 pub fn detect_aggregate(func_name: &str) -> Option<AggregateKind> {
@@ -674,7 +800,7 @@ pub(crate) struct AggregateCall {
 }
 
 pub(crate) fn resolve_aggregate_call(f: &Function) -> Option<AggregateCall> {
-    let mut kind = detect_aggregate(&f.name.to_string())?;
+    let mut kind = builtin_aggregate_kind(f)?;
     if matches!(kind, AggregateKind::Count) && is_wildcard_arg(&f.args) {
         kind = AggregateKind::CountStar;
     }
@@ -734,6 +860,7 @@ fn extract_select_column(expr: &Expr, alias: Option<String>) -> SelectColumn {
                 #[cfg(test)]
                 filter_expr: None,
                 is_aggregate_derived: false,
+                holds_undecomposed_aggregate: false,
             };
         }
 
@@ -757,13 +884,15 @@ fn extract_select_column(expr: &Expr, alias: Option<String>) -> SelectColumn {
                 #[cfg(test)]
                 filter_expr: call.filter_expr,
                 is_aggregate_derived: false,
+                holds_undecomposed_aggregate: false,
             };
         }
     }
 
     // Check if the expression contains aggregates inside a compound expression
     // (e.g., CASE WHEN SUM(x) > 0 THEN SUM(x)/SUM(y) END)
-    let has_nested_agg = expr_contains_aggregate(expr);
+    let holds_aggregate = expr_contains_aggregate(expr);
+    let has_nested_agg = holds_aggregate && every_aggregate_is_decomposable(expr);
     SelectColumn {
         expr_sql: expr.to_string(),
         alias,
@@ -775,6 +904,7 @@ fn extract_select_column(expr: &Expr, alias: Option<String>) -> SelectColumn {
         #[cfg(test)]
         filter_expr: None,
         is_aggregate_derived: has_nested_agg,
+        holds_undecomposed_aggregate: holds_aggregate && !has_nested_agg,
     }
 }
 
@@ -1590,6 +1720,7 @@ pub fn analyze(statements: &[Statement]) -> Result<SqlAnalysis, SqlAnalysisError
                     #[cfg(test)]
                     filter_expr: None,
                     is_aggregate_derived: false,
+                    holds_undecomposed_aggregate: false,
                 });
             }
             SelectItem::QualifiedWildcard(kind, _) => {
@@ -1604,6 +1735,7 @@ pub fn analyze(statements: &[Statement]) -> Result<SqlAnalysis, SqlAnalysisError
                     #[cfg(test)]
                     filter_expr: None,
                     is_aggregate_derived: false,
+                    holds_undecomposed_aggregate: false,
                 });
             }
         }
