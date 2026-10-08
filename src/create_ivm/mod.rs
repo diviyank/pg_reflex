@@ -1236,6 +1236,25 @@ fn materialize_passthrough(client: &mut pgrx::spi::SpiClient<'_>, ctx: &mut Buil
     }
 }
 
+/// The argument of a SUM or AVG that PostgreSQL adds up in single precision,
+/// which is what it does for a REAL argument and for no other type.
+fn single_precision_sum_argument(ctx: &BuildContext) -> Option<String> {
+    let is_sum = |ic: &&crate::aggregation::IntermediateColumn| {
+        ic.source_aggregate == "SUM" && ic.name.starts_with("__sum_")
+    };
+    ctx.plan.intermediate_columns.iter().find(is_sum)?;
+    let sum_types: std::collections::HashMap<String, String> =
+        describe_query_columns(&generate_base_query(&ctx.analysis, &ctx.plan))
+            .into_iter()
+            .collect();
+    ctx.plan
+        .intermediate_columns
+        .iter()
+        .filter(is_sum)
+        .find(|ic| sum_types.get(&ic.name).map(String::as_str) == Some("real"))
+        .map(|ic| ic.source_arg.clone())
+}
+
 /// The type PostgreSQL gives each aggregate or aggregate-derived SELECT item,
 /// keyed by the name of its target column. `described` are the columns of the
 /// user's query: they pair with the SELECT items by position, and by name when
@@ -2422,6 +2441,16 @@ pub(crate) fn create_reflex_ivm_impl_with_materialization(
 
     if let Err(msg) = resolve_partitioning(&mut ctx) {
         return Box::leak(msg.into_boxed_str());
+    }
+
+    if let Some(arg) = single_precision_sum_argument(&ctx) {
+        return crate::reflex_reject(&format!(
+            "SUM / AVG over the REAL (single precision) expression '{arg}' is not supported. \
+             PostgreSQL adds REAL values in single precision in row order, a result that a sum \
+             maintained by adding and subtracting deltas does not reproduce. \
+             Fix: sum the exact values, SUM(({arg})::numeric) or AVG(({arg})::numeric); \
+             cast the aggregate back, SUM(({arg})::numeric)::real, to keep a REAL result column."
+        ));
     }
 
     Spi::connect_mut(|client| {

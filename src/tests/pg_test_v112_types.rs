@@ -236,6 +236,87 @@ fn v112_ty_leftovers(imv: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// SUM / AVG over a REAL argument
+// ---------------------------------------------------------------------------
+
+/// The create outcome of `select` over a fresh copy of the typed fixture.
+fn v112_ty_create_outcome(tag: &str, select_template: &str) -> (String, String) {
+    let src = format!("v112_ty_{tag}_src");
+    let imv = format!("v112_ty_{tag}");
+    Spi::run(&format!(
+        "CREATE TABLE {src}(id SERIAL PRIMARY KEY, {})",
+        V112_TY_FIXTURE.columns
+    ))
+    .expect("create source");
+    Spi::run(&format!(
+        "INSERT INTO {src}({}) VALUES {}",
+        V112_TY_FIXTURE.insert_columns, V112_TY_FIXTURE.seed
+    ))
+    .expect("seed");
+    let fresh = select_template.replace("{src}", &src);
+    let created = v112_ty_try(&format!(
+        "SELECT create_reflex_ivm('{imv}', $v112sel${fresh}$v112sel$)"
+    ));
+    (created, v112_ty_leftovers(&imv))
+}
+
+macro_rules! v112_ty_real_sum_rejections {
+    ($($name:ident => $select:expr,)+) => {
+        $(
+            #[pg_test]
+            fn $name() {
+                let tag = stringify!($name).trim_start_matches("v112_types_");
+                let (created, leftovers) = v112_ty_create_outcome(tag, $select);
+                assert!(
+                    created.starts_with("ERROR: [reflex-unsupported]")
+                        && created.contains("REAL")
+                        && created.contains("::numeric"),
+                    "{}: {created}",
+                    $select
+                );
+                assert_eq!(leftovers, "none", "{}", $select);
+            }
+        )+
+    };
+}
+
+v112_ty_real_sum_rejections! {
+    v112_types_real_sum_g_rejected => "SELECT g, SUM(rl) AS r FROM {src} GROUP BY g",
+    v112_types_real_sum_u_rejected => "SELECT SUM(rl) AS r FROM {src}",
+    v112_types_real_avg_g_rejected => "SELECT g, AVG(rl) AS r FROM {src} GROUP BY g",
+    v112_types_real_avg_u_rejected => "SELECT AVG(rl) AS r FROM {src}",
+    v112_types_real_sum_expr_rejected => "SELECT g, SUM(rl + rl) AS r FROM {src} GROUP BY g",
+    v112_types_real_sum_cast_rejected => "SELECT g, SUM(v::real) AS r FROM {src} GROUP BY g",
+    v112_types_real_sum_filter_rejected => "SELECT g, SUM(rl) FILTER (WHERE v > 1) AS r FROM {src} GROUP BY g",
+    v112_types_real_sum_nested_rejected => "SELECT g, SUM(rl) / 2 AS r FROM {src} GROUP BY g",
+    v112_types_real_avg_nested_rejected => "SELECT g, COALESCE(AVG(rl), 0) + 1 AS r FROM {src} GROUP BY g",
+    v112_types_real_sum_having_rejected => "SELECT g, COUNT(*) AS r FROM {src} GROUP BY g HAVING SUM(rl) > 0",
+    v112_types_real_sum_beside_others_rejected => "SELECT g, SUM(v) AS sv, MAX(rl) AS mr, AVG(rl) AS r FROM {src} GROUP BY g",
+    v112_types_real_cte_sum_rejected => "WITH c AS (SELECT g, rl FROM {src} WHERE v > 0) SELECT g, SUM(rl) AS r FROM c GROUP BY g",
+    v112_types_real_sum_in_cte_rejected => "WITH c AS (SELECT g, SUM(rl) AS r FROM {src} GROUP BY g) SELECT g, r FROM c WHERE r > 0",
+    v112_types_real_sum_spelling_rejected => "SELECT g, sum(rl) AS r, avg(  rl ) AS a FROM {src} GROUP BY g",
+}
+
+// The remedy the rejection prescribes, and the REAL shapes that stay supported
+v112_ty_cells! {
+    V112_TY_FIXTURE, false;
+    v112_types_real_sum_numeric_g => "SELECT g, SUM(rl::numeric) AS r FROM {src} GROUP BY g",
+    v112_types_real_sum_numeric_u => "SELECT SUM(rl::numeric) AS r FROM {src}",
+    v112_types_real_avg_numeric_g => "SELECT g, AVG(rl::numeric) AS r FROM {src} GROUP BY g",
+    v112_types_real_avg_numeric_u => "SELECT AVG(rl::numeric) AS r FROM {src}",
+    v112_types_real_sum_numeric_nested_g => "SELECT g, SUM(rl::numeric) / 2 AS r FROM {src} GROUP BY g",
+    v112_types_real_sum_numeric_as_real_g => "SELECT g, SUM(rl::numeric)::real AS r FROM {src} GROUP BY g",
+    v112_types_real_count_g => "SELECT g, COUNT(rl) AS r FROM {src} GROUP BY g",
+    v112_types_real_group_key => "SELECT rl, COUNT(*) AS r FROM {src} GROUP BY rl",
+}
+
+v112_ty_cells! {
+    V112_TY_FIXTURE, true;
+    v112_types_real_sum_numeric_g_deferred => "SELECT g, SUM(rl::numeric) AS r FROM {src} GROUP BY g",
+    v112_types_real_avg_numeric_u_deferred => "SELECT AVG(rl::numeric) AS r FROM {src}",
+}
+
+// ---------------------------------------------------------------------------
 // MIN / MAX: the stored type is the type of the argument expression
 // ---------------------------------------------------------------------------
 
