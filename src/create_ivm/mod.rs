@@ -516,6 +516,47 @@ fn keyed_passthrough_aggregate(ctx: &BuildContext) -> Option<String> {
     ))
 }
 
+/// Two output columns the result table would have to hold under one name.
+fn repeated_output_column(analysis: &crate::sql_analyzer::SqlAnalysis) -> Option<String> {
+    let mut seen = std::collections::HashSet::new();
+    analysis
+        .select_columns
+        .iter()
+        .filter_map(|col| match &col.alias {
+            Some(alias) => Some(normalized_column_name(alias)),
+            None => crate::sql_analyzer::is_bare_column_reference(&col.expr_sql)
+                .then(|| normalized_column_name(&col.expr_sql)),
+        })
+        .find(|name| !seen.insert(name.clone()))
+}
+
+/// Two grouping keys (GROUP BY columns, or the columns of a SELECT DISTINCT) the
+/// intermediate table would have to hold under one column name.
+fn group_keys_sharing_a_column_name(
+    analysis: &crate::sql_analyzer::SqlAnalysis,
+) -> Option<(String, String, String)> {
+    let plan = plan_aggregation(analysis);
+    if plan.is_passthrough {
+        return None;
+    }
+    let selects_distinct_rows = analysis.has_distinct && analysis.group_by_columns.is_empty();
+    let distinct_keys = analysis
+        .select_columns
+        .iter()
+        .filter(|col| selects_distinct_rows && col.is_passthrough)
+        .map(|col| &col.expr_sql);
+    let mut first_key_named: std::collections::HashMap<String, &String> =
+        std::collections::HashMap::new();
+    for key in plan.group_by_columns.iter().chain(distinct_keys) {
+        let column = normalized_column_name(key);
+        if let Some(first) = first_key_named.get(&column) {
+            return Some(((*first).clone(), key.clone(), column));
+        }
+        first_key_named.insert(column, key);
+    }
+    None
+}
+
 /// One SELECT with no nested query that the planner maintains as a passthrough: no
 /// GROUP BY and no aggregate it decomposes. Every write recomputes such an IMV from its
 /// own query, so an aggregate pg_reflex cannot decompose is still evaluated by PostgreSQL.
@@ -2273,6 +2314,22 @@ pub(crate) fn create_reflex_ivm_impl_with_materialization(
              index and incremental refresh both rely on. Fix: add '{gb}' to the SELECT \
              list, or move the wrapping expression into a passthrough outer layer \
              (an outer SELECT over a CTE that projects the bare key + aggregates)."
+        ));
+    }
+
+    if let Some((first, second, column)) = group_keys_sharing_a_column_name(&parsed.analysis) {
+        return crate::reflex_reject(&format!(
+            "Grouping keys '{first}' and '{second}' share the column name '{column}', which \
+             the intermediate table cannot hold twice. Fix: list a key once; for two different \
+             columns, rename them in a CTE and group over it: WITH j AS (SELECT a.label AS \
+             a_label, b.label AS b_label FROM ...) SELECT a_label, b_label, COUNT(*) FROM j \
+             GROUP BY a_label, b_label"
+        ));
+    }
+    if let Some(column) = repeated_output_column(&parsed.analysis) {
+        return crate::reflex_reject(&format!(
+            "Two columns of the SELECT list are named '{column}', and a table cannot hold \
+             both. Fix: give each a distinct alias (a.label AS a_label, b.label AS b_label)."
         ));
     }
 

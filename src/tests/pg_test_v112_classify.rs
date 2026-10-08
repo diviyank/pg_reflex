@@ -410,3 +410,97 @@ fn v112_cl_cast_constant_beside_group_by_is_maintained() {
     assert_eq!(v112_cl_unique_key("const_passthrough"), "id");
 }
 
+// ---- output and group-key names ----
+
+const V112_CL_JOIN_STEPS: [&str; 6] = [
+    "INSERT INTO {b}(a_id, label) VALUES (2,'q'),(1,'p')",
+    "INSERT INTO {a}(label) VALUES ('x')",
+    "UPDATE {a} SET label = 'z' WHERE id = 1",
+    "UPDATE {b} SET a_id = 3 WHERE label = 'q'",
+    "DELETE FROM {b} WHERE label = 'p'",
+    "DELETE FROM {a}",
+];
+
+fn v112_cl_join(tag: &str, select: &str) -> String {
+    let a = format!("v112_cl_{tag}_a");
+    let b = format!("v112_cl_{tag}_b");
+    Spi::run(&format!(
+        "CREATE TABLE {a}(id SERIAL PRIMARY KEY, label TEXT); \
+         CREATE TABLE {b}(id SERIAL PRIMARY KEY, a_id INT, label TEXT); \
+         INSERT INTO {a}(label) VALUES ('x'),('y'); \
+         INSERT INTO {b}(a_id, label) VALUES (1,'p'),(1,'q'),(2,'p'),(1,'p')"
+    ))
+    .expect("sources");
+    let named = |text: &str| text.replace("{a}", &a).replace("{b}", &b);
+    let steps: Vec<String> = V112_CL_JOIN_STEPS.iter().map(|step| named(step)).collect();
+    v112_cl_cell(&format!("v112_cl_{tag}"), &named(select), "", "IMMEDIATE", &[&a, &b], &steps)
+}
+
+#[pg_test]
+fn v112_cl_group_keys_sharing_a_column_name_are_rejected() {
+    for (tag, select) in [
+        (
+            "dupkey_bare",
+            "SELECT a.label, b.label, COUNT(*) AS c FROM {a} a JOIN {b} b ON b.a_id = a.id \
+             GROUP BY a.label, b.label",
+        ),
+        (
+            "dupkey_aliased",
+            "SELECT a.label AS la, b.label AS lb, COUNT(*) AS c FROM {a} a JOIN {b} b ON b.a_id = a.id \
+             GROUP BY a.label, b.label",
+        ),
+        (
+            "dupkey_distinct",
+            "SELECT DISTINCT a.label AS la, b.label AS lb FROM {a} a JOIN {b} b ON b.a_id = a.id",
+        ),
+    ] {
+        let outcome = v112_cl_join(tag, select);
+        v112_cl_assert_rejected(tag, &outcome, "share the column name 'label'");
+    }
+    let twice = v112_cl_gv(
+        "dupkey_twice",
+        "SELECT g, COUNT(*) AS c FROM {src} GROUP BY g, {src}.g",
+        "",
+        "IMMEDIATE",
+    );
+    v112_cl_assert_rejected("dupkey_twice", &twice, "share the column name 'g'");
+}
+
+#[pg_test]
+fn v112_cl_group_keys_renamed_in_a_cte_are_maintained() {
+    assert_eq!(
+        v112_cl_join(
+            "dupkey_cte",
+            "WITH j AS (SELECT a.label AS la, b.label AS lb FROM {a} a JOIN {b} b ON b.a_id = a.id) \
+             SELECT la, lb, COUNT(*) AS c FROM j GROUP BY la, lb",
+        ),
+        "ok"
+    );
+}
+
+#[pg_test]
+fn v112_cl_output_columns_sharing_a_name_are_rejected() {
+    for (tag, select) in [
+        ("dupout_bare", "SELECT a.label, b.label FROM {a} a JOIN {b} b ON b.a_id = a.id"),
+        ("dupout_alias", "SELECT a.label AS x, b.label AS x FROM {a} a JOIN {b} b ON b.a_id = a.id"),
+        ("dupout_mixed", "SELECT a.label, b.id AS \"label\" FROM {a} a JOIN {b} b ON b.a_id = a.id"),
+    ] {
+        let outcome = v112_cl_join(tag, select);
+        v112_cl_assert_rejected(tag, &outcome, "distinct alias");
+    }
+    assert_eq!(
+        v112_cl_join(
+            "dupout_fixed",
+            "SELECT a.label AS la, b.label AS lb FROM {a} a JOIN {b} b ON b.a_id = a.id",
+        ),
+        "ok"
+    );
+    assert_eq!(
+        v112_cl_join(
+            "dupout_case",
+            "SELECT a.label AS \"Label\", b.label FROM {a} a JOIN {b} b ON b.a_id = a.id",
+        ),
+        "ok"
+    );
+}
+
