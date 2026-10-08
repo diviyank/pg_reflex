@@ -125,3 +125,87 @@ fn v112_cm_cte_alias_as_relation_and_qualifier_stays_correct() {
          SELECT f.season, x.s FROM f JOIN e AS x ON x.season = f.season WHERE f.s IS NOT NULL",
     );
 }
+
+const V112_CM_ALIAS_NAMES_AGGREGATE_COLUMN: &str =
+    "WITH s AS (SELECT season, SUM(v) AS s FROM {src} GROUP BY season) SELECT season, s FROM s";
+
+const V112_CM_ALIAS_NAMES_DISTINCT_COUNT_COLUMN: &str =
+    "WITH s AS (SELECT season, COUNT(DISTINCT v) AS s FROM {src} GROUP BY season) \
+     SELECT season, s FROM s";
+
+const V112_CM_ALIAS_NAMES_PLAIN_COLUMN: &str =
+    "WITH v AS (SELECT id, season, v FROM {src}) SELECT id, season, v FROM v WHERE v > 2";
+
+const V112_CM_ALIAS_NAMES_GROUPING_COLUMN: &str =
+    "WITH season AS (SELECT id, season, v FROM {src}) \
+     SELECT season, SUM(v) AS total FROM season GROUP BY season";
+
+const V112_CM_ALIAS_NAMES_COLUMN_OF_EARLIER_CTE: &str =
+    "WITH s AS (SELECT season, SUM(v) AS s FROM {src} GROUP BY season), \
+     f AS (SELECT season, s FROM s WHERE s > 2) SELECT season, s FROM f";
+
+#[pg_test]
+fn v112_cm_cte_alias_naming_its_aggregate_column_immediate() {
+    v112_cm_assert_cte_imv_correct(
+        "v112_cm_ca",
+        "IMMEDIATE",
+        V112_CM_ALIAS_NAMES_AGGREGATE_COLUMN,
+    );
+}
+
+#[pg_test]
+fn v112_cm_cte_alias_naming_its_aggregate_column_deferred() {
+    v112_cm_assert_cte_imv_correct(
+        "v112_cm_cad",
+        "DEFERRED",
+        V112_CM_ALIAS_NAMES_AGGREGATE_COLUMN,
+    );
+}
+
+#[pg_test]
+fn v112_cm_cte_alias_naming_its_distinct_count_column_stays_correct() {
+    v112_cm_assert_cte_imv_correct(
+        "v112_cm_cd",
+        "IMMEDIATE",
+        V112_CM_ALIAS_NAMES_DISTINCT_COUNT_COLUMN,
+    );
+}
+
+#[pg_test]
+fn v112_cm_cte_alias_naming_a_plain_column_stays_correct() {
+    v112_cm_assert_cte_imv_correct("v112_cm_cp", "IMMEDIATE", V112_CM_ALIAS_NAMES_PLAIN_COLUMN);
+}
+
+#[pg_test]
+fn v112_cm_cte_alias_naming_the_grouping_column_stays_correct() {
+    v112_cm_assert_cte_imv_correct(
+        "v112_cm_cg",
+        "IMMEDIATE",
+        V112_CM_ALIAS_NAMES_GROUPING_COLUMN,
+    );
+}
+
+#[pg_test]
+fn v112_cm_cte_alias_naming_a_column_read_by_a_later_cte_stays_correct() {
+    v112_cm_assert_cte_imv_correct(
+        "v112_cm_ce",
+        "IMMEDIATE",
+        V112_CM_ALIAS_NAMES_COLUMN_OF_EARLIER_CTE,
+    );
+}
+
+#[pg_test]
+fn v112_cm_cte_alias_naming_its_column_keeps_the_column_type() {
+    v112_cm_assert_cte_imv_correct(
+        "v112_cm_cy",
+        "IMMEDIATE",
+        V112_CM_ALIAS_NAMES_AGGREGATE_COLUMN,
+    );
+    let column_type = Spi::get_one::<String>(
+        "SELECT format_type(atttypid, atttypmod) FROM pg_attribute \
+         WHERE attrelid = 'v112_cm_cy_v'::regclass AND attname = 's'",
+    )
+    .expect("type")
+    .expect("column s");
+    assert_eq!(column_type, "bigint");
+}
