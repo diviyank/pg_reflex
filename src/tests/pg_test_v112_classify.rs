@@ -733,3 +733,77 @@ fn v112_cl_date_of_a_timestamp_carries_the_time_zone_warning() {
     assert_eq!(warning("SELECT id, make_date(y, m, d) AS d FROM t"), None);
 }
 
+#[pg_test]
+fn v112_cl_moving_date_time_literal_is_rejected() {
+    for (position, expression) in [
+        "'now'::timestamptz",
+        "timestamptz 'now'",
+        "'today'::date",
+        "CAST(' Tomorrow ' AS timestamp)",
+        "date('yesterday')",
+        "'now'::time",
+        "'{now}'::timestamptz[]",
+        "'NOW'::pg_catalog.timestamptz",
+        "DATE 'today'",
+        "('today 04:00')::timestamp with time zone",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let tag = format!("moving{position}");
+        let outcome =
+            v112_cl_gv(&tag, &format!("SELECT id, g, ({expression})::text AS x FROM {{src}}"), "", "IMMEDIATE");
+        v112_cl_assert_rejected(&tag, &outcome, "Non-deterministic functions");
+    }
+    let filtered = v112_cl_gv(
+        "moving_where",
+        "SELECT g, COUNT(*) AS c FROM {src} WHERE v < extract(day FROM 'yesterday'::date) GROUP BY g",
+        "",
+        "IMMEDIATE",
+    );
+    v112_cl_assert_rejected("moving_where", &filtered, "remove 'yesterday'::DATE from the IMV query");
+}
+
+#[pg_test]
+fn v112_cl_fixed_date_time_literal_is_accepted() {
+    for (position, expression) in [
+        "'now'::text",
+        "'today'::varchar",
+        "'2020-01-01'::date",
+        "'epoch'::timestamptz",
+        "'infinity'::date",
+        "TIMESTAMP '2020-01-01 10:00'",
+        "'nowhere'",
+        "date('2020-01-02')",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let tag = format!("fixed{position}");
+        assert_eq!(
+            v112_cl_gv(&tag, &format!("SELECT id, g, ({expression})::text AS x FROM {{src}}"), "", "IMMEDIATE"),
+            "ok",
+            "{expression}"
+        );
+    }
+    Spi::run(
+        "CREATE TABLE v112_cl_fixed_col_src(id SERIAL PRIMARY KEY, now TEXT, today DATE); \
+         INSERT INTO v112_cl_fixed_col_src(now, today) VALUES ('now','2020-01-01'),('later','2020-01-02')",
+    )
+    .expect("source");
+    assert_eq!(
+        v112_cl_cell(
+            "v112_cl_fixed_col",
+            "SELECT id, now, today::text AS t FROM v112_cl_fixed_col_src WHERE now = 'now'",
+            "",
+            "IMMEDIATE",
+            &[],
+            &[
+                "INSERT INTO v112_cl_fixed_col_src(now, today) VALUES ('now','2020-01-03')".to_string(),
+                "UPDATE v112_cl_fixed_col_src SET now = 'now' WHERE now = 'later'".to_string(),
+            ],
+        ),
+        "ok"
+    );
+}
+
