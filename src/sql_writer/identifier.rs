@@ -6,8 +6,9 @@
 //!
 //! Every helper here is deliberately small and pure so callers can compose
 //! them. The rewriters:
-//! - [`replace_identifier`] — case-sensitive word-boundary substitution.
-//!   Skips matches that follow `AS ` (output aliases, not table refs).
+//! - `replace_identifier` — case-sensitive word-boundary substitution that
+//!   reads string literals as code. No query is rewritten with it: it is the
+//!   reference the tests of the literal-aware rewriters compare against.
 //! - [`strip_redundant_bare_alias`] — strips a redundant `AS <bare>` clause
 //!   that the user wrote after a schema-qualified source ref.
 //! - [`substitute_identifier_ci`] — case-insensitive word-level substitution
@@ -143,6 +144,7 @@ fn continues_identifier(byte: u8) -> bool {
 /// **Contract:** `new_name` must itself be a simple identifier (possibly
 /// schema-qualified and quoted). A match followed by `.col` produces invalid
 /// SQL if `new_name` is a sub-query expression.
+#[cfg(test)]
 pub fn replace_identifier(sql: &str, old_name: &str, new_name: &str) -> String {
     replace_identifier_outside(sql, old_name, new_name, &[])
 }
