@@ -1,7 +1,6 @@
 //! The outer joins of a stored query, as they bear on a write to one source.
 
 use super::union_delta::{bare_lower, references_source};
-use super::{follows_outer_join_keyword, upper_with_single_spaces};
 use crate::sql_writer::identifier::token_names_source;
 use sqlparser::ast::{
     Expr, JoinOperator, Query, SetExpr, Statement, TableFactor, TableWithJoins, Visit, Visitor,
@@ -46,11 +45,15 @@ pub(crate) struct OuterJoins {
 /// set-operation operands and subqueries of expressions.
 ///
 /// The stored query of an IMV always parses, since it was parsed at create.
-/// Text that does not parse is read by keyword instead, which is exact for the
-/// single-spaced, comment-free text the aggregate path generates.
+/// Text that does not parse gets the answer that recomputes in full on every
+/// write: nothing read from it can be trusted to scope a delta.
 pub(crate) fn outer_joins(base_query: &str, source_table: &str) -> OuterJoins {
     let Some(query) = single_query(base_query) else {
-        return outer_joins_by_keyword(base_query, source_table);
+        return OuterJoins {
+            holds_right_join: true,
+            holds_full_join: true,
+            ..OuterJoins::default()
+        };
     };
     let mut finder = OuterJoinFinder {
         source_lower: source_table.to_lowercase(),
@@ -65,28 +68,19 @@ pub(crate) fn holds_full_join(base_query: &str) -> bool {
     outer_joins(base_query, "").holds_full_join
 }
 
-fn outer_joins_by_keyword(base_query: &str, source_table: &str) -> OuterJoins {
-    let upper = upper_with_single_spaces(base_query);
-    let holds_left_join = upper.contains("LEFT JOIN") || upper.contains("LEFT OUTER");
-    let holds_full_join = upper.contains("FULL JOIN") || upper.contains("FULL OUTER");
-    OuterJoins {
-        holds_right_join: upper.contains("RIGHT JOIN") || upper.contains("RIGHT OUTER"),
-        holds_full_join,
-        source_is_null_extended_table: (holds_left_join || holds_full_join)
-            && follows_outer_join_keyword(&upper, source_table),
-        source_inside_left_joined_subtree: holds_left_join,
-        source_reads: 0,
-        source_name_stands_as_a_value: false,
-    }
-}
-
 #[cfg(test)]
 pub(crate) fn source_inside_left_joined_subtree(
-    _whitespace_normalized_upper_query: &str,
+    whitespace_normalized_upper_query: &str,
     base_query: &str,
     source_table: &str,
 ) -> bool {
-    outer_joins(base_query, source_table).source_inside_left_joined_subtree
+    match single_query(base_query) {
+        Some(_) => outer_joins(base_query, source_table).source_inside_left_joined_subtree,
+        None => {
+            whitespace_normalized_upper_query.contains("LEFT JOIN")
+                || whitespace_normalized_upper_query.contains("LEFT OUTER")
+        }
+    }
 }
 
 struct OuterJoinFinder {

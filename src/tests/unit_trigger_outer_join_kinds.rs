@@ -114,18 +114,26 @@ fn every_table_reference_naming_the_source_is_counted() {
 }
 
 #[test]
-fn unparseable_text_is_read_by_keyword() {
-    let joins = outer_joins("SELECT 1 FROM a RIGHT JOIN b ON a.k = b.k WHERE (", "a");
-    assert!(joins.holds_right_join);
-    let joins = outer_joins("SELECT 1 FROM a LEFT JOIN b ON a.k = b.k WHERE (", "b");
-    assert!(joins.source_is_null_extended_table);
-    assert!(joins.source_inside_left_joined_subtree);
-    assert!(holds_full_join(
-        "SELECT 1 FROM a FULL OUTER JOIN b ON a.k = b.k WHERE ("
+fn unparseable_text_recomputes_in_full_whatever_it_holds() {
+    for text in [
+        "SELECT a FROM t WHERE (",
+        "SELECT 1 FROM a JOIN b ON a.k = b.k WHERE (",
+        "SELECT 1 FROM a LEFT JOIN b ON a.k = b.k WHERE (",
+        "SELECT a FROM t; SELECT a FROM t",
+        "not a query",
+        "",
+    ] {
+        for source in ["t", "a", "b", "public.t"] {
+            let joins = outer_joins(text, source);
+            assert!(joins.holds_right_join && joins.holds_full_join, "{text}");
+            assert!(crate::trigger::has_no_scoped_delta(text, source), "{text}");
+        }
+        assert!(holds_full_join(text), "{text}");
+    }
+    assert!(!crate::trigger::has_no_scoped_delta(
+        "SELECT a FROM t WHERE (a > 0)",
+        "t"
     ));
-    let joins = outer_joins("SELECT 1 FROM a JOIN b ON a.k = b.k WHERE (", "b");
-    assert!(!joins.holds_right_join && !joins.holds_full_join);
-    assert!(!joins.source_is_null_extended_table && !joins.source_inside_left_joined_subtree);
 }
 
 fn update_skip_columns(sql: &str) -> std::collections::HashMap<String, Vec<String>> {
