@@ -1038,3 +1038,68 @@ v112_ty_user_type_cells! {
     v112_types_ut_enum_nested_catalog_path => ("SELECT g, COALESCE(MAX(e), 'zeta') AS hi FROM {src} GROUP BY g", "pg_catalog"),
     v112_types_ut_enum_cast_catalog_path => ("SELECT g, MAX(l)::{schema}.label AS hi, (MAX(v) + 1)::{schema}.pos_int AS p FROM {src} GROUP BY g", "pg_catalog"),
 }
+
+// ---------------------------------------------------------------------------
+// A group key has the type the query gives it
+// ---------------------------------------------------------------------------
+
+v112_ty_cells! {
+    V112_TY_FIXTURE, false;
+    v112_types_key_alias_of_text_column => "SELECT v AS g, COUNT(*) AS c FROM {src} GROUP BY v",
+    v112_types_key_alias_of_int_column => "SELECT g AS v, COUNT(*) AS c FROM {src} GROUP BY g",
+    v112_types_key_alias_and_aggregate_swapped => "SELECT g AS v, COUNT(*) AS c, SUM(v) AS g FROM {src} GROUP BY g",
+    v112_types_key_alias_of_real_column => "SELECT t AS rl, MAX(v) AS hi FROM {src} GROUP BY t",
+    v112_types_key_two_aliases_crossed => "SELECT v AS t, t AS q, COUNT(*) AS c FROM {src} GROUP BY v, t",
+    v112_types_key_varchar => "SELECT vc, COUNT(*) AS c FROM {src} GROUP BY vc",
+    v112_types_key_varchar_alias => "SELECT vc AS n, SUM(v) AS s FROM {src} GROUP BY vc",
+    v112_types_key_interval => "SELECT iv, COUNT(*) AS c FROM {src} GROUP BY iv",
+    v112_types_key_time => "SELECT tm, COUNT(*) AS c, MAX(v) AS hi FROM {src} GROUP BY tm",
+    v112_types_key_smallint_bigint => "SELECT s, q, COUNT(*) AS c FROM {src} GROUP BY s, q",
+    v112_types_key_expression => "SELECT upper(t) AS v, COUNT(*) AS c FROM {src} GROUP BY upper(t)",
+    v112_types_key_distinct => "SELECT DISTINCT vc, iv FROM {src}",
+    v112_types_key_count_distinct => "SELECT g, COUNT(DISTINCT vc) AS d FROM {src} GROUP BY g",
+    v112_types_key_count_distinct_interval => "SELECT vc, COUNT(DISTINCT iv) AS d FROM {src} GROUP BY vc",
+}
+
+v112_ty_cells! {
+    V112_TY_FIXTURE, true;
+    v112_types_key_alias_of_text_column_deferred => "SELECT v AS g, COUNT(*) AS c FROM {src} GROUP BY v",
+    v112_types_key_interval_deferred => "SELECT iv, COUNT(*) AS c FROM {src} GROUP BY iv",
+}
+
+v112_ty_cells! {
+    V112_TY_NAMES_FIXTURE, false;
+    v112_types_key_alias_of_counter_name => "SELECT star AS \"__count_star\", COUNT(*) AS c FROM {src} GROUP BY star",
+}
+
+v112_ty_user_type_cells! {
+    v112_types_ut_enum_key_catalog_path => ("SELECT e, COUNT(*) AS c, MAX(q) AS hi FROM {src} GROUP BY e", "pg_catalog"),
+    v112_types_ut_domain_key_other_path => ("SELECT d, l, COUNT(*) AS c FROM {src} GROUP BY d, l", "{other}, public"),
+    v112_types_ut_quoted_enum_key_other_path => ("SELECT q, COUNT(*) AS c FROM {src} GROUP BY q", "{other}"),
+}
+
+v112_ty_collation_cells! {
+    false;
+    v112_types_coll_icu_group_key => "SELECT tu, COUNT(*) AS c, MAX(v) AS hi FROM {src} GROUP BY tu",
+    v112_types_coll_icu_group_key_alias => "SELECT tu AS td, COUNT(*) AS c FROM {src} GROUP BY tu",
+    v112_types_coll_icu_distinct => "SELECT DISTINCT tu, tc FROM {src}",
+}
+
+/// Two intervals that are equal and spell differently are one group.
+const V112_TY_EQUAL_INTERVALS_FIXTURE: V112TyFixture = V112TyFixture {
+    columns: "iv INTERVAL, v INT",
+    insert_columns: "iv, v",
+    seed: "('1 day', 1), ('2 days', 2), ('48 hours', 3)",
+    steps: &[
+        ("ins", "INSERT INTO {src}(iv, v) VALUES ('24 hours', 4), ('1 day', 5), ('72 hours', 6)"),
+        ("upd", "UPDATE {src} SET iv = '24 hours' WHERE v = 2"),
+        ("del", "DELETE FROM {src} WHERE v IN (1, 3)"),
+        ("empty", "DELETE FROM {src}"),
+        ("refill", "INSERT INTO {src}(iv, v) VALUES ('3 days', 7), ('72 hours', 8)"),
+    ],
+};
+
+v112_ty_cells! {
+    V112_TY_EQUAL_INTERVALS_FIXTURE, false;
+    v112_types_key_equal_intervals => "SELECT iv, COUNT(*) AS c, SUM(v) AS s FROM {src} GROUP BY iv",
+}

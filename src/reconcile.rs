@@ -91,7 +91,8 @@ fn heal_missing_intermediate_table(view_name: &str) {
         )
         .0
     });
-    crate::create_ivm::augment_column_types_from_query(&record.base_query, &mut column_types);
+    let base_columns = crate::create_ivm::describe_query_columns(&record.base_query);
+    crate::create_ivm::augment_column_types(&base_columns, &mut column_types);
     if let Some((sql_query, _)) =
         Spi::connect(|client| crate::sql_writer::registry::read_imv_for_rebuild(client, view_name))
     {
@@ -99,6 +100,12 @@ fn heal_missing_intermediate_table(view_name: &str) {
             crate::create_ivm::augment_column_types_from_query(&sql_query, &mut column_types);
         }
     }
+
+    crate::create_ivm::type_intermediate_keys(
+        &plan,
+        &base_columns.into_iter().collect(),
+        &mut column_types,
+    );
 
     if let Some(unresolved) = first_unresolved_group_key(&plan, &column_types) {
         warning!(
