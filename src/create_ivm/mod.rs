@@ -2313,7 +2313,9 @@ pub(crate) fn create_reflex_ivm_impl_with_materialization(
             || matches!(c.aggregate, Some(ref k) if !matches!(k,
             crate::sql_analyzer::AggregateKind::CountDistinct))
     });
-    if (has_cd && has_other_agg) || crate::aggregation::having_mixes_count_distinct(&analysis) {
+    if (has_cd && has_other_agg)
+        || crate::aggregation::count_distinct_having_conflict(&analysis).is_some()
+    {
         return crate::reflex_reject("COUNT(DISTINCT col) cannot be mixed with other aggregates in the same query. \
                 Use a CTE to separate them: WITH cd AS (SELECT grp, COUNT(DISTINCT col) ...) SELECT ...");
     }
