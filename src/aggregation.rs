@@ -805,9 +805,27 @@ fn replace_aggregate_calls(
             data_type,
             ..
         } => {
-            format!("{}::{}", replace_aggregate_calls(inner, read), data_type)
+            let operand = replace_aggregate_calls(inner, read);
+            if is_single_cast_operand(inner) {
+                format!("{}::{}", operand, data_type)
+            } else {
+                format!("({})::{}", operand, data_type)
+            }
         }
         other => other.to_string(),
+    }
+}
+
+/// Whether `::` applied to the text `replace_aggregate_calls` prints for `expr`
+/// casts all of it. The cast binds tighter than every operator, so any other
+/// expression is parenthesised first.
+fn is_single_cast_operand(expr: &Expr) -> bool {
+    match expr {
+        Expr::Identifier(_) | Expr::CompoundIdentifier(_) | Expr::Value(_) | Expr::Nested(_) => {
+            true
+        }
+        Expr::Function(f) => f.over.is_none(),
+        _ => false,
     }
 }
 
