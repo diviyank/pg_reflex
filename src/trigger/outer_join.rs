@@ -4,7 +4,7 @@ use super::union_delta::{bare_lower, references_source};
 use super::{follows_outer_join_keyword, upper_with_single_spaces};
 use crate::sql_writer::identifier::token_names_source;
 use sqlparser::ast::{
-    JoinOperator, Query, SetExpr, Statement, TableFactor, TableWithJoins, Visit, Visitor,
+    Expr, JoinOperator, Query, SetExpr, Statement, TableFactor, TableWithJoins, Visit, Visitor,
 };
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
@@ -36,6 +36,10 @@ pub(crate) struct OuterJoins {
     pub source_inside_left_joined_subtree: bool,
     /// Table references naming the source, at any depth.
     pub source_reads: usize,
+    /// A bare word of an expression is spelled like the source: a column of
+    /// that name, or the table read as a whole row. The transition swap cannot
+    /// tell it from a table reference.
+    pub source_name_stands_as_a_value: bool,
 }
 
 /// Joins at any depth count: derived tables, parenthesised joins, CTE bodies,
@@ -72,6 +76,7 @@ fn outer_joins_by_keyword(base_query: &str, source_table: &str) -> OuterJoins {
             && follows_outer_join_keyword(&upper, source_table),
         source_inside_left_joined_subtree: holds_left_join,
         source_reads: 0,
+        source_name_stands_as_a_value: false,
     }
 }
 
@@ -150,6 +155,14 @@ impl Visitor for OuterJoinFinder {
         }
         if self.names_source(factor) {
             self.found.source_reads += 1;
+        }
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<()> {
+        if let Expr::Identifier(word) = expr {
+            self.found.source_name_stands_as_a_value |=
+                token_names_source(&word.to_string().to_lowercase(), &self.source_lower);
         }
         ControlFlow::Continue(())
     }

@@ -2074,6 +2074,13 @@ fn first_unprojected_group_key(analysis: &crate::sql_analyzer::SqlAnalysis) -> O
     None
 }
 
+/// A caller's query as every later step reads it. Queries pg_reflex writes
+/// itself (the parents and operands of a decomposition) do not pass here: they
+/// name their sub-IMVs quoted, and the registry lookups rely on it.
+pub(crate) fn query_with_one_spelling_per_identifier(sql: &str) -> String {
+    identifier_quotes::with_one_spelling_per_identifier(sql).unwrap_or_else(|| sql.to_string())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn create_reflex_ivm_impl(
     view_name: &str,
@@ -2473,6 +2480,7 @@ pub(crate) fn keyless_immediate_warning(
 
 mod admin;
 mod decompose;
+mod identifier_quotes;
 /// `ignore_sources` create-time soundness check. Crate-visible because the
 /// `ignore-soundness` audit check calls `unsound_ignored_sources` from
 /// `crate::audit` rather than re-implementing the resolver.
