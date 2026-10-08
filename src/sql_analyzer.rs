@@ -197,6 +197,84 @@ fn keyword_pseudo_function(ident: &Ident) -> Option<CalledFunction> {
         .then_some(CalledFunction { name, arg_count: 0 })
 }
 
+const MOVING_DATE_TIME_WORDS: [&str; 4] = ["now", "today", "tomorrow", "yesterday"];
+
+const DATE_TIME_TYPES: [&str; 11] = [
+    "date",
+    "time",
+    "timetz",
+    "timestamp",
+    "timestamptz",
+    "daterange",
+    "tsrange",
+    "tstzrange",
+    "datemultirange",
+    "tsmultirange",
+    "tstzmultirange",
+];
+
+/// `type_name` as written (`timestamptz`, `pg_catalog.date`, `time(3) with time zone`,
+/// `date[]`) names a built-in type whose input reads the special date/time words.
+fn is_date_time_type(type_name: &str) -> bool {
+    let lower = type_name.to_ascii_lowercase().replace('"', "");
+    let unqualified = lower.strip_prefix("pg_catalog.").unwrap_or(&lower);
+    let base = unqualified
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .next()
+        .unwrap_or_default();
+    DATE_TIME_TYPES.contains(&base)
+}
+
+/// The date/time input words that stand for the moment of evaluation. Any other word
+/// (`epoch`, `infinity`, `allballs`) is a fixed value.
+fn holds_moving_date_time_word(literal: &str) -> bool {
+    literal
+        .to_ascii_lowercase()
+        .split(|c: char| !c.is_ascii_alphabetic())
+        .any(|word| MOVING_DATE_TIME_WORDS.contains(&word))
+}
+
+fn string_literal(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Nested(inner) => string_literal(inner),
+        Expr::Value(value) => value.clone().into_string(),
+        _ => None,
+    }
+}
+
+/// A string literal given a date/time type whose value depends on when it is read:
+/// `'now'::timestamptz`, `DATE 'today'`, `date('yesterday')`.
+fn is_moving_date_time_literal(expr: &Expr) -> bool {
+    let (type_name, literal) = match expr {
+        Expr::Cast {
+            expr: inner,
+            data_type,
+            ..
+        } => (data_type.to_string(), string_literal(inner)),
+        Expr::TypedString(typed) => (
+            typed.data_type.to_string(),
+            typed.value.clone().into_string(),
+        ),
+        Expr::Function(f) => {
+            let only_argument = match &f.args {
+                FunctionArguments::List(list) => match list.args.as_slice() {
+                    [FunctionArg::Unnamed(FunctionArgExpr::Expr(argument))] => {
+                        string_literal(argument)
+                    }
+                    _ => None,
+                },
+                _ => None,
+            };
+            (
+                builtin_function_name(&f.name).unwrap_or_default(),
+                only_argument,
+            )
+        }
+        _ => return false,
+    };
+    is_date_time_type(&type_name) && literal.is_some_and(|text| holds_moving_date_time_word(&text))
+}
+
 /// A select item PostgreSQL refuses as a grouping key, or reads as a position: a bare
 /// string, NULL, boolean or non-integer literal, or a signed number. An unsigned integer
 /// literal is left alone.
@@ -467,13 +545,17 @@ impl SqlAnalysis {
         names
     }
 
+    fn record_nondeterministic(&mut self, name: String) {
+        self.has_nondeterministic_select = true;
+        if !self.nondeterministic_functions.contains(&name) {
+            self.nondeterministic_functions.push(name);
+        }
+    }
+
     fn record_called_function(&mut self, call: CalledFunction, schema: Option<String>) {
         let is_builtin_spelling = !matches!(schema.as_deref(), Some(s) if s != "pg_catalog");
         if is_builtin_spelling && is_clock_or_session_function(&call) {
-            self.has_nondeterministic_select = true;
-            if !self.nondeterministic_functions.contains(&call.name) {
-                self.nondeterministic_functions.push(call.name.clone());
-            }
+            self.record_nondeterministic(call.name.clone());
         }
         let reference = FunctionReference {
             schema,
@@ -520,6 +602,9 @@ impl<'a> Visitor for AnalysisVisitor<'a> {
     }
 
     fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<()> {
+        if is_moving_date_time_literal(expr) {
+            self.analysis.record_nondeterministic(expr.to_string());
+        }
         match expr {
             Expr::Function(f) => {
                 if let FunctionArguments::List(list) = &f.args {
