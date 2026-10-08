@@ -274,3 +274,113 @@ v112_hv_cells! {
     v112_hv_def_ungrouped_sum => "SELECT SUM(v) AS s FROM {src} HAVING SUM(v) > 20",
 }
 
+// COUNT(DISTINCT) regroups the end query, where HAVING follows GROUP BY
+v112_hv_cells! {
+    V112_HV_NULLABLE, false, None;
+    v112_hv_count_distinct => "SELECT g, COUNT(DISTINCT v) AS d FROM {src} GROUP BY g HAVING COUNT(DISTINCT v) > 1",
+    v112_hv_count_distinct_positive => "SELECT g, COUNT(DISTINCT v) AS d FROM {src} GROUP BY g HAVING COUNT(DISTINCT v) > 0",
+    v112_hv_count_distinct_zero => "SELECT g, COUNT(DISTINCT v) AS d FROM {src} GROUP BY g HAVING COUNT(DISTINCT v) = 0",
+    v112_hv_count_distinct_nested => "SELECT g, COUNT(DISTINCT v) AS d FROM {src} GROUP BY g HAVING COUNT(DISTINCT v) * 2 > 3",
+    v112_hv_count_distinct_group_column => "SELECT g, COUNT(DISTINCT v) AS d FROM {src} GROUP BY g HAVING g <> 'a'",
+    v112_hv_count_distinct_ungrouped => "SELECT COUNT(DISTINCT v) AS d FROM {src} HAVING COUNT(DISTINCT v) > 4",
+}
+
+v112_hv_cells! {
+    V112_HV_NULLABLE, true, None;
+    v112_hv_def_count_distinct => "SELECT g, COUNT(DISTINCT v) AS d FROM {src} GROUP BY g HAVING COUNT(DISTINCT v) > 1",
+}
+
+fn v112_hv_source(tag: &str) -> String {
+    let src = format!("v112_hv_{tag}_src");
+    Spi::run(&format!(
+        "CREATE TABLE {src}(id SERIAL PRIMARY KEY, {})",
+        V112_HV_NULLABLE.columns
+    ))
+    .expect("create source");
+    Spi::run(&format!(
+        "INSERT INTO {src}(g, v, b, n) VALUES {}",
+        V112_HV_NULLABLE.seed
+    ))
+    .expect("seed");
+    src
+}
+
+fn v112_hv_create(imv: &str, select: &str) -> String {
+    v112_na_try(&format!(
+        "SELECT create_reflex_ivm('{imv}', $v112sel${select}$v112sel$)"
+    ))
+}
+
+fn v112_hv_assert_nothing_created(imv: &str) {
+    let relations = Spi::get_one::<i64>(&format!(
+        "SELECT COUNT(*) FROM pg_class WHERE relname LIKE '%{imv}%' AND relname NOT LIKE '%{imv}_src%'"
+    ))
+    .expect("catalog")
+    .unwrap_or(-1);
+    let registered = Spi::get_one::<i64>(&format!(
+        "SELECT COUNT(*) FROM public.__reflex_ivm_reference WHERE name LIKE '%{imv}%'"
+    ))
+    .expect("registry")
+    .unwrap_or(-1);
+    assert_eq!((relations, registered), (0, 0), "{imv} left objects behind");
+}
+
+/// The shape is refused with the tagged error before any DDL, and `remedy`,
+/// the rewrite the message prescribes, is created and stays correct.
+fn v112_hv_rejected_with_working_remedy(tag: &str, rejected: &str, remedy: &str) {
+    let src = v112_hv_source(tag);
+    let imv = format!("v112_hv_{tag}");
+    let outcome = v112_hv_create(&imv, &rejected.replace("{src}", &src));
+    assert!(
+        outcome.starts_with("ERROR: [reflex-unsupported]")
+            && outcome.contains("COUNT(DISTINCT")
+            && outcome.contains("CTE"),
+        "{outcome}"
+    );
+    v112_hv_assert_nothing_created(&imv);
+
+    let remedy = remedy.replace("{src}", &src);
+    assert_eq!(
+        v112_hv_create(&imv, &remedy),
+        "CREATE REFLEX INCREMENTAL VIEW"
+    );
+    assert_imv_correct(&imv, &remedy);
+    for (label, dml) in V112_HV_NULLABLE.steps {
+        Spi::run(&dml.replace("{src}", &src)).expect(label);
+        assert_imv_correct(&imv, &remedy);
+    }
+}
+
+#[pg_test]
+fn v112_hv_count_distinct_with_other_aggregate_in_having_is_rejected() {
+    v112_hv_rejected_with_working_remedy(
+        "cd_having_other",
+        "SELECT g, COUNT(DISTINCT v) AS d FROM {src} GROUP BY g HAVING SUM(v) > 5",
+        "WITH cd AS (SELECT g, COUNT(DISTINCT v) AS d FROM {src} GROUP BY g), \
+              other AS (SELECT g, SUM(v) AS s FROM {src} GROUP BY g) \
+         SELECT cd.g, cd.d FROM cd JOIN other ON other.g = cd.g WHERE other.s > 5",
+    );
+}
+
+#[pg_test]
+fn v112_hv_count_distinct_only_in_having_is_rejected() {
+    v112_hv_rejected_with_working_remedy(
+        "cd_having_only",
+        "SELECT g, SUM(v) AS s FROM {src} GROUP BY g HAVING COUNT(DISTINCT v) > 1",
+        "WITH cd AS (SELECT g, COUNT(DISTINCT v) AS d FROM {src} GROUP BY g), \
+              other AS (SELECT g, SUM(v) AS s FROM {src} GROUP BY g) \
+         SELECT other.g, other.s FROM cd JOIN other ON other.g = cd.g WHERE cd.d > 1",
+    );
+}
+
+#[pg_test]
+fn v112_hv_count_distinct_of_another_column_in_having_is_rejected() {
+    v112_hv_rejected_with_working_remedy(
+        "cd_having_other_column",
+        "SELECT g, COUNT(DISTINCT v) AS d FROM {src} GROUP BY g HAVING COUNT(DISTINCT n) > 1",
+        "WITH cd AS (SELECT g, COUNT(DISTINCT v) AS d FROM {src} GROUP BY g), \
+              other AS (SELECT g, COUNT(DISTINCT n) AS dn FROM {src} GROUP BY g) \
+         SELECT cd.g, cd.d FROM cd JOIN other ON other.g = cd.g WHERE other.dn > 1",
+    );
+}
+
