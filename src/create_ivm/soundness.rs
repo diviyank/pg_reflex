@@ -56,11 +56,13 @@ pub(crate) fn canonicalize_analysis_sources(analysis: &mut crate::sql_analyzer::
                         .map(|s| s.to_string())
                 });
             if let Some(q) = qualified {
-                if q.starts_with("public.") {
-                    continue;
-                }
-                if q != *raw {
-                    resolutions.insert(raw.clone(), q);
+                let identity = if q.starts_with("public.") {
+                    registered_spelling_differing_by_quotes(client, raw)
+                } else {
+                    Some(q)
+                };
+                if let Some(identity) = identity.filter(|identity| identity != raw) {
+                    resolutions.insert(raw.clone(), identity);
                 }
             }
         }
@@ -80,6 +82,36 @@ pub(crate) fn canonicalize_analysis_sources(analysis: &mut crate::sql_analyzer::
             *table = q.clone();
         }
     }
+}
+
+/// The spelling under which another IMV already registered the relation `raw`
+/// names, when the two differ only by double quotes (`"t"` and `t`). Triggers
+/// and registry lookups match a source by its registered string, so a relation
+/// registered under two spellings is maintained for one of them only.
+///
+/// Limited to quotes: every consumer of a registered source recognises its
+/// quoted and unquoted forms in the stored query, and no other respelling.
+fn registered_spelling_differing_by_quotes(
+    client: &pgrx::spi::SpiClient<'_>,
+    raw: &str,
+) -> Option<String> {
+    client
+        .select(
+            "SELECT d FROM public.__reflex_ivm_reference r, unnest(r.depends_on) AS d \
+             WHERE d <> $1 AND replace(d, '\"', '') = replace($1, '\"', '') \
+               AND to_regclass(d) = to_regclass($1) \
+             ORDER BY d LIMIT 1",
+            None,
+            &[unsafe { DatumWithOid::new(raw.to_string(), PgBuiltInOids::TEXTOID.oid().value()) }],
+        )
+        .ok()
+        .and_then(|mut rows| rows.next())
+        .and_then(|row| {
+            row.get_by_name::<&str, _>("d")
+                .ok()
+                .flatten()
+                .map(str::to_string)
+        })
 }
 
 /// Build per-source-table column mappings for passthrough DELETE/UPDATE.

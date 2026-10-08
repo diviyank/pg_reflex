@@ -1255,3 +1255,23 @@ fn rewrite_of_every_source_spelling_breaks_no_quoted_identifier() {
         }
     }
 }
+
+#[test]
+fn source_registered_with_quotes_is_rewritten_where_written_without() {
+    assert_eq!(
+        replace_source_with_transition(
+            "SELECT season, SUM(v) AS s FROM dim GROUP BY season",
+            "\"dim\"",
+            "__reflex_new_dim"
+        ),
+        "SELECT season, SUM(v) AS s FROM \"__reflex_new_dim\" GROUP BY season"
+    );
+    assert_eq!(
+        replace_source_with_transition(
+            "SELECT dim.v FROM public.dim JOIN public.dim_backup b ON b.k = dim.k",
+            "public.\"dim\"",
+            "__reflex_new_public_dim"
+        ),
+        "SELECT \"__reflex_new_public_dim\".v FROM \"__reflex_new_public_dim\" JOIN public.dim_backup b ON b.k = \"__reflex_new_public_dim\".k"
+    );
+}
