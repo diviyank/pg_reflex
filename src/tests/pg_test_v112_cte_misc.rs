@@ -209,3 +209,132 @@ fn v112_cm_cte_alias_naming_its_column_keeps_the_column_type() {
     .expect("column s");
     assert_eq!(column_type, "bigint");
 }
+
+/// A LIST-partitioned source on `column`, with one partition per bound and a
+/// DEFAULT one, mirrored by the keyed passthrough IMV `{prefix}_v`.
+fn v112_cm_partitioned_passthrough(prefix: &str, column: &str, bounds: &[&str]) -> String {
+    let src = format!("{prefix}_s");
+    Spi::run(&format!(
+        "CREATE TABLE {src}({column} TEXT NOT NULL, id INT NOT NULL, v INT) PARTITION BY LIST ({column})"
+    ))
+    .expect("source");
+    for (i, bound) in bounds.iter().enumerate() {
+        Spi::run(&format!(
+            "CREATE TABLE {src}_p{i} PARTITION OF {src} FOR VALUES IN ('{bound}')"
+        ))
+        .expect("partition");
+        Spi::run(&format!(
+            "INSERT INTO {src} SELECT '{bound}', g, g FROM generate_series(1, 20) g"
+        ))
+        .expect("seed");
+    }
+    Spi::run(&format!("CREATE TABLE {src}_pd PARTITION OF {src} DEFAULT"))
+        .expect("default partition");
+    Spi::run(&format!(
+        "INSERT INTO {src} SELECT 'elsewhere', g, g FROM generate_series(1, 5) g"
+    ))
+    .expect("seed default");
+    let query = format!("SELECT {column}, id, v FROM {src}");
+    let created = Spi::get_one::<String>(&format!(
+        "SELECT create_reflex_ivm('{prefix}_v', '{query}', '{column}, id', NULL, 'IMMEDIATE', \
+         NULL, ARRAY['{column}'])"
+    ))
+    .expect("create")
+    .expect("result");
+    assert_eq!(created, V112_CM_CREATED);
+    assert_imv_correct(&format!("{prefix}_v"), &query);
+    query
+}
+
+/// Makes the IMV's rows for `bound` wrong in the three possible ways: a
+/// changed row, a missing row and a row the source does not have.
+fn v112_cm_drift(imv: &str, column: &str, bound: &str) {
+    Spi::run(&format!(
+        "UPDATE {imv} SET v = v + 1000 WHERE {column} = '{bound}' AND id = 7"
+    ))
+    .expect("drift update");
+    Spi::run(&format!(
+        "DELETE FROM {imv} WHERE {column} = '{bound}' AND id = 8"
+    ))
+    .expect("drift delete");
+    Spi::run(&format!("INSERT INTO {imv} VALUES ('{bound}', 999, 1)")).expect("drift insert");
+}
+
+fn v112_cm_assert_reconcile_by_key_repairs(prefix: &str, column: &str, bounds: &[&str]) {
+    let imv = format!("{prefix}_v");
+    let query = v112_cm_partitioned_passthrough(prefix, column, bounds);
+    for bound in bounds {
+        v112_cm_drift(&imv, column, bound);
+        let reconciled = Spi::get_one::<String>(&format!(
+            "SELECT reflex_reconcile_partition('{imv}', '{bound}')"
+        ))
+        .expect("reconcile")
+        .expect("result");
+        assert!(
+            reconciled.starts_with("RECONCILED"),
+            "key {bound}: {reconciled}"
+        );
+        assert_imv_correct(&imv, &query);
+    }
+}
+
+#[pg_test]
+fn v112_cm_reconcile_by_key_whose_bound_spells_the_partition_column() {
+    v112_cm_assert_reconcile_by_key_repairs("v112_cm_rk", "k", &["a k b", "k", "K k", "plain"]);
+}
+
+#[pg_test]
+fn v112_cm_reconcile_by_key_whose_multibyte_bound_holds_the_partition_column() {
+    v112_cm_assert_reconcile_by_key_repairs("v112_cm_rm", "t", &["Été", "Hiver", "t夏t"]);
+}
+
+#[pg_test]
+fn v112_cm_reconcile_by_key_holding_a_quote_next_to_the_partition_column() {
+    v112_cm_assert_reconcile_by_key_repairs("v112_cm_rq", "k", &["it''s k", "k''k"]);
+}
+
+/// A populated leaf of an IMV that another IMV reads is rebuilt as a row diff
+/// scoped by the leaf's partition constraint.
+fn v112_cm_assert_leaf_diff_repairs(prefix: &str, column: &str, bounds: &[&str]) {
+    let imv = format!("{prefix}_v");
+    let dependent = format!("{prefix}_d");
+    let query = v112_cm_partitioned_passthrough(prefix, column, bounds);
+    let dependent_query =
+        format!("SELECT {column}, SUM(v) AS total, COUNT(*) AS n FROM {{}} GROUP BY {column}");
+    assert_eq!(
+        crate::create_reflex_ivm(
+            &dependent,
+            &dependent_query.replace("{}", &imv),
+            None,
+            None,
+            None,
+            None
+        ),
+        V112_CM_CREATED
+    );
+    let fresh_dependent = dependent_query.replace("{}", &format!("{prefix}_s"));
+    for (i, bound) in bounds.iter().enumerate() {
+        v112_cm_drift(&imv, column, bound);
+        let reconciled = Spi::get_one::<String>(&format!(
+            "SELECT reflex_reconcile_partition('{imv}', '', '{prefix}_s_p{i}')"
+        ))
+        .expect("reconcile")
+        .expect("result");
+        assert!(
+            reconciled.starts_with("RECONCILED"),
+            "partition of {bound}: {reconciled}"
+        );
+        assert_imv_correct(&imv, &query);
+        assert_imv_correct(&dependent, &fresh_dependent);
+    }
+}
+
+#[pg_test]
+fn v112_cm_leaf_diff_of_bound_spelling_the_partition_column_repairs_the_leaf() {
+    v112_cm_assert_leaf_diff_repairs("v112_cm_dk", "k", &["a k b", "plain"]);
+}
+
+#[pg_test]
+fn v112_cm_leaf_diff_of_multibyte_bound_holding_the_partition_column_repairs_the_leaf() {
+    v112_cm_assert_leaf_diff_repairs("v112_cm_dm", "t", &["Été", "Hiver"]);
+}
