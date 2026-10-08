@@ -434,13 +434,11 @@ impl Check for InternalTablesExist {
                 }
             }
         } else {
-            // Aggregate IMVs use an intermediate table and affected groups table.
-            // Both are recreated by `reflex_reconcile`'s heal step, which
-            // is what makes the `reflex_rebuild_imv` remedy below converge.
+            // Aggregate IMVs use an intermediate table and, when the plan groups,
+            // group-capture tables. All are recreated by `reflex_reconcile`'s heal
+            // step, which is what makes the `reflex_rebuild_imv` remedy below converge.
             required.push(crate::query_decomposer::intermediate_table_name(&imv.name));
-            required.push(crate::query_decomposer::affected_groups_table_name(
-                &imv.name,
-            ));
+            required.extend(imv.group_capture_tables());
         }
 
         let mut missing: Vec<String> = Vec::new();

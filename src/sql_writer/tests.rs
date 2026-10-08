@@ -1255,3 +1255,150 @@ fn rewrite_of_every_source_spelling_breaks_no_quoted_identifier() {
         }
     }
 }
+
+// ---------- partition-constraint rewrite: bound literals, multi-byte neighbours ----------
+
+/// Verbatim copy of `substitute_identifier_ci` as it was while it read string
+/// literals as code and multi-byte characters as word breaks, kept as the
+/// reference for the differential test below.
+fn legacy_substitute_identifier_ci(expr: &str, ident: &str, replacement: &str) -> String {
+    let bytes = expr.as_bytes();
+    let lower_ident = ident.to_lowercase();
+    let mut out = String::with_capacity(expr.len());
+    let mut unmatched_start = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i] as char;
+        if c.is_ascii_alphabetic() || c == '_' {
+            out.push_str(&expr[unmatched_start..i]);
+            let start = i;
+            while i < bytes.len() {
+                let cc = bytes[i] as char;
+                if cc.is_ascii_alphanumeric() || cc == '_' {
+                    i += 1;
+                } else {
+                    break;
+                }
+            }
+            let word = &expr[start..i];
+            if word.to_lowercase() == lower_ident {
+                out.push_str(replacement);
+            } else {
+                out.push_str(word);
+            }
+            unmatched_start = i;
+        } else {
+            i += 1;
+        }
+    }
+    out.push_str(&expr[unmatched_start..]);
+    out
+}
+
+#[test]
+fn substitute_identifier_ci_matches_legacy_on_ascii_input_without_quotes() {
+    const FRAGMENTS: &[&str] = &[
+        "k",
+        "K",
+        "kk",
+        "k_1",
+        "season",
+        "Season",
+        "t",
+        "x",
+        "0",
+        "1k",
+        "_",
+        ".",
+        " ",
+        "(",
+        ")",
+        ",",
+        "=",
+        "::text",
+        " IS NOT NULL",
+        " AND ",
+        " OR ",
+        " = ANY (ARRAY[",
+        "])",
+        ">=",
+        "<",
+        "-",
+        "/",
+        "*",
+        "\n",
+        "\t",
+    ];
+    const IDENTIFIERS: &[&str] = &["k", "K", "season", "t", "kk", "absent", ""];
+    let mut rng = Lcg(0x5eed);
+    let mut rewritten = 0;
+    for case in 0..6000 {
+        let mut expr = rng.concatenation_of(FRAGMENTS, 16);
+        if case % 3 == 0 {
+            let position = rng.below(expr.len() + 1);
+            let any_ascii = (rng.below(0x80) as u8) as char;
+            if !matches!(any_ascii, '\'' | '"' | '$') {
+                expr.insert(position, any_ascii);
+            }
+        }
+        assert!(expr.is_ascii() && !expr.contains(['\'', '"', '$']));
+        for ident in IDENTIFIERS {
+            let expected = legacy_substitute_identifier_ci(&expr, ident, "t.\"k\"");
+            assert_eq!(
+                substitute_identifier_ci(&expr, ident, "t.\"k\""),
+                expected,
+                "expr: {expr:?}, ident: {ident}"
+            );
+            rewritten += usize::from(expected != expr);
+        }
+    }
+    assert!(rewritten > 1000, "rewrote only {rewritten}");
+}
+
+#[test]
+fn substitute_identifier_ci_leaves_bound_literals_alone() {
+    assert_eq!(
+        substitute_identifier_ci("((k IS NOT NULL) AND (k = 'a k b'::text))", "k", "t.\"k\""),
+        "((t.\"k\" IS NOT NULL) AND (t.\"k\" = 'a k b'::text))"
+    );
+    assert_eq!(
+        substitute_identifier_ci(
+            "(k = ANY (ARRAY['k'::text, 'it''s k'::text, 'K'::text]))",
+            "k",
+            "'x'"
+        ),
+        "('x' = ANY (ARRAY['k'::text, 'it''s k'::text, 'K'::text]))"
+    );
+    assert_eq!(
+        substitute_identifier_ci("(K = 'k') AND k > 'k'", "k", "X"),
+        "(X = 'k') AND X > 'k'"
+    );
+}
+
+#[test]
+fn substitute_identifier_ci_leaves_multibyte_bound_literals_alone() {
+    assert_eq!(
+        substitute_identifier_ci("((t IS NOT NULL) AND (t = 'Été'::text))", "t", "'Été'"),
+        "(('Été' IS NOT NULL) AND ('Été' = 'Été'::text))"
+    );
+    assert_eq!(
+        substitute_identifier_ci("(t = 't夏t'::text)", "t", "x.\"t\""),
+        "(x.\"t\" = 't夏t'::text)"
+    );
+}
+
+#[test]
+fn substitute_identifier_ci_reads_a_multibyte_neighbour_as_part_of_the_word() {
+    assert_eq!(
+        substitute_identifier_ci(
+            "(Été = 1) AND (t = 2) AND (夏t = 3) AND (t夏 = 4)",
+            "t",
+            "X"
+        ),
+        "(Été = 1) AND (X = 2) AND (夏t = 3) AND (t夏 = 4)"
+    );
+    assert_eq!(
+        substitute_identifier_ci("(été = 1) AND (ete = 2)", "été", "X"),
+        "(X = 1) AND (ete = 2)"
+    );
+}

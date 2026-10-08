@@ -5,11 +5,106 @@ use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 
 use crate::query_decomposer::{
-    bare_column_name, quote_identifier, replace_identifier, safe_identifier,
+    bare_column_name, quote_identifier, safe_identifier, split_qualified_name,
 };
 use crate::sql_analyzer::analyze;
 use crate::sql_writer::{add_graph_child_links, insert_registry_row, RegistryRow};
 use crate::window;
+
+/// The name an identifier resolves to: verbatim when double-quoted, folded to
+/// lower case otherwise.
+fn resolved_identifier(written: &str) -> String {
+    match written
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
+    {
+        Some(quoted) => quoted.replace("\"\"", "\""),
+        None => written.to_lowercase(),
+    }
+}
+
+/// Points every relation reference to a decomposed CTE at the sub-IMV holding
+/// its rows. Only relation references change: a column, an output alias or a
+/// string literal spelled like the CTE is not one. An unaliased reference
+/// keeps the CTE's name as its alias, so that qualifiers, and a bare name that
+/// is both the CTE and one of its columns, resolve as they do against the CTE.
+struct CteReferencesToSubImvs<'a> {
+    sub_imv_of_cte: &'a [(String, String)],
+}
+
+impl sqlparser::ast::VisitorMut for CteReferencesToSubImvs<'_> {
+    type Break = ();
+
+    fn pre_visit_table_factor(
+        &mut self,
+        table_factor: &mut sqlparser::ast::TableFactor,
+    ) -> std::ops::ControlFlow<()> {
+        use sqlparser::ast::{Ident, ObjectName, ObjectNamePart, TableAlias, TableFactor};
+        if let TableFactor::Table {
+            name,
+            alias,
+            args: None,
+            ..
+        } = table_factor
+        {
+            let referenced_cte = match name.0.as_slice() {
+                [ObjectNamePart::Identifier(reference)] => Some(reference.clone()),
+                _ => None,
+            };
+            let sub_imv = referenced_cte.as_ref().and_then(|reference| {
+                let referenced = resolved_identifier(&reference.to_string());
+                self.sub_imv_of_cte
+                    .iter()
+                    .find(|(cte_alias, _)| resolved_identifier(cte_alias) == referenced)
+                    .map(|(_, sub_imv)| sub_imv)
+            });
+            if let (Some(reference), Some(sub_imv)) = (referenced_cte, sub_imv) {
+                let (schema, relation) = split_qualified_name(sub_imv);
+                *name = ObjectName(
+                    schema
+                        .into_iter()
+                        .chain(std::iter::once(relation))
+                        .map(|part| ObjectNamePart::Identifier(Ident::with_quote('"', part)))
+                        .collect(),
+                );
+                alias.get_or_insert(TableAlias {
+                    explicit: true,
+                    name: reference,
+                    columns: Vec::new(),
+                });
+            }
+        }
+        std::ops::ControlFlow::Continue(())
+    }
+}
+
+fn reading_sub_imvs<T>(query_part: &T, sub_imv_of_cte: &[(String, String)]) -> String
+where
+    T: sqlparser::ast::VisitMut + Clone + std::fmt::Display,
+{
+    let mut rewritten = query_part.clone();
+    let _ = sqlparser::ast::VisitMut::visit(
+        &mut rewritten,
+        &mut CteReferencesToSubImvs { sub_imv_of_cte },
+    );
+    rewritten.to_string()
+}
+
+/// `cte_query` with its references to earlier CTEs pointed at their sub-IMVs.
+/// A query that does not parse is returned as written: creating its sub-IMV
+/// reports the error.
+pub(crate) fn cte_query_reading_sub_imvs(
+    cte_query: &str,
+    sub_imv_of_cte: &[(String, String)],
+) -> String {
+    if sub_imv_of_cte.is_empty() {
+        return cte_query.to_string();
+    }
+    match Parser::parse_sql(&PostgreSqlDialect {}, cte_query) {
+        Ok(statements) if statements.len() == 1 => reading_sub_imvs(&statements[0], sub_imv_of_cte),
+        _ => cte_query.to_string(),
+    }
+}
 
 /// Extract the output column names from a CTE's query.
 /// Compute the subset of partition_by columns that appear in the CTE's output.
@@ -1006,11 +1101,7 @@ with kind: mv.",
         }
 
         // Rewrite references to earlier CTEs in this CTE's query
-        let mut cte_query = cte.query_sql.clone();
-        for (earlier_alias, earlier_imv) in &cte_name_map {
-            let quoted = quote_identifier(earlier_imv);
-            cte_query = replace_identifier(&cte_query, earlier_alias, &quoted);
-        }
+        let cte_query = cte_query_reading_sub_imvs(&cte.query_sql, &cte_name_map);
 
         // Compute partition subset using the pre-computed output columns.
         // If output columns are unknown, pass &[] to skip partition propagation.
@@ -1059,16 +1150,12 @@ with kind: mv.",
 
     // Rewrite main query body: serialize without WITH, replace CTE names
     let body_sql = if let sqlparser::ast::Statement::Query(ref query) = ctx.parsed.parsed_sql[0] {
-        let mut body = query.body.to_string();
-        // Append ORDER BY / LIMIT if present (shouldn't be for valid IMV queries)
-        if let Some(ref ob) = query.order_by {
-            body = format!("{} {}", body, ob);
+        let body = reading_sub_imvs(query.body.as_ref(), &cte_name_map);
+        // Append ORDER BY if present (shouldn't be for valid IMV queries)
+        match query.order_by {
+            Some(ref ob) => format!("{} {}", body, reading_sub_imvs(ob, &cte_name_map)),
+            None => body,
         }
-        for (cte_alias, cte_imv_name) in &cte_name_map {
-            let quoted = quote_identifier(cte_imv_name);
-            body = replace_identifier(&body, cte_alias, &quoted);
-        }
-        body
     } else {
         rollback_partial_sub_imvs(&created_sub_imv_names(&cte_name_map));
         return Some(crate::reflex_reject("Query is not a SELECT"));
