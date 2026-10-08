@@ -114,7 +114,8 @@ const V112_TY_NAMES_FIXTURE: V112TyFixture = V112TyFixture {
               \"aééééééééééééééééééééééééé\" INT",
     insert_columns: "g, v, \"V\", star, v_topk, b, \"aééééééééééééééééééééééééé\"",
     seed: "('a',1,100,NULL,7,true,11),('a',2,200,5,3,false,12),('a',3,NULL,6,9,NULL,13),\
-           ('b',5,500,NULL,1,false,NULL),('n',NULL,NULL,NULL,NULL,NULL,NULL),('z',0,-7,1,0,true,14)",
+           ('b',5,500,NULL,1,false,NULL),('n',NULL,NULL,NULL,NULL,NULL,NULL),('z',0,-7,1,0,true,14),\
+           ('k',8,NULL,2,2,true,3),('k',6,NULL,NULL,5,false,4)",
     steps: &[
         (
             "ins",
@@ -124,7 +125,7 @@ const V112_TY_NAMES_FIXTURE: V112TyFixture = V112TyFixture {
         (
             "upd",
             "UPDATE {src} SET v = v + 10, \"V\" = \"V\" - 3, star = COALESCE(star, 0) + 1, \
-             v_topk = v_topk * 2, b = NOT b WHERE g IN ('a', 'b')",
+             v_topk = v_topk * 2, b = NOT b WHERE g IN ('a', 'b', 'k')",
         ),
         ("move", "UPDATE {src} SET g = 'b' WHERE g = 'z'"),
         (
@@ -190,10 +191,7 @@ fn v112_ty_cell_on(
         steps.push((label.to_string(), v112_ty_oracle(&imv, &fresh)));
     }
     let detail: Vec<String> = steps.iter().map(|(l, o)| format!("{l}={o}")).collect();
-    if !steps
-        .iter()
-        .all(|(_, outcome)| outcome.parse::<i64>().is_ok())
-    {
+    if !steps.iter().all(|(_, outcome)| outcome.parse::<i64>().is_ok()) {
         return format!("RAW-ERROR {}", detail.join(" "));
     }
     if !steps.iter().all(|(_, outcome)| outcome == "0") {
@@ -235,6 +233,103 @@ fn v112_ty_leftovers(imv: &str) -> String {
             WHERE tgrelid = to_regclass('{imv}_src') AND NOT tgisinternal \
          ) leftovers"
     ))
+}
+
+// ---------------------------------------------------------------------------
+// MIN / MAX: the stored type is the type of the argument expression
+// ---------------------------------------------------------------------------
+
+v112_ty_cells! {
+    V112_TY_FIXTURE, false;
+    v112_types_min_real_expr_g => "SELECT g, MIN(rl * 2) AS r FROM {src} GROUP BY g",
+    v112_types_max_real_expr_g => "SELECT g, MAX(rl * 2) AS r FROM {src} GROUP BY g",
+    v112_types_min_real_expr_u => "SELECT MIN(rl * 2) AS r FROM {src}",
+    v112_types_max_real_sum_expr_g => "SELECT g, MAX(rl + rl) AS r FROM {src} GROUP BY g",
+    v112_types_min_real_expr_nested_g => "SELECT g, MIN(rl * 2) / 3 AS r FROM {src} GROUP BY g",
+    v112_types_max_real_expr_nested_u => "SELECT MAX(rl * 2) / 3 AS r FROM {src}",
+    v112_types_min_real_filter_g => "SELECT g, MIN(rl) FILTER (WHERE v > 1) AS r FROM {src} GROUP BY g",
+    v112_types_max_real_column_g => "SELECT g, MAX(rl) AS r FROM {src} GROUP BY g",
+    v112_types_max_real_column_nested_g => "SELECT g, MAX(rl) / 3 AS r FROM {src} GROUP BY g",
+    v112_types_max_real_having_g => "SELECT g, COUNT(*) AS r FROM {src} GROUP BY g HAVING MAX(rl * 2) > 1",
+    v112_types_min_double_expr_g => "SELECT g, MIN(f / 3) AS r FROM {src} GROUP BY g",
+
+    v112_types_max_text_function_g => "SELECT g, SUM(v) AS s, MAX(upper(g)) AS u FROM {src} GROUP BY g",
+    v112_types_max_text_function_only_g => "SELECT g, MAX(upper(t)) AS u FROM {src} GROUP BY g",
+    v112_types_min_text_function_u => "SELECT MIN(upper(t)) AS u FROM {src}",
+    v112_types_max_text_concat_g => "SELECT g, MAX(t || '!') AS u FROM {src} GROUP BY g",
+    v112_types_max_varchar_function_g => "SELECT g, MAX(upper(vc)) AS u FROM {src} GROUP BY g",
+    v112_types_max_varchar_column_g => "SELECT g, MAX(vc) AS u FROM {src} GROUP BY g",
+    v112_types_max_int_function_g => "SELECT g, MAX(length(t)) AS u FROM {src} GROUP BY g",
+    v112_types_max_text_function_nested_g => "SELECT g, COALESCE(MAX(upper(t)), '-') AS u FROM {src} GROUP BY g",
+
+    v112_types_max_text_filter_g => "SELECT g, MAX(t) FILTER (WHERE v > 1) AS r FROM {src} GROUP BY g",
+    v112_types_min_text_filter_g => "SELECT g, MIN(t) FILTER (WHERE v > 1) AS r FROM {src} GROUP BY g",
+    v112_types_max_text_filter_u => "SELECT MAX(t) FILTER (WHERE v > 1) AS r FROM {src}",
+    v112_types_min_text_filter_u => "SELECT MIN(t) FILTER (WHERE v > 1) AS r FROM {src}",
+    v112_types_max_varchar_filter_g => "SELECT g, MAX(vc) FILTER (WHERE v > 1) AS r FROM {src} GROUP BY g",
+
+    v112_types_max_text_filter_nested_g => "SELECT g, COALESCE(MAX(t) FILTER (WHERE v > 1), '-') AS r FROM {src} GROUP BY g",
+    v112_types_min_text_filter_nested_g => "SELECT g, COALESCE(MIN(t) FILTER (WHERE v > 1), '-') AS r FROM {src} GROUP BY g",
+    v112_types_max_text_filter_nested_u => "SELECT COALESCE(MAX(t) FILTER (WHERE v > 1), '-') AS r FROM {src}",
+    v112_types_max_text_filter_having_g => "SELECT g, COUNT(*) AS r FROM {src} GROUP BY g HAVING MAX(t) FILTER (WHERE v > 1) > 'a'",
+
+    v112_types_max_int_expr_g => "SELECT g, MAX(v * 3) AS r FROM {src} GROUP BY g",
+    v112_types_min_int_expr_g => "SELECT g, MIN(v * 3) AS r FROM {src} GROUP BY g",
+    v112_types_max_int_expr_u => "SELECT MAX(v * 3) AS r FROM {src}",
+    v112_types_min_int_expr_u => "SELECT MIN(v * 3) AS r FROM {src}",
+    v112_types_max_int_filter_g => "SELECT g, MAX(v) FILTER (WHERE v > 1) AS r FROM {src} GROUP BY g",
+    v112_types_min_int_filter_u => "SELECT MIN(v) FILTER (WHERE v > 1) AS r FROM {src}",
+    v112_types_max_bigint_expr_g => "SELECT g, MAX(q * 3) AS r FROM {src} GROUP BY g",
+    v112_types_min_bigint_expr_u => "SELECT MIN(q * 3) AS r FROM {src}",
+    v112_types_max_bigint_filter_g => "SELECT g, MAX(q) FILTER (WHERE v > 1) AS r FROM {src} GROUP BY g",
+    v112_types_min_bigint_filter_u => "SELECT MIN(q) FILTER (WHERE v > 1) AS r FROM {src}",
+    v112_types_max_smallint_expr_g => "SELECT g, MAX(s + s) AS r FROM {src} GROUP BY g",
+    v112_types_min_smallint_filter_g => "SELECT g, MIN(s) FILTER (WHERE v > 1) AS r FROM {src} GROUP BY g",
+    v112_types_max_numeric_expr_g => "SELECT g, MAX(n * 3) AS r FROM {src} GROUP BY g",
+
+    v112_types_max_interval_column_g => "SELECT g, MAX(iv) AS r FROM {src} GROUP BY g",
+    v112_types_min_interval_expr_u => "SELECT MIN(iv * 2) AS r FROM {src}",
+    v112_types_max_time_column_g => "SELECT g, MAX(tm) AS r FROM {src} GROUP BY g",
+}
+
+v112_ty_cells! {
+    V112_TY_FIXTURE, true;
+    v112_types_min_real_expr_g_deferred => "SELECT g, MIN(rl * 2) AS r FROM {src} GROUP BY g",
+    v112_types_max_text_function_g_deferred => "SELECT g, SUM(v) AS s, MAX(upper(g)) AS u FROM {src} GROUP BY g",
+    v112_types_max_text_filter_g_deferred => "SELECT g, MAX(t) FILTER (WHERE v > 1) AS r FROM {src} GROUP BY g",
+    v112_types_max_text_filter_nested_g_deferred => "SELECT g, COALESCE(MAX(t) FILTER (WHERE v > 1), '-') AS r FROM {src} GROUP BY g",
+    v112_types_max_int_expr_g_deferred => "SELECT g, MAX(v * 3) AS r FROM {src} GROUP BY g",
+}
+
+// ---------------------------------------------------------------------------
+// Result column types are those of the query
+// ---------------------------------------------------------------------------
+
+v112_ty_cells! {
+    V112_TY_FIXTURE, false;
+    v112_types_alias_of_real_column_g => "SELECT g, SUM(v) / 2 AS rl FROM {src} GROUP BY g",
+    v112_types_alias_of_double_column_g => "SELECT g, SUM(v) AS f FROM {src} GROUP BY g",
+    v112_types_alias_of_text_column_g => "SELECT g, COUNT(*) AS t FROM {src} GROUP BY g",
+    v112_types_alias_of_int_column_g => "SELECT g, MAX(t) AS v FROM {src} GROUP BY g",
+    v112_types_alias_of_int_column_u => "SELECT AVG(n) AS v FROM {src}",
+    v112_types_alias_of_boolean_column_g => "SELECT g, SUM(q) AS b FROM {src} GROUP BY g",
+    v112_types_alias_of_numeric_column_g => "SELECT g, BOOL_OR(b) AS n FROM {src} GROUP BY g",
+    v112_types_alias_of_bigint_column_g => "SELECT g, MIN(n) + 0.5 AS q FROM {src} GROUP BY g",
+
+    v112_types_varchar_n_derived_g => "SELECT g, (COUNT(*) + 1)::varchar(10) AS r FROM {src} GROUP BY g",
+    v112_types_varchar_n_derived_u => "SELECT (COUNT(*) + 1)::varchar(10) AS r FROM {src}",
+    v112_types_varchar_derived_g => "SELECT g, (SUM(v) / 2)::varchar AS r FROM {src} GROUP BY g",
+    v112_types_varchar_top_level_g => "SELECT g, MAX(t)::varchar AS r FROM {src} GROUP BY g",
+    v112_types_varchar_n_top_level_g => "SELECT g, COUNT(*)::varchar(10) AS r FROM {src} GROUP BY g",
+    v112_types_numeric_scale_derived_g => "SELECT g, (SUM(n) / 3)::numeric(12, 2) AS r FROM {src} GROUP BY g",
+
+    v112_types_unaliased_sum_g => "SELECT g, SUM(v) FROM {src} GROUP BY g",
+    v112_types_sum_int_g => "SELECT g, SUM(v) AS r FROM {src} GROUP BY g",
+    v112_types_sum_bigint_g => "SELECT g, SUM(q) AS r FROM {src} GROUP BY g",
+    v112_types_sum_smallint_u => "SELECT SUM(s) AS r FROM {src}",
+    v112_types_avg_int_g => "SELECT g, AVG(v) AS r FROM {src} GROUP BY g",
+    v112_types_count_g => "SELECT g, COUNT(*) AS r, COUNT(v) AS c FROM {src} GROUP BY g",
+    v112_types_bool_or_g => "SELECT g, BOOL_OR(b) AS r FROM {src} GROUP BY g",
 }
 
 // ---------------------------------------------------------------------------

@@ -15,6 +15,7 @@ use crate::schema_builder::{
     build_deferred_flush_ddl, build_deferred_trigger_ddls, build_delta_scratch_table_ddl,
     build_indexes_ddl, build_intermediate_table_ddl, build_passthrough_scratch_ddls,
     build_staging_table_ddl, build_target_table_ddl, build_trigger_ddls, resolve_column_type,
+    uncast_mapping_type,
 };
 use crate::sql_analyzer::{analyze, SqlAnalysisError};
 use crate::sql_writer::registry::{split_ignore_ack, strip_ignore_ack_marker};
@@ -1235,6 +1236,31 @@ fn materialize_passthrough(client: &mut pgrx::spi::SpiClient<'_>, ctx: &mut Buil
     }
 }
 
+/// The type PostgreSQL gives each aggregate or aggregate-derived SELECT item,
+/// keyed by the name of its target column. `described` are the columns of the
+/// user's query: they pair with the SELECT items by position, and by name when
+/// a wildcard item makes the two lists differ in length.
+fn result_types_by_output_alias(
+    analysis: &crate::sql_analyzer::SqlAnalysis,
+    described: &[(String, String)],
+) -> std::collections::HashMap<String, String> {
+    let output_alias = |col: &crate::sql_analyzer::SelectColumn| {
+        crate::query_decomposer::normalized_column_name(
+            col.alias.as_deref().unwrap_or(&col.expr_sql),
+        )
+    };
+    if described.len() != analysis.select_columns.len() {
+        return described.iter().cloned().collect();
+    }
+    analysis
+        .select_columns
+        .iter()
+        .zip(described)
+        .filter(|(col, _)| !col.is_passthrough)
+        .map(|(col, (_, pg_type))| (output_alias(col), pg_type.clone()))
+        .collect()
+}
+
 /// Aggregate materialization: catalog type discovery, intermediate + target + delta-scratch
 /// DDL, partition children. Pushes intermediate table name onto `ctx.unlogged_tables`.
 fn materialize_aggregate(client: &mut pgrx::spi::SpiClient<'_>, ctx: &mut BuildContext) {
@@ -1260,15 +1286,19 @@ fn materialize_aggregate(client: &mut pgrx::spi::SpiClient<'_>, ctx: &mut BuildC
     ctx.plan.imv_relevant_columns.retain(|_, v| !v.is_empty());
 
     let base_q_for_types = generate_base_query(&ctx.analysis, &ctx.plan);
-    augment_column_types_from_query(&base_q_for_types, &mut column_types);
-    augment_column_types_from_query(ctx.sql, &mut column_types);
+    let intermediate_described = describe_query_columns(&base_q_for_types);
+    let result_described = describe_query_columns(ctx.sql);
+    augment_column_types(&intermediate_described, &mut column_types);
+    augment_column_types(&result_described, &mut column_types);
+    let intermediate_types: std::collections::HashMap<String, String> =
+        intermediate_described.into_iter().collect();
+    let result_types = result_types_by_output_alias(&ctx.analysis, &result_described);
 
     for ic in &mut ctx.plan.intermediate_columns {
-        if ic.source_aggregate == "SUM" {
-            let base_type = resolve_column_type(&ic.name, &column_types, "").to_uppercase();
-            if base_type == "DOUBLE PRECISION" {
-                ic.pg_type = "DOUBLE PRECISION".to_string();
-            }
+        if ic.source_aggregate == "SUM"
+            && intermediate_types.get(&ic.name).map(String::as_str) == Some("double precision")
+        {
+            ic.pg_type = "DOUBLE PRECISION".to_string();
         }
     }
 
@@ -1278,7 +1308,7 @@ fn materialize_aggregate(client: &mut pgrx::spi::SpiClient<'_>, ctx: &mut BuildC
         .iter()
         .filter(|ic| {
             ic.source_aggregate == "SUM"
-                && resolve_column_type(&ic.name, &column_types, "").eq_ignore_ascii_case("BIGINT")
+                && intermediate_types.get(&ic.name).map(String::as_str) == Some("bigint")
         })
         .map(|ic| ic.name.clone())
         .collect();
@@ -1286,10 +1316,16 @@ fn materialize_aggregate(client: &mut pgrx::spi::SpiClient<'_>, ctx: &mut BuildC
         ctx.plan.read_nested_sum_as(sum_column, "BIGINT");
     }
 
+    // A MIN / MAX column stores the type PostgreSQL gives the aggregate, in
+    // PostgreSQL's spelling: the planner's `NUMERIC` then stays the mark of a
+    // column whose type is still to be looked up by the name of its argument.
     for ic in &mut ctx.plan.intermediate_columns {
-        if (ic.source_aggregate == "MIN" || ic.source_aggregate == "MAX")
-            && ic.pg_type.eq_ignore_ascii_case("NUMERIC")
-        {
+        if ic.source_aggregate != "MIN" && ic.source_aggregate != "MAX" {
+            continue;
+        }
+        if let Some(aggregate_type) = intermediate_types.get(&ic.name) {
+            ic.pg_type = ddl_type(aggregate_type);
+        } else if ic.pg_type.eq_ignore_ascii_case("NUMERIC") {
             let resolved = resolve_column_type(&ic.source_arg, &column_types, "");
             if !resolved.is_empty() && !resolved.eq_ignore_ascii_case("NUMERIC") {
                 ic.pg_type = resolved;
@@ -1316,20 +1352,24 @@ fn materialize_aggregate(client: &mut pgrx::spi::SpiClient<'_>, ctx: &mut BuildC
             .read_nested_extremum_as(extremum_column, native_type);
     }
 
-    for mapping in &mut ctx.plan.end_query_mappings {
-        if mapping.cast_type.is_none() {
-            let discovered = resolve_column_type(&mapping.output_alias, &column_types, "");
-            if !discovered.is_empty() {
-                let default_type = match mapping.aggregate_type.as_str() {
-                    "SUM" | "AVG" | "DERIVED" => "NUMERIC",
-                    "COUNT" => "BIGINT",
-                    "BOOL_OR" => "BOOLEAN",
-                    _ => "",
-                };
-                if !default_type.is_empty() && discovered.to_uppercase() != default_type {
-                    mapping.cast_type = Some(discovered);
-                }
+    // Each result column takes the type the query gives it: the end query
+    // casts a reading whose own type differs.
+    let result_casts: Vec<Option<String>> = ctx
+        .plan
+        .end_query_mappings
+        .iter()
+        .map(|mapping| {
+            if mapping.cast_type.is_some() {
+                return None;
             }
+            let query_type = result_column_type(result_types.get(&mapping.output_alias)?);
+            let uncast_type = uncast_mapping_type(&ctx.plan, mapping, &column_types);
+            (!query_type.eq_ignore_ascii_case(&uncast_type)).then_some(query_type)
+        })
+        .collect();
+    for (mapping, cast) in ctx.plan.end_query_mappings.iter_mut().zip(result_casts) {
+        if cast.is_some() {
+            mapping.cast_type = cast;
         }
     }
 

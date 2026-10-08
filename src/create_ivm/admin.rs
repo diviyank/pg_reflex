@@ -648,48 +648,99 @@ pub(crate) fn map_information_schema_type(data_type: &str) -> String {
     }
 }
 
-/// Augment the column_types map with actual types from the base_query output.
-/// This handles computed expressions (DATE_TRUNC, EXTRACT, COALESCE, etc.)
-/// whose types cannot be resolved from the source table catalog alone.
+/// The output columns of `query` in SELECT order, each with the type
+/// PostgreSQL gives it, spelled by `format_type` (type modifier included).
 ///
-/// Creates a temporary view from the base_query, reads column types from
-/// pg_attribute, then drops the view.
-pub(crate) fn augment_column_types_from_query(
-    base_query: &str,
-    column_types: &mut HashMap<String, String>,
-) {
+/// PostgreSQL resolves the types: the query becomes a temporary view whose
+/// columns are read from `pg_attribute`, then the view is dropped.
+pub(crate) fn describe_query_columns(query: &str) -> Vec<(String, String)> {
     Spi::connect_mut(|client| {
         let tmp = "__reflex_typecheck_view";
-        let create = format!("CREATE TEMP VIEW {} AS {}", tmp, base_query);
+        let create = format!("CREATE TEMP VIEW {} AS {}", tmp, query);
         if client.update(&create, None, &[]).is_err() {
-            return;
+            return Vec::new();
         }
-        let rows = client
+        let columns: Vec<(String, String)> = client
             .select(
                 "SELECT a.attname::text AS col_name, \
                         format_type(a.atttypid, a.atttypmod)::text AS col_type \
                  FROM pg_attribute a \
-                 JOIN pg_class c ON c.oid = a.attrelid \
-                 WHERE c.relname = $1 AND a.attnum > 0 AND NOT a.attisdropped",
+                 WHERE a.attrelid = to_regclass('pg_temp.' || $1) \
+                   AND a.attnum > 0 AND NOT a.attisdropped \
+                 ORDER BY a.attnum",
                 None,
                 &[unsafe {
                     DatumWithOid::new(tmp.to_string(), PgBuiltInOids::TEXTOID.oid().value())
                 }],
             )
-            .unwrap_or_report();
-        for row in rows {
-            if let (Some(col_name), Some(col_type)) = (
-                row.get_by_name::<String, _>("col_name").unwrap_or(None),
-                row.get_by_name::<String, _>("col_type").unwrap_or(None),
-            ) {
-                let pg_type = map_information_schema_type(&col_type);
-                column_types
-                    .entry(col_name)
-                    .or_insert_with(|| pg_type.to_string());
-            }
-        }
+            .unwrap_or_report()
+            .filter_map(|row| {
+                Some((
+                    row.get_by_name::<String, _>("col_name").ok()??,
+                    row.get_by_name::<String, _>("col_type").ok()??,
+                ))
+            })
+            .collect();
         let _ = client.update(&format!("DROP VIEW IF EXISTS {}", tmp), None, &[]);
-    });
+        columns
+    })
+}
+
+/// Augment the column_types map with actual types from the base_query output.
+/// This handles computed expressions (DATE_TRUNC, EXTRACT, COALESCE, etc.)
+/// whose types cannot be resolved from the source table catalog alone.
+pub(crate) fn augment_column_types_from_query(
+    base_query: &str,
+    column_types: &mut HashMap<String, String>,
+) {
+    augment_column_types(&describe_query_columns(base_query), column_types);
+}
+
+/// Adds the described columns that `column_types` does not hold yet, under the
+/// type names of [`map_information_schema_type`].
+pub(crate) fn augment_column_types(
+    described: &[(String, String)],
+    column_types: &mut HashMap<String, String>,
+) {
+    for (col_name, col_type) in described {
+        column_types
+            .entry(col_name.clone())
+            .or_insert_with(|| map_information_schema_type(col_type));
+    }
+}
+
+/// A `format_type` spelling as a column type usable in DDL and in a cast.
+/// `format_type` writes a `character` without length as `character`, which DDL
+/// reads as `character(1)`.
+pub(crate) fn ddl_type(format_type: &str) -> String {
+    match format_type {
+        "character" => "bpchar".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// The type an output column is declared with: the name
+/// [`map_information_schema_type`] writes for the types it knows exactly, and
+/// PostgreSQL's own spelling for every other type, `varchar(n)` and
+/// `numeric(p, s)` included.
+pub(crate) fn result_column_type(format_type: &str) -> String {
+    match format_type {
+        "integer"
+        | "bigint"
+        | "smallint"
+        | "numeric"
+        | "real"
+        | "double precision"
+        | "boolean"
+        | "date"
+        | "timestamp without time zone"
+        | "timestamp with time zone"
+        | "text"
+        | "uuid"
+        | "json"
+        | "jsonb" => map_information_schema_type(format_type),
+        other => ddl_type(other),
+    }
 }
 
 /// Rebuild a decomposed (CTE/set-op) IMV chain by cascading-dropping the
