@@ -384,3 +384,14 @@ fn v112_hv_count_distinct_of_another_column_in_having_is_rejected() {
     );
 }
 
+#[pg_test]
+fn v112_hv_count_distinct_beside_derived_aggregate_is_rejected() {
+    v112_hv_rejected_with_working_remedy(
+        "cd_derived",
+        "SELECT g, COUNT(DISTINCT v) AS d, SUM(v) + 1 AS s FROM {src} GROUP BY g",
+        "WITH cd AS (SELECT g, COUNT(DISTINCT v) AS d FROM {src} GROUP BY g), \
+              other AS (SELECT g, SUM(v) + 1 AS s FROM {src} GROUP BY g) \
+         SELECT cd.g, cd.d, other.s FROM cd JOIN other ON other.g = cd.g",
+    );
+}
+
