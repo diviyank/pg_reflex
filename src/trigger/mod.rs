@@ -84,8 +84,8 @@ pub(crate) fn source_reference_count(base_query: &str, source_table: &str) -> us
         .count()
 }
 
-/// `sql` upper-cased with every run of whitespace collapsed to one space, the
-/// form the join-keyword guards search.
+/// `sql` upper-cased with every run of whitespace collapsed to one space.
+#[cfg(test)]
 pub(crate) fn upper_with_single_spaces(sql: &str) -> String {
     sql.split_whitespace()
         .collect::<Vec<_>>()
@@ -96,6 +96,7 @@ pub(crate) fn upper_with_single_spaces(sql: &str) -> String {
 /// Whether `source_table` is the table named directly after a LEFT / RIGHT /
 /// FULL (OUTER) JOIN keyword of the upper-cased query. A source that only
 /// appears in an ON condition does not count.
+#[cfg(test)]
 pub(crate) fn follows_outer_join_keyword(bq_upper: &str, source_table: &str) -> bool {
     let source_upper = source_table.to_uppercase();
     let patterns = [
