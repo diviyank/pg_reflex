@@ -1255,7 +1255,24 @@ fn single_precision_sum_argument(ctx: &BuildContext) -> Option<String> {
         .map(|ic| ic.source_arg.clone())
 }
 
-/// The type PostgreSQL gives each aggregate or aggregate-derived SELECT item,
+/// Gives each key column of the intermediate table the type PostgreSQL gives it
+/// in the base query, whose columns `described` holds by name. A key is not
+/// typed by its name among the source columns: an alias can be the name of
+/// another column.
+pub(crate) fn type_intermediate_keys(
+    plan: &crate::aggregation::AggregationPlan,
+    described: &std::collections::HashMap<String, String>,
+    column_types: &mut std::collections::HashMap<String, String>,
+) {
+    for key in plan.group_by_columns.iter().chain(&plan.distinct_columns) {
+        let column = crate::query_decomposer::normalized_column_name(key);
+        if let Some(key_type) = described.get(&column) {
+            column_types.insert(column, result_column_type(key_type));
+        }
+    }
+}
+
+/// The type PostgreSQL gives each SELECT item,
 /// keyed by the name of its target column. `described` are the columns of the
 /// user's query: they pair with the SELECT items by position, and by name when
 /// a wildcard item makes the two lists differ in length.
@@ -1275,7 +1292,6 @@ fn result_types_by_output_alias(
         .select_columns
         .iter()
         .zip(described)
-        .filter(|(col, _)| !col.is_passthrough)
         .map(|(col, (_, pg_type))| (output_alias(col), pg_type.clone()))
         .collect()
 }
@@ -1312,6 +1328,16 @@ fn materialize_aggregate(client: &mut pgrx::spi::SpiClient<'_>, ctx: &mut BuildC
     let intermediate_types: std::collections::HashMap<String, String> =
         intermediate_described.into_iter().collect();
     let result_types = result_types_by_output_alias(&ctx.analysis, &result_described);
+    let mut intermediate_column_types = column_types.clone();
+    type_intermediate_keys(
+        &ctx.plan,
+        &intermediate_types,
+        &mut intermediate_column_types,
+    );
+    let mut target_column_types = column_types.clone();
+    for (output_alias, query_type) in &result_types {
+        target_column_types.insert(output_alias.clone(), result_column_type(query_type));
+    }
 
     for ic in &mut ctx.plan.intermediate_columns {
         if ic.source_aggregate == "SUM"
@@ -1382,7 +1408,7 @@ fn materialize_aggregate(client: &mut pgrx::spi::SpiClient<'_>, ctx: &mut BuildC
                 return None;
             }
             let query_type = result_column_type(result_types.get(&mapping.output_alias)?);
-            let uncast_type = uncast_mapping_type(&ctx.plan, mapping, &column_types);
+            let uncast_type = uncast_mapping_type(&ctx.plan, mapping, &target_column_types);
             (!query_type.eq_ignore_ascii_case(&uncast_type)).then_some(query_type)
         })
         .collect();
@@ -1392,20 +1418,24 @@ fn materialize_aggregate(client: &mut pgrx::spi::SpiClient<'_>, ctx: &mut BuildC
         }
     }
 
-    if let Some(ddl) =
-        build_intermediate_table_ddl(ctx.view_name, &ctx.plan, &column_types, ctx.logged)
-    {
+    if let Some(ddl) = build_intermediate_table_ddl(
+        ctx.view_name,
+        &ctx.plan,
+        &intermediate_column_types,
+        ctx.logged,
+    ) {
         let tbl = intermediate_table_name(ctx.view_name);
         client.update(&ddl, None, &[]).unwrap_or_report();
         ctx.unlogged_tables.push(tbl.clone());
         if let Some(scratch_ddl) =
-            build_delta_scratch_table_ddl(ctx.view_name, &ctx.plan, &column_types)
+            build_delta_scratch_table_ddl(ctx.view_name, &ctx.plan, &intermediate_column_types)
         {
             client.update(&scratch_ddl, None, &[]).unwrap_or_report();
         }
     }
 
-    let target_ddl = build_target_table_ddl(ctx.view_name, &ctx.plan, &column_types, ctx.logged);
+    let target_ddl =
+        build_target_table_ddl(ctx.view_name, &ctx.plan, &target_column_types, ctx.logged);
     client.update(&target_ddl, None, &[]).unwrap_or_report();
 
     if !ctx.plan.partition_columns.is_empty() {
