@@ -1103,3 +1103,62 @@ v112_ty_cells! {
     V112_TY_EQUAL_INTERVALS_FIXTURE, false;
     v112_types_key_equal_intervals => "SELECT iv, COUNT(*) AS c, SUM(v) AS s FROM {src} GROUP BY iv",
 }
+
+// ---------------------------------------------------------------------------
+// SUM / AVG over a type PostgreSQL does not sum as a number
+// ---------------------------------------------------------------------------
+
+const V112_TY_MONEY_FIXTURE: V112TyFixture = V112TyFixture {
+    columns: "g TEXT, m MONEY, iv INTERVAL, tm TIME, v INT",
+    insert_columns: "g, m, iv, tm, v",
+    seed: "('a','1.50','1 day','01:00',1),('a','2.25','2 hours','02:30',2),('b','-4.00','3 days','00:10',3),\
+           ('n',NULL,NULL,NULL,4)",
+    steps: &[
+        ("ins", "INSERT INTO {src}(g, m, iv, tm, v) VALUES ('a','10.10','5 minutes','03:00',5),('c','7.00','1 hour','04:00',6)"),
+        ("upd", "UPDATE {src} SET m = m * 2, iv = iv * 2, v = v + 1 WHERE g = 'a'"),
+        ("move", "UPDATE {src} SET g = 'b' WHERE g = 'c'"),
+        ("del", "DELETE FROM {src} WHERE v IN (2, 6)"),
+        ("empty", "DELETE FROM {src}"),
+        ("refill", "INSERT INTO {src}(g, m, iv, tm, v) VALUES ('a','3.33','4 days','05:00',7)"),
+    ],
+};
+
+macro_rules! v112_ty_unsummable_rejections {
+    ($($name:ident => ($select:expr, $type_name:expr),)+) => {
+        $(
+            #[pg_test]
+            fn $name() {
+                let tag = stringify!($name).trim_start_matches("v112_types_");
+                let outcome = v112_ty_cell_on(&V112_TY_MONEY_FIXTURE, tag, $select, false);
+                assert!(
+                    outcome.starts_with("REJECTED ") && outcome.contains($type_name) && outcome.contains("numeric"),
+                    "{}: {outcome}",
+                    $select
+                );
+                assert_eq!(v112_ty_leftovers(&format!("v112_ty_{tag}")), "none", "{}", $select);
+            }
+        )+
+    };
+}
+
+v112_ty_unsummable_rejections! {
+    v112_types_sum_money_g_rejected => ("SELECT g, SUM(m) AS r FROM {src} GROUP BY g", "money"),
+    v112_types_sum_money_u_rejected => ("SELECT SUM(m) AS r FROM {src}", "money"),
+    v112_types_sum_money_nested_rejected => ("SELECT g, COALESCE(SUM(m), '0'::money) AS r FROM {src} GROUP BY g", "money"),
+    v112_types_sum_money_having_rejected => ("SELECT g, COUNT(*) AS r FROM {src} GROUP BY g HAVING SUM(m) > '1'::money", "money"),
+    v112_types_sum_interval_g_rejected => ("SELECT g, SUM(iv) AS r FROM {src} GROUP BY g", "interval"),
+    v112_types_avg_interval_u_rejected => ("SELECT AVG(iv) AS r FROM {src}", "interval"),
+    v112_types_sum_time_g_rejected => ("SELECT g, SUM(tm) AS r FROM {src} GROUP BY g", "interval"),
+    v112_types_sum_interval_filter_rejected => ("SELECT g, SUM(iv) FILTER (WHERE v > 1) AS r FROM {src} GROUP BY g", "interval"),
+}
+
+// The remedies the rejection names, and the aggregates that stay supported
+v112_ty_cells! {
+    V112_TY_MONEY_FIXTURE, false;
+    v112_types_sum_money_as_numeric_g => "SELECT g, SUM(m::numeric) AS r FROM {src} GROUP BY g",
+    v112_types_sum_money_as_numeric_back_g => "SELECT g, SUM(m::numeric)::money AS r FROM {src} GROUP BY g",
+    v112_types_sum_money_as_numeric_back_u => "SELECT SUM(m::numeric)::money AS r FROM {src}",
+    v112_types_sum_interval_seconds_g => "SELECT g, SUM(EXTRACT(EPOCH FROM iv)) AS r FROM {src} GROUP BY g",
+    v112_types_avg_interval_seconds_u => "SELECT AVG(EXTRACT(EPOCH FROM iv)) AS r FROM {src}",
+    v112_types_min_max_money_g => "SELECT g, MIN(m) AS lo, MAX(m) AS hi, COUNT(m) AS c FROM {src} GROUP BY g",
+}

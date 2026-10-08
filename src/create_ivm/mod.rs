@@ -1236,9 +1236,11 @@ fn materialize_passthrough(client: &mut pgrx::spi::SpiClient<'_>, ctx: &mut Buil
     }
 }
 
-/// The argument of a SUM or AVG that PostgreSQL adds up in single precision,
-/// which is what it does for a REAL argument and for no other type.
-fn single_precision_sum_argument(ctx: &BuildContext) -> Option<String> {
+/// The argument and the sum type of a SUM or AVG whose sum PostgreSQL does not
+/// type bigint, numeric or double precision: the three a `__sum_*` column
+/// stores and adds deltas to. A REAL argument sums as `real`, a money one as
+/// `money`, an interval or a time one as `interval`.
+fn unsupported_sum(ctx: &BuildContext) -> Option<(String, String)> {
     let is_sum = |ic: &&crate::aggregation::IntermediateColumn| {
         ic.source_aggregate == "SUM" && ic.name.starts_with("__sum_")
     };
@@ -1251,8 +1253,11 @@ fn single_precision_sum_argument(ctx: &BuildContext) -> Option<String> {
         .intermediate_columns
         .iter()
         .filter(is_sum)
-        .find(|ic| sum_types.get(&ic.name).map(String::as_str) == Some("real"))
-        .map(|ic| ic.source_arg.clone())
+        .find_map(|ic| {
+            let sum_type = sum_types.get(&ic.name)?;
+            let is_stored = matches!(sum_type.as_str(), "bigint" | "numeric" | "double precision");
+            (!is_stored).then(|| (ic.source_arg.clone(), sum_type.clone()))
+        })
 }
 
 /// Gives each key column of the intermediate table the type PostgreSQL gives it
@@ -2473,14 +2478,26 @@ pub(crate) fn create_reflex_ivm_impl_with_materialization(
         return Box::leak(msg.into_boxed_str());
     }
 
-    if let Some(arg) = single_precision_sum_argument(&ctx) {
-        return crate::reflex_reject(&format!(
-            "SUM / AVG over the REAL (single precision) expression '{arg}' is not supported. \
-             PostgreSQL adds REAL values in single precision in row order, a result that a sum \
-             maintained by adding and subtracting deltas does not reproduce. \
-             Fix: sum the exact values, SUM(({arg})::numeric) or AVG(({arg})::numeric); \
-             cast the aggregate back, SUM(({arg})::numeric)::real, to keep a REAL result column."
-        ));
+    match unsupported_sum(&ctx) {
+        Some((arg, sum_type)) if sum_type == "real" => {
+            return crate::reflex_reject(&format!(
+                "SUM / AVG over the REAL (single precision) expression '{arg}' is not supported. \
+                 PostgreSQL adds REAL values in single precision in row order, a result that a sum \
+                 maintained by adding and subtracting deltas does not reproduce. \
+                 Fix: sum the exact values, SUM(({arg})::numeric) or AVG(({arg})::numeric); \
+                 cast the aggregate back, SUM(({arg})::numeric)::real, to keep a REAL result column."
+            ));
+        }
+        Some((arg, sum_type)) => {
+            return crate::reflex_reject(&format!(
+                "SUM / AVG over '{arg}' is not supported: PostgreSQL sums it as {sum_type}, and \
+                 pg_reflex maintains integer, numeric and double precision sums only. \
+                 Fix: sum a numeric value of it. For money, SUM(({arg})::numeric), and \
+                 SUM(({arg})::numeric)::money to keep the result type. For an interval or a time, \
+                 SUM(EXTRACT(EPOCH FROM {arg})), a numeric number of seconds."
+            ));
+        }
+        None => {}
     }
 
     Spi::connect_mut(|client| {
