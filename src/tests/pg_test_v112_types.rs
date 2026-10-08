@@ -770,3 +770,106 @@ v112_ty_bool_or_cells! {
     v112_types_bool_or_not_null_u_deferred => "SELECT BOOL_OR(b) AS r FROM {src}",
     v112_types_bool_or_is_null_u_deferred => "SELECT BOOL_OR(nb IS NULL) AS r FROM {src}",
 }
+
+// ---------------------------------------------------------------------------
+// Types outside pg_catalog are stored under their schema
+// ---------------------------------------------------------------------------
+
+/// Creates the IMV with the types' schema on the path, then writes, reconciles
+/// and compares under `writer_path`. Returns "ok" or the first failure.
+fn v112_ty_user_type_cell(tag: &str, select_template: &str, writer_path: &str) -> String {
+    let schema = format!("v112_ty_{tag}_app");
+    let other = format!("v112_ty_{tag}_other");
+    let imv = format!("public.v112_ty_{tag}");
+    let src = format!("{schema}.s");
+    for ddl in [
+        format!("CREATE SCHEMA {schema}"),
+        format!("CREATE SCHEMA {other}"),
+        format!("CREATE TYPE {schema}.mood AS ENUM ('zeta', 'mid', 'alpha', 'x10', 'x2')"),
+        format!("CREATE TYPE {schema}.\"My Mood\" AS ENUM ('low', 'High', 'higher')"),
+        format!("CREATE DOMAIN {schema}.pos_int AS INT CHECK (VALUE > 0)"),
+        format!("CREATE DOMAIN {schema}.label AS VARCHAR(8)"),
+        format!(
+            "CREATE TABLE {src}(id SERIAL PRIMARY KEY, g TEXT, e {schema}.mood, \
+             q {schema}.\"My Mood\", d {schema}.pos_int, l {schema}.label, v INT)"
+        ),
+        format!(
+            "INSERT INTO {src}(g, e, q, d, l, v) VALUES ('a','mid','low',3,'bb',1),('a','x10','High',9,'aa',2),\
+             ('b','alpha','higher',5,'zz',3),('n',NULL,NULL,NULL,NULL,4)"
+        ),
+    ] {
+        Spi::run(&ddl).expect("fixture");
+    }
+    let creator_path = v112_ty_try("SELECT current_setting('search_path')");
+    let fresh = select_template.replace("{src}", &src).replace("{schema}", &schema);
+    let set_path = |path: &str| {
+        Spi::run(&format!("SELECT set_config('search_path', '{path}', true)")).expect("path");
+    };
+    set_path(&format!("{schema}, public"));
+    let created = v112_ty_try(&format!(
+        "SELECT public.create_reflex_ivm('{imv}', $v112sel${fresh}$v112sel$)"
+    ));
+    let writer = writer_path.replace("{other}", &other).replace("{schema}", &schema);
+    set_path(&writer);
+    let outcome = (|| {
+        if created != "CREATE REFLEX INCREMENTAL VIEW" {
+            return format!("NOT-CREATED {created}");
+        }
+        let steps = [
+            ("create", String::new()),
+            ("ins", format!("INSERT INTO {src}(g, e, q, d, l, v) VALUES ('a','zeta','higher',1,'cc',5),('c','x2','low',7,'dd',6)")),
+            ("upd", format!("UPDATE {src} SET e = 'x2', q = 'low', d = 2, l = 'mm' WHERE v IN (2, 3)")),
+            ("move", format!("UPDATE {src} SET g = 'b' WHERE g = 'c'")),
+            ("del", format!("DELETE FROM {src} WHERE v IN (1, 5)")),
+            ("reconcile", format!("SELECT public.reflex_reconcile('{imv}')")),
+            ("empty", format!("DELETE FROM {src}")),
+            ("refill", format!("INSERT INTO {src}(g, e, q, d, l, v) VALUES ('a','alpha','High',4,'ee',7)")),
+        ];
+        for (label, dml) in steps {
+            if !dml.is_empty() {
+                let ran = if dml.starts_with("SELECT") { v112_ty_try(&dml) } else { v112_ty_try_dml(&dml) };
+                if ran.starts_with("RAISED") || ran.starts_with("ERROR") {
+                    return format!("{label}: {ran}");
+                }
+            }
+            let mismatches = v112_ty_oracle(&imv, &fresh);
+            if mismatches != "0" {
+                return format!("{label}: oracle {mismatches}");
+            }
+        }
+        "ok".to_string()
+    })();
+    set_path(&creator_path);
+    if outcome != "ok" {
+        return outcome;
+    }
+    match v112_ty_types_against_query(&format!("v112_ty_{tag}"), &fresh).as_str() {
+        "same" => "ok".to_string(),
+        difference => format!("WRONG-TYPE {difference}"),
+    }
+}
+
+macro_rules! v112_ty_user_type_cells {
+    ($($name:ident => ($select:expr, $path:expr),)+) => {
+        $(
+            #[pg_test]
+            fn $name() {
+                let tag = stringify!($name).trim_start_matches("v112_types_");
+                assert_eq!(v112_ty_user_type_cell(tag, $select, $path), "ok", "{} under {}", $select, $path);
+            }
+        )+
+    };
+}
+
+v112_ty_user_type_cells! {
+    v112_types_ut_enum_catalog_path => ("SELECT g, MAX(e) AS hi, MIN(e) AS lo FROM {src} GROUP BY g", "pg_catalog"),
+    v112_types_ut_enum_other_path => ("SELECT g, MAX(e) AS hi, MIN(e) AS lo FROM {src} GROUP BY g", "{other}, public"),
+    v112_types_ut_enum_creator_path => ("SELECT g, MAX(e) AS hi, MIN(e) AS lo FROM {src} GROUP BY g", "{schema}, public"),
+    v112_types_ut_enum_u_catalog_path => ("SELECT MAX(e) AS hi, MIN(e) AS lo FROM {src}", "pg_catalog"),
+    v112_types_ut_quoted_enum_catalog_path => ("SELECT g, MAX(q) AS hi, MIN(q) AS lo FROM {src} GROUP BY g", "pg_catalog"),
+    v112_types_ut_quoted_enum_other_path => ("SELECT g, MAX(q) AS hi FROM {src} GROUP BY g", "{other}"),
+    v112_types_ut_domain_int_catalog_path => ("SELECT g, MAX(d) AS hi, MIN(d) AS lo, SUM(d) AS s FROM {src} GROUP BY g", "pg_catalog"),
+    v112_types_ut_enum_having_other_path => ("SELECT g, COUNT(*) AS c FROM {src} GROUP BY g HAVING MAX(e) > 'mid'", "{other}, public"),
+    v112_types_ut_enum_nested_catalog_path => ("SELECT g, COALESCE(MAX(e), 'zeta') AS hi FROM {src} GROUP BY g", "pg_catalog"),
+    v112_types_ut_enum_cast_catalog_path => ("SELECT g, MAX(l)::{schema}.label AS hi, (MAX(v) + 1)::{schema}.pos_int AS p FROM {src} GROUP BY g", "pg_catalog"),
+}
