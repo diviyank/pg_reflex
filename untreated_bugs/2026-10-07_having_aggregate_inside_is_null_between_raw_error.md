@@ -1,4 +1,4 @@
-# A HAVING aggregate under IS [NOT] NULL / BETWEEN fails at create with `column "v" does not exist` — S3 (loud, at create)
+# A HAVING aggregate under IS [NOT] NULL / BETWEEN / IN / LIKE / ANY fails at create with `column "v" does not exist` — S3 (loud, at create)
 
 Pre-existing: same raw error on the branch before and after the 1.12.0 HAVING fold (commit
 8ef9743 and the `fix/fold-g2-having` head), pg17. Found while probing shapes next to the HAVING
@@ -13,6 +13,15 @@ SELECT create_reflex_ivm('h1', 'SELECT g, COUNT(*) AS c FROM t GROUP BY g HAVING
 SELECT create_reflex_ivm('h2', 'SELECT g, COUNT(*) AS c FROM t GROUP BY g HAVING SUM(v) BETWEEN 1 AND 6');
 -- both: ERROR:  column "v" does not exist
 ```
+
+The adversarial review of the HAVING fold (its P4, pg16, same result on 8ef9743 and on the head)
+observed the same raw error at create for an aggregate under `IN (list)`, `IS TRUE`, `LIKE`,
+`= ANY (ARRAY[...])`, `IS NOT DISTINCT FROM`, `NOTNULL`, `EXTRACT(... FROM MAX(d))`,
+`MAX(d) AT TIME ZONE ...`, a row `IN`, and `> ALL (subquery)`.
+
+Beside a `COUNT(DISTINCT ...)` these shapes are refused with the tagged "cannot be mixed" message
+(pinned by `v112_hv_count_distinct_with_other_aggregate_under_any_expression_is_rejected`): there
+the unrewritten aggregate would be legal SQL over the regrouped end query and silently wrong.
 
 ## Expected vs actual
 
