@@ -679,3 +679,36 @@ fn v112_hv_sub_joined_dimension_gets_no_bulk_insert_shortcut() {
         assert_imv_correct(&imv, &fresh);
     }
 }
+
+// CAST of a compound operand, in HAVING and in the SELECT list
+v112_hv_cells! {
+    V112_HV_NULLABLE, false, None;
+    v112_hv_cast_sum_division => "SELECT g, COUNT(*) AS c FROM {src} GROUP BY g HAVING CAST(SUM(v) / 2 AS numeric) > 2.4",
+    v112_hv_cast_count_division => "SELECT g, SUM(v) AS s FROM {src} GROUP BY g HAVING CAST(COUNT(*) / 2 AS numeric) >= 1.5",
+    v112_hv_cast_max_division => "SELECT g, COUNT(*) AS c FROM {src} GROUP BY g HAVING CAST(MAX(v) / 2 AS float8) > 3.4",
+    v112_hv_cast_group_expression_typmod => "SELECT g, COUNT(*) AS c FROM {src} GROUP BY g HAVING CAST(g || 'x' AS varchar(1)) = 'a' AND COUNT(*) > 1",
+    v112_hv_cast_group_function_division => "SELECT g, SUM(v) AS s FROM {src} GROUP BY g HAVING CAST(length(g) / 2 AS numeric) < 0.4 AND SUM(v) > 3",
+    v112_hv_cast_mixed_addition_to_text => "SELECT g, SUM(v) AS s FROM {src} GROUP BY g HAVING CASE WHEN CAST(length(g) + COUNT(*) AS text) = '5' THEN TRUE ELSE SUM(v) > 10 END",
+    v112_hv_cast_case => "SELECT g, COUNT(*) AS c FROM {src} GROUP BY g HAVING CAST(CASE WHEN SUM(v) > 5 THEN 1 ELSE 0 END AS boolean)",
+    v112_hv_cast_unary_minus => "SELECT g, COUNT(*) AS c FROM {src} GROUP BY g HAVING CAST(- SUM(v) AS numeric) / 2 < -2.4 OR CAST(- COUNT(*) AS text) = '-2'",
+    v112_hv_cast_nested_typmod => "SELECT g, COUNT(*) AS c FROM {src} GROUP BY g HAVING CAST(CAST(SUM(v) / 2 AS numeric(10, 1)) AS text) <> '2.0'",
+    v112_hv_cast_comparison => "SELECT g, COUNT(*) AS c FROM {src} GROUP BY g HAVING CAST(SUM(v) > 5 AS int) = 1",
+    v112_hv_cast_double_colon_parenthesised => "SELECT g, COUNT(*) AS c FROM {src} GROUP BY g HAVING (SUM(v) / 2)::numeric > 2.4 AND SUM(v)::numeric / 2 > 2.4",
+    v112_hv_cast_selected_sum_division => "SELECT g, CAST(SUM(v) / 2 AS numeric) AS h FROM {src} GROUP BY g",
+    v112_hv_cast_selected_sum_division_plus => "SELECT g, CAST(SUM(v) / 2 AS numeric) + 0 AS h FROM {src} GROUP BY g",
+    v112_hv_cast_selected_count_division => "SELECT g, COALESCE(CAST(COUNT(*) / 2 AS numeric), 0) AS h FROM {src} GROUP BY g",
+    v112_hv_cast_selected_and_having => "SELECT g, CAST(SUM(v) / 2 AS numeric) AS h FROM {src} GROUP BY g HAVING CAST(SUM(v) / 2 AS numeric) > 2.4",
+    v112_hv_cast_selected_ungrouped => "SELECT CAST(SUM(v) / 3 AS numeric) AS h FROM {src} HAVING CAST(COUNT(*) / 2 AS numeric) > 2.4",
+}
+
+v112_hv_cells! {
+    V112_HV_NULLABLE, true, None;
+    v112_hv_def_cast_sum_division => "SELECT g, COUNT(*) AS c FROM {src} GROUP BY g HAVING CAST(SUM(v) / 2 AS numeric) > 2.4",
+    v112_hv_def_cast_selected_sum_division => "SELECT g, CAST(SUM(v) / 2 AS numeric) AS h FROM {src} GROUP BY g",
+}
+
+v112_hv_cells! {
+    V112_HV_NOT_NULL, false, None;
+    v112_hv_nn_cast_sum_division => "SELECT g, COUNT(*) AS c FROM {src} GROUP BY g HAVING CAST(SUM(v) / 2 AS numeric) > 2.4",
+    v112_hv_nn_cast_selected_sum_division => "SELECT g, CAST(SUM(v) / 2 AS numeric) AS h FROM {src} GROUP BY g",
+}
