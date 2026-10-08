@@ -1920,17 +1920,50 @@ pub fn reflex_scheduled_reconcile(
 
 /// Refresh ALL IMVs that depend on a given source table or materialized view.
 /// Processes IMVs in graph_depth order (L1 before L2).
+/// Every spelling under which an IMV registered the relation `source` names,
+/// or `source` itself when none did. Callers pass a table the way they write
+/// it, which need not be the way the IMV's query did.
+pub(crate) fn registered_spellings_of(source: &str) -> Vec<String> {
+    let relation = crate::query_decomposer::named_relation(source);
+    let registered: Vec<String> = Spi::connect(|client| {
+        client
+            .select(
+                "SELECT DISTINCT d::text AS d \
+                 FROM public.__reflex_ivm_reference, unnest(depends_on) AS d ORDER BY 1",
+                None,
+                &[],
+            )
+            .unwrap_or_report()
+            .filter_map(|row| {
+                row.get_by_name::<&str, _>("d")
+                    .unwrap_or(None)
+                    .map(|s| s.to_string())
+            })
+            .filter(|spelling| crate::query_decomposer::named_relation(spelling) == relation)
+            .collect()
+    });
+    if registered.is_empty() {
+        vec![source.to_string()]
+    } else {
+        registered
+    }
+}
+
 pub(crate) fn refresh_imv_depending_on(source: &str) -> &'static str {
+    let spellings = registered_spellings_of(source);
     // Collect IMV names in a separate SPI connection (closed before reconcile calls)
     let names: Vec<String> = Spi::connect(|client| {
         client
             .select(
                 "SELECT name FROM public.__reflex_ivm_reference \
-                 WHERE $1 = ANY(depends_on) AND enabled = TRUE \
+                 WHERE depends_on && $1::TEXT[] AND enabled = TRUE \
                  ORDER BY graph_depth, name",
                 None,
                 &[unsafe {
-                    DatumWithOid::new(source.to_string(), PgBuiltInOids::TEXTOID.oid().value())
+                    DatumWithOid::new(
+                        crate::sql_writer::identifier::format_pg_text_array(&spellings),
+                        PgBuiltInOids::TEXTOID.oid().value(),
+                    )
                 }],
             )
             .unwrap_or_report()

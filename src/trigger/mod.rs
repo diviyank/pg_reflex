@@ -138,7 +138,10 @@ pub(crate) fn has_no_scoped_delta(base_query: &str, source_table: &str) -> bool 
 }
 
 fn outer_joins_leave_no_scoped_delta(joins: &OuterJoins) -> bool {
-    joins.source_reads > 1 || joins.holds_right_join || joins.source_inside_left_joined_subtree
+    joins.source_reads > 1
+        || joins.holds_right_join
+        || joins.source_inside_left_joined_subtree
+        || joins.source_name_stands_as_a_value
 }
 
 /// Generates the SQL statements to apply a delta to an IMV.
