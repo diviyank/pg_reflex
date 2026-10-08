@@ -683,3 +683,53 @@ fn v112_cl_window_over_projected_columns_is_maintained() {
     }
 }
 
+// ---- clock, session and moving date/time values ----
+
+#[pg_test]
+fn v112_cl_session_state_functions_are_rejected() {
+    for (position, call) in [
+        "pg_current_snapshot()",
+        "txid_current_snapshot()",
+        "pg_my_temp_schema()",
+        "pg_trigger_depth()",
+        "pg_catalog.pg_trigger_depth()",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let tag = format!("session{position}");
+        let outcome = v112_cl_gv(&tag, &format!("SELECT id, g, {call}::text AS x FROM {{src}}"), "", "IMMEDIATE");
+        v112_cl_assert_rejected(&tag, &outcome, "Non-deterministic functions");
+    }
+    Spi::run(
+        "CREATE TABLE v112_cl_session_col_src(id SERIAL PRIMARY KEY, pg_trigger_depth INT); \
+         INSERT INTO v112_cl_session_col_src(pg_trigger_depth) VALUES (1),(2)",
+    )
+    .expect("source");
+    assert_eq!(
+        v112_cl_cell(
+            "v112_cl_session_col",
+            "SELECT id, pg_trigger_depth FROM v112_cl_session_col_src",
+            "",
+            "IMMEDIATE",
+            &[],
+            &["INSERT INTO v112_cl_session_col_src(pg_trigger_depth) VALUES (3)".to_string()],
+        ),
+        "ok"
+    );
+}
+
+#[pg_test]
+fn v112_cl_date_of_a_timestamp_carries_the_time_zone_warning() {
+    let warning = |sql: &str| {
+        let statements =
+            sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::PostgreSqlDialect {}, sql)
+                .expect("parse");
+        let analysis = crate::sql_analyzer::analyze(&statements).expect("analysis");
+        crate::create_ivm::timezone_sensitivity_warning("v", &analysis)
+    };
+    assert!(warning("SELECT id, date(ts) AS d FROM t").is_some_and(|w| w.contains(" date ")));
+    assert_eq!(warning("SELECT id, d AS date FROM t"), None);
+    assert_eq!(warning("SELECT id, make_date(y, m, d) AS d FROM t"), None);
+}
+

@@ -842,7 +842,11 @@ fn is_clock_or_session_function(call: &CalledFunction) -> bool {
             | "txid_current"
             | "txid_current_if_assigned"
             | "pg_current_xact_id"
-            | "pg_current_xact_id_if_assigned" => true,
+            | "pg_current_xact_id_if_assigned"
+            | "pg_current_snapshot"
+            | "txid_current_snapshot"
+            | "pg_my_temp_schema"
+            | "pg_trigger_depth" => true,
             "age" => call.arg_count == 1,
             _ => false,
         }
@@ -852,6 +856,7 @@ fn is_timezone_sensitive_function(call: &CalledFunction) -> bool {
     match call.name.as_str() {
         "date_trunc" | "to_timestamp" => call.arg_count == 2,
         "date_part" | "to_char" | "to_date" => true,
+        "date" => call.arg_count == 1,
         _ => false,
     }
 }
