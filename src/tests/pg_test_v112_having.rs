@@ -251,3 +251,26 @@ v112_hv_cells! {
     v112_hv_def_max => "SELECT g, COUNT(*) AS c FROM {src} GROUP BY g HAVING MAX(v) < 7",
 }
 
+// An aggregate with no GROUP BY: one row when HAVING holds, none otherwise
+v112_hv_cells! {
+    V112_HV_NULLABLE, false, None;
+    v112_hv_ungrouped_sum => "SELECT SUM(v) AS s FROM {src} HAVING SUM(v) > 20",
+    v112_hv_ungrouped_sum_all_null => "SELECT COUNT(*) AS c FROM {src} HAVING SUM(v) >= 0",
+    v112_hv_ungrouped_count_star => "SELECT COUNT(*) AS c FROM {src} HAVING COUNT(*) >= 0",
+    v112_hv_ungrouped_count_star_positive => "SELECT COUNT(*) AS c, SUM(v) AS s FROM {src} HAVING COUNT(*) > 4",
+    v112_hv_ungrouped_avg => "SELECT AVG(v) AS a FROM {src} HAVING ROUND(AVG(v), 2) > 3",
+    v112_hv_ungrouped_min => "SELECT MIN(v) AS lo FROM {src} HAVING MIN(v) < 0",
+    v112_hv_ungrouped_filter => "SELECT COUNT(*) AS c FROM {src} HAVING COUNT(*) FILTER (WHERE v > 5) > 2",
+    v112_hv_ungrouped_no_aggregate_in_having => "SELECT SUM(v) AS s FROM {src} HAVING 1 = 1",
+}
+
+v112_hv_cells! {
+    V112_HV_NOT_NULL, false, None;
+    v112_hv_nn_ungrouped_sum => "SELECT SUM(v) AS s FROM {src} HAVING SUM(v) > 20",
+}
+
+v112_hv_cells! {
+    V112_HV_NULLABLE, true, None;
+    v112_hv_def_ungrouped_sum => "SELECT SUM(v) AS s FROM {src} HAVING SUM(v) > 20",
+}
+
