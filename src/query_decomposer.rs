@@ -459,7 +459,7 @@ pub fn generate_end_query(view_name: &str, plan: &AggregationPlan) -> String {
     }
 
     if let Some(ref having) = plan.having_clause {
-        let keyword = if plan.needs_ivm_count { "AND" } else { "WHERE" };
+        let keyword = if filters_live_groups { "AND" } else { "WHERE" };
         query.push_str(&format!(" {} ({})", keyword, having));
     }
 
