@@ -122,8 +122,9 @@ pub(crate) fn follows_outer_join_keyword(bq_upper: &str, source_table: &str) -> 
 /// Whether a write to `source_table` has no per-source delta, so the IMV is
 /// recomputed from `base_query`: the source is read more than once, the query
 /// holds a RIGHT JOIN, the source is read inside a derived table or a
-/// parenthesised join that a LEFT JOIN null-extends, or the transition-table
-/// rewrite would break a quoted identifier of another relation.
+/// parenthesised join that a LEFT JOIN null-extends, the source is read by a
+/// subquery used as an expression, or the transition-table rewrite would break
+/// a quoted identifier of another relation.
 ///
 /// A RIGHT JOIN is never scoped. The table before the keyword is the
 /// null-extended one, which `follows_outer_join_keyword` never inspects, and the
@@ -136,6 +137,11 @@ pub(crate) fn has_no_scoped_delta(base_query: &str, source_table: &str) -> bool 
         || bq_upper.contains("RIGHT JOIN")
         || bq_upper.contains("RIGHT OUTER")
         || outer_join::source_inside_left_joined_subtree(&bq_upper, base_query, source_table)
+        || expression_subquery::source_read_by_expression_subquery(
+            &bq_upper,
+            base_query,
+            source_table,
+        )
         || source_rewrite_breaks_quoted_identifier(base_query, source_table)
 }
 
@@ -649,6 +655,7 @@ pub fn reflex_execute_separated(sql: &str) {
 
 pub(crate) mod deferred;
 mod dispatch;
+mod expression_subquery;
 mod merge;
 mod ops;
 mod outer_join;

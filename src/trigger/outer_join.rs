@@ -9,7 +9,7 @@ use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 use std::ops::ControlFlow;
 
-fn single_query(base_query: &str) -> Option<Box<Query>> {
+pub(super) fn single_query(base_query: &str) -> Option<Box<Query>> {
     let mut statements = Parser::parse_sql(&PostgreSqlDialect {}, base_query).ok()?;
     if statements.len() != 1 {
         return None;
