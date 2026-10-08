@@ -758,3 +758,44 @@ fn v112_hv_count_distinct_with_other_aggregate_under_any_expression_is_rejected(
         v112_hv_assert_nothing_created(&imv);
     }
 }
+
+/// HAVING holds no aggregate but a COUNT(DISTINCT) the SELECT list does not
+/// hold in that spelling: the rejection names it instead of blaming another
+/// aggregate.
+#[pg_test]
+fn v112_hv_count_distinct_rejection_names_the_unselected_count() {
+    let src = v112_hv_source("cd_named");
+    let unselected = [
+        (
+            "COUNT(DISTINCT v) AS d",
+            "COUNT(DISTINCT v) FILTER (WHERE v > 2) > 1",
+            "COUNT(DISTINCT v) FILTER (WHERE v > 2)",
+        ),
+        (
+            "COUNT(DISTINCT v) FILTER (WHERE v > 2) AS d",
+            "COUNT(DISTINCT v) > 1",
+            "COUNT(DISTINCT v)",
+        ),
+        (
+            "COUNT(DISTINCT v) AS d",
+            "COUNT(DISTINCT n) IN (1, 2)",
+            "COUNT(DISTINCT n)",
+        ),
+        ("SUM(v) AS s", "COUNT(DISTINCT v) > 1", "COUNT(DISTINCT v)"),
+    ];
+    for (position, (selected, having, named)) in unselected.iter().enumerate() {
+        let imv = format!("v112_hv_cd_named_{position}");
+        let outcome = v112_hv_create(
+            &imv,
+            &format!("SELECT g, {selected} FROM {src} GROUP BY g HAVING {having}"),
+        );
+        assert!(
+            outcome.starts_with("ERROR: [reflex-unsupported] ")
+                && outcome.contains(&format!("HAVING holds {named}, which the SELECT list does not"))
+                && outcome.contains("CTE")
+                && !outcome.contains("cannot be mixed with other aggregates"),
+            "{having}: {outcome}"
+        );
+        v112_hv_assert_nothing_created(&imv);
+    }
+}

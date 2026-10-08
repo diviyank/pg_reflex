@@ -673,9 +673,9 @@ pub(crate) enum CountDistinctHavingConflict {
     /// HAVING holds another aggregate, or does not parse, beside a
     /// `COUNT(DISTINCT ...)` of the SELECT list.
     OtherAggregate,
-    /// HAVING holds a `COUNT(DISTINCT ...)` which the SELECT list does not hold
-    /// with the same argument and FILTER.
-    UnselectedCountDistinct,
+    /// HAVING holds this `COUNT(DISTINCT ...)`, which the SELECT list does not
+    /// hold with the same argument and FILTER.
+    UnselectedCountDistinct(String),
 }
 
 pub(crate) fn count_distinct_having_conflict(
@@ -694,7 +694,7 @@ pub(crate) fn count_distinct_having_conflict(
     };
 
     let mut holds_other_aggregate = false;
-    let mut holds_unselected_distinct = false;
+    let mut unselected_distinct = None;
     for function in &aggregate_spelled_calls(&having) {
         match resolve_aggregate_call(function) {
             Some(call) if matches!(call.kind, AggregateKind::CountDistinct) => {
@@ -702,7 +702,9 @@ pub(crate) fn count_distinct_having_conflict(
                     .arg
                     .as_deref()
                     .is_some_and(|arg| selected_distinct_args.contains(&arg));
-                holds_unselected_distinct |= !selected;
+                if !selected {
+                    unselected_distinct.get_or_insert_with(|| function.to_string());
+                }
             }
             _ => holds_other_aggregate = true,
         }
@@ -710,7 +712,7 @@ pub(crate) fn count_distinct_having_conflict(
     if holds_other_aggregate && selects_count_distinct {
         return Some(CountDistinctHavingConflict::OtherAggregate);
     }
-    holds_unselected_distinct.then_some(CountDistinctHavingConflict::UnselectedCountDistinct)
+    unselected_distinct.map(CountDistinctHavingConflict::UnselectedCountDistinct)
 }
 
 const DECOMPOSED_AGGREGATE_NAMES: [&str; 6] = ["sum", "count", "avg", "min", "max", "bool_or"];
