@@ -15,6 +15,7 @@ use crate::query_decomposer::{
 use crate::sql_writer::identifier::{
     replace_source_with_transition, source_rewrite_breaks_quoted_identifier, token_names_source,
 };
+use outer_join::{outer_joins, OuterJoins};
 
 /// Per-backend cache of built delta SQL keyed by a hash of all inputs.
 /// Entries are content-addressable: identical inputs always produce identical
@@ -126,17 +127,18 @@ pub(crate) fn follows_outer_join_keyword(bq_upper: &str, source_table: &str) -> 
 /// rewrite would break a quoted identifier of another relation.
 ///
 /// A RIGHT JOIN is never scoped. The table before the keyword is the
-/// null-extended one, which `follows_outer_join_keyword` never inspects, and the
-/// per-source key mappings of the plan assume the null-extended table is the
-/// joined one: a group or passthrough key read from the table before the
-/// keyword is NULL on the unmatched rows of the table after it.
+/// null-extended one, and the per-source key mappings of the plan assume the
+/// null-extended table is the joined one: a group or passthrough key read from
+/// the table before the keyword is NULL on the unmatched rows of the table
+/// after it.
 pub(crate) fn has_no_scoped_delta(base_query: &str, source_table: &str) -> bool {
-    let bq_upper = upper_with_single_spaces(base_query);
-    source_reference_count(base_query, source_table) > 1
-        || bq_upper.contains("RIGHT JOIN")
-        || bq_upper.contains("RIGHT OUTER")
-        || outer_join::source_inside_left_joined_subtree(&bq_upper, base_query, source_table)
+    outer_joins_leave_no_scoped_delta(&outer_joins(base_query, source_table))
+        || source_reference_count(base_query, source_table) > 1
         || source_rewrite_breaks_quoted_identifier(base_query, source_table)
+}
+
+fn outer_joins_leave_no_scoped_delta(joins: &OuterJoins) -> bool {
+    joins.source_reads > 1 || joins.holds_right_join || joins.source_inside_left_joined_subtree
 }
 
 /// Generates the SQL statements to apply a delta to an IMV.
@@ -204,31 +206,23 @@ pub fn reflex_build_delta_sql(
     // 1. Self-join: source_table appears multiple times in base_query
     // 2. LEFT/RIGHT JOIN secondary table DELETE/UPDATE: NULL semantics can't be captured by MERGE subtract
     // Detect self-join and outer-join-secondary for BOTH aggregate and passthrough queries.
-    let is_self_join = source_reference_count(base_query, source_table) > 1;
-    let recompute_in_full = has_no_scoped_delta(base_query, source_table);
-
-    let bq_upper = upper_with_single_spaces(base_query);
-    let is_full_outer = bq_upper.contains("FULL JOIN") || bq_upper.contains("FULL OUTER");
-    // Check if source_table is the secondary table in a LEFT/FULL JOIN.
-    // The source is secondary if it appears as the table being outer-joined,
-    // i.e. directly after "LEFT JOIN" or "FULL JOIN".
-    // Do NOT match if source_table only appears in ON conditions (that's the primary table).
-    let is_outer_join_secondary_table = !is_self_join
-        && (bq_upper.contains("LEFT JOIN") || bq_upper.contains("LEFT OUTER") || is_full_outer)
-        && follows_outer_join_keyword(&bq_upper, source_table);
-    // For LEFT/RIGHT JOIN: EVERY operation on the secondary table needs special
+    let joins = outer_joins(base_query, source_table);
+    let recompute_in_full = outer_joins_leave_no_scoped_delta(&joins)
+        || source_reference_count(base_query, source_table) > 1
+        || source_rewrite_breaks_quoted_identifier(base_query, source_table);
+    // For LEFT JOIN: EVERY operation on the secondary table needs special
     // handling. The plain `L LEFT JOIN Δsecondary` delta re-emits all left rows
     // NULL-extended, which double-counts non-matching left rows on INSERT (breaks
     // COUNT(*) and any secondary-derived group key) and can't represent NULL
     // semantics on DELETE/UPDATE. For FULL OUTER JOIN: ALL operations on BOTH
     // tables need targeted reconcile, because the FULL JOIN delta always includes
     // unmatched rows from the other side.
-    let is_outer_join_secondary = (is_outer_join_secondary_table
-        && matches!(
-            operation,
-            "DELETE" | "DELETE_PROMOTED" | "UPDATE" | "INSERT" | "INSERT_PROMOTED"
-        ))
-        || (is_full_outer && !is_self_join);
+    let is_outer_join_secondary = joins.holds_full_join
+        || (joins.source_is_null_extended_table
+            && matches!(
+                operation,
+                "DELETE" | "DELETE_PROMOTED" | "UPDATE" | "INSERT" | "INSERT_PROMOTED"
+            ));
 
     if recompute_in_full {
         full_refresh_stmts(
