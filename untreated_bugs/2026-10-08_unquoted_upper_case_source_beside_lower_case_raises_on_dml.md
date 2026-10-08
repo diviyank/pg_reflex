@@ -31,10 +31,13 @@ write to the table succeeds until one IMV is dropped.
 
 ## What is known about the mechanism
 
-- A source is registered under the caller's spelling when it lives in `public`
-  (`canonicalize_analysis_sources`, `src/create_ivm/soundness.rs`). Quotes that change nothing are
-  dropped there since 1.12.0, so `"t"` and `t` are one source; case is not folded, because the
-  transition-table rewrite is case-sensitive and must find the spelling the stored query holds.
+- A source is registered under the spelling of the caller's query when it lives in `public`
+  (`canonicalize_analysis_sources`, `src/create_ivm/soundness.rs`). Since 1.12.0 the caller's
+  query first loses the double quotes PostgreSQL itself would not write
+  (`src/create_ivm/identifier_quotes.rs`, applied in the `create_reflex_ivm*` entry points), so
+  `"t"` and `t` are one source. Case is not folded: an unquoted `T` is kept as written, because
+  the transition-table rewrite is case-sensitive and must find the spelling the stored query
+  holds.
 - The error names a transition table built from one spelling (`__reflex_new_T`, or
   `__reflex_new_t` in the single-query form), which the firing trigger does not declare. Which
   trigger fires for which registered spelling was not traced.
