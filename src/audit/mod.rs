@@ -94,7 +94,24 @@ impl ImvRow {
         crate::sql_writer::registry::owns_intermediate(&self.end_query)
     }
 
-    /// A row written by `RegistryRow::decomposed` (`src/sql_writer/registry.rs`):
+    /// The group-capture tables this IMV's plan owns, as create and reconcile's
+    /// heal define them: none for an ungrouped aggregate, whose single row has
+    /// no group key to capture. A plan that cannot be read is taken to group.
+    pub fn group_capture_tables(&self) -> Vec<String> {
+        let plan = self.aggregations_json.as_deref().and_then(|json| {
+            serde_json::from_str::<crate::aggregation::AggregationPlan>(json).ok()
+        });
+        match plan {
+            Some(plan) => crate::schema_builder::build_group_capture_ddl(&self.name, &plan)
+                .into_iter()
+                .map(|(table, _)| table)
+                .collect(),
+            None => vec![crate::query_decomposer::affected_groups_table_name(
+                &self.name,
+            )],
+        }
+    }
+
     /// the *wrapper* node of a set-op / DISTINCT ON / window decomposition. It
     /// hardcodes `end_query: ""` AND `aggregations_json: "{}"` — an empty
     /// `end_query` on a row that carries no plan at all, which no row

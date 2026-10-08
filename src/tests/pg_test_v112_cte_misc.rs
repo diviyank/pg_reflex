@@ -338,3 +338,128 @@ fn v112_cm_leaf_diff_of_bound_spelling_the_partition_column_repairs_the_leaf() {
 fn v112_cm_leaf_diff_of_multibyte_bound_holding_the_partition_column_repairs_the_leaf() {
     v112_cm_assert_leaf_diff_repairs("v112_cm_dm", "t", &["Été", "Hiver"]);
 }
+
+fn v112_cm_audit(imv: &str) -> String {
+    Spi::get_one::<String>(&format!("SELECT reflex_audit('{imv}')"))
+        .expect("audit")
+        .expect("report")
+}
+
+fn v112_cm_ungrouped_aggregate(prefix: &str, mode: &str, aggregates: &str) -> (String, String) {
+    let src = format!("{prefix}_t");
+    let imv = format!("{prefix}_v");
+    Spi::run(&format!(
+        "CREATE TABLE {src}(id SERIAL PRIMARY KEY, g TEXT, v INT)"
+    ))
+    .expect("source");
+    Spi::run(&format!(
+        "INSERT INTO {src}(g, v) VALUES ('a',1),('b',2),('a',3)"
+    ))
+    .expect("seed");
+    let query = format!("SELECT {aggregates} FROM {src}");
+    assert_eq!(
+        crate::create_reflex_ivm(&imv, &query, None, None, Some(mode), None),
+        V112_CM_CREATED
+    );
+    (imv, query)
+}
+
+fn v112_cm_assert_fresh_ungrouped_aggregate_audits_clean(
+    prefix: &str,
+    mode: &str,
+    aggregates: &str,
+) {
+    let (imv, query) = v112_cm_ungrouped_aggregate(prefix, mode, aggregates);
+    let report = v112_cm_audit(&imv);
+    assert!(
+        !report.contains("internal-tables-exist"),
+        "fresh ungrouped aggregate must audit clean:\n{report}"
+    );
+    Spi::run(&format!("INSERT INTO {prefix}_t(g, v) VALUES ('c', 9)")).expect("insert");
+    Spi::run(&format!("DELETE FROM {prefix}_t WHERE id = 1")).expect("delete");
+    v112_cm_flush(&format!("{prefix}_t"), mode);
+    assert_imv_correct(&imv, &query);
+    let report = v112_cm_audit(&imv);
+    assert!(
+        !report.contains("internal-tables-exist"),
+        "ungrouped aggregate must audit clean after writes:\n{report}"
+    );
+}
+
+#[pg_test]
+fn v112_cm_fresh_ungrouped_sum_count_audits_clean_immediate() {
+    v112_cm_assert_fresh_ungrouped_aggregate_audits_clean(
+        "v112_cm_au",
+        "IMMEDIATE",
+        "SUM(v) AS s, COUNT(*) AS c",
+    );
+}
+
+#[pg_test]
+fn v112_cm_fresh_ungrouped_sum_count_audits_clean_deferred() {
+    v112_cm_assert_fresh_ungrouped_aggregate_audits_clean(
+        "v112_cm_aud",
+        "DEFERRED",
+        "SUM(v) AS s, COUNT(*) AS c",
+    );
+}
+
+#[pg_test]
+fn v112_cm_fresh_ungrouped_min_max_audits_clean() {
+    v112_cm_assert_fresh_ungrouped_aggregate_audits_clean(
+        "v112_cm_am",
+        "IMMEDIATE",
+        "MIN(v) AS lo, MAX(v) AS hi",
+    );
+}
+
+/// The intermediate of an ungrouped aggregate is still required, and the
+/// printed remedy clears the finding.
+#[pg_test]
+fn v112_cm_ungrouped_aggregate_missing_intermediate_is_reported_and_remedied() {
+    let (imv, query) =
+        v112_cm_ungrouped_aggregate("v112_cm_ai", "IMMEDIATE", "SUM(v) AS s, COUNT(*) AS c");
+    Spi::run(&format!("DROP TABLE __reflex_intermediate_{imv}")).expect("drop intermediate");
+    let report = v112_cm_audit(&imv);
+    assert!(
+        report.contains("internal-tables-exist")
+            && report.contains(&format!("__reflex_intermediate_{imv}"))
+            && !report.contains(&format!("__reflex_affected_{imv}")),
+        "only the intermediate is missing:\n{report}"
+    );
+    assert!(
+        report.contains(&format!("SELECT reflex_rebuild_imv('{imv}');")),
+        "{report}"
+    );
+    Spi::run(&format!("SELECT reflex_rebuild_imv('{imv}')")).expect("remedy");
+    let report = v112_cm_audit(&imv);
+    assert!(
+        !report.contains("internal-tables-exist"),
+        "the printed remedy must clear the finding:\n{report}"
+    );
+    assert_imv_correct(&imv, &query);
+}
+
+/// A grouped aggregate owns an affected-groups table: its absence is still a
+/// finding, and the printed remedy clears it.
+#[pg_test]
+fn v112_cm_grouped_aggregate_missing_affected_table_is_reported_and_remedied() {
+    Spi::run("CREATE TABLE v112_cm_ag_t(id SERIAL PRIMARY KEY, g TEXT, v INT)").expect("source");
+    Spi::run("INSERT INTO v112_cm_ag_t(g, v) VALUES ('a',1),('b',2),('a',3)").expect("seed");
+    let query = "SELECT g, SUM(v) AS s FROM v112_cm_ag_t GROUP BY g";
+    assert_eq!(
+        crate::create_reflex_ivm("v112_cm_ag_v", query, None, None, None, None),
+        V112_CM_CREATED
+    );
+    assert!(!v112_cm_audit("v112_cm_ag_v").contains("internal-tables-exist"));
+    Spi::run("DROP TABLE __reflex_affected_v112_cm_ag_v").expect("drop affected");
+    let report = v112_cm_audit("v112_cm_ag_v");
+    assert!(
+        report.contains("internal-tables-exist")
+            && report.contains("__reflex_affected_v112_cm_ag_v"),
+        "{report}"
+    );
+    Spi::run("SELECT reflex_rebuild_imv('v112_cm_ag_v')").expect("remedy");
+    assert!(!v112_cm_audit("v112_cm_ag_v").contains("internal-tables-exist"));
+    assert_imv_correct("v112_cm_ag_v", query);
+}
