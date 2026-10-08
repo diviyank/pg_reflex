@@ -197,6 +197,27 @@ fn keyword_pseudo_function(ident: &Ident) -> Option<CalledFunction> {
         .then_some(CalledFunction { name, arg_count: 0 })
 }
 
+/// A select item PostgreSQL refuses as a grouping key, or reads as a position: a bare
+/// string, NULL, boolean or non-integer literal, or a signed number. An unsigned integer
+/// literal is left alone.
+fn is_constant_refused_as_group_key(expr: &Expr) -> bool {
+    let is_unsigned_integer =
+        |text: &str| !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit());
+    match expr {
+        Expr::Nested(inner) => is_constant_refused_as_group_key(inner),
+        Expr::Value(value) => match &value.value {
+            sqlparser::ast::Value::Number(number, _) => !is_unsigned_integer(&number.to_string()),
+            sqlparser::ast::Value::Placeholder(_) => false,
+            _ => true,
+        },
+        Expr::UnaryOp { expr: operand, .. } => matches!(
+            operand.as_ref(),
+            Expr::Value(value) if matches!(value.value, sqlparser::ast::Value::Number(..))
+        ),
+        _ => false,
+    }
+}
+
 const DISTINCT_AGGREGATE_REJECTION: &str = "DISTINCT modifier on SUM/AVG/MIN/MAX/BOOL_OR is not supported. \
      Only COUNT(DISTINCT col) is supported. Use a CTE with SELECT DISTINCT \
      to pre-deduplicate: WITH d AS (SELECT DISTINCT grp, val FROM t) SELECT grp, SUM(val) FROM d GROUP BY grp";
@@ -245,6 +266,9 @@ pub struct SqlAnalysis {
     pub has_extract: bool,
     /// Calls spelled so that they cannot be taken for a `pg_catalog` function.
     pub non_builtin_calls: Vec<NonBuiltinCall>,
+    /// SELECT items PostgreSQL refuses as grouping keys (see
+    /// `is_constant_refused_as_group_key`).
+    pub constants_refused_as_group_key: Vec<String>,
     /// Set when a clock or session-identity function is called anywhere in the
     /// query, not only in the SELECT list.
     pub has_nondeterministic_select: bool,
@@ -360,6 +384,14 @@ impl SqlAnalysis {
                  apply the expression in the outer SELECT: WITH a AS (SELECT grp, SUM(val) AS s \
                  FROM t GROUP BY grp) SELECT grp, s IS NULL AS c FROM a",
                 column.alias.as_deref().unwrap_or(&column.expr_sql)
+            ));
+        }
+        if groups_rows && !self.constants_refused_as_group_key.is_empty() {
+            return Some(format!(
+                "The constant {} in the SELECT list beside GROUP BY or DISTINCT is not \
+                 supported: PostgreSQL refuses a bare constant as a grouping key. Fix: cast it \
+                 to its type, e.g. 'plain'::text, NULL::text, TRUE::boolean, 3.5::numeric",
+                self.constants_refused_as_group_key.join(", ")
             ));
         }
         None
@@ -783,6 +815,11 @@ fn first_arg_sql(args: &FunctionArguments) -> Option<String> {
 }
 
 fn push_select_column(analysis: &mut SqlAnalysis, expr: &Expr, alias: Option<String>) {
+    if is_constant_refused_as_group_key(expr) {
+        analysis
+            .constants_refused_as_group_key
+            .push(expr.to_string());
+    }
     let column = extract_select_column(expr, alias);
     if column.is_aggregate_derived && expr_contains_call(expr, &is_count_distinct_call) {
         analysis.nested_count_distinct = true;
