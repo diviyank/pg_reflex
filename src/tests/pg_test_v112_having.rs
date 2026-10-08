@@ -326,6 +326,8 @@ fn v112_hv_create(imv: &str, select: &str) -> String {
     ))
 }
 
+/// Called before the test creates any IMV: no relation or registry row named
+/// after `imv`, and no trigger on any table of the test.
 fn v112_hv_assert_nothing_created(imv: &str) {
     let relations = Spi::get_one::<i64>(&format!(
         "SELECT COUNT(*) FROM pg_class WHERE relname LIKE '%{imv}%' AND relname NOT LIKE '%{imv}_src%'"
@@ -337,7 +339,17 @@ fn v112_hv_assert_nothing_created(imv: &str) {
     ))
     .expect("registry")
     .unwrap_or(-1);
-    assert_eq!((relations, registered), (0, 0), "{imv} left objects behind");
+    let triggers = Spi::get_one::<i64>(
+        "SELECT COUNT(*) FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid \
+         WHERE NOT t.tgisinternal AND c.relname LIKE 'v112\\_hv\\_%'",
+    )
+    .expect("triggers")
+    .unwrap_or(-1);
+    assert_eq!(
+        (relations, registered, triggers),
+        (0, 0, 0),
+        "{imv} left objects behind"
+    );
 }
 
 /// The shape is refused with the tagged error before any DDL, and `remedy`,
