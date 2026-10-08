@@ -129,6 +129,43 @@ fn v112_cl_assert_rejected(tag: &str, outcome: &str, fragment: &str) {
     assert_eq!(left_behind, "false", "{tag}: the rejected create left objects");
 }
 
+// ---- passthrough key detection ----
+
+#[pg_test]
+fn v112_cl_alias_named_like_the_pk_is_not_the_key() {
+    for (position, (select, mode)) in [
+        ("SELECT v AS id, g FROM {src} WHERE v IS NOT NULL", "IMMEDIATE"),
+        ("SELECT v AS id, g FROM {src} WHERE v IS NOT NULL", "DEFERRED"),
+        ("SELECT v + 1 AS id FROM {src}", "IMMEDIATE"),
+        ("SELECT g AS id, id AS v FROM {src}", "IMMEDIATE"),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let tag = format!("alias_key{position}");
+        assert_eq!(v112_cl_gv(&tag, select, "", mode), "ok", "{select}");
+        assert_eq!(v112_cl_unique_key(&tag), "", "{select}");
+    }
+}
+
+#[pg_test]
+fn v112_cl_bare_pk_reference_is_still_the_key() {
+    for (position, select) in [
+        "SELECT id, g, v FROM {src}",
+        "SELECT {src}.id, g FROM {src}",
+        "SELECT id AS id, v FROM {src}",
+        "SELECT t.id, t.v FROM {src} t",
+        "SELECT g, ID FROM {src}",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let tag = format!("bare_key{position}");
+        assert_eq!(v112_cl_gv(&tag, select, "", "IMMEDIATE"), "ok", "{select}");
+        assert_eq!(v112_cl_unique_key(&tag), "id", "{select}");
+    }
+}
+
 // ---- an aggregate is never a keyed row-level passthrough ----
 
 #[pg_test]
