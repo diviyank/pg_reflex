@@ -305,6 +305,9 @@ pub struct SqlAnalysis {
     pub has_extract: bool,
     /// Calls spelled so that they cannot be taken for a `pg_catalog` function.
     pub non_builtin_calls: Vec<NonBuiltinCall>,
+    /// Bare lower-case names of the functions called in the top-level SELECT list,
+    /// outside subqueries and window functions.
+    pub select_list_functions: Vec<String>,
     /// SELECT items PostgreSQL refuses as grouping keys (see
     /// `is_constant_refused_as_group_key`).
     pub constants_refused_as_group_key: Vec<String>,
@@ -753,6 +756,16 @@ fn every_aggregate_is_decomposable(expr: &Expr) -> bool {
     count_decomposable_aggregates(expr) == aggregates.get()
 }
 
+/// Bare lower-case names of the calls of `expr` at its own query level.
+fn called_function_names(expr: &Expr) -> Vec<String> {
+    let names = std::cell::RefCell::new(Vec::new());
+    expr_contains_call(expr, &|f| {
+        names.borrow_mut().push(bare_function_name(&f.name));
+        false
+    });
+    names.into_inner()
+}
+
 pub fn detect_aggregate(func_name: &str) -> Option<AggregateKind> {
     match func_name.to_uppercase().as_str() {
         "SUM" => Some(AggregateKind::Sum),
@@ -870,6 +883,11 @@ fn first_arg_sql(args: &FunctionArguments) -> Option<String> {
 }
 
 fn push_select_column(analysis: &mut SqlAnalysis, expr: &Expr, alias: Option<String>) {
+    for name in called_function_names(expr) {
+        if !analysis.select_list_functions.contains(&name) {
+            analysis.select_list_functions.push(name);
+        }
+    }
     if is_constant_refused_as_group_key(expr) {
         analysis
             .constants_refused_as_group_key

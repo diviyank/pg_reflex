@@ -587,3 +587,46 @@ fn v112_cl_function_below_the_top_level_from_is_still_accepted() {
     }
 }
 
+#[pg_test]
+fn v112_cl_set_returning_select_item_is_maintained_without_a_key() {
+    for (tag, select, mode) in [
+        ("srf_sel0", "SELECT id, unnest(arr) FROM {src}", "IMMEDIATE"),
+        ("srf_sel1", "SELECT id, unnest(arr) AS e FROM {src}", "DEFERRED"),
+        ("srf_sel2", "SELECT id, generate_series(1, 2) AS i FROM {src}", "IMMEDIATE"),
+        ("srf_sel3", "SELECT id, g, pg_catalog.unnest(arr) + 1 AS e FROM {src}", "IMMEDIATE"),
+    ] {
+        assert_eq!(v112_cl_arr(tag, select, "", mode), "ok", "{select}");
+        assert_eq!(v112_cl_unique_key(tag), "", "{select}");
+    }
+}
+
+#[pg_test]
+fn v112_cl_set_returning_select_item_is_refused_a_key() {
+    let outcome = v112_cl_arr("srf_keyed", "SELECT id, unnest(arr) AS e FROM {src}", "id,e", "IMMEDIATE");
+    v112_cl_assert_rejected("srf_keyed", &outcome, "set-returning function");
+}
+
+#[pg_test]
+fn v112_cl_set_returning_function_elsewhere_keeps_the_key() {
+    for (tag, select) in [
+        (
+            "srf_scalar",
+            "SELECT id, g, (SELECT max(e) FROM unnest(ARRAY[1, 2, 3]) AS e) AS m FROM {src}",
+        ),
+        ("srf_in_subquery", "SELECT id, g FROM {src} WHERE id IN (SELECT unnest(ARRAY[1, 3, 4]))"),
+        ("srf_none", "SELECT id, g, array_length(arr, 1) AS n FROM {src}"),
+    ] {
+        assert_eq!(v112_cl_arr(tag, select, "", "IMMEDIATE"), "ok", "{select}");
+        assert_eq!(v112_cl_unique_key(tag), "id", "{select}");
+    }
+    assert_eq!(
+        v112_cl_arr(
+            "srf_grouped",
+            "SELECT unnest(arr) AS e, COUNT(*) AS c FROM {src} GROUP BY unnest(arr)",
+            "",
+            "IMMEDIATE"
+        ),
+        "ok"
+    );
+}
+
