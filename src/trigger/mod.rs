@@ -48,6 +48,24 @@ fn delta_sql_cache_key(
     h.finish()
 }
 
+fn cached_delta_sql(cache_key: u64) -> Option<String> {
+    delta_sql_cache().lock().ok()?.get(&cache_key).cloned()
+}
+
+fn remember_delta_sql(cache_key: u64, sql: &str) {
+    if let Ok(mut guard) = delta_sql_cache().lock() {
+        if guard.len() >= DELTA_SQL_CACHE_MAX {
+            guard.clear();
+        }
+        guard.insert(cache_key, sql.to_string());
+    }
+}
+
+#[cfg(any(test, feature = "pg_test"))]
+pub fn delta_sql_cache_len() -> usize {
+    delta_sql_cache().lock().map_or(0, |guard| guard.len())
+}
+
 #[cfg(any(test, feature = "pg_test"))]
 pub fn reset_delta_sql_cache() {
     if let Ok(mut guard) = delta_sql_cache().lock() {
@@ -445,15 +463,36 @@ pub fn reflex_build_path_c_explain_sql(view_name: &str, source_table: &str) -> S
         Some(t) => t,
         None => return String::new(),
     };
-    match serde_json::from_str::<AggregationPlan>(&agg_json) {
+    let cache_key = delta_sql_cache_key(
+        view_name,
+        source_table,
+        PATH_C_EXPLAIN_OP,
+        &base_query,
+        "",
+        Some(&agg_json),
+        "",
+    );
+    if let Some(cached) = cached_delta_sql(cache_key) {
+        return cached;
+    }
+    let explain_sql = path_c_explain_sql(source_table, &base_query, &agg_json);
+    remember_delta_sql(cache_key, &explain_sql);
+    explain_sql
+}
+
+/// Cache-key operation of the Path C statement, distinct from every DML operation.
+const PATH_C_EXPLAIN_OP: &str = "PATH_C_EXPLAIN";
+
+fn path_c_explain_sql(source_table: &str, base_query: &str, agg_json: &str) -> String {
+    match serde_json::from_str::<AggregationPlan>(agg_json) {
         Ok(plan) if plan.source_join_keys.contains_key(source_table) => {}
         _ => return String::new(),
     }
-    if has_no_scoped_delta(&base_query, source_table) {
+    if has_no_scoped_delta(base_query, source_table) {
         return String::new();
     }
     let transition = transition_new_table_name(source_table);
-    replace_source_with_transition(&base_query, source_table, &transition)
+    replace_source_with_transition(base_query, source_table, &transition)
 }
 
 /// Resolve an IMV name to its already-quoted intermediate-table reference.

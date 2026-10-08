@@ -695,3 +695,40 @@ fn v112_jr_flush_reaches_every_imv_public() {
 fn v112_jr_flush_reaches_every_imv_public_quoted() {
     v112_jr_flush_reaches_every_imv("pubq", V112_JR_CALLER_SPELLINGS[3]);
 }
+
+/// The Path C statement of an IMV is built once per backend and source: the
+/// second call parses nothing.
+#[pg_test]
+fn v112_jr_path_c_statement_is_cached_per_backend() {
+    Spi::run("CREATE TABLE v112_jr_pc_d(kind TEXT PRIMARY KEY, label TEXT)").expect("dim");
+    Spi::run("CREATE TABLE v112_jr_pc_f(id SERIAL PRIMARY KEY, kind TEXT, v INT)").expect("fact");
+    Spi::run("INSERT INTO v112_jr_pc_d VALUES ('a','A'),('b','B')").expect("seed");
+    Spi::run("INSERT INTO v112_jr_pc_f(kind, v) VALUES ('a',1),('b',2)").expect("seed");
+    assert_eq!(
+        crate::create_reflex_ivm(
+            "v112_jr_pc_v",
+            "SELECT f.kind, SUM(f.v) AS s FROM v112_jr_pc_f f JOIN v112_jr_pc_d d ON d.kind = f.kind GROUP BY f.kind",
+            None,
+            None,
+            None,
+            None
+        ),
+        "CREATE REFLEX INCREMENTAL VIEW"
+    );
+    let sources = ["v112_jr_pc_f", "v112_jr_pc_d"];
+    let build = || {
+        sources
+            .map(|source| crate::trigger::reflex_build_path_c_explain_sql("v112_jr_pc_v", source))
+    };
+    crate::trigger::reset_delta_sql_cache();
+    let first = build();
+    assert!(first.iter().any(|sql| sql.contains("__reflex_new_")), "{first:?}");
+    assert_eq!(crate::trigger::delta_sql_cache_len(), sources.len());
+    assert_eq!(build(), first);
+    assert_eq!(crate::trigger::delta_sql_cache_len(), sources.len());
+    assert_eq!(
+        crate::trigger::reflex_build_path_c_explain_sql("v112_jr_pc_missing", "v112_jr_pc_f"),
+        ""
+    );
+    assert_eq!(crate::trigger::delta_sql_cache_len(), sources.len());
+}
