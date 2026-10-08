@@ -888,3 +888,53 @@ fn v112_hv_count_distinct_with_having_subquery_is_rejected() {
         }
     }
 }
+
+/// The intermediate of a COUNT(DISTINCT) is keyed on its argument: keyed on
+/// two arguments it holds one row per pair, and neither count can be read
+/// from it.
+#[pg_test]
+fn v112_hv_two_count_distinct_are_rejected() {
+    v112_hv_rejected_with_working_remedy(
+        "cd_two",
+        "SELECT g, COUNT(DISTINCT v) AS dv, COUNT(DISTINCT n) AS dn FROM {src} GROUP BY g",
+        "WITH a AS (SELECT g, COUNT(DISTINCT v) AS dv FROM {src} GROUP BY g), \
+              b AS (SELECT g, COUNT(DISTINCT n) AS dn FROM {src} GROUP BY g) \
+         SELECT a.g, a.dv, b.dn FROM a JOIN b ON b.g = a.g",
+    );
+}
+
+#[pg_test]
+fn v112_hv_two_count_distinct_with_having_are_rejected() {
+    v112_hv_rejected_with_working_remedy(
+        "cd_two_having",
+        "SELECT g, COUNT(DISTINCT v) AS dv, COUNT(DISTINCT b) AS db FROM {src} GROUP BY g \
+         HAVING COUNT(DISTINCT v) > 1",
+        "WITH a AS (SELECT g, COUNT(DISTINCT v) AS dv FROM {src} GROUP BY g), \
+              b AS (SELECT g, COUNT(DISTINCT b) AS db FROM {src} GROUP BY g) \
+         SELECT a.g, a.dv, b.db FROM a JOIN b ON b.g = a.g WHERE a.dv > 1",
+    );
+}
+
+#[pg_test]
+fn v112_hv_same_column_count_distinct_with_two_filters_is_rejected() {
+    v112_hv_rejected_with_working_remedy(
+        "cd_two_filters",
+        "SELECT g, COUNT(DISTINCT v) AS dv, COUNT(DISTINCT v) FILTER (WHERE v > 2) AS dbig \
+         FROM {src} GROUP BY g",
+        "WITH a AS (SELECT g, COUNT(DISTINCT v) AS dv FROM {src} GROUP BY g), \
+              b AS (SELECT g, COUNT(DISTINCT v) FILTER (WHERE v > 2) AS dbig FROM {src} GROUP BY g) \
+         SELECT a.g, a.dv, b.dbig FROM a JOIN b ON b.g = a.g",
+    );
+}
+
+#[pg_test]
+fn v112_hv_count_distinct_selected_twice_is_rejected() {
+    v112_hv_rejected_with_working_remedy(
+        "cd_twice",
+        "SELECT g, COUNT(DISTINCT v) AS d1, COUNT(DISTINCT v) AS d2 FROM {src} GROUP BY g \
+         HAVING COUNT(DISTINCT v) > 1",
+        "WITH cd AS (SELECT g, COUNT(DISTINCT v) AS d1 FROM {src} GROUP BY g \
+                     HAVING COUNT(DISTINCT v) > 1) \
+         SELECT g, d1, d1 AS d2 FROM cd",
+    );
+}

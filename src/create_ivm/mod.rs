@@ -2308,6 +2308,26 @@ pub(crate) fn create_reflex_ivm_impl_with_materialization(
             Some(crate::sql_analyzer::AggregateKind::CountDistinct)
         )
     });
+    let count_distinct_items = analysis
+        .select_columns
+        .iter()
+        .filter(|c| {
+            matches!(
+                c.aggregate,
+                Some(crate::sql_analyzer::AggregateKind::CountDistinct)
+            )
+        })
+        .count();
+    if count_distinct_items > 1 {
+        return crate::reflex_reject(
+            "More than one COUNT(DISTINCT ...) in the same SELECT list is not supported: the IMV \
+             is keyed on the distinct argument and holds one. Fix: compute each in its own CTE \
+             and join them on the group columns: WITH a AS (SELECT grp, COUNT(DISTINCT x) AS dx \
+             FROM t GROUP BY grp), b AS (SELECT grp, COUNT(DISTINCT y) AS dy FROM t GROUP BY grp) \
+             SELECT a.grp, a.dx, b.dy FROM a JOIN b ON b.grp = a.grp. The same COUNT(DISTINCT) \
+             needed twice is computed once in a CTE and its column repeated in the outer query.",
+        );
+    }
     let has_other_agg = analysis.select_columns.iter().any(|c| {
         c.is_aggregate_derived
             || matches!(c.aggregate, Some(ref k) if !matches!(k,
