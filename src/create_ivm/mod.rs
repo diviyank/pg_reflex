@@ -38,6 +38,9 @@ pub(crate) struct ParsedInputs {
     /// Aggregates pg_reflex does not decompose, accepted because the query is a
     /// single-level passthrough. Only a keyless one recomputes them on every write.
     keyless_only_aggregates: Vec<String>,
+    /// Set-returning functions called in the SELECT list: each source row yields
+    /// several IMV rows, so no key of the source identifies an IMV row.
+    set_returning_select_functions: Vec<String>,
 }
 
 /// Pipeline state shared across phases of `create_reflex_ivm_impl`. Owns the
@@ -71,6 +74,7 @@ pub(crate) struct BuildContext<'a> {
     froms: Vec<String>,
     real_source_names: Vec<String>,
     is_join_query: bool,
+    select_list_returns_sets: bool,
     /// Primary-key columns of the source that name output columns holding another
     /// expression, when that kept the primary key from being the IMV's key.
     primary_key_names_reused_by_outputs: Vec<String>,
@@ -152,7 +156,7 @@ fn validate_and_parse_inputs(
             return Err(crate::reflex_reject(&format!("Failed to parse SQL: {}", e)));
         }
     };
-    let (analysis, keyless_only_aggregates) = match analyze(&parsed_sql) {
+    let (analysis, function_contract) = match analyze(&parsed_sql) {
         Err(SqlAnalysisError::MultipleQueries(_)) => {
             return Err(crate::reflex_reject("Expected 1 query, got multiple"));
         }
@@ -163,14 +167,14 @@ fn validate_and_parse_inputs(
             if let Some(reason) = a.unsupported_reason() {
                 return Err(crate::reflex_reject(&reason));
             }
-            let keyless_only_aggregates = match check_function_contract(view_name, &a) {
-                Ok(aggregates) => aggregates,
+            let function_contract = match check_function_contract(view_name, &a) {
+                Ok(contract) => contract,
                 Err(reason) => return Err(crate::reflex_reject(&reason)),
             };
             if let Some(message) = timezone_sensitivity_warning(view_name, &a) {
                 warning!("{message}");
             }
-            (a, keyless_only_aggregates)
+            (a, function_contract)
         }
     };
     Ok(ParsedInputs {
@@ -180,7 +184,8 @@ fn validate_and_parse_inputs(
         mode_upper,
         parsed_sql,
         analysis,
-        keyless_only_aggregates,
+        keyless_only_aggregates: function_contract.keyless_only_aggregates,
+        set_returning_select_functions: function_contract.set_returning_select_functions,
     })
 }
 
@@ -228,6 +233,12 @@ fn resolve_unique_columns(ctx: &mut BuildContext) {
             &ctx.resolved_unique_columns,
             &real_sources,
             &ctx.analysis,
+        );
+    } else if ctx.select_list_returns_sets {
+        info!(
+            "pg_reflex: passthrough '{}' calls a set-returning function in its SELECT list, so \
+             no key of a source identifies its rows: it is fully refreshed by every write.",
+            ctx.view_name
         );
     } else if !ctx.is_join_query {
         // Auto-detect: only for single-source queries (JOINs need explicit key)
@@ -409,17 +420,23 @@ fn listed_signatures(signatures: &[String]) -> String {
     listed
 }
 
-/// `Ok` carries the aggregates pg_reflex does not decompose that the query may still
-/// use, provided the IMV ends up keyless (see `keyed_keyless_only_aggregate`).
+struct FunctionContract {
+    /// Aggregates pg_reflex does not decompose that the query may still use, provided
+    /// the IMV ends up keyless (see `keyed_keyless_only_aggregate`).
+    keyless_only_aggregates: Vec<String>,
+    set_returning_select_functions: Vec<String>,
+}
+
 fn check_function_contract(
     view_name: &str,
     analysis: &crate::sql_analyzer::SqlAnalysis,
-) -> Result<Vec<String>, String> {
+) -> Result<FunctionContract, String> {
     let CatalogFunctionKinds {
         volatile,
         volatile_signatures,
         alterable_volatile_signatures,
         aggregates,
+        set_returning,
     } = catalog_function_kinds(&analysis.function_references);
     if !volatile_signatures.is_empty() {
         let builtin_signatures: Vec<String> = volatile_signatures
@@ -469,7 +486,15 @@ fn check_function_contract(
     if !unsupported.is_empty() && !is_single_level_passthrough(analysis) {
         return Err(unsupported_aggregates_message(&unsupported));
     }
-    Ok(unsupported)
+    Ok(FunctionContract {
+        keyless_only_aggregates: unsupported,
+        set_returning_select_functions: analysis
+            .select_list_functions
+            .iter()
+            .filter(|name| set_returning.contains(name))
+            .cloned()
+            .collect(),
+    })
 }
 
 /// A keyed passthrough is maintained row by row from the transition tables, which
@@ -585,6 +610,8 @@ fn ungrouped_non_aggregate_column(ctx: &BuildContext) -> Option<String> {
 }
 
 struct CatalogFunctionKinds {
+    /// Bare names with at least one set-returning function among the matched ones.
+    set_returning: Vec<String>,
     /// Bare names with at least one volatile plain function among the matched ones.
     volatile: Vec<String>,
     /// Those volatile functions as `regprocedure` text: quoted and schema-qualified
@@ -610,6 +637,7 @@ fn catalog_function_kinds(
         volatile_signatures: Vec::new(),
         alterable_volatile_signatures: Vec::new(),
         aggregates: Vec::new(),
+        set_returning: Vec::new(),
     };
     if called.is_empty() {
         return kinds;
@@ -638,6 +666,7 @@ fn catalog_function_kinds(
                 "SELECT lower(p.proname::text COLLATE \"C\") AS name, \
                         bool_or(p.prokind = 'f' AND p.provolatile = 'v') AS is_volatile, \
                         bool_or(p.prokind = 'a') AND NOT bool_or(p.prokind = 'f') AS is_aggregate_only, \
+                        bool_or(p.proretset) AS returns_set, \
                         COALESCE(array_agg(p.oid::regprocedure::text ORDER BY p.oid::regprocedure::text) \
                                    FILTER (WHERE p.prokind = 'f' AND p.provolatile = 'v'), \
                                  '{}'::text[]) AS volatile_signatures, \
@@ -669,6 +698,9 @@ fn catalog_function_kinds(
             };
             if row.get_by_name::<bool, _>("is_volatile").unwrap_or(None) == Some(true) {
                 kinds.volatile.push(name.clone());
+            }
+            if row.get_by_name::<bool, _>("returns_set").unwrap_or(None) == Some(true) {
+                kinds.set_returning.push(name.clone());
             }
             if row
                 .get_by_name::<bool, _>("is_aggregate_only")
@@ -2401,6 +2433,7 @@ pub(crate) fn create_reflex_ivm_impl_with_materialization(
         parsed_sql,
         mut analysis,
         keyless_only_aggregates,
+        set_returning_select_functions,
     } = parsed;
 
     // Resolve every bare source against the current `search_path` so the
@@ -2463,6 +2496,7 @@ pub(crate) fn create_reflex_ivm_impl_with_materialization(
         froms,
         real_source_names,
         is_join_query,
+        select_list_returns_sets: !set_returning_select_functions.is_empty(),
         primary_key_names_reused_by_outputs: Vec::new(),
         resolved_unique_columns: Vec::new(),
         resolved_partition_cols: Vec::new(),
@@ -2473,6 +2507,14 @@ pub(crate) fn create_reflex_ivm_impl_with_materialization(
         unlogged_tables: Vec::new(),
     };
 
+    if ctx.plan.is_passthrough && ctx.select_list_returns_sets && !unique_columns_str.is_empty() {
+        return crate::reflex_reject(&format!(
+            "A set-returning function in the SELECT list ({}) yields several rows per source \
+             row, so the IMV cannot be maintained by a unique key: it is recomputed on every \
+             write. Fix: do not pass unique_columns.",
+            set_returning_select_functions.join(", ")
+        ));
+    }
     resolve_unique_columns(&mut ctx);
     if let Some(reason) = keyed_keyless_only_aggregate(&ctx, &keyless_only_aggregates) {
         return crate::reflex_reject(&reason);
