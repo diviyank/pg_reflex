@@ -665,6 +665,37 @@ pub(crate) fn having_predicate(
     Some((predicate, new_columns))
 }
 
+/// Whether the HAVING clause needs an aggregate the regrouped end query of a
+/// `COUNT(DISTINCT ...)` cannot evaluate: any aggregate other than a
+/// `COUNT(DISTINCT ...)` beside one in the SELECT list, or a `COUNT(DISTINCT ...)`
+/// the SELECT list does not hold.
+pub(crate) fn having_mixes_count_distinct(analysis: &SqlAnalysis) -> bool {
+    let Some(having) = analysis.having_clause.as_deref().and_then(parse_expression) else {
+        return false;
+    };
+    let selected_distinct_args: Vec<&str> = analysis
+        .select_columns
+        .iter()
+        .filter(|c| matches!(c.aggregate, Some(AggregateKind::CountDistinct)))
+        .filter_map(|c| c.aggregate_arg.as_deref())
+        .collect();
+    let mut holds_other_aggregate = false;
+    let mut holds_unselected_distinct = false;
+    replace_aggregate_calls(&having, &mut |_, call| {
+        if matches!(call.kind, AggregateKind::CountDistinct) {
+            let selected = call
+                .arg
+                .as_deref()
+                .is_some_and(|arg| selected_distinct_args.contains(&arg));
+            holds_unselected_distinct |= !selected;
+        } else {
+            holds_other_aggregate = true;
+        }
+        String::new()
+    });
+    holds_unselected_distinct || (holds_other_aggregate && !selected_distinct_args.is_empty())
+}
+
 /// `expr` with every aggregate call replaced by the expression that reads it
 /// back from the intermediate table (e.g., SUM(x) -> "__sum_x"). The columns a
 /// reading needs that are in neither `existing` nor `new_cols` are appended to

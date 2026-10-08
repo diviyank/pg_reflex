@@ -458,8 +458,16 @@ pub fn generate_end_query(view_name: &str, plan: &AggregationPlan) -> String {
         query.push_str(&format!(" GROUP BY {}", grp_cols.join(", ")));
     }
 
+    // An end query that re-aggregates filters its groups with HAVING; otherwise
+    // each intermediate row is one group and the predicate filters rows.
     if let Some(ref having) = plan.having_clause {
-        let keyword = if filters_live_groups { "AND" } else { "WHERE" };
+        let keyword = if has_count_distinct_mapping {
+            "HAVING"
+        } else if filters_live_groups {
+            "AND"
+        } else {
+            "WHERE"
+        };
         query.push_str(&format!(" {} ({})", keyword, having));
     }
 
