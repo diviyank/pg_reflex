@@ -37,9 +37,23 @@ impl IntermediateColumn {
         format!("{}_topk", self.name)
     }
 
+    /// `pg_type` without its `COLLATE` clause.
+    pub fn value_type(&self) -> &str {
+        split_collation(&self.pg_type).0
+    }
+
     /// True when this column carries a top-K companion array.
     pub fn has_topk(&self) -> bool {
         self.topk_k.is_some()
+    }
+}
+
+/// A column type as `(type, " COLLATE <collation>")`; the clause is empty for a
+/// type written without one.
+pub(crate) fn split_collation(pg_type: &str) -> (&str, &str) {
+    match pg_type.find(" COLLATE ") {
+        Some(at) => pg_type.split_at(at),
+        None => (pg_type, ""),
     }
 }
 
