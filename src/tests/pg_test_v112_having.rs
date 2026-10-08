@@ -395,3 +395,160 @@ fn v112_hv_count_distinct_beside_derived_aggregate_is_rejected() {
     );
 }
 
+/// Writes to the table read by the HAVING subquery move its value across the
+/// per-group aggregates in both directions; writes to the outer source follow.
+fn v112_hv_subquery_roundtrip(tag: &str, select: &str, deferred: bool) -> String {
+    let src = format!("v112_hv_{tag}_src");
+    let lookup = format!("v112_hv_{tag}_o");
+    let imv = format!("v112_hv_{tag}");
+    Spi::run(&format!(
+        "CREATE TABLE {src}(id SERIAL PRIMARY KEY, g TEXT, v INT)"
+    ))
+    .expect("create source");
+    Spi::run(&format!(
+        "INSERT INTO {src}(g, v) VALUES ('a',1),('a',2),('b',10),('c',4),('c',NULL),('d',NULL)"
+    ))
+    .expect("seed");
+    Spi::run(&format!(
+        "CREATE TABLE {lookup}(id SERIAL PRIMARY KEY, g TEXT, k INT)"
+    ))
+    .expect("create lookup");
+    Spi::run(&format!(
+        "INSERT INTO {lookup}(g, k) VALUES ('a',1),('b',2),('c',2),('d',3)"
+    ))
+    .expect("seed lookup");
+    let fresh = select.replace("{src}", &src).replace("{o}", &lookup);
+    let mode = if deferred { "DEFERRED" } else { "IMMEDIATE" };
+    let created = v112_na_try(&format!(
+        "SELECT create_reflex_ivm('{imv}', $v112sel${fresh}$v112sel$, NULL, 'UNLOGGED', '{mode}')"
+    ));
+    if created != "CREATE REFLEX INCREMENTAL VIEW" {
+        return format!("AT-CREATE {created}");
+    }
+    let lookup_steps = [
+        ("o_ins", format!("INSERT INTO {lookup}(g, k) VALUES ('z', 4)")),
+        (
+            "o_ins_many",
+            format!("INSERT INTO {lookup}(g, k) VALUES ('z', 5), ('z', 6), ('z', 7), ('z', 11)"),
+        ),
+        ("o_upd", format!("UPDATE {lookup} SET k = k - 9 WHERE g = 'z'")),
+        ("o_del", format!("DELETE FROM {lookup} WHERE g = 'z'")),
+        ("o_upd_all", format!("UPDATE {lookup} SET k = k + 1")),
+        ("o_del_joined", format!("DELETE FROM {lookup} WHERE g = 'c'")),
+        ("src_ins", format!("INSERT INTO {src}(g, v) VALUES ('a', 5), ('e', 9), ('d', 1)")),
+        ("src_upd", format!("UPDATE {src} SET v = v - 3 WHERE g IN ('a', 'b')")),
+        ("src_del", format!("DELETE FROM {src} WHERE g = 'a' AND v < 2")),
+        ("o_empty", format!("DELETE FROM {lookup}")),
+        ("o_refill", format!("INSERT INTO {lookup}(g, k) VALUES ('a', 1), ('b', 0), ('e', 2)")),
+        ("src_empty", format!("DELETE FROM {src}")),
+    ];
+    let mut steps = vec![("create".to_string(), v112_na_oracle(&imv, &fresh))];
+    for (label, dml) in &lookup_steps {
+        let ran = v112_na_try_dml(dml);
+        if ran != "OK" {
+            steps.push((label.to_string(), ran));
+            break;
+        }
+        if deferred {
+            let written = if label.starts_with("o_") { &lookup } else { &src };
+            let flushed = v112_na_try(&format!("SELECT reflex_flush_deferred('{written}')"));
+            if flushed.starts_with("RAISED") || flushed.starts_with("ERROR") {
+                steps.push((label.to_string(), flushed));
+                break;
+            }
+        }
+        steps.push((label.to_string(), v112_na_oracle(&imv, &fresh)));
+    }
+    v112_hv_outcome(steps)
+}
+
+const V112_HV_SUB_SUM: &str = "SELECT g, SUM(v) AS s FROM {src} GROUP BY g HAVING SUM(v) > (SELECT COUNT(*) FROM {o})";
+const V112_HV_SUB_COUNT: &str = "SELECT g, COUNT(*) AS c, COUNT(v) AS cv FROM {src} GROUP BY g \
+             HAVING COUNT(v) * 3 >= (SELECT COUNT(*) FROM {o})";
+const V112_HV_SUB_MIN_MAX: &str = "SELECT g, MIN(v) AS lo, MAX(v) AS hi FROM {src} GROUP BY g \
+             HAVING MAX(v) > (SELECT MAX(k) FROM {o}) OR MIN(v) < (SELECT MIN(k) FROM {o})";
+const V112_HV_SUB_AVG_COLUMN: &str = "SELECT g, AVG(v) AS a FROM {src} GROUP BY g \
+             HAVING AVG(v) >= (SELECT COALESCE(SUM(k), 0) FROM {o} WHERE k > 2)";
+const V112_HV_SUB_JOINED: &str = "SELECT {src}.g, SUM({src}.v) AS s, COUNT(*) AS c FROM {src} JOIN {o} ON {o}.g = {src}.g \
+             GROUP BY {src}.g HAVING SUM({src}.v) > (SELECT MAX(k) FROM {o})";
+
+macro_rules! v112_hv_subquery_cells {
+    ($($name:ident => $shape:expr, $deferred:expr;)+) => {
+        $(
+            #[pg_test]
+            fn $name() {
+                let tag = stringify!($name).trim_start_matches("v112_hv_");
+                assert_eq!(
+                    v112_hv_subquery_roundtrip(tag, $shape, $deferred),
+                    "ok",
+                    "{}",
+                    $shape
+                );
+            }
+        )+
+    };
+}
+
+v112_hv_subquery_cells! {
+    v112_hv_sub_sum => V112_HV_SUB_SUM, false;
+    v112_hv_sub_count => V112_HV_SUB_COUNT, false;
+    v112_hv_sub_min_max => V112_HV_SUB_MIN_MAX, false;
+    v112_hv_sub_avg_column => V112_HV_SUB_AVG_COLUMN, false;
+    v112_hv_sub_joined => V112_HV_SUB_JOINED, false;
+    v112_hv_sub_sum_def => V112_HV_SUB_SUM, true;
+    v112_hv_sub_count_def => V112_HV_SUB_COUNT, true;
+    v112_hv_sub_min_max_def => V112_HV_SUB_MIN_MAX, true;
+    v112_hv_sub_joined_def => V112_HV_SUB_JOINED, true;
+}
+
+/// The report's exact sequence: the subquery value stays below both sums, so
+/// the result must not move at all.
+#[pg_test]
+fn v112_hv_sub_write_leaves_qualifying_sums_unchanged() {
+    Spi::run("CREATE TABLE v112_hv_rep_s(id SERIAL PRIMARY KEY, g TEXT, v INT)").expect("s");
+    Spi::run("INSERT INTO v112_hv_rep_s(g, v) VALUES ('a', 1), ('a', 2), ('b', 10)").expect("seed");
+    Spi::run("CREATE TABLE v112_hv_rep_o(k INT)").expect("o");
+    Spi::run("INSERT INTO v112_hv_rep_o VALUES (1)").expect("seed o");
+    let q = "SELECT g, SUM(v) AS s FROM v112_hv_rep_s GROUP BY g \
+             HAVING SUM(v) > (SELECT COUNT(*) FROM v112_hv_rep_o)";
+    assert_eq!(
+        v112_hv_create("v112_hv_rep", q),
+        "CREATE REFLEX INCREMENTAL VIEW"
+    );
+    Spi::run("INSERT INTO v112_hv_rep_o VALUES (2)").expect("insert o");
+    let sums = Spi::get_one::<String>(
+        "SELECT string_agg(g || '=' || s, ',' ORDER BY g) FROM v112_hv_rep",
+    )
+    .expect("read")
+    .unwrap_or_default();
+    assert_eq!(sums, "a=3,b=10");
+    assert_imv_correct("v112_hv_rep", q);
+    Spi::run("DELETE FROM v112_hv_rep_o WHERE k = 2").expect("delete o");
+    assert_imv_correct("v112_hv_rep", q);
+}
+
+/// Only a relation read by the end query counts: an output column or the
+/// intermediate table carrying the source's name does not.
+#[pg_test]
+fn v112_hv_sub_end_query_reads_source_only_as_a_relation() {
+    use crate::trigger::end_query_reads_source;
+    let plain = "SELECT \"g\", \"__sum_v\" AS \"s\" FROM \"__reflex_intermediate_s\" \
+                 WHERE __ivm_count > 0";
+    assert!(!end_query_reads_source(plain, "public.s"));
+    let with_subquery = format!("{plain} AND (\"__sum_v\" > (SELECT COUNT(*) FROM s))");
+    assert!(end_query_reads_source(&with_subquery, "public.s"));
+    assert!(end_query_reads_source(&with_subquery, "\"public\".\"s\""));
+    assert!(!end_query_reads_source(&with_subquery, "public.o"));
+    assert!(end_query_reads_source("SELECT FROM WHERE s (", "s"));
+}
+
+// The HAVING subquery reads the IMV's own source
+v112_hv_cells! {
+    V112_HV_NULLABLE, false, None;
+    v112_hv_sub_own_source => "SELECT g, COUNT(*) AS c FROM {src} GROUP BY g HAVING COUNT(*) > (SELECT COUNT(*) FROM {src}) / 4",
+}
+
+v112_hv_cells! {
+    V112_HV_NULLABLE, true, None;
+    v112_hv_sub_own_source_def => "SELECT g, COUNT(*) AS c FROM {src} GROUP BY g HAVING COUNT(*) > (SELECT COUNT(*) FROM {src}) / 4",
+}
