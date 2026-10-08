@@ -14,7 +14,7 @@ INSERT INTO "Case_T"(season, v) VALUES ('u',100);
 -- ERROR:  relation "__reflex_new_case_t" does not exist
 ```
 
-Both IMVs are created and correct, and the registry holds two distinct sources
+Run as `"V112_jr_case_T"` and `v112_jr_case_t`; the names above are shortened. Both IMVs are created and correct, and the registry holds two distinct sources
 (`"Case_T"` and `case_t`; pinned by `v112_jr_names_differing_by_case_stay_two_sources`). The
 first write raises. Not checked: a write to the lower-case table, DEFERRED, a single IMV over
 `"Case_T"` with no lower-case homonym (the mixed-case reports below suggest it works).
