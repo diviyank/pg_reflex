@@ -2345,6 +2345,17 @@ pub(crate) fn create_reflex_ivm_impl_with_materialization(
              SELECT grp, n FROM cd WHERE n > 1"
         ));
     }
+    if let Some(crate::aggregation::CountDistinctHavingConflict::PrintedAsWritten(call)) =
+        &having_conflict
+    {
+        return crate::reflex_reject(&format!(
+            "HAVING holds {call} under BETWEEN, IN, IS or a similar predicate, which is supported \
+             only for COUNT(DISTINCT <plain column>) without FILTER. Fix: compare it with =, <, \
+             >, <=, >= combined with AND / OR, or compute it in a CTE and filter in the outer \
+             query: WITH cd AS (SELECT grp, COUNT(DISTINCT col) AS n FROM t GROUP BY grp) \
+             SELECT grp, n FROM cd WHERE n BETWEEN 1 AND 2"
+        ));
+    }
     if let Some(crate::aggregation::CountDistinctHavingConflict::Subquery) = &having_conflict {
         return crate::reflex_reject(
             "COUNT(DISTINCT col) cannot be filtered by a HAVING clause that holds a subquery. \

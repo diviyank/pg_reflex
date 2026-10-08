@@ -680,6 +680,10 @@ pub(crate) enum CountDistinctHavingConflict {
     /// HAVING holds this `COUNT(DISTINCT ...)`, which the SELECT list does not
     /// hold with the same argument and FILTER.
     UnselectedCountDistinct(String),
+    /// HAVING holds this selected `COUNT(DISTINCT ...)` under an expression the
+    /// end query evaluates as written, where only a plain column argument
+    /// without FILTER names a column of the intermediate table.
+    PrintedAsWritten(String),
 }
 
 pub(crate) fn count_distinct_having_conflict(
@@ -700,9 +704,22 @@ pub(crate) fn count_distinct_having_conflict(
         return Some(CountDistinctHavingConflict::Subquery);
     }
 
+    let mut read_from_intermediate = Vec::new();
+    replace_aggregate_calls(&having, &mut |function, _| {
+        read_from_intermediate.push(function.to_string());
+        String::new()
+    });
+
     let mut holds_other_aggregate = false;
     let mut unselected_distinct = None;
+    let mut printed_as_written = None;
     for function in &aggregate_spelled_calls(&having) {
+        let spelling = function.to_string();
+        let rewritten = read_from_intermediate
+            .iter()
+            .position(|read| *read == spelling)
+            .map(|position| read_from_intermediate.swap_remove(position))
+            .is_some();
         match resolve_aggregate_call(function) {
             Some(call) if matches!(call.kind, AggregateKind::CountDistinct) => {
                 let selected = call
@@ -710,7 +727,9 @@ pub(crate) fn count_distinct_having_conflict(
                     .as_deref()
                     .is_some_and(|arg| selected_distinct_args.contains(&arg));
                 if !selected {
-                    unselected_distinct.get_or_insert_with(|| function.to_string());
+                    unselected_distinct.get_or_insert(spelling);
+                } else if !rewritten && !counts_a_plain_column(function) {
+                    printed_as_written.get_or_insert(spelling);
                 }
             }
             _ => holds_other_aggregate = true,
@@ -719,7 +738,24 @@ pub(crate) fn count_distinct_having_conflict(
     if holds_other_aggregate && selects_count_distinct {
         return Some(CountDistinctHavingConflict::OtherAggregate);
     }
-    unselected_distinct.map(CountDistinctHavingConflict::UnselectedCountDistinct)
+    unselected_distinct
+        .map(CountDistinctHavingConflict::UnselectedCountDistinct)
+        .or(printed_as_written.map(CountDistinctHavingConflict::PrintedAsWritten))
+}
+
+/// Whether the call counts one unqualified column with no FILTER, the only
+/// spelling that reads the same over the source and over the intermediate.
+fn counts_a_plain_column(function: &sqlparser::ast::Function) -> bool {
+    let FunctionArguments::List(list) = &function.args else {
+        return false;
+    };
+    function.filter.is_none()
+        && matches!(
+            list.args.as_slice(),
+            [FunctionArg::Unnamed(FunctionArgExpr::Expr(
+                Expr::Identifier(_)
+            ))]
+        )
 }
 
 fn holds_subquery(expr: &Expr) -> bool {
