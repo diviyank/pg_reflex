@@ -938,3 +938,28 @@ fn v112_hv_count_distinct_selected_twice_is_rejected() {
          SELECT g, d1, d1 AS d2 FROM cd",
     );
 }
+
+/// Under BETWEEN, IN and the like the end query evaluates the call as
+/// written, which only a plain column argument without FILTER survives.
+#[pg_test]
+fn v112_hv_count_distinct_of_expression_under_between_is_rejected() {
+    v112_hv_rejected_with_working_remedy(
+        "cd_between_filter",
+        "SELECT g, COUNT(DISTINCT v) FILTER (WHERE v > 1) AS d FROM {src} GROUP BY g \
+         HAVING COUNT(DISTINCT v) FILTER (WHERE v > 1) BETWEEN 1 AND 2",
+        "SELECT g, COUNT(DISTINCT v) FILTER (WHERE v > 1) AS d FROM {src} GROUP BY g \
+         HAVING COUNT(DISTINCT v) FILTER (WHERE v > 1) >= 1 \
+            AND COUNT(DISTINCT v) FILTER (WHERE v > 1) <= 2",
+    );
+}
+
+#[pg_test]
+fn v112_hv_count_distinct_of_sum_under_in_list_is_rejected() {
+    v112_hv_rejected_with_working_remedy(
+        "cd_in_expression",
+        "SELECT g, COUNT(DISTINCT v + 1) AS d FROM {src} GROUP BY g \
+         HAVING COUNT(DISTINCT v + 1) IN (2, 3) OR COUNT(DISTINCT v + 1) > 3",
+        "WITH cd AS (SELECT g, COUNT(DISTINCT v + 1) AS d FROM {src} GROUP BY g) \
+         SELECT g, d FROM cd WHERE d IN (2, 3) OR d > 3",
+    );
+}
