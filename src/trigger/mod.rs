@@ -460,6 +460,12 @@ pub fn reflex_build_path_c_explain_sql(view_name: &str, source_table: &str) -> S
     if has_no_scoped_delta(&base_query, source_table) {
         return String::new();
     }
+    // The swap keeps the unmatched rows of a FULL JOIN's other table, whose
+    // groups the intermediate table can already hold.
+    let bq_upper = upper_with_single_spaces(&base_query);
+    if bq_upper.contains("FULL JOIN") || bq_upper.contains("FULL OUTER") {
+        return String::new();
+    }
     let transition = transition_new_table_name(source_table);
     replace_source_with_transition(&base_query, source_table, &transition)
 }
