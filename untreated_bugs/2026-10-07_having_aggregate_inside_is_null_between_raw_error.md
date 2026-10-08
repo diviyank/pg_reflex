@@ -23,6 +23,11 @@ Beside a `COUNT(DISTINCT ...)` these shapes are refused with the tagged "cannot 
 (pinned by `v112_hv_count_distinct_with_other_aggregate_under_any_expression_is_rejected`): there
 the unrewritten aggregate would be legal SQL over the regrouped end query and silently wrong.
 
+A selected `COUNT(DISTINCT ...)` repeated in HAVING under one of these nodes is evaluated as
+written when its argument is a plain column without FILTER (correct, pinned by
+`v112_hv_count_distinct_between`), and refused with a tagged message otherwise
+(`COUNT(DISTINCT v) FILTER (...) BETWEEN 1 AND 2`, `COUNT(DISTINCT v + 1) IN (2, 3)`).
+
 ## Expected vs actual
 
 Expected: an IMV, or a tagged `[reflex-unsupported]` rejection. Actual: a raw PostgreSQL error
