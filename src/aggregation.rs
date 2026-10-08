@@ -673,6 +673,10 @@ pub(crate) enum CountDistinctHavingConflict {
     /// HAVING holds another aggregate, or does not parse, beside a
     /// `COUNT(DISTINCT ...)` of the SELECT list.
     OtherAggregate,
+    /// HAVING holds a subquery beside a `COUNT(DISTINCT ...)` of the SELECT
+    /// list. An aggregate written inside it may belong to the outer query, and
+    /// its clauses are not the ones the end query regroups on.
+    Subquery,
     /// HAVING holds this `COUNT(DISTINCT ...)`, which the SELECT list does not
     /// hold with the same argument and FILTER.
     UnselectedCountDistinct(String),
@@ -692,6 +696,9 @@ pub(crate) fn count_distinct_having_conflict(
     let Some(having) = parse_expression(having) else {
         return selects_count_distinct.then_some(CountDistinctHavingConflict::OtherAggregate);
     };
+    if selects_count_distinct && holds_subquery(&having) {
+        return Some(CountDistinctHavingConflict::Subquery);
+    }
 
     let mut holds_other_aggregate = false;
     let mut unselected_distinct = None;
@@ -713,6 +720,21 @@ pub(crate) fn count_distinct_having_conflict(
         return Some(CountDistinctHavingConflict::OtherAggregate);
     }
     unselected_distinct.map(CountDistinctHavingConflict::UnselectedCountDistinct)
+}
+
+fn holds_subquery(expr: &Expr) -> bool {
+    struct SubqueryFinder(bool);
+    impl Visitor for SubqueryFinder {
+        type Break = ();
+
+        fn pre_visit_query(&mut self, _: &sqlparser::ast::Query) -> ControlFlow<()> {
+            self.0 = true;
+            ControlFlow::Break(())
+        }
+    }
+    let mut finder = SubqueryFinder(false);
+    let _ = expr.visit(&mut finder);
+    finder.0
 }
 
 const DECOMPOSED_AGGREGATE_NAMES: [&str; 6] = ["sum", "count", "avg", "min", "max", "bool_or"];

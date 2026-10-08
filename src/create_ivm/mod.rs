@@ -2325,6 +2325,14 @@ pub(crate) fn create_reflex_ivm_impl_with_materialization(
              SELECT grp, n FROM cd WHERE n > 1"
         ));
     }
+    if let Some(crate::aggregation::CountDistinctHavingConflict::Subquery) = &having_conflict {
+        return crate::reflex_reject(
+            "COUNT(DISTINCT col) cannot be filtered by a HAVING clause that holds a subquery. \
+             Fix: compute the COUNT(DISTINCT) in a CTE and filter in the outer query: \
+             WITH cd AS (SELECT grp, COUNT(DISTINCT col) AS n FROM t GROUP BY grp) \
+             SELECT grp, n FROM cd WHERE n > (SELECT COUNT(*) FROM other)",
+        );
+    }
     if (has_cd && has_other_agg) || having_conflict.is_some() {
         return crate::reflex_reject("COUNT(DISTINCT col) cannot be mixed with other aggregates in the same query. \
                 Use a CTE to separate them: WITH cd AS (SELECT grp, COUNT(DISTINCT col) ...) SELECT ...");

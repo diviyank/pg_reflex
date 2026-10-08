@@ -811,3 +811,80 @@ fn v112_hv_count_distinct_rejection_names_the_unselected_count() {
         v112_hv_assert_nothing_created(&imv);
     }
 }
+
+/// One row per distinct value cannot answer a HAVING subquery: an aggregate
+/// written inside it may belong to the outer query, and a GROUP BY inside it
+/// is not the one the end query regroups on.
+#[pg_test]
+fn v112_hv_count_distinct_with_having_subquery_is_rejected() {
+    let src = v112_hv_source("cd_sub");
+    let lookup = "v112_hv_cd_sub_o";
+    Spi::run(&format!(
+        "CREATE TABLE {lookup}(id SERIAL PRIMARY KEY, g TEXT, k INT)"
+    ))
+    .expect("lookup");
+    Spi::run(&format!(
+        "INSERT INTO {lookup}(g, k) VALUES ('a',1),('b',2),('c',2),('d',3)"
+    ))
+    .expect("seed lookup");
+    let with_subquery = [
+        "(SELECT SUM(v)) > 5",
+        "(SELECT COUNT(v)) >= 3",
+        "g = 'd' AND (SELECT COUNT(v) > 2)",
+        "COUNT(DISTINCT v) >= 1 AND (SELECT SUM(v)) > 5",
+        "(SELECT q.s FROM (SELECT SUM(v) AS s) q) > 5",
+        "(SELECT COUNT(*) FROM {o} WHERE k < COUNT(v)) > 1",
+        "EXISTS (SELECT 1 FROM {o} WHERE k = COUNT(v))",
+        "(SELECT COUNT(*) FROM {o} WHERE k < (SELECT SUM(v))) > 3",
+        "g IN (SELECT g FROM {o} GROUP BY g)",
+        "g IN (SELECT g FROM {o} GROUP BY g HAVING SUM(k) > 1)",
+        "COUNT(DISTINCT v) > (SELECT COUNT(*) FROM {o}) - 3",
+        "COUNT(DISTINCT v) > ALL (SELECT k FROM {o})",
+        "g = ANY (SELECT g FROM {o})",
+        "NOT EXISTS (SELECT 1 FROM {o} WHERE {o}.g = {src}.g)",
+        "CASE WHEN g = 'a' THEN COUNT(DISTINCT v) BETWEEN 1 AND (SELECT MAX(k) FROM {o}) ELSE TRUE END",
+    ];
+    for (position, having) in with_subquery.iter().enumerate() {
+        let imv = format!("v112_hv_cd_sub_{position}");
+        let having = having.replace("{o}", lookup).replace("{src}", &src);
+        let outcome = v112_hv_create(
+            &imv,
+            &format!("SELECT g, COUNT(DISTINCT v) AS d FROM {src} GROUP BY g HAVING {having}"),
+        );
+        assert!(
+            outcome.starts_with("ERROR: [reflex-unsupported] COUNT(DISTINCT col) cannot be filtered by a HAVING clause that holds a subquery")
+                && outcome.contains("CTE"),
+            "{having}: {outcome}"
+        );
+        v112_hv_assert_nothing_created(&imv);
+    }
+
+    let remedy = format!(
+        "WITH cd AS (SELECT g, COUNT(DISTINCT v) AS d FROM {src} GROUP BY g) \
+         SELECT g, d FROM cd WHERE d > (SELECT COUNT(*) FROM {lookup}) - 3"
+    );
+    let rejected = format!(
+        "SELECT g, COUNT(DISTINCT v) AS d FROM {src} GROUP BY g \
+         HAVING COUNT(DISTINCT v) > (SELECT COUNT(*) FROM {lookup}) - 3"
+    );
+    assert_eq!(
+        v112_hv_create("v112_hv_cd_sub", &remedy),
+        "CREATE REFLEX INCREMENTAL VIEW"
+    );
+    assert_imv_correct("v112_hv_cd_sub", &rejected);
+    let lookup_writes = [
+        format!("INSERT INTO {lookup}(g, k) VALUES ('z', 4)"),
+        format!("DELETE FROM {lookup} WHERE g IN ('a', 'b')"),
+        format!("UPDATE {lookup} SET k = k + 1"),
+        format!("DELETE FROM {lookup}"),
+        format!("INSERT INTO {lookup}(g, k) VALUES ('a', 1), ('b', 2), ('c', 3), ('d', 4), ('e', 5)"),
+    ];
+    for (position, (label, dml)) in V112_HV_NULLABLE.steps.iter().enumerate() {
+        Spi::run(&dml.replace("{src}", &src)).expect(label);
+        assert_imv_correct("v112_hv_cd_sub", &rejected);
+        if let Some(lookup_write) = lookup_writes.get(position / 2).filter(|_| position % 2 == 0) {
+            Spi::run(lookup_write).expect("lookup write");
+            assert_imv_correct("v112_hv_cd_sub", &rejected);
+        }
+    }
+}
