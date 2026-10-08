@@ -866,26 +866,32 @@ fn v112_fn_assert_keyed_unknown_aggregate_rejected(name: &str, q: &str, key: Opt
 }
 
 #[pg_test]
-fn v112_fn_ungrouped_unknown_aggregate_aliased_like_the_primary_key_rejected() {
-    v112_fn_table("v112_fn_uk_src");
+fn v112_fn_ungrouped_unknown_aggregate_aliased_like_the_primary_key_is_keyless_and_correct() {
     v112_fn_unknown_aggregate("v112_fn_uk_agg");
-    for (i, mode) in ["IMMEDIATE", "DEFERRED"].iter().enumerate() {
-        v112_fn_assert_keyed_unknown_aggregate_rejected(
-            &format!("v112_fn_uk_a{i}"),
-            "SELECT v112_fn_uk_agg(v) AS id FROM v112_fn_uk_src",
-            None,
-            mode,
-        );
-        v112_fn_assert_keyed_unknown_aggregate_rejected(
-            &format!("v112_fn_uk_b{i}"),
-            "SELECT v112_fn_uk_agg(id) AS id, v112_fn_uk_agg(v) AS m FROM v112_fn_uk_src",
-            None,
-            mode,
-        );
+    let mut case = 0;
+    for (mode, deferred) in [("IMMEDIATE", false), ("DEFERRED", true)] {
+        for select in [
+            "SELECT v112_fn_uk_agg(v) AS id FROM {src}",
+            "SELECT v112_fn_uk_agg(id) AS id, v112_fn_uk_agg(v) AS m FROM {src}",
+        ] {
+            case += 1;
+            let table = format!("v112_fn_uk{case}_src");
+            let imv = format!("v112_fn_uk{case}");
+            let q = select.replace("{src}", &table);
+            v112_fn_table(&table);
+            v112_fn_created(&imv, &q, mode);
+            assert_eq!(
+                Spi::get_one::<i64>(&format!(
+                    "SELECT COALESCE(cardinality(unique_columns), 0)::bigint \
+                     FROM public.__reflex_ivm_reference WHERE name = '{imv}'"
+                ))
+                .expect("registry"),
+                Some(0),
+                "{q} got a unique key"
+            );
+            v112_fn_assert_correct_through_dml(&imv, &q, &table, deferred);
+        }
     }
-    let renamed = "SELECT v112_fn_uk_agg(v) AS m FROM v112_fn_uk_src";
-    v112_fn_created("v112_fn_uk_a0", renamed, "IMMEDIATE");
-    v112_fn_assert_correct_through_dml("v112_fn_uk_a0", renamed, "v112_fn_uk_src", false);
 }
 
 #[pg_test]
