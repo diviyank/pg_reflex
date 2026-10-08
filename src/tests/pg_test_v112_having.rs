@@ -146,8 +146,8 @@ fn v112_hv_cell_on(
             break;
         }
         if deferred {
-            let flushed = v112_na_try(&format!("SELECT reflex_flush_deferred('{src}')"));
-            if flushed.starts_with("RAISED") || flushed.starts_with("ERROR") {
+            let flushed = v112_hv_flush(&imv, &src);
+            if flushed.contains("RAISED") || flushed.contains("ERROR") {
                 steps.push((label.to_string(), flushed));
                 break;
             }
@@ -410,14 +410,25 @@ fn v112_hv_count_distinct_beside_derived_aggregate_is_rejected() {
     );
 }
 
+/// Flushes the staged writes of `table` for `imv` under the spelling the IMV
+/// registered that source with.
+fn v112_hv_flush(imv: &str, table: &str) -> String {
+    v112_na_try(&format!(
+        "SELECT COALESCE(string_agg(public.reflex_flush_deferred(src), ' | '), 'RAISED: {table} is not a source of {imv}') \
+         FROM (SELECT DISTINCT src FROM public.__reflex_ivm_reference, unnest(depends_on) src \
+               WHERE name = '{imv}' AND (src = '{table}' OR src LIKE '%.{table}')) registered"
+    ))
+}
+
 /// Writes to the table read by the HAVING subquery move its value across the
-/// per-group aggregates in both directions; writes to the outer source follow.
+/// per-group aggregates in both directions; writes to the outer source follow,
+/// among them one to a column only a subquery reads.
 fn v112_hv_subquery_roundtrip(tag: &str, select: &str, deferred: bool) -> String {
     let src = format!("v112_hv_{tag}_src");
     let lookup = format!("v112_hv_{tag}_o");
     let imv = format!("v112_hv_{tag}");
     Spi::run(&format!(
-        "CREATE TABLE {src}(id SERIAL PRIMARY KEY, g TEXT, v INT)"
+        "CREATE TABLE {src}(id SERIAL PRIMARY KEY, g TEXT, v INT, w INT DEFAULT 0)"
     ))
     .expect("create source");
     Spi::run(&format!(
@@ -453,6 +464,19 @@ fn v112_hv_subquery_roundtrip(tag: &str, select: &str, deferred: bool) -> String
         ("src_ins", format!("INSERT INTO {src}(g, v) VALUES ('a', 5), ('e', 9), ('d', 1)")),
         ("src_upd", format!("UPDATE {src} SET v = v - 3 WHERE g IN ('a', 'b')")),
         ("src_del", format!("DELETE FROM {src} WHERE g = 'a' AND v < 2")),
+        (
+            "src_w_only",
+            format!("UPDATE {src} SET w = w + 7 WHERE g IN ('a', 'b')"),
+        ),
+        (
+            "src_lower",
+            format!("UPDATE {src} SET v = 1 WHERE g = 'c' AND v IS NOT NULL"),
+        ),
+        ("src_w_reset", format!("UPDATE {src} SET w = 0")),
+        (
+            "src_raise",
+            format!("INSERT INTO {src}(g, v) VALUES ('e', 40), ('b', 6), ('b', 5)"),
+        ),
         ("o_empty", format!("DELETE FROM {lookup}")),
         ("o_refill", format!("INSERT INTO {lookup}(g, k) VALUES ('a', 1), ('b', 0), ('e', 2)")),
         ("src_empty", format!("DELETE FROM {src}")),
@@ -464,10 +488,10 @@ fn v112_hv_subquery_roundtrip(tag: &str, select: &str, deferred: bool) -> String
             steps.push((label.to_string(), ran));
             break;
         }
-        if deferred {
-            let written = if label.starts_with("o_") { &lookup } else { &src };
-            let flushed = v112_na_try(&format!("SELECT reflex_flush_deferred('{written}')"));
-            if flushed.starts_with("RAISED") || flushed.starts_with("ERROR") {
+        let written = if label.starts_with("o_") { &lookup } else { &src };
+        if deferred && fresh.contains(written.as_str()) {
+            let flushed = v112_hv_flush(&imv, written);
+            if flushed.contains("RAISED") || flushed.contains("ERROR") {
                 steps.push((label.to_string(), flushed));
                 break;
             }
@@ -514,6 +538,31 @@ v112_hv_subquery_cells! {
     v112_hv_sub_count_def => V112_HV_SUB_COUNT, true;
     v112_hv_sub_min_max_def => V112_HV_SUB_MIN_MAX, true;
     v112_hv_sub_joined_def => V112_HV_SUB_JOINED, true;
+}
+
+const V112_HV_SUB_ALSO_IN_WHERE: &str = "SELECT g, SUM(v) AS s FROM {src} WHERE g IN (SELECT g FROM {o}) \
+             GROUP BY g HAVING SUM(v) > (SELECT MAX(k) FROM {o})";
+const V112_HV_SUB_JOINED_FILTERED: &str = "SELECT {src}.g, SUM({src}.v) AS sv FROM {src} JOIN {o} ON {o}.g = {src}.g \
+             WHERE {o}.k > 1 GROUP BY {src}.g \
+             HAVING SUM({src}.v) > (SELECT COUNT(*) FROM {o} WHERE k <= 1)";
+const V112_HV_SUB_OWN_DISJOINT_ROWS: &str = "SELECT g, COUNT(*) AS c FROM {src} WHERE v > 3 GROUP BY g \
+             HAVING COUNT(*) >= (SELECT COUNT(*) FROM {src} WHERE v <= 1)";
+const V112_HV_SUB_OWN_OTHER_COLUMN: &str = "SELECT g, COUNT(*) AS c FROM {src} GROUP BY g \
+             HAVING COUNT(*) > (SELECT COUNT(*) FROM {src} WHERE w > 0)";
+const V112_HV_SUB_OWN_MAX: &str = "SELECT g, MAX(v) AS m FROM {src} GROUP BY g \
+             HAVING MAX(v) >= (SELECT MAX(v) FROM {src})";
+
+v112_hv_subquery_cells! {
+    v112_hv_sub_also_in_where => V112_HV_SUB_ALSO_IN_WHERE, false;
+    v112_hv_sub_joined_filtered => V112_HV_SUB_JOINED_FILTERED, false;
+    v112_hv_sub_own_disjoint_rows => V112_HV_SUB_OWN_DISJOINT_ROWS, false;
+    v112_hv_sub_own_other_column => V112_HV_SUB_OWN_OTHER_COLUMN, false;
+    v112_hv_sub_own_max => V112_HV_SUB_OWN_MAX, false;
+    v112_hv_sub_also_in_where_def => V112_HV_SUB_ALSO_IN_WHERE, true;
+    v112_hv_sub_joined_filtered_def => V112_HV_SUB_JOINED_FILTERED, true;
+    v112_hv_sub_own_disjoint_rows_def => V112_HV_SUB_OWN_DISJOINT_ROWS, true;
+    v112_hv_sub_own_other_column_def => V112_HV_SUB_OWN_OTHER_COLUMN, true;
+    v112_hv_sub_own_max_def => V112_HV_SUB_OWN_MAX, true;
 }
 
 /// The report's exact sequence: the subquery value stays below both sums, so
