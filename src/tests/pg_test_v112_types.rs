@@ -414,6 +414,276 @@ v112_ty_cells! {
 }
 
 // ---------------------------------------------------------------------------
+// Intermediate column names
+// ---------------------------------------------------------------------------
+
+v112_ty_cells! {
+    V112_TY_NAMES_FIXTURE, false;
+    v112_types_names_sum_plus_minus_g => "SELECT g, SUM(v + 1) AS ra, SUM(v - 1) AS rb FROM {src} GROUP BY g",
+    v112_types_names_sum_plus_minus_u => "SELECT SUM(v + 1) AS ra, SUM(v - 1) AS rb FROM {src}",
+    v112_types_names_sum_times_over_g => "SELECT g, SUM(v * 2) AS ra, SUM(v / 2) AS rb, SUM(v % 2) AS rc FROM {src} GROUP BY g",
+    v112_types_names_avg_plus_minus_g => "SELECT g, AVG(v + 1) AS ra, AVG(v - 1) AS rb FROM {src} GROUP BY g",
+    v112_types_names_count_nullif_g => "SELECT g, COUNT(NULLIF(v, 1)) AS ra, COUNT(NULLIF(v, -1)) AS rb FROM {src} GROUP BY g",
+    v112_types_names_min_max_plus_minus_g => "SELECT g, MIN(v + 1) AS ra, MIN(v - 1) AS rb, MAX(v + 1) AS rc, MAX(v - 1) AS rd FROM {src} GROUP BY g",
+    v112_types_names_bool_or_comparisons_g => "SELECT g, BOOL_OR(v > 1) AS ra, BOOL_OR(v < 1) AS rb FROM {src} GROUP BY g",
+    v112_types_names_sum_filters_g => "SELECT g, SUM(v) FILTER (WHERE v > 1) AS ra, SUM(v) FILTER (WHERE v < 1) AS rb FROM {src} GROUP BY g",
+    v112_types_names_count_filters_g => "SELECT g, COUNT(*) FILTER (WHERE v > 1) AS ra, COUNT(*) FILTER (WHERE v < 1) AS rb FROM {src} GROUP BY g",
+    v112_types_names_quoted_column_g => "SELECT g, SUM(v) AS ra, SUM(\"V\") AS rb FROM {src} GROUP BY g",
+    v112_types_names_quoted_column_first_g => "SELECT g, MAX(\"V\") AS ra, MAX(v) AS rb FROM {src} GROUP BY g",
+    v112_types_names_count_star_then_column_g => "SELECT g, COUNT(*) AS ra, COUNT(star) AS rb FROM {src} GROUP BY g",
+    v112_types_names_count_column_then_star_g => "SELECT g, COUNT(star) AS ra, COUNT(*) AS rb FROM {src} GROUP BY g",
+    v112_types_names_topk_companion_g => "SELECT g, MIN(v) AS ra, MIN(v_topk) AS rb FROM {src} GROUP BY g",
+    v112_types_names_topk_companion_first_g => "SELECT g, MAX(v_topk) AS ra, MAX(v) AS rb FROM {src} GROUP BY g",
+    v112_types_names_nested_plus_minus_g => "SELECT g, SUM(v + 1) / 2 AS ra, SUM(v - 1) / 2 AS rb FROM {src} GROUP BY g",
+    v112_types_names_top_then_nested_g => "SELECT g, SUM(v + 1) AS ra, COALESCE(SUM(v - 1), 0) AS rb FROM {src} GROUP BY g",
+    v112_types_names_having_g => "SELECT g, SUM(v - 1) AS ra FROM {src} GROUP BY g HAVING SUM(v + 1) > 4",
+    v112_types_names_shared_sum_avg_g => "SELECT g, SUM(v + 1) AS ra, AVG(v + 1) AS rb, AVG(v - 1) AS rc, SUM(v - 1) AS rd FROM {src} GROUP BY g",
+    v112_types_names_long_plus_minus_g => "SELECT g, \
+        SUM(COALESCE(v, 0) + COALESCE(star, 0) + COALESCE(v_topk, 0) + 1) AS ra, \
+        SUM(COALESCE(v, 0) + COALESCE(star, 0) + COALESCE(v_topk, 0) - 1) AS rb FROM {src} GROUP BY g",
+    v112_types_names_long_bool_or_g => "SELECT g, \
+        BOOL_OR(COALESCE(v, 0) + COALESCE(star, 0) + COALESCE(v_topk, 0) > 1) AS ra, \
+        BOOL_OR(COALESCE(v, 0) + COALESCE(star, 0) + COALESCE(v_topk, 0) < 1) AS rb FROM {src} GROUP BY g",
+    v112_types_names_long_min_max_g => "SELECT g, \
+        MIN(COALESCE(v, 0) + COALESCE(star, 0) + COALESCE(v_topk, 0) + 1) AS ra, \
+        MAX(COALESCE(v, 0) + COALESCE(star, 0) + COALESCE(v_topk, 0) - 1) AS rb FROM {src} GROUP BY g",
+    v112_types_names_multiplier_counter_g => "SELECT g, SUM(v) AS ra, SUM(\"V\") AS rb, SUM(\"V\" * COALESCE(star, 1)) AS rc FROM {src} GROUP BY g",
+    v112_types_names_multibyte_g => "SELECT g, SUM(\"aééééééééééééééééééééééééé\") AS ra, \
+        MAX(\"aééééééééééééééééééééééééé\") AS rb FROM {src} GROUP BY g",
+}
+
+v112_ty_cells! {
+    V112_TY_NAMES_FIXTURE, true;
+    v112_types_names_sum_plus_minus_g_deferred => "SELECT g, SUM(v + 1) AS ra, SUM(v - 1) AS rb FROM {src} GROUP BY g",
+    v112_types_names_min_max_plus_minus_g_deferred => "SELECT g, MIN(v + 1) AS ra, MIN(v - 1) AS rb, MAX(v + 1) AS rc, MAX(v - 1) AS rd FROM {src} GROUP BY g",
+    v112_types_names_long_bool_or_g_deferred => "SELECT g, \
+        BOOL_OR(COALESCE(v, 0) + COALESCE(star, 0) + COALESCE(v_topk, 0) > 1) AS ra, \
+        BOOL_OR(COALESCE(v, 0) + COALESCE(star, 0) + COALESCE(v_topk, 0) < 1) AS rb FROM {src} GROUP BY g",
+}
+
+// The same collisions with one of the aggregates, or both, in HAVING
+v112_ty_cells! {
+    V112_TY_NAMES_FIXTURE, false;
+    v112_types_names_having_max_negated_g => "SELECT g, MAX(v) AS ra FROM {src} GROUP BY g HAVING MAX(-v) > -3",
+    v112_types_names_having_max_negated_u => "SELECT MAX(v) AS ra FROM {src} HAVING MAX(-v) > 0",
+    v112_types_names_having_min_negated_g => "SELECT g, MIN(v) AS ra FROM {src} GROUP BY g HAVING MIN(-v) < -2",
+    v112_types_names_having_sum_negated_g => "SELECT g, SUM(v) AS ra FROM {src} GROUP BY g HAVING SUM(-v) < -3",
+    v112_types_names_having_sum_plus_minus_g => "SELECT g, SUM(v - 1) AS ra FROM {src} GROUP BY g HAVING SUM(v + 1) > 6",
+    v112_types_names_having_avg_negated_g => "SELECT g, AVG(v) AS ra FROM {src} GROUP BY g HAVING AVG(-v) < -2",
+    v112_types_names_having_count_nullif_g => "SELECT g, COUNT(NULLIF(v, 1)) AS ra FROM {src} GROUP BY g HAVING COUNT(NULLIF(v, -1)) > 2",
+    v112_types_names_having_bool_or_g => "SELECT g, BOOL_OR(v > 1) AS ra FROM {src} GROUP BY g HAVING BOOL_OR(v < 1)",
+    v112_types_names_having_sum_filter_g => "SELECT g, SUM(v) FILTER (WHERE v > 1) AS ra FROM {src} GROUP BY g HAVING COALESCE(SUM(v) FILTER (WHERE v < 1), 0) < 0",
+    v112_types_names_having_max_filter_g => "SELECT g, MAX(v) FILTER (WHERE v > 1) AS ra FROM {src} GROUP BY g HAVING COALESCE(MAX(v) FILTER (WHERE v < 1), 5) < 5",
+    v112_types_names_having_count_filter_g => "SELECT g, COUNT(*) FILTER (WHERE v > 1) AS ra FROM {src} GROUP BY g HAVING COUNT(*) FILTER (WHERE v < 1) > 0",
+    v112_types_names_having_quoted_max_g => "SELECT g, MAX(v) AS ra FROM {src} GROUP BY g HAVING MAX(\"V\") > 100",
+    v112_types_names_having_quoted_sum_g => "SELECT g, SUM(\"V\") AS ra FROM {src} GROUP BY g HAVING SUM(v) > 3",
+    v112_types_names_having_count_star_column_g => "SELECT g, COUNT(star) AS ra FROM {src} GROUP BY g HAVING COUNT(*) > 1",
+    v112_types_names_having_nested_select_g => "SELECT g, COALESCE(MAX(v), 0) + 1 AS ra FROM {src} GROUP BY g HAVING MAX(-v) > -3",
+    v112_types_names_having_only_sum_g => "SELECT g, COUNT(*) AS ra FROM {src} GROUP BY g HAVING SUM(v + 1) > SUM(v - 1) + 4",
+    v112_types_names_having_only_max_g => "SELECT g, COUNT(*) AS ra FROM {src} GROUP BY g HAVING MAX(-v) > -6 AND MAX(v) > 2",
+    v112_types_names_having_only_min_g => "SELECT g, COUNT(*) AS ra FROM {src} GROUP BY g HAVING MIN(v + 1) > 1 OR MIN(v - 1) < -1",
+    v112_types_names_having_only_avg_g => "SELECT g, COUNT(*) AS ra FROM {src} GROUP BY g HAVING AVG(v + 1) > 3 AND AVG(v - 1) < 12",
+    v112_types_names_having_only_count_g => "SELECT g, COUNT(*) AS ra FROM {src} GROUP BY g HAVING COUNT(NULLIF(v, 1)) > COUNT(NULLIF(v, -1)) - 1",
+    v112_types_names_having_only_bool_or_g => "SELECT g, COUNT(*) AS ra FROM {src} GROUP BY g HAVING BOOL_OR(v > 1) AND NOT BOOL_OR(v < 1)",
+    v112_types_names_having_only_filter_g => "SELECT g, COUNT(*) AS ra FROM {src} GROUP BY g HAVING COALESCE(SUM(v) FILTER (WHERE v > 1), 0) > COALESCE(SUM(v) FILTER (WHERE v < 1), 0) + 5",
+    v112_types_names_having_only_quoted_g => "SELECT g, COUNT(*) AS ra FROM {src} GROUP BY g HAVING MAX(v) < 20 AND MAX(\"V\") > 100",
+    v112_types_names_distinct_keys_g => "SELECT g, COUNT(DISTINCT v) AS ra FROM {src} GROUP BY g HAVING COUNT(DISTINCT v) > 1",
+    v112_types_names_distinct_quoted_keys_g => "SELECT g, COUNT(DISTINCT \"V\") AS ra FROM {src} GROUP BY g HAVING COUNT(DISTINCT \"V\") > 0",
+}
+
+v112_ty_cells! {
+    V112_TY_NAMES_FIXTURE, true;
+    v112_types_names_having_max_negated_g_deferred => "SELECT g, MAX(v) AS ra FROM {src} GROUP BY g HAVING MAX(-v) > -3",
+    v112_types_names_having_sum_plus_minus_g_deferred => "SELECT g, SUM(v - 1) AS ra FROM {src} GROUP BY g HAVING SUM(v + 1) > 6",
+    v112_types_names_having_only_bool_or_g_deferred => "SELECT g, COUNT(*) AS ra FROM {src} GROUP BY g HAVING BOOL_OR(v > 1) AND NOT BOOL_OR(v < 1)",
+}
+
+/// A `COUNT(DISTINCT ...)` in HAVING over another argument than the selected
+/// one has no column to share a name on: the create is refused.
+#[pg_test]
+fn v112_types_names_having_distinct_of_another_argument_is_rejected() {
+    for (tag, select) in [
+        ("hd_neg", "SELECT g, COUNT(DISTINCT v) AS ra FROM {src} GROUP BY g HAVING COUNT(DISTINCT -v) > 1"),
+        ("hd_quoted", "SELECT g, COUNT(DISTINCT v) AS ra FROM {src} GROUP BY g HAVING COUNT(DISTINCT \"V\") > 1"),
+    ] {
+        let outcome = v112_ty_cell_on(&V112_TY_NAMES_FIXTURE, tag, select, false);
+        assert!(outcome.starts_with("REJECTED "), "{select}: {outcome}");
+        assert_eq!(v112_ty_leftovers(&format!("v112_ty_{tag}")), "none", "{select}");
+    }
+}
+
+/// Two sources joined on `g`, each with its own `v`: runs `select` through
+/// writes to both and compares the IMV with the query after each.
+fn v112_ty_join_cell(tag: &str, select_template: &str, deferred: bool) -> String {
+    let left = format!("v112_ty_{tag}_l");
+    let right = format!("v112_ty_{tag}_r");
+    let imv = format!("v112_ty_{tag}");
+    for source in [&left, &right] {
+        Spi::run(&format!(
+            "CREATE TABLE {source}(id SERIAL PRIMARY KEY, g TEXT, v INT)"
+        ))
+        .expect("create source");
+    }
+    Spi::run(&format!(
+        "INSERT INTO {left}(g, v) VALUES ('a',1),('a',9),('b',5),('c',NULL),('d',2)"
+    ))
+    .expect("seed left");
+    Spi::run(&format!(
+        "INSERT INTO {right}(g, v) VALUES ('a',4),('b',-7),('b',30),('c',3),('e',8)"
+    ))
+    .expect("seed right");
+    let fresh = select_template
+        .replace("{left}", &left)
+        .replace("{right}", &right);
+    let mode = if deferred { "DEFERRED" } else { "IMMEDIATE" };
+    let created = v112_ty_try(&format!(
+        "SELECT create_reflex_ivm('{imv}', $v112sel${fresh}$v112sel$, NULL, 'UNLOGGED', '{mode}')"
+    ));
+    if created != "CREATE REFLEX INCREMENTAL VIEW" {
+        return format!("NOT-CREATED {created}");
+    }
+    let steps = [
+        ("ins_right", format!("INSERT INTO {right}(g, v) VALUES ('a',40),('d',-1),('c',NULL)")),
+        ("ins_left", format!("INSERT INTO {left}(g, v) VALUES ('e',6),('b',50)")),
+        ("upd_right", format!("UPDATE {right} SET v = v - 20 WHERE g IN ('a', 'b')")),
+        ("upd_left", format!("UPDATE {left} SET v = v + 20 WHERE g IN ('a', 'd')")),
+        ("move_right", format!("UPDATE {right} SET g = 'd' WHERE g = 'e'")),
+        ("del_left", format!("DELETE FROM {left} WHERE v IN (29, 50)")),
+        ("del_right", format!("DELETE FROM {right} WHERE g = 'b'")),
+        ("empty_left", format!("DELETE FROM {left}")),
+        ("refill_left", format!("INSERT INTO {left}(g, v) VALUES ('a',3),('d',7)")),
+    ];
+    let mut outcomes = vec![format!("create={}", v112_ty_oracle(&imv, &fresh))];
+    for (label, dml) in steps {
+        let ran = v112_ty_try_dml(&dml);
+        if ran != "OK" {
+            outcomes.push(format!("{label}={ran}"));
+            break;
+        }
+        if deferred {
+            for source in [&left, &right] {
+                v112_ty_try(&format!("SELECT reflex_flush_deferred('{source}')"));
+            }
+        }
+        outcomes.push(format!("{label}={}", v112_ty_oracle(&imv, &fresh)));
+    }
+    if outcomes.iter().all(|o| o.ends_with("=0")) {
+        "ok".to_string()
+    } else {
+        outcomes.join(" ")
+    }
+}
+
+macro_rules! v112_ty_join_cells {
+    ($deferred:expr; $($name:ident => $select:expr,)+) => {
+        $(
+            #[pg_test]
+            fn $name() {
+                let tag = stringify!($name).trim_start_matches("v112_types_names_");
+                assert_eq!(v112_ty_join_cell(tag, $select, $deferred), "ok", "{}", $select);
+            }
+        )+
+    };
+}
+
+v112_ty_join_cells! {
+    false;
+    v112_types_names_join_having_max => "SELECT a.g, MAX(a.v) AS ra FROM {left} a JOIN {right} b ON b.g = a.g GROUP BY a.g HAVING MAX(b.v) > 2",
+    v112_types_names_join_having_sum => "SELECT a.g, SUM(a.v) AS ra FROM {left} a JOIN {right} b ON b.g = a.g GROUP BY a.g HAVING SUM(b.v) > 2",
+    v112_types_names_join_select_both => "SELECT a.g, SUM(a.v) AS ra, SUM(b.v) AS rb, MIN(a.v) AS rc, MIN(b.v) AS rd FROM {left} a JOIN {right} b ON b.g = a.g GROUP BY a.g",
+    v112_types_names_join_having_only => "SELECT a.g, COUNT(*) AS ra FROM {left} a JOIN {right} b ON b.g = a.g GROUP BY a.g HAVING MAX(a.v) > 1 AND MAX(b.v) < 35",
+    v112_types_names_join_having_negated => "SELECT a.g, MAX(a.v) AS ra FROM {left} a JOIN {right} b ON b.g = a.g GROUP BY a.g HAVING MAX(-a.v) > -4",
+}
+
+v112_ty_join_cells! {
+    true;
+    v112_types_names_join_having_max_deferred => "SELECT a.g, MAX(a.v) AS ra FROM {left} a JOIN {right} b ON b.g = a.g GROUP BY a.g HAVING MAX(b.v) > 2",
+}
+
+/// `v` is NOT NULL and `"V"` is not: the counter that tells an all-NULL `"V"`
+/// group from a zero sum must survive the elision of the counter of `v`.
+const V112_TY_NOT_NULL_NAMES_FIXTURE: V112TyFixture = V112TyFixture {
+    columns: "g TEXT NOT NULL, v INT NOT NULL, \"V\" INT",
+    insert_columns: "g, v, \"V\"",
+    seed: "('a',1,100),('a',2,NULL),('b',5,NULL),('b',6,NULL),('c',0,-7)",
+    steps: &[
+        ("ins", "INSERT INTO {src}(g, v, \"V\") VALUES ('a',7,700),('d',3,NULL),('b',-1,NULL)"),
+        ("upd", "UPDATE {src} SET v = v + 10, \"V\" = \"V\" - 3 WHERE g IN ('a', 'b')"),
+        ("null", "UPDATE {src} SET \"V\" = NULL WHERE g = 'c'"),
+        ("del", "DELETE FROM {src} WHERE g = 'd' OR (g = 'a' AND v = 11)"),
+        ("empty", "DELETE FROM {src}"),
+        ("refill", "INSERT INTO {src}(g, v, \"V\") VALUES ('a',4,NULL),('a',9,NULL),('e',1,1)"),
+    ],
+};
+
+v112_ty_cells! {
+    V112_TY_NOT_NULL_NAMES_FIXTURE, false;
+    v112_types_names_not_null_counter_g => "SELECT g, SUM(\"V\") AS ra, SUM(v) AS rb FROM {src} GROUP BY g",
+    v112_types_names_not_null_counter_u => "SELECT SUM(\"V\") AS ra, SUM(v) AS rb FROM {src}",
+    v112_types_names_not_null_counter_reversed_g => "SELECT g, SUM(v) AS ra, SUM(\"V\") AS rb FROM {src} GROUP BY g",
+}
+
+/// Every intermediate column of the plan has its own name, the name PostgreSQL
+/// stores (no truncation), over arguments that all sanitise alike.
+#[pg_test]
+fn v112_types_names_are_distinct_and_within_the_identifier_limit() {
+    let select = "SELECT g, \
+        SUM(COALESCE(v, 0) + COALESCE(star, 0) + COALESCE(v_topk, 0) + 1) AS ra, \
+        SUM(COALESCE(v, 0) + COALESCE(star, 0) + COALESCE(v_topk, 0) - 1) AS rb, \
+        BOOL_OR(COALESCE(v, 0) + COALESCE(star, 0) + COALESCE(v_topk, 0) > 1) AS rc, \
+        BOOL_OR(COALESCE(v, 0) + COALESCE(star, 0) + COALESCE(v_topk, 0) < 1) AS rd, \
+        MIN(COALESCE(v, 0) + COALESCE(star, 0) + COALESCE(v_topk, 0) + 1) AS re, \
+        MIN(COALESCE(v, 0) + COALESCE(star, 0) + COALESCE(v_topk, 0) - 1) AS rf, \
+        SUM(v + 1) AS rh, SUM(v - 1) AS ri, SUM(v * 1) AS rj, COUNT(*) AS rk, COUNT(star) AS rl, \
+        MIN(v) AS rm, MIN(v_topk) AS rn \
+        FROM {src} GROUP BY g";
+    assert_eq!(
+        v112_ty_cell_on(&V112_TY_NAMES_FIXTURE, "names_limit", select, false),
+        "ok"
+    );
+    let planned = "SELECT c->>'name' AS name, c->>'source_aggregate' AS agg, c->>'source_arg' AS arg, \
+                          (c->>'topk_k') IS NOT NULL AS has_topk \
+                   FROM public.__reflex_ivm_reference r, \
+                        jsonb_array_elements(r.aggregations->'intermediate_columns') c \
+                   WHERE r.name = 'v112_ty_names_limit'";
+    let names = format!(
+        "SELECT name FROM ({planned}) p UNION ALL SELECT name || '_topk' FROM ({planned}) p WHERE has_topk"
+    );
+    assert_eq!(
+        v112_ty_try(&format!(
+            "SELECT (COUNT(*) - COUNT(DISTINCT name))::text FROM ({names}) n"
+        )),
+        "0",
+        "two intermediate columns share a name"
+    );
+    assert_eq!(
+        v112_ty_try(&format!(
+            "SELECT COUNT(*)::text FROM ({names}) n WHERE octet_length(name) > 63"
+        )),
+        "0",
+        "an intermediate column name exceeds 63 bytes"
+    );
+    assert_eq!(
+        v112_ty_try(&format!(
+            "SELECT (COUNT(DISTINCT (agg, arg)) FILTER (WHERE name LIKE '\\_\\_sum\\_%'))::text \
+             FROM ({planned}) p"
+        )),
+        "5",
+        "each distinct SUM argument keeps its own column"
+    );
+    assert_eq!(
+        v112_ty_try(&format!(
+            "SELECT COUNT(*)::text FROM ({names}) n WHERE NOT EXISTS (\
+                SELECT 1 FROM pg_attribute a \
+                WHERE a.attrelid = '__reflex_intermediate_v112_ty_names_limit'::regclass \
+                  AND a.attname = n.name)"
+        )),
+        "0",
+        "a planned column is not stored under its planned name"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Ungrouped BOOL_OR over a NOT NULL argument
 // ---------------------------------------------------------------------------
 
