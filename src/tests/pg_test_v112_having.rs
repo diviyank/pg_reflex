@@ -712,3 +712,49 @@ v112_hv_cells! {
     v112_hv_nn_cast_sum_division => "SELECT g, COUNT(*) AS c FROM {src} GROUP BY g HAVING CAST(SUM(v) / 2 AS numeric) > 2.4",
     v112_hv_nn_cast_selected_sum_division => "SELECT g, CAST(SUM(v) / 2 AS numeric) AS h FROM {src} GROUP BY g",
 }
+
+// The only aggregate HAVING holds is the selected COUNT(DISTINCT), under an
+// expression the end query evaluates as written
+v112_hv_cells! {
+    V112_HV_NULLABLE, false, None;
+    v112_hv_count_distinct_between => "SELECT g, COUNT(DISTINCT v) AS d FROM {src} GROUP BY g HAVING COUNT(DISTINCT v) BETWEEN 2 AND 3",
+    v112_hv_count_distinct_in_list => "SELECT g, COUNT(DISTINCT v) AS d FROM {src} GROUP BY g HAVING COUNT(DISTINCT v) IN (1, 3) AND g <> 'b'",
+}
+
+/// The regrouped end query holds one row per distinct value, so any other
+/// aggregate it evaluated would see the distinct values instead of the rows:
+/// group `d` holds the value 4 three times.
+#[pg_test]
+fn v112_hv_count_distinct_with_other_aggregate_under_any_expression_is_rejected() {
+    let src = v112_hv_source("cd_hidden");
+    let hidden_aggregates = [
+        "SUM(v) BETWEEN 3 AND 13",
+        "COUNT(*) IN (3, 4, 5)",
+        "(COUNT(v) > 2) IS TRUE",
+        "COUNT(DISTINCT v) > 1 AND COUNT(*) BETWEEN 3 AND 9",
+        "SUM(v) > 5 IS TRUE",
+        "SUM(v)::text LIKE '1%'",
+        "COUNT(v) = ANY (ARRAY[3, 4, 5])",
+        "SUM(v) IS NOT NULL",
+        "MAX(v) IS NOT DISTINCT FROM 4",
+        "AVG(v) NOT BETWEEN 1 AND 2",
+        "COUNT(*) > ALL (ARRAY[1, 2])",
+        "pg_catalog.count(*) > 2",
+        "pg_catalog.sum(v) BETWEEN 3 AND 13",
+        "\"count\"(*) > 2",
+    ];
+    for (position, having) in hidden_aggregates.iter().enumerate() {
+        let imv = format!("v112_hv_cd_hidden_{position}");
+        let outcome = v112_hv_create(
+            &imv,
+            &format!("SELECT g, COUNT(DISTINCT v) AS d FROM {src} GROUP BY g HAVING {having}"),
+        );
+        assert!(
+            outcome.starts_with(
+                "ERROR: [reflex-unsupported] COUNT(DISTINCT col) cannot be mixed with other aggregates"
+            ) && outcome.contains("CTE"),
+            "{having}: {outcome}"
+        );
+        v112_hv_assert_nothing_created(&imv);
+    }
+}

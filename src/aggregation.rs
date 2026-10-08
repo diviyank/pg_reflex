@@ -1,7 +1,8 @@
 use serde::{Deserialize, Serialize};
-use sqlparser::ast::{Expr, FunctionArg, FunctionArgExpr, FunctionArguments};
+use sqlparser::ast::{Expr, FunctionArg, FunctionArgExpr, FunctionArguments, Visit, Visitor};
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
+use std::ops::ControlFlow;
 
 use crate::sql_analyzer::{resolve_aggregate_call, AggregateCall, AggregateKind, SqlAnalysis};
 use crate::sql_writer::keyword_scan::quoted_identifier_spans;
@@ -665,35 +666,95 @@ pub(crate) fn having_predicate(
     Some((predicate, new_columns))
 }
 
-/// Whether the HAVING clause needs an aggregate the regrouped end query of a
-/// `COUNT(DISTINCT ...)` cannot evaluate: any aggregate other than a
-/// `COUNT(DISTINCT ...)` beside one in the SELECT list, or a `COUNT(DISTINCT ...)`
-/// the SELECT list does not hold.
-pub(crate) fn having_mixes_count_distinct(analysis: &SqlAnalysis) -> bool {
-    let Some(having) = analysis.having_clause.as_deref().and_then(parse_expression) else {
-        return false;
-    };
+/// Why the regrouped end query of a `COUNT(DISTINCT ...)` cannot evaluate the
+/// HAVING clause. It holds one row per distinct value, so it can count the
+/// distinct values it is keyed on and nothing else.
+pub(crate) enum CountDistinctHavingConflict {
+    /// HAVING holds another aggregate, or does not parse, beside a
+    /// `COUNT(DISTINCT ...)` of the SELECT list.
+    OtherAggregate,
+    /// HAVING holds a `COUNT(DISTINCT ...)` which the SELECT list does not hold
+    /// with the same argument and FILTER.
+    UnselectedCountDistinct,
+}
+
+pub(crate) fn count_distinct_having_conflict(
+    analysis: &SqlAnalysis,
+) -> Option<CountDistinctHavingConflict> {
+    let having = analysis.having_clause.as_deref()?;
     let selected_distinct_args: Vec<&str> = analysis
         .select_columns
         .iter()
         .filter(|c| matches!(c.aggregate, Some(AggregateKind::CountDistinct)))
         .filter_map(|c| c.aggregate_arg.as_deref())
         .collect();
+    let selects_count_distinct = !selected_distinct_args.is_empty();
+    let Some(having) = parse_expression(having) else {
+        return selects_count_distinct.then_some(CountDistinctHavingConflict::OtherAggregate);
+    };
+
     let mut holds_other_aggregate = false;
     let mut holds_unselected_distinct = false;
-    replace_aggregate_calls(&having, &mut |_, call| {
-        if matches!(call.kind, AggregateKind::CountDistinct) {
-            let selected = call
-                .arg
-                .as_deref()
-                .is_some_and(|arg| selected_distinct_args.contains(&arg));
-            holds_unselected_distinct |= !selected;
-        } else {
-            holds_other_aggregate = true;
+    for function in &aggregate_spelled_calls(&having) {
+        match resolve_aggregate_call(function) {
+            Some(call) if matches!(call.kind, AggregateKind::CountDistinct) => {
+                let selected = call
+                    .arg
+                    .as_deref()
+                    .is_some_and(|arg| selected_distinct_args.contains(&arg));
+                holds_unselected_distinct |= !selected;
+            }
+            _ => holds_other_aggregate = true,
         }
-        String::new()
-    });
-    holds_unselected_distinct || (holds_other_aggregate && !selected_distinct_args.is_empty())
+    }
+    if holds_other_aggregate && selects_count_distinct {
+        return Some(CountDistinctHavingConflict::OtherAggregate);
+    }
+    holds_unselected_distinct.then_some(CountDistinctHavingConflict::UnselectedCountDistinct)
+}
+
+const DECOMPOSED_AGGREGATE_NAMES: [&str; 6] = ["sum", "count", "avg", "min", "max", "bool_or"];
+
+/// Every call in `expr`, outside its subqueries, that is not a window call and
+/// whose name is that of an aggregate pg_reflex decomposes, whatever expression
+/// it sits under and however the name is qualified or quoted.
+fn aggregate_spelled_calls(expr: &Expr) -> Vec<sqlparser::ast::Function> {
+    struct Collector {
+        subquery_depth: usize,
+        calls: Vec<sqlparser::ast::Function>,
+    }
+    impl Visitor for Collector {
+        type Break = ();
+
+        fn pre_visit_query(&mut self, _: &sqlparser::ast::Query) -> ControlFlow<()> {
+            self.subquery_depth += 1;
+            ControlFlow::Continue(())
+        }
+
+        fn post_visit_query(&mut self, _: &sqlparser::ast::Query) -> ControlFlow<()> {
+            self.subquery_depth -= 1;
+            ControlFlow::Continue(())
+        }
+
+        fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<()> {
+            if let Expr::Function(function) = expr {
+                let name = crate::sql_analyzer::bare_function_name(&function.name);
+                if self.subquery_depth == 0
+                    && function.over.is_none()
+                    && DECOMPOSED_AGGREGATE_NAMES.contains(&name.as_str())
+                {
+                    self.calls.push(function.clone());
+                }
+            }
+            ControlFlow::Continue(())
+        }
+    }
+    let mut collector = Collector {
+        subquery_depth: 0,
+        calls: Vec::new(),
+    };
+    let _ = expr.visit(&mut collector);
+    collector.calls
 }
 
 /// `expr` with every aggregate call replaced by the expression that reads it
