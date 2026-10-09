@@ -1644,3 +1644,31 @@ fn null_rejection_accepts_the_name_of_an_unaliased_table_and_no_unqualified_colu
     assert_eq!(filter_of("v > 0 AND abs(fact.v) < 9"), "");
     assert_eq!(filter_of("d.kind > '' AND abs(fact.v) < 9"), "");
 }
+
+#[test]
+fn comment_inside_a_join_keyword_does_not_change_the_null_rejection_decision() {
+    let filter_of = |from: &str, condition: &str| {
+        let a = parse_and_analyze(&format!(
+            "SELECT d.kind, COUNT(*) FROM {from} WHERE {condition} GROUP BY d.kind"
+        ));
+        relevant_where(&a, "fact")
+    };
+    for from in [
+        "dim d LEFT /* c */ JOIN fact f ON d.kind = f.kind",
+        "dim d LEFT -- c\n OUTER /* c */ JOIN fact f ON d.kind = f.kind",
+        "fact f RIGHT /* c */ JOIN dim d ON d.kind = f.kind",
+        "dim d FULL /* c */ OUTER /* c */ JOIN fact f ON d.kind = f.kind",
+        "dim d LEFT /* INNER JOIN */ JOIN fact f ON d.kind = f.kind",
+    ] {
+        assert_eq!(filter_of(from, "f.v > 0 OR f.v IS NULL"), "", "{from}");
+        assert!(
+            filter_of(from, "f.v > 0 AND abs(f.v) < 9").contains("abs(v) < 9"),
+            "{from}"
+        );
+    }
+    let inner = "dim d INNER /* LEFT JOIN */ JOIN fact f ON d.kind = f.kind";
+    assert_eq!(
+        filter_of(inner, "f.v > 0 OR f.v IS NULL"),
+        "v > 0 OR v IS NULL"
+    );
+}
