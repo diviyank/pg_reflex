@@ -97,7 +97,9 @@ fn unread_cte_sub_imv_of(root: &str) -> Option<String> {
                         && sources
                             .iter()
                             .filter(|source| !source.starts_with('<'))
-                            .any(|source| crate::query_decomposer::named_relation(source) == relation)
+                            .any(|source| {
+                                crate::query_decomposer::named_relation(source) == relation
+                            })
                 })
             })
             .map(|(name, _, _)| name.clone())

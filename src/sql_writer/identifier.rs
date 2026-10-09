@@ -258,13 +258,15 @@ pub fn strip_redundant_bare_alias(sql: &str, source_table: &str) -> String {
 /// constraint expression must be matched case-insensitively).
 ///
 /// A partition bound is data: string literals are copied through unchanged.
+#[cfg(test)]
 pub fn substitute_identifier_ci(expr: &str, ident: &str, replacement: &str) -> String {
     substitute_word_ci_outside(expr, ident, replacement, &string_literal_spans(expr))
 }
 
-/// [`substitute_identifier_ci`] for a column name: the type name of a cast
-/// (`'2024-01-01'::date`, `::timestamp with time zone`) is not a column, even
-/// when a column is called `date`, `text` or `zone`.
+/// Case-insensitive word-level substitution of a column name in a partition
+/// constraint. String literals are copied through unchanged, and so is the type
+/// name of a cast (`'2024-01-01'::date`, `::timestamp with time zone`): it is not
+/// a column, even when a column is called `date`, `text` or `zone`.
 pub fn substitute_column_ci(expr: &str, column: &str, replacement: &str) -> String {
     let literals = string_literal_spans(expr);
     let mut untouched = cast_type_spans(expr, &literals);

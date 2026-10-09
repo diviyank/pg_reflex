@@ -80,7 +80,11 @@ pub(crate) fn sync_partition_truncate_triggers(
         )?
         .filter_map(|row| {
             Some(TruncatedRelation {
-                qualified: row.get_by_name::<&str, _>("qualified").ok().flatten()?.to_string(),
+                qualified: row
+                    .get_by_name::<&str, _>("qualified")
+                    .ok()
+                    .flatten()?
+                    .to_string(),
                 announces: row.get_by_name::<bool, _>("announces").ok().flatten()?,
                 rebuilds: row.get_by_name::<bool, _>("rebuilds").ok().flatten()?,
             })
@@ -119,8 +123,14 @@ pub(crate) fn sync_partition_truncate_triggers(
         )?
         .filter_map(|row| {
             Some((
-                row.get_by_name::<&str, _>("qualified").ok().flatten()?.to_string(),
-                row.get_by_name::<&str, _>("trigger").ok().flatten()?.to_string(),
+                row.get_by_name::<&str, _>("qualified")
+                    .ok()
+                    .flatten()?
+                    .to_string(),
+                row.get_by_name::<&str, _>("trigger")
+                    .ok()
+                    .flatten()?
+                    .to_string(),
             ))
         })
         .collect();
@@ -153,8 +163,14 @@ pub(crate) fn drop_truncate_triggers(
         )?
         .filter_map(|row| {
             Some((
-                row.get_by_name::<&str, _>("qualified").ok().flatten()?.to_string(),
-                row.get_by_name::<&str, _>("trigger").ok().flatten()?.to_string(),
+                row.get_by_name::<&str, _>("qualified")
+                    .ok()
+                    .flatten()?
+                    .to_string(),
+                row.get_by_name::<&str, _>("trigger")
+                    .ok()
+                    .flatten()?
+                    .to_string(),
             ))
         })
         .collect();
