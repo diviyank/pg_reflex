@@ -68,13 +68,15 @@ fn v112_sh_check(failures: &mut Vec<String>, at: &str, imv: &str, fresh: &str) {
         Ok(mismatches) => failures.push(format!("{at}: {imv} {mismatches} mismatches")),
         Err(error) => failures.push(format!("{at}: {imv} oracle raised {error}")),
     }
-    if v112_sh_remote(&format!(
-        "SELECT COALESCE(bool_or(known_stale), FALSE) FROM public.__reflex_ivm_reference \
-         WHERE name = {}",
+    let stale_reason = v112_sh_remote(&format!(
+        "SELECT COALESCE(max(COALESCE(stale_reason, 'no reason recorded')) \
+                FILTER (WHERE known_stale), '') \
+         FROM public.__reflex_ivm_reference WHERE name = {}",
         sql_lit(imv)
-    )) == Ok("true".to_string())
-    {
-        failures.push(format!("{at}: {imv} left known_stale"));
+    ))
+    .unwrap_or_else(|error| error);
+    if !stale_reason.is_empty() {
+        failures.push(format!("{at}: {imv} left known_stale: {stale_reason}"));
     }
 }
 
@@ -367,7 +369,7 @@ const V112_SH_THREE_SETUP: &[&str] = &[
     "CREATE TABLE {p}fact2(fk TEXT PRIMARY KEY, v INT)",
     "INSERT INTO {p}fact VALUES ('a',1),('b',-2),('c',-3),('z',-4)",
     "INSERT INTO {p}fact2 VALUES ('a',1),('b',-2),('c',-3),('z',-4)",
-    "INSERT INTO {p}dim VALUES ('a','A'),('b','B'),('c','C'),('u','U'),('e','E')",
+    "INSERT INTO {p}dim VALUES ('a','B'),('b','A'),('c','C'),('u','U'),('e','E')",
     "INSERT INTO {p}other VALUES ('a',1),('b',2),('c',3),('z',4)",
 ];
 
@@ -462,7 +464,7 @@ const V112_SH_KEYWORD_STEPS: &[(&str, &str)] = &[
     ("upd", "UPDATE \"{p}\" SET v = v + 100 WHERE season = 'e'"),
     ("move", "UPDATE \"{p}\" SET season = 'y' WHERE season = 'n'"),
     ("del", "DELETE FROM \"{p}\" WHERE v = 2"),
-    ("drop the first IMV", "SELECT drop_reflex_ivm('{p}_a')"),
+    ("drop the first IMV", "DO $$ BEGIN PERFORM drop_reflex_ivm('{p}_a'); END $$"),
     ("ins after the drop", "INSERT INTO \"{p}\"(season, v) VALUES ('e',1),('k',4)"),
     ("upd after the drop", "UPDATE \"{p}\" SET v = -v WHERE season = 'y'"),
     ("empty", "DELETE FROM \"{p}\""),
@@ -533,3 +535,54 @@ const V112_SH_CD_STEPS: &[(&str, &str)] = &[
     ("empty", "DELETE FROM {p}s"),
     ("refill", "INSERT INTO {p}s(g, v, n) VALUES (NULL,4,4),('a',5,5),(NULL,5,4)"),
 ];
+
+/// The rewrite printed for two COUNT(DISTINCT) returns the rows of the refused
+/// query, the group whose key is NULL included.
+#[pg_test]
+fn v112_sh_two_count_distinct_remedy_keeps_the_null_group() {
+    const REFUSED: &str =
+        "SELECT g, COUNT(DISTINCT v) AS dv, COUNT(DISTINCT n) AS dn FROM {p}s GROUP BY g";
+    probe_db_open("reflex_sh_cd");
+    let mut failures = Vec::new();
+    for mode in ["IMMEDIATE", "DEFERRED"] {
+        let prefix = format!("{}cd_", &mode[..1].to_lowercase());
+        worker_exec(&format!("CREATE TABLE {prefix}s(id SERIAL PRIMARY KEY, g TEXT, v INT, n INT)"));
+        worker_exec(&format!(
+            "INSERT INTO {prefix}s(g, v, n) VALUES ('a',1,1),('a',2,1),('b',5,6),(NULL,1,2),(NULL,1,3),('d',NULL,NULL)"
+        ));
+        let refused = v112_sh_fill(REFUSED, &prefix);
+        let imv = format!("{prefix}v");
+        let answer = v112_sh_create(&imv, &refused, None, mode);
+        if !answer.starts_with("ERROR: [reflex-unsupported] More than one COUNT(DISTINCT") {
+            failures.push(format!("{mode}: the two-count query answered {answer}"));
+            continue;
+        }
+        let printed = answer
+            .split("WITH a AS")
+            .nth(1)
+            .and_then(|rest| rest.split(". The same").next())
+            .map(|rest| format!("WITH a AS{rest}"))
+            .unwrap_or_default();
+        let remedy = printed
+            .replace("grp", "g")
+            .replace("COUNT(DISTINCT x) AS dx", "COUNT(DISTINCT v) AS dv")
+            .replace("COUNT(DISTINCT y) AS dy", "COUNT(DISTINCT n) AS dn")
+            .replace("a.dx", "a.dv")
+            .replace("b.dy", "b.dn")
+            .replace("FROM t ", &format!("FROM {prefix}s "));
+        let created = v112_sh_create(&imv, &remedy, None, mode);
+        if created != V112_SH_CREATED {
+            failures.push(format!("{mode}: remedy <{remedy}> not created: {created}"));
+            continue;
+        }
+        v112_sh_steps(
+            &mut failures,
+            mode,
+            &prefix,
+            V112_SH_CD_STEPS,
+            &[(imv, refused)],
+        );
+    }
+    probe_db_close("reflex_sh_cd");
+    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+}
