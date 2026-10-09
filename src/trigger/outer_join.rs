@@ -106,9 +106,12 @@ impl Visitor for LeftJoinedSubtreeFinder {
 }
 
 /// Whether the query can drop a joined row because of the row of
-/// `source_table` it holds: its WHERE, or the ON condition of a join that is
-/// not a LEFT JOIN, reads a column of the source. `source_table` is a table a
-/// top-level LEFT JOIN introduces.
+/// `source_table` it holds. `source_table` is a table a top-level LEFT JOIN
+/// introduces. A table LEFT JOINed on a column of the source carries, in each
+/// joined row, the row the source's row selects, so it depends on the source
+/// too, and so on down the chain. The joined row can be dropped when the
+/// WHERE, or the ON condition of a join that is not a LEFT JOIN, reads a column
+/// of the source or of a table depending on it.
 ///
 /// The query with the source swapped for a transition table then lists only
 /// the groups of the changed rows that pass, and misses the group a row leaves
@@ -131,37 +134,92 @@ pub(crate) fn left_joined_source_is_filtered(base_query: &str, source_table: &st
     let Some(source_join) = joins().find(introduces_source) else {
         return true;
     };
-    let qualifier = match &source_join.relation {
-        TableFactor::Table {
-            alias: Some(alias), ..
-        } => alias.name.value.to_lowercase(),
-        _ => source.clone(),
+    let Some(source_qualifier) = qualifier_of(&source_join.relation) else {
+        return true;
     };
-    let reads_source = |expr: &Expr| {
-        let mut finder = QualifiedColumnFinder {
-            qualifier: &qualifier,
-        };
-        expr.visit(&mut finder).is_break()
+    let other_joins = || joins().filter(|join| !std::ptr::eq(*join, source_join));
+    let is_left_join = |join: &Join| {
+        matches!(
+            join.join_operator,
+            JoinOperator::Left(_) | JoinOperator::LeftOuter(_)
+        )
     };
-    let filtering_join_reads_source = joins()
-        .filter(|join| !std::ptr::eq(*join, source_join))
-        .any(|join| match &join.join_operator {
-            JoinOperator::Left(_) | JoinOperator::LeftOuter(_) => false,
-            JoinOperator::Join(constraint) | JoinOperator::Inner(constraint) => match constraint {
-                JoinConstraint::On(condition) => reads_source(condition),
-                JoinConstraint::None => false,
-                _ => true,
-            },
-            JoinOperator::CrossJoin(_) => false,
-            _ => true,
-        });
-    filtering_join_reads_source || select.selection.as_ref().is_some_and(reads_source)
+
+    let mut depending_on_source = vec![source_qualifier];
+    loop {
+        let mut grew = false;
+        for join in other_joins().filter(|join| is_left_join(join)) {
+            if !join_condition_reads(join, &depending_on_source) {
+                continue;
+            }
+            let Some(qualifier) = qualifier_of(&join.relation) else {
+                return true;
+            };
+            if !depending_on_source.contains(&qualifier) {
+                depending_on_source.push(qualifier);
+                grew = true;
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+
+    let filtering_join_reads_source = other_joins()
+        .filter(|join| !is_left_join(join))
+        .any(|join| join_condition_reads(join, &depending_on_source));
+    filtering_join_reads_source
+        || select
+            .selection
+            .as_ref()
+            .is_some_and(|condition| reads_column_of(condition, &depending_on_source))
 }
 
-/// Breaks on a column reference that is unqualified or qualified by
-/// `qualifier`, subqueries included.
+/// The lower-cased name a relation's columns are qualified by: its alias, or
+/// the bare name of an unaliased table.
+fn qualifier_of(relation: &TableFactor) -> Option<String> {
+    match relation {
+        TableFactor::Table {
+            alias: Some(alias), ..
+        }
+        | TableFactor::Derived {
+            alias: Some(alias), ..
+        }
+        | TableFactor::NestedJoin {
+            alias: Some(alias), ..
+        } => Some(alias.name.value.to_lowercase()),
+        TableFactor::Table { name, .. } => Some(bare_lower(&name.to_string())),
+        _ => None,
+    }
+}
+
+/// Whether the condition of `join` reads a column under one of `qualifiers`.
+/// A cross join reads nothing; `USING`, `NATURAL` and any other join form
+/// count as reading.
+fn join_condition_reads(join: &Join, qualifiers: &[String]) -> bool {
+    match &join.join_operator {
+        JoinOperator::Join(constraint)
+        | JoinOperator::Inner(constraint)
+        | JoinOperator::Left(constraint)
+        | JoinOperator::LeftOuter(constraint) => match constraint {
+            JoinConstraint::On(condition) => reads_column_of(condition, qualifiers),
+            JoinConstraint::None => false,
+            _ => true,
+        },
+        JoinOperator::CrossJoin(_) => false,
+        _ => true,
+    }
+}
+
+fn reads_column_of(expr: &Expr, qualifiers: &[String]) -> bool {
+    let mut finder = QualifiedColumnFinder { qualifiers };
+    expr.visit(&mut finder).is_break()
+}
+
+/// Breaks on a column reference that is unqualified or qualified by one of
+/// `qualifiers`, subqueries included.
 struct QualifiedColumnFinder<'a> {
-    qualifier: &'a str,
+    qualifiers: &'a [String],
 }
 
 impl Visitor for QualifiedColumnFinder<'_> {
@@ -173,7 +231,7 @@ impl Visitor for QualifiedColumnFinder<'_> {
             Expr::CompoundIdentifier(ids)
                 if ids[..ids.len() - 1]
                     .iter()
-                    .any(|part| part.value.to_lowercase() == self.qualifier) =>
+                    .any(|part| self.qualifiers.contains(&part.value.to_lowercase())) =>
             {
                 ControlFlow::Break(())
             }

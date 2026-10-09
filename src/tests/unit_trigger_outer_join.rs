@@ -109,3 +109,32 @@ fn left_joined_source_no_condition_can_drop_is_not_filtered() {
         assert!(!left_joined_source_is_filtered(query, "f"), "{query}");
     }
 }
+
+#[test]
+fn filter_on_a_table_joined_through_the_left_joined_source_filters_it() {
+    for query in [
+        "SELECT d.l, COUNT(*) FROM d LEFT JOIN f ON d.k = f.k LEFT JOIN o ON o.k = f.k WHERE o.w IS NULL GROUP BY d.l",
+        "SELECT d.l, COUNT(*) FROM d LEFT JOIN f ON d.k = f.k LEFT JOIN o ON o.k = f.k WHERE o.w > 1 GROUP BY d.l",
+        "SELECT d.l, COUNT(*) FROM d LEFT JOIN f x ON d.k = x.k LEFT OUTER JOIN s.o AS y ON y.k = X.k WHERE COALESCE(Y.w, 0) < 2 GROUP BY d.l",
+        "SELECT d.l, COUNT(*) FROM d LEFT JOIN o ON o.k = f.k LEFT JOIN f ON d.k = f.k WHERE o.w IS NULL GROUP BY d.l",
+        "SELECT d.l, COUNT(*) FROM d LEFT JOIN f ON d.k = f.k LEFT JOIN o ON o.k = f.k LEFT JOIN x ON x.k = o.k WHERE x.z IS NULL GROUP BY d.l",
+        "SELECT d.l, COUNT(*) FROM d LEFT JOIN f ON d.k = f.k LEFT JOIN o ON o.k = f.k JOIN x ON x.k = o.k GROUP BY d.l",
+        "SELECT d.l, COUNT(*) FROM d LEFT JOIN f ON d.k = f.k LEFT JOIN o USING (k) WHERE o.w IS NULL GROUP BY d.l",
+        "SELECT d.l, COUNT(*) FROM d LEFT JOIN f ON d.k = f.k LEFT JOIN (SELECT k, w FROM o) y ON y.k = f.k WHERE y.w IS NULL GROUP BY d.l",
+        "SELECT d.l, COUNT(*) FROM d LEFT JOIN f ON d.k = f.k LEFT JOIN (SELECT k, w FROM o) ON k = f.k WHERE d.l = 'a' GROUP BY d.l",
+    ] {
+        assert!(left_joined_source_is_filtered(query, "f"), "{query}");
+    }
+}
+
+#[test]
+fn filter_on_a_table_not_joined_through_the_source_does_not_filter_it() {
+    for query in [
+        "SELECT d.l, COUNT(*) FROM d LEFT JOIN f ON d.k = f.k LEFT JOIN o ON o.k = d.k WHERE o.w IS NULL GROUP BY d.l",
+        "SELECT d.l, COUNT(*) FROM d LEFT JOIN f ON d.k = f.k LEFT JOIN o ON o.k = f.k LEFT JOIN x ON x.k = o.k GROUP BY d.l",
+        "SELECT d.l, COUNT(*) FROM d LEFT JOIN f ON d.k = f.k LEFT JOIN o ON o.k = f.k WHERE d.l <> 'q' GROUP BY d.l",
+        "SELECT d.l, COUNT(*) FROM d LEFT JOIN f ON d.k = f.k LEFT JOIN o ON o.k = d.k JOIN x ON x.k = o.k WHERE x.z > 0 GROUP BY d.l",
+    ] {
+        assert!(!left_joined_source_is_filtered(query, "f"), "{query}");
+    }
+}
