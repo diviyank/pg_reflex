@@ -399,6 +399,9 @@ pub struct SqlAnalysis {
     /// The name PostgreSQL gives each output column that has one by the query's text: an
     /// alias, or the column of a bare column reference. One entry per such select item.
     pub named_outputs: Vec<String>,
+    /// Those of `named_outputs` whose select item is a bare, optionally qualified or
+    /// parenthesised, reference to a column of that same name.
+    pub columns_output_under_their_own_name: Vec<String>,
     /// SELECT items PostgreSQL refuses as grouping keys (see
     /// `is_constant_refused_as_group_key`).
     pub constants_refused_as_group_key: Vec<String>,
@@ -879,6 +882,11 @@ fn record_output_name(analysis: &mut SqlAnalysis, expr: &Expr, alias: Option<&Id
     let column = referenced_column(expr).map(folded);
     let output = alias.map(folded).or_else(|| column.clone());
     if let Some(output) = output {
+        if column.as_ref() == Some(&output) {
+            analysis
+                .columns_output_under_their_own_name
+                .push(output.clone());
+        }
         analysis.named_outputs.push(output);
     }
 }

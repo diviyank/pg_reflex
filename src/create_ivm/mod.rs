@@ -299,7 +299,11 @@ fn resolve_unique_columns(ctx: &mut BuildContext) {
 
             if !pk_cols.is_empty() {
                 let pk_lower: Vec<String> = pk_cols.iter().map(|c| c.to_lowercase()).collect();
-                let all_in_select = pk_lower.iter().all(|c| select_bare_names.contains(c));
+                // The result table names its columns in lower case, so only a
+                // lower-case primary key column keeps its name there.
+                let all_in_select = pk_cols
+                    .iter()
+                    .all(|c| *c == c.to_lowercase() && select_bare_names.contains(c));
                 if all_in_select {
                     ctx.resolved_unique_columns = pk_lower;
                     ctx.plan.passthrough_columns = ctx.resolved_unique_columns.clone();
@@ -365,21 +369,16 @@ fn resolve_unique_columns(ctx: &mut BuildContext) {
     }
 }
 
-/// Lower-case names of the SELECT items that are a bare, optionally qualified, column
-/// reference output under the column's own name. Only such an item holds the value of
-/// the source column it is named after.
+/// Names of the SELECT items that are a bare, optionally qualified or parenthesised,
+/// column reference output under the column's own name. Only such an item holds the
+/// value of the source column it is named after.
 fn columns_projected_under_their_own_name(
     analysis: &crate::sql_analyzer::SqlAnalysis,
 ) -> std::collections::HashSet<String> {
     analysis
-        .select_columns
+        .columns_output_under_their_own_name
         .iter()
-        .filter(|c| crate::sql_analyzer::is_bare_column_reference(&c.expr_sql))
-        .filter_map(|c| {
-            let column = bare_column_name(&c.expr_sql).to_lowercase();
-            let output = bare_column_name(c.alias.as_deref().unwrap_or(&c.expr_sql)).to_lowercase();
-            (column == output).then_some(column)
-        })
+        .cloned()
         .collect()
 }
 
