@@ -259,11 +259,97 @@ pub fn strip_redundant_bare_alias(sql: &str, source_table: &str) -> String {
 ///
 /// A partition bound is data: string literals are copied through unchanged.
 pub fn substitute_identifier_ci(expr: &str, ident: &str, replacement: &str) -> String {
+    substitute_word_ci_outside(expr, ident, replacement, &string_literal_spans(expr))
+}
+
+/// [`substitute_identifier_ci`] for a column name: the type name of a cast
+/// (`'2024-01-01'::date`, `::timestamp with time zone`) is not a column, even
+/// when a column is called `date`, `text` or `zone`.
+pub fn substitute_column_ci(expr: &str, column: &str, replacement: &str) -> String {
+    let literals = string_literal_spans(expr);
+    let mut untouched = cast_type_spans(expr, &literals);
+    untouched.extend(literals);
+    untouched.sort_by_key(|span| span.start);
+    substitute_word_ci_outside(expr, column, replacement, &untouched)
+}
+
+/// Words that continue a type name after its first word.
+const TYPE_NAME_CONTINUATIONS: &[&str] = &[
+    " with time zone",
+    " without time zone",
+    " precision",
+    " varying",
+];
+
+/// The spans of `expr`, outside `literals`, that hold the type name of a `::` cast.
+fn cast_type_spans(expr: &str, literals: &[Range<usize>]) -> Vec<Range<usize>> {
+    let bytes = expr.as_bytes();
+    let mut in_literal = UntouchedSpans {
+        remaining: literals,
+    };
+    let mut spans = Vec::new();
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        if let Some(span_end) = in_literal.end_of_span_containing(i) {
+            i = span_end;
+            continue;
+        }
+        if &bytes[i..i + 2] != b"::" {
+            i += 1;
+            continue;
+        }
+        let type_start = i + 2;
+        let mut end = type_start;
+        while end < bytes.len() && bytes[end] == b' ' {
+            end += 1;
+        }
+        loop {
+            if end < bytes.len() && bytes[end] == b'"' {
+                end += 1;
+                while end < bytes.len() && bytes[end] != b'"' {
+                    end += 1;
+                }
+                end = (end + 1).min(bytes.len());
+            } else {
+                while end < bytes.len() && continues_identifier(bytes[end]) {
+                    end += 1;
+                }
+            }
+            if end < bytes.len() && bytes[end] == b'.' {
+                end += 1;
+            } else {
+                break;
+            }
+        }
+        if end < bytes.len() && bytes[end] == b'(' {
+            while end < bytes.len() && bytes[end] != b')' {
+                end += 1;
+            }
+            end = (end + 1).min(bytes.len());
+        }
+        let rest = expr[end..].to_lowercase();
+        if let Some(continuation) = TYPE_NAME_CONTINUATIONS
+            .iter()
+            .find(|continuation| rest.starts_with(**continuation))
+        {
+            end += continuation.len();
+        }
+        spans.push(type_start..end);
+        i = end.max(type_start);
+    }
+    spans
+}
+
+fn substitute_word_ci_outside(
+    expr: &str,
+    ident: &str,
+    replacement: &str,
+    untouched_spans: &[Range<usize>],
+) -> String {
     let bytes = expr.as_bytes();
     let lower_ident = ident.to_lowercase();
-    let literals = string_literal_spans(expr);
     let mut untouched = UntouchedSpans {
-        remaining: &literals,
+        remaining: untouched_spans,
     };
     let mut out = String::with_capacity(expr.len());
     let mut unmatched_start = 0;

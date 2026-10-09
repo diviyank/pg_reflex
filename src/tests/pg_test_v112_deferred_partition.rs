@@ -859,3 +859,316 @@ fn v112_dp_manual_flush_that_matches_nothing_says_so() {
         );
     }
 }
+
+fn v112_dp_count(sql: &str) -> i64 {
+    Spi::get_one::<i64>(sql).expect("count").unwrap_or(0)
+}
+
+/// A CTE the query never reads, and a WITH nested in a CTE, each get a sub-IMV
+/// that no source list records: the cascade drop of the IMV removes them too.
+#[pg_test]
+fn v112_dp_drop_removes_cte_sub_imvs_that_nothing_reads() {
+    Spi::run("CREATE TABLE v112_dp_or_t(id SERIAL PRIMARY KEY, season TEXT, v INT)").expect("t");
+    Spi::run("CREATE TABLE v112_dp_or_o(id SERIAL PRIMARY KEY, season TEXT, k INT)").expect("o");
+    Spi::run("INSERT INTO v112_dp_or_t(season, v) VALUES ('e',1),('y',2),('e',3)").expect("seed t");
+    Spi::run("INSERT INTO v112_dp_or_o(season, k) VALUES ('e',7),('y',8)").expect("seed o");
+    for (shape, query, key) in [
+        (
+            "unread",
+            "WITH a AS (SELECT season, SUM(v) AS s FROM v112_dp_or_t GROUP BY season) \
+             SELECT id, season, k FROM v112_dp_or_o",
+            Some("id"),
+        ),
+        (
+            "nested",
+            "WITH a AS (WITH b AS (SELECT season, SUM(v) AS s FROM v112_dp_or_t GROUP BY season) \
+                        SELECT season, s FROM b) \
+             SELECT season, s FROM a",
+            None,
+        ),
+        (
+            "nested in a later CTE",
+            "WITH a AS (SELECT season, SUM(v) AS s FROM v112_dp_or_t GROUP BY season), \
+                  c AS (WITH b AS (SELECT season, COUNT(*) AS n FROM v112_dp_or_t GROUP BY season) \
+                        SELECT season, n FROM b) \
+             SELECT a.season, a.s, c.n FROM a JOIN c ON c.season = a.season",
+            None,
+        ),
+    ] {
+        assert_eq!(
+            crate::create_reflex_ivm("v112_dp_or_v", query, key, None, Some("IMMEDIATE"), None),
+            "CREATE REFLEX INCREMENTAL VIEW",
+            "{shape}"
+        );
+        Spi::run("INSERT INTO v112_dp_or_t(season, v) VALUES ('e',10),('z',30)").expect("write");
+        assert_imv_correct("v112_dp_or_v", query);
+        assert_eq!(
+            crate::drop_reflex_ivm_cascade("v112_dp_or_v", true),
+            "DROP REFLEX INCREMENTAL VIEW",
+            "{shape}"
+        );
+        assert_eq!(
+            v112_dp_count(
+                "SELECT count(*) FROM public.__reflex_ivm_reference WHERE name LIKE 'v112_dp_or_v%'"
+            ),
+            0,
+            "{shape}: registry rows left"
+        );
+        assert_eq!(
+            v112_dp_count("SELECT count(*) FROM pg_class WHERE relname LIKE '%v112_dp_or_v%'"),
+            0,
+            "{shape}: relations left"
+        );
+        for source in ["v112_dp_or_t", "v112_dp_or_o"] {
+            assert_eq!(
+                v112_dp_reflex_triggers_on(source),
+                Vec::<String>::new(),
+                "{shape}: triggers left on {source}"
+            );
+        }
+    }
+}
+
+/// The generated sub-IMV of another IMV whose name merely starts like the dropped
+/// one's is not swept with it.
+#[pg_test]
+fn v112_dp_drop_keeps_the_sub_imvs_of_a_similarly_named_imv() {
+    Spi::run("CREATE TABLE v112_dp_ok_t(id SERIAL PRIMARY KEY, season TEXT, v INT)").expect("t");
+    Spi::run("INSERT INTO v112_dp_ok_t(season, v) VALUES ('e',1),('y',2)").expect("seed");
+    let plain = "SELECT season, COUNT(*) AS c FROM v112_dp_ok_t GROUP BY season";
+    let with_cte = "WITH a AS (SELECT season, SUM(v) AS s FROM v112_dp_ok_t GROUP BY season) \
+                    SELECT season, s FROM a";
+    for (imv, query) in [("v112_dp_ok_v", plain), ("v112_dp_ok_v__cte_q", with_cte)] {
+        assert_eq!(
+            crate::create_reflex_ivm(imv, query, None, None, Some("IMMEDIATE"), None),
+            "CREATE REFLEX INCREMENTAL VIEW"
+        );
+    }
+    assert_eq!(crate::drop_reflex_ivm_cascade("v112_dp_ok_v", true), "DROP REFLEX INCREMENTAL VIEW");
+    Spi::run("INSERT INTO v112_dp_ok_t(season, v) VALUES ('e',10),('z',30)").expect("write");
+    assert_imv_correct("v112_dp_ok_v__cte_q", with_cte);
+}
+
+fn v112_dp_run_printed_fix(imv: &str, category: &str) {
+    let report = ps9_audit(imv);
+    let fix = ps9_suggested_fix(&report, category);
+    for statement in fix.split(';').map(str::trim).filter(|s| !s.is_empty()) {
+        let outcome = Spi::get_one::<String>(&format!("SELECT ({})::text", &statement["SELECT".len()..]))
+            .unwrap_or_else(|e| panic!("printed remedy `{statement}` raised: {e}"))
+            .unwrap_or_default();
+        assert!(!outcome.starts_with("ERROR"), "printed remedy `{statement}`: {outcome}");
+    }
+}
+
+/// A dropped `__reflex_scratch_<imv>` is reported, and the printed remedy
+/// recreates it.
+#[pg_test]
+fn v112_dp_missing_delta_scratch_table_is_reported_and_its_remedy_converges() {
+    for (prefix, mode, query) in [
+        ("v112_dp_sg_i", "IMMEDIATE", "SELECT g, SUM(v) AS sv, COUNT(*) AS c FROM {t} GROUP BY g"),
+        ("v112_dp_sg_d", "DEFERRED", "SELECT g, SUM(v) AS sv, COUNT(*) AS c FROM {t} GROUP BY g"),
+        ("v112_dp_su_i", "IMMEDIATE", "SELECT SUM(v) AS sv, COUNT(*) AS c FROM {t}"),
+        ("v112_dp_sm_d", "DEFERRED", "SELECT g, MIN(v) AS lo, MAX(v) AS hi FROM {t} GROUP BY g"),
+    ] {
+        let t = format!("{prefix}_t");
+        let imv = format!("{prefix}_v");
+        let query = query.replace("{t}", &t);
+        Spi::run(&format!("CREATE TABLE {t}(id SERIAL PRIMARY KEY, g TEXT, v INT)")).expect("t");
+        Spi::run(&format!("INSERT INTO {t}(g, v) VALUES ('a',1),('b',2),('a',3)")).expect("seed");
+        assert_eq!(
+            crate::create_reflex_ivm(&imv, &query, None, None, Some(mode), None),
+            "CREATE REFLEX INCREMENTAL VIEW"
+        );
+        assert!(!ps9_audit(&imv).contains("internal-tables-exist"), "fixture: {imv} audits clean");
+        Spi::run(&format!("DROP TABLE \"__reflex_scratch_{imv}\"")).expect("drop scratch");
+        let report = ps9_audit(&imv);
+        assert!(
+            report.contains("internal-tables-exist") && report.contains(&format!("__reflex_scratch_{imv}")),
+            "{imv}: the missing scratch table is not reported:\n{report}"
+        );
+        v112_dp_run_printed_fix(&imv, "internal-tables-exist");
+        let after = ps9_audit(&imv);
+        assert!(!after.contains("internal-tables-exist"), "{imv}: finding not cleared:\n{after}");
+        for write in [
+            "INSERT INTO {t}(g, v) VALUES ('a',10),('c',30)",
+            "UPDATE {t} SET v = v + 1 WHERE g = 'b'",
+            "DELETE FROM {t} WHERE id = 1",
+        ] {
+            Spi::run(&write.replace("{t}", &t)).expect("write");
+            if mode == "DEFERRED" {
+                assert!(v112_dp_flush(&t).starts_with("FLUSHED"));
+            }
+            assert_imv_correct(&imv, &query);
+        }
+    }
+}
+
+/// The remedy for a missing passthrough scratch table names the source as the IMV
+/// registered it, double quotes included for a CTE sub-IMV.
+#[pg_test]
+fn v112_dp_missing_scratch_of_a_cte_parent_remedy_converges() {
+    Spi::run("CREATE TABLE v112_dp_cp_t(id SERIAL PRIMARY KEY, season TEXT, v INT)").expect("t");
+    Spi::run("INSERT INTO v112_dp_cp_t(season, v) VALUES ('e',1),('y',2),('e',3)").expect("seed");
+    let query = "WITH a AS (SELECT season, SUM(v) AS s FROM v112_dp_cp_t GROUP BY season) \
+                 SELECT season, s FROM a";
+    assert_eq!(
+        crate::create_reflex_ivm("v112_dp_cp_v", query, None, None, Some("IMMEDIATE"), None),
+        "CREATE REFLEX INCREMENTAL VIEW"
+    );
+    let scratch = Spi::get_one::<String>(
+        "SELECT relname::text FROM pg_class WHERE relname LIKE '\\_\\_reflex\\_pt\\_new\\_v112\\_dp\\_cp\\_v\\_%'",
+    )
+    .expect("scratch lookup")
+    .expect("fixture: the parent owns a passthrough scratch table");
+    let triggers_before = v112_dp_reflex_triggers_on("v112_dp_cp_v__cte_a");
+    Spi::run(&format!("DROP TABLE \"{scratch}\"")).expect("drop scratch");
+    assert!(ps9_audit("v112_dp_cp_v").contains("internal-tables-exist"));
+    v112_dp_run_printed_fix("v112_dp_cp_v", "internal-tables-exist");
+    let after = ps9_audit("v112_dp_cp_v");
+    assert!(!after.contains("internal-tables-exist"), "finding not cleared:\n{after}");
+    assert_eq!(
+        v112_dp_reflex_triggers_on("v112_dp_cp_v__cte_a"),
+        triggers_before,
+        "the remedy changed the trigger set of the sub-IMV"
+    );
+    Spi::run("INSERT INTO v112_dp_cp_t(season, v) VALUES ('e',10),('z',30)").expect("write");
+    assert_imv_correct("v112_dp_cp_v", query);
+}
+
+/// `reflex_rebuild_triggers` re-emits the triggers the IMVs registered, under any
+/// spelling of the source, and adds no second set.
+#[pg_test]
+fn v112_dp_rebuild_triggers_keeps_one_trigger_set_per_source() {
+    for (t, mode, called) in [
+        ("v112_dp_rt_a", "IMMEDIATE", "v112_dp_rt_a"),
+        ("v112_dp_rt_b", "DEFERRED", "v112_dp_rt_b"),
+        ("v112_dp_rt_c", "DEFERRED", "public.v112_dp_rt_c"),
+        ("v112_dp_rt_d", "IMMEDIATE", "\"v112_dp_rt_d\""),
+    ] {
+        let imv = format!("{t}_v");
+        let query = format!("SELECT g, SUM(v) AS sv FROM {t} GROUP BY g");
+        Spi::run(&format!("CREATE TABLE {t}(id SERIAL PRIMARY KEY, g TEXT, v INT)")).expect("t");
+        Spi::run(&format!("INSERT INTO {t}(g, v) VALUES ('a',1),('b',2)")).expect("seed");
+        assert_eq!(
+            crate::create_reflex_ivm(&imv, &query, None, None, Some(mode), None),
+            "CREATE REFLEX INCREMENTAL VIEW"
+        );
+        let triggers_before = v112_dp_reflex_triggers_on(t);
+        let rebuilt = crate::reflex_rebuild_triggers(called);
+        assert!(!rebuilt.starts_with("ERROR"), "{called}: {rebuilt}");
+        assert_eq!(v112_dp_reflex_triggers_on(t), triggers_before, "rebuilt as {called}");
+        Spi::run(&format!("INSERT INTO {t}(g, v) VALUES ('a',10),('c',30)")).expect("write");
+        if mode == "DEFERRED" {
+            assert!(v112_dp_flush(t).starts_with("FLUSHED"));
+        }
+        assert_imv_correct(&imv, &query);
+    }
+}
+
+#[pg_test]
+fn v112_dp_column_substitution_leaves_cast_type_names_alone() {
+    use crate::sql_writer::identifier::substitute_column_ci;
+    for (constraint, column, expected) in [
+        (
+            "((date IS NOT NULL) AND (date >= '2024-01-01'::date) AND (date < '2024-02-01'::date))",
+            "date",
+            "((X IS NOT NULL) AND (X >= '2024-01-01'::date) AND (X < '2024-02-01'::date))",
+        ),
+        ("((text IS NOT NULL) AND (text = 'a'::text))", "text", "((X IS NOT NULL) AND (X = 'a'::text))"),
+        (
+            "(zone >= '2024-01-01 00:00:00+00'::timestamp with time zone)",
+            "zone",
+            "(X >= '2024-01-01 00:00:00+00'::timestamp with time zone)",
+        ),
+        ("(time < '10:00:00'::time without time zone)", "time", "(X < '10:00:00'::time without time zone)"),
+        ("(precision > 1::double precision)", "precision", "(X > 1::double precision)"),
+        ("(varying = 'a'::character varying(3))", "varying", "(X = 'a'::character varying(3))"),
+        ("(numeric < 1.5::numeric(10,2) AND numeric > 0)", "numeric", "(X < 1.5::numeric(10,2) AND X > 0)"),
+        ("(s = ANY (ARRAY['a'::text, 'b'::text]))", "s", "(X = ANY (ARRAY['a'::text, 'b'::text]))"),
+        ("(my_type = 'a'::public.my_type)", "my_type", "(X = 'a'::public.my_type)"),
+        ("(k >= 1) AND (k < 10)", "k", "(X >= 1) AND (X < 10)"),
+        ("(date = 'date'::date)::boolean AND date IS NOT NULL", "date", "(X = 'date'::date)::boolean AND X IS NOT NULL"),
+    ] {
+        assert_eq!(substitute_column_ci(constraint, column, "X"), expected, "{constraint}");
+    }
+}
+
+/// A partition column named like the type its bounds are cast to.
+#[pg_test]
+fn v112_dp_reconcile_partition_with_a_column_named_like_its_type() {
+    for (column, column_type, strategy, bounds, key) in [
+        (
+            "date",
+            "DATE",
+            "RANGE",
+            ["FROM ('2024-01-01') TO ('2024-02-01')", "FROM ('2024-02-01') TO ('2024-03-01')"],
+            ["2024-01-15", "2024-02-10"],
+        ),
+        ("text", "TEXT", "LIST", ["IN ('a')", "IN ('b')"], ["a", "b"]),
+        (
+            "zone",
+            "TIMESTAMPTZ",
+            "RANGE",
+            [
+                "FROM ('2024-01-01 00:00:00+00') TO ('2024-02-01 00:00:00+00')",
+                "FROM ('2024-02-01 00:00:00+00') TO ('2024-03-01 00:00:00+00')",
+            ],
+            ["2024-01-15 00:00:00+00", "2024-02-10 00:00:00+00"],
+        ),
+    ] {
+        let s = format!("v112_dp_ty_{column}");
+        let imv = format!("{s}_v");
+        let reader = format!("{s}_r");
+        Spi::run(&format!(
+            "CREATE TABLE {s}({column} {column_type} NOT NULL, id INT NOT NULL, v INT) \
+             PARTITION BY {strategy} ({column})"
+        ))
+        .expect("source");
+        for (leaf, bound) in bounds.iter().enumerate() {
+            Spi::run(&format!("CREATE TABLE {s}_p{leaf} PARTITION OF {s} FOR VALUES {bound}"))
+                .expect("leaf");
+        }
+        Spi::run(&format!(
+            "INSERT INTO {s} VALUES ('{0}', 1, 10), ('{0}', 2, 20), ('{1}', 3, 30)",
+            key[0], key[1]
+        ))
+        .expect("seed");
+        let query = format!("SELECT {column}, id, v FROM {s}");
+        let created = Spi::get_one::<String>(&format!(
+            "SELECT create_reflex_ivm('{imv}', '{query}', '{column}, id', NULL, 'IMMEDIATE', NULL, \
+             ARRAY['{column}'])"
+        ))
+        .expect("create")
+        .unwrap_or_default();
+        assert_eq!(created, "CREATE REFLEX INCREMENTAL VIEW", "{column}");
+        let reader_query = format!("SELECT {column}, COUNT(*) AS c, SUM(v) AS sv FROM {imv} GROUP BY {column}");
+        let reader_fresh = format!("SELECT {column}, COUNT(*) AS c, SUM(v) AS sv FROM {s} GROUP BY {column}");
+        assert_eq!(
+            crate::create_reflex_ivm(&reader, &reader_query, None, None, Some("IMMEDIATE"), None),
+            "CREATE REFLEX INCREMENTAL VIEW",
+            "{column}"
+        );
+        let by_key: Vec<String> = key
+            .iter()
+            .map(|value| format!("reflex_reconcile_partition('{imv}', '{value}')"))
+            .collect();
+        let by_source_partition: Vec<String> = (0..2)
+            .map(|leaf| format!("reflex_reconcile_partition('{imv}', '', '{s}_p{leaf}')"))
+            .collect();
+        for calls in [by_key, by_source_partition] {
+            Spi::run(&format!("UPDATE {imv} SET v = v + 1000")).expect("drift");
+            for call in &calls {
+                let outcome = Spi::get_one::<String>(&format!("SELECT {call}::text"))
+                    .unwrap_or_else(|e| panic!("{call} raised: {e}"))
+                    .unwrap_or_default();
+                assert!(!outcome.starts_with("ERROR"), "{call}: {outcome}");
+            }
+            assert_imv_correct(&imv, &query);
+            assert_imv_correct(&reader, &reader_fresh);
+        }
+        assert_imv_correct(&imv, &query);
+        Spi::run(&format!("INSERT INTO {s} VALUES ('{}', 4, 40)", key[1])).expect("write");
+        assert_imv_correct(&imv, &query);
+        assert_imv_correct(&reader, &reader_fresh);
+    }
+}
