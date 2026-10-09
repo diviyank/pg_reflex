@@ -1410,12 +1410,12 @@ fn collect_imv_relevant_where(
     let outer_qualifiers: BTreeSet<String> =
         prefixes_per_source.values().flatten().cloned().collect();
     let empty = BTreeSet::new();
+    let qualifier_scope = top_level_qualifier_scope(select);
     let admits_null_extended_rows_of = |source: &String| {
-        let prefixes = prefixes_per_source.get(source).unwrap_or(&empty);
         null_extended.contains(source)
             && !conjuncts
                 .iter()
-                .any(|conjunct| rejects_null_row_of(conjunct, prefixes))
+                .any(|conjunct| rejects_null_row_of(conjunct, source, &qualifier_scope))
     };
 
     let mut buckets: HashMap<String, Vec<String>> = HashMap::new();
@@ -1533,17 +1533,49 @@ fn null_extended_sources(select: &Select) -> BTreeSet<String> {
     null_extended
 }
 
-/// Whether `conjunct` is false or NULL for every row whose columns under
-/// `qualifiers` are all NULL: a comparison, `IN` list or `BETWEEN` whose
-/// tested operand is such a column, or `IS NOT NULL` of one. Anything else
-/// counts as possibly true.
-fn rejects_null_row_of(conjunct: &Expr, qualifiers: &BTreeSet<String>) -> bool {
+/// Qualifier → table for the top-level FROM clause, as PostgreSQL scopes it:
+/// an aliased table answers to its alias only, an unaliased one to its name
+/// (bare, and as written). A qualifier two relations share is left out.
+fn top_level_qualifier_scope(select: &Select) -> HashMap<String, String> {
+    let mut scope: HashMap<String, String> = HashMap::new();
+    let mut shared: BTreeSet<String> = BTreeSet::new();
+    for (table, alias) in top_level_tables(select) {
+        let qualifiers = match alias {
+            Some(alias) => vec![alias],
+            None => {
+                let bare = table.rsplit('.').next().unwrap_or(&table).to_string();
+                BTreeSet::from([bare, table.clone()]).into_iter().collect()
+            }
+        };
+        for qualifier in qualifiers {
+            if scope.insert(qualifier.clone(), table.clone()).is_some() {
+                shared.insert(qualifier);
+            }
+        }
+    }
+    for qualifier in shared {
+        scope.remove(&qualifier);
+    }
+    scope
+}
+
+/// Whether `conjunct` is false or NULL for every row whose columns of `source`
+/// are all NULL: a comparison, `IN` list or `BETWEEN` whose tested operand is a
+/// column of `source`, or `IS NOT NULL` of one. Only a column whose qualifier
+/// resolves to `source` in `qualifier_scope` counts; an unqualified column
+/// never does. Anything else counts as possibly true.
+fn rejects_null_row_of(
+    conjunct: &Expr,
+    source: &str,
+    qualifier_scope: &HashMap<String, String>,
+) -> bool {
     let is_qualified_column = |expr: &Expr| {
         matches!(expr, Expr::CompoundIdentifier(ids)
-            if ids.len() == 2 && qualifiers.contains(&ids[0].value))
+            if ids.len() == 2
+                && qualifier_scope.get(&ids[0].value).map(String::as_str) == Some(source))
     };
     match conjunct {
-        Expr::Nested(inner) => rejects_null_row_of(inner, qualifiers),
+        Expr::Nested(inner) => rejects_null_row_of(inner, source, qualifier_scope),
         Expr::BinaryOp { left, op, right } => {
             matches!(
                 op,

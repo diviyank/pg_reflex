@@ -1613,3 +1613,34 @@ fn filter_on_the_preserved_table_of_an_outer_join_is_kept() {
     assert_eq!(relevant_where(&a, "dim"), "label <> 'q' OR label IS NULL");
     assert_eq!(relevant_cols(&a, "dim"), vec!["kind"]);
 }
+
+#[test]
+fn null_rejection_resolves_a_qualifier_through_the_alias_that_hides_a_table_name() {
+    let a = parse_and_analyze(
+        "SELECT fact.kind, COUNT(*) FROM dim AS fact LEFT JOIN fact AS f ON fact.kind = f.kind \
+         WHERE fact.kind > '' AND (f.v > 0 OR f.v IS NULL) GROUP BY fact.kind",
+    );
+    assert_eq!(relevant_where(&a, "fact"), "");
+    assert!(relevant_cols(&a, "fact").contains(&"v".to_string()));
+    assert_eq!(relevant_where(&a, "dim"), "kind > ''");
+
+    let a = parse_and_analyze(
+        "SELECT d.kind, COUNT(*) FROM dim d LEFT JOIN fact f ON d.kind = f.kind \
+         WHERE fact.v > 0 AND abs(f.v) < 9 GROUP BY d.kind",
+    );
+    assert_eq!(relevant_where(&a, "fact"), "");
+}
+
+#[test]
+fn null_rejection_accepts_the_name_of_an_unaliased_table_and_no_unqualified_column() {
+    let filter_of = |condition: &str| {
+        let a = parse_and_analyze(&format!(
+            "SELECT d.kind, COUNT(*) FROM dim d LEFT JOIN s.fact ON d.kind = fact.kind \
+             WHERE {condition} GROUP BY d.kind"
+        ));
+        relevant_where(&a, "s.fact")
+    };
+    assert!(filter_of("fact.v > 0 AND abs(fact.v) < 9").contains("abs(v) < 9"));
+    assert_eq!(filter_of("v > 0 AND abs(fact.v) < 9"), "");
+    assert_eq!(filter_of("d.kind > '' AND abs(fact.v) < 9"), "");
+}
