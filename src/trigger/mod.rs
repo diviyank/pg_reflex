@@ -12,7 +12,10 @@ use crate::query_decomposer::{
     quote_identifier, shrunk_groups_table_name, transition_new_table_name,
     transition_old_table_name,
 };
-use crate::sql_writer::identifier::{replace_source_with_transition, token_names_source};
+use crate::sql_writer::identifier::{
+    replace_source_with_transition, source_rewrite_breaks_quoted_identifier, token_names_source,
+};
+use outer_join::{outer_joins, OuterJoins};
 
 /// Per-backend cache of built delta SQL keyed by a hash of all inputs.
 /// Entries are content-addressable: identical inputs always produce identical
@@ -43,6 +46,24 @@ fn delta_sql_cache_key(
     aggregations_json.unwrap_or("").hash(&mut h);
     orig_base_query.hash(&mut h);
     h.finish()
+}
+
+fn cached_delta_sql(cache_key: u64) -> Option<String> {
+    delta_sql_cache().lock().ok()?.get(&cache_key).cloned()
+}
+
+fn remember_delta_sql(cache_key: u64, sql: &str) {
+    if let Ok(mut guard) = delta_sql_cache().lock() {
+        if guard.len() >= DELTA_SQL_CACHE_MAX {
+            guard.clear();
+        }
+        guard.insert(cache_key, sql.to_string());
+    }
+}
+
+#[cfg(any(test, feature = "pg_test"))]
+pub fn delta_sql_cache_len() -> usize {
+    delta_sql_cache().lock().map_or(0, |guard| guard.len())
 }
 
 #[cfg(any(test, feature = "pg_test"))]
@@ -81,9 +102,19 @@ pub(crate) fn source_reference_count(base_query: &str, source_table: &str) -> us
         .count()
 }
 
+/// `sql` upper-cased with every run of whitespace collapsed to one space.
+#[cfg(test)]
+pub(crate) fn upper_with_single_spaces(sql: &str) -> String {
+    sql.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_uppercase()
+}
+
 /// Whether `source_table` is the table named directly after a LEFT / RIGHT /
 /// FULL (OUTER) JOIN keyword of the upper-cased query. A source that only
 /// appears in an ON condition does not count.
+#[cfg(test)]
 pub(crate) fn follows_outer_join_keyword(bq_upper: &str, source_table: &str) -> bool {
     let source_upper = source_table.to_uppercase();
     let patterns = [
@@ -106,6 +137,30 @@ pub(crate) fn follows_outer_join_keyword(bq_upper: &str, source_table: &str) -> 
         }
         false
     })
+}
+
+/// Whether a write to `source_table` has no per-source delta, so the IMV is
+/// recomputed from `base_query`: the source is read more than once, the query
+/// holds a RIGHT JOIN, the source is read inside a derived table or a
+/// parenthesised join that a LEFT JOIN null-extends, or the transition-table
+/// rewrite would break a quoted identifier of another relation.
+///
+/// A RIGHT JOIN is never scoped. The table before the keyword is the
+/// null-extended one, and the per-source key mappings of the plan assume the
+/// null-extended table is the joined one: a group or passthrough key read from
+/// the table before the keyword is NULL on the unmatched rows of the table
+/// after it.
+pub(crate) fn has_no_scoped_delta(base_query: &str, source_table: &str) -> bool {
+    outer_joins_leave_no_scoped_delta(&outer_joins(base_query, source_table))
+        || source_reference_count(base_query, source_table) > 1
+        || source_rewrite_breaks_quoted_identifier(base_query, source_table)
+}
+
+fn outer_joins_leave_no_scoped_delta(joins: &OuterJoins) -> bool {
+    joins.source_reads > 1
+        || joins.holds_right_join
+        || joins.source_inside_left_joined_subtree
+        || joins.source_name_stands_as_a_value
 }
 
 /// Generates the SQL statements to apply a delta to an IMV.
@@ -173,36 +228,25 @@ pub fn reflex_build_delta_sql(
     // 1. Self-join: source_table appears multiple times in base_query
     // 2. LEFT/RIGHT JOIN secondary table DELETE/UPDATE: NULL semantics can't be captured by MERGE subtract
     // Detect self-join and outer-join-secondary for BOTH aggregate and passthrough queries.
-    let is_self_join = source_reference_count(base_query, source_table) > 1;
-
-    let bq_upper = base_query.to_uppercase();
-    let is_full_outer = bq_upper.contains("FULL JOIN") || bq_upper.contains("FULL OUTER");
-    // Check if source_table is the secondary table in a LEFT/RIGHT/FULL JOIN.
-    // The source is secondary if it appears as the table being outer-joined,
-    // i.e. directly after "LEFT JOIN", "RIGHT JOIN", or "FULL JOIN".
-    // Do NOT match if source_table only appears in ON conditions (that's the primary table).
-    let is_outer_join_secondary_table = !is_self_join
-        && (bq_upper.contains("LEFT JOIN")
-            || bq_upper.contains("RIGHT JOIN")
-            || bq_upper.contains("LEFT OUTER")
-            || bq_upper.contains("RIGHT OUTER")
-            || is_full_outer)
-        && follows_outer_join_keyword(&bq_upper, source_table);
-    // For LEFT/RIGHT JOIN: EVERY operation on the secondary table needs special
+    let joins = outer_joins(base_query, source_table);
+    let recompute_in_full = outer_joins_leave_no_scoped_delta(&joins)
+        || source_reference_count(base_query, source_table) > 1
+        || source_rewrite_breaks_quoted_identifier(base_query, source_table);
+    // For LEFT JOIN: EVERY operation on the secondary table needs special
     // handling. The plain `L LEFT JOIN Δsecondary` delta re-emits all left rows
     // NULL-extended, which double-counts non-matching left rows on INSERT (breaks
     // COUNT(*) and any secondary-derived group key) and can't represent NULL
     // semantics on DELETE/UPDATE. For FULL OUTER JOIN: ALL operations on BOTH
     // tables need targeted reconcile, because the FULL JOIN delta always includes
     // unmatched rows from the other side.
-    let is_outer_join_secondary = (is_outer_join_secondary_table
-        && matches!(
-            operation,
-            "DELETE" | "DELETE_PROMOTED" | "UPDATE" | "INSERT" | "INSERT_PROMOTED"
-        ))
-        || (is_full_outer && !is_self_join);
+    let is_outer_join_secondary = joins.holds_full_join
+        || (joins.source_is_null_extended_table
+            && matches!(
+                operation,
+                "DELETE" | "DELETE_PROMOTED" | "UPDATE" | "INSERT" | "INSERT_PROMOTED"
+            ));
 
-    if is_self_join {
+    if recompute_in_full {
         full_refresh_stmts(
             view_name,
             base_query,
@@ -419,12 +463,36 @@ pub fn reflex_build_path_c_explain_sql(view_name: &str, source_table: &str) -> S
         Some(t) => t,
         None => return String::new(),
     };
-    match serde_json::from_str::<AggregationPlan>(&agg_json) {
+    let cache_key = delta_sql_cache_key(
+        view_name,
+        source_table,
+        PATH_C_EXPLAIN_OP,
+        &base_query,
+        "",
+        Some(&agg_json),
+        "",
+    );
+    if let Some(cached) = cached_delta_sql(cache_key) {
+        return cached;
+    }
+    let explain_sql = path_c_explain_sql(source_table, &base_query, &agg_json);
+    remember_delta_sql(cache_key, &explain_sql);
+    explain_sql
+}
+
+/// Cache-key operation of the Path C statement, distinct from every DML operation.
+const PATH_C_EXPLAIN_OP: &str = "PATH_C_EXPLAIN";
+
+fn path_c_explain_sql(source_table: &str, base_query: &str, agg_json: &str) -> String {
+    match serde_json::from_str::<AggregationPlan>(agg_json) {
         Ok(plan) if plan.source_join_keys.contains_key(source_table) => {}
         _ => return String::new(),
     }
+    if has_no_scoped_delta(base_query, source_table) {
+        return String::new();
+    }
     let transition = transition_new_table_name(source_table);
-    replace_source_with_transition(&base_query, source_table, &transition)
+    replace_source_with_transition(base_query, source_table, &transition)
 }
 
 /// Resolve an IMV name to its already-quoted intermediate-table reference.
@@ -620,6 +688,7 @@ pub(crate) mod deferred;
 mod dispatch;
 mod merge;
 mod ops;
+mod outer_join;
 mod scope;
 mod union_delta;
 

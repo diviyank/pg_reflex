@@ -584,7 +584,7 @@ fn create_reflex_ivm(
     let ignore_vec = parse_ignore_sources_list(ignore_sources.unwrap_or(""));
     create_ivm::create_reflex_ivm_impl(
         view_name,
-        sql,
+        &create_ivm::query_with_one_spelling_per_identifier(sql),
         unique_columns.unwrap_or(""),
         false,
         storage.unwrap_or("UNLOGGED"),
@@ -614,7 +614,7 @@ fn create_reflex_ivm_partitioned(
     let part_cols = partition::parse_partition_by_input(Some(partition_by));
     create_ivm::create_reflex_ivm_impl(
         view_name,
-        sql,
+        &create_ivm::query_with_one_spelling_per_identifier(sql),
         unique_columns.unwrap_or(""),
         false,
         storage.unwrap_or("UNLOGGED"),
@@ -640,7 +640,7 @@ fn create_reflex_ivm_with_topk(
     let ignore_vec = parse_ignore_sources_list(ignore_sources.unwrap_or(""));
     create_ivm::create_reflex_ivm_impl(
         view_name,
-        sql,
+        &create_ivm::query_with_one_spelling_per_identifier(sql),
         unique_columns.unwrap_or(""),
         false,
         storage.unwrap_or("UNLOGGED"),
@@ -668,7 +668,7 @@ fn create_reflex_ivm_with_topk_partitioned(
     let part_cols = partition::parse_partition_by_input(Some(partition_by));
     create_ivm::create_reflex_ivm_impl(
         view_name,
-        sql,
+        &create_ivm::query_with_one_spelling_per_identifier(sql),
         unique_columns.unwrap_or(""),
         false,
         storage.unwrap_or("UNLOGGED"),
@@ -693,7 +693,7 @@ fn create_reflex_ivm_if_not_exists(
     let ignore_vec = parse_ignore_sources_list(ignore_sources.unwrap_or(""));
     create_ivm::create_reflex_ivm_impl(
         view_name,
-        sql,
+        &create_ivm::query_with_one_spelling_per_identifier(sql),
         unique_columns.unwrap_or(""),
         true,
         storage.unwrap_or("UNLOGGED"),
@@ -719,7 +719,7 @@ fn create_reflex_ivm_if_not_exists_partitioned(
     let part_cols = partition::parse_partition_by_input(Some(partition_by));
     create_ivm::create_reflex_ivm_impl(
         view_name,
-        sql,
+        &create_ivm::query_with_one_spelling_per_identifier(sql),
         unique_columns.unwrap_or(""),
         true,
         storage.unwrap_or("UNLOGGED"),
@@ -1855,6 +1855,8 @@ mod tests {
     include!("tests/pg_test_v112_source_rewrite.rs");
     include!("tests/pg_test_v112_function_contract.rs");
     include!("tests/pg_test_v112_nested_aggregates.rs");
+    include!("tests/pg_test_v112_joins.rs");
+    include!("tests/pg_test_v112_joins_review.rs");
 }
 
 /// This module is required by `cargo pgrx test` invocations.

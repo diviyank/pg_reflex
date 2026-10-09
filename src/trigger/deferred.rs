@@ -1245,7 +1245,10 @@ fn rebuild_for_cross_source_guard(
         .unwrap_or_report();
 }
 
-/// Flushes all accumulated deferred deltas for a given source table.
+const NO_DEFERRED_IMVS: &str = "NO DEFERRED IMVS";
+
+/// Flushes all accumulated deferred deltas for a given source table, under
+/// every spelling an IMV registered it with.
 ///
 /// Called by the deferred constraint trigger at COMMIT time.
 /// Reads from the staging table (__reflex_delta_<source>), applies deltas
@@ -1256,7 +1259,19 @@ pub fn reflex_flush_deferred(source_table: &str) -> String {
     // settled an upstream IMV a postponed rebuild was waiting for.
     run_as_flush(|| {
         Spi::connect_mut(rebuild_truncated_imvs);
-        let flushed = flush_staged_deltas(source_table);
+        let flushed = crate::reconcile::registered_spellings_of(source_table)
+            .iter()
+            .map(|spelling| flush_staged_deltas(spelling))
+            .reduce(|kept, next| {
+                if kept == NO_DEFERRED_IMVS {
+                    next
+                } else if next == NO_DEFERRED_IMVS || next == kept {
+                    kept
+                } else {
+                    format!("{kept}; {next}")
+                }
+            })
+            .unwrap_or_else(|| NO_DEFERRED_IMVS.to_string());
         Spi::connect_mut(rebuild_truncated_imvs);
         flushed
     })
@@ -1324,7 +1339,7 @@ fn flush_staged_deltas(source_table: &str) -> String {
     });
 
     if imvs.is_empty() {
-        return "NO DEFERRED IMVS".to_string();
+        return NO_DEFERRED_IMVS.to_string();
     }
 
     let mut total_processed = 0usize;

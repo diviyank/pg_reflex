@@ -1,45 +1,40 @@
-# Another schema's quoted table with the same bare name breaks DML on the source — S3 (loud)
+# A quoted identifier equal to a source's bare name, belonging to another relation, makes the IMV recompute in full on every write to that source — perf (correct, slow)
 
-Pre-existing (identical on the base). Observed during the 1.12.0 hardening work on the
-`release/1.12.0` branch (base commit 6946400; Task 1b probe branch based on c71c65d), on pg15.
-Found by the Task 1b adversarial reviewer (P4). The unquoted form of the same query is correct.
+Narrowed by the 1.12.0 bug-fold work (group G1, joins). The original report (Task 1b review, P4)
+was a loud failure: DML on `sa.dim` raised `zero-length delimited identifier at or near """"` for
+`FROM f JOIN "sa".dim a ON … JOIN sb."dim" b ON …`. Reproduced on pg17 (INNER and LEFT, aggregate
+and passthrough, IMMEDIATE and DEFERRED, and for a `public` table beside `other."same_name"`),
+and closed by a guard: the write is recomputed from the query instead of going through the
+transition-table rewrite. What remains is the cost and the rewrite itself.
 
-## Reproduction (pg15)
+## Residual
 
-The reviewer recorded the shape `FROM f JOIN "sa".dim a ON … JOIN sb."dim" b ON …` with fixture
-"fact + `sa.dim` + `sb.dim` (same bare name), INNER and LEFT, DML on all three". The join
-conditions and select list are not recorded; the SQL below is a sketch of that shape with
-illustrative `ON` conditions and select list.
+`replace_source_with_transition` (`src/sql_writer/identifier.rs`) still replaces the bare name
+inside the quotes of `sb."dim"` and returns `sb.""__reflex_new_sa_dim""`. Nothing executes that
+text any more: `has_no_scoped_delta` (`src/trigger/mod.rs`) asks
+`source_rewrite_breaks_quoted_identifier` first and recomputes the IMV in full for the affected
+source (`sa.dim` above; `sb.dim` and `f` keep their scoped deltas). The same applies to a quoted
+column named like the source's table (`x."dim"`).
 
-```sql
-CREATE SCHEMA sa; CREATE SCHEMA sb;
-CREATE TABLE sa.dim(kind TEXT PRIMARY KEY, label TEXT);
-CREATE TABLE sb.dim(kind TEXT PRIMARY KEY, label TEXT);
-CREATE TABLE f(id SERIAL PRIMARY KEY, kind TEXT, v INT);
-SELECT create_reflex_ivm('v', 'SELECT a.label, COUNT(*) AS c FROM f
-  JOIN "sa".dim a ON a.kind = f.kind JOIN sb."dim" b ON b.kind = f.kind GROUP BY a.label');
-INSERT INTO sa.dim VALUES ('k','K');
--- ERROR:  zero-length delimited identifier at or near """"
-```
+Workaround: write the other relation unquoted (`sb.dim`): the guard does not fire and the result
+is correct (test `v112_j_sn_inner_unquoted`).
 
-Recorded: DML on `sa.dim` fails with `zero-length delimited identifier at or near """"`. The same
-fixture with unquoted `sa.dim` and `sb.dim` is correct (green on base and head).
+## Why the rewrite was not changed
 
-## Expected vs actual
+The fix is small: in the source rewrite, refuse a match with a double quote directly before or
+after it (it is part of another identifier). It was written, made the oracle tests green, and
+reverted, because two existing legacy-differential unit tests pin the current output for exactly
+this input class:
 
-Expected: a write to `sa.dim` rewrites only the `sa.dim` reference. Actual: the rewrite produces
-invalid SQL.
-
-## What is known about the mechanism
-
-By the reviewer's reading (`src/sql_writer/identifier.rs`, about lines 313-318): the bare-name
-pass for `sa.dim` matches the bare word `dim` inside `sb."dim"` and replaces it, leaving a stray
-pair of quotes. Related minor note from the same review: the quoted-schema spelling pass can also
-match inside a schema name that itself contains a double quote (`"a""s".t` matches `"s".t`); not
-worth a guard on its own.
+- `source_rewrite_matches_legacy_for_unquoted_fully_quoted_and_bare_references`
+  (`src/sql_writer/tests.rs`): for `SELECT "alp"."product".v FROM product`, source `product`, it
+  expects `SELECT "alp".""__reflex_new_alp_product"".v FROM …`.
+- `literal_aware_rewrite_matches_legacy_when_query_has_no_literal`: random concatenations such as
+  `p"product"`.
 
 ## Fix direction (hypothesis)
 
-Make the bare-name pass refuse a match whose neighbour is a quote or a dot on either side, so a
-reference qualified with a different schema is never taken for the bare name; add oracle tests
-for the quoted and unquoted forms with two schemas sharing a table name, DML on each.
+Apply the quote-neighbour rule in the source rewrite, update the two differential tests on
+purpose (skip the inputs where the legacy output holds `""`), then remove
+`source_rewrite_breaks_quoted_identifier` and its use. The oracle tests `v112_j_sn_*` and
+`v112_j_public_table_beside_quoted_same_name_in_other_schema` must stay green throughout.
