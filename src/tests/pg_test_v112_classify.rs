@@ -567,6 +567,10 @@ fn v112_cl_output_columns_sharing_a_name_are_rejected() {
         ("dupout_bare", "SELECT a.label, b.label FROM {a} a JOIN {b} b ON b.a_id = a.id"),
         ("dupout_alias", "SELECT a.label AS x, b.label AS x FROM {a} a JOIN {b} b ON b.a_id = a.id"),
         ("dupout_mixed", "SELECT a.label, b.id AS \"label\" FROM {a} a JOIN {b} b ON b.a_id = a.id"),
+        ("dupout_ids", "SELECT a.id, b.id FROM {a} a JOIN {b} b ON b.a_id = a.id"),
+        ("dupout_quoted", "SELECT a.id AS \"X\", b.id AS \"X\" FROM {a} a JOIN {b} b ON b.a_id = a.id"),
+        ("dupout_folded", "SELECT a.id AS x, b.id AS X FROM {a} a JOIN {b} b ON b.a_id = a.id"),
+        ("dupout_paren", "SELECT (a.label), b.label FROM {a} a JOIN {b} b ON b.a_id = a.id"),
     ] {
         let outcome = v112_cl_join(tag, select);
         v112_cl_assert_rejected(tag, &outcome, "distinct alias");
@@ -585,6 +589,44 @@ fn v112_cl_output_columns_sharing_a_name_are_rejected() {
         ),
         "ok"
     );
+}
+
+#[pg_test]
+fn v112_cl_quoted_output_names_differing_past_a_dot_or_parenthesis_are_accepted() {
+    for (position, select) in [
+        "SELECT id, v AS \"t.x\", w AS \"u.x\" FROM {src}",
+        "SELECT id, \"x.id\", \"y.id\" FROM {src}",
+        "SELECT id, v AS \"rate (%)\", w AS \"rate (#)\" FROM {src}",
+        "SELECT id, v AS x, w AS \"X\" FROM {src}",
+        "SELECT id, v AS \"a\"\"b\", w AS \"a.b\" FROM {src}",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let tag = format!("outname{position}");
+        let src = format!("v112_cl_{tag}_src");
+        Spi::run(&format!(
+            "CREATE TABLE {src}(id SERIAL PRIMARY KEY, v INT, w INT, \"x.id\" INT, \"y.id\" INT); \
+             INSERT INTO {src}(v, w, \"x.id\", \"y.id\") VALUES (1,2,3,4),(1,2,3,4),(5,6,7,8)"
+        ))
+        .expect("source");
+        let steps = v112_cl_steps(
+            &[
+                "INSERT INTO {src}(v, w, \"x.id\", \"y.id\") VALUES (9,8,7,6)",
+                "UPDATE {src} SET v = w, w = v, \"x.id\" = \"y.id\" + 1 WHERE id <= 2",
+                "DELETE FROM {src} WHERE id = 3",
+                "DELETE FROM {src}",
+            ],
+            &src,
+        );
+        let imv = format!("v112_cl_{tag}");
+        assert_eq!(
+            v112_cl_cell(&imv, &select.replace("{src}", &src), "", "IMMEDIATE", &[&src], &steps),
+            "ok",
+            "{select}"
+        );
+        assert_eq!(v112_cl_unique_key(&tag), "id", "{select}");
+    }
 }
 
 // ---- set-returning functions ----
