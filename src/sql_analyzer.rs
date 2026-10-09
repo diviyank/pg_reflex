@@ -2,8 +2,8 @@ use serde::Serialize;
 use sqlparser::ast::{
     BinaryOperator, Distinct, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments,
     GroupByExpr, GroupByWithModifier, Ident, Join, JoinConstraint, JoinOperator, Query, Select,
-    SelectItem, SetExpr, SetOperator, SetQuantifier, Statement, TableFactor, Visit, VisitMut,
-    Visitor, VisitorMut,
+    SelectItem, SetExpr, SetOperator, SetQuantifier, Statement, TableFactor, TableWithJoins, Visit,
+    VisitMut, Visitor, VisitorMut,
 };
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
@@ -1182,6 +1182,24 @@ pub(crate) fn statement_column_refs(stmts: &[Statement]) -> Option<Vec<Vec<Strin
     (!refs.implicit_columns).then_some(refs.refs)
 }
 
+/// A NATURAL join names no join column: which columns it compares is known
+/// only from the catalog, so none of them can be listed as relevant.
+fn holds_natural_join(from_item: &TableWithJoins) -> bool {
+    let nested = |factor: &TableFactor| match factor {
+        TableFactor::NestedJoin {
+            table_with_joins, ..
+        } => holds_natural_join(table_with_joins),
+        _ => false,
+    };
+    nested(&from_item.relation)
+        || from_item.joins.iter().any(|join| {
+            matches!(
+                join_constraint(&join.join_operator),
+                Some(JoinConstraint::Natural)
+            ) || nested(&join.relation)
+        })
+}
+
 /// Compute the IMV-relevant column set for each source by walking every
 /// clause of the SELECT EXCEPT the WHERE clause: projection, GROUP BY,
 /// HAVING, JOIN ON, and JOIN USING column lists.
@@ -1197,7 +1215,7 @@ fn collect_imv_relevant_columns(
     _all_sources: &[String],
     has_ctes: bool,
 ) -> HashMap<String, BTreeSet<String>> {
-    if has_ctes {
+    if has_ctes || select.from.iter().any(holds_natural_join) {
         return HashMap::new();
     }
     let sources: Vec<String> = top_level_sources(select);
@@ -1651,8 +1669,44 @@ pub fn analyze(statements: &[Statement]) -> Result<SqlAnalysis, SqlAnalysisError
         collect_imv_relevant_columns(select, &analysis.table_aliases, &analysis.sources, has_ctes);
     analysis.imv_relevant_where =
         collect_imv_relevant_where(select, &analysis.table_aliases, &analysis.sources, has_ctes);
+    disable_update_skip_for_repeated_sources(&mut analysis);
 
     Ok(analysis)
+}
+
+/// Drops the UPDATE-skip inputs of every source the query reads more than once.
+/// They are collected per spelling and per alias, so for a relation read twice
+/// they describe one of its roles: an UPDATE of a column only the other role
+/// reads would be skipped as irrelevant. Two sources sharing an unquoted bare
+/// name count as one relation, whatever their schema or quoting.
+fn disable_update_skip_for_repeated_sources(analysis: &mut SqlAnalysis) {
+    let bare_name = |source: &str| {
+        source
+            .rsplit('.')
+            .next()
+            .unwrap_or(source)
+            .trim_matches('"')
+            .to_lowercase()
+    };
+    let read_more_than_once = |source: &String| {
+        let bare = bare_name(source);
+        analysis
+            .sources
+            .iter()
+            .filter(|other| bare_name(other) == bare)
+            .count()
+            > 1
+    };
+    let repeated: Vec<String> = analysis
+        .sources
+        .iter()
+        .filter(|source| read_more_than_once(source))
+        .cloned()
+        .collect();
+    for source in repeated {
+        analysis.imv_relevant_columns.remove(&source);
+        analysis.imv_relevant_where.remove(&source);
+    }
 }
 
 #[cfg(test)]

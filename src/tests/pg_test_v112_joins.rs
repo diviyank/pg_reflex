@@ -1,0 +1,995 @@
+fn v112_j_probe(body: &str) -> String {
+    Spi::run(&format!(
+        "DO $v112j$ DECLARE r text; BEGIN {body}; \
+         PERFORM set_config('v112_j.out', COALESCE(r, 'OK'), true); \
+         EXCEPTION WHEN OTHERS THEN \
+         PERFORM set_config('v112_j.out', 'RAISED: ' || SQLERRM, true); END $v112j$"
+    ))
+    .expect("probe");
+    Spi::get_one::<String>("SELECT current_setting('v112_j.out')")
+        .expect("probe result")
+        .unwrap_or_default()
+}
+
+fn v112_j_try(select: &str) -> String {
+    v112_j_probe(&format!("EXECUTE $v112q${select}$v112q$ INTO r"))
+}
+
+fn v112_j_try_dml(dml: &str) -> String {
+    v112_j_probe(&format!("EXECUTE $v112q${dml}$v112q$"))
+}
+
+fn v112_j_oracle(imv: &str, fresh_sql: &str) -> String {
+    v112_j_try(&format!(
+        "SELECT COUNT(*)::text FROM (\
+            (SELECT * FROM {imv} EXCEPT ALL SELECT * FROM ({fresh_sql}) AS __fresh1) \
+            UNION ALL \
+            (SELECT * FROM ({fresh_sql}) AS __fresh2 EXCEPT ALL SELECT * FROM {imv}) \
+         ) __oracle"
+    ))
+}
+
+/// One DML step: its label, the placeholder of the table it writes, the statement.
+type V112JStep = (&'static str, &'static str, &'static str);
+
+struct V112JFixture {
+    /// `(placeholder, bare table name, column list, seed rows)`.
+    tables: &'static [(&'static str, &'static str, &'static str, &'static str)],
+    steps: &'static [V112JStep],
+}
+
+/// A fact table, a dimension keyed by `kind` and a second dimension, seeded so
+/// both sides of every join hold matched and unmatched rows.
+const V112_J_STAR: V112JFixture = V112JFixture {
+    tables: &[
+        (
+            "{f}",
+            "fact",
+            "id SERIAL PRIMARY KEY, kind TEXT, v INT",
+            "INSERT INTO {f}(kind, v) VALUES ('a',1),('b',2),('c',3),('a',4),(NULL,5)",
+        ),
+        (
+            "{d}",
+            "dim",
+            "kind TEXT PRIMARY KEY, label TEXT",
+            "INSERT INTO {d} VALUES ('a','A'),('b','B'),('u','U')",
+        ),
+        (
+            "{g}",
+            "grp",
+            "kind TEXT PRIMARY KEY, w INT",
+            "INSERT INTO {g} VALUES ('a',10),('b',20),('q',30)",
+        ),
+    ],
+    steps: &[
+        ("f_ins", "{f}", "INSERT INTO {f}(kind, v) VALUES ('a',10),('z',20),('u',30)"),
+        ("f_upd", "{f}", "UPDATE {f} SET v = v + 100 WHERE id = 1"),
+        ("f_move", "{f}", "UPDATE {f} SET kind = 'q' WHERE id = 2"),
+        ("f_del", "{f}", "DELETE FROM {f} WHERE id IN (3, 4)"),
+        ("d_ins", "{d}", "INSERT INTO {d} VALUES ('c','C'),('w','W'),('z','A')"),
+        ("d_upd", "{d}", "UPDATE {d} SET label = 'BB' WHERE kind = 'b'"),
+        ("d_move", "{d}", "UPDATE {d} SET kind = 'q' WHERE kind = 'w'"),
+        ("d_del", "{d}", "DELETE FROM {d} WHERE kind IN ('a', 'c')"),
+        ("g_ins", "{g}", "INSERT INTO {g} VALUES ('z',40),('u',50)"),
+        ("g_upd", "{g}", "UPDATE {g} SET w = w + 1 WHERE kind = 'q'"),
+        ("g_move", "{g}", "UPDATE {g} SET kind = 'x' WHERE kind = 'b'"),
+        ("g_del", "{g}", "DELETE FROM {g} WHERE kind = 'z'"),
+        ("f_ins2", "{f}", "INSERT INTO {f}(kind, v) VALUES ('a',7),('q',8)"),
+        ("f_empty", "{f}", "DELETE FROM {f}"),
+        ("d_empty", "{d}", "DELETE FROM {d}"),
+        ("f_refill", "{f}", "INSERT INTO {f}(kind, v) VALUES ('a',1),('q',2)"),
+        ("d_refill", "{d}", "INSERT INTO {d} VALUES ('a','A'),('k','K')"),
+    ],
+};
+
+#[derive(Clone, Copy)]
+enum V112JNaming {
+    Public,
+    OwnSchema,
+}
+
+fn v112_j_table(tag: &str, naming: V112JNaming, bare: &str) -> String {
+    match naming {
+        V112JNaming::Public => format!("v112_j_{tag}_{bare}"),
+        V112JNaming::OwnSchema => format!("v112_j_{tag}_s.{bare}"),
+    }
+}
+
+fn v112_j_resolve(
+    template: &str,
+    fixture: &V112JFixture,
+    tag: &str,
+    naming: V112JNaming,
+) -> String {
+    fixture
+        .tables
+        .iter()
+        .fold(template.to_string(), |sql, (placeholder, bare, _, _)| {
+            sql.replace(placeholder, &v112_j_table(tag, naming, bare))
+        })
+}
+
+/// Creates the IMV over a fresh fixture, then runs every DML step that writes a
+/// table of the query, comparing the IMV with the query after each. Returns
+/// "ok" when every comparison matched, otherwise the per-step outcomes.
+fn v112_j_cell(
+    fixture: &V112JFixture,
+    tag: &str,
+    naming: V112JNaming,
+    select_template: &str,
+    deferred: bool,
+) -> String {
+    if let V112JNaming::OwnSchema = naming {
+        Spi::run(&format!("CREATE SCHEMA v112_j_{tag}_s")).expect("schema");
+    }
+    for (placeholder, _, columns, seed) in fixture.tables {
+        let table = v112_j_resolve(placeholder, fixture, tag, naming);
+        Spi::run(&format!("CREATE TABLE {table}({columns})")).expect("create table");
+        Spi::run(&v112_j_resolve(seed, fixture, tag, naming)).expect("seed");
+    }
+    let imv = format!("v112_j_{tag}");
+    let fresh = v112_j_resolve(select_template, fixture, tag, naming);
+    let mode = if deferred { "DEFERRED" } else { "IMMEDIATE" };
+    let created = v112_j_try(&format!(
+        "SELECT create_reflex_ivm('{imv}', $v112sel${fresh}$v112sel$, NULL, 'UNLOGGED', '{mode}')"
+    ));
+    if created != "CREATE REFLEX INCREMENTAL VIEW" {
+        return format!("NOT-CREATED {created}");
+    }
+    let mut outcomes = vec![("create".to_string(), v112_j_oracle(&imv, &fresh))];
+    for (label, written, dml) in fixture.steps {
+        if !select_template.contains(written) {
+            continue;
+        }
+        let ran = v112_j_try_dml(&v112_j_resolve(dml, fixture, tag, naming));
+        if ran != "OK" {
+            outcomes.push((label.to_string(), ran));
+            break;
+        }
+        if deferred {
+            let table = v112_j_resolve(written, fixture, tag, naming);
+            let flushed = v112_j_try(&format!("SELECT reflex_flush_deferred('{table}')"));
+            if flushed.starts_with("RAISED") || flushed.starts_with("ERROR") {
+                outcomes.push((label.to_string(), flushed));
+                break;
+            }
+        }
+        outcomes.push((label.to_string(), v112_j_oracle(&imv, &fresh)));
+    }
+    if outcomes.iter().all(|(_, outcome)| outcome == "0") {
+        return "ok".to_string();
+    }
+    outcomes
+        .iter()
+        .map(|(label, outcome)| format!("{label}={outcome}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+macro_rules! v112_j_cells {
+    ($fixture:expr, $naming:expr, $deferred:expr; $($name:ident => $select:expr,)+) => {
+        $(
+            #[pg_test]
+            fn $name() {
+                let tag = stringify!($name).trim_start_matches("v112_j_");
+                assert_eq!(
+                    v112_j_cell(&$fixture, tag, $naming, $select, $deferred),
+                    "ok",
+                    "{}",
+                    $select
+                );
+            }
+        )+
+    };
+}
+
+// ---------------------------------------------------------------------------
+// RIGHT / FULL JOIN: a write to either side, grouped by a column of either side
+// ---------------------------------------------------------------------------
+
+v112_j_cells! { V112_J_STAR, V112JNaming::Public, false;
+    v112_j_rj_fd_by_d => "SELECT d.label, COUNT(*) AS c, SUM(f.v) AS s FROM {f} f RIGHT JOIN {d} d ON d.kind = f.kind GROUP BY d.label",
+    v112_j_rj_df_by_d => "SELECT d.label, COUNT(*) AS c, SUM(f.v) AS s FROM {d} d RIGHT JOIN {f} f ON d.kind = f.kind GROUP BY d.label",
+    v112_j_rj_fd_by_f => "SELECT f.kind, COUNT(*) AS c, SUM(f.v) AS s FROM {f} f RIGHT JOIN {d} d ON d.kind = f.kind GROUP BY f.kind",
+    v112_j_rj_df_by_f => "SELECT f.kind, COUNT(*) AS c, COUNT(d.label) AS n FROM {d} d RIGHT JOIN {f} f ON d.kind = f.kind GROUP BY f.kind",
+    v112_j_rj_fd_by_dkey => "SELECT d.kind, COUNT(*) AS c, SUM(f.v) AS s FROM {f} f RIGHT JOIN {d} d ON d.kind = f.kind GROUP BY d.kind",
+    v112_j_rj_fd_by_both => "SELECT d.label, f.kind, COUNT(*) AS c, SUM(f.v) AS s FROM {f} f RIGHT JOIN {d} d ON d.kind = f.kind GROUP BY d.label, f.kind",
+    v112_j_rj_fd_ungrouped => "SELECT COUNT(*) AS c, SUM(f.v) AS s, COUNT(d.label) AS n FROM {f} f RIGHT JOIN {d} d ON d.kind = f.kind",
+    v112_j_rj_fd_minmax => "SELECT d.label, MIN(f.v) AS mn, MAX(f.v) AS mx, COUNT(f.id) AS c FROM {f} f RIGHT JOIN {d} d ON d.kind = f.kind GROUP BY d.label",
+    v112_j_rj_outer_fd => "SELECT d.label, COUNT(*) AS c, SUM(f.v) AS s FROM {f} f RIGHT OUTER JOIN {d} d ON d.kind = f.kind GROUP BY d.label",
+    v112_j_rj_outer_df => "SELECT f.kind, COUNT(*) AS c, COUNT(d.label) AS n FROM {d} d RIGHT OUTER JOIN {f} f ON d.kind = f.kind GROUP BY f.kind",
+    v112_j_rj_unaliased => "SELECT {d}.label, COUNT(*) AS c, SUM({f}.v) AS s FROM {f} RIGHT JOIN {d} ON {d}.kind = {f}.kind GROUP BY {d}.label",
+    v112_j_rj_lowercase => "select d.label, count(*) as c, sum(f.v) as s from {f} f right join {d} d on d.kind = f.kind group by d.label",
+    v112_j_fj_fd_by_d => "SELECT d.label, COUNT(*) AS c, SUM(f.v) AS s FROM {f} f FULL JOIN {d} d ON d.kind = f.kind GROUP BY d.label",
+    v112_j_fj_fd_by_f => "SELECT f.kind, COUNT(*) AS c, COUNT(d.label) AS n FROM {f} f FULL OUTER JOIN {d} d ON d.kind = f.kind GROUP BY f.kind",
+    v112_j_lj_df_by_d => "SELECT d.label, COUNT(*) AS c, SUM(f.v) AS s FROM {d} d LEFT JOIN {f} f ON d.kind = f.kind GROUP BY d.label",
+    v112_j_lj_df_by_f => "SELECT f.kind, COUNT(*) AS c, COUNT(d.label) AS n FROM {d} d LEFT JOIN {f} f ON d.kind = f.kind GROUP BY f.kind",
+    v112_j_rj_pt_fd => "SELECT f.id, f.v, d.kind, d.label FROM {f} f RIGHT JOIN {d} d ON d.kind = f.kind",
+    v112_j_rj_pt_df => "SELECT f.id, f.v, f.kind AS fkind, d.label FROM {d} d RIGHT JOIN {f} f ON d.kind = f.kind",
+    v112_j_rj_outer_pt_fd => "SELECT f.id, f.v, d.kind, d.label FROM {f} f RIGHT OUTER JOIN {d} d ON d.kind = f.kind",
+    v112_j_fj_pt_fd => "SELECT f.id, f.v, d.kind, d.label FROM {f} f FULL JOIN {d} d ON d.kind = f.kind",
+    v112_j_rj3_fd_inner_g => "SELECT d.label, COUNT(*) AS c, SUM(f.v) AS s, SUM(g.w) AS w FROM {f} f RIGHT JOIN {d} d ON d.kind = f.kind JOIN {g} g ON g.kind = d.kind GROUP BY d.label",
+    v112_j_rj3_fg_right_d => "SELECT d.label, COUNT(*) AS c, SUM(f.v) AS s, SUM(g.w) AS w FROM {f} f JOIN {g} g ON g.kind = f.kind RIGHT JOIN {d} d ON d.kind = f.kind GROUP BY d.label",
+    v112_j_rj3_fd_left_g => "SELECT d.label, COUNT(*) AS c, SUM(f.v) AS s, SUM(g.w) AS w FROM {f} f RIGHT JOIN {d} d ON d.kind = f.kind LEFT JOIN {g} g ON g.kind = d.kind GROUP BY d.label",
+    v112_j_rj3_gf_left_right_d => "SELECT d.label, COUNT(*) AS c, SUM(f.v) AS s, SUM(g.w) AS w FROM {g} g LEFT JOIN {f} f ON g.kind = f.kind RIGHT JOIN {d} d ON d.kind = g.kind GROUP BY d.label",
+    v112_j_rj3_double_right => "SELECT g.kind, COUNT(*) AS c, SUM(f.v) AS s, COUNT(d.label) AS n FROM {f} f RIGHT JOIN {d} d ON d.kind = f.kind RIGHT JOIN {g} g ON g.kind = d.kind GROUP BY g.kind",
+    v112_j_rj3_pt_fd_inner_g => "SELECT f.id, f.v, d.kind, d.label, g.w FROM {f} f RIGHT JOIN {d} d ON d.kind = f.kind JOIN {g} g ON g.kind = d.kind",
+    v112_j_rj3_pt_fg_right_d => "SELECT f.id, f.v, d.kind, d.label, g.w FROM {f} f JOIN {g} g ON g.kind = f.kind RIGHT JOIN {d} d ON d.kind = f.kind",
+    v112_j_rj_paren_nullable => "SELECT d.label, COUNT(*) AS c, SUM(f.v) AS s, SUM(g.w) AS w FROM ({f} f JOIN {g} g ON g.kind = f.kind) RIGHT JOIN {d} d ON d.kind = f.kind GROUP BY d.label",
+}
+
+v112_j_cells! { V112_J_STAR, V112JNaming::Public, true;
+    v112_j_rj_fd_by_d_deferred => "SELECT d.label, COUNT(*) AS c, SUM(f.v) AS s FROM {f} f RIGHT JOIN {d} d ON d.kind = f.kind GROUP BY d.label",
+    v112_j_rj_df_by_d_deferred => "SELECT d.label, COUNT(*) AS c, SUM(f.v) AS s FROM {d} d RIGHT JOIN {f} f ON d.kind = f.kind GROUP BY d.label",
+    v112_j_rj_fd_by_f_deferred => "SELECT f.kind, COUNT(*) AS c, SUM(f.v) AS s FROM {f} f RIGHT JOIN {d} d ON d.kind = f.kind GROUP BY f.kind",
+    v112_j_rj_outer_fd_deferred => "SELECT d.label, COUNT(*) AS c, SUM(f.v) AS s FROM {f} f RIGHT OUTER JOIN {d} d ON d.kind = f.kind GROUP BY d.label",
+    v112_j_fj_fd_by_d_deferred => "SELECT d.label, COUNT(*) AS c, SUM(f.v) AS s FROM {f} f FULL JOIN {d} d ON d.kind = f.kind GROUP BY d.label",
+    v112_j_rj_pt_fd_deferred => "SELECT f.id, f.v, d.kind, d.label FROM {f} f RIGHT JOIN {d} d ON d.kind = f.kind",
+    v112_j_rj_pt_df_deferred => "SELECT f.id, f.v, f.kind AS fkind, d.label FROM {d} d RIGHT JOIN {f} f ON d.kind = f.kind",
+    v112_j_rj3_fd_inner_g_deferred => "SELECT d.label, COUNT(*) AS c, SUM(f.v) AS s, SUM(g.w) AS w FROM {f} f RIGHT JOIN {d} d ON d.kind = f.kind JOIN {g} g ON g.kind = d.kind GROUP BY d.label",
+    v112_j_rj3_fg_right_d_deferred => "SELECT d.label, COUNT(*) AS c, SUM(f.v) AS s, SUM(g.w) AS w FROM {f} f JOIN {g} g ON g.kind = f.kind RIGHT JOIN {d} d ON d.kind = f.kind GROUP BY d.label",
+}
+
+v112_j_cells! { V112_J_STAR, V112JNaming::OwnSchema, false;
+    v112_j_rj_schema_fd_by_d => "SELECT d.label, COUNT(*) AS c, SUM(f.v) AS s FROM {f} f RIGHT JOIN {d} d ON d.kind = f.kind GROUP BY d.label",
+    v112_j_rj_schema_df_by_d => "SELECT d.label, COUNT(*) AS c, SUM(f.v) AS s FROM {d} d RIGHT JOIN {f} f ON d.kind = f.kind GROUP BY d.label",
+    v112_j_rj_schema_fd_by_f => "SELECT f.kind, COUNT(*) AS c, SUM(f.v) AS s FROM {f} f RIGHT JOIN {d} d ON d.kind = f.kind GROUP BY f.kind",
+    v112_j_rj_schema_outer_fd => "SELECT d.label, COUNT(*) AS c, SUM(f.v) AS s FROM {f} f RIGHT OUTER JOIN {d} d ON d.kind = f.kind GROUP BY d.label",
+    v112_j_rj_schema_unaliased => "SELECT {d}.label, COUNT(*) AS c, SUM({f}.v) AS s FROM {f} RIGHT JOIN {d} ON {d}.kind = {f}.kind GROUP BY {d}.label",
+    v112_j_fj_schema_fd_by_d => "SELECT d.label, COUNT(*) AS c, SUM(f.v) AS s FROM {f} f FULL JOIN {d} d ON d.kind = f.kind GROUP BY d.label",
+    v112_j_rj_schema_pt_fd => "SELECT f.id, f.v, d.kind, d.label FROM {f} f RIGHT JOIN {d} d ON d.kind = f.kind",
+    v112_j_rj3_schema_fd_inner_g => "SELECT d.label, COUNT(*) AS c, SUM(f.v) AS s, SUM(g.w) AS w FROM {f} f RIGHT JOIN {d} d ON d.kind = f.kind JOIN {g} g ON g.kind = d.kind GROUP BY d.label",
+    v112_j_rj3_schema_fg_right_d => "SELECT d.label, COUNT(*) AS c, SUM(f.v) AS s, SUM(g.w) AS w FROM {f} f JOIN {g} g ON g.kind = f.kind RIGHT JOIN {d} d ON d.kind = f.kind GROUP BY d.label",
+}
+
+v112_j_cells! { V112_J_STAR, V112JNaming::OwnSchema, true;
+    v112_j_rj_schema_fd_by_d_deferred => "SELECT d.label, COUNT(*) AS c, SUM(f.v) AS s FROM {f} f RIGHT JOIN {d} d ON d.kind = f.kind GROUP BY d.label",
+    v112_j_rj_schema_pt_fd_deferred => "SELECT f.id, f.v, d.kind, d.label FROM {f} f RIGHT JOIN {d} d ON d.kind = f.kind",
+}
+
+v112_j_cells! { V112_J_STAR, V112JNaming::Public, false;
+    v112_j_lj_pt_df => "SELECT f.id, f.v, d.kind, d.label FROM {d} d LEFT JOIN {f} f ON d.kind = f.kind",
+}
+
+/// An UPDATE that brings rows of `{f}` into a WHERE that null-extended rows
+/// pass too. `forced` selects the bulk path of the UPDATE trigger: a zero wipe
+/// threshold over an analysed intermediate.
+fn v112_j_bulk_filter_entering_update_cell(tag: &str, from_template: &str, forced: bool) -> String {
+    let fact = format!("v112_j_{tag}_fact");
+    let dim = format!("v112_j_{tag}_dim");
+    Spi::run(&format!("CREATE TABLE {fact}(kind TEXT PRIMARY KEY, v INT)")).expect("fact");
+    Spi::run(&format!("CREATE TABLE {dim}(kind TEXT PRIMARY KEY, label TEXT)")).expect("dim");
+    Spi::run(&format!(
+        "INSERT INTO {fact} VALUES ('a',1),('b',-2),('c',-3),('z',-4)"
+    ))
+    .expect("seed fact");
+    Spi::run(&format!(
+        "INSERT INTO {dim} VALUES ('a','A'),('b','B'),('c','C'),('u','U')"
+    ))
+    .expect("seed dim");
+    let imv = format!("v112_j_{tag}");
+    let query = format!(
+        "SELECT d.kind, COUNT(*) AS c, SUM(f.v) AS s FROM {} WHERE f.v > 0 OR f.v IS NULL GROUP BY d.kind",
+        from_template.replace("{f}", &fact).replace("{d}", &dim)
+    );
+    let created = v112_j_try(&format!(
+        "SELECT create_reflex_ivm('{imv}', $v112sel${query}$v112sel$)"
+    ));
+    if created != "CREATE REFLEX INCREMENTAL VIEW" {
+        return format!("NOT-CREATED {created}");
+    }
+    let intermediate = Spi::get_one::<String>(&format!(
+        "SELECT reflex_intermediate_table_name('{imv}')"
+    ))
+    .expect("intermediate name")
+    .expect("intermediate name");
+    if forced {
+        Spi::run(&format!("ANALYZE {intermediate}")).expect("analyze");
+        Spi::run("SET LOCAL reflex.wipe_threshold = '0'").expect("threshold");
+    }
+    let mut outcomes = vec![("create".to_string(), v112_j_oracle(&imv, &query))];
+    let steps = [
+        ("enter", format!("UPDATE {fact} SET v = 5 WHERE kind IN ('b', 'c')")),
+        ("enter_unmatched", format!("UPDATE {fact} SET v = 6 WHERE kind = 'z'")),
+        ("leave", format!("UPDATE {fact} SET v = -1 WHERE kind = 'a'")),
+        ("reenter", format!("UPDATE {fact} SET v = 9 WHERE kind = 'a'")),
+    ];
+    for (label, dml) in steps {
+        let ran = v112_j_try_dml(&dml);
+        if ran != "OK" {
+            outcomes.push((label.to_string(), ran));
+            break;
+        }
+        outcomes.push((label.to_string(), v112_j_oracle(&imv, &query)));
+    }
+    Spi::run("RESET reflex.wipe_threshold").expect("reset");
+    if outcomes.iter().all(|(_, outcome)| outcome == "0") {
+        return "ok".to_string();
+    }
+    outcomes
+        .iter()
+        .map(|(label, outcome)| format!("{label}={outcome}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+#[pg_test]
+fn v112_j_bulk_filter_entering_update_right_join_null_extended_table() {
+    assert_eq!(
+        v112_j_bulk_filter_entering_update_cell("bfe_rj", "{f} f RIGHT JOIN {d} d ON d.kind = f.kind", true),
+        "ok"
+    );
+}
+
+#[pg_test]
+fn v112_j_bulk_filter_entering_update_inner_join() {
+    assert_eq!(
+        v112_j_bulk_filter_entering_update_cell("bfe_ij", "{d} d JOIN {f} f ON d.kind = f.kind", true),
+        "ok"
+    );
+}
+
+#[pg_test]
+fn v112_j_filter_entering_update_right_join_unforced() {
+    assert_eq!(
+        v112_j_bulk_filter_entering_update_cell(
+            "fe_rj",
+            "{f} f RIGHT JOIN {d} d ON d.kind = f.kind",
+            false
+        ),
+        "ok"
+    );
+}
+
+/// A passthrough keyed by the join column, its join keyword split over two
+/// lines: the stored query is the caller's text, whitespace included.
+fn v112_j_keyed_passthrough_cell(tag: &str, from_template: &str) -> String {
+    let fact = format!("v112_j_{tag}_fact");
+    let dim = format!("v112_j_{tag}_dim");
+    Spi::run(&format!("CREATE TABLE {fact}(kind TEXT PRIMARY KEY, v INT)")).expect("fact");
+    Spi::run(&format!("CREATE TABLE {dim}(kind TEXT PRIMARY KEY, label TEXT)")).expect("dim");
+    Spi::run(&format!("INSERT INTO {fact} VALUES ('a',1),('b',2),('c',3),('z',4)")).expect("seed");
+    Spi::run(&format!(
+        "INSERT INTO {dim} VALUES ('a','A'),('b','B'),('c','C'),('u','U')"
+    ))
+    .expect("seed");
+    let imv = format!("v112_j_{tag}");
+    let query = format!(
+        "SELECT d.kind, d.label, f.v FROM {}",
+        from_template.replace("{f}", &fact).replace("{d}", &dim)
+    );
+    let created = v112_j_try(&format!(
+        "SELECT create_reflex_ivm('{imv}', $v112sel${query}$v112sel$, 'kind')"
+    ));
+    if created != "CREATE REFLEX INCREMENTAL VIEW" {
+        return format!("NOT-CREATED {created}");
+    }
+    let mut outcomes = vec![("create".to_string(), v112_j_oracle(&imv, &query))];
+    let steps = [
+        ("f_ins", format!("INSERT INTO {fact} VALUES ('u',7),('y',8)")),
+        ("f_upd", format!("UPDATE {fact} SET v = v + 10 WHERE kind = 'a'")),
+        ("f_del", format!("DELETE FROM {fact} WHERE kind = 'b'")),
+        ("d_ins", format!("INSERT INTO {dim} VALUES ('z','Z'),('w','W')")),
+        ("d_upd", format!("UPDATE {dim} SET label = 'CC' WHERE kind = 'c'")),
+        ("d_del", format!("DELETE FROM {dim} WHERE kind IN ('a', 'w')")),
+    ];
+    for (label, dml) in steps {
+        let ran = v112_j_try_dml(&dml);
+        if ran != "OK" {
+            outcomes.push((label.to_string(), ran));
+            break;
+        }
+        outcomes.push((label.to_string(), v112_j_oracle(&imv, &query)));
+    }
+    if outcomes.iter().all(|(_, outcome)| outcome == "0") {
+        return "ok".to_string();
+    }
+    outcomes
+        .iter()
+        .map(|(label, outcome)| format!("{label}={outcome}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+macro_rules! v112_j_keyed_passthrough_cells {
+    ($($name:ident => $from:expr,)+) => {
+        $(
+            #[pg_test]
+            fn $name() {
+                let tag = stringify!($name).trim_start_matches("v112_j_");
+                assert_eq!(v112_j_keyed_passthrough_cell(tag, $from), "ok", "{}", $from);
+            }
+        )+
+    };
+}
+
+v112_j_keyed_passthrough_cells! {
+    v112_j_kp_left_join => "{d} d LEFT JOIN {f} f ON d.kind = f.kind",
+    v112_j_kp_left_join_on_two_lines => "{d} d LEFT\n    JOIN {f} f ON d.kind = f.kind",
+    v112_j_kp_left_outer_join_tabbed => "{d} d left\touter\tjoin {f} f ON d.kind = f.kind",
+    v112_j_kp_right_join => "{f} f RIGHT JOIN {d} d ON d.kind = f.kind",
+    v112_j_kp_right_join_on_two_lines => "{f} f RIGHT\n    JOIN {d} d ON d.kind = f.kind",
+    v112_j_kp_right_outer_join_tabbed => "{f} f right\touter\tjoin {d} d ON d.kind = f.kind",
+}
+
+/// The bulk path of an UPDATE that brings rows of the table after a RIGHT JOIN
+/// into the WHERE filter, forced by a zero wipe threshold over an analysed
+/// intermediate. Their group key is read from the null-extended table, so the
+/// unmatched ones land in the NULL group that already exists.
+#[pg_test]
+fn v112_j_bulk_filter_entering_update_right_join_preserved_table() {
+    Spi::run("CREATE TABLE v112_j_bfp_fact(kind TEXT PRIMARY KEY, v INT)").expect("fact");
+    Spi::run("CREATE TABLE v112_j_bfp_dim(kind TEXT PRIMARY KEY, label TEXT)").expect("dim");
+    Spi::run("INSERT INTO v112_j_bfp_fact VALUES ('a',1),('b',2),('z',4)").expect("seed");
+    Spi::run(
+        "INSERT INTO v112_j_bfp_dim VALUES ('a','A'),('b','B'),('u','U'),('p','x'),('q','x'),('z','x')",
+    )
+    .expect("seed");
+    let query = "SELECT f.kind, COUNT(*) AS c, COUNT(d.label) AS n FROM v112_j_bfp_fact f \
+                 RIGHT JOIN v112_j_bfp_dim d ON d.kind = f.kind WHERE d.label <> 'x' GROUP BY f.kind";
+    assert_eq!(
+        crate::create_reflex_ivm("v112_j_bfp", query, None, None, None, None),
+        "CREATE REFLEX INCREMENTAL VIEW"
+    );
+    assert_imv_correct("v112_j_bfp", query);
+    let intermediate =
+        Spi::get_one::<String>("SELECT reflex_intermediate_table_name('v112_j_bfp')")
+            .expect("intermediate name")
+            .expect("intermediate name");
+    Spi::run(&format!("ANALYZE {intermediate}")).expect("analyze");
+    Spi::run("SET LOCAL reflex.wipe_threshold = '0'").expect("threshold");
+    let entered = v112_j_try_dml("UPDATE v112_j_bfp_dim SET label = 'Y' WHERE label = 'x'");
+    Spi::run("RESET reflex.wipe_threshold").expect("reset");
+    assert_eq!(entered, "OK");
+    assert_imv_correct("v112_j_bfp", query);
+}
+
+/// The fixture of the derived-table report: `{f}` groups joined to a filtered
+/// `{d}`, several `{d}` rows per group.
+const V112_J_DERIVED: V112JFixture = V112JFixture {
+    tables: &[
+        (
+            "{f}",
+            "fact",
+            "id SERIAL PRIMARY KEY, g TEXT, city TEXT, v INT",
+            "INSERT INTO {f}(g, city, v) SELECT 'g' || (i % 3), \
+             CASE WHEN i % 2 = 0 THEN 'Lyon' ELSE 'Paris' END, i FROM generate_series(1, 30) i",
+        ),
+        (
+            "{d}",
+            "dim",
+            "id SERIAL PRIMARY KEY, g TEXT, w INT",
+            "INSERT INTO {d}(g, w) VALUES ('g0',5),('g1',7),('g1',3),('g1',-4),('g9',1)",
+        ),
+        (
+            "{g}",
+            "grp",
+            "g TEXT PRIMARY KEY, z INT",
+            "INSERT INTO {g} VALUES ('g0',1),('g1',2),('g7',3)",
+        ),
+    ],
+    steps: &[
+        ("d_del", "{d}", "DELETE FROM {d} WHERE w = 3"),
+        ("d_ins", "{d}", "INSERT INTO {d}(g, w) VALUES ('g2',9),('g1',1),('g8',2),('g0',-1)"),
+        ("d_upd", "{d}", "UPDATE {d} SET w = w + 10 WHERE g = 'g1'"),
+        ("d_move", "{d}", "UPDATE {d} SET g = 'g2' WHERE g = 'g0'"),
+        ("d_filter", "{d}", "UPDATE {d} SET w = -w WHERE g = 'g2'"),
+        ("f_ins", "{f}", "INSERT INTO {f}(g, city, v) VALUES ('g9','Nice',100),('g1','Nice',200)"),
+        ("f_upd", "{f}", "UPDATE {f} SET v = v + 1000 WHERE id = 3"),
+        ("f_move", "{f}", "UPDATE {f} SET g = 'g8' WHERE id IN (1, 2)"),
+        ("f_del", "{f}", "DELETE FROM {f} WHERE g = 'g2'"),
+        ("g_ins", "{g}", "INSERT INTO {g} VALUES ('g2',4),('g8',5)"),
+        ("g_upd", "{g}", "UPDATE {g} SET z = z + 1 WHERE g = 'g1'"),
+        ("g_del", "{g}", "DELETE FROM {g} WHERE g = 'g1'"),
+        ("d_empty", "{d}", "DELETE FROM {d}"),
+        ("d_refill", "{d}", "INSERT INTO {d}(g, w) VALUES ('g1',2),('g8',6)"),
+        ("f_empty", "{f}", "DELETE FROM {f}"),
+    ],
+};
+
+// ---------------------------------------------------------------------------
+// Outer join onto a derived table or a parenthesised join: a write to a table
+// inside it
+// ---------------------------------------------------------------------------
+
+v112_j_cells! { V112_J_DERIVED, V112JNaming::Public, false;
+    v112_j_dt_lj_minmax_by_f => "SELECT s.g, MIN(d.w) AS mn, MAX(s.v) AS mx FROM {f} s LEFT JOIN (SELECT g, w FROM {d} WHERE w > 0) d ON d.g = s.g GROUP BY s.g",
+    v112_j_dt_lj_sum_by_f => "SELECT s.g, COUNT(*) AS c, SUM(d.w) AS w, SUM(s.v) AS v FROM {f} s LEFT JOIN (SELECT g, w FROM {d} WHERE w > 0) d ON d.g = s.g GROUP BY s.g",
+    v112_j_dt_lj_sum_by_d => "SELECT d.g, COUNT(*) AS c, SUM(d.w) AS w, SUM(s.v) AS v FROM {f} s LEFT JOIN (SELECT g, w FROM {d} WHERE w > 0) d ON d.g = s.g GROUP BY d.g",
+    v112_j_dt_lj_outer_sum => "SELECT s.g, COUNT(*) AS c, SUM(d.w) AS w FROM {f} s LEFT OUTER JOIN (SELECT g, w FROM {d} WHERE w > 0) d ON d.g = s.g GROUP BY s.g",
+    v112_j_dt_lj_ungrouped => "SELECT COUNT(*) AS c, SUM(d.w) AS w, SUM(s.v) AS v FROM {f} s LEFT JOIN (SELECT g, w FROM {d} WHERE w > 0) d ON d.g = s.g",
+    v112_j_dt_lj_pt => "SELECT s.id, s.g, s.v, d.w FROM {f} s LEFT JOIN (SELECT g, w FROM {d} WHERE w > 0) d ON d.g = s.g",
+    v112_j_dt_rj_sum_by_f => "SELECT s.g, COUNT(*) AS c, SUM(d.w) AS w, SUM(s.v) AS v FROM (SELECT g, w FROM {d} WHERE w > 0) d RIGHT JOIN {f} s ON d.g = s.g GROUP BY s.g",
+    v112_j_dt_rj_derived_preserved => "SELECT d.g, COUNT(*) AS c, SUM(d.w) AS w, SUM(s.v) AS v FROM {f} s RIGHT JOIN (SELECT g, w FROM {d} WHERE w > 0) d ON d.g = s.g GROUP BY d.g",
+    v112_j_dt_fj_sum => "SELECT s.g, COUNT(*) AS c, SUM(d.w) AS w FROM {f} s FULL JOIN (SELECT g, w FROM {d} WHERE w > 0) d ON d.g = s.g GROUP BY s.g",
+    v112_j_dt_inner_sum => "SELECT s.g, COUNT(*) AS c, SUM(d.w) AS w, SUM(s.v) AS v FROM {f} s JOIN (SELECT g, w FROM {d} WHERE w > 0) d ON d.g = s.g GROUP BY s.g",
+    v112_j_dt_lj_paren_join => "SELECT s.g, COUNT(*) AS c, SUM(d.w) AS w, SUM(k.z) AS z FROM {f} s LEFT JOIN ({d} d JOIN {g} k ON k.g = d.g) ON d.g = s.g GROUP BY s.g",
+    v112_j_dt_lj_derived_join => "SELECT s.g, COUNT(*) AS c, SUM(d.w) AS w, SUM(d.z) AS z FROM {f} s LEFT JOIN (SELECT x.g, x.w, k.z FROM {d} x JOIN {g} k ON k.g = x.g) d ON d.g = s.g GROUP BY s.g",
+    v112_j_dt_lj_then_inner => "SELECT s.g, COUNT(*) AS c, SUM(d.w) AS w, SUM(k.z) AS z FROM {f} s LEFT JOIN (SELECT g, w FROM {d} WHERE w > 0) d ON d.g = s.g JOIN {g} k ON k.g = s.g GROUP BY s.g",
+}
+
+v112_j_cells! { V112_J_DERIVED, V112JNaming::Public, true;
+    v112_j_dt_lj_minmax_by_f_deferred => "SELECT s.g, MIN(d.w) AS mn, MAX(s.v) AS mx FROM {f} s LEFT JOIN (SELECT g, w FROM {d} WHERE w > 0) d ON d.g = s.g GROUP BY s.g",
+    v112_j_dt_lj_sum_by_f_deferred => "SELECT s.g, COUNT(*) AS c, SUM(d.w) AS w, SUM(s.v) AS v FROM {f} s LEFT JOIN (SELECT g, w FROM {d} WHERE w > 0) d ON d.g = s.g GROUP BY s.g",
+    v112_j_dt_lj_pt_deferred => "SELECT s.id, s.g, s.v, d.w FROM {f} s LEFT JOIN (SELECT g, w FROM {d} WHERE w > 0) d ON d.g = s.g",
+}
+
+v112_j_cells! { V112_J_DERIVED, V112JNaming::OwnSchema, false;
+    v112_j_dt_schema_lj_sum_by_f => "SELECT s.g, COUNT(*) AS c, SUM(d.w) AS w, SUM(s.v) AS v FROM {f} s LEFT JOIN (SELECT g, w FROM {d} WHERE w > 0) d ON d.g = s.g GROUP BY s.g",
+}
+
+/// The stored query of every LEFT JOIN shape below parses and keeps its scoped
+/// delta for each source: the derived-table guard recomputes only what it names.
+#[pg_test]
+fn v112_j_left_join_onto_a_plain_table_keeps_its_scoped_delta() {
+    let shapes = [
+        "SELECT d.label, COUNT(*) AS c, SUM(f.v) AS s, AVG(f.v) AS a, MIN(f.v) AS mn, MAX(f.v) AS mx FROM {d} d LEFT JOIN {f} f ON d.kind = f.kind GROUP BY d.label",
+        "SELECT d.label, COUNT(*) FILTER (WHERE f.v > 1) AS c, BOOL_OR(f.v > 2) AS b FROM {d} d LEFT OUTER JOIN {f} f ON d.kind = f.kind GROUP BY d.label",
+        "SELECT d.label, COUNT(DISTINCT f.v) AS c FROM {d} d LEFT JOIN {f} f ON d.kind = f.kind GROUP BY d.label",
+        "SELECT upper(d.label) AS l, SUM(f.v::numeric) AS s, SUM(CASE WHEN f.v > 1 THEN f.v ELSE 0 END) AS t FROM {d} d LEFT JOIN {f} f ON d.kind = f.kind WHERE d.label LIKE '%' AND d.kind IN ('a', 'b', 'u') AND COALESCE(f.v, 0) BETWEEN 0 AND 100 GROUP BY upper(d.label)",
+        "SELECT d.label, SUM(f.v) AS s FROM {d} d LEFT JOIN {f} f ON d.kind = f.kind GROUP BY d.label HAVING SUM(f.v) > 0",
+        "SELECT d.label, SUM(f.v) AS s, SUM(g.w) AS w FROM {d} d JOIN {g} g ON g.kind = d.kind LEFT JOIN {f} f ON d.kind = f.kind GROUP BY d.label",
+        "SELECT COUNT(*) AS c, SUM(f.v) AS s FROM {d} d LEFT JOIN {f} f ON d.kind = f.kind",
+        "SELECT DISTINCT d.label, f.kind FROM {d} d LEFT JOIN {f} f ON d.kind = f.kind",
+        "SELECT f.id, f.v, d.kind, d.label FROM {d} d LEFT JOIN {f} f ON d.kind = f.kind",
+        "SELECT f.id, f.v, d.label\n  FROM {f} f\n  LEFT JOIN {d} d\n    ON d.kind = f.kind\n  WHERE f.v > 0",
+    ];
+    for (placeholder, _, columns, seed) in V112_J_STAR.tables {
+        let table = v112_j_resolve(placeholder, &V112_J_STAR, "keep", V112JNaming::Public);
+        Spi::run(&format!("CREATE TABLE {table}({columns})")).expect("create table");
+        Spi::run(&v112_j_resolve(seed, &V112_J_STAR, "keep", V112JNaming::Public)).expect("seed");
+    }
+    for (position, shape) in shapes.iter().enumerate() {
+        let imv = format!("v112_j_keep_{position}");
+        let query = v112_j_resolve(shape, &V112_J_STAR, "keep", V112JNaming::Public);
+        assert_eq!(
+            crate::create_reflex_ivm(&imv, &query, None, None, None, None),
+            "CREATE REFLEX INCREMENTAL VIEW",
+            "{query}"
+        );
+        let base_query = Spi::get_one::<String>(&format!(
+            "SELECT base_query FROM public.__reflex_ivm_reference WHERE name = '{imv}'"
+        ))
+        .expect("registry")
+        .expect("base_query");
+        let sources = Spi::get_one::<Vec<String>>(&format!(
+            "SELECT depends_on FROM public.__reflex_ivm_reference WHERE name = '{imv}'"
+        ))
+        .expect("registry")
+        .expect("depends_on");
+        assert!(sources.len() >= 2, "{query}");
+        for source in sources {
+            assert!(
+                !crate::trigger::has_no_scoped_delta(&base_query, &source),
+                "{source} of {base_query}"
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Source spellings: one relation named twice, an alias equal to the bare name,
+// and a same-named table of another schema
+// ---------------------------------------------------------------------------
+
+/// Runs INSERT, UPDATE and DELETE on every table of `writes` (each a
+/// `season TEXT, v INT` table with a serial `id`), comparing the IMV with its
+/// query after each. Returns "ok" or the per-step outcomes.
+fn v112_j_spelling_cell(imv: &str, query: &str, deferred: bool, writes: &[&str]) -> String {
+    let mode = if deferred { "DEFERRED" } else { "IMMEDIATE" };
+    let created = v112_j_try(&format!(
+        "SELECT create_reflex_ivm('{imv}', $v112sel${query}$v112sel$, NULL, 'UNLOGGED', '{mode}')"
+    ));
+    if created != "CREATE REFLEX INCREMENTAL VIEW" {
+        return format!("NOT-CREATED {created}");
+    }
+    let mut outcomes = vec![("create".to_string(), v112_j_oracle(imv, query))];
+    'tables: for table in writes {
+        let steps = [
+            ("ins", format!("INSERT INTO {table}(season, v) VALUES ('e',10),('y',20),('n',30)")),
+            ("upd", format!("UPDATE {table} SET v = v + 100 WHERE id = 1")),
+            ("move", format!("UPDATE {table} SET season = 'y' WHERE id = 3")),
+            ("del", format!("DELETE FROM {table} WHERE id = 2")),
+        ];
+        for (label, dml) in steps {
+            let label = format!("{table}:{label}");
+            let ran = v112_j_try_dml(&dml);
+            if ran != "OK" {
+                outcomes.push((label, ran));
+                break 'tables;
+            }
+            if deferred {
+                let flushed = v112_j_flush_every_source(imv);
+                if flushed.contains("RAISED") || flushed.contains("ERROR") {
+                    outcomes.push((label, flushed));
+                    break 'tables;
+                }
+            }
+            outcomes.push((label, v112_j_oracle(imv, query)));
+        }
+    }
+    if outcomes.iter().all(|(_, outcome)| outcome == "0") {
+        return "ok".to_string();
+    }
+    outcomes
+        .iter()
+        .map(|(label, outcome)| format!("{label}={outcome}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Flushes under the spelling each source is registered with.
+fn v112_j_flush_every_source(imv: &str) -> String {
+    v112_j_try(&format!(
+        "SELECT string_agg(reflex_flush_deferred(d), '; ') FROM (SELECT DISTINCT unnest(depends_on) AS d \
+         FROM public.__reflex_ivm_reference WHERE name = '{imv}') sources"
+    ))
+}
+
+fn v112_j_season_table(table: &str) {
+    Spi::run(&format!(
+        "CREATE TABLE {table}(id SERIAL PRIMARY KEY, season TEXT, v INT)"
+    ))
+    .expect("create");
+    Spi::run(&format!(
+        "INSERT INTO {table}(season, v) VALUES ('e',1),('y',2),('e',3)"
+    ))
+    .expect("seed");
+}
+
+fn v112_j_self_join_cell(tag: &str, left: &str, right: &str, deferred: bool) -> String {
+    let table = format!("v112_j_{tag}_t");
+    v112_j_season_table(&table);
+    let query = format!(
+        "SELECT a.season, COUNT(*) AS c, SUM(b.v) AS s FROM {} a JOIN {} b ON a.season = b.season GROUP BY a.season",
+        left.replace("{t}", &table),
+        right.replace("{t}", &table)
+    );
+    v112_j_spelling_cell(&format!("v112_j_{tag}"), &query, deferred, &[&table])
+}
+
+#[pg_test]
+fn v112_j_self_join_quoted_then_bare() {
+    assert_eq!(v112_j_self_join_cell("sj_qb", "\"{t}\"", "{t}", false), "ok");
+}
+
+#[pg_test]
+fn v112_j_self_join_bare_then_quoted() {
+    assert_eq!(v112_j_self_join_cell("sj_bq", "{t}", "\"{t}\"", false), "ok");
+}
+
+#[pg_test]
+fn v112_j_self_join_both_quoted() {
+    assert_eq!(v112_j_self_join_cell("sj_qq", "\"{t}\"", "\"{t}\"", false), "ok");
+}
+
+#[pg_test]
+fn v112_j_self_join_both_bare() {
+    assert_eq!(v112_j_self_join_cell("sj_bb", "{t}", "{t}", false), "ok");
+}
+
+#[pg_test]
+fn v112_j_self_join_bare_then_public_qualified() {
+    assert_eq!(v112_j_self_join_cell("sj_bp", "{t}", "public.{t}", false), "ok");
+}
+
+#[pg_test]
+fn v112_j_self_join_filter_on_one_alias() {
+    v112_j_season_table("v112_j_sj_w_t");
+    let query = "SELECT a.season, COUNT(*) AS c, SUM(b.v) AS s FROM v112_j_sj_w_t a \
+                 JOIN v112_j_sj_w_t b ON a.season = b.season WHERE a.v > 1 GROUP BY a.season";
+    assert_eq!(
+        crate::create_reflex_ivm("v112_j_sj_w", query, None, None, None, None),
+        "CREATE REFLEX INCREMENTAL VIEW"
+    );
+    assert_imv_correct("v112_j_sj_w", query);
+    // Row 1 fails the filter as `a` before and after, and feeds SUM(b.v) as `b`.
+    Spi::run("UPDATE v112_j_sj_w_t SET season = 'y' WHERE id = 1").expect("move");
+    assert_imv_correct("v112_j_sj_w", query);
+    Spi::run("UPDATE v112_j_sj_w_t SET v = 0 WHERE id = 1").expect("update");
+    assert_imv_correct("v112_j_sj_w", query);
+    Spi::run("DELETE FROM v112_j_sj_w_t WHERE id = 1").expect("delete");
+    assert_imv_correct("v112_j_sj_w", query);
+}
+
+#[pg_test]
+fn v112_j_self_join_quoted_then_bare_deferred() {
+    assert_eq!(v112_j_self_join_cell("sj_qb_d", "\"{t}\"", "{t}", true), "ok");
+}
+
+#[pg_test]
+fn v112_j_self_join_bare_then_quoted_deferred() {
+    assert_eq!(v112_j_self_join_cell("sj_bq_d", "{t}", "\"{t}\"", true), "ok");
+}
+
+fn v112_j_schema_self_join_cell(tag: &str, left: &str, right: &str, deferred: bool) -> String {
+    let schema = format!("v112_j_{tag}_s");
+    Spi::run(&format!("CREATE SCHEMA {schema}")).expect("schema");
+    v112_j_season_table(&format!("{schema}.t"));
+    let query = format!(
+        "SELECT a.season, COUNT(*) AS c, SUM(b.v) AS s FROM {} a JOIN {} b ON a.season = b.season GROUP BY a.season",
+        left.replace("{s}", &schema),
+        right.replace("{s}", &schema)
+    );
+    v112_j_spelling_cell(
+        &format!("v112_j_{tag}"),
+        &query,
+        deferred,
+        &[&format!("{schema}.t")],
+    )
+}
+
+#[pg_test]
+fn v112_j_schema_self_join_bare_then_fully_quoted() {
+    assert_eq!(
+        v112_j_schema_self_join_cell("ssj_bq", "{s}.t", "\"{s}\".\"t\"", false),
+        "ok"
+    );
+}
+
+#[pg_test]
+fn v112_j_schema_self_join_quoted_schema_then_quoted_table() {
+    assert_eq!(
+        v112_j_schema_self_join_cell("ssj_qq", "\"{s}\".t", "{s}.\"t\"", false),
+        "ok"
+    );
+}
+
+#[pg_test]
+fn v112_j_schema_self_join_bare_then_fully_quoted_deferred() {
+    assert_eq!(
+        v112_j_schema_self_join_cell("ssj_bq_d", "{s}.t", "\"{s}\".\"t\"", true),
+        "ok"
+    );
+}
+
+fn v112_j_bare_alias_cell(tag: &str, from_template: &str, alias: &str, deferred: bool) -> String {
+    let schema = format!("v112_j_{tag}_s");
+    Spi::run(&format!("CREATE SCHEMA {schema}")).expect("schema");
+    v112_j_season_table(&format!("{schema}.t"));
+    let from = from_template.replace("{s}", &schema);
+    let aggregate = format!(
+        "SELECT {alias}.season, SUM({alias}.v) AS s FROM {from} WHERE {alias}.v > 0 GROUP BY {alias}.season"
+    );
+    let passthrough =
+        format!("SELECT {alias}.id, {alias}.season, {alias}.v FROM {from} WHERE {alias}.v > 0");
+    let aggregate_outcome = v112_j_spelling_cell(
+        &format!("v112_j_{tag}_agg"),
+        &aggregate,
+        deferred,
+        &[&format!("{schema}.t")],
+    );
+    let passthrough_outcome = v112_j_oracle_after_create(
+        &format!("v112_j_{tag}_pt"),
+        &passthrough,
+        deferred,
+        &format!("{schema}.t"),
+    );
+    format!("agg[{aggregate_outcome}] pt[{passthrough_outcome}]")
+}
+
+/// Creates a second IMV over an already-written table and checks it through one
+/// more INSERT, UPDATE and DELETE.
+fn v112_j_oracle_after_create(imv: &str, query: &str, deferred: bool, table: &str) -> String {
+    let mode = if deferred { "DEFERRED" } else { "IMMEDIATE" };
+    let created = v112_j_try(&format!(
+        "SELECT create_reflex_ivm('{imv}', $v112sel${query}$v112sel$, NULL, 'UNLOGGED', '{mode}')"
+    ));
+    if created != "CREATE REFLEX INCREMENTAL VIEW" {
+        return format!("NOT-CREATED {created}");
+    }
+    let mut outcomes = vec![("create".to_string(), v112_j_oracle(imv, query))];
+    let steps = [
+        ("ins", format!("INSERT INTO {table}(season, v) VALUES ('e',11),('k',-5)")),
+        ("upd", format!("UPDATE {table} SET v = v + 1 WHERE season = 'e'")),
+        ("del", format!("DELETE FROM {table} WHERE season = 'y'")),
+    ];
+    for (label, dml) in steps {
+        let ran = v112_j_try_dml(&dml);
+        if ran != "OK" {
+            outcomes.push((label.to_string(), ran));
+            break;
+        }
+        if deferred {
+            let flushed = v112_j_flush_every_source(imv);
+            if flushed.contains("RAISED") || flushed.contains("ERROR") {
+                outcomes.push((label.to_string(), flushed));
+                break;
+            }
+        }
+        outcomes.push((label.to_string(), v112_j_oracle(imv, query)));
+    }
+    if outcomes.iter().all(|(_, outcome)| outcome == "0") {
+        return "ok".to_string();
+    }
+    outcomes
+        .iter()
+        .map(|(label, outcome)| format!("{label}={outcome}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+macro_rules! v112_j_bare_alias_cells {
+    ($($name:ident => ($from:expr, $alias:expr, $deferred:expr),)+) => {
+        $(
+            #[pg_test]
+            fn $name() {
+                let tag = stringify!($name).trim_start_matches("v112_j_");
+                assert_eq!(
+                    v112_j_bare_alias_cell(tag, $from, $alias, $deferred),
+                    "agg[ok] pt[ok]",
+                    "{}",
+                    $from
+                );
+            }
+        )+
+    };
+}
+
+v112_j_bare_alias_cells! {
+    v112_j_ba_quoted_schema_as => ("\"{s}\".t AS t", "t", false),
+    v112_j_ba_fully_quoted_as => ("\"{s}\".\"t\" AS t", "t", false),
+    v112_j_ba_quoted_table_as => ("{s}.\"t\" AS t", "t", false),
+    v112_j_ba_bare_as => ("{s}.t AS t", "t", false),
+    v112_j_ba_quoted_schema_implicit => ("\"{s}\".t t", "t", false),
+    v112_j_ba_fully_quoted_implicit => ("\"{s}\".\"t\" t", "t", false),
+    v112_j_ba_quoted_schema_lowercase_as => ("\"{s}\".t as t", "t", false),
+    v112_j_ba_quoted_schema_other_alias => ("\"{s}\".t AS x", "x", false),
+    v112_j_ba_fully_quoted_other_alias => ("\"{s}\".\"t\" AS x", "x", false),
+    v112_j_ba_quoted_schema_as_deferred => ("\"{s}\".t AS t", "t", true),
+    v112_j_ba_fully_quoted_as_deferred => ("\"{s}\".\"t\" AS t", "t", true),
+}
+
+#[pg_test]
+fn v112_j_bare_alias_in_a_join_stays_correct() {
+    Spi::run("CREATE SCHEMA v112_j_baj_s").expect("schema");
+    v112_j_season_table("v112_j_baj_s.t");
+    v112_j_season_table("v112_j_baj_o");
+    let query = "SELECT t.season, COUNT(*) AS c, SUM(o.v) AS s FROM \"v112_j_baj_s\".t AS t \
+                 JOIN v112_j_baj_o o ON o.season = t.season GROUP BY t.season";
+    assert_eq!(
+        v112_j_spelling_cell(
+            "v112_j_baj",
+            query,
+            false,
+            &["v112_j_baj_s.t", "v112_j_baj_o"]
+        ),
+        "ok"
+    );
+}
+
+/// An UPDATE that brings a row into the WHERE filter of a join whose aliased
+/// source is the joined table, keyed by the join column.
+fn v112_j_filter_entering_update_cell(tag: &str, from_template: &str) -> String {
+    let schema = format!("v112_j_{tag}_s");
+    Spi::run(&format!("CREATE SCHEMA {schema}")).expect("schema");
+    v112_j_season_table(&format!("{schema}.t"));
+    Spi::run(&format!("INSERT INTO {schema}.t(season, v) VALUES ('n',-1),('n',-2)")).expect("seed");
+    let other = format!("v112_j_{tag}_o");
+    v112_j_season_table(&other);
+    Spi::run(&format!("INSERT INTO {other}(season, v) VALUES ('k',4),('k',4),('k',5)")).expect("seed");
+    let imv = format!("v112_j_{tag}");
+    let query = format!(
+        "SELECT t.id, COUNT(*) AS c, SUM(o.id) AS s FROM {other} o JOIN {} ON o.v = t.id \
+         WHERE t.v > 0 GROUP BY t.id",
+        from_template.replace("{s}", &schema)
+    );
+    let created = v112_j_try(&format!(
+        "SELECT create_reflex_ivm('{imv}', $v112sel${query}$v112sel$)"
+    ));
+    if created != "CREATE REFLEX INCREMENTAL VIEW" {
+        return format!("NOT-CREATED {created}");
+    }
+    let mut outcomes = vec![("create".to_string(), v112_j_oracle(&imv, &query))];
+    let steps = [
+        ("enter", format!("UPDATE {schema}.t SET v = 50 WHERE id = 4")),
+        ("leave", format!("UPDATE {schema}.t SET v = -5 WHERE id = 1")),
+        ("enter_many", format!("UPDATE {schema}.t SET v = 7 WHERE v < 0")),
+        ("ins", format!("INSERT INTO {schema}.t(season, v) VALUES ('z',9)")),
+        ("del", format!("DELETE FROM {schema}.t WHERE id = 4")),
+        ("other_ins", format!("INSERT INTO {other}(season, v) VALUES ('k',5),('k',6)")),
+    ];
+    for (label, dml) in steps {
+        let ran = v112_j_try_dml(&dml);
+        if ran != "OK" {
+            outcomes.push((label.to_string(), ran));
+            break;
+        }
+        outcomes.push((label.to_string(), v112_j_oracle(&imv, &query)));
+    }
+    if outcomes.iter().all(|(_, outcome)| outcome == "0") {
+        return "ok".to_string();
+    }
+    outcomes
+        .iter()
+        .map(|(label, outcome)| format!("{label}={outcome}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+#[pg_test]
+fn v112_j_filter_entering_update_quoted_schema_bare_alias() {
+    assert_eq!(v112_j_filter_entering_update_cell("fe_qs", "\"{s}\".t AS t"), "ok");
+}
+
+#[pg_test]
+fn v112_j_filter_entering_update_fully_quoted_bare_alias() {
+    assert_eq!(v112_j_filter_entering_update_cell("fe_fq", "\"{s}\".\"t\" AS t"), "ok");
+}
+
+#[pg_test]
+fn v112_j_filter_entering_update_unquoted_bare_alias() {
+    assert_eq!(v112_j_filter_entering_update_cell("fe_un", "{s}.t AS t"), "ok");
+}
+
+#[pg_test]
+fn v112_j_filter_entering_update_quoted_schema_implicit_bare_alias() {
+    assert_eq!(v112_j_filter_entering_update_cell("fe_oa", "\"{s}\".t t"), "ok");
+}
+
+/// `{a}` and `{b}` are two schemas each holding a table `dim`; `{f}` joins both.
+fn v112_j_same_name_cell(tag: &str, select_template: &str, deferred: bool) -> String {
+    let schema_a = format!("v112_j_{tag}_a");
+    let schema_b = format!("v112_j_{tag}_b");
+    let fact = format!("v112_j_{tag}_f");
+    Spi::run(&format!("CREATE SCHEMA {schema_a}")).expect("schema a");
+    Spi::run(&format!("CREATE SCHEMA {schema_b}")).expect("schema b");
+    v112_j_season_table(&format!("{schema_a}.dim"));
+    v112_j_season_table(&format!("{schema_b}.dim"));
+    v112_j_season_table(&fact);
+    let query = select_template
+        .replace("{a}", &schema_a)
+        .replace("{b}", &schema_b)
+        .replace("{f}", &fact);
+    v112_j_spelling_cell(
+        &format!("v112_j_{tag}"),
+        &query,
+        deferred,
+        &[
+            &format!("{schema_a}.dim"),
+            &format!("{schema_b}.dim"),
+            &fact,
+        ],
+    )
+}
+
+macro_rules! v112_j_same_name_cells {
+    ($($name:ident => ($select:expr, $deferred:expr),)+) => {
+        $(
+            #[pg_test]
+            fn $name() {
+                let tag = stringify!($name).trim_start_matches("v112_j_");
+                assert_eq!(v112_j_same_name_cell(tag, $select, $deferred), "ok", "{}", $select);
+            }
+        )+
+    };
+}
+
+v112_j_same_name_cells! {
+    v112_j_sn_inner_quoted => ("SELECT a.season, COUNT(*) AS c, SUM(b.v) AS s FROM {f} f JOIN \"{a}\".dim a ON a.season = f.season JOIN {b}.\"dim\" b ON b.season = f.season GROUP BY a.season", false),
+    v112_j_sn_inner_fully_quoted => ("SELECT a.season, COUNT(*) AS c, SUM(b.v) AS s FROM {f} f JOIN \"{a}\".\"dim\" a ON a.season = f.season JOIN \"{b}\".\"dim\" b ON b.season = f.season GROUP BY a.season", false),
+    v112_j_sn_inner_one_quoted => ("SELECT a.season, COUNT(*) AS c, SUM(b.v) AS s FROM {f} f JOIN {a}.dim a ON a.season = f.season JOIN {b}.\"dim\" b ON b.season = f.season GROUP BY a.season", false),
+    v112_j_sn_inner_unquoted => ("SELECT a.season, COUNT(*) AS c, SUM(b.v) AS s FROM {f} f JOIN {a}.dim a ON a.season = f.season JOIN {b}.dim b ON b.season = f.season GROUP BY a.season", false),
+    v112_j_sn_left_quoted => ("SELECT f.season, COUNT(*) AS c, SUM(b.v) AS s, SUM(a.v) AS t FROM {f} f LEFT JOIN \"{a}\".dim a ON a.season = f.season LEFT JOIN {b}.\"dim\" b ON b.season = f.season GROUP BY f.season", false),
+    v112_j_sn_left_unquoted => ("SELECT f.season, COUNT(*) AS c, SUM(b.v) AS s, SUM(a.v) AS t FROM {f} f LEFT JOIN {a}.dim a ON a.season = f.season LEFT JOIN {b}.dim b ON b.season = f.season GROUP BY f.season", false),
+    v112_j_sn_pt_quoted => ("SELECT f.id AS fid, a.season AS aseason, b.season AS bseason, b.v FROM {f} f JOIN \"{a}\".dim a ON a.id = f.id JOIN {b}.\"dim\" b ON b.id = f.id", false),
+    v112_j_sn_inner_quoted_deferred => ("SELECT a.season, COUNT(*) AS c, SUM(b.v) AS s FROM {f} f JOIN \"{a}\".dim a ON a.season = f.season JOIN {b}.\"dim\" b ON b.season = f.season GROUP BY a.season", true),
+}
+
+#[pg_test]
+fn v112_j_public_table_beside_quoted_same_name_in_other_schema() {
+    Spi::run("CREATE SCHEMA v112_j_snp_b").expect("schema");
+    v112_j_season_table("v112_j_snp_dim");
+    v112_j_season_table("v112_j_snp_b.v112_j_snp_dim");
+    let query = "SELECT a.season, COUNT(*) AS c, SUM(b.v) AS s FROM v112_j_snp_dim a \
+                 JOIN v112_j_snp_b.\"v112_j_snp_dim\" b ON b.season = a.season GROUP BY a.season";
+    assert_eq!(
+        v112_j_spelling_cell(
+            "v112_j_snp",
+            query,
+            false,
+            &["v112_j_snp_dim", "v112_j_snp_b.v112_j_snp_dim"]
+        ),
+        "ok"
+    );
+}
