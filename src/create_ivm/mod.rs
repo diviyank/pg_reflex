@@ -34,6 +34,10 @@ pub(crate) struct ParsedInputs {
     storage_upper: String,
     mode_upper: String,
     parsed_sql: Vec<sqlparser::ast::Statement>,
+    /// The query with its unquoted names in lower case, when it writes one otherwise.
+    /// The pipeline then works from this text, so that the names it registers and the
+    /// names in the query it stores are spelled alike.
+    folded_sql: Option<String>,
     analysis: crate::sql_analyzer::SqlAnalysis,
     /// Aggregates pg_reflex does not decompose, accepted because the query is a
     /// single-level passthrough. Only a keyless one recomputes them on every write.
@@ -153,6 +157,7 @@ fn validate_and_parse_inputs(
             return Err(crate::reflex_reject(&format!("Failed to parse SQL: {}", e)));
         }
     };
+    let (parsed_sql, folded_sql) = with_unquoted_names_folded(parsed_sql);
     let (analysis, function_contract) = match analyze(&parsed_sql) {
         Err(SqlAnalysisError::MultipleQueries(_)) => {
             return Err(crate::reflex_reject("Expected 1 query, got multiple"));
@@ -188,10 +193,25 @@ fn validate_and_parse_inputs(
         storage_upper,
         mode_upper,
         parsed_sql,
+        folded_sql,
         analysis,
         keyless_only_aggregates: function_contract.keyless_only_aggregates,
         set_returning_select_functions: function_contract.set_returning_select_functions,
     })
+}
+
+fn with_unquoted_names_folded(
+    mut statements: Vec<sqlparser::ast::Statement>,
+) -> (Vec<sqlparser::ast::Statement>, Option<String>) {
+    let rendered = |statements: &[sqlparser::ast::Statement]| {
+        let texts: Vec<String> = statements.iter().map(|s| s.to_string()).collect();
+        texts.join("; ")
+    };
+    let written = rendered(&statements);
+    crate::sql_analyzer::fold_unquoted_names(&mut statements);
+    let folded = rendered(&statements);
+    let folded_sql = (folded != written).then_some(folded);
+    (statements, folded_sql)
 }
 
 /// For passthrough IMVs, resolve the unique-key column set: explicit
@@ -2380,10 +2400,12 @@ pub(crate) fn create_reflex_ivm_impl_with_materialization(
         return "REFLEX INCREMENTAL VIEW ALREADY EXISTS (skipped)";
     }
 
-    let parsed = match validate_and_parse_inputs(view_name, sql, storage_mode, refresh_mode) {
+    let mut parsed = match validate_and_parse_inputs(view_name, sql, storage_mode, refresh_mode) {
         Ok(p) => p,
         Err(msg) => return msg,
     };
+    let folded_sql = parsed.folded_sql.take();
+    let sql = folded_sql.as_deref().unwrap_or(sql);
 
     warn_on_bare_name_under_nonpublic_search_path(view_name);
 
@@ -2528,6 +2550,7 @@ pub(crate) fn create_reflex_ivm_impl_with_materialization(
         storage_upper,
         mode_upper,
         parsed_sql,
+        folded_sql: _,
         mut analysis,
         keyless_only_aggregates,
         set_returning_select_functions,

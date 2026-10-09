@@ -166,6 +166,86 @@ fn v112_cl_bare_pk_reference_is_still_the_key() {
     }
 }
 
+// ---- identifiers are compared the way PostgreSQL folds them ----
+
+#[pg_test]
+fn v112_cl_upper_case_spelling_of_a_column_is_maintained() {
+    for (position, select) in [
+        "SELECT id, G FROM {src}",
+        "SELECT id, g, V FROM {src}",
+        "SELECT ID, G, v FROM {src}",
+        "SELECT t.id, T.g, T.V FROM {src} t",
+        "SELECT T.id, T.g, t.v FROM {src} T",
+        "SELECT id, \"T\".v FROM {src} \"T\"",
+        "SELECT g, SUM(\"T\".v) AS s FROM {src} AS \"T\" GROUP BY g",
+        "SELECT id, v FROM {src} \"T\" WHERE \"T\".g <> 'b'",
+        "SELECT g, COUNT(*) AS c FROM {src} \"T\" WHERE \"T\".v > 0 GROUP BY g",
+        "SELECT id, g, v FROM {SRC}",
+        "SELECT {SRC}.id, {src}.G FROM {src}",
+        "SELECT id, g FROM {src} WHERE V > 0",
+        "SELECT id, v FROM {src} WHERE G <> 'b' AND g <> 'q'",
+        "SELECT id, V FROM {src} WHERE g <> 'b'",
+        "SELECT g, SUM(V) AS s FROM {src} GROUP BY g",
+        "SELECT G, SUM(v) AS s, COUNT(*) AS c FROM {src} GROUP BY G",
+        "SELECT g, MAX(V) AS m FROM {src} WHERE V > 0 GROUP BY g",
+        "SELECT g, COUNT(*) AS c FROM {SRC} WHERE v IS NOT NULL GROUP BY g",
+        "SELECT SUM(V) AS s, COUNT(G) AS c FROM {src}",
+    ]
+    .iter()
+    .enumerate()
+    {
+        for (mode_tag, mode) in [("i", "IMMEDIATE"), ("d", "DEFERRED")] {
+            let tag = format!("fold{position}{mode_tag}");
+            let src = format!("v112_cl_{tag}_src");
+            Spi::run(&format!(
+                "CREATE TABLE {src}(id SERIAL PRIMARY KEY, g TEXT, v INT); \
+                 INSERT INTO {src}(g, v) VALUES ('a',1),('a',1),('b',2),('c',NULL),('c',4)"
+            ))
+            .expect("source");
+            let named = |text: &str| text.replace("{src}", &src).replace("{SRC}", &src.to_uppercase());
+            let steps: Vec<String> = [
+                "UPDATE {src} SET g = 'b' WHERE g = 'c'",
+                "UPDATE {src} SET v = v + 10 WHERE g = 'a'",
+                "UPDATE {SRC} SET V = 0, G = 'q' WHERE id = 3",
+                "INSERT INTO {src}(g, v) VALUES ('q', 7), ('a', NULL)",
+                "UPDATE {src} SET v = NULL WHERE g = 'q'",
+                "DELETE FROM {src} WHERE g = 'a'",
+                "DELETE FROM {src}",
+            ]
+            .iter()
+            .map(|step| named(step))
+            .collect();
+            assert_eq!(
+                v112_cl_cell(&format!("v112_cl_{tag}"), &named(select), "", mode, &[&src], &steps),
+                "ok",
+                "{select} {mode}"
+            );
+        }
+    }
+}
+
+#[pg_test]
+fn v112_cl_upper_case_spelling_in_a_join_is_maintained() {
+    for (tag, select) in [
+        (
+            "fold_join_agg",
+            "SELECT a.label AS la, COUNT(*) AS c, SUM(B.ID) AS s FROM {a} a JOIN {b} b ON B.A_ID = A.ID \
+             GROUP BY a.label",
+        ),
+        (
+            "fold_join_pass",
+            "SELECT b.id, A.LABEL AS la, B.label AS lb FROM {a} A JOIN {b} b ON b.A_ID = a.ID",
+        ),
+        (
+            "fold_join_using",
+            "SELECT b.id, a.label AS la, B.LABEL AS lb FROM {a} a JOIN {b} B ON B.a_id = A.id \
+             WHERE A.LABEL <> 'nope'",
+        ),
+    ] {
+        assert_eq!(v112_cl_join(tag, select), "ok", "{select}");
+    }
+}
+
 // ---- an aggregate is never a keyed row-level passthrough ----
 
 #[pg_test]
