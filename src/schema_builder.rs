@@ -483,6 +483,28 @@ pub fn build_indexes_ddl(view_name: &str, plan: &AggregationPlan) -> Vec<String>
     indexes
 }
 
+/// The suffix a source's statement triggers and their functions carry.
+fn source_trigger_suffix(source_table: &str) -> String {
+    source_table.replace('.', "_").replace('"', "")
+}
+
+/// Name of the statement trigger maintaining the IMVs of `source_table` on
+/// `op` (`ins`, `del`, `upd`, `trunc`), as PostgreSQL stores it.
+pub(crate) fn source_trigger_name(source_table: &str, op: &str) -> String {
+    safe_identifier(&format!(
+        "__reflex_trigger_{op}_on_{}",
+        source_trigger_suffix(source_table)
+    ))
+}
+
+/// Name, in `public`, of the function the `op` trigger of `source_table` runs.
+pub(crate) fn source_trigger_function_name(source_table: &str, op: &str) -> String {
+    safe_identifier(&format!(
+        "__reflex_{op}_trigger_on_{}",
+        source_trigger_suffix(source_table)
+    ))
+}
+
 /// Build consolidated trigger DDL statements for a source table.
 ///
 /// Returns 4 DDL blocks (INSERT, DELETE, UPDATE, TRUNCATE), each creating a plpgsql
@@ -497,7 +519,6 @@ pub fn build_trigger_ddls(source_table: &str) -> Vec<String> {
 /// `build_trigger_ddls` with the statement-trigger body template given, so a
 /// migration test can render the bodies an older template produced.
 pub(crate) fn build_trigger_ddls_from_body(source_table: &str, body_template: &str) -> Vec<String> {
-    let safe_source = source_table.replace('.', "_").replace('"', "");
     let ref_new = transition_new_table_name(source_table);
     let ref_old = transition_old_table_name(source_table);
 
@@ -693,8 +714,8 @@ pub(crate) fn build_trigger_ddls_from_body(source_table: &str, body_template: &s
     };
 
     // INSERT
-    let ins_fn = safe_identifier(&format!("__reflex_ins_trigger_on_{}", safe_source));
-    let ins_trig = safe_identifier(&format!("__reflex_trigger_ins_on_{}", safe_source));
+    let ins_fn = source_trigger_function_name(source_table, "ins");
+    let ins_trig = source_trigger_name(source_table, "ins");
     let ins_body = render_body(&ref_new, &pred_check_ins, "", "", "", "'INSERT'");
     let ins_ddl = format!(
         "CREATE OR REPLACE FUNCTION public.{ins_fn}() RETURNS TRIGGER AS $fn$ {ins_body} $fn$ LANGUAGE plpgsql;\n\
@@ -705,8 +726,8 @@ pub(crate) fn build_trigger_ddls_from_body(source_table: &str, body_template: &s
     );
 
     // DELETE
-    let del_fn = safe_identifier(&format!("__reflex_del_trigger_on_{}", safe_source));
-    let del_trig = safe_identifier(&format!("__reflex_trigger_del_on_{}", safe_source));
+    let del_fn = source_trigger_function_name(source_table, "del");
+    let del_trig = source_trigger_name(source_table, "del");
     let del_body = render_body(&ref_old, &pred_check_del, "", "", "", "'DELETE'");
     let del_ddl = format!(
         "CREATE OR REPLACE FUNCTION public.{del_fn}() RETURNS TRIGGER AS $fn$ {del_body} $fn$ LANGUAGE plpgsql;\n\
@@ -717,8 +738,8 @@ pub(crate) fn build_trigger_ddls_from_body(source_table: &str, body_template: &s
     );
 
     // UPDATE
-    let upd_fn = safe_identifier(&format!("__reflex_upd_trigger_on_{}", safe_source));
-    let upd_trig = safe_identifier(&format!("__reflex_trigger_upd_on_{}", safe_source));
+    let upd_fn = source_trigger_function_name(source_table, "upd");
+    let upd_trig = source_trigger_name(source_table, "upd");
     let upd_body = render_body(
         &ref_new,
         &pred_check_upd,
@@ -736,8 +757,8 @@ pub(crate) fn build_trigger_ddls_from_body(source_table: &str, body_template: &s
     );
 
     // TRUNCATE — no REFERENCING clauses; loops over all dependent IMVs
-    let trunc_fn = safe_identifier(&format!("__reflex_trunc_trigger_on_{}", safe_source));
-    let trunc_trig = safe_identifier(&format!("__reflex_trigger_trunc_on_{}", safe_source));
+    let trunc_fn = source_trigger_function_name(source_table, "trunc");
+    let trunc_trig = source_trigger_name(source_table, "trunc");
     let trunc_body = slot_replace(
         include_str!("../sql/trigger_truncate_body.plpgsql.in"),
         &[("__REFLEX_SLOT_SOURCE_TABLE__", source_table)],
@@ -777,7 +798,6 @@ pub(crate) fn build_trigger_ddls_from_body(source_table: &str, body_template: &s
 /// column ORDER may differ from the current shape — still receives the rows
 /// at the correct named columns instead of mismatching positionally.
 pub fn build_deferred_trigger_ddls(source_table: &str, source_columns: &[String]) -> Vec<String> {
-    let safe_source = source_table.replace('.', "_").replace('"', "");
     let bare_source = source_table
         .split('.')
         .next_back()
@@ -812,8 +832,8 @@ pub fn build_deferred_trigger_ddls(source_table: &str, source_columns: &[String]
     };
 
     // INSERT
-    let ins_fn = safe_identifier(&format!("__reflex_ins_trigger_on_{}", safe_source));
-    let ins_trig = safe_identifier(&format!("__reflex_trigger_ins_on_{}", safe_source));
+    let ins_fn = source_trigger_function_name(source_table, "ins");
+    let ins_trig = source_trigger_name(source_table, "ins");
     let ins_body = render_ins_del(&ref_new, "INSERT", "I", &ref_new);
     let ins_ddl = format!(
         "CREATE OR REPLACE FUNCTION public.{ins_fn}() RETURNS TRIGGER AS $fn$ {ins_body} $fn$ LANGUAGE plpgsql;\n\
@@ -824,8 +844,8 @@ pub fn build_deferred_trigger_ddls(source_table: &str, source_columns: &[String]
     );
 
     // DELETE
-    let del_fn = safe_identifier(&format!("__reflex_del_trigger_on_{}", safe_source));
-    let del_trig = safe_identifier(&format!("__reflex_trigger_del_on_{}", safe_source));
+    let del_fn = source_trigger_function_name(source_table, "del");
+    let del_trig = source_trigger_name(source_table, "del");
     let del_body = render_ins_del(&ref_old, "DELETE", "D", &ref_old);
     let del_ddl = format!(
         "CREATE OR REPLACE FUNCTION public.{del_fn}() RETURNS TRIGGER AS $fn$ {del_body} $fn$ LANGUAGE plpgsql;\n\
@@ -836,8 +856,8 @@ pub fn build_deferred_trigger_ddls(source_table: &str, source_columns: &[String]
     );
 
     // UPDATE — capture both old and new rows
-    let upd_fn = safe_identifier(&format!("__reflex_upd_trigger_on_{}", safe_source));
-    let upd_trig = safe_identifier(&format!("__reflex_trigger_upd_on_{}", safe_source));
+    let upd_fn = source_trigger_function_name(source_table, "upd");
+    let upd_trig = source_trigger_name(source_table, "upd");
     let upd_body = slot_replace(
         include_str!("../sql/deferred_trigger_update_body.plpgsql.in"),
         &[
@@ -858,8 +878,8 @@ pub fn build_deferred_trigger_ddls(source_table: &str, source_columns: &[String]
     );
 
     // TRUNCATE — same as immediate (no deferred staging for truncate)
-    let trunc_fn = safe_identifier(&format!("__reflex_trunc_trigger_on_{}", safe_source));
-    let trunc_trig = safe_identifier(&format!("__reflex_trigger_trunc_on_{}", safe_source));
+    let trunc_fn = source_trigger_function_name(source_table, "trunc");
+    let trunc_trig = source_trigger_name(source_table, "trunc");
     let trunc_body = slot_replace(
         include_str!("../sql/deferred_trigger_truncate_body.plpgsql.in"),
         &[
