@@ -266,6 +266,14 @@ fn resolve_unique_columns(ctx: &mut BuildContext) {
              no key of a source identifies its rows: it is fully refreshed by every write.",
             ctx.view_name
         );
+    } else if ctx.analysis.sources.iter().any(|s| s.starts_with('<')) {
+        info!(
+            "pg_reflex: passthrough '{}' reads a derived table or a function in FROM, whose \
+             rows are not known to be the rows of a source: it has no key and is fully \
+             refreshed by every write. Pass the key columns as the 3rd argument to \
+             create_reflex_ivm for incremental maintenance.",
+            ctx.view_name
+        );
     } else if !ctx.is_join_query {
         // Auto-detect: only for single-source queries (JOINs need explicit key)
         let select_bare_names = columns_projected_under_their_own_name(&ctx.analysis);

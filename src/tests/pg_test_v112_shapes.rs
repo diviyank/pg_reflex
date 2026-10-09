@@ -504,6 +504,27 @@ const V112_SH_KEY_STEPS: &[(&str, &str)] = &[
     ("refill", "INSERT INTO {p}t(g, v, arr) VALUES ('a',1,'{1,2}'),('b',1,'{3}')"),
 ];
 
+/// A derived table that renames another column to the primary key's name, or
+/// multiplies the rows, gives no key to the IMV.
+#[pg_test]
+fn v112_sh_key_is_not_inferred_through_a_derived_table() {
+    v112_sh_assert_cells(
+        "reflex_sh_key",
+        &[
+            v112_sh_cell!(V112_SH_KEY_SETUP, V112_SH_KEY_STEPS, "renamed", None, "SELECT x.id, x.g FROM (SELECT v AS id, g FROM {p}t) x"),
+            v112_sh_cell!(V112_SH_KEY_SETUP, V112_SH_KEY_STEPS, "unnest", None, "SELECT x.id, x.e FROM (SELECT id, unnest(arr) AS e FROM {p}t) x"),
+            v112_sh_cell!(V112_SH_KEY_SETUP, V112_SH_KEY_STEPS, "renamed_bare", None, "SELECT id, g FROM (SELECT v AS id, g FROM {p}t) x"),
+            v112_sh_cell!(V112_SH_KEY_SETUP, V112_SH_KEY_STEPS, "renamed_star", None, "SELECT * FROM (SELECT v AS id, g FROM {p}t) x"),
+            v112_sh_cell!(V112_SH_KEY_SETUP, V112_SH_KEY_STEPS, "series", None, "SELECT x.id, x.n FROM (SELECT id, generate_series(1, v) AS n FROM {p}t) x"),
+            v112_sh_cell!(V112_SH_KEY_SETUP, V112_SH_KEY_STEPS, "nested", None, "SELECT y.id, y.g FROM (SELECT x.id, x.g FROM (SELECT v AS id, g FROM {p}t) x) y"),
+            v112_sh_cell!(V112_SH_KEY_SETUP, V112_SH_KEY_STEPS, "self_join", None, "SELECT x.id, x.v2 FROM (SELECT a.id, b.v AS v2 FROM {p}t a JOIN {p}t b ON b.g <> a.g) x"),
+            v112_sh_cell!(V112_SH_KEY_SETUP, V112_SH_KEY_STEPS, "expr", None, "SELECT x.id, x.g FROM (SELECT id + v AS id, g FROM {p}t) x"),
+            v112_sh_cell!(V112_SH_KEY_SETUP, V112_SH_KEY_STEPS, "same_ctl", None, "SELECT x.id, x.g, x.v FROM (SELECT id, g, v FROM {p}t WHERE v > 0) x"),
+            v112_sh_cell!(V112_SH_KEY_SETUP, V112_SH_KEY_STEPS, "direct_ctl", None, "SELECT id, g, v FROM {p}t"),
+        ],
+    );
+}
+
 /// The registered sources of an IMV, as one string.
 fn v112_sh_depends_on(imv: &str) -> String {
     v112_sh_remote(&format!(
