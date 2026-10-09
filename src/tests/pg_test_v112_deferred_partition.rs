@@ -679,3 +679,95 @@ fn v112_dp_rewrites_and_neighbours_of_the_refused_row_shapes_stay_correct() {
     probe_db_close(DBNAME);
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
+
+/// A dropped leaf of a partitioned IMV (`intermediate` or target side): the
+/// remedies the audit prints, run as printed until it reports nothing, must leave
+/// the IMV equal to its query, then and after writes to the groups of that leaf.
+fn v112_dp_assert_dropped_leaf_remedy_restores_the_data(prefix: &str, mode: &str, intermediate: bool) {
+    let source = format!("{prefix}_t");
+    let imv = format!("{prefix}_v");
+    let query = format!("SELECT season, SUM(v) AS sv, COUNT(*) AS c FROM {source} GROUP BY season");
+    Spi::run(&format!(
+        "CREATE TABLE {source}(id INT NOT NULL, season TEXT NOT NULL, v INT) PARTITION BY LIST (season)"
+    ))
+    .expect("source");
+    for (leaf, bound) in [("p0", "FOR VALUES IN ('e', 'f')"), ("p1", "FOR VALUES IN ('y')"), ("pd", "DEFAULT")] {
+        Spi::run(&format!("CREATE TABLE {source}_{leaf} PARTITION OF {source} {bound}")).expect("leaf");
+    }
+    Spi::run(&format!(
+        "INSERT INTO {source} VALUES (1,'e',10),(2,'e',40),(3,'f',5),(4,'y',2),(5,'z',3)"
+    ))
+    .expect("seed");
+    let created = Spi::get_one::<String>(&format!(
+        "SELECT create_reflex_ivm('{imv}', '{query}', NULL, NULL, '{mode}', NULL, ARRAY['season'])"
+    ))
+    .expect("create")
+    .unwrap_or_default();
+    assert_eq!(created, "CREATE REFLEX INCREMENTAL VIEW");
+    let flush = || {
+        if mode == "DEFERRED" {
+            Spi::run(&format!("SELECT reflex_flush_deferred('{source}')")).expect("flush");
+        }
+    };
+
+    let parent = if intermediate {
+        format!("__reflex_intermediate_{imv}")
+    } else {
+        imv.clone()
+    };
+    let victim = Spi::get_one::<String>(&format!(
+        "SELECT c.relname::text FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid \
+         WHERE i.inhparent = '\"{parent}\"'::regclass AND c.relname LIKE '%\\_p0'"
+    ))
+    .expect("leaf lookup")
+    .expect("no leaf for p0");
+    Spi::run(&format!("DROP TABLE \"{victim}\"")).expect("drop leaf");
+
+    let mut report = ps9_audit(&imv);
+    assert!(report.contains("partition-mirror"), "the dropped leaf is not reported:\n{report}");
+    for _ in 0..4 {
+        let Some(category) = ["partition-mirror", "archive_residue"]
+            .into_iter()
+            .find(|category| report.contains(category))
+        else {
+            break;
+        };
+        let fix = ps9_suggested_fix(&report, category);
+        Spi::run(&fix).unwrap_or_else(|e| panic!("printed remedy `{fix}` failed: {e}"));
+        report = ps9_audit(&imv);
+    }
+    assert!(
+        !report.contains("partition-mirror") && !report.contains("archive_residue"),
+        "the printed remedies did not clear the findings:\n{report}"
+    );
+    assert_imv_correct(&imv, &query);
+    for write in [
+        "INSERT INTO {s} VALUES (6,'e',4),(7,'y',1)",
+        "UPDATE {s} SET v = v + 1 WHERE season = 'f'",
+        "DELETE FROM {s} WHERE id = 1",
+    ] {
+        Spi::run(&write.replace("{s}", &source)).expect("write");
+        flush();
+        assert_imv_correct(&imv, &query);
+    }
+}
+
+#[pg_test]
+fn v112_dp_dropped_intermediate_leaf_remedy_restores_the_data_immediate() {
+    v112_dp_assert_dropped_leaf_remedy_restores_the_data("v112_dp_li", "IMMEDIATE", true);
+}
+
+#[pg_test]
+fn v112_dp_dropped_intermediate_leaf_remedy_restores_the_data_deferred() {
+    v112_dp_assert_dropped_leaf_remedy_restores_the_data("v112_dp_ld", "DEFERRED", true);
+}
+
+#[pg_test]
+fn v112_dp_dropped_target_leaf_remedy_restores_the_data_immediate() {
+    v112_dp_assert_dropped_leaf_remedy_restores_the_data("v112_dp_ti", "IMMEDIATE", false);
+}
+
+#[pg_test]
+fn v112_dp_dropped_target_leaf_remedy_restores_the_data_deferred() {
+    v112_dp_assert_dropped_leaf_remedy_restores_the_data("v112_dp_td", "DEFERRED", false);
+}
