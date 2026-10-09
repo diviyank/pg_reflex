@@ -59,23 +59,19 @@ fn intermediate_column_spec(
         } else {
             ic.pg_type.clone()
         };
-        let default = match effective_type.as_str() {
-            "BOOLEAN" => "FALSE",
-            t if t.to_uppercase().starts_with("TEXT")
-                || t.to_uppercase().starts_with("VARCHAR")
-                || t.to_uppercase().starts_with("CHAR") =>
-            {
-                "''"
-            }
-            t if t.to_uppercase().contains("TIMESTAMP") || t.to_uppercase().contains("DATE") => {
-                "'epoch'"
-            }
-            _ => "0",
+        let (value_type, collate_clause) = crate::aggregation::split_collation(&effective_type);
+        let default = if is_extremum(ic) {
+            extremum_default(value_type)
+        } else {
+            Some(match effective_type.as_str() {
+                "BOOLEAN" => "FALSE",
+                _ => "0",
+            })
         };
-        columns.push(format!(
-            "    \"{}\" {} DEFAULT {}",
-            ic.name, effective_type, default
-        ));
+        columns.push(match default {
+            Some(default) => format!("    \"{}\" {} DEFAULT {}", ic.name, effective_type, default),
+            None => format!("    \"{}\" {}", ic.name, effective_type),
+        });
 
         // For top-K-enabled MIN/MAX columns, emit the sibling array column.
         // The element type matches the scalar column; the default empty array
@@ -83,10 +79,11 @@ fn intermediate_column_spec(
         // happens at IMV creation via the base_query.
         if ic.has_topk() {
             columns.push(format!(
-                "    \"{}\" {}[] DEFAULT '{{}}'::{}[]",
+                "    \"{}\" {}[]{} DEFAULT '{{}}'::{}[]",
                 ic.topk_column_name(),
-                effective_type,
-                effective_type
+                value_type,
+                collate_clause,
+                value_type
             ));
         }
     }
@@ -97,6 +94,37 @@ fn intermediate_column_spec(
     }
 
     Some(columns)
+}
+
+fn is_extremum(ic: &crate::aggregation::IntermediateColumn) -> bool {
+    ic.source_aggregate == "MIN" || ic.source_aggregate == "MAX"
+}
+
+/// The DEFAULT of a MIN / MAX column: `0`, `''` or `'epoch'` for the number,
+/// string and date families, and none for any other type (an interval, an enum,
+/// an array), whose values those literals may not spell.
+fn extremum_default(pg_type: &str) -> Option<&'static str> {
+    if pg_type.contains('[') {
+        return None;
+    }
+    let family = pg_type
+        .split('(')
+        .next()
+        .unwrap_or(pg_type)
+        .trim()
+        .to_lowercase();
+    match family.as_str() {
+        "smallint" | "integer" | "bigint" | "numeric" | "decimal" | "real" | "double precision"
+        | "int" | "int2" | "int4" | "int8" | "float4" | "float8" => Some("0"),
+        "boolean" => Some("FALSE"),
+        "text" | "varchar" | "char" | "character varying" | "character" | "bpchar" => Some("''"),
+        "date"
+        | "timestamp"
+        | "timestamptz"
+        | "timestamp without time zone"
+        | "timestamp with time zone" => Some("'epoch'"),
+        _ => None,
+    }
 }
 
 /// Build the DDL for the intermediate table.
@@ -229,6 +257,43 @@ pub fn build_group_capture_ddl(view_name: &str, plan: &AggregationPlan) -> Vec<(
     ddl
 }
 
+/// The type the target column of `mapping` is declared with when the end query
+/// does not cast it.
+pub(crate) fn uncast_mapping_type(
+    plan: &AggregationPlan,
+    mapping: &EndQueryMapping,
+    column_types: &HashMap<String, String>,
+) -> String {
+    match mapping.aggregate_type.as_str() {
+        "SUM" | "AVG" | "DERIVED" => "NUMERIC".to_string(),
+        "COUNT" => "BIGINT".to_string(),
+        "MIN" | "MAX" => {
+            // For MIN/MAX, find the matching IntermediateColumn from the plan
+            // and resolve its source_arg (e.g., "e.ts") to get the correct type.
+            // This handles qualified columns like MAX(e.ts) where intermediate_expr
+            // is "__max_e_ts" and source_arg is "e.ts" → resolves to TIMESTAMPTZ
+            // instead of falling back to NUMERIC.
+            if let Some(ic) = plan
+                .intermediate_columns
+                .iter()
+                .find(|ic| ic.name == mapping.intermediate_expr)
+            {
+                resolve_column_type(&ic.source_arg, column_types, "NUMERIC")
+            } else {
+                // Fallback: if no matching IntermediateColumn found, use
+                // prefix-stripping logic (defensive, should rarely happen).
+                let source_arg = mapping
+                    .intermediate_expr
+                    .trim_start_matches("__min_")
+                    .trim_start_matches("__max_");
+                resolve_column_type(source_arg, column_types, "NUMERIC")
+            }
+        }
+        "BOOL_OR" => "BOOLEAN".to_string(),
+        _ => "TEXT".to_string(),
+    }
+}
+
 /// Build the DDL for the target (materialized view result) table.
 ///
 /// When `logged` is true, creates a regular (WAL-logged) table for crash safety.
@@ -241,39 +306,10 @@ pub fn build_target_table_ddl(
 ) -> String {
     let mut columns: Vec<String> = Vec::new();
 
-    // Helper: resolve type for an end_query_mapping
     let mapping_type = |mapping: &EndQueryMapping| -> String {
-        if let Some(ref cast) = mapping.cast_type {
-            cast.to_string()
-        } else {
-            match mapping.aggregate_type.as_str() {
-                "SUM" | "AVG" | "DERIVED" => "NUMERIC".to_string(),
-                "COUNT" => "BIGINT".to_string(),
-                "MIN" | "MAX" => {
-                    // For MIN/MAX, find the matching IntermediateColumn from the plan
-                    // and resolve its source_arg (e.g., "e.ts") to get the correct type.
-                    // This handles qualified columns like MAX(e.ts) where intermediate_expr
-                    // is "__max_e_ts" and source_arg is "e.ts" → resolves to TIMESTAMPTZ
-                    // instead of falling back to NUMERIC.
-                    if let Some(ic) = plan
-                        .intermediate_columns
-                        .iter()
-                        .find(|ic| ic.name == mapping.intermediate_expr)
-                    {
-                        resolve_column_type(&ic.source_arg, column_types, "NUMERIC")
-                    } else {
-                        // Fallback: if no matching IntermediateColumn found, use
-                        // prefix-stripping logic (defensive, should rarely happen).
-                        let source_arg = mapping
-                            .intermediate_expr
-                            .trim_start_matches("__min_")
-                            .trim_start_matches("__max_");
-                        resolve_column_type(source_arg, column_types, "NUMERIC")
-                    }
-                }
-                "BOOL_OR" => "BOOLEAN".to_string(),
-                _ => "TEXT".to_string(),
-            }
+        match mapping.cast_type {
+            Some(ref cast) => cast.to_string(),
+            None => uncast_mapping_type(plan, mapping, column_types),
         }
     };
 

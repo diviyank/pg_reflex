@@ -396,7 +396,7 @@ pub fn generate_end_query(view_name: &str, plan: &AggregationPlan) -> String {
         let expr = if is_sentinel
             && matches!(
                 mapping.aggregate_type.as_str(),
-                "SUM" | "AVG" | "MIN" | "MAX"
+                "SUM" | "AVG" | "MIN" | "MAX" | "BOOL_OR"
             ) {
             format!(
                 "CASE WHEN __ivm_count > 0 THEN {} END",

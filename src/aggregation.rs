@@ -38,9 +38,23 @@ impl IntermediateColumn {
         format!("{}_topk", self.name)
     }
 
+    /// `pg_type` without its `COLLATE` clause.
+    pub fn value_type(&self) -> &str {
+        split_collation(&self.pg_type).0
+    }
+
     /// True when this column carries a top-K companion array.
     pub fn has_topk(&self) -> bool {
         self.topk_k.is_some()
+    }
+}
+
+/// A column type as `(type, " COLLATE <collation>")`; the clause is empty for a
+/// type written without one.
+pub(crate) fn split_collation(pg_type: &str) -> (&str, &str) {
+    match pg_type.find(" COLLATE ") {
+        Some(at) => pg_type.split_at(at),
+        None => (pg_type, ""),
     }
 }
 
@@ -231,8 +245,9 @@ impl AggregationPlan {
         // Class 1: SUM(bare_col) where bare_col is NOT NULL.
         for ic in &self.intermediate_columns {
             if ic.source_aggregate == "SUM" && not_null_columns.contains(&ic.source_arg) {
-                let arg_sanitized = sanitize_for_col_name(&ic.source_arg);
-                to_remove.insert(format!("__nonnull_count_{}", arg_sanitized));
+                if let Some(stem) = ic.name.strip_prefix("__sum_") {
+                    to_remove.insert(format!("__nonnull_count_{}", stem));
+                }
             }
         }
 
@@ -291,15 +306,15 @@ impl AggregationPlan {
                     to_remove.insert(name.clone());
                     continue;
                 }
-                let canonical_sanitized = sanitize_for_col_name(&canonical_x);
-                let canonical_name = format!("__nonnull_count_{}", canonical_sanitized);
-                if &canonical_name != name
-                    && intermediates_snapshot
-                        .iter()
-                        .any(|(other, ..)| other == &canonical_name)
-                {
+                let counter_of_x = intermediates_snapshot.iter().find(|(other, agg, arg)| {
+                    other != name
+                        && agg == "COUNT"
+                        && other.starts_with("__nonnull_count_")
+                        && arg == &canonical_x
+                });
+                if let Some((canonical_name, ..)) = counter_of_x {
                     to_remove.insert(name.clone());
-                    redirect.insert(name.clone(), canonical_name);
+                    redirect.insert(name.clone(), canonical_name.clone());
                 }
             }
         }
@@ -610,10 +625,54 @@ pub fn sanitize_for_col_name(s: &str) -> String {
         let mut hasher = DefaultHasher::new();
         result.hash(&mut hasher);
         let hash = hasher.finish();
-        format!("{}_{:x}", &result[..36], hash)
+        format!("{}_{:x}", leading_bytes(&result, 36), hash)
     } else {
         result
     }
+}
+
+/// The longest prefix of `text` that fits in `max_bytes` without splitting a
+/// character.
+fn leading_bytes(text: &str, max_bytes: usize) -> &str {
+    let mut end = max_bytes.min(text.len());
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
+/// Bytes left for the argument part of an intermediate column name once the
+/// longest decoration, `__bool_or_<stem>_nonnull_count`, is written around it:
+/// every name then fits PostgreSQL's 63-byte identifier.
+const MAX_STEM_BYTES: usize = 63 - "__bool_or_".len() - "_nonnull_count".len();
+
+/// The part of an intermediate column name that stands for the aggregate
+/// argument `arg`. Distinct arguments can sanitise to one spelling, so
+/// `attempt` numbers the alternatives: the caller takes the first whose columns
+/// name no other aggregate.
+fn argument_stem(arg: &str, attempt: usize) -> String {
+    let ordinal = match attempt {
+        0 => String::new(),
+        n => format!("_{}", n + 1),
+    };
+    let sanitized = sanitize_for_col_name(arg);
+    let room = MAX_STEM_BYTES - ordinal.len();
+    format!("{}{}", leading_bytes(&sanitized, room), ordinal)
+}
+
+/// Whether `column` would share its name with a planned column that stores a
+/// different aggregate, or with the top-K companion of a planned extremum.
+fn names_another_column(planned: &[&IntermediateColumn], column: &IntermediateColumn) -> bool {
+    let is_extremum =
+        |ic: &IntermediateColumn| ic.source_aggregate == "MIN" || ic.source_aggregate == "MAX";
+    planned.iter().any(|other| {
+        let stores_another_aggregate = other.name == column.name
+            && (other.source_aggregate != column.source_aggregate
+                || other.source_arg != column.source_arg);
+        let is_companion_of_other = is_extremum(other) && other.topk_column_name() == column.name;
+        let companion_is_other = is_extremum(column) && column.topk_column_name() == other.name;
+        stores_another_aggregate || is_companion_of_other || companion_is_other
+    })
 }
 
 fn parse_expression(sql: &str) -> Option<Expr> {
@@ -829,7 +888,8 @@ fn read_aggregates_from_intermediate(
 ) -> String {
     replace_aggregate_calls(expr, &mut |f, call| {
         let arg = call.arg.as_deref().unwrap_or("*");
-        let Some(reading) = aggregate_reading(&call.kind, arg) else {
+        let planned: Vec<&IntermediateColumn> = existing.iter().chain(new_cols.iter()).collect();
+        let Some(reading) = aggregate_reading_among(&call.kind, arg, &planned) else {
             if regrouped_distinct_args.iter().any(|d| d == arg) {
                 return regrouped_distinct_count(arg);
             }
@@ -988,10 +1048,40 @@ fn intermediate_column(
 }
 
 /// `None` for `COUNT(DISTINCT ...)`, which extends the intermediate key instead
-/// of adding a column.
+/// of adding a column. A column of the reading has the name of a `planned`
+/// column only when both store the same aggregate of the same argument.
+fn aggregate_reading_among(
+    kind: &AggregateKind,
+    arg: &str,
+    planned: &[&IntermediateColumn],
+) -> Option<AggregateReading> {
+    let named_after = match kind {
+        AggregateKind::CountDistinct => return None,
+        AggregateKind::CountStar => "star",
+        _ => arg,
+    };
+    (0..)
+        .map(|attempt| aggregate_reading_named(kind, arg, &argument_stem(named_after, attempt)))
+        .find(|reading| {
+            reading
+                .columns
+                .iter()
+                .all(|column| !names_another_column(planned, column))
+        })
+}
+
+/// The reading of an aggregate planned on its own.
+#[cfg(test)]
 fn aggregate_reading(kind: &AggregateKind, arg: &str) -> Option<AggregateReading> {
-    let arg_sanitized = sanitize_for_col_name(arg);
-    let reading = match kind {
+    aggregate_reading_among(kind, arg, &[])
+}
+
+fn aggregate_reading_named(
+    kind: &AggregateKind,
+    arg: &str,
+    arg_sanitized: &str,
+) -> AggregateReading {
+    match kind {
         AggregateKind::Sum => {
             let sum_col = format!("__sum_{}", arg_sanitized);
             // Counts the non-NULL contributors: with none left the SUM is NULL, not 0.
@@ -1013,11 +1103,14 @@ fn aggregate_reading(kind: &AggregateKind, arg: &str) -> Option<AggregateReading
                 aggregate_type: "COUNT",
             }
         }
-        AggregateKind::CountStar => AggregateReading {
-            columns: vec![intermediate_column("__count_star", "BIGINT", "COUNT", "*")],
-            end_expr: "__count_star".to_string(),
-            aggregate_type: "COUNT",
-        },
+        AggregateKind::CountStar => {
+            let col_name = format!("__count_{}", arg_sanitized);
+            AggregateReading {
+                columns: vec![intermediate_column(&col_name, "BIGINT", "COUNT", "*")],
+                end_expr: col_name,
+                aggregate_type: "COUNT",
+            }
+        }
         AggregateKind::Avg => {
             let sum_col = format!("__sum_{}", arg_sanitized);
             let count_col = format!("__count_{}", arg_sanitized);
@@ -1071,9 +1164,10 @@ fn aggregate_reading(kind: &AggregateKind, arg: &str) -> Option<AggregateReading
                 aggregate_type: "BOOL_OR",
             }
         }
-        AggregateKind::CountDistinct => return None,
-    };
-    Some(reading)
+        AggregateKind::CountDistinct => {
+            unreachable!("COUNT(DISTINCT) is read from the intermediate key, not from a column")
+        }
+    }
 }
 
 fn sum_reading(count_col: &str, sum_col: &str) -> String {
@@ -1149,7 +1243,8 @@ fn plan_aggregation_inner(analysis: &SqlAnalysis) -> AggregationPlan {
 
         let cast_type = col.cast_type.clone();
 
-        let Some(reading) = aggregate_reading(agg, arg) else {
+        let planned: Vec<&IntermediateColumn> = intermediate_columns.iter().collect();
+        let Some(reading) = aggregate_reading_among(agg, arg, &planned) else {
             // COUNT(DISTINCT val): the intermediate uses (grp, val) as compound key.
             // The end_query counts non-NULL distinct values per original GROUP BY
             // using COUNT(val). COUNT(val) (not COUNT(*)) matches Postgres

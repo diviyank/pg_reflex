@@ -113,7 +113,7 @@ pub(crate) fn build_merge_using(
                          SELECT array_agg(v ORDER BY v ASC) FROM \
                          (SELECT v FROM unnest(t.\"{topk}\" || COALESCE(d.\"{topk}\", '{{}}'::{ty}[])) v ORDER BY v ASC LIMIT {k}) s)",
                         topk = topk,
-                        ty = ic.pg_type,
+                        ty = ic.value_type(),
                         k = k,
                     ));
                 }
@@ -130,7 +130,7 @@ pub(crate) fn build_merge_using(
                          SELECT array_agg(v ORDER BY v DESC) FROM \
                          (SELECT v FROM unnest(t.\"{topk}\" || COALESCE(d.\"{topk}\", '{{}}'::{ty}[])) v ORDER BY v DESC LIMIT {k}) s)",
                         topk = topk,
-                        ty = ic.pg_type,
+                        ty = ic.value_type(),
                         k = k,
                     ));
                 }
