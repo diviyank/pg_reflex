@@ -1,8 +1,5 @@
-use crate::aggregation::{AggregationPlan, IntermediateColumn};
+use crate::aggregation::AggregationPlan;
 use crate::sql_analyzer::SqlAnalysis;
-use sqlparser::ast::{Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments};
-use sqlparser::dialect::PostgreSqlDialect;
-use sqlparser::parser::Parser;
 
 // The canonical implementations of these identifier utilities live in
 // `crate::sql_writer::identifier`. The `pub use` re-exports below keep the
@@ -365,98 +362,17 @@ pub fn generate_base_query(analysis: &SqlAnalysis, plan: &AggregationPlan) -> St
     query
 }
 
+/// The HAVING text `having` as a predicate over the intermediate columns of
+/// `plan`. Planning stores this predicate in `plan.having_clause`; this entry
+/// point exists because its tests pin the reading of a HAVING aggregate.
+#[cfg(test)]
+pub fn rewrite_having(having: &str, plan: &AggregationPlan) -> Option<String> {
+    crate::aggregation::having_predicate(having, &plan.intermediate_columns, &[])
+        .map(|(predicate, _)| predicate)
+}
+
 /// Generate the end query: intermediate table -> target table.
 ///
-/// Rewrite a HAVING clause, replacing aggregate function calls with intermediate column refs.
-/// E.g., "SUM(amount) > 1000" → "\"__sum_amount\" > 1000"
-pub fn rewrite_having(having: &str, plan: &AggregationPlan) -> Option<String> {
-    let expr = Parser::new(&PostgreSqlDialect {})
-        .try_with_sql(having)
-        .and_then(|mut p| p.parse_expr())
-        .ok()?;
-    Some(rewrite_having_expr(&expr, &plan.intermediate_columns))
-}
-
-/// Recursively transform a HAVING expression AST, replacing aggregate functions
-/// with references to intermediate table columns.
-fn rewrite_having_expr(expr: &Expr, columns: &[IntermediateColumn]) -> String {
-    match expr {
-        Expr::Function(f) => rewrite_aggregate_call(f, columns),
-        Expr::BinaryOp { left, op, right } => {
-            format!(
-                "{} {} {}",
-                rewrite_having_expr(left, columns),
-                op,
-                rewrite_having_expr(right, columns)
-            )
-        }
-        Expr::UnaryOp { op, expr: inner } => {
-            format!("{} {}", op, rewrite_having_expr(inner, columns))
-        }
-        Expr::Nested(inner) => {
-            format!("({})", rewrite_having_expr(inner, columns))
-        }
-        other => other.to_string(),
-    }
-}
-
-/// Rewrite a single aggregate function call to its intermediate column reference.
-fn rewrite_aggregate_call(f: &Function, columns: &[IntermediateColumn]) -> String {
-    let func_name = f.name.to_string().to_uppercase();
-
-    // Check for COUNT(*)
-    if func_name == "COUNT" {
-        if let FunctionArguments::List(list) = &f.args {
-            if list.args.len() == 1
-                && matches!(
-                    &list.args[0],
-                    FunctionArg::Unnamed(FunctionArgExpr::Wildcard)
-                )
-            {
-                // COUNT(*) → __count_star
-                return "\"__count_star\"".to_string();
-            }
-        }
-    }
-
-    // Extract argument string
-    let arg_str = if let FunctionArguments::List(list) = &f.args {
-        if let Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(arg_expr))) = list.args.first() {
-            Some(arg_expr.to_string())
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-
-    let Some(arg) = arg_str else {
-        return f.to_string(); // Can't rewrite, pass through
-    };
-
-    // AVG(x) → __sum_x / NULLIF(__count_x, 0)
-    if func_name == "AVG" {
-        let sanitized = sanitize_for_col_name(&arg);
-        let sum_col = format!("__sum_{}", sanitized);
-        let count_col = format!("__count_{}", sanitized);
-        return format!("\"{}\" / NULLIF(\"{}\", 0)", sum_col, count_col);
-    }
-
-    // SUM/COUNT/MIN/MAX → find matching intermediate column
-    for col in columns {
-        if col.source_aggregate.to_uppercase() == func_name && col.source_arg == arg {
-            return format!("\"{}\"", col.name);
-        }
-    }
-
-    // Fallback: pass through as-is
-    f.to_string()
-}
-
-pub fn sanitize_for_col_name(s: &str) -> String {
-    crate::aggregation::sanitize_for_col_name(s)
-}
-
 /// Uses bare column names since the intermediate table has no table qualifiers.
 pub fn generate_end_query(view_name: &str, plan: &AggregationPlan) -> String {
     let table = intermediate_table_name(view_name);
@@ -542,8 +458,8 @@ pub fn generate_end_query(view_name: &str, plan: &AggregationPlan) -> String {
     // This ensures deleted groups disappear from the target.
     // Exception: sentinel-only aggregates (no GROUP BY) must always return exactly
     // one row, matching PostgreSQL's behavior of SELECT SUM(x) FROM empty_table → (NULL).
-    let is_sentinel = plan.group_by_columns.is_empty() && plan.distinct_columns.is_empty();
-    if plan.needs_ivm_count && !is_sentinel {
+    let filters_live_groups = plan.needs_ivm_count && !is_sentinel;
+    if filters_live_groups {
         query.push_str(" WHERE __ivm_count > 0");
     }
 
@@ -558,15 +474,17 @@ pub fn generate_end_query(view_name: &str, plan: &AggregationPlan) -> String {
         query.push_str(&format!(" GROUP BY {}", grp_cols.join(", ")));
     }
 
-    // Apply HAVING clause (rewritten to use intermediate column names)
+    // An end query that re-aggregates filters its groups with HAVING; otherwise
+    // each intermediate row is one group and the predicate filters rows.
     if let Some(ref having) = plan.having_clause {
-        if let Some(rewritten) = rewrite_having(having, plan) {
-            if plan.needs_ivm_count {
-                query.push_str(&format!(" AND ({})", rewritten));
-            } else {
-                query.push_str(&format!(" WHERE ({})", rewritten));
-            }
-        }
+        let keyword = if has_count_distinct_mapping {
+            "HAVING"
+        } else if filters_live_groups {
+            "AND"
+        } else {
+            "WHERE"
+        };
+        query.push_str(&format!(" {} ({})", keyword, having));
     }
 
     query

@@ -2315,11 +2315,63 @@ pub(crate) fn create_reflex_ivm_impl_with_materialization(
             Some(crate::sql_analyzer::AggregateKind::CountDistinct)
         )
     });
+    let count_distinct_items = analysis
+        .select_columns
+        .iter()
+        .filter(|c| {
+            matches!(
+                c.aggregate,
+                Some(crate::sql_analyzer::AggregateKind::CountDistinct)
+            )
+        })
+        .count();
+    if count_distinct_items > 1 {
+        return crate::reflex_reject(
+            "More than one COUNT(DISTINCT ...) in the same SELECT list is not supported: the IMV \
+             is keyed on the distinct argument and holds one. Fix: compute each in its own CTE \
+             and join them on the group columns: WITH a AS (SELECT grp, COUNT(DISTINCT x) AS dx \
+             FROM t GROUP BY grp), b AS (SELECT grp, COUNT(DISTINCT y) AS dy FROM t GROUP BY grp) \
+             SELECT a.grp, a.dx, b.dy FROM a JOIN b ON b.grp = a.grp. The same COUNT(DISTINCT) \
+             needed twice is computed once in a CTE and its column repeated in the outer query.",
+        );
+    }
     let has_other_agg = analysis.select_columns.iter().any(|c| {
-        matches!(c.aggregate, Some(ref k) if !matches!(k,
+        c.is_aggregate_derived
+            || matches!(c.aggregate, Some(ref k) if !matches!(k,
             crate::sql_analyzer::AggregateKind::CountDistinct))
     });
-    if has_cd && has_other_agg {
+    let having_conflict = crate::aggregation::count_distinct_having_conflict(&analysis);
+    if let Some(crate::aggregation::CountDistinctHavingConflict::UnselectedCountDistinct(call)) =
+        &having_conflict
+    {
+        return crate::reflex_reject(&format!(
+            "HAVING holds {call}, which the SELECT list does not: a COUNT(DISTINCT ...) can be \
+             filtered on in HAVING only when the SELECT list holds it with the same argument and \
+             the same FILTER, written the same way. Fix: compute it in a CTE and filter in the \
+             outer query: WITH cd AS (SELECT grp, COUNT(DISTINCT col) AS n FROM t GROUP BY grp) \
+             SELECT grp, n FROM cd WHERE n > 1"
+        ));
+    }
+    if let Some(crate::aggregation::CountDistinctHavingConflict::PrintedAsWritten(call)) =
+        &having_conflict
+    {
+        return crate::reflex_reject(&format!(
+            "HAVING holds {call} under BETWEEN, IN, IS or a similar predicate, which is supported \
+             only for COUNT(DISTINCT <plain column>) without FILTER. Fix: compare it with =, <, \
+             >, <=, >= combined with AND / OR, or compute it in a CTE and filter in the outer \
+             query: WITH cd AS (SELECT grp, COUNT(DISTINCT col) AS n FROM t GROUP BY grp) \
+             SELECT grp, n FROM cd WHERE n BETWEEN 1 AND 2"
+        ));
+    }
+    if let Some(crate::aggregation::CountDistinctHavingConflict::Subquery) = &having_conflict {
+        return crate::reflex_reject(
+            "COUNT(DISTINCT col) cannot be filtered by a HAVING clause that holds a subquery. \
+             Fix: compute the COUNT(DISTINCT) in a CTE and filter in the outer query: \
+             WITH cd AS (SELECT grp, COUNT(DISTINCT col) AS n FROM t GROUP BY grp) \
+             SELECT grp, n FROM cd WHERE n > (SELECT COUNT(*) FROM other)",
+        );
+    }
+    if (has_cd && has_other_agg) || having_conflict.is_some() {
         return crate::reflex_reject("COUNT(DISTINCT col) cannot be mixed with other aggregates in the same query. \
                 Use a CTE to separate them: WITH cd AS (SELECT grp, COUNT(DISTINCT col) ...) SELECT ...");
     }
