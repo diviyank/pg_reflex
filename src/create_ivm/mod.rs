@@ -1973,12 +1973,11 @@ fn install_source_triggers(client: &mut pgrx::spi::SpiClient<'_>, ctx: &BuildCon
             continue;
         }
 
-        let safe_source = crate::query_decomposer::sanitized_source_suffix(source);
         let trig_exists = client
             .select(
                 &format!(
-                    "SELECT 1 FROM pg_trigger WHERE tgname = '__reflex_trigger_ins_on_{}'",
-                    safe_source
+                    "SELECT 1 FROM pg_trigger WHERE tgname = '{}'",
+                    crate::schema_builder::source_trigger_name(source, "ins").replace('\'', "''")
                 ),
                 None,
                 &[],
@@ -2028,6 +2027,7 @@ fn install_source_triggers(client: &mut pgrx::spi::SpiClient<'_>, ctx: &BuildCon
                 client.update(&ddl, None, &[]).unwrap_or_report();
             }
         }
+        crate::source_truncate::sync_partition_truncate_triggers(client, source).unwrap_or_report();
     }
 }
 
@@ -3003,6 +3003,17 @@ pub(crate) fn create_reflex_ivm_impl_with_materialization(
         return Box::leak(msg.into_boxed_str());
     }
 
+    let only_source = match ctx.real_source_names.as_slice() {
+        [only] => Some(only.as_str()),
+        _ => None,
+    };
+    let unmaintainable = Spi::connect(|client| {
+        source_row_shape::unmaintainable_source_row_reference(client, ctx.sql, only_source)
+    });
+    if let Some(reason) = unmaintainable {
+        return crate::reflex_reject(&reason);
+    }
+
     if let Some(duplicate) = duplicate_output_column(ctx.sql) {
         return crate::reflex_reject(&format!(
             "{duplicate}: two output columns of the query have the same name. \
@@ -3128,6 +3139,7 @@ mod identifier_quotes;
 /// `crate::audit` rather than re-implementing the resolver.
 pub(crate) mod ignore_soundness;
 mod soundness;
+mod source_row_shape;
 
 pub(crate) use admin::*;
 pub(crate) use decompose::*;

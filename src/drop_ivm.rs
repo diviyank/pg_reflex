@@ -63,6 +63,49 @@ fn detach_function_from_extension(client: &mut pgrx::spi::SpiClient<'_>, fn_ref:
     }
 }
 
+/// A sub-IMV generated for a CTE of `root` that no IMV reads: a CTE the query
+/// never references, or one hoisted out of a nested WITH. Nothing records it in
+/// `root`'s sources, so only its generated name ties it to `root`.
+fn unread_cte_sub_imv_of(root: &str) -> Option<String> {
+    let generated_prefix = format!("{root}__cte_");
+    Spi::connect(|client| {
+        let rows: Vec<(String, bool, Vec<String>)> = client
+            .select(
+                "SELECT name, COALESCE(is_generated_sub_imv, FALSE) AS generated, depends_on \
+                 FROM public.__reflex_ivm_reference ORDER BY name",
+                None,
+                &[],
+            )
+            .unwrap_or_report()
+            .filter_map(|row| {
+                Some((
+                    row.get_by_name::<String, _>("name").ok().flatten()?,
+                    row.get_by_name::<bool, _>("generated").ok().flatten()?,
+                    row.get_by_name::<Vec<String>, _>("depends_on")
+                        .ok()
+                        .flatten()
+                        .unwrap_or_default(),
+                ))
+            })
+            .collect();
+        rows.iter()
+            .filter(|(name, generated, _)| *generated && name.starts_with(&generated_prefix))
+            .find(|(name, _, _)| {
+                let relation = crate::query_decomposer::named_relation(name);
+                !rows.iter().any(|(reader, _, sources)| {
+                    reader != name
+                        && sources
+                            .iter()
+                            .filter(|source| !source.starts_with('<'))
+                            .any(|source| {
+                                crate::query_decomposer::named_relation(source) == relation
+                            })
+                })
+            })
+            .map(|(name, _, _)| name.clone())
+    })
+}
+
 /// Internal entry point that threads the **top-level** view name (`root`)
 /// through recursion. The synthetic-sub-IMV prefix check at the bottom needs
 /// the outermost view's bare name, not the current recursion level's name:
@@ -130,7 +173,7 @@ fn drop_reflex_ivm_impl_inner(view_name: &str, cascade: bool, root: &str) -> &'s
         //    finding this IMV. But we need the reference row for step 7. So we check
         //    here and drop triggers AFTER deleting the row (moved below step 8).
         //    For now, just collect sources that need trigger cleanup.
-        let mut sources_to_cleanup: Vec<(String, String)> = Vec::new(); // (source, safe_source)
+        let mut sources_to_cleanup: Vec<String> = Vec::new();
         for source in &depends_on {
             // Synthetic `<subquery:...>`/`<function:...>` placeholders own no
             // relation of their own — triggers live on the real underlying tables,
@@ -140,11 +183,6 @@ fn drop_reflex_ivm_impl_inner(view_name: &str, cascade: bool, root: &str) -> &'s
             if source.starts_with('<') {
                 continue;
             }
-            // Sub-IMV sources are persisted in `depends_on` already double-quoted
-            // (`"schema"."view__cte_x"`), but the source triggers were installed
-            // under the normalized name. Normalize here using the canonical path,
-            // matching how install_source_triggers builds the trigger name.
-            let safe_source = crate::query_decomposer::sanitized_source_suffix(source);
             let other_count = client
                 .select(
                     "SELECT COUNT(*) AS cnt FROM public.__reflex_ivm_reference \
@@ -169,7 +207,7 @@ fn drop_reflex_ivm_impl_inner(view_name: &str, cascade: bool, root: &str) -> &'s
                 .unwrap_or(0);
 
             if other_count == 0 {
-                sources_to_cleanup.push((source.clone(), safe_source));
+                sources_to_cleanup.push(source.clone());
             }
         }
 
@@ -336,7 +374,7 @@ fn drop_reflex_ivm_impl_inner(view_name: &str, cascade: bool, root: &str) -> &'s
         //    When called from the sql_drop event trigger the source table itself is
         //    already gone (its triggers cascaded with it). DROP TRIGGER ON <missing>
         //    would error on "relation does not exist" — gate on to_regclass.
-        for (source, safe_source) in &sources_to_cleanup {
+        for source in &sources_to_cleanup {
             let source_still_exists: bool = client
                 .select(
                     "SELECT to_regclass($1) IS NOT NULL AS present",
@@ -351,9 +389,10 @@ fn drop_reflex_ivm_impl_inner(view_name: &str, cascade: bool, root: &str) -> &'s
                 .unwrap_or(None)
                 .unwrap_or(false);
 
+            crate::source_truncate::drop_truncate_triggers(client, source).unwrap_or_report();
             for op in &["ins", "del", "upd", "trunc"] {
                 if source_still_exists {
-                    let trig_name = format!("__reflex_trigger_{}_on_{}", op, safe_source);
+                    let trig_name = crate::schema_builder::source_trigger_name(source, op);
                     client
                         .update(
                             &format!("DROP TRIGGER IF EXISTS \"{}\" ON {}", trig_name, source),
@@ -363,7 +402,7 @@ fn drop_reflex_ivm_impl_inner(view_name: &str, cascade: bool, root: &str) -> &'s
                         .unwrap_or_report();
                 }
 
-                let fn_name = format!("__reflex_{}_trigger_on_{}", op, safe_source);
+                let fn_name = crate::schema_builder::source_trigger_function_name(source, op);
                 let qualified = format!("public.{}", fn_name);
                 detach_function_from_extension(client, &qualified);
                 client
@@ -502,6 +541,15 @@ fn drop_reflex_ivm_impl_inner(view_name: &str, cascade: bool, root: &str) -> &'s
         let result = drop_reflex_ivm_impl_inner(sub_imv, true, root);
         if result.starts_with("ERROR") {
             return result;
+        }
+    }
+
+    if view_name == root {
+        while let Some(unread) = unread_cte_sub_imv_of(root) {
+            let result = drop_reflex_ivm_impl_inner(&unread, true, root);
+            if result.starts_with("ERROR") {
+                return result;
+            }
         }
     }
 
