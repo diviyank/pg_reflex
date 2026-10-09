@@ -7,10 +7,14 @@
 
 use pgrx::datum::DatumWithOid;
 use pgrx::prelude::*;
+use sqlparser::ast::{
+    Ident, ObjectName, ObjectNamePart, Query, Statement, Visit, VisitMut, Visitor, VisitorMut,
+};
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::keywords::ALL_KEYWORDS;
 use sqlparser::parser::Parser;
 use sqlparser::tokenizer::{Token, TokenWithSpan, Tokenizer};
+use std::ops::ControlFlow;
 
 fn tokens_of(sql: &str) -> Option<Vec<TokenWithSpan>> {
     Tokenizer::new(&PostgreSqlDialect {}, sql)
@@ -203,6 +207,151 @@ pub(crate) fn with_one_spelling_per_identifier(sql: &str) -> Option<String> {
     }
     let bare = names_postgres_reads_the_same_bare(&candidates);
     without_needless_quotes(sql, &|name| bare.iter().any(|b| b == name))
+}
+
+/// The quoted last part of a relation name written unqualified or under
+/// `public`. A relation of another schema is registered from the catalog,
+/// whatever the query wrote.
+fn quoted_name_of_a_public_relation(relation: &ObjectName) -> Option<&Ident> {
+    let parts: Vec<&Ident> = relation
+        .0
+        .iter()
+        .map(|part| match part {
+            ObjectNamePart::Identifier(name) => Some(name),
+            _ => None,
+        })
+        .collect::<Option<_>>()?;
+    let name = match parts.as_slice() {
+        [name] => name,
+        [schema, name] if schema.value == "public" => name,
+        _ => return None,
+    };
+    (name.quote_style == Some('"')).then_some(*name)
+}
+
+/// The double-quoted plain lower-case names the statements read as a relation,
+/// apart from the CTEs they define.
+fn quoted_relation_names(statements: &[Statement]) -> Vec<String> {
+    #[derive(Default)]
+    struct Names {
+        relations: Vec<String>,
+        ctes: Vec<String>,
+    }
+    impl Visitor for Names {
+        type Break = ();
+
+        fn pre_visit_query(&mut self, query: &Query) -> ControlFlow<()> {
+            if let Some(with) = &query.with {
+                self.ctes.extend(
+                    with.cte_tables
+                        .iter()
+                        .map(|cte| cte.alias.name.value.clone()),
+                );
+            }
+            ControlFlow::Continue(())
+        }
+
+        fn pre_visit_relation(&mut self, relation: &ObjectName) -> ControlFlow<()> {
+            if let Some(name) = quoted_name_of_a_public_relation(relation) {
+                if is_lower_case_word(&name.value) {
+                    self.relations.push(name.value.clone());
+                }
+            }
+            ControlFlow::Continue(())
+        }
+    }
+    let mut names = Names::default();
+    for statement in statements {
+        let _ = statement.visit(&mut names);
+    }
+    names.relations.retain(|name| !names.ctes.contains(name));
+    names.relations.sort();
+    names.relations.dedup();
+    names.relations
+}
+
+/// The keywords among `candidates` PostgreSQL accepts without quotes where a
+/// relation is named: the unreserved ones and those that cannot name a function
+/// or a type. A reserved word is only ever written quoted, and a word that is
+/// no keyword has lost its quotes already.
+fn keywords_postgres_reads_bare_as_a_relation(candidates: &[String]) -> Vec<String> {
+    Spi::connect(|client| {
+        client
+            .select(
+                "SELECT w::text AS w FROM unnest($1::text[]) AS w \
+                 WHERE EXISTS (SELECT 1 FROM pg_get_keywords() k \
+                               WHERE k.word = w AND k.catcode IN ('U', 'C'))",
+                None,
+                &[unsafe {
+                    DatumWithOid::new(
+                        crate::sql_writer::identifier::format_pg_text_array(candidates),
+                        PgBuiltInOids::TEXTOID.oid().value(),
+                    )
+                }],
+            )
+            .map(|rows| {
+                rows.filter_map(|row| {
+                    row.get_by_name::<&str, _>("w")
+                        .ok()
+                        .flatten()
+                        .map(str::to_string)
+                })
+                .collect()
+            })
+            .unwrap_or_default()
+    })
+}
+
+struct RelationNameUnquoter<'a> {
+    read_bare: &'a [String],
+}
+
+impl VisitorMut for RelationNameUnquoter<'_> {
+    type Break = ();
+
+    fn pre_visit_relation(&mut self, relation: &mut ObjectName) -> ControlFlow<()> {
+        let names_a_keyword = quoted_name_of_a_public_relation(relation)
+            .is_some_and(|name| self.read_bare.contains(&name.value));
+        if let (true, Some(ObjectNamePart::Identifier(name))) =
+            (names_a_keyword, relation.0.last_mut())
+        {
+            name.quote_style = None;
+        }
+        ControlFlow::Continue(())
+    }
+}
+
+fn rendered(statements: &[Statement]) -> Vec<String> {
+    statements.iter().map(|s| s.to_string()).collect()
+}
+
+/// Removes the quotes of `"zone"` where it names a relation. The token-level
+/// step above keeps the quotes of a keyword, because a bare keyword is not
+/// accepted in every position; where a relation is named PostgreSQL accepts
+/// the bare word, so `zone` and `"zone"` register one source there. The
+/// statements are left as written when the parser does not read the bare
+/// names back the same.
+pub(crate) fn unquote_relation_names(statements: &mut Vec<Statement>) {
+    let candidates = quoted_relation_names(statements);
+    if candidates.is_empty() {
+        return;
+    }
+    let read_bare = keywords_postgres_reads_bare_as_a_relation(&candidates);
+    if read_bare.is_empty() {
+        return;
+    }
+    let mut unquoted = statements.clone();
+    for statement in &mut unquoted {
+        let _ = statement.visit(&mut RelationNameUnquoter {
+            read_bare: &read_bare,
+        });
+    }
+    let text = rendered(&unquoted);
+    let parser_reads_it_back = Parser::parse_sql(&PostgreSqlDialect {}, &text.join("; "))
+        .is_ok_and(|reparsed| rendered(&reparsed) == text);
+    if parser_reads_it_back {
+        *statements = unquoted;
+    }
 }
 
 #[cfg(test)]
