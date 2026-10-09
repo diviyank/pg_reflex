@@ -379,6 +379,29 @@ const V112_SH_ROWFN_STEPS: &[(&str, &str)] = &[
     ("refill", "INSERT INTO {p}s(g, v) VALUES ('a',1),('b',2)"),
 ];
 
+/// A function that takes the whole row of a source.
+#[pg_test]
+fn v112_sh_function_of_the_whole_row() {
+    v112_sh_assert_cells(
+        "reflex_sh_rowfn",
+        &[
+            v112_sh_cell!(V112_SH_ROWFN_SETUP, V112_SH_ROWFN_STEPS, "alias", None, "SELECT id, {p}f(t) AS x FROM {p}s t"),
+            v112_sh_cell!(V112_SH_ROWFN_SETUP, V112_SH_ROWFN_STEPS, "table", None, "SELECT id, {p}f({p}s) AS x FROM {p}s"),
+            v112_sh_cell!(V112_SH_ROWFN_SETUP, V112_SH_ROWFN_STEPS, "star", None, "SELECT id, {p}f(t.*) AS x FROM {p}s t"),
+            v112_sh_cell!(V112_SH_ROWFN_SETUP, V112_SH_ROWFN_STEPS, "keyed", Some("id"), "SELECT id, g, {p}f(t) + 1 AS x FROM {p}s t WHERE v > 0"),
+            v112_sh_cell!(V112_SH_ROWFN_SETUP, V112_SH_ROWFN_STEPS, "keyless", None, "SELECT g, {p}f(t) AS x FROM {p}s t"),
+            v112_sh_cell!(V112_SH_ROWFN_SETUP, V112_SH_ROWFN_STEPS, "agg", None, "SELECT g, SUM({p}f(t)) AS sx, COUNT(*) AS c FROM {p}s t GROUP BY g"),
+            v112_sh_cell!(V112_SH_ROWFN_SETUP, V112_SH_ROWFN_STEPS, "minmax", None, "SELECT g, MAX({p}f(t)) AS hi FROM {p}s t GROUP BY g"),
+            v112_sh_cell!(V112_SH_ROWFN_SETUP, V112_SH_ROWFN_STEPS, "group", None, "SELECT {p}f(t) AS x, COUNT(*) AS c FROM {p}s t GROUP BY {p}f(t)"),
+            v112_sh_cell!(V112_SH_ROWFN_SETUP, V112_SH_ROWFN_STEPS, "join", Some("id"), "SELECT t.id, o.label, {p}f(t) AS x FROM {p}s t JOIN {p}o o ON o.g = t.g"),
+            v112_sh_cell!(V112_SH_ROWFN_SETUP, V112_SH_ROWFN_STEPS, "join_agg", None, "SELECT o.label, SUM({p}f(t)) AS sx FROM {p}s t JOIN {p}o o ON o.g = t.g GROUP BY o.label"),
+            v112_sh_cell!(V112_SH_ROWFN_SETUP, V112_SH_ROWFN_STEPS, "cast", None, "SELECT id, {p}f(t::{p}s) AS x FROM {p}s t"),
+            v112_sh_cell!(V112_SH_ROWFN_SETUP, V112_SH_ROWFN_STEPS, "json_ctl", None, "SELECT id, to_jsonb(t) AS x FROM {p}s t"),
+            v112_sh_cell!(V112_SH_ROWFN_SETUP, V112_SH_ROWFN_STEPS, "count_ctl", None, "SELECT g, COUNT(t) AS c FROM {p}s t GROUP BY g"),
+        ],
+    );
+}
+
 const V112_SH_THREE_SETUP: &[&str] = &[
     "CREATE TABLE {p}fact(kind TEXT PRIMARY KEY, v INT)",
     "CREATE TABLE {p}dim(kind TEXT PRIMARY KEY, label TEXT)",
