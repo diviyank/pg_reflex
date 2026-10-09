@@ -15,6 +15,7 @@ use crate::schema_builder::{
     build_deferred_flush_ddl, build_deferred_trigger_ddls, build_delta_scratch_table_ddl,
     build_indexes_ddl, build_intermediate_table_ddl, build_passthrough_scratch_ddls,
     build_staging_table_ddl, build_target_table_ddl, build_trigger_ddls, resolve_column_type,
+    uncast_mapping_type,
 };
 use crate::sql_analyzer::{analyze, SqlAnalysisError};
 use crate::sql_writer::registry::{split_ignore_ack, strip_ignore_ack_marker};
@@ -1235,6 +1236,71 @@ fn materialize_passthrough(client: &mut pgrx::spi::SpiClient<'_>, ctx: &mut Buil
     }
 }
 
+/// The argument and the sum type of a SUM or AVG whose sum PostgreSQL does not
+/// type bigint, numeric or double precision: the three a `__sum_*` column
+/// stores and adds deltas to. A REAL argument sums as `real`, a money one as
+/// `money`, an interval or a time one as `interval`.
+fn unsupported_sum(ctx: &BuildContext) -> Option<(String, String)> {
+    let is_sum = |ic: &&crate::aggregation::IntermediateColumn| {
+        ic.source_aggregate == "SUM" && ic.name.starts_with("__sum_")
+    };
+    ctx.plan.intermediate_columns.iter().find(is_sum)?;
+    let sum_types: std::collections::HashMap<String, String> =
+        describe_query_columns(&generate_base_query(&ctx.analysis, &ctx.plan))
+            .into_iter()
+            .collect();
+    ctx.plan
+        .intermediate_columns
+        .iter()
+        .filter(is_sum)
+        .find_map(|ic| {
+            let sum_type = sum_types.get(&ic.name)?;
+            let is_stored = matches!(sum_type.as_str(), "bigint" | "numeric" | "double precision");
+            (!is_stored).then(|| (ic.source_arg.clone(), sum_type.clone()))
+        })
+}
+
+/// Gives each key column of the intermediate table the type PostgreSQL gives it
+/// in the base query, whose columns `described` holds by name. A key is not
+/// typed by its name among the source columns: an alias can be the name of
+/// another column.
+pub(crate) fn type_intermediate_keys(
+    plan: &crate::aggregation::AggregationPlan,
+    described: &std::collections::HashMap<String, String>,
+    column_types: &mut std::collections::HashMap<String, String>,
+) {
+    for key in plan.group_by_columns.iter().chain(&plan.distinct_columns) {
+        let column = crate::query_decomposer::normalized_column_name(key);
+        if let Some(key_type) = described.get(&column) {
+            column_types.insert(column, result_column_type(key_type));
+        }
+    }
+}
+
+/// The type PostgreSQL gives each SELECT item,
+/// keyed by the name of its target column. `described` are the columns of the
+/// user's query: they pair with the SELECT items by position, and by name when
+/// a wildcard item makes the two lists differ in length.
+fn result_types_by_output_alias(
+    analysis: &crate::sql_analyzer::SqlAnalysis,
+    described: &[(String, String)],
+) -> std::collections::HashMap<String, String> {
+    let output_alias = |col: &crate::sql_analyzer::SelectColumn| {
+        crate::query_decomposer::normalized_column_name(
+            col.alias.as_deref().unwrap_or(&col.expr_sql),
+        )
+    };
+    if described.len() != analysis.select_columns.len() {
+        return described.iter().cloned().collect();
+    }
+    analysis
+        .select_columns
+        .iter()
+        .zip(described)
+        .map(|(col, (_, pg_type))| (output_alias(col), pg_type.clone()))
+        .collect()
+}
+
 /// Aggregate materialization: catalog type discovery, intermediate + target + delta-scratch
 /// DDL, partition children. Pushes intermediate table name onto `ctx.unlogged_tables`.
 fn materialize_aggregate(client: &mut pgrx::spi::SpiClient<'_>, ctx: &mut BuildContext) {
@@ -1260,15 +1326,29 @@ fn materialize_aggregate(client: &mut pgrx::spi::SpiClient<'_>, ctx: &mut BuildC
     ctx.plan.imv_relevant_columns.retain(|_, v| !v.is_empty());
 
     let base_q_for_types = generate_base_query(&ctx.analysis, &ctx.plan);
-    augment_column_types_from_query(&base_q_for_types, &mut column_types);
-    augment_column_types_from_query(ctx.sql, &mut column_types);
+    let intermediate_described = describe_query_columns(&base_q_for_types);
+    let result_described = describe_query_columns(ctx.sql);
+    augment_column_types(&intermediate_described, &mut column_types);
+    augment_column_types(&result_described, &mut column_types);
+    let intermediate_types: std::collections::HashMap<String, String> =
+        intermediate_described.into_iter().collect();
+    let result_types = result_types_by_output_alias(&ctx.analysis, &result_described);
+    let mut intermediate_column_types = column_types.clone();
+    type_intermediate_keys(
+        &ctx.plan,
+        &intermediate_types,
+        &mut intermediate_column_types,
+    );
+    let mut target_column_types = column_types.clone();
+    for (output_alias, query_type) in &result_types {
+        target_column_types.insert(output_alias.clone(), result_column_type(query_type));
+    }
 
     for ic in &mut ctx.plan.intermediate_columns {
-        if ic.source_aggregate == "SUM" {
-            let base_type = resolve_column_type(&ic.name, &column_types, "").to_uppercase();
-            if base_type == "DOUBLE PRECISION" {
-                ic.pg_type = "DOUBLE PRECISION".to_string();
-            }
+        if ic.source_aggregate == "SUM"
+            && intermediate_types.get(&ic.name).map(String::as_str) == Some("double precision")
+        {
+            ic.pg_type = "DOUBLE PRECISION".to_string();
         }
     }
 
@@ -1278,7 +1358,7 @@ fn materialize_aggregate(client: &mut pgrx::spi::SpiClient<'_>, ctx: &mut BuildC
         .iter()
         .filter(|ic| {
             ic.source_aggregate == "SUM"
-                && resolve_column_type(&ic.name, &column_types, "").eq_ignore_ascii_case("BIGINT")
+                && intermediate_types.get(&ic.name).map(String::as_str) == Some("bigint")
         })
         .map(|ic| ic.name.clone())
         .collect();
@@ -1286,10 +1366,16 @@ fn materialize_aggregate(client: &mut pgrx::spi::SpiClient<'_>, ctx: &mut BuildC
         ctx.plan.read_nested_sum_as(sum_column, "BIGINT");
     }
 
+    // A MIN / MAX column stores the type PostgreSQL gives the aggregate, in
+    // PostgreSQL's spelling: the planner's `NUMERIC` then stays the mark of a
+    // column whose type is still to be looked up by the name of its argument.
     for ic in &mut ctx.plan.intermediate_columns {
-        if (ic.source_aggregate == "MIN" || ic.source_aggregate == "MAX")
-            && ic.pg_type.eq_ignore_ascii_case("NUMERIC")
-        {
+        if ic.source_aggregate != "MIN" && ic.source_aggregate != "MAX" {
+            continue;
+        }
+        if let Some(aggregate_type) = intermediate_types.get(&ic.name) {
+            ic.pg_type = aggregate_type.clone();
+        } else if ic.pg_type.eq_ignore_ascii_case("NUMERIC") {
             let resolved = resolve_column_type(&ic.source_arg, &column_types, "");
             if !resolved.is_empty() && !resolved.eq_ignore_ascii_case("NUMERIC") {
                 ic.pg_type = resolved;
@@ -1316,37 +1402,45 @@ fn materialize_aggregate(client: &mut pgrx::spi::SpiClient<'_>, ctx: &mut BuildC
             .read_nested_extremum_as(extremum_column, native_type);
     }
 
-    for mapping in &mut ctx.plan.end_query_mappings {
-        if mapping.cast_type.is_none() {
-            let discovered = resolve_column_type(&mapping.output_alias, &column_types, "");
-            if !discovered.is_empty() {
-                let default_type = match mapping.aggregate_type.as_str() {
-                    "SUM" | "AVG" | "DERIVED" => "NUMERIC",
-                    "COUNT" => "BIGINT",
-                    "BOOL_OR" => "BOOLEAN",
-                    _ => "",
-                };
-                if !default_type.is_empty() && discovered.to_uppercase() != default_type {
-                    mapping.cast_type = Some(discovered);
-                }
+    // Each result column takes the type the query gives it: the end query
+    // casts a reading whose own type differs.
+    let result_casts: Vec<Option<String>> = ctx
+        .plan
+        .end_query_mappings
+        .iter()
+        .map(|mapping| {
+            if mapping.cast_type.is_some() {
+                return None;
             }
+            let query_type = result_column_type(result_types.get(&mapping.output_alias)?);
+            let uncast_type = uncast_mapping_type(&ctx.plan, mapping, &target_column_types);
+            (!query_type.eq_ignore_ascii_case(&uncast_type)).then_some(query_type)
+        })
+        .collect();
+    for (mapping, cast) in ctx.plan.end_query_mappings.iter_mut().zip(result_casts) {
+        if cast.is_some() {
+            mapping.cast_type = cast;
         }
     }
 
-    if let Some(ddl) =
-        build_intermediate_table_ddl(ctx.view_name, &ctx.plan, &column_types, ctx.logged)
-    {
+    if let Some(ddl) = build_intermediate_table_ddl(
+        ctx.view_name,
+        &ctx.plan,
+        &intermediate_column_types,
+        ctx.logged,
+    ) {
         let tbl = intermediate_table_name(ctx.view_name);
         client.update(&ddl, None, &[]).unwrap_or_report();
         ctx.unlogged_tables.push(tbl.clone());
         if let Some(scratch_ddl) =
-            build_delta_scratch_table_ddl(ctx.view_name, &ctx.plan, &column_types)
+            build_delta_scratch_table_ddl(ctx.view_name, &ctx.plan, &intermediate_column_types)
         {
             client.update(&scratch_ddl, None, &[]).unwrap_or_report();
         }
     }
 
-    let target_ddl = build_target_table_ddl(ctx.view_name, &ctx.plan, &column_types, ctx.logged);
+    let target_ddl =
+        build_target_table_ddl(ctx.view_name, &ctx.plan, &target_column_types, ctx.logged);
     client.update(&target_ddl, None, &[]).unwrap_or_report();
 
     if !ctx.plan.partition_columns.is_empty() {
@@ -2440,6 +2534,35 @@ pub(crate) fn create_reflex_ivm_impl_with_materialization(
 
     if let Err(msg) = resolve_partitioning(&mut ctx) {
         return Box::leak(msg.into_boxed_str());
+    }
+
+    if let Some(duplicate) = duplicate_output_column(ctx.sql) {
+        return crate::reflex_reject(&format!(
+            "{duplicate}: two output columns of the query have the same name. \
+             Fix: give each its own alias, e.g. MAX(a) AS max_a, MAX(b) AS max_b."
+        ));
+    }
+
+    match unsupported_sum(&ctx) {
+        Some((arg, sum_type)) if sum_type == "real" => {
+            return crate::reflex_reject(&format!(
+                "SUM / AVG over the REAL (single precision) expression '{arg}' is not supported. \
+                 PostgreSQL adds REAL values in single precision in row order, a result that a sum \
+                 maintained by adding and subtracting deltas does not reproduce. \
+                 Fix: sum the exact values, SUM(({arg})::numeric) or AVG(({arg})::numeric); \
+                 cast the aggregate back, SUM(({arg})::numeric)::real, to keep a REAL result column."
+            ));
+        }
+        Some((arg, sum_type)) => {
+            return crate::reflex_reject(&format!(
+                "SUM / AVG over '{arg}' is not supported: PostgreSQL sums it as {sum_type}, and \
+                 pg_reflex maintains integer, numeric and double precision sums only. \
+                 Fix: sum a numeric value of it. For money, SUM(({arg})::numeric), and \
+                 SUM(({arg})::numeric)::money to keep the result type. For an interval or a time, \
+                 SUM(EXTRACT(EPOCH FROM {arg})), a numeric number of seconds."
+            ));
+        }
+        None => {}
     }
 
     Spi::connect_mut(|client| {
