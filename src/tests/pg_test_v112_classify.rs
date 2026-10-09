@@ -156,6 +156,13 @@ fn v112_cl_bare_pk_reference_is_still_the_key() {
         "SELECT id AS id, v FROM {src}",
         "SELECT t.id, t.v FROM {src} t",
         "SELECT g, ID FROM {src}",
+        "SELECT \"id\", v FROM {src}",
+        "SELECT (id), v FROM {src}",
+        "SELECT \"id\" AS id, v FROM {src}",
+        "SELECT (id) AS \"id\", g FROM {src}",
+        "SELECT t.\"id\", t.g FROM {src} t",
+        "SELECT \"t\".\"id\", v FROM {src} \"t\"",
+        "SELECT ((t.id)) AS ID, v, g FROM {src} t",
     ]
     .iter()
     .enumerate()
@@ -163,7 +170,41 @@ fn v112_cl_bare_pk_reference_is_still_the_key() {
         let tag = format!("bare_key{position}");
         assert_eq!(v112_cl_gv(&tag, select, "", "IMMEDIATE"), "ok", "{select}");
         assert_eq!(v112_cl_unique_key(&tag), "id", "{select}");
+        assert_eq!(
+            v112_cl_try(&format!(
+                "SELECT (SELECT string_agg(a.attname::text, ',') FROM pg_index i \
+                 JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey) \
+                 WHERE i.indexrelid = to_regclass('\"__reflex_uk_v112_cl_{tag}\"') AND i.indisunique)"
+            )),
+            "id",
+            "{select} has no unique index on its key"
+        );
     }
+}
+
+#[pg_test]
+fn v112_cl_mixed_case_primary_key_stays_keyless() {
+    Spi::run(
+        "CREATE TABLE v112_cl_mixed_pk_src(\"Id\" SERIAL PRIMARY KEY, v INT); \
+         INSERT INTO v112_cl_mixed_pk_src(v) VALUES (1),(2)",
+    )
+    .expect("source");
+    assert_eq!(
+        v112_cl_cell(
+            "v112_cl_mixed_pk",
+            "SELECT \"Id\", v FROM v112_cl_mixed_pk_src",
+            "",
+            "IMMEDIATE",
+            &[],
+            &[
+                "INSERT INTO v112_cl_mixed_pk_src(v) VALUES (3)".to_string(),
+                "UPDATE v112_cl_mixed_pk_src SET v = v + 1 WHERE v < 3".to_string(),
+                "DELETE FROM v112_cl_mixed_pk_src WHERE v = 3".to_string(),
+            ],
+        ),
+        "ok"
+    );
+    assert_eq!(v112_cl_unique_key("mixed_pk"), "");
 }
 
 // ---- identifiers are compared the way PostgreSQL folds them ----
