@@ -368,7 +368,7 @@ fn v112_cl_aggregate_that_is_not_the_builtin_is_rejected_or_keyless() {
 
 #[pg_test]
 fn v112_cl_bare_constant_beside_group_by_is_rejected() {
-    for (position, constant) in ["'plain'", "NULL", "TRUE", "3.5", "-1", "('plain')"].iter().enumerate() {
+    for (position, constant) in ["'plain'", "NULL", "TRUE", "3.5", "-1", "('plain')", "-(1)", "-1.5", "- (2.5)"].iter().enumerate() {
         for (shape, select) in [
             ("g", format!("SELECT g, {constant} AS d, SUM(v) AS s FROM {{src}} GROUP BY g")),
             ("d", format!("SELECT DISTINCT g, {constant} AS d FROM {{src}}")),
@@ -391,6 +391,9 @@ fn v112_cl_cast_constant_beside_group_by_is_maintained() {
         "2",
         "1 + 1",
         "upper('x')",
+        "+1",
+        "~1",
+        "+(2)",
     ]
     .iter()
     .enumerate()

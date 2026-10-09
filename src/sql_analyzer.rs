@@ -276,7 +276,8 @@ fn is_moving_date_time_literal(expr: &Expr) -> bool {
 }
 
 /// A select item PostgreSQL refuses as a grouping key, or reads as a position: a bare
-/// string, NULL, boolean or non-integer literal, or a signed number. An unsigned integer
+/// string, NULL, boolean or non-integer literal, or a negated number, which its grammar
+/// folds into a constant (`+1` and `~1` stay operator expressions). An unsigned integer
 /// literal is left alone.
 fn is_constant_refused_as_group_key(expr: &Expr) -> bool {
     let is_unsigned_integer =
@@ -288,10 +289,19 @@ fn is_constant_refused_as_group_key(expr: &Expr) -> bool {
             sqlparser::ast::Value::Placeholder(_) => false,
             _ => true,
         },
-        Expr::UnaryOp { expr: operand, .. } => matches!(
-            operand.as_ref(),
-            Expr::Value(value) if matches!(value.value, sqlparser::ast::Value::Number(..))
-        ),
+        Expr::UnaryOp {
+            op: sqlparser::ast::UnaryOperator::Minus,
+            expr: operand,
+        } => {
+            let mut negated = operand.as_ref();
+            while let Expr::Nested(inner) = negated {
+                negated = inner;
+            }
+            matches!(
+                negated,
+                Expr::Value(value) if matches!(value.value, sqlparser::ast::Value::Number(..))
+            )
+        }
         _ => false,
     }
 }
