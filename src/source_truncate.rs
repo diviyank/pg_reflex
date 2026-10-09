@@ -13,13 +13,13 @@ use crate::schema_builder::{
     source_trigger_function_name, source_trigger_name, truncate_announce_trigger_name,
 };
 
-fn text_arg(value: &str) -> DatumWithOid<'static> {
+pub(crate) fn text_arg(value: &str) -> DatumWithOid<'static> {
     unsafe { DatumWithOid::new(value.to_string(), PgBuiltInOids::TEXTOID.oid().value()) }
 }
 
 /// An IMV read as a source is maintained through its root only: pg_reflex
 /// truncates and swaps its partitions itself and cascades those rebuilds in code.
-fn is_registered_imv(
+pub(crate) fn is_registered_imv(
     client: &pgrx::spi::SpiClient<'_>,
     source: &str,
 ) -> Result<bool, pgrx::spi::Error> {

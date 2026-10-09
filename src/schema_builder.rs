@@ -534,6 +534,35 @@ fn truncate_announced_setting(source_table: &str) -> String {
     format!("pg_reflex.truncating_{:016x}", hasher.finish())
 }
 
+/// Name of a trigger pg_reflex puts on the partitions of `source_table` (`op` is
+/// `ins`, `del`, `upd` or `guard`). The triggers of the source itself are named
+/// by [`source_trigger_name`].
+pub(crate) fn partition_trigger_name(source_table: &str, op: &str) -> String {
+    safe_identifier(&format!(
+        "reflex_partition_{op}_on_{}",
+        source_trigger_suffix(source_table)
+    ))
+}
+
+/// Name of the trigger that marks a partitioned `source_table` as written.
+pub(crate) fn partitioned_source_trigger_name(source_table: &str) -> String {
+    safe_identifier(&format!(
+        "reflex_partitioned_source_{}",
+        source_trigger_suffix(source_table)
+    ))
+}
+
+/// Transaction-local setting raised by every INSERT / UPDATE / DELETE statement
+/// addressed to a table of the partition tree of `source_table`: the partition
+/// flush reads it to know that rows of a partition added or removed in this
+/// transaction may already be reflected in the IMVs.
+pub(crate) fn source_written_setting(source_table: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    source_table.hash(&mut hasher);
+    format!("pg_reflex.written_{:016x}", hasher.finish())
+}
+
 /// Build consolidated trigger DDL statements for a source table.
 ///
 /// Returns 4 DDL blocks (INSERT, DELETE, UPDATE, TRUNCATE), each creating a plpgsql
