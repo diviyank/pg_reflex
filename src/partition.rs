@@ -3762,6 +3762,10 @@ pub(crate) fn reflex_flush_partitions_impl(only: Option<&str>) -> String {
             // Canonical key so the snapshot read matches the key written at
             // create-time seed / prior flush, regardless of bare vs qualified.
             let root_key = canonical_root_key(client, root);
+            for spelling in crate::reconcile::registered_spellings_of(root) {
+                crate::source_truncate::sync_partition_truncate_triggers(client, &spelling)
+                    .map_err(|e| format!("flush: truncate trigger sync failed: {}", e))?;
+            }
             // Partitioned IMVs depending on this source root.
             let imvs: Vec<(String, Option<i32>, Vec<String>)> = client
                 .select(

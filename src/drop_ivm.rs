@@ -346,6 +346,7 @@ fn drop_reflex_ivm_impl_inner(view_name: &str, cascade: bool, root: &str) -> &'s
                 .unwrap_or(None)
                 .unwrap_or(false);
 
+            crate::source_truncate::drop_truncate_triggers(client, source).unwrap_or_report();
             for op in &["ins", "del", "upd", "trunc"] {
                 if source_still_exists {
                     let trig_name = crate::schema_builder::source_trigger_name(source, op);

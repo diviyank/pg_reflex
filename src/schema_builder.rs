@@ -505,6 +505,24 @@ pub(crate) fn source_trigger_function_name(source_table: &str, op: &str) -> Stri
     ))
 }
 
+/// Name of the BEFORE TRUNCATE trigger that announces a truncated relation of
+/// `source_table` to its AFTER TRUNCATE trigger.
+pub(crate) fn truncate_announce_trigger_name(source_table: &str) -> String {
+    safe_identifier(&format!(
+        "__reflex_trigger_btrunc_on_{}",
+        source_trigger_suffix(source_table)
+    ))
+}
+
+/// Transaction-local setting counting the relations of `source_table` the running
+/// TRUNCATE statement announced and whose AFTER trigger has not fired.
+fn truncate_announced_setting(source_table: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    source_table.hash(&mut hasher);
+    format!("pg_reflex.truncating_{:016x}", hasher.finish())
+}
+
 /// Build consolidated trigger DDL statements for a source table.
 ///
 /// Returns 4 DDL blocks (INSERT, DELETE, UPDATE, TRUNCATE), each creating a plpgsql
@@ -761,7 +779,13 @@ pub(crate) fn build_trigger_ddls_from_body(source_table: &str, body_template: &s
     let trunc_trig = source_trigger_name(source_table, "trunc");
     let trunc_body = slot_replace(
         include_str!("../sql/trigger_truncate_body.plpgsql.in"),
-        &[("__REFLEX_SLOT_SOURCE_TABLE__", source_table)],
+        &[
+            ("__REFLEX_SLOT_SOURCE_TABLE__", source_table),
+            (
+                "__REFLEX_SLOT_ANNOUNCED_SETTING__",
+                &truncate_announced_setting(source_table),
+            ),
+        ],
     );
     let trunc_ddl = format!(
         "CREATE OR REPLACE FUNCTION public.{trunc_fn}() RETURNS TRIGGER AS $fn$ {trunc_body} $fn$ LANGUAGE plpgsql;\n\
@@ -886,6 +910,10 @@ pub fn build_deferred_trigger_ddls(source_table: &str, source_columns: &[String]
             ("__REFLEX_SLOT_SOURCE_TABLE__", source_table),
             ("__REFLEX_SLOT_BARE_SOURCE__", &bare_source),
             ("__REFLEX_SLOT_DELTA_TBL__", &delta_tbl),
+            (
+                "__REFLEX_SLOT_ANNOUNCED_SETTING__",
+                &truncate_announced_setting(source_table),
+            ),
         ],
     );
     let trunc_ddl = format!(
