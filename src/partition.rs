@@ -3785,6 +3785,8 @@ pub(crate) fn reflex_flush_partitions_impl(only: Option<&str>) -> String {
             for spelling in crate::reconcile::registered_spellings_of(root) {
                 crate::source_truncate::sync_partition_truncate_triggers(client, &spelling)
                     .map_err(|e| format!("flush: truncate trigger sync failed: {}", e))?;
+                crate::source_partition_writes::sync_partition_write_triggers(client, &spelling)
+                    .map_err(|e| format!("flush: write trigger sync failed: {}", e))?;
             }
             // Partitioned IMVs depending on this source root.
             let imvs: Vec<(String, Option<i32>, Vec<String>)> = client
