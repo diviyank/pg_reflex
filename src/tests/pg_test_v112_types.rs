@@ -1104,6 +1104,57 @@ v112_ty_cells! {
     v112_types_key_equal_intervals => "SELECT iv, COUNT(*) AS c, SUM(v) AS s FROM {src} GROUP BY iv",
 }
 
+/// A dropped intermediate table is rebuilt by reconcile with the key and
+/// MIN / MAX columns it was created with.
+#[pg_test]
+fn v112_types_key_heal_rebuilds_typed_columns() {
+    let fixture = &V112_TY_FIXTURE;
+    let src = "v112_ty_key_heal_src";
+    let imv = "v112_ty_key_heal";
+    let intermediate = "__reflex_intermediate_v112_ty_key_heal";
+    Spi::run(&format!("CREATE TABLE {src}(id SERIAL PRIMARY KEY, {})", fixture.columns)).expect("source");
+    Spi::run(&format!("INSERT INTO {src}({}) VALUES {}", fixture.insert_columns, fixture.seed)).expect("seed");
+    let fresh = format!(
+        "SELECT v AS g, vc AS n, iv, COUNT(*) AS c, MAX(upper(t)) AS hi, MIN(tm) AS lo FROM {src} GROUP BY v, vc, iv"
+    );
+    assert_eq!(
+        v112_ty_try(&format!("SELECT create_reflex_ivm('{imv}', $v112sel${fresh}$v112sel$)")),
+        "CREATE REFLEX INCREMENTAL VIEW"
+    );
+    let created_with = v112_ty_column_types(intermediate);
+    Spi::run(&format!("DROP TABLE {intermediate} CASCADE")).expect("drop intermediate");
+    let reconciled = v112_ty_try(&format!("SELECT reflex_reconcile('{imv}')"));
+    assert!(!reconciled.starts_with("RAISED") && !reconciled.starts_with("ERROR"), "{reconciled}");
+    assert_eq!(v112_ty_column_types(intermediate), created_with);
+    assert_eq!(v112_ty_oracle(imv, &fresh), "0", "after the heal");
+    for (label, dml) in fixture.steps {
+        assert_eq!(v112_ty_try_dml(&dml.replace("{src}", src)), "OK", "{label}");
+        assert_eq!(v112_ty_oracle(imv, &fresh), "0", "{label}");
+    }
+}
+
+/// `character(n)` and an unconstrained `bpchar`: MIN / MAX and keys keep the
+/// blank-padded type and its comparison.
+const V112_TY_BPCHAR_FIXTURE: V112TyFixture = V112TyFixture {
+    columns: "g TEXT, c CHAR(3), u BPCHAR, v INT",
+    insert_columns: "g, c, u, v",
+    seed: "('a','b','b  ',1),('a','ab','ab',2),('b','zz ','zz',3),('n',NULL,NULL,4)",
+    steps: &[
+        ("ins", "INSERT INTO {src}(g, c, u, v) VALUES ('a','a','a ',5),('a','zzz','zzz',6),('c','b ','b',7)"),
+        ("upd", "UPDATE {src} SET c = 'm', u = 'm   ' WHERE v IN (2, 3)"),
+        ("del", "DELETE FROM {src} WHERE v IN (5, 6)"),
+        ("empty", "DELETE FROM {src}"),
+        ("refill", "INSERT INTO {src}(g, c, u, v) VALUES ('a','q','q',8),('a','q  ','q ',9)"),
+    ],
+};
+
+v112_ty_cells! {
+    V112_TY_BPCHAR_FIXTURE, false;
+    v112_types_bpchar_min_max_g => "SELECT g, MIN(c) AS a, MAX(c) AS b, MIN(u) AS d, MAX(u) AS e FROM {src} GROUP BY g",
+    v112_types_bpchar_expr_u => "SELECT MAX(c || 'x') AS a, MIN(u::bpchar) AS b, MAX(c::char(2)) AS d FROM {src}",
+    v112_types_bpchar_keys => "SELECT c, u, COUNT(*) AS n FROM {src} GROUP BY c, u",
+}
+
 // ---------------------------------------------------------------------------
 // SUM / AVG over a type PostgreSQL does not sum as a number
 // ---------------------------------------------------------------------------

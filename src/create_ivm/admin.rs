@@ -750,16 +750,6 @@ pub(crate) fn augment_column_types(
     }
 }
 
-/// A `format_type` spelling as a column type usable in DDL and in a cast.
-/// `format_type` writes a `character` without length as `character`, which DDL
-/// reads as `character(1)`.
-pub(crate) fn ddl_type(format_type: &str) -> String {
-    match format_type {
-        "character" => "bpchar".to_string(),
-        other => other.to_string(),
-    }
-}
-
 /// The type an output column is declared with: the name
 /// [`map_information_schema_type`] writes for the types it knows exactly, and
 /// PostgreSQL's own spelling for every other type, `varchar(n)` and
@@ -780,7 +770,7 @@ pub(crate) fn result_column_type(format_type: &str) -> String {
         | "uuid"
         | "json"
         | "jsonb" => map_information_schema_type(format_type),
-        other => ddl_type(other),
+        other => other.to_string(),
     }
 }
 

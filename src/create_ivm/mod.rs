@@ -1374,7 +1374,7 @@ fn materialize_aggregate(client: &mut pgrx::spi::SpiClient<'_>, ctx: &mut BuildC
             continue;
         }
         if let Some(aggregate_type) = intermediate_types.get(&ic.name) {
-            ic.pg_type = ddl_type(aggregate_type);
+            ic.pg_type = aggregate_type.clone();
         } else if ic.pg_type.eq_ignore_ascii_case("NUMERIC") {
             let resolved = resolve_column_type(&ic.source_arg, &column_types, "");
             if !resolved.is_empty() && !resolved.eq_ignore_ascii_case("NUMERIC") {
