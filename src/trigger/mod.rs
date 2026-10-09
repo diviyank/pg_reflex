@@ -145,6 +145,22 @@ pub(crate) fn has_no_scoped_delta(base_query: &str, source_table: &str) -> bool 
         || source_rewrite_breaks_quoted_identifier(base_query, source_table)
 }
 
+/// [`has_no_scoped_delta`] over the whole stored query of an IMV: a source
+/// read by a subquery of `end_query` (HAVING, an expression over an aggregate)
+/// has no scoped delta either.
+pub(crate) fn imv_has_no_scoped_delta(
+    base_query: &str,
+    end_query: &str,
+    source_table: &str,
+) -> bool {
+    has_no_scoped_delta(base_query, source_table)
+        || expression_subquery::imv_reads_source_by_expression_subquery(
+            base_query,
+            end_query,
+            source_table,
+        )
+}
+
 /// Generates the SQL statements to apply a delta to an IMV.
 ///
 /// Called from plpgsql trigger wrappers. Returns a delimiter-separated string
@@ -211,7 +227,7 @@ pub fn reflex_build_delta_sql(
     // 2. LEFT/RIGHT JOIN secondary table DELETE/UPDATE: NULL semantics can't be captured by MERGE subtract
     // Detect self-join and outer-join-secondary for BOTH aggregate and passthrough queries.
     let is_self_join = source_reference_count(base_query, source_table) > 1;
-    let recompute_in_full = has_no_scoped_delta(base_query, source_table);
+    let recompute_in_full = imv_has_no_scoped_delta(base_query, end_query, source_table);
 
     let bq_upper = upper_with_single_spaces(base_query);
     let is_full_outer = bq_upper.contains("FULL JOIN") || bq_upper.contains("FULL OUTER");
@@ -426,11 +442,11 @@ pub fn reflex_build_path_c_explain_sql(view_name: &str, source_table: &str) -> S
     // standard MERGE path.
     let escaped_view = view_name.replace('\'', "''");
     let lookup_sql = format!(
-        "SELECT base_query, aggregations::text AS agg \
+        "SELECT base_query, COALESCE(end_query, '') AS end_query, aggregations::text AS agg \
          FROM public.__reflex_ivm_reference WHERE name = '{}' AND enabled = TRUE",
         escaped_view
     );
-    let (base_query, agg_json): (String, String) = match Spi::connect(|client| {
+    let (base_query, end_query, agg_json): (String, String, String) = match Spi::connect(|client| {
         client
             .select(&lookup_sql, None, &[])
             .ok()
@@ -447,7 +463,13 @@ pub fn reflex_build_path_c_explain_sql(view_name: &str, source_table: &str) -> S
                     .flatten()
                     .map(|s| s.to_string())
                     .unwrap_or_else(|| "{}".to_string());
-                Some((bq, agg))
+                let end_query = row
+                    .get_by_name::<&str, _>("end_query")
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default()
+                    .to_string();
+                Some((bq, end_query, agg))
             })
     }) {
         Some(t) => t,
@@ -457,7 +479,7 @@ pub fn reflex_build_path_c_explain_sql(view_name: &str, source_table: &str) -> S
         Ok(plan) if plan.source_join_keys.contains_key(source_table) => {}
         _ => return String::new(),
     }
-    if has_no_scoped_delta(&base_query, source_table) {
+    if imv_has_no_scoped_delta(&base_query, &end_query, source_table) {
         return String::new();
     }
     // The swap keeps the unmatched rows of a FULL JOIN's other table, whose

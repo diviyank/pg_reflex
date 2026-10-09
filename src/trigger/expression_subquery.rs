@@ -2,6 +2,7 @@
 
 use super::outer_join::single_query;
 use super::union_delta::{bare_lower, references_source};
+use super::upper_with_single_spaces;
 use sqlparser::ast::{Expr, Query, Visit, Visitor};
 use std::ops::ControlFlow;
 
@@ -32,6 +33,37 @@ pub(crate) fn source_read_by_expression_subquery(
     };
     let _ = query.visit(&mut finder);
     finder.found
+}
+
+/// Whether the IMV reads `source_table` through a subquery used as an
+/// expression, wherever the query holds it. `base_query` carries the FROM,
+/// WHERE and GROUP BY clauses and the aggregate arguments; `end_query` carries
+/// HAVING and the select-list expressions computed over the aggregates, and
+/// reads nothing but the intermediate table outside its subqueries. A
+/// passthrough has no `end_query`: its `base_query` is the whole query.
+pub(crate) fn imv_reads_source_by_expression_subquery(
+    base_query: &str,
+    end_query: &str,
+    source_table: &str,
+) -> bool {
+    source_read_by_expression_subquery(
+        &upper_with_single_spaces(base_query),
+        base_query,
+        source_table,
+    ) || end_query_reads_source(end_query, source_table)
+}
+
+/// Whether `end_query` reads `source_table`. An `end_query` that does not
+/// parse counts as reading every source whose name it holds.
+fn end_query_reads_source(end_query: &str, source_table: &str) -> bool {
+    if end_query.is_empty() {
+        return false;
+    }
+    let source = bare_lower(source_table);
+    match single_query(end_query) {
+        Some(query) => references_source(&query, &source),
+        None => end_query.to_lowercase().contains(&source),
+    }
 }
 
 struct ExpressionSubqueryFinder {
