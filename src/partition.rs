@@ -3671,6 +3671,26 @@ fn stop_after_reconcile_block(calls: &[String]) -> String {
     format!("<<reflex_imv_delta>> DECLARE _r TEXT; BEGIN {steps}END reflex_imv_delta")
 }
 
+/// A DEFERRED flush leaves the two sides of its staged delta as session-level
+/// temporary views named like the transition tables of the source. The partition
+/// delta materialises a partition under the same names as temporary tables, which
+/// a view of that name prevents.
+fn session_temp_view_exists(client: &pgrx::spi::SpiClient<'_>, name: &str) -> bool {
+    client
+        .select(
+            "SELECT 1 FROM pg_class \
+             WHERE relname = $1 AND relkind = 'v' AND relnamespace = pg_my_temp_schema()",
+            Some(1),
+            &[
+                unsafe {
+                    DatumWithOid::new(name.to_string(), PgBuiltInOids::TEXTOID.oid().value())
+                },
+            ],
+        )
+        .map(|mut rows| rows.next().is_some())
+        .unwrap_or(false)
+}
+
 pub(crate) fn reflex_flush_partitions_impl(only: Option<&str>) -> String {
     let outcome: Result<String, String> = Spi::connect_mut(|client| {
         let (roots, capped_roots): (Vec<String>, Vec<CappedRoot>) = match only {
@@ -4080,6 +4100,12 @@ pub(crate) fn reflex_flush_partitions_impl(only: Option<&str>) -> String {
                     ));
                     summary.push(format!("{}: full reconcile (unpartitioned)", imv));
                 } else if !delta_stmts.is_empty() {
+                    for transition in [&trans_new, &trans_old] {
+                        if session_temp_view_exists(client, transition) {
+                            root_stmts
+                                .push(format!("DROP VIEW IF EXISTS pg_temp.\"{transition}\""));
+                        }
+                    }
                     root_stmts.push(stop_after_reconcile_block(&delta_stmts));
                     summary.push(format!(
                         "{}: incremental partition delta ({} change(s))",
