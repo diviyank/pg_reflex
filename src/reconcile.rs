@@ -1547,7 +1547,48 @@ pub(crate) fn reconcile_generated_child_for_cross_source_guard(child: &str) -> &
     {
         resync_wrapper_operand_slice(&wrapper, idx, child);
     }
+    for reader in stored_readers_of(child) {
+        crate::trigger::deferred::list_for_commit_reconcile(&reader);
+    }
     result
+}
+
+/// The enabled IMVs that read `child` and store rows of their own. A rebuild of
+/// `child` with its triggers disabled reaches none of them: the COMMIT-time pass
+/// rebuilds each one listed for it, a generated one listing its own readers in turn.
+fn stored_readers_of(child: &str) -> Vec<String> {
+    let spellings = registered_spellings_of(child);
+    let readers: Vec<String> = Spi::connect(|client| {
+        client
+            .select(
+                "SELECT name FROM public.__reflex_ivm_reference \
+                 WHERE depends_on && $1::TEXT[] AND enabled = TRUE AND name <> $2 \
+                 ORDER BY graph_depth, name",
+                None,
+                &[
+                    unsafe {
+                        DatumWithOid::new(
+                            crate::sql_writer::identifier::format_pg_text_array(&spellings),
+                            PgBuiltInOids::TEXTOID.oid().value(),
+                        )
+                    },
+                    unsafe {
+                        DatumWithOid::new(child.to_string(), PgBuiltInOids::TEXTOID.oid().value())
+                    },
+                ],
+            )
+            .unwrap_or_report()
+            .filter_map(|row| {
+                row.get_by_name::<&str, _>("name")
+                    .unwrap_or(None)
+                    .map(|s| s.to_string())
+            })
+            .collect()
+    });
+    readers
+        .into_iter()
+        .filter(|reader| !is_decomposed_wrapper_row(reader))
+        .collect()
 }
 
 /// The rebuild the DEFERRED cross-source guard asks for: a generated sub-IMV
