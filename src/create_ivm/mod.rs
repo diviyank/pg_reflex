@@ -210,6 +210,7 @@ fn with_unquoted_names_folded(
     };
     let written = rendered(&statements);
     crate::sql_analyzer::fold_unquoted_names(&mut statements);
+    identifier_quotes::unquote_relation_names(&mut statements);
     let folded = rendered(&statements);
     let folded_sql = (folded != written).then_some(folded);
     (statements, folded_sql)

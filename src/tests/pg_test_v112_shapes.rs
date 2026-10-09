@@ -571,6 +571,75 @@ const V112_SH_KEYWORD_STEPS: &[(&str, &str)] = &[
     ("refill", "INSERT INTO \"{p}\"(season, v) VALUES ('e',1),('e',2)"),
 ];
 
+/// A `public` table named by a keyword, read bare and quoted: one relation is
+/// one registered source (an unqualified source of `public` is also named by
+/// `public.<source>`), and every IMV over it is maintained, the survivors of a
+/// drop included. `{p}` is the table name here.
+#[pg_test]
+fn v112_sh_keyword_named_table_under_two_spellings() {
+    const BARE_SUM: &str = "SELECT season, SUM(v) AS s FROM {p} GROUP BY season";
+    const QUOTED_COUNT: &str = "SELECT season, COUNT(*) AS c FROM \"{p}\" GROUP BY season";
+    const QUOTED_PASS: &str = "SELECT id, season, v FROM \"{p}\" WHERE v > 0";
+    const BARE_PASS: &str = "SELECT id, season, v FROM {p} WHERE v > 0";
+    const SELF_JOIN: &str = "SELECT a.season, COUNT(*) AS c, SUM(b.v) AS s FROM {p} a \
+                             JOIN \"{p}\" b ON a.season = b.season GROUP BY a.season";
+    const QUALIFIED: &str = "SELECT \"{p}\".season, MAX({p}.v) AS hi FROM public.{p} GROUP BY \"{p}\".season";
+    probe_db_open("reflex_sh_keyword");
+    let mut failures = Vec::new();
+    for (table, mode, first, second) in [
+        ("zone", "IMMEDIATE", BARE_SUM, QUOTED_COUNT),
+        ("year", "IMMEDIATE", QUOTED_COUNT, BARE_SUM),
+        ("data", "DEFERRED", BARE_SUM, QUOTED_COUNT),
+        ("role", "DEFERRED", QUOTED_COUNT, BARE_SUM),
+        ("name", "IMMEDIATE", BARE_PASS, QUOTED_PASS),
+        ("value", "IMMEDIATE", QUOTED_PASS, BARE_PASS),
+        ("type", "DEFERRED", QUOTED_PASS, BARE_SUM),
+        ("key", "IMMEDIATE", SELF_JOIN, QUOTED_COUNT),
+        ("version", "IMMEDIATE", QUOTED_COUNT, SELF_JOIN),
+        ("location", "DEFERRED", SELF_JOIN, BARE_PASS),
+        ("month", "IMMEDIATE", QUALIFIED, QUOTED_COUNT),
+        ("plain_ctl", "IMMEDIATE", BARE_SUM, QUOTED_COUNT),
+    ] {
+        worker_exec(&format!(
+            "CREATE TABLE \"{table}\"(id SERIAL PRIMARY KEY, season TEXT, v INT)"
+        ));
+        worker_exec(&format!(
+            "INSERT INTO \"{table}\"(season, v) VALUES ('e',1),('y',2),('e',3)"
+        ));
+        failures.extend(v112_sh_group_failures(
+            table,
+            mode,
+            table,
+            &[("{p}_a", first, None), ("{p}_b", second, None)],
+            &V112_SH_KEYWORD_STEPS[..4],
+        ));
+        let spellings: std::collections::BTreeSet<String> = ["a", "b"]
+            .iter()
+            .flat_map(|imv| {
+                v112_sh_depends_on(&format!("{table}_{imv}"))
+                    .split(',')
+                    .map(|spelling| spelling.trim_start_matches("public.").to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        if spellings.len() != 1 {
+            failures.push(format!("{table}: registered as {spellings:?}"));
+        }
+        let survivor = [(format!("{table}_b"), v112_sh_fill(second, table))];
+        let mut after_drop = Vec::new();
+        v112_sh_steps(
+            &mut after_drop,
+            &format!("{table} {mode}"),
+            table,
+            &V112_SH_KEYWORD_STEPS[4..],
+            &survivor,
+        );
+        failures.extend(after_drop);
+    }
+    probe_db_close("reflex_sh_keyword");
+    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+}
+
 const V112_SH_CASE_STEPS: &[(&str, &str)] = &[
     ("ins lower", "INSERT INTO {p}t(season, v, w) VALUES ('e',10,1),('n',30,3)"),
     ("upd lower", "UPDATE {p}t SET v = v + 100, w = w + 1 WHERE season = 'e'"),
