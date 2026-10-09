@@ -2537,6 +2537,17 @@ pub(crate) fn create_reflex_ivm_impl_with_materialization(
         return Box::leak(msg.into_boxed_str());
     }
 
+    let only_source = match ctx.real_source_names.as_slice() {
+        [only] => Some(only.as_str()),
+        _ => None,
+    };
+    let unmaintainable = Spi::connect(|client| {
+        source_row_shape::unmaintainable_source_row_reference(client, ctx.sql, only_source)
+    });
+    if let Some(reason) = unmaintainable {
+        return crate::reflex_reject(&reason);
+    }
+
     if let Some(duplicate) = duplicate_output_column(ctx.sql) {
         return crate::reflex_reject(&format!(
             "{duplicate}: two output columns of the query have the same name. \
@@ -2662,6 +2673,7 @@ mod identifier_quotes;
 /// `crate::audit` rather than re-implementing the resolver.
 pub(crate) mod ignore_soundness;
 mod soundness;
+mod source_row_shape;
 
 pub(crate) use admin::*;
 pub(crate) use decompose::*;
