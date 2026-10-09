@@ -831,9 +831,12 @@ pub(crate) fn outer_join_secondary_stmts(
             scope_target_cols.push(tc.clone());
         }
 
-        if scope_cols.is_empty() {
+        if scope_cols.is_empty()
+            || outer_join::left_joined_source_is_filtered(base_query, source_table)
+        {
             // Every group key derives from the mutated secondary — no stable key
-            // to scope by. Fall back to a full intermediate + target refresh.
+            // to scope by — or the affected groups cannot be read off the
+            // transition rows. Fall back to a full intermediate + target refresh.
             stmts.push(format!("TRUNCATE {}", intermediate_tbl));
             stmts.push(format!("INSERT INTO {} {}", intermediate_tbl, base_query));
             stmts.push(rebuild_target_stmt(view_name, end_query));

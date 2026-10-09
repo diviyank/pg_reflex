@@ -1774,6 +1774,7 @@ fn collect_imv_relevant_columns(
     aliases: &HashMap<String, String>,
     _all_sources: &[String],
     has_ctes: bool,
+    unfiltered_where_column_refs: &[Vec<String>],
 ) -> HashMap<String, BTreeSet<String>> {
     if has_ctes || select.from.iter().any(holds_natural_join) {
         return HashMap::new();
@@ -1792,7 +1793,9 @@ fn collect_imv_relevant_columns(
         }
     }
 
-    let mut collector = ColumnRefCollector::default();
+    let mut collector = ColumnRefCollector {
+        refs: unfiltered_where_column_refs.to_vec(),
+    };
 
     // Projection
     for item in &select.projection {
@@ -1936,12 +1939,12 @@ fn collect_imv_relevant_where(
     aliases: &HashMap<String, String>,
     sources: &[String],
     has_ctes: bool,
-) -> HashMap<String, String> {
+) -> SourceFilters {
     if has_ctes {
-        return HashMap::new();
+        return SourceFilters::default();
     }
     let Some(where_expr) = &select.selection else {
-        return HashMap::new();
+        return SourceFilters::default();
     };
 
     // Attribute conjuncts against the OUTER FROM's sources only. A relation
@@ -1955,9 +1958,13 @@ fn collect_imv_relevant_where(
         .filter(|s| is_real_source(s) && outer_names.contains(*s))
         .collect();
     if real_sources.is_empty() {
-        return HashMap::new();
+        return SourceFilters {
+            per_source: HashMap::new(),
+            unfiltered_column_refs: collect_column_refs(where_expr),
+        };
     }
     let outer_sources: Vec<String> = real_sources.iter().map(|s| (*s).clone()).collect();
+    let null_extended = null_extended_sources(select);
 
     // Pre-compute the prefixes we'd need to strip per source: every alias
     // pointing at that source, plus the source's bare table name.
@@ -1976,9 +1983,21 @@ fn collect_imv_relevant_where(
     let mut conjuncts: Vec<Expr> = Vec::new();
     split_top_level_and(where_expr, &mut conjuncts);
 
-    let mut buckets: HashMap<String, Vec<String>> = HashMap::new();
+    let outer_qualifiers: BTreeSet<String> =
+        prefixes_per_source.values().flatten().cloned().collect();
+    let empty = BTreeSet::new();
+    let qualifier_scope = top_level_qualifier_scope(select);
+    let admits_null_extended_rows_of = |source: &String| {
+        null_extended.contains(source)
+            && !conjuncts
+                .iter()
+                .any(|conjunct| rejects_null_row_of(conjunct, source, &qualifier_scope))
+    };
 
-    for conj in conjuncts {
+    let mut buckets: HashMap<String, Vec<String>> = HashMap::new();
+    let mut unfiltered_column_refs: Vec<Vec<String>> = Vec::new();
+
+    for conj in &conjuncts {
         // Only OUTER-level refs attribute the conjunct; a scalar subquery is an
         // opaque value evaluated against its own tables at maintenance time.
         let mut collector = OuterColumnRefCollector::default();
@@ -2011,19 +2030,19 @@ fn collect_imv_relevant_where(
             }
         }
 
-        if ambiguous_or_unattributable {
+        // 0 refs: it's a literal predicate (e.g., TRUE). Drop — not
+        // useful and pollutes both sides equally.
+        // 2+ refs: cross-source conjunct, can't evaluate on one
+        // transition table.
+        let owner = (!ambiguous_or_unattributable && resolved_sources.len() == 1)
+            .then(|| resolved_sources.into_iter().next().unwrap())
+            .filter(|_| !subquery_reads_outer_relation(conj, &outer_qualifiers))
+            .filter(|source| !admits_null_extended_rows_of(source));
+        let Some(source) = owner else {
+            unfiltered_column_refs.extend(collect_column_refs(conj));
             continue;
-        }
-        if resolved_sources.len() != 1 {
-            // 0 refs: it's a literal predicate (e.g., TRUE). Drop — not
-            // useful and pollutes both sides equally.
-            // 2+ refs: cross-source conjunct, can't evaluate on one
-            // transition table.
-            continue;
-        }
+        };
 
-        let source = resolved_sources.into_iter().next().unwrap();
-        let empty = BTreeSet::new();
         let prefixes = prefixes_per_source.get(&source).unwrap_or(&empty);
         let mut rewritten = conj.clone();
         let mut stripper = AliasPrefixStripper {
@@ -2037,10 +2056,160 @@ fn collect_imv_relevant_where(
             .push(rewritten.to_string());
     }
 
-    buckets
-        .into_iter()
-        .map(|(src, parts)| (src, parts.join(" AND ")))
-        .collect()
+    SourceFilters {
+        per_source: buckets
+            .into_iter()
+            .map(|(src, parts)| (src, parts.join(" AND ")))
+            .collect(),
+        unfiltered_column_refs,
+    }
+}
+
+/// The WHERE of a query split by what the UPDATE skip can evaluate on one
+/// source's transition rows.
+#[derive(Default)]
+struct SourceFilters {
+    /// Source → its AND-joined conjuncts, alias prefixes stripped.
+    per_source: HashMap<String, String>,
+    /// Column references of the conjuncts no source filter holds. A change of
+    /// such a column can move a row across the WHERE without any per-source
+    /// filter seeing it, so these columns count as IMV-relevant.
+    unfiltered_column_refs: Vec<Vec<String>>,
+}
+
+/// Top-level tables whose columns an outer join can null-extend: the table a
+/// LEFT JOIN introduces, the tables before a RIGHT JOIN, both for a FULL JOIN.
+/// A filter on such a table does not describe which joined rows pass the
+/// WHERE: a null-extended row is judged on NULLs, not on a row of the table.
+fn null_extended_sources(select: &Select) -> BTreeSet<String> {
+    let table_name = |factor: &TableFactor| match factor {
+        TableFactor::Table { name, .. } => Some(name.to_string()),
+        _ => None,
+    };
+    let mut null_extended = BTreeSet::new();
+    for twj in &select.from {
+        let mut preceding: Vec<String> = table_name(&twj.relation).into_iter().collect();
+        for join in &twj.joins {
+            let joined = table_name(&join.relation);
+            let (extends_joined, extends_preceding) = match join.join_operator {
+                JoinOperator::Left(_) | JoinOperator::LeftOuter(_) => (true, false),
+                JoinOperator::Right(_) | JoinOperator::RightOuter(_) => (false, true),
+                JoinOperator::FullOuter(_) => (true, true),
+                _ => (false, false),
+            };
+            if extends_joined {
+                null_extended.extend(joined.clone());
+            }
+            if extends_preceding {
+                null_extended.extend(preceding.iter().cloned());
+            }
+            preceding.extend(joined);
+        }
+    }
+    null_extended
+}
+
+/// Qualifier → table for the top-level FROM clause, as PostgreSQL scopes it:
+/// an aliased table answers to its alias only, an unaliased one to its name
+/// (bare, and as written). A qualifier two relations share is left out.
+fn top_level_qualifier_scope(select: &Select) -> HashMap<String, String> {
+    let mut scope: HashMap<String, String> = HashMap::new();
+    let mut shared: BTreeSet<String> = BTreeSet::new();
+    for (table, alias) in top_level_tables(select) {
+        let qualifiers = match alias {
+            Some(alias) => vec![alias],
+            None => {
+                let bare = table.rsplit('.').next().unwrap_or(&table).to_string();
+                BTreeSet::from([bare, table.clone()]).into_iter().collect()
+            }
+        };
+        for qualifier in qualifiers {
+            if scope.insert(qualifier.clone(), table.clone()).is_some() {
+                shared.insert(qualifier);
+            }
+        }
+    }
+    for qualifier in shared {
+        scope.remove(&qualifier);
+    }
+    scope
+}
+
+/// Whether `conjunct` is false or NULL for every row whose columns of `source`
+/// are all NULL: a comparison, `IN` list or `BETWEEN` whose tested operand is a
+/// column of `source`, or `IS NOT NULL` of one. Only a column whose qualifier
+/// resolves to `source` in `qualifier_scope` counts; an unqualified column
+/// never does. Anything else counts as possibly true.
+fn rejects_null_row_of(
+    conjunct: &Expr,
+    source: &str,
+    qualifier_scope: &HashMap<String, String>,
+) -> bool {
+    let is_qualified_column = |expr: &Expr| {
+        matches!(expr, Expr::CompoundIdentifier(ids)
+            if ids.len() == 2
+                && qualifier_scope.get(&ids[0].value).map(String::as_str) == Some(source))
+    };
+    match conjunct {
+        Expr::Nested(inner) => rejects_null_row_of(inner, source, qualifier_scope),
+        Expr::BinaryOp { left, op, right } => {
+            matches!(
+                op,
+                BinaryOperator::Eq
+                    | BinaryOperator::NotEq
+                    | BinaryOperator::Lt
+                    | BinaryOperator::LtEq
+                    | BinaryOperator::Gt
+                    | BinaryOperator::GtEq
+            ) && (is_qualified_column(left) || is_qualified_column(right))
+        }
+        Expr::IsNotNull(tested) => is_qualified_column(tested),
+        Expr::InList { expr, .. } | Expr::Between { expr, .. } => is_qualified_column(expr),
+        _ => false,
+    }
+}
+
+/// Whether a subquery inside `expr` reads a column through one of
+/// `outer_qualifiers`. Stripping the qualifier would rebind such a correlated
+/// reference to the subquery's own tables, and leaving it would name a
+/// relation the transition table does not provide.
+fn subquery_reads_outer_relation(expr: &Expr, outer_qualifiers: &BTreeSet<String>) -> bool {
+    struct CorrelatedRefFinder<'a> {
+        outer_qualifiers: &'a BTreeSet<String>,
+        subquery_depth: usize,
+    }
+    impl Visitor for CorrelatedRefFinder<'_> {
+        type Break = ();
+
+        fn pre_visit_query(&mut self, _query: &Query) -> ControlFlow<()> {
+            self.subquery_depth += 1;
+            ControlFlow::Continue(())
+        }
+
+        fn post_visit_query(&mut self, _query: &Query) -> ControlFlow<()> {
+            self.subquery_depth -= 1;
+            ControlFlow::Continue(())
+        }
+
+        fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<()> {
+            match expr {
+                Expr::CompoundIdentifier(ids)
+                    if self.subquery_depth > 0
+                        && ids[..ids.len() - 1]
+                            .iter()
+                            .any(|qualifier| self.outer_qualifiers.contains(&qualifier.value)) =>
+                {
+                    ControlFlow::Break(())
+                }
+                _ => ControlFlow::Continue(()),
+            }
+        }
+    }
+    let mut finder = CorrelatedRefFinder {
+        outer_qualifiers,
+        subquery_depth: 0,
+    };
+    expr.visit(&mut finder).is_break()
 }
 
 /// Returns true if `expr_sql` parses as an `Expr::Identifier(_)` or
@@ -2240,10 +2409,16 @@ pub fn analyze(statements: &[Statement]) -> Result<SqlAnalysis, SqlAnalysisError
     // aliases. CTE-using queries get an empty map (safe; the filter-aware
     // skip is silently disabled). See `collect_imv_relevant_columns`.
     let has_ctes = !analysis.ctes.is_empty();
-    analysis.imv_relevant_columns =
-        collect_imv_relevant_columns(select, &analysis.table_aliases, &analysis.sources, has_ctes);
-    analysis.imv_relevant_where =
+    let source_filters =
         collect_imv_relevant_where(select, &analysis.table_aliases, &analysis.sources, has_ctes);
+    analysis.imv_relevant_columns = collect_imv_relevant_columns(
+        select,
+        &analysis.table_aliases,
+        &analysis.sources,
+        has_ctes,
+        &source_filters.unfiltered_column_refs,
+    );
+    analysis.imv_relevant_where = source_filters.per_source;
     disable_update_skip_for_repeated_sources(&mut analysis);
 
     Ok(analysis)
