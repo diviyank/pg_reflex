@@ -174,6 +174,13 @@ const V112_PD_EXISTING_PARTITIONS: &[(&str, &str)] = &[
          INSERT INTO {s}_pd VALUES (74,'q',50)",
     ),
     ("control: delete on the root", "DELETE FROM {s} WHERE id IN (71, 173)"),
+    (
+        "detach and attach a partition again in one transaction, then write to it",
+        "ALTER TABLE {s} DETACH PARTITION {s}_pa; \
+         ALTER TABLE {s} ATTACH PARTITION {s}_pa FOR VALUES IN ('a', 'b'); \
+         INSERT INTO {s}_pa VALUES (81,'a',8); UPDATE {s} SET v = v + 1 WHERE id = 72",
+    ),
+    ("write to it afterwards", "DELETE FROM {s}_pa WHERE id = 81; INSERT INTO {s}_pa VALUES (82,'b',2)"),
 ];
 
 const V112_PD_LATER_PARTITIONS: &[(&str, &str)] = &[
