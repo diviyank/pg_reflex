@@ -425,6 +425,8 @@ pub(crate) fn reflex_rebuild_triggers_impl(source_table: &str) -> String {
                 .update(ddl, None, &[])
                 .map_err(|e| format!("CREATE TRIGGER failed: {}", e))?;
         }
+        crate::source_truncate::sync_partition_truncate_triggers(client, &resolved)
+            .map_err(|e| format!("partition truncate triggers failed: {}", e))?;
 
         // Heal passthrough scratch tables: a passthrough IMV references a per-(IMV, source) scratch
         // pair (`__reflex_pt_new/old_<imv>_<source>`) that `passthrough_op_stmts`
