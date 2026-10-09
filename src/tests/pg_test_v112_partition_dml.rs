@@ -881,3 +881,95 @@ fn v112_pd_partition_flush_retried_after_a_failure_does_not_reapply_rows() {
     assert!(failures.is_empty(), "{}", failures.join("\n"));
     assert_eq!(pending, 0, "the retried flush left its root pending");
 }
+
+/// A partition leaf of the IMV dropped by hand and recreated by a bare
+/// `reflex_sync_partitions`: its sibling on the other side of the IMV still holds
+/// the partition's rows, so the sync refills the pair from the source.
+fn v112_pd_assert_sync_refills_a_recreated_leaf(prefix: &str, mode: &str, intermediate: bool) {
+    let source = format!("{prefix}_t");
+    let imv = format!("{prefix}_v");
+    let query = format!("SELECT season, SUM(v) AS sv, COUNT(*) AS c FROM {source} GROUP BY season");
+    Spi::run(&format!(
+        "CREATE TABLE {source}(id INT NOT NULL, season TEXT NOT NULL, v INT) PARTITION BY LIST (season)"
+    ))
+    .expect("source");
+    for (leaf, bound) in [
+        ("p0", "FOR VALUES IN ('e', 'f')"),
+        ("p1", "FOR VALUES IN ('y')"),
+        ("pd", "DEFAULT"),
+    ] {
+        Spi::run(&format!("CREATE TABLE {source}_{leaf} PARTITION OF {source} {bound}")).expect("leaf");
+    }
+    Spi::run(&format!(
+        "INSERT INTO {source} VALUES (1,'e',10),(2,'e',40),(3,'f',5),(4,'y',2),(5,'z',3)"
+    ))
+    .expect("seed");
+    let created = Spi::get_one::<String>(&format!(
+        "SELECT create_reflex_ivm('{imv}', '{query}', NULL, NULL, '{mode}', NULL, ARRAY['season'])"
+    ))
+    .expect("create")
+    .unwrap_or_default();
+    assert_eq!(created, "CREATE REFLEX INCREMENTAL VIEW");
+
+    let parent = if intermediate {
+        format!("__reflex_intermediate_{imv}")
+    } else {
+        imv.clone()
+    };
+    let leaves_of = |parent: &str| -> i64 {
+        Spi::get_one::<i64>(&format!(
+            "SELECT count(*) FROM pg_inherits WHERE inhparent = '\"{parent}\"'::regclass"
+        ))
+        .expect("leaves")
+        .unwrap_or(0)
+    };
+    let victim = Spi::get_one::<String>(&format!(
+        "SELECT c.relname::text FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid \
+         WHERE i.inhparent = '\"{parent}\"'::regclass AND c.relname LIKE '%\\_p0'"
+    ))
+    .expect("leaf lookup")
+    .expect("no leaf for p0");
+    Spi::run(&format!("DROP TABLE \"{victim}\"")).expect("drop leaf");
+    assert_eq!(leaves_of(&parent), 2, "fixture: the leaf is gone");
+
+    Spi::run(&format!("SELECT reflex_sync_partitions('{imv}')")).expect("sync");
+    assert_eq!(leaves_of(&parent), 3, "the sync recreates the leaf");
+    assert_imv_correct(&imv, &query);
+    for statement in [
+        format!("INSERT INTO {source} VALUES (6,'e',4),(7,'y',1)"),
+        format!("UPDATE {source} SET v = v + 1 WHERE season = 'f'"),
+        format!("DELETE FROM {source} WHERE id = 2"),
+        format!("INSERT INTO {source}_p0 VALUES (8,'f',8)"),
+    ] {
+        Spi::run(&statement).expect("write");
+        if mode == "DEFERRED" {
+            Spi::run(&format!("SELECT reflex_flush_deferred('{source}')")).expect("flush");
+        }
+        assert_imv_correct(&imv, &query);
+    }
+    let report = ps9_audit(&imv);
+    assert!(
+        !report.contains("partition-mirror") && !report.contains("archive_residue"),
+        "{mode}: the audit still reports the IMV:\n{report}"
+    );
+}
+
+#[pg_test]
+fn v112_pd_sync_refills_a_recreated_intermediate_leaf_immediate() {
+    v112_pd_assert_sync_refills_a_recreated_leaf("v112_pd_si", "IMMEDIATE", true);
+}
+
+#[pg_test]
+fn v112_pd_sync_refills_a_recreated_intermediate_leaf_deferred() {
+    v112_pd_assert_sync_refills_a_recreated_leaf("v112_pd_sd", "DEFERRED", true);
+}
+
+#[pg_test]
+fn v112_pd_sync_refills_a_recreated_target_leaf_immediate() {
+    v112_pd_assert_sync_refills_a_recreated_leaf("v112_pd_ui", "IMMEDIATE", false);
+}
+
+#[pg_test]
+fn v112_pd_sync_refills_a_recreated_target_leaf_deferred() {
+    v112_pd_assert_sync_refills_a_recreated_leaf("v112_pd_ud", "DEFERRED", false);
+}

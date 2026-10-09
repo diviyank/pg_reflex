@@ -1321,6 +1321,11 @@ pub(crate) fn reflex_sync_partitions_impl(view_name: &str, drop_orphans: bool) -
     if let Err(msg) = crate::validate_view_name(view_name) {
         return msg.to_string();
     }
+    // Source partitions whose intermediate or target child had to be created
+    // while the child on the other side exists and holds rows: one half of the
+    // pair was lost, and an empty half next to a filled one publishes wrong
+    // aggregates on the next write. The pair is rebuilt from the source.
+    let mut recreated_beside_a_filled_sibling: Vec<String> = Vec::new();
     let outcome: Result<String, String> = Spi::connect_mut(|client| {
         // Load partition metadata.
         let meta = client
@@ -1640,6 +1645,12 @@ pub(crate) fn reflex_sync_partitions_impl(view_name: &str, drop_orphans: bool) -
                 let tgt_name = target_child_name(view_name, &node.bare_name);
                 let int_is_new = !existing_children.contains(&int_name);
                 let tgt_is_new = !existing_children.contains(&tgt_name);
+                if has_intermediate && int_is_new != tgt_is_new {
+                    let sibling = if int_is_new { &tgt_name } else { &int_name };
+                    if relation_has_rows(client, &schema_prefix(view_name, sibling)) {
+                        recreated_beside_a_filled_sibling.push(node.bare_name.clone());
+                    }
+                }
                 let ddl =
                     build_partition_node_ddl_pair(view_name, node, anchor_root_bare, unlogged);
                 let detached =
@@ -1770,7 +1781,19 @@ pub(crate) fn reflex_sync_partitions_impl(view_name: &str, drop_orphans: bool) -
         Ok(out.into_message())
     });
     match outcome {
-        Ok(s) => s,
+        Ok(synced) if recreated_beside_a_filled_sibling.is_empty() => synced,
+        Ok(synced) => {
+            let refilled = reflex_reconcile_partition_impl(
+                view_name,
+                &[],
+                &recreated_beside_a_filled_sibling.join(","),
+                true,
+            );
+            format!(
+                "{synced}; refilled recreated partition(s) {}: {refilled}",
+                recreated_beside_a_filled_sibling.join(", ")
+            )
+        }
         Err(e) => format!("ERROR: {}", e),
     }
 }
