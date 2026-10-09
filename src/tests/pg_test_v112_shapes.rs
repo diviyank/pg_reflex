@@ -472,6 +472,24 @@ const V112_SH_DERIVED_STEPS: &[(&str, &str)] = &[
     ("s_refill", "INSERT INTO {p}s(g, v, w) VALUES ('a',1,1),('z',2,2),('z',3,3)"),
 ];
 
+/// A derived table that holds a subquery or a UNION ALL.
+#[pg_test]
+fn v112_sh_derived_table_holding_a_subquery() {
+    v112_sh_assert_cells(
+        "reflex_sh_derived",
+        &[
+            v112_sh_cell!(V112_SH_DERIVED_SETUP, V112_SH_DERIVED_STEPS, "in_agg", None, "SELECT x.g, SUM(x.v) AS sv, COUNT(*) AS c FROM (SELECT g, v FROM {p}s WHERE g IN (SELECT g FROM {p}t)) x GROUP BY x.g"),
+            v112_sh_cell!(V112_SH_DERIVED_SETUP, V112_SH_DERIVED_STEPS, "ua_agg", None, "SELECT q.g, SUM(q.v) AS sv, COUNT(*) AS c FROM (SELECT g, v FROM {p}s UNION ALL SELECT g, v FROM {p}t) q GROUP BY q.g"),
+            v112_sh_cell!(V112_SH_DERIVED_SETUP, V112_SH_DERIVED_STEPS, "in_pt", None, "SELECT x.g, x.v FROM (SELECT g, v FROM {p}s WHERE g IN (SELECT g FROM {p}t)) x"),
+            v112_sh_cell!(V112_SH_DERIVED_SETUP, V112_SH_DERIVED_STEPS, "ua_pt", None, "SELECT q.g, q.v FROM (SELECT g, v FROM {p}s UNION ALL SELECT g, v FROM {p}t) q WHERE q.v > 1"),
+            v112_sh_cell!(V112_SH_DERIVED_SETUP, V112_SH_DERIVED_STEPS, "ex_agg", None, "SELECT x.g, MAX(x.v) AS hi FROM (SELECT g, v FROM {p}s m WHERE EXISTS (SELECT 1 FROM {p}t j WHERE j.g = m.g)) x GROUP BY x.g"),
+            v112_sh_cell!(V112_SH_DERIVED_SETUP, V112_SH_DERIVED_STEPS, "sc_agg", None, "SELECT x.g, SUM(x.v) AS sv FROM (SELECT g, v FROM {p}s WHERE v > (SELECT min(v) FROM {p}t)) x GROUP BY x.g"),
+            v112_sh_cell!(V112_SH_DERIVED_SETUP, V112_SH_DERIVED_STEPS, "join_agg", None, "SELECT x.g, SUM(x.v) AS sv, COUNT(j.label) AS c FROM (SELECT g, v FROM {p}s WHERE g IN (SELECT g FROM {p}t)) x JOIN {p}t j ON j.g = x.g GROUP BY x.g"),
+            v112_sh_cell!(V112_SH_DERIVED_SETUP, V112_SH_DERIVED_STEPS, "plain_ctl", None, "SELECT x.g, SUM(x.v) AS sv, COUNT(*) AS c FROM (SELECT g, v FROM {p}s WHERE v > 0) x GROUP BY x.g"),
+        ],
+    );
+}
+
 const V112_SH_KEY_SETUP: &[&str] = &[
     "CREATE TABLE {p}t(id SERIAL PRIMARY KEY, g TEXT, v INT, arr INT[])",
     "INSERT INTO {p}t(g, v, arr) VALUES ('a',1,'{1}'),('b',2,'{3}'),('c',3,'{}')",
