@@ -3671,6 +3671,54 @@ fn stop_after_reconcile_block(calls: &[String]) -> String {
     format!("<<reflex_imv_delta>> DECLARE _r TEXT; BEGIN {steps}END reflex_imv_delta")
 }
 
+/// The partition delta of an unpartitioned IMV applies the rows of an added
+/// partition, or removes those of a detached one, as they are when the flush
+/// runs. That equals the change the IMV misses only while no statement trigger
+/// of the source applied (or staged) a row since the partition changed: a row
+/// written through the source into the added partition would be applied twice.
+fn source_written_in_this_transaction(client: &pgrx::spi::SpiClient<'_>, source: &str) -> bool {
+    client
+        .select(
+            "SELECT COALESCE(current_setting($1, true), '') <> '' AS written",
+            Some(1),
+            &[unsafe {
+                DatumWithOid::new(
+                    crate::schema_builder::source_written_setting(source),
+                    PgBuiltInOids::TEXTOID.oid().value(),
+                )
+            }],
+        )
+        .ok()
+        .and_then(|mut rows| rows.next())
+        .and_then(|row| row.get_by_name::<bool, _>("written").ok().flatten())
+        .unwrap_or(true)
+}
+
+/// True when the pending partition change of `root` was queued by the running
+/// transaction and no flush attempted it: only then does the transaction-local
+/// record of writes cover every statement since the partitions changed.
+fn enqueued_by_this_transaction_and_never_flushed(
+    client: &pgrx::spi::SpiClient<'_>,
+    root: &str,
+) -> bool {
+    client
+        .select(
+            "SELECT failures = 0 AND last_attempt_at IS NULL \
+                    AND enqueued_at >= transaction_timestamp() AS fresh \
+             FROM public.__reflex_partition_pending WHERE source_root = $1",
+            Some(1),
+            &[
+                unsafe {
+                    DatumWithOid::new(root.to_string(), PgBuiltInOids::TEXTOID.oid().value())
+                },
+            ],
+        )
+        .ok()
+        .and_then(|mut rows| rows.next())
+        .and_then(|row| row.get_by_name::<bool, _>("fresh").ok().flatten())
+        .unwrap_or(false)
+}
+
 /// A DEFERRED flush leaves the two sides of its staged delta as session-level
 /// temporary views named like the transition tables of the source. The partition
 /// delta materialises a partition under the same names as temporary tables, which
@@ -3883,6 +3931,8 @@ pub(crate) fn reflex_flush_partitions_impl(only: Option<&str>) -> String {
 
             let current = current_source_leaf_oids(client, root);
             let actions = classify_partition_diff(&snapshot, &current);
+            let partitions_changed_in_this_untouched_transaction =
+                enqueued_by_this_transaction_and_never_flushed(client, root);
             let live_tree = list_partition_tree(client, root);
 
             // Collect all mutating statements for this root to run in one atomically-isolated
@@ -4036,7 +4086,10 @@ pub(crate) fn reflex_flush_partitions_impl(only: Option<&str>) -> String {
                 let mut force_reconcile = snapshot.is_empty()
                     || actions
                         .iter()
-                        .any(|(_, a)| matches!(a, PartitionDiffAction::SwapFill));
+                        .any(|(_, a)| matches!(a, PartitionDiffAction::SwapFill))
+                    || (!actions.is_empty()
+                        && (!partitions_changed_in_this_untouched_transaction
+                            || source_written_in_this_transaction(client, &source)));
 
                 let mut delta_stmts: Vec<String> = Vec::new();
                 if !force_reconcile {
