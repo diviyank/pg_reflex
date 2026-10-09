@@ -4286,7 +4286,7 @@ pub(crate) fn refill_tree_defaults(
     Ok(())
 }
 
-use crate::sql_writer::identifier::substitute_identifier_ci as substitute_identifier;
+use crate::sql_writer::identifier::substitute_column_ci as substitute_identifier;
 
 #[cfg(test)]
 #[path = "tests/unit_partition.rs"]

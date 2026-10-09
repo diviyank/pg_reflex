@@ -341,6 +341,18 @@ pub(crate) fn reflex_rebuild_imv_metadata_impl(view_name: &str) -> String {
 ///
 /// Returns a status string.
 pub(crate) fn reflex_rebuild_triggers_impl(source_table: &str) -> String {
+    // The triggers of a source are named after, and select their IMVs by, the
+    // spelling the IMVs registered: rebuilt under any other they would be a
+    // second set that maintains nothing.
+    let registered = crate::reconcile::spellings_registered_for(source_table);
+    if !registered.is_empty() {
+        return registered
+            .iter()
+            .map(|spelling| rebuild_triggers_named(spelling, spelling.clone()))
+            .collect::<Vec<_>>()
+            .join("; ");
+    }
+
     // Already schema-qualified: trust the caller.
     let resolved = if source_table.contains('.') {
         source_table.to_string()
@@ -392,6 +404,12 @@ pub(crate) fn reflex_rebuild_triggers_impl(source_table: &str) -> String {
         }
     };
 
+    rebuild_triggers_named(source_table, resolved)
+}
+
+/// Re-emits the triggers of the source `resolved` names (`source_table` is the
+/// caller's spelling of it) and the passthrough scratch tables of its IMVs.
+fn rebuild_triggers_named(source_table: &str, resolved: String) -> String {
     let result: Result<usize, String> = Spi::connect_mut(|client| {
         // Pick the correct trigger flavour by inspecting the live
         // dependency graph.  If any enabled IMV depending on this source is
