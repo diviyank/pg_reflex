@@ -537,3 +537,145 @@ fn v112_dp_cte_over_two_tables_written_in_one_transaction() {
     probe_db_close(DBNAME);
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
+
+const V112_DP_CTE_GROUPED: &str =
+    "WITH a AS (SELECT season, SUM(v) AS s, COUNT(*) AS n FROM {t} GROUP BY season)";
+const V112_DP_CTE_ROWS: &str = "WITH a AS (SELECT id, season, v FROM {t} WHERE v > 0)";
+
+/// Queries that read their only source as a whole row in WHERE, or rename a
+/// column of a source with an alias column list:
+/// (name, CTE, query, key, fragment of the refusal).
+const V112_DP_ROW_SHAPES_REFUSED: &[(&str, &str, &str, Option<&str>, &str)] = &[
+    ("cte_row", V112_DP_CTE_GROUPED, "SELECT season, a.s FROM a WHERE a IS NOT NULL", None, "whole row"),
+    ("cte_row_agg", V112_DP_CTE_ROWS, "SELECT season, SUM(v) AS sv FROM a WHERE a IS NOT NULL GROUP BY season", None, "whole row"),
+    ("cte_row_keyed", V112_DP_CTE_ROWS, "SELECT id, season, v FROM a WHERE a IS NOT NULL", Some("id"), "whole row"),
+    ("row", "", "SELECT id, v FROM {t} WHERE {t} IS NOT NULL", Some("id"), "whole row"),
+    ("row_alias", "", "SELECT z.id, z.v FROM {t} z WHERE z IS NOT NULL", Some("id"), "whole row"),
+    ("row_star", "", "SELECT z.id, z.v FROM {t} z WHERE z.* IS NOT NULL", Some("id"), "whole row"),
+    ("row_keyless", "", "SELECT season, v FROM {t} z WHERE NOT (z IS NULL)", None, "whole row"),
+    ("row_agg", "", "SELECT season, SUM(v) AS sv FROM {t} WHERE {t} IS NOT NULL GROUP BY season", None, "whole row"),
+    ("cte_renamed", V112_DP_CTE_GROUPED, "SELECT x.g, x.total FROM a AS x(g, total, cnt) WHERE x.total > 1", None, "alias list"),
+    ("cte_renamed_agg", V112_DP_CTE_ROWS, "SELECT x.g, SUM(x.w) AS sw FROM a AS x(i, g, w) GROUP BY x.g", None, "alias list"),
+    ("renamed_key", "", "SELECT x.a, x.c FROM {t} AS x(a, b, c)", Some("a"), "alias list"),
+    ("renamed_key_partial", "", "SELECT x.a, x.v FROM {t} AS x(a) WHERE x.v > 0", Some("a"), "alias list"),
+    ("renamed_filter", "", "SELECT x.b, SUM(x.c) AS sc FROM {t} AS x(a, b, c) WHERE c > 1 GROUP BY x.b", None, "alias list"),
+    ("renamed_projected", "", "SELECT x.b, x.v FROM {t} AS x(a, b) WHERE x.v > 0", None, "alias list"),
+    ("renamed_agg", "", "SELECT x.b, SUM(x.c) AS sc FROM {t} AS x(a, b, c) GROUP BY x.b", None, "alias list"),
+    ("renamed_keyless", "", "SELECT x.b, x.c FROM {t} AS x(a, b, c)", None, "alias list"),
+    ("join_renamed_key", "", "SELECT m.id, m.v, u.s2 FROM {t} m JOIN {t}_u AS u(s2) ON u.s2 = m.season", Some("id"), "alias list"),
+    ("join_renamed_label", "", "SELECT m.id, u.season, u.lbl FROM {t} m JOIN {t}_u AS u(season, lbl) ON u.season = m.season", Some("id"), "alias list"),
+    ("join_renamed_anchor", "", "SELECT m.k, u.label FROM {t} AS m(k) JOIN {t}_u u ON u.season = m.season", Some("k"), "alias list"),
+];
+
+/// The rewrites the refusals prescribe, then the neighbouring shapes that are
+/// maintained as written: (name, CTE, query, key).
+const V112_DP_ROW_SHAPES_MAINTAINED: &[(&str, &str, &str, Option<&str>)] = &[
+    ("fix_cte_row", V112_DP_CTE_GROUPED, "SELECT season, a.s FROM a WHERE a.season IS NOT NULL AND a.s IS NOT NULL AND a.n IS NOT NULL", None),
+    ("fix_row", "", "SELECT z.id, z.v FROM {t} z WHERE z.id IS NOT NULL AND z.season IS NOT NULL AND z.v IS NOT NULL", Some("id")),
+    ("fix_cte_renamed", V112_DP_CTE_GROUPED, "SELECT x.season AS g, x.s AS total FROM a AS x WHERE x.s > 1", None),
+    ("fix_renamed_key", "", "SELECT x.id AS a, x.v AS c FROM {t} AS x", Some("a")),
+    ("fix_renamed_filter", "", "SELECT x.season AS b, SUM(x.v) AS sc FROM {t} AS x WHERE v > 1 GROUP BY x.season", None),
+    ("fix_renamed_projected", "", "SELECT x.season AS b, x.v FROM {t} AS x WHERE x.v > 0", None),
+    ("fix_join_renamed_label", "", "SELECT m.id, u.season, u.label AS lbl FROM {t} m JOIN {t}_u AS u ON u.season = m.season", Some("id")),
+    ("same_names_listed", "", "SELECT x.id, x.v FROM {t} AS x(id, season, v) WHERE x.v > 0", Some("id")),
+    ("join_same_names_listed", "", "SELECT m.id, u.label FROM {t} m JOIN {t}_u AS u(season, label) ON u.season = m.season WHERE m.v > 0", Some("id")),
+    ("alias_is_a_column", "", "SELECT v.id, v.season FROM {t} v WHERE v > 0", Some("id")),
+    ("alias_is_a_summed_column", "", "SELECT v.season, SUM(v) AS sv FROM {t} v GROUP BY v.season", None),
+    ("row_counted", "", "SELECT season, COUNT({t}) AS c FROM {t} GROUP BY season", None),
+    ("row_star_counted", "", "SELECT season, COUNT({t}.*) AS c FROM {t} GROUP BY season", None),
+    ("row_in_select", "", "SELECT id, num_nulls(z) AS n FROM {t} z", Some("id")),
+    ("join_row_secondary", "", "SELECT m.id, m.v FROM {t} m JOIN {t}_u u ON u.season = m.season WHERE u IS NOT NULL", Some("id")),
+    ("join_row_anchor", "", "SELECT m.id, m.v FROM {t} m JOIN {t}_u u ON u.season = m.season WHERE m IS NOT NULL", Some("id")),
+];
+
+fn v112_dp_row_shape_source(t: &str) {
+    worker_exec(&format!("CREATE TABLE {t}(id SERIAL PRIMARY KEY, season TEXT, v INT)"));
+    worker_exec(&format!("CREATE TABLE {t}_u(season TEXT PRIMARY KEY, label TEXT DEFAULT 'l')"));
+    worker_exec(&format!("INSERT INTO {t}(season, v) VALUES ('e',1),('y',2),('e',3),(NULL,4)"));
+    worker_exec(&format!("INSERT INTO {t}_u(season) VALUES ('e'),('y')"));
+}
+
+fn v112_dp_row_shape_create(t: &str, cte: &str, body: &str, key: Option<&str>, mode: &str) -> (String, String) {
+    let query = format!("{cte} {body}").replace("{t}", t).trim().to_string();
+    let created = rbc_select(&format!(
+        "create_reflex_ivm({}, {}, {}, NULL, {})",
+        sql_lit(&format!("{t}_v")),
+        sql_lit(&query),
+        key.map_or("NULL".to_string(), sql_lit),
+        sql_lit(mode)
+    ));
+    (query, created)
+}
+
+/// Refused before anything is built for the outer query, and what a CTE built
+/// is removed: no registry row, relation or source trigger remains.
+#[pg_test]
+fn v112_dp_whole_row_or_renamed_column_read_from_changed_rows_is_refused() {
+    const DBNAME: &str = "reflex_dp_rowshape_no";
+    probe_db_open(DBNAME);
+    let mut failures = Vec::new();
+    for mode in ["IMMEDIATE", "DEFERRED"] {
+        for (name, cte, body, key, fragment) in V112_DP_ROW_SHAPES_REFUSED {
+            let t = format!("no_{name}_{}", &mode[..1].to_lowercase());
+            v112_dp_row_shape_source(&t);
+            let (_, created) = v112_dp_row_shape_create(&t, cte, body, *key, mode);
+            if !(created.starts_with("ERROR: [reflex-unsupported]") && created.contains(fragment)) {
+                failures.push(format!("{mode} {name}: {created}"));
+            }
+            let left = worker_scalar_i64(&format!(
+                "SELECT (SELECT count(*) FROM public.__reflex_ivm_reference WHERE name LIKE '{t}\\_v%') \
+                      + (SELECT count(*) FROM pg_class WHERE relname LIKE '%{t}\\_v%') \
+                      + (SELECT count(*) FROM pg_trigger \
+                         WHERE tgrelid IN ('{t}'::regclass, '{t}_u'::regclass) AND NOT tgisinternal)"
+            ));
+            if left != 0 {
+                failures.push(format!("{mode} {name}: {left} objects left"));
+            }
+            if let Err(error) = v112_dp_try(&format!("INSERT INTO {t}(season, v) VALUES ('z', 9)")) {
+                failures.push(format!("{mode} {name}: write after the refusal raised {error}"));
+            }
+        }
+    }
+    probe_db_close(DBNAME);
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[pg_test]
+fn v112_dp_rewrites_and_neighbours_of_the_refused_row_shapes_stay_correct() {
+    const DBNAME: &str = "reflex_dp_rowshape_ok";
+    probe_db_open(DBNAME);
+    let mut failures = Vec::new();
+    for mode in ["IMMEDIATE", "DEFERRED"] {
+        for (name, cte, body, key) in V112_DP_ROW_SHAPES_MAINTAINED {
+            let t = format!("ok_{name}_{}", &mode[..1].to_lowercase());
+            v112_dp_row_shape_source(&t);
+            let (query, created) = v112_dp_row_shape_create(&t, cte, body, *key, mode);
+            if created != "CREATE REFLEX INCREMENTAL VIEW" {
+                failures.push(format!("{mode} {name}: {created}"));
+                continue;
+            }
+            for (label, step) in [
+                ("create", "DO $$ BEGIN NULL; END $$"),
+                ("insert", "INSERT INTO {t}(season, v) VALUES ('e',10),('z',30),(NULL,NULL)"),
+                ("update", "UPDATE {t} SET v = v + 100 WHERE id IN (1, 4)"),
+                ("move", "UPDATE {t} SET season = 'y' WHERE id = 3"),
+                ("delete", "DELETE FROM {t} WHERE id = 2"),
+                ("relabel", "UPDATE {t}_u SET label = label || '!'"),
+                ("both tables", "INSERT INTO {t}_u(season) VALUES ('z'); DELETE FROM {t} WHERE id = 1"),
+                ("empty", "DELETE FROM {t}"),
+                ("refill", "INSERT INTO {t}(season, v) VALUES ('e',7),('y',8),(NULL,9)"),
+            ] {
+                if let Err(error) = v112_dp_try(&step.replace("{t}", &t)) {
+                    failures.push(format!("{mode} {name} {label}: raised {error}"));
+                    break;
+                }
+                let mismatches = rbc_mismatch(&format!("{t}_v"), &query);
+                if mismatches != 0 || rbc_known_stale(&format!("{t}_v")) {
+                    failures.push(format!("{mode} {name} {label}: {mismatches} mismatches"));
+                }
+            }
+        }
+    }
+    probe_db_close(DBNAME);
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
