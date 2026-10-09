@@ -318,13 +318,8 @@ impl Check for TriggerModeMatches {
         }
         let mut out = Vec::new();
         for src in imv.real_sources() {
-            let suffix = crate::query_decomposer::sanitized_source_suffix(src);
-            let fn_names = [
-                format!("__reflex_ins_trigger_on_{}", suffix),
-                format!("__reflex_del_trigger_on_{}", suffix),
-                format!("__reflex_upd_trigger_on_{}", suffix),
-                format!("__reflex_trunc_trigger_on_{}", suffix),
-            ];
+            let fn_names = ["ins", "del", "upd", "trunc"]
+                .map(|op| crate::schema_builder::source_trigger_function_name(src, op));
             // Check each trigger function for consistency with refresh_mode.
             for fn_name in &fn_names {
                 let body: Option<String> = client

@@ -623,14 +623,17 @@ pub(crate) const DEFERRED_REBUILD_TABLE_DDL: &str =
      (name TEXT PRIMARY KEY, attempts INT NOT NULL DEFAULT 0, \
       reconcile BOOLEAN NOT NULL DEFAULT FALSE) ON COMMIT DROP";
 
-/// The first source `view_name` does not ignore: a pending row on it makes a flush
-/// that selects `view_name` run at COMMIT. `None` when it ignores every source.
+/// The first table `view_name` reads and does not ignore: a pending row on it makes
+/// a flush that selects `view_name` run at COMMIT. `None` when it ignores every
+/// source. The placeholder of a derived table (`<subquery:x>`) is no table: it has
+/// no staging table to flush.
 pub(crate) fn observed_source(view_name: &str) -> Option<String> {
     let source = registry_value(
         view_name,
         "(SELECT d FROM unnest(depends_on) WITH ORDINALITY AS u(d, i) \
           WHERE NOT (COALESCE(ignored_sources, ARRAY[]::TEXT[]) \
                      && ARRAY[d, regexp_replace(d, '^.*\\.', '')]) \
+            AND d NOT LIKE '<%' \
           ORDER BY i LIMIT 1)",
     );
     (!source.is_empty()).then_some(source)

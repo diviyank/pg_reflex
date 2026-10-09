@@ -163,17 +163,78 @@ pub(crate) fn build_passthrough_key_mappings(
                         &analysis.table_aliases,
                         key_columns,
                         &target_col_to_expr,
+                        KeyColumnMatch::SameQualifiedColumn,
                     );
                     mappings.extend(join_mappings);
                 }
             }
-            if !mappings.is_empty() {
+            let mut seen = std::collections::HashSet::new();
+            mappings.retain(|mapping| seen.insert(mapping.clone()));
+            let owns_this_key_column = |key_column: &String| {
+                target_col_to_expr.get(key_column).is_none_or(|expr| {
+                    expr.rfind('.').is_none_or(|dot| {
+                        let qualifier = &expr[..dot];
+                        alias.is_some_and(|a| a.to_lowercase() == qualifier)
+                            || bare_column_name(source_str).to_lowercase() == qualifier
+                    })
+                })
+            };
+            if !mappings.is_empty()
+                && secondary_mapping_scopes_its_rows(
+                    source_str,
+                    &mappings,
+                    key_columns,
+                    &owns_this_key_column,
+                    analysis,
+                )
+            {
                 plan.passthrough_key_mappings
                     .insert(source_str.to_string(), mappings);
             }
             // If no mappings found, this source has no entry → triggers fall back to full refresh
         }
     }
+}
+
+/// Whether deleting the result rows that carry the mapped values of a changed
+/// row of `source`, then inserting the rows its changed rows yield, leaves the
+/// result right. The delete reaches every result row carrying those values, so
+/// they must all come from changed rows:
+///
+/// * a table a LEFT or FULL JOIN introduces is refilled from the whole query
+///   under the same predicate, whatever the rows are;
+/// * the mapped columns hold a unique key of `source`, so the values name one row;
+/// * or every key column `source` supplies is mapped: two rows of `source` with
+///   the same mapped values would then yield two result rows with one key.
+fn secondary_mapping_scopes_its_rows(
+    source: &str,
+    mappings: &[(String, String)],
+    key_columns: &[String],
+    owns_this_key_column: &dyn Fn(&String) -> bool,
+    analysis: &crate::sql_analyzer::SqlAnalysis,
+) -> bool {
+    let refilled_from_the_whole_query = matches!(
+        join_type_for_target(source, &analysis.joins).as_deref(),
+        Some("LEFT") | Some("FULL OUTER")
+    );
+    if refilled_from_the_whole_query {
+        return true;
+    }
+    let mapped_key_columns: Vec<&String> = mappings.iter().map(|(target, _)| target).collect();
+    let supplies_an_unmapped_key_column = key_columns.iter().any(|key_column| {
+        !mapped_key_columns.contains(&key_column) && owns_this_key_column(key_column)
+    });
+    if !supplies_an_unmapped_key_column {
+        return true;
+    }
+    let mapped_source_columns: Vec<String> = mappings
+        .iter()
+        .map(|(_, source_column)| source_column.to_lowercase())
+        .collect();
+    source_sound_unique_keys(source).iter().any(|key| {
+        key.iter()
+            .all(|column| mapped_source_columns.contains(&column.to_lowercase()))
+    })
 }
 
 /// Build the per-source JOIN-key mapping for aggregate plans.
@@ -264,6 +325,7 @@ pub(crate) fn build_source_join_keys(
                     &analysis.table_aliases,
                     &group_by_lowercased,
                     &target_col_to_expr,
+                    KeyColumnMatch::SameBareName,
                 );
                 all_mappings.extend(join_mappings);
             }
@@ -842,6 +904,17 @@ pub(crate) fn infer_join_passthrough_unique_key(ctx: &BuildContext) -> Option<Ve
     None
 }
 
+/// How the side of a join equality facing the secondary table is recognised as a
+/// key column.
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum KeyColumnMatch {
+    /// By its bare name, whatever table qualifies it.
+    SameBareName,
+    /// By its bare name, unless both it and the key column's SELECT expression
+    /// are qualified and differ: `o.kind = f.fk` says nothing about `d.kind`.
+    SameQualifiedColumn,
+}
+
 /// Parse a JOIN condition to extract column mappings between the key-owner table and a secondary table.
 ///
 /// For `s.product_id = p.id AND s.version = p.version`:
@@ -854,6 +927,7 @@ pub(crate) fn parse_join_condition_mappings(
     table_aliases: &std::collections::HashMap<String, String>,
     key_columns: &[String],
     target_col_to_expr: &std::collections::HashMap<String, String>,
+    key_column_match: KeyColumnMatch,
 ) -> Vec<(String, String)> {
     let mut mappings = Vec::new();
 
@@ -901,6 +975,15 @@ pub(crate) fn parse_join_condition_mappings(
         for kc in key_columns {
             if *kc == other_col {
                 // Direct match: key column "product_id" and other side bare name is "product_id"
+                let names_another_tables_column = key_column_match
+                    == KeyColumnMatch::SameQualifiedColumn
+                    && other_side.contains('.')
+                    && target_col_to_expr.get(kc.as_str()).is_some_and(|expr| {
+                        expr.contains('.') && expr.to_lowercase() != other_side
+                    });
+                if names_another_tables_column {
+                    continue;
+                }
                 mappings.push((kc.clone(), secondary_col.clone()));
                 break;
             }
