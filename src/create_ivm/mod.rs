@@ -2878,9 +2878,11 @@ pub(crate) fn create_reflex_ivm_impl_with_materialization(
         return crate::reflex_reject(
             "More than one COUNT(DISTINCT ...) in the same SELECT list is not supported: the IMV \
              is keyed on the distinct argument and holds one. Fix: compute each in its own CTE \
-             and join them on the group columns: WITH a AS (SELECT grp, COUNT(DISTINCT x) AS dx \
+             and join them on the group columns, with IS NOT DISTINCT FROM so that a group \
+             whose key is NULL is kept: WITH a AS (SELECT grp, COUNT(DISTINCT x) AS dx \
              FROM t GROUP BY grp), b AS (SELECT grp, COUNT(DISTINCT y) AS dy FROM t GROUP BY grp) \
-             SELECT a.grp, a.dx, b.dy FROM a JOIN b ON b.grp = a.grp. The same COUNT(DISTINCT) \
+             SELECT a.grp, a.dx, b.dy FROM a JOIN b ON b.grp IS NOT DISTINCT FROM a.grp. The \
+             same COUNT(DISTINCT) \
              needed twice is computed once in a CTE and its column repeated in the outer query.",
         );
     }
