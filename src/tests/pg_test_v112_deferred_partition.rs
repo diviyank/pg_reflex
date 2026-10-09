@@ -433,3 +433,107 @@ fn v112_dp_drop_removes_the_truncate_triggers_of_every_partition() {
     assert_eq!(v112_dp_reflex_trigger_functions_naming("v112_dp_dr"), 0);
     Spi::run("TRUNCATE v112_dp_dr_a").expect("truncate after drop");
 }
+
+/// DEFERRED IMVs whose CTE body reads `dpc_s` and `dpc_t`: (name, query, key).
+const V112_DP_TWO_TABLE_CTE_IMVS: &[(&str, &str, Option<&str>)] = &[
+    (
+        "dpc_agg",
+        "WITH c AS (SELECT m.g, m.v FROM dpc_s m JOIN dpc_t j ON j.g = m.g) \
+         SELECT g, SUM(v) AS sv, COUNT(*) AS c FROM c GROUP BY g",
+        None,
+    ),
+    (
+        "dpc_chain",
+        "WITH a AS (SELECT m.g, m.v, j.label FROM dpc_s m JOIN dpc_t j ON j.g = m.g), \
+         b AS (SELECT g, label, SUM(v) AS sv FROM a GROUP BY g, label) \
+         SELECT g, MAX(sv) AS top, COUNT(*) AS labels FROM b GROUP BY g",
+        None,
+    ),
+    (
+        "dpc_pass",
+        "WITH c AS (SELECT m.id AS sid, j.id AS tid, m.g, m.v, j.label \
+                    FROM dpc_s m JOIN dpc_t j ON j.g = m.g) \
+         SELECT sid, tid, g, v, label FROM c WHERE v > 0",
+        Some("sid, tid"),
+    ),
+    (
+        "dpc_left",
+        "WITH c AS (SELECT m.g, m.v, j.label FROM dpc_s m LEFT JOIN dpc_t j ON j.g = m.g) \
+         SELECT g, COUNT(label) AS labelled, SUM(v) AS sv FROM c GROUP BY g",
+        None,
+    ),
+    (
+        "dpc_reader",
+        "SELECT c, COUNT(*) AS groups FROM dpc_agg GROUP BY c",
+        None,
+    ),
+];
+
+const V112_DP_TWO_TABLE_CTE_FRESH_READER: &str =
+    "SELECT c, COUNT(*) AS groups FROM (SELECT m.g, COUNT(*) AS c FROM dpc_s m \
+     JOIN dpc_t j ON j.g = m.g GROUP BY m.g) x GROUP BY c";
+
+/// Both tables a CTE body reads are written in one transaction: the sub-IMV is
+/// rebuilt at COMMIT and every IMV above it must follow.
+#[pg_test]
+fn v112_dp_cte_over_two_tables_written_in_one_transaction() {
+    const DBNAME: &str = "reflex_dp_cte2";
+    probe_db_open(DBNAME);
+    worker_exec("CREATE TABLE dpc_s(id SERIAL PRIMARY KEY, g TEXT, v INT, w INT)");
+    worker_exec("CREATE TABLE dpc_t(id SERIAL PRIMARY KEY, g TEXT, label TEXT, v INT)");
+    worker_exec("INSERT INTO dpc_s(g, v, w) VALUES ('a',1,1),('a',2,1),('b',3,1),('b',4,2),('d',9,1)");
+    worker_exec("INSERT INTO dpc_t(g, label, v) VALUES ('a','A',1),('b','B',2),('e','E',3)");
+    for (name, query, key) in V112_DP_TWO_TABLE_CTE_IMVS {
+        v112_dp_create(name, query, *key, "DEFERRED", None);
+    }
+    let mut failures = Vec::new();
+    for (label, step) in [
+        ("control: one table", "INSERT INTO dpc_s(g, v, w) VALUES ('a',5,1)"),
+        (
+            "insert into both",
+            "INSERT INTO dpc_s(g, v, w) VALUES ('a',10,1),('c',7,NULL),('q',3,2),('b',8,3); \
+             INSERT INTO dpc_t(g, label, v) VALUES ('z','Z',0),('k','K',1); \
+             INSERT INTO dpc_t(g, label, v) VALUES ('b','B2',1)",
+        ),
+        (
+            "update both",
+            "UPDATE dpc_t SET label = 'A2' WHERE g = 'a'; UPDATE dpc_s SET v = v + 100 WHERE g = 'b'",
+        ),
+        (
+            "move keys in both",
+            "UPDATE dpc_s SET g = 'k' WHERE g = 'q'; UPDATE dpc_t SET g = 'c' WHERE g = 'z'",
+        ),
+        (
+            "delete from both",
+            "DELETE FROM dpc_t WHERE label = 'B2'; DELETE FROM dpc_s WHERE g = 'a' AND v < 5",
+        ),
+        ("control: other table", "INSERT INTO dpc_t(g, label, v) VALUES ('d','D',4)"),
+        ("empty both", "DELETE FROM dpc_s; DELETE FROM dpc_t"),
+        (
+            "refill both",
+            "INSERT INTO dpc_t(g, label, v) VALUES ('a','A',1),('b','B',2); \
+             INSERT INTO dpc_s(g, v, w) VALUES ('a',1,1),('b',2,2),('b',-3,3)",
+        ),
+    ] {
+        if let Err(error) = v112_dp_try(step) {
+            failures.push(format!("{label}: raised {error}"));
+            continue;
+        }
+        for (name, query, _) in V112_DP_TWO_TABLE_CTE_IMVS {
+            let fresh = if *name == "dpc_reader" {
+                V112_DP_TWO_TABLE_CTE_FRESH_READER
+            } else {
+                query
+            };
+            let mismatches = rbc_mismatch(name, fresh);
+            if mismatches != 0 {
+                failures.push(format!("{label}: {name} {mismatches} mismatches"));
+            }
+            if rbc_known_stale(name) {
+                failures.push(format!("{label}: {name} left known_stale"));
+            }
+        }
+    }
+    probe_db_close(DBNAME);
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
