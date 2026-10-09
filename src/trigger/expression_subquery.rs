@@ -62,7 +62,10 @@ fn end_query_reads_source(end_query: &str, source_table: &str) -> bool {
     let source = bare_lower(source_table);
     match single_query(end_query) {
         Some(query) => references_source(&query, &source),
-        None => end_query.to_lowercase().contains(&source),
+        None => end_query
+            .to_lowercase()
+            .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .any(|word| word == source),
     }
 }
 
