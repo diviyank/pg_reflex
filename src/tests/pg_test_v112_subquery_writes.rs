@@ -239,6 +239,28 @@ macro_rules! v112_sq_cells {
     };
 }
 
+/// DEFERRED cells, flushed by hand after each step, and their list: the same
+/// cells are replayed with one committed transaction per step by the
+/// `v112_sq_commit_*` tests.
+macro_rules! v112_sq_deferred_cells {
+    ($list:ident, $fixture:expr, $key:expr; $($name:ident => $select:expr,)+) => {
+        v112_sq_cells! { $fixture, $key, true; $($name => $select,)+ }
+        #[cfg(test)]
+        const $list: V112SqCommitGroup = V112SqCommitGroup {
+            fixture: &$fixture,
+            key: $key,
+            cells: &[$((stringify!($name), $select),)+],
+        };
+    };
+}
+
+#[cfg(test)]
+struct V112SqCommitGroup {
+    fixture: &'static V112SqFixture,
+    key: Option<&'static str>,
+    cells: &'static [(&'static str, &'static str)],
+}
+
 // ---------------------------------------------------------------------------
 // A table read only through a WHERE subquery: aggregates
 // ---------------------------------------------------------------------------
@@ -272,7 +294,7 @@ v112_sq_cells! { V112_SQ_MEMBERSHIP, None, false;
     v112_sq_sum_join_and_in => "SELECT m.g, SUM(m.v) AS sv, COUNT(*) AS c FROM {s} m JOIN {t} j ON j.g = m.g WHERE m.v > 0 GROUP BY m.g",
 }
 
-v112_sq_cells! { V112_SQ_MEMBERSHIP, None, true;
+v112_sq_deferred_cells! { V112_SQ_DEFERRED_1, V112_SQ_MEMBERSHIP, None;
     v112_sq_sum_in_deferred => "SELECT g, SUM(v) AS sv, COUNT(*) AS c FROM {s} WHERE g IN (SELECT g FROM {t}) GROUP BY g",
     v112_sq_sum_in_or_deferred => "SELECT g, SUM(v) AS sv, COUNT(*) AS c FROM {s} WHERE g IN (SELECT g FROM {t}) OR w IS NULL GROUP BY g",
     v112_sq_sum_not_in_deferred => "SELECT g, SUM(v) AS sv, COUNT(*) AS c FROM {s} WHERE g NOT IN (SELECT g FROM {t}) GROUP BY g",
@@ -317,13 +339,13 @@ v112_sq_cells! { V112_SQ_MEMBERSHIP, Some("id"), false;
     v112_sq_kp_two_line_in => "SELECT id, g, v FROM {s} WHERE g IN\n (SELECT g\n FROM\n {t})",
 }
 
-v112_sq_cells! { V112_SQ_MEMBERSHIP, None, true;
+v112_sq_deferred_cells! { V112_SQ_DEFERRED_2, V112_SQ_MEMBERSHIP, None;
     v112_sq_pt_in_deferred => "SELECT id, g, v FROM {s} WHERE g IN (SELECT g FROM {t})",
     v112_sq_pt_not_exists_deferred => "SELECT m.id, m.g, m.v FROM {s} m WHERE NOT EXISTS (SELECT 1 FROM {t} x WHERE x.g = m.g)",
     v112_sq_pt_scalar_or_deferred => "SELECT id, g, v FROM {s} WHERE v >= (SELECT max(v) FROM {t}) OR w IS NULL",
 }
 
-v112_sq_cells! { V112_SQ_MEMBERSHIP, Some("id"), true;
+v112_sq_deferred_cells! { V112_SQ_DEFERRED_3, V112_SQ_MEMBERSHIP, Some("id");
     v112_sq_kp_in_deferred => "SELECT id, g, v FROM {s} WHERE g IN (SELECT g FROM {t})",
     v112_sq_kp_in_or_deferred => "SELECT id, g, v FROM {s} WHERE g IN (SELECT g FROM {t}) OR w IS NULL",
     v112_sq_kp_exists_deferred => "SELECT m.id, m.g, m.v FROM {s} m WHERE EXISTS (SELECT 1 FROM {t} x WHERE x.g = m.g)",
@@ -362,7 +384,7 @@ v112_sq_cells! { V112_SQ_NULL_EXTENDED, Some("kind"), false;
     v112_sq_lj_kp_rejects_null => "SELECT d.kind, d.label, f.v FROM {d} d LEFT JOIN {f} f ON d.kind = f.kind WHERE f.v > 0",
 }
 
-v112_sq_cells! { V112_SQ_NULL_EXTENDED, None, true;
+v112_sq_deferred_cells! { V112_SQ_DEFERRED_4, V112_SQ_NULL_EXTENDED, None;
     v112_sq_lj_admits_null_deferred => "SELECT d.kind, COUNT(*) AS c, SUM(f.v) AS s FROM {d} d LEFT JOIN {f} f ON d.kind = f.kind WHERE f.v > 0 OR f.v IS NULL GROUP BY d.kind",
     v112_sq_lj_admits_null_minmax_deferred => "SELECT d.kind, MIN(f.v) AS mn, MAX(f.v) AS mx, COUNT(*) AS c FROM {d} d LEFT JOIN {f} f ON d.kind = f.kind WHERE f.v > 0 OR f.v IS NULL GROUP BY d.kind",
     v112_sq_lj_only_null_deferred => "SELECT d.kind, COUNT(*) AS c FROM {d} d LEFT JOIN {f} f ON d.kind = f.kind WHERE f.kind IS NULL GROUP BY d.kind",
@@ -390,7 +412,7 @@ v112_sq_cells! { V112_SQ_MEMBERSHIP, None, false;
     v112_sq_ctl_sum_cross_source_conjunct => "SELECT m.g, COUNT(*) AS c FROM {s} m JOIN {t} j ON j.g = m.g WHERE m.v > j.v GROUP BY m.g",
 }
 
-v112_sq_cells! { V112_SQ_MEMBERSHIP, None, true;
+v112_sq_deferred_cells! { V112_SQ_DEFERRED_5, V112_SQ_MEMBERSHIP, None;
     v112_sq_pt_exists_on_unprojected_deferred => "SELECT m.id, m.g FROM {s} m WHERE EXISTS (SELECT 1 FROM {t} x WHERE x.v = m.v)",
     v112_sq_kp_not_exists_or_deferred => "SELECT m.id, m.g, m.v FROM {s} m WHERE NOT EXISTS (SELECT 1 FROM {t} x WHERE x.g = m.g) OR m.w IS NULL",
     v112_sq_ctl_sum_cross_source_conjunct_deferred => "SELECT m.g, COUNT(*) AS c FROM {s} m JOIN {t} j ON j.g = m.g WHERE m.v > j.v GROUP BY m.g",
@@ -413,7 +435,7 @@ v112_sq_cells! { V112_SQ_NULL_EXTENDED, None, false;
     v112_sq_rj_admits_null => "SELECT d.kind, COUNT(*) AS c, SUM(f.v) AS s FROM {f} f RIGHT JOIN {d} d ON d.kind = f.kind WHERE f.v > 0 OR f.v IS NULL GROUP BY d.kind",
 }
 
-v112_sq_cells! { V112_SQ_NULL_EXTENDED, None, true;
+v112_sq_deferred_cells! { V112_SQ_DEFERRED_6, V112_SQ_NULL_EXTENDED, None;
     v112_sq_lj_admits_null_by_label_deferred => "SELECT d.label, COUNT(*) AS c, SUM(f.v) AS s FROM {d} d LEFT JOIN {f} f ON d.kind = f.kind WHERE f.v > 0 OR f.v IS NULL GROUP BY d.label",
     v112_sq_lj_rejects_null_by_label_deferred => "SELECT d.label, COUNT(*) AS c, SUM(f.v) AS s FROM {d} d LEFT JOIN {f} f ON d.kind = f.kind WHERE f.v > 0 GROUP BY d.label",
     v112_sq_fj_rejects_null_deferred => "SELECT d.kind, COUNT(*) AS c, SUM(f.v) AS s FROM {d} d FULL JOIN {f} f ON d.kind = f.kind WHERE f.v > 0 GROUP BY d.kind",
@@ -431,7 +453,7 @@ v112_sq_cells! { V112_SQ_NULL_EXTENDED, None, false;
     v112_sq_lj_then_inner_on_dim_by_label => "SELECT d.label, COUNT(*) AS c, SUM(f.v) AS s, SUM(o.w) AS w FROM {d} d LEFT JOIN {f} f ON d.kind = f.kind JOIN {o} o ON o.kind = d.kind GROUP BY d.label",
 }
 
-v112_sq_cells! { V112_SQ_NULL_EXTENDED, None, true;
+v112_sq_deferred_cells! { V112_SQ_DEFERRED_7, V112_SQ_NULL_EXTENDED, None;
     v112_sq_lj_then_inner_on_fact_by_label_deferred => "SELECT d.label, COUNT(*) AS c, SUM(f.v) AS s FROM {d} d LEFT JOIN {f} f ON d.kind = f.kind JOIN {o} o ON o.kind = f.kind GROUP BY d.label",
 }
 
@@ -538,7 +560,7 @@ v112_sq_cells! { V112_SQ_NULL_EXTENDED, None, false;
     v112_sq_fj_pt_only_null_fact => "SELECT d.kind, d.label FROM {d} d FULL JOIN {f} f ON d.kind = f.kind WHERE f.kind IS NULL",
 }
 
-v112_sq_cells! { V112_SQ_NULL_EXTENDED, None, true;
+v112_sq_deferred_cells! { V112_SQ_DEFERRED_8, V112_SQ_NULL_EXTENDED, None;
     v112_sq_rj_admits_null_deferred => "SELECT d.kind, COUNT(*) AS c, SUM(f.v) AS s FROM {f} f RIGHT JOIN {d} d ON d.kind = f.kind WHERE f.v > 0 OR f.v IS NULL GROUP BY d.kind",
     v112_sq_rj_coalesce_deferred => "SELECT d.kind, COUNT(*) AS c, SUM(f.v) AS s FROM {f} f RIGHT JOIN {d} d ON d.kind = f.kind WHERE COALESCE(f.v, 1) > 0 GROUP BY d.kind",
     v112_sq_rj_rejects_null_deferred => "SELECT d.kind, COUNT(*) AS c, SUM(f.v) AS s FROM {f} f RIGHT JOIN {d} d ON d.kind = f.kind WHERE f.v > 0 GROUP BY d.kind",
@@ -549,4 +571,365 @@ v112_sq_cells! { V112_SQ_NULL_EXTENDED, None, true;
     v112_sq_fj_dim_admits_null_deferred => "SELECT f.kind, COUNT(*) AS c, COUNT(d.label) AS n FROM {d} d FULL JOIN {f} f ON d.kind = f.kind WHERE d.label <> 'BB' OR d.label IS NULL GROUP BY f.kind",
     v112_sq_lj_pt_only_null_deferred => "SELECT d.kind, d.label FROM {d} d LEFT JOIN {f} f ON d.kind = f.kind WHERE f.kind IS NULL",
     v112_sq_lj_coalesce_deferred => "SELECT d.kind, COUNT(*) AS c, SUM(f.v) AS s FROM {d} d LEFT JOIN {f} f ON d.kind = f.kind WHERE COALESCE(f.v, 1) > 0 GROUP BY d.kind",
+}
+
+// ---------------------------------------------------------------------------
+// A subquery outside the aggregate: HAVING, or an expression over an aggregate
+// ---------------------------------------------------------------------------
+
+v112_sq_cells! { V112_SQ_MEMBERSHIP, None, false;
+    v112_sq_having_scalar => "SELECT g, SUM(v) AS sv FROM {s} GROUP BY g HAVING SUM(v) > (SELECT max(v) FROM {t})",
+    v112_sq_having_in => "SELECT g, SUM(v) AS sv, COUNT(*) AS c FROM {s} GROUP BY g HAVING g IN (SELECT g FROM {t})",
+    v112_sq_having_count => "SELECT g, COUNT(*) AS c FROM {s} GROUP BY g HAVING COUNT(*) >= (SELECT count(*) FROM {t} WHERE v > 2)",
+    v112_sq_having_max => "SELECT g, MAX(v) AS mx FROM {s} GROUP BY g HAVING MAX(v) >= (SELECT min(v) FROM {t})",
+    v112_sq_having_and_where => "SELECT g, SUM(v) AS sv FROM {s} WHERE g IN (SELECT g FROM {t}) GROUP BY g HAVING SUM(v) > (SELECT min(v) FROM {t})",
+    v112_sq_over_sum_plus => "SELECT g, SUM(v) + (SELECT max(v) FROM {t}) AS x FROM {s} GROUP BY g",
+    v112_sq_over_sum_case => "SELECT g, CASE WHEN SUM(v) > (SELECT max(v) FROM {t}) THEN 1 ELSE 0 END AS hi FROM {s} GROUP BY g",
+    v112_sq_over_avg_compare => "SELECT g, AVG(v) > (SELECT avg(v) FROM {t}) AS above FROM {s} GROUP BY g",
+    v112_sq_over_sum_ungrouped => "SELECT SUM(v) + (SELECT max(v) FROM {t}) AS x FROM {s}",
+    v112_sq_having_own_table => "SELECT g, SUM(v) AS sv FROM {s} GROUP BY g HAVING SUM(v) >= (SELECT max(v) FROM {s})",
+    v112_sq_over_sum_own_table => "SELECT g, SUM(v) - (SELECT min(v) FROM {s}) AS x FROM {s} GROUP BY g",
+    v112_sq_select_item_scalar => "SELECT g, SUM(v) AS sv, (SELECT count(*) FROM {t}) AS n FROM {s} GROUP BY g",
+}
+
+v112_sq_deferred_cells! { V112_SQ_DEFERRED_OUTSIDE, V112_SQ_MEMBERSHIP, None;
+    v112_sq_having_scalar_deferred => "SELECT g, SUM(v) AS sv FROM {s} GROUP BY g HAVING SUM(v) > (SELECT max(v) FROM {t})",
+    v112_sq_having_in_deferred => "SELECT g, SUM(v) AS sv, COUNT(*) AS c FROM {s} GROUP BY g HAVING g IN (SELECT g FROM {t})",
+    v112_sq_over_sum_plus_deferred => "SELECT g, SUM(v) + (SELECT max(v) FROM {t}) AS x FROM {s} GROUP BY g",
+    v112_sq_having_own_table_deferred => "SELECT g, SUM(v) AS sv FROM {s} GROUP BY g HAVING SUM(v) >= (SELECT max(v) FROM {s})",
+}
+
+/// For each real IMV, the decision taken from the stored halves of the query
+/// agrees with the one taken from the query the user wrote, for every source.
+#[pg_test]
+fn v112_sq_subquery_in_any_clause_is_seen_from_the_stored_query() {
+    let fixture = &V112_SQ_MEMBERSHIP;
+    let shapes = [
+        "SELECT g, SUM(v) AS sv FROM {s} GROUP BY g HAVING SUM(v) > (SELECT max(v) FROM {t})",
+        "SELECT g, COUNT(*) AS c FROM {s} GROUP BY g HAVING g IN (SELECT g FROM {t})",
+        "SELECT g, SUM(v) + (SELECT max(v) FROM {t}) AS x FROM {s} GROUP BY g",
+        "SELECT g, CASE WHEN SUM(v) > (SELECT max(v) FROM {t}) THEN 1 ELSE 0 END AS hi FROM {s} GROUP BY g",
+        "SELECT g, AVG(v) > (SELECT avg(v) FROM {t}) AS above FROM {s} GROUP BY g",
+        "SELECT g, SUM(v) AS sv, (SELECT count(*) FROM {t}) AS n FROM {s} GROUP BY g",
+        "SELECT g, SUM(v) FILTER (WHERE g IN (SELECT g FROM {t})) AS sv, COUNT(*) AS c FROM {s} GROUP BY g",
+        "SELECT g, SUM(CASE WHEN v > (SELECT min(v) FROM {t}) THEN v ELSE 0 END) AS sv FROM {s} GROUP BY g",
+        "SELECT g IN (SELECT g FROM {t}) AS member, COUNT(*) AS c FROM {s} GROUP BY g IN (SELECT g FROM {t})",
+        "SELECT m.g, COUNT(*) AS c FROM {s} m JOIN {s} n ON n.id = m.id AND m.v > (SELECT min(v) FROM {t}) GROUP BY m.g",
+        "SELECT g, MAX(v) AS mx FROM {s} WHERE g IN (SELECT g FROM {t}) GROUP BY g HAVING MAX(v) > 0",
+        "SELECT id, g, v FROM {s} WHERE v > (SELECT min(v) FROM {t} WHERE g IN (SELECT g FROM {t}))",
+    ];
+    for (placeholder, _, columns, seed) in fixture.tables {
+        let table = v112_sq_resolve(placeholder, fixture, "clause");
+        Spi::run(&format!("CREATE TABLE {table}({columns})")).expect("create table");
+        Spi::run(&v112_sq_resolve(seed, fixture, "clause")).expect("seed");
+    }
+    let subquery_table = v112_sq_resolve("{t}", fixture, "clause");
+    let mut created = 0;
+    for (position, shape) in shapes.iter().enumerate() {
+        let imv = format!("v112_sq_clause_{position}");
+        let query = v112_sq_resolve(shape, fixture, "clause");
+        let outcome = v112_j_try(&format!(
+            "SELECT create_reflex_ivm('{imv}', $v112sel${query}$v112sel$)"
+        ));
+        if outcome != "CREATE REFLEX INCREMENTAL VIEW" {
+            continue;
+        }
+        created += 1;
+        let stored = |column: &str| {
+            Spi::get_one::<String>(&format!(
+                "SELECT COALESCE({column}, '') FROM public.__reflex_ivm_reference WHERE name = '{imv}'"
+            ))
+            .expect("registry")
+            .unwrap_or_default()
+        };
+        let (base_query, end_query) = (stored("base_query"), stored("end_query"));
+        assert!(
+            crate::trigger::imv_has_no_scoped_delta(&base_query, &end_query, &subquery_table),
+            "{query}\n{base_query}\n{end_query}"
+        );
+    }
+    assert!(created >= 9, "only {created} of the shapes were created");
+}
+
+// ---------------------------------------------------------------------------
+// Several fact rows per join key, and tables joined through the null-extended one
+// ---------------------------------------------------------------------------
+
+/// `{d}` LEFT JOINed to a fact `{f}` holding several rows per `kind`, a NULL
+/// `kind` and a NULL `v`; `{o}` is joined to the fact and `{x}` to `{o}`.
+const V112_SQ_NULL_EXTENDED_CHAIN: V112SqFixture = V112SqFixture {
+    tables: &[
+        (
+            "{f}",
+            "fact",
+            "id SERIAL PRIMARY KEY, kind TEXT, v INT",
+            "INSERT INTO {f}(kind, v) VALUES ('a',1),('a',-5),('b',-2),('c',-3),('z',-4),('c',NULL),(NULL,7)",
+        ),
+        (
+            "{d}",
+            "dim",
+            "kind TEXT PRIMARY KEY, label TEXT",
+            "INSERT INTO {d} VALUES ('a','A'),('b','B'),('c','C'),('u','U'),('e','A')",
+        ),
+        (
+            "{o}",
+            "other",
+            "kind TEXT PRIMARY KEY, w INT",
+            "INSERT INTO {o} VALUES ('a',1),('b',2),('c',3),('z',4)",
+        ),
+        (
+            "{x}",
+            "extra",
+            "kind TEXT PRIMARY KEY, z INT",
+            "INSERT INTO {x} VALUES ('a',10),('c',30),('q',40)",
+        ),
+    ],
+    steps: &[
+        v112_sq_step("f_enter", &["{f}"], &["UPDATE {f} SET v = 5 WHERE kind IN ('b','c')"]),
+        v112_sq_step("f_leave_one", &["{f}"], &["UPDATE {f} SET v = -1 WHERE kind = 'a' AND v = 1"]),
+        v112_sq_step("f_ins", &["{f}"], &["INSERT INTO {f}(kind, v) VALUES ('u',-7),('a',3),('e',NULL)"]),
+        v112_sq_step("f_move", &["{f}"], &["UPDATE {f} SET kind = 'u' WHERE kind = 'b'"]),
+        v112_sq_step("f_ins_only_failing", &["{f}"], &["INSERT INTO {f}(kind, v) VALUES ('b',-6)"]),
+        v112_sq_step("f_del_one", &["{f}"], &["DELETE FROM {f} WHERE kind = 'a' AND v = 3"]),
+        v112_sq_step("f_del_only_failing", &["{f}"], &["DELETE FROM {f} WHERE kind = 'b' AND v = -6"]),
+        v112_sq_step("f_del_key", &["{f}"], &["DELETE FROM {f} WHERE kind = 'c'"]),
+        v112_sq_step("f_null_key", &["{f}"], &["UPDATE {f} SET kind = NULL WHERE kind = 'z'"]),
+        v112_sq_step(
+            "f_batch",
+            &["{f}"],
+            &[
+                "INSERT INTO {f}(kind, v) VALUES ('w',-8),('c',2)",
+                "UPDATE {f} SET kind = 'e' WHERE kind = 'w'",
+                "DELETE FROM {f} WHERE kind = 'u' AND v = -7",
+            ],
+        ),
+        v112_sq_step("o_del", &["{o}"], &["DELETE FROM {o} WHERE kind = 'a'"]),
+        v112_sq_step("o_ins", &["{o}"], &["INSERT INTO {o} VALUES ('u',5),('e',0)"]),
+        v112_sq_step("o_upd", &["{o}"], &["UPDATE {o} SET w = w - 3 WHERE kind IN ('c','u')"]),
+        v112_sq_step("x_del", &["{x}"], &["DELETE FROM {x} WHERE kind = 'c'"]),
+        v112_sq_step("x_ins", &["{x}"], &["INSERT INTO {x} VALUES ('u',1),('e',2)"]),
+        v112_sq_step("f_upd_after", &["{f}"], &["UPDATE {f} SET v = v + 1 WHERE kind IN ('a','e')"]),
+        v112_sq_step("d_ins", &["{d}"], &["INSERT INTO {d} VALUES ('z','Z'),('w','W')"]),
+        v112_sq_step("d_del", &["{d}"], &["DELETE FROM {d} WHERE kind = 'a'"]),
+        v112_sq_step("f_empty", &["{f}"], &["DELETE FROM {f}"]),
+        v112_sq_step("f_refill", &["{f}"], &["INSERT INTO {f}(kind, v) VALUES ('a',1),('c',-2),('q',3),('x',NULL),('a',-1)"]),
+        v112_sq_step("o_empty", &["{o}"], &["DELETE FROM {o}"]),
+        v112_sq_step("d_empty", &["{d}"], &["DELETE FROM {d}"]),
+    ],
+};
+
+v112_sq_cells! { V112_SQ_NULL_EXTENDED_CHAIN, None, false;
+    v112_sq_many_lj_admits_null => "SELECT d.kind, COUNT(*) AS c, SUM(f.v) AS s FROM {d} d LEFT JOIN {f} f ON d.kind = f.kind WHERE f.v > 0 OR f.v IS NULL GROUP BY d.kind",
+    v112_sq_many_lj_admits_null_by_label => "SELECT d.label, COUNT(*) AS c, SUM(f.v) AS s FROM {d} d LEFT JOIN {f} f ON d.kind = f.kind WHERE f.v > 0 OR f.v IS NULL GROUP BY d.label",
+    v112_sq_many_lj_only_null => "SELECT d.kind, COUNT(*) AS c FROM {d} d LEFT JOIN {f} f ON d.kind = f.kind WHERE f.id IS NULL GROUP BY d.kind",
+    v112_sq_many_lj_rejects_null => "SELECT d.kind, COUNT(*) AS c, SUM(f.v) AS s FROM {d} d LEFT JOIN {f} f ON d.kind = f.kind WHERE f.v > 0 GROUP BY d.kind",
+    v112_sq_many_lj_rejects_null_minmax => "SELECT d.label, MIN(f.v) AS mn, MAX(f.v) AS mx FROM {d} d LEFT JOIN {f} f ON d.kind = f.kind WHERE f.v <> 3 GROUP BY d.label",
+    v112_sq_many_lj_pt_admits_null => "SELECT d.kind, d.label, f.id, f.v FROM {d} d LEFT JOIN {f} f ON d.kind = f.kind WHERE f.v > 0 OR f.v IS NULL",
+    v112_sq_many_rj_admits_null => "SELECT d.kind, COUNT(*) AS c, SUM(f.v) AS s FROM {f} f RIGHT JOIN {d} d ON d.kind = f.kind WHERE f.v > 0 OR f.v IS NULL GROUP BY d.kind",
+    v112_sq_many_rj_only_null => "SELECT d.label, COUNT(*) AS c FROM {f} f RIGHT JOIN {d} d ON d.kind = f.kind WHERE f.id IS NULL GROUP BY d.label",
+    v112_sq_many_fj_admits_null => "SELECT d.kind, COUNT(*) AS c, SUM(f.v) AS s FROM {d} d FULL JOIN {f} f ON d.kind = f.kind WHERE f.v > 0 OR f.v IS NULL GROUP BY d.kind",
+    v112_sq_many_fj_rejects_null => "SELECT d.kind, COUNT(*) AS c, SUM(f.v) AS s FROM {d} d FULL JOIN {f} f ON d.kind = f.kind WHERE f.v > 0 GROUP BY d.kind",
+    v112_sq_chain_other_null => "SELECT d.kind, COUNT(*) AS c, SUM(f.v) AS s FROM {d} d LEFT JOIN {f} f ON d.kind = f.kind LEFT JOIN {o} o ON o.kind = f.kind WHERE o.w IS NULL GROUP BY d.kind",
+    v112_sq_chain_other_null_by_label => "SELECT d.label, COUNT(*) AS c, SUM(f.v) AS s FROM {d} d LEFT JOIN {f} f ON d.kind = f.kind LEFT JOIN {o} o ON o.kind = f.kind WHERE o.w IS NULL GROUP BY d.label",
+    v112_sq_chain_other_coalesce_by_label => "SELECT d.label, COUNT(*) AS c, SUM(f.v) AS s FROM {d} d LEFT JOIN {f} f ON d.kind = f.kind LEFT JOIN {o} o ON o.kind = f.kind WHERE COALESCE(o.w, 0) < 2 GROUP BY d.label",
+    v112_sq_chain_other_anti => "SELECT d.kind, COUNT(*) AS c FROM {d} d LEFT JOIN {f} f ON d.kind = f.kind LEFT JOIN {o} o ON o.kind = f.kind WHERE o.kind IS NULL GROUP BY d.kind",
+    v112_sq_chain_other_rejects_null => "SELECT d.kind, COUNT(*) AS c, SUM(f.v) AS s FROM {d} d LEFT JOIN {f} f ON d.kind = f.kind LEFT JOIN {o} o ON o.kind = f.kind WHERE o.w > 1 GROUP BY d.kind",
+    v112_sq_chain_other_rejects_null_by_label => "SELECT d.label, COUNT(*) AS c, MIN(f.v) AS mn, MAX(o.w) AS mx FROM {d} d LEFT JOIN {f} f ON d.kind = f.kind LEFT JOIN {o} o ON o.kind = f.kind WHERE o.w > 1 GROUP BY d.label",
+    v112_sq_chain_no_where_by_label => "SELECT d.label, COUNT(*) AS c, SUM(f.v) AS s, SUM(o.w) AS w FROM {d} d LEFT JOIN {f} f ON d.kind = f.kind LEFT JOIN {o} o ON o.kind = f.kind GROUP BY d.label",
+    v112_sq_chain_other_on_dim_null_by_label => "SELECT d.label, COUNT(*) AS c, SUM(f.v) AS s FROM {d} d LEFT JOIN {f} f ON d.kind = f.kind LEFT JOIN {o} o ON o.kind = d.kind WHERE o.w IS NULL GROUP BY d.label",
+    v112_sq_chain4_extra_null_by_label => "SELECT d.label, COUNT(*) AS c, SUM(f.v) AS s FROM {d} d LEFT JOIN {f} f ON d.kind = f.kind LEFT JOIN {o} o ON o.kind = f.kind LEFT JOIN {x} x ON x.kind = o.kind WHERE x.z IS NULL GROUP BY d.label",
+    v112_sq_chain4_extra_rejects_null => "SELECT d.kind, COUNT(*) AS c, SUM(f.v) AS s FROM {d} d LEFT JOIN {f} f ON d.kind = f.kind LEFT JOIN {o} o ON o.kind = f.kind LEFT JOIN {x} x ON x.kind = o.kind WHERE x.z > 5 GROUP BY d.kind",
+    v112_sq_chain4_inner_tail_by_label => "SELECT d.label, COUNT(*) AS c, SUM(f.v) AS s FROM {d} d LEFT JOIN {f} f ON d.kind = f.kind LEFT JOIN {o} o ON o.kind = f.kind JOIN {x} x ON x.kind = o.kind GROUP BY d.label",
+    v112_sq_chain_rj_other_null => "SELECT d.kind, COUNT(*) AS c, SUM(f.v) AS s FROM {o} o RIGHT JOIN {f} f ON o.kind = f.kind RIGHT JOIN {d} d ON d.kind = f.kind WHERE o.w IS NULL GROUP BY d.kind",
+    v112_sq_chain_lj_rj_other_null_by_label => "SELECT d.label, COUNT(*) AS c, SUM(f.v) AS s FROM {f} f LEFT JOIN {o} o ON o.kind = f.kind RIGHT JOIN {d} d ON d.kind = f.kind WHERE o.w IS NULL GROUP BY d.label",
+    v112_sq_chain4_rj_extra_null => "SELECT d.kind, COUNT(*) AS c, SUM(f.v) AS s FROM {x} x RIGHT JOIN {o} o ON x.kind = o.kind RIGHT JOIN {f} f ON o.kind = f.kind RIGHT JOIN {d} d ON d.kind = f.kind WHERE x.z IS NULL GROUP BY d.kind",
+    v112_sq_chain_fj_lj_other_null => "SELECT d.kind, COUNT(*) AS c, SUM(f.v) AS s FROM {d} d FULL JOIN {f} f ON d.kind = f.kind LEFT JOIN {o} o ON o.kind = f.kind WHERE o.w IS NULL GROUP BY d.kind",
+    v112_sq_chain_fj_fj_other_admits => "SELECT d.kind, COUNT(*) AS c, SUM(f.v) AS s FROM {d} d FULL JOIN {f} f ON d.kind = f.kind FULL JOIN {o} o ON o.kind = f.kind WHERE o.w IS NULL OR o.w > 2 GROUP BY d.kind",
+    v112_sq_chain4_fj_extra_null_by_label => "SELECT d.label, COUNT(*) AS c, SUM(f.v) AS s FROM {d} d FULL JOIN {f} f ON d.kind = f.kind LEFT JOIN {o} o ON o.kind = f.kind LEFT JOIN {x} x ON x.kind = o.kind WHERE x.z IS NULL GROUP BY d.label",
+    v112_sq_chain_pt_other_null => "SELECT d.label, f.id, f.v, o.w FROM {d} d LEFT JOIN {f} f ON d.kind = f.kind LEFT JOIN {o} o ON o.kind = f.kind WHERE o.w IS NULL",
+}
+
+v112_sq_deferred_cells! { V112_SQ_DEFERRED_CHAIN, V112_SQ_NULL_EXTENDED_CHAIN, None;
+    v112_sq_many_lj_admits_null_deferred => "SELECT d.kind, COUNT(*) AS c, SUM(f.v) AS s FROM {d} d LEFT JOIN {f} f ON d.kind = f.kind WHERE f.v > 0 OR f.v IS NULL GROUP BY d.kind",
+    v112_sq_many_lj_only_null_deferred => "SELECT d.kind, COUNT(*) AS c FROM {d} d LEFT JOIN {f} f ON d.kind = f.kind WHERE f.id IS NULL GROUP BY d.kind",
+    v112_sq_many_lj_rejects_null_deferred => "SELECT d.kind, COUNT(*) AS c, SUM(f.v) AS s FROM {d} d LEFT JOIN {f} f ON d.kind = f.kind WHERE f.v > 0 GROUP BY d.kind",
+    v112_sq_many_rj_only_null_deferred => "SELECT d.label, COUNT(*) AS c FROM {f} f RIGHT JOIN {d} d ON d.kind = f.kind WHERE f.id IS NULL GROUP BY d.label",
+    v112_sq_many_fj_admits_null_deferred => "SELECT d.kind, COUNT(*) AS c, SUM(f.v) AS s FROM {d} d FULL JOIN {f} f ON d.kind = f.kind WHERE f.v > 0 OR f.v IS NULL GROUP BY d.kind",
+    v112_sq_chain_other_null_deferred => "SELECT d.kind, COUNT(*) AS c, SUM(f.v) AS s FROM {d} d LEFT JOIN {f} f ON d.kind = f.kind LEFT JOIN {o} o ON o.kind = f.kind WHERE o.w IS NULL GROUP BY d.kind",
+    v112_sq_chain_other_null_by_label_deferred => "SELECT d.label, COUNT(*) AS c, SUM(f.v) AS s FROM {d} d LEFT JOIN {f} f ON d.kind = f.kind LEFT JOIN {o} o ON o.kind = f.kind WHERE o.w IS NULL GROUP BY d.label",
+    v112_sq_chain_other_rejects_null_deferred => "SELECT d.kind, COUNT(*) AS c, SUM(f.v) AS s FROM {d} d LEFT JOIN {f} f ON d.kind = f.kind LEFT JOIN {o} o ON o.kind = f.kind WHERE o.w > 1 GROUP BY d.kind",
+    v112_sq_chain_other_rejects_null_by_label_deferred => "SELECT d.label, COUNT(*) AS c, MIN(f.v) AS mn, MAX(o.w) AS mx FROM {d} d LEFT JOIN {f} f ON d.kind = f.kind LEFT JOIN {o} o ON o.kind = f.kind WHERE o.w > 1 GROUP BY d.label",
+    v112_sq_chain4_extra_null_by_label_deferred => "SELECT d.label, COUNT(*) AS c, SUM(f.v) AS s FROM {d} d LEFT JOIN {f} f ON d.kind = f.kind LEFT JOIN {o} o ON o.kind = f.kind LEFT JOIN {x} x ON x.kind = o.kind WHERE x.z IS NULL GROUP BY d.label",
+    v112_sq_chain_rj_other_null_deferred => "SELECT d.kind, COUNT(*) AS c, SUM(f.v) AS s FROM {o} o RIGHT JOIN {f} f ON o.kind = f.kind RIGHT JOIN {d} d ON d.kind = f.kind WHERE o.w IS NULL GROUP BY d.kind",
+    v112_sq_chain_fj_lj_other_null_deferred => "SELECT d.kind, COUNT(*) AS c, SUM(f.v) AS s FROM {d} d FULL JOIN {f} f ON d.kind = f.kind LEFT JOIN {o} o ON o.kind = f.kind WHERE o.w IS NULL GROUP BY d.kind",
+}
+
+// ---------------------------------------------------------------------------
+// An alias equal to the name of the null-extended table
+// ---------------------------------------------------------------------------
+
+v112_sq_cells! { V112_SQ_NULL_EXTENDED_CHAIN, None, false;
+    v112_sq_alias_hides_table_name => "SELECT {f}.kind, COUNT(*) AS c, SUM(f.v) AS s FROM {d} AS {f} LEFT JOIN {f} AS f ON {f}.kind = f.kind WHERE {f}.kind > '' AND (f.v > 0 OR f.v IS NULL) GROUP BY {f}.kind",
+}
+
+v112_sq_deferred_cells! { V112_SQ_DEFERRED_ALIAS, V112_SQ_NULL_EXTENDED_CHAIN, None;
+    v112_sq_alias_hides_table_name_deferred => "SELECT {f}.kind, COUNT(*) AS c, SUM(f.v) AS s FROM {d} AS {f} LEFT JOIN {f} AS f ON {f}.kind = f.kind WHERE {f}.kind > '' AND (f.v > 0 OR f.v IS NULL) GROUP BY {f}.kind",
+    v112_sq_alias_hides_table_name_pt_deferred => "SELECT {f}.kind, {f}.label, f.id, f.v FROM {d} AS {f} LEFT JOIN {f} AS f ON {f}.kind = f.kind WHERE {f}.kind > '' AND (f.v > 0 OR f.v IS NULL)",
+}
+
+// ---------------------------------------------------------------------------
+// The DEFERRED cells again, one committed transaction per step
+// ---------------------------------------------------------------------------
+
+#[pg_test]
+fn v112_sq_commit_boot() {}
+
+/// Runs `cell` over a second connection: every step is `BEGIN; …; COMMIT`, so
+/// the flush is the one COMMIT runs. Returns the steps that left the IMV wrong.
+#[cfg(test)]
+fn v112_sq_commit_cell(
+    sql: &mut dyn FnMut(bool, &str) -> String,
+    group: &V112SqCommitGroup,
+    name: &str,
+    select_template: &str,
+) -> Vec<String> {
+    let fixture = group.fixture;
+    let tag = format!("c_{}", name.trim_start_matches("v112_sq_"));
+    let imv = format!("v112_sq_{tag}");
+    let fresh = v112_sq_resolve(select_template, fixture, &tag);
+    let oracle = |sql: &mut dyn FnMut(bool, &str) -> String| {
+        sql(
+            true,
+            &format!(
+                "SELECT COUNT(*)::text FROM (\
+                    (SELECT * FROM {imv} EXCEPT ALL SELECT * FROM ({fresh}) AS __fresh1) \
+                    UNION ALL \
+                    (SELECT * FROM ({fresh}) AS __fresh2 EXCEPT ALL SELECT * FROM {imv}) \
+                 ) __oracle"
+            ),
+        )
+    };
+    let mut failures: Vec<String> = Vec::new();
+    'cell: {
+        for (placeholder, _, columns, seed) in fixture.tables {
+            let table = v112_sq_resolve(placeholder, fixture, &tag);
+            let seed = v112_sq_resolve(seed, fixture, &tag);
+            let ran = sql(false, &format!("CREATE TABLE {table}({columns}); {seed}"));
+            if ran != "OK" {
+                failures.push(format!("setup={ran}"));
+                break 'cell;
+            }
+        }
+        let key = group.key.map_or("NULL".to_string(), |k| format!("'{k}'"));
+        let created = sql(
+            true,
+            &format!(
+                "SELECT create_reflex_ivm('{imv}', $v112sel${fresh}$v112sel$, {key}, 'UNLOGGED', 'DEFERRED')::text"
+            ),
+        );
+        if created != "CREATE REFLEX INCREMENTAL VIEW" {
+            failures.push(format!("NOT-CREATED {created}"));
+            break 'cell;
+        }
+        let created_mismatches = oracle(sql);
+        if created_mismatches != "0" {
+            failures.push(format!("create={created_mismatches}"));
+        }
+        for step in fixture.steps {
+            if !step.writes.iter().all(|w| select_template.contains(w)) {
+                continue;
+            }
+            let statements: Vec<String> = step
+                .statements
+                .iter()
+                .map(|statement| v112_sq_resolve(statement, fixture, &tag))
+                .collect();
+            let ran = sql(false, &format!("BEGIN; {}; COMMIT;", statements.join("; ")));
+            if ran != "OK" {
+                failures.push(format!("{}={ran}", step.label));
+                continue;
+            }
+            let mismatches = oracle(sql);
+            if mismatches != "0" {
+                failures.push(format!("{}={mismatches}", step.label));
+                let reconciled = sql(true, &format!("SELECT reflex_reconcile('{imv}')::text"));
+                if oracle(sql) != "0" {
+                    failures.push(format!("reconcile-after-{}={reconciled}", step.label));
+                    break;
+                }
+            }
+        }
+    }
+    let _ = sql(true, &format!("SELECT drop_reflex_ivm('{imv}', true)::text"));
+    let tables: Vec<String> = fixture
+        .tables
+        .iter()
+        .map(|(placeholder, _, _, _)| v112_sq_resolve(placeholder, fixture, &tag))
+        .collect();
+    let _ = sql(false, &format!("DROP TABLE IF EXISTS {} CASCADE", tables.join(", ")));
+    failures
+}
+
+#[cfg(test)]
+fn v112_sq_commit_groups(groups: &[&V112SqCommitGroup]) {
+    pgrx_tests::run_test(
+        "v112_sq_commit_boot",
+        None,
+        crate::pg_test::postgresql_conf_options(),
+    )
+    .expect("boot");
+    let (mut client, _session) = pgrx_tests::client().expect("client");
+    let mut sql = |query: bool, text: &str| -> String {
+        let failure = if query {
+            match client.query_one(text, &[]) {
+                Ok(row) => return row.get::<_, String>(0),
+                Err(e) => e,
+            }
+        } else {
+            match client.batch_execute(text) {
+                Ok(()) => return "OK".to_string(),
+                Err(e) => e,
+            }
+        };
+        let message = failure
+            .as_db_error()
+            .map(|db| db.message().to_string())
+            .unwrap_or_else(|| failure.to_string());
+        let _ = client.batch_execute("ROLLBACK");
+        format!("RAISED: {message}")
+    };
+    let mut wrong: Vec<String> = Vec::new();
+    for group in groups {
+        for (name, select) in group.cells {
+            let failures = v112_sq_commit_cell(&mut sql, group, name, select);
+            if !failures.is_empty() {
+                wrong.push(format!("{name}: {}", failures.join(" ")));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "\n{}", wrong.join("\n"));
+}
+
+/// Replays every DEFERRED cell with real COMMITs. A committed DEFERRED create
+/// makes the creates of concurrently running tests fail, so this runs only when
+/// the test filter names it: `cargo pgrx test <pg> v112_sq_commit`.
+#[cfg(test)]
+#[test]
+fn v112_sq_commit_path() {
+    if !std::env::args().any(|argument| argument.contains("v112_sq_commit")) {
+        return;
+    }
+    v112_sq_commit_groups(&[
+        &V112_SQ_DEFERRED_1,
+        &V112_SQ_DEFERRED_2,
+        &V112_SQ_DEFERRED_3,
+        &V112_SQ_DEFERRED_4,
+        &V112_SQ_DEFERRED_5,
+        &V112_SQ_DEFERRED_6,
+        &V112_SQ_DEFERRED_7,
+        &V112_SQ_DEFERRED_8,
+        &V112_SQ_DEFERRED_OUTSIDE,
+        &V112_SQ_DEFERRED_CHAIN,
+        &V112_SQ_DEFERRED_ALIAS,
+    ]);
 }
