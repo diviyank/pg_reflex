@@ -16,10 +16,15 @@ INSERT INTO s(g, v) VALUES ('a', 1);   -- scoped delta, as before
 ```
 
 `reflex_build_delta_sql` returns the full-refresh statements for every operation on `t`
-(`source_read_by_expression_subquery` in `src/trigger/expression_subquery.rs`, called from
-`has_no_scoped_delta`). The shapes covered: `IN` / `NOT IN (SELECT …)`, `EXISTS` / `NOT EXISTS`,
+(`imv_reads_source_by_expression_subquery` in `src/trigger/expression_subquery.rs`, called from
+`imv_has_no_scoped_delta`). The shapes covered: `IN` / `NOT IN (SELECT …)`, `EXISTS` / `NOT EXISTS`,
 `= ANY` / `> ALL (SELECT …)`, a scalar subquery in the WHERE, in the select list, inside an
-aggregate argument or in a join condition, correlated or not, at any nesting depth.
+aggregate argument, in a join condition, in HAVING or in a select-list expression over an
+aggregate, correlated or not, at any nesting depth.
+
+An UPDATE of the subquery's table that changes only columns the subquery does not read
+(`UPDATE t SET note = …`) is recomputed in full as well: a table read only through a subquery has
+no relevant-column list, so the UPDATE skip never applies to it.
 
 ## Workaround
 

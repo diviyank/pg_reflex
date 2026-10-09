@@ -80,3 +80,42 @@ fn a_query_with_one_select_keyword_is_not_parsed() {
         "b"
     ));
 }
+
+#[test]
+fn source_read_only_by_a_subquery_of_the_end_query_is_found() {
+    let base =
+        "SELECT g AS \"g\", SUM(v) AS \"__sum_v\", COUNT(*) AS __ivm_count FROM a GROUP BY g";
+    for end_query in [
+        "SELECT \"g\", \"__sum_v\" AS \"sv\" FROM \"__reflex_intermediate_x\" WHERE __ivm_count > 0 AND \"__sum_v\" > (SELECT max(v) FROM b)",
+        "SELECT \"g\", \"__sum_v\" + (SELECT max(v) FROM s.b) AS \"x\" FROM \"__reflex_intermediate_x\" WHERE __ivm_count > 0",
+        "SELECT \"g\", CASE WHEN \"__sum_v\" > (SELECT max(v) FROM \"b\") THEN 1 ELSE 0 END AS \"hi\" FROM \"__reflex_intermediate_x\" WHERE __ivm_count > 0",
+        "SELECT \"g\" FROM \"__reflex_intermediate_x\" WHERE __ivm_count > 0 AND \"g\" IN (SELECT g FROM b) AND (",
+    ] {
+        assert!(!has_no_scoped_delta(base, "b"), "{end_query}");
+        assert!(imv_reads_source_by_expression_subquery(base, end_query, "b"), "{end_query}");
+        assert!(crate::trigger::imv_has_no_scoped_delta(base, end_query, "b"), "{end_query}");
+        assert!(!crate::trigger::imv_has_no_scoped_delta(base, end_query, "a"), "{end_query}");
+    }
+    let own_table = "SELECT \"g\", \"__sum_v\" AS \"sv\" FROM \"__reflex_intermediate_x\" WHERE __ivm_count > 0 AND \"__sum_v\" >= (SELECT max(v) FROM a)";
+    assert!(crate::trigger::imv_has_no_scoped_delta(
+        base, own_table, "a"
+    ));
+}
+
+#[test]
+fn end_query_that_does_not_read_the_source_keeps_the_scoped_delta() {
+    let base = "SELECT g AS \"g\", SUM(v) AS \"__sum_v\", COUNT(*) AS __ivm_count FROM a JOIN b ON b.g = a.g GROUP BY g";
+    for end_query in [
+        "",
+        "SELECT \"g\", \"__sum_v\" AS \"b\" FROM \"__reflex_intermediate_x\" WHERE __ivm_count > 0",
+        "SELECT \"g\", \"__sum_v\" AS \"sv\" FROM \"__reflex_intermediate_x\" WHERE __ivm_count > 0 AND \"__sum_v\" > (SELECT max(v) FROM c)",
+        "SELECT \"g\", \"__sum_v\" AS \"sv\" FROM \"__reflex_intermediate_b_x\" WHERE __ivm_count > 0 AND \"b_total\" > 0",
+    ] {
+        for source in ["a", "b"] {
+            assert!(
+                !crate::trigger::imv_has_no_scoped_delta(base, end_query, source),
+                "{source} / {end_query}"
+            );
+        }
+    }
+}
