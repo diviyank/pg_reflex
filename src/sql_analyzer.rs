@@ -393,9 +393,9 @@ pub struct SqlAnalysis {
     pub has_extract: bool,
     /// Calls spelled so that they cannot be taken for a `pg_catalog` function.
     pub non_builtin_calls: Vec<NonBuiltinCall>,
-    /// Bare lower-case names of the functions called in the top-level SELECT list,
-    /// outside subqueries and window functions.
-    pub select_list_functions: Vec<String>,
+    /// The functions called in the top-level SELECT list, outside subqueries and window
+    /// functions.
+    pub select_list_calls: Vec<WrittenCall>,
     /// The name PostgreSQL gives each output column that has one by the query's text: an
     /// alias, or the column of a bare column reference. One entry per such select item.
     pub named_outputs: Vec<String>,
@@ -857,14 +857,33 @@ fn every_aggregate_is_decomposable(expr: &Expr) -> bool {
     count_decomposable_aggregates(expr) == aggregates.get()
 }
 
-/// Bare lower-case names of the calls of `expr` at its own query level.
-fn called_function_names(expr: &Expr) -> Vec<String> {
-    let names = std::cell::RefCell::new(Vec::new());
+/// A call as PostgreSQL looks it up: `schema` and `name` folded like identifiers
+/// (`schema` is `None` for an unqualified call), and the number of arguments written.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WrittenCall {
+    pub schema: Option<String>,
+    pub name: String,
+    pub arg_count: usize,
+}
+
+/// The calls of `expr` at its own query level.
+fn written_calls(expr: &Expr) -> Vec<WrittenCall> {
+    let calls = std::cell::RefCell::new(Vec::new());
     expr_contains_call(expr, &|f| {
-        names.borrow_mut().push(bare_function_name(&f.name));
+        let name = f.name.0.last().and_then(|part| part.as_ident()).map(folded);
+        if let Some(name) = name {
+            calls.borrow_mut().push(WrittenCall {
+                schema: function_schema(&f.name),
+                name,
+                arg_count: match &f.args {
+                    FunctionArguments::List(list) => list.args.len(),
+                    _ => 0,
+                },
+            });
+        }
         false
     });
-    names.into_inner()
+    calls.into_inner()
 }
 
 /// The column a select item is when it is a bare, optionally qualified and optionally
@@ -1013,9 +1032,9 @@ fn first_arg_sql(args: &FunctionArguments) -> Option<String> {
 }
 
 fn push_select_column(analysis: &mut SqlAnalysis, expr: &Expr, alias: Option<String>) {
-    for name in called_function_names(expr) {
-        if !analysis.select_list_functions.contains(&name) {
-            analysis.select_list_functions.push(name);
+    for call in written_calls(expr) {
+        if !analysis.select_list_calls.contains(&call) {
+            analysis.select_list_calls.push(call);
         }
     }
     if is_constant_refused_as_group_key(expr) {
