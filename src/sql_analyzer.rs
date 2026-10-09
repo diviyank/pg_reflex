@@ -1760,6 +1760,31 @@ fn holds_natural_join(from_item: &TableWithJoins) -> bool {
         })
 }
 
+/// Whether `select` may read a table of its FROM clause as a whole row
+/// (`f(t)`, `to_jsonb(t.*)`): every column of that table then shapes the
+/// result, and none is named. A bare word spelled like a table or an alias
+/// counts, whether or not a column carries that name too.
+fn reads_a_whole_row(
+    select: &Select,
+    aliases: &HashMap<String, String>,
+    sources: &[String],
+) -> bool {
+    if select.to_string().contains(".*") {
+        return true;
+    }
+    let mut collector = ColumnRefCollector { refs: Vec::new() };
+    let _ = select.visit(&mut collector);
+    let row_names: Vec<String> = aliases
+        .keys()
+        .chain(sources.iter().filter(|source| is_real_source(source)))
+        .map(|name| folded_relation_name(name))
+        .collect();
+    collector
+        .refs
+        .iter()
+        .any(|parts| matches!(parts.as_slice(), [word] if row_names.contains(word)))
+}
+
 /// Compute the IMV-relevant column set for each source by walking every
 /// clause of the SELECT EXCEPT the WHERE clause: projection, GROUP BY,
 /// HAVING, JOIN ON, and JOIN USING column lists.
@@ -1780,6 +1805,9 @@ fn collect_imv_relevant_columns(
         return HashMap::new();
     }
     let sources: Vec<String> = top_level_sources(select);
+    if reads_a_whole_row(select, aliases, &sources) {
+        return HashMap::new();
+    }
 
     // Any wildcard projection means we don't know the exposed columns
     // statically. Bail out — the existing byte-identical fast path remains

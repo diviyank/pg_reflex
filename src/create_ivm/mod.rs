@@ -210,6 +210,7 @@ fn with_unquoted_names_folded(
     };
     let written = rendered(&statements);
     crate::sql_analyzer::fold_unquoted_names(&mut statements);
+    identifier_quotes::unquote_relation_names(&mut statements);
     let folded = rendered(&statements);
     let folded_sql = (folded != written).then_some(folded);
     (statements, folded_sql)
@@ -264,6 +265,14 @@ fn resolve_unique_columns(ctx: &mut BuildContext) {
         info!(
             "pg_reflex: passthrough '{}' calls a set-returning function in its SELECT list, so \
              no key of a source identifies its rows: it is fully refreshed by every write.",
+            ctx.view_name
+        );
+    } else if ctx.analysis.sources.iter().any(|s| s.starts_with('<')) {
+        info!(
+            "pg_reflex: passthrough '{}' reads a derived table or a function in FROM, whose \
+             rows are not known to be the rows of a source: it has no key and is fully \
+             refreshed by every write. Pass the key columns as the 3rd argument to \
+             create_reflex_ivm for incremental maintenance.",
             ctx.view_name
         );
     } else if !ctx.is_join_query {
@@ -2878,9 +2887,11 @@ pub(crate) fn create_reflex_ivm_impl_with_materialization(
         return crate::reflex_reject(
             "More than one COUNT(DISTINCT ...) in the same SELECT list is not supported: the IMV \
              is keyed on the distinct argument and holds one. Fix: compute each in its own CTE \
-             and join them on the group columns: WITH a AS (SELECT grp, COUNT(DISTINCT x) AS dx \
+             and join them on the group columns, with IS NOT DISTINCT FROM so that a group \
+             whose key is NULL is kept: WITH a AS (SELECT grp, COUNT(DISTINCT x) AS dx \
              FROM t GROUP BY grp), b AS (SELECT grp, COUNT(DISTINCT y) AS dy FROM t GROUP BY grp) \
-             SELECT a.grp, a.dx, b.dy FROM a JOIN b ON b.grp = a.grp. The same COUNT(DISTINCT) \
+             SELECT a.grp, a.dx, b.dy FROM a JOIN b ON b.grp IS NOT DISTINCT FROM a.grp. The \
+             same COUNT(DISTINCT) \
              needed twice is computed once in a CTE and its column repeated in the outer query.",
         );
     }
