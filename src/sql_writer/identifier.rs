@@ -6,8 +6,9 @@
 //!
 //! Every helper here is deliberately small and pure so callers can compose
 //! them. The rewriters:
-//! - [`replace_identifier`] — case-sensitive word-boundary substitution.
-//!   Skips matches that follow `AS ` (output aliases, not table refs).
+//! - `replace_identifier` — case-sensitive word-boundary substitution that
+//!   reads string literals as code. No query is rewritten with it: it is the
+//!   reference the tests of the literal-aware rewriters compare against.
 //! - [`strip_redundant_bare_alias`] — strips a redundant `AS <bare>` clause
 //!   that the user wrote after a schema-qualified source ref.
 //! - [`substitute_identifier_ci`] — case-insensitive word-level substitution
@@ -143,6 +144,7 @@ fn continues_identifier(byte: u8) -> bool {
 /// **Contract:** `new_name` must itself be a simple identifier (possibly
 /// schema-qualified and quoted). A match followed by `.col` produces invalid
 /// SQL if `new_name` is a sub-query expression.
+#[cfg(test)]
 pub fn replace_identifier(sql: &str, old_name: &str, new_name: &str) -> String {
     replace_identifier_outside(sql, old_name, new_name, &[])
 }
@@ -247,41 +249,42 @@ pub fn strip_redundant_bare_alias(sql: &str, source_table: &str) -> String {
     out
 }
 
-/// Case-INSENSITIVE word-level substitution. Walks `expr` token by token and
+/// Case-INSENSITIVE word-level substitution. Walks `expr` word by word and
 /// replaces each bare identifier whose lower-cased text equals
 /// `ident.to_lowercase()` with `replacement`.
 ///
 /// Used by partition-constraint expression rewrites (`pg_get_partition_constraintdef`
 /// returns lower-cased identifiers regardless of the user's quoting, so the
 /// constraint expression must be matched case-insensitively).
+///
+/// A partition bound is data: string literals are copied through unchanged.
 pub fn substitute_identifier_ci(expr: &str, ident: &str, replacement: &str) -> String {
     let bytes = expr.as_bytes();
     let lower_ident = ident.to_lowercase();
+    let literals = string_literal_spans(expr);
+    let mut untouched = UntouchedSpans {
+        remaining: &literals,
+    };
     let mut out = String::with_capacity(expr.len());
     let mut unmatched_start = 0;
     let mut i = 0;
     while i < bytes.len() {
-        let c = bytes[i] as char;
-        if c.is_ascii_alphabetic() || c == '_' {
-            out.push_str(&expr[unmatched_start..i]);
-            let start = i;
-            while i < bytes.len() {
-                let cc = bytes[i] as char;
-                if cc.is_ascii_alphanumeric() || cc == '_' {
-                    i += 1;
-                } else {
-                    break;
-                }
-            }
-            let word = &expr[start..i];
-            if word.to_lowercase() == lower_ident {
-                out.push_str(replacement);
-            } else {
-                out.push_str(word);
-            }
-            unmatched_start = i;
-        } else {
+        if let Some(span_end) = untouched.end_of_span_containing(i) {
+            i = span_end;
+            continue;
+        }
+        if !continues_identifier(bytes[i]) || bytes[i].is_ascii_digit() {
             i += 1;
+            continue;
+        }
+        let word_start = i;
+        while i < bytes.len() && continues_identifier(bytes[i]) {
+            i += 1;
+        }
+        if expr[word_start..i].to_lowercase() == lower_ident {
+            out.push_str(&expr[unmatched_start..word_start]);
+            out.push_str(replacement);
+            unmatched_start = i;
         }
     }
     out.push_str(&expr[unmatched_start..]);
