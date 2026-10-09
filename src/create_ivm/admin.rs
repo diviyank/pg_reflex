@@ -343,8 +343,22 @@ pub(crate) fn reflex_rebuild_imv_metadata_impl(view_name: &str) -> String {
 pub(crate) fn reflex_rebuild_triggers_impl(source_table: &str) -> String {
     // The triggers of a source are named after, and select their IMVs by, the
     // spelling the IMVs registered: rebuilt under any other they would be a
-    // second set that maintains nothing.
-    let registered = crate::reconcile::spellings_registered_for(source_table);
+    // second set that maintains nothing. A registered spelling that does not
+    // resolve here (an unqualified name of a table outside the search_path) is
+    // located through the catalog below.
+    let registered: Vec<String> = crate::reconcile::spellings_registered_for(source_table)
+        .into_iter()
+        .filter(|spelling| {
+            Spi::get_one_with_args::<bool>(
+                "SELECT to_regclass($1) IS NOT NULL",
+                &[unsafe {
+                    DatumWithOid::new(spelling.clone(), PgBuiltInOids::TEXTOID.oid().value())
+                }],
+            )
+            .unwrap_or(None)
+            .unwrap_or(false)
+        })
+        .collect();
     if !registered.is_empty() {
         return registered
             .iter()

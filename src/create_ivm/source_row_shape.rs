@@ -26,7 +26,9 @@ fn source_columns(client: &pgrx::spi::SpiClient<'_>, source: &str) -> Vec<String
              WHERE attrelid = to_regclass($1) AND attnum > 0 AND NOT attisdropped \
              ORDER BY attnum",
             None,
-            &[unsafe { DatumWithOid::new(source.to_string(), PgBuiltInOids::TEXTOID.oid().value()) }],
+            &[unsafe {
+                DatumWithOid::new(source.to_string(), PgBuiltInOids::TEXTOID.oid().value())
+            }],
         )
         .map(|rows| {
             rows.filter_map(|row| row.get_by_name::<String, _>("name").ok().flatten())

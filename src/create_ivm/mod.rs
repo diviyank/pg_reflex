@@ -1592,8 +1592,7 @@ fn install_source_triggers(client: &mut pgrx::spi::SpiClient<'_>, ctx: &BuildCon
                 client.update(&ddl, None, &[]).unwrap_or_report();
             }
         }
-        crate::source_truncate::sync_partition_truncate_triggers(client, source)
-            .unwrap_or_report();
+        crate::source_truncate::sync_partition_truncate_triggers(client, source).unwrap_or_report();
     }
 }
 
