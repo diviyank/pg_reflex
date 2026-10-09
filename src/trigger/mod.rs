@@ -142,8 +142,9 @@ pub(crate) fn follows_outer_join_keyword(bq_upper: &str, source_table: &str) -> 
 /// Whether a write to `source_table` has no per-source delta, so the IMV is
 /// recomputed from `base_query`: the source is read more than once, the query
 /// holds a RIGHT JOIN, the source is read inside a derived table or a
-/// parenthesised join that a LEFT JOIN null-extends, or the transition-table
-/// rewrite would break a quoted identifier of another relation.
+/// parenthesised join that a LEFT JOIN null-extends, the source is read by a
+/// subquery used as an expression, or the transition-table rewrite would break
+/// a quoted identifier of another relation.
 ///
 /// A RIGHT JOIN is never scoped. The table before the keyword is the
 /// null-extended one, and the per-source key mappings of the plan assume the
@@ -153,6 +154,10 @@ pub(crate) fn follows_outer_join_keyword(bq_upper: &str, source_table: &str) -> 
 pub(crate) fn has_no_scoped_delta(base_query: &str, source_table: &str) -> bool {
     outer_joins_leave_no_scoped_delta(&outer_joins(base_query, source_table))
         || source_reference_count(base_query, source_table) > 1
+        || expression_subquery::base_query_reads_source_by_expression_subquery(
+            base_query,
+            source_table,
+        )
         || source_rewrite_breaks_quoted_identifier(base_query, source_table)
 }
 
@@ -163,22 +168,17 @@ fn outer_joins_leave_no_scoped_delta(joins: &OuterJoins) -> bool {
         || joins.source_name_stands_as_a_value
 }
 
-/// Whether `end_query` reads `source_table`, as the subquery of a HAVING clause
-/// does. A write to it then moves the HAVING outcome of groups whose aggregates
-/// it leaves unchanged, so no per-group delta scopes it. An end query that names
-/// the source and does not parse counts as reading it.
-pub(crate) fn end_query_reads_source(end_query: &str, source_table: &str) -> bool {
-    let source = union_delta::bare_lower(source_table);
-    if !end_query.to_lowercase().contains(&source) {
-        return false;
-    }
-    match sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::PostgreSqlDialect {}, end_query)
-    {
-        Ok(statements) => statements
-            .iter()
-            .any(|statement| union_delta::references_source(statement, &source)),
-        Err(_) => true,
-    }
+pub(crate) use expression_subquery::end_query_reads_source;
+
+/// [`has_no_scoped_delta`] over the whole stored query of an IMV: a source
+/// read by a subquery of `end_query` (HAVING, an expression over an aggregate)
+/// has no scoped delta either.
+pub(crate) fn imv_has_no_scoped_delta(
+    base_query: &str,
+    end_query: &str,
+    source_table: &str,
+) -> bool {
+    has_no_scoped_delta(base_query, source_table) || end_query_reads_source(end_query, source_table)
 }
 
 /// Generates the SQL statements to apply a delta to an IMV.
@@ -250,7 +250,11 @@ pub fn reflex_build_delta_sql(
     let recompute_in_full = outer_joins_leave_no_scoped_delta(&joins)
         || source_reference_count(base_query, source_table) > 1
         || source_rewrite_breaks_quoted_identifier(base_query, source_table)
-        || end_query_reads_source(end_query, source_table);
+        || expression_subquery::imv_reads_source_by_expression_subquery(
+            base_query,
+            end_query,
+            source_table,
+        );
     // For LEFT JOIN: EVERY operation on the secondary table needs special
     // handling. The plain `L LEFT JOIN Δsecondary` delta re-emits all left rows
     // NULL-extended, which double-counts non-matching left rows on INSERT (breaks
@@ -517,8 +521,10 @@ fn path_c_explain_sql(
         Ok(plan) if plan.source_join_keys.contains_key(source_table) => {}
         _ => return String::new(),
     }
-    if has_no_scoped_delta(base_query, source_table)
-        || end_query_reads_source(end_query, source_table)
+    // The swap keeps the unmatched rows of a FULL JOIN's other table, whose
+    // groups the intermediate table can already hold.
+    if imv_has_no_scoped_delta(base_query, end_query, source_table)
+        || outer_join::holds_full_join(base_query)
     {
         return String::new();
     }
@@ -717,6 +723,7 @@ pub fn reflex_execute_separated(sql: &str) {
 
 pub(crate) mod deferred;
 mod dispatch;
+mod expression_subquery;
 mod merge;
 mod ops;
 mod outer_join;

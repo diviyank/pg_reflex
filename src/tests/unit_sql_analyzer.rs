@@ -1483,3 +1483,164 @@ fn nondeterministic_rejection_names_each_matched_function_once() {
         .unsupported_reason()
         .is_some_and(|r| r.contains("Fix: remove age, now from the IMV query")));
 }
+
+fn relevant_where(a: &SqlAnalysis, source: &str) -> String {
+    a.imv_relevant_where
+        .get(source)
+        .cloned()
+        .unwrap_or_default()
+}
+
+#[test]
+fn columns_of_a_cross_source_conjunct_are_relevant() {
+    let a = parse_and_analyze(
+        "SELECT m.id, j.label FROM s m JOIN t j ON j.g = m.g WHERE m.v > j.w AND m.kind = 'x'",
+    );
+    assert_eq!(relevant_cols(&a, "s"), vec!["g", "id", "v"]);
+    assert_eq!(relevant_cols(&a, "t"), vec!["g", "label", "w"]);
+    assert_eq!(relevant_where(&a, "s"), "kind = 'x'");
+}
+
+#[test]
+fn columns_of_an_unqualified_conjunct_in_a_join_are_relevant() {
+    let a = parse_and_analyze("SELECT m.id FROM s m JOIN t j ON j.g = m.g WHERE flag = 1");
+    assert!(relevant_cols(&a, "s").contains(&"flag".to_string()));
+    assert!(relevant_cols(&a, "t").contains(&"flag".to_string()));
+    assert!(a.imv_relevant_where.is_empty());
+}
+
+#[test]
+fn correlated_subquery_conjunct_is_not_a_source_filter() {
+    for query in [
+        "SELECT m.id FROM s m WHERE NOT EXISTS (SELECT 1 FROM t x WHERE x.g = m.g) OR m.w IS NULL",
+        "SELECT m.id FROM s m WHERE m.v > (SELECT count(*) FROM t x WHERE x.g = m.g)",
+        "SELECT s.id FROM s WHERE NOT EXISTS (SELECT 1 FROM t WHERE t.g = s.g) OR s.w IS NULL",
+    ] {
+        let a = parse_and_analyze(query);
+        assert!(a.imv_relevant_where.is_empty(), "{query}");
+        let cols = relevant_cols(&a, "s");
+        assert!(cols.contains(&"g".to_string()), "{query}");
+    }
+}
+
+#[test]
+fn columns_only_a_correlated_subquery_reads_are_relevant() {
+    let a =
+        parse_and_analyze("SELECT m.id FROM s m WHERE EXISTS (SELECT 1 FROM t x WHERE x.v = m.v)");
+    assert_eq!(relevant_cols(&a, "s"), vec!["id", "v"]);
+    assert!(a.imv_relevant_where.is_empty());
+}
+
+#[test]
+fn uncorrelated_subquery_conjunct_stays_a_source_filter() {
+    let a = parse_and_analyze(
+        "SELECT id, qty FROM orders WHERE g IN (SELECT g FROM config) OR created_at >= (SELECT cutoff FROM config)",
+    );
+    assert_eq!(
+        relevant_where(&a, "orders"),
+        "g IN (SELECT g FROM config) OR created_at >= (SELECT cutoff FROM config)"
+    );
+    assert_eq!(relevant_cols(&a, "orders"), vec!["id", "qty"]);
+}
+
+#[test]
+fn filter_on_a_null_extended_table_is_kept_only_when_the_where_rejects_null_rows() {
+    let filter_of = |from: &str, condition: &str| {
+        let a = parse_and_analyze(&format!(
+            "SELECT d.kind, COUNT(*) FROM {from} WHERE {condition} GROUP BY d.kind"
+        ));
+        (relevant_where(&a, "fact"), relevant_cols(&a, "fact"))
+    };
+    let left = "dim d LEFT JOIN fact f ON d.kind = f.kind";
+    for admitting in [
+        "f.v > 0 OR f.v IS NULL",
+        "f.kind IS NULL",
+        "COALESCE(f.v, 1) > 0",
+        "f.v IS DISTINCT FROM 1",
+        "NOT (f.v > 0)",
+        "f.v + 1 > 0",
+        "f.v IS NOT TRUE",
+    ] {
+        let (filter, columns) = filter_of(left, admitting);
+        assert_eq!(filter, "", "{admitting}");
+        assert!(
+            columns.contains(&"v".to_string()) || admitting.contains("f.kind"),
+            "{admitting}"
+        );
+    }
+    for rejecting in [
+        "f.v > 0",
+        "0 < f.v",
+        "(f.v <> 3)",
+        "f.v IN (1, 2)",
+        "f.v NOT IN (1, 2)",
+        "f.v BETWEEN 1 AND 9",
+        "f.v IS NOT NULL",
+        "f.v = d.w",
+    ] {
+        let (filter, _) = filter_of(left, &format!("{rejecting} AND abs(f.v) < 100"));
+        assert!(filter.contains("abs(v) < 100"), "{rejecting}: {filter}");
+    }
+    for (from, null_extends_fact) in [
+        ("dim d JOIN fact f ON d.kind = f.kind", false),
+        ("fact f LEFT JOIN dim d ON d.kind = f.kind", false),
+        ("fact f RIGHT JOIN dim d ON d.kind = f.kind", true),
+        ("dim d RIGHT JOIN fact f ON d.kind = f.kind", false),
+        ("dim d FULL JOIN fact f ON d.kind = f.kind", true),
+        ("fact f FULL OUTER JOIN dim d ON d.kind = f.kind", true),
+        (
+            "fact f JOIN other o ON o.kind = f.kind RIGHT JOIN dim d ON d.kind = f.kind",
+            true,
+        ),
+        ("dim d LEFT OUTER JOIN fact f ON d.kind = f.kind", true),
+    ] {
+        let (filter, columns) = filter_of(from, "f.v > 0 OR f.v IS NULL");
+        assert_eq!(filter.is_empty(), null_extends_fact, "{from}");
+        assert_eq!(
+            columns.contains(&"v".to_string()),
+            null_extends_fact,
+            "{from}"
+        );
+    }
+}
+
+#[test]
+fn filter_on_the_preserved_table_of_an_outer_join_is_kept() {
+    let a = parse_and_analyze(
+        "SELECT d.kind, COUNT(*) FROM dim d LEFT JOIN fact f ON d.kind = f.kind \
+         WHERE d.label <> 'q' OR d.label IS NULL GROUP BY d.kind",
+    );
+    assert_eq!(relevant_where(&a, "dim"), "label <> 'q' OR label IS NULL");
+    assert_eq!(relevant_cols(&a, "dim"), vec!["kind"]);
+}
+
+#[test]
+fn null_rejection_resolves_a_qualifier_through_the_alias_that_hides_a_table_name() {
+    let a = parse_and_analyze(
+        "SELECT fact.kind, COUNT(*) FROM dim AS fact LEFT JOIN fact AS f ON fact.kind = f.kind \
+         WHERE fact.kind > '' AND (f.v > 0 OR f.v IS NULL) GROUP BY fact.kind",
+    );
+    assert_eq!(relevant_where(&a, "fact"), "");
+    assert!(relevant_cols(&a, "fact").contains(&"v".to_string()));
+    assert_eq!(relevant_where(&a, "dim"), "kind > ''");
+
+    let a = parse_and_analyze(
+        "SELECT d.kind, COUNT(*) FROM dim d LEFT JOIN fact f ON d.kind = f.kind \
+         WHERE fact.v > 0 AND abs(f.v) < 9 GROUP BY d.kind",
+    );
+    assert_eq!(relevant_where(&a, "fact"), "");
+}
+
+#[test]
+fn null_rejection_accepts_the_name_of_an_unaliased_table_and_no_unqualified_column() {
+    let filter_of = |condition: &str| {
+        let a = parse_and_analyze(&format!(
+            "SELECT d.kind, COUNT(*) FROM dim d LEFT JOIN s.fact ON d.kind = fact.kind \
+             WHERE {condition} GROUP BY d.kind"
+        ));
+        relevant_where(&a, "s.fact")
+    };
+    assert!(filter_of("fact.v > 0 AND abs(fact.v) < 9").contains("abs(v) < 9"));
+    assert_eq!(filter_of("v > 0 AND abs(fact.v) < 9"), "");
+    assert_eq!(filter_of("d.kind > '' AND abs(fact.v) < 9"), "");
+}

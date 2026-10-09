@@ -1861,6 +1861,7 @@ mod tests {
     include!("tests/pg_test_v112_cte_misc.rs");
     include!("tests/pg_test_v112_types.rs");
     include!("tests/pg_test_v112_classify.rs");
+    include!("tests/pg_test_v112_subquery_writes.rs");
 }
 
 /// This module is required by `cargo pgrx test` invocations.
