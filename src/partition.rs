@@ -1321,6 +1321,11 @@ pub(crate) fn reflex_sync_partitions_impl(view_name: &str, drop_orphans: bool) -
     if let Err(msg) = crate::validate_view_name(view_name) {
         return msg.to_string();
     }
+    // Source partitions whose intermediate or target child had to be created
+    // while the child on the other side exists and holds rows: one half of the
+    // pair was lost, and an empty half next to a filled one publishes wrong
+    // aggregates on the next write. The pair is rebuilt from the source.
+    let mut recreated_beside_a_filled_sibling: Vec<String> = Vec::new();
     let outcome: Result<String, String> = Spi::connect_mut(|client| {
         // Load partition metadata.
         let meta = client
@@ -1640,6 +1645,12 @@ pub(crate) fn reflex_sync_partitions_impl(view_name: &str, drop_orphans: bool) -
                 let tgt_name = target_child_name(view_name, &node.bare_name);
                 let int_is_new = !existing_children.contains(&int_name);
                 let tgt_is_new = !existing_children.contains(&tgt_name);
+                if has_intermediate && int_is_new != tgt_is_new {
+                    let sibling = if int_is_new { &tgt_name } else { &int_name };
+                    if relation_has_rows(client, &schema_prefix(view_name, sibling)) {
+                        recreated_beside_a_filled_sibling.push(node.bare_name.clone());
+                    }
+                }
                 let ddl =
                     build_partition_node_ddl_pair(view_name, node, anchor_root_bare, unlogged);
                 let detached =
@@ -1770,7 +1781,19 @@ pub(crate) fn reflex_sync_partitions_impl(view_name: &str, drop_orphans: bool) -
         Ok(out.into_message())
     });
     match outcome {
-        Ok(s) => s,
+        Ok(synced) if recreated_beside_a_filled_sibling.is_empty() => synced,
+        Ok(synced) => {
+            let refilled = reflex_reconcile_partition_impl(
+                view_name,
+                &[],
+                &recreated_beside_a_filled_sibling.join(","),
+                true,
+            );
+            format!(
+                "{synced}; refilled recreated partition(s) {}: {refilled}",
+                recreated_beside_a_filled_sibling.join(", ")
+            )
+        }
         Err(e) => format!("ERROR: {}", e),
     }
 }
@@ -3671,6 +3694,74 @@ fn stop_after_reconcile_block(calls: &[String]) -> String {
     format!("<<reflex_imv_delta>> DECLARE _r TEXT; BEGIN {steps}END reflex_imv_delta")
 }
 
+/// The partition delta of an unpartitioned IMV applies the rows of an added
+/// partition, or removes those of a detached one, as they are when the flush
+/// runs. That equals the change the IMV misses only while no statement trigger
+/// of the source applied (or staged) a row since the partition changed: a row
+/// written through the source into the added partition would be applied twice.
+fn source_written_in_this_transaction(client: &pgrx::spi::SpiClient<'_>, source: &str) -> bool {
+    client
+        .select(
+            "SELECT COALESCE(current_setting($1, true), '') <> '' AS written",
+            Some(1),
+            &[unsafe {
+                DatumWithOid::new(
+                    crate::schema_builder::source_written_setting(source),
+                    PgBuiltInOids::TEXTOID.oid().value(),
+                )
+            }],
+        )
+        .ok()
+        .and_then(|mut rows| rows.next())
+        .and_then(|row| row.get_by_name::<bool, _>("written").ok().flatten())
+        .unwrap_or(true)
+}
+
+/// True when the pending partition change of `root` was queued by the running
+/// transaction and no flush attempted it: only then does the transaction-local
+/// record of writes cover every statement since the partitions changed.
+fn enqueued_by_this_transaction_and_never_flushed(
+    client: &pgrx::spi::SpiClient<'_>,
+    root: &str,
+) -> bool {
+    client
+        .select(
+            "SELECT failures = 0 AND last_attempt_at IS NULL \
+                    AND enqueued_at >= transaction_timestamp() AS fresh \
+             FROM public.__reflex_partition_pending WHERE source_root = $1",
+            Some(1),
+            &[
+                unsafe {
+                    DatumWithOid::new(root.to_string(), PgBuiltInOids::TEXTOID.oid().value())
+                },
+            ],
+        )
+        .ok()
+        .and_then(|mut rows| rows.next())
+        .and_then(|row| row.get_by_name::<bool, _>("fresh").ok().flatten())
+        .unwrap_or(false)
+}
+
+/// A DEFERRED flush leaves the two sides of its staged delta as session-level
+/// temporary views named like the transition tables of the source. The partition
+/// delta materialises a partition under the same names as temporary tables, which
+/// a view of that name prevents.
+fn session_temp_view_exists(client: &pgrx::spi::SpiClient<'_>, name: &str) -> bool {
+    client
+        .select(
+            "SELECT 1 FROM pg_class \
+             WHERE relname = $1 AND relkind = 'v' AND relnamespace = pg_my_temp_schema()",
+            Some(1),
+            &[
+                unsafe {
+                    DatumWithOid::new(name.to_string(), PgBuiltInOids::TEXTOID.oid().value())
+                },
+            ],
+        )
+        .map(|mut rows| rows.next().is_some())
+        .unwrap_or(false)
+}
+
 pub(crate) fn reflex_flush_partitions_impl(only: Option<&str>) -> String {
     let outcome: Result<String, String> = Spi::connect_mut(|client| {
         let (roots, capped_roots): (Vec<String>, Vec<CappedRoot>) = match only {
@@ -3765,6 +3856,8 @@ pub(crate) fn reflex_flush_partitions_impl(only: Option<&str>) -> String {
             for spelling in crate::reconcile::registered_spellings_of(root) {
                 crate::source_truncate::sync_partition_truncate_triggers(client, &spelling)
                     .map_err(|e| format!("flush: truncate trigger sync failed: {}", e))?;
+                crate::source_partition_writes::sync_partition_write_triggers(client, &spelling)
+                    .map_err(|e| format!("flush: write trigger sync failed: {}", e))?;
             }
             // Partitioned IMVs depending on this source root.
             let imvs: Vec<(String, Option<i32>, Vec<String>)> = client
@@ -3861,6 +3954,8 @@ pub(crate) fn reflex_flush_partitions_impl(only: Option<&str>) -> String {
 
             let current = current_source_leaf_oids(client, root);
             let actions = classify_partition_diff(&snapshot, &current);
+            let partitions_changed_in_this_untouched_transaction =
+                enqueued_by_this_transaction_and_never_flushed(client, root);
             let live_tree = list_partition_tree(client, root);
 
             // Collect all mutating statements for this root to run in one atomically-isolated
@@ -4014,7 +4109,10 @@ pub(crate) fn reflex_flush_partitions_impl(only: Option<&str>) -> String {
                 let mut force_reconcile = snapshot.is_empty()
                     || actions
                         .iter()
-                        .any(|(_, a)| matches!(a, PartitionDiffAction::SwapFill));
+                        .any(|(_, a)| matches!(a, PartitionDiffAction::SwapFill))
+                    || (!actions.is_empty()
+                        && (!partitions_changed_in_this_untouched_transaction
+                            || source_written_in_this_transaction(client, &source)));
 
                 let mut delta_stmts: Vec<String> = Vec::new();
                 if !force_reconcile {
@@ -4080,6 +4178,12 @@ pub(crate) fn reflex_flush_partitions_impl(only: Option<&str>) -> String {
                     ));
                     summary.push(format!("{}: full reconcile (unpartitioned)", imv));
                 } else if !delta_stmts.is_empty() {
+                    for transition in [&trans_new, &trans_old] {
+                        if session_temp_view_exists(client, transition) {
+                            root_stmts
+                                .push(format!("DROP VIEW IF EXISTS pg_temp.\"{transition}\""));
+                        }
+                    }
                     root_stmts.push(stop_after_reconcile_block(&delta_stmts));
                     summary.push(format!(
                         "{}: incremental partition delta ({} change(s))",

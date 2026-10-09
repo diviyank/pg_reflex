@@ -42,6 +42,7 @@ mod query_decomposer;
 mod rebuild_diff;
 mod reconcile;
 mod schema_builder;
+mod source_partition_writes;
 mod source_truncate;
 mod sql_analyzer;
 mod sql_writer;
@@ -1865,6 +1866,7 @@ mod tests {
     include!("tests/pg_test_v112_subquery_writes.rs");
     include!("tests/pg_test_v112_deferred_partition.rs");
     include!("tests/pg_test_v112_shapes.rs");
+    include!("tests/pg_test_v112_partition_dml.rs");
 }
 
 /// This module is required by `cargo pgrx test` invocations.
