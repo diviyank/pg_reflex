@@ -796,6 +796,79 @@ fn v112_cl_set_returning_function_elsewhere_keeps_the_key() {
     );
 }
 
+#[pg_test]
+fn v112_cl_scalar_call_beside_a_set_returning_namesake_keeps_the_key() {
+    Spi::run(
+        "CREATE SCHEMA v112_cl_srfns; CREATE SCHEMA v112_cl_srfhidden; \
+         CREATE FUNCTION v112_cl_srfns.gt(int) RETURNS int LANGUAGE sql IMMUTABLE AS 'SELECT $1 + 1'; \
+         CREATE FUNCTION v112_cl_srfns.gt() RETURNS SETOF int LANGUAGE sql IMMUTABLE AS 'SELECT 1'; \
+         CREATE FUNCTION v112_cl_srfhidden.upper(text) RETURNS SETOF text LANGUAGE sql IMMUTABLE \
+             AS 'SELECT $1 UNION ALL SELECT $1'; \
+         CREATE FUNCTION v112_cl_srfhidden.array_length(anyarray, int) RETURNS SETOF int \
+             LANGUAGE sql IMMUTABLE AS 'SELECT 1'",
+    )
+    .expect("functions");
+    for (tag, select, key) in [
+        ("srf_overload", "SELECT id, v112_cl_srfns.gt(id) AS tags FROM {src}", ""),
+        ("srf_overload_keyed", "SELECT id, v112_cl_srfns.gt(id) AS tags FROM {src}", "id"),
+        ("srf_other_schema", "SELECT id, upper(g) AS ug, array_length(arr, 1) AS n FROM {src}", ""),
+        ("srf_other_schema_keyed", "SELECT id, upper(g) AS ug FROM {src}", "id"),
+        ("srf_quoted", "SELECT id, \"upper\"(g) AS ug, pg_catalog.lower(g) AS lg FROM {src}", ""),
+    ] {
+        assert_eq!(v112_cl_arr(tag, select, key, "IMMEDIATE"), "ok", "{select}");
+        assert_eq!(v112_cl_unique_key(tag), "id", "{select}");
+    }
+}
+
+#[pg_test]
+fn v112_cl_set_returning_call_resolved_by_schema_or_search_path_is_keyless() {
+    Spi::run(
+        "CREATE SCHEMA v112_cl_srfq; \
+         CREATE FUNCTION v112_cl_srfq.twice(int) RETURNS SETOF int LANGUAGE sql IMMUTABLE \
+             AS 'SELECT $1 UNION ALL SELECT $1 + 100'; \
+         CREATE FUNCTION v112_cl_twice_public(int) RETURNS SETOF int LANGUAGE sql IMMUTABLE \
+             AS 'SELECT $1 UNION ALL SELECT $1 + 100'",
+    )
+    .expect("functions");
+    for (tag, select) in [
+        ("srf_qualified", "SELECT id, v112_cl_srfq.twice(id) AS e FROM {src}"),
+        ("srf_search_path", "SELECT id, V112_CL_TWICE_PUBLIC(id) AS e FROM {src}"),
+    ] {
+        assert_eq!(v112_cl_arr(tag, select, "", "IMMEDIATE"), "ok", "{select}");
+        assert_eq!(v112_cl_unique_key(tag), "", "{select}");
+    }
+    let keyed = v112_cl_arr("srf_qualified_keyed", "SELECT id, v112_cl_srfq.twice(id) AS e FROM {src}", "id,e", "IMMEDIATE");
+    v112_cl_assert_rejected("srf_qualified_keyed", &keyed, "set-returning function");
+}
+
+#[pg_test]
+fn v112_cl_set_returning_overload_beside_a_scalar_one_of_the_same_arity_is_keyless() {
+    Spi::run(
+        "CREATE FUNCTION v112_cl_hidden(int) RETURNS SETOF int LANGUAGE sql IMMUTABLE \
+             AS 'SELECT $1 UNION ALL SELECT $1 + 100'; \
+         CREATE FUNCTION v112_cl_hidden(text) RETURNS int LANGUAGE sql IMMUTABLE AS 'SELECT 1'; \
+         CREATE FUNCTION v112_cl_hidden_late(int) RETURNS SETOF int LANGUAGE sql IMMUTABLE \
+             AS 'SELECT i FROM generate_series(1, CASE WHEN $1 > 3 THEN 2 ELSE 1 END) AS i'; \
+         CREATE FUNCTION v112_cl_hidden_late(text) RETURNS int LANGUAGE sql IMMUTABLE AS 'SELECT 1'",
+    )
+    .expect("functions");
+    for (tag, select, mode) in [
+        ("srf_hidden", "SELECT id, v112_cl_hidden(id) AS e FROM {src}", "IMMEDIATE"),
+        ("srf_hidden_late_i", "SELECT id, v112_cl_hidden_late(id) AS e FROM {src}", "IMMEDIATE"),
+        ("srf_hidden_late_d", "SELECT id, v112_cl_hidden_late(id) AS e FROM {src}", "DEFERRED"),
+    ] {
+        assert_eq!(v112_cl_arr(tag, select, "", mode), "ok", "{select} {mode}");
+        assert_eq!(v112_cl_unique_key(tag), "", "{select} {mode}");
+    }
+    let keyed = v112_cl_arr(
+        "srf_hidden_keyed",
+        "SELECT id, v112_cl_hidden_late(id) AS e FROM {src}",
+        "id",
+        "DEFERRED",
+    );
+    v112_cl_assert_rejected("srf_hidden_keyed", &keyed, "set-returning function");
+}
+
 // ---- window functions read the base sub-IMV ----
 
 #[pg_test]

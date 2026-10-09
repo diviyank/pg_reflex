@@ -451,7 +451,6 @@ fn check_function_contract(
         volatile_signatures,
         alterable_volatile_signatures,
         aggregates,
-        set_returning,
     } = catalog_function_kinds(&analysis.function_references);
     if !volatile_signatures.is_empty() {
         let builtin_signatures: Vec<String> = volatile_signatures
@@ -503,13 +502,64 @@ fn check_function_contract(
     }
     Ok(FunctionContract {
         keyless_only_aggregates: unsupported,
-        set_returning_select_functions: analysis
-            .select_list_functions
-            .iter()
-            .filter(|name| set_returning.contains(name))
-            .cloned()
-            .collect(),
+        set_returning_select_functions: set_returning_calls(&analysis.select_list_calls),
     })
+}
+
+/// Those of `calls` that may run a set-returning function: one of the functions the call
+/// could resolve to returns a set. The candidates are the functions of that name taking
+/// that many arguments, in the schema the call names or, unqualified, on the
+/// `search_path`. Argument types are unknown here, so a scalar function among such
+/// candidates does not clear the call: keyed on the source key, a set-returning one would
+/// leave a DEFERRED IMV stale without an error.
+fn set_returning_calls(calls: &[crate::sql_analyzer::WrittenCall]) -> Vec<String> {
+    if calls.is_empty() {
+        return Vec::new();
+    }
+    let text_array = |values: Vec<String>| unsafe {
+        DatumWithOid::new(
+            crate::sql_writer::identifier::format_pg_text_array(&values),
+            PgBuiltInOids::TEXTOID.oid().value(),
+        )
+    };
+    let schemas = calls.iter().map(|c| c.schema.clone().unwrap_or_default());
+    let names = calls.iter().map(|c| c.name.clone());
+    let arg_counts = calls.iter().map(|c| c.arg_count.to_string());
+    let set_returning_positions: Vec<i64> = Spi::connect(|client| {
+        client
+            .select(
+                "SELECT called.position \
+                 FROM unnest($1::text[], $2::text[], $3::text[]) WITH ORDINALITY \
+                      AS called(schema_name, name, arg_count, position) \
+                 JOIN pg_catalog.pg_proc p ON p.proname::text = called.name \
+                 JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace \
+                 WHERE CASE WHEN called.schema_name = '' \
+                            THEN n.nspname = ANY(current_schemas(true)) \
+                            ELSE n.nspname::text = called.schema_name END \
+                   AND (p.pronargs = called.arg_count::int \
+                        OR (p.provariadic <> 0 AND called.arg_count::int >= p.pronargs - 1) \
+                        OR called.arg_count::int BETWEEN p.pronargs - p.pronargdefaults \
+                                                     AND p.pronargs) \
+                 GROUP BY called.position HAVING bool_or(p.proretset) ORDER BY 1",
+                None,
+                &[
+                    text_array(schemas.collect()),
+                    text_array(names.collect()),
+                    text_array(arg_counts.collect()),
+                ],
+            )
+            .unwrap_or_report()
+            .filter_map(|row| row.get_by_name::<i64, _>("position").unwrap_or(None))
+            .collect()
+    });
+    set_returning_positions
+        .into_iter()
+        .filter_map(|position| calls.get(position as usize - 1))
+        .map(|call| match &call.schema {
+            Some(schema) => format!("{schema}.{}", call.name),
+            None => call.name.clone(),
+        })
+        .collect()
 }
 
 /// Column references that PostgreSQL resolves as a call `function(row)`: the qualifier
@@ -723,8 +773,6 @@ fn ungrouped_non_aggregate_column(ctx: &BuildContext) -> Option<String> {
 }
 
 struct CatalogFunctionKinds {
-    /// Bare names with at least one set-returning function among the matched ones.
-    set_returning: Vec<String>,
     /// Bare names with at least one volatile plain function among the matched ones.
     volatile: Vec<String>,
     /// Those volatile functions as `regprocedure` text: quoted and schema-qualified
@@ -750,7 +798,6 @@ fn catalog_function_kinds(
         volatile_signatures: Vec::new(),
         alterable_volatile_signatures: Vec::new(),
         aggregates: Vec::new(),
-        set_returning: Vec::new(),
     };
     if called.is_empty() {
         return kinds;
@@ -779,7 +826,6 @@ fn catalog_function_kinds(
                 "SELECT lower(p.proname::text COLLATE \"C\") AS name, \
                         bool_or(p.prokind = 'f' AND p.provolatile = 'v') AS is_volatile, \
                         bool_or(p.prokind = 'a') AND NOT bool_or(p.prokind = 'f') AS is_aggregate_only, \
-                        bool_or(p.proretset) AS returns_set, \
                         COALESCE(array_agg(p.oid::regprocedure::text ORDER BY p.oid::regprocedure::text) \
                                    FILTER (WHERE p.prokind = 'f' AND p.provolatile = 'v'), \
                                  '{}'::text[]) AS volatile_signatures, \
@@ -811,9 +857,6 @@ fn catalog_function_kinds(
             };
             if row.get_by_name::<bool, _>("is_volatile").unwrap_or(None) == Some(true) {
                 kinds.volatile.push(name.clone());
-            }
-            if row.get_by_name::<bool, _>("returns_set").unwrap_or(None) == Some(true) {
-                kinds.set_returning.push(name.clone());
             }
             if row
                 .get_by_name::<bool, _>("is_aggregate_only")
