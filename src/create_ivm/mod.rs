@@ -658,18 +658,15 @@ fn keyed_passthrough_aggregate(ctx: &BuildContext) -> Option<String> {
     ))
 }
 
-/// Two output columns the result table would have to hold under one name.
+/// Two output columns PostgreSQL gives the same name, which the result table would have
+/// to hold twice.
 fn repeated_output_column(analysis: &crate::sql_analyzer::SqlAnalysis) -> Option<String> {
     let mut seen = std::collections::HashSet::new();
     analysis
-        .select_columns
+        .named_outputs
         .iter()
-        .filter_map(|col| match &col.alias {
-            Some(alias) => Some(normalized_column_name(alias)),
-            None => crate::sql_analyzer::is_bare_column_reference(&col.expr_sql)
-                .then(|| normalized_column_name(&col.expr_sql)),
-        })
-        .find(|name| !seen.insert(name.clone()))
+        .find(|name| !seen.insert(name.as_str()))
+        .cloned()
 }
 
 /// Two grouping keys (GROUP BY columns, or the columns of a SELECT DISTINCT) the

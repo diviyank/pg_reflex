@@ -396,6 +396,9 @@ pub struct SqlAnalysis {
     /// Bare lower-case names of the functions called in the top-level SELECT list,
     /// outside subqueries and window functions.
     pub select_list_functions: Vec<String>,
+    /// The name PostgreSQL gives each output column that has one by the query's text: an
+    /// alias, or the column of a bare column reference. One entry per such select item.
+    pub named_outputs: Vec<String>,
     /// SELECT items PostgreSQL refuses as grouping keys (see
     /// `is_constant_refused_as_group_key`).
     pub constants_refused_as_group_key: Vec<String>,
@@ -859,6 +862,25 @@ fn called_function_names(expr: &Expr) -> Vec<String> {
         false
     });
     names.into_inner()
+}
+
+/// The column a select item is when it is a bare, optionally qualified and optionally
+/// parenthesised, column reference.
+fn referenced_column(expr: &Expr) -> Option<&Ident> {
+    match expr {
+        Expr::Nested(inner) => referenced_column(inner),
+        Expr::Identifier(column) => Some(column),
+        Expr::CompoundIdentifier(parts) => parts.last(),
+        _ => None,
+    }
+}
+
+fn record_output_name(analysis: &mut SqlAnalysis, expr: &Expr, alias: Option<&Ident>) {
+    let column = referenced_column(expr).map(folded);
+    let output = alias.map(folded).or_else(|| column.clone());
+    if let Some(output) = output {
+        analysis.named_outputs.push(output);
+    }
 }
 
 pub fn detect_aggregate(func_name: &str) -> Option<AggregateKind> {
@@ -2093,9 +2115,11 @@ pub fn analyze(statements: &[Statement]) -> Result<SqlAnalysis, SqlAnalysisError
     for item in &select.projection {
         match item {
             SelectItem::UnnamedExpr(expr) => {
+                record_output_name(&mut analysis, expr, None);
                 push_select_column(&mut analysis, expr, None);
             }
             SelectItem::ExprWithAlias { expr, alias } => {
+                record_output_name(&mut analysis, expr, Some(alias));
                 push_select_column(&mut analysis, expr, Some(alias.to_string()));
             }
             SelectItem::Wildcard(_) => {
