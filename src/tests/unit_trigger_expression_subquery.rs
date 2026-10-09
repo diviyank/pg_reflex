@@ -119,3 +119,32 @@ fn end_query_that_does_not_read_the_source_keeps_the_scoped_delta() {
         }
     }
 }
+
+#[test]
+fn having_and_expression_subqueries_share_one_end_query_decision() {
+    use crate::trigger::end_query_reads_source;
+    let plain = "SELECT \"g\", \"__sum_v\" AS \"sv\" FROM \"__reflex_intermediate_x\" WHERE __ivm_count > 0";
+    let having = format!("{plain} AND \"__sum_v\" > (SELECT max(v) FROM public.s)");
+    let over_aggregate = "SELECT \"g\", (\"__sum_v\" + (SELECT max(v) FROM s))::BIGINT AS \"x\" FROM \"__reflex_intermediate_x\" WHERE __ivm_count > 0";
+    for (end_query, source, reads) in [
+        (plain, "public.s", false),
+        (having.as_str(), "public.s", true),
+        (having.as_str(), "\"public\".\"s\"", true),
+        (having.as_str(), "public.o", false),
+        (over_aggregate, "s", true),
+        ("SELECT FROM WHERE s (", "s", true),
+        ("SELECT FROM WHERE sums (", "s", false),
+        ("", "s", false),
+    ] {
+        assert_eq!(
+            end_query_reads_source(end_query, source),
+            reads,
+            "{end_query} / {source}"
+        );
+        assert_eq!(
+            imv_reads_source_by_expression_subquery("SELECT 1 FROM a", end_query, source),
+            reads,
+            "{end_query} / {source}"
+        );
+    }
+}

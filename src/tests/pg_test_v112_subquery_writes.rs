@@ -765,6 +765,31 @@ v112_sq_deferred_cells! { V112_SQ_DEFERRED_CHAIN, V112_SQ_NULL_EXTENDED_CHAIN, N
 }
 
 // ---------------------------------------------------------------------------
+// A comment inside the join keyword
+// ---------------------------------------------------------------------------
+
+v112_sq_cells! { V112_SQ_NULL_EXTENDED_CHAIN, None, false;
+    v112_sq_comment_lj_admits_null => "SELECT d.kind, COUNT(*) AS c, SUM(f.v) AS s FROM {d} d LEFT /* c */ JOIN {f} f ON d.kind = f.kind WHERE f.v > 0 OR f.v IS NULL GROUP BY d.kind",
+    v112_sq_comment_lj_rejects_null_by_label => "SELECT d.label, COUNT(*) AS c, SUM(f.v) AS s FROM {d} d LEFT /* c */ OUTER -- c\n JOIN {f} f ON d.kind = f.kind WHERE f.v > 0 GROUP BY d.label",
+    v112_sq_comment_lj_pt_admits_null => "SELECT d.kind, d.label, f.id, f.v FROM {d} d LEFT /* c */ JOIN {f} f ON d.kind = f.kind WHERE f.v > 0 OR f.v IS NULL",
+    v112_sq_comment_lj_pt_only_null => "SELECT d.kind, d.label FROM {d} d LEFT /* RIGHT JOIN */ JOIN {f} f ON d.kind = f.kind WHERE f.id IS NULL",
+    v112_sq_comment_rj_pt_only_null => "SELECT d.kind, d.label FROM {f} f RIGHT /* c */ JOIN {d} d ON d.kind = f.kind WHERE f.id IS NULL",
+    v112_sq_comment_fj_rejects_null => "SELECT d.kind, COUNT(*) AS c, SUM(f.v) AS s FROM {d} d FULL /* c */ JOIN {f} f ON d.kind = f.kind WHERE f.v > 0 GROUP BY d.kind",
+    v112_sq_comment_fj_pt_admits_null => "SELECT d.kind, d.label, f.id, f.v FROM {d} d FULL /* c */ OUTER /* c */ JOIN {f} f ON d.kind = f.kind WHERE f.v > 0 OR f.v IS NULL",
+    v112_sq_comment_chain_other_null_by_label => "SELECT d.label, COUNT(*) AS c, SUM(f.v) AS s FROM {d} d LEFT /* c */ JOIN {f} f ON d.kind = f.kind LEFT /* c */ JOIN {o} o ON o.kind = f.kind WHERE o.w IS NULL GROUP BY d.label",
+    v112_sq_comment_chain_other_rejects_null => "SELECT d.kind, COUNT(*) AS c, SUM(f.v) AS s FROM {d} d LEFT /* c */ JOIN {f} f ON d.kind = f.kind LEFT -- c\n JOIN {o} o ON o.kind = f.kind WHERE o.w > 1 GROUP BY d.kind",
+    v112_sq_comment_chain_pt_other_null => "SELECT d.label, f.id, f.v, o.w FROM {d} d LEFT /* c */ JOIN {f} f ON d.kind = f.kind LEFT /* c */ JOIN {o} o ON o.kind = f.kind WHERE o.w IS NULL",
+}
+
+v112_sq_deferred_cells! { V112_SQ_DEFERRED_COMMENT, V112_SQ_NULL_EXTENDED_CHAIN, None;
+    v112_sq_comment_lj_admits_null_deferred => "SELECT d.kind, COUNT(*) AS c, SUM(f.v) AS s FROM {d} d LEFT /* c */ JOIN {f} f ON d.kind = f.kind WHERE f.v > 0 OR f.v IS NULL GROUP BY d.kind",
+    v112_sq_comment_lj_pt_only_null_deferred => "SELECT d.kind, d.label FROM {d} d LEFT /* RIGHT JOIN */ JOIN {f} f ON d.kind = f.kind WHERE f.id IS NULL",
+    v112_sq_comment_rj_pt_only_null_deferred => "SELECT d.kind, d.label FROM {f} f RIGHT /* c */ JOIN {d} d ON d.kind = f.kind WHERE f.id IS NULL",
+    v112_sq_comment_fj_pt_admits_null_deferred => "SELECT d.kind, d.label, f.id, f.v FROM {d} d FULL /* c */ OUTER /* c */ JOIN {f} f ON d.kind = f.kind WHERE f.v > 0 OR f.v IS NULL",
+    v112_sq_comment_chain_other_null_by_label_deferred => "SELECT d.label, COUNT(*) AS c, SUM(f.v) AS s FROM {d} d LEFT /* c */ JOIN {f} f ON d.kind = f.kind LEFT /* c */ JOIN {o} o ON o.kind = f.kind WHERE o.w IS NULL GROUP BY d.label",
+}
+
+// ---------------------------------------------------------------------------
 // An alias equal to the name of the null-extended table
 // ---------------------------------------------------------------------------
 
@@ -931,5 +956,6 @@ fn v112_sq_commit_path() {
         &V112_SQ_DEFERRED_OUTSIDE,
         &V112_SQ_DEFERRED_CHAIN,
         &V112_SQ_DEFERRED_ALIAS,
+        &V112_SQ_DEFERRED_COMMENT,
     ]);
 }

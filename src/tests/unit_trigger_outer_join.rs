@@ -138,3 +138,20 @@ fn filter_on_a_table_not_joined_through_the_source_does_not_filter_it() {
         assert!(!left_joined_source_is_filtered(query, "f"), "{query}");
     }
 }
+
+#[test]
+fn comment_inside_a_join_keyword_does_not_change_the_filter_decision() {
+    for query in [
+        "SELECT d.l, COUNT(*) FROM d LEFT /* c */ JOIN f ON d.k = f.k LEFT /* c */ JOIN o ON o.k = f.k WHERE o.w IS NULL GROUP BY d.l",
+        "SELECT d.l, COUNT(*) FROM d LEFT -- c\n OUTER /* c */ JOIN f ON d.k = f.k WHERE f.v > 0 GROUP BY d.l",
+        "SELECT d.l, COUNT(*) FROM d LEFT /* c */ JOIN f ON d.k = f.k INNER /* LEFT JOIN */ JOIN o ON o.k = f.k GROUP BY d.l",
+    ] {
+        assert!(left_joined_source_is_filtered(query, "f"), "{query}");
+    }
+    for query in [
+        "SELECT d.l, COUNT(*) FROM d LEFT /* c */ JOIN f ON d.k = f.k LEFT /* INNER */ JOIN o ON o.k = f.k GROUP BY d.l",
+        "SELECT d.l, COUNT(*) FROM d LEFT /* c */ JOIN f ON d.k = f.k LEFT /* c */ JOIN o ON o.k = d.k WHERE o.w IS NULL GROUP BY d.l",
+    ] {
+        assert!(!left_joined_source_is_filtered(query, "f"), "{query}");
+    }
+}
