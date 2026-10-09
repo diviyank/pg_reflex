@@ -1066,6 +1066,11 @@ fn v112_cl_row_function_in_attribute_notation_is_rejected() {
         "SELECT id, t.v112_cl_rowimm AS x FROM v112_cl_rowfn_src t",
         "SELECT id, v FROM v112_cl_rowfn_src t WHERE t.v112_cl_rowimm > 1",
         "SELECT t.V112_CL_ROWIMM AS x, COUNT(*) AS c FROM v112_cl_rowfn_src t GROUP BY t.V112_CL_ROWIMM",
+        "SELECT id, public.v112_cl_rowfn_src.v112_cl_rowimm AS x FROM public.v112_cl_rowfn_src",
+        "SELECT id, v FROM v112_cl_rowfn_src t1 WHERE (t1.*).v112_cl_rowimm > 1",
+        "SELECT id, (public.v112_cl_rowfn_src).v112_cl_rowvol AS x FROM public.v112_cl_rowfn_src",
+        "SELECT d.id FROM (SELECT id, t.v112_cl_rowimm AS x FROM v112_cl_rowfn_src t) AS t JOIN v112_cl_rowfn_src d ON d.id = t.id",
+        "SELECT id, (SELECT s.v112_cl_rowimm FROM v112_cl_rowfn_src s WHERE s.id = o.id) AS x FROM v112_cl_rowfn_src o",
     ]
     .iter()
     .enumerate()
@@ -1101,4 +1106,42 @@ fn v112_cl_column_named_like_a_row_function_is_accepted() {
         ),
         "ok"
     );
+}
+
+#[pg_test]
+fn v112_cl_column_of_a_derived_table_or_cte_named_like_a_row_function_is_accepted() {
+    Spi::run(
+        "CREATE TABLE v112_cl_rowder_src(id SERIAL PRIMARY KEY, v INT); \
+         INSERT INTO v112_cl_rowder_src(v) VALUES (1),(2); \
+         CREATE FUNCTION v112_cl_rowder_h(v112_cl_rowder_src) RETURNS int LANGUAGE sql IMMUTABLE \
+             AS 'SELECT $1.v + 1'",
+    )
+    .expect("fixture");
+    for (position, select) in [
+        "SELECT v112_cl_rowder_src.id, v112_cl_rowder_src.v112_cl_rowder_h \
+         FROM (SELECT id, v AS v112_cl_rowder_h FROM v112_cl_rowder_src) AS v112_cl_rowder_src",
+        "SELECT x.id, x.v112_cl_rowder_h FROM (SELECT id, v AS v112_cl_rowder_h FROM v112_cl_rowder_src) AS x",
+        "WITH v112_cl_rowder_src AS (SELECT id, v AS v112_cl_rowder_h FROM public.v112_cl_rowder_src) \
+         SELECT v112_cl_rowder_src.id, v112_cl_rowder_src.v112_cl_rowder_h FROM v112_cl_rowder_src",
+    ]
+    .iter()
+    .enumerate()
+    {
+        assert_eq!(
+            v112_cl_cell(
+                &format!("v112_cl_rowder{position}"),
+                select,
+                "",
+                "IMMEDIATE",
+                &[],
+                &[
+                    "INSERT INTO v112_cl_rowder_src(v) VALUES (5)".to_string(),
+                    "UPDATE v112_cl_rowder_src SET v = v + 1 WHERE id = 1".to_string(),
+                    "DELETE FROM v112_cl_rowder_src WHERE id = 2".to_string(),
+                ],
+            ),
+            "ok",
+            "{select}"
+        );
+    }
 }

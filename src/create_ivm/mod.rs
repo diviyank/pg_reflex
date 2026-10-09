@@ -173,7 +173,7 @@ fn validate_and_parse_inputs(
                 Ok(contract) => contract,
                 Err(reason) => return Err(crate::reflex_reject(&reason)),
             };
-            if let Some(call) = attribute_notation_calls(&parsed_sql, &a).first() {
+            if let Some(call) = attribute_notation_calls(&parsed_sql).first() {
                 return Err(crate::reflex_reject(&format!(
                     "'{call}' calls a function in attribute notation (the function takes the \
                      row of the table), which pg_reflex cannot maintain. Fix: store the value \
@@ -562,85 +562,227 @@ fn set_returning_calls(calls: &[crate::sql_analyzer::WrittenCall]) -> Vec<String
         .collect()
 }
 
-/// Column references that PostgreSQL resolves as a call `function(row)`: the qualifier
-/// names a source table that has no such column and a one-argument function over its
-/// row type does. Returned as the query writes them.
-fn attribute_notation_calls(
-    statements: &[sqlparser::ast::Statement],
-    analysis: &crate::sql_analyzer::SqlAnalysis,
-) -> Vec<String> {
-    use sqlparser::ast::{AccessExpr, Expr, Visit, Visitor};
-    use std::ops::ControlFlow;
+/// What a qualifier names in the FROM clause of one query level.
+#[derive(Clone)]
+enum FromBinding {
+    /// A table, as the query writes it. Only one written without an alias answers to
+    /// its schema-qualified name.
+    Relation { written: String, has_alias: bool },
+    /// A derived table, a CTE or a function: its row type is not a table's.
+    NotATable,
+}
 
-    #[derive(Default)]
-    struct QualifiedReferences(Vec<(String, String, String)>);
-    impl Visitor for QualifiedReferences {
-        type Break = ();
+/// The FROM bindings of each query level being visited, innermost last, and the CTE
+/// names each level declares.
+#[derive(Default)]
+struct RowFunctionCandidates {
+    from_bindings: Vec<std::collections::HashMap<String, Vec<FromBinding>>>,
+    cte_names: Vec<Vec<String>>,
+    /// (table as written, schema the reference names or "", name, reference as written)
+    found: Vec<(String, String, String, String)>,
+}
 
-        fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<()> {
-            let parts = match expr {
-                Expr::CompoundIdentifier(parts) if parts.len() == 2 => Some((&parts[0], &parts[1])),
-                Expr::CompoundFieldAccess { root, access_chain } => {
-                    let mut qualifier = root.as_ref();
-                    while let Expr::Nested(inner) = qualifier {
-                        qualifier = inner;
-                    }
-                    match (qualifier, access_chain.as_slice()) {
-                        (Expr::Identifier(table), [AccessExpr::Dot(Expr::Identifier(name))]) => {
-                            Some((table, name))
-                        }
-                        _ => None,
+impl RowFunctionCandidates {
+    fn bind_set_expr(&mut self, body: &sqlparser::ast::SetExpr) {
+        use sqlparser::ast::SetExpr;
+        match body {
+            SetExpr::Select(select) => {
+                for table in &select.from {
+                    self.bind_factor(&table.relation);
+                    for join in &table.joins {
+                        self.bind_factor(&join.relation);
                     }
                 }
-                _ => None,
-            };
-            if let Some((qualifier, name)) = parts {
-                self.0.push((
-                    crate::sql_analyzer::folded(qualifier),
-                    crate::sql_analyzer::folded(name),
-                    expr.to_string(),
-                ));
             }
-            ControlFlow::Continue(())
+            SetExpr::SetOperation { left, right, .. } => {
+                self.bind_set_expr(left);
+                self.bind_set_expr(right);
+            }
+            _ => {}
         }
-    }
-    let mut references = QualifiedReferences::default();
-    for statement in statements {
-        let _ = statement.visit(&mut references);
     }
 
-    let source_named = |qualifier: &str| {
-        let aliased = analysis
-            .table_aliases
-            .iter()
-            .find(|(alias, _)| normalized_column_name(alias) == qualifier)
-            .map(|(_, table)| table.clone());
-        aliased.or_else(|| {
-            analysis
-                .sources
-                .iter()
-                .find(|source| {
-                    !source.starts_with('<') && normalized_column_name(source) == qualifier
-                })
-                .cloned()
-        })
-    };
-    let mut relations = Vec::new();
-    let mut names = Vec::new();
-    let mut written = Vec::new();
-    for (qualifier, name, text) in references.0 {
-        if let Some(relation) = source_named(&qualifier) {
-            relations.push(relation);
-            names.push(name);
-            written.push(text);
+    fn bind_factor(&mut self, factor: &sqlparser::ast::TableFactor) {
+        use crate::sql_analyzer::folded;
+        use sqlparser::ast::TableFactor;
+        let (qualifier, binding) = match factor {
+            TableFactor::Table {
+                name, alias, args, ..
+            } => {
+                let table = name.0.last().and_then(|part| part.as_ident()).map(folded);
+                let names_a_cte = name.0.len() == 1
+                    && table
+                        .as_ref()
+                        .is_some_and(|table| self.cte_names.iter().flatten().any(|c| c == table));
+                let binding = if args.is_some() || names_a_cte {
+                    FromBinding::NotATable
+                } else {
+                    FromBinding::Relation {
+                        written: name.to_string(),
+                        has_alias: alias.is_some(),
+                    }
+                };
+                (alias.as_ref().map(|a| folded(&a.name)).or(table), binding)
+            }
+            TableFactor::NestedJoin {
+                table_with_joins,
+                alias,
+            } => {
+                self.bind_factor(&table_with_joins.relation);
+                for join in &table_with_joins.joins {
+                    self.bind_factor(&join.relation);
+                }
+                (
+                    alias.as_ref().map(|a| folded(&a.name)),
+                    FromBinding::NotATable,
+                )
+            }
+            TableFactor::Derived { alias, .. }
+            | TableFactor::TableFunction { alias, .. }
+            | TableFactor::Function { alias, .. }
+            | TableFactor::UNNEST { alias, .. } => (
+                alias.as_ref().map(|a| folded(&a.name)),
+                FromBinding::NotATable,
+            ),
+            _ => (None, FromBinding::NotATable),
+        };
+        if let (Some(qualifier), Some(level)) = (qualifier, self.from_bindings.last_mut()) {
+            level.entry(qualifier).or_default().push(binding);
         }
     }
-    if relations.is_empty() {
+
+    /// The tables `qualifier` can only name at the innermost level that binds it. A
+    /// level that also binds it to something that is not a table settles nothing.
+    fn tables_named(&self, qualifier: &str) -> Vec<(String, bool)> {
+        let Some(bindings) = self
+            .from_bindings
+            .iter()
+            .rev()
+            .find_map(|level| level.get(qualifier))
+        else {
+            return Vec::new();
+        };
+        let mut tables = Vec::new();
+        for binding in bindings {
+            match binding {
+                FromBinding::Relation { written, has_alias } => {
+                    tables.push((written.clone(), *has_alias))
+                }
+                FromBinding::NotATable => return Vec::new(),
+            }
+        }
+        tables
+    }
+
+    fn record(
+        &mut self,
+        schema: Option<&sqlparser::ast::Ident>,
+        table: &str,
+        name: &str,
+        text: &str,
+    ) {
+        for (written, has_alias) in self.tables_named(table) {
+            // PostgreSQL matches `schema.table` against unaliased FROM items only.
+            if schema.is_some() && has_alias {
+                continue;
+            }
+            self.found.push((
+                written,
+                schema.map(crate::sql_analyzer::folded).unwrap_or_default(),
+                name.to_string(),
+                text.to_string(),
+            ));
+        }
+    }
+}
+
+impl sqlparser::ast::Visitor for RowFunctionCandidates {
+    type Break = ();
+
+    fn pre_visit_query(&mut self, query: &sqlparser::ast::Query) -> std::ops::ControlFlow<()> {
+        let declared = query.with.iter().flat_map(|with| &with.cte_tables);
+        self.cte_names.push(
+            declared
+                .map(|cte| crate::sql_analyzer::folded(&cte.alias.name))
+                .collect(),
+        );
+        self.from_bindings.push(Default::default());
+        self.bind_set_expr(&query.body);
+        std::ops::ControlFlow::Continue(())
+    }
+
+    fn post_visit_query(&mut self, _: &sqlparser::ast::Query) -> std::ops::ControlFlow<()> {
+        self.cte_names.pop();
+        self.from_bindings.pop();
+        std::ops::ControlFlow::Continue(())
+    }
+
+    fn pre_visit_expr(&mut self, expr: &sqlparser::ast::Expr) -> std::ops::ControlFlow<()> {
+        use crate::sql_analyzer::folded;
+        use sqlparser::ast::{AccessExpr, Expr};
+        let text = expr.to_string();
+        match expr {
+            Expr::CompoundIdentifier(parts) => match parts.as_slice() {
+                [table, name] => self.record(None, &folded(table), &folded(name), &text),
+                [schema, table, name] => {
+                    self.record(Some(schema), &folded(table), &folded(name), &text)
+                }
+                _ => {}
+            },
+            Expr::CompoundFieldAccess { root, access_chain } => {
+                let [AccessExpr::Dot(Expr::Identifier(name))] = access_chain.as_slice() else {
+                    return std::ops::ControlFlow::Continue(());
+                };
+                let mut row = root.as_ref();
+                while let Expr::Nested(inner) = row {
+                    row = inner;
+                }
+                let qualifier: Vec<&sqlparser::ast::Ident> = match row {
+                    Expr::Identifier(table) => vec![table],
+                    Expr::CompoundIdentifier(parts) => parts.iter().collect(),
+                    Expr::QualifiedWildcard(table, _) => {
+                        table.0.iter().filter_map(|part| part.as_ident()).collect()
+                    }
+                    _ => Vec::new(),
+                };
+                match qualifier.as_slice() {
+                    [table] => self.record(None, &folded(table), &folded(name), &text),
+                    // `(t.c).name` reads a field of the column `c` when `t` is in scope.
+                    [schema, table] if self.tables_named(&folded(schema)).is_empty() => {
+                        self.record(Some(schema), &folded(table), &folded(name), &text)
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+        std::ops::ControlFlow::Continue(())
+    }
+}
+
+/// Column references that PostgreSQL resolves as a call `function(row)`: the qualifier
+/// names a table in the FROM clause in scope, that table has no such column, and a
+/// one-argument function over its row type does. Returned as the query writes them.
+fn attribute_notation_calls(statements: &[sqlparser::ast::Statement]) -> Vec<String> {
+    use sqlparser::ast::Visit;
+
+    let mut candidates = RowFunctionCandidates::default();
+    for statement in statements {
+        let _ = statement.visit(&mut candidates);
+    }
+    if candidates.found.is_empty() {
         return Vec::new();
     }
-    let text_array = |values: &[String]| unsafe {
+    let column = |position: usize| -> Vec<String> {
+        candidates
+            .found
+            .iter()
+            .map(|found| [&found.0, &found.1, &found.2][position].clone())
+            .collect()
+    };
+    let text_array = |values: Vec<String>| unsafe {
         DatumWithOid::new(
-            crate::sql_writer::identifier::format_pg_text_array(values),
+            crate::sql_writer::identifier::format_pg_text_array(&values),
             PgBuiltInOids::TEXTOID.oid().value(),
         )
     };
@@ -648,17 +790,23 @@ fn attribute_notation_calls(
         client
             .select(
                 "SELECT DISTINCT referenced.position \
-                 FROM unnest($1::text[], $2::text[]) WITH ORDINALITY \
-                      AS referenced(relation, name, position) \
+                 FROM unnest($1::text[], $2::text[], $3::text[]) WITH ORDINALITY \
+                      AS referenced(relation, schema_name, name, position) \
                  JOIN pg_catalog.pg_class r ON r.oid = to_regclass(referenced.relation) \
+                 JOIN pg_catalog.pg_namespace rn ON rn.oid = r.relnamespace \
                  JOIN pg_catalog.pg_proc p ON p.proname::text = referenced.name \
                       AND p.pronargs = 1 AND p.proargtypes[0] = r.reltype \
-                 WHERE NOT EXISTS (SELECT 1 FROM pg_catalog.pg_attribute a \
+                 WHERE referenced.schema_name IN ('', rn.nspname::text) \
+                   AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_attribute a \
                                    WHERE a.attrelid = r.oid AND a.attname::text = referenced.name \
                                      AND a.attnum > 0 AND NOT a.attisdropped) \
                  ORDER BY 1",
                 None,
-                &[text_array(&relations), text_array(&names)],
+                &[
+                    text_array(column(0)),
+                    text_array(column(1)),
+                    text_array(column(2)),
+                ],
             )
             .unwrap_or_report()
             .filter_map(|row| row.get_by_name::<i64, _>("position").unwrap_or(None))
@@ -666,7 +814,8 @@ fn attribute_notation_calls(
     });
     called_positions
         .into_iter()
-        .filter_map(|position| written.get(position as usize - 1).cloned())
+        .filter_map(|position| candidates.found.get(position as usize - 1))
+        .map(|found| found.3.clone())
         .collect()
 }
 
