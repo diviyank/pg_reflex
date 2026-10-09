@@ -294,6 +294,23 @@ const V112_SH_SEASON_STEPS: &[(&str, &str)] = &[
     ("t_refill", "INSERT INTO {p}t(season, v, w) VALUES ('y',1,1),('y',2,2),('q',3,3)"),
 ];
 
+/// A passthrough over an inner join created without a key: the inferred key
+/// holds the row id of one table and the join column.
+#[pg_test]
+fn v112_sh_keyless_inner_join_passthrough() {
+    v112_sh_assert_cells(
+        "reflex_sh_ptinner",
+        &[
+            v112_sh_cell!(V112_SH_SEASON_SETUP, V112_SH_SEASON_STEPS, "dim_first", None, "SELECT d.season, d.label, t.id, t.v FROM {p}dim d JOIN {p}t t ON d.season = t.season"),
+            v112_sh_cell!(V112_SH_SEASON_SETUP, V112_SH_SEASON_STEPS, "t_first", None, "SELECT t.id, t.v, d.season, d.label FROM {p}t t JOIN {p}dim d ON d.season = t.season"),
+            v112_sh_cell!(V112_SH_SEASON_SETUP, V112_SH_SEASON_STEPS, "t_season", None, "SELECT t.season, d.label, t.id, t.v FROM {p}dim d JOIN {p}t t ON d.season = t.season"),
+            v112_sh_cell!(V112_SH_SEASON_SETUP, V112_SH_SEASON_STEPS, "no_season", None, "SELECT d.label, t.id, t.v FROM {p}dim d JOIN {p}t t ON d.season = t.season"),
+            v112_sh_cell!(V112_SH_SEASON_SETUP, V112_SH_SEASON_STEPS, "keyed_ctl", Some("id"), "SELECT d.season, d.label, t.id, t.v FROM {p}dim d JOIN {p}t t ON d.season = t.season"),
+            v112_sh_cell!(V112_SH_SEASON_SETUP, V112_SH_SEASON_STEPS, "left_ctl", None, "SELECT d.season, d.label, t.id, t.v FROM {p}dim d LEFT JOIN {p}t t ON d.season = t.season"),
+        ],
+    );
+}
+
 const V112_SH_STAR_SETUP: &[&str] = &[
     "CREATE TABLE {p}fact(id SERIAL PRIMARY KEY, kind TEXT, v INT)",
     "INSERT INTO {p}fact(kind, v) VALUES ('a',1),('b',2),('c',3),('a',4),(NULL,5)",
@@ -389,6 +406,27 @@ const V112_SH_THREE_STEPS: &[(&str, &str)] = &[
     ("f_empty", "DELETE FROM {p}fact; DELETE FROM {p}fact2"),
     ("f_refill", "INSERT INTO {p}fact VALUES ('e',1),('u',2); INSERT INTO {p}fact2 VALUES ('e',1),('u',2)"),
 ];
+
+/// A passthrough over `a LEFT JOIN b ... JOIN c` whose tables share the name of
+/// the key column.
+#[pg_test]
+fn v112_sh_left_join_then_inner_join_on_one_key_name() {
+    v112_sh_assert_cells(
+        "reflex_sh_three",
+        &[
+            v112_sh_cell!(V112_SH_THREE_SETUP, V112_SH_THREE_STEPS, "report", None, "SELECT d.kind, d.label, f.v, o.w FROM {p}dim d LEFT JOIN {p}fact f ON d.kind = f.kind JOIN {p}other o ON o.kind = f.kind"),
+            v112_sh_cell!(V112_SH_THREE_SETUP, V112_SH_THREE_STEPS, "keyed", Some("kind"), "SELECT d.kind, d.label, f.v, o.w FROM {p}dim d LEFT JOIN {p}fact f ON d.kind = f.kind JOIN {p}other o ON o.kind = f.kind"),
+            v112_sh_cell!(V112_SH_THREE_SETUP, V112_SH_THREE_STEPS, "two_left", None, "SELECT d.kind, d.label, f.v, o.w FROM {p}dim d LEFT JOIN {p}fact f ON d.kind = f.kind LEFT JOIN {p}other o ON o.kind = f.kind"),
+            v112_sh_cell!(V112_SH_THREE_SETUP, V112_SH_THREE_STEPS, "inner_on_dim", None, "SELECT d.kind, d.label, f.v, o.w FROM {p}dim d LEFT JOIN {p}fact f ON d.kind = f.kind JOIN {p}other o ON o.kind = d.kind"),
+            v112_sh_cell!(V112_SH_THREE_SETUP, V112_SH_THREE_STEPS, "fact_key_out", None, "SELECT d.kind, f.kind AS fkind, d.label, f.v, o.w FROM {p}dim d LEFT JOIN {p}fact f ON d.kind = f.kind JOIN {p}other o ON o.kind = f.kind"),
+            v112_sh_cell!(V112_SH_THREE_SETUP, V112_SH_THREE_STEPS, "other_name", None, "SELECT d.kind, d.label, f.v, o.w FROM {p}dim d LEFT JOIN {p}fact2 f ON d.kind = f.fk JOIN {p}other o ON o.kind = f.fk"),
+            v112_sh_cell!(V112_SH_THREE_SETUP, V112_SH_THREE_STEPS, "cross_name", Some("kind"), "SELECT d.kind, d.label, f.v, o.w FROM {p}dim d JOIN {p}fact2 f ON lower(d.label) = f.fk JOIN {p}other o ON o.kind = f.fk"),
+            v112_sh_cell!(V112_SH_THREE_SETUP, V112_SH_THREE_STEPS, "cross_name_left", Some("kind"), "SELECT d.kind, d.label, f.v, o.w FROM {p}dim d LEFT JOIN {p}fact2 f ON lower(d.label) = f.fk LEFT JOIN {p}other o ON o.kind = f.fk"),
+            v112_sh_cell!(V112_SH_THREE_SETUP, V112_SH_THREE_STEPS, "repeated_equality", None, "SELECT d.kind, d.label, f.v, o.w FROM {p}dim d LEFT JOIN {p}fact f ON d.kind = f.kind LEFT JOIN {p}other o ON o.kind = d.kind AND d.kind = f.kind"),
+            v112_sh_cell!(V112_SH_THREE_SETUP, V112_SH_THREE_STEPS, "two_ctl", None, "SELECT d.kind, d.label, f.v FROM {p}dim d LEFT JOIN {p}fact f ON d.kind = f.kind"),
+        ],
+    );
+}
 
 const V112_SH_DERIVED_SETUP: &[&str] = &[
     "CREATE TABLE {p}s(id SERIAL PRIMARY KEY, g TEXT, v INT, w INT)",
