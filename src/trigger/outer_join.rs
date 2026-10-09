@@ -3,8 +3,8 @@
 use super::union_delta::{bare_lower, references_source};
 use crate::sql_writer::identifier::token_names_source;
 use sqlparser::ast::{
-    Expr, Join, JoinConstraint, JoinOperator, Query, SetExpr, Statement, TableFactor,
-    TableWithJoins, Visit, Visitor,
+    Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, Join, JoinConstraint,
+    JoinOperator, Query, SetExpr, Statement, TableFactor, TableWithJoins, Visit, Visitor,
 };
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
@@ -36,9 +36,10 @@ pub(crate) struct OuterJoins {
     pub source_inside_left_joined_subtree: bool,
     /// Table references naming the source, at any depth.
     pub source_reads: usize,
-    /// A bare word of an expression is spelled like the source: a column of
-    /// that name, or the table read as a whole row. The transition swap cannot
-    /// tell it from a table reference.
+    /// A bare word of an expression, or a `name.*` argument, is spelled like
+    /// the source or like its alias: a column of that name, or the table read
+    /// as a whole row. The transition swap cannot tell the first from a table
+    /// reference, and the changed rows do not carry the row type of the source.
     pub source_name_stands_as_a_value: bool,
 }
 
@@ -59,10 +60,38 @@ pub(crate) fn outer_joins(base_query: &str, source_table: &str) -> OuterJoins {
     let mut finder = OuterJoinFinder {
         source_lower: source_table.to_lowercase(),
         source_bare: bare_lower(source_table),
+        source_aliases: Vec::new(),
+        words_standing_as_values: Vec::new(),
         found: OuterJoins::default(),
     };
     let _ = query.visit(&mut finder);
+    finder.found.source_name_stands_as_a_value |= finder
+        .words_standing_as_values
+        .iter()
+        .any(|word| finder.source_aliases.contains(word));
     finder.found
+}
+
+/// The relations a function call receives as `name.*`.
+fn whole_row_arguments(function: &Function) -> Vec<String> {
+    let FunctionArguments::List(list) = &function.args else {
+        return Vec::new();
+    };
+    list.args
+        .iter()
+        .filter_map(|argument| match argument {
+            FunctionArg::Unnamed(FunctionArgExpr::QualifiedWildcard(name))
+            | FunctionArg::Named {
+                arg: FunctionArgExpr::QualifiedWildcard(name),
+                ..
+            }
+            | FunctionArg::ExprNamed {
+                arg: FunctionArgExpr::QualifiedWildcard(name),
+                ..
+            } => Some(name.to_string()),
+            _ => None,
+        })
+        .collect()
 }
 
 pub(crate) fn holds_full_join(base_query: &str) -> bool {
@@ -87,10 +116,20 @@ pub(crate) fn source_inside_left_joined_subtree(
 struct OuterJoinFinder {
     source_lower: String,
     source_bare: String,
+    /// Lower-cased aliases of the table references naming the source.
+    source_aliases: Vec<String>,
+    /// Lower-cased bare words of expressions, and names of `name.*` arguments.
+    words_standing_as_values: Vec<String>,
     found: OuterJoins,
 }
 
 impl OuterJoinFinder {
+    fn note_word_standing_as_a_value(&mut self, written: &str) {
+        let word = written.to_lowercase();
+        self.found.source_name_stands_as_a_value |= token_names_source(&word, &self.source_lower);
+        self.words_standing_as_values.push(bare_lower(&word));
+    }
+
     fn names_source(&self, factor: &TableFactor) -> bool {
         matches!(factor, TableFactor::Table { name, .. }
             if token_names_source(&name.to_string().to_lowercase(), &self.source_lower))
@@ -150,14 +189,28 @@ impl Visitor for OuterJoinFinder {
         }
         if self.names_source(factor) {
             self.found.source_reads += 1;
+            if let TableFactor::Table {
+                alias: Some(alias), ..
+            } = factor
+            {
+                self.source_aliases.push(alias.name.value.to_lowercase());
+            }
         }
         ControlFlow::Continue(())
     }
 
     fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<()> {
-        if let Expr::Identifier(word) = expr {
-            self.found.source_name_stands_as_a_value |=
-                token_names_source(&word.to_string().to_lowercase(), &self.source_lower);
+        match expr {
+            Expr::Identifier(word) => self.note_word_standing_as_a_value(&word.to_string()),
+            Expr::QualifiedWildcard(name, _) => {
+                self.note_word_standing_as_a_value(&name.to_string())
+            }
+            Expr::Function(function) => {
+                for name in whole_row_arguments(function) {
+                    self.note_word_standing_as_a_value(&name);
+                }
+            }
+            _ => {}
         }
         ControlFlow::Continue(())
     }
