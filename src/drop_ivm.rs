@@ -27,7 +27,7 @@ pub(crate) fn drop_reflex_ivm_impl(view_name: &str, cascade: bool) -> &'static s
 /// names it (bare or schema-qualified, no argument list); the membership probe
 /// resolves it through the same search_path via `to_regprocedure`, so a missing
 /// or non-member function is a silent no-op.
-fn detach_function_from_extension(client: &mut pgrx::spi::SpiClient<'_>, fn_ref: &str) {
+pub(crate) fn detach_function_from_extension(client: &mut pgrx::spi::SpiClient<'_>, fn_ref: &str) {
     // `extname` is PG's `name` type — selecting it `::text` keeps SPI's
     // `String` extraction from silently coercing a type mismatch into `None`.
     let owning_extension: Option<String> = client
@@ -390,6 +390,8 @@ fn drop_reflex_ivm_impl_inner(view_name: &str, cascade: bool, root: &str) -> &'s
                 .unwrap_or(false);
 
             crate::source_truncate::drop_truncate_triggers(client, source).unwrap_or_report();
+            crate::source_partition_writes::drop_partition_write_triggers(client, source)
+                .unwrap_or_report();
             for op in &["ins", "del", "upd", "trunc"] {
                 if source_still_exists {
                     let trig_name = crate::schema_builder::source_trigger_name(source, op);

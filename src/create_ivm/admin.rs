@@ -459,6 +459,8 @@ fn rebuild_triggers_named(source_table: &str, resolved: String) -> String {
         }
         crate::source_truncate::sync_partition_truncate_triggers(client, &resolved)
             .map_err(|e| format!("partition truncate triggers failed: {}", e))?;
+        crate::source_partition_writes::sync_partition_write_triggers(client, &resolved)
+            .map_err(|e| format!("partition write triggers failed: {}", e))?;
 
         // Heal passthrough scratch tables: a passthrough IMV references a per-(IMV, source) scratch
         // pair (`__reflex_pt_new/old_<imv>_<source>`) that `passthrough_op_stmts`

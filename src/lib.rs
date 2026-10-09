@@ -42,6 +42,7 @@ mod query_decomposer;
 mod rebuild_diff;
 mod reconcile;
 mod schema_builder;
+mod source_partition_writes;
 mod source_truncate;
 mod sql_analyzer;
 mod sql_writer;
