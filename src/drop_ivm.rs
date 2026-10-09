@@ -130,7 +130,7 @@ fn drop_reflex_ivm_impl_inner(view_name: &str, cascade: bool, root: &str) -> &'s
         //    finding this IMV. But we need the reference row for step 7. So we check
         //    here and drop triggers AFTER deleting the row (moved below step 8).
         //    For now, just collect sources that need trigger cleanup.
-        let mut sources_to_cleanup: Vec<(String, String)> = Vec::new(); // (source, safe_source)
+        let mut sources_to_cleanup: Vec<String> = Vec::new();
         for source in &depends_on {
             // Synthetic `<subquery:...>`/`<function:...>` placeholders own no
             // relation of their own — triggers live on the real underlying tables,
@@ -140,11 +140,6 @@ fn drop_reflex_ivm_impl_inner(view_name: &str, cascade: bool, root: &str) -> &'s
             if source.starts_with('<') {
                 continue;
             }
-            // Sub-IMV sources are persisted in `depends_on` already double-quoted
-            // (`"schema"."view__cte_x"`), but the source triggers were installed
-            // under the normalized name. Normalize here using the canonical path,
-            // matching how install_source_triggers builds the trigger name.
-            let safe_source = crate::query_decomposer::sanitized_source_suffix(source);
             let other_count = client
                 .select(
                     "SELECT COUNT(*) AS cnt FROM public.__reflex_ivm_reference \
@@ -169,7 +164,7 @@ fn drop_reflex_ivm_impl_inner(view_name: &str, cascade: bool, root: &str) -> &'s
                 .unwrap_or(0);
 
             if other_count == 0 {
-                sources_to_cleanup.push((source.clone(), safe_source));
+                sources_to_cleanup.push(source.clone());
             }
         }
 
@@ -336,7 +331,7 @@ fn drop_reflex_ivm_impl_inner(view_name: &str, cascade: bool, root: &str) -> &'s
         //    When called from the sql_drop event trigger the source table itself is
         //    already gone (its triggers cascaded with it). DROP TRIGGER ON <missing>
         //    would error on "relation does not exist" — gate on to_regclass.
-        for (source, safe_source) in &sources_to_cleanup {
+        for source in &sources_to_cleanup {
             let source_still_exists: bool = client
                 .select(
                     "SELECT to_regclass($1) IS NOT NULL AS present",
@@ -353,7 +348,7 @@ fn drop_reflex_ivm_impl_inner(view_name: &str, cascade: bool, root: &str) -> &'s
 
             for op in &["ins", "del", "upd", "trunc"] {
                 if source_still_exists {
-                    let trig_name = format!("__reflex_trigger_{}_on_{}", op, safe_source);
+                    let trig_name = crate::schema_builder::source_trigger_name(source, op);
                     client
                         .update(
                             &format!("DROP TRIGGER IF EXISTS \"{}\" ON {}", trig_name, source),
@@ -363,7 +358,7 @@ fn drop_reflex_ivm_impl_inner(view_name: &str, cascade: bool, root: &str) -> &'s
                         .unwrap_or_report();
                 }
 
-                let fn_name = format!("__reflex_{}_trigger_on_{}", op, safe_source);
+                let fn_name = crate::schema_builder::source_trigger_function_name(source, op);
                 let qualified = format!("public.{}", fn_name);
                 detach_function_from_extension(client, &qualified);
                 client

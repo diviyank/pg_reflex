@@ -1538,12 +1538,11 @@ fn install_source_triggers(client: &mut pgrx::spi::SpiClient<'_>, ctx: &BuildCon
             continue;
         }
 
-        let safe_source = crate::query_decomposer::sanitized_source_suffix(source);
         let trig_exists = client
             .select(
                 &format!(
-                    "SELECT 1 FROM pg_trigger WHERE tgname = '__reflex_trigger_ins_on_{}'",
-                    safe_source
+                    "SELECT 1 FROM pg_trigger WHERE tgname = '{}'",
+                    crate::schema_builder::source_trigger_name(source, "ins").replace('\'', "''")
                 ),
                 None,
                 &[],
