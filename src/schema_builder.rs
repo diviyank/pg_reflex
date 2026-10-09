@@ -497,12 +497,23 @@ pub(crate) fn source_trigger_name(source_table: &str, op: &str) -> String {
     ))
 }
 
-/// Name, in `public`, of the function the `op` trigger of `source_table` runs.
+/// Name, in `public`, of the function the `op` trigger of `source_table` runs,
+/// as PostgreSQL stores it. The name is written without quotes, so PostgreSQL
+/// folds it: a suffix holding an upper-case letter is folded here and carries a
+/// hash of its exact spelling, which keeps `"T"` and `t` on two functions.
 pub(crate) fn source_trigger_function_name(source_table: &str, op: &str) -> String {
-    safe_identifier(&format!(
+    let written = format!(
         "__reflex_{op}_trigger_on_{}",
         source_trigger_suffix(source_table)
-    ))
+    );
+    let folded = written.to_ascii_lowercase();
+    if folded == written {
+        return safe_identifier(&written);
+    }
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    written.hash(&mut hasher);
+    safe_identifier(&format!("{folded}_{:08x}", hasher.finish() as u32))
 }
 
 /// Name of the BEFORE TRUNCATE trigger that announces a truncated relation of

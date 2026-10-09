@@ -563,6 +563,49 @@ const V112_SH_CASE_STEPS: &[(&str, &str)] = &[
     ("refill lower", "INSERT INTO {p}t(season, v, w) VALUES ('e',1,1),('e',2,2)"),
 ];
 
+/// Table names that differ only by case, and one table spelled in both cases
+/// without quotes: `{p}t` and `"{p}T"` are two relations, `{P}T` is `{p}t`.
+#[pg_test]
+fn v112_sh_table_names_differing_by_case() {
+    const LOWER: &str = "SELECT season, SUM(v) AS s FROM {p}t GROUP BY season";
+    const MIXED: &str = "SELECT season, SUM(v) AS s FROM \"{p}T\" GROUP BY season";
+    const UPPER: &str = "SELECT season, SUM(w) AS s FROM {P}T GROUP BY season";
+    const UPPER_SELF_JOIN: &str = "SELECT a.season, COUNT(*) AS c, SUM(b.v) AS s FROM {P}T a \
+                                   JOIN {p}t b ON a.season = b.season GROUP BY a.season";
+    const UPPER_PASS: &str = "SELECT id, season, v FROM {P}T WHERE v > 0";
+    const MIXED_PASS: &str = "SELECT id, season, w FROM \"{p}T\" WHERE w > 0";
+    const BOTH_TABLES: &str = "SELECT a.season, SUM(a.v) AS sa, SUM(b.w) AS sb FROM {p}t a \
+                               JOIN \"{p}T\" b ON a.season = b.season GROUP BY a.season";
+    probe_db_open("reflex_sh_case");
+    let mut failures = Vec::new();
+    for (prefix, mode, imvs) in [
+        ("c1", "IMMEDIATE", &[("{p}_a", MIXED, None), ("{p}_b", LOWER, None)][..]),
+        ("c2", "IMMEDIATE", &[("{p}_a", LOWER, None), ("{p}_b", MIXED, None)][..]),
+        ("c3", "DEFERRED", &[("{p}_a", MIXED, None), ("{p}_b", LOWER, None)][..]),
+        ("c4", "IMMEDIATE", &[("{p}_a", UPPER_SELF_JOIN, None)][..]),
+        ("c5", "IMMEDIATE", &[("{p}_a", LOWER, None), ("{p}_b", UPPER, None)][..]),
+        ("c6", "IMMEDIATE", &[("{p}_a", UPPER, None), ("{p}_b", LOWER, None)][..]),
+        ("c7", "DEFERRED", &[("{p}_a", LOWER, None), ("{p}_b", UPPER, None), ("{p}_c", UPPER_SELF_JOIN, None)][..]),
+        ("c8", "IMMEDIATE", &[("{p}_a", UPPER_PASS, None), ("{p}_b", MIXED_PASS, None), ("{p}_c", LOWER, None)][..]),
+        ("c9", "IMMEDIATE", &[("{p}_a", BOTH_TABLES, None), ("{p}_b", UPPER, None)][..]),
+        ("c10", "DEFERRED", &[("{p}_a", BOTH_TABLES, None), ("{p}_b", MIXED_PASS, None)][..]),
+        ("c11", "IMMEDIATE", &[("{p}_a", MIXED, None)][..]),
+        ("c12", "IMMEDIATE", &[("{p}_a", UPPER, None)][..]),
+    ] {
+        for table in [format!("{prefix}t"), format!("\"{prefix}T\"")] {
+            worker_exec(&format!(
+                "CREATE TABLE {table}(id SERIAL PRIMARY KEY, season TEXT, v INT, w INT)"
+            ));
+            worker_exec(&format!(
+                "INSERT INTO {table}(season, v, w) VALUES ('e',1,10),('y',2,20),('e',3,30)"
+            ));
+        }
+        failures.extend(v112_sh_group_failures(prefix, mode, prefix, imvs, V112_SH_CASE_STEPS));
+    }
+    probe_db_close("reflex_sh_case");
+    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+}
+
 /// The reproduction of the report: a DEFERRED IMV over a CTE whose body joins
 /// two tables, both written in one transaction.
 #[pg_test]
