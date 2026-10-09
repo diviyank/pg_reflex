@@ -62,6 +62,11 @@ pub struct SelectColumn {
     /// (e.g., CASE WHEN SUM(x) > 0 THEN SUM(x)/SUM(y) END). The constituent aggregates
     /// are extracted separately and this expression is rewritten in the end_query.
     pub is_aggregate_derived: bool,
+    /// True if the expression holds an aggregate in a place the aggregate mapping does
+    /// not rewrite (under IS NULL, BETWEEN, IN, LIKE, an array constructor, ...). Such an
+    /// item is evaluated by PostgreSQL as written: it is neither a group key nor an
+    /// aggregate pg_reflex maintains.
+    pub holds_undecomposed_aggregate: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -112,6 +117,24 @@ fn function_schema(name: &sqlparser::ast::ObjectName) -> Option<String> {
     })
 }
 
+/// The lower-case name of a call that can only mean a `pg_catalog` function: the call is
+/// unqualified or qualified with `pg_catalog`, and its name is unquoted or quoted in
+/// lower case. `"SUM"(x)` and `other.sum(x)` name other functions.
+fn builtin_function_name(name: &sqlparser::ast::ObjectName) -> Option<String> {
+    let ident = name.0.last()?.as_ident()?;
+    let schema_is_builtin = match function_schema(name) {
+        None => name.0.len() == 1,
+        Some(schema) => schema == "pg_catalog" && name.0.len() == 2,
+    };
+    let is_exact_lower_case = ident.value == ident.value.to_ascii_lowercase();
+    (schema_is_builtin && (ident.quote_style.is_none() || is_exact_lower_case))
+        .then(|| ident.value.to_ascii_lowercase())
+}
+
+fn builtin_aggregate_kind(f: &Function) -> Option<AggregateKind> {
+    builtin_function_name(&f.name).and_then(|name| detect_aggregate(&name))
+}
+
 /// A called function as the catalog lookup needs it: `schema` is `None` for an
 /// unqualified call, which PostgreSQL resolves through the caller's `search_path`.
 #[derive(Debug, Clone, PartialEq)]
@@ -124,6 +147,14 @@ pub struct FunctionReference {
 pub struct CalledFunction {
     pub name: String,
     pub arg_count: usize,
+}
+
+/// A call whose spelling cannot be taken for a `pg_catalog` function: `name` is its
+/// bare lower-case name, `written` the name as the query spells it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NonBuiltinCall {
+    pub name: String,
+    pub written: String,
 }
 
 const KEYWORD_PSEUDO_FUNCTIONS: [&str; 12] = [
@@ -164,6 +195,154 @@ fn keyword_pseudo_function(ident: &Ident) -> Option<CalledFunction> {
     KEYWORD_PSEUDO_FUNCTIONS
         .contains(&name.as_str())
         .then_some(CalledFunction { name, arg_count: 0 })
+}
+
+const MOVING_DATE_TIME_WORDS: [&str; 4] = ["now", "today", "tomorrow", "yesterday"];
+
+const DATE_TIME_TYPES: [&str; 11] = [
+    "date",
+    "time",
+    "timetz",
+    "timestamp",
+    "timestamptz",
+    "daterange",
+    "tsrange",
+    "tstzrange",
+    "datemultirange",
+    "tsmultirange",
+    "tstzmultirange",
+];
+
+/// `type_name` as written (`timestamptz`, `pg_catalog.date`, `time(3) with time zone`,
+/// `date[]`) names a built-in type whose input reads the special date/time words.
+fn is_date_time_type(type_name: &str) -> bool {
+    let lower = type_name.to_ascii_lowercase().replace('"', "");
+    let unqualified = lower.strip_prefix("pg_catalog.").unwrap_or(&lower);
+    let base = unqualified
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .next()
+        .unwrap_or_default();
+    DATE_TIME_TYPES.contains(&base)
+}
+
+/// The date/time input words that stand for the moment of evaluation. Any other word
+/// (`epoch`, `infinity`, `allballs`) is a fixed value.
+fn holds_moving_date_time_word(literal: &str) -> bool {
+    literal
+        .to_ascii_lowercase()
+        .split(|c: char| !c.is_ascii_alphabetic())
+        .any(|word| MOVING_DATE_TIME_WORDS.contains(&word))
+}
+
+fn string_literal(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Nested(inner) => string_literal(inner),
+        Expr::Value(value) => value.clone().into_string(),
+        _ => None,
+    }
+}
+
+/// A string literal given a date/time type whose value depends on when it is read:
+/// `'now'::timestamptz`, `DATE 'today'`, `date('yesterday')`.
+fn is_moving_date_time_literal(expr: &Expr) -> bool {
+    let (type_name, literal) = match expr {
+        Expr::Cast {
+            expr: inner,
+            data_type,
+            ..
+        } => (data_type.to_string(), string_literal(inner)),
+        Expr::TypedString(typed) => (
+            typed.data_type.to_string(),
+            typed.value.clone().into_string(),
+        ),
+        Expr::Function(f) => {
+            let only_argument = match &f.args {
+                FunctionArguments::List(list) => match list.args.as_slice() {
+                    [FunctionArg::Unnamed(FunctionArgExpr::Expr(argument))] => {
+                        string_literal(argument)
+                    }
+                    _ => None,
+                },
+                _ => None,
+            };
+            (
+                builtin_function_name(&f.name).unwrap_or_default(),
+                only_argument,
+            )
+        }
+        _ => return false,
+    };
+    is_date_time_type(&type_name) && literal.is_some_and(|text| holds_moving_date_time_word(&text))
+}
+
+/// A select item PostgreSQL refuses as a grouping key, or reads as a position: a bare
+/// string, NULL, boolean or non-integer literal, or a negated number, which its grammar
+/// folds into a constant (`+1` and `~1` stay operator expressions). An unsigned integer
+/// literal is left alone.
+fn is_constant_refused_as_group_key(expr: &Expr) -> bool {
+    let is_unsigned_integer =
+        |text: &str| !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit());
+    match expr {
+        Expr::Nested(inner) => is_constant_refused_as_group_key(inner),
+        Expr::Value(value) => match &value.value {
+            sqlparser::ast::Value::Number(number, _) => !is_unsigned_integer(&number.to_string()),
+            sqlparser::ast::Value::Placeholder(_) => false,
+            _ => true,
+        },
+        Expr::UnaryOp {
+            op: sqlparser::ast::UnaryOperator::Minus,
+            expr: operand,
+        } => {
+            let mut negated = operand.as_ref();
+            while let Expr::Nested(inner) = negated {
+                negated = inner;
+            }
+            matches!(
+                negated,
+                Expr::Value(value) if matches!(value.value, sqlparser::ast::Value::Number(..))
+            )
+        }
+        _ => false,
+    }
+}
+
+/// The function a FROM item calls, by the name the query gives it.
+fn from_function_name(factor: &TableFactor) -> Option<String> {
+    match factor {
+        TableFactor::Table {
+            name,
+            args: Some(_),
+            ..
+        } => Some(name.to_string()),
+        TableFactor::Function { name, .. } => Some(name.to_string()),
+        TableFactor::UNNEST { .. } => Some("unnest".to_string()),
+        TableFactor::TableFunction { expr, .. } => Some(expr.to_string()),
+        TableFactor::JsonTable { .. } => Some("json_table".to_string()),
+        TableFactor::OpenJsonTable { .. } => Some("openjson".to_string()),
+        TableFactor::XmlTable { .. } => Some("xmltable".to_string()),
+        _ => None,
+    }
+}
+
+fn factor_is_function_call(factor: &TableFactor) -> bool {
+    matches!(factor, TableFactor::Table { args: Some(_), .. })
+}
+
+fn collect_from_functions(factor: &TableFactor, functions: &mut Vec<String>) {
+    if let TableFactor::NestedJoin {
+        table_with_joins, ..
+    } = factor
+    {
+        collect_from_functions(&table_with_joins.relation, functions);
+        for join in &table_with_joins.joins {
+            collect_from_functions(&join.relation, functions);
+        }
+    }
+    if let Some(name) = from_function_name(factor) {
+        if !functions.contains(&name) {
+            functions.push(name);
+        }
+    }
 }
 
 const DISTINCT_AGGREGATE_REJECTION: &str = "DISTINCT modifier on SUM/AVG/MIN/MAX/BOOL_OR is not supported. \
@@ -212,6 +391,23 @@ pub struct SqlAnalysis {
     /// The same calls once per distinct (schema, bare name).
     pub function_references: Vec<FunctionReference>,
     pub has_extract: bool,
+    /// Calls spelled so that they cannot be taken for a `pg_catalog` function.
+    pub non_builtin_calls: Vec<NonBuiltinCall>,
+    /// The functions called in the top-level SELECT list, outside subqueries and window
+    /// functions.
+    pub select_list_calls: Vec<WrittenCall>,
+    /// The name PostgreSQL gives each output column that has one by the query's text: an
+    /// alias, or the column of a bare column reference. One entry per such select item.
+    pub named_outputs: Vec<String>,
+    /// Those of `named_outputs` whose select item is a bare, optionally qualified or
+    /// parenthesised, reference to a column of that same name.
+    pub columns_output_under_their_own_name: Vec<String>,
+    /// SELECT items PostgreSQL refuses as grouping keys (see
+    /// `is_constant_refused_as_group_key`).
+    pub constants_refused_as_group_key: Vec<String>,
+    /// Functions used as FROM items: in the top-level FROM clause, or anywhere when
+    /// written `name(args)`, which the source collection takes for a table.
+    pub from_functions: Vec<String>,
     /// Set when a clock or session-identity function is called anywhere in the
     /// query, not only in the SELECT list.
     pub has_nondeterministic_select: bool,
@@ -314,6 +510,39 @@ impl SqlAnalysis {
         if self.nested_count_distinct {
             return Some(NESTED_COUNT_DISTINCT_REJECTION.into());
         }
+        if !self.from_functions.is_empty() {
+            return Some(format!(
+                "A function in FROM ({}) is not supported: an IMV is maintained from the rows \
+                 written to its source tables, and a function is not one. Fix: store the \
+                 function's rows in a table and join that table; a function of the row's own \
+                 columns can be called in the SELECT list instead \
+                 (SELECT g, unnest(arr) AS e FROM t)",
+                self.from_functions.join(", ")
+            ));
+        }
+        let groups_rows = !self.group_by_columns.is_empty() || self.has_distinct;
+        let undecomposed_aggregate = self
+            .select_columns
+            .iter()
+            .find(|column| column.holds_undecomposed_aggregate);
+        if let (true, Some(column)) = (groups_rows, undecomposed_aggregate) {
+            return Some(format!(
+                "'{}' holds an aggregate inside an expression pg_reflex does not decompose \
+                 (IS NULL, BETWEEN, IN, LIKE, an array and similar), so it is neither a group \
+                 key nor an aggregate it maintains. Fix: compute the aggregate in a CTE and \
+                 apply the expression in the outer SELECT: WITH a AS (SELECT grp, SUM(val) AS s \
+                 FROM t GROUP BY grp) SELECT grp, s IS NULL AS c FROM a",
+                column.alias.as_deref().unwrap_or(&column.expr_sql)
+            ));
+        }
+        if groups_rows && !self.constants_refused_as_group_key.is_empty() {
+            return Some(format!(
+                "The constant {} in the SELECT list beside GROUP BY or DISTINCT is not \
+                 supported: PostgreSQL refuses a bare constant as a grouping key. Fix: cast it \
+                 to its type, e.g. 'plain'::text, NULL::text, TRUE::boolean, 3.5::numeric",
+                self.constants_refused_as_group_key.join(", ")
+            ));
+        }
         None
     }
 
@@ -332,13 +561,17 @@ impl SqlAnalysis {
         names
     }
 
+    fn record_nondeterministic(&mut self, name: String) {
+        self.has_nondeterministic_select = true;
+        if !self.nondeterministic_functions.contains(&name) {
+            self.nondeterministic_functions.push(name);
+        }
+    }
+
     fn record_called_function(&mut self, call: CalledFunction, schema: Option<String>) {
         let is_builtin_spelling = !matches!(schema.as_deref(), Some(s) if s != "pg_catalog");
         if is_builtin_spelling && is_clock_or_session_function(&call) {
-            self.has_nondeterministic_select = true;
-            if !self.nondeterministic_functions.contains(&call.name) {
-                self.nondeterministic_functions.push(call.name.clone());
-            }
+            self.record_nondeterministic(call.name.clone());
         }
         let reference = FunctionReference {
             schema,
@@ -385,6 +618,9 @@ impl<'a> Visitor for AnalysisVisitor<'a> {
     }
 
     fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<()> {
+        if is_moving_date_time_literal(expr) {
+            self.analysis.record_nondeterministic(expr.to_string());
+        }
         match expr {
             Expr::Function(f) => {
                 if let FunctionArguments::List(list) = &f.args {
@@ -418,6 +654,15 @@ impl<'a> Visitor for AnalysisVisitor<'a> {
                         self.analysis.unsupported_aggregates.push(func_name.clone());
                     }
                     if let Some(call) = called_function(f) {
+                        if builtin_function_name(&f.name).is_none() {
+                            let spelling = NonBuiltinCall {
+                                name: call.name.clone(),
+                                written: f.name.to_string(),
+                            };
+                            if !self.analysis.non_builtin_calls.contains(&spelling) {
+                                self.analysis.non_builtin_calls.push(spelling);
+                            }
+                        }
                         self.analysis
                             .record_called_function(call, function_schema(&f.name));
                     }
@@ -450,6 +695,9 @@ impl<'a> Visitor for AnalysisVisitor<'a> {
                 sample,
                 ..
             } => {
+                if factor_is_function_call(factor) {
+                    collect_from_functions(factor, &mut self.analysis.from_functions);
+                }
                 let table_name = name.to_string();
                 self.analysis.sources.push(table_name.clone());
                 if let Some(a) = alias {
@@ -484,10 +732,10 @@ impl<'a> Visitor for AnalysisVisitor<'a> {
     }
 }
 
-/// Detect aggregate kind from a function name.
-/// Recursively check if an expression tree contains any aggregate function calls.
+/// Whether `expr` holds a call to a built-in aggregate pg_reflex maintains, anywhere
+/// but in a subquery or inside a window function.
 pub fn expr_contains_aggregate(expr: &Expr) -> bool {
-    expr_contains_call(expr, &|f| detect_aggregate(&f.name.to_string()).is_some())
+    expr_contains_call(expr, &|f| builtin_aggregate_kind(f).is_some())
 }
 
 fn is_count_distinct_call(f: &sqlparser::ast::Function) -> bool {
@@ -499,44 +747,166 @@ fn is_count_distinct_call(f: &sqlparser::ast::Function) -> bool {
         )
 }
 
+pub(crate) fn is_window_call(expr: &Expr) -> bool {
+    matches!(expr, Expr::Function(f) if f.over.is_some())
+}
+
+/// Whether `matches_call` accepts a call of `expr` that belongs to the query level of
+/// `expr`: not one in a subquery, and not one in the arguments or the window of a window
+/// function.
 fn expr_contains_call(
     expr: &Expr,
     matches_call: &dyn Fn(&sqlparser::ast::Function) -> bool,
 ) -> bool {
-    let recurse = |e: &Expr| expr_contains_call(e, matches_call);
-    match expr {
-        Expr::Function(f) if f.over.is_none() => {
-            if matches_call(f) {
-                return true;
-            }
-            if let FunctionArguments::List(list) = &f.args {
-                for arg in &list.args {
-                    if let FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) = arg {
-                        if recurse(e) {
-                            return true;
-                        }
-                    }
+    struct CallSearch<'a> {
+        matches_call: &'a dyn Fn(&sqlparser::ast::Function) -> bool,
+        enclosing_queries: usize,
+        enclosing_window_calls: usize,
+    }
+    impl Visitor for CallSearch<'_> {
+        type Break = ();
+
+        fn pre_visit_query(&mut self, _query: &Query) -> ControlFlow<()> {
+            self.enclosing_queries += 1;
+            ControlFlow::Continue(())
+        }
+
+        fn post_visit_query(&mut self, _query: &Query) -> ControlFlow<()> {
+            self.enclosing_queries -= 1;
+            ControlFlow::Continue(())
+        }
+
+        fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<()> {
+            if is_window_call(expr) {
+                self.enclosing_window_calls += 1;
+            } else if let Expr::Function(f) = expr {
+                let at_this_level = self.enclosing_queries == 0 && self.enclosing_window_calls == 0;
+                if at_this_level && (self.matches_call)(f) {
+                    return ControlFlow::Break(());
                 }
             }
-            false
+            ControlFlow::Continue(())
         }
-        Expr::BinaryOp { left, right, .. } => recurse(left) || recurse(right),
-        Expr::UnaryOp { expr: inner, .. } => recurse(inner),
-        Expr::Nested(inner) => recurse(inner),
+
+        fn post_visit_expr(&mut self, expr: &Expr) -> ControlFlow<()> {
+            if is_window_call(expr) {
+                self.enclosing_window_calls -= 1;
+            }
+            ControlFlow::Continue(())
+        }
+    }
+    let mut search = CallSearch {
+        matches_call,
+        enclosing_queries: 0,
+        enclosing_window_calls: 0,
+    };
+    expr.visit(&mut search).is_break()
+}
+
+/// The aggregate calls of `expr` that the aggregate mapping
+/// (`aggregation::replace_aggregate_calls`) reaches and rewrites: those under arithmetic
+/// and boolean operators, parentheses, CASE, casts and positional function arguments.
+fn count_decomposable_aggregates(expr: &Expr) -> usize {
+    let count = count_decomposable_aggregates;
+    match expr {
+        Expr::Function(f) if f.over.is_none() => {
+            if builtin_aggregate_kind(f).is_some() {
+                return 1;
+            }
+            match &f.args {
+                FunctionArguments::List(list) => list
+                    .args
+                    .iter()
+                    .map(|arg| match arg {
+                        FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => count(e),
+                        _ => 0,
+                    })
+                    .sum(),
+                _ => 0,
+            }
+        }
+        Expr::BinaryOp { left, right, .. } => count(left) + count(right),
+        Expr::UnaryOp { expr: inner, .. } => count(inner),
+        Expr::Nested(inner) => count(inner),
         Expr::Case {
             operand,
             conditions,
             else_result,
             ..
         } => {
-            operand.as_deref().is_some_and(recurse)
-                || conditions
+            operand.as_deref().map_or(0, count)
+                + conditions
                     .iter()
-                    .any(|cw| recurse(&cw.condition) || recurse(&cw.result))
-                || else_result.as_deref().is_some_and(recurse)
+                    .map(|when| count(&when.condition) + count(&when.result))
+                    .sum::<usize>()
+                + else_result.as_deref().map_or(0, count)
         }
-        Expr::Cast { expr: inner, .. } => recurse(inner),
-        _ => false,
+        Expr::Cast { expr: inner, .. } => count(inner),
+        _ => 0,
+    }
+}
+
+fn every_aggregate_is_decomposable(expr: &Expr) -> bool {
+    let aggregates = std::cell::Cell::new(0usize);
+    expr_contains_call(expr, &|f| {
+        if builtin_aggregate_kind(f).is_some() {
+            aggregates.set(aggregates.get() + 1);
+        }
+        false
+    });
+    count_decomposable_aggregates(expr) == aggregates.get()
+}
+
+/// A call as PostgreSQL looks it up: `schema` and `name` folded like identifiers
+/// (`schema` is `None` for an unqualified call), and the number of arguments written.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WrittenCall {
+    pub schema: Option<String>,
+    pub name: String,
+    pub arg_count: usize,
+}
+
+/// The calls of `expr` at its own query level.
+fn written_calls(expr: &Expr) -> Vec<WrittenCall> {
+    let calls = std::cell::RefCell::new(Vec::new());
+    expr_contains_call(expr, &|f| {
+        let name = f.name.0.last().and_then(|part| part.as_ident()).map(folded);
+        if let Some(name) = name {
+            calls.borrow_mut().push(WrittenCall {
+                schema: function_schema(&f.name),
+                name,
+                arg_count: match &f.args {
+                    FunctionArguments::List(list) => list.args.len(),
+                    _ => 0,
+                },
+            });
+        }
+        false
+    });
+    calls.into_inner()
+}
+
+/// The column a select item is when it is a bare, optionally qualified and optionally
+/// parenthesised, column reference.
+fn referenced_column(expr: &Expr) -> Option<&Ident> {
+    match expr {
+        Expr::Nested(inner) => referenced_column(inner),
+        Expr::Identifier(column) => Some(column),
+        Expr::CompoundIdentifier(parts) => parts.last(),
+        _ => None,
+    }
+}
+
+fn record_output_name(analysis: &mut SqlAnalysis, expr: &Expr, alias: Option<&Ident>) {
+    let column = referenced_column(expr).map(folded);
+    let output = alias.map(folded).or_else(|| column.clone());
+    if let Some(output) = output {
+        if column.as_ref() == Some(&output) {
+            analysis
+                .columns_output_under_their_own_name
+                .push(output.clone());
+        }
+        analysis.named_outputs.push(output);
     }
 }
 
@@ -616,7 +986,11 @@ fn is_clock_or_session_function(call: &CalledFunction) -> bool {
             | "txid_current"
             | "txid_current_if_assigned"
             | "pg_current_xact_id"
-            | "pg_current_xact_id_if_assigned" => true,
+            | "pg_current_xact_id_if_assigned"
+            | "pg_current_snapshot"
+            | "txid_current_snapshot"
+            | "pg_my_temp_schema"
+            | "pg_trigger_depth" => true,
             "age" => call.arg_count == 1,
             _ => false,
         }
@@ -626,6 +1000,7 @@ fn is_timezone_sensitive_function(call: &CalledFunction) -> bool {
     match call.name.as_str() {
         "date_trunc" | "to_timestamp" => call.arg_count == 2,
         "date_part" | "to_char" | "to_date" => true,
+        "date" => call.arg_count == 1,
         _ => false,
     }
 }
@@ -657,6 +1032,16 @@ fn first_arg_sql(args: &FunctionArguments) -> Option<String> {
 }
 
 fn push_select_column(analysis: &mut SqlAnalysis, expr: &Expr, alias: Option<String>) {
+    for call in written_calls(expr) {
+        if !analysis.select_list_calls.contains(&call) {
+            analysis.select_list_calls.push(call);
+        }
+    }
+    if is_constant_refused_as_group_key(expr) {
+        analysis
+            .constants_refused_as_group_key
+            .push(expr.to_string());
+    }
     let column = extract_select_column(expr, alias);
     if column.is_aggregate_derived && expr_contains_call(expr, &is_count_distinct_call) {
         analysis.nested_count_distinct = true;
@@ -674,7 +1059,7 @@ pub(crate) struct AggregateCall {
 }
 
 pub(crate) fn resolve_aggregate_call(f: &Function) -> Option<AggregateCall> {
-    let mut kind = detect_aggregate(&f.name.to_string())?;
+    let mut kind = builtin_aggregate_kind(f)?;
     if matches!(kind, AggregateKind::Count) && is_wildcard_arg(&f.args) {
         kind = AggregateKind::CountStar;
     }
@@ -734,6 +1119,7 @@ fn extract_select_column(expr: &Expr, alias: Option<String>) -> SelectColumn {
                 #[cfg(test)]
                 filter_expr: None,
                 is_aggregate_derived: false,
+                holds_undecomposed_aggregate: false,
             };
         }
 
@@ -757,13 +1143,15 @@ fn extract_select_column(expr: &Expr, alias: Option<String>) -> SelectColumn {
                 #[cfg(test)]
                 filter_expr: call.filter_expr,
                 is_aggregate_derived: false,
+                holds_undecomposed_aggregate: false,
             };
         }
     }
 
     // Check if the expression contains aggregates inside a compound expression
     // (e.g., CASE WHEN SUM(x) > 0 THEN SUM(x)/SUM(y) END)
-    let has_nested_agg = expr_contains_aggregate(expr);
+    let holds_aggregate = expr_contains_aggregate(expr);
+    let has_nested_agg = holds_aggregate && every_aggregate_is_decomposable(expr);
     SelectColumn {
         expr_sql: expr.to_string(),
         alias,
@@ -775,6 +1163,7 @@ fn extract_select_column(expr: &Expr, alias: Option<String>) -> SelectColumn {
         #[cfg(test)]
         filter_expr: None,
         is_aggregate_derived: has_nested_agg,
+        holds_undecomposed_aggregate: holds_aggregate && !has_nested_agg,
     }
 }
 
@@ -906,6 +1295,45 @@ impl Visitor for ColumnRefCollector {
     }
 }
 
+/// The parts of a possibly qualified name as the query writes it (`T`, `public."My T"`),
+/// each folded the way PostgreSQL folds an identifier.
+fn folded_name_parts(written: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut part = String::new();
+    let mut part_is_quoted = false;
+    let mut inside_quotes = false;
+    let mut chars = written.chars().peekable();
+    let mut finish = |part: &mut String, part_is_quoted: &mut bool| {
+        parts.push(if *part_is_quoted {
+            std::mem::take(part)
+        } else {
+            std::mem::take(part).to_lowercase()
+        });
+        *part_is_quoted = false;
+    };
+    while let Some(c) = chars.next() {
+        match c {
+            '"' if inside_quotes && chars.peek() == Some(&'"') => {
+                chars.next();
+                part.push('"');
+            }
+            '"' => {
+                inside_quotes = !inside_quotes;
+                part_is_quoted = true;
+            }
+            '.' if !inside_quotes => finish(&mut part, &mut part_is_quoted),
+            other => part.push(other),
+        }
+    }
+    finish(&mut part, &mut part_is_quoted);
+    parts
+}
+
+/// The table name of `written`, folded: its last part.
+fn folded_relation_name(written: &str) -> String {
+    folded_name_parts(written).pop().unwrap_or_default()
+}
+
 /// Like [`ColumnRefCollector`] but ignores column references nested inside a
 /// subquery — only the OUTER expression's refs are collected. Used by
 /// [`collect_imv_relevant_where`] so a WHERE conjunct of the form
@@ -1017,7 +1445,11 @@ fn resolve_column_ref(
     // schema-qualified entry in `sources`. We try a few lookup forms.
     let prefix = &parts[parts.len() - 2];
 
-    if let Some(resolved) = aliases.get(prefix) {
+    let aliased = aliases
+        .iter()
+        .find(|(alias, _)| folded_relation_name(alias) == *prefix)
+        .map(|(_, table)| table);
+    if let Some(resolved) = aliased {
         if real_sources.iter().any(|s| s.as_str() == resolved.as_str()) {
             return vec![(resolved.clone(), column)];
         }
@@ -1027,13 +1459,9 @@ fn resolve_column_ref(
     // when the user wrote `AS foo`. An unaliased FROM table appears in
     // `sources` directly.
     for s in &real_sources {
-        if s.as_str() == prefix {
-            return vec![((*s).clone(), column)];
-        }
-        // Schema-qualified vs bare-name match (e.g., source "alp.product"
-        // referenced as "product.id" or vice versa).
-        let bare = s.rsplit('.').next().unwrap_or(s.as_str());
-        if bare == prefix {
+        // The reference names the table itself, whatever its schema qualifier
+        // (e.g., source "alp.product" referenced as "product.id").
+        if folded_relation_name(s) == *prefix {
             return vec![((*s).clone(), column)];
         }
     }
@@ -1102,10 +1530,142 @@ pub(crate) fn collect_column_refs(expr: &Expr) -> Vec<Vec<String>> {
     collector.refs
 }
 
-fn folded(id: &Ident) -> String {
+pub(crate) fn folded(id: &Ident) -> String {
     match id.quote_style {
         Some(_) => id.value.clone(),
         None => id.value.to_lowercase(),
+    }
+}
+
+/// Rewrites every unquoted table, alias and column name of `statements` to the lower
+/// case PostgreSQL folds it to. Everything downstream matches names as text (the
+/// registered source names, the columns a write must touch to matter, the rewrite of a
+/// source into its transition table), so `T` and `t` have to be one spelling there.
+pub(crate) fn fold_unquoted_names(statements: &mut [Statement]) {
+    for statement in statements {
+        let _ = statement.visit(&mut UnquotedNameFolder);
+    }
+}
+
+struct UnquotedNameFolder;
+
+impl UnquotedNameFolder {
+    fn fold(id: &mut Ident) {
+        id.value = folded(id);
+    }
+
+    fn fold_name(name: &mut sqlparser::ast::ObjectName) {
+        for part in &mut name.0 {
+            if let sqlparser::ast::ObjectNamePart::Identifier(id) = part {
+                Self::fold(id);
+            }
+        }
+    }
+
+    fn fold_alias(alias: &mut sqlparser::ast::TableAlias) {
+        Self::fold(&mut alias.name);
+        for column in &mut alias.columns {
+            Self::fold(&mut column.name);
+        }
+    }
+
+    fn fold_using_columns(table: &mut sqlparser::ast::TableWithJoins) {
+        use sqlparser::ast::{JoinConstraint, JoinOperator};
+        if let TableFactor::NestedJoin {
+            table_with_joins, ..
+        } = &mut table.relation
+        {
+            Self::fold_using_columns(table_with_joins);
+        }
+        for join in &mut table.joins {
+            if let TableFactor::NestedJoin {
+                table_with_joins, ..
+            } = &mut join.relation
+            {
+                Self::fold_using_columns(table_with_joins);
+            }
+            let constraint = match &mut join.join_operator {
+                JoinOperator::Join(constraint)
+                | JoinOperator::Inner(constraint)
+                | JoinOperator::Left(constraint)
+                | JoinOperator::LeftOuter(constraint)
+                | JoinOperator::Right(constraint)
+                | JoinOperator::RightOuter(constraint)
+                | JoinOperator::FullOuter(constraint) => constraint,
+                _ => continue,
+            };
+            if let JoinConstraint::Using(columns) = constraint {
+                columns.iter_mut().for_each(Self::fold_name);
+            }
+        }
+    }
+
+    fn fold_select_level_names(body: &mut SetExpr) {
+        match body {
+            SetExpr::Select(select) => {
+                for item in &mut select.projection {
+                    if let SelectItem::QualifiedWildcard(
+                        sqlparser::ast::SelectItemQualifiedWildcardKind::ObjectName(name),
+                        _,
+                    ) = item
+                    {
+                        Self::fold_name(name);
+                    }
+                }
+                select.from.iter_mut().for_each(Self::fold_using_columns);
+            }
+            SetExpr::SetOperation { left, right, .. } => {
+                Self::fold_select_level_names(left);
+                Self::fold_select_level_names(right);
+            }
+            _ => {}
+        }
+    }
+}
+
+impl VisitorMut for UnquotedNameFolder {
+    type Break = ();
+
+    fn pre_visit_query(&mut self, query: &mut Query) -> ControlFlow<()> {
+        if let Some(with) = &mut query.with {
+            for cte in &mut with.cte_tables {
+                Self::fold_alias(&mut cte.alias);
+            }
+        }
+        Self::fold_select_level_names(&mut query.body);
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_relation(&mut self, relation: &mut sqlparser::ast::ObjectName) -> ControlFlow<()> {
+        Self::fold_name(relation);
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_table_factor(&mut self, factor: &mut TableFactor) -> ControlFlow<()> {
+        match factor {
+            TableFactor::Table { alias, .. }
+            | TableFactor::Derived { alias, .. }
+            | TableFactor::TableFunction { alias, .. }
+            | TableFactor::Function { alias, .. }
+            | TableFactor::UNNEST { alias, .. }
+            | TableFactor::NestedJoin { alias, .. } => {
+                if let Some(alias) = alias {
+                    Self::fold_alias(alias);
+                }
+            }
+            _ => {}
+        }
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_expr(&mut self, expr: &mut Expr) -> ControlFlow<()> {
+        match expr {
+            Expr::Identifier(id) => Self::fold(id),
+            Expr::CompoundIdentifier(ids) => ids.iter_mut().for_each(Self::fold),
+            Expr::QualifiedWildcard(name, _) => Self::fold_name(name),
+            _ => {}
+        }
+        ControlFlow::Continue(())
     }
 }
 
@@ -1346,9 +1906,9 @@ impl<'a> VisitorMut for AliasPrefixStripper<'a> {
 
     fn pre_visit_expr(&mut self, expr: &mut Expr) -> ControlFlow<()> {
         if let Expr::CompoundIdentifier(ids) = expr {
-            if ids.len() == 2 && self.prefixes_to_strip.contains(&ids[0].value) {
+            if ids.len() == 2 && self.prefixes_to_strip.contains(&folded(&ids[0])) {
                 let col = ids.last().unwrap().clone();
-                *expr = Expr::Identifier(Ident::new(col.value));
+                *expr = Expr::Identifier(col);
             }
         }
         ControlFlow::Continue(())
@@ -1404,12 +1964,10 @@ fn collect_imv_relevant_where(
     let mut prefixes_per_source: HashMap<String, BTreeSet<String>> = HashMap::new();
     for s in &real_sources {
         let mut prefixes: BTreeSet<String> = BTreeSet::new();
-        let bare = s.rsplit('.').next().unwrap_or(s.as_str()).to_string();
-        prefixes.insert(bare);
-        prefixes.insert((*s).clone());
+        prefixes.insert(folded_relation_name(s));
         for (alias, table) in aliases {
             if table == *s {
-                prefixes.insert(alias.clone());
+                prefixes.insert(folded_relation_name(alias));
             }
         }
         prefixes_per_source.insert((*s).clone(), prefixes);
@@ -1525,6 +2083,17 @@ pub fn is_bare_column_reference(expr_sql: &str) -> bool {
     matches!(e, Expr::Identifier(_) | Expr::CompoundIdentifier(_))
 }
 
+/// The SELECT of a single-statement query that is not a set operation.
+pub(crate) fn top_level_select(statements: &[Statement]) -> Option<&Select> {
+    match statements {
+        [Statement::Query(query)] => match query.body.as_ref() {
+            SetExpr::Select(select) => Some(select),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 pub fn analyze(statements: &[Statement]) -> Result<SqlAnalysis, SqlAnalysisError> {
     if statements.len() != 1 {
         return Err(SqlAnalysisError::MultipleQueries(statements.len()));
@@ -1591,9 +2160,11 @@ pub fn analyze(statements: &[Statement]) -> Result<SqlAnalysis, SqlAnalysisError
     for item in &select.projection {
         match item {
             SelectItem::UnnamedExpr(expr) => {
+                record_output_name(&mut analysis, expr, None);
                 push_select_column(&mut analysis, expr, None);
             }
             SelectItem::ExprWithAlias { expr, alias } => {
+                record_output_name(&mut analysis, expr, Some(alias));
                 push_select_column(&mut analysis, expr, Some(alias.to_string()));
             }
             SelectItem::Wildcard(_) => {
@@ -1608,6 +2179,7 @@ pub fn analyze(statements: &[Statement]) -> Result<SqlAnalysis, SqlAnalysisError
                     #[cfg(test)]
                     filter_expr: None,
                     is_aggregate_derived: false,
+                    holds_undecomposed_aggregate: false,
                 });
             }
             SelectItem::QualifiedWildcard(kind, _) => {
@@ -1622,6 +2194,7 @@ pub fn analyze(statements: &[Statement]) -> Result<SqlAnalysis, SqlAnalysisError
                     #[cfg(test)]
                     filter_expr: None,
                     is_aggregate_derived: false,
+                    holds_undecomposed_aggregate: false,
                 });
             }
         }
@@ -1655,7 +2228,9 @@ pub fn analyze(statements: &[Statement]) -> Result<SqlAnalysis, SqlAnalysisError
     analysis.from_clause_sql = from_parts.join(", ");
 
     for twj in &select.from {
+        collect_from_functions(&twj.relation, &mut analysis.from_functions);
         for join in &twj.joins {
+            collect_from_functions(&join.relation, &mut analysis.from_functions);
             analysis.joins.push(extract_join_info(join));
         }
     }
