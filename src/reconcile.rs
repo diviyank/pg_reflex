@@ -42,7 +42,55 @@ use crate::validate_view_name;
 /// probe of the intermediate would silently skip half the damage.
 fn heal_missing_intermediate(view_name: &str) {
     heal_missing_intermediate_table(view_name);
+    heal_missing_delta_scratch_table(view_name);
     heal_missing_group_capture_tables(view_name);
+}
+
+/// Recreates `__reflex_scratch_<view>` when it is absent while the intermediate
+/// is present. It has the intermediate's column shape, which is copied from the
+/// live intermediate.
+fn heal_missing_delta_scratch_table(view_name: &str) {
+    let owns_intermediate = matches!(
+        Spi::connect(|client| crate::sql_writer::registry::read_imv(client, view_name)),
+        Some(record) if record.enabled && record.owns_intermediate()
+    );
+    if !owns_intermediate {
+        return;
+    }
+    let intermediate = intermediate_table_name(view_name);
+    let scratch = crate::query_decomposer::delta_scratch_table_name(view_name);
+    let recreated = Spi::connect_mut(|client| {
+        if !relation_present(client, &intermediate) || relation_present(client, &scratch) {
+            return false;
+        }
+        let _ = client.update(
+            "SELECT pg_advisory_xact_lock(hashtext($1), hashtext(reverse($1)))",
+            None,
+            &[unsafe {
+                DatumWithOid::new(view_name.to_string(), PgBuiltInOids::TEXTOID.oid().value())
+            }],
+        );
+        if relation_present(client, &scratch) {
+            return false;
+        }
+        client
+            .update(
+                &format!("CREATE UNLOGGED TABLE {scratch} (LIKE {intermediate})"),
+                None,
+                &[],
+            )
+            .unwrap_or_report();
+        true
+    });
+    if recreated {
+        warning!(
+            "pg_reflex: recreated the missing delta scratch table of IMV '{}' ({}). \
+             Writes to its sources failed or were not applied while it was absent; \
+             this reconcile refills the IMV.",
+            view_name,
+            scratch
+        );
+    }
 }
 
 fn heal_missing_intermediate_table(view_name: &str) {
@@ -1547,7 +1595,48 @@ pub(crate) fn reconcile_generated_child_for_cross_source_guard(child: &str) -> &
     {
         resync_wrapper_operand_slice(&wrapper, idx, child);
     }
+    for reader in stored_readers_of(child) {
+        crate::trigger::deferred::list_for_commit_reconcile(&reader);
+    }
     result
+}
+
+/// The enabled IMVs that read `child` and store rows of their own. A rebuild of
+/// `child` with its triggers disabled reaches none of them: the COMMIT-time pass
+/// rebuilds each one listed for it, a generated one listing its own readers in turn.
+fn stored_readers_of(child: &str) -> Vec<String> {
+    let spellings = registered_spellings_of(child);
+    let readers: Vec<String> = Spi::connect(|client| {
+        client
+            .select(
+                "SELECT name FROM public.__reflex_ivm_reference \
+                 WHERE depends_on && $1::TEXT[] AND enabled = TRUE AND name <> $2 \
+                 ORDER BY graph_depth, name",
+                None,
+                &[
+                    unsafe {
+                        DatumWithOid::new(
+                            crate::sql_writer::identifier::format_pg_text_array(&spellings),
+                            PgBuiltInOids::TEXTOID.oid().value(),
+                        )
+                    },
+                    unsafe {
+                        DatumWithOid::new(child.to_string(), PgBuiltInOids::TEXTOID.oid().value())
+                    },
+                ],
+            )
+            .unwrap_or_report()
+            .filter_map(|row| {
+                row.get_by_name::<&str, _>("name")
+                    .unwrap_or(None)
+                    .map(|s| s.to_string())
+            })
+            .collect()
+    });
+    readers
+        .into_iter()
+        .filter(|reader| !is_decomposed_wrapper_row(reader))
+        .collect()
 }
 
 /// The rebuild the DEFERRED cross-source guard asks for: a generated sub-IMV
@@ -1931,8 +2020,19 @@ pub fn reflex_scheduled_reconcile(
 /// or `source` itself when none did. Callers pass a table the way they write
 /// it, which need not be the way the IMV's query did.
 pub(crate) fn registered_spellings_of(source: &str) -> Vec<String> {
+    let registered = spellings_registered_for(source);
+    if registered.is_empty() {
+        vec![source.to_string()]
+    } else {
+        registered
+    }
+}
+
+/// Every spelling under which an IMV registered the relation `source` names;
+/// empty when no IMV reads it.
+pub(crate) fn spellings_registered_for(source: &str) -> Vec<String> {
     let relation = crate::query_decomposer::named_relation(source);
-    let registered: Vec<String> = Spi::connect(|client| {
+    Spi::connect(|client| {
         client
             .select(
                 "SELECT DISTINCT d::text AS d \
@@ -1948,12 +2048,7 @@ pub(crate) fn registered_spellings_of(source: &str) -> Vec<String> {
             })
             .filter(|spelling| crate::query_decomposer::named_relation(spelling) == relation)
             .collect()
-    });
-    if registered.is_empty() {
-        vec![source.to_string()]
-    } else {
-        registered
-    }
+    })
 }
 
 pub(crate) fn refresh_imv_depending_on(source: &str) -> &'static str {

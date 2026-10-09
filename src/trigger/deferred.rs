@@ -1273,8 +1273,27 @@ pub fn reflex_flush_deferred(source_table: &str) -> String {
             })
             .unwrap_or_else(|| NO_DEFERRED_IMVS.to_string());
         Spi::connect_mut(rebuild_truncated_imvs);
+        if flushed == NO_DEFERRED_IMVS {
+            return nothing_to_flush(source_table);
+        }
         flushed
     })
+}
+
+/// What a flush that reached no DEFERRED IMV returns. A direct call also warns,
+/// as `refresh_imv_depending_on` does; the COMMIT-time trigger flushes sources
+/// whose IMVs may have been dropped or disabled since they were queued.
+fn nothing_to_flush(source_table: &str) -> String {
+    let called_directly = Spi::get_one::<bool>("SELECT pg_trigger_depth() = 0")
+        .unwrap_or(None)
+        .unwrap_or(false);
+    if called_directly {
+        pgrx::warning!(
+            "pg_reflex: no enabled DEFERRED IMV depends on '{}'; nothing was flushed",
+            source_table
+        );
+    }
+    format!("{NO_DEFERRED_IMVS}: no enabled DEFERRED IMV depends on '{source_table}'")
 }
 
 fn flush_staged_deltas(source_table: &str) -> String {

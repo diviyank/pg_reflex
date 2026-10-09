@@ -341,6 +341,32 @@ pub(crate) fn reflex_rebuild_imv_metadata_impl(view_name: &str) -> String {
 ///
 /// Returns a status string.
 pub(crate) fn reflex_rebuild_triggers_impl(source_table: &str) -> String {
+    // The triggers of a source are named after, and select their IMVs by, the
+    // spelling the IMVs registered: rebuilt under any other they would be a
+    // second set that maintains nothing. A registered spelling that does not
+    // resolve here (an unqualified name of a table outside the search_path) is
+    // located through the catalog below.
+    let registered: Vec<String> = crate::reconcile::spellings_registered_for(source_table)
+        .into_iter()
+        .filter(|spelling| {
+            Spi::get_one_with_args::<bool>(
+                "SELECT to_regclass($1) IS NOT NULL",
+                &[unsafe {
+                    DatumWithOid::new(spelling.clone(), PgBuiltInOids::TEXTOID.oid().value())
+                }],
+            )
+            .unwrap_or(None)
+            .unwrap_or(false)
+        })
+        .collect();
+    if !registered.is_empty() {
+        return registered
+            .iter()
+            .map(|spelling| rebuild_triggers_named(spelling, spelling.clone()))
+            .collect::<Vec<_>>()
+            .join("; ");
+    }
+
     // Already schema-qualified: trust the caller.
     let resolved = if source_table.contains('.') {
         source_table.to_string()
@@ -392,6 +418,12 @@ pub(crate) fn reflex_rebuild_triggers_impl(source_table: &str) -> String {
         }
     };
 
+    rebuild_triggers_named(source_table, resolved)
+}
+
+/// Re-emits the triggers of the source `resolved` names (`source_table` is the
+/// caller's spelling of it) and the passthrough scratch tables of its IMVs.
+fn rebuild_triggers_named(source_table: &str, resolved: String) -> String {
     let result: Result<usize, String> = Spi::connect_mut(|client| {
         // Pick the correct trigger flavour by inspecting the live
         // dependency graph.  If any enabled IMV depending on this source is
@@ -425,6 +457,8 @@ pub(crate) fn reflex_rebuild_triggers_impl(source_table: &str) -> String {
                 .update(ddl, None, &[])
                 .map_err(|e| format!("CREATE TRIGGER failed: {}", e))?;
         }
+        crate::source_truncate::sync_partition_truncate_triggers(client, &resolved)
+            .map_err(|e| format!("partition truncate triggers failed: {}", e))?;
 
         // Heal passthrough scratch tables: a passthrough IMV references a per-(IMV, source) scratch
         // pair (`__reflex_pt_new/old_<imv>_<source>`) that `passthrough_op_stmts`

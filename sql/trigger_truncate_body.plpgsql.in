@@ -1,5 +1,15 @@
-DECLARE _rec RECORD; _stmts TEXT;
+DECLARE _rec RECORD; _stmts TEXT; _announced INT;
 BEGIN
+    -- A TRUNCATE fires this function before and after for every relation it
+    -- truncates (a partition, or the source and each of its partitions); the
+    -- IMVs are rebuilt once, by the last AFTER firing of the statement.
+    _announced := COALESCE(NULLIF(current_setting('__REFLEX_SLOT_ANNOUNCED_SETTING__', true), ''), '0')::INT;
+    IF TG_WHEN = 'BEFORE' THEN
+        PERFORM set_config('__REFLEX_SLOT_ANNOUNCED_SETTING__', (_announced + 1)::TEXT, true);
+        RETURN NULL;
+    END IF;
+    PERFORM set_config('__REFLEX_SLOT_ANNOUNCED_SETTING__', GREATEST(_announced - 1, 0)::TEXT, true);
+    IF _announced > 1 THEN RETURN NULL; END IF;
     FOR _rec IN
       SELECT name
       FROM public.__reflex_ivm_reference

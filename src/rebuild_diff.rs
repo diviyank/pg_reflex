@@ -8,7 +8,7 @@ use pgrx::pg_sys::panic::ErrorReportable;
 use pgrx::prelude::*;
 
 use crate::query_decomposer::quote_identifier;
-use crate::sql_writer::identifier::substitute_identifier_ci;
+use crate::sql_writer::identifier::substitute_column_ci;
 
 pub(crate) enum RebuildScope {
     Whole,
@@ -134,7 +134,7 @@ fn qualified_on(alias: &str, constraint: &str, partition_columns: &[String]) -> 
     partition_columns
         .iter()
         .fold(constraint.to_string(), |acc, col| {
-            substitute_identifier_ci(&acc, col, &format!("{alias}.{}", quoted(col)))
+            substitute_column_ci(&acc, col, &format!("{alias}.{}", quoted(col)))
         })
 }
 

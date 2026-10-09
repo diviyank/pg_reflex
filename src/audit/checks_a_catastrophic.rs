@@ -438,6 +438,7 @@ impl Check for InternalTablesExist {
             // group-capture tables. All are recreated by `reflex_reconcile`'s heal
             // step, which is what makes the `reflex_rebuild_imv` remedy below converge.
             required.push(crate::query_decomposer::intermediate_table_name(&imv.name));
+            required.push(crate::query_decomposer::delta_scratch_table_name(&imv.name));
             required.extend(imv.group_capture_tables());
         }
 

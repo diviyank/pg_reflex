@@ -304,12 +304,36 @@ impl Check for PartitionMirror {
             src_children.len()
         ));
 
+        // The sync recreates a missing child empty, while its sibling on the other
+        // side of the IMV keeps its rows: each such partition is refilled from the
+        // source after the sync.
+        let recreated_empty: Vec<&str> = src_children
+            .iter()
+            .filter(|child| {
+                missing_int.contains(&crate::partition::intermediate_child_name(
+                    &imv.name,
+                    &child.bare_name,
+                )) || missing_tgt.contains(&crate::partition::target_child_name(
+                    &imv.name,
+                    &child.bare_name,
+                ))
+            })
+            .map(|child| child.bare_name.as_str())
+            .collect();
+        let mut suggested_fix = format!("SELECT reflex_sync_partitions('{}');", imv.name);
+        for source_child in recreated_empty {
+            suggested_fix.push_str(&format!(
+                " SELECT reflex_reconcile_partition('{}', '', '{}');",
+                imv.name, source_child
+            ));
+        }
+
         vec![Finding {
             imv: Some(imv.name.clone()),
             severity: Severity::Warning,
             category: "partition-mirror",
             finding: msg,
-            suggested_fix: format!("SELECT reflex_sync_partitions('{}');", imv.name),
+            suggested_fix,
         }]
     }
 }
