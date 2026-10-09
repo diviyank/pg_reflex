@@ -1,9 +1,10 @@
 # A function called in attribute notation over a CTE / derived table, or one taking `record`, is not seen — limitation
 
 Residual of "the volatile function check does not see a call written in attribute notation".
-Closed on the 1.12.0 branch: `t.f`, `(t).f` and `tbl.f`, where the qualifier names a source table
-that has no column `f` and a one-argument function `f(<row type of that table>)` exists, are
-rejected at create, whatever the function's volatility (`attribute_notation_calls`,
+Closed on the 1.12.0 branch: `t.f`, `(t).f`, `(t.*).f`, `tbl.f`, `schema.tbl.f` and
+`(schema.tbl).f`, where the qualifier names a table of the FROM clause in scope that has no
+column `f` and a one-argument function `f(<row type of that table>)` exists, are rejected at
+create, whatever the function's volatility (`attribute_notation_calls`,
 `src/create_ivm/mod.rs`). Step 0 showed that the volatile case was the smaller problem: an
 IMMUTABLE row function in attribute notation was created and then raised
 `column t.f does not exist` on the first write to the source.
@@ -15,7 +16,8 @@ compares the function's argument type with that table's row type, so it does not
 
 - a qualifier naming a CTE or a derived table (`WITH c AS (...) SELECT c.f FROM c`);
 - a function declared over `record`, a polymorphic type or a parent table's row type;
-- a three-part reference (`schema.table.f`).
+- a qualifier that one query level binds both to a table and to a derived table (the two
+  branches of a UNION using the same alias for each): the reference is left alone.
 
 ## Expected vs actual
 
