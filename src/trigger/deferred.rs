@@ -1506,8 +1506,10 @@ fn flush_staged_deltas(source_table: &str) -> String {
             .map(|(n, t)| (n.clone(), t.clone()))
             .collect();
         let projection = src_cols.join(", ");
-        let new_view = transition_new_table_name(source_table);
-        let old_view = transition_old_table_name(source_table);
+        // Quoted like every reference the delta statements make to them: a
+        // source name holding an upper-case letter keeps its case here.
+        let new_view = format!("\"{}\"", transition_new_table_name(source_table));
+        let old_view = format!("\"{}\"", transition_old_table_name(source_table));
         // The new-side (I, U_NEW) and old-side (D, U_OLD) of a batch can both
         // carry a row for the same key when one key is touched more than once
         // before the flush — e.g. INSERT k then UPDATE k stages I(v0), U_OLD(v0),
