@@ -35,10 +35,17 @@ pub(crate) struct ParsedInputs {
     storage_upper: String,
     mode_upper: String,
     parsed_sql: Vec<sqlparser::ast::Statement>,
+    /// The query with its unquoted names in lower case, when it writes one otherwise.
+    /// The pipeline then works from this text, so that the names it registers and the
+    /// names in the query it stores are spelled alike.
+    folded_sql: Option<String>,
     analysis: crate::sql_analyzer::SqlAnalysis,
     /// Aggregates pg_reflex does not decompose, accepted because the query is a
     /// single-level passthrough. Only a keyless one recomputes them on every write.
     keyless_only_aggregates: Vec<String>,
+    /// Set-returning functions called in the SELECT list: each source row yields
+    /// several IMV rows, so no key of the source identifies an IMV row.
+    set_returning_select_functions: Vec<String>,
 }
 
 /// Pipeline state shared across phases of `create_reflex_ivm_impl`. Owns the
@@ -72,6 +79,7 @@ pub(crate) struct BuildContext<'a> {
     froms: Vec<String>,
     real_source_names: Vec<String>,
     is_join_query: bool,
+    select_list_returns_sets: bool,
 
     // Pre-SPI resolution outputs
     resolved_unique_columns: Vec<String>,
@@ -150,7 +158,8 @@ fn validate_and_parse_inputs(
             return Err(crate::reflex_reject(&format!("Failed to parse SQL: {}", e)));
         }
     };
-    let (analysis, keyless_only_aggregates) = match analyze(&parsed_sql) {
+    let (parsed_sql, folded_sql) = with_unquoted_names_folded(parsed_sql);
+    let (analysis, function_contract) = match analyze(&parsed_sql) {
         Err(SqlAnalysisError::MultipleQueries(_)) => {
             return Err(crate::reflex_reject("Expected 1 query, got multiple"));
         }
@@ -161,14 +170,22 @@ fn validate_and_parse_inputs(
             if let Some(reason) = a.unsupported_reason() {
                 return Err(crate::reflex_reject(&reason));
             }
-            let keyless_only_aggregates = match check_function_contract(view_name, &a) {
-                Ok(aggregates) => aggregates,
+            let function_contract = match check_function_contract(view_name, &a) {
+                Ok(contract) => contract,
                 Err(reason) => return Err(crate::reflex_reject(&reason)),
             };
+            if let Some(call) = attribute_notation_calls(&parsed_sql).first() {
+                return Err(crate::reflex_reject(&format!(
+                    "'{call}' calls a function in attribute notation (the function takes the \
+                     row of the table), which pg_reflex cannot maintain. Fix: store the value \
+                     in a column of the source table (for an immutable function, a generated \
+                     column) and select that column."
+                )));
+            }
             if let Some(message) = timezone_sensitivity_warning(view_name, &a) {
                 warning!("{message}");
             }
-            (a, keyless_only_aggregates)
+            (a, function_contract)
         }
     };
     Ok(ParsedInputs {
@@ -177,9 +194,25 @@ fn validate_and_parse_inputs(
         storage_upper,
         mode_upper,
         parsed_sql,
+        folded_sql,
         analysis,
-        keyless_only_aggregates,
+        keyless_only_aggregates: function_contract.keyless_only_aggregates,
+        set_returning_select_functions: function_contract.set_returning_select_functions,
     })
+}
+
+fn with_unquoted_names_folded(
+    mut statements: Vec<sqlparser::ast::Statement>,
+) -> (Vec<sqlparser::ast::Statement>, Option<String>) {
+    let rendered = |statements: &[sqlparser::ast::Statement]| {
+        let texts: Vec<String> = statements.iter().map(|s| s.to_string()).collect();
+        texts.join("; ")
+    };
+    let written = rendered(&statements);
+    crate::sql_analyzer::fold_unquoted_names(&mut statements);
+    let folded = rendered(&statements);
+    let folded_sql = (folded != written).then_some(folded);
+    (statements, folded_sql)
 }
 
 /// For passthrough IMVs, resolve the unique-key column set: explicit
@@ -227,17 +260,15 @@ fn resolve_unique_columns(ctx: &mut BuildContext) {
             &real_sources,
             &ctx.analysis,
         );
+    } else if ctx.select_list_returns_sets {
+        info!(
+            "pg_reflex: passthrough '{}' calls a set-returning function in its SELECT list, so \
+             no key of a source identifies its rows: it is fully refreshed by every write.",
+            ctx.view_name
+        );
     } else if !ctx.is_join_query {
         // Auto-detect: only for single-source queries (JOINs need explicit key)
-        let select_bare_names: std::collections::HashSet<String> = ctx
-            .analysis
-            .select_columns
-            .iter()
-            .map(|c| {
-                let name = c.alias.as_deref().unwrap_or(&c.expr_sql);
-                bare_column_name(name).to_lowercase()
-            })
-            .collect();
+        let select_bare_names = columns_projected_under_their_own_name(&ctx.analysis);
 
         let real_sources: Vec<&String> = ctx.real_source_names.iter().collect();
         for source in &real_sources {
@@ -269,7 +300,11 @@ fn resolve_unique_columns(ctx: &mut BuildContext) {
 
             if !pk_cols.is_empty() {
                 let pk_lower: Vec<String> = pk_cols.iter().map(|c| c.to_lowercase()).collect();
-                let all_in_select = pk_lower.iter().all(|c| select_bare_names.contains(c));
+                // The result table names its columns in lower case, so only a
+                // lower-case primary key column keeps its name there.
+                let all_in_select = pk_cols
+                    .iter()
+                    .all(|c| *c == c.to_lowercase() && select_bare_names.contains(c));
                 if all_in_select {
                     ctx.resolved_unique_columns = pk_lower;
                     ctx.plan.passthrough_columns = ctx.resolved_unique_columns.clone();
@@ -335,6 +370,19 @@ fn resolve_unique_columns(ctx: &mut BuildContext) {
     }
 }
 
+/// Names of the SELECT items that are a bare, optionally qualified or parenthesised,
+/// column reference output under the column's own name. Only such an item holds the
+/// value of the source column it is named after.
+fn columns_projected_under_their_own_name(
+    analysis: &crate::sql_analyzer::SqlAnalysis,
+) -> std::collections::HashSet<String> {
+    analysis
+        .columns_output_under_their_own_name
+        .iter()
+        .cloned()
+        .collect()
+}
+
 fn populate_source_join_keys(ctx: &mut BuildContext) {
     if ctx.plan.is_passthrough || !ctx.is_join_query {
         return;
@@ -388,12 +436,17 @@ fn listed_signatures(signatures: &[String]) -> String {
     listed
 }
 
-/// `Ok` carries the aggregates pg_reflex does not decompose that the query may still
-/// use, provided the IMV ends up keyless (see `keyed_keyless_only_aggregate`).
+struct FunctionContract {
+    /// Aggregates pg_reflex does not decompose that the query may still use, provided
+    /// the IMV ends up keyless (see `keyed_keyless_only_aggregate`).
+    keyless_only_aggregates: Vec<String>,
+    set_returning_select_functions: Vec<String>,
+}
+
 fn check_function_contract(
     view_name: &str,
     analysis: &crate::sql_analyzer::SqlAnalysis,
-) -> Result<Vec<String>, String> {
+) -> Result<FunctionContract, String> {
     let CatalogFunctionKinds {
         volatile,
         volatile_signatures,
@@ -430,15 +483,341 @@ fn check_function_contract(
             listed_signatures(&volatile_signatures)
         ));
     }
-    let unsupported: Vec<String> = aggregates
-        .into_iter()
+    let mut unsupported: Vec<String> = aggregates
+        .iter()
         .filter(|name| !SUPPORTED_AGGREGATES.contains(&name.as_str()))
         .map(|name| name.to_uppercase())
         .collect();
+    // A supported name spelled so that it is not the built-in (`other.max`, `"SUM"`)
+    // is another aggregate, which the planner reads as a plain function.
+    for call in &analysis.non_builtin_calls {
+        let written = call.written.to_uppercase();
+        let shadows_supported_name =
+            aggregates.contains(&call.name) && SUPPORTED_AGGREGATES.contains(&call.name.as_str());
+        if shadows_supported_name && !unsupported.contains(&written) {
+            unsupported.push(written);
+        }
+    }
     if !unsupported.is_empty() && !is_single_level_passthrough(analysis) {
         return Err(unsupported_aggregates_message(&unsupported));
     }
-    Ok(unsupported)
+    Ok(FunctionContract {
+        keyless_only_aggregates: unsupported,
+        set_returning_select_functions: set_returning_calls(&analysis.select_list_calls),
+    })
+}
+
+/// Those of `calls` that may run a set-returning function: one of the functions the call
+/// could resolve to returns a set. The candidates are the functions of that name taking
+/// that many arguments, in the schema the call names or, unqualified, on the
+/// `search_path`. Argument types are unknown here, so a scalar function among such
+/// candidates does not clear the call: keyed on the source key, a set-returning one would
+/// leave a DEFERRED IMV stale without an error.
+fn set_returning_calls(calls: &[crate::sql_analyzer::WrittenCall]) -> Vec<String> {
+    if calls.is_empty() {
+        return Vec::new();
+    }
+    let text_array = |values: Vec<String>| unsafe {
+        DatumWithOid::new(
+            crate::sql_writer::identifier::format_pg_text_array(&values),
+            PgBuiltInOids::TEXTOID.oid().value(),
+        )
+    };
+    let schemas = calls.iter().map(|c| c.schema.clone().unwrap_or_default());
+    let names = calls.iter().map(|c| c.name.clone());
+    let arg_counts = calls.iter().map(|c| c.arg_count.to_string());
+    let set_returning_positions: Vec<i64> = Spi::connect(|client| {
+        client
+            .select(
+                "SELECT called.position \
+                 FROM unnest($1::text[], $2::text[], $3::text[]) WITH ORDINALITY \
+                      AS called(schema_name, name, arg_count, position) \
+                 JOIN pg_catalog.pg_proc p ON p.proname::text = called.name \
+                 JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace \
+                 WHERE CASE WHEN called.schema_name = '' \
+                            THEN n.nspname = ANY(current_schemas(true)) \
+                            ELSE n.nspname::text = called.schema_name END \
+                   AND (p.pronargs = called.arg_count::int \
+                        OR (p.provariadic <> 0 AND called.arg_count::int >= p.pronargs - 1) \
+                        OR called.arg_count::int BETWEEN p.pronargs - p.pronargdefaults \
+                                                     AND p.pronargs) \
+                 GROUP BY called.position HAVING bool_or(p.proretset) ORDER BY 1",
+                None,
+                &[
+                    text_array(schemas.collect()),
+                    text_array(names.collect()),
+                    text_array(arg_counts.collect()),
+                ],
+            )
+            .unwrap_or_report()
+            .filter_map(|row| row.get_by_name::<i64, _>("position").unwrap_or(None))
+            .collect()
+    });
+    set_returning_positions
+        .into_iter()
+        .filter_map(|position| calls.get(position as usize - 1))
+        .map(|call| match &call.schema {
+            Some(schema) => format!("{schema}.{}", call.name),
+            None => call.name.clone(),
+        })
+        .collect()
+}
+
+/// What a qualifier names in the FROM clause of one query level.
+#[derive(Clone)]
+enum FromBinding {
+    /// A table, as the query writes it. Only one written without an alias answers to
+    /// its schema-qualified name.
+    Relation { written: String, has_alias: bool },
+    /// A derived table, a CTE or a function: its row type is not a table's.
+    NotATable,
+}
+
+/// The FROM bindings of each query level being visited, innermost last, and the CTE
+/// names each level declares.
+#[derive(Default)]
+struct RowFunctionCandidates {
+    from_bindings: Vec<std::collections::HashMap<String, Vec<FromBinding>>>,
+    cte_names: Vec<Vec<String>>,
+    /// (table as written, schema the reference names or "", name, reference as written)
+    found: Vec<(String, String, String, String)>,
+}
+
+impl RowFunctionCandidates {
+    fn bind_set_expr(&mut self, body: &sqlparser::ast::SetExpr) {
+        use sqlparser::ast::SetExpr;
+        match body {
+            SetExpr::Select(select) => {
+                for table in &select.from {
+                    self.bind_factor(&table.relation);
+                    for join in &table.joins {
+                        self.bind_factor(&join.relation);
+                    }
+                }
+            }
+            SetExpr::SetOperation { left, right, .. } => {
+                self.bind_set_expr(left);
+                self.bind_set_expr(right);
+            }
+            _ => {}
+        }
+    }
+
+    fn bind_factor(&mut self, factor: &sqlparser::ast::TableFactor) {
+        use crate::sql_analyzer::folded;
+        use sqlparser::ast::TableFactor;
+        let (qualifier, binding) = match factor {
+            TableFactor::Table {
+                name, alias, args, ..
+            } => {
+                let table = name.0.last().and_then(|part| part.as_ident()).map(folded);
+                let names_a_cte = name.0.len() == 1
+                    && table
+                        .as_ref()
+                        .is_some_and(|table| self.cte_names.iter().flatten().any(|c| c == table));
+                let binding = if args.is_some() || names_a_cte {
+                    FromBinding::NotATable
+                } else {
+                    FromBinding::Relation {
+                        written: name.to_string(),
+                        has_alias: alias.is_some(),
+                    }
+                };
+                (alias.as_ref().map(|a| folded(&a.name)).or(table), binding)
+            }
+            TableFactor::NestedJoin {
+                table_with_joins,
+                alias,
+            } => {
+                self.bind_factor(&table_with_joins.relation);
+                for join in &table_with_joins.joins {
+                    self.bind_factor(&join.relation);
+                }
+                (
+                    alias.as_ref().map(|a| folded(&a.name)),
+                    FromBinding::NotATable,
+                )
+            }
+            TableFactor::Derived { alias, .. }
+            | TableFactor::TableFunction { alias, .. }
+            | TableFactor::Function { alias, .. }
+            | TableFactor::UNNEST { alias, .. } => (
+                alias.as_ref().map(|a| folded(&a.name)),
+                FromBinding::NotATable,
+            ),
+            _ => (None, FromBinding::NotATable),
+        };
+        if let (Some(qualifier), Some(level)) = (qualifier, self.from_bindings.last_mut()) {
+            level.entry(qualifier).or_default().push(binding);
+        }
+    }
+
+    /// The tables `qualifier` can only name at the innermost level that binds it. A
+    /// level that also binds it to something that is not a table settles nothing.
+    fn tables_named(&self, qualifier: &str) -> Vec<(String, bool)> {
+        let Some(bindings) = self
+            .from_bindings
+            .iter()
+            .rev()
+            .find_map(|level| level.get(qualifier))
+        else {
+            return Vec::new();
+        };
+        let mut tables = Vec::new();
+        for binding in bindings {
+            match binding {
+                FromBinding::Relation { written, has_alias } => {
+                    tables.push((written.clone(), *has_alias))
+                }
+                FromBinding::NotATable => return Vec::new(),
+            }
+        }
+        tables
+    }
+
+    fn record(
+        &mut self,
+        schema: Option<&sqlparser::ast::Ident>,
+        table: &str,
+        name: &str,
+        text: &str,
+    ) {
+        for (written, has_alias) in self.tables_named(table) {
+            // PostgreSQL matches `schema.table` against unaliased FROM items only.
+            if schema.is_some() && has_alias {
+                continue;
+            }
+            self.found.push((
+                written,
+                schema.map(crate::sql_analyzer::folded).unwrap_or_default(),
+                name.to_string(),
+                text.to_string(),
+            ));
+        }
+    }
+}
+
+impl sqlparser::ast::Visitor for RowFunctionCandidates {
+    type Break = ();
+
+    fn pre_visit_query(&mut self, query: &sqlparser::ast::Query) -> std::ops::ControlFlow<()> {
+        let declared = query.with.iter().flat_map(|with| &with.cte_tables);
+        self.cte_names.push(
+            declared
+                .map(|cte| crate::sql_analyzer::folded(&cte.alias.name))
+                .collect(),
+        );
+        self.from_bindings.push(Default::default());
+        self.bind_set_expr(&query.body);
+        std::ops::ControlFlow::Continue(())
+    }
+
+    fn post_visit_query(&mut self, _: &sqlparser::ast::Query) -> std::ops::ControlFlow<()> {
+        self.cte_names.pop();
+        self.from_bindings.pop();
+        std::ops::ControlFlow::Continue(())
+    }
+
+    fn pre_visit_expr(&mut self, expr: &sqlparser::ast::Expr) -> std::ops::ControlFlow<()> {
+        use crate::sql_analyzer::folded;
+        use sqlparser::ast::{AccessExpr, Expr};
+        let text = expr.to_string();
+        match expr {
+            Expr::CompoundIdentifier(parts) => match parts.as_slice() {
+                [table, name] => self.record(None, &folded(table), &folded(name), &text),
+                [schema, table, name] => {
+                    self.record(Some(schema), &folded(table), &folded(name), &text)
+                }
+                _ => {}
+            },
+            Expr::CompoundFieldAccess { root, access_chain } => {
+                let [AccessExpr::Dot(Expr::Identifier(name))] = access_chain.as_slice() else {
+                    return std::ops::ControlFlow::Continue(());
+                };
+                let mut row = root.as_ref();
+                while let Expr::Nested(inner) = row {
+                    row = inner;
+                }
+                let qualifier: Vec<&sqlparser::ast::Ident> = match row {
+                    Expr::Identifier(table) => vec![table],
+                    Expr::CompoundIdentifier(parts) => parts.iter().collect(),
+                    Expr::QualifiedWildcard(table, _) => {
+                        table.0.iter().filter_map(|part| part.as_ident()).collect()
+                    }
+                    _ => Vec::new(),
+                };
+                match qualifier.as_slice() {
+                    [table] => self.record(None, &folded(table), &folded(name), &text),
+                    // `(t.c).name` reads a field of the column `c` when `t` is in scope.
+                    [schema, table] if self.tables_named(&folded(schema)).is_empty() => {
+                        self.record(Some(schema), &folded(table), &folded(name), &text)
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+        std::ops::ControlFlow::Continue(())
+    }
+}
+
+/// Column references that PostgreSQL resolves as a call `function(row)`: the qualifier
+/// names a table in the FROM clause in scope, that table has no such column, and a
+/// one-argument function over its row type does. Returned as the query writes them.
+fn attribute_notation_calls(statements: &[sqlparser::ast::Statement]) -> Vec<String> {
+    use sqlparser::ast::Visit;
+
+    let mut candidates = RowFunctionCandidates::default();
+    for statement in statements {
+        let _ = statement.visit(&mut candidates);
+    }
+    if candidates.found.is_empty() {
+        return Vec::new();
+    }
+    let column = |position: usize| -> Vec<String> {
+        candidates
+            .found
+            .iter()
+            .map(|found| [&found.0, &found.1, &found.2][position].clone())
+            .collect()
+    };
+    let text_array = |values: Vec<String>| unsafe {
+        DatumWithOid::new(
+            crate::sql_writer::identifier::format_pg_text_array(&values),
+            PgBuiltInOids::TEXTOID.oid().value(),
+        )
+    };
+    let called_positions: Vec<i64> = Spi::connect(|client| {
+        client
+            .select(
+                "SELECT DISTINCT referenced.position \
+                 FROM unnest($1::text[], $2::text[], $3::text[]) WITH ORDINALITY \
+                      AS referenced(relation, schema_name, name, position) \
+                 JOIN pg_catalog.pg_class r ON r.oid = to_regclass(referenced.relation) \
+                 JOIN pg_catalog.pg_namespace rn ON rn.oid = r.relnamespace \
+                 JOIN pg_catalog.pg_proc p ON p.proname::text = referenced.name \
+                      AND p.pronargs = 1 AND p.proargtypes[0] = r.reltype \
+                 WHERE referenced.schema_name IN ('', rn.nspname::text) \
+                   AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_attribute a \
+                                   WHERE a.attrelid = r.oid AND a.attname::text = referenced.name \
+                                     AND a.attnum > 0 AND NOT a.attisdropped) \
+                 ORDER BY 1",
+                None,
+                &[
+                    text_array(column(0)),
+                    text_array(column(1)),
+                    text_array(column(2)),
+                ],
+            )
+            .unwrap_or_report()
+            .filter_map(|row| row.get_by_name::<i64, _>("position").unwrap_or(None))
+            .collect()
+    });
+    called_positions
+        .into_iter()
+        .filter_map(|position| candidates.found.get(position as usize - 1))
+        .map(|found| found.3.clone())
+        .collect()
 }
 
 /// A keyed passthrough is maintained row by row from the transition tables, which
@@ -458,6 +837,62 @@ fn keyed_keyless_only_aggregate(
         unsupported_aggregates_message(keyless_only_aggregates),
         ctx.resolved_unique_columns.join(", ")
     ))
+}
+
+/// A passthrough is maintained row by row once it has a key, and an aggregate the
+/// planner leaves to PostgreSQL (`COUNT(DISTINCT ...)` or an aggregate under IS NULL,
+/// without GROUP BY) is not a row of the source.
+fn keyed_passthrough_aggregate(ctx: &BuildContext) -> Option<String> {
+    if !ctx.plan.is_passthrough || ctx.resolved_unique_columns.is_empty() {
+        return None;
+    }
+    let aggregate = ctx.analysis.select_columns.iter().find(|col| {
+        col.aggregate.is_some() || col.is_aggregate_derived || col.holds_undecomposed_aggregate
+    })?;
+    Some(format!(
+        "{} without GROUP BY is recomputed on every write and cannot be maintained by a \
+         unique key; this IMV would be keyed on ({}). Fix: do not pass unique_columns.",
+        aggregate.expr_sql,
+        ctx.resolved_unique_columns.join(", ")
+    ))
+}
+
+/// Two output columns PostgreSQL gives the same name, which the result table would have
+/// to hold twice.
+fn repeated_output_column(analysis: &crate::sql_analyzer::SqlAnalysis) -> Option<String> {
+    let mut seen = std::collections::HashSet::new();
+    analysis
+        .named_outputs
+        .iter()
+        .find(|name| !seen.insert(name.as_str()))
+        .cloned()
+}
+
+/// Two grouping keys (GROUP BY columns, or the columns of a SELECT DISTINCT) the
+/// intermediate table would have to hold under one column name.
+fn group_keys_sharing_a_column_name(
+    analysis: &crate::sql_analyzer::SqlAnalysis,
+) -> Option<(String, String, String)> {
+    let plan = plan_aggregation(analysis);
+    if plan.is_passthrough {
+        return None;
+    }
+    let selects_distinct_rows = analysis.has_distinct && analysis.group_by_columns.is_empty();
+    let distinct_keys = analysis
+        .select_columns
+        .iter()
+        .filter(|col| selects_distinct_rows && col.is_passthrough)
+        .map(|col| &col.expr_sql);
+    let mut first_key_named: std::collections::HashMap<String, &String> =
+        std::collections::HashMap::new();
+    for key in plan.group_by_columns.iter().chain(distinct_keys) {
+        let column = normalized_column_name(key);
+        if let Some(first) = first_key_named.get(&column) {
+            return Some(((*first).clone(), key.clone(), column));
+        }
+        first_key_named.insert(column, key);
+    }
+    None
 }
 
 /// One SELECT with no nested query that the planner maintains as a passthrough: no
@@ -2254,10 +2689,12 @@ pub(crate) fn create_reflex_ivm_impl_with_materialization(
         return "REFLEX INCREMENTAL VIEW ALREADY EXISTS (skipped)";
     }
 
-    let parsed = match validate_and_parse_inputs(view_name, sql, storage_mode, refresh_mode) {
+    let mut parsed = match validate_and_parse_inputs(view_name, sql, storage_mode, refresh_mode) {
         Ok(p) => p,
         Err(msg) => return msg,
     };
+    let folded_sql = parsed.folded_sql.take();
+    let sql = folded_sql.as_deref().unwrap_or(sql);
 
     warn_on_bare_name_under_nonpublic_search_path(view_name);
 
@@ -2317,6 +2754,22 @@ pub(crate) fn create_reflex_ivm_impl_with_materialization(
              index and incremental refresh both rely on. Fix: add '{gb}' to the SELECT \
              list, or move the wrapping expression into a passthrough outer layer \
              (an outer SELECT over a CTE that projects the bare key + aggregates)."
+        ));
+    }
+
+    if let Some((first, second, column)) = group_keys_sharing_a_column_name(&parsed.analysis) {
+        return crate::reflex_reject(&format!(
+            "Grouping keys '{first}' and '{second}' share the column name '{column}', which \
+             the intermediate table cannot hold twice. Fix: list a key once; for two different \
+             columns, rename them in a CTE and group over it: WITH j AS (SELECT a.label AS \
+             a_label, b.label AS b_label FROM ...) SELECT a_label, b_label, COUNT(*) FROM j \
+             GROUP BY a_label, b_label"
+        ));
+    }
+    if let Some(column) = repeated_output_column(&parsed.analysis) {
+        return crate::reflex_reject(&format!(
+            "Two columns of the SELECT list are named '{column}', and a table cannot hold \
+             both. Fix: give each a distinct alias (a.label AS a_label, b.label AS b_label)."
         ));
     }
 
@@ -2386,8 +2839,10 @@ pub(crate) fn create_reflex_ivm_impl_with_materialization(
         storage_upper,
         mode_upper,
         parsed_sql,
+        folded_sql: _,
         mut analysis,
         keyless_only_aggregates,
+        set_returning_select_functions,
     } = parsed;
 
     // Resolve every bare source against the current `search_path` so the
@@ -2501,6 +2956,7 @@ pub(crate) fn create_reflex_ivm_impl_with_materialization(
         froms,
         real_source_names,
         is_join_query,
+        select_list_returns_sets: !set_returning_select_functions.is_empty(),
         resolved_unique_columns: Vec::new(),
         resolved_partition_cols: Vec::new(),
         resolved_strategy: String::new(),
@@ -2510,8 +2966,19 @@ pub(crate) fn create_reflex_ivm_impl_with_materialization(
         unlogged_tables: Vec::new(),
     };
 
+    if ctx.plan.is_passthrough && ctx.select_list_returns_sets && !unique_columns_str.is_empty() {
+        return crate::reflex_reject(&format!(
+            "A set-returning function in the SELECT list ({}) yields several rows per source \
+             row, so the IMV cannot be maintained by a unique key: it is recomputed on every \
+             write. Fix: do not pass unique_columns.",
+            set_returning_select_functions.join(", ")
+        ));
+    }
     resolve_unique_columns(&mut ctx);
     if let Some(reason) = keyed_keyless_only_aggregate(&ctx, &keyless_only_aggregates) {
+        return crate::reflex_reject(&reason);
+    }
+    if let Some(reason) = keyed_passthrough_aggregate(&ctx) {
         return crate::reflex_reject(&reason);
     }
 
