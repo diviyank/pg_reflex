@@ -6,9 +6,11 @@ use crate::sql_analyzer::SqlAnalysis;
 // names available here so existing call sites (and the public-facing test
 // surface in `unit_query_decomposer.rs`) compile without churn. They are true
 // aliases, not wrappers, so there is no extra function-call indirection.
+#[cfg(test)]
+pub use crate::sql_writer::identifier::replace_identifier;
 pub use crate::sql_writer::identifier::{
     format_pg_text_array as format_pg_text_array_literal, quote as quote_identifier,
-    replace_identifier, safe as safe_identifier, split_qualified as split_qualified_name,
+    safe as safe_identifier, split_qualified as split_qualified_name,
 };
 
 /// The single normalization point for a stored source name. A CTE-decomposed
@@ -243,12 +245,6 @@ pub fn normalized_column_name(col: &str) -> String {
     };
     truncate_identifier(result)
 }
-
-// `replace_identifier` is re-exported at the top of this file (see the
-// `pub use` block). `strip_redundant_bare_alias` is not re-exported
-// here — call [`crate::sql_writer::identifier::strip_redundant_bare_alias`]
-// directly (the only caller, `replace_source_with_transition`, lives in
-// `sql_writer::identifier` itself).
 
 /// Generate the base query: source data -> intermediate table.
 ///

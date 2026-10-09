@@ -1858,6 +1858,7 @@ mod tests {
     include!("tests/pg_test_v112_joins.rs");
     include!("tests/pg_test_v112_joins_review.rs");
     include!("tests/pg_test_v112_having.rs");
+    include!("tests/pg_test_v112_cte_misc.rs");
 }
 
 /// This module is required by `cargo pgrx test` invocations.
