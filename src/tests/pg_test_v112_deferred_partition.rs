@@ -771,3 +771,91 @@ fn v112_dp_dropped_target_leaf_remedy_restores_the_data_immediate() {
 fn v112_dp_dropped_target_leaf_remedy_restores_the_data_deferred() {
     v112_dp_assert_dropped_leaf_remedy_restores_the_data("v112_dp_td", "DEFERRED", false);
 }
+
+fn v112_dp_flush(source: &str) -> String {
+    Spi::get_one::<String>(&format!(
+        "SELECT reflex_flush_deferred({})",
+        sql_lit(source)
+    ))
+    .expect("flush")
+    .unwrap_or_default()
+}
+
+/// A manual flush names the source the way the caller writes it, which need not
+/// be the way the IMV's query did.
+#[pg_test]
+fn v112_dp_manual_flush_accepts_every_spelling_of_the_source() {
+    let spellings = ["{t}", "public.{t}", "\"{t}\"", "\"public\".\"{t}\"", "PUBLIC.{T}"];
+    for (r, registered) in spellings.iter().take(4).enumerate() {
+        for (c, called) in spellings.iter().enumerate() {
+            let t = format!("v112_dp_fl_{r}{c}");
+            let spell = |pattern: &str| pattern.replace("{t}", &t).replace("{T}", &t.to_uppercase());
+            Spi::run(&format!("CREATE TABLE {t}(id SERIAL PRIMARY KEY, g TEXT, v INT)")).expect("t");
+            Spi::run(&format!("INSERT INTO {t}(g, v) VALUES ('a', 1), ('b', 2)")).expect("seed");
+            let query = format!("SELECT g, SUM(v) AS sv FROM {} GROUP BY g", spell(registered));
+            let imv = format!("{t}_v");
+            assert_eq!(
+                crate::create_reflex_ivm(&imv, &query, None, None, Some("DEFERRED"), None),
+                "CREATE REFLEX INCREMENTAL VIEW"
+            );
+            Spi::run(&format!("INSERT INTO {t}(g, v) VALUES ('a', 10), ('c', 30)")).expect("write");
+            let flushed = v112_dp_flush(&spell(called));
+            assert!(
+                flushed.starts_with("FLUSHED"),
+                "registered as {}, flushed as {}: {flushed}",
+                spell(registered),
+                spell(called)
+            );
+            assert_imv_correct(&imv, &query);
+        }
+    }
+}
+
+/// The outer IMV of a decomposed CTE registers its sub-IMV double-quoted; the
+/// plain name of the sub-IMV flushes it all the same.
+#[pg_test]
+fn v112_dp_manual_flush_by_the_plain_name_of_a_cte_sub_imv() {
+    Spi::run("CREATE TABLE v112_dp_fc(id SERIAL PRIMARY KEY, season TEXT, v INT)").expect("t");
+    Spi::run("INSERT INTO v112_dp_fc(season, v) VALUES ('e',1),('y',2),('e',3)").expect("seed");
+    let query = "WITH e AS (SELECT season, SUM(v) AS s FROM v112_dp_fc GROUP BY season) \
+                 SELECT season, s FROM e WHERE season <> 'x'";
+    assert_eq!(
+        crate::create_reflex_ivm("v112_dp_fc_v", query, None, None, Some("DEFERRED"), None),
+        "CREATE REFLEX INCREMENTAL VIEW"
+    );
+    for (write, sub_imv) in [
+        ("INSERT INTO v112_dp_fc(season, v) VALUES ('e',10),('z',30)", "v112_dp_fc_v__cte_e"),
+        ("UPDATE v112_dp_fc SET v = v + 1", "public.v112_dp_fc_v__cte_e"),
+        ("DELETE FROM v112_dp_fc WHERE season = 'y'", "\"v112_dp_fc_v__cte_e\""),
+    ] {
+        Spi::run(write).expect("write");
+        assert!(v112_dp_flush("v112_dp_fc").starts_with("FLUSHED"));
+        let flushed = v112_dp_flush(sub_imv);
+        assert!(flushed.starts_with("FLUSHED"), "flushed as {sub_imv}: {flushed}");
+        assert_imv_correct("v112_dp_fc_v", query);
+    }
+}
+
+/// A flush that reaches no DEFERRED IMV names the source it was given.
+#[pg_test]
+fn v112_dp_manual_flush_that_matches_nothing_says_so() {
+    Spi::run("CREATE TABLE v112_dp_fn(id SERIAL PRIMARY KEY, g TEXT, v INT)").expect("t");
+    assert_eq!(
+        crate::create_reflex_ivm(
+            "v112_dp_fn_v",
+            "SELECT g, SUM(v) AS sv FROM v112_dp_fn GROUP BY g",
+            None,
+            None,
+            Some("IMMEDIATE"),
+            None
+        ),
+        "CREATE REFLEX INCREMENTAL VIEW"
+    );
+    for source in ["v112_dp_fn", "v112_dp_no_such_table", "v112_dp_fn_v"] {
+        let flushed = v112_dp_flush(source);
+        assert!(
+            flushed.starts_with("NO DEFERRED IMVS") && flushed.contains(source),
+            "{source}: {flushed}"
+        );
+    }
+}
