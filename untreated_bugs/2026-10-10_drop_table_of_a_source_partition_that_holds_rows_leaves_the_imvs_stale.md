@@ -24,8 +24,9 @@ only mode run): grouped aggregate, MIN/MAX, ungrouped aggregate, filtered aggreg
 keyless passthrough, partitioned aggregate and partitioned keyed passthrough all still hold the
 dropped partition's rows (bidirectional `EXCEPT ALL` non-empty for the 9 IMVs of the fixture of
 `src/tests/pg_test_v112_partition_dml.rs`, with the step added by hand; the step is not in the
-committed matrix). No error, no warning; `known_stale` was not read. The next write through the
-source does not repair them.
+committed matrix; run once, on an earlier state of that branch). No error, no warning;
+`known_stale` was not read. After the next writes through the source, 7 of the 9 were still wrong
+(the two unpartitioned passthroughs without an aggregate were not).
 
 `ALTER TABLE s DETACH PARTITION s_pe; DROP TABLE s_pe;` in one transaction is correct (it is a
 step of the committed matrix, IMMEDIATE and DEFERRED).
