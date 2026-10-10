@@ -4,6 +4,54 @@
 // `pg_test_partition_attach_locks.rs`, `pg_test_rebuild_commit.rs`,
 // `pg_test_v112_deferred_partition.rs` and `pg_test_v112_partition_dml.rs`).
 
+/// The statements an audit report prints under its "Suggested fix:" lines.
+fn v112_pr_remedies(report: &str) -> Vec<String> {
+    let mut remedies: Vec<String> = Vec::new();
+    let mut inside_a_fix = false;
+    for line in report.lines() {
+        if line.trim() == "Suggested fix:" {
+            inside_a_fix = true;
+            continue;
+        }
+        if !inside_a_fix {
+            continue;
+        }
+        match line.strip_prefix("    ").map(str::trim) {
+            Some(statement) if !statement.is_empty() => {
+                if !remedies.iter().any(|known| known == statement) {
+                    remedies.push(statement.to_string());
+                }
+            }
+            _ => inside_a_fix = false,
+        }
+    }
+    remedies
+}
+
+/// The expression of a remedy printed as `SELECT <expression>;`.
+fn v112_pr_remedy_expression(remedy: &str) -> &str {
+    remedy
+        .trim_end_matches(';')
+        .strip_prefix("SELECT ")
+        .unwrap_or_else(|| panic!("the remedy is not a SELECT statement: {remedy}"))
+}
+
+fn v112_pr_worker_audit() -> String {
+    rbc_select("reflex_audit()")
+}
+
+/// Runs on the worker, one transaction each, every remedy `report` prints; the
+/// remedies that answered with an error.
+fn v112_pr_worker_run_remedies(report: &str) -> Vec<String> {
+    v112_pr_remedies(report)
+        .into_iter()
+        .filter_map(|remedy| {
+            let outcome = rbc_select(v112_pr_remedy_expression(&remedy));
+            outcome.starts_with("ERROR").then(|| format!("{remedy} answered {outcome}"))
+        })
+        .collect()
+}
+
 /// (IMV, what differs) for every IMV of `imvs` that differs from its query or is
 /// flagged stale on the worker.
 fn v112_pr_wrong_imvs(imvs: &[(String, String)]) -> Vec<String> {
@@ -212,6 +260,194 @@ fn v112_pr_tree_fixture(mode: &str) -> Vec<(String, String)> {
     ]
 }
 
+/// (table of the tree, a partition-key value it accepts, one of its triggers).
+const V112_PR_TREE_TRIGGERS: &[(&str, &str, &str)] = &[
+    ("s_pa", "a", "reflex_partition_ins_on_s"),
+    ("s_pa", "a", "reflex_partition_del_on_s"),
+    ("s_pa", "a", "reflex_partition_upd_on_s"),
+    ("s_pa", "a", "reflex_partition_guard_on_s"),
+    ("s_pa", "a", "__reflex_trigger_btrunc_on_s"),
+    ("s_pa", "a", "__reflex_trigger_trunc_on_s"),
+    ("s_pc1", "c", "reflex_partition_ins_on_s"),
+    ("s_pc1", "c", "__reflex_trigger_trunc_on_s"),
+    ("s_pc", "c", "reflex_partition_upd_on_s"),
+    ("s_pc", "c", "__reflex_trigger_trunc_on_s"),
+    ("s", "a", "reflex_partitioned_source_s"),
+    ("s", "a", "__reflex_trigger_btrunc_on_s"),
+    ("s", "a", "__reflex_trigger_ins_on_s"),
+    ("s", "a", "__reflex_trigger_trunc_on_s"),
+];
+
+fn v112_pr_trigger_state(table: &str, trigger: &str) -> String {
+    rbc_select(&format!(
+        "SELECT COALESCE((SELECT tgenabled::text FROM pg_trigger \
+           WHERE tgrelid = '{table}'::regclass AND tgname = '{trigger}'), 'missing')"
+    ))
+}
+
+/// Statements addressed to `table`, one transaction each: every kind of write,
+/// and a TRUNCATE when `truncating`.
+fn v112_pr_writes_addressed_to(table: &str, value: &str, id: usize, truncating: bool) -> Vec<String> {
+    let mut writes = vec![
+        format!("INSERT INTO {table} VALUES ({id},'{value}',5),({},'{value}',6)", id + 1),
+        format!("UPDATE {table} SET v = v + 1"),
+        format!("DELETE FROM {table} WHERE id = (SELECT min(id) FROM {table})"),
+    ];
+    if truncating {
+        writes.push(format!("TRUNCATE {table}"));
+        writes.push(format!("INSERT INTO {table} VALUES ({},'{value}',8)", id + 2));
+    }
+    writes
+}
+
+/// For every trigger of the tree, dropped and then disabled: the audit names the
+/// table and the trigger, its printed remedy leaves a clean audit and correct
+/// IMVs, and statements addressed to the table are maintained again.
+fn v112_pr_damaged_trigger_failures(mode: &str) -> Vec<String> {
+    let imvs = v112_pr_tree_fixture(mode);
+    let mut failures = Vec::new();
+    let clean = v112_pr_worker_audit();
+    if !clean.contains("no findings") {
+        failures.push(format!("{mode} audit after create:\n{clean}"));
+    }
+    let (id_while_damaged, id_once_restored) = (20, 30);
+    for (damage, expected_state) in [("dropped", "missing"), ("disabled", "D")] {
+        for (table, value, trigger) in V112_PR_TREE_TRIGGERS {
+            let case = format!("{mode} {trigger} {damage} on {table}");
+            let truncating = trigger.contains("trunc");
+            worker_exec(&match damage {
+                "dropped" => format!("DROP TRIGGER \"{trigger}\" ON {table}"),
+                _ => format!("ALTER TABLE {table} DISABLE TRIGGER \"{trigger}\""),
+            });
+            assert_eq!(v112_pr_trigger_state(table, trigger), expected_state, "fixture: {case}");
+            for write in v112_pr_writes_addressed_to(table, value, id_while_damaged, truncating) {
+                let _ = v112_dp_try(&write);
+            }
+
+            let report = v112_pr_worker_audit();
+            let named = report.contains("trigger-attached")
+                && report.contains(trigger)
+                && report.contains(&format!(" {table} "))
+                && (damage == "dropped" || report.contains("disabled"));
+            if !named {
+                failures.push(format!("{case}: the audit does not name it:\n{report}"));
+            }
+            failures.extend(
+                v112_pr_worker_run_remedies(&report).into_iter().map(|e| format!("{case}: {e}")),
+            );
+            let state = v112_pr_trigger_state(table, trigger);
+            if state != "O" {
+                failures.push(format!("{case}: after the remedy the trigger is {state}"));
+            }
+            let after_remedy = v112_pr_worker_audit();
+            if !after_remedy.contains("no findings") {
+                failures.push(format!("{case}: audit after the remedy:\n{after_remedy}"));
+            }
+            let wrong = v112_pr_wrong_imvs(&imvs);
+            if !wrong.is_empty() {
+                failures.push(format!("{case}: after the remedy {}", wrong.join("; ")));
+            }
+
+            // Whatever the remedy did, the next case starts from a sound state.
+            let _ = v112_dp_try(&format!("ALTER TABLE {table} ENABLE TRIGGER \"{trigger}\""));
+            let _ = rbc_select("reflex_rebuild_triggers('s')");
+            v112_pr_worker_reconcile(&imvs);
+
+            let mut writes =
+                v112_pr_writes_addressed_to(table, value, id_once_restored, truncating);
+            writes.push(format!("DELETE FROM s; {V112_PR_TREE_SEED}"));
+            for write in writes {
+                if let Err(error) = v112_dp_try(&write) {
+                    failures.push(format!("{case}: {write} raised {error}"));
+                }
+                let wrong = v112_pr_wrong_imvs(&imvs);
+                if !wrong.is_empty() {
+                    failures.push(format!("{case}: after {write}: {}", wrong.join("; ")));
+                    v112_pr_worker_reconcile(&imvs);
+                }
+            }
+        }
+    }
+    failures.extend(v112_pr_partition_without_any_trigger_failures(mode, &imvs));
+    failures
+}
+
+/// A partition that carries none of its triggers, as one created while event
+/// triggers did not fire: one finding per IMV of the source names the partition
+/// and its six triggers, and the remedy restores them and the rows it missed.
+fn v112_pr_partition_without_any_trigger_failures(
+    mode: &str,
+    imvs: &[(String, String)],
+) -> Vec<String> {
+    let case = format!("{mode} every trigger dropped on s_pa");
+    let mut failures = Vec::new();
+    let triggers: Vec<String> = rbc_select(
+        "SELECT string_agg(tgname::text, ',' ORDER BY tgname) FROM pg_trigger \
+         WHERE tgrelid = 's_pa'::regclass AND NOT tgisinternal",
+    )
+    .split(',')
+    .map(str::to_string)
+    .collect();
+    assert_eq!(triggers.len(), 6, "fixture: s_pa carries {triggers:?}");
+    for trigger in &triggers {
+        worker_exec(&format!("DROP TRIGGER \"{trigger}\" ON s_pa"));
+    }
+    for write in v112_pr_writes_addressed_to("s_pa", "a", 20, true) {
+        let _ = v112_dp_try(&write);
+    }
+    let report = v112_pr_worker_audit();
+    let findings_naming_the_partition = report
+        .lines()
+        .filter(|line| line.contains("Table s_pa of the partition tree of source s "))
+        .filter(|line| triggers.iter().all(|trigger| line.contains(trigger.as_str())))
+        .count();
+    if findings_naming_the_partition != 2 {
+        failures.push(format!(
+            "{case}: {findings_naming_the_partition} findings name the partition and its \
+             six triggers, one is expected for each of s_total and s_agg:\n{report}"
+        ));
+    }
+    failures.extend(v112_pr_worker_run_remedies(&report).into_iter().map(|e| format!("{case}: {e}")));
+    let after_remedy = v112_pr_worker_audit();
+    if !after_remedy.contains("no findings") {
+        failures.push(format!("{case}: audit after the remedy:\n{after_remedy}"));
+    }
+    let wrong = v112_pr_wrong_imvs(imvs);
+    if !wrong.is_empty() {
+        failures.push(format!("{case}: after the remedy {}", wrong.join("; ")));
+        let _ = rbc_select("reflex_rebuild_triggers('s')");
+        v112_pr_worker_reconcile(imvs);
+    }
+    for write in v112_pr_writes_addressed_to("s_pa", "a", 30, true) {
+        if let Err(error) = v112_dp_try(&write) {
+            failures.push(format!("{case}: {write} raised {error}"));
+        }
+        let wrong = v112_pr_wrong_imvs(imvs);
+        if !wrong.is_empty() {
+            failures.push(format!("{case}: after {write}: {}", wrong.join("; ")));
+            v112_pr_worker_reconcile(imvs);
+        }
+    }
+    failures
+}
+
+fn v112_pr_assert_damaged_triggers_are_reported_and_restored(dbname: &str, mode: &str) {
+    probe_db_open(dbname);
+    let failures = v112_pr_damaged_trigger_failures(mode);
+    probe_db_close(dbname);
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[pg_test]
+fn v112_pr_audit_names_a_missing_or_disabled_tree_trigger_and_its_remedy_restores_it_immediate() {
+    v112_pr_assert_damaged_triggers_are_reported_and_restored("reflex_pr_damage_i", "IMMEDIATE");
+}
+
+#[pg_test]
+fn v112_pr_audit_names_a_missing_or_disabled_tree_trigger_and_its_remedy_restores_it_deferred() {
+    v112_pr_assert_damaged_triggers_are_reported_and_restored("reflex_pr_damage_d", "DEFERRED");
+}
+
 /// (triggers damaged, as (table, trigger); the transaction that truncates).
 const V112_PR_TRUNCATES_OVER_A_DAMAGED_TREE: &[(&[(&str, &str)], &str)] = &[
     (&[("s_pa", "__reflex_trigger_trunc_on_s")], "TRUNCATE s_pa, s_pc1"),
@@ -286,4 +522,124 @@ fn v112_pr_truncate_rebuilds_when_a_truncated_table_lacks_a_truncate_trigger_imm
 #[pg_test]
 fn v112_pr_truncate_rebuilds_when_a_truncated_table_lacks_a_truncate_trigger_deferred() {
     v112_pr_assert_truncate_over_a_damaged_tree("reflex_pr_trunc_d", "DEFERRED");
+}
+
+// ---------------------------------------------------------------------------
+// The audit's view of the triggers of a source
+// ---------------------------------------------------------------------------
+
+fn v112_pr_audit_of(imv: &str) -> String {
+    Spi::get_one::<String>(&format!("SELECT reflex_audit({})", sql_lit(imv)))
+        .expect("audit")
+        .expect("audit report")
+}
+
+fn v112_pr_run_remedies(report: &str) {
+    for remedy in v112_pr_remedies(report) {
+        let outcome = Spi::get_one::<String>(&format!(
+            "SELECT ({})::text",
+            v112_pr_remedy_expression(&remedy)
+        ))
+        .expect("remedy")
+        .unwrap_or_default();
+        assert!(!outcome.starts_with("ERROR"), "{remedy} answered {outcome}");
+    }
+}
+
+fn v112_pr_assert_audit_clean(imv: &str, when: &str) {
+    let report = v112_pr_audit_of(imv);
+    assert!(report.contains("no findings"), "{when}: audit of {imv}:\n{report}");
+}
+
+/// Sources whose trigger names exceed 63 bytes and are stored shortened:
+/// (statements creating the source, the name the query uses, a table to write).
+fn v112_pr_long_named_sources() -> Vec<(Vec<String>, &'static str, &'static str)> {
+    const PLAIN: &str = "v112_pr_a_plain_source_with_a_name_of_fifty_five_characters";
+    const QUALIFIED: &str = "v112_pr_a_long_schema_name.a_source_table_with_a_long_name";
+    const PARTITIONED: &str = "v112_pr_a_partitioned_source_with_a_name_of_fifty_chars";
+    const PARTITION: &str = "v112_pr_a_partitioned_source_with_a_name_of_fifty_chars_p1";
+    vec![
+        (vec![format!("CREATE TABLE {PLAIN}(id INT NOT NULL, g TEXT NOT NULL, v INT)")], PLAIN, PLAIN),
+        (
+            vec![
+                "CREATE SCHEMA v112_pr_a_long_schema_name".to_string(),
+                format!("CREATE TABLE {QUALIFIED}(id INT NOT NULL, g TEXT NOT NULL, v INT)"),
+            ],
+            QUALIFIED,
+            QUALIFIED,
+        ),
+        (
+            vec![
+                format!(
+                    "CREATE TABLE {PARTITIONED}(id INT NOT NULL, g TEXT NOT NULL, v INT) \
+                     PARTITION BY LIST (g)"
+                ),
+                format!(
+                    "CREATE TABLE {PARTITION} PARTITION OF {PARTITIONED} FOR VALUES IN ('a', 'b', 'c')"
+                ),
+            ],
+            PARTITIONED,
+            PARTITION,
+        ),
+    ]
+}
+
+/// Right after create the audit is clean; a trigger then dropped is reported
+/// under the name PostgreSQL stores, and the printed remedy clears the finding.
+#[pg_test]
+fn v112_pr_audit_knows_the_stored_trigger_names_of_a_long_named_source() {
+    lock_shared_fixtures();
+    for mode in ["IMMEDIATE", "DEFERRED"] {
+        for (ddls, source, written) in v112_pr_long_named_sources() {
+            for ddl in &ddls {
+                Spi::run(ddl).expect("source");
+            }
+            Spi::run(&format!("INSERT INTO {source} VALUES (1,'a',1),(2,'b',2)")).expect("seed");
+            let query = format!("SELECT g, SUM(v) AS sv FROM {source} GROUP BY g");
+            assert_eq!(
+                crate::create_reflex_ivm("v112_pr_long_v", &query, None, None, Some(mode), None),
+                "CREATE REFLEX INCREMENTAL VIEW"
+            );
+            let case = format!("{mode} {source}");
+            v112_pr_assert_audit_clean("v112_pr_long_v", &format!("{case} after create"));
+
+            let stored: Vec<String> = Spi::connect(|client| {
+                client
+                    .select(
+                        &format!(
+                            "SELECT tgname::text AS n FROM pg_trigger \
+                             WHERE tgrelid = '{source}'::regclass AND NOT tgisinternal \
+                               AND tgname LIKE '\\_\\_reflex\\_trigger\\_%' ORDER BY 1"
+                        ),
+                        None,
+                        &[],
+                    )
+                    .expect("triggers")
+                    .filter_map(|row| row.get_by_name::<String, _>("n").ok().flatten())
+                    .collect()
+            });
+            assert!(stored.len() >= 4, "fixture: {case} carries {stored:?}");
+            for trigger in &stored {
+                Spi::run(&format!("DROP TRIGGER \"{trigger}\" ON {source}")).expect("drop trigger");
+                let report = v112_pr_audit_of("v112_pr_long_v");
+                assert!(
+                    report.contains("trigger-attached") && report.contains(trigger.as_str()),
+                    "{case}: {trigger} dropped, audit:\n{report}"
+                );
+                v112_pr_run_remedies(&report);
+                v112_pr_assert_audit_clean("v112_pr_long_v", &format!("{case} after the remedy"));
+            }
+            if mode == "IMMEDIATE" {
+                Spi::run(&format!("INSERT INTO {written} VALUES (3,'a',4),(4,'c',5)")).expect("write");
+                Spi::run(&format!("UPDATE {written} SET v = v + 1 WHERE id = 1")).expect("update");
+                Spi::run(&format!("DELETE FROM {written} WHERE id = 2")).expect("delete");
+                assert_imv_correct("v112_pr_long_v", &query);
+            }
+            assert_eq!(crate::drop_reflex_ivm("v112_pr_long_v"), "DROP REFLEX INCREMENTAL VIEW");
+            Spi::run(&format!("DROP TABLE {source}")).expect("drop source");
+            if ddls.len() > 1 && ddls[0].starts_with("CREATE SCHEMA") {
+                Spi::run("DROP SCHEMA v112_pr_a_long_schema_name").expect("drop schema");
+            }
+        }
+    }
 }
