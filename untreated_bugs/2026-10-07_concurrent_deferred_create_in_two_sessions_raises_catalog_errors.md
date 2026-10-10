@@ -35,8 +35,10 @@ is serialised across sessions before the DDL runs.
 ## Consequence for the test suite
 
 Tests that COMMIT cannot run in the default parallel run. `v112_sq_commit_path`
-(`src/tests/pg_test_v112_subquery_writes.rs`) returns at once unless the test filter names it:
-`cargo pgrx test <pg> v112_sq_commit`.
+(`src/tests/pg_test_v112_subquery_writes.rs`) is `#[ignore]`d, so the default run reports it
+as ignored, not as passed. Run it alone (`cargo pgrx test` has no way to pass `--ignored`):
+`cargo test --no-default-features --features "pg18 pg_test" --lib v112_sq_commit_path -- --ignored`.
+CI does not run it yet: it needs one serial step with that command.
 
 ## Fix direction (hypothesis to falsify)
 

@@ -19,7 +19,7 @@ fn resolved_identifier(written: &str) -> String {
         .and_then(|rest| rest.strip_suffix('"'))
     {
         Some(quoted) => quoted.replace("\"\"", "\""),
-        None => written.to_lowercase(),
+        None => written.to_ascii_lowercase(),
     }
 }
 

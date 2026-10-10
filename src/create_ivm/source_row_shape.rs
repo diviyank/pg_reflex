@@ -15,7 +15,7 @@ use sqlparser::parser::Parser;
 fn resolved(written: &sqlparser::ast::Ident) -> String {
     match written.quote_style {
         Some(_) => written.value.clone(),
-        None => written.value.to_lowercase(),
+        None => written.value.to_ascii_lowercase(),
     }
 }
 
