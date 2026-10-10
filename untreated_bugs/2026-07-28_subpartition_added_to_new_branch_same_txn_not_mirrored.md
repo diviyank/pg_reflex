@@ -80,3 +80,26 @@ deeper, so the fix is not special-cased to depth 2.
 * Not a regression: identical failure on `2f8b786`.
 * Not the detached-build/ATTACH change: the branch itself mirrors correctly; it
   is only the later sub-partition that is missed.
+
+## Second shape (2026-10-10): sub-partition added under an EXISTING branch, IMMEDIATE
+
+Found by review seat R3 of the 1.12.0 full re-review (pg16), identical on `6946400` and on the
+1.12.0 integration branch at `0324f47` (`*/r3_lc_*.txt` step 19 under
+`.superpowers/sdd/2026-10-07-1.12.0-create-contract-hardening/full-review-r3-out/`); filed from its
+outputs, not re-run when filing.
+
+```sql
+-- s LIST (g); s_pc FOR VALUES IN ('c') PARTITION BY RANGE (id); s_pc1 (0..100), s_pc2 (100..200)
+-- keyed = SELECT id, g, v FROM s, key (id, g), mirroring the partitions of s to depth 2
+-- one transaction, IMMEDIATE:
+CREATE TABLE s_pc3 PARTITION OF s_pc FOR VALUES FROM (200) TO (300);
+INSERT INTO s VALUES (250,'c',1);
+-- ERROR: no partition of relation "keyed_s_pc" found for row
+```
+
+The branch is not new here, so the mirror's branch exists and only its new leaf is missing when
+the INSERT is applied; the transaction rolls back (loud, S2). DEFERRED is correct, since the
+partition flush extends the mirror before the staged rows are applied. Whether the mechanism is the
+one described above (the sync marks the parent done for the transaction) or a second one (no sync
+at all before the statement trigger of the INSERT runs) is not established.
+

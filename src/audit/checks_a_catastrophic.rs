@@ -5,6 +5,7 @@ use pgrx::PgBuiltInOids;
 
 use super::{read_attname_set, relation_exists};
 use super::{Check, Finding, ImvRow, Severity};
+use crate::source_truncate::TriggerState;
 
 pub(super) struct StagingShape;
 
@@ -246,13 +247,8 @@ impl Check for TriggerAttached {
         }
         let mut out = Vec::new();
         for src in imv.real_sources() {
-            let suffix = crate::query_decomposer::sanitized_source_suffix(src);
-            let expected = [
-                format!("__reflex_trigger_ins_on_{}", suffix),
-                format!("__reflex_trigger_del_on_{}", suffix),
-                format!("__reflex_trigger_upd_on_{}", suffix),
-                format!("__reflex_trigger_trunc_on_{}", suffix),
-            ];
+            let statement_triggers = ["ins", "del", "upd", "trunc"]
+                .map(|op| crate::schema_builder::source_trigger_name(src, op));
             // Resolve source oid; skip if missing (source-exists check covers it).
             let source_oid = match client
                 .select(
@@ -270,10 +266,11 @@ impl Check for TriggerAttached {
                 Some(0) | None => continue,
                 Some(o) => o,
             };
-            let mut present: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let mut carried: std::collections::HashMap<String, String> =
+                std::collections::HashMap::new();
             let rs = client
                 .select(
-                    "SELECT tgname::text AS n FROM pg_trigger \
+                    "SELECT tgname::text AS n, tgenabled::text AS e FROM pg_trigger \
                      WHERE tgrelid = $1::oid AND NOT tgisinternal",
                     None,
                     &[unsafe {
@@ -282,19 +279,102 @@ impl Check for TriggerAttached {
                 )
                 .unwrap_or_report();
             for row in rs {
-                if let Ok(Some(n)) = row.get_by_name::<&str, _>("n") {
-                    present.insert(n.to_string());
+                if let (Ok(Some(n)), Ok(Some(e))) = (
+                    row.get_by_name::<&str, _>("n"),
+                    row.get_by_name::<&str, _>("e"),
+                ) {
+                    carried.insert(n.to_string(), e.to_string());
                 }
             }
-            let missing: Vec<&String> = expected.iter().filter(|e| !present.contains(*e)).collect();
+            let in_state = |state: TriggerState| -> Vec<String> {
+                statement_triggers
+                    .iter()
+                    .filter(|name| {
+                        TriggerState::of(carried.get(*name).map(String::as_str)) == state
+                    })
+                    .cloned()
+                    .collect()
+            };
+            let suggested_fix = format!(
+                "SELECT reflex_rebuild_triggers('{}');\nSELECT reflex_reconcile('{}');",
+                src.replace('\'', "''"),
+                imv.name.replace('\'', "''")
+            );
+            let missing = in_state(TriggerState::Missing);
             if !missing.is_empty() {
-                let names: Vec<String> = missing.iter().map(|s| (*s).clone()).collect();
                 out.push(Finding {
                     imv: Some(imv.name.clone()),
                     severity: Severity::Error,
                     category: "trigger-attached",
-                    finding: format!("Source {} is missing trigger(s): {}", src, names.join(", ")),
-                    suggested_fix: format!("SELECT reflex_rebuild_triggers('{}');", src),
+                    finding: format!(
+                        "Source {} is missing trigger(s): {}",
+                        src,
+                        missing.join(", ")
+                    ),
+                    suggested_fix: suggested_fix.clone(),
+                });
+            }
+            let disabled = in_state(TriggerState::Disabled);
+            if !disabled.is_empty() {
+                out.push(Finding {
+                    imv: Some(imv.name.clone()),
+                    severity: Severity::Error,
+                    category: "trigger-attached",
+                    finding: format!(
+                        "Source {} has disabled trigger(s): {}",
+                        src,
+                        disabled.join(", ")
+                    ),
+                    suggested_fix: suggested_fix.clone(),
+                });
+            }
+
+            // (table, missing, disabled) for the tables of the partition tree,
+            // the source included, in tree order.
+            let mut damaged_tables: Vec<(String, Vec<String>, Vec<String>)> = Vec::new();
+            for trigger in
+                crate::source_partition_writes::tree_triggers(client, src).unwrap_or_report()
+            {
+                let reported_above =
+                    trigger.on_source && statement_triggers.contains(&trigger.name);
+                if trigger.state == TriggerState::Enabled || reported_above {
+                    continue;
+                }
+                let position = damaged_tables
+                    .iter()
+                    .position(|(table, _, _)| *table == trigger.table)
+                    .unwrap_or_else(|| {
+                        damaged_tables.push((trigger.table.clone(), Vec::new(), Vec::new()));
+                        damaged_tables.len() - 1
+                    });
+                let (_, missing, disabled) = &mut damaged_tables[position];
+                match trigger.state {
+                    TriggerState::Missing => missing.push(trigger.name),
+                    _ => disabled.push(trigger.name),
+                }
+            }
+            for (table, missing, disabled) in damaged_tables {
+                let mut damage = Vec::new();
+                if !missing.is_empty() {
+                    damage.push(format!("is missing trigger(s): {}", missing.join(", ")));
+                }
+                if !disabled.is_empty() {
+                    damage.push(format!("has disabled trigger(s): {}", disabled.join(", ")));
+                }
+                out.push(Finding {
+                    imv: Some(imv.name.clone()),
+                    severity: Severity::Error,
+                    category: "trigger-attached",
+                    finding: format!(
+                        "Table {} of the partition tree of source {} {}. Statements \
+                         addressed to {} are not maintained, or refused, until the \
+                         triggers are back.",
+                        table,
+                        src,
+                        damage.join(" and "),
+                        table
+                    ),
+                    suggested_fix: suggested_fix.clone(),
                 });
             }
         }
@@ -320,7 +400,23 @@ impl Check for TriggerModeMatches {
         for src in imv.real_sources() {
             let fn_names = ["ins", "del", "upd", "trunc"]
                 .map(|op| crate::schema_builder::source_trigger_function_name(src, op));
-            // Check each trigger function for consistency with refresh_mode.
+            // The functions of a source serve every IMV reading it: they stage
+            // (DEFERRED body) as soon as one enabled reader is DEFERRED, and apply
+            // the IMMEDIATE readers inline.
+            let source_has_deferred_reader = imv.refresh_mode == "DEFERRED"
+                || client
+                    .select(
+                        "SELECT 1 FROM public.__reflex_ivm_reference \
+                         WHERE $1 = ANY(depends_on) AND refresh_mode = 'DEFERRED' \
+                           AND enabled = TRUE LIMIT 1",
+                        None,
+                        &[unsafe {
+                            DatumWithOid::new(src.to_string(), PgBuiltInOids::TEXTOID.oid().value())
+                        }],
+                    )
+                    .unwrap_or_report()
+                    .next()
+                    .is_some();
             for fn_name in &fn_names {
                 let body: Option<String> = client
                     .select(
@@ -342,22 +438,30 @@ impl Check for TriggerModeMatches {
                     None => continue, // trigger-attached check covers absence
                 };
                 let body_is_deferred = body.contains("__reflex_delta_");
-                let expected_deferred = imv.refresh_mode == "DEFERRED";
+                let expected_deferred = source_has_deferred_reader;
                 if body_is_deferred != expected_deferred {
                     out.push(Finding {
                         imv: Some(imv.name.clone()),
                         severity: Severity::Error,
                         category: "trigger-mode-matches",
                         finding: format!(
-                            "Trigger function {} is in {} mode but IMV {} refresh_mode is {}.",
+                            "Trigger function {} is in {} mode but {}.",
                             fn_name,
                             if body_is_deferred {
                                 "DEFERRED"
                             } else {
                                 "IMMEDIATE"
                             },
-                            imv.name,
-                            imv.refresh_mode,
+                            if imv.refresh_mode == "DEFERRED" {
+                                format!("IMV {} refresh_mode is DEFERRED", imv.name)
+                            } else if source_has_deferred_reader {
+                                format!("source {} is read by a DEFERRED IMV", src)
+                            } else {
+                                format!(
+                                    "IMV {} refresh_mode is IMMEDIATE and no IMV of {} is DEFERRED",
+                                    imv.name, src
+                                )
+                            },
                         ),
                         suggested_fix: format!("SELECT reflex_rebuild_triggers('{}');", src),
                     });
