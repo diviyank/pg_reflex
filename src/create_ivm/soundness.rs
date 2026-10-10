@@ -39,7 +39,13 @@ pub(crate) fn canonicalize_analysis_sources(analysis: &mut crate::sql_analyzer::
             }
             let qualified: Option<String> = client
                 .select(
-                    "SELECT quote_ident(n.nspname) || '.' || quote_ident(c.relname) AS q \
+                    "SELECT n.nspname::text AS schema_name, c.relname::text AS table_name, \
+                            quote_ident(n.nspname) AS quoted_schema, \
+                            quote_ident(c.relname) AS quoted_table, \
+                            EXISTS (SELECT 1 FROM pg_get_keywords() k \
+                                    WHERE k.word = n.nspname::text) AS schema_is_keyword, \
+                            EXISTS (SELECT 1 FROM pg_get_keywords() k \
+                                    WHERE k.word = c.relname::text) AS table_is_keyword \
                      FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
                      WHERE c.oid = to_regclass($1)",
                     None,
@@ -50,10 +56,21 @@ pub(crate) fn canonicalize_analysis_sources(analysis: &mut crate::sql_analyzer::
                 .ok()
                 .and_then(|mut it| it.next())
                 .and_then(|row| {
-                    row.get_by_name::<&str, _>("q")
-                        .ok()
-                        .flatten()
-                        .map(|s| s.to_string())
+                    let text = |column: &str| row.get_by_name::<String, _>(column).ok().flatten();
+                    let flag = |column: &str| row.get_by_name::<bool, _>(column).ok().flatten();
+                    Some(format!(
+                        "{}.{}",
+                        registered_spelling(
+                            &text("schema_name")?,
+                            text("quoted_schema")?,
+                            flag("schema_is_keyword")?
+                        ),
+                        registered_spelling(
+                            &text("table_name")?,
+                            text("quoted_table")?,
+                            flag("table_is_keyword")?
+                        )
+                    ))
                 });
             if let Some(q) = qualified {
                 if q.starts_with("public.") {
@@ -82,11 +99,30 @@ pub(crate) fn canonicalize_analysis_sources(analysis: &mut crate::sql_analyzer::
     }
 }
 
-/// The first of `sources` that is a partitioned table whose schema or name PostgreSQL
-/// prints in double quotes (upper case, a reserved or column-name keyword, a special
-/// character). The partition bookkeeping keys a partitioned source by its unquoted
-/// `schema.name`, which is not the spelling such a source is registered under: a
-/// partition attached with rows, detached or dropped would not reach the IMV.
+/// How one part of a catalog name is registered: bare when PostgreSQL reads the bare
+/// word back as that name (`é_part` and `my$part` included, which `quote_ident` quotes
+/// although they need no quotes), quoted otherwise (upper case, a space, a keyword
+/// `quote_ident` quotes).
+fn registered_spelling(name: &str, quoted: String, is_keyword: bool) -> String {
+    let starts_a_bare_word = |c: char| c.is_ascii_lowercase() || c == '_' || !c.is_ascii();
+    let continues_a_bare_word = |c: char| starts_a_bare_word(c) || c.is_ascii_digit() || c == '$';
+    let mut characters = name.chars();
+    let reads_back_bare = !is_keyword
+        && characters.next().is_some_and(starts_a_bare_word)
+        && characters.all(continues_a_bare_word);
+    if quoted == name || reads_back_bare {
+        name.to_string()
+    } else {
+        quoted
+    }
+}
+
+/// The first of `sources` that is a partitioned table registered under a spelling
+/// that needs its double quotes (upper case, a reserved or column-name keyword, a
+/// space; not a sub-IMV, whose plain name is registered quoted). The
+/// partition bookkeeping keys a partitioned source by its unquoted `schema.name` or
+/// `name`, which is not the spelling such a source is registered under: a partition
+/// attached with rows, detached or dropped would not reach the IMV.
 pub(crate) fn partitioned_source_whose_name_needs_quotes(sources: &[String]) -> Option<String> {
     Spi::connect(|client| {
         sources.iter().find_map(|source| {
@@ -95,6 +131,7 @@ pub(crate) fn partitioned_source_whose_name_needs_quotes(sources: &[String]) -> 
                     "SELECT quote_ident(n.nspname) || '.' || quote_ident(c.relname) AS printed \
                      FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
                      WHERE c.oid = to_regclass($1) AND c.relkind = 'p' \
+                       AND $1 NOT IN (c.relname::text, n.nspname::text || '.' || c.relname::text) \
                        AND (quote_ident(n.nspname) <> n.nspname::text \
                             OR quote_ident(c.relname) <> c.relname::text)",
                     Some(1),
@@ -313,6 +350,15 @@ pub(crate) fn build_source_join_keys(
         let target_name = normalized_column_name(target_name);
         if group_by_set.contains(&target_name) {
             target_col_to_expr.insert(target_name, lower_case_unless_quoted(&col.expr_sql));
+        }
+    }
+    // A group column selected under an alias is not found by its output name:
+    // its expression is the GROUP BY entry itself.
+    for (name, written) in group_by_names.iter().zip(&plan.group_by_columns) {
+        if written.contains('.') && !written.contains('(') {
+            target_col_to_expr
+                .entry(name.clone())
+                .or_insert_with(|| lower_case_unless_quoted(written));
         }
     }
 

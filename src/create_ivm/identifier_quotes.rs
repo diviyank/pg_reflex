@@ -8,7 +8,9 @@
 use pgrx::datum::DatumWithOid;
 use pgrx::prelude::*;
 use sqlparser::ast::{
-    Expr, Ident, ObjectName, ObjectNamePart, Query, Statement, Visit, VisitMut, Visitor, VisitorMut,
+    Expr, FunctionArg, FunctionArgExpr, FunctionArguments, Ident, ObjectName, ObjectNamePart,
+    Query, SelectItem, SelectItemQualifiedWildcardKind, SetExpr, Statement, TableFactor, Visit,
+    VisitMut, Visitor, VisitorMut,
 };
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::keywords::ALL_KEYWORDS;
@@ -426,13 +428,13 @@ fn respelling(name: &Ident, keywords: &[(String, PrintedAs)]) -> Option<PrintedA
     }
 }
 
-/// The relation names written as a plain lower-case word, quoted or not, apart
-/// from the CTEs the statements define, and the qualifiers of their columns.
+/// The relation names written as a plain lower-case word, quoted or not, the CTEs
+/// the statements define and the aliases they give their tables.
 #[derive(Default)]
 struct PlainWordRelationNames {
-    relations: Vec<Ident>,
-    qualifiers: Vec<Ident>,
+    relations: Vec<String>,
     ctes: Vec<String>,
+    aliases: Vec<String>,
 }
 
 impl Visitor for PlainWordRelationNames {
@@ -452,62 +454,135 @@ impl Visitor for PlainWordRelationNames {
     fn pre_visit_relation(&mut self, relation: &ObjectName) -> ControlFlow<()> {
         if let Some(name) = table_name_of(relation) {
             if is_spelled_as_a_plain_word(name) {
-                self.relations.push(name.clone());
+                self.relations.push(name.value.clone());
             }
         }
         ControlFlow::Continue(())
     }
 
-    fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<()> {
-        if let Expr::CompoundIdentifier(parts) = expr {
-            if let [qualifier, _] = parts.as_slice() {
-                if qualifier.quote_style.is_none() {
-                    self.qualifiers.push(qualifier.clone());
-                }
-            }
+    fn pre_visit_table_factor(&mut self, factor: &TableFactor) -> ControlFlow<()> {
+        let alias = match factor {
+            TableFactor::Table { alias, .. }
+            | TableFactor::Derived { alias, .. }
+            | TableFactor::TableFunction { alias, .. }
+            | TableFactor::Function { alias, .. }
+            | TableFactor::UNNEST { alias, .. }
+            | TableFactor::NestedJoin { alias, .. } => alias.as_ref(),
+            _ => None,
+        };
+        if let Some(alias) = alias {
+            self.aliases.push(alias.name.value.clone());
         }
         ControlFlow::Continue(())
     }
 }
 
+/// Respells the keyword-named relations, and quotes with them every reference to
+/// one that gains quotes (`t.c`, `s.t.c`, `t.*`, `s.t.*`), recording each name it
+/// changes as it was written. A name that is also a table alias of the statements
+/// is respelled where it names the relation only: a qualifier written like it may
+/// be the alias. A quoted qualifier of a relation that loses its quotes stays as
+/// written: the analysis reads `"zone".c` as a column of `zone`.
 struct RelationNameRespeller<'a> {
     keywords: &'a [(String, PrintedAs)],
-    quoted_relations: &'a [String],
+    relations: &'a [String],
+    aliases: &'a [String],
+    respelled: Vec<(Ident, PrintedAs)>,
 }
 
 impl RelationNameRespeller<'_> {
-    fn respell(name: &mut Ident, printed_as: PrintedAs) {
-        name.quote_style = match printed_as {
-            PrintedAs::Bare => None,
-            PrintedAs::Quoted => Some('"'),
-        };
+    fn respell(&mut self, name: &mut Ident, is_a_qualifier: bool) {
+        if !self.relations.contains(&name.value) || !is_spelled_as_a_plain_word(name) {
+            return;
+        }
+        let respelling = respelling(name, self.keywords)
+            .filter(|printed_as| !is_a_qualifier || *printed_as == PrintedAs::Quoted);
+        if let Some(printed_as) = respelling {
+            self.respelled.push((name.clone(), printed_as));
+            name.quote_style = match printed_as {
+                PrintedAs::Bare => None,
+                PrintedAs::Quoted => Some('"'),
+            };
+        }
+    }
+
+    fn respell_qualifiers(&mut self, qualifiers: &mut [Ident]) {
+        for qualifier in qualifiers {
+            if !self.aliases.contains(&qualifier.value) {
+                self.respell(qualifier, true);
+            }
+        }
+    }
+
+    fn respell_wildcard_qualifiers(&mut self, name: &mut ObjectName) {
+        for part in &mut name.0 {
+            if let ObjectNamePart::Identifier(qualifier) = part {
+                self.respell_qualifiers(std::slice::from_mut(qualifier));
+            }
+        }
+    }
+
+    fn respell_select_level_wildcards(&mut self, body: &mut SetExpr) {
+        match body {
+            SetExpr::Select(select) => {
+                for item in &mut select.projection {
+                    if let SelectItem::QualifiedWildcard(
+                        SelectItemQualifiedWildcardKind::ObjectName(name),
+                        _,
+                    ) = item
+                    {
+                        self.respell_wildcard_qualifiers(name);
+                    }
+                }
+            }
+            SetExpr::SetOperation { left, right, .. } => {
+                self.respell_select_level_wildcards(left);
+                self.respell_select_level_wildcards(right);
+            }
+            _ => {}
+        }
     }
 }
 
 impl VisitorMut for RelationNameRespeller<'_> {
     type Break = ();
 
+    fn pre_visit_query(&mut self, query: &mut Query) -> ControlFlow<()> {
+        self.respell_select_level_wildcards(&mut query.body);
+        ControlFlow::Continue(())
+    }
+
     fn pre_visit_relation(&mut self, relation: &mut ObjectName) -> ControlFlow<()> {
-        let printed_as = table_name_of(relation)
-            .filter(|name| is_spelled_as_a_plain_word(name))
-            .and_then(|name| respelling(name, self.keywords));
-        if let (Some(printed_as), Some(ObjectNamePart::Identifier(name))) =
-            (printed_as, relation.0.last_mut())
+        let is_a_table_name = table_name_of(relation).is_some();
+        if let (true, Some(ObjectNamePart::Identifier(name))) =
+            (is_a_table_name, relation.0.last_mut())
         {
-            Self::respell(name, printed_as);
+            self.respell(name, false);
         }
         ControlFlow::Continue(())
     }
 
     fn pre_visit_expr(&mut self, expr: &mut Expr) -> ControlFlow<()> {
-        if let Expr::CompoundIdentifier(parts) = expr {
-            if let [qualifier, _] = parts.as_mut_slice() {
-                if qualifier.quote_style.is_none()
-                    && self.quoted_relations.contains(&qualifier.value)
-                {
-                    Self::respell(qualifier, PrintedAs::Quoted);
+        match expr {
+            Expr::CompoundIdentifier(parts) => {
+                if let Some((_column, qualifiers)) = parts.split_last_mut() {
+                    self.respell_qualifiers(qualifiers);
                 }
             }
+            Expr::QualifiedWildcard(name, _) => self.respell_wildcard_qualifiers(name),
+            Expr::Function(function) => {
+                if let FunctionArguments::List(list) = &mut function.args {
+                    for argument in &mut list.args {
+                        let (FunctionArg::Unnamed(value)
+                        | FunctionArg::Named { arg: value, .. }
+                        | FunctionArg::ExprNamed { arg: value, .. }) = argument;
+                        if let FunctionArgExpr::QualifiedWildcard(name) = value {
+                            self.respell_wildcard_qualifiers(name);
+                        }
+                    }
+                }
+            }
+            _ => {}
         }
         ControlFlow::Continue(())
     }
@@ -538,10 +613,11 @@ fn respelled_in_place(sql: &mut String, name: &Ident, printed_as: PrintedAs) -> 
 }
 
 /// Spells a keyword that names a relation the way PostgreSQL prints it, which is
-/// how a dropped table is reported and how a table of another schema is registered: `"zone"` becomes `zone` (an
-/// unreserved keyword) and `position` becomes `"position"`, with the qualifiers of
-/// its columns. The token-level step above leaves keywords alone, because a bare
-/// keyword is not accepted in every position; where a relation is named these
+/// how a dropped table is reported and how a table of another schema is registered:
+/// `"zone"` becomes `zone` (an unreserved keyword) and `position` becomes
+/// `"position"`, in the relation name and in every reference qualified by it. The
+/// token-level step above leaves keywords alone, because a bare keyword is not
+/// accepted in every position; where a relation or a qualifier is named these
 /// spellings name one relation. Returns the text with only those quote characters
 /// changed, or `None`, leaving `statements` as written, when nothing changes or
 /// when the parser does not read the new text as the respelled statements.
@@ -553,52 +629,35 @@ pub(crate) fn with_keyword_relations_as_postgres_prints_them(
     for statement in statements.iter() {
         let _ = statement.visit(&mut names);
     }
-    names
-        .relations
-        .retain(|name| !names.ctes.contains(&name.value));
-    let mut candidates: Vec<String> = names
-        .relations
-        .iter()
-        .map(|name| name.value.clone())
-        .collect();
-    candidates.sort();
-    candidates.dedup();
-    if candidates.is_empty() {
+    names.relations.retain(|name| !names.ctes.contains(name));
+    names.relations.sort();
+    names.relations.dedup();
+    if names.relations.is_empty() {
         return None;
     }
-    let keywords = keywords_as_postgres_prints_them(&candidates);
-    let mut edits: Vec<(Ident, PrintedAs)> = names
-        .relations
-        .into_iter()
-        .filter_map(|name| respelling(&name, &keywords).map(|printed_as| (name, printed_as)))
-        .collect();
+    let keywords = keywords_as_postgres_prints_them(&names.relations);
+    if keywords.is_empty() {
+        return None;
+    }
+    let mut respeller = RelationNameRespeller {
+        keywords: &keywords,
+        relations: &names.relations,
+        aliases: &names.aliases,
+        respelled: Vec::new(),
+    };
+    let mut respelled = statements.clone();
+    for statement in &mut respelled {
+        let _ = statement.visit(&mut respeller);
+    }
+    let mut edits = respeller.respelled;
     if edits.is_empty() {
         return None;
     }
-    let quoted_relations: Vec<String> = edits
-        .iter()
-        .filter(|(_, printed_as)| *printed_as == PrintedAs::Quoted)
-        .map(|(name, _)| name.value.clone())
-        .collect();
-    edits.extend(
-        names
-            .qualifiers
-            .into_iter()
-            .filter(|qualifier| quoted_relations.contains(&qualifier.value))
-            .map(|qualifier| (qualifier, PrintedAs::Quoted)),
-    );
     edits.sort_by_key(|(name, _)| (name.span.start.line, name.span.start.column));
     edits.dedup_by_key(|(name, _)| (name.span.start.line, name.span.start.column));
     let mut respelled_sql = sql.to_string();
     for (name, printed_as) in edits.iter().rev() {
         respelled_in_place(&mut respelled_sql, name, *printed_as)?;
-    }
-    let mut respelled = statements.clone();
-    for statement in &mut respelled {
-        let _ = statement.visit(&mut RelationNameRespeller {
-            keywords: &keywords,
-            quoted_relations: &quoted_relations,
-        });
     }
     let reparsed = Parser::parse_sql(&PostgreSqlDialect {}, &respelled_sql).ok()?;
     if rendered(&reparsed) != rendered(&respelled) {

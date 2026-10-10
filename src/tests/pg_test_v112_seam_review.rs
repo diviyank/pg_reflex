@@ -1237,11 +1237,23 @@ v112_sr_admin_path_cells! {
 /// refused with the message for a partitioned source whose name needs quotes.
 fn v112_sr_partitioned_source_cell(schema: &str, parent: &str, first: &str, attached: &str) -> String {
     Spi::run(&format!("CREATE SCHEMA {schema}")).expect("schema");
-    let table = &format!("{schema}.{parent}");
-    let first = &format!("{schema}.{first}");
-    let second = &format!("{schema}.p_b");
-    let attached = &format!("{schema}.{attached}");
-    let tag = schema.trim_matches('"').to_lowercase();
+    v112_sr_partitioned_source_tables(
+        &schema.trim_matches('"').to_lowercase(),
+        &format!("{schema}.{parent}"),
+        &format!("{schema}.{first}"),
+        &format!("{schema}.p_b"),
+        &format!("{schema}.{attached}"),
+    )
+}
+
+/// The same over tables named in full; `tag` names the IMVs.
+fn v112_sr_partitioned_source_tables(
+    tag: &str,
+    table: &str,
+    first: &str,
+    second: &str,
+    attached: &str,
+) -> String {
     Spi::run(&format!(
         "CREATE TABLE {table}(id INT, g TEXT NOT NULL, v INT) PARTITION BY LIST (g)"
     ))
@@ -1344,4 +1356,513 @@ fn v112_sr_adm_partitioned_source_named_by_a_column_name_keyword_is_refused() {
         v112_sr_partitioned_source_cell("v112_sr_admp_kw", "\"position\"", "p_a", "p_c"),
         "REFUSED"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Every reference to a respelled relation is respelled with it
+// ---------------------------------------------------------------------------
+
+/// `ok`, or the first step that raised or left the IMV different from `query`. A
+/// DEFERRED IMV is flushed after each write and must then equal its query.
+fn v112_sr_mode_cell(imv: &str, query: &str, deferred: bool, steps: &[String]) -> String {
+    let mode = if deferred { "DEFERRED" } else { "IMMEDIATE" };
+    let created = v112_j_try(&format!(
+        "SELECT create_reflex_ivm('{imv}', $v112sel${query}$v112sel$, NULL, 'UNLOGGED', '{mode}')"
+    ));
+    if created != "CREATE REFLEX INCREMENTAL VIEW" {
+        return format!("NOT-CREATED {created}");
+    }
+    let at_create = v112_j_oracle(imv, query);
+    if at_create != "0" {
+        return format!("create={at_create}");
+    }
+    for (position, dml) in steps.iter().enumerate() {
+        let ran = v112_j_try_dml(dml);
+        if ran != "OK" {
+            return format!("step{position}={ran} [{dml}]");
+        }
+        if deferred {
+            let flushed = v112_sr_flush_chain(imv);
+            if flushed.contains("RAISED") || flushed.contains("ERROR") {
+                return format!("step{position} flush={flushed} [{dml}]");
+            }
+        }
+        let compared = v112_j_oracle(imv, query);
+        if compared != "0" {
+            return format!("step{position}={compared} [{dml}]");
+        }
+    }
+    "ok".to_string()
+}
+
+/// Flushes every source of `imv` and of the sub-IMVs it was decomposed into, the
+/// base tables first.
+fn v112_sr_flush_chain(imv: &str) -> String {
+    let sources_base_first = Spi::get_one::<Vec<String>>(&format!(
+        "SELECT array_agg(d ORDER BY depth, d) FROM ( \
+            SELECT d, MIN(graph_depth) AS depth \
+            FROM public.__reflex_ivm_reference, unnest(depends_on) AS d \
+            WHERE name = '{imv}' OR name LIKE '{imv}\\_\\_%' GROUP BY d) sources"
+    ))
+    .expect("sources")
+    .unwrap_or_default();
+    sources_base_first
+        .iter()
+        .map(|source| v112_j_try(&format!("SELECT reflex_flush_deferred($v112src${source}$v112src$)")))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// `(tag, query)`: `{k}` is the keyword-named table as the cell writes it, `{p}`
+/// a plain table with a column named like it.
+const V112_SR_KEYWORD_REFERENCES: [(&str, &str); 19] = [
+    ("three_part", "SELECT public.{k}.id, public.{k}.v FROM public.{k}"),
+    ("two_part", "SELECT {k}.id, {k}.v FROM {k}"),
+    ("two_part_public_from", "SELECT {k}.id, {k}.v FROM public.{k}"),
+    ("wildcard", "SELECT {k}.* FROM {k}"),
+    ("wildcard_three_part", "SELECT public.{k}.* FROM public.{k}"),
+    ("where", "SELECT {k}.id, {k}.g FROM {k} WHERE {k}.v > 0 AND {k}.g <> 'z'"),
+    ("join_on", "SELECT public.{k}.id, p.label FROM public.{k} JOIN {p} p ON p.id = public.{k}.id AND {k}.v > 0"),
+    ("left_join_on", "SELECT p.id, p.label, public.{k}.v FROM {p} p LEFT JOIN public.{k} ON public.{k}.id = p.id"),
+    ("group_by", "SELECT public.{k}.g, SUM(public.{k}.v) AS s, COUNT(*) AS c FROM public.{k} GROUP BY public.{k}.g"),
+    ("group_by_two_part", "SELECT {k}.g, MIN({k}.v) AS mn, COUNT({k}.*) AS c FROM {k} GROUP BY {k}.g"),
+    ("having", "SELECT {k}.g, SUM({k}.v) AS s FROM public.{k} GROUP BY {k}.g HAVING SUM(public.{k}.v) > 0"),
+    ("aggregate_join", "SELECT p.label, SUM(public.{k}.v) AS s, COUNT(*) AS c FROM public.{k} JOIN {p} p ON p.id = public.{k}.id GROUP BY p.label"),
+    ("in_subquery", "SELECT p.id, p.label FROM {p} p WHERE p.id IN (SELECT public.{k}.id FROM public.{k} WHERE {k}.v > 0)"),
+    ("derived", "SELECT q.id, q.v FROM (SELECT public.{k}.id, public.{k}.v FROM public.{k} WHERE public.{k}.v IS NOT NULL) q"),
+    ("cte", "WITH c AS (SELECT public.{k}.id, {k}.v FROM public.{k}) SELECT c.id, c.v FROM c"),
+    ("same_named_alias", "SELECT k.id, {k}.label FROM public.{k} k JOIN {p} AS {k} ON {k}.id = k.id"),
+    ("same_named_column", "SELECT public.{k}.id, p.{k} AS col, p.label FROM public.{k} JOIN {p} p ON p.id = public.{k}.id"),
+    ("keyword_function", "SELECT public.{k}.id, {call} AS o FROM public.{k}"),
+    ("keyword_type", "SELECT public.{k}.id, public.{k}.v::numeric AS n, {cast} AS t FROM public.{k}"),
+];
+
+/// Flushing a DEFERRED passthrough over a derived table raises whatever the table is
+/// named (`untreated_bugs/2026-10-10_deferred_flush_of_a_passthrough_over_a_derived_table_raises.md`).
+const V112_SR_KEYWORD_REFERENCES_IMMEDIATE_ONLY: [&str; 1] = ["derived"];
+
+/// A table named by a column-name keyword, read through every kind of reference
+/// to it and written in lower and in upper case, IMMEDIATE and DEFERRED.
+fn v112_sr_keyword_references(keyword: &str, written: &str) -> Vec<String> {
+    let mut wrong = Vec::new();
+    for (tag, select) in V112_SR_KEYWORD_REFERENCES {
+        for deferred in [false, true] {
+            if deferred && V112_SR_KEYWORD_REFERENCES_IMMEDIATE_ONLY.contains(&tag) {
+                continue;
+            }
+            let mode = if deferred { "d" } else { "i" };
+            let table = format!("\"{keyword}\"");
+            let other = format!("v112_sr_kwref_{keyword}_{tag}_{mode}_p");
+            Spi::run(&format!("CREATE TABLE {table}(id INT PRIMARY KEY, g TEXT, v INT)")).expect("table");
+            Spi::run(&format!("INSERT INTO {table} VALUES (1,'a',10),(2,'a',-20),(3,'b',30)")).expect("seed");
+            Spi::run(&format!(
+                "CREATE TABLE {other}(id INT PRIMARY KEY, label TEXT, {table} INT)"
+            ))
+            .expect("other");
+            Spi::run(&format!("INSERT INTO {other} VALUES (1,'one',7),(2,'two',8),(4,'four',9)")).expect("seed");
+            let steps = vec![
+                format!("INSERT INTO {table} VALUES (4,'b',40),(5,'c',50)"),
+                format!("UPDATE {table} SET v = v + 1 WHERE id IN (1, 4)"),
+                format!("UPDATE {other} SET label = label || '!', {table} = {table} + 1 WHERE id < 4"),
+                format!("UPDATE {table} SET g = 'c', v = NULL WHERE id = 2"),
+                format!("DELETE FROM {table} WHERE id = 3"),
+                format!("INSERT INTO {other} VALUES (5,'five',1)"),
+                format!("DELETE FROM {other} WHERE id = 1"),
+            ];
+            // A function or a type named like the table itself is rewritten with it
+            // at trigger time, whatever the spelling: the cells call another one.
+            let call = if keyword == "position" {
+                "overlay({k}.g PLACING 'x' FROM 1)"
+            } else {
+                "position('a' IN {k}.g)"
+            };
+            let cast = if keyword == "time" { "'2020-01-01'::date" } else { "'10:00'::time" };
+            let query = select
+                .replace("{call}", call)
+                .replace("{cast}", cast)
+                .replace("{k}", written)
+                .replace("{p}", &other);
+            let outcome = v112_sr_mode_cell(
+                &format!("v112_sr_kwref_{keyword}_{tag}_{mode}"),
+                &query,
+                deferred,
+                &steps,
+            );
+            if outcome != "ok" {
+                wrong.push(format!("{tag} {mode}: {outcome}"));
+            }
+            Spi::run(&format!("DROP TABLE {table} CASCADE")).expect("drop keyword table");
+            Spi::run(&format!("DROP TABLE {other} CASCADE")).expect("drop other table");
+        }
+    }
+    wrong
+}
+
+#[pg_test]
+fn v112_sr_kwref_position_lower_case() {
+    lock_shared_fixtures();
+    let wrong = v112_sr_keyword_references("position", "position");
+    assert!(wrong.is_empty(), "\n{}", wrong.join("\n"));
+}
+
+#[pg_test]
+fn v112_sr_kwref_position_upper_case() {
+    lock_shared_fixtures();
+    let wrong = v112_sr_keyword_references("position", "POSITION");
+    assert!(wrong.is_empty(), "\n{}", wrong.join("\n"));
+}
+
+#[pg_test]
+fn v112_sr_kwref_position_quoted() {
+    lock_shared_fixtures();
+    let wrong = v112_sr_keyword_references("position", "\"position\"");
+    assert!(wrong.is_empty(), "\n{}", wrong.join("\n"));
+}
+
+#[pg_test]
+fn v112_sr_kwref_time_mixed_case() {
+    lock_shared_fixtures();
+    let wrong = v112_sr_keyword_references("time", "Time");
+    assert!(wrong.is_empty(), "\n{}", wrong.join("\n"));
+}
+
+/// The same references to a table with a plain name.
+#[pg_test]
+fn v112_sr_kwref_plain_name() {
+    let wrong = v112_sr_keyword_references("v112_sr_kwref_plain", "v112_sr_kwref_plain");
+    assert!(wrong.is_empty(), "\n{}", wrong.join("\n"));
+}
+
+/// A function, a type, a column and an alias written like the respelled table keep
+/// their spelling in the stored text.
+#[pg_test]
+fn v112_sr_kwref_only_references_to_the_relation_are_respelled() {
+    lock_shared_fixtures();
+    Spi::run("CREATE TABLE \"position\"(id INT PRIMARY KEY, g TEXT, v INT)").expect("table");
+    Spi::run("CREATE TABLE \"time\"(id INT PRIMARY KEY, g TEXT, position INT)").expect("table");
+    for (imv, written, stored) in [
+        (
+            "v112_sr_kwref_text_function",
+            "SELECT public.position.v + 1 AS w, position('a' IN position.g) AS at, Position.* FROM public.POSITION",
+            "SELECT public.\"position\".v + 1 AS w, position('a' IN \"position\".g) AS at, \"position\".* FROM public.\"position\"",
+        ),
+        (
+            "v112_sr_kwref_text_type",
+            "SELECT time.id, '10:00'::time AS t, time '11:00' AS u, CAST(time.g AS time) AS w, time.position FROM time",
+            "SELECT \"time\".id, '10:00'::time AS t, time '11:00' AS u, CAST(\"time\".g AS time) AS w, \"time\".position FROM \"time\"",
+        ),
+        (
+            "v112_sr_kwref_text_alias",
+            "SELECT k.id, time.g FROM position k JOIN public.time AS time ON time.id = k.id",
+            "SELECT k.id, time.g FROM \"position\" k JOIN public.\"time\" AS time ON time.id = k.id",
+        ),
+        (
+            "v112_sr_kwref_text_cte",
+            "WITH position AS (SELECT time.id, time.g FROM time) SELECT position.id, position.g FROM position",
+            "SELECT position.id, position.g FROM \"v112_sr_kwref_text_cte__cte_position\" AS position",
+        ),
+    ] {
+        let created = v112_j_try(&format!(
+            "SELECT create_reflex_ivm('{imv}', $v112sel${written}$v112sel$)"
+        ));
+        assert_eq!(created, "CREATE REFLEX INCREMENTAL VIEW", "{written}");
+        assert_eq!(v112_sr_stored_query(imv), stored, "{written}");
+    }
+    assert_eq!(
+        v112_sr_stored_query("v112_sr_kwref_text_cte__cte_position"),
+        "SELECT \"time\".id, \"time\".g FROM \"time\""
+    );
+}
+
+/// An unreserved keyword loses its quotes in every reference too.
+#[pg_test]
+fn v112_sr_kwref_unreserved_quoted() {
+    lock_shared_fixtures();
+    let wrong = v112_sr_keyword_references("whitespace", "\"whitespace\"");
+    assert!(wrong.is_empty(), "\n{}", wrong.join("\n"));
+}
+
+// ---------------------------------------------------------------------------
+// Partitioned sources the partition bookkeeping follows without quotes
+// ---------------------------------------------------------------------------
+
+#[pg_test]
+fn v112_sr_adm_partitioned_source_non_ascii_lower_case_name() {
+    assert_eq!(
+        v112_sr_partitioned_source_tables(
+            "v112_sr_admp_e",
+            "v112_sr_admp_é_part",
+            "v112_sr_admp_é_part_a",
+            "v112_sr_admp_é_part_b",
+            "v112_sr_admp_é_part_c"
+        ),
+        "ok"
+    );
+}
+
+#[pg_test]
+fn v112_sr_adm_partitioned_source_dollar_name() {
+    assert_eq!(
+        v112_sr_partitioned_source_tables(
+            "v112_sr_admp_d",
+            "v112_sr_admp_my$part",
+            "v112_sr_admp_my$part_a",
+            "v112_sr_admp_my$part_b",
+            "v112_sr_admp_my$part_c"
+        ),
+        "ok"
+    );
+}
+
+#[pg_test]
+fn v112_sr_adm_partitioned_source_non_ascii_name_in_another_schema() {
+    assert_eq!(v112_sr_partitioned_source_cell("v112_sr_admp_es", "é_part", "p_a", "p_c"), "ok");
+}
+
+#[pg_test]
+fn v112_sr_adm_partitioned_source_dollar_name_in_a_non_ascii_schema() {
+    Spi::run("CREATE SCHEMA v112_sr_admp_é").expect("schema");
+    assert_eq!(
+        v112_sr_partitioned_source_tables(
+            "v112_sr_admp_ds",
+            "v112_sr_admp_é.my$part",
+            "v112_sr_admp_é.p_a",
+            "v112_sr_admp_é.p_b",
+            "v112_sr_admp_é.p_c"
+        ),
+        "ok"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The NOT NULL probe reads the source itself, not a table named like it in
+// another case
+// ---------------------------------------------------------------------------
+
+#[pg_test]
+fn v112_sr_not_null_probe_reads_the_quoted_source_not_its_lower_case_twin() {
+    let mut wrong = Vec::new();
+    for (tag, select, key) in [
+        ("agg", "SELECT k, SUM(v) AS s, COUNT(*) AS c FROM {t} GROUP BY k", "NULL"),
+        ("distinct", "SELECT DISTINCT k FROM {t}", "NULL"),
+        ("keyed", "SELECT k, v FROM {t}", "'k, v'"),
+    ] {
+        for deferred in [false, true] {
+            let mode = if deferred { "DEFERRED" } else { "IMMEDIATE" };
+            let twin = format!("v112_sr_nn_{tag}_{}", mode.to_lowercase());
+            let table = format!("\"V112_sr_nn_{tag}_{}\"", mode.to_lowercase());
+            Spi::run(&format!("CREATE TABLE {twin}(k INT NOT NULL, v INT NOT NULL)")).expect("twin");
+            Spi::run(&format!("CREATE TABLE {table}(k INT, v INT)")).expect("table");
+            Spi::run(&format!("INSERT INTO {table} VALUES (1,10),(2,20),(3,30)")).expect("seed");
+            let imv = format!("{twin}_imv");
+            let query = select.replace("{t}", &table);
+            let created = v112_j_try(&format!(
+                "SELECT create_reflex_ivm('{imv}', $v112sel${query}$v112sel$, {key}, 'UNLOGGED', '{mode}')"
+            ));
+            if created != "CREATE REFLEX INCREMENTAL VIEW" {
+                wrong.push(format!("{tag} {mode}: NOT-CREATED {created}"));
+                continue;
+            }
+            for dml in [
+                format!("INSERT INTO {table} VALUES (NULL, 5), (4, NULL)"),
+                format!("UPDATE {table} SET v = 6 WHERE k IS NULL"),
+                format!("INSERT INTO {table} VALUES (NULL, 7)"),
+                format!("UPDATE {table} SET k = NULL WHERE k = 2"),
+                format!("DELETE FROM {table} WHERE k IS NULL AND v = 6"),
+                format!("DELETE FROM {table} WHERE k IS NULL"),
+            ] {
+                let ran = v112_j_try_dml(&dml);
+                let flushed = if deferred {
+                    v112_j_flush_every_source(&imv)
+                } else {
+                    String::new()
+                };
+                let compared = v112_j_oracle(&imv, &query);
+                if ran != "OK" || flushed.contains("RAISED") || flushed.contains("ERROR") || compared != "0" {
+                    wrong.push(format!("{tag} {mode}: {ran} {flushed} {compared} [{dml}]"));
+                    break;
+                }
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "\n{}", wrong.join("\n"));
+}
+
+// ---------------------------------------------------------------------------
+// A group column selected under an alias
+// ---------------------------------------------------------------------------
+
+macro_rules! v112_sr_aliased_group_cells {
+    ($($name:ident => $select:expr,)+) => {
+        $(
+            #[pg_test]
+            fn $name() {
+                let tag = stringify!($name).trim_start_matches("v112_sr_");
+                let mut wrong = Vec::new();
+                for deferred in [false, true] {
+                    let tag = format!("{tag}_{}", if deferred { "d" } else { "i" });
+                    let (fact, dimension, steps) = v112_sr_fact_and_dimension(&tag);
+                    let query = $select.replace("{f}", &fact).replace("{d}", &dimension).replace("{F}", &fact.to_uppercase()).replace("{D}", &dimension.to_uppercase());
+                    let outcome = v112_sr_mode_cell(&format!("v112_sr_{tag}"), &query, deferred, &steps);
+                    if outcome != "ok" {
+                        wrong.push(format!("{tag}: {outcome}"));
+                    }
+                }
+                assert!(wrong.is_empty(), "{}\n{}", $select, wrong.join("\n"));
+            }
+        )+
+    };
+}
+
+v112_sr_aliased_group_cells! {
+    v112_sr_ag_alias => "SELECT d.k AS grp, SUM(f.v) AS s, COUNT(*) AS c FROM {f} f JOIN {d} d ON d.id = f.k GROUP BY d.k",
+    v112_sr_ag_alias_named_like_the_join_column => "SELECT d.k AS id, SUM(f.v) AS s, COUNT(*) AS c FROM {f} f JOIN {d} d ON d.id = f.k GROUP BY d.k",
+    v112_sr_ag_alias_min_max => "SELECT d.k AS grp, MIN(f.v) AS mn, MAX(f.v) AS mx FROM {f} f JOIN {d} d ON d.id = f.k GROUP BY d.k",
+    v112_sr_ag_alias_quoted_upper => "SELECT d.k AS \"K\", SUM(f.v) AS s, COUNT(*) AS c FROM {f} f JOIN {d} d ON d.id = f.k GROUP BY d.k",
+    v112_sr_ag_alias_two_keys => "SELECT d.k AS grp, d.v, SUM(f.v) AS s, COUNT(*) AS c FROM {f} f JOIN {d} d ON d.id = f.k GROUP BY d.k, d.v",
+    v112_sr_ag_alias_three_tables => "SELECT e.k AS grp, SUM(f.v) AS s, COUNT(*) AS c FROM {f} f JOIN {d} d ON d.id = f.k JOIN {d} e ON e.id = d.k GROUP BY e.k",
+    v112_sr_ag_alias_other_aliases => "SELECT x.k AS grp, SUM(y.v) AS s, COUNT(*) AS c FROM {f} y JOIN {d} x ON x.id = y.k GROUP BY x.k",
+    v112_sr_ag_alias_upper_case => "SELECT D.K AS Grp, SUM(F.V) AS s, COUNT(*) AS c FROM {F} F JOIN {D} D ON D.ID = F.K GROUP BY D.K",
+    v112_sr_ag_alias_of_the_join_side => "SELECT f.k AS grp, SUM(f.v) AS s, SUM(d.v) AS t, COUNT(*) AS c FROM {f} f JOIN {d} d ON d.id = f.k GROUP BY f.k",
+    v112_sr_ag_alias_left_join => "SELECT d.k AS grp, SUM(f.v) AS s, COUNT(*) AS c FROM {f} f LEFT JOIN {d} d ON d.id = f.k GROUP BY d.k",
+}
+
+// ---------------------------------------------------------------------------
+// Dropping a table of another schema named like a source
+// ---------------------------------------------------------------------------
+
+#[pg_test]
+fn v112_sr_drop_of_a_same_named_table_of_another_schema_keeps_the_imv() {
+    Spi::run("CREATE SCHEMA v112_sr_dsx").expect("schema");
+    Spi::run("CREATE TABLE v112_sr_dt(id INT PRIMARY KEY, v INT)").expect("table");
+    Spi::run("CREATE TABLE v112_sr_dsx.v112_sr_dt(id INT PRIMARY KEY, v INT)").expect("namesake");
+    Spi::run("INSERT INTO v112_sr_dt VALUES (1, 10)").expect("seed");
+    for (imv, query) in [
+        ("v112_sr_dt_bare", "SELECT id, v FROM v112_sr_dt"),
+        ("v112_sr_dt_public", "SELECT id, v FROM public.v112_sr_dt"),
+        ("v112_sr_dt_other", "SELECT id, v FROM v112_sr_dsx.v112_sr_dt"),
+    ] {
+        assert_eq!(
+            crate::create_reflex_ivm(imv, query, None, None, None, None),
+            "CREATE REFLEX INCREMENTAL VIEW"
+        );
+    }
+    Spi::run("DROP TABLE v112_sr_dsx.v112_sr_dt").expect("drop the namesake");
+    assert!(v112_sr_registered("v112_sr_dt_bare"));
+    assert!(v112_sr_registered("v112_sr_dt_public"));
+    assert!(!v112_sr_registered("v112_sr_dt_other"));
+    Spi::run("INSERT INTO v112_sr_dt VALUES (2, 20)").expect("write");
+    assert_imv_correct("v112_sr_dt_bare", "SELECT id, v FROM v112_sr_dt");
+    assert_imv_correct("v112_sr_dt_public", "SELECT id, v FROM public.v112_sr_dt");
+    Spi::run("DROP TABLE v112_sr_dt").expect("drop the source");
+    assert!(!v112_sr_registered("v112_sr_dt_bare"));
+    assert!(!v112_sr_registered("v112_sr_dt_public"));
+}
+
+v112_sr_alias_cells! {
+    v112_sr_p2_outer_name_aliases_inner_bare_columns => "SELECT id, amount, name FROM {o} WHERE cid IN (SELECT {o}.id FROM {c} {o} WHERE {o}.active)",
+    v112_sr_p2_outer_name_aliases_inner_aggregate => "SELECT {o}.name, SUM({o}.amount) AS s, COUNT(*) AS c FROM {o} WHERE {o}.cid IN (SELECT {o}.id FROM {c} {o}) GROUP BY {o}.name",
+    v112_sr_p2_outer_name_aliases_inner_join => "SELECT {o}.id, {o}.amount, x.active FROM {o} JOIN {c} x ON x.id = {o}.cid WHERE EXISTS (SELECT 1 FROM {c} {o} WHERE {o}.active)",
+    v112_sr_p2_outer_name_aliases_itself => "SELECT {o}.id, {o}.amount FROM {o} WHERE {o}.cid IN (SELECT {o}.cid FROM {o} {o} WHERE {o}.amount > 15)",
+    v112_sr_p2_outer_name_aliases_a_joined_table => "SELECT name, SUM({o}.amount) AS s, COUNT(*) AS c FROM {o} JOIN {c} x ON x.id = {o}.cid WHERE EXISTS (SELECT 1 FROM {c} {o} WHERE {o}.active) GROUP BY name",
+    v112_sr_p2_outer_name_aliases_a_joined_table_in_from => "SELECT name, SUM({o}.amount) AS s, COUNT(*) AS c FROM {o} JOIN {c} x ON x.id = {o}.cid JOIN (SELECT {o}.id FROM {c} {o} WHERE {o}.active) q ON q.id = x.id GROUP BY name",
+    v112_sr_p2_inner_table_named_by_outer_alias => "SELECT {c}.id, {c}.amount, {c}.name FROM {o} {c} WHERE {c}.cid IN (SELECT {c}.id FROM {c} WHERE {c}.active)",
+}
+
+/// Two quoted columns of one table whose names differ by case only: the join
+/// reads one of them, the groups are keyed by the other.
+#[pg_test]
+fn v112_sr_i4_group_column_and_join_column_differ_by_case_only() {
+    let mut wrong = Vec::new();
+    for (tag, select) in [
+        ("aliased", "SELECT a.\"Ab\", SUM(b.w) AS s, COUNT(*) AS c FROM {q} a JOIN {r} b ON a.\"aB\" = b.k GROUP BY a.\"Ab\""),
+        ("joined_side_first", "SELECT a.\"Ab\", SUM(b.w) AS s, COUNT(*) AS c FROM {q} a JOIN {r} b ON b.k = a.\"aB\" GROUP BY a.\"Ab\""),
+        ("no_aliases", "SELECT {q}.\"Ab\", SUM({r}.w) AS s, COUNT(*) AS c FROM {q} JOIN {r} ON {q}.\"aB\" = {r}.k GROUP BY {q}.\"Ab\""),
+        ("grouped_by_the_join_column", "SELECT a.\"aB\", SUM(b.w) AS s, COUNT(*) AS c FROM {q} a JOIN {r} b ON a.\"aB\" = b.k GROUP BY a.\"aB\""),
+    ] {
+        let left = format!("v112_sr_i4c_{tag}_q");
+        let right = format!("v112_sr_i4c_{tag}_r");
+        Spi::run(&format!("CREATE TABLE {left}(id INT PRIMARY KEY, \"Ab\" INT, \"aB\" INT)")).expect("left");
+        Spi::run(&format!("CREATE TABLE {right}(k INT PRIMARY KEY, w INT)")).expect("right");
+        Spi::run(&format!("INSERT INTO {left} VALUES (1,1,2),(2,2,3),(3,3,1),(4,1,3),(5,4,4)")).expect("seed");
+        Spi::run(&format!("INSERT INTO {right} VALUES (1,10),(2,20),(3,30)")).expect("seed");
+        let steps = vec![
+            format!("DELETE FROM {right} WHERE k = 2"),
+            format!("INSERT INTO {right} VALUES (2, 7), (4, 40)"),
+            format!("UPDATE {right} SET w = w + 1 WHERE k < 3"),
+            format!("UPDATE {right} SET k = 6 WHERE k = 3"),
+            format!("DELETE FROM {left} WHERE id = 1"),
+            format!("UPDATE {left} SET \"aB\" = 6 WHERE id = 5"),
+            format!("UPDATE {left} SET \"Ab\" = \"aB\" WHERE id = 3"),
+            format!("INSERT INTO {left} VALUES (6, 2, 1), (7, 6, 2)"),
+            format!("DELETE FROM {right} WHERE k IN (1, 6)"),
+            format!("DELETE FROM {right}"),
+        ];
+        let query = select.replace("{q}", &left).replace("{r}", &right);
+        let outcome = v112_sr_cell(&format!("v112_sr_i4c_{tag}"), &query, "", &steps);
+        if outcome != "ok" {
+            wrong.push(format!("{tag}: {outcome}"));
+        }
+    }
+    assert!(wrong.is_empty(), "\n{}", wrong.join("\n"));
+}
+
+/// A table whose name PostgreSQL prints quoted but reads bare (a non-ASCII
+/// letter, a `$`) takes its IMVs with it when dropped, in any schema.
+#[pg_test]
+fn v112_sr_drop_of_a_table_registered_bare_but_printed_quoted_drops_its_imvs() {
+    Spi::run("CREATE SCHEMA v112_sr_dbq").expect("schema");
+    let mut kept = Vec::new();
+    for (tag, table) in [
+        ("accent", "v112_sr_dbq_é"),
+        ("dollar", "v112_sr_dbq$t"),
+        ("accent_s", "v112_sr_dbq.é_t"),
+        ("dollar_s", "v112_sr_dbq.my$t"),
+        ("upper_accent_s", "v112_sr_dbq.É_t"),
+    ] {
+        Spi::run(&format!("CREATE TABLE {table}(id INT PRIMARY KEY, v INT)")).expect("table");
+        Spi::run(&format!("INSERT INTO {table} VALUES (1, 10)")).expect("seed");
+        for mode in ["IMMEDIATE", "DEFERRED"] {
+            let imv = format!("v112_sr_dbq_{tag}_{}", mode.to_lowercase());
+            assert_eq!(
+                crate::create_reflex_ivm(&imv, &format!("SELECT id, v FROM {table}"), None, None, Some(mode), None),
+                "CREATE REFLEX INCREMENTAL VIEW"
+            );
+        }
+        Spi::run(&format!("DROP TABLE {table}")).expect("drop");
+        for mode in ["immediate", "deferred"] {
+            if v112_sr_registered(&format!("v112_sr_dbq_{tag}_{mode}")) {
+                kept.push(format!("{tag} {mode}"));
+            }
+        }
+    }
+    assert!(kept.is_empty(), "still registered after the drop: {kept:?}");
+}
+
+/// A dropped table is not taken for another one whose registered name its own
+/// unquoted name happens to spell: a dot inside the name, another case.
+#[pg_test]
+fn v112_sr_drop_of_a_table_whose_unquoted_name_spells_another_keeps_the_imv() {
+    Spi::run("CREATE SCHEMA v112_sr_dun").expect("schema");
+    Spi::run("CREATE TABLE v112_sr_dun.t(id INT PRIMARY KEY, v INT)").expect("table");
+    Spi::run("CREATE TABLE v112_sr_dunp(id INT PRIMARY KEY, v INT)").expect("table");
+    Spi::run("CREATE TABLE \"v112_sr_dun.t\"(id INT PRIMARY KEY, v INT)").expect("dotted");
+    Spi::run("CREATE TABLE \"V112_sr_dunp\"(id INT PRIMARY KEY, v INT)").expect("upper");
+    Spi::run("CREATE TABLE v112_sr_dun.\"V112_sr_dunp\"(id INT PRIMARY KEY, v INT)").expect("upper");
+    for (imv, query) in [
+        ("v112_sr_dun_schema", "SELECT id, v FROM v112_sr_dun.t"),
+        ("v112_sr_dun_plain", "SELECT id, v FROM v112_sr_dunp"),
+    ] {
+        assert_eq!(
+            crate::create_reflex_ivm(imv, query, None, None, None, None),
+            "CREATE REFLEX INCREMENTAL VIEW"
+        );
+    }
+    Spi::run("DROP TABLE \"v112_sr_dun.t\", \"V112_sr_dunp\", v112_sr_dun.\"V112_sr_dunp\"").expect("drop");
+    assert!(v112_sr_registered("v112_sr_dun_schema"));
+    assert!(v112_sr_registered("v112_sr_dun_plain"));
+    Spi::run("INSERT INTO v112_sr_dun.t VALUES (2, 20)").expect("write");
+    Spi::run("INSERT INTO v112_sr_dunp VALUES (2, 20)").expect("write");
+    assert_imv_correct("v112_sr_dun_schema", "SELECT id, v FROM v112_sr_dun.t");
+    assert_imv_correct("v112_sr_dun_plain", "SELECT id, v FROM v112_sr_dunp");
 }
