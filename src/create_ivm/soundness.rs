@@ -39,7 +39,7 @@ pub(crate) fn canonicalize_analysis_sources(analysis: &mut crate::sql_analyzer::
             }
             let qualified: Option<String> = client
                 .select(
-                    "SELECT n.nspname::TEXT || '.' || c.relname::TEXT AS q \
+                    "SELECT quote_ident(n.nspname) || '.' || quote_ident(c.relname) AS q \
                      FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
                      WHERE c.oid = to_regclass($1)",
                     None,
@@ -263,23 +263,24 @@ pub(crate) fn build_source_join_keys(
         return;
     }
 
-    // 1) Build the lowered set of GROUP BY column names and a target→expr
-    //    map so `parse_join_condition_mappings` can recognize "other side"
-    //    references whether they're bare (`dem_plan_id`) or qualified
+    // 1) Build the GROUP BY column names as PostgreSQL resolves them (a quoted
+    //    name keeps its case) and a target→expr map so
+    //    `parse_join_condition_mappings` can recognize "other side" references
+    //    whether they're bare (`dem_plan_id`) or qualified
     //    (`sales_simulation.dem_plan_id`).
-    let group_by_lowercased: Vec<String> = plan
+    let group_by_names: Vec<String> = plan
         .group_by_columns
         .iter()
-        .map(|c| normalized_column_name(c).to_lowercase())
+        .map(|c| normalized_column_name(c))
         .collect();
-    let group_by_set: HashSet<String> = group_by_lowercased.iter().cloned().collect();
+    let group_by_set: HashSet<String> = group_by_names.iter().cloned().collect();
 
     let mut target_col_to_expr: HashMap<String, String> = HashMap::new();
     for col in &analysis.select_columns {
         let target_name = col.alias.as_deref().unwrap_or(&col.expr_sql);
-        let target_name = bare_column_name(target_name).to_lowercase();
+        let target_name = normalized_column_name(target_name);
         if group_by_set.contains(&target_name) {
-            target_col_to_expr.insert(target_name, col.expr_sql.to_lowercase());
+            target_col_to_expr.insert(target_name, lower_case_unless_quoted(&col.expr_sql));
         }
     }
 
@@ -323,9 +324,9 @@ pub(crate) fn build_source_join_keys(
                     cond,
                     source_str,
                     &analysis.table_aliases,
-                    &group_by_lowercased,
+                    &group_by_names,
                     &target_col_to_expr,
-                    KeyColumnMatch::SameBareName,
+                    KeyColumnMatch::EitherSideOfTheEquality,
                 );
                 all_mappings.extend(join_mappings);
             }
@@ -359,6 +360,16 @@ pub(crate) fn build_source_join_keys(
 
         plan.source_join_keys
             .insert(source_str.to_string(), all_mappings);
+    }
+}
+
+/// A join condition is compared in lower case. An expression holding a quoted
+/// name keeps its case, so that `"ID"` never passes for `id`.
+fn lower_case_unless_quoted(expr: &str) -> String {
+    if expr.contains('"') {
+        expr.to_string()
+    } else {
+        expr.to_lowercase()
     }
 }
 
@@ -908,8 +919,10 @@ pub(crate) fn infer_join_passthrough_unique_key(ctx: &BuildContext) -> Option<Ve
 /// key column.
 #[derive(Clone, Copy, PartialEq)]
 pub(crate) enum KeyColumnMatch {
-    /// By its bare name, whatever table qualifies it.
-    SameBareName,
+    /// By its bare name, unless both it and the key column's SELECT expression
+    /// are qualified and the expression is neither side of the equality:
+    /// `d.id = f.k` says nothing about `d.k`, and maps `f.k` as well as `d.id`.
+    EitherSideOfTheEquality,
     /// By its bare name, unless both it and the key column's SELECT expression
     /// are qualified and differ: `o.kind = f.fk` says nothing about `d.kind`.
     SameQualifiedColumn,
@@ -975,11 +988,18 @@ pub(crate) fn parse_join_condition_mappings(
         for kc in key_columns {
             if *kc == other_col {
                 // Direct match: key column "product_id" and other side bare name is "product_id"
-                let names_another_tables_column = key_column_match
-                    == KeyColumnMatch::SameQualifiedColumn
-                    && other_side.contains('.')
+                let names_another_tables_column = other_side.contains('.')
                     && target_col_to_expr.get(kc.as_str()).is_some_and(|expr| {
-                        expr.contains('.') && expr.to_lowercase() != other_side
+                        expr.contains('.')
+                            && match key_column_match {
+                                KeyColumnMatch::SameQualifiedColumn => {
+                                    expr.to_lowercase() != other_side
+                                }
+                                KeyColumnMatch::EitherSideOfTheEquality => {
+                                    !is_the_same_qualified_column(expr, &other_side)
+                                        && !is_the_same_qualified_column(expr, &secondary_side)
+                                }
+                            }
                     });
                 if names_another_tables_column {
                     continue;
@@ -999,6 +1019,11 @@ pub(crate) fn parse_join_condition_mappings(
     }
 
     mappings
+}
+
+/// `t.c` and `s.t.c` name one column: the schema is optional.
+fn is_the_same_qualified_column(one: &str, other: &str) -> bool {
+    one == other || one.ends_with(&format!(".{other}")) || other.ends_with(&format!(".{one}"))
 }
 
 /// Check if a qualified column reference (e.g., "p.id") belongs to a given table.
