@@ -1172,15 +1172,18 @@ extension_sql!(
         _imv RECORD;
     BEGIN
         FOR _obj IN
-            SELECT object_identity
+            SELECT object_identity, schema_name
             FROM pg_event_trigger_dropped_objects()
             WHERE object_type = 'table'
         LOOP
+            -- A source is registered without a schema only when it is a table of
+            -- public: a table of another schema with the same name is another table.
             FOR _imv IN
                 SELECT name
                 FROM public.__reflex_ivm_reference
                 WHERE depends_on @> ARRAY[_obj.object_identity]
-                   OR depends_on @> ARRAY[split_part(_obj.object_identity, '.', 2)]
+                   OR (_obj.schema_name = 'public'
+                       AND depends_on @> ARRAY[split_part(_obj.object_identity, '.', 2)])
                 ORDER BY graph_depth DESC, name DESC
             LOOP
                 BEGIN
