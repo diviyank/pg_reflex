@@ -2,8 +2,8 @@
 
 Pre-existing: identical on `6946400` (1.11.5) and on the 1.12.0 integration branch at `0324f47`.
 Found by review seat R3 of the 1.12.0 full re-review (pg16) while deleting one internal object at
-a time under each IMV kind (`head2/r3_rem_*.txt` under `.superpowers/sdd/2026-10-07-1.12.0-create-contract-hardening/full-review-r3-out/`); 
-The reduction below was run on pg16 on `0324f47` and on `fix/full-review-r3` (probe `zz_file_probe`, kept at `/private/tmp/rfx-remote/b-r3fix-file-probe.rs` with its outputs `b-r3fix-fp-{base,head}.log`): same outcome on both. (the `__reflex_delta_<source>` half; the `__reflex_deferred_pending` half is the review's).
+a time under each IMV kind (`head2/r3_rem_*.txt` under `.superpowers/sdd/2026-10-07-1.12.0-create-contract-hardening/full-review-r3-out/`).
+The reduction below was run on pg16 on `0324f47` and on `fix/full-review-r3` (probe `zz_file_probe`, kept at `/private/tmp/rfx-remote/b-r3fix-file-probe.rs` with its outputs `b-r3fix-fp-{base,head}.log`): same outcome on both (the `__reflex_delta_<source>` half; the `__reflex_deferred_pending` half is the review's).
 
 ## Reproduction (pg16)
 
