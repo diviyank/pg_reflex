@@ -30,10 +30,115 @@ pub(crate) fn is_registered_imv(
         .any(|name| named_relation(name) == relation))
 }
 
-struct TruncatedRelation {
-    qualified: String,
-    announces: bool,
-    rebuilds: bool,
+/// Whether a trigger fires in an ordinary session.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TriggerState {
+    Enabled,
+    Disabled,
+    Missing,
+}
+
+impl TriggerState {
+    /// From `pg_trigger.tgenabled`; `None` when the table has no such trigger.
+    pub(crate) fn of(tgenabled: Option<&str>) -> Self {
+        match tgenabled {
+            None => TriggerState::Missing,
+            Some("O") | Some("A") => TriggerState::Enabled,
+            Some(_) => TriggerState::Disabled,
+        }
+    }
+}
+
+/// A trigger pg_reflex keeps on a table of the partition tree of a source.
+pub(crate) struct TreeTrigger {
+    pub(crate) table: String,
+    pub(crate) on_source: bool,
+    pub(crate) name: String,
+    pub(crate) state: TriggerState,
+    pub(crate) create_ddl: String,
+}
+
+pub(crate) fn function_exists(
+    client: &pgrx::spi::SpiClient<'_>,
+    function: &str,
+) -> Result<bool, pgrx::spi::Error> {
+    Ok(client
+        .select(
+            "SELECT 1 FROM pg_proc f JOIN pg_namespace n ON n.oid = f.pronamespace \
+             WHERE n.nspname = 'public' AND f.proname = $1",
+            None,
+            &[text_arg(function)],
+        )?
+        .next()
+        .is_some())
+}
+
+/// True when the tables of the partition tree of `source` carry its truncate
+/// triggers: an IMV read as a source and a source without truncate function do not.
+fn truncate_triggers_are_kept(
+    client: &pgrx::spi::SpiClient<'_>,
+    source: &str,
+) -> Result<bool, pgrx::spi::Error> {
+    Ok(!source.starts_with('<')
+        && !is_registered_imv(client, source)?
+        && function_exists(client, &source_trigger_function_name(source, "trunc"))?)
+}
+
+/// The truncate triggers every table of the partition tree of `source` (the
+/// spelling its trigger function was built from) is to carry, with their state.
+/// Empty for a source that is neither a partition nor a partitioned table: it
+/// keeps its single AFTER trigger.
+pub(crate) fn truncate_triggers_of_tree(
+    client: &pgrx::spi::SpiClient<'_>,
+    source: &str,
+) -> Result<Vec<TreeTrigger>, pgrx::spi::Error> {
+    if !truncate_triggers_are_kept(client, source)? {
+        return Ok(Vec::new());
+    }
+    let function = source_trigger_function_name(source, "trunc");
+    let announce = truncate_announce_trigger_name(source);
+    let rebuild = source_trigger_name(source, "trunc");
+    let mut triggers = Vec::new();
+    let tree = client.select(
+        "SELECT c.oid::regclass::text AS qualified, \
+                c.oid = to_regclass($1) AS is_source, \
+                (SELECT t.tgenabled::text FROM pg_trigger t \
+                 WHERE t.tgrelid = c.oid AND t.tgname = $2) AS announces, \
+                (SELECT t.tgenabled::text FROM pg_trigger t \
+                 WHERE t.tgrelid = c.oid AND t.tgname = $3) AS rebuilds \
+         FROM pg_partition_tree(to_regclass($1)) p \
+         JOIN pg_class c ON c.oid = p.relid \
+         WHERE c.relkind IN ('r', 'p') \
+         ORDER BY p.level, c.oid",
+        None,
+        &[text_arg(source), text_arg(&announce), text_arg(&rebuild)],
+    )?;
+    for row in tree {
+        let Some(qualified) = row.get_by_name::<&str, _>("qualified").ok().flatten() else {
+            continue;
+        };
+        let on_source = row
+            .get_by_name::<bool, _>("is_source")
+            .ok()
+            .flatten()
+            .unwrap_or(false);
+        for (column, trigger, when) in [
+            ("announces", &announce, "BEFORE"),
+            ("rebuilds", &rebuild, "AFTER"),
+        ] {
+            triggers.push(TreeTrigger {
+                table: qualified.to_string(),
+                on_source,
+                name: trigger.clone(),
+                state: TriggerState::of(row.get_by_name::<&str, _>(column).ok().flatten()),
+                create_ddl: format!(
+                    "CREATE TRIGGER \"{trigger}\" {when} TRUNCATE ON {qualified} \
+                     FOR EACH STATEMENT EXECUTE FUNCTION public.{function}()"
+                ),
+            });
+        }
+    }
+    Ok(triggers)
 }
 
 /// Installs the truncate triggers of `source` (the spelling its trigger function
@@ -44,68 +149,13 @@ pub(crate) fn sync_partition_truncate_triggers(
     client: &mut pgrx::spi::SpiClient<'_>,
     source: &str,
 ) -> Result<(), pgrx::spi::Error> {
-    if source.starts_with('<') || is_registered_imv(client, source)? {
+    if !truncate_triggers_are_kept(client, source)? {
         return Ok(());
     }
     let function = source_trigger_function_name(source, "trunc");
-    let announce = truncate_announce_trigger_name(source);
-    let rebuild = source_trigger_name(source, "trunc");
-
-    let function_exists = client
-        .select(
-            "SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
-             WHERE n.nspname = 'public' AND p.proname = $1",
-            None,
-            &[text_arg(&function)],
-        )?
-        .next()
-        .is_some();
-    if !function_exists {
-        return Ok(());
-    }
-
-    let tree: Vec<TruncatedRelation> = client
-        .select(
-            "SELECT c.oid::regclass::text AS qualified, \
-                    EXISTS (SELECT 1 FROM pg_trigger t \
-                            WHERE t.tgrelid = c.oid AND t.tgname = $2) AS announces, \
-                    EXISTS (SELECT 1 FROM pg_trigger t \
-                            WHERE t.tgrelid = c.oid AND t.tgname = $3) AS rebuilds \
-             FROM pg_partition_tree(to_regclass($1)) p \
-             JOIN pg_class c ON c.oid = p.relid \
-             WHERE c.relkind IN ('r', 'p') \
-             ORDER BY p.level, c.oid",
-            None,
-            &[text_arg(source), text_arg(&announce), text_arg(&rebuild)],
-        )?
-        .filter_map(|row| {
-            Some(TruncatedRelation {
-                qualified: row
-                    .get_by_name::<&str, _>("qualified")
-                    .ok()
-                    .flatten()?
-                    .to_string(),
-                announces: row.get_by_name::<bool, _>("announces").ok().flatten()?,
-                rebuilds: row.get_by_name::<bool, _>("rebuilds").ok().flatten()?,
-            })
-        })
-        .collect();
-    for relation in &tree {
-        for (present, trigger, when) in [
-            (relation.announces, &announce, "BEFORE"),
-            (relation.rebuilds, &rebuild, "AFTER"),
-        ] {
-            if !present {
-                client.update(
-                    &format!(
-                        "CREATE TRIGGER \"{trigger}\" {when} TRUNCATE ON {} \
-                         FOR EACH STATEMENT EXECUTE FUNCTION public.{function}()",
-                        relation.qualified
-                    ),
-                    None,
-                    &[],
-                )?;
-            }
+    for trigger in truncate_triggers_of_tree(client, source)? {
+        if trigger.state == TriggerState::Missing {
+            client.update(&trigger.create_ddl, None, &[])?;
         }
     }
 
