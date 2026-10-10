@@ -34,7 +34,7 @@ pub fn canonical_source(name: &str) -> (Option<String>, String) {
 pub fn named_relation(source: &str) -> (String, String) {
     let folded = |part: &str| match part.strip_prefix('"').and_then(|p| p.strip_suffix('"')) {
         Some(quoted) => quoted.to_string(),
-        None => part.to_lowercase(),
+        None => part.to_ascii_lowercase(),
     };
     let (schema, name) = split_qualified_name(source);
     (
