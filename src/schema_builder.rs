@@ -525,8 +525,9 @@ pub(crate) fn truncate_announce_trigger_name(source_table: &str) -> String {
     ))
 }
 
-/// Transaction-local setting counting the relations of `source_table` the running
-/// TRUNCATE statement announced and whose AFTER trigger has not fired.
+/// Transaction-local setting holding the relations of `source_table` a TRUNCATE
+/// statement announced and whose AFTER trigger has not fired, and whether that
+/// statement rebuilt the IMVs.
 fn truncate_announced_setting(source_table: &str) -> String {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -553,9 +554,10 @@ pub(crate) fn partitioned_source_trigger_name(source_table: &str) -> String {
 }
 
 /// Transaction-local setting raised by every INSERT / UPDATE / DELETE statement
-/// addressed to a table of the partition tree of `source_table`: the partition
-/// flush reads it to know that rows of a partition added or removed in this
-/// transaction may already be reflected in the IMVs.
+/// addressed to a table of the partition tree of `source_table`, and by every
+/// TRUNCATE that rebuilds its IMVs: the partition flush reads it to know that
+/// rows of a partition added or removed in this transaction may already be
+/// reflected in the IMVs.
 pub(crate) fn source_written_setting(source_table: &str) -> String {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -825,6 +827,10 @@ pub(crate) fn build_trigger_ddls_from_body(source_table: &str, body_template: &s
                 "__REFLEX_SLOT_ANNOUNCED_SETTING__",
                 &truncate_announced_setting(source_table),
             ),
+            (
+                "__REFLEX_SLOT_WRITTEN_SETTING__",
+                &source_written_setting(source_table),
+            ),
         ],
     );
     let trunc_ddl = format!(
@@ -953,6 +959,10 @@ pub fn build_deferred_trigger_ddls(source_table: &str, source_columns: &[String]
             (
                 "__REFLEX_SLOT_ANNOUNCED_SETTING__",
                 &truncate_announced_setting(source_table),
+            ),
+            (
+                "__REFLEX_SLOT_WRITTEN_SETTING__",
+                &source_written_setting(source_table),
             ),
         ],
     );

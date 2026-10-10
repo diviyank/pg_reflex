@@ -452,6 +452,8 @@ fn rebuild_triggers_named(source_table: &str, resolved: String) -> String {
         } else {
             crate::schema_builder::build_trigger_ddls(&resolved)
         };
+        crate::source_partition_writes::drop_disabled_triggers(client, &resolved)
+            .map_err(|e| format!("dropping disabled triggers failed: {}", e))?;
         for ddl in &ddls {
             client
                 .update(ddl, None, &[])

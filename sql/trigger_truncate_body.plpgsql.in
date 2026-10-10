@@ -1,15 +1,28 @@
-DECLARE _rec RECORD; _stmts TEXT; _announced INT;
+DECLARE _rec RECORD; _stmts TEXT; _state TEXT; _announced TEXT[]; _rebuilt BOOLEAN; _was_announced BOOLEAN;
 BEGIN
     -- A TRUNCATE fires this function before and after for every relation it
-    -- truncates (a partition, or the source and each of its partitions); the
-    -- IMVs are rebuilt once, by the last AFTER firing of the statement.
-    _announced := COALESCE(NULLIF(current_setting('__REFLEX_SLOT_ANNOUNCED_SETTING__', true), ''), '0')::INT;
+    -- truncates (a partition, or the source and each of its partitions), all the
+    -- BEFORE firings first. They announce the relations of the statement; the
+    -- first AFTER firing rebuilds the IMVs and those of the other announced
+    -- relations do nothing. An AFTER firing of a relation nothing announced
+    -- rebuilds: a relation can lack either trigger, and its statement is then
+    -- indistinguishable from a new one.
+    _state := COALESCE(current_setting('__REFLEX_SLOT_ANNOUNCED_SETTING__', true), '');
+    _rebuilt := _state LIKE 'rebuilt:%';
+    _announced := string_to_array(NULLIF(split_part(_state, ':', 2), ''), ',');
     IF TG_WHEN = 'BEFORE' THEN
-        PERFORM set_config('__REFLEX_SLOT_ANNOUNCED_SETTING__', (_announced + 1)::TEXT, true);
+        IF _rebuilt THEN _announced := NULL; END IF;
+        PERFORM set_config('__REFLEX_SLOT_ANNOUNCED_SETTING__',
+            'announced:' || array_to_string(array_append(_announced, TG_RELID::TEXT), ','), true);
         RETURN NULL;
     END IF;
-    PERFORM set_config('__REFLEX_SLOT_ANNOUNCED_SETTING__', GREATEST(_announced - 1, 0)::TEXT, true);
-    IF _announced > 1 THEN RETURN NULL; END IF;
+    _was_announced := COALESCE(TG_RELID::TEXT = ANY(_announced), FALSE);
+    PERFORM set_config('__REFLEX_SLOT_ANNOUNCED_SETTING__',
+        'rebuilt:' || COALESCE(array_to_string(array_remove(_announced, TG_RELID::TEXT), ','), ''), true);
+    IF _rebuilt AND _was_announced THEN RETURN NULL; END IF;
+    -- The rebuild reflects every partition the source has now: a partition added
+    -- or removed in this transaction must not be applied again by the flush.
+    PERFORM set_config('__REFLEX_SLOT_WRITTEN_SETTING__', '1', true);
     FOR _rec IN
       SELECT name
       FROM public.__reflex_ivm_reference
