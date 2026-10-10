@@ -3,6 +3,13 @@
 1.12.0 refuses, with a tagged message, an IMV over a partitioned table that PostgreSQL prints
 quoted (`"S".p`, `s."P"`, `"position"`, `s."select"`). This report tracks lifting the refusal.
 
+The refusal covers exactly the partitioned sources registered under a spelling that needs its
+quotes: an upper-case letter, a space, a leading digit, a reserved or column-name keyword. A
+name PostgreSQL prints quoted but reads back bare (`é_part`, `my$part`, in any schema) is
+registered bare, followed by the partition bookkeeping, and accepted
+(`v112_sr_adm_partitioned_source_*`). For partitions (not the parent) whose names need quotes
+see `2026-10-10_attached_partition_whose_name_does_not_read_back_unquoted_is_lost.md`.
+
 ## Why it is refused
 
 Two families of readers match a source against `depends_on`, and they spell it differently:
