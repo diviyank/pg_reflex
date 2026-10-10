@@ -91,12 +91,6 @@ fn v112_dp_reconnect(dbname: &str) {
     .expect("worker reconnect");
 }
 
-/// (step, IMV) pairs left unchecked: an ungrouped aggregate is wrong after a
-/// partition is created and written in one transaction, with or without a
-/// TRUNCATE (its report is in `untreated_bugs/`). The next TRUNCATE rebuilds it.
-const V112_DP_KNOWN_WRONG: &[(&str, &str)] =
-    &[("create, fill and truncate a partition in one transaction", "total")];
-
 /// Commits each step and compares every IMV of the fixture with its query.
 fn v112_dp_truncate_failures(
     s: &str,
@@ -114,9 +108,6 @@ fn v112_dp_truncate_failures(
             continue;
         }
         for (suffix, query, _, _) in V112_DP_TRUNCATE_IMVS {
-            if V112_DP_KNOWN_WRONG.contains(&(*label, *suffix)) {
-                continue;
-            }
             let mismatches = rbc_mismatch(&format!("{s}_{suffix}"), &query.replace("{s}", s));
             if mismatches != 0 {
                 failures.push(format!("{mode} {label}: {suffix} {mismatches} mismatches"));
