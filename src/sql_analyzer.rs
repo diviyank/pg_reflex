@@ -2481,8 +2481,59 @@ pub fn analyze(statements: &[Statement]) -> Result<SqlAnalysis, SqlAnalysisError
     );
     analysis.imv_relevant_where = source_filters.per_source;
     disable_update_skip_for_repeated_sources(&mut analysis);
+    if binds_an_alias_twice(select) {
+        analysis.imv_relevant_columns.clear();
+        analysis.imv_relevant_where.clear();
+    }
 
     Ok(analysis)
+}
+
+/// Whether a table alias of the query is also the alias, or the unaliased name, of
+/// another table of the query or of one of its subqueries. The alias map is one
+/// per statement, so the columns qualified by such an alias are attributed to one
+/// of the tables only, and the UPDATE-skip inputs of the other miss them.
+fn binds_an_alias_twice(select: &Select) -> bool {
+    #[derive(Default)]
+    struct Bindings {
+        aliases: Vec<String>,
+        unaliased_tables: Vec<String>,
+    }
+    impl Visitor for Bindings {
+        type Break = ();
+
+        fn pre_visit_table_factor(&mut self, factor: &TableFactor) -> ControlFlow<()> {
+            match factor {
+                TableFactor::Table {
+                    name, alias: None, ..
+                } => self
+                    .unaliased_tables
+                    .push(folded_relation_name(&name.to_string())),
+                TableFactor::Table { alias, .. }
+                | TableFactor::Derived { alias, .. }
+                | TableFactor::TableFunction { alias, .. }
+                | TableFactor::Function { alias, .. }
+                | TableFactor::UNNEST { alias, .. }
+                | TableFactor::NestedJoin { alias, .. } => {
+                    if let Some(alias) = alias {
+                        self.aliases.push(folded(&alias.name));
+                    }
+                }
+                _ => {}
+            }
+            ControlFlow::Continue(())
+        }
+    }
+    let mut bindings = Bindings::default();
+    let _ = select.visit(&mut bindings);
+    bindings
+        .aliases
+        .iter()
+        .enumerate()
+        .any(|(position, alias)| {
+            bindings.aliases[..position].contains(alias)
+                || bindings.unaliased_tables.contains(alias)
+        })
 }
 
 /// Drops the UPDATE-skip inputs of every source the query reads more than once.
