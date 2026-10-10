@@ -131,8 +131,25 @@ fn builtin_function_name(name: &sqlparser::ast::ObjectName) -> Option<String> {
         .then(|| ident.value.to_ascii_lowercase())
 }
 
+/// The supported built-in aggregates all take one argument (`COUNT(*)` counts as
+/// one), so a call with another number of arguments resolves to a function of the
+/// same name the user defined.
+fn takes_one_argument(f: &Function) -> bool {
+    matches!(&f.args, FunctionArguments::List(list) if list.args.len() == 1)
+}
+
 fn builtin_aggregate_kind(f: &Function) -> Option<AggregateKind> {
-    builtin_function_name(&f.name).and_then(|name| detect_aggregate(&name))
+    builtin_function_name(&f.name)
+        .and_then(|name| detect_aggregate(&name))
+        .filter(|_| takes_one_argument(f))
+}
+
+/// A call PostgreSQL does not resolve to the built-in its name suggests.
+fn is_not_the_builtin_it_is_named_like(f: &Function) -> bool {
+    match builtin_function_name(&f.name) {
+        None => true,
+        Some(name) => detect_aggregate(&name).is_some() && !takes_one_argument(f),
+    }
 }
 
 /// A called function as the catalog lookup needs it: `schema` is `None` for an
@@ -654,7 +671,7 @@ impl<'a> Visitor for AnalysisVisitor<'a> {
                         self.analysis.unsupported_aggregates.push(func_name.clone());
                     }
                     if let Some(call) = called_function(f) {
-                        if builtin_function_name(&f.name).is_none() {
+                        if is_not_the_builtin_it_is_named_like(f) {
                             let spelling = NonBuiltinCall {
                                 name: call.name.clone(),
                                 written: f.name.to_string(),
