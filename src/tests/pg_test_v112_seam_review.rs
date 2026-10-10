@@ -1398,12 +1398,19 @@ fn v112_sr_mode_cell(imv: &str, query: &str, deferred: bool, steps: &[String]) -
 /// Flushes every source of `imv` and of the sub-IMVs it was decomposed into, the
 /// base tables first.
 fn v112_sr_flush_chain(imv: &str) -> String {
-    v112_j_try(&format!(
-        "SELECT string_agg(reflex_flush_deferred(d), '; ' ORDER BY depth) FROM ( \
+    let sources_base_first = Spi::get_one::<Vec<String>>(&format!(
+        "SELECT array_agg(d ORDER BY depth, d) FROM ( \
             SELECT d, MIN(graph_depth) AS depth \
             FROM public.__reflex_ivm_reference, unnest(depends_on) AS d \
             WHERE name = '{imv}' OR name LIKE '{imv}\\_\\_%' GROUP BY d) sources"
     ))
+    .expect("sources")
+    .unwrap_or_default();
+    sources_base_first
+        .iter()
+        .map(|source| v112_j_try(&format!("SELECT reflex_flush_deferred($v112src${source}$v112src$)")))
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 /// `(tag, query)`: `{k}` is the keyword-named table as the cell writes it, `{p}`
