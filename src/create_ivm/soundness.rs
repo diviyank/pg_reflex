@@ -39,7 +39,7 @@ pub(crate) fn canonicalize_analysis_sources(analysis: &mut crate::sql_analyzer::
             }
             let qualified: Option<String> = client
                 .select(
-                    "SELECT n.nspname::TEXT || '.' || c.relname::TEXT AS q \
+                    "SELECT quote_ident(n.nspname) || '.' || quote_ident(c.relname) AS q \
                      FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
                      WHERE c.oid = to_regclass($1)",
                     None,
