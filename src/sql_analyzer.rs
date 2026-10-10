@@ -1538,51 +1538,64 @@ pub(crate) fn folded(id: &Ident) -> String {
 }
 
 /// Rewrites every unquoted table, alias and column name of `statements` to the lower
-/// case PostgreSQL folds it to. Everything downstream matches names as text (the
-/// registered source names, the columns a write must touch to matter, the rewrite of a
-/// source into its transition table), so `T` and `t` have to be one spelling there.
-pub(crate) fn fold_unquoted_names(statements: &mut [Statement]) {
+/// case PostgreSQL folds it to, and returns the spellings it rewrote, as written.
+/// Everything downstream matches names as text (the registered source names, the
+/// columns a write must touch to matter, the rewrite of a source into its transition
+/// table), so `T` and `t` have to be one spelling there. PostgreSQL folds the ASCII
+/// letters only in a multibyte encoding: `É` stays `É`.
+pub(crate) fn fold_unquoted_names(statements: &mut [Statement]) -> Vec<String> {
+    let mut folder = UnquotedNameFolder::default();
     for statement in statements {
-        let _ = statement.visit(&mut UnquotedNameFolder);
+        let _ = statement.visit(&mut folder);
     }
+    folder.rewritten_spellings.sort();
+    folder.rewritten_spellings.dedup();
+    folder.rewritten_spellings
 }
 
-struct UnquotedNameFolder;
+#[derive(Default)]
+struct UnquotedNameFolder {
+    rewritten_spellings: Vec<String>,
+}
 
 impl UnquotedNameFolder {
-    fn fold(id: &mut Ident) {
-        id.value = folded(id);
+    fn fold(&mut self, id: &mut Ident) {
+        let lower_case = folded(id);
+        if lower_case != id.value {
+            self.rewritten_spellings
+                .push(std::mem::replace(&mut id.value, lower_case));
+        }
     }
 
-    fn fold_name(name: &mut sqlparser::ast::ObjectName) {
+    fn fold_name(&mut self, name: &mut sqlparser::ast::ObjectName) {
         for part in &mut name.0 {
             if let sqlparser::ast::ObjectNamePart::Identifier(id) = part {
-                Self::fold(id);
+                self.fold(id);
             }
         }
     }
 
-    fn fold_alias(alias: &mut sqlparser::ast::TableAlias) {
-        Self::fold(&mut alias.name);
+    fn fold_alias(&mut self, alias: &mut sqlparser::ast::TableAlias) {
+        self.fold(&mut alias.name);
         for column in &mut alias.columns {
-            Self::fold(&mut column.name);
+            self.fold(&mut column.name);
         }
     }
 
-    fn fold_using_columns(table: &mut sqlparser::ast::TableWithJoins) {
+    fn fold_using_columns(&mut self, table: &mut sqlparser::ast::TableWithJoins) {
         use sqlparser::ast::{JoinConstraint, JoinOperator};
         if let TableFactor::NestedJoin {
             table_with_joins, ..
         } = &mut table.relation
         {
-            Self::fold_using_columns(table_with_joins);
+            self.fold_using_columns(table_with_joins);
         }
         for join in &mut table.joins {
             if let TableFactor::NestedJoin {
                 table_with_joins, ..
             } = &mut join.relation
             {
-                Self::fold_using_columns(table_with_joins);
+                self.fold_using_columns(table_with_joins);
             }
             let constraint = match &mut join.join_operator {
                 JoinOperator::Join(constraint)
@@ -1595,12 +1608,12 @@ impl UnquotedNameFolder {
                 _ => continue,
             };
             if let JoinConstraint::Using(columns) = constraint {
-                columns.iter_mut().for_each(Self::fold_name);
+                columns.iter_mut().for_each(|column| self.fold_name(column));
             }
         }
     }
 
-    fn fold_select_level_names(body: &mut SetExpr) {
+    fn fold_select_level_names(&mut self, body: &mut SetExpr) {
         match body {
             SetExpr::Select(select) => {
                 for item in &mut select.projection {
@@ -1609,14 +1622,17 @@ impl UnquotedNameFolder {
                         _,
                     ) = item
                     {
-                        Self::fold_name(name);
+                        self.fold_name(name);
                     }
                 }
-                select.from.iter_mut().for_each(Self::fold_using_columns);
+                select
+                    .from
+                    .iter_mut()
+                    .for_each(|table| self.fold_using_columns(table));
             }
             SetExpr::SetOperation { left, right, .. } => {
-                Self::fold_select_level_names(left);
-                Self::fold_select_level_names(right);
+                self.fold_select_level_names(left);
+                self.fold_select_level_names(right);
             }
             _ => {}
         }
@@ -1629,15 +1645,15 @@ impl VisitorMut for UnquotedNameFolder {
     fn pre_visit_query(&mut self, query: &mut Query) -> ControlFlow<()> {
         if let Some(with) = &mut query.with {
             for cte in &mut with.cte_tables {
-                Self::fold_alias(&mut cte.alias);
+                self.fold_alias(&mut cte.alias);
             }
         }
-        Self::fold_select_level_names(&mut query.body);
+        self.fold_select_level_names(&mut query.body);
         ControlFlow::Continue(())
     }
 
     fn pre_visit_relation(&mut self, relation: &mut sqlparser::ast::ObjectName) -> ControlFlow<()> {
-        Self::fold_name(relation);
+        self.fold_name(relation);
         ControlFlow::Continue(())
     }
 
@@ -1650,7 +1666,7 @@ impl VisitorMut for UnquotedNameFolder {
             | TableFactor::UNNEST { alias, .. }
             | TableFactor::NestedJoin { alias, .. } => {
                 if let Some(alias) = alias {
-                    Self::fold_alias(alias);
+                    self.fold_alias(alias);
                 }
             }
             _ => {}
@@ -1660,9 +1676,9 @@ impl VisitorMut for UnquotedNameFolder {
 
     fn pre_visit_expr(&mut self, expr: &mut Expr) -> ControlFlow<()> {
         match expr {
-            Expr::Identifier(id) => Self::fold(id),
-            Expr::CompoundIdentifier(ids) => ids.iter_mut().for_each(Self::fold),
-            Expr::QualifiedWildcard(name, _) => Self::fold_name(name),
+            Expr::Identifier(id) => self.fold(id),
+            Expr::CompoundIdentifier(ids) => ids.iter_mut().for_each(|id| self.fold(id)),
+            Expr::QualifiedWildcard(name, _) => self.fold_name(name),
             _ => {}
         }
         ControlFlow::Continue(())

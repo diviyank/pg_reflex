@@ -35,7 +35,8 @@ pub(crate) struct ParsedInputs {
     storage_upper: String,
     mode_upper: String,
     parsed_sql: Vec<sqlparser::ast::Statement>,
-    /// The query with its unquoted names in lower case, when it writes one otherwise.
+    /// The caller's text with its unquoted names in lower case and its keyword-named
+    /// relations spelled as PostgreSQL prints them, when it writes one otherwise.
     /// The pipeline then works from this text, so that the names it registers and the
     /// names in the query it stores are spelled alike.
     folded_sql: Option<String>,
@@ -150,6 +151,12 @@ fn validate_and_parse_inputs(
     }
     let deferred = mode_upper == "DEFERRED";
     validate_view_name(view_name)?;
+    if let Some(written) = identifier_quotes::unicode_escaped_identifier(sql) {
+        return Err(crate::reflex_reject(&format!(
+            "pg_reflex does not read the identifier {written}, written with Unicode escapes. \
+             Fix: write the name itself between double quotes, without the U& prefix."
+        )));
+    }
     let dialect = PostgreSqlDialect {};
     let parsed_sql = match Parser::parse_sql(&dialect, sql) {
         Ok(stmts) => stmts,
@@ -158,7 +165,10 @@ fn validate_and_parse_inputs(
             return Err(crate::reflex_reject(&format!("Failed to parse SQL: {}", e)));
         }
     };
-    let (parsed_sql, folded_sql) = with_unquoted_names_folded(parsed_sql);
+    let (parsed_sql, folded_sql) = match with_one_spelling_per_name(sql, parsed_sql) {
+        Ok(folded) => folded,
+        Err(reason) => return Err(crate::reflex_reject(&reason)),
+    };
     let (analysis, function_contract) = match analyze(&parsed_sql) {
         Err(SqlAnalysisError::MultipleQueries(_)) => {
             return Err(crate::reflex_reject("Expected 1 query, got multiple"));
@@ -201,19 +211,39 @@ fn validate_and_parse_inputs(
     })
 }
 
-fn with_unquoted_names_folded(
+/// The statements with every unquoted name in the lower case PostgreSQL folds it
+/// to and every keyword-named relation spelled as PostgreSQL prints it, with the
+/// text they are the parse of: the caller's, in which only the case of those names
+/// and the quotes of those relations differ. `None` for the text when nothing does.
+fn with_one_spelling_per_name(
+    sql: &str,
     mut statements: Vec<sqlparser::ast::Statement>,
-) -> (Vec<sqlparser::ast::Statement>, Option<String>) {
-    let rendered = |statements: &[sqlparser::ast::Statement]| {
-        let texts: Vec<String> = statements.iter().map(|s| s.to_string()).collect();
-        texts.join("; ")
-    };
-    let written = rendered(&statements);
-    crate::sql_analyzer::fold_unquoted_names(&mut statements);
-    identifier_quotes::unquote_relation_names(&mut statements);
-    let folded = rendered(&statements);
-    let folded_sql = (folded != written).then_some(folded);
-    (statements, folded_sql)
+) -> Result<(Vec<sqlparser::ast::Statement>, Option<String>), String> {
+    let mut rewritten_sql: Option<String> = None;
+    let rewritten_spellings = crate::sql_analyzer::fold_unquoted_names(&mut statements);
+    if !rewritten_spellings.is_empty() {
+        let lower_cased = identifier_quotes::with_words_in_lower_case(sql, &rewritten_spellings)
+            .and_then(|text| {
+                let mut reparsed = Parser::parse_sql(&PostgreSqlDialect {}, &text).ok()?;
+                crate::sql_analyzer::fold_unquoted_names(&mut reparsed)
+                    .is_empty()
+                    .then_some((reparsed, text))
+            });
+        let Some((reparsed, text)) = lower_cased else {
+            return Err(format!(
+                "pg_reflex could not write the unquoted name(s) {} in lower case in the query \
+                 text. Fix: write them in lower case, as PostgreSQL reads them.",
+                rewritten_spellings.join(", ")
+            ));
+        };
+        statements = reparsed;
+        rewritten_sql = Some(text);
+    }
+    let respelled = identifier_quotes::with_keyword_relations_as_postgres_prints_them(
+        rewritten_sql.as_deref().unwrap_or(sql),
+        &mut statements,
+    );
+    Ok((statements, respelled.or(rewritten_sql)))
 }
 
 /// For passthrough IMVs, resolve the unique-key column set: explicit
@@ -2618,7 +2648,9 @@ fn first_unprojected_group_key(analysis: &crate::sql_analyzer::SqlAnalysis) -> O
 /// itself (the parents and operands of a decomposition) do not pass here: they
 /// name their sub-IMVs quoted, and the registry lookups rely on it.
 pub(crate) fn query_with_one_spelling_per_identifier(sql: &str) -> String {
-    identifier_quotes::with_one_spelling_per_identifier(sql).unwrap_or_else(|| sql.to_string())
+    let sql = identifier_quotes::without_idle_unicode_escape_prefixes(sql)
+        .unwrap_or_else(|| sql.to_string());
+    identifier_quotes::with_one_spelling_per_identifier(&sql).unwrap_or(sql)
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -8,7 +8,7 @@
 use pgrx::datum::DatumWithOid;
 use pgrx::prelude::*;
 use sqlparser::ast::{
-    Ident, ObjectName, ObjectNamePart, Query, Statement, Visit, VisitMut, Visitor, VisitorMut,
+    Expr, Ident, ObjectName, ObjectNamePart, Query, Statement, Visit, VisitMut, Visitor, VisitorMut,
 };
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::keywords::ALL_KEYWORDS;
@@ -50,13 +50,59 @@ fn byte_offset(sql: &str, line: u64, column: u64) -> Option<usize> {
     }
 }
 
-fn glues_to_a_bare_word(neighbour: Option<char>) -> bool {
-    neighbour.is_some_and(|c| c.is_alphanumeric() || matches!(c, '_' | '$' | '"' | '\'' | '&'))
+/// A neighbour a space separates from the bare word: the last letter of a keyword
+/// or of a name, as in `FROM"t"WHERE`.
+fn is_letter(neighbour: Option<char>) -> bool {
+    neighbour.is_some_and(|c| c.is_alphabetic() || c == '_')
 }
 
-/// `(byte offset, name)` of every double-quoted identifier that is a plain
-/// lower-case word and stands apart from its neighbours.
-fn quoted_lower_case_words(sql: &str) -> Vec<(usize, String)> {
+/// A neighbour the quoted name is left beside as written: another quoted name, a
+/// string, the `&` of `U&"..."`, a digit or a `$`.
+fn keeps_the_quotes_beside(neighbour: Option<char>) -> bool {
+    neighbour.is_some_and(|c| c.is_numeric() || matches!(c, '"' | '\'' | '&' | '$'))
+}
+
+/// A double-quoted identifier that is a plain lower-case word, and whether the
+/// bare word would run into the text before or after it.
+struct QuotedWord {
+    start: usize,
+    name: String,
+    glued_before: bool,
+    glued_after: bool,
+}
+
+impl QuotedWord {
+    fn end(&self) -> usize {
+        self.start + self.name.len() + 2
+    }
+
+    fn bare(&self) -> String {
+        format!(
+            "{}{}{}",
+            if self.glued_before { " " } else { "" },
+            self.name,
+            if self.glued_after { " " } else { "" }
+        )
+    }
+}
+
+fn quoted_word_at(sql: &str, start: usize, name: &str) -> Option<QuotedWord> {
+    let end = start + name.len() + 2;
+    let before = sql.get(..start)?.chars().next_back();
+    let after = sql.get(end..)?.chars().next();
+    let written_as_expected = sql.get(start..end)? == format!("\"{name}\"");
+    let stands_apart = !keeps_the_quotes_beside(before) && !keeps_the_quotes_beside(after);
+    (written_as_expected && stands_apart).then(|| QuotedWord {
+        start,
+        name: name.to_string(),
+        glued_before: is_letter(before),
+        glued_after: is_letter(after),
+    })
+}
+
+/// Every double-quoted identifier that is a plain lower-case word and is a token
+/// of its own.
+fn quoted_lower_case_words(sql: &str) -> Vec<QuotedWord> {
     let Some(tokens) = tokens_of(sql) else {
         return Vec::new();
     };
@@ -70,12 +116,7 @@ fn quoted_lower_case_words(sql: &str) -> Vec<(usize, String)> {
                 return None;
             }
             let start = byte_offset(sql, token.span.start.line, token.span.start.column)?;
-            let end = start + word.value.len() + 2;
-            let written = sql.get(start..end)?;
-            let stands_apart = !glues_to_a_bare_word(sql[..start].chars().next_back())
-                && !glues_to_a_bare_word(sql[end..].chars().next());
-            (written == format!("\"{}\"", word.value) && stands_apart)
-                .then(|| (start, word.value.clone()))
+            quoted_word_at(sql, start, &word.value)
         })
         .collect()
 }
@@ -112,13 +153,13 @@ fn single_statement_text(sql: &str) -> Option<String> {
 fn with_quotes_removed(sql: &str, loses_its_quotes: &dyn Fn(&str) -> bool) -> String {
     let mut unquoted = String::with_capacity(sql.len());
     let mut copied_up_to = 0;
-    for (start, name) in quoted_lower_case_words(sql) {
-        if !loses_its_quotes(&name) {
+    for word in quoted_lower_case_words(sql) {
+        if !loses_its_quotes(&word.name) {
             continue;
         }
-        unquoted.push_str(&sql[copied_up_to..start]);
-        unquoted.push_str(&name);
-        copied_up_to = start + name.len() + 2;
+        unquoted.push_str(&sql[copied_up_to..word.start]);
+        unquoted.push_str(&word.bare());
+        copied_up_to = word.end();
     }
     unquoted.push_str(&sql[copied_up_to..]);
     unquoted
@@ -147,7 +188,8 @@ fn parser_reads_them_the_same(
 
 /// `sql` with the quotes removed from every quoted identifier `reads_the_same_bare`
 /// accepts, or `None` when nothing changes. Only the quote characters differ
-/// from `sql`: literals, comments and spacing are kept. When a bare name would
+/// from `sql`, a space taking their place where the bare word would run into its
+/// neighbour: literals, comments and spacing are kept. When a bare name would
 /// change what the parser reads, the names it knows as keywords keep their quotes.
 pub(crate) fn without_needless_quotes(
     sql: &str,
@@ -198,7 +240,7 @@ fn names_postgres_reads_the_same_bare(candidates: &[String]) -> Vec<String> {
 pub(crate) fn with_one_spelling_per_identifier(sql: &str) -> Option<String> {
     let mut candidates: Vec<String> = quoted_lower_case_words(sql)
         .into_iter()
-        .map(|(_, name)| name)
+        .map(|word| word.name)
         .collect();
     candidates.sort();
     candidates.dedup();
@@ -209,10 +251,105 @@ pub(crate) fn with_one_spelling_per_identifier(sql: &str) -> Option<String> {
     without_needless_quotes(sql, &|name| bare.iter().any(|b| b == name))
 }
 
-/// The quoted last part of a relation name written unqualified or under
-/// `public`. A relation of another schema is registered from the catalog,
-/// whatever the query wrote.
-fn quoted_name_of_a_public_relation(relation: &ObjectName) -> Option<&Ident> {
+/// An identifier written `U&"..."`, which the parser reads as `u & "..."`.
+struct UnicodeEscapedIdentifier {
+    start: usize,
+    written: String,
+    /// No escape sequence and no `UESCAPE` clause: the name is the text between
+    /// the quotes, as for a plain quoted identifier.
+    holds_no_escape: bool,
+}
+
+fn unicode_escaped_identifiers(sql: &str) -> Vec<UnicodeEscapedIdentifier> {
+    let Some(tokens) = tokens_of(sql) else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    for (position, window) in tokens.windows(3).enumerate() {
+        let (Token::Word(prefix), Token::Ampersand, Token::Word(name)) =
+            (&window[0].token, &window[1].token, &window[2].token)
+        else {
+            continue;
+        };
+        if prefix.quote_style.is_some()
+            || !prefix.value.eq_ignore_ascii_case("u")
+            || name.quote_style != Some('"')
+        {
+            continue;
+        }
+        let Some(start) = byte_offset(sql, window[0].span.start.line, window[0].span.start.column)
+        else {
+            continue;
+        };
+        if !sql
+            .get(start..start + 3)
+            .is_some_and(|written| written.eq_ignore_ascii_case("u&\""))
+        {
+            continue;
+        }
+        let followed_by_uescape = tokens[position + 3..]
+            .iter()
+            .map(|token| &token.token)
+            .find(|token| !matches!(token, Token::Whitespace(_)))
+            .is_some_and(
+                |token| matches!(token, Token::Word(word) if word.quote_style.is_none() && word.value.eq_ignore_ascii_case("uescape")),
+            );
+        found.push(UnicodeEscapedIdentifier {
+            start,
+            written: format!("{}&\"{}\"", prefix.value, name.value),
+            holds_no_escape: !name.value.contains('\\') && !followed_by_uescape,
+        });
+    }
+    found
+}
+
+/// `sql` with `U&"name"` written `"name"` wherever the name holds no escape
+/// sequence, or `None` when nothing changes.
+pub(crate) fn without_idle_unicode_escape_prefixes(sql: &str) -> Option<String> {
+    let mut plain = String::with_capacity(sql.len());
+    let mut copied_up_to = 0;
+    for identifier in unicode_escaped_identifiers(sql) {
+        if !identifier.holds_no_escape {
+            continue;
+        }
+        plain.push_str(&sql[copied_up_to..identifier.start]);
+        copied_up_to = identifier.start + 2;
+    }
+    plain.push_str(&sql[copied_up_to..]);
+    (plain != sql).then_some(plain)
+}
+
+/// The first identifier of `sql` written with Unicode escapes, as written.
+pub(crate) fn unicode_escaped_identifier(sql: &str) -> Option<String> {
+    unicode_escaped_identifiers(sql)
+        .into_iter()
+        .next()
+        .map(|identifier| identifier.written)
+}
+
+/// `sql` with every unquoted word written like one of `spellings` in lower case.
+/// Only the case of those letters differs from `sql`.
+pub(crate) fn with_words_in_lower_case(sql: &str, spellings: &[String]) -> Option<String> {
+    let mut lower_cased = sql.to_string();
+    for token in tokens_of(sql)? {
+        let Token::Word(word) = &token.token else {
+            continue;
+        };
+        if word.quote_style.is_some() || !spellings.contains(&word.value) {
+            continue;
+        }
+        let start = byte_offset(sql, token.span.start.line, token.span.start.column)?;
+        let end = start + word.value.len();
+        if sql.get(start..end)? != word.value {
+            return None;
+        }
+        lower_cased.replace_range(start..end, &word.value.to_ascii_lowercase());
+    }
+    Some(lower_cased)
+}
+
+/// The table name of a relation written unqualified or under a schema.
+fn table_name_of(relation: &ObjectName) -> Option<&Ident> {
     let parts: Vec<&Ident> = relation
         .0
         .iter()
@@ -221,66 +358,32 @@ fn quoted_name_of_a_public_relation(relation: &ObjectName) -> Option<&Ident> {
             _ => None,
         })
         .collect::<Option<_>>()?;
-    let name = match parts.as_slice() {
-        [name] => name,
-        [schema, name] if schema.value == "public" => name,
-        _ => return None,
-    };
-    (name.quote_style == Some('"')).then_some(*name)
+    match parts.as_slice() {
+        [name] | [_, name] => Some(name),
+        _ => None,
+    }
 }
 
-/// The double-quoted plain lower-case names the statements read as a relation,
-/// apart from the CTEs they define.
-fn quoted_relation_names(statements: &[Statement]) -> Vec<String> {
-    #[derive(Default)]
-    struct Names {
-        relations: Vec<String>,
-        ctes: Vec<String>,
-    }
-    impl Visitor for Names {
-        type Break = ();
-
-        fn pre_visit_query(&mut self, query: &Query) -> ControlFlow<()> {
-            if let Some(with) = &query.with {
-                self.ctes.extend(
-                    with.cte_tables
-                        .iter()
-                        .map(|cte| cte.alias.name.value.clone()),
-                );
-            }
-            ControlFlow::Continue(())
-        }
-
-        fn pre_visit_relation(&mut self, relation: &ObjectName) -> ControlFlow<()> {
-            if let Some(name) = quoted_name_of_a_public_relation(relation) {
-                if is_lower_case_word(&name.value) {
-                    self.relations.push(name.value.clone());
-                }
-            }
-            ControlFlow::Continue(())
-        }
-    }
-    let mut names = Names::default();
-    for statement in statements {
-        let _ = statement.visit(&mut names);
-    }
-    names.relations.retain(|name| !names.ctes.contains(name));
-    names.relations.sort();
-    names.relations.dedup();
-    names.relations
+fn is_spelled_as_a_plain_word(name: &Ident) -> bool {
+    matches!(name.quote_style, None | Some('"')) && is_lower_case_word(&name.value)
 }
 
-/// The keywords among `candidates` PostgreSQL accepts without quotes where a
-/// relation is named: the unreserved ones and those that cannot name a function
-/// or a type. A reserved word is only ever written quoted, and a word that is
-/// no keyword has lost its quotes already.
-fn keywords_postgres_reads_bare_as_a_relation(candidates: &[String]) -> Vec<String> {
+/// How PostgreSQL prints a keyword that names a relation: an unreserved one
+/// bare, any other one quoted.
+#[derive(Clone, Copy, PartialEq)]
+enum PrintedAs {
+    Bare,
+    Quoted,
+}
+
+/// The names among `candidates` that are keywords, each with the way
+/// `quote_ident` prints it.
+fn keywords_as_postgres_prints_them(candidates: &[String]) -> Vec<(String, PrintedAs)> {
     Spi::connect(|client| {
         client
             .select(
-                "SELECT w::text AS w FROM unnest($1::text[]) AS w \
-                 WHERE EXISTS (SELECT 1 FROM pg_get_keywords() k \
-                               WHERE k.word = w AND k.catcode IN ('U', 'C'))",
+                "SELECT k.word::text AS w, (k.catcode = 'U') AS bare \
+                 FROM pg_get_keywords() k WHERE k.word = ANY($1::text[])",
                 None,
                 &[unsafe {
                     DatumWithOid::new(
@@ -291,10 +394,16 @@ fn keywords_postgres_reads_bare_as_a_relation(candidates: &[String]) -> Vec<Stri
             )
             .map(|rows| {
                 rows.filter_map(|row| {
-                    row.get_by_name::<&str, _>("w")
-                        .ok()
-                        .flatten()
-                        .map(str::to_string)
+                    let word = row.get_by_name::<&str, _>("w").ok().flatten()?.to_string();
+                    let bare = row.get_by_name::<bool, _>("bare").ok().flatten()?;
+                    Some((
+                        word,
+                        if bare {
+                            PrintedAs::Bare
+                        } else {
+                            PrintedAs::Quoted
+                        },
+                    ))
                 })
                 .collect()
             })
@@ -302,20 +411,103 @@ fn keywords_postgres_reads_bare_as_a_relation(candidates: &[String]) -> Vec<Stri
     })
 }
 
-struct RelationNameUnquoter<'a> {
-    read_bare: &'a [String],
+/// The spelling `name` must take to read as PostgreSQL prints it, when it is not
+/// written so already. A quoted keyword PostgreSQL does not accept bare where a
+/// relation is named (a reserved one, or one that names a function or a type) is
+/// only ever written quoted.
+fn respelling(name: &Ident, keywords: &[(String, PrintedAs)]) -> Option<PrintedAs> {
+    let printed_as = keywords
+        .iter()
+        .find(|(word, _)| *word == name.value)
+        .map(|(_, printed_as)| *printed_as)?;
+    match (name.quote_style, printed_as) {
+        (Some(_), PrintedAs::Bare) | (None, PrintedAs::Quoted) => Some(printed_as),
+        _ => None,
+    }
 }
 
-impl VisitorMut for RelationNameUnquoter<'_> {
+/// The relation names written as a plain lower-case word, quoted or not, apart
+/// from the CTEs the statements define, and the qualifiers of their columns.
+#[derive(Default)]
+struct PlainWordRelationNames {
+    relations: Vec<Ident>,
+    qualifiers: Vec<Ident>,
+    ctes: Vec<String>,
+}
+
+impl Visitor for PlainWordRelationNames {
+    type Break = ();
+
+    fn pre_visit_query(&mut self, query: &Query) -> ControlFlow<()> {
+        if let Some(with) = &query.with {
+            self.ctes.extend(
+                with.cte_tables
+                    .iter()
+                    .map(|cte| cte.alias.name.value.clone()),
+            );
+        }
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_relation(&mut self, relation: &ObjectName) -> ControlFlow<()> {
+        if let Some(name) = table_name_of(relation) {
+            if is_spelled_as_a_plain_word(name) {
+                self.relations.push(name.clone());
+            }
+        }
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<()> {
+        if let Expr::CompoundIdentifier(parts) = expr {
+            if let [qualifier, _] = parts.as_slice() {
+                if qualifier.quote_style.is_none() {
+                    self.qualifiers.push(qualifier.clone());
+                }
+            }
+        }
+        ControlFlow::Continue(())
+    }
+}
+
+struct RelationNameRespeller<'a> {
+    keywords: &'a [(String, PrintedAs)],
+    quoted_relations: &'a [String],
+}
+
+impl RelationNameRespeller<'_> {
+    fn respell(name: &mut Ident, printed_as: PrintedAs) {
+        name.quote_style = match printed_as {
+            PrintedAs::Bare => None,
+            PrintedAs::Quoted => Some('"'),
+        };
+    }
+}
+
+impl VisitorMut for RelationNameRespeller<'_> {
     type Break = ();
 
     fn pre_visit_relation(&mut self, relation: &mut ObjectName) -> ControlFlow<()> {
-        let names_a_keyword = quoted_name_of_a_public_relation(relation)
-            .is_some_and(|name| self.read_bare.contains(&name.value));
-        if let (true, Some(ObjectNamePart::Identifier(name))) =
-            (names_a_keyword, relation.0.last_mut())
+        let printed_as = table_name_of(relation)
+            .filter(|name| is_spelled_as_a_plain_word(name))
+            .and_then(|name| respelling(name, self.keywords));
+        if let (Some(printed_as), Some(ObjectNamePart::Identifier(name))) =
+            (printed_as, relation.0.last_mut())
         {
-            name.quote_style = None;
+            Self::respell(name, printed_as);
+        }
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_expr(&mut self, expr: &mut Expr) -> ControlFlow<()> {
+        if let Expr::CompoundIdentifier(parts) = expr {
+            if let [qualifier, _] = parts.as_mut_slice() {
+                if qualifier.quote_style.is_none()
+                    && self.quoted_relations.contains(&qualifier.value)
+                {
+                    Self::respell(qualifier, PrintedAs::Quoted);
+                }
+            }
         }
         ControlFlow::Continue(())
     }
@@ -325,33 +517,95 @@ fn rendered(statements: &[Statement]) -> Vec<String> {
     statements.iter().map(|s| s.to_string()).collect()
 }
 
-/// Removes the quotes of `"zone"` where it names a relation. The token-level
-/// step above keeps the quotes of a keyword, because a bare keyword is not
-/// accepted in every position; where a relation is named PostgreSQL accepts
-/// the bare word, so `zone` and `"zone"` register one source there. The
-/// statements are left as written when the parser does not read the bare
-/// names back the same.
-pub(crate) fn unquote_relation_names(statements: &mut Vec<Statement>) {
-    let candidates = quoted_relation_names(statements);
+/// `sql` with the name at `name`'s position spelled as `printed_as`, or `None`
+/// when the text there is not the name as the parser read it.
+fn respelled_in_place(sql: &mut String, name: &Ident, printed_as: PrintedAs) -> Option<()> {
+    let start = byte_offset(sql, name.span.start.line, name.span.start.column)?;
+    match printed_as {
+        PrintedAs::Bare => {
+            let word = quoted_word_at(sql, start, &name.value)?;
+            sql.replace_range(start..word.end(), &word.bare());
+        }
+        PrintedAs::Quoted => {
+            let end = start + name.value.len();
+            if sql.get(start..end)? != name.value {
+                return None;
+            }
+            sql.replace_range(start..end, &format!("\"{}\"", name.value));
+        }
+    }
+    Some(())
+}
+
+/// Spells a keyword that names a relation the way PostgreSQL prints it, which is
+/// how a dropped table is reported and how a table of another schema is registered: `"zone"` becomes `zone` (an
+/// unreserved keyword) and `position` becomes `"position"`, with the qualifiers of
+/// its columns. The token-level step above leaves keywords alone, because a bare
+/// keyword is not accepted in every position; where a relation is named these
+/// spellings name one relation. Returns the text with only those quote characters
+/// changed, or `None`, leaving `statements` as written, when nothing changes or
+/// when the parser does not read the new text as the respelled statements.
+pub(crate) fn with_keyword_relations_as_postgres_prints_them(
+    sql: &str,
+    statements: &mut Vec<Statement>,
+) -> Option<String> {
+    let mut names = PlainWordRelationNames::default();
+    for statement in statements.iter() {
+        let _ = statement.visit(&mut names);
+    }
+    names
+        .relations
+        .retain(|name| !names.ctes.contains(&name.value));
+    let mut candidates: Vec<String> = names
+        .relations
+        .iter()
+        .map(|name| name.value.clone())
+        .collect();
+    candidates.sort();
+    candidates.dedup();
     if candidates.is_empty() {
-        return;
+        return None;
     }
-    let read_bare = keywords_postgres_reads_bare_as_a_relation(&candidates);
-    if read_bare.is_empty() {
-        return;
+    let keywords = keywords_as_postgres_prints_them(&candidates);
+    let mut edits: Vec<(Ident, PrintedAs)> = names
+        .relations
+        .into_iter()
+        .filter_map(|name| respelling(&name, &keywords).map(|printed_as| (name, printed_as)))
+        .collect();
+    if edits.is_empty() {
+        return None;
     }
-    let mut unquoted = statements.clone();
-    for statement in &mut unquoted {
-        let _ = statement.visit(&mut RelationNameUnquoter {
-            read_bare: &read_bare,
+    let quoted_relations: Vec<String> = edits
+        .iter()
+        .filter(|(_, printed_as)| *printed_as == PrintedAs::Quoted)
+        .map(|(name, _)| name.value.clone())
+        .collect();
+    edits.extend(
+        names
+            .qualifiers
+            .into_iter()
+            .filter(|qualifier| quoted_relations.contains(&qualifier.value))
+            .map(|qualifier| (qualifier, PrintedAs::Quoted)),
+    );
+    edits.sort_by_key(|(name, _)| (name.span.start.line, name.span.start.column));
+    edits.dedup_by_key(|(name, _)| (name.span.start.line, name.span.start.column));
+    let mut respelled_sql = sql.to_string();
+    for (name, printed_as) in edits.iter().rev() {
+        respelled_in_place(&mut respelled_sql, name, *printed_as)?;
+    }
+    let mut respelled = statements.clone();
+    for statement in &mut respelled {
+        let _ = statement.visit(&mut RelationNameRespeller {
+            keywords: &keywords,
+            quoted_relations: &quoted_relations,
         });
     }
-    let text = rendered(&unquoted);
-    let parser_reads_it_back = Parser::parse_sql(&PostgreSqlDialect {}, &text.join("; "))
-        .is_ok_and(|reparsed| rendered(&reparsed) == text);
-    if parser_reads_it_back {
-        *statements = unquoted;
+    let reparsed = Parser::parse_sql(&PostgreSqlDialect {}, &respelled_sql).ok()?;
+    if rendered(&reparsed) != rendered(&respelled) {
+        return None;
     }
+    *statements = reparsed;
+    Some(respelled_sql)
 }
 
 #[cfg(test)]
