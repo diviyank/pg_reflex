@@ -1672,3 +1672,70 @@ fn comment_inside_a_join_keyword_does_not_change_the_null_rejection_decision() {
         "v > 0 OR v IS NULL"
     );
 }
+
+fn folded_statement(sql: &str) -> (String, Vec<String>) {
+    let mut parsed = Parser::parse_sql(&PostgreSqlDialect {}, sql).unwrap();
+    let rewritten = fold_unquoted_names(&mut parsed);
+    (parsed[0].to_string(), rewritten)
+}
+
+#[test]
+fn folding_reports_the_spellings_it_rewrote_and_touches_ascii_letters_only() {
+    assert_eq!(
+        folded_statement("SELECT Id, É, ÉCOLE, \"Mixed\", SUM(V) FROM T1 X WHERE X.Id > 0"),
+        (
+            "SELECT id, É, École, \"Mixed\", SUM(v) FROM t1 x WHERE x.id > 0".to_string(),
+            vec!["Id", "T1", "V", "X", "ÉCOLE"]
+                .into_iter()
+                .map(String::from)
+                .collect()
+        )
+    );
+    assert_eq!(
+        folded_statement("SELECT id, é FROM t x"),
+        ("SELECT id, é FROM t x".to_string(), Vec::new())
+    );
+}
+
+#[test]
+fn a_call_named_like_an_aggregate_with_two_arguments_is_no_aggregate() {
+    let holds_an_aggregate = |analysis: &SqlAnalysis| {
+        analysis
+            .select_columns
+            .iter()
+            .any(|column| column.aggregate.is_some())
+    };
+    let two_arguments = parse_and_analyze("SELECT id, sum(v, w) AS x FROM t");
+    assert!(!holds_an_aggregate(&two_arguments));
+    assert!(two_arguments
+        .non_builtin_calls
+        .iter()
+        .any(|call| call.name == "sum"));
+    for sql in [
+        "SELECT sum(v) AS x FROM t",
+        "SELECT COUNT(*) AS c FROM t",
+        "SELECT COUNT(DISTINCT v) AS c FROM t",
+        "SELECT pg_catalog.max(v) AS m FROM t",
+    ] {
+        let one_argument = parse_and_analyze(sql);
+        assert!(holds_an_aggregate(&one_argument), "{sql}");
+        assert!(one_argument.non_builtin_calls.is_empty(), "{sql}");
+    }
+}
+
+#[test]
+fn an_alias_declared_twice_drops_the_update_skip_inputs() {
+    for sql in [
+        "SELECT id, t.amount FROM o t WHERE t.cid IN (SELECT t.id FROM c t WHERE t.active)",
+        "SELECT o.id, o.amount FROM o WHERE o.cid IN (SELECT o.id FROM c o)",
+        "SELECT t.id, t.amount FROM o t JOIN (SELECT t.id FROM c t) q ON q.id = t.cid",
+    ] {
+        let analysis = parse_and_analyze(sql);
+        assert!(analysis.imv_relevant_columns.is_empty(), "{sql}");
+        assert!(analysis.imv_relevant_where.is_empty(), "{sql}");
+    }
+    let distinct_aliases = parse_and_analyze(
+        "SELECT id, t.amount FROM o t WHERE t.cid IN (SELECT u.id FROM c u WHERE u.active)",
+    );
+    assert!(distinct_aliases.imv_relevant_columns.contains_key("o"));
+}
