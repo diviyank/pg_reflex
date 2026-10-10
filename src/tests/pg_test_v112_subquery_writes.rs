@@ -936,14 +936,13 @@ fn v112_sq_commit_groups(groups: &[&V112SqCommitGroup]) {
 }
 
 /// Replays every DEFERRED cell with real COMMITs. A committed DEFERRED create
-/// makes the creates of concurrently running tests fail, so this runs only when
-/// the test filter names it: `cargo pgrx test <pg> v112_sq_commit`.
+/// makes the creates of concurrently running tests fail, so this is left out of
+/// the default run and reported as ignored. Run it alone:
+/// `cargo test --no-default-features --features "pg18 pg_test" --lib v112_sq_commit_path -- --ignored`.
 #[cfg(test)]
 #[test]
+#[ignore = "commits DEFERRED IMVs, which fails the creates of tests running beside it: run it alone with -- --ignored"]
 fn v112_sq_commit_path() {
-    if !std::env::args().any(|argument| argument.contains("v112_sq_commit")) {
-        return;
-    }
     v112_sq_commit_groups(&[
         &V112_SQ_DEFERRED_1,
         &V112_SQ_DEFERRED_2,
