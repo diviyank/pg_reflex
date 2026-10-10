@@ -1307,7 +1307,7 @@ fn folded_name_parts(written: &str) -> Vec<String> {
         parts.push(if *part_is_quoted {
             std::mem::take(part)
         } else {
-            std::mem::take(part).to_lowercase()
+            std::mem::take(part).to_ascii_lowercase()
         });
         *part_is_quoted = false;
     };
@@ -1533,7 +1533,7 @@ pub(crate) fn collect_column_refs(expr: &Expr) -> Vec<Vec<String>> {
 pub(crate) fn folded(id: &Ident) -> String {
     match id.quote_style {
         Some(_) => id.value.clone(),
-        None => id.value.to_lowercase(),
+        None => id.value.to_ascii_lowercase(),
     }
 }
 
