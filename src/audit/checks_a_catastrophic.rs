@@ -400,7 +400,23 @@ impl Check for TriggerModeMatches {
         for src in imv.real_sources() {
             let fn_names = ["ins", "del", "upd", "trunc"]
                 .map(|op| crate::schema_builder::source_trigger_function_name(src, op));
-            // Check each trigger function for consistency with refresh_mode.
+            // The functions of a source serve every IMV reading it: they stage
+            // (DEFERRED body) as soon as one enabled reader is DEFERRED, and apply
+            // the IMMEDIATE readers inline.
+            let source_has_deferred_reader = imv.refresh_mode == "DEFERRED"
+                || client
+                    .select(
+                        "SELECT 1 FROM public.__reflex_ivm_reference \
+                         WHERE $1 = ANY(depends_on) AND refresh_mode = 'DEFERRED' \
+                           AND enabled = TRUE LIMIT 1",
+                        None,
+                        &[unsafe {
+                            DatumWithOid::new(src.to_string(), PgBuiltInOids::TEXTOID.oid().value())
+                        }],
+                    )
+                    .unwrap_or_report()
+                    .next()
+                    .is_some();
             for fn_name in &fn_names {
                 let body: Option<String> = client
                     .select(
@@ -422,22 +438,30 @@ impl Check for TriggerModeMatches {
                     None => continue, // trigger-attached check covers absence
                 };
                 let body_is_deferred = body.contains("__reflex_delta_");
-                let expected_deferred = imv.refresh_mode == "DEFERRED";
+                let expected_deferred = source_has_deferred_reader;
                 if body_is_deferred != expected_deferred {
                     out.push(Finding {
                         imv: Some(imv.name.clone()),
                         severity: Severity::Error,
                         category: "trigger-mode-matches",
                         finding: format!(
-                            "Trigger function {} is in {} mode but IMV {} refresh_mode is {}.",
+                            "Trigger function {} is in {} mode but {}.",
                             fn_name,
                             if body_is_deferred {
                                 "DEFERRED"
                             } else {
                                 "IMMEDIATE"
                             },
-                            imv.name,
-                            imv.refresh_mode,
+                            if imv.refresh_mode == "DEFERRED" {
+                                format!("IMV {} refresh_mode is DEFERRED", imv.name)
+                            } else if source_has_deferred_reader {
+                                format!("source {} is read by a DEFERRED IMV", src)
+                            } else {
+                                format!(
+                                    "IMV {} refresh_mode is IMMEDIATE and no IMV of {} is DEFERRED",
+                                    imv.name, src
+                                )
+                            },
                         ),
                         suggested_fix: format!("SELECT reflex_rebuild_triggers('{}');", src),
                     });
