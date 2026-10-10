@@ -643,3 +643,89 @@ fn v112_pr_audit_knows_the_stored_trigger_names_of_a_long_named_source() {
         }
     }
 }
+
+const V112_PR_MIXED_QUERIES: [(&str, &str, &str); 2] = [
+    ("imm", "SELECT g, SUM(v) AS sv FROM {s} GROUP BY g", "IMMEDIATE"),
+    ("def", "SELECT g, COUNT(*) AS c FROM {s} GROUP BY g", "DEFERRED"),
+];
+
+/// A plain source read by an IMMEDIATE and a DEFERRED IMV, created in the order
+/// given; the IMV names.
+fn v112_pr_mixed_mode_fixture(source: &str, order: [usize; 2]) -> Vec<String> {
+    Spi::run(&format!("CREATE TABLE {source}(id INT, g TEXT, v INT)")).expect("source");
+    Spi::run(&format!("INSERT INTO {source} VALUES (1,'a',1),(2,'b',2)")).expect("seed");
+    for index in order {
+        let (suffix, query, mode) = V112_PR_MIXED_QUERIES[index];
+        assert_eq!(
+            crate::create_reflex_ivm(
+                &format!("{source}_{suffix}"),
+                &query.replace("{s}", source),
+                None,
+                None,
+                Some(mode),
+                None
+            ),
+            "CREATE REFLEX INCREMENTAL VIEW"
+        );
+    }
+    V112_PR_MIXED_QUERIES.iter().map(|(suffix, _, _)| format!("{source}_{suffix}")).collect()
+}
+
+fn v112_pr_assert_immediate_imv_of_mixed_source_correct(source: &str) {
+    assert_imv_correct(
+        &format!("{source}_imm"),
+        &V112_PR_MIXED_QUERIES[0].1.replace("{s}", source),
+    );
+}
+
+#[pg_test]
+fn v112_pr_audit_is_clean_for_an_immediate_and_a_deferred_imv_on_one_source() {
+    lock_shared_fixtures();
+    for (source, order) in [("v112_pr_mixed_a", [0, 1]), ("v112_pr_mixed_b", [1, 0])] {
+        for imv in v112_pr_mixed_mode_fixture(source, order) {
+            v112_pr_assert_audit_clean(&imv, "after create");
+        }
+        Spi::run(&format!("INSERT INTO {source} VALUES (3,'a',4)")).expect("write");
+        v112_pr_assert_immediate_imv_of_mixed_source_correct(source);
+    }
+}
+
+/// The functions of a source read by a DEFERRED IMV, overwritten by the ones an
+/// IMMEDIATE-only source gets, stage nothing: reported for every IMV of the
+/// source, and the printed remedy clears the findings.
+#[pg_test]
+fn v112_pr_audit_reports_immediate_functions_on_a_source_read_by_a_deferred_imv() {
+    lock_shared_fixtures();
+    let imvs = v112_pr_mixed_mode_fixture("v112_pr_mixed_c", [0, 1]);
+    for ddl in crate::schema_builder::build_trigger_ddls("v112_pr_mixed_c") {
+        Spi::run(&ddl).expect("immediate functions");
+    }
+    let reports: Vec<String> = imvs.iter().map(|imv| v112_pr_audit_of(imv)).collect();
+    for (imv, report) in imvs.iter().zip(&reports) {
+        assert!(
+            report.contains("[ERROR]") && report.contains("trigger-mode-matches"),
+            "audit of {imv}:\n{report}"
+        );
+    }
+    for report in &reports {
+        v112_pr_run_remedies(report);
+    }
+    for imv in &imvs {
+        v112_pr_assert_audit_clean(imv, "after the remedy");
+    }
+    Spi::run("INSERT INTO v112_pr_mixed_c VALUES (3,'a',4)").expect("write");
+    v112_pr_assert_immediate_imv_of_mixed_source_correct("v112_pr_mixed_c");
+}
+
+/// The IMMEDIATE IMV left alone on a source once its DEFERRED sibling is
+/// dropped: whatever the audit then prints, its remedy clears it.
+#[pg_test]
+fn v112_pr_audit_of_the_immediate_imv_converges_once_its_deferred_sibling_is_dropped() {
+    lock_shared_fixtures();
+    v112_pr_mixed_mode_fixture("v112_pr_mixed_d", [0, 1]);
+    assert_eq!(crate::drop_reflex_ivm("v112_pr_mixed_d_def"), "DROP REFLEX INCREMENTAL VIEW");
+    v112_pr_run_remedies(&v112_pr_audit_of("v112_pr_mixed_d_imm"));
+    v112_pr_assert_audit_clean("v112_pr_mixed_d_imm", "after the remedy");
+    Spi::run("INSERT INTO v112_pr_mixed_d VALUES (3,'a',4)").expect("write");
+    v112_pr_assert_immediate_imv_of_mixed_source_correct("v112_pr_mixed_d");
+}
