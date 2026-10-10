@@ -1799,3 +1799,63 @@ fn v112_sr_i4_group_column_and_join_column_differ_by_case_only() {
     }
     assert!(wrong.is_empty(), "\n{}", wrong.join("\n"));
 }
+
+/// A table whose name PostgreSQL prints quoted but reads bare (a non-ASCII
+/// letter, a `$`) takes its IMVs with it when dropped, in any schema.
+#[pg_test]
+fn v112_sr_drop_of_a_table_registered_bare_but_printed_quoted_drops_its_imvs() {
+    Spi::run("CREATE SCHEMA v112_sr_dbq").expect("schema");
+    let mut kept = Vec::new();
+    for (tag, table) in [
+        ("accent", "v112_sr_dbq_é"),
+        ("dollar", "v112_sr_dbq$t"),
+        ("accent_s", "v112_sr_dbq.é_t"),
+        ("dollar_s", "v112_sr_dbq.my$t"),
+        ("upper_accent_s", "v112_sr_dbq.É_t"),
+    ] {
+        Spi::run(&format!("CREATE TABLE {table}(id INT PRIMARY KEY, v INT)")).expect("table");
+        Spi::run(&format!("INSERT INTO {table} VALUES (1, 10)")).expect("seed");
+        for mode in ["IMMEDIATE", "DEFERRED"] {
+            let imv = format!("v112_sr_dbq_{tag}_{}", mode.to_lowercase());
+            assert_eq!(
+                crate::create_reflex_ivm(&imv, &format!("SELECT id, v FROM {table}"), None, None, Some(mode), None),
+                "CREATE REFLEX INCREMENTAL VIEW"
+            );
+        }
+        Spi::run(&format!("DROP TABLE {table}")).expect("drop");
+        for mode in ["immediate", "deferred"] {
+            if v112_sr_registered(&format!("v112_sr_dbq_{tag}_{mode}")) {
+                kept.push(format!("{tag} {mode}"));
+            }
+        }
+    }
+    assert!(kept.is_empty(), "still registered after the drop: {kept:?}");
+}
+
+/// A dropped table is not taken for another one whose registered name its own
+/// unquoted name happens to spell: a dot inside the name, another case.
+#[pg_test]
+fn v112_sr_drop_of_a_table_whose_unquoted_name_spells_another_keeps_the_imv() {
+    Spi::run("CREATE SCHEMA v112_sr_dun").expect("schema");
+    Spi::run("CREATE TABLE v112_sr_dun.t(id INT PRIMARY KEY, v INT)").expect("table");
+    Spi::run("CREATE TABLE v112_sr_dunp(id INT PRIMARY KEY, v INT)").expect("table");
+    Spi::run("CREATE TABLE \"v112_sr_dun.t\"(id INT PRIMARY KEY, v INT)").expect("dotted");
+    Spi::run("CREATE TABLE \"V112_sr_dunp\"(id INT PRIMARY KEY, v INT)").expect("upper");
+    Spi::run("CREATE TABLE v112_sr_dun.\"V112_sr_dunp\"(id INT PRIMARY KEY, v INT)").expect("upper");
+    for (imv, query) in [
+        ("v112_sr_dun_schema", "SELECT id, v FROM v112_sr_dun.t"),
+        ("v112_sr_dun_plain", "SELECT id, v FROM v112_sr_dunp"),
+    ] {
+        assert_eq!(
+            crate::create_reflex_ivm(imv, query, None, None, None, None),
+            "CREATE REFLEX INCREMENTAL VIEW"
+        );
+    }
+    Spi::run("DROP TABLE \"v112_sr_dun.t\", \"V112_sr_dunp\", v112_sr_dun.\"V112_sr_dunp\"").expect("drop");
+    assert!(v112_sr_registered("v112_sr_dun_schema"));
+    assert!(v112_sr_registered("v112_sr_dun_plain"));
+    Spi::run("INSERT INTO v112_sr_dun.t VALUES (2, 20)").expect("write");
+    Spi::run("INSERT INTO v112_sr_dunp VALUES (2, 20)").expect("write");
+    assert_imv_correct("v112_sr_dun_schema", "SELECT id, v FROM v112_sr_dun.t");
+    assert_imv_correct("v112_sr_dun_plain", "SELECT id, v FROM v112_sr_dunp");
+}
