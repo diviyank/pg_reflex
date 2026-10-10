@@ -315,6 +315,15 @@ pub(crate) fn build_source_join_keys(
             target_col_to_expr.insert(target_name, lower_case_unless_quoted(&col.expr_sql));
         }
     }
+    // A group column selected under an alias is not found by its output name:
+    // its expression is the GROUP BY entry itself.
+    for (name, written) in group_by_names.iter().zip(&plan.group_by_columns) {
+        if written.contains('.') && !written.contains('(') {
+            target_col_to_expr
+                .entry(name.clone())
+                .or_insert_with(|| lower_case_unless_quoted(written));
+        }
+    }
 
     // 2) For each source, look only at the JOIN that *introduces* this
     //    source into the FROM clause — i.e. `analysis.joins[i]` with
