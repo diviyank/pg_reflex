@@ -1360,7 +1360,7 @@ pub(crate) fn inner_join_equi_non_null_refs(
 }
 
 /// Resolve a (possibly aliased) column reference to its real source table.
-/// Returns `(real_table, bare_column)` when the reference is a simple
+/// Returns `(real_table as the analysis spells it, bare_column)` when the reference is a simple
 /// `qualifier.col` or a bare `col` with a single source; `None` otherwise.
 pub(crate) fn resolve_column_source(
     analysis: &crate::sql_analyzer::SqlAnalysis,
@@ -1375,11 +1375,11 @@ pub(crate) fn resolve_column_source(
             .table_aliases
             .iter()
             .find(|(k, _)| k.eq_ignore_ascii_case(qual))
-            .map(|(_, v)| v.trim_matches('"').to_lowercase())
+            .map(|(_, v)| v.clone())
             .unwrap_or_else(|| qual.to_string());
         Some((real, col.to_string()))
     } else if analysis.sources.len() == 1 {
-        Some((analysis.sources[0].trim_matches('"').to_lowercase(), canon))
+        Some((analysis.sources[0].clone(), canon))
     } else {
         None
     }
@@ -1397,7 +1397,7 @@ pub(crate) fn column_base_not_null(
     let Some((table, col)) = resolve_column_source(analysis, col_expr) else {
         return false;
     };
-    if left_target_tables.contains(&table) {
+    if left_target_tables.contains(&table.trim_matches('"').to_lowercase()) {
         return false;
     }
     client
