@@ -3063,6 +3063,15 @@ pub(crate) fn create_reflex_ivm_impl_with_materialization(
         return crate::reflex_reject(&reason);
     }
 
+    if let Some(source) = partitioned_source_whose_name_needs_quotes(&ctx.real_source_names) {
+        return crate::reflex_reject(&format!(
+            "the source {source} is a partitioned table whose name PostgreSQL writes in double \
+             quotes, and pg_reflex follows the partitions of a source by its unquoted name. \
+             Fix: give the table and its schema lower-case names that are not keywords \
+             (ALTER TABLE ... RENAME TO ...), then create the IMV."
+        ));
+    }
+
     if let Some(duplicate) = duplicate_output_column(ctx.sql) {
         return crate::reflex_reject(&format!(
             "{duplicate}: two output columns of the query have the same name. \
