@@ -77,3 +77,15 @@ Related, not a bug: `resolve_column_source` (`src/create_ivm/soundness.rs`) spli
 first `.` too, so a 3-part reference resolves to table `public`, column `fb.k`. Its only
 caller is `column_base_not_null`, whose catalog probe then finds nothing and returns
 `false` — a missed NOT-NULL inference, which is the safe direction.
+
+## Addendum 2026-10-10 (1.12.0 fix round 3, pg17)
+
+Met again with plain table names while building the keyword-relation matrix:
+
+- `SELECT public.t.id, public.t.v FROM t` (three-part reference, bare FROM) and a three-part
+  reference in WHERE: IMMEDIATE raises on the first write, as above. **DEFERRED does not
+  raise: the flush returns and the IMV is silently stale** — so the "low corruption risk"
+  above holds for IMMEDIATE only.
+- A query mixing `t.c` and `public.t.c` for the same table fails the same way.
+- `SELECT public.t.id FROM public.t` (three-part reference, schema-qualified FROM) is
+  maintained; the keyword cells `three_part` of `V112_SR_KEYWORD_REFERENCES` cover that shape.
