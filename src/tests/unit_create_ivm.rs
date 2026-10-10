@@ -527,3 +527,66 @@ fn query_of_the_first_cte_is_kept_as_written() {
     let query = "SELECT  season,sum(v) as s FROM t GROUP BY season";
     assert_eq!(cte_query_reading_sub_imvs(query, &[]), query);
 }
+
+fn aggregate_join_key_mappings(
+    condition: &str,
+    secondary: &str,
+    aliases: &[(&str, &str)],
+    group_column: &str,
+    group_expression: &str,
+) -> Vec<(String, String)> {
+    let aliases: HashMap<String, String> = aliases
+        .iter()
+        .map(|(alias, table)| (alias.to_string(), table.to_string()))
+        .collect();
+    let expressions: HashMap<String, String> =
+        HashMap::from([(group_column.to_string(), group_expression.to_string())]);
+    soundness::parse_join_condition_mappings(
+        condition,
+        secondary,
+        &aliases,
+        &[group_column.to_string()],
+        &expressions,
+        soundness::KeyColumnMatch::EitherSideOfTheEquality,
+    )
+}
+
+#[test]
+fn a_group_column_maps_to_a_join_column_only_when_it_is_a_side_of_the_equality() {
+    let aliases = [("f", "fact"), ("d", "dim")];
+    let mapped = |pairs: &[(&str, &str)]| -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(target, source)| (target.to_string(), source.to_string()))
+            .collect()
+    };
+    for (condition, secondary, group_expression, expected) in [
+        ("d.id = f.k", "dim", "d.k", mapped(&[])),
+        ("d.id = f.k", "fact", "d.k", mapped(&[])),
+        ("f.k = d.k", "dim", "f.k", mapped(&[("k", "k")])),
+        ("f.k = d.k", "dim", "d.k", mapped(&[("k", "k")])),
+        ("f.k = d.k", "fact", "d.k", mapped(&[("k", "k")])),
+        ("f.k = d.k", "dim", "public.fact.k", mapped(&[])),
+        (
+            "fact.k = dim.k",
+            "dim",
+            "public.fact.k",
+            mapped(&[("k", "k")]),
+        ),
+        (
+            "fact.k = dim.k",
+            "dim",
+            "public.dim.k",
+            mapped(&[("k", "k")]),
+        ),
+        ("fact.k = dim.id", "dim", "public.dim.k", mapped(&[])),
+        ("f.k = d.k", "dim", "k", mapped(&[("k", "k")])),
+        ("d.kk = f.k", "dim", "f.k", mapped(&[("k", "kk")])),
+    ] {
+        assert_eq!(
+            aggregate_join_key_mappings(condition, secondary, &aliases, "k", group_expression),
+            expected,
+            "{condition} / {secondary} / {group_expression}"
+        );
+    }
+}
