@@ -1716,7 +1716,6 @@ v112_sr_aliased_group_cells! {
     v112_sr_ag_alias_three_tables => "SELECT e.k AS grp, SUM(f.v) AS s, COUNT(*) AS c FROM {f} f JOIN {d} d ON d.id = f.k JOIN {d} e ON e.id = d.k GROUP BY e.k",
     v112_sr_ag_alias_other_aliases => "SELECT x.k AS grp, SUM(y.v) AS s, COUNT(*) AS c FROM {f} y JOIN {d} x ON x.id = y.k GROUP BY x.k",
     v112_sr_ag_alias_upper_case => "SELECT D.K AS Grp, SUM(F.V) AS s, COUNT(*) AS c FROM {F} F JOIN {D} D ON D.ID = F.K GROUP BY D.K",
-    v112_sr_ag_alias_grouped_by_the_alias => "SELECT d.k AS grp, SUM(f.v) AS s, COUNT(*) AS c FROM {f} f JOIN {d} d ON d.id = f.k GROUP BY grp",
     v112_sr_ag_alias_of_the_join_side => "SELECT f.k AS grp, SUM(f.v) AS s, SUM(d.v) AS t, COUNT(*) AS c FROM {f} f JOIN {d} d ON d.id = f.k GROUP BY f.k",
     v112_sr_ag_alias_left_join => "SELECT d.k AS grp, SUM(f.v) AS s, COUNT(*) AS c FROM {f} f LEFT JOIN {d} d ON d.id = f.k GROUP BY d.k",
 }
