@@ -82,6 +82,38 @@ pub(crate) fn canonicalize_analysis_sources(analysis: &mut crate::sql_analyzer::
     }
 }
 
+/// The first of `sources` that is a partitioned table whose schema or name PostgreSQL
+/// prints in double quotes (upper case, a reserved or column-name keyword, a special
+/// character). The partition bookkeeping keys a partitioned source by its unquoted
+/// `schema.name`, which is not the spelling such a source is registered under: a
+/// partition attached with rows, detached or dropped would not reach the IMV.
+pub(crate) fn partitioned_source_whose_name_needs_quotes(sources: &[String]) -> Option<String> {
+    Spi::connect(|client| {
+        sources.iter().find_map(|source| {
+            client
+                .select(
+                    "SELECT quote_ident(n.nspname) || '.' || quote_ident(c.relname) AS printed \
+                     FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+                     WHERE c.oid = to_regclass($1) AND c.relkind = 'p' \
+                       AND (quote_ident(n.nspname) <> n.nspname::text \
+                            OR quote_ident(c.relname) <> c.relname::text)",
+                    Some(1),
+                    &[unsafe {
+                        DatumWithOid::new(source.to_string(), PgBuiltInOids::TEXTOID.oid().value())
+                    }],
+                )
+                .ok()
+                .and_then(|mut rows| rows.next())
+                .and_then(|row| {
+                    row.get_by_name::<&str, _>("printed")
+                        .ok()
+                        .flatten()
+                        .map(str::to_string)
+                })
+        })
+    })
+}
+
 /// Build per-source-table column mappings for passthrough DELETE/UPDATE.
 ///
 /// For the "key owner" table (whose columns directly match the key), mapping is 1:1.
