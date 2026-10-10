@@ -1095,3 +1095,253 @@ v112_sr_keyword_table_of_another_schema_cells! {
     v112_sr_kws_plain => ("plain", "plain"),
     v112_sr_kws_plain_quoted => ("plain", "\"plain\""),
 }
+
+// ---------------------------------------------------------------------------
+// Every reader of a registered source name takes the quoted spelling
+// ---------------------------------------------------------------------------
+
+/// Before PostgreSQL 16, `to_regclass` raises on a name it cannot parse instead of
+/// answering NULL: a reader that mangles a quoted source name is loud there and
+/// silent after. Each maintenance entry point runs over IMVs whose source name
+/// needs quotes, then the IMVs are written and compared again.
+fn v112_sr_admin_paths_over(tag: &str, table: &str, deferred: bool) -> String {
+    Spi::run(&format!("CREATE TABLE {table}(id INT PRIMARY KEY, g TEXT NOT NULL, v INT)")).expect("table");
+    Spi::run(&format!("INSERT INTO {table} VALUES (1,'a',10),(2,'a',-20),(3,'b',30)")).expect("seed");
+    let mode = if deferred { "DEFERRED" } else { "IMMEDIATE" };
+    let imvs = [
+        (format!("v112_sr_adm_{tag}_pt"), format!("SELECT id, g, v FROM {table}")),
+        (
+            format!("v112_sr_adm_{tag}_agg"),
+            format!("SELECT g, SUM(v) AS s, MIN(v) AS mn, COUNT(*) AS c FROM {table} GROUP BY g"),
+        ),
+    ];
+    for (imv, query) in &imvs {
+        let created = v112_j_try(&format!(
+            "SELECT create_reflex_ivm('{imv}', $v112sel${query}$v112sel$, NULL, 'UNLOGGED', '{mode}')"
+        ));
+        if created != "CREATE REFLEX INCREMENTAL VIEW" {
+            return format!("{imv}: NOT-CREATED {created}");
+        }
+    }
+    let check = |after: &str| -> Option<String> {
+        if deferred {
+            let flushed = v112_j_flush_every_source(&imvs[0].0);
+            if flushed.contains("RAISED") || flushed.contains("ERROR") {
+                return Some(format!("flush after {after}: {flushed}"));
+            }
+        }
+        imvs.iter().find_map(|(imv, query)| {
+            let compared = v112_j_oracle(imv, query);
+            (compared != "0").then(|| format!("{imv} after {after}: {compared}"))
+        })
+    };
+    let write = |dml: String| -> Option<String> {
+        let ran = v112_j_try_dml(&dml);
+        if ran != "OK" {
+            return Some(format!("{ran} [{dml}]"));
+        }
+        check(&dml)
+    };
+    if let Some(wrong) = write(format!("INSERT INTO {table} VALUES (4,'b',40),(5,'c',50)")) {
+        return wrong;
+    }
+    let source = Spi::get_one::<String>(&format!(
+        "SELECT depends_on[1] FROM public.__reflex_ivm_reference WHERE name = '{}'",
+        imvs[0].0
+    ))
+    .expect("registry")
+    .unwrap_or_default();
+    let source_literal = source.replace('\'', "''");
+    let mut calls = vec![
+        "SELECT reflex_audit()".to_string(),
+        "SELECT count(*)::text FROM reflex_ivm_status()".to_string(),
+        format!("SELECT reflex_rebuild_triggers('{source_literal}')"),
+        format!("SELECT refresh_imv_depending_on('{source_literal}')"),
+    ];
+    for (imv, _) in &imvs {
+        calls.extend([
+            format!("SELECT reflex_audit('{imv}')"),
+            format!("SELECT count(*)::text FROM reflex_doctor('{imv}')"),
+            format!("SELECT reflex_probe_not_null_columns('{imv}')"),
+            format!("SELECT reflex_rebuild_imv_metadata('{imv}')"),
+            format!("SELECT reflex_reconcile('{imv}')"),
+            format!("SELECT refresh_reflex_imv('{imv}')"),
+            format!("SELECT reflex_rebuild_imv('{imv}')"),
+        ]);
+    }
+    for call in calls {
+        let answered = v112_j_try(&call);
+        if answered.starts_with("RAISED") || answered.starts_with("ERROR") {
+            return format!("{call}: {answered}");
+        }
+        if let Some(wrong) = check(&call) {
+            return wrong;
+        }
+    }
+    for dml in [
+        format!("UPDATE {table} SET v = v + 1, g = 'c' WHERE id IN (1, 4)"),
+        format!("DELETE FROM {table} WHERE id = 3"),
+        format!("INSERT INTO {table} VALUES (6,'a',NULL)"),
+    ] {
+        if let Some(wrong) = write(dml) {
+            return wrong;
+        }
+    }
+    let dropped = v112_j_try_dml(&format!("DROP TABLE {table} CASCADE"));
+    if dropped != "OK" {
+        return format!("drop: {dropped}");
+    }
+    match imvs.iter().find(|(imv, _)| v112_sr_registered(imv)) {
+        Some((imv, _)) => format!("{imv} left registered after the drop"),
+        None => "ok".to_string(),
+    }
+}
+
+macro_rules! v112_sr_admin_path_cells {
+    ($($name:ident => ($schema:expr, $table:expr, $deferred:expr),)+) => {
+        $(
+            #[pg_test]
+            fn $name() {
+                lock_shared_fixtures();
+                let tag = stringify!($name).trim_start_matches("v112_sr_adm_");
+                let table = match $schema {
+                    "" => $table.to_string(),
+                    schema => {
+                        let schema = schema.replace("{tag}", tag);
+                        Spi::run(&format!("CREATE SCHEMA {schema}")).expect("schema");
+                        format!("{schema}.{}", $table)
+                    }
+                };
+                assert_eq!(v112_sr_admin_paths_over(tag, &table, $deferred), "ok");
+            }
+        )+
+    };
+}
+
+v112_sr_admin_path_cells! {
+    v112_sr_adm_public_column_name_keyword => ("", "\"overlay\"", false),
+    v112_sr_adm_public_column_name_keyword_deferred => ("", "\"overlay\"", true),
+    v112_sr_adm_public_mixed_case => ("", "\"V112_sr_adm_Mixed\"", false),
+    v112_sr_adm_schema_column_name_keyword => ("v112_sr_adm_{tag}", "\"position\"", false),
+    v112_sr_adm_schema_reserved_keyword_deferred => ("v112_sr_adm_{tag}", "\"select\"", true),
+    v112_sr_adm_schema_mixed_case_table => ("v112_sr_adm_{tag}", "\"Mixed\"", false),
+    v112_sr_adm_mixed_case_schema => ("\"v112_sr_adm_{tag}_S\"", "\"T\"", false),
+    v112_sr_adm_mixed_case_schema_deferred => ("\"v112_sr_adm_{tag}_S\"", "\"T\"", true),
+    v112_sr_adm_mixed_case_schema_lower_table => ("\"v112_sr_adm_{tag}_S\"", "u", false),
+    v112_sr_adm_plain => ("v112_sr_adm_{tag}", "plain", false),
+}
+
+/// A partitioned source read by an aggregate and by a passthrough: writes through
+/// the parent and through a partition, a partition attached with rows, a
+/// partition detached. `ok`, or what went wrong; `REFUSED` when the create is
+/// refused with the message for a partitioned source whose name needs quotes.
+fn v112_sr_partitioned_source_cell(schema: &str, parent: &str, first: &str, attached: &str) -> String {
+    Spi::run(&format!("CREATE SCHEMA {schema}")).expect("schema");
+    let table = &format!("{schema}.{parent}");
+    let first = &format!("{schema}.{first}");
+    let second = &format!("{schema}.p_b");
+    let attached = &format!("{schema}.{attached}");
+    let tag = schema.trim_matches('"').to_lowercase();
+    Spi::run(&format!(
+        "CREATE TABLE {table}(id INT, g TEXT NOT NULL, v INT) PARTITION BY LIST (g)"
+    ))
+    .expect("parent");
+    Spi::run(&format!("CREATE TABLE {first} PARTITION OF {table} FOR VALUES IN ('a')")).expect("partition");
+    Spi::run(&format!("CREATE TABLE {second} PARTITION OF {table} FOR VALUES IN ('b')")).expect("partition");
+    Spi::run(&format!("INSERT INTO {table} VALUES (1,'a',10),(2,'a',-20),(3,'b',30)")).expect("seed");
+    let imvs = [
+        (format!("{tag}_agg"), format!("SELECT g, SUM(v) AS s, COUNT(*) AS c FROM {table} GROUP BY g")),
+        (format!("{tag}_pt"), format!("SELECT id, g, v FROM {table}")),
+    ];
+    let mut refused = 0;
+    for (imv, query) in &imvs {
+        let created = v112_j_try(&format!(
+            "SELECT create_reflex_ivm('{imv}', $v112sel${query}$v112sel$)"
+        ));
+        if created.starts_with("ERROR: [reflex-unsupported] the source ")
+            && created.contains("is a partitioned table whose name PostgreSQL writes in double quotes")
+            && created.contains("Fix: give the table and its schema lower-case names that are not keywords")
+            && !v112_sr_registered(imv)
+        {
+            refused += 1;
+        } else if created != "CREATE REFLEX INCREMENTAL VIEW" {
+            return format!("{imv}: NOT-CREATED {created}");
+        }
+    }
+    if refused == imvs.len() {
+        return "REFUSED".to_string();
+    }
+    if refused > 0 {
+        return "one refused, one created".to_string();
+    }
+    let steps = [
+        (format!("INSERT INTO {table} VALUES (4,'b',40),(5,'a',50)"), true),
+        (format!("INSERT INTO {first} VALUES (6,'a',60)"), true),
+        (format!("UPDATE {table} SET v = v + 1 WHERE id IN (1, 4)"), true),
+        (format!("UPDATE {second} SET v = v * 2"), true),
+        (format!("UPDATE {table} SET g = 'b' WHERE id = 2"), true),
+        (format!("DELETE FROM {first} WHERE id = 5"), true),
+        (format!("CREATE TABLE {attached} (id INT, g TEXT NOT NULL, v INT)"), true),
+        (format!("INSERT INTO {attached} VALUES (7,'c',70)"), true),
+        (format!("ALTER TABLE {table} ATTACH PARTITION {attached} FOR VALUES IN ('c')"), false),
+        ("SELECT reflex_flush_partitions()".to_string(), true),
+        (format!("INSERT INTO {table} VALUES (8,'c',80)"), true),
+        (format!("ALTER TABLE {table} DETACH PARTITION {second}"), false),
+        ("SELECT reflex_flush_partitions()".to_string(), true),
+        (format!("DELETE FROM {table} WHERE g = 'c' AND id = 7"), true),
+    ];
+    for (dml, compared_after) in steps {
+        let ran = v112_j_try_dml(&dml);
+        if ran != "OK" {
+            return format!("{ran} [{dml}]");
+        }
+        if !compared_after {
+            continue;
+        }
+        for (imv, query) in &imvs {
+            let compared = v112_j_oracle(imv, query);
+            if compared != "0" {
+                return format!("{imv}: {compared} [{dml}]");
+            }
+        }
+    }
+    "ok".to_string()
+}
+
+#[pg_test]
+fn v112_sr_adm_partitioned_source_plain_names() {
+    assert_eq!(v112_sr_partitioned_source_cell("v112_sr_admp_plain", "p", "p_a", "p_c"), "ok");
+}
+
+/// Quotes on a partition do not matter: the source is the parent.
+#[pg_test]
+fn v112_sr_adm_partitioned_source_plain_parent_quoted_partitions() {
+    assert_eq!(
+        v112_sr_partitioned_source_cell("v112_sr_admp_parts", "p", "\"P_a\"", "\"select\""),
+        "ok"
+    );
+}
+
+/// An unreserved keyword is printed bare.
+#[pg_test]
+fn v112_sr_adm_partitioned_source_named_by_an_unreserved_keyword() {
+    assert_eq!(v112_sr_partitioned_source_cell("v112_sr_admp_zone", "\"zone\"", "p_a", "p_c"), "ok");
+}
+
+#[pg_test]
+fn v112_sr_adm_partitioned_source_in_a_mixed_case_schema_is_refused() {
+    assert_eq!(v112_sr_partitioned_source_cell("\"v112_sr_admp_S\"", "p", "p_a", "p_c"), "REFUSED");
+}
+
+#[pg_test]
+fn v112_sr_adm_partitioned_source_with_a_mixed_case_name_is_refused() {
+    assert_eq!(v112_sr_partitioned_source_cell("v112_sr_admp_mixed", "\"P\"", "p_a", "p_c"), "REFUSED");
+}
+
+#[pg_test]
+fn v112_sr_adm_partitioned_source_named_by_a_column_name_keyword_is_refused() {
+    assert_eq!(
+        v112_sr_partitioned_source_cell("v112_sr_admp_kw", "\"position\"", "p_a", "p_c"),
+        "REFUSED"
+    );
+}
