@@ -2941,9 +2941,13 @@ pub(crate) fn create_reflex_ivm_impl_with_materialization(
         return crate::reflex_reject(&format!(
             "HAVING holds {call}, which the SELECT list does not: a COUNT(DISTINCT ...) can be \
              filtered on in HAVING only when the SELECT list holds it with the same argument and \
-             the same FILTER, written the same way. Fix: compute it in a CTE and filter in the \
-             outer query: WITH cd AS (SELECT grp, COUNT(DISTINCT col) AS n FROM t GROUP BY grp) \
-             SELECT grp, n FROM cd WHERE n > 1"
+             the same FILTER, written the same way. Fix: compute it in a CTE, the other \
+             aggregates in a second one, and join them on the group columns, with IS NOT \
+             DISTINCT FROM so that a group whose key is NULL is kept: \
+             WITH cd AS (SELECT grp, COUNT(DISTINCT col) AS n FROM t GROUP BY grp), \
+             agg AS (SELECT grp, SUM(x) AS total FROM t GROUP BY grp) \
+             SELECT agg.grp, agg.total FROM agg JOIN cd ON cd.grp IS NOT DISTINCT FROM agg.grp \
+             WHERE cd.n > 1"
         ));
     }
     if let Some(crate::aggregation::CountDistinctHavingConflict::PrintedAsWritten(call)) =
