@@ -51,3 +51,5 @@ source's trigger detects that another source of the IMV was modified by the curr
 fall back to a reconcile of the IMV for that statement; (3) document: writing two sources of
 a join IMV in one statement is unsupported for IMMEDIATE IMVs — split the statement or use
 DEFERRED (which is correct without `SET CONSTRAINTS ALL IMMEDIATE`).
+
+See also \`2026-10-10_table_joined_with_cte_over_itself_blocks_inserts_23505.md\`: a one-statement, one-table reproduction (a table joined with a CTE over itself) of this class that raises 23505 and blocks the insert.
