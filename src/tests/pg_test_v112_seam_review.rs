@@ -1751,3 +1751,51 @@ fn v112_sr_drop_of_a_same_named_table_of_another_schema_keeps_the_imv() {
     assert!(!v112_sr_registered("v112_sr_dt_bare"));
     assert!(!v112_sr_registered("v112_sr_dt_public"));
 }
+
+v112_sr_alias_cells! {
+    v112_sr_p2_outer_name_aliases_inner_bare_columns => "SELECT id, amount, name FROM {o} WHERE cid IN (SELECT {o}.id FROM {c} {o} WHERE {o}.active)",
+    v112_sr_p2_outer_name_aliases_inner_aggregate => "SELECT {o}.name, SUM({o}.amount) AS s, COUNT(*) AS c FROM {o} WHERE {o}.cid IN (SELECT {o}.id FROM {c} {o}) GROUP BY {o}.name",
+    v112_sr_p2_outer_name_aliases_inner_join => "SELECT {o}.id, {o}.amount, x.active FROM {o} JOIN {c} x ON x.id = {o}.cid WHERE EXISTS (SELECT 1 FROM {c} {o} WHERE {o}.active)",
+    v112_sr_p2_outer_name_aliases_itself => "SELECT {o}.id, {o}.amount FROM {o} WHERE {o}.cid IN (SELECT {o}.cid FROM {o} {o} WHERE {o}.amount > 15)",
+    v112_sr_p2_outer_name_aliases_a_joined_table => "SELECT name, SUM({o}.amount) AS s, COUNT(*) AS c FROM {o} JOIN {c} x ON x.id = {o}.cid WHERE EXISTS (SELECT 1 FROM {c} {o} WHERE {o}.active) GROUP BY name",
+    v112_sr_p2_outer_name_aliases_a_joined_table_in_from => "SELECT name, SUM({o}.amount) AS s, COUNT(*) AS c FROM {o} JOIN {c} x ON x.id = {o}.cid JOIN (SELECT {o}.id FROM {c} {o} WHERE {o}.active) q ON q.id = x.id GROUP BY name",
+    v112_sr_p2_inner_table_named_by_outer_alias => "SELECT {c}.id, {c}.amount, {c}.name FROM {o} {c} WHERE {c}.cid IN (SELECT {c}.id FROM {c} WHERE {c}.active)",
+}
+
+/// Two quoted columns of one table whose names differ by case only: the join
+/// reads one of them, the groups are keyed by the other.
+#[pg_test]
+fn v112_sr_i4_group_column_and_join_column_differ_by_case_only() {
+    let mut wrong = Vec::new();
+    for (tag, select) in [
+        ("aliased", "SELECT a.\"Ab\", SUM(b.w) AS s, COUNT(*) AS c FROM {q} a JOIN {r} b ON a.\"aB\" = b.k GROUP BY a.\"Ab\""),
+        ("joined_side_first", "SELECT a.\"Ab\", SUM(b.w) AS s, COUNT(*) AS c FROM {q} a JOIN {r} b ON b.k = a.\"aB\" GROUP BY a.\"Ab\""),
+        ("no_aliases", "SELECT {q}.\"Ab\", SUM({r}.w) AS s, COUNT(*) AS c FROM {q} JOIN {r} ON {q}.\"aB\" = {r}.k GROUP BY {q}.\"Ab\""),
+        ("grouped_by_the_join_column", "SELECT a.\"aB\", SUM(b.w) AS s, COUNT(*) AS c FROM {q} a JOIN {r} b ON a.\"aB\" = b.k GROUP BY a.\"aB\""),
+    ] {
+        let left = format!("v112_sr_i4c_{tag}_q");
+        let right = format!("v112_sr_i4c_{tag}_r");
+        Spi::run(&format!("CREATE TABLE {left}(id INT PRIMARY KEY, \"Ab\" INT, \"aB\" INT)")).expect("left");
+        Spi::run(&format!("CREATE TABLE {right}(k INT PRIMARY KEY, w INT)")).expect("right");
+        Spi::run(&format!("INSERT INTO {left} VALUES (1,1,2),(2,2,3),(3,3,1),(4,1,3),(5,4,4)")).expect("seed");
+        Spi::run(&format!("INSERT INTO {right} VALUES (1,10),(2,20),(3,30)")).expect("seed");
+        let steps = vec![
+            format!("DELETE FROM {right} WHERE k = 2"),
+            format!("INSERT INTO {right} VALUES (2, 7), (4, 40)"),
+            format!("UPDATE {right} SET w = w + 1 WHERE k < 3"),
+            format!("UPDATE {right} SET k = 6 WHERE k = 3"),
+            format!("DELETE FROM {left} WHERE id = 1"),
+            format!("UPDATE {left} SET \"aB\" = 6 WHERE id = 5"),
+            format!("UPDATE {left} SET \"Ab\" = \"aB\" WHERE id = 3"),
+            format!("INSERT INTO {left} VALUES (6, 2, 1), (7, 6, 2)"),
+            format!("DELETE FROM {right} WHERE k IN (1, 6)"),
+            format!("DELETE FROM {right}"),
+        ];
+        let query = select.replace("{q}", &left).replace("{r}", &right);
+        let outcome = v112_sr_cell(&format!("v112_sr_i4c_{tag}"), &query, "", &steps);
+        if outcome != "ok" {
+            wrong.push(format!("{tag}: {outcome}"));
+        }
+    }
+    assert!(wrong.is_empty(), "\n{}", wrong.join("\n"));
+}
