@@ -21,17 +21,21 @@ fn v112_pl_holder_exec(sql: &str) {
 /// Evaluates `expr` on the worker; the error text when it raises or when it
 /// reports a failure as an `ERROR…` value.
 fn v112_pl_call(expr: &str) -> Result<String, String> {
+    v112_pl_call_on("reflex_lock_worker", expr)
+}
+
+fn v112_pl_call_on(session: &str, expr: &str) -> Result<String, String> {
     const RAISED: &str = "__raised__";
     let value = Spi::get_one::<String>(&format!(
         "SELECT COALESCE(string_agg(COALESCE(v, ''), ''), '{RAISED}') \
-         FROM dblink('reflex_lock_worker', {}, false) AS t(v text)",
+         FROM dblink('{session}', {}, false) AS t(v text)",
         sql_lit(&format!("SELECT ({expr})::text"))
     ))
-    .expect("worker call")
+    .expect("call over dblink")
     .unwrap_or_default();
     if value == RAISED {
         return Err(
-            Spi::get_one::<String>("SELECT dblink_error_message('reflex_lock_worker')")
+            Spi::get_one::<String>(&format!("SELECT dblink_error_message('{session}')"))
                 .expect("dblink_error_message")
                 .unwrap_or_default(),
         );
@@ -96,7 +100,45 @@ fn v112_pl_locks_held_in_other_schema_at_commit(operation: &V112PlOperation) -> 
 fn v112_pl_schema_fixture(schema: &str, mode: &str) {
     worker_exec(&format!("CREATE SCHEMA {schema}"));
     v112_dp_truncate_fixture(&format!("{schema}.sim"), mode);
+    worker_exec(&format!(
+        "CREATE TABLE {schema}.dim(g TEXT PRIMARY KEY, label TEXT NOT NULL); \
+         INSERT INTO {schema}.dim VALUES ('a','first'),('b','first'),('c','second'),('p','rest'),('z','rest')"
+    ));
+    for (suffix, query, key) in V112_PL_JOIN_AND_CHAIN_IMVS {
+        v112_dp_create(&format!("{schema}.{suffix}"), &query.replace("{schema}", schema), *key, mode, None);
+    }
+    for round in 0..2 {
+        worker_exec(&format!(
+            "CREATE TABLE {schema}.side{round}(id INT PRIMARY KEY, v INT); \
+             INSERT INTO {schema}.side{round} VALUES (1, 1), (2, 2)"
+        ));
+        v112_dp_create(
+            &format!("{schema}.side{round}_sum"),
+            &format!("SELECT COUNT(*) AS c, SUM(v) AS sv FROM {schema}.side{round}"),
+            None,
+            mode,
+            None,
+        );
+    }
 }
+
+/// A join with a second table and a chain of two CTEs, each kept as a sub-IMV:
+/// (name, query over `{schema}`, key).
+const V112_PL_JOIN_AND_CHAIN_IMVS: &[(&str, &str, Option<&str>)] = &[
+    (
+        "sim_join",
+        "SELECT d.label, COUNT(*) AS c, SUM(m.v) AS sv FROM {schema}.sim m \
+         JOIN {schema}.dim d ON d.g = m.g GROUP BY d.label",
+        None,
+    ),
+    (
+        "sim_chain",
+        "WITH per AS (SELECT g, SUM(v) AS s, COUNT(*) AS n FROM {schema}.sim GROUP BY g), \
+              kept AS (SELECT g, s FROM per WHERE n > 0) \
+         SELECT g, s FROM kept WHERE s IS NOT NULL",
+        None,
+    ),
+];
 
 /// Opens the holder session, swaps a leaf of the held schema in a transaction
 /// left open, and locks every table of that schema `ACCESS EXCLUSIVE`.
@@ -261,6 +303,40 @@ fn v112_pl_operations(mode: &str, round: usize) -> Vec<(String, V112PlOperation)
         "drop an IMV".to_string(),
         Call(format!("drop_reflex_ivm({})", sql_lit(&format!("{added_imv}_flat")))),
     ));
+    let schema = V112_PL_MAINTAINED_SCHEMA;
+    operations.push((
+        "write to the joined table".to_string(),
+        Statements(format!(
+            "UPDATE {schema}.dim SET label = 'moved{round}' WHERE g = 'b'; \
+             INSERT INTO {schema}.dim VALUES ('k{round}', 'new')"
+        )),
+    ));
+    operations.push((
+        "truncate a leaf".to_string(),
+        Statements(format!("TRUNCATE {s}_pd; INSERT INTO {s} VALUES ({a},'p',1)", a = base + 51)),
+    ));
+    operations.push((
+        "truncate the source".to_string(),
+        Statements(format!(
+            "TRUNCATE {s}; INSERT INTO {s} VALUES ({a},'a',1),({b},'b',2),({c},'c',3),({d},'p',4)",
+            a = base + 61,
+            b = base + 62,
+            c = 60 + round,
+            d = base + 64
+        )),
+    ));
+    operations.push((
+        "reflex_flush_deferred".to_string(),
+        Call(format!("reflex_flush_deferred({})", sql_lit(&s))),
+    ));
+    operations.push((
+        "reflex_heal_ignored_sources".to_string(),
+        Call(format!("reflex_heal_ignored_sources({})", sql_lit(&format!("{s}_agg")))),
+    ));
+    operations.push((
+        "drop a source table".to_string(),
+        Statements(format!("DROP TABLE {schema}.side{round}")),
+    ));
     operations
 }
 
@@ -278,6 +354,16 @@ fn v112_pl_maintained_schema_defects(added_rounds: usize) -> Vec<String> {
         for flat in ["", "_flat"] {
             imvs.push((format!("{s}_added{round}{flat}"), V112_PL_ADDED_IMV_QUERY.replace("{s}", &s)));
         }
+    }
+    let schema = V112_PL_MAINTAINED_SCHEMA;
+    for (suffix, query, _) in V112_PL_JOIN_AND_CHAIN_IMVS {
+        imvs.push((format!("{schema}.{suffix}"), query.replace("{schema}", schema)));
+    }
+    for round in 0..2 {
+        imvs.push((
+            format!("{schema}.side{round}_sum"),
+            format!("SELECT COUNT(*) AS c, SUM(v) AS sv FROM {schema}.side{round}"),
+        ));
     }
     let mut defects = Vec::new();
     for (imv, fresh) in imvs {
@@ -377,6 +463,467 @@ fn v112_pl_maintaining_one_schema_takes_no_lock_in_another_immediate() {
 #[pg_test]
 fn v112_pl_maintaining_one_schema_takes_no_lock_in_another_deferred() {
     let failures = v112_pl_failures_of_maintaining_beside_another_schema("reflex_pl_def", "DEFERRED");
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// The source of `v112_dp_truncate_fixture` and its seven IMVs under the same
+/// names in `public` (registered without a schema) and in each of `schemas`.
+const V112_PL_SAME_NAME_SCHEMAS: &[&str] = &["public", "ta", "tb"];
+
+fn v112_pl_sim_of(schema: &str) -> String {
+    if schema == "public" { "sim".to_string() } else { format!("{schema}.sim") }
+}
+
+fn v112_pl_same_name_fixture(mode: &str) {
+    for schema in V112_PL_SAME_NAME_SCHEMAS {
+        if *schema != "public" {
+            worker_exec(&format!("CREATE SCHEMA {schema}"));
+        }
+        v112_dp_truncate_fixture(&v112_pl_sim_of(schema), mode);
+    }
+    // An IMV of public whose unqualified name is the name of a partitioned
+    // source of another schema, over a table of public that other schemas
+    // also have under the same name, partitioned and read by no IMV.
+    worker_exec("CREATE TABLE public.plain(id INT PRIMARY KEY, v INT); INSERT INTO public.plain VALUES (1, 1)");
+    v112_dp_create("zed", "SELECT id, v FROM plain", Some("id"), mode, None);
+    for schema in ["ta", "tb"] {
+        worker_exec(&format!(
+            "CREATE TABLE {schema}.plain(id INT NOT NULL, v INT) PARTITION BY RANGE (id); \
+             CREATE TABLE {schema}.plain_low PARTITION OF {schema}.plain FOR VALUES FROM (0) TO (100); \
+             CREATE TABLE {schema}.zed(id INT NOT NULL, g TEXT NOT NULL, v INT) PARTITION BY LIST (g); \
+             CREATE TABLE {schema}.zed_a PARTITION OF {schema}.zed FOR VALUES IN ('a'); \
+             INSERT INTO {schema}.zed VALUES (1,'a',1),(2,'a',2)"
+        ));
+        for (suffix, query, key, partition_by) in V112_PL_ZED_IMVS {
+            v112_dp_create(
+                &format!("{schema}.zed_{suffix}"),
+                &query.replace("{s}", &format!("{schema}.zed")),
+                *key,
+                mode,
+                *partition_by,
+            );
+        }
+    }
+}
+
+const V112_PL_ZED_IMVS: &[(&str, &str, Option<&str>, Option<&str>)] = &[
+    ("agg", "SELECT g, COUNT(*) AS c, SUM(v) AS sv FROM {s} GROUP BY g", None, None),
+    ("total", "SELECT COUNT(*) AS c, SUM(v) AS sv FROM {s}", None, None),
+    ("part", "SELECT id, g, v FROM {s}", Some("id, g"), Some("g")),
+];
+
+/// Every IMV of the same-name fixture read by `schema`, with its query.
+fn v112_pl_same_name_imvs(schema: &str) -> Vec<(String, String)> {
+    let sim = v112_pl_sim_of(schema);
+    let mut imvs: Vec<(String, String)> = V112_DP_TRUNCATE_IMVS
+        .iter()
+        .map(|(suffix, query, _, _)| (format!("{sim}_{suffix}"), query.replace("{s}", &sim)))
+        .collect();
+    if schema == "public" {
+        imvs.push(("zed".to_string(), "SELECT id, v FROM plain".to_string()));
+    } else {
+        let zed = format!("{schema}.zed");
+        for (suffix, query, _, _) in V112_PL_ZED_IMVS {
+            imvs.push((format!("{zed}_{suffix}"), query.replace("{s}", &zed)));
+        }
+    }
+    imvs
+}
+
+/// Every kind of partition DDL on the `sim` of `schema`, then on its `zed`.
+fn v112_pl_partition_ddl_of(schema: &str) -> Vec<(&'static str, String)> {
+    let s = v112_pl_sim_of(schema);
+    let mut steps = vec![
+        (
+            "create a partition",
+            format!("CREATE TABLE {s}_n PARTITION OF {s} FOR VALUES IN ('n'); INSERT INTO {s} VALUES (301,'n',1)"),
+        ),
+        (
+            "attach a partition that holds rows",
+            format!(
+                "CREATE TABLE {s}_t (LIKE {s} INCLUDING ALL); INSERT INTO {s}_t VALUES (311,'t',1),(312,'t',2); \
+                 ALTER TABLE {s} ATTACH PARTITION {s}_t FOR VALUES IN ('t')"
+            ),
+        ),
+        (
+            "leaf swap",
+            format!(
+                "CREATE TABLE {s}_swap (LIKE {s} INCLUDING ALL); INSERT INTO {s}_swap VALUES (321,'a',7),(322,'b',8); \
+                 ALTER TABLE {s} DETACH PARTITION {s}_pa; \
+                 ALTER TABLE {s} ATTACH PARTITION {s}_swap FOR VALUES IN ('a', 'b'); DROP TABLE {s}_pa"
+            ),
+        ),
+        (
+            "create a sub-partition",
+            format!("CREATE TABLE {s}_pc3 PARTITION OF {s}_pc FOR VALUES FROM (200) TO (300)"),
+        ),
+        ("insert into the sub-partition", format!("INSERT INTO {s} VALUES (250,'c',5)")),
+        (
+            "detach a partition that holds rows",
+            format!("ALTER TABLE {s} DETACH PARTITION {s}_t"),
+        ),
+        (
+            "detach and drop a partition",
+            format!("ALTER TABLE {s} DETACH PARTITION {s}_n; DROP TABLE {s}_n"),
+        ),
+        (
+            "create and drop an empty partition",
+            format!("CREATE TABLE {s}_e PARTITION OF {s} FOR VALUES IN ('e'); DROP TABLE {s}_e"),
+        ),
+        ("write after the partition changes", format!("INSERT INTO {s} VALUES (331,'a',1),(332,'q',2)")),
+    ];
+    if schema != "public" {
+        let z = format!("{schema}.zed");
+        steps.extend([
+            (
+                "attach to the source named like an IMV of public",
+                format!(
+                    "CREATE TABLE {z}_att (LIKE {z} INCLUDING ALL); INSERT INTO {z}_att VALUES (5,'z',5),(6,'z',6); \
+                     ALTER TABLE {z} ATTACH PARTITION {z}_att FOR VALUES IN ('z')"
+                ),
+            ),
+            (
+                "swap a leaf of the source named like an IMV of public",
+                format!(
+                    "CREATE TABLE {z}_swap (LIKE {z} INCLUDING ALL); INSERT INTO {z}_swap VALUES (7,'a',7); \
+                     ALTER TABLE {z} DETACH PARTITION {z}_a; \
+                     ALTER TABLE {z} ATTACH PARTITION {z}_swap FOR VALUES IN ('a'); DROP TABLE {z}_a"
+                ),
+            ),
+            (
+                "create a partition of the source named like an IMV of public",
+                format!("CREATE TABLE {z}_b PARTITION OF {z} FOR VALUES IN ('b'); INSERT INTO {z} VALUES (8,'b',8)"),
+            ),
+            (
+                "add a partition to a table no IMV of its schema reads",
+                format!(
+                    "CREATE TABLE {schema}.plain_high PARTITION OF {schema}.plain FOR VALUES FROM (100) TO (200); \
+                     INSERT INTO {schema}.plain VALUES (150, 1)"
+                ),
+            ),
+            (
+                "alter a table no IMV of its schema reads, under the error policy",
+                format!(
+                    "SET LOCAL pg_reflex.alter_source_policy = 'error'; \
+                     ALTER TABLE {schema}.plain ADD COLUMN note TEXT"
+                ),
+            ),
+        ]);
+    }
+    steps
+}
+
+/// The partitions of every IMV-side tree of `schema`, to tell whether a
+/// partition change elsewhere synchronised them.
+fn v112_pl_imv_partitions_of(schema: &str) -> String {
+    rbc_select(&format!(
+        "SELECT COALESCE(string_agg(c.relname, ',' ORDER BY c.relname), '') \
+         FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid \
+         JOIN pg_class p ON p.oid = i.inhparent JOIN pg_namespace n ON n.oid = p.relnamespace \
+         WHERE n.nspname = {} AND p.relname NOT IN ('sim', 'sim_pc', 'zed')",
+        sql_lit(schema)
+    ))
+}
+
+/// Stale IMVs and failed partition flushes, whatever the schema.
+fn v112_pl_registry_defects() -> Vec<String> {
+    let mut defects = Vec::new();
+    let stale = rbc_select(
+        "SELECT COALESCE(string_agg(name || ' (' || COALESCE(stale_reason, '') || ')', ', ' ORDER BY name), '') \
+         FROM public.__reflex_ivm_reference WHERE known_stale",
+    );
+    if !stale.is_empty() {
+        defects.push(format!("known_stale: {stale}"));
+    }
+    let pending = rbc_select(
+        "SELECT COALESCE(string_agg(source_root || ' failures=' || failures || ' (' \
+                || COALESCE(last_error, '') || ')', ', ' ORDER BY source_root), '') \
+         FROM public.__reflex_partition_pending",
+    );
+    if !pending.is_empty() {
+        defects.push(format!("partition changes left pending: {pending}"));
+    }
+    defects
+}
+
+fn v112_pl_mismatches_of(schema: &str) -> Vec<String> {
+    v112_pl_same_name_imvs(schema)
+        .into_iter()
+        .filter_map(|(imv, fresh)| {
+            let mismatches = rbc_mismatch(&imv, &fresh);
+            (mismatches != 0).then(|| format!("{imv} {mismatches} mismatches"))
+        })
+        .collect()
+}
+
+/// Opens the holder session and locks `ACCESS EXCLUSIVE` every table of the
+/// same-name fixture outside `active`, the tables of public that every schema
+/// shares excepted.
+fn v112_pl_hold_schemas_other_than(dbname: &str, active: &str) {
+    Spi::get_one::<String>(&format!(
+        "SELECT dblink_connect('reflex_lock_holder', {})",
+        sql_lit(&conninfo_for(dbname))
+    ))
+    .expect("holder connect");
+    v112_pl_holder_exec("BEGIN");
+    v112_pl_holder_exec(&format!(
+        "DO $$ DECLARE r record; BEGIN \
+           FOR r IN SELECT c.oid::regclass AS rel FROM pg_class c \
+                    JOIN pg_namespace n ON n.oid = c.relnamespace \
+                    WHERE n.nspname IN ('public', 'ta', 'tb') AND n.nspname <> '{active}' \
+                      AND c.relkind IN ('r', 'p') \
+                      AND c.relname NOT IN ('__reflex_ivm_reference', '__reflex_event_log', \
+                          '__reflex_source_partition_snapshot', '__reflex_partition_pending', \
+                          '__reflex_heal_pending', '__reflex_deferred_pending', \
+                          'v112_pl_lock_census', 'v112_pl_census_request') \
+                    ORDER BY c.oid LOOP \
+             EXECUTE format('LOCK TABLE %s IN ACCESS EXCLUSIVE MODE', r.rel); \
+           END LOOP; END $$"
+    ));
+}
+
+fn v112_pl_release_holder() {
+    v112_pl_holder_exec("COMMIT");
+    let _ = Spi::get_one::<String>("SELECT dblink_disconnect('reflex_lock_holder')");
+}
+
+/// Partition DDL on the `sim` of one schema while the same-named sources and
+/// IMVs of the two other schemas are held: it waits on none of them, leaves
+/// them as they were, and its own IMVs follow.
+fn v112_pl_failures_of_partition_ddl_beside_same_named_sources(dbname: &str, mode: &str) -> Vec<String> {
+    probe_db_open(dbname);
+    v112_pl_same_name_fixture(mode);
+    let mut failures = Vec::new();
+    for active in ["tb", "public"] {
+        let others: Vec<&str> =
+            V112_PL_SAME_NAME_SCHEMAS.iter().copied().filter(|schema| *schema != active).collect();
+        let partitions_before: Vec<String> =
+            others.iter().map(|schema| v112_pl_imv_partitions_of(schema)).collect();
+        v112_pl_hold_schemas_other_than(dbname, active);
+        worker_exec("SET lock_timeout = '4s'");
+        for (label, step) in v112_pl_partition_ddl_of(active) {
+            if let Err(error) = v112_dp_try(&step) {
+                failures.push(format!("{mode}, {active}, {label}: {error}"));
+            }
+            let defects = v112_pl_mismatches_of(active).into_iter().chain(v112_pl_registry_defects());
+            failures.extend(defects.map(|defect| format!("{mode}, {active}, {label}: {defect}")));
+        }
+        worker_exec("RESET lock_timeout");
+        v112_pl_release_holder();
+        for (schema, before) in others.iter().zip(partitions_before) {
+            let after = v112_pl_imv_partitions_of(schema);
+            if after != before {
+                failures.push(format!(
+                    "{mode}, {active}: the IMV partitions of {schema} changed from [{before}] to [{after}]"
+                ));
+            }
+            let defects = v112_pl_mismatches_of(schema).into_iter();
+            failures.extend(defects.map(|defect| format!("{mode}, after the partition DDL of {active}: {defect}")));
+        }
+    }
+    failures.extend(v112_pl_imvs_flagged_outside("tb", dbname).into_iter().map(|flagged| {
+        format!("{mode}, a partition flush of tb.sim that fails flags an IMV of another schema: {flagged}")
+    }));
+    probe_db_close(dbname);
+    failures
+}
+
+/// Makes a partition flush of `schema`'s `sim` fail on a lock of its own IMV
+/// and returns the IMVs flagged stale that do not belong to `schema`.
+fn v112_pl_imvs_flagged_outside(schema: &str, dbname: &str) -> Vec<String> {
+    Spi::get_one::<String>(&format!(
+        "SELECT dblink_connect('reflex_lock_holder', {})",
+        sql_lit(&conninfo_for(dbname))
+    ))
+    .expect("holder connect");
+    v112_pl_holder_exec("BEGIN");
+    v112_pl_holder_exec(&format!("LOCK TABLE {schema}.sim_agg IN ACCESS EXCLUSIVE MODE"));
+    worker_exec("SET lock_timeout = '1s'");
+    let _ = v112_dp_try(&format!(
+        "CREATE TABLE {schema}.sim_w PARTITION OF {schema}.sim FOR VALUES IN ('w')"
+    ));
+    worker_exec("RESET lock_timeout");
+    v112_pl_release_holder();
+    let flagged = rbc_select(
+        "SELECT COALESCE(string_agg(name, ',' ORDER BY name), '') FROM public.__reflex_ivm_reference WHERE known_stale",
+    );
+    let flagged: Vec<String> = flagged.split(',').filter(|name| !name.is_empty()).map(str::to_string).collect();
+    let mut outside: Vec<String> =
+        flagged.iter().filter(|name| !name.starts_with(&format!("{schema}."))).cloned().collect();
+    if flagged.len() == outside.len() {
+        outside.push(format!("(fixture: no IMV of {schema} was flagged, the flush did not fail)"));
+    }
+    outside
+}
+
+#[pg_test]
+fn v112_pl_partition_ddl_reaches_only_the_imvs_of_its_own_source_immediate() {
+    let failures = v112_pl_failures_of_partition_ddl_beside_same_named_sources("reflex_pl_same_imm", "IMMEDIATE");
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[pg_test]
+fn v112_pl_partition_ddl_reaches_only_the_imvs_of_its_own_source_deferred() {
+    let failures = v112_pl_failures_of_partition_ddl_beside_same_named_sources("reflex_pl_same_def", "DEFERRED");
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+const V112_PL_DEFERRED_CREATE_QUERY: &str =
+    "SELECT g, COUNT(*) AS c, SUM(v) AS sv FROM {s} WHERE v IS NOT NULL GROUP BY g";
+
+fn v112_pl_deferred_create(imv: &str, source: &str) -> String {
+    format!(
+        "create_reflex_ivm({}, {}, NULL, NULL, 'DEFERRED')",
+        sql_lit(imv),
+        sql_lit(&V112_PL_DEFERRED_CREATE_QUERY.replace("{s}", source))
+    )
+}
+
+/// A DEFERRED create left open in one schema, and DEFERRED writes left open in
+/// one schema, wait on nothing and hold up nothing of another schema.
+#[pg_test]
+fn v112_pl_deferred_create_and_deferred_writes_of_two_schemas_do_not_wait_on_each_other() {
+    const DBNAME: &str = "reflex_pl_defcreate";
+    probe_db_open(DBNAME);
+    for schema in ["ta", "tb"] {
+        worker_exec(&format!("CREATE SCHEMA {schema}"));
+        v112_dp_truncate_fixture(&format!("{schema}.sim"), "DEFERRED");
+    }
+    let mut failures = Vec::new();
+    let mut tb_imvs: Vec<(String, String)> = V112_DP_TRUNCATE_IMVS
+        .iter()
+        .map(|(suffix, query, _, _)| (format!("tb.sim_{suffix}"), query.replace("{s}", "tb.sim")))
+        .collect();
+    let check_tb = |failures: &mut Vec<String>, label: &str, imvs: &[(String, String)]| {
+        for (imv, fresh) in imvs {
+            let mismatches = rbc_mismatch(imv, fresh);
+            if mismatches != 0 {
+                failures.push(format!("{label}: {imv} {mismatches} mismatches"));
+            }
+        }
+        failures.extend(v112_pl_registry_defects().into_iter().map(|defect| format!("{label}: {defect}")));
+    };
+    Spi::get_one::<String>(&format!(
+        "SELECT dblink_connect('reflex_lock_holder', {})",
+        sql_lit(&conninfo_for(DBNAME))
+    ))
+    .expect("holder connect");
+    worker_exec("SET lock_timeout = '4s'");
+
+    v112_pl_holder_exec("SET lock_timeout = '4s'");
+    v112_pl_holder_exec("BEGIN");
+    if let Err(error) = v112_pl_call_on("reflex_lock_holder", &v112_pl_deferred_create("ta.sim_open", "ta.sim")) {
+        failures.push(format!("fixture: the DEFERRED create left open raised {error}"));
+    }
+    for (label, operation) in [
+        (
+            "writes",
+            V112PlOperation::Statements(
+                "INSERT INTO tb.sim VALUES (401,'a',1),(402,'q',2); UPDATE tb.sim SET v = v + 1 WHERE g = 'a'; \
+                 DELETE FROM tb.sim WHERE id = 402"
+                    .to_string(),
+            ),
+        ),
+        (
+            "truncate a leaf",
+            V112PlOperation::Statements("TRUNCATE tb.sim_pd; INSERT INTO tb.sim VALUES (403,'p',3)".to_string()),
+        ),
+        ("reflex_flush_deferred", V112PlOperation::Call("reflex_flush_deferred('tb.sim')".to_string())),
+        (
+            "create a partition",
+            V112PlOperation::Statements(
+                "CREATE TABLE tb.sim_n PARTITION OF tb.sim FOR VALUES IN ('n'); INSERT INTO tb.sim VALUES (404,'n',4)"
+                    .to_string(),
+            ),
+        ),
+        (
+            "leaf swap",
+            V112PlOperation::Statements(
+                "CREATE TABLE tb.sim_swap (LIKE tb.sim INCLUDING ALL); INSERT INTO tb.sim_swap VALUES (405,'a',5); \
+                 ALTER TABLE tb.sim DETACH PARTITION tb.sim_pa; \
+                 ALTER TABLE tb.sim ATTACH PARTITION tb.sim_swap FOR VALUES IN ('a', 'b'); DROP TABLE tb.sim_pa"
+                    .to_string(),
+            ),
+        ),
+        ("DEFERRED create", V112PlOperation::Call(v112_pl_deferred_create("tb.sim_beside_create", "tb.sim"))),
+        ("write after the create", V112PlOperation::Statements("INSERT INTO tb.sim VALUES (406,'b',6)".to_string())),
+    ] {
+        let ran = v112_pl_run(&operation);
+        if let Err(error) = &ran {
+            failures.push(format!("beside an open DEFERRED create, {label}: {error}"));
+        }
+        if label == "DEFERRED create" && ran.is_ok() {
+            tb_imvs.push((
+                "tb.sim_beside_create".to_string(),
+                V112_PL_DEFERRED_CREATE_QUERY.replace("{s}", "tb.sim"),
+            ));
+        }
+        check_tb(&mut failures, &format!("beside an open DEFERRED create, {label}"), &tb_imvs);
+    }
+    v112_pl_holder_exec("COMMIT");
+
+    v112_pl_holder_exec("BEGIN");
+    v112_pl_holder_exec("INSERT INTO ta.sim VALUES (501,'a',1),(502,'q',2)");
+    if let Err(error) = v112_pl_call(&v112_pl_deferred_create("tb.sim_beside_writes", "tb.sim")) {
+        failures.push(format!("DEFERRED create beside open DEFERRED writes: {error}"));
+    } else {
+        tb_imvs.push(("tb.sim_beside_writes".to_string(), V112_PL_DEFERRED_CREATE_QUERY.replace("{s}", "tb.sim")));
+    }
+    check_tb(&mut failures, "DEFERRED create beside open DEFERRED writes", &tb_imvs);
+
+    // Both schemas now hold DEFERRED writes open. A create over a source this
+    // transaction wrote is refused before it touches anything; committed first,
+    // it is accepted.
+    worker_exec("BEGIN");
+    worker_exec("INSERT INTO tb.sim VALUES (407,'a',7)");
+    for (session, schema) in [("reflex_lock_worker", "tb"), ("reflex_lock_holder", "ta")] {
+        let imv = format!("{schema}.sim_after_own_write");
+        let source = format!("{schema}.sim");
+        match v112_pl_call_on(session, &v112_pl_deferred_create(&imv, &source)) {
+            Err(refusal) if refusal.contains("already wrote to its source") => {}
+            other => failures.push(format!("DEFERRED create of {imv} after a write to its source: {other:?}")),
+        }
+        let left_behind = Spi::get_one::<String>(&format!(
+            "SELECT v FROM dblink('{session}', {}) AS t(v text)",
+            sql_lit(&format!(
+                "SELECT (to_regclass('{imv}') IS NOT NULL OR EXISTS (SELECT 1 FROM \
+                 public.__reflex_ivm_reference WHERE name = '{imv}'))::text"
+            ))
+        ))
+        .expect("refused create leftovers")
+        .unwrap_or_default();
+        if left_behind != "false" {
+            failures.push(format!("the refused create of {imv} left something behind"));
+        }
+        let committed = Spi::get_one::<String>(&format!("SELECT dblink_exec('{session}', 'COMMIT', false)"))
+            .expect("commit")
+            .unwrap_or_default();
+        if committed == "ERROR" {
+            failures.push(format!("COMMIT of {schema} after the refused create raised"));
+        }
+        match v112_pl_call_on(session, &v112_pl_deferred_create(&imv, &source)) {
+            Ok(_) if schema == "tb" => {
+                tb_imvs.push((imv, V112_PL_DEFERRED_CREATE_QUERY.replace("{s}", &source)));
+            }
+            Ok(_) => {}
+            Err(error) => failures.push(format!("DEFERRED create of {imv} after COMMIT: {error}")),
+        }
+    }
+    let _ = Spi::get_one::<String>("SELECT dblink_disconnect('reflex_lock_holder')");
+    check_tb(&mut failures, "after both schemas committed", &tb_imvs);
+    let mut ta_imvs: Vec<(String, String)> = V112_DP_TRUNCATE_IMVS
+        .iter()
+        .map(|(suffix, query, _, _)| (format!("ta.sim_{suffix}"), query.replace("{s}", "ta.sim")))
+        .collect();
+    for created in ["ta.sim_open", "ta.sim_after_own_write"] {
+        if rbc_select(&format!("to_regclass({}) IS NOT NULL", sql_lit(created))) == "true" {
+            ta_imvs.push((created.to_string(), V112_PL_DEFERRED_CREATE_QUERY.replace("{s}", "ta.sim")));
+        } else {
+            failures.push(format!("{created} was not created"));
+        }
+    }
+    check_tb(&mut failures, "the other schema after both committed", &ta_imvs);
+    probe_db_close(DBNAME);
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 

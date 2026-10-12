@@ -32,6 +32,25 @@ object is created or altered. The errors point at a relation created with `IF NO
 a catalog row rewritten by every DEFERRED create (a shared function or table), neither of which
 is serialised across sessions before the DDL runs.
 
+## Narrowed on 2026-10-12 (branch `fix/v112-partition-catalog-locks`)
+
+The two shared objects are `public.__reflex_deferred_pending` (created with `IF NOT EXISTS`) and
+`public.__reflex_deferred_flush_fn` with its trigger (replaced and re-created by every DEFERRED
+create, `schema_builder::build_deferred_flush_ddl`). A create now leaves them alone when they are
+installed as it would create them, which removes the rewrite behind `tuple concurrently updated`
+and the table lock that made DEFERRED creates and DEFERRED writes of different schemas wait on
+each other.
+
+What remains is the first install: sessions that all find the table missing race on
+`CREATE TABLE IF NOT EXISTS`. Observed on pg15 with the whole suite run with `--include-ignored`:
+`v112_sq_commit_path` passed, and at the instant its first create committed, four `#[pg_test]`s
+that were creating a DEFERRED IMV in their own open transaction failed with
+`duplicate key value violates unique constraint "pg_type_typname_nsp_index"`; no
+`tuple concurrently updated`. In a database where a DEFERRED IMV was ever committed the table
+exists and the race cannot occur; in the shared test database no `#[pg_test]` commits it, so every
+test is a first installer. Installing the table, function and trigger at `CREATE EXTENSION` (and
+in the migration) closes it.
+
 ## Consequence for the test suite
 
 Tests that COMMIT cannot run in the default parallel run. `v112_sq_commit_path`
