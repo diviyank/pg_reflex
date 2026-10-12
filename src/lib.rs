@@ -1879,6 +1879,7 @@ mod tests {
     include!("tests/pg_test_v112_partition_dml.rs");
     include!("tests/pg_test_v112_partition_review.rs");
     include!("tests/pg_test_v112_seam_review.rs");
+    include!("tests/pg_test_v112_create_rejections.rs");
 }
 
 /// This module is required by `cargo pgrx test` invocations.
