@@ -1654,7 +1654,12 @@ extension_sql!(
     CREATE OR REPLACE FUNCTION public.__reflex_partition_flush_fn()
     RETURNS TRIGGER LANGUAGE plpgsql AS $fn$
     BEGIN
-        PERFORM public.reflex_flush_partition_source(NEW.source_root);
+        -- Every partition DDL command of a transaction queues one event for its
+        -- root; the event of the latest enqueue flushes them all, once.
+        IF EXISTS (SELECT 1 FROM public.__reflex_partition_pending
+                    WHERE source_root = NEW.source_root AND attempts = NEW.attempts) THEN
+            PERFORM public.reflex_flush_partition_source(NEW.source_root);
+        END IF;
         RETURN NULL;
     END;
     $fn$;
@@ -1920,6 +1925,7 @@ mod tests {
     include!("tests/pg_test_v112_partition_locks.rs");
     include!("tests/pg_test_v112_create_rejections.rs");
     include!("tests/pg_test_v112_swap_cascade.rs");
+    include!("tests/pg_test_v112_transient_suspension.rs");
 }
 
 /// This module is required by `cargo pgrx test` invocations.
