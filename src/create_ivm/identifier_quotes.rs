@@ -38,7 +38,7 @@ fn is_parser_keyword(name: &str) -> bool {
         .is_ok()
 }
 
-fn byte_offset(sql: &str, line: u64, column: u64) -> Option<usize> {
+pub(super) fn byte_offset(sql: &str, line: u64, column: u64) -> Option<usize> {
     let line_start: usize = sql
         .split_inclusive('\n')
         .take(line.checked_sub(1)? as usize)

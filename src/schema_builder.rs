@@ -484,7 +484,7 @@ pub fn build_indexes_ddl(view_name: &str, plan: &AggregationPlan) -> Vec<String>
 }
 
 /// The suffix a source's statement triggers and their functions carry.
-fn source_trigger_suffix(source_table: &str) -> String {
+pub(crate) fn source_trigger_suffix(source_table: &str) -> String {
     source_table.replace('.', "_").replace('"', "")
 }
 
