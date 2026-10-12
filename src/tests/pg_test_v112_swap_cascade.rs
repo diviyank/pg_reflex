@@ -1391,6 +1391,38 @@ const SX_IMVS: &[SxImv] = &[
         ignore: "!mv,!zz_tot",
         partition_by: &["plan", "d"],
     },
+    // Readers of the passthrough over ys that observe it.
+    SxImv { name: "o_flat", sql: "SELECT v.plan, v.k, v.q FROM {yv} AS v", keys: "plan, k", ignore: "", partition_by: &[] },
+    SxImv { name: "o_pass", sql: "SELECT v.plan, v.k, v.q FROM {yv} AS v", keys: "plan, k", ignore: "", partition_by: &["plan"] },
+    SxImv { name: "o_agg", sql: SX_PLAN_SUMS_Y, keys: "plan", ignore: "", partition_by: &[] },
+    SxImv { name: "o_agg_dep", sql: "SELECT g.plan, g.sq FROM {o_agg} AS g", keys: "plan", ignore: "", partition_by: &[] },
+    // A dependent reached by keys whose partition column has another type than
+    // the rebuilt IMV's: numeric into integer, varchar into text, timestamp
+    // into timestamptz.
+    SxImv { name: "tn_v", sql: "SELECT s.c, s.k, s.q FROM tn_s AS s", keys: "c, k", ignore: "", partition_by: &["c"] },
+    SxImv {
+        name: "tn_d",
+        sql: "SELECT a.c, v.k, v.q, a.w FROM {tn_v} AS v JOIN tn_a AS a ON a.c = v.c AND a.k = v.k",
+        keys: "c, k",
+        ignore: "!tn_v",
+        partition_by: &["c"],
+    },
+    SxImv { name: "tt_v", sql: "SELECT s.c, s.k, s.q FROM tt_s AS s", keys: "c, k", ignore: "", partition_by: &["c"] },
+    SxImv {
+        name: "tt_d",
+        sql: "SELECT a.c, v.k, v.q, a.w FROM {tt_v} AS v JOIN tt_a AS a ON a.c = v.c AND a.k = v.k",
+        keys: "c, k",
+        ignore: "!tt_v",
+        partition_by: &["c"],
+    },
+    SxImv { name: "tz_v", sql: "SELECT s.c, s.k, s.q FROM tz_s AS s", keys: "c, k", ignore: "", partition_by: &["c"] },
+    SxImv {
+        name: "tz_d",
+        sql: "SELECT a.c, v.k, v.q, a.w FROM {tz_v} AS v JOIN tz_a AS a ON a.c = v.c AND a.k = v.k",
+        keys: "c, k",
+        ignore: "!tz_v",
+        partition_by: &["c"],
+    },
 ];
 
 fn sx_query(imv: &SxImv, inline: bool) -> String {
@@ -1490,6 +1522,38 @@ fn sx_open(dbname: &str, mode: &str) {
            FROM generate_series(0, 3) day, generate_series(1, 2) k",
         "CREATE TABLE zmap (src_plan INT NOT NULL, plan INT NOT NULL, PRIMARY KEY (src_plan, plan))",
         "INSERT INTO zmap VALUES (1, 1), (1, 2)",
+        "CREATE TABLE tn_s (c NUMERIC NOT NULL, k INT NOT NULL, q INT NOT NULL, PRIMARY KEY (c, k)) \
+           PARTITION BY LIST (c)",
+        "CREATE TABLE tn_s_p1 PARTITION OF tn_s FOR VALUES IN (1.0)",
+        "CREATE TABLE tn_s_p2 PARTITION OF tn_s FOR VALUES IN (2.0)",
+        "INSERT INTO tn_s SELECT p + 0.0, k, p * 100 + k FROM generate_series(1, 2) p, generate_series(1, 4) k",
+        "CREATE TABLE tn_a (c INT NOT NULL, k INT NOT NULL, w INT NOT NULL, PRIMARY KEY (c, k)) \
+           PARTITION BY LIST (c)",
+        "CREATE TABLE tn_a_p1 PARTITION OF tn_a FOR VALUES IN (1)",
+        "CREATE TABLE tn_a_p2 PARTITION OF tn_a FOR VALUES IN (2)",
+        "INSERT INTO tn_a SELECT p, k, p + k FROM generate_series(1, 2) p, generate_series(1, 4) k",
+        "CREATE TABLE tt_s (c VARCHAR(5) NOT NULL, k INT NOT NULL, q INT NOT NULL, PRIMARY KEY (c, k)) \
+           PARTITION BY LIST (c)",
+        "CREATE TABLE tt_s_a PARTITION OF tt_s FOR VALUES IN ('a ')",
+        "CREATE TABLE tt_s_b PARTITION OF tt_s FOR VALUES IN ('b')",
+        "INSERT INTO tt_s SELECT c, k, k * 7 FROM unnest(ARRAY['a ', 'b']) c, generate_series(1, 4) k",
+        "CREATE TABLE tt_a (c TEXT NOT NULL, k INT NOT NULL, w INT NOT NULL, PRIMARY KEY (c, k)) \
+           PARTITION BY LIST (c)",
+        "CREATE TABLE tt_a_a PARTITION OF tt_a FOR VALUES IN ('a ')",
+        "CREATE TABLE tt_a_b PARTITION OF tt_a FOR VALUES IN ('b')",
+        "INSERT INTO tt_a SELECT c, k, k FROM unnest(ARRAY['a ', 'b']) c, generate_series(1, 4) k",
+        "CREATE TABLE tz_s (c TIMESTAMP NOT NULL, k INT NOT NULL, q INT NOT NULL, PRIMARY KEY (c, k)) \
+           PARTITION BY LIST (c)",
+        "CREATE TABLE tz_s_1 PARTITION OF tz_s FOR VALUES IN ('2027-01-01 00:00')",
+        "CREATE TABLE tz_s_2 PARTITION OF tz_s FOR VALUES IN ('2027-02-01 00:00')",
+        "INSERT INTO tz_s SELECT c, k, k * 3 FROM unnest(ARRAY['2027-01-01'::timestamp, '2027-02-01']) c, \
+           generate_series(1, 4) k",
+        "CREATE TABLE tz_a (c TIMESTAMPTZ NOT NULL, k INT NOT NULL, w INT NOT NULL, PRIMARY KEY (c, k)) \
+           PARTITION BY LIST (c)",
+        "CREATE TABLE tz_a_1 PARTITION OF tz_a FOR VALUES IN ('2027-01-01 00:00')",
+        "CREATE TABLE tz_a_2 PARTITION OF tz_a FOR VALUES IN ('2027-02-01 00:00')",
+        "INSERT INTO tz_a SELECT c, k, k FROM unnest(ARRAY['2027-01-01'::timestamptz, '2027-02-01']) c, \
+           generate_series(1, 4) k",
     ]
     .iter()
     .map(|ddl| ddl.to_string())
@@ -1791,6 +1855,48 @@ fn sx_steps() -> Vec<SxStep> {
                 sx_swap_month(2, 1, &sx_ms_rows(2, 1, 1, 4))
             ),
         ),
+        SxStep {
+            refreshed: &[("tn_d", "full")],
+            ..step(
+                "numeric key into an integer partition column",
+                sx_swap("tn_s", "tn_s_p1", "FOR VALUES IN (1.0)", "SELECT c, k, q + 11 FROM tn_s_p1"),
+            )
+        },
+        SxStep {
+            refreshed: &[("tt_d", "full")],
+            ..step(
+                "varchar key with a trailing space into a text partition column",
+                sx_swap("tt_s", "tt_s_a", "FOR VALUES IN ('a ')", "SELECT c, k, q + 1 FROM tt_s_a"),
+            )
+        },
+        SxStep {
+            refreshed: &[("tz_d", "full")],
+            ..step(
+                "timestamp key into a timestamptz partition column",
+                sx_swap(
+                    "tz_s",
+                    "tz_s_1",
+                    "FOR VALUES IN ('2027-01-01 00:00')",
+                    "SELECT c, k, q + 1 FROM tz_s_1",
+                ),
+            )
+        },
+        step(
+            "listed leaf swapped for rows of other keys",
+            sx_swap("ys", "ys_p1", "FOR VALUES IN (1)", "SELECT plan, k + 100, q FROM ys_p1"),
+        ),
+        step(
+            "listed leaf swapped for an empty table",
+            sx_swap("ys", "ys_p1", "FOR VALUES IN (1)", "SELECT * FROM ys WHERE FALSE"),
+        ),
+        step(
+            "default leaf swapped for an empty table",
+            sx_swap("ys", "ys_def", "DEFAULT", "SELECT * FROM ys WHERE FALSE"),
+        ),
+        step(
+            "leaf with rows detached and dropped",
+            "ALTER TABLE ys DETACH PARTITION ys_p5; DROP TABLE ys_p5".to_string(),
+        ),
     ]
 }
 
@@ -1863,4 +1969,65 @@ fn v112_sc_shapes_stay_correct_immediate() {
 #[pg_test]
 fn v112_sc_shapes_stay_correct_deferred() {
     sx_assert_shapes_stay_correct("reflex_sx_d", "DEFERRED");
+}
+
+/// A write that rebuilds a hot partition of an IMMEDIATE IMV inside the
+/// source's statement trigger reaches a DEFERRED aggregate of it by key. That
+/// refresh cannot run while the statement may still stage a delta, so it is
+/// left to the COMMIT-time reconcile, which must find it listed.
+#[pg_test]
+fn v112_sc_group_refresh_inside_a_write_is_left_to_commit() {
+    probe_db_open("reflex_sc_hot");
+    let chain = ScChain { field_names: false, cross_plan: false };
+    for ddl in [
+        "CREATE TABLE hs (id INT NOT NULL, region TEXT NOT NULL, amount INT NOT NULL) \
+           PARTITION BY LIST (region)",
+        "CREATE TABLE hs_a PARTITION OF hs FOR VALUES IN ('A')",
+        "CREATE TABLE hs_b PARTITION OF hs FOR VALUES IN ('B')",
+        "CREATE TABLE hs_c PARTITION OF hs FOR VALUES IN ('C')",
+        "CREATE TABLE hs_d PARTITION OF hs FOR VALUES IN ('D')",
+        "INSERT INTO hs SELECT g, r, g FROM unnest(ARRAY['B', 'C', 'D']) r, generate_series(1, 20) g",
+        "CREATE TABLE sc_trace (seq SERIAL, name TEXT NOT NULL, context TEXT NOT NULL)",
+        "CREATE TABLE sc_xact (id TEXT NOT NULL)",
+    ] {
+        worker_exec(ddl);
+    }
+    for call in [
+        "create_reflex_ivm('hv', 'SELECT region, SUM(amount) AS total, COUNT(*) AS n FROM hs \
+           GROUP BY region', NULL, NULL, 'IMMEDIATE', NULL, ARRAY['region'])",
+        "create_reflex_ivm('hg', 'SELECT region, SUM(total) AS t FROM hv GROUP BY region', \
+           NULL, NULL, 'DEFERRED', NULL, ARRAY[]::text[])",
+    ] {
+        assert_eq!(rbc_select(call), "CREATE REFLEX INCREMENTAL VIEW", "{call}");
+    }
+    for ddl in [
+        "SELECT reflex_set_wipe_threshold('hv', 0.1::numeric)",
+        "SELECT reflex_set_wipe_floor_rows('hv', 1)",
+        "ANALYZE hs",
+        "ANALYZE \"__reflex_intermediate_hv\"",
+    ] {
+        if let Some(call) = ddl.strip_prefix("SELECT ") {
+            worker_exec(&format!("DO $$ BEGIN PERFORM {call}; END $$"));
+        } else {
+            worker_exec(ddl);
+        }
+    }
+    let outcome = chain.commit("INSERT INTO hs SELECT g, 'A', g FROM generate_series(1, 50) g");
+    let wrong: Vec<String> = [
+        ("hv", "SELECT region, SUM(amount) AS total, COUNT(*) AS n FROM hs GROUP BY region"),
+        (
+            "hg",
+            "SELECT region, SUM(total) AS t FROM \
+             (SELECT region, SUM(amount) AS total FROM hs GROUP BY region) AS hv GROUP BY region",
+        ),
+    ]
+    .iter()
+    .filter_map(|(imv, fresh)| {
+        let mismatches = rbc_mismatch(imv, fresh);
+        (mismatches != 0).then(|| format!("{imv}: {mismatches} mismatches"))
+    })
+    .collect();
+    probe_db_close("reflex_sc_hot");
+    assert_eq!(outcome, Ok(()));
+    assert!(wrong.is_empty(), "{}", wrong.join(", "));
 }
