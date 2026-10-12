@@ -861,23 +861,20 @@ fn v112_sc_unchanged_leaf_still_refreshes_the_ignoring_sub_imvs() {
     assert!(outside.is_empty(), "wrote outside plan 3: {outside:?}");
 }
 
-/// A partition of a source other than the anchor names the slice under the
-/// same bound; a relation that is no partition of a source is refused.
+/// A partition reconcile serves partitions of the source the IMV mirrors. A
+/// partition of another source, or a relation that is no partition, is refused
+/// and nothing is rebuilt.
 #[pg_test]
-fn v112_sc_partition_of_a_non_anchor_source_names_its_slice() {
+fn v112_sc_partition_of_a_source_that_is_not_mirrored_is_refused() {
     let chain = ScChain { field_names: true, cross_plan: false };
     sc_open("reflex_sc_bound", "DEFERRED", chain);
-    let partition_of_plan_2 = |imv: &str| {
-        sc_text_rows(&chain.named(&format!(
-            "SELECT c.relname::text FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid \
-             WHERE i.inhparent = '{imv}'::regclass \
-               AND pg_get_expr(c.relpartbound, c.oid) = 'FOR VALUES IN (2)'"
-        )))
-        .pop()
-        .expect("partition of plan 2")
-    };
-    let date_limits = partition_of_plan_2("sc_fav__cte_date_limits");
-    let forecast_sales = partition_of_plan_2("sc_fav__cte_forecast_sales");
+    let date_limits = sc_text_rows(&chain.named(
+        "SELECT c.relname::text FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid \
+         WHERE i.inhparent = 'sc_fav__cte_date_limits'::regclass \
+           AND pg_get_expr(c.relpartbound, c.oid) = 'FOR VALUES IN (2)'",
+    ))
+    .pop()
+    .expect("partition of plan 2");
     let by_other_source = rbc_select(&chain.named(&format!(
         "reflex_reconcile_partition('sc_fav__cte_forecast_sales', '', 'public.{date_limits}')"
     )));
@@ -887,12 +884,12 @@ fn v112_sc_partition_of_a_non_anchor_source_names_its_slice() {
     let wrong = chain.wrong_nodes(&[]);
     probe_db_close("reflex_sc_bound");
 
-    assert_eq!(by_other_source, format!("RECONCILED partitions: {forecast_sales}"));
-    assert!(
-        by_unrelated_relation.starts_with("ERROR")
-            && by_unrelated_relation.contains("is not a partition of a source of"),
-        "{by_unrelated_relation}"
-    );
+    for refusal in [&by_other_source, &by_unrelated_relation] {
+        assert!(
+            refusal.starts_with("ERROR") && refusal.contains("is not a partition of"),
+            "{refusal}"
+        );
+    }
     assert!(wrong.is_empty(), "{}", wrong.join(", "));
 }
 
@@ -1002,6 +999,45 @@ fn v112_sc_scope_is_proven_only_for_aligned_queries() {
             "src",
         ),
         ("SELECT sf.plan + 1 AS plan, sf.x FROM src AS sf", &["src"][..], "src"),
+        (
+            "SELECT r.plan, sf.x FROM src AS sf JOIN other AS r ON r.k = sf.k \
+               LEFT JOIN third AS z ON z.plan = sf.plan AND r.plan = sf.plan",
+            &["src", "other", "third"][..],
+            "src",
+        ),
+        (
+            "SELECT COALESCE(f.plan, hs.plan) AS plan, f.x FROM src AS f \
+               FULL JOIN other AS hs ON f.plan = hs.plan \
+               FULL JOIN third AS t ON t.k = f.k",
+            &["src", "other", "third"][..],
+            "src",
+        ),
+        (
+            "SELECT COALESCE(f.plan, hs.plan) AS plan, f.x FROM src AS f \
+               FULL JOIN other AS hs ON f.plan = hs.plan \
+               JOIN third AS t ON t.k = f.k",
+            &["src", "other", "third"][..],
+            "src",
+        ),
+        (
+            "SELECT COALESCE(f.plan, hs.plan) AS plan, f.x FROM third AS t \
+               JOIN src AS f ON f.k = t.k FULL JOIN other AS hs ON f.plan = hs.plan",
+            &["third", "src", "other"][..],
+            "src",
+        ),
+        (
+            "SELECT COALESCE(f.plan, hs.plan) AS plan, f.x FROM other AS f \
+               FULL JOIN third AS hs ON f.plan = hs.plan \
+               LEFT JOIN src AS v ON v.k = f.k",
+            &["other", "third", "src"][..],
+            "src",
+        ),
+        (
+            "SELECT COALESCE(f.plan, f.alt) AS plan, f.x FROM src AS f \
+               FULL JOIN other AS hs ON f.plan = f.alt",
+            &["src", "other"][..],
+            "src",
+        ),
         ("SELECT sf.alt AS plan, sf.x FROM src AS sf", &["src"][..], "src"),
         (
             "SELECT dl.alt AS plan, sf.x FROM src AS sf JOIN other AS dl ON sf.alt = dl.alt",
@@ -1045,38 +1081,726 @@ fn v112_sc_scope_is_proven_only_for_aligned_queries() {
 
 #[pg_test]
 fn v112_sc_scopes_reaching_one_dependent_merge_to_the_wider() {
-    use crate::cascade::RefreshScope::{Groups, PartitionKeys, SourcePartitions, Whole};
-    let set = |items: &[&str]| items.iter().map(|i| i.to_string()).collect::<std::collections::BTreeSet<String>>();
+    use crate::cascade::RefreshScope::{Groups, Partitions, Whole};
+    let set = |items: &[&str]| {
+        items.iter().map(|i| i.to_string()).collect::<std::collections::BTreeSet<String>>()
+    };
+    let partitions = |source_partitions: &[&str], keys: &[&str]| Partitions {
+        source_partitions: set(source_partitions),
+        keys: set(keys),
+    };
+    let groups = |column: &str, keys: &[&str]| Groups { column: column.to_string(), keys: set(keys) };
     let whole = || Whole("unproven".to_string());
-    for narrower in [
-        SourcePartitions(set(&["public.p_1"])),
-        PartitionKeys(set(&["1"])),
-        Groups { column: "plan".to_string(), keys: set(&["1"]) },
-    ] {
+    for narrower in [partitions(&["public.p_1"], &[]), partitions(&[], &["1"]), groups("plan", &["1"])] {
         assert_eq!(whole().merged_with(narrower.clone()), whole());
         assert_eq!(narrower.clone().merged_with(whole()), whole());
     }
     assert_eq!(
-        PartitionKeys(set(&["1"])).merged_with(PartitionKeys(set(&["2"]))),
-        PartitionKeys(set(&["1", "2"]))
+        partitions(&["public.p_1"], &["1"]).merged_with(partitions(&["public.p_2"], &["2"])),
+        partitions(&["public.p_1", "public.p_2"], &["1", "2"])
     );
     assert_eq!(
-        SourcePartitions(set(&["public.p_1"])).merged_with(SourcePartitions(set(&["public.p_2"]))),
-        SourcePartitions(set(&["public.p_1", "public.p_2"]))
+        partitions(&["public.p_1"], &[]).merged_with(partitions(&[], &["2"])),
+        partitions(&["public.p_1"], &["2"])
     );
     assert_eq!(
-        Groups { column: "plan".to_string(), keys: set(&["1"]) }
-            .merged_with(Groups { column: "plan".to_string(), keys: set(&["2"]) }),
-        Groups { column: "plan".to_string(), keys: set(&["1", "2"]) }
+        groups("plan", &["1"]).merged_with(groups("plan", &["2"])),
+        groups("plan", &["1", "2"])
     );
     for (one, other) in [
-        (PartitionKeys(set(&["1"])), SourcePartitions(set(&["public.p_1"]))),
-        (
-            Groups { column: "plan".to_string(), keys: set(&["1"]) },
-            Groups { column: "yr".to_string(), keys: set(&["1"]) },
-        ),
-        (PartitionKeys(set(&["1"])), Groups { column: "plan".to_string(), keys: set(&["1"]) }),
+        (groups("plan", &["1"]), groups("yr", &["1"])),
+        (partitions(&[], &["1"]), groups("plan", &["1"])),
     ] {
         assert!(matches!(one.merged_with(other), Whole(_)));
     }
+}
+
+/// Only a bound that lists plain values names the keys of its partition.
+#[pg_test]
+fn v112_sc_only_a_plain_list_bound_names_its_keys() {
+    let listed = |bound: &str| crate::cascade::keys_listed_by(bound);
+    let keys = |items: &[&str]| Some(items.iter().map(|i| i.to_string()).collect::<Vec<_>>());
+    assert_eq!(listed("FOR VALUES IN (7)"), keys(&["7"]));
+    assert_eq!(listed("FOR VALUES IN (1, 2)"), keys(&["1", "2"]));
+    assert_eq!(listed("FOR VALUES IN ('-1', 2.50, -3)"), keys(&["-1", "2.50", "-3"]));
+    assert_eq!(listed("FOR VALUES IN ('a, b', 'it''s')"), keys(&["a, b", "it's"]));
+    assert_eq!(listed("FOR VALUES IN ('2027-01-01')"), keys(&["2027-01-01"]));
+    for unlisted in [
+        "DEFAULT",
+        "FOR VALUES IN (NULL, 5)",
+        "FOR VALUES IN (NULL)",
+        "FOR VALUES IN (true)",
+        "FOR VALUES IN ('a'::text)",
+        "FOR VALUES FROM (1) TO (5)",
+        "FOR VALUES FROM ('2027-01-01') TO ('2027-02-01')",
+        "FOR VALUES WITH (modulus 4, remainder 0)",
+        "FOR VALUES IN (1",
+        "",
+    ] {
+        assert_eq!(listed(unlisted), None, "{unlisted}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shapes in which a narrowed refresh is complete only under a condition: a
+// DEFAULT partition, a dependent mirroring another root, a leaf holding several
+// keys or the NULL key, a dependent of a group-refreshed node, a second
+// partition level taken from another relation, and queries the alignment proof
+// must refuse. Every IMV is real; every scenario is committed on the worker and
+// followed by the oracle on every IMV.
+
+thread_local! {
+    static SC_NOTICES: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+unsafe extern "C-unwind" fn sc_keep_reflex_notices(edata: *mut pgrx::pg_sys::ErrorData) {
+    const NOTICE: i32 = 18;
+    if edata.is_null() {
+        return;
+    }
+    let (level, message) = unsafe { ((*edata).elevel, (*edata).message) };
+    if level != NOTICE || message.is_null() {
+        return;
+    }
+    let text = unsafe { std::ffi::CStr::from_ptr(message) }.to_string_lossy().to_string();
+    if text.starts_with("pg_reflex:") {
+        SC_NOTICES.with(|notices| notices.borrow_mut().push(text));
+    }
+}
+
+/// Starts keeping the `pg_reflex:` NOTICEs of the calling backend.
+#[pg_extern]
+fn sc_keep_notices() -> bool {
+    unsafe {
+        pgrx::pg_sys::emit_log_hook = Some(sc_keep_reflex_notices);
+    }
+    true
+}
+
+/// The NOTICEs kept since the last call, one per row.
+#[pg_extern]
+fn sc_kept_notices() -> Vec<String> {
+    SC_NOTICES.with(|notices| notices.borrow_mut().drain(..).collect())
+}
+
+#[derive(Clone, Copy)]
+struct SxImv {
+    name: &'static str,
+    /// Its query; `{name}` stands for another IMV of the fixture.
+    sql: &'static str,
+    keys: &'static str,
+    ignore: &'static str,
+    partition_by: &'static [&'static str],
+}
+
+const SX_YD: &str = "SELECT v.plan, v.k, v.q, t.w FROM {yv} AS v \
+     JOIN a_t AS t ON t.plan = v.plan AND t.k = v.k";
+const SX_PLAN_SUMS_Y: &str =
+    "SELECT v.plan, SUM(v.q) AS sq, COUNT(*) AS n FROM {yv} AS v GROUP BY v.plan";
+const SX_DAY_SUMS: &str = "SELECT d, SUM(q) AS sq, COUNT(*) AS n FROM {gv} AS gv GROUP BY d";
+const SX_PLAN_SUMS_L: &str =
+    "SELECT plan, SUM(q) AS sq, COUNT(*) AS n FROM {lv} AS lv GROUP BY plan";
+const SX_PLAN_SUMS_M: &str =
+    "SELECT plan, SUM(q) AS sq, MIN(d) AS lo, COUNT(*) AS n FROM {mv} AS mv GROUP BY plan";
+const SX_OTHER_DAY: &str =
+    "SELECT mv.plan, o.d, mv.k, mv.q, mv.d AS od FROM {mv} AS mv JOIN mo AS o ON o.k = mv.k";
+const SX_TWO_PATHS: &str = "SELECT v.plan, v.k, v.d, v.q, xm.q AS mq FROM {mv} AS v \
+     JOIN {m_map} AS xm ON xm.plan = v.plan AND xm.k = v.k AND xm.d = v.d";
+
+const SX_IMVS: &[SxImv] = &[
+    // A source with a DEFAULT partition, and dependents mirroring another root.
+    SxImv { name: "yv", sql: "SELECT s.plan, s.k, s.q FROM ys AS s", keys: "plan, k", ignore: "", partition_by: &["plan"] },
+    SxImv { name: "yd", sql: SX_YD, keys: "plan, k", ignore: "!yv", partition_by: &["plan"] },
+    SxImv { name: "yd_obs", sql: SX_YD, keys: "plan, k", ignore: "", partition_by: &["plan"] },
+    SxImv { name: "yg", sql: SX_PLAN_SUMS_Y, keys: "plan", ignore: "!yv", partition_by: &[] },
+    SxImv { name: "yp", sql: "SELECT v.plan, v.k, v.q FROM {yv} AS v", keys: "plan, k", ignore: "!yv", partition_by: &["plan"] },
+    // Mirrors a root that has no partition for plan 5.
+    SxImv {
+        name: "yx",
+        sql: "SELECT v.plan, v.k, v.q, x.r FROM {yv} AS v \
+              JOIN x2_t AS x ON x.plan = v.plan AND x.k = v.k",
+        keys: "plan, k",
+        ignore: "!yv",
+        partition_by: &["plan"],
+    },
+    // Its plan is the joined table's; the equality with the view's plan sits in
+    // the ON of an outer join of a third table and constrains nothing.
+    SxImv {
+        name: "y_loose",
+        sql: "SELECT r.plan, v.plan AS vplan, v.k, v.q, z.z FROM {yv} AS v \
+              JOIN a_t AS r ON r.k = v.k \
+              LEFT JOIN zt AS z ON z.plan = v.plan AND r.plan = v.plan",
+        keys: "plan, vplan, k",
+        ignore: "!yv",
+        partition_by: &["plan"],
+    },
+    // COALESCE over the two sides of a FULL JOIN neither of which is the view.
+    SxImv {
+        name: "y_beside",
+        sql: "SELECT COALESCE(f.plan, h.plan) AS plan, COALESCE(f.k, h.k) AS k, f.w, h.r, v.q \
+              FROM a_t AS f FULL JOIN x2_t AS h ON f.plan = h.plan AND f.k = h.k \
+              LEFT JOIN {yv} AS v ON v.k = COALESCE(f.k, h.k) AND v.plan = 1",
+        keys: "plan, k",
+        ignore: "!yv",
+        partition_by: &["plan"],
+    },
+    // COALESCE over a FULL JOIN followed by a second FULL JOIN, whose unmatched
+    // rows carry no plan.
+    SxImv {
+        name: "y_two_full",
+        sql: "SELECT COALESCE(v.plan, h.plan) AS plan, COALESCE(v.k, h.k) AS k, v.q, h.w, t.z \
+              FROM {yv} AS v FULL JOIN a_t AS h ON v.plan = h.plan AND v.k = h.k \
+              FULL JOIN zk AS t ON t.k = COALESCE(v.k, h.k)",
+        keys: "",
+        ignore: "!yv",
+        partition_by: &["plan"],
+    },
+    // Sources of another column or joined on another column.
+    SxImv {
+        name: "nd",
+        sql: "SELECT t.plan, t.k, t.w, x.r FROM a_t AS t JOIN x_t AS x ON x.k = t.k",
+        keys: "plan, k",
+        ignore: "",
+        partition_by: &["plan"],
+    },
+    SxImv {
+        name: "nd2",
+        sql: "SELECT t.plan, t.k, t.w, x.r FROM a_t AS t JOIN x2_t AS x ON x.k = t.k",
+        keys: "plan, k",
+        ignore: "",
+        partition_by: &["plan"],
+    },
+    // A RANGE leaf holds several days.
+    SxImv { name: "gv", sql: "SELECT s.d, s.k, s.q FROM gs AS s", keys: "d, k", ignore: "", partition_by: &["d"] },
+    SxImv { name: "gg", sql: SX_DAY_SUMS, keys: "d", ignore: "!gv", partition_by: &[] },
+    SxImv { name: "gg_obs", sql: SX_DAY_SUMS, keys: "d", ignore: "", partition_by: &[] },
+    SxImv { name: "gg_dep", sql: "SELECT g.d, g.sq FROM {gg} AS g", keys: "d", ignore: "!gg", partition_by: &[] },
+    SxImv { name: "gg_dep_obs", sql: "SELECT g.d, g.sq FROM {gg} AS g", keys: "d", ignore: "", partition_by: &[] },
+    // A LIST leaf holds two plans.
+    SxImv { name: "lv", sql: "SELECT s.plan, s.k, s.q FROM ls AS s", keys: "plan, k", ignore: "", partition_by: &["plan"] },
+    SxImv { name: "lg", sql: SX_PLAN_SUMS_L, keys: "plan", ignore: "!lv", partition_by: &[] },
+    SxImv { name: "lg_obs", sql: SX_PLAN_SUMS_L, keys: "plan", ignore: "", partition_by: &[] },
+    // A leaf holds the NULL key.
+    SxImv { name: "nv", sql: "SELECT s.plan, s.k, s.q FROM ns AS s", keys: "", ignore: "", partition_by: &["plan"] },
+    SxImv {
+        name: "ng",
+        sql: "SELECT plan, SUM(q) AS sq, COUNT(*) AS n FROM {nv} AS nv GROUP BY plan",
+        keys: "",
+        ignore: "!nv",
+        partition_by: &[],
+    },
+    // The NULL key in a leaf below a top-level partition that is not replaced.
+    SxImv { name: "nv2", sql: "SELECT s.plan, s.d, s.k, s.q FROM ns2 AS s", keys: "plan, d, k", ignore: "", partition_by: &["plan", "d"] },
+    SxImv {
+        name: "ng2",
+        sql: "SELECT plan, SUM(q) AS sq, COUNT(*) AS n FROM {nv2} AS nv2 GROUP BY plan",
+        keys: "",
+        ignore: "!nv2",
+        partition_by: &[],
+    },
+    // Months first, then a list: a leaf's days are not listed by any bound.
+    SxImv { name: "tv", sql: "SELECT s.d, s.k, s.q FROM ts AS s", keys: "d, k", ignore: "", partition_by: &["d", "k"] },
+    SxImv { name: "tg", sql: "SELECT d, SUM(q) AS sq, COUNT(*) AS n FROM {tv} AS tv GROUP BY d", keys: "d", ignore: "!tv", partition_by: &[] },
+    SxImv { name: "tg_obs", sql: "SELECT d, SUM(q) AS sq, COUNT(*) AS n FROM {tv} AS tv GROUP BY d", keys: "d", ignore: "", partition_by: &[] },
+    // Two levels.
+    SxImv { name: "mv", sql: "SELECT s.plan, s.d, s.k, s.q FROM ms AS s", keys: "plan, k, d", ignore: "", partition_by: &["plan", "d"] },
+    SxImv { name: "mg", sql: SX_PLAN_SUMS_M, keys: "plan", ignore: "!mv", partition_by: &[] },
+    SxImv { name: "mg_obs", sql: SX_PLAN_SUMS_M, keys: "plan", ignore: "", partition_by: &[] },
+    SxImv {
+        name: "mg2",
+        sql: "SELECT plan, d, SUM(q) AS sq FROM {mv} AS mv GROUP BY plan, d",
+        keys: "plan, d",
+        ignore: "!mv",
+        partition_by: &[],
+    },
+    SxImv {
+        name: "m_rename",
+        sql: "SELECT k AS plan, plan AS orig, SUM(q) AS sq FROM {mv} AS mv GROUP BY k, plan",
+        keys: "plan, orig",
+        ignore: "!mv",
+        partition_by: &[],
+    },
+    SxImv { name: "mg_dep", sql: "SELECT g.plan, g.sq FROM {mg} AS g", keys: "plan", ignore: "!mg", partition_by: &[] },
+    SxImv { name: "m_other", sql: SX_OTHER_DAY, keys: "plan, k, od, d", ignore: "!mv", partition_by: &["plan", "d"] },
+    SxImv { name: "m_other_obs", sql: SX_OTHER_DAY, keys: "plan, k, od, d", ignore: "", partition_by: &["plan", "d"] },
+    SxImv {
+        name: "m_pd",
+        sql: "SELECT mv.plan, mv.d, mv.k, mv.q FROM {mv} AS mv",
+        keys: "plan, k, d",
+        ignore: "!mv",
+        partition_by: &["plan", "d"],
+    },
+    // The view read a second time, in a sub-query.
+    SxImv {
+        name: "m_scalar",
+        sql: "SELECT v.plan, v.k, v.d, v.q, (SELECT MAX(v2.q) FROM {mv} AS v2) AS mx FROM {mv} AS v",
+        keys: "plan, k, d",
+        ignore: "!mv",
+        partition_by: &["plan"],
+    },
+    SxImv {
+        name: "m_above_mean",
+        sql: "SELECT v.plan, v.k, v.d, v.q FROM {mv} AS v \
+              WHERE v.q >= (SELECT AVG(v2.q) FROM {mv} AS v2)",
+        keys: "plan, k, d",
+        ignore: "!mv",
+        partition_by: &["plan"],
+    },
+    // Reached by an aligned path and by one that is refreshed whole.
+    SxImv {
+        name: "m_map",
+        sql: "SELECT m.plan, v.k, v.d, v.q FROM {mv} AS v JOIN zmap AS m ON m.src_plan = v.plan",
+        keys: "plan, k, d",
+        ignore: "!mv",
+        partition_by: &["plan"],
+    },
+    SxImv { name: "m_two_paths", sql: SX_TWO_PATHS, keys: "plan, k, d", ignore: "!mv,!m_map", partition_by: &["plan"] },
+];
+
+fn sx_query(imv: &SxImv, inline: bool) -> String {
+    let mut sql = imv.sql.to_string();
+    for other in SX_IMVS {
+        let placeholder = format!("{{{}}}", other.name);
+        if sql.contains(&placeholder) {
+            let replacement = if inline {
+                format!("({})", sx_query(other, true))
+            } else {
+                other.name.to_string()
+            };
+            sql = sql.replace(&placeholder, &replacement);
+        }
+    }
+    sql
+}
+
+fn sx_month_bounds(month: i32) -> (String, String) {
+    (format!("2027-{month:02}-01"), format!("2027-{:02}-01", month + 1))
+}
+
+fn sx_ms_rows(plan: i32, month: i32, first_day: i32, bump: i32) -> String {
+    format!(
+        "SELECT {plan}, DATE '2027-{month:02}-01' + day, k, \
+                {plan} * 1000 + {month} * 100 + k * 10 + day + {bump} \
+         FROM generate_series({first_day}, {first_day} + 2) day, generate_series(1, 3) k"
+    )
+}
+
+fn sx_open(dbname: &str, mode: &str) {
+    probe_db_open(dbname);
+    let mut setup: Vec<String> = [
+        "CREATE TABLE ys (plan INT NOT NULL, k INT NOT NULL, q INT NOT NULL, PRIMARY KEY (plan, k)) \
+           PARTITION BY LIST (plan)",
+        "CREATE TABLE ys_p1 PARTITION OF ys FOR VALUES IN (1)",
+        "CREATE TABLE ys_p5 PARTITION OF ys FOR VALUES IN (5)",
+        "CREATE TABLE ys_def PARTITION OF ys DEFAULT",
+        "INSERT INTO ys SELECT p, k, p * 100 + k FROM unnest(ARRAY[1, 2, 3, 5]) p, generate_series(1, 4) k",
+        "CREATE TABLE a_t (plan INT NOT NULL, k INT NOT NULL, w INT NOT NULL, PRIMARY KEY (plan, k)) \
+           PARTITION BY LIST (plan)",
+        "CREATE TABLE a_t_p1 PARTITION OF a_t FOR VALUES IN (1)",
+        "CREATE TABLE a_t_p2 PARTITION OF a_t FOR VALUES IN (2)",
+        "CREATE TABLE a_t_def PARTITION OF a_t DEFAULT",
+        "INSERT INTO a_t SELECT p, k, p * 10 + k FROM generate_series(1, 5) p, generate_series(1, 4) k",
+        "CREATE TABLE x_t (region INT NOT NULL, k INT NOT NULL, r INT NOT NULL, \
+           PRIMARY KEY (region, k)) PARTITION BY LIST (region)",
+        "CREATE TABLE x_t_r1 PARTITION OF x_t FOR VALUES IN (1)",
+        "CREATE TABLE x_t_r2 PARTITION OF x_t FOR VALUES IN (2)",
+        "INSERT INTO x_t VALUES (1, 1, 11), (1, 2, 12), (2, 3, 23), (2, 4, 24)",
+        "CREATE TABLE x2_t (plan INT NOT NULL, k INT NOT NULL, r INT NOT NULL, \
+           PRIMARY KEY (plan, k)) PARTITION BY LIST (plan)",
+        "CREATE TABLE x2_t_p1 PARTITION OF x2_t FOR VALUES IN (1)",
+        "CREATE TABLE x2_t_p2 PARTITION OF x2_t FOR VALUES IN (2)",
+        "INSERT INTO x2_t VALUES (1, 1, 11), (1, 2, 12), (2, 3, 23), (2, 4, 24)",
+        "CREATE TABLE zt (plan INT PRIMARY KEY, z INT NOT NULL)",
+        "INSERT INTO zt SELECT p, p * 3 FROM generate_series(1, 5) p",
+        "CREATE TABLE gs (d DATE NOT NULL, k INT NOT NULL, q INT NOT NULL, PRIMARY KEY (d, k)) \
+           PARTITION BY RANGE (d)",
+        "CREATE TABLE gs_m01 PARTITION OF gs FOR VALUES FROM ('2027-01-01') TO ('2027-02-01')",
+        "CREATE TABLE gs_m02 PARTITION OF gs FOR VALUES FROM ('2027-02-01') TO ('2027-03-01')",
+        "INSERT INTO gs SELECT DATE '2027-01-01' + day, k, day * 10 + k \
+           FROM generate_series(0, 3) day, generate_series(1, 3) k",
+        "INSERT INTO gs SELECT DATE '2027-02-01' + day, k, 500 + day * 10 + k \
+           FROM generate_series(0, 3) day, generate_series(1, 3) k",
+        "CREATE TABLE ls (plan INT NOT NULL, k INT NOT NULL, q INT NOT NULL, PRIMARY KEY (plan, k)) \
+           PARTITION BY LIST (plan)",
+        "CREATE TABLE ls_a PARTITION OF ls FOR VALUES IN (1, 2)",
+        "CREATE TABLE ls_b PARTITION OF ls FOR VALUES IN (3)",
+        "INSERT INTO ls SELECT p, k, p * 100 + k FROM generate_series(1, 3) p, generate_series(1, 4) k",
+        "CREATE TABLE ns (plan INT, k INT NOT NULL, q INT NOT NULL) PARTITION BY LIST (plan)",
+        "CREATE TABLE ns_a PARTITION OF ns FOR VALUES IN (1)",
+        "CREATE TABLE ns_n PARTITION OF ns FOR VALUES IN (NULL, 5)",
+        "INSERT INTO ns SELECT p, k, COALESCE(p, 9) * 100 + k \
+           FROM (VALUES (1), (5), (NULL)) AS plans(p), generate_series(1, 3) k",
+        "CREATE TABLE ms (plan INT NOT NULL, d DATE NOT NULL, k INT NOT NULL, q INT NOT NULL, \
+           PRIMARY KEY (plan, k, d)) PARTITION BY LIST (plan)",
+        "CREATE TABLE mo (k INT PRIMARY KEY, d DATE NOT NULL)",
+        "INSERT INTO mo VALUES (1, '2027-02-10'), (2, '2027-01-10'), (3, '2027-02-11')",
+        "CREATE TABLE zk (k INT PRIMARY KEY, z INT NOT NULL)",
+        "INSERT INTO zk SELECT k, k * 11 FROM unnest(ARRAY[1, 2, 3, 4, 9]) k",
+        "CREATE TABLE ns2 (plan INT, d DATE NOT NULL, k INT NOT NULL, q INT NOT NULL) \
+           PARTITION BY LIST (plan)",
+        "CREATE TABLE ns2_a PARTITION OF ns2 FOR VALUES IN (1) PARTITION BY RANGE (d)",
+        "CREATE TABLE ns2_a_m01 PARTITION OF ns2_a FOR VALUES FROM ('2027-01-01') TO ('2027-02-01')",
+        "CREATE TABLE ns2_n PARTITION OF ns2 FOR VALUES IN (NULL, 5) PARTITION BY RANGE (d)",
+        "CREATE TABLE ns2_n_m01 PARTITION OF ns2_n FOR VALUES FROM ('2027-01-01') TO ('2027-02-01')",
+        "INSERT INTO ns2 SELECT p, DATE '2027-01-05', k, COALESCE(p, 9) * 100 + k \
+           FROM (VALUES (1), (5), (NULL)) AS plans(p), generate_series(1, 3) k",
+        "CREATE TABLE ts (d DATE NOT NULL, k INT NOT NULL, q INT NOT NULL, PRIMARY KEY (d, k)) \
+           PARTITION BY RANGE (d)",
+        "CREATE TABLE ts_m01 PARTITION OF ts FOR VALUES FROM ('2027-01-01') TO ('2027-02-01') \
+           PARTITION BY LIST (k)",
+        "CREATE TABLE ts_m01_k1 PARTITION OF ts_m01 FOR VALUES IN (1)",
+        "CREATE TABLE ts_m01_k2 PARTITION OF ts_m01 FOR VALUES IN (2)",
+        "INSERT INTO ts SELECT DATE '2027-01-01' + day, k, day * 10 + k \
+           FROM generate_series(0, 3) day, generate_series(1, 2) k",
+        "CREATE TABLE zmap (src_plan INT NOT NULL, plan INT NOT NULL, PRIMARY KEY (src_plan, plan))",
+        "INSERT INTO zmap VALUES (1, 1), (1, 2)",
+    ]
+    .iter()
+    .map(|ddl| ddl.to_string())
+    .collect();
+    for plan in 1..=2 {
+        setup.push(format!(
+            "CREATE TABLE ms_p{plan} PARTITION OF ms FOR VALUES IN ({plan}) PARTITION BY RANGE (d)"
+        ));
+        for month in 1..=2 {
+            let (lo, hi) = sx_month_bounds(month);
+            setup.push(format!(
+                "CREATE TABLE ms_p{plan}_m{month:02} PARTITION OF ms_p{plan} \
+                 FOR VALUES FROM ('{lo}') TO ('{hi}')"
+            ));
+            setup.push(format!("INSERT INTO ms {}", sx_ms_rows(plan, month, 0, 0)));
+        }
+    }
+    for ddl in &setup {
+        worker_exec(ddl);
+    }
+    for imv in SX_IMVS {
+        let optional = |text: &str| {
+            if text.is_empty() {
+                "NULL".to_string()
+            } else {
+                sql_lit(text)
+            }
+        };
+        let partition_by: Vec<String> = imv.partition_by.iter().map(|column| sql_lit(column)).collect();
+        let call = format!(
+            "create_reflex_ivm({}, {}, {}, NULL, {}, {}, ARRAY[{}]::text[])",
+            sql_lit(imv.name),
+            sql_lit(&sx_query(imv, false)),
+            optional(imv.keys),
+            sql_lit(mode),
+            optional(imv.ignore),
+            partition_by.join(", ")
+        );
+        assert_eq!(rbc_select(&call), "CREATE REFLEX INCREMENTAL VIEW", "{call}");
+    }
+    for ddl in [
+        "CREATE TABLE sc_trace (seq SERIAL, name TEXT NOT NULL, context TEXT NOT NULL)",
+        "CREATE TABLE sc_xact (id TEXT NOT NULL)",
+        "CREATE FUNCTION sc_note_refresh() RETURNS TRIGGER LANGUAGE plpgsql AS $$ \
+           DECLARE stack TEXT; \
+           BEGIN GET DIAGNOSTICS stack = PG_CONTEXT; \
+             INSERT INTO sc_trace (name, context) VALUES (NEW.name, stack); RETURN NULL; END $$",
+        "CREATE TRIGGER sc_note_refresh AFTER UPDATE OF last_update_date \
+           ON public.__reflex_ivm_reference FOR EACH ROW EXECUTE FUNCTION sc_note_refresh()",
+        "SET log_min_messages = notice",
+    ] {
+        worker_exec(ddl);
+    }
+    assert_eq!(rbc_select("tests.sc_keep_notices()"), "true");
+}
+
+fn sx_wrong() -> Vec<String> {
+    SX_IMVS
+        .iter()
+        .filter_map(|imv| {
+            let mismatches = rbc_mismatch(imv.name, &sx_query(imv, true));
+            (mismatches != 0).then(|| format!("{}: {mismatches} mismatches", imv.name))
+        })
+        .collect()
+}
+
+/// A flat leaf replaced the way the application does it.
+fn sx_swap(root: &str, leaf: &str, bound: &str, rows: &str) -> String {
+    format!(
+        "CREATE TABLE {leaf}_swap (LIKE {root} INCLUDING DEFAULTS); \
+         INSERT INTO {leaf}_swap {rows}; \
+         ALTER TABLE {root} DETACH PARTITION {leaf}; \
+         ALTER TABLE {root} ATTACH PARTITION {leaf}_swap {bound}; \
+         DROP TABLE {leaf}; \
+         ALTER TABLE {leaf}_swap RENAME TO {leaf}"
+    )
+}
+
+fn sx_swap_month(plan: i32, month: i32, rows: &str) -> String {
+    let (lo, hi) = sx_month_bounds(month);
+    sx_swap(
+        &format!("ms_p{plan}"),
+        &format!("ms_p{plan}_m{month:02}"),
+        &format!("FOR VALUES FROM ('{lo}') TO ('{hi}')"),
+        rows,
+    )
+}
+
+struct SxStep {
+    label: &'static str,
+    statements: String,
+    /// `(node, kind)` refreshes the step must run exactly once each.
+    refreshed: &'static [(&'static str, &'static str)],
+    /// A text one of the step's NOTICEs must hold.
+    notice: Option<&'static str>,
+}
+
+fn sx_steps() -> Vec<SxStep> {
+    let gs_m01 = "FOR VALUES FROM ('2027-01-01') TO ('2027-02-01')";
+    let gs_m02 = "FOR VALUES FROM ('2027-02-01') TO ('2027-03-01')";
+    let step = |label, statements: String| SxStep { label, statements, refreshed: &[], notice: None };
+    vec![
+        SxStep {
+            refreshed: &[
+                ("yd", "full"),
+                ("yd_obs", "full"),
+                ("yg", "full"),
+                ("yp", "partitions"),
+                ("y_loose", "full"),
+                ("y_beside", "full"),
+                ("y_two_full", "full"),
+            ],
+            notice: Some(
+                "pg_reflex: 'yd' is refreshed whole, not by partition, after the partition rebuild \
+                 of 'yv': partition 'yv_ys_def' was created or altered in this transaction and its \
+                 bound (DEFAULT) does not list the \"plan\" values its rows held",
+            ),
+            ..step(
+                "default leaf changed",
+                sx_swap("ys", "ys_def", "DEFAULT", "SELECT plan, k, q + 1000 FROM ys_def"),
+            )
+        },
+        step(
+            "default leaf loses a plan and gains one",
+            sx_swap(
+                "ys",
+                "ys_def",
+                "DEFAULT",
+                "SELECT CASE WHEN plan = 3 THEN 4 ELSE plan END, k, q + 7 FROM ys_def",
+            ),
+        ),
+        SxStep {
+            refreshed: &[("yd", "partitions"), ("yd_obs", "partitions"), ("yp", "partitions")],
+            ..step(
+                "listed leaf changed",
+                sx_swap("ys", "ys_p1", "FOR VALUES IN (1)", "SELECT plan, k, q + 50 FROM ys_p1"),
+            )
+        },
+        step(
+            "listed leaf gains a key",
+            sx_swap(
+                "ys",
+                "ys_p1",
+                "FOR VALUES IN (1)",
+                "SELECT plan, k, q + 1 FROM ys_p1 UNION ALL SELECT 1, 9, 109",
+            ),
+        ),
+        SxStep {
+            refreshed: &[("yx", "full")],
+            notice: Some(
+                "pg_reflex: 'yx' is refreshed whole, not by partition, after the partition \
+                 rebuild of 'yv': its partition-scoped refresh returned: reconcile_partition: \
+                 no children matched",
+            ),
+            ..step(
+                "leaf of a plan the other root has no partition for",
+                sx_swap("ys", "ys_p5", "FOR VALUES IN (5)", "SELECT plan, k, q + 9 FROM ys_p5"),
+            )
+        },
+        step(
+            "range leaf with other days",
+            sx_swap(
+                "gs",
+                "gs_m01",
+                gs_m01,
+                "SELECT DATE '2027-01-01' + day, k, 900 + day * 10 + k \
+                   FROM generate_series(2, 5) day, generate_series(1, 3) k",
+            ),
+        ),
+        step(
+            "one range leaf emptied, another changed",
+            format!(
+                "{}; {}",
+                sx_swap("gs", "gs_m01", gs_m01, "SELECT * FROM gs WHERE FALSE"),
+                sx_swap("gs", "gs_m02", gs_m02, "SELECT d, k, q + 1 FROM gs_m02")
+            ),
+        ),
+        SxStep {
+            refreshed: &[("gg", "full")],
+            ..step(
+                "range leaf refilled",
+                sx_swap(
+                    "gs",
+                    "gs_m01",
+                    gs_m01,
+                    "SELECT DATE '2027-01-01' + day, k, 40 + day * 10 + k \
+                       FROM generate_series(0, 3) day, generate_series(1, 3) k",
+                ),
+            )
+        },
+        SxStep {
+            refreshed: &[("lg", "groups")],
+            ..step(
+                "two-value leaf loses a plan",
+                sx_swap(
+                    "ls",
+                    "ls_a",
+                    "FOR VALUES IN (1, 2)",
+                    "SELECT plan, k, q + 5 FROM ls_a WHERE plan = 1",
+                ),
+            )
+        },
+        step(
+            "two-value leaf swaps its plan",
+            sx_swap("ls", "ls_a", "FOR VALUES IN (1, 2)", "SELECT 2, k, q + 9 FROM ls_a"),
+        ),
+        SxStep {
+            refreshed: &[("ng", "full")],
+            notice: Some("pg_reflex: 'ng' is refreshed whole, not by partition, after the partition rebuild of 'nv': "),
+            ..step(
+                "leaf holding the null key changed",
+                sx_swap("ns", "ns_n", "FOR VALUES IN (NULL, 5)", "SELECT plan, k, q + 3 FROM ns_n"),
+            )
+        },
+        SxStep {
+            refreshed: &[("ng2", "full")],
+            notice: Some("holds rows whose \"plan\" is NULL"),
+            ..step(
+                "month holding the null key changed",
+                sx_swap(
+                    "ns2_n",
+                    "ns2_n_m01",
+                    "FOR VALUES FROM ('2027-01-01') TO ('2027-02-01')",
+                    "SELECT plan, d, k, q + 3 FROM ns2_n_m01",
+                ),
+            )
+        },
+        SxStep {
+            refreshed: &[("tg", "groups")],
+            ..step(
+                "list leaf below a month, with other days",
+                sx_swap(
+                    "ts_m01",
+                    "ts_m01_k1",
+                    "FOR VALUES IN (1)",
+                    "SELECT DATE '2027-01-01' + day, 1, 700 + day FROM generate_series(2, 5) day",
+                ),
+            )
+        },
+        SxStep {
+            refreshed: &[
+                ("mg", "groups"),
+                ("m_pd", "partitions"),
+                ("m_other", "partitions"),
+                ("m_scalar", "full"),
+                ("m_above_mean", "full"),
+                ("m_map", "full"),
+                ("m_rename", "full"),
+            ],
+            ..step("one month changed", sx_swap_month(1, 1, &sx_ms_rows(1, 1, 0, 7)))
+        },
+        step(
+            "a month of one plan emptied, a month of another changed",
+            format!(
+                "{}; {}",
+                sx_swap_month(1, 2, "SELECT * FROM ms WHERE FALSE"),
+                sx_swap_month(2, 1, &sx_ms_rows(2, 1, 0, 9))
+            ),
+        ),
+        step("a month with other days", sx_swap_month(2, 2, &sx_ms_rows(2, 2, 5, 1))),
+        step(
+            "one month, explicit flush",
+            format!(
+                "{}; SELECT reflex_flush_partition_source('ms')",
+                sx_swap_month(1, 1, &sx_ms_rows(1, 1, 3, 2))
+            ),
+        ),
+        step(
+            "new month attached with rows",
+            "CREATE TABLE ms_p1_m03 (LIKE ms_p1 INCLUDING DEFAULTS); \
+             INSERT INTO ms_p1_m03 SELECT 1, DATE '2027-03-01' + day, k, 7000 + k * 10 + day \
+               FROM generate_series(0, 2) day, generate_series(1, 3) k; \
+             ALTER TABLE ms_p1 ATTACH PARTITION ms_p1_m03 \
+               FOR VALUES FROM ('2027-03-01') TO ('2027-04-01')"
+                .to_string(),
+        ),
+        step(
+            "a plan emptied entirely and another changed",
+            format!(
+                "{}; {}; {}",
+                sx_swap_month(1, 1, "SELECT * FROM ms WHERE FALSE"),
+                sx_swap_month(1, 2, "SELECT * FROM ms WHERE FALSE"),
+                sx_swap_month(2, 1, &sx_ms_rows(2, 1, 1, 4))
+            ),
+        ),
+    ]
+}
+
+fn sx_assert_shapes_stay_correct(dbname: &str, mode: &str) {
+    sx_open(dbname, mode);
+    let chain = ScChain { field_names: false, cross_plan: false };
+    let mut failures = sx_wrong()
+        .into_iter()
+        .map(|wrong| format!("after create: {wrong}"))
+        .collect::<Vec<_>>();
+    for step in sx_steps() {
+        let label = step.label;
+        let _ = sc_text_rows("SELECT unnest(tests.sc_kept_notices())");
+        if let Err(error) = chain.commit(&step.statements) {
+            failures.push(format!("{label}: raised {error}"));
+            continue;
+        }
+        let refreshes = chain.refreshes();
+        for (node, kind) in step.refreshed {
+            let kinds: Vec<&str> = refreshes
+                .iter()
+                .filter(|(refreshed, _)| refreshed == node)
+                .map(|(_, kind)| kind.as_str())
+                .collect();
+            if kinds != [*kind] {
+                failures.push(format!("{label}: {node} refreshed {kinds:?}, not once by {kind}"));
+            }
+        }
+        if let Some(expected) = step.notice {
+            let notices = sc_text_rows("SELECT unnest(tests.sc_kept_notices())");
+            if !notices.iter().any(|notice| notice.contains(expected)) {
+                let whole: Vec<&String> =
+                    notices.iter().filter(|notice| notice.contains("refreshed whole")).collect();
+                failures.push(format!("{label}: no NOTICE <{expected}> in {whole:?}"));
+            }
+        }
+        for wrong in sx_wrong() {
+            let (name, _) = wrong.split_once(':').expect("name: mismatches");
+            let repaired = rbc_select(&format!("reflex_reconcile('{name}')"));
+            failures.push(format!("{label}: {wrong} (then {repaired})"));
+        }
+    }
+    for (view, partition) in [("nd", "x_t_r1"), ("nd2", "x2_t_p1")] {
+        let refusal =
+            rbc_select(&format!("reflex_reconcile_partition('{view}', '', '{partition}')"));
+        if !(refusal.starts_with("ERROR") && refusal.contains("is not a partition of")) {
+            failures.push(format!("{view} by {partition}: {refusal}"));
+        }
+    }
+    for wrong in sx_wrong() {
+        failures.push(format!("after the refused calls: {wrong}"));
+    }
+    probe_db_close(dbname);
+    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+}
+
+#[pg_test]
+fn v112_sc_shapes_stay_correct_immediate() {
+    sx_assert_shapes_stay_correct("reflex_sx_i", "IMMEDIATE");
+}
+
+#[pg_test]
+fn v112_sc_shapes_stay_correct_deferred() {
+    sx_assert_shapes_stay_correct("reflex_sx_d", "DEFERRED");
 }
