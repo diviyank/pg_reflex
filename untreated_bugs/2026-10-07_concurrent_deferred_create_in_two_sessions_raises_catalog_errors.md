@@ -64,3 +64,13 @@ CI does not run it yet: it needs one serial step with that command.
 Take one advisory lock for the shared DEFERRED infrastructure before creating or replacing any
 of it, and create it once (extension install or first use under that lock) instead of on every
 create. Then the COMMIT-path tests can join the default run.
+
+## Note on the remaining race (added 2026-10-12)
+
+From `p3-c-report.md` R2.9 in the ledger
+`.superpowers/sdd/2026-10-07-1.12.0-create-contract-hardening/`: "The first DEFERRED create of a
+database still installs the shared trigger and takes its lock once; installing it at
+`CREATE EXTENSION` would remove that and belongs with the migration." That is the same first
+install this report is narrowed to, seen from the lock side: until the shared pending table and
+its trigger are created by the bootstrap DDL (and by the migration, byte-identical), the first
+DEFERRED create of a database is the one statement that still runs DDL on a shared relation.

@@ -32,3 +32,21 @@ One statement changes two inputs of the join at once: the table and its CTE sub-
 
 ## Fix direction (hypothesis to falsify)
 Treat this shape as that report's case: when the same statement already merged a delta through another input of the IMV, fall back to a reconcile of the IMV for the statement. Test: c17 and y16 with the `assert_imv_correct` oracle after INSERT, refill and reseed in IMMEDIATE.
+
+## Seed rows and the failing statement (added 2026-10-12, from `full-review-r1-probes.rs` in the ledger)
+
+Copied from the probe source; not re-run as a standalone script. c17: the table above seeded
+with 12 rows, the IMV created, then the first step ("products ins") is the same statement for
+ids 13 to 18 and raises `Key (id)=(13) already exists`.
+
+```sql
+INSERT INTO products SELECT g, 'prod' || g, 'SKU-' || g, (ARRAY['toys','books','food',NULL])[1 + g % 4],
+  (g * 2.5)::numeric(10,2), g * 0.5, g % 3 <> 0, DATE '2023-01-01' + g * 10 FROM generate_series(1, 12) g;
+-- create r_c17, then:
+INSERT INTO products SELECT g, 'prod' || g, 'SKU-' || g, (ARRAY['toys','books','food',NULL])[1 + g % 4],
+  (g * 2.5)::numeric(10,2), g * 0.5, g % 3 <> 0, DATE '2023-01-01' + g * 10 FROM generate_series(13, 18) g;
+```
+
+z09, y15, y16: `orders` and its 60-row seed as printed in
+`2026-10-10_select_distinct_expression_alias_is_lost.md`; the failing step is the same seed
+statement with `generate_series(61, 66)` (y16: `Key (id)=(65)`).
