@@ -21,3 +21,12 @@ The window is already in the outermost SELECT; it sits inside an arithmetic expr
 
 ## Fix direction (hypothesis)
 Distinguish "window inside a subquery / derived table" from "window nested in an expression" in the rejection (the detector finds a window anywhere below the select item, then emits the subquery text). Test: the message for w05, w08, w15, x62 does not say "subquery or derived table" and names the nested expression.
+
+## Fixture of the probe (added 2026-10-12, from `full-review-r1-probes.rs` in the ledger)
+
+The rejection is at create and does not depend on the rows. `measurements` as
+`CREATE TABLE measurements (id INT, ts TIMESTAMPTZ, value FLOAT8, sensor TEXT)`, seeded with
+`INSERT INTO measurements SELECT g, TIMESTAMPTZ '2024-01-01 00:00:00+00' + g * INTERVAL '1 hour', g * 1.5, 's' || g % 3 FROM generate_series(1, 30) g`.
+`orders`: the table and the 60-row seed are printed in
+`2026-10-10_select_distinct_expression_alias_is_lost.md`. Copied from the probe source; not
+re-run as a standalone script.

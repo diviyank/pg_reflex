@@ -34,3 +34,12 @@ upgrade to PostgreSQL 16+ (recommended). Possible guard: on PG15, detect MERGE (
 in a statement trigger; an UPDATE transition table whose NEW keys are not a permutation of OLD
 keys is the symptom) and fall back to a reconcile of the touched partitions. Check whether the
 newest 15.x minor fixes it.
+
+## Wider reach since 1.12.0 (added 2026-10-12, not run)
+
+1.12.0 installs write triggers on every partition, so a statement addressed to a partition is
+now maintained. The full re-review of 1.12.0 (seat R3, pg16 only) lists, among the cells to
+check on the other versions and not run there: "pg15 MERGE into a sub-partitioned branch (the
+filed PG15 transition defect is now reachable through a branch-addressed MERGE)". Before 1.12.0
+such a MERGE was not propagated at all. Nobody has run it on PostgreSQL 15: whether a MERGE
+addressed to a sub-partitioned branch gives the same bad NEW transition table is a hypothesis.

@@ -2,7 +2,7 @@
 
 Pre-existing: identical on `6946400` (1.11.5) and on the 1.12.0 integration branch at `0324f47`.
 Found by review seat R3 of the 1.12.0 full re-review (pg16).
-The reduction below was run on pg16 on `0324f47` and on `fix/full-review-r3` (probe `zz_file_probe`, kept at `/private/tmp/rfx-remote/b-r3fix-file-probe.rs` with its outputs `b-r3fix-fp-{base,head}.log`): same outcome on both.
+The reduction below was run on pg16 on `0324f47` and on `fix/full-review-r3` (probe `zz_file_probe`, kept at `.superpowers/sdd/2026-10-07-1.12.0-create-contract-hardening/full-review-r3-fix-evidence/b-r3fix-file-probe.rs` with its outputs `b-r3fix-fp-{base,head}.log`): same outcome on both.
 
 ## Reproduction (pg16, every statement committed; IMMEDIATE run here, DEFERRED by the review)
 
@@ -49,3 +49,14 @@ Before dropping a mirror node, apply its rows to the readers as a DELETE (`DELET
 WHERE <partition bound>` with the IMV's own statement triggers enabled, then drop the emptied
 partition), or reconcile the dependents of an IMV whose mirror lost a node. Test with the fixture
 above, both modes, and a dependent of a dependent.
+
+## Later observation (added 2026-10-12)
+
+From the review of the swap-cascade work (`p3-b-review.md` in the ledger
+`.superpowers/sdd/2026-10-07-1.12.0-create-contract-hardening/`, "Pre-existing, seen on both
+trees"; trees `d0a3e06` and the branch `fix/v112-swap-cascade-scope`): in its `main` scenario 22
+(a partition detached and dropped) 32 nodes per mode are wrong on both trees, and **three stay
+wrong after `reflex_reconcile`** (`za_full` and two `__cte_pm` sub-IMVs). The fixture and the
+exact `reflex_reconcile` calls are in that review's probe, not printed in its text; which IMV was
+reconciled is not stated. This qualifies "reconciling the dependents repairs them" above: it was
+shown for the two-level fixture of this report, not for a chain through CTE sub-IMVs.
