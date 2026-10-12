@@ -1087,6 +1087,46 @@ fn imv_is_registered(view_name: &str) -> bool {
     })
 }
 
+/// A source of the DEFERRED IMV being created for which this transaction has
+/// staged a write that its COMMIT will flush into every DEFERRED reader,
+/// including one filled from the source after that write.
+fn source_written_deferred_by_this_transaction(ctx: &BuildContext) -> Option<String> {
+    if !ctx.deferred || ctx.froms.is_empty() {
+        return None;
+    }
+    Spi::connect(|client| {
+        let pending_exists = client
+            .select(
+                "SELECT to_regclass('public.__reflex_deferred_pending') IS NOT NULL AS present",
+                Some(1),
+                &[],
+            )
+            .ok()
+            .and_then(|mut rows| rows.next())
+            .and_then(|row| row.get_by_name::<bool, _>("present").ok().flatten())
+            .unwrap_or(false);
+        if !pending_exists {
+            return None;
+        }
+        client
+            .select(
+                "SELECT p.source_table::text AS source FROM public.__reflex_deferred_pending p \
+                 WHERE p.source_table = ANY($1::TEXT[]) AND public.__reflex_xid_is_current(p.xmin) \
+                 LIMIT 1",
+                Some(1),
+                &[unsafe {
+                    DatumWithOid::new(
+                        format_pg_text_array_literal(&ctx.froms),
+                        PgBuiltInOids::TEXTOID.oid().value(),
+                    )
+                }],
+            )
+            .unwrap_or_report()
+            .next()
+            .and_then(|row| row.get_by_name::<String, _>("source").ok().flatten())
+    })
+}
+
 /// Pre-flight checks: reject a duplicate view name and a cycle in the IMV
 /// dependency DAG. Returns the rejection when the create should stop.
 fn check_existence_and_cycle(ctx: &BuildContext) -> Option<&'static str> {
@@ -2204,7 +2244,7 @@ fn ensure_staging_matches_source(client: &mut pgrx::spi::SpiClient<'_>, source_t
 /// When the IMV uses deferred refresh, ensure the deferred-flush
 /// infrastructure (function + per-source helpers) exists.
 fn install_deferred_flush_if_needed(client: &mut pgrx::spi::SpiClient<'_>, ctx: &BuildContext) {
-    if ctx.deferred {
+    if ctx.deferred && !crate::schema_builder::deferred_flush_is_installed(client) {
         for ddl in build_deferred_flush_ddl() {
             client.update(&ddl, None, &[]).unwrap_or_report();
         }
@@ -3044,6 +3084,13 @@ pub(crate) fn create_reflex_ivm_impl_with_materialization(
         ));
     }
 
+    if let Some(source) = source_written_deferred_by_this_transaction(&ctx) {
+        return crate::reflex_reject(&format!(
+            "DEFERRED IMV '{view_name}' cannot be created in a transaction that already wrote to \
+             its source '{source}': the staged write would reach the new IMV a second time at \
+             COMMIT. Fix: COMMIT the writes, then create the IMV in its own transaction."
+        ));
+    }
     if let Some(msg) = check_existence_and_cycle(&ctx) {
         return msg;
     }
