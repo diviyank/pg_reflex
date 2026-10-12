@@ -49,6 +49,21 @@ fn v112_cr_not_the_refusal(outcome: &str, problem: &str) -> Option<String> {
     }
 }
 
+/// Why `outcome` is not a tagged refusal that names `problem` and starts its remedy
+/// within the first 300 characters, and holds `detail` anywhere; `None` when it is.
+fn v112_cr_refusal_defect(outcome: &str, problem: &str, detail: &str) -> Option<String> {
+    let head: String = outcome.chars().take(300).collect();
+    let tagged = outcome.starts_with("ERROR: [reflex-unsupported] ");
+    if tagged && head.contains(problem) && head.contains("Fix: ") && outcome.contains(detail) {
+        None
+    } else {
+        Some(format!("expected a refusal naming '{problem}' and holding '{detail}', got: {outcome}"))
+    }
+}
+
+const V112_CR_A_PARTITION: &str = "a source is a partition";
+const V112_CR_SAME_TRIGGER_NAMES: &str = "two relations would get the same pg_reflex trigger names";
+
 /// `ok`, or the first write that raised or left the IMV different from `query`.
 fn v112_cr_maintained(imv: &str, query: &str, deferred: bool, steps: &[String]) -> String {
     let at_start = v112_j_oracle(imv, query);
@@ -148,7 +163,7 @@ fn v112_cr_partition_source_is_refused() {
         for deferred in [false, true] {
             let imv = format!("v112_cri_pr_{tag}_{}", if deferred { "d" } else { "i" });
             let outcome = v112_cr_create(&imv, query, "", deferred);
-            if let Some(reason) = v112_cr_not_the_refusal(&outcome, &format!("is a partition of {p}")) {
+            if let Some(reason) = v112_cr_refusal_defect(&outcome, V112_CR_A_PARTITION, &format!(", of {p}.")) {
                 wrong.push(format!("{imv}: {reason}"));
             }
         }
@@ -176,7 +191,7 @@ fn v112_cr_partition_source_is_refused() {
             "SELECT {}",
             call.replace("{imv}", &imv).replace("{query}", query)
         ));
-        if let Some(reason) = v112_cr_not_the_refusal(&outcome, &format!("is a partition of {p}")) {
+        if let Some(reason) = v112_cr_refusal_defect(&outcome, V112_CR_A_PARTITION, &format!(", of {p}.")) {
             wrong.push(format!("{imv}: {reason}"));
         }
     }
@@ -223,11 +238,11 @@ fn v112_cr_remedied_partitions(p: &str, partitions: &[&str], deferred: bool, ste
             "",
             deferred,
         );
-        let Some(remedy) = refused
-            .split("partition key: ")
-            .nth(1)
-            .and_then(|rest| rest.strip_suffix('.'))
-        else {
+        let printed = refused
+            .split_once(": FROM ")
+            .and_then(|(_, rest)| rest.rsplit_once(". The partition is "))
+            .map(|(rows_of_the_partition, _)| format!("FROM {rows_of_the_partition}"));
+        let Some(remedy) = printed.as_deref() else {
             wrong.push(format!("{p}_{partition}: no remedy in: {refused}"));
             continue;
         };
@@ -391,7 +406,11 @@ fn v112_cr_sources_sharing_trigger_names_are_refused() {
             ("in_subquery", format!("SELECT id, v FROM {first} WHERE id IN (SELECT id FROM {second})")),
         ] {
             let outcome = v112_cr_create(&format!("{second_imv}_{tag}"), &query, "", deferred);
-            let refusal = v112_cr_not_the_refusal(&outcome, &format!("{second} and {first}"));
+            let refusal = v112_cr_refusal_defect(
+                &outcome,
+                V112_CR_SAME_TRIGGER_NAMES,
+                &format!("Fix: rename the table {second} (ALTER TABLE"),
+            );
             if let Some(reason) = refusal {
                 wrong.push(format!("{second_imv}_{tag}: {reason}"));
             }
@@ -455,22 +474,26 @@ fn v112_cr_sources_sharing_trigger_names_in_one_definition() {
     Spi::run("CREATE SCHEMA v112_crt_se; CREATE SCHEMA v112_crt_se_a").expect("schemas");
     let mut wrong: Vec<String> = Vec::new();
     for (tag, first, second, renamed) in [
-        ("dot", "v112_crt_se.t", "v112_crt_se_t", "v112_crt_se_t2"),
-        ("split", "v112_crt_se_a.b_c", "v112_crt_se.a_b_c", "v112_crt_se.a_b_c2"),
-        ("public", "public.v112_crt_sh", "public_v112_crt_sh", "public_v112_crt_sh2"),
+        ("dot", "v112_crt_se.t", "v112_crt_se_t", "v112_crt_se.t2"),
+        ("split", "v112_crt_se_a.b_c", "v112_crt_se.a_b_c", "v112_crt_se_a.b_c2"),
+        ("public", "public.v112_crt_sh", "public_v112_crt_sh", "public.v112_crt_sh2"),
         (
             "long",
             "v112_crt_se.a_long_table_name_that_fills_what_is_left_of_a_name",
             "v112_crt_se_a_long_table_name_that_fills_what_is_left_of_a_name",
-            "v112_crt_se_renamed_a_long_table_name_that_fills_w",
+            "v112_crt_se.renamed_long_table",
         ),
     ] {
         v112_cr_two_tables(first, second);
         let imv = format!("v112_cri_se_{tag}");
-        let query = |second: &str| format!("SELECT a.id, b.v FROM {first} a JOIN {second} b ON b.id = a.id");
+        let query = |first: &str| format!("SELECT a.id, b.v FROM {first} a JOIN {second} b ON b.id = a.id");
         for deferred in [false, true] {
-            let outcome = v112_cr_create(&imv, &query(second), "id", deferred);
-            let refusal = v112_cr_not_the_refusal(&outcome, &format!("{first} and {second}"));
+            let outcome = v112_cr_create(&imv, &query(first), "id", deferred);
+            let refusal = v112_cr_refusal_defect(
+                &outcome,
+                V112_CR_SAME_TRIGGER_NAMES,
+                &format!("Fix: rename the table {first} (ALTER TABLE"),
+            );
             if let Some(reason) = refusal {
                 wrong.push(format!("{imv}: {reason}"));
             }
@@ -482,13 +505,13 @@ fn v112_cr_sources_sharing_trigger_names_in_one_definition() {
             wrong.push(format!("triggers left on {first} or {second}"));
         }
         let bare_new_name = renamed.rsplit('.').next().expect("name");
-        Spi::run(&format!("ALTER TABLE {second} RENAME TO {bare_new_name}")).expect("rename");
+        Spi::run(&format!("ALTER TABLE {first} RENAME TO {bare_new_name}")).expect("rename");
         let created = v112_cr_create(&imv, &query(renamed), "id", false);
         if created != V112_CR_CREATED {
             wrong.push(format!("{imv} over the renamed table: {created}"));
             continue;
         }
-        let kept = v112_cr_maintained(&imv, &query(renamed), false, &v112_cr_two_table_steps(first, renamed));
+        let kept = v112_cr_maintained(&imv, &query(renamed), false, &v112_cr_two_table_steps(renamed, second));
         if kept != "ok" {
             wrong.push(format!("{imv} over the renamed table: {kept}"));
         }
@@ -508,7 +531,11 @@ fn v112_cr_source_named_through_the_search_path_is_refused() {
     Spi::run("SET LOCAL search_path = v112_crt_si, public").expect("search_path");
     let outcome = v112_cr_create("public.v112_cri_si_second", "SELECT id, v FROM t", "", false);
     assert_eq!(
-        v112_cr_not_the_refusal(&outcome, "v112_crt_si.t and v112_crt_si_t"),
+        v112_cr_refusal_defect(
+            &outcome,
+            V112_CR_SAME_TRIGGER_NAMES,
+            "Fix: rename the table v112_crt_si.t (ALTER TABLE"
+        ),
         None
     );
     assert_eq!(v112_cr_left_behind("v112_cri_si_second"), 0);
@@ -592,7 +619,21 @@ fn v112_cr_expression_query(position: &str, t: &str, e: &str) -> (String, &'stat
             "id",
         ),
         "derived_select" => (format!("SELECT q.id, q.x FROM (SELECT id, {e} AS x FROM {t}) q"), ""),
+        "exists_subquery" => (
+            format!("SELECT id, v FROM {t} WHERE EXISTS (SELECT 1 FROM {t}_d WHERE {t}_d.id = {t}.id AND {e} > 1)"),
+            "",
+        ),
+        "exists_beside_a_filter" => (
+            format!(
+                "SELECT id, v FROM {t} WHERE u IS NOT NULL AND EXISTS (SELECT 1 FROM {t}_d WHERE {t}_d.id = {t}.id AND {e} > 1)"
+            ),
+            "",
+        ),
         "pt_where" => (format!("SELECT id, v FROM {t} WHERE {e} > 1"), ""),
+        "pt_where_beside_exists" => (
+            format!("SELECT id, v FROM {t} WHERE EXISTS (SELECT 1 FROM {t}_d WHERE {t}_d.id = {t}.id) AND {e} > 1"),
+            "",
+        ),
         "where_subquery" => (
             format!("SELECT id, v FROM {t} WHERE id IN (SELECT id FROM {t}_d WHERE {e} > 1)"),
             "",
@@ -630,13 +671,21 @@ fn v112_cr_expression_query(position: &str, t: &str, e: &str) -> (String, &'stat
     }
 }
 
-/// The select list and the FROM clause of a plain SELECT, which PostgreSQL runs as
-/// the caller wrote them.
-const V112_CR_RUN_AS_WRITTEN: [&str; 3] = ["pt_select", "pt_join_on", "derived_select"];
+/// The select list, the FROM clause and the WHERE conjuncts pg_reflex does not keep
+/// per source (a correlated EXISTS) of a plain SELECT, which PostgreSQL runs as the
+/// caller wrote them.
+const V112_CR_RUN_AS_WRITTEN: [&str; 5] = [
+    "pt_select",
+    "pt_join_on",
+    "derived_select",
+    "exists_subquery",
+    "exists_beside_a_filter",
+];
 
 /// The clauses pg_reflex writes back from the parsed query.
-const V112_CR_REWRITTEN: [&str; 17] = [
+const V112_CR_REWRITTEN: [&str; 18] = [
     "pt_where",
+    "pt_where_beside_exists",
     "where_subquery",
     "agg_group_key",
     "agg_arg",
@@ -699,7 +748,9 @@ fn v112_cr_not_refused(tag: &str, position: &str, e: &str, problem: &str, deferr
 }
 
 /// `(tag, expression, what the refusal names, minimum server version)`.
-const V112_CR_REPRINTED_DIFFERENTLY: [(&str, &str, &str, i32); 7] = [
+const V112_CR_REPRINTED_DIFFERENTLY: [(&str, &str, &str, i32); 9] = [
+    ("mmm", "- - -v", "Fix: put the operand in parentheses, -(-(-v)) in place of - - -v, or write -v alone", 0),
+    ("abs_mm", "@ - -v", "Fix: put the operand in parentheses, @(-(-v)) in place of @ - -v.", 0),
     ("mm", "- -v", "back as '--', which PostgreSQL reads as the start of a comment. Fix: put the operand in parentheses, -(-v) in place of - -v, or write v alone", 0),
     ("mm_literal", "- -1 + v", "back as '--', which PostgreSQL reads as the start of a comment. Fix: put the operand in parentheses, -(-1) in place of - -1, or write 1 alone", 0),
     ("abs_minus", "@ -v", "back as '@-', which PostgreSQL reads as one operator. Fix: put the operand in parentheses, @(-v) in place of @ -v", 0),
@@ -784,6 +835,9 @@ fn v112_cr_reprinted_expression_remedies_are_maintained() {
     for (tag, e, minimum_version) in [
         ("minus", "-v", 0),
         ("mm_paren", "-(-v)", 0),
+        ("mmm_paren", "-(-(-v))", 0),
+        ("abs_mm_paren", "@(-(-v))", 0),
+        ("mm_in_call_paren", "-(-abs(-(-v)))", 0),
         ("mm_literal_paren", "-(-1) + v", 0),
         ("abs_paren", "@(-v)", 0),
         ("not_paren", "~(-v)", 0),
@@ -959,5 +1013,554 @@ fn v112_cr_definitions_around_the_refusals_stay_accepted() {
             compare(&mut wrong, &dml);
         }
     }
+    assert!(wrong.is_empty(), "\n{}", wrong.join("\n"));
+}
+
+// ---------------------------------------------------------------------------
+// Remedies that depend on what the colliding relation is
+// ---------------------------------------------------------------------------
+
+fn v112_cr_every_imv_equals(imvs: &[(&str, String)], after: &str) -> Vec<String> {
+    imvs.iter()
+        .filter_map(|(imv, query)| {
+            let compared = v112_j_oracle(imv, query);
+            (compared != "0").then(|| format!("{imv} differs by {compared} after [{after}]"))
+        })
+        .collect()
+}
+
+/// An IMV target whose trigger names a table read by another IMV already carries is
+/// not renamed: the refusal asks for the IMV to be created again under another name,
+/// and after that every IMV is maintained.
+#[pg_test]
+fn v112_cr_trigger_names_of_an_imv_target_against_a_read_table() {
+    lock_shared_fixtures();
+    Spi::run("CREATE SCHEMA v112_crt_u").expect("schema");
+    v112_cr_two_tables("v112_crt_u.base", "v112_crt_u_m");
+    let rows = "SELECT id, v FROM v112_crt_u.base";
+    let total = |source: &str| format!("SELECT COUNT(*) AS c, SUM(v) AS s FROM {source}");
+    assert_eq!(v112_cr_create("v112_crt_u.m", rows, "", false), V112_CR_CREATED);
+    assert_eq!(v112_cr_create("v112_cri_u_agg", &total("v112_crt_u_m"), "", false), V112_CR_CREATED);
+    let refused = v112_cr_create("v112_cri_u_over", &total("v112_crt_u.m"), "", false);
+    assert_eq!(
+        v112_cr_refusal_defect(
+            &refused,
+            V112_CR_SAME_TRIGGER_NAMES,
+            "Fix: drop the IMV v112_crt_u.m (SELECT drop_reflex_ivm('v112_crt_u.m')) and create it again under another name"
+        ),
+        None
+    );
+    assert!(!refused.contains("rename"), "{refused}");
+    assert_eq!(v112_cr_left_behind("v112_cri_u_over"), 0);
+
+    assert_eq!(crate::drop_reflex_ivm("v112_crt_u.m"), "DROP REFLEX INCREMENTAL VIEW");
+    assert_eq!(v112_cr_create("v112_crt_u.m2", rows, "", false), V112_CR_CREATED);
+    assert_eq!(v112_cr_create("v112_cri_u_over", &total("v112_crt_u.m2"), "", false), V112_CR_CREATED);
+    let imvs = [
+        ("v112_crt_u.m2", rows.to_string()),
+        ("v112_cri_u_agg", total("v112_crt_u_m")),
+        ("v112_cri_u_over", total("v112_crt_u.base")),
+    ];
+    let mut wrong: Vec<String> = Vec::new();
+    for dml in v112_cr_two_table_steps("v112_crt_u.base", "v112_crt_u_m") {
+        assert_eq!(v112_j_try_dml(&dml), "OK", "{dml}");
+        wrong.extend(v112_cr_every_imv_equals(&imvs, &dml));
+    }
+    assert!(wrong.is_empty(), "\n{}", wrong.join("\n"));
+}
+
+/// The other way round, the table no IMV reads yet is the one to rename.
+#[pg_test]
+fn v112_cr_trigger_names_of_a_free_table_against_an_imv_target() {
+    lock_shared_fixtures();
+    Spi::run("CREATE SCHEMA v112_crt_v").expect("schema");
+    v112_cr_two_tables("v112_crt_v.base", "v112_crt_v_m");
+    let rows = "SELECT id, v FROM v112_crt_v.base";
+    let total = |source: &str| format!("SELECT COUNT(*) AS c, SUM(v) AS s FROM {source}");
+    assert_eq!(v112_cr_create("v112_crt_v.m", rows, "", false), V112_CR_CREATED);
+    assert_eq!(v112_cr_create("v112_cri_v_over", &total("v112_crt_v.m"), "", false), V112_CR_CREATED);
+    let refused = v112_cr_create("v112_cri_v_agg", &total("v112_crt_v_m"), "", false);
+    assert_eq!(
+        v112_cr_refusal_defect(
+            &refused,
+            V112_CR_SAME_TRIGGER_NAMES,
+            "Fix: rename the table v112_crt_v_m (ALTER TABLE"
+        ),
+        None
+    );
+    assert_eq!(v112_cr_left_behind("v112_cri_v_agg"), 0);
+    Spi::run("ALTER TABLE v112_crt_v_m RENAME TO v112_crt_v_m_renamed").expect("rename");
+    assert_eq!(
+        v112_cr_create("v112_cri_v_agg", &total("v112_crt_v_m_renamed"), "", false),
+        V112_CR_CREATED
+    );
+    let imvs = [
+        ("v112_crt_v.m", rows.to_string()),
+        ("v112_cri_v_agg", total("v112_crt_v_m_renamed")),
+        ("v112_cri_v_over", total("v112_crt_v.base")),
+    ];
+    let mut wrong: Vec<String> = Vec::new();
+    for dml in v112_cr_two_table_steps("v112_crt_v.base", "v112_crt_v_m_renamed") {
+        assert_eq!(v112_j_try_dml(&dml), "OK", "{dml}");
+        wrong.extend(v112_cr_every_imv_equals(&imvs, &dml));
+    }
+    assert!(wrong.is_empty(), "\n{}", wrong.join("\n"));
+}
+
+/// A table the IMV would build for itself cannot be renamed by the caller: the
+/// refusal asks for another IMV name, under which the definition is maintained.
+#[pg_test]
+fn v112_cr_trigger_names_of_a_generated_table_against_a_read_table() {
+    lock_shared_fixtures();
+    Spi::run("CREATE SCHEMA v112_crt_w").expect("schema");
+    v112_cr_two_tables("v112_crt_w.t", "v112_crt_w_x__cte_c");
+    let total = "SELECT COUNT(*) AS c FROM v112_crt_w_x__cte_c";
+    assert_eq!(v112_cr_create("v112_cri_w_tbl", total, "", false), V112_CR_CREATED);
+    let query = "WITH c AS (SELECT id, SUM(v) AS s FROM v112_crt_w.t GROUP BY id) SELECT id, s FROM c WHERE s > 0";
+    let refused = v112_cr_create("v112_crt_w.x", query, "", false);
+    assert_eq!(
+        v112_cr_refusal_defect(&refused, V112_CR_SAME_TRIGGER_NAMES, "Fix: give this IMV another name"),
+        None
+    );
+    assert!(!refused.contains("rename"), "{refused}");
+    let left = Spi::get_one::<i64>(
+        "SELECT (SELECT count(*) FROM public.__reflex_ivm_reference WHERE name LIKE 'v112_crt_w.x%') \
+              + (SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+                  WHERE n.nspname = 'v112_crt_w' AND c.relname LIKE 'x%')",
+    )
+    .expect("left behind");
+    assert_eq!(left, Some(0));
+    assert_eq!(v112_cr_create("v112_crt_w.x2", query, "", false), V112_CR_CREATED);
+    let imvs = [("v112_crt_w.x2", query.to_string()), ("v112_cri_w_tbl", total.to_string())];
+    let mut wrong: Vec<String> = Vec::new();
+    for dml in v112_cr_two_table_steps("v112_crt_w.t", "v112_crt_w_x__cte_c") {
+        assert_eq!(v112_j_try_dml(&dml), "OK", "{dml}");
+        wrong.extend(v112_cr_every_imv_equals(&imvs, &dml));
+    }
+    assert!(wrong.is_empty(), "\n{}", wrong.join("\n"));
+}
+
+// ---------------------------------------------------------------------------
+// A source the definition ignores is not followed, so nothing is asked of it
+// ---------------------------------------------------------------------------
+
+/// A partition, an inheritance child and a table whose trigger names are taken,
+/// each ignored with `!`, are accepted, and the IMV follows its other source.
+#[pg_test]
+fn v112_cr_ignored_source_is_not_refused() {
+    lock_shared_fixtures();
+    Spi::run(
+        "CREATE SCHEMA v112_crt_ig; \
+         CREATE TABLE v112_crt_ig.t(id INT PRIMARY KEY, w INT); \
+         CREATE TABLE v112_crt_ig_t(id INT PRIMARY KEY, w INT); \
+         CREATE TABLE v112_crt_igf(id INT PRIMARY KEY, k TEXT, v INT); \
+         CREATE TABLE v112_crt_igl(id INT NOT NULL, g TEXT NOT NULL, w INT) PARTITION BY LIST (g); \
+         CREATE TABLE v112_crt_igl_a PARTITION OF v112_crt_igl FOR VALUES IN ('a'); \
+         CREATE TABLE v112_crt_igh(id INT, w INT); \
+         CREATE TABLE v112_crt_igh_c() INHERITS (v112_crt_igh); \
+         INSERT INTO v112_crt_igf VALUES (1,'x',1),(2,'y',2),(3,'z',3); \
+         INSERT INTO v112_crt_igl VALUES (1,'a',10),(2,'a',20); \
+         INSERT INTO v112_crt_igh_c VALUES (1,10),(3,30); \
+         INSERT INTO v112_crt_ig.t VALUES (1,10); INSERT INTO v112_crt_ig_t VALUES (2,20),(3,30)",
+    )
+    .expect("fixture");
+    assert_eq!(
+        v112_cr_create("v112_cri_ig_first", "SELECT id, w FROM v112_crt_ig.t", "", false),
+        V112_CR_CREATED
+    );
+    let mut wrong: Vec<String> = Vec::new();
+    let mut created: Vec<(String, String)> = Vec::new();
+    for ignored in ["v112_crt_igl_a", "v112_crt_igh_c", "v112_crt_ig_t"] {
+        for (shape, query) in [
+            ("rows", format!("SELECT f.id, f.v, l.w FROM v112_crt_igf f JOIN {ignored} l ON l.id = f.id")),
+            (
+                "agg",
+                format!("SELECT COUNT(*) AS c, SUM(l.w) AS s FROM v112_crt_igf f JOIN {ignored} l ON l.id = f.id"),
+            ),
+        ] {
+            let imv = format!("v112_cri_{}_{shape}", &ignored[9..]);
+            let outcome = v112_j_try(&format!(
+                "SELECT create_reflex_ivm('{imv}', $v112sel${query}$v112sel$, NULL, 'UNLOGGED', 'IMMEDIATE', '!{ignored}')"
+            ));
+            if outcome != V112_CR_CREATED {
+                wrong.push(format!("{imv}: {outcome}"));
+                continue;
+            }
+            created.push((imv, query));
+        }
+    }
+    for dml in [
+        "INSERT INTO v112_crt_igf VALUES (10,'n',10),(11,'m',11)",
+        "UPDATE v112_crt_igf SET v = v + 100 WHERE id IN (1, 2)",
+        "DELETE FROM v112_crt_igf WHERE id = 2",
+    ] {
+        assert_eq!(v112_j_try_dml(dml), "OK", "{dml}");
+        for (imv, query) in &created {
+            let compared = v112_j_oracle(imv, query);
+            if compared != "0" {
+                wrong.push(format!("{imv} differs by {compared} after [{dml}]"));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "\n{}", wrong.join("\n"));
+}
+
+// ---------------------------------------------------------------------------
+// A source of an inheritance hierarchy
+// ---------------------------------------------------------------------------
+
+/// A table that inherits, and a table others inherit from, are refused as sources in
+/// both modes; once the child is taken out of the hierarchy, as the message asks,
+/// both are sources whose IMVs are maintained. A table whose child is gone is one.
+#[pg_test]
+fn v112_cr_inheritance_member_is_refused() {
+    lock_shared_fixtures();
+    let (parent, child) = ("v112_crt_h", "v112_crt_h_c");
+    Spi::run(&format!(
+        "CREATE TABLE {parent}(id INT, g TEXT, v INT); \
+         CREATE TABLE {child}() INHERITS ({parent}); \
+         INSERT INTO {parent} VALUES (1,'a',1),(2,'b',2); INSERT INTO {child} VALUES (3,'a',3),(4,'c',4); \
+         CREATE TABLE {parent}_had(id INT, g TEXT, v INT); \
+         CREATE TABLE {parent}_had_c() INHERITS ({parent}_had); DROP TABLE {parent}_had_c; \
+         INSERT INTO {parent}_had VALUES (1,'a',1)"
+    ))
+    .expect("fixture");
+    let shapes = [
+        ("rows", "SELECT id, g, v FROM {s}"),
+        ("agg", "SELECT COUNT(*) AS c, SUM(v) AS sv FROM {s}"),
+        ("cte", "WITH c AS (SELECT g, SUM(v) AS sv FROM {s} GROUP BY g) SELECT g, sv FROM c"),
+    ];
+    let mut wrong: Vec<String> = Vec::new();
+    let take_out = format!("ALTER TABLE {child} NO INHERIT {parent}");
+    for source in [parent, child] {
+        for (shape, query) in shapes {
+            for deferred in [false, true] {
+                let imv = format!("v112_cri_h_refused_{shape}");
+                let outcome = v112_cr_create(&imv, &query.replace("{s}", source), "", deferred);
+                let defect = v112_cr_refusal_defect(&outcome, "inheritance hierarchy", &take_out);
+                if let Some(reason) = defect {
+                    wrong.push(format!("{source} {shape} deferred={deferred}: {reason}"));
+                }
+            }
+        }
+    }
+    if v112_cr_left_behind("v112_cri_h_refused") != 0 {
+        wrong.push("a refused definition left a registry row or a relation".to_string());
+    }
+    if v112_cr_user_triggers(parent) + v112_cr_user_triggers(child) != 0 {
+        wrong.push("triggers left on the hierarchy".to_string());
+    }
+    assert!(wrong.is_empty(), "\n{}", wrong.join("\n"));
+
+    Spi::run(&take_out).expect("no inherit");
+    let mut created: Vec<(String, String, bool)> = Vec::new();
+    for source in [parent, child, "v112_crt_h_had"] {
+        for (shape, query) in shapes {
+            for deferred in [false, true] {
+                let imv = format!("v112_cri_h_{}_{shape}_{}", &source[9..], if deferred { "d" } else { "i" });
+                let query = query.replace("{s}", source);
+                let outcome = v112_cr_create(&imv, &query, "", deferred);
+                if outcome != V112_CR_CREATED {
+                    wrong.push(format!("{imv}: {outcome}"));
+                    continue;
+                }
+                created.push((imv, query, deferred));
+            }
+        }
+    }
+    for table in [parent, child, "v112_crt_h_had"] {
+        for dml in [
+            format!("INSERT INTO {table} VALUES (10,'a',10),(11,'d',11)"),
+            format!("UPDATE {table} SET v = v + 100 WHERE id IN (1, 3, 10)"),
+            format!("DELETE FROM {table} WHERE id IN (2, 4, 11)"),
+        ] {
+            assert_eq!(v112_j_try_dml(&dml), "OK", "{dml}");
+            for (imv, query, deferred) in &created {
+                if *deferred {
+                    let flushed = format!(
+                        "{} {}",
+                        v112_j_try(&format!("SELECT reflex_flush_deferred('{table}')")),
+                        v112_j_flush_every_source(imv)
+                    );
+                    if flushed.contains("ERROR") || flushed.contains("RAISED") {
+                        wrong.push(format!("{imv}: flush {flushed} after [{dml}]"));
+                    }
+                }
+                let compared = v112_j_oracle(imv, query);
+                if compared != "0" {
+                    wrong.push(format!("{imv} differs by {compared} after [{dml}]"));
+                }
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "\n{}", wrong.join("\n"));
+}
+
+// ---------------------------------------------------------------------------
+// Integers the parser reads as the number 0 followed by a name
+// ---------------------------------------------------------------------------
+
+fn v112_cr_trailing_literal_cell(tag: &str, position: &str, literal: &str) -> String {
+    let t = format!("v112_crt_n_{tag}_{position}");
+    v112_sr_value_table(&t);
+    let query = match position {
+        "plain" => format!("SELECT id, v + {literal} FROM {t}"),
+        "agg_item" => format!("SELECT b, SUM(v) + {literal} FROM {t} GROUP BY b"),
+        "second_agg_item" => format!("SELECT b, COUNT(*) AS c, SUM(v) + {literal} FROM {t} GROUP BY b"),
+        "count_item" => format!("SELECT b, COUNT(*) + {literal} FROM {t} GROUP BY b"),
+        "cte_outer" => format!("WITH c AS (SELECT id, v FROM {t}) SELECT id, v + {literal} FROM c"),
+        "distinct" => format!("SELECT DISTINCT v + {literal} FROM {t}"),
+        "union" => format!("SELECT id, v + {literal} FROM {t} UNION ALL SELECT id, u FROM {t}"),
+        other => panic!("unknown position {other}"),
+    };
+    let imv = format!("v112_cri_n_{tag}_{position}");
+    let created = v112_cr_create(&imv, &query, "", false);
+    if created != V112_CR_CREATED {
+        return format!("NOT-CREATED left={} {created}", v112_cr_left_behind(&imv));
+    }
+    v112_cr_maintained(&imv, &query, false, &v112_sr_value_steps(&t))
+}
+
+const V112_CR_REWRITTEN_SELECT_ITEMS: [&str; 6] =
+    ["agg_item", "second_agg_item", "count_item", "cte_outer", "distinct", "union"];
+
+/// `0X1F`, `0o17`, `0b101` and their other-case prefixes ending an unaliased select
+/// item are refused wherever pg_reflex writes the item back, with the decimal value;
+/// in a plain SELECT list, run as written, they are maintained. The decimal value and
+/// the literals the parser reads as PostgreSQL does are maintained everywhere.
+#[cfg(not(feature = "pg15"))]
+#[pg_test]
+fn v112_cr_integer_read_as_zero_and_a_name_is_refused() {
+    lock_shared_fixtures();
+    let mut wrong: Vec<String> = Vec::new();
+    for (tag, literal, decimal) in [
+        ("hex_upper", "0X1F", "31"),
+        ("octal", "0o17", "15"),
+        ("octal_upper", "0O17", "15"),
+        ("binary", "0b101", "5"),
+        ("binary_upper", "0B101", "5"),
+        ("binary_underscore", "0b1_01", "5"),
+        ("hex_underscore", "0x_1F", "31"),
+    ] {
+        for position in V112_CR_REWRITTEN_SELECT_ITEMS {
+            let outcome = v112_cr_trailing_literal_cell(tag, position, literal);
+            let refused = outcome.strip_prefix("NOT-CREATED left=0 ").is_some_and(|message| {
+                let named = format!("Fix: write the integer in decimal: {decimal}.");
+                v112_cr_refusal_defect(message, &named, literal).is_none()
+            });
+            if !refused {
+                wrong.push(format!("{tag} {position}: {outcome}"));
+            }
+        }
+        let plain = v112_cr_trailing_literal_cell(tag, "plain", literal);
+        if plain != "ok" {
+            wrong.push(format!("{tag} plain: {plain}"));
+        }
+    }
+    for (tag, literal) in [
+        ("decimal", "31"),
+        ("underscore", "1_000"),
+        ("exponent", "1e2"),
+        ("bit_string", "(X'1F')::int"),
+        ("zero", "0"),
+    ] {
+        for position in V112_CR_REWRITTEN_SELECT_ITEMS.iter().chain(&["plain"]) {
+            let outcome = v112_cr_trailing_literal_cell(tag, position, literal);
+            if outcome != "ok" {
+                wrong.push(format!("{tag} {position}: {outcome}"));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "\n{}", wrong.join("\n"));
+}
+
+/// An operand that holds the same construct deeper is refused with a remedy that
+/// names no expression pg_reflex would misread.
+#[pg_test]
+fn v112_cr_reprinted_expression_nested_in_a_call_is_refused() {
+    lock_shared_fixtures();
+    let refused = v112_cr_not_refused("mm_in_call", "pt_where", "- -abs(- -v)", "as in -(-v)", false);
+    assert_eq!(refused, None);
+}
+
+// ---------------------------------------------------------------------------
+// Partition refusals: long names, and roots whose remedy differs
+// ---------------------------------------------------------------------------
+
+/// With names of 63 characters in a schema of 63, both refusals still name the
+/// problem and start the remedy within 300 characters, and the remedy is maintained.
+#[pg_test]
+fn v112_cr_refusals_with_names_of_maximum_length() {
+    lock_shared_fixtures();
+    let padded = |stem: &str| format!("{stem}{}", "x".repeat(63 - stem.len()));
+    let schema = padded("v112_crt_long_schema_");
+    let root = padded("v112_crt_long_root_");
+    let partition = padded("v112_crt_long_part_");
+    Spi::run(&format!(
+        "CREATE SCHEMA {schema}; \
+         CREATE TABLE {schema}.{root}(id INT, g TEXT, v INT) PARTITION BY LIST (g); \
+         CREATE TABLE {schema}.{partition} PARTITION OF {schema}.{root} FOR VALUES IN ('a'); \
+         INSERT INTO {schema}.{root} VALUES (1,'a',1)"
+    ))
+    .expect("fixture");
+    let refused = v112_cr_create(
+        "v112_cri_long_refused",
+        &format!("SELECT COUNT(*) AS c, SUM(v) AS sv FROM {schema}.{partition}"),
+        "",
+        false,
+    );
+    assert_eq!(
+        v112_cr_refusal_defect(&refused, "Fix: read the partitioned table", &format!(", of {schema}.{root}.")),
+        None
+    );
+    let remedy = refused
+        .split_once(": FROM ")
+        .and_then(|(_, rest)| rest.rsplit_once(". The partition is "))
+        .map(|(rows, _)| format!("SELECT COUNT(*) AS c, SUM(v) AS sv FROM {rows}"))
+        .expect("remedy");
+    assert_eq!(v112_cr_create("v112_cri_long_remedy", &remedy, "", false), V112_CR_CREATED);
+    let steps = vec![
+        format!("INSERT INTO {schema}.{root} VALUES (2,'a',2)"),
+        format!("UPDATE {schema}.{partition} SET v = v + 10"),
+        format!("DELETE FROM {schema}.{root} WHERE id = 1"),
+    ];
+    assert_eq!(v112_cr_maintained("v112_cri_long_remedy", &remedy, false, &steps), "ok");
+
+    let other_schema = format!("{}_a", &schema[..61]);
+    let (table_in_schema, table_in_other) = (padded("a_v112_crt_long_"), padded("v112_crt_long_")[..61].to_string());
+    Spi::run(&format!("CREATE SCHEMA {other_schema}")).expect("schema");
+    let first = format!("{}.{table_in_schema}", &schema[..61]);
+    let second = format!("{other_schema}.{table_in_other}");
+    Spi::run(&format!("CREATE SCHEMA {}", &schema[..61])).expect("schema");
+    v112_cr_two_tables(&first, &second);
+    assert_eq!(
+        v112_cr_create("v112_cri_long_first", &format!("SELECT id, v FROM {first}"), "", false),
+        V112_CR_CREATED
+    );
+    let refused = v112_cr_create("v112_cri_long_second", &format!("SELECT id, v FROM {second}"), "", false);
+    assert_eq!(
+        v112_cr_refusal_defect(&refused, "Fix: rename the table", &format!("rename the table {second} (ALTER TABLE")),
+        None
+    );
+}
+
+/// Below a table partitioned on several columns, at the root or at a branch, the
+/// refusal prints no WHERE: it asks for the partitioned table itself, unpartitioned,
+/// and that call is maintained.
+#[pg_test]
+fn v112_cr_partition_below_a_multi_column_key_remedy_is_maintained() {
+    lock_shared_fixtures();
+    let mut wrong: Vec<String> = Vec::new();
+    for (tag, tree) in [
+        (
+            "root",
+            "CREATE TABLE {p}(id INT NOT NULL, g TEXT, v INT NOT NULL) PARTITION BY RANGE (id, v); \
+             CREATE TABLE {p}_lo PARTITION OF {p} FOR VALUES FROM (0, 0) TO (100, 0); \
+             CREATE TABLE {p}_hi PARTITION OF {p} FOR VALUES FROM (100, 0) TO (MAXVALUE, MAXVALUE)",
+        ),
+        (
+            "branch",
+            "CREATE TABLE {p}(id INT NOT NULL, g TEXT, v INT NOT NULL) PARTITION BY LIST (g); \
+             CREATE TABLE {p}_ab PARTITION OF {p} FOR VALUES IN ('a', 'b') PARTITION BY RANGE (id, v); \
+             CREATE TABLE {p}_lo PARTITION OF {p}_ab FOR VALUES FROM (0, 0) TO (100, 0); \
+             CREATE TABLE {p}_hi PARTITION OF {p}_ab FOR VALUES FROM (100, 0) TO (MAXVALUE, MAXVALUE)",
+        ),
+    ] {
+        for deferred in [false, true] {
+            let mode = if deferred { "DEFERRED" } else { "IMMEDIATE" };
+            let p = format!("v112_crt_pmc_{tag}_{}", &mode[..1].to_lowercase());
+            Spi::run(&tree.replace("{p}", &p)).expect("tree");
+            Spi::run(&format!("INSERT INTO {p} VALUES (1,'a',1),(2,'b',5),(102,'b',7),(150,'a',9)")).expect("seed");
+            let refused = v112_cr_create(&format!("{p}_refused"), &format!("SELECT id, g, v FROM {p}_lo"), "", deferred);
+            let defect = v112_cr_refusal_defect(
+                &refused,
+                "Fix: read the partitioned table itself",
+                &format!("FROM {p}, and pass partition_by => ARRAY[]::text[]"),
+            );
+            if let Some(reason) = defect {
+                wrong.push(format!("{p}: {reason}"));
+            }
+            if refused.contains(" WHERE (") {
+                wrong.push(format!("{p}: a WHERE is printed: {refused}"));
+            }
+            let mut created: Vec<(String, String)> = Vec::new();
+            for (shape, query) in [
+                ("rows", format!("SELECT id, g, v FROM {p}")),
+                ("agg", format!("SELECT COUNT(*) AS c, SUM(v) AS sv FROM {p}")),
+                ("group", format!("SELECT g, COUNT(*) AS c, SUM(v) AS sv FROM {p} GROUP BY g")),
+            ] {
+                let imv = format!("v112_cri_pmc_{tag}_{}_{shape}", &mode[..1].to_lowercase());
+                let outcome = v112_j_try(&format!(
+                    "SELECT create_reflex_ivm('{imv}', $v112sel${query}$v112sel$, NULL, 'UNLOGGED', '{mode}', NULL, ARRAY[]::text[])"
+                ));
+                if outcome != V112_CR_CREATED {
+                    wrong.push(format!("{imv}: {outcome}"));
+                    continue;
+                }
+                created.push((imv, query));
+            }
+            for dml in [
+                format!("INSERT INTO {p} VALUES (10,'a',1),(111,'b',3)"),
+                format!("INSERT INTO {p}_lo VALUES (13,'a',5)"),
+                format!("UPDATE {p} SET v = v + 10"),
+                format!("UPDATE {p} SET id = id + 100 WHERE id = 2"),
+                format!("DELETE FROM {p} WHERE id IN (10, 111)"),
+                format!("DELETE FROM {p}_hi WHERE id = 150"),
+            ] {
+                let ran = v112_j_try_dml(&dml);
+                if ran != "OK" {
+                    wrong.push(format!("{ran} [{dml}]"));
+                    break;
+                }
+                if deferred {
+                    let flushed = v112_j_try(&format!("SELECT reflex_flush_deferred('{p}')"));
+                    if flushed.contains("RAISED") || flushed.contains("ERROR") {
+                        wrong.push(format!("flush {flushed} [{dml}]"));
+                        break;
+                    }
+                }
+                for (imv, query) in &created {
+                    let compared = v112_j_oracle(imv, query);
+                    if compared != "0" {
+                        wrong.push(format!("{imv} differs by {compared} after [{dml}]"));
+                    }
+                }
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "\n{}", wrong.join("\n"));
+}
+
+/// A partition of a table whose name needs quotes is refused without a query pg_reflex
+/// would refuse in turn: the table is renamed first, and the remedy then printed is
+/// maintained.
+#[pg_test]
+fn v112_cr_partition_of_a_quoted_root_remedy_is_maintained() {
+    lock_shared_fixtures();
+    Spi::run(
+        "CREATE TABLE \"V112_crt_PQ\"(id INT, g TEXT, v INT) PARTITION BY LIST (g); \
+         CREATE TABLE v112_crt_pq_a PARTITION OF \"V112_crt_PQ\" FOR VALUES IN ('a'); \
+         CREATE TABLE v112_crt_pq_b PARTITION OF \"V112_crt_PQ\" FOR VALUES IN ('b'); \
+         INSERT INTO \"V112_crt_PQ\" VALUES (1,'a',1),(2,'b',5)",
+    )
+    .expect("fixture");
+    let refused = v112_cr_create("v112_cri_pq_refused", "SELECT id, g, v FROM v112_crt_pq_a", "", false);
+    assert_eq!(
+        v112_cr_refusal_defect(
+            &refused,
+            "Fix: give the partitioned table and its schema lower-case names",
+            "The partitioned table is \"V112_crt_PQ\"."
+        ),
+        None
+    );
+    assert!(!refused.contains("FROM \"V112_crt_PQ\""), "{refused}");
+    Spi::run("ALTER TABLE \"V112_crt_PQ\" RENAME TO v112_crt_pq").expect("rename");
+    let steps = [
+        "INSERT INTO v112_crt_pq VALUES (10,'a',1),(11,'b',2)".to_string(),
+        "UPDATE v112_crt_pq SET v = v + 10".to_string(),
+        "UPDATE v112_crt_pq SET g = 'b' WHERE id = 1".to_string(),
+        "DELETE FROM v112_crt_pq_a".to_string(),
+    ];
+    let wrong = v112_cr_remedied_partitions("v112_crt_pq", &["a", "b"], false, &steps);
     assert!(wrong.is_empty(), "\n{}", wrong.join("\n"));
 }
