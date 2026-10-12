@@ -1,6 +1,7 @@
 // Definitions refused at create because nothing pg_reflex installs can keep them
-// equal to their query: two sources whose triggers would carry the same names, and
-// an expression pg_reflex writes back as text PostgreSQL reads differently. Every
+// equal to their query: a source that is a partition, two sources whose triggers
+// would carry the same names, and an expression pg_reflex writes back as text
+// PostgreSQL reads differently. Every
 // refusal leaves nothing behind, and the remedy its message gives is created over
 // real tables and compared with its query after every write.
 
@@ -71,6 +72,260 @@ fn v112_cr_maintained(imv: &str, query: &str, deferred: bool, steps: &[String]) 
         }
     }
     "ok".to_string()
+}
+
+// ---------------------------------------------------------------------------
+// A source that is a partition
+// ---------------------------------------------------------------------------
+
+fn v112_cr_partitioned_fixture(p: &str) {
+    Spi::run(&format!(
+        "CREATE TABLE {p}(id INT, g TEXT, v INT) PARTITION BY LIST (g); \
+         CREATE TABLE {p}_a PARTITION OF {p} FOR VALUES IN ('a'); \
+         CREATE TABLE {p}_b PARTITION OF {p} FOR VALUES IN ('b') PARTITION BY RANGE (id); \
+         CREATE TABLE {p}_b_lo PARTITION OF {p}_b FOR VALUES FROM (0) TO (100); \
+         CREATE TABLE {p}_b_hi PARTITION OF {p}_b FOR VALUES FROM (100) TO (200); \
+         CREATE TABLE {p}_rest PARTITION OF {p} DEFAULT; \
+         CREATE TABLE {p}_dim(id INT PRIMARY KEY, w INT); \
+         INSERT INTO {p} VALUES (1,'a',1),(2,'b',5),(102,'b',7),(3,'z',9),(4,'a',NULL); \
+         INSERT INTO {p}_dim VALUES (1,10),(2,20),(3,30),(102,40)"
+    ))
+    .expect("partitioned fixture");
+}
+
+fn v112_cr_partitioned_steps(p: &str) -> Vec<String> {
+    vec![
+        format!("INSERT INTO {p} VALUES (10,'a',1),(11,'b',2),(111,'b',3),(12,'q',4)"),
+        format!("INSERT INTO {p}_a VALUES (13,'a',5)"),
+        format!("INSERT INTO {p}_b_lo VALUES (14,'b',6)"),
+        format!("INSERT INTO {p}_b VALUES (114,'b',8)"),
+        format!("UPDATE {p} SET v = COALESCE(v, 0) + 10"),
+        format!("UPDATE {p}_a SET v = v + 1 WHERE id = 13"),
+        format!("UPDATE {p} SET g = 'b' WHERE id = 1"),
+        format!("UPDATE {p} SET g = 'a' WHERE id = 3"),
+        format!("UPDATE {p} SET id = id + 100 WHERE id = 2"),
+        format!("DELETE FROM {p} WHERE id IN (10, 111)"),
+        format!("DELETE FROM {p}_rest"),
+        format!("DELETE FROM {p}_a WHERE id = 13"),
+        format!("DELETE FROM {p}_b_hi"),
+    ]
+}
+
+/// A partition named anywhere in the definition, a leaf or a sub-partitioned branch,
+/// is refused in both modes by every create function, and nothing is created.
+#[pg_test]
+fn v112_cr_partition_source_is_refused() {
+    lock_shared_fixtures();
+    let p = "v112_crt_pr";
+    v112_cr_partitioned_fixture(p);
+    let definitions = [
+        ("agg", format!("SELECT COUNT(*) AS c, SUM(v) AS sv FROM {p}_a")),
+        ("rows", format!("SELECT id, v FROM {p}_a")),
+        ("qualified", format!("SELECT id, v FROM public.{p}_a")),
+        ("upper", format!("SELECT ID, V FROM {}_A", p.to_uppercase())),
+        ("quoted", format!("SELECT id, v FROM \"{p}_a\" AS x")),
+        ("join", format!("SELECT d.id, x.v FROM {p}_dim d JOIN {p}_a x ON x.id = d.id")),
+        ("cte", format!("WITH c AS (SELECT id, v FROM {p}_a) SELECT id, v FROM c")),
+        (
+            "second_cte",
+            format!(
+                "WITH d AS (SELECT id, w FROM {p}_dim), c AS (SELECT id, v FROM {p}_a) \
+                 SELECT d.id, c.v FROM d JOIN c ON c.id = d.id"
+            ),
+        ),
+        ("cte_of_its_name", format!("WITH {p}_a AS (SELECT id, v FROM {p}_a) SELECT id, v FROM {p}_a")),
+        ("derived", format!("SELECT q.id FROM (SELECT id FROM {p}_a) q")),
+        ("in_subquery", format!("SELECT id, w FROM {p}_dim WHERE id IN (SELECT id FROM {p}_a)")),
+        ("union", format!("SELECT id FROM {p}_dim UNION ALL SELECT id FROM {p}_a")),
+        ("group", format!("SELECT g, COUNT(*) AS c FROM {p}_a GROUP BY g")),
+        ("branch", format!("SELECT id, v FROM {p}_b")),
+        ("branch_agg", format!("SELECT COUNT(*) AS c FROM {p}_b")),
+        ("leaf_of_branch", format!("SELECT id, v FROM {p}_b_lo")),
+        ("default", format!("SELECT id, v FROM {p}_rest")),
+    ];
+    let mut wrong: Vec<String> = Vec::new();
+    for (tag, query) in &definitions {
+        for deferred in [false, true] {
+            let imv = format!("v112_cri_pr_{tag}_{}", if deferred { "d" } else { "i" });
+            let outcome = v112_cr_create(&imv, query, "", deferred);
+            if let Some(reason) = v112_cr_not_the_refusal(&outcome, &format!("is a partition of {p}")) {
+                wrong.push(format!("{imv}: {reason}"));
+            }
+        }
+    }
+    let query = &definitions[0].1;
+    for (tag, call) in [
+        ("two_arguments", "create_reflex_ivm('{imv}', $q${query}$q$)"),
+        (
+            "partition_by",
+            "create_reflex_ivm('{imv}', $q${query}$q$, NULL, 'UNLOGGED', 'IMMEDIATE', NULL, ARRAY[]::text[])",
+        ),
+        ("topk", "create_reflex_ivm('{imv}', $q${query}$q$, NULL, 'UNLOGGED', 'IMMEDIATE', 3)"),
+        (
+            "topk_partition_by",
+            "create_reflex_ivm('{imv}', $q${query}$q$, NULL, 'UNLOGGED', 'DEFERRED', 3, NULL, ARRAY[]::text[])",
+        ),
+        ("if_not_exists", "create_reflex_ivm_if_not_exists('{imv}', $q${query}$q$)"),
+        (
+            "if_not_exists_partition_by",
+            "create_reflex_ivm_if_not_exists('{imv}', $q${query}$q$, NULL, 'UNLOGGED', 'DEFERRED', NULL, ARRAY[]::text[])",
+        ),
+    ] {
+        let imv = format!("v112_cri_pr_{tag}");
+        let outcome = v112_j_try(&format!(
+            "SELECT {}",
+            call.replace("{imv}", &imv).replace("{query}", query)
+        ));
+        if let Some(reason) = v112_cr_not_the_refusal(&outcome, &format!("is a partition of {p}")) {
+            wrong.push(format!("{imv}: {reason}"));
+        }
+    }
+    if v112_cr_left_behind("v112_cri_pr_") != 0 {
+        wrong.push("a refused definition left a registry row or a relation".to_string());
+    }
+    for table in ["", "_a", "_b", "_b_lo", "_b_hi", "_rest", "_dim"] {
+        let triggers = v112_cr_user_triggers(&format!("{p}{table}"));
+        if triggers != 0 {
+            wrong.push(format!("{triggers} trigger(s) left on {p}{table}"));
+        }
+    }
+    assert!(wrong.is_empty(), "\n{}", wrong.join("\n"));
+}
+
+/// A CTE named like a partition is not that partition.
+#[pg_test]
+fn v112_cr_cte_named_like_a_partition_is_accepted() {
+    lock_shared_fixtures();
+    let p = "v112_crt_pc";
+    v112_cr_partitioned_fixture(p);
+    let query = format!("WITH {p}_a AS (SELECT id, w FROM {p}_dim) SELECT id, w FROM {p}_a");
+    assert_eq!(v112_cr_create("v112_cri_pc", &query, "", false), V112_CR_CREATED);
+    let steps = vec![
+        format!("INSERT INTO {p}_dim VALUES (50, 5)"),
+        format!("UPDATE {p}_dim SET w = w + 1"),
+        format!("DELETE FROM {p}_dim WHERE id = 1"),
+    ];
+    assert_eq!(v112_cr_maintained("v112_cri_pc", &query, false, &steps), "ok");
+}
+
+/// What goes wrong when each of `partitions` of `p` is refused as a source and the
+/// `FROM <partitioned table> WHERE <bound>` its refusal prints is created as written,
+/// as rows, as an aggregate and as groups, then compared after each of `steps` with
+/// its own query and with the same query over the partition.
+fn v112_cr_remedied_partitions(p: &str, partitions: &[&str], deferred: bool, steps: &[String]) -> Vec<String> {
+    let mut wrong: Vec<String> = Vec::new();
+    let mode = if deferred { "d" } else { "i" };
+    let mut remedied: Vec<(String, String, String)> = Vec::new();
+    for partition in partitions {
+        let refused = v112_cr_create(
+            &format!("v112_cri_{mode}_refused_{p}_{partition}"),
+            &format!("SELECT id, g, v FROM {p}_{partition}"),
+            "",
+            deferred,
+        );
+        let Some(remedy) = refused
+            .split("partition key: ")
+            .nth(1)
+            .and_then(|rest| rest.strip_suffix('.'))
+        else {
+            wrong.push(format!("{p}_{partition}: no remedy in: {refused}"));
+            continue;
+        };
+        if !remedy.starts_with(&format!("FROM {p} WHERE ")) {
+            wrong.push(format!("{p}_{partition}: the remedy does not read {p}: {remedy}"));
+        }
+        for (shape, select) in [
+            ("rows", "SELECT id, g, v"),
+            ("agg", "SELECT COUNT(*) AS c, SUM(v) AS sv"),
+            ("group", "SELECT g, COUNT(*) AS c, SUM(v) AS sv"),
+        ] {
+            let group_by = if shape == "group" { " GROUP BY g" } else { "" };
+            let imv = format!("v112_cri_{mode}_{p}_{partition}_{shape}");
+            let query = format!("{select} {remedy}{group_by}");
+            let created = v112_cr_create(&imv, &query, "", deferred);
+            if created != V112_CR_CREATED {
+                wrong.push(format!("{imv}: {created} [{query}]"));
+                continue;
+            }
+            remedied.push((imv, query, format!("{select} FROM {p}_{partition}{group_by}")));
+        }
+    }
+    if remedied.len() != 3 * partitions.len() {
+        return wrong;
+    }
+    let compare = |wrong: &mut Vec<String>, after: &str| {
+        for (imv, query, partition_query) in &remedied {
+            for (oracle, fresh) in [("its query", query), ("the partition", partition_query)] {
+                let compared = v112_j_oracle(imv, fresh);
+                if compared != "0" {
+                    wrong.push(format!("{imv} differs from {oracle} by {compared} after [{after}]"));
+                }
+            }
+        }
+    };
+    compare(&mut wrong, "create");
+    for dml in steps {
+        let ran = v112_j_try_dml(dml);
+        if ran != "OK" {
+            wrong.push(format!("{ran} [{dml}]"));
+            break;
+        }
+        if deferred {
+            let flushed = v112_j_try(&format!("SELECT reflex_flush_deferred('{p}')"));
+            if flushed.contains("RAISED") || flushed.contains("ERROR") {
+                wrong.push(format!("flush {flushed} [{dml}]"));
+                break;
+            }
+        }
+        compare(&mut wrong, dml);
+    }
+    wrong
+}
+
+/// The remedy of a LIST partition, of a sub-partitioned branch, of its RANGE leaves
+/// and of a DEFAULT partition is maintained through writes addressed to the
+/// partitioned table, to the partition and to its neighbours, rows changing partition.
+#[pg_test]
+fn v112_cr_partition_source_remedy_is_maintained() {
+    lock_shared_fixtures();
+    let mut wrong: Vec<String> = Vec::new();
+    for deferred in [false, true] {
+        let p = format!("v112_crt_pm{}", if deferred { "d" } else { "i" });
+        v112_cr_partitioned_fixture(&p);
+        wrong.extend(v112_cr_remedied_partitions(
+            &p,
+            &["a", "b", "b_lo", "b_hi", "rest"],
+            deferred,
+            &v112_cr_partitioned_steps(&p),
+        ));
+    }
+    assert!(wrong.is_empty(), "\n{}", wrong.join("\n"));
+}
+
+/// The same for the partitions of a HASH partitioned table.
+#[pg_test]
+fn v112_cr_hash_partition_source_remedy_is_maintained() {
+    lock_shared_fixtures();
+    let mut wrong: Vec<String> = Vec::new();
+    for deferred in [false, true] {
+        let p = format!("v112_crt_ph{}", if deferred { "d" } else { "i" });
+        Spi::run(&format!(
+            "CREATE TABLE {p}(id INT, g TEXT, v INT) PARTITION BY HASH (id); \
+             CREATE TABLE {p}_0 PARTITION OF {p} FOR VALUES WITH (MODULUS 2, REMAINDER 0); \
+             CREATE TABLE {p}_1 PARTITION OF {p} FOR VALUES WITH (MODULUS 2, REMAINDER 1); \
+             INSERT INTO {p} SELECT n, 'g' || (n % 3), n FROM generate_series(1, 12) AS n"
+        ))
+        .expect("hash fixture");
+        let steps = [
+            format!("INSERT INTO {p} SELECT n, 'g' || (n % 3), n FROM generate_series(20, 30) AS n"),
+            format!("UPDATE {p} SET v = v + 10 WHERE id % 3 = 0"),
+            format!("UPDATE {p} SET id = id + 1000 WHERE id < 6"),
+            format!("DELETE FROM {p} WHERE id % 4 = 0"),
+            format!("DELETE FROM {p}_1 WHERE v > 20"),
+        ];
+        wrong.extend(v112_cr_remedied_partitions(&p, &["0", "1"], deferred, &steps));
+    }
+    assert!(wrong.is_empty(), "\n{}", wrong.join("\n"));
 }
 
 // ---------------------------------------------------------------------------
