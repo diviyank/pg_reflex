@@ -2739,6 +2739,10 @@ pub(crate) fn create_reflex_ivm_impl_with_materialization(
     let folded_sql = parsed.folded_sql.take();
     let sql = folded_sql.as_deref().unwrap_or(sql);
 
+    if let Some(reason) = source_relations::source_relation_not_followed(&parsed.parsed_sql) {
+        return crate::reflex_reject(&reason);
+    }
+
     warn_on_bare_name_under_nonpublic_search_path(view_name);
 
     // Refuse an ignore whose source can determine this IMV's contents. Such
@@ -3197,6 +3201,7 @@ mod identifier_quotes;
 /// `crate::audit` rather than re-implementing the resolver.
 pub(crate) mod ignore_soundness;
 mod soundness;
+mod source_relations;
 mod source_row_shape;
 
 pub(crate) use admin::*;
