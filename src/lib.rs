@@ -31,6 +31,7 @@ unsafe extern "C" {}
 
 mod aggregation;
 mod audit;
+mod cascade;
 mod create_ivm;
 mod doctor;
 mod drop_ivm;
