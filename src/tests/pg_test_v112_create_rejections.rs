@@ -533,3 +533,156 @@ fn v112_cr_reprinted_expression_remedies_are_maintained() {
     }
     assert!(wrong.is_empty(), "\n{}", wrong.join("\n"));
 }
+
+// ---------------------------------------------------------------------------
+// Definitions around the refusals that stay accepted
+// ---------------------------------------------------------------------------
+
+/// `(query, unique key)`; `{kt}` is a public table, `{k1}` and `{k2}` two schemas
+/// holding a table `t`, `{k1}.t_x` and `{k1}_tx` two tables whose names differ by a
+/// `.` against a `_` without colliding, `{kp}` a partitioned table.
+const V112_CR_ACCEPTED: [(&str, &str); 68] = [
+    ("SELECT id, v FROM {kp} WHERE g = 'a'", ""),
+    ("SELECT id, g, v FROM {kp} WHERE g IS NOT NULL AND g = 'a'", ""),
+    ("SELECT g, COUNT(*) AS c, SUM(v) AS sv FROM {kp} WHERE g IN ('a', 'b') GROUP BY g", ""),
+    ("SELECT COUNT(*) AS c, SUM(v) AS sv FROM {kp} WHERE ((g IS NOT NULL) AND (g = 'a'::text))", ""),
+    ("SELECT id, g, v FROM {kp}", ""),
+    ("SELECT g, MAX(v) AS mx, COUNT(*) AS c FROM {kp} GROUP BY g", ""),
+    ("SELECT {kp}.id, {kt}.v FROM {kp} JOIN {kt} ON {kt}.id = {kp}.id WHERE {kp}.g = 'a'", ""),
+    ("SELECT COUNT(*) AS c FROM {kp} WHERE NOT (g IS NOT NULL AND g IN ('a', 'b'))", ""),
+    ("SELECT id, v FROM {k1}.t", ""),
+    ("SELECT id, v FROM {k2}.t", ""),
+    ("SELECT a.id, b.v FROM {k1}.t a JOIN {k2}.t b ON b.id = a.id", "id"),
+    ("SELECT g, SUM(v) AS sv, COUNT(*) AS c FROM {k1}.t GROUP BY g", ""),
+    ("SELECT g, SUM(v) AS sv, COUNT(*) AS c FROM {k2}.t GROUP BY g", ""),
+    ("SELECT id, v FROM {k1}.t_x", ""),
+    ("SELECT id, v FROM {k1}_tx", ""),
+    ("SELECT a.id, b.v FROM {k1}.t_x a JOIN {k1}_tx b ON b.id = a.id", "id"),
+    ("SELECT id, v FROM {kt}", ""),
+    ("SELECT id, v FROM public.{kt}", ""),
+    ("SELECT ID, V FROM {KT}", ""),
+    ("WITH c AS (SELECT id, v FROM {k1}.t) SELECT id, v FROM c", ""),
+    ("SELECT id, -v AS x FROM {kt}", ""),
+    ("SELECT id, v FROM {kt} WHERE -v < 2", ""),
+    ("SELECT g, SUM(-v) AS s, COUNT(*) AS c FROM {kt} GROUP BY g", ""),
+    ("SELECT -v AS x, COUNT(*) AS c FROM {kt} GROUP BY -v", ""),
+    ("SELECT id, - v AS x FROM {kt} WHERE - v < 2", ""),
+    ("SELECT g, COUNT(*) AS c FROM {kt} GROUP BY g HAVING SUM(-v) < 5", ""),
+    ("SELECT id, +v AS x FROM {kt} WHERE +v > 0", ""),
+    ("SELECT id, v FROM {kt} WHERE -(v + 1) < 0", ""),
+    ("SELECT g, SUM(-(v)) AS s, COUNT(*) AS c FROM {kt} GROUP BY g", ""),
+    ("SELECT g, SUM(-(-v)) AS s, COUNT(*) AS c FROM {kt} GROUP BY g", ""),
+    ("SELECT g, SUM(- (- v)) AS s, COUNT(*) AS c FROM {kt} WHERE - (- v) > -100 GROUP BY g", ""),
+    ("SELECT id, v FROM {kt} WHERE ABS(-v) > 1", ""),
+    ("SELECT id, v FROM {kt} WHERE v > -1", ""),
+    ("SELECT id, v FROM {kt} WHERE v IN (-4, -9, 3)", ""),
+    ("SELECT id, v FROM {kt} WHERE v BETWEEN -5 AND -1", ""),
+    ("SELECT g, SUM(COALESCE(v, -1)) AS s, COUNT(*) AS c FROM {kt} GROUP BY g", ""),
+    ("SELECT g, SUM(v * -1) AS s, COUNT(*) AS c FROM {kt} GROUP BY g", ""),
+    ("SELECT g, SUM(-1 * v) AS s, COUNT(*) AS c FROM {kt} WHERE -1 < v GROUP BY g", ""),
+    ("SELECT g, COUNT(*) FILTER (WHERE v < -1) AS c FROM {kt} GROUP BY g", ""),
+    ("SELECT g, SUM(CASE WHEN v < -1 THEN -1 ELSE 1 END) AS s, COUNT(*) AS c FROM {kt} GROUP BY g", ""),
+    ("SELECT id, v FROM {kt} WHERE v % -2 = 0", ""),
+    ("SELECT id, v - -1 AS x FROM {kt}", ""),
+    ("SELECT id, v FROM {kt} WHERE v - -1 > 0", ""),
+    ("SELECT g, SUM(v - -1) AS s, COUNT(*) AS c FROM {kt} GROUP BY g", ""),
+    ("SELECT v - -1 AS x, COUNT(*) AS c FROM {kt} GROUP BY v - -1", ""),
+    ("SELECT g, COUNT(*) AS c FROM {kt} WHERE v + -1 < 10 AND v - - 1 > -10 GROUP BY g", ""),
+    ("SELECT g, SUM(v) AS s, COUNT(*) AS c FROM {kt} WHERE 1 - -v > -100 GROUP BY g", ""),
+    ("SELECT id, v FROM {kt} WHERE v > 1.5", ""),
+    ("SELECT g, SUM(v * 0.25) AS s, COUNT(*) AS c FROM {kt} GROUP BY g", ""),
+    ("SELECT id, v FROM {kt} WHERE v < 1e2", ""),
+    ("SELECT g, SUM(v * 1.5e-3) AS s, COUNT(*) AS c FROM {kt} GROUP BY g", ""),
+    ("SELECT id, v FROM {kt} WHERE v > .5", ""),
+    ("SELECT id, v FROM {kt} WHERE v > -2.5e0", ""),
+    ("SELECT g, COUNT(*) AS c FROM {kt} WHERE v <> 1000000 GROUP BY g", ""),
+    ("SELECT id, v + 31 AS x FROM {kt} WHERE 31 > v", ""),
+    ("SELECT id, s FROM {kt} WHERE s <> '--x'", ""),
+    ("SELECT id, s FROM {kt} WHERE s = '0x1F' OR s LIKE '%--%'", ""),
+    ("SELECT g, COUNT(*) FILTER (WHERE s LIKE '%--%') AS c FROM {kt} GROUP BY g", ""),
+    ("SELECT s || '--' AS x, COUNT(*) AS c FROM {kt} GROUP BY s || '--'", ""),
+    ("SELECT g, MAX(s || ' 0x1F -- ') AS m, COUNT(*) AS c FROM {kt} GROUP BY g", ""),
+    ("SELECT id, s FROM {kt} WHERE s IS DISTINCT FROM '- -v'", ""),
+    ("SELECT g, COUNT(*) AS c FROM {kt} WHERE s IS DISTINCT FROM (X'1F')::text GROUP BY g", ""),
+    ("SELECT id, v /* 0x1F - -v */ FROM {kt} -- trailing 0x1F\n WHERE v > 0", ""),
+    ("SELECT g, /* - -v */ COUNT(*) AS c FROM {kt} -- - -v\n GROUP BY g", ""),
+    ("SELECT g, SUM(v) AS s, COUNT(*) AS c FROM {kt} WHERE v > -1 -- 0x1F\n GROUP BY g", ""),
+    ("SELECT id, v -- note\n FROM {kt} WHERE s <> '/* -- */'", ""),
+    ("SELECT id, - -v AS x, @ -v AS y FROM {kt}", ""),
+    ("SELECT a.id, - -b.v AS x FROM {kt} a JOIN {k1}.t b ON b.id = a.id AND - -b.v > -100", "id"),
+];
+
+/// Every definition of the list is created and equals its query after writes to
+/// every table.
+#[pg_test]
+fn v112_cr_definitions_around_the_refusals_stay_accepted() {
+    lock_shared_fixtures();
+    let (kt, k1, k2, kp) = ("v112_crt_kt", "v112_crt_k1", "v112_crt_k2", "v112_crt_kp");
+    Spi::run(&format!("CREATE SCHEMA {k1}; CREATE SCHEMA {k2}")).expect("schemas");
+    let tables = [
+        kt.to_string(),
+        format!("{k1}.t"),
+        format!("{k2}.t"),
+        format!("{k1}.t_x"),
+        format!("{k1}_tx"),
+    ];
+    for table in &tables {
+        Spi::run(&format!("CREATE TABLE {table}(id INT PRIMARY KEY, g TEXT, v INT, s TEXT)")).expect("table");
+    }
+    Spi::run(&format!(
+        "CREATE TABLE {kp}(id INT, g TEXT, v INT, s TEXT) PARTITION BY LIST (g); \
+         CREATE TABLE {kp}_a PARTITION OF {kp} FOR VALUES IN ('a'); \
+         CREATE TABLE {kp}_b PARTITION OF {kp} FOR VALUES IN ('b'); \
+         CREATE TABLE {kp}_rest PARTITION OF {kp} DEFAULT"
+    ))
+    .expect("partitioned table");
+    let every_table: Vec<String> = tables.iter().cloned().chain([kp.to_string()]).collect();
+    for table in &every_table {
+        Spi::run(&format!(
+            "INSERT INTO {table} VALUES (1,'a',3,'x--y'),(2,'b',-4,'0x1F'),(3,'a',NULL,NULL),(4,NULL,0,'--'),(5,'b',7,'plain')"
+        ))
+        .expect("seed");
+    }
+    let mut wrong: Vec<String> = Vec::new();
+    let mut created: Vec<(String, String)> = Vec::new();
+    for (position, (query, key)) in V112_CR_ACCEPTED.iter().enumerate() {
+        let query = query
+            .replace("{kt}", kt)
+            .replace("{KT}", &kt.to_uppercase())
+            .replace("{k1}", k1)
+            .replace("{k2}", k2)
+            .replace("{kp}", kp);
+        let imv = format!("v112_cri_k{position}");
+        let outcome = v112_cr_create(&imv, &query, key, false);
+        if outcome != V112_CR_CREATED {
+            wrong.push(format!("{position} [{query}]: {outcome}"));
+            continue;
+        }
+        created.push((imv, query));
+    }
+    let compare = |wrong: &mut Vec<String>, after: &str| {
+        for (imv, query) in &created {
+            let compared = v112_j_oracle(imv, query);
+            if compared != "0" {
+                wrong.push(format!("{imv} [{query}] differs by {compared} after [{after}]"));
+            }
+        }
+    };
+    compare(&mut wrong, "create");
+    for table in &every_table {
+        for dml in [
+            format!("INSERT INTO {table} VALUES (10,'a',-9,'--'),(11,'c',12,'0xFF'),(12,NULL,NULL,NULL)"),
+            format!("UPDATE {table} SET v = -v WHERE id IN (1, 2, 10)"),
+            format!("UPDATE {table} SET g = 'b', s = s || '--' WHERE id = 1"),
+            format!("DELETE FROM {table} WHERE id IN (2, 11)"),
+        ] {
+            let ran = v112_j_try_dml(&dml);
+            if ran != "OK" {
+                wrong.push(format!("{ran} [{dml}]"));
+                continue;
+            }
+            compare(&mut wrong, &dml);
+        }
+    }
+    assert!(wrong.is_empty(), "\n{}", wrong.join("\n"));
+}
