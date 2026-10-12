@@ -342,18 +342,17 @@ fn partition_at_depth(
         .unwrap_or(qualified)
 }
 
-/// The scope `rebuilt` gives `dependent`; `None` when no row of the rebuilt IMV
-/// changed, so nothing of the dependent can have.
+/// The scope `rebuilt` gives `dependent`.
 fn scope_of(
     client: &pgrx::spi::SpiClient<'_>,
     dependent: &Dependent,
     rebuilt: &RebuiltRows<'_>,
-) -> Option<RefreshScope> {
+) -> RefreshScope {
     let Some(column) = rebuilt.partition_columns.first() else {
-        return Some(RefreshScope::Whole(format!(
+        return RefreshScope::Whole(format!(
             "'{}' names no column its refreshed rows share",
             rebuilt.view_name
-        )));
+        ));
     };
     let aligned_on = |level: usize| match (
         dependent.partition_columns.get(level),
@@ -392,7 +391,7 @@ fn scope_of(
         aligned_on(0)
     };
     if let Some(reason) = unproven {
-        return Some(RefreshScope::Whole(reason));
+        return RefreshScope::Whole(reason);
     }
 
     if !groups_by_it
@@ -414,25 +413,29 @@ fn scope_of(
                 }
             })
             .collect();
-        return Some(if source_partitions.iter().all(|p| !p.contains(',')) {
+        return if source_partitions.iter().all(|p| !p.contains(',')) {
             RefreshScope::Partitions {
                 source_partitions,
                 keys: BTreeSet::new(),
             }
         } else {
             RefreshScope::Whole("a rebuilt partition's name holds a comma".to_string())
-        });
+        };
     }
 
     let keys = match &rebuilt.keys {
         Ok(keys) => keys,
-        Err(reason) => return Some(RefreshScope::Whole(reason.clone())),
+        Err(reason) => return RefreshScope::Whole(reason.clone()),
     };
     if keys.is_empty() {
-        return None;
+        return RefreshScope::Whole(
+            "its rebuilt partitions held no row before or after the rebuild, so no key names the \
+             rows it may have behind"
+                .to_string(),
+        );
     }
     let keys: BTreeSet<String> = keys.iter().cloned().collect();
-    Some(if groups_by_it {
+    if groups_by_it {
         RefreshScope::Groups {
             column: column.clone(),
             keys,
@@ -444,7 +447,7 @@ fn scope_of(
         }
     } else {
         RefreshScope::Whole("a partition key holds a comma or edge whitespace".to_string())
-    })
+    }
 }
 
 /// Queues the refresh of each enabled IMV of `dependents` after `rebuilt`.
@@ -457,9 +460,8 @@ pub(crate) fn queue_dependents(
         let Some(dependent) = read_dependent(client, name) else {
             continue;
         };
-        if let Some(scope) = scope_of(client, &dependent, rebuilt) {
-            queue_refresh(name, dependent.graph_depth, scope, rebuilt.view_name);
-        }
+        let scope = scope_of(client, &dependent, rebuilt);
+        queue_refresh(name, dependent.graph_depth, scope, rebuilt.view_name);
     }
 }
 
@@ -773,8 +775,10 @@ fn top_level_relations(select: &Select) -> Option<Vec<JoinedRelation<'_>>> {
 ///   equates with `source`'s, and no join can produce a row without that
 ///   relation's row;
 /// * the output column is `COALESCE` over the two columns, one per side and
-///   one of them `source`'s, that the query's FULL JOIN equates, when that join
-///   is its first and every later one is a LEFT JOIN.
+///   one of them `source`'s, that the ON of the query's first join equates
+///   (INNER, LEFT or FULL), when every later join is a LEFT JOIN: a row with
+///   both sides carries their common value, a row with one side carries that
+///   side's, and a `source` row of one value only matches rows of that value.
 ///
 /// A window function, DISTINCT ON or set operation makes a row depend on rows
 /// of other partitions and is refused.
@@ -812,11 +816,10 @@ pub(crate) fn unproven_partition_alignment(
     let Some(relations) = top_level_relations(select) else {
         return Some("its FROM clause is not a plain list of joined tables".to_string());
     };
-    let read_at_top_level: Vec<&JoinedRelation<'_>> = relations
+    let Some(source_relation) = relations
         .iter()
-        .filter(|relation| relation.table == source_table)
-        .collect();
-    let [source_relation] = read_at_top_level.as_slice() else {
+        .find(|relation| relation.table == source_table)
+    else {
         return Some(format!("'{source}' is not one of its top-level relations"));
     };
     if relations.iter().any(|relation| {
@@ -874,17 +877,18 @@ pub(crate) fn unproven_partition_alignment(
         let [first, second] = coalesced.as_slice() else {
             return not_from_source();
         };
-        let full_join_then_left_joins = relations.get(1).is_some_and(|r| r.kind == JoinKind::Full)
-            && relations[2..].iter().all(|r| r.kind == JoinKind::Left);
-        let equated_by_the_full_join = relations.get(1).is_some_and(|full_join| {
-            full_join.condition.is_some_and(|condition| {
+        let later_joins_are_left = relations
+            .get(2..)
+            .is_some_and(|later| later.iter().all(|r| r.kind == JoinKind::Left));
+        let equated_by_the_first_join = relations.get(1).is_some_and(|first_join| {
+            first_join.condition.is_some_and(|condition| {
                 equated_columns(condition)
                     .iter()
                     .any(|(a, b)| (a == first && b == second) || (a == second && b == first))
             })
         });
-        let proven = full_join_then_left_joins
-            && equated_by_the_full_join
+        let proven = later_joins_are_left
+            && equated_by_the_first_join
             && first.0 != second.0
             && (from_source(first) || from_source(second));
         return if proven { None } else { not_from_source() };

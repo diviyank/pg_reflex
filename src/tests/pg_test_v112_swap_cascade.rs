@@ -952,6 +952,18 @@ fn v112_sc_scope_is_proven_only_for_aligned_queries() {
             &["\"v__cte_bounds\"", "one", "cur"][..],
             "v__cte_bounds",
         ),
+        (
+            "SELECT COALESCE(f.plan, hs.plan) AS plan, f.x FROM src AS f \
+               JOIN other AS hs ON f.plan = hs.plan",
+            &["src", "other"][..],
+            "src",
+        ),
+        (
+            "SELECT COALESCE(t.plan, s.plan) AS plan, t.x FROM other AS t \
+               LEFT JOIN src AS s ON s.plan = t.plan",
+            &["other", "src"][..],
+            "src",
+        ),
     ] {
         assert_eq!(unproven(sql, reads, source), None, "{sql}");
     }
@@ -1223,6 +1235,14 @@ const SX_IMVS: &[SxImv] = &[
         ignore: "!yv",
         partition_by: &["plan"],
     },
+    // Partitioned first by a column of another source, of the same type as plan.
+    SxImv {
+        name: "yr_region",
+        sql: "SELECT v.plan, x.region, v.k, v.q FROM {yv} AS v JOIN x_t AS x ON x.k = v.k",
+        keys: "plan, k, region",
+        ignore: "!yv",
+        partition_by: &["region"],
+    },
     // Its plan is the joined table's; the equality with the view's plan sits in
     // the ON of an outer join of a third table and constrains nothing.
     SxImv {
@@ -1355,6 +1375,22 @@ const SX_IMVS: &[SxImv] = &[
         partition_by: &["plan"],
     },
     SxImv { name: "m_two_paths", sql: SX_TWO_PATHS, keys: "plan, k, d", ignore: "!mv,!m_map", partition_by: &["plan"] },
+    // Mirrors the view's months and reads a per-plan total of it: a changed month
+    // changes the total, so every month of that plan.
+    SxImv {
+        name: "zz_tot",
+        sql: "SELECT plan, SUM(q) AS sq FROM {mv} AS mv GROUP BY plan",
+        keys: "plan",
+        ignore: "!mv",
+        partition_by: &["plan"],
+    },
+    SxImv {
+        name: "m_with_total",
+        sql: "SELECT v.plan, v.d, v.k, v.q, t.sq FROM {mv} AS v JOIN {zz_tot} AS t ON t.plan = v.plan",
+        keys: "plan, k, d",
+        ignore: "!mv,!zz_tot",
+        partition_by: &["plan", "d"],
+    },
 ];
 
 fn sx_query(imv: &SxImv, inline: bool) -> String {
@@ -1549,12 +1585,20 @@ struct SxStep {
     refreshed: &'static [(&'static str, &'static str)],
     /// A text one of the step's NOTICEs must hold.
     notice: Option<&'static str>,
+    /// Nodes an IMMEDIATE chain refreshes exactly once, of any kind.
+    once_when_immediate: &'static [&'static str],
 }
 
 fn sx_steps() -> Vec<SxStep> {
     let gs_m01 = "FOR VALUES FROM ('2027-01-01') TO ('2027-02-01')";
     let gs_m02 = "FOR VALUES FROM ('2027-02-01') TO ('2027-03-01')";
-    let step = |label, statements: String| SxStep { label, statements, refreshed: &[], notice: None };
+    let step = |label, statements: String| SxStep {
+        label,
+        statements,
+        refreshed: &[],
+        notice: None,
+        once_when_immediate: &[],
+    };
     vec![
         SxStep {
             refreshed: &[
@@ -1586,7 +1630,12 @@ fn sx_steps() -> Vec<SxStep> {
             ),
         ),
         SxStep {
-            refreshed: &[("yd", "partitions"), ("yd_obs", "partitions"), ("yp", "partitions")],
+            refreshed: &[
+                ("yd", "partitions"),
+                ("yd_obs", "partitions"),
+                ("yp", "partitions"),
+                ("yr_region", "full"),
+            ],
             ..step(
                 "listed leaf changed",
                 sx_swap("ys", "ys_p1", "FOR VALUES IN (1)", "SELECT plan, k, q + 50 FROM ys_p1"),
@@ -1702,7 +1751,10 @@ fn sx_steps() -> Vec<SxStep> {
                 ("m_above_mean", "full"),
                 ("m_map", "full"),
                 ("m_rename", "full"),
+                ("zz_tot", "partitions"),
+                ("m_with_total", "partitions"),
             ],
+            once_when_immediate: &["m_two_paths"],
             ..step("one month changed", sx_swap_month(1, 1, &sx_ms_rows(1, 1, 0, 7)))
         },
         step(
@@ -1765,6 +1817,14 @@ fn sx_assert_shapes_stay_correct(dbname: &str, mode: &str) {
                 .collect();
             if kinds != [*kind] {
                 failures.push(format!("{label}: {node} refreshed {kinds:?}, not once by {kind}"));
+            }
+        }
+        if mode == "IMMEDIATE" {
+            for node in step.once_when_immediate {
+                let times = refreshes.iter().filter(|(refreshed, _)| refreshed == node).count();
+                if times != 1 {
+                    failures.push(format!("{label}: {node} refreshed {times} times, not once"));
+                }
             }
         }
         if let Some(expected) = step.notice {
