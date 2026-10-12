@@ -165,6 +165,16 @@ fn validate_and_parse_inputs(
             return Err(crate::reflex_reject(&format!("Failed to parse SQL: {}", e)));
         }
     };
+    let reprinted = |run_as_written| {
+        reprinted_expressions::first_expression_reprinted_differently(
+            &parsed_sql,
+            sql,
+            run_as_written,
+        )
+    };
+    let reprinted_anywhere = reprinted(reprinted_expressions::RunAsWritten::Nothing);
+    let reprinted_in_a_rewritten_clause =
+        reprinted(reprinted_expressions::RunAsWritten::SelectListAndFrom);
     let (parsed_sql, folded_sql) = match with_one_spelling_per_name(sql, parsed_sql) {
         Ok(folded) => folded,
         Err(reason) => return Err(crate::reflex_reject(&reason)),
@@ -191,6 +201,14 @@ fn validate_and_parse_inputs(
                      in a column of the source table (for an immutable function, a generated \
                      column) and select that column."
                 )));
+            }
+            let reprinted = if select_list_and_from_run_as_written(&a) {
+                reprinted_in_a_rewritten_clause
+            } else {
+                reprinted_anywhere
+            };
+            if let Some(reason) = reprinted {
+                return Err(crate::reflex_reject(&reason));
             }
             if let Some(message) = timezone_sensitivity_warning(view_name, &a) {
                 warning!("{message}");
@@ -940,6 +958,17 @@ fn group_keys_sharing_a_column_name(
 fn is_single_level_passthrough(analysis: &crate::sql_analyzer::SqlAnalysis) -> bool {
     analysis.set_operation.is_none()
         && !analysis.has_nested_query
+        && !analysis.has_distinct_on
+        && !analysis.has_window_function
+        && analysis.having_clause.is_none()
+        && plan_aggregation(analysis).is_passthrough
+}
+
+/// One SELECT the pipeline neither decomposes nor aggregates: its stored query, which
+/// every write runs, is the caller's text, and only its other clauses are written
+/// back from the parsed query.
+fn select_list_and_from_run_as_written(analysis: &crate::sql_analyzer::SqlAnalysis) -> bool {
+    analysis.ctes.is_empty()
         && !analysis.has_distinct_on
         && !analysis.has_window_function
         && analysis.having_clause.is_none()
@@ -3200,6 +3229,7 @@ mod identifier_quotes;
 /// `ignore-soundness` audit check calls `unsound_ignored_sources` from
 /// `crate::audit` rather than re-implementing the resolver.
 pub(crate) mod ignore_soundness;
+mod reprinted_expressions;
 mod soundness;
 mod source_relations;
 mod source_row_shape;

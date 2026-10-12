@@ -1,7 +1,8 @@
 // Definitions refused at create because nothing pg_reflex installs can keep them
-// equal to their query: two sources whose triggers would carry the same names.
-// Every refusal leaves nothing behind, and the remedy its message gives is created
-// over real tables and compared with its query after every write.
+// equal to their query: two sources whose triggers would carry the same names, and
+// an expression pg_reflex writes back as text PostgreSQL reads differently. Every
+// refusal leaves nothing behind, and the remedy its message gives is created over
+// real tables and compared with its query after every write.
 
 const V112_CR_CREATED: &str = "CREATE REFLEX INCREMENTAL VIEW";
 
@@ -312,6 +313,221 @@ fn v112_cr_one_relation_under_several_spellings_is_accepted() {
                 if compared != "0" {
                     wrong.push(format!("{tag} differs by {compared} after [{dml}]"));
                 }
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "\n{}", wrong.join("\n"));
+}
+
+// ---------------------------------------------------------------------------
+// Expressions pg_reflex writes back as text PostgreSQL reads differently
+// ---------------------------------------------------------------------------
+
+fn v112_cr_expression_query(position: &str, t: &str, e: &str) -> (String, &'static str) {
+    match position {
+        "pt_select" => (format!("SELECT id, {e} AS x FROM {t}"), ""),
+        "pt_join_on" => (
+            format!("SELECT {t}.id, {t}_d.w FROM {t} JOIN {t}_d ON {t}_d.id = {t}.id AND {e} > 1"),
+            "id",
+        ),
+        "derived_select" => (format!("SELECT q.id, q.x FROM (SELECT id, {e} AS x FROM {t}) q"), ""),
+        "pt_where" => (format!("SELECT id, v FROM {t} WHERE {e} > 1"), ""),
+        "where_subquery" => (
+            format!("SELECT id, v FROM {t} WHERE id IN (SELECT id FROM {t}_d WHERE {e} > 1)"),
+            "",
+        ),
+        "agg_group_key" => (format!("SELECT {e} AS x, COUNT(*) AS c FROM {t} GROUP BY {e}"), ""),
+        "agg_arg" => (format!("SELECT b, SUM({e}) AS s, COUNT(*) AS c FROM {t} GROUP BY b"), ""),
+        "agg_where" => (format!("SELECT b, COUNT(*) AS c FROM {t} WHERE {e} > 1 GROUP BY b"), ""),
+        "agg_having" => (format!("SELECT b, COUNT(*) AS c FROM {t} GROUP BY b HAVING SUM({e}) > 1"), ""),
+        "agg_filter" => (format!("SELECT b, COUNT(*) FILTER (WHERE {e} > 1) AS c FROM {t} GROUP BY b"), ""),
+        "agg_case" => (
+            format!("SELECT b, SUM(CASE WHEN {e} > 1 THEN 1 ELSE 0 END) AS s FROM {t} GROUP BY b"),
+            "",
+        ),
+        "agg_join_on" => (
+            format!(
+                "SELECT {t}.b, COUNT(*) AS c FROM {t} JOIN {t}_d ON {t}_d.id = {t}.id AND {e} > 1 GROUP BY {t}.b"
+            ),
+            "",
+        ),
+        "agg_order_by" => (format!("SELECT b, SUM(v ORDER BY {e}) AS s, COUNT(*) AS c FROM {t} GROUP BY b"), ""),
+        "cte_select" => (format!("WITH c AS (SELECT id, {e} AS x FROM {t}) SELECT id, x FROM c"), ""),
+        "cte_outer_select" => (format!("WITH c AS (SELECT id, v FROM {t}) SELECT id, {e} AS x FROM c"), ""),
+        "union_select" => (format!("SELECT id, {e} AS x FROM {t} UNION ALL SELECT id, u FROM {t}"), ""),
+        "distinct" => (format!("SELECT DISTINCT {e} AS x FROM {t}"), ""),
+        "distinct_on_item" => (format!("SELECT DISTINCT ON (b) b, id, {e} AS x FROM {t} ORDER BY b, id"), ""),
+        "window_item" => (
+            format!("SELECT id, b, v, {e} AS x, SUM(v) OVER (PARTITION BY b) AS w FROM {t}"),
+            "",
+        ),
+        "window_where" => (
+            format!("SELECT id, b, v, SUM(v) OVER (PARTITION BY b) AS w FROM {t} WHERE {e} > 1"),
+            "",
+        ),
+        other => panic!("unknown position {other}"),
+    }
+}
+
+/// The select list and the FROM clause of a plain SELECT, which PostgreSQL runs as
+/// the caller wrote them.
+const V112_CR_RUN_AS_WRITTEN: [&str; 3] = ["pt_select", "pt_join_on", "derived_select"];
+
+/// The clauses pg_reflex writes back from the parsed query.
+const V112_CR_REWRITTEN: [&str; 17] = [
+    "pt_where",
+    "where_subquery",
+    "agg_group_key",
+    "agg_arg",
+    "agg_where",
+    "agg_having",
+    "agg_filter",
+    "agg_case",
+    "agg_join_on",
+    "agg_order_by",
+    "cte_select",
+    "cte_outer_select",
+    "union_select",
+    "distinct",
+    "distinct_on_item",
+    "window_item",
+    "window_where",
+];
+
+fn v112_cr_expression_cell(tag: &str, position: &str, e: &str, deferred: bool) -> String {
+    let mode = if deferred { "d" } else { "i" };
+    let table = format!("v112_crt_e{mode}_{tag}_{position}");
+    v112_sr_value_table(&table);
+    Spi::run(&format!(
+        "CREATE TABLE {table}_d(id INT PRIMARY KEY, w INT); \
+         INSERT INTO {table}_d VALUES (1,1),(2,2),(3,3),(4,4),(10,10),(21,21)"
+    ))
+    .expect("second table");
+    let expression = if position == "where_subquery" {
+        e.replace('v', "w")
+    } else {
+        e.to_string()
+    };
+    let (query, key) = v112_cr_expression_query(position, &table, &expression);
+    let imv = format!("v112_cri_e{mode}_{tag}_{position}");
+    let created = v112_cr_create(&imv, &query, key, deferred);
+    if created != V112_CR_CREATED {
+        let left = v112_cr_left_behind(&imv);
+        let triggers = v112_cr_user_triggers(&table) + v112_cr_user_triggers(&format!("{table}_d"));
+        return format!("NOT-CREATED left={left} triggers={triggers} {created}");
+    }
+    let mut steps = v112_sr_value_steps(&table);
+    steps.push(format!("UPDATE {table}_d SET w = w + 30 WHERE id IN (2, 10)"));
+    steps.push(format!("DELETE FROM {table}_d WHERE id = 1"));
+    v112_cr_maintained(&imv, &query, deferred, &steps)
+}
+
+/// `None` when the cell is refused with a message naming `problem` and nothing is
+/// created; what happened otherwise.
+fn v112_cr_not_refused(tag: &str, position: &str, e: &str, problem: &str, deferred: bool) -> Option<String> {
+    let problem = if position == "where_subquery" {
+        problem.replace('v', "w")
+    } else {
+        problem.to_string()
+    };
+    let outcome = v112_cr_expression_cell(tag, position, e, deferred);
+    let refused = outcome
+        .strip_prefix("NOT-CREATED left=0 triggers=0 ")
+        .is_some_and(|message| v112_cr_not_the_refusal(message, &problem).is_none());
+    (!refused).then(|| format!("{tag} {position} deferred={deferred}: {outcome}"))
+}
+
+/// `(tag, expression, what the refusal names, minimum server version)`.
+const V112_CR_REPRINTED_DIFFERENTLY: [(&str, &str, &str, i32); 7] = [
+    ("mm", "- -v", "'- -v' back as '--v'", 0),
+    ("mm_literal", "- -1 + v", "'- -1' back as '--1'", 0),
+    ("abs_minus", "@ -v", "'@ -v' back as '@-v'", 0),
+    ("not_minus", "~ -v", "'~ -v' back as '~-v'", 0),
+    ("minus_abs", "- @v", "'- @v' back as '-@v'", 0),
+    ("minus_not", "- ~v", "'- ~v' back as '-~v'", 0),
+    ("hex", "0x1F + v", "0x1F back as the bit string X'1F'", 160000),
+];
+
+/// A doubled minus, a prefix operator directly before another, and a hexadecimal
+/// integer are refused in every clause pg_reflex writes back, and nothing is created.
+#[pg_test]
+fn v112_cr_reprinted_expressions_are_refused() {
+    lock_shared_fixtures();
+    let version = v112_sr_server_version();
+    let mut wrong: Vec<String> = Vec::new();
+    for (tag, e, problem, minimum_version) in V112_CR_REPRINTED_DIFFERENTLY {
+        if version < minimum_version {
+            continue;
+        }
+        for position in V112_CR_REWRITTEN {
+            wrong.extend(v112_cr_not_refused(tag, position, e, problem, false));
+        }
+    }
+    for (tag, e, problem) in [("mm", "- -v", "'- -v' back as '--v'"), ("abs_minus", "@ -v", "'@ -v' back as '@-v'")] {
+        for position in ["pt_where", "agg_group_key", "cte_select"] {
+            wrong.extend(v112_cr_not_refused(tag, position, e, problem, true));
+        }
+    }
+    assert!(wrong.is_empty(), "\n{}", wrong.join("\n"));
+}
+
+/// The same expressions in the select list and the FROM clause of a plain SELECT,
+/// which PostgreSQL runs as written, are created and maintained in both modes.
+#[pg_test]
+fn v112_cr_reprinted_expressions_run_as_written_are_accepted() {
+    lock_shared_fixtures();
+    let version = v112_sr_server_version();
+    let mut wrong: Vec<String> = Vec::new();
+    for (tag, e, _, minimum_version) in V112_CR_REPRINTED_DIFFERENTLY {
+        if version < minimum_version {
+            continue;
+        }
+        for position in V112_CR_RUN_AS_WRITTEN {
+            for deferred in [false, true] {
+                // No DEFERRED passthrough over a derived table is flushed, whatever
+                // its select list holds.
+                if deferred && position == "derived_select" {
+                    continue;
+                }
+                let outcome = v112_cr_expression_cell(tag, position, e, deferred);
+                if outcome != "ok" {
+                    wrong.push(format!("{tag} {position} deferred={deferred}: {outcome}"));
+                }
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "\n{}", wrong.join("\n"));
+}
+
+/// The rewrites the refusals ask for, and the neighbouring expressions that are not
+/// refused, are maintained in every clause.
+#[pg_test]
+fn v112_cr_reprinted_expression_remedies_are_maintained() {
+    lock_shared_fixtures();
+    let version = v112_sr_server_version();
+    let mut wrong: Vec<String> = Vec::new();
+    for (tag, e, minimum_version) in [
+        ("minus", "-v", 0),
+        ("mm_paren", "-(-v)", 0),
+        ("mm_literal_paren", "-(-1) + v", 0),
+        ("abs_paren", "@(-v)", 0),
+        ("not_paren", "~(-v)", 0),
+        ("minus_abs_paren", "-(@v)", 0),
+        ("minus_not_paren", "-(~v)", 0),
+        ("decimal", "31 + v", 0),
+        ("plus_minus", "+ -v", 0),
+        ("minus_minus_binary", "v - -1", 0),
+        ("bit_string", "(X'1F')::int + v", 0),
+        ("bit_string_lower", "(x'1f')::int + v", 0),
+        ("underscore", "1_000 + v", 160000),
+    ] {
+        if version < minimum_version {
+            continue;
+        }
+        for position in V112_CR_RUN_AS_WRITTEN.iter().chain(&V112_CR_REWRITTEN) {
+            let outcome = v112_cr_expression_cell(tag, position, e, false);
+            if outcome != "ok" {
+                wrong.push(format!("{tag} {position}: {outcome}"));
             }
         }
     }
