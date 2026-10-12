@@ -4281,6 +4281,17 @@ pub(crate) struct DrainEntry {
     pub default_level: i32,
 }
 
+/// The DEFAULT partitions in the tree of `$1`, each with its level in that tree.
+/// Read from `pg_partitioned_table.partdefid`, a plain catalog column: a
+/// predicate over `pg_get_expr(relpartbound, oid)` opens every relation the
+/// planner chooses to evaluate it on, including partitions of other trees.
+pub(crate) const TREE_DEFAULT_PARTITIONS_SQL: &str =
+    "SELECT quote_ident(n.nspname) || '.' || quote_ident(c.relname) AS q, t.level AS lvl \
+       FROM pg_partition_tree($1) t \
+       JOIN pg_partitioned_table parent ON parent.partdefid = t.relid \
+       JOIN pg_class c ON c.oid = t.relid \
+       JOIN pg_namespace n ON n.oid = c.relnamespace";
+
 /// Phase 1 of the multi-level default drain: for every DEFAULT partition in each
 /// root's tree that holds rows, move those rows into a fresh holding table and
 /// leave the default attached but empty. Emptied defaults let the subsequent
@@ -4291,23 +4302,22 @@ pub(crate) fn drain_tree_defaults(
 ) -> Result<Vec<DrainEntry>, String> {
     let mut entries = Vec::new();
     for root in roots {
-        let defaults: Vec<(String, i32)> = client
-            .select(
-                "SELECT quote_ident(n.nspname) || '.' || quote_ident(c.relname) AS q, t.level AS lvl \
-                   FROM pg_partition_tree($1) t \
-                   JOIN pg_class c ON c.oid = t.relid \
-                   JOIN pg_namespace n ON n.oid = c.relnamespace \
-                  WHERE pg_get_expr(c.relpartbound, c.oid) = 'DEFAULT'",
-                None,
-                &[unsafe { DatumWithOid::new(root.clone(), PgBuiltInOids::TEXTOID.oid().value()) }],
-            )
-            .map_err(|e| format!("drain: enumerate defaults of {}: {}", root, e))?
-            .filter_map(|r| {
-                let q = r.get_by_name::<&str, _>("q").ok().flatten()?.to_string();
-                let lvl = r.get_by_name::<i32, _>("lvl").ok().flatten().unwrap_or(0);
-                Some((q, lvl))
-            })
-            .collect();
+        let defaults: Vec<(String, i32)> =
+            client
+                .select(
+                    TREE_DEFAULT_PARTITIONS_SQL,
+                    None,
+                    &[unsafe {
+                        DatumWithOid::new(root.clone(), PgBuiltInOids::TEXTOID.oid().value())
+                    }],
+                )
+                .map_err(|e| format!("drain: enumerate defaults of {}: {}", root, e))?
+                .filter_map(|r| {
+                    let q = r.get_by_name::<&str, _>("q").ok().flatten()?.to_string();
+                    let lvl = r.get_by_name::<i32, _>("lvl").ok().flatten().unwrap_or(0);
+                    Some((q, lvl))
+                })
+                .collect();
 
         for (default_qual, default_level) in defaults {
             let (schema, bare) = split_qualified_name(&default_qual);
