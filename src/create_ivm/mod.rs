@@ -165,16 +165,7 @@ fn validate_and_parse_inputs(
             return Err(crate::reflex_reject(&format!("Failed to parse SQL: {}", e)));
         }
     };
-    let reprinted = |run_as_written| {
-        reprinted_expressions::first_expression_reprinted_differently(
-            &parsed_sql,
-            sql,
-            run_as_written,
-        )
-    };
-    let reprinted_anywhere = reprinted(reprinted_expressions::RunAsWritten::Nothing);
-    let reprinted_in_a_rewritten_clause =
-        reprinted(reprinted_expressions::RunAsWritten::SelectListAndFrom);
+    let written_statements = parsed_sql.clone();
     let (parsed_sql, folded_sql) = match with_one_spelling_per_name(sql, parsed_sql) {
         Ok(folded) => folded,
         Err(reason) => return Err(crate::reflex_reject(&reason)),
@@ -202,12 +193,18 @@ fn validate_and_parse_inputs(
                      column) and select that column."
                 )));
             }
-            let reprinted = if select_list_and_from_run_as_written(&a) {
-                reprinted_in_a_rewritten_clause
+            let run_as_written = if select_list_and_from_run_as_written(&a) {
+                reprinted_expressions::RunAsWritten::PlainSelect {
+                    printed_where_conjuncts: &a.where_conjuncts_printed,
+                }
             } else {
-                reprinted_anywhere
+                reprinted_expressions::RunAsWritten::Nothing
             };
-            if let Some(reason) = reprinted {
+            if let Some(reason) = reprinted_expressions::first_expression_reprinted_differently(
+                &written_statements,
+                sql,
+                run_as_written,
+            ) {
                 return Err(crate::reflex_reject(&reason));
             }
             if let Some(message) = timezone_sensitivity_warning(view_name, &a) {
@@ -965,8 +962,7 @@ fn is_single_level_passthrough(analysis: &crate::sql_analyzer::SqlAnalysis) -> b
 }
 
 /// One SELECT the pipeline neither decomposes nor aggregates: its stored query, which
-/// every write runs, is the caller's text, and only its other clauses are written
-/// back from the parsed query.
+/// every write runs, is the caller's text.
 fn select_list_and_from_run_as_written(analysis: &crate::sql_analyzer::SqlAnalysis) -> bool {
     analysis.ctes.is_empty()
         && !analysis.has_distinct_on
@@ -2768,10 +2764,6 @@ pub(crate) fn create_reflex_ivm_impl_with_materialization(
     let folded_sql = parsed.folded_sql.take();
     let sql = folded_sql.as_deref().unwrap_or(sql);
 
-    if let Some(reason) = source_relations::source_relation_not_followed(&parsed.parsed_sql) {
-        return crate::reflex_reject(&reason);
-    }
-
     warn_on_bare_name_under_nonpublic_search_path(view_name);
 
     // Refuse an ignore whose source can determine this IMV's contents. Such
@@ -2813,6 +2805,14 @@ pub(crate) fn create_reflex_ivm_impl_with_materialization(
              refresh this IMV, so it can silently diverge, and a later rebuild from the \
              base query makes that permanent."
         ));
+    }
+
+    if let Some(reason) = source_relations::source_relation_not_followed(
+        &parsed.parsed_sql,
+        view_name,
+        &ignored_clean,
+    ) {
+        return crate::reflex_reject(&reason);
     }
 
     // The `unique_columns` argument may carry per-CTE keys after the outer key

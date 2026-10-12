@@ -448,9 +448,8 @@ fn v112_pd_partition_refused_as_a_source_still_feeds_the_root_imv() {
         v112_pd_create("v112_pd_two_root", ROOT_QUERY, mode);
         let refused = crate::create_reflex_ivm("v112_pd_two_leaf", LEAF_QUERY, None, None, Some(mode), None);
         assert!(
-            refused.starts_with(
-                "ERROR: [reflex-unsupported] the source v112_pd_two_a is a partition of v112_pd_two:"
-            ),
+            refused.starts_with("ERROR: [reflex-unsupported] a source is a partition")
+                && refused.contains("The partition is v112_pd_two_a, of v112_pd_two."),
             "{mode}: {refused}"
         );
         let left_behind = Spi::get_one::<i64>(
