@@ -178,8 +178,8 @@ fn sc_chain(with_cross_plan: bool) -> Vec<(String, String)> {
     let mut chain = vec![
         ("sc_sfv".to_string(), SC_SFV_SQL.to_string()),
         ("sc_fav".to_string(), sc_fav_fresh(SC_FAV_SELECT)),
-        ("sc_fdya".to_string(), SC_FDYA_SQL.replace("{sfv}", &sc_sfv_inline())),
-        ("sc_adya".to_string(), SC_ADYA_SQL.replace("{fav}", &sc_fav_inline())),
+        ("sc_fdya".to_string(), SC_FDYA_SQL.replace("{sfv}", &format!("{} AS inlined", sc_sfv_inline()))),
+        ("sc_adya".to_string(), SC_ADYA_SQL.replace("{fav}", &format!("{} AS inlined", sc_fav_inline()))),
     ];
     for cte in [
         "history_bounds",
