@@ -1041,6 +1041,22 @@ pub(crate) fn reflex_reconcile_with_orphans(view_name: &str, drop_orphans: bool)
         }
     }
 
+    reconcile_node_then_dependents(view_name, drop_orphans, child_failed)
+}
+
+/// The whole refresh of a dependent of an IMV a cascade just rebuilt
+/// ([`crate::cascade`]). Its generated sub-IMVs are not rebuilt first: each is
+/// either untouched by that rebuild, or refreshed by the same cascade before
+/// its readers.
+pub(crate) fn reconcile_as_cascaded_dependent(view_name: &str) -> &'static str {
+    reconcile_node_then_dependents(view_name, true, false)
+}
+
+fn reconcile_node_then_dependents(
+    view_name: &str,
+    drop_orphans: bool,
+    child_failed: bool,
+) -> &'static str {
     PARTITIONED_REBUILD_ALL_DIFFED.set(false);
     let own = reconcile_named_node(view_name, drop_orphans);
     let all_leaves_diffed = PARTITIONED_REBUILD_ALL_DIFFED.replace(false);
@@ -1073,6 +1089,9 @@ pub(crate) fn reflex_reconcile_with_orphans(view_name: &str, drop_orphans: bool)
     }
     if !own.starts_with("ERROR") && !is_partitioned_imv(view_name) {
         for dep in ignoring_dependents(view_name) {
+            if crate::cascade::queue_whole_refresh(&dep, view_name) {
+                continue;
+            }
             let result = reflex_reconcile_with_orphans(&dep, drop_orphans);
             if result.starts_with("ERROR") {
                 warning!(
@@ -1172,6 +1191,9 @@ fn cascade_partitioned_rebuild_to_dependents(
     };
 
     for dep in &dependents {
+        if crate::cascade::queue_whole_refresh(dep, view_name) {
+            continue;
+        }
         let result = reflex_reconcile_with_orphans(dep, drop_orphans);
         if result.starts_with("ERROR") {
             warning!(

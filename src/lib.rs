@@ -31,6 +31,7 @@ unsafe extern "C" {}
 
 mod aggregation;
 mod audit;
+mod cascade;
 mod create_ivm;
 mod doctor;
 mod drop_ivm;
@@ -1918,6 +1919,7 @@ mod tests {
     include!("tests/pg_test_v112_seam_review.rs");
     include!("tests/pg_test_v112_partition_locks.rs");
     include!("tests/pg_test_v112_create_rejections.rs");
+    include!("tests/pg_test_v112_swap_cascade.rs");
 }
 
 /// This module is required by `cargo pgrx test` invocations.

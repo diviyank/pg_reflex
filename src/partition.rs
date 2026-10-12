@@ -1909,10 +1909,11 @@ fn drop_bound_collision_orphan(
 ///    swap children to the canonical names.  Lock hold on the parent
 ///    drops from "full rebuild duration" to "the ALTER TABLE swap
 ///    itself" (µs).
-/// 5. Cascade to dependents:
-///    * Same partition column → partition-scoped reconcile.
-///    * Non-partitioned but GROUP BY this column → key-scoped reconcile.
-///    * Anything else → full reconcile.
+/// 5. Queue the dependents for the cascade this call belongs to
+///    ([`crate::cascade`]), each with the narrowest scope proven for it: its
+///    partitions under the rebuilt bounds, its groups of the rebuilt keys, or
+///    the whole IMV. The outermost call of the cascade refreshes them, once
+///    each, after it returns from its own rebuild.
 ///
 /// Atomicity: failures are REPORTED (an `ERROR: …` return value), not raised,
 /// so the calling statement commits. Steps 1-4 therefore run inside an explicit
@@ -1927,6 +1928,43 @@ fn drop_bound_collision_orphan(
 /// normally and RELEASE, committing every child already swapped. So the
 /// subtransaction is opened on both paths.
 pub(crate) fn reflex_reconcile_partition_impl(
+    view_name: &str,
+    partition_keys: &[String],
+    source_partition: &str,
+    skip_sync: bool,
+) -> String {
+    let keys_when_no_partition_is_named: &[String] = if source_partition.trim().is_empty() {
+        partition_keys
+    } else {
+        &[]
+    };
+    reconcile_partitions_and_keys(
+        view_name,
+        keys_when_no_partition_is_named,
+        source_partition,
+        skip_sync,
+    )
+}
+
+/// Rebuilds the partitions of `view_name` under the source partitions of
+/// `source_partition` and those that accept one of `partition_keys`.
+pub(crate) fn reconcile_partitions_and_keys(
+    view_name: &str,
+    partition_keys: &[String],
+    source_partition: &str,
+    skip_sync: bool,
+) -> String {
+    crate::cascade::run_then_refresh_dependents(|| {
+        rebuild_partitions_and_queue_dependents(
+            view_name,
+            partition_keys,
+            source_partition,
+            skip_sync,
+        )
+    })
+}
+
+fn rebuild_partitions_and_queue_dependents(
     view_name: &str,
     partition_keys: &[String],
     source_partition: &str,
@@ -2043,7 +2081,30 @@ pub(crate) fn reflex_reconcile_partition_impl(
         let unlogged = storage_mode.eq_ignore_ascii_case("UNLOGGED");
         let part_col = &part_cols[0];
 
-        let mut to_process: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let anchor = resolve_anchor_source(client, part_col, &depends_on).unwrap_or_default();
+        let full_tree = if anchor.is_empty() {
+            Vec::new()
+        } else {
+            list_partition_tree(client, &anchor)
+        };
+        let anchor_node_of_child: std::collections::HashMap<String, String> = full_tree
+            .iter()
+            .map(|n| (target_child_name(view_name, &n.bare_name), n.bare_name.clone()))
+            .collect();
+        let (_, view_bare) = split_qualified_name(view_name);
+        let anchor_node_mirrored_by = |child_bare: &str| {
+            anchor_node_of_child
+                .get(child_bare)
+                .cloned()
+                .unwrap_or_else(|| {
+                    child_bare
+                        .strip_prefix(&format!("{}_", view_bare))
+                        .unwrap_or(child_bare)
+                        .to_string()
+                })
+        };
+        let mut anchor_nodes: std::collections::BTreeSet<String> =
+            std::collections::BTreeSet::new();
 
         if !source_partition.trim().is_empty() {
             // Level-agnostic + depth-aware path: expand each named source
@@ -2056,35 +2117,37 @@ pub(crate) fn reflex_reconcile_partition_impl(
             // call — the affected-key derivation and dependent cascade below
             // then run ONCE over the union, instead of once per leaf (which
             // redundantly rebuilds the same dependent slice N times).
-            let anchor = resolve_anchor_source(client, part_col, &depends_on).unwrap_or_default();
-            let full_tree = if anchor.is_empty() {
-                Vec::new()
-            } else {
-                list_partition_tree(client, &anchor)
-            };
             let mirror_depth = partition_depth
                 .map(|d| d as usize)
                 .unwrap_or_else(|| max_tree_depth(&full_tree));
+            let in_anchor_tree = |bare: &str| full_tree.iter().any(|n| n.bare_name == bare);
             for sp in source_partition
                 .split(',')
                 .map(|s| s.trim())
                 .filter(|s| !s.is_empty())
             {
-                for src_leaf in expand_source_partition_to_leaves(client, sp) {
+                let leaves = expand_source_partition_to_leaves(client, sp);
+                if !full_tree.is_empty() && !leaves.iter().any(|leaf| in_anchor_tree(leaf)) {
+                    return Err(format!(
+                        "reconcile_partition: '{}' is not a partition of '{}', the source whose \
+                         partitions '{}' mirrors",
+                        sp, anchor, view_name
+                    ));
+                }
+                for src_leaf in leaves {
                     let chain = leaf_ancestor_chain(&full_tree, &src_leaf);
                     let node = ancestor_bare_at_depth(&chain, &src_leaf, mirror_depth)
                         .unwrap_or_else(|| src_leaf.clone());
-                    to_process.insert(target_child_name(view_name, &node));
+                    anchor_nodes.insert(node);
                 }
             }
-        } else {
+        } else if partition_keys.is_empty() {
+            return Err(
+                "reconcile_partition: empty partition_keys (or pass source_partition)".to_string(),
+            );
+        }
+        if !partition_keys.is_empty() {
             let keys = partition_keys;
-            if keys.is_empty() {
-                return Err(
-                    "reconcile_partition: empty partition_keys (or pass source_partition)"
-                        .to_string(),
-                );
-            }
             let tgt_children = list_partition_children(client, &tgt_parent);
             for key in keys {
                 let child_match = tgt_children.iter().find(|c| {
@@ -2132,42 +2195,31 @@ pub(crate) fn reflex_reconcile_partition_impl(
                     // A matched top-level child may itself be partitioned (internal
                     // node) on a multi-level IMV: expand to its leaves (or itself).
                     for leaf in target_leaves_under(client, &schema, &c.bare_name) {
-                        to_process.insert(leaf);
+                        anchor_nodes.insert(anchor_node_mirrored_by(&leaf));
                     }
                 }
             }
         }
 
-        if to_process.is_empty() {
+        if anchor_nodes.is_empty() {
             return Ok(format!(
                 "reconcile_partition: no children matched (keys={:?}, source_partition={:?})",
                 partition_keys, source_partition
             ));
         }
 
-        // Deterministic order. `to_process` is a set, and iterating it in hash
-        // order would make both the NOTICE stream and — when one child fails midway —
-        // WHICH children had already been swapped vary run to run, so a partial
-        // failure would not be reproducible. It also makes the returned
-        // "RECONCILED partitions: …" list stable.
-        let mut to_process: Vec<String> = to_process.into_iter().collect();
-        to_process.sort();
-
-        // Process each child via the shared atomic DETACH/ATTACH swap
-        // helper.  The intermediate is swapped before the target so the
-        // target's `end_query` fill reads the fresh intermediate.
-        // Recover each source bare-child name from the target bare-child name
-        // (target = "<bare_view>_<src_child>" per `target_child_name`).
-        let (_, view_bare) = split_qualified_name(view_name);
-        let src_children: Vec<String> = to_process
-            .iter()
-            .map(|child_bare| {
-                child_bare
-                    .strip_prefix(&format!("{}_", view_bare))
-                    .unwrap_or(child_bare)
-                    .to_string()
-            })
+        // Deterministic order: the NOTICE stream, WHICH children were already
+        // swapped when one fails midway, and the returned "RECONCILED
+        // partitions: …" list are the same run to run.
+        let mut mirrored: Vec<(String, String)> = anchor_nodes
+            .into_iter()
+            .map(|node| (target_child_name(view_name, &node), node))
             .collect();
+        mirrored.sort();
+        let (to_process, src_children): (Vec<String>, Vec<String>) = mirrored.into_iter().unzip();
+
+        // The intermediate is swapped before the target so the target's
+        // `end_query` fill reads the fresh intermediate.
         match crate::trigger::deferred::guard_scoped_rebuild(
             client,
             view_name,
@@ -2181,6 +2233,9 @@ pub(crate) fn reflex_reconcile_partition_impl(
                     .map_err(|e| format!("reconcile_partition: record rebuilt slice: {}", e))?;
             }
         }
+        let mut keys_of_changed_rows =
+            KeysOfRebuiltPartitions::of(client, &schema, &to_process, part_col, partition_keys);
+        keys_of_changed_rows.add_the_keys_held(client);
         let all_diffed = rebuild_mirror_leaves(
             client,
             view_name,
@@ -2192,6 +2247,7 @@ pub(crate) fn reflex_reconcile_partition_impl(
             true,
         )
         .map_err(|(_, e)| format!("reconcile_partition: {}", e))?;
+        keys_of_changed_rows.add_the_keys_held(client);
 
         // Update last_update_date.
         let _ = client.update(
@@ -2202,31 +2258,6 @@ pub(crate) fn reflex_reconcile_partition_impl(
             }],
         );
 
-        // Affected partition-key values driving this reconcile — used to scope
-        // the cascade into non-partitioned aggregate dependents. Taken from the
-        // keys when called by key; otherwise derived from the reconciled
-        // parent's target children (the swap-fill / flush path passes a source
-        // partition, not keys).
-        let affected_keys: Vec<String> = if !partition_keys.is_empty() {
-            partition_keys.to_vec()
-        } else {
-            let mut set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-            for child_bare in &to_process {
-                let q = format!(
-                    "SELECT DISTINCT \"{}\"::text AS k FROM \"{}\".\"{}\"",
-                    part_col, schema, child_bare
-                );
-                if let Ok(it) = client.select(&q, None, &[]) {
-                    for row in it {
-                        if let Some(k) = row.get_by_name::<&str, _>("k").ok().flatten() {
-                            set.insert(k.to_string());
-                        }
-                    }
-                }
-            }
-            set.into_iter().collect()
-        };
-
         // Observing dependents already received every leaf's change as DML when
         // all leaves were diffed; only the ignoring ones still need a refresh.
         let children: Vec<String> = if all_diffed && origin_triggers_fire(client) {
@@ -2235,154 +2266,17 @@ pub(crate) fn reflex_reconcile_partition_impl(
             children
         };
 
-        // Cascade to dependents.  Resolve each dependent's own metadata:
-        //   * partitioned on the SAME column        -> partition-scoped reconcile.
-        //   * non-partitioned, GROUP BY this column  -> key-scoped reconcile.
-        //   * anything else                          -> full reconcile.
-        for child in &children {
-            let dep = client
-                .select(
-                    "SELECT partition_columns, base_query, end_query, aggregations::text AS agg_json \
-                     FROM public.__reflex_ivm_reference WHERE name = $1",
-                    Some(1),
-                    &[unsafe {
-                        DatumWithOid::new(child.to_string(), PgBuiltInOids::TEXTOID.oid().value())
-                    }],
-                )
-                .ok()
-                .and_then(|mut it| it.next());
-            let (dep_cols, dep_base, dep_end, dep_group_by): (
-                Vec<String>,
-                String,
-                String,
-                Vec<String>,
-            ) = match dep {
-                Some(r) => {
-                    let group_by = r
-                        .get_by_name::<&str, _>("agg_json")
-                        .ok()
-                        .flatten()
-                        .and_then(|j| {
-                            serde_json::from_str::<crate::aggregation::AggregationPlan>(j).ok()
-                        })
-                        .map(|p| p.group_by_columns)
-                        .unwrap_or_default();
-                    (
-                        r.get_by_name::<Vec<String>, _>("partition_columns")
-                            .ok()
-                            .flatten()
-                            .unwrap_or_default(),
-                        r.get_by_name::<&str, _>("base_query")
-                            .ok()
-                            .flatten()
-                            .unwrap_or("")
-                            .to_string(),
-                        r.get_by_name::<&str, _>("end_query")
-                            .ok()
-                            .flatten()
-                            .unwrap_or("")
-                            .to_string(),
-                        group_by,
-                    )
-                }
-                None => (Vec::new(), String::new(), String::new(), Vec::new()),
-            };
-            let same_part = !dep_cols.is_empty()
-                && dep_cols
-                    .first()
-                    .map(|c| c.eq_ignore_ascii_case(part_col))
-                    .unwrap_or(false);
-            // We can't reflex_reconcile_partition / reflex_reconcile from
-            // inside this SPI scope directly — call the inner impls in a
-            // fresh SPI session by deferring via PERFORM at SQL level.
-            // The SQL entry point splits keys on commas and trims each one, so a key
-            // that is empty, contains a comma or has edge whitespace cannot cross it
-            // unchanged; such a dependent takes the full reconcile below.
-            //
-            // Called by source partition (ATTACH / flush), `partition_keys` is
-            // empty, and the same-column dependent is reconciled by the rebuilt
-            // children instead: they are its source partitions, so this reaches
-            // exactly the slices that mirror them, emptied ones included.
-            let same_part_call = if !partition_keys.is_empty() {
-                partition_keys
-                    .iter()
-                    .all(|k| !k.is_empty() && !k.contains(',') && k.trim() == k)
-                    .then(|| {
-                        format!(
-                            "SELECT public.reflex_reconcile_partition({}, {})",
-                            sql_literal_text(child),
-                            sql_literal_text(&partition_keys.join(","))
-                        )
-                    })
-            } else {
-                let rebuilt: Vec<String> = to_process
-                    .iter()
-                    .map(|c| format!("{}.{}", schema, c))
-                    .collect();
-                rebuilt.iter().all(|c| !c.contains(',')).then(|| {
-                    format!(
-                        "SELECT public.reflex_reconcile_partition({}, '', {})",
-                        sql_literal_text(child),
-                        sql_literal_text(&rebuilt.join(","))
-                    )
-                })
-            };
-            let same_part_reconciled = match (same_part, same_part_call) {
-                (true, Some(q)) => client
-                    .update(&q, None, &[])
-                    .ok()
-                    .and_then(|rows| rows.first().get_one::<&str>().ok().flatten())
-                    .is_some_and(|r| {
-                        r.starts_with("RECONCILED")
-                            || r == crate::reconcile::RECONCILE_QUEUED_FOR_COMMIT
-                    }),
-                _ => false,
-            };
-            if same_part_reconciled {
-                continue;
-            }
-            if let Some(scoped_with) = build_scoped_cascade_reconcile(
-                child,
-                part_col,
-                &affected_keys,
-                &dep_cols,
-                &dep_base,
-                &dep_end,
-                &dep_group_by,
-            ) {
-                if crate::trigger::deferred::scoped_rebuild_waits_for_commit(child) {
-                    crate::trigger::deferred::list_for_commit_reconcile(child);
-                    continue;
-                }
-                let literals = affected_keys
-                    .iter()
-                    .map(|k| sql_literal_text(k))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                let guard = crate::trigger::deferred::guard_scoped_rebuild(
-                    client,
-                    child,
-                    crate::trigger::deferred::RebuiltSlice::Keys {
-                        column: part_col,
-                        literals: &literals,
-                    },
-                );
-                let record_rebuild = match &guard {
-                    ScopedRebuildGuard::RecordWithRebuild(record) => format!("{record};"),
-                    _ => String::new(),
-                };
-                let _ = client.update(&scoped_with(&record_rebuild), None, &[]);
-                if matches!(guard, ScopedRebuildGuard::ReconcileAtCommit) {
-                    crate::trigger::deferred::list_for_commit_reconcile(child);
-                }
-            } else {
-                let q = format!(
-                    "SELECT public.reflex_reconcile({})",
-                    sql_literal_text(child)
-                );
-                let _ = client.update(&q, None, &[]);
-            }
-        }
+        crate::cascade::queue_dependents(
+            client,
+            &crate::cascade::RebuiltRows {
+                view_name,
+                partition_columns: &part_cols,
+                schema: &schema,
+                partitions: &to_process,
+                keys: keys_of_changed_rows.listed(),
+            },
+            &children,
+        );
 
         Ok(format!(
             "RECONCILED partitions: {}",
@@ -2403,6 +2297,135 @@ pub(crate) fn reflex_reconcile_partition_impl(
         Ok(s) => s,
         Err(e) => format!("ERROR: {}", e),
     }
+}
+
+/// The values of an IMV's first partition column over every row a partition
+/// rebuild can have added, removed or changed: the rows its rebuilt partitions
+/// held before the rebuild or hold after it.
+///
+/// A partition whose top-level bound lists its values holds no other. Any other
+/// partition is read before and after the rebuild, which shows its former rows
+/// only if it is the relation that held them: one created or altered in this
+/// transaction may stand in for a dropped predecessor, and then the keys are
+/// not known.
+struct KeysOfRebuiltPartitions {
+    column: String,
+    keys: std::collections::BTreeSet<String>,
+    read_for_their_keys: Vec<String>,
+    unknown: Option<String>,
+}
+
+impl KeysOfRebuiltPartitions {
+    fn of(
+        client: &pgrx::spi::SpiClient<'_>,
+        schema: &str,
+        partitions: &[String],
+        column: &str,
+        requested_keys: &[String],
+    ) -> Self {
+        let mut known = KeysOfRebuiltPartitions {
+            column: column.to_string(),
+            keys: requested_keys.iter().cloned().collect(),
+            read_for_their_keys: Vec::new(),
+            unknown: None,
+        };
+        for partition in partitions {
+            let Some((top_level_bound, untouched_by_this_transaction)) =
+                top_level_bound_and_age(client, schema, partition)
+            else {
+                known.unknown = Some(format!(
+                    "partition '{}' could not be read before its rebuild",
+                    partition
+                ));
+                continue;
+            };
+            if let Some(listed) = crate::cascade::keys_listed_by(&top_level_bound) {
+                known.keys.extend(listed);
+            } else if untouched_by_this_transaction {
+                known
+                    .read_for_their_keys
+                    .push(format!("\"{}\".\"{}\"", schema, partition));
+            } else {
+                known.unknown = Some(format!(
+                    "partition '{}' was created or altered in this transaction and its bound \
+                     ({}) does not list the \"{}\" values its rows held",
+                    partition, top_level_bound, column
+                ));
+            }
+        }
+        known
+    }
+
+    fn add_the_keys_held(&mut self, client: &pgrx::spi::SpiClient<'_>) {
+        for partition in &self.read_for_their_keys {
+            let held = format!(
+                "SELECT DISTINCT \"{}\"::text AS k FROM {}",
+                self.column, partition
+            );
+            let Ok(rows) = client.select(&held, None, &[]) else {
+                self.unknown = Some(format!("the keys of {} could not be read", partition));
+                continue;
+            };
+            for row in rows {
+                match row.get_by_name::<&str, _>("k").ok().flatten() {
+                    Some(key) => {
+                        self.keys.insert(key.to_string());
+                    }
+                    None => {
+                        self.unknown = Some(format!(
+                            "{} holds rows whose \"{}\" is NULL",
+                            partition, self.column
+                        ))
+                    }
+                }
+            }
+        }
+    }
+
+    fn listed(self) -> Result<Vec<String>, String> {
+        match self.unknown {
+            Some(reason) => Err(reason),
+            None => Ok(self.keys.into_iter().collect()),
+        }
+    }
+}
+
+/// The bound of the top-level partition that holds `schema`.`partition` (its
+/// own when it is one), and whether no statement of the current transaction
+/// created or altered `partition`. `None` when it does not exist.
+fn top_level_bound_and_age(
+    client: &pgrx::spi::SpiClient<'_>,
+    schema: &str,
+    partition: &str,
+) -> Option<(String, bool)> {
+    let text_arg = |value: &str| unsafe {
+        DatumWithOid::new(value.to_string(), PgBuiltInOids::TEXTOID.oid().value())
+    };
+    let row = client
+        .select(
+            "SELECT pg_get_expr(top.relpartbound, top.oid) AS bound, own.xmin::text AS written_by \
+             FROM pg_class own, \
+                  pg_partition_ancestors(own.oid) WITH ORDINALITY AS up(relid, steps_from_partition) \
+             JOIN pg_class top ON top.oid = up.relid \
+             WHERE own.oid = to_regclass(format('%I.%I', $1, $2)) \
+             ORDER BY up.steps_from_partition DESC OFFSET 1 LIMIT 1",
+            Some(1),
+            &[text_arg(schema), text_arg(partition)],
+        )
+        .ok()?
+        .next()?;
+    let bound = row.get_by_name::<String, _>("bound").ok().flatten()?;
+    let written_by = row
+        .get_by_name::<String, _>("written_by")
+        .ok()
+        .flatten()
+        .and_then(|xid| xid.parse::<u32>().ok())?;
+    let written_by_this_transaction = unsafe {
+        pgrx::pg_sys::TransactionIdIsCurrentTransactionId(pgrx::pg_sys::TransactionId::from(
+            written_by,
+        ))
+    };
+    Some((bound, !written_by_this_transaction))
 }
 
 /// Whether the call names a slice of a partitioned IMV. Any other call is
@@ -2444,7 +2467,7 @@ fn requests_a_partition_slice(
 /// optimization can never leave the dependent incorrect. The returned builder
 /// takes a statement run first inside the scoped path (the DEFERRED slice
 /// record), so it is undone with the scoped path when that fails.
-fn build_scoped_cascade_reconcile(
+pub(crate) fn build_scoped_cascade_reconcile(
     child: &str,
     part_col: &str,
     affected_keys: &[String],
@@ -3211,7 +3234,7 @@ fn read_immediate_parent_qual(
         })
 }
 
-fn sql_literal_text(s: &str) -> String {
+pub(crate) fn sql_literal_text(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
 }
 
