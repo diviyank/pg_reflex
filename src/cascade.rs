@@ -46,7 +46,7 @@ pub(crate) enum RefreshScope {
 }
 
 impl RefreshScope {
-    fn merged_with(self, other: RefreshScope) -> RefreshScope {
+    pub(crate) fn merged_with(self, other: RefreshScope) -> RefreshScope {
         use RefreshScope::*;
         match (self, other) {
             (Whole(reason), _) | (_, Whole(reason)) => Whole(reason),

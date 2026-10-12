@@ -942,6 +942,14 @@ fn v112_sc_scope_is_proven_only_for_aligned_queries() {
             "tenant.src",
         ),
         (
+            "SELECT COALESCE(forecast.plan, \"v__cte_hs\".plan) AS plan, forecast.x \
+             FROM \"v__cte_fs\" AS forecast \
+               FULL JOIN \"v__cte_hs\" ON forecast.plan = \"v__cte_hs\".plan \
+               LEFT JOIN \"v__cte_aa\" AS caav ON caav.k = forecast.k",
+            &["\"v__cte_fs\"", "\"v__cte_hs\"", "\"v__cte_aa\""][..],
+            "v__cte_hs",
+        ),
+        (
             "SELECT fb.plan, fb.lo FROM \"v__cte_bounds\" AS fb CROSS JOIN one AS o \
              WHERE fb.plan IN (SELECT c.plan FROM cur AS c)",
             &["\"v__cte_bounds\"", "one", "cur"][..],
@@ -994,6 +1002,12 @@ fn v112_sc_scope_is_proven_only_for_aligned_queries() {
             "src",
         ),
         ("SELECT sf.plan + 1 AS plan, sf.x FROM src AS sf", &["src"][..], "src"),
+        ("SELECT sf.alt AS plan, sf.x FROM src AS sf", &["src"][..], "src"),
+        (
+            "SELECT dl.alt AS plan, sf.x FROM src AS sf JOIN other AS dl ON sf.alt = dl.alt",
+            &["src", "other"][..],
+            "src",
+        ),
         (
             "SELECT t.plan, t.x FROM other AS t WHERE t.k IN (SELECT s.k FROM src AS s)",
             &["other", "src"][..],
@@ -1026,5 +1040,43 @@ fn v112_sc_scope_is_proven_only_for_aligned_queries() {
         ),
     ] {
         assert!(unproven(sql, reads, source).is_some(), "{sql}");
+    }
+}
+
+#[pg_test]
+fn v112_sc_scopes_reaching_one_dependent_merge_to_the_wider() {
+    use crate::cascade::RefreshScope::{Groups, PartitionKeys, SourcePartitions, Whole};
+    let set = |items: &[&str]| items.iter().map(|i| i.to_string()).collect::<std::collections::BTreeSet<String>>();
+    let whole = || Whole("unproven".to_string());
+    for narrower in [
+        SourcePartitions(set(&["public.p_1"])),
+        PartitionKeys(set(&["1"])),
+        Groups { column: "plan".to_string(), keys: set(&["1"]) },
+    ] {
+        assert_eq!(whole().merged_with(narrower.clone()), whole());
+        assert_eq!(narrower.clone().merged_with(whole()), whole());
+    }
+    assert_eq!(
+        PartitionKeys(set(&["1"])).merged_with(PartitionKeys(set(&["2"]))),
+        PartitionKeys(set(&["1", "2"]))
+    );
+    assert_eq!(
+        SourcePartitions(set(&["public.p_1"])).merged_with(SourcePartitions(set(&["public.p_2"]))),
+        SourcePartitions(set(&["public.p_1", "public.p_2"]))
+    );
+    assert_eq!(
+        Groups { column: "plan".to_string(), keys: set(&["1"]) }
+            .merged_with(Groups { column: "plan".to_string(), keys: set(&["2"]) }),
+        Groups { column: "plan".to_string(), keys: set(&["1", "2"]) }
+    );
+    for (one, other) in [
+        (PartitionKeys(set(&["1"])), SourcePartitions(set(&["public.p_1"]))),
+        (
+            Groups { column: "plan".to_string(), keys: set(&["1"]) },
+            Groups { column: "yr".to_string(), keys: set(&["1"]) },
+        ),
+        (PartitionKeys(set(&["1"])), Groups { column: "plan".to_string(), keys: set(&["1"]) }),
+    ] {
+        assert!(matches!(one.merged_with(other), Whole(_)));
     }
 }
