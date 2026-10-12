@@ -36,6 +36,13 @@ use crate::trigger::deferred::ScopedRebuildGuard;
 /// `known_stale`, so the condition is reported rather than silently retried.
 pub(crate) const PARTITION_FLUSH_FAILURE_CAP: i32 = 5;
 
+/// Errors a later flush of the same root can succeed past without any change:
+/// deadlock, serialization failure, lock not available (`lock_timeout`, NOWAIT).
+/// They are recorded and leave the root queued, but never count toward
+/// `PARTITION_FLUSH_FAILURE_CAP`. A cancel or a `statement_timeout` (57014) is
+/// not caught by `EXCEPTION WHEN OTHERS`: it fails the whole call, counting nothing.
+const TRANSIENT_FLUSH_SQLSTATES: &str = "'40P01', '40001', '55P03'";
+
 /// An explicit PostgreSQL subtransaction, the same primitive a plpgsql
 /// `BEGIN … EXCEPTION` block opens.
 ///
@@ -4248,7 +4255,7 @@ pub(crate) fn reflex_flush_partitions_impl(only: Option<&str>) -> String {
                  EXCEPTION WHEN OTHERS THEN \
                    UPDATE public.__reflex_partition_pending \
                       SET last_error = left(SQLERRM, 2000), \
-                          failures   = failures + 1 \
+                          failures   = failures + CASE WHEN SQLSTATE IN ({TRANSIENT_FLUSH_SQLSTATES}) THEN 0 ELSE 1 END \
                     WHERE source_root = '{root_esc}'; \
                    UPDATE public.__reflex_ivm_reference \
                       SET known_stale = TRUE, stale_reason = left(SQLERRM, 2000), stale_since = now() \
