@@ -6,9 +6,12 @@
 //! it, the scopes of every path are merged, and each dependent is refreshed
 //! once, in `graph_depth` order, so after every IMV it reads.
 //!
-//! A dependent is refreshed for the rebuilt partitions only when its query shows
-//! that its rows of one partition-key value come from the rebuilt IMV's rows of
-//! that same value ([`unproven_partition_alignment`]). Any other dependent is
+//! A dependent is refreshed for part of its rows only when two things are
+//! shown. Its query must take a row's partition key from the row of the rebuilt
+//! IMV it is built on ([`unproven_partition_alignment`]). And the part must be
+//! named without guessing: by the rebuilt partitions when the dependent mirrors
+//! the rebuilt IMV's own partition tree, otherwise by the keys the rebuilt
+//! partitions held before or after the rebuild. Any other dependent is
 //! refreshed whole, with a NOTICE that says why.
 
 use pgrx::datum::DatumWithOid;
@@ -16,26 +19,27 @@ use pgrx::prelude::*;
 use pgrx::PgBuiltInOids;
 use sqlparser::ast::{
     BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, JoinConstraint,
-    JoinOperator, Select, SelectItem, TableFactor,
+    JoinOperator, Select, SelectItem, TableFactor, UnaryOperator, Value,
 };
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::query_decomposer::{quote_identifier, split_qualified_name};
+use crate::query_decomposer::split_qualified_name;
 use crate::sql_analyzer::folded;
-use crate::sql_writer::identifier::format_pg_text_array;
 use crate::trigger::deferred::ScopedRebuildGuard;
 
 /// How much of a dependent a cascade refreshes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RefreshScope {
-    /// The partitions that share the bounds of these rebuilt partitions of its
-    /// sources (schema-qualified names).
-    SourcePartitions(BTreeSet<String>),
-    /// The partitions that hold these values of the partition column.
-    PartitionKeys(BTreeSet<String>),
+    /// Of a partitioned dependent: the partitions that mirror
+    /// `source_partitions` (schema-qualified partitions of the IMV whose tree it
+    /// mirrors) and the partitions that accept one of `keys`.
+    Partitions {
+        source_partitions: BTreeSet<String>,
+        keys: BTreeSet<String>,
+    },
     /// The groups of an unpartitioned aggregate whose `column` is one of `keys`.
     Groups {
         column: String,
@@ -50,13 +54,22 @@ impl RefreshScope {
         use RefreshScope::*;
         match (self, other) {
             (Whole(reason), _) | (_, Whole(reason)) => Whole(reason),
-            (SourcePartitions(mut a), SourcePartitions(b)) => {
-                a.extend(b);
-                SourcePartitions(a)
-            }
-            (PartitionKeys(mut a), PartitionKeys(b)) => {
-                a.extend(b);
-                PartitionKeys(a)
+            (
+                Partitions {
+                    mut source_partitions,
+                    mut keys,
+                },
+                Partitions {
+                    source_partitions: other_partitions,
+                    keys: other_keys,
+                },
+            ) => {
+                source_partitions.extend(other_partitions);
+                keys.extend(other_keys);
+                Partitions {
+                    source_partitions,
+                    keys,
+                }
             }
             (
                 Groups {
@@ -198,21 +211,23 @@ pub(crate) fn queue_whole_refresh(dependent: &str, rebuilt_source: &str) -> bool
     true
 }
 
-/// The partitions of `view_name` a partition reconcile rebuilt.
-pub(crate) struct RebuiltPartitions<'a> {
+/// The rows of `view_name` a refresh may have added, removed or changed.
+pub(crate) struct RebuiltRows<'a> {
     pub view_name: &'a str,
-    pub partition_column: &'a str,
-    /// The keys the reconcile was called with; empty when it was called with
-    /// source partitions.
-    pub partition_keys: &'a [String],
-    /// The rebuilt target partitions, schema-qualified.
+    /// The columns `view_name` is partitioned by, outermost first; for an
+    /// unpartitioned aggregate, the column its refreshed groups are named by.
+    pub partition_columns: &'a [String],
+    pub schema: &'a str,
+    /// The rebuilt partitions (bare names); empty for an unpartitioned IMV.
     pub partitions: &'a [String],
-    /// The partition-column values the rebuilt partitions hold.
-    pub keys_held: &'a [String],
+    /// The values of the first of `partition_columns` those rows hold or held;
+    /// the reason they cannot be listed when they cannot.
+    pub keys: Result<Vec<String>, String>,
 }
 
 struct Dependent {
     graph_depth: i32,
+    graph_child: Vec<String>,
     partition_columns: Vec<String>,
     group_by_columns: Vec<String>,
     sql_query: String,
@@ -224,8 +239,8 @@ struct Dependent {
 fn read_dependent(client: &pgrx::spi::SpiClient<'_>, name: &str) -> Option<Dependent> {
     let row = client
         .select(
-            "SELECT graph_depth, partition_columns, sql_query, base_query, end_query, depends_on, \
-                    aggregations::text AS agg_json \
+            "SELECT graph_depth, graph_child, partition_columns, sql_query, base_query, end_query, \
+                    depends_on, aggregations::text AS agg_json \
              FROM public.__reflex_ivm_reference WHERE name = $1 AND enabled",
             Some(1),
             &[text_arg(name)],
@@ -247,6 +262,7 @@ fn read_dependent(client: &pgrx::spi::SpiClient<'_>, name: &str) -> Option<Depen
     };
     Some(Dependent {
         graph_depth: row.get_by_name::<i32, _>("graph_depth").ok().flatten()?,
+        graph_child: texts("graph_child"),
         partition_columns: texts("partition_columns"),
         group_by_columns: row
             .get_by_name::<&str, _>("agg_json")
@@ -268,75 +284,181 @@ fn key_survives_the_key_list(key: &str) -> bool {
     !key.is_empty() && !key.contains(',') && key.trim() == key
 }
 
-fn scope_of(dependent: &Dependent, rebuilt: &RebuiltPartitions<'_>) -> RefreshScope {
-    let column = rebuilt.partition_column;
-    let partitioned_alike = dependent
-        .partition_columns
-        .first()
-        .is_some_and(|c| c.eq_ignore_ascii_case(column));
+/// Whether `dependent` mirrors the partition tree of `view_name` itself, so
+/// that each of its partitions holds exactly the keys of one partition of
+/// `view_name`.
+fn mirrors_the_partitions_of(
+    client: &pgrx::spi::SpiClient<'_>,
+    dependent: &Dependent,
+    view_name: &str,
+) -> bool {
+    let Some(first_column) = dependent.partition_columns.first() else {
+        return false;
+    };
+    let Ok(anchor) =
+        crate::partition::resolve_anchor_source(client, first_column, &dependent.depends_on)
+    else {
+        return false;
+    };
+    client
+        .select(
+            "SELECT to_regclass($1) = to_regclass($2) AS same",
+            Some(1),
+            &[text_arg(&anchor), text_arg(view_name)],
+        )
+        .ok()
+        .and_then(|mut rows| rows.next())
+        .and_then(|row| row.get_by_name::<bool, _>("same").ok().flatten())
+        .unwrap_or(false)
+}
+
+/// The partition of the tree of `schema`.`partition` at `depth` below the root
+/// that holds it (the partition itself when it is not deeper), schema-qualified.
+fn partition_at_depth(
+    client: &pgrx::spi::SpiClient<'_>,
+    schema: &str,
+    partition: &str,
+    depth: usize,
+) -> String {
+    let qualified = format!("{schema}.{partition}");
+    client
+        .select(
+            "SELECT n.nspname || '.' || c.relname AS holder \
+             FROM pg_partition_ancestors(to_regclass(format('%I.%I', $1, $2))) \
+                  WITH ORDINALITY AS up(relid, steps_from_partition) \
+             JOIN pg_class c ON c.oid = up.relid \
+             JOIN pg_namespace n ON n.oid = c.relnamespace \
+             ORDER BY up.steps_from_partition DESC OFFSET $3::bigint LIMIT 1",
+            Some(1),
+            &[
+                text_arg(schema),
+                text_arg(partition),
+                text_arg(&depth.to_string()),
+            ],
+        )
+        .ok()
+        .and_then(|mut rows| rows.next())
+        .and_then(|row| row.get_by_name::<String, _>("holder").ok().flatten())
+        .unwrap_or(qualified)
+}
+
+/// The scope `rebuilt` gives `dependent`; `None` when no row of the rebuilt IMV
+/// changed, so nothing of the dependent can have.
+fn scope_of(
+    client: &pgrx::spi::SpiClient<'_>,
+    dependent: &Dependent,
+    rebuilt: &RebuiltRows<'_>,
+) -> Option<RefreshScope> {
+    let Some(column) = rebuilt.partition_columns.first() else {
+        return Some(RefreshScope::Whole(format!(
+            "'{}' names no column its refreshed rows share",
+            rebuilt.view_name
+        )));
+    };
+    let aligned_on = |level: usize| match (
+        dependent.partition_columns.get(level),
+        rebuilt.partition_columns.get(level),
+    ) {
+        (Some(own), Some(theirs)) if own.eq_ignore_ascii_case(theirs) => {
+            unproven_partition_alignment(
+                &dependent.sql_query,
+                &dependent.depends_on,
+                rebuilt.view_name,
+                theirs,
+            )
+        }
+        _ => Some("its partition column differs at that level".to_string()),
+    };
     let groups_by_it = dependent.partition_columns.is_empty()
         && !dependent.end_query.trim().is_empty()
         && dependent
             .group_by_columns
             .iter()
             .any(|c| c.eq_ignore_ascii_case(column));
-    if !partitioned_alike && !groups_by_it {
-        return RefreshScope::Whole(format!(
+    let unproven = if groups_by_it {
+        unproven_partition_alignment(
+            &dependent.sql_query,
+            &dependent.depends_on,
+            rebuilt.view_name,
+            column,
+        )
+    } else if dependent.partition_columns.is_empty() {
+        Some(format!(
             "it is neither partitioned nor grouped by \"{column}\""
-        ));
-    }
-    if let Some(reason) = unproven_partition_alignment(
-        &dependent.sql_query,
-        &dependent.depends_on,
-        rebuilt.view_name,
-        column,
-    ) {
-        return RefreshScope::Whole(reason);
-    }
-    if groups_by_it {
-        return if rebuilt.keys_held.is_empty() {
-            RefreshScope::Whole(format!(
-                "the rebuilt partitions hold no row to name its \"{column}\" groups"
-            ))
-        } else {
-            RefreshScope::Groups {
-                column: column.to_string(),
-                keys: rebuilt.keys_held.iter().cloned().collect(),
-            }
-        };
-    }
-    if !rebuilt.partition_keys.is_empty() {
-        return if rebuilt
-            .partition_keys
-            .iter()
-            .all(|k| key_survives_the_key_list(k))
-        {
-            RefreshScope::PartitionKeys(rebuilt.partition_keys.iter().cloned().collect())
-        } else {
-            RefreshScope::Whole("a partition key holds a comma or edge whitespace".to_string())
-        };
-    }
-    if rebuilt.partitions.iter().all(|p| !p.contains(',')) {
-        RefreshScope::SourcePartitions(rebuilt.partitions.iter().cloned().collect())
+        ))
+    } else if !dependent.partition_columns[0].eq_ignore_ascii_case(column) {
+        Some(format!("it is not partitioned by \"{column}\" first"))
     } else {
-        RefreshScope::Whole("a rebuilt partition's name holds a comma".to_string())
+        aligned_on(0)
+    };
+    if let Some(reason) = unproven {
+        return Some(RefreshScope::Whole(reason));
     }
+
+    if !groups_by_it
+        && !rebuilt.partitions.is_empty()
+        && mirrors_the_partitions_of(client, dependent, rebuilt.view_name)
+    {
+        let aligned_levels = (1..dependent.partition_columns.len())
+            .take_while(|level| aligned_on(*level).is_none())
+            .count()
+            + 1;
+        let source_partitions: BTreeSet<String> = rebuilt
+            .partitions
+            .iter()
+            .map(|partition| {
+                if aligned_levels >= dependent.partition_columns.len() {
+                    format!("{}.{}", rebuilt.schema, partition)
+                } else {
+                    partition_at_depth(client, rebuilt.schema, partition, aligned_levels)
+                }
+            })
+            .collect();
+        return Some(if source_partitions.iter().all(|p| !p.contains(',')) {
+            RefreshScope::Partitions {
+                source_partitions,
+                keys: BTreeSet::new(),
+            }
+        } else {
+            RefreshScope::Whole("a rebuilt partition's name holds a comma".to_string())
+        });
+    }
+
+    let keys = match &rebuilt.keys {
+        Ok(keys) => keys,
+        Err(reason) => return Some(RefreshScope::Whole(reason.clone())),
+    };
+    if keys.is_empty() {
+        return None;
+    }
+    let keys: BTreeSet<String> = keys.iter().cloned().collect();
+    Some(if groups_by_it {
+        RefreshScope::Groups {
+            column: column.clone(),
+            keys,
+        }
+    } else if keys.iter().all(|k| key_survives_the_key_list(k)) {
+        RefreshScope::Partitions {
+            source_partitions: BTreeSet::new(),
+            keys,
+        }
+    } else {
+        RefreshScope::Whole("a partition key holds a comma or edge whitespace".to_string())
+    })
 }
 
 /// Queues the refresh of each enabled IMV of `dependents` after `rebuilt`.
 pub(crate) fn queue_dependents(
     client: &pgrx::spi::SpiClient<'_>,
-    rebuilt: &RebuiltPartitions<'_>,
+    rebuilt: &RebuiltRows<'_>,
     dependents: &[String],
 ) {
     for name in dependents {
-        if let Some(dependent) = read_dependent(client, name) {
-            queue_refresh(
-                name,
-                dependent.graph_depth,
-                scope_of(&dependent, rebuilt),
-                rebuilt.view_name,
-            );
+        let Some(dependent) = read_dependent(client, name) else {
+            continue;
+        };
+        if let Some(scope) = scope_of(client, &dependent, rebuilt) {
+            queue_refresh(name, dependent.graph_depth, scope, rebuilt.view_name);
         }
     }
 }
@@ -344,13 +466,27 @@ pub(crate) fn queue_dependents(
 fn refresh_dependent(dependent: &str, refresh: QueuedRefresh) {
     let source = &refresh.rebuilt_source;
     match refresh.scope {
-        RefreshScope::SourcePartitions(partitions) => {
-            let partitions: Vec<String> = partitions.into_iter().collect();
-            refresh_partitions(dependent, &[], &partitions.join(","), source);
-        }
-        RefreshScope::PartitionKeys(keys) => {
+        RefreshScope::Partitions {
+            source_partitions,
+            keys,
+        } => {
+            let source_partitions: Vec<String> = source_partitions.into_iter().collect();
             let keys: Vec<String> = keys.into_iter().collect();
-            refresh_partitions(dependent, &keys, "", source);
+            let result = crate::partition::reconcile_partitions_and_keys(
+                dependent,
+                &keys,
+                &source_partitions.join(","),
+                false,
+            );
+            if !result.starts_with("RECONCILED")
+                && result != crate::reconcile::RECONCILE_QUEUED_FOR_COMMIT
+            {
+                refresh_whole(
+                    dependent,
+                    source,
+                    &format!("its partition-scoped refresh returned: {result}"),
+                );
+            }
         }
         RefreshScope::Groups { column, keys } => {
             let keys: Vec<String> = keys.into_iter().collect();
@@ -362,25 +498,9 @@ fn refresh_dependent(dependent: &str, refresh: QueuedRefresh) {
     }
 }
 
-fn refresh_partitions(dependent: &str, keys: &[String], source_partitions: &str, source: &str) {
-    let result = crate::partition::reflex_reconcile_partition_impl(
-        dependent,
-        keys,
-        source_partitions,
-        false,
-    );
-    if !result.starts_with("RECONCILED") && result != crate::reconcile::RECONCILE_QUEUED_FOR_COMMIT
-    {
-        refresh_whole(
-            dependent,
-            source,
-            &format!("its partition-scoped refresh returned: {result}"),
-        );
-    }
-}
-
 /// Rebuilds the groups of an unpartitioned aggregate `dependent` whose `column`
-/// is one of `keys`; the reason it cannot when it cannot.
+/// is one of `keys`, then queues its own dependents; the reason it cannot when
+/// it cannot.
 fn refresh_groups(dependent: &str, column: &str, keys: &[String]) -> Result<(), String> {
     Spi::connect_mut(|client| {
         let shape = read_dependent(client, dependent)
@@ -395,6 +515,7 @@ fn refresh_groups(dependent: &str, column: &str, keys: &[String]) -> Result<(), 
             &shape.group_by_columns,
         )
         .ok_or_else(|| format!("its query has no GROUP BY to restrict to \"{column}\" values"))?;
+        // The COMMIT-time reconcile it is left to refreshes its dependents.
         if crate::trigger::deferred::scoped_rebuild_waits_for_commit(dependent) {
             crate::trigger::deferred::list_for_commit_reconcile(dependent);
             return Ok(());
@@ -419,7 +540,25 @@ fn refresh_groups(dependent: &str, column: &str, keys: &[String]) -> Result<(), 
         let _ = client.update(&scoped_with(&record_rebuild), None, &[]);
         if matches!(guard, ScopedRebuildGuard::ReconcileAtCommit) {
             crate::trigger::deferred::list_for_commit_reconcile(dependent);
+            return Ok(());
         }
+        // Its observing dependents received the rewritten groups as DML.
+        let unreached = if crate::partition::origin_triggers_fire(client) {
+            crate::reconcile::ignoring_dependents(dependent)
+        } else {
+            shape.graph_child
+        };
+        queue_dependents(
+            client,
+            &RebuiltRows {
+                view_name: dependent,
+                partition_columns: &[column.to_string()],
+                schema: "",
+                partitions: &[],
+                keys: Ok(keys.to_vec()),
+            },
+            &unreached,
+        );
         Ok(())
     })
 }
@@ -445,57 +584,40 @@ fn refresh_whole(dependent: &str, source: &str, reason: &str) {
     }
 }
 
-/// The top-level partitions of `view_name` (bare names) whose bound is the one
-/// `source_partition` falls under in its own tree, when `source_partition`
-/// belongs to a source of `view_name` other than the anchor it mirrors.
-pub(crate) fn children_sharing_the_bound_of(
-    client: &pgrx::spi::SpiClient<'_>,
-    view_name: &str,
-    depends_on: &[String],
-    source_partition: &str,
-) -> Result<Vec<String>, String> {
-    let top_level = client
-        .select(
-            "SELECT pg_get_expr(top.relpartbound, top.oid) AS bound, \
-                    EXISTS (SELECT 1 FROM unnest($2::text[]) AS source(name) \
-                             WHERE to_regclass(source.name) = up.root) AS read_by_view \
-             FROM (SELECT a.relid, lead(a.relid) OVER (ORDER BY a.level) AS root, \
-                          lead(a.relid, 2) OVER (ORDER BY a.level) AS above_root \
-                     FROM pg_partition_ancestors(to_regclass($1)) WITH ORDINALITY \
-                          AS a(relid, level)) up \
-             JOIN pg_class top ON top.oid = up.relid \
-             WHERE up.root IS NOT NULL AND up.above_root IS NULL",
-            Some(1),
-            &[
-                text_arg(source_partition),
-                text_arg(&format_pg_text_array(depends_on)),
-            ],
-        )
-        .map_err(|e| format!("reading the tree of '{source_partition}' failed: {e}"))?
-        .next()
-        .and_then(|row| {
-            Some((
-                row.get_by_name::<String, _>("bound").ok().flatten()?,
-                row.get_by_name::<bool, _>("read_by_view").ok().flatten()?,
-            ))
-        });
-    let Some((bound, true)) = top_level else {
-        return Err(format!(
-            "'{source_partition}' is not a partition of a source of '{view_name}'"
-        ));
-    };
-    let children: Vec<String> =
-        crate::partition::list_partition_children(client, &quote_identifier(view_name))
-            .into_iter()
-            .filter(|child| child.bound_expr == bound)
-            .map(|child| child.bare_name)
-            .collect();
-    if children.is_empty() {
-        return Err(format!(
-            "no partition of '{view_name}' has the bound {bound} of '{source_partition}'"
-        ));
-    }
-    Ok(children)
+/// The values a LIST partition bound lists (`FOR VALUES IN (1, 'a')`), as key
+/// texts; `None` for any other bound and for a list that holds anything but
+/// plain number and string literals (NULL among them).
+pub(crate) fn keys_listed_by(bound: &str) -> Option<Vec<String>> {
+    let listed = bound
+        .trim()
+        .strip_prefix("FOR VALUES IN (")?
+        .strip_suffix(')')?;
+    let values = Parser::new(&PostgreSqlDialect {})
+        .try_with_sql(listed)
+        .ok()?
+        .parse_comma_separated(Parser::parse_expr)
+        .ok()?;
+    values
+        .iter()
+        .map(|value| match value {
+            Expr::Value(literal) => match &literal.value {
+                Value::Number(number, _) => Some(number.to_string()),
+                Value::SingleQuotedString(text) => Some(text.clone()),
+                _ => None,
+            },
+            Expr::UnaryOp {
+                op: UnaryOperator::Minus,
+                expr,
+            } => match expr.as_ref() {
+                Expr::Value(literal) => match &literal.value {
+                    Value::Number(number, _) => Some(format!("-{number}")),
+                    _ => None,
+                },
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect()
 }
 
 fn relation_bare_name(name: &str) -> String {
@@ -650,8 +772,9 @@ fn top_level_relations(select: &Select) -> Option<Vec<JoinedRelation<'_>>> {
 /// * the output column is another relation's column that a join condition
 ///   equates with `source`'s, and no join can produce a row without that
 ///   relation's row;
-/// * the output column is `COALESCE` over the two columns a FULL JOIN equates,
-///   one of them `source`'s.
+/// * the output column is `COALESCE` over the two columns, one per side and
+///   one of them `source`'s, that the query's FULL JOIN equates, when that join
+///   is its first and every later one is a LEFT JOIN.
 ///
 /// A window function, DISTINCT ON or set operation makes a row depend on rows
 /// of other partitions and is refused.
@@ -751,19 +874,19 @@ pub(crate) fn unproven_partition_alignment(
         let [first, second] = coalesced.as_slice() else {
             return not_from_source();
         };
-        let equated_by_the_full_join = relations.iter().any(|relation| {
-            relation.kind == JoinKind::Full
-                && relation.condition.is_some_and(|condition| {
-                    equated_columns(condition)
-                        .iter()
-                        .any(|(a, b)| (a == first && b == second) || (a == second && b == first))
-                })
+        let full_join_then_left_joins = relations.get(1).is_some_and(|r| r.kind == JoinKind::Full)
+            && relations[2..].iter().all(|r| r.kind == JoinKind::Left);
+        let equated_by_the_full_join = relations.get(1).is_some_and(|full_join| {
+            full_join.condition.is_some_and(|condition| {
+                equated_columns(condition)
+                    .iter()
+                    .any(|(a, b)| (a == first && b == second) || (a == second && b == first))
+            })
         });
-        let proven = full_joins == 1
+        let proven = full_join_then_left_joins
             && equated_by_the_full_join
-            && (from_source(first) || from_source(second))
-            && !can_be_missing(&first.0)
-            && !can_be_missing(&second.0);
+            && first.0 != second.0
+            && (from_source(first) || from_source(second));
         return if proven { None } else { not_from_source() };
     }
     if full_joins > 0 {
