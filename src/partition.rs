@@ -3864,7 +3864,7 @@ pub(crate) fn reflex_flush_partitions_impl(only: Option<&str>) -> String {
                 .select(
                     "SELECT name, partition_depth, depends_on FROM public.__reflex_ivm_reference \
                      WHERE partition_columns IS NOT NULL AND array_length(partition_columns,1) > 0 \
-                       AND (depends_on @> ARRAY[$1] OR depends_on @> ARRAY[split_part($1,'.',2)])",
+                       AND public.__reflex_reads_relation(depends_on, $1)",
                     None,
                     &[unsafe { DatumWithOid::new(root.to_string(), pgrx::pg_sys::TEXTOID) }],
                 )
@@ -4082,7 +4082,7 @@ pub(crate) fn reflex_flush_partitions_impl(only: Option<&str>) -> String {
                     "SELECT name, depends_on FROM public.__reflex_ivm_reference \
                      WHERE enabled = TRUE \
                        AND COALESCE(array_length(partition_columns, 1), 0) = 0 \
-                       AND (depends_on @> ARRAY[$1] OR depends_on @> ARRAY[split_part($1,'.',2)])",
+                       AND public.__reflex_reads_relation(depends_on, $1)",
                     None,
                     &[unsafe { DatumWithOid::new(root.to_string(), pgrx::pg_sys::TEXTOID) }],
                 )
@@ -4229,7 +4229,7 @@ pub(crate) fn reflex_flush_partitions_impl(only: Option<&str>) -> String {
                     WHERE source_root = '{root_esc}'; \
                    UPDATE public.__reflex_ivm_reference \
                       SET known_stale = TRUE, stale_reason = left(SQLERRM, 2000), stale_since = now() \
-                    WHERE depends_on @> ARRAY['{root_esc}'] OR depends_on @> ARRAY[split_part('{root_esc}', '.', 2)]; \
+                    WHERE public.__reflex_reads_relation(depends_on, '{root_esc}'); \
                    RAISE WARNING 'pg_reflex: partition flush for root % failed: % (SQLSTATE %) — left pending for retry', \
                      '{root_esc}', SQLERRM, SQLSTATE; \
                  END \

@@ -1235,6 +1235,42 @@ extension_sql!(
         ON sql_drop
         EXECUTE FUNCTION public.__reflex_on_sql_drop();
 
+    -- The relation a registered spelling names, as ARRAY[schema, name] folded the
+    -- way PostgreSQL folds identifiers: an unquoted part is lower-cased (ASCII
+    -- only), a quoted part is taken as written. A spelling without a schema
+    -- names a relation of public: a source or an IMV of another schema is
+    -- always registered with its schema.
+    CREATE OR REPLACE FUNCTION public.__reflex_named_relation(spelling TEXT)
+    RETURNS TEXT[] LANGUAGE sql IMMUTABLE AS $fn$
+        SELECT CASE
+                 WHEN p.part IS NULL THEN ARRAY[spelling]
+                 WHEN p.part[2] IS NULL THEN ARRAY['public', f.first_part]
+                 ELSE ARRAY[f.first_part, f.second_part]
+               END
+          FROM (SELECT regexp_match(
+                    spelling,
+                    '^("(?:[^"]|"")*"|[^."]+)(?:\.("(?:[^"]|"")*"|[^."]+))?$') AS part) p
+         CROSS JOIN LATERAL (
+            SELECT CASE WHEN p.part[1] LIKE '"%"'
+                        THEN replace(substr(p.part[1], 2, length(p.part[1]) - 2), '""', '"')
+                        ELSE translate(p.part[1], 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz')
+                   END AS first_part,
+                   CASE WHEN p.part[2] LIKE '"%"'
+                        THEN replace(substr(p.part[2], 2, length(p.part[2]) - 2), '""', '"')
+                        ELSE translate(p.part[2], 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz')
+                   END AS second_part) f
+    $fn$;
+
+    -- True when one of the registered spellings names the relation `relation`
+    -- spells. `ta.t` is read by an IMV registered with `ta.t` or `"ta"."t"`,
+    -- never by one registered with `t`, which is `public.t`.
+    CREATE OR REPLACE FUNCTION public.__reflex_reads_relation(registered TEXT[], relation TEXT)
+    RETURNS BOOLEAN LANGUAGE sql IMMUTABLE AS $fn$
+        SELECT EXISTS (
+            SELECT 1 FROM unnest(registered) AS spelling
+             WHERE public.__reflex_named_relation(spelling) = public.__reflex_named_relation(relation))
+    $fn$;
+
     CREATE OR REPLACE FUNCTION public.__reflex_on_ddl_command_end()
     RETURNS event_trigger LANGUAGE plpgsql AS $$
     DECLARE
@@ -1370,7 +1406,11 @@ extension_sql!(
                    AND _part_root NOT LIKE '%\_\_reflex\_%'
                    AND NOT EXISTS (
                        SELECT 1 FROM public.__reflex_ivm_reference r
-                       WHERE r.name = _part_root OR r.name = split_part(_part_root, '.', 2)
+                       WHERE public.__reflex_named_relation(
+                                 CASE WHEN r.target_schema IS NOT NULL AND r.name NOT LIKE '%.%'
+                                      THEN quote_ident(r.target_schema) || '.' || r.name
+                                      ELSE r.name END)
+                             = public.__reflex_named_relation(_part_root)
                    )
                    AND EXISTS (
                        -- Enqueue for ANY enabled IMV depending on this root:
@@ -1379,8 +1419,7 @@ extension_sql!(
                        -- this, an unpartitioned IMV on a swap source goes stale.
                        SELECT 1 FROM public.__reflex_ivm_reference r
                        WHERE r.enabled
-                         AND (r.depends_on @> ARRAY[_part_root]
-                              OR r.depends_on @> ARRAY[split_part(_part_root, '.', 2)])
+                         AND public.__reflex_reads_relation(r.depends_on, _part_root)
                    )
                 THEN
                     INSERT INTO public.__reflex_partition_pending (source_root)
@@ -1394,8 +1433,7 @@ extension_sql!(
                     SELECT name FROM public.__reflex_ivm_reference
                     WHERE partition_columns IS NOT NULL
                       AND array_length(partition_columns, 1) > 0
-                      AND (depends_on @> ARRAY[_parent]
-                           OR depends_on @> ARRAY[split_part(_parent, '.', 2)])
+                      AND public.__reflex_reads_relation(depends_on, _parent)
                 LOOP
                     _sync_key := _parent || '|' || _imv.name;
                     IF _sync_key = ANY(_synced_keys) THEN
@@ -1432,8 +1470,7 @@ extension_sql!(
                       AND to_regclass(_src) = to_regclass(_toggle_root);
             FOR _imv IN
                 SELECT name FROM public.__reflex_ivm_reference
-                WHERE depends_on @> ARRAY[_src]
-                   OR depends_on @> ARRAY[split_part(_src, '.', 2)]
+                WHERE public.__reflex_reads_relation(depends_on, _src)
             LOOP
                 -- Skip pg_reflex's own DISABLE/ENABLE TRIGGER on a generated
                 -- sub-IMV of the chain being reconciled: the consumer named here
