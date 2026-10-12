@@ -1,5 +1,6 @@
 //! Relations a definition reads that the statement triggers of pg_reflex cannot
-//! follow: a table whose triggers would carry the names of another table's.
+//! follow: a partition, which a write addressed to its partitioned table does not
+//! report to, and a table whose triggers would carry the names of another table's.
 
 use std::ops::ControlFlow;
 
@@ -66,6 +67,37 @@ fn text_argument<'a>(value: &str) -> DatumWithOid<'a> {
     unsafe { DatumWithOid::new(value.to_string(), PgBuiltInOids::TEXTOID.oid().value()) }
 }
 
+/// Why the first relation of `relations` that is a partition cannot be a source.
+/// PostgreSQL fires the statement triggers of the table a statement names, so the
+/// triggers of a partition stay silent for a write addressed to an ancestor.
+fn partition_read_as_a_source(relations: &[String]) -> Option<String> {
+    Spi::connect(|client| {
+        relations.iter().find_map(|relation| {
+            let row = client
+                .select(
+                    "SELECT pg_partition_root(c.oid)::regclass::text AS root, \
+                            pg_get_partition_constraintdef(c.oid) AS bound \
+                     FROM pg_class c WHERE c.oid = to_regclass($1) AND c.relispartition",
+                    Some(1),
+                    &[text_argument(relation)],
+                )
+                .ok()?
+                .next()?;
+            let root = row.get_by_name::<String, _>("root").ok().flatten()?;
+            let rows_of_the_partition = match row.get_by_name::<String, _>("bound").ok().flatten() {
+                Some(bound) => format!("FROM {root} WHERE {bound}"),
+                None => format!("FROM {root}"),
+            };
+            Some(format!(
+                "the source {relation} is a partition of {root}: a write addressed to {root} \
+                 does not fire the triggers of {relation}, and the IMV would miss it. \
+                 Fix: read {root} and keep the rows of the partition with a WHERE on the \
+                 partition key: {rows_of_the_partition}."
+            ))
+        })
+    })
+}
+
 /// The spelling each of `relations` is registered under as a source.
 fn registered_spellings(relations: Vec<String>) -> Vec<String> {
     let mut named = SqlAnalysis {
@@ -123,8 +155,11 @@ fn source_sharing_trigger_names(sources: &[String]) -> Option<(String, String)> 
 /// Why pg_reflex cannot follow one of the relations `statements` read, in FROM, JOIN,
 /// a CTE or a subquery, with the change that makes it a source pg_reflex follows.
 pub(super) fn source_relation_not_followed(statements: &[Statement]) -> Option<String> {
-    let sources = registered_spellings(relations_read(statements));
-    let (source, other) = source_sharing_trigger_names(&sources)?;
+    let relations = relations_read(statements);
+    if let Some(reason) = partition_read_as_a_source(&relations) {
+        return Some(reason);
+    }
+    let (source, other) = source_sharing_trigger_names(&registered_spellings(relations))?;
     Some(format!(
         "the sources {source} and {other} would get the same pg_reflex trigger names, and the \
          IMVs of one would go unmaintained. Fix: rename {source} (ALTER TABLE ... RENAME TO \
