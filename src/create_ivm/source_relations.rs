@@ -126,9 +126,9 @@ pub(super) fn source_relation_not_followed(statements: &[Statement]) -> Option<S
     let sources = registered_spellings(relations_read(statements));
     let (source, other) = source_sharing_trigger_names(&sources)?;
     Some(format!(
-        "the sources {source} and {other} are two tables whose pg_reflex triggers and trigger \
-         functions get the same names (a '.' and a '_' are written alike in them): the IMVs of \
-         one would no longer be maintained. Fix: rename {source} (ALTER TABLE {source} RENAME \
-         TO ...), then create the IMV over the new name."
+        "the sources {source} and {other} would get the same pg_reflex trigger names, and the \
+         IMVs of one would go unmaintained. Fix: rename {source} (ALTER TABLE ... RENAME TO \
+         ...), then create the IMV over the new name. A '.' and a '_' are written alike in \
+         the names of the triggers and of their functions."
     ))
 }

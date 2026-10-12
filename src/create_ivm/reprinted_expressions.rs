@@ -39,23 +39,22 @@ fn prefix_operator_joined_to_its_operand(
     if two_signs && !(operator == "-" && joined == '-') {
         return None;
     }
-    let (read_as, plain_value) = match operand {
+    let read_as = if operator == "-" && joined == '-' {
+        "the start of a comment"
+    } else {
+        "one operator"
+    };
+    let plain_value = match operand {
         Expr::UnaryOp {
             op: UnaryOperator::Minus,
             expr: negated_twice,
-        } if operator == "-" => (
-            "the start of a comment".to_string(),
-            format!(", or {negated_twice} alone"),
-        ),
-        _ if operator == "-" && joined == '-' => {
-            ("the start of a comment".to_string(), String::new())
-        }
-        _ => (format!("the operator {operator}{joined}"), String::new()),
+        } if operator == "-" => format!(", or write {negated_twice} alone"),
+        _ => String::new(),
     };
     Some(format!(
-        "pg_reflex writes the expression '{operator} {operand}' back as '{printed}', where \
-         PostgreSQL reads '{operator}{joined}' as {read_as}. Fix: put the operand in \
-         parentheses, {operator}({operand}){plain_value}."
+        "pg_reflex writes two operators in a row back as '{operator}{joined}', which \
+         PostgreSQL reads as {read_as}. Fix: put the operand in parentheses, \
+         {operator}({operand}) in place of {operator} {operand}{plain_value}."
     ))
 }
 

@@ -203,6 +203,12 @@ fn v112_cr_sources_sharing_trigger_names_in_one_definition() {
         ("dot", "v112_crt_se.t", "v112_crt_se_t", "v112_crt_se_t2"),
         ("split", "v112_crt_se_a.b_c", "v112_crt_se.a_b_c", "v112_crt_se.a_b_c2"),
         ("public", "public.v112_crt_sh", "public_v112_crt_sh", "public_v112_crt_sh2"),
+        (
+            "long",
+            "v112_crt_se.a_long_table_name_that_fills_what_is_left_of_a_name",
+            "v112_crt_se_a_long_table_name_that_fills_what_is_left_of_a_name",
+            "v112_crt_se_renamed_a_long_table_name_that_fills_w",
+        ),
     ] {
         v112_cr_two_tables(first, second);
         let imv = format!("v112_cri_se_{tag}");
@@ -439,12 +445,12 @@ fn v112_cr_not_refused(tag: &str, position: &str, e: &str, problem: &str, deferr
 
 /// `(tag, expression, what the refusal names, minimum server version)`.
 const V112_CR_REPRINTED_DIFFERENTLY: [(&str, &str, &str, i32); 7] = [
-    ("mm", "- -v", "'- -v' back as '--v'", 0),
-    ("mm_literal", "- -1 + v", "'- -1' back as '--1'", 0),
-    ("abs_minus", "@ -v", "'@ -v' back as '@-v'", 0),
-    ("not_minus", "~ -v", "'~ -v' back as '~-v'", 0),
-    ("minus_abs", "- @v", "'- @v' back as '-@v'", 0),
-    ("minus_not", "- ~v", "'- ~v' back as '-~v'", 0),
+    ("mm", "- -v", "back as '--', which PostgreSQL reads as the start of a comment. Fix: put the operand in parentheses, -(-v) in place of - -v, or write v alone", 0),
+    ("mm_literal", "- -1 + v", "back as '--', which PostgreSQL reads as the start of a comment. Fix: put the operand in parentheses, -(-1) in place of - -1, or write 1 alone", 0),
+    ("abs_minus", "@ -v", "back as '@-', which PostgreSQL reads as one operator. Fix: put the operand in parentheses, @(-v) in place of @ -v", 0),
+    ("not_minus", "~ -v", "back as '~-', which PostgreSQL reads as one operator. Fix: put the operand in parentheses, ~(-v) in place of ~ -v", 0),
+    ("minus_abs", "- @v", "back as '-@', which PostgreSQL reads as one operator. Fix: put the operand in parentheses, -(@v) in place of - @v", 0),
+    ("minus_not", "- ~v", "back as '-~', which PostgreSQL reads as one operator. Fix: put the operand in parentheses, -(~v) in place of - ~v", 0),
     ("hex", "0x1F + v", "0x1F back as the bit string X'1F'", 160000),
 ];
 
@@ -463,12 +469,26 @@ fn v112_cr_reprinted_expressions_are_refused() {
             wrong.extend(v112_cr_not_refused(tag, position, e, problem, false));
         }
     }
-    for (tag, e, problem) in [("mm", "- -v", "'- -v' back as '--v'"), ("abs_minus", "@ -v", "'@ -v' back as '@-v'")] {
+    for (tag, e, problem) in [("mm", "- -v", "-(-v) in place of - -v"), ("abs_minus", "@ -v", "@(-v) in place of @ -v")] {
         for position in ["pt_where", "agg_group_key", "cte_select"] {
             wrong.extend(v112_cr_not_refused(tag, position, e, problem, true));
         }
     }
     assert!(wrong.is_empty(), "\n{}", wrong.join("\n"));
+}
+
+/// However long the operand, the refusal gives its remedy within the first 300
+/// characters, and the remedy is maintained.
+#[pg_test]
+fn v112_cr_reprinted_long_expression_refusal_gives_its_remedy_first() {
+    lock_shared_fixtures();
+    let operand = format!("(v{})", " + 1 - 1".repeat(40));
+    for (tag, position) in [("long_where", "pt_where"), ("long_key", "agg_group_key")] {
+        let refused = v112_cr_not_refused(tag, position, &format!("- -{operand}"), "Fix: put the operand in parentheses, -(-(v + 1", false);
+        assert_eq!(refused, None);
+        let remedied = v112_cr_expression_cell(&format!("{tag}_paren"), position, &format!("-(-{operand})"), false);
+        assert_eq!(remedied, "ok", "{position}");
+    }
 }
 
 /// The same expressions in the select list and the FROM clause of a plain SELECT,
