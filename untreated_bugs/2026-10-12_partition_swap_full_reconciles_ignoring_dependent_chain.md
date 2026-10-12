@@ -33,9 +33,10 @@ Fixed on branch `fix/v112-swap-cascade-scope` (`src/cascade.rs`, tests
 - **Unchanged leaf:** it cascades like a changed one, by design (see below).
 
 Now a partition rebuild queues its dependents, merges the scopes reaching one dependent and
-refreshes each once in dependency order. The scope is kept only when the dependent's query
-proves that a row's partition key is the rebuilt view's; otherwise the dependent is refreshed
-whole once, with a NOTICE naming it and the reason.
+refreshes each once in dependency order. A dependent is refreshed for part of its rows only
+when its query proves that a row's partition key is the rebuilt view's AND the part can be
+named without guessing; otherwise it is refreshed whole once, with a NOTICE naming it and the
+reason.
 
 ## Residual
 
@@ -43,23 +44,33 @@ whole once, with a NOTICE naming it and the reason.
    `reflex_reconcile_partition` call. The flush issues one call per IMV mirroring the root, so
    a node below two such IMVs is still refreshed once per IMV.
 2. **Shapes whose scope is not proven are refreshed whole.** By construction (correctness
-   first): the rebuilt view read twice, read inside a CTE or derived table, a set operation, a
-   window, `DISTINCT ON`, a partition column taken from another relation that is not equated
-   to the rebuilt view's by an inner join, RIGHT / NATURAL / USING joins, comma-joined tables. Each costs
-   one whole refresh per flush and says so in a NOTICE. Widening the proof is possible case
-   by case and must come with the oracle test of the shape.
-3. **An unchanged leaf still refreshes the dependents that ignore the rebuilt view.** Ordinary
+   first): the rebuilt view read twice (a sub-query counts), read inside a CTE or derived
+   table, a set operation, a window, `DISTINCT ON`, a partition column taken from another
+   relation that is not equated to the rebuilt view's by an inner join, RIGHT / NATURAL /
+   USING joins, comma-joined tables, a FULL JOIN that is not the first join or is followed by
+   anything but LEFT JOINs. Each costs one whole refresh per flush and says so in a NOTICE.
+3. **Parts that cannot be named are refreshed whole.** A dependent that mirrors the rebuilt
+   view's own partition tree is refreshed in the mirrored partitions. Any other dependent
+   (one mirroring another root, an unpartitioned aggregate) is refreshed by key, and the keys
+   are known only when the top-level bound lists them (`FOR VALUES IN (...)` of plain values)
+   or the rebuilt partition was not created or altered in the transaction (it is then read
+   before and after). So for such a dependent a replaced top-level RANGE or DEFAULT
+   partition, and any partition holding a NULL key, means a whole refresh.
+4. **Second partition level.** A dependent whose second-level column is not proven to be the
+   rebuilt view's is refreshed in the whole first-level partition, not the leaf.
+5. **An aggregate grouped by a qualified column (`GROUP BY v.plan`) is refreshed whole**: the
+   registry stores its group column with the qualifier and the group-scoped refresh does not
+   recognise it. Writing `GROUP BY plan` keeps the group scope.
+6. **An unchanged leaf still refreshes the dependents that ignore the rebuilt view.** Ordinary
    writes do not reach such a dependent, so an empty diff of the swapped leaf does not prove
-   it current; the swap is what catches it up. Skipping it would need a per-partition
-   "dependent is current" proof that does not exist.
-4. **A scoped reconcile queued for COMMIT from inside a trigger** still becomes a whole one:
+   it current; the swap is what catches it up.
+7. **A reconcile queued for COMMIT from inside a trigger** still becomes a whole one, and a
+   node reached both by the cascade and by that COMMIT-time reconcile is refreshed twice:
    `2026-10-02_in_trigger_scoped_reconcile_escalates_to_full_commit_rebuild.md`.
-5. **Not verified in the field.** The cause was reproduced with the field names and shapes on
+8. **Not verified in the field.** The cause was reproduced with the field names and shapes on
    a synthetic chain, not on the tenant. After the upgrade the push should show partition
    refreshes of the three direct dependents only; any `is refreshed whole, not by partition`
    NOTICE on that chain names what is left.
-6. **The NOTICE text is not asserted by a test** (the tests assert which nodes are refreshed
-   whole and how often, from the registry).
 
 ## Related, filed separately
 
@@ -68,3 +79,4 @@ whole once, with a NOTICE naming it and the reason.
 - `2026-10-12_deferred_flush_into_partitioned_join_of_an_ignored_source_and_an_aggregate_fails_column_does_not_exist.md`
 - `2026-10-12_create_raises_raw_syntax_error_for_a_partitioned_passthrough_joining_a_cte_aggregate_of_its_own_source.md`
 - `2026-10-12_default_drain_catalog_query_locks_every_partition_in_the_database.md`
+- `2026-10-12_swap_of_a_partition_of_a_source_that_is_not_the_mirrored_one_leaves_the_imv_stale.md`
