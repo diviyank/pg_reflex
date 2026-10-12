@@ -2333,6 +2333,10 @@ impl KeysOfRebuiltPartitions {
             let Some((top_level_bound, untouched_by_this_transaction)) =
                 top_level_bound_and_age(client, schema, partition)
             else {
+                known.unknown = Some(format!(
+                    "partition '{}' could not be read before its rebuild",
+                    partition
+                ));
                 continue;
             };
             if let Some(listed) = crate::cascade::keys_listed_by(&top_level_bound) {
