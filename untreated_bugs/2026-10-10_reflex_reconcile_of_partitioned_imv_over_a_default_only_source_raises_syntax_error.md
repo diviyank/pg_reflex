@@ -30,7 +30,7 @@ IMV.
   DEFAULT one reconciles (`RECONCILED`).
 - Not the trigger changes of the fix round: same error on `0324f47`.
 
-Probe `zz_file_probe` (`/private/tmp/rfx-remote/b-r3fix-file-probe.rs`, outputs
+Probe `zz_file_probe` (`.superpowers/sdd/2026-10-07-1.12.0-create-contract-hardening/full-review-r3-fix-evidence/b-r3fix-file-probe.rs`, outputs
 `b-r3fix-fp-{base,head}.log`, lines `DEFAULT-only` and `DEFAULT and one LIST partition`).
 
 ## Mechanism

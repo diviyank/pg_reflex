@@ -467,6 +467,10 @@ pub struct SqlAnalysis {
     /// against a single transition table). The original `where_clause`
     /// field is unchanged — it is the full text for downstream uses.
     pub imv_relevant_where: HashMap<String, String>,
+    /// Positions, among the top-level AND conjuncts of the WHERE clause, of those
+    /// `imv_relevant_where` holds: the only part of the WHERE of a query stored as
+    /// the caller's text that is written back from the parsed query.
+    pub where_conjuncts_printed: Vec<usize>,
 }
 
 impl SqlAnalysis {
@@ -1934,7 +1938,7 @@ fn collect_imv_relevant_columns(
 
 /// Recursively split an Expr by top-level AND into a flat list of conjuncts.
 /// Stops descending at the first non-AND BinaryOp or any other node.
-fn split_top_level_and(expr: &Expr, out: &mut Vec<Expr>) {
+pub(crate) fn split_top_level_and(expr: &Expr, out: &mut Vec<Expr>) {
     if let Expr::BinaryOp {
         left,
         op: BinaryOperator::And,
@@ -2022,6 +2026,7 @@ fn collect_imv_relevant_where(
         return SourceFilters {
             per_source: HashMap::new(),
             unfiltered_column_refs: collect_column_refs(where_expr),
+            printed_conjuncts: Vec::new(),
         };
     }
     let outer_sources: Vec<String> = real_sources.iter().map(|s| (*s).clone()).collect();
@@ -2058,7 +2063,8 @@ fn collect_imv_relevant_where(
     let mut buckets: HashMap<String, Vec<String>> = HashMap::new();
     let mut unfiltered_column_refs: Vec<Vec<String>> = Vec::new();
 
-    for conj in &conjuncts {
+    let mut printed_conjuncts: Vec<usize> = Vec::new();
+    for (position, conj) in conjuncts.iter().enumerate() {
         // Only OUTER-level refs attribute the conjunct; a scalar subquery is an
         // opaque value evaluated against its own tables at maintenance time.
         let mut collector = OuterColumnRefCollector::default();
@@ -2115,6 +2121,7 @@ fn collect_imv_relevant_where(
             .entry(source)
             .or_default()
             .push(rewritten.to_string());
+        printed_conjuncts.push(position);
     }
 
     SourceFilters {
@@ -2123,6 +2130,7 @@ fn collect_imv_relevant_where(
             .map(|(src, parts)| (src, parts.join(" AND ")))
             .collect(),
         unfiltered_column_refs,
+        printed_conjuncts,
     }
 }
 
@@ -2136,6 +2144,8 @@ struct SourceFilters {
     /// such a column can move a row across the WHERE without any per-source
     /// filter seeing it, so these columns count as IMV-relevant.
     unfiltered_column_refs: Vec<Vec<String>>,
+    /// Positions of the conjuncts `per_source` holds, among the top-level ones.
+    printed_conjuncts: Vec<usize>,
 }
 
 /// Top-level tables whose columns an outer join can null-extend: the table a
@@ -2479,6 +2489,7 @@ pub fn analyze(statements: &[Statement]) -> Result<SqlAnalysis, SqlAnalysisError
         has_ctes,
         &source_filters.unfiltered_column_refs,
     );
+    analysis.where_conjuncts_printed = source_filters.printed_conjuncts;
     analysis.imv_relevant_where = source_filters.per_source;
     disable_update_skip_for_repeated_sources(&mut analysis);
     if binds_an_alias_twice(select) {

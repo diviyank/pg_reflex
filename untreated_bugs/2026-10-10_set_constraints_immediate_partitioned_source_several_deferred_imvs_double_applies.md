@@ -4,7 +4,7 @@ Pre-existing: identical on `6946400` (1.11.5) and on the 1.12.0 integration bran
 Found by review seat R3 of the 1.12.0 full re-review (pg16); filed from its probe outputs
 (`*/r3b_sc.txt`, variants `part` and `part+mix`, steps A to E, under `.superpowers/sdd/2026-10-07-1.12.0-create-contract-hardening/full-review-r3-out/`; probe
 `zz_r3b_set_constraints` in `.superpowers/sdd/2026-10-07-1.12.0-create-contract-hardening/full-review-r3-probes.rs`).
-The reduction below was run on pg16 on `0324f47` and on `fix/full-review-r3` (probe `zz_file_probe`, kept at `/private/tmp/rfx-remote/b-r3fix-file-probe.rs` with its outputs `b-r3fix-fp-{base,head}.log`): same outcome on both.
+The reduction below was run on pg16 on `0324f47` and on `fix/full-review-r3` (probe `zz_file_probe`, kept at `.superpowers/sdd/2026-10-07-1.12.0-create-contract-hardening/full-review-r3-fix-evidence/b-r3fix-file-probe.rs` with its outputs `b-r3fix-fp-{base,head}.log`): same outcome on both.
 A third shape beside
 `2026-10-01_set_constraints_immediate_in_trigger_reconcile_double_applies.md` and
 `2026-10-01_set_constraints_immediate_two_source_statement_double_counts.md`.

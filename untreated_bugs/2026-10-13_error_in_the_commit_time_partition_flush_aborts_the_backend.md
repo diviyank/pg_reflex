@@ -28,7 +28,7 @@ IMV violated by a swapped leaf's rows (two-level tree, swap of a leaf with `q + 
 Also reached by a lock error: two sessions swapping a leaf of sources in two schemas at once
 deadlocked in the default drain of the auto-sync (its `pg_get_expr` filter opened every
 partition of the database), and the COMMIT of the session that lost aborted the backend. That
-route is closed by `fix/v112-swap-cascade-scope` (the drain reads its own tree only; test
+route is closed by `1143253` (the drain reads `partdefid`; pinned again by
 `v112_sc_swaps_in_two_schemas_do_not_wait_on_each_other_*`, RED on `0a1884c` by this abort),
 but any other error at COMMIT still aborts.
 
