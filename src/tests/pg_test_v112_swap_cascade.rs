@@ -2226,3 +2226,337 @@ fn v112_sc_partitions_fed_through_a_join_keep_their_rows_immediate() {
 fn v112_sc_partitions_fed_through_a_join_keep_their_rows_deferred() {
     sc_assert_partitions_fed_through_a_join_keep_their_rows("reflex_sc_fedjoin_d", "DEFERRED");
 }
+
+/// One IMV of a step fixture: name, query, unique key, ignore list, partition
+/// columns (SQL literals as `create_reflex_ivm` takes them).
+type ScImv<'a> = (&'a str, &'a str, &'a str, &'a str, &'a str);
+
+/// One committed step and the IMVs not compared after it.
+type ScCommittedStep<'a> = (&'a str, &'a str, &'a [&'a str]);
+
+/// Builds `setup` and `imvs` in `mode` on a private database, commits each step
+/// and compares every IMV with `fresh` after it; an IMV found wrong is
+/// reconciled so the next step starts right. Leaves the database open.
+fn sc_run_committed_steps(
+    dbname: &str,
+    mode: &str,
+    setup: &[&str],
+    imvs: &[ScImv<'_>],
+    fresh: &dyn Fn(&str) -> String,
+    steps: &[ScCommittedStep<'_>],
+) -> Vec<String> {
+    probe_db_open(dbname);
+    for ddl in setup {
+        worker_exec(ddl);
+    }
+    let mode = sql_lit(mode);
+    for (name, sql, keys, ignore, partition_by) in imvs {
+        let call = format!(
+            "create_reflex_ivm('{name}', {}, {keys}, NULL, {mode}, {ignore}, {partition_by})",
+            sql_lit(sql)
+        );
+        assert_eq!(rbc_select(&call), "CREATE REFLEX INCREMENTAL VIEW", "{call}");
+    }
+    let mut failures = Vec::new();
+    let check = |label: &str, skipped: &[&str], failures: &mut Vec<String>| {
+        for (name, ..) in imvs {
+            if skipped.contains(name) {
+                continue;
+            }
+            let mismatches = rbc_mismatch(name, &fresh(name));
+            if mismatches != 0 {
+                failures.push(format!("{label}: {name}: {mismatches} mismatches"));
+                rbc_select(&format!("reflex_reconcile('{name}')"));
+            }
+        }
+        for name in skipped {
+            rbc_select(&format!("reflex_reconcile('{name}')"));
+        }
+    };
+    check("after create", &[], &mut failures);
+    for (label, statements, skipped) in steps {
+        worker_exec(&format!("BEGIN; {statements}; COMMIT"));
+        check(label, skipped, &mut failures);
+    }
+    failures
+}
+
+/// A leaf, or the DEFAULT leaf, swapped for an empty table under another name
+/// (no final rename): the rows that leave reach every reader. A detached plan
+/// whose values the DEFAULT then takes keeps its mirror, and the IMV is
+/// rebuilt whole.
+fn sc_assert_leaves_swapped_for_empty_tables_reach_every_reader(dbname: &str, mode: &str) {
+    let setup = [
+        "CREATE TABLE hs (plan INT, k INT NOT NULL, q INT NOT NULL) PARTITION BY LIST (plan)",
+        "CREATE TABLE hs_p1 PARTITION OF hs FOR VALUES IN (1)",
+        "CREATE TABLE hs_p2 PARTITION OF hs FOR VALUES IN (2)",
+        "CREATE TABLE hs_p3 PARTITION OF hs FOR VALUES IN (3)",
+        "CREATE TABLE hs_p8 PARTITION OF hs FOR VALUES IN (8)",
+        "CREATE TABLE hs_def PARTITION OF hs DEFAULT",
+        "INSERT INTO hs SELECT p, k, p * 100 + k FROM generate_series(1, 8) p, generate_series(1, 4) k",
+        "INSERT INTO hs VALUES (NULL, 1, 9001), (NULL, 2, 9002)",
+    ];
+    let imvs = [
+        ("hv", "SELECT s.plan, s.k, s.q FROM hs AS s", "NULL", "NULL", "ARRAY['plan']"),
+        ("hv_agg", "SELECT v.plan, SUM(v.q) AS sq, COUNT(*) AS n FROM hv AS v GROUP BY v.plan", "NULL", "NULL", "ARRAY[]::text[]"),
+        ("hv_tot", "SELECT COUNT(*) AS n, SUM(v.q) AS t FROM hv AS v", "NULL", "NULL", "ARRAY[]::text[]"),
+        ("hv_flat", "SELECT v.plan, v.k, v.q FROM hv AS v", "NULL", "NULL", "ARRAY[]::text[]"),
+        ("hv_rr", "SELECT COUNT(*) AS n, SUM(a.sq) AS t FROM hv_agg AS a", "NULL", "NULL", "ARRAY[]::text[]"),
+        ("hv_ign", "SELECT v.plan, SUM(v.q) AS sq, COUNT(*) AS n FROM hv AS v GROUP BY v.plan", "NULL", "'!hv'", "ARRAY[]::text[]"),
+    ];
+    let fresh = |name: &str| match name {
+        "hv" | "hv_flat" => "SELECT s.plan, s.k, s.q FROM hs AS s".to_string(),
+        "hv_tot" => "SELECT COUNT(*) AS n, SUM(s.q) AS t FROM hs AS s".to_string(),
+        "hv_rr" => "SELECT COUNT(*) AS n, SUM(a.sq) AS t \
+                    FROM (SELECT SUM(s.q) AS sq FROM hs AS s GROUP BY s.plan) a"
+            .to_string(),
+        _ => "SELECT s.plan, SUM(s.q) AS sq, COUNT(*) AS n FROM hs AS s GROUP BY s.plan".to_string(),
+    };
+    let steps: [ScCommittedStep<'_>; 4] = [
+        (
+            "listed leaf swapped for an empty table under another name",
+            "CREATE TABLE hs_p2_new (LIKE hs); ALTER TABLE hs DETACH PARTITION hs_p2; \
+             ALTER TABLE hs ATTACH PARTITION hs_p2_new FOR VALUES IN (2); DROP TABLE hs_p2",
+            &[],
+        ),
+        (
+            "DEFAULT leaf swapped for an empty table under another name",
+            "CREATE TABLE hs_def_new (LIKE hs); ALTER TABLE hs DETACH PARTITION hs_def; \
+             ALTER TABLE hs ATTACH PARTITION hs_def_new DEFAULT; DROP TABLE hs_def",
+            &[],
+        ),
+        (
+            // An ordinary write does not reach hv_ign, by its ignore list.
+            "leaf swapped for an empty table, then a write",
+            "CREATE TABLE hs_p3_new (LIKE hs); ALTER TABLE hs DETACH PARTITION hs_p3; \
+             ALTER TABLE hs ATTACH PARTITION hs_p3_new FOR VALUES IN (3); DROP TABLE hs_p3; \
+             INSERT INTO hs VALUES (1, 9, 199)",
+            &["hv_ign"],
+        ),
+        (
+            "plan detached, its values then taken by the DEFAULT",
+            "ALTER TABLE hs DETACH PARTITION hs_p8; INSERT INTO hs VALUES (8, 9, 899)",
+            &[],
+        ),
+    ];
+    let failures = sc_run_committed_steps(dbname, mode, &setup, &imvs, &fresh, &steps);
+    probe_db_close(dbname);
+    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+}
+
+#[pg_test]
+fn v112_sc_leaves_swapped_for_empty_tables_reach_every_reader_immediate() {
+    sc_assert_leaves_swapped_for_empty_tables_reach_every_reader("reflex_sc_empty_i", "IMMEDIATE");
+}
+
+#[pg_test]
+fn v112_sc_leaves_swapped_for_empty_tables_reach_every_reader_deferred() {
+    sc_assert_leaves_swapped_for_empty_tables_reach_every_reader("reflex_sc_empty_d", "DEFERRED");
+}
+
+/// An IMV partitioned by a column it also reads from a second source that is
+/// partitioned by another column: every partition change of that source
+/// reaches it.
+fn sc_assert_partition_changes_of_a_source_partitioned_otherwise_reach_the_imv(
+    dbname: &str,
+    mode: &str,
+) {
+    let setup = [
+        "CREATE TABLE pa (plan INT NOT NULL, k INT NOT NULL, q INT NOT NULL) PARTITION BY LIST (plan)",
+        "CREATE TABLE pa_p1 PARTITION OF pa FOR VALUES IN (1)",
+        "CREATE TABLE pa_p2 PARTITION OF pa FOR VALUES IN (2)",
+        "INSERT INTO pa SELECT p, k, p * 100 + k FROM generate_series(1, 2) p, generate_series(1, 4) k",
+        "CREATE TABLE pb (region INT NOT NULL, plan INT NOT NULL, k INT NOT NULL, w INT NOT NULL) \
+         PARTITION BY LIST (region)",
+        "CREATE TABLE pb_r1 PARTITION OF pb FOR VALUES IN (1)",
+        "CREATE TABLE pb_r2 PARTITION OF pb FOR VALUES IN (2)",
+        "INSERT INTO pb SELECT 1 + (k % 2), p, k, p * 10 + k FROM generate_series(1, 2) p, generate_series(1, 4) k",
+    ];
+    let jx = "SELECT a.plan, a.k, a.q, b.w, b.region FROM pa AS a JOIN pb AS b ON b.plan = a.plan AND b.k = a.k";
+    let jx_agg = "SELECT x.plan, SUM(x.w) AS sw, COUNT(*) AS n FROM jx AS x GROUP BY x.plan";
+    let imvs = [
+        ("jx", jx, "NULL", "NULL", "ARRAY['plan']"),
+        ("jx_agg", jx_agg, "NULL", "NULL", "ARRAY[]::text[]"),
+        ("jx_ign", jx_agg, "NULL", "'!jx'", "ARRAY[]::text[]"),
+    ];
+    let fresh = |name: &str| match name {
+        "jx" => jx.to_string(),
+        _ => format!("SELECT x.plan, SUM(x.w) AS sw, COUNT(*) AS n FROM ({jx}) x GROUP BY x.plan"),
+    };
+    let steps: [ScCommittedStep<'_>; 4] = [
+        (
+            "leaf of the other source swapped",
+            "CREATE TABLE pb_r2_swap (LIKE pb); INSERT INTO pb_r2_swap SELECT region, plan, k, w + 7 FROM pb_r2; \
+             ALTER TABLE pb DETACH PARTITION pb_r2; ALTER TABLE pb ATTACH PARTITION pb_r2_swap FOR VALUES IN (2); \
+             DROP TABLE pb_r2; ALTER TABLE pb_r2_swap RENAME TO pb_r2",
+            &[],
+        ),
+        (
+            "leaf of the other source detached and dropped",
+            "ALTER TABLE pb DETACH PARTITION pb_r1; DROP TABLE pb_r1",
+            &[],
+        ),
+        (
+            "leaf of the other source attached with rows",
+            "CREATE TABLE pb_r3 (LIKE pb); INSERT INTO pb_r3 VALUES (3, 1, 1, 9001), (3, 2, 3, 9002); \
+             ALTER TABLE pb ATTACH PARTITION pb_r3 FOR VALUES IN (3)",
+            &[],
+        ),
+        (
+            "leaf of the other source swapped for an empty table under another name",
+            "CREATE TABLE pb_r3e (LIKE pb); ALTER TABLE pb DETACH PARTITION pb_r3; \
+             ALTER TABLE pb ATTACH PARTITION pb_r3e FOR VALUES IN (3); DROP TABLE pb_r3",
+            &[],
+        ),
+    ];
+    let failures = sc_run_committed_steps(dbname, mode, &setup, &imvs, &fresh, &steps);
+    probe_db_close(dbname);
+    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+}
+
+#[pg_test]
+fn v112_sc_partition_changes_of_a_source_partitioned_otherwise_reach_the_imv_immediate() {
+    sc_assert_partition_changes_of_a_source_partitioned_otherwise_reach_the_imv(
+        "reflex_sc_other_i",
+        "IMMEDIATE",
+    );
+}
+
+#[pg_test]
+fn v112_sc_partition_changes_of_a_source_partitioned_otherwise_reach_the_imv_deferred() {
+    sc_assert_partition_changes_of_a_source_partitioned_otherwise_reach_the_imv(
+        "reflex_sc_other_d",
+        "DEFERRED",
+    );
+}
+
+/// A two-level tree whose levels repeat a literal: a swapped leaf rebuilds that
+/// leaf only, every IMV over the root stays reconcilable, and a flush that
+/// fails flags every IMV and reader it leaves behind.
+fn sc_assert_repeated_bound_literals_keep_the_tree(dbname: &str, mode: &str) {
+    let setup = [
+        "CREATE TABLE tt (plan INT NOT NULL, region INT NOT NULL, k INT NOT NULL, q INT NOT NULL) \
+         PARTITION BY LIST (plan)",
+        "CREATE TABLE tt_p1 PARTITION OF tt FOR VALUES IN (1) PARTITION BY LIST (region)",
+        "CREATE TABLE tt_p1_r1 PARTITION OF tt_p1 FOR VALUES IN (1)",
+        "CREATE TABLE tt_p1_r2 PARTITION OF tt_p1 FOR VALUES IN (2)",
+        "CREATE TABLE tt_p2 PARTITION OF tt FOR VALUES IN (2) PARTITION BY LIST (region)",
+        "CREATE TABLE tt_p2_r1 PARTITION OF tt_p2 FOR VALUES IN (1)",
+        "CREATE TABLE tt_p2_r2 PARTITION OF tt_p2 FOR VALUES IN (2)",
+        "INSERT INTO tt SELECT p, r, k, p * 100 + r * 10 + k \
+         FROM generate_series(1, 2) p, generate_series(1, 2) r, generate_series(1, 3) k",
+    ];
+    let tv = "SELECT s.plan, s.region, s.k, s.q FROM tt AS s";
+    let imvs = [
+        ("tv", tv, "'plan, region, k'", "NULL", "ARRAY['plan', 'region']"),
+        ("tv2", tv, "'plan, region, k'", "NULL", "ARRAY['plan', 'region']"),
+        ("tv_obs", "SELECT v.plan, v.region, v.k, v.q FROM tv AS v", "NULL", "NULL", "ARRAY[]::text[]"),
+    ];
+    let fresh = |_: &str| tv.to_string();
+    let steps: [ScCommittedStep<'_>; 1] = [(
+        "leaf swapped",
+        "CREATE TABLE tt_p1_r1_swap (LIKE tt); INSERT INTO tt_p1_r1_swap SELECT plan, region, k, q + 5 FROM tt_p1_r1; \
+         ALTER TABLE tt_p1 DETACH PARTITION tt_p1_r1; ALTER TABLE tt_p1 ATTACH PARTITION tt_p1_r1_swap FOR VALUES IN (1); \
+         DROP TABLE tt_p1_r1; ALTER TABLE tt_p1_r1_swap RENAME TO tt_p1_r1",
+        &[],
+    )];
+    let mut failures = sc_run_committed_steps(dbname, mode, &setup, &imvs, &fresh, &steps);
+    for name in ["tv", "tv2", "tv_obs"] {
+        let result = rbc_select(&format!("reflex_reconcile('{name}')"));
+        if !result.starts_with("RECONCILED") {
+            failures.push(format!("reconcile of {name} returned {result}"));
+        }
+        let mismatches = rbc_mismatch(name, tv);
+        if mismatches != 0 {
+            failures.push(format!("after reconcile of {name}: {mismatches} mismatches"));
+        }
+    }
+    let pending = sc_text_rows("SELECT count(*)::text AS v FROM public.__reflex_partition_pending");
+    if pending != ["0"] {
+        failures.push(format!("pending roots left: {pending:?}"));
+    }
+    worker_exec(
+        "CREATE FUNCTION sc_refuse_delete() RETURNS TRIGGER LANGUAGE plpgsql AS \
+         $$ BEGIN RAISE EXCEPTION 'tv refuses deletes'; END $$",
+    );
+    worker_exec(
+        "CREATE TRIGGER sc_refuse_delete BEFORE DELETE ON tv \
+         FOR EACH STATEMENT EXECUTE FUNCTION sc_refuse_delete()",
+    );
+    // Read inside the transaction, then rolled back: a flush that fails again
+    // at COMMIT aborts the backend
+    // (untreated_bugs/2026-10-13_error_in_the_commit_time_partition_flush_aborts_the_backend.md).
+    worker_exec("BEGIN");
+    worker_exec("ALTER TABLE tt_p2 DETACH PARTITION tt_p2_r2");
+    worker_exec("DO $$ BEGIN PERFORM reflex_flush_partitions(); END $$");
+    let flagged = sc_text_rows(
+        "SELECT name AS v FROM public.__reflex_ivm_reference WHERE known_stale ORDER BY name",
+    );
+    worker_exec("ROLLBACK");
+    if flagged != ["tv", "tv2", "tv_obs"] {
+        failures.push(format!("after a failed flush, flagged {flagged:?}"));
+    }
+    probe_db_close(dbname);
+    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+}
+
+#[pg_test]
+fn v112_sc_repeated_bound_literals_keep_the_tree_immediate() {
+    sc_assert_repeated_bound_literals_keep_the_tree("reflex_sc_ll_i", "IMMEDIATE");
+}
+
+#[pg_test]
+fn v112_sc_repeated_bound_literals_keep_the_tree_deferred() {
+    sc_assert_repeated_bound_literals_keep_the_tree("reflex_sc_ll_d", "DEFERRED");
+}
+
+/// A partition kept because the query still fills it is not an audit or doctor
+/// finding: no remedy that keeps it is ever printed.
+#[pg_test]
+fn v112_sc_kept_partition_is_not_an_audit_finding() {
+    let setup = [
+        "CREATE TABLE gs (plan INT NOT NULL, k INT NOT NULL, q INT NOT NULL) PARTITION BY LIST (plan)",
+        "CREATE TABLE gs_p1 PARTITION OF gs FOR VALUES IN (1)",
+        "CREATE TABLE gs_p2 PARTITION OF gs FOR VALUES IN (2)",
+        "CREATE TABLE gs_p3 PARTITION OF gs FOR VALUES IN (3)",
+        "INSERT INTO gs SELECT p, k, p * 100 + k FROM generate_series(1, 3) p, generate_series(1, 4) k",
+        "CREATE TABLE gmap (src_plan INT NOT NULL, plan INT NOT NULL, PRIMARY KEY (src_plan, plan))",
+        "INSERT INTO gmap VALUES (1, 1), (2, 2), (3, 3), (1, 3)",
+    ];
+    let gx = "SELECT m.plan, s.k, s.q FROM gs AS s JOIN gmap AS m ON m.src_plan = s.plan";
+    let imvs = [
+        ("gx", gx, "NULL", "NULL", "ARRAY['plan']"),
+        ("gx_agg", "SELECT x.plan, SUM(x.q) AS sq, COUNT(*) AS n FROM gx AS x GROUP BY x.plan", "NULL", "NULL", "ARRAY[]::text[]"),
+    ];
+    let fresh = |name: &str| match name {
+        "gx" => gx.to_string(),
+        _ => format!("SELECT x.plan, SUM(x.q) AS sq, COUNT(*) AS n FROM ({gx}) x GROUP BY x.plan"),
+    };
+    let steps: [ScCommittedStep<'_>; 1] =
+        [("plan 3 detached", "ALTER TABLE gs DETACH PARTITION gs_p3", &[])];
+    let mut failures =
+        sc_run_committed_steps("reflex_sc_kept_audit", "IMMEDIATE", &setup, &imvs, &fresh, &steps);
+    let kept = sc_text_rows(
+        "SELECT c.relname::text AS v FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid \
+         WHERE i.inhparent = 'gx'::regclass AND c.relname = 'gx_gs_p3'",
+    );
+    if kept.is_empty() {
+        failures.push("the partition fed by plan 1 was not kept".to_string());
+    }
+    let audit = sc_text_rows(
+        "SELECT r AS v FROM reflex_audit('gx') AS r \
+         WHERE r ~ '(no source counterpart|unexpected child partitions)'",
+    );
+    if !audit.is_empty() {
+        failures.push(format!("audit reports the kept partition: {audit:?}"));
+    }
+    let doctor = sc_text_rows(
+        "SELECT check_id || ': ' || coalesce(object, '') AS v FROM reflex_doctor('gx') \
+         WHERE check_id = 'F3'",
+    );
+    if !doctor.is_empty() {
+        failures.push(format!("doctor reports the kept partition: {doctor:?}"));
+    }
+    probe_db_close("reflex_sc_kept_audit");
+    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+}
