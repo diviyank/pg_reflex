@@ -2058,6 +2058,7 @@ fn sc_assert_detached_rows_reach_every_reader(dbname: &str, mode: &str) {
         ("dep_agg", "SELECT COUNT(*) AS n, SUM(sv) AS t FROM agg", "NULL", "NULL", "ARRAY[]::text[]"),
         ("dep_keyed", "SELECT g, COUNT(*) AS c FROM keyed GROUP BY g", "NULL", "NULL", "ARRAY[]::text[]"),
         ("ign_keyed", "SELECT g, COUNT(*) AS c FROM keyed GROUP BY g", "NULL", "'!keyed'", "ARRAY[]::text[]"),
+        ("dep_of_dep", "SELECT COUNT(*) AS n, SUM(c) AS t FROM dep_keyed", "NULL", "NULL", "ARRAY[]::text[]"),
     ];
     for (name, sql, keys, ignore, partition_by) in imvs {
         let call = format!(
@@ -2071,6 +2072,10 @@ fn sc_assert_detached_rows_reach_every_reader(dbname: &str, mode: &str) {
         "keyed" => "SELECT id, g, v FROM s".to_string(),
         "dep_agg" => {
             "SELECT COUNT(*) AS n, SUM(sv) AS t FROM (SELECT SUM(v) AS sv FROM s GROUP BY g) x"
+                .to_string()
+        }
+        "dep_of_dep" => {
+            "SELECT COUNT(*) AS n, SUM(c) AS t FROM (SELECT COUNT(*) AS c FROM s GROUP BY g) x"
                 .to_string()
         }
         _ => "SELECT g, COUNT(*) AS c FROM s GROUP BY g".to_string(),
@@ -2120,4 +2125,93 @@ fn v112_sc_detached_rows_reach_every_reader_immediate() {
 #[pg_test]
 fn v112_sc_detached_rows_reach_every_reader_deferred() {
     sc_assert_detached_rows_reach_every_reader("reflex_sc_detach_d", "DEFERRED");
+}
+
+/// An IMV partitioned by a column it takes from a joined table holds, in the
+/// partition named after a source partition, rows that other source partitions
+/// feed. Those rows outlive the source partition, through the drop and through
+/// every reconcile, and the IMVs reading it follow.
+fn sc_assert_partitions_fed_through_a_join_keep_their_rows(dbname: &str, mode: &str) {
+    probe_db_open(dbname);
+    for ddl in [
+        "CREATE TABLE zs (plan INT NOT NULL, k INT NOT NULL, q INT) PARTITION BY LIST (plan)",
+        "CREATE TABLE zs_p1 PARTITION OF zs FOR VALUES IN (1)",
+        "CREATE TABLE zs_p2 PARTITION OF zs FOR VALUES IN (2)",
+        "CREATE TABLE zs_p3 PARTITION OF zs FOR VALUES IN (3)",
+        "CREATE TABLE zs_p4 PARTITION OF zs FOR VALUES IN (4)",
+        "INSERT INTO zs SELECT p, k, p * 10 + k FROM generate_series(1, 4) p, generate_series(1, 4) k",
+        "CREATE TABLE zmap (src_plan INT NOT NULL, plan INT NOT NULL, PRIMARY KEY (src_plan, plan))",
+        "INSERT INTO zmap VALUES (1, 1), (1, 2), (1, 3), (2, 2), (3, 3), (4, 4)",
+    ] {
+        worker_exec(ddl);
+    }
+    let mode = sql_lit(mode);
+    let mapped = "SELECT m.plan, v.k, v.q FROM zv AS v JOIN zmap AS m ON m.src_plan = v.plan";
+    let imvs = [
+        ("zv", "SELECT s.plan, s.k, s.q FROM zs AS s", "'plan, k'", "NULL", "ARRAY['plan']"),
+        ("zx_ign", mapped, "'plan, k, q'", "'!zv'", "ARRAY['plan']"),
+        ("zx_obs", mapped, "NULL", "NULL", "ARRAY['plan']"),
+        ("zx_agg", "SELECT x.plan, SUM(x.q) AS sq, COUNT(*) AS n FROM zx_obs AS x GROUP BY x.plan", "NULL", "NULL", "ARRAY['plan']"),
+        ("zx_tot", "SELECT COUNT(*) AS n, SUM(x.q) AS t FROM zx_ign AS x", "NULL", "NULL", "ARRAY[]::text[]"),
+    ];
+    for (name, sql, keys, ignore, partition_by) in imvs {
+        let call = format!(
+            "create_reflex_ivm('{name}', {}, {keys}, NULL, {mode}, {ignore}, {partition_by})",
+            sql_lit(sql)
+        );
+        assert_eq!(rbc_select(&call), "CREATE REFLEX INCREMENTAL VIEW", "{call}");
+    }
+    let mapped_fresh = "SELECT m.plan, v.k, v.q FROM zs AS v JOIN zmap AS m ON m.src_plan = v.plan";
+    let fresh = |name: &str| match name {
+        "zv" => "SELECT s.plan, s.k, s.q FROM zs AS s".to_string(),
+        "zx_agg" => format!("SELECT x.plan, SUM(x.q) AS sq, COUNT(*) AS n FROM ({mapped_fresh}) x GROUP BY x.plan"),
+        "zx_tot" => format!("SELECT COUNT(*) AS n, SUM(x.q) AS t FROM ({mapped_fresh}) x"),
+        _ => mapped_fresh.to_string(),
+    };
+    let mut failures = Vec::new();
+    let check = |label: &str, failures: &mut Vec<String>| {
+        for (name, ..) in imvs {
+            // An ordinary write to zv does not reach zx_ign, by its ignore list.
+            if label == "write to plan 1" && ["zx_ign", "zx_tot"].contains(&name) {
+                continue;
+            }
+            let mismatches = rbc_mismatch(name, &fresh(name));
+            if mismatches != 0 {
+                failures.push(format!("{label}: {name}: {mismatches} mismatches"));
+                rbc_select(&format!("reflex_reconcile('{name}')"));
+            }
+        }
+    };
+    check("after create", &mut failures);
+    for (label, statements) in [
+        ("plan 3 detached and dropped", "ALTER TABLE zs DETACH PARTITION zs_p3; DROP TABLE zs_p3"),
+        ("write to plan 1", "INSERT INTO zs VALUES (1, 9, 199)"),
+        ("plan 4 detached", "ALTER TABLE zs DETACH PARTITION zs_p4"),
+    ] {
+        worker_exec(&format!("BEGIN; {statements}; COMMIT"));
+        check(label, &mut failures);
+        if label == "write to plan 1" {
+            rbc_select("reflex_reconcile('zx_ign')");
+            check("reconcile of zx_ign after the write", &mut failures);
+        }
+    }
+    for name in ["zv", "zx_ign", "zx_obs", "zx_agg", "zx_tot"] {
+        let result = rbc_select(&format!("reflex_reconcile('{name}')"));
+        if !result.starts_with("RECONCILED") {
+            failures.push(format!("reconcile of {name} returned {result}"));
+        }
+        check(&format!("after reconcile of {name}"), &mut failures);
+    }
+    probe_db_close(dbname);
+    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+}
+
+#[pg_test]
+fn v112_sc_partitions_fed_through_a_join_keep_their_rows_immediate() {
+    sc_assert_partitions_fed_through_a_join_keep_their_rows("reflex_sc_fedjoin_i", "IMMEDIATE");
+}
+
+#[pg_test]
+fn v112_sc_partitions_fed_through_a_join_keep_their_rows_deferred() {
+    sc_assert_partitions_fed_through_a_join_keep_their_rows("reflex_sc_fedjoin_d", "DEFERRED");
 }
