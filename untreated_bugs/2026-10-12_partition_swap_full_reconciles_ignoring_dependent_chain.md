@@ -82,9 +82,9 @@ reason.
    partition of the source may feed any of its partitions (`partition_by` naming a column
    taken from a joined table, or a shape the proof of item 2 cannot read). A partition of
    such an IMV that the query still fills is kept, never dropped, and is renamed to the
-   incoming child at a bound collision. The field shapes `sop_forecast_view` and
-   `sop_last_forecast_view` project the partition columns straight from the mirrored source
-   over INNER/LEFT joins, which the proof accepts.
+   incoming child at a bound collision. The benchmark's `sop_forecast_view` shape is proven
+   (its swap timings are unchanged); `sop_last_forecast_view` has the same form (partition
+   column projected from the mirrored source, INNER/LEFT joins) but was not run.
 10. **A reconcile queued for COMMIT from inside a trigger** still becomes a whole one, and a
    node reached both by the cascade and by that COMMIT-time reconcile is refreshed twice:
    `2026-10-02_in_trigger_scoped_reconcile_escalates_to_full_commit_rebuild.md`.
