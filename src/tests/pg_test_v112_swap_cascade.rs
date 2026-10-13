@@ -2669,3 +2669,54 @@ fn v112_sc_swaps_in_two_schemas_do_not_wait_on_each_other_immediate() {
 fn v112_sc_swaps_in_two_schemas_do_not_wait_on_each_other_deferred() {
     sc_assert_swaps_in_two_schemas_do_not_wait_on_each_other("reflex_sc_two_d", "DEFERRED");
 }
+
+/// A plan dropped from the source reaches the readers of an IMV that ignores
+/// the mirroring IMV: they ignore the IMV the catch-up refreshes, so a refresh
+/// of the dropped keys behind its root alone never reaches them.
+fn sc_assert_readers_of_an_ignoring_reader_see_a_dropped_plan(dbname: &str, mode: &str) {
+    let setup = [
+        "CREATE TABLE ws (plan INT NOT NULL, k INT NOT NULL, q INT NOT NULL, PRIMARY KEY (plan, k)) \
+           PARTITION BY LIST (plan)",
+        "CREATE TABLE ws_p1 PARTITION OF ws FOR VALUES IN (1)",
+        "CREATE TABLE ws_p2 PARTITION OF ws FOR VALUES IN (2)",
+        "CREATE TABLE ws_p3 PARTITION OF ws FOR VALUES IN (3)",
+        "INSERT INTO ws SELECT p, k, p * 100 + k FROM generate_series(1, 3) p, generate_series(1, 4) k",
+    ];
+    let imvs = [
+        ("wv", "SELECT s.plan, s.k, s.q FROM ws AS s", "'plan, k'", "NULL", "ARRAY['plan']"),
+        ("wp", "SELECT v.plan, v.k, v.q FROM wv AS v", "'plan, k'", "'!wv'", "ARRAY['plan']"),
+        ("wp_agg", "SELECT a.plan, SUM(a.q) AS sq, COUNT(*) AS n FROM wp AS a GROUP BY a.plan", "'plan'", "'!wp'", "ARRAY[]::text[]"),
+        ("wp_x", "SELECT a.plan, a.k, a.q, b.q AS rq FROM wp AS a JOIN wp AS b ON b.plan = 1 AND b.k = a.k", "'plan, k'", "'!wp'", "ARRAY['plan']"),
+        ("wp_deep", "SELECT c.plan, c.sq FROM wp_agg AS c WHERE c.sq > 0", "'plan'", "'!wp_agg'", "ARRAY[]::text[]"),
+    ];
+    let fresh = |name: &str| {
+        let rows = "SELECT s.plan, s.k, s.q FROM ws AS s";
+        let groups = format!("SELECT a.plan, SUM(a.q) AS sq, COUNT(*) AS n FROM ({rows}) AS a GROUP BY a.plan");
+        match name {
+            "wp_agg" => groups,
+            "wp_x" => format!(
+                "SELECT a.plan, a.k, a.q, b.q AS rq FROM ({rows}) AS a \
+                 JOIN ({rows}) AS b ON b.plan = 1 AND b.k = a.k"
+            ),
+            "wp_deep" => format!("SELECT c.plan, c.sq FROM ({groups}) AS c WHERE c.sq > 0"),
+            _ => rows.to_string(),
+        }
+    };
+    let steps: [ScCommittedStep<'_>; 2] = [
+        ("plan 3 detached and dropped", "ALTER TABLE ws DETACH PARTITION ws_p3; DROP TABLE ws_p3", &[]),
+        ("plan 2 detached", "ALTER TABLE ws DETACH PARTITION ws_p2", &[]),
+    ];
+    let failures = sc_run_committed_steps(dbname, mode, &setup, &imvs, &fresh, &steps);
+    probe_db_close(dbname);
+    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+}
+
+#[pg_test]
+fn v112_sc_readers_of_an_ignoring_reader_see_a_dropped_plan_immediate() {
+    sc_assert_readers_of_an_ignoring_reader_see_a_dropped_plan("reflex_sc_rir_i", "IMMEDIATE");
+}
+
+#[pg_test]
+fn v112_sc_readers_of_an_ignoring_reader_see_a_dropped_plan_deferred() {
+    sc_assert_readers_of_an_ignoring_reader_see_a_dropped_plan("reflex_sc_rir_d", "DEFERRED");
+}
