@@ -2077,22 +2077,35 @@ fn sc_assert_detached_rows_reach_every_reader(dbname: &str, mode: &str) {
         _ => "SELECT g, COUNT(*) AS c FROM s GROUP BY g".to_string(),
     };
     let mut failures = Vec::new();
-    for (label, statements) in [
-        ("detach", "ALTER TABLE s DETACH PARTITION s_pa"),
-        ("detach and drop", "ALTER TABLE s DETACH PARTITION s_pc; DROP TABLE s_pc"),
-        ("detach and write", "ALTER TABLE s DETACH PARTITION s_pd; INSERT INTO s VALUES (7, 'e', 13)"),
-        ("two detaches", "ALTER TABLE s DETACH PARTITION s_pe; ALTER TABLE s ATTACH PARTITION s_pa FOR VALUES IN ('a', 'b'); ALTER TABLE s DETACH PARTITION s_pa"),
+    // ign_keyed is told nothing of a write to keyed, by its ignore list: the
+    // step that writes is checked on the IMVs that observe the write.
+    let observing_the_write = |name: &&str| *name != "ign_keyed";
+    for (label, statements, write) in [
+        ("detach", "ALTER TABLE s DETACH PARTITION s_pa", false),
+        ("detach and drop", "ALTER TABLE s DETACH PARTITION s_pc; DROP TABLE s_pc", false),
+        ("detach and write", "ALTER TABLE s DETACH PARTITION s_pd; INSERT INTO s VALUES (7, 'e', 13)", true),
+        ("two detaches", "ALTER TABLE s DETACH PARTITION s_pe; ALTER TABLE s ATTACH PARTITION s_pa FOR VALUES IN ('a', 'b'); ALTER TABLE s DETACH PARTITION s_pa", false),
     ] {
         if let Err(error) = chain.commit(statements) {
             failures.push(format!("{label}: raised {error}"));
             continue;
         }
-        for (name, ..) in imvs {
+        for name in imvs.map(|(name, ..)| name).iter().filter(|name| !write || observing_the_write(name)) {
             let mismatches = rbc_mismatch(name, &fresh(name));
             if mismatches != 0 {
-                failures.push(format!("{label}: {name}: {mismatches} mismatches"));
+                failures.push(format!(
+                    "{label}: {name}: {mismatches} mismatches; holds {:?}, query {:?}",
+                    sc_text_rows(&format!("SELECT to_jsonb(t)::text AS v FROM {name} t ORDER BY 1")),
+                    sc_text_rows(&format!(
+                        "SELECT to_jsonb(t)::text AS v FROM ({}) t ORDER BY 1",
+                        fresh(name)
+                    )),
+                ));
                 rbc_select(&format!("reflex_reconcile('{name}')"));
             }
+        }
+        if write {
+            rbc_select("reflex_reconcile('ign_keyed')");
         }
     }
     probe_db_close(dbname);
