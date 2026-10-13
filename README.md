@@ -83,7 +83,7 @@ git pull
 psql -d mydb -c "ALTER EXTENSION pg_reflex UPDATE;"
 ```
 
-Existing IMVs, triggers, and data are preserved across upgrades. No need to recreate views.
+Existing IMVs, triggers, and data are preserved across upgrades. Unless the notes of a release say otherwise, there is no need to recreate views. **1.12.0 says otherwise: run `ALTER EXTENSION pg_reflex UPDATE TO '1.12.0'` right after installing the library (until it runs, partition DDL on a source fails at COMMIT), then recreate every IMV.** The steps, the definitions it now refuses and the shapes that become slower are in [`docs/getting-started/upgrading.md`](docs/getting-started/upgrading.md#upgrading-to-1120).
 
 ## Quick Start
 
@@ -343,9 +343,10 @@ SELECT create_reflex_ivm('typed_totals',
 |--------|:---------:|-------|
 | Passthrough (no agg) | Yes | Complex JOINs/filters without GROUP BY. INSERT is incremental (O(delta)); DELETE/UPDATE do full refresh from source |
 | `GROUP BY` | Yes | Required for aggregate queries |
-| `WHERE` | Yes | Static filters only (no `NOW()` or `RANDOM()`) |
+| `WHERE` | Yes | Static filters only (no clock, session or `VOLATILE` function) |
 | `JOIN` (INNER) | Yes | Triggers created on each source table |
-| `LEFT/RIGHT JOIN` | Yes | Parsed and used, same trigger mechanism |
+| `LEFT JOIN` | Yes | Parsed and used, same trigger mechanism |
+| `RIGHT JOIN` | Yes | Recomputed from the query on every write to any source; write it as a `LEFT JOIN` with the tables swapped to keep writes to the preserved table incremental |
 | `HAVING` | Yes | Rewritten to filter on intermediate columns; aggregates not in SELECT are auto-added |
 | `DISTINCT` | Yes | Without GROUP BY, columns become implicit group keys |
 | `CTE (WITH)` | Yes | Each CTE becomes a sub-IMV; passthrough main body becomes a VIEW |
@@ -862,7 +863,7 @@ Trigger overhead only (GROUP BY + SUM/COUNT), measured in isolation.
 - **Passthrough DELETE/UPDATE with exact duplicates:** Passthrough IMVs use row-matching for incremental DELETE/UPDATE. If the view contains rows that are identical across ALL columns (exact duplicates), a single-row delete may remove multiple matching rows. This is rare in practice (most queries include a PK or unique column).
 - **Recursive CTEs:** `WITH RECURSIVE` is not supported.
 - **MIN/MAX on DELETE:** the stored extremum is nulled on every retraction and re-derived from the source, scoped to the groups affected by the delta (not the full table). Workloads that retract from the same hot group repeatedly may still re-scan that group's rows on each flush. `BOOL_OR` is algebraic since 1.1.3 and carries no retraction cost.
-- **Non-deterministic functions:** `NOW()`, `RANDOM()`, `CURRENT_DATE` in WHERE clauses are not supported -- the view definition must be static.
+- **Non-deterministic functions:** clock and session functions (`NOW()`, `RANDOM()`, `CURRENT_DATE`, …) and any function PostgreSQL labels `VOLATILE` are rejected anywhere in the query -- the view definition must be static. A deterministic user function must be declared `IMMUTABLE` or `STABLE`.
 - **Subqueries with aggregation in FROM:** `SELECT ... FROM (SELECT SUM(x) ... GROUP BY y) AS sub` is not supported — use a CTE (`WITH sub AS (...)`) instead, which pg_reflex decomposes into sub-IMVs automatically. Simple subqueries without aggregation (e.g., WHERE filters) work correctly.
 
 ## Monitoring

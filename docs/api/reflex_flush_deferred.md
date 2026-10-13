@@ -9,8 +9,14 @@ reflex_flush_deferred(source_table TEXT) RETURNS TEXT
 ```
 
 Returns a status string with the count of IMVs processed (e.g.
-`'FLUSHED 3 DEFERRED OPERATIONS'`, or `'NO DEFERRED IMVS'` when nothing depends
-on the source).
+`'FLUSHED 3 DEFERRED OPERATIONS'`). When no enabled DEFERRED IMV depends on
+the source it returns `NO DEFERRED IMVS: no enabled DEFERRED IMV depends on
+'<source>'` and, called directly, raises a `WARNING` (1.12.0; the string was
+`'NO DEFERRED IMVS'` before). A client that tests the result should compare
+its prefix.
+
+The source may be written in any spelling (`t`, `"t"`, `public.t`): the
+flush reaches every IMV that registered the table.
 
 ## `ignore_sources` is honored
 

@@ -23,5 +23,5 @@ Each filtered aggregate gets its own intermediate column (`__sum_amount_refunds`
 
 ## Limitations
 
-- `FILTER` cannot reference subqueries or non-deterministic functions (`NOW()`, `RANDOM()`).
+- `FILTER` cannot reference non-deterministic functions (`NOW()`, `RANDOM()`, any `VOLATILE` function). A subquery is accepted; writes to the table it reads recompute the IMV from its query.
 - `COUNT(DISTINCT x) FILTER (WHERE cond)` is not yet supported.

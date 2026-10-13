@@ -47,8 +47,10 @@ Previously, table-qualified arguments on non-numeric MIN/MAX would fail with a t
 
 ## Unsupported aggregates
 
-`STRING_AGG`, `ARRAY_AGG`, `JSON_AGG`, `JSONB_AGG`, `XMLAGG`, `STDDEV`, `VARIANCE`, `PERCENTILE_*` — emit a `WARNING` at create time and are silently dropped from the IMV. Use `MATERIALIZED VIEW` for these.
+Any aggregate other than `SUM`, `COUNT`, `AVG`, `MIN`, `MAX`, `BOOL_OR` (`STRING_AGG`, `ARRAY_AGG`, `JSON_AGG`, `JSONB_AGG`, `XMLAGG`, `STDDEV`, `VARIANCE`, `PERCENTILE_*`, extension and user-defined aggregates) is rejected at create time. One shape is accepted: a single-level query with no `GROUP BY` and no unique key, recomputed from its query on every write. Use `MATERIALIZED VIEW` otherwise.
 
-`SUM(DISTINCT x)`, `AVG(DISTINCT x)`, `MIN/MAX/BOOL_OR(DISTINCT x)` are rejected (only `COUNT(DISTINCT x)` is supported).
+`SUM(DISTINCT x)`, `AVG(DISTINCT x)`, `MIN/MAX/BOOL_OR(DISTINCT x)` are rejected (only `COUNT(DISTINCT x)` is supported), as is `COUNT(DISTINCT x)` inside an expression or twice in one SELECT list.
+
+`SUM` / `AVG` over `REAL`, and `SUM` over `money`, an interval or a time, are rejected: sum `(x)::numeric`. `SUM` / `AVG` over `DOUBLE PRECISION` are accepted and can differ from the query in the last digits. See [Unsupported shapes](../limitations/unsupported-shapes.md#sum-avg-over-real-money-intervals-and-times).
 
 [Top-K MIN/MAX deep dive :material-arrow-right-bold:](../concepts/topk.md){ .md-button }

@@ -29,6 +29,9 @@ Each repair runs in its own subtransaction, so one failure records `failed:<err>
 
 Since 1.10.9 the underlying audit is crash-isolated per check: a check that raises a Postgres error becomes a `check-errored` finding rather than aborting the whole run. Whole-database scope (`target => NULL`) additionally surfaces orphan aux tables (**F9** — orphan intermediate/staging/scratch, with their `DROP … CASCADE`) and duplicate trigger functions (**F11**), both report-only. Since 1.11.4 an unacknowledged unsound `ignore_sources` entry is surfaced as **F13** (`ignore-soundness`), also report-only: its remedy, `reflex_ack_ignore_source(imv, source)`, records an operator's acceptance of a divergence risk and is never auto-executed. Also since 1.11.4, an IMV with partitions queued for heal after an ignored source changed is reported as **F14**. Its action is `SELECT reflex_heal_ignored_sources('<imv>');`, which `fix => TRUE` runs before the stale repairs, reporting `fixed` only once the IMV's queue is empty (see [`reflex_heal_ignored_sources`](reflex_heal_ignored_sources.md)). F14 also reports, as a `WARNING` that `fix => TRUE` skips (`skipped(needs recreate)`), an IMV whose ignored source lost a mapped or watched column; recreating the IMV against the current columns clears it. Archive-residue (F5/F6) repairs use `reflex_reconcile_partition` per partition, collapsing to a single `reflex_reconcile(<imv>)` when more than three partitions of one IMV are affected.
 
+!!! warning "Trigger findings are not forwarded"
+    `reflex_doctor` returns no row for the `trigger-attached` and `trigger-mode-matches` findings of [`reflex_audit`](reflex_audit.md): a source or a partition that lost a trigger, or whose trigger is disabled, is reported by `reflex_audit` only. Run `SELECT reflex_audit();` as well; its remedy for these findings is `reflex_rebuild_triggers('<source>')` then `reflex_reconcile('<imv>')`.
+
 ## Example: dry-run (report only)
 
 ```sql

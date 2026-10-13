@@ -21,6 +21,8 @@ __reflex_trigger_trunc_on_<source>   AFTER TRUNCATE
 
 The trigger body loops over `__reflex_ivm_reference` and computes the delta per IMV. Adding a second IMV on the same source piggybacks on existing triggers — no extra trigger overhead per source row.
 
+A partitioned source carries two more, and each table of its partition tree six of its own (1.12.0): see [Per-source triggers](architecture.md#per-source-triggers).
+
 ## The dispatch DO block
 
 Every grouped non-MIN/MAX flush is wrapped in a per-IMV `DO` block that picks one of two paths based on selectivity (`src/trigger/dispatch.rs` · `build_high_selectivity_dispatch_sql`):
@@ -215,7 +217,9 @@ When the user adds a new partition to a source — `ALTER TABLE parent ATTACH PA
 
 1. Iterates `pg_event_trigger_ddl_commands()`.
 2. For each `ALTER TABLE` it treats the object identity as the candidate parent. For each `CREATE TABLE` it looks up `pg_inherits` to determine whether the new table was attached as a partition of some parent (this catches both `CREATE TABLE … PARTITION OF` and `ATTACH PARTITION` paths regardless of how Postgres labels the `object_type`).
-3. For every partitioned IMV (`partition_columns IS NOT NULL`) whose `depends_on` contains that parent, it calls `reflex_sync_partitions(view, drop_orphans=>FALSE)`. The sync is idempotent and advisory-lock protected; duplicates within one transaction collapse harmlessly.
+3. For every partitioned IMV (`partition_columns IS NOT NULL`) whose `depends_on` names that parent, it calls `reflex_sync_partitions(view, drop_orphans=>FALSE)`. The sync is idempotent and advisory-lock protected; duplicates within one transaction collapse harmlessly.
+
+A registered spelling is matched to the parent by `public.__reflex_reads_relation(depends_on, parent)` (1.12.0): a spelling without a schema names a table of `public`, so partition DDL on `tb.t` does not reach the IMVs of `public.t`. The same function picks the root to queue in `__reflex_partition_pending` for the COMMIT-time flush, and the IMVs the flush reconciles.
 
 `drop_orphans=FALSE` is deliberate: DETACH on the source is not a delete signal. The IMV partition may still hold data the operator wants to query. To drop orphans, call `reflex_sync_partitions(view, true)` manually.
 
@@ -235,9 +239,9 @@ The capture mechanism depends on *how* rows reach the source. The full coverage 
 |---|---|---|
 | `DETACH`/`ATTACH PARTITION` swap | **Event trigger → enqueue → flush** (this section) | No |
 | Ordinary DML through the **root** (`INSERT/UPDATE/DELETE yse.sales_simulation`) | The root statement trigger — its transition table captures all routed rows, including rows landing in newly-attached sub-partitions | No |
-| Ordinary DML **directly against a leaf** (`UPDATE sales_simulation_p_172_2025_03 …`) | Not captured automatically — detectable via the audit drift-check | No |
+| Ordinary DML **directly against a leaf or branch** (`UPDATE sales_simulation_p_172_2025_03 …`) | The source's write and TRUNCATE triggers installed on every table of the tree (1.12.0; not captured before) | Yes |
 
-The key fact: **statement-level triggers with transition tables fire only for the table named in the SQL command, and `ATTACH`/`DETACH` are DDL that fire no DML trigger at all** (and an attached partition's rows pre-exist any trigger). So a swap can only be captured by a *reconcile*, driven by a PostgreSQL **event trigger** — never by a row/statement trigger on the partition. This is why pg_reflex places **no triggers on sub-partitions**: a newly-attached sub-partition needs zero trigger management.
+The key fact: **statement-level triggers with transition tables fire only for the table named in the SQL command, and `ATTACH`/`DETACH` are DDL that fire no DML trigger at all** (and an attached partition's rows pre-exist any trigger). So a swap can only be captured by a *reconcile*, driven by a PostgreSQL **event trigger** — never by a row/statement trigger on the partition. A statement addressed to a partition fires that partition's triggers only, so since 1.12.0 every table of the tree carries the source's triggers, installed for a new or attached partition at the COMMIT of its DDL (see [Per-source triggers](architecture.md#per-source-triggers)). For the same reason a partition, or a table of an inheritance hierarchy, is refused as a source at create.
 
 ### Full-hierarchy mirroring
 

@@ -26,6 +26,13 @@ Additional checks:
 - **`archive_residue`** (severity: Drift) — a partitioned IMV partition that is empty while its authoritative source (listed in `ignore_sources`) has rows for that partition key. Suggests `reflex_reconcile_partition` to fix.
 - **`bare_name_ambiguity`** (severity: Drift) — an unqualified `depends_on` entry that resolves to a relation in more than one schema (detection-only; register schema-qualified names to fix).
 
+Changes in 1.12.0:
+
+- **`trigger-attached`** also reports disabled triggers (`Source <s> has disabled trigger(s): …`) and, for a partitioned source, each table of its partition tree (`Table <t> of the partition tree of source <s> is missing trigger(s): … and has disabled trigger(s): …`). The remedy of every `trigger-attached` finding is two statements: `SELECT reflex_rebuild_triggers('<source>');` then `SELECT reflex_reconcile('<imv>');`.
+- **`trigger-mode-matches`** expects DEFERRED trigger functions on a source that any DEFERRED IMV reads, whatever the mode of the IMV audited: an IMMEDIATE IMV sharing a source with a DEFERRED one is no longer reported.
+- **`internal-tables-exist`** requires `__reflex_scratch_<imv>` and, for a top-K MIN / MAX IMV, `__reflex_shrunk_<imv>`, and no longer demands `__reflex_affected_<imv>` for an ungrouped aggregate. `reflex_reconcile` recreates a missing scratch table.
+- **`partition-mirror`**: the remedy for a dropped leaf is `SELECT reflex_sync_partitions('<imv>'); SELECT reflex_reconcile_partition('<imv>', '', '<source partition>');`.
+
 ## Examples
 
 ```sql

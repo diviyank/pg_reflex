@@ -219,7 +219,7 @@ SELECT create_reflex_ivm('region_summary',
      headcount AS (
          SELECT region, COUNT(*) AS n FROM employees GROUP BY region
      )
-     SELECT r.region, revenue.r, headcount.n
+     SELECT revenue.region, revenue.r, headcount.n
        FROM revenue
        JOIN headcount USING (region)');
 ```
