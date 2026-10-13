@@ -608,15 +608,25 @@ pub(crate) fn outer_join_secondary_stmts(
     let qv = quote_identifier(view_name);
 
     if plan.is_passthrough {
-        match plan.passthrough_key_mappings.get(source_table) {
+        // A FULL JOIN delta surfaces unmatched rows from the OTHER side that
+        // keyed scoping on this source's join keys cannot capture. It is
+        // scoped only by the output columns proven to carry the source row's
+        // value (`COALESCE` over the two columns the FULL JOIN equates): a
+        // source row only matches other-side rows of its own values, so the
+        // rows of those values are all a change can reach.
+        let full_join_mappings: Option<Vec<(String, String)>> =
+            outer_join::holds_full_join(base_query).then(|| {
+                crate::cascade::columns_following(base_query, source_table)
+                    .into_iter()
+                    .map(|column| (column.clone(), column))
+                    .collect()
+            });
+        let mappings = match &full_join_mappings {
+            Some(aligned) => Some(aligned),
+            None => plan.passthrough_key_mappings.get(source_table),
+        };
+        match mappings {
             Some(mappings) if !mappings.is_empty() => {
-                if outer_join::holds_full_join(base_query) {
-                    // A FULL JOIN delta surfaces unmatched rows from the OTHER
-                    // side that keyed scoping (on this secondary's join keys)
-                    // cannot capture — keep the safe full rebuild.
-                    stmts.push(rebuild_target_stmt(view_name, base_query));
-                    return;
-                }
                 let target_cols: Vec<String> =
                     mappings.iter().map(|(t, _)| format!("\"{}\"", t)).collect();
                 // Changed secondary join keys, drawn only from the transition
@@ -631,27 +641,31 @@ pub(crate) fn outer_join_secondary_stmts(
                 //   target name so the membership subquery's projection matches the
                 //   target columns being filtered (the secondary's join column may
                 //   differ from the IMV output name, e.g. b.a_id projected as "id").
-                let alias_pairs: Vec<String> = mappings
-                    .iter()
-                    .map(|(t, s)| format!("\"{}\" AS \"{}\"", s, t))
-                    .collect();
-                let ap = alias_pairs.join(", ");
+                // A proven FULL JOIN column is read qualified by its transition
+                // table, so a column the source lacks raises instead of binding
+                // to the target's column of that name.
+                let scoped_by_proof = full_join_mappings.is_some();
+                let keys_of = |transition: &str| -> String {
+                    let pairs: Vec<String> = mappings
+                        .iter()
+                        .map(|(t, s)| {
+                            if scoped_by_proof {
+                                format!("\"{transition}\".\"{s}\" AS \"{t}\"")
+                            } else {
+                                format!("\"{s}\" AS \"{t}\"")
+                            }
+                        })
+                        .collect();
+                    format!("SELECT {} FROM \"{transition}\"", pairs.join(", "))
+                };
                 let needs_new = matches!(operation, "INSERT" | "INSERT_PROMOTED" | "UPDATE");
                 let needs_old = matches!(operation, "DELETE" | "DELETE_PROMOTED" | "UPDATE");
                 let mut sides: Vec<String> = Vec::new();
                 if needs_old {
-                    sides.push(format!(
-                        "SELECT {ap} FROM \"{old}\"",
-                        ap = ap,
-                        old = old_tbl
-                    ));
+                    sides.push(keys_of(old_tbl));
                 }
                 if needs_new {
-                    sides.push(format!(
-                        "SELECT {ap} FROM \"{new}\"",
-                        ap = ap,
-                        new = new_tbl
-                    ));
+                    sides.push(keys_of(new_tbl));
                 }
                 let changed_keys = sides.join(" UNION ");
                 // The membership source is a derived table (a UNION over the

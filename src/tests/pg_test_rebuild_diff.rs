@@ -420,13 +420,14 @@ fn pg_rbd_keyed_duplicate_key_rebuild_raises() {
 }
 
 /// An invalid unique index (e.g. a failed CREATE UNIQUE INDEX CONCURRENTLY)
-/// guarantees nothing, so it must not be used as the diff key.
+/// guarantees nothing, so it must not be used as the diff key. The IMV is a
+/// keyless passthrough: nothing but that index could name a key.
 #[pg_test]
 fn pg_rbd_invalid_unique_index_is_not_a_key() {
-    let up_sql = "SELECT product_id, location_id, COUNT(*) AS n FROM rbi_rel GROUP BY product_id, location_id";
-    Spi::run("CREATE TABLE rbi_rel (product_id INT NOT NULL, location_id INT NOT NULL)")
+    let up_sql = "SELECT product_id, location_id, n FROM rbi_rel";
+    Spi::run("CREATE TABLE rbi_rel (product_id INT NOT NULL, location_id INT NOT NULL, n INT NOT NULL)")
         .expect("rel");
-    Spi::run("INSERT INTO rbi_rel VALUES (1,1),(1,1),(2,2)").expect("seed");
+    Spi::run("INSERT INTO rbi_rel VALUES (1,1,2),(2,2,1)").expect("seed");
     assert_eq!(
         crate::create_reflex_ivm("rbi_up", up_sql, None, None, None, None),
         "CREATE REFLEX INCREMENTAL VIEW"
@@ -460,6 +461,57 @@ fn pg_rbd_invalid_unique_index_is_not_a_key() {
         seen.as_deref(),
         Some("DELETE:2,INSERT:2"),
         "an invalid unique index was used as the diff key"
+    );
+}
+
+/// An aggregate target holds one row per group, so an invalid unique index on
+/// it does not stop the diff from being keyed: the GROUP BY columns are the
+/// key, and its reader receives the changed group as an UPDATE.
+#[pg_test]
+fn pg_rbd_aggregate_with_an_invalid_unique_index_is_diffed_by_its_groups() {
+    let up_sql = "SELECT product_id, location_id, COUNT(*) AS n FROM rbg_rel GROUP BY product_id, location_id";
+    let reader_sql = "SELECT product_id, location_id, n FROM rbg_up";
+    Spi::run("CREATE TABLE rbg_rel (product_id INT NOT NULL, location_id INT NOT NULL)")
+        .expect("rel");
+    Spi::run("INSERT INTO rbg_rel VALUES (1,1),(1,1),(2,2)").expect("seed");
+    assert_eq!(
+        crate::create_reflex_ivm("rbg_up", up_sql, None, None, None, None),
+        "CREATE REFLEX INCREMENTAL VIEW"
+    );
+    assert_eq!(
+        crate::create_reflex_ivm("rbg_reader", reader_sql, None, None, None, None),
+        "CREATE REFLEX INCREMENTAL VIEW"
+    );
+    Spi::run(
+        "CREATE UNIQUE INDEX rbg_up_key ON rbg_up (product_id, location_id) NULLS NOT DISTINCT",
+    )
+    .expect("key");
+    Spi::run("UPDATE pg_index SET indisvalid = FALSE WHERE indexrelid = 'rbg_up_key'::regclass")
+        .expect("invalidate");
+    Spi::run("CREATE TABLE rbg_seen (op TEXT, product_id INT)").expect("seen");
+    Spi::run(
+        "CREATE FUNCTION rbg_record_seen() RETURNS trigger LANGUAGE plpgsql AS $f$ BEGIN \
+           INSERT INTO rbg_seen VALUES (TG_OP, COALESCE(NEW.product_id, OLD.product_id)); RETURN NULL; END $f$",
+    )
+    .expect("fn");
+    Spi::run(
+        "CREATE TRIGGER rbg_record_seen AFTER INSERT OR UPDATE OR DELETE ON rbg_up \
+         FOR EACH ROW EXECUTE FUNCTION rbg_record_seen()",
+    )
+    .expect("trigger");
+    Spi::run("UPDATE rbg_up SET n = n + 5 WHERE product_id = 2").expect("drift");
+    Spi::run("TRUNCATE rbg_seen").expect("reset");
+    assert_eq!(rbd_rebuild("rbg_up", up_sql), "DIFFED");
+    assert_imv_correct("rbg_up", up_sql);
+    assert_imv_correct("rbg_reader", "SELECT product_id, location_id, COUNT(*) AS n FROM rbg_rel GROUP BY product_id, location_id");
+    let seen = Spi::get_one::<String>(
+        "SELECT string_agg(op || ':' || product_id, ',' ORDER BY op, product_id) FROM rbg_seen",
+    )
+    .unwrap();
+    assert_eq!(
+        seen.as_deref(),
+        Some("UPDATE:2"),
+        "the aggregate was not diffed by its GROUP BY columns"
     );
 }
 
@@ -899,4 +951,72 @@ fn pg_rbd_diff_dml_runs_under_caller_planner_settings() {
         None,
         "diff DML ran with the caller's enable_nestloop overridden"
     );
+}
+
+/// A keyless aggregate target that already repeats a group's row (a target
+/// gone wrong) cannot be diffed by its GROUP BY columns: the rebuild must leave
+/// it, and the passthrough reading it, equal to their queries.
+fn rbd_repeated_group_rows_run(p: &str, mode: &str) {
+    let agg_sql = format!("SELECT g, SUM(v) AS s, COUNT(*) AS c FROM {p}_rel GROUP BY g");
+    let reader_sql = format!("SELECT g, s, c FROM {p}_agg");
+    let reader_fresh = format!("SELECT g, s, c FROM ({agg_sql}) z");
+    Spi::run(&format!("CREATE TABLE {p}_rel (g INT, k INT NOT NULL, v INT NOT NULL)")).expect("rel");
+    Spi::run(&format!(
+        "INSERT INTO {p}_rel VALUES (NULL, 1, 1), (NULL, 2, 2), (1, 3, 3), (1, 4, 4), (2, 5, 5), (3, 7, 1)"
+    ))
+    .expect("seed");
+    for (name, sql) in [(format!("{p}_agg"), &agg_sql), (format!("{p}_reader"), &reader_sql)] {
+        let created = Spi::get_one::<String>(&format!(
+            "SELECT create_reflex_ivm('{name}', $q${sql}$q$, NULL, NULL, '{mode}')"
+        ))
+        .expect("create")
+        .unwrap_or_default();
+        assert_eq!(created, "CREATE REFLEX INCREMENTAL VIEW", "{name}");
+    }
+    Spi::run(&format!(
+        "DO $d$ DECLARE r record; BEGIN FOR r IN SELECT indexrelid::regclass AS i FROM pg_index \
+           WHERE indrelid = '{p}_agg'::regclass AND indisunique LOOP EXECUTE 'DROP INDEX ' || r.i; \
+         END LOOP; END $d$"
+    ))
+    .expect("drop unique indexes");
+    let mismatches = |name: &str, query: &str| {
+        Spi::get_one::<i64>(&format!(
+            "SELECT count(*) FROM ((SELECT x::text FROM {name} x EXCEPT ALL SELECT x::text FROM ({query}) x) \
+             UNION ALL (SELECT x::text FROM ({query}) x EXCEPT ALL SELECT x::text FROM {name} x)) o"
+        ))
+        .expect("oracle")
+        .unwrap_or(-1)
+    };
+    for drift in [
+        "INSERT INTO {p}_agg SELECT * FROM {p}_agg WHERE g IS NULL",
+        "INSERT INTO {p}_agg SELECT * FROM {p}_agg WHERE g = 1",
+        "UPDATE {p}_agg SET s = s + 5 WHERE g = 2",
+        "INSERT INTO {p}_agg SELECT * FROM {p}_agg WHERE g = 2",
+    ] {
+        let drift = drift.replace("{p}", p);
+        Spi::run(&drift).expect("drift");
+        if mode == "DEFERRED" {
+            Spi::run(&format!("SELECT reflex_flush_deferred('{p}_agg')")).expect("flush");
+        }
+        rbd_rebuild(&format!("{p}_agg"), &agg_sql);
+        if mode == "DEFERRED" {
+            Spi::run(&format!("SELECT reflex_flush_deferred('{p}_agg')")).expect("flush");
+        }
+        assert_eq!(mismatches(&format!("{p}_agg"), &agg_sql), 0, "{mode} {p}_agg after <{drift}>");
+        assert_eq!(
+            mismatches(&format!("{p}_reader"), &reader_fresh),
+            0,
+            "{mode} {p}_reader after <{drift}>"
+        );
+    }
+}
+
+#[pg_test]
+fn pg_rbd_aggregate_target_repeating_a_group_is_not_diffed_by_its_groups_immediate() {
+    rbd_repeated_group_rows_run("rbrg_i", "IMMEDIATE");
+}
+
+#[pg_test]
+fn pg_rbd_aggregate_target_repeating_a_group_is_not_diffed_by_its_groups_deferred() {
+    rbd_repeated_group_rows_run("rbrg_d", "DEFERRED");
 }

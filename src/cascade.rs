@@ -793,6 +793,8 @@ enum JoinKind {
 struct JoinedRelation<'a> {
     /// The name its columns are qualified with: the alias, or the table name.
     qualifier: String,
+    /// Its name as the query writes it, schema included when written.
+    written: String,
     table: String,
     kind: JoinKind,
     condition: Option<&'a Expr>,
@@ -804,24 +806,26 @@ fn top_level_relations(select: &Select) -> Option<Vec<JoinedRelation<'_>>> {
     };
     let named = |factor: &TableFactor| match factor {
         TableFactor::Table { name, alias, .. } => {
-            let table = relation_bare_name(&name.to_string());
+            let written = name.to_string();
+            let table = relation_bare_name(&written);
             let qualifier = alias
                 .as_ref()
                 .map(|a| folded(&a.name))
                 .unwrap_or_else(|| table.clone());
-            Some((qualifier, table))
+            Some((qualifier, written, table))
         }
         _ => None,
     };
-    let (qualifier, table) = named(&from.relation)?;
+    let (qualifier, written, table) = named(&from.relation)?;
     let mut relations = vec![JoinedRelation {
         qualifier,
+        written,
         table,
         kind: JoinKind::Inner,
         condition: None,
     }];
     for join in &from.joins {
-        let (qualifier, table) = named(&join.relation)?;
+        let (qualifier, written, table) = named(&join.relation)?;
         let kind = match &join.join_operator {
             JoinOperator::Join(_) | JoinOperator::Inner(_) | JoinOperator::CrossJoin(_) => {
                 JoinKind::Inner
@@ -837,6 +841,7 @@ fn top_level_relations(select: &Select) -> Option<Vec<JoinedRelation<'_>>> {
         };
         relations.push(JoinedRelation {
             qualifier,
+            written,
             table,
             kind,
             condition,
@@ -867,6 +872,63 @@ pub(crate) fn partitions_follow_source(
     })
 }
 
+/// The output columns of `sql_query` each proven, by
+/// [`unproven_partition_alignment`], to take its value from the `source` row a
+/// row is built on: a change to the rows of `source` holding some values of
+/// these columns can only change the output rows holding the same values.
+///
+/// Every relation the query reads, subqueries included, counts as a read of
+/// `source` when its table name is `source`'s, whatever its schema. A column
+/// shown by a join's equality qualifies only when the two equated columns have
+/// one type, type modifier and collation: else the join may match values the
+/// output column tells apart.
+pub(crate) fn columns_following(sql_query: &str, source: &str) -> Vec<String> {
+    let Ok(statements) = Parser::parse_sql(&PostgreSqlDialect {}, sql_query) else {
+        return Vec::new();
+    };
+    let Some(select) = crate::sql_analyzer::top_level_select(&statements) else {
+        return Vec::new();
+    };
+    let depends_on = crate::sql_analyzer::statement_relation_names(&statements);
+    select
+        .projection
+        .iter()
+        .filter_map(|item| match item {
+            SelectItem::ExprWithAlias { alias, .. } => Some(folded(alias)),
+            SelectItem::UnnamedExpr(expr) => qualified_column(expr)
+                .map(|(_, column)| column)
+                .or_else(|| unqualified_column(expr)),
+            _ => None,
+        })
+        .filter(
+            |column| match partition_alignment(sql_query, &depends_on, source, column) {
+                Ok(Alignment::OwnColumn) => true,
+                Ok(Alignment::Equated(one, other)) => of_one_type_and_collation(&one, &other),
+                Err(_) => false,
+            },
+        )
+        .collect()
+}
+
+fn of_one_type_and_collation(one: &WrittenColumn, other: &WrittenColumn) -> bool {
+    Spi::connect(|client| {
+        let one_type = column_type(client, &one.0, &one.1);
+        one_type.is_some() && one_type == column_type(client, &other.0, &other.1)
+    })
+}
+
+/// A column of a relation of a query: the relation as the query writes it,
+/// and the column's folded name.
+type WrittenColumn = (String, String);
+
+/// How an output column is shown to take its value from the `source` row.
+enum Alignment {
+    /// It is `source`'s own column.
+    OwnColumn,
+    /// A join's equality of these two columns shows it.
+    Equated(WrittenColumn, WrittenColumn),
+}
+
 /// Why a change to the rows of `source` that hold some values of
 /// `partition_column` could change rows of the dependent that hold other values
 /// of its own `partition_column`; `None` when the dependent's query shows it
@@ -895,16 +957,33 @@ pub(crate) fn unproven_partition_alignment(
     source: &str,
     partition_column: &str,
 ) -> Option<String> {
+    partition_alignment(
+        sql_query,
+        depends_on,
+        source,
+        &partition_column.to_lowercase(),
+    )
+    .err()
+}
+
+/// [`unproven_partition_alignment`] for the already folded `column`, with
+/// the columns the proof relies on.
+fn partition_alignment(
+    sql_query: &str,
+    depends_on: &[String],
+    source: &str,
+    column: &str,
+) -> Result<Alignment, String> {
     let source_table = relation_bare_name(source);
-    let column = partition_column.to_lowercase();
+    let column = column.to_string();
     let reads = depends_on
         .iter()
         .filter(|read| relation_bare_name(read) == source_table)
         .count();
     if reads != 1 {
-        return Some(format!("it reads '{source}' {reads} times"));
+        return Err(format!("it reads '{source}' {reads} times"));
     }
-    let unreadable = || Some("its query could not be analysed".to_string());
+    let unreadable = || Err("its query could not be analysed".to_string());
     let Ok(statements) = Parser::parse_sql(&PostgreSqlDialect {}, sql_query) else {
         return unreadable();
     };
@@ -913,7 +992,7 @@ pub(crate) fn unproven_partition_alignment(
     };
     if analysis.has_window_function || analysis.has_distinct_on || analysis.set_operation.is_some()
     {
-        return Some(
+        return Err(
             "a window function, DISTINCT ON or set operation reads across partitions".to_string(),
         );
     }
@@ -921,13 +1000,13 @@ pub(crate) fn unproven_partition_alignment(
         return unreadable();
     };
     let Some(relations) = top_level_relations(select) else {
-        return Some("its FROM clause is not a plain list of joined tables".to_string());
+        return Err("its FROM clause is not a plain list of joined tables".to_string());
     };
     let Some(source_relation) = relations
         .iter()
         .find(|relation| relation.table == source_table)
     else {
-        return Some(format!("'{source}' is not one of its top-level relations"));
+        return Err(format!("'{source}' is not one of its top-level relations"));
     };
     if relations.iter().any(|relation| {
         relations
@@ -936,13 +1015,13 @@ pub(crate) fn unproven_partition_alignment(
             .count()
             > 1
     }) {
-        return Some("two of its relations share a name".to_string());
+        return Err("two of its relations share a name".to_string());
     }
     if relations
         .iter()
         .any(|relation| relation.kind == JoinKind::Other)
     {
-        return Some("it uses a join other than INNER, LEFT or FULL".to_string());
+        return Err("it uses a join other than INNER, LEFT or FULL".to_string());
     }
 
     let Some(projected) = select.projection.iter().find_map(|item| match item {
@@ -957,7 +1036,7 @@ pub(crate) fn unproven_partition_alignment(
         }
         _ => None,
     }) else {
-        return Some(format!(
+        return Err(format!(
             "its \"{column}\" column is not a column of its query"
         ));
     };
@@ -975,7 +1054,7 @@ pub(crate) fn unproven_partition_alignment(
         .filter(|relation| relation.kind == JoinKind::Full)
         .count();
     let not_from_source = || {
-        Some(format!(
+        Err(format!(
             "its \"{column}\" column is not shown to be '{source}''s"
         ))
     };
@@ -998,10 +1077,21 @@ pub(crate) fn unproven_partition_alignment(
             && equated_by_the_first_join
             && first.0 != second.0
             && (from_source(first) || from_source(second));
-        return if proven { None } else { not_from_source() };
+        let written = |(qualifier, name): &(String, String)| -> WrittenColumn {
+            let relation = relations.iter().find(|r| r.qualifier == *qualifier);
+            (
+                relation.map_or_else(String::new, |r| r.written.clone()),
+                name.clone(),
+            )
+        };
+        return if proven {
+            Ok(Alignment::Equated(written(first), written(second)))
+        } else {
+            not_from_source()
+        };
     }
     if full_joins > 0 {
-        return Some(format!(
+        return Err(format!(
             "a FULL JOIN can output a row whose \"{column}\" is not '{source}''s"
         ));
     }
@@ -1014,12 +1104,12 @@ pub(crate) fn unproven_partition_alignment(
         },
     };
     if can_be_missing(&projected_column.0) {
-        return Some(format!(
+        return Err(format!(
             "its \"{column}\" column comes from the nullable side of a LEFT JOIN"
         ));
     }
     if from_source(&projected_column) {
-        return None;
+        return Ok(Alignment::OwnColumn);
     }
     let equated_with_source = relations.iter().any(|relation| {
         let joins_on_matching_rows = relation.kind == JoinKind::Inner
@@ -1033,7 +1123,14 @@ pub(crate) fn unproven_partition_alignment(
             })
     });
     if equated_with_source {
-        None
+        let projected_relation = relations
+            .iter()
+            .find(|relation| relation.qualifier == projected_column.0)
+            .map_or_else(String::new, |relation| relation.written.clone());
+        Ok(Alignment::Equated(
+            (source_relation.written.clone(), column.clone()),
+            (projected_relation, projected_column.1.clone()),
+        ))
     } else {
         not_from_source()
     }
