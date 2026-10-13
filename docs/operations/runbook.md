@@ -41,7 +41,7 @@ SELECT reflex_reset_partition_failures('<schema.source_root>');
 SELECT reflex_flush_partition_source('<schema.source_root>');
 ```
 
-The report clears as soon as the root drains. A `deadlock detected` last error is usually transient — re-arming alone fixes it. A duplicate-key error re-caps the root on the first retry unless step 2 removed the duplicates. `reflex_doctor(fix => TRUE)` performs step 3 with a single retry (F2b), never step 2.
+The report clears as soon as the root drains. Since 1.12.0 a deadlock, serialization failure or lock timeout is not counted toward the cap: a root meeting one stays queued, is retried at the next partition DDL COMMIT or manual flush, and is never capped by it. A root capped by such an error under an earlier version needs re-arming only. A duplicate-key error re-caps the root on the first retry unless step 2 removed the duplicates. `reflex_doctor(fix => TRUE)` performs step 3 with a single retry (F2b), never step 2.
 
 ## IMV slice empty after an ignored source changed
 

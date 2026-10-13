@@ -2,6 +2,786 @@
 
 ## [Unreleased]
 
+## [1.12.0] - 2026-10-13
+
+A correctness release for what `create_reflex_ivm` accepts and for how an
+accepted IMV is maintained. It started as a hardening of the create-time
+contract (non-ASCII text or a string literal could corrupt the generated
+delta SQL, an aggregate nested in an expression stored the wrong value,
+DISTINCT and volatile-function checks could be bypassed by spelling) and
+then took in the defects of the same kind met along the way: joins,
+HAVING, subqueries, CTEs, column types, identifier spelling and
+partitioned sources. The rule applied throughout: a shape that cannot be maintained
+incrementally is recomputed in full on the writes concerned, and a shape
+that cannot be maintained at all is refused at create with a message that
+carries the rewrite. Both cost something, listed under Changed: several
+definitions 1.11.5 created are now refused, and several shapes are slower.
+
+It also refuses at create the sources pg_reflex cannot follow (a partition,
+a table of an inheritance hierarchy, two tables whose triggers would share
+names) and the expressions it writes back with another meaning; keeps the
+partition maintenance of one schema from waiting on the locks of another;
+refreshes each IMV built on a rebuilt partitioned IMV once per partition
+swap, within the rebuilt partitions when its query proves it; and no longer
+suspends a partitioned source for a transient lock error.
+
+Stored plans, registered source spellings and per-source trigger functions
+are generated when an IMV is created, so most fixes reach an IMV only when
+it is recreated. **Recreate every IMV after the update**; see "Upgrading
+to 1.12.0" in `docs/getting-started/upgrading.md`.
+`ALTER EXTENSION pg_reflex UPDATE TO '1.12.0';` **is required by the new
+library**: until it runs, every transaction that changes the partitions of
+a source fails at COMMIT.
+
+---
+
+### Fixed
+
+Maintenance SQL assembled from the query text:
+
+- **(SILENT) Non-ASCII text in an IMV query corrupted the maintenance SQL.**
+  The source-name rewriter copied the query byte by byte, so `'Été'` reached
+  PostgreSQL as mojibake and the IMV stopped following its source. Text is
+  now copied as UTF-8. The same defect is fixed in the alias stripper, the
+  partition-predicate substitution, JOIN `ON` splitting (which could also
+  panic) and long-name truncation.
+- **(SILENT) A string literal containing the source's name was rewritten.**
+  `WHERE season = 'a-prod-b'` over table `prod` had the literal replaced by
+  the transition-table name. Single-quoted, `E''` and dollar-quoted strings
+  are skipped; a multi-byte character next to a match counts as part of the
+  identifier.
+- **(SILENT) A source referenced with mixed quoting (`"s".t`, `s."t"`) was
+  not recognised**, so each write added every existing row again. Both
+  spellings are rewritten, and the self-join and outer-join guards recognise
+  every spelling the rewriter does.
+- **(SILENT) Predicates spliced into maintenance SQL by keyword search.** A
+  `WHERE`, `GROUP BY` or `OR` inside a string literal, a comment or a
+  subquery moved the splice point: duplicated rows, a MIN / MAX recompute
+  that ignored half of a `WHERE a OR b`, or a syntax error on every write. A
+  literal- and depth-aware scanner finds the clause; a predicate with a
+  top-level `OR` is parenthesised; a fallback that cannot scope its work
+  rebuilds instead of inserting unscoped.
+- **(SILENT) A string literal equal to a CTE alias was rewritten**, and so
+  was a column named like the CTE: `WITH season AS (…) SELECT season,
+  SUM(v) … GROUP BY season` grouped by the whole row of the sub-IMV. Only
+  relation references of a decomposed CTE are pointed at its sub-IMV now.
+- **(SILENT) `reflex_reconcile_partition` left a leaf unrepaired when a
+  partition bound held the partition column's name** (column `k`, bound
+  `'a k b'`): the constraint was rewritten inside the literal, matched
+  nothing, and the call returned `RECONCILED`. Other bounds raised a syntax
+  error, as did a partition column named like a type (`date`, `text`,
+  `zone`). Literals and cast type names are left alone.
+
+Aggregates:
+
+- **(SILENT) An aggregate nested in an expression lost its meaning.**
+  `ROUND(AVG(v), 2)` stored the SUM; a nested `SUM` over an all-NULL group
+  read 0; `FILTER` on any nested aggregate was ignored; nested `MIN` / `MAX`
+  under integer division were wrong. Nested aggregates now use the mapping
+  top-level ones use.
+- **(SILENT) HAVING read its aggregates through a mapping of its own.**
+  `HAVING COUNT(*) FILTER (WHERE v > 1) > 1` ignored the FILTER, `HAVING
+  SUM(v) >= 0` kept an all-NULL group, `HAVING SUM(v) / 2 > 2` divided
+  exactly where PostgreSQL divides integers. HAVING now reads through the
+  SELECT-list mapping. `HAVING ROUND(AVG(v), 2) > 1`, `COALESCE(SUM(v), 0)`
+  and `BOOL_OR(b)` in HAVING, which failed at create, are created.
+- **(SILENT) `CAST(SUM(v) / 2 AS numeric)` was emitted as `SUM(v) /
+  2::numeric`**, in the SELECT list and in HAVING. The whole operand is
+  cast.
+- **(SILENT) Two aggregates whose arguments differ only in characters a
+  column name cannot hold shared one stored column**: `MAX(v)` beside
+  `MAX(-v)`, `SUM(v + 1)` beside `SUM(v - 1)`, `SUM(v)` beside `SUM("V")`,
+  `COUNT(*)` beside a column named `star`. Each (aggregate, argument) pair
+  has its own column.
+- **(SILENT) Result and extremum types were looked up by column name.** An
+  output alias equal to a source column took that column's type (`AVG(n) AS
+  v` was rounded to the integer type of `v`); `MIN` / `MAX` over a float
+  expression went through NUMERIC; `MAX(interval)` and `MAX(time)` were
+  stored as text and compared as strings. Types are now read from
+  PostgreSQL's description of the query, by position. This also creates
+  what failed at create before: `MAX(upper(g))`, `MIN` / `MAX … FILTER`
+  over text, a group key aliased to another column's name.
+- **(SILENT) An ungrouped `BOOL_OR` over a NOT NULL column read `false` on
+  an emptied source**, where the query gives NULL.
+- **(SILENT) `SUM` / `AVG` over a `REAL` argument drifted from the query**
+  on ordinary data. Refused at create (see Changed).
+- **(SILENT) More than one `COUNT(DISTINCT …)` in a SELECT list** was
+  created with wrong counts. Refused at create.
+- **(SILENT) `HAVING COUNT(DISTINCT x)` without the same `COUNT(DISTINCT
+  x)` in the SELECT list** was evaluated as `COUNT(x)`. Refused at create.
+- **(SILENT) `COUNT(DISTINCT v)` inside an expression** (`COUNT(DISTINCT v)
+  + 1`) was accepted and wrong. Refused at create.
+- **(SILENT) DISTINCT aggregates were detected by searching the query
+  text**, so `SUM( DISTINCT v)` or a comment between the tokens was accepted
+  and maintained as a plain `SUM`. Detection reads the parsed query.
+- **An ungrouped aggregate with HAVING** (`SELECT SUM(v) FROM t HAVING
+  COUNT(*) > 1`) and **`COUNT(DISTINCT x)` with a HAVING on that same
+  count** failed at create with a raw PostgreSQL error; both are created.
+- **A built-in aggregate written qualified or quoted** (`pg_catalog.sum(v)`,
+  `"sum"(v)`) failed at create; it is the built-in and is maintained.
+- **`MIN` / `MAX` over text with a non-default collation** keep that
+  collation in their stored columns; a user type is stored under its
+  schema, so writes under another `search_path` no longer raise `type …
+  does not exist`.
+
+Joins:
+
+- **(SILENT) An aggregate over a `RIGHT JOIN` was wrong after writes** to
+  the table before the keyword, and after a join-key UPDATE of the other
+  one. A query holding a RIGHT JOIN is now recomputed in full on every
+  write.
+- **(SILENT) `LEFT JOIN` onto a derived table or a parenthesised join**:
+  writes to a table inside it left the aggregate wrong. Those writes
+  recompute the IMV.
+- **(SILENT) A WHERE clause filtering the null-extended table of an outer
+  join** (`d LEFT JOIN f … WHERE f.v > 0 OR f.v IS NULL`, the anti-join
+  `WHERE f.kind IS NULL`, the RIGHT and FULL forms, a filter on a table
+  reached through the LEFT JOINed one): a row failing the filter was
+  skipped although it turns a null-extended row into a matched one. The
+  per-source filter is kept only when the WHERE provably rejects
+  null-extended rows.
+- **(SILENT) An UPDATE was skipped as irrelevant when it was not**: a
+  self-join written with two spellings of the table (`"t" a JOIN t b`, `t a
+  JOIN public.t b`) or filtered on one alias; the join column of a `NATURAL
+  JOIN`; a column compared with another table's column in WHERE (`m.v >
+  j.v`); a column read only by a correlated subquery; a table alias
+  declared twice in the query; a row passed whole to a function
+  (`to_jsonb(t)`).
+- **(SILENT) A join keyword holding a comment or a line break** (`LEFT /* c
+  */ JOIN`, `LEFT⏎JOIN`) was not seen as an outer join: duplicate key on a
+  keyed passthrough, silently wrong in DEFERRED. Join kinds are read from
+  the parsed query.
+- **(SILENT) An aggregate over a join mapped the joined table to a group
+  column that only shared its name** (`f JOIN d ON d.id = f.k GROUP BY
+  d.k`, also with the group column aliased): a DELETE on `d` left the IMV
+  wrong. A group column is matched to a join column only when it is a side
+  of the equality, by case when quoted.
+- **(SILENT) A keyless inner-join passthrough inferred a key mapping that
+  did not identify the changed rows**: an UPDATE of one row deleted every
+  result row sharing its join value. Such a table has no mapping and is
+  fully refreshed.
+- **A passthrough over `d LEFT JOIN f … JOIN o ON o.kind = f.kind`** raised
+  `column reference "kind" is ambiguous` on every write to `f`, and was
+  silently wrong in DEFERRED. A key column is mapped through its own column
+  only.
+
+Subqueries, derived tables and CTEs:
+
+- **(SILENT) A write to a table read only through a subquery in WHERE,
+  HAVING or the SELECT list** (`IN`, `NOT IN`, `= ANY`, `EXISTS`, a scalar
+  subquery) left an aggregate wrong and raised `duplicate key value violates
+  unique constraint "__reflex_uk_…"` on a keyed passthrough. Such a write
+  recomputes the IMV; writes to the tables of the outer FROM clause keep
+  their delta.
+- **A DEFERRED IMV over a derived table** (`FROM (SELECT g, v FROM s WHERE
+  v > 0) x`) raised `relation "__reflex_delta_<subquery:x>" does not exist`
+  at COMMIT.
+- **(SILENT) A DEFERRED IMV over a CTE reading two tables, both written in
+  one transaction**: the CTE's sub-IMV was rebuilt at COMMIT and its
+  readers were not.
+
+Identifiers and source names:
+
+- **(SILENT) An unquoted name written in upper case was not folded.**
+  `SELECT id, G FROM t` went stale after an UPDATE of `g`; `FROM T` in a
+  DEFERRED IMV was never flushed by `reflex_flush_deferred('t')`. Unquoted
+  names are folded to lower case at create, ASCII letters only, as
+  PostgreSQL does in a UTF-8 database.
+- **(SILENT) Two IMVs reading one table as `t` and `"t"`**: the triggers
+  select IMVs by the spelling of the first, so the second was never
+  maintained, and dropping the first removed the triggers under the second.
+  Quotes PostgreSQL does not need are dropped from the query at create;
+  same for a table named by a keyword (`zone` and `"zone"`).
+- **(SILENT) A table in a mixed-case schema** (`"S"."T"`) was registered as
+  `S.T`: triggers went on `s.t` when it existed, and the create raised
+  otherwise. Each part is registered with the quotes it needs.
+- **(SILENT) A quoted source beside a lower-case namesake** (`"NnT"` and
+  `nnt`): the NOT NULL probe of a key column read the namesake's
+  constraints, and a NULL-key group was lost.
+- **(SILENT in DEFERRED) Two tables whose names differ only by case** (`"T"`
+  and `t`) shared one trigger function; the first write raised, and a
+  DEFERRED flush over any mixed-case source failed.
+- **`DROP TABLE other.t` dropped the IMVs of `public.t`.** The `sql_drop`
+  hook matched the bare name whatever the schema; it now does so for a
+  table of `public` only.
+- **`drop_reflex_ivm` left the triggers and functions of a source whose
+  trigger names exceed 63 bytes**, and left CTE sub-IMVs that nothing read.
+
+Partitioned sources:
+
+- **(SILENT) A statement addressed to a partition was not maintained.**
+  INSERT, UPDATE, DELETE, COPY and MERGE on a partition (leaf or branch)
+  fire the statement triggers of that table only, and pg_reflex had
+  triggers on the source alone. Every table of the partition tree now
+  carries the source's write triggers.
+- **(SILENT) `TRUNCATE` of a partition was not propagated.** Every table of
+  the tree carries the source's truncate triggers; one TRUNCATE statement
+  rebuilds each IMV of the source once.
+- **(SILENT) A partition created or attached and written through the
+  parent in one transaction** was counted twice by an ungrouped aggregate
+  or one grouped by another column than the partition key. The COMMIT-time
+  partition flush reconciles such IMVs instead of applying the partition's
+  rows as a delta.
+- **(SILENT) A leaf recreated by `reflex_sync_partitions` stayed empty**
+  with a clean audit. The sync refills a leaf it recreates beside a filled
+  sibling, and the audit remedy for a dropped leaf now includes
+  `reflex_reconcile_partition`.
+- **A partition flush failed in a session that had run a DEFERRED flush**
+  (`"__reflex_new_<source>" is not a table`), leaving the source's IMVs
+  flagged stale.
+
+IMVs built on a partition-mirroring IMV, after a partition swap or
+`reflex_reconcile_partition`:
+
+- **(SILENT) A dependent was refreshed within the rebuilt partitions
+  because it was partitioned or grouped by a column of the same name**,
+  although its rows of one partition key depended on rows of other keys (a
+  self-join on the rebuilt IMV, a partition column taken from a mapping
+  table): 360 wrong rows after a one-leaf swap in the test fixture. A
+  dependent is now refreshed by partition only when it mirrors the
+  partitions of the rebuilt IMV, by key only when its query proves that a
+  change of key `k` changes only its rows of key `k` (one read of the
+  rebuilt IMV, as a top-level relation; the column taken from it, from a
+  table equated to it in an inner join, or `COALESCE` over the two columns
+  of the first join's equality; level by level for a partition tree), and
+  whole otherwise.
+- **(SILENT) A dependent refreshed by key missed the keys that left the
+  rebuilt partitions**: the keys were read after the rebuild only. They
+  are now the values a `FOR VALUES IN (…)` bound lists, else the keys read
+  before and after the rebuild when the partition was not created or
+  altered in the transaction; otherwise, and for a NULL key, the
+  dependent is refreshed whole.
+- **(SILENT) A dependent refreshed by key did not pass the refresh on** to
+  the IMVs that read it while ignoring it; and **a scope proven for the
+  first partition level was applied at the leaf level**, so rows derived
+  into another leaf of a two-level dependent were not refreshed.
+- **(SILENT) A partition change of `tb.t` was not queued when an IMV of
+  `public` was named `t`**: the event trigger took the root for an IMV of
+  pg_reflex by its bare name, and the IMVs of `tb.t` stayed stale.
+
+- **(SILENT) A dependent took the key path over a key column of another
+  type** (`numeric` beside `integer`, `timestamp` beside `timestamptz`):
+  the keys were re-parsed as text. Keys are handed to a dependent only
+  when its column has the rebuilt IMV's type, type modifier and collation;
+  otherwise it is refreshed whole.
+- **(SILENT) Rows of a dropped mirror partition never reached the IMV's
+  readers.** A source leaf detached, dropped, or swapped for an empty
+  table (listed or DEFAULT) dropped the matching partition of a mirroring
+  IMV with its rows, and no DML reached the IMVs reading it. Every drop of
+  a mirror partition now first deletes its rows through the IMV's root,
+  and the readers that ignore the IMV are caught up on the keys those rows
+  held (by key when their query proves the keys are theirs, else whole,
+  and recursively for their own ignoring readers).
+- **(SILENT) A mirror partition that the IMV's query still fills was
+  dropped** when its source partition went: an IMV partitioned by a
+  column taken from a mapping table, a source partition feeding other
+  partitions of the IMV, a plan re-attached under another name. A mirror
+  partition is dropped only when the query yields no row inside its
+  bounds; the whole reconcile also rebuilds the leaves that mirror no
+  source leaf, and `reflex_audit` / `reflex_doctor` no longer report such
+  a kept partition (their remedy could not clear it).
+- **(SILENT) An IMV was flushed per partition when its partition column
+  was not the source's.** The per-partition path is now taken only when
+  every partition level of the IMV is proven to follow a source level
+  partitioned on that column; otherwise the IMV is rebuilt whole.
+- **A leaf swap's orphan heal could drop a whole top-level branch** of a
+  LIST-over-LIST IMV with repeated values; it now compares the swapped
+  child's siblings only. A failing flush flags every IMV reading the root
+  and, recursively, their readers `known_stale`, not only the direct ones.
+
+Several schemas in one database:
+
+- **The partition flush of one schema waited on the locks of another.**
+  The query that finds the DEFAULT partitions of a source evaluated
+  `pg_get_expr(relpartbound, …)` on every partition of the database, which
+  opens each one; behind a transaction holding another schema's partitions
+  (a swap in progress) the COMMIT-time flush, the manual flushes,
+  `reflex_sync_partitions`, `reflex_reconcile_partition`, `reflex_reconcile`,
+  `reflex_rebuild_imv` and `refresh_reflex_imv` waited, or failed on
+  `lock_timeout`, and two schemas changing partitions at once could each
+  wait on the other. The
+  query now reads `pg_partitioned_table.partdefid`, a catalog column.
+- **Partition DDL on `tb.t` reached the IMVs of `public` that read a table
+  `t`.** The event trigger and the flush matched a source registered
+  without a schema against the bare name of any schema's table: they
+  synced and locked the IMVs of `public.t`, flagged them `known_stale` on a
+  lock timeout, counted the failures against `tb.t`, and under
+  `pg_reflex.alter_source_policy = 'error'` refused `ALTER TABLE tb.t`. A
+  source registered without a schema is now a table of `public` only
+  (`__reflex_named_relation`, `__reflex_reads_relation`, created by the
+  migration).
+- **Every DEFERRED create re-created the shared flush trigger** on
+  `public.__reflex_deferred_pending`, so an open DEFERRED create blocked
+  every DEFERRED write of every schema until it committed. The trigger is
+  created only when it is missing or differs.
+
+Partition swap cost:
+
+- **One partition swap refreshed the IMVs built on the rebuilt IMV in
+  full, several times.** A dependent's partition is named
+  `<dependent>_<partition>`; past 63 bytes PostgreSQL cuts the name and
+  appends a hash, the source partition read back from it was wrong, the
+  partition refresh failed silently and fell to a full `reflex_reconcile`;
+  and a dependent reached by several paths was refreshed once per path.
+  Each dependent is now queued once per cascade with the union of the
+  scopes that reach it, and refreshed after every IMV it reads. On a
+  2.16 M-row source (30 plans × 24 months × 3000 rows, the field's names,
+  DEFERRED, PostgreSQL 16): one leaf swapped and committed 152.5 s →
+  22.1 s, the same by explicit flush 155.3 s → 22.1 s, 20 leaves of one
+  plan 208.8 s → 29.5 s.
+- **Each partition DDL command of a transaction flushed its root again at
+  COMMIT**; the root is now flushed once per COMMIT.
+- **Every partition DDL statement paid for the registry size, and an
+  internal trigger toggle re-synced the whole reader chain.** The name
+  predicates the DDL event trigger evaluates per registry row are PL/pgSQL
+  (an SQL function with a FROM was parsed and planned at every call), and
+  pg_reflex's own `DISABLE` / `ENABLE TRIGGER USER` around a relocation no
+  longer syncs the readers of the toggled IMV, which in turn toggled their
+  own. With a forecast-shaped chain beside 50 other IMVs (PostgreSQL 16
+  release build): one leaf swapped 1285 ms → 125 ms, a plan attached
+  2804 ms → 162 ms, a plan detached 1861 ms → 92 ms, an unrelated
+  `ALTER TABLE` 22.5 ms → 6.6 ms.
+
+Partition flush failures:
+
+- **A transient lock error suspended a partitioned source.** A deadlock
+  (`40P01`), serialization failure (`40001`) or lock timeout (`55P03`) in
+  the partition flush counted toward the 5-failure cap like a logic error,
+  and with one flush per DDL command a single COMMIT of a three-leaf swap
+  that met a lock reached the cap: the root was skipped by every later
+  flush and its IMVs stayed stale until `reflex_reset_partition_failures`.
+  These three SQLSTATEs are no longer counted; the root stays queued and
+  is retried at the next partition DDL COMMIT or manual flush. Its IMVs
+  are flagged `known_stale` with the lock error in the meantime, as
+  before. Other errors count once per COMMIT and suspend at 5, as before.
+
+Audit and maintenance entry points:
+
+- **`reflex_audit` reported errors that no remedy could clear**:
+  `internal-tables-exist` demanded an affected-groups table of an ungrouped
+  aggregate, `trigger-attached` rebuilt by hand the trigger names of a
+  source longer than about 37 bytes, `trigger-mode-matches` flagged an
+  IMMEDIATE IMV sharing a source with a DEFERRED one.
+- **`reflex_audit` did not report a missing `__reflex_scratch_<imv>`
+  table**; it does, and `reflex_reconcile` recreates it.
+- **`reflex_rebuild_triggers`** called with a bare registered name
+  installed a second, inert trigger set; called with the quoted name of a
+  CTE sub-IMV it raised. It rebuilds under the registered spelling.
+- **A `SUM(DISTINCT …) OVER ()` definition** returns the tagged rejection
+  instead of a raw PostgreSQL error.
+
+### Changed
+
+**Definitions `create_reflex_ivm` now refuses.** Each returns `ERROR:
+[reflex-unsupported] …` with the rewrite; nothing is created. An existing
+IMV of such a definition keeps being maintained until it is recreated.
+`docs/getting-started/upgrading.md` gives the message and remedy of each.
+
+Created on 1.11.5 and correct there in at least the cases tried; these
+are the definitions to rewrite:
+
+- **A function PostgreSQL labels `VOLATILE`**, read from `pg_proc`.
+  `CREATE FUNCTION` labels a function `VOLATILE` unless told otherwise, so
+  an unlabelled deterministic function is refused. The message prints
+  `ALTER FUNCTION … IMMUTABLE (or STABLE)`. An unqualified call is matched
+  by name in every schema and overload; a schema-qualified call in that
+  schema only.
+- **Clock and session functions, however spelled**: besides `NOW()`,
+  `CURRENT_TIMESTAMP` / `DATE` / `TIME`, `RANDOM()`, `CLOCK_TIMESTAMP()`,
+  `STATEMENT_TIMESTAMP()`, `TIMEOFDAY()` and `GEN_RANDOM_UUID()`, now also
+  one-argument `age(x)`, `current_setting()`, `CURRENT_USER`,
+  `SESSION_USER`, `USER`, `CURRENT_ROLE`, `CURRENT_SCHEMA`,
+  `CURRENT_CATALOG`, `SYSTEM_USER`, `LOCALTIME`, `LOCALTIMESTAMP`,
+  `transaction_timestamp()`, `current_database()`, `current_schemas()`,
+  `pg_backend_pid()`, `inet_client_addr()` / `_port()`, `inet_server_addr()`
+  / `_port()`, `txid_current*()`, `pg_current_xact_id*()`,
+  `pg_current_snapshot()`, `pg_postmaster_start_time()`,
+  `pg_conf_load_time()`, `pg_my_temp_schema()`, `pg_trigger_depth()`. The
+  list applies to unqualified and `pg_catalog`-qualified calls; a function
+  of the same name in another schema is judged by its volatility.
+- **A string literal holding `now`, `today`, `tomorrow` or `yesterday`
+  given a date/time type**: `'now'::timestamptz`, `DATE 'today'`,
+  `date('yesterday')`.
+- **`SUM` / `AVG` over a `REAL` argument.** Remedy: `SUM((x)::numeric)`,
+  and `SUM((x)::numeric)::real` to keep a REAL column.
+- **`HAVING COUNT(DISTINCT x)` when the SELECT list does not hold the same
+  `COUNT(DISTINCT x)`.** Remedy: two CTEs joined with `IS NOT DISTINCT
+  FROM`.
+- **A column alias list that renames a source's columns** (`FROM customers
+  AS c(cid, nm)`). Remedy: rename in the SELECT list, and for a
+  passthrough whose primary key is renamed pass the new name as the key
+  (no key is inferred from a renamed primary key). A list that repeats the
+  columns' own names is accepted.
+- **A partitioned source registered under a name that needs its quotes**:
+  upper case, a space, a reserved word, or a column-name keyword
+  (`position`, `time`, `values`, `overlay`, …) even written bare. Remedy:
+  rename the table and its schema to lower-case names that are not
+  keywords. Unreserved keywords, non-ASCII letters and `$` are accepted.
+- **A source that is a partition**, at any depth, in FROM, a JOIN, a CTE
+  or a subquery. It was maintained only for statements addressed to the
+  partition itself: PostgreSQL fires the triggers of the table a statement
+  names, so a write through the partitioned table was missed. Remedy, as
+  printed: `FROM <partitioned table> WHERE <the partition's bound>`; under a
+  table partitioned on several columns, read the partitioned table itself
+  and pass `partition_by => ARRAY[]::text[]`; under a partitioned table
+  whose name needs quotes, rename it. A partition listed in
+  `ignore_sources` with `!` is not refused.
+- **A table of an inheritance hierarchy** (`INHERITS`): a child, or a
+  parent that has children. A write to another table of the hierarchy was
+  missed. Remedy: `ALTER TABLE <child> NO INHERIT <parent>`. Not refused
+  when ignored with `!`.
+- **Inside an aggregate's `ORDER BY`**, the forms of the next list
+  (`SUM(v ORDER BY - -v)`, `array_agg(v ORDER BY 0x1F)`): the order of an
+  order-insensitive aggregate was dropped, so these were correct; the
+  refusal covers every clause pg_reflex can write back. Remedy: as below.
+
+Created on 1.11.5 but wrong or raising on a later write:
+
+- **Two tables whose pg_reflex trigger names would be equal**: a `.` and a
+  `_` are written alike in those names, so `s.t` and `s_t`, or `a.b_c` and
+  `a_b.c`, got one set of triggers and functions, and the IMVs of the
+  first went unmaintained. Refused when the second is created, or when
+  both are read by one definition. Remedy, as printed: rename the table no
+  IMV reads yet; or drop the IMV whose target collides and create it under
+  another name; or give the IMV being created another name when its own
+  generated table collides.
+- **An expression pg_reflex writes back with another meaning**, wherever
+  it is written back (group key, aggregate argument, FILTER, HAVING, a CTE
+  body, a set-operation operand, DISTINCT and DISTINCT ON, a window, a
+  join condition, a WHERE conjunct of an aggregate or of a decomposed
+  query): two prefix operators in a row are printed without a space, so
+  `- -v` becomes `--v`, the start of a comment (silently wrong in a group
+  key and in `SELECT DISTINCT`), and `@ -v`, `~ -v`, `- @v`, `- ~v` become
+  one operator (an error at create, or on every write); an integer written
+  `0x1F` is printed as the bit string `X'1F'`; `0X1F`, `0o17`, `0b101`
+  ending an unaliased item are read as the number `0` aliased `X1F`
+  (silently wrong). Remedy, as printed: `-(-v)`, `@(-v)`, or the integer in
+  decimal. `- +v` and `+ -v` are not refused. In a plain SELECT (no
+  aggregate, CTE, DISTINCT ON, window or HAVING), the select list, the FROM
+  clause and the WHERE conjuncts pg_reflex keeps as written run as written
+  and are not refused.
+
+- `SUM` / `AVG` / `MIN` / `MAX` / `BOOL_OR` with `DISTINCT` under any
+  spelling; `COUNT(DISTINCT x)` inside an expression; more than one
+  `COUNT(DISTINCT …)` in a SELECT list.
+- A set-returning function in the SELECT list (`unnest(tags)`) together
+  with `unique_columns`; an aggregate without GROUP BY that pg_reflex
+  leaves to PostgreSQL (`COUNT(DISTINCT v)`, `SUM(v) IS NULL`) together
+  with `unique_columns`. Remedy for both: do not pass `unique_columns`.
+- A function called in attribute notation on a source row (`c.display_name`
+  for `display_name(customers)`).
+- `SUM` over `money`, which raised on UPDATE (over `interval` or `time`
+  it was a raw error at create). Remedy: `SUM((x)::numeric)::money`,
+  `SUM(EXTRACT(EPOCH FROM x))`.
+- A WHERE clause reading the source of a one-source query as a whole row
+  (`FROM orders o WHERE o IS NOT NULL`).
+- A function in the top-level FROM clause (`FROM t, unnest(arr) AS e`),
+  silently wrong after an UPDATE of `arr`.
+- An aggregate other than SUM, COUNT, AVG, MIN, MAX, BOOL_OR in an
+  ungrouped query that ends up with a unique key.
+
+Also refused: an identifier written `U&"…"` with an escape sequence or a
+`UESCAPE` clause (write the name itself between double quotes); and a
+DEFERRED create in a transaction that has already written to one of its
+sources through a DEFERRED IMV (`DEFERRED IMV '<imv>' cannot be created in
+a transaction that already wrote to its source '<source>': the staged write
+would reach the new IMV a second time at COMMIT. Fix: COMMIT the writes,
+then create the IMV in its own transaction.`). Such a create used to fail
+on the re-creation of the shared flush trigger, which a create no longer
+runs.
+
+A raw PostgreSQL error at create on 1.11.5, now a tagged message with a
+remedy: an aggregate pg_reflex does not decompose (still accepted in a
+single-level query with no GROUP BY and no unique key, recomputed on every
+write); a select item that is neither an aggregate nor a group key in an
+ungrouped aggregate query; an aggregate under IS NULL / BETWEEN / IN /
+LIKE / an array beside GROUP BY or DISTINCT; a bare constant select item
+beside GROUP BY or DISTINCT (`'x'`, `NULL`, `TRUE`, `3.5`, `-1`; cast it);
+two grouping keys sharing a column name; two output columns of one name;
+`COUNT(DISTINCT x)` beside another aggregate inside an expression or in
+HAVING, or with a HAVING subquery; a window function reading a column the
+SELECT list does not project bare, a qualified column or an unaliased
+aggregate.
+
+**Shapes that are now recomputed in full** (the IMV is rebuilt from its
+query by the writing statement, or by the flush in DEFERRED mode):
+
+- any query holding a `RIGHT JOIN`: every write to any of its sources.
+  Writes to the table after the keyword were incremental on 1.11.5;
+- a table read inside a LEFT JOINed derived table or parenthesised join:
+  writes to that table;
+- a table read through a subquery in an expression (WHERE, HAVING, SELECT
+  list, FILTER, JOIN ON): writes to that table. An UPDATE of a column the
+  subquery does not read recomputes too. A passthrough of this shape
+  infers no key, and without one writes to its outer tables recompute as
+  well: pass the key as the third argument;
+- a source read more than once (self-join, two aliases of one dimension, a
+  CTE referenced twice): such writes already recomputed; an UPDATE that
+  changes no column the IMV reads is no longer skipped and recomputes too;
+- a query that reads a source as a whole row or names a value like the
+  source (`COUNT(t)`, `to_jsonb(t)`, `t.*` in an expression, a column named
+  like its table's alias): writes to that source;
+- an aggregate grouped by a column other than the join key, over a LEFT
+  JOIN whose WHERE or later inner join reads a column of the LEFT JOINed
+  table: writes to that table;
+- a passthrough over a derived table or with a set-returning function in
+  the SELECT list infers no key and is refreshed by every write;
+- a keyed passthrough join: a joined table whose key mapping does not
+  identify its rows is refreshed by every write to it; with a declared key
+  whose columns come from two tables, by every write to either;
+- a query holding a quoted identifier equal to a source's bare name that
+  belongs to another relation (`sa.dim` beside `sb."dim"`): writes to that
+  source;
+- a DEFERRED IMV over a CTE whose two tables are written in one
+  transaction: the readers of the CTE's sub-IMV are rebuilt at COMMIT;
+- a partitioned source: a transaction that creates, attaches or detaches
+  a partition **and** writes to the source or one of its partitions
+  reconciles in full, at COMMIT, every IMV of that source that does not
+  mirror its partitions. Loading the new partition directly, or changing
+  partitions in an earlier transaction, stays incremental. A TRUNCATE of
+  a partition rebuilds every IMV of the source;
+- an IMV built on a partitioned IMV whose partitions are rebuilt (a swap,
+  `reflex_reconcile_partition`), when its query does not prove that its
+  rows of one partition key come from rows of that key only (see Fixed),
+  or when the rebuilt keys cannot be named: refreshed whole, once per
+  cascade, with the NOTICE `pg_reflex: '<imv>' is refreshed whole, not by
+  partition, after the partition rebuild of '<source>': <reason>`. Some of
+  these were refreshed by partition before, and some of those were wrong.
+
+Skips that are off, without a full recompute: no UPDATE skip for a query
+holding a NATURAL join or declaring a table alias twice; no UPDATE skip,
+promotion or row filtering for a table an outer join null-extends unless
+the WHERE provably rejects its null-extended rows; no bulk-insert shortcut
+under a FULL JOIN.
+
+**Registry spellings.** `depends_on` and the stored `sql_query` hold one
+spelling per relation: unquoted names in lower case; no quotes around a
+name that does not need them (`"orders"` is registered `orders`); a table
+named by a column-name keyword quoted (`"position"`), by an unreserved
+keyword bare; a table of another schema with the quotes each part needs
+(`"S"."T"`); a name with a non-ASCII letter or a `$` bare. `t` and
+`public.t` remain two registered spellings. The stored `sql_query` is the
+caller's text with those words edited in place. An unaliased reference to
+a CTE is stored as `FROM "<imv>__cte_<alias>" AS <alias>`. A client that
+reads `depends_on` must expect these spellings on recreated IMVs.
+
+**Column types follow PostgreSQL.** A `varchar(n)` / `char(n)` group key
+keeps its type (was `text`); `COUNT(*)` / `SUM(int)` over a partitioned or
+quoted source is `bigint` (was `integer`); `MIN` / `MAX` over an integer
+expression is `integer` (was `numeric`); enum, array, interval, money and
+time keys and extrema keep their type (were `text`). Equal intervals that
+spell differently (`1 day`, `24 hours`) are one group. Intermediate column
+names change for aggregates whose arguments collide and for arguments
+longer than 39 bytes once sanitised.
+
+**Triggers of a partitioned source.** The source carries six triggers
+instead of four: `__reflex_trigger_btrunc_on_<source>` (BEFORE TRUNCATE)
+and `reflex_partitioned_source_<source>` (BEFORE INSERT / UPDATE / DELETE)
+are new. Every partition, leaf and branch, carries six:
+`__reflex_trigger_btrunc_on_<source>`, `__reflex_trigger_trunc_on_<source>`
+and `reflex_partition_{ins,del,upd,guard}_on_<source>`; a partition whose
+columns are in another order than the source's carries the two truncate
+triggers and the guard. The `reflex_partition…` names have no `__reflex_`
+prefix. They are installed at create and by `reflex_rebuild_triggers`, for
+a new or attached partition at the COMMIT of its DDL, and removed at the
+COMMIT of a DETACH and with the last IMV of the source. Create takes
+`SHARE ROW EXCLUSIVE` on every partition, drop `ACCESS EXCLUSIVE`.
+
+**New refusals on a partitioned source**, raised by the guard trigger:
+
+- INSERT / UPDATE / DELETE addressed to a partition whose columns are in
+  another order than the source's (a table created on its own, then
+  attached): `pg_reflex: … cannot maintain the incremental views of
+  <source>: the columns of this partition are in a different order …`,
+  with the hint to address the statement to the source. A WARNING says so
+  when the trigger is installed. Refused also when no row is touched.
+- a write to a table in the transaction that detached it: `… the table is
+  no longer a partition of <source> and carries its triggers until the
+  transaction that detached it commits`.
+
+**Return strings and audit texts.**
+
+- `reflex_flush_deferred(source)` that reaches no enabled DEFERRED IMV
+  returns `NO DEFERRED IMVS: no enabled DEFERRED IMV depends on
+  '<source>'` (was `NO DEFERRED IMVS`) and, called directly, raises a
+  WARNING. It accepts any spelling of the source.
+- `reflex_sync_partitions` appends `; refilled recreated partition(s) <p>:
+  <result>` when it refills a leaf.
+- `reflex_reconcile_partition(<imv>, '', '<p>')` with a partition `<p>`
+  outside the tree of the source the IMV mirrors returns `ERROR:
+  reconcile_partition: '<p>' is not a partition of '<source>', the source
+  whose partitions '<imv>' mirrors` and rebuilds nothing.
+- A partition rebuild that refreshes a dependent whole says so in a NOTICE
+  (`pg_reflex: '<imv>' is refreshed whole, not by partition, after the
+  partition rebuild of '<source>': <reason>`); the reason names the
+  condition the dependent's query does not meet, or the error of a
+  partition refresh that failed.
+- `reflex_rebuild_chain` on an IMV whose definition 1.12.0 refuses raises
+  `reflex_rebuild_chain: failed to recreate IMV '<imv>': ERROR:
+  [reflex-unsupported] …` and keeps the IMV. `reflex_rebuild_imv` and
+  `reflex_reconcile` rebuild the data from the stored query without
+  validating it again and keep working on such an IMV.
+- `reflex_audit`, `trigger-attached`: new findings `Source <s> has
+  disabled trigger(s): …` and `Table <t> of the partition tree of source
+  <s> is missing trigger(s): … and has disabled trigger(s): …`. The remedy
+  of every `trigger-attached` finding is two statements: `SELECT
+  reflex_rebuild_triggers('<source>');` then `SELECT
+  reflex_reconcile('<imv>');`.
+- `reflex_audit`, `trigger-mode-matches`: a source read by a DEFERRED IMV
+  is expected to carry DEFERRED functions whatever the mode of the IMV
+  audited; the finding reads `Trigger function <f> is in <mode> mode but
+  <reason>.`
+- `reflex_audit`, `internal-tables-exist`: requires `__reflex_scratch_<imv>`
+  and the `__reflex_shrunk_<imv>` table of a top-K MIN / MAX IMV, and no
+  `__reflex_affected_<imv>` for an ungrouped aggregate.
+- `reflex_audit`, `partition-mirror`: the remedy for a dropped leaf is
+  `SELECT reflex_sync_partitions('<imv>'); SELECT
+  reflex_reconcile_partition('<imv>', '', '<source partition>');`.
+- `reflex_rebuild_triggers` drops and recreates disabled triggers of the
+  source and of its partition tree. Create and the COMMIT-time sync only
+  add missing triggers, so a `DISABLE TRIGGER` is undone by
+  `reflex_rebuild_triggers` alone.
+- `create_reflex_ivm_if_not_exists` on an existing IMV returns its no-op
+  before validating the query, so a deployment script that re-runs a
+  definition 1.12.0 would refuse keeps working.
+- Time-zone-sensitive functions are accepted with one WARNING (two-argument
+  `date_trunc`, `date_part`, `EXTRACT`, `to_char`, `to_date`, two-argument
+  `to_timestamp`, one-argument `date`): on `timestamptz` their result
+  depends on the writer's `TimeZone`.
+- A HAVING clause that does not parse is kept as written and fails at
+  create; it used to be dropped from the end query.
+
+**Tests.** `v112_sq_commit_path` (the DEFERRED subquery cells replayed
+with real COMMITs) is `#[ignore]`d: a committed DEFERRED create fails the
+creates of tests running beside it. CI runs it alone, after the suite, on
+each PostgreSQL version.
+
+**Known limitations.**
+
+- `SUM` / `AVG` over `DOUBLE PRECISION` stay accepted and are maintained by
+  adding and subtracting, which is not the order PostgreSQL adds rows in.
+  Measured on 20 000 rows of two-decimal values in 5 groups (sums about 4.5
+  million) through 90 writing statements: largest error of a SUM 1.2e-8.
+  After one outlier is inserted and deleted the error stays while the group
+  has rows: 5.5e-5 for a value of 1e12, 0.055 for 1e15, 10.07 for 1e18. It
+  disappears when the group empties and refills. Sum `(x)::numeric` when
+  cancellation matters.
+- Unquoted identifiers are folded as in a UTF-8 database (ASCII letters
+  only). In a single-byte encoding PostgreSQL also folds non-ASCII letters
+  through the locale; write such names in lower case.
+- Session-dependent functions are found by a name list, and a moving
+  date/time value that is not a typed literal is not seen (`WHERE ts <
+  'now'`, `daterange('2024-01-01', 'today')`).
+- `reflex_ivm_status()`, `reflex_audit()` and `reflex_flush_partitions()`
+  called without an argument read the IMVs or pending roots of every
+  schema, so they can still wait behind another schema's partition DDL;
+  `reflex_audit('<imv>')` and `reflex_flush_partition_source('<root>')` do
+  not. The COMMIT-time flush uses the per-root path.
+- A partitioned source whose flush keeps meeting a transient lock error is
+  retried without a cap, each attempt waiting up to `lock_timeout`; its
+  IMVs stay flagged `known_stale` with the lock error meanwhile. After the
+  retry succeeds, IMVs that are correct can stay flagged `known_stale`
+  until their next `reflex_reconcile`.
+- On PostgreSQL builds compiled with `--enable-cassert` and older than the
+  minor releases carrying upstream commit `e371cb7b89` (after 15.19, 16.15,
+  17.11, 18.6), an error caught by a COMMIT-time flush (partition or
+  DEFERRED) at an explicit `COMMIT` aborts the backend on a PostgreSQL
+  assertion. 1.11.5 does the same. Production builds have no assertions:
+  the flush logs its WARNING, flags the IMVs `known_stale` and the COMMIT
+  succeeds.
+
+**Silent defects that remain open**, filed in `untreated_bugs/`:
+
+- `DROP TABLE` of a source partition that holds rows leaves every IMV of
+  the source stale (`DETACH` then `DROP` is followed).
+- A partition attached with rows whose name does not read back unquoted
+  (`"C2_D"`, `"c4 d"`) is lost.
+- A table that is already a source and is then attached as a partition:
+  its IMVs miss the writes addressed to the new partitioned table. (A
+  source that is a partition when the IMV is created is refused.)
+- Swapping a partition of a partitioned source that an IMV reads but does
+  not mirror (a second partitioned source of a join) leaves that IMV stale,
+  unflagged.
+- A partition change and a write to another source of a join IMV in one
+  transaction count the joined rows twice.
+- `reflex_reconcile` called by hand in the transaction that attached a
+  filled partition: the flush adds the partition's rows again.
+- `SET CONSTRAINTS ALL IMMEDIATE` on a partitioned source read by several
+  DEFERRED IMVs applies a write twice.
+- A CTE over a partitioned source does not follow a new partition (silent
+  in DEFERRED, raises in IMMEDIATE).
+- IMVs created before 1.12.0 over two sources that share trigger names
+  (`s.t` and `s_t`) stay unmaintained until recreated; 1.12.0 refuses the
+  second create.
+- `COUNT(DISTINCT e.id)` over a LEFT JOIN is silently wrong in DEFERRED
+  (raises in IMMEDIATE).
+- An ungrouped `MAX(d) - MIN(d)` over dates reads 0 on an emptied source
+  (IMMEDIATE).
+- An aggregate whose WHERE is two AND-ed conjuncts that each hold an OR
+  (`(a OR (b AND c)) AND (d OR (e AND f))`) goes stale on an UPDATE that
+  moves a row out of it (the same on 1.11.5).
+- A type named like the source table is rewritten at trigger time (silent
+  in DEFERRED); a three-part column reference with a bare FROM entry
+  (`SELECT public.t.id FROM t`) is silently stale in DEFERRED.
+- One statement writing two sources of an IMMEDIATE join IMV counts
+  ΔA ⋈ ΔB twice (open since 1.11.5).
+
+### Tests
+
+- 22 new `pg_test` files (`pg_test_v112_*`) and 6 new unit-test files.
+  The suite on the release tree: 3689 passed, 0 failed, 1 ignored on
+  PostgreSQL 16, 17 and 18; 3685 / 0 / 1 on PostgreSQL 15.
+- The partition-swap, schema-isolation and suspension tests commit each
+  step through `dblink` in private databases; the schema-isolation tests
+  hold every table of another schema `ACCESS EXCLUSIVE` while one schema
+  is maintained under a `lock_timeout`.
+- Fixtures are real tables and real IMVs; each cell compares the IMV with
+  a fresh run of its query (bidirectional `EXCEPT ALL`) after create and
+  after every write, in IMMEDIATE and DEFERRED. DEFERRED and partition
+  scenarios commit each step through a second session, so the flush is the
+  one COMMIT runs.
+- Each fix was reverted to check that its tests fail. Cells that pass
+  either way are kept as pins of the surrounding behaviour.
+- No test present on 1.11.5 was deleted, renamed, ignored or edited.
+- Outside the suite, 650 definitions were run in both modes on 1.11.5 and
+  on the tree before the last fix rounds, every step committed: no
+  definition correct on 1.11.5 was wrong or raising.
+
+### Internal (no behaviour change)
+
+- Code the compiler reports unused is removed; test-only helpers are gated.
+- Comments state invariants and reasons; release numbers, report names and
+  finding tags are removed. Each file is proven token-identical.
+- Defects met and not fixed are filed one per report in `untreated_bugs/`.
+
+### Migration
+
+- `ALTER EXTENSION pg_reflex UPDATE TO '1.12.0';` replaces
+  `public.__reflex_on_sql_drop()`, creates
+  `public.__reflex_named_relation(TEXT)` and
+  `public.__reflex_reads_relation(TEXT[], TEXT)`, and replaces
+  `public.__reflex_on_ddl_command_end()` and
+  `public.__reflex_partition_flush_fn()`, each byte-identical to the
+  bootstrap text. No registry column, table, index, trigger, event trigger
+  or function signature changes.
+- **The new library requires the migration.** Its partition flush calls
+  `__reflex_reads_relation`: between installing the library and running
+  `ALTER EXTENSION`, a transaction that creates, attaches or detaches a
+  partition of a source fails at COMMIT with `function
+  public.__reflex_reads_relation(text[], text) does not exist` and is
+  rolled back, and `reflex_flush_partition_source` raises the same. Run the
+  update right after installing the library.
+- The migration does not rewrite per-source trigger functions. A source
+  keeps its 1.11.5 functions and trigger set until
+  `reflex_rebuild_triggers('<source>')` runs or its IMVs are recreated.
+  Run it only on sources that carry triggers: on the `<imv>__base` table
+  of a window IMV it installs a set that makes every later write raise.
+- Recreate every IMV after the update: see "Upgrading to 1.12.0" in
+  `docs/getting-started/upgrading.md` for the steps, the refused
+  definitions and what stays stale otherwise.
+
+---
+
 ## [1.11.5] - 2026-10-01
 
 Rebuilds no longer wipe the IMVs built on the rebuilt one. In the field

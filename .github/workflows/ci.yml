@@ -68,6 +68,9 @@ jobs:
       - name: Run tests
         run: cargo pgrx test pg${{ matrix.pg }}
 
+      - name: Run the COMMIT-path test alone
+        run: cargo test --no-default-features --features "pg${{ matrix.pg }} pg_test" --lib v112_sq_commit_path -- --ignored
+
   concurrent-test:
     name: "Concurrent tests"
     runs-on: ubuntu-latest

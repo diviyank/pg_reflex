@@ -50,6 +50,26 @@ __reflex_trigger_trunc_on_<source>   AFTER TRUNCATE
 
 These triggers are **shared across all IMVs on the same source** — adding a second IMV doesn't add a second set of triggers. Each trigger body looks up the IMV registry, computes the delta, and applies it.
 
+A **partitioned** source carries two more (1.12.0), and every table of its partition tree, leaf and branch, carries six of its own, so that a statement or a TRUNCATE addressed to a partition is maintained like one addressed to the source:
+
+```
+on the source:
+__reflex_trigger_btrunc_on_<source>      BEFORE TRUNCATE
+reflex_partitioned_source_<source>       BEFORE INSERT / UPDATE / DELETE
+
+on each partition:
+__reflex_trigger_btrunc_on_<source>      BEFORE TRUNCATE
+__reflex_trigger_trunc_on_<source>       AFTER TRUNCATE
+reflex_partition_ins_on_<source>
+reflex_partition_del_on_<source>
+reflex_partition_upd_on_<source>
+reflex_partition_guard_on_<source>
+```
+
+The `reflex_partition…` names have no `__reflex_` prefix. They are installed at create and by [`reflex_rebuild_triggers`](../api/reflex_rebuild_triggers.md), for a new or attached partition at the COMMIT of its DDL, and removed at the COMMIT of a DETACH and with the last IMV of the source. Creating an IMV takes `SHARE ROW EXCLUSIVE` on every partition; dropping the last IMV of the source takes `ACCESS EXCLUSIVE`.
+
+A partition whose columns are in another order than the source's (a table created on its own, then attached) carries the two TRUNCATE triggers and the guard only: INSERT / UPDATE / DELETE addressed to it are refused, with the hint to address the statement to the source. A write to a table in the transaction that detached it is refused as well. A TRUNCATE of a partition rebuilds every IMV of the source.
+
 ## Sufficient statistics
 
 Instead of storing raw rows, the intermediate table stores the **minimum state needed to maintain each aggregate**:

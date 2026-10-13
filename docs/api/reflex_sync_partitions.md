@@ -17,6 +17,8 @@ RETURNS TEXT
 
 Idempotent and advisory-lock protected, so duplicate fires inside one transaction collapse harmlessly. A no-op on unpartitioned IMVs.
 
+Since 1.12.0, when it recreates a leaf beside a sibling that holds rows, it refills that leaf and appends `; refilled recreated partition(s) <p>: <result>` to the returned string.
+
 ## Automatic invocation
 
 After a source `ATTACH PARTITION` or `CREATE TABLE ... PARTITION OF`, the `reflex_on_ddl_command_end` event trigger calls `reflex_sync_partitions(view, drop_orphans => FALSE)` for every partitioned IMV depending on that source — so new partitions appear automatically. Orphan deletion is never automatic (a source `DETACH` is not a delete signal); call this manually with `drop_orphans => TRUE` to prune them.

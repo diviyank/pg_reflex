@@ -42,11 +42,13 @@ SELECT create_reflex_ivm('region_ranking',
     regional_counts AS (
         SELECT region, COUNT(*) AS num_orders FROM orders GROUP BY region
     )
-    SELECT t.region, t.total, c.num_orders,
-           RANK() OVER (ORDER BY t.total DESC) AS rank
-    FROM regional_totals t
-    JOIN regional_counts c ON t.region = c.region');
+    SELECT region, total, num_orders,
+           RANK() OVER (ORDER BY total DESC) AS rank
+    FROM regional_totals
+    JOIN regional_counts USING (region)');
 ```
+
+The window is computed over the IMV's output columns, so the SELECT list and the window read them by their bare names: a qualified reference (`t.total`) is rejected. When two CTEs hold a column of the same name, join them in a third CTE that renames it and apply the window over that one.
 
 Both `regional_totals` and `regional_counts` are preserved as sub-IMVs, and the window function rank applies at read time.
 
