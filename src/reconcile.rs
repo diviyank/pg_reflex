@@ -1114,6 +1114,7 @@ fn reconcile_node_then_dependents(
                     dep,
                     result
                 );
+                crate::cascade::flag_stale_after_failed_refresh(&dep, view_name, result);
             }
         }
     }
@@ -1219,6 +1220,7 @@ fn cascade_partitioned_rebuild_to_dependents(
                 result,
                 dep
             );
+            crate::cascade::flag_stale_after_failed_refresh(dep, view_name, result);
         }
     }
 }

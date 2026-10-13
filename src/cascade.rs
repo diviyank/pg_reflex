@@ -668,7 +668,31 @@ fn refresh_whole(dependent: &str, source: &str, reason: &str) {
             result,
             dependent
         );
+        flag_stale_after_failed_refresh(dependent, source, result);
     }
+}
+
+/// Flags `dependent` known stale after its refresh following the rebuild of
+/// `source` returned `result`, an error: it no longer matches its query, and no
+/// heal is queued for it when the rebuild covered it. A later successful
+/// `reflex_reconcile` clears the flag.
+pub(crate) fn flag_stale_after_failed_refresh(dependent: &str, source: &str, result: &str) {
+    let reason = format!(
+        "its refresh after the rebuild of '{source}' returned: {result}. Run SELECT \
+         reflex_reconcile('{}'); once the cause is cleared.",
+        dependent.replace('\'', "''")
+    );
+    Spi::run_with_args(
+        "UPDATE public.__reflex_ivm_reference \
+            SET known_stale = TRUE, \
+                stale_since = COALESCE(stale_since, now()), \
+                stale_reason = left(CASE WHEN COALESCE(known_stale, FALSE) \
+                                          AND COALESCE(stale_reason, '') <> '' \
+                                    THEN stale_reason || ' | ' || $2 ELSE $2 END, 2000) \
+          WHERE name = $1",
+        &[text_arg(dependent), text_arg(&reason)],
+    )
+    .unwrap_or_else(|e| pgrx::error!("pg_reflex: flag '{dependent}' stale: {e}"));
 }
 
 /// The values a LIST partition bound lists (`FOR VALUES IN (1, 'a')`), as key
