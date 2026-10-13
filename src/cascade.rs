@@ -480,6 +480,61 @@ fn scope_of(
     }
 }
 
+/// The statement that catches `dependent` up with rows of `rebuilt` that left
+/// without reaching it (a dropped partition, read by an IMV that ignores
+/// `rebuilt`): a refresh of the keys they held when its query proves those keys
+/// are its own, else a whole refresh. A keyed refresh that does not report
+/// success falls back to the whole one. One that finds no partition of
+/// `dependent` for those keys left (its pre-sync dropped it, its query filling
+/// none) leaves `dependent` right but its own ignoring readers behind: they are
+/// caught up on the same keys in turn.
+pub(crate) fn catch_up_statement(
+    client: &pgrx::spi::SpiClient<'_>,
+    dependent: &str,
+    rebuilt: &RebuiltRows<'_>,
+) -> String {
+    let literal = crate::partition::sql_literal_text;
+    let whole = format!("PERFORM public.reflex_reconcile({})", literal(dependent));
+    let Some(shape) = read_dependent(client, dependent) else {
+        return whole;
+    };
+    match scope_of(client, &shape, rebuilt) {
+        RefreshScope::Partitions {
+            source_partitions,
+            keys,
+        } if source_partitions.is_empty() && !keys.is_empty() => {
+            let keys: Vec<String> = keys.into_iter().collect();
+            let dependent_rows = RebuiltRows {
+                view_name: dependent,
+                partition_columns: &shape.partition_columns,
+                schema: rebuilt.schema,
+                partitions: &[],
+                keys: Ok(keys.clone()),
+            };
+            let readers_catch_up: String = crate::reconcile::ignoring_dependents(dependent)
+                .iter()
+                .map(|reader| format!("{};", catch_up_statement(client, reader, &dependent_rows)))
+                .collect();
+            let result = format!("refreshed_{}", shape.graph_depth);
+            format!(
+                "DECLARE {result} TEXT; \
+                 BEGIN \
+                   {result} := public.reflex_reconcile_partition({dependent}, {keys}); \
+                   IF {result} LIKE 'reconcile_partition: no children matched%' THEN \
+                     NULL; {readers_catch_up} \
+                   ELSIF {result} NOT LIKE 'RECONCILED%' AND {result} <> {queued} THEN \
+                     {whole}; \
+                   END IF; \
+                 END",
+                queued = literal(crate::reconcile::RECONCILE_QUEUED_FOR_COMMIT),
+                dependent = literal(dependent),
+                keys = literal(&keys.join(",")),
+            )
+        }
+        _ => whole,
+    }
+}
+
 /// Queues the refresh of each enabled IMV of `dependents` after `rebuilt`.
 pub(crate) fn queue_dependents(
     client: &pgrx::spi::SpiClient<'_>,
@@ -790,16 +845,16 @@ fn top_level_relations(select: &Select) -> Option<Vec<JoinedRelation<'_>>> {
     Some(relations)
 }
 
-/// Whether every partition column of `imv` is proven to be the column of
-/// `source` that `source` is partitioned by: a partition of `source` then
-/// feeds only the partition of `imv` that mirrors it.
+/// Whether each partition column of `imv` is the column `source` is
+/// partitioned by at that level, proven to be that column of `source`: a
+/// partition of `source` then feeds only the partition of `imv` that mirrors it.
 pub(crate) fn partitions_follow_source(
     client: &pgrx::spi::SpiClient<'_>,
     imv: &str,
     source: &str,
 ) -> bool {
     read_dependent(client, imv).is_some_and(|dependent| {
-        !dependent.partition_columns.is_empty()
+        crate::partition::source_levels_partitioned_on(client, source, &dependent.partition_columns)
             && dependent.partition_columns.iter().all(|column| {
                 unproven_partition_alignment(
                     &dependent.sql_query,
