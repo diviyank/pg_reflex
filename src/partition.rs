@@ -1669,12 +1669,18 @@ pub(crate) fn reflex_sync_partitions_impl(view_name: &str, drop_orphans: bool) -
             // CASCADE may remove a relation `existing_children` still lists,
             // so after the first drop every create is issued again.
             let mut existing_children_current = true;
-
+            // No flush follows a partition change of an IMV source, and the
+            // partitions of an IMV not proven to follow its source's may hold
+            // rows of other source partitions: there an orphan the query still
+            // fills is kept as the incoming child rather than dropped.
+            let adopt_filled_orphans = crate::source_truncate::is_registered_imv(client, &anchor)
+                .unwrap_or(true)
+                || !crate::cascade::partitions_follow_source(client, view_name, &anchor);
             for node in &nodes {
                 let int_name = intermediate_child_name(view_name, &node.bare_name);
                 let tgt_name = target_child_name(view_name, &node.bare_name);
-                let int_is_new = !existing_children.contains(&int_name);
-                let tgt_is_new = !existing_children.contains(&tgt_name);
+                let mut int_is_new = !existing_children.contains(&int_name);
+                let mut tgt_is_new = !existing_children.contains(&tgt_name);
                 if has_intermediate && int_is_new != tgt_is_new {
                     let sibling = if int_is_new { &tgt_name } else { &int_name };
                     if relation_has_rows(client, &schema_prefix(view_name, sibling)) {
@@ -1686,8 +1692,6 @@ pub(crate) fn reflex_sync_partitions_impl(view_name: &str, drop_orphans: bool) -
                 let detached =
                     build_detached_node_ddl_pair(view_name, node, anchor_root_bare, unlogged);
                 let top_level = is_top_level_node(node, anchor_root_bare);
-                let build_int_detached = top_level && int_is_new;
-                let build_tgt_detached = top_level && tgt_is_new;
                 if has_intermediate {
                     // Bound-collision heal: a source-side repartition that DETACHes a leaf and
                     // ATTACHes a freshly-named replacement at the SAME bound
@@ -1699,16 +1703,21 @@ pub(crate) fn reflex_sync_partitions_impl(view_name: &str, drop_orphans: bool) -
                     // to the incoming child AND mapped to no live source leaf
                     // — never a broader drop_orphans-style sweep. Mirrors the
                     // orphan heal in `execute_partition_swap_for_child`.
-                    if drop_bound_collision_orphan(
+                    match heal_bound_collision(
                         client,
+                        view_name,
                         schema,
                         &ddl.int_parent_qual,
                         &src_expected_int,
                         &int_name,
                         &node.bound_expr,
+                        adopt_filled_orphans,
                     )? {
-                        existing_children_current = false;
+                        BoundCollision::Dropped => existing_children_current = false,
+                        BoundCollision::Adopted => int_is_new = false,
+                        BoundCollision::None => {}
                     }
+                    let build_int_detached = top_level && int_is_new;
                     if build_int_detached {
                         client
                             .update(&detached.int_create, None, &[])
@@ -1728,16 +1737,21 @@ pub(crate) fn reflex_sync_partitions_impl(view_name: &str, drop_orphans: bool) -
                         out.added_intermediate += 1;
                     }
                 }
-                if drop_bound_collision_orphan(
+                match heal_bound_collision(
                     client,
+                    view_name,
                     schema,
                     &ddl.tgt_parent_qual,
                     &src_expected_tgt,
                     &tgt_name,
                     &node.bound_expr,
+                    adopt_filled_orphans,
                 )? {
-                    existing_children_current = false;
+                    BoundCollision::Dropped => existing_children_current = false,
+                    BoundCollision::Adopted => tgt_is_new = false,
+                    BoundCollision::None => {}
                 }
+                let build_tgt_detached = top_level && tgt_is_new;
                 if build_tgt_detached {
                     client
                         .update(&detached.tgt_create, None, &[])
@@ -1881,24 +1895,51 @@ fn toggle_relocation_triggers(
 /// that one passes the IMV ROOT rather than the swapped leaf's immediate
 /// parent, so on a multi-level tree it compares the root's direct children
 /// against a leaf's bound, never matches, and silently heals nothing (a known
-/// limitation of that heal) — do not copy that scoping here. Returns whether a child was dropped.
-fn drop_bound_collision_orphan(
+/// limitation of that heal) — do not copy that scoping here.
+///
+/// With `adopt_filled`, an orphan the query of `view_name` still fills is
+/// renamed to `about_to_attach` instead, keeping its rows: they may come from
+/// other source partitions (its partition column is taken from another
+/// relation), or from a partition of an IMV source that was itself kept.
+#[allow(clippy::too_many_arguments)]
+fn heal_bound_collision(
     client: &mut pgrx::spi::SpiClient<'_>,
+    view_name: &str,
     schema: &str,
     parent_qual: &str,
     expected: &std::collections::HashSet<String>,
     about_to_attach: &str,
     bound_expr: &str,
-) -> Result<bool, String> {
+    adopt_filled: bool,
+) -> Result<BoundCollision, String> {
     if bound_expr.is_empty() {
-        return Ok(false);
+        return Ok(BoundCollision::None);
     }
-    let mut dropped = false;
+    let mut outcome = BoundCollision::None;
     for child in list_partition_children(client, parent_qual) {
         if child.bare_name == about_to_attach || expected.contains(&child.bare_name) {
             continue;
         }
         if !child.bound_expr.is_empty() && child.bound_expr == bound_expr {
+            if adopt_filled && query_fills_partition(client, view_name, schema, &child.bare_name) {
+                client
+                    .update(
+                        &format!(
+                            "ALTER TABLE \"{}\".\"{}\" RENAME TO \"{}\"",
+                            schema, child.bare_name, about_to_attach
+                        ),
+                        None,
+                        &[],
+                    )
+                    .map_err(|e| format!("sync: adopt orphan '{}': {}", child.bare_name, e))?;
+                pgrx::notice!(
+                    "pg_reflex: orphan partition '{}' still holds rows of '{}': renamed to the incoming child '{}'",
+                    child.bare_name,
+                    view_name,
+                    about_to_attach
+                );
+                return Ok(BoundCollision::Adopted);
+            }
             delete_rows_through_the_imv_root(client, schema, &child.bare_name)
                 .map_err(|e| format!("sync: {}", e))?;
             let q = format!(
@@ -1916,10 +1957,17 @@ fn drop_bound_collision_orphan(
                 child.bare_name,
                 about_to_attach
             );
-            dropped = true;
+            outcome = BoundCollision::Dropped;
         }
     }
-    Ok(dropped)
+    Ok(outcome)
+}
+
+/// What [`heal_bound_collision`] did with an orphan holding the incoming bound.
+enum BoundCollision {
+    None,
+    Dropped,
+    Adopted,
 }
 
 /// Whether the query of `view_name` yields a row inside the bounds of its
@@ -4323,17 +4371,17 @@ pub(crate) fn reflex_flush_partitions_impl(only: Option<&str>) -> String {
                 let (schema_opt, _) = split_qualified_name(imv);
                 let schema = schema_opt.unwrap_or("public");
 
-                // A partition the query still fills is rebuilt with the whole
-                // IMV, not dropped; the rows of the others reach the readers first.
-                // Unless the IMV's partitions provably follow the source's, a
-                // gone source partition may also have fed other partitions:
-                // the IMV is then rebuilt whole.
-                let rebuilt_whole_for_drops = !to_drop.is_empty()
-                    && !crate::cascade::partitions_follow_source(client, imv, root);
+                // A partition the query still fills is kept, not dropped; the
+                // rows of the others reach the readers first. Unless the IMV's
+                // partitions provably follow the source's, a source partition
+                // that came or went may feed or have fed any partition of the
+                // IMV, which is then rebuilt whole.
                 let (filled_nodes, to_drop): (BTreeSet<String>, BTreeSet<String>) =
                     to_drop.into_iter().partition(|node| {
                         query_fills_partition(client, imv, schema, &target_child_name(imv, node))
                     });
+                let rebuilt_whole = !filled_nodes.is_empty()
+                    || !crate::cascade::partitions_follow_source(client, imv, root);
                 for node in &to_drop {
                     root_stmts.extend(delete_through_the_imv_root_statement(
                         client,
@@ -4363,7 +4411,7 @@ pub(crate) fn reflex_flush_partitions_impl(only: Option<&str>) -> String {
                         schema, int
                     ));
                 }
-                if rebuilt_whole_for_drops || !filled_nodes.is_empty() {
+                if rebuilt_whole {
                     root_stmts.push(format!(
                         "PERFORM public.reflex_reconcile({})",
                         sql_literal_text(imv)
@@ -4388,7 +4436,7 @@ pub(crate) fn reflex_flush_partitions_impl(only: Option<&str>) -> String {
                     .filter(|(_, fill)| **fill)
                     .map(|(node, _)| node.as_str())
                     .collect();
-                if !fill_nodes.is_empty() {
+                if !fill_nodes.is_empty() && !rebuilt_whole {
                     root_stmts.push(format!(
                         "PERFORM public.reflex_reconcile_partition({}, '', {}, true)",
                         sql_literal_text(imv),
