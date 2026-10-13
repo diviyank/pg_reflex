@@ -952,3 +952,71 @@ fn pg_rbd_diff_dml_runs_under_caller_planner_settings() {
         "diff DML ran with the caller's enable_nestloop overridden"
     );
 }
+
+/// A keyless aggregate target that already repeats a group's row (a target
+/// gone wrong) cannot be diffed by its GROUP BY columns: the rebuild must leave
+/// it, and the passthrough reading it, equal to their queries.
+fn rbd_repeated_group_rows_run(p: &str, mode: &str) {
+    let agg_sql = format!("SELECT g, SUM(v) AS s, COUNT(*) AS c FROM {p}_rel GROUP BY g");
+    let reader_sql = format!("SELECT g, s, c FROM {p}_agg");
+    let reader_fresh = format!("SELECT g, s, c FROM ({agg_sql}) z");
+    Spi::run(&format!("CREATE TABLE {p}_rel (g INT, k INT NOT NULL, v INT NOT NULL)")).expect("rel");
+    Spi::run(&format!(
+        "INSERT INTO {p}_rel VALUES (NULL, 1, 1), (NULL, 2, 2), (1, 3, 3), (1, 4, 4), (2, 5, 5), (3, 7, 1)"
+    ))
+    .expect("seed");
+    for (name, sql) in [(format!("{p}_agg"), &agg_sql), (format!("{p}_reader"), &reader_sql)] {
+        let created = Spi::get_one::<String>(&format!(
+            "SELECT create_reflex_ivm('{name}', $q${sql}$q$, NULL, NULL, '{mode}')"
+        ))
+        .expect("create")
+        .unwrap_or_default();
+        assert_eq!(created, "CREATE REFLEX INCREMENTAL VIEW", "{name}");
+    }
+    Spi::run(&format!(
+        "DO $d$ DECLARE r record; BEGIN FOR r IN SELECT indexrelid::regclass AS i FROM pg_index \
+           WHERE indrelid = '{p}_agg'::regclass AND indisunique LOOP EXECUTE 'DROP INDEX ' || r.i; \
+         END LOOP; END $d$"
+    ))
+    .expect("drop unique indexes");
+    let mismatches = |name: &str, query: &str| {
+        Spi::get_one::<i64>(&format!(
+            "SELECT count(*) FROM ((SELECT x::text FROM {name} x EXCEPT ALL SELECT x::text FROM ({query}) x) \
+             UNION ALL (SELECT x::text FROM ({query}) x EXCEPT ALL SELECT x::text FROM {name} x)) o"
+        ))
+        .expect("oracle")
+        .unwrap_or(-1)
+    };
+    for drift in [
+        "INSERT INTO {p}_agg SELECT * FROM {p}_agg WHERE g IS NULL",
+        "INSERT INTO {p}_agg SELECT * FROM {p}_agg WHERE g = 1",
+        "UPDATE {p}_agg SET s = s + 5 WHERE g = 2",
+        "INSERT INTO {p}_agg SELECT * FROM {p}_agg WHERE g = 2",
+    ] {
+        let drift = drift.replace("{p}", p);
+        Spi::run(&drift).expect("drift");
+        if mode == "DEFERRED" {
+            Spi::run(&format!("SELECT reflex_flush_deferred('{p}_agg')")).expect("flush");
+        }
+        rbd_rebuild(&format!("{p}_agg"), &agg_sql);
+        if mode == "DEFERRED" {
+            Spi::run(&format!("SELECT reflex_flush_deferred('{p}_agg')")).expect("flush");
+        }
+        assert_eq!(mismatches(&format!("{p}_agg"), &agg_sql), 0, "{mode} {p}_agg after <{drift}>");
+        assert_eq!(
+            mismatches(&format!("{p}_reader"), &reader_fresh),
+            0,
+            "{mode} {p}_reader after <{drift}>"
+        );
+    }
+}
+
+#[pg_test]
+fn pg_rbd_aggregate_target_repeating_a_group_is_not_diffed_by_its_groups_immediate() {
+    rbd_repeated_group_rows_run("rbrg_i", "IMMEDIATE");
+}
+
+#[pg_test]
+fn pg_rbd_aggregate_target_repeating_a_group_is_not_diffed_by_its_groups_deferred() {
+    rbd_repeated_group_rows_run("rbrg_d", "DEFERRED");
+}
