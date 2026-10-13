@@ -196,19 +196,22 @@ pub(crate) fn queue_whole_refresh(dependent: &str, rebuilt_source: &str) -> bool
     if !cascade_is_open() {
         return false;
     }
-    let graph_depth = Spi::get_one_with_args::<i32>(
-        "SELECT graph_depth FROM public.__reflex_ivm_reference WHERE name = $1",
-        &[text_arg(dependent)],
-    )
-    .unwrap_or(None)
-    .unwrap_or(i32::MAX);
     queue_refresh(
         dependent,
-        graph_depth,
+        graph_depth_of(dependent),
         RefreshScope::Whole(format!("'{rebuilt_source}' was rebuilt whole")),
         rebuilt_source,
     );
     true
+}
+
+fn graph_depth_of(imv: &str) -> i32 {
+    Spi::get_one_with_args::<i32>(
+        "SELECT graph_depth FROM public.__reflex_ivm_reference WHERE name = $1",
+        &[text_arg(imv)],
+    )
+    .unwrap_or(None)
+    .unwrap_or(i32::MAX)
 }
 
 /// The rows of `view_name` a refresh may have added, removed or changed.
@@ -226,6 +229,7 @@ pub(crate) struct RebuiltRows<'a> {
 }
 
 struct Dependent {
+    name: String,
     graph_depth: i32,
     graph_child: Vec<String>,
     partition_columns: Vec<String>,
@@ -261,6 +265,7 @@ fn read_dependent(client: &pgrx::spi::SpiClient<'_>, name: &str) -> Option<Depen
             .unwrap_or_default()
     };
     Some(Dependent {
+        name: name.to_string(),
         graph_depth: row.get_by_name::<i32, _>("graph_depth").ok().flatten()?,
         graph_child: texts("graph_child"),
         partition_columns: texts("partition_columns"),
@@ -340,6 +345,23 @@ fn partition_at_depth(
         .and_then(|mut rows| rows.next())
         .and_then(|row| row.get_by_name::<String, _>("holder").ok().flatten())
         .unwrap_or(qualified)
+}
+
+/// The type, type modifier and collation of `relation`'s column `column`.
+fn column_type(client: &pgrx::spi::SpiClient<'_>, relation: &str, column: &str) -> Option<String> {
+    client
+        .select(
+            "SELECT format_type(a.atttypid, a.atttypmod) || ' COLLATE ' || a.attcollation::text \
+                    AS typed \
+             FROM pg_attribute a \
+             WHERE a.attrelid = to_regclass($1) AND a.attname = $2 \
+               AND a.attnum > 0 AND NOT a.attisdropped",
+            Some(1),
+            &[text_arg(relation), text_arg(column)],
+        )
+        .ok()
+        .and_then(|mut rows| rows.next())
+        .and_then(|row| row.get_by_name::<String, _>("typed").ok().flatten())
 }
 
 /// The scope `rebuilt` gives `dependent`.
@@ -423,6 +445,14 @@ fn scope_of(
         };
     }
 
+    let rebuilt_type = column_type(client, rebuilt.view_name, column);
+    if rebuilt_type.is_none() || rebuilt_type != column_type(client, &dependent.name, column) {
+        return RefreshScope::Whole(format!(
+            "its \"{column}\" column is not of the type and collation of '{}''s ({})",
+            rebuilt.view_name,
+            rebuilt_type.unwrap_or_else(|| "unknown".to_string())
+        ));
+    }
     let keys = match &rebuilt.keys {
         Ok(keys) => keys,
         Err(reason) => return RefreshScope::Whole(reason.clone()),
