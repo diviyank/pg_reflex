@@ -9,6 +9,23 @@
 // it was refreshed. Any other write to `sc_sfv` (its maintenance after a write to
 // its source) still queues. Chain and helpers: pg_test_v112_swap_cascade.rs.
 
+// 1.12.1, honour ignore on the push path: a partition flush now leaves the
+// ignoring sub-IMVs to their heal (tests at the end of this file). The tests
+// below pin the explicit partition reconcile, which still refreshes them, and
+// the heal trigger's skip around that refresh.
+
+/// Plan `plan` of the source drifts behind its IMVs (written with their
+/// triggers off), then the passthrough's partition of it is reconciled
+/// explicitly.
+fn hor_drift_and_reconcile(plan: i32) -> String {
+    format!(
+        "ALTER TABLE sc_ss DISABLE TRIGGER USER; \
+         UPDATE sc_ss SET qty = qty + 3, base = base + 1 WHERE plan = {plan}; \
+         ALTER TABLE sc_ss ENABLE TRIGGER USER; \
+         SELECT reflex_reconcile_partition('sc_sfv', '{plan}')"
+    )
+}
+
 fn hor_queued_keys() -> Vec<String> {
     sc_text_rows(
         "SELECT imv_name || ':' || partition_key FROM public.__reflex_heal_pending \
@@ -44,9 +61,8 @@ fn hor_assert_own_rebuild_queues_no_heal(dbname: &str, mode: &str, field_names: 
         failures.push("fixture: the passthrough carries no heal UPDATE trigger".to_string());
     }
     for (label, statements) in [
-        ("three leaves, explicit flush", format!("{}; {SC_FLUSH}", sc_three_leaves(2, 4))),
-        ("one leaf, flushed at COMMIT", sc_swap(3, 2, &sc_leaf_rows(3, 2, 4, 7))),
-        ("whole plan replaced", sc_swap_plan(1, 3)),
+        ("plan 2 reconciled", hor_drift_and_reconcile(2)),
+        ("plan 3 reconciled", hor_drift_and_reconcile(3)),
     ] {
         if let Err(error) = chain.commit(&statements) {
             failures.push(format!("{label}: raised {error}"));
@@ -66,19 +82,19 @@ fn hor_assert_own_rebuild_queues_no_heal(dbname: &str, mode: &str, field_names: 
     }
 
     match chain.commit(&format!(
-        "{}; {SC_FLUSH}; UPDATE sc_ss SET qty = qty + 1 WHERE plan = 4 AND product = 2",
-        sc_swap(1, 2, &sc_leaf_rows(1, 2, 4, 11))
+        "{}; UPDATE sc_ss SET qty = qty + 1 WHERE plan = 4 AND product = 2",
+        hor_drift_and_reconcile(1)
     )) {
-        Err(error) => failures.push(format!("flush then write: raised {error}")),
+        Err(error) => failures.push(format!("reconcile then write: raised {error}")),
         Ok(()) => {
             let queued = hor_queued_keys();
             if queued != vec![format!("{forecast_sales}:4")] {
                 failures.push(format!(
-                    "flush then write: queued {queued:?}, want only the written plan 4"
+                    "reconcile then write: queued {queued:?}, want only the written plan 4"
                 ));
             }
             if !hor_stale_imvs().contains(&forecast_sales) {
-                failures.push("flush then write: the ignoring sub-IMV is not stale".to_string());
+                failures.push("reconcile then write: the ignoring sub-IMV is not stale".to_string());
             }
         }
     }
@@ -118,9 +134,9 @@ fn v1121_hor_own_rebuild_skips_the_heal_key_derivation() {
     sc_open("reflex_hor_cost", "IMMEDIATE", chain);
     let heal_queue_locked = "SELECT count(*)::text FROM pg_locks \
          WHERE pid = pg_backend_pid() AND relation = 'public.__reflex_heal_pending'::regclass";
-    let after_flush = sc_text_rows(&format!(
-        "{}; {SC_FLUSH}; {heal_queue_locked}",
-        sc_three_leaves(2, 4)
+    let after_reconcile = sc_text_rows(&format!(
+        "{}; {heal_queue_locked}",
+        hor_drift_and_reconcile(2)
     ));
     let after_write = sc_text_rows(&format!(
         "UPDATE sc_ss SET qty = qty + 1 WHERE plan = 3 AND product = 1; {heal_queue_locked}"
@@ -129,7 +145,7 @@ fn v1121_hor_own_rebuild_skips_the_heal_key_derivation() {
     probe_db_close("reflex_hor_cost");
 
     assert_eq!(after_write, vec!["1".to_string()], "control: a write runs the derivation");
-    assert_eq!(after_flush, vec!["0".to_string()], "the flush must not run it");
+    assert_eq!(after_reconcile, vec!["0".to_string()], "the explicit reconcile must not run it");
     assert!(wrong.is_empty(), "{}", wrong.join(", "));
 }
 
@@ -152,7 +168,7 @@ fn v1121_hor_unproven_reader_keeps_its_heal() {
         "SELECT count(*)::int8 FROM public.__reflex_ivm_reference \
          WHERE name = 'hor_two_level' AND aggregations->'ignore_heal_keys' ? 'sc_sfv'",
     );
-    let flushed = chain.commit(&format!("{}; {SC_FLUSH}", sc_swap(2, 2, &sc_leaf_rows(2, 2, 4, 7))));
+    let flushed = chain.commit(&hor_drift_and_reconcile(2));
     let queued = hor_queued_keys();
     let mut wrong = chain.wrong_nodes(&[]);
     let fresh = HOR_TWO_LEVEL_SQL.replace("sc_sfv AS sf", &format!("({SC_SFV_SQL}) AS sf"));
@@ -220,7 +236,7 @@ fn v1121_hor_readers_outside_the_coverage_keep_their_heal() {
         }
     }
     if let Err(error) =
-        chain.commit(&format!("{}; {SC_FLUSH}", sc_swap(2, 2, &sc_leaf_rows(2, 2, 4, 7))))
+        chain.commit(&hor_drift_and_reconcile(2))
     {
         failures.push(format!("swap and flush: raised {error}"));
     }
@@ -277,10 +293,7 @@ fn v1121_hor_failed_refresh_of_a_covered_reader_flags_it_stale() {
            WHEN (NEW.name = 'sc_fav__cte_forecast_bounds') \
            EXECUTE FUNCTION hor_disable_reader()",
     );
-    let flushed = chain.commit(&format!(
-        "{}; {SC_FLUSH}",
-        sc_swap(2, 2, &sc_leaf_rows(2, 2, 4, 7))
-    ));
+    let flushed = chain.commit(&hor_drift_and_reconcile(2));
     let behind = chain.wrong_nodes(&[]);
     let (flagged, reason) = hor_registry_flag(&chain, &reader);
     let queued = hor_queued_keys();
