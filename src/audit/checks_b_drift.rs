@@ -246,6 +246,9 @@ impl Check for PartitionMirror {
         //
         // The target-side comparison runs in every case, so a clean target yields
         // zero findings rather than an empty-bodied one.
+        // A partition the query still fills is kept by the sync on purpose.
+        let not_kept =
+            |child: &String| !crate::partition::partition_kept_as_filled(client, &imv.name, child);
         let (missing_int, extra_int): (Vec<String>, Vec<String>) =
             if intermediate_expected && intermediate_present {
                 let int_children = crate::partition::list_partition_children(client, &int_parent);
@@ -257,13 +260,21 @@ impl Check for PartitionMirror {
                     .collect();
                 (
                     src_expected_int.difference(&int_have).cloned().collect(),
-                    int_have.difference(&src_expected_int).cloned().collect(),
+                    int_have
+                        .difference(&src_expected_int)
+                        .filter(|child| not_kept(child))
+                        .cloned()
+                        .collect(),
                 )
             } else {
                 (Vec::new(), Vec::new())
             };
         let missing_tgt: Vec<String> = src_expected_tgt.difference(&tgt_have).cloned().collect();
-        let extra_tgt: Vec<String> = tgt_have.difference(&src_expected_tgt).cloned().collect();
+        let extra_tgt: Vec<String> = tgt_have
+            .difference(&src_expected_tgt)
+            .filter(|child| not_kept(child))
+            .cloned()
+            .collect();
 
         if missing_int.is_empty()
             && extra_int.is_empty()
@@ -397,7 +408,12 @@ impl Check for PartitionTreeDrift {
             .collect();
 
         let missing_leaves: Vec<String> = src_leaves.difference(&imv_leaves).cloned().collect();
-        let extra_leaves: Vec<String> = imv_leaves.difference(&src_leaves).cloned().collect();
+        // A partition the query still fills is kept by the sync on purpose.
+        let extra_leaves: Vec<String> = imv_leaves
+            .difference(&src_leaves)
+            .filter(|leaf| !crate::partition::partition_kept_as_filled(client, &imv.name, leaf))
+            .cloned()
+            .collect();
 
         if missing_leaves.is_empty() && extra_leaves.is_empty() {
             return vec![];
