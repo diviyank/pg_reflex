@@ -338,39 +338,30 @@ pub(crate) struct HealsCoveredByRebuild {
 }
 
 impl HealsCoveredByRebuild {
+    /// `None` when the rebuild covers no reader: the setting is left as it is.
     pub(crate) fn begin(
         client: &mut pgrx::spi::SpiClient<'_>,
         view_name: &str,
         partition_column: &str,
         refreshed_readers: &[String],
-    ) -> Self {
-        let previous = client
+    ) -> Option<Self> {
+        let (previous, covered) = client
             .select(
-                &format!("SELECT current_setting('{COVERED_BY_REBUILD_GUC}', true) AS v"),
-                Some(1),
-                &[],
-            )
-            .ok()
-            .and_then(|mut rows| rows.next())
-            .and_then(|row| row.get_by_name::<String, _>("v").ok().flatten())
-            .unwrap_or_default();
-        client
-            .update(
                 &format!(
-                    "SELECT set_config('{COVERED_BY_REBUILD_GUC}', COALESCE(( \
-                         SELECT jsonb_build_object('relid', to_regclass($1)::oid, \
-                                                   'imvs', jsonb_agg(DISTINCT r.name))::text \
-                           FROM public.__reflex_ivm_reference r \
-                          CROSS JOIN LATERAL jsonb_each( \
-                                COALESCE(r.aggregations->'ignore_heal_keys', '{{}}'::jsonb)) k \
-                          WHERE COALESCE(r.enabled, TRUE) \
-                            AND r.name = ANY($3::text[]) \
-                            AND array_length(r.partition_columns, 1) = 1 \
-                            AND to_regclass(k.value->>'relation') = to_regclass($1) \
-                            AND k.value->>'source_column' = $2 \
-                         HAVING count(*) > 0), ''), true)"
+                    "SELECT COALESCE(current_setting('{COVERED_BY_REBUILD_GUC}', true), '') AS previous, \
+                            (SELECT jsonb_build_object('relid', to_regclass($1)::oid, \
+                                                       'imvs', jsonb_agg(DISTINCT r.name))::text \
+                               FROM public.__reflex_ivm_reference r \
+                              CROSS JOIN LATERAL jsonb_each( \
+                                    COALESCE(r.aggregations->'ignore_heal_keys', '{{}}'::jsonb)) k \
+                              WHERE COALESCE(r.enabled, TRUE) \
+                                AND r.name = ANY($3::text[]) \
+                                AND array_length(r.partition_columns, 1) = 1 \
+                                AND to_regclass(k.value->>'relation') = to_regclass($1) \
+                                AND k.value->>'source_column' = $2 \
+                             HAVING count(*) > 0) AS covered"
                 ),
-                None,
+                Some(1),
                 &[
                     unsafe {
                         DatumWithOid::new(
@@ -392,21 +383,37 @@ impl HealsCoveredByRebuild {
                     },
                 ],
             )
-            .unwrap_or_else(|e| pgrx::error!("pg_reflex: heal coverage of '{view_name}': {e}"));
-        HealsCoveredByRebuild { previous }
+            .unwrap_or_else(|e| pgrx::error!("pg_reflex: heal coverage of '{view_name}': {e}"))
+            .next()
+            .map(|row| {
+                (
+                    row.get_by_name::<String, _>("previous")
+                        .ok()
+                        .flatten()
+                        .unwrap_or_default(),
+                    row.get_by_name::<String, _>("covered").ok().flatten(),
+                )
+            })?;
+        let covered = covered?;
+        set_heal_coverage(client, &covered);
+        Some(HealsCoveredByRebuild { previous })
     }
 
     pub(crate) fn end(self, client: &mut pgrx::spi::SpiClient<'_>) {
-        client
-            .update(
-                &format!("SELECT set_config('{COVERED_BY_REBUILD_GUC}', $1, true)"),
-                None,
-                &[unsafe {
-                    DatumWithOid::new(self.previous, PgBuiltInOids::TEXTOID.oid().value())
-                }],
-            )
-            .unwrap_or_else(|e| pgrx::error!("pg_reflex: heal coverage reset: {e}"));
+        set_heal_coverage(client, &self.previous);
     }
+}
+
+fn set_heal_coverage(client: &mut pgrx::spi::SpiClient<'_>, value: &str) {
+    client
+        .update(
+            &format!("SELECT set_config('{COVERED_BY_REBUILD_GUC}', $1, true)"),
+            None,
+            &[unsafe {
+                DatumWithOid::new(value.to_string(), PgBuiltInOids::TEXTOID.oid().value())
+            }],
+        )
+        .unwrap_or_else(|e| pgrx::error!("pg_reflex: heal coverage: {e}"));
 }
 
 /// One heal attempt: the IMV, what the partition reconcile returned, and how long

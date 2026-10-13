@@ -2608,7 +2608,9 @@ fn rebuild_partitions_and_queue_dependents(
             unlogged,
             true,
         );
-        covered.end(client);
+        if let Some(covered) = covered {
+            covered.end(client);
+        }
         let all_diffed = rebuilt.map_err(|(_, e)| format!("reconcile_partition: {}", e))?;
         keys_of_changed_rows.add_the_keys_held(client);
 
