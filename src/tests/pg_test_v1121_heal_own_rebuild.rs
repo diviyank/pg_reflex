@@ -310,3 +310,168 @@ fn v1121_hor_failed_refresh_of_a_covered_reader_flags_it_stale() {
     assert!(!flagged_after, "the printed remedy must clear the flag");
     assert!(wrong_after.is_empty(), "{}", wrong_after.join(", "));
 }
+
+/// The whole reconcile of an IMV refreshes the readers that ignore it itself, a
+/// partitioned one through its dependent cascade, an unpartitioned one through
+/// its ignoring readers. A refresh there that returns an error flags the reader
+/// stale too, and the printed remedy clears the flag.
+#[pg_test]
+fn v1121_hor_failed_refresh_after_a_whole_reconcile_flags_the_reader_stale() {
+    let chain = ScChain { field_names: false, cross_plan: false };
+    sc_open("reflex_hor_wfail", "IMMEDIATE", chain);
+    for reader in ["hor_years", "hor_a_years"] {
+        chain.create(&format!(
+            "create_reflex_ivm('{reader}', {}, 'plan, yr', NULL, 'IMMEDIATE', '!sc_fdya', \
+               ARRAY[]::text[])",
+            sql_lit(
+                "SELECT f.plan, f.yr, f.min_date FROM sc_fdya AS f JOIN sc_dp AS dp ON dp.id = f.plan"
+            )
+        ));
+    }
+    chain.exec(
+        "CREATE FUNCTION hor_disable_after() RETURNS TRIGGER LANGUAGE plpgsql AS $$ \
+           BEGIN IF NEW.name = TG_ARGV[0] THEN \
+                   UPDATE public.__reflex_ivm_reference SET enabled = FALSE WHERE name = TG_ARGV[1]; \
+                 END IF; RETURN NULL; END $$",
+    );
+    for (refreshed_first, disabled) in [
+        ("sc_fav__cte_forecast_bounds", "sc_fav__cte_forecast_sales"),
+        ("hor_a_years", "hor_years"),
+    ] {
+        chain.exec(&format!(
+            "CREATE TRIGGER hor_disable_{disabled} AFTER UPDATE OF last_update_date \
+               ON public.__reflex_ivm_reference FOR EACH ROW \
+               EXECUTE FUNCTION hor_disable_after('{refreshed_first}', '{disabled}')"
+        ));
+    }
+    let mut failures = Vec::new();
+    for (reconciled, reader) in [("sc_sfv", "sc_fav__cte_forecast_sales"), ("sc_fdya", "hor_years")] {
+        if let Err(error) = chain.commit(&format!("SELECT reflex_reconcile('{reconciled}')")) {
+            failures.push(format!("{reconciled}: raised {error}"));
+        }
+        let (flagged, reason) = hor_registry_flag(&chain, reader);
+        let remedy = format!("SELECT reflex_reconcile('{reader}')");
+        if !flagged || !reason.contains(&remedy) {
+            failures.push(format!("{reader} after reconcile of {reconciled}: flagged {flagged}, {reason}"));
+        }
+    }
+    for (_, disabled) in [("", "sc_fav__cte_forecast_sales"), ("", "hor_years")] {
+        chain.exec(&format!(
+            "DROP TRIGGER hor_disable_{disabled} ON public.__reflex_ivm_reference"
+        ));
+        chain.exec(&format!(
+            "UPDATE public.__reflex_ivm_reference SET enabled = TRUE WHERE name = '{disabled}'"
+        ));
+        if let Err(error) = chain.commit(&format!("SELECT reflex_reconcile('{disabled}')")) {
+            failures.push(format!("remedy of {disabled}: raised {error}"));
+        }
+        if hor_registry_flag(&chain, disabled).0 {
+            failures.push(format!("{disabled}: the printed remedy left the flag"));
+        }
+    }
+    failures.extend(chain.wrong_nodes(&[]));
+    probe_db_close("reflex_hor_wfail");
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+fn hor_rl_create(name: &str, sql: &str, key: &str, tail: &str) {
+    let created = Spi::get_one::<String>(&format!(
+        "SELECT create_reflex_ivm({}, {}, {}, NULL, 'IMMEDIATE'{tail})",
+        sql_lit(name),
+        sql_lit(sql),
+        sql_lit(key)
+    ))
+    .expect("create")
+    .unwrap_or_default();
+    assert_eq!(created, "CREATE REFLEX INCREMENTAL VIEW", "{name}");
+}
+
+fn hor_rl_mismatch(fresh: &str) -> i64 {
+    Spi::get_one::<i64>(&format!(
+        "SELECT count(*) FROM ((SELECT x::text FROM hor_rl_r x EXCEPT ALL SELECT x::text FROM ({fresh}) x) \
+         UNION ALL (SELECT x::text FROM ({fresh}) x EXCEPT ALL SELECT x::text FROM hor_rl_r x)) o"
+    ))
+    .expect("oracle")
+    .unwrap_or(-1)
+}
+
+/// R ignores X and Y, an IMMEDIATE IMV observing X. The partition rebuild of X
+/// writes Y while X's coverage is set; Y's changed rows reach plans of R other
+/// than X's rebuilt one, so Y's write must still queue R's heal, and the heal
+/// sweep must bring R back to its query.
+#[pg_test]
+fn v1121_hor_write_to_another_relation_inside_the_rebuild_still_queues() {
+    for ddl in [
+        "CREATE TABLE hor_rl_s (plan INT NOT NULL, k INT NOT NULL, v INT NOT NULL, \
+           PRIMARY KEY (plan, k)) PARTITION BY LIST (plan)",
+        "CREATE TABLE hor_rl_s_1 PARTITION OF hor_rl_s FOR VALUES IN (1)",
+        "CREATE TABLE hor_rl_s_2 PARTITION OF hor_rl_s FOR VALUES IN (2)",
+        "CREATE TABLE hor_rl_s_3 PARTITION OF hor_rl_s FOR VALUES IN (3)",
+        "INSERT INTO hor_rl_s SELECT a, b, 10 * a + b FROM generate_series(1, 3) a, \
+           generate_series(1, 3) b",
+        "CREATE TABLE hor_rl_d (id INT PRIMARY KEY)",
+        "INSERT INTO hor_rl_d VALUES (1), (2), (3)",
+    ] {
+        Spi::run(ddl).expect("fixture");
+    }
+    hor_rl_create("hor_rl_x", "SELECT plan, k, v FROM hor_rl_s", "plan, k", ", NULL, ARRAY['plan']");
+    hor_rl_create(
+        "hor_rl_y",
+        "SELECT k AS plan, plan AS orig, v FROM hor_rl_x",
+        "plan, orig",
+        "",
+    );
+    hor_rl_create(
+        "hor_rl_r",
+        "SELECT d.id AS plan, x.k, x.v, y.v AS yv FROM hor_rl_d AS d \
+         JOIN hor_rl_x AS x ON x.plan = d.id JOIN hor_rl_y AS y ON y.plan = d.id AND y.orig = x.k",
+        "plan, k",
+        ", '!hor_rl_x,!hor_rl_y', ARRAY['plan']",
+    );
+    let fresh = "SELECT d.id AS plan, x.k, x.v, y.v AS yv FROM hor_rl_d AS d \
+         JOIN (SELECT plan, k, v FROM hor_rl_s) AS x ON x.plan = d.id \
+         JOIN (SELECT k AS plan, plan AS orig, v FROM hor_rl_s) AS y \
+           ON y.plan = d.id AND y.orig = x.k";
+    let heal_maps_both: i64 = Spi::get_one(
+        "SELECT count(*)::int8 FROM public.__reflex_ivm_reference, \
+                jsonb_object_keys(aggregations->'ignore_heal_keys') k \
+          WHERE name = 'hor_rl_r'",
+    )
+    .expect("heal keys")
+    .unwrap_or(0);
+    assert_eq!(heal_maps_both, 2, "fixture: R heals on both X and Y");
+    assert_eq!(hor_rl_mismatch(fresh), 0, "fixture: R right before");
+
+    Spi::run(
+        "ALTER TABLE hor_rl_s DISABLE TRIGGER USER; \
+         UPDATE hor_rl_s SET v = v + 100 WHERE plan = 2; \
+         ALTER TABLE hor_rl_s ENABLE TRIGGER USER",
+    )
+    .expect("drift plan 2 of the source");
+    let rebuilt = Spi::get_one::<String>("SELECT reflex_reconcile_partition('hor_rl_x', '2')")
+        .expect("rebuild")
+        .unwrap_or_default();
+    assert!(rebuilt.starts_with("RECONCILED"), "{rebuilt}");
+    let behind = hor_rl_mismatch(fresh);
+    let queued: Vec<String> = Spi::connect(|client| {
+        client
+            .select(
+                "SELECT partition_key FROM public.__reflex_heal_pending \
+                  WHERE imv_name = 'hor_rl_r' ORDER BY 1",
+                None,
+                &[],
+            )
+            .expect("queue")
+            .filter_map(|row| row.get_by_name::<String, _>("partition_key").ok().flatten())
+            .collect()
+    });
+    assert!(
+        behind == 0 || !queued.is_empty(),
+        "R is {behind} rows wrong after X's rebuild and nothing is queued"
+    );
+    let healed = Spi::get_one::<String>("SELECT reflex_heal_ignored_sources()")
+        .expect("heal")
+        .unwrap_or_default();
+    assert!(!healed.starts_with("ERROR"), "{healed}");
+    assert_eq!(hor_rl_mismatch(fresh), 0, "R must match its query after the heal sweep");
+}
