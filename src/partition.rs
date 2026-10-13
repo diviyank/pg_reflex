@@ -1896,21 +1896,17 @@ fn drop_bound_collision_orphan(
     Ok(dropped)
 }
 
-/// Deletes the rows of `schema`.`partition`, a partition of an IMV, through the
-/// IMV's root before the partition is dropped, so that the IMVs reading the IMV
-/// receive the rows that leave as DML. Does nothing for a relation that is not
-/// a partition of a registered IMV, or when no write to that IMV reaches a
-/// reader: a partition rebuilt later in the transaction is then refreshed as
-/// replaced, not diffed.
-fn delete_rows_through_the_imv_root(
-    client: &mut pgrx::spi::SpiClient<'_>,
+/// The registered IMV `schema`.`partition` is a partition of, and the
+/// condition that selects the rows the partition holds through that IMV's root.
+fn imv_and_rows_held_by_partition(
+    client: &pgrx::spi::SpiClient<'_>,
     schema: &str,
     partition: &str,
-) -> Result<(), String> {
+) -> Result<Option<(String, String)>, String> {
     let text_arg = |value: &str| unsafe {
         DatumWithOid::new(value.to_string(), PgBuiltInOids::TEXTOID.oid().value())
     };
-    let held = client
+    Ok(client
         .select(
             "SELECT r.name AS imv, pg_get_partition_constraintdef(c.oid) AS rows_held \
              FROM pg_class c \
@@ -1926,11 +1922,64 @@ fn delete_rows_through_the_imv_root(
                 row.get_by_name::<String, _>("imv").ok().flatten()?,
                 row.get_by_name::<String, _>("rows_held").ok().flatten()?,
             ))
-        });
+        }))
+}
+
+/// The statement that deletes the rows of `schema`.`partition`, a partition of
+/// an IMV whose writes reach its readers, through the IMV's root. `None` when
+/// the partition is not one, or when no write to the IMV reaches a reader.
+fn delete_through_the_imv_root_statement(
+    client: &pgrx::spi::SpiClient<'_>,
+    schema: &str,
+    partition: &str,
+) -> Option<String> {
+    let (imv, rows_held) = imv_and_rows_held_by_partition(client, schema, partition).ok()??;
+    crate::rebuild_diff::target_propagates(client, &imv)
+        .then(|| format!("DELETE FROM {} WHERE {}", quote_identifier(&imv), rows_held))
+}
+
+/// Deletes the rows of `schema`.`partition`, a partition of an IMV, through the
+/// IMV's root before the partition is dropped, so that the IMVs reading the IMV
+/// receive the rows that leave as DML. Does nothing for a relation that is not
+/// a partition of a registered IMV. When no write to that IMV reaches a reader
+/// (the auto-sync of an ATTACH), the IMV is recorded so that a partition of it
+/// rebuilt later in the transaction is refreshed as replaced, not diffed.
+fn delete_rows_through_the_imv_root(
+    client: &mut pgrx::spi::SpiClient<'_>,
+    schema: &str,
+    partition: &str,
+) -> Result<(), String> {
+    let held = imv_and_rows_held_by_partition(client, schema, partition)?;
     let Some((imv, rows_held)) = held else {
         return Ok(());
     };
     if !crate::rebuild_diff::target_propagates(client, &imv) {
+        let holds_rows = client
+            .select(
+                &format!(
+                    "SELECT EXISTS (SELECT 1 FROM {}.{}) AS holds",
+                    quote_identifier(schema),
+                    quote_identifier(partition)
+                ),
+                Some(1),
+                &[],
+            )
+            .ok()
+            .and_then(|mut rows| rows.next())
+            .and_then(|row| row.get_by_name::<bool, _>("holds").ok().flatten())
+            .unwrap_or(true);
+        if holds_rows {
+            client
+                .select(
+                    "SELECT set_config($1, concat_ws(E'\\n', NULLIF(current_setting($1, true), ''), $2), true)",
+                    Some(1),
+                    &[
+                        crate::source_truncate::text_arg(ROWS_DROPPED_WITHOUT_DML_GUC),
+                        crate::source_truncate::text_arg(&imv),
+                    ],
+                )
+                .map_err(|e| format!("recording the rows of '{}': {}", partition, e))?;
+        }
         return Ok(());
     }
     client
@@ -2448,33 +2497,23 @@ impl KeysOfRebuiltPartitions {
     }
 }
 
-/// Whether the current transaction created or altered the relation `qualified`
-/// (its catalog row was written by it). A relation that does not exist counts
-/// as created.
-fn created_or_altered_in_this_transaction(
-    client: &pgrx::spi::SpiClient<'_>,
-    qualified: &str,
-) -> bool {
-    let written_by = client
+/// Transaction-local list of the IMVs a partition of which was dropped with
+/// rows while their writes reached no reader.
+const ROWS_DROPPED_WITHOUT_DML_GUC: &str = "pg_reflex.rows_dropped_without_dml";
+
+fn lost_rows_without_dml(client: &pgrx::spi::SpiClient<'_>, view_name: &str) -> bool {
+    use crate::source_truncate::text_arg;
+    client
         .select(
-            "SELECT xmin::text AS written_by FROM pg_class WHERE oid = to_regclass($1)",
+            "SELECT $2 = ANY (string_to_array(COALESCE(current_setting($1, true), ''), E'\\n')) \
+                    AS lost",
             Some(1),
-            &[unsafe {
-                DatumWithOid::new(qualified.to_string(), PgBuiltInOids::TEXTOID.oid().value())
-            }],
+            &[text_arg(ROWS_DROPPED_WITHOUT_DML_GUC), text_arg(view_name)],
         )
         .ok()
         .and_then(|mut rows| rows.next())
-        .and_then(|row| row.get_by_name::<String, _>("written_by").ok().flatten())
-        .and_then(|xid| xid.parse::<u32>().ok());
-    match written_by {
-        Some(xid) => unsafe {
-            pgrx::pg_sys::TransactionIdIsCurrentTransactionId(pgrx::pg_sys::TransactionId::from(
-                xid,
-            ))
-        },
-        None => true,
-    }
+        .and_then(|row| row.get_by_name::<bool, _>("lost").ok().flatten())
+        .unwrap_or(true)
 }
 
 /// The bound of the top-level partition that holds `schema`.`partition` (its
@@ -2991,10 +3030,11 @@ fn swap_partition_child_ddl(
             rebuilt_at.as_deref(),
         );
         // An empty leaf that stayed empty changed nothing a dependent reads,
-        // unless it replaced, in this transaction, a leaf dropped with its rows.
+        // unless a partition of this IMV was dropped with rows its readers
+        // were not told about.
         let stayed_empty = rows_before_tgt == Some(0)
             && rows_after == Some(0)
-            && !created_or_altered_in_this_transaction(client, &tgt_child_qual_probe);
+            && !lost_rows_without_dml(client, view_name);
         return Ok(if tgt_propagates && stayed_empty {
             SwapOutcome::Diffed
         } else {
@@ -4149,6 +4189,13 @@ pub(crate) fn reflex_flush_partitions_impl(only: Option<&str>) -> String {
                 // here, then drive the per-leaf reconciles with skip_sync => true
                 // so they don't each re-walk the whole tree. This also creates the
                 // (empty) mirror partitions for the skipped empty leaves above.
+                for node in &to_drop {
+                    root_stmts.extend(delete_through_the_imv_root_statement(
+                        client,
+                        schema,
+                        &target_child_name(imv, node),
+                    ));
+                }
                 if !fill_node.is_empty() || !to_drop.is_empty() {
                     root_stmts.push(format!(
                         "PERFORM public.reflex_sync_partitions({}, true)",
