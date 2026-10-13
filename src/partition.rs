@@ -4325,6 +4325,11 @@ pub(crate) fn reflex_flush_partitions_impl(only: Option<&str>) -> String {
 
                 // A partition the query still fills is rebuilt with the whole
                 // IMV, not dropped; the rows of the others reach the readers first.
+                // Unless the IMV's partitions provably follow the source's, a
+                // gone source partition may also have fed other partitions:
+                // the IMV is then rebuilt whole.
+                let rebuilt_whole_for_drops = !to_drop.is_empty()
+                    && !crate::cascade::partitions_follow_source(client, imv, &root);
                 let (filled_nodes, to_drop): (BTreeSet<String>, BTreeSet<String>) =
                     to_drop.into_iter().partition(|node| {
                         query_fills_partition(client, imv, schema, &target_child_name(imv, node))
@@ -4358,7 +4363,7 @@ pub(crate) fn reflex_flush_partitions_impl(only: Option<&str>) -> String {
                         schema, int
                     ));
                 }
-                if !filled_nodes.is_empty() {
+                if rebuilt_whole_for_drops || !filled_nodes.is_empty() {
                     root_stmts.push(format!(
                         "PERFORM public.reflex_reconcile({})",
                         sql_literal_text(imv)
